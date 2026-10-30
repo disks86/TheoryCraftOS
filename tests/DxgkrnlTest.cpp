@@ -2727,8 +2727,9 @@ void test_dxbc_real() {
         CHECK(p->emit_tgsi(&text) == status::kSuccess && strstr(std::string(text.view().data(), text.size()).c_str(), k.name));
       }
     }
-    const std::vector<uint8_t> compute_blob = read_blob("cs_fill.dxbc"), geometry_blob = read_blob("gs_copy.dxbc"), int_write_blob = read_blob("ps_int_write.dxbc"), int_load_blob = read_blob("ps_int_load.dxbc");
-    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob, &compute_blob, &geometry_blob, &int_write_blob, &int_load_blob}) {
+    const std::vector<uint8_t> compute_blob = read_blob("cs_fill.dxbc"), geometry_blob = read_blob("gs_copy.dxbc"), int_write_blob = read_blob("ps_int_write.dxbc"), int_load_blob = read_blob("ps_int_load.dxbc"),
+                                     hull_blob = read_blob("hs_tri.dxbc"), domain_blob = read_blob("ds_dent.dxbc");
+    for (const std::vector<uint8_t>* blob : {&vs_blob, &color_blob, &tex_blob, &math_blob, &volume_blob, &array_blob, &cube_blob, &compute_blob, &geometry_blob, &int_write_blob, &int_load_blob, &hull_blob, &domain_blob}) {
       for (size_t cut = 0; cut < blob->size(); cut += 3) {
         std::vector<uint8_t> t(blob->begin(), blob->begin() + static_cast<long>(cut));
         UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
@@ -2760,6 +2761,14 @@ void test_dxbc_real() {
           graphics::GeometryOutputData out;
           p->run_geometry(in, constants, &out);
           CHECK(out.count <= graphics::kMaxGeometryVertices);
+          // (a hull and a domain shader, given a patch)
+          graphics::HullInputData hin;
+          hin.control_points = 3;
+          for (uint32_t k = 0; k < 3; ++k) hin.position[k] = {static_cast<float>(k), 1.0f, 0.5f, 1.0f};
+          graphics::HullOutputData hout;
+          p->run_hull(hin, constants, &hout);
+          graphics::ShaderIo domain_io;
+          p->run_domain(hout, 0.25f, 0.25f, 0.5f, constants, &domain_io);
         } else {
           ++refused;
         }
@@ -4185,6 +4194,87 @@ void test_formats() {
   }
 }
 
+void test_tessellation_kernel() {
+  Env e;
+  namespace b = conformance_blobs;
+  auto shader = [&](graphics::ShaderStage stage, const uint8_t* code, uint32_t size, Handle* out, Kernel* kernel = nullptr, Handle device = 0) {
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code, size);
+    return (kernel ? kernel->create_shader(kPid, device, sd, out) : e.kernel.create_shader(kPid, e.dev, sd, out));
+  };
+  Handle vs = 0, hs = 0, ds = 0, ps = 0, gs = 0;
+  CHECK(shader(graphics::ShaderStage::Vertex, b::k_vs, sizeof b::k_vs, &vs) == status::kSuccess && shader(graphics::ShaderStage::Hull, b::k_hs_tri, sizeof b::k_hs_tri, &hs) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &ds) == status::kSuccess && shader(graphics::ShaderStage::Fragment, b::k_ps_color, sizeof b::k_ps_color, &ps) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Geometry, b::k_gs_copy, sizeof b::k_gs_copy, &gs) == status::kSuccess);
+  // (the stage a DXBC shader says it is, not the one asked for, is its stage: this is a hull shader too)
+  Handle also_hull = 0;
+  CHECK(shader(graphics::ShaderStage::Vertex, b::k_hs_tri, sizeof b::k_hs_tri, &also_hull) == status::kSuccess);
+  auto pipeline = [&](Handle hull, Handle domain, Handle geometry, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.hull_shader = hull, pd.domain_shader = domain, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  Handle tess = 0, plain = 0, bad = 0;
+  CHECK(pipeline(hs, ds, 0, &tess) == status::kSuccess && pipeline(0, 0, 0, &plain) == status::kSuccess);
+  CHECK(pipeline(hs, 0, 0, &bad) == status::kInvalidParameter && pipeline(0, ds, 0, &bad) == status::kInvalidParameter);   // (both or neither)
+  CHECK(pipeline(ds, hs, 0, &bad) == status::kInvalidParameter);                                                         // (the wrong way round)
+  CHECK(pipeline(vs, ds, 0, &bad) == status::kInvalidParameter && pipeline(also_hull, ds, 0, &bad) == status::kSuccess);
+  CHECK(pipeline(hs, ds, gs, &bad) == status::kNotSupported);                                                           // (no geometry shader after the tessellator)
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  const float v[42] = {-0.9f, -0.9f, 0.5f, 1, 0, 0, 1, 0.9f, -0.9f, 0.5f, 0, 1, 0, 1, 0, 0.9f, 0.5f, 0, 0, 1, 1, -0.9f, -0.9f, 0.5f, 1, 0, 0, 1, 0.9f, -0.9f, 0.5f, 0, 1, 0, 1, 0, 0.9f, 0.5f, 0, 0, 1, 1};
+  CHECK(e.write(vb, floats(v, 42)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto draw = [&](Handle pipe, Topology topology, uint32_t count) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.set_topology(topology);
+    w.draw(count);
+    w.end_pass();
+    return e.render(w, {target, vb});
+  };
+  auto lit = [&] {
+    uint32_t n = 0;
+    for (uint32_t y = 0; y < 32; ++y)
+      for (uint32_t x = 0; x < 32; ++x) n += (e.pixel(target, x, y) & 0xFFFFFF) != 0;
+    return n;
+  };
+  CHECK(draw(tess, patch_list(3), 3) == status::kSuccess && lit() > 200);
+  CHECK(draw(tess, patch_list(3), 6) == status::kSuccess && lit() > 200);   // (two patches)
+  CHECK(draw(tess, patch_list(3), 2) == status::kSuccess && lit() == 0);    // (not enough vertices for a patch)
+  // What does not go together: the control point count, a list with the tessellation pipeline, patches with a plain pipeline, a topology that does not exist.
+  CHECK(draw(tess, patch_list(4), 4) == status::kInvalidParameter && draw(tess, patch_list(1), 3) == status::kInvalidParameter);
+  CHECK(draw(tess, Topology::TriangleList, 3) == status::kInvalidParameter && draw(plain, patch_list(3), 3) == status::kInvalidParameter);
+  CHECK(draw(tess, static_cast<Topology>(kPatchListBase + graphics::kMaxPatchControlPoints + 1), 3) == status::kInvalidParameter);
+  // Factors the software tessellator does not make (3: the inner rings; 0 culls the patch) draw nothing.
+  {
+    const std::vector<uint8_t> big = read_blob("hs_tri3.dxbc"), zero = read_blob("hs_tri0.dxbc");
+    Handle hs3 = 0, hs0 = 0, tess3 = 0, tess0 = 0;
+    CHECK(shader(graphics::ShaderStage::Hull, big.data(), static_cast<uint32_t>(big.size()), &hs3) == status::kSuccess && shader(graphics::ShaderStage::Hull, zero.data(), static_cast<uint32_t>(zero.size()), &hs0) == status::kSuccess);
+    CHECK(pipeline(hs3, ds, 0, &tess3) == status::kSuccess && pipeline(hs0, ds, 0, &tess0) == status::kSuccess);
+    CHECK(draw(tess3, patch_list(3), 3) == status::kSuccess && lit() == 0);
+    CHECK(draw(tess0, patch_list(3), 3) == status::kSuccess && lit() == 0);
+  }
+  // A device without the feature refuses the shaders and the topology.
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(e.allocator, &screen);
+  SpyDevice limited(software);
+  limited.feature_mask = 0;
+  Kernel kernel(e.allocator);
+  AdapterConfig c;
+  c.display = &screen;
+  kernel.add_adapter(limited, c);
+  Handle adapter = 0, dev = 0, refused = 0;
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && kernel.create_device(kPid, adapter, &dev) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Hull, b::k_hs_tri, sizeof b::k_hs_tri, &refused, &kernel, dev) == status::kNotSupported);
+  CHECK(shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &refused, &kernel, dev) == status::kNotSupported);
+}
+
 void test_conformance() {
   test_half_floats();
   HostAllocator allocator;
@@ -4270,6 +4360,19 @@ void test_conformance() {
         CHECK(near(px(7, 4), 0xFF36659C) && (px(6, 4) & 0xFFFFFF) == 0);
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
+    }
+    if (__builtin_strstr(r.name, "tessellation")) {
+      // The bent triangle: factors 2, so the corners and the midpoints of the edges are the vertices; the domain shader moves a point by the products of its coordinates, so the midpoints
+      // (and with them the edges) move, and the picture is not the plain triangle's.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 3 || d < -3) return false;
+        }
+        return true;
+      };
+      CHECK(near(px(14, 8), 0x2D13BF) && near(px(16, 20), 0x595551) && near(px(20, 24), 0x4C862D) && px(0, 0) == 0 && px(31, 31) == 0);
     }
     if (__builtin_strstr(r.name, "multisampling")) {
       // Inside a rectangle all four samples agree; on the left edge of the far one (x = 4.3) three of the four samples of the pixel are inside: 3/4 of red. Where the near green edge
@@ -4860,7 +4963,7 @@ void test_topologies() {
     CHECK(lit(picture(pipe, [](CommandWriter& w) { w.set_topology(Topology::TriangleStrip); w.draw(2); })) == 0);
     CommandWriter bad(e.allocator);
     bad.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
-    bad.set_topology(static_cast<Topology>(7));
+    bad.set_topology(static_cast<Topology>(99));   // (7 is a patch list of two control points now)
     bad.end_pass();
     CHECK(e.render(bad, {rt, vb, ib}) == status::kInvalidParameter);
   }
@@ -5409,6 +5512,7 @@ int main() {
   test_multisample();
   test_geometry_kernel();
   test_formats();
+  test_tessellation_kernel();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

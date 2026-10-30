@@ -29,7 +29,7 @@ namespace graphics {
 struct RecordedCommand {
   enum class Type : uint8_t {
     BeginRenderPass, BindPipeline, BindVertexBuffer, BindIndexBuffer, PushConstants, BindTexture, SetViewport, SetScissor,
-    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve,
+    Draw, DrawIndexed, EndRenderPass, SetTopology, BeginQuery, EndQuery, BindComputePipeline, BindStorageBuffer, Dispatch, Resolve, SetPatchPoints,
   };
   Type type = Type::Draw;
   RenderPassBegin pass;
@@ -141,6 +141,12 @@ class CommandRecorder : public ICommandBuffer {
     c.vertex_offset = vertex_offset;
     c.instance_count = instance_count;
     c.first_instance = first_instance;
+    add(c);
+  }
+  void set_patch_control_points(uint32_t count) override {
+    RecordedCommand c;
+    c.type = RecordedCommand::Type::SetPatchPoints;
+    c.count = count;
     add(c);
   }
   void set_primitive_topology(PrimitiveTopology topology) override {

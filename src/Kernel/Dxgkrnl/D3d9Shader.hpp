@@ -77,6 +77,13 @@ class D3d9Program {
   graphics::GeometryTopology geometry_output() const { return geometry_output_; }
   uint32_t geometry_max_vertices() const { return geometry_max_vertices_; }
   void run_geometry(const graphics::GeometryInputData& input, const uint8_t* constants, graphics::GeometryOutputData* output) const;
+  // A hull or domain shader (hs_5_0 / ds_5_0 DXBC, triangle domain), see D3d9Dxbc.cpp; the tessellator's settings both stages declare.
+  uint32_t tess_input_points() const { return tess_input_points_; }
+  uint32_t tess_output_points() const { return tess_output_points_; }
+  graphics::TessPartitioning tess_partitioning() const { return tess_partitioning_; }
+  graphics::TessOutput tess_output() const { return tess_output_; }
+  void run_hull(const graphics::HullInputData& input, const uint8_t* constants, graphics::HullOutputData* output) const;
+  void run_domain(const graphics::HullOutputData& patch, float u, float v, float w, const uint8_t* constants, graphics::ShaderIo* out) const;
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   BufferKind storage_kind(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_kind_[slot] : BufferKind::None; }
   uint32_t storage_stride(uint32_t slot) const { return slot < graphics::kMaxStorageBuffers ? uav_stride_[slot] : 0; }
@@ -127,7 +134,7 @@ class D3d9Program {
   friend class TgsiEmitter;
   friend class D3d9Writer;
   struct State;
-  void execute(State& s) const;
+  void execute(State& s, uint64_t begin = 0, uint64_t end = ~uint64_t{0}) const;
 
   allocators::IAllocator& allocator_;
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
@@ -137,6 +144,13 @@ class D3d9Program {
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   graphics::GeometryTopology geometry_output_ = graphics::GeometryTopology::TriangleStrip;
   uint32_t geometry_max_vertices_ = 0;
+  uint32_t tess_input_points_ = 0, tess_output_points_ = 0;
+  graphics::TessPartitioning tess_partitioning_ = graphics::TessPartitioning::Integer;
+  graphics::TessOutput tess_output_ = graphics::TessOutput::TriangleCcw;
+  // A hull shader's phases: the instruction range of the control point phase (run once per output control point) and of the one fork and the one join phase, and which patch
+  // constant registers the tessellation factors are in (-1: not written).
+  uint64_t hs_cp_begin_ = 0, hs_cp_end_ = 0, hs_fork_begin_ = 0, hs_fork_end_ = 0, hs_join_begin_ = 0, hs_join_end_ = 0;
+  int8_t outer_factor_reg_[3] = {-1, -1, -1}, inner_factor_reg_ = -1;
   BufferKind uav_kind_[graphics::kMaxStorageBuffers] = {};
   uint32_t uav_stride_[graphics::kMaxStorageBuffers] = {};
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};

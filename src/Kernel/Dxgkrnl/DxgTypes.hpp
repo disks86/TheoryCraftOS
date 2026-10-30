@@ -208,6 +208,7 @@ struct ShaderDesc {
 
 struct PipelineDesc {
   Handle vertex_shader = 0, fragment_shader = 0;
+  Handle hull_shader = 0, domain_shader = 0;   // not 0: tessellation (both, stages Hull and Domain; needs kFeatureTessellation; the draws are PatchList topology with the hull shader's input control point count)
   Handle geometry_shader = 0;   // not 0: a geometry shader (stage Geometry) that runs between the vertex and the pixel shader; needs kFeatureGeometryShaders, and the draws must make what it takes
   Handle compute_shader = 0;   // not 0: a compute pipeline of that shader (stage Compute), and nothing else of the description is used; needs kFeatureCompute
   uint32_t vertex_stride = 0;

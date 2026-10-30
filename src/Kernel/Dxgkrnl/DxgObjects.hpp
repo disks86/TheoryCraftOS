@@ -67,6 +67,8 @@ class ShaderObject {
   graphics::ShaderStage stage() const { return stage_; }
   graphics::IShaderModule* module() const { return module_; }
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
+  uint32_t tess_input_points() const { return tess_input_points_; }
+  uint32_t tess_output_points() const { return tess_output_points_; }
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
 
  private:
@@ -81,6 +83,7 @@ class ShaderObject {
   uint32_t thread_group_[3] = {1, 1, 1};     // a compute shader's thread group
   uint32_t storage_mask_ = 0;                // ... and the storage buffer slots it uses (bit n: u<n>)
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;   // a geometry shader's input
+  uint32_t tess_input_points_ = 0, tess_output_points_ = 0;   // a hull or domain shader's control points
   D3d9Binding d3d9_;              // Direct3D 9 bytecode being interpreted (the module's function finds the program through it)
 };
 
@@ -101,6 +104,9 @@ class PipelineObject {
   // Does the pipeline blend (any target)? Draws into integer targets must not.
   bool blends() const { return blends_; }
   bool has_geometry() const { return static_cast<bool>(geometry_); }
+  // Tessellation: the pipeline has a hull and a domain shader, which take patches of this many control points.
+  bool has_tessellation() const { return static_cast<bool>(hull_); }
+  uint32_t tess_input_points() const { return tess_input_points_; }
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   uint32_t storage_mask() const { return storage_mask_; }
@@ -115,7 +121,8 @@ class PipelineObject {
   bool per_instance_ = false;
   bool compute_ = false;
   bool blends_ = false;
-  SharedPointer<ShaderObject> geometry_;
+  SharedPointer<ShaderObject> geometry_, hull_, domain_;
+  uint32_t tess_input_points_ = 0;
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   uint32_t thread_group_[3] = {1, 1, 1};
   uint32_t storage_mask_ = 0;

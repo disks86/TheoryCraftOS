@@ -148,7 +148,7 @@ class IImage {
 
 // --- Shaders -----------------------------------------------------------------
 
-enum class ShaderStage : uint8_t { Vertex, Fragment, Compute, Geometry };
+enum class ShaderStage : uint8_t { Vertex, Fragment, Compute, Geometry, Hull, Domain };
 
 // --- Textures ----------------------------------------------------------------
 
@@ -257,6 +257,30 @@ struct GeometryOutputData {
 };
 using GeometryShaderFn = void (*)(const GeometryInputData& input, const uint8_t* constants, GeometryOutputData* output);
 
+// Tessellation (kFeatureTessellation). A draw of PatchList topology takes `control_points` vertices per patch (set_patch_control_points); the vertex shader runs on each, the hull shader
+// then makes the patch's output control points and its tessellation factors, the fixed-function tessellator makes a lattice of domain points from the factors, and the domain shader
+// turns each into a vertex from the patch (the lattice's triangles are then drawn). The software device calls functions; virgl takes TGSI text for the two stages. Only the triangle domain
+// with integer or power-of-two partitioning is made, and only when the factors of a patch (after rounding) are all the same; a patch with other factors is dropped by the software device.
+constexpr uint32_t kMaxPatchControlPoints = 32;
+constexpr uint32_t kMaxPatchRegisters = 16;   // patch constant registers (tessellation factors included)
+enum class TessDomain : uint8_t { Isoline, Triangle, Quad };
+enum class TessPartitioning : uint8_t { Integer, Pow2 };
+enum class TessOutput : uint8_t { TriangleCw, TriangleCcw };
+struct HullInputData {
+  uint32_t control_points = 0;
+  uint32_t primitive_id = 0;
+  Vec4 position[kMaxPatchControlPoints];
+  Vec4 varying[kMaxPatchControlPoints][kMaxVaryings];
+};
+struct HullOutputData {
+  ShaderIo control_point[kMaxPatchControlPoints];   // the output control points
+  Vec4 patch[kMaxPatchRegisters];                   // the patch constant registers (the tessellation factors are in the x of theirs)
+  float outer[4] = {};                              // edge factors (triangle: u = 0, v = 0, w = 0 edges), inner[0] the inside factor
+  float inner[2] = {};
+};
+using HullShaderFn = void (*)(const HullInputData& input, const uint8_t* constants, HullOutputData* output);
+using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, float w, const uint8_t* constants, ShaderIo* out);
+
 // Compute shaders (kFeatureCompute). A software compute shader is called once per thread; the device runs the groups of a dispatch one after the other and the threads of a group
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
@@ -298,6 +322,13 @@ struct ShaderModuleDesc {
   GeometryPrimitive geometry_input = GeometryPrimitive::Triangle;
   GeometryTopology geometry_output = GeometryTopology::TriangleStrip;
   uint32_t geometry_max_vertices = 0;
+  // Hull and domain shaders (stages Hull and Domain): functions for the software device (virgl: TGSI text), the control points taken and made, and the tessellator's settings (both stages say them).
+  HullShaderFn hull_function = nullptr;
+  DomainShaderFn domain_function = nullptr;
+  uint32_t tess_input_points = 0, tess_output_points = 0;
+  TessDomain tess_domain = TessDomain::Triangle;
+  TessPartitioning tess_partitioning = TessPartitioning::Integer;
+  TessOutput tess_output = TessOutput::TriangleCcw;
   uint32_t thread_group[3] = {1, 1, 1};
   // TGSI text for the GPU device. Inputs are the vertex attributes (vertex stage) or the
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).
@@ -385,6 +416,9 @@ struct GraphicsPipelineDesc {
   bool multisample = false;
   // kFeatureGeometryShaders: a geometry shader module run between the vertex and fragment shaders (nullptr: none). What it takes must be what the draws make (triangles, lines or points).
   const IShaderModule* geometry_shader = nullptr;
+  // kFeatureTessellation: the hull and domain shader modules of a pipeline for PatchList draws (both or neither).
+  const IShaderModule* hull_shader = nullptr;
+  const IShaderModule* domain_shader = nullptr;
   StencilState stencil;
   BlendState blend;                                   // kFeatureBlendState
   CompareOp depth_compare = CompareOp::LessEqual;     // kFeatureBlendState: what depth_test compares with (a device without it always uses LessEqual)
@@ -407,7 +441,7 @@ class IPipeline {
 enum class IndexType : uint8_t { Uint16, Uint32 };
 
 // What the vertices of a draw make (set_primitive_topology, DeviceFeature kFeatureLines for anything but triangles). Lines and points are one pixel wide.
-enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList };
+enum class PrimitiveTopology : uint8_t { TriangleList, LineList, PointList, PatchList };   // (PatchList: kFeatureTessellation, with set_patch_control_points)
 
 struct Viewport {
   float x = 0, y = 0, width = 0, height = 0;
@@ -450,6 +484,8 @@ class ICommandBuffer {
   virtual void draw_indexed(uint32_t index_count, uint32_t first_index = 0, int32_t vertex_offset = 0, uint32_t instance_count = 1, uint32_t first_instance = 0) = 0;
   // What the vertices of the draws that follow make (kFeatureLines for lines and points; the default is a list of triangles).
   virtual void set_primitive_topology(PrimitiveTopology topology) = 0;
+  // How many control points a patch of the PatchList draws that follow has (1 .. kMaxPatchControlPoints).
+  virtual void set_patch_control_points(uint32_t count) { (void)count; }
   virtual void end_render_pass() = 0;
   // Averages the samples of a multisampled colour image into a single-sample image of the same format and size (kFeatureMultisample), outside a render pass.
   virtual void resolve_image(IImage* destination, IImage* source) {
@@ -492,6 +528,7 @@ enum DeviceFeature : uint32_t {
   kFeatureInstancing = 1u << 3,    // draw(..., instance_count, first_instance) and VertexAttribute::per_instance
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
+  kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
   kFeatureSrgbFormats = 1u << 13,      // Format::B8G8R8A8Srgb / R8G8B8A8Srgb
   kFeatureUnorm16Formats = 1u << 14,   // Format::R16G16B16A16Unorm (also kFeatureFloatFormats' read_pixels_float / write_pixels_float)
   kFeatureIntegerFormats = 1u << 15,   // Format::R32G32B32A32Uint

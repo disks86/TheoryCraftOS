@@ -351,7 +351,7 @@ class VirglShaderModule final : public IShaderModule {
     if (!cmd) return;
     cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + text_dwords);
     cmd[1] = handle_;
-    cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : virgl::kShaderFragment;
+    cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : desc.stage == ShaderStage::Hull ? virgl::kShaderTessControl : desc.stage == ShaderStage::Domain ? virgl::kShaderTessEval : virgl::kShaderFragment;
     cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
     cmd[5] = 0;                              // no stream output
@@ -403,7 +403,9 @@ class VirglPipeline final : public VirglPipelineBase {
   VirglPipeline(VirglDevice& device, const GraphicsPipelineDesc& desc)
       : VirglPipelineBase(false), device_(device), desc_(desc), vs_(static_cast<const VirglShaderModule*>(desc.vertex_shader)->handle()),
         fs_(static_cast<const VirglShaderModule*>(desc.fragment_shader)->handle()),
-        gs_(desc.geometry_shader ? static_cast<const VirglShaderModule*>(desc.geometry_shader)->handle() : 0) {
+        gs_(desc.geometry_shader ? static_cast<const VirglShaderModule*>(desc.geometry_shader)->handle() : 0),
+        hs_(desc.hull_shader ? static_cast<const VirglShaderModule*>(desc.hull_shader)->handle() : 0),
+        ds_(desc.domain_shader ? static_cast<const VirglShaderModule*>(desc.domain_shader)->handle() : 0) {
     blend_ = device.new_handle();
     dsa_ = device.new_handle();
     rasterizer_ = device.new_handle();
@@ -506,11 +508,13 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t vertex_shader() const { return vs_; }
   uint32_t fragment_shader() const { return fs_; }
   uint32_t geometry_shader() const { return gs_; }   // (0: none)
+  uint32_t hull_shader() const { return hs_; }
+  uint32_t domain_shader() const { return ds_; }
 
  private:
   VirglDevice& device_;
   GraphicsPipelineDesc desc_;
-  uint32_t vs_, fs_, gs_;
+  uint32_t vs_, fs_, gs_, hs_, ds_;
   uint8_t stencil_reference_ = 0;
   uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
   bool ok_ = false;
@@ -622,6 +626,7 @@ IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& des
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment)
     return nullptr;
   if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
+  if ((desc.hull_shader != nullptr) != (desc.domain_shader != nullptr) || (desc.hull_shader && (desc.hull_shader->stage() != ShaderStage::Hull || desc.domain_shader->stage() != ShaderStage::Domain))) return nullptr;
   VirglPipeline* p = make<VirglPipeline>(gpu_.allocator(), *this, desc);
   if (p && !p->valid()) {
     destroy(gpu_.allocator(), p);
@@ -688,6 +693,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   bool in_pass = false;
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;
   const VirglComputePipeline* compute = nullptr;
+  uint32_t patch_points = 0;
   struct StorageBinding {
     VirglBuffer* buffer = nullptr;
     uint64_t offset = 0, size = 0;
@@ -783,6 +789,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::SetTopology:
         topology = cmd.topology;
+        break;
+      case RecordedCommand::Type::SetPatchPoints:
+        patch_points = cmd.count;
         break;
       case RecordedCommand::Type::EndRenderPass:
         if (queries.open != kMaxOcclusionQueries) return false;
@@ -903,6 +912,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.command(virgl::kBindShader, 0, 2);
         stream.put(pipeline->geometry_shader());
         stream.put(virgl::kShaderGeometry);
+        stream.command(virgl::kBindShader, 0, 2);
+        stream.put(pipeline->hull_shader());
+        stream.put(virgl::kShaderTessControl);
+        stream.command(virgl::kBindShader, 0, 2);
+        stream.put(pipeline->domain_shader());
+        stream.put(virgl::kShaderTessEval);
         constants_dirty = constants_dwords != 0;  // constants belong to the program: resend
         break;
       }
@@ -998,10 +1013,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(index_type == IndexType::Uint16 ? 2 : 4);
           stream.put(static_cast<uint32_t>(index_offset));
         }
-        stream.command(virgl::kDrawVbo, 0, 12);
+        const bool patches = topology == PrimitiveTopology::PatchList;
+        stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
         stream.put(cmd.first);
         stream.put(cmd.count);
-        stream.put(topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
+        stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
         stream.put(indexed ? 1 : 0);
         stream.put(cmd.instance_count);
         stream.put(static_cast<uint32_t>(cmd.vertex_offset));
@@ -1011,6 +1027,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         stream.put(0);  // min index
         stream.put(0xFFFFFFFFu);  // max index
         stream.put(0);  // count from stream output
+        if (patches) {
+          stream.put(patch_points);
+          stream.put(0);   // draw id
+        }
         break;
       }
     }

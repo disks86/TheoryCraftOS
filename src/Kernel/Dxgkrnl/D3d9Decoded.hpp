@@ -51,9 +51,9 @@ enum Opcode : uint16_t {
   kLoopBegin = 0x1200, kLoopEnd, kBreak0, kBreakNz, kBreakZ, kContinue0, kContinueNz, kContinueZ,
 };
 
-enum RegType : uint8_t { kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
+enum RegType : uint8_t { kPatchOut = 21 /* a hull shader's patch constant output register (fork and join phases) */, kPatchIn = 22 /* a domain shader's patch constant input register */, kTemp = 0, kInput = 1, kConst = 2, kAddrTex = 3, kRastOut = 4, kAttrOut = 5, kTexCrdOut = 6, kColorOut = 8, kDepthOut = 9, kSampler = 10, kConstBool = 14,
                kSysValue = 20 /* (not in a token stream: a Shader Model 4 system value; number: kSysPosition ...) */ };
-enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysDispatchThreadId, kSysGroupId, kSysGroupThreadId, kSysGroupIndex, kSysValueCount };
+enum SysValue : uint8_t { kSysPosition = 0, kSysFrontFacing, kSysPrimitiveId, kSysVertexId, kSysInstanceId, kSysDispatchThreadId, kSysGroupId, kSysGroupThreadId, kSysGroupIndex, kSysOutputControlPointId, kSysForkInstanceId, kSysJoinInstanceId, kSysDomainLocation, kSysValueCount };
 enum AtomicKind : uint8_t { kAtomicAdd = 0, kAtomicAnd, kAtomicOr, kAtomicXor, kAtomicIMax, kAtomicIMin, kAtomicUMax, kAtomicUMin, kAtomicExchange };
 enum Usage : uint8_t { kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10 };
 enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kModSignNeg, kModComp, kModX2, kModX2Neg, kModDz, kModDw, kModAbs, kModAbsNeg, kModNot };
@@ -75,7 +75,8 @@ struct D3d9Program::Instruction {
   struct Src {
     uint8_t type = 0;
     uint16_t number = 0;
-    uint8_t vertex = 0;        // a geometry shader's input: which vertex of the primitive (v[vertex][register])
+    uint8_t vertex = 0;        // a geometry, hull or domain shader's input: which vertex or control point (v[vertex][register])
+    bool vertex_from_id = false;   // ... the one the hull shader's control point phase is making (vOutputControlPointID)
     int8_t slot = kSlotNone;   // inputs: the attribute location / varying
     uint8_t swizzle[4] = {0, 1, 2, 3};
     uint8_t modifier = kModNone;

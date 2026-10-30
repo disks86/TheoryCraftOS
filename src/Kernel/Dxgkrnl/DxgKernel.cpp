@@ -820,8 +820,11 @@ NtStatus Kernel::create_pipeline_locked(Process& p, Handle device, const Pipelin
   if (!vs || !fs || vs->device != device || fs->device != device) return status::kInvalidHandle;
   SharedPointer<ShaderRec> gs = desc.geometry_shader ? p.shaders.get(desc.geometry_shader) : SharedPointer<ShaderRec>();
   if (desc.geometry_shader && (!gs || gs->device != device)) return status::kInvalidHandle;
+  SharedPointer<ShaderRec> hs = desc.hull_shader ? p.shaders.get(desc.hull_shader) : SharedPointer<ShaderRec>(), ds = desc.domain_shader ? p.shaders.get(desc.domain_shader) : SharedPointer<ShaderRec>();
+  if ((desc.hull_shader && (!hs || hs->device != device)) || (desc.domain_shader && (!ds || ds->device != device))) return status::kInvalidHandle;
   SharedPointer<PipelineObject> pipe;
-  NtStatus st = d->adapter().create_pipeline(desc, vs->shader, fs->shader, &pipe, gs ? gs->shader : SharedPointer<ShaderObject>());
+  NtStatus st = d->adapter().create_pipeline(desc, vs->shader, fs->shader, &pipe, gs ? gs->shader : SharedPointer<ShaderObject>(), hs ? hs->shader : SharedPointer<ShaderObject>(),
+                                             ds ? ds->shader : SharedPointer<ShaderObject>());
   if (st != status::kSuccess) return st;
   SharedPointer<PipelineRec> rec = SharedPointer<PipelineRec>::make(allocator_);
   if (!rec) return status::kNoMemory;
@@ -869,7 +872,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
     case EscapeOp::CreateShader: {
       ShaderDesc desc;
       const uint32_t kind = in.le32(), stage = in.le32(), bytes = in.le32();
-      if (!in.ok() || kind > static_cast<uint32_t>(ShaderKind::Dxbc) || stage > 3) return status::kInvalidParameter;
+      if (!in.ok() || kind > static_cast<uint32_t>(ShaderKind::Dxbc) || stage > 5) return status::kInvalidParameter;
       desc.kind = static_cast<ShaderKind>(kind);
       desc.stage = static_cast<graphics::ShaderStage>(stage);
       desc.code = in.take(bytes);
@@ -933,9 +936,14 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
               const uint32_t multisample = in.le32();
               if (!in.ok() || multisample > 1) return status::kInvalidParameter;
               desc.multisample = multisample != 0;
-              if (!in.at_end()) {   // (and, after that, a geometry shader)
+              if (!in.at_end()) {   // (and, after that, a geometry shader, then a hull and a domain shader)
                 desc.geometry_shader = in.le32();
                 if (!in.ok()) return status::kInvalidParameter;
+                if (!in.at_end()) {
+                  desc.hull_shader = in.le32();
+                  desc.domain_shader = in.le32();
+                  if (!in.ok()) return status::kInvalidParameter;
+                }
               }
             }
           }
