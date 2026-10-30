@@ -33,6 +33,52 @@ uint32_t slice_count(uint32_t esz) { return 16u >> esz; }
 }  // namespace
 
 AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
+  if (((insn >> 24) & 0xFE) == 0xA0 && !((insn >> 23) & 1)) {      // SVE2.1 / SME2: LD1, LDNT1, ST1, STNT1 of two or four vectors, governed by a predicate-as-counter
+    const bool strided = (insn >> 24) & 1, four = (insn >> 15) & 1, store = (insn >> 21) & 1, immediate = (insn >> 22) & 1;
+    const uint32_t esz = bits_of(insn, 14, 13), nreg = four ? 4 : 2, rn = bits_of(insn, 9, 5), pn = 8 + bits_of(insn, 12, 10);
+    uint32_t zt;
+    bool nontemporal;
+    if (!strided) {
+      if (four && ((insn >> 1) & 1)) return undefined();
+      zt = four ? (bits_of(insn, 4, 2) << 2) : (bits_of(insn, 4, 1) << 1);
+      nontemporal = insn & 1;
+    } else {
+      if (four && ((insn >> 2) & 1)) return undefined();
+      zt = (((insn >> 4) & 1) << 4) | (four ? bits_of(insn, 1, 0) : bits_of(insn, 2, 0));
+      nontemporal = (insn >> 3) & 1;
+    }
+    (void)nontemporal;
+    uint64_t address = reg_sp(rn, true);
+    if (immediate) {
+      if ((insn >> 20) & 1) return undefined();
+      address += static_cast<uint64_t>(sext(bits_of(insn, 19, 16), 4) * static_cast<int64_t>(nreg) * kVectorBytes);
+    } else {
+      const uint32_t rm = bits_of(insn, 20, 16);
+      if (rm == 31) return undefined();
+      address += reg(rm, true) << esz;
+    }
+    Vec data[4];
+    uint32_t regs[4];
+    for (uint32_t k = 0; k < nreg; ++k) regs[k] = strided ? (zt + k * (four ? 4 : 8)) & 31 : (zt + k) & 31;
+    for (uint32_t k = 0; k < nreg; ++k) {
+      const uint16_t gp = counter_to_predicate(s_.p[pn], esz, k);
+      const uint64_t base = address + static_cast<uint64_t>(k) * kVectorBytes;
+      for (uint32_t i = 0; i < element_count(esz); ++i) {
+        if (!active(gp, i, esz)) continue;
+        const uint64_t where = base + (static_cast<uint64_t>(i) << esz);
+        if (store) {
+          if (!this->store(m, where, 1u << esz, get(s_.v[regs[k]], esz, i))) return Step::Fault;
+        } else {
+          uint64_t v;
+          if (!this->load(m, where, 1u << esz, &v)) return Step::Fault;
+          put(&data[k], esz, i, v);
+        }
+      }
+    }
+    if (!store)
+      for (uint32_t k = 0; k < nreg; ++k) s_.v[regs[k]] = data[k];
+    return Step::Ok;
+  }
   if (!s_.streaming && (insn >> 24) != 0xE1) return undefined();      // (only LDR / STR of ZA work outside streaming mode)
   const uint32_t top = insn >> 24, size = bits_of(insn, 23, 22), rn = bits_of(insn, 9, 5), zd = insn & 31;
   const uint32_t pg = bits_of(insn, 12, 10), rs = bits_of(insn, 14, 13);
@@ -230,10 +276,9 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     }
     if ((top == 0xA0 || top == 0xA1) && bits_of(insn, 23, 22) >= 2 && !((insn >> 20) & 1) == false) {}
     if (top == 0xA0 || top == 0xA1) {      // SMOPA .. USMOPS: signed / unsigned integer outer products accumulating into 32-bit (bytes, or halfwords when bit 3 is set) or 64-bit (halfwords) tiles
-      const bool wide = size == 3, n_unsigned = top == 0xA1, m_unsigned = (insn >> 21) & 1;
+      const bool wide = size == 3, n_unsigned = top == 0xA1, m_unsigned = (b3 && !wide) ? n_unsigned : ((insn >> 21) & 1);      // (the two-way halfword form has one signedness for both)
       if (size < 2) return undefined();
       const uint32_t group = wide ? 4 : (b3 ? 2 : 4), src_esz = (wide || b3) ? 1 : 0;
-      if (b3 && !wide && (n_unsigned != m_unsigned)) return undefined();
       if (wide && b3) return undefined();
       const uint32_t esz = wide ? 3 : 2, n = slice_count(esz), tile = insn & (wide ? 7 : 3), sw = element_bits(src_esz);
       for (uint32_t i = 0; i < n; ++i)

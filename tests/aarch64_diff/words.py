@@ -52,7 +52,7 @@ def key(t):
 groups = collections.defaultdict(list)
 for w, t in zip(valid, texts):
     if SME:
-        if re.search(r'\bzt0|\bsp\b|\bx27\b|\bx28\b|\bz31\b|\bpn[0-9]', t) or not re.search(r'\bza|\bzt0', t): continue
+        if re.search(r'\bsp\b|\bx27\b|\bx28\b|\bz31\b', t): continue
     elif SVEMEM:
         # memory forms only; the ones that need the stack pointer or a 128-bit element (SVE2.1) are skipped
         # (qemu does not load a first-fault or non-fault element that is the first active one but sits in the upper half of the register, which the architecture does not allow: those are
