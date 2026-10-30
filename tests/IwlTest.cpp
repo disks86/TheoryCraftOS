@@ -40,6 +40,8 @@
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlScan.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlLink.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
+#include "Network/NetworkStack.hpp"
 #include "Hardware/WirelessInterface/Ieee80211Frames.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
@@ -258,7 +260,7 @@ struct FakeIwl final : IIwlRegisters {
   std::vector<Transfer> transfers;
   std::map<uint32_t, uint8_t> device_memory;
   std::function<void()> on_alive, on_doorbell;
-  std::function<void(uint32_t)> on_queue_doorbell;
+  std::function<void(uint32_t)> on_queue_doorbell, on_ring_programmed;
   uint32_t queue_wrptr[32] = {};
   bool force_radio = false;
   bool w1c = false, fail_transfers = false, cpu_released = false, alive_never = false, extended_during = false;
@@ -298,6 +300,9 @@ struct FakeIwl final : IIwlRegisters {
       }
     }
     if (offset == iwl_fh::kUcodeLoadStatus && value == 0xFFFFFFFFu && cpu_released && !alive_never) { regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitAlive; if (on_alive) on_alive(); }
+    if (on_ring_programmed)
+      for (uint32_t q = 0; q < 32; ++q)
+        if (offset == iwl_tx::cbbc_queue(q)) on_ring_programmed(q);
     if (offset == iwl_tx::kHbusTargWrptr) {
       if (((value >> 8) & 0xFF) != 0) {                             // another queue's pointer: not the command queue's doorbell
         const uint32_t q = (value >> 8) & 0x1F;
@@ -1119,10 +1124,13 @@ static Bytes rx_mpdu(const Bytes& frame, uint8_t channel, uint8_t energy, bool c
   return b;
 }
 
-static Bytes beacon(const char* name, uint8_t last_octet, bool wpa2) {
+static Bytes beacon(const char* name, uint8_t last_octet, bool wpa2, const uint8_t* bssid = nullptr) {
   Bytes f{0x80, 0x00, 0, 0};
   f.insert(f.end(), 6, 0xFF);
-  for (int i = 0; i < 2; ++i) f.insert(f.end(), {0x02, 0x11, 0x22, 0x33, 0x44, last_octet});
+  for (int i = 0; i < 2; ++i) {
+    if (bssid) f.insert(f.end(), bssid, bssid + 6);
+    else f.insert(f.end(), {0x02, 0x11, 0x22, 0x33, 0x44, last_octet});
+  }
   f.insert(f.end(), {0, 0});
   f.insert(f.end(), 8, 0);
   f.insert(f.end(), {0x64, 0});
@@ -1610,6 +1618,199 @@ static void test_station_link() {
   }
 }
 
+// ---- the wireless interface: scan, connect, frames, disconnect, through one fixture of firmware, chip and access point ---------------------------------------------------------
+
+struct FixedRandom final : crypto::IRandom {
+  bool fill(ByteView out) override { for (uint64_t i = 0; i < out.size(); ++i) out[i] = static_cast<uint8_t>(0x40 + i); return true; }
+};
+
+struct WifiFixture {
+  TestAllocator alloc;
+  FakeIwl chip;
+  FakeRxChip rxhw{chip};
+  FakeTxChip txhw{chip}, q4{chip, 4};
+  MemorySource source;
+  TestClock clock;
+  FixedRandom random;
+  linktest::Authenticator ap;
+  std::vector<uint8_t> commands;                        // opcodes seen on the command queue
+  std::vector<Bytes> queue4;                            // frames sent to the access point
+  bool ap_answers_handshake = true;
+  uint32_t phy_actions = 0;                             // PHY context action of the latest PHY command
+  int last_phy_action = 0;
+
+  explicit WifiFixture(const char* ap_passphrase) {
+    source.file = make_loadable_firmware(64, true);
+    source.only = "iwlwifi-9000-pu-b0-jf-b0-40.ucode";
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.regs[iwl_csr::kHwRev / 4] = (0x31u << 4) | 0x1;
+    chip.regs[iwl_csr::kHwRfId / 4] = 0x108u << 12;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    chip.regs[0x388 / 4] = 0x28D24401; chip.regs[0x38C / 4] = 0x00000203;
+    wpa2::derive_pmk(StringView(ap_passphrase), ConstByteView(reinterpret_cast<const uint8_t*>("Home"), 4), ap.pmk);
+    for (int i = 0; i < 32; ++i) ap.anonce[i] = static_cast<uint8_t>(i * 3 + 1);
+    ap.rsn_ie = Bytes{48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 2, 0, 0};
+    for (int i = 0; i < 16; ++i) ap.gtk[i] = static_cast<uint8_t>(0x30 + i);
+    chip.on_alive = [this] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [this] { command_doorbell(); };
+    chip.on_queue_doorbell = [this](uint32_t q) { if (q == 4) data_doorbell(); };
+    chip.on_ring_programmed = [this](uint32_t q) { if (q == 4) q4.read = 0; };           // a new ring starts at the beginning
+  }
+  void deliver_frame(const Bytes& frame, bool decrypted = false) {
+    Bytes g;
+    FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(frame, 6, 50, true, decrypted));
+    rxhw.deliver(g);
+  }
+  void command_doorbell() {
+    bool ok = false;
+    for (const Bytes& c : txhw.process(&ok)) {
+      const uint8_t group = c[1], op = c[0];
+      const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+      commands.push_back(op);
+      Bytes f;
+      if (group == 0x0C && op == 0x02) {
+        FakeRxChip::frame(f, group, op, seq, nvm_info(5, 0x1F, 1));
+      } else if (group == 1 && op == 0x0D) {
+        FakeRxChip::frame(f, group, op, seq, Bytes{1, 0, 0, 0, 0, 0, 0, 0});
+        rxhw.deliver(f);
+        Bytes g;
+        FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Home", 0xA5, true, linktest::kBssid), 6, 50, true));
+        FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Cafe", 2, false), 11, 70, true));
+        rxhw.deliver(g);
+        const uint32_t uid = static_cast<uint32_t>(c[8 + 4] | (c[8 + 5] << 8));
+        Bytes e, h;
+        FakeRxChip::frame(e, 0, 0x0F, 0x8000, Bytes{static_cast<uint8_t>(uid), static_cast<uint8_t>(uid >> 8), 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        rxhw.deliver(e);
+        continue;
+      } else {
+        const uint8_t status = (op == 0x2B) ? 0 : (op == 0x18 || op == 0x17) ? 1 : 0;
+        FakeRxChip::frame(f, group, op, seq, Bytes{status, 0, 0, 0});
+        if (group == 2 && op == 3) FakeRxChip::frame(f, 2, 4, 0x8000, Bytes{1});
+        if (op == 0x08) last_phy_action = c[4 + 4];
+      }
+      rxhw.deliver(f);
+    }
+  }
+  void data_doorbell() {
+    bool ok = false;
+    for (const Bytes& c : q4.process(&ok)) {
+      queue4.push_back(c);
+      const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
+      Bytes resp(48, 0);
+      resp[0] = 1; resp[40] = 1; resp[44] = static_cast<uint8_t>((seq & 0xFF) + 1);
+      Bytes f;
+      FakeRxChip::frame(f, 0, 0x1C, static_cast<uint16_t>(0x8000 | seq), resp);
+      rxhw.deliver(f);
+      const Bytes frame(c.begin() + 60, c.end());
+      const uint16_t fc = static_cast<uint16_t>(frame[0] | (frame[1] << 8));
+      if ((fc & 0x00FC) == 0x00B0) deliver_frame(ap_mgmt_auth());
+      else if ((fc & 0x00FC) == 0x0000) { deliver_frame(ap_assoc_response()); deliver_frame(ap_data(ap.message1(), 0x888E, false)); }
+      else if ((fc & 0x000C) == 0x0008 && !(fc & 0x4000) && frame.size() > 32) {
+        wpa2::EapolKey k;
+        ConstByteView p(frame.data() + 32, frame.size() - 32);
+        if (wpa2::parse_eapol_key(p, &k) && !(k.info & wpa2::kInfoSecure) && ap_answers_handshake && ap.check_message2(Bytes(p.data(), p.data() + p.size())))
+          deliver_frame(ap_data(ap.message3(), 0x888E, false));
+      }
+    }
+  }
+};
+
+static void test_wireless_interface() {
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    WifiFixture fx(scenario == 2 ? "another passphrase" : "hunter2hunter2");
+    IwlWirelessInterface::Inputs in;
+    in.firmware = &fx.source; in.allocator = &fx.alloc; in.clock = &fx.clock; in.random = &fx.random;
+    IwlWirelessInterface wifi(in);
+    CHECK(!wifi.link_up() && wifi.start_scan() == false && wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Failed);       // not started
+    CHECK(wifi.start(fx.chip, true));
+    if (!wifi.link_up() && wifi.failure()[0]) printf("  failure: %s\n", wifi.failure());
+    const MacAddress mac = wifi.mac_address();
+    CHECK(mac.bytes[0] == 0x28 && mac.bytes[1] == 0xD2 && mac.bytes[2] == 0x44 && mac.bytes[3] == 0x01 && mac.bytes[4] == 0x02 && mac.bytes[5] == 0x03);
+    CHECK(wifi.wireless() == &wifi && !wifi.link_up() && wifi.status().state == WifiState::Disconnected);
+    // scan
+    CHECK(wifi.start_scan() && wifi.status().state != WifiState::Connecting);
+    for (int i = 0; i < 20 && wifi.status().state == WifiState::Scanning; ++i) {}
+    WifiNetwork nets[8];
+    uint32_t n = wifi.scan_results(ArrayView<WifiNetwork>(nets, 8));
+    CHECK(n == 2 && strcmp(nets[0].ssid, "Home") == 0 && strcmp(nets[1].ssid, "Cafe") == 0 && nets[0].security == WifiSecurity::Wpa2 && nets[0].channel == 6);
+    // refusals
+    CHECK(wifi.connect(StringView("Nowhere"), StringView("hunter2hunter2")) == WifiResult::NoSuchNetwork);
+    CHECK(wifi.connect(StringView("Home"), StringView("short")) == WifiResult::BadPassphrase);
+    CHECK(wifi.connect(StringView(), StringView()) == WifiResult::InvalidArgument);
+    CHECK(wifi.connect(StringView("Cafe"), StringView()) == WifiResult::Unsupported);                  // WEP
+    // join
+    CHECK(wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Ok);
+    CHECK(wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Busy && !wifi.start_scan());
+    WifiStatus st = wifi.status();
+    if (scenario == 2) {                                                  // the wrong passphrase: the access point never sends message 3
+      CHECK(st.state == WifiState::Connecting && !wifi.link_up());
+      fx.clock.us += 6000000;
+      st = wifi.status();
+      CHECK(st.state == WifiState::Disconnected && st.last_result == WifiResult::BadPassphrase && !wifi.link_up());
+      CHECK(wifi.start_scan());                                           // free to scan and try again
+      wifi.shutdown();
+      CHECK(fx.alloc.dma.empty());
+      continue;
+    }
+    CHECK(st.state == WifiState::Connected && st.last_result == WifiResult::Ok && strcmp(st.network.ssid, "Home") == 0 && wifi.link_up() && wifi.link_speed_mbps() == 24);
+    if (scenario == 1) {
+      // a deauthentication ends the connection
+      fx.deliver_frame(ap_mgmt(0x00C0));
+      st = wifi.status();
+      CHECK(st.state == WifiState::Connected);                            // (the deauthentication frame lacks a reason: dropped as malformed)
+      Bytes de = ap_mgmt(0x00C0); de.insert(de.end(), {7, 0});
+      fx.deliver_frame(de);
+      st = wifi.status();
+      CHECK(st.state == WifiState::Disconnected && st.last_result == WifiResult::Failed && !wifi.link_up());
+      CHECK(wifi.start_scan());
+      wifi.shutdown();
+      CHECK(fx.alloc.dma.empty());
+      continue;
+    }
+    // frames through the interface
+    Bytes eth{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x28, 0xD2, 0x44, 1, 2, 3, 0x08, 0x00, 'h', 'i'};
+    fx.queue4.clear();
+    CHECK(wifi.transmit(ConstByteView(eth.data(), eth.size())));
+    CHECK(fx.queue4.size() == 1 && fx.queue4[0][4 + 17] == 2 && fx.queue4[0][61] == 0x41);
+    CHECK(!wifi.transmit(ConstByteView(eth.data(), 5)));
+    fx.deliver_frame(ap_data(Bytes{'y', 'o'}, 0x0800, true), true);
+    uint8_t buf[64];
+    uint32_t len = 0;
+    CHECK(wifi.receive(ByteView(buf, sizeof buf), &len) && len == 16 && buf[12] == 8 && buf[14] == 'y');
+    CHECK(!wifi.receive(ByteView(buf, sizeof buf), &len));
+    NetworkStatistics ns = wifi.statistics();
+    CHECK(ns.frames_sent == 1 && ns.frames_received == 1 && ns.send_failures == 1);
+    // the network stack over it: DHCP starts when the link comes up
+    {
+      TestClock stack_clock;
+      network::NetworkStack stack(wifi, stack_clock, fx.alloc);
+      CHECK(stack.initialize());
+      stack.set_dhcp_follows_link(true);
+      fx.queue4.clear();
+      stack.poll();                                                        // the link is up: DHCP discover goes out as protected data
+      CHECK(!fx.queue4.empty() && fx.queue4[0][61] == 0x41);
+    }
+    // disconnect: the station and the binding leave the firmware, the link drops, joining again works with the PHY context modified
+    fx.commands.clear();
+    wifi.disconnect();
+    CHECK(wifi.status().state == WifiState::Disconnected && !wifi.link_up());
+    bool removed_station = false, removed_binding = false;
+    for (uint8_t op : fx.commands) { removed_station |= op == 0x19; removed_binding |= op == 0x2B; }
+    CHECK(removed_station && removed_binding);
+    CHECK(!wifi.transmit(ConstByteView(eth.data(), eth.size())));
+    CHECK(wifi.start_scan());
+    for (int i = 0; i < 20 && wifi.status().state == WifiState::Scanning; ++i) {}
+    const WifiResult again = wifi.connect(StringView("Home"), StringView("hunter2hunter2"));
+    if (again != WifiResult::Ok) { printf("  reconnect: %s; commands:", wifi_result_name(again)); for (size_t i = fx.commands.size() > 12 ? fx.commands.size() - 12 : 0; i < fx.commands.size(); ++i) printf(" %02x", fx.commands[i]); printf(" ; taken %u wp %u\n", fx.rxhw.taken, fx.rxhw.write_pointer()); }
+    CHECK(again == WifiResult::Ok);
+    CHECK(fx.last_phy_action == 2);
+    CHECK(wifi.status().state == WifiState::Connected);
+    wifi.shutdown();
+    CHECK(fx.alloc.dma.empty() && !wifi.link_up());
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -1626,6 +1827,7 @@ int main() {
   test_scanner();
   test_link_builders();
   test_station_link();
+  test_wireless_interface();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

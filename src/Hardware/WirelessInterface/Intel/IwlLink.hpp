@@ -58,6 +58,8 @@ class IwlStationLink final : public IWifiLink, public IIwlNotificationHandler {
 
   // The firmware's contexts and queue for `network`. `scanner` must be ready (its station interface exists). False with a message.
   bool prepare(const IwlFirmware& firmware, const IwlNvmData& nvm, const WifiNetwork& network, const char** error);
+  // Takes the access point's station and the binding out of the firmware and frees the queue (a disconnect); release() only drops our side.
+  void teardown();
   void release();
   bool prepared() const { return prepared_; }
 
@@ -92,7 +94,7 @@ class IwlStationLink final : public IWifiLink, public IIwlNotificationHandler {
   WifiNetwork network_;
   uint8_t address_[6] = {};
   uint32_t tx_antennas_ = 1, rx_antennas_ = 1;
-  bool prepared_ = false, have_ptk_ = false;
+  bool prepared_ = false, have_ptk_ = false, phy_added_ = false;
   uint8_t tk_[16] = {};
   uint64_t pn_ = 0;
   uint32_t frames_sent_ = 0, frames_received_ = 0, tx_failures_ = 0;
