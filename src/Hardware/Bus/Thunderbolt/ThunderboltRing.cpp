@@ -38,10 +38,27 @@ void write_shared32(uint32_t* p, uint32_t v) { *static_cast<volatile uint32_t*>(
 uint64_t tb_bus_address(const void* dma_memory) { return reinterpret_cast<uint64_t>(dma_memory); }
 
 void TbNhi::disable_interrupts() {
-  for (uint32_t& m : interrupt_mask_) m = 0;
   const uint32_t hops = hop_count();
-  for (uint32_t i = 0; i < (31 + 2 * hops) / 32; ++i) registers_.write32(tb_reg::kRingInterruptMaskClearBase + i * 4, ~0u);
-  for (uint32_t i = 0; i < (31 + 3 * hops) / 32; ++i) registers_.write32(tb_reg::kRingIntClear + i * 4, ~0u);
+  for (uint32_t& m : interrupt_mask_) m = 0;
+  // (an Intel host interface: the enable registers are written whole, and reading a notify register clears what it holds - nhi.c's QUIRK_AUTO_CLEAR_INT)
+  for (uint32_t i = 0; i < (31 + 2 * hops) / 32 && i < 64; ++i) registers_.write32(tb_reg::kRingInterruptBase + i * 4, 0);
+  for (uint32_t i = 0; i < (31 + 3 * hops) / 32 && i < 96; ++i) registers_.read32(tb_reg::kRingNotifyBase + i * 4);
+}
+
+int TbNhi::allocate_hop(bool transmit) {
+  const uint32_t hops = hop_count();
+  uint32_t* used = hops_used_[transmit ? 1 : 0];
+  for (uint32_t hop = 1; hop < hops && hop < 1024; ++hop) {
+    if (used[hop / 32] >> (hop % 32) & 1) continue;
+    used[hop / 32] |= 1u << (hop % 32);
+    return static_cast<int>(hop);
+  }
+  return -1;
+}
+
+void TbNhi::release_hop(bool transmit, uint32_t hop) {
+  if (hop == 0 || hop >= 1024) return;
+  hops_used_[transmit ? 1 : 0][hop / 32] &= ~(1u << (hop % 32));
 }
 
 void TbNhi::set_control_interrupts(bool on) {
@@ -51,13 +68,9 @@ void TbNhi::set_control_interrupts(bool on) {
   for (uint32_t index : indexes) {
     const uint32_t reg = index / 32, bit = 1u << (index % 32);
     if (reg >= 64) continue;
-    if (on) {
-      interrupt_mask_[reg] |= bit;
-      registers_.write32(tb_reg::kRingInterruptBase + reg * 4, interrupt_mask_[reg]);
-    } else {
-      interrupt_mask_[reg] &= ~bit;
-      registers_.write32(tb_reg::kRingInterruptMaskClearBase + reg * 4, bit);
-    }
+    if (on) interrupt_mask_[reg] |= bit;
+    else interrupt_mask_[reg] &= ~bit;
+    registers_.write32(tb_reg::kRingInterruptBase + reg * 4, interrupt_mask_[reg]);
   }
 }
 
@@ -97,25 +110,41 @@ TbMailboxResult TbNhi::mailbox(uint32_t command, uint32_t data, uint32_t timeout
 }
 
 bool TbRing::start(uint32_t frame_bytes, uint16_t sof_mask, uint16_t eof_mask) {
+  if (frame_bytes != 0 && (frame_bytes < 256 || frame_bytes > 4095)) return false;
+  Mode mode;
+  mode.frame = false;
+  return start_ring(mode, frame_bytes, sof_mask, eof_mask);
+}
+
+bool TbRing::start(const Mode& mode, uint16_t sof_mask, uint16_t eof_mask) { return start_ring(mode, 0, sof_mask, eof_mask); }
+
+bool TbRing::start_ring(const Mode& mode, uint32_t frame_bytes, uint16_t sof_mask, uint16_t eof_mask) {
   stop();
-  if (size_ < 2 || size_ > 0xFFFF || (frame_bytes != 0 && (frame_bytes < 256 || frame_bytes > 4095))) return false;
+  if (size_ < 2 || size_ > 0xFFFF) return false;
   descriptors_ = allocate_dma_view<uint32_t>(allocator_, static_cast<uint64_t>(size_) * (kDescriptorBytes / 4), 16);
   if (descriptors_.size() == 0) return false;
   descriptors_.fill(0);
   head_ = tail_ = 0;
+  frame_mode_ = mode.frame;
   const uint32_t base = ring_base(), options = options_base();
   const uint64_t bus = tb_bus_address(descriptors_.data());
   registers_.write32(base + 0, static_cast<uint32_t>(bus));
   registers_.write32(base + 4, static_cast<uint32_t>(bus >> 32));
+  // (a frame size of zero means 4096; the raw mode wants the smallest, 256)
   if (transmit_) {
     registers_.write32(base + 12, size_);
     registers_.write32(options + 4, 0);
   } else {
-    // (the raw mode wants the smallest frame size field: 256 bytes)
-    registers_.write32(base + 12, (frame_bytes << 16) | size_);
+    registers_.write32(base + 12, ((mode.frame ? 0 : frame_bytes) << 16) | size_);
     registers_.write32(options + 4, (static_cast<uint32_t>(sof_mask) << 16) | eof_mask);
   }
-  registers_.write32(options + 0, tb_reg::kRingFlagEnable | tb_reg::kRingFlagRaw);
+  uint32_t flags = tb_reg::kRingFlagEnable | (mode.frame ? 0 : tb_reg::kRingFlagRaw);
+  registers_.write32(options + 0, flags);
+  // end to end flow control is switched on once the ring is valid
+  if (mode.e2e) {
+    if (!transmit_) flags |= (mode.e2e_tx_hop << tb_reg::kRxOptionsE2eHopShift) & tb_reg::kRxOptionsE2eHopMask;
+    registers_.write32(options + 0, flags | tb_reg::kRingFlagE2eFlowControl);
+  }
   return true;
 }
 
@@ -146,8 +175,8 @@ bool TbRing::post(uint64_t bus, uint32_t word) {
 }
 
 bool TbRing::post_transmit(uint64_t bus, uint32_t bytes, uint8_t sof, uint8_t eof) {
-  if (!transmit_ || bytes == 0 || bytes > 4095) return false;
-  // length 12 bits, EOF 4, SOF 4, flags 12
+  if (!transmit_ || bytes == 0 || bytes > 4096) return false;
+  // length 12 bits (zero for 4096), EOF 4, SOF 4, flags 12
   return post(bus, (bytes & 0xFFF) | (static_cast<uint32_t>(eof & 0xF) << 12) | (static_cast<uint32_t>(sof & 0xF) << 16) | (static_cast<uint32_t>(kDescPosted | kDescInterrupt) << 20));
 }
 
@@ -163,6 +192,7 @@ bool TbRing::poll(TbCompletion* out) {
   const uint16_t flags = static_cast<uint16_t>(word >> 20);
   if (!(flags & kDescCompleted)) return false;
   out->length = word & 0xFFF;
+  if (frame_mode_ && !transmit_ && out->length == 0) out->length = 4096;
   out->eof = static_cast<uint8_t>((word >> 12) & 0xF);
   out->sof = static_cast<uint8_t>((word >> 16) & 0xF);
   out->flags = flags;

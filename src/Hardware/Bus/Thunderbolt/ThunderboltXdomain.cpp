@@ -271,16 +271,23 @@ const TbPropertyEntry* tb_properties_find(const List<TbPropertyEntry>& entries, 
 }
 
 bool tb_properties_build_local(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name, List<uint32_t>& out) {
+  return tb_properties_build_local(vendor_id, device_id, device_revision, vendor_name, device_name, false, 0, out);
+}
+
+bool tb_properties_build_local(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name, bool offer_network, uint32_t network_flags,
+                               List<uint32_t>& out) {
   struct Item {
     const char* key;
     const char* text;               // nullptr: a value
     uint32_t value;
+    bool directory;
   };
-  const Item items[] = {{"vendorid", nullptr, vendor_id}, {"vendorid", vendor_name, 0}, {"deviceid", nullptr, device_id}, {"deviceid", device_name, 0}, {"devicerv", nullptr, device_revision}};
-  constexpr uint32_t n = sizeof items / sizeof items[0];
   // (a value and a text may share a key: they are told apart by their type, as Linux does)
+  const Item items[] = {{"vendorid", nullptr, vendor_id, false}, {"vendorid", vendor_name, 0, false}, {"deviceid", nullptr, device_id, false}, {"deviceid", device_name, 0, false},
+                        {"devicerv", nullptr, device_revision, false}, {"network", nullptr, 0, true}};
+  const uint32_t n = offer_network ? 6 : 5;
   out.clear();
-  uint32_t data_words = 0, text_words[n] = {};
+  uint32_t data_words = 0, text_words[6] = {};
   for (uint32_t i = 0; i < n; ++i) {
     if (!items[i].text) continue;
     uint32_t len = 0;
@@ -288,19 +295,28 @@ bool tb_properties_build_local(uint32_t vendor_id, uint32_t device_id, uint32_t 
     text_words[i] = (len + 1 + 3) / 4;
     data_words += text_words[i];
   }
-  const uint32_t total = 2 + 4 * n + data_words;
+  // a directory follows the root's data, after a word of padding: its UUID (4 words) and four entries
+  constexpr uint32_t kDirectoryWords = 4 + 4 * 4;
+  const uint32_t root_words = 2 + 4 * n + data_words;
+  const uint32_t total = root_words + (offer_network ? 1 + kDirectoryWords : 0);
   if (total > tb_xdp::kMaxBlockWords || !out.reserve(total)) return false;
   for (uint32_t i = 0; i < total; ++i) out.push_back(0);
   out[0] = kRootMagic;
   out[1] = 4 * n;
+  auto key_words = [&](uint32_t at, const char* key) {
+    uint8_t k[8] = {};
+    for (uint32_t i = 0; i < 8 && key[i] != 0; ++i) k[i] = static_cast<uint8_t>(key[i]);
+    out[at] = (uint32_t{k[0]} << 24) | (uint32_t{k[1]} << 16) | (uint32_t{k[2]} << 8) | k[3];
+    out[at + 1] = (uint32_t{k[4]} << 24) | (uint32_t{k[5]} << 16) | (uint32_t{k[6]} << 8) | k[7];
+  };
   uint32_t data_at = 2 + 4 * n;
   for (uint32_t i = 0; i < n; ++i) {
     const uint32_t at = 2 + 4 * i;
-    uint8_t key[8] = {};
-    for (uint32_t k = 0; k < 8 && items[i].key[k] != 0; ++k) key[k] = static_cast<uint8_t>(items[i].key[k]);
-    out[at] = (uint32_t{key[0]} << 24) | (uint32_t{key[1]} << 16) | (uint32_t{key[2]} << 8) | key[3];
-    out[at + 1] = (uint32_t{key[4]} << 24) | (uint32_t{key[5]} << 16) | (uint32_t{key[6]} << 8) | key[7];
-    if (!items[i].text) {
+    key_words(at, items[i].key);
+    if (items[i].directory) {
+      out[at + 2] = kDirectoryWords | (0x44u << 24);
+      out[at + 3] = root_words + 1;
+    } else if (!items[i].text) {
       out[at + 2] = 1u | (0x76u << 24);
       out[at + 3] = items[i].value;
     } else {
@@ -312,6 +328,19 @@ bool tb_properties_build_local(uint32_t vendor_id, uint32_t device_id, uint32_t 
         if (c == 0) break;
       }
       data_at += text_words[i];
+    }
+  }
+  if (offer_network) {
+    // (c66189ca-1cce-4195-bdb8-49592e5f5a4f: the 16 bytes copied into the block as they are, so each word is the little endian value of four of them)
+    const uint32_t uuid[4] = {0xCA8961C6u, 0x9541CE1Cu, 0x5949B8BDu, 0x4F5A5F2Eu};
+    const uint32_t dir = root_words + 1;
+    for (uint32_t i = 0; i < 4; ++i) out[dir + i] = uuid[i];
+    const struct { const char* key; uint32_t value; } props[4] = {{"prtcid", 1}, {"prtcvers", 1}, {"prtcrevs", 1}, {"prtcstns", network_flags}};
+    for (uint32_t i = 0; i < 4; ++i) {
+      const uint32_t at = dir + 4 + 4 * i;
+      key_words(at, props[i].key);
+      out[at + 2] = 1u | (0x76u << 24);
+      out[at + 3] = props[i].value;
     }
   }
   return true;
