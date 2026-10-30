@@ -166,7 +166,7 @@ class VirglImage final : public IImage {
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
     color_format_ = desc.format == Format::R32G32B32A32Float ? virgl::kFormatR32G32B32A32Float : desc.format == Format::R16G16B16A16Float ? virgl::kFormatR16G16B16A16Float
-                    : desc.format == Format::R16G16B16A16Unorm ? virgl::kFormatR16G16B16A16Unorm : desc.format == Format::B8G8R8A8Srgb ? virgl::kFormatB8G8R8A8Srgb : virgl::kFormatB8G8R8A8Unorm;
+                    : desc.format == Format::R16G16B16A16Unorm ? virgl::kFormatR16G16B16A16Unorm : desc.format == Format::R32G32B32A32Uint ? virgl::kFormatR32G32B32A32Uint : desc.format == Format::B8G8R8A8Srgb ? virgl::kFormatB8G8R8A8Srgb : virgl::kFormatB8G8R8A8Unorm;
     const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
@@ -631,7 +631,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   }
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
-  if (desc.format == Format::R32G32B32A32Uint || desc.format == Format::R8G8B8A8Srgb) return nullptr;   // (no integer formats here, and only BGRA colour)
+  if (desc.format == Format::R8G8B8A8Srgb) return nullptr;   // (only BGRA sRGB colour)
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && !is_wide_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
