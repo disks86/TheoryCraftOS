@@ -38,11 +38,11 @@ namespace hardware {
 
 namespace tb_icm {
 // icm_pkg_code
-constexpr uint8_t kGetTopology = 0x1, kDriverReady = 0x3, kApproveDevice = 0x4, kChallengeDevice = 0x5, kAddDeviceKey = 0x6, kGetRoute = 0xA, kApproveXdomain = 0x10, kDisconnectXdomain = 0x11;
+constexpr uint8_t kPrebootAcl = 0x18, kGetTopology = 0x1, kDriverReady = 0x3, kApproveDevice = 0x4, kChallengeDevice = 0x5, kAddDeviceKey = 0x6, kGetRoute = 0xA, kApproveXdomain = 0x10, kDisconnectXdomain = 0x11;
 // icm_event_code
 constexpr uint8_t kEventDeviceConnected = 0x3, kEventDeviceDisconnected = 0x4, kEventXdomainConnected = 0x6, kEventXdomainDisconnected = 0x7, kEventRtd3Veto = 0xA;
 // the header's flags
-constexpr uint8_t kFlagError = 1u << 0, kFlagNoKey = 1u << 1, kFlagDualLane = 1u << 5, kFlagRtd3 = 1u << 6, kFlagSpeedGen3 = 1u << 7;
+constexpr uint8_t kFlagWrite = 1u << 7, kFlagError = 1u << 0, kFlagNoKey = 1u << 1, kFlagDualLane = 1u << 5, kFlagRtd3 = 1u << 6, kFlagSpeedGen3 = 1u << 7;
 constexpr uint32_t kFlagSecurityShift = 3, kFlagSecurityMask = 3u << 3;
 // link_info
 constexpr uint16_t kLinkMask = 0x7, kDepthMask = 0xF0, kApproved = 1u << 8, kRejected = 1u << 9, kBoot = 1u << 10;
@@ -64,6 +64,16 @@ struct TbDriverReady {
   TbSecurityLevel security = TbSecurityLevel::Unknown;
   uint32_t boot_acl_entries = 0;      // 0 if the firmware has no preboot ACL
   bool rtd3 = false;
+};
+
+// An entry of the preboot ACL: the unique id of a device the firmware lets connect before the operating system runs (all zero: an empty entry). The firmware keeps the low 64 bits; the high 64 are
+// always ones for a device that is listed.
+struct TbUuid {
+  uint8_t bytes[16] = {};
+  bool is_null() const {
+    for (const uint8_t b : bytes) if (b != 0) return false;
+    return true;
+  }
 };
 
 // A device the firmware reports.
@@ -118,6 +128,10 @@ uint32_t build_approve_xdomain(const TbXDomain& xd, uint16_t transmit_path, uint
 uint32_t build_approve_xdomain_tr(const TbXDomain& xd, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, ByteView out);
 uint32_t build_disconnect_xdomain_tr(const TbXDomain& xd, uint8_t stage, ByteView out);
 uint32_t build_get_topology(ByteView out);
+// ICM_PREBOOT_ACL, 16 entries of 8 bytes: a read asks, a write sends `entries` (empty ones as all ones; false if a listed one does not have ones in its high half). The answer to both has the list.
+constexpr uint32_t kPrebootAclEntries = 16, kPrebootAclBytes = 4 + kPrebootAclEntries * 8;
+uint32_t build_preboot_acl(bool write, ArrayView<const TbUuid> entries, ByteView out);
+bool parse_preboot_acl(ConstByteView response, ArrayView<TbUuid> entries);
 bool parse_topology_packet(ConstByteView packet, TbTopologySwitch* out);
 uint32_t build_driver_ready(ByteView out);
 bool parse_driver_ready(ConstByteView response, TbDriverReady* out);
@@ -248,6 +262,11 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // lost its key (or a different device with the same UUID) fails the challenge and stays unapproved. A device can only be approved after the one it hangs from.
   void set_secure(crypto::IRandom* random, ITbKeyStore* keys) { random_ = random; keys_ = keys; }
   bool approve_secure(uint64_t index, const char** error);
+  // The preboot ACL (Alpine Ridge and Titan Ridge firmware that has one; the count is driver_ready().boot_acl_entries): the devices the firmware connects before the operating system starts, which
+  // is how a docking station works at the boot menu. `get` fills as many of `entries` as there are in the list (empty ones are null); `set` replaces the whole list (a shorter one is padded with empty
+  // entries). Whether a device is in it is reported by the device's `boot` flag. The firmware also fills the list itself from the approved devices when the system sleeps (save_devices).
+  bool get_boot_acl(ArrayView<TbUuid> entries, const char** error);
+  bool set_boot_acl(ArrayView<const TbUuid> entries, const char** error);
   // The route string of the device (ICM_GET_ROUTE).
   bool route(uint64_t index, uint64_t* route);
   // The topology the firmware reports (GET_TOPOLOGY, an answer of up to 14 packets): `out` gets one entry per packet.

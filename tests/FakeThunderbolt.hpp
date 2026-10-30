@@ -150,6 +150,11 @@ class FakeNhi final : public hardware::ITbRegisters {
   bool firmware_comes_up_on_reset = true;    // a CIO reset after the ARC was told to wait for it starts the firmware
   uint32_t cio_resets = 0;
   uint32_t interrupt_mask_writes = 0, interrupt_clear_writes = 0;
+  uint32_t boot_acl_entries = 0;                   // the firmware keeps a preboot ACL of this many entries (0: none)
+  uint32_t acl[32] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                      0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  bool acl_error = false;                          // the ACL requests end with the error flag
+  uint32_t acl_writes = 0;
   std::function<void()> raise_interrupt;           // the MSI: called when a ring that is unmasked completes something
   uint32_t notify_reads = 0, interrupts_raised = 0;
   uint32_t unmasked[64] = {};                      // the interrupt enable registers as the host left them
@@ -521,8 +526,9 @@ private:
     if (code == 3) {
       if (!answer_driver_ready) return;
       const uint32_t hdr = 3u | ((rtd3 ? 0x40u : 0u) << 8) | (1u << 24);
-      if (titan_ridge) reply(kIcmResponse, {hdr, (security & 0x7u) << 16, 0x00100002u, 0x15EBu});
-      else reply(kIcmResponse, {hdr, 5u | (7u << 8) | ((security & 0xFu) << 16)});
+      const uint32_t acl_info = boot_acl_entries ? ((boot_acl_entries << 7) | (titan_ridge ? 0u : (1u << 13))) : 0u;
+      if (titan_ridge) reply(kIcmResponse, {hdr, ((security & 0x7u) | acl_info) << 16, 0x00100002u, 0x15EBu});
+      else reply(kIcmResponse, {hdr, 5u | (7u << 8) | (((security & 0xFu) | acl_info) << 16)});
     } else if (code == 4 && w.size() >= (titan_ridge ? 8u : 6u)) {
       Device d;
       memcpy(d.uuid, &w[1], 16);
@@ -595,6 +601,18 @@ private:
         for (int port = 0; port < 16; ++port) out[6 + port] = topology[i].ports[port];
         reply(kIcmResponse, out);
       }
+    } else if (code == 0x18 && w.size() >= 33) {
+      acl_writes += (w[0] >> 8) & 0x80 ? 1 : 0;
+      if (acl_error) {
+        reply(kIcmResponse, {0x18u | (1u << 8) | (1u << 24)});
+        return;
+      }
+      if ((w[0] >> 8) & 0x80)
+        for (int i = 0; i < 32; ++i) acl[i] = w[1 + i];
+      std::vector<uint32_t> out(33);
+      out[0] = 0x18u | (1u << 24);
+      for (int i = 0; i < 32; ++i) out[1 + i] = acl[i];
+      reply(kIcmResponse, out);
     } else if (code == 0xA && w.size() >= 2) {
       if (!answer_get_route) return;
       reply(kIcmResponse, {0xAu | (1u << 24), w[1], static_cast<uint32_t>(route_answer >> 32), static_cast<uint32_t>(route_answer)});

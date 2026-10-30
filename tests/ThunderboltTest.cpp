@@ -2494,6 +2494,95 @@ static void test_driver() {
   CHECK(alloc.dma.empty());
 }
 
+// ---- the preboot ACL
+
+static TbUuid acl_uuid(uint8_t seed, bool device = true) {
+  TbUuid u;
+  for (uint32_t i = 0; i < 8; ++i) u.bytes[i] = static_cast<uint8_t>(seed + i);
+  for (uint32_t i = 8; i < 16; ++i) u.bytes[i] = device ? 0xFF : 0x12;
+  return u;
+}
+
+static void test_boot_acl() {
+  uint8_t bytes[tb_icm::kPrebootAclBytes];
+  TbUuid list[3] = {acl_uuid(0x10), TbUuid(), acl_uuid(0x30)};
+  // the messages: 4 + 16 * 8 bytes, the write flag only on a write, an empty entry (and the rest of a short list) all ones
+  CHECK(tb_icm::build_preboot_acl(false, ArrayView<const TbUuid>(), ByteView(bytes, sizeof bytes)) == 132 && bytes[0] == 0x18 && bytes[1] == 0 && bytes[4] == 0xFF && bytes[131] == 0xFF);
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(list, 3), ByteView(bytes, sizeof bytes)) == 132 && bytes[0] == 0x18 && bytes[1] == 0x80);
+  CHECK(bytes[4] == 0x10 && bytes[11] == 0x17 && bytes[12] == 0xFF && bytes[19] == 0xFF && bytes[20] == 0x30 && bytes[28] == 0xFF && bytes[131] == 0xFF);
+  uint8_t small[100];
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(list, 3), ByteView(small, sizeof small)) == 0);                 // too small a buffer
+  const TbUuid not_a_device = acl_uuid(0x50, false);
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(&not_a_device, 1), ByteView(bytes, sizeof bytes)) == 0);          // the high half has to be ones
+  std::vector<TbUuid> too_many(17, acl_uuid(1));
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(too_many.data(), too_many.size()), ByteView(bytes, sizeof bytes)) == 0);
+  // reading an answer: ones and zeros are empty, the others get their high half
+  CHECK(tb_icm::build_preboot_acl(true, ArrayView<const TbUuid>(list, 3), ByteView(bytes, sizeof bytes)) == 132);
+  memset(&bytes[4 + 3 * 8], 0, 8);                                                                                             // (an all zero entry is empty too)
+  TbUuid got[16];
+  CHECK(tb_icm::parse_preboot_acl(ConstByteView(bytes, sizeof bytes), ArrayView<TbUuid>(got, 16)));
+  CHECK(memcmp(got[0].bytes, list[0].bytes, 16) == 0 && got[1].is_null() && memcmp(got[2].bytes, list[2].bytes, 16) == 0 && got[3].is_null() && got[15].is_null());
+  TbUuid few[2];
+  CHECK(tb_icm::parse_preboot_acl(ConstByteView(bytes, sizeof bytes), ArrayView<TbUuid>(few, 2)) && memcmp(few[0].bytes, list[0].bytes, 16) == 0);   // (only as many as asked for)
+  for (uint32_t cut = 0; cut < sizeof bytes; cut += 7) CHECK(!tb_icm::parse_preboot_acl(ConstByteView(bytes, cut), ArrayView<TbUuid>(got, 16)));    // truncated
+  for (uint32_t bit = 0; bit < sizeof bytes * 8; bit += 5) {                                                                   // bit flips never read outside or crash
+    uint8_t flipped[sizeof bytes];
+    memcpy(flipped, bytes, sizeof bytes);
+    flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    tb_icm::parse_preboot_acl(ConstByteView(flipped, sizeof flipped), ArrayView<TbUuid>(got, 16));
+  }
+
+  // against the firmware: Alpine Ridge and Titan Ridge forms
+  for (const bool titan : {false, true}) {
+    TestAllocator alloc;
+    FakeNhi chip;
+    chip.titan_ridge = titan;
+    chip.boot_acl_entries = 16;
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.generation = titan ? TbGeneration::TitanRidge : TbGeneration::AlpineRidge;
+    icm.set_options(options);
+    const char* error = nullptr;
+    TbUuid entries[16];
+    CHECK(!icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && error);                                                // not started
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.driver_ready().boot_acl_entries == 16);
+    CHECK(icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error));
+    for (const TbUuid& e : entries) CHECK(e.is_null());                                                                          // (a fresh firmware has none)
+    CHECK(icm.set_boot_acl(ArrayView<const TbUuid>(list, 3), &error) && chip.acl_writes == 1);
+    CHECK(chip.acl[0] == 0x13121110u && chip.acl[1] == 0x17161514u && chip.acl[2] == 0xFFFFFFFFu && chip.acl[4] == 0x33323130u && chip.acl[6] == 0xFFFFFFFFu);
+    TbUuid back[4];
+    CHECK(icm.get_boot_acl(ArrayView<TbUuid>(back, 4), &error) && memcmp(back[0].bytes, list[0].bytes, 16) == 0 && back[1].is_null() && memcmp(back[2].bytes, list[2].bytes, 16) == 0 && back[3].is_null());
+    CHECK(icm.set_boot_acl(ArrayView<const TbUuid>(), &error) && icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && entries[0].is_null());     // cleared
+    CHECK(!icm.set_boot_acl(ArrayView<const TbUuid>(too_many.data(), 17), &error) && error);
+    CHECK(!icm.set_boot_acl(ArrayView<const TbUuid>(&not_a_device, 1), &error) && error);
+    chip.acl_error = true;
+    CHECK(!icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && error && !icm.set_boot_acl(ArrayView<const TbUuid>(list, 3), &error));
+    chip.acl_error = false;
+    chip.answer_driver_ready = true;
+  }
+  {   // a firmware without one
+    TestAllocator alloc;
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.driver_ready().boot_acl_entries == 0);
+    const char* error = nullptr;
+    TbUuid entries[16];
+    CHECK(!icm.get_boot_acl(ArrayView<TbUuid>(entries, 16), &error) && error && !icm.set_boot_acl(ArrayView<const TbUuid>(entries, 1), &error));
+  }
+  {   // a shorter list than the firmware keeps is refused when it is longer than the firmware's
+    TestAllocator alloc;
+    FakeNhi chip;
+    chip.boot_acl_entries = 4;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    const char* error = nullptr;
+    TbUuid five[5] = {acl_uuid(1), acl_uuid(2), acl_uuid(3), acl_uuid(4), acl_uuid(5)};
+    CHECK(!icm.set_boot_acl(ArrayView<const TbUuid>(five, 5), &error) && icm.set_boot_acl(ArrayView<const TbUuid>(five, 4), &error));
+    TbUuid out[16];
+    CHECK(icm.get_boot_acl(ArrayView<TbUuid>(out, 16), &error) && !out[3].is_null() && out[4].is_null());
+  }
+}
+
 int main() {
   test_devices();
   test_framing();
@@ -2504,6 +2593,7 @@ int main() {
   test_icm_start();
   test_device_events();
   test_approve();
+  test_boot_acl();
   test_garbage();
   test_cio();
   test_firmware_start();
