@@ -261,6 +261,12 @@ struct FragmentContext {
   Vec4 position;
   bool front_facing = true;
   uint32_t primitive_id = 0;
+  // Derivatives (ddx / ddy): the pixel is one of the four of a 2 x 2 quad (`quad_corner`: x & 1 | (y & 1) << 1), and `quad_fn` gives the varyings and the position of any corner, at its
+  // pixel's centre, extended out of the primitive if it is not covered. A shader asks only when it takes a derivative; without the function (points, lines) the derivatives are zero.
+  using QuadFn = void (*)(const void* user, uint32_t corner, Vec4* varyings, Vec4* position);
+  QuadFn quad_fn = nullptr;
+  const void* quad_user = nullptr;
+  uint32_t quad_corner = 0;
 };
 using VertexShaderFnEx = void (*)(const Vec4* attributes, const uint8_t* constants, const VertexContext& context, ShaderIo* out);
 using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext& context, const uint8_t* constants, const ITextureSet& textures, Vec4* color);

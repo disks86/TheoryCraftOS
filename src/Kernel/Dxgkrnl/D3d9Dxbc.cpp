@@ -470,6 +470,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       {41, kIShl, 2, false}, {42, kIShr, 2, false}, {85, kUShr, 2, false}, {1, kAnd, 2, false}, {60, kOr, 2, false}, {87, kXor, 2, false}, {59, kNot, 1, false},
       {27, kFtoI, 1, false}, {28, kFtoU, 1, false}, {43, kItoF, 1, false}, {86, kUtoF, 1, false}, {32, kIEq, 2, false}, {39, kINe, 2, false}, {34, kILt, 2, false}, {33, kIGe, 2, false},
       {79, kULt, 2, false}, {80, kUGe, 2, false},
+      // derivatives (Shader Model 4 has the one kind: fine here)
+      {11, kDdx, 1, false}, {12, kDdy, 1, false}, {122, kDdxCoarse, 1, false}, {123, kDdx, 1, false}, {124, kDdyCoarse, 1, false}, {125, kDdy, 1, false},
   };
 
   List<uint32_t> open_ifs(allocator);

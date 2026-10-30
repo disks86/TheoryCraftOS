@@ -5270,6 +5270,55 @@ void test_dxil() {
       }
     }
   }
+  // Derivatives (ddx_fine / ddy_fine / ddx_coarse / ddy_coarse): the varyings are a plane over the quad, so each corner's are the first corner's plus its steps; the golden takes the
+  // difference of the same function at the corners of the pair.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_deriv.dxil", &translated));
+    if (translated) {
+      struct Plane {
+        graphics::Vec4 origin[4], step_x[4], step_y[4];
+        graphics::Vec4 at(uint32_t i, uint32_t corner) const {
+          const float fx = static_cast<float>(corner & 1), fy = static_cast<float>(corner >> 1);
+          return {origin[i].x + step_x[i].x * fx + step_y[i].x * fy, origin[i].y + step_x[i].y * fx + step_y[i].y * fy, origin[i].z + step_x[i].z * fx + step_y[i].z * fy,
+                  origin[i].w + step_x[i].w * fx + step_y[i].w * fy};
+        }
+      };
+      for (uint32_t n = 0; n < 200; ++n) {
+        Plane plane = {};
+        for (uint32_t i = 0; i < 4; ++i) {
+          plane.origin[i] = {random(-1, 1), random(-1, 1), random(-1, 1), random(-1, 1)};
+          plane.step_x[i] = {random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f)};
+          plane.step_y[i] = {random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f)};
+        }
+        const uint32_t own = n % 4;
+        graphics::FragmentContext context;
+        context.quad_corner = own;
+        context.quad_user = &plane;
+        context.quad_fn = [](const void* user, uint32_t corner, graphics::Vec4* varyings, graphics::Vec4* position) {
+          const Plane& p = *static_cast<const Plane*>(user);
+          for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
+          *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
+        };
+        graphics::Vec4 varyings[4];
+        for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        auto f = [&](uint32_t corner) {
+          const graphics::Vec4 c = plane.at(0, corner), t = plane.at(2, corner);
+          return c.x * c.y + t.x * t.x;
+        };
+        const uint32_t row = own & 2, col = own & 1;
+        const float want[4] = {f(row + 1) - f(row), f(col + 2) - f(col),
+                               plane.at(0, 1).z * plane.at(0, 1).z - plane.at(0, 0).z * plane.at(0, 0).z,
+                               plane.at(0, 2).w + plane.at(2, 2).y * plane.at(2, 2).y - plane.at(0, 0).w - plane.at(2, 0).y * plane.at(2, 0).y};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 4) printf("  deriv #%u (corner %u): %g %g %g %g wants %g %g %g %g\n", n, own, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;

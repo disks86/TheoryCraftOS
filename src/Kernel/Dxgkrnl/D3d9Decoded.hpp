@@ -35,6 +35,7 @@ enum Opcode : uint16_t {
   // Instructions of Shader Model 4 (DXBC, see D3d9Dxbc.cpp) that Direct3D 9 has no token for. Booleans are 1.0 / 0.0 here, not all-ones masks: the front end only takes shaders that use
   // them to select (movc, if, discard).
   kDiv = 0x1000, kSqrt, kSeq, kSne, kDp2, kFloor, kCeil, kTrunc, kRoundNe, kSin, kCos, kSelect, kIfNz, kIfZ, kDiscardNz, kDiscardZ,
+  kDdx, kDdy, kDdxCoarse, kDdyCoarse,   // (derivatives over the 2 x 2 quad: fine takes the pair of the pixel's own row or column, coarse the quad's first)
   // Integer and bitwise instructions: the 32 bits of a register component are the integer (the interpreter keeps them in the float's bits), comparisons give all ones or zero.
   kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe,
   kIntegerFirst = kIAdd, kIntegerLast = kUGe,

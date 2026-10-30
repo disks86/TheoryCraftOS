@@ -935,6 +935,18 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       context.position = {px, py, z, b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w};
       context.front_facing = front;
       context.primitive_id = s.primitive_id;
+      // (the corners of the pixel's quad for the derivatives: the varyings, and depth and 1 / w, of the plane of the triangle at the corner's centre)
+      auto quad_source = [&](uint32_t corner, Vec4* out_varyings, Vec4* out_position) {
+        const float qx = static_cast<float>(x & ~1) + 0.5f + static_cast<float>(corner & 1), qy = static_cast<float>(y & ~1) + 0.5f + static_cast<float>(corner >> 1);
+        varyings_at(qx, qy, out_varyings);
+        const float l0 = -((qx - v1->x) * e0dy - (qy - v1->y) * e0dx), l1 = -((qx - v2->x) * e1dy - (qy - v2->y) * e1dx), l2 = -((qx - v0->x) * e2dy - (qy - v0->y) * e2dx);
+        const float a0 = l0 * inv_area, a1 = l1 * inv_area, a2 = l2 * inv_area;
+        *out_position = {qx, qy, a0 * v0->z + a1 * v1->z + a2 * v2->z, a0 * v0->inv_w + a1 * v1->inv_w + a2 * v2->inv_w};
+      };
+      using QuadSource = decltype(quad_source);
+      context.quad_fn = [](const void* user, uint32_t corner, Vec4* out_varyings, Vec4* out_position) { (*static_cast<const QuadSource*>(user))(corner, out_varyings, out_position); };
+      context.quad_user = &quad_source;
+      context.quad_corner = static_cast<uint32_t>(x & 1) | static_cast<uint32_t>(y & 1) << 1;
       if (!run_fragment_shader(s, varying, context, color)) continue;
       if (pd.alpha_to_coverage && pd.multisample && sample_count > 1) {
         // (the first round(alpha * samples) samples of the pixel keep what they covered)

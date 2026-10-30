@@ -70,7 +70,7 @@ enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
   kCBufferLoadLegacy = 59, kSample = 60, kSampleLevel = 62, kTextureGather = 73, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
-  kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
+  kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
 };
 
 class Translator {
@@ -1644,6 +1644,10 @@ bool Translator::dx_call(const Instruction& ins) {
     case 8: case 9: case 10: return classify(ins, static_cast<uint32_t>(opcode));
     case 14: case 18: case 19: case 20: return trig(ins, static_cast<uint32_t>(opcode));
     case 15: case 16: case 17: return inverse_trig(ins, static_cast<uint32_t>(opcode));
+    case kDerivCoarseX: return unary(ins, 122, 1);
+    case kDerivCoarseY: return unary(ins, 124, 1);
+    case kDerivFineX: return unary(ins, 123, 1);
+    case kDerivFineY: return unary(ins, 125, 1);
     case kFAbs: return unary(ins, 54, 1, 2);
     case kSaturate: return unary(ins, 54, 1, 0, true);
     case kSin: return sincos(ins, false);

@@ -612,6 +612,10 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kSne: simple = "SNE", sources = 2; break;
     case kDp2: simple = "DP2", sources = 2; break;
     case kFloor: simple = "FLR", sources = 1; break;
+    case kDdx: simple = "DDX_FINE", sources = 1; break;
+    case kDdy: simple = "DDY_FINE", sources = 1; break;
+    case kDdxCoarse: simple = "DDX", sources = 1; break;
+    case kDdyCoarse: simple = "DDY", sources = 1; break;
     case kCeil: simple = "CEIL", sources = 1; break;
     case kTrunc: simple = "TRUNC", sources = 1; break;
     case kRoundNe: simple = "ROUND", sources = 1; break;
