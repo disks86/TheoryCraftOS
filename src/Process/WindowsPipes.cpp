@@ -363,6 +363,14 @@ uint32_t pipe_set_information(Process& p, uint64_t slot, uint32_t info_class, ui
   return kSuccess;
 }
 
+bool pipe_handle_name(Process& p, uint64_t slot, String* name) {
+  ObjectManager* objects = system_objects();
+  if (!objects || p.files().kind(slot) != DescriptorKind::Pipe) return false;
+  char text[ObjectManager::kNameBytes];
+  const uint32_t size = objects->object_name(token_id(p.files().token(slot)), text, sizeof(text));
+  return name->assign(StringView(text, size));
+}
+
 uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
   uint64_t status_block = 0, code = 0, input = 0, input_length = 0, output = 0, output_length = 0;
   if (!argument(p, r, 4, &status_block) || !argument(p, r, 5, &code) || !argument(p, r, 6, &input) || !argument(p, r, 7, &input_length) || !argument(p, r, 8, &output) ||
@@ -370,6 +378,7 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
     return kAccessViolation;
   uint64_t slot = 0;
   if (!slot_of(r.args[0], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (p.files().kind(slot) == DescriptorKind::File) return file_fs_control(p, slot, status_block, uint32_t(code), output, output_length & 0xFFFFFFFFu);
   if (p.files().kind(slot) != DescriptorKind::Pipe) return kInvalidDeviceRequest;
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;

@@ -44,7 +44,7 @@ constexpr uint64_t kUnixToNtSeconds = 11644473600ull;
 constexpr uint64_t kUseFilePointer = 0xFFFFFFFFFFFFFFFEull, kWriteToEnd = 0xFFFFFFFFFFFFFFFFull;
 // NtCreateFile dispositions, options, access bits, Information results
 constexpr uint32_t kSupersede = 0, kOpen = 1, kCreate = 2, kOpenIf = 3, kOverwrite = 4, kOverwriteIf = 5;
-constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000, kOpenByFileId = 0x2000;
+constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000, kOpenByFileId = 0x2000, kOpenReparsePoint = 0x200000;
 constexpr uint32_t kCannotDelete = 0xC0000121u, kUserMappedFile = 0xC0000243u;
 constexpr uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kGenericAll = 0x10000000u, kFileReadData = 1, kFileWriteData = 2, kFileAppendData = 4;
 constexpr uint64_t kFileSuperseded = 0, kFileOpened = 1, kFileCreated = 2, kFileOverwritten = 3;
@@ -133,7 +133,7 @@ uint32_t attributes_of(const DirectoryEntry& e) {
   uint32_t a = e.type == NodeType::Directory ? kAttributeDirectory : 0;
   if (e.read_only) a |= kAttributeReadOnly;
   if (e.is_symlink) a |= kAttributeReparsePoint;
-  if (e.type != NodeType::Directory && !e.is_symlink) a |= kAttributeArchive;      // (not kept: a file always counts as one that has not been backed up)
+  if (e.type != NodeType::Directory) a |= kAttributeArchive;      // (not kept: a file always counts as one that has not been backed up)
   return a ? a : kAttributeNormal;
 }
 
@@ -300,6 +300,19 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (disposition > kOverwriteIf) return kInvalidParameter;
   if ((options & kDirectoryFile) && (options & kNonDirectoryFile)) return kInvalidParameter;
 
+  if ((options & kOpenReparsePoint) && disposition == kOpen) {      // a symbolic link opened itself
+    uint32_t link_slot = 0;
+    if (files.open_link(virtual_path.view(), &link_slot) == Status::Ok) {
+      if (files.kind(link_slot) == DescriptorKind::File) if (OpenObject* opened = files.object(link_slot)) opened->granted_access = access;
+      uint32_t object_flags = 0;
+      uint8_t flag_bytes[4];
+      if (p.read_user(object_attributes + 24, ByteView(flag_bytes, 4))) object_flags = flag_bytes[0] | (uint32_t{flag_bytes[1]} << 8) | (uint32_t{flag_bytes[2]} << 16) | (uint32_t{flag_bytes[3]} << 24);
+      files.set_handle_flags(link_slot, (object_flags & 2) != 0, false);
+      *handle = (uint64_t{link_slot} + 1) * 4;
+      *information = kFileOpened;
+      return kSuccess;
+    }
+  }
   OpenFlags f;
   const bool all = access & kGenericAll;
   f.write = all || (access & (kGenericWrite | kFileWriteData | kFileAppendData));
@@ -624,6 +637,21 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     if (!p.write_user(r.args[2], ConstByteView(b, sizeof b))) return kAccessViolation;
     return store_io_status(p, r.args[1], kSuccess, sizeof b) ? kSuccess : kAccessViolation;
   }
+  if (kind == DescriptorKind::Pipe && static_cast<uint32_t>(info_class) == kFileNameInformation) {      // "\\name": where a pipe is
+    String pipe_name(files.allocator()), windows_name(files.allocator());
+    if (!pipe_handle_name(p, slot, &pipe_name) || pipe_name.empty() || !windows_name.push_back('\\') || !windows_name.append(pipe_name.view())) return kInvalidParameter;
+    uint8_t name[2 * (kMaxPath + 1)];
+    const uint64_t bytes = to_utf16(windows_name.view(), name, sizeof(name));
+    const uint64_t length = r.args[3] & 0xFFFFFFFFu;
+    if (length < 4) return kInfoLengthMismatch;
+    uint8_t out[4];
+    put(ByteView(out, 4), 0, bytes, 4);
+    if (!p.write_user(r.args[2], ConstByteView(out, 4))) return kAccessViolation;
+    const uint64_t room = length - 4 < bytes ? length - 4 : bytes;
+    if (room && !p.write_user(r.args[2] + 4, ConstByteView(name, room))) return kAccessViolation;
+    const uint32_t status = room < bytes ? kBufferOverflow : kSuccess;
+    return store_io_status(p, r.args[1], status, 4 + room) ? status : kAccessViolation;
+  }
   if (kind == DescriptorKind::Pipe) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
     if (pipe_class == 8 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
@@ -781,6 +809,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
     }
     case kFileRenameInformation: {
       if (length < 20) return kInfoLengthMismatch;
+      if (!(object->granted_access & (0x10000 /* DELETE */ | kGenericAll))) return kAccessDenied;      // (a rename takes the right to delete)
       uint8_t header[20];
       if (!p.read_user(address, ByteView(header, 20))) return kAccessViolation;
       const uint64_t name_bytes = header[16] | (uint64_t{header[17]} << 8) | (uint64_t{header[18]} << 16) | (uint64_t{header[19]} << 24);
@@ -929,6 +958,7 @@ uint32_t nt_query_attributes_file(Process& p, const SyscallRequest& r) {
   const uint32_t named = object_path(p, r.args[0], &virtual_path);
   if (named != kSuccess) return named;
   DirectoryEntry e;
+  if (files.stat_link(virtual_path.view(), &e) == Status::Ok) return write_basic(p, r.args[1], e) ? kSuccess : kAccessViolation;      // (a link answers for itself)
   const Status status = files.stat(virtual_path.view(), &e);
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
   return write_basic(p, r.args[1], e) ? kSuccess : kAccessViolation;
@@ -950,7 +980,10 @@ uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r) {
   if (files.resolve_from(virtual_directory_of(link_virtual.view()), raw_target.view(), &target_virtual) != PathResult::Ok) return kObjectNameInvalid;
   const bool target_is_directory = (r.args[2] & 0xFF) != 0;
   const Status status = files.create_symbolic_link(link_virtual.view(), target_virtual.view(), target_is_directory);
-  if (status == Status::Ok) notify_directory_changed(link_virtual.view(), kFileActionAdded);
+  if (status == Status::Ok) {
+    notify_directory_changed(link_virtual.view(), kFileActionAdded);
+    if (ObjectManager* objects = system_objects()) objects->link_note(link_virtual.view(), raw_target.view());      // (the text of the target as the program wrote it)
+  }
   return status_for(files, status, link_virtual.view());
 }
 
@@ -1139,6 +1172,58 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
 
 // NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, IoControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength).
 // The mount manager knows the one volume: its drive letter and its volume name, both pointing at the device of the volume.
+uint32_t file_fs_control(Process& p, uint64_t slot, uint64_t status_block, uint32_t code, uint64_t output, uint64_t output_length) {
+  constexpr uint32_t kGetReparsePoint = 0x900A8, kNotAReparsePoint = 0xC0000275u, kBufferTooSmall = 0xC0000023u, kSymlinkTag = 0xA000000Cu;
+  ProcessFiles& files = p.files();
+  OpenObject* object = files.object(slot);
+  if (code != kGetReparsePoint || !object) return kInvalidDeviceRequest;
+  if (!object->is_link) return kNotAReparsePoint;
+  // The text of the target as it was written, or the place it points to written out as a path of drive C.
+  DirectoryEntry entry;
+  String host_target(files.allocator()), raw(files.allocator());
+  if (files.stat_link(object->path.view(), &entry, &host_target) != Status::Ok) return kObjectNameNotFound;
+  char text[520];
+  const uint32_t text_size = system_objects() ? system_objects()->link_text(object->path.view(), text, sizeof(text)) : 0;
+  if (text_size != 0) {
+    raw.assign(StringView(text, text_size));
+  } else {
+    String inside(files.allocator());
+    if (!files.virtual_path_of_host(host_target.view(), &inside) || !raw.assign(StringView("C:"))) return kInvalidParameter;
+    for (char c : inside.view()) if (!raw.push_back(c == '/' ? '\\' : c)) return kNoMemory;
+    if (inside.view() == StringView("/")) raw.push_back('\\');
+  }
+  const bool rooted = !raw.empty() && (raw.view()[0] == '\\' || raw.view()[0] == '/');
+  const bool drive = raw.size() >= 2 && raw.view()[1] == ':';
+  const bool relative = !rooted && !drive;
+  String substitute(files.allocator());
+  if (relative) {
+    substitute.assign(raw.view());
+  } else {
+    String resolved(files.allocator());
+    if (files.resolve(raw.view(), &resolved) != PathResult::Ok || !substitute.assign(StringView("\\??\\C:"))) return kObjectNameInvalid;
+    if (resolved.view() == StringView("/")) substitute.push_back('\\');
+    else for (char c : resolved.view()) if (!substitute.push_back(c == '/' ? '\\' : c)) return kNoMemory;
+    if (resolved.view() != StringView("/") && (raw.view()[raw.size() - 1] == '\\' || raw.view()[raw.size() - 1] == '/')) substitute.push_back('\\');
+  }
+  uint8_t substitute_units[2 * 1100], print_units[2 * 600];
+  const uint64_t substitute_bytes = to_utf16(substitute.view(), substitute_units, sizeof(substitute_units)), print_bytes = to_utf16(raw.view(), print_units, sizeof(print_units));
+  if ((substitute_bytes == 0 && !substitute.empty()) || (print_bytes == 0 && !raw.empty())) return kInvalidParameter;
+  const uint64_t data_length = 12 + substitute_bytes + print_bytes, total = 8 + data_length;
+  if (output_length < total) return kBufferTooSmall;
+  uint8_t image[8 + 12 + 2 * 1100 + 2 * 600];
+  ByteView v(image, total);
+  v.fill(0);
+  put(v, 0, kSymlinkTag, 4);
+  put(v, 4, data_length, 2);
+  put(v, 8, 0, 2); put(v, 10, substitute_bytes, 2);      // SubstituteNameOffset, SubstituteNameLength
+  put(v, 12, substitute_bytes, 2); put(v, 14, print_bytes, 2);      // PrintNameOffset, PrintNameLength
+  put(v, 16, relative ? 1 : 0, 4);      // SYMLINK_FLAG_RELATIVE
+  for (uint64_t i = 0; i < substitute_bytes; ++i) v[20 + i] = substitute_units[i];
+  for (uint64_t i = 0; i < print_bytes; ++i) v[20 + substitute_bytes + i] = print_units[i];
+  if (!p.write_user(output, ConstByteView(image, total))) return kAccessViolation;
+  return store_io_status(p, status_block, kSuccess, total) ? kSuccess : kAccessViolation;
+}
+
 uint32_t nt_device_io_control_file(Process& p, const SyscallRequest& r) {
   uint64_t status_block = 0, code = 0, input = 0, input_length = 0, output = 0, output_length = 0;
   if (!argument(p, r, 4, &status_block) || !argument(p, r, 5, &code) || !argument(p, r, 6, &input) || !argument(p, r, 7, &input_length) || !argument(p, r, 8, &output) ||

@@ -220,7 +220,19 @@ EXPORT BOOL WINAPI SetFileInformationByHandle(HANDLE h, int info_class, LPVOID i
 EXPORT HANDLE WINAPI ReOpenFile(HANDLE original, DWORD access, DWORD share, DWORD flags) {
   if (flags & 0xFFFF) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
   WCHAR path[PATH_CHARS + 64];
-  const DWORD n = GetFinalPathNameByHandleW(original, path, PATH_CHARS + 64, 0);
+  DWORD n = 0;
+  if (device_type(original) == 0x11) {      /* a pipe: another end of it, by its name */
+    IO_STATUS_BLOCK iosb;
+    BYTE info[4 + 2 * 256];
+    if (NT_SUCCESS(NtQueryInformationFile(original, &iosb, info, sizeof(info), 9)) && get32(info) / 2 < 256) {
+      static const WCHAR folder[] = {'\\', '\\', '.', '\\', 'p', 'i', 'p', 'e'};
+      memcpy(path, folder, sizeof(folder));
+      memcpy(path + 8, info + 4, get32(info));
+      path[8 + get32(info) / 2] = 0;
+      return CreateFileW(path, access, share, NULL, OPEN_EXISTING, flags, NULL);
+    }
+  }
+  n = GetFinalPathNameByHandleW(original, path, PATH_CHARS + 64, 0);
   if (n == 0 || n >= PATH_CHARS + 64) {
     if (n == 0 && GetLastError() == ERROR_INVALID_HANDLE) return INVALID_HANDLE_VALUE;
     set_error(n ? ERROR_FILENAME_EXCED_RANGE : ERROR_INVALID_PARAMETER);

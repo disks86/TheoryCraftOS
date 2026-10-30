@@ -358,7 +358,7 @@ void ProcessFiles::apply_precise_times(StringView virtual_path, DirectoryEntry* 
   if (!objects || !objects->file_times_get(virtual_path, &t)) return;
   if (t.written != 0) {      // (a time before 1970 is 0 seconds to the file systems)
     const int64_t known = static_cast<int64_t>(t.written / 10000000ull) - static_cast<int64_t>(kNtEpochSeconds), have = static_cast<int64_t>(entry->modified);
-    if (!(known < 0 && have == 0) && (known > have ? known - have : have - known) > 3) return;
+    if (have != 0 && (known > have ? known - have : have - known) > 3) return;      // (a file system without a clock, or a time before 1970, has 0)
   }
   entry->exact_created = t.created;
   entry->exact_accessed = t.accessed;
@@ -427,6 +427,48 @@ Status ProcessFiles::open(StringView virtual_path, const OpenFlags& flags, uint3
   return Status::Ok;
 }
 
+Status ProcessFiles::stat_link(StringView virtual_path, DirectoryEntry* entry, String* host_target) {
+  if (!fs_ || style_ != PathStyle::Windows) return Status::NotFound;
+  String path(*allocator_), target(*allocator_);
+  if (!host_path(virtual_path, &path)) return Status::NotFound;
+  bool to_directory = false;
+  const Status status = fs_->read_symbolic_link(path.view(), &target, &to_directory);
+  if (status != Status::Ok) return status;
+  *entry = DirectoryEntry();
+  const uint64_t cut = path.view().rfind('/');
+  entry->name.assign(cut == StringView::npos ? path.view() : path.view().without_prefix(cut + 1));
+  entry->type = to_directory ? NodeType::Directory : NodeType::File;
+  entry->is_symlink = true;
+  apply_precise_times(virtual_path, entry);
+  if (host_target) host_target->assign(target.view());
+  return Status::Ok;
+}
+
+bool ProcessFiles::virtual_path_of_host(StringView host, String* out) const {
+  if (host.size() < root_prefix_.size() || !equal_ignoring_case(host.first(root_prefix_.size()), root_prefix_)) return false;
+  const StringView rest = host.without_prefix(root_prefix_.size());
+  if (!rest.empty() && rest[0] != '/') return false;
+  return out->assign(rest.empty() ? StringView("/") : rest);
+}
+
+Status ProcessFiles::open_link(StringView virtual_path, uint32_t* slot) {
+  DirectoryEntry entry;
+  const Status status = stat_link(virtual_path, &entry);
+  if (status != Status::Ok) return status;
+  const int64_t target = free_slot(0);
+  if (target < 0) return Status::OutOfMemory;
+  SharedPointer<OpenObject> object = SharedPointer<OpenObject>::make(*allocator_, *allocator_);
+  if (!object || !object->path.assign(virtual_path)) return Status::OutOfMemory;
+  object->is_link = true;
+  object->no_data_access = true;
+  slots_[target].kind = DescriptorKind::File;
+  slots_[target].object = object;
+  slots_[target].close_on_exec = false;
+  slots_[target].inherit = slots_[target].protect = false;
+  *slot = static_cast<uint32_t>(target);
+  return Status::Ok;
+}
+
 Status ProcessFiles::make_directory(StringView virtual_path) {
   if (!fs_) return Status::NotFound;
   String path(*allocator_);
@@ -447,7 +489,7 @@ Status ProcessFiles::remove(StringView virtual_path) {
   if (!host_path(virtual_path, &path)) return Status::NotFound;
   if (virtual_path == StringView("/")) return Status::Busy;      // the root of the program's tree stays
   const Status status = fs_->remove(path.view());
-  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) objects->file_times_forget(virtual_path);
+  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_forget(virtual_path); objects->link_forget(virtual_path); }
   return status;
 }
 
@@ -464,7 +506,7 @@ Status ProcessFiles::rename(StringView from, StringView to) {
   }
   if (from == StringView("/")) return Status::Busy;
   const Status status = fs_->rename(a.view(), b.view());
-  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) objects->file_times_move(from, to);
+  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_move(from, to); objects->link_forget(from); }
   return status;
 }
 
@@ -516,6 +558,7 @@ Status ProcessFiles::resize(OpenObject& object, uint64_t size) {
 Status ProcessFiles::flush(OpenObject& object) { return object.file ? object.file->flush() : Status::Ok; }
 
 Status ProcessFiles::stat_object(const OpenObject& object, DirectoryEntry* entry) {
+  if (object.is_link) return stat_link(object.path.view(), entry);
   const Status status = stat(object.path.view(), entry);
   if (status == Status::Ok && object.file) entry->size = object.file->size();      // reflects writes the file system has not been asked about yet
   return status;

@@ -101,6 +101,7 @@ class ObjectManager {
   void pipe_cancel(uint32_t id);
   bool pipe_client_gone_locked(uint32_t id, uint32_t end_code);      // a client end whose server disconnected it
   bool pipe_name_exists_locked(StringView name);      // some instance of the pipe exists (listening or not)
+  uint32_t object_name(uint32_t id, char* out, uint32_t capacity);      // the name a pipe (or other named object) was made with; its length, 0 if it has none or is not that big
   bool pipe_name_available_locked(StringView name);      // some instance of the named pipe is not connected
   struct PipeInfo {
     bool anonymous = false, connected = false, message_type = false;
@@ -183,6 +184,12 @@ class ObjectManager {
   bool file_times_get(StringView path, FileTimes* times);
   void file_times_move(StringView from, StringView to);      // the file was renamed
   void file_times_forget(StringView path);                   // the file is gone
+
+  // --- symbolic links as the program that made them wrote them: the file systems keep the place a link points to, the program also wants the text it gave (a reparse point
+  // has it as the "print name", and a relative target stays relative). Kept by the link's path for as long as the link is there.
+  void link_note(StringView link_path, StringView target_text);
+  uint32_t link_text(StringView link_path, char* out, uint32_t capacity);      // the target text, 0 if none is known
+  void link_forget(StringView link_path);
 
   // --- job objects (kind Job: create() and open() make and find them). A job groups processes: its limits (active process count, kill on close, breakaway) are enforced and
   // its members can be ended together. A process belongs to at most one job; the processes it starts join the same job. Members are ended by a flag that they see themselves
@@ -314,7 +321,7 @@ class ObjectManager {
   void job_flag_all_locked(Job& j, uint32_t code);
   Pipe* pipe_of(uint32_t id);      // (locked)
   void free_pipe_locked(Object& o);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64;
 
   struct Watch {
     bool used = false;
@@ -341,6 +348,8 @@ class ObjectManager {
   ShareEntry* shares_ = nullptr;      // kMaxShares of them, made with the first
   struct TimesEntry;
   TimesEntry* times_ = nullptr;      // kMaxTimes of them, made with the first
+  struct LinkEntry;
+  LinkEntry* links_ = nullptr;      // kMaxLinkTexts of them, made with the first
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)

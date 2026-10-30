@@ -66,6 +66,7 @@ struct OpenObject {
   bool no_data_access = false;      // opened for its attributes only (no read, write or execute right): it cannot be mapped
   uint32_t granted_access = 0xFFFFFFFFu;      // the access mask it was opened with (Windows; a handle made some other way has every right)
   bool delete_on_close = false;
+  bool is_link = false;             // a symbolic link opened itself (not what it points to): it has no data, only the link
   // Directory listing: 0 = "." next, 1 = ".." next, 2 = the real entries.
   uint32_t directory_phase = 0;
   uint64_t directory_index = 0;      // entries handed out so far (a cookie for getdents)
@@ -131,6 +132,13 @@ class ProcessFiles {
   filesystem::Status stat(StringView virtual_path, filesystem::DirectoryEntry* entry);
   // Puts the exact times the system keeps for the file (see ObjectManager::file_times_set) into `entry`.
   void apply_precise_times(StringView virtual_path, filesystem::DirectoryEntry* entry) const;
+  // A name that is a symbolic link itself, even one whose target is not there: its entry (a directory or a file by what it was made to point to, with is_symlink) and the place it
+  // points to as the file system keeps it. NotFound, or InvalidArgument for a name that is not a link.
+  filesystem::Status stat_link(StringView virtual_path, filesystem::DirectoryEntry* entry, String* host_target = nullptr);
+  // The path of this process's tree that a path of the file system underneath names (what a link keeps as its target); false if it is outside.
+  bool virtual_path_of_host(StringView host, String* out) const;
+  // A descriptor for the link itself (File kind, no file behind it).
+  filesystem::Status open_link(StringView virtual_path, uint32_t* slot);
   filesystem::Status make_directory(StringView virtual_path);
   filesystem::Status set_metadata(StringView virtual_path, const filesystem::MetadataChange& change);
   filesystem::Status remove(StringView virtual_path);

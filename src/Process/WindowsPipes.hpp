@@ -31,6 +31,8 @@ uint32_t nt_create_pipe(Process& p, const SyscallRequest& r);
 // ULONG ReadMode, ULONG CompletionMode, ULONG MaximumInstances, ULONG InboundQuota, ULONG OutboundQuota, PLARGE_INTEGER DefaultTimeout): one instance of a named pipe;
 // ShareAccess says the direction (FILE_SHARE_READ: the server writes, FILE_SHARE_WRITE: the server reads, both: duplex).
 uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r);
+// The name of the pipe a pipe handle is for, in UTF-8 and without the folder (empty for an anonymous pipe or the folder).
+bool pipe_handle_name(Process& p, uint64_t slot, String* name);
 // NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FsControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength): on a pipe,
 // FSCTL_PIPE_LISTEN, _DISCONNECT, _PEEK, _WAIT and _TRANSCEIVE.
 uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r);

@@ -243,6 +243,7 @@ ObjectManager::~ObjectManager() {
   if (locks_ && allocator_) allocator_->deallocate(locks_);
   if (shares_ && allocator_) allocator_->deallocate(shares_);
   if (times_ && allocator_) allocator_->deallocate(times_);
+  if (links_ && allocator_) allocator_->deallocate(links_);
   if (sections_) {
     for (uint32_t i = 0; i < kMaxSections; ++i) if (sections_[i].storage && allocator_) allocator_->deallocate(sections_[i].storage);
     if (allocator_) allocator_->deallocate(sections_);
@@ -524,6 +525,14 @@ bool ObjectManager::pipe_client_gone_locked(uint32_t id, uint32_t end_code) {
   return p && (end_code & 1) && !p->connected && p->disconnected;
 }
 
+uint32_t ObjectManager::object_name(uint32_t id, char* out, uint32_t capacity) {
+  Locked hold(sync_);
+  const Object* o = at(id);
+  if (!o || o->name_size == 0 || o->name_size > capacity) return 0;
+  for (uint32_t i = 0; i < o->name_size; ++i) out[i] = o->name[i];
+  return o->name_size;
+}
+
 bool ObjectManager::pipe_name_exists_locked(StringView name) {
   for (Object& o : objects_) if (o.kind == ObjectKind::Pipe && o.name_size != 0 && same_name(o.name, o.name_size, name)) return true;
   return false;
@@ -680,6 +689,52 @@ uint32_t ObjectManager::share_owners(StringView path, const void** owners, uint3
     ++count;
   }
   return count;
+}
+
+struct ObjectManager::LinkEntry {
+  bool used = false;
+  char path[260] = {};
+  char text[520] = {};
+  uint32_t path_size = 0, text_size = 0;
+};
+
+void ObjectManager::link_note(StringView link_path, StringView target_text) {
+  Locked hold(sync_);
+  if (!allocator_ || link_path.size() >= 260 || target_text.size() >= 520) return;
+  if (!links_) {
+    void* memory = allocator_->allocate(sizeof(LinkEntry) * kMaxLinkTexts);
+    if (!memory) return;
+    links_ = static_cast<LinkEntry*>(memory);
+    for (uint32_t i = 0; i < kMaxLinkTexts; ++i) new (&links_[i]) LinkEntry();
+  }
+  LinkEntry* slot = nullptr;
+  for (uint32_t i = 0; i < kMaxLinkTexts && !slot; ++i) if (links_[i].used && same_name(links_[i].path, links_[i].path_size, link_path)) slot = &links_[i];
+  for (uint32_t i = 0; i < kMaxLinkTexts && !slot; ++i) if (!links_[i].used) slot = &links_[i];
+  if (!slot) slot = &links_[0];      // (all taken: the first one makes room)
+  slot->used = true;
+  for (uint32_t k = 0; k < link_path.size(); ++k) slot->path[k] = link_path[k];
+  slot->path_size = static_cast<uint32_t>(link_path.size());
+  for (uint32_t k = 0; k < target_text.size(); ++k) slot->text[k] = target_text[k];
+  slot->text_size = static_cast<uint32_t>(target_text.size());
+}
+
+uint32_t ObjectManager::link_text(StringView link_path, char* out, uint32_t capacity) {
+  Locked hold(sync_);
+  if (!links_) return 0;
+  for (uint32_t i = 0; i < kMaxLinkTexts; ++i) {
+    const LinkEntry& e = links_[i];
+    if (!e.used || !same_name(e.path, e.path_size, link_path)) continue;
+    if (e.text_size > capacity) return 0;
+    for (uint32_t k = 0; k < e.text_size; ++k) out[k] = e.text[k];
+    return e.text_size;
+  }
+  return 0;
+}
+
+void ObjectManager::link_forget(StringView link_path) {
+  Locked hold(sync_);
+  if (!links_) return;
+  for (uint32_t i = 0; i < kMaxLinkTexts; ++i) if (links_[i].used && same_name(links_[i].path, links_[i].path_size, link_path)) links_[i].used = false;
 }
 
 struct ObjectManager::TimesEntry {

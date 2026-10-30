@@ -101,6 +101,87 @@ EXPORT BOOL WINAPI OpenProcessToken(HANDLE process, DWORD access, PHANDLE token)
   return TRUE;
 }
 EXPORT BOOL WINAPI OpenThreadToken(HANDLE thread, DWORD access, BOOL self, PHANDLE token) { (void)thread; (void)self; return OpenProcessToken(NULL, access, token); }
+typedef struct { DWORD LowPart; LONG HighPart; } LUID, *PLUID;
+/* Privileges: the names programs know them by and their numbers (the low part of the LUID). The user of this OS is a standard one: the privileges that a standard user's token holds
+ * are the ones that can be enabled; asking for another one is answered as Windows does, with success and ERROR_NOT_ALL_ASSIGNED. */
+static const struct { const char *name; DWORD value; BOOL held; } g_privileges[] = {
+  {"SeCreateTokenPrivilege", 2, 0}, {"SeAssignPrimaryTokenPrivilege", 3, 0}, {"SeLockMemoryPrivilege", 4, 0}, {"SeIncreaseQuotaPrivilege", 5, 0}, {"SeMachineAccountPrivilege", 6, 0},
+  {"SeTcbPrivilege", 7, 0}, {"SeSecurityPrivilege", 8, 0}, {"SeTakeOwnershipPrivilege", 9, 0}, {"SeLoadDriverPrivilege", 10, 0}, {"SeSystemProfilePrivilege", 11, 0},
+  {"SeSystemtimePrivilege", 12, 0}, {"SeProfileSingleProcessPrivilege", 13, 0}, {"SeIncreaseBasePriorityPrivilege", 14, 0}, {"SeCreatePagefilePrivilege", 15, 0},
+  {"SeCreatePermanentPrivilege", 16, 0}, {"SeBackupPrivilege", 17, 0}, {"SeRestorePrivilege", 18, 0}, {"SeShutdownPrivilege", 19, 1}, {"SeDebugPrivilege", 20, 0},
+  {"SeAuditPrivilege", 21, 0}, {"SeSystemEnvironmentPrivilege", 22, 0}, {"SeChangeNotifyPrivilege", 23, 1}, {"SeRemoteShutdownPrivilege", 24, 0}, {"SeUndockPrivilege", 25, 1},
+  {"SeSyncAgentPrivilege", 26, 0}, {"SeEnableDelegationPrivilege", 27, 0}, {"SeManageVolumePrivilege", 28, 0}, {"SeImpersonatePrivilege", 29, 0}, {"SeCreateGlobalPrivilege", 30, 0},
+  {"SeTrustedCredManAccessPrivilege", 31, 0}, {"SeRelabelPrivilege", 32, 0}, {"SeIncreaseWorkingSetPrivilege", 33, 1}, {"SeTimeZonePrivilege", 34, 1},
+  {"SeCreateSymbolicLinkPrivilege", 35, 1}, {"SeDelegateSessionUserImpersonatePrivilege", 36, 0},
+};
+#define PRIVILEGE_COUNT_ ((int)(sizeof(g_privileges) / sizeof(g_privileges[0])))
+EXPORT BOOL WINAPI LookupPrivilegeValueA(LPCSTR system, LPCSTR name, PLUID luid) {
+  if (!name || !luid || (system && *system)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  for (int i = 0; i < PRIVILEGE_COUNT_; ++i) {
+    const char *a = name, *b = g_privileges[i].name;
+    while (*a && ((*a | 0x20) == (*b | 0x20))) { ++a; ++b; }
+    if (*a || *b) continue;
+    luid->LowPart = g_privileges[i].value;
+    luid->HighPart = 0;
+    return TRUE;
+  }
+  SetLastError(1313 /* ERROR_NO_SUCH_PRIVILEGE */);
+  return FALSE;
+}
+EXPORT BOOL WINAPI LookupPrivilegeValueW(LPCWSTR system, LPCWSTR name, PLUID luid) {
+  char narrow[64];
+  size_t_ n = 0;
+  if (!name || (system && *system)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  for (; name[n] && n < sizeof(narrow) - 1; ++n) { if (name[n] > 0x7F) { SetLastError(1313); return FALSE; } narrow[n] = (char)name[n]; }
+  if (name[n]) { SetLastError(1313); return FALSE; }
+  narrow[n] = 0;
+  return LookupPrivilegeValueA(NULL, narrow, luid);
+}
+EXPORT BOOL WINAPI LookupPrivilegeNameW(LPCWSTR system, PLUID luid, LPWSTR name, LPDWORD size) {
+  if (!luid || !size || (system && *system)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  for (int i = 0; i < PRIVILEGE_COUNT_; ++i) {
+    if (luid->HighPart != 0 || luid->LowPart != g_privileges[i].value) continue;
+    const DWORD length = (DWORD)strlen(g_privileges[i].name);
+    if (*size < length + 1) { *size = length + 1; SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    for (DWORD k = 0; k <= length; ++k) name[k] = (WCHAR)(unsigned char)g_privileges[i].name[k];
+    *size = length;
+    return TRUE;
+  }
+  SetLastError(1313);
+  return FALSE;
+}
+EXPORT BOOL WINAPI LookupPrivilegeNameA(LPCSTR system, PLUID luid, LPSTR name, LPDWORD size) {
+  if (!luid || !size || (system && *system)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  for (int i = 0; i < PRIVILEGE_COUNT_; ++i) {
+    if (luid->HighPart != 0 || luid->LowPart != g_privileges[i].value) continue;
+    const DWORD length = (DWORD)strlen(g_privileges[i].name);
+    if (*size < length + 1) { *size = length + 1; SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    memcpy(name, g_privileges[i].name, length + 1);
+    *size = length;
+    return TRUE;
+  }
+  SetLastError(1313);
+  return FALSE;
+}
+typedef struct { LUID Luid; DWORD Attributes; } LUID_AND_ATTRIBUTES_;
+typedef struct { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES_ Privileges[1]; } TOKEN_PRIVILEGES_;
+/* AdjustTokenPrivileges: enabling a privilege the token holds works; one it does not hold leaves the call a success with ERROR_NOT_ALL_ASSIGNED, as on Windows. */
+EXPORT BOOL WINAPI AdjustTokenPrivileges(HANDLE token, BOOL disable_all, TOKEN_PRIVILEGES_ *state, DWORD length, TOKEN_PRIVILEGES_ *previous, LPDWORD returned) {
+  (void)disable_all; (void)length;
+  if (token != TOKEN_PSEUDO_HANDLE_) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+  DWORD error = 0;
+  if (state) {
+    for (DWORD i = 0; i < state->PrivilegeCount; ++i) {
+      BOOL held = FALSE;
+      for (int k = 0; k < PRIVILEGE_COUNT_; ++k) if (state->Privileges[i].Luid.HighPart == 0 && state->Privileges[i].Luid.LowPart == g_privileges[k].value) held = g_privileges[k].held;
+      if (!held && (state->Privileges[i].Attributes & 2 /* SE_PRIVILEGE_ENABLED */)) error = 1300 /* ERROR_NOT_ALL_ASSIGNED */;
+    }
+  }
+  if (previous) previous->PrivilegeCount = 0;
+  if (returned) *returned = 4;
+  SetLastError(error);
+  return TRUE;
+}
 typedef struct { DWORD Attributes; } SID_AND_ATTRIBUTES_;
 typedef struct { PVOID Sid; } TOKEN_USER_;
 EXPORT BOOL WINAPI GetTokenInformation(HANDLE token, int class_, PVOID info, DWORD capacity, LPDWORD returned) {

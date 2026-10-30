@@ -182,7 +182,9 @@ EXPORT BOOLEAN WINAPI CreateSymbolicLinkW(LPCWSTR link, LPCWSTR target, DWORD fl
   UNICODE_STRING raw_target;
   raw_target.Buffer = (WCHAR *)target;
   raw_target.Length = raw_target.MaximumLength = (USHORT)(wcslen(target) * 2);
+  if (!(flags & SYMBOLIC_LINK_FLAG_DIRECTORY) && is_separator(link[wcslen(link) - 1])) { set_error(ERROR_INVALID_NAME); return FALSE; }      /* (a link to a file is not named as a folder) */
   const NTSTATUS status = NtCreateSymbolicLink(&link_attributes, &raw_target, (flags & SYMBOLIC_LINK_FLAG_DIRECTORY) ? 1 : 0);
+  if (NT_SUCCESS(status)) set_error(ERROR_SUCCESS);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOLEAN WINAPI CreateSymbolicLinkA(LPCSTR link, LPCSTR target, DWORD flags) {

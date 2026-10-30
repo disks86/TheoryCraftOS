@@ -3306,6 +3306,11 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   ULONG options = FILE_SYNCHRONOUS_IO_NONALERT_;
   if (!(flags & FILE_FLAG_BACKUP_SEMANTICS)) options |= FILE_NON_DIRECTORY_FILE_;
   if (flags & FILE_FLAG_DELETE_ON_CLOSE) { options |= FILE_DELETE_ON_CLOSE_; nt_access |= DELETE; }
+  if ((flags & FILE_FLAG_BACKUP_SEMANTICS) && (flags & 0x01000000u /* FILE_FLAG_POSIX_SEMANTICS */) && (flags & FILE_ATTRIBUTE_DIRECTORY) && disposition == CREATE_NEW) {      /* a new directory, asked for this way */
+    options &= ~(ULONG)FILE_NON_DIRECTORY_FILE_;
+    options |= FILE_DIRECTORY_FILE_;
+  }
+  if (flags & 0x00200000u /* FILE_FLAG_OPEN_REPARSE_POINT */) options |= 0x00200000u;      /* FILE_OPEN_REPARSE_POINT: a link is opened itself */
   HANDLE handle = NULL;
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtCreateFile(&handle, nt_access, &attributes, &iosb, NULL, (flags & 0x7FB7) ? (flags & 0x7FB7) : FILE_ATTRIBUTE_NORMAL, share & 7, nt_disposition, options, NULL, 0);

@@ -752,7 +752,9 @@ static BOOL port_take(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *
   Port *p = port_of(port);
   if (!p) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (overlapped) *overlapped = NULL;
-  const DWORD w = WaitForSingleObjectEx(p->semaphore, timeout, alertable);
+  DWORD w = WaitForSingleObjectEx(p->semaphore, 0, FALSE);      /* (a packet that is there is taken before any queued call is run) */
+  if (w != WAIT_OBJECT_0 && timeout) w = WaitForSingleObjectEx(p->semaphore, timeout, alertable);
+  else if (w != WAIT_OBJECT_0 && alertable) w = WaitForSingleObjectEx(p->semaphore, 0, TRUE);
   if (w != WAIT_OBJECT_0) { set_error(w == WAIT_TIMEOUT || w == WAIT_IO_COMPLETION ? w : GetLastError()); return FALSE; }
   atom_lock();
   PortPacket k = p->packets[p->head];
