@@ -180,6 +180,8 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtDebugContinue: return windowsabi::nt_debug_continue(process, r);
       case WindowsSyscallNumber::NtSetInformationDebugObject: return windowsabi::nt_set_information_debug_object(process, r);
       case WindowsSyscallNumber::NtCreateDebugObject: return windowsabi::nt_create_debug_object(process, r);
+      case WindowsSyscallNumber::NtSuspendProcess: return windowsabi::nt_suspend_resume_process(process, r, true);
+      case WindowsSyscallNumber::NtResumeProcess: return windowsabi::nt_suspend_resume_process(process, r, false);
       case WindowsSyscallNumber::NtTcosDebugException: return windowsabi::nt_tcos_debug_exception(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);

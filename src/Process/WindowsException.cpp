@@ -25,7 +25,7 @@ namespace {
 
 constexpr uint64_t kMachineFrameBytes = 0x40;      // 40 bytes of frame, padded so that the CONTEXT after it stays 16-aligned
 constexpr uint64_t kUserLimit = 0x0000800000000000ull;      // addresses at or above are not canonical user addresses
-constexpr uint64_t kFlagsUser = 0x0CD5;                      // CF PF AF ZF SF DF OF: what a program may set
+constexpr uint64_t kFlagsUser = 0x0DD5;                      // CF PF AF ZF SF TF DF OF: what a program may set (TF: single-stepping for a debugger)
 constexpr uint32_t kMxcsrUsable = 0xFFBF;
 
 uint32_t mxcsr_of(const uint8_t* fpu) { return uint32_t(fpu[24]) | uint32_t(fpu[25]) << 8 | uint32_t(fpu[26]) << 16 | uint32_t(fpu[27]) << 24; }
@@ -37,11 +37,10 @@ bool fault_to_exception(uint64_t vector, uint64_t error, uint64_t cr2, X86Contex
   out->address = at->rip;
   switch (vector & 0xFF) {
     case 0: out->code = 0xC0000094u; return true;      // STATUS_INTEGER_DIVIDE_BY_ZERO
-    case 1: out->code = 0x80000004u; return true;      // STATUS_SINGLE_STEP
+    case 1: out->code = 0x80000004u; at->rflags &= ~uint64_t{0x100}; return true;      // STATUS_SINGLE_STEP (the trap flag is clear in what the debugger sees)
     case 3:
-      out->code = 0x80000003u;      // STATUS_BREAKPOINT
-      at->rip -= 1;
-      out->address = at->rip;
+      out->code = 0x80000003u;      // STATUS_BREAKPOINT: reported at the INT3, the context is after it (as on Windows)
+      out->address = at->rip - 1;
       out->count = 1;
       return true;
     case 4: out->code = 0xC0000095u; return true;      // STATUS_INTEGER_OVERFLOW
