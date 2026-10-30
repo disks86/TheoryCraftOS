@@ -66,6 +66,9 @@ inline constexpr const char* kTodoDatabase = "/AppStore/Todo/todo.db";
 // The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
 inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";
 
+// The Bluetooth bonds: the keys of the devices this machine has paired with, one file (the "Bluetooth" application's folder in the AppStore).
+inline constexpr const char* kBluetoothBonds = "/AppStore/Bluetooth/bonds.bin";
+
 // The name the EFI system partition is mounted under (the folder "/EFI").
 inline constexpr const char* kEfiMountName = "EFI";
 

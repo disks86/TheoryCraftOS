@@ -3687,6 +3687,11 @@ static void test_usb4_titan_ridge_clx() {
     CHECK(domain.start(nullptr) && domain.clx_state(1) == (kClx0s | kClx1));
     CHECK((rig.fabric.at(0).ports[1].space[0x11] & all) == (kLaneCs1Cl0sEnable | kLaneCs1Cl1Enable) && (rig.fabric.at(0x01).ports[1].space[0x11] & all) == (kLaneCs1Cl0sEnable | kLaneCs1Cl1Enable));
     CHECK(rig.fabric.at(0x01).regs[0x101] == 0x18 && rig.fabric.at(0x01).regs[0x102] == 0x19);
+    // its time is kept in step with the host's too: the rate, both ends uni-directional, the objections of the time capability and of the upstream adapter off, the disruption bit down
+    fake_usb4::Router& dock = rig.fabric.at(0x01);
+    CHECK(domain.tmu_enabled(1) && (rig.fabric.at(0).regs[0x20 + kTmuRtrCs3] >> kTmuRtrCs3IntervalShift) == 1000 && dock.post_times == 0);
+    CHECK((dock.ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm) && (rig.fabric.at(0).ports[1].space[0x40 + kTmuAdpCs3] & kTmuAdpCs3Udm));
+    CHECK(!(dock.regs[0x120 + kTime2Cs9] & kTime2Cs9ObjMask) && (dock.ports[1].space[0x40 + kTmuAdpCs6] & kTmuAdpCs6ObjMask) == kTmuAdpCs6ObjMask && !(dock.regs[0x120 + kTime2Cs26] & kTime2Cs26Td));
   }
   {   // the link controller says the link cannot: nothing; no low power capability: the enable is undone; a Thunderbolt 3 router that is not Titan Ridge: nothing
     Usb4Rig no_cps(false);
@@ -3839,6 +3844,71 @@ static void test_usb4_retimers() {
     Usb4Rig rig(false);
     Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
     CHECK(domain.start(nullptr) && domain.retimer_count(0, 1) == 0 && domain.present_count() == 2);
+  }
+}
+
+static void test_usb4_retimer_nvm() {
+  auto view = [](const std::vector<uint8_t>& v) { return ConstByteView(v.data(), v.size()); };
+  const std::vector<uint8_t> image = nvm_image(64 * 1024, 0x2222);
+  auto rig_with_retimers = [](Usb4Rig& rig) { rig.fabric.at(0).ports[1].retimers = {{0x8086, 0x1111, 4096}, {0x8087, 0x2222, 8192}}; };
+  {   // the image goes in 64 byte blocks to the other flash area from the digital section on, and reads back
+    Usb4Rig rig(false);
+    rig_with_retimers(rig);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr));
+    fake_usb4::Port& port = rig.fabric.at(0).ports[1];
+    CHECK(domain.retimer_nvm_write(0, 1, 1, view(image)) == Usb4Domain::RetimerNvm::Ok);
+    CHECK(port.rt_block_writes[2] == (64 * 1024 - 0x4000) / 64 && port.rt_flash[2].size() == 64 * 1024 - 0x4000);
+    CHECK(std::equal(port.rt_flash[2].begin(), port.rt_flash[2].end(), image.begin() + 0x4000));
+    std::vector<uint8_t> back(300);
+    CHECK(domain.retimer_nvm_read(0, 1, 1, 0x100, ByteView(back.data(), back.size())) == Usb4Domain::RetimerNvm::Ok && std::equal(back.begin(), back.end(), image.begin() + 0x4000 + 0x100));
+    // refused before anything is written: another product, a retimer of another vendor, no such retimer, a size that is not whole dwords, truncated images
+    const std::vector<uint8_t> other = nvm_image(64 * 1024, 0x3333);
+    CHECK(domain.retimer_nvm_write(0, 1, 1, view(other)) == Usb4Domain::RetimerNvm::BadImage && domain.retimer_nvm_write(0, 1, 0, view(image)) == Usb4Domain::RetimerNvm::Unsupported);
+    CHECK(domain.retimer_nvm_write(0, 1, 2, view(image)) == Usb4Domain::RetimerNvm::NoSuchRetimer && domain.retimer_nvm_write(0, 3, 0, view(image)) == Usb4Domain::RetimerNvm::NoSuchRetimer && domain.retimer_nvm_write(9, 1, 0, view(image)) == Usb4Domain::RetimerNvm::NoSuchRetimer);
+    std::vector<uint8_t> odd = image;
+    odd.push_back(1);
+    CHECK(domain.retimer_nvm_write(0, 1, 1, view(odd)) == Usb4Domain::RetimerNvm::BadImage);
+    for (uint32_t cut : {0u, 3u, 100u, 0x4000u, 0x4005u, 0x7FFCu}) {
+      const std::vector<uint8_t> shorter(image.begin(), image.begin() + cut);
+      CHECK(domain.retimer_nvm_write(0, 1, 1, view(shorter)) == Usb4Domain::RetimerNvm::BadImage);
+    }
+    for (uint32_t bit = 0; bit < 64; ++bit) {                                                  // (a flipped bit in the header: either still valid or refused, never a crash)
+      std::vector<uint8_t> flipped = image;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      const Usb4Domain::RetimerNvm r = domain.retimer_nvm_write(0, 1, 1, view(flipped));
+      CHECK(r == Usb4Domain::RetimerNvm::Ok || r == Usb4Domain::RetimerNvm::BadImage);
+    }
+  }
+  {   // a block that is not taken is tried again (three times); too many failures fail the write
+    Usb4Rig rig(false);
+    rig_with_retimers(rig);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr));
+    fake_usb4::Port& port = rig.fabric.at(0).ports[1];
+    port.rt_block_timeouts = 3;
+    CHECK(domain.retimer_nvm_write(0, 1, 1, view(image)) == Usb4Domain::RetimerNvm::Ok && port.rt_flash[2].size() == 64 * 1024 - 0x4000);
+    port.rt_block_timeouts = 4;
+    CHECK(domain.retimer_nvm_write(0, 1, 1, view(image)) == Usb4Domain::RetimerNvm::Failed);
+  }
+  {   // authentication: the retimer restarts and stops answering; a refusal that can be read says why
+    Usb4Rig rig(false);
+    rig_with_retimers(rig);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    CHECK(domain.start(nullptr));
+    fake_usb4::Port& port = rig.fabric.at(0).ports[1];
+    uint32_t status = 99;
+    CHECK(domain.retimer_nvm_write(0, 1, 1, view(image)) == Usb4Domain::RetimerNvm::Ok);
+    CHECK(domain.retimer_nvm_authenticate(0, 1, 1, false, &status) == Usb4Domain::RetimerNvm::Ok && status == 0 && port.rt_gone[2]);
+    uint8_t word[4];
+    CHECK(domain.retimer_nvm_read(0, 1, 1, 0, ByteView(word, 4)) == Usb4Domain::RetimerNvm::Failed);
+    Usb4Rig refused(false);
+    rig_with_retimers(refused);
+    Usb4Domain d(refused.control, refused.nhi, refused.alloc);
+    CHECK(d.start(nullptr));
+    refused.fabric.at(0).ports[1].rt_auth_error = 5;
+    CHECK(d.retimer_nvm_authenticate(0, 1, 1, true, &status) == Usb4Domain::RetimerNvm::AuthFailed && status == 5 && !refused.fabric.at(0).ports[1].rt_gone[2]);
+    CHECK(d.retimer_nvm_authenticate(0, 1, 0, false, &status) == Usb4Domain::RetimerNvm::Unsupported && d.retimer_nvm_authenticate(0, 1, 7, false, &status) == Usb4Domain::RetimerNvm::NoSuchRetimer);
   }
 }
 
@@ -4023,7 +4093,45 @@ static void test_usb4_dp_groups() {
   // a request to give back starts the time again, and the last stream of the group takes the keep with it
   fabric.request_dp_bandwidth(0, 10, 20000);
   CHECK(domain.dp_poll_requests() == 1 && domain.dp_group_reserved(1) == 11000);
-  CHECK(domain.disconnect_dp(0, 10) && domain.dp_group_reserved(1) == 11000 && domain.disconnect_dp(0, 11) && domain.dp_group_reserved(1) == 0);
+  domain.tick(5000);                                                           // (from a clock: the first reading only starts it)
+  domain.tick(14999);
+  CHECK(domain.dp_group_reserved(1) == 11000);
+  domain.tick(15000);
+  CHECK(domain.dp_group_reserved(1) == 0);
+  fabric.request_dp_bandwidth(0, 10, 10000);
+  CHECK(domain.dp_poll_requests() == 1 && domain.dp_group_reserved(1) == 10000);
+  CHECK(domain.disconnect_dp(0, 10) && domain.dp_group_reserved(1) == 10000 && domain.disconnect_dp(0, 11) && domain.dp_group_reserved(1) == 0);
+  control.stop();
+}
+
+static void test_usb4_dp_policy() {
+  TestAllocator alloc;
+  FakeNhi chip;
+  fake_usb4::Fabric fabric(chip);
+  fabric.add(0, 2, 2, false, true, 2, false, 2, 0);                        // host: DP in 10 11
+  fabric.add(0x01, 2, 1, true, false, 1, true, 0, 1);                      // D1: DP out 9
+  fabric.add(0x301, 1, 0, true, false, 0, true, 0, 1);                     // D2: DP out 5
+  fabric.link(0, 1, 0x01);
+  fabric.link(0x01, 3, 0x301);
+  TbNhi nhi(chip);
+  TbControl control(nhi, alloc);
+  CHECK(control.start());
+  Usb4Domain domain(control, nhi, alloc);
+  CHECK(domain.start(nullptr));
+  uint32_t router = 99, port = 99;
+  CHECK(domain.dp_connect_displays() == 0 && !domain.dp_find_output(0, 10, &router, &port));                  // no display anywhere
+  CHECK(!domain.dp_find_output(0, 5, &router, &port) && !domain.dp_find_output(9, 10, &router, &port));       // not an input, no such router
+  fabric.at(0x301).ports[5].space[0x10 + kDpOutCs2] |= kDpOutCs2Hpd;                                          // a display on the far dock
+  CHECK(domain.dp_find_output(0, 10, &router, &port) && router == 2 && port == 5);
+  fabric.at(0x01).ports[9].space[0x10 + kDpOutCs2] |= kDpOutCs2Hpd;                                           // and one on the near dock: it comes first
+  CHECK(domain.dp_find_output(0, 10, &router, &port) && router == 1 && port == 9);
+  // each input gets the next display; with both outputs taken nothing is left, and a second call makes nothing
+  CHECK(domain.dp_connect_displays() == 2 && domain.dp_tunnels() == 2 && domain.dp_connect_displays() == 0);
+  CHECK(!domain.dp_find_output(0, 10, &router, &port));
+  // a display that went away, its stream removed: the input can take another when one is plugged in
+  CHECK(domain.disconnect_dp(0, 10) && domain.disconnect_dp(0, 11));
+  fabric.at(0x01).ports[9].space[0x10 + kDpOutCs2] &= ~kDpOutCs2Hpd;
+  CHECK(domain.dp_connect_displays() == 1 && domain.dp_tunnels() == 1);
   control.stop();
 }
 
@@ -4120,9 +4228,11 @@ int main() {
   test_usb4_tbt3_extras();
   test_usb4_tbt3_drom();
   test_usb4_retimers();
+  test_usb4_retimer_nvm();
   test_usb4_dp_bandwidth();
   test_usb4_dp_arbitration();
   test_usb4_dp_groups();
+  test_usb4_dp_policy();
   test_usb4_usb3_and_dp_bandwidth();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();

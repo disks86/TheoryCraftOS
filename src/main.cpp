@@ -90,6 +90,11 @@
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
+#ifdef TCOS_BLUETOOTH
+#include "Hardware/Bluetooth/BluetoothService.hpp"
+#include "Hardware/Bluetooth/HidOverGatt.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
+#endif
 #ifdef TCOS_INTEL_WIFI
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
 #endif
@@ -692,7 +697,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           .text(renderer->accelerated() ? " (GPU accelerated)" : " (software)");
       if (system_graphics.accelerated()) {
         const int groups = check_2d_groups(system_graphics.device(), shared_allocator);
-        Entry(groups > 0 ? Level::Ok : groups == 0 ? Level::Warning : Level::Info, "Graphics").text("2D offscreen groups: ").text(groups > 2 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips)" : groups > 1 ? "ok (opacity, composite, blur and colour filters; clips approximated)" : groups > 0 ? "ok (opacity, composite; no filters on this device)" : groups == 0 ? "WRONG on this device" : "not supported by this device");
+        Entry(groups > 0 ? Level::Ok : groups == 0 ? Level::Warning : Level::Info, "Graphics").text("2D offscreen groups: ").text(groups > 3 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips, drop shadows)" : groups > 2 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips)" : groups > 1 ? "ok (opacity, composite, blur and colour filters; clips approximated)" : groups > 0 ? "ok (opacity, composite; no filters on this device)" : groups == 0 ? "WRONG on this device" : "not supported by this device");
+      }
+      if (system_graphics.accelerated()) {
+        const int glyphs = check_2d_glyphs(system_graphics.device(), shared_allocator);
+        Entry(glyphs > 0 ? Level::Ok : glyphs == 0 ? Level::Warning : Level::Info, "Graphics").text("2D glyph atlas: ").text(glyphs > 0 ? "ok (kept on the GPU, tinted by the GPU)" : glyphs == 0 ? "WRONG on this device" : "not supported by this device");
       }
       if (!system_graphics.accelerated())
         Entry(system_gpu.virtio_gpu() || system_gpu.vmware_gpu() ? Level::Warning : Level::Info, "Graphics").text("no 3D acceleration: ").text(system_graphics.software_reason());
@@ -1007,6 +1016,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);
+#ifdef TCOS_BLUETOOTH
+  hardware::HidOverGatt bluetooth_hid(shared_allocator);      // Bluetooth keyboards and mice: a profile for the Bluetooth manager and a source of input devices for SystemInput (it outlives both)
+#endif
   input.set_vmmdev(guest.virtualbox());
   input.initialize();
   // The touchpad and the touchscreen of a laptop are HID devices on an I2C bus behind the chipset (ACPI PNP0C50): found through the ACPI tables, and added to the mouse.
@@ -1207,6 +1219,43 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           Entry(Level::Warning, "Wi-Fi").text("Intel Wireless-AC not started: ").text(wifi->failure());
         }
         break;
+      }
+    }
+#endif
+#ifdef TCOS_BLUETOOTH
+    // The Bluetooth controllers on the USB ports (the Intel one on the Wireless-AC 9560 among them): its firmware, /firmware/ibt-*.sfi (the name without Linux's intel/ directory), is
+    // loaded and the controller brought up. Nothing is scanned, paired or connected. Opt-in (-DTCOS_BLUETOOTH=ON): none of it has run on a real controller.
+    struct BluetoothFirmwareFiles final : hardware::IBluetoothFirmwareSource {
+      hardware::FileSystemFirmwareSource files;
+      BluetoothFirmwareFiles(filesystem::IFileSystem& file_system, allocators::IAllocator& allocator) : files(file_system, allocator) {}
+      bool read(const char* name, ByteBuffer& out) override {
+        const char prefix[] = "intel/";
+        uint32_t skip = 0;
+        while (prefix[skip] && name[skip] == prefix[skip]) ++skip;
+        return files.read(name + (prefix[skip] ? 0 : skip), out);
+      }
+    } bluetooth_files(explorer_files.file_system(), shared_allocator);
+    hardware::FileBluetoothBonds bluetooth_bonds(explorer_files.file_system(), shared_allocator);
+    if (!smb_random.ready()) smb_random.initialize();
+    UniquePointer<hardware::BluetoothService> bluetooth = UniquePointer<hardware::BluetoothService>::make(shared_allocator, &usb, &bluetooth_files, shared_allocator, smb_random.ready() ? &smb_random : nullptr, &bluetooth_bonds);
+    uint32_t bluetooth_bonds_saved = 0;
+    if (bluetooth && paging_ok) {
+      bluetooth->add_profile(&bluetooth_hid);
+      input.add_source(&bluetooth_hid);
+      bluetooth->start();
+      bluetooth_bonds_saved = bluetooth->bonds().count();
+      for (uint32_t i = 0; i < bluetooth->count(); ++i) {
+        const hardware::BluetoothService::Entry* e = bluetooth->entry(i);
+        Entry log(e->state == hardware::BluetoothState::Ready ? Level::Ok : Level::Warning, "Bluetooth");
+        if (e->state == hardware::BluetoothState::Ready) {
+          const hardware::hci::BdAddr& a = e->controller->info().address;
+          log.text("controller ");
+          for (int b = 5; b >= 0; --b) log.hex2(a.b[b]).text(b > 0 ? ":" : "");
+          log.text(", ready");
+        } else {
+          log.text("controller not started: ").text(e->message);
+          if (e->firmware[0]) log.text(" (").text(e->firmware).text(")");
+        }
       }
     }
 #endif
@@ -1769,6 +1818,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
       }
 #endif
+#ifdef TCOS_BLUETOOTH
+      if (bluetooth) {
+        static uint32_t bluetooth_idle = 0;
+        if (++bluetooth_idle >= 25) {                                // (about every 100 ms: events read, controllers plugged in or pulled out noticed)
+          bluetooth_idle = 0;
+          bluetooth->step(true);
+          if (bluetooth->bonds().count() != bluetooth_bonds_saved) {                  // (a device was paired: the keys are kept)
+            bluetooth_bonds_saved = bluetooth->bonds().count();
+            bluetooth->save_bonds();
+          }
+        }
+      }
+#endif
 #ifdef TCOS_ACPI_EVENTS
       if (acpi_events) {
         static uint32_t acpi_idle = 0;
@@ -1823,6 +1885,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           tb_seen = tb_arrived;
           tb_idle = 0;
           thunderbolt->poll();
+          if (thunderbolt->usb4()) thunderbolt->usb4()->tick(hardware::uptime_us() / 1000);       // (the bandwidth groups' timers)
           if (thunderbolt_net) thunderbolt_net->poll();
         }
 #ifdef TCOS_THUNDERBOLT_RUNTIME_PM

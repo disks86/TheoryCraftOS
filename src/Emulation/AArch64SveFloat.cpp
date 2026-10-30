@@ -792,4 +792,8 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
   }
 }
 
+namespace sve {
+uint64_t fscale_value(Format f, uint64_t x, int64_t n, Env& env) { return emulation::fscale(f, x, n, env); }
+}  // namespace sve
+
 }  // namespace emulation

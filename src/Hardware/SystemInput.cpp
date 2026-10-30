@@ -143,6 +143,35 @@ uint32_t SystemInput::drop_removed() {
   return dropped;
 }
 
+bool SystemInput::add_source(IInputDeviceSource* source) {
+  if (!source) return false;
+  for (IInputDeviceSource* s : sources_)
+    if (s == source) return true;
+  for (IInputDeviceSource*& s : sources_) {
+    if (s) continue;
+    s = source;
+    return true;
+  }
+  return false;
+}
+
+bool SystemInput::remove_source(IInputDeviceSource* source) {
+  for (IInputDeviceSource*& s : sources_) {
+    if (s != source || !s) continue;
+    Sink sink(*this);
+    s->detach_all(sink);
+    s = nullptr;
+    return true;
+  }
+  return false;
+}
+
+uint32_t SystemInput::source_count() const {
+  uint32_t n = 0;
+  for (IInputDeviceSource* s : sources_) n += s != nullptr;
+  return n;
+}
+
 uint32_t SystemInput::poll() {
   uint32_t changes = drop_removed();
   watcher_.scan([&](uint32_t, IUsbHostController& host, uint32_t port) {
@@ -150,6 +179,9 @@ uint32_t SystemInput::poll() {
     changes += take_up(host, port);
   });
   changes += drop_removed();
+  Sink sink(*this);
+  for (IInputDeviceSource* s : sources_)
+    if (s) changes += s->poll(sink);
   return changes;
 }
 
@@ -225,6 +257,11 @@ void SystemInput::initialize() {
 
 void SystemInput::shutdown() {
   stop_service();
+  Sink sink(*this);
+  for (IInputDeviceSource*& s : sources_) {
+    if (s) s->detach_all(sink);
+    s = nullptr;
+  }
   for (uint64_t i = owned_.count(); i > 0; --i) owned_[i - 1]->shutdown();  // newest first
   owned_.clear();  // frees the devices
   ps2_keyboard_.shutdown();

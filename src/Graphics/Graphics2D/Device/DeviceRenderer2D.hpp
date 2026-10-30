@@ -82,6 +82,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   void fill_rounded_rect(const Rect2D& rect, const CornerRadii& radii, uint32_t color) override;
   void stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) override;
   void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) override;
+  void draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) override;
   bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) override;
   bool begin_group(const Rect2D& bounds) override;
   bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) override;
@@ -89,6 +90,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool begin_filter_group(const Rect2D& bounds) override;
   bool group_blur(float sigma) override;
   bool group_color(const ColorTransform& t) override;
+  bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) override;
+  bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) override;
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
@@ -101,6 +104,13 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
   bool draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) override;
   void present() override;
+
+  // How many clip masks were found already made (and how many had to be made) since this renderer began: the masks of rounded and mask clips are kept between frames.
+  uint64_t clip_mask_hits() const { return mask_hits_; }
+  uint64_t clip_mask_misses() const { return mask_misses_; }
+  // How many glyphs were put on the atlas since this renderer began (a glyph drawn again is not put there again).
+  uint64_t glyphs_made() const { return glyphs_made_; }
+  bool has_glyph_atlas() const { return atlas_ok_; }
 
   // The color to draw for a pixel with `cov` (0..255) coverage; false: draw nothing (used by the rounded-rect helpers).
   bool coverage_color(uint32_t color, uint32_t cov, uint32_t* out) const;
@@ -120,6 +130,8 @@ class DeviceRenderer2D final : public IRenderer2D {
     Rect2D clip;
     BlendMode blend;
     bool sheet;   // the vertices are the sheet's (textured), not the colored batch's
+    bool glyph = false;   // the vertices are the glyph batch's (tinted, from the atlas)
+    bool erase = false;   // the vertices erase what is under them (a group's picture times one minus their alpha)
   };
 
   void triangle_colors(const float* xs, const float* ys, const Vec4* colors);  // three vertices, own colors
@@ -136,6 +148,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool sheet_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y);   // room for a w x h mask on the sheet (a submit and a fresh sheet if it is full)
   void sheet_emit(uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, int64_t dx, int64_t dy);   // the rectangle that shows it
   void close_sheet_range();
+  void close_glyph_range();
   void reset_sheet();
   bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
   // The image's (u0, v0)-(u1, v1) on the quadrilateral with corners (xs[i], ys[i]) (top left, top right, bottom right, bottom left), sampled with `filter`.
@@ -152,6 +165,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool open_group(const Rect2D& bounds, bool detached);   // begin_group / begin_filter_group
   bool filter_pass(IPipeline* pipeline, void* constants, uint32_t size, bool horizontal_unused);   // the top group's image through `pipeline` into a new image (which replaces it)
   bool blur_pass(int32_t radius, bool horizontal);
+  // One textured rectangle covering all of `dest` (w x h), showing `source`, through `pipeline`; `clear` first wipes dest to transparent.
+  bool pass_to(IImage* dest, uint32_t w, uint32_t h, IImage* source, IPipeline* pipeline, const void* constants, uint32_t size, Filter filter, bool clear);
   IPipeline* colored_pipeline(BlendMode mode) const;
   IPipeline* textured_pipeline(BlendMode mode) const;
 
@@ -210,11 +225,36 @@ class DeviceRenderer2D final : public IRenderer2D {
     float opacity = 1.0f;          // the renderer's per-shape opacity outside the group
     bool layer = false;            // from push_layer: its opacity is applied when it ends
     uint8_t layer_opacity = 255;
+    int32_t mask_slot = -1;        // the mask is entry n of the mask cache (which owns it), or -1: the group owns it
     IImage* mask = nullptr;        // a clip by a coverage mask: the picture is laid over the parent through it when the clip is popped
     bool detached = false;         // a filter group: its clip is its bounds alone
     uint32_t prev_detach = 0xFFFFFFFFu;      // detach_index_ outside it
     uint32_t prev_overflow = 0;
   };
+  // The glyph atlas: the coverage of glyphs (as alpha), kept from frame to frame, so a glyph is made and sent up once and drawn tinted by the GPU
+  // (a vertex color) whenever it is wanted. Shelf packing; when it is full, it starts again.
+  static constexpr uint32_t kAtlasSize = 1024, kAtlasTable = 4096, kAtlasMaxGlyph = 128, kMaxGlyphVertices = 6 * 4096;
+  struct AtlasEntry {
+    uint64_t id = 0;
+    uint16_t x = 0, y = 0, w = 0, h = 0;
+    bool used = false;
+  };
+  bool atlas_ok_ = false;
+  IShaderModule* tint_vs_ = nullptr;
+  IShaderModule* tint_fs_ = nullptr;
+  IPipeline* glyph_blended_ = nullptr;
+  IPipeline* glyph_group_ = nullptr;
+  IBuffer* glyph_vertices_ = nullptr;
+  ArrayView<TintedVertex> glyph_batch_;
+  uint32_t glyph_count_ = 0, glyph_range_start_ = 0;
+  IImage* atlas_ = nullptr;
+  ArrayView<uint32_t> atlas_pixels_;
+  ArrayView<AtlasEntry> atlas_table_;
+  uint64_t glyphs_made_ = 0;
+  uint32_t atlas_entries_ = 0, atlas_x_ = 0, atlas_y_ = 0, atlas_shelf_ = 0;
+  bool atlas_dirty_ = false;
+  bool atlas_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y);
+  void atlas_reset();
   IShaderModule* scaled_fs_ = nullptr;
   IPipeline* group_blended_ = nullptr;
   IPipeline* texture_group_ = nullptr;
@@ -222,9 +262,25 @@ class DeviceRenderer2D final : public IRenderer2D {
   Group groups_[kMaxGroups];
   uint32_t group_depth_ = 0;
   bool groups_ok_ = false;
+  // The coverage masks of exact clips, kept (least recently used first to go) so that the same clip drawn again does not build and upload its mask again.
+  static constexpr uint32_t kMaskCacheEntries = 24;
+  static constexpr uint64_t kMaskCachePixels = uint64_t{1} << 23;   // what the cache may hold in all
+  struct MaskEntry {
+    uint64_t key = 0, used = 0;
+    uint32_t width = 0, height = 0, in_use = 0;   // in_use: open groups that draw through it
+    IImage* image = nullptr;
+  };
+  MaskEntry mask_cache_[kMaskCacheEntries];
+  uint64_t mask_clock_ = 0, mask_cache_pixels_ = 0, mask_hits_ = 0, mask_misses_ = 0;
+  int32_t find_mask(uint64_t key, uint32_t w, uint32_t h);
+  int32_t keep_mask(uint64_t key, IImage* image, uint32_t w, uint32_t h);   // a slot for a new mask (evicting the oldest unused), or -1
   IShaderModule* masked_fs_ = nullptr;
   IPipeline* masked_ = nullptr;
   bool masks_ok_ = false;
+  IShaderModule* shadow_fs_ = nullptr;
+  IPipeline* filter_shadow_ = nullptr;
+  IPipeline* group_erase_ = nullptr;
+  bool erase_ = false;   // shapes recorded now erase
   IShaderModule* blur_fs_ = nullptr;
   IShaderModule* color_fs_ = nullptr;
   IPipeline* filter_blur_ = nullptr;

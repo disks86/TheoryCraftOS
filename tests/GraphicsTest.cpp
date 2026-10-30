@@ -731,6 +731,153 @@ static void test_groups(Rig& g) {
   CHECK(!r.end_group(none, 255, ImageFilter::Nearest));   // (no group open)
 }
 
+// The masks of rounded and mask clips are kept: the same clip again (even moved) is found made, a different one is made, and the picture is the same either way.
+static void test_mask_cache(Rig& g) {
+  IRenderer2D& r = *g.r;
+  DeviceRenderer2D& d = *g.dev;
+  auto rounded = [&](int32_t x, int32_t y, float radius) {
+    g.reset();
+    CHECK(r.push_clip_rounded_rect({x, y, 40, 40}, CornerRadii::uniform(radius)));
+    r.fill_rect({0, 0, 64, 64}, kWhite);
+    r.pop_clip();
+    g.read();
+  };
+  rounded(8, 8, 12);
+  const uint64_t hits0 = d.clip_mask_hits(), misses0 = d.clip_mask_misses();
+  uint32_t first[64 * 64];
+  for (uint32_t i = 0; i < 64 * 64; ++i) first[i] = g.frame[i];
+  rounded(8, 8, 12);
+  CHECK(d.clip_mask_hits() == hits0 + 1 && d.clip_mask_misses() == misses0);
+  uint32_t same = 0;
+  for (uint32_t i = 0; i < 64 * 64; ++i) same += first[i] == g.frame[i];
+  CHECK(same == 64 * 64);
+  rounded(10, 6, 12);   // (moved: the same mask)
+  CHECK(d.clip_mask_hits() == hits0 + 2 && d.clip_mask_misses() == misses0);
+  CHECK(g.at(10 + 20, 6 + 20) == kWhite && g.at(10, 6) == kBlack && g.at(10 + 39, 6 + 39) == kBlack);
+  rounded(8, 8, 6);   // (another radius)
+  CHECK(d.clip_mask_misses() == misses0 + 1 && g.at(8, 8) == kBlack);
+  // a mask clip
+  uint8_t m8[64], n8[64];
+  for (uint32_t i = 0; i < 64; ++i) {
+    m8[i] = (i % 8) < 4 ? 255 : 0;
+    n8[i] = (i % 8) < 2 ? 255 : 0;
+  }
+  const uint64_t mh = d.clip_mask_hits(), mm = d.clip_mask_misses();
+  for (int round = 0; round < 3; ++round) {
+    g.reset();
+    r.push_clip_mask(MaskView{ConstByteView(m8, 64), 8, 8, 8}, 20, 20);
+    r.fill_rect({0, 0, 64, 64}, kWhite);
+    r.pop_clip();
+    g.read();
+    CHECK(g.at(21, 21) == kWhite && g.at(25, 21) == kBlack);
+  }
+  CHECK(d.clip_mask_misses() == mm + 1 && d.clip_mask_hits() == mh + 2);
+  g.reset();
+  r.push_clip_mask(MaskView{ConstByteView(n8, 64), 8, 8, 8}, 20, 20);
+  r.fill_rect({0, 0, 64, 64}, kWhite);
+  r.pop_clip();
+  g.read();
+  CHECK(d.clip_mask_misses() == mm + 2 && g.at(21, 21) == kWhite && g.at(23, 21) == kBlack);
+  // many different clips push the oldest out; the first one still draws right afterwards (made again)
+  for (int i = 0; i < 40; ++i) rounded(2, 2, 3.1f + static_cast<float>(i) * 0.25f);
+  const uint64_t before = d.clip_mask_misses();
+  rounded(8, 8, 12);
+  CHECK(d.clip_mask_misses() == before + 1);
+  uint32_t same2 = 0;
+  for (uint32_t i = 0; i < 64 * 64; ++i) same2 += first[i] == g.frame[i];
+  CHECK(same2 == 64 * 64);
+  // clips nested deeper than a cache entry could be spared still draw
+  g.reset();
+  r.push_clip_rounded_rect({0, 0, 60, 60}, CornerRadii::uniform(20));
+  r.push_clip_rounded_rect({4, 4, 52, 52}, CornerRadii::uniform(16));
+  r.push_clip_rounded_rect({8, 8, 44, 44}, CornerRadii::uniform(12));
+  r.fill_rect({0, 0, 64, 64}, kWhite);
+  r.pop_clip();
+  r.pop_clip();
+  r.pop_clip();
+  g.read();
+  CHECK(g.at(30, 30) == kWhite && g.at(0, 0) == kBlack && g.at(8, 8) == kBlack);
+}
+
+// draw_glyph: the device renderer keeps glyphs on an atlas and tints them with the GPU; the picture is the CPU renderer's (to rounding), a glyph drawn again is not made again, and
+// glyphs mix in order with other shapes, in layers and under clips.
+static void test_glyphs() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  DeviceRenderer2D d(device, a, {kW, kH});
+  CHECK(d.valid() && d.has_glyph_atlas());
+  Surface cs = make_surface(a, kW, kH);
+  SoftwareRenderer2D cpu(cs, nullptr, &a);
+  ArrayView<uint32_t> frame = allocate_view<uint32_t>(a, kW * kH);
+  uint8_t cov_a[10 * 12], cov_b[7 * 9];
+  for (uint32_t i = 0; i < sizeof cov_a; ++i) cov_a[i] = static_cast<uint8_t>((i * 37) % 256);
+  for (uint32_t i = 0; i < sizeof cov_b; ++i) cov_b[i] = static_cast<uint8_t>(i % 5 == 0 ? 255 : (i * 11) % 200);
+  const MaskView ma{ConstByteView(cov_a, sizeof cov_a), 10, 12, 10}, mb{ConstByteView(cov_b, sizeof cov_b), 7, 9, 7};
+  auto scene = [&](IRenderer2D& r) {
+    r.reset_clip();
+    r.clear(0xFF204060);
+    r.fill_rect({0, 0, 30, 20}, 0xFF804020);   // (colored shapes before, between and after the glyphs)
+    r.draw_glyph(1001, ma, 4, 4, 0xFFFFFFFF);
+    r.fill_rect({10, 2, 6, 6}, 0xC000FF00);
+    r.draw_glyph(1002, mb, 20, 6, 0xFFFFEE00);
+    r.draw_glyph(1001, ma, 40, 30, 0xA0FF0000);   // (the same glyph again, translucent, in another colour)
+    r.set_clip({0, 40, 64, 24});
+    r.draw_glyph(1002, mb, 58, 44, 0xFF00FFFF);   // (partly outside the clip)
+    r.reset_clip();
+    r.draw_glyph(1001, ma, -4, 50, 0xFF88FF88);   // (partly outside the target)
+    r.draw_glyph(1003, ma, 30, 50, 0x00FFFFFF);   // (transparent: nothing)
+  };
+  scene(d);
+  scene(cpu);
+  CHECK(d.read_pixels(frame));
+  uint32_t far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  CHECK(d.glyphs_made() == 2);   // (1001 and 1002; 1003 was never wanted on the screen)
+  scene(d);   // a second frame: nothing is made again
+  CHECK(d.read_pixels(frame));
+  CHECK(d.glyphs_made() == 2);
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // inside a layer (an offscreen group): the glyph is laid over as part of the picture
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (IRenderer2D* r : {static_cast<IRenderer2D*>(&d), static_cast<IRenderer2D*>(&cpu)}) {
+    r->push_layer({0, 0, 64, 64}, 128);
+    r->draw_glyph(1001, ma, 10, 10, 0xFFFFFFFF);
+    r->draw_glyph(1002, mb, 14, 12, 0xFFFFFFFF);   // (overlapping: one picture)
+    r->pop_layer();
+  }
+  CHECK(d.read_pixels(frame));
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // many glyphs: the atlas fills up and starts again, and every glyph still comes out right
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (uint32_t i = 0; i < 3400; ++i) {
+    uint8_t cov[16 * 16];
+    for (uint32_t k = 0; k < sizeof cov; ++k) cov[k] = static_cast<uint8_t>((k * 7 + i * 13) % 251);
+    const MaskView m{ConstByteView(cov, sizeof cov), 16, 16, 16};
+    const int32_t gx = static_cast<int32_t>(i % 4) * 16, gy = static_cast<int32_t>((i / 4) % 4) * 16;
+    d.draw_glyph(5000 + i, m, gx, gy, 0xFFFFFFFF);
+    cpu.draw_mask(m, {0, 0, 16, 16}, gx, gy, 0xFFFFFFFF);
+    if (i % 1100 == 0 || i == 3399) {   // (look at the picture now and then: the later glyphs cover the earlier ones)
+      CHECK(d.read_pixels(frame));
+      far = 0;
+      for (uint32_t y = 0; y < kH; ++y)
+        for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+      CHECK(far == 0);
+    }
+  }
+  release_view(a, frame);
+  release_view(a, cs.pixels);
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -1158,6 +1305,7 @@ static void test_primitives() {
     test_scaled(g, a);
     test_transformed(g, a);
     test_groups(g);
+    test_mask_cache(g);
     test_gradients(g);
     test_clip_stack(g, a);
     test_layers(g);
@@ -1791,6 +1939,7 @@ int main() {
   test_fast_paths();
   test_primitives();
   test_renderers_agree();
+  test_glyphs();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("graphics: all checks passed\n");
   return 0;

@@ -1,5 +1,5 @@
 // Generated from the LLVM encodings of the SME2 ZA-array instructions (mask / value of the fixed bits, and where the offset and the element index live). Do not edit.
-enum Sme2Op : uint8_t {k_add, k_bfadd, k_bfdot, k_bfmla, k_bfmlal, k_bfmls, k_bfmlsl, k_bfsub, k_bfvdot, k_fadd, k_fdot, k_fmla, k_fmlal, k_fmls, k_fmlsl, k_fsub, k_fvdot, k_sdot, k_smlal, k_smlall, k_smlsl, k_smlsll, k_sub, k_sudot, k_sumlall, k_suvdot, k_svdot, k_udot, k_umlal, k_umlall, k_umlsl, k_umlsll, k_usdot, k_usmlall, k_usvdot, k_uvdot};
+enum Sme2Op : uint8_t {k_add, k_bfadd, k_bfdot, k_bfmla, k_bfmlal, k_bfmls, k_bfmlsl, k_bfsub, k_bfvdot, k_fadd, k_fdot, k_fdot8, k_fmla, k_fmlal, k_fmlal8, k_fmlall8, k_fmls, k_fmlsl, k_fsub, k_fvdot, k_fvdot8, k_fvdotb8, k_fvdott8, k_sdot, k_smlal, k_smlall, k_smlsl, k_smlsll, k_sub, k_sudot, k_sumlall, k_suvdot, k_svdot, k_udot, k_umlal, k_umlall, k_umlsl, k_umlsll, k_usdot, k_usmlall, k_usvdot, k_uvdot};
 struct Sme2Form { uint32_t mask, value; Sme2Op op; uint8_t group, shape, src, dst, off_scale, off_count, idx_count; uint8_t off_bits[4], idx_bits[4]; };
 static const Sme2Form kSme2Forms[] = {
     {0xffff9c38, 0xc1a01c10, k_add, 2, 0, 2, 2, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // add
@@ -299,4 +299,35 @@ static const Sme2Form kSme2Forms[] = {
     {0xfff09070, 0xc1109030, k_bfmls, 4, 3, 1, 1, 1, 3, 3, {0,1,2,0}, {3,10,11,0}},  // bfmls
     {0xfff09038, 0xc1500020, k_svdot, 2, 3, 1, 2, 1, 3, 2, {0,1,2,0}, {10,11,0,0}},  // svdot
     {0xfff09038, 0xc1500030, k_uvdot, 2, 3, 1, 2, 1, 3, 2, {0,1,2,0}, {10,11,0,0}},  // uvdot
+    {0xfff09c38, 0xc1201008, k_fdot8, 2, 1, 0, 1, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xffe19c38, 0xc1a01020, k_fdot8, 2, 2, 0, 1, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xfff09030, 0xc1d00020, k_fdot8, 2, 3, 0, 1, 1, 3, 3, {0,1,2,0}, {3,10,11,0}},  // fdot
+    {0xfff09c38, 0xc1201018, k_fdot8, 2, 1, 0, 2, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xffe19c38, 0xc1a01030, k_fdot8, 2, 2, 0, 2, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xfff09038, 0xc1500038, k_fdot8, 2, 3, 0, 2, 1, 3, 2, {0,1,2,0}, {10,11,0,0}},  // fdot
+    {0xfff09c78, 0xc1301008, k_fdot8, 4, 1, 0, 1, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xffe39c78, 0xc1a11020, k_fdot8, 4, 2, 0, 1, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xfff09070, 0xc1109040, k_fdot8, 4, 3, 0, 1, 1, 3, 3, {0,1,2,0}, {3,10,11,0}},  // fdot
+    {0xfff09c78, 0xc1301018, k_fdot8, 4, 1, 0, 2, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xffe39c78, 0xc1a11030, k_fdot8, 4, 2, 0, 2, 1, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fdot
+    {0xfff09078, 0xc1508008, k_fdot8, 4, 3, 0, 2, 1, 3, 2, {0,1,2,0}, {10,11,0,0}},  // fdot
+    {0xfff09c18, 0xc1300c00, k_fmlal8, 1, 4, 0, 1, 2, 3, 0, {0,1,2,0}, {0,0,0,0}},  // fmlal
+    {0xfff01010, 0xc1c00000, k_fmlal8, 1, 5, 0, 1, 2, 3, 4, {0,1,2,0}, {3,10,11,15}},  // fmlal
+    {0xfff09c3c, 0xc1200804, k_fmlal8, 2, 1, 0, 1, 2, 2, 0, {0,1,0,0}, {0,0,0,0}},  // fmlal
+    {0xffe19c3c, 0xc1a00820, k_fmlal8, 2, 2, 0, 1, 2, 2, 0, {0,1,0,0}, {0,0,0,0}},  // fmlal
+    {0xfff09030, 0xc1901030, k_fmlal8, 2, 3, 0, 1, 2, 2, 4, {0,1,0,0}, {2,3,10,11}},  // fmlal
+    {0xfff09c7c, 0xc1300804, k_fmlal8, 4, 1, 0, 1, 2, 2, 0, {0,1,0,0}, {0,0,0,0}},  // fmlal
+    {0xffe39c7c, 0xc1a10820, k_fmlal8, 4, 2, 0, 1, 2, 2, 0, {0,1,0,0}, {0,0,0,0}},  // fmlal
+    {0xfff09070, 0xc1909020, k_fmlal8, 4, 3, 0, 1, 2, 2, 4, {0,1,0,0}, {2,3,10,11}},  // fmlal
+    {0xfff09c1c, 0xc1300400, k_fmlall8, 1, 4, 0, 2, 4, 2, 0, {0,1,0,0}, {0,0,0,0}},  // fmlall
+    {0xfff0001c, 0xc1400000, k_fmlall8, 1, 5, 0, 2, 4, 2, 4, {0,1,0,0}, {10,11,12,15}},  // fmlall
+    {0xfff09c3e, 0xc1200002, k_fmlall8, 2, 1, 0, 2, 4, 1, 0, {0,0,0,0}, {0,0,0,0}},  // fmlall
+    {0xffe19c3e, 0xc1a00020, k_fmlall8, 2, 2, 0, 2, 4, 1, 0, {0,0,0,0}, {0,0,0,0}},  // fmlall
+    {0xfff09038, 0xc1900020, k_fmlall8, 2, 3, 0, 2, 4, 1, 4, {0,0,0,0}, {1,2,10,11}},  // fmlall
+    {0xfff09c7e, 0xc1300002, k_fmlall8, 4, 1, 0, 2, 4, 1, 0, {0,0,0,0}, {0,0,0,0}},  // fmlall
+    {0xffe39c7e, 0xc1a10020, k_fmlall8, 4, 2, 0, 2, 4, 1, 0, {0,0,0,0}, {0,0,0,0}},  // fmlall
+    {0xfff09078, 0xc1108040, k_fmlall8, 4, 3, 0, 2, 4, 1, 4, {0,0,0,0}, {1,2,10,11}},  // fmlall
+    {0xfff09030, 0xc1d01020, k_fvdot8, 2, 3, 0, 1, 1, 3, 3, {0,1,2,0}, {3,10,11,0}},  // fvdot
+    {0xfff09830, 0xc1d00800, k_fvdotb8, 2, 3, 0, 2, 1, 3, 2, {0,1,2,0}, {3,10,0,0}},  // fvdotb
+    {0xfff09830, 0xc1d00810, k_fvdott8, 2, 3, 0, 2, 1, 3, 2, {0,1,2,0}, {3,10,0,0}},  // fvdott
 };

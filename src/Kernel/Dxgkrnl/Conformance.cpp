@@ -1091,10 +1091,9 @@ void scene_texel_cube(Rig& rig, ArrayView<uint32_t> out) {
 
 // A compute shader (cs_fill.hlsl): 4 x 8 groups of 8 x 4 threads, each writing a pixel of a 32 x 32 picture into a structured buffer from its SV_DispatchThreadID, SV_GroupID and
 // SV_GroupIndex, a structured buffer of uint4 it writes and reads back, a constant from the constant buffer, and two atomic counters that must end at 1024. The picture is the buffer.
-void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
+void compute_fill(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
-  namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_fill, sizeof b::k_cs_fill));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1250,12 +1249,50 @@ void scene_d3d12_heap(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// DXIL (Shader Model 6) shaders: a vertex shader with a constant buffer (a matrix and a tint) and three pixel shaders - one with a lot of arithmetic, one with branches and a discard, one with
+// loops - each drawing a triangle in a third of the picture. The kernel translates the bitcode to the tokens of the same shader, so this checks that what comes out runs on the GPU as it does on the CPU.
+void scene_dxil(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle first = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_math, sizeof b::k_dxil_ps_math, 0);
+  Handle second = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_flow, sizeof b::k_dxil_ps_flow, 0);
+  Handle third = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_loop, sizeof b::k_dxil_ps_loop, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  // (positions in the cell, colours, so that the varyings span ranges that take the branches both ways)
+  Vertex v[9];
+  for (uint32_t cell = 0; cell < 3; ++cell) {
+    const float x0 = -0.97f + 0.65f * static_cast<float>(cell), x1 = x0 + 0.6f;
+    v[3 * cell] = {x0, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f};
+    v[3 * cell + 1] = {x1, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f};
+    v[3 * cell + 2] = {(x0 + x1) * 0.5f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f};
+  }
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  float constants[20];
+  for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+  constants[16] = 1.0f, constants[17] = 0.9f, constants[18] = 1.0f, constants[19] = 1.0f;   // (the tint)
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(constants, sizeof constants));
+  w.bind_pipeline(first);
+  w.draw(3, 0);
+  w.bind_pipeline(second);
+  w.draw(3, 3);
+  w.bind_pipeline(third);
+  w.draw(3, 6);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+void scene_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_cs_fill, sizeof conformance_blobs::k_cs_fill); }
+// The same shader as DXIL (cs_6_0).
+void scene_dxil_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_dxil_cs_fill, sizeof conformance_blobs::k_dxil_cs_fill); }
+
 // Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
 // by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
-void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
+void compute_shared(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
-  namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_shared, sizeof b::k_cs_shared));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1269,6 +1306,9 @@ void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {picture});
   rig.read_words(picture, out);
 }
+
+void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_cs_shared, sizeof conformance_blobs::k_cs_shared); }
+void scene_dxil_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_dxil_cs_shared, sizeof conformance_blobs::k_dxil_cs_shared); }
 
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
@@ -1314,12 +1354,12 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
 }
 
 // A geometry shader (gs_copy.hlsl): every triangle comes out as itself and, as a second strip, a half-size copy moved to the lower right with the red and blue swapped.
-void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
+void geometry_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* gs_code, uint32_t gs_size) {
   if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
   namespace b = conformance_blobs;
   const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
   Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
-  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy, sizeof b::k_gs_copy));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(gs_code, gs_size));
   Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
   PipelineDesc pd = colour_pipeline_desc(vs, ps);
   pd.varying_count = 3;
@@ -1337,6 +1377,10 @@ void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {target, vb});
   rig.read(target, out);
 }
+
+void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_gs_copy, sizeof conformance_blobs::k_gs_copy); }
+// The same shader as DXIL (gs_6_0).
+void scene_dxil_geometry(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_dxil_gs_copy, sizeof conformance_blobs::k_dxil_gs_copy); }
 
 // The geometry shader that runs twice for each primitive (gs_copy_inst2: gs_copy with an instance count of 2): the same triangles drawn twice over, so the same picture as gs_copy's.
 void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
@@ -2153,6 +2197,11 @@ TESS_SCENE(scene_tess_fractional_even,
            {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_even_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
            {TESS_BLOB(hs_iso_even_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
 
+// The same with DXIL (Shader Model 6) hull and domain shaders: a triangle patch and a quad patch with different factors.
+TESS_SCENE(scene_dxil_tess,
+           {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {3, 6, 2, 4}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {4, 4, 4, 4}, {4, 4, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {2, 3, 5, 8}, {4, 3, 0, 0}, kNoCull})
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2187,6 +2236,11 @@ const Entry kScenes[] = {
     {"Direct3D 12 root signature, descriptors and states: compute (DXBC)", scene_d3d12_compute},
     {"Direct3D 12 root signature, descriptors and states: textures (DXBC)", scene_d3d12_textures},
     {"Direct3D 12 resource heap: a target and a texture aliased (DXBC)", scene_d3d12_heap},
+    {"Direct3D 12 DXIL shaders (Shader Model 6)", scene_dxil},
+    {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
+    {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
+    {"Direct3D 12 DXIL hull and domain shaders (Shader Model 6)", scene_dxil_tess},
+    {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
     {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},

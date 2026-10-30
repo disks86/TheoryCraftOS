@@ -127,6 +127,12 @@ class IRenderer2D {
   // The glyph blit: `source_rect` of `mask` tinted with `color` (its alpha scales the coverage), top left at
   // (x, y). Fully covered pixels of an opaque color are written directly.
   virtual void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) = 0;
+  // draw_mask for a glyph: `id` names the bitmap (the same id is always the same pixels), so a renderer may keep it between calls and need not be given it again to
+  // draw it; the pixels are `mask` as they are. The default draws the mask.
+  virtual void draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) {
+    (void)id;
+    draw_mask(mask, Rect2D{0, 0, mask.width, mask.height}, x, y, color);
+  }
   // Draws `source_rect` of `source` stretched over `dest`. Pixel centers of `dest` map linearly into
   // `source_rect`; samples never leave the rectangle (clamped at its edges).
   virtual void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) = 0;
@@ -169,6 +175,17 @@ class IRenderer2D {
   }
   virtual bool group_color(const ColorTransform& t) {
     (void)t;
+    return false;
+  }
+  // A drop shadow: the picture's alpha moved by (dx, dy) whole pixels, blurred (as group_blur does, sigma pixels) and tinted with `color` (0xAARRGGBB, its alpha scales the
+  // shadow), put under the picture.
+  virtual bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) {
+    (void)dx, (void)dy, (void)sigma, (void)color;
+    return false;
+  }
+  // Erases the coverage of a rounded rectangle (anti-aliased like fill_rounded_rect) from a filter group's picture: what was there is multiplied by one minus the coverage.
+  virtual bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) {
+    (void)rect, (void)radii;
     return false;
   }
 

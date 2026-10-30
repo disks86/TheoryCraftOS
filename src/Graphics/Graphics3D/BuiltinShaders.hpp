@@ -55,6 +55,16 @@ struct TexturedScaledConstants {
   float pad[3];
 };
 ShaderModuleDesc textured_scaled_fragment_shader();
+// The tinted textured pair, for glyphs: per vertex a position, a texture coordinate and a straight color (rgba, 0..1); the fragment shader writes that color with its alpha times the
+// alpha of the texel of texture unit 0. The vertex shader takes the same matrix. Only the software and virgl devices have it.
+struct TintedVertex {
+  float position[3];
+  float uv[2];
+  float color[4];
+};
+ShaderModuleDesc tinted_vertex_shader();
+ShaderModuleDesc tinted_fragment_shader();
+void describe_tinted_pipeline(GraphicsPipelineDesc* desc);
 // Filters of a picture of premultiplied colors, one render pass each (the vertex shader is the textured one; software and virgl only).
 // Blur: one box blur pass along the step: the center texel and eight each way at multiples of the step (texture coordinates), with the nine mirrored weights.
 struct TexturedBlurConstants {
@@ -65,6 +75,14 @@ struct TexturedBlurConstants {
 };
 // A picture (texture 0, premultiplied) multiplied by the alpha of texture 1 at the same coordinate: a clip by a coverage mask. Its pipeline has two textures.
 ShaderModuleDesc textured_masked_fragment_shader();
+// The shadow of a picture: its alpha moved by `offset` (texture coordinates) and tinted with `color` (straight 0..1, alpha included), premultiplied.
+struct TexturedShadowConstants {
+  Mat4 mvp;
+  float color[4];
+  float offset[2];
+  float pad[2];
+};
+ShaderModuleDesc textured_shadow_fragment_shader();
 ShaderModuleDesc textured_blur_fragment_shader();
 // Colour function on straight colors: rgb' = rows * rgb + add (each row: three factors and the add), clamped, alpha' = alpha * alpha_scale; the output is premultiplied.
 struct TexturedColorConstants {

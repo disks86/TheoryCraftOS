@@ -659,17 +659,29 @@ int Usb4Domain::find_router_cap(const Usb4Router& r, uint8_t id) {
   uint32_t header = 0;
   if (!read(r.route, 0, TbConfigSpace::Switch, 1, ArrayView<uint32_t>(&header, 1))) return -1;
   uint32_t offset = header & 0xFF;
-  for (uint32_t i = 0; i < 64 && offset != 0 && offset < 64; ++i) {
+  for (uint32_t i = 0; i < 64 && offset != 0 && offset < 0x1F00; ++i) {
     uint32_t word = 0;
     if (!read(r.route, 0, TbConfigSpace::Switch, offset, ArrayView<uint32_t>(&word, 1))) return -1;
     if (((word >> 8) & 0xFF) == id) return static_cast<int>(offset);
-    offset = word & 0xFF;
+    uint32_t next = word & 0xFF;
+    if (((word >> 8) & 0xFF) == kSwitchCapVse && ((word >> 24) & 0xFF) == 0) {      // (a vendor specific capability in the long form keeps its next offset in the second dword)
+      uint32_t second = 0;
+      if (!read(r.route, 0, TbConfigSpace::Switch, offset + 1, ArrayView<uint32_t>(&second, 1))) return -1;
+      next = second & 0xFFFF;
+    }
+    offset = next;
   }
   return -1;
 }
 
 bool Usb4Domain::tmu_set_time_disruption(const Usb4Router& r, bool set) {
   uint32_t word = 0;
+  if (r.tbt3) {                                              // (a Thunderbolt 3 router has the bit in its time vendor capability)
+    const int cap = find_router_vse(r, kVsecTime2);
+    if (cap < 0 || static_cast<uint32_t>(cap) + kTime2Cs26 >= 0x1F00 || !read(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs26, ArrayView<uint32_t>(&word, 1))) return false;
+    word = set ? (word | kTime2Cs26Td) : (word & ~kTime2Cs26Td);
+    return write(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs26, ArrayView<const uint32_t>(&word, 1));
+  }
   if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&word, 1))) return false;
   word = set ? (word | kTmuRtrCs0Td) : (word & ~kTmuRtrCs0Td);
   return write(r.route, 0, TbConfigSpace::Switch, r.cap_tmu + kTmuRtrCs0, ArrayView<const uint32_t>(&word, 1));
@@ -727,11 +739,22 @@ bool Usb4Domain::tmu_enable_root(Usb4Router& root) {
   return ok;
 }
 
+// Titan Ridge objects to CL states while the time is synchronized; the objections of the time capability and of the upstream adapter are switched off first (tb_switch_tmu_disable_objections).
+bool Usb4Domain::tmu_disable_objections(const Usb4Router& r) {
+  if (!is_titan_ridge(r)) return true;
+  const int cap = find_router_vse(r, kVsecTime2);
+  uint32_t word = 0;
+  if (cap < 0 || static_cast<uint32_t>(cap) + kTime2Cs9 >= 0x1F00 || !read(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs9, ArrayView<uint32_t>(&word, 1))) return false;
+  word &= ~kTime2Cs9ObjMask;
+  return write(r.route, 0, TbConfigSpace::Switch, cap + kTime2Cs9, ArrayView<const uint32_t>(&word, 1)) && tmu_port_write(r, r.upstream_port, kTmuAdpCs6, kTmuAdpCs6ObjMask, kTmuAdpCs6ObjMask);
+}
+
 bool Usb4Domain::tmu_enable(Usb4Router& child, Usb4Router& parent, const Usb4Router& root, uint32_t down_port) {
-  if (child.tbt3 || child.cap_tmu == 0 || !parent.tmu_lowres) return false;
+  if (child.cap_tmu == 0 || !parent.tmu_lowres) return false;
   uint32_t cs0 = 0;
   if (!read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&cs0, 1)) || !(cs0 & kTmuRtrCs0Ucap)) return false;
-  tmu_post_time(child, root);
+  if (child.tbt3 && !tmu_disable_objections(child)) return false;
+  if (!child.tbt3) tmu_post_time(child, root);              // (the time is posted to USB4 routers only)
   if (!tmu_set_time_disruption(child, true)) return false;
   bool ok = tmu_rate_write(parent, kTmuLowResRate);
   // the parameters of the mode: the frequency measurement window and the averaging constants
@@ -825,6 +848,86 @@ void Usb4Domain::scan_retimers(Usb4Router& r, uint32_t port) {
     rt.product = product;
     rt.sector_size = metadata & 0xFFFFFF;
   }
+}
+
+const Usb4Port::Retimer* Usb4Domain::find_retimer(uint32_t router_index, uint32_t port, uint32_t index, const Usb4Router** router) const {
+  const Usb4Router* r = this->router(router_index);
+  if (!r || port == 0 || port >= usb4::kMaxPorts || index >= r->ports[port].retimer_count) return nullptr;
+  *router = r;
+  return &r->ports[port].retimers[index];
+}
+
+// NVM_SET_OFFSET: the dword address in the metadata (bits 23:2), then the operation.
+bool Usb4Domain::retimer_set_offset(const Usb4Router& r, uint32_t port, uint32_t sb_index, uint32_t address) {
+  uint32_t metadata = ((address / 4) << 2) & 0xFFFFFCu;
+  return sb_transfer(r, port, kSbTargetRetimer, sb_index, kSbMetadata, true, &metadata, 4) == 0 && sb_op(r, port, kSbTargetRetimer, sb_index, kSbOpNvmSetOffset, 500000) == 0;
+}
+
+Usb4Domain::RetimerNvm Usb4Domain::retimer_nvm_write(uint32_t router_index, uint32_t port, uint32_t index, ConstByteView image) {
+  const Usb4Router* r = nullptr;
+  const Usb4Port::Retimer* rt = find_retimer(router_index, port, index, &r);
+  if (!rt) return RetimerNvm::NoSuchRetimer;
+  if (rt->vendor != kRetimerVendorIntel) return RetimerNvm::Unsupported;
+  uint32_t start = 0;
+  if (!tb_nvm_validate_image(image, static_cast<uint16_t>(rt->product), false, &start) || (image.size() - start) % 4 != 0) return RetimerNvm::BadImage;
+  const uint32_t sb_index = index + 1;
+  if (!retimer_set_offset(*r, port, sb_index, 0)) return RetimerNvm::Failed;
+  const uint64_t total = image.size() - start;
+  for (uint64_t done = 0; done < total;) {
+    const uint32_t bytes = static_cast<uint32_t>(total - done < 64 ? total - done : 64);
+    uint32_t block[kOpDataDwords] = {};
+    for (uint32_t i = 0; i < bytes; ++i) block[i / 4] |= uint32_t{image[start + done + i]} << (8 * (i % 4));
+    bool ok = false;
+    for (uint32_t attempt = 0; attempt < 4 && !ok; ++attempt)        // (a timeout is tried again, three times)
+      ok = sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbData, true, block, bytes) == 0 && sb_op(*r, port, kSbTargetRetimer, sb_index, kSbOpNvmBlockWrite, 1000000) == 0;
+    if (!ok) return RetimerNvm::Failed;
+    done += bytes;
+  }
+  return RetimerNvm::Ok;
+}
+
+// The authentication starts with a raw write of the opcode: once it runs the retimer's index is gone, so there is no answer to wait for. A status that can still be read is an error code
+// with the reason in the metadata; no answer at all is what it looks like when it works. `auth_only` authenticates what is in the flash already (the offset set to the start).
+Usb4Domain::RetimerNvm Usb4Domain::retimer_nvm_authenticate(uint32_t router_index, uint32_t port, uint32_t index, bool auth_only, uint32_t* status) {
+  const Usb4Router* r = nullptr;
+  const Usb4Port::Retimer* rt = find_retimer(router_index, port, index, &r);
+  if (!rt) return RetimerNvm::NoSuchRetimer;
+  if (rt->vendor != kRetimerVendorIntel) return RetimerNvm::Unsupported;
+  const uint32_t sb_index = index + 1;
+  if (auth_only && !retimer_set_offset(*r, port, sb_index, 0)) return RetimerNvm::Failed;
+  uint32_t opcode = kSbOpNvmAuthWrite;
+  if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbOpcode, true, &opcode, 4) != 0) return RetimerNvm::Failed;
+  delay_us(150);
+  if (status) *status = 0;
+  uint32_t value = 0;
+  if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbOpcode, false, &value, 4) != 0) return RetimerNvm::Ok;        // (gone: it restarts)
+  if (value == 0) return RetimerNvm::Ok;
+  if (value != kSbOpErr) return RetimerNvm::Failed;
+  uint32_t metadata = 0;
+  if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbMetadata, false, &metadata, 4) != 0) return RetimerNvm::Failed;
+  if (status) *status = metadata & kSbMetadataAuthMask;
+  return (metadata & kSbMetadataAuthMask) != 0 ? RetimerNvm::AuthFailed : RetimerNvm::Ok;
+}
+
+// NVM_READ in blocks of up to 16 dwords from a dword aligned address (tb_nvm_read_data); a block shorter than 16 dwords says its length in the metadata.
+Usb4Domain::RetimerNvm Usb4Domain::retimer_nvm_read(uint32_t router_index, uint32_t port, uint32_t index, uint32_t address, ByteView out) {
+  const Usb4Router* r = nullptr;
+  const Usb4Port::Retimer* rt = find_retimer(router_index, port, index, &r);
+  if (!rt) return RetimerNvm::NoSuchRetimer;
+  if (address % 4 != 0 || out.size() % 4 != 0 || address > 0x3FFFFFu) return RetimerNvm::Failed;
+  const uint32_t sb_index = index + 1;
+  for (uint64_t done = 0; done < out.size();) {
+    const uint32_t bytes = static_cast<uint32_t>(out.size() - done < 64 ? out.size() - done : 64), dwords = bytes / 4;
+    uint32_t metadata = (((address + static_cast<uint32_t>(done)) / 4) << 2) & 0xFFFFFCu;
+    if (dwords < kOpDataDwords) metadata |= dwords << 24;
+    uint32_t block[kOpDataDwords] = {};
+    if (sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbMetadata, true, &metadata, 4) != 0 || sb_op(*r, port, kSbTargetRetimer, sb_index, kSbOpNvmRead, 500000) != 0 ||
+        sb_transfer(*r, port, kSbTargetRetimer, sb_index, kSbData, false, block, bytes) != 0)
+      return RetimerNvm::Failed;
+    for (uint32_t i = 0; i < bytes; ++i) out[done + i] = static_cast<uint8_t>(block[i / 4] >> (8 * (i % 4)));
+    done += bytes;
+  }
+  return RetimerNvm::Ok;
 }
 
 // ------------------------------------------------------------------ the tree
@@ -2040,6 +2143,46 @@ bool Usb4Domain::disconnect_dp(uint32_t in_router, uint32_t in_port) {
   return false;
 }
 
+bool Usb4Domain::dp_find_output(uint32_t in_router, uint32_t in_port, uint32_t* out_router, uint32_t* out_port) {
+  if (!started_ || in_router >= routers_.count() || !routers_[in_router]->present || in_port == 0 || in_port > routers_[in_router]->max_port || routers_[in_router]->ports[in_port].type != kTypeDpIn) return false;
+  auto top_port = [&](uint32_t router) {                    // the host router's lane adapter that leads to the router (0 for the host router itself)
+    int r = static_cast<int>(router);
+    if (routers_[r]->parent < 0) return 0u;
+    while (routers_[routers_[r]->parent]->parent >= 0) r = routers_[r]->parent;
+    return static_cast<uint32_t>(routers_[r]->parent_port);
+  };
+  const uint32_t wanted = top_port(in_router);
+  for (uint32_t r = 0; r < routers_.count(); ++r) {
+    const Usb4Router& router = *routers_[r];
+    if (!router.present || r == in_router || (wanted != 0 && top_port(r) != wanted)) continue;
+    for (uint32_t p = 1; p <= router.max_port; ++p) {
+      const Usb4Port& port = router.ports[p];
+      if (port.type != kTypeDpOut || port.cap_adapter == 0) continue;
+      bool used = false;
+      for (uint32_t i = 0; i < kMaxTunnels; ++i) used = used || (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].device_router == static_cast<int>(r) && tunnels_[i].up_port == p);
+      uint32_t word = 0;
+      if (used || !port_read(router, p, port.cap_adapter + kDpOutCs2, ArrayView<uint32_t>(&word, 1)) || !(word & kDpOutCs2Hpd)) continue;
+      *out_router = r;
+      *out_port = p;
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t Usb4Domain::dp_connect_displays() {
+  uint32_t made = 0;
+  for (uint32_t r = 0; r < routers_.count(); ++r) {
+    if (!routers_[r]->present) continue;
+    for (uint32_t p = 1; p <= routers_[r]->max_port; ++p) {
+      if (routers_[r]->ports[p].type != kTypeDpIn || dp_find(r, p) >= 0) continue;
+      uint32_t out_router = 0, out_port = 0;
+      if (dp_find_output(r, p, &out_router, &out_port) && tunnel_dp(r, p, out_router, out_port, nullptr)) ++made;
+    }
+  }
+  return made;
+}
+
 uint32_t Usb4Domain::dp_tunnels() const {
   uint32_t n = 0;
   for (uint32_t i = 0; i < kMaxTunnels; ++i) n += tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp;
@@ -2341,6 +2484,15 @@ bool Usb4Domain::dp_serve_request(int slot) {
   }
   usb3_reclaim();
   return ok;
+}
+
+void Usb4Domain::tick(uint64_t now_ms) {
+  if (ticked_ && now_ms > last_tick_ms_) {
+    const uint64_t delta = now_ms - last_tick_ms_;
+    advance_time(delta > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(delta));
+  }
+  ticked_ = true;
+  last_tick_ms_ = now_ms;
 }
 
 // Time passes: a group's keep is let go when its 10 s are over, and the estimates of the streams are made again.
