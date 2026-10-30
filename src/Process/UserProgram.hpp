@@ -48,7 +48,7 @@ struct ProgramStart {
 class UserProgram final : public IModuleHost {
  public:
   UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = 256ull << 20)
-      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator) {}
+      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator), startup_title_(allocator), startup_desktop_(allocator) {}
   UserProgram(const UserProgram&) = delete;
   UserProgram& operator=(const UserProgram&) = delete;
 
@@ -63,6 +63,15 @@ class UserProgram final : public IModuleHost {
 
   // The command line a Windows program sees, when it is not simply the arguments joined (CreateProcess hands over the exact text). Set before load().
   void set_command_line(StringView text) { command_line_.assign(text); }
+  // The startup information (STARTUPINFO, the console) a Windows program finds in its process parameters. Set before load().
+  void set_startup(const StartupSpec& spec) {
+    startup_ = spec;
+    startup_title_.assign(spec.title);
+    startup_desktop_.assign(spec.desktop);
+    startup_.title = startup_title_.view();
+    startup_.desktop = startup_desktop_.view();
+    has_startup_ = true;
+  }
   filesystem::IFileSystem* file_system() const { return files_; }
   ILibraryProvider* library_provider() const { return libraries_; }
   IProcessHost& host() const { return host_; }
@@ -103,7 +112,9 @@ class UserProgram final : public IModuleHost {
   filesystem::IFileSystem* files_ = nullptr;
   ILibraryProvider* libraries_ = nullptr;
   UniquePointer<ModuleSet> modules_;
-  String detail_, working_directory_, command_line_;
+  String detail_, working_directory_, command_line_, startup_title_, startup_desktop_;
+  StartupSpec startup_;
+  bool has_startup_ = false;
   uint32_t processor_count_ = 1;
   UniquePointer<Process> process_;
   ProgramStart start_;

@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Process/ProcessFiles.hpp"
+#include "Process/StartupSpec.hpp"
 #include "Process/Syscall.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -95,6 +96,7 @@ struct ChildSpec {
   bool inherit_handles = false;          // the child gets the parent's inheritable handles, at the same numbers
   bool use_std_handles = false;          // the child's standard input, output and error are these handles of the parent (which are inherited too)
   uint64_t std_handles[3] = {};
+  StartupSpec startup;                   // the STARTUPINFO of the parent and the console of the child
 };
 
 // What a process needs to run more than one thread: supplied by whoever runs the program (the kernel). Without one a process has a single thread. The process has
@@ -209,6 +211,8 @@ class Process {
   Process& operator=(const Process&) = delete;
 
   uint64_t id() const { return id_; }
+  uint64_t parent_id() const { return parent_id_; }      // the process that started it (0: none)
+  void set_parent_id(uint64_t id) { parent_id_ = id; }
   SyscallAbi abi() const { return binding_.abi; }
   UserArch arch() const { return binding_.arch; }
 
@@ -363,6 +367,7 @@ class Process {
 
  private:
   uint64_t id_;
+  uint64_t parent_id_ = 0;
   ProcessBinding binding_;
   IUserMemory& memory_;
   IProcessHost& host_;

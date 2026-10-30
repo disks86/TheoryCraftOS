@@ -119,6 +119,9 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
     if (!utf16(entry, &environment) || !environment.put16(0)) return LoadStatus::Malformed;
   }
   if (!environment.put16(0) || (input.environment.empty() && !environment.put16(0))) return LoadStatus::OutOfMemory;      // ends with an empty string (two NULs if empty)
+  ByteBuffer window_title(allocator), desktop_info(allocator);
+  if (input.startup && (!utf16(input.startup->title, &window_title) || !utf16(input.startup->desktop, &desktop_info))) return LoadStatus::Malformed;
+  const uint64_t title_bytes = window_title.size(), desktop_bytes = desktop_info.size();
   const uint64_t path_bytes = image_path.size(), command_bytes = command_line.size(), directory_bytes = directory.size(), environment_bytes = environment.size();
 
   // --- the static TLS of the program and of the libraries: one template per module that has a TLS directory, numbered in the order they are found
@@ -149,7 +152,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
 
   // --- one region: PEB | TEB | parameters and strings | TLS array and block
   uint64_t strings_at = kParametersHeader;
-  const uint64_t strings_bytes = path_bytes + command_bytes + directory_bytes + environment_bytes + 16;      // (the three strings are followed by a NUL each: 6 of the 16)
+  const uint64_t strings_bytes = path_bytes + command_bytes + directory_bytes + environment_bytes + title_bytes + desktop_bytes + 32;      // (the three strings are followed by a NUL each: 6 of the 16)
   uint64_t parameters_bytes = 0, tls_bytes = 0, total = 0;
   if (strings_bytes > kMaxStartupBytes || !AddressSpace::round_up(strings_at + strings_bytes, &parameters_bytes)) return LoadStatus::Malformed;
   if (!AddressSpace::round_up(tls_total, &tls_bytes)) return LoadStatus::Malformed;
@@ -173,6 +176,9 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.bytes(command_at, command_line.view());
   w.bytes(directory_at, directory.view());
   w.bytes(environment_at, environment.view());
+  const uint64_t title_at = environment_at + environment_bytes + 2, desktop_at = title_at + title_bytes + 2;
+  w.bytes(title_at, window_title.view());
+  w.bytes(desktop_at, desktop_info.view());
   w.u32(parameters + 0x00, uint32_t(parameters_bytes));      // MaximumLength
   w.u32(parameters + 0x04, uint32_t(parameters_bytes));      // Length
   w.u32(parameters + 0x08, 1);                               // Flags: RTL_USER_PROC_PARAMS_NORMALIZED
@@ -183,7 +189,24 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.unicode_string(parameters + 0x60, path_at, path_bytes, path_bytes + 2);                    // ImagePathName
   w.unicode_string(parameters + 0x70, command_at, command_bytes, command_bytes + 2);            // CommandLine
   w.u64(parameters + 0x80, environment_at);                                                 // Environment
-  w.u64(parameters + 0x3F0, environment_bytes);                                             // EnvironmentSize
+  w.u64(parameters + 0x3F0, environment_bytes);
+  w.u64(parameters + 0x10, 0x1000);                         // ConsoleHandle: the console the first program has
+  if (input.startup) {
+    const StartupSpec& st = *input.startup;
+    w.u64(parameters + 0x10, st.console_handle);          // ConsoleHandle
+    w.u32(parameters + 0x18, st.console_flags);            // ConsoleFlags
+    w.u32(parameters + 0x88, st.x);                        // StartingX
+    w.u32(parameters + 0x8C, st.y);
+    w.u32(parameters + 0x90, st.x_size);                   // CountX
+    w.u32(parameters + 0x94, st.y_size);
+    w.u32(parameters + 0x98, st.x_chars);                  // CountCharsX
+    w.u32(parameters + 0x9C, st.y_chars);
+    w.u32(parameters + 0xA0, st.fill_attribute);
+    w.u32(parameters + 0xA4, st.flags);                    // WindowFlags
+    w.u32(parameters + 0xA8, st.show_window);              // ShowWindowFlags
+    w.unicode_string(parameters + 0xB0, title_at, title_bytes, title_bytes + 2);      // WindowTitle
+    w.unicode_string(parameters + 0xC0, desktop_at, desktop_bytes, desktop_bytes + 2);      // DesktopInfo
+  }                                             // EnvironmentSize
 
   // --- the PEB
   w.u64(peb + 0x08, ~uint64_t{0});                  // Mutant
