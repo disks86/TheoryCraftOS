@@ -4361,6 +4361,12 @@ void test_conformance() {
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
     }
+    if (__builtin_strstr(r.name, "of every width") || __builtin_strstr(r.name, "10-bit normalised")) {
+      // The colour of the triangle of each quarter, as the format keeps it (integers: colour * 255 (- 100); the 10-bit alpha of 0.7 is 2/3, of 0.3 1/3).
+      auto tri = [&](uint32_t q) { return r.device_picture[((q >> 1) * 16 + 8) * 32 + (q & 1) * 16 + 8]; };
+      if (__builtin_strstr(r.name, "of every width")) CHECK(tri(0) == 0xFF3380CC && tri(1) == 0xFF4D99E5 && tri(2) == 0xFFE56619 && tri(3) == 0xFF19B366);
+      else CHECK(tri(0) == 0xFF4C99E5 && tri(1) == 0xFF00E573 && tri(2) == 0xAA3380CC && tri(3) == 0x550DF280);
+    }
     if (__builtin_strstr(r.name, "GetDimensions of")) {
       // The alpha is the number of levels over 2 (one level: 0x80) wherever something is drawn; the size is in the colour: the 4 x 4 texels of a 3D image of 4 slices, an array of 3 layers
       // (blue 3 / 8 over 2 = 0x30 in the first band) and a cube map.

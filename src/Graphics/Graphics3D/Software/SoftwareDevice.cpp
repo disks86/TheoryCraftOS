@@ -20,6 +20,7 @@
 #include <new>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/Software/Tessellator.hpp"
+#include "Graphics/WidePixels.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace graphics {
@@ -194,15 +195,8 @@ class SoftwareImage final : public IImage {
     for (uint64_t i = 0; i < hdr_.size(); ++i) hdr_[i] = store_float(pixels[i]);
     return true;
   }
-  // What a pixel of this image keeps of a colour: half-float images round to half precision.
-  Vec4 store_float(Vec4 c) const {
-    if (desc_.format == Format::R16G16B16A16Unorm) {
-      auto q = [](float v) { return !(v > 0.0f) ? 0.0f : v >= 1.0f ? 1.0f : static_cast<float>(static_cast<uint32_t>(v * 65535.0f + 0.5f)) * (1.0f / 65535.0f); };
-      return {q(c.x), q(c.y), q(c.z), q(c.w)};
-    }
-    if (desc_.format != Format::R16G16B16A16Float) return c;   // (single precision and integers are kept as they are)
-    return {half_to_float(float_to_half(c.x)), half_to_float(float_to_half(c.y)), half_to_float(float_to_half(c.z)), half_to_float(float_to_half(c.w))};
-  }
+  // What a pixel of this image keeps of a colour (WidePixels.hpp).
+  Vec4 store_float(Vec4 c) const { return quantize_wide_pixel(desc_.format, c); }
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
     if (color_.empty() || level >= desc_.mip_levels) return false;
     const Surface s = surface(level);
