@@ -117,7 +117,7 @@ bool AArch64Cpu::neon_two_register(uint32_t insn, Step* result) {
       const uint64_t x = lane(a, w, 0);
       uint64_t out;
       if (is_nan(f, x)) { if (!((x >> (s.frac_bits - 1)) & 1)) env.flags |= kInvalid; out = x | (uint64_t{1} << (s.frac_bits - 1)); }
-      else out = (x & (uint64_t{1} << (s.exp_bits + s.frac_bits))) | ((~(x >> s.frac_bits) & ones(s.exp_bits)) << s.frac_bits);
+      else out = (x & (uint64_t{1} << (s.exp_bits + s.frac_bits))) | ((((x >> s.frac_bits) & ones(s.exp_bits)) == 0 ? ones(s.exp_bits) - 1 : (~(x >> s.frac_bits) & ones(s.exp_bits))) << s.frac_bits);
       set_lane(&r, w, 0, fp_default_nan_fix(f, out) & ones(w));
       return finish(r);
     }

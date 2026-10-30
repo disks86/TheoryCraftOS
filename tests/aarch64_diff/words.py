@@ -9,7 +9,8 @@ per_key = int(sys.argv[4]) if len(sys.argv) > 4 else 4
 candidates = int(sys.argv[5]) if len(sys.argv) > 5 else 600000
 rng = random.Random(seed)
 import os
-SVE = bool(os.environ.get('SVE'))
+SVEMEM = bool(os.environ.get('SVEMEM'))
+SVE = bool(os.environ.get('SVE')) or SVEMEM
 words = []
 while len(words) < candidates:
     w = rng.getrandbits(32)
@@ -48,7 +49,12 @@ def key(t):
     return m + ' ' + shape
 groups = collections.defaultdict(list)
 for w, t in zip(valid, texts):
-    if SVE:
+    if SVEMEM:
+        # memory forms only; the ones that need the stack pointer or a 128-bit element (SVE2.1) are skipped
+        # (qemu does not load a first-fault or non-fault element that is the first active one but sits in the upper half of the register, which the architecture does not allow: those are
+        # covered by the unit tests instead)
+        if not re.match(r'^(ld[1-4]|ldnt1|st[1-4]|stnt1|prf)', t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\bsp\b|\.q\b|\bz31\b|\bx27\b|\bx28\b', t): continue
+    elif SVE:
         if SKIP_SVE.match(t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\[x[0-9]|\[sp|\bsm(start|stop)', t): continue
     else:
         if SKIP.match(t): continue
@@ -85,6 +91,9 @@ if probe:
         else:
             print('qprobe failed (%d of %d results); keeping all' % (len(qres), len(kept)))
     missing = collections.Counter(t.split()[0] for (w, t), st in zip(rows, res) if st == 1)
+    with open(work + '/missing.txt', 'w') as f:
+        for (w, t), st in zip(rows, res):
+            if st == 1: f.write('%s %s\n' % (w, t))
     with open(work + '/sample.txt', 'w') as f:
         for w, t in kept: f.write('%s %s\n' % (w, t))
     print('emulator lacks %d of %d sampled forms; kept %d' % (sum(missing.values()), len(rows), len(kept)))

@@ -25,6 +25,7 @@ fail=0
 for mode in "${modes[@]}"; do
   for seed in $(seq 1 "$seeds"); do
     if [ "$mode" = words ]; then python3 tests/aarch64_diff/words.py "$seed" "$work" "$filter" "$perkey"; fi
+    if [ "$mode" = svemem ]; then SVEMEM=1 python3 tests/aarch64_diff/words.py "$seed" "$work" "$filter" "$perkey"; fi
     python3 tests/aarch64_diff/gen.py "$mode" "$seed" "$work"
     llvm-mc -triple=aarch64-linux-gnu -mattr=+all -filetype=obj "$work/t.s" -o "$work/t.o"
     "$lld" -static -nostdlib -e _start "$work/t.o" -o "$work/t.elf"

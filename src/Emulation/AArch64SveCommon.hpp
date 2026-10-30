@@ -91,5 +91,8 @@ inline bool decode_logical_immediate(uint32_t imm13, uint64_t* out) {
 // The high half of a 64 x 64 product, signed or unsigned.
 uint64_t multiply_high(uint64_t a, uint64_t b, bool is_signed);
 
+// FEXPA: the exponential-approximation helper (AArch64SveFloat.cpp).
+uint64_t sve_expa(uint32_t esz, uint64_t x);
+
 }  // namespace sve
 }  // namespace emulation

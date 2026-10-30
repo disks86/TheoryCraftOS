@@ -439,9 +439,11 @@ bool AArch64Cpu::sve_integer(uint32_t insn) {
       }
       return true;
     }
-    case 0x2E: {      // FEXPA and MOVPRFX (unpredicated)
-      if (zm == 0 && size == 0) { *dst = s_.v[zn]; return true; }
-      return false;
+    case 0x2E: {      // FEXPA
+      if (zm != 0 || esz == 0) return false;
+      const Vec a = s_.v[zn];
+      for (uint32_t i = 0; i < elements; ++i) put(dst, esz, i, sve_expa(esz, get(a, esz, i)));
+      return true;
     }
     case 0x2F: {
       if (zm == 0 && size == 0) { *dst = s_.v[zn]; return true; }

@@ -97,7 +97,7 @@ bool AArch64Cpu::sve_predicate(uint32_t insn) {
         if (!active(gp, i, esz)) continue;
         // (a wide compare reads the 64-bit element that holds the narrow one; signed kinds then sign-extend the narrow element to 64 bits)
         const uint64_t x = get(a, esz, i);
-        const bool is_signed = kind == kGe || kind == kGt || kind == kLt || kind == kLe;
+        const bool is_signed = kind == kGe || kind == kGt || kind == kLt || kind == kLe || kind == kEq || kind == kNe;      // (the equality compares sign-extend too)
         bool r;
         if (wide) {
           const uint64_t y = get(b, 3, (i << esz) / 8);

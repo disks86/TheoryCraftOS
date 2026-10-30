@@ -407,6 +407,28 @@ elif mode == 'words':
     for line in open(WORK + '/sample.txt'):
         w, text = line.rstrip('\n').split(' ', 1)
         add(f'.inst 0x{w} // {text}')
+elif mode == 'svemem':
+    # SVE loads and stores chosen by words.py (SVEMEM=1): the registers that address memory are rewritten so that every access lands in the scratch buffer.
+    # x28 is the buffer base, x27 a small element offset, z31 a vector of small offsets (or, as a vector base, of addresses inside the buffer).
+    import re as _re
+    for line in open(WORK + '/sample.txt'):
+        w, text = line.rstrip('\n').split(' ', 1)
+        pre = ''
+        m = _re.search(r'\[(x\d+|sp)(?:, (x\d+|z\d+\.[sd]))?', text)
+        t2 = _re.sub(r'\[x\d+', '[x28', text)
+        if _re.search(r'\[z\d+\.([sd])', t2):      # vector base (plus immediate or scalar)
+            t2 = _re.sub(r'\[z\d+\.([sd])', r'[z31.\1', t2)
+            T = _re.search(r'\[z31\.([sd])', t2).group(1)
+            pre = f'index z31.{T}, ' + ('w28' if T == 's' else 'x28') + f', #{random.choice([1, 2, 4, 8])}'
+        elif _re.search(r', z\d+\.([sd])(, |\])', t2):      # vector of offsets
+            t2 = _re.sub(r', z\d+\.([sd])(, |\])', r', z31.\1\2', t2, count=1)
+            T = _re.search(r', z31\.([sd])', t2).group(1)
+            neg = 'sxtw' in t2 and random.random() < 0.3
+            pre = f'index z31.{T}, #{random.randrange(-8, 0) if neg else random.randrange(0, 4)}, #{random.choice([1, 2, 3, 4])}'
+        t2 = _re.sub(r', x\d+(\]|, lsl)', r', x27\1', t2)
+        if _re.search(r'\bz31\b', _re.sub(r'\[[^]]*\]', '', t2)): continue      # the destination or source list uses z31: skip
+        if pre: add(pre + '\n  ' + t2)
+        else: add(t2)
 elif mode == 'int2':
     for _ in range(6000):
         sf = random.random() < 0.6
@@ -445,7 +467,7 @@ RES_NZCV = RES_OFF + 31*8; RES_FPSR = RES_NZCV + 8
 RES_V = (RES_FPSR + 8 + 15) // 16 * 16
 RES_P = RES_V + 32*16       # p0..p15 then FFR, 2 bytes each (vector length 128 bits)
 BUF_OFF = (RES_P + 17*2 + 15) // 16 * 16
-BUF_SIZE = 256
+BUF_SIZE = 1024
 INIT_P = V_OFF + 32*16      # initial predicates, same layout (inside the init area, which is RES_OFF-aligned, so reserve the room)
 BLK = BUF_OFF + BUF_SIZE
 
@@ -459,7 +481,8 @@ for i, text in enumerate(cases):
     for k in range(16): out.append(f'  ldr p{k}, [x1, #{k}, mul vl]')
     for k in range(0, 30, 2): out.append(f'  ldp x{k}, x{k+1}, [sp, #{X_OFF + k*8}]')
     out.append(f'  ldr x30, [sp, #{X_OFF + 30*8}]')
-    out.append(f'  add x28, sp, #{BUF_OFF + 96}')
+    out.append(f'  add x28, sp, #{BUF_OFF + 384}')
+    out.append(f'  mov x27, #{random.randrange(0, 6)}')
     out.append(f'  {text}')
     out.append(f'  add sp, sp, #{RES_OFF}')
     for k in range(0, 30, 2): out.append(f'  stp x{k}, x{k+1}, [sp, #{RES_X + k*8 - RES_OFF}]')
