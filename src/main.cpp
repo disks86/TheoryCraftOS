@@ -1262,8 +1262,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             }
           }
           // networking to another host: offered in our properties, an interface for the network stack that gets an address when the cable's other end answers
-          if (thunderbolt->icm()) thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->icm(), shared_allocator, smb_random);
-          if (thunderbolt_net && thunderbolt->icm()->offer_network(hardware::ThunderboltNet::offered_flags(hardware::ThunderboltNet::Config())) && thunderbolt_net->initialize()) {
+          if (thunderbolt->xdomain_host()) thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->xdomain_host(), shared_allocator, smb_random);
+          if (thunderbolt_net && thunderbolt->xdomain_host()->offer_network(hardware::ThunderboltNet::offered_flags(hardware::ThunderboltNet::Config())) && thunderbolt_net->initialize()) {
             UniquePointer<hardware::ThunderboltNetLink> link = UniquePointer<hardware::ThunderboltNetLink>::make(shared_allocator, thunderbolt_net.get());
             hardware::ThunderboltNetLink* raw = link.get();
             stacks.stop_service();

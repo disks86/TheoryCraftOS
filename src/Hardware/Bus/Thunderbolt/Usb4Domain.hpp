@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltXdomainHost.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltXdomainTypes.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -50,7 +52,7 @@ constexpr uint8_t kPortCapPhy = 0x01, kPortCapAdapter = 0x04, kPortCapUsb4 = 0x0
 constexpr uint32_t kRouterCs1 = 1, kRouterCs5 = 5, kRouterCs6 = 6, kRouterCs7 = 7;
 constexpr uint32_t kCs5Pto = 1u << 25, kCs5Hco = 1u << 26, kCs5Slp = 1u << 0, kCs5Cns = 1u << 23, kCs5Cv = 1u << 31, kCs6Slpr = 1u << 0, kCs6Hci = 1u << 18, kCs6Cr = 1u << 25;
 // adapter registers (relative to the adapter capability, except ADP_CS_4 and ADP_CS_5 which are in the port header)
-constexpr uint32_t kAdpCs4 = 4, kAdpCs4Lck = 1u << 31, kAdpCs5 = 5, kAdpCs5Dhp = 1u << 31, kPortCs19 = 0x13, kPortCs19Pc = 1u << 3, kAdpPcieCs0 = 0, kAdpPcieCs0Pe = 1u << 31;
+constexpr uint32_t kAdpCs4 = 4, kAdpCs4Lck = 1u << 31, kAdpCs5 = 5, kAdpCs5Dhp = 1u << 31, kPortCs19 = 0x13, kPortCs19Pc = 1u << 3, kPortCs19Pid = 1u << 4, kAdpPcieCs0 = 0, kAdpPcieCs0Pe = 1u << 31;
 // port states (the lane adapter's)
 constexpr uint32_t kPortDisabled = 0, kPortConnecting = 1, kPortUp = 2, kPortTxCl0s = 3, kPortRxCl0s = 4, kPortCl1 = 5, kPortCl2 = 6, kPortUnplugged = 7;
 // limits
@@ -69,6 +71,8 @@ struct Usb4Port {
   uint64_t in_hops[usb4::kHopWords] = {}, out_hops[usb4::kHopWords] = {};   // HopIDs in use (up to 512 each)
   bool is_lane() const { return type == usb4::kTypePort; }
   bool bonded = false;               // both lanes of the link carry traffic as one
+  bool xdomain = false;              // another host is on the cable behind this lane adapter (no router answers)
+  uint16_t total_credits = 0, ctl_credits = 2;   // the buffers of the adapter, and what the control path uses of them
 };
 
 struct Usb4Router {
@@ -96,11 +100,12 @@ struct Usb4Hop {
 struct Usb4Path {
   uint8_t length = 0;
   uint8_t priority = 3, weight = 1;
+  uint8_t egress_fc_enable = 3, ingress_fc_enable = 7;     // which hops (source 1, internal 2, destination 4) have flow control out of / into them
   Usb4Hop hops[usb4::kMaxHops];
   bool activated = false;
 };
 
-enum class Usb4TunnelKind : uint8_t { Pcie, Usb3 };
+enum class Usb4TunnelKind : uint8_t { Pcie, Usb3, Dma };
 
 struct Usb4Tunnel {
   bool used = false;
@@ -108,13 +113,14 @@ struct Usb4Tunnel {
   int16_t device_router = -1;        // the router at the far end (its PCIe up adapter)
   int16_t host_router = -1;          // where the PCIe down adapter is
   uint8_t down_port = 0, up_port = 0;
-  Usb4Path down, up;                 // down: from the down adapter to the up adapter; up: back
+  Usb4Path down, up;                 // down: from the down adapter to the up adapter; up: back (a DMA tunnel: down is the path we send on, up the one we receive on)
+  uint64_t xdomain_route = 0;        // a DMA tunnel: the route of the other host
   bool active = false;
 };
 
-class Usb4Domain final : public IThunderboltEvents {
+class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private IXdomainPaths {
  public:
-  Usb4Domain(TbControl& control, allocators::IAllocator& allocator) : control_(control), allocator_(allocator), routers_(allocator) {}
+  Usb4Domain(TbControl& control, TbNhi& nhi, allocators::IAllocator& allocator) : control_(control), nhi_(nhi), allocator_(allocator), routers_(allocator), xd_(control, allocator, this, *this) {}
   ~Usb4Domain() = default;
   Usb4Domain(const Usb4Domain&) = delete;
   Usb4Domain& operator=(const Usb4Domain&) = delete;
@@ -152,7 +158,28 @@ class Usb4Domain final : public IThunderboltEvents {
   bool resume(const char** error);
   bool suspended() const { return suspended_; }
 
-  // IThunderboltEvents: hot plug events are queued, everything else ignored.
+  // Other hosts on the cable (IXdomainHost): a lane adapter whose link is up and behind which no router answers is taken for one, its UUID and properties are asked for in poll(), the
+  // requests it makes are answered, and the data path for ThunderboltIP is a DMA tunnel from our host interface to that adapter (two paths: the HopIDs the service chose on the host
+  // interface and on the cable). Services (ThunderboltNet) run on top of this exactly as on the firmware connection manager.
+  TbControl& control() override { return control_; }
+  TbNhi& nhi() override { return nhi_; }
+  IThunderboltEvents* event_sink() override { return this; }
+  uint64_t xdomain_count() const override { return xd_.count(); }
+  const TbXDomain& xdomain(uint64_t index) const override { return xd_.at(index); }
+  void set_ip_handler(IThunderboltIpHandler* handler) override { xd_.set_ip_handler(handler); }
+  bool offer_network(uint32_t flags) override { return xd_.offer_network(flags); }
+  // Hosts on the cable now (xdomain_count() is the size of the list, which keeps the empty places of hosts that left).
+  uint32_t xdomains_present() const { return xd_.live(); }
+  bool set_identity(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name) { return xd_.set_identity(vendor_id, device_id, device_revision, vendor_name, device_name); }
+  bool approve_xdomain_paths(uint64_t index, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, const char** error) override {
+    return xd_.approve(index, transmit_path, transmit_ring, receive_path, receive_ring, error);
+  }
+  bool disconnect_xdomain_paths(uint64_t index) override { return xd_.disconnect(index); }
+  void ring_interrupts(bool transmit, uint32_t hop, bool on) override { if (interrupts_ || !on) nhi_.set_ring_interrupts(transmit, hop, on, data_vector_ >= 0 ? data_vector_ : msix_vector_); }
+  // The control channel's interrupts (and the data rings', through ring_interrupts) as ThunderboltIcm::use_interrupts does it.
+  bool use_interrupts(bool on, int msix_vector = -1, int data_vector = -1);
+
+  // IThunderboltEvents: hot plug events are queued, XDomain packets go to the hosts' side, everything else ignored.
   bool on_event(TbPacketType type, ConstByteView body) override;
 
   // Numbers that tests and the log want.
@@ -174,7 +201,7 @@ class Usb4Domain final : public IThunderboltEvents {
   int find_port_cap(const Usb4Router& r, uint32_t port, uint8_t first, uint8_t id);
 
   int allocate_router();
-  bool read_router(uint64_t route, int16_t parent, uint8_t parent_port, int* index, const char** error);
+  bool read_router(uint64_t route, int16_t parent, uint8_t parent_port, int* index, const char** error, bool* silent = nullptr);
   bool configure_router(Usb4Router& r);
   bool init_ports(Usb4Router& r);
   void link_lane_adapters(Usb4Router& r);
@@ -213,9 +240,21 @@ class Usb4Domain final : public IThunderboltEvents {
   int lane_width(const Usb4Router& r, uint32_t port);
   bool set_lane_width(const Usb4Router& r, uint32_t port, uint32_t target);
 
+  // IXdomainPaths
+  bool open_paths(const TbXDomain& xd, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, const char** error) override;
+  void close_paths(const TbXDomain& xd) override;
+  void add_xdomain(int router_index, uint32_t port, uint64_t route);
+  void remove_xdomain(int router_index, uint32_t port);
+  bool take_hop(Usb4Router& r, uint32_t port, bool in, uint32_t hop);
+  bool build_dma_path(Usb4Path* path, const int* chain, uint32_t chain_length, bool toward_host, uint32_t xdomain_port, uint32_t nhi_port, uint32_t ring, uint32_t cable_hop);
+
   TbControl& control_;
+  TbNhi& nhi_;
+  bool interrupts_ = false;
+  int msix_vector_ = -1, data_vector_ = -1;
   allocators::IAllocator& allocator_;
   List<UniquePointer<Usb4Router>> routers_;
+  TbXdomainHost xd_;
   Usb4Tunnel tunnels_[usb4::kMaxTunnels];
   Plug plugs_[kPlugQueue];
   uint32_t plug_head_ = 0, plug_count_ = 0;

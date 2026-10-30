@@ -72,7 +72,7 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
       usb4_error_ = "the control channel did not start";
       return outcome_ = Outcome::ControllerFailed;
     }
-    usb4_ = UniquePointer<Usb4Domain>::make(allocator_, *usb4_control_, allocator_);
+    usb4_ = UniquePointer<Usb4Domain>::make(allocator_, *usb4_control_, *usb4_nhi_, allocator_);
     if (!usb4_) return outcome_ = Outcome::OutOfMemory;
     if (!usb4_->start(&usb4_error_)) return outcome_ = Outcome::ControllerFailed;
     return outcome_ = Outcome::Started;

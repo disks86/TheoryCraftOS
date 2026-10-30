@@ -95,13 +95,14 @@ int Usb4Domain::allocate_router() {
 // ------------------------------------------------------------------ routers
 
 // Reads the router at `route` (the header and the upstream port), writes its configuration and reads its ports. Returns its index.
-bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port, int* index_out, const char** error) {
+bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port, int* index_out, const char** error, bool* silent) {
   const char* local = nullptr;
   if (!error) error = &local;
   uint32_t header[5];
   uint8_t upstream = 0;
   if (!read(route, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(header, 5), &upstream)) {
     *error = "the router does not answer";
+    if (silent) *silent = true;                              // (nothing there to be a router: another host, perhaps)
     return false;
   }
   const uint32_t depth = route_length(route);
@@ -177,12 +178,18 @@ bool Usb4Domain::init_ports(Usb4Router& r) {
     port.type = h[2] & 0xFFFFFF;
     port.max_in_hop = static_cast<uint16_t>(h[5] & 0x7FF);
     port.max_out_hop = static_cast<uint16_t>((h[5] >> 11) & 0x7FF);
+    port.total_credits = static_cast<uint16_t>((h[4] >> 20) & 0x3FF);
     const uint8_t first = static_cast<uint8_t>(h[1] & 0xFF);
     if (port.type == kTypePort) {
       const int phy = find_port_cap(r, p, first, kPortCapPhy);
       if (phy > 0) port.cap_phy = static_cast<uint8_t>(phy);
       const int u4 = find_port_cap(r, p, first, kPortCapUsb4);
-      if (u4 > 0) port.cap_usb4 = static_cast<uint8_t>(u4);
+      if (u4 > 0) {
+        port.cap_usb4 = static_cast<uint8_t>(u4);
+        uint32_t hop0[2];                                   // (the buffers the control path uses are in its hop entry)
+        if (read(r.route, p, TbConfigSpace::Hops, 0, ArrayView<uint32_t>(hop0, 2))) port.ctl_credits = static_cast<uint16_t>((hop0[0] >> 17) & 0x7F);
+      }
+      if (port.ctl_credits == 0) port.ctl_credits = 2;
     } else {
       const int adapter = find_port_cap(r, p, first, kPortCapAdapter);
       if (adapter > 0) port.cap_adapter = static_cast<uint8_t>(adapter);
@@ -305,8 +312,10 @@ void Usb4Domain::scan_port(int index, uint32_t port_number) {
   const uint64_t route = parent_ref.route | (static_cast<uint64_t>(port_number) << (8 * parent_ref.depth));
   int child_index = -1;
   const char* why = nullptr;
-  if (!read_router(route, static_cast<int16_t>(index), static_cast<uint8_t>(port_number), &child_index, &why)) {
-    ++unreachable_;                                       // (another host on the cable, a router we cannot run, or nothing)
+  bool silent = false;
+  if (!read_router(route, static_cast<int16_t>(index), static_cast<uint8_t>(port_number), &child_index, &why, &silent)) {
+    if (silent) add_xdomain(index, port_number, route);   // (no router there: another host on the cable)
+    else ++unreachable_;                                  // (a router we cannot run)
     return;
   }
   Usb4Router& parent = *routers_[index];
@@ -322,7 +331,46 @@ void Usb4Domain::scan_port(int index, uint32_t port_number) {
   scan_router(child_index);
 }
 
+// Another host behind a lane adapter: it is added to the hosts to discover, with our UUID taken from the host router's unique id (uid, uid, ones, ones), and the adapter is marked as
+// having one (PORT_CS_19.PID).
+void Usb4Domain::add_xdomain(int router_index, uint32_t port, uint64_t route) {
+  Usb4Router& r = *routers_[router_index];
+  Usb4Port& p = r.ports[port];
+  int root = 0;
+  for (uint64_t i = 0; i < routers_.count(); ++i)
+    if (routers_[i]->present && routers_[i]->parent < 0) root = static_cast<int>(i);
+  uint8_t uuid[16];
+  const uint64_t uid = routers_[root]->uid;
+  for (uint32_t k = 0; k < 8; ++k) uuid[k] = static_cast<uint8_t>(uid >> (8 * k));
+  for (uint32_t k = 8; k < 16; ++k) uuid[k] = 0xFF;
+  if (xd_.add(route, uuid) < 0) return;
+  p.xdomain = true;
+  if (p.cap_usb4 != 0) {
+    uint32_t word = 0;
+    if (port_read(r, port, p.cap_usb4 + kPortCs19, ArrayView<uint32_t>(&word, 1))) {
+      word |= kPortCs19Pid;
+      port_write(r, port, p.cap_usb4 + kPortCs19, ArrayView<const uint32_t>(&word, 1));
+    }
+  }
+}
+
+void Usb4Domain::remove_xdomain(int router_index, uint32_t port) {
+  Usb4Router& r = *routers_[router_index];
+  Usb4Port& p = r.ports[port];
+  if (!p.xdomain) return;
+  xd_.remove(r.route | (static_cast<uint64_t>(port) << (8 * r.depth)));
+  p.xdomain = false;
+  if (p.cap_usb4 != 0 && r.present) {
+    uint32_t word = 0;
+    if (port_read(r, port, p.cap_usb4 + kPortCs19, ArrayView<uint32_t>(&word, 1))) {
+      word &= ~kPortCs19Pid;
+      port_write(r, port, p.cap_usb4 + kPortCs19, ArrayView<const uint32_t>(&word, 1));
+    }
+  }
+}
+
 void Usb4Domain::remove_below(int index, uint32_t port) {
+  if (routers_[index]->ports[port].xdomain) remove_xdomain(index, port);
   Usb4Port& p = routers_[index]->ports[port];
   if (p.remote_router < 0) return;
   const int child = p.remote_router;
@@ -335,6 +383,7 @@ void Usb4Domain::remove_router(int index) {
   Usb4Router& r = *routers_[index];
   for (uint32_t p = 1; p <= r.max_port; ++p) {
     Usb4Port& port = r.ports[p];
+    if (port.xdomain) remove_xdomain(index, p);
     if (port.remote_router >= 0 && port.remote_router != r.parent) {
       const int child = port.remote_router;
       port.remote_router = -1;
@@ -383,6 +432,7 @@ bool Usb4Domain::put_to_sleep(Usb4Router& r) {
 bool Usb4Domain::suspend() {
   if (!started_ || suspended_) return false;
   plug_count_ = 0;                                         // (events from before the sleep mean nothing after it)
+  xd_.clear();                                              // (the other hosts and their paths)
   for (uint32_t i = 0; i < kMaxTunnels; ++i)
     if (tunnels_[i].used) remove_tunnel(static_cast<int>(i));
   // deepest first; a router that will not sleep is left awake and dropped with the rest, the host router's refusal is what the answer reports
@@ -410,6 +460,7 @@ bool Usb4Domain::resume(const char** error) {
 // ------------------------------------------------------------------ events
 
 bool Usb4Domain::on_event(TbPacketType type, ConstByteView body) {
+  if (type == TbPacketType::XdomainRequest || type == TbPacketType::XdomainResponse) return xd_.handle(type, body);
   if (type != TbPacketType::Event || body.size() < 12) return false;
   ByteReader r(body);
   const uint32_t hi = r.le32(), lo = r.le32(), word = r.le32();
@@ -450,6 +501,22 @@ void Usb4Domain::poll() {
     process_plug(plug);
     control_.poll(this);
   }
+  xd_.service();
+}
+
+bool Usb4Domain::use_interrupts(bool on, int msix_vector, int data_vector) {
+  if (msix_vector > 15 || data_vector > 15) return false;
+  interrupts_ = on;
+  if (on) {
+    msix_vector_ = msix_vector;
+    data_vector_ = data_vector;
+    nhi_.set_control_interrupts(true, msix_vector);
+  } else {
+    nhi_.set_control_interrupts(false, msix_vector >= 0 ? msix_vector : msix_vector_);
+    nhi_.disable_interrupts();
+    msix_vector_ = data_vector_ = -1;
+  }
+  return true;
 }
 
 // ------------------------------------------------------------------ hop tables and paths
@@ -532,7 +599,7 @@ bool Usb4Domain::build_path(Usb4Path* path, int first_router, uint32_t first_por
 // One entry of a hop table (tb_path_activate). PCIe paths: flow control out of the source and internal hops and into every hop, no shared buffers, priority 3, weight 1.
 bool Usb4Domain::write_hop(const Usb4Router& r, uint32_t port, uint32_t hop_index, const Usb4Hop& hop, bool first, bool last, const Usb4Path& path) {
   const uint8_t in_mask = first ? kPathSource : kPathInternal, out_mask = last ? kPathDestination : kPathInternal;
-  const bool ingress_fc = (kPathAll & in_mask) != 0, egress_fc = ((kPathSource | kPathInternal) & out_mask) != 0;
+  const bool ingress_fc = (path.ingress_fc_enable & in_mask) != 0, egress_fc = (path.egress_fc_enable & out_mask) != 0;
   uint32_t words[2];
   words[0] = hop.out_hop | (static_cast<uint32_t>(hop.out_port) << 11) | (static_cast<uint32_t>(hop.credits) << 17) | (1u << 31);
   words[1] = path.weight | (static_cast<uint32_t>(path.priority) << 8) | (0x7FFu << 12) | (ingress_fc ? 1u << 24 : 0) | (egress_fc ? 1u << 25 : 0);   // (counter field all ones, counter disabled: what Linux writes)
@@ -671,8 +738,8 @@ bool Usb4Domain::usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_p
 bool Usb4Domain::remove_tunnel(int slot) {
   Usb4Tunnel& t = tunnels_[slot];
   // the adapters first (down, then up), then the paths; the device may be gone already
-  if (t.host_router >= 0 && routers_[t.host_router]->present) set_adapter_enable(*routers_[t.host_router], t.down_port, t.kind, false);
-  if (t.device_router >= 0 && routers_[t.device_router]->present) {
+  if (t.kind != Usb4TunnelKind::Dma && t.host_router >= 0 && routers_[t.host_router]->present) set_adapter_enable(*routers_[t.host_router], t.down_port, t.kind, false);
+  if (t.kind != Usb4TunnelKind::Dma && t.device_router >= 0 && routers_[t.device_router]->present) {
     set_adapter_enable(*routers_[t.device_router], t.up_port, t.kind, false);
     if (t.kind == Usb4TunnelKind::Pcie) routers_[t.device_router]->pcie_tunnel = false;
     else routers_[t.device_router]->usb3_tunnel = false;
@@ -785,6 +852,159 @@ bool Usb4Domain::disconnect_pcie(uint32_t router_index) {
 bool Usb4Domain::disconnect_usb3(uint32_t router_index) {
   const int slot = find_tunnel(static_cast<int>(router_index), Usb4TunnelKind::Usb3);
   return slot >= 0 && remove_tunnel(slot);
+}
+
+// ------------------------------------------------------------------ data paths to another host
+
+bool Usb4Domain::take_hop(Usb4Router& r, uint32_t port, bool in, uint32_t hop) {
+  Usb4Port& p = r.ports[port];
+  const uint32_t limit = in ? p.max_in_hop : p.max_out_hop;
+  uint64_t* bits = in ? p.in_hops : p.out_hops;
+  if (hop == 0 || hop > limit || hop >= kHopIdLimit || bit_test(bits, hop)) return false;
+  bit_set(bits, hop);
+  return true;
+}
+
+// A path between the host interface and the lane adapter of the host on the cable, through the routers in `chain` (the one that holds that adapter first, the host router last):
+// `toward_host` for the path we receive on, otherwise the one we send on. The first input and the last output HopIDs are given (the ring on the host interface, the HopID on the cable); the
+// ones in between are the lowest free of both ends of each link (tb_path_alloc / tb_dma_init_*_path).
+bool Usb4Domain::build_dma_path(Usb4Path* path, const int* chain, uint32_t n, bool toward_host, uint32_t xdomain_port, uint32_t nhi_port, uint32_t ring, uint32_t cable_hop) {
+  *path = Usb4Path();
+  if (n == 0 || n > kMaxHops) return false;
+  path->priority = 5;
+  path->weight = 1;
+  path->egress_fc_enable = toward_host ? kPathSource | kPathInternal : kPathAll;
+  path->ingress_fc_enable = kPathAll;
+  struct Step { int router; uint32_t in_port, out_port; };
+  Step steps[kMaxHops];
+  auto upstream_lane = [&](const Usb4Router& r) {
+    uint32_t lane = r.upstream_port;
+    if (r.ports[lane].link_nr != 0 && r.ports[lane].dual_link >= 0) lane = static_cast<uint32_t>(r.ports[lane].dual_link);
+    return lane;
+  };
+  for (uint32_t i = 0; i < n; ++i) {
+    // position along the direction of travel
+    const uint32_t k = toward_host ? i : n - 1 - i;          // which router of the chain
+    const Usb4Router& r = *routers_[chain[k]];
+    const Usb4Router* below = k > 0 ? routers_[chain[k - 1]].get() : nullptr;
+    const uint32_t down_lane = below ? below->parent_port : xdomain_port;           // toward the other host
+    const uint32_t up_lane = k + 1 < n ? upstream_lane(r) : nhi_port;               // toward the host interface
+    steps[i] = Step{chain[k], toward_host ? down_lane : up_lane, toward_host ? up_lane : down_lane};
+  }
+  uint32_t in_hop = toward_host ? cable_hop : ring;
+  const uint32_t last_out = toward_host ? ring : cable_hop;
+  bool ok = take_hop(*routers_[steps[0].router], steps[0].in_port, true, in_hop);
+  for (uint32_t i = 0; ok && i < n; ++i) {
+    Usb4Router& r = *routers_[steps[i].router];
+    // the hop is recorded as soon as its input is held, so that a failure further on gives it back
+    Usb4Hop& hop = path->hops[path->length++];
+    hop = Usb4Hop{static_cast<int16_t>(steps[i].router), static_cast<uint8_t>(steps[i].in_port), static_cast<uint8_t>(steps[i].out_port), static_cast<uint16_t>(in_hop), 0, 0};
+    uint32_t out_hop = 0;
+    if (i + 1 == n) {
+      out_hop = last_out;
+      ok = take_hop(r, steps[i].out_port, false, out_hop);
+    } else {
+      Usb4Router& next = *routers_[steps[i + 1].router];
+      for (uint32_t h = kMinPathHop; h < kHopIdLimit && out_hop == 0; ++h) {
+        if (h > r.ports[steps[i].out_port].max_out_hop || h > next.ports[steps[i + 1].in_port].max_in_hop) break;
+        if (!bit_test(r.ports[steps[i].out_port].out_hops, h) && !bit_test(next.ports[steps[i + 1].in_port].in_hops, h)) out_hop = h;
+      }
+      ok = out_hop != 0 && take_hop(r, steps[i].out_port, false, out_hop);
+      if (ok && !take_hop(next, steps[i + 1].in_port, true, out_hop)) {
+        release_hop(r, steps[i].out_port, false, out_hop);
+        ok = false;
+        out_hop = 0;
+      }
+    }
+    if (!ok) break;
+    hop.out_hop = static_cast<uint16_t>(out_hop);
+    in_hop = out_hop;
+  }
+  if (!ok) {
+    release_path(path);
+    return false;
+  }
+  // credits (tb_dma_reserve_credits without credit allocation): 6 on a lane adapter, 14 when bonded, the adapter's buffers up to 14 on a protocol adapter; the first hop of the path we
+  // receive on gets what the lane adapter has left after the control path
+  for (uint32_t i = 0; i < path->length; ++i) {
+    const Usb4Port& in = routers_[path->hops[i].router]->ports[path->hops[i].in_port];
+    uint32_t credits = in.is_lane() ? (in.bonded ? 14 : 6) : (in.total_credits < 14 ? in.total_credits : 14);
+    if (toward_host && i == 0) {
+      const uint32_t usable = in.total_credits > in.ctl_credits ? in.total_credits - in.ctl_credits : 0;
+      credits = usable < 14 ? usable : 14;
+    }
+    path->hops[i].credits = static_cast<uint8_t>(credits);
+  }
+  return true;
+}
+
+bool Usb4Domain::open_paths(const TbXDomain& xd, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  if (transmit_ring == 0 || receive_ring == 0) {
+    *error = "ring 0 is the control channel";
+    return false;
+  }
+  // where the other host hangs: the router whose route is the host's without its last byte, and that byte is the lane adapter
+  uint32_t length = route_length(xd.route);
+  if (length == 0) {
+    *error = "no route";
+    return false;
+  }
+  const uint64_t parent_route = xd.route & ~(0xFFull << (8 * (length - 1)));
+  const uint32_t xdomain_port = static_cast<uint32_t>((xd.route >> (8 * (length - 1))) & 0xFF);
+  const int parent = find_router(parent_route);
+  int root = -1;
+  for (uint64_t i = 0; i < routers_.count(); ++i)
+    if (routers_[i]->present && routers_[i]->parent < 0) root = static_cast<int>(i);
+  if (parent < 0 || root < 0 || xdomain_port == 0 || xdomain_port > routers_[parent]->max_port || !routers_[parent]->ports[xdomain_port].xdomain) {
+    *error = "the host is not where it was";
+    return false;
+  }
+  int chain[kMaxHops];
+  uint32_t n = 0;
+  for (int r = parent; r >= 0 && n < kMaxHops; r = routers_[r]->parent) chain[n++] = r;
+  if (chain[n - 1] != root) {
+    *error = "no route to the host interface";
+    return false;
+  }
+  const uint32_t nhi_port = routers_[root]->upstream_port;
+  int slot = -1;
+  for (uint32_t i = 0; i < kMaxTunnels && slot < 0; ++i)
+    if (!tunnels_[i].used) slot = static_cast<int>(i);
+  if (slot < 0) {
+    *error = "too many tunnels";
+    return false;
+  }
+  Usb4Tunnel& t = tunnels_[slot];
+  t = Usb4Tunnel();
+  t.used = true;
+  t.kind = Usb4TunnelKind::Dma;
+  t.xdomain_route = xd.route;
+  // we send on `transmit_path` from `transmit_ring`; the other host sends on `receive_path` into `receive_ring`
+  if (!build_dma_path(&t.down, chain, n, false, xdomain_port, nhi_port, transmit_ring, transmit_path) || !build_dma_path(&t.up, chain, n, true, xdomain_port, nhi_port, receive_ring, receive_path)) {
+    release_path(&t.down);
+    release_path(&t.up);
+    t = Usb4Tunnel();
+    *error = "the HopIDs are in use";
+    return false;
+  }
+  if (!activate_path(&t.down) || !activate_path(&t.up)) {
+    deactivate_path(&t.down);
+    deactivate_path(&t.up);
+    release_path(&t.down);
+    release_path(&t.up);
+    t = Usb4Tunnel();
+    *error = "the paths could not be written";
+    return false;
+  }
+  t.active = true;
+  return true;
+}
+
+void Usb4Domain::close_paths(const TbXDomain& xd) {
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dma && tunnels_[i].xdomain_route == xd.route) remove_tunnel(static_cast<int>(i));
 }
 
 // ------------------------------------------------------------------ lane bonding
