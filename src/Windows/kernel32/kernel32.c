@@ -313,7 +313,7 @@ EXPORT void WINAPI OutputDebugStringA(LPCSTR s) {
   record.NumberParameters = 2;
   record.ExceptionInformation[0] = strlen(s) + 1;
   record.ExceptionInformation[1] = (ULONG_PTR)s;
-  NtTcosDebugException(&record, TRUE);
+  NtTcosDebugException(&record, TRUE, NULL);
 }
 EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) {
   if (!s || !NtCurrentPeb()->BeingDebugged) return;
@@ -1702,7 +1702,7 @@ EXPORT HANDLE WINAPI OpenThread(DWORD access, BOOL inherit, DWORD id) {
   memset(&attributes, 0, sizeof(attributes));
   attributes.Length = sizeof(attributes);
   attributes.Attributes = inherit ? 2 : 0;
-  ULONG64 client[2] = {GetCurrentProcessId(), id};
+  ULONG64 client[2] = {0, id};
   HANDLE h = NULL;
   const NTSTATUS status = NtOpenThread(&h, access, &attributes, client);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }

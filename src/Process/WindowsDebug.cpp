@@ -39,7 +39,7 @@ constexpr uint32_t kMaxObjects = 8, kMaxEvents = 48, kMaxAttached = 16, kInfoByt
 struct Event {
   bool used = false, delivered = false, continued = false, blocking = false, orphan = false;
   uint32_t state = 0, status = kDbgNotHandled;
-  uint64_t pid = 0, tid = 0, base = 0, start = 0;      // base/start: the image base and start address of a process or thread, the base of a library
+  uint64_t pid = 0, tid = 0, base = 0, start = 0, context = 0;      // context: the CONTEXT the thread waits with (an exception); base/start: the image base and start address of a process or thread, the base of a library
   uint8_t info[kInfoBytes] = {};
 };
 struct DebugObject {
@@ -304,7 +304,7 @@ uint32_t debug_attach_child(Process& parent, uint64_t child_pid) {
 }
 
 // A blocking event of the calling program: queued, then waited for until the debugger has answered. Returns the answer.
-static uint32_t post_and_wait(Process& p, uint32_t state, uint64_t tid, const uint8_t* info, uint32_t info_bytes) {
+static uint32_t post_and_wait(Process& p, uint32_t state, uint64_t tid, const uint8_t* info, uint32_t info_bytes, uint64_t context = 0) {
   ObjectManager* objects = system_objects();
   if (!objects) return kDbgNotHandled;
   ISystemSync& sync = objects->sync();
@@ -314,6 +314,7 @@ static uint32_t post_and_wait(Process& p, uint32_t state, uint64_t tid, const ui
   Event* e = o ? post_locked(*o, state, p.id(), tid, true) : nullptr;
   if (!e) { sync.unlock(); return kDbgNotHandled; }
   for (uint32_t i = 0; i < info_bytes && i < kInfoBytes; ++i) e->info[i] = info[i];
+  e->context = context;
   sync.notify_all();
   sync.unlock();
   uint32_t answer = kDbgNotHandled;
@@ -483,6 +484,25 @@ uint32_t nt_set_information_debug_object(Process& p, const SyscallRequest& r) {
   return kSuccess;
 }
 
+uint32_t nt_suspend_resume_process(Process& p, const SyscallRequest& r, bool suspend) {
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t pid = 0;
+  if (!process_handle_info(p, r.args[0], &exited, &code, &pid)) return r.args[0] == ~uint64_t{0} ? kAccessDenied : kInvalidHandle;
+  if (exited) return kProcessIsTerminating;
+  IProcessRuntime* runtime = p.runtime();
+  if (!runtime || pid == p.id()) return kNotImplemented;
+  IProcessRuntime::ThreadEntry threads[64];
+  const uint32_t count = runtime->list_threads(pid, threads, 64);
+  for (uint32_t i = 0; i < count; ++i) {
+    IProcessRuntime::RemoteOp op;
+    op.kind = suspend ? IProcessRuntime::RemoteOp::SuspendThread : IProcessRuntime::RemoteOp::ResumeThread;
+    op.thread_id = threads[i].id;
+    runtime->remote_operation(pid, op);
+  }
+  return kSuccess;
+}
+
 uint32_t nt_tcos_debug_exception(Process& p, const SyscallRequest& r) {
   if (!debug_object_of(p.id())) return kDbgNotHandled;
   uint8_t record[0x98];
@@ -490,7 +510,20 @@ uint32_t nt_tcos_debug_exception(Process& p, const SyscallRequest& r) {
   uint8_t info[0xA8] = {};
   for (uint32_t i = 0; i < sizeof(record); ++i) info[i] = record[i];
   put(info + 0x98, (r.args[1] & 0xFF) ? 1 : 0, 4);      // FirstChance
-  return post_and_wait(p, kStateException, p.runtime() ? p.runtime()->current_thread_id() : p.id(), info, sizeof(info));
+  return post_and_wait(p, kStateException, p.runtime() ? p.runtime()->current_thread_id() : p.id(), info, sizeof(info), r.args[2]);
+}
+
+// A thread that waits for the debugger at an exception is stopped at that exception: its registers are the CONTEXT it waits with.
+bool debug_stopped_context(uint64_t pid, uint64_t tid, uint64_t* address) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return false;
+  bool found = false;
+  objects->sync().lock();
+  const Attached* a = attachment_of(pid);
+  DebugObject* o = a ? object_by_id(a->object) : nullptr;
+  if (o) for (const Event& e : o->events) if (e.used && e.blocking && !e.orphan && !e.continued && e.pid == pid && e.tid == tid && e.context != 0) { *address = e.context; found = true; break; }
+  objects->sync().unlock();
+  return found;
 }
 
 }  // namespace process::windowsabi

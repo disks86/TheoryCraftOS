@@ -31,6 +31,7 @@
 #include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRing.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltXdomainTypes.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -100,24 +101,6 @@ struct TbTopologySwitch {
   }
 };
 
-// Another host on the cable.
-struct TbXDomain {
-  uint8_t remote_uuid[16] = {}, local_uuid[16] = {};
-  uint8_t link = 0, depth = 0;           // Alpine Ridge: where it is
-  uint64_t route = 0;                    // the route string that reaches it (the one the firmware names as local)
-  bool discovered = false;               // the UUID and property exchange succeeded
-  bool gave_up = false;                  // it did not, after the retries
-  uint8_t attempts = 0;
-  uint32_t vendor_id = 0, device_id = 0, generation = 0;
-  char vendor_name[48] = {}, device_name[48] = {};
-  uint32_t protocols[8] = {};            // the protocol ids of the services it offers (prtcid of each service directory; 1 is IP networking)
-  uint32_t protocol_count = 0;
-  bool has_network = false;              // it offers the network service (protocol 1) ...
-  uint32_t network_flags = 0;            // ... with these flags (its prtcstns: ThunderboltNet's kFlag...)
-  bool dual_lane = false, gen3 = false;  // how the firmware says the link runs
-  bool tunnel = false;                   // a data path to it is approved (ICM_APPROVE_XDOMAIN)
-};
-
 namespace tb_icm {
 // ICM_EVENT_XDOMAIN_CONNECTED / DISCONNECTED, in both generations' layouts (Titan Ridge names the domain by route, Alpine Ridge by port and depth)
 constexpr uint32_t kApproveXdomainBytes = 32, kTrApproveXdomainBytes = 36, kTrDisconnectXdomainBytes = 32, kXdomainConnectedBytes = 56, kXdomainDisconnectedBytes = 24, kTrXdomainDisconnectedBytes = 28;
@@ -161,18 +144,8 @@ bool parse_device_connected(ConstByteView event, TbDevice* out, bool* rejected);
 bool parse_device_disconnected(ConstByteView event, uint8_t* link, uint8_t* depth);
 }  // namespace tb_icm
 
-// A service that talks to another host in XDomain messages of its own (ThunderboltIP): the messages that start with the service's UUID instead of the discovery protocol's. Returns true if the
-// packet was a request of the service and was dealt with; the answers to the service's own requests are left to the request that waits for them.
-class IThunderboltIpHandler {
- public:
-  virtual bool handle_ip_packet(ConstByteView body) = 0;
 
- protected:
-  constexpr IThunderboltIpHandler() = default;
-  ~IThunderboltIpHandler() = default;
-};
-
-class ThunderboltIcm final : public IThunderboltEvents {
+class ThunderboltIcm final : public IThunderboltEvents, public IXdomainHost {
  public:
   enum class Outcome : uint8_t {
     NotStarted,
@@ -230,7 +203,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool use_interrupts(bool on, int msix_vector = -1, int data_vector = -1);
   bool interrupts_on() const { return interrupts_; }
   // Routes a data ring's interrupt the way the control channel's is (to the MSI-X entry given to use_interrupts, or the single MSI); does nothing while interrupts are off, so the ring is polled.
-  void ring_interrupts(bool transmit, uint32_t hop, bool on) { if (interrupts_ || !on) nhi_.set_ring_interrupts(transmit, hop, on, data_vector_ >= 0 ? data_vector_ : msix_vector_); }
+  void ring_interrupts(bool transmit, uint32_t hop, bool on) override { if (interrupts_ || !on) nhi_.set_ring_interrupts(transmit, hop, on, data_vector_ >= 0 ? data_vector_ : msix_vector_); }
   Outcome outcome() const { return outcome_; }
 
   // Reads the control channel: events update the device list.
@@ -238,16 +211,17 @@ class ThunderboltIcm final : public IThunderboltEvents {
 
   // Other hosts on the cable (XDomain connections). Each is introduced as the firmware reports it and discovered on the next poll(): its UUID is asked for, then its property block read
   // in pieces and parsed into the vendor, device and the protocols of its services. Requests from the other host (UUID, properties) are answered from the identity set here.
-  uint64_t xdomain_count() const { return xdomains_.count(); }
-  const TbXDomain& xdomain(uint64_t index) const { return xdomains_[index]; }
+  uint64_t xdomain_count() const override { return xdomains_.count(); }
+  const TbXDomain& xdomain(uint64_t index) const override { return xdomains_[index]; }
+  IThunderboltEvents* event_sink() override { return this; }
   // What this host tells another one about itself (vendor and device numbers, names); defaults to a made up identity.
   // Offers the network service to other hosts (their property block read shows it), with these flags.
-  bool offer_network(uint32_t flags);
-  void set_ip_handler(IThunderboltIpHandler* handler) { ip_handler_ = handler; }
+  bool offer_network(uint32_t flags) override;
+  void set_ip_handler(IThunderboltIpHandler* handler) override { ip_handler_ = handler; }
   // Asks the firmware to open the data path to the other host (ICM_APPROVE_XDOMAIN): we send on `transmit_path` from our ring `transmit_ring`, and the other host sends on
   // `receive_path`, into our ring `receive_ring`. One path at a time. disconnect_xdomain_paths() closes it.
-  bool approve_xdomain_paths(uint64_t index, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, const char** error);
-  bool disconnect_xdomain_paths(uint64_t index);
+  bool approve_xdomain_paths(uint64_t index, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, const char** error) override;
+  bool disconnect_xdomain_paths(uint64_t index) override;
   bool set_identity(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name);
 
   const TbDriverReady& driver_ready() const { return ready_; }
@@ -276,8 +250,8 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // The route string of the router at `link` and `depth`, found by walking that topology (icm_fr_get_route): the first router behind the link, then the next that follows in the index order.
   static bool route_in_topology(const List<TbTopologySwitch>& switches, uint8_t link, uint8_t depth, uint64_t* route);
 
-  TbNhi& nhi() { return nhi_; }
-  TbControl& control() { return control_; }
+  TbNhi& nhi() override { return nhi_; }
+  TbControl& control() override { return control_; }
 
   bool on_event(TbPacketType type, ConstByteView body) override;
 

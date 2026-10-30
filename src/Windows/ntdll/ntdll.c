@@ -1144,7 +1144,7 @@ typedef BOOL (WINAPI *DllEntry)(HANDLE, DWORD, PVOID);
 typedef int (WINAPI *ProgramEntry)(PVOID);
 
 /* The program's first breakpoint, where a debugger that started it takes over; it is not DbgBreakPoint, as on Windows. */
-static __attribute__((noinline)) void tcos_initial_break(void) { __asm__ volatile("int3" ::: "memory"); }
+static __attribute__((noinline)) void tcos_initial_break(void) { *((BYTE *)NtCurrentTeb() + 0x1668) = 2; __asm__ volatile("int3" ::: "memory"); *((BYTE *)NtCurrentTeb() + 0x1668) = 0; }
 
 /* The thread of a program starts here: the kernel puts the program's entry point in the first argument and the PEB in the second. The libraries' entry points run first
  * (in the order the kernel listed them: a library after the libraries it imports), then the program's. Its return value ends the process. */

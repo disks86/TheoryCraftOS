@@ -360,15 +360,15 @@ static BOOL being_debugged(void) { return NtCurrentPeb()->BeingDebugged != 0; }
  * the kernel reported at the int3 itself is stepped over, as the processor does after one). */
 static BOOL debugger_handled(EXCEPTION_RECORD *record, CONTEXT *context, BOOLEAN first_chance) {
   if (!being_debugged()) return FALSE;
-  if (NtTcosDebugException(record, first_chance) != DBG_CONTINUE_STATUS) return FALSE;
-  if (record->ExceptionCode == 0x80000003u && (ULONG64)record->ExceptionAddress == context->Rip && *(volatile BYTE *)context->Rip == 0xCC) context->Rip++;
+  if (NtTcosDebugException(record, first_chance, context) != DBG_CONTINUE_STATUS) return FALSE;
   return TRUE;
 }
 
 /* Nobody handled it: the top-level filter gets its say, then the process ends with the exception's code. */
 #define TEB_REMOTE_BREAK(teb) (*(BYTE *)((BYTE *)(teb) + 0x1668))      /* set in the thread DbgUiIssueRemoteBreakin makes */
 static __attribute__((noreturn, noinline)) void unhandled_exception(EXCEPTION_RECORD *record, CONTEXT *context) {
-  if (TEB_REMOTE_BREAK(NtCurrentTeb())) RtlExitUserThread(0);      /* (DbgUiRemoteBreakin ignores a breakpoint nobody handled) */
+  if (TEB_REMOTE_BREAK(NtCurrentTeb()) == 1) RtlExitUserThread(0);      /* (DbgUiRemoteBreakin ignores a breakpoint nobody handled) */
+  if (TEB_REMOTE_BREAK(NtCurrentTeb()) == 2) { TEB_REMOTE_BREAK(NtCurrentTeb()) = 0; NtContinue(context, FALSE); }      /* (so does the first breakpoint of a program) */
   if (debugger_handled(record, context, FALSE)) NtContinue(context, FALSE);
   if (g_init_guard && g_init_guard_teb == NtCurrentTeb()) __builtin_longjmp(g_init_guard, 1);      /* (a library's entry point failed: see call_library_entry) */
   if (g_top_level_filter) {

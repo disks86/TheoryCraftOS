@@ -69,11 +69,13 @@ class ThunderboltDriver {
   }
   // Devices connected (routers other than the host's own, for the software connection manager) and other hosts on the cable (none are handled there).
   uint64_t device_count() const { return icm_ ? icm_->device_count() : usb4_ && usb4_->present_count() != 0 ? usb4_->present_count() - 1 : 0; }
-  uint64_t xdomain_count() const { return icm_ ? icm_->xdomain_count() : 0; }
+  uint64_t xdomain_count() const { return icm_ ? icm_->xdomain_count() : usb4_ ? usb4_->xdomains_present() : 0; }
+  // The connection manager as a host for services on the cable (ThunderboltNet), whichever kind it is.
+  IXdomainHost* xdomain_host() { return icm_ ? static_cast<IXdomainHost*>(icm_.get()) : static_cast<IXdomainHost*>(usb4_.get()); }
   // A request of the control channel that interrupts when answered, for checking that an interrupt arrives.
   void probe_control();
-  // Whether runtime suspend is possible (the firmware connection manager's RTD3; not for the software one).
-  bool runtime_allowed() const { return icm_ && icm_->runtime_allowed(); }
+  // Whether runtime suspend is possible (the firmware connection manager's RTD3; for the software one: nothing tunnelled and no other host on the cable).
+  bool runtime_allowed() const { return icm_ ? icm_->runtime_allowed() : usb4_ && usb4_->runtime_allowed(); }
   // Interrupt-driven operation. `on_interrupt()` is what the MSI handler calls: it acknowledges the chip and counts. `interrupts()` is the count, for a loop that polls only after one
   // came (and now and then regardless, in case one was lost). `use_interrupts(true)` unmasks the control channel's ring interrupts in the chip; the MSI itself is the caller's.
   void on_interrupt() {
@@ -84,10 +86,7 @@ class ThunderboltDriver {
   // `msix_vector`: the entry of the MSI-X table that carries them (see PciMsix), or -1 for a single MSI. `data_vector`: another entry for the data rings (networking), or -1 for the same one.
   bool use_interrupts(bool on, int msix_vector = -1, int data_vector = -1) {
     if (icm_) return icm_->use_interrupts(on, msix_vector, data_vector);
-    if (!usb4_nhi_ || msix_vector > 15) return false;
-    if (on) usb4_nhi_->set_control_interrupts(true, msix_vector);
-    else usb4_nhi_->disable_interrupts();
-    return true;
+    return usb4_ && usb4_->use_interrupts(on, msix_vector, data_vector);
   }
   // Sleep. suspend() puts the controller to sleep (ThunderboltIcm::suspend) and the PCI function in D3hot, with its wake-up (PME) armed if `wake` is asked for and the function can raise one
   // from D3hot (`wake_armed()` says); resume() brings the function back to D0 and the controller up again. runtime_suspend() is the same while the machine runs, for a controller the

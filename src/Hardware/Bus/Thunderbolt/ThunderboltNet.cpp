@@ -209,7 +209,7 @@ void ThunderboltNet::close(bool logout) {
       for (uint32_t attempt = 0; attempt < 3; ++attempt) {
         const uint32_t n = tb_ip::build_logout(route_, 0, local_uuid_, remote_uuid_, ++command_id_, ByteView(request, sizeof request));
         uint32_t got = 0;
-        if (n != 0 && icm_.control().xdomain_request(ConstByteView(request, n), ByteView(response, sizeof response), &got, 200000, &icm_, TbPacketType::XdomainResponse) != TbControl::Result::Timeout) break;
+        if (n != 0 && icm_.control().xdomain_request(ConstByteView(request, n), ByteView(response, sizeof response), &got, 200000, icm_.event_sink(), TbPacketType::XdomainResponse) != TbControl::Result::Timeout) break;
       }
     }
     // the path first, then the rings: the chip may still be moving frames
@@ -267,7 +267,7 @@ void ThunderboltNet::try_login() {
   uint8_t request[tb_ip::kLoginBytes], response[tb_frame::kFrameBytes];
   const uint32_t n = tb_ip::build_login(route_, static_cast<uint8_t>(login_tries_ % 4), local_uuid_, remote_uuid_, ++command_id_, local_path_, ByteView(request, sizeof request));
   uint32_t got = 0;
-  bool ok = n != 0 && icm_.control().xdomain_request(ConstByteView(request, n), ByteView(response, sizeof response), &got, config_.login_timeout_us, &icm_, TbPacketType::XdomainResponse) ==
+  bool ok = n != 0 && icm_.control().xdomain_request(ConstByteView(request, n), ByteView(response, sizeof response), &got, config_.login_timeout_us, icm_.event_sink(), TbPacketType::XdomainResponse) ==
                           TbControl::Result::Ok;
   if (ok) {
     const ConstByteView packet(response, got < sizeof response ? got : sizeof response);

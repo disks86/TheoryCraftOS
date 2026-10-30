@@ -72,7 +72,7 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
       usb4_error_ = "the control channel did not start";
       return outcome_ = Outcome::ControllerFailed;
     }
-    usb4_ = UniquePointer<Usb4Domain>::make(allocator_, *usb4_control_, allocator_);
+    usb4_ = UniquePointer<Usb4Domain>::make(allocator_, *usb4_control_, *usb4_nhi_, allocator_);
     if (!usb4_) return outcome_ = Outcome::OutOfMemory;
     if (!usb4_->start(&usb4_error_)) return outcome_ = Outcome::ControllerFailed;
     return outcome_ = Outcome::Started;
@@ -102,8 +102,8 @@ bool ThunderboltDriver::sleep(bool wake, bool runtime) {
   if (icm_) {
     if (!(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
   } else {
-    if (runtime) return false;                                // (the software connection manager has no runtime power management)
-    usb4_->suspend();                                          // (routers asleep, tunnels down; the control channel stops with it)
+    if (runtime && !usb4_->runtime_allowed()) return false;   // (a path to another host or a tunnel keeps it awake)
+    usb4_->suspend(runtime);                                   // (routers asleep, tunnels down; the control channel stops with it)
     usb4_control_->stop();
   }
   if (icl_ && !devices) {

@@ -74,6 +74,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       display_settings_(allocator),
       network_properties_(allocator),
       wireless_properties_(allocator),
+      device_properties_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
       database_url_(allocator),
@@ -189,6 +190,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   computer_manager_.on_open_display_settings({&Desktop::on_display_settings, this});
   computer_manager_.on_open_network_properties({&Desktop::on_network_properties, this});
   computer_manager_.on_open_wireless_properties({&Desktop::on_wireless_properties, this});
+  computer_manager_.on_open_device_properties({&Desktop::on_device_properties, this});
   input_.set_confine(&Desktop::confine_pointer, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
@@ -818,6 +820,19 @@ void Desktop::on_wireless_properties(void* self, Control&) {
   d->open_wireless_properties(d->computer_manager_.wireless_adapter());
 }
 
+void Desktop::open_device_properties(HardwareGroup group, uint32_t id) {
+  window_.locked([&] {
+    device_properties_.show_device(group, id);
+    if (device_properties_.manager()) device_properties_.activate();
+    else windows_.add_window(&device_properties_);
+  });
+}
+
+void Desktop::on_device_properties(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->open_device_properties(d->computer_manager_.device_group(), d->computer_manager_.device_id());
+}
+
 void Desktop::open_file_properties(StringView path) {
   window_.locked([&] {
     file_properties_.show(path);
@@ -1124,6 +1139,7 @@ void Desktop::pump(uint64_t uptime_us) {
     polled_second_ = second;
     if (network_properties_.manager()) network_properties_.update();
     if (wireless_properties_.manager()) wireless_properties_.update();
+    if (device_properties_.manager()) device_properties_.update();
     display_settings_.tick();
     if (computer_manager_.manager()) computer_manager_.update(uptime_us);
     DateTime now;

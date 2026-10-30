@@ -497,9 +497,11 @@ add_executable(BOOTX64
   src/Desktop/CubeRenderer.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
+  src/SystemDeviceDetails.cpp
   src/SystemNetworkDetails.cpp
   src/SystemWirelessDetails.cpp
   src/Desktop/NetworkProperties.cpp
+  src/Desktop/DeviceProperties.cpp
   src/Desktop/WirelessProperties.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
@@ -747,6 +749,7 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltPower.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltNvm.cpp
   src/Hardware/Bus/Thunderbolt/Usb4Domain.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltXdomainHost.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltXdomain.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp

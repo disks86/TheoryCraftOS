@@ -26,6 +26,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Crypto/Random.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltXdomainTypes.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -71,8 +72,8 @@ class ThunderboltNet final : public INetworkInterface, public IThunderboltIpHand
   };
   static constexpr uint32_t kFirstPath = 8;     // TB_PATH_MIN_HOPID: the lowest HopID of a path on the cable
 
-  ThunderboltNet(ThunderboltIcm& icm, allocators::IAllocator& allocator, crypto::IRandom& random) : icm_(icm), allocator_(allocator), random_(random), packet_(allocator) {}
-  ThunderboltNet(ThunderboltIcm& icm, allocators::IAllocator& allocator, crypto::IRandom& random, const Config& config)
+  ThunderboltNet(IXdomainHost& icm, allocators::IAllocator& allocator, crypto::IRandom& random) : icm_(icm), allocator_(allocator), random_(random), packet_(allocator) {}
+  ThunderboltNet(IXdomainHost& icm, allocators::IAllocator& allocator, crypto::IRandom& random, const Config& config)
       : icm_(icm), allocator_(allocator), random_(random), config_(config), packet_(allocator) {}
   ~ThunderboltNet() { shutdown(); }
   ThunderboltNet(const ThunderboltNet&) = delete;
@@ -121,7 +122,7 @@ class ThunderboltNet final : public INetworkInterface, public IThunderboltIpHand
   bool queue_packet(ConstByteView packet);
   bool respond(ConstByteView packet);
 
-  ThunderboltIcm& icm_;
+  IXdomainHost& icm_;
   allocators::IAllocator& allocator_;
   crypto::IRandom& random_;
   Config config_;
