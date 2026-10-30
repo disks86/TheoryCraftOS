@@ -230,7 +230,6 @@ static BOOL linguistic_match(void *context, int start, int available, int *found
   }
   return FALSE;
 }
-static int nls_locale_of_name(LPCWSTR name);
 EXPORT int WINAPI FindNLSStringEx(LPCWSTR locale_name, DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, LPINT found_length, LPVOID version, LPVOID reserved, LPARAM sort_handle) {
   (void)version; (void)reserved; (void)sort_handle;
   const DWORD mode = flags & FIND_MODES_;
@@ -280,78 +279,6 @@ EXPORT int WINAPI NormalizeString(int form, LPCWSTR source, int count, LPWSTR de
 
 /* ---- locale information (English, United States) --------------------------------------------------------------------------------------------------------- */
 
-static const char *const k_days[7] = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"};
-static const char *const k_months[12] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
-/* The text of a LOCALE_ value, or NULL for a number (*number) or an unknown one. */
-static const char *locale_text(DWORD type, DWORD *number, char *scratch) {
-  *number = (DWORD)-1;
-  switch (type & 0xFFFF) {
-    case 0x01: return "1033";                  /* LOCALE_ILANGUAGE */
-    case 0x02: return "English (United States)";      /* SLANGUAGE */
-    case 0x03: case 0x1001: return "English";   /* SABBREVLANGNAME, SENGLISHLANGUAGENAME */
-    case 0x04: return "English (United States)";
-    case 0x05: *number = 1; return NULL;       /* ICOUNTRY */
-    case 0x06: return "United States";         /* SCOUNTRY */
-    case 0x07: return "USA";
-    case 0x08: return "USA";
-    case 0x09: *number = 1; return NULL;       /* SABBREVCTRYNAME... ICOUNTRY (kept) */
-    case 0x0A: return "United States";
-    case 0x0B: return "1";                     /* IDEFAULTCOUNTRY */
-    case 0x0C: return ",";                     /* SLIST */
-    case 0x0D: *number = 1; return NULL;       /* IMEASURE: US */
-    case 0x0E: return ".";                     /* SDECIMAL */
-    case 0x0F: return ",";                     /* STHOUSAND */
-    case 0x10: return "3;0";                   /* SGROUPING */
-    case 0x11: *number = 2; return NULL;       /* IDIGITS */
-    case 0x12: *number = 1; return NULL;       /* ILZERO */
-    case 0x13: *number = 0; return NULL;       /* INEGNUMBER... (see 0x1010) */
-    case 0x14: return "$";                     /* SCURRENCY */
-    case 0x15: return "USD";                   /* SINTLSYMBOL */
-    case 0x16: return ".";                     /* SMONDECIMALSEP */
-    case 0x17: return ",";                     /* SMONTHOUSANDSEP */
-    case 0x18: return "3;0";                   /* SMONGROUPING */
-    case 0x19: *number = 2; return NULL;       /* ICURRDIGITS */
-    case 0x1A: *number = 2; return NULL;       /* IINTLCURRDIGITS */
-    case 0x1B: *number = 0; return NULL;       /* ICURRENCY: $1 */
-    case 0x1C: *number = 0; return NULL;       /* INEGCURR: ($1) */
-    case 0x1D: return "/";                     /* SDATE */
-    case 0x1E: return ":";                     /* STIME */
-    case 0x1F: return "M/d/yyyy";              /* SSHORTDATE */
-    case 0x20: return "dddd, MMMM d, yyyy";    /* SLONGDATE */
-    case 0x21: *number = 0; return NULL;       /* IDATE: month-day-year */
-    case 0x22: *number = 0; return NULL;       /* ILDATE */
-    case 0x23: *number = 0; return NULL;       /* ITIME: 12 hour */
-    case 0x24: *number = 0; return NULL;       /* ICENTURY... */
-    case 0x25: *number = 0; return NULL;       /* ITLZERO */
-    case 0x26: *number = 0; return NULL;       /* IDAYLZERO */
-    case 0x27: *number = 0; return NULL;       /* IMONLZERO */
-    case 0x28: return "AM";
-    case 0x29: return "PM";
-    case 0x4A: *number = 0; return NULL;       /* ITIMEMARKPOSN */
-    case 0x50: return "";                      /* SPOSITIVESIGN */
-    case 0x51: return "-";                     /* SNEGATIVESIGN */
-    case 0x59: return "en";                    /* SISO639LANGNAME */
-    case 0x5A: return "US";                    /* SISO3166CTRYNAME */
-    case 0x5C: return "en-US";                 /* SNAME */
-    case 0x1002: return "United States";       /* SENGLISHCOUNTRYNAME */
-    case 0x1003: return "h:mm:ss tt";          /* STIMEFORMAT */
-    case 0x1006: return "MMMM yyyy";           /* SYEARMONTH */
-    case 0x79: return "h:mm tt";               /* SSHORTTIME */
-    case 0x1004: *number = 1252; return NULL;  /* IDEFAULTANSICODEPAGE */
-    case 0x1007: *number = 437; return NULL;   /* IDEFAULTCODEPAGE */
-    case 0x100B: *number = 0; return NULL;     /* IFIRSTWEEKOFYEAR */
-    case 0x100C: *number = 6; return NULL;     /* IFIRSTDAYOFWEEK: Sunday */
-    case 0x1010: *number = 1; return NULL;     /* INEGNUMBER */
-    case 0x1014: *number = 0; return NULL;     /* ILANGUAGE (kept) */
-    default: break;
-  }
-  const DWORD t = type & 0xFFFF;
-  if (t >= 0x2A && t <= 0x30) return k_days[t - 0x2A];      /* SDAYNAME1..7 */
-  if (t >= 0x31 && t <= 0x37) { memcpy(scratch, k_days[t - 0x31], 3); scratch[3] = 0; return scratch; }      /* SABBREVDAYNAME */
-  if (t >= 0x38 && t <= 0x43) return k_months[t - 0x38];     /* SMONTHNAME1..12 */
-  if (t >= 0x44 && t <= 0x4F) { memcpy(scratch, k_months[t - 0x44], 3); scratch[3] = 0; return scratch; }      /* SABBREVMONTHNAME */
-  return NULL;
-}
 EXPORT int WINAPI GetUserPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) {
   (void)flags;
   static const WCHAR en[] = {'e', 'n', '-', 'U', 'S', 0, 0};

@@ -3755,6 +3755,7 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
   return TRUE;
 }
 
+#include "locale.inc"
 #include "extra.inc"
 #include "extra2.inc"
 #include "extra3.inc"

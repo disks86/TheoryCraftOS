@@ -33,45 +33,6 @@
 #define NLS_TIME_NOTIMEMARKER 0x04
 #define NLS_TIME_FORCE24HOURFORMAT 0x08
 
-/* Which locale an LCID names: 0 none, 1 English (United States), 2 the invariant locale. */
-static int nls_locale_of(LCID lcid) {
-  switch (lcid) {
-    case 0: case 0x400: case 0x800: case 0x1000: case 0x2000: case 0x409: case 0x0009: return 1;
-    case 0x7F: case 0x1007F: return 2;
-    default: break;
-  }
-  if ((lcid & 0xFFFF) == 0x409) return 1;
-  return 0;
-}
-static WCHAR nls_lower(WCHAR c) { return c >= 'A' && c <= 'Z' ? (WCHAR)(c + 32) : c; }
-static BOOL nls_name_is(const WCHAR *name, const char *text) {
-  for (; *text; ++text, ++name) if (nls_lower(*name) != (WCHAR)*text) return FALSE;
-  return *name == 0;
-}
-/* The locale a name (NULL: the user's, "": invariant, "en-US", "en") picks: like nls_locale_of(). */
-static int nls_locale_of_name(LPCWSTR name) {
-  if (!name) return 1;
-  if (*name == 0) return 2;
-  if (nls_name_is(name, "en-us") || nls_name_is(name, "en") || nls_name_is(name, "!x-sys-default-locale") || nls_name_is(name, "en-us_tradnl") ) return 1;
-  return 0;
-}
-
-/* The days of the week and months, in wide characters. */
-static const WCHAR *nls_day_name(int weekday /* 0 = Sunday */, BOOL abbreviated, WCHAR *scratch) {
-  const char *name = k_days[(weekday + 6) % 7];
-  int n = 0;
-  for (; name[n] && (!abbreviated || n < 3); ++n) scratch[n] = (WCHAR)name[n];
-  scratch[n] = 0;
-  return scratch;
-}
-static const WCHAR *nls_month_name(int month, BOOL abbreviated, WCHAR *scratch) {
-  const char *name = k_months[(month - 1) % 12];
-  int n = 0;
-  for (; name[n] && (!abbreviated || n < 3); ++n) scratch[n] = (WCHAR)name[n];
-  scratch[n] = 0;
-  return scratch;
-}
-
 static BOOL nls_valid_date(const SYSTEMTIME *st) {
   return st->wYear >= 1601 && st->wYear <= 30827 && st->wMonth >= 1 && st->wMonth <= 12 && st->wDay >= 1 && st->wDay <= month_days(st->wYear, st->wMonth);
 }
@@ -115,8 +76,8 @@ static const WCHAR *nls_quoted(NlsOut *o, const WCHAR *p) {
   return p;
 }
 
-static void nls_date_picture(NlsOut *o, const WCHAR *p, const SYSTEMTIME *st) {
-  WCHAR scratch[16];
+static void nls_date_picture(NlsOut *o, int kind, const WCHAR *p, const SYSTEMTIME *st) {
+  WCHAR scratch[80];
   while (*p) {
     if (*p == '\'') { p = nls_quoted(o, p + 1); continue; }
     const WCHAR c = *p;
@@ -126,13 +87,13 @@ static void nls_date_picture(NlsOut *o, const WCHAR *p, const SYSTEMTIME *st) {
       case 'd': {
         if (run > 4) run = 4;
         if (run <= 2) nls_put_number(o, st->wDay, run);
-        else nls_put_text(o, nls_day_name(nls_weekday(st), run == 3, scratch));
+        else nls_put_text(o, nls_day_name(kind, nls_weekday(st), run == 3, scratch));
         break;
       }
       case 'M': {
         if (run > 4) run = 4;
         if (run <= 2) nls_put_number(o, st->wMonth, run);
-        else nls_put_text(o, nls_month_name(st->wMonth, run == 3, scratch));
+        else nls_put_text(o, nls_month_name(kind, st->wMonth, run == 3, scratch));
         break;
       }
       case 'y': {
@@ -154,7 +115,7 @@ static void nls_date_picture(NlsOut *o, const WCHAR *p, const SYSTEMTIME *st) {
   }
 }
 
-static void nls_time_picture(NlsOut *o, const WCHAR *p, const SYSTEMTIME *st, DWORD flags) {
+static void nls_time_picture(NlsOut *o, int kind, const WCHAR *p, const SYSTEMTIME *st, DWORD flags) {
   while (*p) {
     if (*p == '\'') { p = nls_quoted(o, p + 1); continue; }
     const WCHAR c = *p;
@@ -180,8 +141,8 @@ static void nls_time_picture(NlsOut *o, const WCHAR *p, const SYSTEMTIME *st, DW
       case 't':
         if (flags & NLS_TIME_NOTIMEMARKER) nls_drop(o);
         else {
-          nls_put(o, st->wHour < 12 ? 'A' : 'P');
-          if (width == 2) nls_put(o, 'M');
+          WCHAR marker[80];
+          if (nls_text_wide(kind, st->wHour < 12 ? 0x28u : 0x29u, marker)) { if (width == 2) nls_put_text(o, marker); else if (marker[0]) nls_put(o, marker[0]); }
           nls_keep(o);
         }
         break;
@@ -202,6 +163,7 @@ static int nls_deliver(const NlsOut *o, LPWSTR out, int capacity) {
 }
 static void nls_widen(WCHAR *to, const char *from) { while ((*to++ = (WCHAR)(BYTE)*from++)) {} }
 
+static BOOL nls_info_text(int kind, DWORD type, BOOL user_override, WCHAR *out /* 80 */);
 static int nls_date_format(int locale, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity) {
   if (locale == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   const DWORD shapes = flags & (NLS_DATE_SHORTDATE | NLS_DATE_LONGDATE | NLS_DATE_YEARMONTH | NLS_DATE_MONTHDAY);
@@ -210,14 +172,14 @@ static int nls_date_format(int locale, DWORD flags, const SYSTEMTIME *time, LPCW
   SYSTEMTIME now;
   if (!time) { GetLocalTime(&now); time = &now; }
   if (!nls_valid_date(time)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  WCHAR picture[40];
+  WCHAR picture[80];
   if (!format) {
-    nls_widen(picture, (shapes & NLS_DATE_LONGDATE) ? "dddd, MMMM d, yyyy" : (shapes & NLS_DATE_YEARMONTH) ? "MMMM yyyy" : (shapes & NLS_DATE_MONTHDAY) ? "MMMM d" : "M/d/yyyy");
+    nls_info_text(locale, (shapes & NLS_DATE_LONGDATE) ? 0x20u : (shapes & NLS_DATE_YEARMONTH) ? 0x1006u : (shapes & NLS_DATE_MONTHDAY) ? 0x78u : 0x1Fu, !(flags & NLS_NOUSEROVERRIDE), picture);
     format = picture;
   }
   NlsOut o;
   o.length = 0; o.mark = 0; o.skipping = FALSE;
-  nls_date_picture(&o, format, time);
+  nls_date_picture(&o, locale, format, time);
   return nls_deliver(&o, out, capacity);
 }
 static int nls_time_format(int locale, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity) {
@@ -227,14 +189,14 @@ static int nls_time_format(int locale, DWORD flags, const SYSTEMTIME *time, LPCW
   SYSTEMTIME now;
   if (!time) { GetLocalTime(&now); time = &now; }
   if (time->wHour > 23 || time->wMinute > 59 || time->wSecond > 59 || time->wMilliseconds > 999) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  WCHAR picture[24];
+  WCHAR picture[80];
   if (!format) {
-    nls_widen(picture, (flags & NLS_TIME_FORCE24HOURFORMAT) ? "HH:mm:ss" : "h:mm:ss tt");
+    nls_info_text(locale, 0x1003u, !(flags & NLS_NOUSEROVERRIDE), picture);
     format = picture;
   }
   NlsOut o;
   o.length = 0; o.mark = 0; o.skipping = FALSE;
-  nls_time_picture(&o, format, time, flags);
+  nls_time_picture(&o, locale, format, time, flags);
   return nls_deliver(&o, out, capacity);
 }
 
@@ -294,27 +256,13 @@ static const WCHAR *nls_override(DWORD type) {
 }
 
 /* The text of a LOCALE_ value in wide characters, with the numbers written as text. FALSE if the type is not known. `invariant` picks the invariant locale. */
-static BOOL nls_info_text(int locale, DWORD type, BOOL user_override, WCHAR *out /* 80 */) {
+static BOOL nls_info_text(int kind, DWORD type, BOOL user_override, WCHAR *out /* 80 */) {
   const DWORD base = type & 0xFFFF;
-  if (user_override && locale == 1) {
+  if (user_override && kind == nls_default_kind()) {
     const WCHAR *o = nls_override(base);
     if (o) { int i = 0; for (; o[i] && i < 79; ++i) out[i] = o[i]; out[i] = 0; return TRUE; }
   }
-  char scratch[8], number_text[16];
-  DWORD number = (DWORD)-1;
-  const char *text = locale_text(base, &number, scratch);
-  if (!text && number != (DWORD)-1) {
-    char *p = number_text + sizeof(number_text) - 1;
-    *p = 0;
-    DWORD v = number;
-    do { *--p = (char)('0' + v % 10); v /= 10; } while (v);
-    text = p;
-  }
-  if (!text) return FALSE;
-  int i = 0;
-  for (; text[i] && i < 79; ++i) out[i] = (WCHAR)(BYTE)text[i];
-  out[i] = 0;
-  return TRUE;
+  return nls_text_wide(kind, base, out);
 }
 static BOOL nls_info_is_number(DWORD base) {
   switch (base) {
@@ -323,45 +271,18 @@ static BOOL nls_info_is_number(DWORD base) {
     default: return FALSE;
   }
 }
-/* The ANSI code page a language uses on Windows (0: none, a language of Unicode only); the code page of this system is UTF-8, but a program asking for the default ANSI code page of a locale gets this. */
-static BOOL nls_ansi_codepage(LCID lcid, DWORD *cp) {
-  switch (lcid & 0x3FF) {
-    case 0x09: case 0x07: case 0x0A: case 0x0C: case 0x10: case 0x13: case 0x16: case 0x1D: *cp = 1252; return TRUE;   /* English, German, Spanish, French, Italian, Dutch, Portuguese, Swedish */
-    case 0x19: case 0x22: case 0x23: *cp = 1251; return TRUE;                                                         /* Russian, Ukrainian, Belarusian */
-    case 0x11: *cp = 932; return TRUE;
-    case 0x04: *cp = 936; return TRUE;
-    case 0x12: *cp = 949; return TRUE;
-    case 0x15: case 0x0E: case 0x05: *cp = 1250; return TRUE;                                                         /* Polish, Hungarian, Czech */
-    case 0x08: *cp = 1253; return TRUE;
-    case 0x1F: *cp = 1254; return TRUE;
-    case 0x0D: *cp = 1255; return TRUE;
-    case 0x01: *cp = 1256; return TRUE;
-    case 0x39: case 0x37: *cp = 0; return TRUE;                                                                        /* Hindi, Georgian: Unicode only */
-    default: return FALSE;
-  }
-}
-EXPORT int WINAPI GetLocaleInfoW(LCID locale, LCTYPE type, LPWSTR buffer, int capacity) {
-  int kind = nls_locale_of(locale);
-  DWORD ansi_cp = 0;
-  const BOOL ansi = (type & 0xFFFF) == 0x1004 && nls_ansi_codepage(locale, &ansi_cp) && !(kind == 2);
-  if (ansi) kind = 1;
+/* The worker of GetLocaleInfoW and GetLocaleInfoEx. LOCALE_RETURN_NUMBER hands the value over as a DWORD (the language identifiers are written in hexadecimal). */
+static int nls_get_locale_info(int kind, LCTYPE type, LPWSTR buffer, int capacity) {
   if (kind == 0 || capacity < 0 || (capacity > 0 && !buffer)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   WCHAR text[80];
   const BOOL user = !(type & LCT_NOUSEROVERRIDE);
   if (!nls_info_text(kind, type, user, text)) { set_error(ERROR_INVALID_FLAGS); return 0; }
-  if (ansi) {
-    char digits[12];
-    int d = 0, k = 0;
-    DWORD v = ansi_cp;
-    do { digits[d++] = (char)('0' + v % 10); v /= 10; } while (v);
-    while (d) text[k++] = (WCHAR)digits[--d];
-    text[k] = 0;
-  }
   const DWORD base = type & 0xFFFF;
   if (type & LCT_RETURN_NUMBER) {
     if (!nls_info_is_number(base)) { set_error(ERROR_INVALID_FLAGS); return 0; }
     DWORD number = 0;
-    for (const WCHAR *c = text; *c >= '0' && *c <= '9'; ++c) number = number * 10 + (DWORD)(*c - '0');
+    const DWORD radix = base == 0x01 || base == 0x09 ? 16 : 10;
+    for (const WCHAR *c = text; (*c >= '0' && *c <= '9') || (radix == 16 && ((*c | 0x20) >= 'a' && (*c | 0x20) <= 'f')); ++c) number = number * radix + (DWORD)(*c <= '9' ? *c - '0' : (*c | 0x20) - 'a' + 10);
     if (capacity == 0) return 2;
     if (capacity < 2) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
     memcpy(buffer, &number, 4);
@@ -374,6 +295,7 @@ EXPORT int WINAPI GetLocaleInfoW(LCID locale, LCTYPE type, LPWSTR buffer, int ca
   memcpy(buffer, text, (size_t_)n * 2);
   return n;
 }
+EXPORT int WINAPI GetLocaleInfoW(LCID locale, LCTYPE type, LPWSTR buffer, int capacity) { return nls_get_locale_info(nls_locale_of(locale), type, buffer, capacity); }
 EXPORT int WINAPI GetLocaleInfoA(LCID locale, LCTYPE type, LPSTR buffer, int capacity) {
   if (type & LCT_RETURN_NUMBER) {
     if (capacity < 0 || (capacity > 0 && !buffer)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
@@ -386,14 +308,10 @@ EXPORT int WINAPI GetLocaleInfoA(LCID locale, LCTYPE type, LPSTR buffer, int cap
   if (n == 0) return 0;
   return nls_narrow_result(n, wide, buffer, capacity);
 }
-EXPORT int WINAPI GetLocaleInfoEx(LPCWSTR name, LCTYPE type, LPWSTR buffer, int capacity) {
-  const int kind = nls_locale_of_name(name);
-  if (kind == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  return GetLocaleInfoW(kind == 2 ? 0x7F : 0x409, type, buffer, capacity);
-}
+EXPORT int WINAPI GetLocaleInfoEx(LPCWSTR name, LCTYPE type, LPWSTR buffer, int capacity) { return nls_get_locale_info(nls_locale_of_name(name), type, buffer, capacity); }
 static BOOL nls_set_info(LCID locale, LCTYPE type, LPCWSTR value) {
   if (!value) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  if (nls_locale_of(locale) != 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (nls_locale_of(locale) != nls_default_kind()) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   const DWORD base = type & 0xFFFF;
   switch (base) {
     case 0x1009 /* ICALENDARTYPE */: case 0x19: case 0x1B: case 0x11: case 0x1073 /* IDIGITSUBSTITUTION */: case 0x100C: case 0x100B: case 0x12: case 0x0D: case 0x1C: case 0x1010:
@@ -955,42 +873,43 @@ EXPORT int WINAPI LCMapStringA(LCID locale, DWORD flags, LPCSTR source, int coun
 
 /* ---- locale names ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-IMPORT NTSTATUS NTAPI RtlLcidToLocaleName(ULONG, PVOID, ULONG, BOOLEAN);
 EXPORT int WINAPI LCIDToLocaleName(LCID lcid, LPWSTR name, int capacity, DWORD flags) {
   (void)flags;
   if (capacity < 0 || (capacity > 0 && !name)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  static const WCHAR en_us[] = {'e', 'n', '-', 'U', 'S', 0}, en[] = {'e', 'n', 0}, invariant[] = {0};
-  const WCHAR *text;
-  switch (lcid) {
-    case 0: case 0x400: case 0x800: case 0x1000: case 0x2000: case 0x409: text = en_us; break;
-    case 0x7F: text = invariant; break;
-    case 0x09: text = en; break;
-    default: set_error(ERROR_INVALID_PARAMETER); return 0;
-  }
+  const int kind = nls_locale_of(lcid);
+  WCHAR text[80];
+  if (kind == 0 || !nls_text_wide(kind, 0x5C, text)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   const int n = (int)wcslen(text) + 1;
   if (capacity == 0) return n;
   if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
   memcpy(name, text, (size_t_)n * 2);
   return n;
 }
+/* The identifier of the locale of a name; a neutral name gives the identifier of its specific locale unless LOCALE_ALLOW_NEUTRAL_NAMES is set (zh-Hant and zh-Hans are neutral). */
 EXPORT LCID WINAPI LocaleNameToLCID(LPCWSTR name, DWORD flags) {
-  if (!name) return 0x409;
-  if (*name == 0) return 0x7F;
-  if (nls_name_is(name, "en-us") || nls_name_is(name, "!x-sys-default-locale")) return 0x409;
-  if (nls_name_is(name, "en")) return (flags & 0x08000000) ? 0x09 : 0x409;
-  set_error(ERROR_INVALID_PARAMETER);
-  return 0;
+  if (flags & ~(0x08000000u | 0x80000000u | 0x2000u)) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  const int kind = nls_locale_of_name(name);
+  if (kind == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (nls_kind_is_neutral(kind) && !(flags & 0x08000000)) return k_locale_lcid[k_locale_default[kind - 1]];
+  return k_locale_lcid[kind - 1];
 }
-EXPORT BOOL WINAPI IsValidLocaleName(LPCWSTR name) { return name && (*name == 0 || nls_name_is(name, "en-us") || nls_name_is(name, "en")); }
+EXPORT BOOL WINAPI IsValidLocaleName(LPCWSTR name) { return name && nls_locale_of_name(name) != 0 && !nls_name_is(name, "!x-sys-default-locale"); }
 EXPORT BOOL WINAPI IsValidLocale(LCID lcid, DWORD flags) {
   if (flags != 1 && flags != 2) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
-  return lcid == 0x409 || lcid == 0x7F;
+  return nls_locale_of(lcid) != 0;
 }
 EXPORT LCID WINAPI ConvertDefaultLocale(LCID lcid) {
   switch (lcid) {
-    case 0: case 0x400: case 0x800: case 0x1000: case 0x2000: return 0x409;
-    default: return lcid;
+    case 0: case 0x400: case 0x800: case 0xC00: case 0x1000: return NLS_LCID_EN_US;
+    case 0x1400: return 0x409;
+    default: break;
   }
+  /* a neutral sublanguage becomes the default one of the language */
+  if (!(lcid & 0xFC00) && (lcid & 0xFFFF) && (lcid >> 10 & 0x3F) == 0) {
+    const int kind = nls_locale_of(lcid);
+    if (kind != 0 && nls_index_of_lcid(lcid) >= 0 && nls_kind_is_neutral(nls_index_of_lcid(lcid) + 1)) return (lcid & 0xFFFF0000u) | (k_locale_lcid[kind - 1] & 0xFFFF);
+  }
+  return lcid;
 }
 EXPORT int WINAPI ResolveLocaleName(LPCWSTR name, LPWSTR out, int capacity) {
   static const WCHAR en_us[] = {'e', 'n', '-', 'U', 'S', 0}, invariant[] = {0};
@@ -1112,7 +1031,7 @@ static BOOL nls_calendar_text(int kind, DWORD calendar, DWORD type, WCHAR *out /
   const DWORD t = type & 0xFFFF;
   if (t == 0x30 /* CAL_ITWODIGITYEARMAX */) { nls_widen(out, "2029"); return TRUE; }
   if (calendar != 1 && calendar != 2) return FALSE;
-  WCHAR scratch[16];
+  WCHAR scratch[80];
   const char *text = NULL;
   switch (t) {
     case 0x01: text = calendar == 2 ? "2" : "1"; break;
@@ -1120,21 +1039,24 @@ static BOOL nls_calendar_text(int kind, DWORD calendar, DWORD type, WCHAR *out /
     case 0x03: text = "0"; break;
     case 0x04: text = "A.D."; break;
     case 0x39: text = "AD"; break;
-    case 0x05: text = kind == 2 ? "MM/dd/yyyy" : "M/d/yyyy"; break;
-    case 0x06: text = kind == 2 ? "dddd, dd MMMM yyyy" : "dddd, MMMM d, yyyy"; break;
-    case 0x2F: text = kind == 2 ? "yyyy MMMM" : "MMMM yyyy"; break;
-    case 0x38: text = kind == 2 ? "MMMM dd" : "MMMM d"; break;
-    case 0x3A: text = kind == 2 ? "dddd, dd MMMM yyyy" : "dddd, MMMM d, yyyy"; break;
+    default: break;
+  }
+  switch (t) {
+    case 0x05: return nls_text_wide(kind, 0x1F, out);
+    case 0x06: return nls_text_wide(kind, 0x20, out);
+    case 0x2F: return nls_text_wide(kind, 0x1006, out);
+    case 0x38: return nls_text_wide(kind, 0x78, out);
+    case 0x3A: return nls_text_wide(kind, 0x7C, out);
     default: break;
   }
   if (text) { nls_widen(out, text); return TRUE; }
-  if (t >= 0x07 && t <= 0x0D) { nls_day_name((int)((t - 0x07 + 1) % 7), FALSE, out); return TRUE; }
-  if (t >= 0x0E && t <= 0x14) { nls_day_name((int)((t - 0x0E + 1) % 7), TRUE, out); return TRUE; }
-  if (t >= 0x15 && t <= 0x20) { nls_month_name((int)(t - 0x15 + 1), FALSE, out); return TRUE; }
+  if (t >= 0x07 && t <= 0x0D) { nls_day_name(kind, (int)((t - 0x07 + 1) % 7), FALSE, out); return TRUE; }
+  if (t >= 0x0E && t <= 0x14) { nls_day_name(kind, (int)((t - 0x0E + 1) % 7), TRUE, out); return TRUE; }
+  if (t >= 0x15 && t <= 0x20) { nls_month_name(kind, (int)(t - 0x15 + 1), FALSE, out); return TRUE; }
   if (t == 0x21) { out[0] = 0; return TRUE; }
-  if (t >= 0x22 && t <= 0x2D) { nls_month_name((int)(t - 0x22 + 1), TRUE, out); return TRUE; }
+  if (t >= 0x22 && t <= 0x2D) { nls_month_name(kind, (int)(t - 0x22 + 1), TRUE, out); return TRUE; }
   if (t == 0x2E) { out[0] = 0; return TRUE; }
-  if (t >= 0x31 && t <= 0x37) { nls_day_name((int)((t - 0x31 + 1) % 7), TRUE, scratch); out[0] = scratch[0]; out[1] = scratch[1]; out[2] = 0; return TRUE; }
+  if (t >= 0x31 && t <= 0x37) { nls_day_name(kind, (int)((t - 0x31 + 1) % 7), TRUE, scratch); out[0] = scratch[0]; out[1] = scratch[1]; out[2] = 0; return TRUE; }
   return FALSE;
 }
 static int nls_calendar_info(int kind, DWORD calendar, DWORD type, WCHAR *buffer, int capacity, DWORD *value) {
