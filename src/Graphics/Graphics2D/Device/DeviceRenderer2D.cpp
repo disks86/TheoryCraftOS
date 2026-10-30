@@ -130,9 +130,11 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
 
 DeviceRenderer2D::~DeviceRenderer2D() {
   while (group_depth_) {
-    if (groups_[--group_depth_].mask) device_.destroy_image(groups_[group_depth_].mask);
+    if (groups_[--group_depth_].mask && groups_[group_depth_].mask_slot < 0) device_.destroy_image(groups_[group_depth_].mask);
     if (groups_[group_depth_].image) device_.destroy_image(groups_[group_depth_].image);
   }
+  for (MaskEntry& e : mask_cache_)
+    if (e.image) device_.destroy_image(e.image);
   if (masked_) device_.destroy_pipeline(masked_);
   if (masked_fs_) device_.destroy_shader_module(masked_fs_);
   if (filter_color_) device_.destroy_pipeline(filter_color_);
@@ -1047,6 +1049,7 @@ bool DeviceRenderer2D::open_group(const Rect2D& bounds, bool detached) {
   g.layer = false;
   g.layer_opacity = 255;
   g.mask = nullptr;
+  g.mask_slot = -1;
   g.detached = detached;
   g.prev_detach = detach_index_;
   clip_stack_[clip_depth_++] = b;   // (nothing outside the picture)
@@ -1085,9 +1088,69 @@ bool DeviceRenderer2D::finish_group(const Matrix2D& m, uint8_t opacity, ImageFil
   }
   const float scale = static_cast<float>(opacity) / 255.0f;
   ok = ok && draw_textured_corners(*g.image, xs, ys, 0.0f, 0.0f, 1.0f, 1.0f, filter == ImageFilter::Nearest ? Filter::Nearest : Filter::Linear, &scale, g.mask);
-  if (g.mask) device_.destroy_image(g.mask);
+  if (g.mask && g.mask_slot < 0) device_.destroy_image(g.mask);
+  else if (g.mask && mask_cache_[g.mask_slot].in_use) --mask_cache_[g.mask_slot].in_use;
   device_.destroy_image(g.image);
   return ok;
+}
+
+int32_t DeviceRenderer2D::find_mask(uint64_t key, uint32_t w, uint32_t h) {
+  for (uint32_t i = 0; i < kMaskCacheEntries; ++i) {
+    MaskEntry& e = mask_cache_[i];
+    if (e.image && e.key == key && e.width == w && e.height == h) {
+      e.used = ++mask_clock_;
+      return static_cast<int32_t>(i);
+    }
+  }
+  return -1;
+}
+
+int32_t DeviceRenderer2D::keep_mask(uint64_t key, IImage* image, uint32_t w, uint32_t h) {
+  const uint64_t pixels = uint64_t{w} * h;
+  if (pixels > kMaskCachePixels) return -1;
+  for (;;) {   // make room: the least recently used entry nobody is drawing through goes first
+    int32_t free_slot = -1, oldest = -1;
+    for (uint32_t i = 0; i < kMaskCacheEntries; ++i) {
+      const MaskEntry& e = mask_cache_[i];
+      if (!e.image) {
+        if (free_slot < 0) free_slot = static_cast<int32_t>(i);
+      } else if (!e.in_use && (oldest < 0 || e.used < mask_cache_[oldest].used)) {
+        oldest = static_cast<int32_t>(i);
+      }
+    }
+    if (free_slot >= 0 && mask_cache_pixels_ + pixels <= kMaskCachePixels) {
+      MaskEntry& e = mask_cache_[free_slot];
+      e.key = key;
+      e.width = w;
+      e.height = h;
+      e.image = image;
+      e.in_use = 0;
+      e.used = ++mask_clock_;
+      mask_cache_pixels_ += pixels;
+      return free_slot;
+    }
+    if (oldest < 0) return -1;   // everything is in use
+    MaskEntry& e = mask_cache_[oldest];
+    device_.destroy_image(e.image);
+    mask_cache_pixels_ -= uint64_t{e.width} * e.height;
+    e.image = nullptr;
+  }
+}
+
+// FNV-1a over 32-bit words.
+static uint64_t mix(uint64_t h, uint32_t v) {
+  for (int i = 0; i < 4; ++i) {
+    h ^= (v >> (8 * i)) & 0xFF;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+static uint32_t float_bits(float f) {
+  uint32_t v = 0;
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(&f);   // (a float's bytes, copied out: same size, no alignment question)
+  uint8_t* dst = reinterpret_cast<uint8_t*>(&v);
+  for (int i = 0; i < 4; ++i) dst[i] = src[i];
+  return v;
 }
 
 // A clip that is not a rectangle, exact: what is drawn under it goes to a group of the clip's bounds, laid over the parent through the clip's coverage at pop_clip().
@@ -1100,25 +1163,53 @@ bool DeviceRenderer2D::push_exact_clip(const Rect2D& rect, const raster::RRect* 
     return true;
   }
   const uint64_t count = uint64_t{b.width} * b.height;
-  if (count > (uint64_t{1} << 24) || !prepare_rows(count)) return false;
-  const ArrayView<uint32_t> rows = texture_rows_.first(count);
-  for (uint32_t j = 0; j < b.height; ++j) {
-    const int32_t y = b.y + static_cast<int32_t>(j);
-    for (uint32_t i = 0; i < b.width; ++i) {
-      const int32_t x = b.x + static_cast<int32_t>(i);
-      uint32_t cov = 0;
-      if (rounded) cov = rounded->coverage(x, y);
-      else if (mask) cov = mask->coverage[uint64_t{static_cast<uint32_t>(y - rect.y)} * mask->pitch + static_cast<uint32_t>(x - rect.x)];
-      rows[uint64_t{j} * b.width + i] = cov << 24;
+  if (count > (uint64_t{1} << 24)) return false;
+  // what the coverage of this part of the clip depends on: the shape relative to the part, or the mask's bytes
+  uint64_t key = 14695981039346656037ull;
+  key = mix(key, rounded ? 1u : 2u);
+  if (rounded) {
+    key = mix(mix(mix(mix(key, static_cast<uint32_t>(rounded->x0 - b.x)), static_cast<uint32_t>(rounded->y0 - b.y)), static_cast<uint32_t>(rounded->x1 - b.x)), static_cast<uint32_t>(rounded->y1 - b.y));
+    for (int i = 0; i < 4; ++i) key = mix(mix(key, float_bits(rounded->rx[i])), float_bits(rounded->ry[i]));
+  } else {
+    for (uint32_t j = 0; j < b.height; ++j) {
+      const uint64_t row = uint64_t{static_cast<uint32_t>(b.y - rect.y) + j} * mask->pitch + static_cast<uint32_t>(b.x - rect.x);
+      for (uint32_t i = 0; i < b.width; ++i) key = (key ^ mask->coverage[row + i]) * 1099511628211ull;
     }
   }
-  IImage* image = device_.create_image({{b.width, b.height}, Format::B8G8R8A8Unorm, kImageSampled});
-  if (!image) return false;
-  if (!image->write_pixels(ArrayView<const uint32_t>(texture_rows_.data(), count)) || !open_group(b, false)) {
-    device_.destroy_image(image);
+  int32_t slot = find_mask(key, b.width, b.height);
+  IImage* image = slot >= 0 ? mask_cache_[slot].image : nullptr;
+  if (slot >= 0) {
+    ++mask_hits_;
+  } else {
+    ++mask_misses_;
+    if (!prepare_rows(count)) return false;
+    const ArrayView<uint32_t> rows = texture_rows_.first(count);
+    for (uint32_t j = 0; j < b.height; ++j) {
+      const int32_t y = b.y + static_cast<int32_t>(j);
+      for (uint32_t i = 0; i < b.width; ++i) {
+        const int32_t x = b.x + static_cast<int32_t>(i);
+        uint32_t cov = 0;
+        if (rounded) cov = rounded->coverage(x, y);
+        else cov = mask->coverage[uint64_t{static_cast<uint32_t>(y - rect.y)} * mask->pitch + static_cast<uint32_t>(x - rect.x)];
+        rows[uint64_t{j} * b.width + i] = cov << 24;
+      }
+    }
+    image = device_.create_image({{b.width, b.height}, Format::B8G8R8A8Unorm, kImageSampled});
+    if (!image) return false;
+    if (!image->write_pixels(ArrayView<const uint32_t>(texture_rows_.data(), count))) {
+      device_.destroy_image(image);
+      return false;
+    }
+    slot = keep_mask(key, image, b.width, b.height);
+  }
+  if (!open_group(b, false)) {
+    if (slot < 0) device_.destroy_image(image);   // (a cached one stays for next time)
     return false;
   }
-  groups_[group_depth_ - 1].mask = image;
+  Group& g = groups_[group_depth_ - 1];
+  g.mask = image;
+  g.mask_slot = slot;
+  if (slot >= 0) ++mask_cache_[slot].in_use;
   return true;
 }
 
