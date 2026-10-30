@@ -82,6 +82,7 @@ BluetoothProperties::BluetoothProperties(allocators::IAllocator& allocator)
       gap_b_(allocator),
       gap_c_(allocator),
       passkey_(allocator),
+      auto_reconnect_(allocator),
       search_button_(allocator),
       connect_button_(allocator),
       disconnect_button_(allocator),
@@ -97,6 +98,12 @@ BluetoothProperties::BluetoothProperties(allocators::IAllocator& allocator)
 
   adapter_label_.set_dock(DockStyle::Top);
   adapter_label_.set_size(0, 24);
+
+  auto_reconnect_.set_text("Reconnect to paired devices automatically");
+  auto_reconnect_.set_dock(DockStyle::Top);
+  auto_reconnect_.set_size(0, 22);
+  auto_reconnect_.set_enabled(false);
+  auto_reconnect_.on_changed({&BluetoothProperties::on_auto_reconnect, this});
 
   buttons_.set_style(PanelStyle::Transparent);
   buttons_.set_dock(DockStyle::Bottom);
@@ -171,6 +178,7 @@ BluetoothProperties::BluetoothProperties(allocators::IAllocator& allocator)
   grid_.on_selection_changed({&BluetoothProperties::on_selection, this});
 
   add(&adapter_label_);
+  add(&auto_reconnect_);
   add(&buttons_);
   add(&status_);
   add(&prompt_row_);
@@ -306,6 +314,7 @@ void BluetoothProperties::update() {
   if (!details_ || !details_->adapter(id_, &info)) {
     known_ = false;
     discovering_ = false;
+    auto_reconnect_.set_enabled(false);
     adapter_label_.set_text(details_ ? "This Bluetooth adapter is not there any more." : "No Bluetooth information is available.");
     fill_devices(nullptr, 0);
     update_prompt();
@@ -314,6 +323,10 @@ void BluetoothProperties::update() {
   }
   known_ = info.ready;
   discovering_ = info.discovering;
+  syncing_ = true;
+  auto_reconnect_.set_checked(info.auto_reconnect);
+  auto_reconnect_.set_enabled(true);
+  syncing_ = false;
   String text(allocator());
   text.assign(info.name);
   text.append(" - Bluetooth");
@@ -387,6 +400,14 @@ void BluetoothProperties::on_forget(void* self, Control&) {
   w->details_->forget(w->id_, device.key);
   w->status_.set_text("The pairing was deleted.");
   w->update();
+}
+
+void BluetoothProperties::on_auto_reconnect(void* self, Control&) {
+  auto* w = static_cast<BluetoothProperties*>(self);
+  if (w->syncing_ || !w->details_) return;
+  UiGuard lock(w);
+  w->details_->set_auto_reconnect(w->id_, w->auto_reconnect_.checked());
+  w->status_.set_text(w->auto_reconnect_.checked() ? "Paired devices will connect again by themselves." : "Paired devices will not connect again by themselves.");
 }
 
 void BluetoothProperties::on_accept(void* self, Control&) {
