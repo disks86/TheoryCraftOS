@@ -26,6 +26,11 @@
 #include "FakePeripheral.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/Bluetooth/BluetoothService.hpp"
+#include "Hardware/Bluetooth/HciBluetoothAdapter.hpp"
+#include "Hardware/Bluetooth/HidOverGatt.hpp"
+#include "Hardware/Hid/HidDescriptor.hpp"
+#include "Hardware/Keyboard/CompositeKeyboard.hpp"
+#include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Bluetooth/Smp.hpp"
 
 namespace hardware {
@@ -812,6 +817,333 @@ static void test_service_stack() {
   CHECK(a.live == base || a.live <= base + 8);   // (the file system keeps what it was given for the bond file)
 }
 
+// ------------------------------------------------------------------------------------------------ HID
+
+// A keyboard with report id 1 and a mouse with report id 2, as one descriptor.
+static const uint8_t kKeyboardMouseMap[] = {
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xC0,
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03,
+    0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
+    0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0};
+
+static void test_hid_descriptor() {
+  using namespace hid;
+  ReportMap map;
+  CHECK(parse_report_map(ConstByteView(kKeyboardMouseMap, sizeof kKeyboardMouseMap), &map) && map.report_count == 2 && !map.truncated);
+  const InputReport* kb = map.find(1);
+  const InputReport* ms = map.find(2);
+  CHECK(kb && ms && kb->app_page == 1 && kb->app_usage == 6 && ms->app_usage == 2 && kb->bits == 64 && ms->bits == 32 && !map.find(3) && map.find_application(1, 2) == ms);
+  KeyboardDecoder kd;
+  CHECK(kd.init(*kb) && kd.valid());
+  KeyboardState st;
+  const uint8_t report[8] = {0x02, 0, 0x04, 0x05, 0, 0, 0, 0};
+  CHECK(kd.decode(ConstByteView(report, 8), &st) && st.modifiers == 0x02 && st.key_count == 2 && st.keys[0] == 4 && st.keys[1] == 5);
+  const uint8_t rollover[8] = {0, 0, 1, 1, 1, 1, 1, 1};                                // a rollover error is not a key
+  CHECK(kd.decode(ConstByteView(rollover, 8), &st) && st.key_count == 0);
+  CHECK(!kd.decode(ConstByteView(report, 5), &st));
+  KeyboardDiff diff;
+  std::vector<std::pair<int, bool>> events;
+  auto emit = [&](uint8_t usage, bool pressed) { events.push_back({usage, pressed}); };
+  diff.update(st, emit);
+  KeyboardState a;
+  CHECK(kd.decode(ConstByteView(report, 8), &a));
+  diff.update(a, emit);
+  CHECK(events.size() == 3 && events[0] == std::make_pair(0xE1, true) && events[1] == std::make_pair(4, true) && events[2] == std::make_pair(5, true));
+  events.clear();
+  const uint8_t next[8] = {0, 0, 0x05, 0x06, 0, 0, 0, 0};
+  KeyboardState b;
+  CHECK(kd.decode(ConstByteView(next, 8), &b));
+  diff.update(b, emit);
+  CHECK(events.size() == 3);                                                          // shift up, A up, 6 down
+  events.clear();
+  diff.release_all(emit);
+  CHECK(events.size() == 2 && !events[0].second && !events[1].second);
+  PointerDecoder pd;
+  CHECK(pd.init(*ms) && pd.valid() && !pd.absolute());
+  MouseEvent e;
+  const uint8_t move[4] = {0x05, 0xFE, 0x03, 0xFF};                                   // left+middle, dx -2, dy 3, wheel -1
+  CHECK(pd.decode(ConstByteView(move, 4), &e) && e.buttons == 5 && e.dx == -2 && e.dy == 3 && e.wheel == -1 && !e.absolute);
+  CHECK(!pd.decode(ConstByteView(move, 3), &e));
+  // a tablet, and a keyboard whose keys are a bitmap
+  const uint8_t tablet[] = {0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x01, 0x15, 0x00, 0x25, 0x01, 0x95, 0x01, 0x75, 0x01, 0x81, 0x02,
+                            0x95, 0x01, 0x75, 0x07, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xC0, 0xC0};
+  ReportMap tmap;
+  CHECK(parse_report_map(ConstByteView(tablet, sizeof tablet), &tmap) && tmap.report_count == 1);
+  PointerDecoder tp;
+  CHECK(tp.init(tmap.reports[0]) && tp.absolute() && tp.max_x() == 0x7FFF);
+  const uint8_t touch[5] = {1, 0x10, 0x20, 0x00, 0x40};
+  CHECK(tp.decode(ConstByteView(touch, 5), &e) && e.absolute && e.x == 0x2010 && e.y == 0x4000 && e.buttons == 1 && e.max_x == 0x7FFF);
+  const uint8_t nkro[] = {0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+                          0x19, 0x00, 0x29, 0x77, 0x95, 0x78, 0x81, 0x02, 0xC0};
+  ReportMap nmap;
+  CHECK(parse_report_map(ConstByteView(nkro, sizeof nkro), &nmap));
+  KeyboardDecoder nd;
+  CHECK(nd.init(nmap.reports[0]));
+  uint8_t bits[16] = {};
+  bits[1 + 0] |= 1u << 4;                                                              // usage 4 (A)
+  bits[1 + 1] |= 1u << 1;                                                              // usage 9 (F)
+  CHECK(nd.decode(ConstByteView(bits, 16), &st) && st.key_count == 2 && st.keys[0] == 4 && st.keys[1] == 9);
+  // a descriptor cut at every length and with every bit flipped: nothing read outside, the decoders refuse what does not fit
+  for (size_t n = 0; n <= sizeof kKeyboardMouseMap; ++n) {
+    ReportMap m;
+    parse_report_map(ConstByteView(kKeyboardMouseMap, n), &m);
+    for (uint32_t i = 0; i < m.report_count; ++i) { KeyboardDecoder k; PointerDecoder p; k.init(m.reports[i]); p.init(m.reports[i]); k.decode(ConstByteView(report, 8), &st); p.decode(ConstByteView(move, 4), &e); }
+  }
+  for (size_t bit = 0; bit < sizeof kKeyboardMouseMap * 8; ++bit) {
+    uint8_t flipped[sizeof kKeyboardMouseMap];
+    memcpy(flipped, kKeyboardMouseMap, sizeof flipped);
+    flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    ReportMap m;
+    parse_report_map(ConstByteView(flipped, sizeof flipped), &m);
+    for (uint32_t i = 0; i < m.report_count; ++i) { KeyboardDecoder k; PointerDecoder p; k.init(m.reports[i]); p.init(m.reports[i]); k.decode(ConstByteView(report, 8), &st); p.decode(ConstByteView(move, 4), &e); p.decode(ConstByteView(report, 1), &e); }
+  }
+  // a huge report size and count do not wrap
+  const uint8_t huge[] = {0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x75, 0xFF, 0x96, 0xFF, 0xFF, 0x81, 0x02, 0x75, 0x20, 0x95, 0xFF, 0x81, 0x02, 0xC0};
+  ReportMap hm;
+  parse_report_map(ConstByteView(huge, sizeof huge), &hm);
+  CHECK(extract_bits(ConstByteView(report, 8), 60, 32, false) == 0 && extract_bits(ConstByteView(report, 8), 0xFFFFFFF0u, 8, false) == 0);
+}
+
+struct TestSink final : IInputSink {
+  CompositeKeyboard keyboards;
+  CompositeMouse mice;
+  std::vector<std::string> notes;
+  bool add_keyboard(IKeyboard* k) override { return keyboards.add(k); }
+  bool remove_keyboard(IKeyboard* k) override { return keyboards.remove(k); }
+  bool add_mouse(IMouse* m) override { return mice.add(m); }
+  bool remove_mouse(IMouse* m) override { return mice.remove(m); }
+  void notify(StringView text) override { notes.push_back(std::string(text.data(), text.size())); }
+  bool noted(const char* what) const { for (const std::string& n : notes) if (n.find(what) != std::string::npos) return true; return false; }
+  std::vector<KeyEvent> drain_keys() { std::vector<KeyEvent> v; KeyEvent e; while (keyboards.poll(&e)) v.push_back(e); return v; }
+  std::vector<MouseEvent> drain_mouse() { std::vector<MouseEvent> v; MouseEvent e; while (mice.poll(&e)) v.push_back(e); return v; }
+};
+
+struct PairingUi final : IBluetoothPairingUi {
+  Peripheral* peripheral = nullptr;
+  uint32_t displayed = 0, displays = 0;
+  void display_passkey(const hci::BdAddr&, uint32_t passkey) override { displayed = passkey; ++displays; if (peripheral) peripheral->passkey = passkey; }
+  void confirm_numeric(const hci::BdAddr&, uint32_t) override {}
+  void request_passkey(const hci::BdAddr&) override {}
+};
+
+// A GATT database of a HID peripheral: report map and reports behind encryption, as real keyboards have them.
+static void build_hid_database(Peripheral& per, bool report_protocol, bool boot_keyboard) {
+  per.add_service(1, 4, Uuid::from16(0x1800));
+  per.add_characteristic(2, gatt::kPropRead, Uuid::from16(0x2A00), Bytes{'K', 'e', 'y', 'b', 'o', 'a', 'r', 'd'});
+  per.add_service(30, 60, Uuid::from16(0x1812));
+  per.add_characteristic(31, gatt::kPropRead | gatt::kPropWriteWithoutResponse, Uuid::from16(0x2A4E), Bytes{1}, false, true);          // protocol mode
+  if (report_protocol) {
+    per.add_characteristic(33, gatt::kPropRead, Uuid::from16(0x2A4B), Bytes(kKeyboardMouseMap, kKeyboardMouseMap + sizeof kKeyboardMouseMap), true);
+    per.add_characteristic(35, gatt::kPropRead | gatt::kPropNotify, Uuid::from16(0x2A4D), Bytes(8, 0), true);                         // keyboard input, id 1
+    per.add_cccd(37);
+    per.add_descriptor(38, 0x2908, Bytes{1, 1});
+    per.add_characteristic(39, gatt::kPropRead | gatt::kPropNotify, Uuid::from16(0x2A4D), Bytes(4, 0), true);                         // mouse input, id 2
+    per.add_cccd(41);
+    per.add_descriptor(42, 0x2908, Bytes{2, 1});
+    per.add_characteristic(43, gatt::kPropRead | gatt::kPropWrite, Uuid::from16(0x2A4D), Bytes(1, 0), true, true);                    // keyboard LEDs, id 1, output
+    per.add_descriptor(45, 0x2908, Bytes{1, 2});
+  }
+  if (boot_keyboard) {
+    per.add_characteristic(46, gatt::kPropRead | gatt::kPropNotify, Uuid::from16(0x2A22), Bytes(8, 0), true);
+    per.add_cccd(48);
+  }
+}
+
+struct HidWorld : World {
+  TestSink sink;
+  BluetoothProfileRegistry profiles;
+  HidOverGatt hogp{a};
+  UniquePointer<HciBluetoothAdapter> adapter;
+  PairingUi pairing_ui;
+  HidWorld() {
+    profiles.add(&hogp);
+    adapter = UniquePointer<HciBluetoothAdapter>::make(a, *c, *l2, *att, *gatt, sm.get(), bonds, profiles, a);
+    adapter->set_pairing_ui(&pairing_ui);
+  }
+  void make_peripheral(bool report_protocol = true, bool boot = false) {
+    handle = 0x40;
+    p = UniquePointer<Peripheral>::make(a, host.controller, handle, true);
+    p->random = &random;
+    build_hid_database(*p, report_protocol, boot);
+    pairing_ui.peripheral = p.get();
+    ui.peripheral = p.get();
+  }
+  void advertise() { host.controller.advertisements(); }
+  // Polls the adapter (and the input source) until the device is in the wanted state; false if it never gets there.
+  bool run_until(const hci::BdAddr& address, BluetoothLinkState wanted, int limit = 3000) {
+    for (int i = 0; i < limit; ++i) {
+      adapter->poll();
+      hogp.poll(sink);
+      BluetoothDeviceInfo info;
+      if (adapter->find_device(address, &info) && info.state == wanted) return true;
+    }
+    return false;
+  }
+  hci::BdAddr peer() const { hci::BdAddr b; memcpy(b.b, p->address, 6); return b; }
+};
+
+static void test_hid_end_to_end() {
+  {   // discovery, connection with pairing (just works), the keyboard and mouse appear in the input system, reports flow, the device leaves
+    HidWorld w;
+    w.make_peripheral();
+    CHECK(w.adapter->ready() && w.adapter->start_discovery() == BluetoothResult::Ok);
+    w.advertise();
+    w.adapter->poll();
+    BluetoothDeviceInfo info;
+    CHECK(w.adapter->find_device(w.peer(), &info) && info.le && info.connectable && strcmp(info.name, "Keyboard") == 0 && info.state == BluetoothLinkState::Disconnected && !info.paired && info.appearance == 0x03C1);
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok && w.adapter->connect(w.peer()) == BluetoothResult::Busy);
+    CHECK(w.run_until(w.peer(), BluetoothLinkState::Connected));
+    CHECK(w.adapter->find_device(w.peer(), &info) && info.paired && strcmp(info.profiles, "HID over GATT") == 0 && w.bonds.count() == 1);
+    CHECK(w.hogp.device_count() == 1 && w.sink.keyboards.count() == 1 && w.sink.mice.count() == 1 && w.sink.noted("Keyboard: connected"));
+    // keys: shift+A, then A released, with a mouse report and a report of the keyboard's output kind that is ignored
+    w.p->notify(36, Bytes{0x02, 0, 0x04, 0, 0, 0, 0, 0});
+    w.adapter->poll();
+    std::vector<KeyEvent> keys = w.sink.drain_keys();
+    CHECK(keys.size() == 2 && keys[0].usage == 0xE1 && keys[0].pressed && keys[1].usage == 4 && keys[1].pressed && w.sink.keyboards.modifiers() == 0x02);
+    w.p->notify(36, Bytes{0x02, 0, 0, 0, 0, 0, 0, 0});
+    w.p->notify(40, Bytes{0x01, 5, 0xFD, 1});
+    w.adapter->poll();
+    keys = w.sink.drain_keys();
+    CHECK(keys.size() == 1 && keys[0].usage == 4 && !keys[0].pressed);
+    std::vector<MouseEvent> mouse = w.sink.drain_mouse();
+    CHECK(mouse.size() == 1 && mouse[0].buttons == 1 && mouse[0].dx == 5 && mouse[0].dy == -3 && mouse[0].wheel == 1);
+    w.p->notify(44, Bytes{1});
+    w.adapter->poll();
+    CHECK(w.sink.drain_keys().empty());
+    // a key held when the link drops is released
+    w.p->notify(36, Bytes{0, 0, 0x07, 0, 0, 0, 0, 0});
+    w.adapter->poll();
+    w.sink.drain_keys();
+    CHECK(w.adapter->disconnect(w.peer()) == BluetoothResult::Ok);
+    w.adapter->poll();
+    w.hogp.poll(w.sink);
+    keys = w.sink.drain_keys();
+    CHECK(keys.size() == 1 && keys[0].usage == 7 && !keys[0].pressed && w.sink.keyboards.count() == 0 && w.sink.mice.count() == 0 && w.sink.noted("disconnected") && w.hogp.device_count() == 0);
+    CHECK(w.adapter->find_device(w.peer(), &info) && info.state == BluetoothLinkState::Disconnected && info.paired);
+    // coming back by itself when the keyboard advertises: the bond encrypts the link, no pairing
+    const uint32_t pairings = w.p->pairings_completed;
+    w.p->encrypted = false;
+    w.adapter->set_auto_reconnect(true);
+    w.adapter->poll();
+    w.advertise();
+    CHECK(w.run_until(w.peer(), BluetoothLinkState::Connected) && w.p->pairings_completed == pairings && w.sink.keyboards.count() == 1);
+    // forgetting removes the bond and the device
+    CHECK(w.adapter->forget(w.peer()) == BluetoothResult::Ok && w.bonds.count() == 0);
+    w.adapter->poll();
+    w.hogp.poll(w.sink);
+    CHECK(w.sink.keyboards.count() == 0 && w.adapter->forget(w.peer()) == BluetoothResult::NoSuchDevice);
+  }
+  {   // a device that makes the user type a passkey: the adapter shows it through the pairing interface
+    HidWorld w;
+    w.make_peripheral();
+    w.p->io_capability = 2;               // keyboard only
+    w.p->want_mitm = true;
+    w.p->method = 3;                      // the host displays, the keyboard types
+    w.advertise();
+    w.adapter->poll();
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok && w.run_until(w.peer(), BluetoothLinkState::Connected));
+    CHECK(w.pairing_ui.displays == 1 && w.pairing_ui.displayed < 1000000);
+    BluetoothDeviceInfo info;
+    CHECK(w.adapter->find_device(w.peer(), &info) && info.authenticated);
+  }
+  {   // the boot protocol: no report map, a boot keyboard input report
+    HidWorld w;
+    w.make_peripheral(false, true);
+    w.advertise();
+    w.adapter->poll();
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok && w.run_until(w.peer(), BluetoothLinkState::Connected));
+    CHECK(w.sink.keyboards.count() == 1 && w.sink.mice.count() == 0 && w.p->attr(32)->value == Bytes{0});            // (protocol mode set to boot)
+    w.p->notify(47, Bytes{0x01, 0, 0x1E, 0, 0, 0, 0, 0});
+    w.adapter->poll();
+    std::vector<KeyEvent> keys = w.sink.drain_keys();
+    CHECK(keys.size() == 2 && keys[0].usage == 0xE0 && keys[1].usage == 0x1E);
+  }
+  {   // refusals and failures
+    HidWorld w;
+    w.make_peripheral();
+    hci::BdAddr nobody;
+    CHECK(w.adapter->connect(nobody) == BluetoothResult::NoSuchDevice && w.adapter->disconnect(nobody) == BluetoothResult::NoSuchDevice);
+    w.advertise();
+    w.adapter->poll();
+    w.host.controller.connect_status = hci::kStatusMemoryFull;
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok);
+    BluetoothDeviceInfo info;
+    CHECK(w.adapter->find_device(w.peer(), &info) && info.state == BluetoothLinkState::Failed && strlen(info.failure) > 0);
+    w.host.controller.connect_status = 0;
+    w.p->reject_pairing = true;                                        // the device refuses to pair
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok && w.run_until(w.peer(), BluetoothLinkState::Failed));
+    CHECK(w.adapter->find_device(w.peer(), &info) && strstr(info.failure, "does not support pairing") && w.sink.keyboards.count() == 0 && w.adapter->connected_count() == 0);
+    w.p->reject_pairing = false;
+    // a classic device cannot be connected to
+    w.host.controller.inquiry();
+    w.c->poll();
+    BluetoothDeviceInfo classic;
+    bool found_classic = false;
+    for (uint32_t i = 0; i < w.adapter->device_count(); ++i)
+      if (w.adapter->device(i, &classic) && !classic.le) { found_classic = true; break; }
+    CHECK(found_classic && w.adapter->connect(classic.address) == BluetoothResult::Unsupported);
+  }
+  {   // a device that never answers the service discovery: the attempt fails with a reason, and nothing is left connected
+    HidWorld w;
+    w.make_peripheral();
+    w.advertise();
+    w.adapter->poll();
+    w.p->silent_att = true;
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok && w.run_until(w.peer(), BluetoothLinkState::Failed));
+    BluetoothDeviceInfo info;
+    CHECK(w.adapter->find_device(w.peer(), &info) && strstr(info.failure, "services") && w.adapter->connected_count() == 0 && w.hogp.device_count() == 0);
+    // and a connection in progress can be cancelled
+    w.p->silent_att = false;
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok);
+    w.adapter->poll();
+    CHECK(w.adapter->disconnect(w.peer()) == BluetoothResult::Ok);
+    CHECK(w.adapter->connect(w.peer()) == BluetoothResult::Ok && w.run_until(w.peer(), BluetoothLinkState::Connected));
+  }
+}
+
+// A profile registered by someone who knows nothing of the adapter or of HID: it is offered the device, and what it makes reaches the system through its own interface.
+static void test_profile_plugin() {
+  struct Battery final : IBluetoothProfile, IBluetoothNotificationSink {
+    int attached = 0, detached = 0, notifications = 0;
+    uint8_t level = 0;
+    const char* name() const override { return "Battery"; }
+    bool matches(const BluetoothDeviceInfo&, const GattDatabase& db) const override { return db.find_service(Uuid::from16(0x180F)) >= 0; }
+    bool attach(IBluetoothRemote& r) override {
+      ++attached;
+      const int c = r.database().find_characteristic(Uuid::from16(0x2A19));
+      uint8_t v[4];
+      uint32_t n = 0;
+      if (c < 0 || r.read(c, ByteView(v), &n) != AttStatus::Ok || n != 1) return false;
+      level = v[0];
+      return r.subscribe(c, false, this) == AttStatus::Ok;
+    }
+    void detach(IBluetoothRemote&) override { ++detached; }
+    void on_notification(IBluetoothRemote&, uint16_t, ConstByteView v, bool) override { ++notifications; level = v[0]; }
+  } battery;
+  World w;
+  CHECK(w.connect_le());
+  BluetoothProfileRegistry profiles;
+  CHECK(profiles.add(&battery) && profiles.add(&battery) && profiles.count() == 1);
+  UniquePointer<HciBluetoothAdapter> adapter = UniquePointer<HciBluetoothAdapter>::make(w.a, *w.c, *w.l2, *w.att, *w.gatt, w.sm.get(), w.bonds, profiles, w.a);
+  // the peripheral is connected already by World; hand the link to a new operation by disconnecting and connecting through the adapter
+  CHECK(w.c->disconnect(w.handle) == HciResult::Ok);
+  w.c->poll();
+  w.host.controller.advertisements();
+  adapter->poll();
+  hci::BdAddr peer;
+  memcpy(peer.b, w.p->address, 6);
+  CHECK(adapter->connect(peer) == BluetoothResult::Ok);
+  for (int i = 0; i < 500 && battery.attached == 0; ++i) adapter->poll();
+  BluetoothDeviceInfo info;
+  CHECK(battery.attached == 1 && battery.level == 87 && adapter->find_device(peer, &info) && strcmp(info.profiles, "Battery") == 0);
+  w.p->notify(8, Bytes{55});
+  adapter->poll();
+  CHECK(battery.notifications == 1 && battery.level == 55);
+  CHECK(adapter->disconnect(peer) == BluetoothResult::Ok && battery.detached == 1);
+  CHECK(profiles.remove(&battery) && !profiles.remove(&battery) && profiles.count() == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_crypto();
@@ -823,6 +1155,9 @@ int main() {
   test_bonds_and_encryption();
   test_garbage();
   test_service_stack();
+  test_hid_descriptor();
+  test_hid_end_to_end();
+  test_profile_plugin();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("bluetooth stack tests passed\n");
   return 0;

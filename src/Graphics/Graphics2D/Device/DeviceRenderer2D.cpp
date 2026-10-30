@@ -125,12 +125,45 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
     group_erase_ = device.create_graphics_pipeline(colored);
     filters_ok_ = groups_ok_ && filter_blur_ && filter_color_ && group_erase_ && filter_shadow_;
   }
+  // The glyph atlas (best effort: without it glyphs go the way of any mask)
+  if (texture_vs_ && (device.info().features & kFeatureBlendState)) {
+    tint_vs_ = device.create_shader_module(tinted_vertex_shader());
+    tint_fs_ = device.create_shader_module(tinted_fragment_shader());
+    if (tint_vs_ && tint_fs_) {
+      GraphicsPipelineDesc tinted;
+      describe_tinted_pipeline(&tinted);
+      tinted.vertex_shader = tint_vs_;
+      tinted.fragment_shader = tint_fs_;
+      tinted.cull_mode = CullMode::None;
+      tinted.alpha_blend = true;
+      glyph_blended_ = device.create_graphics_pipeline(tinted);
+      BlendState over;   // as the group pipelines: premultiplied over
+      over.custom = over.enable = true;
+      over.src_color = BlendFactor::SrcAlpha;
+      over.dst_color = BlendFactor::InvSrcAlpha;
+      over.src_alpha = BlendFactor::One;
+      over.dst_alpha = BlendFactor::InvSrcAlpha;
+      tinted.alpha_blend = false;
+      tinted.blend = over;
+      glyph_group_ = device.create_graphics_pipeline(tinted);
+      glyph_vertices_ = device.create_buffer(sizeof(TintedVertex) * kMaxGlyphVertices, kBufferVertex);
+      atlas_ = device.create_image({{kAtlasSize, kAtlasSize}, Format::B8G8R8A8Unorm, kImageSampled});
+      atlas_pixels_ = allocate_view<uint32_t>(allocator, uint64_t{kAtlasSize} * kAtlasSize);
+      atlas_table_ = allocate_view<AtlasEntry>(allocator, kAtlasTable);
+    }
+  }
   for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
   valid_ = blended_ && opaque_ && vertices_ && images_[0] && images_[1] && commands_;
   if (valid_) {
     batch_ = vertices_->map().cast<ColoredVertex>();
     valid_ = !batch_.empty();
+  }
+  if (valid_ && glyph_blended_ && glyph_group_ && glyph_vertices_ && atlas_ && !atlas_pixels_.empty() && !atlas_table_.empty()) {
+    glyph_batch_ = glyph_vertices_->map().cast<TintedVertex>();
+    atlas_ok_ = glyph_batch_.size() >= kMaxGlyphVertices;
+    for (uint32_t& p : atlas_pixels_) p = 0;
+    for (AtlasEntry& e : atlas_table_) e = AtlasEntry();
   }
   if (valid_ && sheet_vertices_ && sheet_ && !sheet_pixels_.empty()) {
     sheet_batch_ = sheet_vertices_->map().cast<TexturedVertex>();
@@ -140,6 +173,14 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
 }
 
 DeviceRenderer2D::~DeviceRenderer2D() {
+  if (atlas_) device_.destroy_image(atlas_);
+  if (glyph_vertices_) device_.destroy_buffer(glyph_vertices_);
+  if (glyph_group_) device_.destroy_pipeline(glyph_group_);
+  if (glyph_blended_) device_.destroy_pipeline(glyph_blended_);
+  if (tint_fs_) device_.destroy_shader_module(tint_fs_);
+  if (tint_vs_) device_.destroy_shader_module(tint_vs_);
+  release_view(allocator_, atlas_pixels_);
+  release_view(allocator_, atlas_table_);
   while (group_depth_) {
     if (groups_[--group_depth_].mask && groups_[group_depth_].mask_slot < 0) device_.destroy_image(groups_[group_depth_].mask);
     if (groups_[group_depth_].image) device_.destroy_image(groups_[group_depth_].image);
@@ -181,16 +222,24 @@ DeviceRenderer2D::~DeviceRenderer2D() {
 
 void DeviceRenderer2D::close_range() {
   close_sheet_range();
+  close_glyph_range();
   if (count_ <= range_start_) return;
-  ranges_[range_count_++] = {range_start_, count_ - range_start_, clip_, blend_, false, erase_};
+  ranges_[range_count_++] = {range_start_, count_ - range_start_, clip_, blend_, false, false, erase_};
   range_start_ = count_;
   if (range_count_ == kMaxRanges) submit_pending();
 }
 
 void DeviceRenderer2D::close_sheet_range() {
   if (sheet_count_ <= sheet_range_start_) return;
-  ranges_[range_count_++] = {sheet_range_start_, sheet_count_ - sheet_range_start_, clip_, blend_, true, false};
+  ranges_[range_count_++] = {sheet_range_start_, sheet_count_ - sheet_range_start_, clip_, blend_, true, false, false};
   sheet_range_start_ = sheet_count_;
+  if (range_count_ == kMaxRanges) submit_pending();
+}
+
+void DeviceRenderer2D::close_glyph_range() {
+  if (glyph_count_ <= glyph_range_start_) return;
+  ranges_[range_count_++] = {glyph_range_start_, glyph_count_ - glyph_range_start_, clip_, blend_, false, true, false};
+  glyph_range_start_ = glyph_count_;
   if (range_count_ == kMaxRanges) submit_pending();
 }
 
@@ -234,6 +283,13 @@ bool DeviceRenderer2D::submit_pending() {
   close_range();
   if (!valid_ || range_count_ == 0) return true;
   vertices_->unmap();
+  if (atlas_ok_) {
+    glyph_vertices_->unmap();
+    if (atlas_dirty_) {
+      if (!atlas_->write_pixels(ArrayView<const uint32_t>(atlas_pixels_.data(), atlas_pixels_.size()))) return false;
+      atlas_dirty_ = false;
+    }
+  }
   if (sheet_ok_) {
     sheet_vertices_->unmap();
     if (sheet_dirty_) {
@@ -249,11 +305,20 @@ bool DeviceRenderer2D::submit_pending() {
   ColoredConstants constants;
   fill_matrix(&constants.mvp);
   bool pushed = false;
-  int bound = -1;   // which vertex buffer is bound: 0 colored, 1 the sheet's
+  int bound = -1;   // which vertex buffer is bound: 0 colored, 1 the sheet's, 2 the glyphs'
   for (uint32_t i = 0; i < range_count_; ++i) {
     const Range& r = ranges_[i];
     commands_->set_scissor(to_target(r.clip));
-    if (r.sheet) {
+    if (r.glyph) {
+      commands_->bind_pipeline(group_depth_ ? glyph_group_ : glyph_blended_);
+      if (bound != 2) {
+        commands_->bind_vertex_buffer(glyph_vertices_);
+        SamplerDesc sampler;   // (nearest at the pixel centres: the coverage as it is)
+        sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+        commands_->bind_texture(0, atlas_, sampler);
+        bound = 2;
+      }
+    } else if (r.sheet) {
       commands_->bind_pipeline(textured_pipeline(r.blend));
       if (bound != 1) {
         commands_->bind_vertex_buffer(sheet_vertices_);
@@ -279,6 +344,7 @@ bool DeviceRenderer2D::submit_pending() {
   const bool ok = commands_->end() && device_.submit(commands_);
   count_ = range_start_ = range_count_ = 0;
   sheet_count_ = sheet_range_start_ = 0;
+  glyph_count_ = glyph_range_start_ = 0;
   return ok;
 }
 
@@ -293,6 +359,7 @@ void DeviceRenderer2D::triangle_colors(const float* xs, const float* ys, const V
   if (!valid_ || clip_.width == 0 || clip_.height == 0) return;  // (nothing can show through an empty scissor)
   if (count_ + 3 > kMaxVertices) submit_pending();
   if (sheet_count_ > sheet_range_start_) close_sheet_range();   // (a run of sheet rectangles ends here: the order of drawing is kept)
+  if (glyph_count_ > glyph_range_start_) close_glyph_range();
   for (int i = 0; i < 3; ++i) batch_[count_++] = {{xs[i], ys[i], 0}, {colors[i].x, colors[i].y, colors[i].z, colors[i].w * opacity_}};
 }
 
@@ -341,6 +408,7 @@ void DeviceRenderer2D::clear(uint32_t color) {
   }
   count_ = range_start_ = range_count_ = 0;  // the clear wipes whatever was recorded
   sheet_count_ = sheet_range_start_ = 0;
+  glyph_count_ = glyph_range_start_ = 0;
   commands_->begin();
   RenderPassBegin pass;
   pass.color = images_[back_];
@@ -479,7 +547,7 @@ bool DeviceRenderer2D::sheet_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t*
 void DeviceRenderer2D::sheet_emit(uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, int64_t dx, int64_t dy) {
   if (clip_.width == 0 || clip_.height == 0) return;
   if (sheet_count_ + 6 > kMaxSheetVertices) submit_pending();   // (the sheet's contents stay: the slot is already taken)
-  if (count_ > range_start_) close_range();   // (a run of colored shapes ends here)
+  if (count_ > range_start_ || glyph_count_ > glyph_range_start_) close_range();   // (a run of colored shapes or glyphs ends here)
   constexpr float k = 1.0f / kSheetSize;
   const float x0 = static_cast<float>(dx), y0 = static_cast<float>(dy), x1 = x0 + static_cast<float>(w), y1 = y0 + static_cast<float>(h);
   const float u0 = static_cast<float>(sx) * k, v0 = static_cast<float>(sy) * k, u1 = static_cast<float>(sx + w) * k, v1 = static_cast<float>(sy + h) * k;
@@ -754,6 +822,99 @@ void DeviceRenderer2D::draw_mask(const MaskView& mask, const Rect2D& rect, int32
       i = j;
     }
   }
+}
+
+void DeviceRenderer2D::atlas_reset() {
+  atlas_x_ = atlas_y_ = atlas_shelf_ = 0;
+  atlas_entries_ = 0;
+  for (AtlasEntry& e : atlas_table_) e.used = false;
+}
+
+bool DeviceRenderer2D::atlas_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y) {
+  if (atlas_x_ + w > kAtlasSize) {   // the next shelf
+    atlas_y_ += atlas_shelf_;
+    atlas_x_ = 0;
+    atlas_shelf_ = 0;
+  }
+  if (atlas_y_ + h > kAtlasSize || atlas_entries_ >= kAtlasTable * 3 / 4) {   // full: what was recorded is drawn with the atlas as it is, and the atlas starts again
+    if (!submit_pending()) return false;
+    atlas_reset();
+  }
+  *x = atlas_x_;
+  *y = atlas_y_;
+  atlas_x_ += w;
+  if (h > atlas_shelf_) atlas_shelf_ = h;
+  return true;
+}
+
+// A glyph: its coverage is kept on the atlas (made and sent up the first time), and it is drawn as a rectangle tinted by the vertex color.
+void DeviceRenderer2D::draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) {
+  if (!valid_) return;
+  const bool usable = atlas_ok_ && blend_ == BlendMode::Alpha && !erase_ && mask.valid() && mask.width <= kAtlasMaxGlyph && mask.height <= kAtlasMaxGlyph;
+  if (!usable) {
+    draw_mask(mask, Rect2D{0, 0, mask.width, mask.height}, x, y, color);
+    return;
+  }
+  if (clip_.width == 0 || clip_.height == 0 || (color >> 24) == 0) return;
+  const Rect2D area = raster::intersect(Rect2D{x, y, mask.width, mask.height}, clip_);
+  if (!area.width || !area.height) return;   // (nothing of it is inside the clip)
+  // find it, or make a place for it
+  uint32_t slot = static_cast<uint32_t>(id ^ (id >> 29)) % kAtlasTable;
+  AtlasEntry* entry = nullptr;
+  for (uint32_t probe = 0; probe < kAtlasTable; ++probe) {
+    AtlasEntry& e = atlas_table_[(slot + probe) % kAtlasTable];
+    if (!e.used) {
+      entry = &e;
+      break;
+    }
+    if (e.id == id && e.w == mask.width && e.h == mask.height) {
+      entry = &e;
+      break;
+    }
+  }
+  if (!entry) return;   // (the table cannot be full: atlas_slot starts again at three quarters)
+  if (!entry->used) {
+    uint32_t ax = 0, ay = 0;
+    if (!atlas_slot(mask.width, mask.height, &ax, &ay)) return;
+    // (atlas_slot may have started the atlas again: the table was emptied, so look for the entry's place again)
+    slot = static_cast<uint32_t>(id ^ (id >> 29)) % kAtlasTable;
+    entry = nullptr;
+    for (uint32_t probe = 0; probe < kAtlasTable; ++probe) {
+      AtlasEntry& e = atlas_table_[(slot + probe) % kAtlasTable];
+      if (!e.used) {
+        entry = &e;
+        break;
+      }
+    }
+    if (!entry) return;
+    for (uint32_t j = 0; j < mask.height; ++j) {
+      const ConstByteView row = mask.coverage.subview(uint64_t{j} * mask.pitch, mask.width);
+      const ArrayView<uint32_t> out = atlas_pixels_.subview(uint64_t{ay + j} * kAtlasSize + ax, mask.width);
+      for (uint32_t i = 0; i < mask.width; ++i) out[i] = static_cast<uint32_t>(row[i]) << 24;
+    }
+    entry->id = id;
+    entry->x = static_cast<uint16_t>(ax);
+    entry->y = static_cast<uint16_t>(ay);
+    entry->w = static_cast<uint16_t>(mask.width);
+    entry->h = static_cast<uint16_t>(mask.height);
+    entry->used = true;
+    ++atlas_entries_;
+    ++glyphs_made_;
+    atlas_dirty_ = true;
+  }
+  if (glyph_count_ + 6 > kMaxGlyphVertices) submit_pending();
+  if (count_ > range_start_ || sheet_count_ > sheet_range_start_) close_range();   // (a run of colored shapes or sheet rectangles ends here: the order of drawing is kept)
+  constexpr float k = 1.0f / kAtlasSize;
+  const float x0 = static_cast<float>(x), y0 = static_cast<float>(y), x1 = x0 + static_cast<float>(entry->w), y1 = y0 + static_cast<float>(entry->h);
+  const float u0 = static_cast<float>(entry->x) * k, v0 = static_cast<float>(entry->y) * k, u1 = static_cast<float>(entry->x + entry->w) * k, v1 = static_cast<float>(entry->y + entry->h) * k;
+  const Vec4 c = unpack_color(color);
+  const float tint[4] = {c.x, c.y, c.z, c.w * opacity_};
+  auto vertex = [&](float px, float py, float u, float v) {
+    TintedVertex t{{px, py, 0}, {u, v}, {tint[0], tint[1], tint[2], tint[3]}};
+    glyph_batch_[glyph_count_++] = t;
+  };
+  vertex(x0, y0, u0, v0); vertex(x1, y0, u1, v0); vertex(x1, y1, u1, v1);
+  vertex(x0, y0, u0, v0); vertex(x1, y1, u1, v1); vertex(x0, y1, u0, v1);
 }
 
 void DeviceRenderer2D::draw_image_scaled(const Surface& source, const RectF& src, const Rect2D& dest, ImageFilter filter) {

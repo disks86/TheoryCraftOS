@@ -185,6 +185,47 @@ int groups_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
   return result;
 }
 
+// Glyphs on the atlas, tinted by the GPU: 1 ok, 0 wrong, -1 the device renderer has no atlas on this device.
+int glyphs_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
+  constexpr uint32_t W = 64, H = 48;
+  DeviceRenderer2D r(device, allocator, {W, H});
+  ArrayView<uint32_t> px = allocate_view<uint32_t>(allocator, W * H);
+  if (!r.valid() || px.empty()) {
+    release_view(allocator, px);
+    return 0;
+  }
+  if (!r.has_glyph_atlas()) {
+    release_view(allocator, px);
+    return -1;
+  }
+  uint8_t cov[8 * 8];
+  for (uint32_t y = 0; y < 8; ++y)
+    for (uint32_t x = 0; x < 8; ++x) cov[y * 8 + x] = x < 4 ? 255 : (x < 6 ? 128 : 0);
+  const MaskView m{ConstByteView(cov, sizeof cov), 8, 8, 8};
+  r.clear(rgb(0, 0, 0));
+  r.set_blend(BlendMode::Alpha);
+  r.fill_rect({0, 0, 64, 8}, rgb(0, 0, 80));            // (a shape before, the glyph in two colours and twice, a shape after: drawn in order)
+  r.draw_glyph(77, m, 4, 4, rgb(255, 0, 0));
+  r.draw_glyph(77, m, 20, 4, rgb(0, 255, 0));
+  r.fill_rect({36, 4, 4, 4}, rgb(255, 255, 255));
+  r.draw_glyph(77, m, 36, 20, 0x80FFFFFF);               // (the same glyph, half transparent)
+  bool ok = r.read_pixels(px) && r.glyphs_made() == 1;
+  if (ok) {
+    auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x]; };
+    auto near = [](uint32_t c, uint32_t e) {
+      for (int sh = 0; sh < 24; sh += 8) {
+        const int d = static_cast<int>((c >> sh) & 0xFF) - static_cast<int>((e >> sh) & 0xFF);
+        if (d > 3 || d < -3) return false;
+      }
+      return true;
+    };
+    ok = near(at(5, 5), 0xFFFF0000) && near(at(21, 5), 0xFF00FF00) && near(at(8, 5), 0xFF7F0028 /* half red over (0,0,80) */) && near(at(10, 5), 0xFF000050) &&
+         near(at(37, 5), 0xFFFFFFFF) && near(at(37, 21), 0xFF808080) && near(at(40, 21), 0xFF404040) && near(at(43, 21), 0xFF000000);
+  }
+  release_view(allocator, px);
+  return ok ? 1 : 0;
+}
+
 bool demo_2d(SystemGraphics& graphics) {
   IRenderer2D* renderer = graphics.renderer_2d();
   if (!renderer) return false;
@@ -339,6 +380,8 @@ bool demo_3d(SystemGraphics& graphics, allocators::IAllocator& allocator, uint64
   return ok && first_frame_checked;
 }
 }  // namespace
+
+int check_2d_glyphs(IGraphicsDevice& device, allocators::IAllocator& allocator) { return glyphs_check(device, allocator); }
 
 int check_2d_groups(IGraphicsDevice& device, allocators::IAllocator& allocator) { return groups_check(device, allocator); }
 

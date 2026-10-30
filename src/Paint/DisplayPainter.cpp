@@ -38,11 +38,12 @@ void DisplayPainter::draw_text(graphics::IRenderer2D& r, font::FontHandle font, 
       mask.width = bitmap->width;
       mask.height = bitmap->height;
       mask.pitch = bitmap->pitch();
-      graphics::Rect2D source;
-      source.width = bitmap->width;
-      source.height = bitmap->height;
       const int32_t whole = (pen >= 0 ? pen / 64 : -((-pen + 63) / 64));
-      r.draw_mask(mask, source, whole + bitmap->left, baseline - bitmap->top, color);
+      // (the glyph's identity - which font set, face, glyph, size, phase - lets a renderer keep its picture)
+      uint64_t id = fonts_.serial();
+      const uint64_t parts[4] = {g.face, g.glyph, static_cast<uint32_t>(font.size), subpixel};
+      for (const uint64_t part : parts) id = (id ^ part) * 1099511628211ull + 0x9E3779B97F4A7C15ull;
+      r.draw_glyph(id, mask, whole + bitmap->left, baseline - bitmap->top, color);
     }
     pen += g.advance;
   }

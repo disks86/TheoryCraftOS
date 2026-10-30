@@ -24,6 +24,7 @@
 #include "Crypto/Random.hpp"
 #include "Hardware/Bluetooth/BondFile.hpp"
 #include "Hardware/Bluetooth/Gatt.hpp"
+#include "Hardware/Bluetooth/HciBluetoothAdapter.hpp"
 #include "Hardware/Bluetooth/HciController.hpp"
 #include "Hardware/Bluetooth/L2cap.hpp"
 #include "Hardware/Bluetooth/IntelBluetooth.hpp"
@@ -49,7 +50,7 @@ class IBluetoothFirmwareSource {
 
 enum class BluetoothState : uint8_t { Ready, FirmwareMissing, Failed };
 
-class BluetoothService {
+class BluetoothService final : public IBluetoothManager {
  public:
   struct Entry {
     UniquePointer<UsbHciTransport> transport;
@@ -59,6 +60,7 @@ class BluetoothService {
     UniquePointer<AttClient> att;
     UniquePointer<GattClient> gatt;
     UniquePointer<SecurityManager> security;
+    UniquePointer<HciBluetoothAdapter> adapter;         // the user's view of the controller (IBluetoothAdapter)
     BluetoothState state = BluetoothState::Failed;
     char message[96] = {};
     char firmware[64] = {};            // the file an Intel controller is waiting for
@@ -78,6 +80,12 @@ class BluetoothService {
   const Entry* entry(uint32_t index) const { return index < entries_.count() ? entries_[index].get() : nullptr; }
   HciController* controller(uint32_t index) { return index < entries_.count() && entries_[index]->state == BluetoothState::Ready ? entries_[index]->controller.get() : nullptr; }
   uint32_t ready_count() const;
+
+  // IBluetoothManager: the adapters of the controllers that are ready, and the profiles offered to the devices that connect to them.
+  uint32_t adapter_count() const override;
+  IBluetoothAdapter* adapter(uint32_t index) override;
+  bool add_profile(IBluetoothProfile* profile) override { return profiles_.add(profile); }
+  bool remove_profile(IBluetoothProfile* profile) override { return profiles_.remove(profile); }
   // The bonds of every controller (one table: a device bonded through one is known to the others). They are loaded when the service starts and saved by save_bonds().
   SmBondStore& bonds() { return bonds_; }
   bool save_bonds();
@@ -95,6 +103,7 @@ class BluetoothService {
   crypto::IRandom* random_;
   IBluetoothBondStorage* bond_storage_;
   SmBondStore bonds_;
+  BluetoothProfileRegistry profiles_;
   UsbPortWatcher watcher_;
   List<UniquePointer<Entry>> entries_;
   uint32_t added_ = 0, removed_ = 0;

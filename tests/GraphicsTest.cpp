@@ -799,6 +799,85 @@ static void test_mask_cache(Rig& g) {
   CHECK(g.at(30, 30) == kWhite && g.at(0, 0) == kBlack && g.at(8, 8) == kBlack);
 }
 
+// draw_glyph: the device renderer keeps glyphs on an atlas and tints them with the GPU; the picture is the CPU renderer's (to rounding), a glyph drawn again is not made again, and
+// glyphs mix in order with other shapes, in layers and under clips.
+static void test_glyphs() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  DeviceRenderer2D d(device, a, {kW, kH});
+  CHECK(d.valid() && d.has_glyph_atlas());
+  Surface cs = make_surface(a, kW, kH);
+  SoftwareRenderer2D cpu(cs, nullptr, &a);
+  ArrayView<uint32_t> frame = allocate_view<uint32_t>(a, kW * kH);
+  uint8_t cov_a[10 * 12], cov_b[7 * 9];
+  for (uint32_t i = 0; i < sizeof cov_a; ++i) cov_a[i] = static_cast<uint8_t>((i * 37) % 256);
+  for (uint32_t i = 0; i < sizeof cov_b; ++i) cov_b[i] = static_cast<uint8_t>(i % 5 == 0 ? 255 : (i * 11) % 200);
+  const MaskView ma{ConstByteView(cov_a, sizeof cov_a), 10, 12, 10}, mb{ConstByteView(cov_b, sizeof cov_b), 7, 9, 7};
+  auto scene = [&](IRenderer2D& r) {
+    r.reset_clip();
+    r.clear(0xFF204060);
+    r.fill_rect({0, 0, 30, 20}, 0xFF804020);   // (colored shapes before, between and after the glyphs)
+    r.draw_glyph(1001, ma, 4, 4, 0xFFFFFFFF);
+    r.fill_rect({10, 2, 6, 6}, 0xC000FF00);
+    r.draw_glyph(1002, mb, 20, 6, 0xFFFFEE00);
+    r.draw_glyph(1001, ma, 40, 30, 0xA0FF0000);   // (the same glyph again, translucent, in another colour)
+    r.set_clip({0, 40, 64, 24});
+    r.draw_glyph(1002, mb, 58, 44, 0xFF00FFFF);   // (partly outside the clip)
+    r.reset_clip();
+    r.draw_glyph(1001, ma, -4, 50, 0xFF88FF88);   // (partly outside the target)
+    r.draw_glyph(1003, ma, 30, 50, 0x00FFFFFF);   // (transparent: nothing)
+  };
+  scene(d);
+  scene(cpu);
+  CHECK(d.read_pixels(frame));
+  uint32_t far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  CHECK(d.glyphs_made() == 2);   // (1001 and 1002; 1003 was never wanted on the screen)
+  scene(d);   // a second frame: nothing is made again
+  CHECK(d.read_pixels(frame));
+  CHECK(d.glyphs_made() == 2);
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // inside a layer (an offscreen group): the glyph is laid over as part of the picture
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (IRenderer2D* r : {static_cast<IRenderer2D*>(&d), static_cast<IRenderer2D*>(&cpu)}) {
+    r->push_layer({0, 0, 64, 64}, 128);
+    r->draw_glyph(1001, ma, 10, 10, 0xFFFFFFFF);
+    r->draw_glyph(1002, mb, 14, 12, 0xFFFFFFFF);   // (overlapping: one picture)
+    r->pop_layer();
+  }
+  CHECK(d.read_pixels(frame));
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // many glyphs: the atlas fills up and starts again, and every glyph still comes out right
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (uint32_t i = 0; i < 3400; ++i) {
+    uint8_t cov[16 * 16];
+    for (uint32_t k = 0; k < sizeof cov; ++k) cov[k] = static_cast<uint8_t>((k * 7 + i * 13) % 251);
+    const MaskView m{ConstByteView(cov, sizeof cov), 16, 16, 16};
+    const int32_t gx = static_cast<int32_t>(i % 4) * 16, gy = static_cast<int32_t>((i / 4) % 4) * 16;
+    d.draw_glyph(5000 + i, m, gx, gy, 0xFFFFFFFF);
+    cpu.draw_mask(m, {0, 0, 16, 16}, gx, gy, 0xFFFFFFFF);
+    if (i % 1100 == 0 || i == 3399) {   // (look at the picture now and then: the later glyphs cover the earlier ones)
+      CHECK(d.read_pixels(frame));
+      far = 0;
+      for (uint32_t y = 0; y < kH; ++y)
+        for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+      CHECK(far == 0);
+    }
+  }
+  release_view(a, frame);
+  release_view(a, cs.pixels);
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -1860,6 +1939,7 @@ int main() {
   test_fast_paths();
   test_primitives();
   test_renderers_agree();
+  test_glyphs();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("graphics: all checks passed\n");
   return 0;
