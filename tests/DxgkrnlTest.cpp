@@ -5125,7 +5125,7 @@ void test_dxil() {
   };
   DxilTextures textures;
   // The pixel shaders: the same varyings, the same colour (and the same pixel killed).
-  for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow", "dxil_ps_loop"}) {
+  for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow", "dxil_ps_loop", "dxil_ps_loop2"}) {
     UniquePointer<D3d9Program> reference, translated;
     const std::string base(name);
     CHECK(load((base + ".dxbc").c_str(), &reference) && load((base + ".dxil").c_str(), &translated));
