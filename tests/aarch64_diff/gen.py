@@ -18,6 +18,12 @@ def r64():
     if k < 0.5: return random.getrandbits(32)
     return random.getrandbits(64)
 def v64(fp):
+    if fp == 'h': return vh()
+    if fp == 'mix':
+        k = random.random()
+        if k < 0.25: return vh()
+        if k < 0.55: return v64(True)
+        return r64()
     k = random.random()
     if fp and k < 0.45:
         if random.random() < 0.5: return random.choice(SF64)
@@ -30,6 +36,29 @@ def v64(fp):
         b = struct.unpack('<I', struct.pack('<f', random.uniform(-1000, 1000)))[0]
         return a | (b << 32)
     return r64()
+
+SF16 = [0x0, 0x8000, 0x3C00, 0xBC00, 0x4000, 0x7C00, 0xFC00, 0x7E00, 0x7D00, 0x0001, 0x03FF, 0x7BFF, 0x5640, 0xD640, 0x3800, 0x5BE0, 0x0400, 0x8001, 0xFBFF, 0x3555]
+def vh():
+    # four packed half-precision values, mostly special or ordinary
+    out = 0
+    for i in range(4):
+        k = random.random()
+        h = random.choice(SF16) if k < 0.4 else (struct.unpack('<H', struct.pack('<e', random.uniform(-100, 100)))[0] if k < 0.8 else random.getrandbits(16))
+        out |= h << (16 * i)
+    return out
+
+def pred16():
+    # a predicate for a 128-bit vector: random, all true, element-aligned patterns for each element size, or sparse
+    k = random.random()
+    if k < 0.3: return random.getrandbits(16)
+    if k < 0.4: return 0xFFFF
+    if k < 0.45: return 0
+    if k < 0.85:
+        esz = random.randrange(4); out = 0
+        for i in range(16 >> esz):
+            if random.random() < 0.6: out |= 1 << (i << esz)
+        return out
+    return 1 << random.randrange(16)
 
 def regs3(): return [random.randrange(0, 31) for _ in range(3)]
 def fp(): return random.randrange(0, 32)
@@ -348,17 +377,98 @@ elif mode == 'neon':
             txt = f'addp d{d}, v{n}.2d'
         if txt: add(txt)
 
+elif mode == 'fp16':
+    for _ in range(5000):
+        d, n, m, a = fp(), fp(), fp(), fp()
+        S = lambda k: f'h{k}'
+        c = random.choice(['eq','ne','cs','cc','mi','pl','vs','vc','hi','ls','ge','lt','gt','le'])
+        sf = random.random() < 0.5
+        t = [
+         lambda: f'fadd {S(d)}, {S(n)}, {S(m)}', lambda: f'fsub {S(d)}, {S(n)}, {S(m)}', lambda: f'fmul {S(d)}, {S(n)}, {S(m)}', lambda: f'fdiv {S(d)}, {S(n)}, {S(m)}',
+         lambda: f'fnmul {S(d)}, {S(n)}, {S(m)}', lambda: f'fmax {S(d)}, {S(n)}, {S(m)}', lambda: f'fmin {S(d)}, {S(n)}, {S(m)}', lambda: f'fmaxnm {S(d)}, {S(n)}, {S(m)}', lambda: f'fminnm {S(d)}, {S(n)}, {S(m)}',
+         lambda: f'fmadd {S(d)}, {S(n)}, {S(m)}, {S(a)}', lambda: f'fmsub {S(d)}, {S(n)}, {S(m)}, {S(a)}', lambda: f'fnmadd {S(d)}, {S(n)}, {S(m)}, {S(a)}', lambda: f'fnmsub {S(d)}, {S(n)}, {S(m)}, {S(a)}',
+         lambda: f'fsqrt {S(d)}, {S(n)}', lambda: f'fabs {S(d)}, {S(n)}', lambda: f'fneg {S(d)}, {S(n)}', lambda: f'fmov {S(d)}, {S(n)}',
+         lambda: f'{random.choice(["frintn","frintp","frintm","frintz","frinta","frintx","frinti"])} {S(d)}, {S(n)}',
+         lambda: f'fcmp {S(n)}, {S(m)}', lambda: f'fcmpe {S(n)}, #0.0', lambda: f'fccmp {S(n)}, {S(m)}, #{random.randrange(16)}, {c}', lambda: f'fcsel {S(d)}, {S(n)}, {S(m)}, {c}',
+         lambda: f'fcvt s{d}, {S(n)}', lambda: f'fcvt d{d}, {S(n)}', lambda: f'fcvt {S(d)}, s{n}', lambda: f'fcvt {S(d)}, d{n}',
+         lambda: f'{random.choice(["fcvtzs","fcvtzu","fcvtns","fcvtnu","fcvtms","fcvtmu","fcvtps","fcvtpu","fcvtas","fcvtau"])} {X(d % 31, sf)}, {S(n)}',
+         lambda: f'{random.choice(["scvtf","ucvtf"])} {S(d)}, {X(n % 31, sf)}',
+         lambda: f'scvtf {S(d)}, {X(n % 31, sf)}, #{random.randrange(1, 32)}', lambda: f'fcvtzu {X(d % 31, sf)}, {S(n)}, #{random.randrange(1, 32)}',
+         lambda: f'fmov {S(d)}, #{random.choice(["1.0","-2.5","0.125","31.0","-0.5","10.0"])}',
+         lambda: f'fmov {X(d % 31, sf)}, {S(n)}', lambda: f'fmov {S(d)}, {X(n % 31, sf)}',
+         lambda: f'bfcvt {S(d)}, s{n}',
+         lambda: f'fjcvtzs w{d % 31}, d{n}',
+         lambda: f'{random.choice(["frint32x","frint64x"])} {random.choice("sd")}{d}, ' + random.choice("sd") + f'{n}' if False else f'{random.choice(["frint32x","frint64x"])} s{d}, s{n}',
+         lambda: f'{random.choice(["frint32x","frint64x"])} d{d}, d{n}',
+        ]
+        add(random.choice(t)())
+elif mode == 'words':
+    # instruction words chosen by words.py (WORK/sample.txt: "<hex> <disassembly>"), with random state: ints, packed halves, singles and doubles in every vector lane
+    for line in open(WORK + '/sample.txt'):
+        w, text = line.rstrip('\n').split(' ', 1)
+        add(f'.inst 0x{w} // {text}')
+elif mode == 'svemem':
+    # SVE loads and stores chosen by words.py (SVEMEM=1): the registers that address memory are rewritten so that every access lands in the scratch buffer.
+    # x28 is the buffer base, x27 a small element offset, z31 a vector of small offsets (or, as a vector base, of addresses inside the buffer).
+    import re as _re
+    for line in open(WORK + '/sample.txt'):
+        w, text = line.rstrip('\n').split(' ', 1)
+        pre = ''
+        m = _re.search(r'\[(x\d+|sp)(?:, (x\d+|z\d+\.[sd]))?', text)
+        t2 = _re.sub(r'\[x\d+', '[x28', text)
+        if _re.search(r'\[z\d+\.([sd])', t2):      # vector base (plus immediate or scalar)
+            t2 = _re.sub(r'\[z\d+\.([sd])', r'[z31.\1', t2)
+            T = _re.search(r'\[z31\.([sd])', t2).group(1)
+            pre = f'index z31.{T}, ' + ('w28' if T == 's' else 'x28') + f', #{random.choice([1, 2, 4, 8])}'
+        elif _re.search(r', z\d+\.([sd])(, |\])', t2):      # vector of offsets
+            t2 = _re.sub(r', z\d+\.([sd])(, |\])', r', z31.\1\2', t2, count=1)
+            T = _re.search(r', z31\.([sd])', t2).group(1)
+            neg = 'sxtw' in t2 and random.random() < 0.3
+            pre = f'index z31.{T}, #{random.randrange(-8, 0) if neg else random.randrange(0, 4)}, #{random.choice([1, 2, 3, 4])}'
+        t2 = _re.sub(r', x\d+(\]|, lsl)', r', x27\1', t2)
+        if _re.search(r'\bz31\b', _re.sub(r'\[[^]]*\]', '', t2)): continue      # the destination or source list uses z31: skip
+        if pre: add(pre + '\n  ' + t2)
+        else: add(t2)
+elif mode == 'int2':
+    for _ in range(6000):
+        sf = random.random() < 0.6
+        d, n, m = [random.randrange(0, 28) for _ in range(3)]
+        R = lambda k: X(k, sf)
+        op = random.randrange(0, 17)
+        if 'OP' in __import__('os').environ: op = int(__import__('os').environ['OP'])
+        t = [
+         lambda: f'{random.choice(["smax","smin","umax","umin"])} {R(d)}, {R(n)}, {R(m)}',
+         lambda: f'{random.choice(["smax","smin"])} {R(d)}, {R(n)}, #{random.randrange(-128, 128)}',
+         lambda: f'{random.choice(["umax","umin"])} {R(d)}, {R(n)}, #{random.randrange(0, 256)}',
+         lambda: f'{random.choice(["abs","cnt","ctz"])} {R(d)}, {R(n)}',
+         lambda: f'{random.choice(["crc32b","crc32h","crc32w","crc32cb","crc32ch","crc32cw"])} w{d}, w{n}, w{m}',
+         lambda: f'{random.choice(["crc32x","crc32cx"])} w{d}, w{n}, x{m}',
+         lambda: f'smulh x{d}, x{n}, x{m}', lambda: f'umulh x{d}, x{n}, x{m}',
+         lambda: f'stxp w{m}, {R(d)}, {R(n)}, [x28]' if len({d, n, m}) == 3 else f'stlxp w{m}, {R(d)}, {R(n)}, [x28]' if len({d, n, m}) == 3 else f'ldxp {R(d)}, {R(n)}, [x28]',
+         lambda: f'ldxp {R(d)}, {R(n)}, [x28]' if d != n else f'ldxp {R(d)}, {R((n + 1) % 28)}, [x28]',
+         lambda: f'ldxp {R(d)}, {R(n)}, [x28] ; {random.choice(["stxp","stlxp"])} w{m}, {R(d)}, {R(n)}, [x28]' if len({d, n, m}) == 3 else f'ldaxp {R(d)}, {R((d + 1) % 28)}, [x28]',
+         lambda: f'casp {X(2*(d//2), sf)}, {X(2*(d//2)+1, sf)}, {X(2*(n//2), sf)}, {X(2*(n//2)+1, sf)}, [x28]',
+         lambda: f'caspal {X(2*(d//2), sf)}, {X(2*(d//2)+1, sf)}, {X(2*(n//2), sf)}, {X(2*(n//2)+1, sf)}, [x28]',
+         lambda: f'{random.choice(["ldapur","stlur"])} {R(d)}, [x28, #{8 * random.randrange(-12, 12)}]',
+         lambda: f'{random.choice(["ldapurb","stlurb","ldapurh","stlurh"])} w{d}, [x28, #{8 * random.randrange(-12, 12)}]',
+         lambda: f'{random.choice(["ldapursb","ldapursh"])} {"w" if random.random()<0.5 else "x"}{d}, [x28, #{8 * random.randrange(-12, 12)}]',
+         lambda: f'ldapursw x{d}, [x28, #{8 * random.randrange(-12, 12)}]',
+        ]
+        add(t[op]())
+
 # --- emit asm
 NZCV_OFF = 0; X_OFF = 8; V_OFF = 8 + 31*8 + 8  # keep 16-aligned: x0..x30 then pad
 V_OFF = (8 + 31*8 + 15) // 16 * 16
-INIT_SIZE = V_OFF + 32*16
+INIT_SIZE = V_OFF + 32*16 + 48
 RES_OFF = (INIT_SIZE + 15) // 16 * 16
 RES_X = RES_OFF; RES_V = RES_OFF + 31*8 + 24  # nzcv,fpsr stored first? layout below
 # result layout: x0..x30 (248), nzcv(8), fpsr(8), pad to 16, v0..v31
 RES_NZCV = RES_OFF + 31*8; RES_FPSR = RES_NZCV + 8
 RES_V = (RES_FPSR + 8 + 15) // 16 * 16
-BUF_OFF = (RES_V + 32*16 + 15) // 16 * 16
-BUF_SIZE = 256
+RES_P = RES_V + 32*16       # p0..p15 then FFR, 2 bytes each (vector length 128 bits)
+BUF_OFF = (RES_P + 17*2 + 15) // 16 * 16
+BUF_SIZE = 1024
+INIT_P = V_OFF + 32*16      # initial predicates, same layout (inside the init area, which is RES_OFF-aligned, so reserve the room)
 BLK = BUF_OFF + BUF_SIZE
 
 out = ['.text', '.globl _start', '_start:']
@@ -367,25 +477,32 @@ for i, text in enumerate(cases):
     out.append(f'  adrp x0, blk{i}\n  add x0, x0, :lo12:blk{i}\n  mov sp, x0')
     out.append(f'  ldr x0, [sp, #{NZCV_OFF}]\n  msr nzcv, x0\n  msr fpsr, xzr')
     for k in range(0, 32, 2): out.append(f'  ldp q{k}, q{k+1}, [sp, #{V_OFF + k*16}]')
+    out.append(f'  add x1, sp, #{INIT_P}\n  ldr p0, [x1, #16, mul vl]\n  wrffr p0.b')
+    for k in range(16): out.append(f'  ldr p{k}, [x1, #{k}, mul vl]')
     for k in range(0, 30, 2): out.append(f'  ldp x{k}, x{k+1}, [sp, #{X_OFF + k*8}]')
     out.append(f'  ldr x30, [sp, #{X_OFF + 30*8}]')
-    out.append(f'  add x28, sp, #{BUF_OFF + 96}')
+    out.append(f'  add x28, sp, #{BUF_OFF + 384}')
+    out.append(f'  mov x27, #{random.randrange(0, 6)}')
     out.append(f'  {text}')
     out.append(f'  add sp, sp, #{RES_OFF}')
     for k in range(0, 30, 2): out.append(f'  stp x{k}, x{k+1}, [sp, #{RES_X + k*8 - RES_OFF}]')
     out.append(f'  str x30, [sp, #{RES_X + 30*8 - RES_OFF}]')
     out.append(f'  mrs x0, nzcv\n  str x0, [sp, #{RES_NZCV - RES_OFF}]\n  mrs x0, fpsr\n  str x0, [sp, #{RES_FPSR - RES_OFF}]')
     for k in range(0, 32, 2): out.append(f'  stp q{k}, q{k+1}, [sp, #{RES_V + k*16 - RES_OFF}]')
+    out.append(f'  add x1, sp, #{RES_P - RES_OFF}')
+    for k in range(16): out.append(f'  str p{k}, [x1, #{k}, mul vl]')
+    out.append(f'  rdffr p0.b\n  str p0, [x1, #16, mul vl]')
     data.append(f'blk{i}:')
     words = [random.getrandbits(32) & 0xF0000000]  # nzcv
     words = [struct.pack('<Q', random.getrandbits(4) << 28)]
     xs = [struct.pack('<Q', r64()) for _ in range(31)]
     pad = [struct.pack('<Q', 0)] * ((V_OFF - 8 - 31*8) // 8)
-    fpmode = mode in ('fp', 'neon')
+    fpmode = 'h' if mode in ('fp16', 'neon16') else 'mix' if mode == 'words' else mode in ('fp', 'neon', 'fpx', 'neonx')
     vs = []
     for _ in range(32):
         vs.append(struct.pack('<QQ', v64(fpmode), v64(fpmode)))
-    blob = b''.join(words + xs + pad + vs)
+    ps = b''.join(struct.pack('<H', pred16()) for _ in range(17))
+    blob = b''.join(words + xs + pad + vs) + ps
     blob += bytes(BUF_OFF - len(blob)) + bytes(random.getrandbits(8) for _ in range(BUF_SIZE))
     for off in range(0, len(blob), 16):
         data.append('  .quad 0x%x, 0x%x' % struct.unpack('<QQ', blob[off:off+16]))
@@ -395,4 +512,4 @@ out.append('.balign 8\n.pool')
 data.append(f'.set total, {BLK * len(cases)}')
 open(WORK + '/t.s', 'w').write('\n'.join(out + data) + '\n')
 open(WORK + '/cases.txt', 'w').write('\n'.join(c.replace('\n', ' ; ') for c in cases) + '\n')
-open(WORK + '/layout.txt', 'w').write(f'{BLK} {X_OFF} {V_OFF} {RES_X} {RES_NZCV} {RES_FPSR} {RES_V} {BUF_OFF}\n')
+open(WORK + '/layout.txt', 'w').write(f'{BLK} {X_OFF} {V_OFF} {RES_X} {RES_NZCV} {RES_FPSR} {RES_V} {BUF_OFF} {RES_P}\n')

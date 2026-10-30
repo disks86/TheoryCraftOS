@@ -661,6 +661,19 @@ add_executable(BOOTX64
   src/Emulation/AArch64Cpu.cpp
   src/Emulation/AArch64Fp.cpp
   src/Emulation/AArch64Simd.cpp
+  src/Emulation/AArch64Crypto.cpp
+  src/Emulation/AArch64Sve.cpp
+  src/Emulation/AArch64SveInt.cpp
+  src/Emulation/AArch64SveMem.cpp
+  src/Emulation/AArch64SvePred.cpp
+  src/Emulation/AArch64SvePermute.cpp
+  src/Emulation/AArch64SveFloat.cpp
+  src/Emulation/AArch64Sve2.cpp
+  src/Emulation/AArch64NeonShift.cpp
+  src/Emulation/AArch64NeonThree.cpp
+  src/Emulation/AArch64NeonElement.cpp
+  src/Emulation/AArch64NeonTwo.cpp
+  src/Emulation/AArch64NeonDiff.cpp
   src/Emulation/RiscV64Cpu.cpp
   src/Emulation/RiscV64Fp.cpp
   src/Emulation/RiscV64Vector.cpp
@@ -721,6 +734,18 @@ add_executable(BOOTX64
   src/Hardware/Bus/I2c/LpssI2c.cpp
   src/Hardware/Mouse/I2c/I2cHidPointer.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
+  src/Hardware/Bus/Pci/PciMsix.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltCio.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltKeys.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltNet.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltPower.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltXdomain.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltIcl.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltIcm.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltDriver.cpp
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
   src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
   src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
@@ -1059,6 +1084,14 @@ option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware f
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
 endif()
+option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
+option(TCOS_THUNDERBOLT_START_FIRMWARE "With TCOS_THUNDERBOLT: start the controller's connection manager firmware if the BIOS did not (resets the controller's CPU through the upstream port's vendor registers)" OFF)
+if(TCOS_THUNDERBOLT)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT)
+  if(TCOS_THUNDERBOLT_START_FIRMWARE)
+    target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT_START_FIRMWARE)
+  endif()
+endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_SELFTESTS)
@@ -1086,7 +1119,7 @@ set(ESP_DIR ${CMAKE_BINARY_DIR}/esp)
 add_custom_target(esp ALL
   COMMAND ${CMAKE_COMMAND} -E make_directory ${ESP_DIR}/EFI/BOOT
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:BOOTX64> ${ESP_DIR}/EFI/BOOT/BOOTX64.EFI
-  # Microcode the OS loads from /firmware (see firmware/README.md; AMD's license files travel with it)
+  # Microcode the OS loads from /firmware (see firmware/README.md; AMD's and Intel's license files travel with it)
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/firmware ${ESP_DIR}/firmware
   DEPENDS BOOTX64
   COMMENT "Assembling ESP directory"

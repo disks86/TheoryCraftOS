@@ -69,6 +69,15 @@ uint64_t saturate_unsigned(__int128 v, uint32_t w) {
 }  // namespace
 
 AArch64Cpu::Step AArch64Cpu::simd(uint32_t insn) {
+  {
+    Step crypto_result;
+    if (crypto(insn, &crypto_result)) return crypto_result;
+    if (neon_shift_immediate(insn, &crypto_result)) return crypto_result;
+    if (neon_three_same(insn, &crypto_result)) return crypto_result;
+    if (neon_by_element(insn, &crypto_result)) return crypto_result;
+    if (neon_two_register(insn, &crypto_result)) return crypto_result;
+    if (neon_three_different(insn, &crypto_result)) return crypto_result;
+  }
   const uint32_t rd = insn & 31, rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
   const bool q = (insn >> 30) & 1, u = (insn >> 29) & 1;
   const uint32_t size = bits_of(insn, 23, 22);

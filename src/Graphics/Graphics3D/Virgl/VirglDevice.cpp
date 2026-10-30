@@ -166,7 +166,7 @@ class VirglImage final : public IImage {
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
     color_format_ = desc.format == Format::R32G32B32A32Float ? virgl::kFormatR32G32B32A32Float : desc.format == Format::R16G16B16A16Float ? virgl::kFormatR16G16B16A16Float
-                    : desc.format == Format::R16G16B16A16Unorm ? virgl::kFormatR16G16B16A16Unorm : desc.format == Format::B8G8R8A8Srgb ? virgl::kFormatB8G8R8A8Srgb : virgl::kFormatB8G8R8A8Unorm;
+                    : desc.format == Format::R16G16B16A16Unorm ? virgl::kFormatR16G16B16A16Unorm : desc.format == Format::R32G32B32A32Uint ? virgl::kFormatR32G32B32A32Uint : desc.format == Format::B8G8R8A8Srgb ? virgl::kFormatB8G8R8A8Srgb : virgl::kFormatB8G8R8A8Unorm;
     const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
     // A sampled image is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP flip of the images that are only
     // drawn into (and shown).
@@ -340,7 +340,7 @@ class VirglImage final : public IImage {
 
 class VirglShaderModule final : public IShaderModule {
  public:
-  VirglShaderModule(VirglDevice& device, const ShaderModuleDesc& desc) : stage_(desc.stage) {
+  VirglShaderModule(VirglDevice& device, const ShaderModuleDesc& desc) : stage_(desc.stage), tgsi_(desc.tgsi), tess_output_(desc.tess_output), tess_partitioning_(desc.tess_partitioning) {
     for (uint32_t k = 0; k < 3; ++k) thread_group_[k] = desc.thread_group[k];
     handle_ = device.new_handle();
     const uint32_t length = string_length(desc.tgsi) + 1;  // with the terminating NUL
@@ -363,11 +363,17 @@ class VirglShaderModule final : public IShaderModule {
   bool valid() const { return ok_; }
   ShaderStage stage() const override { return stage_; }
   uint32_t handle() const { return handle_; }
+  const char* tgsi() const { return tgsi_; }   // (the text the kernel keeps for the module's life)
+  TessOutput tess_output() const { return tess_output_; }
+  TessPartitioning tess_partitioning() const { return tess_partitioning_; }
   uint32_t thread_group(uint32_t axis) const { return thread_group_[axis]; }
 
  private:
   uint32_t thread_group_[3] = {1, 1, 1};
   ShaderStage stage_;
+  const char* tgsi_ = nullptr;
+  TessOutput tess_output_ = TessOutput::TriangleCcw;
+  TessPartitioning tess_partitioning_ = TessPartitioning::Integer;
   uint32_t handle_ = 0;
   bool ok_ = false;
 };
@@ -406,6 +412,42 @@ class VirglPipeline final : public VirglPipelineBase {
         gs_(desc.geometry_shader ? static_cast<const VirglShaderModule*>(desc.geometry_shader)->handle() : 0),
         hs_(desc.hull_shader ? static_cast<const VirglShaderModule*>(desc.hull_shader)->handle() : 0),
         ds_(desc.domain_shader ? static_cast<const VirglShaderModule*>(desc.domain_shader)->handle() : 0) {
+    // The output primitive of the tessellator is the hull shader's to say (Direct3D) but the evaluation shader's TGSI (OpenGL): a domain shader made for another one gets a copy of its text
+    // with the winding and point mode of the hull shader it is used with.
+    if (hs_ && ds_) {
+      const auto* hull = static_cast<const VirglShaderModule*>(desc.hull_shader);
+      const auto* domain = static_cast<const VirglShaderModule*>(desc.domain_shader);
+      if ((hull->tess_output() != domain->tess_output() || hull->tess_partitioning() != domain->tess_partitioning()) && domain->tgsi()) {
+        const uint32_t length = string_length(domain->tgsi());
+        char* text = static_cast<char*>(device.gpu().allocator().allocate(length + 1));
+        if (!text) return;
+        __builtin_memcpy(text, domain->tgsi(), length + 1);
+        auto set_digit = [&](const char* name, char digit) {
+          const uint32_t n = string_length(name);
+          for (uint32_t i = 0; i + n < length; ++i) {
+            uint32_t k = 0;
+            while (k < n && text[i + k] == name[k]) ++k;
+            if (k == n) {
+              text[i + n] = digit;
+              return;
+            }
+          }
+        };
+        set_digit("TES_VERTEX_ORDER_CW ", hull->tess_output() == TessOutput::TriangleCw ? '1' : '0');
+        set_digit("TES_POINT_MODE ", hull->tess_output() == TessOutput::Point ? '1' : '0');
+        // (PIPE_TESS_SPACING: 0 fractional odd, 1 fractional even, 2 equal, which integer partitioning is and power-of-two is after the control shader rounds the factors up)
+        set_digit("TES_SPACING ", hull->tess_partitioning() == TessPartitioning::FractionalOdd ? '0' : hull->tess_partitioning() == TessPartitioning::FractionalEven ? '1' : '2');
+        ShaderModuleDesc variant;
+        variant.stage = ShaderStage::Domain;
+        variant.tgsi = text;
+        variant.tess_output = hull->tess_output();
+        variant.tess_partitioning = hull->tess_partitioning();
+        VirglShaderModule module(device, variant);
+        device.gpu().allocator().deallocate(text);
+        if (!module.valid()) return;
+        ds_ = module.handle();
+      }
+    }
     blend_ = device.new_handle();
     dsa_ = device.new_handle();
     rasterizer_ = device.new_handle();
@@ -589,7 +631,7 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   }
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
-  if (desc.format == Format::R32G32B32A32Uint || desc.format == Format::R8G8B8A8Srgb) return nullptr;   // (no integer formats here, and only BGRA colour)
+  if (desc.format == Format::R8G8B8A8Srgb) return nullptr;   // (only BGRA sRGB colour)
   if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && !is_wide_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
@@ -992,7 +1034,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           }
         }
         if (constants_dirty) {
-          for (uint32_t shader = 0; shader < 2; ++shader) {
+          // (the vertex and fragment shaders' stages, and those of the geometry, hull and domain shaders the pipeline has: shader types 2, 3 and 4)
+          for (uint32_t shader = 0; shader < 5; ++shader) {
+            if ((shader == 2 && !pipeline->geometry_shader()) || (shader == 3 && !pipeline->hull_shader()) || (shader == 4 && !pipeline->domain_shader())) continue;
             stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
             stream.put(shader);
             stream.put(0);

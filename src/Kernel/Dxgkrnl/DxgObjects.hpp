@@ -69,6 +69,7 @@ class ShaderObject {
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   uint32_t tess_input_points() const { return tess_input_points_; }
   uint32_t tess_output_points() const { return tess_output_points_; }
+  graphics::TessDomain tess_domain() const { return tess_domain_; }
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
 
  private:
@@ -84,6 +85,7 @@ class ShaderObject {
   uint32_t storage_mask_ = 0;                // ... and the storage buffer slots it uses (bit n: u<n>)
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;   // a geometry shader's input
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;   // a hull or domain shader's control points
+  graphics::TessDomain tess_domain_ = graphics::TessDomain::Triangle;   // ... and the domain it tessellates
   D3d9Binding d3d9_;              // Direct3D 9 bytecode being interpreted (the module's function finds the program through it)
 };
 

@@ -830,18 +830,22 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         const uint32_t unit = ins.src[1].number;
         if (s.textures) {
           graphics::Vec4 t = {0, 0, 0, 0};
+          const graphics::TextureKind kind = unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D;
+          const bool flat = kind == graphics::TextureKind::Texture2D;
           if (ins.op == kTexFetch) {
-            t = s.textures->fetch(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(a.f[3]));
+            t = flat ? s.textures->fetch(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), bits_of(a.f[3]))
+                     : s.textures->fetch_volume(unit, __builtin_bit_cast(int32_t, a.f[0]), __builtin_bit_cast(int32_t, a.f[1]), __builtin_bit_cast(int32_t, a.f[2]), bits_of(a.f[3]));
           } else if (ins.op == kTexLod) {
             const Q lod = fetch(ins.src[2], 0);
-            t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0]);
+            t = flat ? s.textures->sample_lod(unit, a.f[0], a.f[1], lod.f[0]) : s.textures->sample_lod_volume(unit, a.f[0], a.f[1], a.f[2], lod.f[0]);
           } else {
-            uint32_t w = 0, h = 0, levels = 0;
-            if (s.textures->size(unit, bits_of(a.f[0]), &w, &h, &levels) && bits_of(a.f[0]) < levels) {
+            uint32_t w = 0, h = 0, d = 1, levels = 0;
+            if (s.textures->size_volume(unit, bits_of(a.f[0]), &w, &h, &d, &levels) && bits_of(a.f[0]) < levels) {
+              if (kind == graphics::TextureKind::TextureCube || flat) d = 0;   // (what resinfo leaves in the third component for the kinds with no depth)
               const uint32_t mode = ins.control;
-              t = mode == 2 ? graphics::Vec4{from_bits(w), from_bits(h), 0.0f, from_bits(levels)}
-                            : mode == 1 ? graphics::Vec4{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h), 0.0f, 1.0f / static_cast<float>(levels)}
-                                        : graphics::Vec4{static_cast<float>(w), static_cast<float>(h), 0.0f, static_cast<float>(levels)};
+              t = mode == 2 ? graphics::Vec4{from_bits(w), from_bits(h), from_bits(d), from_bits(levels)}
+                            : mode == 1 ? graphics::Vec4{1.0f / static_cast<float>(w), 1.0f / static_cast<float>(h), d ? 1.0f / static_cast<float>(d) : 0.0f, 1.0f / static_cast<float>(levels)}
+                                        : graphics::Vec4{static_cast<float>(w), static_cast<float>(h), static_cast<float>(d), static_cast<float>(levels)};
             }
           }
           const float texel[4] = {t.x, t.y, t.z, t.w};
@@ -917,8 +921,8 @@ void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* 
   if (hs_fork_end_ > hs_fork_begin_) execute(s, hs_fork_begin_, hs_fork_end_);
   if (hs_join_end_ > hs_join_begin_) execute(s, hs_join_begin_, hs_join_end_);
   for (uint32_t i = 0; i < graphics::kMaxPatchRegisters; ++i) output->patch[i] = {s.patch_out[i].f[0], s.patch_out[i].f[1], s.patch_out[i].f[2], s.patch_out[i].f[3]};
-  for (uint32_t k = 0; k < 3; ++k) output->outer[k] = outer_factor_reg_[k] >= 0 ? s.patch_out[outer_factor_reg_[k]].f[0] : 0.0f;   // (a factor not written culls the patch)
-  output->inner[0] = inner_factor_reg_ >= 0 ? s.patch_out[inner_factor_reg_].f[0] : 0.0f;
+  for (uint32_t k = 0; k < 4; ++k) output->outer[k] = outer_factor_reg_[k] >= 0 ? s.patch_out[outer_factor_reg_[k]].f[0] : 0.0f;   // (a factor not written culls the patch)
+  for (uint32_t k = 0; k < 2; ++k) output->inner[k] = inner_factor_reg_[k] >= 0 ? s.patch_out[inner_factor_reg_[k]].f[0] : 1.0f;      // (an inside factor not written is 1)
 }
 
 void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, float v, float w, const uint8_t* constants, graphics::ShaderIo* out) const {
@@ -1052,7 +1056,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
     else desc->domain_function = decltype(kTrampolines)::domain[slot];
     desc->tess_input_points = program->tess_input_points();
     desc->tess_output_points = program->tess_output_points();
-    desc->tess_domain = graphics::TessDomain::Triangle;
+    desc->tess_domain = program->tess_domain();
     desc->tess_partitioning = program->tess_partitioning();
     desc->tess_output = program->tess_output();
     program_ = util::move(program);

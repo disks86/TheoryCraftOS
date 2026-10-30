@@ -131,7 +131,7 @@ static Bytes make_firmware() {
   tlv(f, 19, section(0xAAAABBBB, 0, 0));                         // the paging separator
   tlv(f, 19, section(0x00000000, 16, 0xC1));                     // a paging section
   tlv(f, 20, section(0x00000000, 4, 0xD1));                      // SEC_INIT
-  tlv(f, 48, Bytes{1, 2, 3, 4, 0, 5, 6, 7});                     // CMD_VERSIONS: (cmd 1, group 2, ver 3, notif 4) and (cmd 0, group 5, ver 6, notif 7)
+  tlv(f, 48, Bytes{1, 2, 3, 4, 0, 5, 6, 7, 0x18, 1, 10, 0});     // CMD_VERSIONS: (cmd 1, group 2, ver 3, notif 4), (cmd 0, group 5, ver 6, notif 7) and (cmd 0x18, the long group 1, ver 10)
   tlv(f, 52, Bytes{9, 9, 9, 9, 9});                              // IML
   tlv(f, 0x1000005, Bytes{1, 2, 3});                             // a type nobody needs (debug)
   return f;
@@ -154,7 +154,7 @@ static void test_firmware() {
   CHECK(fw.part(IwlImage::Regular, 2, s, 8) == 1 && s[0].data.size() == 16 && fw.part(IwlImage::Regular, 3, s, 8) == 0);
   CHECK(fw.part(IwlImage::Regular, 0, s, 1) == 1);
   CHECK(fw.part(IwlImage::Init, 0, s, 8) == 1 && s[0].data.size() == 4);
-  CHECK(fw.command_version_count() == 2 && fw.command_version_of(2, 1) == 3 && fw.command_version_of(5, 0) == 6 && fw.command_version_of(9, 9) == 0 && fw.command_version(1).group == 5 && fw.command_version(1).command == 0);
+  CHECK(fw.command_version_count() == 3 && fw.command_version_of(0, 0x18) == 10 && fw.command_version_of(1, 0x18) == 10 && fw.command_version_of(2, 0x18) == 0 && fw.command_version_of(0, 0x19) == 0 && fw.command_version_of(2, 1) == 3 && fw.command_version_of(5, 0) == 6 && fw.command_version_of(9, 9) == 0 && fw.command_version(1).group == 5 && fw.command_version(1).command == 0);
   CHECK(fw.image_loader().size() == 5 && fw.image_loader()[0] == 9);
 
   // not a firmware file, and files that are not whole

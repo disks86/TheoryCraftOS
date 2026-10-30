@@ -90,7 +90,11 @@ AArch64Cpu::Step AArch64Cpu::fail(uint8_t vector, uint64_t address) {
   return Step::Fault;
 }
 
+// Top Byte Ignore: Linux runs user code with TCR_EL1.TBI0 set, so bits 63:56 of a user address (bit 55 clear) are not part of it. Programs keep pointer tags (MTE, HWASan, Java) there.
+static uint64_t untag(uint64_t address) { return (address >> 55) & 1 ? address : address & 0x00FFFFFFFFFFFFFFull; }
+
 bool AArch64Cpu::load(GuestMemory& m, uint64_t address, uint32_t size, uint64_t* out) {
+  address = untag(address);
   uint8_t raw[8] = {};
   if (!m.read(address, ByteView(raw, size))) {
     fail(14, address);
@@ -103,6 +107,7 @@ bool AArch64Cpu::load(GuestMemory& m, uint64_t address, uint32_t size, uint64_t*
 }
 
 bool AArch64Cpu::store(GuestMemory& m, uint64_t address, uint32_t size, uint64_t value) {
+  address = untag(address);
   uint8_t raw[8];
   for (uint32_t i = 0; i < 8; ++i) raw[i] = static_cast<uint8_t>(value >> (8 * i));
   if (!m.write(address, ConstByteView(raw, size))) {
@@ -236,6 +241,19 @@ AArch64Cpu::Step AArch64Cpu::data_immediate(uint32_t insn) {
       const uint64_t r = sub ? add_with_carry(a, ~imm, 1, sf, set) : add_with_carry(a, imm, 0, sf, set);
       if (set) set_reg(rd, r, sf);
       else set_reg_sp(rd, r, sf);
+      return Step::Ok;
+    }
+    case 3: {      // SMAX, UMAX, SMIN, UMIN with an 8-bit immediate (FEAT_CSSC)
+      if (bits_of(insn, 30, 29) != 0 || !((insn >> 22) & 1)) return undefined();
+      const uint32_t opc = bits_of(insn, 21, 18);
+      if (opc > 3) return undefined();
+      const bool is_signed = !(opc & 1), is_max = !(opc & 2);
+      const uint32_t imm8 = bits_of(insn, 17, 10);
+      const uint32_t size = sf ? 64 : 32;
+      const uint64_t b = is_signed ? static_cast<uint64_t>(sext(imm8, 8)) & ones(size) : imm8;
+      const uint64_t a = reg(rn, sf);
+      const bool a_greater = is_signed ? sext(a, size) > sext(b, size) : a > b;
+      set_reg(rd, a == b ? a : ((a_greater == is_max) ? a : b), sf);
       return Step::Ok;
     }
     case 4: {      // logical immediate
@@ -402,6 +420,18 @@ AArch64Cpu::Step AArch64Cpu::data_register(uint32_t insn) {
             for (uint32_t b = 0; b < 8; ++b) r |= ((v >> (8 * b)) & 0xFF) << (8 * (7 - b));
             break;
           case 4: r = count_leading_zeros(v, size); break;
+          case 6: {      // CTZ (FEAT_CSSC)
+            uint32_t n = 0;
+            while (n < size && !((v >> n) & 1)) ++n;
+            r = n;
+            break;
+          }
+          case 7: r = static_cast<uint64_t>(__builtin_popcountll(v)); break;      // CNT
+          case 8: {      // ABS
+            const int64_t signed_v = sext(v, size);
+            r = static_cast<uint64_t>(signed_v < 0 ? -signed_v : signed_v) & ones(size);
+            break;
+          }
           case 5: {      // CLS
             const bool top = (v >> (size - 1)) & 1;
             uint32_t n = 0;
@@ -428,6 +458,27 @@ AArch64Cpu::Step AArch64Cpu::data_register(uint32_t insn) {
           const uint64_t mb = sb < 0 ? ~static_cast<uint64_t>(sb) + 1 : static_cast<uint64_t>(sb);
           const uint64_t q = ma / mb;
           r = neg ? ~q + 1 : q;
+          break;
+        }
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: {      // CRC32B/H/W/X and CRC32CB/H/W/X
+          const uint32_t width = 8u << (opcode & 3);
+          if ((width == 64) != sf) return undefined();
+          const uint32_t polynomial = (opcode & 4) ? 0x82F63B78u : 0xEDB88320u;
+          uint32_t crc = static_cast<uint32_t>(a);
+          uint64_t data = b & ones(width);
+          for (uint32_t i = 0; i < width; ++i) {
+            crc = (crc >> 1) ^ (((crc ^ static_cast<uint32_t>(data)) & 1) ? polynomial : 0);
+            data >>= 1;
+          }
+          r = crc;
+          set_reg(rd, r, false);
+          return Step::Ok;
+        }
+        case 24: case 25: case 26: case 27: {      // SMAX, UMAX, SMIN, UMIN (FEAT_CSSC)
+          const bool is_signed = !(opcode & 1), is_max = !(opcode & 2);
+          const bool a_greater = is_signed ? sext(a, size) > sext(b, size) : a > b;
+          r = (a_greater == is_max) ? a : b;
+          if (a == b) r = a;
           break;
         }
         case 8: r = shift_value(a, 0, static_cast<uint32_t>(b) % size, sf); break;
@@ -465,7 +516,7 @@ AArch64Cpu::Step AArch64Cpu::data_register(uint32_t insn) {
         return Step::Ok;
       }
       case 2: case 6: {      // SMULH, UMULH
-        if (ra != 31 || o0) return undefined();
+        if (o0) return undefined();      // (Ra is should-be-one; hardware and qemu ignore it)
         uint64_t hi, lo;
         const uint64_t x = reg(rn, true), y = reg(rm, true);
         multiply_unsigned(x, y, &hi, &lo);
@@ -591,7 +642,43 @@ AArch64Cpu::Step AArch64Cpu::load_store_exclusive(GuestMemory& m, uint32_t insn)
   const uint32_t size = 1u << (insn >> 30), rt = insn & 31, rn = (insn >> 5) & 31, rs = (insn >> 16) & 31;
   const bool o2 = (insn >> 23) & 1, load_bit = (insn >> 22) & 1, o1 = (insn >> 21) & 1;
   const uint64_t address = reg_sp(rn, true);
-  if (o1 && !o2) return undefined();      // exclusive pairs
+  if (o1 && !o2) {      // exclusive pairs (bit 31 set) and CASP (bit 31 clear)
+    const bool o0 = (insn >> 15) & 1;
+    const uint32_t rt2 = bits_of(insn, 14, 10);
+    if (!(insn >> 31)) {      // CASP, CASPA, CASPAL, CASPL: Xs:Xs+1 compared with memory, Xt:Xt+1 stored, the old value to Xs:Xs+1
+      const bool wide_pair = (insn >> 30) & 1;
+      if ((rs & 1) || (rt & 1) || rt2 != 31) return undefined();
+      const uint32_t half = wide_pair ? 8 : 4;
+      uint64_t old_low, old_high;
+      if (!load(m, address, half, &old_low) || !load(m, address + half, half, &old_high)) return Step::Fault;
+      const uint64_t mask = ones(half * 8);
+      if (old_low == (reg(rs, true) & mask) && old_high == (reg(rs + 1, true) & mask)) {
+        if (!store(m, address, half, reg(rt, true)) || !store(m, address + half, half, reg(rt + 1, true))) return Step::Fault;
+      }
+      set_reg(rs, old_low, wide_pair);
+      set_reg(rs + 1, old_high, wide_pair);
+      return Step::Ok;
+    }
+    const uint32_t half = (insn >> 30) & 1 ? 8 : 4;
+    if (load_bit) {      // LDXP, LDAXP
+      uint64_t first, second;
+      if (!load(m, address, half, &first) || !load(m, address + half, half, &second)) return Step::Fault;
+      set_reg(rt, first, half == 8);
+      set_reg(rt2, second, half == 8);
+      exclusive_valid_ = true;
+      exclusive_address_ = address;
+    } else {      // STXP, STLXP
+      if (exclusive_valid_ && exclusive_address_ == address) {
+        if (!store(m, address, half, reg(rt, true)) || !store(m, address + half, half, reg(rt2, true))) return Step::Fault;
+        set_reg(rs, 0, false);
+      } else {
+        set_reg(rs, 1, false);
+      }
+      exclusive_valid_ = false;
+    }
+    (void)o0;
+    return Step::Ok;
+  }
   if (o2 && o1) {      // CAS, CASA, CASAL, CASL
     if (bits_of(insn, 14, 10) != 31) return undefined();
     uint64_t old;
@@ -765,13 +852,67 @@ AArch64Cpu::Step AArch64Cpu::load_store_register(GuestMemory& m, uint32_t insn) 
   return Step::Ok;
 }
 
+// LDAPUR / STLUR (FEAT_LRCPC2: an unscaled signed 9-bit offset, release / acquire ordering that makes no difference here) and the FEAT_LRCPC3 STLR pre-index / LDAPR post-index forms.
+AArch64Cpu::Step AArch64Cpu::load_store_ordered(GuestMemory& m, uint32_t insn) {
+  const uint32_t size = insn >> 30, rt = insn & 31, rn = (insn >> 5) & 31, opc = bits_of(insn, 23, 22), mode = bits_of(insn, 11, 10);
+  const bool vector = (insn >> 26) & 1;
+  const uint64_t base = reg_sp(rn, true);
+  uint32_t bytes = vector ? (opc >= 2 ? 16u : 1u << size) : 1u << size;
+  if (vector && opc >= 2 && size != 0) return undefined();
+  uint64_t address = base;
+  bool writeback = false;
+  uint64_t new_base = 0;
+  if (mode == (vector ? 2u : 0u)) {      // (the SIMD&FP forms have 10 in bits 11:10)
+    address = base + static_cast<uint64_t>(sext(bits_of(insn, 20, 12), 9));
+  } else if (mode == 2 && !vector) {      // LRCPC3: STLR with pre-decrement (opc 2), LDAPR with post-increment (opc 3); the immediate field is zero
+    if (bits_of(insn, 20, 12) != 0 || (opc != 2 && opc != 3) || vector || size < 2) return undefined();
+    writeback = true;
+    if (opc == 2) { address = base - bytes; new_base = address; }
+    else new_base = base + bytes;
+  } else {
+    return undefined();
+  }
+  if (vector) {
+    const bool is_load = opc & 1;
+    if (is_load) {
+      Vec v;
+      if (!load_vec(m, address, bytes, &v)) return Step::Fault;
+      if (bytes < 16) v.hi = 0;
+      if (bytes < 8) v.lo &= ones(bytes * 8);
+      s_.v[rt] = v;
+    } else if (!store_vec(m, address, bytes, s_.v[rt])) {
+      return Step::Fault;
+    }
+    return Step::Ok;
+  }
+  if (mode == 2 ? opc == 2 : opc == 0) {      // store
+    if (!store(m, address, bytes, reg(rt, true))) return Step::Fault;
+  } else {
+    uint64_t v;
+    if (!load(m, address, bytes, &v)) return Step::Fault;
+    bool sign = false, wide_dest = true;
+    if (mode == 0 && opc >= 2) {
+      if (size == 3 || (size == 2 && opc == 3)) return undefined();
+      sign = true;
+      wide_dest = opc == 2;
+    } else {
+      wide_dest = size == 3;
+    }
+    if (sign) v = static_cast<uint64_t>(sext(v, bytes * 8));
+    set_reg(rt, v, wide_dest);
+  }
+  if (writeback) set_reg_sp(rn, new_base, true);
+  return Step::Ok;
+}
+
 AArch64Cpu::Step AArch64Cpu::load_store(GuestMemory& m, uint32_t insn) {
   const bool vector = (insn >> 26) & 1;
   switch (bits_of(insn, 29, 27)) {
     case 1:      // exclusives (V = 0) and the Advanced SIMD structure loads and stores (V = 1)
       if (!vector) return load_store_exclusive(m, insn);
       return ((insn >> 24) & 1) ? simd_load_store_single(m, insn) : simd_load_store_multiple(m, insn);
-    case 3: {    // load register (literal)
+    case 3: {    // load register (literal), and the LRCPC2 / LRCPC3 unscaled and writeback forms (bits 25:24 = 01)
+      if (bits_of(insn, 25, 24) == 1 && !((insn >> 21) & 1)) return load_store_ordered(m, insn);
       if (bits_of(insn, 25, 24) != 0) return undefined();
       const uint32_t opc = insn >> 30, rt = insn & 31;
       const uint64_t address = s_.pc + static_cast<uint64_t>(sext(bits_of(insn, 23, 5), 19) * 4);
@@ -822,6 +963,9 @@ AArch64Cpu::Step AArch64Cpu::step(GuestMemory& m) {
       break;
     case 5: case 13:     // x101: data processing, register
       result = data_register(insn);
+      break;
+    case 2:              // 0010: SVE
+      result = sve(m, insn);
       break;
     case 7: case 15:     // x111: scalar floating point and Advanced SIMD
       result = (((insn >> 24) & 0x1E) == 0x1E && !((insn >> 29) & 1) && !((insn >> 30) & 1)) ? floating_point(insn) : simd(insn);

@@ -923,6 +923,130 @@ static void test_aarch64() {
   }
 }
 
+// Known answers for the AArch64 extensions added after the base set (checked against qemu-aarch64 by tests/aarch64_diff.sh; these have independent expected values).
+static void test_aarch64_extensions() {
+  {      // CRC32 and CRC32C of "123456789": the standard check values 0xCBF43926 and 0xE3069283
+    for (int castagnoli = 0; castagnoli < 2; ++castagnoli) {
+      Words w = {0x12800000};      // mov w0, #-1
+      for (int i = 0; i < 9; ++i) {
+        w.push_back(0x38401441);      // ldrb w1, [x2], #1
+        w.push_back(castagnoli ? 0x1ac15000 : 0x1ac14000);      // crc32b / crc32cb w0, w0, w1
+      }
+      w.push_back(0x2a2003e0);      // mvn w0, w0
+      w.push_back(0xd4000001);
+      A64Machine m(w);
+      m.x(2) = kData;
+      const uint8_t digits[9] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+      m.space.write(kData, ConstByteView(digits, 9));
+      CHECK(m.run() == StopReason::Syscall && m.x(0) == (castagnoli ? 0xE3069283u : 0xCBF43926u));
+    }
+  }
+  {      // PMULL 64x64: (all ones) x (all ones) in GF(2)[x] is 0x5555...
+    A64Machine m({0x0ee1e002, 0xd4000001});      // pmull v2.1q, v0.1d, v1.1d
+    m.cpu.state().v[0].lo = m.cpu.state().v[1].lo = ~0ull;
+    CHECK(m.run() == StopReason::Syscall && m.cpu.state().v[2].lo == 0x5555555555555555ull && m.cpu.state().v[2].hi == 0x5555555555555555ull);
+  }
+  {      // AES round 1 of FIPS-197 appendix B: SubBytes, ShiftRows (AESE with a zero key) and MixColumns (AESMC)
+    A64Machine m({0x4e284820, 0x4e286800, 0xd4000001});      // aese v0.16b, v1.16b; aesmc v0.16b, v0.16b
+    const uint8_t state[16] = {0x19, 0x3d, 0xe3, 0xbe, 0xa0, 0xf4, 0xe2, 0x2b, 0x9a, 0xc6, 0x8d, 0x2a, 0xe9, 0xf8, 0x48, 0x08};
+    const uint8_t expected[16] = {0x04, 0x66, 0x81, 0xe5, 0xe0, 0xcb, 0x19, 0x9a, 0x48, 0xf8, 0xd3, 0x7a, 0x28, 0x06, 0x26, 0x4c};
+    uint64_t lo = 0, hi = 0, elo = 0, ehi = 0;
+    for (int i = 0; i < 8; ++i) { lo |= uint64_t{state[i]} << (8 * i); hi |= uint64_t{state[8 + i]} << (8 * i); elo |= uint64_t{expected[i]} << (8 * i); ehi |= uint64_t{expected[8 + i]} << (8 * i); }
+    m.cpu.state().v[0].lo = lo; m.cpu.state().v[0].hi = hi;
+    CHECK(m.run() == StopReason::Syscall && m.cpu.state().v[0].lo == elo && m.cpu.state().v[0].hi == ehi);
+  }
+  {      // exclusive pairs, CASP-free: ldxp / stxp round trip; smax; half precision; sdot; acquire/release with an offset
+    A64Machine m({0xc87f0440,       // ldxp x0, x1, [x2]
+                  0xc8231444,       // stxp w3, x4, x5, [x2]
+                  0x9ac26026,       // smax x6, x1, x2
+                  0x1ee01001,       // fmov h1, #2.0
+                  0x1ee11002,       // fmov h2, #3.0
+                  0x1ee22820,       // fadd h0, h1, h2
+                  0x1ee24000,       // fcvt s0, h0
+                  0x1e260007,       // fmov w7, s0
+                  0xd4000001});
+    m.x(2) = kData;
+    m.x(4) = 0x1111;
+    m.x(5) = 0x2222;
+    const uint8_t init[16] = {1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+    m.space.write(kData, ConstByteView(init, 16));
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(m.x(0) == 1 && m.x(3) == 0 && m.x(6) == kData && m.x(7) == 0x40A00000u);
+    uint8_t out[16];
+    m.space.read(kData, ByteView(out, 16));
+    CHECK(out[0] == 0x11 && out[1] == 0x11 && out[8] == 0x22 && out[9] == 0x22);
+  }
+  {      // stlur / ldapur with a negative offset
+    A64Machine m({0xd91f8020,       // stlur x0, [x1, #-8]
+                  0xd95f8022,       // ldapur x2, [x1, #-8]
+                  0xd4000001});
+    m.x(0) = 0xABCD;
+    m.x(1) = kData + 8;
+    CHECK(m.run() == StopReason::Syscall && m.x(2) == 0xABCD);
+  }
+  {      // dot product: bytes of 2 and 3 give 4 * 6 = 24 in every 32-bit lane
+    A64Machine m({0x4e829420, 0xd4000001});
+    m.cpu.state().v[1].lo = m.cpu.state().v[1].hi = 0x0202020202020202ull;
+    m.cpu.state().v[2].lo = m.cpu.state().v[2].hi = 0x0303030303030303ull;
+    CHECK(m.run() == StopReason::Syscall && m.cpu.state().v[0].lo == 0x0000001800000018ull && m.cpu.state().v[0].hi == 0x0000001800000018ull);
+  }
+  {      // pointer tags in the top byte are ignored by loads and stores (TBI)
+    A64Machine m({0xf9400020, 0xd4000001});      // ldr x0, [x1]
+    const uint64_t value = 0x0123456789ABCDEFull;
+    m.space.write(kData, ConstByteView(reinterpret_cast<const uint8_t*>(&value), 8));
+    m.x(1) = kData | (0x5Aull << 56);
+    CHECK(m.run() == StopReason::Syscall && m.x(0) == value);
+  }
+}
+
+static void test_aarch64_sve() {
+  {      // INDEX, ADD (vectors) and SADDV: 1 2 3 4 doubled and summed
+    A64Machine m({0x2598e3e0, 0x04a14020, 0x04a00001, 0x04802022, 0xd4000001});      // ptrue p0.s; index z0.s, #1, #1; add z1.s, z0.s, z0.s; saddv d2, p0, z1.s
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(m.cpu.state().v[1].lo == 0x0000000400000002ull && m.cpu.state().v[1].hi == 0x0000000800000006ull && m.cpu.state().v[2].lo == 20 && m.cpu.state().v[2].hi == 0);
+    CHECK(m.cpu.state().p[0] == 0x1111);
+  }
+  {      // WHILELT builds a three-element predicate; LD1W / ST1W move only those elements
+    A64Machine m({0x25a317e1, 0xa540a483, 0xe540e4a3, 0xd4000001});      // whilelt p1.s, xzr, x3; ld1w {z3.s}, p1/z, [x4]; st1w {z3.s}, p1, [x5]
+    const uint32_t src[4] = {11, 22, 33, 44}, dst[4] = {0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu};
+    m.space.write(kData, ConstByteView(reinterpret_cast<const uint8_t*>(src), 16));
+    m.space.write(kData + 64, ConstByteView(reinterpret_cast<const uint8_t*>(dst), 16));
+    m.x(3) = 3; m.x(4) = kData; m.x(5) = kData + 64;
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(m.cpu.state().p[1] == 0x0111 && m.cpu.state().v[3].lo == 0x000000160000000Bull && m.cpu.state().v[3].hi == 0x21);
+    uint32_t out[4];
+    m.space.read(kData + 64, ByteView(reinterpret_cast<uint8_t*>(out), 16));
+    CHECK(out[0] == 11 && out[1] == 22 && out[2] == 33 && out[3] == 0xAAAAAAAAu);
+  }
+  {      // first-fault and non-fault loads at the end of the mapping: the bytes that exist are loaded, the first-fault register records where it stopped
+    for (int nonfault = 0; nonfault < 2; ++nonfault) {
+      A64Machine m({0x2518e3e2, 0x252c9000, nonfault ? 0xa410a8c5u : 0xa41f68c4u, 0x2519f003, 0xd4000001});      // ptrue p2.b; setffr; ldnf1b / ldff1b {z4/z5.b}, p2/z, [x6]; rdffr p3.b
+      const uint8_t tail[3] = {0x41, 0x42, 0x43};
+      m.space.write(kData + 0x2000 - 3, ConstByteView(tail, 3));
+      m.x(6) = kData + 0x2000 - 3;
+      CHECK(m.run() == StopReason::Syscall);
+      const AArch64Cpu::Vec& z = m.cpu.state().v[nonfault ? 5 : 4];
+      CHECK(z.lo == 0x434241 && z.hi == 0 && m.cpu.state().p[3] == 0x0007 && m.cpu.state().ffr == 0x0007);
+    }
+    A64Machine plain({0x2518e3e2, 0xa40048c4, 0xd4000001});      // an ordinary LD1B over the same bytes faults
+    plain.x(6) = kData + 0x2000 - 3;
+    CHECK(plain.run() == StopReason::Fault);
+  }
+  {      // FADD on floats, and the gather forms: LD1D with 64-bit offsets, LD1B widening to doublewords
+    A64Machine m({0x2518e3e2, 0x04e84008, 0xc5c8c889, 0xc448c88a, 0x25b9cf06, 0x658600c7, 0xd4000001});      // ptrue p2.b; index z8.d, #0, #8; ld1d z9.d; ld1b z10.d; fdup z6.s, #1.5; fadd z7.s, z6.s, z6.s
+    const uint64_t data[2] = {0x1122334455667788ull, 0x99AABBCCDDEEFF00ull};
+    m.space.write(kData, ConstByteView(reinterpret_cast<const uint8_t*>(data), 16));
+    m.x(4) = kData;
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(m.cpu.state().v[9].lo == data[0] && m.cpu.state().v[9].hi == data[1] && m.cpu.state().v[10].lo == 0x88 && m.cpu.state().v[10].hi == 0x00);
+    CHECK(m.cpu.state().v[7].lo == 0x4040000040400000ull && m.cpu.state().v[7].hi == 0x4040000040400000ull);
+  }
+  {      // an octoword load needs a longer vector than this one: undefined, as are other reserved encodings
+    A64Machine m({0xa4212861, 0xd4000001});      // ld1rob {z1.b}, p2/z, [x3, #32]
+    CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
+  }
+}
+
 static void test_aarch64_robustness() {
   const Words sample = {0xf9400420, 0x91000400, 0xf9000420, 0x1e601000, 0x1e611001, 0x1e612802, 0x9e660045, 0x1f410803, 0x9e780066, 0x3dc00020, 0x4ea08400, 0x3d800420,
                         0xf1000c1f, 0x1a9f17e7, 0xdac01149, 0x0c407000, 0x4c40a000, 0x0d404000, 0x2e208400, 0x0e200800};
@@ -947,7 +1071,28 @@ static void test_aarch64_robustness() {
     m.run(4);
     ++runs;
   }
-  CHECK(runs > 40000);
+  {      // SVE: every bit flip of one word of each kind (integer, predicate, permute, floating point, SVE2, loads, stores), then random words from the SVE encoding space with addresses in the data page
+    const Words sve = {0x04a14020, 0x04802022, 0x2598e3e0, 0x25a317e1, 0x05a36041, 0x658600c7, 0x44836041, 0x45836041, 0xa540a483, 0xa41f68c4, 0xc5c8c889, 0xe540e4a3, 0xe5a4a861, 0x8508448b, 0x2519f003, 0x252c9000};
+    for (size_t i = 0; i < sve.size(); ++i)
+      for (int bit = 0; bit < 32; ++bit) {
+        A64Machine m({sve[i] ^ (1u << bit), 0xd4000001});
+        for (int r = 0; r < 31; ++r) m.x(r) = kData + 256 + 8 * r;
+        for (auto& v : m.cpu.state().v) v.lo = v.hi = 0x0000000800000004ull;
+        for (auto& pr : m.cpu.state().p) pr = 0x5555;
+        m.run(4);
+        ++runs;
+      }
+    for (int i = 0; i < 40000; ++i) {
+      seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+      A64Machine m({(uint32_t(seed) & ~(0xFu << 25)) | (2u << 25), 0xd4000001});
+      for (int r = 0; r < 31; ++r) m.x(r) = (r & 1) ? kData + 512 : (seed >> r) & 0x1F;
+      for (auto& v : m.cpu.state().v) v.lo = v.hi = seed * 0x9E3779B97F4A7C15ull;
+      for (int k = 0; k < 16; ++k) m.cpu.state().p[k] = uint16_t(seed >> (k + 3));
+      m.run(4);
+      ++runs;
+    }
+  }
+  CHECK(runs > 80000);
 }
 
 
@@ -1487,6 +1632,8 @@ int main(int argc, char** argv) {
   test_softfloat_conversions();
   test_softfloat_arm_extras();
   test_aarch64();
+  test_aarch64_extensions();
+  test_aarch64_sve();
   test_aarch64_robustness();
   test_riscv64();
   test_riscv64_robustness();

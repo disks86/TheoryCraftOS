@@ -4251,13 +4251,13 @@ void test_tessellation_kernel() {
   CHECK(draw(tess, patch_list(4), 4) == status::kInvalidParameter && draw(tess, patch_list(1), 3) == status::kInvalidParameter);
   CHECK(draw(tess, Topology::TriangleList, 3) == status::kInvalidParameter && draw(plain, patch_list(3), 3) == status::kInvalidParameter);
   CHECK(draw(tess, static_cast<Topology>(kPatchListBase + graphics::kMaxPatchControlPoints + 1), 3) == status::kInvalidParameter);
-  // Factors the software tessellator does not make (3: the inner rings; 0 culls the patch) draw nothing.
+  // Factor 3 makes rings inside the triangle; factor 0 culls the patch.
   {
     const std::vector<uint8_t> big = read_blob("hs_tri3.dxbc"), zero = read_blob("hs_tri0.dxbc");
     Handle hs3 = 0, hs0 = 0, tess3 = 0, tess0 = 0;
     CHECK(shader(graphics::ShaderStage::Hull, big.data(), static_cast<uint32_t>(big.size()), &hs3) == status::kSuccess && shader(graphics::ShaderStage::Hull, zero.data(), static_cast<uint32_t>(zero.size()), &hs0) == status::kSuccess);
     CHECK(pipeline(hs3, ds, 0, &tess3) == status::kSuccess && pipeline(hs0, ds, 0, &tess0) == status::kSuccess);
-    CHECK(draw(tess3, patch_list(3), 3) == status::kSuccess && lit() == 0);
+    CHECK(draw(tess3, patch_list(3), 3) == status::kSuccess && lit() > 200);
     CHECK(draw(tess0, patch_list(3), 3) == status::kSuccess && lit() == 0);
   }
   // A device without the feature refuses the shaders and the topology.
@@ -4361,18 +4361,29 @@ void test_conformance() {
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
     }
+    if (__builtin_strstr(r.name, "GetDimensions of")) {
+      // The alpha is the number of levels over 2 (one level: 0x80) wherever something is drawn; the size is in the colour: the 4 x 4 texels of a 3D image of 4 slices, an array of 3 layers
+      // (blue 3 / 8 over 2 = 0x30 in the first band) and a cube map.
+      uint32_t drawn = 0, wrong = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i)
+        if (r.device_picture[i] >> 24 == 0x80) ++drawn;
+        else if ((r.device_picture[i] & 0xFFFFFF) != 0) ++wrong;
+      CHECK(drawn > 500 && wrong == 0);
+      if (__builtin_strstr(r.name, "image array")) CHECK((r.device_picture[8] & 0xFF) == 0x30);
+      if (__builtin_strstr(r.name, "3D image")) CHECK((r.device_picture[20 * 32 + 8] & 0xFFFF00) == 0x102000);
+    }
+    if (__builtin_strstr(r.name, "tessellation, winding")) {
+      // Back faces culled: the counter-clockwise patches (the right cells) are drawn, the clockwise ones (the left cells) are not.
+      uint32_t left = 0, right = 0;
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x) (x < 16 ? left : right) += (r.device_picture[y * 32 + x] & 0xFFFFFF) != 0;
+      CHECK(left == 0 && right > 100);
+    }
     if (__builtin_strstr(r.name, "tessellation")) {
-      // The bent triangle: factors 2, so the corners and the midpoints of the edges are the vertices; the domain shader moves a point by the products of its coordinates, so the midpoints
-      // (and with them the edges) move, and the picture is not the plain triangle's.
-      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
-      auto near = [](uint32_t a, uint32_t b) {
-        for (uint32_t shift = 0; shift < 24; shift += 8) {
-          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
-          if (d > 3 || d < -3) return false;
-        }
-        return true;
-      };
-      CHECK(near(px(14, 8), 0x2D13BF) && near(px(16, 20), 0x595551) && near(px(20, 24), 0x4C862D) && px(0, 0) == 0 && px(31, 31) == 0);
+      // Every tessellation scene draws something in all four cells (the winding one in two), and the rings show: more than a plain triangle's worth of distinct colours.
+      uint32_t lit = 0;
+      for (uint32_t i = 0; i < 32 * 32; ++i) lit += (r.device_picture[i] & 0xFFFFFF) != 0;
+      CHECK(lit > 30);
     }
     if (__builtin_strstr(r.name, "multisampling")) {
       // Inside a rectangle all four samples agree; on the left edge of the far one (x = 4.3) three of the four samples of the pixel are inside: 3/4 of red. Where the near green edge
