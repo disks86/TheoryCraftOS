@@ -499,6 +499,8 @@ add_executable(BOOTX64
   src/SystemInventory.cpp
   src/SystemNetworkDetails.cpp
   src/SystemWirelessDetails.cpp
+  src/SystemBluetoothDetails.cpp
+  src/Desktop/BluetoothProperties.cpp
   src/Desktop/NetworkProperties.cpp
   src/Desktop/WirelessProperties.cpp
   src/Gui/Controls/MenuButton.cpp

@@ -90,6 +90,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       display_menu_(allocator),
       adapter_menu_(allocator),
       wireless_menu_(allocator),
+      bluetooth_menu_(allocator),
       hardware_info_(allocator),
       cpu_meter_(allocator),
       memory_meter_(allocator),
@@ -209,6 +210,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   properties_item_ = adapter_menu_.add_item("Properties...", {&ComputerManager::on_properties_item, this});
   wireless_adapter_item_ = wireless_menu_.add_item("Properties...", {&ComputerManager::on_properties_item, this});
   wireless_properties_item_ = wireless_menu_.add_item("Wi-Fi Properties...", {&ComputerManager::on_wireless_item, this});
+  bluetooth_settings_item_ = bluetooth_menu_.add_item("Bluetooth Settings...", {&ComputerManager::on_bluetooth_item, this});
   hardware_page_.add(&hardware_info_);
   hardware_page_.add(&tree_);
 
@@ -280,6 +282,11 @@ void ComputerManager::on_wireless_item(void* self, Control&) {
   if (!t->selected_adapter(&t->properties_adapter_)) return;
   t->fire(t->open_wireless_properties_);
 }
+void ComputerManager::on_bluetooth_item(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  if (!t->selected_adapter(&t->properties_adapter_)) return;
+  t->fire(t->open_bluetooth_properties_);
+}
 void ComputerManager::on_copy_row(void* self, Control&) { static_cast<ComputerManager*>(self)->grid_.copy_selected_row(); }
 void ComputerManager::on_grid_menu_opening(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
@@ -334,6 +341,7 @@ void ComputerManager::rebuild_hardware() {
         group_nodes_[g] = node;
       }
       const int32_t device = tree_.add_node(node, e.name, i, g == static_cast<uint32_t>(HardwareGroup::Storage) ? ItemIcon::Drive : ItemIcon::File);
+      if (device >= 0 && g == static_cast<uint32_t>(HardwareGroup::Bluetooth) && e.bluetooth) tree_.set_node_menu(device, &bluetooth_menu_);   // (Bluetooth Settings)
       if (device >= 0 && g == static_cast<uint32_t>(HardwareGroup::Network)) tree_.set_node_menu(device, e.wireless ? &wireless_menu_ : &adapter_menu_);   // (Properties; a Wi-Fi adapter has Wi-Fi Properties too)
     }
     if (node < 0) continue;

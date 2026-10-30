@@ -29,6 +29,7 @@
 #include "Hardware/Bluetooth/HciBluetoothAdapter.hpp"
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
 #include "Hardware/Hid/HidDescriptor.hpp"
+#include "SystemBluetoothDetails.hpp"
 #include "Hardware/Keyboard/CompositeKeyboard.hpp"
 #include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Bluetooth/Smp.hpp"
@@ -1144,6 +1145,154 @@ static void test_profile_plugin() {
   CHECK(profiles.remove(&battery) && !profiles.remove(&battery) && profiles.count() == 0);
 }
 
+// The desktop's view of the adapters (SystemBluetoothDetails) over a real adapter: the device rows, and the pairing questions reaching the window and the answers going back.
+static void test_system_details() {
+  struct Manager final : IBluetoothManager {
+    IBluetoothAdapter* a = nullptr;
+    BluetoothProfileRegistry* profiles = nullptr;
+    uint32_t adapter_count() const override { return a ? 1 : 0; }
+    IBluetoothAdapter* adapter(uint32_t i) override { return i == 0 ? a : nullptr; }
+    bool add_profile(IBluetoothProfile* p) override { return profiles->add(p); }
+    bool remove_profile(IBluetoothProfile* p) override { return profiles->remove(p); }
+  };
+  auto settle = [](HidWorld& w, SystemBluetoothDetails& d, desktop::BluetoothPromptKind* seen, uint32_t* number, int rounds) {
+    for (int i = 0; i < rounds; ++i) {
+      w.adapter->poll();
+      w.hogp.poll(w.sink);
+      desktop::BluetoothPrompt prompt;
+      if (d.prompt(0, &prompt)) { *seen = prompt.kind; *number = prompt.number; return true; }
+    }
+    return false;
+  };
+  {   // rows
+    HidWorld w;
+    w.make_peripheral();
+    Manager manager;
+    manager.a = w.adapter.get();
+    manager.profiles = &w.profiles;
+    SystemBluetoothDetails details(manager);
+    CHECK(details.is_bluetooth(0) && !details.is_bluetooth(1));
+    desktop::BluetoothAdapterInfo info;
+    CHECK(details.adapter(0, &info) && strcmp(info.name, "Bluetooth adapter") == 0 && strcmp(info.address, "66:55:44:33:22:11") == 0 && info.ready && !info.discovering && !details.adapter(1, &info));
+    CHECK(details.set_discovery(0, true) && details.adapter(0, &info) && info.discovering);
+    w.advertise();
+    w.host.controller.inquiry();
+    w.adapter->poll();
+    desktop::BluetoothDeviceRow rows[desktop::IBluetoothDetails::kMaxDevices];
+    const uint32_t n = details.devices(0, rows, desktop::IBluetoothDetails::kMaxDevices);
+    CHECK(n == 6);
+    // the supported ones first, by signal: the keyboard (-53 dBm), then the beacon (-80 dBm), then the classic devices
+    CHECK(strcmp(rows[0].name, "Keyboard") == 0 && strcmp(rows[0].kind, "Keyboard") == 0 && rows[0].signal_percent == 94 && rows[0].supported && !rows[0].paired && strcmp(rows[0].address, "C6:C5:C4:C3:C2:C1") == 0 && rows[0].key[0] == 0xC1);
+    CHECK(strcmp(rows[1].kind, "Device") == 0 && rows[1].signal_percent == 40 && rows[1].name[0] == 0);
+    uint32_t classic = 0;
+    for (uint32_t i = 2; i < n; ++i) classic += !rows[i].supported;
+    CHECK(classic == 4);
+    bool saw_phone = false, saw_headset_ext = false;
+    for (uint32_t i = 2; i < n; ++i) { saw_phone = saw_phone || strcmp(rows[i].kind, "Phone") == 0; saw_headset_ext = saw_headset_ext || strcmp(rows[i].name, "Headset X") == 0; }
+    CHECK(saw_phone && saw_headset_ext);
+    CHECK(details.devices(0, rows, 2) == 2 && details.devices(1, rows, 2) == 0);
+    CHECK(details.connect(0, rows[2].key) == desktop::BluetoothResult::Unsupported && details.connect(1, rows[0].key) == desktop::BluetoothResult::NotReady);
+    uint8_t nobody[6] = {9, 9, 9, 9, 9, 9};
+    CHECK(details.connect(0, nobody) == desktop::BluetoothResult::NoSuchDevice);
+    details.set_discovery(0, false);
+    CHECK(details.adapter(0, &info) && !info.discovering);
+  }
+  struct Case { const char* name; uint8_t central_io_unused; uint8_t peripheral_io; bool mitm; int method; desktop::BluetoothPromptKind prompt; };
+  const Case cases[] = {
+      {"just works", 0, 3, false, 0, desktop::BluetoothPromptKind::None},
+      {"the host shows a passkey", 0, 2, true, 3, desktop::BluetoothPromptKind::ShowPasskey},
+      {"the device shows a passkey", 0, 0, true, 2, desktop::BluetoothPromptKind::EnterPasskey},
+      {"numbers to compare", 0, 1, true, 1, desktop::BluetoothPromptKind::ConfirmNumber},
+  };
+  for (const Case& c : cases) {
+    HidWorld w;
+    w.make_peripheral();
+    w.p->io_capability = c.peripheral_io;
+    w.p->want_mitm = c.mitm;
+    w.p->method = c.method;
+    w.p->passkey = 123456;
+    Manager manager;
+    manager.a = w.adapter.get();
+    manager.profiles = &w.profiles;
+    SystemBluetoothDetails details(manager);
+    struct Reader { SystemBluetoothDetails* details; desktop::BluetoothPromptKind kind = desktop::BluetoothPromptKind::None; uint32_t number = 0; } reader{&details};
+    if (c.prompt == desktop::BluetoothPromptKind::ShowPasskey) {      // (the pairing does not wait for the user to type: the peripheral reads the number off the screen when it needs it)
+      w.p->passkey_provider = [](void* context) -> uint32_t {
+        Reader& r = *static_cast<Reader*>(context);
+        desktop::BluetoothPrompt prompt;
+        if (r.details->prompt(0, &prompt)) { r.kind = prompt.kind; r.number = prompt.number; }
+        return r.number;
+      };
+      w.p->provider_context = &reader;
+    }
+    w.advertise();
+    w.adapter->poll();
+    uint8_t key[6];
+    memcpy(key, w.p->address, 6);
+    CHECK(details.connect(0, key) == desktop::BluetoothResult::Ok);
+    desktop::BluetoothPromptKind seen = desktop::BluetoothPromptKind::None;
+    uint32_t number = 0;
+    const bool asked = c.prompt == desktop::BluetoothPromptKind::ShowPasskey ? false : settle(w, details, &seen, &number, 600);
+    if (c.prompt == desktop::BluetoothPromptKind::ShowPasskey) {
+      for (int i = 0; i < 2000 && reader.kind == desktop::BluetoothPromptKind::None; ++i) { w.adapter->poll(); w.hogp.poll(w.sink); }
+      CHECK(reader.kind == desktop::BluetoothPromptKind::ShowPasskey && reader.number < 1000000);
+    } else if (c.prompt == desktop::BluetoothPromptKind::None) {
+      CHECK(!asked);
+    } else {
+      CHECK(asked && seen == c.prompt);
+      desktop::BluetoothPrompt prompt;
+      CHECK(details.prompt(0, &prompt) && strcmp(prompt.device, "Keyboard") == 0);
+      if (seen == desktop::BluetoothPromptKind::ConfirmNumber) {
+        details.answer_confirm(0, true);
+      } else {
+        details.answer_passkey(0, 123456);
+      }
+      CHECK(!details.prompt(0, &prompt));                              // (answered: the question is gone)
+    }
+    BluetoothDeviceInfo bt;
+    bool connected = false;
+    for (int i = 0; i < 2000 && !connected; ++i) {
+      w.adapter->poll();
+      w.hogp.poll(w.sink);
+      connected = w.adapter->find_device(w.peer(), &bt) && bt.state == BluetoothLinkState::Connected;
+    }
+    CHECK(connected && w.sink.keyboards.count() == 1);
+    if (c.method == 1) CHECK(number == w.p->numeric_value);
+    desktop::BluetoothDeviceRow rows[8];
+    CHECK(details.devices(0, rows, 8) >= 1 && rows[0].state == desktop::BluetoothDeviceState::Connected && rows[0].paired && strcmp(rows[0].profiles, "HID over GATT") == 0);
+    details.disconnect(0, key);
+    w.adapter->poll();
+    CHECK(details.devices(0, rows, 8) >= 1 && rows[0].state == desktop::BluetoothDeviceState::Disconnected && rows[0].paired);
+    details.forget(0, key);
+    CHECK(details.devices(0, rows, 8) >= 1 && !rows[0].paired);
+  }
+  {   // a numbers-to-compare question the user rejects fails the pairing, and the window sees the failure
+    HidWorld w;
+    w.make_peripheral();
+    w.p->io_capability = 1;
+    w.p->want_mitm = true;
+    w.p->method = 1;
+    Manager manager;
+    manager.a = w.adapter.get();
+    manager.profiles = &w.profiles;
+    SystemBluetoothDetails details(manager);
+    w.advertise();
+    w.adapter->poll();
+    uint8_t key[6];
+    memcpy(key, w.p->address, 6);
+    CHECK(details.connect(0, key) == desktop::BluetoothResult::Ok);
+    desktop::BluetoothPromptKind seen = desktop::BluetoothPromptKind::None;
+    uint32_t number = 0;
+    CHECK(settle(w, details, &seen, &number, 600) && seen == desktop::BluetoothPromptKind::ConfirmNumber);
+    details.answer_confirm(0, false);
+    CHECK(w.run_until(w.peer(), BluetoothLinkState::Failed));
+    desktop::BluetoothDeviceRow rows[8];
+    CHECK(details.devices(0, rows, 8) >= 1 && rows[0].state == desktop::BluetoothDeviceState::Failed && strstr(rows[0].failure, "numbers"));
+    desktop::BluetoothPrompt prompt;
+    CHECK(!details.prompt(0, &prompt));
+  }
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_crypto();
@@ -1158,6 +1307,7 @@ int main() {
   test_hid_descriptor();
   test_hid_end_to_end();
   test_profile_plugin();
+  test_system_details();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("bluetooth stack tests passed\n");
   return 0;
