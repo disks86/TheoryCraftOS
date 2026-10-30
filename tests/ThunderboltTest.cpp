@@ -30,6 +30,7 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltNvm.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
 #include "Hardware/Bus/Pci/PciMsix.hpp"
@@ -2583,6 +2584,181 @@ static void test_boot_acl() {
   }
 }
 
+// ---- the firmware update through the DMA port
+
+// An image the validation accepts: the digital section at 16 KiB, its size inside, the device id at +5, `size` bytes in all.
+static std::vector<uint8_t> nvm_image(uint32_t size, uint16_t device_id, uint32_t header = 0x4000) {
+  std::vector<uint8_t> image(size);
+  for (uint32_t i = 0; i < size; ++i) image[i] = static_cast<uint8_t>(i * 7 + (i >> 8));
+  image[0] = static_cast<uint8_t>(header);
+  image[1] = static_cast<uint8_t>(header >> 8);
+  image[2] = static_cast<uint8_t>(header >> 16);
+  image[3] = 0x55;                                   // (the top byte is not part of the pointer)
+  if (header + 6 >= size) return image;              // (a pointer that leads outside: nothing to fill in)
+  image[header] = 0x00;
+  image[header + 1] = 0x10;                          // the section is 4 KiB
+  image[header + 5] = static_cast<uint8_t>(device_id);
+  image[header + 6] = static_cast<uint8_t>(device_id >> 8);
+  return image;
+}
+
+static void test_nvm() {
+  // the image checks
+  {
+    uint32_t start = 0;
+    const std::vector<uint8_t> good = nvm_image(64 * 1024, 0x15EB);
+    CHECK(tb_nvm_validate_image(ConstByteView(good.data(), good.size()), 0x15EB, false, &start) && start == 0x4000);
+    CHECK(!tb_nvm_validate_image(ConstByteView(good.data(), good.size()), 0x15D9, false, &start));           // another controller's
+    CHECK(tb_nvm_validate_image(ConstByteView(good.data(), good.size()), 0x15D9, true, &start));            // (safe mode: any)
+    const std::vector<uint8_t> small = nvm_image(16 * 1024 + 16, 0x15EB);
+    CHECK(!tb_nvm_validate_image(ConstByteView(small.data(), small.size()), 0x15EB, false, &start));        // below the minimum size
+    const std::vector<uint8_t> unaligned = nvm_image(64 * 1024, 0x15EB, 0x4100);
+    CHECK(!tb_nvm_validate_image(ConstByteView(unaligned.data(), unaligned.size()), 0x15EB, false, &start));
+    const std::vector<uint8_t> outside = nvm_image(64 * 1024, 0x15EB, 0xFF000);
+    CHECK(!tb_nvm_validate_image(ConstByteView(outside.data(), outside.size()), 0x15EB, false, &start));
+    std::vector<uint8_t> edge = nvm_image(64 * 1024, 0x15EB, 0xC000);                                         // the section starts so near the end that the id is cut off
+    CHECK(tb_nvm_validate_image(ConstByteView(edge.data(), edge.size()), 0x15EB, true, &start));
+    std::vector<uint8_t> cut(good.begin(), good.begin() + 0x4005 + 2 - 1);
+    CHECK(!tb_nvm_validate_image(ConstByteView(cut.data(), cut.size()), 0x15EB, true, &start));              // (and below the minimum)
+    std::vector<uint8_t> cut_edge = nvm_image(32 * 1024, 0x15EB, 0x7000);
+    cut_edge.resize(0x7000 + 7);
+    CHECK(!tb_nvm_validate_image(ConstByteView(cut_edge.data(), cut_edge.size()), 0x15EB, true, &start));
+    std::vector<uint8_t> big_section = nvm_image(32 * 1024, 0x15EB);
+    big_section[0x4000] = 0xFF; big_section[0x4001] = 0xFF;                                                  // a section larger than the image
+    CHECK(!tb_nvm_validate_image(ConstByteView(big_section.data(), big_section.size()), 0x15EB, false, &start));
+    const std::vector<uint8_t> huge(1024 * 1024 + 4, 0);
+    CHECK(!tb_nvm_validate_image(ConstByteView(huge.data(), huge.size()), 0x15EB, false, &start) && !tb_nvm_validate_image(ConstByteView(), 0, true, nullptr));
+    // bit flips in the header never make it read outside
+    for (uint32_t bit = 0; bit < 64; ++bit) {
+      std::vector<uint8_t> f = good;
+      f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      tb_nvm_validate_image(ConstByteView(f.data(), f.size()), 0x15EB, false, &start);
+    }
+  }
+  TestAllocator alloc;
+  auto make_chip = [](FakeNhi& chip) {
+    chip.flash.present = true;
+    chip.flash.active.resize(256 * 1024);
+    for (uint32_t i = 0; i < chip.flash.active.size(); ++i) chip.flash.active[i] = static_cast<uint8_t>(i * 13 + (i >> 9));
+    chip.flash.active[0x45] = 0x02;                  // one area: (1 MiB << 2) / 8 = 512 KiB, less the 16 KiB header, halved
+    chip.flash.active[0x46] = 0;
+    chip.flash.active[0x08] = 0;
+    chip.flash.active[0x09] = 0x2A;                  // minor 42
+    chip.flash.active[0x0A] = 0x17;                  // major 23
+    chip.flash.active[0x0B] = 0;
+  };
+  {   // finding the port, reading, the version
+    FakeNhi chip;
+    make_chip(chip);
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    uint8_t buffer[8];
+    CHECK(port.flash_read(0, ByteView(buffer, 4)) == TbNvmResult::NoDmaPort);                                 // (not found yet)
+    CHECK(port.find() == TbNvmResult::Ok && port.port() == 5);
+    for (uint32_t port_number : {3u, 7u}) {
+      FakeNhi other;
+      make_chip(other);
+      other.flash.port = port_number;
+      ThunderboltIcm other_icm(other, alloc);
+      CHECK(other_icm.start() == ThunderboltIcm::Outcome::Started);
+      TbDmaPort other_port(other_icm.control(), &other_icm);
+      CHECK(other_port.find() == TbNvmResult::Ok && other_port.port() == port_number);
+    }
+    TbNvmVersion version;
+    CHECK(tb_nvm_read_version(port, &version) == TbNvmResult::Ok && version.major == 0x17 && version.minor == 0x2A && version.active_size == (512 * 1024 - 16 * 1024) / 2);
+    // reads of every alignment and length come out right, across block boundaries
+    for (uint32_t address : {0u, 1u, 3u, 60u, 61u, 64u, 1000u}) {
+      for (uint32_t length : {1u, 2u, 4u, 63u, 64u, 65u, 130u}) {
+        std::vector<uint8_t> got(length);
+        CHECK(port.flash_read(address, ByteView(got.data(), got.size())) == TbNvmResult::Ok && memcmp(got.data(), chip.flash.active.data() + address, length) == 0);
+      }
+    }
+    // a command that is slow to finish is waited for; one the controller refuses fails with its status; a lost one is tried again
+    chip.flash.busy_reads = 5;
+    std::vector<uint8_t> got(10);
+    CHECK(port.flash_read(100, ByteView(got.data(), got.size())) == TbNvmResult::Ok && memcmp(got.data(), chip.flash.active.data() + 100, 10) == 0);
+    chip.flash.fail_status = 2;
+    CHECK(port.flash_read(0, ByteView(got.data(), got.size())) == TbNvmResult::Ok);                           // (a read is tried again: the second time works)
+    chip.flash.fail_status = 2;
+    CHECK(port.flash_write(0, ConstByteView(chip.flash.active.data(), 8)) == TbNvmResult::Access);
+    chip.flash.fail_status = 3;
+    CHECK(port.update_auth() == TbNvmResult::Failed && !chip.flash.auth_started);
+    CHECK(port.flash_write(2, ConstByteView(chip.flash.active.data(), 8)) == TbNvmResult::BadRequest && port.flash_write(0, ConstByteView(chip.flash.active.data(), 7)) == TbNvmResult::BadRequest);
+    CHECK(chip.flash.inactive.empty());                                                                         // none of that wrote anything
+  }
+  {   // the update: the image after its header goes to the other area, then the authentication starts
+    FakeNhi chip;
+    make_chip(chip);
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    CHECK(port.find() == TbNvmResult::Ok);
+    const std::vector<uint8_t> image = nvm_image(100 * 1024, 0x15EB);
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15D9, false) == TbNvmResult::BadImage && chip.flash.inactive.empty() && !chip.flash.auth_started);   // the wrong controller: nothing written
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Ok);
+    CHECK(chip.flash.inactive.size() == image.size() - 0x4000 && memcmp(chip.flash.inactive.data(), image.data() + 0x4000, chip.flash.inactive.size()) == 0 && chip.flash.auth_started && !chip.flash.css_written);
+    CHECK(chip.flash.active[0x45] == 0x02);                                                                     // (the running area is untouched)
+    uint32_t status = 99;
+    CHECK(port.update_auth_status(&status) == 1 && status == 0);
+    CHECK(port.power_cycle() == TbNvmResult::Ok && chip.flash.power_cycled);
+    // 64 byte blocks of 16 dwords, the last one shorter
+    uint32_t writes = 0;
+    for (uint32_t cmd : chip.flash.commands) writes += (cmd >> 28) == 0;
+    CHECK(writes == (image.size() - 0x4000 + 63) / 64);
+  }
+  {   // a bad signature, a write that fails half way, and a controller that does not answer the authentication (it is restarting: not an error)
+    FakeNhi chip;
+    make_chip(chip);
+    chip.flash.fail_auth = true;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    CHECK(port.find() == TbNvmResult::Ok);
+    const std::vector<uint8_t> image = nvm_image(40 * 1024, 0x15EB);
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Auth);
+    uint32_t status = 0;
+    CHECK(port.update_auth_status(&status) == 1 && status == 1);
+    chip.flash.fail_auth = false;
+    chip.flash.mail_out = 0;
+    CHECK(port.update_auth_status(&status) == 0);                                                               // no update status to report
+    chip.flash.inactive.clear();
+    chip.flash.fail_status = 2;
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Access);
+    chip.flash.auth_started = false;
+    chip.flash.drop_writes = 1000000;                                                                           // the mailbox never takes a command
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) != TbNvmResult::Ok);
+    chip.flash.drop_writes = 0;
+    chip.flash.commands.clear();
+    // a controller that restarts: the authentication command times out and that counts as started
+    chip.flash.busy_reads = 0;
+    FakeNhi quiet;
+    make_chip(quiet);
+    ThunderboltIcm quiet_icm(quiet, alloc);
+    CHECK(quiet_icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort quiet_port(quiet_icm.control(), &quiet_icm);
+    CHECK(quiet_port.find() == TbNvmResult::Ok);
+    quiet.flash.drop_writes = 0;
+    CHECK(tb_nvm_update(quiet_port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::Ok);
+  }
+  {   // no mailbox on the router
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    TbDmaPort port(icm.control(), &icm);
+    TbNvmVersion version;
+    CHECK(port.find() == TbNvmResult::NoDmaPort && tb_nvm_read_version(port, &version) == TbNvmResult::NoDmaPort && port.update_auth() == TbNvmResult::NoDmaPort && port.update_auth_status(nullptr) == -1);
+    const std::vector<uint8_t> image = nvm_image(40 * 1024, 0x15EB);
+    CHECK(tb_nvm_update(port, ConstByteView(image.data(), image.size()), 0x15EB, false) == TbNvmResult::NoDmaPort);
+  }
+  {   // the paths are closed through the mailbox first
+    FakeNhi chip;
+    ThunderboltIcm icm(chip, alloc);
+    CHECK(!icm.disconnect_pcie_paths());
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.disconnect_pcie_paths() && chip.mailbox_commands.back() == 0x06);
+  }
+}
+
 int main() {
   test_devices();
   test_framing();
@@ -2594,6 +2770,7 @@ int main() {
   test_device_events();
   test_approve();
   test_boot_acl();
+  test_nvm();
   test_garbage();
   test_cio();
   test_firmware_start();

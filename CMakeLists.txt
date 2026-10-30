@@ -715,6 +715,7 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltKeys.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltNet.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltPower.cpp
+  src/Hardware/Bus/Thunderbolt/ThunderboltNvm.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltXdomain.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp

@@ -267,6 +267,8 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // entries). Whether a device is in it is reported by the device's `boot` flag. The firmware also fills the list itself from the approved devices when the system sleeps (save_devices).
   bool get_boot_acl(ArrayView<TbUuid> entries, const char** error);
   bool set_boot_acl(ArrayView<const TbUuid> entries, const char** error);
+  // Closes every PCIe tunnel through the mailbox (the controller's firmware update asks for it first).
+  bool disconnect_pcie_paths() { return outcome_ == Outcome::Started && nhi_.mailbox(tb_mailbox::kDisconnectPciePaths, 0, 500000) == TbMailboxResult::Ok; }
   // The route string of the device (ICM_GET_ROUTE).
   bool route(uint64_t index, uint64_t* route);
   // The topology the firmware reports (GET_TOPOLOGY, an answer of up to 14 packets): `out` gets one entry per packet.

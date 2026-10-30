@@ -351,6 +351,10 @@ class FakeNhi final : public hardware::ITbRegisters {
       reply(kError, {route_hi | (0x200u << 22), route_lo, 2u /* invalid config space */ | (0u << 8)});
       return;
     }
+    if (flash.present && space == 1 && ((addr >> 19) & 0x3F) == flash.port && (offset == 2 || (offset >= kFlashCap && offset <= kFlashCap + 18))) {
+      flash_access(eof == kWrite, route_hi, route_lo, addr, offset, length, w);
+      return;
+    }
     if (error_code != 0) {
       reply(kError, {route_hi | (0x200u << 22), route_lo, error_code | (3u << 8)});
       return;
@@ -368,6 +372,86 @@ class FakeNhi final : public hardware::ITbRegisters {
     reply(static_cast<uint8_t>(eof), out);
   }
 
+public:
+  // The DMA port of the host router: the NHI port (type 2 in dword 2) with the mailbox of the NVM update (dma_port.c): data at kFlashCap + 1, MAIL_IN at + 17, MAIL_OUT at + 18.
+  static constexpr uint32_t kFlashCap = 0x3E;
+  struct Flash {
+    bool present = false;
+    uint32_t port = 5;
+    std::vector<uint8_t> active, inactive;       // the two areas (the host reads the first, writes the other)
+    uint32_t mail_in = 0, mail_out = 0, data[16] = {};
+    uint32_t busy_reads = 0;                     // MAIL_IN reads that still show the request bit
+    uint32_t fail_status = 0;                    // the next command ends with this status
+    uint32_t drop_writes = 0;                    // MAIL_IN writes that are lost (the command times out) before one works
+    bool css_written = false, auth_started = false, power_cycled = false;
+    uint32_t auth_status = 0;                    // the status of the update, reported once the host asks
+    bool fail_auth = false;                      // the image does not pass the signature check
+    std::vector<uint32_t> commands;              // the MAIL_IN words that were executed
+  } flash;
+  void flash_access(bool write, uint32_t route_hi, uint32_t route_lo, uint32_t addr, uint32_t offset, uint32_t length, const std::vector<uint32_t>& w) {
+    std::vector<uint32_t> out = {route_hi | (0x200u << 22), route_lo, addr};
+    if (!write) {
+      for (uint32_t i = 0; i < length; ++i) {
+        const uint32_t o = offset + i;
+        uint32_t v = 0;
+        if (o == 2) v = 2;                                           // the NHI port
+        else if (o >= kFlashCap + 1 && o < kFlashCap + 17) v = flash.data[o - kFlashCap - 1];
+        else if (o == kFlashCap + 17) { v = flash.mail_in; if (flash.busy_reads > 0) { --flash.busy_reads; v |= 1; } }
+        else if (o == kFlashCap + 18) v = flash.mail_out;
+        out.push_back(v);
+      }
+      reply(kRead, out);
+      return;
+    }
+    for (uint32_t i = 0; i < length && 3 + i < w.size(); ++i) {
+      const uint32_t o = offset + i, v = w[3 + i];
+      if (o >= kFlashCap + 1 && o < kFlashCap + 17) flash.data[o - kFlashCap - 1] = v;
+      else if (o == kFlashCap + 17) {
+        if (flash.drop_writes > 0) { --flash.drop_writes; continue; }
+        flash_command(v);
+      }
+    }
+    reply(kWrite, out);
+  }
+  void flash_command(uint32_t in) {
+    flash.commands.push_back(in);
+    const uint32_t cmd = in >> 28;
+    uint32_t status = flash.fail_status;
+    flash.fail_status = 0;
+    const uint32_t dwaddress = (in >> 2) & 0x3FFFFF;
+    if (status == 0) {
+      if (cmd == 0) {                                                // write
+        const uint32_t dwords = ((in >> 24) & 0xF) + 1;
+        if (in & 2) flash.css_written = true;
+        else {
+          if (flash.inactive.size() < (dwaddress + dwords) * 4) flash.inactive.resize((dwaddress + dwords) * 4, 0xFF);
+          for (uint32_t i = 0; i < dwords; ++i)
+            for (uint32_t k = 0; k < 4; ++k) flash.inactive[(dwaddress + i) * 4 + k] = static_cast<uint8_t>(flash.data[i] >> (8 * k));
+        }
+      } else if (cmd == 2) {                                         // read
+        uint32_t dwords = (in >> 24) & 0xF;
+        if (dwords == 0) dwords = 16;
+        for (uint32_t i = 0; i < dwords; ++i) {
+          uint32_t v = 0;
+          for (uint32_t k = 0; k < 4; ++k) {
+            const size_t at = (dwaddress + i) * 4 + k;
+            v |= uint32_t{at < flash.active.size() ? flash.active[at] : uint8_t{0xFF}} << (8 * k);
+          }
+          flash.data[i] = v;
+        }
+      } else if (cmd == 1) {
+        flash.auth_started = true;
+        flash.auth_status = flash.fail_auth ? 1 : 0;
+      } else if (cmd == 4) {
+        flash.power_cycled = true;
+      }
+    }
+    if (cmd == 1 && status == 0) status = flash.auth_status;
+    flash.mail_in = in & ~1u;                                        // the request is done
+    flash.mail_out = (1u << 29) | (cmd << 4) | status;
+  }
+
+private:
   // (the words of a body are the little endian values of the bytes the driver wrote: an ICM header is code | flags << 8 | packet id << 16 | total packets << 24)
   // the host's ThunderboltIP messages (login, logout) to the other host
   void service_message(const std::vector<uint32_t>& w) {
