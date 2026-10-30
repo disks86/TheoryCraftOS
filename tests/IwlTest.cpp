@@ -30,6 +30,7 @@
 #include "Hardware/WirelessInterface/Intel/IwlDevices.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlFirmware.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlFwLoad.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlRx.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -452,12 +453,144 @@ static void test_load() {
   }
 }
 
+// ---- the receive queue ----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+struct CollectSink final : IIwlPacketSink {
+  struct Seen { uint8_t command, group; uint16_t sequence; Bytes payload; };
+  std::vector<Seen> seen;
+  void on_packet(const IwlRxPacket& p) override {
+    Seen s{p.command, p.group, p.sequence, Bytes()};
+    for (uint64_t i = 0; i < p.payload.size(); ++i) s.payload.push_back(p.payload[i]);
+    seen.push_back(s);
+  }
+};
+
+// The chip's receive side: takes the posted buffers in order, fills them with frames, closes them.
+struct FakeRxChip {
+  FakeIwl& chip;
+  uint32_t taken = 0, closed = 0;
+  explicit FakeRxChip(FakeIwl& c) : chip(c) {}
+  uint64_t prph64(uint32_t a) { return chip.prph[(a & 0xFFFFF) / 4] | (static_cast<uint64_t>(chip.prph[((a & 0xFFFFF) + 4) / 4]) << 32); }
+  uint32_t write_pointer() { return chip.regs[0x1C80 / 4]; }
+  // frame: len_n_flags(size = 4 + payload), command header, payload; padded to 64
+  static void frame(Bytes& b, uint8_t group, uint8_t cmd, uint16_t seq, const Bytes& payload) {
+    put32(b, static_cast<uint32_t>(4 + payload.size()));
+    b.push_back(cmd); b.push_back(group); b.push_back(static_cast<uint8_t>(seq)); b.push_back(static_cast<uint8_t>(seq >> 8));
+    b.insert(b.end(), payload.begin(), payload.end());
+    while (b.size() % 64) b.push_back(0);
+  }
+  // returns false when the host has not posted a buffer
+  bool deliver(const Bytes& content, bool end_marker = true) {
+    if (((write_pointer() - taken) & 255) == 0) return false;
+    const uint64_t* ring = reinterpret_cast<const uint64_t*>(prph64(0xA08000));
+    const uint64_t entry = ring[taken % 256];
+    const uint32_t vid = entry & 0xFFF;
+    uint8_t* buffer = reinterpret_cast<uint8_t*>(entry & ~0xFFFull);
+    memset(buffer, 0, 4096);
+    memcpy(buffer, content.data(), content.size() < 4096 ? content.size() : 4096);
+    if (end_marker && content.size() + 4 <= 4096) { const uint32_t m = iwl_frame::kInvalid; memcpy(buffer + content.size(), &m, 4); }
+    uint32_t* used = reinterpret_cast<uint32_t*>(prph64(0xA08100));
+    used[closed % 256] = vid;
+    ++taken;
+    ++closed;
+    *reinterpret_cast<uint16_t*>(prph64(0xA08200)) = static_cast<uint16_t>(closed % 256);
+    return true;
+  }
+};
+
+static void test_rx() {
+  TestAllocator alloc;
+  FakeIwl chip;
+  chip.w1c = true;
+  IwlPcieDevice dev(chip);
+  CHECK(dev.apm_init());
+  IwlRxQueue rxq(dev, alloc);
+  const char* error = nullptr;
+  CHECK(rxq.init(true, &error));
+  if (error) printf("  rx error: %s\n", error);
+  FakeRxChip hw(chip);
+  CHECK(chip.prph[0x09820 / 4] == (iwl_rfh::kDmaEnable | iwl_rfh::kDmaBufferSize4K | iwl_rfh::kDmaMinBuffer4And8 | iwl_rfh::kDmaDropTooLarge | iwl_rfh::kDmaRingSize256));
+  CHECK(chip.prph[0x0980C / 4] == 0x10001u && (chip.prph[0x09800 / 4] & 3) == 3 && !(chip.prph[0x09800 / 4] & iwl_rfh::kGenCfgChunk128));
+  CHECK(hw.write_pointer() == 248 && rxq.buffers_posted() == 248 && (chip.regs[iwl_rfh::kIntCoalescing / 4] & 0xFF) == iwl_rfh::kIntCoalescingDefault);
+  const uint64_t* ring = reinterpret_cast<const uint64_t*>(hw.prph64(0xA08000));
+  CHECK((ring[0] & 0xFFF) == 1 && (ring[247] & 0xFFF) == 248 && (ring[0] & ~0xFFFull) != 0);
+  CollectSink sink;
+  CHECK(rxq.poll(sink) == 0);
+  // one buffer with three frames
+  Bytes content;
+  FakeRxChip::frame(content, 0, 0x01, 0x8000 | 5, Bytes{1, 2, 3, 4, 5});                 // a notification
+  FakeRxChip::frame(content, 3, 0x40, 0x0007, Bytes(100, 0xEE));                         // a response of queue 0, index 7
+  FakeRxChip::frame(content, 0, 0x02, 0x0400, Bytes());
+  CHECK(hw.deliver(content));
+  CHECK(rxq.poll(sink) == 3 && sink.seen.size() == 3);
+  CHECK(sink.seen[0].command == 1 && sink.seen[0].group == 0 && sink.seen[0].sequence == 0x8005 && sink.seen[0].payload == Bytes({1, 2, 3, 4, 5}));
+  CHECK(sink.seen[1].command == 0x40 && sink.seen[1].group == 3 && sink.seen[1].payload.size() == 100 && sink.seen[1].payload[99] == 0xEE);
+  CHECK(sink.seen[2].payload.empty() && sink.seen[2].sequence == 0x0400);
+  { IwlRxPacket p; p.sequence = 0x0407; CHECK(p.is_response() && p.queue() == 4 && p.index() == 7); p.sequence = 0x8001; CHECK(!p.is_response()); }
+  // the buffer went back: 249 posted, the pointer moves in groups of eight
+  CHECK(rxq.buffers_posted() == 249 && hw.write_pointer() == 248);
+  for (int i = 0; i < 7; ++i) { CHECK(hw.deliver(content)); }
+  CHECK(rxq.poll(sink) == 21 && rxq.buffers_posted() == 256 && hw.write_pointer() == 0);
+  // lying frames: a size beyond the buffer, a size smaller than the header, the invalid marker in the middle
+  sink.seen.clear();
+  Bytes bad;
+  put32(bad, 0x3FFF); bad.push_back(1); bad.push_back(0); bad.push_back(0); bad.push_back(0);
+  CHECK(hw.deliver(bad));
+  Bytes tiny;
+  put32(tiny, 2); tiny.insert(tiny.end(), 8, 0);
+  CHECK(hw.deliver(tiny));
+  Bytes marked;
+  FakeRxChip::frame(marked, 0, 9, 0x8000, Bytes{7});
+  put32(marked, iwl_frame::kInvalid);
+  FakeRxChip::frame(marked, 0, 10, 0x8000, Bytes{8});
+  CHECK(hw.deliver(marked, false));
+  CHECK(rxq.poll(sink) == 1 && sink.seen.size() == 1 && sink.seen[0].command == 9);
+  // a full buffer of frames up to its last byte
+  Bytes full;
+  while (full.size() + 64 <= 4096) FakeRxChip::frame(full, 0, 11, 0x8000, Bytes(40, 1));
+  CHECK(hw.deliver(full, false));
+  sink.seen.clear();
+  CHECK(rxq.poll(sink) == 64);
+  // the chip names buffers that do not exist and a closed index beyond what it wrote
+  {
+    uint32_t* used = reinterpret_cast<uint32_t*>(hw.prph64(0xA08100));
+    used[hw.closed % 256] = 0; used[(hw.closed + 1) % 256] = 0xFFF; used[(hw.closed + 2) % 256] = 300;
+    hw.closed += 3;
+    *reinterpret_cast<uint16_t*>(hw.prph64(0xA08200)) = static_cast<uint16_t>(hw.closed % 256);
+    CHECK(rxq.poll(sink) == 0);
+    *reinterpret_cast<uint16_t*>(hw.prph64(0xA08200)) = 0xFFFF;                       // an index with the high bits set: only 12 bits count
+    (void)rxq.poll(sink);
+  }
+  // random buffers
+  uint32_t seed = 99;
+  for (int round = 0; round < 200; ++round) {
+    Bytes junk(4096);
+    for (auto& b : junk) { seed = seed * 1664525u + 1013904223u; b = static_cast<uint8_t>(seed >> 24); }
+    if (round % 3 == 0) for (size_t i = 0; i < junk.size(); i += 64) { junk[i + 1] &= 0x3F; junk[i + 2] = 0; junk[i + 3] = 0; }
+    *reinterpret_cast<uint16_t*>(hw.prph64(0xA08200)) = static_cast<uint16_t>(hw.closed % 256);
+    if (!hw.deliver(junk, false)) break;
+    (void)rxq.poll(sink);
+  }
+  rxq.release();
+  CHECK(!rxq.ready() && alloc.dma.empty() && chip.prph[0x09820 / 4] == 0);
+  // no memory
+  struct Empty final : allocators::IAllocator {
+    void* allocate(uint64_t) override { return nullptr; }
+    void* allocate_aligned(uint64_t, uint64_t) override { return nullptr; }
+    void* allocate_dma(uint64_t, uint64_t) override { return nullptr; }
+    void deallocate(void*) override {}
+  } none;
+  IwlRxQueue starved(dev, none);
+  CHECK(!starved.init(false, &error) && !starved.ready());
+}
+
 int main() {
   test_devices();
   test_firmware();
   test_real_firmware();
   test_pcie();
   test_load();
+  test_rx();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
