@@ -451,6 +451,7 @@ DrawStatus draw(allocators::IAllocator& allocator, const DrawCall& call, Framebu
     float area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[1].y - v[0].y) * (v[2].x - v[0].x);
     if (area == 0.0f || area != area) continue;
     const float original_area = area;
+    if (ds.cull != 0 && ((original_area > 0.0f) == ds.front_clockwise) == (ds.cull == 1)) continue;   // (a culled face: front when its winding agrees with front_clockwise)
     if (area < 0.0f) { order[1] = 2; order[2] = 1; area = -area; }
     const Screen& a = v[order[0]];
     const Screen& b = v[order[1]];

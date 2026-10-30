@@ -165,7 +165,7 @@ bool AmdVegaM::bring_up(const Inputs& in) {
   gart_plan_ = amd_plan_gmc8_gart(map);
   if (!gart_plan_.ok) return fail(Step::Memory, "no room in the GPU's address space for the GART");
   AmdGfx8Compute::Config compute_config;
-  layout_ = plan(ucode_layout.total_bytes, gart_plan_.table_bytes, compute_config.queues, align_up(in.max_framebuffer_bytes, kMiB) + in.output_framebuffer_bytes);
+  layout_ = plan(ucode_layout.total_bytes, gart_plan_.table_bytes, compute_config.queues, align_up(align_up(in.max_framebuffer_bytes, kMiB) + in.output_framebuffer_bytes, kMiB) + align_up(in.draw_area_bytes, kMiB));
   if (!layout_.ok) return fail(Step::Memory, "the block does not fit the part of video memory set aside for it");
   if (kRegionOffset + layout_.total > in.aperture_bytes || kRegionOffset + layout_.total > map.video_memory_bytes) return fail(Step::Memory, "the memory BAR or video memory is too small");
   if (!in.mapper->map_registers(in.aperture_physical + kRegionOffset, layout_.total, &block_)) return fail(Step::Memory, "the memory BAR cannot be mapped");

@@ -69,6 +69,10 @@ struct VegaDrawRequest {
   float clear_depth = 1.0f;
   uint8_t clear_stencil = 0;
   VegaTexture textures[gcn::abi::kMaxSamplers];                     // texture i is the shader's SAMP[i] / SVIEW[i]; one with no texels is not bound
+  bool device_clip_space = false;                                   // clip space as IGraphicsDevice has it: +Y down the screen, depth 0 to 1 (else OpenGL's)
+  // What the planes hold before the draw instead of the clear values, in the layout draw() returns them in (target_bytes(), depth_bytes() and stencil_bytes() long): how a second draw
+  // goes on from the first one's picture. An empty view: cleared.
+  ConstByteView initial_target, initial_depth, initial_stencil;
 };
 
 class AmdVegaDraw {

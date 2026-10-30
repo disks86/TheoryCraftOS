@@ -584,18 +584,27 @@ static void test_faces_and_bounds(Rig& rig) {
     CHECK((cp.context_reg(0xa10b) >> 16 & 0xF) == 2 && cp.context_reg(0xa10d) == ((0xFFu << 8) | (0xFFu << 16) | (1u << 24)));
     CHECK(cp.context_reg(0xa008) == 0 && cp.context_reg(0xa009) == (variant == 2 ? 0x3F000000u : 0x3F800000u));
   }
-  // culling and polygon modes are not modelled
+  // culling of one face is modelled (the emulator drops those triangles); culling both faces and the polygon modes are not
   DrawState s = backend_state(rig);
   uint32_t buf[512];
   bool ok;
   const uint32_t n = build(s, buf, 512, &ok);
-  Pm4Writer extra(ArrayView<uint32_t>(buf + n, 512 - n));
-  extra.set_context_reg(0xa205, 1u << 1);                         // cull back
-  extra.draw_index_auto(6);
   CommandProcessorModel cp(rig.alloc, rig.mem);
   CHECK(ok && cp.execute(ArrayView<const uint32_t>(buf, n)) == CommandProcessorModel::Result::Ok);
-  CommandProcessorModel cp2(rig.alloc, rig.mem);
-  CHECK(cp2.execute(ArrayView<const uint32_t>(buf, n + extra.count())) == CommandProcessorModel::Result::Unsupported);
+  for (const uint32_t mode : {1u << 0, 1u << 1}) {   // cull front, cull back
+    Pm4Writer cull(ArrayView<uint32_t>(buf + n, 512 - n));
+    cull.set_context_reg(0xa205, mode);
+    cull.draw_index_auto(6);
+    CommandProcessorModel with_cull(rig.alloc, rig.mem);
+    CHECK(with_cull.execute(ArrayView<const uint32_t>(buf, n + cull.count())) == CommandProcessorModel::Result::Ok);
+  }
+  for (const uint32_t mode : {(1u << 0) | (1u << 1), 1u << 3}) {   // both faces, a polygon mode
+    Pm4Writer extra(ArrayView<uint32_t>(buf + n, 512 - n));
+    extra.set_context_reg(0xa205, mode);
+    extra.draw_index_auto(6);
+    CommandProcessorModel cp2(rig.alloc, rig.mem);
+    CHECK(cp2.execute(ArrayView<const uint32_t>(buf, n + extra.count())) == CommandProcessorModel::Result::Unsupported);
+  }
 }
 
 // Dual source blending through the registers: the shader's second colour export, COL1 in SPI_SHADER_COL_FORMAT, both colours in CB_SHADER_MASK, the SRC1 factors in CB_BLEND0_CONTROL

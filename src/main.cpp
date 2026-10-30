@@ -580,6 +580,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   graphics::GraphicsPool graphics_pool(gpu_pool, system_graphics, shared_allocator);
   if (graphics_pool.count() > 1)
     Entry(Level::Info, "Graphics").dec(graphics_pool.count()).text(" GPUs, ").dec(graphics_pool.accelerated_count()).text(" with a 3D engine");
+#ifdef TCOS_AMD_VEGAM
+  // The Vega M's 3D node, made when the card is up (further down). Declared here so that it outlives the Direct3D kernel, whose adapter for the card draws with it.
+  UniquePointer<graphics::RenderNode> vega_node;
+#endif
   // The kernel half of Direct3D (what a Windows program's D3D runtime reaches through the D3DKMT system calls): one adapter per GPU of the pool.
   dxgk::Kernel dxg_kernel(shared_allocator);
   uint32_t dxg_fallbacks = 0;
@@ -1130,6 +1134,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         inputs.doorbells = doorbells;
         inputs.max_framebuffer_bytes = largest;
         inputs.output_framebuffer_bytes = 16ull << 20;     // room for the picture of one external output that light_up() lights (1920x1200 at most)
+        inputs.draw_area_bytes = 32ull << 20;              // room for the data of one draw of the 3D device (a target of 400x300 and its planes need about 10 MiB)
         // The full reset of the card as the last resort when an engine will not come back from its soft reset. This OS cannot POST a card afterwards (no AtomBIOS interpreter), so the
         // card would stay down and whatever it shows would go dark: only allowed when the card does not drive the display.
         inputs.pci = &pci;
@@ -1249,6 +1254,25 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           Entry(display->native_scanout() ? Level::Ok : Level::Info, "Vega M").text(display->native_scanout() ? "display: own framebuffer in video memory (DCE 11.2)" : "display: the firmware's framebuffer stays (the CRTC does not show it as expected)");
         } else {
           Entry(Level::Info, "Vega M").text("display: the card does not drive the display the firmware set up");
+        }
+        if (up) {
+          // 3D on the card: its graphics engine as a render node of its own (the display is another GPU's, or the firmware's), tried with the same self-tests as the other back ends, then
+          // a Direct3D adapter if it draws the Direct3D triangle. The desktop's own renderer does not use it: each draw is a round trip to the card (graphics/Graphics3D/Vega).
+          vega_node = UniquePointer<graphics::RenderNode>::make(shared_allocator, nullptr, nullptr, nullptr, shared_allocator, true, nullptr, false, vega_m.get());
+          if (vega_node && vega_node->accelerated()) {
+            graphics::DxgFallback vega_why;
+            bool vega_fell_back = false;
+            if (graphics::register_dxg_node(dxg_kernel, *vega_node, shared_allocator, false, &vega_fell_back, &vega_why)) {
+              ++dxg_adapters;
+              Entry(Level::Ok, "Vega M").text("3D: the graphics engine is a Direct3D adapter (each draw is a round trip to the card)");
+            } else {
+              Entry(Level::Warning, "Vega M").text("3D: the graphics engine failed the Direct3D self-test, step ").text(vega_why.step).text(vega_why.picture_wrong ? " (the picture was wrong)" : "");
+              vega_node = UniquePointer<graphics::RenderNode>();
+            }
+          } else {
+            Entry(Level::Info, "Vega M").text("3D: not used - ").text(vega_node ? vega_node->software_reason() : "out of memory");
+            vega_node = UniquePointer<graphics::RenderNode>();
+          }
         }
         break;
       }
