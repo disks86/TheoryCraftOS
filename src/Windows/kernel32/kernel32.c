@@ -95,41 +95,7 @@ EXPORT void WINAPI SetLastErrorEx(DWORD error, DWORD type) { (void)type; set_err
 
 /* ---- text conversion: the ANSI code page is UTF-8 ---------------------------------------------------------------------------------------------------------- */
 
-/* Converts `length` bytes (-1: up to and with the terminating NUL). Returns the number of characters written, or needed if `capacity` is 0; 0 on failure. */
-EXPORT int WINAPI MultiByteToWideChar(UINT code_page, DWORD flags, LPCSTR source, int length, LPWSTR dest, int capacity) {
-  (void)code_page; (void)flags;
-  if (!source || length == 0 || capacity < 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (length < 0) length = (int)strlen(source) + 1;
-  ULONG bytes = 0;
-  const NTSTATUS status = RtlMultiByteToUnicodeN(capacity ? dest : NULL, (ULONG)capacity * 2, &bytes, source, (ULONG)length);
-  if (!NT_SUCCESS(status) || (status == STATUS_BUFFER_OVERFLOW)) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  return (int)(bytes / 2);
-}
-EXPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR source, int length, LPSTR dest, int capacity, LPCSTR default_char, LPBOOL used_default) {
-  (void)code_page; (void)flags; (void)default_char;
-  if (used_default) *used_default = FALSE;
-  if (!source || length == 0 || capacity < 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (length < 0) length = (int)wcslen(source) + 1;
-  ULONG bytes = 0;
-  const NTSTATUS status = RtlUnicodeToMultiByteN(capacity ? dest : NULL, (ULONG)capacity, &bytes, source, (ULONG)length * 2);
-  if (!NT_SUCCESS(status) || (status == STATUS_BUFFER_OVERFLOW)) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  return (int)bytes;
-}
-EXPORT UINT WINAPI GetACP(void) { return CP_UTF8; }
-EXPORT UINT WINAPI GetOEMCP(void) { return CP_UTF8; }
-EXPORT UINT WINAPI GetConsoleCP(void) { return CP_UTF8; }
-EXPORT UINT WINAPI GetConsoleOutputCP(void) { return CP_UTF8; }
-EXPORT BOOL WINAPI SetConsoleCP(UINT cp) { (void)cp; return TRUE; }
-EXPORT BOOL WINAPI SetConsoleOutputCP(UINT cp) { (void)cp; return TRUE; }
-EXPORT BOOL WINAPI IsValidCodePage(UINT cp) { return cp == CP_UTF8 || cp == 437 || cp == 1252 || cp == CP_ACP || cp == CP_OEMCP; }
-typedef struct { UINT MaxCharSize; BYTE DefaultChar[2]; BYTE LeadByte[12]; } CPINFO;
-EXPORT BOOL WINAPI GetCPInfo(UINT cp, CPINFO *info) {
-  (void)cp;
-  memset(info, 0, sizeof(*info));
-  info->MaxCharSize = 4;
-  info->DefaultChar[0] = '?';
-  return TRUE;
-}
+#include "codepage.inc"
 /* The lstr functions of Windows end quietly on an address that cannot be read; the pages are probed as the string crosses into them. */
 static BOOL range_allowed(const void *p, SIZE_T length, BOOL write);
 static int probe_length_a(const char *s) {

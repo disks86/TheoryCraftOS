@@ -91,8 +91,10 @@
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
 #ifdef TCOS_INTEL_WIFI
-#include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"
-#include "Kernel/Delay.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
+#endif
+#ifdef TCOS_THUNDERBOLT
+#include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
 #endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
@@ -959,9 +961,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
     if (started) Entry(Level::Info, "Input").dec(started).text(" pointing device(s) on I2C");
   }
-#ifdef TCOS_INTEL_WIFI
-  hardware::IwlDriver intel_wifi(shared_allocator);
-#endif
   Entry(input.keyboards().count() ? Level::Ok : Level::Warning, "Input").dec(input.keyboards().count()).text(" keyboards");
   for (uint32_t i = 0; i < input.keyboards().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.keyboards().at(i)->name());
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
@@ -1112,38 +1111,70 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemFileSystem explorer_files(shared_allocator, storage);
     desktop::KernelProgramLauncher program_launcher(shared_allocator);      // what the terminals run programs with
 #ifdef TCOS_INTEL_WIFI
-    // The Intel Wireless-AC 9560 (and the rest of the 9000 series): the firmware from /firmware, started, initialised, its hardware address and channels read. Scanning and joining a
-    // network are not written yet, so the card is not given to the network stack. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
+    // The Intel Wireless-AC 9560 (and the rest of the 9000 series) as a network interface: the firmware from /firmware is started, and the card then scans and joins networks through the
+    // Wi-Fi window; its network stack gets an address (DHCP) whenever it is joined. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
     if (clock_ok && paging_ok) {
       hardware::FileSystemFirmwareSource wifi_firmware(explorer_files.file_system(), shared_allocator);
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
         hardware::PciDeviceInfo d;
         if (!pci.pci_device(i, &d) || !hardware::IwlDriver::supports(d)) continue;
-        const hardware::IwlDriver::Outcome outcome = intel_wifi.start(pci, d, register_mapper, wifi_firmware);
-        if (outcome == hardware::IwlDriver::Outcome::Started) {
-          const hardware::IwlNvmData& nvm = intel_wifi.nvm();
-          Entry e(Level::Ok, "Wi-Fi");
-          e.text("Intel Wireless-AC ").text(intel_wifi.firmware_name()).text(", ");
-          for (int b = 0; b < 6; ++b) e.hex2(nvm.hw_address[b]).text(b < 5 ? ":" : "");
-          e.text(", ").dec(nvm.valid_channels()).text(" channels");
-          // a look around: scan, wait up to 15 s for the end, list what was heard
-          const char* scan_error = nullptr;
-          if (hardware::IwlScanner* scanner = intel_wifi.enable_scanning(&scan_error)) {
-            if (scanner->start_scan(true, &scan_error)) {
-              for (uint32_t waited = 0; scanner->poll() && waited < 15000000; waited += 20000) hardware::delay_us(20000);
-              hardware::WifiNetwork found[16];
-              const uint32_t n = scanner->results(ArrayView<hardware::WifiNetwork>(found, 16));
-              Entry(n ? Level::Ok : Level::Info, "Wi-Fi").dec(n).text(" network(s) in range").text(scanner->scanning() ? " (the scan did not finish)" : "");
-              for (uint32_t i = 0; i < n; ++i)
-                Entry(Level::Info, "Wi-Fi").text("  ").text(found[i].ssid).text("  ").text(hardware::wifi_security_name(found[i].security)).text("  channel ").dec(found[i].channel).text("  ").dec(found[i].signal_percent).text("%");
-            } else {
-              Entry(Level::Warning, "Wi-Fi").text("scan not started: ").text(scan_error ? scan_error : "?");
-            }
+        if (!smb_random.ready()) smb_random.initialize();
+        hardware::IwlWirelessInterface::Inputs wifi_inputs;
+        wifi_inputs.pci = &pci;
+        wifi_inputs.device = d;
+        wifi_inputs.mapper = &register_mapper;
+        wifi_inputs.firmware = &wifi_firmware;
+        wifi_inputs.allocator = &shared_allocator;
+        wifi_inputs.clock = &clock;
+        wifi_inputs.random = &smb_random;
+        UniquePointer<hardware::IwlWirelessInterface> wifi = UniquePointer<hardware::IwlWirelessInterface>::make(shared_allocator, wifi_inputs);
+        if (!wifi) break;
+        if (wifi->initialize()) {
+          hardware::IwlWirelessInterface* radio = wifi.get();
+          const hardware::MacAddress mac = radio->mac_address();
+          stacks.stop_service();                                       // (a stack for it; the others keep theirs)
+          if (network.adopt(util::move(wifi)) && stacks.add(*radio)) {
+            Entry e(Level::Ok, "Wi-Fi");
+            e.text("Intel Wireless-AC ").text(radio->driver().firmware_name()).text(", ");
+            for (int b2 = 0; b2 < 6; ++b2) e.hex2(mac.bytes[b2]).text(b2 < 5 ? ":" : "");
+            e.text(", ready to scan");
           } else {
-            Entry(Level::Warning, "Wi-Fi").text("scanning not available: ").text(scan_error ? scan_error : "?");
+            Entry(Level::Warning, "Wi-Fi").text("could not add the Intel Wireless-AC to the network interfaces");
           }
+          stacks.start_service();
         } else {
-          Entry(Level::Warning, "Wi-Fi").text("Intel Wireless-AC not started: ").text(hardware::IwlDriver::outcome_name(outcome)).text(intel_wifi.message()[0] ? " - " : "").text(intel_wifi.message());
+          Entry(Level::Warning, "Wi-Fi").text("Intel Wireless-AC not started: ").text(wifi->failure());
+        }
+        break;
+      }
+    }
+#endif
+#ifdef TCOS_THUNDERBOLT
+    // The Thunderbolt 3 host interface (Alpine Ridge): the control channel to the controller's own connection manager firmware, which the BIOS has to have started. Devices that are
+    // connected are listed (and announced on the desktop); none gets a PCIe tunnel, which would give it access to memory, until something approves it. Opt-in (-DTCOS_THUNDERBOLT=ON): none
+    // of it has run on a real controller.
+    UniquePointer<hardware::ThunderboltDriver> thunderbolt;
+    UniquePointer<hardware::FileTbKeyStore> thunderbolt_keys;       // the keys of devices approved at the secure level
+    uint64_t thunderbolt_devices = 0;
+    if (clock_ok && paging_ok) {
+      for (uint32_t i = 0; i < pci.device_count(); ++i) {
+        hardware::PciDeviceInfo d;
+        if (!pci.pci_device(i, &d) || !hardware::ThunderboltDriver::supports(d)) continue;
+        hardware::ThunderboltDriver::Config thunderbolt_config;
+#ifdef TCOS_THUNDERBOLT_START_FIRMWARE
+        thunderbolt_config.start_firmware = true;
+#endif
+        thunderbolt = UniquePointer<hardware::ThunderboltDriver>::make(shared_allocator, shared_allocator, thunderbolt_config);
+        if (!thunderbolt) break;
+        if (thunderbolt->start(pci, d, register_mapper) == hardware::ThunderboltDriver::Outcome::Started) {
+          if (!smb_random.ready()) smb_random.initialize();
+          thunderbolt_keys = UniquePointer<hardware::FileTbKeyStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
+          if (thunderbolt_keys) thunderbolt->icm()->set_secure(&smb_random, thunderbolt_keys.get());
+          Entry e(Level::Ok, "Thunderbolt");
+          e.text(thunderbolt->model()->name).text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
+        } else {
+          Entry(Level::Warning, "Thunderbolt").text(thunderbolt->model() ? thunderbolt->model()->name : "controller").text(" not started: ").text(thunderbolt->message());
+          thunderbolt = UniquePointer<hardware::ThunderboltDriver>();
         }
         break;
       }
@@ -1559,6 +1590,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
       }
 #endif
+#ifdef TCOS_THUNDERBOLT
+      if (thunderbolt) {
+        thunderbolt->poll();
+        const uint64_t now_devices = thunderbolt->icm()->device_count();
+        if (now_devices != thunderbolt_devices) {
+          desktop.notify(StringView("Thunderbolt"), StringView(now_devices > thunderbolt_devices ? "A Thunderbolt device was connected (not authorized: no PCIe tunnel)" : "A Thunderbolt device was removed"),
+                         gui::NoticeKind::Information);
+          thunderbolt_devices = now_devices;
+        }
+      }
+#endif
       uint32_t tools_width, tools_height;
       if (vmware_tools.take_resolution(&tools_width, &tools_height)) on_vbox_display_request(&vbox_display, tools_width, tools_height);
       if (threaded) {
@@ -1621,9 +1663,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   audio.shutdown();
   cameras.shutdown();
   serial_ports.shutdown();
-#ifdef TCOS_INTEL_WIFI
-  intel_wifi.stop();
-#endif
 #ifdef TCOS_AMD_VEGAM
   if (hardware::AmdGpu* display = system_gpu.amd_gpu()) display->set_native_display(nullptr);   // (gives the firmware's framebuffer back before the card is stopped)
   vega_m = UniquePointer<hardware::AmdVegaM>();

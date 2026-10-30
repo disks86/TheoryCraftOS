@@ -82,6 +82,8 @@ class IwlCommandQueue {
   bool start(const char** error);
   // A queue that is not the command queue, after the scheduler is running (the command queue's start() set it up): chained, active on its FIFO.
   bool start_secondary(const char** error);
+  // The scheduler stops using the queue (before its memory is given back).
+  void deactivate();
   void release();
   bool ready() const { return tfds_.size() != 0; }
 

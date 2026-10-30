@@ -16,7 +16,9 @@ boot volume (`<build>/esp/firmware`); on an installed machine copy the files to 
 | `vegam_mec.bin`, `vegam_mec2.bin` | Command processor (compute) microcode, MEC 1 and 2, version 718 | `vegam_mec2.bin` only for the jump table entry |
 | `vegam_rlc.bin` | Run list controller microcode, version 16 | Loaded by the SMC |
 | `vegam_sdma.bin`, `vegam_sdma1.bin` | DMA engine microcode (SDMA 3.1), version 4 | Loaded by the SMC |
+| `iwlwifi-9000-pu-b0-jf-b0-46.ucode` | Intel Wireless-AC 9560 (iwlwifi 9000 family, PU MAC with the JF radio; Dell XPS 15 9575), firmware core43, API 46 | The driver tries newer API numbers first and takes the first file it finds |
 | `LICENSE.amdgpu` | The license these files are distributed under | Must stay with them |
+| `LICENCE.iwlwifi_firmware` | The license the Intel file is distributed under | Must stay with it |
 
 The three VCN 1 images are byte-identical in linux-firmware today (same SHA-256 below); they are kept under all three names because that is how the
 driver names them and AMD may make them differ. The file for a machine is chosen the way the Linux amdgpu driver chooses it (`amdgpu_ucode_ip_version_decode`, soc15.c): revision >= 8 is
@@ -46,7 +48,17 @@ c729f89ade4fcd05c390f7bbf1fcb93eda47ac6911027c707add844181004b47  vegam_rlc.bin
 
 `vegam_uvd.bin` was added from the same repository (`amdgpu/vegam_uvd.bin`, listed in WHENCE as redistributable under LICENSE.amdgpu), also unmodified. `vegam_vce.bin` (`amdgpu/vegam_vce.bin`, the same WHENCE entry style) was fetched from the kernel.org linux-firmware tree and added unmodified too. The graphics engine files (`amdgpu/vegam_{pfp,me,ce,mec,mec2,rlc,sdma,sdma1}.bin`) come from the same tree, likewise unmodified.
 
+`iwlwifi-9000-pu-b0-jf-b0-46.ucode` is `intel/iwlwifi/iwlwifi-9000-pu-b0-jf-b0-46.ucode` of linux-firmware (the `linux-firmware-intel` 20260916-1 package), decompressed from its `.zst` and otherwise unmodified; `LICENCE.iwlwifi_firmware` is the license file of that package. SHA-256 (of the decompressed file, 1519568 bytes):
+
+```
+9a0c5d938646942f9798e6212579c25771e4bb44301cd409b82abe361ca2c3e0  iwlwifi-9000-pu-b0-jf-b0-46.ucode
+```
+
+It is read by `src/Hardware/WirelessInterface/Intel/IwlFirmware` (`IwlTest` with `IWL_FIRMWARE_FILE=firmware/iwlwifi-9000-pu-b0-jf-b0-46.ucode` takes it apart and damages it): 13 runtime and 9 init sections, 57 command versions, which include the versions the driver writes (ADD_STA 10, SCAN_REQ_UMAC 8, ADD_STA_KEY 1, TX_CMD 6, PHY_CONTEXT 2). The file lists the legacy commands under the long group (1); `IwlFirmware::command_version_of` looks there too.
+
 ## License
 
 These files are AMD's, not part of TheoryCraftOS, and are not covered by the AGPL that covers the rest of the repository. They are redistributed
 in binary form only, under `LICENSE.amdgpu` (reproduced here, as it requires). No reverse engineering, decompilation or disassembly is permitted.
+
+The Intel file is Intel's, redistributed in binary form only under `LICENCE.iwlwifi_firmware` (reproduced here, as it requires): the copyright notice and disclaimer travel with it, Intel's name may not be used to endorse anything, and no reverse engineering, decompilation or disassembly is permitted.

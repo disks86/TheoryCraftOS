@@ -31,6 +31,7 @@ void set_system_network_stacks(NetworkStackSet* stacks) { g_system_stacks = stac
 bool NetworkStackSet::add(hardware::INetworkInterface& nic) {
   UniquePointer<NetworkStack> stack = UniquePointer<NetworkStack>::make(allocator_, nic, clock_, allocator_);
   if (!stack || !stack->initialize()) return false;
+  if (nic.wireless()) stack->set_dhcp_follows_link(true);       // the link of a Wi-Fi adapter is the connection: addresses come and go with it
   return stacks_.push_back(util::move(stack));
 }
 
