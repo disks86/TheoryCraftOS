@@ -684,6 +684,25 @@ EXPORT HRESULT WINAPI CreatePseudoConsole(COORD size, HANDLE input, HANDLE outpu
 EXPORT HRESULT WINAPI ResizePseudoConsole(HANDLE console, COORD size) { (void)console; return size.X > 0 && size.Y > 0 ? 0 : (HRESULT)0x80070057; }
 EXPORT void WINAPI ClosePseudoConsole(HANDLE console) { CloseHandle(console); }
 
+/* GetProcessInformation: only the machine of the process (ProcessMachineTypeInfo) is answered. */
+EXPORT BOOL WINAPI GetProcessInformation(HANDLE process, int information_class, LPVOID information, DWORD size) {
+  if (information_class != 9 /* ProcessMachineTypeInfo */) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (size != 8) { set_error(ERROR_BAD_LENGTH); return FALSE; }
+  DWORD machines[8] = {};
+  const NTSTATUS status = NtQuerySystemInformationEx(230 /* SystemSupportedProcessorArchitectures2 */, &process, sizeof(process), machines, sizeof(machines), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  for (int i = 0; i < 8 && (machines[i] & 0xFFFF); ++i) {
+    if (!(machines[i] & (1u << 19))) continue;      /* (the one the process runs as) */
+    BYTE *out = information;
+    memset(out, 0, 8);
+    *(WORD *)out = (WORD)(machines[i] & 0xFFFF);
+    *(DWORD *)(out + 4) = ((machines[i] >> 17) & 1) | (((machines[i] >> 16) & 1) << 1) | (((machines[i] >> 20) & 1) << 2);      /* UserEnabled, KernelEnabled, Wow64Container */
+    return TRUE;
+  }
+  set_error(ERROR_INVALID_PARAMETER);
+  return FALSE;
+}
+
 /* VerifyVersionInfo and GetProductInfo: ntdll knows the version (RtlGetVersion, RtlVerifyVersionInfo). */
 NTSTATUS NTAPI RtlVerifyVersionInfo(const void *info, ULONG types, ULONGLONG mask);
 EXPORT BOOL WINAPI VerifyVersionInfoW(OSVERSIONINFOEXW *info, DWORD type_mask, ULONGLONG condition_mask) {
@@ -722,7 +741,7 @@ EXPORT BOOL WINAPI GetProductInfo(DWORD major, DWORD minor, DWORD sp_major, DWOR
 #define PORT_MAX 16
 #define PORT_QUEUE 1024
 typedef struct { DWORD bytes; ULONG_PTR key; LPOVERLAPPED overlapped; } PortPacket;
-typedef struct { HANDLE semaphore; PortPacket packets[PORT_QUEUE]; DWORD head, count; } Port;
+typedef struct { HANDLE semaphore; PortPacket packets[PORT_QUEUE]; DWORD head, count; HANDLE jobs[4]; int job_count; } Port;      /* (jobs: the job objects whose events come out of this port) */
 static Port *g_ports[PORT_MAX];
 static Port *port_of(HANDLE h) {
   Port *p = NULL;
@@ -845,12 +864,38 @@ EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PT
   ReleaseSemaphore(p->semaphore, 1, NULL);
   return TRUE;
 }
+/* The next event of a job object tied to the port: the message is the byte count, the process id the "overlapped" (as Windows reports them). */
+static BOOL job_port_event(Port *p, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped) {
+  for (int i = 0; i < p->job_count; ++i) {
+    BYTE info[24];
+    ULONG got = 0;
+    const NTSTATUS status = NtQueryInformationJobObject(p->jobs[i], 0x80, info, sizeof(info), &got);
+    if (NT_SUCCESS(status) && status != (NTSTATUS)0x8000001A) {
+      if (bytes) *bytes = get32(info);
+      if (overlapped) *overlapped = (LPOVERLAPPED)(ULONG_PTR)get64(info + 8);
+      if (key) *key = (ULONG_PTR)get64(info + 16);
+      return TRUE;
+    }
+    if (status == (NTSTATUS)0xC0000008) p->jobs[i--] = p->jobs[--p->job_count];      /* (the job's handle is gone) */
+  }
+  return FALSE;
+}
 static BOOL port_take(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped, DWORD timeout, BOOL alertable) {
   Port *p = port_of(port);
   if (!p) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (overlapped) *overlapped = NULL;
   DWORD w = WaitForSingleObjectEx(p->semaphore, 0, FALSE);      /* (a packet that is there is taken before any queued call is run) */
-  if (w != WAIT_OBJECT_0 && timeout) w = WaitForSingleObjectEx(p->semaphore, timeout, alertable);
+  if (w != WAIT_OBJECT_0 && p->job_count) {      /* the events of the job objects come from the kernel: looked for between short waits */
+    const DWORD start = GetTickCount();
+    for (;;) {
+      if (job_port_event(p, bytes, key, overlapped)) return TRUE;
+      if (timeout == 0) { w = WAIT_TIMEOUT; break; }
+      const DWORD left = timeout == INFINITE ? 5 : (GetTickCount() - start >= timeout ? 0 : timeout - (GetTickCount() - start));
+      if (left == 0) { w = WAIT_TIMEOUT; break; }
+      w = WaitForSingleObjectEx(p->semaphore, left < 5 ? left : 5, alertable);
+      if (w != WAIT_TIMEOUT) break;
+    }
+  } else if (w != WAIT_OBJECT_0 && timeout) w = WaitForSingleObjectEx(p->semaphore, timeout, alertable);
   else if (w != WAIT_OBJECT_0 && alertable) w = WaitForSingleObjectEx(p->semaphore, 0, TRUE);
   if (w != WAIT_OBJECT_0) { set_error(w == WAIT_TIMEOUT || w == WAIT_IO_COMPLETION ? w : GetLastError()); return FALSE; }
   atom_lock();
@@ -1397,6 +1442,22 @@ EXPORT BOOL WINAPI QueryInformationJobObject(HANDLE job, int info_class, LPVOID 
   return NT_SUCCESS(s) && s != (NTSTATUS)0x80000005 ? TRUE : fail_nt(s);
 }
 EXPORT BOOL WINAPI SetInformationJobObject(HANDLE job, int info_class, LPVOID info, DWORD length) {
+  if (info_class == 7 && info && length == 2 * sizeof(PVOID)) {      /* JobObjectAssociateCompletionPortInformation: the port is this program's own, the kernel only keeps the events for it */
+    HANDLE port = ((HANDLE *)info)[1];
+    if (port && !port_of(port)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+    const NTSTATUS s = NtSetInformationJobObject(job, 7, info, length);
+    if (!NT_SUCCESS(s)) return fail_nt(s);
+    atom_lock();
+    for (int i = 0; i < PORT_MAX; ++i) {      /* (the job is tied to this port, and to no other) */
+      Port *q = g_ports[i];
+      if (!q) continue;
+      for (int k = 0; k < q->job_count; ++k) if (q->jobs[k] == job) q->jobs[k--] = q->jobs[--q->job_count];
+    }
+    Port *p = port ? port_of(port) : NULL;
+    if (p && p->job_count < 4) p->jobs[p->job_count++] = job;
+    LeaveCriticalSection(&g_atom_lock);
+    return TRUE;
+  }
   const NTSTATUS s = NtSetInformationJobObject(job, (ULONG)info_class, info, length);
   return NT_SUCCESS(s) ? TRUE : fail_nt(s);
 }

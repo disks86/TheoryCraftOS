@@ -1390,8 +1390,9 @@ void ObjectManager::free_job_locked(Object& o) {
   if (j.info.limit_flags & kJobLimitKillOnClose) job_flag_all_locked(j, 1);
   for (JobMember& m : j.members) {      // the members stay members of nothing; those flagged keep their flag (it is found by their process id)
     if (m.pid == 0) continue;
-    if (m.kill) { /* leave the entry so that the flagged process still finds it, until it ends */ continue; }
+    if (m.kill && !m.gone) { /* leave the entry so that the flagged process still finds it, until it ends */ continue; }
     m.pid = 0;
+    m.gone = 0;
   }
   bool keep = false;
   for (const JobMember& m : j.members) if (m.pid != 0) keep = true;
@@ -1400,19 +1401,28 @@ void ObjectManager::free_job_locked(Object& o) {
   o.job = -1;
 }
 
+void ObjectManager::job_event_locked(Job& j, uint32_t message, uint64_t pid) {
+  if (!j.port_set) return;
+  if (j.event_count == Job::kMaxEvents) { j.event_head = (j.event_head + 1) % Job::kMaxEvents; --j.event_count; }      // (the oldest is lost)
+  j.events[(j.event_head + j.event_count++) % Job::kMaxEvents] = JobEvent{message, pid};
+}
+
 uint32_t ObjectManager::job_assign(uint32_t job, uint64_t pid) {
   Locked hold(sync_);
   Job* j = job_of(job);
   if (!j) return kInvalidHandle;
   for (uint32_t k = 0; k < kJobMaxJobs; ++k) if (jobs_[k].used) for (const JobMember& m : jobs_[k].members) if (m.pid == pid) return kAccessDenied;
   if ((j->info.limit_flags & kJobLimitActiveProcess) && j->info.active_processes >= j->info.active_limit) return kQuotaExceeded;
-  for (JobMember& m : j->members) {
-    if (m.pid != 0) continue;
-    m.kill = 0; m.code = 0;
-    __atomic_store_n(&m.pid, pid, __ATOMIC_RELEASE);
-    ++j->info.active_processes;
-    ++j->info.total_processes;
-    return kSuccess;
+  for (int pass = 0; pass < 2; ++pass) {      // a free place, else one of a process that has ended
+    for (JobMember& m : j->members) {
+      if (pass == 0 ? m.pid != 0 : !m.gone) continue;
+      m.kill = 0; m.code = 0; m.gone = 0;
+      __atomic_store_n(&m.pid, pid, __ATOMIC_RELEASE);
+      ++j->info.active_processes;
+      ++j->info.total_processes;
+      job_event_locked(*j, 6, pid);      // JOB_OBJECT_MSG_NEW_PROCESS
+      return kSuccess;
+    }
   }
   return kQuotaExceeded;
 }
@@ -1439,12 +1449,13 @@ uint32_t ObjectManager::job_inherit(uint64_t parent, uint64_t child, bool breaka
       if (j.info.limit_flags & kJobLimitSilentBreakawayOk) return kSuccess;
       if ((j.info.limit_flags & kJobLimitActiveProcess) && j.info.active_processes >= j.info.active_limit) return kQuotaExceeded;
       for (JobMember& m : j.members) {
-        if (m.pid != 0) continue;
-        m.kill = 0; m.code = 0;
+        if (m.pid != 0 && !m.gone) continue;
+        m.kill = 0; m.code = 0; m.gone = 0;
         if (pm.kill) { m.code = pm.code; m.kill = 1; __atomic_add_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL); }      // (a child of a process being ended is ended too)
         __atomic_store_n(&m.pid, child, __ATOMIC_RELEASE);
         ++j.info.active_processes;
         ++j.info.total_processes;
+        job_event_locked(j, 6, child);      // JOB_OBJECT_MSG_NEW_PROCESS
         return kSuccess;
       }
       return kQuotaExceeded;
@@ -1459,17 +1470,16 @@ void ObjectManager::job_forget_locked(uint64_t pid) {
     Job& j = jobs_[k];
     if (!j.used) continue;
     for (JobMember& m : j.members) {
-      if (m.pid != pid) continue;
-      if (m.kill) {
-        __atomic_sub_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL);
-        ++j.info.terminated_processes;
-      }
+      if (m.pid != pid || m.gone) continue;
+      if (m.kill) __atomic_sub_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL);
       __atomic_store_n(&m.kill, 0u, __ATOMIC_RELEASE);
-      __atomic_store_n(&m.pid, uint64_t{0}, __ATOMIC_RELEASE);
+      m.gone = 1;      // (it stays in the job, as far as IsProcessInJob goes, until its place is wanted)
       if (j.info.active_processes > 0) --j.info.active_processes;
+      job_event_locked(j, 7, pid);      // JOB_OBJECT_MSG_EXIT_PROCESS
+      if (j.info.active_processes == 0) job_event_locked(j, 4, 0);      // JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO
       if (j.object == 0) {      // the job object is gone; this was one of the members still to end
         bool any = false;
-        for (const JobMember& other : j.members) if (other.pid != 0) any = true;
+        for (const JobMember& other : j.members) if (other.pid != 0 && !other.gone) any = true;
         if (!any) j.used = false;
       }
       return;
@@ -1496,7 +1506,7 @@ bool ObjectManager::job_info(uint32_t job, JobInfo* out, uint64_t* pids, uint32_
   if (!j) return false;
   *out = j->info;
   uint32_t n = 0;
-  for (const JobMember& m : j->members) if (m.pid != 0) { if (pids && n < capacity) pids[n] = m.pid; ++n; }
+  for (const JobMember& m : j->members) if (m.pid != 0 && !m.gone) { if (pids && n < capacity) pids[n] = m.pid; ++n; }
   if (pid_count) *pid_count = n;
   return true;
 }
@@ -1518,6 +1528,30 @@ uint32_t ObjectManager::job_set(uint32_t job, const JobInfo& in, bool extended) 
   d.limit_flags = in.limit_flags; d.active_limit = in.active_limit;
   if (extended) { d.process_memory_limit = in.process_memory_limit; d.job_memory_limit = in.job_memory_limit; }
   return kSuccess;
+}
+
+uint32_t ObjectManager::job_set_port(uint32_t job, uint64_t key, bool present) {
+  Locked hold(sync_);
+  Job* j = job_of(job);
+  if (!j) return kInvalidHandle;
+  if (!present) { j->port_set = false; j->event_head = j->event_count = 0; return kSuccess; }
+  if (j->port_set) return kInvalid;
+  j->port_set = true;
+  j->port_key = key;
+  j->event_head = j->event_count = 0;
+  for (const JobMember& m : j->members) if (m.pid != 0 && !m.gone) job_event_locked(*j, 6, m.pid);      // (the processes that are in the job already)
+  return kSuccess;
+}
+
+bool ObjectManager::job_take_event(uint32_t job, uint32_t* message, uint64_t* pid, uint64_t* key) {
+  Locked hold(sync_);
+  Job* j = job_of(job);
+  if (!j || !j->port_set || j->event_count == 0) return false;
+  const JobEvent& e = j->events[j->event_head];
+  *message = e.message; *pid = e.pid; *key = j->port_key;
+  j->event_head = (j->event_head + 1) % Job::kMaxEvents;
+  --j->event_count;
+  return true;
 }
 
 bool ObjectManager::job_kill_for(uint64_t pid, uint32_t* code) {

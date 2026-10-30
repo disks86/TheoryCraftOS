@@ -560,21 +560,29 @@ EXPORT void WINAPI GetStartupInfoW(LPSTARTUPINFOW info) {
     info->hStdError = pp->StandardError;
   }
 }
-/* The same with ANSI strings, converted once and kept. */
+/* The same with ANSI strings, converted once and kept: the first call makes it and later calls give the same answer whatever happens to the parameters. */
 EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
   static char title[260], desktop[260];
-  const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
-  STARTUPINFOW wide;
-  GetStartupInfoW(&wide);
-  memset(info, 0, sizeof(*info));
-  info->cb = sizeof(*info);
-  if (wide.lpTitle) { WideCharToMultiByte(CP_UTF8, 0, wide.lpTitle, -1, title, sizeof(title), NULL, NULL); info->lpTitle = title; }
-  if (wide.lpDesktop) { WideCharToMultiByte(CP_UTF8, 0, wide.lpDesktop, -1, desktop, sizeof(desktop), NULL, NULL); info->lpDesktop = desktop; }
-  info->dwX = wide.dwX; info->dwY = wide.dwY; info->dwXSize = wide.dwXSize; info->dwYSize = wide.dwYSize;
-  info->dwXCountChars = wide.dwXCountChars; info->dwYCountChars = wide.dwYCountChars; info->dwFillAttribute = wide.dwFillAttribute;
-  info->dwFlags = wide.dwFlags; info->wShowWindow = wide.wShowWindow;
-  if (pp->WindowFlags & 0x100) { info->hStdInput = pp->StandardInput; info->hStdOutput = pp->StandardOutput; info->hStdError = pp->StandardError; }
-  else info->hStdInput = info->hStdOutput = info->hStdError = INVALID_HANDLE_VALUE;
+  static STARTUPINFOA cached;
+  static volatile LONG state;      /* 0: not made, 1: being made, 2: made */
+  if (state != 2) {
+    if (__sync_bool_compare_and_swap(&state, 0, 1)) {
+      const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
+      STARTUPINFOW wide;
+      GetStartupInfoW(&wide);
+      memset(&cached, 0, sizeof(cached));
+      cached.cb = sizeof(cached);
+      if (wide.lpTitle) { WideCharToMultiByte(CP_UTF8, 0, wide.lpTitle, -1, title, sizeof(title), NULL, NULL); cached.lpTitle = title; }
+      if (wide.lpDesktop) { WideCharToMultiByte(CP_UTF8, 0, wide.lpDesktop, -1, desktop, sizeof(desktop), NULL, NULL); cached.lpDesktop = desktop; }
+      cached.dwX = wide.dwX; cached.dwY = wide.dwY; cached.dwXSize = wide.dwXSize; cached.dwYSize = wide.dwYSize;
+      cached.dwXCountChars = wide.dwXCountChars; cached.dwYCountChars = wide.dwYCountChars; cached.dwFillAttribute = wide.dwFillAttribute;
+      cached.dwFlags = wide.dwFlags; cached.wShowWindow = wide.wShowWindow;
+      if (pp->WindowFlags & 0x100) { cached.hStdInput = pp->StandardInput; cached.hStdOutput = pp->StandardOutput; cached.hStdError = pp->StandardError; }
+      else cached.hStdInput = cached.hStdOutput = cached.hStdError = INVALID_HANDLE_VALUE;
+      state = 2;
+    } else while (state != 2) NtYieldExecution();
+  }
+  memcpy(info, &cached, sizeof(cached));
 }
 
 EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }

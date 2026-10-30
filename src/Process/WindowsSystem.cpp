@@ -83,8 +83,17 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
       break;
     }
     case 5: {    // SYSTEM_PROCESS_INFORMATION for each program, one after the other: the entry (0x100 bytes), its threads (SYSTEM_THREAD_INFORMATION, 0x50 bytes each), the image name's characters
-      IProcessRuntime::ProcessEntry entries[32];
-      const uint32_t count = runtime ? runtime->list_processes(entries, 32) : 0;
+      IProcessRuntime::ProcessEntry entries[34];
+      uint32_t count = runtime ? runtime->list_processes(entries, 32) : 0;
+      {      // the processes of the system itself (session 0), which every list of Windows has
+        static const struct { uint64_t pid, parent; const char* name; } kSystemProcesses[2] = {{4, 0, "System"}, {0x1D4, 4, "services.exe"}};
+        for (const auto& sys : kSystemProcesses) {
+          IProcessRuntime::ProcessEntry& e = entries[count++];
+          e = IProcessRuntime::ProcessEntry();
+          e.pid = sys.pid; e.parent = sys.parent; e.session = 0;
+          for (uint32_t k = 0; sys.name[k] && k + 1 < sizeof e.name; ++k) e.name[k] = sys.name[k];
+        }
+      }
       for (uint32_t i = 1; i < count; ++i) {      // (in the order of their ids: a program just started comes after the ones that started it)
         IProcessRuntime::ProcessEntry moved = entries[i];
         uint32_t k = i;
@@ -114,6 +123,7 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
         put(0x48, 8, 4);                                            // BasePriority
         put(0x50, e.pid, 8);                                        // UniqueProcessId
         put(0x58, e.parent, 8);                                     // InheritedFromUniqueProcessId
+        put(0x64, e.session, 4);                                    // SessionId
         put(0x78, e.memory_bytes, 8);                               // VirtualSize
         put(0x90, e.memory_bytes, 8);                               // WorkingSetSize
         put(0xB8, e.memory_bytes, 8);                               // PagefileUsage
@@ -184,7 +194,7 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
 namespace {
 
 constexpr uint32_t kBufferTooSmall = 0xC0000023u, kInvalidParameter = 0xC000000Du, kInvalidHandleStatus = 0xC0000008u, kNoMemory = 0xC0000017u;
-constexpr uint32_t kSystemLogicalProcessorInformationEx = 107, kSystemCpuSetInformation = 175;
+constexpr uint32_t kSystemLogicalProcessorInformationEx = 107, kSystemCpuSetInformation = 175, kSystemSupportedProcessorArchitectures2 = 230;
 
 // Little-endian numbers appended to a byte buffer; a failed append is remembered.
 class Writer {
@@ -257,7 +267,7 @@ uint32_t nt_query_system_information_ex(Process& p, const SyscallRequest& r) {
   IProcessRuntime* runtime = p.runtime();
   const uint32_t processors = runtime ? runtime->processor_count() : 1;
   const uint32_t cores = processors > 255 ? 255 : processors;
-  if (info_class != kSystemLogicalProcessorInformationEx && info_class != kSystemCpuSetInformation) {
+  if (info_class != kSystemLogicalProcessorInformationEx && info_class != kSystemCpuSetInformation && info_class != kSystemSupportedProcessorArchitectures2) {
     SyscallRequest plain = r;      // the same question without an input
     plain.args[0] = info_class;
     plain.args[1] = r.args[3];
@@ -266,14 +276,23 @@ uint32_t nt_query_system_information_ex(Process& p, const SyscallRequest& r) {
     return nt_query_system_information(p, plain);
   }
   uint8_t input[8] = {};
-  const uint32_t wanted_input = info_class == kSystemCpuSetInformation ? 8 : 4;
+  const uint32_t wanted_input = info_class == kSystemLogicalProcessorInformationEx ? 4 : 8;
   if (input_length != wanted_input) return kInvalidParameter;
   if (!p.read_user(r.args[1], ByteView(input, wanted_input))) return kAccessViolation;
   uint64_t first = 0;
   for (uint32_t i = 0; i < wanted_input; ++i) first |= uint64_t{input[i]} << (8 * i);
   ByteBuffer answer(p.files().allocator());
   Writer w(answer);
-  if (info_class == kSystemCpuSetInformation) {
+  if (info_class == kSystemSupportedProcessorArchitectures2) {      // the machines of this system: x86-64 only, in kernel and user mode, for processes too
+    if (first != ~uint64_t{0} && !names_own_process(p, first)) {
+      bool exited = false;
+      uint32_t code = 0;
+      uint64_t pid = 0;
+      if (!process_handle_info(p, first, &exited, &code, &pid)) return kInvalidHandleStatus;
+    }
+    w.u32(0x8664u | (1u << 16) | (1u << 17) | (1u << 18) | (1u << 19));      // Machine, KernelMode, UserMode, Native, Process
+    w.u32(0);
+  } else if (info_class == kSystemCpuSetInformation) {
     if (first != ~uint64_t{0} && !names_own_process(p, first)) {
       bool exited = false;
       uint32_t code = 0;

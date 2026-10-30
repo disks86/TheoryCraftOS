@@ -215,6 +215,10 @@ class ObjectManager {
   bool job_info(uint32_t job, JobInfo* out, uint64_t* pids, uint32_t capacity, uint32_t* pid_count);
   uint32_t job_set(uint32_t job, const JobInfo& in, bool extended);       // NTSTATUS
   bool job_kill_for(uint64_t pid, uint32_t* code);                  // lock-free: has this process been flagged to end?
+  // A completion port (JobObjectAssociateCompletionPortInformation): the job keeps the JOB_OBJECT_MSG_* events (new process, exit, no process left) for whoever reads them
+  // from the port. NTSTATUS: invalid parameter if a port is associated already (and `present`). Associating queues a new-process event for each process in the job.
+  uint32_t job_set_port(uint32_t job, uint64_t key, bool present);
+  bool job_take_event(uint32_t job, uint32_t* message, uint64_t* pid, uint64_t* key);      // the oldest event; false if there is none
 
   // --- change notifications (kind ChangeNotification; FindFirstChangeNotification/ReadDirectoryChangesW): a handle that becomes signalled, exactly like a manual-reset
   // event, when something is created, deleted, renamed or linked directly under the directory it watches (or anywhere under it, if `watch_subtree`). Reset it
@@ -312,13 +316,20 @@ class ObjectManager {
   void write_section_locked(Section& s);
   Section* section_of_owner(const SharedMemory* owner);      // (locked)
   void free_section_locked(Object& o);
-  struct JobMember { uint64_t pid = 0; uint32_t kill = 0, code = 0; };
+  struct JobMember { uint64_t pid = 0; uint32_t kill = 0, code = 0, gone = 0; };      // (gone: the process has ended; it is still said to be in the job)
+  struct JobEvent { uint32_t message = 0; uint64_t pid = 0; };
   struct Job {
     bool used = false;
     uint32_t object = 0;
     JobInfo info;
     JobMember members[kJobMaxMembers];
+    bool port_set = false;      // a completion port is associated: the events below wait to be taken
+    uint64_t port_key = 0;
+    static constexpr uint32_t kMaxEvents = 32;
+    JobEvent events[kMaxEvents];
+    uint32_t event_head = 0, event_count = 0;
   };
+  void job_event_locked(Job& j, uint32_t message, uint64_t pid);
   void free_job_locked(Object& o);
   void job_forget_locked(uint64_t pid);
   Job* job_of(uint32_t id);      // (locked)

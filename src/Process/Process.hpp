@@ -155,7 +155,7 @@ class IProcessRuntime {
   // The core the calling thread runs on right now.
   virtual uint32_t current_processor() { return 0; }
   // The running programs (Toolhelp, EnumProcesses): returns how many entries it wrote.
-  struct ProcessEntry { uint64_t pid = 0, parent = 0; uint32_t threads = 0; char name[24] = {}; uint64_t memory_bytes = 0, create_time = 0; };
+  struct ProcessEntry { uint64_t pid = 0, parent = 0; uint32_t threads = 0; char name[24] = {}; uint64_t memory_bytes = 0, create_time = 0; uint32_t session = 1; };
   virtual uint32_t list_processes(ProcessEntry* out, uint32_t capacity) { (void)out; (void)capacity; return 0; }
   // Work on the memory and threads of another running program (by process id). The runtime takes that program's lock and gives up the caller's meanwhile; the work is done by
   // windowsabi::run_remote(). Returns an NTSTATUS.
