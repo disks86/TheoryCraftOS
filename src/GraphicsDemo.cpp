@@ -137,7 +137,12 @@ int groups_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
     const bool mexact = r.push_clip_mask(MaskView{ConstByteView(cov, sizeof cov), 16, 8, 16}, 40, 4);
     r.fill_rect({0, 0, 64, 48}, rgb(255, 255, 255));
     r.pop_clip();
-    bool ok = exact && mexact && r.read_pixels(px);
+    // the same clip again finds its mask made (and draws the same)
+    const uint64_t hits = r.clip_mask_hits();
+    const bool again = r.push_clip_rounded_rect({4, 4, 32, 32}, CornerRadii::uniform(14));
+    r.fill_rect({0, 0, 64, 48}, rgb(255, 255, 255));
+    r.pop_clip();
+    bool ok = exact && mexact && again && r.clip_mask_hits() == hits + 1 && r.read_pixels(px);
     if (ok) {
       auto chan = [&](uint32_t x, uint32_t y) { return static_cast<int>((px[y * W + x] >> 8) & 0xFF); };
       const int corner = chan(4, 4), middle = chan(20, 20), edge = chan(5, 12), outside = chan(2, 20);

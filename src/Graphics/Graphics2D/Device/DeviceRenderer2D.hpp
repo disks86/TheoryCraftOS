@@ -102,6 +102,10 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) override;
   void present() override;
 
+  // How many clip masks were found already made (and how many had to be made) since this renderer began: the masks of rounded and mask clips are kept between frames.
+  uint64_t clip_mask_hits() const { return mask_hits_; }
+  uint64_t clip_mask_misses() const { return mask_misses_; }
+
   // The color to draw for a pixel with `cov` (0..255) coverage; false: draw nothing (used by the rounded-rect helpers).
   bool coverage_color(uint32_t color, uint32_t cov, uint32_t* out) const;
 
@@ -210,6 +214,7 @@ class DeviceRenderer2D final : public IRenderer2D {
     float opacity = 1.0f;          // the renderer's per-shape opacity outside the group
     bool layer = false;            // from push_layer: its opacity is applied when it ends
     uint8_t layer_opacity = 255;
+    int32_t mask_slot = -1;        // the mask is entry n of the mask cache (which owns it), or -1: the group owns it
     IImage* mask = nullptr;        // a clip by a coverage mask: the picture is laid over the parent through it when the clip is popped
     bool detached = false;         // a filter group: its clip is its bounds alone
     uint32_t prev_detach = 0xFFFFFFFFu;      // detach_index_ outside it
@@ -222,6 +227,18 @@ class DeviceRenderer2D final : public IRenderer2D {
   Group groups_[kMaxGroups];
   uint32_t group_depth_ = 0;
   bool groups_ok_ = false;
+  // The coverage masks of exact clips, kept (least recently used first to go) so that the same clip drawn again does not build and upload its mask again.
+  static constexpr uint32_t kMaskCacheEntries = 24;
+  static constexpr uint64_t kMaskCachePixels = uint64_t{1} << 23;   // what the cache may hold in all
+  struct MaskEntry {
+    uint64_t key = 0, used = 0;
+    uint32_t width = 0, height = 0, in_use = 0;   // in_use: open groups that draw through it
+    IImage* image = nullptr;
+  };
+  MaskEntry mask_cache_[kMaskCacheEntries];
+  uint64_t mask_clock_ = 0, mask_cache_pixels_ = 0, mask_hits_ = 0, mask_misses_ = 0;
+  int32_t find_mask(uint64_t key, uint32_t w, uint32_t h);
+  int32_t keep_mask(uint64_t key, IImage* image, uint32_t w, uint32_t h);   // a slot for a new mask (evicting the oldest unused), or -1
   IShaderModule* masked_fs_ = nullptr;
   IPipeline* masked_ = nullptr;
   bool masks_ok_ = false;
