@@ -42,6 +42,7 @@ constexpr uint8_t kVectorYield = 0x41;     // software interrupt: give up the co
 constexpr uint8_t kVectorWakeup = 0x42;    // inter-processor interrupt: look for work
 constexpr uint8_t kVectorVirtioGpu = 0x50; // MSI-X: the virtio-gpu's command completions
 constexpr uint8_t kVectorAmdVegaM = 0x51;  // MSI: the Radeon RX Vega M's interrupt ring has vectors
+constexpr uint8_t kVectorThunderbolt = 0x52; // MSI: the Thunderbolt host interface's control channel rings
 constexpr uint8_t kVectorSpurious = 0xFF;
 constexpr uint64_t kRflagsInterrupts = 1u << 9;
 #elif defined(__aarch64__)

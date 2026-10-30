@@ -722,6 +722,7 @@ struct Entry {
   const char* name;
   Scene run;
   bool edges_vary = false;   // lines and points: which pixels a line covers is up to the rasterizer, so a pixel may also match any of its neighbours
+  uint32_t allowed_bad = kAllowedBad;   // pixels that may differ (a scene that is nothing but the placement of points is held to less)
 };
 
 // Two render targets (SV_Target0 / SV_Target1 of ps_mrt.dxbc): the first holds the vertex colour, the second the same with red and blue swapped. The picture compared is
@@ -981,6 +982,45 @@ void scene_texture_cube(Rig& rig, ArrayView<uint32_t> out) {
   sample_layered(rig, out, b::k_ps_texcube, sizeof b::k_ps_texcube, texture, v, 6);
 }
 
+// The same textures read with Load, SampleLevel and GetDimensions (ps_texel3d / ps_texelarray / ps_texelcube): the picture is the texel loaded, the texel sampled and the size.
+void scene_texel_3d(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture3D, 4, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF0000u : layer == 1 ? 0x00FF00u : layer == 2 ? 0x0000FFu : 0xFFFF00u; });
+  Vertex v[12];
+  quad_pixels(v, 0, 0, 32, 16, [](float u, float vv) { return graphics::Vec3{u * 0.97f + 0.01f, vv * 0.97f + 0.01f, 0.6f}; });
+  quad_pixels(v + 6, 0, 16, 32, 32, [](float u, float vv) { return graphics::Vec3{u * 0.97f + 0.01f, 0.3f, vv * 0.97f + 0.01f}; });
+  sample_layered(rig, out, b::k_ps_texel3d, sizeof b::k_ps_texel3d, texture, v, 2);
+}
+
+void scene_texel_array(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture2DArray, 3, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF8000u : layer == 1 ? 0x00FF80u : 0x8000FFu; });
+  Vertex v[18];
+  for (uint32_t i = 0; i < 3; ++i)
+    quad_pixels(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 32, [i](float u, float vv) { return graphics::Vec3{u * 0.97f + 0.01f, vv * 0.97f + 0.01f, static_cast<float>(i)}; });
+  sample_layered(rig, out, b::k_ps_texelarray, sizeof b::k_ps_texelarray, texture, v, 3);
+}
+
+void scene_texel_cube(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::TextureCube, 6, [](uint32_t face) -> uint32_t {
+    static const uint32_t kColours[6] = {0xFF0000u, 0x00FFFFu, 0x00FF00u, 0xFF00FFu, 0x0000FFu, 0xFFFF00u};
+    return kColours[face];
+  });
+  Vertex v[36];
+  for (uint32_t face = 0; face < 6; ++face) {
+    const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(face / 3 * 16);
+    quad_pixels(v + 6 * face, x0, y0, x0 + 10, y0 + 16, [face](float u, float vv) {
+      const float a = -0.8f + 1.6f * u, c = -0.8f + 1.6f * vv, axis = face % 2 ? -1.0f : 1.0f;
+      return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+    });
+  }
+  sample_layered(rig, out, b::k_ps_texelcube, sizeof b::k_ps_texelcube, texture, v, 6);
+}
+
 // A compute shader (cs_fill.hlsl): 4 x 8 groups of 8 x 4 threads, each writing a pixel of a 32 x 32 picture into a structured buffer from its SV_DispatchThreadID, SV_GroupID and
 // SV_GroupIndex, a structured buffer of uint4 it writes and reads back, a constant from the constant buffer, and two atomic counters that must end at 1024. The picture is the buffer.
 void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
@@ -1195,34 +1235,103 @@ void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
-// Tessellation (hs_tri / ds_dent): a patch of three control points is cut into the 4 x 4 lattice of the triangle domain (all factors 4, integer partitioning), and the domain shader pulls
-// each point toward the centre by how far it is from the edges, so the picture is a dented triangle that shows the lattice (a plain triangle if the tessellator did nothing).
-void scene_tessellation(Rig& rig, ArrayView<uint32_t> out) {
+// Tessellation: a few patches drawn into one picture, each in its own cell (a single one fills the picture), with the tessellation factors in the constants after the matrix. The domain shaders move every point by an amount of its own, so a point that is not where the tessellator should put it, or a
+// triangle that joins other points, shows in the picture.
+struct TessBlob {
+  const uint8_t* code;
+  uint32_t size;
+};
+struct TessCase {
+  TessBlob hull, domain;
+  uint32_t points;           // control points of a patch: 3 (triangle), 4 (quad), 2 (isoline)
+  float f0[4], f1[4];        // the constants after the matrix: the hull shaders read their factors there (a triangle's inside factor is the fourth of the first)
+  graphics::CullMode cull;
+};
+#define TESS_BLOB(name) TessBlob{conformance_blobs::k_##name, sizeof conformance_blobs::k_##name}
+
+void tess_scene(Rig& rig, ArrayView<uint32_t> out, const TessCase* cases, uint32_t count) {
   if (!rig.has(graphics::kFeatureTessellation)) return void(rig.step("tessellation", status::kNotSupported));
   namespace b = conformance_blobs;
-  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
   Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
-  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_hs_tri, sizeof b::k_hs_tri));
-  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_ds_dent, sizeof b::k_ds_dent));
   Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
-  PipelineDesc pd = colour_pipeline_desc(vs, ps);
-  pd.varying_count = 3;
-  pd.hull_shader = hs;
-  pd.domain_shader = ds;
-  Handle pipe = rig.pipeline(pd);
   Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
-  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  if (count == 0 || count > 4) return void(rig.step("tessellation (cases)", status::kInvalidParameter));
+  // The patches: the control points in the corners of a cell (red, green, blue, yellow).
+  Vertex v[4 * 4];
+  for (uint32_t i = 0; i < count; ++i) {
+    const float h = count == 1 ? 0.85f : 0.42f;
+    const float cx = count == 1 ? 0.0f : (i & 1 ? 0.5f : -0.5f), cy = count == 1 ? 0.0f : (i & 2 ? 0.5f : -0.5f);
+    Vertex* p = v + i * 4;
+    const uint32_t n = cases[i].points;
+    if (n == 3) {
+      p[0] = {cx - h, cy - h, 0.5f, 1, 0, 0, 1}, p[1] = {cx + h, cy - h, 0.5f, 0, 1, 0, 1}, p[2] = {cx, cy + h, 0.5f, 0, 0, 1, 1};
+    } else if (n == 4) {
+      p[0] = {cx - h, cy - h, 0.5f, 1, 0, 0, 1}, p[1] = {cx + h, cy - h, 0.5f, 0, 1, 0, 1}, p[2] = {cx - h, cy + h, 0.5f, 0, 0, 1, 1}, p[3] = {cx + h, cy + h, 0.5f, 1, 1, 0, 1};
+    } else {
+      p[0] = {cx - h, cy, 0.5f, 1, 0, 0, 1}, p[1] = {cx + h, cy, 0.5f, 0, 1, 0, 1};
+    }
+  }
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof(Vertex) * 4 * count));
   CommandWriter w(rig.allocator());
   begin(w, 0, kNoAllocation, {0, 0, 0, 1});
-  w.bind_pipeline(pipe);
-  w.bind_vertex_buffer(1);
-  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
-  w.set_topology(patch_list(3));
-  w.draw(3);
+  for (uint32_t i = 0; i < count; ++i) {
+    const TessCase& c = cases[i];
+    Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(c.hull.code, c.hull.size));
+    Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(c.domain.code, c.domain.size));
+    PipelineDesc pd = colour_pipeline_desc(vs, ps);
+    pd.varying_count = 3;
+    pd.hull_shader = hs;
+    pd.domain_shader = ds;
+    pd.cull_mode = c.cull;
+    Handle pipe = rig.pipeline(pd);
+    float constants[24];
+    for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+    for (uint32_t k = 0; k < 4; ++k) constants[16 + k] = c.f0[k], constants[20 + k] = c.f1[k];
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(bytes_of(constants, sizeof constants));
+    w.set_topology(patch_list(c.points));
+    w.draw(c.points, i * 4);
+  }
   w.end_pass();
   rig.render(w, {target, vb});
   rig.read(target, out);
 }
+
+#define TESS_SCENE(name, ...)                                         \
+  void name(Rig& rig, ArrayView<uint32_t> out) {                      \
+    static constexpr TessCase cases[] = {__VA_ARGS__};                \
+    tess_scene(rig, out, cases, sizeof cases / sizeof cases[0]);      \
+  }
+constexpr auto kNoCull = graphics::CullMode::None;
+
+// Triangles of different factors (odd and even, edges that differ, an inside factor of 1), every one cut in rings of its own.
+TESS_SCENE(scene_tess_triangle,
+           {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {4, 4, 4, 4}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {3, 6, 2, 4}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {1, 7, 4, 1}, {0, 0, 0, 0}, kNoCull})
+// Quads: even and odd rings, edges that differ from the inside, and a strip of quads left in the middle.
+TESS_SCENE(scene_tess_quad,
+           {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {4, 4, 4, 4}, {4, 4, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {5, 5, 5, 5}, {5, 5, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {2, 3, 5, 8}, {4, 3, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {3, 3, 3, 3}, {7, 3, 0, 0}, kNoCull})
+// Isolines drawn as lines and as points, and the points of a triangle and of a quad.
+TESS_SCENE(scene_tess_lines_points,
+           {TESS_BLOB(hs_iso_cb), TESS_BLOB(ds_iso), 2, {4, 6, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_iso_point_cb), TESS_BLOB(ds_iso), 2, {3, 5, 0, 0}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_tri_point_cb), TESS_BLOB(ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_point_cb), TESS_BLOB(ds_quad), 4, {4, 4, 4, 4}, {3, 3, 0, 0}, kNoCull})
+// Which way the triangles wind: with back faces culled, the clockwise output of a triangle patch and of a quad patch is drawn or not as the counter-clockwise output is not or is.
+TESS_SCENE(scene_tess_winding,
+           {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {3, 3, 3, 3}, {0, 0, 0, 0}, graphics::CullMode::Back}, {TESS_BLOB(hs_tri_ccw_cb), TESS_BLOB(ds_noise), 3, {3, 3, 3, 3}, {0, 0, 0, 0}, graphics::CullMode::Back},
+           {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {3, 3, 3, 3}, {3, 3, 0, 0}, graphics::CullMode::Back}, {TESS_BLOB(hs_quad_ccw_cb), TESS_BLOB(ds_quad), 4, {3, 3, 3, 3}, {3, 3, 0, 0}, graphics::CullMode::Back})
+// Power-of-two partitioning: factors that are rounded up to 4, 8, 2 and 4.
+TESS_SCENE(scene_tess_pow2,
+           {TESS_BLOB(hs_tri_pow2_cb), TESS_BLOB(ds_noise), 3, {3, 5, 2, 3}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_pow2_cb), TESS_BLOB(ds_noise), 3, {6, 6, 6, 6}, {0, 0, 0, 0}, kNoCull})
+
+// Fractional partitioning: the factors are not whole numbers; the points of an edge are placed between those of the whole factors on either side of it.
+TESS_SCENE(scene_tess_fractional_odd,
+           {TESS_BLOB(hs_tri_odd_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_odd_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_iso_odd_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_odd_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
+TESS_SCENE(scene_tess_fractional_even,
+           {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_even_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_iso_even_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
 
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
@@ -1253,7 +1362,13 @@ const Entry kScenes[] = {
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
-    {"Direct3D 11 tessellation, hull and domain shaders (DXBC)", scene_tessellation},
+    {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
+    {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
+    {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},
+    {"Direct3D 11 tessellation, winding (DXBC)", scene_tess_winding},
+    {"Direct3D 11 tessellation, power-of-two partitioning (DXBC)", scene_tess_pow2, false, 6},
+    {"Direct3D 11 tessellation, fractional odd partitioning (DXBC)", scene_tess_fractional_odd, true},
+    {"Direct3D 11 tessellation, fractional even partitioning (DXBC)", scene_tess_fractional_even, true},
     {"Direct3D 10 sRGB render target and texture", scene_srgb},
     {"Direct3D 10 16-bit normalised render target and texture", scene_unorm16},
     {"Direct3D 10 integer render target and Load (DXBC)", scene_integer},
@@ -1266,6 +1381,9 @@ const Entry kScenes[] = {
     {"Direct3D 10 volume texture (DXBC)", scene_texture_3d},
     {"Direct3D 10 texture array (DXBC)", scene_texture_array},
     {"Direct3D 10 cube texture (DXBC)", scene_texture_cube},
+    {"Direct3D 10 Load, SampleLevel, GetDimensions of a 3D image (DXBC)", scene_texel_3d},
+    {"Direct3D 10 Load, SampleLevel, GetDimensions of an image array (DXBC)", scene_texel_array},
+    {"Direct3D 10 SampleLevel, GetDimensions of a cube map (DXBC)", scene_texel_cube},
 };
 
 bool channels_close(uint32_t a, uint32_t b) {
@@ -1328,7 +1446,7 @@ uint32_t run_conformance(allocators::IAllocator& allocator, Kernel& kernel, uint
         for (uint64_t i = 0; i < kPixels && result.verdict == SceneVerdict::Same; ++i)
           if (!pixel_matches(device_pixels, reference_pixels, i, scene.edges_vary) && result.bad_pixels++ == 0)
             result.first_bad = static_cast<uint32_t>(i), result.device_value = device_pixels[i], result.reference_value = reference_pixels[i];
-        if (result.bad_pixels > kAllowedBad) result.verdict = SceneVerdict::Differs, ++bad;
+        if (result.bad_pixels > scene.allowed_bad) result.verdict = SceneVerdict::Differs, ++bad;
       }
       result.device_picture = device_pixels.data(), result.reference_picture = reference_pixels.data();
       if (report) report(context, result);

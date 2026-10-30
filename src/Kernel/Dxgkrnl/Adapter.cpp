@@ -907,6 +907,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       shader->geometry_input_ = program->geometry_input();
       shader->tess_input_points_ = program->tess_input_points();
       shader->tess_output_points_ = program->tess_output_points();
+      shader->tess_domain_ = program->tess_domain();
       for (uint32_t u = 0; u < graphics::kMaxStorageBuffers; ++u)
         if (program->storage_kind(u) != D3d9Program::BufferKind::None) shader->storage_mask_ |= 1u << u;
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
@@ -966,7 +967,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (d.independent_blend && !(caps_.features & graphics::kFeatureIndependentBlend)) return status::kNotSupported;
   if (d.multisample && !(caps_.features & graphics::kFeatureMultisample)) return status::kNotSupported;
   if (hull || domain) {
-    if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points()) return status::kInvalidParameter;
+    if (!hull || !domain || hull->stage() != graphics::ShaderStage::Hull || domain->stage() != graphics::ShaderStage::Domain || hull->tess_output_points() != domain->tess_input_points() || hull->tess_domain() != domain->tess_domain()) return status::kInvalidParameter;
     if (!(caps_.features & graphics::kFeatureTessellation)) return status::kNotSupported;
     if (geometry) return status::kNotSupported;   // (a geometry shader after the tessellator is not made)
   }
