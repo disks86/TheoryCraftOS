@@ -18,6 +18,7 @@
 /* Unicode normalization (forms C, D, KC and KD) of ntdll.dll (included by ntdll.c): RtlNormalizeString and RtlIsNormalizedString, over the tables of unidata.inc. */
 
 #include "unidata.inc"
+#include "idn_data.inc"
 
 #define NORM_C 1u
 #define NORM_D 2u
@@ -166,12 +167,42 @@ static SIZE_T norm_utf16_length(const NormList *l) {
   return n;
 }
 
+/* The first step of nameprep (the IDN form): characters that map to nothing go, the others are case folded. The text is refused when it holds a NUL that is not the last
+ * character or one of the bidirectional isolates Windows does not allow. */
+static NTSTATUS norm_idn_map(NormList *cps, SIZE_T *bad) {
+  NormList mapped = {0};
+  for (SIZE_T i = 0; i < cps->count; ++i) {
+    const DWORD cp = cps->items[i];
+    if ((cp == 0 && i + 1 != cps->count) || (cp >= 0x2066 && cp <= 0x2069)) { *bad = i; norm_free(&mapped); return NORM_NO_UNICODE_TRANSLATION; }
+    BOOL ignored = FALSE;
+    for (SIZE_T k = 0; k < sizeof(uni_idn_ignored) / sizeof(uni_idn_ignored[0]); ++k) if (cp >= uni_idn_ignored[k].first && cp <= uni_idn_ignored[k].last) { ignored = TRUE; break; }
+    if (ignored) continue;
+    SIZE_T lo = 0, hi = sizeof(uni_idn_fold) / sizeof(uni_idn_fold[0]);
+    BOOL folded = FALSE;
+    while (lo < hi) {
+      const SIZE_T mid = lo + (hi - lo) / 2;
+      if (uni_idn_fold[mid].cp < cp) lo = mid + 1;
+      else if (uni_idn_fold[mid].cp > cp) hi = mid;
+      else { for (BYTE k = 0; k < uni_idn_fold[mid].length; ++k) norm_push(&mapped, uni_idn_fold_pool[uni_idn_fold[mid].offset + k]); folded = TRUE; break; }
+    }
+    if (!folded) norm_push(&mapped, cp);
+  }
+  norm_free(cps);
+  *cps = mapped;
+  return mapped.failed ? STATUS_NO_MEMORY : STATUS_SUCCESS;
+}
+
 /* Normalizes into a list of code points. */
 static NTSTATUS norm_run(ULONG form, const WCHAR *src, SIZE_T length, NormList *out, SIZE_T *bad) {
   NormList decoded = {0};
+  if (!norm_decode(src, length, &decoded, bad)) { norm_free(&decoded); return NORM_NO_UNICODE_TRANSLATION; }
+  if (form == NORM_IDN) {
+    const NTSTATUS mapped = norm_idn_map(&decoded, bad);
+    if (mapped != STATUS_SUCCESS) { norm_free(&decoded); return mapped; }
+    form = NORM_KC;
+  }
   const BOOL compat = form == NORM_KC || form == NORM_KD;
   const BOOL compose = form == NORM_C || form == NORM_KC;
-  if (!norm_decode(src, length, &decoded, bad)) { norm_free(&decoded); return NORM_NO_UNICODE_TRANSLATION; }
   for (SIZE_T i = 0; i < decoded.count; ++i) norm_decompose(out, decoded.items[i], compat);
   norm_free(&decoded);
   if (out->failed) return STATUS_NO_MEMORY;
