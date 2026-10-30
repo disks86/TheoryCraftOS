@@ -121,6 +121,7 @@ class FakeNhi final : public hardware::ITbRegisters {
   std::vector<std::vector<uint32_t>> xdp_requests;   // what the host sent, as words
   std::vector<std::vector<uint32_t>> xdp_responses;  // what the host answered to the remote's requests
   bool titan_ridge = false;                  // the Titan Ridge forms of the messages
+  bool rtd3 = false;                         // DRIVER_READY says the firmware supports runtime power management
   bool answer_get_route = true;
   // secure connect: the keys the devices hold (by the first word of the UUID), and how they misbehave
   std::map<uint32_t, std::vector<uint8_t>> device_keys;
@@ -517,8 +518,9 @@ private:
     requests_seen.push_back(code);
     if (code == 3) {
       if (!answer_driver_ready) return;
-      if (titan_ridge) reply(kIcmResponse, {3u | (1u << 24), (security & 0x7u) << 16, 0x00100002u, 0x15EBu});
-      else reply(kIcmResponse, {3u | (1u << 24), 5u | (7u << 8) | ((security & 0xFu) << 16)});
+      const uint32_t hdr = 3u | ((rtd3 ? 0x40u : 0u) << 8) | (1u << 24);
+      if (titan_ridge) reply(kIcmResponse, {hdr, (security & 0x7u) << 16, 0x00100002u, 0x15EBu});
+      else reply(kIcmResponse, {hdr, 5u | (7u << 8) | ((security & 0xFu) << 16)});
     } else if (code == 4 && w.size() >= (titan_ridge ? 8u : 6u)) {
       Device d;
       memcpy(d.uuid, &w[1], 16);
@@ -657,6 +659,8 @@ class FakePci final : public hardware::IPciBus {
     hardware::PciDeviceInfo info;
     uint8_t header_type = 1, secondary = 0, subordinate = 0;
     int pcie_type = -1;                  // -1: no PCI Express capability
+    bool pm = false, pme_from_d3hot = true;     // a power management capability at 0x70
+    mutable uint32_t pmcsr = 0;
   };
   std::vector<Function> functions;
   const char* name() const override { return "fake pci"; }
@@ -678,13 +682,23 @@ class FakePci final : public hardware::IPciBus {
     if (offset == 0x0C) return uint32_t(f->header_type) << 16;
     if (offset == 0x18) return uint32_t(f->secondary) << 8 | uint32_t(f->subordinate) << 16;
     if (offset == 0x80 && f->pcie_type >= 0) return 0x10 | (uint32_t(f->pcie_type) << 20);
+    if (f->pm && offset == 0x70) return 0x01 | (3u << 16) | (f->pme_from_d3hot ? (1u << 30) : 0);
+    if (f->pm && offset == 0x74) return f->pmcsr;
     return 0;
   }
-  void write32(hardware::PciAddress, uint16_t, uint32_t) const override {}
+  void write32(hardware::PciAddress a, uint16_t offset, uint32_t value) const override {
+    const Function* f = find(a);
+    if (!f || !f->pm || offset != 0x74) return;
+    // the state and the PME enable are written; the status bit clears when a one is written
+    f->pmcsr = (value & 0x103) | (f->pmcsr & 0x8000 & ~value);
+  }
+  void set_wake_pending(hardware::PciAddress a) const { const Function* f = find(a); if (f) f->pmcsr |= 0x8000; }
   uint64_t memory_bar(hardware::PciAddress, uint8_t) const override { return 0; }
   uint16_t find_capability(hardware::PciAddress a, uint8_t id) const override {
     const Function* f = find(a);
-    return (f && id == 0x10 && f->pcie_type >= 0) ? 0x80 : 0;
+    if (f && id == 0x10 && f->pcie_type >= 0) return 0x80;
+    if (f && id == 0x01 && f->pm) return 0x70;
+    return 0;
   }
 };
 
