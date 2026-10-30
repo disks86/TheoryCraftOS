@@ -229,7 +229,15 @@ class Adapter::StreamRunner {
     uint32_t kind = 0;
     if (!p.at_end()) kind = p.le32();
     if (!exact(p) || !in_pass_ || query_open_ || !(adapter_.caps_.features & graphics::kFeatureOcclusionQueries)) return kBad;
-    if (kind > static_cast<uint32_t>(graphics::QueryKind::PsInvocations) || (kind != 0 && !(adapter_.caps_.features & graphics::kFeatureStatisticsQueries))) return kBad;
+    // (the kind in the low byte, the output stream of a stream output query above it)
+    const uint32_t stream = kind >> 8;
+    kind &= 0xFF;
+    const uint32_t features = adapter_.caps_.features;
+    const bool so_kind = kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten) || kind == static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded);
+    if (kind > static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded) || stream >= (so_kind ? graphics::kMaxGeometryStreams : 1u)) return kBad;
+    if (kind == static_cast<uint32_t>(graphics::QueryKind::Timestamp) ? !(features & graphics::kFeatureTimestampQueries)
+        : so_kind ? (features & (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)) != (graphics::kFeatureStatisticsQueries | graphics::kFeatureStreamOutput)
+        : (kind != 0 && !(features & graphics::kFeatureStatisticsQueries))) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_query_result() || offset % 8 || offset > a->desc().size - 8) return kBad;
     if (queries_in_stream_ >= graphics::kMaxOcclusionQueries) return kBad;
@@ -239,7 +247,7 @@ class Adapter::StreamRunner {
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
     if (!pending_.push_back({a, offset, next_slot_})) return status::kNoMemory;
-    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind));
+    cb_->begin_query(next_slot_++, static_cast<graphics::QueryKind>(kind), stream);
     return status::kSuccess;
   }
 
@@ -394,14 +402,15 @@ class Adapter::StreamRunner {
       return status::kSuccess;
     }
     Allocation* a = alloc(index);
-    if (!a || !(a->desc().flags & kAllocStreamOutput) || offset % 4 || offset > a->desc().size) return kBad;
+    const bool append = offset == kStreamOutputAppendOffset;
+    if (!a || !(a->desc().flags & kAllocStreamOutput) || (!append && (offset % 4 || offset > a->desc().size))) return kBad;
     so_bound_[slot] = true;
     so_alloc_[slot] = a;
     if (!exec_) return status::kSuccess;
     NtStatus s = resident(*a);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->bind_stream_output(slot, a->buffer(), offset);
+    cb_->bind_stream_output(slot, a->buffer(), append ? graphics::kStreamOutputAppend : offset);
     return status::kSuccess;
   }
 
@@ -1028,15 +1037,16 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
     if (geometry) return status::kNotSupported;   // (a geometry shader after the tessellator is not made)
   }
   if (d.stream_output_count) {
-    // (stream output needs a geometry shader that has the streams the entries name, outputs and components that exist, and a buffer takes only one stream; each buffer's record is as long as
-    // its entries need, in whole words)
+    // (stream output takes the outputs of the geometry shader, or the domain shader, or the vertex shader; the entries name streams the geometry shader has (the others have one), outputs and
+    // components that exist, and a buffer takes only one stream; each buffer's record is as long as its entries need, in whole words)
     if (!(caps_.features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
-    if (!geometry || d.stream_output_count > graphics::kMaxStreamOutputEntries || d.rasterized_stream < -1 || d.rasterized_stream >= static_cast<int32_t>(graphics::kMaxGeometryStreams)) return status::kInvalidParameter;
+    if (d.stream_output_count > graphics::kMaxStreamOutputEntries || d.rasterized_stream < -1 || d.rasterized_stream >= static_cast<int32_t>(graphics::kMaxGeometryStreams) || (!geometry && d.rasterized_stream > 0)) return status::kInvalidParameter;
+    const uint32_t stream_count = geometry ? geometry->geometry_streams() : 1;
     int32_t stream_of_buffer[graphics::kMaxStreamOutputBuffers] = {-1, -1, -1, -1};
     uint32_t bytes[graphics::kMaxStreamOutputBuffers] = {};
     for (uint32_t e = 0; e < d.stream_output_count; ++e) {
       const graphics::StreamOutputEntry& entry = d.stream_output[e];
-      if (entry.stream >= geometry->geometry_streams() || entry.output > graphics::kMaxVaryings || entry.component_count == 0 || entry.start_component + entry.component_count > 4 || entry.buffer >= graphics::kMaxStreamOutputBuffers)
+      if (entry.stream >= stream_count || entry.output > graphics::kMaxVaryings || entry.component_count == 0 || entry.start_component + entry.component_count > 4 || entry.buffer >= graphics::kMaxStreamOutputBuffers)
         return status::kInvalidParameter;
       if (stream_of_buffer[entry.buffer] >= 0 && stream_of_buffer[entry.buffer] != entry.stream) return status::kInvalidParameter;
       stream_of_buffer[entry.buffer] = entry.stream;

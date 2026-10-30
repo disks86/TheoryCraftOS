@@ -79,6 +79,7 @@ class Allocation {
   ByteView cpu_;
   graphics::IImage* image_ = nullptr;
   graphics::IBuffer* buffer_ = nullptr;
+  uint64_t so_filled_ = 0;   // a stream output buffer: how far the last stream output into it got (kept while the device object is gone)
   uint64_t device_bytes_ = 0;    // what residency costs
   bool device_stale_ = true;     // the device object (if any) lacks the backing's current contents
   bool cpu_written_ = false;     // something other than the GPU wrote the backing since creation (a device that cannot take pixels may skip the upload of an allocation nobody wrote)
