@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <type_traits>
 #include "Kernel/Interrupts.hpp"
+#include "Kernel/Thread.hpp"
 
 // Read-copy-update, shaped after C++26 <rcu> (P2545): readers run inside a read-side critical section and
 // never block or write shared data; a writer publishes a new version of an object, retires the old one, and
@@ -42,6 +43,9 @@
 //    RcuObjectBase. The deleter is stored in the object, so it is copied at retire time.
 //  - The kernel has no thread-local storage, so lock() hands back the counter it joined and unlock() needs it back.
 //    RcuReader keeps it; use that unless you must split lock and unlock.
+//  - Reader counters are sharded by core (kernel::current_core(), one load from the core's GS-relative record), so
+//    readers on different cores touch different cache lines. A reader that migrates to another core inside its section
+//    is fine: the token names the shard it joined, and unlock() leaves that one.
 //
 // Kernel properties:
 //  - A read-side section is two atomic increments/decrements: no lock, no interrupt masking, no allocation.
@@ -54,9 +58,9 @@
 //  - rcu_synchronize() and rcu_barrier() wait (spin) in the caller: thread context only, and never inside a
 //    read-side section or a deleter (the grace period would wait for the caller itself).
 //
-// How the grace period works: two reader counters, selected by the parity of a domain epoch. A reader joins the
-// counter of the current parity (re-checking the epoch so it cannot join one a writer has already left). A grace
-// period flips the epoch and waits for the counter of the old parity to reach zero, then does that a second time
+// How the grace period works: per core shard, two reader counters, selected by the parity of a domain epoch. A reader
+// joins the counter of its core's shard and the current parity (re-checking the epoch so it cannot join one a writer has
+// already left). A grace period flips the epoch and waits for the counters of the old parity, in every shard, to reach zero, then does that a second time
 // so that readers on either counter are covered (a single flip would miss a reader that started two flips ago and
 // has been running ever since). Readers that start after a flip began after the retired objects were unlinked and
 // are not waited for. Objects retired during a grace period go into the next one.
@@ -84,18 +88,22 @@ class RcuDomain {
   // (Trivial destructor, so a global domain needs no atexit registration in the freestanding kernel: call barrier()
   // before a domain that is not global goes away, or whatever is still retired never runs.)
 
-  // Enters a read-side section; the returned token goes to unlock().
+  // Reader counters per parity; cores beyond this share (core % kShards), which only costs some cache line sharing.
+  static constexpr uint32_t kShards = 16;
+
+  // Enters a read-side section; the returned token (shard and parity) goes to unlock().
   uint32_t lock() {
+    const uint32_t shard = current_core() % kShards;
     for (;;) {
       const uint32_t parity = __atomic_load_n(&epoch_, __ATOMIC_SEQ_CST) & 1;
-      __atomic_fetch_add(&counters_[parity].readers, 1, __ATOMIC_SEQ_CST);
+      __atomic_fetch_add(&counters_[shard][parity].readers, 1, __ATOMIC_SEQ_CST);
       // Sequentially consistent against the flip in poll(): either the flip comes after this increment (and the
       // writer waits for it), or the epoch has moved on, we undo and join the new counter.
-      if ((__atomic_load_n(&epoch_, __ATOMIC_SEQ_CST) & 1) == parity) return parity;
-      __atomic_fetch_sub(&counters_[parity].readers, 1, __ATOMIC_RELEASE);
+      if ((__atomic_load_n(&epoch_, __ATOMIC_SEQ_CST) & 1) == parity) return shard * 2 + parity;
+      __atomic_fetch_sub(&counters_[shard][parity].readers, 1, __ATOMIC_RELEASE);
     }
   }
-  void unlock(uint32_t token) { __atomic_fetch_sub(&counters_[token & 1].readers, 1, __ATOMIC_RELEASE); }
+  void unlock(uint32_t token) { __atomic_fetch_sub(&counters_[(token >> 1) % kShards][token & 1].readers, 1, __ATOMIC_RELEASE); }
 
   // Queues `node` (callback already set) to run after a grace period. Lock-free and allocation-free; `node` must stay
   // valid until the callback has run.
@@ -119,7 +127,7 @@ class RcuDomain {
         phase_ = Phase::FirstFlip;
         continue;
       }
-      if (__atomic_load_n(&counters_[old_parity_].readers, __ATOMIC_SEQ_CST) != 0) break;   // a reader of that era is still running
+      if (!drained(old_parity_)) break;   // a reader of that era is still running
       if (phase_ == Phase::FirstFlip) {
         old_parity_ ^= 1;   // the parity the first flip made current; flip away from it, too
         __atomic_fetch_add(&epoch_, 1, __ATOMIC_SEQ_CST);
@@ -168,6 +176,14 @@ class RcuDomain {
     uint32_t readers = 0;
   };
 
+  // True once no shard has a reader on the counter of `parity`. The shards are read one after the other, which is enough:
+  // after the flip nothing joins the old parity for good (a transient join is undone at once), so a shard seen at zero stays so.
+  bool drained(uint32_t parity) const {
+    for (const Counter (&shard)[2] : counters_) {
+      if (__atomic_load_n(&shard[parity].readers, __ATOMIC_SEQ_CST) != 0) return false;
+    }
+    return true;
+  }
   void enqueue(RcuNode& node) {
     __atomic_fetch_add(&outstanding_, 1, __ATOMIC_RELAXED);
     RcuNode* old = __atomic_load_n(&retired_head_, __ATOMIC_RELAXED);
@@ -186,8 +202,8 @@ class RcuDomain {
     return out;
   }
 
-  Counter counters_[2];
-  uint32_t epoch_ = 0;
+  Counter counters_[kShards][2];
+  alignas(64) uint32_t epoch_ = 0;   // (read by every reader, written only by a grace period: its own line)
   uint32_t outstanding_ = 0;
   RcuNode* retired_head_ = nullptr;   // lock-free stack of what was retired since the last batch was taken
   // Owned by whoever holds poll_lock_:

@@ -32,6 +32,16 @@ using namespace kernel;
 static int g_failed = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAILED line %d: %s\n", __LINE__, #cond); ++g_failed; } } while (0)
 
+// The scheduler is not part of this test: hand out a core number per thread, so readers spread over the shards.
+namespace {
+std::atomic<uint32_t> g_next_core{1};
+thread_local uint32_t t_core = ~uint32_t{0};
+}
+uint32_t kernel::current_core() {
+  if (t_core == ~uint32_t{0}) t_core = g_next_core++;
+  return t_core;
+}
+
 namespace {
 std::atomic<int> g_live{0};
 std::atomic<int> g_freed{0};
@@ -133,6 +143,28 @@ void test_barrier_after_late_reader_released() {
   reader.join();
   waiter.join();
   CHECK(done && g_live == 0);
+}
+
+// Every shard holds up the grace period, and a section may end on another core than it began on.
+void test_shards_and_migration() {
+  RcuDomain d;
+  constexpr int kReaders = 20;   // more than kShards: some share a shard
+  uint32_t tokens[kReaders];
+  uint32_t shards_seen = 0;
+  for (int i = 0; i < kReaders; ++i) {
+    std::thread([&, i] { tokens[i] = d.lock(); }).join();   // (each thread has its own "core")
+    shards_seen |= 1u << (tokens[i] >> 1);
+  }
+  CHECK(shards_seen == 0xFFFFu);
+  Item* item = new Item(4);
+  item->retire(FreeItem{}, d);
+  for (int i = 0; i < kReaders; ++i) {
+    for (int k = 0; k < 5; ++k) d.poll();
+    CHECK(g_live == 1);                       // still held by the readers left
+    std::thread([&, i] { d.unlock(tokens[i]); }).join();   // (released from a different thread and core)
+  }
+  drain(d);
+  CHECK(g_live == 0);
 }
 
 struct Chain : RcuObjectBase<Chain, void (*)(Chain*)> {
@@ -242,6 +274,7 @@ int main() {
   test_no_readers_and_order();
   test_nested_and_late_readers();
   test_barrier_after_late_reader_released();
+  test_shards_and_migration();
   test_deleter_retires();
   test_auto_poll_and_destructor();
   test_default_domain();
