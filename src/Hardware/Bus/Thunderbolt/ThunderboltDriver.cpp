@@ -59,6 +59,11 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
   return outcome_ = result == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
 }
 
+ThunderboltDriver::Outcome ThunderboltDriver::resume() {
+  if (!icm_) return outcome_;
+  return outcome_ = icm_->resume() == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
+}
+
 void ThunderboltDriver::stop() {
   icm_ = UniquePointer<ThunderboltIcm>();
   cio_ = UniquePointer<TbPcie2Cio>();

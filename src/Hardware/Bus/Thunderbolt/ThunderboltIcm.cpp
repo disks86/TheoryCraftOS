@@ -194,6 +194,7 @@ uint8_t physical_port(uint8_t link) { return link == 0 ? 0 : static_cast<uint8_t
 const char* ThunderboltIcm::outcome_name(Outcome outcome) {
   switch (outcome) {
     case Outcome::NotStarted: return "not started";
+    case Outcome::Suspended: return "suspended";
     case Outcome::Started: return "started";
     case Outcome::NotPresent: return "the controller does not answer";
     case Outcome::FirmwareNotRunning: return "the connection manager firmware is not running (the BIOS did not start it)";
@@ -220,6 +221,10 @@ bool ThunderboltIcm::request(ConstByteView request, ByteView response, uint32_t 
 
 ThunderboltIcm::Outcome ThunderboltIcm::start(uint32_t timeout_us) {
   stop();
+  return bring_up(timeout_us, false);
+}
+
+ThunderboltIcm::Outcome ThunderboltIcm::bring_up(uint32_t timeout_us, bool resuming) {
   devices_.clear();
   ready_ = TbDriverReady();
   if (!nhi_.present()) return outcome_ = Outcome::NotPresent;
@@ -246,7 +251,7 @@ ThunderboltIcm::Outcome ThunderboltIcm::start(uint32_t timeout_us) {
       return outcome_ = Outcome::WrongMode;
   }
   // links that are already up are bounced, so that the firmware finds what is connected again (failures are not fatal)
-  if (options_.cio && options_.reset_ports)
+  if (options_.cio && options_.reset_ports && !resuming)
     for (uint32_t physical = 0; physical < 2; ++physical)
       if (!reset_physical_port(physical)) ++port_reset_failures_;
   uint8_t request_bytes[tb_icm::kDriverReadyBytes], response[tb_icm::kDriverReadyResponseBytes];
@@ -290,6 +295,21 @@ bool ThunderboltIcm::reset_physical_port(uint32_t physical_port) {
   delay_us(100);
   if (!cio.read(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, &v0) || !cio.read(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, &v1)) return false;
   return cio.write(TbConfigSpace::Port, port0, tb_cio::kPhyPortCs1, v0 & ~tb_cio::kPhyLinkDisable) && cio.write(TbConfigSpace::Port, port1, tb_cio::kPhyPortCs1, v1 & ~tb_cio::kPhyLinkDisable);
+}
+
+bool ThunderboltIcm::suspend() {
+  if (outcome_ != Outcome::Started) return false;
+  nhi_.mailbox(tb_mailbox::kSaveDevices, 0, 500000);
+  nhi_.mailbox(tb_mailbox::kDriverUnloads, 0, 500000);
+  control_.stop();
+  devices_.clear();
+  outcome_ = Outcome::Suspended;
+  return true;
+}
+
+ThunderboltIcm::Outcome ThunderboltIcm::resume(uint32_t timeout_us) {
+  if (outcome_ != Outcome::Suspended) return outcome_;
+  return bring_up(timeout_us, true);
 }
 
 void ThunderboltIcm::stop() {
