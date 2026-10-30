@@ -76,18 +76,39 @@ static const WCHAR *nls_quoted(NlsOut *o, const WCHAR *p) {
   return p;
 }
 
-/* Whether a picture has the day of the month (d or dd outside quotes): then the month names are the genitive forms. */
-static BOOL nls_picture_has_day(const WCHAR *p) {
+/* The day tokens of a picture (d and dd are the day of the month, ddd and dddd the name of the weekday), outside quotes, by position. */
+typedef struct { int position; int kind; /* 1 number, 2 name */ } NlsDayToken;
+static int nls_day_tokens(const WCHAR *p, NlsDayToken *tokens, int max) {
+  int n = 0;
+  const WCHAR *start = p;
   while (*p) {
     if (*p == '\'') { ++p; while (*p && *p != '\'') ++p; if (*p) ++p; continue; }
-    if (*p == 'd') { int run = 0; while (p[run] == 'd') ++run; if (run <= 2) return TRUE; p += run; continue; }
+    if (*p == 'd') {
+      int run = 0;
+      while (p[run] == 'd') ++run;
+      if (n < max) { tokens[n].position = (int)(p - start); tokens[n].kind = run <= 2 ? 1 : 2; ++n; }
+      p += run;
+      continue;
+    }
     ++p;
   }
-  return FALSE;
+  return n;
+}
+/* Whether the month in a picture at a position is in the genitive form: when the day of the month follows, or when it comes before and no weekday name follows. */
+static BOOL nls_month_is_genitive(const NlsDayToken *tokens, int count, int position) {
+  int previous = 0, next = 0;
+  for (int i = 0; i < count; ++i) {
+    if (tokens[i].position < position) previous = tokens[i].kind;
+    else if (!next) next = tokens[i].kind;
+  }
+  if (next == 1) return TRUE;
+  return previous == 1;
 }
 static void nls_date_picture(NlsOut *o, int kind, const WCHAR *p, const SYSTEMTIME *st) {
   WCHAR scratch[80];
-  const BOOL genitive = nls_picture_has_day(p);
+  NlsDayToken day_tokens[16];
+  const WCHAR *picture_start = p;
+  const int day_count = nls_day_tokens(p, day_tokens, 16);
   while (*p) {
     if (*p == '\'') { p = nls_quoted(o, p + 1); continue; }
     const WCHAR c = *p;
@@ -105,7 +126,7 @@ static void nls_date_picture(NlsOut *o, int kind, const WCHAR *p, const SYSTEMTI
         if (run <= 2) nls_put_number(o, st->wMonth, run);
         else {
           const DWORD base = (run == 3 ? 0x44u : 0x38u) + (DWORD)(st->wMonth - 1);
-          if (genitive && nls_text_wide(kind, base | 0x8000u, scratch)) nls_put_text(o, scratch);
+          if (nls_month_is_genitive(day_tokens, day_count, (int)(p - picture_start)) && nls_text_wide(kind, base | 0x8000u, scratch)) nls_put_text(o, scratch);
           else nls_put_text(o, nls_month_name(kind, st->wMonth, run == 3, scratch));
         }
         break;
