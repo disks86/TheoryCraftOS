@@ -448,6 +448,19 @@ void scene_dxil_texture_array(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// sample_c (dxil_ps_cmp_show.hlsl): a texture whose red grows from the left (0.1) to the right (0.9) compared with references that grow down the quad and a fixed one; the comparison is
+// filtered, so the edges between passing and failing texels are blends.
+void scene_dxil_compare(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_cmp_show, sizeof b::k_dxil_ps_cmp_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16);
+  Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(texture, bytes_of(texels, sizeof texels));
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
 void scene_render_to_texture(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
@@ -2335,6 +2348,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
     {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
     {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},
+    {"Direct3D 12 DXIL comparison sampling (Shader Model 6)", scene_dxil_compare},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},

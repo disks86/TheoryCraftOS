@@ -930,6 +930,28 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         store(ins.dst, b);
         break;
       }
+      case kTexCompare: {
+        // sample_c: the footprint's four texels compared with the reference (passing where reference <= texel), then filtered bilinearly by the position inside it
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        uint32_t w = 0, h = 0, levels = 0;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
+          const float reference = fetch(ins.src[2], 0).f[0];
+          const float px = a.f[0] * static_cast<float>(w) - 0.5f, py = a.f[1] * static_cast<float>(h) - 0.5f;
+          const float x = __builtin_floorf(px), y = __builtin_floorf(py), fx = px - x, fy = py - y;
+          float pass[2][2];   // [row][column]
+          for (uint32_t row = 0; row < 2; ++row)
+            for (uint32_t col = 0; col < 2; ++col) {
+              const graphics::Vec4 t = s.textures->sample_lod(unit, (x + static_cast<float>(col) + 0.5f) / static_cast<float>(w), (y + static_cast<float>(row) + 0.5f) / static_cast<float>(h), 0.0f);
+              pass[row][col] = reference <= t.x ? 1.0f : 0.0f;
+            }
+          const float top = pass[0][0] * (1.0f - fx) + pass[0][1] * fx, bottom = pass[1][0] * (1.0f - fx) + pass[1][1] * fx;
+          const float value = top * (1.0f - fy) + bottom * fy;
+          b = {{value, value, value, value}};
+        }
+        store(ins.dst, b);
+        break;
+      }
       case kTexGather: {
         // The four texels of the bilinear footprint of (u, v), component `control` of each: x (i0, j0 + 1), y (i1, j0 + 1), z (i1, j0), w (i0, j0). Each is looked up by a filtered sample at
         // the middle of its texel, so that the sampler's address mode (wrap, clamp, mirror) does what it does for any other lookup.

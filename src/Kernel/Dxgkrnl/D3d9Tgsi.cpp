@@ -980,6 +980,52 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       }
       break;
     }
+    case kTexCompare: {
+      // sample_c as the comparison of a gather, filtered by hand (a depth texture and a comparison sampler are not needed: any texture whose red channel is the depth works)
+      t = begin_result(ins, true, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind(unit)));
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), reference = operand(ins.src[2], 0, 1, nullptr, true);
+      const String g = temp(kWork2), g_x = temp(kWork2, ".xxxx"), g_y = temp(kWork2, ".yyyy"), g_z = temp(kWork2, ".zzzz"), g_w = temp(kWork2, ".wwww");
+      const String f = temp(kWork3), f_x = temp(kWork3, ".xxxx"), f_y = temp(kWork3, ".yyyy"), f_z = temp(kWork3, ".zzzz"), f_w = temp(kWork3, ".wwww"), f_xy = temp(kWork3, ".xy");
+      String component = str();
+      add(component, "IMM[");
+      add_uint(component, imm4_bits(0, 0, 0, 0));
+      add(component, "].xxxx");
+      line("TG4", &g, &coordinate, &component, &sampler);
+      line("SGE", &g, &g, &reference);
+      const String level = zero();
+      String size_target = str();
+      add(size_target, temp(kWork3).view());
+      String queried = str();
+      add(queried, level.view());
+      add(queried, ", ");
+      add(queried, sampler.view());
+      line("TXQ", &f, &queried);
+      line("U2F", &f, &f);
+      const String coordinate_xy = operand(ins.src[0], 0, 0, xyxy, false), half = splat(0.5f), negative_half = negate(half);
+      const String f_src = temp(kWork3, ".xyxy");   // (a source takes all four swizzle letters)
+      line("MUL", &f_xy, &coordinate_xy, &f_src);
+      line("ADD", &f_xy, &f_src, &negative_half);
+      line("FRC", &f_xy, &f_src);
+      const String top = temp(kWork3, ".z"), bottom = temp(kWork3, ".w");
+      line("LRP", &top, &f_x, &g_z, &g_w);
+      line("LRP", &bottom, &f_x, &g_y, &g_x);
+      const String result = temp(kWork);
+      (void)f_z, (void)f_w, (void)size_target;
+      line("LRP", &result, &f_y, &f_w, &f_z);
+      break;
+    }
     case kTexGather: {
       // gather4: TG4 takes the component (an integer immediate) between the coordinate and the sampler
       t = begin_result(ins, false, &direct);

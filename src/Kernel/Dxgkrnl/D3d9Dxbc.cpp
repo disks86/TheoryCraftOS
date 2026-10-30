@@ -1020,7 +1020,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((s = to_src(value, &ins.src[1])) != status::kSuccess) return s;
         ins.src_count = 2;
       }
-    } else if (opcode == kSample4 || opcode == 109 || opcode == 73 || opcode == 74 || opcode == 108) {   // (sample, gather4, sample_d, sample_b, lod)
+    } else if (opcode == kSample4 || opcode == 109 || opcode == 73 || opcode == 74 || opcode == 108 || opcode == 70 || opcode == 71) {   // (sample, gather4, sample_d, sample_b, lod, sample_c, sample_c_lz)
       if (vertex || compute) return status::kNotSupported;   // (no textures in the vertex stage)
       Operand d, coordinate, resource, sampler;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess ||
@@ -1038,13 +1038,16 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || sampler.type != kOpSampler) return status::kNotSupported;
       Operand extra[2];
-      if (opcode == 108 && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+      if ((opcode == 108 || opcode == 70 || opcode == 71) && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+      if (opcode == 70 || opcode == 71) {   // sample_c: the reference value
+        if ((s = read_operand(p, &extra[0])) != status::kSuccess) return s;
+      }
       if (opcode == 73 || opcode == 74) {   // sample_d: the two gradients, sample_b: the bias (2D textures only)
         for (uint32_t k = 0; k < (opcode == 73 ? 2u : 1u); ++k)
           if ((s = read_operand(p, &extra[k])) != status::kSuccess) return s;
         if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
       }
-      ins.op = opcode == 109 ? kTexGather : opcode == 73 ? kTexGrad : opcode == 74 ? kTexBias : opcode == 108 ? kTexQueryLod : kTexLd;
+      ins.op = opcode == 109 ? kTexGather : opcode == 73 ? kTexGrad : opcode == 74 ? kTexBias : opcode == 108 ? kTexQueryLod : (opcode == 70 || opcode == 71) ? kTexCompare : kTexLd;
       s = to_dst(d, &ins.dst);
       if (s != status::kSuccess) return s;
       s = to_src(coordinate, &ins.src[0]);
@@ -1060,6 +1063,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (resource.components == 2)
           for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
         if (opcode == 74) program->uses_system_values_ = true;   // (the bias goes with the implicit derivatives: needs the quad)
+      } else if (opcode == 70 || opcode == 71) {
+        s = to_src(extra[0], &ins.src[2]);
+        if (s != status::kSuccess) return s;
+        ins.src_count = 3;
+        if (resource.components == 2)
+          for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+        program->uses_system_values_ = true;   // (the required-features path: the function with the texture set)
       } else if (opcode == 108) {
         program->uses_system_values_ = true;   // (the quad)
         if (resource.components == 2)

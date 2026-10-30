@@ -69,7 +69,7 @@ struct Resource {
 enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
-  kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kTextureGather = 73, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
+  kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
   kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
 };
 
@@ -248,6 +248,7 @@ class Translator {
   }
   Val forced_result_;
   bool calculate_lod(const Instruction& ins);
+  bool sample_compare(const Instruction& ins, bool level_zero);
   bool sample_bias_grad(const Instruction& ins, bool gradients);
   bool inverse_trig(const Instruction& ins, uint32_t opcode);
   bool trig(const Instruction& ins, uint32_t opcode);
@@ -1403,6 +1404,31 @@ bool Translator::sample(const Instruction& ins, bool level) {
   return define(ins.result, r);
 }
 
+// SampleCmp / SampleCmpLevelZero of a 2D texture: the comparison filtered.
+bool Translator::sample_compare(const Instruction& ins, bool level_zero) {
+  Val srv, smp;
+  if (ins.arg_count < 11 || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp)) return error(status::kNotSupported);
+  for (uint32_t k = 7; k < 10; ++k) {   // offsets: none
+    uint64_t v = 0;
+    const Constant* c = constant(ins.args[k]);
+    if (!c || (c->kind != ConstantKind::Undef && !(constant_int(ins.args[k], &v) && v == 0))) return error(status::kNotSupported);
+  }
+  const Val r = new_aggregate(ins.result);   // (a ResRet: the comparison in every component)
+  uint32_t scratch = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  if (!pack(ins.args + 3, 2, scratch, false)) return false;
+  const Val reference = use(ins.args[10]);
+  const uint32_t at = begin(level_zero ? 71 : 70);
+  dst_temp(r.a, 0xF);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+  put(scratch);
+  src_resource(srv.c);
+  src_sampler(smp.c);
+  src(reference);
+  finish(at);
+  return define(ins.result, r);
+}
+
 // CalculateLOD of a 2D texture: the lod instruction's x (clamped) or y (not).
 bool Translator::calculate_lod(const Instruction& ins) {
   Val srv, smp;
@@ -1812,6 +1838,7 @@ bool Translator::dx_call(const Instruction& ins) {
     case kTextureLoad: return with_array(ins, [&] { return texture_load(ins); });
     case kTextureGather: return with_array(ins, [&] { return texture_gather(ins); });
     case kCalculateLod: return calculate_lod(ins);
+    case kSampleCmp: case kSampleCmpLevelZero: return with_array(ins, [&] { return sample_compare(ins, opcode == kSampleCmpLevelZero); });
     case kThreadId: return thread_value(ins, 32, true);
     case kGroupId: return thread_value(ins, 33, true);
     case kThreadIdInGroup: return thread_value(ins, 34, true);

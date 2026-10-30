@@ -5441,6 +5441,36 @@ void test_dxil() {
       CHECK(seen[0] && seen[1]);
     }
   }
+  // sample_c / sample_c_lz: the four texels of the footprint compared with the reference (reference <= texel) and filtered bilinearly; the fake texture's red is (x + 0.5) / 16.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_cmp.dxil", &translated));
+    if (translated) {
+      auto compared = [](float u, float v, float reference) {
+        const float px = u * 8.0f - 0.5f, py = v * 4.0f - 0.5f, x = __builtin_floorf(px), y = __builtin_floorf(py), fx = px - x, fy = py - y;
+        float pass[2][2];
+        for (int row = 0; row < 2; ++row)
+          for (int col = 0; col < 2; ++col) pass[row][col] = reference <= (x + static_cast<float>(col) + 0.5f) / 16.0f ? 1.0f : 0.0f;
+        const float top = pass[0][0] * (1 - fx) + pass[0][1] * fx, bottom = pass[1][0] * (1 - fx) + pass[1][1] * fx;
+        return top * (1 - fy) + bottom * fy;
+      };
+      unsigned partial = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float a = compared(varyings[2].x, varyings[2].y, varyings[0].x), b = compared(varyings[2].x * 0.9f, varyings[2].y * 0.9f, varyings[0].y);
+        if (a > 0.01f && a < 0.99f) ++partial;
+        const bool same = alive && close_to(room[0].x, a) && close_to(room[0].y, b) && close_to(room[0].z, a * b);
+        if (!same && n < 3) printf("  cmp #%u: %g %g %g wants %g %g %g\n", n, room[0].x, room[0].y, room[0].z, a, b, a * b);
+        CHECK(same);
+      }
+      CHECK(partial > 20);
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;
