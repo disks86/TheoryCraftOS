@@ -1593,8 +1593,9 @@ Value AmlInterpreter::Impl::eval_one(Frame& f) {
       return v;
     }
     case 0x86: {   // Notify
-      parse_target(f);
-      eval(f);
+      const Target t = parse_target(f);
+      const Value v = eval(f);
+      if (!bad && t.kind == Target::Named && t.node) host.notify(t.node, v.kind == ValueKind::Integer ? static_cast<uint32_t>(v.integer) : 0);
       return Value();
     }
     case 0x87: return size_of(f);

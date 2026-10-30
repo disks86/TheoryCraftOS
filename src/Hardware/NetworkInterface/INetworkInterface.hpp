@@ -63,6 +63,9 @@ class INetworkInterface : public IHardware {
   // when the link comes up and gives it up when it goes down.
   virtual bool link_comes_and_goes() const { return false; }
 
+  // True for an interface that is a cable to one other host: there may be no DHCP server on it, so its network stack makes up a link-local address (169.254.x.y, RFC 3927) when DHCP fails.
+  virtual bool direct_link() const { return false; }
+
   // The Wi-Fi side of this interface (scanning, joining a network), or nullptr when it is not a wireless adapter.
   virtual IWirelessInterface* wireless() { return nullptr; }
 

@@ -111,6 +111,8 @@
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
+#include "Hardware/Acpi/SystemAcpiPorts.hpp"
+#include "Hardware/Acpi/AcpiEvents.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
 #include "FileSystem/SystemLayout.hpp"
@@ -174,6 +176,18 @@ static kernel::Frame* on_thunderbolt_interrupt(kernel::Frame* frame, void* drive
   static_cast<hardware::ThunderboltDriver*>(driver)->on_interrupt();
   return frame;
 }
+#endif
+
+#ifdef TCOS_THUNDERBOLT
+// The firmware says Notify(device, 2) when the controller (or a root port above it) woke the machine: counted, for the desktop loop to act on.
+struct ThunderboltWakeListener final : hardware::IAcpiNotifyListener {
+  hardware::AcpiEvents* events = nullptr;
+  acpi::Node* controller = nullptr;
+  uint32_t wakes = 0;
+  void on_notify(acpi::Node* device, uint32_t value) override {
+    if (value == 2 && events && controller && events->is_within(device, controller)) ++wakes;
+  }
+};
 #endif
 
 #ifdef TCOS_AMD_VEGAM
@@ -1172,6 +1186,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::ThunderboltNet> thunderbolt_net;        // networking to another host on the cable (after the driver: it goes first)
     hardware::ThunderboltNetLink* thunderbolt_link = nullptr;       // its entry in the list of network interfaces, which outlives them both
     uint64_t thunderbolt_devices = 0;
+    hardware::PciAddress thunderbolt_address = {0, 0, 0};
     UniquePointer<hardware::PciMsix> thunderbolt_msix;              // its MSI-X, when the machine delivers it
     UniquePointer<hardware::PciMsi> thunderbolt_msi;                // else its MSI
     bool thunderbolt_msi_working = false;                           // an interrupt arrived in the start-up check: the loop reads the channel only when one comes
@@ -1185,6 +1200,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #endif
         thunderbolt = UniquePointer<hardware::ThunderboltDriver>::make(shared_allocator, shared_allocator, thunderbolt_config);
         if (!thunderbolt) break;
+        thunderbolt_address = d.address;
         if (thunderbolt->start(pci, d, register_mapper) == hardware::ThunderboltDriver::Outcome::Started) {
           if (!smb_random.ready()) smb_random.initialize();
           thunderbolt_keys = UniquePointer<hardware::FileTbKeyStore>::make(shared_allocator, explorer_files.file_system(), shared_allocator);
@@ -1553,6 +1569,30 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         else e2.text(", ").dec(static_cast<uint32_t>(first.percent)).text("%").text(first.state == hardware::BatteryState::Charging ? ", charging" : first.state == hardware::BatteryState::Discharging ? ", discharging" : first.state == hardware::BatteryState::Full ? ", full" : "");
       }
     }
+#ifdef TCOS_THUNDERBOLT
+    // The ACPI side of the controller's wake: its _PRW names the event (a GPE) the PME arrives as, which is armed here; the firmware's method for the event says Notify(device, 2). The events are
+    // read by polling (no SCI handler). Only with a controller that started, and only a machine whose tables describe the controller.
+    hardware::SystemAcpiPorts acpi_ports;
+    UniquePointer<hardware::AcpiEvents> acpi_events;
+    ThunderboltWakeListener thunderbolt_wake;
+    uint32_t thunderbolt_wakes_seen = 0;
+    if (thunderbolt && acpi_tables.initialize()) {
+      acpi_events = UniquePointer<hardware::AcpiEvents>::make(shared_allocator, acpi_host, acpi_ports, shared_allocator);
+      if (acpi_events && acpi_events->initialize(acpi_tables) && acpi_events->enable_acpi_mode()) {
+        acpi::Node* controller = acpi_events->find_pci_device(pci, thunderbolt_address);
+        thunderbolt_wake.events = acpi_events.get();
+        thunderbolt_wake.controller = controller;
+        acpi_events->set_listener(&thunderbolt_wake);
+        hardware::AcpiEvents::WakeSource source;
+        if (controller && acpi_events->wake_source(controller, &source) && acpi_events->enable_wake(controller))
+          Entry(Level::Ok, "Thunderbolt").text("wake: ACPI event ").dec(source.gpe).text(" armed (from sleep state S").dec(source.deepest_state).text(")");
+        else
+          Entry(Level::Info, "Thunderbolt").text(controller ? "the controller names no wake event in the ACPI tables" : "the controller is not described in the ACPI tables");
+      } else {
+        acpi_events = UniquePointer<hardware::AcpiEvents>();
+      }
+    }
+#endif
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);
@@ -1649,11 +1689,52 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (thunderbolt) {
         static uint32_t tb_seen = 0, tb_idle = 0;                   // with MSI the channel is read when an interrupt came (and now and then in case one was lost)
         const uint32_t tb_arrived = thunderbolt->interrupts();
+#ifdef TCOS_THUNDERBOLT_RUNTIME_PM
+        static bool tb_asleep = false;                              // in D3hot: its registers are not read
+        static uint64_t tb_idle_since = hardware::uptime_us();
+        if (tb_asleep) {
+          // the wake: the firmware's notification (an ACPI event polled below) or, failing that, the PME status of the function
+          if (thunderbolt_wake.wakes != thunderbolt_wakes_seen || thunderbolt->wake_pending()) {
+            thunderbolt_wakes_seen = thunderbolt_wake.wakes;
+            tb_asleep = thunderbolt->resume() != hardware::ThunderboltDriver::Outcome::Started;
+            tb_idle_since = hardware::uptime_us();
+            Entry(tb_asleep ? Level::Warning : Level::Info, "Thunderbolt").text(tb_asleep ? "did not come back from runtime suspend" : "back from runtime suspend");
+          }
+        }
+        if (!tb_asleep)
+#endif
         if (!thunderbolt_msi_working || tb_arrived != tb_seen || ++tb_idle >= 250) {
           tb_seen = tb_arrived;
           tb_idle = 0;
           thunderbolt->poll();
           if (thunderbolt_net) thunderbolt_net->poll();
+        }
+#ifdef TCOS_THUNDERBOLT_RUNTIME_PM
+        // Idle (no device, no other host, the firmware allows it) for half a minute: sleep, with the wake armed in ACPI so that a plugged in cable is noticed.
+        if (!tb_asleep) {
+          const uint64_t tb_now = hardware::uptime_us();
+          if (thunderbolt->icm()->device_count() != 0 || thunderbolt->icm()->xdomain_count() != 0 || !acpi_events || !thunderbolt_wake.controller) {
+            tb_idle_since = tb_now;
+          } else if (tb_now - tb_idle_since >= 30000000ull && thunderbolt->icm()->runtime_allowed()) {
+            tb_idle_since = tb_now;                                  // (whatever happens, the next try is half a minute away)
+            if (thunderbolt->runtime_suspend(true)) {
+              tb_asleep = true;
+              Entry(Level::Info, "Thunderbolt").text(thunderbolt->wake_armed() ? "runtime suspend, wake armed" : "runtime suspend");
+            }
+          }
+        }
+#endif
+        if (acpi_events) {
+          static uint32_t acpi_idle = 0;
+          if (++acpi_idle >= 25) {                                   // (about every 100 ms: a few port reads)
+            acpi_idle = 0;
+            acpi_events->poll();
+          }
+          if (thunderbolt_wake.wakes != thunderbolt_wakes_seen) {
+            thunderbolt_wakes_seen = thunderbolt_wake.wakes;
+            Entry(Level::Info, "Thunderbolt").text("woken by the firmware's notification");
+            thunderbolt->poll();                                     // (what woke it is in the control channel)
+          }
         }
         const uint64_t now_devices = thunderbolt->icm()->device_count();
         if (now_devices != thunderbolt_devices) {
@@ -1673,6 +1754,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       hardware::delay_us(4000);
     }
 #ifdef TCOS_THUNDERBOLT
+    if (acpi_events && thunderbolt_wake.controller) acpi_events->disable_wake(thunderbolt_wake.controller);
     if (thunderbolt_link) thunderbolt_link->detach();                // (the network interface list keeps the entry; it stops using the connection before that goes)
     if (thunderbolt_msix || thunderbolt_msi) {                      // (before the driver goes: the handler holds a pointer to it)
       thunderbolt_msix = UniquePointer<hardware::PciMsix>();

@@ -41,6 +41,8 @@ struct RegionAccess {
   uint8_t pci_bus, pci_device, pci_function;   // PciConfig only
 };
 
+struct Node;
+
 class IAmlHost {
  public:
   virtual bool region_read(const RegionAccess& access, uint64_t* value) = 0;
@@ -48,13 +50,13 @@ class IAmlHost {
   virtual void stall_us(uint32_t us) { (void)us; }
   virtual void sleep_ms(uint32_t ms) { (void)ms; }
   virtual uint64_t timer_100ns() { return 0; }
+  // AML executed Notify(device, value): the firmware tells the OS something happened to the device (2: the device woke the system, 0 and 1: bus check, 0x80 and up: the device's own events).
+  virtual void notify(Node* device, uint32_t value) { (void)device; (void)value; }
 
  protected:
   constexpr IAmlHost() = default;
   ~IAmlHost() = default;
 };
-
-struct Node;
 
 enum class ValueKind : uint8_t {
   Uninitialized,
