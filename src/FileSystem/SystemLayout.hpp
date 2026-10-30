@@ -63,6 +63,9 @@ inline constexpr const char* kCalendarDatabase = "/AppStore/Calendar/calendar.db
 // The to-do application's items (the "Todo" application's folder in the AppStore).
 inline constexpr const char* kTodoDatabase = "/AppStore/Todo/todo.db";
 
+// The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
+inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";
+
 // The name the EFI system partition is mounted under (the folder "/EFI").
 inline constexpr const char* kEfiMountName = "EFI";
 
