@@ -30,6 +30,10 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaDraw.hpp"
+#include "Graphics/Graphics3D/BuiltinShaders.hpp"
+#include "Graphics/Graphics3D/CubeMesh.hpp"
+#include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#include "Graphics/Graphics3D/Vega/VegaGraphicsDevice.hpp"
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/GcnCp.hpp"
 #include "FakeAmdDce11.hpp"
 #include "FakeAuxSink.hpp"
@@ -3295,12 +3299,283 @@ static void test_back_end_on_card() {
   vega.shutdown();
 }
 
+
+// --- The graphics device on the card ----------------------------------------------------------------
+
+// Allocates from the pool of system memory the simulated card can reach (the device keeps its staging memory there); nothing is given back.
+struct PoolAllocator final : allocators::IAllocator {
+  explicit PoolAllocator(Pool& pool) : pool_(pool) {}
+  void* allocate(uint64_t size) override { return allocate_aligned(size, 16); }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override {
+    const uint64_t al = alignment < 16 ? 16 : alignment;
+    const uint64_t at = (used_ + al - 1) / al * al;
+    if (at + size > pool_.memory.size()) return nullptr;
+    used_ = at + size;
+    return pool_.memory.data() + at;
+  }
+  void deallocate(void*) override {}
+
+ private:
+  Pool& pool_;
+  uint64_t used_ = 0;
+};
+
+namespace vd {
+using namespace graphics;
+
+struct Scene {
+  const char* name;
+  bool textured = false;
+  CullMode cull = CullMode::Back;
+  FrontFace front = FrontFace::CounterClockwise;
+  bool blend = false;
+  bool two_passes = false;   // a second draw in the same pass: a translucent quad over the first picture
+  bool scissor = false;
+  float angle = 0.7f;
+};
+
+// The picture of a scene on a device, 0xAARRGGBB; false if the device refused anything.
+static bool render(IGraphicsDevice& device, const Scene& scene, uint32_t w, uint32_t h, ArrayView<uint32_t> out) {
+  IShaderModule* vs = device.create_shader_module(scene.textured ? textured_vertex_shader() : colored_vertex_shader());
+  IShaderModule* fs = device.create_shader_module(scene.textured ? textured_fragment_shader() : colored_fragment_shader());
+  GraphicsPipelineDesc d;
+  if (scene.textured) describe_textured_pipeline(&d);
+  else describe_colored_pipeline(&d);
+  d.vertex_shader = vs;
+  d.fragment_shader = fs;
+  d.cull_mode = scene.cull;
+  d.front_face = scene.front;
+  d.depth_test = d.depth_write = true;
+  IPipeline* pipeline = vs && fs ? device.create_graphics_pipeline(d) : nullptr;
+  GraphicsPipelineDesc q;   // the translucent quad: no depth, alpha blended
+  describe_colored_pipeline(&q);
+  IShaderModule* qvs = device.create_shader_module(colored_vertex_shader());
+  IShaderModule* qfs = device.create_shader_module(colored_fragment_shader());
+  q.vertex_shader = qvs;
+  q.fragment_shader = qfs;
+  q.cull_mode = CullMode::None;
+  q.alpha_blend = true;
+  IPipeline* quad_pipeline = qvs && qfs ? device.create_graphics_pipeline(q) : nullptr;
+
+  TexturedVertex textured[kCubeVertices];
+  uint16_t indices[kCubeIndices];
+  build_textured_cube(ArrayView<TexturedVertex>(textured, kCubeVertices), ArrayView<uint16_t>(indices, kCubeIndices));
+  ColoredVertex colored[kCubeVertices];
+  static const float kColors[6][4] = {{0.95f, 0.30f, 0.30f, 1}, {0.30f, 0.85f, 0.35f, 1}, {0.30f, 0.50f, 0.95f, 1}, {0.95f, 0.85f, 0.25f, 1}, {0.85f, 0.35f, 0.90f, 1}, {0.30f, 0.85f, 0.90f, 1}};
+  for (uint32_t i = 0; i < kCubeVertices; ++i) {
+    for (uint32_t k = 0; k < 3; ++k) colored[i].position[k] = textured[i].position[k];
+    for (uint32_t k = 0; k < 4; ++k) colored[i].color[k] = kColors[i / 4][k];
+  }
+  const ColoredVertex quad[6] = {{{-0.6f, -0.3f, 0.1f}, {0, 0, 0, 0.5f}}, {{0.6f, -0.3f, 0.1f}, {0, 0, 0, 0.5f}}, {{0.6f, 0.6f, 0.1f}, {0, 0, 0, 0.5f}},
+                                 {{-0.6f, -0.3f, 0.1f}, {0, 0, 0, 0.5f}}, {{0.6f, 0.6f, 0.1f}, {0, 0, 0, 0.5f}}, {{-0.6f, 0.6f, 0.1f}, {0, 0, 0, 0.5f}}};
+  IBuffer* vb = device.create_buffer(scene.textured ? sizeof textured : sizeof colored, kBufferVertex);
+  IBuffer* ib = device.create_buffer(sizeof indices, kBufferIndex);
+  IBuffer* qb = device.create_buffer(sizeof quad, kBufferVertex);
+  IImage* color = device.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  IImage* depth = device.create_image({{w, h}, Format::D32Float, kImageDepthAttachment});
+  IImage* texture = scene.textured ? device.create_image({{16, 16}, Format::B8G8R8A8Unorm, kImageSampled}) : nullptr;
+  ICommandBuffer* cb = device.create_command_buffer();
+  bool ok = pipeline && quad_pipeline && vb && ib && qb && color && depth && cb && (!scene.textured || texture);
+  if (ok) {
+    ByteView v = vb->map(), i = ib->map(), qm = qb->map();
+    v.copy_from(scene.textured ? ConstByteView(reinterpret_cast<const uint8_t*>(textured), sizeof textured) : ConstByteView(reinterpret_cast<const uint8_t*>(colored), sizeof colored));
+    i.copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(indices), sizeof indices));
+    qm.copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(quad), sizeof quad));
+    if (texture) {
+      uint32_t texels[256];
+      for (uint32_t k = 0; k < 256; ++k) texels[k] = 0xFF000000u | ((k % 16) * 16 << 16) | ((k / 16) * 16 << 8) | (((k % 16) ^ (k / 16)) & 1 ? 0xC0 : 0x30);
+      ok = texture->write_pixels(ArrayView<const uint32_t>(texels, 256));
+    }
+  }
+  if (ok) {
+    const Mat4 mvp = Mat4::scaling(1, -1, 1) * Mat4::perspective(0.9f, float(w) / float(h), 0.1f, 20.0f) * Mat4::translation(0, 0, -4.5f) * Mat4::rotation_y(scene.angle) * Mat4::rotation_x(0.6f * scene.angle);
+    const Mat4 identity = Mat4::scaling(1, 1, 1);
+    SamplerDesc sampler;
+    sampler.filter = Filter::Linear;
+    sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+    RenderPassBegin pass;
+    pass.color = color;
+    pass.depth = depth;
+    pass.clear_color_value = {0.063f, 0.063f, 0.102f, 1.0f};
+    cb->begin();
+    cb->begin_render_pass(pass);
+    if (scene.scissor) cb->set_scissor({int32_t(w / 4), int32_t(h / 4), w / 2, h / 2});
+    cb->bind_pipeline(pipeline);
+    cb->bind_vertex_buffer(vb);
+    cb->bind_index_buffer(ib, IndexType::Uint16);
+    if (scene.textured) cb->bind_texture(0, texture, sampler);
+    cb->push_constants(&mvp, sizeof mvp);
+    cb->draw_indexed(kCubeIndices);
+    if (scene.two_passes) {
+      cb->bind_pipeline(quad_pipeline);
+      cb->bind_vertex_buffer(qb);
+      cb->push_constants(&identity, sizeof identity);
+      cb->draw(6);
+    }
+    cb->end_render_pass();
+    ok = cb->end() && device.submit(cb) && color->read_pixels(out);
+  }
+  if (cb) device.destroy_command_buffer(cb);
+  if (texture) device.destroy_image(texture);
+  if (depth) device.destroy_image(depth);
+  if (color) device.destroy_image(color);
+  if (qb) device.destroy_buffer(qb);
+  if (ib) device.destroy_buffer(ib);
+  if (vb) device.destroy_buffer(vb);
+  if (quad_pipeline) device.destroy_pipeline(quad_pipeline);
+  if (pipeline) device.destroy_pipeline(pipeline);
+  if (qfs) device.destroy_shader_module(qfs);
+  if (qvs) device.destroy_shader_module(qvs);
+  if (fs) device.destroy_shader_module(fs);
+  if (vs) device.destroy_shader_module(vs);
+  return ok;
+}
+}  // namespace vd
+
+static void test_graphics_device() {
+  Rig rig;
+  AmdVegaM vega(rig.alloc);
+  Pool pool(40u << 20);
+  AmdVegaM::Inputs in = rig.inputs();
+  in.system_addresses = &pool;
+  in.draw_area_bytes = 4ull << 20;
+  CHECK(vega.bring_up(in));
+  if (!vega.up()) return;
+  const AmdVegaM::Layout& l = vega.layout();
+  rig.card.sdma.gart_start = vega.gart_plan().gart_start;
+  rig.card.sdma.gart_size = vega.gart_plan().gart_size;
+  rig.card.sdma.gart_table = rig.vram + kRegion + l.gart_table;
+  rig.card.sdma.system_host = pool.memory.data();
+  rig.card.sdma.system_base = Pool::kBase;
+  rig.card.sdma.system_bytes = pool.memory.size();
+  VramMemory memory;
+  memory.vram = rig.vram;
+  rig.card.gfx.graphics_ib_hook = [&](uint64_t address, uint32_t dwords) {
+    if (!memory.in_range(address, dwords * 4ull)) return false;
+    gcn::CommandProcessorModel cp(rig.alloc, memory);
+    return cp.execute(ArrayView<const uint32_t>(reinterpret_cast<const uint32_t*>(rig.vram + (address - kGpuBase)), dwords)) == gcn::CommandProcessorModel::Result::Ok;
+  };
+
+  uint64_t area_offset = 0, area_bytes = 0;
+  CHECK(vega.draw_area(&area_offset, &area_bytes) && area_bytes == (4ull << 20) && area_offset % 256 == 0 && area_offset + area_bytes <= l.framebuffer_bytes);
+
+  PoolAllocator pooled(pool);
+  graphics::VegaGraphicsDevice device(pooled, vega);
+  graphics::SoftwareDevice reference(rig.alloc, nullptr);
+  CHECK(device.usable() && device.info().accelerated && device.info().kind == graphics::DeviceKind::Gpu);
+
+  using vd::Scene;
+  const uint32_t W = 64, H = 48;
+  ArrayView<uint32_t> got = allocate_view<uint32_t>(rig.alloc, W * H), want = allocate_view<uint32_t>(rig.alloc, W * H);
+  Scene flat{"flat cube"};
+  Scene logo{"textured cube"};
+  logo.textured = true;
+  Scene cull_front{"front faces culled"};
+  cull_front.cull = graphics::CullMode::Front;
+  Scene clockwise{"clockwise is front"};
+  clockwise.front = graphics::FrontFace::Clockwise;
+  Scene no_cull{"no culling"};
+  no_cull.cull = graphics::CullMode::None;
+  Scene blended{"a translucent quad over the cube"};
+  blended.two_passes = true;
+  Scene scissored{"scissored", false, graphics::CullMode::Back, graphics::FrontFace::CounterClockwise, false, true, true};
+  const Scene scenes[] = {flat, logo, cull_front, clockwise, no_cull, blended, scissored};
+  for (const Scene& scene : scenes) {
+    got.fill(0);
+    want.fill(0);
+    const uint64_t draws_before = device.hardware_draws();
+    CHECK(vd::render(device, scene, W, H, got));
+    CHECK(vd::render(reference, scene, W, H, want));
+    uint32_t different = 0, far = 0, covered = 0;
+    int biggest = 0;
+    for (uint32_t i = 0; i < W * H; ++i) {
+      if (want[i] != 0xFF10101A) ++covered;
+      int worst = 0;
+      for (int shift : {0, 8, 16, 24}) {
+        const int d = abs(int((got[i] >> shift) & 0xFF) - int((want[i] >> shift) & 0xFF));
+        worst = d > worst ? d : worst;
+      }
+      different += worst > 0;
+      far += worst > 24;
+      biggest = worst > biggest ? worst : biggest;
+    }
+    printf("  %s: %u of %u pixels differ (by at most %d levels, %u by more than 24; %u pixels are not the background); %llu draws on the card%s%s\n", scene.name, different, W * H, biggest, far, covered,
+           static_cast<unsigned long long>(device.hardware_draws() - draws_before), device.last_error()[0] ? ", last error: " : "", device.last_error());
+    CHECK(device.hardware_draws() > draws_before);
+    CHECK(biggest <= 2 && covered > 200);   // (float against 8 bit rounding is one level at most; a wrong winding, flip, blend or clip space would differ over the whole cube)
+  }
+
+  // the RenderNode's drawing test: one red triangle much bigger than a 16 x 16 target, with no depth image and a pipeline that does not cull
+  {
+    using namespace graphics;
+    IShaderModule* vs = device.create_shader_module(colored_vertex_shader());
+    IShaderModule* fs = device.create_shader_module(colored_fragment_shader());
+    IImage* image = device.create_image({{16, 16}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+    IBuffer* buffer = device.create_buffer(sizeof(ColoredVertex) * 3, kBufferVertex);
+    ICommandBuffer* commands = device.create_command_buffer();
+    GraphicsPipelineDesc desc;
+    describe_colored_pipeline(&desc);
+    desc.vertex_shader = vs;
+    desc.fragment_shader = fs;
+    desc.cull_mode = CullMode::None;
+    IPipeline* pipeline = vs && fs ? device.create_graphics_pipeline(desc) : nullptr;
+    CHECK(pipeline && image && buffer && commands);
+    if (pipeline && image && buffer && commands) {
+      ColoredVertex v[3];
+      const float corners[3][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+      for (int i = 0; i < 3; ++i) {
+        v[i].position[0] = corners[i][0], v[i].position[1] = corners[i][1], v[i].position[2] = 0.5f;
+        v[i].color[0] = 1, v[i].color[1] = 0, v[i].color[2] = 0, v[i].color[3] = 1;
+      }
+      buffer->map().copy_from(ConstByteView(reinterpret_cast<const uint8_t*>(v), sizeof v));
+      const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+      RenderPassBegin pass;
+      pass.color = image;
+      pass.clear_color_value = {0, 0, 1, 1};
+      commands->begin();
+      commands->begin_render_pass(pass);
+      commands->bind_pipeline(pipeline);
+      commands->bind_vertex_buffer(buffer);
+      commands->push_constants(identity, sizeof identity);
+      commands->draw(3);
+      commands->end_render_pass();
+      uint32_t pixels[256] = {};
+      const bool ran = commands->end() && device.submit(commands) && image->read_pixels(ArrayView<uint32_t>(pixels, 256));
+      CHECK(ran && (pixels[8 * 16 + 8] & 0xFFFFFF) == 0xFF0000 && (pixels[0] & 0xFFFFFF) == 0xFF0000 && (pixels[255] & 0xFFFFFF) == 0xFF0000);
+    }
+    if (commands) device.destroy_command_buffer(commands);
+    if (pipeline) device.destroy_pipeline(pipeline);
+    if (buffer) device.destroy_buffer(buffer);
+    if (image) device.destroy_image(image);
+    if (fs) device.destroy_shader_module(fs);
+    if (vs) device.destroy_shader_module(vs);
+  }
+
+  // what the device refuses, so that a caller falls back to the software device
+  graphics::ImageDesc half;
+  half.extent = {8, 8};
+  half.format = graphics::Format::R16G16B16A16Float;
+  CHECK(device.create_image(half) == nullptr);
+  half.format = graphics::Format::B8G8R8A8Unorm;
+  half.mip_levels = 2;
+  half.usage = graphics::kImageSampled;
+  CHECK(device.create_image(half) == nullptr);
+  graphics::ShaderModuleDesc no_text = graphics::colored_vertex_shader();
+  no_text.tgsi = nullptr;
+  CHECK(device.create_shader_module(no_text) == nullptr);
+  CHECK(!device.present(nullptr));
+  release_view(rig.alloc, got);
+  release_view(rig.alloc, want);
+  vega.shutdown();
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_plan();
   test_bring_up();
   test_transfer();
   test_draw_on_card();
+  test_graphics_device();
   test_back_end_on_card();
   test_failures();
   test_display();

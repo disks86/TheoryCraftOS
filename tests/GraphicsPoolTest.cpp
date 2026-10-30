@@ -28,7 +28,7 @@ using namespace graphics;
 using namespace fakegpu;
 
 // The fake GPUs have no 3D engine: RenderNodeAccel.cpp (virgl, SVGA3D and the drivers under them) is not built here, and these stand in for it.
-void RenderNode::build_accelerated(hardware::VirtioGpu*, hardware::VmwareSvgaGpu*, hardware::IntelGpu*, allocators::IAllocator&, bool, bool) { reason_ = "fake GPU"; }
+void RenderNode::build_accelerated(hardware::VirtioGpu*, hardware::VmwareSvgaGpu*, hardware::IntelGpu*, hardware::AmdVegaM*, allocators::IAllocator&, bool, bool) { reason_ = "fake GPU"; }
 void RenderNode::destroy_accelerated() {}
 
 

@@ -21,10 +21,10 @@
 namespace graphics {
 
 RenderNode::RenderNode(hardware::IGraphicsProcessingUnit* gpu, hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, allocators::IAllocator& allocator,
-                       bool allow_acceleration, hardware::IntelGpu* intel, bool allow_intel_render)
+                       bool allow_acceleration, hardware::IntelGpu* intel, bool allow_intel_render, hardware::AmdVegaM* vega)
     : gpu_(gpu), software_(allocator, gpu) {
   active_ = &software_;
-  build_accelerated(virtio, vmware, intel, allocator, allow_acceleration, allow_intel_render);
+  build_accelerated(virtio, vmware, intel, vega, allocator, allow_acceleration, allow_intel_render);
 }
 
 RenderNode::~RenderNode() { destroy_accelerated(); }

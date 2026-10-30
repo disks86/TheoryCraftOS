@@ -22,10 +22,13 @@
 #include <new>
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/IntelGen9/IntelRenderStack.hpp"
+#ifdef TCOS_AMD_VEGAM
+#include "Graphics/Graphics3D/Vega/VegaGraphicsDevice.hpp"
+#endif
 
 namespace graphics {
 
-void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* svga, hardware::IntelGpu* intel, allocators::IAllocator& allocator,
+void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* svga, hardware::IntelGpu* intel, hardware::AmdVegaM* vega, allocators::IAllocator& allocator,
                                    bool allow_acceleration, bool allow_intel_render) {
   if (!allow_acceleration) {
     reason_ = "acceleration was switched off";
@@ -56,6 +59,26 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
         reason_ = "SVGA3D did not draw the test picture correctly";
       }
     }
+#ifdef TCOS_AMD_VEGAM
+  } else if (vega) {
+    // The graphics engine of the Radeon RX Vega M, on the strength of its own tests: it must create every kind of object and draw the test picture, or the CPU renderer stays.
+    void* memory = allocator.allocate(sizeof(VegaGraphicsDevice));
+    VegaGraphicsDevice* device = memory ? new (memory) VegaGraphicsDevice(allocator, *vega) : nullptr;
+    if (device && device->usable() && self_test(*device) && drawing_test(*device)) {
+      gpu_device_ = device;
+      active_ = device;
+      vega_device_ = device;
+      vega_allocator_ = &allocator;
+    } else {
+      reason_ = device && !device->usable() ? "the Vega M has no room for draws" : "the Vega M graphics engine did not draw the test picture";   // (before the device is gone)
+      if (device) {
+        device->~VegaGraphicsDevice();
+        allocator.deallocate(device);
+      }
+    }
+#else
+    (void)vega;
+#endif
   } else if (intel && allow_intel_render) {
     // The render engine of the Intel GPU, on the strength of its own test: the device must draw the test picture, or the CPU renderer stays.
     void* memory = allocator.allocate(sizeof(IntelRenderStack));
@@ -89,10 +112,17 @@ void RenderNode::build_accelerated(hardware::VirtioGpu* virtio, hardware::Vmware
 
 void RenderNode::destroy_accelerated() {
   if (locked_) locked_->~LockedDevice();
-  if (raw_device_ && !intel_stack_) {
+  if (raw_device_ && !intel_stack_ && !vega_device_) {
     if (svga_) static_cast<SvgaDevice*>(raw_device_)->~SvgaDevice();
     else static_cast<VirglDevice*>(raw_device_)->~VirglDevice();
   }
+#ifdef TCOS_AMD_VEGAM
+  if (vega_device_) {   // (after the locked wrapper that points to it)
+    vega_device_->~VegaGraphicsDevice();
+    vega_allocator_->deallocate(vega_device_);
+    vega_device_ = nullptr;
+  }
+#endif
   if (intel_stack_) {   // (after the locked wrapper that points into it)
     intel_stack_->~IntelRenderStack();
     intel_allocator_->deallocate(intel_stack_);

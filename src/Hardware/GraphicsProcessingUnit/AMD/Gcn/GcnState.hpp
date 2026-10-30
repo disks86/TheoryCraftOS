@@ -74,6 +74,8 @@ struct DrawState {
   DepthStencilState depth_stencil;
   DepthTarget depth;
   uint8_t ps_param[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};      // SPI_PS_INPUT_CNTL_k.OFFSET: the parameter pixel shader input k reads
+  // The clip space of this OS's devices (IGraphicsDevice: Vulkan's): +Y down the screen and depth 0 to 1, instead of OpenGL's +Y up and -1 to 1.
+  bool device_clip_space = false;
   // The draw: `index_count` vertices (a triangle list) numbered 0, 1, 2 ... (DRAW_INDEX_AUTO), or when `index_address` is not 0 the 32 bit indices at that address (DRAW_INDEX_2).
   uint32_t index_count = 0;
   uint64_t index_address = 0;

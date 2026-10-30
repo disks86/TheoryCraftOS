@@ -34,4 +34,8 @@ struct DxgFallback {
 };
 uint32_t register_dxg_adapters(dxgk::Kernel& kernel, GraphicsPool& pool, allocators::IAllocator& allocator, uint32_t* fallbacks = nullptr, DxgFallback* why = nullptr);
 
+// One node as an adapter (what the function above does for each GPU of the pool), for a GPU that comes up after the pool was made. With `software_fallback` false an accelerated node that
+// fails the self-test is not added at all (it is not given the CPU renderer: the machine has that adapter already); `*fell_back` says whether the self-test failed. True if an adapter was added.
+bool register_dxg_node(dxgk::Kernel& kernel, RenderNode& node, allocators::IAllocator& allocator, bool software_fallback, bool* fell_back = nullptr, DxgFallback* why = nullptr);
+
 }  // namespace graphics

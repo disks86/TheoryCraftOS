@@ -425,6 +425,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Intel/IntelRenderBatch.cpp
   src/Graphics/Graphics3D/IntelGen9/Gen9GraphicsDevice.cpp
   src/Graphics/Graphics3D/IntelGen9/IntelRenderStack.cpp
+  src/Graphics/Graphics3D/Vega/VegaGraphicsDevice.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp

@@ -31,11 +31,13 @@
 
 namespace hardware {
 class IntelGpu;
+class AmdVegaM;
 }
 
 namespace graphics {
 
 class IntelRenderStack;
+class VegaGraphicsDevice;
 
 class RenderNode {
  public:
@@ -43,8 +45,10 @@ class RenderNode {
   // one of those (they carry the 3D command channel). All must outlive this object. With `allow_acceleration` false the CPU renderer is used
   // even where a GPU device would work. `intel` is the same driver when it is an Intel one; its render engine is used only if `allow_intel_render` is true (the path
   // has not run on real hardware: the caller decides, see TCOS_INTEL_RENDER, which is on by default; the node's self-tests fall back to the CPU).
+  // `vega` is a Radeon RX Vega M that is up (AmdVegaM::bring_up, with room for draws: Inputs::draw_area_bytes): its graphics engine is the 3D device when the node is built with
+  // TCOS_AMD_VEGAM and the device draws the test picture. It runs each draw as a round trip to the card, so it is for a GPU that is not the display's (a node with no `gpu` of its own).
   RenderNode(hardware::IGraphicsProcessingUnit* gpu, hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, allocators::IAllocator& allocator,
-             bool allow_acceleration = true, hardware::IntelGpu* intel = nullptr, bool allow_intel_render = false);
+             bool allow_acceleration = true, hardware::IntelGpu* intel = nullptr, bool allow_intel_render = false, hardware::AmdVegaM* vega = nullptr);
   ~RenderNode();
   RenderNode(const RenderNode&) = delete;
   RenderNode& operator=(const RenderNode&) = delete;
@@ -61,8 +65,8 @@ class RenderNode {
 
  private:
   // Look for a 3D engine on the GPU and use it if it works (sets the device, or the reason there is none); and give it back (RenderNodeAccel.cpp).
-  void build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, hardware::IntelGpu* intel, allocators::IAllocator& allocator, bool allow_acceleration,
-                         bool allow_intel_render);
+  void build_accelerated(hardware::VirtioGpu* virtio, hardware::VmwareSvgaGpu* vmware, hardware::IntelGpu* intel, hardware::AmdVegaM* vega, allocators::IAllocator& allocator,
+                         bool allow_acceleration, bool allow_intel_render);
   void destroy_accelerated();
   bool self_test(IGraphicsDevice& device);
   // Draws a triangle on the device and looks at the pixel: for back ends whose protocol could not be tried against a real host in advance.
@@ -80,6 +84,8 @@ class RenderNode {
   bool svga_ = false;
   IntelRenderStack* intel_stack_ = nullptr;          // (RenderNodeAccel.cpp makes and destroys it, so this file needs nothing of the Intel driver)
   allocators::IAllocator* intel_allocator_ = nullptr;
+  VegaGraphicsDevice* vega_device_ = nullptr;        // (the Vega M's device, when it is the node's: allocated from vega_allocator_)
+  allocators::IAllocator* vega_allocator_ = nullptr;
   const char* reason_ = "";
   FixedString<96> reason_text_;
   IGraphicsDevice* gpu_device_ = nullptr;
