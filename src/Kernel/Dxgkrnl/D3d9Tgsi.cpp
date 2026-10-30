@@ -341,10 +341,6 @@ String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot,
         unsupported_ = true;
         break;
       }
-      if (s.number == kSysPrimitiveId) {   // (virglrenderer's GLSL has no gl_PrimitiveID in a pixel shader without a geometry stage: refused, not lost)
-        unsupported_ = true;
-        break;
-      }
       add(base, "TEMP[");
       add_uint(base, kSys + s.number);
       add(base, "]");
@@ -1125,6 +1121,7 @@ void TgsiEmitter::assemble(String* out) {
     }
     if (sys_used_[kSysPosition]) add(*out, "DCL IN[16], POSITION, LINEAR\n");
     if (sys_used_[kSysFrontFacing]) add(*out, "DCL IN[17], FACE, CONSTANT\n");
+    if (sys_used_[kSysPrimitiveId]) add(*out, "DCL IN[18], PRIMID, CONSTANT\n");
     add(*out, "DCL OUT[0], COLOR\n");
     for (uint32_t i = 1; i < p_.color_outputs_; ++i) {
       add(*out, "DCL OUT[");

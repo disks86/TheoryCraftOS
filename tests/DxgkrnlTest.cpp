@@ -5418,7 +5418,7 @@ void test_dxbc_system_values() {
     UniquePointer<D3d9Program> with_primitive = compile_dxbc(allocator, ps_blob, &st);
     CHECK(with_primitive && st == status::kSuccess);
     String refused(allocator);
-    CHECK(with_primitive->emit_tgsi(&refused) == status::kNotSupported);
+    CHECK(with_primitive->emit_tgsi(&refused) == status::kSuccess && __builtin_strstr(refused.c_str(), "PRIMID"));   // (the primitive number is a PRIMID input)
   }
 
   // A device without system values or texel access does not get these shaders (they would read zeros).
