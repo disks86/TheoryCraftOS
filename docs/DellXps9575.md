@@ -10,6 +10,12 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 | Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | H.264, H.265, MPEG-2 and VC-1 on `AmdUvd6VideoEngine`, opt-in (`TCOS_AMD_UVD`), tested in simulation, **not run on hardware** (below); the other codecs on the CPU |
 | 3D acceleration | `Gen9GraphicsDevice` on the render engine, opt-in (`TCOS_INTEL_RENDER`), tested in simulation, **not run on hardware** (below) | none (CPU renderer) |
 
+## Wi-Fi (Intel Wireless-AC 9560, iwlwifi 9000 family)
+
+`src/Hardware/WirelessInterface/Intel/`: **`IwlDevices`** (PCI IDs 0x2526, 0x271B/C, 0x30DC, 0x31DC, 0x9DF0, 0xA370 with their crystal latency / shared clock; the firmware name from the hardware revision and RF id: `iwlwifi-9000-pu-b0-jf-b0-<api>.ucode`, `iwlwifi-9260-th-b0-jf-b0-<api>.ucode`; other MACs, radios and CDB are refused), **`IwlFirmware`** (the `.ucode` TLV file: header, runtime / init / wowlan sections split by the CPU and paging separators, secure sections, flags, API and capability bits, PHY SKU, paging size, firmware version, command versions, image loader; strict length checks) and **`IwlPcie`** (the CSR registers: taking ownership of the card, waking the MAC, APM init / stop, the peripheral and memory windows, interrupts off, the radio switch). Tests: `IwlTest` (synthetic file with every prefix and bit flip, a register model of the chip, and a real firmware file when `IWL_FIRMWARE_FILE` names one).
+
+**Not done:** context-info boot (firmware sections in DMA memory, ALIVE), command and receive queues, NVM / MAC address, the MVM init sequence, scan, authentication and association, WPA2-PSK (4-way handshake, CCMP), transmit and receive, the `IWirelessInterface` binding. The firmware blob is not in the repository. Nothing has run on hardware.
+
 ## Touchpad and touchscreen (HID over I2C)
 
 On this machine neither the touchpad nor the touchscreen is USB or PS/2: both are HID over I2C devices behind the chipset's low power subsystem, described by the ACPI tables as `PNP0C50` / `ACPI0C50`. Without this path the laptop has no pointer.
