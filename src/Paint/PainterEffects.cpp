@@ -525,19 +525,33 @@ void DisplayPainter::draw_shadow(graphics::IRenderer2D& r, const ShadowData& sh,
   // an outer shadow is cut out under the box, an inset one only shows inside it
   const RRect box_shape = RRect::make(static_cast<float>(box.x), static_cast<float>(box.y), static_cast<float>(box.width), static_cast<float>(box.height), sh.radii);
   const uint32_t pitch = static_cast<uint32_t>(work.width);
+  // (inside the box, away from every corner curve, the coverage is exactly 1: no per-pixel evaluation there)
+  float corner = 0.0f;
+  const float radii[8] = {box_shape.tlx, box_shape.tly, box_shape.trx, box_shape.try_, box_shape.brx, box_shape.bry, box_shape.blx, box_shape.bly};
+  for (const float v : radii) corner = v > corner ? v : corner;
+  const int32_t margin = static_cast<int32_t>(corner) + 2;
+  const IRect solid = box.width > 2 * margin && box.height > 2 * margin ? IRect{box.x + margin, box.y + margin, box.width - 2 * margin, box.height - 2 * margin} : IRect{0, 0, 0, 0};
   for (int32_t j = 0; j < work.height; ++j) {
     const int32_t y = work.y + j;
     const bool row_in_box = y >= box.y && y < box.bottom();
-    if (!sh.inset && !row_in_box) continue;
+    const uint64_t row = static_cast<uint64_t>(j) * pitch;
+    if (!row_in_box) {
+      if (sh.inset) data.subview(row, pitch).fill(0);   // (an inset shadow only shows inside the box)
+      continue;
+    }
+    const bool row_solid = y >= solid.y && y < solid.bottom();
     for (int32_t i = 0; i < work.width; ++i) {
       const int32_t x = work.x + i;
-      uint8_t& m = data[static_cast<uint64_t>(j) * pitch + static_cast<uint32_t>(i)];
+      uint8_t& m = data[row + static_cast<uint32_t>(i)];
       if (m == 0) continue;
       if (!sh.inset) {
         if (x < box.x || x >= box.right()) continue;
-        m = to_byte(static_cast<float>(m) * (1.0f - box_shape.coverage(x, y)));
-      } else {
-        m = (row_in_box && x >= box.x && x < box.right()) ? to_byte(static_cast<float>(m) * box_shape.coverage(x, y)) : 0;
+        if (row_solid && x >= solid.x && x < solid.right()) m = 0;
+        else m = to_byte(static_cast<float>(m) * (1.0f - box_shape.coverage(x, y)));
+      } else if (x < box.x || x >= box.right()) {
+        m = 0;
+      } else if (!(row_solid && x >= solid.x && x < solid.right())) {
+        m = to_byte(static_cast<float>(m) * box_shape.coverage(x, y));
       }
     }
   }
