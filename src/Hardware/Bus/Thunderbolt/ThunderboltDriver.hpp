@@ -74,8 +74,8 @@ class ThunderboltDriver {
   IXdomainHost* xdomain_host() { return icm_ ? static_cast<IXdomainHost*>(icm_.get()) : static_cast<IXdomainHost*>(usb4_.get()); }
   // A request of the control channel that interrupts when answered, for checking that an interrupt arrives.
   void probe_control();
-  // Whether runtime suspend is possible (the firmware connection manager's RTD3; not for the software one).
-  bool runtime_allowed() const { return icm_ && icm_->runtime_allowed(); }
+  // Whether runtime suspend is possible (the firmware connection manager's RTD3; for the software one: nothing tunnelled and no other host on the cable).
+  bool runtime_allowed() const { return icm_ ? icm_->runtime_allowed() : usb4_ && usb4_->runtime_allowed(); }
   // Interrupt-driven operation. `on_interrupt()` is what the MSI handler calls: it acknowledges the chip and counts. `interrupts()` is the count, for a loop that polls only after one
   // came (and now and then regardless, in case one was lost). `use_interrupts(true)` unmasks the control channel's ring interrupts in the chip; the MSI itself is the caller's.
   void on_interrupt() {

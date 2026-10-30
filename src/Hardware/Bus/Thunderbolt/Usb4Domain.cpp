@@ -155,6 +155,7 @@ bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port
     *error = "could not read the router's ports";
     return false;
   }
+  read_drom(r);                                            // (before the default pairing, which leaves what it says alone)
   link_lane_adapters(r);
   *index_out = index;
   return true;
@@ -267,6 +268,96 @@ bool Usb4Domain::configuration_valid(Usb4Router& r) {
     delay_us(1000);
   }
   return false;
+}
+
+// ------------------------------------------------------------------ router operations and the DROM
+
+bool Usb4Domain::router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metadata, uint8_t* status, const uint32_t* tx, uint32_t tx_dwords, uint32_t* rx, uint32_t rx_dwords) {
+  if (tx_dwords > kOpDataDwords || rx_dwords > kOpDataDwords) return false;
+  if (metadata && !write(r.route, 0, TbConfigSpace::Switch, kRouterCs25, ArrayView<const uint32_t>(metadata, 1))) return false;
+  if (tx_dwords && !write(r.route, 0, TbConfigSpace::Switch, kRouterCs9, ArrayView<const uint32_t>(tx, tx_dwords))) return false;
+  uint32_t word = opcode | kCs26Ov;
+  if (!write(r.route, 0, TbConfigSpace::Switch, kRouterCs26, ArrayView<const uint32_t>(&word, 1))) return false;
+  bool done = false;
+  for (uint32_t waited = 0; waited < 500000 && !done; waited += 1000) {
+    if (!read(r.route, 0, TbConfigSpace::Switch, kRouterCs26, ArrayView<uint32_t>(&word, 1))) return false;
+    done = (word & kCs26Ov) == 0;
+    if (!done) delay_us(1000);
+  }
+  if (!done || (word & kCs26Ons)) return false;
+  if (status) *status = static_cast<uint8_t>((word & kCs26StatusMask) >> kCs26StatusShift);
+  if (metadata && !read(r.route, 0, TbConfigSpace::Switch, kRouterCs25, ArrayView<uint32_t>(metadata, 1))) return false;
+  if (rx_dwords && !read(r.route, 0, TbConfigSpace::Switch, kRouterCs9, ArrayView<uint32_t>(rx, rx_dwords))) return false;
+  return true;
+}
+
+// DROM_READ in blocks of up to 16 dwords, the address and the length in the metadata (usb4_switch_drom_read_block, and tb_nvm_read_data's handling of unaligned starts).
+bool Usb4Domain::drom_read(const Usb4Router& r, uint32_t address, ByteView out) {
+  uint64_t done = 0;
+  while (done < out.size()) {
+    const uint32_t offset = address & 3;
+    const uint64_t want = out.size() - done;
+    const uint32_t nbytes = static_cast<uint32_t>(want + offset < 64 ? want + offset : 64);
+    const uint32_t dwords = (nbytes + 3) / 4, dwaddress = address / 4;
+    if (dwaddress > 0x1FFF) return false;
+    uint32_t block[kOpDataDwords];
+    bool ok = false;
+    for (uint32_t attempt = 0; attempt < 3 && !ok; ++attempt) {
+      uint32_t metadata = ((dwords << 15) & 0xF8000u) | ((dwaddress << 2) & 0x7FFCu);
+      uint8_t status = 0;
+      ok = router_op(r, kOpDromRead, &metadata, &status, nullptr, 0, block, dwords) && status == 0;
+    }
+    if (!ok) return false;
+    uint8_t bytes[64];
+    for (uint32_t i = 0; i < dwords; ++i)
+      for (uint32_t k = 0; k < 4; ++k) bytes[i * 4 + k] = static_cast<uint8_t>(block[i] >> (8 * k));
+    const uint32_t take = nbytes - offset;
+    for (uint32_t i = 0; i < take; ++i) out[done + i] = bytes[offset + i];
+    done += take;
+    address += take;
+  }
+  return true;
+}
+
+bool Usb4Domain::read_drom(Usb4Router& r) {
+  r.drom = false;
+  uint8_t size_bytes[2];
+  if (!drom_read(r, 14, ByteView(size_bytes, 2))) return false;
+  const uint32_t data_len = (size_bytes[0] | (uint32_t{size_bytes[1]} << 8)) & 0xFFF;
+  const uint32_t total = data_len + 13;
+  if (total < 16 || total > 4096) return false;
+  uint8_t rom[4096];
+  if (!drom_read(r, 0, ByteView(rom, total))) return false;
+  if (rom[13] != 3) return false;                          // (only the USB4 layout: revision 3; the data CRC is not enforced, as in Linux)
+  uint32_t pos = 16;
+  while (pos < total) {
+    const uint8_t len = rom[pos];
+    if (pos + 1 == total || len == 0 || pos + len > total || len < 2) return false;     // (an entry that runs past the end)
+    const uint8_t index = rom[pos + 1] & 0x3F;
+    const bool disabled = (rom[pos + 1] & 0x40) != 0, port_entry = (rom[pos + 1] & 0x80) != 0;
+    if (!port_entry) {
+      if (index == 1 || index == 2) {
+        char* name = index == 1 ? r.vendor_name : r.device_name;
+        uint32_t n = 0;
+        for (; n + 2 < len && n + 1 < sizeof r.vendor_name && rom[pos + 2 + n] != 0; ++n) name[n] = static_cast<char>(rom[pos + 2 + n]);
+        name[n] = 0;
+      }
+    } else if (index >= 1 && index <= r.max_port) {
+      Usb4Port& port = r.ports[index];
+      port.disabled = disabled;
+      if (!disabled && port.type == kTypePort) {
+        if (len != 8) return false;
+        port.link_nr = (rom[pos + 2] >> 4) & 1;
+        if (rom[pos + 2] & 0x80) {
+          const uint32_t other = rom[pos + 3] & 0x3F;
+          if (other >= 1 && other <= r.max_port && other != index) port.dual_link = static_cast<int8_t>(other);
+        }
+      }
+    }
+    pos += len;
+  }
+  r.drom = true;
+  return true;
 }
 
 // ------------------------------------------------------------------ the tree
@@ -416,7 +507,36 @@ void Usb4Domain::close_preboot_tunnels() {
 // ------------------------------------------------------------------ sleep
 
 // usb4_switch_set_sleep: the sleep bit, then wait for the router to say it is ready.
-bool Usb4Domain::put_to_sleep(Usb4Router& r) {
+// usb4_switch_set_wake: every lane adapter with the USB4 port capability (the host router's upstream one is the NHI and has none) is set to wake the host: the upstream one for a USB4 link,
+// a downstream one that is configured for a disconnect and for a link that comes up as USB4, an unconfigured one for a connect; the router itself for PCIe, USB 3 and DisplayPort activity.
+bool Usb4Domain::set_wake(Usb4Router& r, bool runtime) {
+  if (!runtime) return true;                               // (a wake from system sleep is the platform's: nothing is armed here)
+  for (uint32_t p = 1; p <= r.max_port; ++p) {
+    const Usb4Port& port = r.ports[p];
+    if (!port.is_lane() || port.cap_usb4 == 0 || (r.parent < 0 && p == r.upstream_port)) continue;
+    uint32_t word = 0;
+    if (!port_read(r, p, port.cap_usb4 + kPortCs19, ArrayView<uint32_t>(&word, 1))) return false;
+    word &= ~(kPortCs19Woc | kPortCs19Wod | kPortCs19Wou4);
+    if (r.parent >= 0 && p == r.upstream_port) {
+      word |= kPortCs19Wou4;
+    } else {
+      const bool configured = (word & kPortCs19Pc) != 0;
+      if (!configured) word |= kPortCs19Woc;
+      else word |= kPortCs19Wod | kPortCs19Wou4;
+    }
+    if (!port_write(r, p, port.cap_usb4 + kPortCs19, ArrayView<const uint32_t>(&word, 1))) return false;
+  }
+  if (r.parent >= 0) {
+    uint32_t cs5 = 0;
+    if (!read(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<uint32_t>(&cs5, 1))) return false;
+    cs5 |= kCs5Wop | kCs5Wou | kCs5Wod;
+    if (!write(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<const uint32_t>(&cs5, 1))) return false;
+  }
+  return true;
+}
+
+bool Usb4Domain::put_to_sleep(Usb4Router& r, bool runtime) {
+  if (!set_wake(r, runtime)) return false;
   uint32_t cs5 = 0;
   if (!read(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<uint32_t>(&cs5, 1))) return false;
   cs5 |= kCs5Slp;
@@ -429,8 +549,15 @@ bool Usb4Domain::put_to_sleep(Usb4Router& r) {
   return false;
 }
 
-bool Usb4Domain::suspend() {
-  if (!started_ || suspended_) return false;
+bool Usb4Domain::runtime_allowed() const {
+  if (!started_ || suspended_ || xd_.live() != 0) return false;
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used) return false;
+  return true;
+}
+
+bool Usb4Domain::suspend(bool runtime) {
+  if (!started_ || suspended_ || (runtime && !runtime_allowed())) return false;
   plug_count_ = 0;                                         // (events from before the sleep mean nothing after it)
   xd_.clear();                                              // (the other hosts and their paths)
   for (uint32_t i = 0; i < kMaxTunnels; ++i)
@@ -441,7 +568,7 @@ bool Usb4Domain::suspend() {
     for (uint64_t i = 0; i < routers_.count(); ++i) {
       Usb4Router& r = *routers_[i];
       if (!r.present || r.depth != depth) continue;
-      if (!put_to_sleep(r) && depth == 0) host_asleep = false;
+      if (!put_to_sleep(r, runtime) && depth == 0) host_asleep = false;
     }
   }
   for (uint64_t i = 0; i < routers_.count(); ++i) routers_[i]->present = false;
