@@ -36,12 +36,24 @@ ThunderboltDriver::Outcome ThunderboltDriver::start(IPciBus& pci, const PciDevic
   if (!base || !mapper.map_registers(base, kRegisterBytes, &region)) return outcome_ = Outcome::BarUnmapped;
   mmio_ = UniquePointer<MmioTbRegisters>::make(allocator_, region);
   if (!mmio_) return outcome_ = Outcome::OutOfMemory;
-  return start_device(*mmio_);
+  // the controller's own registers through the switch's upstream port, if it has them
+  PciAddress upstream;
+  if (tb_find_upstream_port(pci, device, &upstream)) {
+    upstream_config_ = UniquePointer<PciFunctionConfig>::make(allocator_, pci, upstream);
+    const uint16_t capability = upstream_config_ ? tb_find_vendor_capability(*upstream_config_) : 0;
+    if (capability != 0) cio_ = UniquePointer<TbPcie2Cio>::make(allocator_, *upstream_config_, capability);
+  }
+  return start_device(*mmio_, cio_.get());
 }
 
-ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registers) {
+ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registers, TbPcie2Cio* cio) {
   icm_ = UniquePointer<ThunderboltIcm>::make(allocator_, registers, allocator_);
   if (!icm_) return outcome_ = Outcome::OutOfMemory;
+  ThunderboltIcm::Options options;
+  options.cio = cio;
+  options.start_firmware = config_.start_firmware;
+  options.reset_ports = config_.reset_ports;
+  icm_->set_options(options);
   const ThunderboltIcm::Outcome result = icm_->start();
   // (a controller in safe mode still answers, with no devices: reported as a failure so nobody waits for devices)
   return outcome_ = result == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
@@ -49,6 +61,8 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
 
 void ThunderboltDriver::stop() {
   icm_ = UniquePointer<ThunderboltIcm>();
+  cio_ = UniquePointer<TbPcie2Cio>();
+  upstream_config_ = UniquePointer<PciFunctionConfig>();
   mmio_ = UniquePointer<MmioTbRegisters>();
   outcome_ = Outcome::NotStarted;
 }

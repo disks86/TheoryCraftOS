@@ -24,6 +24,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRing.hpp"
 #include "ObjectContainer/List.hpp"
@@ -85,13 +86,20 @@ class ThunderboltIcm final : public IThunderboltEvents {
     NotStarted,
     Started,
     NotPresent,          // the registers do not answer
-    FirmwareNotRunning,  // the BIOS did not start the firmware; this driver does not
+    FirmwareNotRunning,  // the BIOS did not start the firmware, and this driver was not told to (or cannot)
+    FirmwareStartFailed, // the driver restarted the firmware through the PCIe-to-CIO registers and it did not come up
     ControlFailed,       // the control channel's rings
     AuthTimeout,         // the firmware's NVM image is not authenticated
     SafeMode,            // the controller needs an NVM update before it works: no devices
     WrongMode,           // the firmware is in a mode that does not manage the controller
     DriverReadyFailed,   // no answer to DRIVER_READY
     RootSwitchFailed,    // the root router's configuration space does not become readable
+  };
+  // What the caller can offer beyond the NHI. `cio` is the way through the upstream port's vendor registers (nullptr: none).
+  struct Options {
+    TbPcie2Cio* cio = nullptr;
+    bool start_firmware = false;       // start the firmware if the BIOS did not (needs `cio`); off by default: it resets the controller's CPU
+    bool reset_ports = true;           // bounce the links of both physical ports (needs `cio`) so that the firmware enumerates what is connected afresh
   };
   static constexpr uint32_t kRequestTimeoutUs = 5000000, kApproveTimeoutUs = 10000000, kRetries = 3, kMaxDevices = 32;
 
@@ -101,6 +109,9 @@ class ThunderboltIcm final : public IThunderboltEvents {
   ThunderboltIcm& operator=(const ThunderboltIcm&) = delete;
 
   static const char* outcome_name(Outcome outcome);
+  void set_options(const Options& options) { options_ = options; }
+  // How many of the two port resets failed in the last start() (a failure does not stop the start).
+  uint32_t port_reset_failures() const { return port_reset_failures_; }
 
   // Brings the controller up: interrupts off, the control channel, the firmware's mode, DRIVER_READY, then waits for the root router. Devices that are already connected are reported
   // through events during the next poll() calls.
@@ -130,12 +141,16 @@ class ThunderboltIcm final : public IThunderboltEvents {
 
  private:
   bool request(ConstByteView request, ByteView response, uint32_t timeout_us);
+  bool start_firmware();
+  bool reset_physical_port(uint32_t physical_port);
   void remove_downstream(uint8_t link, uint8_t depth);
 
   TbNhi nhi_;
   TbControl control_;
   List<TbDevice> devices_;
   TbDriverReady ready_;
+  Options options_;
+  uint32_t port_reset_failures_ = 0;
   Outcome outcome_ = Outcome::NotStarted;
 };
 
