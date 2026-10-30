@@ -130,7 +130,8 @@ EXPORT LANGID WINAPI GetUserDefaultLangID(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetSystemDefaultLangID(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetUserDefaultUILanguage(void) { return 0x0409; }
 EXPORT LANGID WINAPI GetSystemDefaultUILanguage(void) { return 0x0409; }
-EXPORT LANGID WINAPI GetThreadUILanguage(LANGID l) { (void)l; return 0x0409; }
+USHORT NTAPI RtlThreadUILanguageInternal(void);
+EXPORT LANGID WINAPI GetThreadUILanguage(void) { return RtlThreadUILanguageInternal(); }
 static LCID g_thread_locale = 0x0409;
 EXPORT LCID WINAPI GetThreadLocale(void) { return g_thread_locale; }
 EXPORT BOOL WINAPI SetThreadLocale(LCID l) { if (!nls_locale_of(l)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } g_thread_locale = l; return TRUE; }

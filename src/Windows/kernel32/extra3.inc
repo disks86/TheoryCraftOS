@@ -279,17 +279,33 @@ EXPORT int WINAPI NormalizeString(int form, LPCWSTR source, int count, LPWSTR de
 
 /* ---- locale information (English, United States) --------------------------------------------------------------------------------------------------------- */
 
-EXPORT int WINAPI GetUserPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) {
-  (void)flags;
-  static const WCHAR en[] = {'e', 'n', '-', 'U', 'S', 0, 0};
-  if (count) *count = 1;
-  if (length) { if (languages && *length < 7) { *length = 7; set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; } *length = 7; }
-  if (languages) memcpy(languages, en, sizeof(en));
-  return TRUE;
+NTSTATUS NTAPI RtlGetSystemPreferredUILanguages(DWORD flags, PVOID unknown, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlGetUserPreferredUILanguages(DWORD flags, PVOID unknown, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlGetProcessPreferredUILanguages(DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlGetThreadPreferredUILanguages(DWORD flags, ULONG *count, WCHAR *buffer, ULONG *size);
+NTSTATUS NTAPI RtlSetThreadPreferredUILanguages(DWORD flags, const WCHAR *languages, ULONG *count);
+NTSTATUS NTAPI RtlSetProcessPreferredUILanguages(DWORD flags, const WCHAR *languages, ULONG *count);
+USHORT NTAPI RtlThreadUILanguageInternal(void);
+int WINAPI LCIDToLocaleName(LCID lcid, LPWSTR name, int capacity, DWORD flags);
+static BOOL ui_result(NTSTATUS status) { if (status == STATUS_SUCCESS) return TRUE; set_error(RtlNtStatusToDosError(status)); return FALSE; }
+EXPORT BOOL WINAPI GetUserPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetUserPreferredUILanguages(flags, NULL, count, languages, length)); }
+EXPORT BOOL WINAPI GetSystemPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetSystemPreferredUILanguages(flags, NULL, count, languages, length)); }
+EXPORT BOOL WINAPI GetThreadPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetThreadPreferredUILanguages(flags, count, languages, length)); }
+EXPORT BOOL WINAPI GetProcessPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return ui_result(RtlGetProcessPreferredUILanguages(flags, count, languages, length)); }
+EXPORT BOOL WINAPI SetThreadPreferredUILanguages(DWORD flags, PCWSTR languages, PULONG count) { return ui_result(RtlSetThreadPreferredUILanguages(flags, languages, count)); }
+EXPORT BOOL WINAPI SetProcessPreferredUILanguages(DWORD flags, PCWSTR languages, PULONG count) { return ui_result(RtlSetProcessPreferredUILanguages(flags, languages, count)); }
+/* SetThreadUILanguage(0) just reports the language; any other makes it the language of the thread. */
+EXPORT LANGID WINAPI SetThreadUILanguage(LANGID language) {
+  if (language) {
+    WCHAR name[85];
+    if (LCIDToLocaleName(language, name, 85, 0) <= 0) return 0;
+    WCHAR list[88] = {0};
+    memcpy(list, name, wcslen(name) * 2);
+    if (!ui_result(RtlSetThreadPreferredUILanguages(0x8, list, NULL))) return 0;
+    return language;
+  }
+  return RtlThreadUILanguageInternal();
 }
-EXPORT BOOL WINAPI GetSystemPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
-EXPORT BOOL WINAPI GetThreadPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
-EXPORT BOOL WINAPI GetProcessPreferredUILanguages(DWORD flags, PULONG count, LPWSTR languages, PULONG length) { return GetUserPreferredUILanguages(flags, count, languages, length); }
 
 /* ---- atoms ----------------------------------------------------------------------------------------------------------------------------------------------- */
 
