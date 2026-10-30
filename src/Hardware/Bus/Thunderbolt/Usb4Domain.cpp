@@ -1447,7 +1447,13 @@ bool Usb4Domain::remove_tunnel(int slot) {
   deactivate_path(&t.up);
   release_path(&t.down);
   release_path(&t.up);
+  const uint8_t group = t.bw_mode || t.kind == Usb4TunnelKind::Dp ? t.group : 0;
   t = Usb4Tunnel();
+  if (group != 0 && group < 8) {                            // (the last stream of a group takes the group's keep with it)
+    bool others = false;
+    for (uint32_t i = 0; i < kMaxTunnels; ++i) others = others || (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].bw_mode && tunnels_[i].group == group);
+    if (!others) group_reserved_[group] = group_timer_[group] = 0;
+  }
   return true;
 }
 
@@ -2042,8 +2048,13 @@ uint32_t Usb4Domain::dp_tunnels() const {
 
 // ------------------------------------------------------------------ CL states
 
+bool Usb4Domain::is_titan_ridge(const Usb4Router& r) {
+  return r.vendor_id == 0x8086 && (r.device_id == 0x15E7 || r.device_id == 0x15EA || r.device_id == 0x15EF);
+}
+
+// Of the Thunderbolt 3 routers only Titan Ridge has CL states (tb_switch_clx_is_supported).
 bool Usb4Domain::clx_supported(const Usb4Router& r) const {
-  if (r.tbt3 || r.usb4_version == 0) return false;
+  if (r.tbt3 ? !is_titan_ridge(r) : r.usb4_version == 0) return false;
   if (r.vendor_id == 0x8086 && (r.device_id == 0x9A1B || r.device_id == 0x9A1D || r.device_id == 0x9A1F || r.device_id == 0x9A21)) return false;     // (tb_switch_is_tiger_lake)
   return true;
 }
@@ -2051,9 +2062,14 @@ bool Usb4Domain::clx_supported(const Usb4Router& r) const {
 // tb_port_clx_supported: a bonded link, no other host, the port says it can (PORT_CS_18.CPS), and the lane adapter lists the states.
 bool Usb4Domain::port_clx_supported(const Usb4Router& r, uint32_t port, uint8_t states) {
   const Usb4Port& p = r.ports[port];
-  if (!p.bonded || p.xdomain || p.cap_usb4 == 0 || p.cap_phy == 0) return false;
+  if (!p.bonded || p.xdomain || p.cap_phy == 0) return false;
   uint32_t word = 0;
-  if (!port_read(r, port, p.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1)) || !(word & kPortCs18Cps)) return false;
+  if (r.tbt3) {                                              // (the link controller says whether the link, an active cable included, supports it: tb_lc_is_clx_supported)
+    uint32_t block = 0;
+    if (!lc_port_block(r, port, &block) || block + kLcLinkAttr >= 0x1F00 || !read(r.route, 0, TbConfigSpace::Switch, block + kLcLinkAttr, ArrayView<uint32_t>(&word, 1)) || !(word & kLcLinkAttrCps)) return false;
+  } else if (p.cap_usb4 == 0 || !port_read(r, port, p.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1)) || !(word & kPortCs18Cps)) {
+    return false;
+  }
   uint32_t mask = 0;
   if (states & kClx0s) mask |= kLaneCs0Cl0sSupport;
   if (states & kClx1) mask |= kLaneCs0Cl1Support;
@@ -2101,8 +2117,27 @@ bool Usb4Domain::clx_enable(Usb4Router& child, uint8_t states) {
     port_clx_set(child, up, states, false);
     return false;
   }
+  if (!mask_clx_objections(child)) {
+    port_clx_set(child, up, states, false);
+    port_clx_set(parent, down, states, false);
+    return false;
+  }
   child.clx = static_cast<uint8_t>(child.clx | states);
   return true;
+}
+
+// A Titan Ridge below the host has two dual-lane ports (lanes 1 2 and 3 4): the objections of the port that is not the upstream one are masked in the low power capability, those of the
+// upstream one unmasked (tb_switch_mask_clx_objections).
+bool Usb4Domain::mask_clx_objections(const Usb4Router& child) {
+  if (!child.tbt3 || !is_titan_ridge(child)) return true;
+  const int cap = find_router_vse(child, kVsecLowPower);
+  if (cap < 0) return false;
+  const bool port_a = child.upstream_port == 1;
+  const uint32_t mask = port_a ? kLowPwrPortBMask : kLowPwrPortAMask, unmask = port_a ? kLowPwrPortAMask : kLowPwrPortBMask, offset = static_cast<uint32_t>(cap) + (port_a ? kLowPwrC1Cl1 : kLowPwrC3Cl1);
+  uint32_t val[2] = {};
+  if (offset + 2 >= 0x1F00 || !read(child.route, 0, TbConfigSpace::Switch, offset, ArrayView<uint32_t>(val, 2))) return false;
+  for (uint32_t& v : val) v = (v | mask) & ~unmask;
+  return write(child.route, 0, TbConfigSpace::Switch, offset, ArrayView<const uint32_t>(val, 2));
 }
 
 bool Usb4Domain::clx_disable(Usb4Router& child) {
@@ -2185,6 +2220,15 @@ int Usb4Domain::dp_available(int slot) {
       for (uint32_t h = 0; h + 1 < other.third.length; ++h)
         if (other.third.hops[h].router == r) { capacity -= static_cast<int>(other.allocated_bw); break; }
     }
+    uint32_t groups = 0;                                     // (what is kept for the groups of the streams that cross the link, once per group, the stream's own included)
+    for (uint32_t i = 0; i < kMaxTunnels; ++i) {
+      const Usb4Tunnel& other = tunnels_[i];
+      if (!other.used || other.kind != Usb4TunnelKind::Dp || !other.bw_mode || other.group >= 8) continue;
+      for (uint32_t h = 0; h + 1 < other.third.length; ++h)
+        if (other.third.hops[h].router == r) { groups |= 1u << other.group; break; }
+    }
+    for (uint32_t g = 1; g < 8; ++g)
+      if (groups & (1u << g)) capacity -= static_cast<int>(group_reserved_[g]);
     if (router.usb4_version >= 2 && router.parent >= 0 && routers_[router.parent]->usb4_version >= 2 && find_tunnel(r, Usb4TunnelKind::Pcie) >= 0) capacity -= 1500;
     const int usb3 = usb3_on_link(r);                        // (what the USB 3 stream is allocated, times the PCIe weight on top of its own: 3 / 2)
     if (usb3 >= 0) capacity -= static_cast<int>(tunnels_[usb3].allocated_bw * 3 / 2);
@@ -2230,7 +2274,8 @@ bool Usb4Domain::dp_enable_bandwidth_mode(int slot) {
   if (!port_read(in, t.down_port, i.cap_adapter + kDpCs2, ArrayView<uint32_t>(&cs2, 1))) return false;
   const uint32_t lane = t.third.length ? t.third.hops[t.third.length - 1].in_port : 1;
   cs2 &= ~(kDpCs2CmIdMask | kDpCs2GroupMask | kDpCs2NrdRateMask | kDpCs2NrdLanesMask | kDpCs2GranularityMask);
-  cs2 |= kDpCs2Cmms | (0u << kDpCs2CmIdShift) | ((((lane - 1) / 2) % 7 + 1) << kDpCs2GroupShift) | (rate_i << kDpCs2NrdRateShift) | lanes_i | ((granularity == 250 ? 0u : granularity == 500 ? 1u : 2u) << kDpCs2GranularityShift);
+  t.group = static_cast<uint8_t>(((lane - 1) / 2) % 7 + 1);
+  cs2 |= kDpCs2Cmms | (0u << kDpCs2CmIdShift) | (static_cast<uint32_t>(t.group) << kDpCs2GroupShift) | (rate_i << kDpCs2NrdRateShift) | lanes_i | ((granularity == 250 ? 0u : granularity == 500 ? 1u : 2u) << kDpCs2GranularityShift);
   if (!port_write(in, t.down_port, i.cap_adapter + kDpCs2, ArrayView<const uint32_t>(&cs2, 1))) return false;
   t.granularity = granularity;
   t.max_bw = (max_bw + granularity - 1) / granularity * granularity;
@@ -2274,16 +2319,42 @@ bool Usb4Domain::dp_serve_request(int slot) {
   if (!port_read(in, t.down_port, p.cap_adapter + kDpCs8, ArrayView<uint32_t>(&cs8, 1)) || !(cs8 & kDpCs8Dr)) return false;
   uint32_t requested = (cs8 & kDpCs8RequestedMask) * t.granularity;
   if (requested > t.max_bw) requested = t.max_bw;
+  if (requested <= t.allocated_bw) {                         // (less or the same: what is given back is kept for the group for a while, tb_alloc_dp_bandwidth)
+    if (t.group < 8 && t.allocated_bw > requested) {
+      group_reserved_[t.group] += t.allocated_bw - requested;
+      group_timer_[t.group] = kGroupReleaseMs;
+    }
+    return dp_allocate(slot, requested);
+  }
   usb3_release_unused(slot);                                // (USB 3 gives back what it holds without using, to make room)
   const int available = dp_available(slot);
-  if (available < 0 || requested > static_cast<uint32_t>(available)) {
+  const uint32_t reserved = t.group < 8 ? group_reserved_[t.group] : 0;
+  if (available < 0 || requested > static_cast<uint32_t>(available) + reserved) {
     dp_allocate(slot, t.allocated_bw);                       // (not enough: the adapter is acknowledged with what it has, so that it stops asking and settles for that)
     usb3_reclaim();
     return false;
   }
   const bool ok = dp_allocate(slot, requested);
+  if (ok && t.group < 8 && requested > static_cast<uint32_t>(available)) {     // (the part that came from the group's keep)
+    const uint32_t used = requested - static_cast<uint32_t>(available);
+    group_reserved_[t.group] -= used < group_reserved_[t.group] ? used : group_reserved_[t.group];
+  }
   usb3_reclaim();
   return ok;
+}
+
+// Time passes: a group's keep is let go when its 10 s are over, and the estimates of the streams are made again.
+void Usb4Domain::advance_time(uint32_t milliseconds) {
+  bool released = false;
+  for (uint32_t g = 1; g < 8; ++g) {
+    if (group_timer_[g] == 0) continue;
+    group_timer_[g] = milliseconds >= group_timer_[g] ? 0 : group_timer_[g] - milliseconds;
+    if (group_timer_[g] == 0 && group_reserved_[g] != 0) {
+      group_reserved_[g] = 0;
+      released = true;
+    }
+  }
+  if (released) dp_recalc_estimates();
 }
 
 // tb_release_unused_usb3_bandwidth: the USB 3 streams on the links this stream crosses are cut down to what they consume.
@@ -2328,7 +2399,7 @@ void Usb4Domain::dp_recalc_estimates() {
     if (!tunnels_[i].used || tunnels_[i].kind != Usb4TunnelKind::Dp || !tunnels_[i].bw_mode) continue;
     const int available = dp_available(static_cast<int>(i));
     if (available < 0) continue;
-    uint32_t estimate = static_cast<uint32_t>(available);      // (what the links have free for it, its own allocation not counted against it)
+    uint32_t estimate = static_cast<uint32_t>(available) + (tunnels_[i].group < 8 ? group_reserved_[tunnels_[i].group] : 0);     // (what the links have free for it, its own allocation not counted against it, the keep of its group added)
     if (estimate > tunnels_[i].max_bw) estimate = tunnels_[i].max_bw;
     dp_write_estimate(static_cast<int>(i), estimate);
   }

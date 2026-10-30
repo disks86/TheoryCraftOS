@@ -426,6 +426,28 @@ bool DisplayPainter::paint_group(graphics::IRenderer2D& r, const DisplayList& li
   }
   const IRect visible = g.intersection(clip_visible);
   if (visible.empty()) return true;
+  // The GPU does a chain of blurs and colour functions on the picture of the content (a drop shadow stays on the CPU).
+  bool on_gpu = r.supports_group_filters();
+  for (uint32_t i = 0; i < chain.count && i < kMaxFilterSteps; ++i) on_gpu = on_gpu && chain.steps[i].kind != FilterStep::DropShadow;
+  if (on_gpu) {
+    // (the picture is the visible part and what the blurs read around it; the clip shows only the visible part when it is laid over the target)
+    const IRect area = grown(visible, reach);
+    r.push_clip_rect(to_rect(visible));
+    bool ok = false;
+    if (r.begin_filter_group(to_rect(area))) {
+      ok = run(r, list, begin + 1, close, dx, dy, area, groups + 1);
+      for (uint32_t i = 0; i < chain.count && i < kMaxFilterSteps; ++i) {
+        const FilterStep& step = chain.steps[i];
+        graphics::ColorTransform t;
+        if (step.kind == FilterStep::Blur) ok = r.group_blur(step.amount) && ok;
+        else if (color_filter_transform(step.kind, step.amount, &t)) ok = r.group_color(t) && ok;
+      }
+      ok = r.end_group(graphics::Matrix2D(), 255, graphics::ImageFilter::Nearest) && ok;
+      r.pop_clip();
+      return ok;
+    }
+    r.pop_clip();
+  }
   const IRect source = grown(visible, reach).intersection(g);
   Pixmap content(allocator_);
   if (!content.create(source.width, source.height)) return run(r, list, begin + 1, close, dx, dy, clip_visible, groups) && false;

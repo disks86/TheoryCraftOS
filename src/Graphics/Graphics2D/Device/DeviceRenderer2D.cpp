@@ -89,6 +89,30 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
       composite_ = device.create_graphics_pipeline(textured);
     }
     groups_ok_ = group_blended_ && texture_group_ && composite_;
+    // clips by a coverage mask: a group through a second texture's alpha
+    masked_fs_ = device.create_shader_module(textured_masked_fragment_shader());
+    if (masked_fs_ && groups_ok_) {
+      textured.fragment_shader = masked_fs_;
+      textured.texture_count = 2;
+      textured.blend = premultiplied;
+      masked_ = device.create_graphics_pipeline(textured);
+      textured.texture_count = 1;
+    }
+    masks_ok_ = groups_ok_ && masked_;
+    // the filters: one pass each, no blending (the result replaces the picture)
+    blur_fs_ = device.create_shader_module(textured_blur_fragment_shader());
+    color_fs_ = device.create_shader_module(textured_color_fragment_shader());
+    textured.blend = BlendState();
+    textured.alpha_blend = false;
+    if (blur_fs_) {
+      textured.fragment_shader = blur_fs_;
+      filter_blur_ = device.create_graphics_pipeline(textured);
+    }
+    if (color_fs_) {
+      textured.fragment_shader = color_fs_;
+      filter_color_ = device.create_graphics_pipeline(textured);
+    }
+    filters_ok_ = groups_ok_ && filter_blur_ && filter_color_;
   }
   for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
@@ -106,8 +130,15 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
 
 DeviceRenderer2D::~DeviceRenderer2D() {
   while (group_depth_) {
-    if (groups_[--group_depth_].image) device_.destroy_image(groups_[group_depth_].image);
+    if (groups_[--group_depth_].mask) device_.destroy_image(groups_[group_depth_].mask);
+    if (groups_[group_depth_].image) device_.destroy_image(groups_[group_depth_].image);
   }
+  if (masked_) device_.destroy_pipeline(masked_);
+  if (masked_fs_) device_.destroy_shader_module(masked_fs_);
+  if (filter_color_) device_.destroy_pipeline(filter_color_);
+  if (filter_blur_) device_.destroy_pipeline(filter_blur_);
+  if (color_fs_) device_.destroy_shader_module(color_fs_);
+  if (blur_fs_) device_.destroy_shader_module(blur_fs_);
   if (composite_) device_.destroy_pipeline(composite_);
   if (texture_group_) device_.destroy_pipeline(texture_group_);
   if (group_blended_) device_.destroy_pipeline(group_blended_);
@@ -257,7 +288,12 @@ void DeviceRenderer2D::quad(float x0, float y0, float x1, float y1, uint32_t col
 void DeviceRenderer2D::apply_clip() {
   close_range();  // what is recorded belongs to the old clip
   Rect2D r = base_clip_;
-  for (uint32_t i = 0; i < clip_depth_; ++i) r = raster::intersect(r, clip_stack_[i]);
+  uint32_t first = 0;
+  if (detach_index_ != kNoDetach && detach_index_ < clip_depth_) {   // (inside a filter group the clips outside it do not apply)
+    r = clip_stack_[detach_index_];
+    first = detach_index_ + 1;
+  }
+  for (uint32_t i = first; i < clip_depth_; ++i) r = raster::intersect(r, clip_stack_[i]);
   if (clip_overflow_) r.width = r.height = 0;  // fail closed
   clip_ = r;
 }
@@ -466,7 +502,7 @@ bool DeviceRenderer2D::draw_textured_quad(IImage& image, int64_t dx, int64_t dy,
   return draw_textured_corners(image, xs, ys, u0, v0, u1, v1, Filter::Nearest);   // (nearest at the pixel centres: the picture's own pixels)
 }
 
-bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale) {
+bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale, IImage* mask) {
   if (!submit_pending()) return false;
   const TexturedVertex tl{{xs[0], ys[0], 0}, {u0, v0}}, tr{{xs[1], ys[1], 0}, {u1, v0}}, br{{xs[2], ys[2], 0}, {u1, v1}}, bl{{xs[3], ys[3], 0}, {u0, v1}};
   const TexturedVertex quad[6] = {tl, tr, br, tl, br, bl};
@@ -480,12 +516,17 @@ bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], c
   pass.color = target_image();
   pass.clear_color = false;
   commands_->begin_render_pass(pass);
-  commands_->bind_pipeline(scale ? composite_ : textured_pipeline(blend_));
+  commands_->bind_pipeline(mask ? masked_ : scale ? composite_ : textured_pipeline(blend_));
   commands_->bind_vertex_buffer(texture_vertices_);
   SamplerDesc sampler;
   sampler.filter = filter;
   sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
   commands_->bind_texture(0, &image, sampler);
+  if (mask) {
+    SamplerDesc nearest;   // (the coverage as it is, at the pixel centres)
+    nearest.address_u = nearest.address_v = AddressMode::ClampToEdge;
+    commands_->bind_texture(1, mask, nearest);
+  }
   TexturedScaledConstants constants;
   fill_matrix(&constants.mvp);
   constants.scale = scale ? *scale : 1.0f;
@@ -898,6 +939,7 @@ bool DeviceRenderer2D::push_clip_rounded_rect(const Rect2D& rect, const CornerRa
   const raster::RRect rr = raster::RRect::make(rect, radii);
   bool square = true;
   for (int i = 0; i < 4; ++i) square = square && rr.rx[i] == 0;
+  if (!square && push_exact_clip(rect, &rr, nullptr)) return true;
   const bool ok = push_clip_rect(rect);
   return ok && square;
 }
@@ -907,13 +949,21 @@ bool DeviceRenderer2D::push_clip_mask(const MaskView& mask, int32_t x, int32_t y
     push_clip_rect({0, 0, 0, 0});
     return false;
   }
-  push_clip_rect({x, y, mask.width, mask.height});
+  const Rect2D area{x, y, mask.width, mask.height};
+  if (push_exact_clip(area, nullptr, &mask)) return true;
+  push_clip_rect(area);
   return false;
 }
 
 void DeviceRenderer2D::pop_clip() {
-  if (clip_overflow_) --clip_overflow_;
-  else if (clip_depth_) --clip_depth_;
+  if (clip_overflow_) {
+    --clip_overflow_;
+  } else if (group_depth_ && groups_[group_depth_ - 1].mask && groups_[group_depth_ - 1].clip_depth + 1 == clip_depth_) {
+    finish_group(Matrix2D(), 255, ImageFilter::Nearest);   // (restores the clips below it)
+    return;
+  } else if (clip_depth_) {
+    --clip_depth_;
+  }
   apply_clip();
 }
 
@@ -956,18 +1006,24 @@ void DeviceRenderer2D::pop_layer() {
   --layer_depth_;
   if (layer_is_group_ & (1u << layer_depth_)) {
     layer_is_group_ &= ~(1u << layer_depth_);
-    end_group(Matrix2D(), groups_[group_depth_ - 1].layer_opacity, ImageFilter::Nearest);
+    unwind_masks();   // (clips left open inside the layer)
+    if (group_depth_) end_group(Matrix2D(), groups_[group_depth_ - 1].layer_opacity, ImageFilter::Nearest);
     return;
   }
+  while (group_depth_ && groups_[group_depth_ - 1].mask && groups_[group_depth_ - 1].clip_depth >= layer_clip_depth_[layer_depth_]) finish_group(Matrix2D(), 255, ImageFilter::Nearest);
   opacity_ = layer_opacity_[layer_depth_];
   clip_depth_ = layer_clip_depth_[layer_depth_];  // clips pushed inside the layer end with it
   clip_overflow_ = layer_clip_overflow_[layer_depth_];
   apply_clip();
 }
 
-bool DeviceRenderer2D::begin_group(const Rect2D& bounds) {
+bool DeviceRenderer2D::begin_group(const Rect2D& bounds) { return open_group(bounds, false); }
+
+bool DeviceRenderer2D::begin_filter_group(const Rect2D& bounds) { return filters_ok_ && open_group(bounds, true); }
+
+bool DeviceRenderer2D::open_group(const Rect2D& bounds, bool detached) {
   if (!valid_ || !groups_ok_ || group_depth_ >= kMaxGroups || opacity_ != 1.0f || clip_depth_ >= kMaxClipDepth) return false;
-  const Rect2D b = raster::intersect(bounds, clip_);
+  const Rect2D b = detached ? bounds : raster::intersect(bounds, clip_);
   if (!b.width || !b.height || uint64_t{b.width} * b.height > (uint64_t{1} << 24)) return false;
   if (!submit_pending()) return false;   // (what was drawn so far goes to the parent first)
   IImage* image = device_.create_image({{b.width, b.height}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
@@ -990,17 +1046,34 @@ bool DeviceRenderer2D::begin_group(const Rect2D& bounds) {
   g.opacity = opacity_;
   g.layer = false;
   g.layer_opacity = 255;
+  g.mask = nullptr;
+  g.detached = detached;
+  g.prev_detach = detach_index_;
   clip_stack_[clip_depth_++] = b;   // (nothing outside the picture)
+  if (detached) {
+    detach_index_ = clip_depth_ - 1;
+    clip_overflow_ = 0;
+  }
   apply_clip();
   return true;
 }
 
+void DeviceRenderer2D::unwind_masks() {
+  while (group_depth_ && groups_[group_depth_ - 1].mask) finish_group(Matrix2D(), 255, ImageFilter::Nearest);
+}
+
 bool DeviceRenderer2D::end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) {
+  unwind_masks();   // (clips left open inside the group end with it)
   if (!group_depth_) return false;
+  return finish_group(m, opacity, filter);
+}
+
+bool DeviceRenderer2D::finish_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) {
   bool ok = submit_pending();   // the group's own shapes into its image
   const Group g = groups_[--group_depth_];
   clip_depth_ = g.clip_depth;   // clips pushed inside the group end with it
   clip_overflow_ = g.clip_overflow;
+  detach_index_ = g.prev_detach;
   opacity_ = g.opacity;
   apply_clip();
   const float lx[4] = {0, static_cast<float>(g.bounds.width), static_cast<float>(g.bounds.width), 0}, ly[4] = {0, 0, static_cast<float>(g.bounds.height), static_cast<float>(g.bounds.height)};
@@ -1011,9 +1084,150 @@ bool DeviceRenderer2D::end_group(const Matrix2D& m, uint8_t opacity, ImageFilter
     ys[i] = m.b * x + m.d * y + m.f;
   }
   const float scale = static_cast<float>(opacity) / 255.0f;
-  ok = ok && draw_textured_corners(*g.image, xs, ys, 0.0f, 0.0f, 1.0f, 1.0f, filter == ImageFilter::Nearest ? Filter::Nearest : Filter::Linear, &scale);
+  ok = ok && draw_textured_corners(*g.image, xs, ys, 0.0f, 0.0f, 1.0f, 1.0f, filter == ImageFilter::Nearest ? Filter::Nearest : Filter::Linear, &scale, g.mask);
+  if (g.mask) device_.destroy_image(g.mask);
   device_.destroy_image(g.image);
   return ok;
+}
+
+// A clip that is not a rectangle, exact: what is drawn under it goes to a group of the clip's bounds, laid over the parent through the clip's coverage at pop_clip().
+bool DeviceRenderer2D::push_exact_clip(const Rect2D& rect, const raster::RRect* rounded, const MaskView* mask) {
+  if (!valid_ || !masks_ok_ || clip_overflow_ || clip_depth_ >= kMaxClipDepth || group_depth_ >= kMaxGroups || opacity_ != 1.0f) return false;
+  const Rect2D b = raster::intersect(rect, clip_);
+  if (!b.width || !b.height) {   // nothing of it is on the target: nothing shows
+    clip_stack_[clip_depth_++] = {0, 0, 0, 0};
+    apply_clip();
+    return true;
+  }
+  const uint64_t count = uint64_t{b.width} * b.height;
+  if (count > (uint64_t{1} << 24) || !prepare_rows(count)) return false;
+  const ArrayView<uint32_t> rows = texture_rows_.first(count);
+  for (uint32_t j = 0; j < b.height; ++j) {
+    const int32_t y = b.y + static_cast<int32_t>(j);
+    for (uint32_t i = 0; i < b.width; ++i) {
+      const int32_t x = b.x + static_cast<int32_t>(i);
+      uint32_t cov = 0;
+      if (rounded) cov = rounded->coverage(x, y);
+      else if (mask) cov = mask->coverage[uint64_t{static_cast<uint32_t>(y - rect.y)} * mask->pitch + static_cast<uint32_t>(x - rect.x)];
+      rows[uint64_t{j} * b.width + i] = cov << 24;
+    }
+  }
+  IImage* image = device_.create_image({{b.width, b.height}, Format::B8G8R8A8Unorm, kImageSampled});
+  if (!image) return false;
+  if (!image->write_pixels(ArrayView<const uint32_t>(texture_rows_.data(), count)) || !open_group(b, false)) {
+    device_.destroy_image(image);
+    return false;
+  }
+  groups_[group_depth_ - 1].mask = image;
+  return true;
+}
+
+// The top group's picture through `pipeline` (one textured rectangle over a new image of the same size, sampled linearly): the result replaces the picture.
+bool DeviceRenderer2D::filter_pass(IPipeline* pipeline, void* constants, uint32_t size, bool) {
+  Group& g = groups_[group_depth_ - 1];
+  const uint32_t w = g.bounds.width, h = g.bounds.height;
+  IImage* dest = device_.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
+  if (!dest) return false;
+  const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+  const TexturedVertex tl{{0, 0, 0}, {0, 0}}, tr{{fw, 0, 0}, {1, 0}}, br{{fw, fh, 0}, {1, 1}}, bl{{0, fh, 0}, {0, 1}};
+  const TexturedVertex quad[6] = {tl, tr, br, tl, br, bl};
+  const ArrayView<TexturedVertex> mapped = texture_vertices_->map().cast<TexturedVertex>();
+  if (mapped.size() < 6) {
+    device_.destroy_image(dest);
+    return false;
+  }
+  mapped.copy_from(ArrayView<const TexturedVertex>(quad, 6));
+  texture_vertices_->unmap();
+  commands_->begin();
+  RenderPassBegin pass;
+  pass.color = dest;
+  pass.clear_color_value = Vec4{0, 0, 0, 0};
+  commands_->begin_render_pass(pass);
+  commands_->bind_pipeline(pipeline);
+  commands_->bind_vertex_buffer(texture_vertices_);
+  SamplerDesc sampler;
+  sampler.filter = Filter::Linear;
+  sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+  commands_->bind_texture(0, g.image, sampler);
+  commands_->push_constants(constants, size);
+  commands_->set_scissor({0, 0, w, h});
+  commands_->draw(6);
+  commands_->end_render_pass();
+  const bool ok = commands_->end() && device_.submit(commands_);
+  if (!ok) {
+    device_.destroy_image(dest);
+    return false;
+  }
+  device_.destroy_image(g.image);
+  g.image = dest;
+  return true;
+}
+
+static Mat4 image_matrix(uint32_t w, uint32_t h) {
+  Mat4 m;
+  m.m[0] = 2.0f / static_cast<float>(w);
+  m.m[5] = 2.0f / static_cast<float>(h);
+  m.m[10] = 0;
+  m.m[12] = -1;
+  m.m[13] = -1;
+  m.m[14] = 0.5f;
+  return m;
+}
+
+// One box blur pass of `radius` texels along a row or a column. Up to radius 8 the 17 taps are on whole texels (and the weights cut off at the radius); beyond it they are
+// spread over the radius, so the box is sampled sparsely (the linear filter fills in between).
+bool DeviceRenderer2D::blur_pass(int32_t radius, bool horizontal) {
+  const Group& g = groups_[group_depth_ - 1];
+  TexturedBlurConstants c;
+  c.mvp = image_matrix(g.bounds.width, g.bounds.height);
+  for (float& w : c.weight) w = 0.0f;
+  const float spacing = radius > 8 ? static_cast<float>(radius) / 8.0f : 1.0f;
+  const int32_t reach = radius > 8 ? 8 : radius;   // taps on each side that count
+  const float each = 1.0f / static_cast<float>(2 * reach + 1);
+  for (int32_t i = 0; i <= reach; ++i) c.weight[i] = each;
+  c.step[0] = horizontal ? spacing / static_cast<float>(g.bounds.width) : 0.0f;
+  c.step[1] = horizontal ? 0.0f : spacing / static_cast<float>(g.bounds.height);
+  c.pad[0] = c.pad[1] = 0;
+  return filter_pass(filter_blur_, &c, sizeof(c), horizontal);
+}
+
+bool DeviceRenderer2D::group_blur(float sigma) {
+  if (!group_depth_ || !filters_ok_) return false;
+  if (!(sigma >= 0.3f)) return true;   // (nothing to blur)
+  if (sigma > 500.0f) sigma = 500.0f;
+  unwind_masks();
+  if (!group_depth_ || !submit_pending()) return false;
+  // three box sizes (odd) whose blurs in a row approximate a Gaussian of that standard deviation (the same as the CPU blur)
+  const float s2 = sigma * sigma;
+  const float ideal = raster::sqrt_f(12.0f * s2 / 3.0f + 1.0f);
+  int32_t wl = static_cast<int32_t>(ideal);
+  if (wl % 2 == 0) --wl;
+  if (wl < 1) wl = 1;
+  const int32_t wu = wl + 2;
+  const float m_ideal = (12.0f * s2 - 3.0f * static_cast<float>(wl * wl) - 12.0f * static_cast<float>(wl) - 9.0f) / (-4.0f * static_cast<float>(wl) - 4.0f);
+  const int32_t m = static_cast<int32_t>(m_ideal + 0.5f);
+  for (int i = 0; i < 3; ++i) {
+    const int32_t radius = ((i < m ? wl : wu) - 1) / 2;
+    if (radius <= 0) continue;
+    if (!blur_pass(radius, true) || !blur_pass(radius, false)) return false;
+  }
+  return true;
+}
+
+bool DeviceRenderer2D::group_color(const ColorTransform& t) {
+  unwind_masks();
+  if (!group_depth_ || !filters_ok_) return false;
+  if (!submit_pending()) return false;
+  const Group& g = groups_[group_depth_ - 1];
+  TexturedColorConstants c;
+  c.mvp = image_matrix(g.bounds.width, g.bounds.height);
+  for (int r = 0; r < 3; ++r) {
+    for (int k = 0; k < 3; ++k) c.row[r][k] = t.m[r * 3 + k];
+    c.row[r][3] = t.add[r];
+  }
+  c.alpha_scale = t.alpha_scale;
+  c.pad[0] = c.pad[1] = c.pad[2] = 0;
+  return filter_pass(filter_color_, &c, sizeof(c), true);
 }
 
 bool DeviceRenderer2D::copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) {

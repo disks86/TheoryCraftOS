@@ -62,7 +62,8 @@ constexpr uint32_t kPortCs1 = 1, kPortCs2 = 2, kSbLengthShift = 8, kSbTargetShif
                    kSbTargetRouter = 0, kSbTargetRetimer = 2, kSbVendorId = 0x00, kSbProductId = 0x01, kSbOpcode = 0x08, kSbMetadata = 0x09, kMaxRetimers = 6,
                    kSbOpErr = 0x20525245, kSbOpOns = 0x444D4321, kSbOpEnumerate = 0x4D554E45, kSbOpQueryLast = 0x5453414C, kSbOpGetNvmSectorSize = 0x53534E47;
 // Thunderbolt 3 device routers: the vendor specific capabilities of their space (plug events, link controller) and the link controller's registers
-constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06;
+constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06, kVsecLowPower = 0x04;
+constexpr uint32_t kLcLinkAttr = 0x97, kLcLinkAttrCps = 1u << 18, kLowPwrC1Cl1 = 1, kLowPwrC3Cl1 = 3, kLowPwrPortAMask = 0x6, kLowPwrPortBMask = 0x18;
 constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlWoc = 1u << 1, kLcSxCtrlWod = 1u << 2, kLcSxCtrlWodpc = 1u << 3, kLcSxCtrlWodpd = 1u << 4, kLcSxCtrlWou4 = 1u << 5, kLcSxCtrlWop = 1u << 6, kLcSxCtrlSlp = 1u << 31, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcCs42 = 0x2A, kLcCs42UsbPlugged = 1u << 31, kLcLinkReq = 0xAD, kLcLinkReqXhciConnect = 1u << 31, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2,
                    kPlugEventsEepromCtl = 4, kPlugEventsDromOffset = 12, kEepromSk = 1u << 0, kEepromCs = 1u << 1, kEepromDi = 1u << 2, kEepromDo = 1u << 3, kEepromBitBang = 1u << 4, kEepromNotPresent = 1u << 5, kEepromPresent = 1u << 7,
                    kPlugEventsPcieWrData = 0x1B, kPlugEventsPcieCmd = 0x1C, kPcieCmdBridgeShift = 10, kPcieCmdWrite = 1u << 21, kPcieCmdValue = 2u << 22, kPcieCmdReqAck = 1u << 30, kPcieCmdTimeout = 1u << 31;
@@ -163,6 +164,7 @@ struct Usb4Tunnel {
   uint8_t down_port = 0, up_port = 0;
   Usb4Path third;                    // a DisplayPort tunnel: down is the video path, up the AUX transmit path, third the AUX receive path
   Usb4Path down, up;                 // down: from the down adapter to the up adapter; up: back (a DMA tunnel: down is the path we send on, up the one we receive on)
+  uint8_t group = 0;                 // a DisplayPort tunnel with the allocation mode: the bandwidth group (1 to 7) of the streams that leave the host by the same lane adapter
   bool bw_mode = false;              // a DisplayPort tunnel whose bandwidth is allocated by the connection manager (the allocation mode of the DP IN adapter)
   uint32_t granularity = 0, max_bw = 0, allocated_bw = 0;      // Mb/s: one step of the adapter's registers, the most the stream can use, what it is given
   uint64_t xdomain_route = 0;        // a DMA tunnel: the route of the other host
@@ -216,6 +218,11 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // Whether the display on the stream's DP IN adapter has been read (DPRX done: its receiver capabilities are in the adapter's local capability register), and the wait for it. The wait
   // is for the caller that knows a display is plugged in (it takes as long as the display needs, up to `timeout_ms`); when it ends in success a stream with the allocation mode gets its
   // maximum from what the display said (tb_dp_bandwidth_mode_maximum_bandwidth).
+  // Bandwidth a stream gave back is kept for its group for 10 s (kGroupReleaseMs) in case it asks again, and only then freed for the streams of other groups (a stream of the group can
+  // use it at once). `advance_time` tells the domain that time has passed; call it from whatever polls. dp_group_reserved() is what a group keeps now.
+  static constexpr uint32_t kGroupReleaseMs = 10000;
+  void advance_time(uint32_t milliseconds);
+  uint32_t dp_group_reserved(uint32_t group) const { return group < 8 ? group_reserved_[group] : 0; }
   bool dp_dprx_done(uint32_t in_router, uint32_t in_port);
   bool dp_wait_dprx(uint32_t in_router, uint32_t in_port, uint32_t timeout_ms);
   // Is the link above this router running both lanes as one?
@@ -377,6 +384,8 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool asym_start(const Usb4Router& r, uint32_t port);
   bool wait_link_width(const Usb4Router& r, uint32_t port, uint32_t widths, uint32_t timeout_us);
   bool clx_supported(const Usb4Router& r) const;
+  static bool is_titan_ridge(const Usb4Router& r);
+  bool mask_clx_objections(const Usb4Router& child);
   bool port_clx_supported(const Usb4Router& r, uint32_t port, uint8_t states);
   bool port_clx_set(const Usb4Router& r, uint32_t port, uint8_t states, bool enable);
   bool clx_enable(Usb4Router& child, uint8_t states);
@@ -413,6 +422,7 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   TbXdomainHost xd_;
   Usb4Tunnel tunnels_[usb4::kMaxTunnels];
   Plug plugs_[kPlugQueue];
+  uint32_t group_reserved_[8] = {}, group_timer_[8] = {};   // per bandwidth group: what is kept for it, the milliseconds until it is let go
   Plug dp_requests_[kPlugQueue];
   uint32_t dp_request_head_ = 0, dp_request_count_ = 0;
   uint32_t plug_head_ = 0, plug_count_ = 0;

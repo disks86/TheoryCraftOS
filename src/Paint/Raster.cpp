@@ -449,7 +449,7 @@ bool blur_pixmap(Pixmap& pixmap, float sigma) {
 
 // ---- Colour filters ----------------------------------------------------------------------------------------------
 
-void color_filter(Pixmap& pixmap, FilterStep::Kind kind, float amount) {
+bool color_filter_transform(FilterStep::Kind kind, float amount, graphics::ColorTransform* out) {
   // rgb' = m * rgb + add, the matrices of the filter effects specification
   float m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
   float add[3] = {0, 0, 0};
@@ -505,8 +505,20 @@ void color_filter(Pixmap& pixmap, FilterStep::Kind kind, float amount) {
       break;
     }
     case FilterStep::Opacity: alpha_scale = clamp01(a); break;
-    default: return;
+    default: return false;
   }
+  for (int i = 0; i < 9; ++i) out->m[i] = m[i];
+  for (int i = 0; i < 3; ++i) out->add[i] = add[i];
+  out->alpha_scale = alpha_scale;
+  return true;
+}
+
+void color_filter(Pixmap& pixmap, FilterStep::Kind kind, float amount) {
+  graphics::ColorTransform t;
+  if (!color_filter_transform(kind, amount, &t)) return;
+  const float* m = t.m;
+  const float* add = t.add;
+  const float alpha_scale = t.alpha_scale;
   const ArrayView<uint32_t> px = pixmap.pixels();
   for (uint64_t i = 0; i < px.size(); ++i) {
     const uint32_t p = px[i], alpha = p >> 24;

@@ -26,3 +26,7 @@
 // false if anything failed. The screen is left showing the last frame: re-attach
 // the console afterwards.
 bool run_graphics_demo(graphics::SystemGraphics& graphics, allocators::IAllocator& allocator);
+
+// Draws offscreen groups with the 2D renderer on `device` and reads them back: 1 when they come out right (group opacity, moved pictures), 2 when the group filters (blur, colour functions) came out right too, 3 when rounded and mask clips came out exact as well, 0 when wrong, -1 when the
+// device does not do them. Needs no screen.
+int check_2d_groups(graphics::IGraphicsDevice& device, allocators::IAllocator& allocator);

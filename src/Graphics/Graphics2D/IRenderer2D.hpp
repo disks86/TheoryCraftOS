@@ -65,6 +65,13 @@ struct Matrix2D {
   float a = 1, b = 0, c = 0, d = 1, e = 0, f = 0;
 };
 
+// A colour filter function on straight (not premultiplied) colours, channels 0..1: rgb' = m * rgb + add (m row by row), alpha' = alpha * alpha_scale; results are clamped.
+struct ColorTransform {
+  float m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  float add[3] = {0, 0, 0};
+  float alpha_scale = 1;
+};
+
 enum class ImageFilter : uint8_t {
   Nearest,   // the texel containing the pixel center
   Bilinear,  // 2x2 texels weighted by distance, alpha-aware, never reading outside the source rectangle
@@ -145,6 +152,23 @@ class IRenderer2D {
   }
   virtual bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) {
     (void)m, (void)opacity, (void)filter;
+    return false;
+  }
+  // Filters on a group's picture, done by the GPU. supports_group_filters() says whether this renderer has them; if so, begin_filter_group() is begin_group() for a
+  // picture that is filtered: its bounds are not cut by the clip in force (a blur reads around what shows) and its own clip is its bounds alone; the clip applies when end_group()
+  // lays the result over the target. Between the drawing and end_group(), group_blur() blurs the picture (a Gaussian of standard deviation `sigma` pixels, made of box blurs;
+  // outside the picture is transparent) and group_color() applies a colour function; each returns false if it could not (the picture is then unfiltered at that step).
+  virtual bool supports_group_filters() const { return false; }
+  virtual bool begin_filter_group(const Rect2D& bounds) {
+    (void)bounds;
+    return false;
+  }
+  virtual bool group_blur(float sigma) {
+    (void)sigma;
+    return false;
+  }
+  virtual bool group_color(const ColorTransform& t) {
+    (void)t;
     return false;
   }
 
