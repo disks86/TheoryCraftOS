@@ -42,7 +42,8 @@ constexpr uint32_t kTypeInactive = 0, kTypePort = 0x000001, kTypeNhi = 0x000002,
                    kTypeUsb3Down = 0x200101, kTypeUsb3Up = 0x200102;
 // the lane adapter capability (LANE_ADP_CS_0 and 1, relative to the PHY capability) and the USB4 port capability
 constexpr uint32_t kLaneCs0 = 0, kLaneCs0WidthShift = 20, kLaneCs0WidthMask = 0x3F, kLaneCs0WidthDual = 2, kLaneCs1 = 1, kLaneCs1TargetWidthMask = 3u << 4, kLaneCs1TargetSingle = 1u << 4,
-                   kLaneCs1TargetDual = 3u << 4, kLaneCs1Lb = 1u << 15, kLaneCs1CurrentWidthShift = 20, kLaneCs1CurrentWidthMask = 0x3Fu << 20, kPortCs18 = 0x12, kPortCs18Be = 1u << 8;
+                   kLaneCs1TargetDual = 3u << 4, kLaneCs1Lb = 1u << 15, kLaneCs1CurrentWidthShift = 20, kLaneCs1CurrentWidthMask = 0x3Fu << 20, kPortCs18 = 0x12, kPortCs18Be = 1u << 8, kPortCs18Csa = 1u << 22, kPortCs18Tip = 1u << 24, kPortCs19StartAsym = 1u << 24,
+                   kLaneCs1TargetAsymMask = 3u << 6, kLaneCs1TargetAsymTx = 1u << 6, kLaneCs1TargetAsymRx = 2u << 6, kLaneCs1CurrentSpeedShift = 16, kLaneCs1CurrentSpeedMask = 0xFu << 16, kLaneSpeedGen4 = 2, kLaneSpeedGen3 = 4;
 // USB 3 adapters (ADP_USB3_CS_*, relative to the adapter capability)
 constexpr uint32_t kUsb3Cs0Pe = 1u << 31, kUsb3Cs1 = 1, kUsb3Cs1Hca = 1u << 31, kUsb3Cs2 = 2, kUsb3Cs2Cmr = 1u << 31, kUsb3Cs3 = 3, kUsb3Cs4 = 4, kUsb3Cs4MslrShift = 12, kUsb3Cs4MslrMask = 0x7F, kUsb3Cs4Mslr20G = 1,
                    kUsb3Hop = 8, kUsb3Priority = 3, kUsb3Weight = 2;
@@ -132,6 +133,9 @@ struct Usb4Path {
   bool activated = false;
 };
 
+// The width of a link: one lane, two lanes bonded, or (USB4 version 2, 80 Gb/s links) three lanes one way and one the other. The values are what the lane adapter reports.
+enum class Usb4LinkWidth : uint8_t { Single = 1, Dual = 2, AsymTx = 4, AsymRx = 8 };
+
 enum class Usb4TunnelKind : uint8_t { Pcie, Usb3, Dma, Dp };
 
 struct Usb4Tunnel {
@@ -184,6 +188,12 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   uint32_t dp_tunnels() const;
   // Is the link above this router running both lanes as one?
   bool link_bonded(uint32_t router_index) const;
+  // The current width of the link above a router, read from its lane adapter (0 for the host router or a link that cannot be read).
+  Usb4LinkWidth link_width(uint32_t router_index);
+  // Changes the link above a router between two lanes bonded and the asymmetric forms with three lanes in one direction (AsymTx: three from the host towards the router): both routers must be
+  // USB4 version 2, the link must run at generation 4 and both ends must support the change (PORT_CS_18.CSA). The host-side policy of when an asymmetric link is worth it (bandwidth demand) is
+  // the caller's. Refused with a tunnel of a bandwidth-sensitive kind (DisplayPort) through the link.
+  bool set_link_width(uint32_t router_index, Usb4LinkWidth width, const char** error);
 
   // Sleep (tb_suspend): every tunnel is taken down and each router told to sleep, the ones farthest from the host first (ROUTER_CS_5.SLP, waiting for SLPR), and the topology is forgotten.
   // resume() starts afresh - the host router is configured again and everything below it found again, the links having come up on their own - so no tunnel is restored: they are approved
@@ -302,6 +312,11 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool remove_tunnel(int slot);
   bool set_adapter_enable(const Usb4Router& r, uint32_t port, Usb4TunnelKind kind, bool enable);
   bool usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_port, const Usb4Router& device, uint32_t up_port);
+  int link_generation(const Usb4Router& r, uint32_t port);
+  bool asym_supported(const Usb4Router& r, uint32_t port);
+  bool set_asym_width(const Usb4Router& r, uint32_t port, Usb4LinkWidth width);
+  bool asym_start(const Usb4Router& r, uint32_t port);
+  bool wait_link_width(const Usb4Router& r, uint32_t port, uint32_t widths, uint32_t timeout_us);
   bool bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_port);
   int lane_width(const Usb4Router& r, uint32_t port);
   bool set_lane_width(const Usb4Router& r, uint32_t port, uint32_t target);

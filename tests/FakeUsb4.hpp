@@ -147,6 +147,8 @@ class Fabric {
   }
   bool tmu_ucap = true;                                          // new routers support the uni-directional TMU mode
   bool refuse_sleep = false;                                     // ROUTER_CS_6.SLPR never comes up
+  bool gen4_links = false;                                       // every link runs at generation 4 and reports asymmetric widths as asked
+  bool asym_stuck = false;                                       // the transition never completes
   bool dp_handshake_never_done = false;                         // CMHS stays set
   bool no_usb3_ack = false;                                      // the USB 3 adapter never grants the connection manager its request
   bool bond_never_completes = false;                             // the link keeps reporting one lane
@@ -169,7 +171,7 @@ class Fabric {
     p.space[0x10] = 0x20 | (kPortCapPhy << 8) | (2u << 20);       // the lane adapter capability, next at 0x20; it supports two lanes
     p.space[0x20] = 0x40 | (kPortCapUsb4 << 8);                   // the USB4 capability, next the TMU one
     p.space[0x40] = (kPortCapTime1 << 8);
-    p.space[0x20 + kPortCs18] = kPortCs18Be;                      // bonding enabled
+    p.space[0x20 + kPortCs18] = kPortCs18Be | kPortCs18Csa;       // bonding and asymmetric links supported
     return p;
   }
   static Port usb3(uint32_t number, uint32_t type) {
@@ -307,7 +309,11 @@ class Fabric {
     Port& p = r.ports[port];
     if (i == 0x11 && p.type == kTypePort) {                                            // the lane adapter's second dword (PHY capability at 0x10)
       const bool dual = (p.space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual && !bond_never_completes;
-      return (p.space[0x11] & (kLaneCs1TargetWidthMask | kLaneCs1Lb)) | (p.state << 26) | ((dual ? 2u : 1u) << kLaneCs1CurrentWidthShift);
+      const uint32_t asym = p.space[0x11] & kLaneCs1TargetAsymMask;
+      uint32_t width = dual ? 2u : 1u;
+      if (gen4_links) width = asym == kLaneCs1TargetAsymTx ? 4u : asym == kLaneCs1TargetAsymRx ? 8u : (dual || width == 2 ? 2u : (bond_never_completes ? 1u : 2u));
+      if (asym_stuck) width = 2u;
+      return (p.space[0x11] & (kLaneCs1TargetWidthMask | kLaneCs1Lb | kLaneCs1TargetAsymMask)) | (p.state << 26) | (width << kLaneCs1CurrentWidthShift) | ((gen4_links ? kLaneSpeedGen4 : kLaneSpeedGen3) << kLaneCs1CurrentSpeedShift);
     }
     return p.space[i];
   }
@@ -316,6 +322,10 @@ class Fabric {
     if (i == 4 && p.type == kTypePort) {                                               // ADP_CS_4: the lock bit
       p.space[4] = v;
       if (!(v & kAdpCs4Lck)) p.locked = false;
+      return;
+    }
+    if (p.type == kTypePort && i == 0x20 + 0x13 && (v & kPortCs19StartAsym)) {         // the transition starts and ends at once
+      p.space[i] = v & ~kPortCs19StartAsym;
       return;
     }
     if (p.type == kTypeDpOut && i == 0x10 + kDpStatusCtrl) {                            // the connection manager handshake completes at once

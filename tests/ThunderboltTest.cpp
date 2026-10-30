@@ -3572,6 +3572,52 @@ static void test_usb4_dp() {
   control.stop();
 }
 
+static void test_usb4_asymmetric() {
+  {   // a generation 4 link between version 2 routers: three lanes towards the router, back to two, three towards the host
+    Usb4Rig rig(false);
+    rig.fabric.gen4_links = true;
+    rig.fabric.at(0).version = 0x40;
+    rig.fabric.at(0x01).version = 0x40;
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && domain.link_bonded(1) && domain.link_width(1) == Usb4LinkWidth::Dual && domain.link_width(0) == static_cast<Usb4LinkWidth>(0));
+    fake_usb4::Router& host = rig.fabric.at(0);
+    fake_usb4::Router& d1 = rig.fabric.at(0x01);
+    // bonding at generation 4 went through the asymmetric bits (dual is zero there), not the target width bits
+    CHECK((host.ports[1].space[0x11] & kLaneCs1TargetAsymMask) == 0 && (host.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == 0);
+    CHECK(domain.set_link_width(1, Usb4LinkWidth::Dual, &error));                              // (already)
+    CHECK(domain.set_link_width(1, Usb4LinkWidth::AsymTx, &error) && domain.link_width(1) == Usb4LinkWidth::AsymTx);
+    CHECK((d1.ports[1].space[0x11] & kLaneCs1TargetAsymMask) == kLaneCs1TargetAsymTx && (host.ports[1].space[0x11] & kLaneCs1TargetAsymMask) == kLaneCs1TargetAsymRx);
+    CHECK(!domain.set_link_width(1, Usb4LinkWidth::AsymRx, &error) && error);                  // via symmetric first
+    CHECK(domain.set_link_width(1, Usb4LinkWidth::Dual, &error) && domain.link_width(1) == Usb4LinkWidth::Dual && (d1.ports[1].space[0x11] & kLaneCs1TargetAsymMask) == 0);
+    CHECK(domain.set_link_width(1, Usb4LinkWidth::AsymRx, &error) && domain.link_width(1) == Usb4LinkWidth::AsymRx && (d1.ports[1].space[0x11] & kLaneCs1TargetAsymMask) == kLaneCs1TargetAsymRx);
+    CHECK(!domain.set_link_width(1, Usb4LinkWidth::Single, &error) && !domain.set_link_width(0, Usb4LinkWidth::Dual, &error) && !domain.set_link_width(9, Usb4LinkWidth::Dual, &error));
+    // paths over the link still work (credits double with the bonded lanes)
+    CHECK(domain.set_link_width(1, Usb4LinkWidth::Dual, &error) && domain.approve_pcie(1, &error));
+    // a stuck transition is reported
+    rig.fabric.asym_stuck = true;
+    CHECK(!domain.set_link_width(1, Usb4LinkWidth::AsymTx, &error) && error);
+  }
+  {   // not available: version 1 routers, a generation 3 link, one end without the capability
+    Usb4Rig rig(false);
+    Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+    const char* error = nullptr;
+    CHECK(domain.start(nullptr) && !domain.set_link_width(1, Usb4LinkWidth::AsymTx, &error) && error);
+    Usb4Rig gen3(false);
+    gen3.fabric.at(0).version = 0x40;
+    gen3.fabric.at(0x01).version = 0x40;
+    Usb4Domain d3(gen3.control, gen3.nhi, gen3.alloc);
+    CHECK(d3.start(nullptr) && !d3.set_link_width(1, Usb4LinkWidth::AsymTx, &error));
+    Usb4Rig half(false);
+    half.fabric.gen4_links = true;
+    half.fabric.at(0).version = 0x40;
+    half.fabric.at(0x01).version = 0x40;
+    half.fabric.at(0).ports[1].space[0x20 + kPortCs18] &= ~kPortCs18Csa;
+    Usb4Domain d4(half.control, half.nhi, half.alloc);
+    CHECK(d4.start(nullptr) && !d4.set_link_width(1, Usb4LinkWidth::AsymTx, &error));
+  }
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3625,6 +3671,7 @@ int main() {
   test_usb4_credits();
   test_usb4_tbt3_device();
   test_usb4_dp();
+  test_usb4_asymmetric();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();

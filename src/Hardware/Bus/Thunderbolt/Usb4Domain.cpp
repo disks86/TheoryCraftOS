@@ -1669,6 +1669,122 @@ uint32_t Usb4Domain::dp_tunnels() const {
 
 // ------------------------------------------------------------------ lane bonding
 
+int Usb4Domain::link_generation(const Usb4Router& r, uint32_t port) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t word = 0;
+  if (p.cap_phy == 0 || !port_read(r, port, p.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return 0;
+  const uint32_t speed = (word & kLaneCs1CurrentSpeedMask) >> kLaneCs1CurrentSpeedShift;
+  return speed == kLaneSpeedGen4 ? 4 : speed == kLaneSpeedGen3 ? 3 : speed == 8 ? 2 : 0;
+}
+
+bool Usb4Domain::asym_supported(const Usb4Router& r, uint32_t port) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t word = 0;
+  return p.cap_usb4 != 0 && port_read(r, port, p.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1)) && (word & kPortCs18Csa);
+}
+
+// usb4_port_asym_set_link_width: the target of the asymmetric width bits of the lane adapter (dual is 0 there).
+bool Usb4Domain::set_asym_width(const Usb4Router& r, uint32_t port, Usb4LinkWidth width) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t word = 0;
+  if (p.cap_phy == 0 || !port_read(r, port, p.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return false;
+  word &= ~kLaneCs1TargetAsymMask;
+  if (width == Usb4LinkWidth::AsymTx) word |= kLaneCs1TargetAsymTx;
+  else if (width == Usb4LinkWidth::AsymRx) word |= kLaneCs1TargetAsymRx;
+  else if (width != Usb4LinkWidth::Dual) return false;
+  return port_write(r, port, p.cap_phy + kLaneCs1, ArrayView<const uint32_t>(&word, 1));
+}
+
+// usb4_port_asym_start: START_ASYM is written and must clear within a second (the transition began), then TIP must clear within five (it is done).
+bool Usb4Domain::asym_start(const Usb4Router& r, uint32_t port) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t word = 0;
+  if (p.cap_usb4 == 0 || !port_read(r, port, p.cap_usb4 + kPortCs19, ArrayView<uint32_t>(&word, 1))) return false;
+  word |= kPortCs19StartAsym;
+  if (!port_write(r, port, p.cap_usb4 + kPortCs19, ArrayView<const uint32_t>(&word, 1))) return false;
+  bool started = false;
+  for (uint32_t waited = 0; waited < 1000000 && !started; waited += 1000) {
+    started = port_read(r, port, p.cap_usb4 + kPortCs19, ArrayView<uint32_t>(&word, 1)) && !(word & kPortCs19StartAsym);
+    if (!started) delay_us(1000);
+  }
+  if (!started) return false;
+  for (uint32_t waited = 0; waited < 5000000; waited += 1000) {
+    if (!port_read(r, port, p.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1))) return false;
+    if (!(word & kPortCs18Tip)) return true;
+    delay_us(1000);
+  }
+  return false;
+}
+
+bool Usb4Domain::wait_link_width(const Usb4Router& r, uint32_t port, uint32_t widths, uint32_t timeout_us) {
+  for (uint32_t waited = 0; waited < timeout_us; waited += 1000) {
+    const int width = lane_width(r, port);
+    if (width > 0 && (static_cast<uint32_t>(width) & widths)) return true;
+    delay_us(1000);
+  }
+  return false;
+}
+
+Usb4LinkWidth Usb4Domain::link_width(uint32_t router_index) {
+  const Usb4Router* r = router(router_index);
+  if (!r || r->parent < 0) return static_cast<Usb4LinkWidth>(0);
+  const int width = lane_width(*r, r->upstream_port);
+  return width > 0 ? static_cast<Usb4LinkWidth>(width) : static_cast<Usb4LinkWidth>(0);
+}
+
+bool Usb4Domain::set_link_width(uint32_t router_index, Usb4LinkWidth width, const char** error) {
+  const char* local = nullptr;
+  if (!error) error = &local;
+  Usb4Router* child = router_index < routers_.count() && routers_[router_index]->present ? routers_[router_index].get() : nullptr;
+  if (!started_ || !child || child->parent < 0) {
+    *error = "no such router";
+    return false;
+  }
+  Usb4Router& parent = *routers_[child->parent];
+  const uint32_t up = child->upstream_port, down = child->parent_port;
+  if (child->usb4_version < 2 || parent.usb4_version < 2 || link_generation(*child, up) < 4 || !asym_supported(*child, up) || !asym_supported(parent, down)) {
+    *error = "the link cannot be asymmetric";
+    return false;
+  }
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && (tunnels_[i].device_router == static_cast<int>(router_index) || tunnels_[i].host_router == static_cast<int>(router_index))) {
+      *error = "a DisplayPort stream runs over the link";
+      return false;
+    }
+  const int current = lane_width(*child, up);
+  if (current <= 0) {
+    *error = "the link width cannot be read";
+    return false;
+  }
+  if (static_cast<uint32_t>(current) == static_cast<uint32_t>(width)) return true;
+  bool ok;
+  if (width == Usb4LinkWidth::Dual) {
+    // tb_switch_asym_disable: both ends back to dual; the router that had three transmit lanes starts the change
+    ok = set_asym_width(*child, up, Usb4LinkWidth::Dual) && set_asym_width(parent, down, Usb4LinkWidth::Dual);
+    if (ok && current > static_cast<int>(Usb4LinkWidth::Dual)) ok = asym_start(current == static_cast<int>(Usb4LinkWidth::AsymTx) ? *child : parent, current == static_cast<int>(Usb4LinkWidth::AsymTx) ? up : down) &&
+                                                                  wait_link_width(*child, up, static_cast<uint32_t>(Usb4LinkWidth::Dual), 100000);
+  } else if (width == Usb4LinkWidth::AsymTx || width == Usb4LinkWidth::AsymRx) {
+    // tb_switch_asym_enable: the device router's width as asked, the host's the opposite; the router that gains the third transmit lane starts the change
+    const Usb4LinkWidth host_width = width == Usb4LinkWidth::AsymTx ? Usb4LinkWidth::AsymRx : Usb4LinkWidth::AsymTx;
+    const bool start_on_host = width == Usb4LinkWidth::AsymTx;
+    if (current == static_cast<int>(Usb4LinkWidth::AsymTx) || current == static_cast<int>(Usb4LinkWidth::AsymRx)) {
+      *error = "go through the symmetric width first";
+      return false;
+    }
+    ok = set_asym_width(*child, up, width) && set_asym_width(parent, down, host_width) && (start_on_host ? asym_start(parent, down) : asym_start(*child, up)) &&
+         wait_link_width(*child, up, static_cast<uint32_t>(width), 100000);
+  } else {
+    *error = "a single lane cannot be asked for on this link";
+    return false;
+  }
+  if (!ok) {
+    *error = "the transition did not complete";
+    return false;
+  }
+  child->ports[up].bonded = parent.ports[down].bonded = true;
+  return true;
+}
+
 int Usb4Domain::lane_width(const Usb4Router& r, uint32_t port) {
   const Usb4Port& p = r.ports[port];
   uint32_t word = 0;
@@ -1704,6 +1820,8 @@ bool Usb4Domain::bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_
   struct End { Usb4Router* router; uint32_t lane0; bool upstream; };
   const End ends[2] = {{&child, child.upstream_port, true}, {&parent, down_port, false}};
   bool done[2] = {false, false};
+  const bool gen4 = link_generation(parent, down_port) >= 4;                 // (at generation 4 the width is set through the asymmetric bits: dual is zero there)
+  auto set_dual = [&](const Usb4Router& r, uint32_t lane) { return gen4 ? set_asym_width(r, lane, Usb4LinkWidth::Dual) : set_lane_width(r, lane, kLaneCs1TargetDual); };
   auto undo = [&]() {
     for (int i = 0; i < 2; ++i) {
       if (!done[i]) continue;
@@ -1715,9 +1833,9 @@ bool Usb4Domain::bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_
   for (int i = 0; i < 2; ++i) {
     const End& e = ends[i];
     const uint32_t lane1 = static_cast<uint32_t>(e.router->ports[e.lane0].dual_link);
-    if (lane_width(*e.router, e.lane0) == 1 && !set_lane_width(*e.router, e.lane0, kLaneCs1TargetDual)) { undo(); return false; }
+    if (lane_width(*e.router, e.lane0) == 1 && !set_dual(*e.router, e.lane0)) { undo(); return false; }
     const int width1 = lane_width(*e.router, lane1);
-    if (width1 == 1 && !set_lane_width(*e.router, lane1, kLaneCs1TargetDual)) { undo(); return false; }
+    if (width1 == 1 && !set_dual(*e.router, lane1)) { undo(); return false; }
     if (width1 == 1 && !e.upstream) {
       const Usb4Port& p = e.router->ports[e.lane0];
       uint32_t word = 0;
@@ -1729,7 +1847,8 @@ bool Usb4Domain::bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_
   }
   bool dual = false;
   for (uint32_t waited = 0; waited < 100000 && !dual; waited += 1000) {
-    dual = lane_width(parent, down_port) == static_cast<int>(kLaneCs0WidthDual);
+    const int now = lane_width(parent, down_port);
+    dual = now == static_cast<int>(kLaneCs0WidthDual) || (gen4 && (now == static_cast<int>(Usb4LinkWidth::AsymTx) || now == static_cast<int>(Usb4LinkWidth::AsymRx)));
     if (!dual) delay_us(1000);
   }
   if (!dual) { undo(); return false; }
