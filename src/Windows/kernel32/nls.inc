@@ -76,8 +76,18 @@ static const WCHAR *nls_quoted(NlsOut *o, const WCHAR *p) {
   return p;
 }
 
+/* Whether a picture has the day of the month (d or dd outside quotes): then the month names are the genitive forms. */
+static BOOL nls_picture_has_day(const WCHAR *p) {
+  while (*p) {
+    if (*p == '\'') { ++p; while (*p && *p != '\'') ++p; if (*p) ++p; continue; }
+    if (*p == 'd') { int run = 0; while (p[run] == 'd') ++run; if (run <= 2) return TRUE; p += run; continue; }
+    ++p;
+  }
+  return FALSE;
+}
 static void nls_date_picture(NlsOut *o, int kind, const WCHAR *p, const SYSTEMTIME *st) {
   WCHAR scratch[80];
+  const BOOL genitive = nls_picture_has_day(p);
   while (*p) {
     if (*p == '\'') { p = nls_quoted(o, p + 1); continue; }
     const WCHAR c = *p;
@@ -93,7 +103,11 @@ static void nls_date_picture(NlsOut *o, int kind, const WCHAR *p, const SYSTEMTI
       case 'M': {
         if (run > 4) run = 4;
         if (run <= 2) nls_put_number(o, st->wMonth, run);
-        else nls_put_text(o, nls_month_name(kind, st->wMonth, run == 3, scratch));
+        else {
+          const DWORD base = (run == 3 ? 0x44u : 0x38u) + (DWORD)(st->wMonth - 1);
+          if (genitive && nls_text_wide(kind, base | 0x8000u, scratch)) nls_put_text(o, scratch);
+          else nls_put_text(o, nls_month_name(kind, st->wMonth, run == 3, scratch));
+        }
         break;
       }
       case 'y': {
@@ -306,7 +320,7 @@ EXPORT int WINAPI GetLocaleInfoA(LCID locale, LCTYPE type, LPSTR buffer, int cap
     if (capacity < 4) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
     return GetLocaleInfoW(locale, type, (LPWSTR)buffer, 2) ? 4 : 0;
   }
-  if (type & LCT_RETURN_GENITIVE_NAMES) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  if ((type & LCT_RETURN_GENITIVE_NAMES) || (type & 0xFFFF) == 0x79 /* SSHORTTIME */) { set_error(ERROR_INVALID_FLAGS); return 0; }
   WCHAR wide[80];
   const int n = GetLocaleInfoW(locale, type, wide, 80);
   if (n == 0) return 0;
@@ -327,11 +341,14 @@ static BOOL nls_set_info(LCID locale, LCTYPE type, LPCWSTR value) {
   if (nls_locale_of(locale) != nls_default_kind()) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   const DWORD base = type & 0xFFFF;
   switch (base) {
-    case 0x1009 /* ICALENDARTYPE */: case 0x19: case 0x1B: case 0x11: case 0x1073 /* IDIGITSUBSTITUTION */: case 0x100C: case 0x100B: case 0x12: case 0x0D: case 0x1C: case 0x1010:
-    case 0x100A /* IPAPERSIZE */: case 0x23: case 0x28: case 0x29: case 0x14: case 0x1D: case 0x0E: case 0x10: case 0x0C: case 0x20: case 0x16: case 0x18: case 0x17: case 0x13 + 0x1000:
-    case 0x1012 /* SNATIVEDIGITS */: case 0x51: case 0x50: case 0x1F: case 0x1003: case 0x0F: case 0x1E:
+    case 0x1009 /* ICALENDARTYPE */: case 0x19 /* ICURRDIGITS */: case 0x1B /* ICURRENCY */: case 0x11 /* IDIGITS */: case 0x1014 /* IDIGITSUBSTITUTION */: case 0x100C /* IFIRSTDAYOFWEEK */:
+    case 0x100D /* IFIRSTWEEKOFYEAR */: case 0x12 /* ILZERO */: case 0x0D /* IMEASURE */: case 0x1C /* INEGCURR */: case 0x1010 /* INEGNUMBER */: case 0x100A /* IPAPERSIZE */:
+    case 0x23 /* ITIME */: case 0x28 /* S1159 */: case 0x29 /* S2359 */: case 0x14 /* SCURRENCY */: case 0x1D /* SDATE */: case 0x0E /* SDECIMAL */: case 0x10 /* SGROUPING */:
+    case 0x0C /* SLIST */: case 0x20 /* SLONGDATE */: case 0x16 /* SMONDECIMALSEP */: case 0x18 /* SMONGROUPING */: case 0x17 /* SMONTHOUSANDSEP */: case 0x13 /* SNATIVEDIGITS */:
+    case 0x51 /* SNEGATIVESIGN */: case 0x50 /* SPOSITIVESIGN */: case 0x1F /* SSHORTDATE */: case 0x79 /* SSHORTTIME */: case 0x0F /* STHOUSAND */: case 0x1E /* STIME */:
+    case 0x1003 /* STIMEFORMAT */: case 0x1006 /* SYEARMONTH */: case 0x15 /* SINTLSYMBOL */:
       break;
-    default: set_error(ERROR_INVALID_PARAMETER); return FALSE;
+    default: set_error(ERROR_INVALID_FLAGS); return FALSE;
   }
   int length = 0;
   while (value[length]) ++length;
@@ -976,12 +993,21 @@ typedef BOOL (CALLBACK *TIMEFMT_ENUMPROCEX_)(LPWSTR, LPARAM);
 
 /* Calls `call(text)` (wide) for each of the formats until it answers FALSE. */
 typedef BOOL (*nls_each_fn)(const WCHAR *text, void *context);
+static BOOL nls_info_text(int kind, DWORD type, BOOL user_override, WCHAR *out /* 80 */);
+static BOOL nls_each_format_for(int kind, const char *const *list, DWORD info_type, nls_each_fn call, void *context);
 static BOOL nls_each_format(const char *const *list, nls_each_fn call, void *context) {
   for (; *list; ++list) {
     WCHAR text[40];
     nls_widen(text, *list);
     if (!call(text, context)) break;
   }
+  return TRUE;
+}
+/* The formats of a locale: the English (United States) ones come as a list, any other locale has its own format. */
+static BOOL nls_each_format_for(int kind, const char *const *list, DWORD info_type, nls_each_fn call, void *context) {
+  if (kind == nls_default_kind()) return nls_each_format(list, call, context);
+  WCHAR text[80];
+  if (nls_info_text(kind, info_type, FALSE, text)) call(text, context);
   return TRUE;
 }
 static const char *const *nls_date_list(DWORD flags) {
@@ -1011,51 +1037,59 @@ static BOOL nls_each_w(const WCHAR *text, void *context) {
   }
 }
 static BOOL nls_enum_check(int kind, void *proc, BOOL flags_ok) {
+  if (!flags_ok) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
   if (!proc) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   if (kind == 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  if (!flags_ok) { set_error(ERROR_INVALID_FLAGS); return FALSE; }
   return TRUE;
 }
 EXPORT BOOL WINAPI EnumDateFormatsA(DATEFMT_ENUMPROCA_ proc, LCID locale, DWORD flags) {
-  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of(locale);
+  if (!nls_enum_check(kind, (void *)proc, nls_date_flags_ok(flags))) return FALSE;
   NlsEnumContext c = {(void *)proc, 0, 1, 0};
-  return nls_each_format(nls_date_list(flags), nls_each_a, &c);
+  return nls_each_format_for(kind, nls_date_list(flags), ((flags & NLS_DATE_LONGDATE) ? 0x20u : (flags & NLS_DATE_YEARMONTH) ? 0x1006u : 0x1Fu), nls_each_a, &c);
 }
 EXPORT BOOL WINAPI EnumDateFormatsW(DATEFMT_ENUMPROCW_ proc, LCID locale, DWORD flags) {
-  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of(locale);
+  if (!nls_enum_check(kind, (void *)proc, nls_date_flags_ok(flags))) return FALSE;
   NlsEnumContext c = {(void *)proc, 0, 1, 0};
-  return nls_each_format(nls_date_list(flags), nls_each_w, &c);
+  return nls_each_format_for(kind, nls_date_list(flags), ((flags & NLS_DATE_LONGDATE) ? 0x20u : (flags & NLS_DATE_YEARMONTH) ? 0x1006u : 0x1Fu), nls_each_w, &c);
 }
 EXPORT BOOL WINAPI EnumDateFormatsExA(DATEFMT_ENUMPROCEXA_ proc, LCID locale, DWORD flags) {
-  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of(locale);
+  if (!nls_enum_check(kind, (void *)proc, nls_date_flags_ok(flags))) return FALSE;
   NlsEnumContext c = {(void *)proc, 1, 1, 0};
-  return nls_each_format(nls_date_list(flags), nls_each_a, &c);
+  return nls_each_format_for(kind, nls_date_list(flags), ((flags & NLS_DATE_LONGDATE) ? 0x20u : (flags & NLS_DATE_YEARMONTH) ? 0x1006u : 0x1Fu), nls_each_a, &c);
 }
 EXPORT BOOL WINAPI EnumDateFormatsExW(DATEFMT_ENUMPROCEXW_ proc, LCID locale, DWORD flags) {
-  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of(locale);
+  if (!nls_enum_check(kind, (void *)proc, nls_date_flags_ok(flags))) return FALSE;
   NlsEnumContext c = {(void *)proc, 1, 1, 0};
-  return nls_each_format(nls_date_list(flags), nls_each_w, &c);
+  return nls_each_format_for(kind, nls_date_list(flags), ((flags & NLS_DATE_LONGDATE) ? 0x20u : (flags & NLS_DATE_YEARMONTH) ? 0x1006u : 0x1Fu), nls_each_w, &c);
 }
 EXPORT BOOL WINAPI EnumDateFormatsExEx(DATEFMT_ENUMPROCEXEX_ proc, LPCWSTR name, DWORD flags, LPARAM param) {
-  if (!nls_enum_check(nls_locale_of_name(name), (void *)proc, nls_date_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of_name(name);
+  if (!nls_enum_check(kind, (void *)proc, nls_date_flags_ok(flags))) return FALSE;
   NlsEnumContext c = {(void *)proc, 2, 1, param};
-  return nls_each_format(nls_date_list(flags), nls_each_w, &c);
+  return nls_each_format_for(kind, nls_date_list(flags), ((flags & NLS_DATE_LONGDATE) ? 0x20u : (flags & NLS_DATE_YEARMONTH) ? 0x1006u : 0x1Fu), nls_each_w, &c);
 }
 static BOOL nls_time_flags_ok(DWORD flags) { flags &= ~(LCT_USE_CP_ACP | NLS_NOUSEROVERRIDE); return flags == 0 || flags == NLS_TIME_NOSECONDS; }
 EXPORT BOOL WINAPI EnumTimeFormatsA(DATEFMT_ENUMPROCA_ proc, LCID locale, DWORD flags) {
-  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_time_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of(locale);
+  if (!nls_enum_check(kind, (void *)proc, nls_time_flags_ok(flags) && !(flags & NLS_TIME_NOSECONDS))) return FALSE;
   NlsEnumContext c = {(void *)proc, 0, 0, 0};
-  return nls_each_format((flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, nls_each_a, &c);
+  return nls_each_format_for(kind, (flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, ((flags & NLS_TIME_NOSECONDS) ? 0x79u : 0x1003u), nls_each_a, &c);
 }
 EXPORT BOOL WINAPI EnumTimeFormatsW(DATEFMT_ENUMPROCW_ proc, LCID locale, DWORD flags) {
-  if (!nls_enum_check(nls_locale_of(locale), (void *)proc, nls_time_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of(locale);
+  if (!nls_enum_check(kind, (void *)proc, nls_time_flags_ok(flags))) return FALSE;
   NlsEnumContext c = {(void *)proc, 0, 0, 0};
-  return nls_each_format((flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, nls_each_w, &c);
+  return nls_each_format_for(kind, (flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, ((flags & NLS_TIME_NOSECONDS) ? 0x79u : 0x1003u), nls_each_w, &c);
 }
 EXPORT BOOL WINAPI EnumTimeFormatsEx(TIMEFMT_ENUMPROCEX_ proc, LPCWSTR name, DWORD flags, LPARAM param) {
-  if (!nls_enum_check(nls_locale_of_name(name), (void *)proc, nls_time_flags_ok(flags))) return FALSE;
+  const int kind = nls_locale_of_name(name);
+  if (!nls_enum_check(kind, (void *)proc, nls_time_flags_ok(flags))) return FALSE;
   NlsEnumContext c = {(void *)proc, 3, 0, param};
-  return nls_each_format((flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, nls_each_w, &c);
+  return nls_each_format_for(kind, (flags & NLS_TIME_NOSECONDS) ? k_times_short : k_times, ((flags & NLS_TIME_NOSECONDS) ? 0x79u : 0x1003u), nls_each_w, &c);
 }
 
 /* ---- the calendar ------------------------------------------------------------------------------------------------------------------------------------------- */
