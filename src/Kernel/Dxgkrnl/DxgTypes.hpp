@@ -108,6 +108,8 @@ struct AllocationDesc {
   uint32_t mip_levels = 1;           // textures only; more than one needs a texture that is not a render target
   uint64_t size = 0;                 // buffers: bytes
   graphics::TextureKind kind = graphics::TextureKind::Texture2D;   // textures: more than 2D needs the adapter's kFeatureTextureKinds, flags exactly kAllocTexture (kAllocShared too), one mip level, an 8-bit colour format
+  uint32_t samples = 1;              // 2, 4 or 8 (the adapter's kFeatureMultisample and sample counts): a render target of an 8-bit colour format or a depth buffer, nothing else; it has no system-memory
+                                     // backing, cannot be locked, copied, sampled or presented, and is turned into an ordinary image by the stream's ResolveRegion
   uint32_t layers = 1;               // Texture3D: the depth; Texture2DArray: the array size (1 .. graphics::kMaxTextureLayers); TextureCube: 6 (width equals height)
 };
 
@@ -210,6 +212,7 @@ struct PipelineDesc {
   // (the attributes' per_instance flag needs kFeatureInstancing)
   bool independent_blend = false;    // needs kFeatureIndependentBlend: target n (1..3) blends with target_blend[n - 1], target 0 with `blend` (see graphics::GraphicsPipelineDesc)
   graphics::BlendState target_blend[graphics::kMaxColorTargets - 1];
+  bool multisample = false;          // needs kFeatureMultisample: coverage per sample in a pass of multisampled images (see graphics::GraphicsPipelineDesc::multisample)
   uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
 };
 
