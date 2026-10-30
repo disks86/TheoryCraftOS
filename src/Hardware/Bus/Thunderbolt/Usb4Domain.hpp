@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltNvm.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomainHost.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomainTypes.hpp"
 #include "ObjectContainer/List.hpp"
@@ -58,11 +59,14 @@ constexpr uint32_t kDpCs0 = 0, kDpCs0Ae = 1u << 30, kDpCs0Ve = 1u << 31, kDpCs3 
                    kDpCs8 = 8, kDpCs8RequestedMask = 0xFF, kDpCs8Dpme = 1u << 30, kDpCs8Dr = 1u << 31, kDpCommonUhbr10 = 1u << 17, kDpCommonUhbr20 = 1u << 18, kDpCommonUhbr13_5 = 1u << 19, kDpCommonDprxDone = 1u << 31, kDpCommonBwMode = 1u << 28, kErrorDpBandwidth = 32,
                    kDpVideoHop = 9, kDpAuxTxHop = 8, kDpAuxRxHop = 8, kDpVideoPriority = 1, kDpAuxPriority = 2, kDpWeight = 1, kAdpCs4NfcMask = 0x3FF;
 // The sideband channel of a USB4 port (PORT_CS_1 holds the command, PORT_CS_2 on the data) and what retimers answer on it (sb_regs.h)
+constexpr uint32_t kDpOutCs2 = 2, kDpOutCs2Hpd = 1u << 6;
 constexpr uint32_t kPortCs1 = 1, kPortCs2 = 2, kSbLengthShift = 8, kSbTargetShift = 16, kSbRetimerShift = 20, kSbWrite = 1u << 24, kSbNoResponse = 1u << 25, kSbResponseCode = 1u << 26, kSbPending = 1u << 31,
                    kSbTargetRouter = 0, kSbTargetRetimer = 2, kSbVendorId = 0x00, kSbProductId = 0x01, kSbOpcode = 0x08, kSbMetadata = 0x09, kMaxRetimers = 6,
-                   kSbOpErr = 0x20525245, kSbOpOns = 0x444D4321, kSbOpEnumerate = 0x4D554E45, kSbOpQueryLast = 0x5453414C, kSbOpGetNvmSectorSize = 0x53534E47;
+                   kSbOpErr = 0x20525245, kSbOpOns = 0x444D4321, kSbOpEnumerate = 0x4D554E45, kSbOpQueryLast = 0x5453414C, kSbOpGetNvmSectorSize = 0x53534E47, kSbData = 0x12,
+                   kSbOpNvmSetOffset = 0x53504F42, kSbOpNvmBlockWrite = 0x574B4C42, kSbOpNvmAuthWrite = 0x48545541, kSbOpNvmRead = 0x52524641, kSbMetadataAuthMask = 0x3F, kRetimerVendorIntel = 0x8087;
 // Thunderbolt 3 device routers: the vendor specific capabilities of their space (plug events, link controller) and the link controller's registers
-constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06, kVsecLowPower = 0x04;
+constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06, kVsecLowPower = 0x04, kVsecTime2 = 0x03;
+constexpr uint32_t kTime2Cs9 = 9, kTime2Cs9ObjMask = 3u << 16, kTime2Cs26 = 0x1A, kTime2Cs26Td = 1u << 22, kTmuAdpCs6ObjMask = 3u << 2;
 constexpr uint32_t kLcLinkAttr = 0x97, kLcLinkAttrCps = 1u << 18, kLowPwrC1Cl1 = 1, kLowPwrC3Cl1 = 3, kLowPwrPortAMask = 0x6, kLowPwrPortBMask = 0x18;
 constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlWoc = 1u << 1, kLcSxCtrlWod = 1u << 2, kLcSxCtrlWodpc = 1u << 3, kLcSxCtrlWodpd = 1u << 4, kLcSxCtrlWou4 = 1u << 5, kLcSxCtrlWop = 1u << 6, kLcSxCtrlSlp = 1u << 31, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcCs42 = 0x2A, kLcCs42UsbPlugged = 1u << 31, kLcLinkReq = 0xAD, kLcLinkReqXhciConnect = 1u << 31, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2,
                    kPlugEventsEepromCtl = 4, kPlugEventsDromOffset = 12, kEepromSk = 1u << 0, kEepromCs = 1u << 1, kEepromDi = 1u << 2, kEepromDo = 1u << 3, kEepromBitBang = 1u << 4, kEepromNotPresent = 1u << 5, kEepromPresent = 1u << 7,
@@ -207,6 +211,11 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool tunnel_dp(uint32_t in_router, uint32_t in_port, uint32_t out_router, uint32_t out_port, const char** error);
   bool disconnect_dp(uint32_t in_router, uint32_t in_port);
   uint32_t dp_tunnels() const;
+  // The policy for making streams (tb_find_dp_out, tb_tunnel_dp): the output for an input is the first DP OUT adapter, in the order the routers were found, that has a display on it (hot
+  // plug detect), is not in use, is on another router and, if the input is not on the host router, is under the same host lane adapter. `dp_find_output` says which; `dp_connect_displays`
+  // makes a stream for each input that has none yet and returns how many it made. Whoever drives the displays calls these when a display appears (or not at all).
+  bool dp_find_output(uint32_t in_router, uint32_t in_port, uint32_t* out_router, uint32_t* out_port);
+  uint32_t dp_connect_displays();
   // The bandwidth allocation mode of a DisplayPort tunnel (tb_dp_bandwidth_alloc_mode_enable, tb_handle_dp_bandwidth_request): when the DP IN adapter supports it the adapter is told the
   // connection manager does the allocating, the non-reduced rate and lane count, the granularity and the estimate of what is available are written, and nothing is allocated until the adapter
   // asks (an error packet, or dp_poll_requests()). A request is granted if the links on the way can carry it next to the other streams (their allocations and the PCIe share of a version 2 link).
@@ -222,6 +231,8 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // use it at once). `advance_time` tells the domain that time has passed; call it from whatever polls. dp_group_reserved() is what a group keeps now.
   static constexpr uint32_t kGroupReleaseMs = 10000;
   void advance_time(uint32_t milliseconds);
+  // The same from a clock: `now_ms` is any millisecond counter that only goes forward (the first call only reads it).
+  void tick(uint64_t now_ms);
   uint32_t dp_group_reserved(uint32_t group) const { return group < 8 ? group_reserved_[group] : 0; }
   bool dp_dprx_done(uint32_t in_router, uint32_t in_port);
   bool dp_wait_dprx(uint32_t in_router, uint32_t in_port, uint32_t timeout_ms);
@@ -282,11 +293,21 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   // The retimers on the cable behind a USB4 port (tb_retimer_scan): the router is asked to enumerate them, each index is asked whether it is the last, and the vendor, product and NVM sector size of
   // the ones found are read. Done for every port with a link when it is scanned; not the firmware update of a retimer.
   uint8_t retimer_count(uint32_t router_index, uint32_t port) const { const Usb4Router* r = router(router_index); return r && port < usb4::kMaxPorts ? r->ports[port].retimer_count : 0; }
+  // The firmware of a retimer (usb4_port_retimer_nvm_*, tb_retimer_nvm_validate_and_write): the image is checked first (its size, the digital section and the product id in it against the
+  // retimer's) and then written, in blocks, to the retimer's other flash area; nothing is changed until it is authenticated, which restarts the retimer (it stops answering, and a status that
+  // can still be read says whether the image was refused). `index` counts from 0 as retimer() does. Only Intel retimers. Nobody calls these: a wrong image at the wrong time can leave a
+  // dock without its link, so it is for a caller that has the image, the user's say-so and a power supply it can rely on.
+  enum class RetimerNvm : uint8_t { Ok, NoSuchRetimer, Unsupported, BadImage, Failed, AuthFailed };
+  RetimerNvm retimer_nvm_write(uint32_t router_index, uint32_t port, uint32_t index, ConstByteView image);
+  RetimerNvm retimer_nvm_authenticate(uint32_t router_index, uint32_t port, uint32_t index, bool auth_only, uint32_t* status);
+  RetimerNvm retimer_nvm_read(uint32_t router_index, uint32_t port, uint32_t index, uint32_t address, ByteView out);
   const Usb4Port::Retimer* retimer(uint32_t router_index, uint32_t port, uint32_t index) const { const Usb4Router* r = router(router_index); return r && port < usb4::kMaxPorts && index < r->ports[port].retimer_count ? &r->ports[port].retimers[index] : nullptr; }
   bool read_buffer_allocation(Usb4Router& r);
   int sb_transfer(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t reg, bool write_it, uint32_t* data, uint32_t bytes);
   int sb_op(const Usb4Router& r, uint32_t port, uint32_t target, uint32_t index, uint32_t opcode, uint32_t timeout_us);
   void scan_retimers(Usb4Router& r, uint32_t port);
+  const Usb4Port::Retimer* find_retimer(uint32_t router_index, uint32_t port, uint32_t index, const Usb4Router** router) const;
+  bool retimer_set_offset(const Usb4Router& r, uint32_t port, uint32_t sb_index, uint32_t address);
   // Time synchronisation (tmu.c, uni-directional low resolution - the mode the Linux driver starts in): the host router is asked for its rate, each router below it gets the parameters, the
   // adapters on both ends of its link are set to uni-directional with time sync on, and its local time is first set from the host router's so that it starts near it.
   bool tmu_enabled(uint32_t router_index) const { const Usb4Router* r = router(router_index); return r && r->tmu_lowres; }
@@ -386,6 +407,7 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool clx_supported(const Usb4Router& r) const;
   static bool is_titan_ridge(const Usb4Router& r);
   bool mask_clx_objections(const Usb4Router& child);
+  bool tmu_disable_objections(const Usb4Router& r);
   bool port_clx_supported(const Usb4Router& r, uint32_t port, uint8_t states);
   bool port_clx_set(const Usb4Router& r, uint32_t port, uint8_t states, bool enable);
   bool clx_enable(Usb4Router& child, uint8_t states);
@@ -422,6 +444,8 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   TbXdomainHost xd_;
   Usb4Tunnel tunnels_[usb4::kMaxTunnels];
   Plug plugs_[kPlugQueue];
+  uint64_t last_tick_ms_ = 0;
+  bool ticked_ = false;
   uint32_t group_reserved_[8] = {}, group_timer_[8] = {};   // per bandwidth group: what is kept for it, the milliseconds until it is let go
   Plug dp_requests_[kPlugQueue];
   uint32_t dp_request_head_ = 0, dp_request_count_ = 0;
