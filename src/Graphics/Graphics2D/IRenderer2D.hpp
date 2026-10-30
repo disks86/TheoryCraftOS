@@ -171,6 +171,11 @@ class IRenderer2D {
     (void)t;
     return false;
   }
+  // Erases the coverage of a rounded rectangle (anti-aliased like fill_rounded_rect) from a filter group's picture: what was there is multiplied by one minus the coverage.
+  virtual bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) {
+    (void)rect, (void)radii;
+    return false;
+  }
 
   // Fills `rect` with a gradient along the line from `from` to `to` (pixel coordinates; stops at 0 and 1 are
   // at those points, the ends extend as flat color). Stops must be sorted by offset; at most
