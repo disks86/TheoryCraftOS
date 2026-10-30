@@ -409,6 +409,7 @@ ThunderboltIcm::Outcome ThunderboltIcm::bring_up(uint32_t timeout_us, bool resum
   devices_.clear();
   xdomains_.clear();
   ready_ = TbDriverReady();
+  rtd3_veto_ = false;
   if (!nhi_.present()) return outcome_ = Outcome::NotPresent;
   nhi_.disable_interrupts();
   port_reset_failures_ = 0;
@@ -491,10 +492,16 @@ bool ThunderboltIcm::use_interrupts(bool on) {
   return true;
 }
 
-bool ThunderboltIcm::suspend() {
-  if (outcome_ != Outcome::Started) return false;
+bool ThunderboltIcm::runtime_suspend() {
+  if (!runtime_allowed()) return false;
+  return suspend_controller(false);
+}
+
+bool ThunderboltIcm::suspend() { return outcome_ == Outcome::Started && suspend_controller(true); }
+
+bool ThunderboltIcm::suspend_controller(bool save_devices) {
   xdomains_.clear();
-  nhi_.mailbox(tb_mailbox::kSaveDevices, 0, 500000);
+  if (save_devices) nhi_.mailbox(tb_mailbox::kSaveDevices, 0, 500000);
   nhi_.mailbox(tb_mailbox::kDriverUnloads, 0, 500000);
   control_.stop();
   devices_.clear();
@@ -559,6 +566,14 @@ bool ThunderboltIcm::on_event(TbPacketType type, ConstByteView body) {
   if (type != TbPacketType::IcmEvent) return false;
   uint8_t code = 0;
   if (!body.try_get(0, &code)) return false;
+  if (code == tb_icm::kEventRtd3Veto) {
+    // (the veto reason follows the header; zero lifts the veto)
+    ByteReader r(body);
+    r.skip(4);
+    const uint32_t reason = r.le32();
+    if (r.ok()) rtd3_veto_ = reason != 0;
+    return true;
+  }
   if (code == tb_icm::kEventXdomainConnected) {
     TbXDomain x;
     if (!tb_icm::parse_xdomain_connected(body, &x)) return true;

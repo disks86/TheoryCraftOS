@@ -25,6 +25,7 @@
 #include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltPower.hpp"
 #include "Hardware/RegisterMapper.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -65,14 +66,25 @@ class ThunderboltDriver {
   }
   uint32_t interrupts() const { return __atomic_load_n(&interrupts_, __ATOMIC_ACQUIRE); }
   bool use_interrupts(bool on) { return icm_ && icm_->use_interrupts(on); }
-  // System sleep: see ThunderboltIcm::suspend / resume.
-  bool suspend() { return icm_ && icm_->suspend(); }
+  // Sleep. suspend() puts the controller to sleep (ThunderboltIcm::suspend) and the PCI function in D3hot, with its wake-up (PME) armed if `wake` is asked for and the function can raise one
+  // from D3hot (`wake_armed()` says); resume() brings the function back to D0 and the controller up again. runtime_suspend() is the same while the machine runs, for a controller the
+  // firmware allows that for (ThunderboltIcm::runtime_allowed): not with a path to another host open or while the firmware vetoes it.
+  bool suspend(bool wake = false) { return sleep(wake, false); }
+  bool runtime_suspend(bool wake = true) { return sleep(wake, true); }
   Outcome resume();
+  bool wake_armed() const { return wake_armed_; }
+  // Does the function say something woke it? (PME status)
+  bool wake_pending() { return power_ && power_->wake_pending(); }
+  // The power management of the PCI function (done by start(); a test supplies its own).
+  void attach_power(IPciBus& bus, PciAddress address) { power_ = UniquePointer<TbPciPower>::make(allocator_, bus, address); }
 
  private:
+  bool sleep(bool wake, bool runtime);
   allocators::IAllocator& allocator_;
   Config config_;
   uint32_t interrupts_ = 0;
+  bool wake_armed_ = false;
+  UniquePointer<TbPciPower> power_;
   UniquePointer<PciFunctionConfig> upstream_config_;
   UniquePointer<TbPcie2Cio> cio_;
   UniquePointer<MmioTbRegisters> mmio_;
