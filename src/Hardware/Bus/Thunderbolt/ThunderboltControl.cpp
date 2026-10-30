@@ -137,6 +137,11 @@ bool TbControl::send(TbPacketType type, ConstByteView body) {
 
 bool TbControl::matches(TbPacketType type, ConstByteView body) const {
   if (!pending_.active || pending_.done) return false;
+  if (pending_.xdomain) {
+    // the route (the top bit of the first word is set in answers) and the sequence number (bits 27 and 28 of the third word) are the request's
+    return type == TbPacketType::XdomainResponse && body.size() >= 12 && (load_le32(body, 0) & 0x7FFFFFFFu) == (pending_.route >> 32) && load_le32(body, 4) == (pending_.route & 0xFFFFFFFFu) &&
+           ((load_le32(body, 8) >> 27) & 3) == pending_.seq;
+  }
   if (!pending_.config) {
     uint8_t code = 0;
     return type == TbPacketType::IcmResponse && body.try_get(0, &code) && code == pending_.code && body.size() >= pending_.expected_bytes;
@@ -151,6 +156,11 @@ bool TbControl::matches(TbPacketType type, ConstByteView body) const {
 void TbControl::complete(TbPacketType type, ConstByteView body) {
   pending_.done = true;
   pending_.result = Result::Ok;
+  if (pending_.xdomain) {
+    pending_.received = static_cast<uint32_t>(body.size());
+    pending_.out.first(body.size() < pending_.out.size() ? body.size() : pending_.out.size()).copy_from(body.first(body.size() < pending_.out.size() ? body.size() : pending_.out.size()));
+    return;
+  }
   if (!pending_.config) {
     // packet `id` of `total` goes to its place; the request is done when all of them are there
     const uint32_t id = load_le32(body, 0) >> 16 & 0xFF, total = load_le32(body, 0) >> 24;
@@ -207,7 +217,6 @@ void TbControl::handle(const TbCompletion& completion, IThunderboltEvents* event
   switch (type) {
     case TbPacketType::Event:
     case TbPacketType::XdomainRequest:
-    case TbPacketType::XdomainResponse:
     case TbPacketType::IcmEvent:
       if (events) events->on_event(type, body);
       return;
@@ -237,6 +246,26 @@ TbControl::Result TbControl::wait(uint32_t timeout_us, IThunderboltEvents* event
     if (waited >= timeout_us) return Result::Timeout;
     delay_us(kPollStepUs);
   }
+}
+
+TbControl::Result TbControl::xdomain_request(ConstByteView request, ByteView response, uint32_t* received, uint32_t timeout_us, IThunderboltEvents* events) {
+  if (!running_) return Result::NotRunning;
+  if (request.size() < 12 || request.size() % 4 != 0) return Result::Failed;
+  const uint64_t route = (static_cast<uint64_t>(load_le32(request, 0)) << 32) | load_le32(request, 4);
+  pending_ = Pending();
+  pending_.active = true;
+  pending_.xdomain = true;
+  pending_.route = route & ~(1ull << 63);
+  pending_.seq = static_cast<uint8_t>((load_le32(request, 8) >> 27) & 3);
+  pending_.out = response;
+  if (!send(TbPacketType::XdomainRequest, request)) {
+    pending_ = Pending();
+    return Result::Failed;
+  }
+  const Result result = wait(timeout_us, events);
+  if (received) *received = pending_.received;
+  pending_ = Pending();
+  return result;
 }
 
 TbControl::Result TbControl::icm_request(ConstByteView request, ByteView response, uint32_t timeout_us, IThunderboltEvents* events) {

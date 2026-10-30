@@ -64,6 +64,8 @@ inline std::vector<uint32_t> words_of(const std::vector<uint8_t>& frame, bool ch
   return words;
 }
 
+static const uint8_t protocol_uuid[16] = {0xB6, 0x38, 0xD7, 0x0E, 0x42, 0xFF, 0x40, 0xBB, 0x97, 0xC2, 0x90, 0xE2, 0xC0, 0xB2, 0xFF, 0x07};
+
 enum Pdf : uint8_t { kRead = 1, kWrite = 2, kError = 3, kEvent = 5, kIcmEvent = 10, kIcmCommand = 11, kIcmResponse = 12 };
 
 struct Device {
@@ -94,6 +96,16 @@ class FakeNhi final : public hardware::ITbRegisters {
   uint32_t unreadable_root_reads = 0;        // root router reads that fail with an error packet first
   uint32_t error_code = 0;                   // set: answer configuration requests with this error code
   uint64_t route_answer = 0x0000000000000001ull;
+  // the other host on an XDomain connection
+  struct Remote {
+    uint8_t uuid[16] = {};
+    std::vector<uint32_t> block;                     // its property block, as the values of the words
+    uint32_t generation = 5;
+    bool answer = true, wrong_uuid = false, not_ready = false, wrong_offset = false, shrink_length = false;
+    uint32_t drop_first = 0;                        // requests not answered
+  } remote;
+  std::vector<std::vector<uint32_t>> xdp_requests;   // what the host sent, as words
+  std::vector<std::vector<uint32_t>> xdp_responses;  // what the host answered to the remote's requests
   bool titan_ridge = false;                  // the Titan Ridge forms of the messages
   bool answer_get_route = true;
   // secure connect: the keys the devices hold (by the first word of the UUID), and how they misbehave
@@ -298,6 +310,8 @@ class FakeNhi final : public hardware::ITbRegisters {
     std::vector<uint32_t> w = words_of(frame, !icm);
     if (w.empty()) return;
     if (eof == kIcmCommand) { icm_command(w); return; }
+    if (eof == 6) { xdp_request(w); return; }
+    if (eof == 7) { xdp_responses.push_back(w); return; }
     if (eof != kRead && eof != kWrite) return;
     // configuration space request: route (22 + 32 bits), then offset:13 length:6 port:6 space:2 seq:2
     const uint32_t route_hi = w[0] & 0x3FFFFF, route_lo = w[1], addr = w[2];
@@ -326,6 +340,85 @@ class FakeNhi final : public hardware::ITbRegisters {
   }
 
   // (the words of a body are the little endian values of the bytes the driver wrote: an ICM header is code | flags << 8 | packet id << 16 | total packets << 24)
+  // an XDomain request from the host: answered the way another host would
+  void xdp_request(const std::vector<uint32_t>& w) {
+    xdp_requests.push_back(w);
+    if (w.size() < 8 || !remote.answer) return;
+    if (remote.drop_first > 0) { --remote.drop_first; return; }
+    const uint32_t type = w[7];
+    const uint32_t sn = (w[2] >> 27) & 3;
+    auto header = [&](std::vector<uint32_t>& out, uint32_t t) {
+      out.assign({w[0] | 0x80000000u, w[1], 0, 0, 0, 0, 0, t});
+      memcpy(&out[3], fake_tb::protocol_uuid, 16);
+    };
+    auto finish = [&](std::vector<uint32_t>& out) {
+      out[2] = static_cast<uint32_t>(out.size() * 4 - 12) / 4 | (sn << 27);
+      reply(7, out);
+    };
+    std::vector<uint32_t> out;
+    if (type == 12) {                                                   // UUID_REQUEST
+      if (remote.not_ready) { header(out, 7); out.push_back(4); finish(out); return; }
+      header(out, 2);
+      uint8_t u[16];
+      memcpy(u, remote.uuid, 16);
+      if (remote.wrong_uuid) u[0] ^= 0xFF;
+      out.resize(8 + 4);
+      memcpy(&out[8], u, 16);
+      out.push_back(w[0] & 0x3FFFFF);
+      out.push_back(w[1]);
+      finish(out);
+    } else if (type == 3 && w.size() >= 17) {                           // PROPERTIES_REQUEST: src, dst, offset
+      const uint32_t offset = w[16] & 0xFFFF;
+      header(out, 4);
+      out.resize(8 + 8);
+      memcpy(&out[8], &w[12], 16);                                      // (the answer's source is the request's destination)
+      memcpy(&out[12], &w[8], 16);
+      uint32_t length = static_cast<uint32_t>(remote.block.size());
+      if (offset >= length) return;
+      uint32_t count = length - offset > 45 ? 45 : length - offset;
+      out.push_back((remote.wrong_offset ? offset + 1 : offset) | ((remote.shrink_length && offset > 0 ? length - 1 : length) << 16));
+      out.push_back(remote.generation);
+      for (uint32_t i = 0; i < count; ++i) out.push_back(remote.block[offset + i]);
+      finish(out);
+    }
+  }
+
+public:
+  // The other host asks us something (a request frame on the control channel).
+  void remote_request(uint32_t type, const std::vector<uint32_t>& extra, uint64_t route = 0x01, uint32_t sn = 0) {
+    std::vector<uint32_t> w = {static_cast<uint32_t>(route >> 32), static_cast<uint32_t>(route), 0, 0, 0, 0, 0, type};
+    memcpy(&w[3], fake_tb::protocol_uuid, 16);
+    for (uint32_t x : extra) w.push_back(x);
+    w[2] = static_cast<uint32_t>(w.size() * 4 - 12) / 4 | (sn << 27);
+    push_to_host(0, 6, 6, wire_frame(w));
+  }
+  void send_xdomain_connected(const uint8_t remote_uuid[16], const uint8_t local_uuid[16], uint8_t link, uint8_t depth, uint64_t local_route) {
+    std::vector<uint32_t> w(14, 0);
+    w[0] = 6u | (1u << 24);
+    w[1] = (uint32_t(link) | (uint32_t(depth) << 4)) << 16;
+    memcpy(&w[2], remote_uuid, 16);
+    memcpy(&w[6], local_uuid, 16);
+    w[10] = static_cast<uint32_t>(local_route >> 32);
+    w[11] = static_cast<uint32_t>(local_route);
+    send_icm_event(w);
+  }
+  void send_xdomain_disconnected(const uint8_t remote_uuid[16], uint8_t link, uint8_t depth) {
+    std::vector<uint32_t> w(6, 0);
+    w[0] = 7u | (1u << 24);
+    w[1] = (uint32_t(link) | (uint32_t(depth) << 4)) << 16;
+    memcpy(&w[2], remote_uuid, 16);
+    send_icm_event(w);
+  }
+  void send_xdomain_disconnected_tr(const uint8_t remote_uuid[16], uint64_t route) {
+    std::vector<uint32_t> w(7, 0);
+    w[0] = 7u | (1u << 24);
+    w[1] = static_cast<uint32_t>(route >> 32);
+    w[2] = static_cast<uint32_t>(route);
+    memcpy(&w[3], remote_uuid, 16);
+    send_icm_event(w);
+  }
+
+private:
   void icm_command(const std::vector<uint32_t>& w) {
     const uint8_t code = static_cast<uint8_t>(w[0] & 0xFF);
     requests_seen.push_back(code);

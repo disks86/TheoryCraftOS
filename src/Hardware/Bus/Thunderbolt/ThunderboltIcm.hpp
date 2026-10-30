@@ -30,6 +30,7 @@
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRing.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -89,7 +90,26 @@ struct TbTopologySwitch {
   }
 };
 
+// Another host on the cable.
+struct TbXDomain {
+  uint8_t remote_uuid[16] = {}, local_uuid[16] = {};
+  uint8_t link = 0, depth = 0;           // Alpine Ridge: where it is
+  uint64_t route = 0;                    // the route string that reaches it (the one the firmware names as local)
+  bool discovered = false;               // the UUID and property exchange succeeded
+  bool gave_up = false;                  // it did not, after the retries
+  uint8_t attempts = 0;
+  uint32_t vendor_id = 0, device_id = 0, generation = 0;
+  char vendor_name[48] = {}, device_name[48] = {};
+  uint32_t protocols[8] = {};            // the protocol ids of the services it offers (prtcid of each service directory; 1 is IP networking)
+  uint32_t protocol_count = 0;
+};
+
 namespace tb_icm {
+// ICM_EVENT_XDOMAIN_CONNECTED / DISCONNECTED, in both generations' layouts (Titan Ridge names the domain by route, Alpine Ridge by port and depth)
+constexpr uint32_t kXdomainConnectedBytes = 56, kXdomainDisconnectedBytes = 24, kTrXdomainDisconnectedBytes = 28;
+bool parse_xdomain_connected(ConstByteView event, TbXDomain* out);
+bool parse_xdomain_disconnected(ConstByteView event, uint8_t remote_uuid[16], uint8_t* link, uint8_t* depth);
+bool parse_xdomain_disconnected_tr(ConstByteView event, uint64_t* route, uint8_t remote_uuid[16]);
 uint32_t build_get_topology(ByteView out);
 bool parse_topology_packet(ConstByteView packet, TbTopologySwitch* out);
 uint32_t build_driver_ready(ByteView out);
@@ -146,7 +166,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   };
   static constexpr uint32_t kRequestTimeoutUs = 5000000, kApproveTimeoutUs = 10000000, kRetries = 3, kMaxDevices = 32;
 
-  ThunderboltIcm(ITbRegisters& registers, allocators::IAllocator& allocator) : allocator_(allocator), nhi_(registers), control_(nhi_, allocator), devices_(allocator) {}
+  ThunderboltIcm(ITbRegisters& registers, allocators::IAllocator& allocator) : allocator_(allocator), nhi_(registers), control_(nhi_, allocator), devices_(allocator), xdomains_(allocator), local_block_(allocator) {}
   ~ThunderboltIcm() { stop(); }
   ThunderboltIcm(const ThunderboltIcm&) = delete;
   ThunderboltIcm& operator=(const ThunderboltIcm&) = delete;
@@ -175,6 +195,13 @@ class ThunderboltIcm final : public IThunderboltEvents {
 
   // Reads the control channel: events update the device list.
   void poll();
+
+  // Other hosts on the cable (XDomain connections). Each is introduced as the firmware reports it and discovered on the next poll(): its UUID is asked for, then its property block read
+  // in pieces and parsed into the vendor, device and the protocols of its services. Requests from the other host (UUID, properties) are answered from the identity set here.
+  uint64_t xdomain_count() const { return xdomains_.count(); }
+  const TbXDomain& xdomain(uint64_t index) const { return xdomains_[index]; }
+  // What this host tells another one about itself (vendor and device numbers, names); defaults to a made up identity.
+  bool set_identity(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name);
 
   const TbDriverReady& driver_ready() const { return ready_; }
   TbSecurityLevel security_level() const { return ready_.security; }
@@ -210,6 +237,10 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool parent_authorized(const TbDevice& device) const;
   void mark_authorized(const TbDevice& device);
   bool request_flags(ConstByteView request, ByteView response, uint32_t timeout_us, const char** error, const char* no_answer);
+  void service_xdomains();
+  bool discover_xdomain(uint64_t index);
+  void answer_xdomain_request(ConstByteView body);
+  bool ensure_identity();
   bool start_firmware();
   bool reset_physical_port(uint32_t physical_port);
   void remove_downstream(uint8_t link, uint8_t depth);
@@ -218,6 +249,9 @@ class ThunderboltIcm final : public IThunderboltEvents {
   TbNhi nhi_;
   TbControl control_;
   List<TbDevice> devices_;
+  List<TbXDomain> xdomains_;
+  List<uint32_t> local_block_;
+  uint32_t local_generation_ = 1, polls_ = 0;
   TbDriverReady ready_;
   crypto::IRandom* random_ = nullptr;
   bool interrupts_ = false;

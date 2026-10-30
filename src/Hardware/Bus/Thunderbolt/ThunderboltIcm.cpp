@@ -184,6 +184,52 @@ bool parse_device_disconnected(ConstByteView event, uint8_t* link, uint8_t* dept
   return true;
 }
 
+// ---- XDomain events
+
+bool parse_xdomain_connected(ConstByteView event, TbXDomain* out) {
+  if (event.size() < kXdomainConnectedBytes) return false;
+  ByteReader r(event);
+  const uint8_t code = r.u8();
+  r.skip(3);
+  r.skip(2);
+  const uint16_t link_info = r.le16();
+  TbXDomain x;
+  const bool a = r.read_into(ByteView(x.remote_uuid, 16)), b = r.read_into(ByteView(x.local_uuid, 16));
+  const uint32_t local_hi = r.le32(), local_lo = r.le32();
+  r.skip(8);                                                  // the remote's route to us: not needed
+  if (!r.ok() || !a || !b || code != kEventXdomainConnected) return false;
+  x.link = link_info & kLinkMask;
+  x.depth = static_cast<uint8_t>((link_info & kDepthMask) >> kDepthShift);
+  x.route = (static_cast<uint64_t>(local_hi & 0x3FFFFF) << 32) | local_lo;
+  *out = x;
+  return true;
+}
+
+bool parse_xdomain_disconnected(ConstByteView event, uint8_t remote_uuid[16], uint8_t* link, uint8_t* depth) {
+  if (event.size() < kXdomainDisconnectedBytes) return false;
+  ByteReader r(event);
+  const uint8_t code = r.u8();
+  r.skip(5);
+  const uint16_t link_info = r.le16();
+  const bool got = r.read_into(ByteView(remote_uuid, 16));
+  if (!r.ok() || !got || code != kEventXdomainDisconnected) return false;
+  *link = link_info & kLinkMask;
+  *depth = static_cast<uint8_t>((link_info & kDepthMask) >> kDepthShift);
+  return true;
+}
+
+bool parse_xdomain_disconnected_tr(ConstByteView event, uint64_t* route, uint8_t remote_uuid[16]) {
+  if (event.size() < kTrXdomainDisconnectedBytes) return false;
+  ByteReader r(event);
+  const uint8_t code = r.u8();
+  r.skip(3);
+  const uint32_t hi = r.le32(), lo = r.le32();
+  const bool got = r.read_into(ByteView(remote_uuid, 16));
+  if (!r.ok() || !got || code != kEventXdomainDisconnected) return false;
+  *route = (static_cast<uint64_t>(hi & 0x3FFFFF) << 32) | lo;
+  return true;
+}
+
 // ---- Titan Ridge
 
 namespace {
@@ -322,6 +368,7 @@ ThunderboltIcm::Outcome ThunderboltIcm::start(uint32_t timeout_us) {
 
 ThunderboltIcm::Outcome ThunderboltIcm::bring_up(uint32_t timeout_us, bool resuming) {
   devices_.clear();
+  xdomains_.clear();
   ready_ = TbDriverReady();
   if (!nhi_.present()) return outcome_ = Outcome::NotPresent;
   nhi_.disable_interrupts();
@@ -407,6 +454,7 @@ bool ThunderboltIcm::use_interrupts(bool on) {
 
 bool ThunderboltIcm::suspend() {
   if (outcome_ != Outcome::Started) return false;
+  xdomains_.clear();
   nhi_.mailbox(tb_mailbox::kSaveDevices, 0, 500000);
   nhi_.mailbox(tb_mailbox::kDriverUnloads, 0, 500000);
   control_.stop();
@@ -426,12 +474,15 @@ void ThunderboltIcm::stop() {
     control_.stop();
   }
   devices_.clear();
+  xdomains_.clear();
   interrupts_ = false;
   outcome_ = Outcome::NotStarted;
 }
 
 void ThunderboltIcm::poll() {
-  if (outcome_ == Outcome::Started || outcome_ == Outcome::SafeMode) control_.poll(this);
+  if (outcome_ != Outcome::Started && outcome_ != Outcome::SafeMode) return;
+  control_.poll(this);
+  if (outcome_ == Outcome::Started) service_xdomains();
 }
 
 void ThunderboltIcm::remove_downstream(uint8_t link, uint8_t depth) {
@@ -461,9 +512,43 @@ bool ThunderboltIcm::same_place(const TbDevice& a, const TbDevice& b) const {
 }
 
 void ThunderboltIcm::on_event(TbPacketType type, ConstByteView body) {
+  if (type == TbPacketType::XdomainRequest) {
+    answer_xdomain_request(body);
+    return;
+  }
   if (type != TbPacketType::IcmEvent) return;
   uint8_t code = 0;
   if (!body.try_get(0, &code)) return;
+  if (code == tb_icm::kEventXdomainConnected) {
+    TbXDomain x;
+    if (!tb_icm::parse_xdomain_connected(body, &x)) return;
+    // the same host again, or another one at that place
+    for (uint64_t i = xdomains_.count(); i-- > 0;) {
+      bool same = true;
+      for (uint32_t k = 0; k < 16; ++k) same = same && xdomains_[i].remote_uuid[k] == x.remote_uuid[k];
+      if (same) {
+        // (still there: keep what was discovered unless it moved)
+        if (xdomains_[i].route == x.route) return;
+        xdomains_.remove_at(i);
+      } else if (titan() ? xdomains_[i].route == x.route : (physical_port(xdomains_[i].link) == physical_port(x.link) && xdomains_[i].depth == x.depth)) {
+        xdomains_.remove_at(i);
+      }
+    }
+    if (xdomains_.count() < kMaxDevices) xdomains_.push_back(x);
+    return;
+  }
+  if (code == tb_icm::kEventXdomainDisconnected) {
+    uint8_t uuid[16], link = 0, depth = 0;
+    uint64_t route = 0;
+    const bool ok = titan() ? tb_icm::parse_xdomain_disconnected_tr(body, &route, uuid) : tb_icm::parse_xdomain_disconnected(body, uuid, &link, &depth);
+    if (!ok) return;
+    for (uint64_t i = xdomains_.count(); i-- > 0;) {
+      bool same = true;
+      for (uint32_t k = 0; k < 16; ++k) same = same && xdomains_[i].remote_uuid[k] == uuid[k];
+      if (same) xdomains_.remove_at(i);
+    }
+    return;
+  }
   if (code == tb_icm::kEventDeviceConnected) {
     TbDevice device;
     bool rejected = false;
@@ -684,6 +769,171 @@ bool ThunderboltIcm::route(uint64_t index, uint64_t* route) {
   // a firmware without GET_ROUTE (Falcon Ridge) shows the routes in its topology
   List<TbTopologySwitch> switches(allocator_);
   return topology(switches) && route_in_topology(switches, device.link, device.depth, route);
+}
+
+
+// ---- XDomain
+
+bool ThunderboltIcm::set_identity(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name) {
+  if (!tb_properties_build_local(vendor_id, device_id, device_revision, vendor_name, device_name, local_block_)) return false;
+  ++local_generation_;
+  return true;
+}
+
+bool ThunderboltIcm::ensure_identity() {
+  return local_block_.count() != 0 || set_identity(0, 1, 1, "TheoryCraftOS", "TheoryCraftOS");
+}
+
+namespace {
+bool uuid_equal(const uint8_t* a, const uint8_t* b) {
+  bool same = true;
+  for (uint32_t k = 0; k < 16; ++k) same = same && a[k] == b[k];
+  return same;
+}
+constexpr uint32_t kXdpTimeoutUs = 2000000, kXdpAttempts = 4, kXdpGiveUpAfter = 5, kXdpRetryPolls = 50;
+}  // namespace
+
+// What the other host asks of us: who we are, and our properties.
+void ThunderboltIcm::answer_xdomain_request(ConstByteView body) {
+  tb_xdp::Header h;
+  if (!tb_xdp::parse_header(body, &h) || !ensure_identity()) return;
+  // the host this is for: the connection with that route, else (a UUID request may come before the connection is announced) the first one there is
+  const TbXDomain* xd = nullptr;
+  for (uint64_t i = 0; i < xdomains_.count(); ++i)
+    if (xdomains_[i].route == h.route) xd = &xdomains_[i];
+  if (!xd && xdomains_.count() != 0 && h.type == tb_xdp::kUuidRequest) xd = &xdomains_[0];
+  if (!xd) return;
+  const uint64_t route = xd->route;
+  uint8_t local_uuid[16];
+  for (uint32_t k = 0; k < 16; ++k) local_uuid[k] = xd->local_uuid[k];
+  uint8_t out[tb_frame::kMaxBody];
+  uint32_t n = 0;
+  switch (h.type) {
+    case tb_xdp::kUuidRequest:
+      n = tb_xdp::build_uuid_response(route, h.sequence, local_uuid, ByteView(out, sizeof out));
+      break;
+    case tb_xdp::kPropertiesRequest: {
+      tb_xdp::PropertiesRequest q;
+      if (!tb_xdp::parse_properties_request(body, &q)) return;
+      if (!uuid_equal(q.destination, local_uuid)) {
+        n = tb_xdp::build_error_response(route, h.sequence, tb_xdp::kErrorUnknownDomain, ByteView(out, sizeof out));
+      } else {
+        n = tb_xdp::build_properties_response(route, h.sequence, local_uuid, q.source, ArrayView<const uint32_t>(&local_block_[0], local_block_.count()), local_generation_, q.offset, ByteView(out, sizeof out));
+      }
+      break;
+    }
+    case tb_xdp::kPropertiesChangedRequest:
+      // (they changed their properties: read them again)
+      n = tb_xdp::build_properties_changed_response(route, h.sequence, ByteView(out, sizeof out));
+      for (uint64_t i = 0; i < xdomains_.count(); ++i)
+        if (xdomains_[i].route == route) {
+          xdomains_[i].discovered = false;
+          xdomains_[i].gave_up = false;
+          xdomains_[i].attempts = 0;
+        }
+      break;
+    default:
+      // link state requests and anything newer: not supported here
+      n = tb_xdp::build_error_response(route, h.sequence, tb_xdp::kErrorNotSupported, ByteView(out, sizeof out));
+      break;
+  }
+  if (n != 0) control_.send(TbPacketType::XdomainResponse, ConstByteView(out, n));
+}
+
+// The exchange with a host that was just announced (xdomain.c: the UUID request, then the properties).
+bool ThunderboltIcm::discover_xdomain(uint64_t index) {
+  if (!ensure_identity()) return false;
+  const TbXDomain xd = xdomains_[index];
+  uint8_t request[tb_frame::kMaxBody], response[tb_frame::kFrameBytes];
+  uint32_t got = 0;
+
+  // who is there
+  uint32_t n = tb_xdp::build_uuid_request(xd.route, xd.attempts % 4, ByteView(request, sizeof request));
+  if (n == 0 || control_.xdomain_request(ConstByteView(request, n), ByteView(response, sizeof response), &got, kXdpTimeoutUs, this) != TbControl::Result::Ok) return false;
+  tb_xdp::UuidResponse who;
+  uint32_t error = 0;
+  if (tb_xdp::parse_uuid_response(ConstByteView(response, got < sizeof response ? got : sizeof response), &who, &error) != tb_xdp::Parsed::Ok) return false;
+  if (!uuid_equal(who.uuid, xd.remote_uuid)) return false;                   // another host than announced: it will be announced again
+
+  // its properties, a piece at a time
+  List<uint32_t> block(allocator_);
+  uint32_t length = 0, offset = 0, generation = 0;
+  for (uint32_t round = 0; round < tb_xdp::kMaxBlockWords; ++round) {
+    n = tb_xdp::build_properties_request(xd.route, xd.attempts % 4, xd.local_uuid, xd.remote_uuid, static_cast<uint16_t>(offset), ByteView(request, sizeof request));
+    if (n == 0 || control_.xdomain_request(ConstByteView(request, n), ByteView(response, sizeof response), &got, kXdpTimeoutUs, this) != TbControl::Result::Ok) return false;
+    const ConstByteView packet(response, got < sizeof response ? got : sizeof response);
+    tb_xdp::PropertiesResponse p;
+    if (tb_xdp::parse_properties_response(packet, &p, &error) != tb_xdp::Parsed::Ok || p.offset != offset) return false;
+    if (length == 0) {
+      length = p.data_length;
+      generation = p.generation;
+      if (length == 0 || length > tb_xdp::kMaxBlockWords) return false;
+      for (uint32_t i = 0; i < length; ++i)
+        if (!block.push_back(0)) return false;
+    } else if (p.data_length != length) {
+      return false;
+    }
+    if (p.words == 0) return false;
+    ByteReader r(packet);
+    r.skip(tb_xdp::kPropertiesResponseHeaderBytes);
+    for (uint32_t i = 0; i < p.words && offset + i < length; ++i) block[offset + i] = r.le32();
+    if (!r.ok()) return false;
+    offset += p.words;
+    if (offset >= length) break;
+  }
+  if (offset < length) return false;
+
+  List<TbPropertyEntry> entries(allocator_);
+  if (!tb_properties_parse(ArrayView<const uint32_t>(&block[0], block.count()), entries)) return false;
+
+  // the list may have changed while waiting
+  for (uint64_t i = 0; i < xdomains_.count(); ++i) {
+    TbXDomain& x = xdomains_[i];
+    if (!uuid_equal(x.remote_uuid, xd.remote_uuid)) continue;
+    x.generation = generation;
+    const TbPropertyEntry* vendor = tb_properties_find(entries, "vendorid", TbPropertyType::Value);
+    const TbPropertyEntry* device = tb_properties_find(entries, "deviceid", TbPropertyType::Value);
+    x.vendor_id = vendor ? vendor->value : 0;
+    x.device_id = device ? device->value : 0;
+    const TbPropertyEntry* vendor_name = tb_properties_find(entries, "vendorid", TbPropertyType::Text);
+    const TbPropertyEntry* device_name = tb_properties_find(entries, "deviceid", TbPropertyType::Text);
+    for (uint32_t k = 0; k < sizeof x.vendor_name; ++k) x.vendor_name[k] = vendor_name && k + 1 < sizeof x.vendor_name ? vendor_name->text[k] : 0;
+    for (uint32_t k = 0; k < sizeof x.device_name; ++k) x.device_name[k] = device_name && k + 1 < sizeof x.device_name ? device_name->text[k] : 0;
+    // the services: directories (depth 1) with a protocol id
+    x.protocol_count = 0;
+    for (uint64_t e = 0; e < entries.count(); ++e) {
+      const TbPropertyEntry& entry = entries[e];
+      if (entry.depth != 1 || entry.type != TbPropertyType::Value || x.protocol_count >= 8) continue;
+      const char key[] = "prtcid";
+      bool is_id = true;
+      for (uint32_t k = 0; k <= 6; ++k) is_id = is_id && entry.key[k] == key[k];
+      if (is_id) x.protocols[x.protocol_count++] = entry.value;
+    }
+    x.discovered = true;
+    return true;
+  }
+  return true;
+}
+
+// Called from poll(), when no request is waiting: one host at a time, a few tries each, spaced out.
+void ThunderboltIcm::service_xdomains() {
+  ++polls_;
+  for (uint64_t i = 0; i < xdomains_.count(); ++i) {
+    const TbXDomain x = xdomains_[i];                       // (a copy: the list can change during the exchange)
+    if (x.discovered || x.gave_up) continue;
+    // (a retry waits some polls; the first try is at once)
+    if (x.attempts != 0 && polls_ % kXdpRetryPolls != 0) continue;
+    const bool ok = discover_xdomain(i);
+    // find it again: the exchange can take events that change the list
+    for (uint64_t k = 0; k < xdomains_.count(); ++k) {
+      bool same = true;
+      for (uint32_t b = 0; b < 16; ++b) same = same && xdomains_[k].remote_uuid[b] == x.remote_uuid[b];
+      if (!same) continue;
+      if (!ok && !xdomains_[k].discovered && ++xdomains_[k].attempts >= kXdpGiveUpAfter) xdomains_[k].gave_up = true;
+      break;
+    }
+    return;
+  }
 }
 
 }  // namespace hardware

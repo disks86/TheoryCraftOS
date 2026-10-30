@@ -97,6 +97,9 @@ class TbControl {
   // as many packets have come as the first of them says there are (they may arrive in any order); one that claims more than `packets`, or an id outside them, is not taken.
   Result icm_request_packets(ConstByteView request, ByteView responses, uint32_t packet_bytes, uint32_t packets, uint32_t timeout_us, IThunderboltEvents* events,
                               uint32_t* total_packets = nullptr);
+  // An XDomain (XDP) request: the packet is sent as an XDomain request and the first XDomain response with the same route and sequence number is copied into `response` (as much as fits;
+  // `*received` is the size of the packet). What the response means is for the caller (tb_xdp). Events that arrive while waiting go to `events`.
+  Result xdomain_request(ConstByteView request, ByteView response, uint32_t* received, uint32_t timeout_us, IThunderboltEvents* events);
   // Router configuration space (tb_cfg_read_raw / tb_cfg_write_raw): `words` 32 bit words at the word offset `offset` of `space` (of `port` for the port space) of the router at `route`.
   Result read_config(uint64_t route, uint32_t port, TbConfigSpace space, uint32_t offset, ArrayView<uint32_t> words, uint32_t timeout_us, ConfigError* error, IThunderboltEvents* events);
   Result write_config(uint64_t route, uint32_t port, TbConfigSpace space, uint32_t offset, ArrayView<const uint32_t> words, uint32_t timeout_us, ConfigError* error, IThunderboltEvents* events);
@@ -104,7 +107,8 @@ class TbControl {
  private:
   struct Pending {
     bool active = false, done = false;
-    bool config = false;
+    bool config = false, xdomain = false;
+    uint32_t received = 0;
     TbPacketType request_type = TbPacketType::Read;
     uint64_t route = 0;
     uint8_t seq = 0, code = 0;
