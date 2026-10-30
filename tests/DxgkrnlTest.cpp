@@ -5125,7 +5125,7 @@ void test_dxil() {
   };
   DxilTextures textures;
   // The pixel shaders: the same varyings, the same colour (and the same pixel killed).
-  for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow"}) {
+  for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow", "dxil_ps_loop"}) {
     UniquePointer<D3d9Program> reference, translated;
     const std::string base(name);
     CHECK(load((base + ".dxbc").c_str(), &reference) && load((base + ".dxil").c_str(), &translated));
@@ -5178,14 +5178,74 @@ void test_dxil() {
       }
     }
   }
+
+  // The compute shaders: the same buffers in, the same buffers out.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_cs_fill.dxbc", &reference) && load("dxil_cs_fill.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Compute && translated->thread_group(0) == 8 && translated->thread_group(1) == 4);
+      auto run = [&](D3d9Program& p, std::vector<uint8_t>* picture, std::vector<uint8_t>* structured, std::vector<uint8_t>* counters) {
+        picture->assign(4096, 0), structured->assign(16384, 0), counters->assign(16, 0);
+        graphics::ComputeContext context;
+        context.buffers[0] = ByteView(picture->data(), picture->size()), context.buffers[1] = ByteView(structured->data(), structured->size()), context.buffers[2] = ByteView(counters->data(), counters->size());
+        const uint32_t k[4] = {0x00102030u, 0, 0, 0};
+        uint8_t constants[128] = {};
+        for (uint32_t i = 0; i < 4; ++i)
+          for (uint32_t b = 0; b < 4; ++b) constants[4 * i + b] = static_cast<uint8_t>(k[i] >> (8 * b));
+        for (uint32_t gy = 0; gy < 8; ++gy)
+          for (uint32_t gx = 0; gx < 4; ++gx) {
+            uint32_t index = 0;
+            for (uint32_t ty = 0; ty < 4; ++ty)
+              for (uint32_t tx = 0; tx < 8; ++tx, ++index) {
+                context.group_id[0] = gx, context.group_id[1] = gy, context.thread_id[0] = tx, context.thread_id[1] = ty;
+                context.dispatch_id[0] = gx * 8 + tx, context.dispatch_id[1] = gy * 4 + ty;
+                context.group_index = index;
+                p.run_compute(context, constants);
+              }
+          }
+      };
+      std::vector<uint8_t> a0, a1, a2, b0, b1, b2;
+      run(*reference, &a0, &a1, &a2);
+      run(*translated, &b0, &b1, &b2);
+      CHECK(a0 == b0 && a1 == b1 && a2 == b2);
+      CHECK(b0[0] != 0 && b2[0] == 0 && b2[1] == 4);   // (the counters reached 1024: 0x400)
+      printf("  dxil dxil_cs_fill: %s\n", a0 == b0 && a1 == b1 && a2 == b2 ? "same buffers" : "buffers differ");
+    }
+  }
+
+  // A compute shader with group-shared memory and barriers (a reduction in a loop): the buffer after every group has run.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_cs_shared.dxbc", &reference) && load("dxil_cs_shared.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->needs_group() && translated->shared_total_bytes() == 256);
+      auto run = [&](D3d9Program& p, std::vector<uint8_t>* picture) {
+        picture->assign(4096, 0);
+        graphics::ComputeContext context;
+        context.buffers[0] = ByteView(picture->data(), picture->size());
+        for (uint32_t gy = 0; gy < 4; ++gy)
+          for (uint32_t gx = 0; gx < 4; ++gx) {
+            context.group_id[0] = gx, context.group_id[1] = gy;
+            p.run_compute_group(context, nullptr);
+          }
+      };
+      std::vector<uint8_t> a, b;
+      run(*reference, &a);
+      run(*translated, &b);
+      CHECK(a == b);
+      printf("  dxil dxil_cs_shared: %s\n", a == b ? "same buffer" : "buffers differ");
+    }
+  }
   // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
-  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil"}) {
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil"}) {
     const std::vector<uint8_t> blob = read_blob(name);
     for (size_t n = 0; n < blob.size(); n += 11) {
       UniquePointer<D3d9Program> program;
       D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &program);
     }
-    for (size_t bit = 0; bit < blob.size() * 8; bit += 37) {
+    const size_t stride = getenv("DXIL_FUZZ_STRIDE") ? static_cast<size_t>(atoi(getenv("DXIL_FUZZ_STRIDE"))) : 37;   // (every bit when looking for something)
+    for (size_t bit = 0; bit < blob.size() * 8; bit += stride) {
       std::vector<uint8_t> flipped = blob;
       flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
       UniquePointer<D3d9Program> program;

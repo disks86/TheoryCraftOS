@@ -58,7 +58,7 @@ struct Type {
 };
 
 // A constant: an integer (Int, up to 64 bits), a float (the bits of a float), undef/null, or an aggregate (elements in value numbers).
-enum class ConstantKind : uint8_t { None, Int, Float, Null, Undef, Aggregate, Other };
+enum class ConstantKind : uint8_t { None, Int, Float, Null, Undef, Aggregate, Gep, Other };   // Gep: a constant expression getelementptr of a global: bits = the global's value number | the last index's value number << 32
 struct Constant {
   ConstantKind kind = ConstantKind::None;
   uint64_t bits = 0;
@@ -82,6 +82,11 @@ struct Instruction {
   uint32_t args[kMaxCallArguments] = {};
   uint32_t phi_first = 0, phi_count = 0;   // Phi: the range in Function::phi_values / phi_blocks
   bool has_value = false;
+};
+
+// A global variable: its value number, its type (the value type) and address space (3 is group-shared memory).
+struct Global {
+  uint32_t value = 0, type = 0, address_space = 0;
 };
 
 struct Function {
@@ -120,7 +125,7 @@ class Module {
  public:
   explicit Module(allocators::IAllocator& allocator)
       : types(allocator), type_refs(allocator), constants(allocator), value_types(allocator), functions(allocator), instructions(allocator), blocks(allocator), phi_values(allocator), phi_blocks(allocator),
-        meta(allocator), meta_refs(allocator), strings(allocator), named(allocator), local_types(allocator), local_constants(allocator), allocator_(allocator) {}
+        meta(allocator), meta_refs(allocator), strings(allocator), named(allocator), globals(allocator), local_types(allocator), local_constants(allocator), allocator_(allocator) {}
   allocators::IAllocator& allocator() const { return allocator_; }
 
   List<Type> types;
@@ -136,6 +141,7 @@ class Module {
   List<uint32_t> meta_refs;
   List<String> strings;
   List<NamedMeta> named;
+  List<Global> globals;
   List<uint32_t> local_types;       // the types and constants of the function-local values of every function (see Function::local_first)
   List<Constant> local_constants;
   uint32_t module_values = 0;       // the value numbers below this belong to the module (globals, functions, module constants)

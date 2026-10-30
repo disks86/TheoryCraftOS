@@ -392,7 +392,17 @@ class ModuleBuilder final : public BitstreamVisitor {
   }
 
   bool module_record(uint32_t code, ArrayView<const uint64_t> ops) {
-    if (code == 7 || code == 9 || code == 14) return add_value(0, Constant());   // GLOBALVAR, ALIAS: a value the translator does not use
+    if (code == 7) {   // GLOBALVAR [type, isconst | explicit type << 1 | address space << 2, initializer, ...]
+      Global g;
+      g.value = static_cast<uint32_t>(m_.value_types.count());
+      if (ops.size() >= 2) {
+        g.type = static_cast<uint32_t>(ops[0]);
+        g.address_space = (ops[1] & 2) ? static_cast<uint32_t>(ops[1] >> 2) : 0;
+      }
+      if (m_.globals.count() >= 256 || !m_.globals.push_back(g)) return fail(status::kNotSupported);
+      return add_value(0, Constant());
+    }
+    if (code == 9 || code == 14) return add_value(0, Constant());   // ALIAS: a value the translator does not use
     if (code == 8) {                                                            // FUNCTION [type, cc, isproto, ...]
       if (ops.size() < 3 || m_.functions.count() >= kMaxFunctions) return fail(status::kInvalidParameter);
       Function f(m_.allocator());
@@ -425,6 +435,10 @@ class ModuleBuilder final : public BitstreamVisitor {
         c.kind = ConstantKind::Float, c.bits = ops[0];
         break;
       case 7: c.kind = ConstantKind::Aggregate; break;
+      case 12: case 20:   // CE_GEP / CE_INBOUNDS_GEP [source type, (type, value) pairs]: the base and two indices
+        if (ops.size() == 7) c.kind = ConstantKind::Gep, c.bits = (ops[2] & 0xFFFFFFFFu) | (ops[6] << 32);
+        else c.kind = ConstantKind::Other;
+        break;
       default: c.kind = ConstantKind::Other; break;
     }
     return add_value(current_type_, c);
@@ -670,9 +684,28 @@ class ModuleBuilder final : public BitstreamVisitor {
       }
       case 12: ins.op = Op::Switch; return fail(status::kNotSupported);
       case 19: ins.op = Op::Alloca; return push_instruction(ins, true);   // (numbered; the translator refuses it)
-      case 20: ins.op = Op::Load; return push_instruction(ins, true);
-      case 43: ins.op = Op::Gep; return push_instruction(ins, true);
-      case 44: ins.op = Op::Store; return push_instruction(ins, false);
+      case 20: {  // LOAD [pointer, type, alignment, volatile]
+        ins.op = Op::Load;
+        if (!operand(ops, &at, &ins.operands[0], true) || at >= ops.size()) return fail(status::kInvalidParameter);
+        ins.type = static_cast<uint32_t>(ops[at]);
+        return push_instruction(ins, true);
+      }
+      case 43: {  // GEP [inbounds, source type, pointer, indices...]
+        ins.op = Op::Gep;
+        if (ops.size() < 4) return fail(status::kInvalidParameter);
+        at = 2;
+        if (!operand(ops, &at, &ins.operands[0], true)) return fail(status::kInvalidParameter);
+        while (at < ops.size()) {
+          if (ins.arg_count >= kMaxCallArguments || !operand(ops, &at, &ins.args[ins.arg_count], true)) return fail(status::kNotSupported);
+          ++ins.arg_count;
+        }
+        return push_instruction(ins, true);
+      }
+      case 44: {  // STORE [pointer, value, alignment, volatile]
+        ins.op = Op::Store;
+        if (!operand(ops, &at, &ins.operands[0], true) || !operand(ops, &at, &ins.operands[1], true)) return fail(status::kInvalidParameter);
+        return push_instruction(ins, false);
+      }
       default: return fail(status::kNotSupported);
     }
   }

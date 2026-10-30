@@ -31,6 +31,9 @@
 #include "Kernel/Dxgkrnl/D3d9Shader.hpp"
 #include "Kernel/Dxgkrnl/DxilBitcode.hpp"
 #include "Utility/ByteStream.hpp"
+#ifdef DXIL_TRACE
+#include <cstdio>
+#endif
 
 namespace dxgk {
 
@@ -43,7 +46,7 @@ constexpr uint32_t kNone = ~0u;
 constexpr uint32_t kSlots = 128;   // 32 temporaries of four components
 constexpr uint32_t kMaxResources = 16;
 
-enum class VK : uint8_t { None, Imm, Temp, Input, Cb, Agg, CbAgg, Handle };
+enum class VK : uint8_t { None, Imm, Temp, Input, Cb, Agg, CbAgg, Handle, Sys, Ptr };
 
 // What a value of the function is, in the program being made.
 struct Val {
@@ -57,7 +60,7 @@ struct SigElement {
 };
 
 struct Resource {
-  uint32_t id = 0, space = 0, lower = 0, size = 0, kind = 0, bytes = 0;
+  uint32_t id = 0, space = 0, lower = 0, size = 0, kind = 0, bytes = 0, stride = 0;
   bool present = false;
 };
 
@@ -65,7 +68,8 @@ struct Resource {
 enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
-  kCBufferLoadLegacy = 59, kSample = 60, kSampleLevel = 62, kTextureLoad = 66, kDiscard = 82,
+  kCBufferLoadLegacy = 59, kSample = 60, kSampleLevel = 62, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
+  kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
 };
 
 class Translator {
@@ -129,7 +133,11 @@ class Translator {
     ByteReader r(out_.view().subview(uint64_t{at} * 4, 4));
     return r.le32();
   }
-  bool error(NtStatus s) {
+  bool error(NtStatus s, uint32_t line = __builtin_LINE()) {
+#ifdef DXIL_TRACE
+    fprintf(stderr, "dxil error %x at line %u\n", static_cast<unsigned>(s), line);
+#endif
+    (void)line;
     if (status_ == status::kSuccess) status_ = s;
     return false;
   }
@@ -194,6 +202,10 @@ class Translator {
   bool dot(const Instruction& ins, uint32_t n);
   bool sample(const Instruction& ins, bool level);
   bool texture_load(const Instruction& ins);
+  bool buffer_load(const Instruction& ins);
+  bool buffer_store(const Instruction& ins);
+  bool atomic(const Instruction& ins);
+  bool thread_value(const Instruction& ins, uint32_t type, bool dimension);
   bool pack(const uint32_t* ids, uint32_t count, uint32_t reg, bool integer);
   bool resource_of(uint32_t handle_id, uint32_t expected_class, Val* out);
 
@@ -219,6 +231,23 @@ class Translator {
   uint32_t input_count_ = 0, output_count_ = 0;
   uint32_t threads_[3] = {1, 1, 1};
   uint32_t entry_value_ = kNone;
+  struct LoopInfo {
+    uint32_t header, latch, exit, depth;
+    int32_t start;
+  };
+  List<LoopInfo> loops_{allocator_};
+  List<uint32_t> latch_of_{allocator_};    // by block: the last block that jumps back to it (a loop header), or kNone
+  List<int32_t> def_pos_{allocator_};      // by value: the event that defines it (-1: before the code)
+  void end_loop_lifetimes(int32_t start, int32_t end);
+  List<uint8_t> ptr_ok_{allocator_};      // by value: a pointer into group-shared memory
+  uint32_t shared_bytes_[4] = {};
+  bool shared_used_[4] = {};
+  bool shared_slot(uint32_t global_value, uint32_t* slot, uint32_t* bytes) const;
+  bool shared_access(const Instruction& ins, bool store);
+  bool shared_pointer(uint32_t id, Val* out);   // a pointer into group-shared memory: a getelementptr instruction's result, or a constant one
+  bool is_shared_pointer(uint32_t id) const;
+  bool sys_used_[4] = {};          // vThreadID, vThreadGroupID, vThreadIDInGroup, vThreadIDInGroupFlattened
+  bool uav_used_[kMaxResources] = {};
 };
 
 // --- operands --------------------------------------------------------------------------------------------------------------------------------------------------
@@ -239,6 +268,9 @@ void Translator::src(const Val& v, uint32_t modifier) {
       if (modifier) put(1u | (modifier << 6));
       put(v.a);
       put(v.b);
+      break;
+    case VK::Sys:
+      put(2u | (2u << 2) | (v.b << 4) | (v.a << 12));
       break;
     default:
       error(status::kNotSupported);
@@ -322,8 +354,35 @@ bool Translator::alias_cast(const Instruction& ins) const {
   }
 }
 
+bool Translator::is_shared_pointer(uint32_t id) const {
+  if (id < ptr_ok_.count() && ptr_ok_[id]) return true;
+  const Constant* c = constant(id);
+  uint32_t slot = 0, bytes = 0;
+  return c && c->kind == ConstantKind::Gep && shared_slot(static_cast<uint32_t>(c->bits), &slot, &bytes);
+}
+
+bool Translator::shared_slot(uint32_t global_value, uint32_t* slot, uint32_t* bytes) const {
+  uint32_t ordinal = 0;
+  for (const Global& g : m_.globals.view()) {
+    if (g.address_space != 3) continue;
+    if (g.value == global_value) {
+      const Type* t = m_.type_at(g.type);
+      if (!t || ordinal >= 4) return false;
+      uint32_t elements = 1, element_type = g.type;
+      if (t->kind == TypeKind::Array) elements = t->count, element_type = t->first;
+      const Type* e = m_.type_at(element_type);
+      if (!e || !((e->kind == TypeKind::Int && e->width == 32) || (e->kind == TypeKind::Float && e->width == 32)) || elements == 0 || elements > 8192) return false;
+      *slot = ordinal, *bytes = elements * 4;
+      return true;
+    }
+    ++ordinal;
+  }
+  return false;
+}
+
 bool Translator::analyze(const Instruction& ins) {
   const int32_t at = pos_;
+  if (ins.has_value && ins.result < def_pos_.count()) def_pos_[ins.result] = at;
   switch (ins.op) {
     case Op::Binop: case Op::Cmp:
       note_use(ins.operands[0], at), note_use(ins.operands[1], at);
@@ -342,7 +401,33 @@ bool Translator::analyze(const Instruction& ins) {
     case Op::Call:
       for (uint32_t k = 0; k < ins.arg_count; ++k) note_use(ins.args[k], at);
       return true;
-    case Op::Load: case Op::Alloca: case Op::Gep:
+    case Op::Gep: {
+      uint32_t slot = 0, bytes = 0;
+      if (ins.arg_count == 2 && ins.result < ptr_ok_.count() && shared_slot(ins.operands[0], &slot, &bytes)) {
+        uint64_t zero = 1;
+        if (!constant_int(ins.args[0], &zero) || zero != 0) return error(status::kNotSupported);
+        ptr_ok_[ins.result] = 1;
+        note_use(ins.args[1], at);
+        if (ins.result < alias_of_.count()) alias_of_[ins.result] = ins.args[1];   // (the pointer keeps its index alive)
+        return true;
+      }
+      if (ins.result < unsupported_.count()) unsupported_[ins.result] = 1;
+      return true;
+    }
+    case Op::Load:
+      if (is_shared_pointer(ins.operands[0])) {
+        note_use(ins.operands[0], at);
+        return true;
+      }
+      if (ins.result < unsupported_.count()) unsupported_[ins.result] = 1;
+      return true;
+    case Op::Store:
+      if (is_shared_pointer(ins.operands[0])) {
+        note_use(ins.operands[0], at), note_use(ins.operands[1], at);
+        return true;
+      }
+      return error(status::kNotSupported);
+    case Op::Alloca:
       if (ins.result < unsupported_.count()) unsupported_[ins.result] = 1;
       return true;
     case Op::Phi:
@@ -355,26 +440,64 @@ bool Translator::analyze(const Instruction& ins) {
 bool Translator::phi_moves(uint32_t pred, uint32_t target) {
   if (target >= f_.block_count) return error(status::kInvalidParameter);
   const Block& blk = block_at(target);
+  // The moves of one edge happen together: a value that is itself a phi of this block is read before any of them writes.
+  struct Move {
+    Val to, from;
+    uint32_t from_id;
+  } moves[16];
+  uint32_t count = 0;
   for (uint32_t i = 0; i < blk.count; ++i) {
     const Instruction& phi = instruction_at(blk.first + i);
     if (phi.op != Op::Phi) break;
     uint32_t incoming = kNone;
     for (uint32_t k = 0; k < phi.phi_count; ++k)
       if (m_.phi_blocks[phi.phi_first + k] == pred) incoming = m_.phi_values[phi.phi_first + k];
-    if (incoming == kNone) return error(status::kInvalidParameter);
+    if (incoming == kNone || count >= 16) return error(incoming == kNone ? status::kInvalidParameter : status::kNotSupported);
     if (dry_) {
-      note_use(incoming, pos_);
+      note_use(incoming, pos_ + static_cast<int32_t>(count));
     } else {
-      const Val from = use(incoming), to = vals_[phi.result];
-      if (to.kind != VK::Temp) return error(status::kInvalidParameter);
-      const uint32_t at = begin(54);
-      dst_scalar(to);
-      src(from);
-      finish(at);
+      moves[count].from_id = incoming;
+      moves[count].to = vals_[phi.result];
+      if (moves[count].to.kind != VK::Temp) return error(status::kInvalidParameter);
+      moves[count].from = use(incoming);
     }
-    ++pos_;
+    ++count;
   }
+  if (dry_) {
+    pos_ += static_cast<int32_t>(count);
+    return status_ == status::kSuccess;
+  }
+  bool hazard = false;
+  for (uint32_t a = 0; a < count; ++a)
+    for (uint32_t c = 0; c < count; ++c)
+      if (a != c && moves[a].from.kind == VK::Temp && moves[c].to.kind == VK::Temp && moves[a].from.a == moves[c].to.a && moves[a].from.b == moves[c].to.b) hazard = true;
+  if (hazard)
+    for (uint32_t a = 0; a < count; ++a) {
+      if (moves[a].from.kind != VK::Temp) continue;
+      uint32_t reg = 0, comp = 0;
+      if (!alloc_scalar(pos_ + static_cast<int32_t>(count), &reg, &comp)) return false;
+      Val copy;
+      copy.kind = VK::Temp, copy.a = reg, copy.b = comp;
+      const uint32_t at = begin(54);
+      dst_scalar(copy);
+      src(moves[a].from);
+      finish(at);
+      moves[a].from = copy;
+    }
+  for (uint32_t a = 0; a < count; ++a) {
+    const uint32_t at = begin(54);
+    dst_scalar(moves[a].to);
+    src(moves[a].from);
+    finish(at);
+  }
+  pos_ += static_cast<int32_t>(count);
   return status_ == status::kSuccess;
+}
+
+// A loop ends: what was defined before it and is read inside it is needed until its end (the next time round reads it again).
+void Translator::end_loop_lifetimes(int32_t start, int32_t end) {
+  for (uint64_t i = 0; i < last_use_.count(); ++i)
+    if (last_use_[i] >= start && last_use_[i] < end && def_pos_[i] < start) last_use_[i] = end;
 }
 
 void Translator::successors_of(uint32_t block, uint32_t* out, uint32_t* count) const {
@@ -433,16 +556,58 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     ~Leave() { --depth; }
   } leave{depth_};
   if (start == stop) return phi_moves(pred, stop);
+  // An `if` on a value (nonzero: if_nz, else if_z).
+  auto condition = [&](uint32_t value, bool nonzero) {
+    if (dry_) {
+      note_use(value, pos_);
+    } else {
+      const Val cond = use(value);
+      const uint32_t at = begin(31, nonzero ? 1u << 18 : 0u);
+      src(cond);
+      finish(at);
+    }
+    ++pos_;
+  };
+  auto simple = [&](uint32_t opcode) {
+    if (!dry_) finish(begin(opcode));
+  };
+  // The loop on top of the stack ends here: its exit block is what comes next.
+  auto end_loop = [&](uint32_t* exit) -> bool {
+    const LoopInfo done = loops_[loops_.count() - 1];
+    simple(22);   // endloop
+    if (dry_) end_loop_lifetimes(done.start, pos_);
+    ++pos_;
+    loops_.remove_at(loops_.count() - 1);
+    *exit = done.exit;
+    return done.exit != kNone || error(status::kNotSupported);   // (a loop with no way out)
+  };
   uint32_t b = start;
   for (;;) {
+    if (b >= f_.block_count) return error(status::kInvalidParameter);
+    if (latch_of_[b] != kNone && !(loops_.count() && loops_[loops_.count() - 1].header == b)) {
+      // a loop begins: the moves into its phis were made on the edge that came here
+      if (loops_.count() >= 4 || !loops_.push_back({b, latch_of_[b], kNone, depth_, pos_})) return error(status::kNotSupported);
+      simple(48);   // loop
+      ++pos_;
+    }
     if (!visit_block(b)) return false;
     const Instruction& t = terminator(b);
+    const int loop_i = static_cast<int>(loops_.count()) - 1;
+    auto top = [&]() -> LoopInfo& { return loops_[static_cast<uint64_t>(loop_i)]; };
+    // The block the walk goes on in after a loop; false: the region is over.
+    auto after_loop = [&](uint32_t exit, bool* done) {
+      *done = false;
+      if (exit == stop) return *done = true, true;
+      if (stop != kNone && exit > stop) return error(status::kNotSupported);
+      b = exit;
+      return true;
+    };
     if (t.op == Op::Ret) {
+      if (loop_i >= 0) return error(status::kNotSupported);   // (a return inside a loop)
       if (dry_) {
         if (t.operands[0] != 0) note_use(t.operands[0], pos_);
       } else {
-        const uint32_t at = begin(62);
-        finish(at);
+        finish(begin(62));
       }
       ++pos_;
       return true;
@@ -450,7 +615,22 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     if (t.op == Op::Unreachable) return true;
     if (t.op == Op::Br) {
       const uint32_t target = t.blocks[0];
-      if (target <= b) return error(status::kNotSupported);   // (a loop)
+      if (loop_i >= 0 && target == top().header) {   // the back edge
+        if (b != top().latch || depth_ != top().depth || !phi_moves(b, target)) return error(status::kNotSupported);
+        uint32_t exit = kNone;
+        bool done = false;
+        if (!end_loop(&exit) || !after_loop(exit, &done)) return false;
+        if (done) return true;
+        continue;
+      }
+      if (loop_i >= 0 && target > top().latch) {   // a break
+        if (top().exit != kNone && top().exit != target) return error(status::kNotSupported);
+        top().exit = target;
+        if (!phi_moves(b, target)) return false;
+        simple(2);   // break
+        return true;
+      }
+      if (target <= b) return error(status::kNotSupported);
       if (!phi_moves(b, target)) return false;
       if (target == stop) return true;
       if (stop != kNone && target > stop) return error(status::kNotSupported);
@@ -459,21 +639,50 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     }
     if (t.op != Op::CondBr) return error(status::kNotSupported);
     const uint32_t tb = t.blocks[0], fb = t.blocks[1];
-    if (tb <= b || fb <= b || tb == fb) return error(status::kNotSupported);
-    const uint32_t merge = find_merge(tb, fb);
-    if (dry_) {
-      note_use(t.operands[0], pos_);
-    } else {
-      const Val cond = use(t.operands[0]);
-      const uint32_t at = begin(31, 1u << 18);   // if_nz
-      src(cond);
-      finish(at);
+    if (tb == fb) return error(status::kNotSupported);
+    if (loop_i >= 0) {
+      const bool t_back = tb == top().header, f_back = fb == top().header, t_out = tb > top().latch, f_out = fb > top().latch;
+      if (t_back || f_back) {   // the latch: one way back to the top, the other out
+        const uint32_t other = t_back ? fb : tb;
+        if (t_back == f_back || b != top().latch || depth_ != top().depth || other <= top().latch) return error(status::kNotSupported);
+        if (top().exit != kNone && top().exit != other) return error(status::kNotSupported);
+        top().exit = other;
+        condition(t.operands[0], t_back);
+        if (!phi_moves(b, top().header)) return false;
+        simple(18);   // else
+        if (!phi_moves(b, other)) return false;
+        simple(2);    // break
+        simple(21);   // endif
+        uint32_t exit = kNone;
+        bool done = false;
+        if (!end_loop(&exit) || !after_loop(exit, &done)) return false;
+        if (done) return true;
+        continue;
+      }
+      if (t_out && f_out) return error(status::kNotSupported);
+      if (t_out || f_out) {     // one way leaves the loop: a conditional break, then the loop goes on
+        const uint32_t out = t_out ? tb : fb, in = t_out ? fb : tb;
+        if (in <= b || (top().exit != kNone && top().exit != out)) return error(status::kNotSupported);
+        top().exit = out;
+        condition(t.operands[0], t_out);
+        if (!phi_moves(b, out)) return false;
+        simple(2);    // break
+        simple(21);   // endif
+        if (!phi_moves(b, in)) return false;
+        if (in == stop) return true;
+        if (stop != kNone && in > stop) return error(status::kNotSupported);
+        b = in;
+        continue;
+      }
     }
-    ++pos_;
+    if (tb <= b || fb <= b) return error(status::kNotSupported);
+    const uint32_t merge = find_merge(tb, fb);
+    if (loop_i >= 0 && merge != kNone && merge > top().latch) return error(status::kNotSupported);
+    condition(t.operands[0], true);
     if (!region(tb, merge, b)) return false;
-    if (!dry_) finish(begin(18));   // else
+    simple(18);   // else
     if (!region(fb, merge, b)) return false;
-    if (!dry_) finish(begin(21));   // endif
+    simple(21);   // endif
     if (merge == kNone || merge == stop) return true;
     if (stop != kNone && merge > stop) return error(status::kNotSupported);
     b = merge;
@@ -512,7 +721,22 @@ bool Translator::translate(const Instruction& ins) {
       return define(ins.result, v);
     }
     case Op::Call: return dx_call(ins);
-    case Op::Load: case Op::Alloca: case Op::Gep: return true;   // (refused only if something uses the result)
+    case Op::Gep: {
+      // (a pointer into group-shared memory: the memory and the index; any other pointer is refused only if it is used)
+      uint32_t slot = 0, bytes = 0;
+      if (!(ins.result < ptr_ok_.count() && ptr_ok_[ins.result])) return true;
+      if (!shared_slot(ins.operands[0], &slot, &bytes)) return error(status::kNotSupported);
+      Val v;
+      v.kind = VK::Ptr, v.a = slot, v.c = ins.args[1];
+      shared_bytes_[slot] = bytes;
+      shared_used_[slot] = true;
+      return define(ins.result, v);
+    }
+    case Op::Load: case Op::Store: {
+      if (!is_shared_pointer(ins.operands[0])) return true;   // (a load nothing uses)
+      return shared_access(ins, ins.op == Op::Store);
+    }
+    case Op::Alloca: return true;   // (refused only if something uses the result)
     default: return error(status::kNotSupported);
   }
 }
@@ -771,9 +995,7 @@ bool Translator::sample(const Instruction& ins, bool level) {
     const Constant* c = constant(ins.args[k]);
     if (!c || (c->kind != ConstantKind::Undef && !(constant_int(ins.args[k], &v) && v == 0))) return error(status::kNotSupported);
   }
-  const Resource& t = res_[0][srv.b];
-  const Resource& s = res_[3][smp.b];
-  const uint32_t t_reg = t.lower + srv.c, s_reg = s.lower + smp.c;
+  const uint32_t t_reg = srv.c, s_reg = smp.c;
   const Val r = new_aggregate(ins.result);
   uint32_t scratch = 0;
   if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
@@ -800,7 +1022,6 @@ bool Translator::texture_load(const Instruction& ins) {
     const Constant* c = constant(ins.args[k]);
     if (!c || (c->kind != ConstantKind::Undef && !(constant_int(ins.args[k], &v) && v == 0))) return error(status::kNotSupported);
   }
-  const Resource& t = res_[0][srv.b];
   const Val r = new_aggregate(ins.result);
   uint32_t scratch = 0;
   if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
@@ -817,7 +1038,182 @@ bool Translator::texture_load(const Instruction& ins) {
   dst_temp(r.a, 0xF);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
   put(scratch);
-  src_resource(t.lower + srv.c);
+  src_resource(srv.c);
+  finish(at);
+  return define(ins.result, r);
+}
+
+bool Translator::thread_value(const Instruction& ins, uint32_t type, bool dimension) {
+  uint64_t axis = 0;
+  if (dimension && (ins.arg_count < 2 || !constant_int(ins.args[1], &axis) || axis > 2)) return error(status::kNotSupported);
+  Val v;
+  v.kind = VK::Sys, v.a = type, v.b = static_cast<uint32_t>(axis);
+  sys_used_[type == 32 ? 0 : type == 33 ? 1 : type == 34 ? 2 : 3] = true;
+  return define(ins.result, v);
+}
+
+// A UAV operand with a write mask (a store's destination) or a full swizzle (a load's source).
+uint32_t uav_token(uint32_t mask, bool destination) {
+  return destination ? (2u | (mask << 4) | (30u << 12) | (1u << 20)) : (2u | (1u << 2) | (0xE4u << 4) | (30u << 12) | (1u << 20));
+}
+
+bool Translator::buffer_load(const Instruction& ins) {
+  Val h;
+  if (ins.arg_count < 4 || !resource_of(ins.args[1], 1, &h)) return error(status::kNotSupported);
+  const Resource& r = res_[1][h.b];
+  const bool structured = r.kind == 12;
+  if (!structured && r.kind != 11) return error(status::kNotSupported);
+  const Val index = use(ins.args[2]);
+  const Val r_out = new_aggregate(ins.result);
+  if (r_out.kind == VK::None) return false;
+  const uint32_t slot = h.c;
+  if (structured) {
+    const Val offset = use(ins.args[3]);   // (undef: the start of the element)
+    const uint32_t at = begin(167);        // ld_structured dst, index, offset, u#
+    dst_temp(r_out.a, 0xF);
+    src(index), src(offset);
+    put(uav_token(0, false)), put(slot);
+    finish(at);
+  } else {
+    const uint32_t at = begin(165);        // ld_raw dst, byte address, u#
+    dst_temp(r_out.a, 0xF);
+    src(index);
+    put(uav_token(0, false)), put(slot);
+    finish(at);
+  }
+  return define(ins.result, r_out);
+}
+
+bool Translator::buffer_store(const Instruction& ins) {
+  Val h;
+  uint64_t mask = 0;
+  if (ins.arg_count < 9 || !resource_of(ins.args[1], 1, &h) || !constant_int(ins.args[8], &mask)) return error(status::kNotSupported);
+  const Resource& r = res_[1][h.b];
+  const bool structured = r.kind == 12;
+  if (!structured && r.kind != 11) return error(status::kNotSupported);
+  mask &= 0xF;
+  const Val index = use(ins.args[2]);
+  uint32_t scratch = 0;
+  if (!alloc_reg(pos_, &scratch)) return false;
+  // (the values of the components that are written, each in its own component of the register: a store writes the words of the mask in order)
+  uint32_t words = 0;
+  for (uint32_t k = 0; k < 4; ++k) {
+    if (!(mask >> k & 1)) continue;
+    const Val v = use(ins.args[4 + k]);
+    const uint32_t at = begin(54);
+    dst_temp(scratch, 1u << words);
+    src(v);
+    finish(at);
+    ++words;
+  }
+  if (words == 0) return true;
+  const uint32_t write_mask = (1u << words) - 1;
+  const uint32_t slot = h.c;
+  if (structured) {
+    const Val offset = use(ins.args[3]);
+    const uint32_t at = begin(168);        // store_structured u#.mask, index, offset, value
+    put(uav_token(write_mask, true)), put(slot);
+    src(index), src(offset);
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+    put(scratch);
+    finish(at);
+  } else {
+    const uint32_t at = begin(166);        // store_raw u#.mask, byte address, value
+    put(uav_token(write_mask, true)), put(slot);
+    src(index);
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+    put(scratch);
+    finish(at);
+  }
+  return status_ == status::kSuccess;
+}
+
+bool Translator::atomic(const Instruction& ins) {
+  Val h;
+  uint64_t op = 0;
+  if (ins.arg_count < 7 || !resource_of(ins.args[1], 1, &h) || !constant_int(ins.args[2], &op)) return error(status::kNotSupported);
+  const Resource& r = res_[1][h.b];
+  const bool structured = r.kind == 12;
+  if (!structured && r.kind != 11) return error(status::kNotSupported);
+  static const uint32_t kImm[] = {180, 181, 182, 183, 187, 186, 189, 188, 184};   // add, and, or, xor, imin, imax, umin, umax, exchange
+  if (op >= sizeof kImm / sizeof kImm[0]) return error(status::kNotSupported);
+  const Val c0 = use(ins.args[3]), value = use(ins.args[6]);
+  const Val r_out = new_scalar(ins.result);
+  if (r_out.kind == VK::None) return false;
+  uint32_t scratch = 0;
+  if (!alloc_reg(pos_, &scratch)) return false;
+  {
+    const uint32_t at = begin(54);   // the address: the index in x (and the offset in y of a structured buffer)
+    dst_temp(scratch, 1);
+    src(c0);
+    finish(at);
+  }
+  if (structured) {
+    const Val c1 = use(ins.args[4]);
+    const uint32_t at = begin(54);
+    dst_temp(scratch, 2);
+    src(c1);
+    finish(at);
+  }
+  const uint32_t slot = h.c;
+  const uint32_t at = begin(kImm[op]);
+  dst_scalar(r_out);
+  put((30u << 12) | (1u << 20)), put(slot);   // the unordered access view
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+  put(scratch);
+  src(value);
+  finish(at);
+  return define(ins.result, r_out);
+}
+
+bool Translator::shared_pointer(uint32_t id, Val* out) {
+  const Constant* c = constant(id);
+  uint32_t slot = 0, bytes = 0;
+  if (c && c->kind == ConstantKind::Gep && shared_slot(static_cast<uint32_t>(c->bits), &slot, &bytes)) {
+    out->kind = VK::Ptr, out->a = slot, out->c = static_cast<uint32_t>(c->bits >> 32);
+    shared_bytes_[slot] = bytes;
+    shared_used_[slot] = true;
+    return true;
+  }
+  *out = use(id);
+  return out->kind == VK::Ptr;
+}
+
+bool Translator::shared_access(const Instruction& ins, bool store) {
+  Val ptr;
+  if (!shared_pointer(ins.operands[0], &ptr)) return error(status::kInvalidParameter);
+  // the byte address: 4 * the index
+  Val address;
+  const Constant* c = constant(ptr.c);
+  if (c && (c->kind == ConstantKind::Int || c->kind == ConstantKind::Null)) {
+    address.kind = VK::Imm, address.a = static_cast<uint32_t>((c->kind == ConstantKind::Null ? 0 : c->bits) * 4);
+  } else {
+    uint32_t reg = 0, comp = 0;
+    if (!alloc_scalar(pos_, &reg, &comp)) return false;
+    address.kind = VK::Temp, address.a = reg, address.b = comp;
+    const Val index = use(ptr.c);
+    Val two;
+    two.kind = VK::Imm, two.a = 2;
+    const uint32_t at = begin(41);   // ishl address, index, 2
+    dst_scalar(address);
+    src(index), src(two);
+    finish(at);
+  }
+  const uint32_t operand = 2u | (1u << 2) | (0x00u << 4) | (31u << 12) | (1u << 20);   // (.xxxx: the first word, whichever component of the destination it goes to)
+  if (store) {
+    const Val value = use(ins.operands[1]);
+    const uint32_t at = begin(166);   // store_raw g#.x, address, value
+    put(2u | (1u << 4) | (31u << 12) | (1u << 20)), put(ptr.a);
+    src(address), src(value);
+    finish(at);
+    return status_ == status::kSuccess;
+  }
+  const Val r = new_scalar(ins.result);
+  if (r.kind == VK::None) return false;
+  const uint32_t at = begin(165);     // ld_raw dst, address, g#
+  dst_scalar(r);
+  src(address);
+  put(operand), put(ptr.a);
   finish(at);
   return define(ins.result, r);
 }
@@ -887,7 +1283,9 @@ bool Translator::dx_call(const Instruction& ins) {
       uint64_t cls = 0, range = 0, index = 0;
       if (ins.arg_count < 4 || !constant_int(ins.args[1], &cls) || !constant_int(ins.args[2], &range) || !constant_int(ins.args[3], &index) || cls > 3 || range >= kMaxResources || !res_[cls][range].present)
         return error(status::kNotSupported);   // (a resource array indexed by a variable)
-      if (index >= (res_[cls][range].size == 0xFFFFFFFFu ? 0xFFFFu : res_[cls][range].size)) return error(status::kInvalidParameter);
+      // (the index is the register: the range's lower bound for a single resource)
+      const Resource& range_info = res_[cls][range];
+      if (index < range_info.lower || (range_info.size != 0xFFFFFFFFu && index - range_info.lower >= range_info.size)) return error(status::kInvalidParameter);
       Val v;
       v.kind = VK::Handle, v.a = static_cast<uint32_t>(cls), v.b = static_cast<uint32_t>(range), v.c = static_cast<uint32_t>(index);
       return define(ins.result, v);
@@ -899,12 +1297,27 @@ bool Translator::dx_call(const Instruction& ins) {
       const Resource& cb = res_[2][h.b];
       if (reg >= cb.bytes / 16) return error(status::kInvalidParameter);
       Val v;
-      v.kind = VK::CbAgg, v.a = cb.lower + h.c, v.b = static_cast<uint32_t>(reg);
+      v.kind = VK::CbAgg, v.a = h.c, v.b = static_cast<uint32_t>(reg);
       return define(ins.result, v);
     }
     case kSample: return sample(ins, false);
     case kSampleLevel: return sample(ins, true);
     case kTextureLoad: return texture_load(ins);
+    case kThreadId: return thread_value(ins, 32, true);
+    case kGroupId: return thread_value(ins, 33, true);
+    case kThreadIdInGroup: return thread_value(ins, 34, true);
+    case kFlattenedThreadIdInGroup: return thread_value(ins, 36, false);
+    case kBufferLoad: return buffer_load(ins);
+    case kBufferStore: return buffer_store(ins);
+    case kAtomicBinOp: return atomic(ins);
+    case kBarrier: {
+      uint64_t mode = 0;
+      if (ins.arg_count < 2 || !constant_int(ins.args[1], &mode)) return error(status::kNotSupported);
+      // (DXIL: 1 sync the threads, 2 fence UAVs globally, 4 fence UAVs in the group, 8 fence group-shared memory; DXBC: 1 sync, 2 shared memory, 4 UAVs in the group, 8 UAVs globally)
+      const uint32_t flags = (mode & 1 ? 1u : 0u) | (mode & 8 ? 2u : 0u) | (mode & 4 ? 4u : 0u) | (mode & 2 ? 8u : 0u);
+      finish(begin(190, flags << 11));
+      return true;
+    }
     case kDiscard: {
       if (ins.arg_count < 2) return error(status::kInvalidParameter);
       const Val cond = use(ins.args[1]);
@@ -940,6 +1353,12 @@ NtStatus Translator::read_metadata() {
       meta_int(operand_of(node, 6), &extra);
       if (id >= kMaxResources || space != 0) return status::kNotSupported;
       Resource& r = res_[cls][id];
+      // (a structured buffer's element size: the tag 1 of the node's tags, the last operand)
+      const Meta* tags = operand_of(node, cls == 1 ? 10 : cls == 0 ? 8 : 99);
+      for (uint32_t k = 0; tags && k + 1 < tags->count; k += 2) {
+        uint64_t tag = 0, value = 0;
+        if (meta_int(operand_of(tags, k), &tag) && tag == 1 && meta_int(operand_of(tags, k + 1), &value)) r.stride = static_cast<uint32_t>(value);
+      }
       r.present = true, r.id = static_cast<uint32_t>(id), r.lower = static_cast<uint32_t>(lower), r.size = static_cast<uint32_t>(size);
       if (cls == 2) r.bytes = static_cast<uint32_t>(extra);
       else r.kind = static_cast<uint32_t>(extra);
@@ -1015,8 +1434,19 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 32) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
       else if (c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) v.kind = VK::Imm, v.a = 0;
     }
-    if (!vals_.push_back(v) || !last_use_.push_back(-1) || !alias_of_.push_back(kNone) || !unsupported_.push_back(0)) return status::kNoMemory;
+    if (!vals_.push_back(v) || !last_use_.push_back(-1) || !alias_of_.push_back(kNone) || !unsupported_.push_back(0) || !ptr_ok_.push_back(0)) return status::kNoMemory;
   }
+  // loops: the last block that jumps back to each block; where each value is defined
+  for (uint32_t i = 0; i < f_.block_count; ++i)
+    if (!latch_of_.push_back(kNone)) return status::kNoMemory;
+  for (uint32_t x = 0; x < f_.block_count; ++x) {
+    uint32_t next[2], count = 0;
+    successors_of(x, next, &count);
+    for (uint32_t k = 0; k < count; ++k)
+      if (next[k] <= x && next[k] < f_.block_count && (latch_of_[next[k]] == kNone || latch_of_[next[k]] < x)) latch_of_[next[k]] = x;
+  }
+  for (uint64_t i = 0; i < values; ++i)
+    if (!def_pos_.push_back(-1)) return status::kNoMemory;
   // the first pass: what is used how long
   visited_marks_.clear();
   for (uint32_t i = 0; i < f_.block_count; ++i)
@@ -1051,8 +1481,27 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   // --- the declarations and the program
   ByteBuffer decl(allocator_);
   auto word = [&](uint32_t w) { return decl.put32(w); };
-  const bool pixel = program_kind == 0, vertex = program_kind == 1;
-  if (!pixel && !vertex) return status::kNotSupported;
+  const bool pixel = program_kind == 0, vertex = program_kind == 1, compute = program_kind == 5;
+  if (!pixel && !vertex && !compute) return status::kNotSupported;
+  if (compute) {
+    if (threads_[0] == 0 || threads_[1] == 0 || threads_[2] == 0) return status::kInvalidParameter;
+    word(155u | (4u << 24)), word(threads_[0]), word(threads_[1]), word(threads_[2]);
+    static const uint32_t kSysTypes[4] = {32, 33, 34, 36};
+    for (uint32_t k = 0; k < 4; ++k)
+      if (sys_used_[k]) word(95u | (2u << 24)), word(2u | ((k == 3 ? 1u : 7u) << 4) | (kSysTypes[k] << 12));
+    for (uint32_t k = 0; k < 4; ++k)
+      if (shared_used_[k]) word(159u | (4u << 24)), word((31u << 12) | (1u << 20)), word(k), word(shared_bytes_[k]);
+    for (uint32_t i = 0; i < kMaxResources; ++i) {
+      const Resource& r = res_[1][i];
+      if (!r.present) continue;
+      if (r.lower >= graphics::kMaxStorageBuffers) return status::kNotSupported;
+      if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
+      else return status::kNotSupported;
+    }
+  } else if (res_[1][0].present || res_[1][1].present) {
+    return status::kNotSupported;   // (unordered access views of the other stages)
+  }
   // constant buffers
   for (uint32_t i = 0; i < kMaxResources; ++i) {
     const Resource& r = res_[2][i];
@@ -1072,7 +1521,6 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     if (!dimension || r.lower >= graphics::kMaxTextureUnits) return status::kNotSupported;
     word(88u | (dimension << 11) | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower), word(0x5555u);
   }
-  if (res_[1][0].present || res_[1][1].present) return status::kNotSupported;   // (unordered access views: compute shaders)
   for (uint32_t i = 0; i < input_count_; ++i) {
     const SigElement& e = inputs_[i];
     const uint32_t operand = 2u | ((e.mask & 0xF) << 4) | (1u << 12) | (1u << 20);
@@ -1156,7 +1604,7 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   ConstByteView bitcode;
   if (!program.try_subview(8 + uint64_t{bitcode_offset}, bitcode_size, &bitcode)) return status::kInvalidParameter;
   const uint32_t kind = version >> 16;
-  if (kind != 0 && kind != 1) return status::kNotSupported;
+  if (kind != 0 && kind != 1 && kind != 5) return status::kNotSupported;
   dxil::Module module(allocator);
   NtStatus s = dxil::read_module(allocator, bitcode, &module);
   if (s != status::kSuccess) return s;
@@ -1171,6 +1619,14 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   ByteBuffer shex(allocator);
   s = translator.run(kind, isg1, osg1, &shex);
   if (s != status::kSuccess) return s;
+#ifdef DXIL_TRACE
+  {
+    ByteReader dump(shex.view());
+    fprintf(stderr, "shex:");
+    while (!dump.at_end()) fprintf(stderr, " %08x", dump.le32());
+    fprintf(stderr, "\n");
+  }
+#endif
   // the container: the converted signatures and the program
   ByteBuffer in_sig(allocator), out_sig(allocator);
   if (!isg1.empty() && !convert_signature(allocator, isg1, &in_sig)) return status::kInvalidParameter;

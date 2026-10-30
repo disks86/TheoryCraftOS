@@ -1091,10 +1091,9 @@ void scene_texel_cube(Rig& rig, ArrayView<uint32_t> out) {
 
 // A compute shader (cs_fill.hlsl): 4 x 8 groups of 8 x 4 threads, each writing a pixel of a 32 x 32 picture into a structured buffer from its SV_DispatchThreadID, SV_GroupID and
 // SV_GroupIndex, a structured buffer of uint4 it writes and reads back, a constant from the constant buffer, and two atomic counters that must end at 1024. The picture is the buffer.
-void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
+void compute_fill(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
-  namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_fill, sizeof b::k_cs_fill));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1250,16 +1249,22 @@ void scene_d3d12_heap(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
-// DXIL (Shader Model 6) shaders: a vertex shader with a constant buffer (a matrix and a tint) and two pixel shaders - one with a lot of arithmetic, one with branches and a discard - each
-// drawing a triangle in a half of the picture. The kernel translates the bitcode to the tokens of the same shader, so this checks that what comes out runs on the GPU as it does on the CPU.
+// DXIL (Shader Model 6) shaders: a vertex shader with a constant buffer (a matrix and a tint) and three pixel shaders - one with a lot of arithmetic, one with branches and a discard, one with
+// loops - each drawing a triangle in a third of the picture. The kernel translates the bitcode to the tokens of the same shader, so this checks that what comes out runs on the GPU as it does on the CPU.
 void scene_dxil(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
-  Handle left = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_math, sizeof b::k_dxil_ps_math, 0);
-  Handle right = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_flow, sizeof b::k_dxil_ps_flow, 0);
+  Handle first = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_math, sizeof b::k_dxil_ps_math, 0);
+  Handle second = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_flow, sizeof b::k_dxil_ps_flow, 0);
+  Handle third = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_loop, sizeof b::k_dxil_ps_loop, 0);
   Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
   // (positions in the cell, colours, so that the varyings span ranges that take the branches both ways)
-  const Vertex v[6] = {{-0.9f, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f}, {-0.05f, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f}, {-0.45f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f},
-                       {0.05f, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f}, {0.9f, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f}, {0.45f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f}};
+  Vertex v[9];
+  for (uint32_t cell = 0; cell < 3; ++cell) {
+    const float x0 = -0.97f + 0.65f * static_cast<float>(cell), x1 = x0 + 0.6f;
+    v[3 * cell] = {x0, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f};
+    v[3 * cell + 1] = {x1, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f};
+    v[3 * cell + 2] = {(x0 + x1) * 0.5f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f};
+  }
   Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
   float constants[20];
   for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
@@ -1268,21 +1273,26 @@ void scene_dxil(Rig& rig, ArrayView<uint32_t> out) {
   begin(w, 0, kNoAllocation, {0, 0, 0, 1});
   w.bind_vertex_buffer(1);
   w.push_constants(bytes_of(constants, sizeof constants));
-  w.bind_pipeline(left);
+  w.bind_pipeline(first);
   w.draw(3, 0);
-  w.bind_pipeline(right);
+  w.bind_pipeline(second);
   w.draw(3, 3);
+  w.bind_pipeline(third);
+  w.draw(3, 6);
   w.end_pass();
   rig.render(w, {target, vb});
   rig.read(target, out);
 }
 
+void scene_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_cs_fill, sizeof conformance_blobs::k_cs_fill); }
+// The same shader as DXIL (cs_6_0).
+void scene_dxil_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_dxil_cs_fill, sizeof conformance_blobs::k_dxil_cs_fill); }
+
 // Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
 // by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
-void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
+void compute_shared(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
-  namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_shared, sizeof b::k_cs_shared));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1296,6 +1306,9 @@ void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {picture});
   rig.read_words(picture, out);
 }
+
+void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_cs_shared, sizeof conformance_blobs::k_cs_shared); }
+void scene_dxil_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_dxil_cs_shared, sizeof conformance_blobs::k_dxil_cs_shared); }
 
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
@@ -2215,6 +2228,8 @@ const Entry kScenes[] = {
     {"Direct3D 12 root signature, descriptors and states: textures (DXBC)", scene_d3d12_textures},
     {"Direct3D 12 resource heap: a target and a texture aliased (DXBC)", scene_d3d12_heap},
     {"Direct3D 12 DXIL shaders (Shader Model 6)", scene_dxil},
+    {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
+    {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
     {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},
