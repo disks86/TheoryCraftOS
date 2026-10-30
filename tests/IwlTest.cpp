@@ -31,6 +31,7 @@
 #include "Hardware/WirelessInterface/Intel/IwlFirmware.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlFwLoad.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlRx.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlTx.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlPcie.hpp"
 
 namespace hardware {
@@ -584,6 +585,124 @@ static void test_rx() {
   CHECK(!starved.init(false, &error) && !starved.ready());
 }
 
+// ---- the command queue ------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// The chip's transmit side for the command queue: reads the TFDs the host announced and puts their buffers together.
+struct FakeTxChip {
+  FakeIwl& chip;
+  uint32_t read = 0;
+  explicit FakeTxChip(FakeIwl& c) : chip(c) {}
+  uint64_t ring_base() { return static_cast<uint64_t>(chip.regs[iwl_tx::cbbc_queue(0) / 4]) << 8; }
+  std::vector<Bytes> process(bool* ok) {
+    std::vector<Bytes> out;
+    *ok = true;
+    const uint32_t wr = chip.regs[iwl_tx::kHbusTargWrptr / 4] & 0xFF;
+    while (read != wr) {
+      const uint8_t* tfd = reinterpret_cast<const uint8_t*>(ring_base()) + read * 128;
+      Bytes cmd;
+      const uint32_t tbs = tfd[3] & 0x1F;
+      if (tbs == 0 || tbs > 20) { *ok = false; }
+      for (uint32_t i = 0; i < tbs && i < 20; ++i) {
+        const uint8_t* tb = tfd + 4 + i * 6;
+        uint32_t lo; memcpy(&lo, tb, 4);
+        uint16_t hi_len; memcpy(&hi_len, tb + 4, 2);
+        const uint64_t addr = lo | (static_cast<uint64_t>(hi_len & 0xF) << 32);
+        const uint32_t len = hi_len >> 4;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(addr);
+        cmd.insert(cmd.end(), p, p + len);
+      }
+      out.push_back(cmd);
+      read = (read + 1) & 255;
+    }
+    return out;
+  }
+};
+
+static void test_tx() {
+  TestAllocator alloc;
+  FakeIwl chip;
+  chip.w1c = true;
+  IwlPcieDevice dev(chip);
+  CHECK(dev.apm_init());
+  IwlCommandQueue q(dev, alloc);
+  const char* error = nullptr;
+  CHECK(q.init(&error));
+  if (error) printf("  tx error: %s\n", error);
+  FakeTxChip hw(chip);
+  CHECK(hw.ring_base() != 0 && (hw.ring_base() & 255) == 0 && (chip.prph[iwl_tx::kScdTxFact & 0xFFFFF / 4 ? (iwl_tx::kScdTxFact & 0xFFFFF) / 4 : 0]) == 0);
+  CHECK((chip.prph[(iwl_tx::kScdGpCtrl & 0xFFFFF) / 4] & (iwl_tx::kScdGpCtrlAutoActive | 1)) == (iwl_tx::kScdGpCtrlAutoActive | 1) && chip.regs[iwl_tx::kFhKeepWarm / 4] != 0);
+  // every TFD in the ring points at the invalid block until used
+  { const uint8_t* t = reinterpret_cast<const uint8_t*>(hw.ring_base()); CHECK(t[3] == 1 && t[255 * 128 + 3] == 1); }
+  // before the scheduler is started: commands can be queued
+  chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+  CHECK(q.start(&error));
+  CHECK(q.scd_base() == 0x800000);
+  CHECK(chip.prph[(iwl_tx::scd_queue_status(0) & 0xFFFFF) / 4] == (iwl_tx::kQueueStatusActive | iwl_tx::kCommandFifo | iwl_tx::kQueueStatusWsl | iwl_tx::kQueueStatusMask));
+  CHECK(chip.prph[(iwl_tx::kScdEnCtrl & 0xFFFFF) / 4] == 1 && chip.prph[(iwl_tx::kScdTxFact & 0xFFFFF) / 4] == 0xFF);
+  CHECK(chip.prph[(iwl_tx::kScdDramBase & 0xFFFFF) / 4] != 0);
+  CHECK(chip.regs[iwl_fh::tx_config(3) / 4] == (iwl_fh::kTxChannelEnable | iwl_tx::kTcsrCreditEnable) && (chip.regs[iwl_tx::kFhTxChickenBits / 4] & 2));
+  CHECK(chip.mem[((0x800000 + iwl_tx::scd_context_queue(0) + 4) / 4) % 0x1000] == (64u | (64u << 16)));
+  // a short command: header 4 bytes, 6 bytes of data
+  Bytes d1{1, 2, 3, 4, 5, 6};
+  IwlHostCommand c1;
+  c1.opcode = 0x40; c1.data = ConstByteView(d1.data(), d1.size());
+  int32_t seq = q.enqueue(c1, &error);
+  CHECK(seq == 0 && q.in_flight() == 1 && (chip.regs[iwl_tx::kHbusTargWrptr / 4] & 0xFF) == 1 && ((chip.regs[iwl_tx::kHbusTargWrptr / 4] >> 8) & 0xFF) == 0);
+  bool ok = false;
+  std::vector<Bytes> got = hw.process(&ok);
+  CHECK(ok && got.size() == 1 && got[0] == Bytes({0x40, 0, 0, 0, 1, 2, 3, 4, 5, 6}));
+  { const uint8_t* t = reinterpret_cast<const uint8_t*>(hw.ring_base()); CHECK(t[3] == 1); }   // one TB: the command fits the first 20 bytes
+  // a long wide command
+  Bytes d2(100);
+  for (size_t i = 0; i < d2.size(); ++i) d2[i] = static_cast<uint8_t>(i);
+  IwlHostCommand c2;
+  c2.group = 3; c2.opcode = 0x07; c2.version = 2; c2.data = ConstByteView(d2.data(), d2.size());
+  seq = q.enqueue(c2, &error);
+  CHECK(seq == 1);
+  got = hw.process(&ok);
+  CHECK(ok && got.size() == 1 && got[0].size() == 108 && got[0][0] == 7 && got[0][1] == 3 && got[0][2] == 1 && got[0][3] == 0 && got[0][4] == 100 && got[0][5] == 0 && got[0][7] == 2 && got[0][8] == 0 && got[0][107] == 99);
+  { const uint8_t* t = reinterpret_cast<const uint8_t*>(hw.ring_base()) + 128; CHECK(t[3] == 2); }
+  // the queue fills at 31 commands
+  CHECK(q.in_flight() == 2);
+  int sent = 0;
+  while (q.enqueue(c1, &error) >= 0) ++sent;
+  CHECK(sent == 29 && q.in_flight() == 31 && error);
+  // too large
+  Bytes big(2000);
+  IwlHostCommand c3; c3.opcode = 1; c3.data = ConstByteView(big.data(), big.size());
+  CHECK(q.enqueue(c3, &error) < 0);
+  // answers free the commands, bogus indexes change nothing
+  q.reclaim(200);
+  CHECK(q.in_flight() == 31);
+  q.reclaim(5);
+  CHECK(q.in_flight() == 25);
+  q.reclaim(5);
+  CHECK(q.in_flight() == 25);
+  q.reclaim(30);
+  CHECK(q.in_flight() == 0);
+  // the ring wraps (the chip catches up first)
+  (void)hw.process(&ok);
+  for (int round = 0; round < 40; ++round) {
+    const int32_t s = q.enqueue(c1, &error);
+    CHECK(s >= 0);
+    if (s < 0) break;
+    got = hw.process(&ok);
+    CHECK(ok && got.size() == 1 && got[0][2] == static_cast<uint8_t>(s) && got[0][3] == 0);
+    q.reclaim(static_cast<uint32_t>(s) & 0xFF);
+  }
+  CHECK(q.in_flight() == 0);
+  for (int round = 0; round < 300; ++round) {
+    const int32_t s = q.enqueue(c1, &error);
+    CHECK(s >= 0);
+    if (s < 0) break;
+    (void)hw.process(&ok);
+    q.reclaim(static_cast<uint32_t>(s) & 0xFF);
+  }
+  CHECK(q.write_pointer() == (1 + 1 + 29 + 40 + 300) % 256);
+  q.release();
+  CHECK(!q.ready() && alloc.dma.empty() && q.enqueue(c1, &error) < 0);
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -591,6 +710,7 @@ int main() {
   test_pcie();
   test_load();
   test_rx();
+  test_tx();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }
