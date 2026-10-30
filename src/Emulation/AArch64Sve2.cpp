@@ -27,18 +27,6 @@ using namespace sve;
 
 namespace {
 
-// The low 64 bits of a product (wrapping, so a 64-bit element times itself is not signed overflow).
-uint64_t product_bits(int64_t a, int64_t b) { return static_cast<uint64_t>(a) * static_cast<uint64_t>(b); }
-
-// A signed 64 x 64 product as a 128-bit integer (built from the unsigned product, so that no compiler runtime routine is needed).
-I128 multiply_signed(int64_t a, int64_t b) {
-  const bool negative = (a < 0) != (b < 0);
-  uint64_t hi, lo;
-  multiply_unsigned(a < 0 ? uint64_t{0} - static_cast<uint64_t>(a) : static_cast<uint64_t>(a), b < 0 ? uint64_t{0} - static_cast<uint64_t>(b) : static_cast<uint64_t>(b), &hi, &lo);
-  const I128 magnitude = (static_cast<I128>(hi) << 64) | lo;
-  return negative ? -magnitude : magnitude;
-}
-
 // The signed shift amount of an element, clamped to what the shifters handle (the whole element counts, not just its low byte).
 int32_t shift_amount(uint64_t element, uint32_t w) {
   const int64_t v = sext(element, w);
@@ -57,12 +45,6 @@ uint64_t shift_by_element(I128 v, int32_t sh, uint32_t w, bool round, bool satur
     return sh >= static_cast<int32_t>(w) ? 0 : (static_cast<uint64_t>(v) << sh) & ones(w);
   }
   return static_cast<uint64_t>(shift_right(v, static_cast<uint32_t>(-sh), round)) & ones(w);
-}
-
-// (acc * 2^w + 2 * sign * prod + round) >> w, evaluated as acc + ((sign * prod + 2^(w-2)) >> (w-1)) so that nothing exceeds 128 bits even for 64-bit elements.
-I128 doubling_high(I128 acc, I128 prod, uint32_t w, bool rounding) {
-  const I128 half_unit = rounding ? (static_cast<I128>(1) << (w - 2)) : 0;
-  return acc + ((prod + half_unit) >> (w - 1));
 }
 
 // BEXT / BDEP / BGRP on one element.
@@ -551,7 +533,7 @@ bool AArch64Cpu::sve2(uint32_t insn) {
 
   // 0x45
   if (!b21) {
-    if (op <= 0x1F) {      // widening add / subtract / absolute difference / multiply, bottom and top
+    if (op <= 0x1F && (op < 0x08 || op > 0x0B)) {      // widening add / subtract / absolute difference / multiply, bottom and top
       const uint32_t src_esz = esz - 1;
       if (op == 0x1A || op == 0x1B) {      // PMULLB / PMULLT
         const Vec n = s_.v[zn], m = s_.v[zm];
@@ -661,7 +643,7 @@ bool AArch64Cpu::sve2(uint32_t insn) {
       }
       case 0x28: case 0x29: case 0x2A: case 0x2B: {      // SSHLLB, SSHLLT, USHLLB, USHLLT
         uint32_t src_esz, amount;
-        if (!shll_fields(insn, &src_esz, &amount, false) || src_esz > 2) return false;
+        if (((insn >> 23) & 1) || !shll_fields(insn, &src_esz, &amount, false) || src_esz > 2) return false;
         const uint32_t d = src_esz + 1, nw = element_bits(src_esz);
         const bool top = (op & 1) != 0, is_unsigned = op >= 0x2A;
         const Vec n = s_.v[zn];
