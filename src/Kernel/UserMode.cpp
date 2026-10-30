@@ -691,19 +691,32 @@ void Task::flush_write_buffers() {
 
 bool Task::set_affinity(uint64_t thread_id, uint64_t mask) {
   const uint64_t online = online_core_mask();
-  if (!(mask & online)) return false;
-  if (thread_id == 0) {
+  if (thread_id == ~uint64_t{0}) {      // the mask new threads get, with the threads there are left alone
+    if (!(mask & online)) return false;
+    process_mask = mask;
+    return true;
+  }
+  if (thread_id == 0) {      // the process's mask: a thread that follows it takes it; one with a mask of its own keeps what is left of that (or takes it if nothing is)
+    if (!(mask & online)) return false;
     process_mask = mask;
     for (UserThread* t = threads; t; t = t->next) {
-      t->core_mask = mask;
-      if (t->spawned && t->thread && !t->joined && !t->finished) set_thread_core_mask(t->thread, mask);
+      if (t->affinity_explicit && (t->core_mask & mask & online)) t->core_mask &= mask;
+      else { t->core_mask = mask; t->affinity_explicit = false; }
+      if (t->spawned && t->thread && !t->joined && !t->finished) set_thread_core_mask(t->thread, t->core_mask);
     }
     return true;
   }
   UserThread* t = find_thread(thread_id);
   if (!t) return false;
-  t->core_mask = mask;
-  if (t->spawned && t->thread && !t->joined && !t->finished) set_thread_core_mask(t->thread, mask);
+  if (mask == 0) {      // no mask: back to following the process's
+    t->core_mask = process_mask;
+    t->affinity_explicit = false;
+  } else {
+    if (!(mask & online)) return false;
+    t->core_mask = mask;
+    t->affinity_explicit = true;
+  }
+  if (t->spawned && t->thread && !t->joined && !t->finished) set_thread_core_mask(t->thread, t->core_mask);
   return true;
 }
 

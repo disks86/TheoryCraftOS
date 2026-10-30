@@ -61,6 +61,7 @@ struct UserThread {
   uint64_t stale_rip = 0, stale_address = 0;      // the last fault that was answered by rebuilding the page tables (see UserMode.cpp), to catch one that repeats
   uint32_t stale_count = 0;
   uint64_t core_mask = ~uint64_t{0};      // the cores it may run on (SetThreadAffinityMask)
+  bool affinity_explicit = false;         // its own mask was set (the process's mask only narrows it); otherwise it follows the process's
   uint8_t priority = kernel::kDefaultPriority;      // the kernel scheduler priority (0..31), reapplied at launch() if the thread was not spawned yet
   uint64_t saved_rip = 0;
   process::X86Context saved;      // its registers while it is parked

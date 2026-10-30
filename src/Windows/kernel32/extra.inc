@@ -692,16 +692,37 @@ EXPORT BOOL WINAPI DeleteTimerQueueEx(HANDLE queue, HANDLE completion) {
 }
 EXPORT BOOL WINAPI DeleteTimerQueue(HANDLE queue) { return DeleteTimerQueueEx(queue, NULL); }
 
-/* Waits for a handle: a thread per wait. The callback goes to the pool; a one-shot wait is then finished until it is set again. */
-typedef struct TpWait { TP_WAIT_CALLBACK_ callback; WAITORTIMERCALLBACK_ simple; PVOID context; HANDLE handle, stop; DWORD timeout; DWORD flags; BOOL once; volatile LONG pending; HANDLE idle; HANDLE thread; volatile LONG closing; } TpWait;
-static void run_wait(TpItem *item) {
-  TpWait *w = item->object;
-  const ULONG result = (ULONG)(ULONG_PTR)item->context;      /* WAIT_OBJECT_0 or WAIT_TIMEOUT */
+/* Waits for a handle: a thread per wait. The callback goes to the pool (or, for WT_EXECUTEINWAITTHREAD, runs in the wait's own thread, one at a time for all waits, as on
+ * a shared wait thread); a one-shot wait is then finished until it is set again. A wait unregistered while its callback runs goes when the callback is over. */
+typedef struct TpWait {
+  TP_WAIT_CALLBACK_ callback; WAITORTIMERCALLBACK_ simple; PVOID context; HANDLE handle, stop; DWORD timeout; DWORD flags; BOOL once;
+  volatile LONG pending; HANDLE idle; HANDLE thread; volatile LONG closing;
+  volatile LONG delete_requested; HANDLE completion; volatile DWORD callback_thread;
+} TpWait;
+static CRITICAL_SECTION g_wait_exec_lock;
+static volatile LONG g_wait_exec_ready;
+static void wait_free(TpWait *w);
+static void wait_destroy_deferred(TpWait *w, BOOL own_thread) {
+  HANDLE completion = w->completion;
+  if (own_thread) { if (w->thread) CloseHandle(w->thread); CloseHandle(w->idle); CloseHandle(w->stop); HeapFree(heap(), 0, w); }
+  else wait_free(w);
+  if (completion) SetEvent(completion);
+}
+static void run_wait_callback(TpWait *w, ULONG result) {
   TpInstance in;
   memset(&in, 0, sizeof(in));
+  w->callback_thread = GetCurrentThreadId();
   if (w->callback) w->callback(&in, w->context, w, result); else w->simple(w->context, result == WAIT_TIMEOUT);
+  w->callback_thread = 0;
   instance_finish(&in);
-  if (InterlockedDecrement(&w->pending) == 0) SetEvent(w->idle);
+}
+static void run_wait(TpItem *item) {
+  TpWait *w = item->object;
+  run_wait_callback(w, (ULONG)(ULONG_PTR)item->context);      /* WAIT_OBJECT_0 or WAIT_TIMEOUT */
+  if (InterlockedDecrement(&w->pending) == 0) {
+    SetEvent(w->idle);
+    if (w->delete_requested && InterlockedCompareExchange(&w->delete_requested, 0, 1) == 1) wait_destroy_deferred(w, FALSE);
+  }
 }
 static DWORD WINAPI wait_thread(LPVOID p) {
   TpWait *w = p;
@@ -710,7 +731,17 @@ static DWORD WINAPI wait_thread(LPVOID p) {
     const DWORD r = WaitForMultipleObjects(2, both, FALSE, w->timeout);
     if (r == WAIT_OBJECT_0 || w->closing) return 0;      /* told to stop */
     if (InterlockedIncrement(&w->pending) == 1) ResetEvent(w->idle);
-    if (!pool_post(run_wait, w, (PVOID)(ULONG_PTR)(r == WAIT_TIMEOUT ? WAIT_TIMEOUT : WAIT_OBJECT_0))) { if (InterlockedDecrement(&w->pending) == 0) SetEvent(w->idle); }
+    if (w->flags & 4 /* WT_EXECUTEINWAITTHREAD */) {
+      if (InterlockedCompareExchange(&g_wait_exec_ready, 1, 0) == 0) { RtlInitializeCriticalSection(&g_wait_exec_lock); g_wait_exec_ready = 2; }
+      while (g_wait_exec_ready != 2) Sleep(0);
+      EnterCriticalSection(&g_wait_exec_lock);
+      run_wait_callback(w, r == WAIT_TIMEOUT ? WAIT_TIMEOUT : WAIT_OBJECT_0);
+      LeaveCriticalSection(&g_wait_exec_lock);
+      if (InterlockedDecrement(&w->pending) == 0) {
+        SetEvent(w->idle);
+        if (w->delete_requested && InterlockedCompareExchange(&w->delete_requested, 0, 1) == 1) { wait_destroy_deferred(w, TRUE); return 0; }
+      }
+    } else if (!pool_post(run_wait, w, (PVOID)(ULONG_PTR)(r == WAIT_TIMEOUT ? WAIT_TIMEOUT : WAIT_OBJECT_0))) { if (InterlockedDecrement(&w->pending) == 0) SetEvent(w->idle); }
     if (w->once) return 0;      /* (a pool wait is set again with SetThreadpoolWait) */
   }
 }
@@ -724,7 +755,7 @@ static TpWait *wait_new(void) {
 static void wait_stop(TpWait *w) {
   w->closing = 1;
   SetEvent(w->stop);
-  if (w->thread) { WaitForSingleObject(w->thread, INFINITE); CloseHandle(w->thread); w->thread = NULL; }
+  if (w->thread) { if (GetThreadId(w->thread) != GetCurrentThreadId()) WaitForSingleObject(w->thread, INFINITE); CloseHandle(w->thread); w->thread = NULL; }
   WaitForSingleObject(w->idle, INFINITE);
 }
 static void wait_free(TpWait *w) {
@@ -768,6 +799,20 @@ EXPORT BOOL WINAPI RegisterWaitForSingleObject(PHANDLE new_wait, HANDLE object, 
 EXPORT BOOL WINAPI UnregisterWaitEx(HANDLE wait, HANDLE completion) {
   TpWait *w = wait;
   if (!w) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  w->closing = 1;
+  SetEvent(w->stop);
+  if (w->callback_thread == GetCurrentThreadId()) {      /* from its own callback: it goes when the callback returns */
+    w->completion = (completion && completion != INVALID_HANDLE_VALUE) ? completion : NULL;
+    w->delete_requested = 1;
+    return TRUE;
+  }
+  if (w->pending != 0 && completion != INVALID_HANDLE_VALUE) {      /* a callback is running: the wait goes when it has finished */
+    w->completion = completion;
+    w->delete_requested = 1;
+    if (w->pending == 0 && InterlockedCompareExchange(&w->delete_requested, 0, 1) == 1) { wait_destroy_deferred(w, FALSE); return TRUE; }
+    set_error(997 /* ERROR_IO_PENDING */);
+    return FALSE;
+  }
   wait_free(w);
   if (completion && completion != INVALID_HANDLE_VALUE) SetEvent(completion);
   return TRUE;

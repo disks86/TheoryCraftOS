@@ -54,6 +54,9 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
     textured.alpha_blend = false;
     texture_opaque_ = device.create_graphics_pipeline(textured);
     texture_vertices_ = device.create_buffer(sizeof(TexturedVertex) * 6, kBufferVertex);
+    sheet_vertices_ = device.create_buffer(sizeof(TexturedVertex) * kMaxSheetVertices, kBufferVertex);
+    sheet_ = device.create_image({{kSheetSize, kSheetSize}, Format::B8G8R8A8Unorm, kImageSampled});
+    sheet_pixels_ = allocate_view<uint32_t>(allocator, uint64_t{kSheetSize} * kSheetSize);
   }
   for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
@@ -62,9 +65,17 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
     batch_ = vertices_->map().cast<ColoredVertex>();
     valid_ = !batch_.empty();
   }
+  if (valid_ && sheet_vertices_ && sheet_ && !sheet_pixels_.empty()) {
+    sheet_batch_ = sheet_vertices_->map().cast<TexturedVertex>();
+    sheet_ok_ = sheet_batch_.size() >= kMaxSheetVertices && texture_blended_ && texture_opaque_ && texture_vertices_;
+    for (uint32_t& p : sheet_pixels_) p = 0;
+  }
 }
 
 DeviceRenderer2D::~DeviceRenderer2D() {
+  if (sheet_) device_.destroy_image(sheet_);
+  if (sheet_vertices_) device_.destroy_buffer(sheet_vertices_);
+  release_view(allocator_, sheet_pixels_);
   if (texture_) device_.destroy_image(texture_);
   release_view(allocator_, texture_rows_);
   if (texture_vertices_) device_.destroy_buffer(texture_vertices_);
@@ -83,22 +94,41 @@ DeviceRenderer2D::~DeviceRenderer2D() {
 }
 
 void DeviceRenderer2D::close_range() {
+  close_sheet_range();
   if (count_ <= range_start_) return;
-  ranges_[range_count_++] = {range_start_, count_ - range_start_, clip_, blend_};
+  ranges_[range_count_++] = {range_start_, count_ - range_start_, clip_, blend_, false};
   range_start_ = count_;
   if (range_count_ == kMaxRanges) submit_pending();
+}
+
+void DeviceRenderer2D::close_sheet_range() {
+  if (sheet_count_ <= sheet_range_start_) return;
+  ranges_[range_count_++] = {sheet_range_start_, sheet_count_ - sheet_range_start_, clip_, blend_, true};
+  sheet_range_start_ = sheet_count_;
+  if (range_count_ == kMaxRanges) submit_pending();
+}
+
+// A new frame starts with an empty sheet (what the last frame put on it is drawn by now).
+void DeviceRenderer2D::reset_sheet() {
+  sheet_x_ = sheet_y_ = sheet_shelf_ = 0;
 }
 
 bool DeviceRenderer2D::submit_pending() {
   close_range();
   if (!valid_ || range_count_ == 0) return true;
   vertices_->unmap();
+  if (sheet_ok_) {
+    sheet_vertices_->unmap();
+    if (sheet_dirty_) {
+      if (!sheet_->write_pixels(ArrayView<const uint32_t>(sheet_pixels_.data(), sheet_pixels_.size()))) return false;
+      sheet_dirty_ = false;
+    }
+  }
   commands_->begin();
   RenderPassBegin pass;
   pass.color = images_[back_];
   pass.clear_color = false;  // keep what earlier frames and submissions drew
   commands_->begin_render_pass(pass);
-  commands_->bind_vertex_buffer(vertices_);
   // Pixel coordinates (0,0 top left) to clip space; depth is constant.
   ColoredConstants constants;
   constants.mvp.m[0] = 2.0f / extent_.width;
@@ -108,10 +138,26 @@ bool DeviceRenderer2D::submit_pending() {
   constants.mvp.m[13] = -1;
   constants.mvp.m[14] = 0.5f;
   bool pushed = false;
+  int bound = -1;   // which vertex buffer is bound: 0 colored, 1 the sheet's
   for (uint32_t i = 0; i < range_count_; ++i) {
     const Range& r = ranges_[i];
     commands_->set_scissor(r.clip);
-    commands_->bind_pipeline(r.blend == BlendMode::Alpha ? blended_ : opaque_);
+    if (r.sheet) {
+      commands_->bind_pipeline(r.blend == BlendMode::Alpha ? texture_blended_ : texture_opaque_);
+      if (bound != 1) {
+        commands_->bind_vertex_buffer(sheet_vertices_);
+        SamplerDesc sampler;   // (nearest at the pixel centres: the baked pixels as they are)
+        sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+        commands_->bind_texture(0, sheet_, sampler);
+        bound = 1;
+      }
+    } else {
+      commands_->bind_pipeline(r.blend == BlendMode::Alpha ? blended_ : opaque_);
+      if (bound != 0) {
+        commands_->bind_vertex_buffer(vertices_);
+        bound = 0;
+      }
+    }
     if (!pushed) {  // (constants stay with the commands; binding another pipeline does not lose them)
       commands_->push_constants(&constants, sizeof(constants));
       pushed = true;
@@ -121,6 +167,7 @@ bool DeviceRenderer2D::submit_pending() {
   commands_->end_render_pass();
   const bool ok = commands_->end() && device_.submit(commands_);
   count_ = range_start_ = range_count_ = 0;
+  sheet_count_ = sheet_range_start_ = 0;
   return ok;
 }
 
@@ -134,6 +181,7 @@ void DeviceRenderer2D::triangle(float x0, float y0, float x1, float y1, float x2
 void DeviceRenderer2D::triangle_colors(const float* xs, const float* ys, const Vec4* colors) {
   if (!valid_ || clip_.width == 0 || clip_.height == 0) return;  // (nothing can show through an empty scissor)
   if (count_ + 3 > kMaxVertices) submit_pending();
+  if (sheet_count_ > sheet_range_start_) close_sheet_range();   // (a run of sheet rectangles ends here: the order of drawing is kept)
   for (int i = 0; i < 3; ++i) batch_[count_++] = {{xs[i], ys[i], 0}, {colors[i].x, colors[i].y, colors[i].z, colors[i].w * opacity_}};
 }
 
@@ -168,6 +216,7 @@ void DeviceRenderer2D::set_blend(BlendMode mode) {
 void DeviceRenderer2D::clear(uint32_t color) {
   if (!valid_) return;
   count_ = range_start_ = range_count_ = 0;  // the clear wipes whatever was recorded
+  sheet_count_ = sheet_range_start_ = 0;
   commands_->begin();
   RenderPassBegin pass;
   pass.color = images_[back_];
@@ -268,9 +317,74 @@ bool DeviceRenderer2D::draw_texture(const Surface& s, const Rect2D& rect, int32_
     else
       for (uint32_t i = 0; i < w; ++i) to[i] = s.decode(from[i]);
   }
-  if (!submit_pending() || !ensure_texture(w, h) || !texture_->write_pixels(ArrayView<const uint32_t>(rows.data(), rows.size()))) return false;
+  return upload_and_draw(w, h, dx, dy);
+}
 
-  return draw_textured_quad(*texture_, dx, dy, w, h, 0.0f, 0.0f, 1.0f, 1.0f);
+bool DeviceRenderer2D::prepare_rows(uint64_t count) {
+  if (texture_rows_.size() >= count) return true;
+  release_view(allocator_, texture_rows_);
+  texture_rows_ = allocate_view<uint32_t>(allocator_, count);
+  return !texture_rows_.empty();
+}
+
+// The first w * h pixels of texture_rows_ as one rectangle at (dx, dy): uploaded as a texture of that size and drawn after what was recorded before it.
+bool DeviceRenderer2D::upload_and_draw(uint64_t w, uint64_t h, int64_t dx, int64_t dy) {
+  const uint32_t width = static_cast<uint32_t>(w), height = static_cast<uint32_t>(h);
+  if (!submit_pending() || !ensure_texture(width, height) || !texture_->write_pixels(ArrayView<const uint32_t>(texture_rows_.data(), w * h))) return false;
+  return draw_textured_quad(*texture_, dx, dy, width, height, 0.0f, 0.0f, 1.0f, 1.0f);
+}
+
+bool DeviceRenderer2D::sheet_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y) {
+  if (w > kSheetSize || h > kSheetSize) return false;
+  if (sheet_x_ + w > kSheetSize) {   // the next shelf
+    sheet_y_ += sheet_shelf_;
+    sheet_x_ = 0;
+    sheet_shelf_ = 0;
+  }
+  if (sheet_y_ + h > kSheetSize) {   // full: what was recorded is drawn with the sheet as it is, and the sheet starts again
+    if (!submit_pending()) return false;
+    reset_sheet();
+  }
+  *x = sheet_x_;
+  *y = sheet_y_;
+  sheet_x_ += w;
+  if (h > sheet_shelf_) sheet_shelf_ = h;
+  return true;
+}
+
+void DeviceRenderer2D::sheet_emit(uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, int64_t dx, int64_t dy) {
+  if (clip_.width == 0 || clip_.height == 0) return;
+  if (sheet_count_ + 6 > kMaxSheetVertices) submit_pending();   // (the sheet's contents stay: the slot is already taken)
+  if (count_ > range_start_) close_range();   // (a run of colored shapes ends here)
+  constexpr float k = 1.0f / kSheetSize;
+  const float x0 = static_cast<float>(dx), y0 = static_cast<float>(dy), x1 = x0 + static_cast<float>(w), y1 = y0 + static_cast<float>(h);
+  const float u0 = static_cast<float>(sx) * k, v0 = static_cast<float>(sy) * k, u1 = static_cast<float>(sx + w) * k, v1 = static_cast<float>(sy + h) * k;
+  const TexturedVertex quad[6] = {{{x0, y0, 0}, {u0, v0}}, {{x1, y0, 0}, {u1, v0}}, {{x1, y1, 0}, {u1, v1}}, {{x0, y0, 0}, {u0, v0}}, {{x1, y1, 0}, {u1, v1}}, {{x0, y1, 0}, {u0, v1}}};
+  for (const TexturedVertex& v : quad) sheet_batch_[sheet_count_++] = v;
+}
+
+// A mask in the colors coverage_color gives it (alpha blending only), as pixels: small ones are baked onto the sheet, big ones are a texture of their own.
+bool DeviceRenderer2D::draw_mask_textured(const MaskView& mask, int64_t ddx, int64_t ddy, int64_t dx0, int64_t dy0, uint64_t w, uint64_t h, uint32_t color) {
+  if (!sheet_ok_) return false;
+  const bool small = w <= kSheetMaxMask && h <= kSheetMaxMask && w * h < kTextureMinPixels;
+  uint32_t sx = 0, sy = 0;
+  if (small) {
+    if (!sheet_slot(static_cast<uint32_t>(w), static_cast<uint32_t>(h), &sx, &sy)) return false;
+  } else if (!prepare_rows(w * h)) {
+    return false;
+  }
+  for (uint64_t j = 0; j < h; ++j) {
+    const ConstByteView cov = mask.coverage.subview(static_cast<uint64_t>(dy0 - ddy + static_cast<int64_t>(j)) * mask.pitch + static_cast<uint64_t>(dx0 - ddx), w);
+    const ArrayView<uint32_t> out = small ? sheet_pixels_.subview(uint64_t{sy + j} * kSheetSize + sx, w) : texture_rows_.subview(j * w, w);
+    for (uint64_t i = 0; i < w; ++i) {
+      uint32_t c;
+      out[i] = coverage_color(color, cov[i], &c) ? c : 0;   // (no coverage: fully transparent, which blends to nothing)
+    }
+  }
+  if (!small) return upload_and_draw(w, h, dx0, dy0);
+  sheet_dirty_ = true;
+  sheet_emit(sx, sy, static_cast<uint32_t>(w), static_cast<uint32_t>(h), dx0, dy0);
+  return true;
 }
 
 // One rectangle at (dx, dy), w x h pixels, showing the part (u0, v0)-(u1, v1) of the image: drawn at once, in a submit of its own after what was recorded before it.
@@ -463,6 +577,8 @@ void DeviceRenderer2D::draw_mask(const MaskView& mask, const Rect2D& rect, int32
   const int64_t dy0 = raster::max_i(raster::saturate_i32(sy0 + ddy), clip_.y), dy1 = raster::min_i(raster::saturate_i32(sy1 + ddy), raster::saturate_i32(int64_t{clip_.y} + clip_.height));
   if (dx0 >= dx1 || dy0 >= dy1) return;
   const uint64_t n = static_cast<uint64_t>(dx1 - dx0);
+  // (alpha blending at full opacity: glyphs and shadows go up as pixels, not as a rectangle per run of equal coverage)
+  if (blend_ == BlendMode::Alpha && opacity_ == 1.0f && draw_mask_textured(mask, ddx, ddy, dx0, dy0, n, static_cast<uint64_t>(dy1 - dy0), color)) return;
   for (int64_t dy = dy0; dy < dy1; ++dy) {
     const ConstByteView cov = mask.coverage.subview(static_cast<uint64_t>(dy - ddy) * mask.pitch + static_cast<uint64_t>(dx0 - ddx), n);
     for (uint64_t i = 0; i < n;) {
@@ -484,6 +600,17 @@ void DeviceRenderer2D::draw_image_scaled(const Surface& source, const RectF& src
   if (!area.width || !area.height) return;
   const float step_x = src.width / static_cast<float>(dest.width), step_y = src.height / static_cast<float>(dest.height);
   const int64_t col0 = int64_t{area.x} - dest.x, row0 = int64_t{area.y} - dest.y;
+  // A big enough area is sampled here, as ever, but sent up as one texture (the pixels are the same ones) instead of a rectangle per run.
+  if (sheet_ok_ && opacity_ == 1.0f && uint64_t{area.width} * area.height >= kTextureMinPixels && prepare_rows(uint64_t{area.width} * area.height)) {
+    for (uint32_t j = 0; j < area.height; ++j) {
+      const float sy = src.y + (static_cast<float>(row0 + j) + 0.5f) * step_y;
+      for (uint32_t i = 0; i < area.width; ++i) {
+        const float sx = src.x + (static_cast<float>(col0 + i) + 0.5f) * step_x;
+        texture_rows_[uint64_t{j} * area.width + i] = filter == ImageFilter::Nearest ? raster::sample_nearest(source, bounds, sx, sy) : raster::sample_bilinear(source, bounds, sx, sy);
+      }
+    }
+    if (upload_and_draw(area.width, area.height, area.x, area.y)) return;
+  }
   for (uint32_t j = 0; j < area.height; ++j) {
     const float sy = src.y + (static_cast<float>(row0 + j) + 0.5f) * step_y;
     uint32_t run_start = 0, run_color = 0;
@@ -737,6 +864,7 @@ bool DeviceRenderer2D::copy_rect(const Rect2D& source, int32_t dest_x, int32_t d
 
 void DeviceRenderer2D::present() {
   if (submit_pending() && device_.present(images_[back_])) back_ ^= 1;
+  reset_sheet();
 }
 
 bool DeviceRenderer2D::read_pixels(ArrayView<uint32_t> out) { return submit_pending() && images_[back_] && images_[back_]->read_pixels(out); }

@@ -126,6 +126,8 @@ struct DepthStencilState {
   // Two sided stencil: the faces that are not front use `back`. A triangle is clockwise when its signed area is positive in window coordinates (y down); it is a front face when
   // that agrees with `front_clockwise` (PA_SU_SC_MODE_CNTL.FACE).
   bool two_sided = false, front_clockwise = false;
+  // Face culling (PA_SU_SC_MODE_CNTL.CULL_FRONT / CULL_BACK): 0 none, 1 front faces are not drawn, 2 back faces are not drawn. Which faces are front is front_clockwise.
+  uint8_t cull = 0;
   StencilFace back;
   StencilFace front() const { return StencilFace{stencil_func, stencil_ref, stencil_mask, stencil_write_mask, stencil_op_value, fail_op, zpass_op, zfail_op}; }
 };

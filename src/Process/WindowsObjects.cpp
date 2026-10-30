@@ -218,7 +218,12 @@ bool resolve(Process& p, uint64_t handle, Waitable* w) {
   uint64_t slot = 0;
   if (!slot_of(handle, &slot)) return false;
   const DescriptorKind k = p.files().kind(slot);
-  if (k == DescriptorKind::Thread) { w->type = Waitable::Thread; w->thread = p.files().token(slot); return true; }
+  if (k == DescriptorKind::Thread) {
+    if (p.files().denied_access(slot) & 0x100000u) return false;
+    w->type = Waitable::Thread;
+    w->thread = p.files().token(slot);
+    return true;
+  }
   if (k == DescriptorKind::Pipe) { w->type = Waitable::Pipe; w->thread = slot; return true; }      // (a pipe handle is signalled, as a file object with no call under way is)
   if (k == DescriptorKind::Mailslot) { w->type = Waitable::Mailslot; w->thread = slot; return true; }
   if (k == DescriptorKind::File || k == DescriptorKind::Directory || k == DescriptorKind::ConsoleInput || k == DescriptorKind::ConsoleOutput || k == DescriptorKind::ConsoleError ||

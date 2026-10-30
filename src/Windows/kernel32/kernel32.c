@@ -333,6 +333,19 @@ EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { if (!h
 EXPORT void WINAPI DebugBreak(void) { __asm__ volatile("int3"); }
 EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
 EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
+IMPORT NTSTATUS NTAPI RtlSetThreadErrorMode(ULONG, ULONG *);
+IMPORT ULONG NTAPI RtlGetThreadErrorMode(void);
+static DWORD thread_error_mode_from_rtl(ULONG rtl) { return ((rtl & 0x10) ? 1u : 0u) | ((rtl & 0x20) ? 2u : 0u) | ((rtl & 0x40) ? 0x8000u : 0u); }
+EXPORT DWORD WINAPI GetThreadErrorMode(void) { return thread_error_mode_from_rtl(RtlGetThreadErrorMode()); }
+EXPORT BOOL WINAPI SetThreadErrorMode(DWORD mode, LPDWORD old) {
+  if (mode & ~(DWORD)(1 | 2 | 0x8000)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG previous = 0;
+  const ULONG rtl = ((mode & 1) ? 0x10u : 0u) | ((mode & 2) ? 0x20u : 0u) | ((mode & 0x8000) ? 0x40u : 0u);
+  const NTSTATUS s = RtlSetThreadErrorMode(rtl, &previous);
+  if (!NT_SUCCESS(s)) return fail_nt(s);
+  if (old) *old = thread_error_mode_from_rtl(previous);
+  return TRUE;
+}
 EXPORT UINT WINAPI SetErrorMode(UINT mode) {
   ULONG old = 0;
   NtQueryInformationProcess(NtCurrentProcess(), 12, &old, sizeof(old), NULL);
@@ -1110,8 +1123,9 @@ EXPORT BOOL WINAPI FlsSetValue(DWORD index, PVOID value) {
 /* ---- synchronization: one thread, so these count and never wait ------------------------------------------------------------------------------------------ */
 
 EXPORT void WINAPI InitializeCriticalSection(LPCRITICAL_SECTION cs) { RtlInitializeCriticalSection(cs); }
-EXPORT BOOL WINAPI InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin) { (void)spin; RtlInitializeCriticalSection(cs); return TRUE; }
-EXPORT BOOL WINAPI InitializeCriticalSectionEx(LPCRITICAL_SECTION cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; RtlInitializeCriticalSection(cs); return TRUE; }
+IMPORT NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION, ULONG, ULONG);
+EXPORT BOOL WINAPI InitializeCriticalSectionEx(LPCRITICAL_SECTION cs, DWORD spin, DWORD flags) { const NTSTATUS s = RtlInitializeCriticalSectionEx(cs, spin, flags); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin) { return InitializeCriticalSectionEx(cs, spin, 0); }
 EXPORT void WINAPI EnterCriticalSection(LPCRITICAL_SECTION cs) { RtlEnterCriticalSection(cs); }
 EXPORT BOOL WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION cs) { return RtlTryEnterCriticalSection(cs); }
 EXPORT void WINAPI LeaveCriticalSection(LPCRITICAL_SECTION cs) { RtlLeaveCriticalSection(cs); }
@@ -1177,16 +1191,74 @@ EXPORT ULONGLONG WINAPI GetTickCount64(void);
 
 /* Slim reader/writer locks and condition variables for the threads of the process: waiting threads give their time slice away (condition variables wake all waiters,
  * which the contract allows: a waiter rechecks its condition). */
+/* The lock word: bit 0 is set while a thread holds the lock exclusively, bits 4 and up count the shared holders (16 each), bits 32 and up count the threads waiting for the
+ * exclusive lock; shared requests give way to those. */
+#define SRW_EXCLUSIVE 1ull
+#define SRW_SHARED_UNIT 16ull
+#define SRW_SHARED_MASK 0xFFFFFFF0ull
+#define SRW_WAITER_UNIT (1ull << 32)
+#define SRW_WORD(lock) ((volatile ULONGLONG *)&(lock)->Ptr)
 EXPORT void WINAPI InitializeSRWLock(PSRWLOCK lock) { lock->Ptr = NULL; }
-EXPORT void WINAPI AcquireSRWLockExclusive(PSRWLOCK lock) { while (!__sync_bool_compare_and_swap((ULONG_PTR *)&lock->Ptr, 0, 1)) NtYieldExecution(); }
-EXPORT BOOLEAN WINAPI TryAcquireSRWLockExclusive(PSRWLOCK lock) { return __sync_bool_compare_and_swap((ULONG_PTR *)&lock->Ptr, 0, 1); }
-EXPORT void WINAPI ReleaseSRWLockExclusive(PSRWLOCK lock) { __sync_lock_release((ULONG_PTR *)&lock->Ptr); }
+EXPORT BOOLEAN WINAPI TryAcquireSRWLockExclusive(PSRWLOCK lock) {
+  for (;;) {
+    const ULONGLONG v = *SRW_WORD(lock);
+    if (v & (SRW_EXCLUSIVE | SRW_SHARED_MASK)) return FALSE;
+    if (__sync_bool_compare_and_swap(SRW_WORD(lock), v, v | SRW_EXCLUSIVE)) return TRUE;
+  }
+}
+EXPORT void WINAPI AcquireSRWLockExclusive(PSRWLOCK lock) {
+  __sync_fetch_and_add(SRW_WORD(lock), SRW_WAITER_UNIT);
+  for (;;) {
+    const ULONGLONG v = *SRW_WORD(lock);
+    if (!(v & (SRW_EXCLUSIVE | SRW_SHARED_MASK)) && __sync_bool_compare_and_swap(SRW_WORD(lock), v, (v | SRW_EXCLUSIVE) - SRW_WAITER_UNIT)) return;
+    NtYieldExecution();
+  }
+}
+EXPORT void WINAPI ReleaseSRWLockExclusive(PSRWLOCK lock) { __sync_fetch_and_and(SRW_WORD(lock), ~SRW_EXCLUSIVE); }
 EXPORT BOOLEAN WINAPI TryAcquireSRWLockShared(PSRWLOCK lock) {
-  const ULONG_PTR v = (ULONG_PTR)lock->Ptr;
-  return !(v & 1) && __sync_bool_compare_and_swap((ULONG_PTR *)&lock->Ptr, v, v + 2);
+  for (;;) {
+    const ULONGLONG v = *SRW_WORD(lock);
+    if ((v & SRW_EXCLUSIVE) || (v >> 32) != 0) return FALSE;      /* (held, or a thread is waiting for it exclusively) */
+    if (__sync_bool_compare_and_swap(SRW_WORD(lock), v, v + SRW_SHARED_UNIT)) return TRUE;
+  }
 }
 EXPORT void WINAPI AcquireSRWLockShared(PSRWLOCK lock) { while (!TryAcquireSRWLockShared(lock)) NtYieldExecution(); }
-EXPORT void WINAPI ReleaseSRWLockShared(PSRWLOCK lock) { __sync_fetch_and_sub((ULONG_PTR *)&lock->Ptr, 2); }
+EXPORT void WINAPI ReleaseSRWLockShared(PSRWLOCK lock) { __sync_fetch_and_sub(SRW_WORD(lock), SRW_SHARED_UNIT); }
+/* Synchronization barriers. The 32 bytes of the SYNCHRONIZATION_BARRIER hold: the number of threads that wait without NO_DELETE (DeleteSynchronizationBarrier waits for them to
+ * be gone), the number of threads the barrier is for, and one 64-bit word with the generation (high half) and how many have arrived in it (low half). The thread that
+ * arrives last starts the next generation and gets TRUE. */
+EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD count, const ULONG_PTR *arguments);
+typedef struct SyncBarrier { volatile LONG delete_waiters; LONG total; volatile ULONGLONG state; LONG spin; LONG unused[3]; } SyncBarrier;
+EXPORT BOOL WINAPI InitializeSynchronizationBarrier(SyncBarrier *barrier, LONG total, LONG spin) {
+  if (!barrier || total < 1 || spin < -1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  memset(barrier, 0, sizeof(*barrier));
+  barrier->total = total;
+  barrier->spin = spin;
+  return TRUE;
+}
+EXPORT BOOL WINAPI EnterSynchronizationBarrier(SyncBarrier *barrier, DWORD flags) {
+  if (flags & ~7u) RaiseException(0xC000000Du /* STATUS_INVALID_PARAMETER */, 1 /* EXCEPTION_NONCONTINUABLE */, 0, NULL);
+  const BOOL counted = !(flags & 4 /* SYNCHRONIZATION_BARRIER_FLAGS_NO_DELETE */);
+  if (counted) __sync_fetch_and_add(&barrier->delete_waiters, 1);
+  ULONGLONG generation;
+  for (;;) {
+    const ULONGLONG v = barrier->state;
+    generation = v >> 32;
+    if ((LONG)(v & 0xFFFFFFFFu) + 1 >= barrier->total) {      /* the last to arrive */
+      if (__sync_bool_compare_and_swap(&barrier->state, v, (generation + 1) << 32)) {
+        if (counted) __sync_fetch_and_sub(&barrier->delete_waiters, 1);
+        return TRUE;
+      }
+    } else if (__sync_bool_compare_and_swap(&barrier->state, v, v + 1)) break;
+  }
+  while ((barrier->state >> 32) == generation) NtYieldExecution();
+  if (counted) __sync_fetch_and_sub(&barrier->delete_waiters, 1);
+  return FALSE;
+}
+EXPORT BOOL WINAPI DeleteSynchronizationBarrier(SyncBarrier *barrier) {
+  while (barrier->delete_waiters > 0) NtYieldExecution();
+  return TRUE;
+}
 EXPORT void WINAPI InitializeConditionVariable(PCONDITION_VARIABLE cv) { cv->Ptr = NULL; }
 EXPORT void WINAPI WakeConditionVariable(PCONDITION_VARIABLE cv) { __sync_fetch_and_add((ULONG_PTR *)&cv->Ptr, 1); }
 EXPORT void WINAPI WakeAllConditionVariable(PCONDITION_VARIABLE cv) { __sync_fetch_and_add((ULONG_PTR *)&cv->Ptr, 1); }
@@ -1624,14 +1696,13 @@ EXPORT SIZE_T WINAPI VirtualQueryEx(HANDLE process, LPCVOID address, PMEMORY_BAS
 }
 
 EXPORT HANDLE WINAPI OpenThread(DWORD access, BOOL inherit, DWORD id) {
-  (void)access;
   OBJECT_ATTRIBUTES attributes;
   memset(&attributes, 0, sizeof(attributes));
   attributes.Length = sizeof(attributes);
   attributes.Attributes = inherit ? 2 : 0;
   ULONG64 client[2] = {GetCurrentProcessId(), id};
   HANDLE h = NULL;
-  const NTSTATUS status = NtOpenThread(&h, 0x1F03FF, &attributes, client);
+  const NTSTATUS status = NtOpenThread(&h, access, &attributes, client);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   return h;
 }
@@ -1754,9 +1825,96 @@ EXPORT DWORD WINAPI SuspendThread(HANDLE h) {
 }
 EXPORT BOOL WINAPI TerminateThread(HANDLE h, DWORD code) { const NTSTATUS status = NtTerminateThread(h, (NTSTATUS)code); return NT_SUCCESS(status) ? TRUE : fail_nt(status); }
 EXPORT BOOL WINAPI SetThreadPriority(HANDLE h, int priority) {
+  if (!(priority == -15 || priority == 15 || (priority >= -2 && priority <= 2))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* IDLE, LOWEST..HIGHEST, TIME_CRITICAL */
   LONG value = priority;
   const NTSTATUS status = NtSetInformationThread(h, 3, &value, sizeof(value));      /* ThreadBasePriority */
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+
+EXPORT BOOL WINAPI SetProcessAffinityMask(HANDLE h, DWORD_PTR mask);
+typedef struct GroupAffinity { ULONG_PTR Mask; WORD Group; WORD Reserved[3]; } GROUP_AFFINITY;
+typedef ULONG_PTR KAFFINITY, *PULONG_PTR;
+EXPORT BOOL WINAPI GetProcessAffinityMask(HANDLE h, DWORD_PTR *process, DWORD_PTR *system);
+/* Priority boost: whether the system may raise the thread's priority is only remembered (nothing here boosts). */
+static struct { DWORD id; BOOL disabled; } g_boost[64];
+static BOOL g_process_boost_disabled;
+EXPORT BOOL WINAPI SetThreadPriorityBoost(HANDLE h, BOOL disabled) {
+  BYTE info[48];
+  const NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);      /* (the handle has to name a thread, and allow querying) */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  LONG value = 0;
+  const NTSTATUS set = NtSetInformationThread(h, 3, &value, 0);      /* (only the right to set is checked: a length of 0 changes nothing) */
+  if (set == 0xC0000022u) return fail_nt(set);
+  const DWORD id = GetThreadId(h);
+  int slot = -1;
+  for (int i = 0; i < 64; ++i) if (g_boost[i].id == id) { slot = i; break; }
+  if (slot < 0) for (int i = 0; i < 64; ++i) if (!g_boost[i].id) { slot = i; break; }
+  if (slot < 0) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  g_boost[slot].id = id;
+  g_boost[slot].disabled = disabled != 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetThreadPriorityBoost(HANDLE h, PBOOL disabled) {
+  BYTE info[48];
+  const NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  const DWORD id = GetThreadId(h);
+  *disabled = g_process_boost_disabled;
+  for (int i = 0; i < 64; ++i) if (g_boost[i].id == id) *disabled = g_boost[i].disabled;
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetProcessPriorityBoost(HANDLE process, BOOL disabled) {
+  (void)process;
+  g_process_boost_disabled = disabled != 0;
+  for (int i = 0; i < 64; ++i) g_boost[i].id = 0;      /* (every thread follows the process) */
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetProcessPriorityBoost(HANDLE process, PBOOL disabled) { (void)process; *disabled = g_process_boost_disabled; return TRUE; }
+
+/* The limits of the thread's stack, and the part of it kept for handling a stack overflow. */
+EXPORT void WINAPI GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high) {
+  *low = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x1478);      /* DeallocationStack */
+  *high = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x08);      /* StackBase */
+}
+EXPORT BOOL WINAPI SetThreadStackGuarantee(PULONG size) {
+  ULONG *guarantee = (ULONG *)TEB_BYTE(NtCurrentTeb(), 0x1748);
+  const ULONG old = *guarantee, wanted = *size;
+  const ULONG_PTR stack = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x08) - *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x1478);
+  *size = old;
+  if (wanted == 0) return TRUE;
+  if (wanted > stack / 2) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG rounded = (wanted + 0xFFF) & ~0xFFFu;
+  if (rounded < 8192) rounded = 8192;      /* (at least two pages) */
+  if (rounded > old) *guarantee = rounded;
+  return TRUE;
+}
+
+/* Processor groups: there is one, group 0, and the thread's affinity mask is its mask. */
+EXPORT BOOL WINAPI GetThreadGroupAffinity(HANDLE h, GROUP_AFFINITY *affinity) {
+  if (!affinity) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  BYTE info[48];
+  const NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  memset(affinity, 0, sizeof(*affinity));
+  affinity->Mask = (KAFFINITY)get64(info + 32);
+  affinity->Group = 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetThreadGroupAffinity(HANDLE h, const GROUP_AFFINITY *affinity, GROUP_AFFINITY *previous) {
+  if (!affinity) { set_error(ERROR_NOACCESS); return FALSE; }
+  DWORD_PTR process_mask = 0, system_mask = 0;
+  GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+  if (affinity->Group != 0 || (affinity->Mask & ~system_mask)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  BYTE info[48];
+  NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  const KAFFINITY old = (KAFFINITY)get64(info + 32);
+  (void)process_mask;
+  GROUP_AFFINITY sent = *affinity;      /* (no mask: the thread follows the process's again) */
+  status = NtSetInformationThread(h, 30, &sent, 16);      /* ThreadGroupInformation */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (previous) { memset(previous, 0, sizeof(*previous)); previous->Mask = old; }
+  return TRUE;
 }
 EXPORT int WINAPI GetThreadPriority(HANDLE h) {
   BYTE info[48];
@@ -1765,6 +1923,7 @@ EXPORT int WINAPI GetThreadPriority(HANDLE h) {
   return (LONG)get32(info + 44);      /* BasePriority */
 }
 EXPORT DWORD_PTR WINAPI SetThreadAffinityMask(HANDLE h, DWORD_PTR mask) {
+  if (mask == 0) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   BYTE info[48];
   NTSTATUS status = NtQueryInformationThread(h, 0, info, sizeof(info), NULL);
   if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }

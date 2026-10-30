@@ -310,6 +310,63 @@ static void test_device_2d_large_image() {
   release_view(a, cpu_surface.pixels);
 }
 
+// Masks (glyphs) and scaled pictures on the device renderer go up as pixels (a sheet of small masks, a texture for big ones); the picture is the CPU renderer's, in order with the
+// rectangles drawn between them, under clips, and with sheets that fill up and start again.
+static void test_device_2d_masks_and_scaled() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  const uint32_t W = 320, H = 240;
+  DeviceRenderer2D d(device, a, {W, H});
+  CHECK(d.valid());
+  Surface cpu_surface = make_surface(a, W, H);
+  SoftwareRenderer2D cpu(cpu_surface);
+  ArrayView<uint8_t> glyph = allocate_view<uint8_t>(a, 12 * 14);   // a 12 x 14 "glyph" with every coverage value in it
+  for (uint32_t i = 0; i < glyph.size(); ++i) glyph[i] = static_cast<uint8_t>((i * 37) % 256) < 40 ? 0 : static_cast<uint8_t>((i * 37) % 256);
+  ArrayView<uint8_t> big = allocate_view<uint8_t>(a, 150 * 90);     // a big mask (a shadow)
+  for (uint32_t y = 0; y < 90; ++y)
+    for (uint32_t x = 0; x < 150; ++x) big[y * 150 + x] = static_cast<uint8_t>((x * y) % 251);
+  Surface img = make_surface(a, 30, 20);
+  for (uint32_t y = 0; y < 20; ++y)
+    for (uint32_t x = 0; x < 30; ++x) img.pixels[y * 30 + x] = 0xFF000000u | (x * 8 << 16) | (y * 12 << 8) | ((x + y) * 5 & 0xFF);
+  const MaskView small{ConstByteView(glyph.data(), glyph.size()), 12, 14, 12}, shadow{ConstByteView(big.data(), big.size()), 150, 90, 150};
+  const uint32_t colors[4] = {0xFFFFFFFF, 0xFFFF4020, 0x8040C0FF, 0xFF20FF60};
+  for (IRenderer2D* r : {static_cast<IRenderer2D*>(&d), static_cast<IRenderer2D*>(&cpu)}) {
+    r->clear(0xFF182030);
+    // Text-like: rows of glyphs, with a rectangle behind every few of them (the order must hold), then a clipped part, then more than a sheet's worth.
+    for (uint32_t n = 0; n < 24; ++n) {   // (13 apart: translucent glyphs over each other round differently on the device in a few pixels, which is not what is tested here)
+      if (n % 5 == 0) r->fill_rect({static_cast<int32_t>(4 + n * 13), 10, 30, 18}, 0xFF405070);
+      r->draw_mask(small, {0, 0, 12, 14}, static_cast<int32_t>(4 + n * 13), 12, colors[n % 4]);
+    }
+    r->set_clip({20, 40, 60, 12});
+    r->draw_mask(small, {0, 0, 12, 14}, 30, 36, colors[1]);
+    r->draw_mask(small, {2, 3, 9, 9}, 90, 40, colors[2]);   // (a part of it, and clipped away)
+    r->reset_clip();
+    for (uint32_t n = 0; n < 2500; ++n) r->draw_mask(small, {0, 0, 12, 14}, static_cast<int32_t>(2 + (n % 25) * 12), static_cast<int32_t>(60 + (n / 25) % 12 * 14), colors[n % 4]);
+    r->fill_rect({100, 100, 40, 40}, 0xFF804020);   // over the text
+    r->draw_mask(small, {0, 0, 12, 14}, 110, 110, colors[0]);
+    r->draw_mask(shadow, {0, 0, 150, 90}, 150, 140, 0xC0000000);   // the big one
+    r->draw_image_scaled(img, {0, 0, 30, 20}, {10, 150, 90, 60}, ImageFilter::Nearest);
+    r->draw_image_scaled(img, {2, 1, 25, 17}, {110, 160, 70, 50}, ImageFilter::Bilinear);
+    r->draw_image_scaled(img, {0, 0, 30, 20}, {-20, 210, 100, 80}, ImageFilter::Bilinear);   // (running off the target)
+  }
+  ArrayView<uint32_t> pixels = allocate_view<uint32_t>(a, W * H);
+  CHECK(d.read_pixels(pixels));
+  uint32_t differing = 0, first = 0xFFFFFFFF;
+  for (uint32_t y = 0; y < H; ++y)
+    for (uint32_t x = 0; x < W; ++x)
+      if (pixels[y * W + x] != px(cpu_surface, x, y)) {
+        if (!differing) first = y * W + x;
+        ++differing;
+      }
+  if (differing) printf("masks and scaled: %u pixels differ, the first at (%u, %u): %08X against %08X\n", differing, first % W, first / W, pixels[first], px(cpu_surface, first % W, first / W));
+  CHECK(differing == 0);
+  release_view(a, pixels);
+  release_view(a, img.pixels);
+  release_view(a, big);
+  release_view(a, glyph);
+  release_view(a, cpu_surface.pixels);
+}
+
 // ---- Pixel-engine primitives, run on both renderers --------------------------------------------------------
 
 namespace {
@@ -1648,6 +1705,7 @@ int main() {
   test_3d();
   test_device_2d();
   test_device_2d_large_image();
+  test_device_2d_masks_and_scaled();
   test_blend_math();
   test_fast_paths();
   test_primitives();

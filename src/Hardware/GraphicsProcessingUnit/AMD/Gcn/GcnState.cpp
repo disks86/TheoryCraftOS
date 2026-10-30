@@ -205,15 +205,18 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
   w.set_context_reg(mmDB_Z_INFO, ArrayView<const uint32_t>(planes, 8));
 
   // the viewport transform over the target (y down), scissors over the target, no clipping modes beyond the defaults, pixel centres at the half
-  const uint32_t viewport[] = {float_bits(0.5f * static_cast<float>(t.width)), float_bits(0.5f * static_cast<float>(t.width)), float_bits(-0.5f * static_cast<float>(t.height)),
-                               float_bits(0.5f * static_cast<float>(t.height)), float_bits(0.5f), float_bits(0.5f)};
+  const float y_sign = s.device_clip_space ? 1.0f : -1.0f;                 // (clip +Y down the screen, or up as in OpenGL)
+  const float z_scale = s.device_clip_space ? 1.0f : 0.5f, z_offset = s.device_clip_space ? 0.0f : 0.5f;   // (depth 0 to 1, or -1 to 1 mapped onto it)
+  const uint32_t viewport[] = {float_bits(0.5f * static_cast<float>(t.width)), float_bits(0.5f * static_cast<float>(t.width)), float_bits(y_sign * 0.5f * static_cast<float>(t.height)),
+                               float_bits(0.5f * static_cast<float>(t.height)), float_bits(z_scale), float_bits(z_offset)};
   w.set_context_reg(mmPA_CL_VPORT_XSCALE, ArrayView<const uint32_t>(viewport, 6));
   const uint32_t vte = (1u << PA_CL_VTE_CNTL__VPORT_X_SCALE_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_X_OFFSET_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_Y_SCALE_ENA__SHIFT) |
                        (1u << PA_CL_VTE_CNTL__VPORT_Y_OFFSET_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_Z_SCALE_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_Z_OFFSET_ENA__SHIFT) |
                        (1u << PA_CL_VTE_CNTL__VTX_W0_FMT__SHIFT);
   w.set_context_reg(mmPA_CL_VTE_CNTL, vte);
-  w.set_context_reg(mmPA_CL_CLIP_CNTL, 0);
-  w.set_context_reg(mmPA_SU_SC_MODE_CNTL, (d.front_clockwise ? 1u : 0u) << PA_SU_SC_MODE_CNTL__FACE__SHIFT);          // no culling, filled; which winding is the front
+  w.set_context_reg(mmPA_CL_CLIP_CNTL, s.device_clip_space ? 1u << PA_CL_CLIP_CNTL__DX_CLIP_SPACE_DEF__SHIFT : 0u);   // (DX_CLIP_SPACE_DEF: z from 0 to w)
+  w.set_context_reg(mmPA_SU_SC_MODE_CNTL, ((d.front_clockwise ? 1u : 0u) << PA_SU_SC_MODE_CNTL__FACE__SHIFT) | ((d.cull == 1 ? 1u : 0u) << PA_SU_SC_MODE_CNTL__CULL_FRONT__SHIFT) |
+                                              ((d.cull == 2 ? 1u : 0u) << PA_SU_SC_MODE_CNTL__CULL_BACK__SHIFT));          // filled; which winding is the front, which faces are culled
   w.set_context_reg(mmPA_SU_VTX_CNTL, 1u << PA_SU_VTX_CNTL__PIX_CENTER__SHIFT);
   w.set_context_reg(mmPA_SC_WINDOW_OFFSET, 0);
   const uint32_t scissor_tl = 1u << PA_SC_WINDOW_SCISSOR_TL__WINDOW_OFFSET_DISABLE__SHIFT;

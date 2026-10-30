@@ -21,6 +21,7 @@
 #include "ObjectContainer/BinaryTree.hpp"
 #include "ObjectContainer/Dictionary.hpp"
 #include "ObjectContainer/LinkedList.hpp"
+#include "ObjectContainer/Hive.hpp"
 #include "ObjectContainer/List.hpp"
 #include "ObjectContainer/PriorityQueue.hpp"
 #include "ObjectContainer/Queue.hpp"
@@ -50,6 +51,21 @@ bool run_container_demo(allocators::Allocator& allocator) {
     // 1 + 4 + ... + 100^2 = 338350, minus 50^2 (the 51st entry, index 50 after the insert), plus -1
     ok &= list.count() == 100 && sum == 338350 - 2500 - 1;
     report("list (100 squares, insert, remove)", ok);
+    all_ok &= ok;
+  }
+  {
+    Hive<int> hive(allocator);
+    bool ok = true;
+    int* first = hive.insert(1);
+    ok &= first != nullptr;
+    int* doomed[20] = {};
+    for (int i = 0; i < 20; ++i) doomed[i] = hive.insert(i + 2);
+    for (int* p : doomed) ok &= p && hive.erase(p);
+    for (int i = 0; i < 2000; ++i) ok &= hive.insert(i) != nullptr;
+    int64_t sum = 0;
+    for (int value : hive) sum += value;  // iteration skips the holes
+    ok &= first && *first == 1 && hive.count() == 2001 && sum == 1 + 1999 * 2000 / 2;  // the first element never moved
+    report("hive (stable pointers, erase, hole reuse)", ok);
     all_ok &= ok;
   }
   {
