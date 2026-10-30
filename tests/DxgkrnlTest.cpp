@@ -5408,6 +5408,79 @@ void test_dxil() {
   }
 }
 
+
+// Reserved (tiled) buffers: tiles mapped to places in heaps.
+void test_d3d12_reserved() {
+  Env e;
+  auto create = [&](uint32_t flags, uint64_t size, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.size = size, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, p = 0, q = 0, r = 0, none = 0;
+  CHECK(create(kAllocHeap, 4 * kTileBytes, 0, 0, &heap) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer, kTileBytes, heap, 0, &p) == status::kSuccess && create(kAllocVertexBuffer, kTileBytes, heap, 2 * kTileBytes, &q) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, 3 * kTileBytes, 0, 0, &r) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, 3 * kTileBytes + 4, 0, 0, &none) == status::kInvalidParameter && create(kAllocVertexBuffer | kAllocReserved, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocQueryResult | kAllocReserved, kTileBytes, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap | kAllocReserved, kTileBytes, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, kTileBytes, heap, 0, &none) == status::kInvalidParameter);   // (reserved and placed)
+  AllocationDesc image;
+  image.flags = kAllocTexture | kAllocReserved, image.format = Format::A8R8G8B8, image.width = image.height = 8;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);
+  // Mapping: tile 0 to the start of the heap, tile 1 to its third tile, tile 2 nowhere.
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 1, heap, 2 * kTileBytes, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 2, 0, 0, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 3, heap, 0, 1) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, r, 0, heap, 100, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 3 * kTileBytes, 2) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, p, 0, heap, 0, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, 0x7777, 0, 1) == status::kInvalidHandle);
+  std::vector<uint8_t> a(kTileBytes), b(kTileBytes);
+  for (uint32_t i = 0; i < kTileBytes; ++i) a[i] = static_cast<uint8_t>(i % 251 + 1), b[i] = static_cast<uint8_t>(i % 241 + 2);
+  CHECK(e.write(p, ConstByteView(a.data(), a.size())) && e.write(q, ConstByteView(b.data(), b.size())));
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 3 * kTileBytes);
+  bool good = true;
+  for (uint32_t i = 0; i < kTileBytes && good; ++i) good = lock.data[i] == a[i] && lock.data[kTileBytes + i] == b[i] && lock.data[2 * kTileBytes + i] == 0;   // (what is mapped, and nowhere: zeros)
+  CHECK(good);
+  e.kernel.unlock(kPid, r);
+  // Writes through the reserved buffer reach the heap (and its placed allocations); those to an unmapped tile are dropped.
+  CHECK(e.kernel.lock(kPid, r, 0, 0, &lock) == status::kSuccess);
+  lock.data[kTileBytes + 100] = 0x5A;
+  lock.data[2 * kTileBytes + 7] = 0x77;
+  e.kernel.unlock(kPid, r);
+  CHECK(e.kernel.lock(kPid, q, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[100] == 0x5A);
+  e.kernel.unlock(kPid, q);
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[2 * kTileBytes + 7] == 0);
+  e.kernel.unlock(kPid, r);
+  // The other way: what is written to the heap through a placed allocation shows through the reserved one.
+  a[5] = 0xEE;
+  CHECK(e.write(p, ConstByteView(a.data(), a.size())));
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[5] == 0xEE);
+  e.kernel.unlock(kPid, r);
+  // The GPU reads it: a triangle written through the placed allocation is drawn from the reserved buffer.
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8);
+  Handle pipe = make_colored_pipeline(e, false);
+  CHECK(write_triangle(e, p, 0, 0, 1));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, r}) == status::kSuccess && e.pixel(target, 4, 4) == 0xFF0000FFu);
+  // Unmapped, the same draw gets zero vertices (nothing drawn).
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, 0, 0, 1) == status::kSuccess);
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(identity, 16));
+  w2.draw(3);
+  w2.end_pass();
+  CHECK(e.render(w2, {target, r}) == status::kSuccess && e.pixel(target, 4, 4) == 0xFF000000u);
+}
+
 // Geometry shaders with adjacency input and instances.
 void test_geometry_extras() {
   HostAllocator allocator;
@@ -6796,6 +6869,7 @@ int main() {
   test_d3d12_compute();
   test_d3d12_barriers();
   test_d3d12_heaps();
+  test_d3d12_reserved();
   test_dxil();
   test_compute_shared();
   test_geometry_extras();

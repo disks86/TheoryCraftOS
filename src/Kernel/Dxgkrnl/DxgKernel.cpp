@@ -972,6 +972,20 @@ NtStatus Kernel::copy_descriptors(ProcessId pid, Handle destination, uint32_t de
   return status::kSuccess;
 }
 
+NtStatus Kernel::update_tile_mappings(ProcessId pid, Handle reserved, uint32_t first_tile, Handle heap, uint64_t heap_offset, uint32_t tile_count) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  SharedPointer<AllocRec> r = p ? p->allocations.get(reserved) : SharedPointer<AllocRec>();
+  if (!r) return status::kInvalidHandle;
+  SharedPointer<Allocation> heap_allocation;
+  if (heap) {
+    SharedPointer<AllocRec> h = p->allocations.get(heap);
+    if (!h || h->device != r->device) return status::kInvalidHandle;
+    heap_allocation = h->allocation;
+  }
+  return r->allocation->manager().map_tiles(*r->allocation, first_tile, heap_allocation, heap_offset, tile_count);
+}
+
 NtStatus Kernel::destroy_shader(ProcessId pid, Handle shader) {
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);

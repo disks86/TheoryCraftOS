@@ -117,10 +117,12 @@ enum AllocationFlags : uint32_t {
   kAllocStreamOutput = 1u << 10,   // a buffer a geometry shader's stream output is written to (SetStreamOutput; the adapter's kFeatureStreamOutput): read by locking it
   kAllocConstantBuffer = 1u << 11,   // a buffer of constants (Direct3D 12 root constant buffer views and descriptors); system memory only, never resident: read by the CPU when a draw needs it
   kAllocHeap = 1u << 13,             // Direct3D 12 resource heap: memory other allocations are placed in (AllocationDesc::heap / heap_offset); system memory only, never resident, no other flags but kAllocShared-free
+  kAllocReserved = 1u << 14,         // Direct3D 12 reserved (tiled) buffer: with the flags of a vertex, index, storage or stream output buffer; its size a multiple of kTileBytes; no memory of its own - Kernel::update_tile_mappings maps its 64 KiB tiles to places in heaps (an unmapped tile reads as zero and drops writes)
   kAllocTrackState = 1u << 12,       // Direct3D 12 resource states: AllocationDesc::initial_state is the state; ResourceBarrier moves it and uses of the allocation check it (CommandStream.hpp). Any other flags as usual.
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
+constexpr uint32_t kTileBytes = 65536;   // the size of a tile of a reserved resource
 constexpr uint32_t kMaxTextureDimension = 4096;
 constexpr uint64_t kMaxBufferBytes = 256ull * 1024 * 1024;
 

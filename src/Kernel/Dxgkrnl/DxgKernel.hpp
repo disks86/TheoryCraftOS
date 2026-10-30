@@ -162,6 +162,8 @@ class Kernel {
   NtStatus destroy_descriptor_heap(ProcessId pid, Handle heap);
   NtStatus write_descriptor(ProcessId pid, Handle heap, uint32_t index, const DescriptorDesc& desc);
   NtStatus copy_descriptors(ProcessId pid, Handle destination, uint32_t destination_index, Handle source, uint32_t source_index, uint32_t count);
+  // Reserved buffers (kAllocReserved): `tile_count` tiles of 64 KiB from `first_tile` go to `heap_offset` (a multiple of 64 KiB) of the heap on; heap 0 unmaps them.
+  NtStatus update_tile_mappings(ProcessId pid, Handle reserved, uint32_t first_tile, Handle heap, uint64_t heap_offset, uint32_t tile_count);
   NtStatus destroy_shader(ProcessId pid, Handle shader);
   NtStatus destroy_pipeline(ProcessId pid, Handle pipeline);
   NtStatus escape(ProcessId pid, Handle device, ConstByteView request, ByteView reply, uint32_t* reply_bytes);
