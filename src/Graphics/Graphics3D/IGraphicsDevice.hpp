@@ -77,7 +77,7 @@ enum ImageUsage : uint32_t {
 // What a sampled image is (kFeatureTextureKinds for anything but Texture2D). Texture3D has `layers` slices of depth, Texture2DArray `layers` layers, TextureCube six faces in the order
 // +X, -X, +Y, -Y, +Z, -Z (`layers` is ignored). All but Texture2D have one mip level, a colour format of 8-bit channels and no usage but kImageSampled; they are filled and read
 // layer by layer (write_layer_pixels / read_layer_pixels), each layer a 2D image of `extent`.
-enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube };
+enum class TextureKind : uint8_t { Texture2D, Texture3D, Texture2DArray, TextureCube, Texture2DMS };   // (Texture2DMS: only what a shader declares for a unit - a multisampled colour image, whose ImageDesc::kind is Texture2D, is bound to it)
 constexpr uint32_t kMaxTextureLayers = 256;
 
 struct ImageDesc {
@@ -200,6 +200,11 @@ class ITextureSet {
   virtual bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const {
     *depth = 1;
     return size(unit, level, width, height, levels);
+  }
+  // One sample of a multisampled colour image (Texture2DMS Load): x and y are texel numbers, `sample` the sample; outside the image or the samples it is transparent black.
+  virtual Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const {
+    (void)unit, (void)x, (void)y, (void)sample;
+    return {0, 0, 0, 0};
   }
   // --- kFeatureTexelAccess (DeviceInfo::features); a device without it leaves these at their defaults.
   // The lookup at an explicit level of detail (lambda: 0 is the base level), as sample() takes it from the derivatives.

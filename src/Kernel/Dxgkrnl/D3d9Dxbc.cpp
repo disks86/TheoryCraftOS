@@ -52,6 +52,7 @@ enum DxbcOp : uint32_t {
 bool resource_kind(uint32_t dimension, graphics::TextureKind* kind) {
   switch (dimension) {
     case 3: *kind = graphics::TextureKind::Texture2D; return true;
+    case 4: *kind = graphics::TextureKind::Texture2DMS; return true;   // (dcl_resource_texture2dms: the sample count is in the token)
     case 5: *kind = graphics::TextureKind::Texture3D; return true;
     case 6: *kind = graphics::TextureKind::TextureCube; return true;
     case 8: *kind = graphics::TextureKind::Texture2DArray; return true;
@@ -567,10 +568,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if (!resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
           texture_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
           program->texture_kind_[o.index[1]] = kind;
+          program->texture_samples_[o.index[1]] = static_cast<uint8_t>((token >> 16) & 0x7F);
           continue;
         }
         if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // two units
         program->texture_kind_[o.index[0]] = kind;
+        program->texture_samples_[o.index[0]] = static_cast<uint8_t>((token >> 16) & 0x7F);
         continue;
       }
       case kDclInput4: case kDclInputPs4: case kDclOutput4: case kDclInputSiv4: case kDclInputPsSiv4: case kDclOutputSiv4: case kDclInputSgv4: case kDclInputPsSgv4: case kDclOutputSgv4: {
@@ -844,12 +847,15 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (!p.at_end()) return status::kInvalidParameter;
       continue;
-    } else if (opcode == 45 || opcode == 72 || opcode == 61) {
+    } else if (opcode == 45 || opcode == 46 || opcode == 72 || opcode == 61 || opcode == 111) {
       // ld (dst, integer address, resource), sample_l (dst, coordinate, resource, sampler, level), resinfo (dst, level, resource): Shader Model 4 texture access beyond sample.
       if (vertex || compute) return status::kNotSupported;
       Operand d, address, resource, sampler, lod;
-      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &address)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess) return s;
+      if ((s = read_operand(p, &d)) != status::kSuccess) return s;
+      if (opcode != 111 && (s = read_operand(p, &address)) != status::kSuccess) return s;   // (sampleinfo has no address)
+      if ((s = read_operand(p, &resource)) != status::kSuccess) return s;
       if (opcode == 72 && ((s = read_operand(p, &sampler)) != status::kSuccess || (s = read_operand(p, &lod)) != status::kSuccess)) return s;
+      if (opcode == 46 && (s = read_operand(p, &lod)) != status::kSuccess) return s;   // (ld_ms: the sample)
       uint32_t unit = resource.index[0];
       if (v51) {
         if (resource.type != kOpResource || resource.dims != 2 || resource.index[0] >= 8 || texture_register[resource.index[0]] < 0 || resource.index[1] != static_cast<uint32_t>(texture_register[resource.index[0]]))
@@ -860,7 +866,24 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || (opcode == 72 && sampler.type != kOpSampler)) return status::kNotSupported;
       if (opcode == 45 && program->texture_kind_[unit] == graphics::TextureKind::TextureCube) return status::kNotSupported;   // (a cube has no Load)
-      ins.op = opcode == 45 ? kTexFetch : opcode == 72 ? kTexLod : kTexSize;
+      const bool multisampled = program->texture_kind_[unit] == graphics::TextureKind::Texture2DMS;
+      if ((opcode == 46 || opcode == 111) != multisampled && (opcode == 46 || opcode == 111 || opcode == 45 || opcode == 72)) return status::kNotSupported;   // (ld_ms and sampleinfo go with a multisampled texture, and ld and sample_l do not)
+      ins.op = opcode == 45 ? kTexFetch : opcode == 46 ? kTexFetchMs : opcode == 111 ? kTexSamples : opcode == 72 ? kTexLod : kTexSize;
+      if (opcode == 111) {
+        // sampleinfo: the sample count the texture was declared with, as a constant (an unsigned result when the instruction says so)
+        ins.control = static_cast<uint8_t>(program->texture_samples_[unit]);
+        ins.tex_swizzle[0] = ((token >> 11) & 1) ? 1 : 0;
+        s = to_dst(d, &ins.dst);
+        if (s != status::kSuccess) return s;
+        ins.src[0].type = kSampler, ins.src[0].number = static_cast<uint16_t>(unit);
+        ins.src_count = 0;
+        program->uses_textures_ = true;
+        program->uses_texel_access_ = true;
+        if (!p.at_end()) return status::kInvalidParameter;
+        s = emit(ins);
+        if (s != status::kSuccess) return s;
+        continue;
+      }
       if (opcode == 61) {
         const uint32_t mode = (token >> 11) & 3;
         if (mode > 2) return status::kNotSupported;
@@ -872,7 +895,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (s != status::kSuccess) return s;
       ins.src[1].type = kSampler, ins.src[1].number = static_cast<uint16_t>(unit);
       ins.src_count = 2;
-      if (opcode == 72) {
+      if (opcode == 72 || opcode == 46) {
         s = to_src(lod, &ins.src[2]);
         if (s != status::kSuccess) return s;
         ins.src_count = 3;

@@ -3912,8 +3912,8 @@ void test_multisample() {
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 8) == status::kSuccess && create(kAllocDepthStencil, Format::D32Float, 4) == status::kSuccess);
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 3) == status::kNotSupported && create(kAllocRenderTarget, Format::A8R8G8B8, 16) == status::kNotSupported);
   CHECK(create(kAllocRenderTarget, Format::A8R8G8B8, 64) == status::kNotSupported);
-  // Render targets and depth buffers only, one level, 8-bit colour.
-  CHECK(create(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 4) == status::kInvalidParameter);
+  // Render targets (that may be read by a shader, as a multisampled texture) and depth buffers only, one level, 8-bit colour.
+  CHECK(create(kAllocRenderTarget | kAllocTexture, Format::A8R8G8B8, 4) == status::kSuccess && create(kAllocDepthStencil | kAllocTexture, Format::D32Float, 4) == status::kInvalidParameter);
   CHECK(create(kAllocTexture, Format::A8R8G8B8, 4) == status::kInvalidParameter);
   CHECK(create(kAllocRenderTarget | kAllocPresent, Format::A8R8G8B8, 4) == status::kInvalidParameter);
   CHECK(create(kAllocStaging, Format::A8R8G8B8, 4) == status::kInvalidParameter);
@@ -4479,6 +4479,13 @@ void test_conformance() {
         CHECK(near(px(7, 4), 0xFF36659C) && (px(6, 4) & 0xFFFFFF) == 0);
       }
       if (__builtin_strstr(r.name, "integer render")) CHECK(px(16, 4) == 0xFF3380CC && px(0, 0) == 0xFF14283C);   // (51, 128, 204 = 255 * the colour, and the cleared (20, 40, 60))
+    }
+    if (__builtin_strstr(r.name, "multisampled image as a shader")) {
+      // The red rectangle's left edge is x = 4.3, which cuts pixel 4: the rows of its column read samples 0 .. 3 in turn, and of the four two are on the red side and two are not.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
+      uint32_t black = 0, red = 0;
+      for (uint32_t y = 8; y < 12; ++y) (px(4, y) == 0xFF000000u ? black : red) += px(4, y) == 0xFF000000u || px(4, y) == 0xFFFF0000u;
+      CHECK(black == 2 && red == 2 && px(10, 10) == 0xFFFF0000u && px(14, 14) == 0xFF00FF00u);
     }
     if (__builtin_strstr(r.name, "group-shared memory")) {
       // Thread 0 of group (0, 0): the neighbour's value is 1, the sum of the 64 slots (0 .. 63) 2016 (>> 3 is 252), the thread's own number 0. Thread 1 sees 2 and has 4 as its blue.

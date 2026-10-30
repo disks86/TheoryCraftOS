@@ -610,9 +610,9 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.mip_levels != 1) return nullptr;   // (no mipmaps either)
   if (desc.samples != 1) {
-    // (a multisampled image is an 8-bit colour or a depth attachment alone: resolved, never read or sampled)
+    // (a multisampled image is an 8-bit colour image, which a shader may read with texel fetches, or a depth attachment alone: resolved)
     const bool depth = desc.format == Format::D32Float;
-    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm)) return nullptr;
+    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm)) return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
     // (a volume, array or cube is only sampled: 8-bit colour, one level)

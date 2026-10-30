@@ -1349,6 +1349,57 @@ void scene_unorm16(Rig& rig, ArrayView<uint32_t> out) {
   release_view(rig.allocator(), other);
 }
 
+// A multisampled image read by a shader (ps_ms.hlsl: Texture2DMS Load, sample (x mod 4) of the pixel at x, y): two rectangles with edges off the pixel grid drawn into a 4x multisampled
+// target (the colours of its samples are what the picture shows, one sample a column), then the target itself is bound to the pixel shader as a texture.
+void scene_multisample_resource(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureMultisample | graphics::kFeatureTexelAccess | graphics::kFeatureSystemInputs)) return void(rig.step("multisampling", status::kNotSupported));
+  namespace b = conformance_blobs;
+  auto rect = [](Vertex* v, float x0, float y0, float x1, float y1, float z, float r, float g, float bl) {
+    auto at = [&](float px, float py) { return Vertex{px / 16.0f - 1.0f, py / 16.0f - 1.0f, z, r, g, bl, 1}; };
+    v[0] = at(x0, y0), v[1] = at(x1, y0), v[2] = at(x0, y1);
+    v[3] = at(x0, y1), v[4] = at(x1, y0), v[5] = at(x1, y1);
+  };
+  Vertex v[12];
+  rect(v, 4.3f, 3.4f, 20.6f, 22.7f, 0.6f, 1, 0, 0);
+  rect(v + 6, 12.4f, 9.2f, 27.8f, 28.6f, 0.3f, 0, 1, 0);
+  Handle vs = rig.vertex_shader(bytes_of(kVertexTokens, sizeof kVertexTokens), ShaderKind::D3d9Bytecode);
+  Handle ps = rig.pixel_shader(bytes_of(kPixelTokens, sizeof kPixelTokens), ShaderKind::D3d9Bytecode);
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.depth_test = pd.depth_write = true;
+  pd.multisample = true;
+  Handle pipe = rig.pipeline(pd);
+  AllocationDesc color_desc, depth_desc;
+  color_desc.flags = kAllocRenderTarget | kAllocTexture, color_desc.format = Format::A8R8G8B8, color_desc.width = color_desc.height = kSize, color_desc.samples = 4;
+  depth_desc.flags = kAllocDepthStencil, depth_desc.format = Format::D32Float, depth_desc.width = depth_desc.height = kSize, depth_desc.samples = 4;
+  Handle multisampled = rig.create(color_desc), depth = rig.create(depth_desc);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  w.begin_pass(0, 1, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(12);
+  w.end_pass();
+  rig.render(w, {multisampled, depth, vb});
+  // The second pass: a quad over the target, the pixel shader loading the samples.
+  auto vert = [](float x, float y) { return Vertex{x, y, 0.5f, 1, 1, 1, 1}; };
+  const Vertex quad[6] = {vert(-1, -1), vert(1, -1), vert(-1, 1), vert(-1, 1), vert(1, -1), vert(1, 1)};
+  Handle show = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_ms, sizeof b::k_ps_ms, 1);
+  Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  graphics::SamplerDesc sampler;
+  CommandWriter w2(rig.allocator());
+  begin(w2, 0, kNoAllocation, {0, 0, 0, 1});
+  w2.bind_pipeline(show);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w2.bind_texture(0, 2, sampler);
+  w2.draw(6);
+  w2.end_pass();
+  rig.render(w2, {target, qvb, multisampled});
+  rig.read(target, out);
+}
+
 // Alpha to coverage: five bands of whole pixels, all the same orange, with alphas 0, 1, 0, 1 and 1: into a 4x multisampled target the alpha 0 bands keep none of their samples and the
 // others all, so the resolved picture is black, orange, black, orange, orange. (A GPU gives a fraction of an alpha a number of samples that varies from pixel to pixel, which a picture cannot
 // compare; the CPU renderer's own rounding is tested in test_alpha_to_coverage.)
@@ -1632,6 +1683,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 signed and 10-bit normalised formats (DXBC)", scene_normalised_formats},
     {"Direct3D 10 4x multisampling", scene_multisample},
     {"Direct3D 10 alpha to coverage", scene_alpha_to_coverage},
+    {"Direct3D 10 multisampled image as a shader resource (DXBC)", scene_multisample_resource},
     {"Direct3D 11 compute shader and unordered access views (DXBC)", scene_compute},
     {"Direct3D 11 group-shared memory and barriers (DXBC)", scene_compute_shared},
     {"Direct3D 10 independent blend per render target (DXBC)", scene_independent_blend},

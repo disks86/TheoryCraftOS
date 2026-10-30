@@ -422,6 +422,14 @@ class TextureSet final : public ITextureSet {
     if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
     return texel(surface, x, y);
   }
+  Vec4 fetch_sample(uint32_t unit, int32_t x, int32_t y, uint32_t sample) const override {
+    const SoftwareImage* image = image_for(unit);
+    if (!image || image->samples() < 2 || sample >= image->samples()) return {0, 0, 0, 0};
+    const Surface surface = image->surface();
+    if (x < 0 || y < 0 || static_cast<uint32_t>(x) >= surface.width || static_cast<uint32_t>(y) >= surface.height) return {0, 0, 0, 0};
+    // (the samples of a pixel are neighbours: the pixel x is at x * samples)
+    return texel(surface, static_cast<int64_t>(x) * image->samples() + sample, y);
+  }
   bool size_volume(uint32_t unit, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* depth, uint32_t* levels) const override {
     if (!size(unit, level, width, height, levels)) return false;
     const SoftwareImage* image = image_for(unit);
@@ -1159,7 +1167,7 @@ IImage* SoftwareDevice::create_image(const ImageDesc& desc) {
     // (a multisampled image is an 8-bit colour or a depth attachment, alone, of one level)
     const bool depth = desc.format == Format::D32Float;
     if ((desc.samples != 2 && desc.samples != 4 && desc.samples != 8) || desc.mip_levels != 1 || desc.kind != TextureKind::Texture2D || is_wide_format(desc.format) ||
-        desc.usage != (depth ? kImageDepthAttachment : kImageColorAttachment))
+        (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment))
       return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {

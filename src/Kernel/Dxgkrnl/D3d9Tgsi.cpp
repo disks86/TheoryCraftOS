@@ -42,6 +42,7 @@ const char* dimension_name(graphics::TextureKind kind) {
     case graphics::TextureKind::Texture3D: return "3D";
     case graphics::TextureKind::Texture2DArray: return "2D_ARRAY";
     case graphics::TextureKind::TextureCube: return "CUBE";
+    case graphics::TextureKind::Texture2DMS: return "2D_MSAA";
     default: return "2D";
   }
 }
@@ -885,6 +886,61 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       t = begin_result(ins, true, &direct);
       const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
       line("MOV", &w, &old_all);
+      break;
+    }
+    case kTexSamples: {
+      // (the count the shader declared the texture with: a constant)
+      t = begin_result(ins, true, &direct);
+      const String w = temp(kWork);
+      float v[4];
+      for (float& f : v) f = ins.tex_swizzle[0] ? __builtin_bit_cast(float, static_cast<uint32_t>(ins.control)) : static_cast<float>(ins.control);
+      const String value = imm_text(v, ".xxxx");
+      line("MOV", &w, &value);
+      break;
+    }
+    case kTexFetchMs: {
+      // ld_ms: TXF on a multisampled view takes the sample in the fourth component of the coordinate
+      const bool swizzled = ins.tex_swizzle[0] != 0 || ins.tex_swizzle[1] != 1 || ins.tex_swizzle[2] != 2 || ins.tex_swizzle[3] != 3;
+      t = begin_result(ins, true, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "]");
+      String dim = str();
+      add(dim, "2D_MSAA");
+      const String texel = temp(kWork2);
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), sample = operand(ins.src[2], 0, 1, nullptr, true);
+      const String xy = temp(kWork3, ".xy"), sw = temp(kWork3, ".w"), packed = temp(kWork3);
+      line("MOV", &xy, &coordinate);
+      line("MOV", &sw, &sample);
+      if (p_.texture_samples_[unit] == 4) {
+        // (the host's sample 1 is Direct3D's sample 3 and the other way round - found by drawing edges through a pixel and seeing which samples they covered: an index of 1 or 3 has its
+        // second bit flipped: index ^ ((index & 1) << 1))
+        const String one = splat(1.0f), t = temp(kWork2, ".w"), tx = temp(kWork2, ".wwww"), swx = temp(kWork3, ".wwww");
+        float ones[4];
+        for (float& f : ones) f = __builtin_bit_cast(float, 1u);
+        const String one_bits = imm_text(ones, ".xxxx");
+        line("AND", &t, &swx, &one_bits);
+        line("SHL", &t, &tx, &one_bits);
+        line("XOR", &sw, &swx, &tx);
+        (void)one;
+      }
+      line("TXF", &texel, &packed, &sampler, &dim);
+      const String w = temp(kWork);
+      if (swizzled) {
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+      } else {
+        line("MOV", &w, &texel);
+      }
       break;
     }
     case kTexFetch: case kTexLod: case kTexSize: {
