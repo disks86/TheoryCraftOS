@@ -19,6 +19,7 @@
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include <new>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Graphics/Graphics3D/Software/Tessellator.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace graphics {
@@ -37,6 +38,26 @@ void destroy(allocators::IAllocator& allocator, T* object) {
   object->~T();
   allocator.deallocate(object);
 }
+
+// The tessellator of a draw with patches (made only when there are some), freed when the draw ends.
+class TessellatorHolder {
+ public:
+  TessellatorHolder(allocators::IAllocator& allocator, bool wanted) : allocator_(allocator), tessellator_(wanted ? make<Tessellator>(allocator, allocator) : nullptr) {
+    if (tessellator_ && !tessellator_->valid()) {
+      destroy(allocator_, tessellator_);
+      tessellator_ = nullptr;
+    }
+  }
+  ~TessellatorHolder() { destroy(allocator_, tessellator_); }
+  TessellatorHolder(const TessellatorHolder&) = delete;
+  TessellatorHolder& operator=(const TessellatorHolder&) = delete;
+  bool valid() const { return tessellator_ != nullptr; }
+  Tessellator* get() const { return tessellator_; }
+
+ private:
+  allocators::IAllocator& allocator_;
+  Tessellator* tessellator_;
+};
 
 // --- Resources ---------------------------------------------------------------
 
@@ -1046,10 +1067,10 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
   }
 }
 
-// Tessellates one patch: the hull shader makes the output control points and the factors; with all four factors the same after rounding (integer: up, power of two: up to the next one;
-// 1 or 2) the triangle domain is the regular lattice of N * N triangles, each corner turned into a vertex by the domain shader. A factor that is not above 0 culls the patch; factors
-// that differ drop it (the stitching of rings is not made). The triangles are (u, v) counter-clockwise, or clockwise for TriangleCw.
-void run_tessellation(const DrawState& s, const SoftwareShaderModule& hull, const SoftwareShaderModule& domain, const ClipVertex* v, uint32_t count) {
+// Tessellates one patch: the hull shader makes the output control points and the factors, the tessellator the domain points and the primitives joining them, and the domain shader turns each
+// point into a vertex (a triangle's w is 1 - u - v; a quad's and an isoline's shader has no w). Triangles are drawn in the order the tessellator made them, the way a Direct3D pipeline
+// hands them to the rasterizer; a patch the tessellator culls draws nothing.
+void run_tessellation(const DrawState& s, Tessellator& tessellator, const SoftwareShaderModule& hull, const SoftwareShaderModule& domain, const ClipVertex* v, uint32_t count) {
   const ShaderModuleDesc& hd = hull.desc();
   HullInputData input;
   input.control_points = count;
@@ -1060,47 +1081,27 @@ void run_tessellation(const DrawState& s, const SoftwareShaderModule& hull, cons
   }
   HullOutputData patch;
   hd.hull_function(input, s.constants, &patch);
-  const float factors[4] = {patch.outer[0], patch.outer[1], patch.outer[2], patch.inner[0]};
-  uint32_t n[4];
-  for (uint32_t k = 0; k < 4; ++k) {
-    float f = factors[k];
-    if (!(f > 0.0f)) return;   // (culled)
-    if (f > 64.0f) f = 64.0f;
-    uint32_t c = static_cast<uint32_t>(f);
-    if (static_cast<float>(c) < f) ++c;   // (rounded up)
-    if (c < 1) c = 1;
-    if (hd.tess_partitioning == TessPartitioning::Pow2) {
-      uint32_t p = 1;
-      while (p < c) p <<= 1;
-      c = p;
-    }
-    n[k] = c;
-  }
-  if (n[0] != n[1] || n[1] != n[2] || n[2] != n[3]) return;
-  // (the lattice is what the real tessellator makes for 1 and 2 only: from 3 on its inner triangles are concentric rings, stitched to the outer one, not the points of the lattice)
-  if (n[0] > 2) return;
-  const uint32_t N = n[0];
+  if (!tessellator.tessellate(hd.tess_domain, hd.tess_partitioning, hd.tess_output, patch.outer, patch.inner)) return;
   const DomainShaderFn ds = domain.desc().domain_function;
-  auto vertex = [&](uint32_t i, uint32_t j) {
+  const bool triangles = hd.tess_domain == TessDomain::Triangle;
+  const ArrayView<const Tessellator::Point> points = tessellator.points();
+  const ArrayView<const uint16_t> indices = tessellator.indices();
+  auto vertex = [&](uint32_t index) {
+    const Tessellator::Point p = points[index];
     ShaderIo io;
-    const float inv = 1.0f / static_cast<float>(N);
-    ds(patch, static_cast<float>(i) * inv, static_cast<float>(j) * inv, static_cast<float>(N - i - j) * inv, s.constants, &io);
+    ds(patch, p.u, p.v, triangles ? 1.0f - p.u - p.v : 0.0f, s.constants, &io);
     ClipVertex c;
     c.position = io.position;
     for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = io.varying[k];
     return c;
   };
-  const bool clockwise = hd.tess_output == TessOutput::TriangleCw;
-  auto emit = [&](uint32_t ai, uint32_t aj, uint32_t bi, uint32_t bj, uint32_t ci, uint32_t cj) {
-    const ClipVertex a = vertex(ai, aj), b = vertex(bi, bj), c = vertex(ci, cj);
-    if (clockwise) draw_triangle(s, a, c, b);
-    else draw_triangle(s, a, b, c);
-  };
-  for (uint32_t j = 0; j < N; ++j)
-    for (uint32_t i = 0; i + j < N; ++i) {
-      emit(i, j, i + 1, j, i, j + 1);
-      if (i + j + 2 <= N) emit(i + 1, j, i + 1, j + 1, i, j + 1);
-    }
+  if (hd.tess_output == TessOutput::Point) {
+    for (const uint16_t i : indices) draw_point(s, vertex(i));
+  } else if (hd.tess_output == TessOutput::Line) {
+    for (uint64_t i = 0; i + 2 <= indices.size(); i += 2) draw_line(s, vertex(indices[i]), vertex(indices[i + 1]));
+  } else {
+    for (uint64_t i = 0; i + 3 <= indices.size(); i += 3) draw_triangle(s, vertex(indices[i]), vertex(indices[i + 1]), vertex(indices[i + 2]));
+  }
 }
 
 }  // namespace
@@ -1148,9 +1149,9 @@ void SoftwareDevice::destroy_image(IImage* image) { destroy(allocator_, static_c
 
 IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc) {
   if (desc.stage == ShaderStage::Hull || desc.stage == ShaderStage::Domain) {
-    // (the triangle domain only, with up to the most control points)
+    // (any domain, with up to the most control points)
     if (desc.stage == ShaderStage::Hull ? !desc.hull_function : !desc.domain_function) return nullptr;
-    if (desc.tess_domain != TessDomain::Triangle || desc.tess_input_points == 0 || desc.tess_input_points > kMaxPatchControlPoints || desc.tess_output_points == 0 || desc.tess_output_points > kMaxPatchControlPoints) return nullptr;
+    if (desc.tess_input_points == 0 || desc.tess_input_points > kMaxPatchControlPoints || desc.tess_output_points == 0 || desc.tess_output_points > kMaxPatchControlPoints) return nullptr;
     return make<SoftwareShaderModule>(allocator_, desc);
   }
   if (desc.stage == ShaderStage::Geometry) {
@@ -1192,7 +1193,7 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
     if (!desc.hull_shader || !desc.domain_shader || desc.hull_shader->stage() != ShaderStage::Hull || desc.domain_shader->stage() != ShaderStage::Domain) return nullptr;
     const ShaderModuleDesc& h = static_cast<const SoftwareShaderModule*>(desc.hull_shader)->desc();
     const ShaderModuleDesc& d = static_cast<const SoftwareShaderModule*>(desc.domain_shader)->desc();
-    if (h.tess_output_points != d.tess_input_points) return nullptr;   // (the domain shader takes the hull shader's control points)
+    if (h.tess_output_points != d.tess_input_points || h.tess_domain != d.tess_domain) return nullptr;   // (the domain shader takes the hull shader's control points and domain)
   }
   // A shader that samples textures needs the pipeline to say how many, and the other way round.
   // (one with system values reads whatever it likes)
@@ -1461,6 +1462,9 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           const GeometryPrimitive taken = geometry->desc().geometry_input;
           if (taken != (per_primitive == 3 ? GeometryPrimitive::Triangle : per_primitive == 2 ? GeometryPrimitive::Line : GeometryPrimitive::Point)) return false;
         }
+        // (the tessellator's room is taken once for the draw)
+        TessellatorHolder tessellator(allocator_, patches);
+        if (patches && !tessellator.valid()) return false;
         for (uint32_t instance = 0; instance < instances; ++instance) {
           s.primitive_id = 0;
           for (uint32_t t = 0; t + per_primitive <= cmd.count; t += per_primitive, ++s.primitive_id) {
@@ -1468,7 +1472,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             for (uint32_t k = 0; k < per_primitive; ++k)
               if (!vertex_at(t + k, instance, &v[k])) return false;
             if (patches) {
-              run_tessellation(s, *hull, *domain, v, per_primitive);
+              run_tessellation(s, *tessellator.get(), *hull, *domain, v, per_primitive);
               continue;
             }
             if (geometry) {

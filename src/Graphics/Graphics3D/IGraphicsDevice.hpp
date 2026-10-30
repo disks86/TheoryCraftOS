@@ -259,13 +259,14 @@ using GeometryShaderFn = void (*)(const GeometryInputData& input, const uint8_t*
 
 // Tessellation (kFeatureTessellation). A draw of PatchList topology takes `control_points` vertices per patch (set_patch_control_points); the vertex shader runs on each, the hull shader
 // then makes the patch's output control points and its tessellation factors, the fixed-function tessellator makes a lattice of domain points from the factors, and the domain shader
-// turns each into a vertex from the patch (the lattice's triangles are then drawn). The software device calls functions; virgl takes TGSI text for the two stages. Only the triangle domain
-// with integer or power-of-two partitioning is made, and only when the factors of a patch (after rounding) are all the same; a patch with other factors is dropped by the software device.
+// turns each into a vertex from the patch (the triangles, lines or points joining them are then drawn). The software device calls functions; virgl takes TGSI text for the two stages.
+// The triangle, quad and isoline domains are made with integer or power-of-two partitioning (not the fractional ones), by the fixed-function tessellator of Direct3D 11 (see
+// Software/Tessellator.hpp): an edge factor says how many segments the edge has, the inside factors how many rings (concentric triangles, or rectangles) there are.
 constexpr uint32_t kMaxPatchControlPoints = 32;
 constexpr uint32_t kMaxPatchRegisters = 16;   // patch constant registers (tessellation factors included)
 enum class TessDomain : uint8_t { Isoline, Triangle, Quad };
 enum class TessPartitioning : uint8_t { Integer, Pow2 };
-enum class TessOutput : uint8_t { TriangleCw, TriangleCcw };
+enum class TessOutput : uint8_t { TriangleCw, TriangleCcw, Point, Line };
 struct HullInputData {
   uint32_t control_points = 0;
   uint32_t primitive_id = 0;
@@ -275,8 +276,8 @@ struct HullInputData {
 struct HullOutputData {
   ShaderIo control_point[kMaxPatchControlPoints];   // the output control points
   Vec4 patch[kMaxPatchRegisters];                   // the patch constant registers (the tessellation factors are in the x of theirs)
-  float outer[4] = {};                              // edge factors (triangle: u = 0, v = 0, w = 0 edges), inner[0] the inside factor
-  float inner[2] = {};
+  float outer[4] = {};                              // edge factors (triangle: the u = 0, v = 0 and w = 0 edges; quad: u = 0, v = 0, u = 1, v = 1; isoline: line density, line detail)
+  float inner[2] = {};                              // inside factors (triangle: the first; quad: u, v)
 };
 using HullShaderFn = void (*)(const HullInputData& input, const uint8_t* constants, HullOutputData* output);
 using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, float w, const uint8_t* constants, ShaderIo* out);

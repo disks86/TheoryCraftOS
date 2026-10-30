@@ -722,6 +722,7 @@ struct Entry {
   const char* name;
   Scene run;
   bool edges_vary = false;   // lines and points: which pixels a line covers is up to the rasterizer, so a pixel may also match any of its neighbours
+  uint32_t allowed_bad = kAllowedBad;   // pixels that may differ (a scene that is nothing but the placement of points is held to less)
 };
 
 // Two render targets (SV_Target0 / SV_Target1 of ps_mrt.dxbc): the first holds the vertex colour, the second the same with red and blue swapped. The picture compared is
@@ -1195,34 +1196,95 @@ void scene_integer(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
-// Tessellation (hs_tri / ds_dent): a patch of three control points is cut into the 4 x 4 lattice of the triangle domain (all factors 4, integer partitioning), and the domain shader pulls
-// each point toward the centre by how far it is from the edges, so the picture is a dented triangle that shows the lattice (a plain triangle if the tessellator did nothing).
-void scene_tessellation(Rig& rig, ArrayView<uint32_t> out) {
+// Tessellation: a few patches drawn into one picture, each in its own cell (a single one fills the picture), with the tessellation factors in the constants after the matrix. The domain shaders move every point by an amount of its own, so a point that is not where the tessellator should put it, or a
+// triangle that joins other points, shows in the picture.
+struct TessBlob {
+  const uint8_t* code;
+  uint32_t size;
+};
+struct TessCase {
+  TessBlob hull, domain;
+  uint32_t points;           // control points of a patch: 3 (triangle), 4 (quad), 2 (isoline)
+  float f0[4], f1[4];        // the constants after the matrix: the hull shaders read their factors there (a triangle's inside factor is the fourth of the first)
+  graphics::CullMode cull;
+};
+#define TESS_BLOB(name) TessBlob{conformance_blobs::k_##name, sizeof conformance_blobs::k_##name}
+
+void tess_scene(Rig& rig, ArrayView<uint32_t> out, const TessCase* cases, uint32_t count) {
   if (!rig.has(graphics::kFeatureTessellation)) return void(rig.step("tessellation", status::kNotSupported));
   namespace b = conformance_blobs;
-  const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
   Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
-  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_hs_tri, sizeof b::k_hs_tri));
-  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_ds_dent, sizeof b::k_ds_dent));
   Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
-  PipelineDesc pd = colour_pipeline_desc(vs, ps);
-  pd.varying_count = 3;
-  pd.hull_shader = hs;
-  pd.domain_shader = ds;
-  Handle pipe = rig.pipeline(pd);
   Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
-  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  if (count == 0 || count > 4) return void(rig.step("tessellation (cases)", status::kInvalidParameter));
+  // The patches: the control points in the corners of a cell (red, green, blue, yellow).
+  Vertex v[4 * 4];
+  for (uint32_t i = 0; i < count; ++i) {
+    const float h = count == 1 ? 0.85f : 0.42f;
+    const float cx = count == 1 ? 0.0f : (i & 1 ? 0.5f : -0.5f), cy = count == 1 ? 0.0f : (i & 2 ? 0.5f : -0.5f);
+    Vertex* p = v + i * 4;
+    const uint32_t n = cases[i].points;
+    if (n == 3) {
+      p[0] = {cx - h, cy - h, 0.5f, 1, 0, 0, 1}, p[1] = {cx + h, cy - h, 0.5f, 0, 1, 0, 1}, p[2] = {cx, cy + h, 0.5f, 0, 0, 1, 1};
+    } else if (n == 4) {
+      p[0] = {cx - h, cy - h, 0.5f, 1, 0, 0, 1}, p[1] = {cx + h, cy - h, 0.5f, 0, 1, 0, 1}, p[2] = {cx - h, cy + h, 0.5f, 0, 0, 1, 1}, p[3] = {cx + h, cy + h, 0.5f, 1, 1, 0, 1};
+    } else {
+      p[0] = {cx - h, cy, 0.5f, 1, 0, 0, 1}, p[1] = {cx + h, cy, 0.5f, 0, 1, 0, 1};
+    }
+  }
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof(Vertex) * 4 * count));
   CommandWriter w(rig.allocator());
   begin(w, 0, kNoAllocation, {0, 0, 0, 1});
-  w.bind_pipeline(pipe);
-  w.bind_vertex_buffer(1);
-  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
-  w.set_topology(patch_list(3));
-  w.draw(3);
+  for (uint32_t i = 0; i < count; ++i) {
+    const TessCase& c = cases[i];
+    Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(c.hull.code, c.hull.size));
+    Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(c.domain.code, c.domain.size));
+    PipelineDesc pd = colour_pipeline_desc(vs, ps);
+    pd.varying_count = 3;
+    pd.hull_shader = hs;
+    pd.domain_shader = ds;
+    pd.cull_mode = c.cull;
+    Handle pipe = rig.pipeline(pd);
+    float constants[24];
+    for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+    for (uint32_t k = 0; k < 4; ++k) constants[16 + k] = c.f0[k], constants[20 + k] = c.f1[k];
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(bytes_of(constants, sizeof constants));
+    w.set_topology(patch_list(c.points));
+    w.draw(c.points, i * 4);
+  }
   w.end_pass();
   rig.render(w, {target, vb});
   rig.read(target, out);
 }
+
+#define TESS_SCENE(name, ...)                                         \
+  void name(Rig& rig, ArrayView<uint32_t> out) {                      \
+    static constexpr TessCase cases[] = {__VA_ARGS__};                \
+    tess_scene(rig, out, cases, sizeof cases / sizeof cases[0]);      \
+  }
+constexpr auto kNoCull = graphics::CullMode::None;
+
+// Triangles of different factors (odd and even, edges that differ, an inside factor of 1), every one cut in rings of its own.
+TESS_SCENE(scene_tess_triangle,
+           {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {4, 4, 4, 4}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {3, 6, 2, 4}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {1, 7, 4, 1}, {0, 0, 0, 0}, kNoCull})
+// Quads: even and odd rings, edges that differ from the inside, and a strip of quads left in the middle.
+TESS_SCENE(scene_tess_quad,
+           {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {4, 4, 4, 4}, {4, 4, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {5, 5, 5, 5}, {5, 5, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {2, 3, 5, 8}, {4, 3, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {3, 3, 3, 3}, {7, 3, 0, 0}, kNoCull})
+// Isolines drawn as lines and as points, and the points of a triangle and of a quad.
+TESS_SCENE(scene_tess_lines_points,
+           {TESS_BLOB(hs_iso_cb), TESS_BLOB(ds_iso), 2, {4, 6, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_iso_point_cb), TESS_BLOB(ds_iso), 2, {3, 5, 0, 0}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(hs_tri_point_cb), TESS_BLOB(ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_point_cb), TESS_BLOB(ds_quad), 4, {4, 4, 4, 4}, {3, 3, 0, 0}, kNoCull})
+// Which way the triangles wind: with back faces culled, the clockwise output of a triangle patch and of a quad patch is drawn or not as the counter-clockwise output is not or is.
+TESS_SCENE(scene_tess_winding,
+           {TESS_BLOB(hs_tri_cb), TESS_BLOB(ds_noise), 3, {3, 3, 3, 3}, {0, 0, 0, 0}, graphics::CullMode::Back}, {TESS_BLOB(hs_tri_ccw_cb), TESS_BLOB(ds_noise), 3, {3, 3, 3, 3}, {0, 0, 0, 0}, graphics::CullMode::Back},
+           {TESS_BLOB(hs_quad_cb), TESS_BLOB(ds_quad), 4, {3, 3, 3, 3}, {3, 3, 0, 0}, graphics::CullMode::Back}, {TESS_BLOB(hs_quad_ccw_cb), TESS_BLOB(ds_quad), 4, {3, 3, 3, 3}, {3, 3, 0, 0}, graphics::CullMode::Back})
+// Power-of-two partitioning: factors that are rounded up to 4, 8, 2 and 4.
+TESS_SCENE(scene_tess_pow2,
+           {TESS_BLOB(hs_tri_pow2_cb), TESS_BLOB(ds_noise), 3, {3, 5, 2, 3}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_pow2_cb), TESS_BLOB(ds_noise), 3, {6, 6, 6, 6}, {0, 0, 0, 0}, kNoCull})
 
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
@@ -1253,7 +1315,11 @@ const Entry kScenes[] = {
     {"Direct3D 10 instancing", scene_instancing},
     {"Direct3D 10 multiple render targets (DXBC)", scene_multiple_targets},
     {"Direct3D 10 geometry shader (DXBC)", scene_geometry_shader},
-    {"Direct3D 11 tessellation, hull and domain shaders (DXBC)", scene_tessellation},
+    {"Direct3D 11 tessellation, triangle domain (DXBC)", scene_tess_triangle, false, 6},
+    {"Direct3D 11 tessellation, quad domain (DXBC)", scene_tess_quad, false, 6},
+    {"Direct3D 11 tessellation, isolines and points (DXBC)", scene_tess_lines_points, true},
+    {"Direct3D 11 tessellation, winding (DXBC)", scene_tess_winding},
+    {"Direct3D 11 tessellation, power-of-two partitioning (DXBC)", scene_tess_pow2, false, 6},
     {"Direct3D 10 sRGB render target and texture", scene_srgb},
     {"Direct3D 10 16-bit normalised render target and texture", scene_unorm16},
     {"Direct3D 10 integer render target and Load (DXBC)", scene_integer},
@@ -1328,7 +1394,7 @@ uint32_t run_conformance(allocators::IAllocator& allocator, Kernel& kernel, uint
         for (uint64_t i = 0; i < kPixels && result.verdict == SceneVerdict::Same; ++i)
           if (!pixel_matches(device_pixels, reference_pixels, i, scene.edges_vary) && result.bad_pixels++ == 0)
             result.first_bad = static_cast<uint32_t>(i), result.device_value = device_pixels[i], result.reference_value = reference_pixels[i];
-        if (result.bad_pixels > kAllowedBad) result.verdict = SceneVerdict::Differs, ++bad;
+        if (result.bad_pixels > scene.allowed_bad) result.verdict = SceneVerdict::Differs, ++bad;
       }
       result.device_picture = device_pixels.data(), result.reference_picture = reference_pixels.data();
       if (report) report(context, result);

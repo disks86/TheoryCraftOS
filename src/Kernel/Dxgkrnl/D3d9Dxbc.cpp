@@ -184,7 +184,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   const bool patch_stage = hull || domain;
   int phase = 0;   // a hull shader: 0 declarations, 1 control point, 2 fork, 3 join
   uint32_t input_points = 0, output_points = 0;
-  bool tess_domain_declared = false;
+  bool tess_domain_declared = false, tess_output_declared = false;
+  uint32_t factors_domain = 0;   // which domain the tessellation factors a hull shader writes are for (0: none yet)
   bool geometry_input_declared = false, geometry_output_declared = false;
   uint32_t geometry_vertices = 0;   // the vertices of an input primitive
   bool thread_group_declared = false;
@@ -587,12 +588,21 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           return status::kNotSupported;
         }
         if (hull && opcode == kDclOutputSiv4 && o.type == kOpOutput && (phase == 2 || phase == 3)) {
-          // a tessellation factor: the register of the patch constant outputs it is in (the triangle's three edges, then the inside)
+          // a tessellation factor: the register of the patch constant outputs it is in (D3D_NAME 11..14 a quad's edges, 15 and 16 its inside, 17..19 a triangle's edges, 20 its inside, 21 an
+          // isoline's detail, 22 its density)
           const uint32_t name = p.le32() & 0xFFFF;
           if (!p.ok() || o.dims != 1 || o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
-          if (name >= 17 && name <= 19) program->outer_factor_reg_[name - 17] = static_cast<int8_t>(o.index[0]);
-          else if (name == 20) program->inner_factor_reg_ = static_cast<int8_t>(o.index[0]);
+          const int8_t reg = static_cast<int8_t>(o.index[0]);
+          uint32_t factor_domain = 0;
+          if (name >= 11 && name <= 14) program->outer_factor_reg_[name - 11] = reg, factor_domain = 3;
+          else if (name == 15 || name == 16) program->inner_factor_reg_[name - 15] = reg, factor_domain = 3;
+          else if (name >= 17 && name <= 19) program->outer_factor_reg_[name - 17] = reg, factor_domain = 2;
+          else if (name == 20) program->inner_factor_reg_[0] = reg, factor_domain = 2;
+          else if (name == 21) program->outer_factor_reg_[1] = reg, factor_domain = 1;   // (the detail: the second factor)
+          else if (name == 22) program->outer_factor_reg_[0] = reg, factor_domain = 1;   // (the density: the first)
           else return status::kNotSupported;
+          if (factors_domain != 0 && factors_domain != factor_domain) return status::kInvalidParameter;
+          factors_domain = factor_domain;
           continue;
         }
         if (hull && opcode == kDclOutput4 && o.type == kOpOutput && (phase == 2 || phase == 3)) continue;   // (a patch constant register)
@@ -634,10 +644,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         (opcode == kDclInputControlPointCount4 ? input_points : output_points) = n;
         continue;
       }
-      case kDclTessDomain4:
-        if (!patch_stage || ((token >> 11) & 7) != 2) return status::kNotSupported;   // (the triangle domain only)
+      case kDclTessDomain4: {
+        // (D3D11_SB_TESSELLATOR_DOMAIN: 1 isoline, 2 triangle, 3 quad)
+        const uint32_t mode = (token >> 11) & 7;
+        if (!patch_stage || mode < 1 || mode > 3) return status::kNotSupported;
+        program->tess_domain_ = mode == 1 ? graphics::TessDomain::Isoline : mode == 2 ? graphics::TessDomain::Triangle : graphics::TessDomain::Quad;
         tess_domain_declared = true;
         continue;
+      }
       case kDclTessPartitioning4: {
         const uint32_t mode = (token >> 11) & 7;
         if (!hull || (mode != 1 && mode != 2)) return status::kNotSupported;   // (integer and power of two)
@@ -645,9 +659,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         continue;
       }
       case kDclTessOutputPrimitive4: {
+        // (D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE: 1 point, 2 line, 3 triangle_cw, 4 triangle_ccw)
         const uint32_t mode = (token >> 11) & 7;
-        if (!hull || (mode != 3 && mode != 4)) return status::kNotSupported;   // (triangles)
-        program->tess_output_ = mode == 3 ? graphics::TessOutput::TriangleCw : graphics::TessOutput::TriangleCcw;
+        if (!hull || mode < 1 || mode > 4) return status::kNotSupported;
+        program->tess_output_ = mode == 1 ? graphics::TessOutput::Point : mode == 2 ? graphics::TessOutput::Line : mode == 3 ? graphics::TessOutput::TriangleCw : graphics::TessOutput::TriangleCcw;
+        tess_output_declared = true;
         continue;
       }
       case kDclHsMaxTessFactor4:
@@ -944,7 +960,16 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   if (geometry && (!geometry_input_declared || !geometry_output_declared || program->geometry_max_vertices_ == 0)) return status::kInvalidParameter;
   if (patch_stage) {
     if (!tess_domain_declared || input_points == 0) return status::kInvalidParameter;
-    if (hull && (output_points == 0 || phase == 0)) return status::kInvalidParameter;
+    if (hull && (output_points == 0 || phase == 0 || !tess_output_declared)) return status::kInvalidParameter;
+    if (hull) {
+      // (the factors, and the primitives the tessellator makes, go with the domain: lines come from isolines and triangles from the others, points from any)
+      const bool isoline = program->tess_domain_ == graphics::TessDomain::Isoline;
+      const uint32_t want = isoline ? 1 : program->tess_domain_ == graphics::TessDomain::Triangle ? 2 : 3;
+      if (factors_domain != want) return status::kInvalidParameter;
+      if ((program->tess_output_ == graphics::TessOutput::Line) != isoline && program->tess_output_ != graphics::TessOutput::Point) return status::kInvalidParameter;
+      for (uint32_t k = 0; k < (isoline ? 2u : want == 2 ? 3u : 4u); ++k)
+        if (program->outer_factor_reg_[k] < 0) return status::kInvalidParameter;
+    }
     program->tess_input_points_ = input_points;
     program->tess_output_points_ = hull ? output_points : input_points;
   }

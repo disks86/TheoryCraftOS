@@ -917,8 +917,8 @@ void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* 
   if (hs_fork_end_ > hs_fork_begin_) execute(s, hs_fork_begin_, hs_fork_end_);
   if (hs_join_end_ > hs_join_begin_) execute(s, hs_join_begin_, hs_join_end_);
   for (uint32_t i = 0; i < graphics::kMaxPatchRegisters; ++i) output->patch[i] = {s.patch_out[i].f[0], s.patch_out[i].f[1], s.patch_out[i].f[2], s.patch_out[i].f[3]};
-  for (uint32_t k = 0; k < 3; ++k) output->outer[k] = outer_factor_reg_[k] >= 0 ? s.patch_out[outer_factor_reg_[k]].f[0] : 0.0f;   // (a factor not written culls the patch)
-  output->inner[0] = inner_factor_reg_ >= 0 ? s.patch_out[inner_factor_reg_].f[0] : 0.0f;
+  for (uint32_t k = 0; k < 4; ++k) output->outer[k] = outer_factor_reg_[k] >= 0 ? s.patch_out[outer_factor_reg_[k]].f[0] : 0.0f;   // (a factor not written culls the patch)
+  for (uint32_t k = 0; k < 2; ++k) output->inner[k] = inner_factor_reg_[k] >= 0 ? s.patch_out[inner_factor_reg_[k]].f[0] : 1.0f;      // (an inside factor not written is 1)
 }
 
 void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, float v, float w, const uint8_t* constants, graphics::ShaderIo* out) const {
@@ -1052,7 +1052,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
     else desc->domain_function = decltype(kTrampolines)::domain[slot];
     desc->tess_input_points = program->tess_input_points();
     desc->tess_output_points = program->tess_output_points();
-    desc->tess_domain = graphics::TessDomain::Triangle;
+    desc->tess_domain = program->tess_domain();
     desc->tess_partitioning = program->tess_partitioning();
     desc->tess_output = program->tess_output();
     program_ = util::move(program);

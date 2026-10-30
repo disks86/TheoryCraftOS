@@ -1049,10 +1049,15 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, p_.tess_output_points_);
       add(*out, "\nDCL SV[0], INVOCATIONID\n");
     } else {
-      // (the values of these properties are numbers: PIPE_PRIM_TRIANGLES is 4, PIPE_TESS_SPACING_EQUAL 2)
-      add(*out, "TESS_EVAL\nPROPERTY TES_PRIM_MODE 4\nPROPERTY TES_SPACING 2\n");
+      // (the values of these properties are numbers: PIPE_PRIM_LINES is 1, PIPE_PRIM_TRIANGLES 4, PIPE_PRIM_QUADS 7; PIPE_TESS_SPACING_EQUAL is 2, which is what integer partitioning is: a power
+      // of two is made by rounding the factors up in the control shader)
+      const graphics::TessDomain tess_domain = p_.tess_domain_;
+      add(*out, "TESS_EVAL\nPROPERTY TES_PRIM_MODE ");
+      add(*out, tess_domain == graphics::TessDomain::Isoline ? "1" : tess_domain == graphics::TessDomain::Triangle ? "4" : "7");
+      add(*out, "\nPROPERTY TES_SPACING 2\n");
       add(*out, p_.tess_output_ == graphics::TessOutput::TriangleCw ? "PROPERTY TES_VERTEX_ORDER_CW 1\n" : "PROPERTY TES_VERTEX_ORDER_CW 0\n");
-      add(*out, "PROPERTY TES_POINT_MODE 0\nDCL SV[0], TESSCOORD\n");
+      add(*out, p_.tess_output_ == graphics::TessOutput::Point ? "PROPERTY TES_POINT_MODE 1\n" : "PROPERTY TES_POINT_MODE 0\n");
+      add(*out, "DCL SV[0], TESSCOORD\n");
     }
     add(*out, "DCL IN[][0], POSITION\n");
     for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
@@ -1335,20 +1340,33 @@ NtStatus TgsiEmitter::run(String* out) {
     if (hull_) {
       // The patch constants: the factors out of the registers the shader wrote them to (the patch outputs, as TGSI has them, are the two vectors of factors).
       const String tess_outer = [&] { String s = str(); add(s, "OUT[5]"); return s; }(), tess_inner = [&] { String s = str(); add(s, "OUT[6]"); return s; }();
-      for (uint32_t k = 0; k < 3; ++k) {
-        if (p_.outer_factor_reg_[k] < 0) continue;
+      const bool pow2 = p_.tess_partitioning_ == graphics::TessPartitioning::Pow2;
+      // (a power of two: the factor rounded up to the next one, found by comparing it with each of them in turn rather than by a logarithm, which is not exact at the powers)
+      auto write_factor = [&](const char* vector, uint32_t component, uint32_t reg, bool round_up) {
         String target = str();
-        add(target, "OUT[5].");
-        add(target, StringView(&"xyz"[k], 1));
-        const String source = temp(kPatchBase + static_cast<uint32_t>(p_.outer_factor_reg_[k]), ".xxxx");
-        line("MOV", &target, &source);
-      }
-      if (p_.inner_factor_reg_ >= 0) {
-        String target = str();
-        add(target, "OUT[6].x");
-        const String source = temp(kPatchBase + static_cast<uint32_t>(p_.inner_factor_reg_), ".xxxx");
-        line("MOV", &target, &source);
-      }
+        add(target, vector);
+        add(target, StringView(&"xyzw"[component], 1));
+        const String source = temp(kPatchBase + reg, ".xxxx");
+        if (!round_up) {
+          line("MOV", &target, &source);
+          return;
+        }
+        const String r = temp(kWork3, ".x"), rx = temp(kWork3, ".xxxx"), t = temp(kWork2, ".x"), tx = temp(kWork2, ".xxxx");
+        const String one = splat(1.0f);
+        line("MOV", &r, &one);
+        for (uint32_t bit = 1; bit <= 6; ++bit) {
+          const String below = splat(static_cast<float>(1u << (bit - 1))), value = splat(static_cast<float>(1u << bit));
+          line("SLT", &t, &below, &source);   // 1 if 2^(bit - 1) < factor
+          line("MUL", &t, &tx, &value);
+          line("MAX", &r, &rx, &tx);
+        }
+        line("MOV", &target, &rx);
+      };
+      // (an isoline's line density is always an integer, not a power of two)
+      for (uint32_t k = 0; k < 4; ++k)
+        if (p_.outer_factor_reg_[k] >= 0) write_factor("OUT[5].", k, static_cast<uint32_t>(p_.outer_factor_reg_[k]), pow2 && !(p_.tess_domain_ == graphics::TessDomain::Isoline && k == 0));
+      for (uint32_t k = 0; k < 2; ++k)
+        if (p_.inner_factor_reg_[k] >= 0) write_factor("OUT[6].", k, static_cast<uint32_t>(p_.inner_factor_reg_[k]), pow2);
       (void)tess_outer, (void)tess_inner;
     } else if (geometry_) {
       // (the vertices were written out by the emits)

@@ -130,7 +130,7 @@ The kernel-mode driver is the D3DKMT layer, which Direct3D 9, 10, 11 and 12 all 
   The escape ABI's `CreatePipeline` takes the blend state, the depth comparison and the per-instance bits as optional trailing words.
 - **Checked against a real compiler:** `ps_texel` (Load, SampleLevel, GetDimensions, SV_Position, SV_IsFrontFace, SV_PrimitiveID) and `vs_ids` (SV_VertexID, SV_InstanceID with a
   per-instance input) from Wine's HLSL compiler run through the kernel on the software device with the expected pictures.
-- **Not done for Direct3D 10:** stream output and geometry shader features beyond the basics (see Geometry shaders below), tessellation beyond the triangle domain with factors 1 and 2 (see Tessellation), `sample_b` / `sample_c` / derivatives, more than four vertex attributes, more than four varyings (and semantics
+- **Not done for Direct3D 10:** stream output and geometry shader features beyond the basics (see Geometry shaders below), fractional tessellation partitioning (see Tessellation), `sample_b` / `sample_c` / derivatives, more than four vertex attributes, more than four varyings (and semantics
   beyond COLOR0/1 and TEXCOORD0/1), more than one vertex buffer slot, multisampling, predication and queries other than occlusion counts (`D3D10_QUERY_OCCLUSION`; `OCCLUSION_PREDICATE` and `SO_STATISTICS` etc. are not done), depth bias and wireframe fill, texture arrays
   with mipmaps, mipmapped / filtered-across-faces cube and 3D textures, `Load` / `SampleLevel` / `GetDimensions` on them, cube arrays, packed formats (float, half-float, sRGB, 16-bit unorm and R32G32B32A32_UINT colour formats are done; the other integer widths, SNORM and 10-bit formats are not), UAV textures, typed UAV loads and stores, append / consume buffers, group-shared memory and barriers, indirect dispatch (Direct3D 11 compute without those). The other devices (virgl, SVGA3D, Intel Gen9, V3D) have none of the features above, so
   they run the Direct3D 9 level only.
@@ -255,10 +255,16 @@ ABI's last two optional trailing words); the adapter needs `kFeatureTessellation
 points), and the pipeline's hull shader must take that many; patches go with tessellation pipelines and lists with the others (`draw` refuses a mismatch, and a geometry shader after the tessellator).
 The vertex shader runs on each control point, the hull shader's control point phase makes the output control points and its fork and join phases (one instance each) the patch constant registers
 (the tessellation factors are the ones declared with `SV_TessFactor` / `SV_InsideTessFactor` names; user constants reach the domain shader as `vpc[n]` on the CPU renderer), the tessellator
-makes the lattice, the domain shader the vertices. Taken: the triangle domain, integer and power-of-two partitioning, `triangle_cw` / `triangle_ccw`, immediate or `vOutputControlPointID`
-control point indices. **Not made:** the quad and isoline domains, fractional partitioning, point output, adjacency; and the CPU renderer tessellates only when the four factors are equal
-after rounding and are **1 or 2** - the lattice of N * N triangles is what the real tessellator makes for those; from 3 on its inner triangles are concentric rings stitched to the outer one
-(factor 4 was tried on virglrenderer: a different set of points), which is not implemented, so the CPU renderer drops such a patch (as it does one with a factor of 0 or less, which D3D culls too).
+makes the domain points and the triangles (or lines, or points) joining them, the domain shader the vertices. Taken: the triangle, quad and isoline domains, integer and power-of-two
+partitioning, `triangle_cw` / `triangle_ccw` / `point` / `line` output, immediate or `vOutputControlPointID` control point indices. **Not made:** fractional partitioning, adjacency.
+The tessellator is `Graphics/Graphics3D/Software/Tessellator.hpp`, after the published Direct3D 11 reference one: the outer ring has as many segments as the edge factor, the inner rings two
+segments less each (a triangle's concentric about the centre, so their points are not on the lattice; a quad's the rectangles of the lattice), an inside factor of 1 is taken as 2, all factors 1 is
+the patch itself, a factor not above 0 (or NaN) on an edge culls the patch, factors are clamped to 1..64; the first inner ring is joined to the outer one in the order of the "ruler function", the
+others by a fixed pattern, and an odd smaller factor leaves a strip of quads in a quad's middle. Points and triangles agree pixel for pixel with a real GPU (virglrenderer) for triangles and quads
+of factors 1 to 8 with edges that differ from the inside, isolines and point output. **Winding:** with the usual domain shaders (V up on the screen) `triangle_cw` patches are back faces under
+Direct3D's default front face on the real GPU, and the CPU renderer orders the indices so as to agree. virgl takes the output primitive (winding, point mode) from the hull shader the domain
+shader is paired with: `VirglPipeline` makes a copy of the evaluation shader with those properties patched. The constants (push constants) are set for the geometry, hull and domain stages
+of the host too, which they were not before.
 The vertex shader's positions come with Y down and the hull and domain shaders work in Direct3D's clip space, so the CPU renderer turns them over on the way in (`run_hull`) and out
 (`run_domain`). virgl: `TESS_CTRL` TGSI (the control point phase written once for each output control point behind a test of `INVOCATIONID`, since the per-vertex arrays are then written with
 constant indices; the factors in the `TESSOUTER` / `TESSINNER` outputs), `TESS_EVAL` TGSI (`TES_PRIM_MODE 4`, `TES_SPACING 2`, the values of these properties are numbers), shader types 3 and 4,
