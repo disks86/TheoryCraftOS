@@ -110,6 +110,8 @@ class ThunderboltIcm final : public IThunderboltEvents {
   enum class Outcome : uint8_t {
     NotStarted,
     Started,
+    Suspended,           // suspend() was called: the channel is down, the firmware has been told
+
     NotPresent,          // the registers do not answer
     FirmwareNotRunning,  // the BIOS did not start the firmware, and this driver was not told to (or cannot)
     FirmwareStartFailed, // the driver restarted the firmware through the PCIe-to-CIO registers and it did not come up
@@ -141,6 +143,11 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // Brings the controller up: interrupts off, the control channel, the firmware's mode, DRIVER_READY, then waits for the root router. Devices that are already connected are reported
   // through events during the next poll() calls.
   Outcome start(uint32_t timeout_us = kRequestTimeoutUs);
+  // System sleep (icm_suspend / icm_complete): the firmware is asked to save the devices it knows (SAVE_DEVS) and told the driver goes away, the control channel is stopped and its memory
+  // freed, the device list is dropped. Putting the PCI function to sleep is for the caller. resume() brings the channel up again, restarts the firmware if it did not survive, sends
+  // DRIVER_READY and waits for the root router; the firmware then reports the devices that are still connected again (with their approval), so nothing is approved by resuming.
+  bool suspend();
+  Outcome resume(uint32_t timeout_us = kRequestTimeoutUs);
   // Tells the firmware the driver goes away (the mailbox's DRIVER_UNLOADS) and stops the channel.
   void stop();
   bool running() const { return outcome_ == Outcome::Started; }
@@ -174,6 +181,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   void on_event(TbPacketType type, ConstByteView body) override;
 
  private:
+  Outcome bring_up(uint32_t timeout_us, bool resuming);
   bool request(ConstByteView request, ByteView response, uint32_t timeout_us);
   bool parent_authorized(const TbDevice& device) const;
   void mark_authorized(const TbDevice& device);

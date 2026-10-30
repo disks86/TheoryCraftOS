@@ -1059,6 +1059,74 @@ static void test_key_files() {
   }
 }
 
+
+// ---- sleep
+
+static void test_suspend() {
+  TestAllocator alloc;
+  {
+    FakeNhi chip;
+    fake_tb::FakeCio config(chip);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.cio = &cio;
+    icm.set_options(options);
+    CHECK(!icm.suspend());                                            // nothing to suspend yet
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    const size_t commands_at_start = config.commands.size();
+    chip.send_device_connected(make_device(0x20, 1, 1), true);
+    icm.poll();
+    CHECK(icm.device_count() == 1);
+    chip.mailbox_commands.clear();
+    CHECK(icm.suspend() && icm.outcome() == ThunderboltIcm::Outcome::Suspended && !icm.running());
+    CHECK(chip.mailbox_commands.size() == 2 && chip.mailbox_commands[0] == 0x05 && chip.mailbox_commands[1] == 0x07);        // SAVE_DEVS, DRIVER_UNLOADS
+    CHECK(!chip.tx_enabled(0) && alloc.dma.empty() && icm.device_count() == 0);
+    CHECK(!icm.suspend());
+    const char* error = nullptr;
+    CHECK(!icm.approve(0, &error) && error);
+    icm.poll();                                                       // (nothing happens)
+    // wake up: the channel again, DRIVER_READY, no approval, no port bounce; the firmware reports what is still there
+    CHECK(icm.resume() == ThunderboltIcm::Outcome::Started && icm.running() && chip.tx_enabled(0));
+    CHECK(config.commands.size() == commands_at_start && icm.device_count() == 0);
+    chip.send_device_connected(make_device(0x20, 1, 1), true);
+    icm.poll();
+    CHECK(icm.device_count() == 1 && icm.device(0).authorized);
+    // resume when nothing was suspended changes nothing
+    CHECK(icm.resume() == ThunderboltIcm::Outcome::Started);
+    icm.stop();
+    CHECK(alloc.dma.empty());
+  }
+  // the firmware did not survive: restarted if it may be, otherwise reported
+  for (bool allowed : {true, false}) {
+    FakeNhi chip;
+    fake_tb::FakeCio config(chip);
+    TbPcie2Cio cio(config, 0x100);
+    ThunderboltIcm icm(chip, alloc);
+    ThunderboltIcm::Options options;
+    options.cio = &cio;
+    options.start_firmware = allowed;
+    icm.set_options(options);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started && icm.suspend());
+    chip.icm_enabled = false;
+    chip.auth_done = false;
+    const ThunderboltIcm::Outcome got = icm.resume(50000);
+    CHECK(got == (allowed ? ThunderboltIcm::Outcome::Started : ThunderboltIcm::Outcome::FirmwareNotRunning));
+    CHECK(alloc.dma.empty() || got == ThunderboltIcm::Outcome::Started);
+  }
+  // a controller that is gone after sleep
+  {
+    FakeNhi chip;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started && driver.suspend());
+    chip.present = false;
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::ControllerFailed);
+    chip.present = true;
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started && driver.suspend() && driver.resume() == ThunderboltDriver::Outcome::Started);
+  }
+  CHECK(alloc.dma.empty());
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -1123,6 +1191,7 @@ int main() {
   test_topology();
   test_secure();
   test_key_files();
+  test_suspend();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

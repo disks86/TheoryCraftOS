@@ -58,6 +58,9 @@ class ThunderboltDriver {
   ThunderboltIcm* icm() { return icm_.get(); }
   const char* message() const { return icm_ ? ThunderboltIcm::outcome_name(icm_->outcome()) : ""; }
   void poll() { if (icm_) icm_->poll(); }
+  // System sleep: see ThunderboltIcm::suspend / resume.
+  bool suspend() { return icm_ && icm_->suspend(); }
+  Outcome resume();
 
  private:
   allocators::IAllocator& allocator_;
