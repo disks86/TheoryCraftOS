@@ -46,12 +46,12 @@ constexpr uint32_t kNone = ~0u;
 constexpr uint32_t kSlots = 128;   // 32 temporaries of four components
 constexpr uint32_t kMaxResources = 16;
 
-enum class VK : uint8_t { None, Imm, Temp, Input, Cb, Agg, CbAgg, Handle, Sys, Ptr };
+enum class VK : uint8_t { None, Imm, Temp, Input, Cb, Agg, CbAgg, Handle, Sys, Ptr, HandleVar };
 
 // What a value of the function is, in the program being made.
 struct Val {
   VK kind = VK::None;
-  uint32_t a = 0, b = 0, c = 0;   // Imm: the bits; Temp / Agg: register (a), component (b); Input: register (a), component (b); Cb: slot (a), register (b), component (c); CbAgg: slot (a), register (b); Handle: class (a), register (b)
+  uint32_t a = 0, b = 0, c = 0;   // Imm: the bits; Temp / Agg: register (a), component (b); Input: register (a), component (b); Cb: slot (a), register (b), component (c); CbAgg: slot (a), register (b); Handle: class (a), register (b); HandleVar: class (a), range (b), the value of the index (c)
   bool is_mask = false;           // (a boolean: all ones or zero)
   uint8_t d = 0;                  // Input: 0 an input register, 1 an input control point of a domain shader (v[vertex][register]), 2 a patch constant register
 };
@@ -209,6 +209,44 @@ class Translator {
   bool ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool sincos(const Instruction& ins, bool cosine);
   bool texture_gather(const Instruction& ins);
+  // A lookup whose texture (args[1]) is an element of an array chosen by a variable: the lookup is made once for each element, behind a test of the index, into one result register.
+  template <typename F>
+  bool with_array(const Instruction& ins, F body) {
+    if (ins.arg_count < 2) return error(status::kNotSupported);
+    const Val h = use(ins.args[1]);
+    if (h.kind != VK::HandleVar) return body();
+    const Resource& range = res_[0][h.b];
+    const Val result = new_aggregate(ins.result);
+    const Val index = use(h.c);
+    Val mask;
+    mask.kind = VK::Temp;
+    if (result.kind == VK::None || !alloc_scalar(pos_ + 1, &mask.a, &mask.b)) return false;
+    forced_result_ = result;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < range.size; ++i) {
+      Val element, number;
+      element.kind = VK::Handle, element.a = 0, element.b = h.b, element.c = range.lower + i;
+      number.kind = VK::Imm, number.a = range.lower + i;
+      {
+        const uint32_t at = begin(32);   // ieq
+        dst_scalar(mask);
+        src(index), src(number);
+        finish(at);
+      }
+      {
+        const uint32_t at = begin(31, 1u << 18);   // if_nz
+        src(mask);
+        finish(at);
+      }
+      vals_[ins.args[1]] = element;
+      ok = body();
+      finish(begin(21));   // endif
+    }
+    vals_[ins.args[1]] = h;
+    forced_result_ = Val();
+    return ok && define(ins.result, result);
+  }
+  Val forced_result_;
   bool calculate_lod(const Instruction& ins);
   bool sample_bias_grad(const Instruction& ins, bool gradients);
   bool inverse_trig(const Instruction& ins, uint32_t opcode);
@@ -371,6 +409,7 @@ Val Translator::new_scalar(uint32_t id, bool mask) {
 }
 
 Val Translator::new_aggregate(uint32_t id) {
+  if (forced_result_.kind != VK::None) return forced_result_;
   Val v;
   v.kind = VK::Agg;
   if (!alloc_reg(last_use_of(id), &v.a)) v.kind = VK::None;
@@ -434,9 +473,12 @@ bool Translator::analyze(const Instruction& ins) {
       note_use(ins.operands[0], at);
       if (ins.result < alias_of_.count()) alias_of_[ins.result] = ins.operands[0];
       return true;
-    case Op::Call:
+    case Op::Call: {
       for (uint32_t k = 0; k < ins.arg_count; ++k) note_use(ins.args[k], at);
+      uint64_t dx_op = 0;
+      if (ins.arg_count >= 4 && constant_int(ins.args[0], &dx_op) && dx_op == kCreateHandle && ins.result < alias_of_.count()) alias_of_[ins.result] = ins.args[3];   // (a handle on a variable index keeps the index alive)
       return true;
+    }
     case Op::Gep: {
       uint32_t slot = 0, bytes = 0;
       if (ins.arg_count == 2 && ins.result < ptr_ok_.count() && shared_slot(ins.operands[0], &slot, &bytes)) {
@@ -1739,8 +1781,14 @@ bool Translator::dx_call(const Instruction& ins) {
     case kDot4: return dot(ins, 4);
     case kCreateHandle: {
       uint64_t cls = 0, range = 0, index = 0;
+      if (ins.arg_count >= 4 && constant_int(ins.args[1], &cls) && constant_int(ins.args[2], &range) && !constant_int(ins.args[3], &index) && cls == 0 && range < kMaxResources && res_[0][range].present &&
+          res_[0][range].size != 0xFFFFFFFFu && res_[0][range].size >= 2 && res_[0][range].size <= 8) {
+        Val v;   // (a texture array indexed by a variable: the lookups that use it test the index)
+        v.kind = VK::HandleVar, v.a = 0, v.b = static_cast<uint32_t>(range), v.c = ins.args[3];
+        return define(ins.result, v);
+      }
       if (ins.arg_count < 4 || !constant_int(ins.args[1], &cls) || !constant_int(ins.args[2], &range) || !constant_int(ins.args[3], &index) || cls > 3 || range >= kMaxResources || !res_[cls][range].present)
-        return error(status::kNotSupported);   // (a resource array indexed by a variable)
+        return error(status::kNotSupported);   // (a resource array indexed by a variable: only a small array of textures)
       // (the index is the register: the range's lower bound for a single resource)
       const Resource& range_info = res_[cls][range];
       if (index < range_info.lower || (range_info.size != 0xFFFFFFFFu && index - range_info.lower >= range_info.size)) return error(status::kInvalidParameter);
@@ -1758,11 +1806,11 @@ bool Translator::dx_call(const Instruction& ins) {
       v.kind = VK::CbAgg, v.a = h.c, v.b = static_cast<uint32_t>(reg);
       return define(ins.result, v);
     }
-    case kSample: return sample(ins, false);
-    case kSampleLevel: return sample(ins, true);
-    case kSampleBias: case kSampleGrad: return sample_bias_grad(ins, opcode == kSampleGrad);
-    case kTextureLoad: return texture_load(ins);
-    case kTextureGather: return texture_gather(ins);
+    case kSample: return with_array(ins, [&] { return sample(ins, false); });
+    case kSampleLevel: return with_array(ins, [&] { return sample(ins, true); });
+    case kSampleBias: case kSampleGrad: return with_array(ins, [&] { return sample_bias_grad(ins, opcode == kSampleGrad); });
+    case kTextureLoad: return with_array(ins, [&] { return texture_load(ins); });
+    case kTextureGather: return with_array(ins, [&] { return texture_gather(ins); });
     case kCalculateLod: return calculate_lod(ins);
     case kThreadId: return thread_value(ins, 32, true);
     case kGroupId: return thread_value(ins, 33, true);
@@ -2151,8 +2199,10 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     }
     // (the kind: 2 texture 2D, 4 texture 3D, 5 cube, 7 2D array)
     const uint32_t dimension = r.kind == 2 ? 3 : r.kind == 4 ? 5 : r.kind == 5 ? 6 : r.kind == 7 ? 8 : 0;
-    if (!dimension || r.lower >= graphics::kMaxTextureUnits) return status::kNotSupported;
-    word(88u | (dimension << 11) | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower), word(0x5555u);
+    const uint32_t elements = r.size != 0xFFFFFFFFu && r.size >= 1 && r.size <= 8 ? r.size : 1;   // (an array: every element is declared)
+    if (!dimension || r.lower >= graphics::kMaxTextureUnits || elements > graphics::kMaxTextureUnits - r.lower) return status::kNotSupported;
+    for (uint32_t e = 0; e < elements; ++e)
+      word(88u | (dimension << 11) | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower + e), word(0x5555u);
   }
   for (uint32_t i = 0; i < input_count_; ++i) {
     const SigElement& e = inputs_[i];

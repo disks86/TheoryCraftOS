@@ -418,6 +418,36 @@ void scene_dxil_lod(Rig& rig, ArrayView<uint32_t> out) {
   textured_quad(rig, pipe, texture, target, graphics::Filter::Nearest, out);
 }
 
+// A texture array indexed by a variable (dxil_ps_array_show.hlsl): the left half of the quad samples the first texture, the right half the second.
+void scene_dxil_texture_array(Rig& rig, ArrayView<uint32_t> out) {
+  if (graphics::kMaxTextureUnits < 2) return void(rig.step("two texture units", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_array_show, sizeof b::k_dxil_ps_array_show, 2);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle first = checker(rig);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = ((i % 4 + i / 4) & 1) ? 0xFF20F060u : 0xFFF02060u;
+  Handle second = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(second, bytes_of(texels, sizeof texels));
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex v[6] = {vert(-0.9f, -0.9f, 0, 0), vert(0.9f, -0.9f, 1, 0), vert(-0.9f, 0.9f, 0, 1), vert(-0.9f, 0.9f, 0, 1), vert(0.9f, -0.9f, 1, 0), vert(0.9f, 0.9f, 1, 1)};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Nearest;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, sampler);
+  w.bind_texture(1, 3, sampler);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {target, vb, first, second});
+  rig.read(target, out);
+}
+
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
 void scene_render_to_texture(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
@@ -2305,6 +2335,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
     {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
     {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},
+    {"Direct3D 12 DXIL texture array indexed by a variable (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},

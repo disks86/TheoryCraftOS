@@ -5418,6 +5418,29 @@ void test_dxil() {
       }
     }
   }
+  // A texture array indexed by a variable: the lookup of the element the index picks (the fake texture's colour says which unit answered).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_array.dxil", &translated));
+    if (translated) {
+      bool seen[2] = {};
+      for (uint32_t n = 0; n < 200; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), 0, 0, 0};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const uint32_t i = static_cast<uint32_t>(varyings[0].x * 1.99f);
+        seen[i] = true;
+        const float fi = static_cast<float>(i);
+        const bool same = alive && close_to(room[0].x, varyings[2].x + 0.0625f) && close_to(room[0].y, varyings[2].y + 0.25f) && close_to(room[0].z, 0.25f + 0.1f * fi + 0.0f) && close_to(room[0].w, 1.75f + 0.0625f * fi);
+        if (!same && n < 3) printf("  array #%u (%u): %g %g %g %g\n", n, i, room[0].x, room[0].y, room[0].z, room[0].w);
+        CHECK(same);
+      }
+      CHECK(seen[0] && seen[1]);
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;
