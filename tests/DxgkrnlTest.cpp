@@ -5397,6 +5397,36 @@ void test_dxil() {
     }
   }
 
+  // A geometry shader with two output streams (the streams of each vertex and every output of it).
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_gs_streams.dxbc", &reference) && load("dxil_gs_streams.dxil", &translated));
+    if (reference && translated) {
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::GeometryInputData in;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::GeometryOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_geometry(in, constants, &a);
+        translated->run_geometry(in, constants, &b);
+        bool same = a.count == b.count && a.count == 6;
+        bool both_streams[2] = {};
+        for (uint32_t i = 0; same && i < a.count; ++i) {
+          same = a.stream[i] == b.stream[i] && a.restart[i] == b.restart[i] && close_to(a.vertex[i].position.x, b.vertex[i].position.x) && close_to(a.vertex[i].position.w, b.vertex[i].position.w);
+          for (uint32_t k = 0; k < 4; ++k) same = same && close_to(a.vertex[i].varying[k].x, b.vertex[i].varying[k].x) && close_to(a.vertex[i].varying[k].w, b.vertex[i].varying[k].w);
+          if (a.stream[i] < 2) both_streams[a.stream[i]] = true;
+        }
+        if (!same && n == 0) printf("  streams: counts %u %u\n", a.count, b.count);
+        CHECK(same && both_streams[0] && both_streams[1]);
+      }
+      printf("  dxil dxil_gs_streams: 100 triangles compared\n");
+    }
+  }
+
   // A domain shader: the vertex it makes of a patch at a point of the domain.
   {
     UniquePointer<D3d9Program> reference, translated;
@@ -5691,6 +5721,48 @@ void test_geometry_extras() {
   }
 }
 
+// Derivatives through the whole draw: the rasterizer hands each pixel the corners of its quad, so ddx_fine of a function of the interpolated coordinate is its slope per pixel.
+void test_derivative_draw() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_dxil_ps_deriv_show, sizeof b::k_dxil_ps_deriv_show);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  const float corners[6][4] = {{-0.9f, -0.9f, 0, 0}, {0.9f, -0.9f, 1, 0}, {-0.9f, 0.9f, 0, 1}, {-0.9f, 0.9f, 0, 1}, {0.9f, -0.9f, 1, 0}, {0.9f, 0.9f, 1, 1}};
+  float v[42];
+  for (uint32_t i = 0; i < 6; ++i) {
+    const float* c = corners[i];
+    const float one[7] = {c[0], c[1], 0.5f, c[2] / 2, c[3] / 2, 1, 1};
+    for (uint32_t k = 0; k < 7; ++k) v[7 * i + k] = one[k];
+  }
+  CHECK(e.write(vb, floats(v, 42)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(6);
+  w.end_pass();
+  { const NtStatus rs = e.render(w, {target, vb}); if (rs != status::kSuccess) printf("render status %x\n", static_cast<unsigned>(rs)); CHECK(rs == status::kSuccess); }
+  // (at the middle u = v = 0.5: d(u v / 4 + u u) / du = 1.125 per unit, 1 / 28.8 unit per pixel, times 8 and 255: about 80; the blue one is a function of v only)
+  const uint32_t pixel = e.pixel(target, 16, 16);
+  const uint32_t red = (pixel >> 16) & 0xFF, blue = pixel & 0xFF;
+  CHECK(red >= 70 && red <= 90 && blue == 0);
+  // (the same pair of pixels of a quad gets the same value: fine derivatives are per row)
+  CHECK(((e.pixel(target, 16, 16) >> 16) & 0xFF) == ((e.pixel(target, 17, 16) >> 16) & 0xFF));
+}
+
 // Alpha to coverage on the CPU renderer: a quad of whole pixels keeps round(alpha * 4) of the 4 samples, so the resolved red is that many quarters (a GPU dithers fractions from pixel to pixel,
 // which the conformance scene therefore leaves out).
 void test_alpha_to_coverage() {
@@ -5754,6 +5826,7 @@ void test_conformance() {
       case SceneVerdict::Refused: ++l.refused; printf("  conformance: %s refused at %s\n", r.name, r.step); break;
       case SceneVerdict::Broken: ++l.broken; printf("  conformance: %s broken at %s: %x\n", r.name, r.step, static_cast<unsigned>(r.status)); break;
     }
+    if (!(r.device_picture && r.reference_picture && !r.reference_failed)) printf("  conformance scene failed: %s (%s) %x dev=%d ref=%d rf=%d\n", r.name, r.step, static_cast<unsigned>(r.status), !!r.device_picture, !!r.reference_picture, !!r.reference_failed);
     CHECK(r.device_picture && r.reference_picture && !r.reference_failed);
     if (__builtin_strstr(r.name, "float render target")) {
       // Where the two triangles overlap the target holds 2.5 in red (x 0.4 = 1.0); a clamping target would hold 1.0 there (x 0.4 = 0.4). One triangle alone gives 1.5 (x 0.4 = 0.6).
@@ -7054,6 +7127,7 @@ int main() {
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();
+  test_derivative_draw();
   test_conformance();
   test_occlusion_queries();
   test_texture_kinds();

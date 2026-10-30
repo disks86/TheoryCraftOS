@@ -1755,10 +1755,16 @@ bool Translator::dx_call(const Instruction& ins) {
       domain_used_ = true;
       return define(ins.result, v);
     }
-    case 97: case 98: {   // emitStream / cutStream (stream 0)
-      uint64_t stream = 1;
-      if (kind_ != 2 || ins.arg_count < 2 || !constant_int(ins.args[1], &stream) || stream != 0) return error(status::kNotSupported);
-      finish(begin(opcode == 97 ? 19 : 9));
+    case 97: case 98: {   // emitStream / cutStream
+      uint64_t stream = ~uint64_t{0};
+      if (kind_ != 2 || ins.arg_count < 2 || !constant_int(ins.args[1], &stream) || stream >= graphics::kMaxGeometryStreams || !(gs_[2] >> stream & 1)) return error(status::kNotSupported);
+      if (gs_[2] == 1) {
+        finish(begin(opcode == 97 ? 19 : 9));
+      } else {
+        const uint32_t at = begin(opcode == 97 ? 117 : 118);   // emit_stream / cut_stream m#
+        put((16u << 12) | (1u << 20)), put(static_cast<uint32_t>(stream));
+        finish(at);
+      }
       return true;
     }
     case kDiscard: {
@@ -2024,10 +2030,15 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency; the topologies: 1 point list, 3 line strip, 5 triangle strip)
     const uint32_t primitive = gs_[0];
     input_vertices = primitive == 1 ? 1 : primitive == 2 ? 2 : primitive == 3 ? 3 : primitive == 6 ? 4 : primitive == 7 ? 6 : 0;
-    if (!input_vertices || gs_[1] == 0 || gs_[1] > graphics::kMaxGeometryVertices || (gs_[3] != 1 && gs_[3] != 3 && gs_[3] != 5) || gs_[2] != 1) return status::kNotSupported;   // (stream 0 only)
+    if (!input_vertices || gs_[1] == 0 || gs_[1] > graphics::kMaxGeometryVertices || (gs_[3] != 1 && gs_[3] != 3 && gs_[3] != 5) || gs_[2] == 0 || gs_[2] > 15) return status::kNotSupported;
     word(93u | (primitive << 11) | (1u << 24));
     word(92u | (gs_[3] << 11) | (1u << 24));
     word(94u | (2u << 24)), word(gs_[1]);
+    if (gs_[2] != 1) {   // (more than the first stream: dcl_stream m0 .. m<highest>, which the other front end wants one after the other)
+      uint32_t streams = 0;
+      while (gs_[2] >> streams) ++streams;
+      for (uint32_t k = 0; k < streams; ++k) word(143u | (3u << 24)), word((16u << 12) | (1u << 20)), word(k);
+    }
     if (gs_[4] > 1) {
       if (gs_[4] > 32) return status::kNotSupported;
       word(206u | (2u << 24)), word(gs_[4]);
@@ -2118,7 +2129,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
 }
 
 // The ISG1 / OSG1 signature part (32 bytes an element) as the ISGN / OSGN one (24).
-bool convert_signature(allocators::IAllocator& allocator, ConstByteView chunk, ByteBuffer* out) {
+// `streams`: the output signature of a geometry shader, whose entries keep the stream they belong to (the 28-byte OSG5 layout).
+bool convert_signature(allocators::IAllocator& allocator, ConstByteView chunk, ByteBuffer* out, bool streams = false) {
   ByteReader in(chunk);
   const uint32_t n = in.le32();
   const uint32_t key = in.le32();
@@ -2130,11 +2142,12 @@ bool convert_signature(allocators::IAllocator& allocator, ConstByteView chunk, B
     ConstByteView entry = in.take(32);
     if (!in.ok()) return false;
     ByteReader e(entry);
-    e.le32();
+    const uint32_t stream = e.le32();
     const uint32_t name = e.le32();
     if (name < table_at || name > chunk.size()) return false;
     const uint32_t index = e.le32(), sysval = e.le32(), type = e.le32(), reg = e.le32(), masks = e.le32() & 0xFFFF;
-    if (!out->put32(name - static_cast<uint32_t>(uint64_t{n} * 8)) || !out->put32(index) || !out->put32(sysval) || !out->put32(type) || !out->put32(reg) || !out->put32(masks)) return false;
+    if (streams && (stream >= graphics::kMaxGeometryStreams || !out->put32(stream))) return false;
+    if (!out->put32(name - static_cast<uint32_t>(uint64_t{n} * (streams ? 4 : 8))) || !out->put32(index) || !out->put32(sysval) || !out->put32(type) || !out->put32(reg) || !out->put32(masks)) return false;
   }
   if (table_at > chunk.size()) return false;
   (void)allocator;
@@ -2229,14 +2242,14 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   // the container: the converted signatures and the program
   ByteBuffer in_sig(allocator), out_sig(allocator);
   if (!isg1.empty() && !convert_signature(allocator, isg1, &in_sig)) return status::kInvalidParameter;
-  if (!osg1.empty() && !convert_signature(allocator, osg1, &out_sig)) return status::kInvalidParameter;
+  if (!osg1.empty() && !convert_signature(allocator, osg1, &out_sig, kind == 2)) return status::kInvalidParameter;
   struct Part {
     uint32_t fourcc;
     ConstByteView data;
   } parts[3];
   uint32_t part_count = 0;
   if (in_sig.size()) parts[part_count++] = {kFourIsgn, in_sig.view()};
-  if (out_sig.size()) parts[part_count++] = {kFourOsgn, out_sig.view()};
+  if (out_sig.size()) parts[part_count++] = {kind == 2 ? 0x3547534Fu : kFourOsgn, out_sig.view()};   // (OSG5 for the streams)
   parts[part_count++] = {kFourShex, shex.view()};
   ByteBuffer container(allocator);
   uint64_t size = 32 + uint64_t{part_count} * 4;

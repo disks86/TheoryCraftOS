@@ -1062,6 +1062,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (s != status::kSuccess) return s;
       ins.op = alu->op;
       ins.vector = alu->vector;
+      if (alu->op >= kDdx && alu->op <= kDdyCoarse) program->uses_system_values_ = true;   // (derivatives need the pixel's quad: the function that takes the FragmentContext)
       ins.mask_result = alu->op == kSeq || alu->op == kSne || alu->op == kSlt || alu->op == kSge;   // (all ones for true, as the integer instructions read them)
       s = to_dst(d, &ins.dst);
       if (s != status::kSuccess) return s;
