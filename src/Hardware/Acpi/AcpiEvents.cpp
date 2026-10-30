@@ -32,17 +32,22 @@ bool acpi_parse_fadt(ConstByteView table, AcpiFadt* out) {
   f.acpi_enable = r.u8();
   f.acpi_disable = r.u8();
   r.skip(2);                      // S4BIOS_REQ, PSTATE_CNT
-  r.skip(4);                      // PM1a_EVT_BLK
+  f.pm1a_event = r.le32();
   r.skip(4);                      // PM1b_EVT_BLK
   f.pm1a_control = r.le32();
   r.skip(4 + 4 + 4);              // PM1b_CNT_BLK, PM2_CNT_BLK, PM_TMR_BLK
   f.gpe0_block = r.le32();
   f.gpe1_block = r.le32();
-  r.skip(1 + 1 + 1 + 1);          // PM1_EVT_LEN, PM1_CNT_LEN, PM2_CNT_LEN, PM_TMR_LEN
+  f.pm1_event_length = r.u8();
+  r.skip(1 + 1 + 1);              // PM1_CNT_LEN, PM2_CNT_LEN, PM_TMR_LEN
   f.gpe0_length = r.u8();
   f.gpe1_length = r.u8();
   f.gpe1_base = r.u8();
-  if (!r.ok() || f.pm1a_control > 0xFFFF || f.gpe0_block > 0xFFFF || f.gpe1_block > 0xFFFF || f.smi_command > 0xFFFF) return false;   // (I/O ports)
+  if (table.size() >= 116) {      // (the flags, in every FADT of revision 1 and later)
+    r.skip(112 - 95);
+    f.flags = r.le32();
+  }
+  if (!r.ok() || f.pm1a_event > 0xFFFF || f.pm1a_control > 0xFFFF || f.gpe0_block > 0xFFFF || f.gpe1_block > 0xFFFF || f.smi_command > 0xFFFF) return false;   // (I/O ports)
   *out = f;
   return true;
 }
@@ -231,6 +236,11 @@ void AcpiEvents::deliver() {
     values[i] = bridge_.values[i];
   }
   bridge_.count = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (values[i] != 0x80) continue;                                      // (a button's own event: pressed, or the lid moved)
+    for (uint32_t k = 0; k < button_count_; ++k)
+      if (buttons_[k].device == nodes[i]) button_pressed(buttons_[k].kind);
+  }
   if (listener_)
     for (uint32_t i = 0; i < count; ++i) listener_->on_notify(nodes[i], values[i]);
 }
@@ -239,6 +249,10 @@ static char hex_digit(uint32_t v) { return static_cast<char>(v < 10 ? '0' + v : 
 
 void AcpiEvents::handle(uint32_t gpe, uint16_t status_port, uint16_t enable_port, uint8_t bit) {
   ++handled_;
+  if (ec_node_ && gpe == ec_gpe_) {
+    handle_ec(status_port, enable_port, bit);
+    return;
+  }
   // \_GPE._Lxx (level: the source stays until the method has dealt with it, so the event is masked meanwhile) or ._Exx (edge: acknowledged first)
   char name[16] = {'\\', '_', 'G', 'P', 'E', '.', '_', 'L', hex_digit((gpe >> 4) & 0xF), hex_digit(gpe & 0xF), 0};
   acpi::Node* method = gpe < 0x100 ? vm_.find(name) : nullptr;
@@ -264,9 +278,172 @@ void AcpiEvents::handle(uint32_t gpe, uint16_t status_port, uint16_t enable_port
   deliver();
 }
 
+// --- the embedded controller
+
+static bool ec_ports_of(const acpi::Value& crs, uint16_t* data, uint16_t* command) {
+  if (crs.kind != acpi::ValueKind::Buffer) return false;
+  uint16_t ports[2];
+  uint32_t found = 0, at = 0;
+  while (at < crs.length && found < 2) {
+    const uint8_t tag = crs.bytes[at];
+    if (tag & 0x80) {
+      if (at + 3 > crs.length) return false;
+      at += 3u + (crs.bytes[at + 1] | (uint32_t{crs.bytes[at + 2]} << 8));
+      continue;
+    }
+    const uint32_t type = (tag >> 3) & 0xF, length = tag & 7;
+    if (type == 0xF) break;
+    if (at + 1 + length > crs.length) return false;
+    if (type == 0x8 && length >= 7) ports[found++] = static_cast<uint16_t>(crs.bytes[at + 2] | (crs.bytes[at + 3] << 8));
+    else if (type == 0x9 && length >= 3) ports[found++] = static_cast<uint16_t>(crs.bytes[at + 1] | (crs.bytes[at + 2] << 8));
+    at += 1 + length;
+  }
+  if (found < 2) return false;
+  *data = ports[0];
+  *command = ports[1];
+  return true;
+}
+
+bool AcpiEvents::enable_embedded_controller() {
+  if (!ready_ || ec_node_) return ec_node_ != nullptr;
+  // the controller device: PNP0C09 anywhere in the namespace (the first)
+  struct Finder {
+    acpi::AmlInterpreter& vm;
+    acpi::Node* found = nullptr;
+    void visit(acpi::Node* node, uint32_t depth) {
+      if (found || depth > 8) return;
+      for (acpi::Node* child = vm.first_child(node); child && !found; child = vm.next_sibling(child)) {
+        if (vm.is_device(child) && vm.device_has_id(child, "PNP0C09")) found = child;
+        else visit(child, depth + 1);
+      }
+    }
+  } finder{vm_};
+  finder.visit(vm_.root(), 0);
+  acpi::Node* ec = finder.found;
+  if (!ec) return false;
+  acpi::Node* gpe_node = vm_.find("_GPE", ec);
+  if (!gpe_node || vm_.parent(gpe_node) != ec) return false;
+  acpi::Value gpe;
+  if (!vm_.evaluate(gpe_node, nullptr, 0, &gpe)) return false;
+  if (gpe.kind == acpi::ValueKind::Package && gpe.length >= 2) gpe = gpe.elements[1];      // { GPE block device, number }
+  uint16_t status = 0, enable = 0;
+  uint8_t bit = 0;
+  if (gpe.kind != acpi::ValueKind::Integer || gpe.integer >= 0x100 || !locate(static_cast<uint32_t>(gpe.integer), &status, &enable, &bit)) return false;
+  uint16_t data_port = 0x62, command_port = 0x66;                                            // (where PCs have it unless the tables say otherwise)
+  acpi::Node* crs = vm_.find("_CRS", ec);
+  acpi::Value ports;
+  if (crs && vm_.parent(crs) == ec && vm_.evaluate(crs, nullptr, 0, &ports)) ec_ports_of(ports, &data_port, &command_port);
+  host_.configure_ec(data_port, command_port);
+  acpi::Node* reg = vm_.find("_REG", ec);
+  if (reg && vm_.parent(reg) == ec) {
+    acpi::Value args[2];
+    args[0].kind = args[1].kind = acpi::ValueKind::Integer;
+    args[0].integer = static_cast<uint64_t>(acpi::RegionSpace::EmbeddedControl);
+    args[1].integer = 1;
+    vm_.evaluate(reg, args, 2, nullptr);
+  }
+  ec_node_ = ec;
+  ec_gpe_ = static_cast<uint32_t>(gpe.integer);
+  ports_.out8(status, bit);
+  ports_.out8(enable, static_cast<uint8_t>(ports_.in8(enable) | bit));
+  // events the controller already holds raised the line before it was armed: look at once
+  handle_ec(status, enable, bit);
+  return true;
+}
+
+static char hex_digit_of(uint32_t v) { return static_cast<char>(v < 10 ? '0' + v : 'A' + (v - 10)); }
+
+void AcpiEvents::handle_ec(uint16_t status_port, uint16_t enable_port, uint8_t bit) {
+  ports_.out8(enable_port, static_cast<uint8_t>(ports_.in8(enable_port) & ~bit));       // (level: masked while the controller is asked)
+  for (uint32_t i = 0; i < 16; ++i) {                                                      // (bounded: a stuck line would otherwise keep us here)
+    uint8_t status = 0, event = 0;
+    if (!host_.ec_status(&status) || !(status & 0x20)) break;
+    if (!host_.ec_query(&event)) break;
+    if (event == 0) continue;                                                              // (a spurious one; the line may still be up)
+    ++ec_events_;
+    char name[5] = {'_', 'Q', hex_digit_of(event >> 4), hex_digit_of(event & 0xF), 0};
+    acpi::Node* method = vm_.find(name, ec_node_);
+    if (method && vm_.parent(method) == ec_node_) vm_.evaluate(method, nullptr, 0, nullptr);
+    deliver();
+  }
+  ports_.out8(status_port, bit);
+  ports_.out8(enable_port, static_cast<uint8_t>(ports_.in8(enable_port) | bit));
+}
+
+// --- buttons
+
+void AcpiEvents::find_buttons(acpi::Node* node, uint32_t depth) {
+  if (depth > 8) return;
+  for (acpi::Node* child = vm_.first_child(node); child && button_count_ < kMaxButtons; child = vm_.next_sibling(child)) {
+    if (vm_.is_device(child)) {
+      AcpiButton kind = AcpiButton::Power;
+      bool is_button = true;
+      if (vm_.device_has_id(child, "PNP0C0C")) kind = AcpiButton::Power;
+      else if (vm_.device_has_id(child, "PNP0C0E")) kind = AcpiButton::Sleep;
+      else if (vm_.device_has_id(child, "PNP0C0D")) kind = AcpiButton::Lid;
+      else is_button = false;
+      if (is_button) {
+        buttons_[button_count_].device = child;
+        buttons_[button_count_].kind = kind;
+        ++button_count_;
+        continue;
+      }
+    }
+    find_buttons(child, depth + 1);
+  }
+}
+
+uint32_t AcpiEvents::enable_buttons() {
+  if (!ready_) return 0;
+  if (button_count_ == 0) find_buttons(vm_.root(), 0);
+  uint32_t reportable = 0;
+  for (uint32_t i = 0; i < button_count_; ++i) {
+    enable_wake(buttons_[i].device);                                                       // (a button that can wake the machine names an event; others have none)
+    ++reportable;
+  }
+  // the fixed feature buttons: PWRBTN (bit 8) and SLPBTN (bit 9) of PM1 status, with their enables in the second half of the block
+  if (fadt_.pm1a_event != 0 && fadt_.pm1_event_length >= 4) {
+    const uint16_t status = static_cast<uint16_t>(fadt_.pm1a_event), enable = static_cast<uint16_t>(fadt_.pm1a_event + fadt_.pm1_event_length / 2);
+    uint16_t enabled = ports_.in16(enable);
+    if (!(fadt_.flags & AcpiFadt::kFlagPowerButtonControlMethod)) { enabled |= 1u << 8; fixed_power_ = true; ++reportable; }
+    if (!(fadt_.flags & AcpiFadt::kFlagSleepButtonControlMethod)) { enabled |= 1u << 9; fixed_sleep_ = true; ++reportable; }
+    ports_.out16(status, (1u << 8) | (1u << 9));                                           // (a press from before we looked is old news)
+    ports_.out16(enable, enabled);
+  }
+  return reportable;
+}
+
+bool AcpiEvents::lid_open(bool* open) {
+  for (uint32_t i = 0; i < button_count_; ++i) {
+    if (buttons_[i].kind != AcpiButton::Lid) continue;
+    acpi::Node* lid = vm_.find("_LID", buttons_[i].device);
+    uint64_t state = 0;
+    if (!lid || vm_.parent(lid) != buttons_[i].device || !vm_.evaluate_integer(lid, &state)) return false;
+    *open = state != 0;
+    return true;
+  }
+  return false;
+}
+
+void AcpiEvents::button_pressed(AcpiButton kind) {
+  if (!buttons_listener_) return;
+  bool open = true;
+  if (kind == AcpiButton::Lid && !lid_open(&open)) return;
+  buttons_listener_->on_button(kind, open);
+}
+
+void AcpiEvents::poll_fixed_buttons() {
+  if ((!fixed_power_ && !fixed_sleep_) || fadt_.pm1a_event == 0) return;
+  const uint16_t status_port = static_cast<uint16_t>(fadt_.pm1a_event), enable_port = static_cast<uint16_t>(fadt_.pm1a_event + fadt_.pm1_event_length / 2);
+  const uint16_t pending = static_cast<uint16_t>(ports_.in16(status_port) & ports_.in16(enable_port));
+  if (pending & (1u << 8)) { ports_.out16(status_port, 1u << 8); button_pressed(AcpiButton::Power); }
+  if (pending & (1u << 9)) { ports_.out16(status_port, 1u << 9); button_pressed(AcpiButton::Sleep); }
+}
+
 uint32_t AcpiEvents::poll() {
   if (!ready_) return 0;
   uint32_t before = handled_;
+  poll_fixed_buttons();
   struct Block { uint32_t port, length, base; };
   const Block blocks[2] = {{fadt_.gpe0_block, fadt_.gpe0_length, 0}, {fadt_.gpe1_block, fadt_.gpe1_length, fadt_.gpe1_base}};
   for (const Block& block : blocks) {

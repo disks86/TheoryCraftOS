@@ -18,7 +18,7 @@
 
 // The ACPI embedded controller (the small processor of a laptop that knows the battery, the keys and the fans): its register space is read and written
 // byte by byte through two I/O ports, a data port and a command/status port (ACPI specification, chapter 12). This is the polling protocol; the
-// controller's events (the SCI) are not handled.
+// controller's events are found by the caller: status() shows SCI_EVT, query() asks which event it was.
 #pragma once
 #include <stdint.h>
 
@@ -51,12 +51,17 @@ class EmbeddedController {
   bool read(uint8_t address, uint8_t* value);
   bool write(uint8_t address, uint8_t value);
   bool broken() const { return failures_ >= kMaxFailures; }
+  // The status register: bit 5 (kStatusSciEvent) says the controller has an event for the OS.
+  bool status(uint8_t* value);
+  // QR_EC: the number of the pending event (0 if there is none); the method _Qxx of that number handles it.
+  bool query(uint8_t* event);
+  static constexpr uint8_t kStatusSciEvent = 0x20;
 
   static constexpr uint32_t kMaxFailures = 3;
 
  private:
   static constexpr uint8_t kStatusOutputFull = 0x01, kStatusInputFull = 0x02;
-  static constexpr uint8_t kCommandRead = 0x80, kCommandWrite = 0x81;
+  static constexpr uint8_t kCommandRead = 0x80, kCommandWrite = 0x81, kCommandQuery = 0x84;
   static constexpr uint32_t kPollMicroseconds = 10, kPollLimit = 5000;   // up to 50 ms per step
   bool wait(uint8_t mask, bool set);
   void finish(bool ok) { failures_ = ok ? 0 : failures_ + 1; }
