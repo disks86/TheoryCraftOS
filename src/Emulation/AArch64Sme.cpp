@@ -92,6 +92,14 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     for (uint64_t& w : s_.zt0) w = 0;
     return Step::Ok;
   }
+  if ((insn & 0xFFFFCFE0u) == 0xC04F03E0u) {      // MOVT ZT0[#off, MUL VL], Zt: a vector into 16 bytes of ZT0
+    if (!s_.za_enabled) return undefined();
+    const uint32_t index = 2 * bits_of(insn, 13, 12);
+    if (index == 0) for (uint64_t& w : s_.zt0) w = 0;      // (without an offset the whole table is written, the rest zero)
+    s_.zt0[index] = s_.v[insn & 31].lo;
+    s_.zt0[index + 1] = s_.v[insn & 31].hi;
+    return Step::Ok;
+  }
   if ((insn & 0xFFFF8FE0u) == 0xC04C03E0u || (insn & 0xFFFF8FE0u) == 0xC04E03E0u) {      // MOVT Xt, ZT0[#off] / MOVT ZT0[#off], Xt
     if (!s_.za_enabled) return undefined();
     const uint32_t index = bits_of(insn, 14, 12), rt = insn & 31;
@@ -156,7 +164,6 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
   if (top == 0xC0 && (bits_of(insn, 21, 17) == 2 || bits_of(insn, 21, 17) == 3) && !((insn >> 16) & 1) && !((insn >> 12) & 1)) {      // MOVA / MOVAZ of two or four vectors: tile slices, or ZA array vectors (bit 11)
     const bool to_vector = (insn >> 17) & 1, four = (insn >> 10) & 1, array = (insn >> 11) & 1, zeroing = to_vector && ((insn >> 9) & 1);
     const uint32_t nreg = four ? 4 : 2, rv = static_cast<uint32_t>(reg(8 + (array ? bits_of(insn, 14, 13) : 4 + bits_of(insn, 14, 13)), false));
-    if (!to_vector && ((insn >> 9) & 1) && !array) return undefined();
     uint32_t zt, field;
     if (to_vector) {
       zt = four ? (bits_of(insn, 4, 2) << 2) : (bits_of(insn, 4, 1) << 1);
@@ -294,6 +301,8 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
   }
 
   if (top == 0x80 || top == 0x81 || top == 0xA0 || top == 0xA1) {      // outer products
+    uint32_t mop4_form;
+    if (sme2_mop4_match(insn, &mop4_form)) return sme2_mop4(mop4_form, insn);
     const uint32_t zm = bits_of(insn, 20, 16);
     const uint16_t pm = s_.p[bits_of(insn, 15, 13)], pn = s_.p[bits_of(insn, 12, 10)];
     const bool subtract = (insn >> 4) & 1, b3 = (insn >> 3) & 1;
