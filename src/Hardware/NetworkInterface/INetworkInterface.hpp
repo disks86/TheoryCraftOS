@@ -59,6 +59,10 @@ class INetworkInterface : public IHardware {
     return false;
   }
 
+  // True for an interface whose link comes and goes with a connection (Wi-Fi, a cable to another host) rather than with a cable to a network: its network stack then asks for an address
+  // when the link comes up and gives it up when it goes down.
+  virtual bool link_comes_and_goes() const { return false; }
+
   // The Wi-Fi side of this interface (scanning, joining a network), or nullptr when it is not a wireless adapter.
   virtual IWirelessInterface* wireless() { return nullptr; }
 

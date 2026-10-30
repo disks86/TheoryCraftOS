@@ -38,9 +38,9 @@ namespace hardware {
 
 namespace tb_icm {
 // icm_pkg_code
-constexpr uint8_t kGetTopology = 0x1, kDriverReady = 0x3, kApproveDevice = 0x4, kChallengeDevice = 0x5, kAddDeviceKey = 0x6, kGetRoute = 0xA;
+constexpr uint8_t kGetTopology = 0x1, kDriverReady = 0x3, kApproveDevice = 0x4, kChallengeDevice = 0x5, kAddDeviceKey = 0x6, kGetRoute = 0xA, kApproveXdomain = 0x10, kDisconnectXdomain = 0x11;
 // icm_event_code
-constexpr uint8_t kEventDeviceConnected = 0x3, kEventDeviceDisconnected = 0x4, kEventXdomainConnected = 0x6, kEventXdomainDisconnected = 0x7;
+constexpr uint8_t kEventDeviceConnected = 0x3, kEventDeviceDisconnected = 0x4, kEventXdomainConnected = 0x6, kEventXdomainDisconnected = 0x7, kEventRtd3Veto = 0xA;
 // the header's flags
 constexpr uint8_t kFlagError = 1u << 0, kFlagNoKey = 1u << 1, kFlagDualLane = 1u << 5, kFlagRtd3 = 1u << 6, kFlagSpeedGen3 = 1u << 7;
 constexpr uint32_t kFlagSecurityShift = 3, kFlagSecurityMask = 3u << 3;
@@ -102,14 +102,21 @@ struct TbXDomain {
   char vendor_name[48] = {}, device_name[48] = {};
   uint32_t protocols[8] = {};            // the protocol ids of the services it offers (prtcid of each service directory; 1 is IP networking)
   uint32_t protocol_count = 0;
+  bool has_network = false;              // it offers the network service (protocol 1) ...
+  uint32_t network_flags = 0;            // ... with these flags (its prtcstns: ThunderboltNet's kFlag...)
+  bool dual_lane = false, gen3 = false;  // how the firmware says the link runs
+  bool tunnel = false;                   // a data path to it is approved (ICM_APPROVE_XDOMAIN)
 };
 
 namespace tb_icm {
 // ICM_EVENT_XDOMAIN_CONNECTED / DISCONNECTED, in both generations' layouts (Titan Ridge names the domain by route, Alpine Ridge by port and depth)
-constexpr uint32_t kXdomainConnectedBytes = 56, kXdomainDisconnectedBytes = 24, kTrXdomainDisconnectedBytes = 28;
+constexpr uint32_t kApproveXdomainBytes = 32, kTrApproveXdomainBytes = 36, kTrDisconnectXdomainBytes = 32, kXdomainConnectedBytes = 56, kXdomainDisconnectedBytes = 24, kTrXdomainDisconnectedBytes = 28;
 bool parse_xdomain_connected(ConstByteView event, TbXDomain* out);
 bool parse_xdomain_disconnected(ConstByteView event, uint8_t remote_uuid[16], uint8_t* link, uint8_t* depth);
 bool parse_xdomain_disconnected_tr(ConstByteView event, uint64_t* route, uint8_t remote_uuid[16]);
+uint32_t build_approve_xdomain(const TbXDomain& xd, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, ByteView out);
+uint32_t build_approve_xdomain_tr(const TbXDomain& xd, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, ByteView out);
+uint32_t build_disconnect_xdomain_tr(const TbXDomain& xd, uint8_t stage, ByteView out);
 uint32_t build_get_topology(ByteView out);
 bool parse_topology_packet(ConstByteView packet, TbTopologySwitch* out);
 uint32_t build_driver_ready(ByteView out);
@@ -139,6 +146,17 @@ bool parse_get_route(ConstByteView response, uint64_t* route);
 bool parse_device_connected(ConstByteView event, TbDevice* out, bool* rejected);
 bool parse_device_disconnected(ConstByteView event, uint8_t* link, uint8_t* depth);
 }  // namespace tb_icm
+
+// A service that talks to another host in XDomain messages of its own (ThunderboltIP): the messages that start with the service's UUID instead of the discovery protocol's. Returns true if the
+// packet was a request of the service and was dealt with; the answers to the service's own requests are left to the request that waits for them.
+class IThunderboltIpHandler {
+ public:
+  virtual bool handle_ip_packet(ConstByteView body) = 0;
+
+ protected:
+  constexpr IThunderboltIpHandler() = default;
+  ~IThunderboltIpHandler() = default;
+};
 
 class ThunderboltIcm final : public IThunderboltEvents {
  public:
@@ -183,6 +201,12 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // freed, the device list is dropped. Putting the PCI function to sleep is for the caller. resume() brings the channel up again, restarts the firmware if it did not survive, sends
   // DRIVER_READY and waits for the root router; the firmware then reports the devices that are still connected again (with their approval), so nothing is approved by resuming.
   bool suspend();
+  // Runtime power management (RTD3): the controller may be put to sleep while the machine runs, when nothing needs it. The firmware says whether it supports that (the driver ready answer's
+  // RTD3 flag) and may veto it with an event (the veto reason is not zero) while something it manages is busy; a data path to another host also keeps it awake. Like suspend(), without
+  // asking the firmware to save its devices. runtime_resume() is resume().
+  bool runtime_suspend();
+  bool runtime_allowed() const { return outcome_ == Outcome::Started && ready_.rtd3 && !rtd3_veto_ && !tunnel_active(); }
+  bool rtd3_vetoed() const { return rtd3_veto_; }
   Outcome resume(uint32_t timeout_us = kRequestTimeoutUs);
   // Tells the firmware the driver goes away (the mailbox's DRIVER_UNLOADS) and stops the channel.
   void stop();
@@ -201,6 +225,13 @@ class ThunderboltIcm final : public IThunderboltEvents {
   uint64_t xdomain_count() const { return xdomains_.count(); }
   const TbXDomain& xdomain(uint64_t index) const { return xdomains_[index]; }
   // What this host tells another one about itself (vendor and device numbers, names); defaults to a made up identity.
+  // Offers the network service to other hosts (their property block read shows it), with these flags.
+  bool offer_network(uint32_t flags);
+  void set_ip_handler(IThunderboltIpHandler* handler) { ip_handler_ = handler; }
+  // Asks the firmware to open the data path to the other host (ICM_APPROVE_XDOMAIN): we send on `transmit_path` from our ring `transmit_ring`, and the other host sends on
+  // `receive_path`, into our ring `receive_ring`. One path at a time. disconnect_xdomain_paths() closes it.
+  bool approve_xdomain_paths(uint64_t index, uint16_t transmit_path, uint16_t transmit_ring, uint16_t receive_path, uint16_t receive_ring, const char** error);
+  bool disconnect_xdomain_paths(uint64_t index);
   bool set_identity(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name);
 
   const TbDriverReady& driver_ready() const { return ready_; }
@@ -225,7 +256,7 @@ class ThunderboltIcm final : public IThunderboltEvents {
   TbNhi& nhi() { return nhi_; }
   TbControl& control() { return control_; }
 
-  void on_event(TbPacketType type, ConstByteView body) override;
+  bool on_event(TbPacketType type, ConstByteView body) override;
 
  private:
   bool titan() const { return options_.generation == TbGeneration::TitanRidge; }
@@ -234,9 +265,15 @@ class ThunderboltIcm final : public IThunderboltEvents {
   uint32_t build_approve(const TbDevice& device, ByteView out) const { return titan() ? tb_icm::build_approve_device_tr(device, out) : tb_icm::build_approve_device(device, out); }
   Outcome bring_up(uint32_t timeout_us, bool resuming);
   bool request(ConstByteView request, ByteView response, uint32_t timeout_us, uint32_t retries = kRetries);
+  bool tunnel_active() const {
+    for (uint64_t i = 0; i < xdomains_.count(); ++i)
+      if (xdomains_[i].tunnel) return true;
+    return false;
+  }
   bool parent_authorized(const TbDevice& device) const;
   void mark_authorized(const TbDevice& device);
   bool request_flags(ConstByteView request, ByteView response, uint32_t timeout_us, const char** error, const char* no_answer);
+  bool suspend_controller(bool save_devices);
   void service_xdomains();
   bool discover_xdomain(uint64_t index);
   void answer_xdomain_request(ConstByteView body);
@@ -251,10 +288,14 @@ class ThunderboltIcm final : public IThunderboltEvents {
   List<TbDevice> devices_;
   List<TbXDomain> xdomains_;
   List<uint32_t> local_block_;
+  IThunderboltIpHandler* ip_handler_ = nullptr;
+  bool offer_network_ = false;
+  uint32_t network_flags_ = 0, identity_[3] = {0, 1, 1};
+  char vendor_name_[48] = "TheoryCraftOS", device_name_[48] = "TheoryCraftOS";
   uint32_t local_generation_ = 1, polls_ = 0;
   TbDriverReady ready_;
   crypto::IRandom* random_ = nullptr;
-  bool interrupts_ = false;
+  bool interrupts_ = false, rtd3_veto_ = false;
   ITbKeyStore* keys_ = nullptr;
   Options options_;
   uint32_t port_reset_failures_ = 0;

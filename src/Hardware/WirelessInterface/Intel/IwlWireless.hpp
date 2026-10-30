@@ -59,6 +59,7 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   bool start(IIwlRegisters& registers, bool integrated);
   void shutdown() override;
   const char* name() const override { return "Intel Wireless-AC (Wi-Fi)"; }
+  bool link_comes_and_goes() const override { return true; }
   const char* failure() const { return failure_; }
   const IwlDriver& driver() const { return driver_; }
 

@@ -101,5 +101,9 @@ const TbPropertyEntry* tb_properties_find(const List<TbPropertyEntry>& entries, 
 // A block for this host: the root directory with vendorid, deviceid and devicerv as values and the vendor's and device's names as text under the keys vendorid and deviceid (a value and a text
 // may share a key; the type tells them apart).
 bool tb_properties_build_local(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name, List<uint32_t>& out);
+// The same with the network service (USB4NET / ThunderboltIP) offered: a directory "network" (UUID c66189ca-1cce-4195-bdb8-49592e5f5a4f) with prtcid 1, prtcvers 1, prtcrevs 1 and
+// prtcstns = `network_flags` (the TbNet flags of ThunderboltNet.hpp).
+bool tb_properties_build_local(uint32_t vendor_id, uint32_t device_id, uint32_t device_revision, const char* vendor_name, const char* device_name, bool offer_network, uint32_t network_flags,
+                               List<uint32_t>& out);
 
 }  // namespace hardware

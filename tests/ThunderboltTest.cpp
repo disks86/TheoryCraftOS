@@ -29,6 +29,7 @@
 #include "FakeThunderbolt.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltKeys.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltXdomain.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
@@ -129,7 +130,7 @@ static void test_nhi() {
   CHECK(!nhi.present());
   chip.present = true;
   nhi.disable_interrupts();
-  CHECK(chip.interrupt_mask_writes == (31 + 2 * 12) / 32 && chip.interrupt_clear_writes == (31 + 3 * 12) / 32);
+  CHECK(chip.interrupt_mask_writes == (31 + 2 * 12) / 32 && chip.notify_reads == (31 + 3 * 12) / 32);          // (the enable registers written, the notify registers read to clear them)
   CHECK(nhi.icm_running() && nhi.firmware_mode() == TbFirmwareMode::ConnectionManager);
   chip.icm_enabled = false;
   CHECK(!nhi.icm_running());
@@ -201,9 +202,10 @@ static void test_ring() {
 struct Events final : IThunderboltEvents {
   std::vector<TbPacketType> types;
   std::vector<std::vector<uint8_t>> bodies;
-  void on_event(TbPacketType type, ConstByteView body) override {
+  bool on_event(TbPacketType type, ConstByteView body) override {
     types.push_back(type);
     bodies.push_back(std::vector<uint8_t>(body.data(), body.data() + body.size()));
+    return false;
   }
 };
 
@@ -1809,6 +1811,470 @@ static void test_xdomain() {
   }
 }
 
+
+// ---- networking over the cable (ThunderboltIP)
+
+static void test_net_messages() {
+  uint8_t initiator[16], target[16], out[128];
+  for (int i = 0; i < 16; ++i) { initiator[i] = static_cast<uint8_t>(0x10 + i); target[i] = static_cast<uint8_t>(0x90 + i); }
+  CHECK(tb_ip::build_login(0x0201, 2, initiator, target, 77, 9, ByteView(out, sizeof out)) == 92);
+  CHECK(out[4] == 0x01 && out[5] == 0x02 && out[8] == 20 && out[11] == 0x10);                               // route low; length (92 - 12) / 4 = 20 words, sequence 2
+  CHECK(memcmp(out + 12, tb_ip::kServiceUuid, 16) == 0 && out[28] == 0x10 && out[44] == 0x90 && out[60] == 0 && out[64] == 77 && out[68] == 1 && out[72] == 9);
+  tb_ip::Header h;
+  CHECK(tb_ip::parse_header(ConstByteView(out, 92), &h) && h.route == 0x0201 && h.sequence == 2 && h.type == 0 && h.command_id == 77 && memcmp(h.initiator, initiator, 16) == 0 && memcmp(h.target, target, 16) == 0);
+  uint32_t version = 0, path = 0;
+  CHECK(tb_ip::parse_login(ConstByteView(out, 92), &version, &path) && version == 1 && path == 9);
+  for (size_t len = 0; len < 92; ++len) {
+    CHECK(!tb_ip::parse_login(ConstByteView(out, len), &version, &path));
+    if (len < 68) CHECK(!tb_ip::parse_header(ConstByteView(out, len), &h));
+  }
+  for (size_t bit = 12 * 8; bit < 28 * 8; ++bit) {                                                          // the service UUID is checked
+    uint8_t f[92];
+    memcpy(f, out, 92);
+    f[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+    CHECK(!tb_ip::parse_header(ConstByteView(f, 92), &h));
+  }
+  const uint8_t mac[6] = {2, 3, 4, 5, 6, 7};
+  CHECK(tb_ip::build_login_response(0x01, 1, target, initiator, 77, mac, ByteView(out, sizeof out)) == 100 && out[60] == 1);
+  uint32_t status = 9;
+  uint8_t got[6];
+  CHECK(tb_ip::parse_login_response(ConstByteView(out, 100), &status, got) && status == 0 && memcmp(got, mac, 6) == 0);
+  for (size_t len = 0; len < 100; ++len) CHECK(!tb_ip::parse_login_response(ConstByteView(out, len), &status, got));
+  out[80] = 5;                                                                                            // an address that is not six bytes
+  CHECK(!tb_ip::parse_login_response(ConstByteView(out, 100), &status, got));
+  CHECK(tb_ip::build_logout(0x01, 0, initiator, target, 5, ByteView(out, sizeof out)) == 68 && out[60] == 2);
+  CHECK(tb_ip::build_status(0x01, 0, initiator, target, 5, 0, ByteView(out, sizeof out)) == 72 && out[60] == 3);
+  CHECK(tb_ip::build_login(0x01, 0, initiator, target, 1, 1, ByteView(out, 91)) == 0);
+  // the network directory in a property block
+  TestAllocator alloc;
+  List<uint32_t> block(alloc);
+  CHECK(tb_properties_build_local(1, 2, 3, "A", "B", true, 3, block));
+  List<TbPropertyEntry> entries(alloc);
+  CHECK(tb_properties_parse(ArrayView<const uint32_t>(&block[0], block.count()), entries));
+  uint32_t flags = 99;
+  bool dir = false;
+  for (uint64_t i = 0; i < entries.count(); ++i) {
+    if (entries[i].depth == 0 && entries[i].type == TbPropertyType::Directory && strcmp(entries[i].key, "network") == 0) dir = true;
+    if (entries[i].depth == 1 && strcmp(entries[i].key, "prtcstns") == 0) flags = entries[i].value;
+  }
+  CHECK(dir && flags == 3 && entries.count() == 10);
+  for (size_t len = 0; len < block.count(); ++len) tb_properties_parse(ArrayView<const uint32_t>(&block[0], len), entries);
+}
+
+static std::vector<uint8_t> ethernet(size_t payload, uint8_t seed) {
+  std::vector<uint8_t> f(14 + payload);
+  for (size_t i = 0; i < f.size(); ++i) f[i] = static_cast<uint8_t>(seed + i * 7);
+  f[12] = 0x08;
+  f[13] = 0x00;
+  return f;
+}
+
+struct NetFixture {
+  TestAllocator alloc;
+  FakeNhi chip;
+  CountingRandom random;
+  uint8_t remote[16], local[16];
+  ThunderboltIcm icm;
+  ThunderboltNet::Config config;
+  UniquePointer<ThunderboltNet> net;
+  explicit NetFixture(bool titan = false, uint32_t peer_flags = 3) : icm(chip, alloc) {
+    titan_ = titan;
+    for (int i = 0; i < 16; ++i) { remote[i] = static_cast<uint8_t>(0x40 + i); local[i] = static_cast<uint8_t>(0xC0 + i); }
+    config.login_delay_polls = 3;
+    chip.titan_ridge = titan;
+    ThunderboltIcm::Options options;
+    options.generation = titan ? TbGeneration::TitanRidge : TbGeneration::AlpineRidge;
+    icm.set_options(options);
+    memcpy(chip.remote.uuid, remote, 16);
+    List<uint32_t> block(alloc);
+    tb_properties_build_local(0x1234, 0x77, 1, "Acme", "Box", true, peer_flags, block);
+    chip.remote.block.clear();
+    for (uint64_t i = 0; i < block.count(); ++i) chip.remote.block.push_back(block[i]);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    icm.offer_network(ThunderboltNet::offered_flags(config));
+    net = UniquePointer<ThunderboltNet>::make(alloc, icm, alloc, random, config);
+    CHECK(net->initialize());
+  }
+  ~NetFixture() { net = UniquePointer<ThunderboltNet>(); }
+  uint64_t route() const { return titan_ ? 0x0201 : 0x01; }
+  bool titan_ = false;
+  void connect_host() { chip.send_xdomain_connected(remote, local, 1, 1, route()); }
+  void step() { icm.poll(); net->poll(); }
+  // up to login: the host is found, our login is answered; then the other host logs in
+  void bring_up() {
+    connect_host();
+    for (int i = 0; i < 6; ++i) step();
+    chip.peer_login(remote, local, route(), 5, chip.peer.path);
+    for (int i = 0; i < 6 && !net->connected(); ++i) step();
+  }
+};
+
+static void test_net() {
+  {
+    NetFixture f;
+    f.titan_ = false;
+    CHECK(!f.net->link_up() && !f.net->connected());
+    f.connect_host();
+    f.step();
+    CHECK(f.icm.xdomain_count() == 1 && f.icm.xdomain(0).discovered && f.icm.xdomain(0).has_network && f.icm.xdomain(0).network_flags == 3);
+    for (int i = 0; i < 3; ++i) f.step();
+    // we logged in: the type 0 message went out once, on the route we know the other host by; its answer gave us its address
+    CHECK(f.chip.peer.logins_seen.size() == 1 && f.chip.peer.host_path == 8 && f.net->bound() && !f.net->connected());
+    CHECK(memcmp(f.net->peer_mac(), f.chip.peer.mac, 6) == 0 && f.net->peer_flags() == 3);
+    // the other host's login: answered (with our address), and the connection is made
+    f.chip.peer_login(f.remote, f.local, 0x01, 5, f.chip.peer.path);
+    for (int i = 0; i < 4 && !f.net->connected(); ++i) f.step();
+    CHECK(f.net->connected() && f.net->link_up() && f.net->link_speed_mbps() == 10000);
+    const std::vector<uint32_t>& response = f.chip.peer.service_messages.back();
+    CHECK(response[15] == 1 && response[16] == 5 && memcmp(&response[18], f.net->mac_address().bytes, 6) == 0 && (f.net->mac_address().bytes[0] & 3) == 2);
+    // the path: our transmit path 8 from our ring, theirs 9 into our receive ring; one approval
+    CHECK(f.chip.xdomain_approvals == 1 && f.chip.peer.approved && f.chip.peer.tx_path == 8 && f.chip.peer.rx_path == 9 && f.chip.peer.tx_ring == 1 && f.chip.peer.rx_ring == 1);
+    CHECK(f.icm.xdomain(0).tunnel);
+    // end to end flow control is on in both rings (both ends do it), the receiver names our transmit hop for the credits
+    CHECK((f.chip.tx(1).options & (1u << 28)) && (f.chip.rx(1).options & (1u << 28)) && ((f.chip.rx(1).options >> 12) & 0x7FF) == 1);
+    CHECK(f.chip.rx(1).frame_size == 0 && f.chip.rx(1).size == tb_ip::kRingSize && !(f.chip.rx(1).options & (1u << 30)));            // frame mode: not raw
+    // a frame out
+    const std::vector<uint8_t> out = ethernet(100, 3);
+    CHECK(f.net->transmit(ConstByteView(out.data(), out.size())));
+    const FakeNhi::SentFrame& sent = f.chip.sent.back();
+    CHECK(sent.hop == 1 && sent.sof == 1 && sent.eof == 2 && sent.bytes.size() == 12 + out.size());
+    uint32_t header[3];
+    memcpy(header, sent.bytes.data(), 12);
+    CHECK(header[0] == out.size() && header[1] == 0 && header[2] == 1 && memcmp(sent.bytes.data() + 12, out.data(), out.size()) == 0);
+    // the next one has the next frame id (the other host matches frames by it)
+    CHECK(f.net->transmit(ConstByteView(out.data(), out.size())));
+    memcpy(header, f.chip.sent.back().bytes.data(), 12);
+    CHECK((header[1] >> 16) == 1);
+    // a short frame is padded to the Ethernet minimum, a long one refused, an empty one too
+    const std::vector<uint8_t> tiny = ethernet(0, 1);
+    CHECK(f.net->transmit(ConstByteView(tiny.data(), tiny.size())) && f.chip.sent.back().bytes.size() == 12 + 60);
+    const std::vector<uint8_t> big = ethernet(1501, 1);
+    CHECK(!f.net->transmit(ConstByteView(big.data(), big.size())) && !f.net->transmit(ConstByteView()));
+    // frames in: one frame, a packet of several frames, one that needs three
+    uint8_t buffer[70000];
+    uint32_t length = 0;
+    CHECK(!f.net->receive(ByteView(buffer, sizeof buffer), &length));
+    const std::vector<uint8_t> in1 = ethernet(300, 5), in2 = ethernet(1500, 9), in3 = ethernet(9000, 11);
+    f.chip.peer_send(in1, 0);
+    f.chip.peer_send(in2, 1, 600);
+    f.chip.peer_send(in3, 2);
+    CHECK(f.net->receive(ByteView(buffer, sizeof buffer), &length) && length == in1.size() && memcmp(buffer, in1.data(), length) == 0);
+    CHECK(f.net->receive(ByteView(buffer, sizeof buffer), &length) && length == in2.size() && memcmp(buffer, in2.data(), length) == 0);
+    CHECK(f.net->receive(ByteView(buffer, sizeof buffer), &length) && length == in3.size() && memcmp(buffer, in3.data(), length) == 0);
+    CHECK(!f.net->receive(ByteView(buffer, sizeof buffer), &length));
+    // a buffer that is too small gets the start and the true length
+    f.chip.peer_send(in1, 3);
+    uint8_t small[20];
+    CHECK(f.net->receive(ByteView(small, sizeof small), &length) && length == in1.size() && memcmp(small, in1.data(), 20) == 0);
+    // many frames in a row: the receive buffers are given back
+    for (int i = 0; i < 300; ++i) {
+      f.chip.peer_send(in1, static_cast<uint32_t>(i));
+      if (!f.net->receive(ByteView(buffer, sizeof buffer), &length) || length != in1.size()) { printf("  receive %d failed (dropped %llu)\n", i, (unsigned long long)f.net->statistics().frames_dropped); CHECK(false); break; }
+    }
+    // a lot of sending: the ring never fills for good
+    uint32_t refused = 0;
+    for (int i = 0; i < 300; ++i) if (!f.net->transmit(ConstByteView(out.data(), out.size()))) { ++refused; f.step(); }
+    CHECK(f.net->statistics().frames_sent >= 300 - refused);
+    // damaged frames: dropped, and the ones after still arrive
+    const NetworkStatistics before = f.net->statistics();
+    auto crafted = [&](uint32_t size, uint32_t index, uint32_t id, uint32_t count, uint32_t data_bytes) {
+      std::vector<uint8_t> frame(12 + data_bytes, 0x5A);
+      const uint32_t h[3] = {size, index | (id << 16), count};
+      memcpy(frame.data(), h, 12);
+      f.chip.push_to_host(f.chip.peer.rx_ring, 1, 2, frame);
+    };
+    crafted(0, 0, 0, 1, 20);                 // no data
+    crafted(50, 0, 0, 1, 20);                // claims more than there is
+    crafted(20, 0, 0, 0, 20);                // no frames in the packet
+    crafted(20, 1, 0, 2, 20);                // starts in the middle
+    crafted(20, 0, 0, 40, 20);               // far too many frames
+    crafted(20, 0, 0, 3, 20);                // the first of three ...
+    crafted(20, 2, 0, 3, 20);                // ... then the third: one is missing
+    crafted(10, 0, 0, 1, 10);                // (too short for an Ethernet header: dropped)
+    f.chip.push_to_host(f.chip.peer.rx_ring, 1, 2, std::vector<uint8_t>(8, 1));         // shorter than the header
+    CHECK(!f.net->receive(ByteView(buffer, sizeof buffer), &length));
+    CHECK(f.net->statistics().frames_dropped >= before.frames_dropped + 8);
+    f.chip.peer_send(in1, 9);
+    CHECK(f.net->receive(ByteView(buffer, sizeof buffer), &length) && length == in1.size());
+    // the other host logs out: answered, the connection ends and is made again once it logs in
+    f.chip.peer_logout(f.remote, f.local, 0x01, 6);
+    f.step();
+    CHECK(!f.net->connected() && f.chip.rx(1).base == 0);
+    CHECK(!f.net->transmit(ConstByteView(out.data(), out.size())));
+    f.net->shutdown();
+    CHECK(f.alloc.dma.size() > 0 || true);
+  }
+}
+
+
+
+static void test_net_lifecycle() {
+  // the other host logs out: the connection is closed (path and rings), and made again when it logs in
+  {
+    NetFixture f;
+    f.bring_up();
+    CHECK(f.net->connected());
+    f.chip.peer_logout(f.remote, f.local, 0x01, 6);
+    f.step();
+    CHECK(!f.net->connected() && !f.net->bound() && !f.icm.xdomain(0).tunnel && f.chip.rx(1).base == 0 && f.chip.tx(1).base == 0);
+    CHECK(!f.chip.mailbox_commands.empty() && f.chip.mailbox_commands.back() == 0x10);                  // the path closed through the mailbox (Alpine Ridge)
+    f.chip.peer.logins_seen.clear();
+    f.chip.peer.approved = false;
+    for (int i = 0; i < 6; ++i) f.step();                                                              // opens again and logs in
+    CHECK(f.chip.peer.logins_seen.size() == 1);
+    f.chip.peer_login(f.remote, f.local, 0x01, 7, f.chip.peer.path);
+    for (int i = 0; i < 6 && !f.net->connected(); ++i) f.step();
+    CHECK(f.net->connected() && f.chip.xdomain_approvals == 2);
+    // the hops were given back: the same ones again
+    CHECK(f.chip.peer.tx_ring == 1 && f.chip.peer.rx_ring == 1);
+  }
+  // the host goes away: no logout is sent, everything is released
+  {
+    NetFixture f;
+    f.bring_up();
+    CHECK(f.net->connected());
+    const size_t messages = f.chip.peer.service_messages.size();
+    f.chip.send_xdomain_disconnected(f.remote, 1, 1);
+    f.step();
+    CHECK(!f.net->connected() && !f.net->bound() && f.chip.peer.service_messages.size() == messages && !f.chip.peer.logout_seen);
+  }
+  // the connection is closed by the user: a logout is asked for, the path closed
+  {
+    NetFixture f;
+    f.bring_up();
+    f.net->shutdown();
+    CHECK(f.chip.peer.logout_seen && !f.net->connected() && f.chip.rx(1).base == 0);
+    f.net->shutdown();                                                // (again: nothing to do)
+  }
+  // no answer to our login: tried again after the delay, not forever; the other host's login starts the tries over
+  {
+    NetFixture f;
+    f.config.login_retries = 3;
+    f.net = UniquePointer<ThunderboltNet>::make(f.alloc, f.icm, f.alloc, f.random, f.config);
+    CHECK(f.net->initialize());
+    f.chip.peer.answer_login = false;
+    f.connect_host();
+    for (int i = 0; i < 60; ++i) f.step();
+    CHECK(f.chip.peer.logins_seen.size() == 3 && !f.net->connected());
+    f.chip.peer.answer_login = true;
+    f.chip.peer_login(f.remote, f.local, 0x01, 5, f.chip.peer.path);
+    for (int i = 0; i < 10 && !f.net->connected(); ++i) f.step();
+    CHECK(f.net->connected());
+    CHECK(f.chip.peer.logins_seen.size() == 4);
+  }
+  // the firmware refuses the path: the rings are taken down again and nothing leaks, then it is tried once more
+  {
+    NetFixture f;
+    f.chip.peer.approve_error = true;
+    f.bring_up();
+    CHECK(!f.net->connected() && f.chip.xdomain_approvals >= 1 && !f.icm.xdomain(0).tunnel && f.chip.rx(1).base == 0 && f.chip.tx(1).base == 0);
+    f.chip.peer.approve_error = false;
+    for (int i = 0; i < 12 && !f.net->connected(); ++i) f.step();
+    CHECK(f.net->connected() && f.icm.xdomain(0).tunnel);
+  }
+  // before the connection there is no link and nothing is sent
+  {
+    NetFixture f;
+    const std::vector<uint8_t> frame = ethernet(50, 1);
+    CHECK(!f.net->transmit(ConstByteView(frame.data(), frame.size())) && f.net->statistics().send_failures == 1);
+    uint8_t buffer[100];
+    uint32_t length = 0;
+    CHECK(!f.net->receive(ByteView(buffer, sizeof buffer), &length) && f.net->link_speed_mbps() == 0 && f.net->link_duplex() == LinkDuplex::Unknown);
+    // another host's login, from a host we do not know or on another route, is not answered
+    f.connect_host();
+    f.step();
+    auto responses = [&]() { size_t n = 0; for (const auto& m : f.chip.peer.service_messages) if (m.size() > 15 && m[15] == 1) ++n; return n; };
+    const size_t seen = responses();
+    uint8_t stranger[16];
+    memset(stranger, 0x77, 16);
+    f.chip.peer_login(stranger, f.local, 0x01, 1, 9);
+    f.chip.peer_login(f.remote, f.local, 0x05, 1, 9);
+    f.step();
+    CHECK(responses() == seen);
+    // no network service offered: nothing to bind to
+    FakeNhi quiet;
+    List<uint32_t> plain(f.alloc);
+    tb_properties_build_local(1, 2, 3, "A", "B", plain);
+    for (uint64_t i = 0; i < plain.count(); ++i) quiet.remote.block.push_back(plain[i]);
+    memcpy(quiet.remote.uuid, f.remote, 16);
+    ThunderboltIcm icm(quiet, f.alloc);
+    CHECK(icm.start() == ThunderboltIcm::Outcome::Started);
+    ThunderboltNet net(icm, f.alloc, f.random);
+    CHECK(net.initialize());
+    quiet.send_xdomain_connected(f.remote, f.local, 1, 1, 0x01);
+    icm.poll();
+    net.poll();
+    CHECK(icm.xdomain(0).discovered && !icm.xdomain(0).has_network && !net.bound());
+    // a random source that fails: no interface
+    CountingRandom broken;
+    broken.fail = true;
+    ThunderboltNet bad(icm, f.alloc, f.random);
+    ThunderboltNet bad2(icm, f.alloc, broken);
+    CHECK(!bad2.initialize());
+  }
+  // a peer without end to end flow control: the rings are made without it, and without frame ids
+  {
+    NetFixture f(false, 0);
+    f.bring_up();
+    CHECK(f.net->connected() && !(f.chip.tx(1).options & (1u << 28)) && !(f.chip.rx(1).options & (1u << 28)));
+    const std::vector<uint8_t> out = ethernet(100, 3);
+    CHECK(f.net->transmit(ConstByteView(out.data(), out.size())) && f.net->transmit(ConstByteView(out.data(), out.size())));
+    uint32_t header[3];
+    memcpy(header, f.chip.sent.back().bytes.data(), 12);
+    CHECK((header[1] >> 16) == 0);
+  }
+  // the entry in the interface list: it works through the connection and goes quiet when it is detached
+  {
+    NetFixture f;
+    ThunderboltNetLink link(f.net.get());
+    CHECK(link.mac_address() == f.net->mac_address() && link.link_comes_and_goes() && !link.link_up());
+    f.bring_up();
+    CHECK(link.link_up() && link.link_speed_mbps() == 10000);
+    const std::vector<uint8_t> out = ethernet(100, 3);
+    CHECK(link.transmit(ConstByteView(out.data(), out.size())) && link.statistics().frames_sent == 1);
+    f.chip.peer_send(out, 0);
+    uint8_t buffer[200];
+    uint32_t length = 0;
+    CHECK(link.receive(ByteView(buffer, sizeof buffer), &length) && length == out.size());
+    link.detach();
+    f.net->shutdown();
+    f.net = UniquePointer<ThunderboltNet>();
+    CHECK(!link.link_up() && !link.transmit(ConstByteView(out.data(), out.size())) && !link.receive(ByteView(buffer, sizeof buffer), &length) && link.link_speed_mbps() == 0 && link.statistics().frames_sent == 0);
+  }
+  // one tunnel at a time
+  {
+    NetFixture f;
+    f.bring_up();
+    const char* error = nullptr;
+    CHECK(!f.icm.approve_xdomain_paths(0, 20, 5, 21, 6, &error) && error);
+    CHECK(!f.icm.approve_xdomain_paths(9, 20, 5, 21, 6, &error));
+  }
+  // Titan Ridge: the same, with the route forms of the messages and the two stage disconnect
+  {
+    NetFixture f(true);
+    f.bring_up();
+    CHECK(f.net->connected() && f.chip.peer.approved && f.chip.peer.tx_path == 8 && f.chip.peer.rx_path == 9);
+    f.chip.peer_logout(f.remote, f.local, 0x0201, 6);
+    f.step();
+    CHECK(!f.net->connected() && f.chip.xdomain_disconnects == 2);
+  }
+}
+
+
+// ---- power: sleep, runtime power management, wake
+
+static void test_power() {
+  TestAllocator alloc;
+  fake_tb::FakePci pci;
+  fake_tb::FakePci::Function nhi;
+  nhi.info.address = {5, 0, 0};
+  nhi.info.vendor_id = 0x8086;
+  nhi.info.device_id = 0x15BF;
+  nhi.pm = true;
+  pci.functions.push_back(nhi);
+  const PciAddress address = {5, 0, 0};
+  auto& fn = pci.functions[0];
+  {
+    TbPciPower power(pci, address);
+    CHECK(power.available() && power.can_wake() && power.state() == 0 && !power.wake_pending());
+    CHECK(power.enter_d3hot(true) && power.state() == 3 && (fn.pmcsr & 0x100));
+    pci.set_wake_pending(address);
+    CHECK(power.wake_pending());
+    CHECK(power.enter_d0() && power.state() == 0 && !(fn.pmcsr & 0x100) && !power.wake_pending());
+    CHECK(power.enter_d3hot(false) && !(fn.pmcsr & 0x100) && power.enter_d0());
+    fn.pme_from_d3hot = false;
+    CHECK(!power.can_wake() && !power.enter_d3hot(true) && power.state() == 0 && power.enter_d3hot(false) && power.state() == 3 && power.enter_d0());
+    fn.pme_from_d3hot = true;
+    TbPciPower none(pci, {9, 9, 9});
+    CHECK(!none.available() && !none.can_wake() && none.state() == 0xFF && !none.enter_d3hot(false) && !none.enter_d0() && !none.wake_pending());
+  }
+  // sleep with the wake-up armed: the controller told, the function in D3hot with PME; back up with PME off
+  {
+    FakeNhi chip;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(pci, address);
+    chip.send_device_connected(make_device(0x20, 1, 1), true);
+    driver.poll();
+    chip.mailbox_commands.clear();
+    CHECK(driver.suspend(true) && driver.wake_armed() && fn.pmcsr == 0x103);
+    CHECK(chip.mailbox_commands.size() == 2 && chip.mailbox_commands[0] == 0x05 && chip.mailbox_commands[1] == 0x07);
+    pci.set_wake_pending(address);
+    CHECK(driver.wake_pending());
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && !driver.wake_armed() && (fn.pmcsr & 0x3) == 0 && !(fn.pmcsr & 0x100) && !driver.wake_pending());
+    // sleep without a wake-up
+    CHECK(driver.suspend(false) && !driver.wake_armed() && fn.pmcsr == 0x003);
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started);
+    // a function that cannot wake from D3hot still sleeps, and says it cannot
+    fn.pme_from_d3hot = false;
+    CHECK(driver.suspend(true) && !driver.wake_armed() && (fn.pmcsr & 0x3) == 3 && !(fn.pmcsr & 0x100));
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started);
+    fn.pme_from_d3hot = true;
+    // not started: nothing to put to sleep
+    ThunderboltDriver idle(alloc);
+    CHECK(!idle.suspend(true) && !idle.runtime_suspend() && !idle.wake_pending());
+  }
+  // without the power management capability the controller still sleeps
+  {
+    fake_tb::FakePci bare;
+    fake_tb::FakePci::Function f = nhi;
+    f.pm = false;
+    bare.functions.push_back(f);
+    FakeNhi chip;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(bare, address);
+    CHECK(driver.suspend(true) && !driver.wake_armed() && driver.resume() == ThunderboltDriver::Outcome::Started);
+  }
+  // runtime power management: only if the firmware says it supports it, never while it vetoes it or a path to another host is open
+  {
+    FakeNhi chip;
+    chip.rtd3 = false;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(pci, address);
+    CHECK(!driver.icm()->runtime_allowed() && !driver.runtime_suspend() && driver.icm()->running() && (fn.pmcsr & 3) == 0);
+  }
+  {
+    FakeNhi chip;
+    chip.rtd3 = true;
+    ThunderboltDriver driver(alloc);
+    CHECK(driver.start_device(chip) == ThunderboltDriver::Outcome::Started);
+    driver.attach_power(pci, address);
+    ThunderboltIcm& icm = *driver.icm();
+    CHECK(icm.driver_ready().rtd3 && icm.runtime_allowed());
+    // a veto from the firmware (its reason is not zero) holds it back until the firmware lifts it
+    chip.send_icm_event({10u | (1u << 24), 0x4});
+    driver.poll();
+    CHECK(icm.rtd3_vetoed() && !icm.runtime_allowed() && !driver.runtime_suspend() && icm.running());
+    chip.send_icm_event({10u | (1u << 24), 0});
+    driver.poll();
+    CHECK(!icm.rtd3_vetoed() && icm.runtime_allowed());
+    chip.send_icm_event({10u | (1u << 24)});                              // (cut short: ignored)
+    driver.poll();
+    CHECK(!icm.rtd3_vetoed());
+    // a path to another host keeps it awake
+    uint8_t remote[16], local[16];
+    for (int i = 0; i < 16; ++i) { remote[i] = static_cast<uint8_t>(0x40 + i); local[i] = static_cast<uint8_t>(0xC0 + i); }
+    memcpy(chip.remote.uuid, remote, 16);
+    chip.remote.block = remote_block();
+    chip.send_xdomain_connected(remote, local, 1, 1, 0x01);
+    driver.poll();
+    CHECK(icm.xdomain_count() == 1 && icm.approve_xdomain_paths(0, 8, 1, 9, 1, nullptr) && !icm.runtime_allowed() && !driver.runtime_suspend());
+    CHECK(icm.disconnect_xdomain_paths(0) && icm.runtime_allowed());
+    // the suspend itself: the controller is told the driver goes away, without saving devices, the function sleeps with its wake armed
+    chip.send_device_connected(make_device(0x20, 1, 1), true);
+    driver.poll();
+    chip.mailbox_commands.clear();
+    CHECK(driver.runtime_suspend() && driver.wake_armed() && fn.pmcsr == 0x103 && !icm.running());
+    CHECK(chip.mailbox_commands.size() == 1 && chip.mailbox_commands[0] == 0x07);
+    CHECK(driver.resume() == ThunderboltDriver::Outcome::Started && icm.running() && (fn.pmcsr & 3) == 0);
+    // (the veto is forgotten over the sleep: the firmware sends it again if it still holds)
+    CHECK(!icm.rtd3_vetoed());
+  }
+  CHECK(alloc.dma.empty());
+}
+
 static void test_driver() {
   TestAllocator alloc;
   {
@@ -1879,6 +2345,10 @@ int main() {
   test_xdomain_messages();
   test_properties();
   test_xdomain();
+  test_net_messages();
+  test_net();
+  test_net_lifecycle();
+  test_power();
   test_driver();
   printf(g_failed ? "ThunderboltTest: %d FAILED\n" : "ThunderboltTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;

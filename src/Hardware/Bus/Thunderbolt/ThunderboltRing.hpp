@@ -49,6 +49,10 @@ class TbNhi {
 
   // Masks every ring interrupt and clears the pending bits (nhi_disable_interrupts, for a chip without the auto-clear quirk).
   void disable_interrupts();
+  // Hop numbers for the rings of data paths (hop 0 is the control channel). Returns the lowest free hop from 1 up, or -1 if there is none; the two directions are counted apart.
+  int allocate_hop(bool transmit);
+  void release_hop(bool transmit, uint32_t hop);
+
   // Unmasks (or masks again) the interrupts of one ring of the control channel, hop 0: the transmit ring's bit is the hop, the receive ring's the hop plus the number of hops.
   void set_control_interrupts(bool on);
   // What the interrupt handler does: reads all the notify registers, which is what lets the chip raise the next interrupt (they are read-to-clear, even those of rings that are masked).
@@ -64,7 +68,8 @@ class TbNhi {
 
  private:
   ITbRegisters& registers_;
-  uint32_t interrupt_mask_[64] = {};          // what is unmasked, as the chip's registers cannot be read back
+  uint32_t interrupt_mask_[64] = {};
+  uint32_t hops_used_[2][32] = {};            // [transmit][hop / 32]          // what is unmasked, as the chip's registers cannot be read back
 };
 
 // A finished descriptor.
@@ -80,6 +85,13 @@ class TbRing {
   static constexpr uint32_t kDescriptorBytes = 16;
   static constexpr uint16_t kDescPosted = 0x4, kDescCompleted = 0x2, kDescInterrupt = 0x8, kDescCrcError = 0x1, kDescOverrun = 0x4;
 
+  // How a ring carries its frames. The control channel uses the raw mode (EOF / SOF are the packet type, every frame carries its own CRC). A data ring uses the frame mode: the buffer is
+  // up to 4096 bytes, SOF and EOF mark the first and last frame of what the sender calls a packet, and the chip checks the CRC itself. End to end flow control makes the receiver give the
+  // sender credits (on the receive ring's `e2e_tx_hop`, the hop of the transmit ring of the same connection).
+  struct Mode {
+    bool frame = false, e2e = false;
+    uint32_t e2e_tx_hop = 0;
+  };
   TbRing(ITbRegisters& registers, allocators::IAllocator& allocator, uint32_t hop, bool transmit, uint32_t size)
       : registers_(registers), allocator_(allocator), hop_(hop), transmit_(transmit), size_(size) {}
   ~TbRing() { stop(); }
@@ -88,6 +100,7 @@ class TbRing {
 
   // Allocates the descriptors and enables the ring. A receive ring takes frames of up to `frame_bytes` (256 is the smallest; 0 means 4096) whose SOF / EOF are in the masks.
   bool start(uint32_t frame_bytes, uint16_t sof_mask, uint16_t eof_mask);
+  bool start(const Mode& mode, uint16_t sof_mask, uint16_t eof_mask);
   // Disables the ring and frees the descriptors; frames in flight are dropped.
   void stop();
   bool running() const { return descriptors_.size() != 0; }
@@ -104,6 +117,7 @@ class TbRing {
   uint32_t size() const { return size_; }
 
  private:
+  bool start_ring(const Mode& mode, uint32_t frame_bytes, uint16_t sof_mask, uint16_t eof_mask);
   bool post(uint64_t bus, uint32_t word);
   uint32_t ring_base() const { return (transmit_ ? tb_reg::kTxRingBase : tb_reg::kRxRingBase) + hop_ * 16; }
   uint32_t options_base() const { return (transmit_ ? tb_reg::kTxOptionsBase : tb_reg::kRxOptionsBase) + hop_ * 32; }
@@ -115,6 +129,7 @@ class TbRing {
   uint32_t size_;
   ArrayView<uint32_t> descriptors_;     // kDescriptorBytes / 4 words per descriptor
   uint32_t head_ = 0, tail_ = 0;
+  bool frame_mode_ = false;
 };
 
 }  // namespace hardware

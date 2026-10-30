@@ -220,6 +220,10 @@ void TbControl::handle(const TbCompletion& completion, IThunderboltEvents* event
     case TbPacketType::IcmEvent:
       if (events) events->on_event(type, body);
       return;
+    case TbPacketType::XdomainResponse:
+      // (a service's own messages come in as responses too: its handler first, then the request that waits)
+      if (events && events->on_event(type, body)) return;
+      break;
     default:
       break;
   }
@@ -248,7 +252,7 @@ TbControl::Result TbControl::wait(uint32_t timeout_us, IThunderboltEvents* event
   }
 }
 
-TbControl::Result TbControl::xdomain_request(ConstByteView request, ByteView response, uint32_t* received, uint32_t timeout_us, IThunderboltEvents* events) {
+TbControl::Result TbControl::xdomain_request(ConstByteView request, ByteView response, uint32_t* received, uint32_t timeout_us, IThunderboltEvents* events, TbPacketType send_as) {
   if (!running_) return Result::NotRunning;
   if (request.size() < 12 || request.size() % 4 != 0) return Result::Failed;
   const uint64_t route = (static_cast<uint64_t>(load_le32(request, 0)) << 32) | load_le32(request, 4);
@@ -258,7 +262,7 @@ TbControl::Result TbControl::xdomain_request(ConstByteView request, ByteView res
   pending_.route = route & ~(1ull << 63);
   pending_.seq = static_cast<uint8_t>((load_le32(request, 8) >> 27) & 3);
   pending_.out = response;
-  if (!send(TbPacketType::XdomainRequest, request)) {
+  if (!send(send_as, request)) {
     pending_ = Pending();
     return Result::Failed;
   }

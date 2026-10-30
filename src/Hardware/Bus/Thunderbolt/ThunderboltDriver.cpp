@@ -36,6 +36,7 @@ ThunderboltDriver::Outcome ThunderboltDriver::start(IPciBus& pci, const PciDevic
   if (!base || !mapper.map_registers(base, kRegisterBytes, &region)) return outcome_ = Outcome::BarUnmapped;
   mmio_ = UniquePointer<MmioTbRegisters>::make(allocator_, region);
   if (!mmio_) return outcome_ = Outcome::OutOfMemory;
+  attach_power(pci, device.address);
   // the controller's own registers through the switch's upstream port, if it has them
   PciAddress upstream;
   if (tb_find_upstream_port(pci, device, &upstream)) {
@@ -60,14 +61,28 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
   return outcome_ = result == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
 }
 
+bool ThunderboltDriver::sleep(bool wake, bool runtime) {
+  if (!icm_ || !(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
+  wake_armed_ = false;
+  if (power_ && power_->available()) {
+    // (a wake that cannot be armed still lets the function sleep)
+    wake_armed_ = wake && power_->enter_d3hot(true);
+    if (!wake_armed_) power_->enter_d3hot(false);
+  }
+  return true;
+}
+
 ThunderboltDriver::Outcome ThunderboltDriver::resume() {
   if (!icm_) return outcome_;
+  if (power_ && power_->available()) power_->enter_d0();
+  wake_armed_ = false;
   return outcome_ = icm_->resume() == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
 }
 
 void ThunderboltDriver::stop() {
   icm_ = UniquePointer<ThunderboltIcm>();
   cio_ = UniquePointer<TbPcie2Cio>();
+  power_ = UniquePointer<TbPciPower>();
   upstream_config_ = UniquePointer<PciFunctionConfig>();
   mmio_ = UniquePointer<MmioTbRegisters>();
   outcome_ = Outcome::NotStarted;

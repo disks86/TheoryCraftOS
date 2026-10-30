@@ -96,6 +96,7 @@
 #ifdef TCOS_THUNDERBOLT
 #include "Hardware/Bus/Pci/PciMsi.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDriver.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltNet.hpp"
 #include "Kernel/Apic.hpp"
 #include "Kernel/Interrupts.hpp"
 #endif
@@ -1167,6 +1168,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // of it has run on a real controller.
     UniquePointer<hardware::ThunderboltDriver> thunderbolt;
     UniquePointer<hardware::FileTbKeyStore> thunderbolt_keys;       // the keys of devices approved at the secure level
+    UniquePointer<hardware::ThunderboltNet> thunderbolt_net;        // networking to another host on the cable (after the driver: it goes first)
+    hardware::ThunderboltNetLink* thunderbolt_link = nullptr;       // its entry in the list of network interfaces, which outlives them both
     uint64_t thunderbolt_devices = 0;
     UniquePointer<hardware::PciMsi> thunderbolt_msi;                // its MSI, when the machine delivers it
     bool thunderbolt_msi_working = false;                           // an interrupt arrived in the start-up check: the loop reads the channel only when one comes
@@ -1201,6 +1204,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
               thunderbolt_msi = UniquePointer<hardware::PciMsi>();
               kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
             }
+          }
+          // networking to another host: offered in our properties, an interface for the network stack that gets an address when the cable's other end answers
+          thunderbolt_net = UniquePointer<hardware::ThunderboltNet>::make(shared_allocator, *thunderbolt->icm(), shared_allocator, smb_random);
+          if (thunderbolt_net && thunderbolt->icm()->offer_network(hardware::ThunderboltNet::offered_flags(hardware::ThunderboltNet::Config())) && thunderbolt_net->initialize()) {
+            UniquePointer<hardware::ThunderboltNetLink> link = UniquePointer<hardware::ThunderboltNetLink>::make(shared_allocator, thunderbolt_net.get());
+            hardware::ThunderboltNetLink* raw = link.get();
+            stacks.stop_service();
+            if (link && network.adopt(util::move(link)) && stacks.add(*raw)) thunderbolt_link = raw;
+            stacks.start_service();
           }
           Entry e(Level::Ok, "Thunderbolt");
           e.text(thunderbolt->model()->name).text(thunderbolt_msi_working ? " (MSI)" : " (polled)").text(", security level ").dec(static_cast<uint32_t>(thunderbolt->icm()->security_level())).text(", firmware ").dec(thunderbolt->icm()->driver_ready().rom_version).text(".").dec(thunderbolt->icm()->driver_ready().ram_version);
@@ -1630,6 +1642,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           tb_seen = tb_arrived;
           tb_idle = 0;
           thunderbolt->poll();
+          if (thunderbolt_net) thunderbolt_net->poll();
         }
         const uint64_t now_devices = thunderbolt->icm()->device_count();
         if (now_devices != thunderbolt_devices) {
@@ -1649,6 +1662,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       hardware::delay_us(4000);
     }
 #ifdef TCOS_THUNDERBOLT
+    if (thunderbolt_link) thunderbolt_link->detach();                // (the network interface list keeps the entry; it stops using the connection before that goes)
     if (thunderbolt_msi) {                                          // (before the driver goes: the handler holds a pointer to it)
       thunderbolt_msi = UniquePointer<hardware::PciMsi>();
       kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);

@@ -64,6 +64,7 @@ inline std::vector<uint32_t> words_of(const std::vector<uint8_t>& frame, bool ch
   return words;
 }
 
+static const uint8_t service_uuid[16] = {0x79, 0x8F, 0x58, 0x9E, 0x36, 0x16, 0x8A, 0x47, 0x97, 0xC6, 0x56, 0x64, 0xA9, 0x20, 0xC8, 0xDD};
 static const uint8_t protocol_uuid[16] = {0xB6, 0x38, 0xD7, 0x0E, 0x42, 0xFF, 0x40, 0xBB, 0x97, 0xC2, 0x90, 0xE2, 0xC0, 0xB2, 0xFF, 0x07};
 
 enum Pdf : uint8_t { kRead = 1, kWrite = 2, kError = 3, kEvent = 5, kIcmEvent = 10, kIcmCommand = 11, kIcmResponse = 12 };
@@ -104,9 +105,23 @@ class FakeNhi final : public hardware::ITbRegisters {
     bool answer = true, wrong_uuid = false, not_ready = false, wrong_offset = false, shrink_length = false;
     uint32_t drop_first = 0;                        // requests not answered
   } remote;
+  // the network service of the other host
+  struct Peer {
+    bool answer_login = true, approve_error = false;
+    uint32_t path = 9;                               // the HopID the peer sends on
+    uint8_t mac[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+    uint32_t host_path = 0;                          // what the host's login said it sends on
+    std::vector<uint32_t> logins_seen, command_ids;  // the types of the service messages the host sent
+    bool logout_seen = false, status_seen = false;
+    bool approved = false;
+    uint32_t tx_path = 0, tx_ring = 0, rx_path = 0, rx_ring = 0;     // from ICM_APPROVE_XDOMAIN: the host sends on tx_path from its ring tx_ring, we send on rx_path into its ring rx_ring
+    std::vector<std::vector<uint32_t>> service_messages;
+  } peer;
+  uint32_t xdomain_approvals = 0, xdomain_disconnects = 0;
   std::vector<std::vector<uint32_t>> xdp_requests;   // what the host sent, as words
   std::vector<std::vector<uint32_t>> xdp_responses;  // what the host answered to the remote's requests
   bool titan_ridge = false;                  // the Titan Ridge forms of the messages
+  bool rtd3 = false;                         // DRIVER_READY says the firmware supports runtime power management
   bool answer_get_route = true;
   // secure connect: the keys the devices hold (by the first word of the UUID), and how they misbehave
   std::map<uint32_t, std::vector<uint8_t>> device_keys;
@@ -176,7 +191,10 @@ class FakeNhi final : public hardware::ITbRegisters {
       regs_[offset] = value;
       return;
     }
-    if (offset >= kRingInterruptBase && offset < kRingInterruptBase + 64 * 4 && (offset - kRingInterruptBase) % 4 == 0 && offset != kRingInterruptMaskClearBase) unmasked[(offset - kRingInterruptBase) / 4] = value;
+    if (offset >= kRingInterruptBase && offset < kRingInterruptBase + 64 * 4 && (offset - kRingInterruptBase) % 4 == 0) {
+      ++interrupt_mask_writes;
+      if (offset != kRingInterruptMaskClearBase) unmasked[(offset - kRingInterruptBase) / 4] = value;
+    }
     if (offset >= kRingInterruptMaskClearBase && offset < kRingInterruptMaskClearBase + 0x100) {
       ++interrupt_mask_writes;
       if ((offset - kRingInterruptMaskClearBase) % 4 == 0 && (offset - kRingInterruptMaskClearBase) / 4 < 64) unmasked[(offset - kRingInterruptMaskClearBase) / 4] &= ~value;
@@ -311,7 +329,11 @@ class FakeNhi final : public hardware::ITbRegisters {
     if (w.empty()) return;
     if (eof == kIcmCommand) { icm_command(w); return; }
     if (eof == 6) { xdp_request(w); return; }
-    if (eof == 7) { xdp_responses.push_back(w); return; }
+    if (eof == 7) {
+      if (w.size() >= 7 && memcmp(&w[3], fake_tb::service_uuid, 16) == 0) service_message(w);
+      else xdp_responses.push_back(w);
+      return;
+    }
     if (eof != kRead && eof != kWrite) return;
     // configuration space request: route (22 + 32 bits), then offset:13 length:6 port:6 space:2 seq:2
     const uint32_t route_hi = w[0] & 0x3FFFFF, route_lo = w[1], addr = w[2];
@@ -340,6 +362,78 @@ class FakeNhi final : public hardware::ITbRegisters {
   }
 
   // (the words of a body are the little endian values of the bytes the driver wrote: an ICM header is code | flags << 8 | packet id << 16 | total packets << 24)
+  // the host's ThunderboltIP messages (login, logout) to the other host
+  void service_message(const std::vector<uint32_t>& w) {
+    peer.service_messages.push_back(w);
+    if (w.size() < 17) return;
+    const uint32_t type = w[15], sn = (w[2] >> 27) & 3;
+    std::vector<uint32_t> out(w.begin(), w.begin() + 17);
+    out[0] = w[0] | 0x80000000u;
+    // the answer is from the other host: initiator and target swap places
+    for (int i = 0; i < 4; ++i) { out[7 + i] = w[11 + i]; out[11 + i] = w[7 + i]; }
+    if (type == 0) {                                       // login
+      peer.host_path = w.size() > 18 ? w[18] : 0;
+      peer.logins_seen.push_back(type);
+      peer.command_ids.push_back(w[16]);
+      if (!peer.answer_login) return;
+      out[15] = 1;
+      out.resize(25, 0);                                   // status, mac (2 words), mac length, 4 reserved
+      out[17] = 0;
+      memcpy(&out[18], peer.mac, 6);
+      out[20] = 6;
+      out[2] = (static_cast<uint32_t>(out.size() * 4 - 12) / 4) | (sn << 27);
+      reply(7, out);
+    } else if (type == 2) {                                // logout
+      peer.logout_seen = true;
+      out[15] = 3;
+      out.resize(18, 0);
+      out[2] = (static_cast<uint32_t>(out.size() * 4 - 12) / 4) | (sn << 27);
+      reply(7, out);
+    }
+  }
+
+public:
+  // The other host logs in to ours (a login request frame on the control channel); `host`/`remote` are the two UUIDs.
+  void peer_login(const uint8_t remote_uuid[16], const uint8_t host_uuid[16], uint64_t route, uint32_t command_id, uint32_t path, uint32_t sn = 0) {
+    std::vector<uint32_t> w(23, 0);
+    w[0] = static_cast<uint32_t>(route >> 32);
+    w[1] = static_cast<uint32_t>(route);
+    memcpy(&w[3], fake_tb::service_uuid, 16);
+    memcpy(&w[7], remote_uuid, 16);
+    memcpy(&w[11], host_uuid, 16);
+    w[15] = 0;
+    w[16] = command_id;
+    w[17] = 1;
+    w[18] = path;
+    w[2] = static_cast<uint32_t>(w.size() * 4 - 12) / 4 | (sn << 27);
+    push_to_host(0, 7, 7, wire_frame(w));
+  }
+  void peer_logout(const uint8_t remote_uuid[16], const uint8_t host_uuid[16], uint64_t route, uint32_t command_id) {
+    std::vector<uint32_t> w(17, 0);
+    w[0] = static_cast<uint32_t>(route >> 32);
+    w[1] = static_cast<uint32_t>(route);
+    memcpy(&w[3], fake_tb::service_uuid, 16);
+    memcpy(&w[7], remote_uuid, 16);
+    memcpy(&w[11], host_uuid, 16);
+    w[15] = 2;
+    w[16] = command_id;
+    w[2] = static_cast<uint32_t>(w.size() * 4 - 12) / 4;
+    push_to_host(0, 7, 7, wire_frame(w));
+  }
+  // The other host sends an Ethernet frame through the data path: one or more frames of at most `chunk` bytes of data each.
+  void peer_send(const std::vector<uint8_t>& packet, uint32_t id, uint32_t chunk = 4084) {
+    const uint32_t count = static_cast<uint32_t>((packet.size() + chunk - 1) / chunk);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t size = i + 1 == count ? static_cast<uint32_t>(packet.size()) - i * chunk : chunk;
+      std::vector<uint8_t> frame(12 + size, 0);
+      const uint32_t header[3] = {size, i | (id << 16), count};
+      memcpy(frame.data(), header, 12);
+      memcpy(frame.data() + 12, packet.data() + static_cast<size_t>(i) * chunk, size);
+      push_to_host(peer.rx_ring, 1, 2, frame);
+    }
+  }
+
+private:
   // an XDomain request from the host: answered the way another host would
   void xdp_request(const std::vector<uint32_t>& w) {
     xdp_requests.push_back(w);
@@ -424,8 +518,9 @@ private:
     requests_seen.push_back(code);
     if (code == 3) {
       if (!answer_driver_ready) return;
-      if (titan_ridge) reply(kIcmResponse, {3u | (1u << 24), (security & 0x7u) << 16, 0x00100002u, 0x15EBu});
-      else reply(kIcmResponse, {3u | (1u << 24), 5u | (7u << 8) | ((security & 0xFu) << 16)});
+      const uint32_t hdr = 3u | ((rtd3 ? 0x40u : 0u) << 8) | (1u << 24);
+      if (titan_ridge) reply(kIcmResponse, {hdr, (security & 0x7u) << 16, 0x00100002u, 0x15EBu});
+      else reply(kIcmResponse, {hdr, 5u | (7u << 8) | ((security & 0xFu) << 16)});
     } else if (code == 4 && w.size() >= (titan_ridge ? 8u : 6u)) {
       Device d;
       memcpy(d.uuid, &w[1], 16);
@@ -464,6 +559,25 @@ private:
         memcpy(&out[head + 8], mac, 32);
       }
       out[0] = 5u | (flags << 8) | (1u << 24);
+      reply(kIcmResponse, out);
+    } else if (code == 0x10 && w.size() >= (titan_ridge ? 9u : 8u)) {
+      // ICM_APPROVE_XDOMAIN: the paths (AR: link info, uuid, two words of paths; TR: the route first)
+      const size_t at = titan_ridge ? 7 : 6;
+      if (!peer.approve_error) {
+        peer.approved = true;
+        peer.tx_path = w[at] & 0xFFFF;
+        peer.tx_ring = w[at] >> 16;
+        peer.rx_path = w[at + 1] & 0xFFFF;
+        peer.rx_ring = w[at + 1] >> 16;
+      }
+      ++xdomain_approvals;
+      std::vector<uint32_t> out(w.begin(), w.end());
+      out[0] = 0x10u | ((peer.approve_error ? 1u : 0u) << 8) | (1u << 24);
+      reply(kIcmResponse, out);
+    } else if (code == 0x11 && titan_ridge) {
+      ++xdomain_disconnects;
+      std::vector<uint32_t> out(w.begin(), w.end());
+      out[0] = 0x11u | (1u << 24);
       reply(kIcmResponse, out);
     } else if (code == 1) {
       if (!answer_topology) return;
@@ -545,6 +659,8 @@ class FakePci final : public hardware::IPciBus {
     hardware::PciDeviceInfo info;
     uint8_t header_type = 1, secondary = 0, subordinate = 0;
     int pcie_type = -1;                  // -1: no PCI Express capability
+    bool pm = false, pme_from_d3hot = true;     // a power management capability at 0x70
+    mutable uint32_t pmcsr = 0;
   };
   std::vector<Function> functions;
   const char* name() const override { return "fake pci"; }
@@ -566,13 +682,23 @@ class FakePci final : public hardware::IPciBus {
     if (offset == 0x0C) return uint32_t(f->header_type) << 16;
     if (offset == 0x18) return uint32_t(f->secondary) << 8 | uint32_t(f->subordinate) << 16;
     if (offset == 0x80 && f->pcie_type >= 0) return 0x10 | (uint32_t(f->pcie_type) << 20);
+    if (f->pm && offset == 0x70) return 0x01 | (3u << 16) | (f->pme_from_d3hot ? (1u << 30) : 0);
+    if (f->pm && offset == 0x74) return f->pmcsr;
     return 0;
   }
-  void write32(hardware::PciAddress, uint16_t, uint32_t) const override {}
+  void write32(hardware::PciAddress a, uint16_t offset, uint32_t value) const override {
+    const Function* f = find(a);
+    if (!f || !f->pm || offset != 0x74) return;
+    // the state and the PME enable are written; the status bit clears when a one is written
+    f->pmcsr = (value & 0x103) | (f->pmcsr & 0x8000 & ~value);
+  }
+  void set_wake_pending(hardware::PciAddress a) const { const Function* f = find(a); if (f) f->pmcsr |= 0x8000; }
   uint64_t memory_bar(hardware::PciAddress, uint8_t) const override { return 0; }
   uint16_t find_capability(hardware::PciAddress a, uint8_t id) const override {
     const Function* f = find(a);
-    return (f && id == 0x10 && f->pcie_type >= 0) ? 0x80 : 0;
+    if (f && id == 0x10 && f->pcie_type >= 0) return 0x80;
+    if (f && id == 0x01 && f->pm) return 0x70;
+    return 0;
   }
 };
 
