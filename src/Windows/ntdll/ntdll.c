@@ -1048,6 +1048,7 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "rtl.inc"
 #include "libc.inc"
 #include "rtl2.inc"
+#include "normalize.inc"
 #include "reg.inc"
 
 /* ---- critical sections (one thread: they only count) ---------------------------------------------------------------------------------------------------- */

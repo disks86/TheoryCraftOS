@@ -203,7 +203,6 @@ ZW_SERVICE(NtGetDevicePowerState, ZwGetDevicePowerState);
 ZW_SERVICE(NtGetMUIRegistryInfo, ZwGetMUIRegistryInfo);
 ZW_SERVICE(NtGetNextProcess, ZwGetNextProcess);
 ZW_SERVICE(NtGetNextThread, ZwGetNextThread);
-ZW_SERVICE(NtGetNlsSectionPtr, ZwGetNlsSectionPtr);
 ZW_SERVICE(NtGetNotificationResourceManager, ZwGetNotificationResourceManager);
 ZW_SERVICE(NtGetPlugPlayEvent, ZwGetPlugPlayEvent);
 ZW_SERVICE(NtGetWriteWatch, ZwGetWriteWatch);

@@ -8776,6 +8776,8 @@ static void test_EnumDateFormatsExEx(void)
 
 START_TEST(locale)
 {
+  const char *only = getenv("LOCALE_ONLY");
+#define RUN(f) do { if (!only || strstr(only, #f)) f(); } while (0)
   char **argv;
   int argc = winetest_get_mainargs( &argv );
 
@@ -8790,69 +8792,69 @@ START_TEST(locale)
       }
   }
 
-  test_EnumTimeFormatsA();
-  test_EnumTimeFormatsW();
-  test_EnumDateFormatsA();
+  RUN(test_EnumTimeFormatsA);
+  RUN(test_EnumTimeFormatsW);
+  RUN(test_EnumDateFormatsA);
 
   /* some tests need an English locale */
   pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, L"en-US\0", NULL );
-  test_GetLocaleInfoA();
-  test_GetLocaleInfoW();
-  test_GetLocaleInfoEx();
-  test_GetGeoInfo();
-  test_invariant();
+  RUN(test_GetLocaleInfoA);
+  RUN(test_GetLocaleInfoW);
+  RUN(test_GetLocaleInfoEx);
+  RUN(test_GetGeoInfo);
+  RUN(test_invariant);
   pSetThreadPreferredUILanguages( MUI_LANGUAGE_NAME, NULL, NULL );
 
-  test_GetTimeFormatA();
-  test_GetTimeFormatEx();
-  test_GetDateFormatA();
-  test_GetDateFormatEx();
-  test_GetDateFormatW();
-  test_GetCurrencyFormatA(); /* Also tests the W version */
-  test_GetNumberFormatA();   /* Also tests the W version */
-  test_GetNumberFormatEx();
-  test_CompareStringA();
-  test_CompareStringW();
-  test_CompareStringEx();
-  test_LCMapStringA();
-  test_LCMapStringW();
-  test_LCMapStringEx();
-  test_LocaleNameToLCID();
-  test_FoldStringA();
-  test_FoldStringW();
-  test_ConvertDefaultLocale();
-  test_EnumSystemLanguageGroupsA();
-  test_EnumSystemLocalesA();
-  test_EnumSystemLocalesW();
-  test_EnumSystemLocalesEx();
-  test_EnumLanguageGroupLocalesA();
-  test_SetLocaleInfo();
-  test_EnumUILanguageA();
-  test_GetCPInfo();
-  test_GetStringTypeW();
-  test_Idn();
-  test_IsValidLocaleName();
-  test_ResolveLocaleName();
-  test_CompareStringOrdinal();
-  test_EnumSystemGeoID();
-  test_GetSystemPreferredUILanguages();
-  test_GetThreadPreferredUILanguages();
-  test_GetUserPreferredUILanguages();
-  test_FindNLSStringEx();
-  test_FindStringOrdinal();
-  test_SetThreadUILanguage();
-  test_NormalizeString();
-  test_SpecialCasing();
-  test_NLSVersion();
-  test_locale_nls();
-  test_geo_name();
+  RUN(test_GetTimeFormatA);
+  RUN(test_GetTimeFormatEx);
+  RUN(test_GetDateFormatA);
+  RUN(test_GetDateFormatEx);
+  RUN(test_GetDateFormatW);
+  RUN(test_GetCurrencyFormatA); /* Also tests the W version */
+  RUN(test_GetNumberFormatA);   /* Also tests the W version */
+  RUN(test_GetNumberFormatEx);
+  RUN(test_CompareStringA);
+  RUN(test_CompareStringW);
+  RUN(test_CompareStringEx);
+  RUN(test_LCMapStringA);
+  RUN(test_LCMapStringW);
+  RUN(test_LCMapStringEx);
+  RUN(test_LocaleNameToLCID);
+  RUN(test_FoldStringA);
+  RUN(test_FoldStringW);
+  RUN(test_ConvertDefaultLocale);
+  RUN(test_EnumSystemLanguageGroupsA);
+  RUN(test_EnumSystemLocalesA);
+  RUN(test_EnumSystemLocalesW);
+  RUN(test_EnumSystemLocalesEx);
+  RUN(test_EnumLanguageGroupLocalesA);
+  RUN(test_SetLocaleInfo);
+  RUN(test_EnumUILanguageA);
+  RUN(test_GetCPInfo);
+  RUN(test_GetStringTypeW);
+  RUN(test_Idn);
+  RUN(test_IsValidLocaleName);
+  RUN(test_ResolveLocaleName);
+  RUN(test_CompareStringOrdinal);
+  RUN(test_EnumSystemGeoID);
+  RUN(test_GetSystemPreferredUILanguages);
+  RUN(test_GetThreadPreferredUILanguages);
+  RUN(test_GetUserPreferredUILanguages);
+  RUN(test_FindNLSStringEx);
+  RUN(test_FindStringOrdinal);
+  RUN(test_SetThreadUILanguage);
+  RUN(test_NormalizeString);
+  RUN(test_SpecialCasing);
+  RUN(test_NLSVersion);
+  RUN(test_locale_nls);
+  RUN(test_geo_name);
   /* TCOS: these two compare every character of Unicode with the full Windows sort table; the debug console cannot print their failures in time (scripts/winetest.sh) */
   if (!getenv("WINETEST_SKIP_SORTING")) { test_sorting(); test_unicode_sorting(); }
-  test_EnumCalendarInfoA();
-  test_EnumCalendarInfoW();
-  test_EnumCalendarInfoExA();
-  test_EnumCalendarInfoExW();
+  RUN(test_EnumCalendarInfoA);
+  RUN(test_EnumCalendarInfoW);
+  RUN(test_EnumCalendarInfoExA);
+  RUN(test_EnumCalendarInfoExW);
 
   /* Run this test at the end */
-  test_EnumDateFormatsExEx();
+  RUN(test_EnumDateFormatsExEx);
 }

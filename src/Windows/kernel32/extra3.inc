@@ -70,18 +70,70 @@ EXPORT BOOL WINAPI GetStringTypeA(LCID locale, DWORD info_type, LPCSTR source, i
 }
 EXPORT BOOL WINAPI GetStringTypeExA(LCID locale, DWORD info_type, LPCSTR source, int count, LPWORD types) { return GetStringTypeA(locale, info_type, source, count, types); }
 
+/* ---- FoldString ------------------------------------------------------------------------------------------------------------------------------------ */
+
+#define FOLD_CZONE 0x10u
+#define FOLD_PRECOMPOSED 0x20u
+#define FOLD_COMPOSITE 0x40u
+#define FOLD_DIGITS 0x80u
+#define FOLD_LIGATURES 0x2000u
+/* The scripts' digits MAP_FOLDDIGITS turns into ASCII: the first character, the digit it stands for and how many follow (the numbers of Windows, not all of Unicode). */
+static const struct { DWORD first; BYTE digit, count; } k_fold_digits[] = {{0x0030,0,10},{0x00b2,2,2},{0x00b9,1,1},{0x0660,0,10},{0x06f0,0,10},{0x07c0,0,10},{0x0966,0,10},{0x09e6,0,10},{0x0a66,0,10},{0x0ae6,0,10},{0x0b66,0,10},{0x0be6,0,10},{0x0c66,0,10},{0x0c78,0,4},{0x0c7c,1,3},{0x0ce6,0,10},{0x0d66,0,10},{0x0de6,0,10},{0x0e50,0,10},{0x0ed0,0,10},{0x0f20,0,10},{0x1040,0,10},{0x1090,0,10},{0x1369,1,9},{0x17e0,0,10},{0x1810,0,10},{0x1946,0,10},{0x19d0,0,10},{0x19da,1,1},{0x1a80,0,10},{0x1a90,0,10},{0x1b50,0,10},{0x1bb0,0,10},{0x1c40,0,10},{0x1c50,0,10},{0x2070,0,1},{0x2074,4,6},{0x2080,0,10},{0x2460,1,9},{0x2474,1,9},{0x2488,1,9},{0x24ea,0,1},{0x24f5,1,9},{0x24ff,0,1},{0x2776,1,9},{0x2780,1,9},{0x278a,1,9},{0x3007,0,1},{0x3021,1,9},{0xa620,0,10},{0xa8d0,0,10},{0xa8e0,0,10},{0xa900,0,10},{0xa9d0,0,10},{0xa9f0,0,10},{0xaa50,0,10},{0xabf0,0,10},{0xff10,0,10},{0x10107,1,9},{0x10320,1,1},{0x10321,5,1},{0x104a0,0,10},{0x10a40,1,4},{0x10d30,0,10},{0x10d40,0,10},{0x10e60,1,9},{0x11052,1,9},{0x11066,0,10},{0x110f0,0,10},{0x11136,0,10},{0x111d0,0,10},{0x112f0,0,10},{0x11450,0,10},{0x114d0,0,10},{0x11650,0,10},{0x116c0,0,10},{0x116d0,0,10},{0x116da,0,10},{0x11730,0,10},{0x118e0,0,10},{0x11950,0,10},{0x11bf0,0,10},{0x11c50,0,10},{0x11d50,0,10},{0x11da0,0,10},{0x11de0,0,10},{0x11f50,0,10},{0x16130,0,10},{0x16a60,0,10},{0x16ac0,0,10},{0x16b50,0,10},{0x16d70,0,10},{0x1ccf0,0,10},{0x1d7ce,0,10},{0x1d7d8,0,10},{0x1d7e2,0,10},{0x1d7ec,0,10},{0x1d7f6,0,10},{0x1e140,0,10},{0x1e2f0,0,10},{0x1e4f0,0,10},{0x1e5f1,0,10},{0x1e950,0,10},{0x1f100,0,1},{0x1f101,0,10},{0x1fbf0,0,10}};
+/* What MAP_EXPAND_LIGATURES makes of a character (at most 3 characters). */
+static const struct { WCHAR from; WCHAR to[3]; } k_ligatures[] = {
+  {0x00c6, {'A', 'E', 0}}, {0x00de, {'T', 'H', 0}}, {0x00df, {'s', 's', 0}}, {0x00e6, {'a', 'e', 0}}, {0x00fe, {'t', 'h', 0}}, {0x0132, {'I', 'J', 0}}, {0x0133, {'i', 'j', 0}},
+  {0x0152, {'O', 'E', 0}}, {0x0153, {'o', 'e', 0}}, {0x01c4, {'D', 0x017d, 0}}, {0x01c5, {'D', 0x017e, 0}}, {0x01c6, {'d', 0x017e, 0}}, {0x01c7, {'L', 'J', 0}},
+  {0x01c8, {'L', 'j', 0}}, {0x01c9, {'l', 'j', 0}}, {0x01ca, {'N', 'J', 0}}, {0x01cb, {'N', 'j', 0}}, {0x01cc, {'n', 'j', 0}}, {0x01e2, {0x0100, 0x0112, 0}},
+  {0x01e3, {0x0101, 0x0113, 0}}, {0x01f1, {'D', 'Z', 0}}, {0x01f2, {'D', 'z', 0}}, {0x01f3, {'d', 'z', 0}}, {0x01fc, {0x00c1, 0x00c9, 0}}, {0x01fd, {0x00e1, 0x00e9, 0}},
+  {0x05f0, {0x05d5, 0x05d5, 0}}, {0x05f1, {0x05d5, 0x05d9, 0}}, {0x05f2, {0x05d9, 0x05d9, 0}}, {0xfb00, {'f', 'f', 0}}, {0xfb01, {'f', 'i', 0}}, {0xfb02, {'f', 'l', 0}},
+  {0xfb03, {'f', 'f', 'i'}}, {0xfb04, {'f', 'f', 'l'}}, {0xfb05, {0x017f, 't', 0}}, {0xfb06, {'s', 't', 0}},
+};
+static BOOL fold_digit(DWORD cp, DWORD *ascii) {
+  for (SIZE_T i = 0; i < sizeof(k_fold_digits) / sizeof(k_fold_digits[0]); ++i)
+    if (cp >= k_fold_digits[i].first && cp - k_fold_digits[i].first < k_fold_digits[i].count) { *ascii = '0' + k_fold_digits[i].digit + (cp - k_fold_digits[i].first); return TRUE; }
+  return FALSE;
+}
+NTSTATUS NTAPI RtlNormalizeString(ULONG form, const WCHAR *src, INT src_len, WCHAR *dst, INT *dst_len);
 EXPORT int WINAPI FoldStringW(DWORD flags, LPCWSTR source, int count, LPWSTR dest, int capacity) {
-  if (!source) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (count < 0) count = (int)wcslen(source) + 1;
-  if (capacity == 0) return count;
-  if (capacity < count) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  for (int i = 0; i < count; ++i) {
-    WCHAR c = source[i];
-    if ((flags & 0x2 /* MAP_FOLDCZONE */) && c >= 0xFF01 && c <= 0xFF5E) c = (WCHAR)(c - 0xFEE0);      /* full-width to ASCII */
-    if ((flags & 0x8 /* MAP_EXPAND_LIGATURES */) == 0 && (flags & 0x10 /* MAP_FOLDDIGITS */) && c >= 0x660 && c <= 0x669) c = (WCHAR)('0' + c - 0x660);
-    dest[i] = c;
+  const DWORD valid = FOLD_CZONE | FOLD_PRECOMPOSED | FOLD_COMPOSITE | FOLD_DIGITS | FOLD_LIGATURES;
+  if (!flags || (flags & ~valid) || ((flags & FOLD_PRECOMPOSED) && (flags & (FOLD_COMPOSITE | FOLD_LIGATURES))) || ((flags & FOLD_COMPOSITE) && (flags & FOLD_LIGATURES))) { set_error(ERROR_INVALID_FLAGS); return 0; }
+  if (!source || !count || capacity < 0 || (capacity > 0 && !dest) || source == dest) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const SIZE_T n = count < 0 ? wcslen(source) + 1 : (SIZE_T)count;
+  /* the work buffer: every character can become at most three, and a normalization of the result is made in a second buffer */
+  WCHAR *work = RtlAllocateHeap(heap(), 0, (n * 3 + 1) * 2);
+  if (!work) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+  SIZE_T length = 0;
+  for (SIZE_T i = 0; i < n; ++i) {
+    DWORD cp = source[i];
+    BOOL pair = FALSE;
+    if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < n && (source[i + 1] & 0xFC00) == 0xDC00) { cp = 0x10000 + ((cp - 0xD800) << 10) + (source[i + 1] - 0xDC00); pair = TRUE; }
+    DWORD ascii;
+    if ((flags & FOLD_DIGITS) && fold_digit(cp, &ascii)) { work[length++] = (WCHAR)ascii; if (pair) ++i; continue; }
+    if (flags & FOLD_LIGATURES) {
+      BOOL expanded = FALSE;
+      for (SIZE_T k = 0; !pair && k < sizeof(k_ligatures) / sizeof(k_ligatures[0]); ++k)
+        if (k_ligatures[k].from == cp) { for (int c = 0; c < 3 && k_ligatures[k].to[c]; ++c) work[length++] = k_ligatures[k].to[c]; expanded = TRUE; break; }
+      if (expanded) continue;
+    }
+    work[length++] = source[i];
+    if (pair) work[length++] = source[++i];
   }
-  return count;
+  const WCHAR *result = work;
+  SIZE_T result_length = length;
+  WCHAR *normalized = NULL;
+  if (flags & (FOLD_CZONE | FOLD_PRECOMPOSED | FOLD_COMPOSITE)) {
+    const ULONG form = (flags & FOLD_COMPOSITE) ? ((flags & FOLD_CZONE) ? 6 : 2) : ((flags & FOLD_PRECOMPOSED) ? ((flags & FOLD_CZONE) ? 5 : 1) : 5);
+    INT room = (INT)(length * 18 + 8);
+    normalized = RtlAllocateHeap(heap(), 0, (SIZE_T)room * 2);
+    if (normalized && RtlNormalizeString(form, work, (INT)length, normalized, &room) == STATUS_SUCCESS) { result = normalized; result_length = (SIZE_T)room; }
+  }
+  int ret;
+  if (capacity == 0) ret = (int)result_length;
+  else if ((SIZE_T)capacity < result_length) { set_error(ERROR_INSUFFICIENT_BUFFER); ret = 0; }
+  else { memcpy(dest, result, result_length * 2); ret = (int)result_length; }
+  RtlFreeHeap(heap(), 0, work);
+  if (normalized) RtlFreeHeap(heap(), 0, normalized);
+  return ret;
 }
 EXPORT int WINAPI FoldStringA(DWORD flags, LPCSTR source, int count, LPSTR dest, int capacity) { (void)flags; if (count < 0) count = (int)strlen(source) + 1; if (capacity == 0) return count; if (capacity < count) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; } memcpy(dest, source, (size_t_)count); return count; }
 EXPORT int WINAPI CompareStringOrdinal(LPCWSTR a, int an, LPCWSTR b, int bn, BOOL ignore_case) {
@@ -115,19 +167,29 @@ EXPORT int WINAPI FindNLSStringEx(LPCWSTR locale_name, DWORD flags, LPCWSTR sour
 }
 EXPORT int WINAPI FindNLSString(LCID locale, DWORD flags, LPCWSTR source, int source_count, LPCWSTR value, int value_count, LPINT found_length) { (void)locale; return FindNLSStringEx(NULL, flags, source, source_count, value, value_count, found_length, NULL, NULL, 0); }
 EXPORT BOOL WINAPI IsNLSDefinedString(int function, DWORD flags, LPVOID version, LPCWSTR text, int count) { (void)function; (void)flags; (void)version; (void)text; (void)count; return TRUE; }
-EXPORT BOOL WINAPI IsNormalizedString(int form, LPCWSTR text, int count) {      /* (text without combining marks is in every form already) */
-  (void)form;
-  if (count < 0) count = (int)wcslen(text);
-  for (int i = 0; i < count; ++i) if (text[i] >= 0x300 && text[i] <= 0x36F) return FALSE;
-  return TRUE;
+NTSTATUS NTAPI RtlNormalizeString(ULONG form, const WCHAR *src, INT src_len, WCHAR *dst, INT *dst_len);
+NTSTATUS NTAPI RtlIsNormalizedString(ULONG form, const WCHAR *src, INT src_len, BOOLEAN *normalized);
+EXPORT BOOL WINAPI IsNormalizedString(int form, LPCWSTR text, int count) {
+  BOOLEAN normalized = FALSE;
+  if (!text || count == 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const NTSTATUS status = RtlIsNormalizedString((ULONG)form, text, count, &normalized);
+  if (!NT_SUCCESS(status)) { set_error(status == ((NTSTATUS)0xC0000717) ? 1113 : RtlNtStatusToDosError(status)); return FALSE; }
+  return normalized;
 }
+/* A negative result is the size needed (ERROR_INSUFFICIENT_BUFFER) or minus the index of the invalid character (ERROR_NO_UNICODE_TRANSLATION). */
 EXPORT int WINAPI NormalizeString(int form, LPCWSTR source, int count, LPWSTR dest, int capacity) {
-  (void)form;
-  if (count < 0) count = (int)wcslen(source) + 1;
-  if (capacity == 0) return count;
-  if (capacity < count) { set_error(ERROR_INSUFFICIENT_BUFFER); return count; }
-  memcpy(dest, source, (size_t_)count * 2);
-  return count;
+  if (!source || count == 0 || capacity < 0 || (capacity > 0 && !dest)) {
+    if (count == 0 && source) { set_error(0); return 0; }
+    set_error(ERROR_INVALID_PARAMETER);
+    return 0;
+  }
+  INT length = capacity;
+  const NTSTATUS status = RtlNormalizeString((ULONG)form, source, count, dest, &length);
+  if (status == STATUS_SUCCESS) { set_error(0); return length; }
+  if (status == ((NTSTATUS)0xC0000023)) { set_error(ERROR_INSUFFICIENT_BUFFER); return -length; }
+  if (status == ((NTSTATUS)0xC0000717)) { set_error(1113); return -length; }
+  set_error(status == STATUS_NO_MEMORY ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER);
+  return 0;
 }
 
 /* ---- locale information (English, United States) --------------------------------------------------------------------------------------------------------- */

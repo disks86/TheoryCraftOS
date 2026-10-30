@@ -179,7 +179,6 @@ NT_SERVICE(NtGetDevicePowerState);
 NT_SERVICE(NtGetMUIRegistryInfo);
 NT_SERVICE(NtGetNextProcess);
 NT_SERVICE(NtGetNextThread);
-NT_SERVICE(NtGetNlsSectionPtr);
 NT_SERVICE(NtGetNotificationResourceManager);
 NT_SERVICE(NtGetPlugPlayEvent);
 NT_SERVICE(NtGetWriteWatch);
