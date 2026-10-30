@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Emulation/CryptoShared.hpp"
 #include "Emulation/X86_64Cpu.hpp"
 #include "Emulation/X86_64EvexInternal.hpp"
 
@@ -522,6 +523,36 @@ X86_64Cpu::Step X86_64Cpu::sm3_instruction(GuestMemory& m, uint32_t map, uint8_t
 }  // namespace emulation
 
 namespace emulation {
+
+void crypto_aes_sub_shift(uint64_t* lo, uint64_t* hi, bool inverse) {
+  Block b;
+  to_block(*lo, *hi, b);
+  shift_rows(b, inverse);
+  sub_bytes(b, inverse);
+  from_block(b, lo, hi);
+}
+
+void crypto_aes_mix(uint64_t* lo, uint64_t* hi, bool inverse) {
+  Block b;
+  to_block(*lo, *hi, b);
+  mix_columns(b, inverse);
+  from_block(b, lo, hi);
+}
+
+void crypto_sm4_rounds(const uint64_t state[2], const uint64_t keys[2], bool key_schedule, uint64_t out[2]) {
+  X86_64Cpu::Xmm s, k;
+  s.lo = state[0]; s.hi = state[1];
+  k.lo = keys[0]; k.hi = keys[1];
+  const X86_64Cpu::Xmm r = sm4_four_rounds(s, k, key_schedule);
+  out[0] = r.lo;
+  out[1] = r.hi;
+}
+
+void crypto_clmul(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi) {
+  const X86_64Cpu::Xmm r = carryless_multiply(a, b);
+  *lo = r.lo;
+  *hi = r.hi;
+}
 
 X86_64Cpu::Xmm crypto_aes_round(const X86_64Cpu::Xmm& state, const X86_64Cpu::Xmm& key, bool inverse, bool last) { return aes_round(state, key, inverse, last); }
 X86_64Cpu::Xmm crypto_carryless_multiply(uint64_t a, uint64_t b) { return carryless_multiply(a, b); }

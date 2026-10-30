@@ -660,6 +660,12 @@ add_executable(BOOTX64
   src/Emulation/AArch64Cpu.cpp
   src/Emulation/AArch64Fp.cpp
   src/Emulation/AArch64Simd.cpp
+  src/Emulation/AArch64Crypto.cpp
+  src/Emulation/AArch64NeonShift.cpp
+  src/Emulation/AArch64NeonThree.cpp
+  src/Emulation/AArch64NeonElement.cpp
+  src/Emulation/AArch64NeonTwo.cpp
+  src/Emulation/AArch64NeonDiff.cpp
   src/Emulation/RiscV64Cpu.cpp
   src/Emulation/RiscV64Fp.cpp
   src/Emulation/RiscV64Vector.cpp

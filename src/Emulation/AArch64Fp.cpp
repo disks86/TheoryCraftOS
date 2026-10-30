@@ -48,14 +48,60 @@ void AArch64Cpu::fp_finish(const Env& env) {
 }
 
 void AArch64Cpu::fp_write(uint32_t r, Format f, uint64_t bits) {
-  s_.v[r].lo = f == Format::F32 ? bits & 0xFFFFFFFFu : bits;
+  s_.v[r].lo = f == Format::F32 ? bits & 0xFFFFFFFFu : (f == Format::F16 || f == Format::BF16) ? bits & 0xFFFF : bits;
   s_.v[r].hi = 0;
 }
 
 // FPCR.DN: every NaN result is the default NaN.
 uint64_t AArch64Cpu::fp_default_nan_fix(Format f, uint64_t bits) const {
   if (!(s_.fpcr & (1u << 25)) || !is_nan(f, bits)) return bits;
-  return f == Format::F32 ? 0x7FC00000u : 0x7FF8000000000000ull;
+  return f == Format::F32 ? 0x7FC00000u : f == Format::F16 ? 0x7E00u : f == Format::BF16 ? 0x7FC0u : 0x7FF8000000000000ull;
+}
+
+// FJCVTZS (FEAT_JSCVT): the JavaScript ToInt32 of a double: the integer part modulo 2^32. Z is set when the conversion was exact, N, C, V are cleared; a NaN, an infinity or a value that does not fit
+// in 32 bits raises invalid, a fraction raises inexact.
+AArch64Cpu::Step AArch64Cpu::fjcvtzs(uint32_t rd, uint32_t rn) {
+  const uint64_t bits = s_.v[rn].lo;
+  const bool negative = bits >> 63;
+  const int32_t biased = static_cast<int32_t>((bits >> 52) & 0x7FF);
+  const uint64_t fraction_bits = bits & 0xFFFFFFFFFFFFFull;
+  uint32_t flags = 0;
+  uint32_t result = 0;
+  bool exact = false;
+  if (biased == 0x7FF) {
+    flags = 1;      // invalid
+  } else if (biased == 0) {
+    flags = (fraction_bits != 0) ? 16 : 0;      // a denormal rounds to zero, inexactly; a zero is exact
+    exact = fraction_bits == 0;
+  } else {
+    const int32_t e = biased - 1023;
+    const uint64_t m = fraction_bits | (uint64_t{1} << 52);
+    bool fractional = false;
+    uint64_t magnitude = 0;
+    bool large = false;
+    if (e < 0) {
+      fractional = true;
+    } else if (e <= 52) {
+      magnitude = m >> (52 - e);
+      fractional = (m & ((uint64_t{1} << (52 - e)) - 1)) != 0;
+      large = e >= 31;
+    } else {
+      magnitude = e >= 116 ? 0 : (m << (e - 52));
+      large = true;
+    }
+    result = static_cast<uint32_t>(negative ? ~magnitude + 1 : magnitude);
+    if (large) {
+      // 2^31 and above do not fit; -2^31 itself does
+      const bool min_int = negative && e == 31 && !fractional && magnitude == (uint64_t{1} << 31);
+      if (!min_int) flags = 1;
+    }
+    if (!(flags & 1) && fractional) flags |= 16;
+    exact = flags == 0;
+  }
+  set_reg(rd, result, false);
+  s_.nzcv = exact ? kZ : 0;
+  s_.fpsr |= flags;
+  return Step::Ok;
 }
 
 AArch64Cpu::Step AArch64Cpu::floating_point(uint32_t insn) {
@@ -65,6 +111,7 @@ AArch64Cpu::Step AArch64Cpu::floating_point(uint32_t insn) {
   auto format_of = [](uint32_t t, Format* f) {
     if (t == 0) { *f = Format::F32; return true; }
     if (t == 1) { *f = Format::F64; return true; }
+    if (t == 3) { *f = Format::F16; return true; }      // FEAT_FP16
     return false;
   };
   Format f = Format::F32;
@@ -115,17 +162,18 @@ AArch64Cpu::Step AArch64Cpu::floating_point(uint32_t insn) {
   if (low == 0) {      // conversions between floating point and integer
     const uint32_t opcode = bits_of(insn, 18, 16), rmode = bits_of(insn, 20, 19);
     const bool sf = insn >> 31;
+    if (opcode == 6 && rmode == 3 && ftype == 1 && !sf) return fjcvtzs(rd, rn);
     if (opcode == 6 || opcode == 7) {      // FMOV
       if (rmode == 1 && ftype == 2 && sf) {      // the top half of a 128-bit register
         if (opcode == 6) set_reg(rd, s_.v[rn].hi, true);
         else s_.v[rd].hi = reg(rn, true);
         return Step::Ok;
       }
-      if (rmode != 0 || !((ftype == 0 && !sf) || (ftype == 1 && sf))) return undefined();
+      if (rmode != 0 || !((ftype == 0 && !sf) || (ftype == 1 && sf) || ftype == 3)) return undefined();
       if (opcode == 6) {
-        set_reg(rd, ftype == 0 ? s_.v[rn].lo & 0xFFFFFFFFu : s_.v[rn].lo, sf);
+        set_reg(rd, ftype == 0 ? s_.v[rn].lo & 0xFFFFFFFFu : ftype == 3 ? s_.v[rn].lo & 0xFFFF : s_.v[rn].lo, sf);
       } else {
-        s_.v[rd].lo = reg(rn, sf);
+        s_.v[rd].lo = ftype == 3 ? reg(rn, sf) & 0xFFFF : reg(rn, sf);
         s_.v[rd].hi = 0;
       }
       return Step::Ok;
@@ -159,21 +207,51 @@ AArch64Cpu::Step AArch64Cpu::floating_point(uint32_t insn) {
     return Step::Ok;
   }
 
-  if ((insn >> 31) || ((insn >> 29) & 1) || !format_of(ftype, &f)) {
-    if (ftype == 3) return undefined();      // half precision
-    return undefined();
-  }
+  if ((insn >> 31) || ((insn >> 29) & 1) || !format_of(ftype, &f)) return undefined();
   if (bits_of(insn, 14, 10) == 0x10) {      // 1 source
     const uint32_t opcode = bits_of(insn, 20, 15);
     const uint64_t a = fp_read(rn, f);
     uint64_t r;
+    if (opcode == 6) {      // BFCVT Hd, Sn (FEAT_BF16; the type field says 01)
+      if (ftype != 1) return undefined();
+      const uint64_t source = s_.v[rn].lo & 0xFFFFFFFFu;
+      fp_write(rd, Format::BF16, fp_default_nan_fix(Format::BF16, convert(Format::F32, Format::BF16, source, env)));
+      fp_finish(env);
+      return Step::Ok;
+    }
+    if (opcode >= 16 && opcode <= 19) {      // FRINT32Z, FRINT32X, FRINT64Z, FRINT64X (FEAT_FRINTTS)
+      if (f != Format::F32 && f != Format::F64) return undefined();
+      const uint32_t width = opcode < 18 ? 32 : 64;
+      const bool exact = opcode & 1;
+      Env local = env;
+      local.flags = 0;
+      uint64_t rounded = a;
+      Env range = env;
+      range.flags = 0;
+      bool bad = is_nan(f, a);
+      if (!bad) {
+        rounded = round_to_integral(f, a, exact ? env.mode : Rounding::TowardZero, exact, local);
+        to_integer_saturating(f, rounded, Rounding::TowardZero, width, false, 0, range);
+        bad = (range.flags & kInvalid) != 0;
+      }
+      if (bad) {
+        env.flags |= kInvalid;
+        r = from_integer(f, uint64_t{1} << (width - 1), true, 0, range);
+      } else {
+        env.flags |= local.flags;
+        r = rounded;
+      }
+      fp_write(rd, f, r);
+      fp_finish(env);
+      return Step::Ok;
+    }
     switch (opcode) {
       case 0: fp_write(rd, f, a); return Step::Ok;      // FMOV
       case 1: fp_write(rd, f, absolute(f, a)); return Step::Ok;
       case 2: fp_write(rd, f, negate(f, a)); return Step::Ok;
       case 3: r = fp_default_nan_fix(f, sqrt(f, a, env)); break;
-      case 4: case 5: {      // FCVT between single and double
-        const Format to = opcode == 4 ? Format::F32 : Format::F64;
+      case 4: case 5: case 7: {      // FCVT between half, single and double
+        const Format to = opcode == 4 ? Format::F32 : opcode == 5 ? Format::F64 : Format::F16;
         if (to == f) return undefined();
         r = fp_default_nan_fix(to, convert(f, to, a, env));
         fp_write(rd, to, r);
@@ -207,7 +285,8 @@ AArch64Cpu::Step AArch64Cpu::floating_point(uint32_t insn) {
     const uint32_t imm = bits_of(insn, 20, 13);
     const uint64_t sign = imm >> 7, b6 = (imm >> 6) & 1, hi2 = (imm >> 4) & 3, lo4 = imm & 15;
     uint64_t bits;
-    if (f == Format::F32) bits = (sign << 31) | ((b6 ? 0 : 1) << 30) | ((b6 ? 0x1Fu : 0) << 25) | (hi2 << 23) | (lo4 << 19);
+    if (f == Format::F16) bits = (sign << 15) | ((b6 ? 0 : 1) << 14) | ((b6 ? 3u : 0) << 12) | (hi2 << 10) | (lo4 << 6);
+    else if (f == Format::F32) bits = (sign << 31) | ((b6 ? 0 : 1) << 30) | ((b6 ? 0x1Fu : 0) << 25) | (hi2 << 23) | (lo4 << 19);
     else bits = (sign << 63) | ((b6 ? 0 : uint64_t{1}) << 62) | ((b6 ? 0xFFull : 0) << 54) | (hi2 << 52) | (lo4 << 48);
     fp_write(rd, f, bits);
     return Step::Ok;

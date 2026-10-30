@@ -92,18 +92,28 @@ class AArch64Cpu final : public IGuestCpu {
   Step load_store_exclusive(GuestMemory& m, uint32_t insn);
   Step load_store_pair(GuestMemory& m, uint32_t insn);
   Step load_store_register(GuestMemory& m, uint32_t insn);
+  Step load_store_ordered(GuestMemory& m, uint32_t insn);
   Step atomic_memory(GuestMemory& m, uint32_t insn);
   Step simd_load_store_multiple(GuestMemory& m, uint32_t insn);
   Step simd_load_store_single(GuestMemory& m, uint32_t insn);
   Step data_register(uint32_t insn);
   Step system_instruction(uint32_t insn);
   Step floating_point(uint32_t insn);      // AArch64Fp.cpp
+  Step fjcvtzs(uint32_t rd, uint32_t rn);
   Step simd(uint32_t insn);                // AArch64Simd.cpp
+  bool neon_shift_immediate(uint32_t insn, Step* result);
+  bool neon_three_same(uint32_t insn, Step* result);      // AArch64NeonThree.cpp
+  bool neon_by_element(uint32_t insn, Step* result);      // AArch64NeonElement.cpp
+  bool neon_two_register(uint32_t insn, Step* result);    // AArch64NeonTwo.cpp
+  bool neon_three_different(uint32_t insn, Step* result);      // AArch64NeonDiff.cpp      // AArch64NeonShift.cpp; these return false when the instruction is not of their class
+  bool crypto(uint32_t insn, Step* result);      // AArch64Crypto.cpp: AES, SHA, SM3, SM4 and pmull; false when the instruction is not one of them
 
   // floating point helpers (AArch64Fp.cpp)
   softfloat::Env fp_env() const;
   void fp_finish(const softfloat::Env& env);
-  uint64_t fp_read(uint32_t r, softfloat::Format f) const { return f == softfloat::Format::F32 ? s_.v[r].lo & 0xFFFFFFFFu : s_.v[r].lo; }
+  uint64_t fp_read(uint32_t r, softfloat::Format f) const {
+    return f == softfloat::Format::F32 ? s_.v[r].lo & 0xFFFFFFFFu : (f == softfloat::Format::F16 || f == softfloat::Format::BF16) ? s_.v[r].lo & 0xFFFF : s_.v[r].lo;
+  }
   void fp_write(uint32_t r, softfloat::Format f, uint64_t bits);      // a scalar write clears the rest of the register
   uint64_t fp_default_nan_fix(softfloat::Format f, uint64_t bits) const;
 
