@@ -52,8 +52,9 @@ class CubeRenderer {
   // for the devices' own y-down clip space, so that is turned back - otherwise the logo would stand on its head.
   static graphics::Mat4 transform(float angle, float aspect);
 
-  // The first adapter of the kernel that is (or is not) a GPU; dxgk::kInvalidIndex if there is none.
-  static uint32_t find_adapter(dxgk::Kernel& kernel, bool accelerated);
+  // The first adapter of the kernel that is (or is not) a GPU; dxgk::kInvalidIndex if there is none. An adapter on the `preferred` device (the one the desktop draws on) comes
+  // before the others, so that the picture can stay on that GPU instead of crossing to the CPU and back.
+  static uint32_t find_adapter(dxgk::Kernel& kernel, bool accelerated, const graphics::IGraphicsDevice* preferred = nullptr);
 
   // Creates everything for a picture of this size on the adapter. False (and nothing is held) if the kernel refuses anything essential; the logo is best effort.
   // `shareable`: the color target can also be sampled, so that a renderer on the same device can show it in place (acquire_target) and the frame need not be read back.
