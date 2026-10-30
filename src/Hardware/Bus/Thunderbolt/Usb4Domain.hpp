@@ -48,6 +48,9 @@ constexpr uint32_t kUsb3Cs0Pe = 1u << 31, kUsb3Cs1 = 1, kUsb3Cs1Hca = 1u << 31, 
                    kUsb3Hop = 8, kUsb3Priority = 3, kUsb3Weight = 2;
 // capabilities of a port (TB_PORT_CAP_*) and of a router
 constexpr uint8_t kPortCapPhy = 0x01, kPortCapTime1 = 0x03, kPortCapAdapter = 0x04, kPortCapUsb4 = 0x06;
+// Thunderbolt 3 device routers: the vendor specific capabilities of their space (plug events, link controller) and the link controller's registers
+constexpr uint8_t kSwitchCapVse = 0x05, kVsecPlugEvents = 0x01, kVsecLinkController = 0x06;
+constexpr uint32_t kLcDesc = 2, kLcSxCtrl = 0x96, kLcSxCtrlL1c = 1u << 16, kLcSxCtrlL2c = 1u << 20, kLcSxCtrlUpstream = 1u << 30, kLcPortAttr = 0x8D, kLcPortAttrBe = 1u << 12, kPlugEventsUsbDisable = 1u << 2;
 // the time management unit: the router capability (TB_SWITCH_CAP_TMU), its registers, the port registers
 constexpr uint8_t kSwitchCapTmu = 0x03;
 constexpr uint32_t kTmuRtrCs0 = 0, kTmuRtrCs0FreqWindShift = 16, kTmuRtrCs0FreqWindMask = 0x7FFu << 16, kTmuRtrCs0Td = 1u << 27, kTmuRtrCs0Ucap = 1u << 30, kTmuRtrCs1 = 1, kTmuRtrCs3 = 3, kTmuRtrCs3IntervalShift = 16,
@@ -99,6 +102,8 @@ struct Usb4Router {
   uint8_t parent_port = 0;
   bool configured = false;
   uint8_t cap_tmu = 0;               // the router's time management unit capability (0: none)
+  bool tbt3 = false;                 // a Thunderbolt 3 router (no USB4 version): configured through its plug events and link controller capabilities
+  uint8_t cap_plug_events = 0, cap_lc = 0;
   bool tmu_lowres = false;           // its time is kept in step with the host router's, uni-directionally at the low resolution
   bool pcie_tunnel = false;          // a PCIe tunnel made by this domain ends here
   bool usb3_tunnel = false;          // so does a USB 3 tunnel
@@ -235,6 +240,11 @@ class Usb4Domain final : public IThunderboltEvents, public IXdomainHost, private
   bool router_op(const Usb4Router& r, uint32_t opcode, uint32_t* metadata, uint8_t* status, const uint32_t* tx, uint32_t tx_dwords, uint32_t* rx, uint32_t rx_dwords);
   bool drom_read(const Usb4Router& r, uint32_t address, ByteView out);
   int find_router_cap(const Usb4Router& r, uint8_t id);
+  int find_router_vse(const Usb4Router& r, uint8_t vsec);
+  bool plug_events_active(const Usb4Router& r);
+  bool lc_set_configured(const Usb4Router& r, uint32_t port, bool upstream);
+  bool configure_port(const Usb4Router& r, uint32_t port, bool upstream);
+  bool bonding_possible(const Usb4Router& child);
   uint32_t available_credits(const Usb4Router& r, const Usb4Port& lane) const;
   bool lane_uses_allocation(const Usb4Router& r, const Usb4Port& p) const { return p.is_lane() && r.credit_allocation; }
   bool tmu_set_time_disruption(const Usb4Router& r, bool set);

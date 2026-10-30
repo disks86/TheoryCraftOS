@@ -106,14 +106,24 @@ bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port
     return false;
   }
   const uint32_t depth = route_length(route);
-  const uint8_t version = static_cast<uint8_t>((header[4] >> 24) >> 5 & 0x7);
+  const uint8_t version = static_cast<uint8_t>((header[4] >> 24) >> 5 & 0x7);   // (the USB4 major version, zero for Thunderbolt 3)
   if (depth > kMaxDepth) {
     *error = "too deep";
     return false;
   }
+  // (a Thunderbolt 3 router has no USB4 version: it is run through its vendor specific capabilities, and must have the plug events one)
+  bool tbt3 = false;
+  int plug_cap = -1, lc_cap = -1;
   if (version == 0) {
-    *error = "not a USB4 router (a Thunderbolt 3 device router is not supported by the software connection manager)";
-    return false;
+    Usb4Router probe;
+    probe.route = route;
+    plug_cap = find_router_vse(probe, kVsecPlugEvents);
+    lc_cap = find_router_vse(probe, kVsecLinkController);
+    if (plug_cap <= 0 || (header[0] & 0xFFFF) != 0x8086) {
+      *error = "a Thunderbolt 3 router without the plug events capability, or not Intel's";
+      return false;
+    }
+    tbt3 = true;
   }
   const uint32_t max_port = (header[1] >> 14) & 0x3F;
   if (max_port == 0 || upstream > max_port) {
@@ -134,6 +144,9 @@ bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port
   r.vendor_id = static_cast<uint16_t>(header[0]);
   r.device_id = static_cast<uint16_t>(header[0] >> 16);
   r.usb4_version = version;
+  r.tbt3 = tbt3;
+  r.cap_plug_events = tbt3 ? static_cast<uint8_t>(plug_cap) : 0;
+  r.cap_lc = tbt3 && lc_cap > 0 ? static_cast<uint8_t>(lc_cap) : 0;
   r.parent = parent;
   r.parent_port = parent_port;
   // configure it (tb_switch_configure): its route, depth, upstream port, enabled; the connection manager's version and the pause between plug events
@@ -142,7 +155,8 @@ bool Usb4Domain::read_router(uint64_t route, int16_t parent, uint8_t parent_port
   config[1] = static_cast<uint32_t>(route);
   config[2] = (static_cast<uint32_t>(route >> 32) & 0x3FFFFF) | (1u << 31);
   config[3] = (header[4] & 0xFFFF0000u) | 0xA | ((version < 2 ? 0x10u : 0x20u) << 8);
-  if (!write(route, 0, TbConfigSpace::Switch, kRouterCs1, ArrayView<const uint32_t>(config, 4))) {
+  // (the Thunderbolt 3 kind has no connection manager version word: three words, then the plug events)
+  if (!write(route, 0, TbConfigSpace::Switch, kRouterCs1, ArrayView<const uint32_t>(config, tbt3 ? 3 : 4)) || (tbt3 && !plug_events_active(r))) {
     r.present = false;
     *error = "could not configure the router";
     return false;
@@ -235,24 +249,53 @@ bool Usb4Domain::unlock_downstream(const Usb4Router& r, uint32_t port) {
   return port_write(r, port, kAdpCs4, ArrayView<const uint32_t>(&word, 1));
 }
 
-bool Usb4Domain::configure_link(Usb4Router& child, Usb4Router& parent, uint32_t down_port) {
-  // both ends of the link are marked configured (usb4_port_configure: PORT_CS_19.PC)
-  const uint32_t ends[2] = {down_port, child.upstream_port};
-  Usb4Router* routers[2] = {&parent, &child};
-  for (uint32_t i = 0; i < 2; ++i) {
-    const Usb4Port& p = routers[i]->ports[ends[i]];
-    if (p.cap_usb4 == 0) return false;
-    uint32_t word = 0;
-    if (!port_read(*routers[i], ends[i], p.cap_usb4 + kPortCs19, ArrayView<uint32_t>(&word, 1))) return false;
-    word |= kPortCs19Pc;
-    if (!port_write(*routers[i], ends[i], p.cap_usb4 + kPortCs19, ArrayView<const uint32_t>(&word, 1))) return false;
+bool Usb4Domain::configure_port(const Usb4Router& r, uint32_t port, bool upstream) {
+  if (r.tbt3) return lc_set_configured(r, port, upstream);
+  const Usb4Port& p = r.ports[port];
+  if (p.cap_usb4 == 0) return false;
+  uint32_t word = 0;
+  if (!port_read(r, port, p.cap_usb4 + kPortCs19, ArrayView<uint32_t>(&word, 1))) return false;
+  word |= kPortCs19Pc;
+  return port_write(r, port, p.cap_usb4 + kPortCs19, ArrayView<const uint32_t>(&word, 1));
+}
+
+// The link controller's registers of the physical port a lane adapter belongs to (find_port_lc_cap): its descriptor says where the per-port blocks start and how big they are.
+bool Usb4Domain::lc_set_configured(const Usb4Router& r, uint32_t port, bool upstream) {
+  if (r.cap_lc == 0) return false;
+  uint32_t desc = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_lc + kLcDesc, ArrayView<uint32_t>(&desc, 1))) return false;
+  const uint32_t start = (desc >> 8) & 0xFF, size = (desc >> 16) & 0xFFF, phys = (port - 1) / 2;
+  const uint32_t cap = r.cap_lc + start + phys * size;
+  if (cap + kLcSxCtrl >= 0x1FFF) return false;
+  uint32_t ctrl = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, cap + kLcSxCtrl, ArrayView<uint32_t>(&ctrl, 1))) return false;
+  ctrl |= (port % 2) ? kLcSxCtrlL1c : kLcSxCtrlL2c;
+  if (upstream) ctrl |= kLcSxCtrlUpstream;
+  return write(r.route, 0, TbConfigSpace::Switch, cap + kLcSxCtrl, ArrayView<const uint32_t>(&ctrl, 1));
+}
+
+bool Usb4Domain::bonding_possible(const Usb4Router& child) {
+  uint32_t word = 0;
+  if (!child.tbt3) {
+    const Usb4Port& up = child.ports[child.upstream_port];
+    return up.cap_usb4 != 0 && port_read(child, child.upstream_port, up.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&word, 1)) && (word & kPortCs18Be);
   }
-  return true;
+  if (child.cap_lc == 0) return false;
+  uint32_t desc = 0;
+  if (!read(child.route, 0, TbConfigSpace::Switch, child.cap_lc + kLcDesc, ArrayView<uint32_t>(&desc, 1))) return false;
+  const uint32_t cap = child.cap_lc + ((desc >> 8) & 0xFF) + ((child.upstream_port - 1) / 2) * ((desc >> 16) & 0xFFF);
+  return cap + kLcPortAttr < 0x1FFF && read(child.route, 0, TbConfigSpace::Switch, cap + kLcPortAttr, ArrayView<uint32_t>(&word, 1)) && (word & kLcPortAttrBe);
+}
+
+bool Usb4Domain::configure_link(Usb4Router& child, Usb4Router& parent, uint32_t down_port) {
+  // both ends of the link are marked configured (usb4_port_configure: PORT_CS_19.PC; the link controller for a Thunderbolt 3 router)
+  return configure_port(child, child.upstream_port, true) && configure_port(parent, down_port, false);
 }
 
 // usb4_switch_setup: CNS cleared (this connection manager does Thunderbolt 3 tunnelling too), PCIe tunnelling allowed when the parent has a PCIe down adapter (and the xHCI over it).
 bool Usb4Domain::switch_setup(Usb4Router& child, const Usb4Router& parent) {
   uint32_t cs6 = 0, cs5 = 0;
+  if (child.tbt3) return true;                              // (nothing of this for a Thunderbolt 3 router)
   if (!read(child.route, 0, TbConfigSpace::Switch, kRouterCs6, ArrayView<uint32_t>(&cs6, 1)) || !read(child.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<uint32_t>(&cs5, 1))) return false;
   bool parent_has_pcie = false;
   for (uint32_t p = 1; p <= parent.max_port; ++p) parent_has_pcie = parent_has_pcie || parent.ports[p].type == kTypePcieDown;
@@ -265,6 +308,7 @@ bool Usb4Domain::switch_setup(Usb4Router& child, const Usb4Router& parent) {
 }
 
 bool Usb4Domain::configuration_valid(Usb4Router& r) {
+  if (r.tbt3) return true;
   uint32_t cs5 = 0;
   if (!read(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<uint32_t>(&cs5, 1))) return false;
   cs5 |= kCs5Cv;
@@ -412,6 +456,47 @@ bool Usb4Domain::read_drom(Usb4Router& r) {
   return true;
 }
 
+// ------------------------------------------------------------------ Thunderbolt 3 routers
+
+// A vendor specific capability of the router's space (tb_switch_find_vse_cap): capability id 5, the VSEC id in byte 2; the short form has a length in byte 3 and the next offset in byte 0,
+// the long form (length zero) has the next offset in the upper half of the second dword.
+int Usb4Domain::find_router_vse(const Usb4Router& r, uint8_t vsec) {
+  uint32_t header = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, 1, ArrayView<uint32_t>(&header, 1))) return -1;
+  uint32_t offset = header & 0xFF;
+  for (uint32_t i = 0; i < 64 && offset != 0 && offset < 0x1F00; ++i) {
+    uint32_t word = 0;
+    if (!read(r.route, 0, TbConfigSpace::Switch, offset, ArrayView<uint32_t>(&word, 1))) return -1;
+    const uint32_t cap = (word >> 8) & 0xFF;
+    uint32_t next = word & 0xFF;
+    if (cap == kSwitchCapVse) {
+      if (((word >> 16) & 0xFF) == vsec) return static_cast<int>(offset);
+      if (((word >> 24) & 0xFF) == 0) {                      // the long form
+        uint32_t second = 0;
+        if (!read(r.route, 0, TbConfigSpace::Switch, offset + 1, ArrayView<uint32_t>(&second, 1))) return -1;
+        next = second & 0xFFFF;
+      }
+    }
+    offset = next;
+  }
+  return -1;
+}
+
+// tb_plug_events_active(true) for the Thunderbolt 3 kind: the pause between events set to its longest, and the USB hot plug event disabled (Alpine Ridge needs it for its xHCI).
+bool Usb4Domain::plug_events_active(const Usb4Router& r) {
+  uint32_t word = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, 4, ArrayView<uint32_t>(&word, 1))) return false;
+  word = (word & ~0xFFu) | 0xFF;
+  if (!write(r.route, 0, TbConfigSpace::Switch, 4, ArrayView<const uint32_t>(&word, 1))) return false;
+  uint32_t events = 0;
+  if (!read(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + 1, ArrayView<uint32_t>(&events, 1))) return false;
+  events &= 0xFFFFFF83u;
+  const uint16_t id = r.device_id;
+  const bool alpine = r.vendor_id == 0x8086 && (id == 0x1576 || id == 0x1578 || id == 0x15C0 || id == 0x15D3 || id == 0x15DA);
+  if (!alpine) events |= kPlugEventsUsbDisable;
+  return write(r.route, 0, TbConfigSpace::Switch, r.cap_plug_events + 1, ArrayView<const uint32_t>(&events, 1));
+}
+
 // ------------------------------------------------------------------ time management unit
 
 // A capability of the router's own space: the list starts at the first offset of the header (dword 1, low byte), each entry has its id in byte 1 and the next offset in byte 0.
@@ -488,7 +573,7 @@ bool Usb4Domain::tmu_enable_root(Usb4Router& root) {
 }
 
 bool Usb4Domain::tmu_enable(Usb4Router& child, Usb4Router& parent, const Usb4Router& root, uint32_t down_port) {
-  if (child.cap_tmu == 0 || !parent.tmu_lowres) return false;
+  if (child.tbt3 || child.cap_tmu == 0 || !parent.tmu_lowres) return false;
   uint32_t cs0 = 0;
   if (!read(child.route, 0, TbConfigSpace::Switch, child.cap_tmu + kTmuRtrCs0, ArrayView<uint32_t>(&cs0, 1)) || !(cs0 & kTmuRtrCs0Ucap)) return false;
   tmu_post_time(child, root);
@@ -702,6 +787,7 @@ bool Usb4Domain::set_wake(Usb4Router& r, bool runtime) {
 }
 
 bool Usb4Domain::put_to_sleep(Usb4Router& r, bool runtime) {
+  if (r.tbt3) return true;                                  // (a Thunderbolt 3 router sleeps through its link controller, which is not driven here: it is left to go with its link)
   if (!set_wake(r, runtime)) return false;
   uint32_t cs5 = 0;
   if (!read(r.route, 0, TbConfigSpace::Switch, kRouterCs5, ArrayView<uint32_t>(&cs5, 1))) return false;
@@ -1362,9 +1448,7 @@ bool Usb4Domain::set_lane_width(const Usb4Router& r, uint32_t port, uint32_t tar
 bool Usb4Domain::bond_link(Usb4Router& child, Usb4Router& parent, uint32_t down_port) {
   Usb4Port& up = child.ports[child.upstream_port];
   Usb4Port& down = parent.ports[down_port];
-  if (up.dual_link < 0 || down.dual_link < 0 || up.cap_usb4 == 0) return false;
-  uint32_t cs18 = 0;
-  if (!port_read(child, child.upstream_port, up.cap_usb4 + kPortCs18, ArrayView<uint32_t>(&cs18, 1)) || !(cs18 & kPortCs18Be)) return false;
+  if (up.dual_link < 0 || down.dual_link < 0 || !bonding_possible(child)) return false;
   for (int end = 0; end < 2; ++end) {
     const Usb4Router& r = end == 0 ? child : parent;
     const uint32_t lane0 = end == 0 ? child.upstream_port : down_port;

@@ -3452,6 +3452,57 @@ static void test_usb4_credits() {
   }
 }
 
+static void test_usb4_tbt3_device() {
+  Usb4Rig rig(false);
+  rig.fabric.add(0x03, 2, 0, true);
+  rig.fabric.make_tbt3(0x03);
+  rig.fabric.at(0x03).regs[0x29] = 0xFFFFFFFFu;                                                 // the plug events register as the router powers up
+  rig.fabric.link(0, 3, 0x03);
+  Usb4Domain domain(rig.control, rig.nhi, rig.alloc);
+  const char* error = nullptr;
+  CHECK(domain.start(nullptr) && domain.present_count() == 3 && domain.unreachable_links() == 0);
+  const Usb4Router& dock = *domain.router(2);
+  CHECK(dock.tbt3 && dock.usb4_version == 0 && dock.route == 0x03 && dock.parent == 0 && dock.cap_plug_events == 0x28 && dock.cap_lc == 0x30 && dock.depth == 1);
+  fake_usb4::Router& fr = rig.fabric.at(0x03);
+  // configured with three words, the pause between plug events at its longest, the USB hot plug event disabled
+  CHECK(fr.regs[2] == 0x03 && fr.regs[3] == (1u << 31) && (fr.regs[4] & 0xFF) == 0xFF && fr.regs[0x29] == 0xFFFFFF87u);
+  // none of the USB4 router steps: no tunnelling bits, no configuration valid
+  CHECK(fr.cs5_writes == 0 && !(fr.regs[5] & kCs5Cv) && !domain.tmu_enabled(2));
+  // the link is marked configured through the link controller on its side (lane 1 of physical port 0: L1C, and the upstream flag) and through the port capability on the USB4 side
+  CHECK((fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlL1c) && (fr.regs[0x34 + kLcSxCtrl] & kLcSxCtrlUpstream) && (rig.fabric.at(0).ports[3].space[0x20 + kPortCs19] & kPortCs19Pc));
+  // the link controller allows bonding: the lanes are bonded
+  CHECK(domain.link_bonded(2) && (fr.ports[1].space[0x11] & kLaneCs1TargetWidthMask) == kLaneCs1TargetDual);
+  // a PCIe tunnel to it works as to any router: 32 credits on the bonded lanes
+  CHECK(domain.approve_pcie(2, &error) && domain.pcie_tunnelled(2) && ((fr.ports[1].hops[8].first >> 17) & 0x7F) == 32 && (fr.ports[5].space[0x10] & kAdpPcieCs0Pe));
+  // it sleeps with the rest (through its own link, not driven here), and is found again
+  CHECK(domain.suspend(false));
+  CHECK(domain.resume(&error) && domain.present_count() == 3);
+  // an Alpine Ridge bridge keeps the USB hot plug event
+  Usb4Rig alpine(false);
+  alpine.fabric.add(0x03, 2, 0, true);
+  alpine.fabric.make_tbt3(0x03, 0x1578);
+  alpine.fabric.at(0x03).regs[0x29] = 0xFFFFFFFFu;
+  alpine.fabric.link(0, 3, 0x03);
+  Usb4Domain d(alpine.control, alpine.nhi, alpine.alloc);
+  CHECK(d.start(nullptr) && alpine.fabric.at(0x03).regs[0x29] == 0xFFFFFF83u);
+  // not Intel's, without the plug events capability, without the link controller: not taken
+  Usb4Rig other(false);
+  other.fabric.add(0x03, 2, 0, true);
+  other.fabric.make_tbt3(0x03);
+  other.fabric.at(0x03).vendor = 0x1234;
+  other.fabric.link(0, 3, 0x03);
+  Usb4Domain d2(other.control, other.nhi, other.alloc);
+  CHECK(d2.start(nullptr) && d2.present_count() == 2 && d2.unreachable_links() == 1);
+  Usb4Rig nolc(false);
+  nolc.fabric.add(0x03, 2, 0, true);
+  nolc.fabric.make_tbt3(0x03);
+  nolc.fabric.at(0x03).regs[0x28] &= ~0xFFu;
+  nolc.fabric.at(0x03).regs[0x30] = 0;                                                          // (the link controller is not in the list any more)
+  nolc.fabric.link(0, 3, 0x03);
+  Usb4Domain d3(nolc.control, nolc.nhi, nolc.alloc);
+  CHECK(d3.start(nullptr) && d3.present_count() == 2);                                         // (it is refused: its link cannot be configured)
+}
+
 static void test_usb4_garbage() {
   // the routers answer with noise: the manager must stay inside its arrays, whatever comes (and the sanitizers say if it does not)
   for (uint32_t seed = 1; seed <= 200; ++seed) {
@@ -3503,6 +3554,7 @@ int main() {
   test_usb4_drom();
   test_usb4_tmu();
   test_usb4_credits();
+  test_usb4_tbt3_device();
   test_usb4_runtime_sleep();
   test_usb4_xdomain_failures();
   test_usb4_driver();
