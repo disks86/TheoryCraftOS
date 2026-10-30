@@ -40,19 +40,34 @@ class IAcpiPorts {
   virtual uint16_t in16(uint16_t port) = 0;
   virtual void out16(uint16_t port, uint16_t value) = 0;
   virtual void delay_us(uint32_t us) = 0;
+  // Registers at memory addresses (a FADT may describe its blocks that way); none by default.
+  virtual uint8_t mem_in8(uint64_t address) { (void)address; return 0; }
+  virtual void mem_out8(uint64_t address, uint8_t value) { (void)address; (void)value; }
+  virtual uint16_t mem_in16(uint64_t address) { (void)address; return 0; }
+  virtual void mem_out16(uint64_t address, uint16_t value) { (void)address; (void)value; }
 
  protected:
   IAcpiPorts() = default;
   ~IAcpiPorts() = default;
 };
 
-// The fields of the FADT ("FACP") the events use.
+// Where a register block is: an I/O port or a physical memory address.
+struct AcpiAddress {
+  uint64_t address = 0;
+  bool memory = false;
+  bool valid() const { return address != 0; }
+  AcpiAddress at(uint32_t offset) const { return AcpiAddress{address + offset, memory}; }
+};
+
+// The fields of the FADT ("FACP") the events use. A block comes from the extended (generic address) field when the table has it and it is not zero, else from the 32 bit one.
 struct AcpiFadt {
   uint16_t sci_interrupt = 0;
   uint32_t smi_command = 0;
   uint8_t acpi_enable = 0, acpi_disable = 0;
-  uint32_t pm1a_control = 0, gpe0_block = 0, gpe1_block = 0;
-  uint8_t gpe0_length = 0, gpe1_length = 0, gpe1_base = 0;
+  AcpiAddress pm1a_event, pm1a_control, gpe0_block, gpe1_block;
+  uint8_t pm1_event_length = 0, gpe0_length = 0, gpe1_length = 0, gpe1_base = 0;
+  uint32_t flags = 0;
+  static constexpr uint32_t kFlagPowerButtonControlMethod = 1u << 4, kFlagSleepButtonControlMethod = 1u << 5;   // no fixed feature button: a device does it
 };
 bool acpi_parse_fadt(ConstByteView table, AcpiFadt* out);
 
@@ -65,8 +80,20 @@ class IAcpiNotifyListener {
   ~IAcpiNotifyListener() = default;
 };
 
+// The buttons of a laptop. A power or sleep button is either a fixed feature (PM1 status bits) or a device (PNP0C0C, PNP0C0E) that notifies 0x80; the lid is a device (PNP0C0D) whose _LID says open or closed.
+enum class AcpiButton : uint8_t { Power, Sleep, Lid };
+class IAcpiButtonListener {
+ public:
+  virtual void on_button(AcpiButton button, bool lid_open) = 0;   // `lid_open` is only meant for the lid
+
+ protected:
+  IAcpiButtonListener() = default;
+  ~IAcpiButtonListener() = default;
+};
+
 class AcpiEvents {
  public:
+  static constexpr uint32_t kMaxButtons = 8;
   static constexpr uint32_t kMaxTables = 64, kMaxWake = 8, kMaxNotifies = 16, kMaxBlockBytes = 32;
   static constexpr uint16_t kScienable = 1;       // SCI_EN, bit 0 of PM1a_CNT
   struct WakeSource {
@@ -74,7 +101,7 @@ class AcpiEvents {
     uint8_t deepest_state = 0;                    // the deepest sleep state the device can wake the machine from
   };
 
-  AcpiEvents(IAcpiHost& host, IAcpiPorts& ports, allocators::IAllocator& allocator) : bridge_(host), ports_(ports), vm_(allocator, bridge_) {}
+  AcpiEvents(IAcpiHost& host, IAcpiPorts& ports, allocators::IAllocator& allocator) : bridge_(host), ports_(ports), vm_(allocator, bridge_), host_(host) {}
 
   // Loads the definition blocks and reads the FADT. False without a DSDT, a FADT or any event register block (then no event hardware is touched). `tables` must stay valid.
   bool initialize(const ConstByteView* tables, uint32_t count, ConstByteView fadt);
@@ -101,9 +128,27 @@ class AcpiEvents {
   uint32_t wake_count() const { return wake_count_; }
 
   void set_listener(IAcpiNotifyListener* listener) { listener_ = listener; }
+
+  // The embedded controller's events: its ports and region are set up from the tables (_CRS, _REG), its GPE (_GPE) armed, and when that fires the controller is asked for its pending events
+  // (status bit SCI_EVT, query command) and the method _Qxx of each runs. This is how a lid or a button of the laptop reaches the tables. False without a controller device (PNP0C09) or a _GPE.
+  bool enable_embedded_controller();
+  bool embedded_controller_armed() const { return ec_node_ != nullptr; }
+  uint32_t embedded_events() const { return ec_events_; }
+
+  // Buttons: the devices are found in the namespace (up to kMaxButtons), their wake events armed, and the fixed feature buttons enabled in PM1 unless the FADT says a device does it. Returns
+  // how many buttons can be reported. The listener hears of a press (Power, Sleep) or of the lid opening or closing.
+  uint32_t enable_buttons();
+  void set_button_listener(IAcpiButtonListener* listener) { buttons_listener_ = listener; }
+  // The state of the lid (_LID); false if there is none.
+  bool lid_open(bool* open);
   // Looks at the event registers and runs the methods of what is pending; the notifications they make go to the listener. Returns the number of events handled.
   uint32_t poll();
   uint32_t events_handled() const { return handled_; }
+  // PM1 events beyond the buttons. The RTC alarm (RTC_STS, bit 10) is reported when enabled: it is what wakes a machine at a set time. The global lock release (GBL, bit 5) and the
+  // wake status (WAK, bit 15) are cleared and counted, never enabled; nothing here uses the timer (bit 0). A set status bit that has no enable is left as the hardware has it.
+  void enable_rtc_event(bool on);
+  uint32_t rtc_alarms() const { return rtc_alarms_; }
+  uint32_t pm1_other() const { return pm1_other_; }
   uint32_t events_without_method() const { return unanswered_; }
 
  private:
@@ -133,9 +178,21 @@ class AcpiEvents {
     uint32_t gpe = 0;
   };
 
-  bool locate(uint32_t gpe, uint16_t* status_port, uint16_t* enable_port, uint8_t* bit) const;
+  struct Button {
+    acpi::Node* device = nullptr;
+    AcpiButton kind = AcpiButton::Power;
+  };
+  void find_buttons(acpi::Node* node, uint32_t depth);
+  void handle_ec(AcpiAddress status_port, AcpiAddress enable_port, uint8_t bit);
+  void button_pressed(AcpiButton kind);
+  void poll_fixed_buttons();
+  bool locate(uint32_t gpe, AcpiAddress* status_port, AcpiAddress* enable_port, uint8_t* bit) const;
+  uint8_t in8(const AcpiAddress& a) { return a.memory ? ports_.mem_in8(a.address) : ports_.in8(static_cast<uint16_t>(a.address)); }
+  void out8(const AcpiAddress& a, uint8_t v) { if (a.memory) ports_.mem_out8(a.address, v); else ports_.out8(static_cast<uint16_t>(a.address), v); }
+  uint16_t in16(const AcpiAddress& a) { return a.memory ? ports_.mem_in16(a.address) : ports_.in16(static_cast<uint16_t>(a.address)); }
+  void out16(const AcpiAddress& a, uint16_t v) { if (a.memory) ports_.mem_out16(a.address, v); else ports_.out16(static_cast<uint16_t>(a.address), v); }
   bool find_in(acpi::Node* parent, const IPciBus& pci, uint8_t bus, PciAddress wanted, uint32_t depth, acpi::Node** found);
-  void handle(uint32_t gpe, uint16_t status_port, uint16_t enable_port, uint8_t bit);
+  void handle(uint32_t gpe, AcpiAddress status_port, AcpiAddress enable_port, uint8_t bit);
   void deliver();
 
   Bridge bridge_;
@@ -146,7 +203,14 @@ class AcpiEvents {
   Wake wake_[kMaxWake];
   uint32_t wake_count_ = 0;
   IAcpiNotifyListener* listener_ = nullptr;
-  uint32_t handled_ = 0, unanswered_ = 0;
+  IAcpiButtonListener* buttons_listener_ = nullptr;
+  acpi::Node* ec_node_ = nullptr;
+  uint32_t ec_gpe_ = 0, ec_events_ = 0;
+  Button buttons_[kMaxButtons];
+  uint32_t button_count_ = 0;
+  bool fixed_power_ = false, fixed_sleep_ = false, rtc_enabled_ = false;
+  IAcpiHost& host_;
+  uint32_t handled_ = 0, unanswered_ = 0, rtc_alarms_ = 0, pm1_other_ = 0;
 };
 
 }  // namespace hardware

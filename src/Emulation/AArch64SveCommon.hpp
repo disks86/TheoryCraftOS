@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "Emulation/AArch64NeonCommon.hpp"
 #include "Emulation/Wide.hpp"
+#include "Emulation/SoftFloat.hpp"
 
 // Helpers shared by the SVE files (AArch64Sve*.cpp). The vector length is fixed at 128 bits, so a Z register is the low and high word of the V register of the same number, a
 // predicate register is 16 bits (one per byte of the vector), and an element of size 2^esz bytes is active when the predicate bit at (index << esz) is set.
@@ -71,6 +72,32 @@ inline uint64_t rotate_right(uint64_t x, uint32_t n, uint32_t w) {
   return n == 0 ? x : ((x >> n) | (x << (w - n))) & ones(w);
 }
 
+// Predicate-as-counter registers (SVE2.1 / SME2): bits 3:0 hold a marker (the lowest set bit gives the element size, 0 = byte .. 3 = doubleword), bits 6:marker+1 the element count and bit 15
+// inverts the meaning. The predicate for vector `segment` of the group, at element size `esz` (a counter made for a wider element keeps that element's spacing).
+inline uint16_t counter_to_predicate(uint16_t pn, uint32_t esz, uint32_t segment) {
+  if ((pn & 15) == 0) return 0;
+  uint32_t marker = 0;
+  while (!((pn >> marker) & 1)) ++marker;
+  const bool invert = (pn >> 15) & 1;
+  const uint32_t count = (pn & 0x7Fu) >> (marker + 1);      // (only bits 6:marker+1 count; the higher bits are ignored)
+  const uint32_t es = esz > marker ? esz : marker;
+  const uint32_t elements = ((count << marker) + (1u << es) - 1) >> es, per_vector = 16u >> es;
+  uint16_t r = 0;
+  for (uint32_t i = 0; i < per_vector; ++i) {
+    const bool on = (segment * per_vector + i < elements) != invert;
+    if (on) r = static_cast<uint16_t>(r | (1u << (i << es)));
+  }
+  return r;
+}
+
+// A counter for `run` leading active elements out of `total` (ascending) or trailing ones (descending, which the inverted form expresses).
+inline uint16_t make_counter(uint32_t run, uint32_t total, uint32_t esz, bool ascending) {
+  const uint16_t marker = static_cast<uint16_t>(1u << esz);
+  if (run >= total) return static_cast<uint16_t>(0x8000u | marker);
+  if (run == 0) return 0;
+  return ascending ? static_cast<uint16_t>(marker | (run << (esz + 1))) : static_cast<uint16_t>(0x8000u | marker | ((total - run) << (esz + 1)));
+}
+
 // A logical immediate (N:immr:imms) as the 64-bit pattern it replicates; false for a reserved encoding.
 inline bool decode_logical_immediate(uint32_t imm13, uint64_t* out) {
   const uint32_t n = (imm13 >> 12) & 1, immr = (imm13 >> 6) & 63, imms = imm13 & 63;
@@ -105,6 +132,27 @@ inline I128 multiply_signed(int64_t a, int64_t b) {
 inline I128 doubling_high(I128 acc, I128 prod, uint32_t w, bool rounding) {
   const I128 half_unit = rounding ? (static_cast<I128>(1) << (w - 2)) : 0;
   return acc + ((prod + half_unit) >> (w - 1));
+}
+
+// The BFloat16 dot product step used by BFDOT, BFMMLA and BFMOPA: exact products, every add rounded to odd, denormals flushed, the default NaN, no exception flags. `sum` is single precision,
+// the four others are BFloat16 values in the low 16 bits.
+inline uint64_t bfloat_odd_op(bool is_mul, uint64_t x, uint64_t y, const softfloat::Env& base) {
+  using namespace softfloat;
+  if (is_nan(Format::F32, x) || is_nan(Format::F32, y)) return 0x7FC00000u;
+  Env e = base;
+  e.mode = Rounding::TowardZero;
+  e.flags = 0;
+  e.daz = true;
+  e.ftz = true;
+  uint64_t r = is_mul ? mul(Format::F32, x, y, e) : add(Format::F32, x, y, e);
+  if (is_nan(Format::F32, r)) return 0x7FC00000u;
+  if (e.flags & kOverflow) return (r & 0x80000000u) | 0x7F800000u;      // (an overflow gives an infinity)
+  if ((e.flags & kInexact) && (r & 0x7FFFFFFFu) != 0x7F800000u) r |= 1;
+  return r;
+}
+inline uint64_t bfloat_dot_add(uint64_t sum, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1, const softfloat::Env& base) {
+  const uint64_t p1 = bfloat_odd_op(true, (a0 & 0xFFFF) << 16, (b0 & 0xFFFF) << 16, base), p2 = bfloat_odd_op(true, (a1 & 0xFFFF) << 16, (b1 & 0xFFFF) << 16, base);
+  return bfloat_odd_op(false, sum, bfloat_odd_op(false, p1, p2, base), base);
 }
 
 // The high half of a 64 x 64 product, signed or unsigned.

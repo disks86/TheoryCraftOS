@@ -542,6 +542,12 @@ AArch64Cpu::Step AArch64Cpu::system_instruction(uint32_t insn) {
     exclusive_valid_ = false;
     return Step::Ok;
   }
+  if ((insn & 0xFFFFF0FFu) == 0xD503407Fu) {      // SMSTART / SMSTOP (SM, ZA or both): CRm bit 0 is the new value, bits 2:1 select what changes
+    const uint32_t crm = bits_of(insn, 11, 8), what = crm >> 1;
+    if (what == 0) return undefined();
+    set_streaming_state((crm & 1) != 0, (crm & 1) != 0, (what & 1) != 0, (what & 2) != 0);
+    return Step::Ok;
+  }
   const bool read = (insn & 0xFFF00000u) == 0xD5300000u, write = (insn & 0xFFF00000u) == 0xD5100000u;
   if (!read && !write) {
     if ((insn & 0xFFF8F01Fu) == 0xD500401Fu) {      // MSR immediate (DAIFSet etc.): only SPSel/DAIF forms exist; ignore
@@ -566,13 +572,17 @@ AArch64Cpu::Step AArch64Cpu::system_instruction(uint32_t insn) {
   } else if (k == make(3, 3, 4, 4, 1)) {      // FPSR
     if (read) set_reg(rt, s_.fpsr, true);
     else s_.fpsr = static_cast<uint32_t>(reg(rt, true)) & 0xF800009Fu;
+  } else if (read && k == make(3, 3, 4, 2, 2)) {      // SVCR: bit 0 SM, bit 1 ZA
+    set_reg(rt, (s_.streaming ? 1u : 0u) | (s_.za_enabled ? 2u : 0u), true);
   } else if (read) {
-    if (k == make(3, 3, 14, 0, 2) || k == make(3, 3, 14, 0, 1)) value = retired_;      // CNTVCT_EL0 / CNTPCT_EL0: the instruction count is the clock
+    if (k == make(3, 0, 0, 4, 5)) value = 0x80f15cff00000000ull;      // ID_AA64SMFR0_EL1: the SME outer products and FA64, SME2 is only partly implemented so it is not reported
+    else if (k == make(3, 3, 14, 0, 2) || k == make(3, 3, 14, 0, 1)) value = retired_;      // CNTVCT_EL0 / CNTPCT_EL0: the instruction count is the clock
     else if (k == make(3, 3, 14, 0, 0)) value = 1000000000;      // CNTFRQ_EL0
     else if (k == make(3, 3, 0, 0, 7)) value = 0x10;      // DCZID_EL0: DC ZVA prohibited
     else if (k == make(3, 3, 0, 0, 1)) value = 0x8444C004;      // CTR_EL0
     else if (k == make(3, 0, 0, 0, 0)) value = 0x410FD070;      // MIDR_EL1 (an Arm implementer, a generic part)
     else if (k == make(3, 0, 0, 0, 5)) value = 0;      // MPIDR_EL1
+    else if (k == make(3, 0, 0, 4, 1)) value = 1ull << 24;      // ID_AA64PFR1_EL1: SME
     else if (k == make(3, 0, 0, 4, 0)) value = 0x100000011ull;      // ID_AA64PFR0_EL1: AArch64 at EL0 and EL1, SVE
     else if (k == make(3, 0, 0, 4, 4)) value = 0x1 | (0x2ull << 4) | (1ull << 16) | (1ull << 20) | (1ull << 32) | (1ull << 40) | (1ull << 44) | (1ull << 52);      // ID_AA64ZFR0_EL1: SVE2, PMULL128, bit permute, BF16, SHA3, SM4, I8MM, F32MM
     else if (k == make(3, 0, 0, 6, 0)) value = (2ull << 4) | (1ull << 8) | (2ull << 12) | (1ull << 16) | (2ull << 20) | (1ull << 28) | (1ull << 32) | (1ull << 36) | (1ull << 40) | (1ull << 44) | (1ull << 48);      // ID_AA64ISAR0_EL1
@@ -971,6 +981,10 @@ AArch64Cpu::Step AArch64Cpu::step(GuestMemory& m) {
     case 2:              // 0010: SVE
       result = sve(m, insn);
       break;
+    case 0:              // 0000: SME (with bit 31 set; the rest is reserved)
+      if (!(insn >> 31)) return undefined();
+      result = sme(m, insn);
+      break;
     case 7: case 15:     // x111: scalar floating point and Advanced SIMD
       result = (((insn >> 24) & 0x1E) == 0x1E && !((insn >> 29) & 1) && !((insn >> 30) & 1)) ? floating_point(insn) : simd(insn);
       break;
@@ -986,7 +1000,7 @@ StopReason AArch64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
     const Step r = step(memory);
     if (r == Step::Fault) return StopReason::Fault;
     ++retired_;
-    if (r == Step::Syscall) return StopReason::Syscall;
+    if (r == Step::Syscall) { s_.streaming = false; return StopReason::Syscall; }      // (a system call leaves streaming mode, as on Linux)
   }
   // The slice is over. Threads take turns, so another one could write the word a pending LDXR read and the STXR would still succeed (real hardware loses the reservation
   // when another observer stores to it). A turn therefore never ends inside the usual few-instruction LDXR..STXR loop; a reservation still open after a generous
@@ -999,6 +1013,26 @@ StopReason AArch64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
   }
   exclusive_valid_ = false;
   return StopReason::Budget;
+}
+
+}  // namespace emulation
+
+namespace emulation {
+
+// SMSTART / SMSTOP: a change of streaming mode clears the vector and predicate registers and resets FPSR; enabling ZA clears it and disabling it discards it.
+void AArch64Cpu::set_streaming_state(bool streaming, bool za, bool change_sm, bool change_za) {
+  if (change_sm && s_.streaming != streaming) {
+    s_.streaming = streaming;
+    for (Vec& v : s_.v) v = Vec{};
+    for (uint16_t& p : s_.p) p = 0;
+    s_.ffr = 0;
+    s_.fpsr = 0x0800009Fu;
+  }
+  if (change_za) {
+    s_.za_enabled = za;
+    for (Vec& r : s_.za) r = Vec{};
+    for (uint64_t& w : s_.zt0) w = 0;
+  }
 }
 
 }  // namespace emulation

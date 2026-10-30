@@ -44,6 +44,10 @@ class AArch64Cpu final : public IGuestCpu {
     // SVE at a vector length of 128 bits: Z0..Z31 are v[], a predicate has one bit per byte of the vector (16 bits), FFR is the first-fault register.
     uint16_t p[16] = {};
     uint16_t ffr = 0;
+    // SME at a streaming vector length of 128 bits: PSTATE.SM and PSTATE.ZA, the ZA array (16 rows of one vector each) and ZT0 (SME2's 512-bit lookup table register).
+    bool streaming = false, za_enabled = false;
+    Vec za[16];
+    uint64_t zt0[8] = {};
   };
   static constexpr uint32_t kN = 1u << 31, kZ = 1u << 30, kC = 1u << 29, kV = 1u << 28;
 
@@ -120,6 +124,8 @@ class AArch64Cpu final : public IGuestCpu {
   bool sve_float(uint32_t insn);            // 0x64 / 0x65: floating point
   Step sve_memory(GuestMemory& m, uint32_t insn);      // 0x84 .. 0xE5: loads and stores
   void sve_set_flags(uint16_t mask, uint16_t result, uint32_t esz);      // PredTest
+  Step sme(GuestMemory& m, uint32_t insn);      // AArch64Sme*.cpp: the SME / SME2 encoding space (top bytes 0x80, 0x81, 0xA0, 0xA1, 0xC0, 0xC1, 0xE0, 0xE1)
+  void set_streaming_state(bool streaming, bool za, bool change_sm, bool change_za);      // SMSTART / SMSTOP
   bool crypto(uint32_t insn, Step* result);      // AArch64Crypto.cpp: AES, SHA, SM3, SM4 and pmull; false when the instruction is not one of them
 
   // floating point helpers (AArch64Fp.cpp)

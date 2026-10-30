@@ -85,6 +85,7 @@ add_executable(BOOTX64
   src/Hardware/Acpi/EmbeddedController.cpp
   src/Hardware/Acpi/SystemAcpiHost.cpp
   src/Hardware/Acpi/AcpiEvents.cpp
+  src/Hardware/Acpi/IoApic.cpp
   src/Hardware/Acpi/SystemAcpiPorts.cpp
   src/Hardware/Battery/AcpiBattery.cpp
   src/Hardware/Keyboard/KeyCodes.cpp
@@ -672,6 +673,7 @@ add_executable(BOOTX64
   src/Emulation/AArch64SvePermute.cpp
   src/Emulation/AArch64SveFloat.cpp
   src/Emulation/AArch64Sve2.cpp
+  src/Emulation/AArch64Sme.cpp
   src/Emulation/AArch64NeonShift.cpp
   src/Emulation/AArch64NeonThree.cpp
   src/Emulation/AArch64NeonElement.cpp
@@ -744,6 +746,7 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltNet.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltPower.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltNvm.cpp
+  src/Hardware/Bus/Thunderbolt/Usb4Domain.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltXdomain.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltControl.cpp
@@ -1090,6 +1093,10 @@ if(TCOS_INTEL_WIFI)
 endif()
 option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
 option(TCOS_THUNDERBOLT_START_FIRMWARE "With TCOS_THUNDERBOLT: start the controller's connection manager firmware if the BIOS did not (resets the controller's CPU through the upstream port's vendor registers)" OFF)
+option(TCOS_ACPI_EVENTS "Handle ACPI events: the power button, the sleep button and the lid, the embedded controller's events, the SCI through the I/O APIC (implied by TCOS_THUNDERBOLT; not yet run on a real machine)" OFF)
+if(TCOS_ACPI_EVENTS OR TCOS_THUNDERBOLT)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_ACPI_EVENTS)
+endif()
 option(TCOS_THUNDERBOLT_RUNTIME_PM "With TCOS_THUNDERBOLT: put the controller in D3hot after half a minute without devices or another host, and wake it by the ACPI event the tables name (polled)" OFF)
 if(TCOS_THUNDERBOLT)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_THUNDERBOLT)

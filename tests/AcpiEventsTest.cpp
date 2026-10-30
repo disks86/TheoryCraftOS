@@ -41,14 +41,26 @@ struct TestAllocator final : allocators::IAllocator {
 };
 
 struct FakeHost final : IAcpiHost {
-  void configure_ec(uint16_t, uint16_t) override {}
+  uint16_t ec_data = 0, ec_command = 0;
+  std::vector<uint8_t> ec_events;          // the events the controller holds, oldest first
+  bool ec_stuck = false;                   // it always claims an event, and says it is number 0x77
+  uint32_t ec_queries = 0;
+  void configure_ec(uint16_t data, uint16_t command) override { ec_data = data; ec_command = command; }
+  bool ec_status(uint8_t* value) override { *value = (!ec_events.empty() || ec_stuck) ? 0x20 : 0; return true; }
+  bool ec_query(uint8_t* event) override {
+    ++ec_queries;
+    if (ec_stuck) { *event = 0x77; return true; }
+    *event = ec_events.empty() ? 0 : ec_events.front();
+    if (!ec_events.empty()) ec_events.erase(ec_events.begin());
+    return true;
+  }
   bool region_read(const RegionAccess&, uint64_t*) override { return false; }
   bool region_write(const RegionAccess&, uint64_t) override { return false; }
 };
 
 // The chipset: I/O ports as a map; the GPE status registers clear by writing ones; SMI_CMD with ACPI_ENABLE sets SCI_EN.
 struct FakePorts final : IAcpiPorts {
-  static constexpr uint16_t kPm1Control = 0x1804, kSmiCommand = 0xB2, kGpe0 = 0x1860;
+  static constexpr uint16_t kPm1Event = 0x1800, kPm1Control = 0x1804, kSmiCommand = 0xB2, kGpe0 = 0x1860;
   static constexpr uint32_t kGpe0Registers = 16;
   std::map<uint16_t, uint8_t> reg;
   bool scien_follows_smi = true;
@@ -64,8 +76,30 @@ struct FakePorts final : IAcpiPorts {
     reg[port] = value;
   }
   uint16_t in16(uint16_t port) override { return static_cast<uint16_t>(reg[port] | (reg[port + 1] << 8)); }
-  void out16(uint16_t port, uint16_t value) override { reg[port] = static_cast<uint8_t>(value); reg[port + 1] = static_cast<uint8_t>(value >> 8); }
+  void out16(uint16_t port, uint16_t value) override {
+    if (port == kPm1Event) {                           // PM1 status: write one to clear
+      reg[port] &= static_cast<uint8_t>(~value);
+      reg[port + 1] &= static_cast<uint8_t>(~(value >> 8));
+      return;
+    }
+    reg[port] = static_cast<uint8_t>(value);
+    reg[port + 1] = static_cast<uint8_t>(value >> 8);
+  }
   void delay_us(uint32_t) override { ++delays; }
+  // memory registers: a block of GPE status/enable bytes (status ones clear when written) at kMemGpe, and PM1 at kMemPm1 as 16 bit registers
+  static constexpr uint64_t kMemGpe = 0x80000000ull, kMemPm1 = 0x80001000ull;
+  std::map<uint64_t, uint8_t> mem;
+  uint8_t mem_in8(uint64_t a) override { return mem[a]; }
+  void mem_out8(uint64_t a, uint8_t v) override {
+    if (a >= kMemGpe && a < kMemGpe + kGpe0Registers) mem[a] &= static_cast<uint8_t>(~v);
+    else mem[a] = v;
+  }
+  uint16_t mem_in16(uint64_t a) override { return static_cast<uint16_t>(mem[a] | (mem[a + 1] << 8)); }
+  void mem_out16(uint64_t a, uint16_t v) override {
+    if (a == kMemPm1) { mem[a] &= static_cast<uint8_t>(~v); mem[a + 1] &= static_cast<uint8_t>(~(v >> 8)); return; }
+    mem[a] = static_cast<uint8_t>(v);
+    mem[a + 1] = static_cast<uint8_t>(v >> 8);
+  }
   void raise(uint32_t gpe) { reg[kGpe0 + gpe / 8] |= static_cast<uint8_t>(1u << (gpe % 8)); }
   bool status(uint32_t gpe) { return reg[kGpe0 + gpe / 8] & (1u << (gpe % 8)); }
   bool enabled(uint32_t gpe) { return reg[kGpe0 + kGpe0Registers + gpe / 8] & (1u << (gpe % 8)); }
@@ -146,6 +180,8 @@ static Bytes make_fadt() {
   put32(t, 48, FakePorts::kSmiCommand);
   t[52] = 0xA0;                                  // ACPI_ENABLE
   t[53] = 0xA1;
+  put32(t, 56, FakePorts::kPm1Event);
+  t[88] = 4;                                     // PM1_EVT_LEN
   put32(t, 64, FakePorts::kPm1Control);
   put32(t, 80, FakePorts::kGpe0);
   t[92] = FakePorts::kGpe0Registers * 2;         // GPE0_BLK_LEN
@@ -160,7 +196,13 @@ static Bytes make_dsdt() {
   const Bytes far = device("NHI2", cat({name_def("_ADR", num(3)), name_def("_PRW", package(2, cat({num(0x1FF), num(3)})))}));   // an event outside the register block
   const Bytes port = device("RP05", cat({name_def("_ADR", num(0x1C0004)), nhi, second, plain, far}));
   const Bytes pci = device("PCI0", cat({name_def("_HID", num(0x080AD041)), name_def("_BBN", num(0)), port}));
-  return cat({scope("\\_SB", cat({name_def("PSWV", num(0xFF)), pci})),
+  const Bytes ec = device("EC0", cat({name_def("_HID", num(0x090CD041)), name_def("_GPE", num(0x23)),
+                                      method("_Q50", 0, notify("\\_SB.LID0", 0x80)),
+                                      method("_Q51", 0, notify("\\_SB.PWRB", 0x80)),
+                                      method("_Q52", 0, cat({store(num(0), path("\\_SB.LIDV")), notify("\\_SB.LID0", 0x80)}))}));
+  const Bytes lid = device("LID0", cat({name_def("_HID", num(0x0D0CD041)), method("_LID", 0, cat({b({0xA4}), path("\\_SB.LIDV")}))}));
+  const Bytes power = device("PWRB", name_def("_HID", num(0x0C0CD041)));
+  return cat({scope("\\_SB", cat({name_def("PSWV", num(0xFF)), name_def("LIDV", num(1)), pci, ec, lid, power})),
               scope("\\_GPE", cat({method("_L6D", 0, notify("\\_SB.PCI0.RP05", 2)), method("_E10", 0, notify("\\_SB.PCI0.RP05", 0x80))}))});
 }
 
@@ -173,8 +215,8 @@ static void test_fadt() {
   const Bytes fadt = make_fadt();
   AcpiFadt f;
   CHECK(acpi_parse_fadt(ConstByteView(fadt.data(), fadt.size()), &f));
-  CHECK(f.sci_interrupt == 9 && f.smi_command == FakePorts::kSmiCommand && f.acpi_enable == 0xA0 && f.acpi_disable == 0xA1 && f.pm1a_control == FakePorts::kPm1Control);
-  CHECK(f.gpe0_block == FakePorts::kGpe0 && f.gpe0_length == 32 && f.gpe1_block == 0 && f.gpe1_length == 0);
+  CHECK(f.sci_interrupt == 9 && f.smi_command == FakePorts::kSmiCommand && f.acpi_enable == 0xA0 && f.acpi_disable == 0xA1 && f.pm1a_control.address == FakePorts::kPm1Control && !f.pm1a_control.memory);
+  CHECK(f.gpe0_block.address == FakePorts::kGpe0 && f.gpe0_length == 32 && f.gpe1_block.address == 0 && f.gpe1_length == 0);
   for (size_t cut = 0; cut < 96; cut += 5) CHECK(!acpi_parse_fadt(ConstByteView(fadt.data(), cut), &f));            // truncated
   Bytes wrong = fadt;
   wrong[0] = 'X';
@@ -265,8 +307,147 @@ static void test_events() {
   CHECK(events.wake_count() == 1);
 }
 
+struct ButtonListener final : IAcpiButtonListener {
+  std::vector<std::pair<AcpiButton, bool>> seen;
+  void on_button(AcpiButton button, bool open) override { seen.push_back({button, open}); }
+};
+
+static void put64(Bytes& t, size_t at, uint64_t v) { put32(t, at, static_cast<uint32_t>(v)); put32(t, at + 4, static_cast<uint32_t>(v >> 32)); }
+
+// A FADT revision 5 that describes its PM1 event and GPE0 blocks as memory (generic address structures at 148 and 220) and PM1a_CNT as a port.
+static Bytes make_memory_fadt() {
+  Bytes t = make_fadt();
+  put32(t, 56, 0);
+  put32(t, 80, 0);
+  t[148] = 0; put64(t, 152, FakePorts::kMemPm1);          // X_PM1a_EVT_BLK: memory
+  t[220] = 0; put64(t, 224, FakePorts::kMemGpe);          // X_GPE0_BLK: memory
+  return t;
+}
+
+static void test_memory_blocks() {
+  TestAllocator alloc;
+  FakeHost host;
+  FakePorts ports;
+  const Bytes dsdt = make_table("DSDT", make_dsdt());
+  const Bytes fadt = make_memory_fadt();
+  const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+  AcpiFadt parsed;
+  CHECK(acpi_parse_fadt(ConstByteView(fadt.data(), fadt.size()), &parsed) && parsed.gpe0_block.memory && parsed.gpe0_block.address == FakePorts::kMemGpe && parsed.pm1a_event.memory && !parsed.pm1a_control.memory);
+  // an extended field that names a port, or nothing, leaves the old field; a space that is neither is ignored
+  Bytes port_form = make_fadt();
+  port_form[220] = 1; put64(port_form, 224, 0x1900);
+  CHECK(acpi_parse_fadt(ConstByteView(port_form.data(), port_form.size()), &parsed) && !parsed.gpe0_block.memory && parsed.gpe0_block.address == 0x1900);
+  Bytes odd = make_fadt();
+  odd[220] = 7; put64(odd, 224, 0x1234);
+  CHECK(acpi_parse_fadt(ConstByteView(odd.data(), odd.size()), &parsed) && parsed.gpe0_block.address == FakePorts::kGpe0);
+  AcpiEvents events(host, ports, alloc);
+  Listener listener;
+  events.set_listener(&listener);
+  CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())));
+  FakePci pci;
+  Node* port_node = events.find_pci_device(pci, {0, 0x1C, 4});
+  Node* nhi = events.find_pci_device(pci, {5, 0, 0});
+  CHECK(port_node && nhi && events.enable_wake(nhi));
+  CHECK((ports.mem[FakePorts::kMemGpe + 16 + 13] & (1u << 5)) && ports.reg.find(FakePorts::kGpe0 + 16 + 13) == ports.reg.end());       // armed in the memory block, not in the port one
+  ports.mem[FakePorts::kMemGpe + 13] |= 1u << 5;                                                                                        // GPE 0x6D
+  CHECK(events.poll() == 1 && listener.seen.size() == 1 && listener.seen[0].first == port_node && !(ports.mem[FakePorts::kMemGpe + 13] & (1u << 5)));
+  // PM1 in memory: the power button, the RTC alarm (only once asked for), and the bits that are just cleared
+  ButtonListener buttons;
+  events.set_button_listener(&buttons);
+  CHECK(events.enable_buttons() >= 2);
+  ports.mem[FakePorts::kMemPm1 + 1] |= 1;                                                                                                // PWRBTN_STS
+  events.poll();
+  CHECK(buttons.seen.size() == 1 && buttons.seen[0].first == AcpiButton::Power && !(ports.mem[FakePorts::kMemPm1 + 1] & 1));
+  ports.mem[FakePorts::kMemPm1 + 1] |= 4;                                                                                                // RTC_STS (bit 10), not enabled
+  events.poll();
+  CHECK(events.rtc_alarms() == 0 && (ports.mem[FakePorts::kMemPm1 + 1] & 4));
+  events.enable_rtc_event(true);
+  CHECK(!(ports.mem[FakePorts::kMemPm1 + 1] & 4));                                                                                       // (the stale status was cleared)
+  ports.mem[FakePorts::kMemPm1 + 1] |= 4;
+  events.poll();
+  CHECK(events.rtc_alarms() == 1 && !(ports.mem[FakePorts::kMemPm1 + 1] & 4));
+  events.enable_rtc_event(false);
+  ports.mem[FakePorts::kMemPm1 + 1] |= 4;
+  events.poll();
+  CHECK(events.rtc_alarms() == 1);
+  ports.mem[FakePorts::kMemPm1] |= 0x20;                                                                                                 // GBL_STS (bit 5)
+  ports.mem[FakePorts::kMemPm1 + 1] |= 0x80;                                                                                             // WAK_STS (bit 15)
+  events.poll();
+  CHECK(events.pm1_other() == 1 && !(ports.mem[FakePorts::kMemPm1] & 0x20) && !(ports.mem[FakePorts::kMemPm1 + 1] & 0x80));
+}
+
+
+static void test_buttons() {
+  TestAllocator alloc;
+  FakeHost host;
+  FakePorts ports;
+  const Bytes dsdt = make_table("DSDT", make_dsdt());
+  const Bytes fadt = make_fadt();
+  const ConstByteView tables[1] = {ConstByteView(dsdt.data(), dsdt.size())};
+  AcpiEvents events(host, ports, alloc);
+  ButtonListener listener;
+  events.set_button_listener(&listener);
+  CHECK(events.initialize(tables, 1, ConstByteView(fadt.data(), fadt.size())));
+  // the controller: ports from the tables' defaults, its event 0x23 armed
+  CHECK(!events.embedded_controller_armed() && events.enable_embedded_controller() && events.embedded_controller_armed());
+  CHECK(host.ec_data == 0x62 && host.ec_command == 0x66 && ports.enabled(0x23));
+  CHECK(events.enable_embedded_controller());                                                                        // (again: nothing)
+  // two devices (lid, power button) and the two fixed buttons
+  CHECK(events.enable_buttons() == 4);
+  bool open = false;
+  CHECK(events.lid_open(&open) && open);
+  // an EC event: the controller holds 0x50, the line goes up; _Q50 says Notify(lid, 0x80); the lid is open
+  host.ec_events = {0x50};
+  ports.raise(0x23);
+  CHECK(events.poll() == 1 && events.embedded_events() == 1 && listener.seen.size() == 1);
+  CHECK(listener.seen[0].first == AcpiButton::Lid && listener.seen[0].second && !ports.status(0x23) && ports.enabled(0x23));
+  // the lid closes (the method changes the state and tells), the power button is pressed: two events in one go
+  host.ec_events = {0x52, 0x51};
+  ports.raise(0x23);
+  CHECK(events.poll() == 1 && events.embedded_events() == 3 && listener.seen.size() == 3);
+  CHECK(listener.seen[1].first == AcpiButton::Lid && !listener.seen[1].second && listener.seen[2].first == AcpiButton::Power);
+  CHECK(events.lid_open(&open) && !open);
+  // an event with no method is counted and ignored; a controller that never stops claiming events is asked a bounded number of times
+  host.ec_events = {0x99};
+  ports.raise(0x23);
+  CHECK(events.poll() == 1 && events.embedded_events() == 4 && listener.seen.size() == 3);
+  host.ec_stuck = true;
+  host.ec_queries = 0;
+  ports.raise(0x23);
+  CHECK(events.poll() == 1 && host.ec_queries <= 16 && ports.enabled(0x23));
+  host.ec_stuck = false;
+  // the fixed buttons: the status bit is read, cleared and reported
+  ports.reg[FakePorts::kPm1Event + 1] |= 1;                                                                           // PWRBTN_STS (bit 8)
+  CHECK(events.poll() == 0 && listener.seen.size() == 4 && listener.seen[3].first == AcpiButton::Power && !(ports.reg[FakePorts::kPm1Event + 1] & 1));
+  ports.reg[FakePorts::kPm1Event + 1] |= 2;                                                                           // SLPBTN_STS (bit 9)
+  events.poll();
+  CHECK(listener.seen.size() == 5 && listener.seen[4].first == AcpiButton::Sleep);
+  {   // buttons that are devices: the FADT says so, nothing is enabled in PM1
+    FakePorts other_ports;
+    Bytes method_fadt = fadt;
+    put32(method_fadt, 112, 0x30);
+    AcpiEvents e(host, other_ports, alloc);
+    ButtonListener l;
+    e.set_button_listener(&l);
+    CHECK(e.initialize(tables, 1, ConstByteView(method_fadt.data(), method_fadt.size())) && e.enable_buttons() == 2);
+    other_ports.reg[FakePorts::kPm1Event + 1] |= 1;
+    e.poll();
+    CHECK(l.seen.empty() && (other_ports.reg[FakePorts::kPm1Event + 1] & 1));
+  }
+  {   // no controller device
+    TestAllocator a2;
+    FakePorts p2;
+    const Bytes plain = make_table("DSDT", scope("\\_SB", device("DEV0", name_def("_ADR", num(0)))));
+    const ConstByteView t2[1] = {ConstByteView(plain.data(), plain.size())};
+    AcpiEvents e(host, p2, a2);
+    CHECK(e.initialize(t2, 1, ConstByteView(fadt.data(), fadt.size())) && !e.enable_embedded_controller() && e.enable_buttons() == 2 && !e.lid_open(&open));
+  }
+}
+
 int main() {
   test_fadt();
+  test_buttons();
+  test_memory_blocks();
   test_events();
   if (g_failed) {
     printf("AcpiEventsTest: %d FAILED\n", g_failed);

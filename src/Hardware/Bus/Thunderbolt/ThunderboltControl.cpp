@@ -335,6 +335,7 @@ TbControl::Result TbControl::config_request(bool write, uint64_t route, uint32_t
     // the reply names the same words
     const uint32_t address = load_le32(ConstByteView(reply, sizeof reply), 8);
     if ((address & 0x1FFF) != offset || ((address >> 13) & 0x3F) != count || ((address >> 25) & 3) != static_cast<uint32_t>(space)) return Result::Failed;
+    error->response_port = static_cast<uint8_t>((address >> 19) & 0x3F);
     if (!write)
       for (uint32_t i = 0; i < count; ++i) out[i] = load_le32(ConstByteView(reply, sizeof reply), kConfigHeaderBytes + 4ull * i);
   }

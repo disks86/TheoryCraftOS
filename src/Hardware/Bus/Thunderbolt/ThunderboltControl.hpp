@@ -74,6 +74,7 @@ class TbControl {
   struct ConfigError {
     bool reported = false;
     uint8_t code = 0, port = 0;
+    uint8_t response_port = 0;       // on success: the port the answer came from (for a read of the router's first word, the upstream port: tb_cfg_get_upstream_port)
   };
 
   TbControl(TbNhi& nhi, allocators::IAllocator& allocator) : nhi_(nhi), allocator_(allocator), tx_(nhi.registers(), allocator, 0, true, kRingSize), rx_(nhi.registers(), allocator, 0, false, kRingSize) {}

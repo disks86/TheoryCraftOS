@@ -27,6 +27,9 @@ namespace hardware {
 class IAcpiHost : public acpi::IAmlHost {
  public:
   virtual void configure_ec(uint16_t data_port, uint16_t command_port) = 0;
+  // The controller's status byte and its event query (see EmbeddedController); false where there is no controller.
+  virtual bool ec_status(uint8_t* value) { (void)value; return false; }
+  virtual bool ec_query(uint8_t* event) { (void)event; return false; }
 
  protected:
   constexpr IAcpiHost() = default;

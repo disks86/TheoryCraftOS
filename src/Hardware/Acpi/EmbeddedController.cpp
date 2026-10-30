@@ -46,6 +46,25 @@ bool EmbeddedController::read(uint8_t address, uint8_t* value) {
   return ok;
 }
 
+bool EmbeddedController::status(uint8_t* value) {
+  if (!configured() || broken()) return false;
+  *value = ports_.in8(command_port_);
+  return true;
+}
+
+bool EmbeddedController::query(uint8_t* event) {
+  if (!configured() || broken()) return false;
+  for (int i = 0; i < 16 && (ports_.in8(command_port_) & kStatusOutputFull); ++i) ports_.in8(data_port_);
+  bool ok = wait(kStatusInputFull, false);
+  if (ok) {
+    ports_.out8(command_port_, kCommandQuery);
+    ok = wait(kStatusOutputFull, true);
+  }
+  if (ok) *event = ports_.in8(data_port_);
+  finish(ok);
+  return ok;
+}
+
 bool EmbeddedController::write(uint8_t address, uint8_t value) {
   if (!configured() || broken()) return false;
   for (int i = 0; i < 16 && (ports_.in8(command_port_) & kStatusOutputFull); ++i) ports_.in8(data_port_);

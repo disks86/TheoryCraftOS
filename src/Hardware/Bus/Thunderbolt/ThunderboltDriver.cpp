@@ -57,6 +57,26 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
     if (!icl_ || !icl_->force_power(true)) return outcome_ = Outcome::ControllerFailed;
     icl_->set_ltr();
   }
+  if (generation == TbGeneration::Usb4) {
+    // no firmware to ask: the host router is configured by Usb4Domain through the control channel (the controller is powered like an Ice Lake one)
+    if (nhi_config) {
+      icl_ = UniquePointer<TbIceLake>::make(allocator_, *nhi_config);
+      if (!icl_ || !icl_->force_power(true)) return outcome_ = Outcome::ControllerFailed;
+      icl_->set_ltr();
+    }
+    usb4_nhi_ = UniquePointer<TbNhi>::make(allocator_, registers);
+    if (!usb4_nhi_) return outcome_ = Outcome::OutOfMemory;
+    usb4_nhi_->disable_interrupts();
+    usb4_control_ = UniquePointer<TbControl>::make(allocator_, *usb4_nhi_, allocator_);
+    if (!usb4_control_ || !usb4_control_->start()) {
+      usb4_error_ = "the control channel did not start";
+      return outcome_ = Outcome::ControllerFailed;
+    }
+    usb4_ = UniquePointer<Usb4Domain>::make(allocator_, *usb4_control_, allocator_);
+    if (!usb4_) return outcome_ = Outcome::OutOfMemory;
+    if (!usb4_->start(&usb4_error_)) return outcome_ = Outcome::ControllerFailed;
+    return outcome_ = Outcome::Started;
+  }
   icm_ = UniquePointer<ThunderboltIcm>::make(allocator_, registers, allocator_);
   if (!icm_) return outcome_ = Outcome::OutOfMemory;
   ThunderboltIcm::Options options;
@@ -70,10 +90,22 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
   return outcome_ = result == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
 }
 
+void ThunderboltDriver::probe_control() {
+  uint32_t word = 0;
+  if (icm_) icm_->control().read_config(0, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 100000, nullptr, icm_.get());
+  else if (usb4_control_) usb4_control_->read_config(0, 0, TbConfigSpace::Switch, 0, ArrayView<uint32_t>(&word, 1), 100000, nullptr, usb4_.get());
+}
+
 bool ThunderboltDriver::sleep(bool wake, bool runtime) {
-  if (!icm_) return false;
-  bool devices = icm_->device_count() != 0 || icm_->xdomain_count() != 0;
-  if (!(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
+  if (!icm_ && !usb4_) return false;
+  bool devices = device_count() != 0 || xdomain_count() != 0;
+  if (icm_) {
+    if (!(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
+  } else {
+    if (runtime) return false;                                // (the software connection manager has no runtime power management)
+    usb4_->suspend();                                          // (routers asleep, tunnels down; the control channel stops with it)
+    usb4_control_->stop();
+  }
   if (icl_ && !devices) {
     // (icl_nhi_suspend: with nothing connected the link controller is told to get ready for a reset and the power forced off; with something connected the controller stays powered)
     icl_->lc_mailbox(tb_icl::kPrepareForReset);
@@ -90,7 +122,7 @@ bool ThunderboltDriver::sleep(bool wake, bool runtime) {
 }
 
 ThunderboltDriver::Outcome ThunderboltDriver::resume() {
-  if (!icm_) return outcome_;
+  if (!icm_ && !usb4_) return outcome_;
   if (power_ && power_->available()) power_->enter_d0();
   wake_armed_ = false;
   if (icl_ && !icl_powered_) {
@@ -98,10 +130,19 @@ ThunderboltDriver::Outcome ThunderboltDriver::resume() {
     icl_->set_ltr();
     icl_powered_ = true;
   }
+  if (usb4_) {
+    usb4_nhi_->disable_interrupts();
+    if (!usb4_control_->start()) return outcome_ = Outcome::ControllerFailed;
+    return outcome_ = usb4_->resume(&usb4_error_) ? Outcome::Started : Outcome::ControllerFailed;
+  }
   return outcome_ = icm_->resume() == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
 }
 
 void ThunderboltDriver::stop() {
+  usb4_ = UniquePointer<Usb4Domain>();
+  if (usb4_control_) usb4_control_->stop();
+  usb4_control_ = UniquePointer<TbControl>();
+  usb4_nhi_ = UniquePointer<TbNhi>();
   icm_ = UniquePointer<ThunderboltIcm>();                       // (tells the firmware first)
   if (icl_ && icl_powered_) icl_->force_power(false);           // (the controller is shut down: the firmware may stop)
   icl_ = UniquePointer<TbIceLake>();
