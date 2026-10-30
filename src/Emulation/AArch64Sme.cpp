@@ -53,9 +53,7 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
       if ((insn >> 20) & 1) return undefined();
       address += static_cast<uint64_t>(sext(bits_of(insn, 19, 16), 4) * static_cast<int64_t>(nreg) * kVectorBytes);
     } else {
-      const uint32_t rm = bits_of(insn, 20, 16);
-      if (rm == 31) return undefined();
-      address += reg(rm, true) << esz;
+      address += reg(bits_of(insn, 20, 16), true) << esz;      // (Rm = 31 is the zero register)
     }
     Vec data[4];
     uint32_t regs[4];
@@ -94,6 +92,14 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
     for (uint64_t& w : s_.zt0) w = 0;
     return Step::Ok;
   }
+  if ((insn & 0xFFFFCFE0u) == 0xC04F03E0u) {      // MOVT ZT0[#off, MUL VL], Zt: a vector into 16 bytes of ZT0
+    if (!s_.za_enabled) return undefined();
+    const uint32_t index = 2 * bits_of(insn, 13, 12);
+    if (index == 0) for (uint64_t& w : s_.zt0) w = 0;      // (without an offset the whole table is written, the rest zero)
+    s_.zt0[index] = s_.v[insn & 31].lo;
+    s_.zt0[index + 1] = s_.v[insn & 31].hi;
+    return Step::Ok;
+  }
   if ((insn & 0xFFFF8FE0u) == 0xC04C03E0u || (insn & 0xFFFF8FE0u) == 0xC04E03E0u) {      // MOVT Xt, ZT0[#off] / MOVT ZT0[#off], Xt
     if (!s_.za_enabled) return undefined();
     const uint32_t index = bits_of(insn, 14, 12), rt = insn & 31;
@@ -106,6 +112,7 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
   const uint32_t pg = bits_of(insn, 12, 10), rs = bits_of(insn, 14, 13);
   const bool vertical = (insn >> 15) & 1;
   if (!s_.za_enabled) return undefined();
+  if (top == 0xC1) return sme2(m, insn);
 
   // slice moves and loads / stores of tile slices
   auto slice_get = [&](uint32_t esz, uint32_t tile, bool vert, uint32_t k) {
@@ -157,7 +164,6 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
   if (top == 0xC0 && (bits_of(insn, 21, 17) == 2 || bits_of(insn, 21, 17) == 3) && !((insn >> 16) & 1) && !((insn >> 12) & 1)) {      // MOVA / MOVAZ of two or four vectors: tile slices, or ZA array vectors (bit 11)
     const bool to_vector = (insn >> 17) & 1, four = (insn >> 10) & 1, array = (insn >> 11) & 1, zeroing = to_vector && ((insn >> 9) & 1);
     const uint32_t nreg = four ? 4 : 2, rv = static_cast<uint32_t>(reg(8 + (array ? bits_of(insn, 14, 13) : 4 + bits_of(insn, 14, 13)), false));
-    if (!to_vector && ((insn >> 9) & 1) && !array) return undefined();
     uint32_t zt, field;
     if (to_vector) {
       zt = four ? (bits_of(insn, 4, 2) << 2) : (bits_of(insn, 4, 1) << 1);
@@ -295,6 +301,8 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
   }
 
   if (top == 0x80 || top == 0x81 || top == 0xA0 || top == 0xA1) {      // outer products
+    uint32_t mop4_form;
+    if (sme2_mop4_match(insn, &mop4_form)) return sme2_mop4(mop4_form, insn);
     const uint32_t zm = bits_of(insn, 20, 16);
     const uint16_t pm = s_.p[bits_of(insn, 15, 13)], pn = s_.p[bits_of(insn, 12, 10)];
     const bool subtract = (insn >> 4) & 1, b3 = (insn >> 3) & 1;
@@ -336,6 +344,22 @@ AArch64Cpu::Step AArch64Cpu::sme(GuestMemory& m, uint32_t insn) {
           put(&row, 3, j, fp_default_nan_fix(Format::F64, fused_multiply_add(Format::F64, x, get(b, 3, j), get(row, 3, j), env)));
         }
       return finish();
+    }
+    if (top == 0x81 && (key == 0x40C || key == 0x40D) && b3 && !(insn & 4) && !(insn & 2)) {      // FMOPA / FMOPS (0x40C) and BFMOPA / BFMOPS (0x40D) into half precision tiles: default NaN, no flags
+      const bool bfloat = key == 0x40D;
+      const Format fmt = bfloat ? Format::BF16 : Format::F16;
+      const uint32_t tile = insn & 1;
+      Env quiet = fp_env();
+      for (uint32_t i = 0; i < 8; ++i)
+        for (uint32_t j = 0; j < 8; ++j) {
+          if (!active(pn, i, 1) || !active(pm, j, 1)) continue;
+          Vec& row = s_.za[i * 2 + tile];
+          const uint64_t x = subtract ? negate(fmt, get(a, 1, i)) : get(a, 1, i);
+          uint64_t result = fused_multiply_add(fmt, x, get(b, 1, j), get(row, 1, j), quiet);
+          if (is_nan(fmt, result)) result = bfloat ? 0x7FC0u : 0x7E00u;
+          put(&row, 1, j, result);
+        }
+      return Step::Ok;
     }
     if (top == 0x81 && (key == 0x40C || key == 0x40D) && !b3) {      // BFMOPA (0x40C) / FMOPA (0x40D) widening half precision into single: no exception flags, the default NaN
       const bool bfloat = key == 0x40C;

@@ -611,7 +611,7 @@ bool AArch64Cpu::sve_float(uint32_t insn) {
         const Format f = format_of(esz, bf_size);
         const Vec lo = s_.v[zn], hi = s_.v[zm];
         for (uint32_t i = 0; i < elements; ++i) {
-          const uint64_t r = arm_minmax(f, arm_minmax(f, get(*dst, esz, i), get(lo, esz, i), true, true, env), get(hi, esz, i), false, true, env);
+          const uint64_t r = arm_minmax(f, arm_minmax(f, get(lo, esz, i), get(*dst, esz, i), true, true, env), get(hi, esz, i), false, true, env);      // (with two NaNs the lower bound's is the one that propagates)
           put(dst, esz, i, nan_fix(f, r));
         }
         return finish();

@@ -1088,6 +1088,38 @@ static void test_aarch64_sme() {
     CHECK(s.v[12].lo == 0x0000010100000100ull && s.v[12].hi == 0x0000010300000102ull && s.v[13].lo == 0x0000010500000104ull && s.v[13].hi == 0x0000010700000106ull);
     CHECK(!s.streaming);      // the system call left streaming mode, as it does on Linux
   }
+  {      // SME2: ZA vector groups, dot products, multi-vector arithmetic, zip, MOP4, slice moves of two vectors and a narrowing shift (streaming mode and ZA are set directly)
+    A64Machine m({0xc1a01c10,       // add za.s[w8, 0, vgx2], {z0.s, z1.s}
+                  0xc1241441,       // sdot za.s[w8, 1, vgx2], {z2.b, z3.b}, z4.b
+                  0xc1a5a006,       // smax {z6.s, z7.s}, {z6.s, z7.s}, z5.s
+                  0xc1a1d008,       // zip {z8.s, z9.s}, z0.s, z1.s
+                  0x80008143,       // smop4a za3.s, z10.b, z16.b
+                  0xc086000c,       // mov {z12.s, z13.s}, za0h.s[w12, 0:1]
+                  0xc1efd40e,       // sqrshr z14.h, {z0.s, z1.s}, #1
+                  0xd4000001});
+    AArch64Cpu::State& s = m.cpu.state();
+    s.streaming = true;
+    s.za_enabled = true;
+    s.v[0].lo = 0x0000000200000001ull; s.v[0].hi = 0x0000000400000003ull;
+    s.v[1].lo = 0x0000000600000005ull; s.v[1].hi = 0x0000000800000007ull;
+    s.v[2].lo = s.v[2].hi = s.v[3].lo = s.v[3].hi = 0x0202020202020202ull;
+    s.v[4].lo = s.v[4].hi = 0x0303030303030303ull;
+    s.v[5].lo = s.v[5].hi = 0x0000000A0000000Aull;
+    s.v[6].lo = 0x0000001400000001ull; s.v[6].hi = 0x0000002800000003ull;
+    s.v[7].lo = 0x0000000600000032ull; s.v[7].hi = 0x0000000800000046ull;
+    s.v[10].lo = s.v[10].hi = 0x0101010101010101ull;
+    s.v[16].lo = s.v[16].hi = 0x0202020202020202ull;
+    m.x(8) = 0;
+    m.x(12) = 0;
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(s.za[0].lo == 0x0000000200000001ull && s.za[0].hi == 0x0000000400000003ull && s.za[8].lo == 0x0000000600000005ull && s.za[8].hi == 0x0000000800000007ull);      // the two vectors of the group, eight rows apart
+    CHECK(s.za[1].lo == 0x0000001800000018ull && s.za[9].hi == 0x0000001800000018ull);      // 4 * (2 * 3)
+    CHECK(s.v[6].lo == 0x000000140000000Aull && s.v[6].hi == 0x000000280000000Aull && s.v[7].lo == 0x0000000A00000032ull && s.v[7].hi == 0x0000000A00000046ull);
+    CHECK(s.v[8].lo == 0x0000000500000001ull && s.v[8].hi == 0x0000000600000002ull && s.v[9].lo == 0x0000000700000003ull && s.v[9].hi == 0x0000000800000004ull);      // zip1 and zip2
+    CHECK(s.za[3].lo == 0x0000000800000008ull && s.za[15].hi == 0x0000000800000008ull);      // 4 * (1 * 2)
+    CHECK(s.v[12].lo == 0x0000000200000001ull && s.v[12].hi == 0x0000000400000003ull && s.v[13].lo == 0 && s.v[13].hi == 0);
+    CHECK(s.v[14].lo == 0x0002000200010001ull && s.v[14].hi == 0x0004000400030003ull);
+  }
   {      // streaming-only instructions are undefined outside streaming mode
     A64Machine m({0xc0828001, 0xd4000001});      // mov z1.s, p0/m, za0v.s[w12, 0]
     CHECK(m.run() == StopReason::Fault && m.cpu.fault().vector == 6);
@@ -1144,7 +1176,8 @@ static void test_aarch64_robustness() {
     }
   }
   {      // SME: every bit flip of one word of each kind in streaming mode with ZA enabled, then random words from the SME encoding space
-    const Words sme = {0xc0800000, 0xc0828001, 0xc0860008, 0xc0840000, 0xc0cc2006, 0xe11f8020, 0xc0480001, 0xe0400000, 0xe1400000, 0x80830061, 0xa0830061, 0xc0090000, 0xa040402c, 0xa0204000, 0xc0e00000, 0xc0c10000};
+    const Words sme = {0xc0800000, 0xc0828001, 0xc0860008, 0xc0840000, 0xc0cc2006, 0xe11f8020, 0xc0480001, 0xe0400000, 0xe1400000, 0x80830061, 0xa0830061, 0xc0090000, 0xa040402c, 0xa0204000, 0xc0e00000, 0xc0c10000,
+                       0xc1a01c10, 0xc1241441, 0xc1a5a006, 0xc1a1d008, 0x80008143, 0xc1efd40e, 0xc1231802, 0xc1600c00, 0xc1a0e000, 0xc1a08000, 0xc1b6e000, 0x81800008, 0xc0000000};
     auto prepare = [](A64Machine& m, uint64_t seed) {
       m.cpu.state().streaming = true;
       m.cpu.state().za_enabled = true;
