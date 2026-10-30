@@ -91,6 +91,8 @@
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
+#include "Hardware/Power/PowerManager.hpp"
+#include "Hardware/Power/Thermal.hpp"
 #include "Hardware/Bus/Ish/IshDriver.hpp"
 #include "Hardware/Pen/PenMouse.hpp"
 #include "Hardware/Sensor/AcpiAmbientLight.hpp"
@@ -1821,6 +1823,43 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (acpi_light && sensors.add(acpi_light.get())) Entry(Level::Ok, "Sensor").text("ambient light sensor through ACPI");
     }
 #endif
+#ifdef TCOS_POWER
+    // Power management: the processor's speed range and idle states under a profile that follows the battery, and a ceiling on the speed when something runs hot.
+    hardware::HostMsr host_msr;
+    hardware::CpuPowerCaps power_caps = hardware::probe_cpu_power_caps();
+    hardware::CpuPower cpu_power(host_msr);
+    struct CpuCeiling final : hardware::IThermalActuator {
+      hardware::CpuPower* cpu = nullptr;
+      bool set_ceiling_percent(uint32_t percent) override { return cpu && cpu->set_ceiling_percent(percent); }
+    } cpu_ceiling;
+    cpu_ceiling.cpu = &cpu_power;
+    hardware::PowerManager power_manager(cpu_power, power_caps, kernel::set_idle_mwait_hint);
+    hardware::ThermalManager thermal(&cpu_ceiling);
+    hardware::CpuThermalSource cpu_thermal(&pci);
+    thermal.add(&cpu_thermal);
+    UniquePointer<hardware::AcpiThermalZone> thermal_zones[4];
+    const bool power_ok = cpu_power.initialize(power_caps);
+    if (power_ok) {
+      power_manager.start();
+      Entry(Level::Ok, "Power").text(cpu_power.uses_hwp() ? "hardware P-states: ratios " : "SpeedStep: ratios ").dec(cpu_power.lowest_ratio()).text(" to ").dec(cpu_power.highest_ratio()).text(" (x100 MHz), profile ").text(hardware::power_profile_name(power_manager.profile()));
+      Entry(Level::Info, "Power").text("idle cores wait with ").text(hardware::CpuPower::idle_hint(power_caps, power_manager.profile()) == 0xFFFFFFFFu ? "HLT" : "MWAIT");
+    } else {
+      Entry(Level::Info, "Power").text("no speed control on this processor (a virtual machine, or no HWP / SpeedStep)");
+    }
+#ifdef TCOS_ACPI_EVENTS
+    if (acpi_events) {
+      acpi::Node* zones[4];
+      const uint32_t found = hardware::AcpiThermalZone::find_zones(acpi_events->interpreter(), zones, 4);
+      for (uint32_t i = 0; i < found; ++i) {
+        thermal_zones[i] = UniquePointer<hardware::AcpiThermalZone>::make(shared_allocator, acpi_events->interpreter(), zones[i]);
+        if (thermal_zones[i]) thermal.add(thermal_zones[i].get());
+      }
+      if (found) Entry(Level::Info, "Power").dec(found).text(" ACPI thermal zone(s)");
+    }
+#endif
+    uint64_t power_battery_ms = 0;
+    bool thermal_warned = false;
+#endif
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);
@@ -1928,6 +1967,33 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #endif
 #ifdef TCOS_ISH
       if (ish) ish->poll();
+#endif
+#ifdef TCOS_POWER
+      {
+        const uint64_t now_ms = hardware::uptime_us() / 1000;
+        if (power_ok && now_ms - power_battery_ms >= 10000) {                   // the battery is a few reads of the embedded controller: every ten seconds
+          power_battery_ms = now_ms;
+          const desktop::TaskBattery tb = monitor.battery();
+          hardware::BatteryStatus status;
+          status.present = tb.present;
+          status.percent = tb.percent;
+          status.state = tb.state == desktop::ChargeState::Charging ? hardware::BatteryState::Charging : tb.state == desktop::ChargeState::Discharging ? hardware::BatteryState::Discharging :
+                         tb.state == desktop::ChargeState::Full ? hardware::BatteryState::Full : tb.state == desktop::ChargeState::NotCharging ? hardware::BatteryState::NotCharging : hardware::BatteryState::Unknown;
+          if (power_manager.update(status, now_ms)) desktop.notify("Power", power_manager.profile() == hardware::PowerProfile::PowerSaver ? "Battery is low: power saver profile" : "Balanced power profile", gui::NoticeKind::Information);
+        }
+        if (thermal.poll(now_ms)) {
+          if (thermal.ceiling_percent() < 100 && !thermal_warned) {
+            thermal_warned = true;
+            desktop.notify("Temperature", "The machine is hot; the processor is slowed down", gui::NoticeKind::Warning);
+          } else if (thermal.ceiling_percent() == 100) {
+            thermal_warned = false;
+          }
+        }
+        if (thermal.critical() && !desktop.shutdown_requested()) {
+          desktop.notify("Temperature", "Critical temperature: shutting down", gui::NoticeKind::Error);
+          desktop.request_shutdown();
+        }
+      }
 #endif
 #ifdef TCOS_ACPI_EVENTS
       if (acpi_events) {

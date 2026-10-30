@@ -113,6 +113,7 @@ class AmlInterpreter {
   Node* parent(const Node* node) const;
   bool is_device(const Node* node) const;
   bool is_method(const Node* node) const;
+  bool is_thermal_zone(const Node* node) const;
   bool is_region(const Node* node) const;
   // The four-character name of a node (not zero-terminated).
   const char* name_of(const Node* node) const;

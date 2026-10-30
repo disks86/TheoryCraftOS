@@ -2075,6 +2075,7 @@ Node* AmlInterpreter::first_child(const Node* node) const { return node ? node->
 Node* AmlInterpreter::next_sibling(const Node* node) const { return node ? node->next : nullptr; }
 Node* AmlInterpreter::parent(const Node* node) const { return node ? node->parent : nullptr; }
 bool AmlInterpreter::is_device(const Node* node) const { return node && node->kind == NodeKind::Device; }
+bool AmlInterpreter::is_thermal_zone(const Node* node) const { return node && node->kind == NodeKind::ThermalZone; }
 bool AmlInterpreter::is_method(const Node* node) const { return node && node->kind == NodeKind::Method; }
 bool AmlInterpreter::is_region(const Node* node) const { return node && node->kind == NodeKind::Region; }
 const char* AmlInterpreter::name_of(const Node* node) const { return node ? node->name : "____"; }
