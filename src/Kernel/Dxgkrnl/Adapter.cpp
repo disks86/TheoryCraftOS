@@ -904,12 +904,26 @@ class Adapter::StreamRunner {
   NtStatus resource_barrier(ByteReader& p) {
     const uint32_t count = p.le32();
     if (!p.ok() || count == 0) return kBad;
-    if (exec_) return status::kSuccess;   // (checked when the stream was queued)
     for (uint32_t i = 0; i < count; ++i) {
       const uint32_t type = p.le32(), index = p.le32(), before = p.le32(), after = p.le32(), flags = p.le32();
       if (!p.ok() || type > 2 || flags > 2) return kBad;
       Allocation* a = index == kNoAllocation ? nullptr : alloc(index);
       if (index != kNoAllocation && !a) return kBad;
+      if (type == 2) {
+        // An aliasing barrier: `index` is the allocation going out of use and the "before" word the index of the one coming into use (either may be kNoAllocation: nothing to do), both placed in
+        // one heap. What the GPU holds for the first goes to the heap's memory and the second is uploaded from it.
+        Allocation* incoming = before == kNoAllocation ? nullptr : alloc(before);
+        if (before != kNoAllocation && !incoming) return kBad;
+        if (!a || !incoming) continue;
+        if (in_pass_ || !a->placed() || a->heap().get() != incoming->heap().get() || a == incoming) return kBad;
+        if (exec_) {
+          NtStatus s = flush();   // (what was recorded runs first)
+          if (s == status::kSuccess && !mm_.switch_alias(*a, *incoming)) s = status::kInvalidDeviceState;
+          if (s != status::kSuccess) return s;
+        }
+        continue;
+      }
+      if (exec_) continue;   // (the rest was checked when the stream was queued)
       if (type != 0) {
         // (an unordered access barrier: for an allocation that is in that state; the devices order a dispatch's writes themselves. An aliasing barrier: nothing to do.)
         if (type == 1 && a && a->state_tracked() && !(state_of(a) & state::kUnorderedAccess)) return kBad;

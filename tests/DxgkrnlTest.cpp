@@ -4980,13 +4980,115 @@ void test_d3d12_barriers() {
   CHECK(frame([&](CommandWriter& w) { w.transition(2, state::kGenericRead, 0x8000); }) == status::kInvalidParameter);
   CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{0, 2, state::kGenericRead, state::kCopyDest, 1}, CommandWriter::Barrier{0, 2, state::kGenericRead, state::kCopyDest, 2}}); w.transition(2, state::kCopyDest, state::kGenericRead); }) == status::kSuccess);
   // Unordered access and aliasing barriers are accepted (the first only for something in that state, or nothing in particular).
-  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{1, CommandWriter::Barrier::kNoAllocationIndex, 0, 0, 0}, CommandWriter::Barrier{2, 0, 0, 0, 0}}); }) == status::kSuccess);
+  CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{1, CommandWriter::Barrier::kNoAllocationIndex, 0, 0, 0}, CommandWriter::Barrier{2, 0, CommandWriter::Barrier::kNoAllocationIndex, 0, 0}}); }) == status::kSuccess);
   CHECK(frame([&](CommandWriter& w) { w.resource_barrier({CommandWriter::Barrier{1, 0, 0, 0, 0}}); }) == status::kInvalidParameter);   // (the target is not in the unordered access state)
   // An allocation that does not track states takes barriers as no-ops and is used in any state.
   CHECK(frame([&](CommandWriter&) {}, plain_rt) == status::kSuccess);
   // A texture bound while it is in no state that reads: refused. Moved to copy destination: not a shader resource.
   CHECK(frame([&](CommandWriter& w) { w.transition(1, state::kPixelShaderResource, state::kCopyDest); }) == status::kInvalidParameter);
   CHECK(e.kernel.query_allocation(kPid, tex, &info) == status::kSuccess);
+}
+
+
+// Resource heaps: allocations placed in one block of memory, overlapping, with the GPU's contents carried across by aliasing barriers.
+void test_d3d12_heaps() {
+  Env e;
+  auto create = [&](uint32_t flags, uint64_t size, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.size = size, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, none = 0;
+  CHECK(create(kAllocHeap, 4096, 0, 0, &heap) == status::kSuccess);
+  CHECK(create(kAllocHeap, 100, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocHeap | kAllocVertexBuffer, 4096, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap, 4096, heap, 0, &none) == status::kInvalidParameter);
+  const uint64_t before = e.kernel.adapter(0)->vidmm().system_bytes();
+  // Buffers, overlapping: 0 .. 256 and 128 .. 384 share 128 bytes; the third is apart.
+  Handle first = 0, second = 0, apart = 0;
+  CHECK(create(kAllocVertexBuffer, 256, heap, 0, &first) == status::kSuccess && create(kAllocVertexBuffer, 256, heap, 128, &second) == status::kSuccess && create(kAllocVertexBuffer, 256, heap, 1024, &apart) == status::kSuccess);
+  CHECK(e.kernel.adapter(0)->vidmm().system_bytes() == before);   // (the memory is the heap's: not counted again)
+  uint8_t pattern[256];
+  for (uint32_t i = 0; i < 256; ++i) pattern[i] = static_cast<uint8_t>(i + 1);
+  CHECK(e.write(first, ConstByteView(pattern, 256)));
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, second, kLockReadOnly, 0, &lock) == status::kSuccess);
+  bool same = lock.data.size() == 256;
+  for (uint32_t i = 0; i < 128 && same; ++i) same = lock.data[i] == pattern[128 + i];
+  for (uint32_t i = 128; i < 256 && same; ++i) same = lock.data[i] == 0;   // (past the end of the first: the heap's own zeros)
+  CHECK(same);
+  e.kernel.unlock(kPid, second);
+  CHECK(e.kernel.lock(kPid, apart, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[0] == 0);
+  e.kernel.unlock(kPid, apart);
+  // What does not go: past the end, misaligned, a handle that is not a heap, a heap of nothing, shared, a depth image, a multisampled one.
+  CHECK(create(kAllocVertexBuffer, 256, heap, 3968 + 16, &none) == status::kInvalidParameter && create(kAllocVertexBuffer, 256, heap, 8, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocVertexBuffer, 256, first, 0, &none) == status::kInvalidParameter && create(kAllocVertexBuffer, 256, 0x7777, 0, &none) == status::kInvalidHandle);
+  CHECK(create(kAllocVertexBuffer | kAllocShared, 256, heap, 0, &none) == status::kInvalidParameter);
+  AllocationDesc depth;
+  depth.flags = kAllocDepthStencil, depth.format = Format::D32Float, depth.width = depth.height = 8, depth.heap = heap;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, depth, &none) == status::kNotSupported);
+  // The GPU: a render target A and a texture B at the same place. Draw red into A, pass the use to B with an aliasing barrier, and sample B.
+  AllocationDesc id;
+  id.flags = kAllocRenderTarget, id.format = Format::A8R8G8B8, id.width = id.height = 8, id.heap = heap, id.heap_offset = 2048;
+  Handle a_target = 0, b_texture = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, id, &a_target) == status::kSuccess);
+  id.flags = kAllocTexture;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, id, &b_texture) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 4 * 28), tvb = e.buffer(kAllocVertexBuffer, 4 * 20);
+  Handle red_pipe = make_colored_pipeline(e, false), tex_pipe = make_colored_pipeline(e, true);
+  CHECK(write_triangle(e, vb, 1, 0, 0));
+  const float quad[20] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(tvb, floats(quad, 15)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto run = [&](bool barrier) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);   // (list: A 0, B 1, target 2, vb 3, tvb 4)
+    w.bind_pipeline(red_pipe);
+    w.bind_vertex_buffer(3);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    if (barrier) w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+    w.begin_pass(2, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(tex_pipe);
+    w.bind_vertex_buffer(4);
+    w.push_constants(floats(identity, 16));
+    w.bind_texture(0, 1, graphics::SamplerDesc());
+    w.draw(3);
+    w.end_pass();
+    return w.ok() ? e.render(w, {a_target, b_texture, target, vb, tvb}) : status::kNoMemory;
+  };
+  // Without the barrier B is what it was before A was drawn into (nothing); with it, it is A's picture.
+  CHECK(run(false) == status::kSuccess && e.pixel(target, 4, 4) != 0xFFFF0000u);
+  CHECK(run(true) == status::kSuccess && e.pixel(target, 4, 4) == 0xFFFF0000u);
+  // The memory has it: the CPU reads it through B, through A, and through the heap.
+  CHECK(e.pixel(b_texture, 2, 2) == 0xFFFF0000u && e.pixel(a_target, 3, 3) == 0xFFFF0000u);
+  CHECK(e.kernel.lock(kPid, heap, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 4096);
+  ByteReader heap_in(ConstByteView(lock.data.data(), lock.data.size()));
+  heap_in.skip(2048);
+  CHECK(heap_in.le32() == 0xFFFF0000u);
+  e.kernel.unlock(kPid, heap);
+  // The CPU writing through B reaches A (which is not resident-stale to the stream any more): drawn into again, A is what the stream draws, not what the CPU wrote.
+  CHECK(e.fill(b_texture, 0xFF00FF00u));
+  CHECK(e.pixel(a_target, 0, 0) == 0xFF00FF00u);
+  // Aliasing barriers: not in a pass, only between placed allocations of one heap, and a null side is nothing.
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(2, kNoAllocation, 0, {0, 0, 0, 0}, 1, 0);
+    w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+    w.end_pass();
+    CHECK(e.render(w, {a_target, b_texture, target}) == status::kInvalidParameter);
+  }
+  {
+    CommandWriter w(e.allocator);
+    w.resource_barrier({CommandWriter::Barrier{2, 0, 2, 0, 0}});
+    CHECK(e.render(w, {a_target, b_texture, target}) == status::kInvalidParameter);   // (the target is not placed)
+    CommandWriter w2(e.allocator);
+    w2.resource_barrier({CommandWriter::Barrier{2, 0, CommandWriter::Barrier::kNoAllocationIndex, 0, 0}, CommandWriter::Barrier{2, CommandWriter::Barrier::kNoAllocationIndex, 1, 0, 0}});
+    CHECK(e.render(w2, {a_target, b_texture, target}) == status::kSuccess);
+  }
+  // The heap goes when its handle is destroyed but the allocations placed in it keep its memory.
+  CHECK(e.kernel.destroy_allocation(kPid, heap) == status::kSuccess);
+  CHECK(e.pixel(b_texture, 0, 0) == 0xFF00FF00u);
 }
 
 // Geometry shaders with adjacency input and instances.
@@ -6376,6 +6478,7 @@ int main() {
   test_d3d12_binding();
   test_d3d12_compute();
   test_d3d12_barriers();
+  test_d3d12_heaps();
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();

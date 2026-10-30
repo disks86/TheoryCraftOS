@@ -1208,6 +1208,48 @@ void scene_d3d12_textures(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// Direct3D 12 resource heaps: a render target and a texture placed at the same place in one heap. A triangle is drawn into the render target, an aliasing barrier passes the use to the
+// texture (what the GPU holds for the target goes to the heap's memory, the texture is uploaded from it) and the texture is drawn onto the target.
+void scene_d3d12_heap(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle first = d3d9_pipeline(rig, false, false);
+  Handle second = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_tex, sizeof b::k_ps_tex, 1);
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 8192;
+  Handle heap = rig.create(hd);
+  AllocationDesc id;
+  id.flags = kAllocRenderTarget, id.format = Format::A8R8G8B8, id.width = id.height = kSize, id.heap = heap, id.heap_offset = 256;
+  Handle placed_target = rig.create(id);
+  id.flags = kAllocTexture;
+  Handle placed_texture = rig.create(id);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  const Vertex tri[3] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  Handle tvb = rig.buffer(kAllocVertexBuffer, bytes_of(tri, sizeof tri));
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex quad[6] = {vert(-0.6f, -0.6f, 0, 0), vert(0.9f, -0.6f, 1, 0), vert(-0.6f, 0.9f, 0, 1), vert(-0.6f, 0.9f, 0, 1), vert(0.9f, -0.6f, 1, 0), vert(0.9f, 0.9f, 1, 1)};
+  Handle qvb = rig.buffer(kAllocVertexBuffer, bytes_of(quad, sizeof quad));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Linear;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w(rig.allocator());   // (list: target 0, texture 1, screen 2, triangle 3, quad 4)
+  begin(w, 0, kNoAllocation, {0.1f, 0.1f, 0.1f, 1});
+  w.bind_pipeline(first);
+  w.bind_vertex_buffer(3);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  w.resource_barrier({CommandWriter::Barrier{2, 0, 1, 0, 0}});
+  begin(w, 2, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(second);
+  w.bind_vertex_buffer(4);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 1, sampler);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {placed_target, placed_texture, target, tvb, qvb});
+  rig.read(target, out);
+}
+
 // Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
 // by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
 void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
@@ -2144,6 +2186,7 @@ const Entry kScenes[] = {
     {"Direct3D 10 adjacency primitives (DXBC)", scene_geometry_adjacency},
     {"Direct3D 12 root signature, descriptors and states: compute (DXBC)", scene_d3d12_compute},
     {"Direct3D 12 root signature, descriptors and states: textures (DXBC)", scene_d3d12_textures},
+    {"Direct3D 12 resource heap: a target and a texture aliased (DXBC)", scene_d3d12_heap},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
     {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},

@@ -45,7 +45,7 @@ graphics::Format wide_format_of(Format f) {
 }
 
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
-constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState;
+constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap;
 
 // The bytes of all levels of a w x h image of `pixel`-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
 bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t pixel, uint64_t* total) {
@@ -82,7 +82,7 @@ bool Allocation::level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) 
 }
 
 Allocation::Allocation(VidMm& manager, allocators::IAllocator& allocator, const AllocationDesc& desc, uint64_t id)
-    : manager_(manager), allocator_(allocator), desc_(desc), id_(id) {}
+    : manager_(manager), allocator_(allocator), desc_(desc), id_(id), placed_(allocator) {}
 
 Allocation::~Allocation() { manager_.forget(*this); }
 
@@ -101,13 +101,14 @@ uint32_t VidMm::from_logical(Format f, uint32_t pixel) {
   return pixel;
 }
 
-NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation>* out) {
+NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation>* out, const SharedPointer<Allocation>& heap) {
   AllocationDesc desc = requested;
   const bool track_state = (desc.flags & kAllocTrackState) != 0;   // (the other checks are about what the allocation is, not what states it moves through)
   desc.flags &= ~kAllocTrackState;
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
-  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer)) != 0;
+  const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0;
+  if ((desc.flags & kAllocHeap) && (desc.flags != kAllocHeap || heap || requested.heap)) return status::kInvalidParameter;
   if ((desc.flags & kAllocUnorderedAccess) && !(device_.info().features & graphics::kFeatureCompute)) return status::kNotSupported;
   if ((desc.flags & kAllocStreamOutput) && !(device_.info().features & graphics::kFeatureStreamOutput)) return status::kNotSupported;
   uint64_t cpu_bytes = 0, device_bytes = 0;
@@ -116,6 +117,9 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     if (desc.flags & ~(kAllocQueryResult | kAllocShared)) return status::kInvalidParameter;
     if (!(device_.info().features & graphics::kFeatureOcclusionQueries)) return status::kNotSupported;
     if (desc.size < 8 || desc.size > kMaxQueryResultBytes) return status::kInvalidParameter;
+    cpu_bytes = desc.size;
+  } else if (desc.flags & kAllocHeap) {
+    if (desc.size < 256 || desc.size % 256 || desc.size > kMaxBufferBytes) return status::kInvalidParameter;
     cpu_bytes = desc.size;
   } else if (desc.flags & kAllocConstantBuffer) {
     // (read by the CPU when a draw takes the constants: no device object)
@@ -176,11 +180,25 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
     }
   }
 sized:
-  if (cpu_bytes > system_limit_ || system_bytes_ > system_limit_ - cpu_bytes) return status::kGraphicsNoVideoMemory;
+  const bool placed = requested.heap != 0;
+  if (placed) {
+    // (its backing is part of the heap's memory: what can be in a heap are the things whose contents are the backing)
+    if (!heap || !heap->is_heap() || &heap->manager() != this || (desc.flags & kAllocShared)) return status::kInvalidParameter;
+    if (desc.samples != 1 || (desc.flags & kAllocDepthStencil)) return status::kNotSupported;   // (these have no backing to share)
+    if (requested.heap_offset % 16 || requested.heap_offset > heap->desc().size || cpu_bytes == 0 || cpu_bytes > heap->desc().size - requested.heap_offset) return status::kInvalidParameter;
+  } else if (cpu_bytes > system_limit_ || system_bytes_ > system_limit_ - cpu_bytes) {
+    return status::kGraphicsNoVideoMemory;
+  }
 
   SharedPointer<Allocation> a = SharedPointer<Allocation>::make(allocator_, *this, allocator_, desc, next_id_);
   if (!a) return status::kNoMemory;
-  if (cpu_bytes) {
+  if (placed) {
+    if (!heap->placed_.push_back(a.get())) return status::kNoMemory;
+    a->heap_ = heap;
+    a->heap_offset_ = requested.heap_offset;
+    a->cpu_ = heap->cpu_.subview(requested.heap_offset, cpu_bytes);   // (shared, not owned)
+    cpu_bytes = 0;                                                    // (and not charged again)
+  } else if (cpu_bytes) {
     a->cpu_ = allocate_view<uint8_t>(allocator_, cpu_bytes, 16);
     if (a->cpu_.empty()) return status::kNoMemory;
     a->cpu_.fill(0);
@@ -196,6 +214,14 @@ sized:
 
 void VidMm::forget(Allocation& a) {
   if (a.resident()) release_device_object(a);
+  if (a.heap_) {
+    for (uint64_t i = 0; i < a.heap_->placed_.count(); ++i)
+      if (a.heap_->placed_[i] == &a) {
+        a.heap_->placed_.remove_at(i);
+        break;
+      }
+    return;   // (the memory is the heap's)
+  }
   system_bytes_ -= a.cpu_.size();
   release_view(allocator_, a.cpu_);
 }
@@ -375,13 +401,37 @@ bool VidMm::read_back(Allocation& a) {
   return true;
 }
 
+namespace {
+// Whether two placed allocations of one heap share bytes.
+bool overlaps(const Allocation& a, const Allocation& b) {
+  const uint64_t a_end = a.heap_offset() + a.backing().size(), b_end = b.heap_offset() + b.backing().size();
+  return a.heap_offset() < b_end && b.heap_offset() < a_end;
+}
+}  // namespace
+
 void VidMm::note_cpu_write(Allocation& a) {
   a.device_stale_ = true;
   a.cpu_written_ = true;
+  if (a.heap_)
+    for (Allocation* other : a.heap_->placed_)
+      if (other != &a && overlaps(a, *other)) other->device_stale_ = other->cpu_written_ = true;   // (its device object is out of date, and what it holds is now written by someone)
 }
 void VidMm::note_gpu_write(Allocation& a) {
   a.gpu_newer_ = true;
   a.last_use_ = ++clock_;
+}
+
+bool VidMm::switch_alias(Allocation& outgoing, Allocation& incoming) {
+  if (!outgoing.heap_ || outgoing.heap_ != incoming.heap_) return false;
+  if (outgoing.gpu_newer_ && !read_back(outgoing)) return false;
+  // The memory holds the outgoing allocation's contents now; every allocation that shares any of it has a device object that does not.
+  for (Allocation* other : outgoing.heap_->placed_)
+    if (other != &outgoing && overlaps(outgoing, *other)) {
+      if (other->gpu_newer_ && !read_back(*other)) return false;   // (what the GPU wrote there before: kept where it does not overlap)
+      other->device_stale_ = other->cpu_written_ = true;
+    }
+  incoming.device_stale_ = incoming.cpu_written_ = true;
+  return true;
 }
 
 bool VidMm::evict(Allocation& a) {

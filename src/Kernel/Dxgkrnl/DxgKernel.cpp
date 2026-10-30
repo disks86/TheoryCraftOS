@@ -441,8 +441,13 @@ NtStatus Kernel::create_allocation(ProcessId pid, Handle device, const Allocatio
   Process* p = find_process(pid);
   DeviceObject* d = p ? p->devices.raw(device) : nullptr;
   if (!d) return status::kInvalidHandle;
-  SharedPointer<Allocation> a;
-  NtStatus s = d->adapter().vidmm().create(desc, &a);
+  SharedPointer<Allocation> a, heap;
+  if (desc.heap) {
+    SharedPointer<AllocRec> h = p->allocations.get(desc.heap);
+    if (!h || h->device != device) return status::kInvalidHandle;
+    heap = h->allocation;
+  }
+  NtStatus s = d->adapter().vidmm().create(desc, &a, heap);
   if (s != status::kSuccess) return s;
   SharedPointer<AllocRec> rec = SharedPointer<AllocRec>::make(allocator_);
   if (!rec) return status::kNoMemory;
