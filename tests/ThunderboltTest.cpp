@@ -2009,6 +2009,43 @@ static void test_net() {
 
 
 
+// The data rings take part in the interrupts: with MSI-X their two bits go to the table entry the control channel uses, with a single MSI they are only unmasked, and without interrupts they stay polled.
+static void test_net_interrupts() {
+  using namespace hardware::tb_reg;
+  {
+    NetFixture f;
+    CHECK(f.icm.use_interrupts(true, 3));
+    f.bring_up();
+    CHECK(f.net->connected());
+    // (12 hops: the transmit ring of hop 1 is bit 1, the receive ring of hop 1 is bit 13; each ring's slot in the allocation has 4 bits, 8 slots to a register)
+    CHECK(f.chip.unmasked[0] & (1u << 1));
+    CHECK(f.chip.unmasked[0] & (1u << 13));
+    CHECK(((f.chip.read32(kIntVecAllocBase) >> 4) & 0xF) == 3 && ((f.chip.read32(kIntVecAllocBase + 4) >> 20) & 0xF) == 3);
+    // a frame for us raises the interrupt through the data ring's bit
+    uint32_t raised = f.chip.interrupts_raised;
+    f.chip.peer_send(ethernet(100, 1), 0);
+    CHECK(f.chip.interrupts_raised > raised);
+    // closing masks them again, before the hops are released
+    f.chip.peer_logout(f.remote, f.local, 0x01, 6);
+    f.step();
+    CHECK(!f.net->connected() && !(f.chip.unmasked[0] & (1u << 1)) && !(f.chip.unmasked[0] & (1u << 13)) && (f.chip.unmasked[0] & (1u << 0)));
+    CHECK(((f.chip.read32(kIntVecAllocBase) >> 4) & 0xF) == 0);
+  }
+  {   // a single MSI: unmasked, no vector allocation
+    NetFixture f;
+    CHECK(f.icm.use_interrupts(true));
+    f.bring_up();
+    CHECK(f.net->connected() && (f.chip.unmasked[0] & (1u << 1)) && (f.chip.unmasked[0] & (1u << 13)) && f.chip.read32(kIntVecAllocBase) == 0);
+  }
+  {   // no interrupts: polled, nothing unmasked; turning them on and off covers the data rings
+    NetFixture f;
+    f.bring_up();
+    CHECK(f.net->connected() && f.chip.unmasked[0] == 0);
+    CHECK(f.icm.use_interrupts(true, 0) && (f.chip.unmasked[0] & (1u << 0)));
+    CHECK(f.icm.use_interrupts(false) && f.chip.unmasked[0] == 0);
+  }
+}
+
 static void test_net_lifecycle() {
   // the other host logs out: the connection is closed (path and rings), and made again when it logs in
   {
@@ -2484,6 +2521,7 @@ int main() {
   test_net_messages();
   test_net();
   test_net_lifecycle();
+  test_net_interrupts();
   test_power();
   test_msix();
   test_ice_lake();

@@ -215,6 +215,8 @@ class ThunderboltIcm final : public IThunderboltEvents {
   // read by poll(), which the caller may then call only after an interrupt. Remembered over suspend and resume. False if the controller is not running.
   bool use_interrupts(bool on, int msix_vector = -1);
   bool interrupts_on() const { return interrupts_; }
+  // Routes a data ring's interrupt the way the control channel's is (to the MSI-X entry given to use_interrupts, or the single MSI); does nothing while interrupts are off, so the ring is polled.
+  void ring_interrupts(bool transmit, uint32_t hop, bool on) { if (interrupts_ || !on) nhi_.set_ring_interrupts(transmit, hop, on, msix_vector_); }
   Outcome outcome() const { return outcome_; }
 
   // Reads the control channel: events update the device list.
