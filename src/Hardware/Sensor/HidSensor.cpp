@@ -126,7 +126,7 @@ bool HidSensor::enable() {
   }
   if (!have_id) return false;
   const bool ids = map.uses_report_ids();
-  return device_.device().set_feature(ids ? id : 0, ConstByteView(buffer + (ids ? 1 : 0), size - (ids ? 1 : 0)));
+  return device_.set_feature(ids ? id : 0, ConstByteView(buffer + (ids ? 1 : 0), size - (ids ? 1 : 0)));
 }
 
 void HidSensor::on_report(ConstByteView report) {

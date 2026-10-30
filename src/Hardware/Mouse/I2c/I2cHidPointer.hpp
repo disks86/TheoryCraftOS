@@ -30,6 +30,7 @@
 #include "Hardware/Bus/I2c/HidInputMap.hpp"
 #include "Hardware/Bus/I2c/I2cHidClient.hpp"
 #include "Hardware/Bus/I2c/IAttentionLine.hpp"
+#include "Hardware/Hid/HidFunctionHost.hpp"
 #include "Hardware/Bus/I2c/I2cHidDevice.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/Mouse/IMouse.hpp"
@@ -37,7 +38,7 @@
 
 namespace hardware {
 
-class I2cHidPointer final : public IMouse {
+class I2cHidPointer final : public IMouse, public IHidFunctionHost {
  public:
   enum class Kind : uint8_t { None, Touchpad, Touchscreen, Mouse, Other };   // Other: no pointer, but a pen or sensors (clients)
   static constexpr uint32_t kMaxContacts = 10, kQueue = 64;
@@ -49,13 +50,14 @@ class I2cHidPointer final : public IMouse {
   Kind kind() const { return kind_; }
   const I2cHidDevice& device() const { return device_; }
   I2cHidDevice& device() { return device_; }
-  const HidInputMap& map() const { return map_; }
+  const HidInputMap& map() const override { return map_; }
   // Pens and sensors of the same device: they are given every input report. Up to kMaxClients.
   static constexpr uint32_t kMaxClients = 4;
-  bool add_client(II2cHidClient* client);
-  void remove_client(II2cHidClient* client);
+  bool add_client(II2cHidClient* client) override;
+  void remove_client(II2cHidClient* client) override;
+  bool set_feature(uint8_t id, ConstByteView report) override { return device_.set_feature(id, report); }
   // Reads what the device has (as poll() does) without producing a mouse event; for the clients, which are fed from it. Safe to call from several threads.
-  void pump();
+  void pump() override;
 
   const char* name() const override { return name_; }
   bool initialize() override;
