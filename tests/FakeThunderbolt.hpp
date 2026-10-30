@@ -165,6 +165,8 @@ class FakeNhi final : public hardware::ITbRegisters {
   std::function<ConfigAnswer(bool write, uint64_t route, uint32_t port, uint32_t space, uint32_t offset, uint32_t length, const std::vector<uint32_t>& data)> config_model;
   std::vector<std::vector<uint32_t>> errors_from_host;       // error packets the host sent (the acknowledgement of a plug event)
   // A hot plug event from the router at `route`.
+  // An asynchronous error packet (the DisplayPort bandwidth request is code 32) from the router at `route`, about `port`.
+  void send_async_error(uint64_t route, uint32_t port, uint32_t code) { reply(kError, {static_cast<uint32_t>(route >> 32) & 0x3FFFFF, static_cast<uint32_t>(route), code | (port << 8)}); }
   void send_plug_event(uint64_t route, uint32_t port, bool unplug) { reply(kEvent, {static_cast<uint32_t>(route >> 32) & 0x3FFFFF, static_cast<uint32_t>(route), port | (unplug ? 0x80000000u : 0u)}); }
   std::function<void()> raise_interrupt;           // the MSI: called when a ring that is unmasked completes something
   uint32_t notify_reads = 0, interrupts_raised = 0;

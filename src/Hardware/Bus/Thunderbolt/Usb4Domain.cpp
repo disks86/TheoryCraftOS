@@ -26,7 +26,7 @@ using namespace usb4;
 namespace {
 constexpr uint8_t kPathSource = 1, kPathInternal = 2, kPathDestination = 4, kPathAll = 7;
 constexpr uint32_t kHopIdLimit = kHopWords * 64;            // HopIDs above this are not tracked (no adapter has that many)
-constexpr uint8_t kErrorInvalidConfig = 2, kErrorNoSuchPort = 6, kErrorAckPlugEvent = 7;
+constexpr uint8_t kErrorInvalidConfig = 2, kErrorNoSuchPort = 4, kErrorAckPlugEvent = 7;
 
 uint32_t route_length(uint64_t route) {
   uint32_t length = 0;
@@ -1034,6 +1034,7 @@ bool Usb4Domain::runtime_allowed() const {
 bool Usb4Domain::suspend(bool runtime) {
   if (!started_ || suspended_ || (runtime && !runtime_allowed())) return false;
   plug_count_ = 0;                                         // (events from before the sleep mean nothing after it)
+  dp_request_count_ = 0;
   xd_.clear();                                              // (the other hosts and their paths)
   for (uint64_t i = 0; i < routers_.count(); ++i)
     if (routers_[i]->present) clx_disable(*routers_[i]);     // (the low power states go before the links do)
@@ -1065,6 +1066,20 @@ bool Usb4Domain::resume(const char** error) {
 
 bool Usb4Domain::on_event(TbPacketType type, ConstByteView body) {
   if (type == TbPacketType::XdomainRequest || type == TbPacketType::XdomainResponse) return xd_.handle(type, body);
+  if (type == TbPacketType::Error && body.size() >= 12) {                 // the DisplayPort bandwidth request error: the adapter wants more or gives some back
+    ByteReader e(body);
+    const uint32_t hi = e.le32(), lo = e.le32(), word = e.le32();
+    if (e.ok() && (word & 0xFF) == kErrorDpBandwidth) {
+      if (dp_request_count_ < kPlugQueue) {
+        Plug& request = dp_requests_[(dp_request_head_ + dp_request_count_) % kPlugQueue];
+        request.route = (static_cast<uint64_t>(hi & 0x3FFFFF) << 32) | lo;
+        request.port = static_cast<uint8_t>((word >> 8) & 0x3F);
+        ++dp_request_count_;
+      }
+      return true;
+    }
+    return false;
+  }
   if (type != TbPacketType::Event || body.size() < 12) return false;
   ByteReader r(body);
   const uint32_t hi = r.le32(), lo = r.le32(), word = r.le32();
@@ -1104,6 +1119,14 @@ void Usb4Domain::poll() {
     --plug_count_;
     process_plug(plug);
     control_.poll(this);
+  }
+  while (dp_request_count_ != 0) {
+    const Plug request = dp_requests_[dp_request_head_];
+    dp_request_head_ = (dp_request_head_ + 1) % kPlugQueue;
+    --dp_request_count_;
+    const int router = find_router(request.route);
+    const int slot = router >= 0 ? dp_find(static_cast<uint32_t>(router), request.port) : -1;
+    if (slot >= 0 && tunnels_[slot].bw_mode && dp_serve_request(slot)) dp_recalc_estimates();
   }
   xd_.service();
 }
@@ -1334,7 +1357,7 @@ int Usb4Domain::port_pcie_down_for(const Usb4Router& host, uint32_t lane_port, u
 
 // USB 3 bandwidth of the host router's down adapter (usb4_usb3_port_allocate_bandwidth): the adapter is asked for control (CMR, waiting for HCA), the bandwidth already consumed is read, and the
 // larger of that and the wanted rate is written with a scale that makes it fit 12 bits; the request is withdrawn again.
-bool Usb4Domain::usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_port, const Usb4Router& device, uint32_t up_port) {
+bool Usb4Domain::usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_port, const Usb4Router& device, uint32_t up_port, uint32_t* allocated) {
   const Usb4Port& down = host.ports[down_port];
   const Usb4Port& up = device.ports[up_port];
   uint32_t speed_down = 0, speed_up = 0;
@@ -1342,6 +1365,13 @@ bool Usb4Domain::usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_p
   const uint32_t rate_down = ((speed_down >> kUsb3Cs4MslrShift) & kUsb3Cs4MslrMask) == kUsb3Cs4Mslr20G ? 20000 : 10000;
   const uint32_t rate_up = ((speed_up >> kUsb3Cs4MslrShift) & kUsb3Cs4MslrMask) == kUsb3Cs4Mslr20G ? 20000 : 10000;
   const uint32_t wanted = (rate_down < rate_up ? rate_down : rate_up) * 90 / 100;
+  return usb3_set_allocation(host, down_port, wanted, wanted, false, allocated);
+}
+
+// usb4_usb3_port_allocate_bandwidth / release_bandwidth: the adapter is asked for control (CMR, waiting for HCA), the bandwidth already consumed is read, and the larger of that and the wanted
+// rate (for a release: just what is consumed) is written with a scale that makes it fit 12 bits; the request is withdrawn again.
+bool Usb4Domain::usb3_set_allocation(const Usb4Router& host, uint32_t down_port, uint32_t wanted_up, uint32_t wanted_down, bool release, uint32_t* allocated) {
+  const Usb4Port& down = host.ports[down_port];
   auto set_request = [&](bool on) {
     uint32_t cs2 = 0;
     if (!port_read(host, down_port, down.cap_adapter + kUsb3Cs2, ArrayView<uint32_t>(&cs2, 1))) return false;
@@ -1362,7 +1392,7 @@ bool Usb4Domain::usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_p
     scale &= 0x3F;
     auto to_mbps = [](uint32_t bw, uint32_t sc) { return static_cast<uint32_t>((static_cast<uint64_t>(bw) * 512 << sc) * 8000 / 1000000); };
     const uint32_t consumed_up = to_mbps(cs1 & 0xFFF, scale), consumed_down = to_mbps((cs1 >> 12) & 0xFFF, scale);
-    const uint32_t up_bw = wanted > consumed_up ? wanted : consumed_up, down_bw = wanted > consumed_down ? wanted : consumed_down;
+    const uint32_t up_bw = release ? consumed_up : (wanted_up > consumed_up ? wanted_up : consumed_up), down_bw = release ? consumed_down : (wanted_down > consumed_down ? wanted_down : consumed_down);
     const uint32_t max_bw = up_bw > down_bw ? up_bw : down_bw;
     auto to_bw = [](uint32_t mbps, uint32_t sc) { const uint64_t uframes = static_cast<uint64_t>(mbps) * 1000000 / 8000; const uint64_t unit = 512ull << sc; return static_cast<uint32_t>((uframes + unit - 1) / unit); };
     uint32_t new_scale = 0;
@@ -1372,10 +1402,18 @@ bool Usb4Domain::usb3_allocate_bandwidth(const Usb4Router& host, uint32_t down_p
         port_read(host, down_port, down.cap_adapter + kUsb3Cs2, ArrayView<uint32_t>(&cs2, 1))) {
       cs2 = (cs2 & ~0x00FFFFFFu) | to_bw(up_bw, new_scale) | (to_bw(down_bw, new_scale) << 12);
       ok = port_write(host, down_port, down.cap_adapter + kUsb3Cs2, ArrayView<const uint32_t>(&cs2, 1));
+      if (ok && allocated) *allocated = down_bw;
     }
   }
   set_request(false);
   return ok;
+}
+
+// A USB 3 stream whose bandwidth the host router's adapter manages and that crosses the link above `r` (the first link below the host): the tunnel, or -1.
+int Usb4Domain::usb3_on_link(int r) const {
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Usb3 && tunnels_[i].device_router == r && routers_[tunnels_[i].host_router]->parent < 0) return static_cast<int>(i);
+  return -1;
 }
 
 bool Usb4Domain::remove_tunnel(int slot) {
@@ -1400,6 +1438,7 @@ bool Usb4Domain::remove_tunnel(int slot) {
     if (t.device_router >= 0 && routers_[t.device_router]->present) set_dp_enable(*routers_[t.device_router], t.up_port, false);
     deactivate_path(&t.third);
     release_path(&t.third);
+    t.bw_mode = false;
   }
   deactivate_path(&t.down);
   deactivate_path(&t.up);
@@ -1484,7 +1523,11 @@ bool Usb4Domain::make_tunnel(uint32_t router_index, Usb4TunnelKind kind, const c
       !build_path(&t.up, static_cast<int>(router_index), static_cast<uint32_t>(up), device.parent, static_cast<uint32_t>(down), kind))
     return fail("no HopIDs left for the paths");
   // USB 3 over the host router's adapter has its bandwidth allocated first
-  if (!pcie && host.parent < 0 && !usb3_allocate_bandwidth(host, static_cast<uint32_t>(down), device, static_cast<uint32_t>(up))) return fail("the USB 3 bandwidth could not be allocated");
+  if (!pcie && host.parent < 0) {
+    uint32_t allocated = 0;
+    if (!usb3_allocate_bandwidth(host, static_cast<uint32_t>(down), device, static_cast<uint32_t>(up), &allocated)) return fail("the USB 3 bandwidth could not be allocated");
+    t.allocated_bw = allocated;
+  }
   if (!activate_path(&t.down) || !activate_path(&t.up)) return fail("the paths could not be written");
   // PCIe: the far adapter first; USB 3: the near one first (tb_pci_activate / tb_usb3_activate)
   if (pcie) {
@@ -1861,15 +1904,22 @@ bool Usb4Domain::tunnel_dp(uint32_t in_router, uint32_t in_port, uint32_t out_ro
     }
   }
   if (!dp_exchange_caps(in, in_port, out, out_port)) return fail("the adapters did not exchange their capabilities");
+  if (!dp_enable_bandwidth_mode(slot)) return fail("the bandwidth allocation mode could not be set up");
   if (!activate_path(&t.down) || !activate_path(&t.up) || !activate_path(&t.third)) return fail("the paths could not be written");
   if (!set_dp_enable(in, in_port, true) || !set_dp_enable(out, out_port, true)) return fail("the DisplayPort adapters could not be enabled");
   t.active = true;
+  dp_recalc_estimates();
   return true;
 }
 
 bool Usb4Domain::disconnect_dp(uint32_t in_router, uint32_t in_port) {
-  for (uint32_t i = 0; i < kMaxTunnels; ++i)
-    if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].host_router == static_cast<int>(in_router) && tunnels_[i].down_port == in_port) return remove_tunnel(static_cast<int>(i));
+  for (uint32_t i = 0; i < kMaxTunnels; ++i) {
+    if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].host_router == static_cast<int>(in_router) && tunnels_[i].down_port == in_port) {
+      const bool ok = remove_tunnel(static_cast<int>(i));
+      dp_recalc_estimates();                                 // (the others can have what it held)
+      return ok;
+    }
+  }
   return false;
 }
 
@@ -1976,6 +2026,208 @@ bool Usb4Domain::set_clx(uint32_t router_index, uint8_t states) {
   Usb4Router& r = *routers_[router_index];
   if (states == 0) return r.clx == 0 || clx_disable(r);
   return clx_enable(r, states);
+}
+
+// ------------------------------------------------------------------ DisplayPort bandwidth
+
+int Usb4Domain::dp_find(uint32_t in_router, uint32_t in_port) const {
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].host_router == static_cast<int>(in_router) && tunnels_[i].down_port == in_port) return static_cast<int>(i);
+  return -1;
+}
+
+bool Usb4Domain::dp_bandwidth_mode(uint32_t in_router, uint32_t in_port) const { const int s = dp_find(in_router, in_port); return s >= 0 && tunnels_[s].bw_mode; }
+uint32_t Usb4Domain::dp_allocated_bandwidth(uint32_t in_router, uint32_t in_port) const { const int s = dp_find(in_router, in_port); return s >= 0 ? tunnels_[s].allocated_bw : 0; }
+uint32_t Usb4Domain::dp_maximum_bandwidth(uint32_t in_router, uint32_t in_port) const { const int s = dp_find(in_router, in_port); return s >= 0 ? tunnels_[s].max_bw : 0; }
+
+// The speed of one lane of the link in Gb/s (tb_port_get_link_speed): generation 4 40, generation 3 20, else 10.
+int Usb4Domain::link_speed(const Usb4Router& r, uint32_t port) {
+  const Usb4Port& p = r.ports[port];
+  uint32_t word = 0;
+  if (p.cap_phy == 0 || !port_read(r, port, p.cap_phy + kLaneCs1, ArrayView<uint32_t>(&word, 1))) return -1;
+  const uint32_t speed = (word & kLaneCs1CurrentSpeedMask) >> kLaneCs1CurrentSpeedShift;
+  return speed == kLaneSpeedGen4 ? 40 : speed == kLaneSpeedGen3 ? 20 : 10;
+}
+
+// What the link above a router can carry from the host towards the router, in Mb/s (tb_maximum_bandwidth, the downstream direction): speed times the lanes that carry that way - two when bonded,
+// one when not, one of an asymmetric link that transmits three towards the host and three when it transmits one.
+int Usb4Domain::link_down_capacity(const Usb4Router& child) {
+  const int speed = link_speed(child, child.upstream_port);
+  const int width = lane_width(child, child.upstream_port);
+  if (speed < 0 || width <= 0) return -1;
+  const int lanes = width == static_cast<int>(Usb4LinkWidth::AsymTx) ? 1 : width == static_cast<int>(Usb4LinkWidth::AsymRx) ? 3 : width;
+  return speed * lanes * 1000;
+}
+
+// What is left for the stream in slot `slot` on the links between its output and its input: each link's capacity less the allocations of the other DisplayPort streams that cross it and the
+// 1500 Mb/s a PCIe tunnel between two version 2 routers keeps for itself (tb_available_bandwidth, downstream).
+int Usb4Domain::dp_available(int slot) {
+  const Usb4Tunnel& t = tunnels_[slot];
+  int available = 0x7FFFFFFF;
+  for (int r = t.device_router; r >= 0 && r != t.host_router; r = routers_[r]->parent) {
+    const Usb4Router& router = *routers_[r];
+    int capacity = link_down_capacity(router);
+    if (capacity < 0) return -1;
+    for (uint32_t i = 0; i < kMaxTunnels; ++i) {
+      const Usb4Tunnel& other = tunnels_[i];
+      if (static_cast<int>(i) == slot || !other.used || other.kind != Usb4TunnelKind::Dp || !other.bw_mode) continue;
+      for (uint32_t h = 0; h + 1 < other.third.length; ++h)
+        if (other.third.hops[h].router == r) { capacity -= static_cast<int>(other.allocated_bw); break; }
+    }
+    if (router.usb4_version >= 2 && router.parent >= 0 && routers_[router.parent]->usb4_version >= 2 && find_tunnel(r, Usb4TunnelKind::Pcie) >= 0) capacity -= 1500;
+    const int usb3 = usb3_on_link(r);                        // (what the USB 3 stream is allocated, times the PCIe weight on top of its own: 3 / 2)
+    if (usb3 >= 0) capacity -= static_cast<int>(tunnels_[usb3].allocated_bw * 3 / 2);
+    if (capacity < available) available = capacity;
+  }
+  return available < 0 ? 0 : available;
+}
+
+bool Usb4Domain::dp_write_estimate(int slot, uint32_t bandwidth) {
+  const Usb4Tunnel& t = tunnels_[slot];
+  const Usb4Router& in = *routers_[t.host_router];
+  const Usb4Port& p = in.ports[t.down_port];
+  uint32_t cs2 = 0;
+  if (!port_read(in, t.down_port, p.cap_adapter + kDpCs2, ArrayView<uint32_t>(&cs2, 1)) || t.granularity == 0) return false;
+  const uint32_t steps = bandwidth / t.granularity;
+  cs2 = (cs2 & ~kDpCs2EstimatedMask) | ((steps > 0xFF ? 0xFFu : steps) << kDpCs2EstimatedShift);
+  return port_write(in, t.down_port, p.cap_adapter + kDpCs2, ArrayView<const uint32_t>(&cs2, 1));
+}
+
+// tb_dp_bandwidth_alloc_mode_enable: the connection manager is declared (id, bandwidth mode supported, group), the non-reduced rate and lanes are the smaller of the two adapters', the
+// granularity is the smallest of 250, 500 and 1000 Mb/s that lets the maximum fit 8 bits, the estimate is what the links have free, and nothing is allocated yet.
+bool Usb4Domain::dp_enable_bandwidth_mode(int slot) {
+  Usb4Tunnel& t = tunnels_[slot];
+  Usb4Router& in = *routers_[t.host_router];
+  Usb4Router& out = *routers_[t.device_router];
+  const Usb4Port& i = in.ports[t.down_port];
+  const Usb4Port& o = out.ports[t.up_port];
+  uint32_t in_cap = 0, out_cap = 0, cs2 = 0;
+  if (!port_read(in, t.down_port, i.cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&in_cap, 1))) return false;
+  if (!(in_cap & kDpCommonBwMode) || in.usb4_version == 0 || out.usb4_version == 0) return true;       // (not supported: the stream runs at the full rate, as before)
+  if (!port_read(out, t.up_port, o.cap_adapter + kDpLocalCap, ArrayView<uint32_t>(&out_cap, 1))) return false;
+  static const uint32_t kRates[4] = {1620, 2700, 5400, 8100}, kLanes[3] = {1, 2, 4};
+  const uint32_t in_rate_i = (in_cap & kDpCommonRateMask) >> kDpCommonRateShift, out_rate_i = (out_cap & kDpCommonRateMask) >> kDpCommonRateShift;
+  const uint32_t in_lanes_i = (in_cap & kDpCommonLanesMask) >> kDpCommonLanesShift, out_lanes_i = (out_cap & kDpCommonLanesMask) >> kDpCommonLanesShift;
+  if (in_rate_i > 3 || out_rate_i > 3 || in_lanes_i > 2 || out_lanes_i > 2) return false;
+  const uint32_t rate_i = in_rate_i < out_rate_i ? in_rate_i : out_rate_i, lanes_i = in_lanes_i < out_lanes_i ? in_lanes_i : out_lanes_i;
+  const uint32_t nrd_bw = kRates[rate_i] * kLanes[lanes_i] * 8 / 10;
+  uint32_t granularity = 250;
+  while (nrd_bw / granularity > 255 && granularity <= 1000) granularity *= 2;
+  if (granularity > 1000) return false;
+  // the connection manager's declaration and the group of streams that share a link: one group per host lane adapter the stream leaves by
+  if (!port_read(in, t.down_port, i.cap_adapter + kDpCs2, ArrayView<uint32_t>(&cs2, 1))) return false;
+  const uint32_t lane = t.third.length ? t.third.hops[t.third.length - 1].in_port : 1;
+  cs2 &= ~(kDpCs2CmIdMask | kDpCs2GroupMask | kDpCs2NrdRateMask | kDpCs2NrdLanesMask | kDpCs2GranularityMask);
+  cs2 |= kDpCs2Cmms | (0u << kDpCs2CmIdShift) | ((((lane - 1) / 2) % 7 + 1) << kDpCs2GroupShift) | (rate_i << kDpCs2NrdRateShift) | lanes_i | ((granularity == 250 ? 0u : granularity == 500 ? 1u : 2u) << kDpCs2GranularityShift);
+  if (!port_write(in, t.down_port, i.cap_adapter + kDpCs2, ArrayView<const uint32_t>(&cs2, 1))) return false;
+  t.granularity = granularity;
+  t.max_bw = (nrd_bw + granularity - 1) / granularity * granularity;
+  t.bw_mode = true;
+  const int available = dp_available(slot);
+  if (available < 0 || !dp_write_estimate(slot, static_cast<uint32_t>(available))) return false;
+  return dp_allocate(slot, 0);
+}
+
+// usb4_dp_port_allocate_bandwidth: the amount in units of the granularity into DP_STATUS, the connection manager's acknowledge raised, then lowered while the request bit is waited for.
+bool Usb4Domain::dp_allocate(int slot, uint32_t bandwidth) {
+  Usb4Tunnel& t = tunnels_[slot];
+  const Usb4Router& in = *routers_[t.host_router];
+  const Usb4Port& p = in.ports[t.down_port];
+  uint32_t status = 0, cs2 = 0;
+  if (t.granularity == 0 || !port_read(in, t.down_port, p.cap_adapter + kDpStatusCtrl, ArrayView<uint32_t>(&status, 1))) return false;
+  status = (status & ~kDpStatusAllocatedMask) | ((bandwidth / t.granularity) << kDpStatusAllocatedShift);
+  if (!port_write(in, t.down_port, p.cap_adapter + kDpStatusCtrl, ArrayView<const uint32_t>(&status, 1))) return false;
+  if (!port_read(in, t.down_port, p.cap_adapter + kDpCs2, ArrayView<uint32_t>(&cs2, 1))) return false;
+  cs2 |= kDpCs2Ca;
+  if (!port_write(in, t.down_port, p.cap_adapter + kDpCs2, ArrayView<const uint32_t>(&cs2, 1))) return false;
+  cs2 &= ~kDpCs2Ca;
+  if (!port_write(in, t.down_port, p.cap_adapter + kDpCs2, ArrayView<const uint32_t>(&cs2, 1))) return false;
+  bool done = false;
+  for (uint32_t waited = 0; waited < 500000 && !done; waited += 50) {
+    uint32_t cs8 = 0;
+    if (!port_read(in, t.down_port, p.cap_adapter + kDpCs8, ArrayView<uint32_t>(&cs8, 1))) return false;
+    done = !(cs8 & kDpCs8Dr);
+    if (!done) delay_us(50);
+  }
+  if (done) t.allocated_bw = bandwidth;
+  return done;
+}
+
+// One request of a DP IN adapter: read (granularity times the 8 bit field), refused if the links cannot carry it next to the others, else allocated (never above the stream's maximum).
+bool Usb4Domain::dp_serve_request(int slot) {
+  Usb4Tunnel& t = tunnels_[slot];
+  const Usb4Router& in = *routers_[t.host_router];
+  const Usb4Port& p = in.ports[t.down_port];
+  uint32_t cs8 = 0;
+  if (!port_read(in, t.down_port, p.cap_adapter + kDpCs8, ArrayView<uint32_t>(&cs8, 1)) || !(cs8 & kDpCs8Dr)) return false;
+  uint32_t requested = (cs8 & kDpCs8RequestedMask) * t.granularity;
+  if (requested > t.max_bw) requested = t.max_bw;
+  usb3_release_unused(slot);                                // (USB 3 gives back what it holds without using, to make room)
+  const int available = dp_available(slot);
+  if (available < 0 || requested > static_cast<uint32_t>(available)) {
+    dp_allocate(slot, t.allocated_bw);                       // (not enough: the adapter is acknowledged with what it has, so that it stops asking and settles for that)
+    usb3_reclaim();
+    return false;
+  }
+  const bool ok = dp_allocate(slot, requested);
+  usb3_reclaim();
+  return ok;
+}
+
+// tb_release_unused_usb3_bandwidth: the USB 3 streams on the links this stream crosses are cut down to what they consume.
+void Usb4Domain::usb3_release_unused(int dp_slot) {
+  for (int r = tunnels_[dp_slot].device_router; r >= 0 && r != tunnels_[dp_slot].host_router; r = routers_[r]->parent) {
+    const int u = usb3_on_link(r);
+    if (u < 0) continue;
+    uint32_t allocated = 0;
+    if (usb3_set_allocation(*routers_[tunnels_[u].host_router], tunnels_[u].down_port, 0, 0, true, &allocated)) tunnels_[u].allocated_bw = allocated;
+  }
+}
+
+// tb_reclaim_usb3_bandwidth: each USB 3 stream at the host takes back what is free, up to 90% of its link rate, never less than it has.
+void Usb4Domain::usb3_reclaim() {
+  for (uint32_t i = 0; i < kMaxTunnels; ++i) {
+    Usb4Tunnel& u = tunnels_[i];
+    if (!u.used || u.kind != Usb4TunnelKind::Usb3 || routers_[u.host_router]->parent >= 0) continue;
+    const Usb4Router& router = *routers_[u.device_router];
+    int capacity = link_down_capacity(router);
+    if (capacity < 0) continue;
+    for (uint32_t k = 0; k < kMaxTunnels; ++k) {              // (less what the DisplayPort streams across it hold)
+      const Usb4Tunnel& dp = tunnels_[k];
+      if (!dp.used || dp.kind != Usb4TunnelKind::Dp || !dp.bw_mode) continue;
+      for (uint32_t h = 0; h + 1 < dp.third.length; ++h)
+        if (dp.third.hops[h].router == u.device_router) { capacity -= static_cast<int>(dp.allocated_bw); break; }
+    }
+    uint32_t max_rate = 9000;                                  // (the 10 Gb/s rate's 90%; a 20 Gb/s adapter's is more, read below)
+    const Usb4Router& host = *routers_[u.host_router];
+    uint32_t speed = 0;
+    if (port_read(host, u.down_port, host.ports[u.down_port].cap_adapter + kUsb3Cs4, ArrayView<uint32_t>(&speed, 1)) && ((speed >> kUsb3Cs4MslrShift) & kUsb3Cs4MslrMask) == kUsb3Cs4Mslr20G) max_rate = 18000;
+    uint32_t want = capacity > 0 ? static_cast<uint32_t>(capacity) : 0;                 // (what the link has free, the stream itself not counted)
+    if (want > max_rate) want = max_rate;
+    if (want <= u.allocated_bw) continue;
+    uint32_t allocated = 0;
+    if (usb3_set_allocation(host, u.down_port, want, want, false, &allocated)) u.allocated_bw = allocated;
+  }
+}
+
+// After a change, every stream is told the most it could have now: what the links have free for it, up to its own maximum (tb_recalc_estimated_bandwidth).
+void Usb4Domain::dp_recalc_estimates() {
+  for (uint32_t i = 0; i < kMaxTunnels; ++i) {
+    if (!tunnels_[i].used || tunnels_[i].kind != Usb4TunnelKind::Dp || !tunnels_[i].bw_mode) continue;
+    const int available = dp_available(static_cast<int>(i));
+    if (available < 0) continue;
+    uint32_t estimate = static_cast<uint32_t>(available);      // (what the links have free for it, its own allocation not counted against it)
+    if (estimate > tunnels_[i].max_bw) estimate = tunnels_[i].max_bw;
+    dp_write_estimate(static_cast<int>(i), estimate);
+  }
+}
+
+uint32_t Usb4Domain::dp_poll_requests() {
+  uint32_t granted = 0;
+  for (uint32_t i = 0; i < kMaxTunnels; ++i)
+    if (tunnels_[i].used && tunnels_[i].kind == Usb4TunnelKind::Dp && tunnels_[i].bw_mode && dp_serve_request(static_cast<int>(i))) ++granted;
+  if (granted) dp_recalc_estimates();
+  return granted;
 }
 
 // ------------------------------------------------------------------ lane bonding
