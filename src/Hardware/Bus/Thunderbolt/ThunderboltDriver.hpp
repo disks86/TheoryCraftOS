@@ -24,6 +24,7 @@
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltDevices.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltIcl.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltIcm.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltPower.hpp"
 #include "Hardware/RegisterMapper.hpp"
@@ -51,7 +52,8 @@ class ThunderboltDriver {
   Outcome start(IPciBus& pci, const PciDeviceInfo& device, IRegisterMapper& mapper);
   // The part after the registers are reachable (tests bring their own).
   // `cio`: the PCIe-to-CIO registers if there are any (see ThunderboltCio).
-  Outcome start_device(ITbRegisters& registers, TbPcie2Cio* cio = nullptr, TbGeneration generation = TbGeneration::AlpineRidge);
+  // `nhi_config`: the NHI's PCI configuration space, which an Ice Lake controller needs for its power handling (force power, the link controller's mailbox); not otherwise.
+  Outcome start_device(ITbRegisters& registers, TbPcie2Cio* cio = nullptr, TbGeneration generation = TbGeneration::AlpineRidge, ITbConfigSpace* nhi_config = nullptr);
   void stop();
 
   Outcome outcome() const { return outcome_; }
@@ -84,8 +86,10 @@ class ThunderboltDriver {
   allocators::IAllocator& allocator_;
   Config config_;
   uint32_t interrupts_ = 0;
-  bool wake_armed_ = false;
+  bool wake_armed_ = false, icl_powered_ = true;
   UniquePointer<TbPciPower> power_;
+  UniquePointer<PciFunctionConfig> nhi_config_;
+  UniquePointer<TbIceLake> icl_;
   UniquePointer<PciFunctionConfig> upstream_config_;
   UniquePointer<TbPcie2Cio> cio_;
   UniquePointer<MmioTbRegisters> mmio_;

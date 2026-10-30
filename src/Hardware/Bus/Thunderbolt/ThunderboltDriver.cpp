@@ -44,10 +44,19 @@ ThunderboltDriver::Outcome ThunderboltDriver::start(IPciBus& pci, const PciDevic
     const uint16_t capability = upstream_config_ ? tb_find_vendor_capability(*upstream_config_) : 0;
     if (capability != 0) cio_ = UniquePointer<TbPcie2Cio>::make(allocator_, *upstream_config_, capability);
   }
-  return start_device(*mmio_, cio_.get(), model_->generation);
+  nhi_config_ = UniquePointer<PciFunctionConfig>::make(allocator_, pci, device.address);
+  return start_device(*mmio_, cio_.get(), model_->generation, nhi_config_.get());
 }
 
-ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registers, TbPcie2Cio* cio, TbGeneration generation) {
+ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registers, TbPcie2Cio* cio, TbGeneration generation, ITbConfigSpace* nhi_config) {
+  icl_ = UniquePointer<TbIceLake>();
+  if (generation == TbGeneration::IceLake) {
+    // the firmware runs only while the controller is force powered
+    if (!nhi_config) return outcome_ = Outcome::ControllerFailed;
+    icl_ = UniquePointer<TbIceLake>::make(allocator_, *nhi_config);
+    if (!icl_ || !icl_->force_power(true)) return outcome_ = Outcome::ControllerFailed;
+    icl_->set_ltr();
+  }
   icm_ = UniquePointer<ThunderboltIcm>::make(allocator_, registers, allocator_);
   if (!icm_) return outcome_ = Outcome::OutOfMemory;
   ThunderboltIcm::Options options;
@@ -62,7 +71,15 @@ ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registe
 }
 
 bool ThunderboltDriver::sleep(bool wake, bool runtime) {
-  if (!icm_ || !(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
+  if (!icm_) return false;
+  bool devices = icm_->device_count() != 0 || icm_->xdomain_count() != 0;
+  if (!(runtime ? icm_->runtime_suspend() : icm_->suspend())) return false;
+  if (icl_ && !devices) {
+    // (icl_nhi_suspend: with nothing connected the link controller is told to get ready for a reset and the power forced off; with something connected the controller stays powered)
+    icl_->lc_mailbox(tb_icl::kPrepareForReset);
+    icl_->force_power(false);
+    icl_powered_ = false;
+  }
   wake_armed_ = false;
   if (power_ && power_->available()) {
     // (a wake that cannot be armed still lets the function sleep)
@@ -76,11 +93,19 @@ ThunderboltDriver::Outcome ThunderboltDriver::resume() {
   if (!icm_) return outcome_;
   if (power_ && power_->available()) power_->enter_d0();
   wake_armed_ = false;
+  if (icl_ && !icl_powered_) {
+    if (!icl_->force_power(true)) return outcome_ = Outcome::ControllerFailed;
+    icl_->set_ltr();
+    icl_powered_ = true;
+  }
   return outcome_ = icm_->resume() == ThunderboltIcm::Outcome::Started ? Outcome::Started : Outcome::ControllerFailed;
 }
 
 void ThunderboltDriver::stop() {
-  icm_ = UniquePointer<ThunderboltIcm>();
+  icm_ = UniquePointer<ThunderboltIcm>();                       // (tells the firmware first)
+  if (icl_ && icl_powered_) icl_->force_power(false);           // (the controller is shut down: the firmware may stop)
+  icl_ = UniquePointer<TbIceLake>();
+  icl_powered_ = true;
   cio_ = UniquePointer<TbPcie2Cio>();
   power_ = UniquePointer<TbPciPower>();
   upstream_config_ = UniquePointer<PciFunctionConfig>();

@@ -29,6 +29,7 @@
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/RegisterMapper.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltCio.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltIcl.hpp"
 #include "Hardware/Bus/Thunderbolt/ThunderboltRegisters.hpp"
 
 namespace fake_tb {
@@ -727,6 +728,38 @@ class FakeMapper final : public hardware::IRegisterMapper {
     ++mapped;
     *region = hardware::MmioRegion(physical, length);
     return true;
+  }
+};
+
+
+// The NHI's PCI configuration space as far as an Ice Lake controller's power handling uses it.
+class FakeIclConfig final : public hardware::ITbConfigSpace {
+ public:
+  bool firmware_comes_up = true;           // FW_READY appears once the controller is force powered
+  bool lc_done = true;
+  uint32_t force_power_register = 0, ltr = 0, max_ltr = 0x3FFF, lc_command = 0;
+  std::vector<uint32_t> lc_commands;       // the commands sent (without the valid bit)
+  uint32_t power_writes = 0;
+  uint32_t read32(uint16_t offset) override {
+    using namespace hardware::tb_icl;
+    if (offset == kFwReadyRegister) return (firmware_comes_up && (force_power_register & kForcePower)) ? kFwReady : 0;
+    if (offset == kMaxLtrRegister) return max_ltr;
+    if (offset == kLtrRegister) return ltr;
+    if (offset == kLcDoneRegister) return lc_done ? kLcDone : 0;
+    if (offset == kLcCommandRegister) return lc_command;
+    if (offset == kForcePowerRegister) return force_power_register;
+    if (offset == kUuidLowRegister) return 0x11223344u;
+    if (offset == kUuidHighRegister) return 0x55667788u;
+    return 0;
+  }
+  void write32(uint16_t offset, uint32_t value) override {
+    using namespace hardware::tb_icl;
+    if (offset == kForcePowerRegister) { force_power_register = value; ++power_writes; }
+    else if (offset == kLtrRegister) ltr = value;
+    else if (offset == kLcCommandRegister) {
+      lc_command = value;
+      if (value & kLcValid) lc_commands.push_back((value & kLcCommandMask) >> kLcCommandShift);
+    }
   }
 };
 
