@@ -2197,6 +2197,11 @@ TESS_SCENE(scene_tess_fractional_even,
            {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_even_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
            {TESS_BLOB(hs_iso_even_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
 
+// The same with DXIL (Shader Model 6) hull and domain shaders: a triangle patch and a quad patch with different factors.
+TESS_SCENE(scene_dxil_tess,
+           {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {3, 6, 2, 4}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {4, 4, 4, 4}, {4, 4, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {2, 3, 5, 8}, {4, 3, 0, 0}, kNoCull})
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2234,6 +2239,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL shaders (Shader Model 6)", scene_dxil},
     {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
     {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
+    {"Direct3D 12 DXIL hull and domain shaders (Shader Model 6)", scene_dxil_tess},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},

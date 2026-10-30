@@ -1856,6 +1856,12 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     if (phase == 0) return status::kInvalidParameter;
     const uint32_t points_in = hs_[0];
     if (phase == 1) {
+      for (uint32_t i = 0; i < kMaxResources; ++i) {   // (the constant buffers of both functions)
+        const Resource& r = res_[2][i];
+        if (!r.present) continue;
+        if (r.bytes == 0 || r.bytes % 16 || r.lower >= 14) return status::kNotSupported;
+        word(89u | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (8u << 12) | (2u << 20)), word(r.lower), word(r.bytes / 16);
+      }
       if (points_in < 1 || points_in > graphics::kMaxPatchControlPoints) return status::kNotSupported;
       for (uint32_t i = 0; i < input_count_; ++i) {
         const SigElement& e = inputs_[i];
