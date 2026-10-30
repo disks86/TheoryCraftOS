@@ -259,7 +259,9 @@ class ThunderboltIcm final : public IThunderboltEvents {
   bool on_event(TbPacketType type, ConstByteView body) override;
 
  private:
-  bool titan() const { return options_.generation == TbGeneration::TitanRidge; }
+  // (Ice Lake's firmware speaks Titan Ridge's messages)
+  bool titan() const { return options_.generation == TbGeneration::TitanRidge || options_.generation == TbGeneration::IceLake; }
+  bool ice_lake() const { return options_.generation == TbGeneration::IceLake; }
   bool same_place(const TbDevice& a, const TbDevice& b) const;
   uint32_t approve_bytes() const { return titan() ? tb_icm::kTrApproveBytes : tb_icm::kApproveBytes; }
   uint32_t build_approve(const TbDevice& device, ByteView out) const { return titan() ? tb_icm::build_approve_device_tr(device, out) : tb_icm::build_approve_device(device, out); }

@@ -18,13 +18,14 @@
 
 // The Thunderbolt host interfaces this driver knows. Only the Thunderbolt 3 controllers whose connection manager is the firmware on the controller (ICM: Alpine Ridge and Titan Ridge) are
 // listed: the host does not build tunnels itself, it asks the firmware to. The two generations name devices differently (Alpine Ridge by port and depth, Titan Ridge by route string). The USB4
-// controllers need other messages (or the host as connection manager) and are not listed.
+// controllers need other messages (or the host as connection manager) and are not listed - except Ice Lake's, whose firmware is the connection manager as well, speaking Titan Ridge's messages.
+// (Tiger Lake and later run the connection manager in the host by default: that is a different, much larger piece of software, not here.)
 #pragma once
 #include <stdint.h>
 
 namespace hardware {
 
-enum class TbGeneration : uint8_t { AlpineRidge, TitanRidge };
+enum class TbGeneration : uint8_t { AlpineRidge, TitanRidge, IceLake };
 
 struct TbNhiDevice {
   uint16_t device_id;
