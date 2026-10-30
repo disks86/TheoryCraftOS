@@ -71,6 +71,32 @@ inline uint64_t rotate_right(uint64_t x, uint32_t n, uint32_t w) {
   return n == 0 ? x : ((x >> n) | (x << (w - n))) & ones(w);
 }
 
+// Predicate-as-counter registers (SVE2.1 / SME2): bits 3:0 hold a marker (the lowest set bit gives the element size, 0 = byte .. 3 = doubleword), bits 6:marker+1 the element count and bit 15
+// inverts the meaning. The predicate for vector `segment` of the group, at element size `esz` (a counter made for a wider element keeps that element's spacing).
+inline uint16_t counter_to_predicate(uint16_t pn, uint32_t esz, uint32_t segment) {
+  if ((pn & 15) == 0) return 0;
+  uint32_t marker = 0;
+  while (!((pn >> marker) & 1)) ++marker;
+  const bool invert = (pn >> 15) & 1;
+  const uint32_t count = (pn & 0x7Fu) >> (marker + 1);      // (only bits 6:marker+1 count; the higher bits are ignored)
+  const uint32_t es = esz > marker ? esz : marker;
+  const uint32_t elements = ((count << marker) + (1u << es) - 1) >> es, per_vector = 16u >> es;
+  uint16_t r = 0;
+  for (uint32_t i = 0; i < per_vector; ++i) {
+    const bool on = (segment * per_vector + i < elements) != invert;
+    if (on) r = static_cast<uint16_t>(r | (1u << (i << es)));
+  }
+  return r;
+}
+
+// A counter for `run` leading active elements out of `total` (ascending) or trailing ones (descending, which the inverted form expresses).
+inline uint16_t make_counter(uint32_t run, uint32_t total, uint32_t esz, bool ascending) {
+  const uint16_t marker = static_cast<uint16_t>(1u << esz);
+  if (run >= total) return static_cast<uint16_t>(0x8000u | marker);
+  if (run == 0) return 0;
+  return ascending ? static_cast<uint16_t>(marker | (run << (esz + 1))) : static_cast<uint16_t>(0x8000u | marker | ((total - run) << (esz + 1)));
+}
+
 // A logical immediate (N:immr:imms) as the 64-bit pattern it replicates; false for a reserved encoding.
 inline bool decode_logical_immediate(uint32_t imm13, uint64_t* out) {
   const uint32_t n = (imm13 >> 12) & 1, immr = (imm13 >> 6) & 63, imms = imm13 & 63;

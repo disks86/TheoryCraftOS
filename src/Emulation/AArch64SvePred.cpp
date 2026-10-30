@@ -275,6 +275,83 @@ bool AArch64Cpu::sve_predicate(uint32_t insn) {
   if ((insn & 0xFFFFFE1Fu) == 0x25289000u) { s_.ffr = s_.p[pn]; return true; }
 
   // 0x25 with bit 21 set
+  {
+    const uint32_t pd4 = insn & 15;
+    // SVE2.1 / SME2: predicate-as-counter registers (pn8..pn15 live in p8..p15)
+    if ((insn & 0xFF3FFFF8u) == 0x25207810u) {      // PTRUE pn<8+n>.t
+      s_.p[8 + (insn & 7)] = static_cast<uint16_t>(0x8000u | (1u << esz));
+      return true;
+    }
+    if (bits_of(insn, 20, 16) == 0 && bits_of(insn, 15, 11) == 0x10 && bits_of(insn, 9, 8) == 3 ) {      // CNTP Xd, pn<8+n>.t, vlx2 / vlx4
+      const uint32_t pn8 = 8 + bits_of(insn, 7, 5), vectors = ((insn >> 10) & 1) ? 4 : 2;
+      uint32_t n = 0;
+      for (uint32_t v = 0; v < vectors; ++v) {
+        const uint16_t pr = counter_to_predicate(s_.p[pn8], esz, v);
+        for (uint32_t i = 0; i < 16; ++i) n += (pr >> i) & 1;
+      }
+      set_reg(insn & 31, n, true);
+      return true;
+    }
+    if (bits_of(insn, 20, 16) == 0 && (bits_of(insn, 15, 10) == 0x1C || bits_of(insn, 15, 10) == 0x1D) && ((insn >> 4) & 1)) {      // PEXT (one predicate / a pair)
+      const bool pair = bits_of(insn, 15, 10) == 0x1D;
+      const uint32_t pn8 = 8 + bits_of(insn, 7, 5);
+      if (pair) {
+        if (((insn >> 9) & 1) || (insn & 1)) return false;
+        const uint32_t index = (insn >> 8) & 1, first = (insn & 15);
+        s_.p[first] = counter_to_predicate(s_.p[pn8], esz, index * 2);
+        s_.p[first + 1] = counter_to_predicate(s_.p[pn8], esz, index * 2 + 1);
+        return true;
+      }
+      s_.p[pd4] = counter_to_predicate(s_.p[pn8], esz, bits_of(insn, 9, 8));
+      return true;
+    }
+    if (top2 == 1 && !bit4 && !((insn >> 9) & 1)) {      // PSEL Pd, Pn, Pm.T[Wv, #imm]
+      const uint32_t t = ((insn >> 18) & 1) | (((insn >> 19) & 1) << 1) | (((insn >> 20) & 1) << 2) | (((insn >> 22) & 1) << 3) | (((insn >> 23) & 1) << 4);
+      if (t == 0) return false;
+      uint32_t e = 0;
+      while (!((t >> e) & 1)) ++e;
+      const uint32_t index = t >> (e + 1), elems = 16u >> e;
+      const uint32_t i = (static_cast<uint32_t>(reg(12 + bits_of(insn, 17, 16), false)) + index) % elems;
+      s_.p[pd4] = active(s_.p[bits_of(insn, 8, 5)], i, e) ? s_.p[bits_of(insn, 13, 10)] : 0;
+      return true;
+    }
+    if (top2 == 1 && bit4 && bits_of(insn, 15, 14) == 1) {      // WHILExx into a counter (vlx2 / vlx4) or into a pair of predicates
+      const bool pair = (insn >> 12) & 1, vl4 = (insn >> 13) & 1;
+      if (pair && vl4) return false;
+      const uint32_t rn = bits_of(insn, 9, 5), rm = bits_of(insn, 20, 16);
+      const bool is_unsigned = (insn >> 11) & 1, lt = (insn >> 10) & 1, eq = pair ? (insn & 1) : ((insn >> 3) & 1);
+      const uint32_t total = (pair || !vl4 ? 2u : 4u) * (16u >> esz);
+      const I128 a = is_unsigned ? static_cast<I128>(reg(rn, true)) : static_cast<I128>(static_cast<int64_t>(reg(rn, true)));
+      const I128 b = is_unsigned ? static_cast<I128>(reg(rm, true)) : static_cast<I128>(static_cast<int64_t>(reg(rm, true)));
+      uint32_t run = 0;
+      for (; run < total; ++run) {
+        I128 x = lt ? a + run : a - run;
+        if (is_unsigned) x &= (static_cast<I128>(1) << 64) - 1;      // (unsigned operands wrap around)
+        const bool cond = lt ? (eq ? x <= b : x < b) : (eq ? x > b : x >= b);
+        if (!cond) break;
+      }
+      {      // the flags describe the whole run: N the first element active, Z none active, C the last element not active
+        const bool first_active = lt ? run > 0 : run == total, any = run > 0, last_active = lt ? run == total : run > 0;
+        s_.nzcv = (first_active ? kN : 0) | (any ? 0 : kZ) | (last_active ? 0 : kC);
+      }
+      if (!pair) {
+        s_.p[8 + (insn & 7)] = make_counter(run, total, esz, lt);
+        return true;
+      }
+      const uint32_t first = insn & 14, per = 16u >> esz;
+      for (uint32_t v = 0; v < 2; ++v) {
+        uint16_t r = 0;
+        for (uint32_t i = 0; i < per; ++i) {
+          const uint32_t k = v * per + i;
+          if (lt ? k < run : k >= total - run) r = static_cast<uint16_t>(r | (1u << (i << esz)));
+        }
+        s_.p[first + v] = r;
+      }
+      return true;
+    }
+  }
+
+  // 0x25 with bit 21 set
   const uint32_t d = insn & 31;
   if (top2 == 3) {      // integer instructions with a wide immediate
     const uint32_t group = bits_of(insn, 20, 19), opc = bits_of(insn, 18, 16), imm8 = bits_of(insn, 12, 5), sh = (insn >> 13) & 1;
@@ -374,7 +451,8 @@ bool AArch64Cpu::sve_predicate(uint32_t insn) {
     const I128 b = is_unsigned ? static_cast<I128>(reg(rm, sf)) : static_cast<I128>(sf ? static_cast<int64_t>(reg(rm, true)) : sext(reg(rm, false), 32));
     uint16_t r = 0;
     for (uint32_t i = 0; i < elements; ++i) {
-      const I128 x = lt ? a + i : a - i;
+      I128 x = lt ? a + i : a - i;
+      if (is_unsigned) x &= (sf ? (static_cast<I128>(1) << 64) : (static_cast<I128>(1) << 32)) - 1;      // (unsigned operands wrap around at their width)
       const bool cond = lt ? (eq ? x <= b : x < b) : (eq ? x > b : x >= b);
       // (the encodings: lt with eq = LE / LS, lt without = LT / LO, and for the decrementing forms eq = GT / HI, otherwise GE / HS)
       if (!cond) break;

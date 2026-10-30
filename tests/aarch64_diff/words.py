@@ -53,9 +53,9 @@ for w, t in zip(valid, texts):
         # memory forms only; the ones that need the stack pointer or a 128-bit element (SVE2.1) are skipped
         # (qemu does not load a first-fault or non-fault element that is the first active one but sits in the upper half of the register, which the architecture does not allow: those are
         # covered by the unit tests instead)
-        if not re.match(r'^(ld[1-4]|ldnt1|st[1-4]|stnt1|prf)', t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\bsp\b|\.q\b|\bz31\b|\bx27\b|\bx28\b', t): continue
+        if not re.match(r'^(ld[1-4]|ldnt1|st[1-4]|stnt1|prf)', t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\bsp\b|\bz31\b|\bx27\b|\bx28\b', t): continue
     elif SVE:
-        if SKIP_SVE.match(t) or re.search(r'\bza|\bpn[0-9]|\bzt0|\[x[0-9]|\[sp|\bsm(start|stop)', t): continue
+        if SKIP_SVE.match(t) or re.search(r'\bza|\bzt0|\[x[0-9]|\[sp|\bsm(start|stop)', t): continue
     else:
         if SKIP.match(t): continue
         if re.search(r'\bz#|\bz[0-9]|\bp[0-9]+[/,.]|\bpn|\bza|\[x[0-9]|\[sp', t): continue
