@@ -110,6 +110,8 @@ class DeviceRenderer2D final : public IRenderer2D {
   uint64_t clip_mask_misses() const { return mask_misses_; }
   // How many glyphs were put on the atlas since this renderer began (a glyph drawn again is not put there again).
   uint64_t glyphs_made() const { return glyphs_made_; }
+  // How many pixels of the glyph atlas were sent to the device so far (only the part that changed is sent, when the device can).
+  uint64_t atlas_pixels_sent() const { return atlas_pixels_sent_; }
   bool has_glyph_atlas() const { return atlas_ok_; }
 
   // The color to draw for a pixel with `cov` (0..255) coverage; false: draw nothing (used by the rounded-rect helpers).
@@ -194,6 +196,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   uint32_t sheet_count_ = 0, sheet_range_start_ = 0;
   uint32_t sheet_x_ = 0, sheet_y_ = 0, sheet_shelf_ = 0;   // where the next mask goes: the shelf in use
   bool sheet_dirty_ = false;                // pixels added since the last upload
+  Rect2D sheet_dirty_area_;                 // ... and where (the rectangle that holds them all)
   bool sheet_ok_ = false;                   // all of it exists
   // Double buffered: frames are drawn into images_[back_] and present() shows that image and then draws into the other, so the screen
   // never shows a half-drawn frame. (Every frame must repaint all of the target: the back image holds the frame before last.)
@@ -253,7 +256,12 @@ class DeviceRenderer2D final : public IRenderer2D {
   uint64_t glyphs_made_ = 0;
   uint32_t atlas_entries_ = 0, atlas_x_ = 0, atlas_y_ = 0, atlas_shelf_ = 0;
   bool atlas_dirty_ = false;
+  Rect2D atlas_dirty_area_;   // where the glyphs added since the last upload are
+  uint64_t atlas_pixels_sent_ = 0;
   bool atlas_slot(uint32_t w, uint32_t h, uint32_t* x, uint32_t* y);
+  // Sends the changed part of a picture kept in memory (`pixels`, size x size) to its image: just the rectangle if the device takes rectangles, else all of it.
+  bool upload(IImage* image, ArrayView<uint32_t> pixels, uint32_t size, const Rect2D& area, uint64_t* sent);
+  static void grow_area(Rect2D* area, bool* dirty, int32_t x, int32_t y, uint32_t w, uint32_t h);
   void atlas_reset();
   IShaderModule* scaled_fs_ = nullptr;
   IPipeline* group_blended_ = nullptr;

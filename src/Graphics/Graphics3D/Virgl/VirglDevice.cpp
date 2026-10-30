@@ -310,6 +310,21 @@ class VirglImage final : public IImage {
     return device_.gpu().command(as_bytes(transfer));
   }
 
+  // A rectangle: its rows go to the same place in the backing (the backing is the whole image), and the host copies just that box.
+  bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) override {
+    const Extent2D e = desc_.extent;
+    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || is_wide_format(desc_.format) || !area.width || !area.height || pitch < area.width) return false;
+    if (area.x < 0 || area.y < 0 || uint64_t{static_cast<uint32_t>(area.x)} + area.width > e.width || uint64_t{static_cast<uint32_t>(area.y)} + area.height > e.height) return false;
+    if (pixels.size() < uint64_t{area.height - 1} * pitch + area.width) return false;
+    if (!ensure_backing(uint64_t{e.width} * e.height)) return false;
+    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
+    for (uint32_t j = 0; j < area.height; ++j)
+      for (uint32_t i = 0; i < area.width; ++i) staged[uint64_t{static_cast<uint32_t>(area.y) + j} * e.width + static_cast<uint32_t>(area.x) + i] = pixels[uint64_t{j} * pitch + i];
+    const uint64_t offset = (uint64_t{static_cast<uint32_t>(area.y)} * e.width + static_cast<uint32_t>(area.x)) * 4;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {static_cast<uint32_t>(area.x), static_cast<uint32_t>(area.y), 0, area.width, area.height, 1}, offset, id_, 0, e.width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer));
+  }
+
  private:
   // Guest memory for the host to copy from or into, attached on first use.
   bool ensure_backing(uint64_t pixel_count) {

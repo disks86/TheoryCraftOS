@@ -116,6 +116,13 @@ class IImage {
     (void)pixels;
     return false;
   }
+  // Replaces a rectangle of a color image and leaves the rest as it is: `pixels` begins at the rectangle's top left pixel and its rows are `pitch` pixels apart (the rectangle's
+  // last row must be inside `pixels`), 0xAARRGGBB, rows top to bottom. False if the device cannot do this (the default: write_pixels the whole image then), the rectangle is empty or
+  // not inside the image, `pitch` is less than its width, `pixels` is too short, or as for write_pixels.
+  virtual bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) {
+    (void)area, (void)pixels, (void)pitch;
+    return false;
+  }
   // The same for the float formats (kFeatureFloatFormats; Format::R16G16B16A16Float / R32G32B32A32Float): extent.width * extent.height colours, rows top to bottom, not clamped. Half-float images
   // round what they are given to half precision. False for another format, a wrong size, or a device without float formats.
   virtual bool read_pixels_float(ArrayView<Vec4> out) {
