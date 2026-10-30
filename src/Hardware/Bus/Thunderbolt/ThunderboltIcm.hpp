@@ -1,0 +1,142 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// The connection manager firmware (ICM) of an Alpine Ridge Thunderbolt 3 controller, from the host's side (icm.c of the Linux thunderbolt driver, the Falcon Ridge / Alpine Ridge
+// messages). The firmware enumerates the devices on the ports and builds the tunnels itself; the host says it is ready (DRIVER_READY, which also tells the security level), is told
+// about every device that is connected or disconnected, and asks for a device to be approved, which makes the firmware create its PCIe tunnel. The tunnel gives the device DMA
+// access to memory, so nothing is approved unless the caller asks, and only at the security levels where one approval is enough (none, user).
+// The messages are structures of 32 bit words in the layout the Linux driver uses (little endian in memory); TbControl puts them on the wire.
+#pragma once
+#include <stdint.h>
+#include "Allocators/IAllocator.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltControl.hpp"
+#include "Hardware/Bus/Thunderbolt/ThunderboltRing.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Utility/ArrayView.hpp"
+
+namespace hardware {
+
+namespace tb_icm {
+// icm_pkg_code
+constexpr uint8_t kGetTopology = 0x1, kDriverReady = 0x3, kApproveDevice = 0x4, kChallengeDevice = 0x5, kAddDeviceKey = 0x6, kGetRoute = 0xA;
+// icm_event_code
+constexpr uint8_t kEventDeviceConnected = 0x3, kEventDeviceDisconnected = 0x4, kEventXdomainConnected = 0x6, kEventXdomainDisconnected = 0x7;
+// the header's flags
+constexpr uint8_t kFlagError = 1u << 0, kFlagNoKey = 1u << 1, kFlagDualLane = 1u << 5, kFlagRtd3 = 1u << 6, kFlagSpeedGen3 = 1u << 7;
+constexpr uint32_t kFlagSecurityShift = 3, kFlagSecurityMask = 3u << 3;
+// link_info
+constexpr uint16_t kLinkMask = 0x7, kDepthMask = 0xF0, kApproved = 1u << 8, kRejected = 1u << 9, kBoot = 1u << 10;
+constexpr uint32_t kDepthShift = 4;
+// the sizes of the structures
+constexpr uint32_t kHeaderBytes = 4, kDriverReadyBytes = 4, kDriverReadyResponseBytes = 8, kApproveBytes = 24, kGetRouteBytes = 8, kGetRouteResponseBytes = 16, kDeviceConnectedMinBytes = 24,
+                   kDeviceDisconnectedBytes = 8;
+}  // namespace tb_icm
+
+// tb_security_level (the low bits of the driver ready response's info word)
+enum class TbSecurityLevel : uint8_t { None = 0, User = 1, Secure = 2, DisplayPortOnly = 3, UsbOnly = 4, NoPcie = 5, Unknown = 255 };
+
+struct TbDriverReady {
+  uint8_t rom_version = 0, ram_version = 0;
+  TbSecurityLevel security = TbSecurityLevel::Unknown;
+  uint32_t boot_acl_entries = 0;      // 0 if the firmware has no preboot ACL
+  bool rtd3 = false;
+};
+
+// A device the firmware reports.
+struct TbDevice {
+  uint8_t uuid[16] = {};
+  uint8_t connection_key = 0, connection_id = 0;
+  uint8_t link = 0, depth = 0;         // the port (1 to 4) and how many routers away from the host
+  bool authorized = false, boot = false, dual_lane = false, gen3 = false;
+  TbSecurityLevel security = TbSecurityLevel::Unknown;
+};
+
+namespace tb_icm {
+uint32_t build_driver_ready(ByteView out);
+bool parse_driver_ready(ConstByteView response, TbDriverReady* out);
+uint32_t build_approve_device(const TbDevice& device, ByteView out);
+uint32_t build_get_route(uint8_t link, uint8_t depth, ByteView out);
+// The header flags of a response (kFlagError ...), or 0.
+uint8_t response_flags(ConstByteView response);
+bool parse_get_route(ConstByteView response, uint64_t* route);
+// An ICM_EVENT_DEVICE_CONNECTED. `rejected` is the firmware refusing the device (too deep a topology).
+bool parse_device_connected(ConstByteView event, TbDevice* out, bool* rejected);
+bool parse_device_disconnected(ConstByteView event, uint8_t* link, uint8_t* depth);
+}  // namespace tb_icm
+
+class ThunderboltIcm final : public IThunderboltEvents {
+ public:
+  enum class Outcome : uint8_t {
+    NotStarted,
+    Started,
+    NotPresent,          // the registers do not answer
+    FirmwareNotRunning,  // the BIOS did not start the firmware; this driver does not
+    ControlFailed,       // the control channel's rings
+    AuthTimeout,         // the firmware's NVM image is not authenticated
+    SafeMode,            // the controller needs an NVM update before it works: no devices
+    WrongMode,           // the firmware is in a mode that does not manage the controller
+    DriverReadyFailed,   // no answer to DRIVER_READY
+    RootSwitchFailed,    // the root router's configuration space does not become readable
+  };
+  static constexpr uint32_t kRequestTimeoutUs = 5000000, kApproveTimeoutUs = 10000000, kRetries = 3, kMaxDevices = 32;
+
+  ThunderboltIcm(ITbRegisters& registers, allocators::IAllocator& allocator) : nhi_(registers), control_(nhi_, allocator), devices_(allocator) {}
+  ~ThunderboltIcm() { stop(); }
+  ThunderboltIcm(const ThunderboltIcm&) = delete;
+  ThunderboltIcm& operator=(const ThunderboltIcm&) = delete;
+
+  static const char* outcome_name(Outcome outcome);
+
+  // Brings the controller up: interrupts off, the control channel, the firmware's mode, DRIVER_READY, then waits for the root router. Devices that are already connected are reported
+  // through events during the next poll() calls.
+  Outcome start(uint32_t timeout_us = kRequestTimeoutUs);
+  // Tells the firmware the driver goes away (the mailbox's DRIVER_UNLOADS) and stops the channel.
+  void stop();
+  bool running() const { return outcome_ == Outcome::Started; }
+  Outcome outcome() const { return outcome_; }
+
+  // Reads the control channel: events update the device list.
+  void poll();
+
+  const TbDriverReady& driver_ready() const { return ready_; }
+  TbSecurityLevel security_level() const { return ready_.security; }
+  uint64_t device_count() const { return devices_.count(); }
+  const TbDevice& device(uint64_t index) const { return devices_[index]; }
+
+  // Asks the firmware to approve the device (and so to create its PCIe tunnel). Refused here unless the security level is none or user. On false, `*error` says why.
+  bool approve(uint64_t index, const char** error);
+  // The route string of the device (ICM_GET_ROUTE).
+  bool route(uint64_t index, uint64_t* route);
+
+  TbNhi& nhi() { return nhi_; }
+  TbControl& control() { return control_; }
+
+  void on_event(TbPacketType type, ConstByteView body) override;
+
+ private:
+  bool request(ConstByteView request, ByteView response, uint32_t timeout_us);
+  void remove_downstream(uint8_t link, uint8_t depth);
+
+  TbNhi nhi_;
+  TbControl control_;
+  List<TbDevice> devices_;
+  TbDriverReady ready_;
+  Outcome outcome_ = Outcome::NotStarted;
+};
+
+}  // namespace hardware
