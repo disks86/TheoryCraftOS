@@ -94,6 +94,7 @@ NT_SERVICE(NtIsProcessInJob);
 NT_SERVICE(NtReadVirtualMemory);
 NT_SERVICE(NtWriteVirtualMemory);
 NT_SERVICE(NtCreateSymbolicLink);
+NT_SERVICE(NtTcosDebugException);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);
@@ -1142,6 +1143,9 @@ EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return featur
 typedef BOOL (WINAPI *DllEntry)(HANDLE, DWORD, PVOID);
 typedef int (WINAPI *ProgramEntry)(PVOID);
 
+/* The program's first breakpoint, where a debugger that started it takes over; it is not DbgBreakPoint, as on Windows. */
+static __attribute__((noinline)) void tcos_initial_break(void) { *((BYTE *)NtCurrentTeb() + 0x1668) = 2; __asm__ volatile("int3" ::: "memory"); *((BYTE *)NtCurrentTeb() + 0x1668) = 0; }
+
 /* The thread of a program starts here: the kernel puts the program's entry point in the first argument and the PEB in the second. The libraries' entry points run first
  * (in the order the kernel listed them: a library after the libraries it imports), then the program's. Its return value ends the process. */
 EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
@@ -1151,6 +1155,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   reset_floating_point();
   fls_thread_begins();
   act_init_process();
+  if (peb->BeingDebugged) tcos_initial_break();      /* (a debugger that started the program gets the first word) */
   if (ldr) {
     loader_lock();
     /* the libraries in the order they depend on each other, then the program's TLS callbacks, then the program */

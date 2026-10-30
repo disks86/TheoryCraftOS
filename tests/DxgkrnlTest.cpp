@@ -4318,6 +4318,324 @@ void test_compute_shared() {
   }
 }
 
+// Stream output: a geometry shader with two streams of points (stream 0: the position and colour, stream 1: a vector made of them), and one with a triangle strip, written to buffers.
+void test_stream_output() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, gs = 0, gs_strip = 0, ps = 0;
+  auto shader = [&](graphics::ShaderStage stage, const uint8_t* code, uint32_t size, Handle* out) {
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code, size);
+    return e.kernel.create_shader(kPid, e.dev, sd, out);
+  };
+  CHECK(shader(graphics::ShaderStage::Vertex, b::k_vs, sizeof b::k_vs, &vs) == status::kSuccess && shader(graphics::ShaderStage::Fragment, b::k_ps_color, sizeof b::k_ps_color, &ps) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Geometry, b::k_gs_streams, sizeof b::k_gs_streams, &gs) == status::kSuccess && shader(graphics::ShaderStage::Geometry, b::k_gs_copy, sizeof b::k_gs_copy, &gs_strip) == status::kSuccess);
+  auto make = [&](Handle geometry, uint32_t entries, const graphics::StreamOutputEntry* list, uint32_t stride0, uint32_t stride1, int32_t rasterized, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    pd.stream_output_count = entries;
+    for (uint32_t i = 0; i < entries; ++i) pd.stream_output[i] = list[i];
+    pd.stream_output_stride[0] = stride0, pd.stream_output_stride[1] = stride1;
+    pd.rasterized_stream = rasterized;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  // stream 0: position (output 0) and colour (output 1) in buffer 0; stream 1: the texture coordinate 1 (output 4) in buffer 1
+  const graphics::StreamOutputEntry two[3] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}, {1, 4, 0, 4, 1}};
+  Handle pipe = 0, bad = 0;
+  CHECK(make(gs, 3, two, 32, 16, 0, &pipe) == status::kSuccess);
+  // What does not go together: no geometry shader, a stream the shader does not have, a buffer for two streams, a stride that is too short or not whole words, a rasterized stream that does not exist.
+  CHECK(make(0, 3, two, 32, 16, 0, &bad) == status::kInvalidParameter);
+  const graphics::StreamOutputEntry past[1] = {{2, 0, 0, 4, 0}}, shared[2] = {{0, 0, 0, 4, 0}, {1, 4, 0, 4, 0}}, empty[1] = {{0, 0, 0, 0, 0}}, overrun[1] = {{0, 0, 2, 4, 0}};
+  CHECK(make(gs, 1, past, 16, 16, 0, &bad) == status::kInvalidParameter && make(gs, 2, shared, 32, 16, 0, &bad) == status::kInvalidParameter);
+  CHECK(make(gs, 1, empty, 16, 16, 0, &bad) == status::kInvalidParameter && make(gs, 1, overrun, 32, 16, 0, &bad) == status::kInvalidParameter);
+  CHECK(make(gs, 3, two, 24, 16, 0, &bad) == status::kInvalidParameter && make(gs, 3, two, 34, 16, 0, &bad) == status::kInvalidParameter && make(gs, 3, two, 32, 16, 4, &bad) == status::kInvalidParameter);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  AllocationDesc od;
+  od.flags = kAllocStreamOutput, od.size = 3 * 32;
+  Handle out0 = 0, out1 = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out0) == status::kSuccess);
+  od.size = 3 * 16;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out1) == status::kSuccess);
+  const float v[21] = {-0.5f, -0.5f, 0.5f, 1, 0, 0, 1, 0.5f, -0.5f, 0.5f, 0, 1, 0, 1, 0, 0.5f, 0.5f, 0, 0, 1, 1};
+  CHECK(e.write(vb, floats(v, 21)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto read_floats = [&](Handle h, uint32_t count, float* out) {
+    LockResult lock;
+    if (e.kernel.lock(kPid, h, kLockReadOnly, 0, &lock) != status::kSuccess) return false;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    for (uint32_t i = 0; i < count; ++i) out[i] = __builtin_bit_cast(float, in.le32());
+    e.kernel.unlock(kPid, h);
+    return in.ok();
+  };
+  auto draw = [&](Handle pipeline, uint32_t first_buffer, uint32_t second_buffer, bool bind_second) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, first_buffer);
+    if (bind_second) w.set_stream_output(1, second_buffer);
+    w.bind_pipeline(pipeline);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {target, vb, out0, out1});
+  };
+  // The buffers must all be bound for the draw.
+  CHECK(draw(pipe, 2, 3, false) == status::kInvalidParameter);
+  CHECK(draw(pipe, 2, 3, true) == status::kSuccess);
+  float f0[24], f1[12];
+  CHECK(read_floats(out0, 24, f0) && read_floats(out1, 12, f1));
+  // Stream 0: the three vertices, position (+Y up, as the shader had it) then colour; stream 1: position * 2 + colour.
+  for (uint32_t i = 0; i < 3; ++i) {
+    const float* in = v + 7 * i;
+    const float position[4] = {in[0], in[1], in[2], 1.0f}, colour[4] = {in[3], in[4], in[5], in[6]};
+    for (uint32_t c = 0; c < 4; ++c) {
+      CHECK(f0[8 * i + c] == position[c] && f0[8 * i + 4 + c] == colour[c]);
+      CHECK(f1[4 * i + c] == position[c] * 2.0f + colour[c]);
+    }
+  }
+  CHECK(e.pixel(target, 0, 0) == 0xFF000000u);   // (points: one pixel each, nothing near the corner)
+  // A target that is too small for all the primitives: the ones that fit are written, whole.
+  AllocationDesc small;
+  small.flags = kAllocStreamOutput, small.size = 2 * 32 + 8;
+  Handle short_buffer = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, small, &short_buffer) == status::kSuccess);
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.set_stream_output(0, 2), w.set_stream_output(1, 3);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, short_buffer, out1}) == status::kSuccess);
+  float sh[18];
+  CHECK(read_floats(short_buffer, 18, sh));
+  CHECK(sh[0] == v[0] && sh[8] == v[7] && sh[4] == 1 && sh[12] == 0 && sh[16] == 0 && sh[17] == 0);   // (two whole records; nothing of the third, not even the 8 bytes that were left)
+  // No stream is drawn with -1.
+  Handle quiet = 0;
+  CHECK(make(gs, 3, two, 32, 16, -1, &quiet) == status::kSuccess);
+  // A triangle strip: the shader of gs_copy emits two strips (the input triangle, and a copy), each a triangle; written as 6 vertices of position and colour in buffer 0.
+  const graphics::StreamOutputEntry strip_entries[2] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}};
+  Handle strip_pipe = 0;
+  CHECK(make(gs_strip, 2, strip_entries, 32, 0, 0, &strip_pipe) == status::kSuccess);
+  AllocationDesc od2;
+  od2.flags = kAllocStreamOutput, od2.size = 6 * 32;
+  Handle strips = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, od2, &strips) == status::kSuccess);
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w2.set_stream_output(0, 2);
+  w2.bind_pipeline(strip_pipe);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(identity, 16));
+  w2.draw(3);
+  w2.end_pass();
+  CHECK(e.render(w2, {target, vb, strips}) == status::kSuccess);
+  float s[48];
+  CHECK(read_floats(strips, 48, s));
+  // (the first triangle: the vertices as they came; the second: moved to the corner, with red and blue swapped)
+  CHECK(s[0] == -0.5f && s[1] == -0.5f && s[4] == 1 && s[5] == 0 && s[6] == 0 && s[8] == 0.5f && s[12] == 0 && s[13] == 1);
+  CHECK(s[24] != 0.0f || s[25] != 0.0f);
+  CHECK(s[28] == 0 && s[30] == 1);   // (the colour of the copy's first vertex: red 1 became blue 1)
+  (void)quiet;
+}
+
+
+// Stream output statistics and timestamp queries, appending, stream output of vertex and domain shaders, and drawing a stream other than the first.
+void test_stream_output_extras() {
+  Env e;
+  namespace b = conformance_blobs;
+  auto shader = [&](graphics::ShaderStage stage, const uint8_t* code, uint32_t size, Handle* out) {
+    ShaderDesc sd;
+    sd.kind = ShaderKind::Dxbc, sd.stage = stage, sd.code = ConstByteView(code, size);
+    return e.kernel.create_shader(kPid, e.dev, sd, out);
+  };
+  Handle vs = 0, gs = 0, gs_draw1 = 0, hs = 0, ds = 0, ps = 0;
+  CHECK(shader(graphics::ShaderStage::Vertex, b::k_vs, sizeof b::k_vs, &vs) == status::kSuccess && shader(graphics::ShaderStage::Fragment, b::k_ps_color, sizeof b::k_ps_color, &ps) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Geometry, b::k_gs_streams, sizeof b::k_gs_streams, &gs) == status::kSuccess && shader(graphics::ShaderStage::Geometry, b::k_gs_streams_draw1, sizeof b::k_gs_streams_draw1, &gs_draw1) == status::kSuccess);
+  CHECK(shader(graphics::ShaderStage::Hull, b::k_hs_tri, sizeof b::k_hs_tri, &hs) == status::kSuccess && shader(graphics::ShaderStage::Domain, b::k_ds_dent, sizeof b::k_ds_dent, &ds) == status::kSuccess);
+  auto make = [&](Handle hull, Handle domain, Handle geometry, uint32_t entries, const graphics::StreamOutputEntry* list, uint32_t stride0, uint32_t stride1, int32_t rasterized, Handle* out) {
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = ps, pd.hull_shader = hull, pd.domain_shader = domain, pd.geometry_shader = geometry, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+    pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+    pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+    pd.cull_mode = graphics::CullMode::None;
+    pd.stream_output_count = entries;
+    for (uint32_t i = 0; i < entries; ++i) pd.stream_output[i] = list[i];
+    pd.stream_output_stride[0] = stride0, pd.stream_output_stride[1] = stride1;
+    pd.rasterized_stream = rasterized;
+    return e.kernel.create_pipeline(kPid, e.dev, pd, out);
+  };
+  const graphics::StreamOutputEntry two[3] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}, {1, 4, 0, 4, 1}};
+  Handle pipe = 0;
+  CHECK(make(0, 0, gs, 3, two, 32, 16, -1, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float v[21] = {-0.5f, -0.5f, 0.5f, 1, 0, 0, 1, 0.5f, -0.5f, 0.5f, 0, 1, 0, 1, 0, 0.5f, 0.5f, 0, 0, 1, 1};
+  CHECK(e.write(vb, floats(v, 21)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  auto buffer = [&](uint32_t bytes) {
+    AllocationDesc od;
+    od.flags = kAllocStreamOutput, od.size = bytes;
+    Handle out = 0;
+    CHECK(e.kernel.create_allocation(kPid, e.dev, od, &out) == status::kSuccess);
+    return out;
+  };
+  auto read_floats = [&](Handle h, uint32_t count, float* out) {
+    LockResult lock;
+    if (e.kernel.lock(kPid, h, kLockReadOnly, 0, &lock) != status::kSuccess) return false;
+    ByteReader in(ConstByteView(lock.data.data(), lock.data.size()));
+    for (uint32_t i = 0; i < count; ++i) out[i] = __builtin_bit_cast(float, in.le32());
+    e.kernel.unlock(kPid, h);
+    return in.ok();
+  };
+
+  // Statistics: the buffer of stream 0 holds two of the three records, so two are written and three needed; stream 1's holds all.
+  Handle small0 = buffer(2 * 32 + 8), full1 = buffer(3 * 16), results = e.buffer(kAllocQueryResult, 64);
+  auto statistic = [&](uint32_t kind, uint32_t stream) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2), w.set_stream_output(1, 3);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.begin_query(4, 0, kind | stream << 8);
+    w.draw(3);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, small0, full1, results}) == status::kSuccess);
+    return query_count(e, results, 0);
+  };
+  const uint32_t kWritten = static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesWritten), kNeeded = static_cast<uint32_t>(graphics::QueryKind::SoPrimitivesNeeded);
+  CHECK(statistic(kWritten, 0) == 2 && statistic(kNeeded, 0) == 3 && statistic(kWritten, 1) == 3 && statistic(kNeeded, 1) == 3);
+  CHECK(statistic(kNeeded, 2) == 0 && statistic(kNeeded, 3) == 0);   // (streams the shader does not write)
+  {
+    // (a stream that does not exist, and a statistic of a stream other than the first for a kind that has one)
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.begin_query(2, 0, kWritten | 4u << 8);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, results}) == status::kInvalidParameter);
+  }
+
+  // Timestamps never go back.
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    for (uint32_t q = 0; q < 3; ++q) {
+      w.begin_query(2, q * 8, static_cast<uint32_t>(graphics::QueryKind::Timestamp));
+      w.end_query();
+    }
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, results}) == status::kSuccess);
+    const uint64_t t0 = query_count(e, results, 0), t1 = query_count(e, results, 1), t2 = query_count(e, results, 2);
+    CHECK(t0 != 0 && t1 > t0 && t2 > t1);
+  }
+
+  // Appending: the second draw, in another pass, goes after the first's records.
+  Handle big0 = buffer(6 * 32), big1 = buffer(6 * 16);
+  Handle quiet = 0;
+  CHECK(make(0, 0, gs, 3, two, 32, 16, -1, &quiet) == status::kSuccess);
+  auto pass = [&](uint32_t offset0, uint32_t offset1) {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2, offset0), w.set_stream_output(1, 3, offset1);
+    w.bind_pipeline(quiet);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    return e.render(w, {target, vb, big0, big1});
+  };
+  CHECK(pass(0, 0) == status::kSuccess && pass(kStreamOutputAppendOffset, kStreamOutputAppendOffset) == status::kSuccess);
+  float a0[48], a1[24];
+  CHECK(read_floats(big0, 48, a0) && read_floats(big1, 24, a1));
+  for (uint32_t i = 0; i < 24; ++i) CHECK(a0[i] == a0[24 + i]);   // (the second round of records is the first's again, after it)
+  for (uint32_t i = 0; i < 12; ++i) CHECK(a1[i] == a1[12 + i]);
+  CHECK(a0[0] == -0.5f && a0[8] == 0.5f && a0[16] == 0.0f && a1[3] != 0.0f);
+  // A third round does not fit: nothing past the end is written and the draw is not an error. Starting over (offset 0) writes the first record again.
+  CHECK(pass(kStreamOutputAppendOffset, kStreamOutputAppendOffset) == status::kSuccess && pass(kStreamOutputAppendOffset, kStreamOutputAppendOffset) == status::kSuccess);
+  CHECK(pass(0, 0) == status::kSuccess);
+
+  // A vertex shader's stream output: the vertices of the triangle, in order, position as it was (+Y up) and colour.
+  const graphics::StreamOutputEntry vs_entries[2] = {{0, 0, 0, 4, 0}, {0, 1, 0, 4, 0}};
+  Handle vs_pipe = 0, vs_bad = 0;
+  CHECK(make(0, 0, 0, 2, vs_entries, 32, 0, -1, &vs_pipe) == status::kSuccess);
+  const graphics::StreamOutputEntry vs_stream1[1] = {{1, 0, 0, 4, 0}};
+  CHECK(make(0, 0, 0, 1, vs_stream1, 16, 0, -1, &vs_bad) == status::kInvalidParameter);
+  Handle vs_out = buffer(3 * 32), vs_count = e.buffer(kAllocQueryResult, 16);
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2);
+    w.bind_pipeline(vs_pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.begin_query(3, 0, kWritten);
+    w.draw(3);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, vs_out, vs_count}) == status::kSuccess);
+    float f[24];
+    CHECK(read_floats(vs_out, 24, f));
+    for (uint32_t i = 0; i < 3; ++i)
+      for (uint32_t c = 0; c < 3; ++c) CHECK(f[8 * i + c] == v[7 * i + c] && f[8 * i + 4 + c] == v[7 * i + 3 + c]);
+    CHECK(query_count(e, vs_count, 0) == 1);
+  }
+
+  // A domain shader's: the tessellated triangles of a three-point patch with factors 2 (positions, 16 bytes a vertex, as many as the tessellator makes).
+  const graphics::StreamOutputEntry ds_entries[1] = {{0, 0, 0, 4, 0}};
+  Handle ds_pipe = 0;
+  CHECK(make(hs, ds, 0, 1, ds_entries, 16, 0, -1, &ds_pipe) == status::kSuccess);
+  Handle ds_out = buffer(64 * 3 * 16);
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2);
+    w.bind_pipeline(ds_pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.set_topology(patch_list(3));
+    w.begin_query(3, 0, kWritten);
+    w.draw(3);
+    w.end_query();
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, ds_out, vs_count}) == status::kSuccess);
+    const uint64_t triangles = query_count(e, vs_count, 0);
+    CHECK(triangles >= 4 && triangles <= 64);
+    float f[64 * 12];
+    CHECK(read_floats(ds_out, 64 * 12, f));
+    for (uint64_t i = 0; i < triangles * 3; ++i) CHECK(f[4 * i + 3] == 1.0f && f[4 * i] >= -1.0f && f[4 * i] <= 1.0f && f[4 * i + 1] >= -1.0f && f[4 * i + 1] <= 1.0f);
+  }
+
+  // Stream 1 drawn: gs_streams_draw1 puts a point at each vertex (moved by half a pixel) in stream 1 and the vertex plus its colour in stream 0, which only the buffer gets.
+  const graphics::StreamOutputEntry draw1_entries[2] = {{0, 4, 0, 4, 0}, {1, 0, 0, 4, 1}};
+  Handle draw1 = 0, draw1_bad = 0;
+  CHECK(make(0, 0, gs_draw1, 2, draw1_entries, 16, 16, 1, &draw1) == status::kSuccess);
+  CHECK(make(0, 0, 0, 1, vs_entries, 32, 0, 1, &draw1_bad) == status::kInvalidParameter);   // (no stream 1 without a geometry shader)
+  Handle d0 = buffer(3 * 16), d1 = buffer(3 * 16);
+  {
+    CommandWriter w(e.allocator);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.set_stream_output(0, 2), w.set_stream_output(1, 3);
+    w.bind_pipeline(draw1);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, d0, d1}) == status::kSuccess);
+    float f[12], g[12];
+    CHECK(read_floats(d0, 12, f) && read_floats(d1, 12, g));
+    CHECK(f[0] == -0.5f + 1.0f && f[1] == -0.5f + 0.0f);   // (position + colour: red)
+    CHECK(g[0] == -0.5f + 0.03125f && g[4] == 0.5f + 0.03125f);
+    // (points at the pixel centres, the colour of each vertex)
+    CHECK(e.pixel(target, 8, 23) == 0xFFFF0000u && e.pixel(target, 24, 23) == 0xFF00FF00u && e.pixel(target, 16, 7) == 0xFF0000FFu);
+  }
+}
+
 // Geometry shaders with adjacency input and instances.
 void test_geometry_extras() {
   HostAllocator allocator;
@@ -4491,6 +4809,18 @@ void test_conformance() {
       // Thread 0 of group (0, 0): the neighbour's value is 1, the sum of the 64 slots (0 .. 63) 2016 (>> 3 is 252), the thread's own number 0. Thread 1 sees 2 and has 4 as its blue.
       auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x]; };
       CHECK(px(0, 0) == 0xFF01FC00u && px(1, 0) == 0xFF02FC04u && px(8, 0) == (0xFF000000u | (8u << 16) | (0x34u << 8)));
+    }
+    if (__builtin_strstr(r.name, "stream output of two streams")) {
+      // Squares at the three positions of stream 0 (the lower left and lower right and the top middle, +Y up as the shader had it), coloured by 0.5 * q + 0.5 of stream 1.
+      auto px = [&](uint32_t x, uint32_t y) { return r.device_picture[y * 32 + x] & 0xFFFFFF; };
+      auto near = [](uint32_t a, uint32_t b) {
+        for (uint32_t shift = 0; shift < 24; shift += 8) {
+          const int32_t d = static_cast<int32_t>((a >> shift) & 0xFF) - static_cast<int32_t>((b >> shift) & 0xFF);
+          if (d > 3 || d < -3) return false;
+        }
+        return true;
+      };
+      CHECK(near(px(8, 24), 0x7F00FF) && near(px(24, 24), 0xFF7FFF) && near(px(16, 8), 0x7FFFFF) && px(16, 24) == 0 && px(0, 0) == 0);
     }
     if (__builtin_strstr(r.name, "adjacency primitives")) {
       // The triangle (left) and the quad (right) both drawn.
@@ -5687,6 +6017,8 @@ int main() {
   test_sm3_and_sm51();
   test_ps1();
   test_device_suite();
+  test_stream_output();
+  test_stream_output_extras();
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();

@@ -77,7 +77,8 @@ struct D3d9Program::State {
   const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
   Q patch_out[graphics::kMaxPatchRegisters] = {};          // a hull shader's patch constant registers
   graphics::GeometryOutputData* geometry_out = nullptr;
-  bool geometry_cut = false;   // a cut came after the last emit
+  bool geometry_cut[graphics::kMaxGeometryStreams] = {};   // a cut came after the last emit to the stream
+  uint32_t stream_vertices[graphics::kMaxGeometryStreams] = {};   // vertices emitted to each stream
   Q sys[kSysValueCount] = {};
   bool killed = false;
   bool at_barrier = false;     // the run stopped at a barrier ...
@@ -633,8 +634,11 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         graphics::ShaderIo& v = out->vertex[out->count];
         v.position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
         for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) v.varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
-        out->restart[out->count] = s.geometry_cut;
-        s.geometry_cut = false;
+        const uint32_t stream = ins.control < graphics::kMaxGeometryStreams ? ins.control : 0;
+        out->restart[out->count] = s.geometry_cut[stream];
+        out->stream[out->count] = static_cast<uint8_t>(stream);
+        s.geometry_cut[stream] = false;
+        ++s.stream_vertices[stream];
         ++out->count;
         break;
       }
@@ -643,7 +647,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         s.barrier_pc = pc;
         return;
       case kGsCut:
-        if (s.geometry_out && s.geometry_out->count) s.geometry_cut = true;
+        if (s.geometry_out && ins.control < graphics::kMaxGeometryStreams && s.stream_vertices[ins.control]) s.geometry_cut[ins.control] = true;
         break;
       case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
         if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories) break;
@@ -1167,6 +1171,7 @@ NtStatus D3d9Binding::bind(UniquePointer<D3d9Program> program, graphics::ShaderM
     desc->geometry_output = program->geometry_output();
     desc->geometry_max_vertices = program->geometry_max_vertices();
     desc->geometry_instances = program->geometry_instances();
+    desc->geometry_streams = program->geometry_streams();
     program_ = util::move(program);
     return status::kSuccess;
   }

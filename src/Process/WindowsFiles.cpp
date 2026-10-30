@@ -981,7 +981,7 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
   switch (kind) {      // an event, a section, a thread ... is not a file
     case DescriptorKind::Event: case DescriptorKind::Mutex: case DescriptorKind::Semaphore: case DescriptorKind::Process: case DescriptorKind::Thread: case DescriptorKind::Timer:
-    case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH
+    case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: case DescriptorKind::DebugObject: return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH
     default: break;
   }
   const uint32_t volume_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the argument is not defined)

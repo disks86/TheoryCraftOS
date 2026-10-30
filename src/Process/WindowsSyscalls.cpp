@@ -21,6 +21,7 @@
 #include "Process/WindowsThreads.hpp"
 #include "Process/WindowsLocks.hpp"
 #include "Process/WindowsJobs.hpp"
+#include "Process/WindowsDebug.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
@@ -173,6 +174,15 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtCreatePipe: return windowsabi::nt_create_pipe(process, r);
       case WindowsSyscallNumber::NtCreateNamedPipeFile: return windowsabi::nt_create_named_pipe_file(process, r);
       case WindowsSyscallNumber::NtDeviceIoControlFile: return windowsabi::nt_device_io_control_file(process, r);
+      case WindowsSyscallNumber::NtDebugActiveProcess: return windowsabi::nt_debug_active_process(process, r);
+      case WindowsSyscallNumber::NtRemoveProcessDebug: return windowsabi::nt_remove_process_debug(process, r);
+      case WindowsSyscallNumber::NtWaitForDebugEvent: return windowsabi::nt_wait_for_debug_event(process, r);
+      case WindowsSyscallNumber::NtDebugContinue: return windowsabi::nt_debug_continue(process, r);
+      case WindowsSyscallNumber::NtSetInformationDebugObject: return windowsabi::nt_set_information_debug_object(process, r);
+      case WindowsSyscallNumber::NtCreateDebugObject: return windowsabi::nt_create_debug_object(process, r);
+      case WindowsSyscallNumber::NtSuspendProcess: return windowsabi::nt_suspend_resume_process(process, r, true);
+      case WindowsSyscallNumber::NtResumeProcess: return windowsabi::nt_suspend_resume_process(process, r, false);
+      case WindowsSyscallNumber::NtTcosDebugException: return windowsabi::nt_tcos_debug_exception(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);
       case WindowsSyscallNumber::NtSetInformationObject: return windowsabi::nt_set_information_object(process, r);

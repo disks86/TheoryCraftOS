@@ -294,11 +294,33 @@ EXPORT BOOL WINAPI GetExitCodeProcess(HANDLE h, LPDWORD code) {
   return TRUE;
 }
 EXPORT BOOL WINAPI IsWow64Process(HANDLE h, LPBOOL wow) { (void)h; *wow = FALSE; return TRUE; }
-EXPORT BOOL WINAPI IsDebuggerPresent(void) { return FALSE; }
-EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) { if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *present = FALSE; return TRUE; }
+EXPORT BOOL WINAPI IsDebuggerPresent(void) { return NtCurrentPeb()->BeingDebugged != 0; }
+EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) {
+  if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG_PTR port = 0;
+  const NTSTATUS status = NtQueryInformationProcess(h, 7 /* ProcessDebugPort */, &port, sizeof(port), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *present = port != 0;
+  return TRUE;
+}
 EXPORT void WINAPI DebugBreak(void) { __asm__ volatile("int3"); }
-EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
-EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
+/* A debugger is told with a DBG_PRINTEXCEPTION_C exception (the length with the NUL, the text); without one nothing happens. */
+EXPORT void WINAPI OutputDebugStringA(LPCSTR s) {
+  if (!s || !NtCurrentPeb()->BeingDebugged) return;
+  EXCEPTION_RECORD record;
+  memset(&record, 0, sizeof(record));
+  record.ExceptionCode = 0x40010006u;
+  record.NumberParameters = 2;
+  record.ExceptionInformation[0] = strlen(s) + 1;
+  record.ExceptionInformation[1] = (ULONG_PTR)s;
+  NtTcosDebugException(&record, TRUE, NULL);
+}
+EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) {
+  if (!s || !NtCurrentPeb()->BeingDebugged) return;
+  char text[1024];
+  const int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, text, sizeof(text), NULL, NULL);
+  if (n > 0) OutputDebugStringA(text); else { text[sizeof(text) - 1] = 0; OutputDebugStringA(text); }
+}
 IMPORT NTSTATUS NTAPI RtlSetThreadErrorMode(ULONG, ULONG *);
 IMPORT ULONG NTAPI RtlGetThreadErrorMode(void);
 static DWORD thread_error_mode_from_rtl(ULONG rtl) { return ((rtl & 0x10) ? 1u : 0u) | ((rtl & 0x20) ? 2u : 0u) | ((rtl & 0x40) ? 0x8000u : 0u); }
@@ -1680,7 +1702,7 @@ EXPORT HANDLE WINAPI OpenThread(DWORD access, BOOL inherit, DWORD id) {
   memset(&attributes, 0, sizeof(attributes));
   attributes.Length = sizeof(attributes);
   attributes.Attributes = inherit ? 2 : 0;
-  ULONG64 client[2] = {GetCurrentProcessId(), id};
+  ULONG64 client[2] = {0, id};
   HANDLE h = NULL;
   const NTSTATUS status = NtOpenThread(&h, access, &attributes, client);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
@@ -2186,7 +2208,9 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   HANDLE process = NULL, thread = NULL;
   ULONG process_id = 0, thread_id = 0;
   /* STARTF_USESTDHANDLES (0x100): the child's standard handles are the ones in the startup information (inheritable handles of this process, or the console's). */
-  ULONG nt_flags = ((flags & CREATE_SUSPENDED) ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
+  const BOOL debug_start = (flags & (0x1 | 0x2) /* DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS */) != 0;
+  if (debug_start && !NT_SUCCESS(DbgUiConnectToDbg())) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
+  ULONG nt_flags = ((flags & CREATE_SUSPENDED) || debug_start ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
   HANDLE std_in = NULL, std_out = NULL, std_err = NULL;
   if (startup && (startup->dwFlags & 0x100)) {
     nt_flags |= 4;
@@ -2214,6 +2238,12 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     return FALSE;
   }
   con_note_child(process_id, block.console);
+  if (debug_start) {      /* attached before it runs its first instruction; its children too, unless DEBUG_ONLY_THIS_PROCESS */
+    const NTSTATUS attached = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
+    if (NT_SUCCESS(attached) && (flags & 0x1) && !(flags & 0x2)) { ULONG inherit = 1; NtSetInformationProcess(process, 31, &inherit, sizeof(inherit)); }
+    if (!NT_SUCCESS(attached)) { NtTerminateProcess(process, 0); NtClose(process); NtClose(thread); fail_nt(attached); return FALSE; }
+    if (!(flags & CREATE_SUSPENDED)) { ULONG previous = 0; NtResumeThread(thread, &previous); }
+  }
   if (information) {
     information->hProcess = process;
     information->hThread = thread;

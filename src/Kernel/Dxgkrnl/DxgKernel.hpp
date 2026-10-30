@@ -60,7 +60,8 @@ class IWaitHook {
 //                    write, reference: one word each)                                                                                       reply: handle
 //                    (optionally, after that: depth_compare, blend custom, enable, source colour, destination colour, source alpha, destination alpha factors, colour op, alpha op,
 //                    write mask, per-instance bits of the attributes, then the number of colour outputs, then for independent blending a flag and the nine words
-//                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3, then multisample, then the geometry shader (0: none), then the hull and domain shaders (0: none) - one word each)
+//                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3, then multisample, then the geometry shader (0: none), then the hull and domain shaders (0: none) - one word each; then stream output: the number of entries, and for more than none the rasterized stream (-1: none), the strides of the four
+//                    buffers and for each entry two words: stream | output << 8 | start component << 16 | component count << 24, and the buffer)
 //   DestroyShader / DestroyPipeline   handle
 //   CreateComputePipeline   shader (a Compute stage shader)                                                                           reply: handle
 enum class EscapeOp : uint32_t { CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5 };

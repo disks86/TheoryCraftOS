@@ -50,6 +50,7 @@ uint32_t nt_release_semaphore(Process& p, const SyscallRequest& r);
 uint32_t nt_wait_for_single_object(Process& p, const SyscallRequest& r);
 uint32_t nt_wait_for_multiple_objects(Process& p, const SyscallRequest& r);
 uint32_t nt_create_job_object(Process& p, const SyscallRequest& r);
+uint32_t nt_create_debug_object(Process& p, const SyscallRequest& r);
 uint32_t nt_open_job_object(Process& p, const SyscallRequest& r);
 // Sections: NtCreateSection, NtOpenSection, NtMapViewOfSection, NtUnmapViewOfSection, NtFlushVirtualMemory.
 uint32_t nt_create_section(Process& p, const SyscallRequest& r);

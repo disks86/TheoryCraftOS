@@ -114,6 +114,7 @@ enum AllocationFlags : uint32_t {
   kAllocStaging = 1u << 6,
   kAllocShared = 1u << 7,        // may be shared with other processes (Kernel::share_allocation)
   kAllocUnorderedAccess = 1u << 9,   // a buffer compute shaders read and write (BindUav; the adapter's kFeatureCompute); may also be a vertex or index buffer
+  kAllocStreamOutput = 1u << 10,   // a buffer a geometry shader's stream output is written to (SetStreamOutput; the adapter's kFeatureStreamOutput): read by locking it
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
@@ -234,6 +235,12 @@ struct PipelineDesc {
   bool independent_blend = false;    // needs kFeatureIndependentBlend: target n (1..3) blends with target_blend[n - 1], target 0 with `blend` (see graphics::GraphicsPipelineDesc)
   graphics::BlendState target_blend[graphics::kMaxColorTargets - 1];
   bool multisample = false;          // needs kFeatureMultisample: coverage per sample in a pass of multisampled images (see graphics::GraphicsPipelineDesc::multisample)
+  // Stream output (the adapter's kFeatureStreamOutput, with a geometry shader): see graphics::StreamOutputEntry. The entries of one buffer are all of one stream. `rasterized_stream` is the
+  // stream that is drawn (-1: none).
+  uint32_t stream_output_count = 0;
+  graphics::StreamOutputEntry stream_output[graphics::kMaxStreamOutputEntries];
+  uint32_t stream_output_stride[graphics::kMaxStreamOutputBuffers] = {};
+  int32_t rasterized_stream = 0;
   bool alpha_to_coverage = false;    // with multisample: the first target's alpha says how many samples a pixel's colour reaches (see graphics::GraphicsPipelineDesc::alpha_to_coverage)
   uint32_t color_target_count = 1;   // the colour outputs the pixel shader fills (SV_Target0 ..); more than one needs the adapter's kFeatureMultipleTargets, and a pass with that many targets
 };

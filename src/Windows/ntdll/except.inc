@@ -44,6 +44,7 @@ IMPORT NTSTATUS NTAPI NtContinue(CONTEXT *, BOOLEAN);
 IMPORT NTSTATUS NTAPI KiRaiseExceptionSecondChance(EXCEPTION_RECORD *, CONTEXT *, BOOLEAN);
 
 EXPORT void NTAPI RtlRaiseException(EXCEPTION_RECORD *record);
+EXPORT void NTAPI RtlExitUserThread(NTSTATUS);
 
 static ULONG64 *int_register(CONTEXT *c, unsigned index) { return &c->Rax + index; }
 
@@ -351,8 +352,24 @@ static void report_unhandled(const EXCEPTION_RECORD *record) {
   NtWriteFile(err, NULL, NULL, NULL, &iosb, text, n, NULL, NULL);
 }
 
+/* ---- the debugger ------------------------------------------------------------------------------------------------------------------------------------------ */
+
+#define DBG_CONTINUE_STATUS ((NTSTATUS)0x00010002)
+static BOOL being_debugged(void) { return NtCurrentPeb()->BeingDebugged != 0; }
+/* The debugger attached to the process (if any) is told about the exception and answers: TRUE if it handled it (the program goes on where the context says; a breakpoint
+ * the kernel reported at the int3 itself is stepped over, as the processor does after one). */
+static BOOL debugger_handled(EXCEPTION_RECORD *record, CONTEXT *context, BOOLEAN first_chance) {
+  if (!being_debugged()) return FALSE;
+  if (NtTcosDebugException(record, first_chance, context) != DBG_CONTINUE_STATUS) return FALSE;
+  return TRUE;
+}
+
 /* Nobody handled it: the top-level filter gets its say, then the process ends with the exception's code. */
+#define TEB_REMOTE_BREAK(teb) (*(BYTE *)((BYTE *)(teb) + 0x1668))      /* set in the thread DbgUiIssueRemoteBreakin makes */
 static __attribute__((noreturn, noinline)) void unhandled_exception(EXCEPTION_RECORD *record, CONTEXT *context) {
+  if (TEB_REMOTE_BREAK(NtCurrentTeb()) == 1) RtlExitUserThread(0);      /* (DbgUiRemoteBreakin ignores a breakpoint nobody handled) */
+  if (TEB_REMOTE_BREAK(NtCurrentTeb()) == 2) { TEB_REMOTE_BREAK(NtCurrentTeb()) = 0; NtContinue(context, FALSE); }      /* (so does the first breakpoint of a program) */
+  if (debugger_handled(record, context, FALSE)) NtContinue(context, FALSE);
   if (g_init_guard && g_init_guard_teb == NtCurrentTeb()) __builtin_longjmp(g_init_guard, 1);      /* (a library's entry point failed: see call_library_entry) */
   if (g_top_level_filter) {
     EXCEPTION_POINTERS pointers = {record, context};
@@ -367,6 +384,7 @@ static __attribute__((noreturn, noinline)) void unhandled_exception(EXCEPTION_RE
 /* The kernel starts the thread here when the program faults (see src/Process/WindowsException.hpp): rsp is at a machine frame, rcx the record, rdx the CONTEXT. The machine
  * frame is what lets the unwinder get from the handlers' frames to the faulting instruction (UWOP_PUSH_MACHFRAME, .seh_pushframe). */
 __attribute__((noreturn, noinline)) void tcos_dispatch_exception(EXCEPTION_RECORD *record, CONTEXT *context) {
+  if (debugger_handled(record, context, TRUE)) NtContinue(context, FALSE);
   if (RtlDispatchException(record, context)) NtContinue(context, FALSE);
   unhandled_exception(record, context);
 }
@@ -392,6 +410,7 @@ EXPORT void NTAPI RtlRaiseException(EXCEPTION_RECORD *record) {
   unwind_step(UNW_FLAG_NHANDLER, &dc, &context);
   context.ContextFlags &= ~(DWORD)CONTEXT_UNWOUND_TO_CALL;
   record->ExceptionAddress = (PVOID)context.Rip;
+  if (debugger_handled(record, &context, TRUE)) NtContinue(&context, FALSE);
   if (RtlDispatchException(record, &context)) NtContinue(&context, FALSE);
   unhandled_exception(record, &context);
 }
@@ -400,6 +419,7 @@ EXPORT void NTAPI RtlRaiseStatus(NTSTATUS status) {
   RtlRaiseException(&record);
 }
 EXPORT NTSTATUS NTAPI NtRaiseException(EXCEPTION_RECORD *record, CONTEXT *context, BOOLEAN first_chance) {
+  if (first_chance && debugger_handled(record, context, TRUE)) return NtContinue(context, FALSE);
   if (first_chance && RtlDispatchException(record, context)) return NtContinue(context, FALSE);
   return KiRaiseExceptionSecondChance(record, context, FALSE);
 }
@@ -500,4 +520,50 @@ EXPORT EXCEPTION_DISPOSITION __C_specific_handler(EXCEPTION_RECORD *record, PVOI
     RtlUnwindEx(frame, (PVOID)(base + s->JumpTarget), record, (PVOID)0, dc->ContextRecord, dc->HistoryTable);
   }
   return ExceptionContinueSearch;
+}
+
+/* ---- DbgUi: what a debugger uses to talk to the kernel (the debug object of the thread is kept in its TEB) ------------------------------------------------- */
+
+IMPORT NTSTATUS NTAPI NtCreateDebugObject(PHANDLE, ULONG, POBJECT_ATTRIBUTES, ULONG);
+IMPORT NTSTATUS NTAPI NtWaitForDebugEvent(HANDLE, BOOLEAN, PLARGE_INTEGER, PVOID);
+IMPORT NTSTATUS NTAPI NtDebugContinue(HANDLE, PVOID, NTSTATUS);
+IMPORT NTSTATUS NTAPI NtRemoveProcessDebug(HANDLE, HANDLE);
+IMPORT NTSTATUS NTAPI NtDebugActiveProcess(HANDLE, HANDLE);
+IMPORT NTSTATUS NTAPI NtClose(HANDLE);
+EXPORT void NTAPI RtlExitUserThread(NTSTATUS);
+#define TEB_DEBUG_OBJECT(teb) (*(HANDLE *)((BYTE *)(teb) + 0x1660))
+EXPORT __attribute__((naked)) void NTAPI DbgBreakPoint(void) { __asm__ volatile("int3\n\tret"); }
+EXPORT HANDLE NTAPI DbgUiGetThreadDebugObject(void) { return TEB_DEBUG_OBJECT(NtCurrentTeb()); }
+EXPORT void NTAPI DbgUiSetThreadDebugObject(HANDLE object) { TEB_DEBUG_OBJECT(NtCurrentTeb()) = object; }
+EXPORT NTSTATUS NTAPI DbgUiConnectToDbg(void) {
+  if (TEB_DEBUG_OBJECT(NtCurrentTeb())) return STATUS_SUCCESS;
+  OBJECT_ATTRIBUTES attributes = {sizeof(attributes), NULL, NULL, 0, NULL, NULL};
+  HANDLE object = NULL;
+  const NTSTATUS status = NtCreateDebugObject(&object, 0x1F000F, &attributes, 1 /* DEBUG_KILL_ON_CLOSE */);
+  if (NT_SUCCESS(status)) TEB_DEBUG_OBJECT(NtCurrentTeb()) = object;
+  return status;
+}
+EXPORT NTSTATUS NTAPI DbgUiWaitStateChange(PVOID state_change, PLARGE_INTEGER timeout) { return NtWaitForDebugEvent(TEB_DEBUG_OBJECT(NtCurrentTeb()), TRUE, timeout, state_change); }
+EXPORT NTSTATUS NTAPI DbgUiContinue(PVOID client_id, NTSTATUS status) { return NtDebugContinue(TEB_DEBUG_OBJECT(NtCurrentTeb()), client_id, status); }
+EXPORT NTSTATUS NTAPI DbgUiStopDebugging(HANDLE process) { return NtRemoveProcessDebug(process, TEB_DEBUG_OBJECT(NtCurrentTeb())); }
+/* The thread that DbgUiIssueRemoteBreakin makes in the program runs this: the breakpoint is the debugger's way in. */
+EXPORT void NTAPI DbgUiRemoteBreakin(PVOID parameter) {
+  (void)parameter;
+  TEB_REMOTE_BREAK(NtCurrentTeb()) = 1;
+  if (being_debugged()) DbgBreakPoint();
+  RtlExitUserThread(0);
+}
+EXPORT NTSTATUS NTAPI DbgUiIssueRemoteBreakin(HANDLE process) {
+  HANDLE thread = NULL;
+  const NTSTATUS status = NtCreateThreadEx(&thread, 0x1FFFFF, NULL, process, (PVOID)DbgUiRemoteBreakin, NULL, 0, 0, 0, 0, NULL);
+  if (NT_SUCCESS(status)) NtClose(thread);
+  return status;
+}
+EXPORT NTSTATUS NTAPI DbgUiDebugActiveProcess(HANDLE process) {
+  NTSTATUS status = NtDebugActiveProcess(process, TEB_DEBUG_OBJECT(NtCurrentTeb()));
+  if (NT_SUCCESS(status)) {
+    status = DbgUiIssueRemoteBreakin(process);
+    if (!NT_SUCCESS(status)) DbgUiStopDebugging(process);
+  }
+  return status;
 }

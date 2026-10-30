@@ -562,6 +562,16 @@ struct DrawState {
   uint32_t sample_count = 1;   // samples per pixel of the pass's images
   uint64_t* samples = nullptr; // the open occlusion query's count: one more for every fragment that passes the stencil and depth tests
   uint64_t* ps_invocations = nullptr;   // one more for every run of the fragment shader (a statistics query)
+  // The stream output targets (BindStreamOutput): where each buffer's next record goes. `closed` is set once a primitive did not fit.
+  struct StreamOutputTarget {
+    ByteView view;
+    uint64_t written = 0;
+    bool closed = false;
+    IBuffer* buffer = nullptr;   // (what it is bound to, to remember how far it got)
+    uint64_t base = 0;           // (the offset the view starts at)
+  };
+  StreamOutputTarget* stream_output = nullptr;   // kMaxStreamOutputBuffers of them (null outside a submit)
+  uint64_t* so_counts = nullptr;   // an open stream output statistics query: for each stream the primitives written (2 * stream) and needed (2 * stream + 1)
 };
 
 float read_float(ConstByteView bytes, uint64_t offset) {
@@ -1068,10 +1078,111 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView ver
 }
 
 // Runs a geometry shader on one primitive and draws what it emits: the vertices are a strip (a triangle strip turns every second triangle over, as Direct3D does) or points.
+// Writes the primitives of the streams the pipeline declares stream output for: each stream's vertices are made into points, lines or triangles as for drawing, and every vertex of a primitive is a
+// record in each buffer its entries name (the entries of a buffer in order, one after the other from the start of the record; the rest of the record is as it was). A primitive that does not
+// fit in the buffers it goes to is not written, nor is any after it of its stream.
+// Writes one primitive of `count` vertices to the stream output buffers `used_buffers` (bit n: buffer n) takes from `stream`, and counts it for a statistics query. A primitive that does not fit
+// in every one of them is dropped and closes them. False if it was not written.
+bool store_stream_output_primitive(const DrawState& s, uint32_t stream, uint32_t used_buffers, const ClipVertex* vertex, uint32_t count) {
+  const GraphicsPipelineDesc& pd = s.pipeline->desc();
+  if (s.so_counts) ++s.so_counts[2 * stream + 1];
+  if (!used_buffers) return false;
+  bool overflow = false;
+  for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b)
+    if ((used_buffers >> b & 1) && (s.stream_output[b].closed || s.stream_output[b].written + uint64_t{count} * pd.stream_output_stride[b] > s.stream_output[b].view.size())) overflow = true;
+  if (overflow) {
+    for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b)
+      if (used_buffers >> b & 1) s.stream_output[b].closed = true;
+    return false;
+  }
+  if (s.so_counts) ++s.so_counts[2 * stream];
+  for (uint32_t k = 0; k < count; ++k) {
+    for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b) {
+      if (!(used_buffers >> b & 1)) continue;
+      ByteView record;
+      if (!s.stream_output[b].view.try_subview(s.stream_output[b].written + uint64_t{k} * pd.stream_output_stride[b], pd.stream_output_stride[b], &record)) continue;
+      ByteWriter out(record);
+      for (uint32_t e = 0; e < pd.stream_output_count; ++e) {
+        const StreamOutputEntry& entry = pd.stream_output[e];
+        if (entry.stream != stream || entry.buffer != b) continue;
+        // (the position goes out as the shader wrote it: the devices' +Y down is turned over)
+        Vec4 value = entry.output == 0 ? Vec4{vertex[k].position.x, -vertex[k].position.y, vertex[k].position.z, vertex[k].position.w} : vertex[k].varying[(entry.output - 1) % kMaxVaryings];
+        const float components[4] = {value.x, value.y, value.z, value.w};
+        for (uint32_t c = 0; c < entry.component_count; ++c) out.le32(__builtin_bit_cast(uint32_t, components[(entry.start_component + c) & 3]));
+      }
+    }
+  }
+  for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b)
+    if (used_buffers >> b & 1) s.stream_output[b].written += uint64_t{count} * pd.stream_output_stride[b];
+  return true;
+}
+
+uint32_t stream_output_buffers_of(const GraphicsPipelineDesc& pd, uint32_t stream) {
+  uint32_t used = 0;
+  for (uint32_t e = 0; e < pd.stream_output_count; ++e)
+    if (pd.stream_output[e].stream == stream) used |= 1u << pd.stream_output[e].buffer;
+  return used;
+}
+
+// The primitives a geometry shader made, to the streams they belong to.
+void capture_stream_output(const DrawState& s, const ShaderModuleDesc& md, const GeometryOutputData& output) {
+  const GraphicsPipelineDesc& pd = s.pipeline->desc();
+  if (!pd.stream_output_count || !s.stream_output) return;
+  const GeometryTopology topology = md.geometry_streams > 1 ? GeometryTopology::PointList : md.geometry_output;
+  const uint32_t need = topology == GeometryTopology::PointList ? 1 : topology == GeometryTopology::LineStrip ? 2 : 3;
+  for (uint32_t stream = 0; stream < md.geometry_streams && stream < kMaxGeometryStreams; ++stream) {
+    const uint32_t used_buffers = stream_output_buffers_of(pd, stream);   // (bit n: buffer n gets this stream)
+    if (!used_buffers && !s.so_counts) continue;
+    uint32_t strip[kMaxGeometryVertices];
+    uint32_t strip_length = 0;   // the vertices of this stream's strip so far (all of them for a list of points)
+    for (uint32_t i = 0; i < output.count; ++i) {
+      if (output.stream[i] != stream) continue;
+      if (output.restart[i]) strip_length = 0;
+      strip[strip_length++] = i;
+      uint32_t primitive[3];
+      uint32_t count = 0;
+      if (topology == GeometryTopology::PointList) {
+        primitive[count++] = i;
+        strip_length = 0;
+      } else if (strip_length >= need) {
+        // (the last `need` vertices of the strip; every second triangle's first two swapped, as the rasterizer winds them)
+        const uint32_t j = strip_length - 1;
+        if (topology == GeometryTopology::LineStrip) {
+          primitive[0] = strip[j - 1], primitive[1] = strip[j];
+        } else if ((strip_length - 3) & 1) {
+          primitive[0] = strip[j - 1], primitive[1] = strip[j - 2], primitive[2] = strip[j];
+        } else {
+          primitive[0] = strip[j - 2], primitive[1] = strip[j - 1], primitive[2] = strip[j];
+        }
+        count = need;
+      } else {
+        continue;
+      }
+      ClipVertex vertices[3];
+      for (uint32_t k = 0; k < count; ++k) {
+        vertices[k].position = output.vertex[primitive[k]].position;
+        for (uint32_t n = 0; n < kMaxVaryings; ++n) vertices[k].varying[n] = output.vertex[primitive[k]].varying[n];
+      }
+      store_stream_output_primitive(s, stream, used_buffers, vertices, count);
+    }
+  }
+}
+
+// The primitives of a vertex or domain shader (no geometry shader): one stream, stream 0.
+void capture_stream_output_primitive(const DrawState& s, const ClipVertex* vertex, uint32_t count) {
+  const GraphicsPipelineDesc& pd = s.pipeline->desc();
+  if (!pd.stream_output_count || !s.stream_output) return;
+  store_stream_output_primitive(s, 0, stream_output_buffers_of(pd, 0), vertex, count);
+}
+
 void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const GeometryInputData& input) {
   GeometryOutputData output;
   md.geometry_function(input, s.constants, &output);
   if (output.count > md.geometry_max_vertices) output.count = md.geometry_max_vertices;
+  capture_stream_output(s, md, output);
+  // (with stream output only the stream that is rasterized is drawn, if any)
+  const int32_t drawn_stream = s.pipeline->desc().stream_output_count ? s.pipeline->desc().rasterized_stream : 0;
+  if (drawn_stream < 0) return;
   auto clip = [&](uint32_t i) {
     ClipVertex c;
     c.position = output.vertex[i].position;
@@ -1080,6 +1191,7 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
   };
   uint32_t in_strip = 0;   // vertices of the strip so far
   for (uint32_t i = 0; i < output.count; ++i) {
+    if (md.geometry_streams > 1 && output.stream[i] != static_cast<uint32_t>(drawn_stream)) continue;   // (several streams are lists of points: the one that is drawn)
     if (output.restart[i]) in_strip = 0;
     ++in_strip;
     if (md.geometry_output == GeometryTopology::PointList) {
@@ -1136,12 +1248,25 @@ void run_tessellation(const DrawState& s, Tessellator& tessellator, const Softwa
     for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = io.varying[k];
     return c;
   };
+  const bool rasterize = !s.pipeline->desc().stream_output_count || s.pipeline->desc().rasterized_stream == 0;
   if (hd.tess_output == TessOutput::Point) {
-    for (const uint16_t i : indices) draw_point(s, vertex(i));
+    for (const uint16_t i : indices) {
+      const ClipVertex a = vertex(i);
+      capture_stream_output_primitive(s, &a, 1);
+      if (rasterize) draw_point(s, a);
+    }
   } else if (hd.tess_output == TessOutput::Line) {
-    for (uint64_t i = 0; i + 2 <= indices.size(); i += 2) draw_line(s, vertex(indices[i]), vertex(indices[i + 1]));
+    for (uint64_t i = 0; i + 2 <= indices.size(); i += 2) {
+      const ClipVertex a[2] = {vertex(indices[i]), vertex(indices[i + 1])};
+      capture_stream_output_primitive(s, a, 2);
+      if (rasterize) draw_line(s, a[0], a[1]);
+    }
   } else {
-    for (uint64_t i = 0; i + 3 <= indices.size(); i += 3) draw_triangle(s, vertex(indices[i]), vertex(indices[i + 1]), vertex(indices[i + 2]));
+    for (uint64_t i = 0; i + 3 <= indices.size(); i += 3) {
+      const ClipVertex a[3] = {vertex(indices[i]), vertex(indices[i + 1]), vertex(indices[i + 2])};
+      capture_stream_output_primitive(s, a, 3);
+      if (rasterize) draw_triangle(s, a[0], a[1], a[2]);
+    }
   }
 }
 
@@ -1196,7 +1321,7 @@ IShaderModule* SoftwareDevice::create_shader_module(const ShaderModuleDesc& desc
     return make<SoftwareShaderModule>(allocator_, desc);
   }
   if (desc.stage == ShaderStage::Geometry) {
-    if (!desc.geometry_function || desc.geometry_max_vertices == 0 || desc.geometry_max_vertices > kMaxGeometryVertices) return nullptr;
+    if (!desc.geometry_function || desc.geometry_max_vertices == 0 || desc.geometry_max_vertices > kMaxGeometryVertices || desc.geometry_streams == 0 || desc.geometry_streams > kMaxGeometryStreams) return nullptr;
     return make<SoftwareShaderModule>(allocator_, desc);
   }
   if (desc.stage == ShaderStage::Compute) {
@@ -1230,6 +1355,24 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
   const auto* fs = static_cast<const SoftwareShaderModule*>(desc.fragment_shader);
   if (vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
   if (desc.geometry_shader && desc.geometry_shader->stage() != ShaderStage::Geometry) return nullptr;
+  if (desc.stream_output_count) {
+    // (stream output takes the outputs of the geometry shader, or the domain shader, or the vertex shader if there are neither; entries that name its streams, outputs and buffers, and buffers
+    // that have only one stream)
+    if (desc.stream_output_count > kMaxStreamOutputEntries || desc.rasterized_stream < -1 || desc.rasterized_stream >= static_cast<int32_t>(kMaxGeometryStreams)) return nullptr;
+    const uint32_t streams = desc.geometry_shader ? static_cast<const SoftwareShaderModule*>(desc.geometry_shader)->desc().geometry_streams : 1;
+    if (!desc.geometry_shader && desc.rasterized_stream > 0) return nullptr;
+    int32_t stream_of_buffer[kMaxStreamOutputBuffers] = {-1, -1, -1, -1};
+    uint32_t bytes[kMaxStreamOutputBuffers] = {};
+    for (uint32_t e = 0; e < desc.stream_output_count; ++e) {
+      const StreamOutputEntry& entry = desc.stream_output[e];
+      if (entry.stream >= streams || entry.output > kMaxVaryings || entry.component_count == 0 || entry.component_count > 4 || entry.start_component > 3 || entry.start_component + entry.component_count > 4 || entry.buffer >= kMaxStreamOutputBuffers) return nullptr;
+      if (stream_of_buffer[entry.buffer] >= 0 && stream_of_buffer[entry.buffer] != entry.stream) return nullptr;
+      stream_of_buffer[entry.buffer] = entry.stream;
+      bytes[entry.buffer] += 4u * entry.component_count;
+    }
+    for (uint32_t b = 0; b < kMaxStreamOutputBuffers; ++b)
+      if (stream_of_buffer[b] >= 0 && (desc.stream_output_stride[b] < bytes[b] || desc.stream_output_stride[b] % 4 || desc.stream_output_stride[b] > 2048)) return nullptr;
+  }
   if (desc.hull_shader || desc.domain_shader) {
     if (!desc.hull_shader || !desc.domain_shader || desc.hull_shader->stage() != ShaderStage::Hull || desc.domain_shader->stage() != ShaderStage::Domain) return nullptr;
     const ShaderModuleDesc& h = static_cast<const SoftwareShaderModule*>(desc.hull_shader)->desc();
@@ -1256,11 +1399,18 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   if (!commands) return false;
   CommandRecorder& recorder = *static_cast<CommandRecorder*>(commands);
   DrawState s;
+  // (how far each stream output buffer got, for the next bind that appends)
+  auto remember_filled = [](const DrawState::StreamOutputTarget& target) {
+    if (target.buffer) target.buffer->set_stream_output_filled(target.base + target.written);
+  };
   const SoftwareComputePipeline* compute = nullptr;
   ByteView storage[kMaxStorageBuffers];
+  DrawState::StreamOutputTarget stream_output[kMaxStreamOutputBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
   QueryKind query_kind = QueryKind::Occlusion;
+  uint32_t query_stream = 0;
+  uint64_t so_counts[2 * kMaxGeometryStreams] = {};
   uint64_t stat_ia_vertices = 0, stat_ia_primitives = 0, stat_vs = 0, stat_ps = 0;   // (what the draws since the query began did)
   bool query_open = false;
   IBuffer* vertex_buffer = nullptr;
@@ -1272,6 +1422,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   uint32_t patch_points = 0;
   bool in_pass = false;
   s.constants = s.constants_storage;
+  s.stream_output = stream_output;
   const ConstByteView pool = recorder.constants();
 
   for (uint64_t i = 0; i < recorder.commands().count(); ++i) {
@@ -1385,6 +1536,21 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (in_pass) return false;
         compute = static_cast<const SoftwareComputePipeline*>(cmd.pipeline);
         break;
+      case RecordedCommand::Type::BindStreamOutput: {
+        if (cmd.unit >= kMaxStreamOutputBuffers) return false;
+        remember_filled(stream_output[cmd.unit]);
+        stream_output[cmd.unit] = {};
+        if (cmd.buffer) {
+          ByteView whole = cmd.buffer->map(), part;
+          const uint64_t start = cmd.offset == kStreamOutputAppend ? cmd.buffer->stream_output_filled() : cmd.offset;
+          if (start > whole.size() || !whole.try_subview(start, whole.size() - start, &part)) return false;
+          stream_output[cmd.unit].view = part;
+          stream_output[cmd.unit].buffer = cmd.buffer;
+          stream_output[cmd.unit].base = start;
+          cmd.buffer->set_stream_output_filled(start);
+        }
+        break;
+      }
       case RecordedCommand::Type::BindStorageBuffer: {
         if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
         ByteView whole = cmd.buffer->map(), part;
@@ -1422,19 +1588,31 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::BeginQuery:
         if (!in_pass || query_open) return false;
-        if (cmd.count > static_cast<uint32_t>(QueryKind::PsInvocations)) return false;
+        if ((cmd.count & 0xFF) > static_cast<uint32_t>(QueryKind::SoPrimitivesNeeded)) return false;
         query_open = true;
         query_slot = cmd.unit;
-        query_kind = static_cast<QueryKind>(cmd.count);
+        query_kind = static_cast<QueryKind>(cmd.count & 0xFF);
+        query_stream = cmd.count >> 8 & 3;
         query_samples = stat_ia_vertices = stat_ia_primitives = stat_vs = stat_ps = 0;
+        for (uint64_t& n : so_counts) n = 0;
         s.samples = &query_samples;
         s.ps_invocations = &stat_ps;
+        s.so_counts = so_counts;
         break;
       case RecordedCommand::Type::EndQuery:
         if (!query_open) return false;
         query_open = false;
         s.samples = nullptr;
         s.ps_invocations = nullptr;
+        s.so_counts = nullptr;
+        if (query_kind == QueryKind::Timestamp) {
+          recorder.set_occlusion_result(query_slot, clock_ ? clock_(clock_context_) : (counted_ns_ += 1000));
+          break;
+        }
+        if (query_kind == QueryKind::SoPrimitivesWritten || query_kind == QueryKind::SoPrimitivesNeeded) {
+          recorder.set_occlusion_result(query_slot, so_counts[2 * query_stream + (query_kind == QueryKind::SoPrimitivesNeeded ? 1 : 0)]);
+          break;
+        }
         recorder.set_occlusion_result(query_slot, query_kind == QueryKind::Occlusion ? query_samples : query_kind == QueryKind::OcclusionPredicate ? (query_samples ? 1u : 0u) : query_kind == QueryKind::IaVertices ? stat_ia_vertices
                                                                                                                               : query_kind == QueryKind::IaPrimitives ? stat_ia_primitives : query_kind == QueryKind::VsInvocations ? stat_vs : stat_ps);
         break;
@@ -1560,6 +1738,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
               run_geometry_shader(s, *geometry, v, per_primitive);
               continue;
             }
+            capture_stream_output_primitive(s, v, topology == PrimitiveTopology::TriangleList ? 3 : topology == PrimitiveTopology::LineList ? 2 : 1);
+            if (s.pipeline->desc().stream_output_count && s.pipeline->desc().rasterized_stream < 0) continue;
             if (topology == PrimitiveTopology::TriangleList) draw_triangle(s, v[0], v[1], v[2]);
             else if (topology == PrimitiveTopology::LineList) draw_line(s, v[0], v[1]);
             else draw_point(s, v[0]);
@@ -1569,6 +1749,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       }
     }
   }
+  for (DrawState::StreamOutputTarget& target : stream_output) remember_filled(target);
   return !in_pass;
 }
 

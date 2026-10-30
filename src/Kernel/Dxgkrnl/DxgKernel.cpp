@@ -944,6 +944,23 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                   desc.hull_shader = in.le32();
                   desc.domain_shader = in.le32();
                   if (!in.ok()) return status::kInvalidParameter;
+                  if (!in.at_end()) {   // (and, after that, stream output: the entry count, and if there are entries the rasterized stream (-1: none), the strides, then the entries)
+                    const uint32_t entries = in.le32();
+                    if (!in.ok() || entries > graphics::kMaxStreamOutputEntries) return status::kInvalidParameter;
+                    if (entries) {
+                      desc.rasterized_stream = static_cast<int32_t>(in.le32());
+                      for (uint32_t& stride : desc.stream_output_stride) stride = in.le32();
+                      for (uint32_t e = 0; e < entries; ++e) {
+                        const uint32_t packed = in.le32(), buffer = in.le32();
+                        if (!in.ok() || buffer >= graphics::kMaxStreamOutputBuffers) return status::kInvalidParameter;
+                        graphics::StreamOutputEntry& entry = desc.stream_output[e];
+                        entry.stream = static_cast<uint8_t>(packed), entry.output = static_cast<uint8_t>(packed >> 8), entry.start_component = static_cast<uint8_t>(packed >> 16);
+                        entry.component_count = static_cast<uint8_t>(packed >> 24), entry.buffer = static_cast<uint8_t>(buffer);
+                      }
+                    }
+                    if (!in.ok()) return status::kInvalidParameter;
+                    desc.stream_output_count = entries;
+                  }
                 }
               }
             }

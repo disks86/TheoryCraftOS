@@ -47,7 +47,7 @@ class Allocation {
   // What being resident costs against the adapter's budget.
   uint64_t device_bytes() const { return device_bytes_; }
   const AllocationDesc& desc() const { return desc_; }
-  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess)) != 0; }
+  bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput)) != 0; }
   bool is_query_result() const { return (desc_.flags & kAllocQueryResult) != 0; }
   bool is_image() const { return !is_buffer(); }
   bool is_depth() const { return dxgk::is_depth(desc_.format); }
@@ -79,6 +79,7 @@ class Allocation {
   ByteView cpu_;
   graphics::IImage* image_ = nullptr;
   graphics::IBuffer* buffer_ = nullptr;
+  uint64_t so_filled_ = 0;   // a stream output buffer: how far the last stream output into it got (kept while the device object is gone)
   uint64_t device_bytes_ = 0;    // what residency costs
   bool device_stale_ = true;     // the device object (if any) lacks the backing's current contents
   bool cpu_written_ = false;     // something other than the GPU wrote the backing since creation (a device that cannot take pixels may skip the upload of an allocation nobody wrote)

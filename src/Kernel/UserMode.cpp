@@ -902,7 +902,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
       else if (kind == process::DescriptorKind::Socket) process::windowsabi::socket_token_add(token);
         else if (kind == process::DescriptorKind::Mailslot) process::windowsabi::mailslot_token_add(token);
         else if (kind == process::DescriptorKind::Key) process::windowsabi::key_token_add(token);
-        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job || kind == process::DescriptorKind::ChangeNotification) objects->add_ref(uint32_t(token));
+        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job || kind == process::DescriptorKind::ChangeNotification || kind == process::DescriptorKind::DebugObject) objects->add_ref(uint32_t(token));
       }
     };
     p.process()->files().inherit_from(program.process()->files(), count_use);
