@@ -239,6 +239,45 @@ int glyphs_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
   return ok ? 1 : 0;
 }
 
+// A picture repeated by the sampler (draw_image_tiled) and a conic gradient as wedges: 1 ok, 0 wrong.
+int fills_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
+  constexpr uint32_t W = 64, H = 48;
+  DeviceRenderer2D r(device, allocator, {W, H});
+  ArrayView<uint32_t> px = allocate_view<uint32_t>(allocator, W * H);
+  ArrayView<uint32_t> tile_pixels = allocate_view<uint32_t>(allocator, 3 * 2);
+  if (!r.valid() || px.empty() || tile_pixels.empty()) {
+    release_view(allocator, px);
+    release_view(allocator, tile_pixels);
+    return 0;
+  }
+  const uint32_t colors[6] = {rgb(255, 0, 0), rgb(0, 255, 0), rgb(0, 0, 255), rgb(255, 255, 255), rgb(255, 255, 0), rgb(0, 255, 255)};
+  for (uint32_t i = 0; i < 6; ++i) tile_pixels[i] = colors[i];
+  Surface tile;
+  tile.pixels = tile_pixels;
+  tile.width = tile.pitch = 3;
+  tile.height = 2;
+  r.clear(rgb(0, 0, 0));
+  r.set_blend(BlendMode::Alpha);
+  bool ok = r.draw_image_tiled(tile, 1, 1, 3, 2, {1, 1, 18, 8});   // (6 x 4 copies)
+  const GradientStop quadrants[8] = {{0.0f, rgb(255, 0, 0)}, {0.25f, rgb(255, 0, 0)}, {0.25f, rgb(0, 255, 0)}, {0.5f, rgb(0, 255, 0)},
+                                     {0.5f, rgb(0, 0, 255)}, {0.75f, rgb(0, 0, 255)}, {0.75f, rgb(255, 255, 0)}, {1.0f, rgb(255, 255, 0)}};
+  ok = ok && r.fill_conic_gradient({24, 0, 40, 40}, {44, 20}, 0.0f, ArrayView<const GradientStop>(quadrants, 8)) && r.read_pixels(px);
+  if (ok) {
+    auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x] & 0xFFFFFF; };
+    // tiles: pixel (x, y) shows the tile pixel ((x - 1) mod 3, (y - 1) mod 2); nothing outside the area
+    bool tiles = true;
+    for (uint32_t y = 1; y < 9; ++y)
+      for (uint32_t x = 1; x < 19; ++x) tiles = tiles && at(x, y) == (colors[((y - 1) % 2) * 3 + ((x - 1) % 3)] & 0xFFFFFF);
+    tiles = tiles && at(0, 1) == 0 && at(19, 1) == 0 && at(1, 9) == 0;
+    // conic: clockwise from the top, red, green, blue, yellow quarters around (44, 20): top right red, bottom right green, bottom left blue, top left yellow
+    const bool conic = at(54, 10) == 0xFF0000 && at(54, 30) == 0x00FF00 && at(34, 30) == 0x0000FF && at(34, 10) == 0xFFFF00;
+    ok = tiles && conic;
+  }
+  release_view(allocator, px);
+  release_view(allocator, tile_pixels);
+  return ok ? 1 : 0;
+}
+
 bool demo_2d(SystemGraphics& graphics) {
   IRenderer2D* renderer = graphics.renderer_2d();
   if (!renderer) return false;
@@ -393,6 +432,8 @@ bool demo_3d(SystemGraphics& graphics, allocators::IAllocator& allocator, uint64
   return ok && first_frame_checked;
 }
 }  // namespace
+
+int check_2d_fills(IGraphicsDevice& device, allocators::IAllocator& allocator) { return fills_check(device, allocator); }
 
 int check_2d_glyphs(IGraphicsDevice& device, allocators::IAllocator& allocator) { return glyphs_check(device, allocator); }
 

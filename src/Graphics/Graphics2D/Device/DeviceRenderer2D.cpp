@@ -588,7 +588,7 @@ bool DeviceRenderer2D::draw_textured_quad(IImage& image, int64_t dx, int64_t dy,
   return draw_textured_corners(image, xs, ys, u0, v0, u1, v1, Filter::Nearest);   // (nearest at the pixel centres: the picture's own pixels)
 }
 
-bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale, IImage* mask) {
+bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale, IImage* mask, AddressMode address) {
   if (!submit_pending()) return false;
   const TexturedVertex tl{{xs[0], ys[0], 0}, {u0, v0}}, tr{{xs[1], ys[1], 0}, {u1, v0}}, br{{xs[2], ys[2], 0}, {u1, v1}}, bl{{xs[3], ys[3], 0}, {u0, v1}};
   const TexturedVertex quad[6] = {tl, tr, br, tl, br, bl};
@@ -606,7 +606,7 @@ bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], c
   commands_->bind_vertex_buffer(texture_vertices_);
   SamplerDesc sampler;
   sampler.filter = filter;
-  sampler.address_u = sampler.address_v = AddressMode::ClampToEdge;
+  sampler.address_u = sampler.address_v = address;
   commands_->bind_texture(0, &image, sampler);
   if (mask) {
     SamplerDesc nearest;   // (the coverage as it is, at the pixel centres)
@@ -621,6 +621,32 @@ bool DeviceRenderer2D::draw_textured_corners(IImage& image, const float xs[4], c
   commands_->draw(6);
   commands_->end_render_pass();
   return commands_->end() && device_.submit(commands_);
+}
+
+// The tile as one texture, drawn as one rectangle over `area` whose texture coordinates run over the copies, the sampler repeating them.
+bool DeviceRenderer2D::draw_image_tiled(const Surface& s, int32_t origin_x, int32_t origin_y, uint32_t cell_w, uint32_t cell_h, const Rect2D& area) {
+  if (!valid_ || !s.valid() || !cell_w || !cell_h || !texture_blended_ || !texture_opaque_ || !texture_vertices_ || opacity_ != 1.0f || !s.width || !s.height) return false;
+  const Rect2D shown = raster::intersect(area, clip_);
+  if (!shown.width || !shown.height) return true;   // (nothing of it is inside the clip)
+  const uint64_t count = uint64_t{s.width} * s.height;
+  if (count > (uint64_t{1} << 24) || !prepare_rows(count)) return false;
+  const ArrayView<uint32_t> rows = texture_rows_.first(count);
+  for (uint32_t j = 0; j < s.height; ++j) {
+    const ArrayView<const uint32_t> from = ArrayView<const uint32_t>(s.row(j), s.width);
+    const ArrayView<uint32_t> to = rows.subview(uint64_t{j} * s.width, s.width);
+    if (s.format == Format::B8G8R8A8Unorm) to.copy_from(from);
+    else
+      for (uint32_t i = 0; i < s.width; ++i) to[i] = s.decode(from[i]);
+  }
+  if (!submit_pending() || !ensure_texture(s.width, s.height) || !texture_->write_pixels(ArrayView<const uint32_t>(texture_rows_.data(), count))) return false;
+  // texture coordinates: copies from the origin, folded into one period so that the numbers stay small
+  auto fold = [](int64_t v, int64_t period) { const int64_t m = v % period; return m < 0 ? m + period : m; };
+  const float u0 = static_cast<float>(fold(int64_t{shown.x} - origin_x, cell_w)) / static_cast<float>(cell_w);
+  const float v0 = static_cast<float>(fold(int64_t{shown.y} - origin_y, cell_h)) / static_cast<float>(cell_h);
+  const float u1 = u0 + static_cast<float>(shown.width) / static_cast<float>(cell_w), v1 = v0 + static_cast<float>(shown.height) / static_cast<float>(cell_h);
+  const float x0 = static_cast<float>(shown.x), y0 = static_cast<float>(shown.y), x1 = x0 + static_cast<float>(shown.width), y1 = y0 + static_cast<float>(shown.height);
+  const float xs[4] = {x0, x1, x1, x0}, ys[4] = {y0, y0, y1, y1};
+  return draw_textured_corners(*texture_, xs, ys, u0, v0, u1, v1, Filter::Nearest, nullptr, nullptr, AddressMode::Repeat);
 }
 
 bool DeviceRenderer2D::draw_image_transformed(const Surface& s, const Rect2D& rect, const Matrix2D& m, ImageFilter filter) {
@@ -1123,6 +1149,49 @@ void DeviceRenderer2D::fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec
   }
   close_range();
   clip_ = saved_clip;
+}
+
+// A fan of thin wedges around the center, each with the colors of its two edges (the center vertex has their mean, so that the color changes along a wedge by at most half the step).
+bool DeviceRenderer2D::fill_conic_gradient(const Rect2D& rect, Vec2 center, float start_turns, ArrayView<const GradientStop> samples) {
+  if (!valid_ || samples.size() < 2 || samples.size() > 4096) return false;
+  const Rect2D area = raster::intersect(rect, clip_);
+  if (!area.width || !area.height) return true;
+  const float x0 = static_cast<float>(area.x), y0 = static_cast<float>(area.y), x1 = x0 + static_cast<float>(area.width), y1 = y0 + static_cast<float>(area.height);
+  float far = 0;
+  const float corner_x[2] = {x0, x1}, corner_y[2] = {y0, y1};
+  for (const float cx : corner_x)
+    for (const float cy : corner_y) {
+      const float d = raster::sqrt_f((cx - center.x) * (cx - center.x) + (cy - center.y) * (cy - center.y));
+      far = d > far ? d : far;
+    }
+  const float radius = far + 2.0f;
+  constexpr double kTwoPi = 6.28318530717958647692;
+  const Rect2D saved_clip = clip_;
+  close_range();
+  clip_ = area;   // (the wedges overshoot the rectangle; the scissor trims them)
+  for (uint64_t i = 0; i + 1 < samples.size(); ++i) {
+    const GradientStop& a = samples[i];
+    const GradientStop& b = samples[i + 1];
+    const float span = b.offset - a.offset;
+    if (!(span > 1e-7f)) continue;   // (a hard edge: no area between the two samples)
+    const Vec4 ca = unpack_color(a.color), cb = unpack_color(b.color);
+    uint32_t parts = static_cast<uint32_t>(span * static_cast<float>(kTwoPi) / 0.4f) + 1;   // (a wedge is at most 0.4 radians wide: its chord stays inside the circumscribed radius)
+    if (parts > 64) parts = 64;
+    for (uint32_t k = 0; k < parts; ++k) {
+      const float f0 = static_cast<float>(k) / static_cast<float>(parts), f1 = static_cast<float>(k + 1) / static_cast<float>(parts);
+      const double t0 = kTwoPi * (static_cast<double>(start_turns) + a.offset + span * f0), t1 = kTwoPi * (static_cast<double>(start_turns) + a.offset + span * f1);
+      const float chord = static_cast<float>(1.0 / fmath::cos((t1 - t0) * 0.5));
+      const float xs[3] = {center.x, center.x + radius * chord * static_cast<float>(fmath::sin(t0)), center.x + radius * chord * static_cast<float>(fmath::sin(t1))};
+      const float ys[3] = {center.y, center.y - radius * chord * static_cast<float>(fmath::cos(t0)), center.y - radius * chord * static_cast<float>(fmath::cos(t1))};
+      auto mix = [&](float f) { return Vec4{ca.x + (cb.x - ca.x) * f, ca.y + (cb.y - ca.y) * f, ca.z + (cb.z - ca.z) * f, ca.w + (cb.w - ca.w) * f}; };
+      const Vec4 c0 = mix(f0), c1 = mix(f1), mid = mix((f0 + f1) * 0.5f);
+      const Vec4 cs[3] = {mid, c0, c1};
+      triangle_colors(xs, ys, cs);
+    }
+  }
+  close_range();
+  clip_ = saved_clip;
+  return true;
 }
 
 bool DeviceRenderer2D::push_clip_rect(const Rect2D& rect) {

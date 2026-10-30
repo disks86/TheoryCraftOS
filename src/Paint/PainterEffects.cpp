@@ -69,6 +69,7 @@ int32_t ifloor(float v) {
   return static_cast<float>(i) > v ? i - 1 : i;
 }
 int32_t iround(float v) { return ifloor(v + 0.5f); }
+int32_t iceil(float v) { return -ifloor(-v); }
 uint8_t to_byte(float v) { return static_cast<uint8_t>(v <= 0.0f ? 0 : v >= 255.0f ? 255 : static_cast<int32_t>(v + 0.5f)); }
 
 uint32_t with_alpha_scaled(uint32_t color, float k) {
@@ -114,6 +115,95 @@ uint32_t gradient_color(const GradientData& g, float t) {
     rgb[k] = (p0 + (p1 - p0) * u) / a;
   }
   return (static_cast<uint32_t>(to_byte(a)) << 24) | (static_cast<uint32_t>(to_byte(rgb[0])) << 16) | (static_cast<uint32_t>(to_byte(rgb[1])) << 8) | to_byte(rgb[2]);
+}
+
+// The hints of a gradient written out as stops: a few between the two stops of a segment that has one, with the colors the hinted curve gives there (the
+// renderer then needs only plain stops). False if they do not fit.
+bool expand_hints(const GradientData& g, GradientData* out) {
+  uint32_t hinted = 0;
+  for (uint32_t i = 0; i + 1 < g.stop_count; ++i) {
+    const float h = g.hints[i];
+    if (h > 0.0f && h < 1.0f && (h < 0.4999f || h > 0.5001f)) ++hinted;
+  }
+  if (g.stop_count < 2 || hinted == 0) return false;
+  uint32_t per = (graphics::kMaxGradientStops - g.stop_count) / hinted;
+  if (per > 12) per = 12;
+  if (per < 2) return false;
+  *out = g;
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < g.stop_count; ++i) {
+    out->stops[n++] = g.stops[i];
+    const float h = i + 1 < g.stop_count ? g.hints[i] : -1.0f;
+    if (!(h > 0.0f && h < 1.0f && (h < 0.4999f || h > 0.5001f))) continue;
+    // (the colors are even steps of the hinted curve y = u^e, so the stops lie closest together where the curve is steepest)
+    const double inverse = fmath::ln(static_cast<double>(h)) / fmath::ln(0.5);   // 1 / e
+    for (uint32_t k = 1; k <= per; ++k) {
+      const double y = static_cast<double>(k) / static_cast<double>(per + 1);
+      graphics::GradientStop st;
+      st.offset = g.stops[i].offset + (g.stops[i + 1].offset - g.stops[i].offset) * static_cast<float>(fmath::pow(y, inverse));
+      st.color = gradient_color(g, st.offset);
+      out->stops[n++] = st;
+    }
+  }
+  out->stop_count = n;
+  for (float& h : out->hints) h = -1.0f;
+  return true;
+}
+
+// The colors of a conic gradient around the circle as samples for the renderer (turns 0..1 from its start): a fine, even grid, plus the stops and the places a repeat
+// begins, twice each (just before and just after) so that a hard edge stays hard. Returns how many.
+uint32_t conic_samples(const GradientData& g, float radius, graphics::GradientStop* out, uint32_t capacity) {
+  const float first = g.stops[0].offset, last = g.stops[g.stop_count - 1].offset, period = last - first;
+  auto color_at = [&](float t) {
+    if (g.repeating) t = period > 1e-6f ? first + period * fract((t - first) / period) : last;
+    return gradient_color(g, t);
+  };
+  // the places the color is not smooth
+  float marks[512];
+  uint32_t marks_n = 0;
+  auto mark = [&](float t) {
+    if (t > 0.0f && t < 1.0f && marks_n < 512) marks[marks_n++] = t;
+  };
+  if (g.repeating && period > 1e-4f) {
+    const int32_t k0 = ifloor((0.0f - first) / period), k1 = ifloor((1.0f - first) / period);
+    for (int32_t k = k0; k <= k1 + 1 && marks_n < 480; ++k)
+      for (uint32_t i = 0; i < g.stop_count; ++i) mark(g.stops[i].offset + period * static_cast<float>(k));
+  } else {
+    for (uint32_t i = 0; i < g.stop_count; ++i) mark(g.stops[i].offset);
+  }
+  for (uint32_t i = 1; i < marks_n; ++i) {   // (sorted: few)
+    const float v = marks[i];
+    uint32_t j = i;
+    while (j > 0 && marks[j - 1] > v) {
+      marks[j] = marks[j - 1];
+      --j;
+    }
+    marks[j] = v;
+  }
+  // an even grid, as fine as three pixels along the rim
+  int32_t steps = iceil(6.2831853f * radius / 3.0f);
+  steps = steps < 90 ? 90 : steps > 720 ? 720 : steps;
+  uint32_t n = 0;
+  auto put = [&](float t, uint32_t color) {
+    if (n < capacity) {
+      out[n].offset = t;
+      out[n].color = color;
+      ++n;
+    }
+  };
+  constexpr float kEdge = 1e-4f;
+  uint32_t m = 0;
+  put(0.0f, color_at(0.0f));
+  for (int32_t s = 1; s <= steps; ++s) {
+    const float t = static_cast<float>(s) / static_cast<float>(steps);
+    while (m < marks_n && marks[m] < t) {   // marks before this grid point
+      put(marks[m], color_at(marks[m] - kEdge));
+      put(marks[m], color_at(marks[m] + kEdge));
+      ++m;
+    }
+    put(t, color_at(t >= 1.0f ? 1.0f - kEdge : t));
+  }
+  return n;
 }
 
 // ---- borders -----------------------------------------------------------------------------------------------------------
@@ -204,6 +294,34 @@ uint32_t side_color(const BorderGeometry& g, int side, float cx, float cy, float
     default: break;
   }
   return with_alpha_scaled(color, cover);
+}
+
+// The straight middle of one side of a border (a piece that is a plain rectangle) as rectangles of one color: along the side, a run of equal colors is one; a pattern
+// that does not change across the line (dashes, small dots, the inset and outset shades) is evaluated once and the runs are as thick as the side.
+void border_runs(graphics::IRenderer2D& r, const BorderGeometry& g, int side, const IRect& area, int32_t origin_x, int32_t origin_y, const IRect& visible) {
+  const bool horizontal = side == 0 || side == 2;
+  const LineStyle style = g.styles[side];
+  const bool constant_across = style == LineStyle::Dashed || (style == LineStyle::Dotted && g.side_width[side] <= 2.0f) || style == LineStyle::Inset || style == LineStyle::Outset;
+  const int32_t lines = horizontal ? area.height : area.width, along = horizontal ? area.width : area.height;
+  for (int32_t line = 0; line < (constant_across ? 1 : lines); ++line) {
+    auto color_at = [&](int32_t i) {
+      const int32_t lx = horizontal ? area.x + i : area.x + line, ly = horizontal ? area.y + line : area.y + i;
+      const float cx = static_cast<float>(lx) + 0.5f, cy = static_cast<float>(ly) + 0.5f;
+      return side_color(g, side, cx, cy, g.outer.depth(cx, cy));
+    };
+    int32_t i = 0;
+    while (i < along) {
+      const uint32_t color = color_at(i);
+      int32_t j = i + 1;
+      while (j < along && color_at(j) == color) ++j;
+      if ((color >> 24) != 0) {
+        IRect piece = horizontal ? IRect{area.x + i, area.y + line, j - i, constant_across ? lines : 1} : IRect{area.x + line, area.y + i, constant_across ? lines : 1, j - i};
+        piece = shifted(piece, origin_x, origin_y).intersection(visible);
+        if (!piece.empty()) r.fill_rect(to_rect(piece), color);
+      }
+      i = j;
+    }
+  }
 }
 
 uint32_t mix_colors(uint32_t c1, float w1, uint32_t c2, float w2) {
@@ -498,12 +616,17 @@ bool DisplayPainter::push_clip_shape(graphics::IRenderer2D& r, const ClipShape& 
 // ---- gradients ------------------------------------------------------------------------------------------------------
 
 void DisplayPainter::draw_gradient(graphics::IRenderer2D& r, const DisplayList& list, const Op& op, const IRect& rect, int32_t dx, int32_t dy, const IRect& visible) {
-  const GradientData& g = list.gradient(op.gradient);
+  const GradientData& original = list.gradient(op.gradient);
   const bool rounded = has_radius(op.radii);
   const graphics::Vec2 shift{static_cast<float>(dx), static_cast<float>(dy)};
-  const graphics::Vec2 from{g.from.x + shift.x, g.from.y + shift.y}, to{g.to.x + shift.x, g.to.y + shift.y}, center{g.center.x + shift.x, g.center.y + shift.y};
+  const graphics::Vec2 from{original.from.x + shift.x, original.from.y + shift.y}, to{original.to.x + shift.x, original.to.y + shift.y}, center{original.center.x + shift.x, original.center.y + shift.y};
   bool hinted = false;
-  for (uint32_t i = 0; i + 1 < g.stop_count; ++i) hinted = hinted || g.hints[i] > 0.0f;
+  for (uint32_t i = 0; i + 1 < original.stop_count; ++i) hinted = hinted || original.hints[i] > 0.0f;
+  // (hints written out as stops, for a renderer that fills with plain stops)
+  GradientData expanded;
+  const bool use_expanded = hinted && original.kind != GradientData::Conic && r.gradients_as_stops() && expand_hints(original, &expanded);
+  if (use_expanded) hinted = false;
+  const GradientData& g = use_expanded ? expanded : original;
   // A repeating gradient is a plain one when the periods that show are written out as stops: then the renderer (the GPU) draws it.
   graphics::GradientStop unrolled[graphics::kMaxGradientStops];
   uint32_t unrolled_count = 0;
@@ -555,9 +678,30 @@ void DisplayPainter::draw_gradient(graphics::IRenderer2D& r, const DisplayList& 
       }
     }
   }
-  const bool by_pixel = g.kind == GradientData::Conic || ((g.repeating || hinted) && unrolled_count == 0);
+  bool conic_done = false;
+  bool by_pixel = g.kind == GradientData::Conic || ((g.repeating || hinted) && unrolled_count == 0);
   if (rounded) r.push_clip_rounded_rect(to_rect(rect), op.radii);
-  if (!by_pixel) {
+  if (g.kind == GradientData::Conic && g.stop_count >= 2) {
+    // The renderer fans out wedges with the gradient's colors sampled around the circle (the GPU); if it cannot, the pixels are colored below.
+    const IRect area = rect.intersection(visible);
+    if (!area.empty()) {
+      const float cx0 = static_cast<float>(area.x), cx1 = static_cast<float>(area.right()), cy0 = static_cast<float>(area.y), cy1 = static_cast<float>(area.bottom());
+      const float mx = (center.x - cx0 > cx1 - center.x ? center.x - cx0 : cx1 - center.x), my = (center.y - cy0 > cy1 - center.y ? center.y - cy0 : cy1 - center.y);
+      constexpr uint32_t kSampleCapacity = 2048;
+      ArrayView<graphics::GradientStop> samples = allocate_view<graphics::GradientStop>(allocator_, kSampleCapacity);
+      if (!samples.empty()) {
+        const uint32_t n = conic_samples(g, fsqrt(mx * mx + my * my), samples.data(), kSampleCapacity);
+        if (n >= 2) {
+          samples[n - 1].offset = 1.0f;
+          conic_done = r.fill_conic_gradient(to_rect(rect), center, g.start_angle / 6.2831853f, ArrayView<const graphics::GradientStop>(samples.first(n)));
+        }
+        release_view(allocator_, samples);
+      }
+    }
+  }
+  if (conic_done) {
+    // (drawn)
+  } else if (!by_pixel) {
     ArrayView<const graphics::GradientStop> stops = unrolled_count ? ArrayView<const graphics::GradientStop>(unrolled, unrolled_count) : ArrayView<const graphics::GradientStop>(g.stops, g.stop_count);
     if (g.kind == GradientData::Radial) r.fill_radial_gradient(to_rect(rect), center, u_radii, stops);
     else r.fill_linear_gradient(to_rect(rect), u_from, u_to, stops);
@@ -584,7 +728,7 @@ void DisplayPainter::draw_gradient(graphics::IRenderer2D& r, const DisplayList& 
             t = fract((fast_atan2(px - center.x, -(py - center.y)) - g.start_angle) / 6.2831853f);
           }
           if (g.repeating) t = period > 1e-6f ? first + period * fract((t - first) / period) : last;
-          pixels.pixels()[static_cast<uint64_t>(j) * static_cast<uint32_t>(area.width) + static_cast<uint32_t>(i)] = gradient_color(g, t);
+          pixels.pixels()[static_cast<uint64_t>(j) * static_cast<uint32_t>(area.width) + static_cast<uint32_t>(i)] = gradient_color(original, t);
         }
       }
       r.draw_image(pixels.surface(), graphics::Rect2D{0, 0, static_cast<uint32_t>(area.width), static_cast<uint32_t>(area.height)}, area.x, area.y);
@@ -762,6 +906,11 @@ void DisplayPainter::draw_border(graphics::IRenderer2D& r, const Op& op, const I
       r.fill_rect(to_rect(target), g.colors[p.side]);
       continue;
     }
+    if (count == 8 && k >= 4) {   // the straight middle of a side with a pattern: rectangles, not a picture of it
+      const int side = k == 4 ? 0 : k == 5 ? 2 : k == 6 ? 3 : 1;
+      border_runs(r, g, side, p.area, rect.x, rect.y, visible);
+      continue;
+    }
     Pixmap pixels(allocator_);
     if (!pixels.create(target.width, target.height)) continue;
     for (int32_t j = 0; j < target.height; ++j)
@@ -903,12 +1052,23 @@ void DisplayPainter::draw_image_layer(graphics::IRenderer2D& r, const DisplayLis
   if (static_cast<int64_t>(ax.count) * ay.count > 16 && static_cast<int64_t>(tw) * th <= (1 << 20)) {
     // many tiles (a pattern): the picture is drawn once, and the visible part of the layer is made from copies of it
     Pixmap tile(allocator_), area(allocator_);
-    if (tile.create(tw, th) && area.create(clip.width, clip.height)) {
+    if (tile.create(tw, th)) {
       {
         graphics::SoftwareRenderer2D inner(tile.surface(), nullptr, &allocator_);
         inner.set_blend(graphics::BlendMode::Alpha);
         objects_->paint_background_image(inner, url, 0, 0, static_cast<uint32_t>(tw), static_cast<uint32_t>(th), graphics::Rect2D{0, 0, static_cast<uint32_t>(tw), static_cast<uint32_t>(th)});
       }
+      // Tiles side by side (no `space`): the renderer repeats the one tile over the area the copies cover (the GPU's sampler does it).
+      if (ax.pitch == ax.size && ay.pitch == ay.size) {
+        const IRect cells{ax.first, ay.first, ax.count * ax.size, ay.count * ay.size};
+        const IRect covered = cells.intersection(clip);
+        if (covered.empty() || r.draw_image_tiled(tile.surface(), ax.first, ay.first, static_cast<uint32_t>(ax.size), static_cast<uint32_t>(ay.size), to_rect(covered))) {
+          if (rounded) r.pop_clip();
+          return;
+        }
+      }
+    }
+    if (tile.width() > 0 && area.create(clip.width, clip.height)) {
       for (int32_t j = 0; j < ay.count; ++j) {
         for (int32_t i = 0; i < ax.count; ++i) {
           const IRect cell{ax.first + i * ax.pitch, ay.first + j * ay.pitch, ax.size, ay.size};

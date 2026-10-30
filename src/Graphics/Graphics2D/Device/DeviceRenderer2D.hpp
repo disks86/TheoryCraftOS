@@ -65,6 +65,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   const char* name() const override { return "device 2D renderer"; }
   bool accelerated() const override { return device_.info().accelerated; }
   Extent2D extent() const override { return extent_; }
+  bool gradients_as_stops() const override { return true; }
 
   void set_clip(const Rect2D& clip) override;
   void reset_clip() override;
@@ -84,6 +85,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) override;
   void draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) override;
   bool draw_image_transformed(const Surface& source, const Rect2D& source_rect, const Matrix2D& m, ImageFilter filter) override;
+  bool draw_image_tiled(const Surface& tile, int32_t origin_x, int32_t origin_y, uint32_t cell_w, uint32_t cell_h, const Rect2D& area) override;
   bool begin_group(const Rect2D& bounds) override;
   bool end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) override;
   bool supports_group_filters() const override { return filters_ok_ && groups_ok_; }
@@ -95,6 +97,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
   void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
+  bool fill_conic_gradient(const Rect2D& rect, Vec2 center, float start_turns, ArrayView<const GradientStop> samples) override;
   bool push_clip_rect(const Rect2D& rect) override;
   bool push_clip_rounded_rect(const Rect2D& rect, const CornerRadii& radii) override;
   bool push_clip_mask(const MaskView& mask, int32_t x, int32_t y) override;
@@ -155,7 +158,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   bool draw_textured_quad(IImage& image, int64_t dx, int64_t dy, uint32_t w, uint32_t h, float u0, float v0, float u1, float v1);
   // The image's (u0, v0)-(u1, v1) on the quadrilateral with corners (xs[i], ys[i]) (top left, top right, bottom right, bottom left), sampled with `filter`.
   // `scale` is not null for the composite of a group: its pipeline, and the opacity it is drawn at.
-  bool draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale = nullptr, IImage* mask = nullptr);
+  bool draw_textured_corners(IImage& image, const float xs[4], const float ys[4], float u0, float v0, float u1, float v1, Filter filter, const float* scale = nullptr, IImage* mask = nullptr, AddressMode address = AddressMode::ClampToEdge);
   // The image, origin and size of what drawing goes to now: the frame, or the innermost group.
   IImage* target_image() const;
   Extent2D target_extent() const;
