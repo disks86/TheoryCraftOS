@@ -51,6 +51,40 @@ bool IwlStationLink::send_station(const IwlStationSpec& spec, const char** error
   return true;
 }
 
+bool IwlStationLink::send_link_quality(const char** error) {
+  uint8_t indices[WifiRateScaler::kTableSize];
+  scaler_.fill_table(indices);
+  uint32_t antenna = tx_antennas_ & 7;
+  antenna = antenna & 1 ? 1 : antenna & 2 ? 2 : 4;
+  uint32_t rates[kLinkQualityTableSize];
+  for (uint32_t i = 0; i < kLinkQualityTableSize; ++i) rates[i] = WifiRateScaler::kPlcp[indices[i]] | (antenna << 14);
+  uint8_t out[kLinkQualityBytes], response[16];
+  const uint32_t n = iwl_build_link_quality(kStationId, tx_antennas_, rates, ByteView(out, sizeof out));
+  if (n == 0) return false;
+  IwlHostCommand command;
+  command.opcode = kLinkQualityCommand;
+  command.data = ConstByteView(out, n);
+  return send_command(command, ByteView(response, sizeof response), nullptr, error);
+}
+
+void IwlStationLink::service() {
+  if (!prepared_ || !rate_control_) return;
+  scaler_.tick(clock_.now_ms());
+  if (scaler_.take_changed()) {
+    lq_dirty_ = true;
+    ++rate_changes_;
+  }
+  if (!lq_dirty_) return;
+  const char* error = nullptr;
+  if (send_link_quality(&error)) {
+    lq_dirty_ = false;
+    lq_failures_ = 0;
+  } else if (++lq_failures_ >= 3) {
+    rate_control_ = false;                                       // the firmware will not take the table: back to the fixed rate
+    lq_dirty_ = false;
+  }
+}
+
 bool IwlStationLink::send_mac_context(bool associated, uint16_t association_id, const char** error) {
   IwlMacContext context;
   context.action = kCtxtActionModify;
@@ -118,6 +152,17 @@ bool IwlStationLink::prepare(const IwlFirmware& firmware, const IwlNvmData& nvm,
   for (uint32_t i = 0; i < 6; ++i) spec.address[i] = network.bssid.bytes[i];
   spec.queue_mask = 1u << kDataQueue;
   if (!send_station(spec, error)) return false;
+  // the rates: the firmware tries the entries of a table; without the command (or if it refuses) frames go out at the fixed rate
+  rate_control_ = false;
+  lq_dirty_ = false;
+  lq_failures_ = 0;
+  if (firmware.command_version_of(0, kLinkQualityCommand) != 0) {
+    scaler_.start(network.signal_percent);
+    scaler_.take_changed();
+    const char* lq_error = nullptr;
+    if (send_link_quality(&lq_error)) rate_control_ = true;
+    else if (transport_.firmware_failed()) { *error = lq_error; return false; }
+  }
   // keep the channel for the join (iwl_mvm_protect_session): a refusal does not stop the join, a failed firmware does
   {
     IwlTimeEvent event;
@@ -182,6 +227,7 @@ void IwlStationLink::teardown() {
 void IwlStationLink::release() {
   prepared_ = false;
   have_ptk_ = false;
+  rate_control_ = false;
   queue_.release();
   for (uint32_t i = 0; i < sizeof tk_; ++i) tk_[i] = 0;
 }
@@ -197,6 +243,8 @@ bool IwlStationLink::enqueue(ConstByteView header, ConstByteView body, uint16_t 
   params.data = data;
   params.association_request = association_request;
   params.tx_antennas = tx_antennas_;
+  params.station_rate = rate_control_;
+  params.data_plcp = rate_control_ ? WifiRateScaler::kPlcp[scaler_.current()] : kRatePlcp24M;
   if (protect)
     for (uint32_t i = 0; i < 16; ++i) params.tk[i] = tk_[i];
   uint8_t prefix[kTxCommandHeaderBytes + kTxParamBytes + 32];
@@ -308,6 +356,11 @@ void IwlStationLink::on_notification(const IwlRxPacket& packet) {
     IwlTxResponse response;
     if (iwl_parse_tx_response(packet.payload, &response)) {
       if (!response.success()) ++tx_failures_;
+      if (rate_control_ && response.frame_count == 1 && (response.frame_control & 0x000C) == 0x0008) {         // a data frame: how did it fare?
+        uint32_t index = WifiRateScaler::kRateCount;
+        if (!(response.initial_rate & (iwl_mvm::kRateCckV1 | (1u << 8)))) index = WifiRateScaler::index_of_plcp(static_cast<uint8_t>(response.initial_rate & 0xFF));
+        scaler_.on_result(response.success(), static_cast<uint32_t>(response.failure_frame) + 1, index, clock_.now_ms());
+      }
       queue_.reclaim_until(response.next_index);
     }
   }

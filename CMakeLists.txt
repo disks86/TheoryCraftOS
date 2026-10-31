@@ -808,6 +808,7 @@ add_executable(BOOTX64
   src/Hardware/Bluetooth/BluetoothService.cpp
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
   src/Hardware/WirelessInterface/Intel/IwlErrorLog.cpp
+  src/Hardware/WirelessInterface/RateScaler.cpp
   src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
   src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
   src/Hardware/WirelessInterface/Intel/IwlFwLoad.cpp
