@@ -53,9 +53,9 @@ struct AesTables {
 };
 constexpr AesTables kAes;
 
-constexpr uint32_t rotr32(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
-constexpr uint32_t rotl32(uint32_t x, uint32_t n) { return (x << n) | (x >> (32 - n)); }
-constexpr uint64_t rotr64(uint64_t x, uint32_t n) { return (x >> n) | (x << (64 - n)); }
+constexpr uint32_t rotr32(uint32_t x, uint32_t n) { return (x >> (n & 31)) | (x << ((32 - n) & 31)); }
+constexpr uint32_t rotl32(uint32_t x, uint32_t n) { return (x << (n & 31)) | (x >> ((32 - n) & 31)); }
+constexpr uint64_t rotr64(uint64_t x, uint32_t n) { return (x >> (n & 63)) | (x << ((64 - n) & 63)); }
 constexpr uint64_t sext32(uint32_t x) { return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(x))); }
 
 // SM4's S-box (read out of qemu through SM4KS, whose low byte is the S-box output).
@@ -206,6 +206,180 @@ bool scalar_crypto(uint32_t insn, uint64_t a, uint64_t b, uint64_t* out) {
     }
   }
   return false;
+}
+
+namespace {
+
+void aes_shift_rows(const uint8_t in[16], bool inverse, uint8_t out[16]) {
+  for (uint32_t c = 0; c < 4; ++c)
+    for (uint32_t r = 0; r < 4; ++r) out[r + 4 * c] = in[r + 4 * (inverse ? (c + 4 - r) % 4 : (c + r) % 4)];
+}
+
+void aes_mix_columns(uint8_t s[16], bool inverse) {
+  for (uint32_t c = 0; c < 4; ++c) {
+    const uint8_t s0 = s[4 * c], s1 = s[4 * c + 1], s2 = s[4 * c + 2], s3 = s[4 * c + 3];
+    if (!inverse) {
+      s[4 * c] = static_cast<uint8_t>(gmul(s0, 2) ^ gmul(s1, 3) ^ s2 ^ s3);
+      s[4 * c + 1] = static_cast<uint8_t>(s0 ^ gmul(s1, 2) ^ gmul(s2, 3) ^ s3);
+      s[4 * c + 2] = static_cast<uint8_t>(s0 ^ s1 ^ gmul(s2, 2) ^ gmul(s3, 3));
+      s[4 * c + 3] = static_cast<uint8_t>(gmul(s0, 3) ^ s1 ^ s2 ^ gmul(s3, 2));
+    } else {
+      s[4 * c] = static_cast<uint8_t>(gmul(s0, 14) ^ gmul(s1, 11) ^ gmul(s2, 13) ^ gmul(s3, 9));
+      s[4 * c + 1] = static_cast<uint8_t>(gmul(s0, 9) ^ gmul(s1, 14) ^ gmul(s2, 11) ^ gmul(s3, 13));
+      s[4 * c + 2] = static_cast<uint8_t>(gmul(s0, 13) ^ gmul(s1, 9) ^ gmul(s2, 14) ^ gmul(s3, 11));
+      s[4 * c + 3] = static_cast<uint8_t>(gmul(s0, 11) ^ gmul(s1, 13) ^ gmul(s2, 9) ^ gmul(s3, 14));
+    }
+  }
+}
+
+uint8_t rcon_for(uint32_t round) {
+  uint8_t r = 1;
+  for (uint32_t i = 1; i < round; ++i) r = xtime(r);
+  return r;
+}
+
+}  // namespace
+
+void aes_round(uint8_t state[16], const uint8_t key[16], uint32_t kind) {
+  const bool decrypt = kind == 0 || kind == 1, mix = kind == 0 || kind == 2;
+  uint8_t t[16];
+  aes_shift_rows(state, decrypt, t);
+  for (uint32_t i = 0; i < 16; ++i) t[i] = decrypt ? kAes.inv[t[i]] : kAes.sbox[t[i]];
+  if (decrypt) {      // decryption adds the round key before InvMixColumns
+    for (uint32_t i = 0; i < 16; ++i) t[i] ^= key[i];
+    if (mix) aes_mix_columns(t, true);
+  } else {
+    if (mix) aes_mix_columns(t, false);
+    for (uint32_t i = 0; i < 16; ++i) t[i] ^= key[i];
+  }
+  for (uint32_t i = 0; i < 16; ++i) state[i] = t[i];
+}
+
+void aes_key_128(const uint8_t key[16], uint32_t round, uint8_t out[16]) {
+  if (round == 0 || round > 10) round ^= 8;
+  uint8_t temp[4] = {kAes.sbox[key[13]], kAes.sbox[key[14]], kAes.sbox[key[15]], kAes.sbox[key[12]]};
+  temp[0] ^= rcon_for(round);
+  for (uint32_t i = 0; i < 4; ++i) out[i] = key[i] ^ temp[i];
+  for (uint32_t i = 4; i < 16; ++i) out[i] = key[i] ^ out[i - 4];
+}
+
+void aes_key_256(const uint8_t previous[16], const uint8_t last[16], uint32_t round, uint8_t out[16]) {
+  if (round == 0 || round > 14) round ^= 8;
+  uint8_t temp[4];
+  if (round & 1) { for (uint32_t i = 0; i < 4; ++i) temp[i] = kAes.sbox[last[12 + i]]; }
+  else {
+    temp[0] = static_cast<uint8_t>(kAes.sbox[last[13]] ^ rcon_for(round / 2));
+    temp[1] = kAes.sbox[last[14]];
+    temp[2] = kAes.sbox[last[15]];
+    temp[3] = kAes.sbox[last[12]];
+  }
+  for (uint32_t i = 0; i < 4; ++i) out[i] = previous[i] ^ temp[i];
+  for (uint32_t i = 4; i < 16; ++i) out[i] = previous[i] ^ out[i - 4];
+}
+
+namespace {
+
+uint64_t ror_w(uint64_t x, uint32_t n, uint32_t sew) {
+  const uint64_t mask = sew == 64 ? ~uint64_t{0} : 0xFFFFFFFFull;
+  x &= mask;
+  return ((x >> n) | (x << (sew - n))) & mask;
+}
+
+}  // namespace
+
+void sha2_message(uint64_t vd[4], const uint64_t vs2[4], const uint64_t vs1[4], uint32_t sew) {
+  const uint64_t mask = sew == 64 ? ~uint64_t{0} : 0xFFFFFFFFull;
+  uint64_t w[20];
+  w[0] = vd[0]; w[1] = vd[1]; w[2] = vd[2]; w[3] = vd[3];
+  w[4] = vs2[0]; w[9] = vs2[1]; w[10] = vs2[2]; w[11] = vs2[3];
+  w[12] = vs1[0]; w[13] = vs1[1]; w[14] = vs1[2]; w[15] = vs1[3];
+  auto s0 = [&](uint64_t x) { return sew == 64 ? ror_w(x, 1, 64) ^ ror_w(x, 8, 64) ^ (x >> 7) : ror_w(x, 7, 32) ^ ror_w(x, 18, 32) ^ ((x & mask) >> 3); };
+  auto s1 = [&](uint64_t x) { return sew == 64 ? ror_w(x, 19, 64) ^ ror_w(x, 61, 64) ^ (x >> 6) : ror_w(x, 17, 32) ^ ror_w(x, 19, 32) ^ ((x & mask) >> 10); };
+  for (uint32_t t = 16; t < 20; ++t) w[t] = (s1(w[t - 2]) + w[t - 7] + s0(w[t - 15]) + w[t - 16]) & mask;
+  for (uint32_t i = 0; i < 4; ++i) vd[i] = w[16 + i];
+}
+
+void sha2_rounds(uint64_t vd[4], const uint64_t vs2[4], const uint64_t vs1[4], uint32_t sew, bool high) {
+  const uint64_t mask = sew == 64 ? ~uint64_t{0} : 0xFFFFFFFFull;
+  uint64_t a = vs2[3], b = vs2[2], e = vs2[1], f = vs2[0], c = vd[3], d = vd[2], g = vd[1], h = vd[0];      // (vs2 holds {a, b, e, f} and vd {c, d, g, h}, most significant element first)
+  auto big0 = [&](uint64_t x) { return sew == 64 ? ror_w(x, 28, 64) ^ ror_w(x, 34, 64) ^ ror_w(x, 39, 64) : ror_w(x, 2, 32) ^ ror_w(x, 13, 32) ^ ror_w(x, 22, 32); };
+  auto big1 = [&](uint64_t x) { return sew == 64 ? ror_w(x, 14, 64) ^ ror_w(x, 18, 64) ^ ror_w(x, 41, 64) : ror_w(x, 6, 32) ^ ror_w(x, 11, 32) ^ ror_w(x, 25, 32); };
+  for (uint32_t r = 0; r < 2; ++r) {
+    const uint64_t wk = vs1[(high ? 2 : 0) + r];
+    const uint64_t t1 = (h + big1(e) + ((e & f) ^ (~e & g)) + wk) & mask;
+    const uint64_t t2 = (big0(a) + ((a & b) ^ (a & c) ^ (b & c))) & mask;
+    h = g; g = f; f = e; e = (d + t1) & mask; d = c; c = b; b = a; a = (t1 + t2) & mask;
+  }
+  vd[3] = a; vd[2] = b; vd[1] = e; vd[0] = f;
+}
+
+namespace {
+
+uint32_t sm4_sub(uint32_t x) {
+  uint32_t r = 0;
+  for (uint32_t i = 0; i < 4; ++i) r |= static_cast<uint32_t>(kSm4[(x >> (8 * i)) & 0xFF]) << (8 * i);
+  return r;
+}
+uint32_t bswap32(uint32_t x) { return (x >> 24) | ((x >> 8) & 0xFF00) | ((x << 8) & 0xFF0000) | (x << 24); }
+uint32_t sm3_p0(uint32_t x) { return x ^ rotl32(x, 9) ^ rotl32(x, 17); }
+uint32_t sm3_p1(uint32_t x) { return x ^ rotl32(x, 15) ^ rotl32(x, 23); }
+
+}  // namespace
+
+void sm4_keys(const uint32_t previous[4], uint32_t round, uint32_t out[4]) {
+  uint32_t k[8] = {previous[0], previous[1], previous[2], previous[3]};
+  for (uint32_t j = 0; j < 4; ++j) {
+    uint32_t ck = 0;
+    for (uint32_t b = 0; b < 4; ++b) ck |= static_cast<uint32_t>(((4 * (round & 7) + j) * 4 + b) * 7 & 0xFF) << (24 - 8 * b);
+    const uint32_t t = sm4_sub(k[j + 1] ^ k[j + 2] ^ k[j + 3] ^ ck);
+    k[j + 4] = k[j] ^ t ^ rotl32(t, 13) ^ rotl32(t, 23);
+  }
+  for (uint32_t i = 0; i < 4; ++i) out[i] = k[4 + i];
+}
+
+void sm4_rounds(const uint32_t state[4], const uint32_t keys[4], uint32_t out[4]) {
+  uint32_t x[8] = {state[0], state[1], state[2], state[3]};
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t t = sm4_sub(x[i + 1] ^ x[i + 2] ^ x[i + 3] ^ keys[i]);
+    x[i + 4] = x[i] ^ t ^ rotl32(t, 2) ^ rotl32(t, 10) ^ rotl32(t, 18) ^ rotl32(t, 24);
+  }
+  for (uint32_t i = 0; i < 4; ++i) out[i] = x[4 + i];
+}
+
+void sm3_expand(const uint32_t low[8], const uint32_t high[8], uint32_t out[8]) {
+  uint32_t w[24];
+  for (uint32_t i = 0; i < 8; ++i) { w[i] = bswap32(low[i]); w[8 + i] = bswap32(high[i]); }
+  for (uint32_t j = 16; j < 24; ++j) w[j] = sm3_p1(w[j - 16] ^ w[j - 9] ^ rotl32(w[j - 3], 15)) ^ rotl32(w[j - 13], 7) ^ w[j - 6];
+  for (uint32_t i = 0; i < 8; ++i) out[i] = bswap32(w[16 + i]);
+}
+
+void sm3_compress(const uint32_t state[8], const uint32_t message[8], uint32_t round, uint32_t out[8]) {
+  uint32_t s[8], m[8];
+  for (uint32_t i = 0; i < 8; ++i) { s[i] = bswap32(state[i]); m[i] = bswap32(message[i]); }
+  for (uint32_t r = 0; r < 2; ++r) {
+    const uint32_t j = 2 * (round & 31) + r;
+    const uint32_t w = m[r], wp = m[r] ^ m[4 + r];
+    const uint32_t a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6], h = s[7];
+    const uint32_t t = j < 16 ? 0x79CC4519u : 0x7A879D8Au;
+    const uint32_t ss1 = rotl32(rotl32(a, 12) + e + rotl32(t, j % 32), 7), ss2 = ss1 ^ rotl32(a, 12);
+    const uint32_t ff = j < 16 ? a ^ b ^ c : (a & b) | (a & c) | (b & c), gg = j < 16 ? e ^ f ^ g : (e & f) | (~e & g);
+    const uint32_t tt1 = ff + d + ss2 + wp, tt2 = gg + h + ss1 + w;
+    s[0] = tt1; s[1] = a; s[2] = rotl32(b, 9); s[3] = c; s[4] = sm3_p0(tt2); s[5] = e; s[6] = rotl32(f, 19); s[7] = g;
+  }
+  for (uint32_t i = 0; i < 8; ++i) out[i] = bswap32(s[i]);
+}
+
+void ghash_multiply(const uint8_t x[16], const uint8_t h[16], uint8_t out[16]) {
+  uint64_t vh = 0, vl = 0, zh = 0, zl = 0;
+  for (uint32_t i = 0; i < 8; ++i) { vh = (vh << 8) | h[i]; vl = (vl << 8) | h[8 + i]; }
+  for (uint32_t i = 0; i < 128; ++i) {
+    if ((x[i / 8] >> (7 - i % 8)) & 1) { zh ^= vh; zl ^= vl; }
+    const bool lsb = vl & 1;
+    vl = (vl >> 1) | (vh << 63);
+    vh >>= 1;
+    if (lsb) vh ^= 0xE100000000000000ull;
+  }
+  for (uint32_t i = 0; i < 8; ++i) { out[i] = static_cast<uint8_t>(zh >> (56 - 8 * i)); out[8 + i] = static_cast<uint8_t>(zl >> (56 - 8 * i)); }
 }
 
 }  // namespace rvcrypto

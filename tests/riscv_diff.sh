@@ -17,7 +17,7 @@ fail=0
 for mode in "${modes[@]}"; do
   for seed in $(seq 1 "$seeds"); do
     python3 tests/riscv_diff/gen.py "$mode" "$seed" "$work"
-    march=rv64gc; cpu=rv64; case $mode in vhalf) march=rv64gcv_zfh_zvfh_zfbfmin_zvfbfmin_zvfbfwma; cpu=max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true ;; vbit) march=rv64gcv_zba_zbb_zvbb_zvbc_zvkb; cpu=max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true ;; zc) march=rv64imafd_zca_zba_zbb_zcb_zcmop_zimop_zawrs_zihintntl_zicbop; cpu=max ;; amo2) march=rv64gc_zabha_zacas; cpu=max ;; crypto) march=rv64gc_zbb_zbkb_zbkx_zknd_zkne_zknh_zksed_zksh; cpu=max ;; half) march=rv64gc_zfh_zfa_zfbfmin; cpu=max ;; bit) march=rv64gc_zba_zbb_zbs_zbc_zicond; cpu=max ;; v*) march=rv64gcv_zba_zbb; cpu=max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true ;; esac
+    march=rv64gc; cpu=rv64; case $mode in vcrypto|vaes|vsha|vsm|vgh) march=rv64gcv_zvkn_zvks_zvkg_zvkt_zvknhb; cpu=max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true ;; vhalf) march=rv64gcv_zfh_zvfh_zfbfmin_zvfbfmin_zvfbfwma; cpu=max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true ;; vbit) march=rv64gcv_zba_zbb_zvbb_zvbc_zvkb; cpu=max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true ;; zc) march=rv64imafd_zca_zba_zbb_zcb_zcmop_zimop_zawrs_zihintntl_zicbop; cpu=max ;; amo2) march=rv64gc_zabha_zacas; cpu=max ;; crypto) march=rv64gc_zbb_zbkb_zbkx_zknd_zkne_zknh_zksed_zksh; cpu=max ;; half) march=rv64gc_zfh_zfa_zfbfmin; cpu=max ;; bit) march=rv64gc_zba_zbb_zbs_zbc_zicond; cpu=max ;; v*) march=rv64gcv_zba_zbb; cpu=max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true ;; esac
     clang --target=riscv64-linux-gnu -march=$march -mabi=lp64d -c "$work/t.s" -o "$work/t.o"
     "$lld" -static -nostdlib -e _start "$work/t.o" -o "$work/t.elf"
     qemu-riscv64 -cpu $cpu "$work/t.elf" > "$work/q.bin"

@@ -693,6 +693,7 @@ add_executable(BOOTX64
   src/Emulation/RiscV64Vector.cpp
   src/Emulation/RiscV64VectorInt.cpp
   src/Emulation/RiscV64VectorBits.cpp
+  src/Emulation/RiscV64VectorCrypto.cpp
   src/Emulation/RiscV64VectorFp.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp

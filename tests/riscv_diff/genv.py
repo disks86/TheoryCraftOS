@@ -396,3 +396,40 @@ def bit_case():
     vd, vs2, _ = groups(3, [r, r, r])
     if random.random() < 0.2: vd = vs2
     return f'{pre}\n {random.choice(["vbrev8", "vrev8", "vbrev", "vclz", "vctz", "vcpop"])}.v v{vd}, v{vs2}{m}'
+
+
+def crypto_case(kinds=None):
+    """Zvkned, Zvknh, Zvksed, Zvksh, Zvkg: SEW 32 (64 for SHA-512), vl a multiple of the element group size"""
+    kind = random.choice(kinds or ['aes', 'aes', 'aeskf', 'sha2', 'sm4', 'sm3', 'ghash'])
+    sew = 64 if (kind == 'sha2' and random.random() < 0.5) else 32
+    cfg = Cfg(sew=sew, max_lmul=8)
+    egs = 4 if kind != 'sm3' else 8
+    if cfg.vlmax < egs or cfg.num < cfg.den: return None
+    vl = random.choice([egs, cfg.vlmax // egs * egs, random.randrange(1, cfg.vlmax // egs + 1) * egs])
+    if vl == 0: return None
+    r = cfg.regs
+    pre = f'li x29, {vl}\n vsetvli x28, x29, {cfg.vtype()}'
+    vd, vs2, vs1 = groups(3, [r, r, r])
+    vs2s = random.randrange(8, 32)      # a single register (the .vs forms)
+    if kind == 'aes':
+        op = random.choice(['vaesdf', 'vaesdm', 'vaesef', 'vaesem'])
+        if random.random() < 0.5: return f'{pre}\n {op}.vv v{vd}, v{vs2}'
+        while vd <= vs2s < vd + r: vs2s = random.randrange(8, 32)
+        if random.random() < 0.2: return f'{pre}\n vaesz.vs v{vd}, v{vs2s}'
+        return f'{pre}\n {op}.vs v{vd}, v{vs2s}'
+    if kind == 'aeskf':
+        if random.random() < 0.5: return f'{pre}\n vaeskf1.vi v{vd}, v{vs2}, {random.randrange(0, 16)}'
+        return f'{pre}\n vaeskf2.vi v{vd}, v{vs2}, {random.randrange(0, 16)}'
+    if kind == 'sha2':
+        return f'{pre}\n {random.choice(["vsha2ms", "vsha2ch", "vsha2cl"])}.vv v{vd}, v{vs2}, v{vs1}'
+    if kind == 'sm4':
+        c = random.randrange(0, 3)
+        if c == 0: return f'{pre}\n vsm4k.vi v{vd}, v{vs2}, {random.randrange(0, 8)}'
+        if c == 1: return f'{pre}\n vsm4r.vv v{vd}, v{vs2}'
+        while vd <= vs2s < vd + r: vs2s = random.randrange(8, 32)
+        return f'{pre}\n vsm4r.vs v{vd}, v{vs2s}'
+    if kind == 'sm3':
+        if random.random() < 0.5: return f'{pre}\n vsm3me.vv v{vd}, v{vs2}, v{vs1}'
+        return f'{pre}\n vsm3c.vi v{vd}, v{vs2}, {random.randrange(0, 32)}'
+    if random.random() < 0.7: return f'{pre}\n vghsh.vv v{vd}, v{vs2}, v{vs1}'
+    return f'{pre}\n vgmul.vv v{vd}, v{vs2}'

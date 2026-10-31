@@ -347,12 +347,12 @@ elif mode == 'comp':
         elif k == 28: add('c.nop\n c.nop')
         else: add(f'c.mv {d}, {s}\n c.add {d}, {d}')
 
-elif mode in ('vint', 'vmem', 'vfp', 'vbit', 'vhalf'):
+elif mode in ('vint', 'vmem', 'vfp', 'vbit', 'vhalf', 'vcrypto', 'vaes', 'vsha', 'vsm', 'vgh'):
     import os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import genv
     genv.HALF = mode == 'vhalf'
-    gen = {'vint': genv.int_case, 'vmem': genv.mem_case, 'vfp': genv.fp_case, 'vbit': genv.bit_case, 'vhalf': genv.fp_case}[mode]
+    gen = {'vint': genv.int_case, 'vmem': genv.mem_case, 'vfp': genv.fp_case, 'vbit': genv.bit_case, 'vhalf': genv.fp_case, 'vcrypto': genv.crypto_case, 'vaes': lambda: genv.crypto_case(['aes', 'aeskf']), 'vsha': lambda: genv.crypto_case(['sha2']), 'vsm': lambda: genv.crypto_case(['sm4', 'sm3']), 'vgh': lambda: genv.crypto_case(['ghash'])}[mode]
     while len(cases) < (5000 if mode in ('vfp', 'vhalf') else 4000):
         c = gen()
         if c: add(c)

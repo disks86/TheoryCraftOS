@@ -17,6 +17,7 @@
  */
 #include "Emulation/RiscV64Cpu.hpp"
 #include "Emulation/RiscV64Crypto.hpp"
+#include "Emulation/RiscV64VectorUnit.hpp"
 #include "Emulation/Wide.hpp"
 
 namespace emulation {
@@ -594,6 +595,13 @@ RiscV64Cpu::Step RiscV64Cpu::execute(GuestMemory& m, uint32_t insn, uint32_t len
         if (r == Step::Syscall) s_.pc = next;      // (the call returns after the ecall)
         return r;
       }
+      break;
+    }
+    case 0x77: {      // OP-VE: the vector cryptography extensions
+      VectorUnit u(*this, m, insn);
+      if (!u.prepare()) return undefined();
+      const Step r = u.crypto();
+      if (r != Step::Ok) return r;
       break;
     }
     case kLoadFp: case kStoreFp:
