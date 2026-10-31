@@ -239,8 +239,21 @@ void show_level(Desktop& d, uint32_t* toast, StringView title, uint32_t percent)
 }
 }  // namespace
 
+void Desktop::set_display_blanked(bool blanked) {
+  if (!backlight_) return;
+  if (blanked && !blanked_) {
+    uint8_t now = 50;
+    backlight_->percent(&now);
+    level_before_blank_ = now;
+    if (backlight_->set_percent(0)) blanked_ = true;
+  } else if (!blanked && blanked_) {
+    blanked_ = false;
+    backlight_->set_percent(level_before_blank_);
+  }
+}
+
 bool Desktop::adjust_brightness(int delta_percent) {
-  if (!backlight_) return false;
+  if (!backlight_ || blanked_) return false;
   uint8_t now = 50;
   backlight_->percent(&now);
   int next = static_cast<int>(now) + delta_percent;

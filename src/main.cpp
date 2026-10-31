@@ -94,6 +94,7 @@
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
 #include "Hardware/Power/PowerManager.hpp"
+#include "Hardware/Tpm/TpmDriver.hpp"
 #include "Hardware/Power/Thermal.hpp"
 #include "Hardware/Bus/Ish/IshDriver.hpp"
 #include "Hardware/Pen/PenMouse.hpp"
@@ -1211,11 +1212,35 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // Network shares (SMB, NFS, SFTP, FTPS): folders of the explorer's tree whose contents are the shares of the servers the user goes to.
     TimingEntropy timing_entropy;
     crypto::CpuEntropySource cpu_entropy;
+    crypto::IEntropySource* tpm_entropy_source = nullptr;      // the TPM's generator, where the system has a TPM and was built to use it
+    uint8_t tpm_seed[32] = {};
+    bool have_tpm_seed = false;
+#ifdef TCOS_TPM
+    hardware::TpmDriver tpm(shared_allocator);
+    UniquePointer<hardware::TpmEntropySource> tpm_entropy;
+    if (paging_ok) {
+      hardware::AcpiTables tpm_tables(st);
+      const ConstByteView table = tpm_tables.initialize() ? tpm_tables.find("TPM2") : ConstByteView();
+      const hardware::TpmDriver::Outcome outcome = tpm.start(table, register_mapper);
+      Entry(outcome == hardware::TpmDriver::Outcome::Started ? Level::Ok : Level::Info, "TPM").text(outcome == hardware::TpmDriver::Outcome::Started ? tpm.device()->transport_name() : "").text(outcome == hardware::TpmDriver::Outcome::Started ? ": started" : hardware::TpmDriver::outcome_name(outcome));
+      if (outcome == hardware::TpmDriver::Outcome::Started) {
+        uint32_t manufacturer = 0, firmware = 0;
+        if (tpm.device()->property(hardware::tpm::kPtManufacturer, &manufacturer) && tpm.device()->property(hardware::tpm::kPtFirmwareVersion1, &firmware)) {
+          char vendor[5] = {static_cast<char>(manufacturer >> 24), static_cast<char>(manufacturer >> 16), static_cast<char>(manufacturer >> 8), static_cast<char>(manufacturer), 0};
+          for (char& c : vendor) if (c && (c < 0x20 || c > 0x7E)) c = '?';
+          Entry(Level::Info, "TPM").text("manufacturer ").text(vendor).text(", firmware ").dec(firmware >> 16).text(".").dec(firmware & 0xFFFF);
+        }
+        have_tpm_seed = tpm.device()->get_random(ByteView(tpm_seed, sizeof tpm_seed));
+        tpm_entropy = UniquePointer<hardware::TpmEntropySource>::make(shared_allocator, *tpm.device());
+        if (tpm_entropy) tpm_entropy_source = tpm_entropy.get();
+      }
+    }
+#endif
     crypto::IEntropySource& smb_entropy = crypto::CpuEntropySource::available() ? static_cast<crypto::IEntropySource&>(cpu_entropy)
-        : guest.entropy() ? *guest.entropy() : static_cast<crypto::IEntropySource&>(timing_entropy);
+        : guest.entropy() ? *guest.entropy() : tpm_entropy_source ? *tpm_entropy_source : static_cast<crypto::IEntropySource&>(timing_entropy);
     crypto::DrbgRandom smb_random(smb_entropy);
     crypto::DrbgRandom web_random(smb_entropy);   // crypto.getRandomValues() and the keys web pages make
-    if (web_random.initialize()) browser::set_system_random(&web_random);
+    if (web_random.initialize(ConstByteView(tpm_seed, have_tpm_seed ? sizeof tpm_seed : 0))) browser::set_system_random(&web_random);   // (the TPM's bytes are added to the seed)
     network::StackSetNetwork smb_network(stacks);
     // Databases (PostgreSQL) for the programs that want them, reached over the same interfaces. TLS needs a trust store, which this system does not ship:
     // connections are plain until one is given (SystemDatabases::transport().set_tls()).
@@ -2046,6 +2071,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           acpi_seen.lid_closed = acpi_buttons.lid_closed;
           acpi_seen.lid_opened = acpi_buttons.lid_opened;
           Entry(Level::Info, "ACPI").text(closed ? "lid closed" : "lid opened");
+          desktop.set_display_blanked(closed);                       // (the backlight goes out with the lid)
           desktop.notify(StringView("Lid"), StringView(closed ? "The lid was closed" : "The lid was opened"), gui::NoticeKind::Information);
         }
       }
