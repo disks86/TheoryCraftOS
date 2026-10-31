@@ -88,6 +88,7 @@ class ShaderObject {
   bool fragment_stores_ = false;             // a pixel shader that writes them
   bool vertex_stores_ = false;               // ... or a vertex shader
   bool geometry_stores_ = false;             // ... or a geometry shader
+  bool tessellation_stores_ = false;         // ... or a hull or domain shader
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;   // a geometry shader's input
   uint32_t geometry_streams_ = 1;                          // ... and how many output streams it has
   uint32_t tess_input_points_ = 0, tess_output_points_ = 0;   // a hull or domain shader's control points
@@ -118,7 +119,7 @@ class PipelineObject {
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   uint32_t storage_mask() const { return storage_mask_; }
-  bool writes_storage() const { return fragment_stores_ || vertex_stores_ || geometry_stores_; }   // a shader of the pipeline writes buffers
+  bool writes_storage() const { return fragment_stores_ || vertex_stores_ || geometry_stores_ || tessellation_stores_; }   // a shader of the pipeline writes buffers
   bool has_per_instance() const { return per_instance_; }
   // Stream output: which buffers (bit n: buffer n) the pipeline's declaration writes to, and whether it has one.
   uint32_t stream_output_buffers() const { return stream_output_buffers_; }
@@ -139,7 +140,7 @@ class PipelineObject {
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   uint32_t thread_group_[3] = {1, 1, 1};
   uint32_t storage_mask_ = 0;
-  bool fragment_stores_ = false, vertex_stores_ = false, geometry_stores_ = false;
+  bool fragment_stores_ = false, vertex_stores_ = false, geometry_stores_ = false, tessellation_stores_ = false;
   SharedPointer<ShaderObject> vertex_, fragment_;   // (kept alive for as long as the pipeline is)
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};
   uint32_t stride_ = 0, attribute_count_ = 0, texture_count_ = 0, color_target_count_ = 1;

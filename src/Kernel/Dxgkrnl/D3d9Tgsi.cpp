@@ -1782,6 +1782,12 @@ NtStatus TgsiEmitter::run(String* out) {
       line("ENDIF");
     }
     first = p_.hs_cp_end_;
+    // The patch constant phase belongs to the patch, not to the control points: the host runs the shader once for each output control point, and a write to a buffer would happen once for each, so
+    // only the first invocation takes it (and writes the factors).
+    const String test = temp(kWork3, ".x"), id = [&] { String s = str(); add(s, "SV[0].xxxx"); return s; }(), number = [&] { String s = str(); add(s, "IMM["); add_uint(s, imm4_bits(0, 0, 0, 0)); add(s, "].xxxx"); return s; }();
+    line("USEQ", &test, &id, &number);
+    const String cond = temp(kWork3, ".xxxx");
+    line("UIF", &cond);
   }
   for (uint64_t i = first; i < code_count && !oom_ && !unsupported_; ++i) {
     instruction(code[i]);
@@ -1821,6 +1827,7 @@ NtStatus TgsiEmitter::run(String* out) {
       for (uint32_t k = 0; k < 2; ++k)
         if (p_.inner_factor_reg_[k] >= 0) write_factor("OUT[6].", k, static_cast<uint32_t>(p_.inner_factor_reg_[k]), pow2);
       (void)tess_outer, (void)tess_inner;
+      line("ENDIF");
     } else if (geometry_) {
       // (the vertices were written out by the emits)
     } else {

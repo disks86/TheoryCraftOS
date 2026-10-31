@@ -802,7 +802,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
         const uint32_t stride = structured_decl ? p.le32() : 0;
-        if ((!compute && !srv && !pixel && !vertex && !geometry) || !p.ok() || o.type != (srv ? kOpResource : kOpUav) || o.dims != 1 || o.index[0] >= (srv ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
+        if ((!compute && !srv && !pixel && !vertex && !geometry && !hull && !domain) || !p.ok() || o.type != (srv ? kOpResource : kOpUav) || o.dims != 1 || o.index[0] >= (srv ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
         const uint32_t slot = srv ? graphics::kMaxUavBuffers + o.index[0] : o.index[0];
         if (program->uav_kind_[slot] != D3d9Program::BufferKind::None) return status::kNotSupported;
         if (structured_decl && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
@@ -811,7 +811,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (!compute) program->uses_graphics_storage_ = program->uses_system_values_ = true;
         if (pixel && !srv) program->uses_fragment_stores_ = true;
         if (vertex && !srv) program->uses_vertex_stores_ = true;
-        if (geometry && !srv) program->uses_geometry_stores_ = true;   // (a view of a buffer in a vertex or pixel shader: the function that takes the context, and a device that binds them in draws)
+        if (geometry && !srv) program->uses_geometry_stores_ = true;
+        if ((hull || domain) && !srv) program->uses_tessellation_stores_ = true;   // (a view of a buffer in a vertex or pixel shader: the function that takes the context, and a device that binds them in draws)
         continue;
       }
       default: break;
@@ -987,7 +988,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
       program->uses_textures_ = true;
       program->uses_texel_access_ = true;
-    } else if ((compute || pixel || vertex || geometry || opcode == kLdRaw4 || opcode == kLdStructured4) && ((opcode >= 165 && opcode <= 168) || (opcode >= 169 && opcode <= 177 && opcode != 172) || (opcode >= 180 && opcode <= 189 && opcode != 185))) {
+    } else if ((compute || pixel || vertex || geometry || hull || domain || opcode == kLdRaw4 || opcode == kLdStructured4) && ((opcode >= 165 && opcode <= 168) || (opcode >= 169 && opcode <= 177 && opcode != 172) || (opcode >= 180 && opcode <= 189 && opcode != 185))) {
       // Storage buffers: ld_raw / ld_structured (dst, address, [offset,] u#), store_raw / store_structured (u#.mask, address, [offset,] value), the atomics (u#, address, value) and the
       // immediate ones that return the old value (dst, u#, address, value).
       const bool load = opcode == kLdRaw4 || opcode == kLdStructured4, store = opcode == kStoreRaw4 || opcode == kStoreStructured4;
@@ -1007,7 +1008,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
       const bool group_shared = uav.type == kOpTgsm;
       const bool read_only_view = uav.type == kOpResource && load;   // (t#: a load only)
-      if (!compute && !pixel && !vertex && !geometry && !read_only_view) return status::kNotSupported;   // (outside compute, vertex, geometry and pixel shaders only the views are read)
+      if (!compute && !pixel && !vertex && !geometry && !hull && !domain && !read_only_view) return status::kNotSupported;
       if (!compute && uav.type == kOpTgsm) return status::kNotSupported;       // (group-shared memory is a compute shader's)
       if ((uav.type != kOpUav && !group_shared && !read_only_view) || uav.dims != 1 || uav.index[0] >= (group_shared ? graphics::kMaxSharedMemories : read_only_view ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers))
         return status::kNotSupported;

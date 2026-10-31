@@ -128,7 +128,7 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }  // namespace
 
 uint32_t D3d9Program::required_features() const {
-  uint32_t kinds = (uses_fragment_stores_ ? graphics::kFeatureFragmentStores : 0u) | (uses_vertex_stores_ ? graphics::kFeatureVertexStores : 0u) | (uses_geometry_stores_ ? graphics::kFeatureGeometryStores : 0u);
+  uint32_t kinds = (uses_fragment_stores_ ? graphics::kFeatureFragmentStores : 0u) | (uses_vertex_stores_ ? graphics::kFeatureVertexStores : 0u) | (uses_geometry_stores_ ? graphics::kFeatureGeometryStores : 0u) | (uses_tessellation_stores_ ? graphics::kFeatureTessellationStores : 0u);
   for (graphics::TextureKind k : texture_kind_)
     if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
   if (stage_ == graphics::ShaderStage::Compute) kinds |= graphics::kFeatureCompute;
