@@ -814,6 +814,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         else return status::kInvalidParameter;
         continue;
       }
+      if (open_ifs.count() || loops.count()) {
+        // (a return in the middle of the program: it ends the run there)
+        Instr early;
+        early.op = kRetEarly;
+        s = emit(early);
+        if (s != status::kSuccess) return s;
+        continue;
+      }
       returned = true;
       continue;
     }

@@ -209,6 +209,10 @@ class Translator {
   // --- the walk over the blocks (twice: once to find what lives how long, once to emit)
   bool region(uint32_t start, uint32_t stop, uint32_t pred);
   bool visit_block(uint32_t block);
+  bool is_return_block(uint32_t block) const;
+  bool returns_directly(uint32_t block) const;   // ... or one that jumps to one
+  uint32_t loop_exit_of(uint32_t header, uint32_t latch) const;
+  bool inline_return(uint32_t block, uint32_t pred);
   bool analyze(const Instruction& ins);
   bool translate(const Instruction& ins);
   bool phi_moves(uint32_t pred, uint32_t target);
@@ -731,6 +735,61 @@ uint32_t Translator::find_merge_of(const uint32_t* targets, uint32_t count) {
   return kNone;
 }
 
+// A block that ends the function.
+bool Translator::is_return_block(uint32_t b) const {
+  if (b >= f_.block_count) return false;
+  const Block& blk = block_at(b);
+  return blk.count != 0 && instruction_at(blk.first + blk.count - 1).op == Op::Ret;
+}
+
+// A block that ends the function, or that only jumps to one.
+bool Translator::returns_directly(uint32_t b) const {
+  if (is_return_block(b)) return true;
+  if (b >= f_.block_count) return false;
+  const Instruction& t = terminator(b);
+  return t.op == Op::Br && is_return_block(t.blocks[0]);
+}
+
+// The block a loop leaves to when it is not returning: the other way out of its latch, or else the first block past it that a block of the loop jumps to and that does not end the function.
+uint32_t Translator::loop_exit_of(uint32_t header, uint32_t latch) const {
+  const Instruction& t = terminator(latch);
+  if (t.op == Op::CondBr) {
+    if (t.blocks[0] == header) return t.blocks[1] > latch ? t.blocks[1] : kNone;
+    if (t.blocks[1] == header) return t.blocks[0] > latch ? t.blocks[0] : kNone;
+  }
+  uint32_t first_return = kNone;
+  for (uint32_t x = header; x <= latch && x < f_.block_count; ++x) {
+    uint32_t next[kMaxSuccessors], successors = 0;
+    successors_of(x, next, &successors);
+    for (uint32_t k = 0; k < successors; ++k) {
+      if (next[k] <= latch) continue;
+      if (!is_return_block(next[k])) return next[k];
+      if (first_return == kNone) first_return = next[k];
+    }
+  }
+  return first_return;
+}
+
+// A jump to a block that ends the function, from inside a loop: the moves into its phis, then the block itself, return included.
+bool Translator::inline_return(uint32_t b, uint32_t pred) {
+  if (!phi_moves(pred, b)) return false;
+  const Block& blk = block_at(b);
+  for (uint32_t i = 0; i + 1 < blk.count; ++i) {
+    const Instruction& ins = instruction_at(blk.first + i);
+    if (ins.op == Op::Phi) continue;
+    if (!(dry_ ? analyze(ins) : translate(ins)) || status_ != status::kSuccess) return false;
+    ++pos_;
+  }
+  const Instruction& t = terminator(b);
+  if (dry_) {
+    if (t.operands[0] != 0) note_use(t.operands[0], pos_);
+  } else {
+    finish(begin(62));   // ret
+  }
+  ++pos_;
+  return true;
+}
+
 bool Translator::visit_block(uint32_t b) {
   if (b >= f_.block_count || ++steps_ > 200000) return error(status::kNotSupported);
   if (visited_marks_[b]) return error(status::kNotSupported);
@@ -788,7 +847,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     if (b >= f_.block_count) return error(status::kInvalidParameter);
     if (latch_of_[b] != kNone && !(loops_.count() && loops_[loops_.count() - 1].header == b)) {
       // a loop begins: the moves into its phis were made on the edge that came here
-      if (loops_.count() >= 4 || !loops_.push_back({b, latch_of_[b], kNone, depth_, pos_})) return error(status::kNotSupported);
+      if (loops_.count() >= 4 || !loops_.push_back({b, latch_of_[b], loop_exit_of(b, latch_of_[b]), depth_, pos_})) return error(status::kNotSupported);
       simple(48);   // loop
       ++pos_;
     }
@@ -805,10 +864,9 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
       return true;
     };
     if (t.op == Op::Ret) {
-      if (loop_i >= 0) return error(status::kNotSupported);   // (a return inside a loop)
       if (dry_) {
         if (t.operands[0] != 0) note_use(t.operands[0], pos_);
-      } else if (if_depth_ == 0) {
+      } else if (if_depth_ == 0 || loop_i >= 0) {   // (inside a loop an arm that returns must really return: the loop goes on after it)
         finish(begin(62));   // (a return in an arm just ends the arm: nothing follows the join of an if whose other arm goes on)
       }
       ++pos_;
@@ -825,6 +883,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
         if (done) return true;
         continue;
       }
+      if (is_return_block(target)) return inline_return(target, b);   // a jump to a block that ends the function (numbered anywhere)
       if (loop_i >= 0 && target > top().latch) {   // a break
         if (top().exit != kNone && top().exit != target) return error(status::kNotSupported);
         top().exit = target;
@@ -843,6 +902,24 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     if (t.op != Op::CondBr) return error(status::kNotSupported);
     const uint32_t tb = t.blocks[0], fb = t.blocks[1];
     if (tb == fb) return error(status::kNotSupported);
+    const bool t_leaves = returns_directly(tb) && !(loop_i >= 0 && tb == top().exit), f_leaves = returns_directly(fb) && !(loop_i >= 0 && fb == top().exit);
+    if (t_leaves != f_leaves || (t_leaves && is_return_block(tb) != is_return_block(fb))) {   // one way returns (a block that ends the function, or jumps to one, wherever it is numbered): the other is what follows
+      const bool t_returns = t_leaves && f_leaves ? is_return_block(tb) : t_leaves;
+      const uint32_t returns = t_returns ? tb : fb, goes_on = t_returns ? fb : tb;
+      if (goes_on <= b) return error(status::kNotSupported);
+      condition(t.operands[0], t_returns);
+      if (is_return_block(returns)) {
+        if (!inline_return(returns, b)) return false;
+      } else if (!region(returns, kNone, b)) {   // (an arm that does something first and then jumps to the block that returns)
+        return false;
+      }
+      end_if();
+      if (!phi_moves(b, goes_on)) return false;
+      if (goes_on == stop) return true;
+      if (stop != kNone && goes_on > stop) return error(status::kNotSupported);
+      b = goes_on;
+      continue;
+    }
     if (loop_i >= 0) {
       const bool t_back = tb == top().header, f_back = fb == top().header, t_out = tb > top().latch, f_out = fb > top().latch;
       if (t_back || f_back) {   // the latch: one way back to the top, the other out
@@ -862,7 +939,33 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
         if (done) return true;
         continue;
       }
-      if (t_out && f_out) return error(status::kNotSupported);
+      if (t_out && f_out) {   // both ways leave: one of them returns
+        const bool t_returns = tb != top().exit && is_return_block(tb), f_returns = fb != top().exit && is_return_block(fb);
+        if (t_returns == f_returns) return error(status::kNotSupported);
+        const uint32_t returns = t_returns ? tb : fb, leaves = t_returns ? fb : tb;
+        condition(t.operands[0], t_returns);
+        if (!inline_return(returns, b)) return false;
+        simple(18);   // else
+        if (!phi_moves(b, leaves)) return false;
+        if (top().exit != kNone && top().exit != leaves) return error(status::kNotSupported);
+        top().exit = leaves;
+        simple(2);    // break
+        end_if();
+        return true;
+      }
+      if ((t_out && tb != top().exit && is_return_block(tb)) || (f_out && fb != top().exit && is_return_block(fb))) {   // one way returns, the other goes on in the loop
+        const bool t_returns = t_out;
+        const uint32_t returns = t_returns ? tb : fb, in = t_returns ? fb : tb;
+        if (in <= b) return error(status::kNotSupported);
+        condition(t.operands[0], t_returns);
+        if (!inline_return(returns, b)) return false;
+        end_if();
+        if (!phi_moves(b, in)) return false;
+        if (in == stop) return true;
+        if (stop != kNone && in > stop) return error(status::kNotSupported);
+        b = in;
+        continue;
+      }
       if (t_out || f_out) {     // one way leaves the loop: a conditional break, then the loop goes on
         const uint32_t out = t_out ? tb : fb, in = t_out ? fb : tb;
         if (in <= b || (top().exit != kNone && top().exit != out)) return error(status::kNotSupported);
@@ -2758,7 +2861,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     uint32_t next[kMaxSuccessors], count = 0;
     successors_of(x, next, &count);
     for (uint32_t k = 0; k < count; ++k)
-      if (next[k] <= x && next[k] < f_.block_count && (latch_of_[next[k]] == kNone || latch_of_[next[k]] < x)) latch_of_[next[k]] = x;
+      if (next[k] <= x && next[k] < f_.block_count && !is_return_block(next[k]) && (latch_of_[next[k]] == kNone || latch_of_[next[k]] < x)) latch_of_[next[k]] = x;
   }
   for (uint64_t i = 0; i < values; ++i)
     if (!def_pos_.push_back(-1)) return status::kNoMemory;

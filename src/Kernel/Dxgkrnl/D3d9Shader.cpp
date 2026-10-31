@@ -652,6 +652,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           return;
         }
         break;
+      case kRetEarly: return;
       case kDdx: case kDdy: case kDdxCoarse: case kDdyCoarse: {
         if (s.capture_at == pc - 1) {
           s.captured = a;
@@ -1005,7 +1006,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
           const float reference = fetch(ins.src[2], 0).f[0];
           const float px = a.f[0] * static_cast<float>(w) - 0.5f, py = a.f[1] * static_cast<float>(h) - 0.5f;
-          const float x = __builtin_floorf(px), y = __builtin_floorf(py), fx = px - x, fy = py - y;
+          const float x = floor_(px), y = floor_(py), fx = px - x, fy = py - y;
           float pass[2][2];   // [row][column]
           for (uint32_t row = 0; row < 2; ++row)
             for (uint32_t col = 0; col < 2; ++col) {
@@ -1026,7 +1027,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         const uint32_t unit = ins.src[1].number;
         uint32_t w = 0, h = 0, levels = 0;
         if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
-          const float x = __builtin_floorf(a.f[0] * static_cast<float>(w) - 0.5f), y = __builtin_floorf(a.f[1] * static_cast<float>(h) - 0.5f);
+          const float x = floor_(a.f[0] * static_cast<float>(w) - 0.5f), y = floor_(a.f[1] * static_cast<float>(h) - 0.5f);
           const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
           for (uint32_t k = 0; k < 4; ++k) {
             const graphics::Vec4 t = s.textures->sample_lod(unit, (xs[k] + 0.5f) / static_cast<float>(w), (ys[k] + 0.5f) / static_cast<float>(h), 0.0f);

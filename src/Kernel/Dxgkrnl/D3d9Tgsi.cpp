@@ -245,6 +245,7 @@ class TgsiEmitter {
   allocators::IAllocator& a_;
   String body_;
   List<Imm> imms_;
+  void write_outputs();   // the shadows of the outputs to the outputs (before the END, and before a return in the middle)
   bool force_integer_ = false;   // the instruction being emitted reads its literals as integers
   uint32_t inst_ = 0;
   bool oom_ = false, unsupported_ = false;
@@ -545,6 +546,14 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("UIF", &test);
       return true;
     }
+    case kRetEarly:
+      if (hull_ || geometry_ || compute_) {
+        unsupported_ = true;
+        return true;
+      }
+      write_outputs();
+      line("RET");
+      return true;
     case kDiscardNz: case kDiscardZ: {
       const String test = zero_test(ins.src[0], op == kDiscardZ);
       line("UIF", &test);
@@ -1447,6 +1456,36 @@ void TgsiEmitter::assemble(String* out) {
   add(*out, body_.view());
 }
 
+void TgsiEmitter::write_outputs() {
+if (vertex_ || domain_) {
+    const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+    const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
+    String o = str();
+    add(o, "OUT[0]");
+    line("MUL", &o, &pos, &factor);
+    String upright = str();
+    add(upright, "OUT[5]");
+    line("MOV", &upright, &pos);
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      String target = str();
+      add(target, "OUT[");
+      add_uint(target, i + 1);
+      add(target, "]");
+      const String v = temp(kVarying + i);
+      line("MOV", &target, &v);
+    }
+} else if (!compute_) {
+    for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
+      String o = str();
+      add(o, "OUT[");
+      add_uint(o, i);
+      add(o, "]");
+      const String c = temp(color_register(i));
+      line("MOV", &o, &c);
+    }
+  }
+}
+
 NtStatus TgsiEmitter::run(String* out) {
   vertex_ = p_.stage_ == graphics::ShaderStage::Vertex;
   compute_ = p_.stage_ == graphics::ShaderStage::Compute;
@@ -1661,32 +1700,8 @@ NtStatus TgsiEmitter::run(String* out) {
       (void)tess_outer, (void)tess_inner;
     } else if (geometry_) {
       // (the vertices were written out by the emits)
-    } else if (vertex_ || domain_) {
-      const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
-      const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
-      String o = str();
-      add(o, "OUT[0]");
-      line("MUL", &o, &pos, &factor);
-      String upright = str();
-      add(upright, "OUT[5]");
-      line("MOV", &upright, &pos);
-      for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
-        String target = str();
-        add(target, "OUT[");
-        add_uint(target, i + 1);
-        add(target, "]");
-        const String v = temp(kVarying + i);
-        line("MOV", &target, &v);
-      }
-    } else if (!compute_) {
-      for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
-        String o = str();
-        add(o, "OUT[");
-        add_uint(o, i);
-        add(o, "]");
-        const String c = temp(color_register(i));
-        line("MOV", &o, &c);
-      }
+    } else {
+      write_outputs();
     }
     add(body_, "  ");
     add_uint(body_, inst_++);

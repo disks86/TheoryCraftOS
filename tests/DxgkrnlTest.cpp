@@ -5580,6 +5580,64 @@ void test_dxil() {
       }
     }
   }
+  // Returns from inside a loop.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_retloop.dxil", &translated));
+    if (translated) {
+      unsigned inside = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(-1.5f, 1), 0, 0, 0};
+        varyings[2] = {random(0, 1), 0, 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        float acc = 0, want[4] = {0, -1, 0, 1};
+        bool done = false;
+        for (int i = 0; i < 8 && !done; ++i) {
+          acc += varyings[0].x + 0.1f;
+          if (acc > varyings[2].x * 4.0f) want[0] = acc, want[1] = static_cast<float>(i), want[2] = 1, want[3] = 1, done = true, ++inside;
+          else if (acc < -2.0f) want[0] = 0, want[1] = 0, want[2] = acc, want[3] = 0.5f, done = true, ++inside;
+        }
+        if (!done) want[0] = acc;
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  retloop #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+      CHECK(inside > 100 && inside < 300);
+    }
+  }
+  { UniquePointer<D3d9Program> shown; CHECK(load("dxil_ps_retloop_show.dxil", &shown)); }
+  // Returns from inside a real loop (a trip count that is not a constant).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_retloop2.dxil", &translated));
+    if (translated) {
+      unsigned inside = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(-1.5f, 1), 0, 0, 0};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        float acc = 0, want[4] = {0, -1, 0, 1};
+        bool done = false;
+        const int trips = static_cast<int>(varyings[2].y * 8.0f) + 1;
+        for (int i = 0; i < trips && !done; ++i) {
+          acc += varyings[0].x + 0.1f;
+          if (acc > varyings[2].x * 4.0f) want[0] = acc, want[1] = static_cast<float>(i), want[2] = 1, want[3] = 1, done = true, ++inside;
+          else if (acc < -2.0f) want[0] = 0, want[1] = 0, want[2] = acc, want[3] = 0.5f, done = true, ++inside;
+        }
+        if (!done) want[0] = acc;
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  retloop2 #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+      CHECK(inside > 100 && inside < 300);
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;

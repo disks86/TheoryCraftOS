@@ -42,7 +42,8 @@ enum Opcode : uint16_t {
   // Loops (Shader Model 4): `target` of a loop is the instruction after its endloop, of an endloop the one after its loop; break leaves, continue goes to the endloop.
   // Texture access of Shader Model 4: ld (src[0] the integer coordinates, x y in the first two components and the level in the last; src[1] the unit), sample_l (src[0] the
   // coordinate, src[1] the unit, src[2] the level), resinfo (src[0] the level, src[1] the unit; control: 0 floats, 1 reciprocals, 2 unsigned integers).
-  kTexFetch = 0x1300, kTexLod, kTexSize, kTexFetchMs, kTexSamples, kTexGather, kTexGrad, kTexBias, kTexQueryLod, kTexCompare,
+  kTexFetch = 0x1300, kTexLod, kTexSize, kTexFetchMs, kTexSamples, kTexGather, kTexGrad, kTexBias, kTexQueryLod, kTexCompare, kRetEarly,   // (kRetEarly: a ret inside an if or a loop ends the program there)
+ 
   // Double precision (Shader Model 5): a double is two components of a register, the low word first (a pair at x y or z w; the operand's swizzle positions 2k and 2k + 1 hold the pair k, and the
   // result goes to the destination's pair k - or, for the comparisons and the conversions to a 32-bit value, to its component k). The instructions to kDoubleLast read doubles.
   kDAdd, kDMul, kDDiv, kDFma, kDRcp, kDMin, kDMax, kDMov, kDMovc, kDEq, kDGe, kDLt, kDNe, kDToF, kDToI, kDToU, kFToD, kIToD, kUToD,
