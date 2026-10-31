@@ -414,6 +414,12 @@ static const WCHAR * const WellKnownPrivNames[SE_MAX_WELL_KNOWN_PRIVILEGE + 1] =
     L"SeManageVolumePrivilege",
     L"SeImpersonatePrivilege",
     L"SeCreateGlobalPrivilege",
+    L"SeTrustedCredManAccessPrivilege",
+    L"SeRelabelPrivilege",
+    L"SeIncreaseWorkingSetPrivilege",
+    L"SeTimeZonePrivilege",
+    L"SeCreateSymbolicLinkPrivilege",
+    L"SeDelegateSessionUserImpersonatePrivilege",
 };
 
 const WCHAR *get_wellknown_privilege_name(const LUID *luid)
@@ -1507,8 +1513,7 @@ __declspec(dllexport) DWORD WINAPI GetSecurityInfo( HANDLE handle, SE_OBJECT_TYP
         break;
 
     default:
-        
-        return ERROR_CALL_NOT_IMPLEMENTED;
+        return ERROR_INVALID_PARAMETER;
     }
 
     if (ppsidOwner)
@@ -2959,8 +2964,7 @@ __declspec(dllexport) DWORD WINAPI SetSecurityInfo(HANDLE handle, SE_OBJECT_TYPE
         break;
 
     default:
-        
-        status = STATUS_SUCCESS;
+        status = STATUS_INVALID_PARAMETER;
         break;
 
     }

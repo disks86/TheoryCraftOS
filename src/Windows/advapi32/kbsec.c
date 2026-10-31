@@ -35,8 +35,8 @@ static BOOL win_fail(DWORD error)
 /* ---- SIDs -------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 EXP BOOL WINAPI IsValidSid(PSID sid) { return RtlValidSid(sid); }
-EXP BOOL WINAPI EqualSid(PSID a, PSID b) { return RtlEqualSid(a, b); }
-EXP BOOL WINAPI EqualPrefixSid(PSID a, PSID b) { return RtlEqualPrefixSid(a, b); }
+EXP BOOL WINAPI EqualSid(PSID a, PSID b) { SetLastError(ERROR_SUCCESS); return RtlEqualSid(a, b); }
+EXP BOOL WINAPI EqualPrefixSid(PSID a, PSID b) { SetLastError(ERROR_SUCCESS); return RtlEqualPrefixSid(a, b); }
 EXP DWORD WINAPI GetSidLengthRequired(UCHAR count) { return RtlLengthRequiredSid(count); }
 EXP DWORD WINAPI GetLengthSid(PSID sid) { return RtlLengthSid(sid); }
 EXP BOOL WINAPI InitializeSid(PSID sid, PSID_IDENTIFIER_AUTHORITY authority, BYTE count)
@@ -59,9 +59,9 @@ EXP BOOL WINAPI CopySid(DWORD length, PSID dest, PSID source)
     NTSTATUS status = RtlCopySid(length, dest, source);
     return status ? nt_fail(status) : TRUE;
 }
-EXP PSID_IDENTIFIER_AUTHORITY WINAPI GetSidIdentifierAuthority(PSID sid) { return RtlIdentifierAuthoritySid(sid); }
-EXP PDWORD WINAPI GetSidSubAuthority(PSID sid, DWORD index) { return RtlSubAuthoritySid(sid, index); }
-EXP PUCHAR WINAPI GetSidSubAuthorityCount(PSID sid) { return RtlSubAuthorityCountSid(sid); }
+EXP PSID_IDENTIFIER_AUTHORITY WINAPI GetSidIdentifierAuthority(PSID sid) { SetLastError(ERROR_SUCCESS); return RtlIdentifierAuthoritySid(sid); }
+EXP PDWORD WINAPI GetSidSubAuthority(PSID sid, DWORD index) { SetLastError(ERROR_SUCCESS); return RtlSubAuthoritySid(sid, index); }
+EXP PUCHAR WINAPI GetSidSubAuthorityCount(PSID sid) { SetLastError(ERROR_SUCCESS); return RtlSubAuthorityCountSid(sid); }
 
 /* ---- security descriptors and ACLs --------------------------------------------------------------------------------------------------------------------------- */
 

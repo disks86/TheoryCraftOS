@@ -233,8 +233,9 @@ class ObjectManager {
   void file_times_move(StringView from, StringView to);      // the file was renamed
   void file_times_forget(StringView path);                   // the file is gone
 
-  // --- security descriptors of files and directories (see FileSecurity.hpp), kept by path for as long as the node is there. A fixed number of nodes can have one: security_room() says
-  // whether another fits, security_set() whether this one did.
+  // --- security blobs, kept by key for as long as what they belong to is there: the self-relative security descriptors (AccessCheck.hpp) of files and directories (the key is the path) and
+  // of kernel objects, processes, threads and registry keys (object_key()), and the blobs of tokens (src/Windows/tcos_token.h). A bounded number can be kept (kMaxSecurity, together
+  // kMaxSecurityBytes): security_set() says whether this one fit.
   bool security_room();
   bool security_set(StringView path, ConstByteView descriptor);
   uint32_t security_get(StringView path, ByteView out);      // the size of the descriptor written to `out`, 0 if the node has none or it does not fit

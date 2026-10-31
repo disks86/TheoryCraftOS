@@ -75,8 +75,8 @@ bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
       {make_sid(5, {15}), 7}, {make_sid(5, {64, 10}), 7}, {make_sid(5, {5, 0, 0x3E7}), 0xC0000007u}, {make_sid(16, {12288}), 0x60},
   };
   struct P { uint32_t low, attrs; };
-  const P privileges[] = {{5, 0}, {8, 0}, {9, 0}, {10, 0}, {11, 0}, {12, 0}, {13, 0}, {14, 0}, {15, 0}, {17, 0}, {18, 0}, {19, 0}, {20, 0}, {22, 0}, {23, 3}, {24, 0}, {25, 0}, {28, 0},
-                          {29, 3}, {30, 3}, {33, 0}, {34, 0}, {35, 0}, {36, 3}};
+  // The privileges a standard user's token holds, all disabled to start with (what the program enables, it asks for).
+  const P privileges[] = {{19, 1}, {23, 1}, {25, 1}, {33, 1}, {34, 1}, {35, 1}};
   const SidBuf admins = make_sid(5, {32, 544}), system_sid = make_sid(5, {18});
   constexpr uint32_t kGroupCount = sizeof(groups) / sizeof(groups[0]), kPrivilegeCount = sizeof(privileges) / sizeof(privileges[0]);
   // Layout: header, user, owner (the user is the owner), primary group, groups (the table, then the SIDs), privileges, default DACL.
