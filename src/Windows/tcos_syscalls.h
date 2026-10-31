@@ -2065,7 +2065,7 @@
 #define NT_SERVICE_NtUserZapActiveAndFocus 5633
 #define NT_SERVICE_NtValidateCompositionSurfaceHandle 5634
 #define NT_SERVICE_NtVisualCaptureBits 5635
-#define NT_SERVICE_COUNT 503
+#define NT_SERVICE_COUNT 505
 #define NT_SERVICE_WIN32K_BASE 4096
 #define NT_SERVICE_WIN32K_END 5636
 #endif

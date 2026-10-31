@@ -174,6 +174,7 @@ bool set_owner(Owner* table, uint64_t id, uint32_t object) {
   ObjectManager* objects = system_objects();
   uint32_t previous = 0;
   bool ok = true;
+  if (!objects) return object == 0;
   objects->sync().lock();
   Owner* o = find_owner(table, id);
   if (object == 0) {
@@ -190,6 +191,7 @@ bool set_owner(Owner* table, uint64_t id, uint32_t object) {
 }
 uint32_t owner_object(Owner* table, uint64_t id) {
   ObjectManager* objects = system_objects();
+  if (!objects) return 0;
   objects->sync().lock();
   Owner* o = find_owner(table, id);
   const uint32_t object = o ? o->object : 0;
@@ -201,6 +203,7 @@ uint32_t owner_object(Owner* table, uint64_t id) {
 uint32_t process_token_object(uint64_t pid) {
   if (uint32_t object = owner_object(g_process_tokens, pid)) return object;
   ObjectManager* objects = system_objects();
+  if (!objects || !objects->allocator()) return 0;
   ByteBuffer blob(*objects->allocator());
   if (!make_default_blob(blob, __atomic_fetch_add(&g_next_token_id, 1, __ATOMIC_RELAXED))) return 0;
   const uint32_t object = new_token_object(blob.view());
@@ -267,6 +270,7 @@ bool process_token_blob(uint64_t pid, ByteBuffer& out) {
 }
 
 bool caller_token_blob(Process& p, ByteBuffer& out) {
+  if (!system_objects()) return false;
   const uint64_t tid = p.runtime() ? p.runtime()->current_thread_id() : p.id();
   if (const uint32_t object = owner_object(g_thread_tokens, tid)) if (load_blob(object, out)) return true;
   return process_token_blob(p.id(), out);
@@ -276,6 +280,7 @@ void token_inherit(uint64_t parent_pid, uint64_t child_pid) {
   const uint32_t parent = owner_object(g_process_tokens, parent_pid);
   if (parent == 0) return;
   ObjectManager* objects = system_objects();
+  if (!objects || !objects->allocator()) return;
   ByteBuffer blob(*objects->allocator());
   if (!load_blob(parent, blob)) return;
   const uint32_t copy = new_token_object(blob.view());
