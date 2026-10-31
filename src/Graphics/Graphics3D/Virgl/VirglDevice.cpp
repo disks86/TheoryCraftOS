@@ -1353,7 +1353,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(patch_points);
           stream.put(0);   // draw id
         }
-        if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
+        if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores || pipeline->desc().geometry_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
           stream.command(virgl::kMemoryBarrier, 0, 1);
           stream.put(0xFFFFFFFFu);
         }

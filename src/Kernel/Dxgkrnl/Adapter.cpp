@@ -433,8 +433,8 @@ class Adapter::StreamRunner {
   NtStatus bind_uav(ByteReader& p) {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32(), size = p.le32();
     const bool view = slot >= graphics::kMaxUavBuffers;   // (a shader resource view of a buffer: read-only, also by the shaders of a draw, and it may change between draws)
-    const bool draws_write = (adapter_.caps_.features & (graphics::kFeatureFragmentStores | graphics::kFeatureVertexStores)) != 0;   // (pixel shaders write the unordered access ones: they are bound between draws too)
-    if (!exact(p) || slot >= graphics::kMaxStorageBuffers || (in_pass_ && !view && !draws_write) || !(adapter_.caps_.features & (graphics::kFeatureCompute | (view ? graphics::kFeatureStorageInDraws : graphics::kFeatureFragmentStores | graphics::kFeatureVertexStores)))) return kBad;
+    const bool draws_write = (adapter_.caps_.features & (graphics::kFeatureFragmentStores | graphics::kFeatureVertexStores | graphics::kFeatureGeometryStores)) != 0;   // (pixel shaders write the unordered access ones: they are bound between draws too)
+    if (!exact(p) || slot >= graphics::kMaxStorageBuffers || (in_pass_ && !view && !draws_write) || !(adapter_.caps_.features & (graphics::kFeatureCompute | (view ? graphics::kFeatureStorageInDraws : graphics::kFeatureFragmentStores | graphics::kFeatureVertexStores | graphics::kFeatureGeometryStores)))) return kBad;
     Allocation* a = alloc(index);
     const bool read_only = slot >= graphics::kMaxUavBuffers;   // (the slots after u3 are shader resource views of buffers)
     if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, read_only ? state::kNonPixelShaderResource : state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
@@ -1333,6 +1333,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
         if (program->storage_kind(u) != D3d9Program::BufferKind::None) shader->storage_mask_ |= 1u << u;
       shader->fragment_stores_ = program->uses_fragment_stores();
       shader->vertex_stores_ = program->uses_vertex_stores();
+      shader->geometry_stores_ = program->uses_geometry_stores();
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
       if (b != status::kSuccess && !md.tgsi) return b;
       no_functions = b;   // (out of trampolines is no matter to a device that takes the text)
@@ -1431,6 +1432,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pd.texture_count = d.texture_count;
   pd.fragment_stores = fragment->fragment_stores_;
   pd.vertex_stores = vertex->vertex_stores_;
+  pd.geometry_stores = geometry && geometry->geometry_stores_;
   pd.cull_mode = d.cull_mode;
   pd.front_face = d.front_face;
   pd.depth_test = d.depth_test;
@@ -1473,6 +1475,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->color_target_count_ = d.color_target_count;
   pipeline->fragment_stores_ = fragment->fragment_stores_;
   pipeline->vertex_stores_ = vertex->vertex_stores_;
+  pipeline->geometry_stores_ = geometry && geometry->geometry_stores_;
   pipeline->storage_mask_ = vertex->storage_mask_ | fragment->storage_mask_ | (geometry ? geometry->storage_mask_ : 0u) | (hull ? hull->storage_mask_ : 0u) | (domain ? domain->storage_mask_ : 0u);   // (the views of buffers their shaders read)
   *out = pipeline;
   return status::kSuccess;

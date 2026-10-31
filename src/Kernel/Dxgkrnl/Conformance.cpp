@@ -2663,6 +2663,50 @@ void scene_dxil_vertex_stores(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
+// A geometry shader that writes buffers (dxil_gs_uav.hlsl): 255 small triangles, each logging its first two corners at the place its colour names and adding to a counter; the picture shows
+// the log.
+void scene_dxil_geometry_stores(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders | graphics::kFeatureGeometryStores)) return void(rig.step("buffer writes by geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_dxil_gs_uav, sizeof b::k_dxil_gs_uav));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Vertex v[255 * 3];
+  for (uint32_t t = 0; t < 255; ++t) {
+    const float cx = -0.9f + 1.8f * static_cast<float>(t % 16) / 15.0f, cy = -0.9f + 1.8f * static_cast<float>(t / 16) / 15.0f, c = static_cast<float>(t) / 255.0f;
+    v[3 * t] = {cx, cy, 0.5f, c, 0.5f, 0.5f, 1}, v[3 * t + 1] = {cx + 0.05f, cy, 0.5f, c, 0.5f, 0.5f, 1}, v[3 * t + 2] = {cx, cy + 0.05f, 0.5f, c, 0.5f, 0.5f, 1};
+  }
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 16;
+  Handle log = rig.create(d);
+  d.size = 16;
+  Handle counter = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_uav(0, 2, 0, kPixels * 16);
+  w.bind_uav(1, 3, 0, 16);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(255 * 3);
+  w.end_pass();
+  rig.render(w, {target, vb, log, counter});
+  uint32_t words[kPixels * 4];
+  rig.read_words(log, ArrayView<uint32_t>(words, kPixels * 4));
+  for (uint32_t i = 0; i < kPixels; ++i) {
+    auto byte = [&](uint32_t k) { return static_cast<uint32_t>((__builtin_bit_cast(float, words[4 * i + k]) + 1.0f) * 127.0f) & 0xFF; };
+    out[i] = byte(3) << 24 | byte(0) << 16 | byte(1) << 8 | byte(2);
+  }
+  if (rig.read_u64(counter, 0) != 255)
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2720,6 +2764,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL buffer views in a vertex shader (Shader Model 6)", scene_dxil_vertex_buffers},
     {"Direct3D 12 DXIL buffer writes by a pixel shader (Shader Model 6)", scene_dxil_pixel_stores},
     {"Direct3D 12 DXIL buffer writes by a vertex shader (Shader Model 6)", scene_dxil_vertex_stores},
+    {"Direct3D 12 DXIL buffer writes by the geometry stage (Shader Model 6)", scene_dxil_geometry_stores},
     {"Direct3D 12 DXIL buffer views in the geometry stage (Shader Model 6)", scene_dxil_geometry_buffers},
     {"Direct3D 12 DXIL buffer views in the hull and domain stages (Shader Model 6)", scene_dxil_tess_buffers},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},

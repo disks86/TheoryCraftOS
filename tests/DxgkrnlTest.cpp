@@ -5232,6 +5232,63 @@ void test_vertex_shader_stores() {
   CHECK(e.pixel(target, 4, 4) != 0);
 }
 
+
+// Geometry shaders that write buffers: each triangle logs its first two corners at the place its colour names and bumps a counter.
+void test_geometry_shader_stores() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, gs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Geometry, sd.code = ConstByteView(b::k_dxil_gs_uav, sizeof b::k_dxil_gs_uav);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &gs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.geometry_shader = gs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  // two triangles, the first with colour.x 3/255 and the second 7/255
+  float v[42];
+  const float corners[2][3][2] = {{{-0.5f, -0.5f}, {0.5f, -0.5f}, {0, 0.5f}}, {{-0.25f, -0.25f}, {0.25f, -0.25f}, {0, 0.25f}}};
+  for (uint32_t t = 0; t < 2; ++t)
+    for (uint32_t k = 0; k < 3; ++k) {
+      float* o = v + 7 * (3 * t + k);
+      o[0] = corners[t][k][0], o[1] = corners[t][k][1], o[2] = 0.5f, o[3] = (t == 0 ? 3.0f : 7.0f) / 255.0f, o[4] = 0.5f, o[5] = 0.5f, o[6] = 1;
+    }
+  CHECK(e.write(vb, floats(v, 42)));
+  Handle log = e.buffer(kAllocUnorderedAccess, 16 * 16), counter = e.buffer(kAllocUnorderedAccess, 16);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.bind_uav(0, 2, 0, 16 * 16);
+  w.bind_uav(1, 3, 0, 16);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(6);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, log, counter}) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, log, kLockReadOnly, 0, &lock) == status::kSuccess);
+  float words[64];
+  ByteReader in(lock.data);
+  for (float& f : words) f = __builtin_bit_cast(float, in.le32());
+  e.kernel.unlock(kPid, log);
+  auto near = [](float a, float b) { return __builtin_fabsf(a - b) < 1e-4f; };
+  // (the geometry shader sees positions with Y as the devices want it, down: the sign of y is turned back for the shader; the logged y is the vertex shader's)
+  CHECK(near(words[4 * 3], corners[0][0][0]) && near(words[4 * 3 + 1], corners[0][0][1]) && near(words[4 * 3 + 2], corners[0][1][0]) && near(words[4 * 3 + 3], corners[0][1][1]));
+  CHECK(near(words[4 * 7], corners[1][0][0]) && near(words[4 * 7 + 1], corners[1][0][1]) && near(words[4 * 7 + 2], corners[1][1][0]) && near(words[4 * 7 + 3], corners[1][1][1]));
+  CHECK(e.kernel.lock(kPid, counter, kLockReadOnly, 0, &lock) == status::kSuccess);
+  CHECK(ByteReader(lock.data).le32() == 2);
+  e.kernel.unlock(kPid, counter);
+  CHECK(e.pixel(target, 4, 4) != 0);
+}
+
 // Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
 void test_d3d12_barriers() {
   Env e;
@@ -7878,6 +7935,7 @@ int main() {
   test_d3d12_buffer_views_in_draw();
   test_pixel_shader_stores();
   test_vertex_shader_stores();
+  test_geometry_shader_stores();
   test_gather_register_offsets();
   test_d3d12_barriers();
   test_d3d12_heaps();

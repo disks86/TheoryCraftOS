@@ -3134,8 +3134,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
       else return status::kNotSupported;
     }
-  } else if (pixel || vertex) {
-    // (a pixel or vertex shader's unordered access views: buffers it writes)
+  } else if (pixel || vertex || geometry) {
+    // (a pixel, vertex or geometry shader's unordered access views: buffers it writes)
     for (uint32_t i = 0; i < kMaxResources; ++i) {
       const Resource& r = res_[1][i];
       if (!r.present) continue;
