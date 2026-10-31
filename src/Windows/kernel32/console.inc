@@ -56,6 +56,7 @@ static BOOL g_ctrl_ignored;
 typedef struct {
   volatile LONG lock;
   DWORD magic, in_mode, history_size, history_buffers, history_flags, member_count, members[CON_MAX_MEMBERS], input_cp, output_cp;      /* (the code pages: 0 is the default, UTF-8) */
+  struct { DWORD pid, group, ignored; } ctrl[CON_MAX_MEMBERS];      /* for each process: its process group and whether it ignores Ctrl+C (what GenerateConsoleCtrlEvent chooses by) */
   WCHAR title[260], original_title[260];
   ScreenBuffer main;
   LONG flip;
@@ -79,6 +80,14 @@ static void con_host_lock(ConHost *h) {
   }
 }
 static void con_host_unlock(ConHost *h) { InterlockedExchange(&h->lock, 0); }
+static void con_host_ctrl_set(ConHost *h, DWORD pid, DWORD group, DWORD ignored) {      /* (the lock of the console is held) */
+  int free_at = -1;
+  for (int i = 0; i < CON_MAX_MEMBERS; ++i) {
+    if (h->ctrl[i].pid == pid) { h->ctrl[i].group = group; h->ctrl[i].ignored = ignored; return; }
+    if (!h->ctrl[i].pid && free_at < 0) free_at = i;
+  }
+  if (free_at >= 0) { h->ctrl[free_at].pid = pid; h->ctrl[free_at].group = group; h->ctrl[free_at].ignored = ignored; }
+}
 static void con_host_add_member(ConHost *h, DWORD pid) {
   for (DWORD i = 0; i < h->member_count; ++i) if (h->members[i] == pid) return;
   if (h->member_count < CON_MAX_MEMBERS) h->members[h->member_count++] = pid;
@@ -121,6 +130,7 @@ static BOOL con_host_join(ULONG_PTR id) {
     memcpy(h->original_title, h->title, sizeof(h->title));
   }
   con_host_add_member(h, GetCurrentProcessId());
+  con_host_ctrl_set(h, GetCurrentProcessId(), *(ULONG *)((BYTE *)parameters() + 0x408), parameters()->ConsoleFlags & 1);
   con_host_unlock(h);
   g_host = h;
   return TRUE;
@@ -212,12 +222,12 @@ IMPORT int NTAPI RtlTcosConsoleEvents(ConEvent *out, int max);
 IMPORT void NTAPI RtlTcosConsoleEventNote(HANDLE h, ULONG_PTR console, LONG kind);
 IMPORT void NTAPI RtlTcosConsoleEventForget(HANDLE h);
 #define CON_ORPHAN (~(ULONG_PTR)0)      /* the console of an event that was given up (the console it belonged to is gone): it stays set */
-static struct { HANDLE h; LONG kind; } g_unbound_cache[16];
+static struct { HANDLE h; LONG kind; } g_unbound_cache[64];
 static int g_unbound_next;
 /* 1 for a handle to the input of the console, 2 for one to the output, 0 for any other; asked of the kernel by the name once for each handle. */
 static LONG con_unbound_kind(HANDLE h) {
   if (!h || h == INVALID_HANDLE_VALUE) return 0;
-  for (int i = 0; i < 16; ++i) if (g_unbound_cache[i].h == h) return g_unbound_cache[i].kind;
+  for (int i = 0; i < 64; ++i) if (g_unbound_cache[i].h == h) return g_unbound_cache[i].kind;
   LONG kind = 0;
   ConEvent own[64];
   const int n = RtlTcosConsoleEvents(own, 64);
@@ -237,11 +247,11 @@ static LONG con_unbound_kind(HANDLE h) {
     }
   }
   g_unbound_cache[g_unbound_next].h = h; g_unbound_cache[g_unbound_next].kind = kind;
-  g_unbound_next = (g_unbound_next + 1) % 16;
+  g_unbound_next = (g_unbound_next + 1) % 64;
   return kind;
 }
 static void con_unbound_forget(HANDLE h) {
-  for (int i = 0; i < 16; ++i) if (g_unbound_cache[i].h == h) g_unbound_cache[i].h = NULL;
+  for (int i = 0; i < 64; ++i) if (g_unbound_cache[i].h == h) g_unbound_cache[i].h = NULL;
 }
 
 /* The standard handles that are consoles, found out once (and again if a handle changes). */
@@ -932,7 +942,11 @@ EXPORT BOOL WINAPI SetConsoleMode(HANDLE h, DWORD mode) {
 EXPORT BOOL WINAPI SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add) {
   con_lock();
   BOOL ok = TRUE;
-  if (!handler) { g_ctrl_ignored = add; parameters()->ConsoleFlags = (parameters()->ConsoleFlags & ~1u) | (add ? 1 : 0); }
+  if (!handler) {
+    g_ctrl_ignored = add;
+    parameters()->ConsoleFlags = (parameters()->ConsoleFlags & ~1u) | (add ? 1 : 0);
+    if (g_host) con_host_ctrl_set(g_host, GetCurrentProcessId(), *(ULONG *)((BYTE *)parameters() + 0x408), add ? 1 : 0);
+  }
   else if (add) { if (g_ctrl_handler_count < 32) g_ctrl_handlers[g_ctrl_handler_count++] = handler; else ok = FALSE; }
   else {
     ok = FALSE;
@@ -945,20 +959,44 @@ EXPORT BOOL WINAPI SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add) {
   if (!ok) set_error(add ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER);
   return ok;
 }
-/* Ctrl+C typed at the terminal ends the program (the kernel does it); a program can send the event to itself, and its handlers run. */
-EXPORT BOOL WINAPI GenerateConsoleCtrlEvent(DWORD event, DWORD group) {
-  (void)group;
-  if (event > 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  if (!con_attached()) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+EXPORT HANDLE WINAPI CreateRemoteThread(HANDLE process, LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPDWORD id);
+/* The handlers of this process run for a control event, newest first; none that takes it ends the program. */
+static void con_run_ctrl_handlers(DWORD event) {
   PHANDLER_ROUTINE handlers[32];
   con_lock();
   const int count = g_ctrl_handler_count;
   for (int i = 0; i < count; ++i) handlers[i] = g_ctrl_handlers[i];
-  const BOOL ignored = g_ctrl_ignored;
   con_unlock();
-  if (ignored && event == 0) return TRUE;
-  for (int i = count - 1; i >= 0; --i) if (handlers[i](event)) return TRUE;
+  for (int i = count - 1; i >= 0; --i) if (handlers[i](event)) return;
   RtlExitUserProcess((NTSTATUS)0xC000013A);      /* STATUS_CONTROL_C_EXIT */
+}
+/* What a thread started in another process of the console runs to give it the event. */
+static DWORD WINAPI con_ctrl_routine(LPVOID event) { con_run_ctrl_handlers((DWORD)(ULONG_PTR)event); return 0; }
+/* Ctrl+C typed at the terminal ends the program (the kernel does it). A program can send an event to the processes of its console: group 0 is all of them, another number the
+ * processes of that group; a process that ignores Ctrl+C is left out of a Ctrl+C. This process runs its handlers at once, the others in a thread made in them. */
+EXPORT BOOL WINAPI GenerateConsoleCtrlEvent(DWORD event, DWORD group) {
+  if (event > 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!con_attached()) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  DWORD targets[CON_MAX_MEMBERS], count = 0;
+  const DWORD me = GetCurrentProcessId();
+  BOOL local = FALSE;
+  con_lock();
+  for (DWORD i = 0; i < g_host->member_count; ++i) {
+    const DWORD pid = g_host->members[i];
+    DWORD member_group = 0, ignored = 0;
+    for (int k = 0; k < CON_MAX_MEMBERS; ++k) if (g_host->ctrl[k].pid == pid) { member_group = g_host->ctrl[k].group; ignored = g_host->ctrl[k].ignored; break; }
+    if ((group != 0 && member_group != group) || (event == 0 && ignored)) continue;
+    if (pid == me) local = TRUE; else targets[count++] = pid;
+  }
+  con_unlock();
+  for (DWORD i = 0; i < count; ++i) {
+    HANDLE process = OpenProcess(0x1F0FFF /* PROCESS_ALL_ACCESS */, FALSE, targets[i]);
+    if (!process) continue;      /* (it has ended) */
+    HANDLE thread = CreateRemoteThread(process, NULL, 0, con_ctrl_routine, (LPVOID)(ULONG_PTR)event, 0, NULL);
+    if (thread) CloseHandle(thread);
+    CloseHandle(process);
+  }
+  if (local) con_run_ctrl_handlers(event);
   return TRUE;
 }
 EXPORT DWORD WINAPI GetConsoleTitleW(LPWSTR title, DWORD size) {
@@ -1063,10 +1101,11 @@ static BOOL con_process_alive(DWORD pid) {
 }
 typedef struct { LONG_PTR ExitStatus; PVOID PebBaseAddress; ULONG_PTR AffinityMask; LONG_PTR BasePriority; ULONG_PTR UniqueProcessId, InheritedFromUniqueProcessId; } PROCESS_BASIC_INFORMATION_;
 /* A child that shares the console of this process is one of its members from the start. */
-static void con_note_child(DWORD pid, HANDLE console) {
+static void con_note_child(DWORD pid, HANDLE console, DWORD group, DWORD ignored) {
   if (!console || !con_attached() || console != parameters()->ConsoleHandle) return;
   con_lock();
   con_host_add_member(g_host, pid);
+  con_host_ctrl_set(g_host, pid, group, ignored);
   con_unlock();
 }
 /* A new console for this process: a number nobody has. */

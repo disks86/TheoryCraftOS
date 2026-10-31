@@ -68,6 +68,9 @@ static BOOL con_input_ready(void);
 static BOOL con_wait_polled(HANDLE h);
 static void con_sync_signals(void);
 static LONG con_unbound_kind(HANDLE h);
+static BOOL con_attached(void);
+/* A handle of a console that this process no longer belongs to is of no use. */
+static BOOL con_dead_handle(HANDLE h) { return !con_attached() && con_unbound_kind(h) != 0; }
 static void con_handle_closed(HANDLE h);
 static BOOL con_is_input(HANDLE h);
 static void con_alias_add(HANDLE h, BOOL input);
@@ -2365,7 +2368,7 @@ static BOOL image_is_gui(LPCWSTR path) {
 
 /* The console a new process belongs to. A window program has none. A console program has none with DETACHED_PROCESS, a console of its own (with a window) with CREATE_NEW_CONSOLE
  * or when this process has no console, a console without a window with CREATE_NO_WINDOW, otherwise the one of this process. `fresh` tells that the console is a new one. */
-static void con_note_child(DWORD pid, HANDLE console);
+static void con_note_child(DWORD pid, HANDLE console, DWORD group, DWORD ignored);
 static HANDLE console_for_new_process(DWORD flags, BOOL gui, BOOL *fresh) {
   static volatile LONG counter;
   if (fresh) *fresh = FALSE;
@@ -2481,7 +2484,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     else fail_nt(status);
     return FALSE;
   }
-  con_note_child(process_id, block.console);
+  con_note_child(process_id, block.console, block.words[11] == 0xFFFFFFFFu ? process_id : block.words[11], block.words[10] & 1);
   if (debug_start) {      /* attached before it runs its first instruction; its children too, unless DEBUG_ONLY_THIS_PROCESS */
     const NTSTATUS attached = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
     if (NT_SUCCESS(attached) && (flags & 0x1) && !(flags & 0x2)) { ULONG inherit = 1; NtSetInformationProcess(process, 31, &inherit, sizeof(inherit)); }
@@ -2688,10 +2691,10 @@ static int device_type(HANDLE h) {
 EXPORT DWORD WINAPI GetFileType(HANDLE h) {
   if ((ULONG_PTR)h >= 0xFFFFFFF4u && (ULONG_PTR)h <= 0xFFFFFFF6u) h = GetStdHandle((DWORD)(ULONG_PTR)h);      /* STD_INPUT_HANDLE and the others */
   const int type = device_type(h);
+  if (con_unbound_kind(h)) { set_error(ERROR_SUCCESS); return FILE_TYPE_CHAR; }      /* a handle of the console that is an event */
   if (type < 0) { set_error(ERROR_INVALID_HANDLE); return FILE_TYPE_UNKNOWN; }
   set_error(ERROR_SUCCESS);
   if (type == 0x0c) return FILE_TYPE_UNKNOWN;      /* a mailslot */
-  if (type != 0x50 && con_unbound_kind(h)) return FILE_TYPE_CHAR;      /* a handle of the console that is an event */
   return (type == 0x50 || type == 0x15) ? FILE_TYPE_CHAR : type == 0x11 ? FILE_TYPE_PIPE : FILE_TYPE_DISK;
 }
 
@@ -2706,6 +2709,7 @@ static BOOL disk_buffer_usable(HANDLE h, const void *buffer, DWORD length, BOOL 
 }
 EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped) {
   if (written) *written = 0;
+  if (con_dead_handle(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (!disk_buffer_usable(h, buffer, length, FALSE, ERROR_INVALID_USER_BUFFER)) return FALSE;
   if (!overlapped) {      /* (probing for the console must not leave its own error behind: a write that works leaves the last error alone) */
     const DWORD saved = TEB_LAST_ERROR(NtCurrentTeb());
@@ -3197,6 +3201,7 @@ static BOOL con_std_is_console(HANDLE h);
 static BOOL con_is_output_only(HANDLE h);
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped) {
   if (read) *read = 0;
+  if (con_dead_handle(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (con_is_output_only(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (length > 0x7FFFFFFFu && con_std_is_console(h)) { set_error(ERROR_NOACCESS); return FALSE; }
   if (!disk_buffer_usable(h, buffer, length, TRUE, ERROR_NOACCESS)) return FALSE;
@@ -3837,6 +3842,7 @@ EXPORT BOOL WINAPI SetEndOfFile(HANDLE h) {
 EXPORT BOOL WINAPI FlushConsoleInputBuffer(HANDLE h);
 EXPORT BOOL WINAPI FlushFileBuffers(HANDLE h) {
   IO_STATUS_BLOCK iosb;
+  if (con_dead_handle(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (con_is_input(h)) return FlushConsoleInputBuffer(h);      /* the input of a console: what was typed and not read is dropped */
   if (con_is_output_only(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   const NTSTATUS status = NtFlushBuffersFile(h, &iosb);
