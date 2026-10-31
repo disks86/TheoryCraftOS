@@ -810,7 +810,7 @@ EXPORT BOOL WINAPI SetConsoleMode(HANDLE h, DWORD mode) {
 EXPORT BOOL WINAPI SetConsoleCtrlHandler(PHANDLER_ROUTINE handler, BOOL add) {
   con_lock();
   BOOL ok = TRUE;
-  if (!handler) g_ctrl_ignored = add;
+  if (!handler) { g_ctrl_ignored = add; parameters()->ConsoleFlags = (parameters()->ConsoleFlags & ~1u) | (add ? 1 : 0); }
   else if (add) { if (g_ctrl_handler_count < 32) g_ctrl_handlers[g_ctrl_handler_count++] = handler; else ok = FALSE; }
   else {
     ok = FALSE;
@@ -944,7 +944,7 @@ static void con_note_child(DWORD pid, HANDLE console) {
   con_unlock();
 }
 /* A new console for this process: a number nobody has. */
-static ULONG_PTR con_new_id(void) { return (ULONG_PTR)console_for_new_process(0x10); }
+static ULONG_PTR con_new_id(void) { return (ULONG_PTR)console_for_new_process(0x10, FALSE, NULL); }
 /* The standard handles of a process that joins a console become the console's (those it was started with stay if it was started with STARTF_USESTDHANDLES and has them). */
 static void con_bind_std_handles(void) {
   RTL_USER_PROCESS_PARAMETERS *pp = parameters();
@@ -1000,7 +1000,14 @@ EXPORT BOOL WINAPI AttachConsole(DWORD pid) {
   con_reset_handlers();
   return TRUE;
 }
-EXPORT HANDLE WINAPI GetConsoleWindow(void) { return NULL; }
+/* The window of the console: a number made from the console's, the same in every process of it; none when the console was made without one (CREATE_NO_WINDOW) or there is no console.
+ * user32.dll knows it as the one window that exists (IsWindow, GetClientRect). */
+EXPORT HANDLE WINAPI GetConsoleWindow(void) {
+  if (!con_attached()) return NULL;
+  const ULONG_PTR id = (ULONG_PTR)parameters()->ConsoleHandle;
+  if (id & CON_ID_NO_WINDOW) return NULL;
+  return (HANDLE)(ULONG_PTR)(0x10000 + (((id >> 8) ^ id) & 0xFFFF) * 4);
+}
 /* The processes of the console (those that have ended are dropped from the list); the list is written only if it is big enough. */
 EXPORT DWORD WINAPI GetConsoleProcessList(LPDWORD list, DWORD count) {
   if (!list || !count) { set_error(ERROR_INVALID_PARAMETER); return 0; }
@@ -1066,11 +1073,20 @@ EXPORT BOOL WINAPI WriteConsoleW(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD
   if (written) *written = length;
   return TRUE;
 }
+/* The console window sits on the desktop (src/Windows/user32: the work area is 1024 x 728, a title bar is 23 high) and shows cells of the one font, 8 x 16: the window is never larger than
+ * that, nor than the buffer. */
+#define CON_FONT_W 8
+#define CON_FONT_H 16
+#define CON_WORK_W 1024
+#define CON_WORK_H 728
+#define CON_CAPTION_H 23
+static COORD con_largest_window(void) { COORD c; c.X = CON_WORK_W / CON_FONT_W; c.Y = (CON_WORK_H - CON_CAPTION_H) / CON_FONT_H; return c; }
+static COORD con_max_window(COORD size) { COORD c = con_largest_window(); if (size.X < c.X) c.X = size.X; if (size.Y < c.Y) c.Y = size.Y; return c; }
 EXPORT BOOL WINAPI GetConsoleScreenBufferInfo(HANDLE h, PCONSOLE_SCREEN_BUFFER_INFO info) {
   if (!info) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WITH_BUFFER(h, sb, FALSE)
   info->dwSize = sb->size; info->dwCursorPosition = sb->cursor; info->wAttributes = sb->attr; info->srWindow = sb->window;
-  info->dwMaximumWindowSize.X = sb->size.X; info->dwMaximumWindowSize.Y = sb->size.Y;
+  info->dwMaximumWindowSize = con_max_window(sb->size);
   con_unlock();
   return TRUE;
 }
@@ -1079,7 +1095,7 @@ EXPORT BOOL WINAPI GetConsoleScreenBufferInfoEx(HANDLE h, CONSOLE_SCREEN_BUFFER_
   WITH_BUFFER(h, sb, FALSE)
   static const DWORD colors[16] = {0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xC0C0C0, 0x808080, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF};
   info->dwSize = sb->size; info->dwCursorPosition = sb->cursor; info->wAttributes = sb->attr; info->srWindow = sb->window;
-  info->dwMaximumWindowSize = sb->size; info->wPopupAttributes = sb->popup ? sb->popup : 0xF5; info->bFullscreenSupported = FALSE;
+  info->dwMaximumWindowSize = con_max_window(sb->size); info->wPopupAttributes = sb->popup ? sb->popup : 0xF5; info->bFullscreenSupported = FALSE;
   for (int i = 0; i < 16; ++i) info->ColorTable[i] = colors[i];
   con_unlock();
   return TRUE;
@@ -1158,15 +1174,19 @@ EXPORT BOOL WINAPI SetConsoleWindowInfo(HANDLE h, BOOL absolute, const SMALL_REC
 EXPORT COORD WINAPI GetLargestConsoleWindowSize(HANDLE h) {
   COORD c = {0, 0};
   con_lock();
-  ScreenBuffer *sb = con_buffer(h);
-  if (sb) c = sb->size; else set_error(ERROR_INVALID_HANDLE);
+  if (con_buffer(h)) c = con_largest_window(); else set_error(ERROR_INVALID_HANDLE);
   con_unlock();
   return c;
 }
 EXPORT BOOL WINAPI GetCurrentConsoleFont(HANDLE h, BOOL maximum, CONSOLE_FONT_INFO_ *info) {
-  (void)maximum;
   if (!info || !con_buffer_or_main(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  info->nFont = 0; info->dwFontSize.X = 8; info->dwFontSize.Y = 16;
+  info->nFont = 0; info->dwFontSize.X = CON_FONT_W; info->dwFontSize.Y = CON_FONT_H;
+  if (maximum) {      /* (the size of the largest window, which is what Windows answers here) */
+    con_lock();
+    ScreenBuffer *sb = con_buffer(h);
+    info->dwFontSize = con_max_window(sb ? sb->size : con_largest_window());
+    con_unlock();
+  }
   return TRUE;
 }
 EXPORT DWORD WINAPI GetNumberOfConsoleFonts(void) { return 1; }

@@ -134,3 +134,62 @@ EXPORT int WINAPI wvsprintfA(LPSTR buffer, LPCSTR format, va_list_ args) {
 }
 EXPORT int WINAPI wsprintfW(LPWSTR buffer, LPCWSTR format, ...) { va_list_ a; __builtin_va_start(a, format); const int r = wvsprintfW(buffer, format, a); __builtin_va_end(a); return r; }
 EXPORT int WINAPI wsprintfA(LPSTR buffer, LPCSTR format, ...) { va_list_ a; __builtin_va_start(a, format); const int r = wvsprintfA(buffer, format, a); __builtin_va_end(a); return r; }
+
+/* ---- the console window --------------------------------------------------------------------------------------------------------------------------------- *
+ * There is no window system. The one window that exists is the window of the console of the process (kernel32's GetConsoleWindow); it is answered for, sized from the window of the
+ * screen buffer shown (cells of the console font, 8 x 16) and put at a fixed place on a 1024 x 768 desktop whose task bar takes the lower 40 lines. */
+typedef struct { LONG left, top, right, bottom; } RECT_;
+IMPORT HANDLE WINAPI GetConsoleWindow(void);
+IMPORT HANDLE WINAPI CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPVOID security, DWORD creation, DWORD flags, HANDLE template_file);
+IMPORT BOOL WINAPI GetConsoleScreenBufferInfo(HANDLE console, PCONSOLE_SCREEN_BUFFER_INFO info);
+IMPORT BOOL WINAPI CloseHandle(HANDLE handle);
+IMPORT void WINAPI SetLastError(DWORD error);
+#define SCREEN_W 1024
+#define SCREEN_H 768
+#define WORK_H 728
+#define CAPTION_H 23
+#define FRAME 8
+
+EXPORT BOOL WINAPI IsWindow(HANDLE window) { return window && window == GetConsoleWindow(); }
+/* The size of the cells the console window shows, 0 x 0 if the console has no screen buffer to ask. */
+static BOOL console_client_size(LONG *width, LONG *height) {
+  HANDLE out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, 3, NULL, OPEN_EXISTING, 0, NULL);
+  if (out == INVALID_HANDLE_VALUE) return FALSE;
+  CONSOLE_SCREEN_BUFFER_INFO info;
+  const BOOL ok = GetConsoleScreenBufferInfo(out, &info);
+  CloseHandle(out);
+  if (!ok) return FALSE;
+  *width = (LONG)(info.srWindow.Right - info.srWindow.Left + 1) * 8;
+  *height = (LONG)(info.srWindow.Bottom - info.srWindow.Top + 1) * 16;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect) {
+  LONG w, h;
+  if (!IsWindow(window) || !rect) { SetLastError(1400 /* ERROR_INVALID_WINDOW_HANDLE */); return FALSE; }
+  if (!console_client_size(&w, &h)) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+  rect->left = rect->top = 0; rect->right = w; rect->bottom = h;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect) {
+  LONG w, h;
+  if (!IsWindow(window) || !rect) { SetLastError(1400); return FALSE; }
+  if (!console_client_size(&w, &h)) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+  rect->left = 100; rect->top = 100; rect->right = 100 + w + 2 * FRAME; rect->bottom = 100 + h + CAPTION_H + 2 * FRAME;
+  return TRUE;
+}
+/* SM_CXSCREEN, SM_CYSCREEN, SM_CYCAPTION, SM_CXFRAME/SM_CYFRAME: the numbers of the desktop above; the others are 0. */
+EXPORT int WINAPI GetSystemMetrics(int index) {
+  switch (index) {
+    case 0: return SCREEN_W;
+    case 1: return SCREEN_H;
+    case 4: return CAPTION_H;
+    case 32: case 33: return FRAME;
+    default: return 0;
+  }
+}
+EXPORT BOOL WINAPI SystemParametersInfoW(UINT action, UINT param, PVOID data, UINT flags) {
+  (void)param; (void)flags;
+  if (action == 0x30 /* SPI_GETWORKAREA */ && data) { RECT_ *r = data; r->left = 0; r->top = 0; r->right = SCREEN_W; r->bottom = WORK_H; return TRUE; }
+  SetLastError(ERROR_INVALID_PARAMETER);
+  return FALSE;
+}

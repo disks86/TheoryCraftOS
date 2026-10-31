@@ -196,6 +196,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
     const StartupSpec& st = *input.startup;
     w.u64(parameters + 0x10, st.console_handle);          // ConsoleHandle
     w.u32(parameters + 0x18, st.console_flags);            // ConsoleFlags
+    w.u32(parameters + 0x408, st.process_group == 0xFFFFFFFFu ? uint32_t(input.process_id) : st.process_group);      // ProcessGroupId
     w.u32(parameters + 0x88, st.x);                        // StartingX
     w.u32(parameters + 0x8C, st.y);
     w.u32(parameters + 0x90, st.x_size);                   // CountX

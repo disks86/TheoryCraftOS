@@ -32,7 +32,7 @@ constexpr uint32_t kSuccess = 0, kNotImplemented = 0xC0000002u, kAccessViolation
                    kNoMemory = 0xC0000017u, kObjectNameNotFound = 0xC0000034u, kInvalidImageFormat = 0xC000007Bu, kNoResources = 0xC000009Au,
                    kNameTooLong = 0xC0000106u;
 constexpr uint64_t kMaxImageBytes = 64ull << 20, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
-constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8, kExplicitStdHandles = 0x10, kPseudoConsole = 0x20, kHasParent = 0x40, kHasHandleList = 0x80;
+constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8, kExplicitStdHandles = 0x10, kPseudoConsole = 0x20, kHasParent = 0x40, kHasHandleList = 0x80, kFreshConsole = 0x100;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
   if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
@@ -245,7 +245,7 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   ChildSpec spec;
   spec.startup.flags = startup_words[1]; spec.startup.x = startup_words[2]; spec.startup.y = startup_words[3]; spec.startup.x_size = startup_words[4]; spec.startup.y_size = startup_words[5];
   spec.startup.x_chars = startup_words[6]; spec.startup.y_chars = startup_words[7]; spec.startup.fill_attribute = startup_words[8]; spec.startup.show_window = startup_words[9];
-  spec.startup.console_flags = startup_words[10]; spec.startup.console_handle = startup_console;
+  spec.startup.console_flags = startup_words[10]; spec.startup.process_group = startup_words[11]; spec.startup.console_handle = startup_console;
   spec.startup.title = startup_title.view();
   spec.startup.desktop = startup_desktop.view();
   spec.pid = runtime->allocate_process_id();
@@ -299,7 +299,7 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
       } else if (window_program && console) {
         value = 0;
       }
-      if ((flags_arg & kPseudoConsole) && !window_program && !detached && (value == 0 || spec.copy_std[i])) {      // a pseudo console is the console of the child: its handles stand in
+      if ((flags_arg & (kPseudoConsole | kFreshConsole)) && !window_program && !detached && (value == 0 || spec.copy_std[i] || ((flags_arg & kFreshConsole) && console))) {      // a pseudo console, or a console that is new, is the console of the child: its handles stand in
         if (value == 0 || console) { value = (uint64_t{i} + 1) * 4; spec.copy_std[i] = false; spec.console_std[i] = true; }
       }
       spec.std_handles[i] = value;

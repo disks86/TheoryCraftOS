@@ -2334,13 +2334,35 @@ static const ProcThreadAttributeEntry *attribute_of(const ProcThreadAttributeLis
   return NULL;
 }
 
-/* The console a new process belongs to: none for DETACHED_PROCESS, a console of its own for CREATE_NEW_CONSOLE, otherwise the one of this process. */
+#define CON_ID_NO_WINDOW 0x1000000000000ull      /* in the number of a console: it has no window (CREATE_NO_WINDOW) */
+
+/* Is the program a window program (IMAGE_SUBSYSTEM_WINDOWS_GUI)? Its header says; a file that cannot be read is taken for a console program. */
+static BOOL image_is_gui(LPCWSTR path) {
+  HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+  if (f == INVALID_HANDLE_VALUE) return FALSE;
+  BYTE head[0x400];
+  DWORD got = 0;
+  BOOL gui = FALSE;
+  if (ReadFile(f, head, sizeof(head), &got, NULL) && got >= 0x40) {
+    const DWORD at = head[0x3C] | (head[0x3D] << 8) | (head[0x3E] << 16) | ((DWORD)head[0x3F] << 24);
+    if (at <= got && got - at >= 24 + 70) gui = (head[at + 24 + 68] | (head[at + 24 + 69] << 8)) == 2;
+  }
+  CloseHandle(f);
+  return gui;
+}
+
+/* The console a new process belongs to. A window program has none. A console program has none with DETACHED_PROCESS, a console of its own (with a window) with CREATE_NEW_CONSOLE
+ * or when this process has no console, a console without a window with CREATE_NO_WINDOW, otherwise the one of this process. `fresh` tells that the console is a new one. */
 static void con_note_child(DWORD pid, HANDLE console);
-static HANDLE console_for_new_process(DWORD flags) {
+static HANDLE console_for_new_process(DWORD flags, BOOL gui, BOOL *fresh) {
   static volatile LONG counter;
-  if (flags & 0x8 /* DETACHED_PROCESS */) return NULL;
-  if (flags & 0x10 /* CREATE_NEW_CONSOLE */) return (HANDLE)(ULONG_PTR)(0x100000000ull | ((ULONG_PTR)GetCurrentProcessId() << 8) | (ULONG_PTR)(InterlockedIncrement(&counter) & 0xFF));
-  return parameters()->ConsoleHandle;
+  if (fresh) *fresh = FALSE;
+  if (gui || (flags & 0x8 /* DETACHED_PROCESS */)) return NULL;
+  const BOOL new_console = (flags & 0x10 /* CREATE_NEW_CONSOLE */) != 0;
+  if (!new_console && parameters()->ConsoleHandle && !(flags & 0x08000000 /* CREATE_NO_WINDOW */)) return parameters()->ConsoleHandle;
+  if (fresh) *fresh = TRUE;
+  return (HANDLE)(ULONG_PTR)(0x100000000ull | (!new_console && (flags & 0x08000000) ? CON_ID_NO_WINDOW : 0) | ((ULONG_PTR)GetCurrentProcessId() << 8) |
+                             (ULONG_PTR)(InterlockedIncrement(&counter) & 0xFF));
 }
 EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information) {
@@ -2411,7 +2433,12 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     if (startup->lpDesktop) { unicode_string(&desktop_string, startup->lpDesktop); block.desktop = &desktop_string; }
   }
   if (!block.title) { unicode_string(&title_string, image); block.title = &title_string; }      /* (a program without a title has its own path as the title) */
-  block.console = console_for_new_process(flags);
+  BOOL fresh_console = FALSE;
+  block.console = console_for_new_process(flags, image_is_gui(image), &fresh_console);
+  if (fresh_console) nt_flags |= 0x100;      /* (the standard handles of a console program with a console of its own are that console's) */
+  /* the console flags (bit 0: Ctrl+C is ignored) are the ones of this process, and a new process group ignores it; the group is this process's own unless a new one starts */
+  block.words[10] = (parameters()->ConsoleFlags & 1) | ((flags & 0x200 /* CREATE_NEW_PROCESS_GROUP */) ? 1 : 0);
+  block.words[11] = (flags & 0x200) ? 0xFFFFFFFFu : *(ULONG *)((BYTE *)parameters() + 0x408);
   if ((flags & 0x80000 /* EXTENDED_STARTUPINFO_PRESENT */) && startup && startup->cb >= sizeof(STARTUPINFOW) + sizeof(PVOID)) {
     const ProcThreadAttributeList *attributes = *(ProcThreadAttributeList *const *)((const BYTE *)startup + sizeof(STARTUPINFOW));
     if (attributes) {

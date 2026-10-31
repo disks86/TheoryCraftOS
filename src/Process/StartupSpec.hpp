@@ -26,6 +26,7 @@ struct StartupSpec {
   uint32_t flags = 0;                          // STARTF_*
   uint32_t x = 0, y = 0, x_size = 0, y_size = 0, x_chars = 0, y_chars = 0, fill_attribute = 0, show_window = 0;
   uint32_t console_flags = 0;
+  uint32_t process_group = 0;                  // ProcessGroupId (0xFFFFFFFF: the process leads a group of its own)
   uint64_t console_handle = 0;                 // the console the child belongs to (0: none)
   StringView title, desktop;                   // UTF-8
 };
