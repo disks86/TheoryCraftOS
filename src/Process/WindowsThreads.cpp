@@ -461,8 +461,9 @@ uint32_t remote_get_context(Process& p, uint64_t pid, uint64_t tid, X86Context* 
   state.kind = IProcessRuntime::RemoteOp::ThreadStatus;
   state.thread_id = tid;
   const bool still = debug_stopped_context(pid, tid, &ignored) || (p.runtime()->remote_operation(pid, state) == kSuccess && state.old_protect > 0);
-  uint32_t status = still ? p.runtime()->remote_operation(pid, op) : 0xC000000Du;
-  if (status != 0xC000000Du) return status;
+  uint32_t status = p.runtime()->remote_operation(pid, op);
+  if (status != kSuccess && status != 0xC000000Du) return status;      // (a thread that is gone, or not to be had)
+  if (status == kSuccess && still) return status;
   IProcessRuntime::RemoteOp stop;
   stop.kind = IProcessRuntime::RemoteOp::SuspendThread;
   stop.thread_id = tid;
