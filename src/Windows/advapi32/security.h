@@ -39,6 +39,8 @@ void *NTAPI RtlProcessHeap(void);
 #define malloc(n) RtlAllocateHeap(RtlProcessHeap(), 0, (n))
 #define calloc(c, n) RtlAllocateHeap(RtlProcessHeap(), HEAP_ZERO_MEMORY, (SIZE_T)(c) * (n))
 #define free(p) RtlFreeHeap(RtlProcessHeap(), 0, (p))
+#define realloc(p, n) ((p) ? RtlReAllocateHeap(RtlProcessHeap(), 0, (p), (n)) : RtlAllocateHeap(RtlProcessHeap(), 0, (n)))
+#define wcsupr _wcsupr
 #define wine_dbg_sprintf(...) ""
 static inline WCHAR *strdupAW(const char *src)
 {

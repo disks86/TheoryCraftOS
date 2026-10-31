@@ -28,7 +28,7 @@ namespace process::windowsabi {
 namespace {
 
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du, kAccessDenied = 0xC0000022u,
-                   kNoResources = 0xC000009Au, kNotImplemented = 0xC0000002u, kNoToken = 0xC000007Cu, kBadTokenType = 0xC000007Bu, kBufferTooSmall = 0xC0000023u,
+                   kNoResources = 0xC000009Au, kNotImplemented = 0xC0000002u, kNoToken = 0xC000007Cu, kBadTokenType = 0xC00000A8u, kBufferTooSmall = 0xC0000023u,
                    kObjectTypeMismatch = 0xC0000024u, kInvalidInfoClass = 0xC0000003u, kUnsuccessful = 0xC0000001u;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0}, kCurrentThread = ~uint64_t{1};
 constexpr uint32_t kTokenAllAccess = 0xF01FF, kTokenImpersonate = 4, kTokenDuplicate = 2;
@@ -98,11 +98,11 @@ bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
   uint32_t at = sizeof(h);
   auto place = [&](const SidBuf& sid) { const uint32_t off = at; tail.append(ConstByteView(sid.bytes, sid.size)); at += sid.size; return off; };
   h.user_off = place(user);
-  h.owner_off = h.user_off;
   h.pgroup_off = place(group);
   uint32_t offsets[kGroupCount];
   for (uint32_t i = 0; i < kGroupCount; ++i) offsets[i] = place(groups[i].sid);
   const uint32_t admins_off = place(admins), system_off = place(system_sid);
+  h.owner_off = admins_off;      // (the owner of what an administrator makes is the group of administrators)
   h.group_count = kGroupCount;
   h.groups_off = at;
   for (uint32_t i = 0; i < kGroupCount; ++i) { tail.put32(offsets[i]); tail.put32(groups[i].attrs); at += 8; }

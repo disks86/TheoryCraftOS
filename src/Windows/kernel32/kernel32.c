@@ -2903,7 +2903,7 @@ EXPORT HANDLE WINAPI CreateNamedPipeW(LPCWSTR name, DWORD open_mode, DWORD pipe_
   timeout.QuadPart = -10000ll * (timeout_ms ? timeout_ms : 50);
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
-  const NTSTATUS status = NtCreateNamedPipeFile(&h, 0xC0100000u /* GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE */, &attributes, &iosb, share, 3 /* FILE_OPEN_IF */, 0x20,
+  const NTSTATUS status = NtCreateNamedPipeFile(&h, 0x00100000u /* SYNCHRONIZE */ | ((open_mode & 1) ? 0x80000000u : 0) | ((open_mode & 2) ? 0x40000000u : 0) | (open_mode & (0x00040000u | 0x00080000u | 0x01000000u)) /* WRITE_DAC, WRITE_OWNER, ACCESS_SYSTEM_SECURITY */, &attributes, &iosb, share, 3 /* FILE_OPEN_IF */, 0x20,
                                                 (pipe_mode & 4) ? 1 : 0, (pipe_mode & 2) ? 1 : 0, (pipe_mode & 1) ? 1 : 0, max_instances == 255 ? 0xFFFFFFFFu : max_instances,
                                                 in_size, out_size, &timeout);
   if (!NT_SUCCESS(status)) { fail_nt(status); return INVALID_HANDLE_VALUE; }

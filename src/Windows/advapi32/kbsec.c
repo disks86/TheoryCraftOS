@@ -272,6 +272,8 @@ EXP VOID WINAPI SetSecurityAccessMask(SECURITY_INFORMATION info, LPDWORD access)
     if (info & (SACL_SECURITY_INFORMATION | PROTECTED_SACL_SECURITY_INFORMATION | UNPROTECTED_SACL_SECURITY_INFORMATION)) *access |= ACCESS_SYSTEM_SECURITY;
 }
 
+BOOL ADVAPI_GetComputerSid(PSID sid);
+
 /* ---- well known SIDs ------------------------------------------------------------------------------------------------------------------------------------- */
 
 /* The SIDs by WELL_KNOWN_SID_TYPE: a fixed one as text, or a relative identifier of a domain (the text then names the SID that is made for a domain). Zero means: not known. */
@@ -362,7 +364,8 @@ EXP BOOL WINAPI CreateWellKnownSid(WELL_KNOWN_SID_TYPE type, PSID domain, PSID s
     if (well_known[type].text) {
         if (!text_to_sid(well_known[type].text, made)) return win_fail(ERROR_INVALID_PARAMETER);
     } else if (well_known[type].domain_rid) {
-        if (!domain) return win_fail(ERROR_INVALID_PARAMETER);
+        BYTE machine[sizeof(SID) + 16 * sizeof(DWORD)];
+        if (!domain) { ADVAPI_GetComputerSid(machine); domain = machine; }      /* (the domain of this machine) */
         if (!RtlValidSid(domain) || ((SID *)domain)->SubAuthorityCount >= SID_MAX_SUB_AUTHORITIES) return win_fail(ERROR_INVALID_SID);
         memcpy(made, domain, RtlLengthSid(domain));
         made->SubAuthority[made->SubAuthorityCount++] = well_known[type].domain_rid;
@@ -380,6 +383,10 @@ EXP BOOL WINAPI IsWellKnownSid(PSID sid, WELL_KNOWN_SID_TYPE type)
     SID *s = sid;
     if (!sid || !RtlValidSid(sid) || (int)type < 0 || (int)type >= WELL_KNOWN_COUNT) return FALSE;
     if (well_known[type].text) return text_to_sid(well_known[type].text, (SID *)buffer) && RtlEqualSid(sid, buffer);
+    if (type == WinLogonIdsSid) {      /* S-1-5-5-x-y */
+        return s->SubAuthorityCount == 3 && s->SubAuthority[0] == 5 && s->IdentifierAuthority.Value[5] == 5 && !s->IdentifierAuthority.Value[0] && !s->IdentifierAuthority.Value[1] &&
+               !s->IdentifierAuthority.Value[2] && !s->IdentifierAuthority.Value[3] && !s->IdentifierAuthority.Value[4];
+    }
     if (well_known[type].domain_rid) {
         /* a domain SID of 4 subauthorities (21-a-b-c) and the relative identifier */
         return s->SubAuthorityCount == 5 && s->SubAuthority[0] == 21 && s->SubAuthority[4] == well_known[type].domain_rid &&
@@ -483,7 +490,6 @@ static const char *sddl_sid_name(PSID sid)
     return NULL;
 }
 /* The SID of a two letter SDDL alias at p (not case sensitive); FALSE if p does not start with one. The aliases of a domain's accounts are made over the SID of this machine. */
-BOOL ADVAPI_GetComputerSid(PSID sid);
 static BOOL alias_to_sid(const WCHAR *p, SID *out)
 {
     for (int i = 0; i < (int)ARRAY_SIZE(sddl_sids); ++i) {

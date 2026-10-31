@@ -861,7 +861,7 @@ NTSTATUS WINAPI RtlMakeSelfRelativeSD(
         pRel->Group = 0;
     }
 
-    if (pAbs->Sacl)
+    if ((pAbs->Control & SE_SACL_PRESENT) && pAbs->Sacl)
     {
         pRel->Sacl = offsetRel;
         length = pAbs->Sacl->AclSize;
@@ -873,7 +873,7 @@ NTSTATUS WINAPI RtlMakeSelfRelativeSD(
         pRel->Sacl = 0;
     }
 
-    if (pAbs->Dacl)
+    if ((pAbs->Control & SE_DACL_PRESENT) && pAbs->Dacl)
     {
         pRel->Dacl = offsetRel;
         length = pAbs->Dacl->AclSize;

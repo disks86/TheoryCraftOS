@@ -43,10 +43,10 @@
 #define STATUS_CANT_DISABLE_MANDATORY_ ((NTSTATUS)0xC000005D)
 #define STATUS_INVALID_OWNER_ ((NTSTATUS)0xC000005A)
 #define STATUS_INVALID_PRIMARY_GROUP_ ((NTSTATUS)0xC000005B)
-#define STATUS_BAD_TOKEN_TYPE_ ((NTSTATUS)0xC000007B)
+#define STATUS_BAD_TOKEN_TYPE_ ((NTSTATUS)0xC00000A8)
 #define STATUS_NO_TOKEN_ ((NTSTATUS)0xC000007C)
 #define STATUS_BAD_IMPERSONATION_LEVEL_ ((NTSTATUS)0xC00000A5)
-#define STATUS_GENERIC_NOT_MAPPED_ ((NTSTATUS)0xC0000046)
+#define STATUS_GENERIC_NOT_MAPPED_ ((NTSTATUS)0xC00000E6)
 #define STATUS_NOT_ALL_ASSIGNED_ ((NTSTATUS)0x00000106)
 #define STATUS_INVALID_SECURITY_DESCR_ ((NTSTATUS)0xC0000079)
 #define STATUS_PRIVILEGE_NOT_HELD_ ((NTSTATUS)0xC0000061)
@@ -551,7 +551,6 @@ __declspec(dllexport) NTSTATUS NTAPI NtSetInformationToken(HANDLE token, TOKEN_I
     NTSTATUS status = STATUS_SUCCESS;
     ACCESS_MASK required = TOKEN_ADJUST_DEFAULT;
     DWORD i;
-    if (!info) return STATUS_ACCESS_VIOLATION_;
     switch (class_) {
     case TokenOwner: case TokenPrimaryGroup: if (length < sizeof(PVOID)) return STATUS_INFO_LENGTH_MISMATCH_; break;
     case TokenDefaultDacl: if (length < sizeof(PVOID)) return STATUS_INFO_LENGTH_MISMATCH_; break;
@@ -561,6 +560,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtSetInformationToken(HANDLE token, TOKEN_I
     case TokenOrigin: if (length < 8) return STATUS_INFO_LENGTH_MISMATCH_; required = TOKEN_ADJUST_DEFAULT; break;
     default: return STATUS_INVALID_INFO_CLASS_;
     }
+    if (!info) return STATUS_ACCESS_VIOLATION_;
     if (!(t = heap_new(sizeof(*t)))) return STATUS_NO_MEMORY_;
     status = read_token(token, required, t);
     if (status) { heap_drop(t); return status; }
@@ -796,9 +796,17 @@ static NTSTATUS check_internal(PSECURITY_DESCRIPTOR sd, HANDLE token, ACCESS_MAS
     ULONGLONG used = 0;
     DWORD out_status = 0, out_granted = 0;
     DWORD privilege_count = 0, i;
-    if (!sd || !mapping || !privs_length || !granted || !access_status || !privs) return STATUS_ACCESS_VIOLATION_;
-    if (desired & (GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL)) return STATUS_GENERIC_NOT_MAPPED_;
-    if (*privs_length < sizeof(PRIVILEGE_SET) - sizeof(LUID_AND_ATTRIBUTES) + 0) return STATUS_BUFFER_TOO_SMALL_;
+    if (!sd || !mapping || !privs_length || !granted || !access_status) return STATUS_ACCESS_VIOLATION_;
+    if (desired & (GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL)) {      /* (a program maps the generic rights itself; with no buffer for the privileges the buffer is what is wrong first) */
+        if (!privs && *privs_length >= sizeof(PRIVILEGE_SET)) return STATUS_ACCESS_VIOLATION_;
+        return STATUS_GENERIC_NOT_MAPPED_;
+    }
+    if (!privs) {      /* (a length of zero is a question about the size, any other length with no buffer a fault) */
+        if (*privs_length != 0) return STATUS_ACCESS_VIOLATION_;
+        *privs_length = sizeof(PRIVILEGE_SET);
+        return STATUS_BUFFER_TOO_SMALL_;
+    }
+    if (*privs_length < sizeof(PRIVILEGE_SET)) { *privs_length = sizeof(PRIVILEGE_SET); return STATUS_BUFFER_TOO_SMALL_; }
     if (((SECURITY_DESCRIPTOR *)sd)->Revision != 1) return STATUS_UNKNOWN_REVISION;
     if (!((SECURITY_DESCRIPTOR *)sd)->Owner && !(((SECURITY_DESCRIPTOR *)sd)->Control & SE_SELF_RELATIVE)) return STATUS_INVALID_SECURITY_DESCR_;
     length = RtlLengthSecurityDescriptor(sd);
@@ -874,40 +882,44 @@ static NTSTATUS token_of_caller(HANDLE *token)
     return status;
 }
 
-/* The descriptor an object has when none was given to it: owner and group of the creator, and its default DACL. */
-static NTSTATUS default_descriptor(BYTE **out, ULONG *length)
+/* The generic mapping of the type of object a handle names. */
+static void mapping_for_handle(HANDLE handle, GENERIC_MAPPING *m)
 {
-    HANDLE token;
-    TokenData *t;
-    NTSTATUS status = token_of_caller(&token);
-    BYTE *buf;
-    SECURITY_DESCRIPTOR_RELATIVE *sd;
-    DWORD at = sizeof(*sd), n;
-    if (status) return status;
-    if (!(t = heap_new(sizeof(*t)))) { NtClose(token); return STATUS_NO_MEMORY_; }
-    status = read_token(token, TOKEN_QUERY, t);
-    NtClose(token);
-    if (status) { heap_drop(t); return status; }
-    buf = heap_new(sizeof(*sd) + 2 * MAX_SID_BYTES + DEFAULT_DACL_BYTES);
-    if (!buf) { heap_drop(t); return STATUS_NO_MEMORY_; }
-    sd = (SECURITY_DESCRIPTOR_RELATIVE *)buf;
-    sd->Revision = 1;
-    sd->Control = SE_SELF_RELATIVE;
-    n = sid_size(t->has_owner ? t->owner : t->user.sid);
-    memcpy(buf + at, t->has_owner ? t->owner : t->user.sid, n);
-    sd->Owner = at; at += n;
-    n = sid_size(t->has_pgroup ? t->pgroup : t->user.sid);
-    memcpy(buf + at, t->has_pgroup ? t->pgroup : t->user.sid, n);
-    sd->Group = at; at += n;
-    if (t->has_dacl) {
-        n = t->dacl[2] | (DWORD)t->dacl[3] << 8;
-        memcpy(buf + at, t->dacl, n);
-        sd->Dacl = at; at += n;
-        sd->Control |= SE_DACL_PRESENT;
+    BYTE buf[256];
+    ULONG got = 0;
+    const WCHAR *name = NULL;
+    USHORT bytes = 0;
+    static const struct { const char *name; DWORD read, write, execute, all; } types[] = {
+        {"Event", 0x20001, 0x20002, 0x120000, 0x1f0003}, {"Mutant", 0x20001, 0x20000, 0x120000, 0x1f0001}, {"Semaphore", 0x20001, 0x20002, 0x120000, 0x1f0003},
+        {"Timer", 0x20001, 0x20002, 0x120000, 0x1f0003}, {"Section", 0x20005, 0x20012, 0x20008, 0xf001f}, {"Key", 0x20019, 0x20006, 0x20019, 0xf003f},
+        {"Process", 0x20410, 0x20bea, 0x121001, 0x1fffff}, {"Thread", 0x20048, 0x20037, 0x120000, 0x1fffff}, {"Token", 0x20008 | 0x10, 0x200e0, 0x20000, 0xf01ff},
+        {"Job", 0x20004, 0x20003, 0x120000, 0x1f001f}, {"DebugObject", 0x20001, 0x20002, 0x120000, 0x1f000f},
+    };
+    unsigned i;
+    m->GenericRead = 0x120089; m->GenericWrite = 0x120116; m->GenericExecute = 0x1200a0; m->GenericAll = 0x1f01ff;      /* (a file) */
+    if (NtQueryObject(handle, 2, buf, sizeof(buf), &got)) return;
+    bytes = *(USHORT *)buf;
+    name = *(const WCHAR **)(buf + 8);
+    if (!name) return;
+    for (i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
+        const char *t = types[i].name;
+        USHORT n = 0;
+        while (t[n] && n * 2 < bytes && (name[n] | 0x20) == (t[n] | 0x20)) ++n;
+        if (!t[n] && n * 2 == bytes) { m->GenericRead = types[i].read; m->GenericWrite = types[i].write; m->GenericExecute = types[i].execute; m->GenericAll = types[i].all; return; }
     }
-    heap_drop(t);
-    *out = buf;
-    *length = at;
+}
+
+/* The descriptor an object has when none was given to it: owner and group of the creator, and its default DACL (the generic rights mapped for the type). */
+static NTSTATUS default_descriptor(HANDLE handle, BYTE **out, ULONG *length)
+{
+    GENERIC_MAPPING mapping;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    NTSTATUS status;
+    mapping_for_handle(handle, &mapping);
+    status = RtlNewSecurityObjectEx(NULL, NULL, &sd, NULL, FALSE, 0, NULL, &mapping);
+    if (status) return status;
+    *length = RtlLengthSecurityDescriptor(sd);
+    *out = sd;
     return STATUS_SUCCESS;
 }
 
@@ -918,7 +930,7 @@ static NTSTATUS current_descriptor(HANDLE handle, ACCESS_MASK required, BYTE **o
     BYTE *buf;
     NTSTATUS status = NtTcosToken(TCOS_OBJECT_SD_GET, (ULONG_PTR)handle, required, 0, 0, (ULONG_PTR)&needed);
     if (status && status != STATUS_BUFFER_TOO_SMALL_) return status;
-    if (needed == 0) return default_descriptor(out, length);
+    if (needed == 0) return default_descriptor(handle, out, length);
     buf = heap_new(needed);
     if (!buf) return STATUS_NO_MEMORY_;
     status = NtTcosToken(TCOS_OBJECT_SD_GET, (ULONG_PTR)handle, required, (ULONG_PTR)buf, needed, (ULONG_PTR)&needed);
@@ -1223,12 +1235,17 @@ __declspec(dllexport) NTSTATUS NTAPI RtlNewSecurityObjectEx(PSECURITY_DESCRIPTOR
     if ((status = read_token(token, TOKEN_QUERY, t))) goto done;
     owner = (c && c->Owner && !(flags & 0) ) ? (const BYTE *)c + c->Owner : (t->has_owner ? t->owner : t->user.sid);
     group = (c && c->Group) ? (const BYTE *)c + c->Group : (t->has_pgroup ? t->pgroup : t->user.sid);
-    dacl_buf = heap_new(65536);
-    sacl_buf = heap_new(65536);
-    result = heap_new(sizeof(SECURITY_DESCRIPTOR_RELATIVE) + 2 * MAX_SID_BYTES + 2 * 65536);
-    if (!dacl_buf || !sacl_buf || !result) { heap_drop(result); status = STATUS_NO_MEMORY_; goto done; }
-    dacl_out.base = dacl_buf + 8; dacl_out.capacity = 65536 - 8; dacl_out.used = 0;
-    sacl_out.base = sacl_buf + 8; sacl_out.capacity = 65536 - 8; sacl_out.used = 0;
+    {
+        /* room for the ACEs of the creator, the parent (each can pass on twice: once as effective, once to pass on) and the token, and an ACL holds 64 KB at most */
+        ULONG room = 1024 + 2 * ((creator_rel ? RtlLengthSecurityDescriptor(creator_rel) : 0) + (parent_rel ? RtlLengthSecurityDescriptor(parent_rel) : 0)) + DEFAULT_DACL_BYTES * 2;
+        if (room > 65536) room = 65536;
+        dacl_buf = heap_new(room + 8);
+        sacl_buf = heap_new(room + 8);
+        result = heap_new(sizeof(SECURITY_DESCRIPTOR_RELATIVE) + 2 * MAX_SID_BYTES + 2 * (room + 8));
+        if (!dacl_buf || !sacl_buf || !result) { heap_drop(result); status = STATUS_NO_MEMORY_; goto done; }
+        dacl_out.base = dacl_buf + 8; dacl_out.capacity = room; dacl_out.used = 0;
+        sacl_out.base = sacl_buf + 8; sacl_out.capacity = room; sacl_out.used = 0;
+    }
     /* the DACL: the creator's if it gave one (the inheritable ACEs of the parent follow when auto-inheriting), else what the parent passes on, else the default of the token */
     if (c && (c->Control & SE_DACL_PRESENT) && !(c->Control & SE_DACL_DEFAULTED)) {
         have_dacl = TRUE;
@@ -1263,7 +1280,14 @@ __declspec(dllexport) NTSTATUS NTAPI RtlNewSecurityObjectEx(PSECURITY_DESCRIPTOR
             const ACL *acl = (const ACL *)t->dacl;
             const ACE_HEADER *ace = (const ACE_HEADER *)(acl + 1);
             DWORD i;
-            for (i = 0; i < acl->AceCount; ++i, ace = (const ACE_HEADER *)((const BYTE *)ace + ace->AceSize)) { acl_append(&dacl_out, ace, ace->AceSize); dacl_count++; }
+            for (i = 0; i < acl->AceCount; ++i, ace = (const ACE_HEADER *)((const BYTE *)ace + ace->AceSize)) {
+                BYTE copy[512];
+                if (ace->AceSize > sizeof(copy)) continue;
+                memcpy(copy, ace, ace->AceSize);
+                if (ace->AceType <= 3) { DWORD m = ((ACCESS_ALLOWED_ACE *)copy)->Mask; RtlMapGenericMask(&m, mapping); ((ACCESS_ALLOWED_ACE *)copy)->Mask = m; }
+                acl_append(&dacl_out, copy, ace->AceSize);
+                dacl_count++;
+            }
             have_dacl = TRUE;
         }
     }

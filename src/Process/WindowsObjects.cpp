@@ -21,6 +21,7 @@
 #include "Process/ModuleLoader.hpp"
 #include "Executable/PeFile.hpp"
 #include "Process/Objects.hpp"
+#include "Process/AccessCheck.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
@@ -129,6 +130,26 @@ uint32_t give_handle(Process& p, ObjectManager& objects, ObjectKind kind, uint32
 }
 
 
+// The rights a handle of each kind can hold, and what its generic rights stand for (the generic mapping of the object type); false for a kind that is not told apart here.
+struct KindAccess { uint32_t valid; security::GenericMapping mapping; };
+bool kind_access(DescriptorKind kind, KindAccess* out) {
+  switch (kind) {
+    case DescriptorKind::Event: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::Mutex: *out = {0x1F0001u, {0x20001u, 0x20000u, 0x120000u, 0x1F0001u}}; return true;
+    case DescriptorKind::Semaphore: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::Timer: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::Section: *out = {0xF001Fu, {0x20005u, 0x20012u, 0x20008u, 0xF001Fu}}; return true;
+    case DescriptorKind::Job: *out = {0x1F001Fu, {0x20004u, 0x20003u, 0x120000u, 0x1F001Fu}}; return true;
+    case DescriptorKind::Process: *out = {0x1FFFFFu, {0x20410u, 0x20BEAu, 0x121001u, 0x1FFFFFu}}; return true;
+    case DescriptorKind::Thread: *out = {0x1FFFFFu, {0x20048u, 0x20037u, 0x120000u, 0x1FFFFFu}}; return true;
+    case DescriptorKind::Key: *out = {0xF003Fu, {0x20019u, 0x20006u, 0x20019u, 0xF003Fu}}; return true;
+    case DescriptorKind::Token: *out = {0xF01FFu, {0x20018u, 0x200E0u, 0x20000u, 0xF01FFu}}; return true;
+    case DescriptorKind::DebugObject: *out = {0x1F000Fu, {0x20001u, 0x20002u, 0x120000u, 0x1F000Fu}}; return true;
+    case DescriptorKind::File: case DescriptorKind::Directory: case DescriptorKind::Pipe: *out = {0x1F01FFu, {0x120089u, 0x120116u, 0x1200A0u, 0x1F01FFu}}; return true;
+    default: return false;
+  }
+}
+
 // The rights a handle to a synchronization object can have: the object's own ("query state", and "modify state" for all but mutexes), the standard ones and SYNCHRONIZE.
 // Generic requests are mapped to them; what is asked for that is not among them is refused. `granted` gets what the handle will hold.
 constexpr uint32_t kAccessDeniedStatus = 0xC0000022u, kPrivilegeNotHeld = 0xC0000061u, kSynchronize = 0x100000u, kMaximumAllowed = 0x2000000u, kAccessSystemSecurity = 0x1000000u;
@@ -161,6 +182,15 @@ void restrict_handle(Process& p, uint64_t handle_at, uint32_t granted, ObjectKin
 bool handle_allows(Process& p, uint64_t handle, uint32_t rights) {
   uint64_t slot = 0;
   return !slot_of(handle, &slot) || (p.files().denied_access(slot) & rights) == 0;
+}
+
+// The rights asked for in a duplicate, with the generic ones as the specific ones of the kind (MAXIMUM_ALLOWED asks for all).
+uint32_t mapped_access(DescriptorKind kind, uint32_t desired) {
+  KindAccess a;
+  if (!kind_access(kind, &a)) return desired;
+  uint32_t mapped = a.mapping.map(desired);
+  if (desired & 0x02000000u) mapped = a.valid;
+  return mapped & ~uint32_t{0x02000000u};
 }
 
 uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, bool manual_reset, bool state, int32_t initial, int32_t maximum) {
@@ -585,7 +615,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if ((options & 1) && !p.files().protected_from_close(slot)) {      // DUPLICATE_CLOSE_SOURCE into this very process: the source goes first, so the handle keeps its number
     if (target_at != 0 && !p.write_user_u64(target_at, r.args[1])) return kAccessViolation;
     const uint32_t original = p.files().denied_access(slot);
-    p.files().set_denied_access(slot, (options & 2) ? original : (original | ~uint32_t(desired_access)));
+    p.files().set_denied_access(slot, (options & 2) ? original : (original | ~mapped_access(p.files().kind(slot), uint32_t(desired_access))));
     p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
     return kSuccess;
   }
@@ -602,7 +632,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   }
   {      // DUPLICATE_SAME_ACCESS keeps the rights; otherwise the copy has the ones asked for (the rights of a section are the ones MapViewOfFile checks)
     const uint32_t original = p.files().denied_access(slot);
-    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~uint32_t(desired_access)));
+    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~mapped_access(p.files().kind(slot), uint32_t(desired_access))));
   }
   const bool same = (options & 4) != 0;      // DUPLICATE_SAME_ATTRIBUTES; otherwise the handle is inheritable if the attributes say OBJ_INHERIT
   p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, same && p.files().protected_from_close(slot));
@@ -1143,13 +1173,11 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
     case 0: {      // OBJECT_BASIC_INFORMATION
       put32(0, (p.files().inheritable(slot) ? 2u : 0u) | (p.files().protected_from_close(slot) ? 1u : 0u));      // Attributes (OBJ_INHERIT, a protected handle)
       uint32_t granted = 0x001F0FFF;
-      if (p.files().kind(slot) == DescriptorKind::Directory) if (const OpenObject* opened = p.files().object(slot)) if (opened->granted_access != 0) {      // a directory handle says what it was opened for
-        granted = opened->granted_access;
-        if (granted & 0x80000000u) granted |= 0x120089u;      // GENERIC_READ
-        if (granted & 0x40000000u) granted |= 0x120116u;      // GENERIC_WRITE
-        if (granted & 0x20000000u) granted |= 0x1200A0u;      // GENERIC_EXECUTE
-        if (granted & 0x10000000u) granted |= 0x1F01FFu;      // GENERIC_ALL
-        granted &= ~0xF0000000u;
+      KindAccess kind_rights;
+      if (kind_access(p.files().kind(slot), &kind_rights)) granted = kind_rights.valid & ~p.files().denied_access(slot);      // what the handle holds of what the kind has
+      if (p.files().kind(slot) == DescriptorKind::File || p.files().kind(slot) == DescriptorKind::Directory) if (const OpenObject* opened = p.files().object(slot)) if (opened->granted_access != 0xFFFFFFFFu) {      // a file or directory handle says what it was opened for
+        granted = kind_rights.mapping.map(opened->granted_access & ~0x02000000u) & kind_rights.valid & ~p.files().denied_access(slot);
+        if (opened->granted_access & 0x02000000u) granted = kind_rights.valid & ~p.files().denied_access(slot);
       }
       put32(4, granted);      // GrantedAccess
       put32(8, 1);               // HandleCount

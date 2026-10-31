@@ -86,6 +86,13 @@ static const AccountSid ACCOUNT_SIDS[] = {
     { WinBuiltinPerfMonitoringUsersSid, L"Performance Monitor Users", L"BUILTIN", SidTypeAlias },
     { WinBuiltinPerfLoggingUsersSid, L"Performance Log Users", L"BUILTIN", SidTypeAlias },
     { WinBuiltinAnyPackageSid, L"ALL APPLICATION PACKAGES", L"APPLICATION PACKAGE AUTHORITY", SidTypeWellKnownGroup },
+    { WinConsoleLogonSid, L"CONSOLE LOGON", L"NT AUTHORITY", SidTypeWellKnownGroup },
+    { WinUntrustedLabelSid, L"Untrusted Mandatory Level", L"Mandatory Label", SidTypeLabel },
+    { WinLowLabelSid, L"Low Mandatory Level", L"Mandatory Label", SidTypeLabel },
+    { WinMediumLabelSid, L"Medium Mandatory Level", L"Mandatory Label", SidTypeLabel },
+    { WinMediumPlusLabelSid, L"Medium Plus Mandatory Level", L"Mandatory Label", SidTypeLabel },
+    { WinHighLabelSid, L"High Mandatory Level", L"Mandatory Label", SidTypeLabel },
+    { WinSystemLabelSid, L"System Mandatory Level", L"Mandatory Label", SidTypeLabel },
 };
 
 /* helper function for SE_FILE_OBJECT objects in [Get|Set]NamedSecurityInfo */
@@ -773,6 +780,25 @@ LookupAccountSidW(
             }
             break;
         }
+    }
+
+    if (dm == NULL && IsWellKnownSid(sid, WinLogonIdsSid)) {      /* the logon session: S-1-5-5-x-y is LogonSessionId_x_y */
+        static const WCHAR prefix[] = L"LogonSessionId_";
+        static WCHAR logon_name[64];
+        DWORD k = 0, part, v, d;
+        WCHAR digits[12];
+        for (; prefix[k]; ++k) logon_name[k] = prefix[k];
+        for (part = 1; part <= 2; ++part) {
+            v = ((MAX_SID *)sid)->SubAuthority[part];
+            d = 0;
+            do { digits[d++] = '0' + v % 10; v /= 10; } while (v);
+            while (d) logon_name[k++] = digits[--d];
+            if (part == 1) logon_name[k++] = '_';
+        }
+        logon_name[k] = 0;
+        ac = logon_name;
+        dm = L"NT AUTHORITY";
+        use = SidTypeLogonSession;
     }
 
     if (dm == NULL) {

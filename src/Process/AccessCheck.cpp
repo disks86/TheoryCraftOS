@@ -297,9 +297,10 @@ uint32_t label_removes(ConstByteView descriptor, const TokenView& token, const G
 CheckResult access_check(ConstByteView descriptor, const TokenView& token, uint32_t desired, const GenericMapping& mapping) {
   CheckResult result;
   if (!valid_descriptor(descriptor) || descriptor_owner(descriptor).empty() || descriptor_group(descriptor).empty()) { result.status = kStatusInvalidSecurityDescriptor; return result; }
-  if (token.is_impersonation() && token.level() < 2) { result.status = kStatusBadImpersonationLevel; return result; }
+  if (token.is_impersonation() && token.level() < 1) { result.status = kStatusBadImpersonationLevel; return result; }
   const bool maximum = (desired & kMaximumAllowed) != 0;
   const uint32_t asked = mapping.map(desired & ~kMaximumAllowed);
+  if (!maximum && asked == 0) { result.status = kStatusAccessDenied; return result; }      // (nothing asked for is nothing granted)
   uint32_t remaining = asked, granted = 0;
   bool enabled = false;
   if (remaining & kAccessSystemSecurity) {
@@ -340,7 +341,7 @@ CheckResult access_check(ConstByteView descriptor, const TokenView& token, uint3
   const uint32_t privilege_granted = granted;
   if (!dacl_present || dacl.empty()) {
     // no DACL, or a NULL one: everything is allowed (an empty one, size 8, is not empty() here: acl_at gives its 8 bytes)
-    granted |= remaining | (maximum ? (mapping.all | kDelete | kReadControl | kWriteDac | kWriteOwner | kSynchronize) : 0);
+    granted |= remaining | (maximum ? mapping.all : 0);
     remaining = 0;
   } else {
     if (maximum) {
