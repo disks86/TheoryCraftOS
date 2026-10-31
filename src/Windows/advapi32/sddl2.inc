@@ -66,9 +66,9 @@ static const WCHAR *sddl_parse_sid(const WCHAR *p, BYTE *out, BOOL *ok)
 
 static BOOL sddl_parse_guid(const WCHAR **pp, GUID *guid, BOOL *present)
 {
-    const WCHAR *p = *pp;
+    const WCHAR *p = sddl_skip(*pp);
     *present = FALSE;
-    if (*p == ';' || *p == ')') return TRUE;
+    if (*p == ';' || *p == ')') { *pp = p; return TRUE; }
     if (*p == '{') ++p;
     DWORD parts[11];
     static const int widths[11] = {8, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2};
@@ -118,7 +118,7 @@ static DWORD sddl_parse_acl(const WCHAR **pp, ACL *acl, WORD *control, WORD prot
         else if (!wcsncmp(p, L"NO_ACCESS_CONTROL", 17)) { *is_null = TRUE; *control |= null_acl; p += 17; }
         else break;
     }
-    while (*p == '(') {
+    for (p = sddl_skip(p); *p == '('; p = sddl_skip(p)) {
         BYTE ace_type = 0, ace_flags = 0;
         DWORD rights = 0;
         GUID object = {0}, inherit = {0};
@@ -134,7 +134,6 @@ static DWORD sddl_parse_acl(const WCHAR **pp, ACL *acl, WORD *control, WORD prot
         if (i == (int)ARRAY_SIZE(sddl_ace_types)) return ERROR_INVALID_ACL;
         ace_type = sddl_ace_types[i].value;
         object_ace = sddl_ace_types[i].object;
-        p = sddl_skip(p);
         if (*p++ != ';') return ERROR_INVALID_ACL;
         for (;;) {      /* flags */
             p = sddl_skip(p);
@@ -146,36 +145,36 @@ static DWORD sddl_parse_acl(const WCHAR **pp, ACL *acl, WORD *control, WORD prot
         }
         if (*p++ != ';') return ERROR_INVALID_ACL;
         p = sddl_skip(p);
-        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-            ULONGLONG v = 0;
-            int digits = 0;
+        for (;;) {      /* the rights: numbers (hexadecimal 0x, octal 0, decimal) and two letter names, together */
+            if (*p >= '0' && *p <= '9') {
+                ULONGLONG v = 0;
+                int digits = 0;
+                if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+                    p += 2;
+                    for (;; ++p, ++digits) {
+                        int x;
+                        if (*p >= '0' && *p <= '9') x = *p - '0';
+                        else if (*p >= 'a' && *p <= 'f') x = *p - 'a' + 10;
+                        else if (*p >= 'A' && *p <= 'F') x = *p - 'A' + 10;
+                        else break;
+                        v = v * 16 + (ULONGLONG)x;
+                        if (v >> 32) return ERROR_INVALID_ACL;
+                    }
+                    if (!digits) return ERROR_INVALID_ACL;
+                } else if (p[0] == '0') {
+                    for (; *p >= '0' && *p <= '7'; ++p) { v = v * 8 + (ULONGLONG)(*p - '0'); if (v >> 32) return ERROR_INVALID_ACL; }
+                } else {
+                    for (; *p >= '0' && *p <= '9'; ++p) { v = v * 10 + (ULONGLONG)(*p - '0'); if (v >> 32) return ERROR_INVALID_ACL; }
+                }
+                rights |= (DWORD)v;
+                continue;
+            }
+            for (i = 0; i < (int)ARRAY_SIZE(sddl_rights); ++i)
+                if (p[0] == (WCHAR)sddl_rights[i].name[0] && p[1] == (WCHAR)sddl_rights[i].name[1]) break;
+            if (i == (int)ARRAY_SIZE(sddl_rights)) break;
+            rights |= sddl_rights[i].value;
             p += 2;
-            for (;; ++p, ++digits) {
-                int x;
-                if (*p >= '0' && *p <= '9') x = *p - '0';
-                else if (*p >= 'a' && *p <= 'f') x = *p - 'a' + 10;
-                else if (*p >= 'A' && *p <= 'F') x = *p - 'A' + 10;
-                else break;
-                v = v * 16 + (ULONGLONG)x;
-                if (v >> 32) return ERROR_INVALID_ACL;
-            }
-            if (!digits) return ERROR_INVALID_ACL;
-            rights = (DWORD)v;
-        } else if (*p >= '0' && *p <= '9') {
-            ULONGLONG v = 0;
-            for (; *p >= '0' && *p <= '9'; ++p) { v = v * 10 + (ULONGLONG)(*p - '0'); if (v >> 32) return ERROR_INVALID_ACL; }
-            rights = (DWORD)v;
-        } else {
-            for (;;) {
-                p = sddl_skip(p);
-                for (i = 0; i < (int)ARRAY_SIZE(sddl_rights); ++i)
-                    if (p[0] == (WCHAR)sddl_rights[i].name[0] && p[1] == (WCHAR)sddl_rights[i].name[1]) break;
-                if (i == (int)ARRAY_SIZE(sddl_rights)) break;
-                rights |= sddl_rights[i].value;
-                p += 2;
-            }
         }
-        p = sddl_skip(p);
         if (*p++ != ';') return ERROR_INVALID_ACL;
         if (!sddl_parse_guid(&p, &object, &has_object)) return ERROR_INVALID_ACL;
         if (*p++ != ';') return ERROR_INVALID_ACL;
@@ -353,7 +352,7 @@ static void sddl_put_rights(sddl_out *o, DWORD mask, BOOL label)
         int n = 0;
         DWORD v = mask;
         int digits = 1;
-        while (v >> (4 * digits)) ++digits;
+        while (digits < 8 && (v >> (4 * digits))) ++digits;
         hex[n++] = '0';
         hex[n++] = 'x';
         sddl_put(o, hex, (DWORD)n);

@@ -294,7 +294,7 @@ uint32_t label_removes(ConstByteView descriptor, const TokenView& token, const G
 
 }  // namespace
 
-CheckResult access_check(ConstByteView descriptor, const TokenView& token, uint32_t desired, const GenericMapping& mapping) {
+CheckResult access_check(ConstByteView descriptor, const TokenView& token, uint32_t desired, const GenericMapping& mapping, uint32_t flags) {
   CheckResult result;
   if (!valid_descriptor(descriptor) || descriptor_owner(descriptor).empty() || descriptor_group(descriptor).empty()) { result.status = kStatusInvalidSecurityDescriptor; return result; }
   if (token.is_impersonation() && token.level() < 1) { result.status = kStatusBadImpersonationLevel; return result; }
@@ -316,6 +316,11 @@ CheckResult access_check(ConstByteView descriptor, const TokenView& token, uint3
     granted |= kWriteOwner;
     remaining &= ~kWriteOwner;
     result.privileges_used |= uint64_t{1} << kSeTakeOwnershipPrivilege;
+  }
+  if (flags & kBackupIntent) {      // the privileges of backup and restore (of files): the rights they stand for
+    constexpr uint32_t kBackupRights = kReadControl | kSynchronize | 0x1200A9u | kAccessSystemSecurity, kRestoreRights = kWriteDac | kWriteOwner | kDelete | 0x120116u | 0x6u | kAccessSystemSecurity;
+    if (token.has_privilege(kSeBackupPrivilege, &enabled) && enabled && (remaining & kBackupRights)) { granted |= remaining & kBackupRights; remaining &= ~kBackupRights; result.privileges_used |= uint64_t{1} << kSeBackupPrivilege; }
+    if (token.has_privilege(kSeRestorePrivilege, &enabled) && enabled && (remaining & kRestoreRights)) { granted |= remaining & kRestoreRights; remaining &= ~kRestoreRights; result.privileges_used |= uint64_t{1} << kSeRestorePrivilege; }
   }
   bool dacl_present;
   const ConstByteView dacl = descriptor_dacl(descriptor, &dacl_present);

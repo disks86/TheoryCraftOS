@@ -2492,7 +2492,10 @@ __declspec(dllexport) BOOL WINAPI ConvertStringSecurityDescriptorToSecurityDescr
     
 
     if(!StringSecurityDescriptor)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
+    }
 
     StringSecurityDescriptorW = strdupAW(StringSecurityDescriptor);
     ret = ConvertStringSecurityDescriptorToSecurityDescriptorW(StringSecurityDescriptorW,

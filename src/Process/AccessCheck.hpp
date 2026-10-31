@@ -74,7 +74,8 @@ struct CheckResult {
 
 // The rights `desired` (generic rights are mapped here) that the token gets to an object with the self-relative security descriptor. Without MAXIMUM_ALLOWED the answer is all or
 // nothing (granted 0 on STATUS_ACCESS_DENIED); with it, granted is everything the token may have.
-CheckResult access_check(ConstByteView descriptor, const TokenView& token, uint32_t desired, const GenericMapping& mapping);
+constexpr uint32_t kBackupIntent = 1;      // a file opened for backup or restore: the privileges of those grant their rights
+CheckResult access_check(ConstByteView descriptor, const TokenView& token, uint32_t desired, const GenericMapping& mapping, uint32_t flags = 0);
 
 // Is the self-relative descriptor well formed (revision, offsets inside the buffer, SIDs and ACLs whole)?
 bool valid_descriptor(ConstByteView descriptor);

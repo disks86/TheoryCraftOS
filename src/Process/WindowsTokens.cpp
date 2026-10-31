@@ -297,8 +297,23 @@ void token_process_exited(uint64_t pid) {
   }
 }
 
+uint32_t open_with_descriptor(Process& p, char tag, uint64_t id, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted) {
+  ObjectManager* objects = system_objects();
+  uint32_t status = 0;
+  *granted = mapping.map(desired & ~kMaximumAllowed);
+  if (desired & kMaximumAllowed) *granted = mapping.all;
+  if (!objects || !objects->allocator()) return kSuccess;
+  char key[16];
+  const uint32_t n = ObjectManager::object_key(tag, uint32_t(id), key);
+  const uint32_t size = objects->security_size(StringView(key, n));
+  if (size == 0) return kSuccess;
+  ByteBuffer sd(*objects->allocator());
+  if (!sd.put_zeros(size) || objects->security_get(StringView(key, n), sd.writable_view()) != size) return kAccessDenied;
+  if (!caller_may(p, sd.view(), desired, mapping, granted, &status)) return status ? status : kAccessDenied;
+  return kSuccess;
+}
+
 bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted, uint32_t* status, bool backup_intent) {
-  (void)backup_intent;
   *granted = mapping.map(desired & ~kMaximumAllowed);
   *status = kSuccess;
   if (descriptor.empty()) return true;
@@ -307,7 +322,7 @@ bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const se
   if (!caller_token_blob(p, blob)) return true;      // (no token can be had: nothing to hold against the caller)
   security::TokenView token;
   if (!token.parse(blob.view())) { *status = kAccessDenied; return false; }
-  const security::CheckResult r = security::access_check(descriptor, token, desired, mapping);
+  const security::CheckResult r = security::access_check(descriptor, token, desired, mapping, backup_intent ? security::kBackupIntent : 0);
   *status = r.status;
   *granted = r.granted;
   return r.status == kSuccess;
@@ -378,6 +393,11 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
       if (!valid) return kAccessDenied;
       const uint32_t object = owner_object(g_thread_tokens, tid);
       if (object == 0) return kNoToken;
+      {      // the token of an anonymous impersonation cannot be opened
+        ByteBuffer blob(*objects->allocator());
+        security::TokenView view;
+        if (load_blob(object, blob) && view.parse(blob.view()) && view.is_impersonation() && view.level() == 0) return 0xC00000A6u;      // STATUS_CANT_OPEN_ANONYMOUS
+      }
       if (const uint32_t status = check_token_access(p, object, rights)) return status;
       return give_token_handle(p, object, rights, (a[4] & 1) != 0, a[3]);
     }
@@ -416,6 +436,21 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
       if (object == 0) return kNoResources;
       return give_token_handle(p, object, kTokenAllAccess, false, a[1]);
     }
+    case TCOS_FILE_PARENT_SD: {      // (op, handle, buffer, capacity, &needed)
+      if (!slot_of(a[1], &slot) || (p.files().kind(slot) != DescriptorKind::File && p.files().kind(slot) != DescriptorKind::Directory)) return kInvalidHandle;
+      OpenObject* o = p.files().object(slot);
+      if (!o) return kInvalidHandle;
+      const StringView full = o->path.view();
+      const uint64_t cut = full.rfind('/');
+      const StringView parent = cut == StringView::npos || cut == 0 ? StringView("/") : full.first(cut);
+      const uint32_t size = objects->security_size(parent);
+      if (a[4] != 0 && !p.write_user_u32(a[4], size)) return kAccessViolation;
+      if (size == 0) return kSuccess;
+      if (a[3] < size) return kBufferTooSmall;
+      ByteBuffer sd(*objects->allocator());
+      if (!sd.put_zeros(size) || objects->security_get(parent, sd.writable_view()) != size) return kNoResources;
+      return p.write_user(a[2], sd.view()) ? kSuccess : kAccessViolation;
+    }
     case TCOS_OBJECT_SD_GET: case TCOS_OBJECT_SD_SET: {      // (op, handle, required, buffer, length-or-capacity, &needed)
       if (!slot_of(a[1], &slot)) return kInvalidHandle;
       const DescriptorKind kind = p.files().kind(slot);
@@ -451,9 +486,9 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
           key_size = n;
           break;
         }
-        case DescriptorKind::Pipe: {
+        case DescriptorKind::Key: case DescriptorKind::Pipe: {
           char k[16];
-          const uint32_t n = ObjectManager::object_key('n', uint32_t(token), k);
+          const uint32_t n = ObjectManager::object_key(kind == DescriptorKind::Key ? 'k' : 'n', uint32_t(token), k);
           for (uint32_t i = 0; i < n; ++i) key[i] = k[i];
           key_size = n;
           break;

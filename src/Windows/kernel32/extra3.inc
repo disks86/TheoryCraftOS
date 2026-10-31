@@ -1443,7 +1443,7 @@ typedef struct { LARGE_INTEGER PerProcessUserTimeLimit, PerJobUserTimeLimit; DWO
 EXPORT HANDLE WINAPI CreateJobObjectW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name) {
   NamedAttributes n;
   HANDLE h = NULL;
-  const NTSTATUS status = NtCreateJobObject(&h, 0x1F001F, named_attributes(&n, name, sa && sa->bInheritHandle));
+  const NTSTATUS status = NtCreateJobObject(&h, 0x1F001F, named_attributes_sa(&n, name, sa));
   return created(status, h);
 }
 EXPORT HANDLE WINAPI CreateJobObjectA(LPSECURITY_ATTRIBUTES sa, LPCSTR name) { WCHAR *w = name ? to_wide(name) : NULL; HANDLE h = CreateJobObjectW(sa, w); free_wide(w); return h; }

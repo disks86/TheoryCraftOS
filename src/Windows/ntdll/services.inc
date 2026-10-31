@@ -99,7 +99,7 @@ NT_SERVICE(NtCreateIRTimer);
 NT_SERVICE(NtCreateIoCompletion);
 NT_SERVICE(NtCreateIoRing);
 NT_SERVICE(NtCreateJobSet);
-NT_SERVICE(NtCreateKey);
+NT_SERVICE_RAW(NtCreateKey);
 NT_SERVICE(NtCreateKeyTransacted);
 NT_SERVICE(NtCreateKeyedEvent);
 NT_SERVICE(NtCreateLowBoxToken);

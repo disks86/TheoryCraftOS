@@ -138,7 +138,7 @@ bool kind_access(DescriptorKind kind, KindAccess* out) {
     case DescriptorKind::Mutex: *out = {0x1F0001u, {0x20001u, 0x20000u, 0x120000u, 0x1F0001u}}; return true;
     case DescriptorKind::Semaphore: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
     case DescriptorKind::Timer: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
-    case DescriptorKind::Section: *out = {0xF001Fu, {0x20005u, 0x20012u, 0x20008u, 0xF001Fu}}; return true;
+    case DescriptorKind::Section: *out = {0xF001Fu, {0x20005u, 0x20002u, 0x20008u, 0xF001Fu}}; return true;
     case DescriptorKind::Job: *out = {0x1F001Fu, {0x20004u, 0x20003u, 0x120000u, 0x1F001Fu}}; return true;
     case DescriptorKind::Process: *out = {0x1FFFFFu, {0x20410u, 0x20BEAu, 0x121001u, 0x1FFFFFu}}; return true;
     case DescriptorKind::Thread: *out = {0x1FFFFFu, {0x20048u, 0x20037u, 0x120000u, 0x1FFFFFu}}; return true;
@@ -176,7 +176,8 @@ void restrict_handle(Process& p, uint64_t handle_at, uint32_t granted, ObjectKin
   uint64_t handle = 0, slot = 0;
   if (!p.read_user_u64(handle_at, &handle) || !slot_of(handle, &slot)) return;
   const bool modifiable = kind != ObjectKind::Mutex;
-  p.files().set_denied_access(slot, ~granted & (0x1F0001u | (modifiable ? 2u : 0u)));
+  (void)modifiable;
+  p.files().set_denied_access(slot, ~granted);
 }
 // Does the handle (a slot) hold the rights?
 bool handle_allows(Process& p, uint64_t handle, uint32_t rights) {
@@ -784,6 +785,7 @@ uint32_t image_section_status(ConstByteView file, exe::PeFile& pe) {
 
 // NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER MaximumSize, ULONG PageProtection, ULONG AllocationAttributes, HANDLE FileHandle): memory to map into
 // address spaces, shared by name; with a file handle it is the file's contents (written back by FlushViewOfFile, when the last view goes and when the section does).
+uint32_t section_rights(uint32_t access);
 uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   uint64_t page_protection = 0, attributes = 0, file_handle = 0;
   if (!argument(p, r, 4, &page_protection) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &file_handle)) return kAccessViolation;
@@ -847,7 +849,10 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     if (!AddressSpace::round_up(pe.size_of_image(), &image_rounded) || size > image_rounded) { objects->release(c.id); return 0xC0000040u; }      // STATUS_SECTION_TOO_BIG
     objects->section_set_reported_size(c.id, size != 0 ? size : image_rounded);
   }
-  return give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
+  const uint32_t given = give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
+  uint64_t handle = 0, slot = 0;
+  if ((given == kSuccess || given == c.status) && p.read_user_u64(r.args[0], &handle) && slot_of(handle, &slot)) p.files().set_denied_access(slot, ~section_rights(uint32_t(r.args[1])));      // (the handle holds the rights it was made for)
+  return given;
 }
 // The rights an access mask asks for, with the generic ones spelled out (a section: query 1, write 2, read 4, execute 8, extend size 0x10).
 uint32_t section_rights(uint32_t access) {

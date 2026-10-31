@@ -697,6 +697,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtPrivilegeCheck(HANDLE token, PPRIVILEGE_S
     if (!set || !result) return STATUS_ACCESS_VIOLATION_;
     if (!(t = heap_new(sizeof(*t)))) return STATUS_NO_MEMORY_;
     status = read_token(token, TOKEN_QUERY, t);
+    if (!status && t->type == TokenImpersonation && t->level < SecurityIdentification) status = STATUS_BAD_IMPERSONATION_LEVEL_;
     if (!status) {
         for (i = 0; i < set->PrivilegeCount; ++i) {
             set->Privilege[i].Attributes &= ~SE_PRIVILEGE_USED_FOR_ACCESS;
@@ -1109,8 +1110,14 @@ __declspec(dllexport) NTSTATUS NTAPI NtSetSecurityObject(HANDLE handle, SECURITY
     NTSTATUS status;
     ACCESS_MASK required = set_rights(info);
     if (!sd) return STATUS_ACCESS_VIOLATION_;
+    if (((SECURITY_DESCRIPTOR *)sd)->Revision != 1) return STATUS_UNKNOWN_REVISION;
     if (!RtlValidSecurityDescriptor(sd)) return STATUS_INVALID_SECURITY_DESCR_;
-    if ((info & OWNER_SECURITY_INFORMATION) && !((SECURITY_DESCRIPTOR *)sd)->Owner && !(((SECURITY_DESCRIPTOR *)sd)->Control & SE_SELF_RELATIVE)) return STATUS_INVALID_SECURITY_DESCR_;
+    {
+        SECURITY_DESCRIPTOR_RELATIVE *rel = sd;
+        BOOL relative = (rel->Control & SE_SELF_RELATIVE) != 0;
+        BOOL has_owner = relative ? rel->Owner != 0 : ((SECURITY_DESCRIPTOR *)sd)->Owner != NULL, has_group = relative ? rel->Group != 0 : ((SECURITY_DESCRIPTOR *)sd)->Group != NULL;
+        if (((info & OWNER_SECURITY_INFORMATION) && !has_owner) || ((info & GROUP_SECURITY_INFORMATION) && !has_group)) return STATUS_INVALID_SECURITY_DESCR_;
+    }
     status = current_descriptor(handle, required, &current, &current_length);
     if (status) return status;
     status = merge_descriptor(current, current_length, info, sd, &merged, &merged_length);
@@ -1374,3 +1381,106 @@ ZW_ALIAS(ZwAccessCheckByType, NtAccessCheckByType);
 ZW_ALIAS(ZwAccessCheckByTypeResultList, NtAccessCheckByTypeResultList);
 ZW_ALIAS(ZwQuerySecurityObject, NtQuerySecurityObject);
 ZW_ALIAS(ZwSetSecurityObject, NtSetSecurityObject);
+
+/* ---- the descriptor of a new object --------------------------------------------------------------------------------------------------------------------- */
+
+enum { SD_FILE = 1, SD_EVENT, SD_MUTANT, SD_SEMAPHORE, SD_TIMER, SD_SECTION, SD_JOB, SD_PIPE, SD_KEY, SD_PROCESS, SD_THREAD };
+static const GENERIC_MAPPING sd_mappings[] = {
+    {0, 0, 0, 0},
+    {0x120089, 0x120116, 0x1200a0, 0x1f01ff},      /* SD_FILE */
+    {0x20001, 0x20002, 0x120000, 0x1f0003},      /* SD_EVENT */
+    {0x20001, 0x20000, 0x120000, 0x1f0001},      /* SD_MUTANT */
+    {0x20001, 0x20002, 0x120000, 0x1f0003},      /* SD_SEMAPHORE */
+    {0x20001, 0x20002, 0x120000, 0x1f0003},      /* SD_TIMER */
+    {0x20005, 0x20002, 0x20008, 0xf001f},      /* SD_SECTION */
+    {0x20004, 0x20003, 0x120000, 0x1f001f},      /* SD_JOB */
+    {0x120089, 0x120116, 0x1200a0, 0x1f01ff},      /* SD_PIPE */
+    {0x20019, 0x20006, 0x20019, 0xf003f},      /* SD_KEY */
+    {0x20410, 0x20bea, 0x121001, 0x1fffff},      /* SD_PROCESS */
+    {0x20048, 0x20037, 0x120000, 0x1fffff},      /* SD_THREAD */
+};
+
+/* A new object gets the descriptor its creator gave it, with what its parent (a file's directory) passes on; with neither it has none and the default is made when it is asked for.
+ * A file or directory made by the system inherits automatically (the inherited ACEs are marked as such). */
+__declspec(dllexport) void NTAPI RtlTcosNewObjectSecurity(HANDLE handle, const OBJECT_ATTRIBUTES *attributes, BOOLEAN container, int kind)
+{
+    PSECURITY_DESCRIPTOR creator = attributes && attributes->Length >= sizeof(OBJECT_ATTRIBUTES) ? attributes->SecurityDescriptor : NULL;
+    BYTE *parent = NULL, *made = NULL;
+    ULONG needed = 0, flags = (kind == SD_FILE) ? (SEF_DACL_AUTO_INHERIT | SEF_SACL_AUTO_INHERIT) : 0, length;
+    if (kind == SD_FILE) {
+        NTSTATUS asked = NtTcosToken(TCOS_FILE_PARENT_SD, (ULONG_PTR)handle, 0, 0, (ULONG_PTR)&needed, 0);
+        if ((asked == 0 || asked == STATUS_BUFFER_TOO_SMALL_) && needed) {
+            parent = heap_new(needed);
+            if (parent && NtTcosToken(TCOS_FILE_PARENT_SD, (ULONG_PTR)handle, (ULONG_PTR)parent, needed, (ULONG_PTR)&needed, 0)) { heap_drop(parent); parent = NULL; }
+        }
+    }
+    if (!creator && !parent) return;
+    if (RtlNewSecurityObjectEx(parent, creator, (PSECURITY_DESCRIPTOR *)&made, NULL, container, flags, NULL, (PGENERIC_MAPPING)&sd_mappings[kind]) == 0) {
+        length = RtlLengthSecurityDescriptor(made);
+        NtTcosToken(TCOS_OBJECT_SD_SET, (ULONG_PTR)handle, 0, (ULONG_PTR)made, length, 0);
+        RtlFreeHeap(RtlProcessHeap(), 0, made);
+    }
+    heap_drop(parent);
+}
+
+extern NTSTATUS NTAPI RawNtCreateEvent(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, BOOLEAN);
+extern NTSTATUS NTAPI RawNtCreateMutant(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, BOOLEAN);
+extern NTSTATUS NTAPI RawNtCreateSemaphore(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, LONG, LONG);
+extern NTSTATUS NTAPI RawNtCreateTimer(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG);
+extern NTSTATUS NTAPI RawNtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+extern NTSTATUS NTAPI RawNtCreateJobObject(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+extern NTSTATUS NTAPI RawNtCreateNamedPipeFile(PHANDLE, ULONG, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, PLARGE_INTEGER);
+
+__declspec(dllexport) NTSTATUS NTAPI NtCreateEvent(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, ULONG type, BOOLEAN state)
+{
+    NTSTATUS status = RawNtCreateEvent(h, access, attr, type, state);
+    if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_EVENT);
+    return status;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtCreateMutant(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, BOOLEAN owned)
+{
+    NTSTATUS status = RawNtCreateMutant(h, access, attr, owned);
+    if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_MUTANT);
+    return status;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtCreateSemaphore(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, LONG initial, LONG maximum)
+{
+    NTSTATUS status = RawNtCreateSemaphore(h, access, attr, initial, maximum);
+    if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_SEMAPHORE);
+    return status;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtCreateTimer(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, ULONG type)
+{
+    NTSTATUS status = RawNtCreateTimer(h, access, attr, type);
+    if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_TIMER);
+    return status;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtCreateSection(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, PLARGE_INTEGER size, ULONG protect, ULONG flags, HANDLE file)
+{
+    NTSTATUS status = RawNtCreateSection(h, access, attr, size, protect, flags, file);
+    if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_SECTION);
+    return status;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtCreateJobObject(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr)
+{
+    NTSTATUS status = RawNtCreateJobObject(h, access, attr);
+    if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_JOB);
+    return status;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtCreateNamedPipeFile(PHANDLE h, ULONG access, POBJECT_ATTRIBUTES attr, PIO_STATUS_BLOCK iosb, ULONG share, ULONG disposition, ULONG options, ULONG type, ULONG read_mode,
+    ULONG completion, ULONG max_instances, ULONG in_quota, ULONG out_quota, PLARGE_INTEGER timeout)
+{
+    NTSTATUS status = RawNtCreateNamedPipeFile(h, access, attr, iosb, share, disposition, options, type, read_mode, completion, max_instances, in_quota, out_quota, timeout);
+    if (status == STATUS_SUCCESS) RtlTcosNewObjectSecurity(*h, attr, FALSE, SD_PIPE);
+    return status;
+}
+
+extern NTSTATUS NTAPI RawNtCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING, ULONG, PULONG);
+__declspec(dllexport) NTSTATUS NTAPI NtCreateKey(PHANDLE h, ACCESS_MASK access, POBJECT_ATTRIBUTES attr, ULONG title, PUNICODE_STRING class_, ULONG options, PULONG disposition)
+{
+    ULONG made = 0;
+    NTSTATUS status = RawNtCreateKey(h, access, attr, title, class_, options, &made);
+    if (disposition) *disposition = made;
+    if (status == STATUS_SUCCESS && made == REG_CREATED_NEW_KEY) RtlTcosNewObjectSecurity(*h, attr, TRUE, SD_KEY);
+    return status;
+}

@@ -1456,11 +1456,26 @@ static HANDLE opened(NTSTATUS status, HANDLE h) {
   return h;
 }
 
+/* The attributes of an object made with SECURITY_ATTRIBUTES: the name, whether the handle is inherited, and the security descriptor the object is made with. */
+static POBJECT_ATTRIBUTES named_attributes_sa(NamedAttributes *n, LPCWSTR name, LPSECURITY_ATTRIBUTES sa) {
+  POBJECT_ATTRIBUTES a = named_attributes(n, name, sa && sa->bInheritHandle);
+  if (!a && sa && sa->lpSecurityDescriptor) {
+    a = &n->attributes;
+    a->Length = sizeof(OBJECT_ATTRIBUTES);
+    a->RootDirectory = NULL;
+    a->ObjectName = NULL;
+    a->Attributes = sa->bInheritHandle ? 2 : 0;
+    a->SecurityQualityOfService = NULL;
+  }
+  if (a) a->SecurityDescriptor = sa ? sa->lpSecurityDescriptor : NULL;
+  return a;
+}
+
 EXPORT HANDLE WINAPI CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR name) {
   NamedAttributes n;
   const BOOL inherit_handle = sa && sa->bInheritHandle;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtCreateEvent(&h, 0x1F0003, named_attributes(&n, name, inherit_handle), manual ? 0 : 1, initial != 0); return created(status, h); }
+  { const NTSTATUS status = NtCreateEvent(&h, 0x1F0003, named_attributes_sa(&n, name, sa), manual ? 0 : 1, initial != 0); return created(status, h); }
 }
 EXPORT HANDLE WINAPI CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -1490,7 +1505,7 @@ EXPORT HANDLE WINAPI CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCWSTR 
   NamedAttributes n;
   const BOOL inherit_handle = sa && sa->bInheritHandle;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtCreateMutant(&h, 0x1F0001, named_attributes(&n, name, inherit_handle), owned != 0); return created(status, h); }
+  { const NTSTATUS status = NtCreateMutant(&h, 0x1F0001, named_attributes_sa(&n, name, sa), owned != 0); return created(status, h); }
 }
 EXPORT HANDLE WINAPI CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -1518,7 +1533,7 @@ EXPORT HANDLE WINAPI CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LO
   NamedAttributes n;
   const BOOL inherit_handle = sa && sa->bInheritHandle;
   HANDLE h = NULL;
-  { const NTSTATUS status = NtCreateSemaphore(&h, 0x1F0003, named_attributes(&n, name, inherit_handle), initial, maximum); return created(status, h); }
+  { const NTSTATUS status = NtCreateSemaphore(&h, 0x1F0003, named_attributes_sa(&n, name, sa), initial, maximum); return created(status, h); }
 }
 EXPORT HANDLE WINAPI CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCSTR name) {
   WCHAR *w = name ? to_wide(name) : NULL;
@@ -1689,7 +1704,7 @@ EXPORT HANDLE WINAPI CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR na
   (void)access;
   NamedAttributes n;
   HANDLE h = NULL;
-  const NTSTATUS status = NtCreateTimer(&h, 0x1F0003, named_attributes(&n, name, sa && sa->bInheritHandle), (flags & 1) ? 0 : 1);      /* CREATE_WAITABLE_TIMER_MANUAL_RESET */
+  const NTSTATUS status = NtCreateTimer(&h, 0x1F0003, named_attributes_sa(&n, name, sa), (flags & 1) ? 0 : 1);      /* CREATE_WAITABLE_TIMER_MANUAL_RESET */
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   set_error(status == 0x40000000 ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
   return h;
@@ -1761,7 +1776,15 @@ EXPORT HANDLE WINAPI CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, D
   }
   NamedAttributes n;
   HANDLE h = NULL;
-  const NTSTATUS status = NtCreateSection(&h, SECTION_ALL_, named_attributes(&n, name, sa && sa->bInheritHandle), size_pointer, page, protect & 0xFFFFFF00u /* the SEC_* flags */, file);
+  ULONG access = 0xF0000 | 1 | 4;      /* STANDARD_RIGHTS_REQUIRED, SECTION_QUERY, SECTION_MAP_READ: and what the protection adds */
+  switch (page) {
+    case 0x02: case 0x08: break;      /* PAGE_READONLY, PAGE_WRITECOPY */
+    case 0x04: access |= 2; break;      /* PAGE_READWRITE: SECTION_MAP_WRITE */
+    case 0x20: case 0x80: access |= 8; break;      /* PAGE_EXECUTE_READ, PAGE_EXECUTE_WRITECOPY: SECTION_MAP_EXECUTE */
+    case 0x40: access |= 2 | 8; break;
+    default: set_error(ERROR_INVALID_PARAMETER); return NULL;      /* (no access, execute only: nothing to map) */
+  }
+  const NTSTATUS status = NtCreateSection(&h, access, named_attributes_sa(&n, name, sa), size_pointer, page, protect & 0xFFFFFF00u /* the SEC_* flags */, file);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   set_error(status == 0x40000000 ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
   return h;
@@ -2388,6 +2411,7 @@ static HANDLE console_for_pseudo(HANDLE pseudo) {
   }
   return NULL;
 }
+IMPORT void NTAPI RtlTcosNewObjectSecurity(HANDLE handle, const OBJECT_ATTRIBUTES *attributes, BOOLEAN container, int kind);
 EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information) {
   (void)process_attributes; (void)thread_attributes;
@@ -2493,6 +2517,14 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     return FALSE;
   }
   con_note_child(process_id, block.console, block.words[11] == 0xFFFFFFFFu ? process_id : block.words[11], block.words[10] & 1);
+  if (process_attributes && process_attributes->lpSecurityDescriptor) {      /* the descriptors the process and its first thread are made with */
+    OBJECT_ATTRIBUTES made = { sizeof(made), NULL, NULL, 0, process_attributes->lpSecurityDescriptor, NULL };
+    RtlTcosNewObjectSecurity(process, &made, FALSE, 10 /* a process */);
+  }
+  if (thread_attributes && thread_attributes->lpSecurityDescriptor) {
+    OBJECT_ATTRIBUTES made = { sizeof(made), NULL, NULL, 0, thread_attributes->lpSecurityDescriptor, NULL };
+    RtlTcosNewObjectSecurity(thread, &made, FALSE, 11 /* a thread */);
+  }
   if (debug_start) {      /* attached before it runs its first instruction; its children too, unless DEBUG_ONLY_THIS_PROCESS */
     const NTSTATUS attached = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
     if (NT_SUCCESS(attached) && (flags & 0x1) && !(flags & 0x2)) { ULONG inherit = 1; NtSetInformationProcess(process, 31, &inherit, sizeof(inherit)); }
@@ -2895,6 +2927,7 @@ EXPORT HANDLE WINAPI CreateNamedPipeW(LPCWSTR name, DWORD open_mode, DWORD pipe_
   OBJECT_ATTRIBUTES attributes;
   if (!name) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   if (!pipe_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
+  attributes.SecurityDescriptor = sa ? sa->lpSecurityDescriptor : NULL;
   if ((pipe_mode & 2) && !(pipe_mode & 4)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }      /* (a byte pipe cannot be read as messages) */
   /* PIPE_ACCESS_INBOUND 1 (the server reads: clients may write), OUTBOUND 2, DUPLEX 3; the NT share access says what clients may do */
   const ULONG share = (open_mode & 3) == 1 ? 2 : (open_mode & 3) == 2 ? 1 : (open_mode & 3) == 3 ? 3 : 0;

@@ -39,7 +39,7 @@ enum {
   TCOS_OBJECT_SD_SET = 7,         /* (handle, required access, descriptor, length) */
   TCOS_TOKEN_SET_PROCESS = 8,     /* (process handle, token handle): the token a process runs as (a process that has not started, as CreateProcessAsUser makes it) */
   TCOS_TOKEN_CALLER = 9,          /* (&handle): the token the caller's access is decided by: the impersonation token of the thread, else the token of the process */
-  TCOS_OBJECT_TYPE_OF = 10        /* (handle, buffer, capacity): the NT type name of the object, as ASCII */
+  TCOS_FILE_PARENT_SD = 11        /* (handle of a file, buffer, capacity, &needed): the descriptor kept for the directory the file is in, needed 0 if none */
 };
 
 #pragma pack(push, 1)

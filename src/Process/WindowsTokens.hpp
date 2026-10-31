@@ -44,4 +44,13 @@ void token_process_exited(uint64_t pid);
 // the generic rights. On success *granted gets the rights. False with the NTSTATUS in *status if not.
 bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted, uint32_t* status, bool backup_intent = false);
 
+// The rights the calling thread gets when it opens the object with the descriptor kept under (tag, id) ('p' a process by its id, 'h' a thread by its id): the rights asked for (generic
+// ones mapped, MAXIMUM_ALLOWED means all that the descriptor allows). STATUS_ACCESS_DENIED etc. in the return; 0 and *granted otherwise. An object with no descriptor allows all.
+uint32_t open_with_descriptor(Process& p, char tag, uint64_t id, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted);
+inline const security::GenericMapping kProcessMapping = {0x20410, 0x20BEA, 0x121001, 0x1FFFFF};
+inline const security::GenericMapping kThreadMapping = {0x20048, 0x20037, 0x120000, 0x1FFFFF};
+
+// The generic mapping of files and directories.
+inline const security::GenericMapping kFileMapping = {0x120089, 0x120116, 0x1200A0, 0x1F01FF};
+
 }  // namespace process::windowsabi
