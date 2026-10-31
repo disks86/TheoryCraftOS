@@ -107,6 +107,9 @@
 #endif
 #ifdef TCOS_INTEL_WIFI
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
+#include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Kernel/Apic.hpp"
+#include "Kernel/Interrupts.hpp"
 #endif
 #ifdef TCOS_THUNDERBOLT
 #include "Hardware/Bus/Pci/PciMsi.hpp"

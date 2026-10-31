@@ -18,6 +18,7 @@
 
 
 #include "Hardware/WirelessInterface/Intel/IwlMvm.hpp"
+#include "Hardware/WirelessInterface/RateScaler.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace hardware {
@@ -36,14 +37,32 @@ uint32_t iwl_build_tx_ant_config(uint32_t valid_antennas, ByteView out) {
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-uint32_t iwl_build_link_quality(uint8_t station_id, uint32_t tx_antennas, const uint32_t rates[kLinkQualityTableSize], ByteView out) {
+uint32_t iwl_rate_code(const WifiRate& rate) {
+  uint32_t width = rate.width_mhz == 80 ? 2 : rate.width_mhz == 40 ? 1 : 0;
+  uint32_t code = 0;
+  switch (rate.mode) {
+    case WifiRate::Mode::Legacy:
+      return WifiRateScaler::kPlcp[rate.mcs < WifiRateScaler::kRateCount ? rate.mcs : 0];
+    case WifiRate::Mode::Ht:
+      code = kRateHtV1 | (rate.mcs & 0x1Fu);
+      break;
+    case WifiRate::Mode::Vht:
+      code = kRateVhtV1 | (rate.mcs & 0xFu) | (static_cast<uint32_t>(rate.streams > 1 ? rate.streams - 1 : 0) << kRateVhtStreamsShift);
+      break;
+  }
+  code |= width << kRateWidthShift;
+  if (rate.short_gi) code |= kRateSgiV1;
+  return code;
+}
+
+uint32_t iwl_build_link_quality(uint8_t station_id, uint32_t tx_antennas, const uint32_t rates[kLinkQualityTableSize], ByteView out, uint32_t mimo_delim) {
   ByteWriter w(out);
   const uint32_t antenna = tx_antennas & 7 ? tx_antennas & 7 : 1;
   w.u8(station_id);
   w.u8(0);                                         // reduced_tpc
   w.le16(0);                                       // control (unused)
   w.u8(0);                                         // flags: no RTS, colour 0
-  w.u8(0);                                         // mimo_delim
+  w.u8(static_cast<uint8_t>(mimo_delim > kLinkQualityTableSize ? kLinkQualityTableSize : mimo_delim));      // mimo_delim
   w.u8(static_cast<uint8_t>(antenna & 1 ? 1 : antenna & 2 ? 2 : 4));      // single_stream_ant_msk
   w.u8(static_cast<uint8_t>(antenna));             // dual_stream_ant_msk
   for (int ac = 0; ac < 4; ++ac) w.u8(0);          // initial_rate_index
@@ -185,7 +204,7 @@ uint32_t iwl_build_station_mac_context(const IwlMacContext& c, ByteView out) {
   return kMacContextBytes;
 }
 
-uint32_t iwl_build_phy_context(uint32_t action, uint8_t channel, bool five_ghz, uint32_t tx_antennas, uint32_t rx_antennas, ByteView out) {
+uint32_t iwl_build_phy_context(uint32_t action, uint8_t channel, bool five_ghz, uint32_t tx_antennas, uint32_t rx_antennas, ByteView out, uint8_t width, uint8_t control_position) {
   ByteWriter w(out);
   w.le32(0);                                       // id 0, colour 0
   w.le32(action);
@@ -193,8 +212,8 @@ uint32_t iwl_build_phy_context(uint32_t action, uint8_t channel, bool five_ghz, 
   w.le32(0);                                       // tx_param_color
   w.u8(five_ghz ? kPhyBand5 : kPhyBand24);
   w.u8(channel);
-  w.u8(0);                                         // 20 MHz
-  w.u8(0);                                         // control channel position
+  w.u8(width);                                     // 0 20 MHz, 1 40, 2 80
+  w.u8(width ? control_position : 0);              // control channel position
   w.le32(tx_antennas);
   // rx chains: the valid ones, and two of them in use whether idle or active (receive diversity for single stream legacy rates)
   w.le32((rx_antennas << 1) | (2u << 10) | (2u << 12));
@@ -225,8 +244,15 @@ uint32_t iwl_build_add_station(const IwlStationSpec& st, ByteView out) {
   w.u8(st.station_id);
   w.u8(0);                                         // modify_mask
   w.le16(0);
-  w.le32(0);                                       // station_flags: 20 MHz, one spatial stream
-  w.le32(kStaFlagFatMask | kStaFlagMimoMask | kStaFlagRtsMimoProt);
+  // station_flags: the width, the streams and (HT) the A-MPDU limits; without HT: 20 MHz, one spatial stream
+  uint32_t flags = 0, mask = kStaFlagFatMask | kStaFlagMimoMask | kStaFlagRtsMimoProt;
+  if (st.ht) {
+    flags = (static_cast<uint32_t>(st.width > 3 ? 0 : st.width) << 26) | (st.streams >= 2 ? 1u << 28 : 0u) | (static_cast<uint32_t>(st.ampdu_exponent > 9 ? 9 : st.ampdu_exponent) << kStaFlagAggSizeShift) |
+            (static_cast<uint32_t>(st.ampdu_density & 7) << kStaFlagAggDensityShift);
+    mask |= kStaFlagAggSizeMask | kStaFlagAggDensityMask;
+  }
+  w.le32(flags);
+  w.le32(mask);
   w.u8(0);
   w.u8(0);
   w.le16(0);
@@ -328,7 +354,8 @@ uint32_t iwl_data_frame_to_ethernet(ConstByteView frame, bool decrypted, ByteVie
   if (!r.ok() || (control & 0x0003) != 0 || (control & 0x000C) != 0x0008 || (control & 0x0300) != 0x0200) return 0;     // data, from the distribution system
   const uint16_t subtype = control & 0x00F0;
   if (subtype == 0x80) {
-    r.skip(2);
+    const uint16_t qos = r.le16();
+    if (qos & 0x0080) return 0;                                        // an A-MSDU: several frames in one, not unpacked here (the access point sends them only inside a block ack session)
     if (control & 0x8000) r.skip(4);
   } else if (subtype != 0x00) {
     return 0;

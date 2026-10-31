@@ -823,6 +823,7 @@ add_executable(BOOTX64
   src/Hardware/WirelessInterface/Intel/IwlLink.cpp
   src/Hardware/WirelessInterface/Intel/IwlWireless.cpp
   src/Hardware/WirelessInterface/Ieee80211Scan.cpp
+  src/Hardware/WirelessInterface/Ieee80211Ht.cpp
   src/Hardware/WirelessInterface/Ieee80211Frames.cpp
   src/Hardware/WirelessInterface/Ieee80211Association.cpp
   src/Hardware/WirelessInterface/Wpa2.cpp

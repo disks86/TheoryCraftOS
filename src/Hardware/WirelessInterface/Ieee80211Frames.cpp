@@ -48,8 +48,9 @@ uint32_t build_authentication(const uint8_t bssid[6], const uint8_t sa[6], ByteV
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-uint32_t build_association_request(const uint8_t bssid[6], const uint8_t sa[6], ConstByteView ssid, bool five_ghz, ConstByteView rsn_ie, ByteView out) {
-  if (ssid.size() == 0 || ssid.size() > 32 || rsn_ie.size() > 64) return 0;
+uint32_t build_association_request(const uint8_t bssid[6], const uint8_t sa[6], ConstByteView ssid, bool five_ghz, ConstByteView rsn_ie, ByteView out,
+                                   ConstByteView extra_elements) {
+  if (ssid.size() == 0 || ssid.size() > 32 || rsn_ie.size() > 64 || extra_elements.size() > 96) return 0;
   ByteWriter w(out);
   header(w, kSubtypeAssocRequest, bssid, sa);
   w.le16(kCapabilityEss | (rsn_ie.size() ? kCapabilityPrivacy : 0));
@@ -64,6 +65,7 @@ uint32_t build_association_request(const uint8_t bssid[6], const uint8_t sa[6], 
     w.bytes(ConstByteView(rates, sizeof rates));
   }
   if (rsn_ie.size()) w.bytes(rsn_ie);
+  if (extra_elements.size()) w.bytes(extra_elements);
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 

@@ -21,6 +21,7 @@
 // the environment names a real file (IWL_FIRMWARE_FILE), on that one with damage done to it, and the register level bring-up (taking ownership, waking the MAC, the peripheral and
 // memory windows, the adapter's start and stop) against a model of the chip's registers.
 #include <stdint.h>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -416,12 +417,14 @@ static void test_pcie() {
 
 // ---- loading the firmware ------------------------------------------------------------------------------------------------------------------------------------------------------
 
+static uint32_t g_phy_sku = 0;                       // when nonzero, the firmware file carries this PHY_SKU (antennas: transmit chains in bits 8-11, receive in 12-15)
 static Bytes make_loadable_firmware(uint32_t big_size, bool scan_tlvs = false) {
   Bytes f;
   put32(f, 0);
   put32(f, IwlFirmware::kMagic);
   f.insert(f.end(), 88 - 8, 0);
   tlv(f, 27, u32s({2}));
+  if (g_phy_sku) tlv(f, 23, u32s({g_phy_sku}));
   if (scan_tlvs) {
     tlv(f, 29, u32s({0, 0x40000000}));                           // API 30 (station type)
     tlv(f, 29, u32s({1, 0x00000405}));                           // APIs 32, 34, 42
@@ -1159,7 +1162,7 @@ static Bytes rx_mpdu(const Bytes& frame, uint8_t channel, uint8_t energy, bool c
   return b;
 }
 
-static Bytes beacon(const char* name, uint8_t last_octet, bool wpa2, const uint8_t* bssid = nullptr) {
+static Bytes beacon(const char* name, uint8_t last_octet, bool wpa2, const uint8_t* bssid = nullptr, const Bytes& extra = Bytes()) {
   Bytes f{0x80, 0x00, 0, 0};
   f.insert(f.end(), 6, 0xFF);
   for (int i = 0; i < 2; ++i) {
@@ -1176,6 +1179,7 @@ static Bytes beacon(const char* name, uint8_t last_octet, bool wpa2, const uint8
     const uint8_t rsn[] = {48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 2, 0, 0};
     f.insert(f.end(), rsn, rsn + sizeof rsn);
   }
+  f.insert(f.end(), extra.begin(), extra.end());
   return f;
 }
 
@@ -1680,6 +1684,9 @@ struct WifiFixture {
   bool data_fails = false;                              // data frames do not get through
   std::vector<Bytes> lq_commands, data_commands;        // the link quality commands and the data frames' TX commands
   int last_phy_action = 0;
+  Bytes home_extra;                                     // more elements in the beacon of "Home" (HT / VHT)
+  uint8_t home_channel = 6;
+  std::vector<Bytes> phy_commands, sta_commands;        // PHY context and ADD_STA commands
 
   explicit WifiFixture(const char* ap_passphrase) {
     source.file = make_loadable_firmware(64, true);
@@ -1711,6 +1718,8 @@ struct WifiFixture {
       const uint16_t seq = static_cast<uint16_t>(c[2] | (c[3] << 8));
       commands.push_back(op);
       if (op == 0x4E) lq_commands.push_back(c);
+      if (op == 0x08) phy_commands.push_back(c);
+      if (op == 0x18) sta_commands.push_back(c);
       Bytes f;
       if (group == 0x0C && op == 0x02) {
         FakeRxChip::frame(f, group, op, seq, nvm_info(5, 0x1F, 1));
@@ -1718,7 +1727,7 @@ struct WifiFixture {
         FakeRxChip::frame(f, group, op, seq, Bytes{1, 0, 0, 0, 0, 0, 0, 0});
         rxhw.deliver(f);
         Bytes g;
-        FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Home", 0xA5, true, linktest::kBssid), 6, 50, true));
+        FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Home", 0xA5, true, linktest::kBssid, home_extra), home_channel, 50, true));
         FakeRxChip::frame(g, 0, 0xC1, 0x8000, rx_mpdu(beacon("Cafe", 2, false), 11, 70, true));
         rxhw.deliver(g);
         const uint32_t uid = static_cast<uint32_t>(c[8 + 4] | (c[8 + 5] << 8));
@@ -2177,6 +2186,182 @@ static void test_rate_control() {
   }
 }
 
+// ---- 802.11n/ac ----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+static Bytes ht_elements(uint8_t streams, uint16_t cap_info, uint8_t primary, uint8_t operation) {
+  Bytes e{45, 26, static_cast<uint8_t>(cap_info), static_cast<uint8_t>(cap_info >> 8), 0x17};
+  for (int i = 0; i < 4; ++i) e.push_back(i < streams ? 0xFF : 0);
+  e.insert(e.end(), 26 - 3 - 4, 0);
+  Bytes op{61, 22, primary, operation};
+  op.insert(op.end(), 20, 0);
+  e.insert(e.end(), op.begin(), op.end());
+  return e;
+}
+static Bytes vht_elements(uint32_t cap_info, uint16_t rx_map, uint8_t width, uint8_t center) {
+  Bytes e{191, 12, static_cast<uint8_t>(cap_info), static_cast<uint8_t>(cap_info >> 8), static_cast<uint8_t>(cap_info >> 16), static_cast<uint8_t>(cap_info >> 24), static_cast<uint8_t>(rx_map), static_cast<uint8_t>(rx_map >> 8)};
+  e.insert(e.end(), 12 - 6, 0);
+  e.insert(e.end(), {192, 5, width, center, 0, 0xFC, 0xFF});
+  return e;
+}
+static uint32_t le32_at(const Bytes& b, size_t at) { return b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (static_cast<uint32_t>(b[at + 3]) << 24); }
+static bool contains(const Bytes& hay, const Bytes& needle) {
+  for (size_t i = 0; i + needle.size() <= hay.size(); ++i)
+    if (std::equal(needle.begin(), needle.end(), hay.begin() + i)) return true;
+  return false;
+}
+static const Bytes* association_request(const WifiFixture& fx) {
+  for (const Bytes& c : fx.queue4)
+    if (c.size() > 62 && (((c[60] | (c[61] << 8)) & 0x00FC) == 0x0000)) return &c;
+  return nullptr;
+}
+
+static void test_ht_builders() {
+  uint8_t buf[256];
+  {   // rate_n_flags
+    WifiRate r;
+    r.mode = WifiRate::Mode::Legacy; r.mcs = 6;
+    CHECK(iwl_rate_code(r) == WifiRateScaler::kPlcp[6]);
+    r.mode = WifiRate::Mode::Ht; r.mcs = 12; r.width_mhz = 40; r.short_gi = true; r.streams = 2;
+    CHECK(iwl_rate_code(r) == (0x100u | 12u | (1u << 11) | (1u << 13)));
+    r.mode = WifiRate::Mode::Vht; r.mcs = 9; r.width_mhz = 80; r.short_gi = false; r.streams = 2;
+    CHECK(iwl_rate_code(r) == ((1u << 26) | 9u | (1u << 4) | (2u << 11)));
+    r.streams = 1; r.width_mhz = 20;
+    CHECK(iwl_rate_code(r) == ((1u << 26) | 9u));
+    // the antennas, STBC and LDPC do not make another rate
+    CHECK(((0x100u | 12u | (3u << 14) | (1u << 17) | (1u << 27)) ^ 0x100u ^ 12u) != 0 && (((0x100u | 12u | (3u << 14) | (1u << 17) | (1u << 27)) ^ (0x100u | 12u)) & iwl_mvm::kRateIdentityMask) == 0);
+    CHECK((((0x100u | 12u) ^ (0x100u | 13u)) & iwl_mvm::kRateIdentityMask) != 0 && (((0x100u | 12u) ^ 12u) & iwl_mvm::kRateIdentityMask) != 0);
+  }
+  {   // the PHY context: the channel width and the control channel position
+    CHECK(iwl_build_phy_context(1, 36, true, 3, 3, ByteView(buf, sizeof buf), 2, 5) == 36 && buf[16] == 0 && buf[17] == 36 && buf[18] == 2 && buf[19] == 5);
+    CHECK(iwl_build_phy_context(1, 6, false, 3, 3, ByteView(buf, sizeof buf)) == 36 && buf[16] == 1 && buf[17] == 6 && buf[18] == 0 && buf[19] == 0);
+    CHECK(iwl_build_phy_context(1, 6, false, 3, 3, ByteView(buf, sizeof buf), 0, 4) == 36 && buf[19] == 0);          // (no position for 20 MHz)
+  }
+  {   // ADD_STA: legacy as before, HT with the width, the streams and the aggregation limits
+    IwlStationSpec st;
+    st.station_id = 1;
+    CHECK(iwl_build_add_station(st, ByteView(buf, sizeof buf)) == 48 && le32_at(Bytes(buf, buf + 48), 20) == 0 && le32_at(Bytes(buf, buf + 48), 24) == (iwl_mvm::kStaFlagFatMask | iwl_mvm::kStaFlagMimoMask | iwl_mvm::kStaFlagRtsMimoProt));
+    st.ht = true; st.width = 2; st.streams = 2; st.ampdu_exponent = 3; st.ampdu_density = 5;
+    CHECK(iwl_build_add_station(st, ByteView(buf, sizeof buf)) == 48);
+    const Bytes b(buf, buf + 48);
+    CHECK(le32_at(b, 20) == ((2u << 26) | (1u << 28) | (3u << 19) | (5u << 23)));
+    CHECK(le32_at(b, 24) == (iwl_mvm::kStaFlagFatMask | iwl_mvm::kStaFlagMimoMask | iwl_mvm::kStaFlagRtsMimoProt | (0xFu << 19) | (7u << 23)));
+    CHECK(b[2] == 0xFF && b[3] == 0xFF);                                    // no aggregation on any TID
+  }
+  {   // the link quality command: how many leading entries use two streams
+    uint32_t rates[16];
+    for (uint32_t i = 0; i < 16; ++i) rates[i] = 0x100 | i;
+    CHECK(iwl_build_link_quality(1, 3, rates, ByteView(buf, sizeof buf), 5) == 88 && buf[5] == 5);
+    CHECK(iwl_build_link_quality(1, 3, rates, ByteView(buf, sizeof buf), 99) == 88 && buf[5] == 16);
+  }
+  {   // an A-MSDU is not unpacked
+    Bytes qos{0x88, 0x02, 0, 0};
+    qos.insert(qos.end(), {0x11, 0x22, 0x33, 0x44, 0x55, 0x66});      // destination
+    qos.insert(qos.end(), {0x02, 0x11, 0x22, 0x33, 0x44, 0xA5});      // bssid
+    qos.insert(qos.end(), {0x28, 0xD2, 0x44, 1, 2, 3});               // source
+    qos.insert(qos.end(), {0, 0});
+    qos.insert(qos.end(), {0, 0});                                    // QoS control: ordinary frame
+    qos.insert(qos.end(), {0xAA, 0xAA, 0x03, 0, 0, 0, 0x08, 0x00, 'h', 'i'});
+    uint8_t eth[128];
+    CHECK(iwl_data_frame_to_ethernet(ConstByteView(qos.data(), qos.size()), false, ByteView(eth, sizeof eth)) == 16);
+    qos[24] = 0x80;                                                   // QoS control: A-MSDU present
+    CHECK(iwl_data_frame_to_ethernet(ConstByteView(qos.data(), qos.size()), false, ByteView(eth, sizeof eth)) == 0);
+  }
+}
+
+static void test_ht_link() {
+  g_phy_sku = 0x3300;                                       // two transmit and two receive chains
+  {   // 2.4 GHz, 40 MHz (secondary channel below), two streams, short GI
+    WifiFixture fx("hunter2hunter2");
+    fx.home_extra = ht_elements(2, 0x006F, 6, 0x07);
+    IwlWirelessInterface::Inputs in;
+    in.firmware = &fx.source; in.allocator = &fx.alloc; in.clock = &fx.clock; in.random = &fx.random;
+    IwlWirelessInterface wifi(in);
+    CHECK(wifi.start(fx.chip, true) && wifi.start_scan());
+    CHECK(wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Ok && wifi.link_up());
+    CHECK(!fx.phy_commands.empty());
+    const Bytes& phy = fx.phy_commands.back();
+    CHECK(phy[4 + 16] == 1 && phy[4 + 17] == 6 && phy[4 + 18] == 1 && phy[4 + 19] == 4);        // 2.4 GHz, channel 6, 40 MHz, the primary above the centre
+    bool saw_station = false;
+    for (const Bytes& c : fx.sta_commands)
+      if (c[4 + 16] == 1) {
+        saw_station = true;
+        CHECK(le32_at(c, 4 + 20) == ((1u << 26) | (1u << 28) | (3u << 19) | (5u << 23)));
+      }
+    CHECK(saw_station);
+    // the association request carries the WMM and HT elements (and no VHT on 2.4 GHz)
+    const Bytes* request = association_request(fx);
+    CHECK(request && contains(*request, Bytes{221, 7, 0x00, 0x50, 0xF2, 2, 0, 1, 0}) && contains(*request, Bytes{45, 26, 0x6E, 0x00}) && !contains(*request, Bytes{191, 12}));
+    // the rates: the ladder is legacy 6, MCS 0-7, then MCS 12-15 (two streams); the start is three quarters up, on a two stream rate
+    CHECK(!fx.lq_commands.empty());
+    const Bytes& lq = fx.lq_commands.back();
+    const uint32_t first = le32_at(lq, 4 + 20);
+    CHECK((first & 0x100) && (first & 0xFF) == 12 && ((first >> 11) & 3) == 1 && (first & (1u << 13)) && (first & (3u << 14)) == (3u << 14));
+    CHECK(lq[4 + 5] == 2);                                                  // mimo_delim: the first two entries
+    const uint32_t third = le32_at(lq, 4 + 20 + 8);
+    CHECK((third & 0x100) && (third & 0xFF) == 7 && (third & (3u << 14)) == (1u << 14));        // then one stream, one chain
+    CHECK(wifi.link_speed_mbps() == 180);
+    // data goes out at that rate
+    Bytes eth{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x28, 0xD2, 0x44, 1, 2, 3, 0x08, 0x00, 'h', 'i'};
+    fx.data_commands.clear();
+    CHECK(wifi.transmit(ConstByteView(eth.data(), eth.size())));
+    CHECK(!fx.data_commands.empty() && (fx.data_commands.back()[4 + 4] & 0x10) && (le32_at(fx.data_commands.back(), 4 + 12) & 0x1FF) == (0x100u | 12u));
+    // frames that fail walk down the ladder, over the HT rates and finally to the legacy one
+    fx.data_fails = true;
+    fx.data_failure_frames = 14;
+    for (int i = 0; i < 400; ++i) { wifi.transmit(ConstByteView(eth.data(), eth.size())); wifi.link_up(); }
+    CHECK(wifi.link_speed_mbps() < 20);
+    wifi.shutdown();
+    CHECK(fx.alloc.dma.empty());
+  }
+  {   // 5 GHz, 80 MHz VHT, two streams
+    WifiFixture fx("hunter2hunter2");
+    fx.home_channel = 36;
+    fx.home_extra = ht_elements(2, 0x006F, 36, 0x05);
+    const Bytes vht = vht_elements((1u << 5) | (3u << 23), 0xFFFA, 1, 42);
+    fx.home_extra.insert(fx.home_extra.end(), vht.begin(), vht.end());
+    IwlWirelessInterface::Inputs in;
+    in.firmware = &fx.source; in.allocator = &fx.alloc; in.clock = &fx.clock; in.random = &fx.random;
+    IwlWirelessInterface wifi(in);
+    CHECK(wifi.start(fx.chip, true) && wifi.start_scan());
+    CHECK(wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Ok && wifi.link_up());
+    const Bytes& phy = fx.phy_commands.back();
+    CHECK(phy[4 + 16] == 0 && phy[4 + 17] == 36 && phy[4 + 18] == 2 && phy[4 + 19] == 1);          // 5 GHz, channel 36, 80 MHz, position 1 below
+    bool saw_station = false;
+    for (const Bytes& c : fx.sta_commands)
+      if (c[4 + 16] == 1) {
+        saw_station = true;
+        CHECK(le32_at(c, 4 + 20) == ((2u << 26) | (1u << 28) | (3u << 19) | (5u << 23)));
+      }
+    CHECK(saw_station);
+    const Bytes* request = association_request(fx);
+    CHECK(request && contains(*request, Bytes{45, 26, 0x6E, 0x00}) && contains(*request, Bytes{191, 12, 0x20, 0, 0, 0, 0xFA, 0xFF}));
+    const Bytes& lq = fx.lq_commands.back();
+    const uint32_t first = le32_at(lq, 4 + 20);
+    CHECK((first & (1u << 26)) && !(first & 0x100) && (first & 0xF) == 6 && ((first >> 4) & 3) == 1 && ((first >> 11) & 3) == 2 && (first & (1u << 13)));
+    CHECK(wifi.link_speed_mbps() == 585);
+    wifi.shutdown();
+    CHECK(fx.alloc.dma.empty());
+  }
+  {   // one chain in the radio: a single stream, whatever the access point offers
+    g_phy_sku = 0x1100;
+    WifiFixture fx("hunter2hunter2");
+    fx.home_extra = ht_elements(2, 0x006F, 6, 0x01);
+    IwlWirelessInterface::Inputs in;
+    in.firmware = &fx.source; in.allocator = &fx.alloc; in.clock = &fx.clock; in.random = &fx.random;
+    IwlWirelessInterface wifi(in);
+    CHECK(wifi.start(fx.chip, true) && wifi.start_scan());
+    CHECK(wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Ok && wifi.link_up());
+    const Bytes& lq = fx.lq_commands.back();
+    const uint32_t first = le32_at(lq, 4 + 20);
+    CHECK((first & 0x100) && (first & 0xFF) < 8 && lq[4 + 5] == 0 && (first & (3u << 14)) == (1u << 14));
+    for (const Bytes& c : fx.sta_commands)
+      if (c[4 + 16] == 1) CHECK(le32_at(c, 4 + 20) == ((3u << 19) | (5u << 23)));
+    wifi.shutdown();
+    CHECK(fx.alloc.dma.empty());
+  }
+  g_phy_sku = 0;
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -2198,6 +2383,8 @@ int main() {
   test_firmware_recovery();
   test_interrupts();
   test_rate_control();
+  test_ht_builders();
+  test_ht_link();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

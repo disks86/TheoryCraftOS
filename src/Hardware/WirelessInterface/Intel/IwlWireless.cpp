@@ -312,13 +312,24 @@ WifiResult IwlWirelessInterface::connect(StringView ssid, StringView passphrase)
     status_.last_result = WifiResult::Failed;               // the scan did not keep the access point's RSN element
     return WifiResult::Failed;
   }
+  // HT / VHT: what the access point announced, and what we use with it
+  WifiPhyNegotiation phy;
+  {
+    WifiPhyCapabilities ap;
+    uint32_t chains = 0;
+    for (uint32_t bits = driver_.nvm().tx_antennas & driver_.nvm().rx_antennas & 7; bits; bits >>= 1) chains += bits & 1;
+    if (scanner->phy_capabilities(network.bssid, &ap)) phy = wifi_negotiate_phy(ap, network.channel, chains);
+  }
+  uint8_t phy_elements[kWifiPhyElementsMax];
+  const uint32_t phy_element_bytes = wifi_build_phy_elements(phy, ByteView(phy_elements, sizeof phy_elements));
   const char* error = nullptr;
-  if (!link_->prepare(driver_.firmware(), driver_.nvm(), network, &error)) {
+  if (!link_->prepare(driver_.firmware(), driver_.nvm(), network, &error, phy)) {
     status_.last_result = WifiResult::Failed;
     return WifiResult::Failed;
   }
   uint8_t address[6];
   for (uint32_t i = 0; i < 6; ++i) address[i] = driver_.nvm().hw_address[i];
+  association_->set_extra_elements(ConstByteView(phy_elements, phy_element_bytes));
   const WifiResult started = association_->start(network, rsn, passphrase, snonce, address);
   if (started != WifiResult::Ok) {
     link_->teardown();
