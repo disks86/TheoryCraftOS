@@ -57,26 +57,28 @@ uint64_t RiscV64Cpu::read_single(uint32_t r) const { return (s_.f[r] >> 32) == 0
 RiscV64Cpu::Step RiscV64Cpu::floating(GuestMemory& m, uint32_t insn) {
   const uint32_t opcode = insn & 0x7F, rd = field(insn, 11, 7), funct3 = field(insn, 14, 12), rs1 = field(insn, 19, 15), rs2 = field(insn, 24, 20), fmt = field(insn, 26, 25), funct5 = insn >> 27;
 
-  if (opcode == 0x07) {      // flw, fld
-    if (funct3 != 2 && funct3 != 3) return undefined();
+  if (opcode == 0x07) {      // flh, flw, fld
+    if (funct3 != 1 && funct3 != 2 && funct3 != 3) return undefined();
     uint64_t v;
-    if (!load(m, s_.x[rs1] + static_cast<uint64_t>(sext(insn >> 20, 12)), funct3 == 2 ? 4 : 8, &v)) return Step::Fault;
-    if (funct3 == 2) write_single(rd, v);
+    if (!load(m, s_.x[rs1] + static_cast<uint64_t>(sext(insn >> 20, 12)), funct3 == 1 ? 2 : funct3 == 2 ? 4 : 8, &v)) return Step::Fault;
+    if (funct3 == 1) write_half(rd, v);
+    else if (funct3 == 2) write_single(rd, v);
     else s_.f[rd] = v;
     return Step::Ok;
   }
-  if (opcode == 0x27) {      // fsw, fsd
-    if (funct3 != 2 && funct3 != 3) return undefined();
+  if (opcode == 0x27) {      // fsh, fsw, fsd
+    if (funct3 != 1 && funct3 != 2 && funct3 != 3) return undefined();
     const int64_t off = sext(((insn >> 25) << 5) | rd, 12);
     const uint64_t address = s_.x[rs1] + static_cast<uint64_t>(off);
-    if (!store(m, address, funct3 == 2 ? 4 : 8, s_.f[rs2])) return Step::Fault;
+    if (!store(m, address, funct3 == 1 ? 2 : funct3 == 2 ? 4 : 8, s_.f[rs2])) return Step::Fault;
     return Step::Ok;
   }
-  if (fmt > 1) return undefined();
-  const Format f = fmt == 0 ? Format::F32 : Format::F64;
-  auto read = [&](uint32_t r) { return f == Format::F32 ? read_single(r) : s_.f[r]; };
+  if (fmt == 3) return undefined();
+  const Format f = fmt == 0 ? Format::F32 : fmt == 1 ? Format::F64 : Format::F16;
+  auto read = [&](uint32_t r) { return f == Format::F32 ? read_single(r) : f == Format::F16 ? read_half(r) : s_.f[r]; };
   auto write = [&](uint64_t bits) {
     if (f == Format::F32) write_single(rd, bits);
+    else if (f == Format::F16) write_half(rd, bits);
     else s_.f[rd] = bits;
   };
   Env env;
@@ -122,41 +124,80 @@ RiscV64Cpu::Step RiscV64Cpu::floating(GuestMemory& m, uint32_t insn) {
       write((x & ~sign) | s);
       return Step::Ok;
     }
-    case 5: {      // fmin, fmax
-      if (funct3 > 1) return undefined();
+    case 5: {      // fmin, fmax, and Zfa's fminm, fmaxm (a NaN operand gives the canonical NaN)
+      if (funct3 > 3) return undefined();
       const uint64_t x = read(rs1), y = read(rs2);
-      const uint64_t r = minmax(f, x, y, funct3 == 1, env);
+      uint64_t r = minmax(f, x, y, funct3 & 1, env);
+      if (funct3 >= 2 && (is_nan(f, x) || is_nan(f, y))) r = canonical_nan(f);
       write(r);
       fp_finish(env);
       return Step::Ok;
     }
-    case 8: {      // fcvt.s.d, fcvt.d.s
+    case 8: {      // fcvt between the formats (rs2 names the source), fround / froundnx (Zfa), and the BFloat16 conversions of Zfbfmin
       if (!rounding_mode(funct3, &env.mode)) return undefined();
-      if (fmt == 0) {
-        if (rs2 != 1) return undefined();
-        write(canonical(Format::F32, convert(Format::F64, Format::F32, s_.f[rs1], env)));
-      } else {
-        if (rs2 != 0) return undefined();
-        write(canonical(Format::F64, convert(Format::F32, Format::F64, read_single(rs1), env)));
+      if (rs2 == 4 || rs2 == 5) {      // fround, froundnx: round to an integral value in the same format
+        const uint64_t x = read(rs1);
+        if (is_nan(f, x)) { if (!(x & (f == Format::F32 ? 0x400000u : f == Format::F64 ? 0x8000000000000ull : 0x200u))) env.flags |= kInvalid; write(canonical_nan(f)); }
+        else write(round_to_integral(f, x, env.mode, rs2 == 5, env));
+        fp_finish(env);
+        return Step::Ok;
       }
+      Format from;
+      if ((fmt == 2 && rs2 == 8) || (fmt == 0 && rs2 == 6)) {      // fcvt.bf16.s and fcvt.s.bf16
+        from = Format::F32;
+        if (fmt == 2) {
+          const uint64_t r = canonical(Format::BF16, convert(Format::F32, Format::BF16, read_single(rs1), env));
+          write_half(rd, r);
+        } else {
+          write_single(rd, canonical(Format::F32, convert(Format::BF16, Format::F32, (s_.f[rs1] >> 16) == 0xFFFFFFFFFFFFull ? (s_.f[rs1] & 0xFFFFu) : 0x7FC0u, env)));
+        }
+        fp_finish(env);
+        return Step::Ok;
+      }
+      if (rs2 == 0) from = Format::F32; else if (rs2 == 1) from = Format::F64; else if (rs2 == 2) from = Format::F16; else return undefined();
+      if (from == f) return undefined();
+      const uint64_t source = from == Format::F32 ? read_single(rs1) : from == Format::F16 ? read_half(rs1) : s_.f[rs1];
+      write(canonical(f, convert(from, f, source, env)));
       fp_finish(env);
       return Step::Ok;
     }
     case 0x14: {      // feq, flt, fle
-      if (funct3 > 2) return undefined();
+      if (funct3 > 5 || funct3 == 3) return undefined();
       const uint64_t x = read(rs1), y = read(rs2);
-      const Order order = compare(f, x, y, funct3 != 2, env);
+      const Order order = compare(f, x, y, funct3 == 0 || funct3 == 1, env);      // (feq, fleq and fltq are quiet comparisons)
       bool result;
       switch (funct3) {
         case 2: result = order == Order::Equal; break;
-        case 1: result = order == Order::Less; break;
+        case 1: case 5: result = order == Order::Less; break;
         default: result = order == Order::Less || order == Order::Equal; break;
       }
       if (rd != 0) s_.x[rd] = result;
       fp_finish(env);
       return Step::Ok;
     }
-    case 0x18: {      // fcvt.w.s, fcvt.wu.s, fcvt.l.s, fcvt.lu.s (and .d)
+    case 0x18: {      // fcvt.w.s, fcvt.wu.s, fcvt.l.s, fcvt.lu.s (and .d, .h), and Zfa's fcvtmod.w.d
+      if (rs2 == 8 && fmt == 1 && funct3 == 1) {      // fcvtmod.w.d: the value truncated toward zero, modulo 2^32, with invalid for a NaN, an infinity or a value too large to be exact
+        const uint64_t x = s_.f[rs1];
+        uint64_t result = 0;
+        const uint32_t exponent = static_cast<uint32_t>((x >> 52) & 0x7FF);
+        if (exponent == 0x7FF) env.flags |= kInvalid;
+        else if (exponent >= 1023) {
+          const int32_t shift = static_cast<int32_t>(exponent) - 1075;      // value = mantissa * 2^shift
+          const uint64_t mantissa = (x & 0xFFFFFFFFFFFFFull) | (uint64_t{1} << 52);
+          uint64_t magnitude;
+          bool too_big = false;
+          if (shift >= 0) { too_big = shift > 11; magnitude = too_big ? 0 : mantissa << shift; }
+          else { magnitude = mantissa >> -shift; if (mantissa & ((uint64_t{1} << -shift) - 1)) env.flags |= kInexact; }
+          const bool negative = static_cast<int64_t>(x) < 0;
+          if (too_big || magnitude > (negative ? uint64_t{1} << 31 : (uint64_t{1} << 31) - 1)) { env.flags |= kInvalid; env.flags &= ~kInexact; }      // (outside the range of a 32 bit integer, though the result is the value modulo 2^32)
+          result = shift >= 0 && shift < 64 && !too_big ? magnitude : (shift < 0 ? magnitude : 0);
+          if (shift >= 0 && shift > 11) result = shift >= 64 ? 0 : mantissa << shift;
+          if (negative) result = 0 - result;
+        } else if ((x & 0x7FFFFFFFFFFFFFFFull) != 0) env.flags |= kInexact;
+        if (rd != 0) s_.x[rd] = static_cast<uint64_t>(sext(result, 32));
+        fp_finish(env);
+        return Step::Ok;
+      }
       if (rs2 > 3 || !rounding_mode(funct3, &env.mode)) return undefined();
       const bool is_unsigned = rs2 & 1, is_long = rs2 >= 2;
       const uint32_t bits = is_long ? 64 : 32;
@@ -190,7 +231,7 @@ RiscV64Cpu::Step RiscV64Cpu::floating(GuestMemory& m, uint32_t insn) {
     case 0x1C: {      // fmv.x.w / fmv.x.d, fclass
       if (rs2 != 0) return undefined();
       if (funct3 == 0) {
-        if (rd != 0) s_.x[rd] = f == Format::F32 ? static_cast<uint64_t>(sext(s_.f[rs1], 32)) : s_.f[rs1];
+        if (rd != 0) s_.x[rd] = f == Format::F32 ? static_cast<uint64_t>(sext(s_.f[rs1], 32)) : f == Format::F16 ? static_cast<uint64_t>(sext(s_.f[rs1], 16)) : s_.f[rs1];
       } else if (funct3 == 1) {
         if (rd != 0) s_.x[rd] = classify(f, read(rs1));
       } else {
@@ -198,9 +239,24 @@ RiscV64Cpu::Step RiscV64Cpu::floating(GuestMemory& m, uint32_t insn) {
       }
       return Step::Ok;
     }
-    case 0x1E: {      // fmv.w.x / fmv.d.x
-      if (rs2 != 0 || funct3 != 0) return undefined();
+    case 0x1E: {      // fmv.w.x / fmv.d.x / fmv.h.x, and Zfa's fli
+      if (funct3 != 0) return undefined();
+      if (rs2 == 1) {      // fli: one of 32 constants, named by rs1
+        static const uint64_t kFli[30] = {0xbff0000000000000ull, 0x0000000000000000ull, 0x3ef0000000000000ull, 0x3f00000000000000ull, 0x3f70000000000000ull, 0x3f80000000000000ull, 0x3fb0000000000000ull, 0x3fc0000000000000ull, 0x3fd0000000000000ull, 0x3fd4000000000000ull, 0x3fd8000000000000ull, 0x3fdc000000000000ull, 0x3fe0000000000000ull, 0x3fe4000000000000ull, 0x3fe8000000000000ull, 0x3fec000000000000ull, 0x3ff0000000000000ull, 0x3ff4000000000000ull, 0x3ff8000000000000ull, 0x3ffc000000000000ull, 0x4000000000000000ull, 0x4004000000000000ull, 0x4008000000000000ull, 0x4010000000000000ull, 0x4020000000000000ull, 0x4030000000000000ull, 0x4060000000000000ull, 0x4070000000000000ull, 0x40e0000000000000ull, 0x40f0000000000000ull};      // (binary64 patterns; converting them is exact in every format)
+        uint64_t bits;
+        if (rs1 == 1) bits = f == Format::F32 ? 0x00800000u : f == Format::F64 ? 0x0010000000000000ull : 0x0400u;      // the smallest normal number
+        else if (rs1 == 30) bits = f == Format::F32 ? 0x7F800000u : f == Format::F64 ? 0x7FF0000000000000ull : 0x7C00u;
+        else if (rs1 == 31) bits = canonical_nan(f);
+        else {
+          Env exact;
+          bits = convert(Format::F64, f, kFli[rs1], exact);
+        }
+        write(bits);
+        return Step::Ok;
+      }
+      if (rs2 != 0) return undefined();
       if (f == Format::F32) write_single(rd, s_.x[rs1]);
+      else if (f == Format::F16) write_half(rd, s_.x[rs1]);
       else s_.f[rd] = s_.x[rs1];
       return Step::Ok;
     }

@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Emulation/RiscV64Cpu.hpp"
+#include "Emulation/RiscV64Crypto.hpp"
+#include "Emulation/RiscV64VectorUnit.hpp"
 #include "Emulation/Wide.hpp"
 
 namespace emulation {
@@ -64,6 +66,16 @@ uint32_t expand_compressed(uint32_t c) {
         case 1: return enc_i(kLoadFp, 3, rd_p, rs1_p, ld_off);
         case 2: return enc_i(kLoad, 2, rd_p, rs1_p, lw_off);
         case 3: return enc_i(kLoad, 3, rd_p, rs1_p, ld_off);
+        case 4: {      // Zcb: c.lbu, c.lhu, c.lh, c.sb, c.sh
+          const uint32_t byte_off = (bit(c, 5) << 1) | bit(c, 6), half_off = bit(c, 5) << 1;
+          switch (field(c, 12, 10)) {
+            case 0: return enc_i(kLoad, 4, rd_p, rs1_p, byte_off);      // c.lbu
+            case 1: return enc_i(kLoad, bit(c, 6) ? 1 : 5, rd_p, rs1_p, half_off);      // c.lh, c.lhu
+            case 2: return enc_s(kStore, 0, rs1_p, rs2_p, byte_off);      // c.sb
+            case 3: return bit(c, 6) ? 0 : enc_s(kStore, 1, rs1_p, rs2_p, half_off);      // c.sh
+            default: return 0;
+          }
+        }
         case 5: return enc_s(kStoreFp, 3, rs1_p, rs2_p, ld_off);
         case 6: return enc_s(kStore, 2, rs1_p, rs2_p, lw_off);
         case 7: return enc_s(kStore, 3, rs1_p, rs2_p, ld_off);
@@ -81,7 +93,7 @@ uint32_t expand_compressed(uint32_t c) {
             if (imm == 0) return 0;
             return enc_i(kOpImm, 0, 2, 2, imm);
           }
-          if (imm6 == 0) return 0;      // c.lui with a zero immediate is reserved
+          if (imm6 == 0) return (rd_full & 1) && rd_full < 16 ? enc_i(kOpImm, 0, 0, 0, 0) : 0;      // c.lui with a zero immediate is reserved, except as Zcmop's c.mop.n (a no-operation)
           return (static_cast<uint32_t>(imm6) << 12 & 0xFFFFF000u) | (rd_full << 7) | kLui;
         }
         case 4: {
@@ -96,7 +108,16 @@ uint32_t expand_compressed(uint32_t c) {
           }
           if (sub == 0) return enc_r(kOp32, 0, 0x20, rs1_p, rs1_p, rs2_p);      // c.subw
           if (sub == 1) return enc_r(kOp32, 0, 0, rs1_p, rs1_p, rs2_p);      // c.addw
-          return 0;
+          if (sub == 2) return enc_r(kOp, 0, 1, rs1_p, rs1_p, rs2_p);      // Zcb: c.mul
+          switch (field(c, 4, 2)) {
+            case 0: return enc_i(kOpImm, 7, rs1_p, rs1_p, 255);      // c.zext.b
+            case 1: return enc_i(kOpImm, 1, rs1_p, rs1_p, 0x604);      // c.sext.b
+            case 2: return enc_r(kOp32, 4, 0x04, rs1_p, rs1_p, 0);      // c.zext.h
+            case 3: return enc_i(kOpImm, 1, rs1_p, rs1_p, 0x605);      // c.sext.h
+            case 4: return enc_r(kOp32, 0, 0x04, rs1_p, rs1_p, 0);      // c.zext.w (add.uw rd, rd, zero)
+            case 5: return enc_i(kOpImm, 4, rs1_p, rs1_p, -1);      // c.not
+            default: return 0;
+          }
         }
         case 5: {      // c.j
           const int64_t off = sext((bit(c, 12) << 11) | (bit(c, 8) << 10) | (field(c, 10, 9) << 8) | (bit(c, 6) << 7) | (bit(c, 7) << 6) | (bit(c, 2) << 5) | (bit(c, 11) << 4) | (field(c, 5, 3) << 1), 12);
@@ -362,7 +383,7 @@ RiscV64Cpu::Step RiscV64Cpu::execute(GuestMemory& m, uint32_t insn, uint32_t len
   auto word = [](uint64_t v) { return static_cast<uint64_t>(sext(v, 32)); };
   if (opcode == kOp || opcode == kOp32 || opcode == kOpImm || opcode == kOpImm32) {
     uint64_t bits;
-    if (bit_manipulation(insn, a, opcode == kOpImm || opcode == kOpImm32 ? 0 : b, &bits)) {
+    if (bit_manipulation(insn, a, opcode == kOpImm || opcode == kOpImm32 ? 0 : b, &bits) || rvcrypto::scalar_crypto(insn, a, opcode == kOpImm || opcode == kOpImm32 ? 0 : b, &bits)) {
       set_x(rd, bits);
       s_.pc = next;
       return Step::Ok;
@@ -576,8 +597,15 @@ RiscV64Cpu::Step RiscV64Cpu::execute(GuestMemory& m, uint32_t insn, uint32_t len
       }
       break;
     }
+    case 0x77: {      // OP-VE: the vector cryptography extensions
+      VectorUnit u(*this, m, insn);
+      if (!u.prepare()) return undefined();
+      const Step r = u.crypto();
+      if (r != Step::Ok) return r;
+      break;
+    }
     case kLoadFp: case kStoreFp:
-      if (funct3 != 2 && funct3 != 3) {      // the vector loads and stores share these opcodes
+      if (funct3 != 1 && funct3 != 2 && funct3 != 3) {      // the vector loads and stores share these opcodes (width 1 is the half precision load or store)
         const Step r = vector_memory(m, insn);
         if (r != Step::Ok) return r;
         break;
@@ -601,11 +629,31 @@ RiscV64Cpu::Step RiscV64Cpu::execute(GuestMemory& m, uint32_t insn, uint32_t len
 
 RiscV64Cpu::Step RiscV64Cpu::atomic(GuestMemory& m, uint32_t insn) {
   const uint32_t rd = field(insn, 11, 7), funct3 = field(insn, 14, 12), rs1 = field(insn, 19, 15), rs2 = field(insn, 24, 20), funct5 = insn >> 27;
-  if (funct3 != 2 && funct3 != 3) return undefined();
-  const uint32_t size = funct3 == 2 ? 4 : 8;
+  if (funct3 > 4 || (funct3 == 4 && funct5 != 5)) return undefined();
+  const uint32_t size = funct3 == 0 ? 1 : funct3 == 1 ? 2 : funct3 == 2 ? 4 : funct3 == 3 ? 8 : 16;      // (Zabha: bytes and halfwords; Zacas: amocas.q on 16 bytes)
   const uint64_t address = s_.x[rs1];
   if (address & (size - 1)) return fail(13, address);
-  auto widen = [&](uint64_t v) { return size == 4 ? static_cast<uint64_t>(sext(v, 32)) : v; };
+  auto widen = [&](uint64_t v) { return size == 1 ? static_cast<uint64_t>(sext(v, 8)) : size == 2 ? static_cast<uint64_t>(sext(v, 16)) : size == 4 ? static_cast<uint64_t>(sext(v, 32)) : v; };
+  if (funct5 == 5) {      // Zacas: amocas
+    if (size == 16) {      // amocas.q works on the register pairs (rd, rd+1) and (rs2, rs2+1)
+      if ((rd & 1) || (rs2 & 1)) return undefined();
+      uint64_t low, high;
+      if (!load(m, address, 8, &low) || !load(m, address + 8, 8, &high)) return Step::Fault;
+      if (low == s_.x[rd] && high == s_.x[rd + 1] && (!store(m, address, 8, s_.x[rs2]) || !store(m, address + 8, 8, s_.x[rs2 + 1]))) return Step::Fault;
+      set_x(rd, low);
+      set_x(rd + 1, high);
+      reservation_valid_ = false;
+      return Step::Ok;
+    }
+    uint64_t old;
+    if (!load(m, address, size, &old)) return Step::Fault;
+    const uint64_t mask = size == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * size)) - 1;
+    if ((old & mask) == (s_.x[rd] & mask) && !store(m, address, size, s_.x[rs2])) return Step::Fault;
+    set_x(rd, widen(old));
+    reservation_valid_ = false;
+    return Step::Ok;
+  }
+  if (size < 4 && (funct5 == 2 || funct5 == 3)) return undefined();      // (there is no lr / sc for bytes and halfwords)
   if (funct5 == 2) {      // lr
     if (rs2 != 0) return undefined();
     uint64_t v;
@@ -627,7 +675,8 @@ RiscV64Cpu::Step RiscV64Cpu::atomic(GuestMemory& m, uint32_t insn) {
   const uint64_t src = s_.x[rs2];
   uint64_t result;
   const int64_t so = static_cast<int64_t>(widen(old)), ss = static_cast<int64_t>(widen(src));
-  const uint64_t uo = size == 4 ? (old & 0xFFFFFFFFu) : old, us = size == 4 ? (src & 0xFFFFFFFFu) : src;
+  const uint64_t mask = size == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * size)) - 1;
+  const uint64_t uo = old & mask, us = src & mask;
   switch (funct5) {
     case 1: result = src; break;
     case 0: result = old + src; break;
@@ -651,7 +700,15 @@ RiscV64Cpu::Step RiscV64Cpu::system(uint32_t insn, uint32_t) {
   if (funct3 == 0) {
     if (insn == 0x00000073) return Step::Syscall;      // ecall
     if (insn == 0x00100073) return fail(3);            // ebreak
+    if (insn == 0x00D00073 || insn == 0x01D00073) return Step::Ok;      // Zawrs: wrs.nto, wrs.sto (the reservation set is never lost, so they return at once)
     return undefined();
+  }
+  if (funct3 == 4) {      // Zimop: mop.r.n and mop.rr.n write zero to rd (no instruction redefines them here)
+    const bool mop_r = (insn >> 31) == 1 && ((insn >> 28) & 3) == 0 && ((insn >> 22) & 0xF) == 7 && !((insn >> 25) & 1);
+    const bool mop_rr = (insn >> 31) == 1 && ((insn >> 28) & 3) == 0 && ((insn >> 25) & 1);
+    if (!mop_r && !mop_rr) return undefined();
+    set_x(field(insn, 11, 7), 0);
+    return Step::Ok;
   }
   return csr_access(insn);
 }

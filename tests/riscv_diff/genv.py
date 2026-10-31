@@ -15,12 +15,14 @@ def vconfigs():
     return out
 CONFIGS = vconfigs()
 
+HALF = False      # the half precision mode (Zvfh): floating-point cases may use SEW 16, and 8-bit integers convert to and from half
+
 class Cfg:
     def __init__(self, sew=None, fp=False, max_lmul=8, min_sew=8):
         while True:
             self.sew, self.lm, self.num, self.den = random.choice(CONFIGS)
             if sew and self.sew != sew: continue
-            if fp and self.sew not in (32, 64): continue
+            if fp and self.sew not in ((16, 16, 32, 64) if HALF else (32, 64)): continue
             if self.num > max_lmul or self.sew < min_sew: continue
             break
         if sew: pass
@@ -264,6 +266,25 @@ FFMA = ['fmacc', 'fnmacc', 'fmsac', 'fnmsac', 'fmadd', 'fnmadd', 'fmsub', 'fnmsu
 FCMP = ['mfeq', 'mfne', 'mflt', 'mfle']
 
 def fp_case():
+    if HALF and random.random() < 0.12:   # Zvfbfmin and Zvfbfwma
+        cfg = Cfg(sew=16, max_lmul=4)
+        pre = cfg.set(); m = mask_suffix(); r = cfg.regs
+        c = random.randrange(0, 3)
+        if c == 0:
+            vd, vs2 = groups(2, [2 * r, r]); return pre + f'\n vfwcvtbf16.f.f.v v{vd}, v{vs2}{m}'
+        if c == 1:
+            vd, vs2 = groups(2, [r, 2 * r]); return pre + f'\n vfncvtbf16.f.f.w v{vd}, v{vs2}{m}'
+        vd, vs2, vs1 = groups(3, [2 * r, r, r])
+        if random.random() < 0.5: return pre + f'\n vfwmaccbf16.vv v{vd}, v{vs1}, v{vs2}{m}'
+        return pre + f'\n vfwmaccbf16.vf v{vd}, {fr()}, v{vs2}{m}'
+    if HALF and random.random() < 0.1:   # 8-bit integers <-> half precision
+        cfg = Cfg(sew=8, max_lmul=4)
+        pre = cfg.set(); m = mask_suffix(); r = cfg.regs
+        if random.random() < 0.5:
+            vd, vs2 = groups(2, [2 * r, r])
+            return pre + f'\n {random.choice(["vfwcvt.f.xu.v", "vfwcvt.f.x.v"])} v{vd}, v{vs2}{m}'
+        vd, vs2 = groups(2, [r, 2 * r])
+        return pre + f'\n {random.choice(["vfncvt.xu.f.w", "vfncvt.x.f.w", "vfncvt.rtz.xu.f.w", "vfncvt.rtz.x.f.w"])} v{vd}, v{vs2}{m}'
     if random.random() < 0.08:   # 16-bit integers <-> single precision
         cfg = Cfg(sew=16, max_lmul=4)
         pre = cfg.set(); m = mask_suffix(); r = cfg.regs
@@ -296,7 +317,7 @@ def fp_case():
     elif k < 55:
         vd, vs2 = groups(2, [r, r]); t = f'{random.choice(["vfsqrt.v", "vfclass.v"])} v{vd}, v{vs2}{m}'
         if random.random() < 0.5:   # the 7-bit estimates, with operands at the interesting exponents
-            fb, eb = (23, 8) if cfg.sew == 32 else (52, 11)
+            fb, eb = (10, 5) if cfg.sew == 16 else (23, 8) if cfg.sew == 32 else (52, 11)
             e = random.choice([0, 0, 0, 1, 2, 3, (1 << eb) - 2, (1 << eb) - 3, (1 << eb) - 4, (1 << eb) - 1, random.randrange(0, 1 << eb), (1 << (eb - 1)) - 1, 1 << (eb - 1)])
             fr_ = random.choice([0, 1, 1 << (fb - 1), 1 << (fb - 2), (1 << (fb - 2)) - 1, (1 << fb) - 1, random.getrandbits(fb), random.getrandbits(fb) >> random.randrange(0, fb)])
             if random.random() < 0.3: e = 0; fr_ = random.choice([1 << (fb - 1), 1 << (fb - 2), (1 << (fb - 2)) - 1, (1 << (fb - 3)) + 5, (1 << (fb - 2)) + 7])
@@ -317,7 +338,7 @@ def fp_case():
         vd, vs2 = groups(2, [r, r])
         t = f'{random.choice(["vfcvt.xu.f.v", "vfcvt.x.f.v", "vfcvt.rtz.xu.f.v", "vfcvt.rtz.x.f.v", "vfcvt.f.xu.v", "vfcvt.f.x.v"])} v{vd}, v{vs2}{m}'
     elif k < 90:   # widening
-        if cfg.sew != 32 or cfg.num > 4: return pre + '\n nop'
+        if cfg.sew not in ((16, 32) if HALF else (32,)) or cfg.num > 4: return pre + '\n nop'
         vd, vs2, vs1 = groups(3, [2 * r, r, r]); c = random.randrange(0, 3)
         if c == 0:
             t = f'{random.choice(["vfwcvt.xu.f.v", "vfwcvt.x.f.v", "vfwcvt.rtz.xu.f.v", "vfwcvt.rtz.x.f.v", "vfwcvt.f.f.v"])} v{vd}, v{vs2}{m}'
@@ -330,7 +351,7 @@ def fp_case():
             vd, vs2, vs1 = groups(3, [2 * r, 2 * r, r])
             t = f'v{mn}.{form} v{vd}, v{vs2}, ' + (f'v{vs1}' if form == 'wv' else fr()) + m
     else:
-        if cfg.sew != 32 or cfg.num > 4: return pre + '\n nop'
+        if cfg.sew not in ((16, 32) if HALF else (32,)) or cfg.num > 4: return pre + '\n nop'
         vd, vs2, vs1 = groups(3, [r, 2 * r, r]); c = random.randrange(0, 3)
         if c == 0:
             t = f'{random.choice(["vfncvt.xu.f.w", "vfncvt.x.f.w", "vfncvt.rtz.xu.f.w", "vfncvt.rtz.x.f.w", "vfncvt.f.xu.w", "vfncvt.f.x.w", "vfncvt.f.f.w", "vfncvt.rod.f.f.w"])} v{vd}, v{vs2}{m}'
@@ -340,3 +361,75 @@ def fp_case():
             t = f'{random.choice(["vfwcvt.f.xu.v", "vfwcvt.f.x.v"])} v{groups(2, [2 * r, r])[0]}, v{groups(2, [2 * r, r])[1]}{m}'
             vd, vs2 = groups(2, [2 * r, r]); t = f'{random.choice(["vfwcvt.f.xu.v", "vfwcvt.f.x.v"])} v{vd}, v{vs2}{m}'
     return pre + '\n ' + t
+
+
+def bit_case():
+    """Zvbb, Zvkb and Zvbc: vandn, vror, vrol, vwsll, the unary bit instructions, vclmul and vclmulh"""
+    k = random.randrange(0, 100)
+    if k < 12:      # vclmul needs SEW = 64
+        cfg = Cfg(sew=64)
+    else:
+        cfg = Cfg()
+    r = cfg.regs
+    m = mask_suffix()
+    pre = cfg.set()
+    if k < 12:
+        vd, vs2, vs1 = groups(3, [r, r, r])
+        mn = random.choice(['vclmul', 'vclmulh'])
+        if random.random() < 0.5: return f'{pre}\n {mn}.vv v{vd}, v{vs2}, v{vs1}{m}'
+        return f'{pre}\n {mn}.vx v{vd}, v{vs2}, {xr()}{m}'
+    if k < 40:
+        vd, vs2, vs1 = groups(3, [r, r, r])
+        if random.random() < 0.2: vd = vs2
+        mn = random.choice(['vandn', 'vror', 'vrol'])
+        forms = ['vv', 'vx'] + (['vi'] if mn == 'vror' else [])
+        form = random.choice(forms)
+        if form == 'vv': return f'{pre}\n {mn}.vv v{vd}, v{vs2}, v{vs1}{m}'
+        if form == 'vx': return f'{pre}\n {mn}.vx v{vd}, v{vs2}, {xr()}{m}'
+        return f'{pre}\n vror.vi v{vd}, v{vs2}, {random.choice([0, 1, 7, 31, 32, 33, 63, random.randrange(0, 64)])}{m}'
+    if k < 60 and cfg.sew <= 32 and cfg.num <= 4:
+        vd, vs2, vs1 = groups(3, [2 * r, r, r])
+        form = random.choice(['vv', 'vx', 'vi'])
+        if form == 'vv': return f'{pre}\n vwsll.vv v{vd}, v{vs2}, v{vs1}{m}'
+        if form == 'vx': return f'{pre}\n vwsll.vx v{vd}, v{vs2}, {xr()}{m}'
+        return f'{pre}\n vwsll.vi v{vd}, v{vs2}, {random.choice([0, 1, 7, 15, 31, random.randrange(0, 32)])}{m}'
+    vd, vs2, _ = groups(3, [r, r, r])
+    if random.random() < 0.2: vd = vs2
+    return f'{pre}\n {random.choice(["vbrev8", "vrev8", "vbrev", "vclz", "vctz", "vcpop"])}.v v{vd}, v{vs2}{m}'
+
+
+def crypto_case(kinds=None):
+    """Zvkned, Zvknh, Zvksed, Zvksh, Zvkg: SEW 32 (64 for SHA-512), vl a multiple of the element group size"""
+    kind = random.choice(kinds or ['aes', 'aes', 'aeskf', 'sha2', 'sm4', 'sm3', 'ghash'])
+    sew = 64 if (kind == 'sha2' and random.random() < 0.5) else 32
+    cfg = Cfg(sew=sew, max_lmul=8)
+    egs = 4 if kind != 'sm3' else 8
+    if cfg.vlmax < egs or cfg.num < cfg.den: return None
+    vl = random.choice([egs, cfg.vlmax // egs * egs, random.randrange(1, cfg.vlmax // egs + 1) * egs])
+    if vl == 0: return None
+    r = cfg.regs
+    pre = f'li x29, {vl}\n vsetvli x28, x29, {cfg.vtype()}'
+    vd, vs2, vs1 = groups(3, [r, r, r])
+    vs2s = random.randrange(8, 32)      # a single register (the .vs forms)
+    if kind == 'aes':
+        op = random.choice(['vaesdf', 'vaesdm', 'vaesef', 'vaesem'])
+        if random.random() < 0.5: return f'{pre}\n {op}.vv v{vd}, v{vs2}'
+        while vd <= vs2s < vd + r: vs2s = random.randrange(8, 32)
+        if random.random() < 0.2: return f'{pre}\n vaesz.vs v{vd}, v{vs2s}'
+        return f'{pre}\n {op}.vs v{vd}, v{vs2s}'
+    if kind == 'aeskf':
+        if random.random() < 0.5: return f'{pre}\n vaeskf1.vi v{vd}, v{vs2}, {random.randrange(0, 16)}'
+        return f'{pre}\n vaeskf2.vi v{vd}, v{vs2}, {random.randrange(0, 16)}'
+    if kind == 'sha2':
+        return f'{pre}\n {random.choice(["vsha2ms", "vsha2ch", "vsha2cl"])}.vv v{vd}, v{vs2}, v{vs1}'
+    if kind == 'sm4':
+        c = random.randrange(0, 3)
+        if c == 0: return f'{pre}\n vsm4k.vi v{vd}, v{vs2}, {random.randrange(0, 8)}'
+        if c == 1: return f'{pre}\n vsm4r.vv v{vd}, v{vs2}'
+        while vd <= vs2s < vd + r: vs2s = random.randrange(8, 32)
+        return f'{pre}\n vsm4r.vs v{vd}, v{vs2s}'
+    if kind == 'sm3':
+        if random.random() < 0.5: return f'{pre}\n vsm3me.vv v{vd}, v{vs2}, v{vs1}'
+        return f'{pre}\n vsm3c.vi v{vd}, v{vs2}, {random.randrange(0, 32)}'
+    if random.random() < 0.7: return f'{pre}\n vghsh.vv v{vd}, v{vs2}, v{vs1}'
+    return f'{pre}\n vgmul.vv v{vd}, v{vs2}'

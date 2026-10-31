@@ -84,6 +84,8 @@ class RiscV64Cpu final : public IGuestCpu {
   void fp_finish(const softfloat::Env& env);
   uint64_t read_single(uint32_t r) const;      // an unboxed single, or the canonical NaN when the register is not NaN-boxed
   void write_single(uint32_t r, uint64_t bits) { s_.f[r] = 0xFFFFFFFF00000000ull | (bits & 0xFFFFFFFFu); }
+  uint64_t read_half(uint32_t r) const { return (s_.f[r] >> 16) == 0xFFFFFFFFFFFFull ? (s_.f[r] & 0xFFFFu) : 0x7E00u; }      // (Zfh: an unboxed half is the canonical NaN)
+  void write_half(uint32_t r, uint64_t bits) { s_.f[r] = 0xFFFFFFFFFFFF0000ull | (bits & 0xFFFFu); }
 
   State s_;
   GuestFault fault_;
