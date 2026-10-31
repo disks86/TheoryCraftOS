@@ -233,6 +233,10 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/Ide/IdeStorageDevice.cpp
   src/Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
   src/Hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
+  src/Hardware/StorageDevice/Sd/SdCard.cpp
+  src/Hardware/StorageDevice/Sd/SdStorageDevice.cpp
+  src/Hardware/Bus/Rtsx/RtsxHost.cpp
+  src/Hardware/Bus/Rtsx/RtsxDriver.cpp
   src/FileSystemDemo.cpp
   src/SystemFileSystem.cpp
   src/Hardware/StorageDevice/Partition/PartitionScanner.cpp
@@ -1139,6 +1143,10 @@ endif()
 option(TCOS_POWER "Power management: Intel hardware P-states / SpeedStep under a profile that follows the battery, MWAIT idle states, thermal throttling and shutdown at the critical temperature; not yet run on a real machine" OFF)
 if(TCOS_POWER)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_POWER)
+endif()
+option(TCOS_SDCARD "Drive the SD card slot of a Realtek card reader (RTS525A, PCI 10EC:525A): a card put in becomes a removable storage device; not yet run on a real machine" OFF)
+if(TCOS_SDCARD)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_SDCARD)
 endif()
 option(TCOS_ISH "Start the Intel Integrated Sensor Hub (PCI 8086:9D35 / A135): resets its IPC, brings up ISHTP and the HID client, adds the sensors to the sensor hub; not yet run on a real machine" OFF)
 if(TCOS_ISH)

@@ -7,10 +7,12 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "FakeSd.hpp"
 #include "FakeUsbSticks.hpp"
 #include "FileSystem/Mount/MountTable.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/StorageDevice/Sd/SdStorageDevice.hpp"
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/StorageDevice/Usb/UsbMassStorageDevice.hpp"
 #include "SystemFileSystem.hpp"
@@ -491,7 +493,35 @@ static void test_boot_time_devices() {
   CHECK(alloc.live == 0);
 }
 
+// An SD slot is a removable source next to the USB ports: a card put in is an Added event, a card taken out a Removed one, and the system works without any USB bus.
+static void test_sd_slot() {
+  TestAllocator alloc;
+  FakePci pci;
+  FakeSdHost slot;
+  SdSlotSource source(slot, alloc);
+  SystemStorageDevices storage(pci, nullptr, alloc, nullptr);
+  CHECK(storage.add_source(&source) && !storage.add_source(nullptr));
+  StorageEvent e;
+  CHECK(!storage.poll(&e) && storage.count() == 0);
+  FakeSdCard card(1024);
+  card.data[510] = 0x55;
+  card.data[511] = 0xAA;
+  slot.insert(&card);
+  CHECK(storage.poll(&e) && e.kind == StorageEvent::Kind::Added && e.device && strcmp(e.device->name(), "SD card") == 0 && e.device->info().removable && storage.count() == 1);
+  uint8_t block[512];
+  CHECK(e.device->read(0, ByteView(block)) && block[510] == 0x55 && block[511] == 0xAA);
+  const uint32_t id = e.id;
+  CHECK(!storage.poll(&e));
+  slot.remove();
+  CHECK(storage.poll(&e) && e.kind == StorageEvent::Kind::Removed && e.id == id && !e.device->present() && storage.count() == 0);
+  FakeSdCard second(2048);
+  slot.insert(&second);
+  CHECK(storage.poll(&e) && e.kind == StorageEvent::Kind::Added && e.id != id && e.device->info().block_count == 2048);
+  storage.shutdown();
+}
+
 int main() {
+  test_sd_slot();
   test_storage_hotplug();
   test_yank_in_the_middle();
   test_mount_table();
