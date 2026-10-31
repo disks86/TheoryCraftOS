@@ -34,6 +34,10 @@ constexpr uint8_t kTxAntConfigCommand = 0x98, kAddStaCommand = 0x18, kMacContext
 constexpr uint8_t kLongGroup = 0x01, kScanConfigCommand = 0x0C, kScanRequestUmacCommand = 0x0D, kScanAbortUmacCommand = 0x0E, kScanCompleteUmacCommand = 0x0F;
 constexpr uint8_t kDataPathGroup = 0x05, kDqaEnableCommand = 0x00;
 constexpr uint8_t kRxMpduCommand = 0xC1;
+constexpr uint8_t kBtConfigCommand = 0x9B, kTimeEventCommand = 0x29, kTimeEventNotification = 0x2A, kReplyError = 0x02;
+constexpr uint32_t kBtCoexNetwork = 1, kBtCoexHighBandRet = 0x10;
+constexpr uint32_t kTimeEventBytes = 36, kTeBssStaAggressiveAssoc = 0;
+constexpr uint32_t kTePolicyNotifyStart = 1u << 0, kTePolicyNotifyEnd = 1u << 1, kTePolicyStartImmediately = 1u << 11, kTeFragNone = 0;
 constexpr uint8_t kPhyContextCommand = 0x08, kAddStaKeyCommand = 0x17, kTxCommand = 0x1C, kBindingContextCommand = 0x2B;
 // firmware command versions this file writes
 constexpr uint32_t kTxAntConfigVersion = 1, kAddStaVersion = 10, kScanConfigVersionMin = 1, kScanRequestVersion = 8;
@@ -69,6 +73,27 @@ constexpr uint8_t kScanCompleted = 1, kScanAborted = 2;
 // ---- builders ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 uint32_t iwl_build_tx_ant_config(uint32_t valid_antennas, ByteView out);
+// BT_CONFIG (iwl_bt_coex_cmd): the network (Wi-Fi owns the antenna arbitration with the firmware's tables) mode and the high band retention module; sent by iwlwifi at every start.
+uint32_t iwl_build_bt_config(ByteView out);
+// TIME_EVENT_CMD (iwl_time_event_cmd, 36 bytes): the firmware keeps the channel of the interface for `duration_tu` time units from now, so that the frames of the join are not lost to a
+// scan or to leaving the channel (iwl_mvm_protect_session). `action` is kCtxtActionAdd, with the event type in `event`; to remove, kCtxtActionRemove with the unique id the add returned.
+struct IwlTimeEvent {
+  uint32_t action = iwl_mvm::kCtxtActionAdd;
+  uint8_t mac_id = 0, mac_color = 0;
+  uint32_t event = iwl_mvm::kTeBssStaAggressiveAssoc;      // the type when adding, the firmware's unique id when removing
+  uint32_t duration_tu = 500, max_delay_tu = 0;
+};
+uint32_t iwl_build_time_event(const IwlTimeEvent& event, ByteView out);
+// The response (iwl_time_event_resp): status (nonzero: scheduled), the id and unique id.
+bool iwl_parse_time_event_response(ConstByteView payload, uint32_t* status, uint32_t* unique_id);
+// REPLY_ERROR (iwl_error_resp): the firmware refused or could not run a command.
+struct IwlErrorResponse {
+  uint32_t error_type = 0;
+  uint8_t command = 0;
+  uint16_t sequence = 0;
+  uint32_t service = 0;
+};
+bool iwl_parse_error_response(ConstByteView payload, IwlErrorResponse* out);
 uint32_t iwl_build_dqa_enable(uint32_t command_queue, ByteView out);
 // The auxiliary station: id `station_id`, bound to the lmac index in the id/colour word, serving the transmit queues in `queue_mask`.
 uint32_t iwl_build_add_aux_station(uint8_t station_id, uint32_t queue_mask, ByteView out);

@@ -324,7 +324,12 @@ struct FakeIwl final : IIwlRegisters {
       else r &= ~iwl_csr::kGpMacClockReady;
     } else if (offset == iwl_csr::kReset) {
       if (value & iwl_csr::kResetStopMaster) r |= iwl_csr::kResetMasterDisabled;
-      if (value & iwl_csr::kResetSwReset) ++resets;
+      if (value & iwl_csr::kResetSwReset) {                       // the device's queues start again from nothing
+        ++resets;
+        for (uint32_t& w : queue_wrptr) w = 0;
+        regs[iwl_tx::kHbusTargWrptr / 4] = 0;
+        regs[0x1C80 / 4] = 0;
+      }
     }
   }
 };
@@ -505,8 +510,9 @@ struct CollectSink final : IIwlPacketSink {
 // The chip's receive side: takes the posted buffers in order, fills them with frames, closes them.
 struct FakeRxChip {
   FakeIwl& chip;
-  uint32_t taken = 0, closed = 0;
-  explicit FakeRxChip(FakeIwl& c) : chip(c) {}
+  uint32_t taken = 0, closed = 0, seen_resets = 0;
+  explicit FakeRxChip(FakeIwl& c) : chip(c), seen_resets(c.resets) {}
+  void sync() { if (seen_resets != chip.resets) { taken = closed = 0; seen_resets = chip.resets; } }
   uint64_t prph64(uint32_t a) { return chip.prph[(a & 0xFFFFF) / 4] | (static_cast<uint64_t>(chip.prph[((a & 0xFFFFF) + 4) / 4]) << 32); }
   uint32_t write_pointer() { return chip.regs[0x1C80 / 4]; }
   // frame: len_n_flags(size = 4 + payload), command header, payload; padded to 64
@@ -518,6 +524,7 @@ struct FakeRxChip {
   }
   // returns false when the host has not posted a buffer
   bool deliver(const Bytes& content, bool end_marker = true) {
+    sync();
     if (((write_pointer() - taken) & 255) == 0) return false;
     const uint64_t* ring = reinterpret_cast<const uint64_t*>(prph64(0xA08000));
     const uint64_t entry = ring[taken % 256];
@@ -627,12 +634,13 @@ static void test_rx() {
 struct FakeTxChip {
   FakeIwl& chip;
   uint32_t read = 0;
-  uint32_t queue = 0;
-  explicit FakeTxChip(FakeIwl& c, uint32_t q = 0) : chip(c), queue(q) {}
+  uint32_t queue = 0, seen_resets = 0;
+  explicit FakeTxChip(FakeIwl& c, uint32_t q = 0) : chip(c), queue(q), seen_resets(c.resets) {}
   uint64_t ring_base() { return static_cast<uint64_t>(chip.regs[iwl_tx::cbbc_queue(queue) / 4]) << 8; }
   std::vector<Bytes> process(bool* ok) {
     std::vector<Bytes> out;
     *ok = true;
+    if (seen_resets != chip.resets) { read = 0; seen_resets = chip.resets; }
     const uint32_t wr = queue == 0 ? (chip.regs[iwl_tx::kHbusTargWrptr / 4] & 0xFF) : chip.queue_wrptr[queue];
     while (read != wr) {
       const uint8_t* tfd = reinterpret_cast<const uint8_t*>(ring_base()) + read * 128;
@@ -1068,6 +1076,23 @@ static void test_mvm_builders() {
   CHECK(iwl_build_add_aux_station(3, 2, ByteView(buf, 47)) == 0);
   CHECK(iwl_build_scan_config(0, 3, 3, ByteView(buf, sizeof buf)) == 12 && buf[2] == 0 && buf[4] == 3 && buf[8] == 3);
   CHECK(iwl_build_tx_ant_config(3, ByteView(buf, sizeof buf)) == 4 && buf[0] == 3 && iwl_build_dqa_enable(0, ByteView(buf, 3)) == 0);
+  // BT_CONFIG: the network mode and the high band retention module; TIME_EVENT_CMD: 36 bytes, the interface first, then the action, the type, the times and the policy
+  CHECK(iwl_build_bt_config(ByteView(buf, sizeof buf)) == 8 && buf[0] == 1 && buf[4] == 0x10 && iwl_build_bt_config(ByteView(buf, 7)) == 0);
+  IwlTimeEvent te;
+  te.mac_id = 2;
+  te.mac_color = 3;
+  te.duration_tu = 500;
+  CHECK(iwl_build_time_event(te, ByteView(buf, sizeof buf)) == 36 && buf[0] == 2 && buf[1] == 3 && buf[4] == 1 && buf[8] == 0 && buf[28] == (500 & 0xFF) && buf[29] == (500 >> 8) && buf[24] == 1 && buf[32] == 1 && buf[33] == 0 &&
+        (buf[34] | (buf[35] << 8)) == 0x803 && iwl_build_time_event(te, ByteView(buf, 35)) == 0);
+  te.action = iwl_mvm::kCtxtActionRemove;
+  te.event = 0x1234;
+  CHECK(iwl_build_time_event(te, ByteView(buf, sizeof buf)) == 36 && buf[4] == 3 && buf[8] == 0x34 && buf[9] == 0x12);
+  uint32_t te_status, te_unique;
+  const uint8_t te_response[16] = {1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0};
+  CHECK(iwl_parse_time_event_response(ConstByteView(te_response, 16), &te_status, &te_unique) && te_status == 1 && te_unique == 9 && !iwl_parse_time_event_response(ConstByteView(te_response, 10), &te_status, &te_unique));
+  IwlErrorResponse er;
+  const uint8_t error_response[12] = {0x20, 0, 0, 0, 0x18, 0, 0x34, 0x12, 5, 0, 0, 0};
+  CHECK(iwl_parse_error_response(ConstByteView(error_response, 12), &er) && er.error_type == 0x20 && er.command == 0x18 && er.sequence == 0x1234 && er.service == 5 && !iwl_parse_error_response(ConstByteView(error_response, 11), &er));
   // the MAC context (148 bytes: node address 16, bssid 24, rates 32/36, filter 52, access categories from 60)
   IwlMacContext mc;
   for (int i = 0; i < 6; ++i) mc.address[i] = static_cast<uint8_t>(0xA0 + i);
@@ -1221,9 +1246,9 @@ static void test_scanner() {
     }
     CHECK(up && sc.ready());
     if (!up) printf("  bring_up: %s\n", error ? error : "?");
-    // the commands went in the order of iwl_mvm_up: antennas, DQA, the auxiliary station, the scan configuration, the interface
-    CHECK(seen.size() >= 5);
-    if (seen.size() >= 5) CHECK(seen[seen.size() - 5] == std::make_pair(uint8_t(0), uint8_t(0x98)) && seen[seen.size() - 4] == std::make_pair(uint8_t(5), uint8_t(0)) &&
+    // the commands went in the order of iwl_mvm_up: antennas, Bluetooth coexistence, DQA, the auxiliary station, the scan configuration, the interface
+    CHECK(seen.size() >= 6);
+    if (seen.size() >= 6) CHECK(seen[seen.size() - 6] == std::make_pair(uint8_t(0), uint8_t(0x98)) && seen[seen.size() - 5] == std::make_pair(uint8_t(0), uint8_t(0x9B)) && seen[seen.size() - 4] == std::make_pair(uint8_t(5), uint8_t(0)) &&
                                 seen[seen.size() - 3] == std::make_pair(uint8_t(0), uint8_t(0x18)) && seen[seen.size() - 2] == std::make_pair(uint8_t(1), uint8_t(0x0C)) && seen[seen.size() - 1] == std::make_pair(uint8_t(0), uint8_t(0x28)));
     // the auxiliary queue was enabled on its FIFO and chained
     CHECK(chip.prph[(iwl_tx::scd_queue_status(1) & 0xFFFFF) / 4] == (iwl_tx::kQueueStatusActive | iwl_tx::kMcastFifo | iwl_tx::kQueueStatusWsl | iwl_tx::kQueueStatusMask));
@@ -1459,6 +1484,7 @@ static void test_station_link() {
     link.set_data_sink(&sink);
     std::vector<std::pair<uint8_t, uint8_t>> commands;
     Bytes last_key_cmd, last_ptk_cmd, last_mac_cmd, last_sta_cmd;
+    std::vector<Bytes> te_commands;
     chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, 1, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
     chip.on_doorbell = [&] {
       bool ok = false;
@@ -1471,6 +1497,7 @@ static void test_station_link() {
         if (op == 0x17) { if (c[4 + 3] & 0x40) last_key_cmd = c; else last_ptk_cmd = c; }
         Bytes f;
         const uint8_t status = (op == 0x2B) ? 0 : (op == 0x18 || op == 0x17) ? 1 : 0;
+        if (op == 0x29) { te_commands.push_back(c); FakeRxChip::frame(f, group, op, seq, Bytes{1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0}); rxhw.deliver(f); continue; }   // the time event is scheduled: unique id 9
         FakeRxChip::frame(f, group, op, seq, Bytes{status, 0, 0, 0});
         rxhw.deliver(f);
       }
@@ -1538,7 +1565,8 @@ static void test_station_link() {
     CHECK(link.prepare(fw, nvm, net, &error));
     if (!link.prepared()) printf("  prepare: %s\n", error ? error : "?");
     // the contexts went in the order: PHY, MAC (with the BSSID), binding, station
-    CHECK(commands.size() >= 4 && commands[commands.size() - 4].second == 0x08 && commands[commands.size() - 3].second == 0x28 && commands[commands.size() - 2].second == 0x2B && commands.back().second == 0x18);
+    CHECK(commands.size() >= 5 && commands[commands.size() - 5].second == 0x08 && commands[commands.size() - 4].second == 0x28 && commands[commands.size() - 3].second == 0x2B && commands[commands.size() - 2].second == 0x18 && commands.back().second == 0x29);   // (then the time event that keeps the channel)
+    CHECK(te_commands.size() == 1 && te_commands[0].size() == 4 + 36 && te_commands[0][4 + 4] == 1 && te_commands[0][4 + 8] == 0 && (te_commands[0][4 + 28] | (te_commands[0][4 + 29] << 8)) == 500);     // the join's channel is held
     CHECK(last_mac_cmd.size() > 36 && memcmp(&last_mac_cmd[4 + 24], kLinkBssid, 6) == 0 && last_mac_cmd[4 + 4] == 2);        // action: modify
     CHECK(last_sta_cmd.size() == 4 + 48 && last_sta_cmd[4 + 16] == 1 && last_sta_cmd[4 + 8] == 0xA0 && last_sta_cmd[4 + 40] == 0x10);
     CHECK(chip.prph[(iwl_tx::scd_queue_status(4) & 0xFFFFF) / 4] == (iwl_tx::kQueueStatusActive | 3 | iwl_tx::kQueueStatusWsl | iwl_tx::kQueueStatusMask));
@@ -1634,6 +1662,7 @@ struct WifiFixture {
   FixedRandom random;
   linktest::Authenticator ap;
   std::vector<uint8_t> commands;                        // opcodes seen on the command queue
+  std::vector<Bytes> te_commands;                       // the time event commands
   std::vector<Bytes> queue4;                            // frames sent to the access point
   bool ap_answers_handshake = true;
   uint32_t phy_actions = 0;                             // PHY context action of the latest PHY command
@@ -1685,6 +1714,7 @@ struct WifiFixture {
         continue;
       } else {
         const uint8_t status = (op == 0x2B) ? 0 : (op == 0x18 || op == 0x17) ? 1 : 0;
+        if (op == 0x29) { te_commands.push_back(c); FakeRxChip::frame(f, group, op, seq, Bytes{1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0}); rxhw.deliver(f); continue; }   // the time event is scheduled: unique id 9
         FakeRxChip::frame(f, group, op, seq, Bytes{status, 0, 0, 0});
         if (group == 2 && op == 3) FakeRxChip::frame(f, 2, 4, 0x8000, Bytes{1});
         if (op == 0x08) last_phy_action = c[4 + 4];
@@ -1798,6 +1828,7 @@ static void test_wireless_interface() {
     bool removed_station = false, removed_binding = false;
     for (uint8_t op : fx.commands) { removed_station |= op == 0x19; removed_binding |= op == 0x2B; }
     CHECK(removed_station && removed_binding);
+    CHECK(fx.te_commands.size() >= 2 && fx.te_commands.back()[4 + 4] == 3 && fx.te_commands.back()[4 + 8] == 9);       // the time event was taken away (action remove, the id the firmware gave)
     CHECK(!wifi.transmit(ConstByteView(eth.data(), eth.size())));
     CHECK(wifi.start_scan());
     for (int i = 0; i < 20 && wifi.status().state == WifiState::Scanning; ++i) {}
@@ -1809,6 +1840,131 @@ static void test_wireless_interface() {
     wifi.shutdown();
     CHECK(fx.alloc.dma.empty() && !wifi.link_up());
   }
+}
+
+// What the card says when the firmware stops: the interrupt status, the error table in the device's memory, a command that is never answered, the refusal of a command.
+static void test_firmware_failure() {
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.regs[iwl_csr::kHwRev / 4] = (0x31u << 4) | 0x3;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    bool answer = true;
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, iwl_cmd::kAliveNotification, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool ok = false;
+      for (const Bytes& c : txhw.process(&ok)) {
+        if (!answer) continue;
+        Bytes f;
+        FakeRxChip::frame(f, c[1], c[0], static_cast<uint16_t>(c[2] | (c[3] << 8)), Bytes{0, 0, 0, 0});
+        rxhw.deliver(f);
+      }
+    };
+    CHECK(tp.start(fw, IwlImage::Regular, 5000, &error) && !tp.firmware_failed() && tp.failure_text()[0] == 0);
+    // the error table the ALIVE notification pointed to (0x1234): one entry, an assert with its data words
+    uint32_t* table = &chip.mem[0x1234 / 4];
+    table[0] = 1;
+    table[1] = 0x70;                                  // error_id
+    table[4] = 0xB2B2B2B2;                            // blink2
+    table[6] = 0x12121212;                            // ilink2
+    table[7] = 0xD1;
+    table[8] = 0xD2;
+    table[9] = 0xD3;
+    table[23] = 0xC0DE;                               // hcmd
+    table[29] = 0x28;                                 // last command
+    uint8_t buf[16];
+    IwlHostCommand c;
+    c.opcode = 0x21;
+    CHECK(tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error) == 4 && tp.command_errors() == 0);
+    {   // a REPLY_ERROR notification is counted and the firmware goes on
+      Bytes f;
+      FakeRxChip::frame(f, 0, iwl_cmd::kReplyError, 0x8000, Bytes{0x20, 0, 0, 0, 0x18, 0, 0x34, 0x12, 5, 0, 0, 0});
+      rxhw.deliver(f);
+      tp.poll(nullptr);
+      CHECK(tp.command_errors() == 1 && !tp.firmware_failed());
+    }
+    if (scenario == 0) {                              // the card raises the software error interrupt
+      chip.regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitSwError;
+      CHECK(tp.check_firmware() && tp.firmware_failed());
+    } else if (scenario == 1) {                       // the same, found while a command waits
+      answer = false;
+      chip.regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitHwError;
+      CHECK(tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error) < 0 && tp.firmware_failed());
+    } else {                                          // nobody answers and no interrupt: the log is read after the wait
+      answer = false;
+      CHECK(tp.send_sync(c, ByteView(buf, sizeof buf), 500, &error) < 0 && tp.firmware_failed());
+    }
+    CHECK(tp.error_log().valid() && tp.error_log().error_id() == 0x70 && tp.error_log().data1() == 0xD1 && tp.error_log().data2() == 0xD2 && tp.error_log().data3() == 0xD3 && tp.error_log().hcmd() == 0xC0DE);
+    CHECK(strstr(tp.failure_text(), "0x00000070") && strstr(tp.failure_text(), "0x000000D1") && strstr(tp.failure_text(), "0x12121212") && strstr(tp.failure_text(), "last command 0x00000028"));
+    // every later command fails at once with the text; a new start clears it
+    error = nullptr;
+    answer = true;
+    CHECK(tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error) < 0 && error && strstr(error, "0x00000070"));
+    chip.regs[iwl_csr::kInt / 4] = 0;
+    tp.stop();
+    CHECK(tp.start(fw, IwlImage::Regular, 5000, &error) && !tp.firmware_failed() && tp.failure_text()[0] == 0 && !tp.error_log().valid());
+    tp.stop();
+  }
+  {   // the log reader on its own: an empty table, a pointer that is no pointer
+    FakeIwl chip;
+    chip.regs[iwl_csr::kGpCntrl / 4] = iwl_csr::kGpMacClockReady;
+    IwlPcieDevice dev(chip);
+    IwlErrorLog log;
+    char text[256];
+    CHECK(iwl_read_error_log(dev, 0x40, &log) && !log.valid());
+    iwl_format_error_log(log, text, sizeof text);
+    CHECK(strstr(text, "without an error log"));
+    CHECK(!iwl_read_error_log(dev, 0, &log) && !iwl_read_error_log(dev, 0x41, &log) && !iwl_read_error_log(dev, 0xFFFFFFFFu, &log));
+    log.words[0] = 1;
+    log.words[1] = 0xABCD;
+    CHECK(iwl_format_error_log(log, text, sizeof text) > 20 && strstr(text, "0x0000ABCD"));
+    char small[12];
+    CHECK(iwl_format_error_log(log, small, sizeof small) == 11 && small[11] == 0);
+    CHECK(iwl_format_error_log(log, small, 0) == 0);
+  }
+}
+
+// The firmware stops while the interface is joined: it is taken down, the card started again, and the interface works again; after too many in a minute it stays down.
+static void test_firmware_recovery() {
+  WifiFixture fx("hunter2hunter2");
+  IwlWirelessInterface::Inputs in;
+  in.firmware = &fx.source; in.allocator = &fx.alloc; in.clock = &fx.clock; in.random = &fx.random;
+  IwlWirelessInterface wifi(in);
+  CHECK(wifi.start(fx.chip, true));
+  CHECK(wifi.start_scan());
+  CHECK(wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Ok && wifi.link_up());
+  uint32_t* table = &fx.chip.mem[0x1234 / 4];
+  table[0] = 1;
+  table[1] = 0x70;
+  table[7] = 0xD1;
+  for (int failure = 1; failure <= 4; ++failure) {
+    fx.chip.regs[iwl_csr::kInt / 4] |= iwl_csr::kIntBitSwError;                        // the firmware asserts
+    CHECK(!wifi.link_up());                                                           // noticed on the next look: the connection is gone
+    if (failure <= 3) {
+      CHECK(wifi.restarts() == static_cast<uint32_t>(failure) && wifi.driver().running() && wifi.status().state == WifiState::Disconnected && strstr(wifi.last_firmware_failure(), "0x00000070"));
+      CHECK(wifi.start_scan());                                                       // alive again
+      for (int i = 0; i < 20 && wifi.status().state == WifiState::Scanning; ++i) {}
+      WifiNetwork nets[8];
+      CHECK(wifi.scan_results(ArrayView<WifiNetwork>(nets, 8)) == 2);
+      if (failure == 1) {
+        CHECK(wifi.connect(StringView("Home"), StringView("hunter2hunter2")) == WifiResult::Ok && wifi.link_up());      // and can join again
+      }
+    } else {
+      CHECK(wifi.restarts() == 3 && !wifi.driver().running() && strstr(wifi.failure(), "keeps failing") && !wifi.start_scan());
+    }
+  }
+  // a minute later the count starts again
+  wifi.shutdown();
+  CHECK(fx.alloc.dma.empty());
 }
 
 int main() {
@@ -1827,7 +1983,9 @@ int main() {
   test_scanner();
   test_link_builders();
   test_station_link();
+  test_firmware_failure();
   test_wireless_interface();
+  test_firmware_recovery();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

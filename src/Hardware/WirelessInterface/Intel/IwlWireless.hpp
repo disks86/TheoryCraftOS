@@ -62,6 +62,12 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   bool link_comes_and_goes() const override { return true; }
   const char* failure() const { return failure_; }
   const IwlDriver& driver() const { return driver_; }
+  // The firmware stopped (its error bits came up, or a command was never answered): the interface is taken down, the card started again, up to kMaxRecentRestarts times within a
+  // minute. The connection is gone after one (the status says disconnected; scan and connect again). restarts() counts them since the start; last_firmware_failure() is the line the
+  // transport made of the firmware's error log.
+  static constexpr uint32_t kMaxRecentRestarts = 3, kRestartWindowMs = 60000;
+  uint32_t restarts() const { return restarts_; }
+  const char* last_firmware_failure() const { return failure_text_; }
 
   // INetworkInterface
   MacAddress mac_address() const override;
@@ -90,6 +96,9 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   void pump() const;
   void finish_connection(WifiResult result) const;
   bool attach();                                       // after the driver is running: scanner, link, state machine, receive ring
+  bool open_locked();
+  void shutdown_locked();
+  void recover() const;
   void leave_locked();
 
   Inputs in_;
@@ -106,6 +115,11 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   mutable uint32_t ring_head_ = 0, ring_tail_ = 0, ring_count_ = 0;
   mutable NetworkStatistics own_;
   const char* failure_ = "";
+  IIwlRegisters* registers_ = nullptr;                 // when started from a register window (tests): to start again
+  bool integrated_ = false;
+  mutable uint32_t restarts_ = 0, recent_restarts_ = 0;
+  mutable uint64_t last_restart_ms_ = 0;
+  mutable char failure_text_[200] = {};
 };
 
 }  // namespace hardware

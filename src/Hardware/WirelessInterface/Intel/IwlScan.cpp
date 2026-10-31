@@ -63,6 +63,13 @@ bool IwlScanner::bring_up(const IwlFirmware& firmware, const IwlNvmData& nvm, co
   command.data = ConstByteView(out, n);
   if (!send(command, ByteView(response, sizeof response), nullptr, error)) return false;
 
+  // Bluetooth coexistence: iwlwifi sends it at every start (the network mode). The firmware goes on without it, so a refusal is not a reason to stop, but a failed firmware is.
+  n = iwl_build_bt_config(ByteView(out, sizeof out));
+  command = IwlHostCommand();
+  command.opcode = kBtConfigCommand;
+  command.data = ConstByteView(out, n);
+  if (!send(command, ByteView(response, sizeof response), nullptr, error) && transport_.firmware_failed()) return false;
+
   // DQA: the queues are assigned by function (the command queue 0, the auxiliary 1, ...)
   if (firmware.has_capability(kCapabilityDqaSupport)) {
     n = iwl_build_dqa_enable(iwl_tx::kCommandQueue, ByteView(out, sizeof out));

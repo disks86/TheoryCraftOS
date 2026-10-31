@@ -41,6 +41,9 @@ bool IwlTransport::start(const IwlFirmware& firmware, IwlImage image, uint32_t t
   if (!error) error = &local;
   stop();
   alive_ = IwlAliveInfo();
+  failed_ = false;
+  failure_text_[0] = 0;
+  error_log_ = IwlErrorLog();
   if (!device_.present()) {
     *error = "the card does not answer";
     return false;
@@ -114,7 +117,24 @@ void IwlTransport::stop() {
   }
 }
 
+void IwlTransport::capture_failure() {
+  if (failed_) return;
+  failed_ = true;
+  if (!iwl_read_error_log(device_, alive_.error_event_table, &error_log_)) error_log_ = IwlErrorLog();
+  iwl_format_error_log(error_log_, failure_text_, sizeof failure_text_);
+}
+
+bool IwlTransport::check_firmware() {
+  if (failed_) return true;
+  if (running_ && (device_.read32(kInt) & (kIntBitSwError | kIntBitHwError))) capture_failure();
+  return failed_;
+}
+
 void IwlTransport::on_packet(const IwlRxPacket& packet) {
+  if (packet.group == 0 && packet.command == iwl_cmd::kReplyError && !packet.is_response()) {
+    ++command_errors_;
+    return;
+  }
   if (packet.group == 0 && packet.command == iwl_cmd::kAliveNotification && !packet.is_response()) {
     ByteReader r(packet.payload);
     alive_.status = r.le16();
@@ -146,12 +166,17 @@ uint32_t IwlTransport::poll(IIwlNotificationHandler* handler) {
   handler_ = handler ? handler : default_handler_;
   const uint32_t frames = rx_.poll(*this);
   handler_ = saved;
+  if (running_) check_firmware();
   return frames;
 }
 
 int32_t IwlTransport::send_sync(const IwlHostCommand& command, ByteView response, uint32_t timeout_us, const char** error) {
   const char* local = nullptr;
   if (!error) error = &local;
+  if (failed_) {
+    *error = failure_text_[0] ? failure_text_ : "the firmware has failed";
+    return -1;
+  }
   if (!running_ || waiting_) {
     *error = running_ ? "a command is already being waited for" : "the firmware is not running";
     return -1;
@@ -167,14 +192,15 @@ int32_t IwlTransport::send_sync(const IwlHostCommand& command, ByteView response
   while (!answered_) {
     poll(handler_);
     if (answered_) break;
-    if (device_.read32(kInt) & (kIntBitSwError | kIntBitHwError)) {
-      *error = "the firmware failed while a command was pending";
+    if (check_firmware()) {
+      *error = failure_text_[0] ? failure_text_ : "the firmware failed while a command was pending";
       waiting_ = false;
       return -1;
     }
     if (waited >= timeout_us) {
       *error = "the firmware did not answer the command";
       waiting_ = false;
+      if (device_.present()) capture_failure();           // (a silent firmware may have stopped without the interrupt: its log says)
       return -1;
     }
     delay_us(50);
