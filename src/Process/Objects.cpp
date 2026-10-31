@@ -19,6 +19,8 @@
 
 #include <new>
 
+#include "Utility/AllocatedView.hpp"
+
 namespace process {
 
 namespace {
@@ -197,19 +199,39 @@ struct ObjectManager::Section {
 
 // ---- pipes
 
+struct ObjectManager::PipeOp {
+  uint32_t tag = 0;      // 0: no operation here
+  PipeOpKind kind = PipeOpKind::None;
+  uint8_t end = 0;      // the end that made the call
+  uint8_t state = 0;      // 0 free, 1 pending, 2 finished, 3 finished and its result taken
+  bool message_mode = false, async = false, counted = false, detached = false;      // (detached: nobody waits for it; it goes when it is over)
+  uint32_t status = 0, length = 0, transferred = 0;      // (length: what a read asks for, what a write has in all)
+  uint64_t owner = 0;      // the process that made the call
+  ByteView data;      // a read that was answered: what it took
+};
+
 struct ObjectManager::Pipe {
+  static constexpr uint32_t kRecords = 128, kOps = 32;
+  // What one write put in the queue of its direction, oldest first (a message of a message pipe). `length` is what of it has not been read; `op` the write that is not
+  // complete yet because there is no room for it (0: complete).
+  struct Record { uint32_t length = 0, op = 0; };
   bool used = false;
-  uint8_t* data[2] = {};            // data[d]: what end d wrote and the other end has not read yet
-  uint32_t capacity[2] = {}, head[2] = {}, count[2] = {};
+  ByteView data[2];            // data[d]: a ring with what end d wrote and the other end has not read yet; larger than `capacity` when writes are waiting for room
+  uint32_t capacity[2] = {}, head[2] = {}, count[2] = {};      // (count: all of it, the writes that wait for room included)
+  Record records[2][kRecords];
+  uint32_t record_head[2] = {}, record_count[2] = {};
+  PipeOp ops[kOps];
+  uint32_t next_tag = 1, undelivered = 0;      // (undelivered: operations finished whose thread has not acted on that yet)
   uint32_t end_refs[2] = {};
+  uint32_t port_semaphore[2] = {};      // the completion port each end is tied to (a semaphore object), and the key
+  uint64_t port_key[2] = {};
+  uint64_t process_id[2] = {};      // the processes of the server and the client
+  uint64_t listen_order = 0;      // when it started to listen: the client goes to the instance that has listened longest
+  bool file_signaled[2] = {true, true};      // (the event of each end's file object)
   bool anonymous = false, connected = false, listening = false, client_seen = false, disconnected = false;
   uint32_t access = 0, max_instances = 0, generation = 0;
   bool message_type = false;
-  uint32_t cancel_generation = 0;
   uint32_t requested_size[2] = {};      // the buffer sizes the server asked for (0 is possible; the capacity then has a default)
-  bool message_count_ok(uint32_t q) const { return message_count[q] > 0; }
-  static constexpr uint32_t kMessages = 64;
-  uint32_t message_size[2][kMessages] = {}, message_head[2] = {}, message_count[2] = {};      // (message pipes: the lengths of what each end wrote, oldest first)
   // The end an end_code names; false for a client end of an earlier connection.
   bool end_of(uint32_t code, uint32_t* end) const {
     *end = code & 1;
@@ -220,6 +242,22 @@ struct ObjectManager::Pipe {
 namespace {
 constexpr uint32_t kPipeBusy = 0xC00000AEu;
 constexpr uint32_t kDefaultPipeBuffer = 4096, kMaxPipeBuffer = 1u << 20;
+constexpr uint32_t kMaxPipeQueue = 32u << 20;      // what a direction may hold in all (the buffer and the writes that wait)
+constexpr uint32_t kStatusCancelled = 0xC0000120u, kStatusBroken = 0xC000014Bu, kStatusDisconnected = 0xC00000B0u, kStatusMoreData = 0x80000005u, kStatusNoMemory = 0xC0000017u;
+
+// Bytes of a ring (the storage, where it starts) `offset` bytes in, into `out` / from `in`.
+void ring_read(ConstByteView ring, uint64_t head, uint64_t offset, ByteView out) {
+  if (out.empty()) return;
+  const uint64_t at = (head + offset) % ring.size(), first = ring.size() - at < out.size() ? ring.size() - at : out.size();
+  out.subview(0, first).copy_from(ring.subview(at, first));
+  if (first < out.size()) out.subview(first, out.size() - first).copy_from(ring.subview(0, out.size() - first));
+}
+void ring_write(ByteView ring, uint64_t head, uint64_t offset, ConstByteView in) {
+  if (in.empty()) return;
+  const uint64_t at = (head + offset) % ring.size(), first = ring.size() - at < in.size() ? ring.size() - at : in.size();
+  ring.subview(at, first).copy_from(in.subview(0, first));
+  if (first < in.size()) ring.subview(0, in.size() - first).copy_from(in.subview(first, in.size() - first));
+}
 }  // namespace
 
 struct ObjectManager::Mailslot {
@@ -235,7 +273,9 @@ struct ObjectManager::Mailslot {
 ObjectManager::~ObjectManager() {
   if (pipes_) {
     for (uint32_t i = 0; i < kMaxPipes; ++i) {
-      for (uint8_t* d : pipes_[i].data) if (d && allocator_) allocator_->deallocate(d);
+      if (!allocator_) continue;
+      for (ByteView& d : pipes_[i].data) release_view(*allocator_, d);
+      for (PipeOp& op : pipes_[i].ops) release_view(*allocator_, op.data);
     }
     if (allocator_) allocator_->deallocate(pipes_);      // (Pipe is plain data: nothing to destroy)
   }
@@ -264,14 +304,14 @@ ObjectManager::Pipe* ObjectManager::pipe_of(uint32_t id) {
 void ObjectManager::free_pipe_locked(Object& o) {
   if (o.pipe < 0 || !pipes_) return;
   Pipe& p = pipes_[o.pipe];
-  for (uint8_t*& d : p.data) {
-    if (d && allocator_) allocator_->deallocate(d);
-    d = nullptr;
+  if (allocator_) {
+    for (ByteView& d : p.data) release_view(*allocator_, d);
+    for (PipeOp& op : p.ops) release_view(*allocator_, op.data);
   }
   p = Pipe();
 }
 
-ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type) {
+ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type, uint64_t pid) {
   Created result;
   if (!allocator_ || name.size() >= kNameBytes || access < kPipeInbound || access > kPipeDuplex) { result.status = !allocator_ ? 0xC0000002u : kInvalid; return result; }
   Locked hold(sync_);
@@ -304,9 +344,9 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
     for (uint32_t d = 0; d < 2; ++d) {
       p.capacity[d] = sizes[d] > kMaxPipeBuffer ? kMaxPipeBuffer : sizes[d];
       if (name.empty() && d == 1) { p.capacity[1] = 0; break; }      // (an anonymous pipe goes one way)
-      p.data[d] = static_cast<uint8_t*>(allocator_->allocate(p.capacity[d]));
-      if (!p.data[d]) {
-        for (uint8_t*& freed : p.data) { if (freed) allocator_->deallocate(freed); freed = nullptr; }
+      p.data[d] = allocate_view<uint8_t>(*allocator_, p.capacity[d]);
+      if (p.data[d].empty()) {
+        for (ByteView& freed : p.data) release_view(*allocator_, freed);
         p = Pipe();
         result.status = 0xC0000017u;
         return result;
@@ -321,6 +361,8 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
     p.requested_size[0] = out_size;
     p.requested_size[1] = in_size;
     p.end_refs[0] = 1;
+    p.process_id[0] = p.process_id[1] = pid;
+    p.listen_order = ++pipe_sequence_;
     if (p.anonymous) p.end_refs[1] = 0;
     o = Object();
     o.kind = ObjectKind::Pipe;
@@ -328,6 +370,7 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
     for (uint32_t k = 0; k < name.size(); ++k) o.name[k] = name[k];
     o.name_size = static_cast<uint32_t>(name.size());
     o.pipe = pipe_index;
+    sync_.notify_all();      // (a new instance takes the clients that wait for one)
     result.id = i + 1;
     return result;
   }
@@ -335,25 +378,35 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
   return result;
 }
 
-ObjectManager::Created ObjectManager::connect_pipe(StringView name, bool want_read, bool want_write) {
+ObjectManager::Created ObjectManager::connect_pipe(StringView name, bool want_read, bool want_write, uint64_t pid) {
   Created result;
   Locked hold(sync_);
   bool found = false;
+  int32_t best = -1;      // the instance that has been listening longest
   for (uint32_t i = 0; i < kCapacity; ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
     found = true;
-    Pipe& p = pipes_[o.pipe];
+    const Pipe& p = pipes_[o.pipe];
     if (p.connected || p.disconnected || p.end_refs[0] == 0) continue;      // (an instance its server disconnected takes no client until it listens again)
+    if (best < 0 || p.listen_order < pipes_[objects_[best].pipe].listen_order) best = static_cast<int32_t>(i);
+  }
+  if (best >= 0) {
+    Object& o = objects_[best];
+    Pipe& p = pipes_[o.pipe];
     if ((want_read && !(p.access & kPipeOutbound)) || (want_write && !(p.access & kPipeInbound))) { result.status = 0xC0000022u; return result; }
     p.connected = true;
     p.client_seen = true;
     p.disconnected = false;
     p.end_refs[1] = 1;
+    p.process_id[1] = pid;
     ++p.generation;
     ++o.references;
+    for (PipeOp& op : p.ops) if (op.state == 1 && op.kind == PipeOpKind::Listen) pipe_finish_locked(p, op, 0, 0);      // (a ConnectNamedPipe that waits is over)
+    p.listening = false;
+    p.file_signaled[1] = true;      // (a new file object)
     sync_.notify_all();
-    result.id = i + 1;
+    result.id = static_cast<uint32_t>(best) + 1;
     result.end_code = 1 | (p.generation << 1);
     return result;
   }
@@ -372,17 +425,247 @@ void ObjectManager::add_pipe_end(uint32_t id, uint32_t end_code) {
 }
 
 void ObjectManager::release_pipe_end(uint32_t id, uint32_t end_code) {
-  Locked hold(sync_);
-  Object* o = at(id);
-  Pipe* p = pipe_of(id);
-  uint32_t end = 0;
-  if (!o || !p || !p->end_of(end_code, &end) || p->end_refs[end] == 0) return;
-  --p->end_refs[end];
-  sync_.notify_all();      // the other end sees the end of the data
-  if (o->references > 0 && --o->references == 0) {
-    free_pipe_locked(*o);
-    *o = Object();
+  uint32_t ports[8], port_count = 0;
+  {
+    Locked hold(sync_);
+    Object* o = at(id);
+    Pipe* p = pipe_of(id);
+    uint32_t end = 0;
+    if (!o || !p || !p->end_of(end_code, &end) || p->end_refs[end] == 0) return;
+    --p->end_refs[end];
+    if (p->end_refs[end] == 0) {      // what this end waits for is given up, and the other end gets nothing more from it
+      for (PipeOp& op : p->ops) {
+        if (op.state != 1 || op.end != end) continue;
+        if (op.async && !op.detached && p->port_semaphore[end] != 0 && port_count < 8 && post_port_packet_locked(*p, end, kStatusCancelled, 0)) ports[port_count++] = p->port_semaphore[end];      // (the port hears of it)
+        op.async = false;      // (the handles that waited are closed: nobody can act on them)
+      }
+      pipe_fail_ops_locked(*p, static_cast<int>(end), kStatusCancelled);
+      pipe_fail_ops_locked(*p, static_cast<int>(1 - end), kStatusBroken);
+      pipe_clear_queue_locked(*p, 1 - end);
+    }
+    sync_.notify_all();      // the other end sees the end of the data
+    if (o->references > 0 && --o->references == 0) {
+      free_pipe_locked(*o);
+      *o = Object();
+    }
   }
+  for (uint32_t k = 0; k < port_count; ++k) {
+    int32_t previous = 0;
+    release_semaphore(ports[k], 1, &previous);
+  }
+}
+
+// The packet for a call of the end that was cancelled, kept for the port the end is tied to (False if the table is full).
+bool ObjectManager::post_port_packet_locked(Pipe& p, uint32_t end, uint32_t status, uint32_t bytes) {
+  if (foreign_count_ >= kMaxForeignPackets) return false;
+  ForeignPacket& f = foreign_[(foreign_head_ + foreign_count_++) % kMaxForeignPackets];
+  f.semaphore = p.port_semaphore[end];
+  f.packet.bytes = bytes;
+  f.packet.status = status;
+  f.packet.key = p.port_key[end];
+  f.packet.overlapped = 0;
+  return true;
+}
+
+// ---- the queues and operations of a pipe
+
+bool ObjectManager::pipe_grow_locked(Pipe& p, uint32_t q, uint64_t needed) {
+  const uint64_t have = p.data[q].size();
+  if (needed <= have) return true;
+  if (!allocator_ || needed > kMaxPipeQueue) return false;
+  uint64_t size = have ? have : 1;
+  while (size < needed) size *= 2;      // (needed is at most kMaxPipeQueue)
+  if (size > kMaxPipeQueue) size = kMaxPipeQueue;
+  ByteView bigger = allocate_view<uint8_t>(*allocator_, size);
+  if (bigger.empty()) return false;
+  if (p.count[q] != 0) ring_read(ConstByteView(p.data[q]), p.head[q], 0, bigger.first(p.count[q]));
+  release_view(*allocator_, p.data[q]);
+  p.data[q] = bigger;
+  p.head[q] = 0;
+  return true;
+}
+
+// Puts `data` at the end of the queue of direction q as a record (of the write `op`, 0 if it is complete). False if there is no room for that in the tables.
+bool ObjectManager::pipe_append_locked(Pipe& p, uint32_t q, ConstByteView data, uint32_t op) {
+  if (p.data[q].empty() || data.size() > kMaxPipeQueue) return false;
+  const bool merge = !p.message_type && op == 0 && !data.empty() && p.record_count[q] > 0 &&
+                     p.records[q][(p.record_head[q] + p.record_count[q] - 1) % Pipe::kRecords].op == 0;      // (a byte pipe has no messages: complete writes are one run)
+  if (!merge && p.record_count[q] == Pipe::kRecords) return false;
+  if (!pipe_grow_locked(p, q, uint64_t{p.count[q]} + data.size())) return false;
+  ring_write(p.data[q], p.head[q], p.count[q], data);
+  p.count[q] += static_cast<uint32_t>(data.size());
+  if (merge) {
+    p.records[q][(p.record_head[q] + p.record_count[q] - 1) % Pipe::kRecords].length += static_cast<uint32_t>(data.size());
+  } else {
+    Pipe::Record& r = p.records[q][(p.record_head[q] + p.record_count[q]) % Pipe::kRecords];
+    r.length = static_cast<uint32_t>(data.size());
+    r.op = op;
+    ++p.record_count[q];
+  }
+  return true;
+}
+
+ObjectManager::PipeOp* ObjectManager::pipe_new_op_locked(Pipe& p, PipeOpKind kind, uint32_t end, uint64_t owner) {
+  for (PipeOp& op : p.ops) {
+    if (op.state != 0) continue;
+    op = PipeOp();
+    op.tag = p.next_tag++;
+    if (p.next_tag == 0) p.next_tag = 1;
+    op.kind = kind;
+    op.end = static_cast<uint8_t>(end);
+    op.state = 1;
+    op.owner = owner;
+    return &op;
+  }
+  return nullptr;
+}
+
+ObjectManager::PipeOp* ObjectManager::pipe_find_op_locked(Pipe& p, uint32_t tag) {
+  if (tag == 0) return nullptr;
+  for (PipeOp& op : p.ops) if (op.state != 0 && op.tag == tag) return &op;
+  return nullptr;
+}
+
+void ObjectManager::pipe_free_op_locked(Pipe& p, PipeOp& op) {
+  if (op.counted && p.undelivered > 0) --p.undelivered;
+  if (allocator_) release_view(*allocator_, op.data);
+  op = PipeOp();
+  sync_.notify_all();
+}
+
+void ObjectManager::pipe_finish_locked(Pipe& p, PipeOp& op, uint32_t status, uint32_t transferred) {
+  op.state = 2;
+  op.status = status;
+  op.transferred = transferred;
+  if (op.async && !op.counted) { op.counted = true; ++p.undelivered; }
+  if (op.detached) pipe_free_op_locked(p, op);
+  sync_.notify_all();
+}
+
+void ObjectManager::pipe_pop_record_locked(Pipe& p, uint32_t q) {
+  if (p.record_count[q] == 0) return;
+  Pipe::Record& first = p.records[q][p.record_head[q]];
+  if (first.op != 0) {      // (a write that was read to the end is complete)
+    PipeOp* op = pipe_find_op_locked(p, first.op);
+    if (op && op->state == 1) pipe_finish_locked(p, *op, 0, op->length);
+    first.op = 0;
+  }
+  p.record_head[q] = (p.record_head[q] + 1) % Pipe::kRecords;
+  --p.record_count[q];
+}
+
+// n bytes were read from the front of the queue.
+void ObjectManager::pipe_consume_locked(Pipe& p, uint32_t q, uint32_t n) {
+  if (n == 0) return;
+  p.head[q] = static_cast<uint32_t>((uint64_t{p.head[q]} + n) % p.data[q].size());
+  p.count[q] -= n;
+  uint32_t left = n;
+  while (left > 0 && p.record_count[q] > 0) {
+    Pipe::Record& first = p.records[q][p.record_head[q]];
+    if (first.length > left) { first.length -= left; left = 0; break; }
+    left -= first.length;
+    pipe_pop_record_locked(p, q);
+  }
+  if (p.count[q] == 0) {
+    p.head[q] = 0;
+    if (allocator_ && p.capacity[q] != 0 && p.data[q].size() > p.capacity[q]) {      // (what grew for writes that waited goes back)
+      ByteView smaller = allocate_view<uint8_t>(*allocator_, p.capacity[q]);
+      if (!smaller.empty()) { release_view(*allocator_, p.data[q]); p.data[q] = smaller; }
+    }
+  }
+}
+
+// Reads from the queue of direction q into `out` (at most its size): the first message only in message mode, or when peeking at a message pipe. `more`: part of the message is
+// left. The queue must hold something (bytes, or a message even if it is empty).
+uint32_t ObjectManager::pipe_take_locked(Pipe& p, uint32_t q, ByteView out, bool message_mode, bool peek, bool* more, uint32_t* front_length) {
+  const bool messages = p.message_type && p.record_count[q] > 0;
+  const uint32_t front = messages ? p.records[q][p.record_head[q]].length : 0;
+  if (front_length) *front_length = front;
+  uint32_t limit = p.count[q];
+  if (messages && (message_mode || peek) && front < limit) limit = front;
+  const uint32_t n = limit < out.size() ? limit : static_cast<uint32_t>(out.size());
+  ring_read(ConstByteView(p.data[q]), p.head[q], 0, out.first(n));
+  *more = messages && message_mode && front > n;
+  if (!peek) {
+    pipe_consume_locked(p, q, n);
+    if (n == 0 && messages && front == 0) pipe_pop_record_locked(p, q);      // (an empty message is read as nothing)
+  }
+  return n;
+}
+
+// Something changed in the queue of direction q: the reads that wait take their share in the order they were made, the writes that fit now are complete, and a flush is
+// over when everything was read.
+void ObjectManager::pipe_settle_locked(Pipe& p, uint32_t q) {
+  const uint32_t reader = 1 - q;
+  for (;;) {
+    PipeOp* op = nullptr;
+    for (PipeOp& c : p.ops) if (c.state == 1 && c.kind == PipeOpKind::Read && c.end == reader && (!op || c.tag < op->tag)) op = &c;
+    if (!op) break;
+    const bool messages = p.message_type && p.record_count[q] > 0;
+    if (p.count[q] == 0 && !messages) break;
+    ByteView held;
+    const uint32_t want = op->length < p.count[q] ? op->length : p.count[q];
+    if (want != 0) {
+      held = allocator_ ? allocate_view<uint8_t>(*allocator_, want) : ByteView();
+      if (held.empty()) { pipe_finish_locked(p, *op, kStatusNoMemory, 0); continue; }
+    }
+    bool more = false;
+    const uint32_t n = pipe_take_locked(p, q, held, op->message_mode, false, &more, nullptr);
+    op->data = held;
+    pipe_finish_locked(p, *op, more ? kStatusMoreData : 0, n);
+  }
+  uint64_t available = 0;
+  for (uint32_t i = 0; i < p.record_count[q]; ++i) {
+    Pipe::Record& r = p.records[q][(p.record_head[q] + i) % Pipe::kRecords];
+    available += r.length;
+    if (r.op == 0) continue;
+    PipeOp* op = pipe_find_op_locked(p, r.op);
+    if (!op || op->state != 1) { r.op = 0; continue; }
+    if (available <= p.capacity[q]) { pipe_finish_locked(p, *op, 0, op->length); r.op = 0; }
+  }
+  if (p.count[q] == 0) {
+    for (PipeOp& c : p.ops) if (c.state == 1 && c.kind == PipeOpKind::Flush && c.end == q) pipe_finish_locked(p, c, 0, 0);
+  }
+  sync_.notify_all();
+}
+
+void ObjectManager::pipe_clear_queue_locked(Pipe& p, uint32_t q) {
+  p.head[q] = p.count[q] = 0;
+  p.record_head[q] = p.record_count[q] = 0;
+}
+
+// A pending operation ends with `status`; a write takes its bytes back out of the queue (the ones that were read stay read).
+void ObjectManager::pipe_cancel_op_locked(Pipe& p, PipeOp& op, uint32_t status) {
+  if (op.state != 1) return;
+  const uint32_t q = op.end;
+  if (op.kind == PipeOpKind::Write && p.record_count[q] > 0 && !p.data[q].empty()) {
+    uint64_t offset = 0;
+    for (uint32_t i = 0; i < p.record_count[q]; ++i) {
+      Pipe::Record& r = p.records[q][(p.record_head[q] + i) % Pipe::kRecords];
+      if (r.op != op.tag) { offset += r.length; continue; }
+      const uint32_t length = r.length;
+      for (uint64_t at = offset; at + length < p.count[q]; ++at)      // (the bytes after it move down)
+        p.data[q][(p.head[q] + at) % p.data[q].size()] = p.data[q][(p.head[q] + at + length) % p.data[q].size()];
+      p.count[q] -= length;
+      for (uint32_t k = i; k + 1 < p.record_count[q]; ++k) p.records[q][(p.record_head[q] + k) % Pipe::kRecords] = p.records[q][(p.record_head[q] + k + 1) % Pipe::kRecords];
+      --p.record_count[q];
+      break;
+    }
+  }
+  const PipeOpKind kind = op.kind;      // (a detached operation is gone when it is finished)
+  pipe_finish_locked(p, op, status, 0);
+  if (kind == PipeOpKind::Listen) {
+    bool any = false;
+    for (const PipeOp& c : p.ops) if (c.state == 1 && c.kind == PipeOpKind::Listen) any = true;
+    p.listening = any;
+  }
+  if (kind == PipeOpKind::Write || kind == PipeOpKind::Flush) pipe_settle_locked(p, q);
+}
+
+// Every pending operation of an end (-1: of both) ends with `status`.
+void ObjectManager::pipe_fail_ops_locked(Pipe& p, int end, uint32_t status) {
+  for (PipeOp& op : p.ops) if (op.state == 1 && op.kind == PipeOpKind::Flush && (end < 0 || op.end == end)) pipe_cancel_op_locked(p, op, status);      // (before the writes they wait for are given up: that would end them well)
+  for (PipeOp& op : p.ops) if (op.state == 1 && (end < 0 || op.end == end)) pipe_cancel_op_locked(p, op, status);
 }
 
 ObjectManager::PipeResult ObjectManager::pipe_read_locked(uint32_t id, uint32_t end_code, uint8_t* out, uint32_t capacity, uint32_t* got, bool peek, uint32_t* available,
@@ -396,37 +679,12 @@ ObjectManager::PipeResult ObjectManager::pipe_read_locked(uint32_t id, uint32_t 
   const uint32_t q = 1 - end;      // the queue the other end writes
   if (available) *available = p->count[q];
   if (end == 0 && !p->connected) return p->client_seen ? PipeResult::Broken : (p->disconnected ? PipeResult::NotConnected : PipeResult::Listening);
-  if (p->count[q] == 0 && !(p->message_type && p->message_count[q] > 0)) return p->end_refs[1 - end] == 0 || (end == 0 && !p->connected) ? PipeResult::Broken : PipeResult::WouldBlock;
-  const bool messages = p->message_type && p->message_count_ok(q);
-  const uint32_t front = messages ? p->message_size[q][p->message_head[q]] : 0;
-  if (message_length) *message_length = front;
-  uint32_t limit = p->count[q];
-  if (messages && (message_mode || peek) && front < limit) limit = front;
-  uint32_t n = limit < capacity ? limit : capacity;
-  for (uint32_t i = 0; i < n; ++i) out[i] = p->data[q][(p->head[q] + i) % p->capacity[q]];
+  if (p->count[q] == 0 && !(p->message_type && p->record_count[q] > 0)) return p->end_refs[1 - end] == 0 || (end == 0 && !p->connected) ? PipeResult::Broken : PipeResult::WouldBlock;
   bool more = false;
-  if (!peek) {
-    p->head[q] = (p->head[q] + n) % p->capacity[q];
-    p->count[q] -= n;
-    if (messages) {      // what was taken comes off the oldest messages
-      uint32_t left = n;
-      while (left > 0 && p->message_count[q] > 0) {
-        uint32_t& first = p->message_size[q][p->message_head[q]];
-        if (first > left) { first -= left; left = 0; break; }
-        left -= first;
-        p->message_head[q] = (p->message_head[q] + 1) % Pipe::kMessages;
-        --p->message_count[q];
-      }
-      if (front == 0 && p->message_count[q] > 0) {      // an empty message is read as nothing
-        p->message_head[q] = (p->message_head[q] + 1) % Pipe::kMessages;
-        --p->message_count[q];
-      }
-      more = message_mode && front > n;
-    }
-    sync_.notify_all();      // room for the writer
-  } else {
-    more = messages && message_mode && front > n;
-  }
+  uint32_t front = 0;
+  const uint32_t n = pipe_take_locked(*p, q, capacity ? ByteView(out, capacity) : ByteView(), message_mode, peek, &more, &front);
+  if (message_length) *message_length = front;
+  if (!peek) pipe_settle_locked(*p, q);      // room for the writer
   *got = n;
   return more ? PipeResult::MoreData : PipeResult::Ok;
 }
@@ -442,37 +700,274 @@ ObjectManager::PipeResult ObjectManager::pipe_write_locked(uint32_t id, uint32_t
   }
   if (p->end_refs[1 - end] == 0) return PipeResult::Closing;
   const uint32_t q = end;
-  if (!p->data[q] || p->capacity[q] == 0) return PipeResult::Broken;
+  if (p->data[q].empty() || p->capacity[q] == 0) return PipeResult::Broken;
   if (count == 0) {      // an empty write: a message of no bytes on a message pipe, nothing on a byte one
-    if (p->message_type && p->message_count[q] < Pipe::kMessages) {
-      p->message_size[q][(p->message_head[q] + p->message_count[q]) % Pipe::kMessages] = 0;
-      ++p->message_count[q];
-      sync_.notify_all();
-    }
+    if (p->message_type) pipe_append_locked(*p, q, ConstByteView(), 0);
+    pipe_settle_locked(*p, q);
     return PipeResult::Ok;
   }
-  const uint32_t room = p->capacity[q] - p->count[q];
-  if (room == 0) return PipeResult::WouldBlock;
-  if (p->message_type && p->message_count[q] == Pipe::kMessages) return PipeResult::WouldBlock;
+  const uint32_t room = p->capacity[q] > p->count[q] ? p->capacity[q] - p->count[q] : 0;
+  if (room == 0 || p->record_count[q] == Pipe::kRecords) return PipeResult::WouldBlock;
   const uint32_t n = room < count ? room : count;
-  for (uint32_t i = 0; i < n; ++i) p->data[q][(p->head[q] + p->count[q] + i) % p->capacity[q]] = data[i];
-  p->count[q] += n;
-  if (p->message_type && n != 0) {      // (a write that does not fit whole is cut into messages)
-    p->message_size[q][(p->message_head[q] + p->message_count[q]) % Pipe::kMessages] = n;
-    ++p->message_count[q];
-  }
+  if (!pipe_append_locked(*p, q, ConstByteView(data, n), 0)) return PipeResult::WouldBlock;
   *done = n;
-  sync_.notify_all();      // data for the reader
+  pipe_settle_locked(*p, q);      // data for the reader
   return PipeResult::Ok;
 }
 
 ObjectManager::PipeResult ObjectManager::pipe_listen_locked(uint32_t id) {
   Pipe* p = pipe_of(id);
   if (!p) return PipeResult::Broken;
-  if (p->connected) return PipeResult::Ok;
+  if (p->connected) return p->end_refs[1] == 0 ? PipeResult::Closing : PipeResult::Ok;      // (Closing: the client came and went)
+  if (p->disconnected) { p->listen_order = ++pipe_sequence_; sync_.notify_all(); }
   p->listening = true;
   p->disconnected = false;
   return PipeResult::WouldBlock;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_begin_read_locked(uint32_t id, uint32_t end_code, uint32_t length, bool message_mode, uint64_t owner, bool async, uint32_t* tag) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
+  uint32_t got = 0;
+  const PipeResult now = pipe_read_locked(id, end_code, nullptr, 0, &got, true, nullptr, message_mode);
+  if (now != PipeResult::WouldBlock) return now;      // (it can be answered: by the call itself)
+  PipeOp* op = pipe_new_op_locked(*p, PipeOpKind::Read, end, owner);
+  if (!op) return PipeResult::NoResources;
+  op->length = length;
+  op->message_mode = message_mode;
+  op->async = async;
+  if (async) p->file_signaled[op->end] = false;      // (the call is not over: the handle is not signalled)
+  *tag = op->tag;
+  return PipeResult::WouldBlock;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_begin_write_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint64_t owner, bool async, uint32_t* tag, uint32_t* done) {
+  *done = 0;
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Closing;
+  if (!p->connected) {
+    if (p->disconnected) return PipeResult::NotConnected;
+    return end == 0 ? (p->client_seen ? PipeResult::Closing : PipeResult::Listening) : PipeResult::Closing;
+  }
+  if (p->end_refs[1 - end] == 0) return PipeResult::Closing;
+  const uint32_t q = end;
+  if (p->data[q].empty() || p->capacity[q] == 0) return PipeResult::Broken;
+  if (data.size() > kMaxPipeWrite) return PipeResult::NoResources;
+  if (data.empty()) {      // an empty write is never kept waiting
+    if (p->message_type) pipe_append_locked(*p, q, data, 0);
+    pipe_settle_locked(*p, q);
+    return PipeResult::Ok;
+  }
+  if (p->record_count[q] == Pipe::kRecords) return PipeResult::WouldBlock;
+  PipeOp* op = pipe_new_op_locked(*p, PipeOpKind::Write, end, owner);
+  if (!op) return PipeResult::NoResources;
+  if (!pipe_append_locked(*p, q, data, op->tag)) { pipe_free_op_locked(*p, *op); return PipeResult::NoResources; }
+  op->length = static_cast<uint32_t>(data.size());
+  pipe_settle_locked(*p, q);      // the reads that wait take their share, and the write may fit then
+  if (op->state == 2) {
+    *done = op->length;
+    pipe_free_op_locked(*p, *op);
+    return PipeResult::Ok;
+  }
+  op->async = async;
+  if (async) p->file_signaled[op->end] = false;      // (the call is not over: the handle is not signalled)
+  *tag = op->tag;
+  return PipeResult::WouldBlock;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_begin_transact_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t read_length, bool message_mode, uint64_t owner, bool async,
+                                                                    uint32_t* tag) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Closing;
+  if (!p->connected) {
+    if (p->disconnected) return PipeResult::NotConnected;
+    return end == 0 ? (p->client_seen ? PipeResult::Closing : PipeResult::Listening) : PipeResult::Closing;
+  }
+  if (!p->message_type || !message_mode) return PipeResult::InvalidState;
+  if (p->end_refs[1 - end] == 0) return PipeResult::Closing;
+  const uint32_t q = end, reader = 1 - end;
+  if (p->data[q].empty() || p->capacity[q] == 0) return PipeResult::Broken;
+  if (p->count[reader] != 0 || p->record_count[reader] != 0) return PipeResult::Busy;
+  if (data.size() > kMaxPipeWrite || p->record_count[q] == Pipe::kRecords) return PipeResult::NoResources;
+  PipeOp* read = pipe_new_op_locked(*p, PipeOpKind::Read, end, owner);
+  if (!read) return PipeResult::NoResources;
+  const uint32_t read_tag = read->tag;
+  read->length = read_length;
+  read->message_mode = true;
+  read->async = async;
+  if (async) p->file_signaled[end] = false;
+  PipeOp* write = data.empty() ? nullptr : pipe_new_op_locked(*p, PipeOpKind::Write, end, owner);
+  if (!data.empty() && !write) { pipe_free_op_locked(*p, *read); return PipeResult::NoResources; }
+  if (!pipe_append_locked(*p, q, data, write ? write->tag : 0)) {
+    if (write) pipe_free_op_locked(*p, *write);
+    pipe_free_op_locked(*p, *read);
+    return PipeResult::NoResources;
+  }
+  if (write) { write->length = static_cast<uint32_t>(data.size()); write->detached = true; }
+  pipe_settle_locked(*p, q);      // the other end's reads that wait take the message
+  *tag = read_tag;
+  return PipeResult::WouldBlock;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_begin_listen_locked(uint32_t id, uint64_t owner, bool async, uint32_t* tag) {
+  Pipe* p = pipe_of(id);
+  if (!p) return PipeResult::Broken;
+  if (p->connected) return PipeResult::Ok;
+  PipeOp* op = pipe_new_op_locked(*p, PipeOpKind::Listen, 0, owner);
+  if (!op) return PipeResult::NoResources;
+  if (p->disconnected) { p->listen_order = ++pipe_sequence_; sync_.notify_all(); }      // (it can take a client again, after the ones that listened before)
+  p->listening = true;
+  p->disconnected = false;
+  op->async = async;
+  if (async) p->file_signaled[op->end] = false;      // (the call is not over: the handle is not signalled)
+  *tag = op->tag;
+  return PipeResult::WouldBlock;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_begin_flush_locked(uint32_t id, uint32_t end_code, uint64_t owner, uint32_t* tag) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end) || p->end_refs[1 - end] == 0 || !p->connected || p->count[end] == 0) return PipeResult::Ok;
+  PipeOp* op = pipe_new_op_locked(*p, PipeOpKind::Flush, end, owner);
+  if (!op) return PipeResult::NoResources;
+  *tag = op->tag;
+  return PipeResult::WouldBlock;
+}
+
+ObjectManager::PipeOpPoll ObjectManager::pipe_op_poll_locked(uint32_t id, uint32_t end_code, uint32_t tag, PipeOpResult* result) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeOpPoll::Missing;
+  PipeOp* op = pipe_find_op_locked(*p, tag);
+  if (!op || op->end != end || op->state == 3) return PipeOpPoll::Missing;
+  if (op->state == 1) return PipeOpPoll::Pending;
+  result->status = op->status;
+  result->transferred = op->transferred;
+  result->data = op->data;
+  op->data = ByteView();
+  op->state = 3;
+  return PipeOpPoll::Done;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_op_cancel_locked(uint32_t id, uint32_t end_code, uint32_t tag, uint32_t status) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
+  PipeOp* op = pipe_find_op_locked(*p, tag);
+  if (!op || op->end != end || op->state != 1) return PipeResult::Broken;
+  pipe_cancel_op_locked(*p, *op, status);
+  return PipeResult::Ok;
+}
+
+void ObjectManager::pipe_op_release(uint32_t id, uint32_t tag) {
+  Locked hold(sync_);
+  Pipe* p = pipe_of(id);
+  if (!p) return;
+  if (PipeOp* op = pipe_find_op_locked(*p, tag)) pipe_free_op_locked(*p, *op);
+}
+
+void ObjectManager::pipe_op_free_data(ByteView& data) {
+  if (allocator_) release_view(*allocator_, data);
+}
+
+bool ObjectManager::pipe_delivered_locked(uint32_t id) {
+  Pipe* p = pipe_of(id);
+  return !p || p->undelivered == 0;
+}
+
+void ObjectManager::pipe_forgive_locked(uint32_t id) {
+  Pipe* p = pipe_of(id);
+  if (!p) return;
+  p->undelivered = 0;
+  for (PipeOp& op : p->ops) op.counted = false;
+}
+
+void ObjectManager::pipe_owner_gone(uint64_t pid) {
+  uint32_t ports[8], port_count = 0;
+  {
+    Locked hold(sync_);
+    if (!pipes_) return;
+    for (uint32_t i = 0; i < kMaxPipes; ++i) {
+      Pipe& p = pipes_[i];
+      if (!p.used) continue;
+      for (PipeOp& op : p.ops) {
+        if (op.state == 0 || op.owner != pid) continue;
+        if ((op.state == 1 || op.state == 2) && op.async && !op.detached && p.port_semaphore[op.end] != 0 && port_count < 8 && post_port_packet_locked(p, op.end, op.state == 1 ? kStatusCancelled : op.status, op.state == 1 ? 0 : op.transferred))
+          ports[port_count++] = p.port_semaphore[op.end];      // (the port hears of a call that was not taken up: it was cancelled, or its result was never acted on)
+        op.async = false;      // (nobody is left to act on it)
+        if (op.state == 1) pipe_cancel_op_locked(p, op, kStatusCancelled);
+        pipe_free_op_locked(p, op);
+      }
+    }
+  }
+  for (uint32_t k = 0; k < port_count; ++k) {
+    int32_t previous = 0;
+    release_semaphore(ports[k], 1, &previous);
+  }
+}
+
+void ObjectManager::pipe_set_port(uint32_t id, uint32_t end_code, uint32_t semaphore_object, uint64_t key) {
+  Locked hold(sync_);
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return;
+  p->port_semaphore[end] = semaphore_object;
+  p->port_key[end] = key;
+}
+
+bool ObjectManager::port_take_foreign(uint32_t semaphore_object, PortPacket* packet) {
+  Locked hold(sync_);
+  for (uint32_t i = 0; i < foreign_count_; ++i) {
+    ForeignPacket& f = foreign_[(foreign_head_ + i) % kMaxForeignPackets];
+    if (f.semaphore != semaphore_object) continue;
+    *packet = f.packet;
+    for (uint32_t k = i; k + 1 < foreign_count_; ++k) foreign_[(foreign_head_ + k) % kMaxForeignPackets] = foreign_[(foreign_head_ + k + 1) % kMaxForeignPackets];
+    --foreign_count_;
+    return true;
+  }
+  return false;
+}
+
+uint32_t ObjectManager::pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread) {
+  Locked hold(sync_);
+  for (uint32_t i = 0; i < kMaxSyncWaits; ++i) {
+    SyncWait& w = sync_waits_[i];
+    if (w.used) continue;
+    w = SyncWait();
+    w.used = true;
+    w.thread = thread;
+    w.pipe = id;
+    w.end_code = end_code;
+    Pipe* p = pipe_of(id);
+    uint32_t end = 0;
+    if (p && p->end_of(end_code, &end)) p->file_signaled[end] = false;      // (a call is under way)
+    return i + 1;
+  }
+  return 0;
+}
+
+bool ObjectManager::pipe_sync_cancelled_locked(uint32_t slot) { return slot >= 1 && slot <= kMaxSyncWaits && sync_waits_[slot - 1].used && sync_waits_[slot - 1].cancelled; }
+
+void ObjectManager::pipe_sync_end(uint32_t slot) {
+  Locked hold(sync_);
+  if (slot < 1 || slot > kMaxSyncWaits || !sync_waits_[slot - 1].used) return;
+  SyncWait& w = sync_waits_[slot - 1];
+  Pipe* p = pipe_of(w.pipe);
+  uint32_t end = 0;
+  if (p && p->end_of(w.end_code, &end)) p->file_signaled[end] = true;
+  w = SyncWait();
+  sync_.notify_all();
+}
+
+bool ObjectManager::pipe_cancel_synchronous(uint64_t thread) {
+  Locked hold(sync_);
+  bool found = false;
+  for (SyncWait& w : sync_waits_) if (w.used && w.thread == thread && !w.cancelled) { w.cancelled = true; found = true; }
+  if (found) sync_.notify_all();
+  return found;
 }
 
 bool ObjectManager::pipe_disconnect(uint32_t id) {
@@ -489,10 +984,9 @@ bool ObjectManager::pipe_disconnect(uint32_t id) {
   }
   p->listening = false;
   p->client_seen = false;
-  p->count[0] = p->count[1] = 0;
-  p->head[0] = p->head[1] = 0;
-  p->message_count[0] = p->message_count[1] = 0;
-  p->message_head[0] = p->message_head[1] = 0;
+  pipe_fail_ops_locked(*p, -1, kStatusDisconnected);
+  pipe_clear_queue_locked(*p, 0);
+  pipe_clear_queue_locked(*p, 1);
   sync_.notify_all();
   return !already;
 }
@@ -500,8 +994,8 @@ bool ObjectManager::pipe_disconnect(uint32_t id) {
 uint32_t ObjectManager::pipe_room_locked(uint32_t id, uint32_t end_code) {
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
-  if (!p || !p->end_of(end_code, &end) || !p->data[end] || p->capacity[end] == 0) return 0;
-  return p->capacity[end] - p->count[end];
+  if (!p || !p->end_of(end_code, &end) || p->data[end].empty() || p->capacity[end] == 0) return 0;
+  return p->capacity[end] > p->count[end] ? p->capacity[end] - p->count[end] : 0;
 }
 
 uint32_t ObjectManager::pipe_pending_locked(uint32_t id, uint32_t end_code) {
@@ -511,14 +1005,19 @@ uint32_t ObjectManager::pipe_pending_locked(uint32_t id, uint32_t end_code) {
   return p->count[end];
 }
 
-uint32_t ObjectManager::pipe_cancel_generation_locked(uint32_t id) {
+bool ObjectManager::pipe_file_signaled_locked(uint32_t id, uint32_t end_code) {
   Pipe* p = pipe_of(id);
-  return p ? p->cancel_generation : 0;
+  uint32_t end = 0;
+  return !p || !p->end_of(end_code, &end) || p->file_signaled[end];
 }
 
-void ObjectManager::pipe_cancel(uint32_t id) {
+void ObjectManager::pipe_set_file_signaled(uint32_t id, uint32_t end_code, bool signaled) {
   Locked hold(sync_);
-  if (Pipe* p = pipe_of(id)) { ++p->cancel_generation; sync_.notify_all(); }
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return;
+  p->file_signaled[end] = signaled;
+  sync_.notify_all();
 }
 
 bool ObjectManager::pipe_client_gone_locked(uint32_t id, uint32_t end_code) {
@@ -546,6 +1045,66 @@ bool ObjectManager::pipe_name_available_locked(StringView name) {
     if (!p.connected && !p.disconnected && p.end_refs[0] != 0) return true;
   }
   return false;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_process(uint32_t id, uint32_t end_code, uint32_t which, uint64_t* pid) {
+  Locked hold(sync_);
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
+  if (!p->connected && (end == 1 || which == 0)) return end == 1 ? PipeResult::NotConnected : PipeResult::Listening;
+  *pid = p->process_id[which ? 0 : 1];
+  return PipeResult::Ok;
+}
+
+ObjectManager::PipeResult ObjectManager::pipe_write_nowait_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t* done) {
+  *done = 0;
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return PipeResult::Closing;
+  if (!p->connected) {
+    if (p->disconnected) return PipeResult::NotConnected;
+    return end == 0 ? (p->client_seen ? PipeResult::Closing : PipeResult::Listening) : PipeResult::Closing;
+  }
+  if (p->end_refs[1 - end] == 0) return PipeResult::Closing;
+  const uint32_t q = end, reader = 1 - end;
+  if (p->data[q].empty() || p->capacity[q] == 0) return PipeResult::Broken;
+  if (data.empty()) {
+    if (p->message_type) pipe_append_locked(*p, q, data, 0);
+    pipe_settle_locked(*p, q);
+    return PipeResult::Ok;
+  }
+  if (data.size() > kMaxPipeWrite || p->record_count[q] == Pipe::kRecords) return PipeResult::Ok;
+  if (p->message_type) {      // a message goes whole or not at all: what the reads that wait leave of it must fit
+    uint64_t left = data.size();
+    uint32_t last = 0;
+    for (;;) {
+      const PipeOp* next = nullptr;
+      for (const PipeOp& c : p->ops) if (c.state == 1 && c.kind == PipeOpKind::Read && c.end == reader && c.tag > last && (!next || c.tag < next->tag)) next = &c;
+      if (!next || left == 0) break;
+      last = next->tag;
+      left -= next->length < left ? next->length : left;
+    }
+    const uint32_t room = p->capacity[q] > p->count[q] ? p->capacity[q] - p->count[q] : 0;
+    if (left > room) return PipeResult::Ok;
+  }
+  PipeOp* op = pipe_new_op_locked(*p, PipeOpKind::Write, end, 0);
+  if (!op) return PipeResult::Ok;
+  if (!pipe_append_locked(*p, q, data, op->tag)) { pipe_free_op_locked(*p, *op); return PipeResult::Ok; }
+  op->length = static_cast<uint32_t>(data.size());
+  const uint32_t tag = op->tag;
+  pipe_settle_locked(*p, q);      // the reads that wait take their share
+  op = pipe_find_op_locked(*p, tag);
+  if (op->state == 2) { *done = op->length; pipe_free_op_locked(*p, *op); return PipeResult::Ok; }
+  uint32_t left = 0;      // what of the write is still queued is taken back
+  for (uint32_t i = 0; i < p->record_count[q]; ++i) {
+    const Pipe::Record& r = p->records[q][(p->record_head[q] + i) % Pipe::kRecords];
+    if (r.op == tag) left = r.length;
+  }
+  *done = op->length - left;
+  pipe_cancel_op_locked(*p, *op, kStatusCancelled);
+  pipe_free_op_locked(*p, *op);
+  return PipeResult::Ok;
 }
 
 bool ObjectManager::pipe_info(uint32_t id, PipeInfo* out) {

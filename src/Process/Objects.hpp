@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Utility/ArrayView.hpp"
 #include "Utility/StringView.hpp"
 
 namespace process {
@@ -78,18 +79,19 @@ class ObjectManager {
   void set_allocator(allocators::IAllocator* allocator) { allocator_ = allocator; }
   static constexpr uint32_t kPipeInbound = 1, kPipeOutbound = 2, kPipeDuplex = 3;      // the server's direction (PIPE_ACCESS_*); anonymous pipes are outbound
   // `name` empty: an anonymous pipe, already connected. Otherwise a new instance of the pipe of that name (up to `max_instances` of them, 0: no limit), not connected.
-  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false);
+  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false, uint64_t pid = 0);
   // A client connects to an instance of the named pipe that is not connected yet (status 0xC0000034 if no pipe has the name, 0xC00000AE if all are connected).
   // `want_read` / `want_write`: what the client asks for; an instance whose direction does not allow it is refused (0xC0000022) and stays unconnected.
-  Created connect_pipe(StringView name, bool want_read, bool want_write);
+  Created connect_pipe(StringView name, bool want_read, bool want_write, uint64_t pid = 0);
   // An end is named by an `end_code`: bit 0 says which end, the rest (for the client end) which connection it belongs to, so that a handle left over from a connection the server
   // ended cannot be mistaken for the next client.
   void add_pipe_end(uint32_t id, uint32_t end_code);
   void release_pipe_end(uint32_t id, uint32_t end_code);
-  enum class PipeResult { Ok, WouldBlock, Broken, Closing, NotConnected, Listening, MoreData };      // MoreData: a message was read in part (the data moved is valid)      // (Listening: the server end has not had a client yet; NotConnected: the server disconnected it)
+  enum class PipeResult { Ok, WouldBlock, Broken, Closing, NotConnected, Listening, MoreData, NoResources, InvalidState, Busy };      // MoreData: a message was read in part (the data moved is valid)      // (Listening: the server end has not had a client yet; NotConnected: the server disconnected it)
   // The lock must be held (sync().lock()) for the _locked calls. Read/write move what fits (at least one byte) or say why not.
   PipeResult pipe_read_locked(uint32_t id, uint32_t end_code, uint8_t* out, uint32_t capacity, uint32_t* got, bool peek = false, uint32_t* available = nullptr, bool message_mode = false, uint32_t* message_length = nullptr);
   // (A message-type pipe keeps what each write wrote as a message. message_mode reads one message at a time; message_length gets the length of the first one, 0 for a byte pipe.)
+  // Writes what fits at once as a message of its own (the part that does not fit stays with the caller): for a pipe that does not make the caller wait.
   PipeResult pipe_write_locked(uint32_t id, uint32_t end_code, const uint8_t* data, uint32_t count, uint32_t* done);
   // The server end listens: Ok if a client is connected (already or now), WouldBlock otherwise.
   PipeResult pipe_listen_locked(uint32_t id);
@@ -97,9 +99,50 @@ class ObjectManager {
   uint32_t pipe_room_locked(uint32_t id, uint32_t end_code);      // how much more this end can write before the pipe is full
   uint32_t pipe_pending_locked(uint32_t id, uint32_t end_code);
   bool pipe_disconnect(uint32_t id);      // false if nothing was connected      // the server ends the connection (the instance can listen again)
-  uint32_t pipe_cancel_generation_locked(uint32_t id);      // changes when CancelIo is called for the pipe: a call that waits compares it with what it saw at the start
-  void pipe_cancel(uint32_t id);
+  // --- operations. A call that has to wait is an operation of the pipe, with a tag: it is served in the order it was made (reads), a write that does not fit is queued whole,
+  // as the other end sees it at once (peeking, ReadDataAvailable), and is complete when enough was read to make room. An operation is cancelled by its tag, which takes back
+  // the bytes of a write that have not been read. `async` marks an operation that another thread of its owner waits for with pipe_op_poll_locked: whoever completes it
+  // waits until that thread has acted on it (pipe_op_release), so that its result is there when the call that completed it returns.
+  enum class PipeOpKind : uint8_t { None, Read, Write, Flush, Listen };
+  enum class PipeOpPoll { Missing, Pending, Done };
+  struct PipeOpResult {
+    uint32_t status = 0, transferred = 0;
+    ByteView data;      // a read: what it took, to be given back with pipe_op_free_data
+  };
+  static constexpr uint32_t kMaxPipeWrite = 8u << 20;      // the longest write that is queued as one (longer ones are cut)
+  // Read: Ok/error when it can be answered now (nothing was queued), WouldBlock when it was queued as `tag`.
+  PipeResult pipe_begin_read_locked(uint32_t id, uint32_t end_code, uint32_t length, bool message_mode, uint64_t owner, bool async, uint32_t* tag);
+  // Write: Ok when all of it went at once (`done` bytes, no operation), WouldBlock when it is queued as `tag`, or why not.
+  PipeResult pipe_begin_write_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint64_t owner, bool async, uint32_t* tag, uint32_t* done);
+  // TransactNamedPipe: `data` is written as a message that does not make it wait (it is queued like any write, but nobody waits for it) and then a read of at most
+  // `read_length` is queued as `tag` (WouldBlock). InvalidState if the pipe is not a message pipe read as messages, Busy if there is something to read already.
+  PipeResult pipe_begin_transact_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t read_length, bool message_mode, uint64_t owner, bool async, uint32_t* tag);
+  PipeResult pipe_begin_listen_locked(uint32_t id, uint64_t owner, bool async, uint32_t* tag);
+  // Waits until what this end wrote has been read: Ok at once, WouldBlock when queued as `tag`.
+  PipeResult pipe_begin_flush_locked(uint32_t id, uint32_t end_code, uint64_t owner, uint32_t* tag);
+  PipeOpPoll pipe_op_poll_locked(uint32_t id, uint32_t end_code, uint32_t tag, PipeOpResult* result);      // Done: the result is moved out, the operation stays until released
+  PipeResult pipe_op_cancel_locked(uint32_t id, uint32_t end_code, uint32_t tag, uint32_t status);      // Ok if it was pending (now finished with `status`), else Broken
+  void pipe_op_release(uint32_t id, uint32_t tag);      // takes the operation away (what the thread that waited for it has done)
+  void pipe_op_free_data(ByteView& data);
+  bool pipe_delivered_locked(uint32_t id);      // no operation is finished that its thread has not yet acted on
+  void pipe_forgive_locked(uint32_t id);      // gives up waiting for them
+  void pipe_owner_gone(uint64_t pid);      // the process ended: what it waits for is cancelled
+  // A thread that waits in the kernel for a call on a pipe end (one that is not an operation of the pipe): while it does, the file object is not signalled, and
+  // CancelSynchronousIo can end the call. begin returns a slot (1 and up), 0 if there is none.
+  uint32_t pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread);
+  bool pipe_sync_cancelled_locked(uint32_t slot);
+  void pipe_sync_end(uint32_t slot);
+  bool pipe_cancel_synchronous(uint64_t thread);      // false if the thread waits for no call
+  // A pipe end tied to an I/O completion port (a semaphore object that the library's port is counted by): when a process ends while a call of it waits on the end, the packet for
+  // that call cannot be queued by the process, so the kernel keeps it for the port (port_take_foreign) and releases the semaphore once.
+  struct PortPacket { uint32_t bytes = 0, status = 0; uint64_t key = 0, overlapped = 0; };
+  void pipe_set_port(uint32_t id, uint32_t end_code, uint32_t semaphore_object, uint64_t key);
+  bool port_take_foreign(uint32_t semaphore_object, PortPacket* packet);
   bool pipe_client_gone_locked(uint32_t id, uint32_t end_code);      // a client end whose server disconnected it
+  // The event of the file object of an end: set when it is made, reset when an operation that waits is started on it, set when one that was started without an event of its
+  // own is over (what a wait on the handle looks at).
+  bool pipe_file_signaled_locked(uint32_t id, uint32_t end_code);
+  void pipe_set_file_signaled(uint32_t id, uint32_t end_code, bool signaled);
   bool pipe_name_exists_locked(StringView name);      // some instance of the pipe exists (listening or not)
   uint32_t object_name(uint32_t id, char* out, uint32_t capacity);      // the name a pipe (or other named object) was made with; its length, 0 if it has none or is not that big
   bool pipe_name_available_locked(StringView name);      // some instance of the named pipe is not connected
@@ -108,6 +151,10 @@ class ObjectManager {
     uint32_t access = 0, out_size = 0, in_size = 0, max_instances = 0, instances = 0;
   };
   bool pipe_info(uint32_t id, PipeInfo* out);
+  // The processes of a connection: `which` 0 the client, 1 the server. Ok, or why the end has no answer (NotConnected: the server disconnected it, Listening: nobody is connected).
+  PipeResult pipe_process(uint32_t id, uint32_t end_code, uint32_t which, uint64_t* pid);
+  // A write on a pipe that does not make the caller wait (PIPE_NOWAIT): what the reads that wait take and what fits goes, the rest is not written; `done` says how much.
+  PipeResult pipe_write_nowait_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t* done);
   void process_exited(uint64_t pid, uint32_t code);
   // A handle to the process object of `pid` (made if there is none and `create` says the process exists).
   Created open_process(uint64_t pid, bool create);
@@ -336,6 +383,21 @@ class ObjectManager {
   void job_flag_all_locked(Job& j, uint32_t code);
   Pipe* pipe_of(uint32_t id);      // (locked)
   void free_pipe_locked(Object& o);
+  struct PipeOp;
+  bool pipe_grow_locked(Pipe& p, uint32_t q, uint64_t needed);
+  bool pipe_append_locked(Pipe& p, uint32_t q, ConstByteView data, uint32_t op);
+  uint32_t pipe_take_locked(Pipe& p, uint32_t q, ByteView out, bool message_mode, bool peek, bool* more, uint32_t* front_length);
+  void pipe_consume_locked(Pipe& p, uint32_t q, uint32_t n);
+  void pipe_pop_record_locked(Pipe& p, uint32_t q);
+  void pipe_settle_locked(Pipe& p, uint32_t q);
+  void pipe_finish_locked(Pipe& p, PipeOp& op, uint32_t status, uint32_t transferred);
+  void pipe_cancel_op_locked(Pipe& p, PipeOp& op, uint32_t status);
+  void pipe_fail_ops_locked(Pipe& p, int end, uint32_t status);      // every pending operation of an end (-1: of both)
+  void pipe_clear_queue_locked(Pipe& p, uint32_t q);
+  PipeOp* pipe_new_op_locked(Pipe& p, PipeOpKind kind, uint32_t end, uint64_t owner);
+  PipeOp* pipe_find_op_locked(Pipe& p, uint32_t tag);
+  void pipe_free_op_locked(Pipe& p, PipeOp& op);
+  bool post_port_packet_locked(Pipe& p, uint32_t end, uint32_t status, uint32_t bytes);
   static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64;
 
   struct Watch {
@@ -354,6 +416,14 @@ class ObjectManager {
   void free_mailslot_locked(Object& o);
 
   ISystemSync& sync_;
+  struct SyncWait { uint64_t thread = 0; uint32_t pipe = 0, end_code = 0; bool used = false, cancelled = false; };
+  static constexpr uint32_t kMaxSyncWaits = 64;
+  SyncWait sync_waits_[kMaxSyncWaits];
+  struct ForeignPacket { uint32_t semaphore = 0; PortPacket packet; };
+  static constexpr uint32_t kMaxForeignPackets = 64;
+  ForeignPacket foreign_[kMaxForeignPackets];
+  uint32_t foreign_head_ = 0, foreign_count_ = 0;
+  uint64_t pipe_sequence_ = 0;      // numbers the instances of pipes in the order they start to listen
   allocators::IAllocator* allocator_ = nullptr;
   Object objects_[kCapacity];
   Pipe* pipes_ = nullptr;      // kMaxPipes of them, made when the first pipe is

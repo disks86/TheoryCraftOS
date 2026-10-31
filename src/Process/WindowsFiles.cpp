@@ -616,7 +616,11 @@ uint32_t nt_close(Process& p, const SyscallRequest& r) {
   uint64_t slot = 0;
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   if (p.files().protected_from_close(slot)) return 0xC0000235u;      // STATUS_HANDLE_NOT_CLOSABLE
-  return p.close_descriptor(slot) ? kSuccess : kInvalidHandle;
+  const bool pipe = p.files().kind(slot) == DescriptorKind::Pipe;
+  const uint64_t token = p.files().token(slot);
+  if (!p.close_descriptor(slot)) return kInvalidHandle;
+  if (pipe) pipe_closed(p, token);      // (the calls of other threads that closing it ended are over when it returns)
+  return kSuccess;
 }
 
 uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {

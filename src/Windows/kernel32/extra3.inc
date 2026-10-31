@@ -831,12 +831,21 @@ static void port_note(HANDLE file, LPOVERLAPPED overlapped, ULONG_PTR bytes) {
   LeaveCriticalSection(&g_atom_lock);
   if (port) PostQueuedCompletionStatus(port, (DWORD)bytes, key, overlapped);
 }
+/* A pipe tied to a port is also known to the kernel as tied to it: if a process that has a call waiting on it ends, the kernel reports that to the port. */
+static void pipe_tie_to_port(HANDLE file, HANDLE port, ULONG_PTR key) {
+  if (device_type(file) != 0x11) return;
+  IO_STATUS_BLOCK iosb;
+  BYTE in[16];
+  *(ULONG64 *)in = (ULONG64)(ULONG_PTR)port;
+  *(ULONG64 *)(in + 8) = (ULONG64)key;
+  NtFsControlFile(file, NULL, NULL, NULL, &iosb, 0x11FFF8, in, sizeof(in), NULL, 0);
+}
 EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_PTR key, DWORD threads) {
   (void)threads;
   if (file && file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK && !overlapped_known(file)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (a file opened for synchronous calls cannot be tied to a port) */
   if (existing) {
     if (!port_of(existing)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-    if (file != INVALID_HANDLE_VALUE) port_link(file, existing, key);
+    if (file != INVALID_HANDLE_VALUE) { port_link(file, existing, key); pipe_tie_to_port(file, existing, key); }
     return existing;
   }
   Port *p = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(Port));
@@ -850,7 +859,7 @@ EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_
   if (slot >= 0) g_ports[slot] = p;
   LeaveCriticalSection(&g_atom_lock);
   if (slot < 0) { CloseHandle(p->semaphore); RtlFreeHeap(heap(), 0, p); set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-  if (file != INVALID_HANDLE_VALUE && file) port_link(file, p->semaphore, key);
+  if (file != INVALID_HANDLE_VALUE && file) { port_link(file, p->semaphore, key); pipe_tie_to_port(file, p->semaphore, key); }
   return p->semaphore;
 }
 EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PTR key, LPOVERLAPPED overlapped) {
@@ -899,6 +908,17 @@ static BOOL port_take(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *
   else if (w != WAIT_OBJECT_0 && alertable) w = WaitForSingleObjectEx(p->semaphore, 0, TRUE);
   if (w != WAIT_OBJECT_0) { set_error(w == WAIT_TIMEOUT || w == WAIT_IO_COMPLETION ? w : GetLastError()); return FALSE; }
   atom_lock();
+  if (p->count == 0) {      /* a call of a process that ended while it waited: the kernel kept the packet (see FSCTL 0x11FFF9) */
+    LeaveCriticalSection(&g_atom_lock);
+    IO_STATUS_BLOCK iosb;
+    BYTE packet[24];
+    if (!NT_SUCCESS(NtFsControlFile(p->semaphore, NULL, NULL, NULL, &iosb, 0x11FFF9, NULL, 0, packet, sizeof(packet)))) { set_error(ERROR_NOT_FOUND); return FALSE; }
+    if (bytes) *bytes = get32(packet);
+    if (key) *key = (ULONG_PTR)get64(packet + 8);
+    if (overlapped) *overlapped = (LPOVERLAPPED)(ULONG_PTR)get64(packet + 16);
+    if (get32(packet + 4)) { set_error(RtlNtStatusToDosError((NTSTATUS)get32(packet + 4))); return FALSE; }
+    return TRUE;
+  }
   PortPacket k = p->packets[p->head];
   p->head = (p->head + 1) % PORT_QUEUE;
   --p->count;

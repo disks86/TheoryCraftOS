@@ -459,7 +459,49 @@ uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, u
   return kSuccess;
 }
 
+uint32_t take_object_handle_from(Process& source, IProcessRuntime::RemoteOp& op) {
+  uint64_t slot = 0;
+  if (!slot_of(op.address, &slot) || source.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  const DescriptorKind kind = source.files().kind(slot);
+  const uint64_t token = source.files().token(slot);
+  if (kind != DescriptorKind::Pipe && !is_object_kind(kind)) return kNotImplemented;      // (the kinds with a count in the object manager or the pipes' ends)
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  op.type = uint32_t(kind);
+  op.argument = token;
+  op.protect = source.files().denied_access(slot);
+  if (kind == DescriptorKind::Pipe) pipe_token_add(token);
+  else objects->add_ref(uint32_t(token));
+  if (op.suspended && !source.files().protected_from_close(slot)) source.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
+  return kSuccess;
+}
+
 namespace {
+
+// NtDuplicateObject from a program other than the caller into the caller.
+uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t pid = 0;
+  if (!process_handle_info(p, r.args[0], &exited, &code, &pid)) return kInvalidHandle;
+  if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
+  if (!p.runtime()) return kNotImplemented;
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::TakeHandle;
+  op.address = r.args[1];
+  op.suspended = (options & 1) != 0;
+  const uint32_t status = p.runtime()->remote_operation(pid, op);
+  if (status != kSuccess) return status;
+  const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~uint32_t(desired_access));
+  uint64_t handle = 0;
+  uint32_t given = give_object_handle_in(p, op.type, op.argument, denied, (options & 4) ? false : (attributes & 2) != 0, &handle);
+  if (given == kSuccess && target_at != 0 && !p.write_user_u64(target_at, handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
+  if (given != kSuccess) {      // (the count the other program made for the copy)
+    if (DescriptorKind(op.type) == DescriptorKind::Pipe) pipe_token_release(op.argument);
+    else if (ObjectManager* objects = system_objects()) objects->release(uint32_t(op.argument));
+  }
+  return given;
+}
 
 // NtDuplicateObject into a program other than the caller (only the kinds of the object manager, which count their references).
 uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
@@ -498,7 +540,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &desired_access) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &options)) return kAccessViolation;
   const bool source_here = names_own_process(p, r.args[0]);
   const bool target_here = names_own_process(p, r.args[2]);
-  if (!source_here) return kNotImplemented;      // (a handle of another program cannot be read from here)
+  if (!source_here) return target_here ? duplicate_from_other(p, r, target_at, desired_access, attributes, options) : kNotImplemented;      // (between two other programs: not here)
   if (!target_here) return duplicate_to_other(p, r, target_at, desired_access, attributes, options);
   if (r.args[1] == ~uint64_t{1}) {      // the pseudo handle of the calling thread becomes a real handle to it
     const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();

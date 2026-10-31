@@ -307,7 +307,7 @@ static void test_duplicate_and_close() {
     CHECK(p.wait(copy, 0) == 0);      // the copy keeps the object
     CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 3) == 0);      // close the source
     CHECK(p.memory.get64(kBase + 0x120) == copy && p.wait(copy, 0) == 0);      // the handle moved (same process: it keeps its number)
-    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, 0x1234, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0xC0000002u);      // another process
+    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, 0x1234, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0xC0000008u);      // another process (a handle that is none: a handle of a running one is taken from it)
     // the pseudo handle of the calling thread becomes a real one (what thread libraries do to find themselves again); it needs a thread record
     CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, ~uint64_t{1}, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0xC0000008u);
     p.process.register_main_thread(1, 0x7FFD0000);

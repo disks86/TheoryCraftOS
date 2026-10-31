@@ -1476,6 +1476,7 @@ EXPORT BOOL WINAPI QueueUserAPC2(void (WINAPI *function)(ULONG_PTR), HANDLE thre
   return TRUE;
 }
 static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, void (WINAPI *routine)(DWORD, DWORD, LPOVERLAPPED));
+static int pipe_begin(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, void (WINAPI *routine)(DWORD, DWORD, LPOVERLAPPED), ULONG_PTR *information, NTSTATUS *result, LPVOID in, DWORD in_size);
 /* ReadFileEx / WriteFileEx: the operation is done at once; the completion routine is an APC for this thread, called when it next waits alertably. */
 typedef void (WINAPI *LPOVERLAPPED_COMPLETION_ROUTINE_)(DWORD, DWORD, LPOVERLAPPED);
 static void NTAPI completion_apc(ULONG_PTR routine, ULONG_PTR overlapped, ULONG_PTR unused) {
@@ -1494,7 +1495,19 @@ EXPORT BOOL WINAPI ReadFileEx(HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPE
 }
 EXPORT BOOL WINAPI WriteFileEx(HANDLE h, LPCVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
   if (!overlapped || !routine) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  if (pipe_start_overlapped(1, h, (LPVOID)buffer, length, overlapped, routine)) return TRUE;
+  {
+    ULONG_PTR information = 0;
+    NTSTATUS result = 0;
+    const int started = pipe_begin(1, h, (LPVOID)buffer, length, overlapped, routine, &information, &result, NULL, 0);      /* 1: waiting, 2: it went at once, 3: it failed */
+    if (started == 1) return TRUE;
+    if (started == 3) { overlapped->Internal = (ULONG_PTR)STATUS_PENDING; return fail_nt(result); }
+    if (started == 2) {
+      complete_overlapped(overlapped, result, information);
+      port_note(h, overlapped, information);
+      NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
+      return TRUE;
+    }
+  }
   DWORD done = 0;
   if (!WriteFile(h, buffer, length, &done, overlapped)) return FALSE;
   NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
@@ -1735,7 +1748,6 @@ static DWORD wait_result(NTSTATUS status) {
   fail_nt(status);
   return WAIT_FAILED;
 }
-static BOOL pipe_calls_pending(void);
 EXPORT BOOL WINAPI SwitchToThread(void);
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable) {
   if ((ULONG_PTR)h >= 0xFFFFFFF4u && (ULONG_PTR)h <= 0xFFFFFFF6u) h = GetStdHandle((DWORD)(ULONG_PTR)h);      /* STD_INPUT_HANDLE and the others */
@@ -1750,10 +1762,6 @@ EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alert
   LARGE_INTEGER t;
   t.QuadPart = -(LONGLONG)timeout_ms * 10000;
   DWORD result = wait_result(NtWaitForSingleObject(h, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
-  for (int tries = 0; result == WAIT_TIMEOUT && timeout_ms == 0 && tries < 200 && pipe_calls_pending(); ++tries) {      /* (a call in a thread of its own that has just been answered gets to say so: the event of a real one is set at once) */
-    SwitchToThread();
-    result = wait_result(NtWaitForSingleObject(h, alertable != 0, &t));
-  }
   return result;
 }
 EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL all, DWORD timeout_ms, BOOL alertable) {
@@ -2383,8 +2391,10 @@ EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
 
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
+static BOOL pipe_cancel_pending(HANDLE h, LPOVERLAPPED overlapped);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
+  pipe_cancel_pending(h, NULL);      /* (the calls that wait on a pipe handle end with it, and their OVERLAPPEDs are completed before it is gone) */
   port_unlink(h);
   overlapped_forget(h);
   con_alias_forget(h);
@@ -2530,7 +2540,19 @@ EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD wri
   if (written) *written = 0;
   if (!disk_buffer_usable(h, buffer, length, FALSE, ERROR_INVALID_USER_BUFFER)) return FALSE;
   if (!overlapped) { BOOL handled; const BOOL result = console_write_hook(h, buffer, length, written, &handled); if (handled) return result; }
-  if (pipe_start_overlapped(1, h, (LPVOID)buffer, length, overlapped, NULL)) { if (written) *written = 0; return FALSE; }
+  if (overlapped) {
+    ULONG_PTR information = 0;
+    NTSTATUS result = 0;
+    const int started = pipe_begin(1, h, (LPVOID)buffer, length, overlapped, NULL, &information, &result, NULL, 0);      /* 1: waiting, 2: it went at once, 3: it failed */
+    if (started == 1) { if (written) *written = 0; return FALSE; }
+    if (started == 2) {
+      complete_overlapped(overlapped, result, information);
+      port_note(h, overlapped, information);
+      if (written) *written = (DWORD)information;
+      return TRUE;
+    }
+    if (started == 3) { overlapped->Internal = (ULONG_PTR)STATUS_PENDING; return fail_nt(result); }
+  }
   IO_STATUS_BLOCK iosb;
   LARGE_INTEGER offset;
   PLARGE_INTEGER pointer = NULL;
@@ -2644,32 +2666,30 @@ EXPORT HANDLE WINAPI CreateNamedPipeA(LPCSTR name, DWORD open_mode, DWORD pipe_m
 #define FSCTL_PIPE_WAIT_ 0x110018
 #define FSCTL_PIPE_TRANSCEIVE_ 0x11C017
 
-/* An overlapped call on a named pipe that has to wait (nothing to read yet, nobody connected yet) is carried out by a thread of its own, as the kernel's calls are
- * synchronous; the thread completes the OVERLAPPED (and so its event) when the call returns. A call that can be answered at once is done in line, as without a thread. */
-typedef struct { int op; HANDLE pipe; LPVOID buffer; DWORD length; LPOVERLAPPED overlapped; LPOVERLAPPED_COMPLETION_ROUTINE_ routine; HANDLE caller; int slot; } PipeRequest;      /* op: 0 read, 1 write, 2 connect */
-/* The calls waiting in threads, so that CancelIo can end them: the thread looks at its flag between tries (it does not sit in the kernel's blocking call). */
+/* An overlapped call on a named pipe that has to wait (nothing to read yet, nobody connected yet, a write that does not fit) is an operation of the pipe in the kernel,
+ * started by the calling thread (a write is queued there, whole, at once: the other end sees its bytes) and waited for by a thread of its own, as the kernel's calls are
+ * synchronous; the thread completes the OVERLAPPED (and so its event) when the operation is over, then says so (ACK) - whoever finished the operation does not return before
+ * that, so the result is there when its call returns. A call that can be answered at once is done in line, as without a thread. */
+typedef struct { int op; HANDLE pipe; LPVOID buffer; DWORD length; LPOVERLAPPED overlapped; LPOVERLAPPED_COMPLETION_ROUTINE_ routine; HANDLE caller; int slot; DWORD tag; } PipeRequest;      /* op: 0 read, 1 write, 2 connect */
+/* The operations waiting in threads, so that CancelIo can end them by their tags. */
 #define PIPE_PENDING_MAX 32
-static struct { HANDLE pipe; LPOVERLAPPED overlapped; volatile LONG used, cancel; } g_pipe_pending[PIPE_PENDING_MAX];
+#define FSCTL_PIPE_BEGIN_READ_ 0x11FFF0
+#define FSCTL_PIPE_BEGIN_WRITE_ 0x11FFF1
+#define FSCTL_PIPE_BEGIN_LISTEN_ 0x11FFF2
+#define FSCTL_PIPE_AWAIT_ 0x11FFF3
+#define FSCTL_PIPE_ACK_ 0x11FFF4
+#define FSCTL_PIPE_CANCEL_ 0x11FFF5
+#define FSCTL_PIPE_BEGIN_TRANSACT_ 0x11FFF6
+static struct { HANDLE pipe; LPOVERLAPPED overlapped; DWORD tag; volatile LONG used; } g_pipe_pending[PIPE_PENDING_MAX];
 static void atom_lock(void);
 static CRITICAL_SECTION g_atom_lock;      /* (defined in extra3.inc; a tentative definition here) */
-static BOOL pipe_calls_pending(void) {
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (g_pipe_pending[n].used) return TRUE;
-  return FALSE;
-}
 static DWORD WINAPI pipe_request_thread(LPVOID parameter) {
   PipeRequest request = *(PipeRequest *)parameter;
   RtlFreeHeap(heap(), 0, parameter);
   IO_STATUS_BLOCK iosb;
   iosb.Information = 0;
-  NTSTATUS status;
-  iosb.Information = 0;
-  if (request.op == 0) status = NtReadFile(request.pipe, NULL, NULL, NULL, &iosb, request.buffer, request.length, NULL, NULL);
-  else if (request.op == 1) status = NtWriteFile(request.pipe, NULL, NULL, NULL, &iosb, request.buffer, request.length, NULL, NULL);
-  else {
-    status = NtFsControlFile(request.pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_LISTEN_, NULL, 0, NULL, 0);
-    if (status == (NTSTATUS)0xC00000AFu) status = STATUS_SUCCESS;      /* (the client came while this was waiting: that is the success) */
-  }
-  g_pipe_pending[request.slot].used = 0;
+  const BYTE no_event = request.overlapped->hEvent ? 0 : 1;      /* (the OVERLAPPED may be gone once it is completed) */
+  NTSTATUS status = NtFsControlFile(request.pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_AWAIT_, &request.tag, 4, request.op == 0 ? request.buffer : NULL, request.op == 0 ? request.length : 0);
   if (status == STATUS_PENDING) status = STATUS_SUCCESS;
   if (request.routine) {      /* ReadFileEx/WriteFileEx: the routine is queued before the event is set, so that a wait that ends on the event has already run it */
     request.overlapped->Internal = (ULONG_PTR)(ULONG)status;
@@ -2677,42 +2697,66 @@ static DWORD WINAPI pipe_request_thread(LPVOID parameter) {
     NtQueueApcThread(request.caller, (PVOID)completion_apc, (ULONG_PTR)request.routine, (ULONG_PTR)request.overlapped, 0);
     NtClose(request.caller);
     if (request.overlapped->hEvent) NtSetEvent((HANDLE)((ULONG_PTR)request.overlapped->hEvent & ~(ULONG_PTR)1), NULL);
-    return 0;
+  } else {
+    complete_overlapped(request.overlapped, status, iosb.Information);
+    port_note(request.pipe, request.overlapped, iosb.Information);
   }
-  complete_overlapped(request.overlapped, status, iosb.Information);
-  port_note(request.pipe, request.overlapped, iosb.Information);
+  g_pipe_pending[request.slot].used = 0;
+  BYTE ack[5] = {(BYTE)request.tag, (BYTE)(request.tag >> 8), (BYTE)(request.tag >> 16), (BYTE)(request.tag >> 24), no_event};
+  NtFsControlFile(request.pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_ACK_, ack, 5, NULL, 0);
   return 0;
 }
-/* True (with ERROR_IO_PENDING set) if the call was handed to a thread. */
-static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
-  if (!overlapped || device_type(h) != 0x11) return FALSE;
-  IO_STATUS_BLOCK iosb;
-  BYTE probe[16];
-  iosb.Information = 0;
-  const NTSTATUS peek = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_PEEK_, NULL, 0, probe, sizeof(probe));
-  if (op == 0 && !(NT_SUCCESS(peek) && get32(probe + 4) == 0)) return FALSE;      /* (data, or an error, is answered now) */
-  if (op == 2 && peek != (NTSTATUS)0xC00000ADu) return FALSE;      /* (already connected) */
-  if (op == 1) {      /* a write waits only when it does not fit */
-    BYTE local[40];
-    if (!NT_SUCCESS(NtQueryInformationFile(h, &iosb, local, sizeof(local), 24)) || get32(local + 28) >= length) return FALSE;
-  }
+/* 0 if the call is to be made the usual way (nothing was done); 1 if it waits in a thread (ERROR_IO_PENDING is set); for a write also 2 if it went at once (*information
+ * bytes) and 3 if it failed (*result). */
+static int pipe_begin(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine, ULONG_PTR *information, NTSTATUS *result, LPVOID in, DWORD in_size) {
+  if (!overlapped || device_type(h) != 0x11) return 0;
   PipeRequest *request = RtlAllocateHeap(heap(), 0, sizeof(*request));
-  if (!request) return FALSE;
+  if (!request) return 0;
   int slot = -1;
   atom_lock();
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (!g_pipe_pending[n].used) { g_pipe_pending[n].used = 1; g_pipe_pending[n].cancel = 0; g_pipe_pending[n].pipe = h; g_pipe_pending[n].overlapped = overlapped; slot = n; break; }
+  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (!g_pipe_pending[n].used) { g_pipe_pending[n].used = 1; g_pipe_pending[n].pipe = h; g_pipe_pending[n].overlapped = overlapped; g_pipe_pending[n].tag = 0; slot = n; break; }
   LeaveCriticalSection(&g_atom_lock);
-  if (slot < 0) { RtlFreeHeap(heap(), 0, request); return FALSE; }
+  if (slot < 0) { RtlFreeHeap(heap(), 0, request); return 0; }
+  IO_STATUS_BLOCK iosb;
+  DWORD tag = 0;
+  iosb.Information = 0;
+  NTSTATUS status;
+  if (op == 0) status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_READ_, &length, 4, &tag, 4);
+  else if (op == 1) status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_WRITE_, buffer, length, &tag, 4);
+  else if (op == 3) { tag = length; status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_TRANSACT_, in, in_size, &tag, 4); }      /* (the read length goes in, the tag comes out) */
+  else status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_LISTEN_, NULL, 0, &tag, 4);
+  if (status != STATUS_PENDING) {      /* answered at once (or not an operation at all) */
+    g_pipe_pending[slot].used = 0;
+    RtlFreeHeap(heap(), 0, request);
+    if ((op != 1 && op != 3) || status == (NTSTATUS)0xC00000BBu) return 0;
+    *information = iosb.Information;
+    *result = status;
+    return NT_SUCCESS(status) ? 2 : 3;
+  }
+  g_pipe_pending[slot].tag = tag;
   request->slot = slot;
-  request->op = op; request->pipe = h; request->buffer = buffer; request->length = length; request->overlapped = overlapped; request->routine = routine; request->caller = NULL;
-  if (routine && !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &request->caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) { RtlFreeHeap(heap(), 0, request); return FALSE; }
+  request->op = op == 3 ? 0 : op; request->pipe = h; request->buffer = buffer; request->length = length; request->overlapped = overlapped; request->routine = routine; request->caller = NULL; request->tag = tag;
   overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
   if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
-  HANDLE thread = CreateThread(NULL, 0, pipe_request_thread, request, 0, NULL);
-  if (!thread) { g_pipe_pending[slot].used = 0; RtlFreeHeap(heap(), 0, request); return FALSE; }
+  HANDLE thread = NULL;
+  if (!routine || DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &request->caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) thread = CreateThread(NULL, 0, pipe_request_thread, request, 0, NULL);
+  if (!thread) {      /* no thread to wait for it: the operation is given up */
+    if (request->caller) NtClose(request->caller);
+    NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_CANCEL_, &tag, 4, NULL, 0);
+    NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_ACK_, &tag, 4, NULL, 0);
+    g_pipe_pending[slot].used = 0;
+    RtlFreeHeap(heap(), 0, request);
+    *result = (NTSTATUS)0xC000009Au;
+    return op == 1 || op == 3 ? 3 : 0;
+  }
   NtClose(thread);
   set_error(997);      /* ERROR_IO_PENDING */
-  return TRUE;
+  return 1;
+}
+static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
+  ULONG_PTR information = 0;
+  NTSTATUS result = 0;
+  return pipe_begin(op, h, buffer, length, overlapped, routine, &information, &result, NULL, 0) == 1;
 }
 EXPORT BOOL WINAPI ConnectNamedPipe(HANDLE h, LPOVERLAPPED overlapped) {
   if (pipe_start_overlapped(2, h, NULL, 0, overlapped, NULL)) return FALSE;
@@ -2748,6 +2792,13 @@ EXPORT BOOL WINAPI PeekNamedPipe(HANDLE h, LPVOID buffer, DWORD size, LPDWORD re
   return ok;
 }
 EXPORT BOOL WINAPI TransactNamedPipe(HANDLE h, LPVOID in, DWORD in_size, LPVOID out, DWORD out_size, LPDWORD read, LPOVERLAPPED overlapped) {
+  if (overlapped) {      /* the message goes at once; the answer is awaited in a thread */
+    ULONG_PTR information = 0;
+    NTSTATUS result = 0;
+    const int started = pipe_begin(3, h, out, out_size, overlapped, NULL, &information, &result, in, in_size);
+    if (started == 1) return FALSE;
+    if (started == 3) return fail_nt(result);
+  }
   IO_STATUS_BLOCK iosb;
   iosb.Information = 0;
   const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_TRANSCEIVE_, in, in_size, out, out_size);
@@ -2795,6 +2846,7 @@ EXPORT BOOL WINAPI WaitNamedPipeA(LPCSTR name, DWORD timeout_ms) {
   free_wide(w);
   return ok;
 }
+EXPORT BOOL WINAPI SetNamedPipeHandleState(HANDLE h, LPDWORD mode, LPDWORD collect, LPDWORD timeout);
 EXPORT BOOL WINAPI CallNamedPipeW(LPCWSTR name, LPVOID in, DWORD in_size, LPVOID out, DWORD out_size, LPDWORD read, DWORD timeout_ms) {
   HANDLE h;
   for (;;) {
@@ -2802,7 +2854,8 @@ EXPORT BOOL WINAPI CallNamedPipeW(LPCWSTR name, LPVOID in, DWORD in_size, LPVOID
     if (h != INVALID_HANDLE_VALUE) break;
     if (GetLastError() != ERROR_PIPE_BUSY || !WaitNamedPipeW(name, timeout_ms)) return FALSE;
   }
-  const BOOL ok = TransactNamedPipe(h, in, in_size, out, out_size, read, NULL);
+  DWORD mode = 2 /* PIPE_READMODE_MESSAGE */;      /* (the answer is a message) */
+  const BOOL ok = SetNamedPipeHandleState(h, &mode, NULL, NULL) && TransactNamedPipe(h, in, in_size, out, out_size, read, NULL);
   const DWORD error = GetLastError();
   CloseHandle(h);
   if (!ok) set_error(error);
@@ -2844,6 +2897,37 @@ EXPORT BOOL WINAPI GetNamedPipeHandleStateW(HANDLE h, LPDWORD state, LPDWORD ins
 EXPORT BOOL WINAPI GetNamedPipeHandleStateA(HANDLE h, LPDWORD state, LPDWORD instances, LPDWORD collect, LPDWORD timeout, LPSTR user, DWORD user_size) {
   return GetNamedPipeHandleStateW(h, state, instances, collect, timeout, (LPWSTR)user, user_size);
 }
+/* The processes at the two ends of a pipe: the kernel keeps them with the instance (`which` 0: the client's, 1: the server's). */
+static BOOL pipe_process_of(HANDLE h, DWORD which, ULONG *pid) {
+  if (!pid) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  IO_STATUS_BLOCK iosb;
+  DWORD out = 0;
+  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, 0x11FFF7, &which, 4, &out, 4);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *pid = out;
+  return TRUE;
+}
+EXPORT BOOL WINAPI ProcessIdToSessionId(DWORD pid, DWORD *session);
+EXPORT BOOL WINAPI GetNamedPipeClientProcessId(HANDLE h, PULONG pid) { return pipe_process_of(h, 0, pid); }
+EXPORT BOOL WINAPI GetNamedPipeServerProcessId(HANDLE h, PULONG pid) { return pipe_process_of(h, 1, pid); }
+EXPORT BOOL WINAPI GetNamedPipeClientSessionId(HANDLE h, PULONG session) {
+  ULONG pid = 0;
+  if (!session) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  return pipe_process_of(h, 0, &pid) && ProcessIdToSessionId(pid, (DWORD *)session);
+}
+/* (There is one session, so the server's is the client's.) */
+EXPORT BOOL WINAPI GetNamedPipeServerSessionId(HANDLE h, PULONG session) {
+  ULONG pid = 0;
+  if (!session) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  return pipe_process_of(h, 1, &pid) && ProcessIdToSessionId(pid, (DWORD *)session);
+}
+/* Every client is on this machine: the call fails with ERROR_PIPE_LOCAL (and leaves the buffer alone), or with ERROR_INSUFFICIENT_BUFFER if there is no room for a name. */
+EXPORT BOOL WINAPI GetNamedPipeClientComputerNameW(HANDLE h, LPWSTR name, ULONG length) {
+  (void)h; (void)name;
+  set_error(length == 0 ? ERROR_INSUFFICIENT_BUFFER : 229 /* ERROR_PIPE_LOCAL */);
+  return FALSE;
+}
+EXPORT BOOL WINAPI GetNamedPipeClientComputerNameA(HANDLE h, LPSTR name, ULONG length) { return GetNamedPipeClientComputerNameW(h, (LPWSTR)name, length); }
 EXPORT BOOL WINAPI SetNamedPipeHandleState(HANDLE h, LPDWORD mode, LPDWORD collect, LPDWORD timeout) {
   (void)collect; (void)timeout;
   if (!mode) return TRUE;
@@ -3434,34 +3518,32 @@ typedef struct _OFSTRUCT { BYTE cBytes, fFixedDisk; WORD nErrCode, Reserved1, Re
  * speaker driver isn't present either. CancelIo/CancelIoEx/CancelSynchronousIo: every I/O call here is already done by the time it returns (there is no real
  * asynchronous I/O to cancel), so there is never anything pending to find. */
 EXPORT BOOL WINAPI Beep(DWORD frequency, DWORD duration) { (void)frequency; (void)duration; return TRUE; }
-/* The calls waiting in threads (see pipe_request_thread) end with STATUS_CANCELLED: the pipe is told so until they have gone (one that has not reached the kernel's wait yet
-   would miss the first telling). */
-static void pipe_cancel_pending(HANDLE h, LPOVERLAPPED overlapped) {
-  for (int tries = 0; tries < 500; ++tries) {
-    BOOL any = FALSE;
-    for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (g_pipe_pending[n].used && g_pipe_pending[n].pipe == h && (!overlapped || g_pipe_pending[n].overlapped == overlapped)) any = TRUE;
-    if (!any) return;
+/* The operations waiting in threads (see pipe_request_thread) end with STATUS_CANCELLED; the kernel does not answer before their threads have completed the OVERLAPPEDs.
+   Returns whether one was ended (one that has just finished on its own cannot be cancelled any more). */
+static BOOL pipe_cancel_pending(HANDLE h, LPOVERLAPPED overlapped) {
+  BOOL cancelled = FALSE;
+  for (int n = 0; n < PIPE_PENDING_MAX; ++n) {
+    if (!g_pipe_pending[n].used || g_pipe_pending[n].pipe != h || (overlapped && g_pipe_pending[n].overlapped != overlapped)) continue;
+    DWORD tag = g_pipe_pending[n].tag;
     IO_STATUS_BLOCK iosb;
-    NtFsControlFile(h, NULL, NULL, NULL, &iosb, 0x11FFFC, NULL, 0, NULL, 0);
-    Sleep(1);
+    if (tag && NT_SUCCESS(NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_CANCEL_, &tag, 4, NULL, 0))) cancelled = TRUE;
   }
+  return cancelled;
 }
 EXPORT BOOL WINAPI CancelIo(HANDLE h) {
-  BOOL pending = FALSE;
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (g_pipe_pending[n].used && g_pipe_pending[n].pipe == h) pending = TRUE;
-  if (pending) pipe_cancel_pending(h, NULL);
+  pipe_cancel_pending(h, NULL);
   return TRUE;
 }
 EXPORT BOOL WINAPI CancelIoEx(HANDLE h, LPOVERLAPPED overlapped) {
-  BOOL found = FALSE;
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) {
-    if (g_pipe_pending[n].used && g_pipe_pending[n].pipe == h && (!overlapped || g_pipe_pending[n].overlapped == overlapped)) found = TRUE;
-  }
-  if (!found) { set_error(ERROR_NOT_FOUND); return FALSE; }
-  pipe_cancel_pending(h, overlapped);
+  if (!pipe_cancel_pending(h, overlapped)) { set_error(ERROR_NOT_FOUND); return FALSE; }
   return TRUE;
 }
-EXPORT BOOL WINAPI CancelSynchronousIo(HANDLE thread) { (void)thread; set_error(ERROR_NOT_FOUND); return FALSE; }
+/* Ends the call a thread waits in on a pipe (the kernel knows which thread waits where); a thread that waits for something else has nothing to cancel. */
+EXPORT BOOL WINAPI CancelSynchronousIo(HANDLE thread) {
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtCancelSynchronousIoFile(thread, NULL, &iosb);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
 /* FatalAppExit: ends the process at once (-1 as the exit code, like a real one's message-box dialog being dismissed); there is no message-box UI here to show
  * the text first. */
 EXPORT void WINAPI FatalAppExitW(UINT action, LPCWSTR text) { (void)action; (void)text; ExitProcess(0xFFFFFFFFu); }

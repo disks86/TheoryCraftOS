@@ -95,6 +95,7 @@ void Process::terminate(uint32_t code) {
   windowsabi::debug_process_exited(id_, code);
   if (ObjectManager* objects = system_objects()) {      // what it owned is abandoned; whoever waits for it or for them looks again
     objects->abandon_process(id_);
+    objects->pipe_owner_gone(id_);      // (what its threads wait for on a pipe is cancelled)
     objects->process_exited(id_, code);
     objects->notify();
   }

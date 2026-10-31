@@ -160,7 +160,7 @@ class IProcessRuntime {
   // Work on the memory and threads of another running program (by process id). The runtime takes that program's lock and gives up the caller's meanwhile; the work is done by
   // windowsabi::run_remote(). Returns an NTSTATUS.
   struct RemoteOp {
-    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo, MapView, Duplicate, GetContext, SetContext, SuspendThread } kind = Read;
+    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo, MapView, Duplicate, GetContext, SetContext, SuspendThread, TakeHandle } kind = Read;
     uint64_t address = 0, size = 0;       // Allocate/Free/Protect: in and out (as the NT services have them); Read/Write: the address; CreateThread: the start routine; thread calls: the thread id
     ByteView out;                         // Read: where the bytes go
     ConstByteView in;                     // Write: the bytes
