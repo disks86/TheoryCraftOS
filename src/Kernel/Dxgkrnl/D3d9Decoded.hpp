@@ -35,13 +35,23 @@ enum Opcode : uint16_t {
   // Instructions of Shader Model 4 (DXBC, see D3d9Dxbc.cpp) that Direct3D 9 has no token for. Booleans are 1.0 / 0.0 here, not all-ones masks: the front end only takes shaders that use
   // them to select (movc, if, discard).
   kDiv = 0x1000, kSqrt, kSeq, kSne, kDp2, kFloor, kCeil, kTrunc, kRoundNe, kSin, kCos, kSelect, kIfNz, kIfZ, kDiscardNz, kDiscardZ,
+  kDdx, kDdy, kDdxCoarse, kDdyCoarse,   // (derivatives over the 2 x 2 quad: fine takes the pair of the pixel's own row or column, coarse the quad's first)
   // Integer and bitwise instructions: the 32 bits of a register component are the integer (the interpreter keeps them in the float's bits), comparisons give all ones or zero.
-  kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe,
-  kIntegerFirst = kIAdd, kIntegerLast = kUGe,
+  kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe, kUMulHi, kIMulHi,   // (the high word of a 32 x 32 product)
+  kIntegerFirst = kIAdd, kIntegerLast = kIMulHi,
   // Loops (Shader Model 4): `target` of a loop is the instruction after its endloop, of an endloop the one after its loop; break leaves, continue goes to the endloop.
   // Texture access of Shader Model 4: ld (src[0] the integer coordinates, x y in the first two components and the level in the last; src[1] the unit), sample_l (src[0] the
   // coordinate, src[1] the unit, src[2] the level), resinfo (src[0] the level, src[1] the unit; control: 0 floats, 1 reciprocals, 2 unsigned integers).
-  kTexFetch = 0x1300, kTexLod, kTexSize, kTexFetchMs, kTexSamples,   // (kTexFetchMs: ld_ms, src[2] the sample; kTexSamples: sampleinfo, a constant: control the count, tex_swizzle[0] 1 for an unsigned result)
+  kTexFetch = 0x1300, kTexLod, kTexSize, kTexFetchMs, kTexSamples, kTexGather, kTexGrad, kTexBias, kTexQueryLod, kTexCompare, kF32ToF16, kF16ToF32,   // (the half in the low 16 bits of the 32-bit result, and back)
+  kRetEarly,   // (kRetEarly: a ret inside an if or a loop ends the program there)
+ 
+  // Double precision (Shader Model 5): a double is two components of a register, the low word first (a pair at x y or z w; the operand's swizzle positions 2k and 2k + 1 hold the pair k, and the
+  // result goes to the destination's pair k - or, for the comparisons and the conversions to a 32-bit value, to its component k). The instructions to kDoubleLast read doubles.
+  kDAdd, kDMul, kDDiv, kDFma, kDRcp, kDMin, kDMax, kDMov, kDMovc, kDEq, kDGe, kDLt, kDNe, kDToF, kDToI, kDToU, kFToD, kIToD, kUToD,
+  kDoubleFirst = kDAdd, kDoubleLast = kDToU,
+    // (kTexCompare: sample_c / sample_c_lz, src[2] the reference: the comparison of the four texels of the footprint, filtered bilinearly; passes where reference <= texel)
+    // (kTexQueryLod: the lod instruction, x the level clamped to the texture's, y not)
+    // (kTexFetchMs: ld_ms, src[2] the sample; kTexGather: gather4, src[0] the coordinate, src[1] the unit, control the component (0..3) of the four texels returned; kTexSamples: sampleinfo, a constant: control the count, tex_swizzle[0] 1 for an unsigned result)
   // Storage buffers (compute shaders, Shader Model 5): kBufLoad (dst; src[0] the byte address or the structure index, src[1] the byte offset in the structure; tex_swizzle picks the loaded
   // words), kBufStore (dst.mask: how many words; src[2] the value), kBufAtomic / kBufImmAtomic (src[0] the address, src[1] the operand; the second also writes the old value to dst). The
   // buffer is `uav`; `stride` is 0 for a raw buffer (byte address) and the structure size for a structured one; an atomic's kind is `control` (AtomicKind).
@@ -101,8 +111,9 @@ struct D3d9Program::Instruction {
   uint8_t uav = 0;       // kBufLoad ..: the storage buffer slot
   uint32_t stride = 0;
   uint8_t tex_swizzle[4] = {0, 1, 2, 3};   // texld: which texel component each result component takes
+  int8_t texel_offset[2] = {0, 0};          // gather4: the static offset of the footprint, in texels (the extended opcode token's)
   Dst dst;
-  Src src[3];
+  Src src[4];
   uint8_t src_count = 0;
   uint32_t target = 0;   // if: where to go when the condition fails; else: where to go to leave the branch
 };

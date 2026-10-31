@@ -245,6 +245,15 @@ static void test_arrays_and_strings() {
   CHECK(is("var ok = 0; try { Array.prototype.map.call(5, function () {}); } catch (e) { ok = e instanceof TypeError; } String(ok)", "true"));
   // a global that is a getter on the window is read by its bare name too (YouTube defines Polymer that way), and `typeof` sees it
   CHECK(is("var store = {x: 7}; Object.defineProperty(this, 'Acc', {get: function () { return store; }, set: function (v) { store = v; }, configurable: true}); Acc.x + ':' + typeof Acc + ':' + typeof NoSuchGlobal", "7:object:undefined"));
+  // a \u escape inside a name (Angular writes q.id.ɵprov): the name is the decoded text, in a property name, a variable and a declaration
+  CHECK(is("var o = {\\u0275prov: 5}; var \\u0061b = 2; o.\\u0275prov + ':' + o['ɵprov'] + ':' + ab + ':' + Object.keys(o)[0].length", "5:5:2:5"));
+  CHECK(is("var o = {}; o.a\\u{62}c = 1; o.abc", "1"));
+  // the collector runs while a script is below Function.prototype.call/apply, new Promise(executor) and Array.prototype.forEach (transpiled code runs almost
+  // entirely there): this loop makes some 250 MB of strings, the limit of the engine is lower than that
+  CHECK(is("var n = 0; function work() { var s = ''; for (var i = 0; i < 500; i++) s += 'x'; n += s.length; }"
+           "[1].forEach(function () { new Promise(function () { work.call(null); for (var k = 0; k < 2000; k++) work.apply(null, []); }); });"
+           "n",
+           "1000500"));
   // errors have a stack (pages' error reporters read its length)
   CHECK(is("var e = new TypeError('boom'); typeof e.stack + ':' + (e.stack.indexOf('TypeError: boom') === 0) + ':' + Object.keys(e).length", "string:true:0"));
   {   // a string literal larger than one arena block (Google's search page evals a 60 KB one)

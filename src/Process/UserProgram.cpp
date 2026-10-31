@@ -185,6 +185,14 @@ uint32_t UserProgram::load_module(ConstByteView file, StringView canonical_name,
   return 0;
 }
 
+void UserProgram::finish_loading() {
+  if (!loading_pending_ || !modules_) return;
+  loading_pending_ = false;
+  if (program_headers_) bind_program_imports(space_, allocator_, *program_headers_, modules_.get());
+  program_headers_.reset();
+  write_u64(space_, peb_ + 0x18, ldr_);      // PEB.Ldr
+}
+
 bool UserProgram::set_standard_handles(const uint64_t handles[3]) {
   if (!process_ || process_->abi() != SyscallAbi::Windows) return false;
   bool ok = true;
@@ -192,7 +200,6 @@ bool UserProgram::set_standard_handles(const uint64_t handles[3]) {
   const uint64_t parameters = ok ? read_u64(space_, peb + 0x20, &ok) : 0;
   if (!ok || parameters == 0) return false;
   for (uint32_t i = 0; i < 3; ++i) {
-    if (handles[i] == 0 || handles[i] == ~uint64_t{0}) continue;
     if (!write_u64(space_, parameters + 0x20 + 8 * i, handles[i])) return false;
   }
   return true;
@@ -232,6 +239,11 @@ uint32_t UserProgram::release_module(uint64_t base, LoadedModule* out, uint32_t 
   return 0;
 }
 
+uint32_t UserProgram::link_modules(uint64_t from, uint64_t to) {
+  if (!modules_) return 0xC00000BBu;
+  return link_libraries(modules_.get(), from, to) ? 0 : 0xC0000008u;
+}
+
 uint32_t UserProgram::unload_module(uint64_t base) {
   if (!modules_) return 0xC00000BBu;
   if (Module* m = modules_->find_base(base); m && process_) take_tls(space_, *process_, *m);
@@ -259,7 +271,9 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     if (status != LoadStatus::Ok) return status;
     if (!AddressSpace::round_up(image.end, &heap_start)) return LoadStatus::Malformed;
   } else if (kind == exe::ExecutableKind::Pe) {
-    exe::PeFile pe(allocator_);
+    UniquePointer<exe::PeFile> headers = UniquePointer<exe::PeFile>::make(allocator_, allocator_);
+    if (!headers) return LoadStatus::OutOfMemory;
+    exe::PeFile& pe = *headers;
     if (!pe.parse(file)) return LoadStatus::Malformed;
     if (!bind_executable(pe, &binding)) return LoadStatus::Unsupported;
     describe_pe_image(pe, file.size(), image_information);
@@ -272,7 +286,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     if (libraries_) {
       modules = UniquePointer<ModuleSet>::make(allocator_, allocator_);
       if (!modules) return LoadStatus::OutOfMemory;
-      status = load_windows_modules(space_, allocator_, pe, file, program_file, *libraries_, modules.get(), &detail_);
+      status = load_windows_modules(space_, allocator_, pe, file, program_file, *libraries_, modules.get(), &detail_, !defer_loading_);
       if (status != LoadStatus::Ok) return status;
     }
     status = map_stack(space_, kDefaultStackBytes, &stack_top);
@@ -291,6 +305,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     input.environment = environment;
     input.processor_count = processor_count_;
     if (has_startup_) input.startup = &startup_;
+    input.defer_ldr = defer_loading_ && modules;
     input.current_directory = working_directory_.empty() ? StringView("/") : working_directory_.view();
     // The module lists for PEB.Ldr: the program, then the libraries in load order; the initialization order as indexes.
     WindowsModule listed[64];
@@ -332,6 +347,12 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     thread_support.start_thunk = thread_thunk;
     thread_teb = startup.teb;
     loaded_modules = static_cast<UniquePointer<ModuleSet>&&>(modules);
+    if (defer_loading_ && loaded_modules) {      // what a first thread has to do before it runs
+      peb_ = startup.peb;
+      ldr_ = startup.ldr;
+      loading_pending_ = true;
+      program_headers_ = static_cast<UniquePointer<exe::PeFile>&&>(headers);
+    }
   } else {
     return LoadStatus::NotExecutable;
   }

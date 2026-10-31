@@ -119,40 +119,67 @@ EXPORT char *strstr(const char *h, const char *n) {
   for (; *h; ++h) if (!strncmp(h, n, length)) return (char *)h;
   return NULL;
 }
+#ifdef OWN_TOWCASE
+int toupper(int c);
+int tolower(int c);
+#else
 EXPORT int toupper(int c) { return c >= 'a' && c <= 'z' ? c - 32 : c; }
 EXPORT int tolower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+#endif
+#ifdef OWN_TOWCASE      /* (ntdll defines them from its case tables) */
+int towupper(int c);
+int towlower(int c);
+#else
 EXPORT int towupper(int c) { return c >= 'a' && c <= 'z' ? c - 32 : c; }
 EXPORT int towlower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+#endif
+#ifdef OWN_TOWCASE
+int isdigit(int c);
+#else
 EXPORT int isdigit(int c) { return c >= '0' && c <= '9'; }
+#endif
+#ifdef OWN_TOWCASE
+int isalpha(int c);
+#else
 EXPORT int isalpha(int c) { return (c | 32) >= 'a' && (c | 32) <= 'z'; }
+#endif
+#ifdef OWN_TOWCASE
+int isalnum(int c);
+#else
 EXPORT int isalnum(int c) { return isdigit(c) || isalpha(c); }
+#endif
+#ifdef OWN_TOWCASE
+int isspace(int c);
+#else
 EXPORT int isspace(int c) { return c == ' ' || (c >= 9 && c <= 13); }
+#endif
 EXPORT int _stricmp(const char *a, const char *b) {
   for (;; ++a, ++b) {
     const int x = tolower((BYTE)*a), y = tolower((BYTE)*b);
-    if (x != y) return x < y ? -1 : 1;
+    if (x != y) return x - y;
     if (!x) return 0;
   }
 }
 EXPORT int _strnicmp(const char *a, const char *b, size_t_ n) {
   for (; n; --n, ++a, ++b) {
     const int x = tolower((BYTE)*a), y = tolower((BYTE)*b);
-    if (x != y) return x < y ? -1 : 1;
+    if (x != y) return x - y;
     if (!x) return 0;
   }
   return 0;
 }
+static int wide_fold(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 EXPORT int _wcsicmp(const WCHAR *a, const WCHAR *b) {
   for (;; ++a, ++b) {
-    const int x = towlower(*a), y = towlower(*b);
-    if (x != y) return x < y ? -1 : 1;
+    const int x = wide_fold(*a), y = wide_fold(*b);
+    if (x != y) return x - y;
     if (!x) return 0;
   }
 }
 EXPORT int _wcsnicmp(const WCHAR *a, const WCHAR *b, size_t_ n) {
   for (; n; --n, ++a, ++b) {
-    const int x = towlower(*a), y = towlower(*b);
-    if (x != y) return x < y ? -1 : 1;
+    const int x = wide_fold(*a), y = wide_fold(*b);
+    if (x != y) return x - y;
     if (!x) return 0;
   }
   return 0;

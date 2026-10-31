@@ -38,6 +38,10 @@
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Mouse/I2c/I2cHidPointer.hpp"
+#include "Hardware/Pen/CompositePen.hpp"
+#include "Hardware/Pen/I2c/I2cHidPen.hpp"
+#include "Hardware/Sensor/HidSensor.hpp"
+#include "Hardware/Sensor/SensorHub.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -50,6 +54,8 @@ class PlatformI2cHid {
     char device[32] = {};            // "TPD0 ELAN0501"
     Outcome outcome = Outcome::DeviceFailed;
     I2cHidPointer::Kind kind = I2cHidPointer::Kind::None;
+    bool pen = false;                // the device has a pen (added to the pens given to set_pens)
+    uint32_t sensors = 0;            // sensors of the device (added to the hub given to set_sensors)
   };
   static constexpr uint32_t kMaxReports = 8;
   static const char* outcome_name(Outcome o);
@@ -57,6 +63,9 @@ class PlatformI2cHid {
   PlatformI2cHid(allocators::IAllocator& allocator, IPciBus& pci, II2cRegisterSource& i2c_registers, IRegisterMapper& mapper, IClock& clock, IAcpiHost& host)
       : allocator_(allocator), pci_(pci), i2c_registers_(i2c_registers), mapper_(mapper), clock_(clock), vm_(allocator, host), controllers_(allocator), gpios_(allocator), lines_(allocator), pointers_(allocator) {}
 
+  // Where the pens and the sensors of the devices go (before start(); without them those functions are left alone).
+  void set_pens(CompositePen* pens) { pens_ = pens; }
+  void set_sensors(SensorHub* sensors) { sensors_ = sensors; }
   // Loads the tables, finds the devices, brings them up. Returns how many pointers were added to `mice`.
   uint32_t start(const AcpiTables& tables, CompositeMouse& mice);
   // Loads the tables given (for tests).
@@ -79,6 +88,10 @@ class PlatformI2cHid {
   struct Pointer {
     char name[40] = {};
     UniquePointer<I2cHidPointer> pointer;
+    UniquePointer<I2cHidPen> pen;
+    UniquePointer<HidSensor> sensors[HidSensor::kMaxPerDevice];
+    char sensor_names[HidSensor::kMaxPerDevice][56] = {};
+    bool as_mouse = false;
   };
 
   uint32_t run(CompositeMouse& mice);
@@ -101,6 +114,8 @@ class PlatformI2cHid {
   List<UniquePointer<Gpio>> gpios_;
   List<UniquePointer<GpioAttentionLine>> lines_;
   List<UniquePointer<Pointer>> pointers_;
+  CompositePen* pens_ = nullptr;
+  SensorHub* sensors_ = nullptr;
   Report reports_[kMaxReports];
   uint32_t report_count_ = 0, tables_loaded_ = 0;
 };

@@ -125,6 +125,13 @@ void SystemStorageDevices::initialize() {
   watcher_.snapshot();   // what was plugged in at start-up has been taken over; later ports are new
 }
 
+bool SystemStorageDevices::add_source(IRemovableMediaSource* source) {
+  if (!source) return false;
+  for (IRemovableMediaSource*& slot : sources_)
+    if (!slot) { slot = source; return true; }
+  return false;
+}
+
 void SystemStorageDevices::shutdown() {
   kernel::ScopedMutex guard(mutex_);
   pending_.clear();
@@ -207,14 +214,23 @@ bool SystemStorageDevices::poll(StorageEvent* event) {
         return true;
       }
     }
-    if (!usb_) return false;
-    // Look for the USB sticks that went (their port moved on to another device or to none), then for new ones.
-    watcher_.scan([&](uint32_t, IUsbHostController& host, uint32_t port) {
-      sweep_removed();
+    // Removable media outside the USB ports (the SD slot): what went is taken out first, then what came is added.
+    sweep_removed();
+    for (IRemovableMediaSource* source : sources_) {
+      if (!source) continue;
       List<UniquePointer<IStorageDevice>> found(allocator_);
-      UsbMassStorageDevice::discover_port(host, port, allocator_, st_, found);
+      source->discover(found);
       adopt(found, true);
-    });
+    }
+    // Look for the USB sticks that went (their port moved on to another device or to none), then for new ones.
+    if (usb_) {
+      watcher_.scan([&](uint32_t, IUsbHostController& host, uint32_t port) {
+        sweep_removed();
+        List<UniquePointer<IStorageDevice>> found(allocator_);
+        UsbMassStorageDevice::discover_port(host, port, allocator_, st_, found);
+        adopt(found, true);
+      });
+    }
     sweep_removed();   // (a stick that was pulled out and nothing came: no port reports it, but the device knows)
     kernel::ScopedMutex guard(mutex_);
     if (pending_.count() == 0) return false;

@@ -8,6 +8,8 @@
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Hardware/Keyboard/KeyboardBase.hpp"
+#include "Hardware/Mouse/MouseBase.hpp"
 
 using namespace hardware;
 
@@ -92,6 +94,39 @@ static void test_keyboard() {
     CHECK(ev.size() == 2 && has_key(ev, key::kLeftShift, false) && has_key(ev, key::kA, false));
     CHECK(input.keyboard().modifiers() == 0);
     CHECK(drain_keys(input).empty() && input.poll() == 0);
+    input.shutdown();
+  }
+  CHECK(f.alloc.live == 0);
+}
+
+static void test_media_keys() {
+  Fixture f;
+  {
+    SystemInput input(f.pci, f.usb, f.alloc, nullptr);
+    Notes notes;
+    input.set_notifier(Notes::add, &notes);
+    FakeStickHost::Stick media = device(6), kb = device(1);
+    f.host.plug(0, &media);
+    f.host.plug(1, &kb);
+    CHECK(input.poll() == 2 && input.keyboards().count() == 2 && input.mice().count() == 0 && notes.has("USB HID media keys: added"));
+    f.host.send_report(0, Bytes({3, 0x05}));                                      // volume up and mute
+    std::vector<KeyEvent> ev = drain_keys(input);
+    CHECK(ev.size() == 2 && has_key(ev, key::kVolumeUp, true) && has_key(ev, key::kMute, true));
+    f.host.send_report(0, Bytes({3, 0x01}));                                      // mute let go
+    ev = drain_keys(input);
+    CHECK(ev.size() == 1 && has_key(ev, key::kMute, false));
+    f.host.send_report(0, Bytes({4, 0x7F}));                                      // another report id: not ours
+    f.host.send_report(0, Bytes());
+    f.host.send_report(0, Bytes({3}));                                            // too short: nothing is decoded, nothing changes
+    CHECK(drain_keys(input).empty());
+    f.host.send_report(1, keys(0, {key::kA}));                                    // the boot keyboard still works next to it
+    ev = drain_keys(input);
+    CHECK(ev.size() == 1 && has_key(ev, key::kA, true));
+    // pulled out with the volume key held: it is released
+    f.host.unplug(0);
+    CHECK(input.poll() == 1 && input.keyboards().count() == 1);
+    ev = drain_keys(input);
+    CHECK(ev.size() == 1 && has_key(ev, key::kVolumeUp, false));
     input.shutdown();
   }
   CHECK(f.alloc.live == 0);
@@ -282,14 +317,83 @@ static void test_shared_bus() {
   CHECK(f.alloc.live == 0);
 }
 
+// A driver SystemInput knows nothing about brings its devices through an IInputDeviceSource.
+struct FakeKeyboard final : KeyboardBase {
+  std::vector<std::pair<uint8_t, bool>> script;
+  const char* name() const override { return "fake keyboard"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  void fetch() override { for (auto& e : script) push(e.first, e.second); script.clear(); }
+  void on_release_all() override { push(key::kA, false); }
+};
+struct FakeMouse final : MouseBase {
+  const char* name() const override { return "fake mouse"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool is_absolute() const override { return false; }
+  uint32_t max_x() const override { return 0; }
+  uint32_t max_y() const override { return 0; }
+  void fetch() override {}
+};
+struct FakeSource final : IInputDeviceSource {
+  FakeKeyboard keyboard;
+  FakeMouse mouse;
+  bool present = false, attached = false;
+  uint32_t detaches = 0;
+  const char* name() const override { return "fake source"; }
+  uint32_t poll(IInputSink& sink) override {
+    if (present && !attached) { attached = sink.add_keyboard(&keyboard) && sink.add_mouse(&mouse); sink.notify(StringView("fake source: keyboard added")); return 2; }
+    if (!present && attached) { keyboard.release_all(); sink.remove_keyboard(&keyboard); sink.remove_mouse(&mouse); attached = false; return 2; }
+    return 0;
+  }
+  void detach_all(IInputSink& sink) override { ++detaches; present = false; poll(sink); }
+};
+
+static void test_source() {
+  Fixture f;
+  {
+    SystemInput input(f.pci, f.usb, f.alloc, nullptr);
+    Notes notes;
+    input.set_notifier(Notes::add, &notes);
+    FakeSource source;
+    CHECK(input.add_source(&source) && input.add_source(&source) && input.source_count() == 1);
+    CHECK(input.poll() == 0 && input.keyboards().count() == 0);
+    source.present = true;
+    CHECK(input.poll() == 2 && input.keyboards().count() == 1 && input.mice().count() == 1 && notes.has("fake source"));
+    source.keyboard.script = {{key::kA, true}};
+    std::vector<KeyEvent> ev = drain_keys(input);
+    CHECK(ev.size() == 1 && ev[0].usage == key::kA && ev[0].pressed);
+    // the device goes: its held key is released and delivered
+    source.present = false;
+    CHECK(input.poll() == 2 && input.keyboards().count() == 0);
+    ev = drain_keys(input);
+    CHECK(ev.size() == 1 && !ev[0].pressed);
+    // removing a source detaches what it still has; more sources than there is room for are refused
+    source.present = true;
+    input.poll();
+    CHECK(input.keyboards().count() == 1 && input.remove_source(&source) && source.detaches == 1 && input.keyboards().count() == 0 && !input.remove_source(&source));
+    FakeSource many[SystemInput::kMaxSources + 1];
+    uint32_t added = 0;
+    for (FakeSource& s : many) added += input.add_source(&s);
+    CHECK(added == SystemInput::kMaxSources && input.add_source(nullptr) == false);
+    many[0].present = true;
+    input.poll();
+    input.shutdown();
+    CHECK(many[0].detaches == 1 && input.source_count() == 0 && input.keyboards().count() == 0);
+  }
+  CHECK(f.alloc.live == 0);
+}
+
 int main() {
   test_keyboard();
+  test_media_keys();
   test_mouse_and_tablet();
   test_several_keyboards();
   test_replaced_before_noticed();
   test_not_taken();
   test_more_than_fit();
   test_shared_bus();
+  test_source();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("InputHotplugTest: all passed\n");
   return 0;

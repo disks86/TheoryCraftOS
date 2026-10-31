@@ -95,6 +95,7 @@ NT_SERVICE(NtReadVirtualMemory);
 NT_SERVICE(NtWriteVirtualMemory);
 NT_SERVICE(NtCreateSymbolicLink);
 NT_SERVICE(NtTcosDebugException);
+NT_SERVICE(NtTcosLinkModules);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);
@@ -129,7 +130,7 @@ NT_SERVICE(NtQuerySystemTime);
 NT_SERVICE(NtAllocateVirtualMemory);
 NT_SERVICE(NtFreeVirtualMemory);
 NT_SERVICE(NtProtectVirtualMemory);
-NT_SERVICE(NtCreateFile);
+NT_SERVICE_RAW(NtCreateFile);
 NT_SERVICE(NtOpenFile);
 NT_SERVICE(NtQueryInformationFile);
 NT_SERVICE(NtSetInformationFile);
@@ -144,6 +145,7 @@ NT_SERVICE(NtQueryInformationProcess);
 
 /* ---- the C library functions ntdll exports (shared with msvcrt.dll) -------------------------------------------------------------------------------------- */
 
+#define OWN_TOWCASE 1
 #include "../libc_string.inc"
 
 /* The Rtl* names kernel32.dll forwards straight to ntdll for (RtlFillMemory's argument order is (dest, length, fill), not memset's (dest, fill, length) - a real,
@@ -159,95 +161,53 @@ EXPORT SIZE_T NTAPI RtlCompareMemory(const void *a, const void *b, SIZE_T n) {
   return i;
 }
 
-/* ---- formatting (the narrow printf family) ------------------------------------------------------------------------------------------------------------- */
+/* ---- formatting (the printf family) --------------------------------------------------------------------------------------------------------------------- */
 
-typedef struct { char *out; size_t_ capacity, length; } Sink;
-static void sink_put(Sink *s, char c) {
-  if (s->length + 1 < s->capacity) s->out[s->length] = c;
-  ++s->length;
+/* Whether a %s or %c argument is a wide string or character: the native width of the printf (%s, %c) or the other one (%S, %C), moved by h (narrow),
+   w (wide), both (the other one) and an odd number of l (wide). */
+static int fmt_wide_arg(int native_wide, int native_conversion, int has_h, int has_w, int ells) {
+  if (has_h && has_w) return !native_wide;
+  if (has_w) return 1;
+  if (has_h) return 0;
+  if (ells & 1) return 1;
+  return native_conversion ? native_wide : !native_wide;
 }
-static void sink_pad(Sink *s, char c, int n) { while (n-- > 0) sink_put(s, c); }
+#define FMT_CH char
+#define FMT_WIDE 0
+#define FMT_SINK Sink
+#define FMT_PUT sink_put
+#define FMT_PAD sink_pad
+#define FMT_FN vformat
+#include "format.inc"
+#undef FMT_CH
+#undef FMT_WIDE
+#undef FMT_SINK
+#undef FMT_PUT
+#undef FMT_PAD
+#undef FMT_FN
+#define FMT_CH WCHAR
+#define FMT_WIDE 1
+#define FMT_SINK WSink
+#define FMT_PUT wsink_put
+#define FMT_PAD wsink_pad
+#define FMT_FN vformatw
+#include "format.inc"
+#undef FMT_CH
+#undef FMT_WIDE
+#undef FMT_SINK
+#undef FMT_PUT
+#undef FMT_PAD
+#undef FMT_FN
 
-EXPORT int vsnprintf(char *buffer, size_t_ capacity, const char *format, va_list_ args) {
-  Sink sink = {buffer, capacity, 0};
-  for (const char *f = format; *f; ++f) {
-    if (*f != '%') { sink_put(&sink, *f); continue; }
-    ++f;
-    int left = 0, zero = 0, plus = 0, space = 0, alt = 0, width = 0, precision = -1, size = 0;
-    for (;; ++f) {
-      if (*f == '-') left = 1; else if (*f == '0') zero = 1; else if (*f == '+') plus = 1; else if (*f == ' ') space = 1; else if (*f == '#') alt = 1; else break;
-    }
-    if (*f == '*') { width = __builtin_va_arg(args, int); if (width < 0) { left = 1; width = -width; } ++f; }
-    else while (isdigit((BYTE)*f)) width = width * 10 + (*f++ - '0');
-    if (*f == '.') {
-      ++f; precision = 0;
-      if (*f == '*') { precision = __builtin_va_arg(args, int); ++f; }
-      else while (isdigit((BYTE)*f)) precision = precision * 10 + (*f++ - '0');
-    }
-    for (;; ++f) {      /* size: 1 = h, 2 = hh, 4 = l (32 bit on Windows), 8 = ll, z, j, t, I64 */
-      if (*f == 'h') size = size == 1 ? 2 : 1;
-      else if (*f == 'l') size = size == 4 ? 8 : 4;
-      else if (*f == 'z' || *f == 'j' || *f == 't') size = 8;
-      else if (*f == 'I' && f[1] == '6' && f[2] == '4') { size = 8; f += 2; }
-      else if (*f == 'I' && f[1] == '3' && f[2] == '2') { size = 0; f += 2; }
-      else break;
-    }
-    const char conversion = *f;
-    if (!conversion) break;
-    char text[80];
-    const char *body = text;
-    int length = 0;
-    char sign = 0;
-    const char *digits = "0123456789abcdef";
-    switch (conversion) {
-      case '%': sink_put(&sink, '%'); continue;
-      case 'c': text[0] = (char)__builtin_va_arg(args, int); length = 1; break;
-      case 's': {
-        body = __builtin_va_arg(args, const char *);
-        if (!body) body = "(null)";
-        while (body[length] && (precision < 0 || length < precision)) ++length;
-        break;
-      }
-      case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'p': {
-        unsigned long long value;
-        int is_signed = conversion == 'd' || conversion == 'i';
-        unsigned base = conversion == 'o' ? 8 : (conversion == 'x' || conversion == 'X' || conversion == 'p') ? 16 : 10;
-        if (conversion == 'X') digits = "0123456789ABCDEF";
-        if (conversion == 'p') { value = (unsigned long long)__builtin_va_arg(args, void *); is_signed = 0; if (precision < 0) precision = 16; digits = "0123456789ABCDEF"; }
-        else if (is_signed) {
-          long long v = size == 8 ? __builtin_va_arg(args, long long) : __builtin_va_arg(args, int);
-          if (size == 1) v = (short)v; else if (size == 2) v = (signed char)v;
-          if (v < 0) { sign = '-'; value = (unsigned long long)-v; } else { value = (unsigned long long)v; if (plus) sign = '+'; else if (space) sign = ' '; }
-        } else {
-          value = size == 8 ? __builtin_va_arg(args, unsigned long long) : __builtin_va_arg(args, unsigned int);
-          if (size == 1) value &= 0xFFFF; else if (size == 2) value &= 0xFF;
-        }
-        char reversed[72];
-        int n = 0;
-        do { reversed[n++] = digits[value % base]; value /= base; } while (value);
-        while (precision >= 0 && n < precision && n < 70) reversed[n++] = '0';
-        if (alt && base == 16 && conversion != 'p') { reversed[n++] = conversion; reversed[n++] = '0'; }
-        for (int i = 0; i < n; ++i) text[i] = reversed[n - 1 - i];
-        length = n;
-        if (precision >= 0 && conversion != 'p') zero = 0;
-        break;
-      }
-      default: sink_put(&sink, '%'); sink_put(&sink, conversion); continue;
-    }
-    int pad = width - length - (sign ? 1 : 0);
-    if (!left && !zero) sink_pad(&sink, ' ', pad);
-    if (sign) sink_put(&sink, sign);
-    if (!left && zero && conversion != 's' && conversion != 'c') sink_pad(&sink, '0', pad);
-    for (int i = 0; i < length; ++i) sink_put(&sink, body[i]);
-    if (left) sink_pad(&sink, ' ', pad);
-  }
-  if (capacity) sink.out[sink.length < capacity ? sink.length : capacity - 1] = 0;
-  return (int)sink.length;
-}
-EXPORT int _vsnprintf(char *b, size_t_ n, const char *f, va_list_ a) { return vsnprintf(b, n, f, a); }
+EXPORT int vsnprintf(char *buffer, size_t_ capacity, const char *format, va_list_ args) { return vformat(buffer, capacity, 0, format, args); }
+EXPORT int _vsnprintf(char *b, size_t_ n, const char *f, va_list_ a) { return vformat(b, n, 1, f, a); }
+EXPORT int _vsnwprintf(WCHAR *b, size_t_ n, const WCHAR *f, va_list_ a) { return vformatw(b, n, 1, f, a); }
+EXPORT int _snwprintf(WCHAR *b, size_t_ n, const WCHAR *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vformatw(b, n, 1, f, a); __builtin_va_end(a); return r; }
+EXPORT int swprintf(WCHAR *b, size_t_ n, const WCHAR *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vformatw(b, n, 0, f, a); __builtin_va_end(a); return r < 0 || (size_t_)r >= n ? -1 : r; }
+EXPORT int vswprintf(WCHAR *b, size_t_ n, const WCHAR *f, va_list_ a) { int r = vformatw(b, n, 0, f, a); return r < 0 || (size_t_)r >= n ? -1 : r; }
 EXPORT int vsprintf(char *b, const char *f, va_list_ a) { return vsnprintf(b, (size_t_)-1 >> 1, f, a); }
 EXPORT int snprintf(char *b, size_t_ n, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vsnprintf(b, n, f, a); __builtin_va_end(a); return r; }
-EXPORT int _snprintf(char *b, size_t_ n, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vsnprintf(b, n, f, a); __builtin_va_end(a); return r; }
+EXPORT int _snprintf(char *b, size_t_ n, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vformat(b, n, 1, f, a); __builtin_va_end(a); return r; }
 EXPORT int sprintf(char *b, const char *f, ...) { va_list_ a; __builtin_va_start(a, f); int r = vsnprintf(b, (size_t_)-1 >> 1, f, a); __builtin_va_end(a); return r; }
 
 /* ---- last error, status codes, the process --------------------------------------------------------------------------------------------------------------- */
@@ -353,62 +313,81 @@ EXPORT VOID NTAPI RtlGetNtVersionNumbers(ULONG *major, ULONG *minor, ULONG *buil
   if (build) *build = 19045 | 0xF0000000u;      /* (the top bits say it is a free build) */
 }
 EXPORT ULONGLONG NTAPI VerSetConditionMask(ULONGLONG mask, ULONG type, UCHAR condition) {
-  if (type == 0) return mask;
-  static const ULONG kTypes[] = {1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80};      /* minor, major, build, platform, SP minor, SP major, suite, product type */
-  for (int bit = 0; bit < 8; bit++) {
-    if (!(type & kTypes[bit])) continue;
-    mask &= ~((ULONGLONG)7 << (bit * 3));
-    mask |= (ULONGLONG)(condition & 7) << (bit * 3);
-  }
+  condition &= 7;
+  if (type & 0x80) mask |= (ULONGLONG)condition << 21;      /* VER_PRODUCT_TYPE */
+  else if (type & 0x40) mask |= (ULONGLONG)condition << 18;      /* VER_SUITENAME */
+  else if (type & 0x20) mask |= (ULONGLONG)condition << 15;      /* VER_SERVICEPACKMAJOR */
+  else if (type & 0x10) mask |= (ULONGLONG)condition << 12;      /* VER_SERVICEPACKMINOR */
+  else if (type & 8) mask |= (ULONGLONG)condition << 9;      /* VER_PLATFORMID */
+  else if (type & 4) mask |= (ULONGLONG)condition << 6;      /* VER_BUILDNUMBER */
+  else if (type & 2) mask |= (ULONGLONG)condition << 3;      /* VER_MAJORVERSION */
+  else if (type & 1) mask |= (ULONGLONG)condition;      /* VER_MINORVERSION */
   return mask;
 }
-static BOOLEAN version_compare(ULONG have, ULONG want, UCHAR condition) {
-  switch (condition) {
-    case 1: return have == want;      /* VER_EQUAL */
-    case 2: return have > want;       /* VER_GREATER */
-    case 3: return have >= want;      /* VER_GREATER_EQUAL */
-    case 4: return have < want;       /* VER_LESS */
-    case 5: return have <= want;      /* VER_LESS_EQUAL */
-    default: return FALSE;
+/* The condition of a field of the chain (major, minor, service pack major, service pack minor), given the one before it: an EQUAL before it gives way to the new
+ * condition if that is one of the comparisons, a GREATER or LESS keeps what it said unless the new one is compatible (the way Windows does it). */
+static UCHAR version_update_condition(UCHAR *last, UCHAR condition) {
+  switch (*last) {
+    case 0: *last = condition; break;
+    case 1: if (condition >= 1 && condition <= 5) { *last = condition; return condition; } break;      /* VER_EQUAL */
+    case 2: case 3: if (condition >= 1 && condition <= 3) return condition; break;      /* VER_GREATER, VER_GREATER_EQUAL */
+    case 4: case 5: if (condition == 1 || (condition >= 4 && condition <= 5)) return condition; break;      /* VER_LESS, VER_LESS_EQUAL */
   }
+  if (!condition) *last |= 0x10;
+  return *last & 0xf;
 }
-/* Does this system meet the version asked for? The conditions are three bits per field in `mask`. Major, minor and the service pack numbers are one chain: a later field is
-   looked at only if the earlier one was equal (and its condition allows equality). STATUS_REVISION_MISMATCH if not. */
+static NTSTATUS version_compare_values(ULONG left, ULONG right, UCHAR condition) {
+  switch (condition) {
+    case 1: if (left != right) return STATUS_REVISION_MISMATCH; break;      /* VER_EQUAL */
+    case 2: if (left <= right) return STATUS_REVISION_MISMATCH; break;      /* VER_GREATER */
+    case 3: if (left < right) return STATUS_REVISION_MISMATCH; break;      /* VER_GREATER_EQUAL */
+    case 4: if (left >= right) return STATUS_REVISION_MISMATCH; break;      /* VER_LESS */
+    case 5: if (left > right) return STATUS_REVISION_MISMATCH; break;      /* VER_LESS_EQUAL */
+    default: return STATUS_REVISION_MISMATCH;
+  }
+  return STATUS_SUCCESS;
+}
+/* Does this system meet the version asked for? The conditions are three bits per field in `mask`. (Ported from Wine's version.c.) STATUS_REVISION_MISMATCH if not. */
 EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULONG types, ULONGLONG mask) {
-  RTL_OSVERSIONINFOEXW now;
-  now.dwOSVersionInfoSize = sizeof(now);
-  if (!info || !types) return STATUS_INVALID_PARAMETER;
-  if (!(types & 0xFF)) return STATUS_INVALID_PARAMETER;
-  RtlGetVersion((RTL_OSVERSIONINFOW *)&now);
-  const BOOLEAN extended = TRUE;      /* (the size in the structure is not looked at: the caller is trusted to have room for the fields it asks about) */
-  #define COND(bit) ((UCHAR)((mask >> ((bit) * 3)) & 7))
-  if (types & 0x80) { if (!extended || !version_compare(now.wProductType, info->wProductType, COND(7))) return STATUS_REVISION_MISMATCH; }
+  RTL_OSVERSIONINFOEXW ver;
+  NTSTATUS status;
+  ver.dwOSVersionInfoSize = sizeof(ver);
+  if ((status = RtlGetVersion((RTL_OSVERSIONINFOW *)&ver)) != STATUS_SUCCESS) return status;
+  if (!(types && mask) || !info) return STATUS_INVALID_PARAMETER;
+  if (types & 0x80) { status = version_compare_values(ver.wProductType, info->wProductType, (UCHAR)(mask >> 21 & 7)); if (status != STATUS_SUCCESS) return status; }
   if (types & 0x40) {      /* VER_SUITENAME: VER_AND needs every bit, VER_OR any */
-    const UCHAR c = COND(6);
-    if (!extended) return STATUS_REVISION_MISMATCH;
-    if (c == 6 /* VER_AND */) { if ((info->wSuiteMask & now.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; }
-    else if (c == 7 /* VER_OR */) { if (info->wSuiteMask && !(info->wSuiteMask & now.wSuiteMask)) return STATUS_REVISION_MISMATCH; }      /* (asking for none is met) */
-    else return STATUS_INVALID_PARAMETER;
-  }
-  if ((types & 8) && !version_compare(now.dwPlatformId, info->dwPlatformId, COND(3))) return STATUS_REVISION_MISMATCH;
-  if ((types & 4) && !version_compare(now.dwBuildNumber, info->dwBuildNumber, COND(2))) return STATUS_REVISION_MISMATCH;
-  if (types & 0x33) {
-    /* Major, minor, service pack major and minor are one chain. The first field whose values differ decides. While they are equal the next field is looked at; a condition
-       of EQUAL gives way to the next field's own condition, any other condition carries on to the fields after it. */
-    struct { ULONG bit_type; int bit; ULONG have, want; } chain[4] = {
-      {2, 1, now.dwMajorVersion, info->dwMajorVersion}, {1, 0, now.dwMinorVersion, info->dwMinorVersion},
-      {0x20, 5, now.wServicePackMajor, extended ? info->wServicePackMajor : 0}, {0x10, 4, now.wServicePackMinor, extended ? info->wServicePackMinor : 0}};
-    UCHAR c = 0;
-    BOOLEAN have_condition = FALSE, result = TRUE;
-    for (int i = 0; i < 4; i++) {
-      if (!(types & chain[i].bit_type)) continue;
-      if (!have_condition || c == 1) { c = COND(chain[i].bit); have_condition = TRUE; }
-      result = version_compare(chain[i].have, chain[i].want, c);
-      if (chain[i].have != chain[i].want) break;
+    switch (mask >> 18 & 7) {
+      case 6: if ((info->wSuiteMask & ver.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; break;
+      case 7: if (!(info->wSuiteMask & ver.wSuiteMask) && info->wSuiteMask) return STATUS_REVISION_MISMATCH; break;
+      default: return STATUS_INVALID_PARAMETER;
     }
-    if (!result) return STATUS_REVISION_MISMATCH;
   }
-  #undef COND
+  if (types & 8) { status = version_compare_values(ver.dwPlatformId, info->dwPlatformId, (UCHAR)(mask >> 9 & 7)); if (status != STATUS_SUCCESS) return status; }
+  if (types & 4) { status = version_compare_values(ver.dwBuildNumber, info->dwBuildNumber, (UCHAR)(mask >> 6 & 7)); if (status != STATUS_SUCCESS) return status; }
+  if (types & (2 | 1 | 0x20 | 0x10)) {
+    UCHAR condition, last_condition = 0;
+    BOOLEAN do_next_check = TRUE;
+    if (types & 2) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask >> 3 & 7));
+      status = version_compare_values(ver.dwMajorVersion, info->dwMajorVersion, condition);
+      do_next_check = ver.dwMajorVersion == info->dwMajorVersion && condition >= 1 && condition <= 5;
+    }
+    if ((types & 1) && do_next_check) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask & 7));
+      status = version_compare_values(ver.dwMinorVersion, info->dwMinorVersion, condition);
+      do_next_check = ver.dwMinorVersion == info->dwMinorVersion && condition >= 1 && condition <= 5;
+    }
+    if ((types & 0x20) && do_next_check) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask >> 15 & 7));
+      status = version_compare_values(ver.wServicePackMajor, info->wServicePackMajor, condition);
+      do_next_check = ver.wServicePackMajor == info->wServicePackMajor && condition >= 1 && condition <= 5;
+    }
+    if ((types & 0x10) && do_next_check) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask >> 12 & 7));
+      status = version_compare_values(ver.wServicePackMinor, info->wServicePackMinor, condition);
+    }
+    if (status != STATUS_SUCCESS) return status;
+  }
   return STATUS_SUCCESS;
 }
 
@@ -456,12 +435,11 @@ static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->Im
 
 #define LDRP_MAPPED_ONLY 0x80000000u      /* loaded with DONT_RESOLVE_DLL_REFERENCES: no imports, no thread-local data, no entry point */
 #define LDRP_PROCESS_DETACH_CALLED 0x00080000u      /* the library has been told the process (or its use of it) ends: once only */
-/* The entry point of a library that is being attached runs under a guard: a fault nobody handles ends the call (the library failed to start) instead of the process. */
+/* The entry point of a library runs under a guard (whatever it is told, as it is by the loader of Windows): a fault nobody handles ends the call (the library failed to start) instead of the process. */
 static void **volatile g_init_guard;
 static volatile PVOID g_init_guard_teb;
 static BOOL call_library_entry(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
   BOOL (WINAPI *entry)(PVOID, DWORD, PVOID) = (BOOL (WINAPI *)(PVOID, DWORD, PVOID))m->EntryPoint;
-  if (reason != DLL_PROCESS_ATTACH) return entry(m->DllBase, reason, reserved);
   void *buffer[5];
   void **const outer = g_init_guard;
   PVOID const outer_teb = g_init_guard_teb;
@@ -519,6 +497,7 @@ static void notify_all_modules(DWORD reason, PVOID reserved, int forward) {
 }
 
 static volatile LONG g_process_ending;
+static volatile LONG g_cs_taken_over;      /* a section its owner died holding was taken over while the process ended */
 static void fls_destroy_current(int free_structure);
 static volatile LONG g_heap_lock;
 static volatile LONG g_fls_lock;
@@ -557,8 +536,9 @@ EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
   for (;;) NtTerminateProcess(NtCurrentProcess(), status);
 }
 
-/* Is the process shutting down (ExitProcess has begun to tell the libraries)? */
-EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0; }
+/* Is the process shutting down (ExitProcess has begun to tell the libraries)? Windows answers FALSE once a library's detach has had to take over a section that a
+ * terminated thread still held (the loader test's phase 7), so that is what a takeover does here too. */
+EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0 && !g_cs_taken_over; }
 
 /* The thread ends (the libraries and the program are told); the process ends with its last thread. */
 EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
@@ -604,10 +584,107 @@ static ULONG run_apcs(void) {
   return count;
 }
 EXPORT NTSTATUS NTAPI NtTestAlert(void) { run_apcs(); return STATUS_SUCCESS; }
+/* The handles of the input of a console are ready when the console has input waiting, which only kernel32.dll (that keeps the console) can say: it tells ntdll.dll which handles those are
+ * and how to ask. */
+static BOOL (*g_console_wait_handle)(HANDLE h);
+static BOOL (*g_console_wait_ready)(void);
+EXPORT void NTAPI RtlTcosSetConsoleWait(BOOL (*handle)(HANDLE), BOOL (*ready)(void)) { g_console_wait_handle = handle; g_console_wait_ready = ready; }
 EXPORT NTSTATUS NTAPI NtWaitForSingleObject(HANDLE h, BOOLEAN alertable, PLARGE_INTEGER timeout) {
+  if (g_console_wait_handle && g_console_wait_handle(h)) {
+    LONGLONG left = timeout ? timeout->QuadPart : 0;
+    if (timeout && left > 0) { LARGE_INTEGER now; NtQuerySystemTime(&now); left = now.QuadPart >= left ? 0 : -(left - now.QuadPart); }      /* (absolute: the time left) */
+    for (;;) {
+      if (g_console_wait_ready()) return STATUS_SUCCESS;
+      if (timeout && left >= 0) return (NTSTATUS)0x102;
+      LARGE_INTEGER step;
+      step.QuadPart = -50000;      /* 5 ms */
+      NtDelayExecution(alertable, &step);
+      if (timeout) left += 50000;
+    }
+  }
   const NTSTATUS status = RawNtWaitForSingleObject(h, alertable, timeout);
   if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
+}
+/* ---- console handles without a screen buffer ---------------------------------------------------------------------------------------------------------------- *
+ * "\Device\ConDrv\Input" and "\Output" (and CurrentIn, CurrentOut, "\??\CONIN$", "\??\CONOUT$") open a handle to the console of the process that is not bound to a screen buffer or to the
+ * standard handles. Here it is a named event (TcosConI_ or TcosConO_, the console, the process, a number): whoever owns the console sets it while the console has input waiting, and
+ * the name says what the handle is to any process it was duplicated into. kernel32.dll keeps the state; the handles made are listed here so that it finds them. */
+typedef struct { HANDLE handle; ULONG_PTR console; LONG kind; } ConEvent;      /* kind: 1 input, 2 output */
+#define CON_EVENTS 64
+static ConEvent g_con_events[CON_EVENTS];
+static volatile LONG g_con_event_lock, g_con_event_serial;
+static void con_event_lock(void) { while (__sync_lock_test_and_set(&g_con_event_lock, 1)) NtYieldExecution(); }
+static void con_event_unlock(void) { __sync_lock_release(&g_con_event_lock); }
+EXPORT void NTAPI RtlTcosConsoleEventNote(HANDLE h, ULONG_PTR console, LONG kind) {
+  con_event_lock();
+  int free_at = -1;
+  for (int i = 0; i < CON_EVENTS; ++i) {
+    if (g_con_events[i].handle == h) { free_at = i; break; }
+    if (!g_con_events[i].handle && free_at < 0) free_at = i;
+  }
+  if (free_at >= 0) { g_con_events[free_at].handle = h; g_con_events[free_at].console = console; g_con_events[free_at].kind = kind; }
+  con_event_unlock();
+}
+EXPORT void NTAPI RtlTcosConsoleEventForget(HANDLE h) {
+  con_event_lock();
+  for (int i = 0; i < CON_EVENTS; ++i) if (g_con_events[i].handle == h) g_con_events[i].handle = NULL;
+  con_event_unlock();
+}
+EXPORT int NTAPI RtlTcosConsoleEvents(ConEvent *out, int max) {
+  int n = 0;
+  con_event_lock();
+  for (int i = 0; i < CON_EVENTS && (!out || n < max); ++i) if (g_con_events[i].handle) { if (out) out[n] = g_con_events[i]; ++n; }      /* (no buffer: only how many) */
+  con_event_unlock();
+  return n;
+}
+static BOOL console_device_name(const UNICODE_STRING *name, LONG *kind) {
+  static const WCHAR *const names[] = {L"\\Device\\ConDrv\\Input", L"\\Device\\ConDrv\\CurrentIn", L"\\??\\CONIN$", L"\\Device\\ConDrv\\Output", L"\\Device\\ConDrv\\CurrentOut", L"\\??\\CONOUT$"};
+  if (!name || !name->Buffer) return FALSE;
+  for (int i = 0; i < 6; ++i) {
+    const WCHAR *t = names[i];
+    ULONG k = 0;
+    for (; t[k] && k < name->Length / 2; ++k) {
+      WCHAR a = name->Buffer[k], b = t[k];
+      if (a >= 'a' && a <= 'z') a = (WCHAR)(a - 32);
+      if (b >= 'a' && b <= 'z') b = (WCHAR)(b - 32);
+      if (a != b) break;
+    }
+    if (!t[k] && k == name->Length / 2) { *kind = i < 3 ? 1 : 2; return TRUE; }
+  }
+  return FALSE;
+}
+extern NTSTATUS NTAPI RawNtCreateFile(PHANDLE, ULONG, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+EXPORT NTSTATUS NTAPI NtCreateFile(PHANDLE handle, ULONG access, POBJECT_ATTRIBUTES attributes, PIO_STATUS_BLOCK iosb, PLARGE_INTEGER size, ULONG file_attributes, ULONG share, ULONG disposition,
+                                   ULONG options, PVOID ea, ULONG ea_length) {
+  LONG kind;
+  if (attributes && attributes->Length >= sizeof(OBJECT_ATTRIBUTES) && !attributes->RootDirectory && handle && iosb && console_device_name(attributes->ObjectName, &kind)) {
+    const ULONG_PTR console = (ULONG_PTR)NtCurrentPeb()->ProcessParameters->ConsoleHandle;
+    if (!console) return STATUS_INVALID_HANDLE;      /* (there is nothing to open without a console) */
+    static const WCHAR hex[] = L"0123456789abcdef";
+    WCHAR text[96] = L"\\BaseNamedObjects\\TcosConX_";
+    int n = 0;
+    while (text[n]) ++n;
+    text[n - 2] = kind == 1 ? 'I' : 'O';
+    for (int shift = 60; shift >= 0; shift -= 4) text[n++] = hex[(console >> shift) & 15];
+    text[n++] = '_';
+    const ULONG_PTR pid = TEB_CLIENT_PROCESS(NtCurrentTeb()), serial = (ULONG_PTR)__sync_add_and_fetch(&g_con_event_serial, 1);
+    for (int shift = 28; shift >= 0; shift -= 4) text[n++] = hex[(pid >> shift) & 15];
+    text[n++] = '_';
+    for (int shift = 12; shift >= 0; shift -= 4) text[n++] = hex[(serial >> shift) & 15];
+    text[n] = 0;
+    UNICODE_STRING name = { (USHORT)(n * 2), (USHORT)(n * 2 + 2), text };
+    OBJECT_ATTRIBUTES oa = { sizeof(oa), NULL, &name, (attributes->Attributes & 2) | 0x40, NULL, NULL };
+    HANDLE event = NULL;
+    const NTSTATUS made = NtCreateEvent(&event, 0x1F0003, &oa, 0 /* NotificationEvent */, FALSE);
+    if (!NT_SUCCESS(made)) return made;
+    RtlTcosConsoleEventNote(event, console, kind);
+    *handle = event;
+    iosb->Status = STATUS_SUCCESS;
+    iosb->Information = 1;      /* FILE_OPENED */
+    return STATUS_SUCCESS;
+  }
+  return RawNtCreateFile(handle, access, attributes, iosb, size, file_attributes, share, disposition, options, ea, ea_length);
 }
 EXPORT NTSTATUS NTAPI NtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtWaitForMultipleObjects(count, handles, type, alertable, timeout);
@@ -665,7 +742,7 @@ static ULONG utf8_next(const BYTE *s, ULONG n, ULONG *used) {
   return cp;
 }
 
-EXPORT NTSTATUS NTAPI RtlUTF8ToUnicodeN(PWSTR dest, ULONG dest_bytes, PULONG written, const char *src, ULONG src_bytes) {
+static NTSTATUS utf8_to_unicode_old(PWSTR dest, ULONG dest_bytes, PULONG written, const char *src, ULONG src_bytes) {
   ULONG units = 0;      /* what the whole source needs */
   ULONG out = 0;
   for (ULONG i = 0; i < src_bytes;) {
@@ -683,10 +760,10 @@ EXPORT NTSTATUS NTAPI RtlUTF8ToUnicodeN(PWSTR dest, ULONG dest_bytes, PULONG wri
   if (written) *written = dest ? out : units * 2;
   return dest && units * 2 > dest_bytes ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
 }
-EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeN(PWSTR d, ULONG db, PULONG w, const char *s, ULONG sb) { return RtlUTF8ToUnicodeN(d, db, w, s, sb); }
-EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeSize(PULONG size, const char *s, ULONG sb) { return RtlUTF8ToUnicodeN(NULL, 0, size, s, sb); }
+EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeN(PWSTR d, ULONG db, PULONG w, const char *s, ULONG sb) { return utf8_to_unicode_old(d, db, w, s, sb); }
+EXPORT NTSTATUS NTAPI RtlMultiByteToUnicodeSize(PULONG size, const char *s, ULONG sb) { return utf8_to_unicode_old(NULL, 0, size, s, sb); }
 
-EXPORT NTSTATUS NTAPI RtlUnicodeToUTF8N(char *dest, ULONG dest_bytes, PULONG written, PCWSTR src, ULONG src_bytes) {
+static NTSTATUS unicode_to_utf8_old(char *dest, ULONG dest_bytes, PULONG written, PCWSTR src, ULONG src_bytes) {
   ULONG needed = 0, out = 0;
   const ULONG count = src_bytes / 2;
   for (ULONG i = 0; i < count; ++i) {
@@ -705,8 +782,87 @@ EXPORT NTSTATUS NTAPI RtlUnicodeToUTF8N(char *dest, ULONG dest_bytes, PULONG wri
   if (written) *written = dest ? out : needed;
   return dest && needed > dest_bytes ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
 }
-EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteN(char *d, ULONG db, PULONG w, PCWSTR s, ULONG sb) { return RtlUnicodeToUTF8N(d, db, w, s, sb); }
-EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteSize(PULONG size, PCWSTR s, ULONG sb) { return RtlUnicodeToUTF8N(NULL, 0, size, s, sb); }
+
+/* The next code point of UTF-8 text for RtlUTF8ToUnicodeN: *used bytes make up what is returned, and an invalid sequence is U+FFFD with *bad set. A lead byte
+   that can start no sequence is one U+FFFD; a lead followed by a continuation byte its range does not allow is one U+FFFD for the two; a valid beginning that
+   stops early is one U+FFFD for all of it. */
+static ULONG utf8_decode(const BYTE *s, ULONG n, ULONG *used, int *bad) {
+  const BYTE b = s[0];
+  if (b < 0x80) { *used = 1; return b; }
+  ULONG extra = 0, low = 0x80, high = 0xBF, cp = 0;
+  if (b >= 0xC2 && b <= 0xDF) { extra = 1; cp = b & 0x1F; }
+  else if (b >= 0xE0 && b <= 0xEF) { extra = 2; cp = b & 0x0F; if (b == 0xE0) low = 0xA0; if (b == 0xED) high = 0x9F; }
+  else if (b >= 0xF0 && b <= 0xF4) { extra = 3; cp = b & 0x07; if (b == 0xF0) low = 0x90; if (b == 0xF4) high = 0x8F; }
+  else { *used = 1; *bad = 1; return 0xFFFD; }
+  ULONG k = 1;
+  for (; k <= extra; ++k) {
+    if (k >= n) break;      /* (the text ends inside the sequence) */
+    const BYTE c = s[k];
+    if (c < (k == 1 ? low : 0x80) || c > (k == 1 ? high : 0xBF)) {
+      if ((c & 0xC0) == 0x80 && k == 1) ++k;      /* (a continuation byte that the lead does not take goes with it) */
+      break;
+    }
+    cp = (cp << 6) | (c & 0x3F);
+  }
+  if (k <= extra) { *used = k; *bad = 1; return 0xFFFD; }
+  *used = extra + 1;
+  return cp;
+}
+EXPORT NTSTATUS NTAPI RtlUTF8ToUnicodeN(PWSTR dest, ULONG dest_bytes, PULONG written, const char *src, ULONG src_bytes) {
+  if (!src) return 0xC00000F2;      /* STATUS_INVALID_PARAMETER_4 */
+  if (!written) return 0xC000000D;
+  ULONG units = 0;
+  int bad = 0, cut = 0;
+  for (ULONG i = 0; i < src_bytes;) {
+    ULONG used;
+    const ULONG cp = utf8_decode((const BYTE *)src + i, src_bytes - i, &used, &bad);
+    i += used;
+    ULONG pair[2];
+    ULONG count = 1;
+    if (cp >= 0x10000) { pair[0] = 0xD800 + ((cp - 0x10000) >> 10); pair[1] = 0xDC00 + ((cp - 0x10000) & 0x3FF); count = 2; }
+    else pair[0] = cp;
+    for (ULONG k = 0; k < count; ++k) {
+      if (dest) {
+        if ((units + 1) * 2 > dest_bytes) { cut = 1; break; }
+        dest[units] = (WCHAR)pair[k];
+      }
+      ++units;
+    }
+    if (cut) break;
+  }
+  *written = units * 2;
+  if (cut) return 0xC0000023u;
+  return bad ? 0x00000107u : STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlUnicodeToUTF8N(char *dest, ULONG dest_bytes, PULONG written, PCWSTR src, ULONG src_bytes) {
+  if (!src) return 0xC00000F2;
+  if (!written) return 0xC000000D;
+  if (dest && (src_bytes & 1)) return 0xC00000F3;      /* STATUS_INVALID_PARAMETER_5 (only when there is something to write to) */
+  ULONG out = 0;
+  int bad = 0, cut = 0;
+  const ULONG count = src_bytes / 2;
+  for (ULONG i = 0; i < count && !cut; ++i) {
+    ULONG cp = src[i];
+    if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < count && src[i + 1] >= 0xDC00 && src[i + 1] < 0xE000) { cp = 0x10000 + ((cp - 0xD800) << 10) + (src[i + 1] - 0xDC00); ++i; }
+    else if (cp >= 0xD800 && cp < 0xE000) { cp = 0xFFFD; bad = 1; }
+    BYTE encoded[4];
+    ULONG n;
+    if (cp < 0x80) { encoded[0] = (BYTE)cp; n = 1; }
+    else if (cp < 0x800) { encoded[0] = (BYTE)(0xC0 | (cp >> 6)); encoded[1] = (BYTE)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) { encoded[0] = (BYTE)(0xE0 | (cp >> 12)); encoded[1] = (BYTE)(0x80 | ((cp >> 6) & 0x3F)); encoded[2] = (BYTE)(0x80 | (cp & 0x3F)); n = 3; }
+    else { encoded[0] = (BYTE)(0xF0 | (cp >> 18)); encoded[1] = (BYTE)(0x80 | ((cp >> 12) & 0x3F)); encoded[2] = (BYTE)(0x80 | ((cp >> 6) & 0x3F)); encoded[3] = (BYTE)(0x80 | (cp & 0x3F)); n = 4; }
+    if (dest) {
+      if (n > dest_bytes - out) { cut = 1; break; }
+      for (ULONG k = 0; k < n; ++k) dest[out + k] = (char)encoded[k];
+    }
+    out += n;
+  }
+  *written = out;
+  if (cut) return 0xC0000023u;
+  return bad ? 0x00000107u : STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteN(char *d, ULONG db, PULONG w, PCWSTR s, ULONG sb) { return unicode_to_utf8_old(d, db, w, s, sb); }
+EXPORT NTSTATUS NTAPI RtlUnicodeToMultiByteSize(PULONG size, PCWSTR s, ULONG sb) { return unicode_to_utf8_old(NULL, 0, size, s, sb); }
 
 /* ---- the heap ------------------------------------------------------------------------------------------------------------------------------------------ */
 
@@ -773,6 +929,8 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "rtl.inc"
 #include "libc.inc"
 #include "rtl2.inc"
+#include "rtl3.inc"
+#include "sec.inc"
 #include "uilang.inc"
 #include "normalize.inc"
 #include "reg.inc"
@@ -801,20 +959,19 @@ EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION cs, U
 }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION cs) { return RtlInitializeCriticalSectionEx(cs, 0, 0); }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION cs, ULONG spin) { return RtlInitializeCriticalSectionEx(cs, spin, 0); }
-/* LockCount is -1 while the section is free, and the recursion depth minus one while a thread holds it. A thread that finds it taken gives its time slice away until the owner
+/* LockCount is -1 while the section is free and -2 while a thread holds it (the recursion depth is the RecursionCount; a thread waiting adds 4 to its distance from -1). A thread that finds it taken gives its time slice away until the owner
  * has let go. */
 EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
   const HANDLE me = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
   if (cs->OwningThread == me && cs->RecursionCount > 0) {      /* (only the owner can see itself here) */
     ++cs->RecursionCount;
-    ++cs->LockCount;
     return STATUS_SUCCESS;
   }
-  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) {
-    if (g_process_ending) { cs->LockCount = 0; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
+  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, -2)) {
+    if (g_process_ending) { g_cs_taken_over = 1; cs->LockCount = -2; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
     if (cs->LockSemaphore) {      /* a section somebody gave a semaphore: the wait is on it, and a handle that is not one is an error that cannot be carried on from */
       LARGE_INTEGER none = { 0 };
-      __sync_add_and_fetch(&cs->LockCount, 1);
+      __sync_sub_and_fetch(&cs->LockCount, 4);
       if (NtWaitForSingleObject(cs->LockSemaphore, FALSE, &none) == STATUS_INVALID_HANDLE) {
         EXCEPTION_RECORD record;
         memset(&record, 0, sizeof(record));
@@ -822,7 +979,7 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
         record.ExceptionFlags = 1 /* EXCEPTION_NONCONTINUABLE */;
         RtlRaiseException(&record);
       }
-      __sync_sub_and_fetch(&cs->LockCount, 1);
+      __sync_add_and_fetch(&cs->LockCount, 4);
     }
     NtYieldExecution();
   }
@@ -832,15 +989,15 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
 }
 EXPORT BOOLEAN NTAPI RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
   const HANDLE me = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
-  if (cs->OwningThread == me && cs->RecursionCount > 0) { ++cs->RecursionCount; ++cs->LockCount; return TRUE; }
-  if (!__sync_bool_compare_and_swap(&cs->LockCount, -1, 0)) return FALSE;
+  if (cs->OwningThread == me && cs->RecursionCount > 0) { ++cs->RecursionCount; return TRUE; }
+  if (!__sync_bool_compare_and_swap(&cs->LockCount, -1, -2)) return FALSE;
   cs->OwningThread = me;
   cs->RecursionCount = 1;
   return TRUE;
 }
 EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs) {
-  if (cs->RecursionCount <= 0) return STATUS_SUCCESS;
-  if (--cs->RecursionCount > 0) { --cs->LockCount; return STATUS_SUCCESS; }
+  if (cs->RecursionCount <= 0) { --cs->RecursionCount; return STATUS_SUCCESS; }      /* (a section that is not held: the count goes below zero, the lock stays as it is) */
+  if (--cs->RecursionCount > 0) return STATUS_SUCCESS;
   cs->OwningThread = NULL;
   __sync_lock_test_and_set(&cs->LockCount, -1);
   return STATUS_SUCCESS;
@@ -858,7 +1015,6 @@ EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) {
 
 #include "except.inc"
 #include "actctx.inc"
-EXPORT ULONG DbgPrint(const char *format, ...) { (void)format; return 0; }
 /* SSE and SSE2 are there (PF_XMMI_INSTRUCTIONS_AVAILABLE = 6, PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10); nothing newer is reported. */
 EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return feature == 6 || feature == 10; }
 
@@ -876,6 +1032,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB *peb = NtCurrentPeb();
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
+  relocate_process_parameters();
   reset_floating_point();
   fls_thread_begins();
   act_init_process();
@@ -1064,8 +1221,10 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
   }
   ULONG attached = 0;
   if (listed == count) {
-    for (; attached < count; ++attached) if (!notify_module(added[attached], DLL_PROCESS_ATTACH, NULL)) break;
-    if (attached == count) for (ULONG i = 0; i < count; ++i) notify_dll_event(1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */, added[i]);
+    for (; attached < count; ++attached) {
+      notify_dll_event(1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */, added[attached]);      /* (before the entry point, which the callback may replace) */
+      if (!notify_module(added[attached], DLL_PROCESS_ATTACH, NULL)) break;
+    }
   }
   if (listed == count && attached == count) {
     *handle = base;
@@ -1073,7 +1232,7 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
     return STATUS_SUCCESS;
   }
   /* it did not start: the libraries that did are told, then everything goes again */
-  for (ULONG i = attached; i > 0; --i) notify_module(added[i - 1], DLL_PROCESS_DETACH, NULL);
+  for (ULONG i = attached < listed ? attached + 1 : attached; i > 0; --i) notify_module(added[i - 1], DLL_PROCESS_DETACH, NULL);      /* (the one that refused is told as well) */
   ldr_release(base, 0);
   loader_unlock();
   return listed == count ? STATUS_DLL_INIT_FAILED : STATUS_NO_MEMORY;
@@ -1126,26 +1285,79 @@ EXPORT NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie) {
   g_user_dll_dirs[i - 1].used = FALSE;
   return STATUS_SUCCESS;
 }
-/* The folders a set of LOAD_LIBRARY_SEARCH_* flags names, separated by ';' (application 0x200, System32 0x800; the user folders belong to kernel32). */
-static BOOLEAN search_flags_path(ULONG flags, WCHAR *out, SIZE_T capacity) {
-  static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+/* ---- the DLL search path ---------------------------------------------------------------------------------------------------------------------------------- */
+
+static const WCHAR kSystemDir[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
+static const WCHAR kSystemPath[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', ';', 'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', ';',
+                                    'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', 0};
+static LONG g_path_safe_mode;      /* RtlSetSearchPathMode: 0 the current folder comes first, 1 it comes after the system folders, 2 that for good */
+static ULONG g_default_search_flags;      /* LdrSetDefaultDllDirectories */
+
+static SIZE_T text_length(const WCHAR *s) { SIZE_T n = 0; while (s[n]) ++n; return n; }
+/* The end of the folder part of a module path: "C:\dir\file" gives "C:\dir", "C:\file" gives "C:\", "C:file" gives "C:". */
+static SIZE_T module_path_end(const WCHAR *module) {
+  SIZE_T end = 0;
+  for (SIZE_T i = 0; module[i]; ++i) if (module[i] == '\\' || module[i] == '/') end = i;
+  if (end == 2 && module[1] == ':') ++end;
+  if (end == 0 && module[0] && module[1] == ':') end = 2;
+  return end;
+}
+static WCHAR *append_path(WCHAR *p, const WCHAR *text, SIZE_T length) {
+  if (!length) return p;
+  for (SIZE_T i = 0; i < length; ++i) p[i] = text[i];
+  p[length] = ';';
+  return p + length + 1;
+}
+static const WCHAR *image_path_name(void) {
+  const BYTE *params = *(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20);
+  return ((const UNICODE_STRING *)(params + 0x60))->Buffer;
+}
+/* module folder; dll_dir or the current folder; the system folders; PATH (with the current folder before it in safe mode). The result is from the process heap. */
+static NTSTATUS get_dll_load_path(const WCHAR *module, const WCHAR *dll_dir, LONG safe_mode, PWSTR *path) {
+  static const WCHAR kPath[] = {'P', 'A', 'T', 'H', 0};
+  UNICODE_STRING name = { 8, 10, (PWSTR)kPath }, value = { 0, 0, NULL };
+  SIZE_T module_chars = module ? module_path_end(module) : 0;
+  SIZE_T path_bytes = 0;
+  if (RtlQueryEnvironmentVariable_U(NULL, &name, &value) == STATUS_BUFFER_TOO_SMALL_) path_bytes = value.Length;
+  const SIZE_T total = (text_length(kSystemPath) + 1) + module_chars + 1 + (dll_dir ? text_length(dll_dir) + 1 : 2) + 2 + path_bytes / 2 + 2;
+  WCHAR *result = RtlAllocateHeap(process_heap(), 0, total * 2), *p = result;
+  if (!result) return STATUS_NO_MEMORY;
+  if (module) p = append_path(p, module, module_chars);
+  if (dll_dir) p = append_path(p, dll_dir, text_length(dll_dir));
+  else if (!safe_mode) p = append_path(p, (const WCHAR *)L".", 1);
+  p = append_path(p, kSystemPath, text_length(kSystemPath));
+  if (!dll_dir && safe_mode) p = append_path(p, (const WCHAR *)L".", 1);
+  value.Buffer = p;
+  value.MaximumLength = (USHORT)(path_bytes > 0xFFFC ? 0xFFFC : path_bytes);
+  value.Length = 0;
+  if (path_bytes && RtlQueryEnvironmentVariable_U(NULL, &name, &value) == STATUS_SUCCESS) p[value.Length / 2] = 0;
+  else *p = 0;
+  *path = result;
+  return STATUS_SUCCESS;
+}
+/* The folders a set of LOAD_LIBRARY_SEARCH_* flags names, separated by ';': the folder of `module` (0x100), of the program (0x200), the user folders (0x400, AddDllDirectory in
+ * the order of the newest first, then SetDllDirectory's), System32 (0x800). */
+static NTSTATUS search_flags_path(const WCHAR *module, ULONG flags, WCHAR *out, SIZE_T capacity) {
   SIZE_T n = 0;
   out[0] = 0;
   if (flags & 0x1000) flags |= 0xE00;      /* LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: application, user and System32 folders */
-  if (flags & 0x200) {      /* the folder of the program: ImagePathName of the process parameters, without the file */
-    const UNICODE_STRING *image = (const UNICODE_STRING *)(*(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20) + 0x60);
-    SIZE_T length = image->Length / 2;
-    while (length > 0 && image->Buffer[length - 1] != '\\') --length;
-    if (length > 1 && length < capacity) {
-      for (SIZE_T i = 0; i + 1 < length; ++i) out[n++] = image->Buffer[i];
-      out[n++] = ';';
-    }
+  if (flags & 0x100) {
+    if (!module) return STATUS_INVALID_PARAMETER;
+    const ULONG type = RtlDetermineDosPathNameType_U(module);
+    if (type != 2 && type != 4 && type != 6 && type != 1) return STATUS_INVALID_PARAMETER;      /* drive absolute, rooted, local device, UNC */
+    const SIZE_T end = module_path_end(module);
+    if (end + 2 > capacity) return STATUS_NAME_TOO_LONG_;
+    for (SIZE_T i = 0; i < end; ++i) out[n++] = module[i];
+    if (end) out[n++] = ';';
   }
-  if (flags & 0x800) {
-    for (SIZE_T i = 0; system32[i] && n + 1 < capacity; ++i) out[n++] = system32[i];
-    out[n++] = ';';
+  if (flags & 0x200) {
+    const WCHAR *image = image_path_name();
+    const SIZE_T end = module_path_end(image);
+    if (n + end + 2 > capacity) return STATUS_NAME_TOO_LONG_;
+    for (SIZE_T i = 0; i < end; ++i) out[n++] = image[i];
+    if (end) out[n++] = ';';
   }
-  if (flags & 0x400) {      /* the folders AddDllDirectory added, the newest first, then the one SetDllDirectory named */
+  if (flags & 0x400) {
     BOOLEAN done[MAX_USER_DLL_DIRS] = {0};
     for (;;) {
       int best = -1;
@@ -1158,25 +1370,78 @@ static BOOLEAN search_flags_path(ULONG flags, WCHAR *out, SIZE_T capacity) {
     for (SIZE_T i = 0; i < g_dll_directory_chars && n + 2 < capacity; ++i) out[n++] = g_dll_directory_text[i];
     if (g_dll_directory_chars) out[n++] = ';';
   }
+  if (flags & 0x800) {
+    for (SIZE_T i = 0; kSystemDir[i] && n + 2 < capacity; ++i) out[n++] = kSystemDir[i];
+    out[n++] = ';';
+  }
   if (n > 0) --n;
   out[n] = 0;
-  return TRUE;
-}
-EXPORT ULONG NTAPI RtlGetFullPathName_U(PCWSTR name, ULONG size, PWSTR buffer, PWSTR *file_part);
-EXPORT NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused) {
-  (void)name;
-  WCHAR text[1040];
-  if ((flags & 8) && (flags & 0x1F00)) return STATUS_INVALID_PARAMETER;
-  search_flags_path(flags ? flags : 0xA00, text, 1040);
-  SIZE_T n = 0;
-  while (text[n]) ++n;
-  PWSTR copy = RtlAllocateHeap(process_heap(), 0, (n + 1) * 2);
-  if (!copy) return STATUS_NO_MEMORY;
-  for (SIZE_T i = 0; i <= n; ++i) copy[i] = text[i];
-  *path = copy;
-  if (unused) *unused = NULL;
   return STATUS_SUCCESS;
 }
+EXPORT ULONG NTAPI RtlGetFullPathName_U(PCWSTR name, ULONG size, PWSTR buffer, PWSTR *file_part);
+EXPORT NTSTATUS NTAPI LdrSetDefaultDllDirectories(ULONG flags) {
+  if (!flags || (flags & ~0x1F00u) || (flags & 0x100)) return STATUS_INVALID_PARAMETER;
+  g_default_search_flags = flags;
+  return STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI LdrGetDllPath(PCWSTR module, ULONG flags, PWSTR *path, PWSTR *unused) {
+  const ULONG search_flags = 0x100 | 0x200 | 0x400 | 0x800 | 0x1000;
+  if (unused) *unused = NULL;
+  if (flags & 8) {      /* LOAD_WITH_ALTERED_SEARCH_PATH */
+    if (flags & search_flags) return STATUS_INVALID_PARAMETER;
+    if (g_default_search_flags) flags |= g_default_search_flags | 0x100;
+  } else if (!(flags & search_flags)) flags |= g_default_search_flags;
+  if (flags & search_flags) {
+    WCHAR text[1040];
+    const NTSTATUS status = search_flags_path(module, flags, text, 1040);
+    if (!NT_SUCCESS(status)) return status;
+    const SIZE_T n = text_length(text);
+    PWSTR copy = RtlAllocateHeap(process_heap(), 0, (n + 1) * 2);
+    if (!copy) return STATUS_NO_MEMORY;
+    for (SIZE_T i = 0; i <= n; ++i) copy[i] = text[i];
+    *path = copy;
+    return STATUS_SUCCESS;
+  }
+  WCHAR dll_directory[520];
+  const WCHAR *dll_dir = NULL;
+  if (g_dll_directory_chars) {
+    for (USHORT i = 0; i <= g_dll_directory_chars; ++i) dll_directory[i] = g_dll_directory_text[i];
+    dll_dir = dll_directory;
+  }
+  const WCHAR *from = module;
+  BOOLEAN has_backslash = FALSE;
+  if (module) for (const WCHAR *c = module; *c; ++c) if (*c == '\\') has_backslash = TRUE;
+  if (!(flags & 8) || !has_backslash) from = image_path_name();
+  return get_dll_load_path(from, dll_dir, 1, path);
+}
+EXPORT NTSTATUS NTAPI RtlSetSearchPathMode(ULONG flags) {
+  LONG value;
+  switch (flags) {
+    case 1: value = 1; break;      /* BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE */
+    case 0x10000: value = 0; break;      /* BASE_SEARCH_PATH_DISABLE_SAFE_SEARCHMODE */
+    case 1 | 0x8000: __sync_lock_test_and_set(&g_path_safe_mode, 2); return STATUS_SUCCESS;      /* ... and for good */
+    default: return STATUS_INVALID_PARAMETER;
+  }
+  for (;;) {
+    const LONG previous = g_path_safe_mode;
+    if (previous == 2) break;
+    if (__sync_val_compare_and_swap(&g_path_safe_mode, previous, value) == previous) return STATUS_SUCCESS;
+  }
+  return STATUS_ACCESS_DENIED;
+}
+/* The folders an executable is looked for in: the program's, the current folder unless NoDefaultCurrentDirectoryInExePath is set (and the name has no path), the system ones, PATH. */
+EXPORT NTSTATUS NTAPI RtlGetExePath(PCWSTR name, PWSTR *path) {
+  static const WCHAR kNoDefault[] = {'N', 'o', 'D', 'e', 'f', 'a', 'u', 'l', 't', 'C', 'u', 'r', 'r', 'e', 'n', 't', 'D', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y', 'I', 'n', 'E', 'x', 'e', 'P', 'a', 't', 'h', 0};
+  const WCHAR *dll_dir = (const WCHAR *)L".";
+  BOOLEAN has_backslash = FALSE;
+  for (const WCHAR *c = name; *c; ++c) if (*c == '\\') has_backslash = TRUE;
+  if (!has_backslash) {
+    UNICODE_STRING variable = { (USHORT)(text_length(kNoDefault) * 2), (USHORT)(text_length(kNoDefault) * 2 + 2), (PWSTR)kNoDefault }, value = { 0, 0, NULL };
+    if (RtlQueryEnvironmentVariable_U(NULL, &variable, &value) != STATUS_VARIABLE_NOT_FOUND_) dll_dir = (const WCHAR *)L"";
+  }
+  return get_dll_load_path(image_path_name(), dll_dir, 0, path);
+}
+EXPORT NTSTATUS NTAPI RtlGetSearchPath(PWSTR *path) { return get_dll_load_path(image_path_name(), NULL, g_path_safe_mode, path); }
 EXPORT VOID NTAPI RtlReleasePath(PWSTR path) { if (path) RtlFreeHeap(process_heap(), 0, path); }
 EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   WCHAR coded[1040];
@@ -1185,7 +1450,7 @@ EXPORT NTSTATUS NTAPI LdrLoadDll(PWSTR search_path, PULONG flags, PUNICODE_STRIN
   if ((ULONG_PTR)search_path <= 0xFFFF && ((ULONG_PTR)search_path & 1)) {      /* LOAD_LIBRARY_SEARCH_* flags in place of a path */
     const ULONG search = (ULONG)(ULONG_PTR)search_path & ~1u;
     if (((search & 8) && (search & 0x1F00)) || ((search & 0x100) && !absolute)) return STATUS_INVALID_PARAMETER;
-    search_flags_path(search, coded, 1040);
+    if (!NT_SUCCESS(search_flags_path(NULL, search, coded, 1040))) return STATUS_INVALID_PARAMETER;
     search_path = coded;
   }
   BOOLEAN bare = TRUE;
@@ -1486,6 +1751,29 @@ EXPORT NTSTATUS NTAPI LdrUnloadDll(PVOID base) {
   else if (e->LoadCount != LDR_STATIC && !g_process_ending) ldr_release(base, 1);      /* (nothing is unloaded while the process ends) */
   loader_unlock();
   return status;
+}
+
+EXPORT NTSTATUS NTAPI LdrAddRefDll(ULONG flags, PVOID base) {
+  if (flags & ~1u) return STATUS_INVALID_PARAMETER;      /* (only LDR_ADDREF_DLL_PIN) */
+  loader_lock();
+  LDR_DATA_TABLE_ENTRY *e = ldr_find_base(base);
+  NTSTATUS status = STATUS_SUCCESS;
+  if (!e) status = STATUS_DLL_NOT_FOUND;
+  else if (flags & 1) e->LoadCount = LDR_STATIC;      /* pinned: never unloaded */
+  else if (e->LoadCount != LDR_STATIC) ++e->LoadCount;
+  loader_unlock();
+  return status;
+}
+typedef void (NTAPI *LdrEnumProc)(LDR_DATA_TABLE_ENTRY *module, PVOID context, BOOLEAN *stop);
+EXPORT NTSTATUS NTAPI LdrEnumerateLoadedModules(PVOID unknown, LdrEnumProc callback, PVOID context) {
+  if (unknown || !callback) return STATUS_INVALID_PARAMETER;
+  loader_lock();
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  BOOLEAN stop = FALSE;
+  for (LIST_ENTRY *e = ldr->InMemoryOrderModuleList.Flink; e != &ldr->InMemoryOrderModuleList && !stop; e = e->Flink)
+    callback((LDR_DATA_TABLE_ENTRY *)((BYTE *)e - sizeof(LIST_ENTRY)), context, &stop);      /* (InMemoryOrderLinks follow InLoadOrderLinks) */
+  loader_unlock();
+  return STATUS_SUCCESS;
 }
 
 /* ntdll's own entry point: nothing to set up (the heap is made when first used). */

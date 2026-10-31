@@ -511,7 +511,7 @@ static void test_windows_files() {
   o = rig.create("\\??\\C:\\temp\\CASE.TEST", kGenericWrite, 5, kOptions);      // FILE_OPEN_IF
   CHECK(o.status == 0 && read_file(fs, "/Windows/Temp/CASE.TEST") == "<missing>" && read_file(fs, "/Windows/Temp/Case.Test") == "");
   rig.call(WindowsSyscallNumber::NtClose, o.handle);
-  o = rig.create("\\??\\C:\\Temp\\moved.txt", kGenericWrite | kGenericRead, 2, kOptions);
+  o = rig.create("\\??\\C:\\Temp\\moved.txt", kGenericWrite | kGenericRead | 0x10000 /* DELETE: a rename takes it */, 2, kOptions);
   rig.write(o.handle, "data", 0);
   // FILE_RENAME_INFORMATION: ReplaceIfExists, RootDirectory, FileNameLength, FileName
   const std::string target = "\\??\\C:\\Temp\\renamed.txt";
@@ -586,7 +586,7 @@ static void test_change_notifications() {
 
   CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\watched"), rig.alloc(16), {0, 0x80, 7, 2, 1, 0, 0}) == 0);
   const uint64_t handle_at = rig.alloc(8);
-  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\watched"), 0, 0, handle_at) == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\watched"), 0, 0x1FF, handle_at) == 0);
   const uint64_t handle = rig.u64(handle_at);
   CHECK(handle != 0);
   auto signalled = [&] { return rig.call(WindowsSyscallNumber::NtWaitForSingleObject, handle, 0, rig.offset(0)) == 0; };
@@ -612,7 +612,7 @@ static void test_change_notifications() {
   CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\watched\\deep"), rig.alloc(16), {0, 0x80, 7, 2, 1, 0, 0}) == 0);
   CHECK(signalled() && reset());      // the "deep" subdirectory's own creation already counts, directly under \watched
   const uint64_t subtree_handle_at = rig.alloc(8);
-  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\watched"), 1, 0, subtree_handle_at) == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateChangeNotification, rig.attributes("\\??\\C:\\watched"), 1, 0x1FF, subtree_handle_at) == 0);
   const uint64_t subtree_handle = rig.u64(subtree_handle_at);
   auto subtree_signalled = [&] { return rig.call(WindowsSyscallNumber::NtWaitForSingleObject, subtree_handle, 0, rig.offset(0)) == 0; };
   CHECK(rig.create("\\??\\C:\\watched\\deep\\inside.txt", kGenericRead, 2, kOptions).status == 0);
@@ -669,7 +669,7 @@ static void test_read_directory_changes() {
   // A real program always calls ReadDirectoryChangesW (arming the watch) *before* the change it is meant to catch, typically with OVERLAPPED so the call does not
   // block its only thread while waiting; this single-threaded, synchronous fixture has no second thread to make a change while blocked in the call. So the watch
   // is armed here directly (bypassing NtNotifyChangeDirectoryFile's own lazy-creation-on-first-call, which would otherwise have nothing queued yet and hang this
-  // fixture's ISystemSync forever, since it never really waits) - everything downstream (notify_path_changed, take_watch_records) is exercised exactly as normal.
+  // fixture's ISystemSync forever, since it never really waits) - everything downstream (notify_entry_changed, take_watch_records) is exercised exactly as normal.
   OpenObject* dir_object = rig.process->files().object(dir.handle / 4 - 1);
   CHECK(dir_object != nullptr);
   const ObjectManager::Created watch = objects.create_change_notification(dir_object->path.view(), false, 0x1 /* FILE_NOTIFY_CHANGE_FILE_NAME */);
@@ -697,9 +697,9 @@ static void test_read_directory_changes() {
   CHECK(records[0].action == 1 && records[0].name == "b.txt");
   CHECK(records[1].action == 2 /* FILE_ACTION_REMOVED */ && records[1].name == "a.txt");
 
-  // a buffer too small for even the first record just reports what fit (nothing): a documented simplification, not a crash
+  // a buffer too small for the changes: STATUS_NOTIFY_ENUM_DIR and nothing in it (look at the directory yourself)
   CHECK(rig.create("\\??\\C:\\watched\\c.txt", kGenericRead, 2, 0x60).status == 0);
-  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 4, 0x1, 0}) == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 4, 0x1, 0}) == 0x10Cu);
   CHECK(rig.u64(iosb + 8) == 0);
 
   rig.call(WindowsSyscallNumber::NtClose, dir.handle);

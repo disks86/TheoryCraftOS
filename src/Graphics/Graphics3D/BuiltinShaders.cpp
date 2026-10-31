@@ -83,6 +83,28 @@ bool textured_color_fragment(const Vec4* varyings, const uint8_t* constants, con
   return true;
 }
 
+// The shadow of a picture: its alpha moved by CONST[5].xy (texture coordinates), tinted with the straight color CONST[4], made premultiplied.
+bool textured_shadow_fragment(const Vec4* varyings, const uint8_t* constants, const ITextureSet& textures, Vec4* color) {
+  const float* c = reinterpret_cast<const float*>(constants);
+  const float a = textures.sample(0, varyings[0].x - c[20], varyings[0].y - c[21]).w * c[19];
+  *color = Vec4{c[16] * a, c[17] * a, c[18] * a, a};
+  return true;
+}
+
+// The tinted textured pair (glyphs): position, texture coordinate and a straight color per vertex; the fragment shader writes the color with its alpha times the texel's alpha.
+void tinted_vertex(const Vec4* attributes, const uint8_t* constants, ShaderIo* out) {
+  const Mat4& mvp = *reinterpret_cast<const Mat4*>(constants);
+  out->position = mvp * Vec4{attributes[0].x, attributes[0].y, attributes[0].z, 1.0f};
+  out->varying[0] = attributes[1];
+  out->varying[1] = attributes[2];
+}
+
+bool tinted_fragment(const Vec4* varyings, const uint8_t*, const ITextureSet& textures, Vec4* color) {
+  const Vec4 t = textures.sample(0, varyings[0].x, varyings[0].y);
+  *color = Vec4{varyings[1].x, varyings[1].y, varyings[1].z, varyings[1].w * t.w};
+  return true;
+}
+
 // A picture through a coverage mask: texture 0 (premultiplied colours) times the alpha of texture 1, at the same coordinate.
 bool textured_masked_fragment(const Vec4* varyings, const uint8_t*, const ITextureSet& textures, Vec4* color) {
   const Vec4 t = textures.sample(0, varyings[0].x, varyings[0].y);
@@ -247,6 +269,54 @@ constexpr const char kTexturedMaskedFragmentTgsi[] =
     "  2: MUL OUT[0], TEMP[0], TEMP[1].wwww\n"
     "  3: END\n";
 
+constexpr const char kTexturedShadowFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL CONST[4..5]\n"
+    "DCL TEMP[0..2]\n"
+    "  0: ADD TEMP[0].xy, IN[0].xyxx, -CONST[5].xyxx\n"
+    "  1: TEX TEMP[1], TEMP[0], SAMP[0], 2D\n"
+    "  2: MUL TEMP[2].x, TEMP[1].wwww, CONST[4].wwww\n"
+    "  3: MUL OUT[0].xyz, CONST[4].xyzx, TEMP[2].xxxx\n"
+    "  4: MOV OUT[0].w, TEMP[2].xxxx\n"
+    "  5: END\n";
+
+constexpr const char kTintedVertexTgsi[] =
+    "VERT\n"
+    "DCL IN[0]\n"
+    "DCL IN[1]\n"
+    "DCL IN[2]\n"
+    "DCL OUT[0], POSITION\n"
+    "DCL OUT[1], GENERIC[0]\n"
+    "DCL OUT[2], GENERIC[1]\n"
+    "DCL CONST[0..3]\n"
+    "DCL TEMP[0]\n"
+    "  0: MUL TEMP[0], CONST[0], IN[0].xxxx\n"
+    "  1: MAD TEMP[0], CONST[1], IN[0].yyyy, TEMP[0]\n"
+    "  2: MAD TEMP[0], CONST[2], IN[0].zzzz, TEMP[0]\n"
+    "  3: ADD OUT[0], TEMP[0], CONST[3]\n"
+    "  4: MOV OUT[1], IN[1]\n"
+    "  5: MOV OUT[2], IN[2]\n"
+    "  6: END\n";
+
+constexpr const char kTintedFragmentTgsi[] =
+    "FRAG\n"
+    "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL IN[1], GENERIC[1], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL TEMP[0]\n"
+    "  0: TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "  1: MOV OUT[0], IN[1]\n"
+    "  2: MUL OUT[0].w, IN[1].wwww, TEMP[0].wwww\n"
+    "  3: END\n";
+
 // The same two shaders as Direct3D 9 bytecode (vs_2_0, ps_2_0). Position comes in as v0, color as v1; the matrix columns are c0..c3, and c31 is
 // the device's (1, -1, 1, 1) that turns Direct3D's +Y up into Vulkan's +Y down.
 constexpr uint32_t kColoredVertexD3d9[] = {
@@ -340,6 +410,40 @@ ShaderModuleDesc textured_masked_fragment_shader() {
   d.textured_fragment_function = textured_masked_fragment;
   d.tgsi = kTexturedMaskedFragmentTgsi;
   return d;
+}
+
+ShaderModuleDesc textured_shadow_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = textured_shadow_fragment;
+  d.tgsi = kTexturedShadowFragmentTgsi;
+  return d;
+}
+
+ShaderModuleDesc tinted_vertex_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Vertex;
+  d.vertex_function = tinted_vertex;
+  d.tgsi = kTintedVertexTgsi;
+  return d;
+}
+
+ShaderModuleDesc tinted_fragment_shader() {
+  ShaderModuleDesc d;
+  d.stage = ShaderStage::Fragment;
+  d.textured_fragment_function = tinted_fragment;
+  d.tgsi = kTintedFragmentTgsi;
+  return d;
+}
+
+void describe_tinted_pipeline(GraphicsPipelineDesc* desc) {
+  desc->vertex_stride = sizeof(TintedVertex);
+  desc->attribute_count = 3;
+  desc->attributes[0] = {0, VertexFormat::Float3, 0};
+  desc->attributes[1] = {1, VertexFormat::Float2, 12};
+  desc->attributes[2] = {2, VertexFormat::Float4, 20};
+  desc->varying_count = 2;
+  desc->texture_count = 1;
 }
 
 void describe_textured_pipeline(GraphicsPipelineDesc* desc) {

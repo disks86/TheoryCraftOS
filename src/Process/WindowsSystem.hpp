@@ -26,5 +26,7 @@ namespace process::windowsabi {
 // NtQuerySystemInformation(Class, Buffer, Length, ReturnLength): SystemBasicInformation (0), SystemProcessorInformation (1), SystemPerformanceInformation (2: the memory
 // figures), SystemTimeOfDayInformation (3).
 uint32_t nt_query_system_information(Process& p, const SyscallRequest& r);
+// NtQuerySystemInformationEx(Class, Input, InputLength, Buffer, Length, ReturnLength): the logical processors (107) and the CPU sets (175), else as NtQuerySystemInformation.
+uint32_t nt_query_system_information_ex(Process& p, const SyscallRequest& r);
 
 }  // namespace process::windowsabi

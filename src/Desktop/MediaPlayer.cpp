@@ -36,7 +36,7 @@ const FileDialog::Filter kFilters[] = {{"Media files", kMediaExtensions}, {"All 
 }  // namespace
 
 MediaPlayer::MediaPlayer(allocators::IAllocator& allocator)
-    : Frame(allocator), menu_(allocator), status_bar_(allocator), status_(allocator), path_(allocator) {
+    : Frame(allocator), menu_(allocator), status_bar_(allocator), status_(allocator), path_(allocator), playlist_(allocator) {
   set_title("Media Player");
   set_bounds({80, 50, 560, 420});
   set_padding(Insets::all(4));
@@ -49,6 +49,10 @@ MediaPlayer::MediaPlayer(allocators::IAllocator& allocator)
     file->add_item("Close File", {&MediaPlayer::on_close_file, this});
     file->add_separator();
     file->add_item("Exit", {&MediaPlayer::on_exit, this});
+  }
+  if (Menu* playback = menu_.add_menu("Playback")) {
+    playback->add_item("Next Track", {&MediaPlayer::on_next_menu, this}, "Ctrl+Right");
+    playback->add_item("Previous Track", {&MediaPlayer::on_previous_menu, this}, "Ctrl+Left");
   }
   status_bar_.set_style(PanelStyle::Sunken);
   status_bar_.set_dock(DockStyle::Bottom);
@@ -107,6 +111,7 @@ void MediaPlayer::close_media() {
   if (audio_control_) audio_control_->set_visible(false);
   kind_ = Kind::None;
   path_.clear();
+  was_playing_ = false;
   set_title("Media Player");
 }
 
@@ -125,6 +130,96 @@ void MediaPlayer::on_picked(void* self, Control&) {
 }
 
 bool MediaPlayer::open_file(StringView path) {
+  uint64_t at = playlist_.index_of(path);
+  if (at == Playlist::kNone) {
+    load_folder(path);
+    at = playlist_.index_of(path);
+  }
+  if (at != Playlist::kNone) playlist_.set_current(at);
+  return play_path(path);
+}
+
+// The playlist becomes the media files of the folder of `path` (and `path` itself, whatever it is called), in the order of the folder listing.
+void MediaPlayer::load_folder(StringView path) {
+  playlist_.clear();
+  if (fs_) {
+    List<filesystem::DirectoryEntry> entries(allocator());
+    const StringView folder = Playlist::folder_of(path);
+    if (!folder.empty() && read_sorted_directory(*fs_, folder, &entries) == Status::Ok) {
+      for (uint64_t i = 0; i < entries.count(); ++i) {
+        const filesystem::DirectoryEntry& e = entries[i];
+        const StringView name = e.name.view();
+        if (e.type == filesystem::NodeType::Directory || !is_media_name(name)) continue;
+        String full(allocator());
+        full.assign(folder);
+        if (folder.size() > 1) full.append("/");
+        full.append(name);
+        if (full.view() == path || is_media_name(full.view())) playlist_.add(full.view());
+      }
+    }
+  }
+  if (playlist_.index_of(path) == Playlist::kNone) playlist_.add(path);
+}
+
+bool MediaPlayer::play_index(uint64_t index) {
+  if (index == Playlist::kNone) return false;
+  String path(allocator());
+  path.assign(playlist_.path(index));
+  playlist_.set_current(index);
+  return play_path(path.view());
+}
+
+int64_t MediaPlayer::position_ms() {
+  if (kind_ == Kind::Audio && audio_player_ && audio_player_->sample_rate())
+    return static_cast<int64_t>(audio_player_->position() * 1000 / audio_player_->sample_rate());
+  if (kind_ == Kind::Video && video_player_) return video_player_->position_us() / 1000;
+  return 0;
+}
+
+bool MediaPlayer::next_track() {
+  if (kind_ == Kind::None) return false;
+  return play_index(playlist_.following(false));
+}
+
+bool MediaPlayer::previous_track() {
+  if (kind_ == Kind::None) return false;
+  if (position_ms() > 3000) return play_index(playlist_.current());   // (back to the start of this one first)
+  const uint64_t before = playlist_.preceding(false);
+  return play_index(before != Playlist::kNone ? before : playlist_.current());
+}
+
+void MediaPlayer::pump() {
+  if (kind_ == Kind::None) {
+    was_playing_ = false;
+    return;
+  }
+  bool playing = false, empty = false;
+  int64_t duration_ms = 0;
+  if (kind_ == Kind::Audio && audio_player_) {
+    playing = audio_player_->playing();
+    empty = audio_player_->state() == audio::PlayerState::Empty;
+    duration_ms = audio_player_->sample_rate() ? static_cast<int64_t>(audio_player_->duration() * 1000 / audio_player_->sample_rate()) : 0;
+  } else if (kind_ == Kind::Video && video_player_) {
+    playing = video_player_->playing();
+    empty = video_player_->state() == video::VideoState::Empty;
+    duration_ms = video_player_->duration_us() / 1000;
+  }
+  if (playing) {
+    was_playing_ = true;
+    last_position_ms_ = position_ms();
+  } else if (was_playing_ && !empty) {
+    was_playing_ = false;
+    // it stopped by itself if the last position seen was at the end (a stop by the user was somewhere in the middle)
+    if (duration_ms > 0 && last_position_ms_ >= duration_ms - 1000) next_track();
+  } else if (empty) {
+    was_playing_ = false;
+  }
+}
+
+void MediaPlayer::on_next_menu(void* self, Control&) { static_cast<MediaPlayer*>(self)->next_track(); }
+void MediaPlayer::on_previous_menu(void* self, Control&) { static_cast<MediaPlayer*>(self)->previous_track(); }
+
+bool MediaPlayer::play_path(StringView path) {
   if (!fs_) {
     notify(NoticeKind::Error, "No storage available.");
     return false;
@@ -165,6 +260,13 @@ bool MediaPlayer::open_file(StringView path) {
   message.append("Playing ");
   message.append(path);
   if (kind_ == Kind::Audio && playing_midi_) message.append(playing_midi_hardware_ ? " (on the MIDI hardware)" : " (synthesized)");
+  if (playlist_.count() > 1 && playlist_.current() != Playlist::kNone) {
+    message.append(" (");
+    message.append_uint(playlist_.current() + 1);
+    message.append(" of ");
+    message.append_uint(playlist_.count());
+    message.append(")");
+  }
   status_.set_text(message.view());
   return true;
 }
@@ -231,12 +333,14 @@ void MediaPlayer::on_open_menu(void* self, Control&) { static_cast<MediaPlayer*>
 void MediaPlayer::on_close_file(void* self, Control&) {
   auto* m = static_cast<MediaPlayer*>(self);
   m->close_media();
+  m->playlist_.clear();
   m->status_.set_text("Choose File > Open to play a sound or video file.");
 }
 void MediaPlayer::on_exit(void* self, Control&) { static_cast<MediaPlayer*>(self)->close(); }
 void MediaPlayer::on_window_closed(void* self, Control&) {
   auto* m = static_cast<MediaPlayer*>(self);
   m->close_media();
+  m->playlist_.clear();
   m->status_.set_text("Choose File > Open to play a sound or video file.");
 }
 
@@ -245,6 +349,8 @@ bool MediaPlayer::on_key(const KeyArgs& args) {
     ask_open();
     return true;
   }
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kRight) { next_track(); return true; }
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kLeft) { previous_track(); return true; }
   return Frame::on_key(args);
 }
 

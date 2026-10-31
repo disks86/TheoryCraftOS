@@ -32,6 +32,9 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r);
 // in the order their entry points have to be called with DLL_PROCESS_DETACH (they stay mapped). Succeeds with Count 0 for a library that is in use otherwise or loaded at
 // start-up.
 uint32_t nt_release_module(Process& p, const SyscallRequest& r);
+// NtTcosLinkModules(PVOID From, PVOID To): the library at From depends on the one at To from now on (an export of From was resolved through a forwarder to To): To stays
+// loaded as long as From does. Once only for a pair; nothing for a library that stays as long as the process does.
+uint32_t nt_link_modules(Process& p, const SyscallRequest& r);
 // NtUnloadModule(PVOID Base): takes the library at Base out of the address space (its entry point has been called already).
 uint32_t nt_unload_module(Process& p, const SyscallRequest& r);
 

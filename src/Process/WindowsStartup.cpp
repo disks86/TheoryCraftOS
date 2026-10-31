@@ -152,7 +152,8 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
 
   // --- one region: PEB | TEB | parameters and strings | TLS array and block
   uint64_t strings_at = kParametersHeader;
-  const uint64_t strings_bytes = path_bytes + command_bytes + directory_bytes + environment_bytes + title_bytes + desktop_bytes + 32;      // (the three strings are followed by a NUL each: 6 of the 16)
+  const uint64_t directory_room = directory_bytes + 2 > 520 ? directory_bytes + 2 : 520;      // (MAX_PATH characters, as Windows keeps the current directory)
+  const uint64_t strings_bytes = path_bytes + command_bytes + directory_room + environment_bytes + title_bytes + desktop_bytes + 32;      // (the three strings are followed by a NUL each: 6 of the 16)
   uint64_t parameters_bytes = 0, tls_bytes = 0, total = 0;
   if (strings_bytes > kMaxStartupBytes || !AddressSpace::round_up(strings_at + strings_bytes, &parameters_bytes)) return LoadStatus::Malformed;
   if (!AddressSpace::round_up(tls_total, &tls_bytes)) return LoadStatus::Malformed;
@@ -171,7 +172,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   Writer w(space);
   // --- the parameters (RTL_USER_PROCESS_PARAMETERS, pointers absolute: flag NORMALIZED)
   uint64_t cursor = parameters + strings_at;
-  const uint64_t path_at = cursor, command_at = path_at + path_bytes + 2, directory_at = command_at + command_bytes + 2, environment_at = directory_at + directory_bytes + 2;      // (zeroed memory: each string ends in a NUL, as Windows has it)
+  const uint64_t path_at = cursor, command_at = path_at + path_bytes + 2, directory_at = command_at + command_bytes + 2, environment_at = directory_at + directory_room;      // (zeroed memory: each string ends in a NUL, as Windows has it)
   w.bytes(path_at, image_path.view());
   w.bytes(command_at, command_line.view());
   w.bytes(directory_at, directory.view());
@@ -185,7 +186,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u64(parameters + 0x20, kStdInputHandle);
   w.u64(parameters + 0x28, kStdOutputHandle);
   w.u64(parameters + 0x30, kStdErrorHandle);
-  w.unicode_string(parameters + 0x38, directory_at, directory_bytes, directory_bytes + 2);      // CurrentDirectory.DosPath
+  w.unicode_string(parameters + 0x38, directory_at, directory_bytes, directory_room);      // CurrentDirectory.DosPath
   w.unicode_string(parameters + 0x60, path_at, path_bytes, path_bytes + 2);                    // ImagePathName
   w.unicode_string(parameters + 0x70, command_at, command_bytes, command_bytes + 2);            // CommandLine
   w.u64(parameters + 0x80, environment_at);                                                 // Environment
@@ -195,6 +196,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
     const StartupSpec& st = *input.startup;
     w.u64(parameters + 0x10, st.console_handle);          // ConsoleHandle
     w.u32(parameters + 0x18, st.console_flags);            // ConsoleFlags
+    w.u32(parameters + 0x408, st.process_group == 0xFFFFFFFFu ? uint32_t(input.process_id) : st.process_group);      // ProcessGroupId
     w.u32(parameters + 0x88, st.x);                        // StartingX
     w.u32(parameters + 0x8C, st.y);
     w.u32(parameters + 0x90, st.x_size);                   // CountX
@@ -218,6 +220,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u16(peb + 0x120, 19045);                        // OSBuildNumber
   w.u32(peb + 0x124, 2);                            // OSPlatformId: VER_PLATFORM_WIN32_NT
   w.u32(peb + 0x2C0, 1);                            // SessionId
+  w.u64(peb + 0xC0, uint64_t(-25920000000000ll));   // CriticalSectionTimeout: 30 days
 
   // --- the TEB (NT_TIB first)
   w.u64(teb + 0x00, ~uint64_t{0});                  // ExceptionList (unused on x64)
@@ -228,6 +231,9 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u64(teb + 0x40, input.process_id);              // ClientId.UniqueProcess
   w.u64(teb + 0x48, input.thread_id);               // ClientId.UniqueThread
   w.u64(teb + 0x60, peb);                           // ProcessEnvironmentBlock
+  w.u64(teb + 0x7D8, input.process_id);             // RealClientId
+  w.u64(teb + 0x7E0, input.thread_id);
+  w.unicode_string(teb + 0x1258, teb + 0x1268, 0, 522);      // StaticUnicodeString
   w.u64(teb + 0x1478, input.stack_top - input.stack_size);    // DeallocationStack
   if (!write_tls(w, space, teb, tls_area, tls, tls_count)) return LoadStatus::Malformed;
   for (uint32_t i = 0; i < tls_count; ++i) if (tls_index_at[i] != 0) w.u32(tls_index_at[i], i);      // _tls_index = the module's number
@@ -284,7 +290,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
       w.u16(entry + 0x6C, 0xFFFF);                     // LoadCount: static
       w.u16(entry + 0x6E, m.tls_rva ? 0xFFFF : 0);     // TlsIndex: -1 for a module with thread-local data
     }
-    w.u64(peb + 0x18, ldr);                            // PEB.Ldr
+    if (!input.defer_ldr) w.u64(peb + 0x18, ldr);      // PEB.Ldr
   }
   if (!w.ok()) return LoadStatus::Malformed;
 
@@ -333,6 +339,9 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   w.u64(teb + 0x40, input.process_id);              // ClientId
   w.u64(teb + 0x48, input.thread_id);
   w.u64(teb + 0x60, input.peb);
+  w.u64(teb + 0x7D8, input.process_id);             // RealClientId
+  w.u64(teb + 0x7E0, input.thread_id);
+  w.unicode_string(teb + 0x1258, teb + 0x1268, 0, 522);      // StaticUnicodeString
   w.u64(teb + 0x1478, base);                        // DeallocationStack
   if (!write_tls(w, space, teb, tls_area, input.tls, input.tls_count, true)) { space.unmap(base, total); return LoadStatus::Malformed; }
   if (!w.ok()) { space.unmap(base, total); return LoadStatus::Malformed; }

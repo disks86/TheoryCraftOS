@@ -22,8 +22,10 @@
 #include "Hardware/Bus/Ps2/I8042Controller.hpp"
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Bus/Usb/UsbPortWatcher.hpp"
+#include "Hardware/InputSource.hpp"
 #include "Hardware/Keyboard/CompositeKeyboard.hpp"
 #include "Hardware/Keyboard/Ps2/Ps2Keyboard.hpp"
+#include "Hardware/Keyboard/Usb/UsbHidConsumer.hpp"
 #include "Hardware/Keyboard/Usb/UsbHidKeyboard.hpp"
 #include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Mouse/Ps2/Ps2Mouse.hpp"
@@ -73,6 +75,12 @@ class SystemInput {
   IKeyboard& keyboard() { return keyboards_; }
   IMouse& mouse() { return mice_; }
 
+  // Another driver's keyboards and mice (see InputSource.hpp): registered once, then served by poll() and detached by shutdown(). The source must outlive this object or be removed.
+  static constexpr uint32_t kMaxSources = 8;
+  bool add_source(IInputDeviceSource* source);
+  bool remove_source(IInputDeviceSource* source);   // detaches its devices first
+  uint32_t source_count() const;
+
   // Hot-plug: takes up the USB keyboards and mice plugged in since the last call and drops those that were pulled out; returns how many
   // came or went. Call from one thread.
   uint32_t poll();
@@ -97,6 +105,19 @@ class SystemInput {
   void find_virtualbox();
   void find_vmware();
 
+  class Sink final : public IInputSink {
+   public:
+    explicit Sink(SystemInput& owner) : owner_(owner) {}
+    bool add_keyboard(IKeyboard* k) override { return owner_.keyboards_.add(k); }
+    bool remove_keyboard(IKeyboard* k) override { return owner_.keyboards_.remove(k); }
+    bool add_mouse(IMouse* m) override { return owner_.mice_.add(m); }
+    bool remove_mouse(IMouse* m) override { return owner_.mice_.remove(m); }
+    void notify(StringView text) override { if (owner_.notifier_) owner_.notifier_(owner_.notifier_context_, text); }
+
+   private:
+    SystemInput& owner_;
+  };
+
   VmmDev* vmm_ = nullptr;
   IPciBus& pci_;
   IUsbBus& usb_;
@@ -112,7 +133,9 @@ class SystemInput {
   List<UniquePointer<IHardware>> owned_;  // the allocator-backed devices, freed with the list
   UsbPortWatcher watcher_;
   UsbHidKeyboard* usb_keyboards_[CompositeKeyboard::kMaxKeyboards] = {};   // the USB devices among them, to find those that left
+  UsbHidConsumer* usb_consumers_[CompositeKeyboard::kMaxKeyboards] = {};
   UsbHidMouse* usb_mice_[CompositeMouse::kMaxMice] = {};
+  IInputDeviceSource* sources_[kMaxSources] = {};
   Notifier notifier_ = nullptr;
   void* notifier_context_ = nullptr;
   kernel::Thread* service_ = nullptr;

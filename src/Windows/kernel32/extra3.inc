@@ -505,28 +505,40 @@ EXPORT BOOL WINAPI WriteProcessMemory(HANDLE process, LPVOID base, LPCVOID buffe
   if (done) *done = got;
   return NT_SUCCESS(status) && status != (NTSTATUS)0x8000000D ? TRUE : fail_nt(status);
 }
-/* Attribute lists: a header and room for as many entries as were asked for; an entry names an attribute and points to the caller's value. */
-typedef struct ProcThreadAttributeEntry { DWORD_PTR attribute; SIZE_T size; PVOID value; } ProcThreadAttributeEntry;
-typedef struct ProcThreadAttributeList { DWORD flags; DWORD capacity; DWORD count; DWORD reserved; PVOID unknown; ProcThreadAttributeEntry entries[1]; } ProcThreadAttributeList;
+/* Attribute lists (the type is in kernel32.c, where CreateProcess reads them): a header and room for as many entries as were asked for; an entry names an attribute and points to
+   the caller's value. Only the four fields of the header are written by Initialize (the rest of the memory stays as it was). */
 EXPORT BOOL WINAPI InitializeProcThreadAttributeList(ProcThreadAttributeList *list, DWORD count, DWORD flags, PSIZE_T size) {
-  if (flags || count == 0 || count > 27) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  const SIZE_T needed = 32 + (SIZE_T)count * sizeof(ProcThreadAttributeEntry);
-  if (!list || *size < needed) { *size = needed; set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  memset(list, 0, needed);
-  list->capacity = count;
+  if (flags || count > 27) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  const SIZE_T needed = 24 + (SIZE_T)count * sizeof(ProcThreadAttributeEntry);
+  const SIZE_T have = *size;
   *size = needed;
+  if (!list || have < needed) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  list->flags = 0;
+  list->capacity = count;
+  list->count = 0;
+  list->unknown = NULL;
   return TRUE;
 }
-EXPORT void WINAPI DeleteProcThreadAttributeList(ProcThreadAttributeList *list) { if (list) list->count = 0; }
+EXPORT void WINAPI DeleteProcThreadAttributeList(ProcThreadAttributeList *list) { (void)list; }
 EXPORT BOOL WINAPI UpdateProcThreadAttribute(ProcThreadAttributeList *list, DWORD flags, DWORD_PTR attribute, PVOID value, SIZE_T size, PVOID previous, PSIZE_T returned) {
   (void)previous; (void)returned;
-  if (flags & ~1u || !list || !value) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  for (DWORD i = 0; i < list->count; ++i) if (list->entries[i].attribute == attribute) { set_error(5010); return FALSE; }
-  if (list->count >= list->capacity) { set_error(31); return FALSE; }
+  if (flags & ~1u) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (list->count >= list->capacity) { set_error(31 /* ERROR_GEN_FAILURE */); return FALSE; }
+  switch (attribute & ~(DWORD_PTR)0x40000000) {      /* (PROC_THREAD_ATTRIBUTE_ADDITIVE is not part of the identity) */
+    case 0x00020000: if (size != sizeof(HANDLE)) { set_error(24 /* ERROR_BAD_LENGTH */); return FALSE; } break;      /* PARENT_PROCESS */
+    case 0x00020002: if (size == 0 || size % sizeof(HANDLE)) { set_error(24); return FALSE; } break;      /* HANDLE_LIST */
+    case 0x00030003: if (size != sizeof(GROUP_AFFINITY)) { set_error(24); return FALSE; } break;      /* GROUP_AFFINITY */
+    case 0x00030005: if (size != 4) { set_error(24); return FALSE; } break;      /* IDEAL_PROCESSOR (a PROCESSOR_NUMBER) */
+    case 0x00020016: if (size != sizeof(HANDLE)) { set_error(24); return FALSE; } break;      /* PSEUDOCONSOLE */
+    default: set_error(ERROR_NOT_SUPPORTED); return FALSE;
+  }
+  const DWORD bit = 1u << (attribute & 0xFFFF);
+  if (list->flags & bit) { set_error(698 /* ERROR_OBJECT_NAME_EXISTS */); return FALSE; }
   list->entries[list->count].attribute = attribute;
   list->entries[list->count].size = size;
   list->entries[list->count].value = value;
   list->count++;
+  list->flags |= bit;
   return TRUE;
 }
 EXPORT HANDLE WINAPI CreateRemoteThreadEx(HANDLE process, LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE start, LPVOID parameter, DWORD flags, LPVOID attributes, LPDWORD id) {
@@ -587,6 +599,118 @@ EXPORT BOOL WINAPI GetLogicalProcessorInformation(SYSTEM_LOGICAL_PROCESSOR_INFOR
   return TRUE;
 }
 
+/* The processors in the shapes Windows 10 gives them: SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records and CPU sets, made by the kernel. */
+EXPORT BOOL WINAPI GetLogicalProcessorInformationEx(DWORD relation, BYTE *buffer, PDWORD length) {
+  if (!length) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG returned = 0;
+  const NTSTATUS status = NtQuerySystemInformationEx(107 /* SystemLogicalProcessorInformationEx */, &relation, sizeof(relation), buffer, buffer ? *length : 0, &returned);
+  if (status == (NTSTATUS)0xC0000004 /* STATUS_INFO_LENGTH_MISMATCH */) { *length = returned; set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *length = returned;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetSystemCpuSetInformation(BYTE *info, ULONG length, ULONG *returned, HANDLE process, ULONG flags) {
+  if (returned) *returned = 0;
+  if (flags) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!info && length) { set_error(ERROR_NOACCESS); return FALSE; }
+  if (!process) process = GetCurrentProcess();
+  ULONG got = 0;
+  const NTSTATUS status = NtQuerySystemInformationEx(175 /* SystemCpuSetInformation */, &process, sizeof(process), info, length, &got);
+  if (returned && (NT_SUCCESS(status) || status == (NTSTATUS)0xC0000023)) *returned = got;
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+/* Every processor is in NUMA node 0 of processor group 0. */
+EXPORT BOOL WINAPI GetNumaProcessorNode(UCHAR processor, PUCHAR node) {
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  if (processor >= si.dwNumberOfProcessors) { *node = 0xFF; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  *node = 0;
+  return TRUE;
+}
+typedef struct { WORD Group; BYTE Number, Reserved; } PROCESSOR_NUMBER_;
+EXPORT BOOL WINAPI GetNumaProcessorNodeEx(PROCESSOR_NUMBER_ *processor, USHORT *node) {
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  if (processor->Group != 0 || processor->Number >= si.dwNumberOfProcessors || processor->Number >= 64) { *node = 0xFFFF; set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  *node = 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetNumaHighestNodeNumber(PULONG node) { *node = 0; return TRUE; }
+/* Windows 10: one session for everything that runs here. */
+EXPORT BOOL WINAPI ProcessIdToSessionId(DWORD pid, DWORD *session) {
+  if (!session) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  HANDLE process = pid == GetCurrentProcessId() ? GetCurrentProcess() : OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, FALSE, pid);
+  if (!process) { if (GetLastError() == ERROR_ACCESS_DENIED || GetLastError() == ERROR_INVALID_PARAMETER) set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  ULONG id = 0;
+  const NTSTATUS status = NtQueryInformationProcess(process, 24 /* ProcessSessionInformation */, &id, sizeof(id), NULL);
+  if (process != GetCurrentProcess()) CloseHandle(process);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *session = id;
+  return TRUE;
+}
+EXPORT DWORD WINAPI WTSGetActiveConsoleSessionId(void) { return 1; }
+EXPORT BOOL WINAPI GetSystemRegistryQuota(PDWORD allowed, PDWORD used) {
+  if (allowed) *allowed = 0x2000000;      /* the registry may hold 32 MiB, and holds a little */
+  if (used) *used = 0x180000;
+  return TRUE;
+}
+/* Nothing here runs under WOW64: the machine of a program is "unknown" (it is the native one), the native machine is x86-64. */
+EXPORT BOOL WINAPI IsWow64Process(HANDLE process, PBOOL wow64) {
+  ULONG_PTR information = 0;
+  const NTSTATUS status = NtQueryInformationProcess(process, 26 /* ProcessWow64Information */, &information, sizeof(information), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (wow64) *wow64 = information != 0;
+  return TRUE;
+}
+EXPORT BOOL WINAPI IsWow64Process2(HANDLE process, USHORT *machine, USHORT *native_machine) {
+  ULONG_PTR information = 0;
+  const NTSTATUS status = NtQueryInformationProcess(process, 26 /* ProcessWow64Information */, &information, sizeof(information), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (machine) *machine = 0;      /* IMAGE_FILE_MACHINE_UNKNOWN */
+  if (native_machine) *native_machine = 0x8664;      /* IMAGE_FILE_MACHINE_AMD64 */
+  return TRUE;
+}
+
+/* Pseudo consoles: an object that stands for the console of a program started with PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE (the program's standard handles are its own console
+   in that case). The pipes it was made with are not read or written: what the program prints stays in its console model. */
+EXPORT HRESULT WINAPI CreatePseudoConsole(COORD size, HANDLE input, HANDLE output, DWORD flags, HANDLE *console) {
+  if (!console || size.X <= 0 || size.Y <= 0 || (flags & ~7u)) return (HRESULT)0x80070057;      /* E_INVALIDARG */
+  if (GetFileType(input) == FILE_TYPE_UNKNOWN || GetFileType(output) == FILE_TYPE_UNKNOWN) return (HRESULT)0x80070006;      /* E_HANDLE */
+  HANDLE object = CreateEventW(NULL, TRUE, FALSE, NULL);
+  if (!object) return (HRESULT)0x8007000E;      /* E_OUTOFMEMORY */
+  for (int i = 0; i < 8; ++i) if (!g_pseudo[i].object) { g_pseudo[i].object = object; g_pseudo[i].x = size.X < 0xFFF ? size.X : 0xFFF; g_pseudo[i].y = size.Y < 0xFFF ? size.Y : 0xFFF; break; }
+  *console = object;
+  return 0;
+}
+EXPORT HRESULT WINAPI ResizePseudoConsole(HANDLE console, COORD size) {
+  if (size.X <= 0 || size.Y <= 0) return (HRESULT)0x80070057;
+  for (int i = 0; i < 8; ++i) if (g_pseudo[i].object == console) { g_pseudo[i].x = size.X < 0xFFF ? size.X : 0xFFF; g_pseudo[i].y = size.Y < 0xFFF ? size.Y : 0xFFF; }
+  return 0;
+}
+EXPORT void WINAPI ClosePseudoConsole(HANDLE console) {
+  for (int i = 0; i < 8; ++i) if (g_pseudo[i].object == console) g_pseudo[i].object = NULL;
+  CloseHandle(console);
+}
+
+/* GetProcessInformation: only the machine of the process (ProcessMachineTypeInfo) is answered. */
+EXPORT BOOL WINAPI GetProcessInformation(HANDLE process, int information_class, LPVOID information, DWORD size) {
+  if (information_class != 9 /* ProcessMachineTypeInfo */) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (size != 8) { set_error(ERROR_BAD_LENGTH); return FALSE; }
+  DWORD machines[8] = {};
+  const NTSTATUS status = NtQuerySystemInformationEx(230 /* SystemSupportedProcessorArchitectures2 */, &process, sizeof(process), machines, sizeof(machines), NULL);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  for (int i = 0; i < 8 && (machines[i] & 0xFFFF); ++i) {
+    if (!(machines[i] & (1u << 19))) continue;      /* (the one the process runs as) */
+    BYTE *out = information;
+    memset(out, 0, 8);
+    *(WORD *)out = (WORD)(machines[i] & 0xFFFF);
+    *(DWORD *)(out + 4) = ((machines[i] >> 17) & 1) | (((machines[i] >> 16) & 1) << 1) | (((machines[i] >> 20) & 1) << 2);      /* UserEnabled, KernelEnabled, Wow64Container */
+    return TRUE;
+  }
+  set_error(ERROR_INVALID_PARAMETER);
+  return FALSE;
+}
+
 /* VerifyVersionInfo and GetProductInfo: ntdll knows the version (RtlGetVersion, RtlVerifyVersionInfo). */
 NTSTATUS NTAPI RtlVerifyVersionInfo(const void *info, ULONG types, ULONGLONG mask);
 EXPORT BOOL WINAPI VerifyVersionInfoW(OSVERSIONINFOEXW *info, DWORD type_mask, ULONGLONG condition_mask) {
@@ -625,7 +749,7 @@ EXPORT BOOL WINAPI GetProductInfo(DWORD major, DWORD minor, DWORD sp_major, DWOR
 #define PORT_MAX 16
 #define PORT_QUEUE 1024
 typedef struct { DWORD bytes; ULONG_PTR key; LPOVERLAPPED overlapped; } PortPacket;
-typedef struct { HANDLE semaphore; PortPacket packets[PORT_QUEUE]; DWORD head, count; } Port;
+typedef struct { HANDLE semaphore; PortPacket packets[PORT_QUEUE]; DWORD head, count; HANDLE jobs[4]; int job_count; } Port;      /* (jobs: the job objects whose events come out of this port) */
 static Port *g_ports[PORT_MAX];
 static Port *port_of(HANDLE h) {
   Port *p = NULL;
@@ -636,6 +760,58 @@ static Port *port_of(HANDLE h) {
 }
 /* The files tied to a port: an overlapped call that finishes on one queues a packet (its key, the bytes moved, the OVERLAPPED) there, unless the low bit of the event
    handle is set. */
+/* ReadFileScatter / WriteFileGather: the bytes go from (to) a list of page-sized buffers, ending with a null entry, to (from) the file at the offset of the OVERLAPPED. The
+ * file has to be one opened for overlapped calls. The work is done at once, the call says what an asynchronous one says and the completion is there for the event and the port. */
+typedef union { PVOID Buffer; ULONGLONG Alignment; } FILE_SEGMENT_ELEMENT_;
+static BOOL scatter_gather(HANDLE h, FILE_SEGMENT_ELEMENT_ *segments, DWORD bytes, LPOVERLAPPED overlapped, BOOL write) {
+  if (!overlapped || !segments || !overlapped_known(h)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  LARGE_INTEGER offset;
+  offset.LowPart = overlapped->Offset;
+  offset.HighPart = (LONG)overlapped->OffsetHigh;
+  overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
+  DWORD done = 0;
+  NTSTATUS status = STATUS_SUCCESS;
+  while (done < bytes && segments->Buffer) {
+    const DWORD n = bytes - done < 4096 ? bytes - done : 4096;
+    IO_STATUS_BLOCK iosb;
+    LARGE_INTEGER at;
+    at.QuadPart = offset.QuadPart + done;
+    iosb.Information = 0;
+    status = write ? NtWriteFile(h, NULL, NULL, NULL, &iosb, segments->Buffer, n, &at, NULL) : NtReadFile(h, NULL, NULL, NULL, &iosb, segments->Buffer, n, &at, NULL);
+    if (!NT_SUCCESS(status)) break;
+    done += (DWORD)iosb.Information;
+    if (iosb.Information < n) break;
+    ++segments;
+  }
+  if (done == 0 && status != STATUS_SUCCESS) {
+    complete_overlapped(overlapped, status, 0);
+    set_error(RtlNtStatusToDosError(status));
+    return FALSE;
+  }
+  complete_overlapped(overlapped, STATUS_SUCCESS, done);
+  port_note(h, overlapped, done);
+  set_error(ERROR_IO_PENDING);
+  return FALSE;
+}
+EXPORT BOOL WINAPI ReadFileScatter(HANDLE h, FILE_SEGMENT_ELEMENT_ *segments, DWORD bytes, LPDWORD reserved, LPOVERLAPPED overlapped) { (void)reserved; return scatter_gather(h, segments, bytes, overlapped, FALSE); }
+EXPORT BOOL WINAPI WriteFileGather(HANDLE h, FILE_SEGMENT_ELEMENT_ *segments, DWORD bytes, LPDWORD reserved, LPOVERLAPPED overlapped) { (void)reserved; return scatter_gather(h, segments, bytes, overlapped, TRUE); }
+/* FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (1) and FILE_SKIP_SET_EVENT_ON_HANDLE (2): a call here is done before it returns, and tells so only by the packet at the port; the modes are accepted. */
+EXPORT BOOL WINAPI SetFileCompletionNotificationModes(HANDLE h, UCHAR modes) {
+  if (modes & ~3) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (device_type(h) < 0) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  return TRUE;
+}
+/* SetFileValidData: tells the file system that the data up to `length` is to be taken as written, which takes the privilege to manage volumes. The tokens here are one fixed user
+ * without any privilege that can be enabled (see advapi32), so a handle that may write is told that it is not held. */
+EXPORT BOOL WINAPI SetFileValidData(HANDLE h, LONGLONG length) {
+  (void)length;
+  IO_STATUS_BLOCK iosb;
+  BYTE access[4];
+  const NTSTATUS status = NtQueryInformationFile(h, &iosb, access, sizeof(access), 8);      /* FileAccessInformation */
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  set_error(get32(access) & 2 /* FILE_WRITE_DATA */ ? 1314 /* ERROR_PRIVILEGE_NOT_HELD */ : ERROR_ACCESS_DENIED);
+  return FALSE;
+}
 EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PTR key, LPOVERLAPPED overlapped);
 typedef struct { HANDLE file, port; ULONG_PTR key; } PortLink;
 static PortLink g_links[64];
@@ -663,11 +839,21 @@ static void port_note(HANDLE file, LPOVERLAPPED overlapped, ULONG_PTR bytes) {
   LeaveCriticalSection(&g_atom_lock);
   if (port) PostQueuedCompletionStatus(port, (DWORD)bytes, key, overlapped);
 }
+/* A pipe tied to a port is also known to the kernel as tied to it: if a process that has a call waiting on it ends, the kernel reports that to the port. */
+static void pipe_tie_to_port(HANDLE file, HANDLE port, ULONG_PTR key) {
+  if (device_type(file) != 0x11) return;
+  IO_STATUS_BLOCK iosb;
+  BYTE in[16];
+  *(ULONG64 *)in = (ULONG64)(ULONG_PTR)port;
+  *(ULONG64 *)(in + 8) = (ULONG64)key;
+  NtFsControlFile(file, NULL, NULL, NULL, &iosb, 0x11FFF8, in, sizeof(in), NULL, 0);
+}
 EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_PTR key, DWORD threads) {
   (void)threads;
+  if (file && file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK && !overlapped_known(file)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }      /* (a file opened for synchronous calls cannot be tied to a port) */
   if (existing) {
     if (!port_of(existing)) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-    if (file != INVALID_HANDLE_VALUE) port_link(file, existing, key);
+    if (file != INVALID_HANDLE_VALUE) { port_link(file, existing, key); pipe_tie_to_port(file, existing, key); }
     return existing;
   }
   Port *p = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(Port));
@@ -681,7 +867,7 @@ EXPORT HANDLE WINAPI CreateIoCompletionPort(HANDLE file, HANDLE existing, ULONG_
   if (slot >= 0) g_ports[slot] = p;
   LeaveCriticalSection(&g_atom_lock);
   if (slot < 0) { CloseHandle(p->semaphore); RtlFreeHeap(heap(), 0, p); set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
-  if (file != INVALID_HANDLE_VALUE && file) port_link(file, p->semaphore, key);
+  if (file != INVALID_HANDLE_VALUE && file) { port_link(file, p->semaphore, key); pipe_tie_to_port(file, p->semaphore, key); }
   return p->semaphore;
 }
 EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PTR key, LPOVERLAPPED overlapped) {
@@ -695,13 +881,52 @@ EXPORT BOOL WINAPI PostQueuedCompletionStatus(HANDLE port, DWORD bytes, ULONG_PT
   ReleaseSemaphore(p->semaphore, 1, NULL);
   return TRUE;
 }
-EXPORT BOOL WINAPI GetQueuedCompletionStatus(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped, DWORD timeout) {
+/* The next event of a job object tied to the port: the message is the byte count, the process id the "overlapped" (as Windows reports them). */
+static BOOL job_port_event(Port *p, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped) {
+  for (int i = 0; i < p->job_count; ++i) {
+    BYTE info[24];
+    ULONG got = 0;
+    const NTSTATUS status = NtQueryInformationJobObject(p->jobs[i], 0x80, info, sizeof(info), &got);
+    if (NT_SUCCESS(status) && status != (NTSTATUS)0x8000001A) {
+      if (bytes) *bytes = get32(info);
+      if (overlapped) *overlapped = (LPOVERLAPPED)(ULONG_PTR)get64(info + 8);
+      if (key) *key = (ULONG_PTR)get64(info + 16);
+      return TRUE;
+    }
+    if (status == (NTSTATUS)0xC0000008) p->jobs[i--] = p->jobs[--p->job_count];      /* (the job's handle is gone) */
+  }
+  return FALSE;
+}
+static BOOL port_take(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped, DWORD timeout, BOOL alertable) {
   Port *p = port_of(port);
   if (!p) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (overlapped) *overlapped = NULL;
-  const DWORD w = WaitForSingleObject(p->semaphore, timeout);
-  if (w != WAIT_OBJECT_0) { set_error(w == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError()); return FALSE; }
+  DWORD w = WaitForSingleObjectEx(p->semaphore, 0, FALSE);      /* (a packet that is there is taken before any queued call is run) */
+  if (w != WAIT_OBJECT_0 && p->job_count) {      /* the events of the job objects come from the kernel: looked for between short waits */
+    const DWORD start = GetTickCount();
+    for (;;) {
+      if (job_port_event(p, bytes, key, overlapped)) return TRUE;
+      if (timeout == 0) { w = WAIT_TIMEOUT; break; }
+      const DWORD left = timeout == INFINITE ? 5 : (GetTickCount() - start >= timeout ? 0 : timeout - (GetTickCount() - start));
+      if (left == 0) { w = WAIT_TIMEOUT; break; }
+      w = WaitForSingleObjectEx(p->semaphore, left < 5 ? left : 5, alertable);
+      if (w != WAIT_TIMEOUT) break;
+    }
+  } else if (w != WAIT_OBJECT_0 && timeout) w = WaitForSingleObjectEx(p->semaphore, timeout, alertable);
+  else if (w != WAIT_OBJECT_0 && alertable) w = WaitForSingleObjectEx(p->semaphore, 0, TRUE);
+  if (w != WAIT_OBJECT_0) { set_error(w == WAIT_TIMEOUT || w == WAIT_IO_COMPLETION ? w : GetLastError()); return FALSE; }
   atom_lock();
+  if (p->count == 0) {      /* a call of a process that ended while it waited: the kernel kept the packet (see FSCTL 0x11FFF9) */
+    LeaveCriticalSection(&g_atom_lock);
+    IO_STATUS_BLOCK iosb;
+    BYTE packet[24];
+    if (!NT_SUCCESS(NtFsControlFile(p->semaphore, NULL, NULL, NULL, &iosb, 0x11FFF9, NULL, 0, packet, sizeof(packet)))) { set_error(ERROR_NOT_FOUND); return FALSE; }
+    if (bytes) *bytes = get32(packet);
+    if (key) *key = (ULONG_PTR)get64(packet + 8);
+    if (overlapped) *overlapped = (LPOVERLAPPED)(ULONG_PTR)get64(packet + 16);
+    if (get32(packet + 4)) { set_error(RtlNtStatusToDosError((NTSTATUS)get32(packet + 4))); return FALSE; }
+    return TRUE;
+  }
   PortPacket k = p->packets[p->head];
   p->head = (p->head + 1) % PORT_QUEUE;
   --p->count;
@@ -711,18 +936,17 @@ EXPORT BOOL WINAPI GetQueuedCompletionStatus(HANDLE port, LPDWORD bytes, PULONG_
   if (overlapped) *overlapped = k.overlapped;
   return TRUE;
 }
-typedef struct { LPOVERLAPPED lpOverlapped; ULONG_PTR key; ULONG_PTR internal; DWORD bytes; } OVERLAPPED_ENTRY_;
+EXPORT BOOL WINAPI GetQueuedCompletionStatus(HANDLE port, LPDWORD bytes, PULONG_PTR key, LPOVERLAPPED *overlapped, DWORD timeout) { return port_take(port, bytes, key, overlapped, timeout, FALSE); }
+typedef struct { ULONG_PTR key; LPOVERLAPPED lpOverlapped; ULONG_PTR internal; DWORD bytes; } OVERLAPPED_ENTRY_;
 EXPORT BOOL WINAPI GetQueuedCompletionStatusEx(HANDLE port, OVERLAPPED_ENTRY_ *entries, ULONG count, PULONG removed, DWORD timeout, BOOL alertable) {
-  (void)alertable;
   ULONG n = 0;
-  DWORD wait = timeout;
   while (n < count) {
     DWORD bytes; ULONG_PTR key; LPOVERLAPPED ov;
-    if (!GetQueuedCompletionStatus(port, &bytes, &key, &ov, n == 0 ? wait : 0)) break;
+    if (!port_take(port, &bytes, &key, &ov, n == 0 ? timeout : 0, n == 0 && alertable)) break;
     entries[n].lpOverlapped = ov; entries[n].key = key; entries[n].internal = 0; entries[n].bytes = bytes; ++n;
   }
   if (removed) *removed = n;
-  if (n == 0) { if (GetLastError() != ERROR_INVALID_HANDLE) set_error(WAIT_TIMEOUT); return FALSE; }
+  if (n == 0) { if (GetLastError() != ERROR_INVALID_HANDLE && GetLastError() != WAIT_IO_COMPLETION) set_error(WAIT_TIMEOUT); return FALSE; }
   return TRUE;
 }
 
@@ -744,7 +968,7 @@ typedef RTL_WALK_ENTRY_ HEAPWALK_;
 #define TH32CS_SNAPMODULE_ 8
 #define TH32CS_SNAPMODULE32_ 0x10
 #define SNAP_MAX 8
-static BOOL IsHandleValid_(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }      /* (a snapshot's handle is an event) */
+static BOOL IsHandleValid_(HANDLE h) { DWORD flags; return GetHandleInformation(h, &flags); }      /* (not SetEvent: the value of a closed snapshot may belong to an event of the program by now, which must stay as it is) */
 typedef struct {
   HANDLE handle;
   DWORD process_count, process_next, thread_count, thread_next, module_count, module_next, heap_count, heap_next;
@@ -1163,26 +1387,44 @@ EXPORT BOOL WINAPI K32GetProcessMemoryInfo(HANDLE process, PROCESS_MEMORY_COUNTE
   if (!found) set_error(ERROR_INVALID_HANDLE);
   return found;
 }
+/* The path of the program as the NT name ("\\Device\\HarddiskVolume1\\..."): its length in characters, or 0 and ERROR_INSUFFICIENT_BUFFER if `size` characters (with the NUL) do not hold it. */
 EXPORT DWORD WINAPI K32GetProcessImageFileNameW(HANDLE process, LPWSTR name, DWORD size) {
+  {      /* the kernel knows the NT name of the program */
+    BYTE info[16 + 2 * (MAX_PATH * 2 + 1)];
+    if (NT_SUCCESS(NtQueryInformationProcess(process, 27, info, sizeof(info), NULL))) {
+      const DWORD length = get16(info) / 2;
+      if (!name || length + 1 > size) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+      memcpy(name, (const WCHAR *)(ULONG_PTR)get64(info + 8), ((size_t_)length + 1) * 2);
+      return length;
+    }
+  }
   ModuleRecord_ m;
   DWORD pid = 0;
   if (!find_module_record(process, NULL, &m, &pid)) return 0;
   MODULEENTRY32W_ *e = RtlAllocateHeap(heap(), 0, sizeof(*e));
-  if (!e) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
-  fill_module_entry(e, &m, pid);
-  const DWORD length = (DWORD)wcslen(e->szExePath), n = length < size ? length : (size ? size - 1 : 0);
-  for (DWORD i = 0; i < n; ++i) name[i] = e->szExePath[i];
-  if (size) name[n] = 0;
-  RtlFreeHeap(heap(), 0, e);
-  return n;
+  WCHAR *native = RtlAllocateHeap(heap(), 0, PATH_CHARS * 2);
+  DWORD result = 0;
+  if (!e || !native) set_error(ERROR_NOT_ENOUGH_MEMORY);
+  else {
+    fill_module_entry(e, &m, pid);
+    if (!dos_path_to_native(e->szExePath, native, PATH_CHARS)) lstrcpyW(native, e->szExePath);
+    const DWORD length = (DWORD)wcslen(native);
+    if (!name || length + 1 > size) set_error(ERROR_INSUFFICIENT_BUFFER);
+    else { memcpy(name, native, ((size_t_)length + 1) * 2); result = length; }
+  }
+  if (e) RtlFreeHeap(heap(), 0, e);
+  if (native) RtlFreeHeap(heap(), 0, native);
+  return result;
 }
 EXPORT DWORD WINAPI K32GetProcessImageFileNameA(HANDLE process, LPSTR name, DWORD size) {
-  WCHAR wide[MAX_PATH];
-  const DWORD n = K32GetProcessImageFileNameW(process, wide, MAX_PATH);
-  const DWORD k = n < size ? n : (size ? size - 1 : 0);
-  for (DWORD i = 0; i < k; ++i) name[i] = (char)wide[i];
-  if (size) name[k] = 0;
-  return k;
+  WCHAR wide[PATH_CHARS];
+  const DWORD n = K32GetProcessImageFileNameW(process, wide, PATH_CHARS);
+  if (n == 0) return 0;
+  if (!name) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, NULL, 0, NULL, NULL);
+  if (needed <= 0 || (DWORD)needed > size) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, name, needed, NULL, NULL);
+  return (DWORD)needed - 1;
 }
 EXPORT BOOL WINAPI K32EmptyWorkingSet(HANDLE process) { (void)process; return TRUE; }
 EXPORT BOOL WINAPI EnumProcessModules(HANDLE p, HMODULE *m, DWORD cb, LPDWORD n) { return K32EnumProcessModules(p, m, cb, n); }
@@ -1228,6 +1470,22 @@ EXPORT BOOL WINAPI QueryInformationJobObject(HANDLE job, int info_class, LPVOID 
   return NT_SUCCESS(s) && s != (NTSTATUS)0x80000005 ? TRUE : fail_nt(s);
 }
 EXPORT BOOL WINAPI SetInformationJobObject(HANDLE job, int info_class, LPVOID info, DWORD length) {
+  if (info_class == 7 && info && length == 2 * sizeof(PVOID)) {      /* JobObjectAssociateCompletionPortInformation: the port is this program's own, the kernel only keeps the events for it */
+    HANDLE port = ((HANDLE *)info)[1];
+    if (port && !port_of(port)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+    const NTSTATUS s = NtSetInformationJobObject(job, 7, info, length);
+    if (!NT_SUCCESS(s)) return fail_nt(s);
+    atom_lock();
+    for (int i = 0; i < PORT_MAX; ++i) {      /* (the job is tied to this port, and to no other) */
+      Port *q = g_ports[i];
+      if (!q) continue;
+      for (int k = 0; k < q->job_count; ++k) if (q->jobs[k] == job) q->jobs[k--] = q->jobs[--q->job_count];
+    }
+    Port *p = port ? port_of(port) : NULL;
+    if (p && p->job_count < 4) p->jobs[p->job_count++] = job;
+    LeaveCriticalSection(&g_atom_lock);
+    return TRUE;
+  }
   const NTSTATUS s = NtSetInformationJobObject(job, (ULONG)info_class, info, length);
   return NT_SUCCESS(s) ? TRUE : fail_nt(s);
 }
@@ -1425,3 +1683,31 @@ EXPORT BOOL WINAPI BindIoCompletionCallback(HANDLE file, IO_COMPLETION_ROUTINE_ 
   LeaveCriticalSection(&g_atom_lock);
   return TRUE;
 }
+
+/* ---- firmware tables (SystemFirmwareTableInformation of NtQuerySystemInformation) ------------------------------------------------------------------------------ */
+
+/* The table (Action 1) or the list of table IDs (Action 0) of a provider: the call fills the request in the buffer; the answer is what follows the 16 byte header. */
+static UINT firmware_call(DWORD signature, DWORD action, DWORD table, void *buffer, DWORD size) {
+  ULONG needed = 0;
+  DWORD head[4] = {signature, action, table, 0};
+  NTSTATUS status = NtQuerySystemInformation(76, head, sizeof(head), &needed);
+  if (status != (NTSTATUS)0xC0000023 && !NT_SUCCESS(status)) { set_error(RtlNtStatusToDosError(status)); return 0; }
+  if (needed < sizeof(head)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const DWORD data = needed - (DWORD)sizeof(head);
+  DWORD *request = RtlAllocateHeap(heap(), 0, needed);
+  if (!request) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+  request[0] = signature; request[1] = action; request[2] = table; request[3] = 0;
+  status = NtQuerySystemInformation(76, request, needed, &needed);
+  UINT result = 0;
+  if (!NT_SUCCESS(status)) set_error(RtlNtStatusToDosError(status));
+  else {
+    result = data;
+    if (buffer && size >= data) memcpy(buffer, request + 4, data);
+    else if (buffer) { set_error(ERROR_INSUFFICIENT_BUFFER); }
+    else if (size) { /* (a size without a buffer: only the length is wanted) */ }
+  }
+  RtlFreeHeap(heap(), 0, request);
+  return result;
+}
+EXPORT UINT WINAPI GetSystemFirmwareTable(DWORD signature, DWORD table, PVOID buffer, DWORD size) { return firmware_call(signature, 1, table, buffer, size); }
+EXPORT UINT WINAPI EnumSystemFirmwareTables(DWORD signature, PVOID buffer, DWORD size) { return firmware_call(signature, 0, 0, buffer, size); }

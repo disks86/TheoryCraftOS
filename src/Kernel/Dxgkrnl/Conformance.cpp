@@ -101,6 +101,9 @@ class Rig {
     step("create_descriptor_heap", ok() ? kernel_.create_descriptor_heap(kProcess, device_, type, count, &h) : status_);
     return h;
   }
+  void map_tiles(Handle reserved, uint32_t first, Handle heap, uint64_t heap_offset, uint32_t count) {
+    step("update_tile_mappings", ok() ? kernel_.update_tile_mappings(kProcess, reserved, first, heap, heap_offset, count) : status_);
+  }
   void descriptor(Handle heap, uint32_t index, const DescriptorDesc& d) { step("write_descriptor", ok() ? kernel_.write_descriptor(kProcess, heap, index, d) : status_); }
   Handle buffer(uint32_t flags, ConstByteView contents) {
     AllocationDesc d;
@@ -379,6 +382,238 @@ void scene_dxbc_texture_linear(Rig& rig, ArrayView<uint32_t> out) {
   Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
   Handle texture = checker(rig);
   textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+// gather4 (dxil_ps_gather.hlsl): the four texels of the footprint, green and red, over the checker texture; a linear sampler (gather ignores the filter, not the address mode).
+void scene_dxil_gather(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_gather, sizeof b::k_dxil_ps_gather, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+// Derivatives (dxil_ps_deriv_show.hlsl): ddx_fine / ddy_fine of values computed from the interpolated colour and texture coordinate, shown as colours; the quad's pairs on the CPU renderer
+// against the hardware's.
+void scene_dxil_derivatives(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_deriv_show, sizeof b::k_dxil_ps_deriv_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Nearest, out);
+}
+
+// sample_d and sample_b (dxil_ps_grad.hlsl) over a texture of one level: the level is clamped to it, so the picture is the plain lookup; what the scene checks is that both reach the device.
+void scene_dxil_grad(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_grad, sizeof b::k_dxil_ps_grad, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+// CalculateLevelOfDetail (dxil_ps_lod_show.hlsl): the level the hardware works out for the coordinate against the interpreter's, from the quad.
+void scene_dxil_lod(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_lod_show, sizeof b::k_dxil_ps_lod_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Nearest, out);
+}
+
+// A texture array indexed by a variable (dxil_ps_array_show.hlsl): the left half of the quad samples the first texture, the right half the second.
+void scene_dxil_texture_array(Rig& rig, ArrayView<uint32_t> out) {
+  if (graphics::kMaxTextureUnits < 2) return void(rig.step("two texture units", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_array_show, sizeof b::k_dxil_ps_array_show, 2);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle first = checker(rig);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = ((i % 4 + i / 4) & 1) ? 0xFF20F060u : 0xFFF02060u;
+  Handle second = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(second, bytes_of(texels, sizeof texels));
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex v[6] = {vert(-0.9f, -0.9f, 0, 0), vert(0.9f, -0.9f, 1, 0), vert(-0.9f, 0.9f, 0, 1), vert(-0.9f, 0.9f, 0, 1), vert(0.9f, -0.9f, 1, 0), vert(0.9f, 0.9f, 1, 1)};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Nearest;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, sampler);
+  w.bind_texture(1, 3, sampler);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {target, vb, first, second});
+  rig.read(target, out);
+}
+
+// sample_c (dxil_ps_cmp_show.hlsl): a texture whose red grows from the left (0.1) to the right (0.9) compared with references that grow down the quad and a fixed one; the comparison is
+// filtered, so the edges between passing and failing texels are blends.
+void scene_dxil_compare(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_cmp_show, sizeof b::k_dxil_ps_cmp_show, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16);
+  Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(texture, bytes_of(texels, sizeof texels));
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+// Double precision (dxil_ps_double_show.hlsl): arithmetic, a select, a loop-carried sum, fma and conversions on doubles, shown as colours.
+void scene_dxil_double(Rig& rig, ArrayView<uint32_t> out) {
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_double_show, sizeof b::k_dxil_ps_double_show, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// 64-bit integers (dxil_ps_int64_show.hlsl): add, subtract, multiply, divide, shifts and comparisons of 64-bit values, shown as the bytes of their results.
+void scene_dxil_int64(Rig& rig, ArrayView<uint32_t> out) {
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_int64_show, sizeof b::k_dxil_ps_int64_show, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  float block[28];
+  for (uint32_t i = 0; i < 16; ++i) block[i] = kIdentity[i];
+  const uint32_t k[12] = {0xF2345678u, 0x000000DEu, 0x9ABCDEF1u, 0x00000012u, 0x0F1E2D3Cu, 0x00000007u, 0, 0, 3, 11, 0, 0};   // (a, b, the step of a, the base shifts)
+  for (uint32_t i = 0; i < 12; ++i) block[16 + i] = __builtin_bit_cast(float, k[i]);
+  w.push_constants(bytes_of(block, sizeof block));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// A reserved (tiled) texture: 256 x 128 pixels, two 128 x 128 tiles, mapped to the places in a heap where two placed textures were filled (the second tile first), and drawn over the target.
+void scene_d3d12_tiled_texture(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_tex, sizeof b::k_ps_tex, 1);
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 3 * 65536;
+  Handle heap = rig.create(hd);
+  AllocationDesc id;
+  id.flags = kAllocTexture, id.format = Format::A8R8G8B8, id.width = id.height = 128, id.heap = heap, id.heap_offset = 0;
+  Handle first = rig.create(id);
+  id.heap_offset = 2 * 65536;
+  Handle second = rig.create(id);
+  ByteBuffer one(rig.allocator()), two(rig.allocator());
+  for (uint32_t y = 0; y < 128; ++y)
+    for (uint32_t x = 0; x < 128; ++x) {
+      one.put32(0xFF000000u | (((x / 16) & 1) ? 0xF04020u : 0x2040F0u) | (((y / 16) & 1) ? 0x00008000u : 0u));
+      two.put32(0xFF000000u | (x * 2 << 16) | (y * 2 << 8) | 0x40u);
+    }
+  rig.write(first, one.view());
+  rig.write(second, two.view());
+  AllocationDesc rd;
+  rd.flags = kAllocTexture | kAllocReserved, rd.format = Format::A8R8G8B8, rd.width = 256, rd.height = 128;
+  Handle texture = rig.create(rd);
+  rig.map_tiles(texture, 0, heap, 2 * 65536, 1);   // (tile 0 is what the second placed texture holds, tile 1 the first)
+  rig.map_tiles(texture, 1, heap, 0, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Nearest, out);
+}
+
+// Returns from inside a loop (dxil_ps_retloop_show.hlsl): a loop with a trip count from the colour that returns early when a running sum passes a threshold.
+void scene_dxil_return_in_loop(Rig& rig, ArrayView<uint32_t> out) {
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_retloop_show, sizeof b::k_dxil_ps_retloop_show, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+// Views of buffers in a pixel shader (dxil_ps_srv.hlsl): a structured buffer of uint4 and a byte address buffer, bound outside the pass to the slots after the unordered access ones.
+void scene_dxil_pixel_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStorageInDraws)) return void(rig.step("buffers in draws", status::kNotSupported));
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_srv, sizeof b::k_dxil_ps_srv, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  ByteBuffer structured(rig.allocator()), raw(rig.allocator());
+  for (uint32_t i = 0; i < 32 * 4; ++i) structured.put32(0x9E3779B9u * (i + 1));
+  for (uint32_t i = 0; i < 16; ++i) raw.put32(0x85EBCA6Bu * (i + 3));
+  Handle s = rig.buffer(kAllocUnorderedAccess, structured.view()), r = rig.buffer(kAllocUnorderedAccess, raw.view());
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, 32 * 16);
+  w.bind_uav(graphics::kMaxUavBuffers + 1, 3, 0, 16 * 4);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, s, r});
+  rig.read(target, out);
+}
+
+// A view of a buffer in a vertex shader (dxil_vs_srv.hlsl): the corners of a triangle moved by a table indexed by SV_VertexID.
+void scene_dxil_vertex_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStorageInDraws | graphics::kFeatureSystemInputs)) return void(rig.step("buffers in draws", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_dxil_vs_srv, sizeof b::k_dxil_vs_srv, b::k_ps_color, sizeof b::k_ps_color, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  const Vertex v[3] = {{-0.6f, -0.6f, 0.5f, 1, 0, 0, 1}, {0.6f, -0.6f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.6f, 0.5f, 0, 0, 1, 1}};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  const float offsets[16] = {-0.2f, -0.1f, 0, 1.0f, 0.3f, -0.2f, 0, 0.5f, 0.0f, 0.3f, 0, 0.8f, 0, 0, 0, 1.0f};
+  Handle table = rig.buffer(kAllocUnorderedAccess, bytes_of(offsets, sizeof offsets));
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, sizeof offsets);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, table});
+  rig.read(target, out);
+}
+
+// 16-bit types (dxil_ps_half_show.hlsl): halves rounded after each operation, 16-bit integers wrapped.
+void scene_dxil_16bit(Rig& rig, ArrayView<uint32_t> out) {
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_half_show, sizeof b::k_dxil_ps_half_show, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
 }
 
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
@@ -1050,6 +1285,35 @@ void scene_texture_cube(Rig& rig, ArrayView<uint32_t> out) {
   sample_layered(rig, out, b::k_ps_texcube, sizeof b::k_ps_texcube, texture, v, 6);
 }
 
+// gather4 of an array texture and of a cube texture (dxil_ps_gather_array / _cube.hlsl): the red and blue of the four texels of the footprint, in the layer or on the face the coordinate names.
+void scene_dxil_gather_array(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture2DArray, 3, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF8000u : layer == 1 ? 0x00FF80u : 0x8000FFu; });
+  Vertex v[18];
+  for (uint32_t i = 0; i < 3; ++i)
+    quad_pixels(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 32, [i](float u, float vv) { return graphics::Vec3{u * 0.9f + 0.05f, vv * 0.9f + 0.05f, static_cast<float>(i)}; });
+  sample_layered(rig, out, b::k_dxil_ps_gather_array, sizeof b::k_dxil_ps_gather_array, texture, v, 3);
+}
+
+void scene_dxil_gather_cube(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::TextureCube, 6, [](uint32_t face) -> uint32_t {
+    static const uint32_t kColours[6] = {0xFF0000u, 0x00FFFFu, 0x00FF00u, 0xFF00FFu, 0x0000FFu, 0xFFFF00u};
+    return kColours[face];
+  });
+  Vertex v[36];
+  for (uint32_t face = 0; face < 6; ++face) {
+    const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(face / 3 * 16);
+    quad_pixels(v + 6 * face, x0, y0, x0 + 10, y0 + 16, [face](float u, float vv) {
+      const float a = -0.7f + 1.4f * u, c = -0.7f + 1.4f * vv, axis = face % 2 ? -1.0f : 1.0f;   // (well inside the face: the footprint stays on it)
+      return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+    });
+  }
+  sample_layered(rig, out, b::k_dxil_ps_gather_cube, sizeof b::k_dxil_ps_gather_cube, texture, v, 6);
+}
+
 // The same textures read with Load, SampleLevel and GetDimensions (ps_texel3d / ps_texelarray / ps_texelcube): the picture is the texel loaded, the texel sampled and the size.
 void scene_texel_3d(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
@@ -1091,10 +1355,9 @@ void scene_texel_cube(Rig& rig, ArrayView<uint32_t> out) {
 
 // A compute shader (cs_fill.hlsl): 4 x 8 groups of 8 x 4 threads, each writing a pixel of a 32 x 32 picture into a structured buffer from its SV_DispatchThreadID, SV_GroupID and
 // SV_GroupIndex, a structured buffer of uint4 it writes and reads back, a constant from the constant buffer, and two atomic counters that must end at 1024. The picture is the buffer.
-void scene_compute(Rig& rig, ArrayView<uint32_t> out) {
+void compute_fill(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
-  namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_fill, sizeof b::k_cs_fill));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1250,12 +1513,50 @@ void scene_d3d12_heap(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// DXIL (Shader Model 6) shaders: a vertex shader with a constant buffer (a matrix and a tint) and three pixel shaders - one with a lot of arithmetic, one with branches and a discard, one with
+// loops - each drawing a triangle in a third of the picture. The kernel translates the bitcode to the tokens of the same shader, so this checks that what comes out runs on the GPU as it does on the CPU.
+void scene_dxil(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle first = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_math, sizeof b::k_dxil_ps_math, 0);
+  Handle second = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_flow, sizeof b::k_dxil_ps_flow, 0);
+  Handle third = dxbc_pipeline(rig, b::k_dxil_vs, sizeof b::k_dxil_vs, b::k_dxil_ps_loop, sizeof b::k_dxil_ps_loop, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  // (positions in the cell, colours, so that the varyings span ranges that take the branches both ways)
+  Vertex v[9];
+  for (uint32_t cell = 0; cell < 3; ++cell) {
+    const float x0 = -0.97f + 0.65f * static_cast<float>(cell), x1 = x0 + 0.6f;
+    v[3 * cell] = {x0, -0.9f, 0.5f, 0.9f, 0.1f, 0.1f, 1.0f};
+    v[3 * cell + 1] = {x1, -0.9f, 0.5f, 0.1f, 0.9f, 0.4f, 1.0f};
+    v[3 * cell + 2] = {(x0 + x1) * 0.5f, 0.9f, 0.5f, 0.2f, 0.3f, 0.9f, 0.6f};
+  }
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  float constants[20];
+  for (uint32_t k = 0; k < 16; ++k) constants[k] = kIdentity[k];
+  constants[16] = 1.0f, constants[17] = 0.9f, constants[18] = 1.0f, constants[19] = 1.0f;   // (the tint)
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(constants, sizeof constants));
+  w.bind_pipeline(first);
+  w.draw(3, 0);
+  w.bind_pipeline(second);
+  w.draw(3, 3);
+  w.bind_pipeline(third);
+  w.draw(3, 6);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
+void scene_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_cs_fill, sizeof conformance_blobs::k_cs_fill); }
+// The same shader as DXIL (cs_6_0).
+void scene_dxil_compute(Rig& rig, ArrayView<uint32_t> out) { compute_fill(rig, out, conformance_blobs::k_dxil_cs_fill, sizeof conformance_blobs::k_dxil_cs_fill); }
+
 // Group-shared memory and barriers (cs_shared.hlsl): 16 groups of 8 x 8 threads, each writing a slot of a 64-word shared array, reading its neighbour's after a barrier, and the 64 slots added
 // by a reduction with a barrier in its loop. The picture is the buffer: red the neighbour's value, green the sum, blue the thread.
-void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
+void compute_shared(Rig& rig, ArrayView<uint32_t> out, const uint8_t* code, uint32_t size) {
   if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
-  namespace b = conformance_blobs;
-  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_cs_shared, sizeof b::k_cs_shared));
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(code, size));
   PipelineDesc pd;
   pd.compute_shader = cs;
   Handle pipe = rig.pipeline(pd);
@@ -1269,6 +1570,33 @@ void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {picture});
   rig.read_words(picture, out);
 }
+
+void scene_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_cs_shared, sizeof conformance_blobs::k_cs_shared); }
+// Buffer shader resource views (dxil_cs_srv.hlsl): a structured buffer of uint4 (t0) and a byte address buffer (t1), read-only, combined into the picture buffer (u0).
+void scene_dxil_compute_srv(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureCompute)) return void(rig.step("compute", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle cs = rig.shader("create_shader (compute)", ShaderKind::Dxbc, graphics::ShaderStage::Compute, bytes_of(b::k_dxil_cs_srv, sizeof b::k_dxil_cs_srv));
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  Handle pipe = rig.pipeline(pd);
+  ByteBuffer structured(rig.allocator()), raw(rig.allocator());
+  for (uint32_t i = 0; i < kPixels * 4; ++i) structured.put32(0x01010101u * (i % 251) + i * 7);
+  for (uint32_t i = 0; i < kPixels; ++i) raw.put32(0x9E3779B9u * (i + 1));
+  Handle src = rig.buffer(kAllocUnorderedAccess, structured.view()), bytes = rig.buffer(kAllocUnorderedAccess, raw.view());
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 4;
+  Handle picture = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_pipeline(pipe);
+  w.bind_uav(0, 2, 0, kPixels * 4);
+  w.bind_uav(graphics::kMaxUavBuffers, 0, 0, kPixels * 16);
+  w.bind_uav(graphics::kMaxUavBuffers + 1, 1, 0, kPixels * 4);
+  w.dispatch(kSize / 8, kSize / 4, 1);
+  rig.render(w, {src, bytes, picture});
+  rig.read_words(picture, out);
+}
+void scene_dxil_compute_shared(Rig& rig, ArrayView<uint32_t> out) { compute_shared(rig, out, conformance_blobs::k_dxil_cs_shared, sizeof conformance_blobs::k_dxil_cs_shared); }
 
 // Multisampling (4 samples): a far red rectangle and a near green one that overlaps it, both with edges between the pixels' sample positions, drawn into 4x colour and depth images (depth
 // tested per sample) and resolved. Vertical and horizontal edges are covered the same by every device that uses the standard 4x pattern, whatever the order of the samples.
@@ -1314,12 +1642,12 @@ void scene_multisample(Rig& rig, ArrayView<uint32_t> out) {
 }
 
 // A geometry shader (gs_copy.hlsl): every triangle comes out as itself and, as a second strip, a half-size copy moved to the lower right with the red and blue swapped.
-void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
+void geometry_scene(Rig& rig, ArrayView<uint32_t> out, const uint8_t* gs_code, uint32_t gs_size) {
   if (!rig.has(graphics::kFeatureGeometryShaders)) return void(rig.step("geometry shaders", status::kNotSupported));
   namespace b = conformance_blobs;
   const Vertex v[3] = {{-0.9f, -0.9f, 0.5f, 1, 0, 0, 1}, {0.9f, -0.9f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.9f, 0.5f, 0, 0, 1, 1}};
   Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
-  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_gs_copy, sizeof b::k_gs_copy));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(gs_code, gs_size));
   Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
   PipelineDesc pd = colour_pipeline_desc(vs, ps);
   pd.varying_count = 3;
@@ -1337,6 +1665,10 @@ void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) {
   rig.render(w, {target, vb});
   rig.read(target, out);
 }
+
+void scene_geometry_shader(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_gs_copy, sizeof conformance_blobs::k_gs_copy); }
+// The same shader as DXIL (gs_6_0).
+void scene_dxil_geometry(Rig& rig, ArrayView<uint32_t> out) { geometry_scene(rig, out, conformance_blobs::k_dxil_gs_copy, sizeof conformance_blobs::k_dxil_gs_copy); }
 
 // The geometry shader that runs twice for each primitive (gs_copy_inst2: gs_copy with an instance count of 2): the same triangles drawn twice over, so the same picture as gs_copy's.
 void scene_geometry_instances(Rig& rig, ArrayView<uint32_t> out) {
@@ -2153,6 +2485,228 @@ TESS_SCENE(scene_tess_fractional_even,
            {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {2.5f, 3.7f, 5.2f, 4.4f}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_quad_even_cb), TESS_BLOB(ds_quad), 4, {3.3f, 2.2f, 6.6f, 4.1f}, {3.7f, 5.5f, 0, 0}, kNoCull},
            {TESS_BLOB(hs_iso_even_cb), TESS_BLOB(ds_iso), 2, {3, 5.5f, 0, 0}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(hs_tri_even_cb), TESS_BLOB(ds_noise), 3, {1, 1, 1, 1.6f}, {0, 0, 0, 0}, kNoCull})
 
+// The same with DXIL (Shader Model 6) hull and domain shaders: a triangle patch and a quad patch with different factors.
+TESS_SCENE(scene_dxil_tess,
+           {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {3, 6, 2, 4}, {0, 0, 0, 0}, kNoCull},
+           {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {4, 4, 4, 4}, {4, 4, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {2, 3, 5, 8}, {4, 3, 0, 0}, kNoCull})
+
+// Views of buffers in a geometry shader (dxil_gs_srv.hlsl): the triangle's corners moved by a table, and its colour scaled.
+void scene_dxil_geometry_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders | graphics::kFeatureStorageInDraws)) return void(rig.step("geometry shaders with buffers", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.6f, -0.6f, 0.5f, 1, 0, 0, 1}, {0.6f, -0.6f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.6f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_dxil_gs_srv, sizeof b::k_dxil_gs_srv));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  const float table[16] = {-0.3f, -0.1f, 0, 0, 0.2f, -0.3f, 0, 0, 0.3f, 0.2f, 0, 0, 0.8f, 0, 0, 0};
+  Handle buffer = rig.buffer(kAllocUnorderedAccess, bytes_of(table, sizeof table));
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, sizeof table);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, buffer});
+  rig.read(target, out);
+}
+
+// Views of buffers in a hull and a domain shader (dxil_hs_srv / dxil_ds_srv.hlsl): the tessellation factors and the bend of the edges come from a table.
+void scene_dxil_tess_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTessellation | graphics::kFeatureStorageInDraws)) return void(rig.step("tessellation with buffers", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_dxil_hs_srv, sizeof b::k_dxil_hs_srv));
+  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_dxil_ds_srv, sizeof b::k_dxil_ds_srv));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.hull_shader = hs;
+  pd.domain_shader = ds;
+  pd.cull_mode = graphics::CullMode::None;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  const Vertex v[3] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  const float table[8] = {4, 3, 5, 4, 0.5f, 0.6f, 0, 0};
+  Handle buffer = rig.buffer(kAllocUnorderedAccess, bytes_of(table, sizeof table));
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, sizeof table);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.set_topology(patch_list(3));
+  w.draw(3, 0);
+  w.end_pass();
+  rig.render(w, {target, vb, buffer});
+  rig.read(target, out);
+}
+
+// A pixel shader that writes buffers (dxil_ps_uav.hlsl): every pixel stores its coordinates in a structured buffer and adds to two atomic counters; the picture shows the buffer.
+void scene_dxil_pixel_stores(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureFragmentStores)) return void(rig.step("buffer writes in draws", status::kNotSupported));
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_uav, sizeof b::k_dxil_ps_uav, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 16;
+  Handle picture = rig.create(d);
+  d.size = 16;
+  Handle counters = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_uav(0, 2, 0, kPixels * 16);
+  w.bind_uav(1, 3, 0, 16);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, picture, counters});
+  // The picture is the buffer: red and green the pixel's coordinates, blue the colour byte, alpha the last word; a counter that is not the number of pixels paints it over.
+  uint32_t words[kPixels * 4];
+  rig.read_words(picture, ArrayView<uint32_t>(words, kPixels * 4));
+  for (uint32_t i = 0; i < kPixels; ++i) out[i] = (words[4 * i + 3] & 0xFF) << 24 | (words[4 * i] * 8 & 0xFF) << 16 | (words[4 * i + 1] * 8 & 0xFF) << 8 | (words[4 * i + 2] & 0xFF);
+  if (rig.read_u64(counters, 0) != (uint64_t{kPixels} | (uint64_t{1536} << 32)))
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
+// gather4 with constant offsets (dxil_ps_gather_off.hlsl) over the checker texture, and gather4_c (dxil_ps_gather_cmp.hlsl) over a texture whose red grows from the left.
+void scene_dxil_gather_offsets(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_gather_off, sizeof b::k_dxil_ps_gather_off, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+void scene_dxil_gather_compare(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_gather_cmp, sizeof b::k_dxil_ps_gather_cmp, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16);
+  Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(texture, bytes_of(texels, sizeof texels));
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+// gather4_po (gather_po.dxbc, assembled by the host test): the footprint moved by an offset worked out from the colour in a register - a -4 .. 4 texel shift of a 4 x 4 ramp, clamped.
+void scene_gather_register_offsets(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_gather_po, sizeof b::k_gather_po, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16) | ((20 + (i / 4) * 50) << 8);
+  Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(texture, bytes_of(texels, sizeof texels));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Linear;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex v[6] = {vert(-0.9f, -0.9f, 0, 0), vert(0.9f, -0.9f, 1, 0), vert(-0.9f, 0.9f, 0, 1), vert(-0.9f, 0.9f, 0, 1), vert(0.9f, -0.9f, 1, 0), vert(0.9f, 0.9f, 1, 1)};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, sampler);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+
+// A vertex shader that writes buffers (dxil_vs_uav.hlsl): 1023 vertices of degenerate triangles, each logging its position and number in a structured buffer and adding to a counter; the
+// picture shows the log.
+void scene_dxil_vertex_stores(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureVertexStores)) return void(rig.step("buffer writes by vertex shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_dxil_vs_uav, sizeof b::k_dxil_vs_uav, b::k_ps_color, sizeof b::k_ps_color, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Vertex v[1023];
+  for (uint32_t i = 0; i < 1023; ++i) v[i] = {-0.95f + 1.9f * static_cast<float>(i % 32) / 31.0f, -0.95f + 1.9f * static_cast<float>(i / 32) / 31.0f, 0.25f + 0.5f * static_cast<float>(i % 3) / 2.0f, 1, 0, 0, 1};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 16;
+  Handle log = rig.create(d);
+  d.size = 16;
+  Handle counter = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_uav(0, 2, 0, kPixels * 16);
+  w.bind_uav(1, 3, 0, 16);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(1023);
+  w.end_pass();
+  rig.render(w, {target, vb, log, counter});
+  uint32_t words[kPixels * 4];
+  rig.read_words(log, ArrayView<uint32_t>(words, kPixels * 4));
+  for (uint32_t i = 0; i < kPixels; ++i) {
+    const float x = __builtin_bit_cast(float, words[4 * i]), y = __builtin_bit_cast(float, words[4 * i + 1]), z = __builtin_bit_cast(float, words[4 * i + 2]), id = __builtin_bit_cast(float, words[4 * i + 3]);
+    out[i] = (static_cast<uint32_t>(z * 255.0f) & 0xFF) << 24 | (static_cast<uint32_t>((x + 1.0f) * 127.0f) & 0xFF) << 16 | (static_cast<uint32_t>((y + 1.0f) * 127.0f) & 0xFF) << 8 | (static_cast<uint32_t>(id) & 0xFF);
+  }
+  if (rig.read_u64(counter, 0) != 1023)
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
+// A geometry shader that writes buffers (dxil_gs_uav.hlsl): 255 small triangles, each logging its first two corners at the place its colour names and adding to a counter; the picture shows
+// the log.
+void scene_dxil_geometry_stores(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders | graphics::kFeatureGeometryStores)) return void(rig.step("buffer writes by geometry shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_dxil_gs_uav, sizeof b::k_dxil_gs_uav));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Vertex v[255 * 3];
+  for (uint32_t t = 0; t < 255; ++t) {
+    const float cx = -0.9f + 1.8f * static_cast<float>(t % 16) / 15.0f, cy = -0.9f + 1.8f * static_cast<float>(t / 16) / 15.0f, c = static_cast<float>(t) / 255.0f;
+    v[3 * t] = {cx, cy, 0.5f, c, 0.5f, 0.5f, 1}, v[3 * t + 1] = {cx + 0.05f, cy, 0.5f, c, 0.5f, 0.5f, 1}, v[3 * t + 2] = {cx, cy + 0.05f, 0.5f, c, 0.5f, 0.5f, 1};
+  }
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 16;
+  Handle log = rig.create(d);
+  d.size = 16;
+  Handle counter = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_uav(0, 2, 0, kPixels * 16);
+  w.bind_uav(1, 3, 0, 16);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(255 * 3);
+  w.end_pass();
+  rig.render(w, {target, vb, log, counter});
+  uint32_t words[kPixels * 4];
+  rig.read_words(log, ArrayView<uint32_t>(words, kPixels * 4));
+  for (uint32_t i = 0; i < kPixels; ++i) {
+    auto byte = [&](uint32_t k) { return static_cast<uint32_t>((__builtin_bit_cast(float, words[4 * i + k]) + 1.0f) * 127.0f) & 0xFF; };
+    out[i] = byte(3) << 24 | byte(0) << 16 | byte(1) << 8 | byte(2);
+  }
+  if (rig.read_u64(counter, 0) != 255)
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2187,6 +2741,35 @@ const Entry kScenes[] = {
     {"Direct3D 12 root signature, descriptors and states: compute (DXBC)", scene_d3d12_compute},
     {"Direct3D 12 root signature, descriptors and states: textures (DXBC)", scene_d3d12_textures},
     {"Direct3D 12 resource heap: a target and a texture aliased (DXBC)", scene_d3d12_heap},
+    {"Direct3D 12 DXIL shaders (Shader Model 6)", scene_dxil},
+    {"Direct3D 12 DXIL compute shader (Shader Model 6)", scene_dxil_compute},
+    {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
+    {"Direct3D 12 DXIL hull and domain shaders (Shader Model 6)", scene_dxil_tess},
+    {"Direct3D 12 DXIL gather4 (Shader Model 6)", scene_dxil_gather},
+    {"Direct3D 12 DXIL gather4 on layers of an image set (Shader Model 6)", scene_dxil_gather_array},
+    {"Direct3D 12 DXIL gather4 on a cubemap (Shader Model 6)", scene_dxil_gather_cube},
+    {"Direct3D 12 DXIL gather4 with offsets (Shader Model 6)", scene_dxil_gather_offsets},
+    {"Direct3D 12 DXIL gather4 with a comparison (Shader Model 6)", scene_dxil_gather_compare},
+    {"Direct3D 11 gather4 with the offset in a register (DXBC)", scene_gather_register_offsets},
+    {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
+    {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
+    {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},
+    {"Direct3D 12 DXIL comparison sampling (Shader Model 6)", scene_dxil_compare},
+    {"Direct3D 12 DXIL double precision (Shader Model 6)", scene_dxil_double},
+    {"Direct3D 12 DXIL 64-bit integers (Shader Model 6)", scene_dxil_int64},
+    {"Direct3D 12 reserved texture", scene_d3d12_tiled_texture},
+    {"Direct3D 12 DXIL returns inside a loop (Shader Model 6)", scene_dxil_return_in_loop},
+    {"Direct3D 12 DXIL half floats and int16 (Shader Model 6)", scene_dxil_16bit},
+    {"Direct3D 12 DXIL buffer views in a pixel shader (Shader Model 6)", scene_dxil_pixel_buffers},
+    {"Direct3D 12 DXIL buffer views in a vertex shader (Shader Model 6)", scene_dxil_vertex_buffers},
+    {"Direct3D 12 DXIL buffer writes by a pixel shader (Shader Model 6)", scene_dxil_pixel_stores},
+    {"Direct3D 12 DXIL buffer writes by a vertex shader (Shader Model 6)", scene_dxil_vertex_stores},
+    {"Direct3D 12 DXIL buffer writes by the geometry stage (Shader Model 6)", scene_dxil_geometry_stores},
+    {"Direct3D 12 DXIL buffer views in the geometry stage (Shader Model 6)", scene_dxil_geometry_buffers},
+    {"Direct3D 12 DXIL buffer views in the hull and domain stages (Shader Model 6)", scene_dxil_tess_buffers},
+    {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
+    {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
+    {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
     {"Direct3D 11 stream output of two streams (DXBC)", scene_stream_output},
     {"Direct3D 11 stream output appending, statistics and timestamps (DXBC)", scene_stream_output_append},
     {"Direct3D 11 stream output of vertex and domain shaders (DXBC)", scene_stream_output_stages},

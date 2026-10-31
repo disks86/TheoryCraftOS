@@ -73,7 +73,7 @@ class FileLibraryProvider final : public ILibraryProvider {
 
 // One image of the process: the program itself or a DLL it (indirectly) imports.
 struct Module {
-  explicit Module(allocators::IAllocator& allocator) : name(allocator), owned(allocator) {}
+  explicit Module(allocators::IAllocator& allocator) : name(allocator), owned(allocator), forward_deps(allocator) {}
   String name;                          // canonical
   exe::PeFile owned;                    // the parsed headers of a DLL (the program's are the caller's)
   const exe::PeFile* pe = nullptr;      // the headers in use: &owned, or the program's
@@ -85,6 +85,7 @@ struct Module {
   uint32_t refs = 0;
   bool pinned = false, doomed = false;
   bool no_bind = false;                 // mapped only: no imports bound, no dependencies, no thread-local data (an image that is not a DLL, or DONT_RESOLVE_DLL_REFERENCES)
+  List<Module*> forward_deps;           // libraries that a forwarded export of this one was resolved through: they stay loaded as long as this one does (like its imports)
   int32_t tls_index = -1;               // the slot of its thread-local data in every thread's array (a library loaded after start-up), or -1
 };
 
@@ -125,8 +126,12 @@ class ModuleSet {
 // the load: its slot points at a stub that stops the program with a message when it is called, which describe_missing() explains. `main_image` is the program as
 // load_pe() mapped it. Fails (NeedsLibraries, Malformed, OutOfMemory) only for a library file that is damaged, built for another CPU, or has no relocations when its
 // base is taken. `detail` gets a text for the user on failure.
+// With `bind_program` false the program's own import table is left as the file has it (bind_program_imports() fills it in later: a process that is created suspended has not
+// resolved its imports yet).
 LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& allocator, const exe::PeFile& program, ConstByteView program_file, StringView program_name,
-                                ILibraryProvider& provider, ModuleSet* out, String* detail);
+                                ILibraryProvider& provider, ModuleSet* out, String* detail, bool bind_program = true);
+// The import table of the program (the first module of the set), when load_windows_modules() left it alone.
+LoadStatus bind_program_imports(AddressSpace& space, allocators::IAllocator& allocator, const exe::PeFile& program, ModuleSet* set);
 
 // After start-up: loads one more library (the file `provider` has for `canonical_name`) and the libraries it imports that are not loaded yet, into the process that `set` describes,
 // and binds their imports. What was loaded is appended to `set` (modules_ and, in the order their entry points must run, order_): the caller reads set->count() and set->init_count()
@@ -134,6 +139,8 @@ LoadStatus load_windows_modules(AddressSpace& space, allocators::IAllocator& all
 LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& allocator, ILibraryProvider& provider, ModuleSet* set, StringView canonical_name, String* detail, bool bind = true);
 // LoadLibrary of a library that is loaded already: counts one more use. False if no such library is there (or it is on its way out).
 bool reference_library(ModuleSet* set, StringView canonical_name, uint64_t* base);
+// The library at `from` depends on the one at `to` from now on (once for a pair); false if either is not there.
+bool link_libraries(ModuleSet* set, uint64_t from, uint64_t to);
 // FreeLibrary: counts one use less. The libraries nobody uses any more (the one at `base`, then what only it kept alive) are marked and appended to `out` in the order their
 // entry points must be called with DLL_PROCESS_DETACH; they stay mapped until unload_library(). Nothing is appended while uses remain, or for a pinned library.
 bool release_library(ModuleSet* set, allocators::IAllocator& allocator, uint64_t base, List<Module*>* out);

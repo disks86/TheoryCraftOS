@@ -41,6 +41,8 @@ uint32_t nt_open_process(Process& p, const SyscallRequest& r);
 bool read_program_file(Process& p, StringView path, ByteBuffer* out, uint32_t* status);
 // A handle to a process created by this system (or 0 if the handle names something else), and what it is.
 bool process_handle_info(Process& p, uint64_t handle, bool* exited, uint32_t* code, uint64_t* pid);
+// Does the handle lack every right in `rights` (an OpenProcess with a smaller access mask)? The pseudo handle (-1) and handles made some other way have them all.
+bool process_handle_lacks(Process& p, uint64_t handle, uint32_t rights);
 // True for the pseudo handle (-1) and for a handle opened on this process's own id.
 bool names_own_process(Process& p, uint64_t handle);
 // NtTerminateProcess / NtResumeThread on a handle from nt_create_user_process; `handled` is false if the handle is not one.

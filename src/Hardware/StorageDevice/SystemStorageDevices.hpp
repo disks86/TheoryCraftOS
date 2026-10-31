@@ -21,6 +21,7 @@
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Bus/Usb/UsbPortWatcher.hpp"
+#include "Hardware/StorageDevice/IRemovableMediaSource.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Kernel/Sync.hpp"
@@ -61,6 +62,9 @@ class SystemStorageDevices {
       : pci_(pci), usb_(usb), allocator_(allocator), st_(st), devices_(allocator), pending_(allocator), watcher_(usb) {}
 
   void initialize();
+  // A source of removable media outside the buses watched here (the SD slot). poll() asks it for new devices; one that is not present any more is taken out like a pulled USB stick.
+  // The source must outlive this object. False when the list (kMaxSources) is full.
+  bool add_source(IRemovableMediaSource* source);
   // Stops every device and frees them.
   void shutdown();
 
@@ -103,6 +107,8 @@ class SystemStorageDevices {
   List<StorageEvent> pending_;    // changes found but not yet handed out
   uint32_t next_id_ = 1;
   UsbPortWatcher watcher_;        // the USB ports as last looked at
+  static constexpr uint32_t kMaxSources = 4;
+  IRemovableMediaSource* sources_[kMaxSources] = {};
 };
 
 }  // namespace hardware

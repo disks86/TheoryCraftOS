@@ -66,6 +66,7 @@ struct OpenObject {
   bool no_data_access = false;      // opened for its attributes only (no read, write or execute right): it cannot be mapped
   uint32_t granted_access = 0xFFFFFFFFu;      // the access mask it was opened with (Windows; a handle made some other way has every right)
   bool delete_on_close = false;
+  bool is_link = false;             // a symbolic link opened itself (not what it points to): it has no data, only the link
   // Directory listing: 0 = "." next, 1 = ".." next, 2 = the real entries.
   uint32_t directory_phase = 0;
   uint64_t directory_index = 0;      // entries handed out so far (a cookie for getdents)
@@ -108,8 +109,11 @@ class ProcessFiles {
   bool protected_from_close(uint64_t slot) const { return slot < kMaxDescriptors && slots_[slot].protect; }
   void set_handle_flags(uint64_t slot, bool inherit, bool protect) { if (slot < kMaxDescriptors) { slots_[slot].inherit = inherit; slots_[slot].protect = protect; } }
   // A new process's table gets the handles of `parent` that are inheritable, at the same numbers (what a Windows child receives). Console descriptors stay as they are.
-  // `copy_token` is called for each token-carrying kind so the owner can count the extra use; returns how many were copied.
-  uint32_t inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token));
+  // `copy_token` is called for each token-carrying kind so the owner can count the extra use; returns how many were copied. With `restrict` only the descriptors in `only` are.
+  uint32_t inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token), const uint64_t* only = nullptr, uint32_t only_count = 0, bool restrict = false);
+  // The one descriptor `slot` of `parent`, inheritable or not, with its handle flags, if this table has nothing at that number yet. False if the parent has nothing there or this
+  // table does.
+  bool adopt_from(const ProcessFiles& parent, uint64_t slot, void (*copy_token)(DescriptorKind kind, uint64_t token));
   // Opens a device node as a descriptor (the Null/Zero/Random kinds).
   int64_t open_device(DescriptorKind kind);
   // A descriptor for something the process keeps track of itself (a thread): `token` says which one. -1 if the table is full.
@@ -129,6 +133,15 @@ class ProcessFiles {
   // --- operations on cleaned virtual paths
   filesystem::Status open(StringView virtual_path, const OpenFlags& flags, uint32_t* slot, bool* created = nullptr);
   filesystem::Status stat(StringView virtual_path, filesystem::DirectoryEntry* entry);
+  // Puts the exact times the system keeps for the file (see ObjectManager::file_times_set) into `entry`.
+  void apply_precise_times(StringView virtual_path, filesystem::DirectoryEntry* entry) const;
+  // A name that is a symbolic link itself, even one whose target is not there: its entry (a directory or a file by what it was made to point to, with is_symlink) and the place it
+  // points to as the file system keeps it. NotFound, or InvalidArgument for a name that is not a link.
+  filesystem::Status stat_link(StringView virtual_path, filesystem::DirectoryEntry* entry, String* host_target = nullptr);
+  // The path of this process's tree that a path of the file system underneath names (what a link keeps as its target); false if it is outside.
+  bool virtual_path_of_host(StringView host, String* out) const;
+  // A descriptor for the link itself (File kind, no file behind it).
+  filesystem::Status open_link(StringView virtual_path, uint32_t* slot);
   filesystem::Status make_directory(StringView virtual_path);
   filesystem::Status set_metadata(StringView virtual_path, const filesystem::MetadataChange& change);
   filesystem::Status remove(StringView virtual_path);
@@ -149,6 +162,11 @@ class ProcessFiles {
   // Next entry of a directory, "." and ".." first. Ok, EndOfDirectory, or an error. `pending` entries are kept by the caller via the object.
   filesystem::Status next_entry(OpenObject& object, filesystem::DirectoryEntry* entry);
   void rewind(OpenObject& object);
+
+ public:
+  // The path as the file system spells it: the case of every name as it is stored, and the directories that are symbolic links replaced by what they point at (the last name is
+  // kept as it is, a link opened itself stays the link). False if it cannot be worked out.
+  bool canonical_path(StringView virtual_path, String* out, uint32_t depth = 0) const;
 
  private:
   struct Slot {

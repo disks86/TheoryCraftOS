@@ -64,6 +64,7 @@ struct WindowsStartupInput {
   // The loaded modules: the program first, then the libraries in load order. `init_order` lists indexes into `modules` in the order the libraries start in.
   ArrayView<const WindowsModule> modules;
   ArrayView<const uint32_t> init_order;
+  bool defer_ldr = false;      // PEB.Ldr stays empty (UserProgram::finish_loading() sets it)
 };
 
 // KUSER_SHARED_DATA is mapped here in every Windows process; programs and ntdll read the version and the processor count from it.

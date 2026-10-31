@@ -310,6 +310,21 @@ class VirglImage final : public IImage {
     return device_.gpu().command(as_bytes(transfer));
   }
 
+  // A rectangle: its rows go to the same place in the backing (the backing is the whole image), and the host copies just that box.
+  bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) override {
+    const Extent2D e = desc_.extent;
+    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || is_wide_format(desc_.format) || !area.width || !area.height || pitch < area.width) return false;
+    if (area.x < 0 || area.y < 0 || uint64_t{static_cast<uint32_t>(area.x)} + area.width > e.width || uint64_t{static_cast<uint32_t>(area.y)} + area.height > e.height) return false;
+    if (pixels.size() < uint64_t{area.height - 1} * pitch + area.width) return false;
+    if (!ensure_backing(uint64_t{e.width} * e.height)) return false;
+    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
+    for (uint32_t j = 0; j < area.height; ++j)
+      for (uint32_t i = 0; i < area.width; ++i) staged[uint64_t{static_cast<uint32_t>(area.y) + j} * e.width + static_cast<uint32_t>(area.x) + i] = pixels[uint64_t{j} * pitch + i];
+    const uint64_t offset = (uint64_t{static_cast<uint32_t>(area.y)} * e.width + static_cast<uint32_t>(area.x)) * 4;
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {static_cast<uint32_t>(area.x), static_cast<uint32_t>(area.y), 0, area.width, area.height, 1}, offset, id_, 0, e.width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer));
+  }
+
  private:
   // Guest memory for the host to copy from or into, attached on first use.
   bool ensure_backing(uint64_t pixel_count) {
@@ -834,7 +849,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     VirglBuffer* buffer = nullptr;
     uint64_t offset = 0, size = 0;
   } storage[kMaxStorageBuffers];
-  bool storage_dirty = false, compute_constants_dirty = false;
+  bool storage_dirty = false, draw_storage_dirty = false, compute_constants_dirty = false;
   // Stream output: the buffers bound (kept here) and the host's target objects for them. The objects are made when a draw with stream output first needs them and live to the end of the submit:
   // the host's transform feedback goes on in them from draw to draw (the position in the buffers is the host's) and only ends when they are destroyed; it can only go on with the program it
   // began with, so another program that draws stream output ends it (and the buffers start again where they were bound). It makes the draws of other programs fail unless the targets are not
@@ -1081,9 +1096,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
-        if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
+        if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         storage[cmd.unit] = {static_cast<VirglBuffer*>(cmd.buffer), cmd.offset, cmd.count};
         storage_dirty = true;
+        draw_storage_dirty = true;
         break;
       case RecordedCommand::Type::Dispatch: {
         if (in_pass || !compute) return false;
@@ -1246,6 +1262,32 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         if (pipeline->desc().stream_output_count && !begin_stream_output()) return false;
+        if (draw_storage_dirty) {
+          // The buffers the stages of a draw read and write, from the host's binding point 0: the views first (t0 .. t3), the unordered access buffers after them (u0 .. u3), the way their TGSI
+          // numbers them; the compute shader's bindings are made again before a dispatch.
+          StorageBinding host[kMaxStorageBuffers];
+          uint32_t slots = 0;
+          for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) {
+            host[k] = storage[k < kMaxSrvBuffers ? kMaxUavBuffers + k : k - kMaxSrvBuffers];
+            if (host[k].buffer) slots = k + 1;
+          }
+          const GraphicsPipelineDesc& pd = pipeline->desc();
+          const uint32_t stages[5] = {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval};
+          for (uint32_t which = 0; which < 5; ++which) {
+            if ((which == 2 && !pd.geometry_shader) || ((which == 3 || which == 4) && !pd.hull_shader)) continue;   // (only the stages the pipeline has)
+            const uint32_t stage = stages[which];
+            stream.command(virgl::kSetShaderBuffers, 0, 2 + 3 * slots);
+            stream.put(stage);
+            stream.put(0);
+            for (uint32_t k = 0; k < slots; ++k) {
+              stream.put(static_cast<uint32_t>(host[k].offset));
+              stream.put(static_cast<uint32_t>(host[k].size));
+              stream.put(host[k].buffer ? host[k].buffer->id() : 0);
+            }
+          }
+          storage_dirty = true;
+          draw_storage_dirty = false;
+        }
         if (const uint32_t unit_count = pipeline->desc().texture_count) {
           for (uint32_t unit = 0; unit < unit_count; ++unit)
             if (!textures[unit] || textures[unit] == color || textures[unit] == depth) return false;   // unbound, or the image being drawn into
@@ -1310,6 +1352,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (patches) {
           stream.put(patch_points);
           stream.put(0);   // draw id
+        }
+        if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores || pipeline->desc().geometry_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
+          stream.command(virgl::kMemoryBarrier, 0, 1);
+          stream.put(0xFFFFFFFFu);
         }
         break;
       }

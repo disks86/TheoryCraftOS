@@ -65,20 +65,38 @@ EXPORT DWORD WINAPI GetTickCount(void);
 static BOOL console_write_hook(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, BOOL *handled);
 static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, BOOL *handled);
 static BOOL con_input_ready(void);
+static BOOL con_wait_polled(HANDLE h);
+static void con_sync_signals(void);
+static LONG con_unbound_kind(HANDLE h);
+static BOOL con_attached(void);
+/* A handle of a console that this process no longer belongs to is of no use. */
+static BOOL con_dead_handle(HANDLE h) { return !con_attached() && con_unbound_kind(h) != 0; }
+static void con_handle_closed(HANDLE h);
 static BOOL con_is_input(HANDLE h);
+static void con_alias_add(HANDLE h, BOOL input);
+static void con_alias_forget(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
 static BOOL is_dos_device_name(const WCHAR *name);
+static BOOL vol_prefix_ci(const WCHAR *s, const WCHAR *prefix);
+static DWORD vol_len(const WCHAR *s);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h);
 static void port_note(HANDLE file, LPOVERLAPPED overlapped, ULONG_PTR bytes);      /* (extra3.inc: a finished overlapped call is queued at the port its file is tied to) */
 static void port_unlink(HANDLE file);
 /* The files opened with FILE_FLAG_OVERLAPPED (every file is opened for synchronous calls underneath; this is what the flag said). */
 static HANDLE volatile g_overlapped_files[256];
 static void overlapped_note(HANDLE h) { for (int i = 0; i < 256; ++i) if (__sync_bool_compare_and_swap(&g_overlapped_files[i], (HANDLE)NULL, h)) return; }
-static void overlapped_forget(HANDLE h) { for (int i = 0; i < 256; ++i) __sync_bool_compare_and_swap(&g_overlapped_files[i], h, (HANDLE)NULL); }
+static void unbuffered_forget(HANDLE h);
+static void overlapped_forget(HANDLE h) { for (int i = 0; i < 256; ++i) __sync_bool_compare_and_swap(&g_overlapped_files[i], h, (HANDLE)NULL); unbuffered_forget(h); }
 static BOOL overlapped_known(HANDLE h) { for (int i = 0; i < 256; ++i) if (g_overlapped_files[i] == h) return TRUE; return FALSE; }
+/* Those of them opened without buffering as well: a call on one goes to the disk, so it is never answered at once. */
+static HANDLE volatile g_unbuffered_files[256];
+static void unbuffered_note(HANDLE h) { for (int i = 0; i < 256; ++i) if (__sync_bool_compare_and_swap(&g_unbuffered_files[i], (HANDLE)NULL, h)) return; }
+static void unbuffered_forget(HANDLE h) { for (int i = 0; i < 256; ++i) __sync_bool_compare_and_swap(&g_unbuffered_files[i], h, (HANDLE)NULL); }
+static BOOL unbuffered_known(HANDLE h) { for (int i = 0; i < 256; ++i) if (g_unbuffered_files[i] == h) return TRUE; return FALSE; }
 EXPORT BOOL WINAPI GetFileAttributesExW(LPCWSTR path, int level, LPVOID data);
+EXPORT DWORD WINAPI GetFinalPathNameByHandleW(HANDLE h, LPWSTR buffer, DWORD capacity, DWORD flags);
 static BOOL fail_nt(NTSTATUS status) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
 static PVOID heap(void) { return RtlProcessHeap(); }
 static WCHAR upper(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
@@ -299,7 +317,6 @@ EXPORT BOOL WINAPI GetExitCodeProcess(HANDLE h, LPDWORD code) {
   *code = (DWORD)info[0];
   return TRUE;
 }
-EXPORT BOOL WINAPI IsWow64Process(HANDLE h, LPBOOL wow) { (void)h; *wow = FALSE; return TRUE; }
 EXPORT BOOL WINAPI IsDebuggerPresent(void) { return NtCurrentPeb()->BeingDebugged != 0; }
 EXPORT BOOL WINAPI CheckRemoteDebuggerPresent(HANDLE h, LPBOOL present) {
   if (!h || !present) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
@@ -366,7 +383,12 @@ EXPORT BOOL WINAPI DisableThreadLibraryCalls(HMODULE m) {
 
 static RTL_USER_PROCESS_PARAMETERS *parameters(void) { return NtCurrentPeb()->ProcessParameters; }
 
-EXPORT LPWSTR WINAPI GetCommandLineW(void) { return parameters()->CommandLine.Buffer; }
+/* (the address is kept from the first call: a program that clears the field in the parameters afterwards still gets its command line) */
+EXPORT LPWSTR WINAPI GetCommandLineW(void) {
+  static LPWSTR cached;
+  if (!cached) cached = parameters()->CommandLine.Buffer;
+  return cached;
+}
 EXPORT LPSTR WINAPI GetCommandLineA(void) {
   static LPSTR cached;
   if (!cached) {
@@ -451,37 +473,12 @@ EXPORT BOOL WINAPI SetEnvironmentStringsW(LPWSTR block) {
   return TRUE;
 }
 /* Builds a new block with NAME set (or removed when value is NULL) and points the process parameters at it. */
+IMPORT NTSTATUS NTAPI RtlSetEnvironmentVar(PWSTR *penv, PCWSTR name, SIZE_T name_len, PCWSTR value, SIZE_T value_len);
 EXPORT BOOL WINAPI SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value) {
   if (!name || !*name || wcslen(name) > 32767) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   for (const WCHAR *c = name; *c; ++c) if (*c == '=') { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  const WCHAR *old = parameters()->Environment;
-  size_t_ old_units = 0;
-  while (old[old_units] || old[old_units + 1]) ++old_units;
-  old_units += 2;
-  const size_t_ name_length = wcslen(name), value_length = value ? wcslen(value) : 0;
-  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (old_units + name_length + value_length + 4) * 2);
-  if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
-  size_t_ out = 0;
-  for (const WCHAR *e = old; *e; e += wcslen(e) + 1) {
-    size_t_ i = 0;
-    while (i < name_length && e[i] && upper(e[i]) == upper(name[i])) ++i;
-    if (i == name_length && e[i] == '=') continue;      /* replaced or removed */
-    const size_t_ n = wcslen(e) + 1;
-    memcpy(fresh + out, e, n * 2);
-    out += n;
-  }
-  if (value) {
-    memcpy(fresh + out, name, name_length * 2);
-    out += name_length;
-    fresh[out++] = '=';
-    memcpy(fresh + out, value, value_length * 2);
-    out += value_length;
-    fresh[out++] = 0;
-  }
-  fresh[out++] = 0;
-  if (out == 1) fresh[out++] = 0;
-  parameters()->Environment = fresh;
-  return TRUE;
+  const NTSTATUS status = RtlSetEnvironmentVar(NULL, name, wcslen(name), value, value ? wcslen(value) : 0);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI SetEnvironmentVariableA(LPCSTR name, LPCSTR value) {
   WCHAR *n = to_wide(name), *v = value ? to_wide(value) : NULL;
@@ -550,39 +547,102 @@ EXPORT DWORD WINAPI ExpandEnvironmentStringsA(LPCSTR source, LPSTR dest, DWORD c
   return needed;
 }
 
-/* The startup information the process was created with: the fields of the process parameters (the strings are the ones in the parameters). */
+/* The startup information the process was created with: the fields of the process parameters (the strings are the ones in the parameters). The standard handles are in it
+   only if the process was started with STARTF_USESTDHANDLES: the wide version leaves them as they are, the ANSI one sets them to INVALID_HANDLE_VALUE. */
 EXPORT void WINAPI GetStartupInfoW(LPSTARTUPINFOW info) {
   const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
-  memset(info, 0, sizeof(*info));
   info->cb = sizeof(*info);
+  info->lpReserved = NULL;
   info->lpDesktop = pp->DesktopInfo.Buffer;
   info->lpTitle = pp->WindowTitle.Buffer;
   info->dwX = pp->StartingX; info->dwY = pp->StartingY; info->dwXSize = pp->CountX; info->dwYSize = pp->CountY;
   info->dwXCountChars = pp->CountCharsX; info->dwYCountChars = pp->CountCharsY; info->dwFillAttribute = pp->FillAttribute;
   info->dwFlags = pp->WindowFlags;
   info->wShowWindow = (WORD)pp->ShowWindowFlags;
-  info->hStdInput = pp->StandardInput;
-  info->hStdOutput = pp->StandardOutput;
-  info->hStdError = pp->StandardError;
+  info->cbReserved2 = 0;
+  info->lpReserved2 = NULL;
+  if (pp->WindowFlags & 0x100) {
+    info->hStdInput = pp->StandardInput;
+    info->hStdOutput = pp->StandardOutput;
+    info->hStdError = pp->StandardError;
+  }
 }
-/* The same with ANSI strings, converted once and kept. */
+/* The same with ANSI strings, converted once and kept: the first call makes it and later calls give the same answer whatever happens to the parameters. */
 EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
   static char title[260], desktop[260];
-  const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
-  STARTUPINFOW wide;
-  GetStartupInfoW(&wide);
-  memset(info, 0, sizeof(*info));
-  info->cb = sizeof(*info);
-  if (wide.lpTitle) { WideCharToMultiByte(CP_UTF8, 0, wide.lpTitle, -1, title, sizeof(title), NULL, NULL); info->lpTitle = title; }
-  if (wide.lpDesktop) { WideCharToMultiByte(CP_UTF8, 0, wide.lpDesktop, -1, desktop, sizeof(desktop), NULL, NULL); info->lpDesktop = desktop; }
-  info->dwX = wide.dwX; info->dwY = wide.dwY; info->dwXSize = wide.dwXSize; info->dwYSize = wide.dwYSize;
-  info->dwXCountChars = wide.dwXCountChars; info->dwYCountChars = wide.dwYCountChars; info->dwFillAttribute = wide.dwFillAttribute;
-  info->dwFlags = wide.dwFlags; info->wShowWindow = wide.wShowWindow;
-  info->hStdInput = pp->StandardInput; info->hStdOutput = pp->StandardOutput; info->hStdError = pp->StandardError;
+  static STARTUPINFOA cached;
+  static volatile LONG state;      /* 0: not made, 1: being made, 2: made */
+  if (state != 2) {
+    if (__sync_bool_compare_and_swap(&state, 0, 1)) {
+      const RTL_USER_PROCESS_PARAMETERS *pp = parameters();
+      STARTUPINFOW wide;
+      GetStartupInfoW(&wide);
+      memset(&cached, 0, sizeof(cached));
+      cached.cb = sizeof(cached);
+      if (wide.lpTitle) { WideCharToMultiByte(CP_UTF8, 0, wide.lpTitle, -1, title, sizeof(title), NULL, NULL); cached.lpTitle = title; }
+      if (wide.lpDesktop) { WideCharToMultiByte(CP_UTF8, 0, wide.lpDesktop, -1, desktop, sizeof(desktop), NULL, NULL); cached.lpDesktop = desktop; }
+      cached.dwX = wide.dwX; cached.dwY = wide.dwY; cached.dwXSize = wide.dwXSize; cached.dwYSize = wide.dwYSize;
+      cached.dwXCountChars = wide.dwXCountChars; cached.dwYCountChars = wide.dwYCountChars; cached.dwFillAttribute = wide.dwFillAttribute;
+      cached.dwFlags = wide.dwFlags; cached.wShowWindow = wide.wShowWindow;
+      if (pp->WindowFlags & 0x100) { cached.hStdInput = pp->StandardInput; cached.hStdOutput = pp->StandardOutput; cached.hStdError = pp->StandardError; }
+      else cached.hStdInput = cached.hStdOutput = cached.hStdError = INVALID_HANDLE_VALUE;
+      state = 2;
+    } else while (state != 2) NtYieldExecution();
+  }
+  memcpy(info, &cached, sizeof(cached));
 }
 
-EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }
 NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info);
+IMPORT NTSTATUS NTAPI RtlQueryInformationActiveActivationContext(ULONG class, PVOID buffer, SIZE_T length, SIZE_T *retlen);
+/* What GetVersion and GetVersionEx tell a program: not the version of the system (RtlGetVersion and VerifyVersionInfo know that) but the one the program was made for. A
+ * manifest that lists the systems the program supports (supportedOS) gets the newest of them; without such a list the version in the program's own header decides: 10.0 or
+ * newer is 10.0, 6.3 up to there is 6.3, anything older is 6.2 (a program of Windows 7 or Vista without a manifest is told Windows 8). */
+typedef struct { DWORD major, minor, build; } ReportedVersion;
+static const struct { DWORD a; WORD b, c; BYTE d[8]; DWORD major, minor, build; } kSupportedOs[] = {
+  {0x8e0f7a12, 0xbfb3, 0x4fe8, {0xb9, 0xa5, 0x48, 0xfd, 0x50, 0xa1, 0x5a, 0x9a}, 10, 0, 19045},      /* Windows 10 */
+  {0x1f676c76, 0x80e1, 0x4239, {0x95, 0xbb, 0x83, 0xd0, 0xf6, 0xd0, 0xda, 0x78}, 6, 3, 9600},      /* Windows 8.1 */
+  {0x4a2f28e3, 0x53b9, 0x4441, {0xba, 0x9c, 0xd6, 0x9d, 0x4a, 0x4a, 0x6e, 0x38}, 6, 2, 9200},      /* Windows 8 */
+  {0x35138b9a, 0x5d96, 0x4fbd, {0x8e, 0x2d, 0xa2, 0x44, 0x02, 0x25, 0xf9, 0x3a}, 6, 1, 7601},      /* Windows 7 */
+  {0xe2011457, 0x1546, 0x43c5, {0xa5, 0xfe, 0x00, 0x8d, 0xee, 0xe3, 0xd3, 0xf0}, 6, 0, 6002},      /* Windows Vista */
+};
+static ReportedVersion reported_version(void) {
+  static volatile LONG state;      /* 0: not looked at, 1: being worked out, 2: done */
+  static ReportedVersion cached;
+  if (state != 2) {
+    if (__sync_bool_compare_and_swap(&state, 0, 1)) {
+      ReportedVersion r = {6, 2, 9200};
+      int found = 0;
+      BYTE buffer[8 + 32 * 16];
+      SIZE_T needed = 0;
+      if (NT_SUCCESS(RtlQueryInformationActiveActivationContext(6, buffer, sizeof(buffer), &needed))) {
+        const DWORD count = *(const DWORD *)buffer;
+        for (DWORD k = 0; k < count && k < 16; ++k) {
+          const BYTE *e = buffer + 8 + (size_t_)k * 32;
+          if (*(const DWORD *)(e + 16) != 1) continue;      /* supportedOS */
+          for (size_t_ g = 0; g < sizeof(kSupportedOs) / sizeof(kSupportedOs[0]); ++g) {
+            if (memcmp(e, &kSupportedOs[g].a, 4) || memcmp(e + 4, &kSupportedOs[g].b, 2) || memcmp(e + 6, &kSupportedOs[g].c, 2) || memcmp(e + 8, kSupportedOs[g].d, 8)) continue;
+            if (!found || kSupportedOs[g].major > r.major || (kSupportedOs[g].major == r.major && kSupportedOs[g].minor > r.minor)) { r.major = kSupportedOs[g].major; r.minor = kSupportedOs[g].minor; r.build = kSupportedOs[g].build; }
+            found = 1;
+          }
+        }
+      }
+      if (!found) {
+        const BYTE *base = (const BYTE *)NtCurrentPeb()->ImageBaseAddress;
+        const DWORD pe = *(const DWORD *)(base + 0x3C);
+        const DWORD image = ((DWORD)*(const WORD *)(base + pe + 24 + 0x28) << 16) | *(const WORD *)(base + pe + 24 + 0x2A);      /* the operating system version of the header */
+        if ((image >> 16) >= 10) { r.major = 10; r.minor = 0; r.build = 19045; }
+        else if ((image >> 16) > 6 || ((image >> 16) == 6 && (image & 0xFFFF) >= 3)) { r.major = 6; r.minor = 3; r.build = 9600; }
+      }
+      cached = r;
+      state = 2;
+    } else while (state != 2) NtYieldExecution();
+  }
+  return cached;
+}
+EXPORT DWORD WINAPI GetVersion(void) {
+  const ReportedVersion r = reported_version();
+  return (r.build << 16) | (r.minor << 8) | r.major;
+}
 /* GetVersionEx: the size says which structure; any other size is ERROR_INSUFFICIENT_BUFFER. The extended fields come from ntdll. */
 EXPORT BOOL WINAPI GetVersionExW(LPOSVERSIONINFOW v) {
   if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOW) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXW))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
@@ -590,6 +650,8 @@ EXPORT BOOL WINAPI GetVersionExW(LPOSVERSIONINFOW v) {
   memset(&info, 0, sizeof(info));
   info.dwOSVersionInfoSize = v->dwOSVersionInfoSize;
   if (!NT_SUCCESS(RtlGetVersion((RTL_OSVERSIONINFOW *)&info))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  const ReportedVersion r = reported_version();
+  info.dwMajorVersion = r.major; info.dwMinorVersion = r.minor; info.dwBuildNumber = r.build;
   memcpy(v, &info, v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXW) ? sizeof(OSVERSIONINFOEXW) : sizeof(OSVERSIONINFOW));
   return TRUE;
 }
@@ -599,7 +661,8 @@ EXPORT BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA v) {
   memset(&info, 0, sizeof(info));
   info.dwOSVersionInfoSize = sizeof(info);
   RtlGetVersion((RTL_OSVERSIONINFOW *)&info);
-  v->dwMajorVersion = info.dwMajorVersion; v->dwMinorVersion = info.dwMinorVersion; v->dwBuildNumber = info.dwBuildNumber; v->dwPlatformId = info.dwPlatformId; v->szCSDVersion[0] = 0;
+  const ReportedVersion r = reported_version();
+  v->dwMajorVersion = r.major; v->dwMinorVersion = r.minor; v->dwBuildNumber = r.build; v->dwPlatformId = info.dwPlatformId; v->szCSDVersion[0] = 0;
   if (v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA)) {
     OSVERSIONINFOEXA *ex = (OSVERSIONINFOEXA *)v;
     ex->wServicePackMajor = info.wServicePackMajor; ex->wServicePackMinor = info.wServicePackMinor; ex->wSuiteMask = info.wSuiteMask; ex->wProductType = info.wProductType; ex->wReserved = 0;
@@ -705,6 +768,7 @@ static LDR_DATA_TABLE_ENTRY *module_by_base(PVOID base) {
 }
 /* A library by name, with or without ".dll", in any case ("KERNEL32", "kernel32.dll"). */
 static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity);
+static BOOL actctx_redirect_key(LPCWSTR name, WCHAR *out, DWORD capacity, BOOL append_dll);
 static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
   if (!ldr) return NULL;
@@ -742,6 +806,27 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
 PVOID NTAPI TcosFindModuleByFile(PCWSTR path);
 static BOOL has_separator(LPCWSTR name);
 static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
+EXPORT DWORD WINAPI GetLongPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity);
+/* A library is known by its long name; one loaded by its 8.3 alias ("C:\\dir\\LONGNA~1.DLL") keeps being told by the spelling it was loaded with. */
+#define MODULE_SPELLINGS 8
+static struct { PVOID base; WCHAR path[260]; } g_module_spellings[MODULE_SPELLINGS];
+static void module_spelling_set(PVOID base, const WCHAR *spelled) {      /* NULL: the library is known by its own name */
+  int free_slot = -1;
+  for (int i = 0; i < MODULE_SPELLINGS; ++i) {
+    if (g_module_spellings[i].base == base) { g_module_spellings[i].base = NULL; }
+    if (!g_module_spellings[i].base && free_slot < 0) free_slot = i;
+  }
+  if (!spelled || free_slot < 0) return;
+  size_t_ n = 0;
+  for (; spelled[n] && n < 259; ++n) g_module_spellings[free_slot].path[n] = spelled[n];
+  g_module_spellings[free_slot].path[n] = 0;
+  g_module_spellings[free_slot].base = base;
+}
+static const WCHAR *module_spelling(PVOID base) {
+  for (int i = 0; i < MODULE_SPELLINGS; ++i) if (g_module_spellings[i].base == base) return g_module_spellings[i].path;
+  return NULL;
+}
+static BOOL has_tilde_name(const WCHAR *name) { for (; *name; ++name) if (*name == '~') return TRUE; return FALSE; }
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
   LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
@@ -750,6 +835,11 @@ EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
     WCHAR full[PATH_CHARS];
     PVOID base;
     if (full_path_w(name, full, PATH_CHARS) && (base = TcosFindModuleByFile(full)) != NULL) return base;
+    if (has_tilde_name(name) && full_path_w(name, full, PATH_CHARS)) {
+      WCHAR expanded[PATH_CHARS];
+      const DWORD n = GetLongPathNameW(full, expanded, PATH_CHARS);
+      if (n != 0 && n < PATH_CHARS && (base = TcosFindModuleByFile(expanded)) != NULL) return base;
+    }
   }
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   return m->DllBase;
@@ -807,13 +897,15 @@ EXPORT BOOL WINAPI GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE *module)
 EXPORT DWORD WINAPI GetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD capacity) {
   LDR_DATA_TABLE_ENTRY *m = module_by_base(module ? module : NtCurrentPeb()->ImageBaseAddress);
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return 0; }
-  const DWORD length = m->FullDllName.Length / 2;
+  const WCHAR *spelled = module_spelling(m->DllBase);
+  const WCHAR *text = spelled ? spelled : m->FullDllName.Buffer;
+  const DWORD length = spelled ? (DWORD)wcslen(spelled) : m->FullDllName.Length / 2;
   if (length + 1 > capacity) {
-    if (capacity) { memcpy(buffer, m->FullDllName.Buffer, (capacity - 1) * 2); buffer[capacity - 1] = 0; }
+    if (capacity) { memcpy(buffer, text, (capacity - 1) * 2); buffer[capacity - 1] = 0; }
     set_error(ERROR_INSUFFICIENT_BUFFER);
     return capacity;
   }
-  memcpy(buffer, m->FullDllName.Buffer, length * 2);
+  memcpy(buffer, text, length * 2);
   buffer[length] = 0;
   set_error(ERROR_SUCCESS);
   return length;
@@ -868,12 +960,19 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
     LDR_DATA_TABLE_ENTRY *target = module_by_name(library);
     if (!target) return NULL;
     const char *function = forward + n + 1;
+    FARPROC resolved;
     if (function[0] == '#') {
       DWORD number = 0;
       for (const char *c = function + 1; *c >= '0' && *c <= '9'; ++c) number = number * 10 + (DWORD)(*c - '0');
-      return export_of(target->DllBase, NULL, number, depth + 1);
+      resolved = export_of(target->DllBase, NULL, number, depth + 1);
+    } else {
+      resolved = export_of(target->DllBase, function, 0, depth + 1);
     }
-    return export_of(target->DllBase, function, 0, depth + 1);
+    if (resolved) {      /* the library that forwards depends on the one it forwards to from now on (unless it stays as long as the process does) */
+      LDR_DATA_TABLE_ENTRY *self = module_by_base((HMODULE)module);
+      if (self && self->LoadCount != 0xFFFF && target->LoadCount != 0xFFFF) NtTcosLinkModules(module, target->DllBase);
+    }
+    return resolved;
   }
   return (FARPROC)(base + rva);
 }
@@ -992,8 +1091,21 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
   }
+  WCHAR spelled[PATH_CHARS];
+  spelled[0] = 0;
+  if (path[0] && has_tilde_name(path)) {      /* an 8.3 alias: the library is loaded as the long name, and told by this spelling */
+    WCHAR expanded[PATH_CHARS];
+    const DWORD n = GetLongPathNameW(path, expanded, PATH_CHARS);
+    if (n != 0 && n < PATH_CHARS) {
+      memcpy(spelled, path, ((size_t_)wcslen(path) + 1) * 2);
+      memcpy(path, expanded, ((size_t_)n + 1) * 2);
+      unicode_string(&us, path);
+    }
+  }
+  PVOID already_loaded = NULL;
   if (path[0] && !(flags & 0x62)) {      /* the file of a library that is loaded already (under another name, or moved): one more use of it */
     PVOID loaded = TcosFindModuleByFile(path);
+    already_loaded = loaded;
     LDR_DATA_TABLE_ENTRY *entry = loaded ? module_by_base(loaded) : NULL;
     if (entry) us = entry->FullDllName;
   }
@@ -1022,6 +1134,7 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   ULONG ldr_flags = (flags & 1) ? 2 : 0;      /* DONT_RESOLVE_DLL_REFERENCES = LDR_DONT_RESOLVE_REFS */
   const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
   if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
+  if (!already_loaded && path[0]) module_spelling_set(handle, spelled[0] ? spelled : NULL);
   return (HMODULE)handle;
 }
 EXPORT HMODULE WINAPI LoadLibraryW(LPCWSTR name) { return LoadLibraryExW(name, NULL, 0); }
@@ -1164,7 +1277,7 @@ EXPORT BOOL WINAPI InitOnceBeginInitialize(PINIT_ONCE once, DWORD flags, PBOOL p
   for (;;) {
     const ULONG_PTR v = *state;
     if ((v & 3) == 2) { *pending = FALSE; if (context) *context = (PVOID)(v & ~(ULONG_PTR)3); return TRUE; }
-    if (flags & INIT_ONCE_CHECK_ONLY_) { set_error(31 /* ERROR_GEN_FAILURE */); return FALSE; }
+    if (flags & INIT_ONCE_CHECK_ONLY_) { set_error(31 /* 31 */); return FALSE; }
     if (flags & INIT_ONCE_ASYNC_) {
       if (v == 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (another thread is initializing synchronously) */
       if (v == 0 && !__sync_bool_compare_and_swap(state, 0, 3)) continue;
@@ -1471,6 +1584,7 @@ EXPORT BOOL WINAPI QueueUserAPC2(void (WINAPI *function)(ULONG_PTR), HANDLE thre
   return TRUE;
 }
 static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, void (WINAPI *routine)(DWORD, DWORD, LPOVERLAPPED));
+static int pipe_begin(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, void (WINAPI *routine)(DWORD, DWORD, LPOVERLAPPED), ULONG_PTR *information, NTSTATUS *result, LPVOID in, DWORD in_size);
 /* ReadFileEx / WriteFileEx: the operation is done at once; the completion routine is an APC for this thread, called when it next waits alertably. */
 typedef void (WINAPI *LPOVERLAPPED_COMPLETION_ROUTINE_)(DWORD, DWORD, LPOVERLAPPED);
 static void NTAPI completion_apc(ULONG_PTR routine, ULONG_PTR overlapped, ULONG_PTR unused) {
@@ -1489,7 +1603,19 @@ EXPORT BOOL WINAPI ReadFileEx(HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPE
 }
 EXPORT BOOL WINAPI WriteFileEx(HANDLE h, LPCVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
   if (!overlapped || !routine) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  if (pipe_start_overlapped(1, h, (LPVOID)buffer, length, overlapped, routine)) return TRUE;
+  {
+    ULONG_PTR information = 0;
+    NTSTATUS result = 0;
+    const int started = pipe_begin(1, h, (LPVOID)buffer, length, overlapped, routine, &information, &result, NULL, 0);      /* 1: waiting, 2: it went at once, 3: it failed */
+    if (started == 1) return TRUE;
+    if (started == 3) { overlapped->Internal = (ULONG_PTR)STATUS_PENDING; return fail_nt(result); }
+    if (started == 2) {
+      complete_overlapped(overlapped, result, information);
+      port_note(h, overlapped, information);
+      NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
+      return TRUE;
+    }
+  }
   DWORD done = 0;
   if (!WriteFile(h, buffer, length, &done, overlapped)) return FALSE;
   NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
@@ -1516,6 +1642,7 @@ static DWORD WINAPI directory_request_thread(LPVOID parameter) {
   complete_overlapped(request.overlapped, status, iosb.Information);
   if (request.routine) NtQueueApcThread(request.caller, (PVOID)completion_apc, (ULONG_PTR)request.routine, (ULONG_PTR)request.overlapped, 0);
   else NtClose(request.caller);
+  NtNotifyChangeDirectoryFile(request.directory, (HANDLE)3, NULL, NULL, &iosb, NULL, 0, request.filter, request.subtree);      /* (whoever changed the directory waits for this) */
   return 0;
 }
 EXPORT BOOL WINAPI ReadDirectoryChangesW(HANDLE h, LPVOID buffer, DWORD length, BOOL watch_subtree, DWORD filter, LPDWORD bytes_returned, LPOVERLAPPED overlapped,
@@ -1523,17 +1650,29 @@ EXPORT BOOL WINAPI ReadDirectoryChangesW(HANDLE h, LPVOID buffer, DWORD length, 
   IO_STATUS_BLOCK iosb;
   if (filter == 0 || (filter & ~0x1FFu) || (!overlapped && (!buffer || length == 0))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   if (overlapped) {
-    { const NTSTATUS registered = NtNotifyChangeDirectoryFile(h, (HANDLE)2, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree); if (!NT_SUCCESS(registered)) return fail_nt(registered); }      /* (this only makes the watch, so that changes from now on are kept) */
+    { const NTSTATUS registered = NtNotifyChangeDirectoryFile(h, (HANDLE)2, NULL, NULL, &iosb, buffer, length, filter, (BOOLEAN)watch_subtree); if (!NT_SUCCESS(registered)) return fail_nt(registered); }      /* (this only makes the watch, so that changes from now on are kept) */
+    overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
+    if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
+    iosb.Information = 0;
+    {      /* what changed since the last request completes this one at once */
+      const NTSTATUS polled = NtNotifyChangeDirectoryFile(h, (HANDLE)5, NULL, NULL, &iosb, buffer, length, filter, (BOOLEAN)watch_subtree);
+      if (polled != (NTSTATUS)0x103) {
+        if (!NT_SUCCESS(polled)) return fail_nt(polled);
+        complete_overlapped(overlapped, polled, iosb.Information);
+        if (routine) NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
+        if (bytes_returned) *bytes_returned = 0;
+        return TRUE;
+      }
+    }
     DirectoryRequest *request = RtlAllocateHeap(heap(), 0, sizeof(*request));
     if (!request) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
     HANDLE caller = NULL;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) { RtlFreeHeap(heap(), 0, request); return FALSE; }
     request->directory = h; request->caller = caller; request->buffer = buffer; request->length = length; request->subtree = (BOOLEAN)watch_subtree;
     request->filter = filter; request->overlapped = overlapped; request->routine = routine;
-    overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
-    if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
+    NtNotifyChangeDirectoryFile(h, (HANDLE)6, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree);      /* (the thread is waited for) */
     HANDLE thread = CreateThread(NULL, 0, directory_request_thread, request, 0, NULL);
-    if (!thread) { NtClose(caller); RtlFreeHeap(heap(), 0, request); return FALSE; }
+    if (!thread) { NtNotifyChangeDirectoryFile(h, (HANDLE)3, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree); NtClose(caller); RtlFreeHeap(heap(), 0, request); return FALSE; }
     (void)thread;      /* the handle is not closed here: see the thread */
     if (bytes_returned) *bytes_returned = 0;
     return TRUE;
@@ -1730,11 +1869,11 @@ static DWORD wait_result(NTSTATUS status) {
   fail_nt(status);
   return WAIT_FAILED;
 }
-static BOOL pipe_calls_pending(void);
 EXPORT BOOL WINAPI SwitchToThread(void);
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable) {
   if ((ULONG_PTR)h >= 0xFFFFFFF4u && (ULONG_PTR)h <= 0xFFFFFFF6u) h = GetStdHandle((DWORD)(ULONG_PTR)h);      /* STD_INPUT_HANDLE and the others */
-  if (con_is_input(h)) {      /* the console input is ready when a key event is waiting: asked again until it is */
+  con_sync_signals();
+  if (con_wait_polled(h)) {      /* the console input is ready when a key event is waiting: asked again until it is */
     const DWORD start = GetTickCount();
     while (!con_input_ready()) {
       if (timeout_ms != INFINITE && GetTickCount() - start >= timeout_ms) return WAIT_TIMEOUT;
@@ -1745,10 +1884,6 @@ EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alert
   LARGE_INTEGER t;
   t.QuadPart = -(LONGLONG)timeout_ms * 10000;
   DWORD result = wait_result(NtWaitForSingleObject(h, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
-  for (int tries = 0; result == WAIT_TIMEOUT && timeout_ms == 0 && tries < 200 && pipe_calls_pending(); ++tries) {      /* (a call in a thread of its own that has just been answered gets to say so: the event of a real one is set at once) */
-    SwitchToThread();
-    result = wait_result(NtWaitForSingleObject(h, alertable != 0, &t));
-  }
   return result;
 }
 EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL all, DWORD timeout_ms, BOOL alertable) {
@@ -1756,11 +1891,12 @@ EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles,
   HANDLE mapped[64];      /* the STD_*_HANDLE numbers stand for the handles the process has for them */
   for (DWORD i = 0; i < count; ++i) mapped[i] = ((ULONG_PTR)handles[i] >= 0xFFFFFFF4u && (ULONG_PTR)handles[i] <= 0xFFFFFFF6u) ? GetStdHandle((DWORD)(ULONG_PTR)handles[i]) : handles[i];
   handles = mapped;
+  con_sync_signals();
   for (DWORD i = 0; i < count && !all; ++i) {
-    if (!con_is_input(handles[i])) continue;
+    if (!con_wait_polled(handles[i])) continue;
     HANDLE others[64];      /* a console input among the handles: the others are asked without waiting, in turns with it */
     DWORD index[64], n = 0;
-    for (DWORD k = 0; k < count; ++k) if (!con_is_input(handles[k])) { others[n] = handles[k]; index[n++] = k; }
+    for (DWORD k = 0; k < count; ++k) if (!con_wait_polled(handles[k])) { others[n] = handles[k]; index[n++] = k; }
     const DWORD start = GetTickCount();
     for (;;) {
       if (con_input_ready()) return WAIT_OBJECT_0 + i;
@@ -2019,35 +2155,50 @@ EXPORT BOOL WINAPI GetProcessHandleCount(HANDLE h, PDWORD count) {
   *count = n;
   return TRUE;
 }
+EXPORT DWORD WINAPI QueryDosDeviceW(LPCWSTR name, LPWSTR buffer, DWORD capacity);
+/* A path "C:\dir\file" as the NT name of the device that holds the drive followed by "\dir\file" ("\Device\HarddiskVolume1\dir\file"). False if there is no such drive. */
+static BOOL dos_path_to_native(const WCHAR *dos, WCHAR *out, DWORD capacity) {
+  WCHAR drive[3] = {dos[0], ':', 0}, device[PATH_CHARS];
+  if (!dos[0] || dos[1] != ':' || QueryDosDeviceW(drive, device, PATH_CHARS) == 0) return FALSE;
+  const size_t_ device_length = wcslen(device), rest = wcslen(dos + 2);
+  if (device_length + rest + 1 > capacity) return FALSE;
+  memcpy(out, device, device_length * 2);
+  memcpy(out + device_length, dos + 2, (rest + 1) * 2);
+  return TRUE;
+}
 EXPORT BOOL WINAPI QueryFullProcessImageNameW(HANDLE h, DWORD flags, LPWSTR name, PDWORD size) {
-  (void)flags;
+  if (flags > 1) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }      /* (PROCESS_NAME_NATIVE is the only flag) */
   BYTE info[16 + 2 * (MAX_PATH * 2 + 1)];
-  const NTSTATUS status = NtQueryInformationProcess(h, 27, info, sizeof(info), NULL);
+  const NTSTATUS status = NtQueryInformationProcess(h, (flags & 1) ? 27 : 43 /* ProcessImageFileName, ProcessImageFileNameWin32 */, info, sizeof(info), NULL);
   if (!NT_SUCCESS(status)) return fail_nt(status);
+  const WCHAR *text = (const WCHAR *)(ULONG_PTR)get64(info + 8);
   const DWORD n = get16(info) / 2;
+  if (!name) { set_error(*size == 0 ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER); return FALSE; }
   if (n + 1 > *size) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  memcpy(name, (WCHAR *)(ULONG_PTR)get64(info + 8), (n + 1) * 2);
+  memcpy(name, text, n * 2);
+  name[n] = 0;
   *size = n;
   return TRUE;
 }
 EXPORT BOOL WINAPI QueryFullProcessImageNameA(HANDLE h, DWORD flags, LPSTR name, PDWORD size) {
-  WCHAR wide[MAX_PATH * 2];
-  DWORD n = MAX_PATH * 2;
+  WCHAR wide[PATH_CHARS];
+  DWORD n = PATH_CHARS;
   if (!QueryFullProcessImageNameW(h, flags, wide, &n)) return FALSE;
-  const DWORD got = (DWORD)WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, name, (int)*size, NULL, NULL);
-  if (got == 0) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
-  *size = got - 1;
+  if (!name) { set_error(*size == 0 ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER); return FALSE; }
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, NULL, 0, NULL, NULL);
+  if (needed <= 0 || (DWORD)needed > *size) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  WideCharToMultiByte(CP_UTF8, 0, wide, (int)n + 1, name, needed, NULL, NULL);
+  *size = (DWORD)needed - 1;
   return TRUE;
 }
 EXPORT HANDLE WINAPI OpenProcess(DWORD access, BOOL inherit, DWORD id) {
-  (void)access;
   OBJECT_ATTRIBUTES attributes;
   memset(&attributes, 0, sizeof(attributes));
   attributes.Length = sizeof(attributes);
   attributes.Attributes = inherit ? 2 : 0;
   ULONG64 client[2] = {id, 0};
   HANDLE h = NULL;
-  const NTSTATUS status = NtOpenProcess(&h, 0x1FFFFF, &attributes, client);
+  const NTSTATUS status = NtOpenProcess(&h, access, &attributes, client);
   if (!NT_SUCCESS(status)) { if (status == (NTSTATUS)0xC000000B) set_error(ERROR_INVALID_PARAMETER); else fail_nt(status); return NULL; }
   return h;
 }
@@ -2116,6 +2267,9 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
 NTSTATUS NTAPI LdrAddDllDirectory(PUNICODE_STRING directory, PVOID *cookie);
 NTSTATUS NTAPI LdrRemoveDllDirectory(PVOID cookie);
 NTSTATUS NTAPI LdrGetDllPath(PCWSTR name, ULONG flags, PWSTR *path, PWSTR *unused);
+NTSTATUS NTAPI LdrSetDefaultDllDirectories(ULONG flags);
+NTSTATUS NTAPI RtlSetSearchPathMode(ULONG flags);
+NTSTATUS NTAPI RtlGetSearchPath(PWSTR *path);
 VOID NTAPI RtlReleasePath(PWSTR path);
 
 EXPORT PVOID WINAPI AddDllDirectory(LPCWSTR directory) {
@@ -2136,6 +2290,7 @@ EXPORT BOOL WINAPI RemoveDllDirectory(PVOID cookie) {
 EXPORT BOOL WINAPI SetDefaultDllDirectories(DWORD flags) {
   if (flags == 0 || (flags & ~0x1F00u) || (flags & 0x100)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   g_default_dll_dirs = flags;
+  LdrSetDefaultDllDirectories(flags);
   return TRUE;
 }
 
@@ -2180,30 +2335,83 @@ static void unicode_string(UNICODE_STRING *s, LPCWSTR text) {
   s->Buffer = (PWSTR)text;
 }
 
-/* The console a new process belongs to: none for DETACHED_PROCESS, a console of its own for CREATE_NEW_CONSOLE, otherwise the one of this process. */
-static void con_note_child(DWORD pid, HANDLE console);
-static HANDLE console_for_new_process(DWORD flags) {
+typedef struct ProcThreadAttributeEntry { DWORD_PTR attribute; SIZE_T size; PVOID value; } ProcThreadAttributeEntry;
+typedef struct ProcThreadAttributeList { DWORD flags; DWORD capacity; DWORD count; DWORD reserved; PVOID unknown; ProcThreadAttributeEntry entries[1]; } ProcThreadAttributeList;
+/* The value of an attribute of a list, or NULL. */
+static const ProcThreadAttributeEntry *attribute_of(const ProcThreadAttributeList *list, DWORD_PTR attribute) {
+  for (DWORD i = 0; list && i < list->count && i < list->capacity; ++i) if (list->entries[i].attribute == attribute) return &list->entries[i];
+  return NULL;
+}
+
+#define CON_ID_NO_WINDOW 0x1000000000000ull      /* in the number of a console: it has no window (CREATE_NO_WINDOW) */
+#define CON_ID_PSEUDO 0x2000000000000ull         /* it is a pseudo console: its size is in the bits above (12 bits each: width from bit 36, height from bit 50 up) */
+#define CON_ID_PSEUDO_X(id) ((int)(((id) >> 36) & 0xFFF))
+#define CON_ID_PSEUDO_Y(id) ((int)(((id) >> 50) & 0xFFF))
+
+/* The pseudo consoles that were made (CreatePseudoConsole): the object that stands for one and the size it has. */
+static struct { HANDLE object; SHORT x, y; } g_pseudo[8];
+
+/* Is the program a window program (IMAGE_SUBSYSTEM_WINDOWS_GUI)? Its header says; a file that cannot be read is taken for a console program. */
+static BOOL image_is_gui(LPCWSTR path) {
+  HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+  if (f == INVALID_HANDLE_VALUE) return FALSE;
+  BYTE head[0x400];
+  DWORD got = 0;
+  BOOL gui = FALSE;
+  if (ReadFile(f, head, sizeof(head), &got, NULL) && got >= 0x40) {
+    const DWORD at = head[0x3C] | (head[0x3D] << 8) | (head[0x3E] << 16) | ((DWORD)head[0x3F] << 24);
+    if (at <= got && got - at >= 24 + 70) gui = (head[at + 24 + 68] | (head[at + 24 + 69] << 8)) == 2;
+  }
+  CloseHandle(f);
+  return gui;
+}
+
+/* The console a new process belongs to. A window program has none. A console program has none with DETACHED_PROCESS, a console of its own (with a window) with CREATE_NEW_CONSOLE
+ * or when this process has no console, a console without a window with CREATE_NO_WINDOW, otherwise the one of this process. `fresh` tells that the console is a new one. */
+static void con_note_child(DWORD pid, HANDLE console, DWORD group, DWORD ignored);
+static HANDLE console_for_new_process(DWORD flags, BOOL gui, BOOL *fresh) {
   static volatile LONG counter;
-  if (flags & 0x8 /* DETACHED_PROCESS */) return NULL;
-  if (flags & 0x10 /* CREATE_NEW_CONSOLE */) return (HANDLE)(ULONG_PTR)(0x100000000ull | ((ULONG_PTR)GetCurrentProcessId() << 8) | (ULONG_PTR)(InterlockedIncrement(&counter) & 0xFF));
-  return parameters()->ConsoleHandle;
+  if (fresh) *fresh = FALSE;
+  if (gui || (flags & 0x8 /* DETACHED_PROCESS */)) return NULL;
+  const BOOL new_console = (flags & 0x10 /* CREATE_NEW_CONSOLE */) != 0;
+  if (!new_console && parameters()->ConsoleHandle && !(flags & 0x08000000 /* CREATE_NO_WINDOW */)) return parameters()->ConsoleHandle;
+  if (fresh) *fresh = TRUE;
+  return (HANDLE)(ULONG_PTR)(0x100000000ull | (!new_console && (flags & 0x08000000) ? CON_ID_NO_WINDOW : 0) | ((ULONG_PTR)GetCurrentProcessId() << 8) |
+                             (ULONG_PTR)(InterlockedIncrement(&counter) & 0xFF));
+}
+/* The console of a program started in a pseudo console: a new one of the size the pseudo console has. */
+static HANDLE console_for_pseudo(HANDLE pseudo) {
+  for (int i = 0; i < 8; ++i) {
+    if (g_pseudo[i].object != pseudo || !pseudo) continue;
+    ULONG_PTR id = (ULONG_PTR)console_for_new_process(0x10, FALSE, NULL);
+    return (HANDLE)(id | CON_ID_PSEUDO | ((ULONG_PTR)g_pseudo[i].x << 36) | ((ULONG_PTR)g_pseudo[i].y << 50));
+  }
+  return NULL;
 }
 EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information) {
   (void)process_attributes; (void)thread_attributes;
+  if (information) memset(information, 0, sizeof(*information));
   if (!application && !command_line) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WCHAR name[MAX_PATH], image[PATH_CHARS];
   if (application) {
+    if (!application[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
     if (wcslen(application) >= MAX_PATH) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
     lstrcpyW(name, application);
-  } else {      /* the first word of the command line (in quotes, or up to a space) */
+  } else {      /* the first word of the command line (in quotes, or up to a space or tab); nothing before it may be blank */
     LPCWSTR c = command_line;
-    while (*c == ' ') ++c;
     size_t_ n = 0;
     const BOOL quoted = *c == '"';
     if (quoted) ++c;
-    while (*c && (quoted ? *c != '"' : *c != ' ')) { if (n + 1 >= MAX_PATH) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; } name[n++] = *c++; }
+    while (*c && (quoted ? *c != '"' : (*c != ' ' && *c != '\t'))) { if (n + 1 >= MAX_PATH) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; } name[n++] = *c++; }
     name[n] = 0;
+    while (n > 0 && name[n - 1] == ' ') name[--n] = 0;      /* (the blanks that end a name are not part of it) */
+    if (n == 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  }
+  if (directory) {      /* a folder that is not there is an error of its own, whatever the program */
+    WCHAR full[PATH_CHARS];
+    const DWORD a = full_path_w(directory, full, PATH_CHARS) ? GetFileAttributesW(full) : INVALID_FILE_ATTRIBUTES;
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) { set_error(ERROR_DIRECTORY); return FALSE; }
   }
   if (!find_program(name, image)) { set_error(ERROR_FILE_NOT_FOUND); return FALSE; }
   WCHAR current[PATH_CHARS];
@@ -2222,15 +2430,23 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   const BOOL debug_start = (flags & (0x1 | 0x2) /* DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS */) != 0;
   if (debug_start && !NT_SUCCESS(DbgUiConnectToDbg())) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
   ULONG nt_flags = ((flags & CREATE_SUSPENDED) || debug_start ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
-  HANDLE std_in = NULL, std_out = NULL, std_err = NULL;
+  /* the standard handles of the child: the ones of the startup information, none for a program without a console, or those of this program (the kernel decides which of them the
+     child can have, by what it inherits) */
+  HANDLE std_in, std_out, std_err;
+  nt_flags |= 0x10;
   if (startup && (startup->dwFlags & 0x100)) {
     nt_flags |= 4;
     std_in = startup->hStdInput;
     std_out = startup->hStdOutput;
     std_err = startup->hStdError;
+  } else {
+    std_in = parameters()->StandardInput;
+    std_out = parameters()->StandardOutput;
+    std_err = parameters()->StandardError;
   }
-  /* the startup block of the kernel: size, STARTF_ flags, position, size, characters, fill, show, console flags, reserved; the console; the title and the desktop */
-  struct { ULONG words[12]; HANDLE console; PUNICODE_STRING title, desktop; } block;
+  /* the startup block of the kernel: size, STARTF_ flags, position, size, characters, fill, show, console flags, reserved; the console; the title and the desktop; the process
+     that stands in for the parent (an attribute) and the handles that are inherited (an attribute) */
+  struct { ULONG words[12]; HANDLE console; PUNICODE_STRING title, desktop; HANDLE parent; HANDLE *inherit_list; ULONG inherit_count, reserved; } block;
   UNICODE_STRING title_string, desktop_string;
   memset(&block, 0, sizeof(block));
   block.words[0] = sizeof(block);
@@ -2240,7 +2456,35 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     if (startup->lpTitle) { unicode_string(&title_string, startup->lpTitle); block.title = &title_string; }
     if (startup->lpDesktop) { unicode_string(&desktop_string, startup->lpDesktop); block.desktop = &desktop_string; }
   }
-  block.console = console_for_new_process(flags);
+  if (!block.title) { unicode_string(&title_string, image); block.title = &title_string; }      /* (a program without a title has its own path as the title) */
+  BOOL fresh_console = FALSE;
+  block.console = console_for_new_process(flags, image_is_gui(image), &fresh_console);
+  if (flags & 0x8 /* DETACHED_PROCESS */) nt_flags |= 0x200;      /* (a program without a console gets no standard handles it did not ask for) */
+  if (fresh_console) {      /* (the standard handles of a console program with a console of its own are that console's: handles of the console it came from do not stay) */
+    nt_flags |= 0x100;
+    if (!(startup && (startup->dwFlags & 0x100))) {
+      if (con_unbound_kind(std_in)) std_in = NULL;
+      if (con_unbound_kind(std_out)) std_out = NULL;
+      if (con_unbound_kind(std_err)) std_err = NULL;
+    }
+  }
+  /* the console flags (bit 0: Ctrl+C is ignored) are the ones of this process, and a new process group ignores it; the group is this process's own unless a new one starts */
+  block.words[10] = (parameters()->ConsoleFlags & 1) | ((flags & 0x210 /* CREATE_NEW_PROCESS_GROUP, not with CREATE_NEW_CONSOLE */) == 0x200 ? 1 : 0);
+  block.words[11] = (flags & 0x200) ? 0xFFFFFFFFu : *(ULONG *)((BYTE *)parameters() + 0x408);
+  if ((flags & 0x80000 /* EXTENDED_STARTUPINFO_PRESENT */) && startup && startup->cb >= sizeof(STARTUPINFOW) + sizeof(PVOID)) {
+    const ProcThreadAttributeList *attributes = *(ProcThreadAttributeList *const *)((const BYTE *)startup + sizeof(STARTUPINFOW));
+    if (attributes) {
+      const ProcThreadAttributeEntry *entry = attribute_of(attributes, 0x00020000);      /* PARENT_PROCESS */
+      if (entry) { block.parent = *(HANDLE *)entry->value; nt_flags |= 0x40; }
+      entry = attribute_of(attributes, 0x00020002);      /* HANDLE_LIST */
+      if (entry) { block.inherit_list = entry->value; block.inherit_count = (ULONG)(entry->size / sizeof(HANDLE)); nt_flags |= 0x80; }
+      entry = attribute_of(attributes, 0x00020016);      /* PSEUDOCONSOLE */
+      if (entry) {
+        nt_flags |= 0x20;
+        if (!(flags & 0x8) && !image_is_gui(image)) { HANDLE own = console_for_pseudo((HANDLE)entry->value); if (own) block.console = own; }
+      }
+    }
+  }
   const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
                                               &thread_id, std_in, std_out, std_err, &block);
   if (!NT_SUCCESS(status)) {
@@ -2248,7 +2492,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     else fail_nt(status);
     return FALSE;
   }
-  con_note_child(process_id, block.console);
+  con_note_child(process_id, block.console, block.words[11] == 0xFFFFFFFFu ? process_id : block.words[11], block.words[10] & 1);
   if (debug_start) {      /* attached before it runs its first instruction; its children too, unless DEBUG_ONLY_THIS_PROCESS */
     const NTSTATUS attached = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
     if (NT_SUCCESS(attached) && (flags & 0x1) && !(flags & 0x2)) { ULONG inherit = 1; NtSetInformationProcess(process, 31, &inherit, sizeof(inherit)); }
@@ -2271,14 +2515,16 @@ EXPORT BOOL WINAPI CreateProcessA(LPCSTR application, LPSTR command_line, LPSECU
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCSTR directory, LPSTARTUPINFOA startup, LPPROCESS_INFORMATION information) {
   WCHAR *wide_application = application ? to_wide(application) : NULL, *wide_command = command_line ? to_wide(command_line) : NULL, *wide_directory = directory ? to_wide(directory) : NULL;
   WCHAR *wide_environment = NULL, *wide_title = NULL, *wide_desktop = NULL;
-  STARTUPINFOW wide_startup;
+  struct { STARTUPINFOW info; LPVOID attributes; } wide_startup;      /* (STARTUPINFOEXW) */
   BOOL ok = FALSE;
   if (startup) {      /* the startup information with wide strings */
-    memcpy(&wide_startup, startup, sizeof(wide_startup));
+    memset(&wide_startup, 0, sizeof(wide_startup));
+    memcpy(&wide_startup.info, startup, sizeof(wide_startup.info));
+    if (startup->cb >= sizeof(wide_startup)) wide_startup.attributes = ((struct { STARTUPINFOA info; LPVOID attributes; } *)startup)->attributes;
     wide_title = startup->lpTitle ? to_wide(startup->lpTitle) : NULL;
     wide_desktop = startup->lpDesktop ? to_wide(startup->lpDesktop) : NULL;
-    wide_startup.lpTitle = wide_title;
-    wide_startup.lpDesktop = wide_desktop;
+    wide_startup.info.lpTitle = wide_title;
+    wide_startup.info.lpDesktop = wide_desktop;
   }
   if ((application && !wide_application) || (command_line && !wide_command) || (directory && !wide_directory)) goto done;
   if (environment) {      /* "NAME=value\0...\0\0" in the ANSI code page: converted as a whole */
@@ -2291,7 +2537,7 @@ EXPORT BOOL WINAPI CreateProcessA(LPCSTR application, LPSTR command_line, LPSECU
     if (!wide_environment) { set_error(ERROR_NOT_ENOUGH_MEMORY); goto done; }
     MultiByteToWideChar(CP_UTF8, 0, e, (int)n, wide_environment, units);
   }
-  ok = CreateProcessW(wide_application, wide_command, process_attributes, thread_attributes, inherit_handles, flags | CREATE_UNICODE_ENVIRONMENT, wide_environment, wide_directory, startup ? &wide_startup : NULL, information);
+  ok = CreateProcessW(wide_application, wide_command, process_attributes, thread_attributes, inherit_handles, flags | CREATE_UNICODE_ENVIRONMENT, wide_environment, wide_directory, startup ? &wide_startup.info : NULL, information);
 done:
   free_wide(wide_application);
   free_wide(wide_command);
@@ -2322,11 +2568,15 @@ EXPORT UINT WINAPI WinExec(LPCSTR command_line, UINT show) {
 
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
+static BOOL pipe_cancel_pending(HANDLE h, LPOVERLAPPED overlapped);
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   if ((ULONG_PTR)h == 0x4B4F54) return TRUE;      /* (advapi32's token "handle": there is nothing behind it) */
+  pipe_cancel_pending(h, NULL);      /* (the calls that wait on a pipe handle end with it, and their OVERLAPPEDs are completed before it is gone) */
   port_unlink(h);
   overlapped_forget(h);
+  con_alias_forget(h);
   const NTSTATUS status = NtClose(h);
+  if (NT_SUCCESS(status)) con_handle_closed(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI GetHandleInformation(HANDLE h, LPDWORD flags) {
@@ -2395,6 +2645,76 @@ EXPORT void WINAPI GetSystemTime(LPSYSTEMTIME st) { FILETIME ft; GetSystemTimeAs
 /* Exception handling lives in ntdll.dll (src/Windows/ntdll/except.inc); kernel32 gives programs the names they know. RtlUnwindEx, RtlVirtualUnwind and the others
  * are forwarded to ntdll by kernel32.def. */
 EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter) { return RtlSetUnhandledExceptionFilter(filter); }
+/* The post-mortem debugger of HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug: when the crashed program has no debugger and the key's Debugger value names one
+ * (and Auto is not 0), it is started with the process id and an event (inheritable) in place of the two %ld, and the crashed program waits until the debugger has
+ * attached and set the event, or has exited. TRUE: it attached (the exception then goes to it as a second chance). */
+VOID NTAPI RtlInitUnicodeString(PUNICODE_STRING dst, PCWSTR src);
+IMPORT NTSTATUS NTAPI NtOpenKey(PHANDLE, ULONG, POBJECT_ATTRIBUTES);
+IMPORT NTSTATUS NTAPI NtQueryValueKey(HANDLE, PUNICODE_STRING, ULONG, PVOID, ULONG, PULONG);
+typedef struct { ULONG TitleIndex, Type, DataLength; BYTE Data[1]; } AE_PARTIAL_VALUE;      /* (KEY_VALUE_PARTIAL_INFORMATION) */
+static BOOL ae_debug_value(HANDLE key, const WCHAR *name, WCHAR *out, ULONG capacity) {
+  UNICODE_STRING value;
+  RtlInitUnicodeString(&value, name);
+  BYTE buffer[16 + 1040] __attribute__((aligned(8)));
+  ULONG length = 0;
+  if (!NT_SUCCESS(NtQueryValueKey(key, &value, 2 /* KeyValuePartialInformation */, buffer, sizeof(buffer), &length)) || length < 12) return FALSE;
+  const AE_PARTIAL_VALUE *info = (const AE_PARTIAL_VALUE *)buffer;
+  ULONG n = info->DataLength / 2;
+  if (n > (length - 12) / 2) n = (length - 12) / 2;
+  if (n >= capacity) n = capacity - 1;
+  memcpy(out, info->Data, n * 2);
+  out[n] = 0;
+  return TRUE;
+}
+static SIZE_T ae_debug_put_number(WCHAR *at, ULONG64 number) {
+  WCHAR digits[24];
+  SIZE_T n = 0, k = 0;
+  do { digits[n++] = (WCHAR)('0' + number % 10); number /= 10; } while (number);
+  while (n) at[k++] = digits[--n];
+  return k;
+}
+static BOOL start_ae_debugger(void) {
+  static const WCHAR path[] = L"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug";
+  UNICODE_STRING name;
+  RtlInitUnicodeString(&name, path);
+  OBJECT_ATTRIBUTES attributes = {sizeof(attributes), NULL, &name, 0x40, NULL, NULL};
+  HANDLE key = NULL;
+  if (!NT_SUCCESS(NtOpenKey(&key, 0x20019, &attributes))) return FALSE;
+  WCHAR format[512], automatic[16], command[600];
+  BOOL have = ae_debug_value(key, L"Debugger", format, 512) && format[0];
+  if (have && ae_debug_value(key, L"Auto", automatic, 16) && automatic[0] == '0') have = FALSE;
+  NtClose(key);
+  if (!have) return FALSE;
+  SECURITY_ATTRIBUTES inheritable = {sizeof(inheritable), NULL, TRUE};
+  HANDLE event = CreateEventW(&inheritable, TRUE, FALSE, NULL);
+  if (!event) return FALSE;
+  SIZE_T n = 0;
+  int numbers = 0;
+  for (const WCHAR *c = format; *c && n < 560; ++c) {
+    if (c[0] == '%' && c[1] == 'l' && c[2] == 'd' && numbers < 2) {
+      n += ae_debug_put_number(command + n, numbers == 0 ? (ULONG64)GetCurrentProcessId() : (ULONG64)(ULONG_PTR)event);
+      ++numbers;
+      c += 2;
+    } else if (c[0] == '%' && c[1] == '%') {
+      command[n++] = '%';
+      ++c;
+    } else command[n++] = *c;
+  }
+  command[n] = 0;
+  STARTUPINFOW startup;
+  PROCESS_INFORMATION info;
+  memset(&startup, 0, sizeof(startup));
+  startup.cb = sizeof(startup);
+  BOOL attached = FALSE;
+  if (CreateProcessW(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &info)) {
+    HANDLE waits[2] = {event, info.hProcess};
+    attached = WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0;
+    CloseHandle(info.hThread);
+    CloseHandle(info.hProcess);
+  }
+  CloseHandle(event);
+  return attached;
+}
 EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) {
   LPTOP_LEVEL_EXCEPTION_FILTER filter = RtlSetUnhandledExceptionFilter(NULL);      /* (read it, put it back) */
   RtlSetUnhandledExceptionFilter(filter);
@@ -2403,6 +2723,7 @@ EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) {
   NtQueryInformationProcess(NtCurrentProcess(), 7 /* ProcessDebugPort */, &port, sizeof(port), NULL);
   if (port) return EXCEPTION_CONTINUE_SEARCH;      /* (the debugger gets the second chance) */
   if (filter) { const LONG answer = filter(info); if (answer != EXCEPTION_CONTINUE_SEARCH) return answer; }
+  if (!(GetErrorMode() & 0x0002u /* SEM_NOGPFAULTERRORBOX */) && start_ae_debugger()) return EXCEPTION_CONTINUE_SEARCH;      /* (the exception goes to the debugger that attached) */
   return EXCEPTION_EXECUTE_HANDLER;
 }
 EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD count, const ULONG_PTR *arguments) {
@@ -2424,14 +2745,14 @@ static HANDLE g_std_override[3];
 static BOOL g_std_overridden[3];
 EXPORT HANDLE WINAPI GetStdHandle(DWORD which) {
   const int i = which == STD_INPUT_HANDLE ? 0 : which == STD_OUTPUT_HANDLE ? 1 : which == STD_ERROR_HANDLE ? 2 : -1;
-  if (i < 0) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (i < 0) { set_error(ERROR_INVALID_HANDLE); return INVALID_HANDLE_VALUE; }
   if (g_std_overridden[i]) return g_std_override[i];
   RTL_USER_PROCESS_PARAMETERS *p = parameters();
   return i == 0 ? p->StandardInput : i == 1 ? p->StandardOutput : p->StandardError;
 }
 EXPORT BOOL WINAPI SetStdHandle(DWORD which, HANDLE h) {
   const int i = which == STD_INPUT_HANDLE ? 0 : which == STD_OUTPUT_HANDLE ? 1 : which == STD_ERROR_HANDLE ? 2 : -1;
-  if (i < 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (i < 0) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   RTL_USER_PROCESS_PARAMETERS *p = parameters();      /* (the standard handles live in the process parameters, where the console functions look too) */
   if (i == 0) p->StandardInput = h; else if (i == 1) p->StandardOutput = h; else p->StandardError = h;
   g_std_override[i] = h;
@@ -2449,15 +2770,46 @@ static int device_type(HANDLE h) {
 EXPORT DWORD WINAPI GetFileType(HANDLE h) {
   if ((ULONG_PTR)h >= 0xFFFFFFF4u && (ULONG_PTR)h <= 0xFFFFFFF6u) h = GetStdHandle((DWORD)(ULONG_PTR)h);      /* STD_INPUT_HANDLE and the others */
   const int type = device_type(h);
+  if (con_unbound_kind(h)) { set_error(ERROR_SUCCESS); return FILE_TYPE_CHAR; }      /* a handle of the console that is an event */
   if (type < 0) { set_error(ERROR_INVALID_HANDLE); return FILE_TYPE_UNKNOWN; }
   set_error(ERROR_SUCCESS);
   if (type == 0x0c) return FILE_TYPE_UNKNOWN;      /* a mailslot */
   return (type == 0x50 || type == 0x15) ? FILE_TYPE_CHAR : type == 0x11 ? FILE_TYPE_PIPE : FILE_TYPE_DISK;
 }
 
+/* A buffer for a file on a disk has to be usable as a whole before anything is moved (a call never does half of its work for that). The handle is checked first. */
+static BOOL disk_buffer_usable(HANDLE h, const void *buffer, DWORD length, BOOL for_reading, DWORD error) {
+  if (length == 0 || range_allowed(buffer, length, for_reading)) return TRUE;
+  const int type = device_type(h);
+  if (type < 0) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (type == 0x50 || type == 0x15 || type == 0x11 || type == 0x0c) return TRUE;      /* (a console, a pipe or a mailslot answers for itself) */
+  set_error(error);
+  return FALSE;
+}
 EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped) {
-  if (!overlapped) { BOOL handled; const BOOL result = console_write_hook(h, buffer, length, written, &handled); if (handled) return result; }
-  if (pipe_start_overlapped(1, h, (LPVOID)buffer, length, overlapped, NULL)) { if (written) *written = 0; return FALSE; }
+  if (written) *written = 0;
+  if (con_dead_handle(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (!disk_buffer_usable(h, buffer, length, FALSE, ERROR_INVALID_USER_BUFFER)) return FALSE;
+  if (!overlapped) {      /* (probing for the console must not leave its own error behind: a write that works leaves the last error alone) */
+    const DWORD saved = TEB_LAST_ERROR(NtCurrentTeb());
+    BOOL handled;
+    const BOOL result = console_write_hook(h, buffer, length, written, &handled);
+    if (!handled || result) set_error(saved);
+    if (handled) return result;
+  }
+  if (overlapped) {
+    ULONG_PTR information = 0;
+    NTSTATUS result = 0;
+    const int started = pipe_begin(1, h, (LPVOID)buffer, length, overlapped, NULL, &information, &result, NULL, 0);      /* 1: waiting, 2: it went at once, 3: it failed */
+    if (started == 1) { if (written) *written = 0; return FALSE; }
+    if (started == 2) {
+      complete_overlapped(overlapped, result, information);
+      port_note(h, overlapped, information);
+      if (written) *written = (DWORD)information;
+      return TRUE;
+    }
+    if (started == 3) { overlapped->Internal = (ULONG_PTR)STATUS_PENDING; return fail_nt(result); }
+  }
   IO_STATUS_BLOCK iosb;
   LARGE_INTEGER offset;
   PLARGE_INTEGER pointer = NULL;
@@ -2471,30 +2823,33 @@ EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD wri
   iosb.Information = 0;
   const NTSTATUS status = NtWriteFile(h, NULL, NULL, NULL, &iosb, (PVOID)buffer, length, pointer, NULL);
   if (!NT_SUCCESS(status)) return fail_nt(status);      /* (a call that fails at once leaves the OVERLAPPED as it set it: still pending) */
-  if (written) *written = (DWORD)iosb.Information;
   complete_overlapped(overlapped, status, iosb.Information);
   port_note(h, overlapped, iosb.Information);
+  if (overlapped && unbuffered_known(h)) { set_error(ERROR_IO_PENDING); return FALSE; }      /* (a call that goes to the disk is asynchronous: the result is in the OVERLAPPED) */
+  if (written) *written = (DWORD)iosb.Information;
   return TRUE;
 }
 /* An asynchronous operation's result is in the OVERLAPPED: Internal is its status (STATUS_PENDING until it is done), InternalHigh the bytes moved. While it is pending the
  * call may wait for the event (or the file) to be signalled; GetOverlappedResultEx also waits on a completed one unless the low bit of the file handle is set. */
-EXPORT BOOL WINAPI GetOverlappedResultEx(HANDLE file, LPOVERLAPPED overlapped, LPDWORD transferred, DWORD timeout, BOOL alertable) {
+static BOOL overlapped_result(HANDLE file, LPOVERLAPPED overlapped, LPDWORD transferred, DWORD timeout, BOOL alertable, BOOL ex) {
   NTSTATUS status = (NTSTATUS)overlapped->Internal;
-  if (status == STATUS_PENDING || (1 && timeout && !((ULONG_PTR)file & 1))) {
-    if (!timeout) { set_error(ERROR_IO_INCOMPLETE); return FALSE; }
-    const DWORD waited = WaitForSingleObjectEx(overlapped->hEvent ? overlapped->hEvent : file, timeout, alertable);
+  if (status == STATUS_PENDING && !timeout) { set_error(ERROR_IO_INCOMPLETE); return FALSE; }
+  const BOOL no_block = ex && ((ULONG_PTR)file & 1);      /* (the Ex call only looks, without waiting, when the low bit of the file handle is set) */
+  if (timeout && (status == STATUS_PENDING || (ex && !no_block))) {
+    const DWORD waited = WaitForSingleObjectEx(overlapped->hEvent ? overlapped->hEvent : file, no_block ? 0 : timeout, alertable);
     if (waited == WAIT_FAILED) return FALSE;
-    if (waited == WAIT_IO_COMPLETION || waited == WAIT_TIMEOUT) { set_error(waited); return FALSE; }
+    if (waited == WAIT_IO_COMPLETION || (waited == WAIT_TIMEOUT && !no_block)) { set_error(waited); return FALSE; }
     status = (NTSTATUS)overlapped->Internal;
   }
   if (transferred) *transferred = (DWORD)overlapped->InternalHigh;
   set_error(RtlNtStatusToDosError(status));
   return status == STATUS_SUCCESS || status == STATUS_PENDING;
 }
+EXPORT BOOL WINAPI GetOverlappedResultEx(HANDLE file, LPOVERLAPPED overlapped, LPDWORD transferred, DWORD timeout, BOOL alertable) { return overlapped_result(file, overlapped, transferred, timeout, alertable, TRUE); }
 EXPORT BOOL WINAPI GetOverlappedResult(HANDLE file, LPOVERLAPPED overlapped, LPDWORD transferred, BOOL wait) {
   if (!overlapped) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  if ((NTSTATUS)overlapped->Internal != STATUS_PENDING) return GetOverlappedResultEx(file, overlapped, transferred, 0, FALSE);      /* (a finished operation is not waited for) */
-  return GetOverlappedResultEx(file, overlapped, transferred, wait ? INFINITE : 0, FALSE);
+  if ((NTSTATUS)overlapped->Internal != STATUS_PENDING) return overlapped_result(file, overlapped, transferred, 0, FALSE, FALSE);      /* (a finished operation is not waited for) */
+  return overlapped_result(file, overlapped, transferred, wait ? INFINITE : 0, FALSE, FALSE);
 }
 
 /* ---- pipes ------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -2568,32 +2923,30 @@ EXPORT HANDLE WINAPI CreateNamedPipeA(LPCSTR name, DWORD open_mode, DWORD pipe_m
 #define FSCTL_PIPE_WAIT_ 0x110018
 #define FSCTL_PIPE_TRANSCEIVE_ 0x11C017
 
-/* An overlapped call on a named pipe that has to wait (nothing to read yet, nobody connected yet) is carried out by a thread of its own, as the kernel's calls are
- * synchronous; the thread completes the OVERLAPPED (and so its event) when the call returns. A call that can be answered at once is done in line, as without a thread. */
-typedef struct { int op; HANDLE pipe; LPVOID buffer; DWORD length; LPOVERLAPPED overlapped; LPOVERLAPPED_COMPLETION_ROUTINE_ routine; HANDLE caller; int slot; } PipeRequest;      /* op: 0 read, 1 write, 2 connect */
-/* The calls waiting in threads, so that CancelIo can end them: the thread looks at its flag between tries (it does not sit in the kernel's blocking call). */
+/* An overlapped call on a named pipe that has to wait (nothing to read yet, nobody connected yet, a write that does not fit) is an operation of the pipe in the kernel,
+ * started by the calling thread (a write is queued there, whole, at once: the other end sees its bytes) and waited for by a thread of its own, as the kernel's calls are
+ * synchronous; the thread completes the OVERLAPPED (and so its event) when the operation is over, then says so (ACK) - whoever finished the operation does not return before
+ * that, so the result is there when its call returns. A call that can be answered at once is done in line, as without a thread. */
+typedef struct { int op; HANDLE pipe; LPVOID buffer; DWORD length; LPOVERLAPPED overlapped; LPOVERLAPPED_COMPLETION_ROUTINE_ routine; HANDLE caller; int slot; DWORD tag; } PipeRequest;      /* op: 0 read, 1 write, 2 connect */
+/* The operations waiting in threads, so that CancelIo can end them by their tags. */
 #define PIPE_PENDING_MAX 32
-static struct { HANDLE pipe; LPOVERLAPPED overlapped; volatile LONG used, cancel; } g_pipe_pending[PIPE_PENDING_MAX];
+#define FSCTL_PIPE_BEGIN_READ_ 0x11FFF0
+#define FSCTL_PIPE_BEGIN_WRITE_ 0x11FFF1
+#define FSCTL_PIPE_BEGIN_LISTEN_ 0x11FFF2
+#define FSCTL_PIPE_AWAIT_ 0x11FFF3
+#define FSCTL_PIPE_ACK_ 0x11FFF4
+#define FSCTL_PIPE_CANCEL_ 0x11FFF5
+#define FSCTL_PIPE_BEGIN_TRANSACT_ 0x11FFF6
+static struct { HANDLE pipe; LPOVERLAPPED overlapped; DWORD tag; volatile LONG used; } g_pipe_pending[PIPE_PENDING_MAX];
 static void atom_lock(void);
 static CRITICAL_SECTION g_atom_lock;      /* (defined in extra3.inc; a tentative definition here) */
-static BOOL pipe_calls_pending(void) {
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (g_pipe_pending[n].used) return TRUE;
-  return FALSE;
-}
 static DWORD WINAPI pipe_request_thread(LPVOID parameter) {
   PipeRequest request = *(PipeRequest *)parameter;
   RtlFreeHeap(heap(), 0, parameter);
   IO_STATUS_BLOCK iosb;
   iosb.Information = 0;
-  NTSTATUS status;
-  iosb.Information = 0;
-  if (request.op == 0) status = NtReadFile(request.pipe, NULL, NULL, NULL, &iosb, request.buffer, request.length, NULL, NULL);
-  else if (request.op == 1) status = NtWriteFile(request.pipe, NULL, NULL, NULL, &iosb, request.buffer, request.length, NULL, NULL);
-  else {
-    status = NtFsControlFile(request.pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_LISTEN_, NULL, 0, NULL, 0);
-    if (status == (NTSTATUS)0xC00000AFu) status = STATUS_SUCCESS;      /* (the client came while this was waiting: that is the success) */
-  }
-  g_pipe_pending[request.slot].used = 0;
+  const BYTE no_event = request.overlapped->hEvent ? 0 : 1;      /* (the OVERLAPPED may be gone once it is completed) */
+  NTSTATUS status = NtFsControlFile(request.pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_AWAIT_, &request.tag, 4, request.op == 0 ? request.buffer : NULL, request.op == 0 ? request.length : 0);
   if (status == STATUS_PENDING) status = STATUS_SUCCESS;
   if (request.routine) {      /* ReadFileEx/WriteFileEx: the routine is queued before the event is set, so that a wait that ends on the event has already run it */
     request.overlapped->Internal = (ULONG_PTR)(ULONG)status;
@@ -2601,42 +2954,66 @@ static DWORD WINAPI pipe_request_thread(LPVOID parameter) {
     NtQueueApcThread(request.caller, (PVOID)completion_apc, (ULONG_PTR)request.routine, (ULONG_PTR)request.overlapped, 0);
     NtClose(request.caller);
     if (request.overlapped->hEvent) NtSetEvent((HANDLE)((ULONG_PTR)request.overlapped->hEvent & ~(ULONG_PTR)1), NULL);
-    return 0;
+  } else {
+    complete_overlapped(request.overlapped, status, iosb.Information);
+    port_note(request.pipe, request.overlapped, iosb.Information);
   }
-  complete_overlapped(request.overlapped, status, iosb.Information);
-  port_note(request.pipe, request.overlapped, iosb.Information);
+  g_pipe_pending[request.slot].used = 0;
+  BYTE ack[5] = {(BYTE)request.tag, (BYTE)(request.tag >> 8), (BYTE)(request.tag >> 16), (BYTE)(request.tag >> 24), no_event};
+  NtFsControlFile(request.pipe, NULL, NULL, NULL, &iosb, FSCTL_PIPE_ACK_, ack, 5, NULL, 0);
   return 0;
 }
-/* True (with ERROR_IO_PENDING set) if the call was handed to a thread. */
-static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
-  if (!overlapped || device_type(h) != 0x11) return FALSE;
-  IO_STATUS_BLOCK iosb;
-  BYTE probe[16];
-  iosb.Information = 0;
-  const NTSTATUS peek = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_PEEK_, NULL, 0, probe, sizeof(probe));
-  if (op == 0 && !(NT_SUCCESS(peek) && get32(probe + 4) == 0)) return FALSE;      /* (data, or an error, is answered now) */
-  if (op == 2 && peek != (NTSTATUS)0xC00000ADu) return FALSE;      /* (already connected) */
-  if (op == 1) {      /* a write waits only when it does not fit */
-    BYTE local[40];
-    if (!NT_SUCCESS(NtQueryInformationFile(h, &iosb, local, sizeof(local), 24)) || get32(local + 28) >= length) return FALSE;
-  }
+/* 0 if the call is to be made the usual way (nothing was done); 1 if it waits in a thread (ERROR_IO_PENDING is set); for a write also 2 if it went at once (*information
+ * bytes) and 3 if it failed (*result). */
+static int pipe_begin(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine, ULONG_PTR *information, NTSTATUS *result, LPVOID in, DWORD in_size) {
+  if (!overlapped || device_type(h) != 0x11) return 0;
   PipeRequest *request = RtlAllocateHeap(heap(), 0, sizeof(*request));
-  if (!request) return FALSE;
+  if (!request) return 0;
   int slot = -1;
   atom_lock();
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (!g_pipe_pending[n].used) { g_pipe_pending[n].used = 1; g_pipe_pending[n].cancel = 0; g_pipe_pending[n].pipe = h; g_pipe_pending[n].overlapped = overlapped; slot = n; break; }
+  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (!g_pipe_pending[n].used) { g_pipe_pending[n].used = 1; g_pipe_pending[n].pipe = h; g_pipe_pending[n].overlapped = overlapped; g_pipe_pending[n].tag = 0; slot = n; break; }
   LeaveCriticalSection(&g_atom_lock);
-  if (slot < 0) { RtlFreeHeap(heap(), 0, request); return FALSE; }
+  if (slot < 0) { RtlFreeHeap(heap(), 0, request); return 0; }
+  IO_STATUS_BLOCK iosb;
+  DWORD tag = 0;
+  iosb.Information = 0;
+  NTSTATUS status;
+  if (op == 0) status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_READ_, &length, 4, &tag, 4);
+  else if (op == 1) status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_WRITE_, buffer, length, &tag, 4);
+  else if (op == 3) { tag = length; status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_TRANSACT_, in, in_size, &tag, 4); }      /* (the read length goes in, the tag comes out) */
+  else status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_BEGIN_LISTEN_, NULL, 0, &tag, 4);
+  if (status != STATUS_PENDING) {      /* answered at once (or not an operation at all) */
+    g_pipe_pending[slot].used = 0;
+    RtlFreeHeap(heap(), 0, request);
+    if ((op != 1 && op != 3) || status == (NTSTATUS)0xC00000BBu) return 0;
+    *information = iosb.Information;
+    *result = status;
+    return NT_SUCCESS(status) ? 2 : 3;
+  }
+  g_pipe_pending[slot].tag = tag;
   request->slot = slot;
-  request->op = op; request->pipe = h; request->buffer = buffer; request->length = length; request->overlapped = overlapped; request->routine = routine; request->caller = NULL;
-  if (routine && !DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &request->caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) { RtlFreeHeap(heap(), 0, request); return FALSE; }
+  request->op = op == 3 ? 0 : op; request->pipe = h; request->buffer = buffer; request->length = length; request->overlapped = overlapped; request->routine = routine; request->caller = NULL; request->tag = tag;
   overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
   if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
-  HANDLE thread = CreateThread(NULL, 0, pipe_request_thread, request, 0, NULL);
-  if (!thread) { g_pipe_pending[slot].used = 0; RtlFreeHeap(heap(), 0, request); return FALSE; }
+  HANDLE thread = NULL;
+  if (!routine || DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &request->caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) thread = CreateThread(NULL, 0, pipe_request_thread, request, 0, NULL);
+  if (!thread) {      /* no thread to wait for it: the operation is given up */
+    if (request->caller) NtClose(request->caller);
+    NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_CANCEL_, &tag, 4, NULL, 0);
+    NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_ACK_, &tag, 4, NULL, 0);
+    g_pipe_pending[slot].used = 0;
+    RtlFreeHeap(heap(), 0, request);
+    *result = (NTSTATUS)0xC000009Au;
+    return op == 1 || op == 3 ? 3 : 0;
+  }
   NtClose(thread);
   set_error(997);      /* ERROR_IO_PENDING */
-  return TRUE;
+  return 1;
+}
+static BOOL pipe_start_overlapped(int op, HANDLE h, LPVOID buffer, DWORD length, LPOVERLAPPED overlapped, LPOVERLAPPED_COMPLETION_ROUTINE_ routine) {
+  ULONG_PTR information = 0;
+  NTSTATUS result = 0;
+  return pipe_begin(op, h, buffer, length, overlapped, routine, &information, &result, NULL, 0) == 1;
 }
 EXPORT BOOL WINAPI ConnectNamedPipe(HANDLE h, LPOVERLAPPED overlapped) {
   if (pipe_start_overlapped(2, h, NULL, 0, overlapped, NULL)) return FALSE;
@@ -2672,6 +3049,13 @@ EXPORT BOOL WINAPI PeekNamedPipe(HANDLE h, LPVOID buffer, DWORD size, LPDWORD re
   return ok;
 }
 EXPORT BOOL WINAPI TransactNamedPipe(HANDLE h, LPVOID in, DWORD in_size, LPVOID out, DWORD out_size, LPDWORD read, LPOVERLAPPED overlapped) {
+  if (overlapped) {      /* the message goes at once; the answer is awaited in a thread */
+    ULONG_PTR information = 0;
+    NTSTATUS result = 0;
+    const int started = pipe_begin(3, h, out, out_size, overlapped, NULL, &information, &result, in, in_size);
+    if (started == 1) return FALSE;
+    if (started == 3) return fail_nt(result);
+  }
   IO_STATUS_BLOCK iosb;
   iosb.Information = 0;
   const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_TRANSCEIVE_, in, in_size, out, out_size);
@@ -2719,6 +3103,7 @@ EXPORT BOOL WINAPI WaitNamedPipeA(LPCSTR name, DWORD timeout_ms) {
   free_wide(w);
   return ok;
 }
+EXPORT BOOL WINAPI SetNamedPipeHandleState(HANDLE h, LPDWORD mode, LPDWORD collect, LPDWORD timeout);
 EXPORT BOOL WINAPI CallNamedPipeW(LPCWSTR name, LPVOID in, DWORD in_size, LPVOID out, DWORD out_size, LPDWORD read, DWORD timeout_ms) {
   HANDLE h;
   for (;;) {
@@ -2726,7 +3111,8 @@ EXPORT BOOL WINAPI CallNamedPipeW(LPCWSTR name, LPVOID in, DWORD in_size, LPVOID
     if (h != INVALID_HANDLE_VALUE) break;
     if (GetLastError() != ERROR_PIPE_BUSY || !WaitNamedPipeW(name, timeout_ms)) return FALSE;
   }
-  const BOOL ok = TransactNamedPipe(h, in, in_size, out, out_size, read, NULL);
+  DWORD mode = 2 /* PIPE_READMODE_MESSAGE */;      /* (the answer is a message) */
+  const BOOL ok = SetNamedPipeHandleState(h, &mode, NULL, NULL) && TransactNamedPipe(h, in, in_size, out, out_size, read, NULL);
   const DWORD error = GetLastError();
   CloseHandle(h);
   if (!ok) set_error(error);
@@ -2768,6 +3154,37 @@ EXPORT BOOL WINAPI GetNamedPipeHandleStateW(HANDLE h, LPDWORD state, LPDWORD ins
 EXPORT BOOL WINAPI GetNamedPipeHandleStateA(HANDLE h, LPDWORD state, LPDWORD instances, LPDWORD collect, LPDWORD timeout, LPSTR user, DWORD user_size) {
   return GetNamedPipeHandleStateW(h, state, instances, collect, timeout, (LPWSTR)user, user_size);
 }
+/* The processes at the two ends of a pipe: the kernel keeps them with the instance (`which` 0: the client's, 1: the server's). */
+static BOOL pipe_process_of(HANDLE h, DWORD which, ULONG *pid) {
+  if (!pid) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  IO_STATUS_BLOCK iosb;
+  DWORD out = 0;
+  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, 0x11FFF7, &which, 4, &out, 4);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  *pid = out;
+  return TRUE;
+}
+EXPORT BOOL WINAPI ProcessIdToSessionId(DWORD pid, DWORD *session);
+EXPORT BOOL WINAPI GetNamedPipeClientProcessId(HANDLE h, PULONG pid) { return pipe_process_of(h, 0, pid); }
+EXPORT BOOL WINAPI GetNamedPipeServerProcessId(HANDLE h, PULONG pid) { return pipe_process_of(h, 1, pid); }
+EXPORT BOOL WINAPI GetNamedPipeClientSessionId(HANDLE h, PULONG session) {
+  ULONG pid = 0;
+  if (!session) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  return pipe_process_of(h, 0, &pid) && ProcessIdToSessionId(pid, (DWORD *)session);
+}
+/* (There is one session, so the server's is the client's.) */
+EXPORT BOOL WINAPI GetNamedPipeServerSessionId(HANDLE h, PULONG session) {
+  ULONG pid = 0;
+  if (!session) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  return pipe_process_of(h, 1, &pid) && ProcessIdToSessionId(pid, (DWORD *)session);
+}
+/* Every client is on this machine: the call fails with ERROR_PIPE_LOCAL (and leaves the buffer alone), or with ERROR_INSUFFICIENT_BUFFER if there is no room for a name. */
+EXPORT BOOL WINAPI GetNamedPipeClientComputerNameW(HANDLE h, LPWSTR name, ULONG length) {
+  (void)h; (void)name;
+  set_error(length == 0 ? ERROR_INSUFFICIENT_BUFFER : 229 /* ERROR_PIPE_LOCAL */);
+  return FALSE;
+}
+EXPORT BOOL WINAPI GetNamedPipeClientComputerNameA(HANDLE h, LPSTR name, ULONG length) { return GetNamedPipeClientComputerNameW(h, (LPWSTR)name, length); }
 EXPORT BOOL WINAPI SetNamedPipeHandleState(HANDLE h, LPDWORD mode, LPDWORD collect, LPDWORD timeout) {
   (void)collect; (void)timeout;
   if (!mode) return TRUE;
@@ -2863,8 +3280,10 @@ static BOOL con_std_is_console(HANDLE h);
 static BOOL con_is_output_only(HANDLE h);
 EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, LPOVERLAPPED overlapped) {
   if (read) *read = 0;
+  if (con_dead_handle(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (con_is_output_only(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (length > 0x7FFFFFFFu && con_std_is_console(h)) { set_error(ERROR_NOACCESS); return FALSE; }
+  if (!disk_buffer_usable(h, buffer, length, TRUE, ERROR_NOACCESS)) return FALSE;
   if (pipe_start_overlapped(0, h, buffer, length, overlapped, NULL)) return FALSE;
   if (!overlapped) { BOOL handled; const BOOL result = console_read_hook(h, buffer, length, read, &handled); if (handled) return result; }
   IO_STATUS_BLOCK iosb;
@@ -2885,11 +3304,16 @@ EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read,
     set_error(ERROR_MORE_DATA);
     return FALSE;
   }
-  if (status == STATUS_END_OF_FILE) { complete_overlapped(overlapped, status, 0); return overlapped ? (set_error(ERROR_HANDLE_EOF), FALSE) : TRUE; }      /* (an overlapped read says so) */
+  if (status == STATUS_END_OF_FILE) {
+    complete_overlapped(overlapped, status, 0);
+    if (overlapped && unbuffered_known(h)) { port_note(h, overlapped, 0); set_error(ERROR_IO_PENDING); return FALSE; }
+    return overlapped ? (set_error(ERROR_HANDLE_EOF), FALSE) : TRUE;      /* (an overlapped read says so) */
+  }
   if (!NT_SUCCESS(status)) return fail_nt(status);
-  if (read) *read = (DWORD)iosb.Information;
   complete_overlapped(overlapped, status, iosb.Information);
   port_note(h, overlapped, iosb.Information);
+  if (overlapped && unbuffered_known(h)) { set_error(ERROR_IO_PENDING); return FALSE; }      /* (a call that goes to the disk is asynchronous: the result is in the OVERLAPPED) */
+  if (read) *read = (DWORD)iosb.Information;
   return TRUE;
 }
 #include "console.inc"
@@ -2970,13 +3394,30 @@ static DWORD dosdev_redirect(WCHAR *buffer, DWORD length, DWORD capacity);
 static BOOL volume_nt_name(LPCWSTR dos, WCHAR *buffer, DWORD capacity, DWORD *length);
 
 /* The NT name ("\??\C:\dir\file") for a Win32 path, and an OBJECT_ATTRIBUTES for it. `buffer` needs PATH_CHARS + 8 characters. */
-static BOOL nt_name(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attributes) {
+static BOOL expand_short_names(WCHAR *path, DWORD length, DWORD capacity, DWORD *new_length);
+static int has_tilde(const WCHAR *s) { for (; *s; ++s) if (*s == '~') return 1; return 0; }
+static BOOL nt_name_ex(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attributes, int expand) {
   DWORD total = 0;
+  if (dos && dos[0] == '\\' && ((dos[1] == '\\' && dos[2] == '?') || (dos[1] == '?' && dos[2] == '?')) && dos[3] == '\\') {      /* \\?\ and \??\: the name is taken as it is, nothing is made of "." and ".." */
+    const WCHAR *rest = dos + 4;
+    if (!*rest) { set_error(ERROR_INVALID_NAME); return FALSE; }
+    for (const WCHAR *c = rest; *c;) {
+      const WCHAR *end = c;
+      while (*end && *end != '\\') ++end;
+      if ((end - c == 1 && c[0] == '.') || (end - c == 2 && c[0] == '.' && c[1] == '.')) { set_error(ERROR_INVALID_NAME); return FALSE; }
+      c = *end ? end + 1 : end;
+    }
+  }
   if (!volume_nt_name(dos, buffer, PATH_CHARS + 8, &total)) {
     buffer[0] = '\\'; buffer[1] = '?'; buffer[2] = '?'; buffer[3] = '\\';
     const DWORD n = full_path_w(dos, buffer + 4, PATH_CHARS);
     if (n == 0) return FALSE;
     total = n + 4;
+    if (expand && has_tilde(buffer + 4)) {      /* a component may be the 8.3 alias of a longer name */
+      DWORD expanded = n;
+      if (!expand_short_names(buffer + 4, n, PATH_CHARS, &expanded)) return FALSE;
+      total = expanded + 4;
+    }
   }
   total = dosdev_redirect(buffer, total, PATH_CHARS + 8);
   if (total == 0) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
@@ -2991,9 +3432,20 @@ static BOOL nt_name(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATT
   return TRUE;
 }
 
+static BOOL nt_name(LPCWSTR dos, WCHAR *buffer, UNICODE_STRING *name, OBJECT_ATTRIBUTES *attributes) { return nt_name_ex(dos, buffer, name, attributes, 1); }
+
+/* full_path_w for GetFullPathName: a path written with a trailing separator ("dir\\") keeps it (the NT names do without). */
+static DWORD full_path_keep_slash(LPCWSTR path, WCHAR *full, DWORD capacity) {
+  DWORD n = full_path_w(path, full, capacity - 1);
+  if (n == 0) return 0;
+  const size_t_ length = wcslen(path);
+  if (length > 0 && is_separator(path[length - 1]) && full[n - 1] != '\\') { full[n++] = '\\'; full[n] = 0; }
+  return n;
+}
+
 EXPORT DWORD WINAPI GetFullPathNameW(LPCWSTR path, DWORD capacity, LPWSTR buffer, LPWSTR *file_part) {
   WCHAR full[PATH_CHARS];
-  const DWORD n = full_path_w(path, full, PATH_CHARS);
+  const DWORD n = full_path_keep_slash(path, full, PATH_CHARS);
   if (n == 0) return 0;
   if (n + 1 > capacity) return n + 1;
   memcpy(buffer, full, (n + 1) * 2);
@@ -3008,7 +3460,7 @@ EXPORT DWORD WINAPI GetFullPathNameA(LPCSTR path, DWORD capacity, LPSTR buffer, 
   WCHAR *w = to_wide(path);
   if (!w) return 0;
   WCHAR full[PATH_CHARS];
-  const DWORD n = full_path_w(w, full, PATH_CHARS);
+  const DWORD n = full_path_keep_slash(w, full, PATH_CHARS);
   free_wide(w);
   if (n == 0) return 0;
   const DWORD r = wide_result_to_ansi(full, n, buffer, capacity);
@@ -3019,9 +3471,6 @@ EXPORT DWORD WINAPI GetFullPathNameA(LPCSTR path, DWORD capacity, LPSTR buffer, 
   }
   return r;
 }
-EXPORT DWORD WINAPI GetLongPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return GetFullPathNameW(path, capacity, buffer, NULL); }
-EXPORT DWORD WINAPI GetLongPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) { return GetFullPathNameA(path, capacity, buffer, NULL); }
-EXPORT DWORD WINAPI GetShortPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return GetFullPathNameW(path, capacity, buffer, NULL); }
 
 EXPORT DWORD WINAPI GetCurrentDirectoryW(DWORD capacity, LPWSTR buffer) {
   size_t_ length = 0;
@@ -3089,13 +3538,28 @@ EXPORT BOOL WINAPI SetCurrentDirectoryW(LPCWSTR path) {
   DWORD length = n;
   if (full[length - 1] != '\\') full[length++] = '\\';
   full[length] = 0;
-  WCHAR *fresh = RtlAllocateHeap(heap(), 0, (SIZE_T)(length + 1) * 2);
+  const SIZE_T room = length + 1 > 260 ? length + 1 : 260;      /* (MAX_PATH characters, as Windows keeps it) */
+  WCHAR *fresh = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, room * 2);
   if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
   memcpy(fresh, full, (SIZE_T)(length + 1) * 2);
-  UNICODE_STRING *cwd = &parameters()->CurrentDirectoryPath;
+  /* The directory is held open (FILE_TRAVERSE, sharing read and write but not delete), as the real one is: it cannot be removed while it is the current one. */
+  HANDLE held = NULL;
+  {
+    WCHAR nt_buffer[PATH_CHARS + 8];
+    UNICODE_STRING nt_us;
+    OBJECT_ATTRIBUTES nt_attributes;
+    IO_STATUS_BLOCK iosb;
+    if (nt_name(full, nt_buffer, &nt_us, &nt_attributes) &&
+        !NT_SUCCESS(NtOpenFile(&held, 0x20 | 0x00100000 /* FILE_TRAVERSE | SYNCHRONIZE */, &nt_attributes, &iosb, 3, 0x1 | 0x20 /* FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT */)))
+      held = NULL;
+  }
+  RTL_USER_PROCESS_PARAMETERS *current = parameters();
+  UNICODE_STRING *cwd = &current->CurrentDirectoryPath;
   cwd->Buffer = fresh;
   cwd->Length = (USHORT)(length * 2);
-  cwd->MaximumLength = (USHORT)(length * 2 + 2);
+  cwd->MaximumLength = (USHORT)(room * 2);
+  if (current->CurrentDirectoryHandle) NtClose(current->CurrentDirectoryHandle);
+  current->CurrentDirectoryHandle = held;
   return TRUE;
 }
 EXPORT BOOL WINAPI SetCurrentDirectoryA(LPCSTR path) {
@@ -3138,16 +3602,42 @@ EXPORT UINT WINAPI GetWindowsDirectoryA(LPSTR buffer, UINT capacity) {
   memcpy(buffer, "C:\\Windows", 11);
   return 10;
 }
+/* The temporary directory as a full path with a trailing backslash: TMP, TEMP, USERPROFILE, in that order (C:\\Temp\\ if none is set). 0 if it is too long. */
+static DWORD temp_path_w(WCHAR *result) {
+  static const WCHAR kTmp[] = {'T', 'M', 'P', 0}, kTemp[] = {'T', 'E', 'M', 'P', 0}, kProfile[] = {'U', 'S', 'E', 'R', 'P', 'R', 'O', 'F', 'I', 'L', 'E', 0};
+  static const WCHAR kDefault[] = {'C', ':', '\\', 'T', 'e', 'm', 'p', 0};
+  const WCHAR *const names[3] = {kTmp, kTemp, kProfile};
+  WCHAR value[PATH_CHARS];
+  DWORD n = 0;
+  for (int i = 0; i < 3 && n == 0; ++i) {
+    n = GetEnvironmentVariableW(names[i], value, PATH_CHARS);
+    if (n >= PATH_CHARS) n = 0;
+  }
+  if (n == 0) memcpy(value, kDefault, sizeof(kDefault));
+  n = full_path_w(value, result, MAX_PATH);
+  if (n == 0 || n > MAX_PATH - 2) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+  if (result[n - 1] != '\\') { result[n++] = '\\'; result[n] = 0; }
+  return n;
+}
+/* A buffer that is too small is emptied (as far as it goes) and the call returns the size needed; otherwise the buffer is zeroed after the path up to 32767 characters. */
 EXPORT DWORD WINAPI GetTempPathW(DWORD capacity, LPWSTR buffer) {
-  static const WCHAR kPath[] = {'C', ':', '\\', 'T', 'e', 'm', 'p', '\\', 0};
-  if (capacity < 9) return 9;
-  memcpy(buffer, kPath, sizeof(kPath));
-  return 8;
+  WCHAR path[MAX_PATH + 2];
+  const DWORD n = temp_path_w(path);
+  if (n == 0) return 0;
+  if (capacity < n + 1) {
+    if (buffer && capacity) memset(buffer, 0, (size_t_)capacity * 2);
+    return n + 1;
+  }
+  memcpy(buffer, path, (n + 1) * 2);
+  const DWORD end = capacity < 32767 ? capacity : 32767;
+  if (end > n + 1) memset(buffer + n + 1, 0, (size_t_)(end - (n + 1)) * 2);
+  return n;
 }
 EXPORT DWORD WINAPI GetTempPathA(DWORD capacity, LPSTR buffer) {
-  if (capacity < 9) return 9;
-  memcpy(buffer, "C:\\Temp\\", 9);
-  return 8;
+  WCHAR path[MAX_PATH + 2];
+  const DWORD n = temp_path_w(path);
+  if (n == 0) return 0;
+  return wide_result_to_ansi(path, n, buffer, capacity);      /* (a buffer that is too small is left alone) */
 }
 
 /* ---- files ----------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -3167,13 +3657,31 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   (void)template_file;
   if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   /* The console by its device names. */
-  if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$")) return GetStdHandle(STD_OUTPUT_HANDLE);
-  if (equals_ignore_case(path, (const WCHAR *)L"CONIN$")) return GetStdHandle(STD_INPUT_HANDLE);
+  if (equals_ignore_case(path, (const WCHAR *)L"CON")) {      /* the console device: its input when it is opened to read, its output when it is opened to write, not both */
+    const BOOL reads = (access & 0x80000000u) != 0, writes = (access & 0x40000000u) != 0;
+    if (reads && writes) { set_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+    return con_open_alias(reads, sa && sa->bInheritHandle);
+  }
+  if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$") || equals_ignore_case(path, (const WCHAR *)L"CONIN$")) {      /* another handle to the console (descriptors 0 and 1 are it) */
+    return con_open_alias(equals_ignore_case(path, (const WCHAR *)L"CONIN$"), sa && sa->bInheritHandle);
+  }
+  if (path[0] == '\\' && path[1] == '?' && path[2] == '?' && path[3] == '\\' &&
+      (equals_ignore_case(path + 4, (const WCHAR *)L"CONOUT$") || equals_ignore_case(path + 4, (const WCHAR *)L"CONIN$"))) {      /* the same by its NT name */
+    if (disposition == 0 || disposition > 5) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+    return con_open_alias(equals_ignore_case(path + 4, (const WCHAR *)L"CONIN$"), sa && sa->bInheritHandle);
+  }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
   const BOOL is_pipe = (path[0] == '\\' || path[0] == '/') && (path[1] == '\\' || path[1] == '/') && path[2] == '.' && (path[3] == '\\' || path[3] == '/') && (path[4] | 0x20) == 'p' &&
                        (path[5] | 0x20) == 'i' && (path[6] | 0x20) == 'p' && (path[7] | 0x20) == 'e' && (path[8] == '\\' || path[8] == '/' || path[8] == 0);      /* \\.\pipe\ */
+  {
+    const size_t_ plen = wcslen(path);
+    /* a name that ends in a separator is a directory: opening it as a file finds no such path */
+    if (!(flags & FILE_FLAG_BACKUP_SEMANTICS) && is_separator(path[plen - 1]) && !(plen == 3 && path[1] == ':') && !is_pipe) {      /* (a pipe's name may end in one) */ set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+    /* \\.\Volume{GUID}: the raw volume, which no program here may open */
+    if (is_separator(path[0]) && is_separator(path[1]) && path[2] == '.' && is_separator(path[3]) && vol_prefix_ci(path + 4, (const WCHAR *)L"Volume{544f5343-0000-4000-8000-000000000001}") && !path[4 + 44]) { set_error(ERROR_ACCESS_DENIED); return INVALID_HANDLE_VALUE; }
+  }
   if (is_pipe) {
     WCHAR normal[300];
     size_t_ i = 0;
@@ -3220,6 +3728,7 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     }
   }
   if (sa && sa->bInheritHandle) attributes.Attributes |= 2;      /* OBJ_INHERIT */
+  if (sa) attributes.SecurityDescriptor = sa->lpSecurityDescriptor;      /* (kept for a file this call makes) */
   if (disposition == TRUNCATE_EXISTING && !(access & GENERIC_WRITE)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }      /* (it has to be able to write) */
   ULONG nt_disposition;
   switch (disposition) {
@@ -3231,12 +3740,18 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     default: set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE;
   }
   ULONG nt_access = (access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL)) | SYNCHRONIZE | FILE_READ_ATTRIBUTES;
-  if (access & (GENERIC_READ | GENERIC_ALL)) nt_access |= FILE_READ_DATA;
-  if (access & (GENERIC_WRITE | GENERIC_ALL)) nt_access |= FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES;
-  if (access & (GENERIC_EXECUTE | GENERIC_ALL)) nt_access |= 0x20 /* FILE_EXECUTE */;
+  if (access & GENERIC_READ) nt_access |= 0x120089;      /* FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE and FILE_ALL_ACCESS written out */
+  if (access & GENERIC_WRITE) nt_access |= 0x120116;
+  if (access & GENERIC_EXECUTE) nt_access |= 0x1200A0;
+  if (access & GENERIC_ALL) nt_access |= 0x1F01FF;
   ULONG options = FILE_SYNCHRONOUS_IO_NONALERT_;
   if (!(flags & FILE_FLAG_BACKUP_SEMANTICS)) options |= FILE_NON_DIRECTORY_FILE_;
   if (flags & FILE_FLAG_DELETE_ON_CLOSE) { options |= FILE_DELETE_ON_CLOSE_; nt_access |= DELETE; }
+  if ((flags & FILE_FLAG_BACKUP_SEMANTICS) && (flags & 0x01000000u /* FILE_FLAG_POSIX_SEMANTICS */) && (flags & FILE_ATTRIBUTE_DIRECTORY) && disposition == CREATE_NEW) {      /* a new directory, asked for this way */
+    options &= ~(ULONG)FILE_NON_DIRECTORY_FILE_;
+    options |= FILE_DIRECTORY_FILE_;
+  }
+  if (flags & 0x00200000u /* FILE_FLAG_OPEN_REPARSE_POINT */) options |= 0x00200000u;      /* FILE_OPEN_REPARSE_POINT: a link is opened itself */
   HANDLE handle = NULL;
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtCreateFile(&handle, nt_access, &attributes, &iosb, NULL, (flags & 0x7FB7) ? (flags & 0x7FB7) : FILE_ATTRIBUTE_NORMAL, share & 7, nt_disposition, options, NULL, 0);
@@ -3247,7 +3762,7 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   /* CREATE_ALWAYS and OPEN_ALWAYS say, by a success with ERROR_ALREADY_EXISTS, that the file was there. */
   set_error(((disposition == CREATE_ALWAYS && iosb.Information == 3) || (disposition == OPEN_ALWAYS && iosb.Information == 1)) ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
   overlapped_forget(handle);
-  if (flags & 0x40000000u /* FILE_FLAG_OVERLAPPED */) overlapped_note(handle);
+  if (flags & 0x40000000u /* FILE_FLAG_OVERLAPPED */) { overlapped_note(handle); if (flags & 0x20000000u /* FILE_FLAG_NO_BUFFERING */) unbuffered_note(handle); }
   return handle;
 }
 EXPORT HANDLE WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file) {
@@ -3264,7 +3779,7 @@ typedef struct { DWORD dwSize, dwFileAttributes, dwFileFlags, dwSecurityQosFlags
 EXPORT HANDLE WINAPI CreateFile2(LPCWSTR path, DWORD access, DWORD share, DWORD disposition, const CREATEFILE2_PARAMS_ *parameters) {
   DWORD flags = 0;
   LPSECURITY_ATTRIBUTES sa = NULL;
-  if (parameters) { flags = parameters->dwFileAttributes | parameters->dwFileFlags | parameters->dwSecurityQosFlags; sa = parameters->lpSecurityAttributes; }
+  if (parameters) { flags = (parameters->dwFileAttributes & 0x7FB7) | (parameters->dwFileFlags & 0xFFF80000u) | parameters->dwSecurityQosFlags; sa = parameters->lpSecurityAttributes; }
   return CreateFileW(path, access, share, sa, disposition, flags, parameters ? parameters->hTemplateFile : NULL);
 }
 
@@ -3281,34 +3796,32 @@ typedef struct _OFSTRUCT { BYTE cBytes, fFixedDisk; WORD nErrCode, Reserved1, Re
  * speaker driver isn't present either. CancelIo/CancelIoEx/CancelSynchronousIo: every I/O call here is already done by the time it returns (there is no real
  * asynchronous I/O to cancel), so there is never anything pending to find. */
 EXPORT BOOL WINAPI Beep(DWORD frequency, DWORD duration) { (void)frequency; (void)duration; return TRUE; }
-/* The calls waiting in threads (see pipe_request_thread) end with STATUS_CANCELLED: the pipe is told so until they have gone (one that has not reached the kernel's wait yet
-   would miss the first telling). */
-static void pipe_cancel_pending(HANDLE h, LPOVERLAPPED overlapped) {
-  for (int tries = 0; tries < 500; ++tries) {
-    BOOL any = FALSE;
-    for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (g_pipe_pending[n].used && g_pipe_pending[n].pipe == h && (!overlapped || g_pipe_pending[n].overlapped == overlapped)) any = TRUE;
-    if (!any) return;
+/* The operations waiting in threads (see pipe_request_thread) end with STATUS_CANCELLED; the kernel does not answer before their threads have completed the OVERLAPPEDs.
+   Returns whether one was ended (one that has just finished on its own cannot be cancelled any more). */
+static BOOL pipe_cancel_pending(HANDLE h, LPOVERLAPPED overlapped) {
+  BOOL cancelled = FALSE;
+  for (int n = 0; n < PIPE_PENDING_MAX; ++n) {
+    if (!g_pipe_pending[n].used || g_pipe_pending[n].pipe != h || (overlapped && g_pipe_pending[n].overlapped != overlapped)) continue;
+    DWORD tag = g_pipe_pending[n].tag;
     IO_STATUS_BLOCK iosb;
-    NtFsControlFile(h, NULL, NULL, NULL, &iosb, 0x11FFFC, NULL, 0, NULL, 0);
-    Sleep(1);
+    if (tag && NT_SUCCESS(NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_CANCEL_, &tag, 4, NULL, 0))) cancelled = TRUE;
   }
+  return cancelled;
 }
 EXPORT BOOL WINAPI CancelIo(HANDLE h) {
-  BOOL pending = FALSE;
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) if (g_pipe_pending[n].used && g_pipe_pending[n].pipe == h) pending = TRUE;
-  if (pending) pipe_cancel_pending(h, NULL);
+  pipe_cancel_pending(h, NULL);
   return TRUE;
 }
 EXPORT BOOL WINAPI CancelIoEx(HANDLE h, LPOVERLAPPED overlapped) {
-  BOOL found = FALSE;
-  for (int n = 0; n < PIPE_PENDING_MAX; ++n) {
-    if (g_pipe_pending[n].used && g_pipe_pending[n].pipe == h && (!overlapped || g_pipe_pending[n].overlapped == overlapped)) found = TRUE;
-  }
-  if (!found) { set_error(ERROR_NOT_FOUND); return FALSE; }
-  pipe_cancel_pending(h, overlapped);
+  if (!pipe_cancel_pending(h, overlapped)) { set_error(ERROR_NOT_FOUND); return FALSE; }
   return TRUE;
 }
-EXPORT BOOL WINAPI CancelSynchronousIo(HANDLE thread) { (void)thread; set_error(ERROR_NOT_FOUND); return FALSE; }
+/* Ends the call a thread waits in on a pipe (the kernel knows which thread waits where); a thread that waits for something else has nothing to cancel. */
+EXPORT BOOL WINAPI CancelSynchronousIo(HANDLE thread) {
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtCancelSynchronousIoFile(thread, NULL, &iosb);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
 /* FatalAppExit: ends the process at once (-1 as the exit code, like a real one's message-box dialog being dismissed); there is no message-box UI here to show
  * the text first. */
 EXPORT void WINAPI FatalAppExitW(UINT action, LPCWSTR text) { (void)action; (void)text; ExitProcess(0xFFFFFFFFu); }
@@ -3318,7 +3831,7 @@ EXPORT void WINAPI FatalAppExitA(UINT action, LPCSTR text) { (void)action; (void
  * signalled like a manual-reset event when something changes under the watched directory - WaitForSingleObject/WaitForMultipleObjects already work on it unmodified.
  * FindNextChangeNotification re-arms it the same way ResetEvent does (it is reset(), not a separate NT service); FindCloseChangeNotification is just CloseHandle. */
 EXPORT HANDLE WINAPI FindFirstChangeNotificationW(LPCWSTR path, BOOL watch_subtree, DWORD notify_filter) {
-  if (!path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
@@ -3326,13 +3839,13 @@ EXPORT HANDLE WINAPI FindFirstChangeNotificationW(LPCWSTR path, BOOL watch_subtr
   HANDLE handle = NULL;
   const NTSTATUS status = NtCreateChangeNotification(&attributes, watch_subtree ? 1 : 0, notify_filter, &handle);
   if (!NT_SUCCESS(status)) {
-    set_error(status == STATUS_OBJECT_PATH_NOT_FOUND || status == STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_PATH_NOT_FOUND :
-              status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
+    set_error(status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
     return INVALID_HANDLE_VALUE;
   }
   return handle;
 }
 EXPORT HANDLE WINAPI FindFirstChangeNotificationA(LPCSTR path, BOOL watch_subtree, DWORD notify_filter) {
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   WCHAR *w = to_wide(path);
   if (!w) return INVALID_HANDLE_VALUE;
   HANDLE h = FindFirstChangeNotificationW(w, watch_subtree, notify_filter);
@@ -3406,8 +3919,12 @@ EXPORT BOOL WINAPI SetEndOfFile(HANDLE h) {
   const NTSTATUS status = NtSetInformationFile(h, &iosb, &position, 8, 20);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
+EXPORT BOOL WINAPI FlushConsoleInputBuffer(HANDLE h);
 EXPORT BOOL WINAPI FlushFileBuffers(HANDLE h) {
   IO_STATUS_BLOCK iosb;
+  if (con_dead_handle(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (con_is_input(h)) return FlushConsoleInputBuffer(h);      /* the input of a console: what was typed and not read is dropped */
+  if (con_is_output_only(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   const NTSTATUS status = NtFlushBuffersFile(h, &iosb);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -3477,23 +3994,6 @@ EXPORT BOOL WINAPI GetFileAttributesExA(LPCSTR path, int level, LPVOID data) {
   free_wide(w);
   return ok;
 }
-EXPORT DWORD WINAPI GetFinalPathNameByHandleW(HANDLE h, LPWSTR buffer, DWORD capacity, DWORD flags) {
-  (void)flags;
-  IO_STATUS_BLOCK iosb;
-  BYTE info[4 + PATH_CHARS * 2];
-  const NTSTATUS status = NtQueryInformationFile(h, &iosb, info, sizeof(info), 9);      /* FileNameInformation: the path on the volume */
-  if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
-  const DWORD units = *(DWORD *)info / 2;
-  const DWORD needed = units + 2 + 4;      /* "\\?\C:" + path */
-  if (needed + 1 > capacity) return needed + 1;
-  DWORD n = 0;
-  buffer[n++] = '\\'; buffer[n++] = '\\'; buffer[n++] = '?'; buffer[n++] = '\\'; buffer[n++] = 'C'; buffer[n++] = ':';
-  memcpy(buffer + n, info + 4, units * 2);
-  n += units;
-  buffer[n] = 0;
-  return n;
-}
-
 EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
   if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR buffer[PATH_CHARS + 8];
@@ -3510,11 +4010,12 @@ EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
 EXPORT BOOL WINAPI DeleteFileA(LPCSTR path) { if (!path) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; } WCHAR *w = to_wide(path); const BOOL ok = w ? DeleteFileW(w) : FALSE; free_wide(w); return ok; }
 
 EXPORT BOOL WINAPI CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
-  (void)sa;
+  if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
   if (!nt_name(path, buffer, &name, &attributes)) return FALSE;
+  if (sa) attributes.SecurityDescriptor = sa->lpSecurityDescriptor;      /* (kept for the directory) */
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtCreateFile(&h, FILE_LIST_DIRECTORY_ | SYNCHRONIZE, &attributes, &iosb, NULL, FILE_ATTRIBUTE_DIRECTORY, 7, FILE_CREATE_, FILE_DIRECTORY_FILE_ | FILE_SYNCHRONOUS_IO_NONALERT_, NULL, 0);
@@ -3522,7 +4023,7 @@ EXPORT BOOL WINAPI CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
   NtClose(h);
   return TRUE;
 }
-EXPORT BOOL WINAPI CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa) { WCHAR *w = to_wide(path); const BOOL ok = w ? CreateDirectoryW(w, sa) : FALSE; free_wide(w); return ok; }
+EXPORT BOOL WINAPI CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa) { if (!path) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; } WCHAR *w = to_wide(path); const BOOL ok = w ? CreateDirectoryW(w, sa) : FALSE; free_wide(w); return ok; }
 EXPORT BOOL WINAPI RemoveDirectoryW(LPCWSTR path) {
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
@@ -3672,7 +4173,7 @@ EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPST
   return id;
 }
 EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options) {
-  const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, inherit ? 2 /* OBJ_INHERIT */ : 0, options & 3);      /* DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS; within this process */
+  const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, inherit ? 2 /* OBJ_INHERIT */ : 0, options & 7);      /* DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DUPLICATE_SAME_ATTRIBUTES */
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 
@@ -3738,7 +4239,8 @@ static void fill_find_data(const BYTE *record, WIN32_FIND_DATAW *data) {
   data->cFileName[units] = 0;
 }
 
-EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
+/* `expand` says whether 8.3 aliases in the directory part are turned into the long names (the 8.3 code itself lists directories without that). */
+static HANDLE find_first_impl(LPCWSTR path, LPWIN32_FIND_DATAW data, int expand) {
   if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   /* The pattern is what follows the last separator of the path as it was written: normalising the whole path would take trailing dots and spaces off it, and those
    * mean something in a pattern ("*." is the names without an extension). */
@@ -3757,7 +4259,7 @@ EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
   FindState *f = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(FindState));
   if (!f) { set_error(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
   const DWORD pattern_length = (DWORD)(path_length - cut);
-  if (pattern_length == 0 || pattern_length >= MAX_PATH) { RtlFreeHeap(heap(), 0, f); set_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  if (pattern_length >= MAX_PATH) { RtlFreeHeap(heap(), 0, f); set_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   memcpy(f->pattern, path + cut, pattern_length * 2);
   f->pattern[pattern_length] = 0;
   if (split > 3) --split;      /* the directory without its trailing backslash, except the root */
@@ -3765,12 +4267,18 @@ EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
-  if (!nt_name(full, buffer, &name, &attributes)) { RtlFreeHeap(heap(), 0, f); return INVALID_HANDLE_VALUE; }
+  if (!nt_name_ex(full, buffer, &name, &attributes, expand)) { RtlFreeHeap(heap(), 0, f); return INVALID_HANDLE_VALUE; }
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtOpenFile(&f->directory, FILE_LIST_DIRECTORY_ | SYNCHRONIZE, &attributes, &iosb, 7, FILE_DIRECTORY_FILE_ | FILE_SYNCHRONOUS_IO_NONALERT_);
   if (!NT_SUCCESS(status)) {
     RtlFreeHeap(heap(), 0, f);
     set_error(status == STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_PATH_NOT_FOUND : status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
+    return INVALID_HANDLE_VALUE;
+  }
+  if (pattern_length == 0) {      /* "dir\\": the directory is there, but nothing is named by it */
+    NtClose(f->directory);
+    RtlFreeHeap(heap(), 0, f);
+    set_error(ERROR_FILE_NOT_FOUND);
     return INVALID_HANDLE_VALUE;
   }
   if (is_dos_device_name(f->pattern)) {      /* a device is found by its name, as an empty file */
@@ -3791,6 +4299,7 @@ EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) {
   fill_find_data(record, data);
   return f;
 }
+EXPORT HANDLE WINAPI FindFirstFileW(LPCWSTR path, LPWIN32_FIND_DATAW data) { return find_first_impl(path, data, 1); }
 EXPORT HANDLE WINAPI FindFirstFileExW(LPCWSTR path, int level, LPVOID data, int search_op, LPVOID filter, DWORD flags) {
   (void)level; (void)search_op; (void)filter; (void)flags;
   return FindFirstFileW(path, data);
@@ -3808,6 +4317,29 @@ EXPORT BOOL WINAPI FindClose(HANDLE h) {
   NtClose(f->directory);
   RtlFreeHeap(heap(), 0, f);
   return TRUE;
+}
+/* The streams of a file: only its data (named "::$DATA"); a directory has none, which the search says by running out at once. */
+typedef struct { LARGE_INTEGER StreamSize; WCHAR cStreamName[MAX_PATH + 36]; } WIN32_FIND_STREAM_DATA_;
+EXPORT HANDLE WINAPI FindFirstStreamW(LPCWSTR path, int level, LPVOID data, DWORD flags) {
+  if (level != 0 || flags != 0 || !data || !path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  WIN32_FILE_ATTRIBUTE_DATA info;
+  if (!GetFileAttributesExW(path, 0, &info)) return INVALID_HANDLE_VALUE;
+  if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { set_error(ERROR_HANDLE_EOF); return INVALID_HANDLE_VALUE; }
+  FindState *f = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, sizeof(FindState));
+  if (!f) { set_error(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
+  f->finished = TRUE;
+  WIN32_FIND_STREAM_DATA_ *out = data;
+  out->StreamSize.LowPart = info.nFileSizeLow;
+  out->StreamSize.HighPart = (LONG)info.nFileSizeHigh;
+  static const WCHAR name[] = {':', ':', '$', 'D', 'A', 'T', 'A', 0};
+  memcpy(out->cStreamName, name, sizeof(name));
+  return f;
+}
+EXPORT BOOL WINAPI FindNextStreamW(HANDLE h, LPVOID data) {
+  (void)data;
+  if (!h || h == INVALID_HANDLE_VALUE) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  set_error(ERROR_HANDLE_EOF);
+  return FALSE;
 }
 static void find_data_to_ansi(const WIN32_FIND_DATAW *w, LPWIN32_FIND_DATAA a) {
   memset(a, 0, sizeof(*a));
@@ -3834,6 +4366,314 @@ EXPORT BOOL WINAPI FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA data) {
   if (!FindNextFileW(h, &wide)) return FALSE;
   find_data_to_ansi(&wide, data);
   return TRUE;
+}
+
+/* ---- 8.3 names -------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The file systems keep no 8.3 names, so they are made up: a name that is not a legal 8.3 name gets "BASE~N.EXT" where N counts the names with the same BASE (6 letters)
+ * and EXT (3 letters) that the directory lists before it. The same listing gives the same names, and a path with an alias in it can be turned back into the long one. */
+typedef struct { WCHAR base[7]; WCHAR ext[4]; } ShortKey;
+
+static BOOL name_is_8dot3(const WCHAR *name, size_t_ length) {
+  if (length == 0) return FALSE;
+  if (name[0] == '.' && (length == 1 || (length == 2 && name[1] == '.'))) return TRUE;
+  size_t_ base = 0, ext = 0;
+  BOOL dot = FALSE;
+  for (size_t_ i = 0; i < length; ++i) {
+    const WCHAR c = name[i];
+    if (c == '.') { if (dot || i == 0) return FALSE; dot = TRUE; continue; }
+    if (c <= ' ' || c >= 0x7F) return FALSE;
+    for (const char *bad = "\"*+,/:;<=>?[\\]|"; *bad; ++bad) if (c == (WCHAR)*bad) return FALSE;
+    if (dot) ++ext; else ++base;
+  }
+  return base <= 8 && ext <= 3 && (!dot || ext > 0);
+}
+
+/* The part of a name that its alias is made of: the first letters of the base and of the extension, upper case, spaces and dots left out, odd characters as '_'. */
+static void short_key(const WCHAR *name, size_t_ length, ShortKey *key) {
+  size_t_ last_dot = length;
+  for (size_t_ i = 1; i < length; ++i) if (name[i] == '.') last_dot = i;
+  size_t_ b = 0, e = 0;
+  for (size_t_ i = 0; i < length; ++i) {
+    WCHAR c = name[i];
+    if (c == ' ' || c == '.') continue;
+    if (c <= ' ' || c >= 0x7F) c = '_';
+    else { for (const char *bad = "\"*+,/:;<=>?[\\]|"; *bad; ++bad) if (c == (WCHAR)*bad) c = '_'; }
+    c = upper(c);
+    if (i > last_dot) { if (e < 3) key->ext[e++] = c; }
+    else if (b < 6) key->base[b++] = c;
+  }
+  key->base[b] = 0;
+  key->ext[e] = 0;
+}
+
+static BOOL wide_equal_ci(const WCHAR *a, size_t_ a_length, const WCHAR *b, size_t_ b_length) {
+  if (a_length != b_length) return FALSE;
+  for (size_t_ i = 0; i < a_length; ++i) if (upper(a[i]) != upper(b[i])) return FALSE;
+  return TRUE;
+}
+
+/* A listing of the directory written as `dir` (it ends in a separator or ':', or is empty for the current directory). */
+static HANDLE scan_open(const WCHAR *dir, size_t_ dir_length, WIN32_FIND_DATAW *data) {
+  WCHAR pattern[PATH_CHARS];
+  if (dir_length + 2 > PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return INVALID_HANDLE_VALUE; }
+  memcpy(pattern, dir, dir_length * 2);
+  pattern[dir_length] = '*';
+  pattern[dir_length + 1] = 0;
+  return find_first_impl(pattern, data, 0);
+}
+
+/* The alias of the file `name` in the directory `dir`. */
+static BOOL short_alias(const WCHAR *dir, size_t_ dir_length, const WCHAR *name, WCHAR *alias) {
+  const size_t_ length = wcslen(name);
+  if (name_is_8dot3(name, length)) { memcpy(alias, name, (length + 1) * 2); return TRUE; }
+  ShortKey want;
+  short_key(name, length, &want);
+  DWORD rank = 1;
+  WIN32_FIND_DATAW data;
+  HANDLE h = scan_open(dir, dir_length, &data);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (lstrcmpW(data.cFileName, name) == 0) break;
+      const size_t_ other_length = wcslen(data.cFileName);
+      if (name_is_8dot3(data.cFileName, other_length)) continue;
+      ShortKey other;
+      short_key(data.cFileName, other_length, &other);
+      if (lstrcmpW(other.base, want.base) == 0 && lstrcmpW(other.ext, want.ext) == 0) ++rank;
+    } while (FindNextFileW(h, &data));
+    FindClose(h);
+  }
+  WCHAR digits[12];
+  size_t_ digit_count = 0;
+  for (DWORD r = rank; r; r /= 10) digits[digit_count++] = (WCHAR)('0' + r % 10);
+  size_t_ base_length = wcslen(want.base);
+  if (base_length + 1 + digit_count > 8) base_length = 8 - 1 - digit_count;
+  size_t_ n = 0;
+  memcpy(alias, want.base, base_length * 2);
+  n = base_length;
+  alias[n++] = '~';
+  while (digit_count) alias[n++] = digits[--digit_count];
+  if (want.ext[0]) {
+    alias[n++] = '.';
+    for (size_t_ i = 0; want.ext[i]; ++i) alias[n++] = want.ext[i];
+  }
+  alias[n] = 0;
+  return TRUE;
+}
+
+/* Finds the file `comp` in the directory `dir`: by its name, or as an alias ("BASE~N.EXT") of one. `by_alias` says which. */
+static BOOL find_entry(const WCHAR *dir, size_t_ dir_length, const WCHAR *comp, size_t_ comp_length, WIN32_FIND_DATAW *found, BOOL *by_alias) {
+  /* the alias pattern: BASE ~ digits [. EXT] */
+  size_t_ tilde = comp_length;
+  for (size_t_ i = 0; i < comp_length; ++i) if (comp[i] == '~') tilde = i;
+  size_t_ digits_end = tilde + 1;
+  DWORD rank = 0;
+  while (tilde < comp_length && digits_end < comp_length && comp[digits_end] >= '0' && comp[digits_end] <= '9' && rank < 100000) { rank = rank * 10 + (DWORD)(comp[digits_end] - '0'); ++digits_end; }
+  BOOL pattern = tilde > 0 && tilde < comp_length && digits_end > tilde + 1 && rank > 0 && tilde <= 6 && (digits_end == comp_length || comp[digits_end] == '.');
+  const WCHAR *ext = comp + digits_end + 1;
+  size_t_ ext_length = pattern && digits_end < comp_length ? comp_length - digits_end - 1 : 0;
+  if (pattern && ext_length > 3) pattern = FALSE;
+  WIN32_FIND_DATAW data, candidate;
+  BOOL have_candidate = FALSE;
+  DWORD count = 0;
+  HANDLE h = scan_open(dir, dir_length, &data);
+  if (h == INVALID_HANDLE_VALUE) return FALSE;
+  do {
+    const size_t_ length = wcslen(data.cFileName);
+    if (wide_equal_ci(data.cFileName, length, comp, comp_length)) { *found = data; *by_alias = FALSE; FindClose(h); return TRUE; }
+    if (!pattern || have_candidate || name_is_8dot3(data.cFileName, length)) continue;
+    ShortKey key;
+    short_key(data.cFileName, length, &key);
+    size_t_ base_length = wcslen(key.base);
+    const size_t_ digit_count = digits_end - tilde - 1;
+    if (base_length + 1 + digit_count > 8) base_length = 8 - 1 - digit_count;
+    if (base_length != tilde || !wide_equal_ci(key.base, base_length, comp, tilde) || !wide_equal_ci(key.ext, wcslen(key.ext), ext, ext_length)) continue;
+    if (++count == rank) { candidate = data; have_candidate = TRUE; }
+  } while (FindNextFileW(h, &data));
+  FindClose(h);
+  if (!have_candidate) return FALSE;
+  *found = candidate;
+  *by_alias = TRUE;
+  return TRUE;
+}
+
+/* The full path `path` ("C:\a\b", `length` characters, room for `capacity`) with the 8.3 aliases in it replaced by the long names. */
+static BOOL expand_short_names(WCHAR *path, DWORD length, DWORD capacity, DWORD *new_length) {
+  DWORD at = 0;
+  while (at < length) {
+    DWORD start = at, end = at;
+    while (start < length && path[start] == '\\') ++start;
+    end = start;
+    while (end < length && path[end] != '\\') ++end;
+    if (end == start) break;
+    at = end;
+    BOOL tilde = FALSE;
+    for (DWORD i = start; i < end; ++i) if (path[i] == '~') tilde = TRUE;
+    if (!tilde || start < 3) continue;      /* (the drive is no component) */
+    WIN32_FIND_DATAW found;
+    BOOL by_alias = FALSE;
+    if (!find_entry(path, start, path + start, end - start, &found, &by_alias) || !by_alias) continue;
+    const DWORD long_length = (DWORD)wcslen(found.cFileName);
+    if (long_length > capacity || length - (end - start) > capacity - long_length - 1) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+    memmove(path + start + long_length, path + end, (length - end + 1) * 2);
+    memcpy(path + start, found.cFileName, long_length * 2);
+    length = length - (end - start) + long_length;
+    at = start + long_length;
+  }
+  *new_length = length;
+  return TRUE;
+}
+
+/* GetLongPathName and GetShortPathName work on the path as it is written: the separators, "." and ".." stay, a relative path stays relative, and each of the other components
+ * is looked up in the directory before it. A long name that is given in its long form keeps the case it was written in. */
+static DWORD convert_path(LPCWSTR in, LPWSTR out, DWORD capacity, int to_short) {
+  if (!in) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  if (!*in) { set_error(ERROR_PATH_NOT_FOUND); return 0; }
+  WCHAR result[PATH_CHARS], lookup[PATH_CHARS];      /* the path as it is returned, and the same with real names for the directory listings */
+  size_t_ r = 0, l = 0, sp = 0;
+  const size_t_ in_length = wcslen(in);
+  const BOOL prefixed = in_length >= 4 && in[0] == '\\' && in[1] == '\\' && in[2] == '?' && in[3] == '\\';
+  if (!prefixed && in_length >= MAX_PATH) { set_error(ERROR_PATH_NOT_FOUND); return 0; }
+  if (in_length + 2 > PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+  if (prefixed) {
+    memcpy(result, in, 4 * 2); memcpy(lookup, in, 4 * 2);
+    r = l = sp = 4;
+  } else if (in[0] == '\\' && in[1] == '\\') {      /* \\computer\X$\...: the drive X of this computer; any other UNC path is returned as it is */
+    WCHAR name[16];
+    DWORD name_length = 16;
+    size_t_ host = 2;
+    while (in[host] && in[host] != '\\') ++host;
+    if (!GetComputerNameW(name, &name_length) || !wide_equal_ci(in + 2, host - 2, name, name_length) || in[host] != '\\' ||
+        !(((in[host + 1] >= 'A' && in[host + 1] <= 'Z') || (in[host + 1] >= 'a' && in[host + 1] <= 'z')) && in[host + 2] == '$' && (in[host + 3] == 0 || in[host + 3] == '\\'))) {
+      if (in_length + 1 > capacity) return (DWORD)in_length + 1;
+      memcpy(out, in, (in_length + 1) * 2);
+      return (DWORD)in_length;
+    }
+    memcpy(result, in, (host + 3) * 2);
+    r = host + 3;
+    lookup[0] = in[host + 1]; lookup[1] = ':';
+    l = 2;
+    sp = host + 3;
+  }
+  if (((in[sp] >= 'A' && in[sp] <= 'Z') || (in[sp] >= 'a' && in[sp] <= 'z')) && in[sp + 1] == ':' && (sp == 0 || sp == 4)) {
+    result[r++] = lookup[l++] = in[sp++];
+    result[r++] = lookup[l++] = in[sp++];
+  }
+  for (size_t_ i = sp; in[i]; ++i) if (in[i] == '*' || in[i] == '?') { set_error(ERROR_INVALID_NAME); return 0; }
+  while (in[sp]) {
+    if (is_separator(in[sp])) { result[r++] = lookup[l++] = in[sp++]; continue; }
+    size_t_ end = sp;
+    while (in[end] && !is_separator(in[end])) ++end;
+    const size_t_ length = end - sp;
+    if (length >= MAX_PATH) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+    if ((length == 1 && in[sp] == '.') || (length == 2 && in[sp] == '.' && in[sp + 1] == '.')) {
+      memcpy(result + r, in + sp, length * 2); r += length;
+      memcpy(lookup + l, in + sp, length * 2); l += length;
+      sp = end;
+      continue;
+    }
+    WIN32_FIND_DATAW found;
+    BOOL by_alias = FALSE;
+    if (!find_entry(lookup, l, in + sp, length, &found, &by_alias)) { set_error(ERROR_FILE_NOT_FOUND); return 0; }
+    const WCHAR *text = found.cFileName;
+    size_t_ text_length = wcslen(text);
+    WCHAR alias[16];
+    if (to_short) {
+      short_alias(lookup, l, found.cFileName, alias);
+      text = alias;
+      text_length = wcslen(alias);
+    } else if (!by_alias && !name_is_8dot3(found.cFileName, text_length)) {
+      text = in + sp;      /* (a long name as it was written) */
+      text_length = length;
+    }
+    const size_t_ real_length = wcslen(found.cFileName);
+    if (r + text_length + 2 > PATH_CHARS || l + real_length + 2 > PATH_CHARS) { set_error(ERROR_FILENAME_EXCED_RANGE); return 0; }
+    memcpy(result + r, text, text_length * 2); r += text_length;
+    memcpy(lookup + l, found.cFileName, real_length * 2); l += real_length;
+    sp = end;
+  }
+  result[r] = 0;
+  if (!out || r + 1 > capacity) return (DWORD)r + 1;      /* (without a buffer it is the size needed, whatever the size says) */
+  memcpy(out, result, (r + 1) * 2);
+  return (DWORD)r;
+}
+static DWORD convert_path_a(LPCSTR path, LPSTR buffer, DWORD capacity, int to_short) {
+  if (!path) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  WCHAR *w = to_wide(path);
+  if (!w) return 0;
+  WCHAR result[PATH_CHARS];
+  const DWORD n = convert_path(w, result, PATH_CHARS, to_short);
+  free_wide(w);
+  if (n == 0 || n >= PATH_CHARS) return n;
+  return wide_result_to_ansi(result, n, buffer, buffer ? capacity : 0);
+}
+EXPORT DWORD WINAPI GetLongPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return convert_path(path, buffer, capacity, 0); }
+EXPORT DWORD WINAPI GetLongPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) { return convert_path_a(path, buffer, capacity, 0); }
+EXPORT DWORD WINAPI GetShortPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity) { return convert_path(path, buffer, capacity, 1); }
+EXPORT DWORD WINAPI GetShortPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) { return convert_path_a(path, buffer, capacity, 1); }
+
+/* Is `name` a legal 8.3 name for CheckNameLegalDOS8Dot3: a base of up to 8 characters, one dot and up to 3 characters of extension, none of the characters a file name cannot
+ * have (spaces are allowed, and said so). The empty name counts as legal. */
+static BOOL check_8dot3(const WCHAR *name, BOOL *spaces) {
+  *spaces = FALSE;
+  size_t_ base = 0, ext = 0;
+  BOOL dot = FALSE;
+  const size_t_ length = wcslen(name);
+  if (length == 0) return TRUE;
+  if (name[0] == '.' && (length == 1 || (length == 2 && name[1] == '.'))) return TRUE;
+  for (size_t_ i = 0; i < length; ++i) {
+    const WCHAR c = name[i];
+    if (c == '.') { if (dot || i == 0) return FALSE; dot = TRUE; continue; }
+    if (c < ' ' || c >= 0x7F) return FALSE;
+    for (const char *bad = "\"*+,/:;<=>?[\\]|"; *bad; ++bad) if (c == (WCHAR)*bad) return FALSE;
+    if (c == ' ') *spaces = TRUE;
+    if (dot) ++ext; else ++base;
+  }
+  return base <= 8 && ext <= 3;
+}
+EXPORT BOOL WINAPI CheckNameLegalDOS8Dot3W(LPCWSTR name, LPSTR oem_name, DWORD oem_length, BOOL *contains_spaces, BOOL *is_legal) {
+  if (!name || !is_legal) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  BOOL spaces = FALSE;
+  *is_legal = check_8dot3(name, &spaces);
+  if (*is_legal && oem_name && oem_length) {      /* (the name in the OEM code page, upper case: as far as it fits) */
+    const size_t_ length = wcslen(name);
+    if (length + 1 > oem_length) *is_legal = FALSE;
+    else { for (size_t_ i = 0; i < length; ++i) oem_name[i] = (char)upper(name[i]); oem_name[length] = 0; }
+  }
+  if (contains_spaces) *contains_spaces = spaces;
+  return TRUE;
+}
+EXPORT BOOL WINAPI CheckNameLegalDOS8Dot3A(LPCSTR name, LPSTR oem_name, DWORD oem_length, BOOL *contains_spaces, BOOL *is_legal) {
+  if (!name || !is_legal) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  WCHAR *w = to_wide(name);
+  if (!w) return FALSE;
+  const BOOL ok = CheckNameLegalDOS8Dot3W(w, oem_name, oem_length, contains_spaces, is_legal);
+  free_wide(w);
+  return ok;
+}
+
+/* Does a program that is started by this name also look in the current folder? Not when NoDefaultCurrentDirectoryInExePath is set, unless the name has a path. */
+EXPORT BOOL WINAPI NeedCurrentDirectoryForExePathW(LPCWSTR name) {
+  static const WCHAR kVariable[] = {'N', 'o', 'D', 'e', 'f', 'a', 'u', 'l', 't', 'C', 'u', 'r', 'r', 'e', 'n', 't', 'D', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y', 'I', 'n', 'E', 'x', 'e', 'P', 'a', 't', 'h', 0};
+  for (LPCWSTR c = name; *c; ++c) if (*c == '\\') return TRUE;
+  WCHAR value[8];
+  const DWORD saved = GetLastError();
+  const BOOL set = GetEnvironmentVariableW(kVariable, value, 8) != 0 || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+  set_error(saved);
+  return !set;
+}
+EXPORT BOOL WINAPI NeedCurrentDirectoryForExePathA(LPCSTR name) {
+  WCHAR *w = to_wide(name);
+  if (!w) return TRUE;
+  const BOOL need = NeedCurrentDirectoryForExePathW(w);
+  free_wide(w);
+  return need;
+}
+EXPORT BOOL WINAPI SetSearchPathMode(DWORD flags) {
+  const NTSTATUS status = RtlSetSearchPathMode(flags);
+  if (NT_SUCCESS(status)) return TRUE;
+  set_error(status == STATUS_ACCESS_DENIED ? ERROR_ACCESS_DENIED : ERROR_INVALID_PARAMETER);
+  return FALSE;
 }
 
 /* ---- error texts ---------------------------------------------------------------------------------------------------------------------------------------- */
@@ -3865,7 +4705,8 @@ static const char *error_text(DWORD error) {
 /* ---- start ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
 EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
-  (void)module; (void)reserved; (void)reason;
+  (void)module; (void)reserved;
+  if (reason == DLL_PROCESS_ATTACH) RtlTcosSetUnhandledExceptionHook(UnhandledExceptionFilter);      /* (what runs when nothing handled an exception) */
   return TRUE;
 }
 
@@ -3877,6 +4718,9 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "legacy.inc"
 #include "fmtmsg.inc"
 #include "time.inc"
+#include "comm.inc"
+#include "profile.inc"
+#include "appmodel.inc"
 #include "nls.inc"
 #include "nls2.inc"
 #include "idn.inc"

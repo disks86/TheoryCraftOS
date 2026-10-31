@@ -45,7 +45,7 @@ graphics::Format wide_format_of(Format f) {
 }
 
 constexpr uint64_t kMaxQueryResultBytes = 1 << 20;
-constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap;
+constexpr uint32_t kKnownFlags = kAllocVertexBuffer | kAllocIndexBuffer | kAllocTexture | kAllocRenderTarget | kAllocDepthStencil | kAllocPresent | kAllocStaging | kAllocShared | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocTrackState | kAllocHeap | kAllocReserved;
 
 // The bytes of all levels of a w x h image of `pixel`-byte pixels; false if the description's levels are not possible. (w and h are at most kMaxTextureDimension, so nothing overflows.)
 bool image_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t pixel, uint64_t* total) {
@@ -82,7 +82,7 @@ bool Allocation::level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) 
 }
 
 Allocation::Allocation(VidMm& manager, allocators::IAllocator& allocator, const AllocationDesc& desc, uint64_t id)
-    : manager_(manager), allocator_(allocator), desc_(desc), id_(id), placed_(allocator) {}
+    : manager_(manager), allocator_(allocator), desc_(desc), id_(id), placed_(allocator), tiles_(allocator) {}
 
 Allocation::~Allocation() { manager_.forget(*this); }
 
@@ -105,6 +105,15 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   AllocationDesc desc = requested;
   const bool track_state = (desc.flags & kAllocTrackState) != 0;   // (the other checks are about what the allocation is, not what states it moves through)
   desc.flags &= ~kAllocTrackState;
+  const bool reserved = (desc.flags & kAllocReserved) != 0;
+  desc.flags &= ~kAllocReserved;
+  // A reserved resource is a buffer of whole tiles, or a plain texture of 4-byte pixels whose sides are whole tiles of kTileTexels (one level, one sample, not a target).
+  const bool reserved_texture = reserved && desc.flags == kAllocTexture;
+  if (reserved && (heap || requested.heap || (desc.flags & (kAllocQueryResult | kAllocConstantBuffer | kAllocHeap | kAllocShared))) ) return status::kInvalidParameter;
+  if (reserved && !reserved_texture && (!(desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocUnorderedAccess | kAllocStreamOutput)) || desc.size == 0 || desc.size % kTileBytes)) return status::kInvalidParameter;
+  if (reserved_texture && (!dxgk::is_color(desc.format) || dxgk::is_wide(desc.format) || pixel_bytes(desc.format) != 4 || desc.width == 0 || desc.height == 0 || desc.width % kTileTexels || desc.height % kTileTexels ||
+                           desc.mip_levels != 1 || desc.samples != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1))
+    return status::kInvalidParameter;
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
   const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0;
@@ -204,6 +213,10 @@ sized:
     a->cpu_.fill(0);
   }
   ++next_id_;
+  if (reserved)
+    for (uint64_t i = 0, tiles = reserved_texture ? uint64_t{desc.width / kTileTexels} * (desc.height / kTileTexels) : desc.size / kTileBytes; i < tiles; ++i)
+      if (!a->tiles_.push_back(Allocation::TileBinding())) return status::kNoMemory;
+  a->reserved_ = reserved;
   a->state_tracked_ = track_state;
   a->state_ = track_state ? requested.initial_state : 0;
   a->device_bytes_ = device_bytes;
@@ -283,7 +296,66 @@ bool VidMm::create_device_object(Allocation& a) {
   return a.image_ != nullptr;
 }
 
+namespace {
+// The bytes of tile `i` of a reserved texture are rows of kTileTexels pixels, one after the other in the heap; in the backing they are the rows of the tile's place in the picture.
+bool texture_tile_row(ByteView backing, const AllocationDesc& desc, uint64_t tile, uint32_t row, ByteView* picture_row) {
+  const uint64_t across = desc.width / kTileTexels, tx = tile % across, ty = tile / across, pitch = uint64_t{desc.width} * 4;
+  return backing.try_subview((ty * kTileTexels + row) * pitch + tx * kTileTexels * 4, kTileTexels * 4, picture_row);
+}
+}  // namespace
+
+void VidMm::gather_tiles(Allocation& a) {
+  if (a.is_image()) {
+    for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
+      const Allocation::TileBinding& b = a.tiles_[i];
+      for (uint32_t row = 0; row < kTileTexels; ++row) {
+        ByteView to;
+        if (!texture_tile_row(a.cpu_, a.desc(), i, row, &to)) continue;
+        ConstByteView from;
+        if (b.heap && b.heap->backing().try_subview(b.offset + uint64_t{row} * kTileTexels * 4, kTileTexels * 4, &from)) to.copy_from(from);
+        else to.fill(0);
+      }
+    }
+    return;
+  }
+  for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
+    ByteView tile;
+    if (!a.cpu_.try_subview(i * kTileBytes, kTileBytes, &tile)) continue;
+    const Allocation::TileBinding& b = a.tiles_[i];
+    ConstByteView from;
+    if (b.heap && b.heap->backing().try_subview(b.offset, kTileBytes, &from)) tile.copy_from(from);
+    else tile.fill(0);   // (nowhere: zeros)
+  }
+}
+
+void VidMm::scatter_tiles(Allocation& a) {
+  for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
+    const Allocation::TileBinding& b = a.tiles_[i];
+    if (!b.heap) continue;
+    ByteView from, to;
+    if (a.is_image()) {
+      for (uint32_t row = 0; row < kTileTexels; ++row)
+        if (texture_tile_row(a.cpu_, a.desc(), i, row, &from) && b.heap->cpu_.try_subview(b.offset + uint64_t{row} * kTileTexels * 4, kTileTexels * 4, &to)) to.copy_from(ConstByteView(from));
+    } else if (a.cpu_.try_subview(i * kTileBytes, kTileBytes, &from) && b.heap->cpu_.try_subview(b.offset, kTileBytes, &to)) to.copy_from(ConstByteView(from));
+    // (what lies in the heap's memory under placed allocations is theirs to see: their device objects are stale now)
+    for (Allocation* other : b.heap->placed_) other->device_stale_ = other->cpu_written_ = true;
+  }
+}
+
+NtStatus VidMm::map_tiles(Allocation& reserved, uint32_t first, const SharedPointer<Allocation>& heap, uint64_t heap_offset, uint32_t count) {
+  if (!reserved.reserved_ || count == 0 || first > reserved.tiles_.count() || count > reserved.tiles_.count() - first) return status::kInvalidParameter;
+  if (heap && (!heap->is_heap() || &heap->manager() != this || heap_offset % kTileBytes || heap_offset > heap->desc().size || uint64_t{count} * kTileBytes > heap->desc().size - heap_offset))
+    return status::kInvalidParameter;
+  for (uint32_t i = 0; i < count; ++i) {
+    reserved.tiles_[first + i].heap = heap;
+    reserved.tiles_[first + i].offset = heap_offset + uint64_t{i} * kTileBytes;
+  }
+  reserved.device_stale_ = true;
+  return status::kSuccess;
+}
+
 bool VidMm::upload(Allocation& a) {
+  if (a.reserved_) gather_tiles(a);
   if (a.buffer_) {
     ByteView mapped = a.buffer_->map();
     const bool ok = mapped.copy_from(ConstByteView(a.cpu_));
@@ -359,12 +431,16 @@ bool VidMm::upload(Allocation& a) {
 }
 
 bool VidMm::read_back(Allocation& a) {
-  if (!a.gpu_newer_) return true;
+  if (!a.gpu_newer_) {
+    if (a.reserved_) gather_tiles(a);   // (the heap's memory may have changed under it)
+    return true;
+  }
   if (a.buffer_) {
     // (a storage buffer a compute shader wrote: the device's contents come back into the backing)
     if (!a.buffer_->read_back()) return false;
     ConstByteView mapped = a.buffer_->map();
     if (!a.cpu_.copy_from(mapped.first(a.cpu_.size() < mapped.size() ? a.cpu_.size() : mapped.size()))) return false;
+    if (a.reserved_) scatter_tiles(a);
     a.gpu_newer_ = false;
     return true;
   }
@@ -412,6 +488,7 @@ bool overlaps(const Allocation& a, const Allocation& b) {
 void VidMm::note_cpu_write(Allocation& a) {
   a.device_stale_ = true;
   a.cpu_written_ = true;
+  if (a.reserved_) scatter_tiles(a);
   if (a.heap_)
     for (Allocation* other : a.heap_->placed_)
       if (other != &a && overlaps(a, *other)) other->device_stale_ = other->cpu_written_ = true;   // (its device object is out of date, and what it holds is now written by someone)

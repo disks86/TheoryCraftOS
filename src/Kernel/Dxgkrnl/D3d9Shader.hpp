@@ -64,6 +64,9 @@ class D3d9Program {
   // Pixel shaders of Shader Model 1 (ps_1_0 .. ps_1_4), see D3d9Ps1.cpp; compile() hands them over.
   static NtStatus compile_ps1(allocators::IAllocator& allocator, ConstByteView tokens, UniquePointer<D3d9Program>* out);
   static NtStatus compile_dxbc(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
+  // A DXIL container (Shader Model 6.0 .. 6.x vertex, pixel and compute shaders): the LLVM bitcode is translated to the Shader Model 5 tokens of the same shader (DxilTranslate.cpp), which
+  // compile_dxbc then takes. compile_dxbc hands such a container over itself.
+  static NtStatus compile_dxil(allocators::IAllocator& allocator, ConstByteView container, UniquePointer<D3d9Program>* out);
 
   graphics::ShaderStage stage() const { return stage_; }
   // How many bytes of push constants the program reads (a Direct3D 9 program: eight registers; a DXBC one: its constant buffers laid end to end in slot order). A device whose
@@ -108,6 +111,9 @@ class D3d9Program {
   // zero), one that fetches texels, samples at a level or asks the size of a texture kFeatureTexelAccess.
   uint32_t required_features() const;
   bool uses_system_values() const { return uses_system_values_; }
+  bool uses_vertex_stores() const { return uses_vertex_stores_; }
+  bool uses_geometry_stores() const { return uses_geometry_stores_; }
+  bool uses_fragment_stores() const { return uses_fragment_stores_; }   // a pixel shader that writes buffers
   // How many colour outputs a pixel shader writes (a DXBC one: SV_Target0 .. n-1; the others: one). More than one needs kFeatureMultipleTargets, and `color` of run_fragment is then that many Vec4s.
   uint32_t color_output_count() const { return color_outputs_; }
   // The same with the system values (D3d9Binding hands these to the device beside the others).
@@ -172,7 +178,7 @@ class D3d9Program {
   bool uses_barrier_ = false;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
-  bool uses_system_values_ = false, uses_texel_access_ = false;
+  bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false, uses_vertex_stores_ = false, uses_geometry_stores_ = false;
   uint32_t color_outputs_ = 1;
   uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;

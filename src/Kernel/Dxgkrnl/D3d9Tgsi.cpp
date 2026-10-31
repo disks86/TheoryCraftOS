@@ -70,6 +70,7 @@ class TgsiEmitter {
 
   struct Imm {
     uint32_t bits[4];
+    bool integer = false;   // (used by an integer instruction: declared UINT32 whatever the bits look like)
   };
 
   // --- text
@@ -126,9 +127,10 @@ class TgsiEmitter {
   // --- immediates
   uint32_t imm4(const float v[4]) {
     Imm im;
+    im.integer = force_integer_;
     for (uint32_t k = 0; k < 4; ++k) im.bits[k] = __builtin_bit_cast(uint32_t, v[k]);
     for (uint64_t i = 0; i < imms_.count(); ++i) {
-      bool same = true;
+      bool same = imms_[i].integer == im.integer;
       for (uint32_t k = 0; k < 4; ++k) same = same && imms_[i].bits[k] == im.bits[k];
       if (same) return static_cast<uint32_t>(i);
     }
@@ -243,6 +245,8 @@ class TgsiEmitter {
   allocators::IAllocator& a_;
   String body_;
   List<Imm> imms_;
+  void write_outputs();   // the shadows of the outputs to the outputs (before the END, and before a return in the middle)
+  bool force_integer_ = false;   // the instruction being emitted reads its literals as integers
   uint32_t inst_ = 0;
   bool oom_ = false, unsupported_ = false;
   bool vertex_ = false, addr_used_ = false;
@@ -505,6 +509,7 @@ bool TgsiEmitter::compare(const Instr& ins) {
 }
 
 bool TgsiEmitter::instruction(const Instr& ins) {
+  force_integer_ = false;
   const uint16_t op = ins.op;
   relative_key_ = -2;
   switch (op) {
@@ -541,6 +546,14 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("UIF", &test);
       return true;
     }
+    case kRetEarly:
+      if (hull_ || geometry_ || compute_) {
+        unsupported_ = true;
+        return true;
+      }
+      write_outputs();
+      line("RET");
+      return true;
     case kDiscardNz: case kDiscardZ: {
       const String test = zero_test(ins.src[0], op == kDiscardZ);
       line("UIF", &test);
@@ -584,6 +597,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
   }
   if (ins.dst.mask == 0) return true;
 
+  force_integer_ = op >= kIntegerFirst && op <= kIntegerLast && op != kFtoI && op != kFtoU;
   bool direct = false;
   const String d = destination(ins.dst);
   String t = str();
@@ -612,6 +626,29 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kSne: simple = "SNE", sources = 2; break;
     case kDp2: simple = "DP2", sources = 2; break;
     case kFloor: simple = "FLR", sources = 1; break;
+    // doubles: a pair of components is a double (the destination's mask and the sources' swizzles say which)
+    case kDAdd: simple = "DADD", sources = 2; break;
+    case kDMul: simple = "DMUL", sources = 2; break;
+    case kDDiv: simple = "DDIV", sources = 2; break;
+    case kDFma: simple = "DFMA", sources = 3; break;
+    case kDRcp: simple = "DRCP", sources = 1; break;
+    case kDMin: simple = "DMIN", sources = 2; break;
+    case kDMax: simple = "DMAX", sources = 2; break;
+    case kDMov: simple = "DMOV", sources = 1; break;
+    case kDEq: simple = "DSEQ", sources = 2; break;
+    case kDGe: simple = "DSGE", sources = 2; break;
+    case kDLt: simple = "DSLT", sources = 2; break;
+    case kDNe: simple = "DSNE", sources = 2; break;
+    case kDToF: simple = "D2F", sources = 1; break;
+    case kDToI: simple = "D2I", sources = 1; break;
+    case kDToU: simple = "D2U", sources = 1; break;
+    case kFToD: simple = "F2D", sources = 1; break;
+    case kIToD: simple = "I2D", sources = 1; break;
+    case kUToD: simple = "U2D", sources = 1; break;
+    case kDdx: simple = "DDX_FINE", sources = 1; break;
+    case kDdy: simple = "DDY_FINE", sources = 1; break;
+    case kDdxCoarse: simple = "DDX", sources = 1; break;
+    case kDdyCoarse: simple = "DDY", sources = 1; break;
     case kCeil: simple = "CEIL", sources = 1; break;
     case kTrunc: simple = "TRUNC", sources = 1; break;
     case kRoundNe: simple = "ROUND", sources = 1; break;
@@ -619,6 +656,8 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kIAdd: simple = "UADD", sources = 2; break;
     case kINeg: simple = "INEG", sources = 1; break;
     case kIMul: case kUMul: simple = "UMUL", sources = 2; break;
+    case kUMulHi: simple = "UMUL_HI", sources = 2; break;
+    case kIMulHi: simple = "IMUL_HI", sources = 2; break;
     case kIMad: case kUMad: simple = "UMAD", sources = 3; break;
     case kIMin: simple = "IMIN", sources = 2; break;
     case kIMax: simple = "IMAX", sources = 2; break;
@@ -840,7 +879,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         shared_used_ = true;
       } else {
         add(buffer, "BUFFER[");
-        add_uint(buffer, ins.uav);
+        add_uint(buffer, compute_ ? ins.uav : ins.uav >= graphics::kMaxUavBuffers ? ins.uav - graphics::kMaxUavBuffers : ins.uav + graphics::kMaxSrvBuffers);   // (the other stages number the views from 0 and the unordered access buffers after them)
         add(buffer, "]");
         buffer_used_[ins.uav] = true;
       }
@@ -900,6 +939,257 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       t = begin_result(ins, true, &direct);
       const String w = temp(kWork), old_all = temp(kWork2, ".xxxx");
       line("MOV", &w, &old_all);
+      break;
+    }
+    case kF32ToF16: case kF16ToF32: {
+      // The host has no PK2H / UP2H (they are accepted and do nothing), so the conversions are made of integer instructions: the rounding to nearest even, the subnormals, the infinities.
+      t = begin_result(ins, false, &direct);
+      auto whole = [&](uint32_t reg, char c) { String w = str(); add(w, "TEMP["); add_uint(w, reg); add(w, "]."); for (int k = 0; k < 4; ++k) add(w, StringView(&c, 1)); return w; };
+      auto one = [&](uint32_t reg, char c) { String w = str(); add(w, "TEMP["); add_uint(w, reg); add(w, "]."); add(w, StringView(&c, 1)); return w; };
+      auto constant = [&](uint32_t v) {
+        const bool saved = force_integer_;
+        force_integer_ = true;
+        String w = str(); add(w, "IMM["); add_uint(w, imm4_bits(v, v, v, v)); add(w, "].xxxx");
+        force_integer_ = saved;
+        return w;
+      };
+      const String a = operand(ins.src[0], 0, 0, nullptr, true);
+      const uint32_t r2 = kWork2, r3 = kWork3;
+      const String x2 = one(r2, 'x'), y2 = one(r2, 'y'), z2 = one(r2, 'z'), w2 = one(r2, 'w'), x3 = one(r3, 'x'), y3 = one(r3, 'y'), z3 = one(r3, 'z'), w3 = one(r3, 'w');
+      const String X2 = whole(r2, 'x'), Y2 = whole(r2, 'y'), Z2 = whole(r2, 'z'), W2 = whole(r2, 'w'), X3 = whole(r3, 'x'), Y3 = whole(r3, 'y'), Z3 = whole(r3, 'z'), W3 = whole(r3, 'w');
+      if (op == kF32ToF16) {
+        const String magnitude = constant(0x7FFFFFFFu);
+        line("AND", &x2, &a, &magnitude);                                               // u: the magnitude's bits
+        const String sign_bits = constant(0x80000000u), sixteen = constant(16), thirteen = constant(13), one_bit = constant(1);
+        line("AND", &y2, &a, &sign_bits);
+        line("USHR", &y2, &Y2, &sixteen);                                               // the sign, where a half has it
+        line("USHR", &z2, &X2, &thirteen);
+        line("AND", &z2, &Z2, &one_bit);                                                // the last kept bit of the fraction (ties go to even)
+        const String rebias = constant(0xC8000FFFu);
+        line("UADD", &w2, &X2, &rebias);                                                // the exponent rebased and the rounding bias added
+        line("UADD", &w2, &W2, &Z2);
+        line("USHR", &w2, &W2, &thirteen);                                              // the result for a normal number
+        const String half_f = splat(0.5f), denorm_bias = constant(0xC1000000u);
+        line("ADD", &x3, &X2, &half_f);                                                 // a subnormal or zero: add 0.5 and read the low bits
+        line("UADD", &x3, &X3, &denorm_bias);
+        const String inf_bits = constant(0x7F800000u), nan_half = constant(0x7E00u), inf_half = constant(0x7C00u);
+        line("USLT", &y3, &inf_bits, &X2);                                              // a NaN: more than infinity
+        line("UCMP", &y3, &Y3, &nan_half, &inf_half);
+        const String big = constant(0x47800000u), small = constant(0x38800000u);
+        line("USGE", &z3, &X2, &big);
+        line("USLT", &w3, &X2, &small);
+        line("UCMP", &w2, &W3, &X3, &W2);
+        line("UCMP", &w2, &Z3, &Y3, &W2);
+        line("OR", &w2, &W2, &Y2);
+        line("MOV", &t, &W2);
+      } else {
+        const String mask16 = constant(0xFFFFu), mask15 = constant(0x7FFFu), thirteen = constant(13), exp_mask = constant(0x0F800000u), rebias = constant(0x38000000u), zero_c = constant(0);
+        line("AND", &x2, &a, &mask16);                                                  // h
+        line("AND", &y2, &X2, &mask15);
+        line("SHL", &y2, &Y2, &thirteen);                                               // exponent and fraction in their float places
+        line("AND", &z2, &Y2, &exp_mask);
+        line("UADD", &y2, &Y2, &rebias);                                                // rebased
+        line("USEQ", &w2, &Z2, &exp_mask);                                              // infinity or NaN: the exponent goes on to all ones
+        line("UADD", &x3, &Y2, &rebias);
+        line("UCMP", &y3, &W2, &X3, &Y2);
+        const String hidden = constant(0x00800000u), denorm_unit = splat(-6.103515625e-05f);
+        line("UADD", &z3, &Y2, &hidden);                                                // a subnormal or zero: the hidden bit added and taken off again as a float
+        line("ADD", &z3, &Z3, &denorm_unit);
+        line("USEQ", &w3, &Z2, &zero_c);
+        line("UCMP", &y3, &W3, &Z3, &Y3);
+        const String sign_bit = constant(0x8000u), sixteen = constant(16);
+        line("AND", &x2, &X2, &sign_bit);
+        line("SHL", &x2, &X2, &sixteen);
+        line("OR", &y3, &Y3, &X2);
+        line("MOV", &t, &Y3);
+      }
+      break;
+    }
+    case kTexQueryLod: {
+      // lod: LODQ gives the clamped level in x and the unclamped in y
+      const bool swizzled = ins.tex_swizzle[0] != 0 || ins.tex_swizzle[1] != 1 || ins.tex_swizzle[2] != 2 || ins.tex_swizzle[3] != 3;
+      t = begin_result(ins, true, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind_[unit]));
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), texel = temp(kWork2), xy = temp(kWork2, ".xy"), z = temp(kWork2, ".zw"), zero_pair = zero();
+      line("LODQ", &xy, &coordinate, &sampler);   // (the host's translation of the whole register fails: only the two components it makes)
+      line("MOV", &z, &zero_pair);
+      const String w = temp(kWork);
+      if (swizzled) {
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+      } else {
+        line("MOV", &w, &texel);
+      }
+      break;
+    }
+    case kTexGrad: case kTexBias: {
+      // sample_d: TXD takes the two gradients after the coordinate; sample_b: TXB takes the bias in the coordinate's fourth component (as TXL the level)
+      const bool swizzled = ins.tex_swizzle[0] != 0 || ins.tex_swizzle[1] != 1 || ins.tex_swizzle[2] != 2 || ins.tex_swizzle[3] != 3;
+      t = begin_result(ins, true, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind_[unit]));
+      const String texel = temp(kWork2);
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      if (op == kTexGrad) {
+        const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), dx = operand(ins.src[2], 0, 1, xyxy, false), dy = operand(ins.src[3], 0, 2, xyxy, false);
+        String rest = str();
+        add(rest, dy.view());
+        add(rest, ", ");
+        add(rest, sampler.view());
+        String first = str();
+        add(first, dx.view());
+        add(first, ", ");
+        add(first, rest.view());
+        line("TXD", &texel, &coordinate, &first);
+      } else {
+        const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), bias = operand(ins.src[2], 0, 1, nullptr, true);
+        const String xy = temp(kWork3, ".xy"), w3 = temp(kWork3, ".w"), packed = temp(kWork3);
+        line("MOV", &xy, &coordinate);
+        line("MOV", &w3, &bias);
+        line("TXB", &texel, &packed, &sampler);
+      }
+      const String w = temp(kWork);
+      if (swizzled) {
+        String picked = temp(kWork2, ".");
+        for (uint32_t c = 0; c < 4; ++c) add(picked, StringView(&"xyzw"[ins.tex_swizzle[c] & 3], 1));
+        line("MOV", &w, &picked);
+      } else {
+        line("MOV", &w, &texel);
+      }
+      break;
+    }
+    case kTexCompare: {
+      // sample_c as the comparison of a gather, filtered by hand (a depth texture and a comparison sampler are not needed: any texture whose red channel is the depth works)
+      t = begin_result(ins, true, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind(unit)));
+      const uint8_t xyxy[4] = {0, 1, 0, 1};
+      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false), reference = operand(ins.src[2], 0, 1, nullptr, true);
+      const String g = temp(kWork2), g_x = temp(kWork2, ".xxxx"), g_y = temp(kWork2, ".yyyy"), g_z = temp(kWork2, ".zzzz"), g_w = temp(kWork2, ".wwww");
+      const String f = temp(kWork3), f_x = temp(kWork3, ".xxxx"), f_y = temp(kWork3, ".yyyy"), f_z = temp(kWork3, ".zzzz"), f_w = temp(kWork3, ".wwww"), f_xy = temp(kWork3, ".xy");
+      String component = str();
+      add(component, "IMM[");
+      add_uint(component, imm4_bits(0, 0, 0, 0));
+      add(component, "].xxxx");
+      line("TG4", &g, &coordinate, &component, &sampler);
+      line("SGE", &g, &g, &reference);
+      const String level = zero();
+      String size_target = str();
+      add(size_target, temp(kWork3).view());
+      String queried = str();
+      add(queried, level.view());
+      add(queried, ", ");
+      add(queried, sampler.view());
+      line("TXQ", &f, &queried);
+      line("U2F", &f, &f);
+      const String coordinate_xy = operand(ins.src[0], 0, 0, xyxy, false), half = splat(0.5f), negative_half = negate(half);
+      const String f_src = temp(kWork3, ".xyxy");   // (a source takes all four swizzle letters)
+      line("MUL", &f_xy, &coordinate_xy, &f_src);
+      line("ADD", &f_xy, &f_src, &negative_half);
+      line("FRC", &f_xy, &f_src);
+      const String top = temp(kWork3, ".z"), bottom = temp(kWork3, ".w");
+      line("LRP", &top, &f_x, &g_z, &g_w);
+      line("LRP", &bottom, &f_x, &g_y, &g_x);
+      const String result = temp(kWork);
+      (void)f_z, (void)f_w, (void)size_target;
+      line("LRP", &result, &f_y, &f_w, &f_z);
+      break;
+    }
+    case kTexGather: {
+      // gather4: TG4 takes the component (an integer immediate) between the coordinate and the sampler
+      t = begin_result(ins, false, &direct);
+      const uint32_t unit = ins.src[1].number;
+      if (unit >= graphics::kMaxTextureUnits) {
+        unsupported_ = true;
+        break;
+      }
+      sampler_used_[unit] = true;
+      const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
+      const bool flat = p_.texture_kind(unit) == graphics::TextureKind::Texture2D;
+      String coordinate = operand(ins.src[0], 0, 0, flat ? xyxy : xyzz, false);
+      String sampler = str();
+      add(sampler, "SAMP[");
+      add_uint(sampler, unit);
+      add(sampler, "], ");
+      add(sampler, dimension_name(p_.texture_kind(unit)));
+      if (ins.control & 8) {
+        // An offset in a register (TGSI takes the offsets of an instruction as literals): the footprint is moved by moving the coordinate to where the corner of the footprint it should have
+        // is exactly between two texels - (floor(u * size - 0.5) + offset + 1) / size - which is as far as can be from a rounding at a texel's middle.
+        const String work = temp(kWork2), size = temp(kWork3), work_xy = temp(kWork2, ".xy"), work_xy_src = temp(kWork2, ".xyxy"), size_xy = temp(kWork3, ".xy"), size_xy_src = temp(kWork3, ".xyxy"),
+                     size_x = temp(kWork3, ".x"), size_y = temp(kWork3, ".y"), size_zw = temp(kWork3, ".zw"), size_zw_src = temp(kWork3, ".zwzw"), work_z = temp(kWork2, ".z");
+        const String offset = operand(ins.src[2], 0, 2, xyxy, false), level = zero(), half = splat(0.5f), minus_half = negate(half), one = splat(1.0f);
+        String queried = str();
+        add(queried, level.view());
+        add(queried, ", ");
+        add(queried, sampler.view());
+        line("TXQ", &size, &queried);
+        line("U2F", &size_xy, &size_xy_src);
+        line("I2F", &size_zw, &offset);
+        line("MUL", &work_xy, &coordinate, &size_xy_src);
+        line("ADD", &work_xy, &work_xy_src, &minus_half);
+        line("FLR", &work_xy, &work_xy_src);
+        line("ADD", &work_xy, &work_xy_src, &size_zw_src);
+        line("ADD", &work_xy, &work_xy_src, &one);
+        const String size_x_src = temp(kWork3, ".xxxx"), size_y_src = temp(kWork3, ".yyyy");
+        line("RCP", &size_x, &size_x_src);
+        line("RCP", &size_y, &size_y_src);
+        line("MUL", &work_xy, &work_xy_src, &size_xy_src);
+        if (!flat) line("MOV", &work_z, &coordinate);
+        coordinate = temp(kWork2, flat ? ".xyxy" : ".xyzz");
+        (void)work;
+      }
+      if (ins.texel_offset[0] || ins.texel_offset[1]) {
+        const bool saved = force_integer_;
+        force_integer_ = true;
+        const uint32_t ox = static_cast<uint32_t>(static_cast<int32_t>(ins.texel_offset[0])), oy = static_cast<uint32_t>(static_cast<int32_t>(ins.texel_offset[1]));
+        add(sampler, ", IMM[");
+        add_uint(sampler, imm4_bits(ox, oy, 0, 0));
+        add(sampler, "].xyz");
+        force_integer_ = saved;
+      }
+      const bool compare = (ins.control & 4) != 0;
+      String component = str();
+      add(component, "IMM[");
+      add_uint(component, imm4_bits(ins.control & 3, ins.control & 3, ins.control & 3, ins.control & 3));
+      add(component, "].xxxx");
+      if (compare) {
+        // (gather4_c: the comparison reference <= texel of each of the four texels, made here as the sampler is not a comparison one)
+        const String texels = temp(kWork3), reference = operand(ins.src[(ins.control & 8) ? 3 : 2], 0, 1, nullptr, true);
+        line("TG4", &texels, &coordinate, &component, &sampler);
+        line("SGE", &t, &texels, &reference);
+        break;
+      }
+      line("TG4", &t, &coordinate, &component, &sampler);
       break;
     }
     case kTexSamples: {
@@ -1247,6 +1537,21 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, ", FLOAT\n");
     }
   }
+  if (!compute_) {   // (the buffers a vertex, geometry, tessellation or pixel shader reads and writes: all the numbers up to the last, so that the host's binding points are the numbers)
+    uint32_t last = 0;
+    bool any = false;
+    for (uint32_t i = 0; i < graphics::kMaxStorageBuffers; ++i) {
+      if (!buffer_used_[i]) continue;
+      const uint32_t index = i >= graphics::kMaxUavBuffers ? i - graphics::kMaxUavBuffers : i + graphics::kMaxSrvBuffers;
+      last = any && last > index ? last : index;
+      any = true;
+    }
+    for (uint32_t index = 0; any && index <= last; ++index) {
+      add(*out, "DCL BUFFER[");
+      add_uint(*out, index);
+      add(*out, "]\n");
+    }
+  }
   add(*out, "DCL CONST[0..");
   add_uint(*out, p_.constant_registers_ - 1);
   add(*out, "]\n");
@@ -1258,7 +1563,7 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, "IMM[");
     add_uint(*out, i);
     // A value that is no ordinary float (an integer literal: a denormal, or all ones, or a large one) is written as its bits.
-    bool integer = false;
+    bool integer = imms_[i].integer;
     for (uint32_t k = 0; k < 4; ++k) {
       const uint32_t exponent = (imms_[i].bits[k] >> 23) & 0xFF, mantissa = imms_[i].bits[k] & 0x7FFFFF;
       integer = integer || (exponent == 0 && mantissa != 0) || (p_.major_ >= 4 && exponent >= 0x9C);   // (a Shader Model 4 literal is typeless: one too large to write as a decimal is an integer, 0xFF000000 and the like)
@@ -1272,6 +1577,36 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, "}\n");
   }
   add(*out, body_.view());
+}
+
+void TgsiEmitter::write_outputs() {
+if (vertex_ || domain_) {
+    const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
+    const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
+    String o = str();
+    add(o, "OUT[0]");
+    line("MUL", &o, &pos, &factor);
+    String upright = str();
+    add(upright, "OUT[5]");
+    line("MOV", &upright, &pos);
+    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      String target = str();
+      add(target, "OUT[");
+      add_uint(target, i + 1);
+      add(target, "]");
+      const String v = temp(kVarying + i);
+      line("MOV", &target, &v);
+    }
+} else if (!compute_) {
+    for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
+      String o = str();
+      add(o, "OUT[");
+      add_uint(o, i);
+      add(o, "]");
+      const String c = temp(color_register(i));
+      line("MOV", &o, &c);
+    }
+  }
 }
 
 NtStatus TgsiEmitter::run(String* out) {
@@ -1488,32 +1823,8 @@ NtStatus TgsiEmitter::run(String* out) {
       (void)tess_outer, (void)tess_inner;
     } else if (geometry_) {
       // (the vertices were written out by the emits)
-    } else if (vertex_ || domain_) {
-      const float flip[4] = {1.0f, -1.0f, 1.0f, 1.0f};
-      const String pos = temp(kPosition), factor = imm_text(flip, ".xyzw");
-      String o = str();
-      add(o, "OUT[0]");
-      line("MUL", &o, &pos, &factor);
-      String upright = str();
-      add(upright, "OUT[5]");
-      line("MOV", &upright, &pos);
-      for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
-        String target = str();
-        add(target, "OUT[");
-        add_uint(target, i + 1);
-        add(target, "]");
-        const String v = temp(kVarying + i);
-        line("MOV", &target, &v);
-      }
-    } else if (!compute_) {
-      for (uint32_t i = 0; i < p_.color_outputs_; ++i) {
-        String o = str();
-        add(o, "OUT[");
-        add_uint(o, i);
-        add(o, "]");
-        const String c = temp(color_register(i));
-        line("MOV", &o, &c);
-      }
+    } else {
+      write_outputs();
     }
     add(body_, "  ");
     add_uint(body_, inst_++);

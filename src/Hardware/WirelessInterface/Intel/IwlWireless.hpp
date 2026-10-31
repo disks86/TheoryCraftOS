@@ -62,11 +62,27 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   bool link_comes_and_goes() const override { return true; }
   const char* failure() const { return failure_; }
   const IwlDriver& driver() const { return driver_; }
+  // The firmware stopped (its error bits came up, or a command was never answered): the interface is taken down, the card started again, up to kMaxRecentRestarts times within a
+  // minute. The connection is gone after one (the status says disconnected; scan and connect again). restarts() counts them since the start; last_firmware_failure() is the line the
+  // transport made of the firmware's error log.
+  static constexpr uint32_t kMaxRecentRestarts = 3, kRestartWindowMs = 60000;
+  uint32_t restarts() const { return restarts_; }
+  // Interrupts. use_interrupts(true) switches the card to interrupt mode (the caller has set up the MSI and its handler, which calls on_interrupt()); while nothing is going on
+  // the interface then looks at the card only when an interrupt came, and every kSafetyPollMs in case one did not (three safety looks in a row that find frames nobody was
+  // told about turn the gating off: the card is then polled as before). verify_interrupts() sends a command and reports whether the answer raised an interrupt; a caller that gets
+  // false calls use_interrupts(false). on_interrupt() is for the interrupt handler and takes no lock.
+  static constexpr uint32_t kSafetyPollMs = 50, kMissedBeforeGivingUp = 3;
+  bool use_interrupts(bool on);
+  bool verify_interrupts();
+  void on_interrupt() { if (IwlTransport* t = const_cast<IwlDriver&>(driver_).transport()) t->on_interrupt(); }
+  bool interrupts_on() const { return interrupts_; }
+  bool interrupt_gating() const { return interrupts_ && gating_; }
+  const char* last_firmware_failure() const { return failure_text_; }
 
   // INetworkInterface
   MacAddress mac_address() const override;
   bool link_up() const override;
-  uint32_t link_speed_mbps() const override { return link_up() ? 24 : 0; }
+  uint32_t link_speed_mbps() const override;
   LinkDuplex link_duplex() const override { return LinkDuplex::Unknown; }
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
@@ -90,6 +106,9 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   void pump() const;
   void finish_connection(WifiResult result) const;
   bool attach();                                       // after the driver is running: scanner, link, state machine, receive ring
+  bool open_locked();
+  void shutdown_locked();
+  void recover() const;
   void leave_locked();
 
   Inputs in_;
@@ -106,6 +125,14 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   mutable uint32_t ring_head_ = 0, ring_tail_ = 0, ring_count_ = 0;
   mutable NetworkStatistics own_;
   const char* failure_ = "";
+  IIwlRegisters* registers_ = nullptr;                 // when started from a register window (tests): to start again
+  bool integrated_ = false;
+  mutable uint32_t restarts_ = 0, recent_restarts_ = 0;
+  mutable bool interrupts_ = false, gating_ = false;
+  mutable uint32_t seen_interrupts_ = 0, seen_frames_ = 0, missed_ = 0;
+  mutable uint64_t last_look_ms_ = 0;
+  mutable uint64_t last_restart_ms_ = 0;
+  mutable char failure_text_[200] = {};
 };
 
 }  // namespace hardware

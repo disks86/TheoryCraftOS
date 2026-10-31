@@ -53,6 +53,8 @@ while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
   # kernel32 tests load a program from System32 (winver.exe) as a library: any program image will do
   cp "$out/winerun.exe" "$out/winver.exe"; files+=("$PWD/$out/winver.exe")
   cp "$out/winerun.exe" "$out/explorer.exe"; files+=("$PWD/$out/explorer.exe")      # (C:\Windows\explorer.exe: another program image to load)
+  cp "$out/winerun.exe" "$out/regedit.exe"; files+=("$PWD/$out/regedit.exe")      # (C:\Windows\regedit.exe: a program file the file tests open)
+  cp "$out/winerun.exe" "$out/iexplore.exe"; files+=("$PWD/$out/iexplore.exe")      # (C:\Program Files\Internet Explorer\iexplore.exe: a program the process tests start)
   cat > "$out/qemu.sh" <<'QEMU'
 #!/bin/sh
 # Runs QEMU without a display until the program prints WINERUN DONE, the debug console is silent for ${WINETEST_QUIET:-90} s, or 40 minutes pass; then stops it.
@@ -78,7 +80,7 @@ QEMU
   cmake -S . -B build -DTCOS_USERMODE_DEMO=OFF -DTCOS_WINE_TEST_PROGRAM="$PWD/$out/winerun.exe" "-DTCOS_WINE_TEST_FILES=$(IFS=';'; echo "${files[*]}")" -DQEMU="$PWD/$out/qemu.sh" >/dev/null
   ninja -C build esp primary vars >"$out/build.log" 2>&1 || { tail -20 "$out/build.log"; exit 1; }
   ninja -C build run-std >/dev/null 2>&1 || true
-  sed -n '/Windows test program/,$p' build/debugcon.log | grep -v "^\[" | grep -v "^  \(test program\|Windows test program\)" >> "$out/$dll.log"
+  sed -n '/Windows test program/,$p' build/debugcon.log | { grep -av "^\[" || true; } | { grep -av "^  \(test program\|Windows test program\)" || true; } >> "$out/$dll.log"      # (-a: a console test writes control characters)
   # the tests that did not start in this round are the next round's; the one that started and never ended is recorded as hung
   last_started=$(grep "^=== .* start" build/debugcon.log | tail -1 | sed 's/^=== \(.*\) start$/\1/')
   if grep -q "WINERUN DONE" build/debugcon.log; then pending=(); break; fi

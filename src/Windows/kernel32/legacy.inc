@@ -74,12 +74,9 @@ EXPORT int WINAPI _lclose(int file) { return CloseHandle(hfile_to_handle(file)) 
 /* OpenFile: the OFSTRUCT gets the full path of the file (and the result code of a failed attempt). OF_PARSE only does that, OF_EXIST checks that the file is there. */
 EXPORT HFILE WINAPI OpenFile(LPCSTR name, LPOFSTRUCT of, UINT style) {
   if (!of) { set_error(ERROR_INVALID_PARAMETER); return (HFILE)-1; }
-  of->cBytes = sizeof(*of);
-  of->nErrCode = 0;
-  of->fFixedDisk = 1;
-  of->Reserved1 = of->Reserved2 = 0;
   if (style & OF_REOPEN_) name = of->szPathName;
   else if (!name) { of->nErrCode = ERROR_INVALID_PARAMETER; set_error(ERROR_INVALID_PARAMETER); return (HFILE)-1; }
+  /* (the structure is only filled in as far as the work goes: a name that cannot be made a full path leaves it as it was) */
   char full[260];
   LPSTR file_part;
   const DWORD n = GetFullPathNameA(name, sizeof(full), full, &file_part);
@@ -89,24 +86,25 @@ EXPORT HFILE WINAPI OpenFile(LPCSTR name, LPOFSTRUCT of, UINT style) {
     return (HFILE)-1;
   }
   memcpy(of->szPathName, full, n + 1);
-  if (style & OF_PARSE_) return 0;
+  of->nErrCode = 0;
+  if (style & OF_PARSE_) { of->cBytes = sizeof(*of); of->fFixedDisk = 1; return 0; }
   if (style & OF_DELETE_) {
     if (!DeleteFileA(of->szPathName)) { of->nErrCode = (WORD)GetLastError(); return (HFILE)-1; }
+    of->cBytes = sizeof(*of);
+    of->fFixedDisk = 1;
     return 1;
   }
   if (style & OF_EXIST_) {
     const DWORD attributes = GetFileAttributesA(of->szPathName);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) { of->nErrCode = ERROR_FILE_NOT_FOUND; set_error(ERROR_FILE_NOT_FOUND); return (HFILE)-1; }
+    of->cBytes = sizeof(*of);
+    of->fFixedDisk = 1;
     return 1;
   }
   const int h = (style & OF_CREATE_) ? _lcreat(of->szPathName, 0) : _lopen(of->szPathName, (int)(style & 0x73));
   if (h == HFILE_ERROR_) { of->nErrCode = (WORD)GetLastError(); return (HFILE)-1; }
+  of->cBytes = sizeof(*of);
+  of->fFixedDisk = 1;
+  of->Reserved1 = of->Reserved2 = 0;
   return (HFILE)h;
-}
-
-/* There are no 8.3 names in this OS's file systems: the short name of a path is its full name. */
-EXPORT DWORD WINAPI GetShortPathNameA(LPCSTR path, LPSTR buffer, DWORD capacity) {
-  if (!path) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return 0;      /* (GetFileAttributesA set the error) */
-  return GetFullPathNameA(path, capacity, buffer, NULL);
 }

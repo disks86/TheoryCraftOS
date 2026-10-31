@@ -183,14 +183,18 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSuspendProcess: return windowsabi::nt_suspend_resume_process(process, r, true);
       case WindowsSyscallNumber::NtResumeProcess: return windowsabi::nt_suspend_resume_process(process, r, false);
       case WindowsSyscallNumber::NtTcosDebugException: return windowsabi::nt_tcos_debug_exception(process, r);
+      case WindowsSyscallNumber::NtTcosLinkModules: return windowsabi::nt_link_modules(process, r);
+      case WindowsSyscallNumber::NtCancelSynchronousIoFile: return windowsabi::nt_cancel_synchronous_io_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);
       case WindowsSyscallNumber::NtSetInformationObject: return windowsabi::nt_set_information_object(process, r);
+      case WindowsSyscallNumber::NtCompareObjects: return windowsabi::nt_compare_objects(process, r);
       case WindowsSyscallNumber::NtReleaseModule: return windowsabi::nt_release_module(process, r);
       case WindowsSyscallNumber::NtUnloadModule: return windowsabi::nt_unload_module(process, r);
       case WindowsSyscallNumber::NtSetInformationProcess: return windowsabi::nt_set_information_process(process, r);
       case WindowsSyscallNumber::NtSetInformationThread: return windowsabi::nt_set_information_thread(process, r);
       case WindowsSyscallNumber::NtQuerySystemInformation: return windowsabi::nt_query_system_information(process, r);
+      case WindowsSyscallNumber::NtQuerySystemInformationEx: return windowsabi::nt_query_system_information_ex(process, r);
       case WindowsSyscallNumber::NtContinue: return nt_continue(process, r);
       case WindowsSyscallNumber::NtCreateThreadEx: return windowsabi::nt_create_thread_ex(process, r);
       case WindowsSyscallNumber::NtTerminateThread: return windowsabi::nt_terminate_thread(process, r);

@@ -21,6 +21,7 @@
 #include "Utility/String.hpp"
 #include "Hardware/Bus/Usb/Hid/UsbHidInterface.hpp"
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
+#include "Hardware/Keyboard/Usb/UsbHidConsumer.hpp"
 #include "Hardware/Keyboard/Usb/UsbHidKeyboard.hpp"
 #include "Hardware/Keyboard/Virtio/VirtioKeyboard.hpp"
 #include "Hardware/Mouse/Usb/UsbHidMouse.hpp"
@@ -76,15 +77,29 @@ uint32_t SystemInput::take_up(IUsbHostController& host_controller, uint32_t port
           release_last();
         }
       }
-    } else if (auto* m = make<UsbHidMouse>(*host, port, iface)) {
-      // Anything else HID: it is used if its report descriptor describes a pointer.
-      if (m->initialize() && mice_.add(m)) {
-        for (UsbHidMouse*& slot : usb_mice_)
-          if (!slot) { slot = m; break; }
-        ++taken;
-        notify(m->name(), "added");
-      } else {
+    } else {
+      // Anything else HID: media keys if its report descriptor has a consumer control collection, else a pointer if it describes one.
+      if (iface.is_boot_mouse()) {
+        // (a boot mouse is a mouse)
+      } else if (auto* c = make<UsbHidConsumer>(*host, port, iface)) {
+        if (c->initialize() && keyboards_.add(c)) {
+          for (UsbHidConsumer*& slot : usb_consumers_)
+            if (!slot) { slot = c; break; }
+          ++taken;
+          notify(c->name(), "added");
+          continue;
+        }
         release_last();
+      }
+      if (auto* m = make<UsbHidMouse>(*host, port, iface)) {
+        if (m->initialize() && mice_.add(m)) {
+          for (UsbHidMouse*& slot : usb_mice_)
+            if (!slot) { slot = m; break; }
+          ++taken;
+          notify(m->name(), "added");
+        } else {
+          release_last();
+        }
       }
     }
   }
@@ -130,6 +145,16 @@ uint32_t SystemInput::drop_removed() {
     destroy(gone);
     ++dropped;
   }
+  for (UsbHidConsumer*& c : usb_consumers_) {
+    if (!c || c->present()) continue;
+    UsbHidConsumer* gone = c;
+    c = nullptr;
+    gone->release_all();
+    keyboards_.remove(gone);
+    notify(gone->name(), "removed");
+    destroy(gone);
+    ++dropped;
+  }
   for (UsbHidMouse*& m : usb_mice_) {
     if (!m || m->present()) continue;
     UsbHidMouse* gone = m;
@@ -143,6 +168,35 @@ uint32_t SystemInput::drop_removed() {
   return dropped;
 }
 
+bool SystemInput::add_source(IInputDeviceSource* source) {
+  if (!source) return false;
+  for (IInputDeviceSource* s : sources_)
+    if (s == source) return true;
+  for (IInputDeviceSource*& s : sources_) {
+    if (s) continue;
+    s = source;
+    return true;
+  }
+  return false;
+}
+
+bool SystemInput::remove_source(IInputDeviceSource* source) {
+  for (IInputDeviceSource*& s : sources_) {
+    if (s != source || !s) continue;
+    Sink sink(*this);
+    s->detach_all(sink);
+    s = nullptr;
+    return true;
+  }
+  return false;
+}
+
+uint32_t SystemInput::source_count() const {
+  uint32_t n = 0;
+  for (IInputDeviceSource* s : sources_) n += s != nullptr;
+  return n;
+}
+
 uint32_t SystemInput::poll() {
   uint32_t changes = drop_removed();
   watcher_.scan([&](uint32_t, IUsbHostController& host, uint32_t port) {
@@ -150,6 +204,9 @@ uint32_t SystemInput::poll() {
     changes += take_up(host, port);
   });
   changes += drop_removed();
+  Sink sink(*this);
+  for (IInputDeviceSource* s : sources_)
+    if (s) changes += s->poll(sink);
   return changes;
 }
 
@@ -225,6 +282,11 @@ void SystemInput::initialize() {
 
 void SystemInput::shutdown() {
   stop_service();
+  Sink sink(*this);
+  for (IInputDeviceSource*& s : sources_) {
+    if (s) s->detach_all(sink);
+    s = nullptr;
+  }
   for (uint64_t i = owned_.count(); i > 0; --i) owned_[i - 1]->shutdown();  // newest first
   owned_.clear();  // frees the devices
   ps2_keyboard_.shutdown();

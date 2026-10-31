@@ -40,6 +40,7 @@
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Media/AudioStreaming.hpp"
 #include "Midi/MidiStream.hpp"
+#include "Desktop/Playlist.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Video/VideoPlayer.hpp"
 
@@ -60,7 +61,15 @@ class MediaPlayer : public gui::Frame {
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
   // Reads the file at `path`, works out what it is and starts playing it. False (with a notice) if that fails; what was open stays closed.
+  // A file that is not in the playlist replaces it with the media files of its folder (by name), so that next / previous have somewhere to go.
   bool open_file(StringView path);
+  // The next / previous track of the playlist (the next button, the media keys). Previous goes back to the start of a track that has played for more than a few seconds first.
+  // False when there is no such track (the end or start of the list, nothing open), or it could not be opened.
+  bool next_track();
+  bool previous_track();
+  Playlist& playlist() { return playlist_; }
+  // Called often (by the desktop): goes on to the next track when the one playing has played through.
+  void pump();
   // File > Open: the dialog, then open_file().
   void ask_open();
   // Stops and forgets the open file.
@@ -94,6 +103,12 @@ class MediaPlayer : public gui::Frame {
     if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) status_.set_text(text);
   }
   bool open_source();
+  bool play_path(StringView path);
+  void load_folder(StringView path);
+  bool play_index(uint64_t index);
+  int64_t position_ms();
+  static void on_next_menu(void* self, gui::Control&);
+  static void on_previous_menu(void* self, gui::Control&);
 
   gui::MenuBar menu_;
   gui::Panel status_bar_;
@@ -110,6 +125,9 @@ class MediaPlayer : public gui::Frame {
   midi::IMidiOutput* midi_output_ = nullptr;
   bool playing_midi_ = false, playing_midi_hardware_ = false;
   String path_;
+  Playlist playlist_;
+  int64_t last_position_ms_ = 0;
+  bool was_playing_ = false;
   Kind kind_ = Kind::None;
 };
 

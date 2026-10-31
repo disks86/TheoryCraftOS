@@ -116,6 +116,13 @@ class IImage {
     (void)pixels;
     return false;
   }
+  // Replaces a rectangle of a color image and leaves the rest as it is: `pixels` begins at the rectangle's top left pixel and its rows are `pitch` pixels apart (the rectangle's
+  // last row must be inside `pixels`), 0xAARRGGBB, rows top to bottom. False if the device cannot do this (the default: write_pixels the whole image then), the rectangle is empty or
+  // not inside the image, `pitch` is less than its width, `pixels` is too short, or as for write_pixels.
+  virtual bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) {
+    (void)area, (void)pixels, (void)pitch;
+    return false;
+  }
   // The same for the float formats (kFeatureFloatFormats; Format::R16G16B16A16Float / R32G32B32A32Float): extent.width * extent.height colours, rows top to bottom, not clamped. Half-float images
   // round what they are given to half precision. False for another format, a wrong size, or a device without float formats.
   virtual bool read_pixels_float(ArrayView<Vec4> out) {
@@ -254,13 +261,22 @@ using TexturedFragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* c
 // (position: x and y window coordinates of the pixel's centre, z the depth, w one over the clip space w), whether the triangle faces the viewer (lines and points: true) and which
 // primitive of the draw it belongs to.
 struct VertexContext {
+  const ByteView* storage = nullptr;   // the storage buffers bound (kFeatureStorageInDraws): kMaxStorageBuffers views, the shader resource views of buffers in the slots after the unordered access ones
   uint32_t vertex_id = 0;     // the index of the vertex (or its number in a draw without indices), before the base vertex offset is added in
   uint32_t instance_id = 0;
 };
 struct FragmentContext {
+  const ByteView* storage = nullptr;   // ... as for the vertex shader
+  bool helper = false;                 // a run made only to learn something about a neighbour (the level of detail, a derivative): it writes no buffer
   Vec4 position;
   bool front_facing = true;
   uint32_t primitive_id = 0;
+  // Derivatives (ddx / ddy): the pixel is one of the four of a 2 x 2 quad (`quad_corner`: x & 1 | (y & 1) << 1), and `quad_fn` gives the varyings and the position of any corner, at its
+  // pixel's centre, extended out of the primitive if it is not covered. A shader asks only when it takes a derivative; without the function (points, lines) the derivatives are zero.
+  using QuadFn = void (*)(const void* user, uint32_t corner, Vec4* varyings, Vec4* position);
+  QuadFn quad_fn = nullptr;
+  const void* quad_user = nullptr;
+  uint32_t quad_corner = 0;
 };
 using VertexShaderFnEx = void (*)(const Vec4* attributes, const uint8_t* constants, const VertexContext& context, ShaderIo* out);
 using FragmentShaderFnEx = bool (*)(const Vec4* varyings, const FragmentContext& context, const uint8_t* constants, const ITextureSet& textures, Vec4* color);
@@ -283,6 +299,7 @@ struct StreamOutputEntry {
   uint8_t stream = 0, output = 0, start_component = 0, component_count = 0, buffer = 0;
 };
 struct GeometryInputData {
+  const ByteView* storage = nullptr;   // the views of buffers the draw can read (kFeatureStorageInDraws), as for the vertex shader
   Vec4 position[kMaxGeometryInputVertices];
   Vec4 varying[kMaxGeometryInputVertices][kMaxVaryings];
   uint32_t primitive_id = 0;   // the number of the primitive in the draw
@@ -307,12 +324,14 @@ enum class TessDomain : uint8_t { Isoline, Triangle, Quad };
 enum class TessPartitioning : uint8_t { Integer, Pow2, FractionalOdd, FractionalEven };
 enum class TessOutput : uint8_t { TriangleCw, TriangleCcw, Point, Line };
 struct HullInputData {
+  const ByteView* storage = nullptr;
   uint32_t control_points = 0;
   uint32_t primitive_id = 0;
   Vec4 position[kMaxPatchControlPoints];
   Vec4 varying[kMaxPatchControlPoints][kMaxVaryings];
 };
 struct HullOutputData {
+  const ByteView* storage = nullptr;                // (the domain shader's views of buffers: the draw's)
   ShaderIo control_point[kMaxPatchControlPoints];   // the output control points
   Vec4 patch[kMaxPatchRegisters];                   // the patch constant registers (the tessellation factors are in the x of theirs)
   float outer[4] = {};                              // edge factors (triangle: the u = 0, v = 0 and w = 0 edges; quad: u = 0, v = 0, u = 1, v = 1; isoline: line density, line detail)
@@ -324,7 +343,9 @@ using DomainShaderFn = void (*)(const HullOutputData& patch, float u, float v, f
 // Compute shaders (kFeatureCompute). A software compute shader is called once per thread; the device runs the groups of a dispatch one after the other and the threads of a group
 // in order (no barriers or group-shared memory: a module that needs them is not given a function). `buffers` are the storage buffers bound at the time (empty views for slots
 // that are not bound); a read or write outside a buffer must be dropped or read as zero by the shader.
-constexpr uint32_t kMaxStorageBuffers = 4;
+constexpr uint32_t kMaxUavBuffers = 4;                            // u0 .. u3: storage buffers shaders read and write
+constexpr uint32_t kMaxSrvBuffers = 4;                            // t0 .. t3 of a buffer: read-only storage buffers, in the slots after the u# ones (slot kMaxUavBuffers + n)
+constexpr uint32_t kMaxStorageBuffers = kMaxUavBuffers + kMaxSrvBuffers;
 constexpr uint32_t kMaxSharedMemories = 4;     // group-shared memories (g0 .. g3) of a compute shader (the group runner makes them: a context's `shared`)
 constexpr uint32_t kMaxSharedBytes = 32768;   // all of them together (Direct3D's limit)
 constexpr uint32_t kMaxBarrierThreads = 256;  // threads of a group that uses barriers (each has its own registers while it waits)
@@ -456,6 +477,9 @@ struct GraphicsPipelineDesc {
   VertexAttribute attributes[kMaxVertexAttributes] = {};
   uint32_t attribute_count = 0;
   uint32_t varying_count = 0;  // values passed from the vertex to the fragment shader
+  bool geometry_stores = false; // the geometry shader writes storage buffers (kFeatureGeometryStores)
+  bool vertex_stores = false;    // the vertex shader writes storage buffers (kFeatureVertexStores)
+  bool fragment_stores = false;  // the fragment shader writes storage buffers (kFeatureFragmentStores): it runs for every fragment the rasterizer makes, also those the depth test then fails
   uint32_t texture_count = 0;  // texture units 0 .. n-1 the fragment shader samples (at most kMaxTextureUnits); every one must be bound before a draw
   CullMode cull_mode = CullMode::Back;
   FrontFace front_face = FrontFace::CounterClockwise;
@@ -608,6 +632,10 @@ enum DeviceFeature : uint32_t {
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
   kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
+  kFeatureGeometryStores = 1u << 26,     // geometry shaders write unordered access buffers (the same bindings as kFeatureFragmentStores); GraphicsPipelineDesc::geometry_stores
+  kFeatureVertexStores = 1u << 25,       // vertex shaders write unordered access buffers (the same bindings as kFeatureFragmentStores); GraphicsPipelineDesc::vertex_stores
+  kFeatureFragmentStores = 1u << 24,     // pixel shaders write unordered access buffers (bind_storage_buffer in the slots u0 .. u3, also inside a pass); GraphicsPipelineDesc::fragment_stores
+  kFeatureStorageInDraws = 1u << 23,     // read-only storage buffers (bind_storage_buffer in the slots after the unordered access ones, also inside a pass) read by vertex and pixel shaders
   kFeatureTimestampQueries = 1u << 22,   // QueryKind::Timestamp
   kFeatureStreamOutput = 1u << 21,       // GraphicsPipelineDesc::stream_output, ICommandBuffer::bind_stream_output, kBufferStreamOutput buffers, ShaderModuleDesc::geometry_streams
   kFeatureDepthResolve = 1u << 19,       // resolve_image of a multisampled depth image (sample 0)

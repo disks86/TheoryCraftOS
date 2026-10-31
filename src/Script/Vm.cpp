@@ -1162,7 +1162,19 @@ JsObject* Vm::new_error(ErrorKind kind, StringView message) {
       stack.append(": ");
       stack.append(message);
     }
-    stack.append("\n    at <anonymous>");
+    // the script functions that are running (the innermost first, at most 10): their names and the source line they are at
+    uint32_t shown = 0;
+    for (uint64_t i = frames_.count(); i > 0 && shown < 10; --i, ++shown) {
+      const Frame& f = frames_[i - 1];
+      stack.append("\n    at ");
+      stack.append(f.code && f.code->name && f.code->name->length ? f.code->name->view() : StringView("<anonymous>"));
+      if (f.code && f.pc > 0 && f.pc <= f.code->lines.count()) {
+        stack.append(" (line ");
+        stack.append_uint(f.code->lines[f.pc - 1]);
+        stack.append(")");
+      }
+    }
+    if (shown == 0) stack.append("\n    at <anonymous>");
     define(e, intern("stack"), Value::make_string(new_string(stack.view())), kWritable);
   }
   return e;
@@ -1992,6 +2004,17 @@ JsObject* Vm::own_symbols(JsObject* o) {
 }
 
 // The own property names of an ordinary object, in the order the language gives: integer indices ascending, then the rest as they were added.
+namespace {
+// The properties Map, Set and WeakSet mark an object with (__oid, __ws<n>): not the page's, so not among the names it gets to see.
+bool is_identity_key(StringView k) {
+  if (k.equals("__oid")) return true;
+  if (!k.starts_with("__ws") || k.size() == 4) return false;
+  for (uint64_t i = 4; i < k.size(); ++i)
+    if (k[i] < '0' || k[i] > '9') return false;
+  return true;
+}
+}  // namespace
+
 void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   List<uint32_t> indexed(allocator_);
   for (uint32_t i = 0; i < o->prop_count; ++i) {
@@ -2014,7 +2037,8 @@ void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   for (uint64_t a = 0; a < indexed.count(); ++a) array_push(names, Value::make_string(o->props[indexed[a]].key));
   for (uint32_t i = 0; i < o->prop_count; ++i) {
     uint32_t n;
-    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n)) array_push(names, Value::make_string(o->props[i].key));
+    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n) && (enumerable || !is_identity_key(o->props[i].key->view())))
+      array_push(names, Value::make_string(o->props[i].key));
   }
 }
 
@@ -3027,7 +3051,7 @@ reload:
       halt("the script ran too long");
       continue;
     }
-    if (gc_wanted_ && native_depth_ == 0 && gc_hold_ == 0) {
+    if (gc_wanted_ && native_depth_ == pass_depth_ && gc_hold_ == 0) {
       fp->pc = pc;
       collect();
     }

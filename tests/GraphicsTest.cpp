@@ -799,6 +799,170 @@ static void test_mask_cache(Rig& g) {
   CHECK(g.at(30, 30) == kWhite && g.at(0, 0) == kBlack && g.at(8, 8) == kBlack);
 }
 
+// IImage::write_rect: only the rectangle changes, the rows come `pitch` apart, and anything that does not fit is refused.
+static void test_write_rect() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  IImage* image = device.create_image({{16, 12}, Format::B8G8R8A8Unorm, kImageSampled});
+  CHECK(image != nullptr);
+  uint32_t all[16 * 12], out[16 * 12];
+  for (uint32_t& p : all) p = 0xFF112233;
+  CHECK(image->write_pixels(ArrayView<const uint32_t>(all, 16 * 12)));
+  uint32_t part[3 * 10];   // (a 4 x 3 rectangle in rows of 10)
+  for (uint32_t j = 0; j < 3; ++j)
+    for (uint32_t i = 0; i < 10; ++i) part[j * 10 + i] = 0xFF000000u | (j * 16 + i);
+  CHECK(image->write_rect({5, 6, 4, 3}, ArrayView<const uint32_t>(part, 3 * 10), 10));
+  CHECK(image->read_pixels(ArrayView<uint32_t>(out, 16 * 12)));
+  uint32_t wrong = 0;
+  for (uint32_t y = 0; y < 12; ++y)
+    for (uint32_t x = 0; x < 16; ++x) {
+      const bool inside = x >= 5 && x < 9 && y >= 6 && y < 9;
+      const uint32_t expect = inside ? part[(y - 6) * 10 + (x - 5)] : 0xFF112233u;
+      wrong += out[y * 16 + x] != expect;
+    }
+  CHECK(wrong == 0);
+  // a rectangle that is not wholly inside, an empty one, a pitch narrower than the rectangle, too few pixels
+  CHECK(!image->write_rect({14, 0, 4, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({-1, 0, 2, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 10, 2, 3}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 0, 0, 2}, ArrayView<const uint32_t>(part, 30), 10));
+  CHECK(!image->write_rect({0, 0, 4, 2}, ArrayView<const uint32_t>(part, 30), 3));
+  CHECK(!image->write_rect({0, 0, 4, 3}, ArrayView<const uint32_t>(part, 20), 10));
+  CHECK(image->write_rect({0, 0, 4, 3}, ArrayView<const uint32_t>(part, 24), 10));   // (the last row needs only its 4 pixels: 2 * 10 + 4)
+  device.destroy_image(image);
+  CHECK(a.live == 0);
+}
+
+// draw_glyph: the device renderer keeps glyphs on an atlas and tints them with the GPU; the picture is the CPU renderer's (to rounding), a glyph drawn again is not made again, and
+// glyphs mix in order with other shapes, in layers and under clips.
+static void test_glyphs() {
+  TestAllocator a;
+  SoftwareDevice device(a, nullptr);
+  DeviceRenderer2D d(device, a, {kW, kH});
+  CHECK(d.valid() && d.has_glyph_atlas());
+  Surface cs = make_surface(a, kW, kH);
+  SoftwareRenderer2D cpu(cs, nullptr, &a);
+  ArrayView<uint32_t> frame = allocate_view<uint32_t>(a, kW * kH);
+  uint8_t cov_a[10 * 12], cov_b[7 * 9];
+  for (uint32_t i = 0; i < sizeof cov_a; ++i) cov_a[i] = static_cast<uint8_t>((i * 37) % 256);
+  for (uint32_t i = 0; i < sizeof cov_b; ++i) cov_b[i] = static_cast<uint8_t>(i % 5 == 0 ? 255 : (i * 11) % 200);
+  const MaskView ma{ConstByteView(cov_a, sizeof cov_a), 10, 12, 10}, mb{ConstByteView(cov_b, sizeof cov_b), 7, 9, 7};
+  auto scene = [&](IRenderer2D& r) {
+    r.reset_clip();
+    r.clear(0xFF204060);
+    r.fill_rect({0, 0, 30, 20}, 0xFF804020);   // (colored shapes before, between and after the glyphs)
+    r.draw_glyph(1001, ma, 4, 4, 0xFFFFFFFF);
+    r.fill_rect({10, 2, 6, 6}, 0xC000FF00);
+    r.draw_glyph(1002, mb, 20, 6, 0xFFFFEE00);
+    r.draw_glyph(1001, ma, 40, 30, 0xA0FF0000);   // (the same glyph again, translucent, in another colour)
+    r.set_clip({0, 40, 64, 24});
+    r.draw_glyph(1002, mb, 58, 44, 0xFF00FFFF);   // (partly outside the clip)
+    r.reset_clip();
+    r.draw_glyph(1001, ma, -4, 50, 0xFF88FF88);   // (partly outside the target)
+    r.draw_glyph(1003, ma, 30, 50, 0x00FFFFFF);   // (transparent: nothing)
+  };
+  scene(d);
+  scene(cpu);
+  CHECK(d.read_pixels(frame));
+  uint32_t far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  CHECK(d.glyphs_made() == 2);   // (1001 and 1002; 1003 was never wanted on the screen)
+  scene(d);   // a second frame: nothing is made again
+  CHECK(d.read_pixels(frame));
+  CHECK(d.glyphs_made() == 2);
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // a new glyph on a busy atlas sends just its own rectangle, not the whole atlas
+  {
+    const uint64_t sent = d.atlas_pixels_sent();
+    d.draw_glyph(2001, mb, 0, 0, 0xFFFFFFFF);
+    CHECK(d.read_pixels(frame));
+    CHECK(d.atlas_pixels_sent() == sent + 7 * 9);
+    d.draw_glyph(2001, mb, 10, 0, 0xFFFFFFFF);   // (again: nothing more is sent)
+    d.draw_glyph(2002, ma, 20, 0, 0xFFFFFFFF);   // (two new ones: the rectangle that holds both, which is small too)
+    d.draw_glyph(2003, mb, 30, 0, 0xFFFFFFFF);
+    CHECK(d.read_pixels(frame));
+    CHECK(d.atlas_pixels_sent() > sent + 7 * 9 && d.atlas_pixels_sent() < sent + 7 * 9 + 1000);
+  }
+  // inside a layer (an offscreen group): the glyph is laid over as part of the picture
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (IRenderer2D* r : {static_cast<IRenderer2D*>(&d), static_cast<IRenderer2D*>(&cpu)}) {
+    r->push_layer({0, 0, 64, 64}, 128);
+    r->draw_glyph(1001, ma, 10, 10, 0xFFFFFFFF);
+    r->draw_glyph(1002, mb, 14, 12, 0xFFFFFFFF);   // (overlapping: one picture)
+    r->pop_layer();
+  }
+  CHECK(d.read_pixels(frame));
+  far = 0;
+  for (uint32_t y = 0; y < kH; ++y)
+    for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+  CHECK(far == 0);
+  // many glyphs: the atlas fills up and starts again, and every glyph still comes out right
+  d.clear(0xFF000000);
+  cpu.clear(0xFF000000);
+  for (uint32_t i = 0; i < 3400; ++i) {
+    uint8_t cov[16 * 16];
+    for (uint32_t k = 0; k < sizeof cov; ++k) cov[k] = static_cast<uint8_t>((k * 7 + i * 13) % 251);
+    const MaskView m{ConstByteView(cov, sizeof cov), 16, 16, 16};
+    const int32_t gx = static_cast<int32_t>(i % 4) * 16, gy = static_cast<int32_t>((i / 4) % 4) * 16;
+    d.draw_glyph(5000 + i, m, gx, gy, 0xFFFFFFFF);
+    cpu.draw_mask(m, {0, 0, 16, 16}, gx, gy, 0xFFFFFFFF);
+    if (i % 1100 == 0 || i == 3399) {   // (look at the picture now and then: the later glyphs cover the earlier ones)
+      CHECK(d.read_pixels(frame));
+      far = 0;
+      for (uint32_t y = 0; y < kH; ++y)
+        for (uint32_t x = 0; x < kW; ++x) far += !chan_near(frame[y * kW + x], px(cs, x, y), 3);
+      CHECK(far == 0);
+    }
+  }
+  release_view(a, frame);
+  release_view(a, cs.pixels);
+}
+
+// draw_image_tiled on the device renderer: a texture the sampler repeats; the CPU renderer says no.
+static void test_tiled(Rig& g, TestAllocator& a) {
+  IRenderer2D& r = *g.r;
+  Surface tile = make_surface(a, 3, 2);
+  const uint32_t colors[6] = {kRed, kGreen, kBlue, kWhite, 0xFFFFFF00, 0xFF00FFFF};
+  for (uint32_t i = 0; i < 6; ++i) tile.pixels[i] = colors[i];
+  // cells of the tile's own size: pixel (x, y) shows tile pixel ((x - 5) mod 3, (y - 4) mod 2), inside the area only
+  g.reset();
+  CHECK(r.draw_image_tiled(tile, 5, 4, 3, 2, {2, 3, 20, 9}));
+  g.read();
+  uint32_t wrong = 0;
+  for (int32_t y = 0; y < 64; ++y)
+    for (int32_t x = 0; x < 64; ++x) {
+      const bool inside = x >= 2 && x < 22 && y >= 3 && y < 12;
+      const int32_t tx = ((x - 5) % 3 + 3) % 3, ty = ((y - 4) % 2 + 2) % 2;
+      wrong += g.at(x, y) != (inside ? colors[ty * 3 + tx] : kBlack);
+    }
+  CHECK(wrong == 0);
+  // cells twice as big: each texel is 2 x 2 pixels
+  g.reset();
+  CHECK(r.draw_image_tiled(tile, 0, 0, 6, 4, {0, 0, 24, 8}));
+  g.read();
+  wrong = 0;
+  for (int32_t y = 0; y < 8; ++y)
+    for (int32_t x = 0; x < 24; ++x) wrong += g.at(x, y) != colors[((y % 4) / 2) * 3 + ((x % 6) / 2)];
+  CHECK(wrong == 0);
+  // translucent texels blend over what is there; a clip limits the area; an empty area draws nothing
+  tile.pixels[0] = 0x80FF0000;
+  g.reset();
+  r.fill_rect({0, 0, 64, 64}, kBlue);
+  r.push_clip_rect({4, 4, 6, 4});
+  CHECK(r.draw_image_tiled(tile, 4, 4, 3, 2, {0, 0, 64, 64}));
+  r.pop_clip();
+  CHECK(r.draw_image_tiled(tile, 0, 0, 3, 2, {10, 10, 0, 5}));
+  g.read();
+  CHECK(chan_near(g.at(4, 4), blend_over(0x80FF0000, kBlue), 1) && g.at(5, 4) == kGreen && g.at(3, 4) == kBlue && g.at(10, 4) == kBlue && g.at(4, 8) == kBlue);
+  release_view(a, tile.pixels);
+}
+
 static void test_gradients(Rig& g) {
   IRenderer2D& r = *g.r;
   const GradientStop rb[2] = {{0, kRed}, {1, kBlue}};
@@ -1226,6 +1390,7 @@ static void test_primitives() {
     test_scaled(g, a);
     test_transformed(g, a);
     test_groups(g);
+    test_tiled(g, a);
     test_mask_cache(g);
     test_gradients(g);
     test_clip_stack(g, a);
@@ -1860,6 +2025,8 @@ int main() {
   test_fast_paths();
   test_primitives();
   test_renderers_agree();
+  test_write_rect();
+  test_glyphs();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("graphics: all checks passed\n");
   return 0;

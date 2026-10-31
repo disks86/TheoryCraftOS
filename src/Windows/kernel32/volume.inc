@@ -694,3 +694,36 @@ EXPORT LONG WINAPI GetDiskSpaceInformationA(LPCSTR root, TCOS_DISK_SPACE_INFORMA
   free_wide(w);
   return result;
 }
+
+/* ---- the name of an open file ---------------------------------------------------------------------------------------------------------------------------- */
+
+/* GetFinalPathNameByHandle: the file system gives the path on the volume ("\dir\file", in the spelling of the directory, with the links in it followed); the flags say how the
+ * volume is written in front of it: VOLUME_NAME_DOS 0 ("\\?\C:"), _GUID 1, _NT 2 ("\Device\HarddiskVolume1") or _NONE 4. A result that does not fit is not written, the call answers
+ * the size needed with the NUL. */
+EXPORT DWORD WINAPI GetFinalPathNameByHandleW(HANDLE h, LPWSTR buffer, DWORD capacity, DWORD flags) {
+  if (flags & ~0xFu || (flags & 3) == 3) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  IO_STATUS_BLOCK iosb;
+  BYTE info[4 + PATH_CHARS * 2];
+  const NTSTATUS status = NtQueryInformationFile(h, &iosb, info, sizeof(info), 9);      /* FileNameInformation: the path on the volume */
+  if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
+  const DWORD units = *(DWORD *)info / 2;
+  const WCHAR *prefix = (flags & 4) ? W_("") : (flags & 3) == 1 ? W_("\\\\?\\Volume{544f5343-0000-4000-8000-000000000001}") : (flags & 3) == 2 ? VOLUME_DEVICE : W_("\\\\?\\C:");
+  const DWORD prefix_units = vol_len(prefix);
+  const DWORD needed = prefix_units + units;
+  if (needed + 1 > capacity) return needed + 1;
+  memcpy(buffer, prefix, prefix_units * 2);
+  memcpy(buffer + prefix_units, info + 4, units * 2);
+  buffer[needed] = 0;
+  return needed;
+}
+EXPORT DWORD WINAPI GetFinalPathNameByHandleA(HANDLE h, LPSTR buffer, DWORD capacity, DWORD flags) {
+  WCHAR wide[PATH_CHARS + 64];
+  const DWORD n = GetFinalPathNameByHandleW(h, wide, PATH_CHARS + 64, flags);
+  if (n == 0 || n >= PATH_CHARS + 64) return n == 0 ? 0 : n;
+  const int need = WideCharToMultiByte(CP_UTF8, 0, wide, (int)n, NULL, 0, NULL, NULL);
+  if (need < 0) return 0;
+  if ((DWORD)need >= capacity) return (DWORD)need;
+  WideCharToMultiByte(CP_UTF8, 0, wide, (int)n, buffer, (int)capacity, NULL, NULL);
+  buffer[need] = 0;
+  return (DWORD)need;
+}

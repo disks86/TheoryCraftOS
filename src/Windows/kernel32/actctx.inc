@@ -245,7 +245,9 @@ EXPORT BOOL WINAPI QueryActCtxSettingsW(DWORD flags, HANDLE h, LPCWSTR ns, LPCWS
 
 /* The path a bare library name is redirected to by the active activation context (the process default when none is active): the directory of the assembly that has the file,
  * and the file's name. */
-static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity) {
+static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity) { return actctx_redirect_key(name, out, capacity, TRUE); }
+/* `append_dll`: a name without a dot is looked up as "name.dll" (otherwise as it is: a file of the manifest may be listed without an extension). */
+static BOOL actctx_redirect_key(LPCWSTR name, WCHAR *out, DWORD capacity, BOOL append_dll) {
   if (!name || !name[0]) return FALSE;
   const SIZE_T n = wcslen(name);
   WCHAR key[PATH_CHARS];
@@ -253,7 +255,7 @@ static BOOL actctx_redirect(LPCWSTR name, WCHAR *out, DWORD capacity) {
   memcpy(key, name, (n + 1) * 2);
   BOOL has_dot = FALSE;
   for (SIZE_T i = 0; i < n; ++i) if (name[i] == '.') has_dot = TRUE;
-  if (!has_dot) { memcpy(key + n, L".dll", 10); }
+  if (!has_dot && append_dll) { memcpy(key + n, L".dll", 10); }
   struct { ULONG size, version; PVOID data; ULONG length; PVOID global; ULONG global_length; PVOID base; ULONG total; PVOID context; ULONG roster; } keyed;
   memset(&keyed, 0, sizeof(keyed));
   keyed.size = sizeof(keyed);

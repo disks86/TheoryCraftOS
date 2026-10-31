@@ -48,6 +48,7 @@ class Allocation {
   uint64_t device_bytes() const { return device_bytes_; }
   const AllocationDesc& desc() const { return desc_; }
   bool is_buffer() const { return (desc_.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0; }
+  bool reserved() const { return reserved_; }   // a reserved (tiled) buffer: see kAllocReserved
   bool is_heap() const { return (desc_.flags & kAllocHeap) != 0; }
   bool placed() const { return static_cast<bool>(heap_); }   // its backing is a part of a heap's memory
   const SharedPointer<Allocation>& heap() const { return heap_; }
@@ -91,6 +92,12 @@ class Allocation {
   SharedPointer<Allocation> heap_;     // placed: the heap (kept alive by it)
   uint64_t heap_offset_ = 0;
   List<Allocation*> placed_;           // a heap: the allocations placed in it
+  struct TileBinding {
+    SharedPointer<Allocation> heap;
+    uint64_t offset = 0;
+  };
+  List<TileBinding> tiles_;            // a reserved buffer: where each of its tiles is (a null heap: nowhere)
+  bool reserved_ = false;
   bool state_tracked_ = false;
   uint32_t state_ = 0;
   uint64_t so_filled_ = 0;   // a stream output buffer: how far the last stream output into it got (kept while the device object is gone)
@@ -136,6 +143,9 @@ class VidMm {
   // `switch_alias` (the aliasing barrier) says the use passes from `outgoing` to `incoming`: what the GPU holds for the first is written to the memory, the second is uploaded from it.
   // The GPU must have run what was recorded before it.
   bool switch_alias(Allocation& outgoing, Allocation& incoming);
+  // Reserved buffers: `count` tiles from `first` are put at `heap_offset` (a multiple of kTileBytes) of `heap` on, or nowhere (a null heap). The buffer's contents are gathered from the tiles whenever
+  // the device or the CPU takes them and scattered back when the GPU's or the CPU's writes arrive.
+  NtStatus map_tiles(Allocation& reserved, uint32_t first, const SharedPointer<Allocation>& heap, uint64_t heap_offset, uint32_t count);
   void note_cpu_write(Allocation& a);
   void note_gpu_write(Allocation& a);
   // The backing has been thrown away by the caller (a discard lock): the GPU's contents are no longer wanted.
@@ -155,6 +165,8 @@ class VidMm {
   friend class Allocation;
   void forget(Allocation& a);   // called by ~Allocation
   bool upload(Allocation& a);
+  void gather_tiles(Allocation& a);
+  void scatter_tiles(Allocation& a);
   void release_device_object(Allocation& a);
   bool evict_for(uint64_t needed, const Allocation* keep);
   bool create_device_object(Allocation& a);

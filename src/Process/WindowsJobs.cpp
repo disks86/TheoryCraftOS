@@ -49,6 +49,11 @@ uint32_t nt_assign_process_to_job_object(Process& p, const SyscallRequest& r) {
   const uint32_t job = job_of_handle(p, r.args[0]);
   uint64_t pid = 0;
   if (job == 0 || !pid_of_handle(p, r.args[1], &pid)) return kInvalidHandle;
+  if (r.args[1] != kCurrentProcess) {      // a process that has ended cannot be put into a job
+    bool exited = false;
+    uint32_t code = 0;
+    if (process_handle_info(p, r.args[1], &exited, &code, &pid) && exited) return kProcessNotInJobStatus;
+  }
   return objects->job_assign(job, pid);
 }
 
@@ -101,7 +106,7 @@ uint32_t nt_query_information_job_object(Process& p, const SyscallRequest& r) {
     case 2: basic_limits(); size = 64; break;
     case 3: {
       const uint32_t fit = length >= 8 ? (length - 8) / 8 : 0, listed = pid_count < fit ? pid_count : fit;
-      if (length < 8) return kInfoLengthMismatch;
+      if (length < 16) return kInfoLengthMismatch;      // (room for one process id at least)
       uint8_t list[8 + 8 * ObjectManager::kJobMaxMembers] = {};
       put(list, 0, pid_count, 4);
       put(list, 4, listed, 4);
@@ -118,6 +123,15 @@ uint32_t nt_query_information_job_object(Process& p, const SyscallRequest& r) {
       put(b, 112, info.process_memory_limit, 8); put(b, 120, info.job_memory_limit, 8);
       size = 144;
       break;
+    case 0x80: {      // this OS's own class: the oldest event of the completion port (message, process id, key)
+      uint32_t message = 0;
+      uint64_t pid = 0, key = 0;
+      if (length < 24) return kInfoLengthMismatch;
+      if (!objects->job_take_event(job, &message, &pid, &key)) return 0x8000001Au;      // STATUS_NO_MORE_ENTRIES
+      put(b, 0, message, 4); put(b, 8, pid, 8); put(b, 16, key, 8);
+      size = 24;
+      break;
+    }
     default: return info_class == 7 ? kNotSupported : kInvalidInfoClass;
   }
   if (returned != 0 && !p.write_user_u32(returned, size)) return kAccessViolation;
@@ -149,7 +163,11 @@ uint32_t nt_set_information_job_object(Process& p, const SyscallRequest& r) {
     case 6:
       if (length != 4) return kInfoLengthMismatch;
       return p.read_user(r.args[2], ByteView(b, 4)) ? kSuccess : kAccessViolation;      // (accepted; nothing about windows or time is enforced)
-    case 7: return kNotSupported;
+    case 7: {      // JobObjectAssociateCompletionPortInformation { CompletionKey, CompletionPort }: the port itself lives with the program that made it (kernel32 reads the events)
+      if (length != 16) return kInfoLengthMismatch;
+      if (!p.read_user(r.args[2], ByteView(b, 16))) return kAccessViolation;
+      return objects->job_set_port(job, get(b, 0, 8), get(b, 8, 8) != 0);
+    }
     default: return kInvalidInfoClass;
   }
 }

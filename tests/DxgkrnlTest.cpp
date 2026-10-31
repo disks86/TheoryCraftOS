@@ -2750,7 +2750,7 @@ void test_dxbc_real() {
           graphics::ShaderIo io;
           p->run_vertex(v, constants, &io);
           // (a compute shader, on buffers that are a little too small for what it does)
-          uint8_t storage[4][64] = {};
+          uint8_t storage[graphics::kMaxStorageBuffers][64] = {};
           graphics::ComputeContext context;
           for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k) context.buffers[k] = ByteView(storage[k], sizeof storage[k]);
           context.dispatch_id[0] = context.dispatch_id[1] = 5;
@@ -4930,6 +4930,365 @@ void test_d3d12_compute() {
   CHECK(run([&](CommandWriter& w) { w.set_root_descriptor(1, 0, 0); w.set_root_descriptor(2, 1, 0); w.set_root_table(3, 2); w.set_root_descriptor(1, 2, 2); }) == status::kInvalidParameter);   // (offset not a multiple of 4... 2)
 }
 
+
+// Shader resource views of buffers: a root descriptor (t0) and a table entry (t1) reach a compute shader as read-only storage buffers.
+void test_d3d12_buffer_views() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle cs = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Compute, sd.code = ConstByteView(b::k_dxil_cs_srv, sizeof b::k_dxil_cs_srv);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &cs) == status::kSuccess);
+  PipelineDesc pd;
+  pd.compute_shader = cs;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle dst = e.buffer(kAllocUnorderedAccess, 4096), src = e.buffer(kAllocUnorderedAccess, 16384), raw = e.buffer(kAllocUnorderedAccess, 4096);
+  std::vector<uint32_t> a(4096), r(1024);
+  for (uint32_t i = 0; i < a.size(); ++i) a[i] = 0x01010101u * (i % 251) + i * 7;
+  for (uint32_t i = 0; i < r.size(); ++i) r[i] = 0x9E3779B9u * (i + 1);
+  CHECK(e.write(src, ConstByteView(reinterpret_cast<const uint8_t*>(a.data()), 16384)) && e.write(raw, ConstByteView(reinterpret_cast<const uint8_t*>(r.data()), 4096)));
+  const std::vector<uint8_t> blob = serialize_signature(1, {{4, 0, {}, 0, 0, 0}, {3, 0, {}, 0, 0, 0}, {0, 0, {{0, 1, 1, 0, 0}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 2, &views) == status::kSuccess);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = raw;
+  CHECK(e.kernel.write_descriptor(kPid, views, 1, srv) == status::kSuccess);
+  auto run = [&](Handle root_src) {
+    CommandWriter w(e.allocator);
+    w.set_root_signature(sig);
+    w.set_descriptor_heaps({views});
+    w.set_root_descriptor(0, 0, 0);
+    w.set_root_descriptor(1, root_src, 0);
+    w.set_root_table(2, 1);
+    w.bind_pipeline(pipe);
+    w.dispatch(4, 8, 1);
+    return w.ok() ? e.render(w, {dst, src, raw}) : status::kNoMemory;
+  };
+  CHECK(run(1) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, dst, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  bool same = true;
+  for (uint32_t i = 0; i < 1024; ++i) same = same && in.le32() == a[4 * i] + a[4 * i + 3] * 3 + r[i] + (r[1023 - i] ^ a[4 * i + 1]);
+  CHECK(same);
+  e.kernel.unlock(kPid, dst);
+  // A texture is not a buffer view; a buffer that is not a storage buffer is no root SRV.
+  Handle vb = e.buffer(kAllocVertexBuffer, 4096);
+  CHECK(run(vb) == status::kInvalidParameter);
+}
+
+
+// Reserved (tiled) textures: 128 x 128 tiles of 4-byte pixels mapped to places in a heap.
+void test_d3d12_reserved_texture() {
+  Env e;
+  auto create = [&](uint32_t flags, uint32_t width, uint32_t height, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.format = Format::A8R8G8B8, d.width = width, d.height = height, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, p = 0, q = 0, r = 0, none = 0;
+  CHECK(create(kAllocHeap, 0, 0, 0, 0, &heap) == status::kInvalidParameter);   // (a heap has a size, not a shape)
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 4 * kTileBytes;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, hd, &heap) == status::kSuccess);
+  CHECK(create(kAllocTexture, 128, 128, heap, 0, &p) == status::kSuccess && create(kAllocTexture, 128, 128, heap, 2 * kTileBytes, &q) == status::kSuccess);
+  CHECK(create(kAllocTexture | kAllocReserved, 256, 256, 0, 0, &r) == status::kSuccess);
+  CHECK(create(kAllocTexture | kAllocReserved, 200, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture | kAllocRenderTarget | kAllocReserved, 256, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 256, heap, 0, &none) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 3, heap, 2 * kTileBytes, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 4, heap, 0, 1) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, r, 0, heap, 3 * kTileBytes, 2) == status::kInvalidParameter);
+  CHECK(e.fill(p, 0xFF112233u) && e.fill(q, 0xFF445566u));
+  // Reading it: tile 0 holds what the placed texture at the start of the heap does, tile 3 the other, the tiles between nothing.
+  CHECK(e.pixel(r, 10, 10) == 0xFF112233u && e.pixel(r, 127, 127) == 0xFF112233u && e.pixel(r, 128, 128) == 0xFF445566u && e.pixel(r, 255, 255) == 0xFF445566u);
+  CHECK(e.pixel(r, 200, 10) == 0 && e.pixel(r, 10, 200) == 0);
+  // Writing a pixel of tile 3 through the reserved texture: the placed texture shows it at the same place of its own; a write to an unmapped tile is dropped.
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, r, 0, 0, &lock) == status::kSuccess);
+  const uint32_t mark = 0xFF778899u;
+  ByteWriter(lock.data.subview((200u * 256 + 200) * 4, 4)).le32(mark);
+  ByteWriter(lock.data.subview((10u * 256 + 200) * 4, 4)).le32(mark);
+  e.kernel.unlock(kPid, r);
+  CHECK(e.pixel(q, 72, 72) == mark && e.pixel(r, 200, 10) == 0);
+  // And the GPU reads it: a triangle that shows the texture over the target gives one quadrant of each kind (two black, one of each colour).
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 20);
+  Handle pipe = make_colored_pipeline(e, true);
+  const float quad[15] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(vb, floats(quad, 15)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(floats(identity, 16));
+  w.bind_texture(0, 1, graphics::SamplerDesc());
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, r, vb}) == status::kSuccess);
+  unsigned first = 0, second = 0, black = 0;
+  for (uint32_t y : {2u, 6u})
+    for (uint32_t x : {2u, 6u}) {
+      const uint32_t c = e.pixel(target, x, y);
+      first += c == 0xFF112233u, second += c == 0xFF445566u || c == mark, black += (c & 0xFFFFFF) == 0;
+    }
+  CHECK(first == 1 && second == 1 && black == 2);
+}
+
+
+// Views of buffers in a draw through a root signature: the root descriptor (t0) and a table entry (t1) reach the pixel shader, and the picture is the one a direct bind gives.
+void test_d3d12_buffer_views_in_draw() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_dxil_ps_srv, sizeof b::k_dxil_ps_srv);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float tri[21] = {-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1, 3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1, -1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1};
+  CHECK(e.write(vb, floats(tri, 21)));
+  Handle structured = e.buffer(kAllocUnorderedAccess, 32 * 16), raw = e.buffer(kAllocUnorderedAccess, 64);
+  std::vector<uint32_t> a(32 * 4), r(16);
+  for (uint32_t i = 0; i < a.size(); ++i) a[i] = 0x9E3779B9u * (i + 1);
+  for (uint32_t i = 0; i < r.size(); ++i) r[i] = 0x85EBCA6Bu * (i + 3);
+  CHECK(e.write(structured, ConstByteView(reinterpret_cast<const uint8_t*>(a.data()), 512)) && e.write(raw, ConstByteView(reinterpret_cast<const uint8_t*>(r.data()), 64)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  // direct
+  {
+    CommandWriter w(e.allocator);
+    w.bind_uav(graphics::kMaxUavBuffers, 2, 0, 512);
+    w.bind_uav(graphics::kMaxUavBuffers + 1, 3, 0, 64);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, structured, raw}) == status::kSuccess);
+  }
+  std::vector<uint32_t> direct;
+  for (uint32_t y = 0; y < 8; ++y)
+    for (uint32_t x = 0; x < 8; ++x) direct.push_back(e.pixel(target, x, y));
+  CHECK(direct[4 * 8 + 4] != 0);
+  // through a root signature: t0 a root descriptor, t1 a table entry
+  const std::vector<uint8_t> blob = serialize_signature(1, {{3, 0, {}, 0, 0, 0}, {0, 0, {{0, 1, 1, 0, 0}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 1, &views) == status::kSuccess);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = raw;
+  CHECK(e.kernel.write_descriptor(kPid, views, 0, srv) == status::kSuccess);
+  CommandWriter w(e.allocator);
+  w.set_root_signature(sig);
+  w.set_descriptor_heaps({views});
+  w.set_root_descriptor(0, 2, 0);
+  w.set_root_table(1, 0);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, structured, raw}) == status::kSuccess);
+  bool same = true;
+  for (uint32_t y = 0; y < 8; ++y)
+    for (uint32_t x = 0; x < 8; ++x) same = same && e.pixel(target, x, y) == direct[y * 8 + x];
+  CHECK(same);
+  // A draw whose shader reads a view nobody bound is refused.
+  CommandWriter bad(e.allocator);
+  bad.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  bad.bind_pipeline(pipe);
+  bad.bind_vertex_buffer(1);
+  bad.push_constants(floats(identity, 16));
+  bad.draw(3);
+  bad.end_pass();
+  CHECK(e.render(bad, {target, vb}) == status::kInvalidParameter);
+}
+
+
+// Pixel shaders that write buffers (RWStructuredBuffer, RWByteAddressBuffer with atomics): every pixel writes its place, and the draw leaves the counters at the number of pixels.
+void test_pixel_shader_stores() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_dxil_ps_uav, sizeof b::k_dxil_ps_uav);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float tri[21] = {-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1, 3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1, -1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1};
+  CHECK(e.write(vb, floats(tri, 21)));
+  Handle picture = e.buffer(kAllocUnorderedAccess, 1024 * 16), counters = e.buffer(kAllocUnorderedAccess, 16);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.bind_uav(0, 2, 0, 1024 * 16);
+  w.bind_uav(1, 3, 0, 16);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, picture, counters}) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, picture, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  bool placed = true;
+  for (uint32_t i = 0; i < 1024; ++i) {
+    const uint32_t x = in.le32(), y = in.le32();
+    in.le32();
+    const uint32_t last = in.le32();
+    placed = placed && x == i % 32 && y == i / 32 && last == i * 7 + 1;
+  }
+  CHECK(placed);
+  e.kernel.unlock(kPid, picture);
+  CHECK(e.kernel.lock(kPid, counters, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader counted(lock.data);
+  CHECK(counted.le32() == 1024 && counted.le32() == 1536);
+  e.kernel.unlock(kPid, counters);
+  CHECK(e.pixel(target, 5, 5) != 0);
+  // With a depth test that every fragment fails the shader still runs (its writes are not the depth test's to stop), and nothing is drawn.
+  Handle depth = e.alloc(kAllocDepthStencil, Format::D32Float, 32, 32), blocked = 0;
+  PipelineDesc dpd = pd;
+  dpd.depth_test = dpd.depth_write = true;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, dpd, &blocked) == status::kSuccess);
+  CommandWriter w2(e.allocator);
+  w2.bind_uav(0, 3, 0, 1024 * 16);
+  w2.bind_uav(1, 4, 0, 16);
+  w2.begin_pass(0, 2, kPassClearColor | kPassClearDepth, {0, 0, 0, 1}, 0.0f, 0);
+  w2.bind_pipeline(blocked);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(identity, 16));
+  w2.draw(3);
+  w2.end_pass();
+  CHECK(e.render(w2, {target, vb, depth, picture, counters}) == status::kSuccess);
+  CHECK(e.pixel(target, 5, 5) == 0xFF000000u);
+  CHECK(e.kernel.lock(kPid, counters, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader again(lock.data);
+  CHECK(again.le32() == 2048 && again.le32() == 3072);
+  e.kernel.unlock(kPid, counters);
+}
+
+
+
+// Vertex shaders that write buffers: each vertex logs itself at its number and bumps a counter.
+void test_vertex_shader_stores() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_dxil_vs_uav, sizeof b::k_dxil_vs_uav);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float tri[21] = {-0.5f, -0.25f, 0.5f, 0.9f, 0.3f, 0.2f, 1, 0.75f, -0.5f, 0.5f, 0.1f, 0.8f, 0.4f, 1, -0.125f, 0.5f, 0.5f, 0.4f, 0.2f, 0.9f, 1};
+  CHECK(e.write(vb, floats(tri, 21)));
+  Handle log = e.buffer(kAllocUnorderedAccess, 3 * 16), counter = e.buffer(kAllocUnorderedAccess, 16);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.bind_uav(0, 2, 0, 3 * 16);
+  w.bind_uav(1, 3, 0, 16);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, log, counter}) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, log, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  bool same = true;
+  for (uint32_t v = 0; v < 3; ++v) {
+    const float x = __builtin_bit_cast(float, in.le32()), y = __builtin_bit_cast(float, in.le32()), z = __builtin_bit_cast(float, in.le32()), id = __builtin_bit_cast(float, in.le32());
+    same = same && x == tri[7 * v] && y == tri[7 * v + 1] && z == tri[7 * v + 2] && id == static_cast<float>(v);
+  }
+  CHECK(same);
+  e.kernel.unlock(kPid, log);
+  CHECK(e.kernel.lock(kPid, counter, kLockReadOnly, 0, &lock) == status::kSuccess);
+  CHECK(ByteReader(lock.data).le32() == 3);
+  e.kernel.unlock(kPid, counter);
+  CHECK(e.pixel(target, 4, 4) != 0);
+}
+
+
+// Geometry shaders that write buffers: each triangle logs its first two corners at the place its colour names and bumps a counter.
+void test_geometry_shader_stores() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, gs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Geometry, sd.code = ConstByteView(b::k_dxil_gs_uav, sizeof b::k_dxil_gs_uav);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &gs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.geometry_shader = gs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  // two triangles, the first with colour.x 3/255 and the second 7/255
+  float v[42];
+  const float corners[2][3][2] = {{{-0.5f, -0.5f}, {0.5f, -0.5f}, {0, 0.5f}}, {{-0.25f, -0.25f}, {0.25f, -0.25f}, {0, 0.25f}}};
+  for (uint32_t t = 0; t < 2; ++t)
+    for (uint32_t k = 0; k < 3; ++k) {
+      float* o = v + 7 * (3 * t + k);
+      o[0] = corners[t][k][0], o[1] = corners[t][k][1], o[2] = 0.5f, o[3] = (t == 0 ? 3.0f : 7.0f) / 255.0f, o[4] = 0.5f, o[5] = 0.5f, o[6] = 1;
+    }
+  CHECK(e.write(vb, floats(v, 42)));
+  Handle log = e.buffer(kAllocUnorderedAccess, 16 * 16), counter = e.buffer(kAllocUnorderedAccess, 16);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.bind_uav(0, 2, 0, 16 * 16);
+  w.bind_uav(1, 3, 0, 16);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(6);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, log, counter}) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, log, kLockReadOnly, 0, &lock) == status::kSuccess);
+  float words[64];
+  ByteReader in(lock.data);
+  for (float& f : words) f = __builtin_bit_cast(float, in.le32());
+  e.kernel.unlock(kPid, log);
+  auto near = [](float a, float b) { return __builtin_fabsf(a - b) < 1e-4f; };
+  // (the geometry shader sees positions with Y as the devices want it, down: the sign of y is turned back for the shader; the logged y is the vertex shader's)
+  CHECK(near(words[4 * 3], corners[0][0][0]) && near(words[4 * 3 + 1], corners[0][0][1]) && near(words[4 * 3 + 2], corners[0][1][0]) && near(words[4 * 3 + 3], corners[0][1][1]));
+  CHECK(near(words[4 * 7], corners[1][0][0]) && near(words[4 * 7 + 1], corners[1][0][1]) && near(words[4 * 7 + 2], corners[1][1][0]) && near(words[4 * 7 + 3], corners[1][1][1]));
+  CHECK(e.kernel.lock(kPid, counter, kLockReadOnly, 0, &lock) == status::kSuccess);
+  CHECK(ByteReader(lock.data).le32() == 2);
+  e.kernel.unlock(kPid, counter);
+  CHECK(e.pixel(target, 4, 4) != 0);
+}
+
 // Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
 void test_d3d12_barriers() {
   Env e;
@@ -5091,6 +5450,1045 @@ void test_d3d12_heaps() {
   CHECK(e.pixel(b_texture, 0, 0) == 0xFF00FF00u);
 }
 
+
+// --- DXIL (Shader Model 6): the same HLSL compiled by fxc to DXBC and by dxc to DXIL must give the same results -----------------------------------------------------------------
+
+struct DxilTextures final : graphics::ITextureSet {
+  graphics::Vec4 sample(uint32_t unit, float u, float v) const override { return {u, v, 0.25f + 0.1f * static_cast<float>(unit), 1.0f}; }
+  graphics::Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const override { return {u * 0.5f, v * 0.5f, lod * 0.125f, 0.5f + 0.1f * static_cast<float>(unit)}; }
+  graphics::Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const override { return {x * 0.0625f, y * 0.125f, static_cast<float>(level) * 0.25f, 0.75f + static_cast<float>(unit) * 0.0625f}; }
+  bool size(uint32_t, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+    *width = 8u >> level, *height = 4u >> level, *levels = 3;
+    return level < 3;
+  }
+};
+
+bool close_to(float a, float b) {
+  if (a != a || b != b) return a != a && b != b;
+  const float scale = 1.0f + (a < 0 ? -a : a);
+  return (a - b < 0 ? b - a : a - b) <= 2e-4f * scale;
+}
+
+// gather4_po: the offset of the footprint in a register. The shader is assembled here (the compilers in reach do not make one): r1 = ftoi(v0.xy * 16 - 4); o0 = the red of the four texels
+// of the footprint moved by r1. The same bytes are tests/data/dxbc/gather_po.dxbc, which the conformance scenes carry (GEN_GATHER_PO=<path> writes it).
+std::vector<uint8_t> gather_po_shader() {
+  DxbcAsm a = dx_pixel_shader();
+  a.version_major = 4;
+  a.constant_buffer = 0;
+  a.ins(88, {dx_resource(0)}, 3u << 11);   // dcl_resource_texture2d t0
+  a.ins(56, {dx_dst(kOpTemp, 1, 0x3), dx_src(kOpInput, 0), dx_imm(16, 16, 16, 16)});
+  a.ins(0, {dx_dst(kOpTemp, 1, 0x3), dx_src(kOpTemp, 1), dx_imm(-4, -4, -4, -4)});
+  a.ins(27, {dx_dst(kOpTemp, 1, 0x3), dx_src(kOpTemp, 1)});   // ftoi
+  a.ins(127, {dx_dst(kOpTemp, 0, 0xF), dx_src(kOpInput, 2), dx_src(kOpTemp, 1), dx_resource(0, 0x00), dx_sampler(0)});   // gather4_po r0, v2, r1, t0.xxxx, s0
+  a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 0)});
+  a.ins(62, {});
+  return a.build();
+}
+
+void test_gather_register_offsets() {
+  HostAllocator allocator;
+  const std::vector<uint8_t> bytes = gather_po_shader();
+  if (const char* path = getenv("GEN_GATHER_PO")) {
+    if (FILE* f = fopen(path, "wb")) {
+      fwrite(bytes.data(), 1, bytes.size(), f);
+      fclose(f);
+    }
+  }
+  const std::vector<uint8_t> shipped = read_blob("gather_po.dxbc");
+  CHECK(shipped == bytes);   // (the blob of the conformance scenes is this shader)
+  NtStatus st = 0;
+  UniquePointer<D3d9Program> p = compile_dxbc(allocator, bytes, &st);
+  CHECK(st == status::kSuccess && p);
+  if (!p) return;
+  DxilTextures textures;
+  uint32_t seed = 99;
+  auto random = [&](float low, float high) {
+    seed = seed * 1664525u + 1013904223u;
+    return low + (high - low) * static_cast<float>(seed >> 8) / static_cast<float>(1u << 24);
+  };
+  for (uint32_t n = 0; n < 200; ++n) {
+    graphics::Vec4 varyings[4] = {};
+    varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
+    varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+    uint8_t constants[128] = {};
+    graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+    CHECK(p->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room));
+    const int ox = static_cast<int>(varyings[0].x * 16.0f - 4.0f), oy = static_cast<int>(varyings[0].y * 16.0f - 4.0f);
+    const float x = __builtin_floorf(varyings[2].x * 8.0f - 0.5f) + static_cast<float>(ox), y = __builtin_floorf(varyings[2].y * 4.0f - 0.5f) + static_cast<float>(oy);
+    (void)y;
+    const float xs[4] = {x, x + 1, x + 1, x};
+    CHECK(close_to(room[0].x, (xs[0] + 0.5f) / 16.0f) && close_to(room[0].y, (xs[1] + 0.5f) / 16.0f) && close_to(room[0].z, (xs[2] + 0.5f) / 16.0f) && close_to(room[0].w, (xs[3] + 0.5f) / 16.0f));
+  }
+}
+
+void test_dxil() {
+  HostAllocator allocator;
+  uint32_t seed = 12345;
+  auto random = [&](float low, float high) {
+    seed = seed * 1664525u + 1013904223u;
+    return low + (high - low) * static_cast<float>(seed >> 8) / static_cast<float>(1u << 24);
+  };
+  auto load = [&](const char* name, UniquePointer<D3d9Program>* program) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    const NtStatus st = D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), blob.size()), program);
+    if (st != status::kSuccess) printf("  %s: compile status %x\n", name, static_cast<unsigned>(st));
+    return st == status::kSuccess && *program;
+  };
+  DxilTextures textures;
+  // The pixel shaders: the same varyings, the same colour (and the same pixel killed).
+  for (const char* name : {"dxil_ps_math", "dxil_ps_tex", "dxil_ps_flow", "dxil_ps_loop", "dxil_ps_loop2"}) {
+    UniquePointer<D3d9Program> reference, translated;
+    const std::string base(name);
+    CHECK(load((base + ".dxbc").c_str(), &reference) && load((base + ".dxil").c_str(), &translated));
+    if (!reference || !translated) continue;
+    CHECK(translated->stage() == graphics::ShaderStage::Fragment && translated->color_output_count() == 1);
+    unsigned alive_count = 0;
+    for (uint32_t n = 0; n < 200; ++n) {
+      graphics::Vec4 varyings[4] = {};
+      varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
+      varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+      graphics::FragmentContext context;
+      context.position = {random(0, 32), random(0, 32), random(0, 1), 1};
+      graphics::Vec4 a_room[graphics::kMaxColorTargets] = {}, b_room[graphics::kMaxColorTargets] = {};
+      uint8_t constants[128] = {};
+      const bool a_alive = reference->run_fragment_ex(varyings, context, constants, &textures, a_room);
+      const bool b_alive = translated->run_fragment_ex(varyings, context, constants, &textures, b_room);
+      CHECK(a_alive == b_alive);
+      alive_count += a_alive;
+      if (a_alive && b_alive) {
+        const bool same = close_to(a_room[0].x, b_room[0].x) && close_to(a_room[0].y, b_room[0].y) && close_to(a_room[0].z, b_room[0].z) && close_to(a_room[0].w, b_room[0].w);
+        if (!same && n < 3) printf("  %s #%u: %g %g %g %g vs %g %g %g %g\n", name, n, a_room[0].x, a_room[0].y, a_room[0].z, a_room[0].w, b_room[0].x, b_room[0].y, b_room[0].z, b_room[0].w);
+        CHECK(same);
+      }
+    }
+    CHECK(alive_count > 20);   // (the test is about colours, not about every pixel being killed)
+    printf("  dxil %s: 200 pixels compared, %u not killed\n", name, alive_count);
+  }
+
+  // The shader the old compiler cannot make (a switch, signed division, tan and the hyperbolic functions, an early return): compared with the same function in C++.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_more.dxil", &translated));
+    if (translated) {
+      unsigned early = 0, checked = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
+        varyings[2] = {n % 7 == 0 ? random(0, 0.1f) : random(0, 1), random(0, 1), 0, 0};
+        const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        float want[4];
+        if (tx < 0.1f) {
+          want[0] = cx, want[1] = cy, want[2] = cz, want[3] = 0.5f;
+          ++early;
+        } else {
+          const int a = static_cast<int>(cx * 20.0f - 8.0f), b = static_cast<int>(ty * 6.0f) - 3, d = b == 0 ? 1 : b;
+          want[0] = static_cast<float>(a / d) + static_cast<float>(a % d) * 0.25f;
+          want[1] = __builtin_tanf(cy * 0.5f) + __builtin_coshf(cz * 0.3f) + __builtin_sinhf(cw * 0.3f) + __builtin_tanhf(cx * 0.2f);
+          const uint32_t which = static_cast<uint32_t>(ty * 5.0f);
+          want[2] = which == 0 ? 1.0f : which <= 2 ? cx * 2.0f : which == 3 ? __builtin_sqrtf(__builtin_fabsf(cy)) : -1.0f;
+          want[3] = 1.0f;
+        }
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && checked < 3) printf("  more #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+        ++checked;
+      }
+      CHECK(early > 10);
+      printf("  dxil dxil_ps_more: 300 pixels compared with C++ (%u early returns)\n", early);
+    }
+  }
+
+  // gather4 (GatherRed / GatherGreen of a 2D texture): the footprint's four texels in the order x (i0, j1), y (i1, j1), z (i1, j0), w (i0, j0); the fake texture's lookups give the texel
+  // middle's coordinates halved, so the golden is computed from the same footprint.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_gather.dxil", &translated));
+    if (translated) {
+      for (uint32_t n = 0; n < 200; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        auto footprint = [&](float u, float v, float* red, float* green) {
+          const float x = __builtin_floorf(u * 8.0f - 0.5f), y = __builtin_floorf(v * 4.0f - 0.5f);
+          const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+          for (uint32_t k = 0; k < 4; ++k) red[k] = (xs[k] + 0.5f) / 16.0f, green[k] = (ys[k] + 0.5f) / 8.0f;
+        };
+        float g_red[4], g[4], r[4], r_green[4];
+        footprint(varyings[2].x, varyings[2].y, g_red, g);
+        footprint(varyings[2].x * 0.9f, varyings[2].y * 0.9f, r, r_green);
+        const float want[4] = {g[0] + g[3] * 2.0f, g[1] * 0.5f + g[2], r[0] + r[1] * 2.0f, r[2] * 0.25f + r[3]};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  gather #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
+  // Derivatives (ddx_fine / ddy_fine / ddx_coarse / ddy_coarse): the varyings are a plane over the quad, so each corner's are the first corner's plus its steps; the golden takes the
+  // difference of the same function at the corners of the pair.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_deriv.dxil", &translated));
+    if (translated) {
+      struct Plane {
+        graphics::Vec4 origin[4], step_x[4], step_y[4];
+        graphics::Vec4 at(uint32_t i, uint32_t corner) const {
+          const float fx = static_cast<float>(corner & 1), fy = static_cast<float>(corner >> 1);
+          return {origin[i].x + step_x[i].x * fx + step_y[i].x * fy, origin[i].y + step_x[i].y * fx + step_y[i].y * fy, origin[i].z + step_x[i].z * fx + step_y[i].z * fy,
+                  origin[i].w + step_x[i].w * fx + step_y[i].w * fy};
+        }
+      };
+      for (uint32_t n = 0; n < 200; ++n) {
+        Plane plane = {};
+        for (uint32_t i = 0; i < 4; ++i) {
+          plane.origin[i] = {random(-1, 1), random(-1, 1), random(-1, 1), random(-1, 1)};
+          plane.step_x[i] = {random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f)};
+          plane.step_y[i] = {random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f), random(-0.3f, 0.3f)};
+        }
+        const uint32_t own = n % 4;
+        graphics::FragmentContext context;
+        context.quad_corner = own;
+        context.quad_user = &plane;
+        context.quad_fn = [](const void* user, uint32_t corner, graphics::Vec4* varyings, graphics::Vec4* position) {
+          const Plane& p = *static_cast<const Plane*>(user);
+          for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
+          *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
+        };
+        graphics::Vec4 varyings[4];
+        for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        auto f = [&](uint32_t corner) {
+          const graphics::Vec4 c = plane.at(0, corner), t = plane.at(2, corner);
+          return c.x * c.y + t.x * t.x;
+        };
+        const uint32_t row = own & 2, col = own & 1;
+        const float want[4] = {f(row + 1) - f(row), f(col + 2) - f(col),
+                               plane.at(0, 1).z * plane.at(0, 1).z - plane.at(0, 0).z * plane.at(0, 0).z,
+                               plane.at(0, 2).w + plane.at(2, 2).y * plane.at(2, 2).y - plane.at(0, 0).w - plane.at(2, 0).y * plane.at(2, 0).y};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 4) printf("  deriv #%u (corner %u): %g %g %g %g wants %g %g %g %g\n", n, own, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
+  // sample_d and sample_b: the level from the gradients (or the quad's differences of the coordinate) and the bias, over the fake texture whose lookup shows the level in the blue channel.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_grad.dxil", &translated));
+    if (translated) {
+      struct Plane {
+        graphics::Vec4 origin[4], step_x[4], step_y[4];
+        graphics::Vec4 at(uint32_t i, uint32_t corner) const {
+          const float fx = static_cast<float>(corner & 1), fy = static_cast<float>(corner >> 1);
+          return {origin[i].x + step_x[i].x * fx + step_y[i].x * fy, origin[i].y + step_x[i].y * fx + step_y[i].y * fy, origin[i].z + step_x[i].z * fx + step_y[i].z * fy,
+                  origin[i].w + step_x[i].w * fx + step_y[i].w * fy};
+        }
+      };
+      auto level = [](float ax, float ay, float bx, float by) {
+        const float l1 = __builtin_sqrtf(ax * ax * 64.0f + ay * ay * 16.0f), l2 = __builtin_sqrtf(bx * bx * 64.0f + by * by * 16.0f);
+        return __builtin_log2f(l1 > l2 ? l1 : l2);
+      };
+      for (uint32_t n = 0; n < 200; ++n) {
+        Plane plane = {};
+        for (uint32_t i = 0; i < 4; ++i) {
+          plane.origin[i] = {random(0.2f, 1), random(0.2f, 1), random(0.2f, 1), random(0.2f, 1)};
+          plane.step_x[i] = {random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f)};
+          plane.step_y[i] = {random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f)};
+        }
+        const uint32_t own = n % 4;
+        graphics::FragmentContext context;
+        context.quad_corner = own;
+        context.quad_user = &plane;
+        context.quad_fn = [](const void* user, uint32_t corner, graphics::Vec4* varyings, graphics::Vec4* position) {
+          const Plane& p = *static_cast<const Plane*>(user);
+          for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
+          *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
+        };
+        graphics::Vec4 varyings[4];
+        for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        const graphics::Vec4 c = varyings[0], uv = varyings[2];
+        const float lod_a = level(c.x * 0.1f, c.y * 0.05f, 0.02f, c.z * 0.2f);
+        const uint32_t row = own & 2, col = own & 1;
+        const graphics::Vec4 r0 = plane.at(2, row), r1 = plane.at(2, row + 1), c0 = plane.at(2, col), c1 = plane.at(2, col + 2);
+        const float lod_b = level(r1.x - r0.x, r1.y - r0.y, c1.x - c0.x, c1.y - c0.y) + (c.w * 2.0f - 1.0f);
+        const float want_blue = lod_a * 0.125f * 0.5f + lod_b * 0.125f * 0.5f;
+        const float want_red = uv.x * 0.5f;   // (both lookups give u / 2)
+        const bool same = alive && close_to(room[0].z, want_blue) && close_to(room[0].x, want_red);
+        if (!same && n < 3) printf("  grad #%u: %g %g wants %g %g\n", n, room[0].x, room[0].z, want_red, want_blue);
+        CHECK(same);
+      }
+    }
+  }
+  // CalculateLevelOfDetail (clamped and not): the same level from the quad's differences of the coordinate.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_lod.dxil", &translated));
+    if (translated) {
+      struct Plane {
+        graphics::Vec4 origin[4], step_x[4], step_y[4];
+        graphics::Vec4 at(uint32_t i, uint32_t corner) const {
+          const float fx = static_cast<float>(corner & 1), fy = static_cast<float>(corner >> 1);
+          return {origin[i].x + step_x[i].x * fx + step_y[i].x * fy, origin[i].y + step_x[i].y * fx + step_y[i].y * fy, origin[i].z + step_x[i].z * fx + step_y[i].z * fy,
+                  origin[i].w + step_x[i].w * fx + step_y[i].w * fy};
+        }
+      };
+      auto level = [](float ax, float ay, float bx, float by) {
+        const float l1 = __builtin_sqrtf(ax * ax * 64.0f + ay * ay * 16.0f), l2 = __builtin_sqrtf(bx * bx * 64.0f + by * by * 16.0f);
+        return __builtin_log2f(l1 > l2 ? l1 : l2);
+      };
+      for (uint32_t n = 0; n < 200; ++n) {
+        Plane plane = {};
+        for (uint32_t i = 0; i < 4; ++i) {
+          plane.origin[i] = {random(0.2f, 1), random(0.2f, 1), random(0.2f, 1), random(0.2f, 1)};
+          plane.step_x[i] = {random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f)};
+          plane.step_y[i] = {random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f), random(0.01f, 0.2f)};
+        }
+        const uint32_t own = n % 4;
+        graphics::FragmentContext context;
+        context.quad_corner = own;
+        context.quad_user = &plane;
+        context.quad_fn = [](const void* user, uint32_t corner, graphics::Vec4* varyings, graphics::Vec4* position) {
+          const Plane& p = *static_cast<const Plane*>(user);
+          for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
+          *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
+        };
+        graphics::Vec4 varyings[4];
+        for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        const uint32_t row = own & 2, col = own & 1;
+        const graphics::Vec4 r0 = plane.at(2, row), r1 = plane.at(2, row + 1), c0 = plane.at(2, col), c1 = plane.at(2, col + 2);
+        const float lod = level(r1.x - r0.x, r1.y - r0.y, c1.x - c0.x, c1.y - c0.y), top = 2.0f;
+        const float want_x = lod < 0 ? 0 : lod > top ? top : lod;
+        const bool same = alive && close_to(room[0].x, want_x) && close_to(room[0].y, lod);
+        if (!same && n < 3) printf("  lod #%u: %g %g wants %g %g\n", n, room[0].x, room[0].y, want_x, lod);
+        CHECK(same);
+      }
+    }
+  }
+  // A texture array indexed by a variable: the lookup of the element the index picks (the fake texture's colour says which unit answered).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_array.dxil", &translated));
+    if (translated) {
+      bool seen[2] = {};
+      for (uint32_t n = 0; n < 200; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), 0, 0, 0};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const uint32_t i = static_cast<uint32_t>(varyings[0].x * 1.99f);
+        seen[i] = true;
+        const float fi = static_cast<float>(i);
+        const bool same = alive && close_to(room[0].x, varyings[2].x + 0.0625f) && close_to(room[0].y, varyings[2].y + 0.25f) && close_to(room[0].z, 0.25f + 0.1f * fi + 0.0f) && close_to(room[0].w, 1.75f + 0.0625f * fi);
+        if (!same && n < 3) printf("  array #%u (%u): %g %g %g %g\n", n, i, room[0].x, room[0].y, room[0].z, room[0].w);
+        CHECK(same);
+      }
+      CHECK(seen[0] && seen[1]);
+    }
+  }
+  // sample_c / sample_c_lz: the four texels of the footprint compared with the reference (reference <= texel) and filtered bilinearly; the fake texture's red is (x + 0.5) / 16.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_cmp.dxil", &translated));
+    if (translated) {
+      auto compared = [](float u, float v, float reference) {
+        const float px = u * 8.0f - 0.5f, py = v * 4.0f - 0.5f, x = __builtin_floorf(px), y = __builtin_floorf(py), fx = px - x, fy = py - y;
+        float pass[2][2];
+        for (int row = 0; row < 2; ++row)
+          for (int col = 0; col < 2; ++col) pass[row][col] = reference <= (x + static_cast<float>(col) + 0.5f) / 16.0f ? 1.0f : 0.0f;
+        const float top = pass[0][0] * (1 - fx) + pass[0][1] * fx, bottom = pass[1][0] * (1 - fx) + pass[1][1] * fx;
+        return top * (1 - fy) + bottom * fy;
+      };
+      unsigned partial = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float a = compared(varyings[2].x, varyings[2].y, varyings[0].x), b = compared(varyings[2].x * 0.9f, varyings[2].y * 0.9f, varyings[0].y);
+        if (a > 0.01f && a < 0.99f) ++partial;
+        const bool same = alive && close_to(room[0].x, a) && close_to(room[0].y, b) && close_to(room[0].z, a * b);
+        if (!same && n < 3) printf("  cmp #%u: %g %g %g wants %g %g %g\n", n, room[0].x, room[0].y, room[0].z, a, b, a * b);
+        CHECK(same);
+      }
+      CHECK(partial > 20);
+    }
+  }
+  // Doubles: arithmetic, conversions, a select, a loop-carried sum, fma and comparisons, against the same function in C++ (doubles all the way, the float at the end).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_double.dxil", &translated));
+    if (translated) {
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0.1f, 2), random(0, 2), random(0, 1), 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const double a = varyings[0].x, b = static_cast<double>(varyings[0].y) * 3.0 + a, d = b / (a + 1.5), e = varyings[0].z > 0.5f ? d : -a;
+        double sum = 0;
+        for (int i = 0; i < 4; ++i) sum += a * static_cast<double>(i);
+        const double f = a * b + 1.0;
+        const uint32_t u = static_cast<uint32_t>(b * 4.0);
+        const float want[4] = {static_cast<float>(d), static_cast<float>(e), static_cast<float>(sum), static_cast<float>(f) + static_cast<float>(u) + (a < b ? 100.0f : 0.0f)};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  double #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
+  // 64-bit integers: add, subtract, multiply, divide, remainder (unsigned and signed), shifts, comparisons and conversions, against the same function in C++.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_int64.dxil", &translated));
+    if (translated) {
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
+        const uint64_t a = (uint64_t{static_cast<uint32_t>(cx * 4000000000.0f)} << 20) + uint64_t{static_cast<uint32_t>(cy * 3000000000.0f)} + 12345;
+        const uint64_t b = (uint64_t{static_cast<uint32_t>(cz * 100.0f)} << 3) + uint64_t{static_cast<uint32_t>(tx * 1000.0f)} + 7;
+        const uint64_t sum = a + b, diff = a - b, prod = a * b, quo = a / b, rem = a % b;
+        const uint64_t sh = (a << static_cast<uint32_t>(ty * 40.0f)) ^ (b >> 3) ^ (a >> static_cast<uint32_t>(cw * 50.0f));
+        const int64_t sa = static_cast<int64_t>(a) - static_cast<int64_t>(b << 30), sq = sa / static_cast<int64_t>(b + 3), sr = sa % static_cast<int64_t>(b + 3);
+        const uint64_t s5 = (a < b ? 1 : 0) + (a > b ? 2 : 0) + (sa < 0 ? 4 : 0) + (a >= b ? 8 : 0) + (static_cast<int64_t>(a) <= static_cast<int64_t>(b) ? 16 : 0) + (a == b ? 32 : 0) + (sa != 0 ? 64 : 0);
+        const float want[4] = {static_cast<float>(static_cast<uint32_t>(sum >> 32)) + static_cast<float>(static_cast<uint32_t>(sum)) * 0.0000001f,
+                               static_cast<float>(static_cast<uint32_t>(diff ^ (diff >> 32))) + static_cast<float>(static_cast<uint32_t>(prod >> 40)),
+                               static_cast<float>(static_cast<uint32_t>(quo)) + static_cast<float>(static_cast<uint32_t>(rem)) * 3.0f + static_cast<float>(static_cast<uint32_t>(sh >> 17)),
+                               static_cast<float>(static_cast<uint32_t>(sq >> 16)) + static_cast<float>(static_cast<uint32_t>(sr)) * 0.5f + static_cast<float>(static_cast<uint32_t>(s5)) + static_cast<float>(sa) * 1e-12f +
+                                   static_cast<float>(static_cast<int64_t>(a >> 3))};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  int64 #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
+  // Returns from inside a loop.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_retloop.dxil", &translated));
+    if (translated) {
+      unsigned inside = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(-1.5f, 1), 0, 0, 0};
+        varyings[2] = {random(0, 1), 0, 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        float acc = 0, want[4] = {0, -1, 0, 1};
+        bool done = false;
+        for (int i = 0; i < 8 && !done; ++i) {
+          acc += varyings[0].x + 0.1f;
+          if (acc > varyings[2].x * 4.0f) want[0] = acc, want[1] = static_cast<float>(i), want[2] = 1, want[3] = 1, done = true, ++inside;
+          else if (acc < -2.0f) want[0] = 0, want[1] = 0, want[2] = acc, want[3] = 0.5f, done = true, ++inside;
+        }
+        if (!done) want[0] = acc;
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  retloop #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+      CHECK(inside > 100 && inside < 300);
+    }
+  }
+  { UniquePointer<D3d9Program> shown; CHECK(load("dxil_ps_retloop_show.dxil", &shown)); }
+  // Returns from inside a real loop (a trip count that is not a constant).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_retloop2.dxil", &translated));
+    if (translated) {
+      unsigned inside = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(-1.5f, 1), 0, 0, 0};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        float acc = 0, want[4] = {0, -1, 0, 1};
+        bool done = false;
+        const int trips = static_cast<int>(varyings[2].y * 8.0f) + 1;
+        for (int i = 0; i < trips && !done; ++i) {
+          acc += varyings[0].x + 0.1f;
+          if (acc > varyings[2].x * 4.0f) want[0] = acc, want[1] = static_cast<float>(i), want[2] = 1, want[3] = 1, done = true, ++inside;
+          else if (acc < -2.0f) want[0] = 0, want[1] = 0, want[2] = acc, want[3] = 0.5f, done = true, ++inside;
+        }
+        if (!done) want[0] = acc;
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  retloop2 #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+      CHECK(inside > 100 && inside < 300);
+    }
+  }
+  // 16-bit types (min16 / native half, int16, uint16): results rounded to halves and wrapped to 16 bits after each operation, against the same function in C++.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_half.dxil", &translated));
+    if (translated) {
+      auto H = [](float x) { return graphics::half_to_float(graphics::float_to_half(x)); };
+      auto s16 = [](int32_t x) { return static_cast<int32_t>(static_cast<int16_t>(x)); };
+      unsigned checked = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 2), random(0, 2), random(0, 1), random(0, 1)};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        const float hv[4] = {H(random(-2, 2)), H(random(-2, 2)), H(random(-2, 2)), H(random(-2, 2))};
+        const int16_t kv[4] = {static_cast<int16_t>(random(-100, 100)), static_cast<int16_t>(random(-300, 300)), static_cast<int16_t>(random(-20, 20)), static_cast<int16_t>(random(-100, 100))};
+        const int16_t divisor_shift = kv[2] == -3 ? 5 : kv[2];   // (a division by zero is for no one to compare)
+        uint8_t constants[128] = {};
+        ByteWriter cw(ByteView(constants, 16));
+        for (int i = 0; i < 4; ++i) cw.le16(graphics::float_to_half(hv[i]));
+        for (int i = 0; i < 4; ++i) cw.le16(static_cast<uint16_t>(i == 2 ? divisor_shift : kv[i]));
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw_ = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
+        const float a = H(cx), b = H(H(cy * 3.0f) + hv[0]);
+        const float s = H(H(a * b) + hv[1]), s_fused = H(a * b + hv[1]);
+        const float d = H(H(a + H(0.001f)) / H(b + H(1.5f)));
+        const float m = H((a > b ? a : b) - (a < hv[2] ? a : hv[2]));
+        const int32_t i = s16(s16(static_cast<int32_t>(cz * 200.0f)) - kv[0]), j = s16(s16(i * s16(static_cast<int32_t>(tx * 300.0f))) + kv[1]);
+        const uint32_t u = static_cast<uint16_t>(static_cast<int32_t>(ty * 60000.0f)), v = (u + static_cast<uint16_t>(static_cast<int32_t>(cw_ * 9000.0f))) & 0xFFFF;
+        const int32_t sh = s16(s16(j >> 3) + s16(i / s16(divisor_shift + 3)));
+        const float q = H(H(static_cast<float>(i)) * H(0.01f));
+        const float want[4] = {s * 0.1f + d, m + q, static_cast<float>(j) + static_cast<float>(sh) * 0.5f, static_cast<float>(v) + (u > v ? 1.0f : 0.0f) + (i < kv[3] ? 2.0f : 0.0f)};
+        const float want_fused[4] = {s_fused * 0.1f + d, want[1], want[2], want[3]};
+        const bool same = alive && (close_to(room[0].x, want[0]) || close_to(room[0].x, want_fused[0])) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 4) printf("  half #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+        ++checked;
+      }
+      CHECK(checked == 300);
+    }
+  }
+  // Views of buffers in a pixel shader (a structured and a byte address buffer, read by index): the FragmentContext carries the bound buffers.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_srv.dxil", &translated));
+    if (translated) {
+      CHECK((translated->required_features() & graphics::kFeatureStorageInDraws) != 0);
+      std::vector<uint32_t> structured(32 * 4), raw(16);
+      for (uint32_t i = 0; i < structured.size(); ++i) structured[i] = 0x9E3779B9u * (i + 1);
+      for (uint32_t i = 0; i < raw.size(); ++i) raw[i] = 0x85EBCA6Bu * (i + 3);
+      ByteView views[graphics::kMaxStorageBuffers];
+      views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(structured.data()), structured.size() * 4);
+      views[graphics::kMaxUavBuffers + 1] = ByteView(reinterpret_cast<uint8_t*>(raw.data()), raw.size() * 4);
+      for (uint32_t n = 0; n < 200; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), random(0, 1), random(0, 1), 0};
+        varyings[2] = {random(0, 1), 0, 0, 0};
+        graphics::FragmentContext context;
+        context.storage = views;
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        const uint32_t i = static_cast<uint32_t>(varyings[0].x * 7.99f) * 4 + static_cast<uint32_t>(varyings[0].y * 3.99f);
+        const uint32_t r = raw[static_cast<uint32_t>(varyings[2].x * 3.99f) + static_cast<uint32_t>(varyings[0].z * 3.99f)];
+        const float want[4] = {static_cast<float>(structured[4 * i] & 255) / 255.0f, static_cast<float>(structured[4 * i + 1] & 255) / 255.0f, static_cast<float>((structured[4 * i + 2] ^ r) & 255) / 255.0f,
+                               static_cast<float>((structured[4 * i + 3] + r) & 255) / 255.0f};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  ps srv #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
+  // gather4 with constant offsets, and gather4_c (the comparison of each texel of the footprint): against the same footprint worked out in C++.
+  {
+    UniquePointer<D3d9Program> offsets, compared;
+    CHECK(load("dxil_ps_gather_off.dxil", &offsets) && load("dxil_ps_gather_cmp.dxil", &compared));
+    // (the fake texture's lookups give the middle of the texel halved: red (x + 0.5) / 16, green (y + 0.5) / 8)
+    auto footprint = [](float u, float v, int ox, int oy, float* red, float* green) {
+      const float x = __builtin_floorf(u * 8.0f - 0.5f) + static_cast<float>(ox), y = __builtin_floorf(v * 4.0f - 0.5f) + static_cast<float>(oy);
+      const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+      for (int k = 0; k < 4; ++k) red[k] = (xs[k] + 0.5f) / 16.0f, green[k] = (ys[k] + 0.5f) / 8.0f;
+    };
+    for (uint32_t n = 0; n < 200 && offsets && compared; ++n) {
+      graphics::Vec4 varyings[4] = {};
+      varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
+      varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+      uint8_t constants[128] = {};
+      graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+      CHECK(offsets->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room));
+      float r1[4], g1[4], r2[4], g2[4];
+      footprint(varyings[2].x, varyings[2].y, 1, -2, r1, g1);
+      footprint(varyings[2].x, varyings[2].y, -3, 2, r2, g2);
+      CHECK(close_to(room[0].x, r1[0]) && close_to(room[0].y, r1[3]) && close_to(room[0].z, g2[1]) && close_to(room[0].w, g2[2]));
+      room[0] = {};
+      CHECK(compared->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room));
+      float ra[4], ga[4], rb[4], gb[4];
+      footprint(varyings[2].x, varyings[2].y, 0, 0, ra, ga);
+      footprint(varyings[2].x, varyings[2].y, 1, 1, rb, gb);
+      auto pass = [](float reference, float texel) { return reference <= texel ? 1.0f : 0.0f; };
+      const float want[4] = {(pass(varyings[0].x, ra[0]) + pass(varyings[0].x, ra[1]) * 2) * 0.0625f, (pass(varyings[0].x, ra[2]) * 4 + pass(varyings[0].x, ra[3]) * 8) * 0.0625f,
+                             (pass(varyings[0].y, rb[0]) + pass(varyings[0].y, rb[1]) * 2) * 0.0625f, (pass(varyings[0].y, rb[2]) * 4 + pass(varyings[0].y, rb[3]) * 8) * 0.0625f};
+      const bool same = close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+      if (!same && n < 3) printf("  gather cmp #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+      CHECK(same);
+    }
+  }
+  // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_inv.dxil", &translated));
+    if (translated) {
+      auto near = [](float a, float b) { return __builtin_fabsf(a - b) < 1e-4f; };
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), random(0, 1), random(0, 1), 0};
+        if (n == 0) varyings[0] = {0.5f, 0.5f, 0.5f, 0};
+        if (n == 1) varyings[0] = {1, 1, 1, 0};
+        if (n == 2) varyings[0] = {0, 0, 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float x = varyings[0].x * 3.0f - 1.5f, y = varyings[0].y * 2.0f - 1.0f, z = varyings[0].z * 8.0f - 4.0f;
+        const bool same = alive && near(room[0].x, __builtin_atanf(x)) && near(room[0].y, __builtin_asinf(y)) && near(room[0].z, __builtin_acosf(y)) && near(room[0].w, __builtin_atanf(z));
+        if (!same) printf("  inv #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, __builtin_atanf(x), __builtin_asinf(y), __builtin_acosf(y), __builtin_atanf(z));
+        CHECK(same);
+      }
+    }
+  }
+  // The vertex shader: a matrix and a tint from the constants.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_vs.dxbc", &reference) && load("dxil_vs.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Vertex);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::Vec4 attributes[4] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
+        float constants_f[32];
+        for (float& c : constants_f) c = random(-2, 2);
+        uint8_t constants[128];
+        for (uint32_t i = 0; i < 32; ++i) {
+          const uint32_t bits = __builtin_bit_cast(uint32_t, constants_f[i]);
+          for (uint32_t k = 0; k < 4; ++k) constants[4 * i + k] = static_cast<uint8_t>(bits >> (8 * k));
+        }
+        graphics::ShaderIo a = {}, b = {};
+        reference->run_vertex_ex(attributes, constants, graphics::VertexContext(), &a);
+        translated->run_vertex_ex(attributes, constants, graphics::VertexContext(), &b);
+        const bool same = close_to(a.position.x, b.position.x) && close_to(a.position.y, b.position.y) && close_to(a.position.z, b.position.z) && close_to(a.position.w, b.position.w) &&
+                          close_to(a.varying[0].x, b.varying[0].x) && close_to(a.varying[0].w, b.varying[0].w) && close_to(a.varying[2].x, b.varying[2].x) && close_to(a.varying[2].y, b.varying[2].y);
+        if (!same && n < 3) printf("  vs #%u: %g %g %g %g vs %g %g %g %g\n", n, a.position.x, a.position.y, a.position.z, a.position.w, b.position.x, b.position.y, b.position.z, b.position.w);
+        CHECK(same);
+      }
+    }
+  }
+
+
+  // A view of a buffer in a vertex shader, indexed by SV_VertexID.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_vs_srv.dxil", &translated));
+    if (translated) {
+      CHECK((translated->required_features() & graphics::kFeatureStorageInDraws) != 0);
+      float table[16];
+      for (float& f : table) f = random(-1, 1);
+      ByteView views[graphics::kMaxStorageBuffers];
+      views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(table), sizeof table);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::Vec4 attributes[4] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
+        graphics::VertexContext context;
+        context.vertex_id = n;
+        context.storage = views;
+        uint8_t constants[128] = {};
+        graphics::ShaderIo io = {};
+        translated->run_vertex_ex(attributes, constants, context, &io);
+        const float* d = table + 4 * (n & 3);
+        const bool same = close_to(io.position.x, attributes[0].x + d[0]) && close_to(io.position.y, -(attributes[0].y + d[1])) && close_to(io.position.z, attributes[0].z + d[2]) && close_to(io.varying[0].x, attributes[1].x * d[3]) &&
+                          close_to(io.varying[0].w, attributes[1].w * d[3]) && close_to(io.varying[2].x, attributes[0].x + d[3]) && close_to(io.varying[2].y, attributes[0].y + 0.5f);
+        if (!same && n < 3) printf("  vs srv #%u: %g %g %g wants %g %g %g\n", n, io.position.x, io.position.y, io.position.z, attributes[0].x + d[0], -(attributes[0].y + d[1]), attributes[0].z + d[2]);
+        CHECK(same);
+      }
+    }
+  }
+  // A geometry shader: the vertices it emits and where it cut the strip.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_gs_copy.dxbc", &reference) && load("dxil_gs_copy.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Geometry && translated->geometry_input() == graphics::GeometryPrimitive::Triangle && translated->geometry_max_vertices() == 6 &&
+            translated->geometry_output() == graphics::GeometryTopology::TriangleStrip);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::GeometryInputData in;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::GeometryOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_geometry(in, constants, &a);
+        translated->run_geometry(in, constants, &b);
+        bool same = a.count == b.count && a.count == 6;
+        for (uint32_t i = 0; same && i < a.count; ++i)
+          same = a.restart[i] == b.restart[i] && close_to(a.vertex[i].position.x, b.vertex[i].position.x) && close_to(a.vertex[i].position.y, b.vertex[i].position.y) &&
+                 close_to(a.vertex[i].position.w, b.vertex[i].position.w) && close_to(a.vertex[i].varying[0].x, b.vertex[i].varying[0].x) && close_to(a.vertex[i].varying[0].z, b.vertex[i].varying[0].z) &&
+                 close_to(a.vertex[i].varying[2].y, b.vertex[i].varying[2].y);
+        CHECK(same);
+      }
+      printf("  dxil dxil_gs_copy: 100 triangles compared\n");
+    }
+  }
+
+  // A geometry shader with two output streams (the streams of each vertex and every output of it).
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_gs_streams.dxbc", &reference) && load("dxil_gs_streams.dxil", &translated));
+    if (reference && translated) {
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::GeometryInputData in;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::GeometryOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_geometry(in, constants, &a);
+        translated->run_geometry(in, constants, &b);
+        bool same = a.count == b.count && a.count == 6;
+        bool both_streams[2] = {};
+        for (uint32_t i = 0; same && i < a.count; ++i) {
+          same = a.stream[i] == b.stream[i] && a.restart[i] == b.restart[i] && close_to(a.vertex[i].position.x, b.vertex[i].position.x) && close_to(a.vertex[i].position.w, b.vertex[i].position.w);
+          for (uint32_t k = 0; k < 4; ++k) same = same && close_to(a.vertex[i].varying[k].x, b.vertex[i].varying[k].x) && close_to(a.vertex[i].varying[k].w, b.vertex[i].varying[k].w);
+          if (a.stream[i] < 2) both_streams[a.stream[i]] = true;
+        }
+        if (!same && n == 0) printf("  streams: counts %u %u\n", a.count, b.count);
+        CHECK(same && both_streams[0] && both_streams[1]);
+      }
+      printf("  dxil dxil_gs_streams: 100 triangles compared\n");
+    }
+  }
+
+  // Views of buffers in a geometry shader and in the hull and domain shaders of a patch.
+  {
+    UniquePointer<D3d9Program> gs, hs, ds;
+    CHECK(load("dxil_gs_srv.dxil", &gs) && load("dxil_hs_srv.dxil", &hs) && load("dxil_ds_srv.dxil", &ds));
+    float table[16];
+    for (float& f : table) f = random(0.5f, 3.0f);
+    ByteView views[graphics::kMaxStorageBuffers];
+    views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(table), sizeof table);
+    if (gs) {
+      CHECK(gs->stage() == graphics::ShaderStage::Geometry && (gs->required_features() & graphics::kFeatureStorageInDraws));
+      for (uint32_t n = 0; n < 50; ++n) {
+        graphics::GeometryInputData in;
+        in.storage = views;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+        }
+        graphics::GeometryOutputData out;
+        uint8_t constants[128] = {};
+        gs->run_geometry(in, constants, &out);
+        bool same = out.count == 3;
+        for (uint32_t v = 0; same && v < 3; ++v)
+          same = close_to(out.vertex[v].position.x, in.position[v].x + table[4 * v]) && close_to(out.vertex[v].position.y, in.position[v].y - table[4 * v + 1]) && close_to(out.vertex[v].position.w, in.position[v].w + table[4 * v + 3]) &&
+                 close_to(out.vertex[v].varying[0].x, in.varying[v][0].x * table[12]);
+        CHECK(same);
+      }
+    }
+    if (hs && ds) {
+      CHECK(hs->stage() == graphics::ShaderStage::Hull && ds->stage() == graphics::ShaderStage::Domain);
+      for (uint32_t n = 0; n < 50; ++n) {
+        graphics::HullInputData in;
+        in.storage = views;
+        in.control_points = 3;
+        for (uint32_t v = 0; v < 3; ++v) in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), 1};
+        graphics::HullOutputData patch;
+        uint8_t constants[128] = {};
+        hs->run_hull(in, constants, &patch);
+        CHECK(close_to(patch.outer[0], table[0]) && close_to(patch.outer[1], table[1]) && close_to(patch.outer[2], table[2]) && close_to(patch.inner[0], table[3]));
+        patch.storage = views;
+        const float u = random(0, 1), v = random(0, 1) * (1 - u), w = 1 - u - v;
+        graphics::ShaderIo io = {};
+        ds->run_domain(patch, u, v, w, constants, &io);
+        const graphics::Vec4 p0 = patch.control_point[0].position, p1 = patch.control_point[1].position, p2 = patch.control_point[2].position;
+        CHECK(close_to(io.position.x, p0.x * u + p1.x * v + p2.x * w + table[4] * u * v));
+      }
+    }
+  }
+  // A domain shader: the vertex it makes of a patch at a point of the domain.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_ds_dent.dxbc", &reference) && load("dxil_ds_dent.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Domain && translated->tess_domain() == graphics::TessDomain::Triangle && translated->tess_input_points() == 3);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::HullOutputData patch;
+        for (uint32_t k = 0; k < 3; ++k) {
+          patch.control_point[k].position = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          patch.control_point[k].varying[0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          patch.control_point[k].varying[2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        const float u = random(0, 1), v = random(0, 1) * (1 - u), w = 1 - u - v;
+        graphics::ShaderIo a = {}, b = {};
+        uint8_t constants[128] = {};
+        reference->run_domain(patch, u, v, w, constants, &a);
+        translated->run_domain(patch, u, v, w, constants, &b);
+        CHECK(close_to(a.position.x, b.position.x) && close_to(a.position.y, b.position.y) && close_to(a.position.z, b.position.z) && close_to(a.position.w, b.position.w) &&
+              close_to(a.varying[0].x, b.varying[0].x) && close_to(a.varying[0].w, b.varying[0].w) && close_to(a.varying[2].x, b.varying[2].x) && close_to(a.varying[2].y, b.varying[2].y));
+      }
+      printf("  dxil dxil_ds_dent: 100 domain points compared\n");
+    }
+  }
+
+  // A hull shader (a control point function and a patch constant function): the control points and the tessellation factors.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_hs_tri.dxbc", &reference) && load("dxil_hs_tri.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Hull && translated->tess_domain() == graphics::TessDomain::Triangle && translated->tess_input_points() == 3 && translated->tess_output_points() == 3 &&
+            translated->tess_partitioning() == reference->tess_partitioning() && translated->tess_output() == reference->tess_output());
+      for (uint32_t n = 0; n < 50; ++n) {
+        graphics::HullInputData in;
+        in.control_points = 3;
+        for (uint32_t k = 0; k < 3; ++k) {
+          in.position[k] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[k][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+          in.varying[k][2] = {random(0, 1), random(0, 1), 0, 0};
+        }
+        graphics::HullOutputData a, b;
+        uint8_t constants[128] = {};
+        reference->run_hull(in, constants, &a);
+        translated->run_hull(in, constants, &b);
+        bool same = true;
+        for (uint32_t k = 0; k < 3; ++k)
+          same = same && close_to(a.control_point[k].position.x, b.control_point[k].position.x) && close_to(a.control_point[k].position.w, b.control_point[k].position.w) &&
+                 close_to(a.control_point[k].varying[0].y, b.control_point[k].varying[0].y) && close_to(a.control_point[k].varying[2].x, b.control_point[k].varying[2].x);
+        for (uint32_t k = 0; k < 3; ++k) same = same && close_to(a.outer[k], b.outer[k]);
+        same = same && close_to(a.inner[0], b.inner[0]) && a.outer[0] == 2.0f && a.inner[0] == 2.0f;
+        if (!same && n < 2) printf("  hs #%u: outer %g %g %g inner %g cp0.x %g w %g v0.y %g | outer %g %g %g inner %g cp0.x %g w %g v0.y %g\n", n, a.outer[0], a.outer[1], a.outer[2], a.inner[0], a.control_point[0].position.x, a.control_point[0].position.w, a.control_point[0].varying[0].y, b.outer[0], b.outer[1], b.outer[2], b.inner[0], b.control_point[0].position.x, b.control_point[0].position.w, b.control_point[0].varying[0].y);
+        CHECK(same);
+      }
+      printf("  dxil dxil_hs_tri: 50 patches compared\n");
+    }
+  }
+
+  // The hull shaders of the other domains and partitionings, with the factors from a constant buffer.
+  for (const char* name : {"dxil_hs_quad_cb", "dxil_hs_iso_cb", "dxil_hs_tri_odd_cb"}) {
+    UniquePointer<D3d9Program> reference, translated;
+    const std::string base(name);
+    CHECK(load((base + ".dxbc").c_str(), &reference) && load((base + ".dxil").c_str(), &translated));
+    if (!reference || !translated) continue;
+    CHECK(translated->tess_domain() == reference->tess_domain() && translated->tess_partitioning() == reference->tess_partitioning() && translated->tess_output() == reference->tess_output() &&
+          translated->tess_input_points() == reference->tess_input_points() && translated->tess_output_points() == reference->tess_output_points());
+    const uint32_t points = reference->tess_input_points();
+    for (uint32_t n = 0; n < 30; ++n) {
+      graphics::HullInputData in;
+      in.control_points = points;
+      for (uint32_t k = 0; k < points; ++k) in.position[k] = {random(-1, 1), random(-1, 1), 0.5f, 1}, in.varying[k][0] = {random(0, 1), 0, 0, 1};
+      uint8_t constants[128] = {};
+      for (uint32_t i = 16; i < 24; ++i) {
+        const float f = random(1, 9);
+        const uint32_t bits = __builtin_bit_cast(uint32_t, f);
+        for (uint32_t b = 0; b < 4; ++b) constants[4 * i + b] = static_cast<uint8_t>(bits >> (8 * b));
+      }
+      graphics::HullOutputData a, b;
+      reference->run_hull(in, constants, &a);
+      translated->run_hull(in, constants, &b);
+      bool same = true;
+      for (uint32_t k = 0; k < 4; ++k) same = same && close_to(a.outer[k], b.outer[k]);
+      for (uint32_t k = 0; k < 2; ++k) same = same && close_to(a.inner[k], b.inner[k]);
+      for (uint32_t k = 0; k < points; ++k) same = same && close_to(a.control_point[k].position.x, b.control_point[k].position.x);
+      if (!same && n < 2) printf("  %s #%u: outer %g %g %g %g inner %g %g | %g %g %g %g %g %g\n", name, n, a.outer[0], a.outer[1], a.outer[2], a.outer[3], a.inner[0], a.inner[1], b.outer[0], b.outer[1], b.outer[2], b.outer[3], b.inner[0], b.inner[1]);
+      CHECK(same);
+    }
+    printf("  dxil %s: 30 patches compared\n", name);
+  }
+  // The compute shaders: the same buffers in, the same buffers out.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_cs_fill.dxbc", &reference) && load("dxil_cs_fill.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->stage() == graphics::ShaderStage::Compute && translated->thread_group(0) == 8 && translated->thread_group(1) == 4);
+      auto run = [&](D3d9Program& p, std::vector<uint8_t>* picture, std::vector<uint8_t>* structured, std::vector<uint8_t>* counters) {
+        picture->assign(4096, 0), structured->assign(16384, 0), counters->assign(16, 0);
+        graphics::ComputeContext context;
+        context.buffers[0] = ByteView(picture->data(), picture->size()), context.buffers[1] = ByteView(structured->data(), structured->size()), context.buffers[2] = ByteView(counters->data(), counters->size());
+        const uint32_t k[4] = {0x00102030u, 0, 0, 0};
+        uint8_t constants[128] = {};
+        for (uint32_t i = 0; i < 4; ++i)
+          for (uint32_t b = 0; b < 4; ++b) constants[4 * i + b] = static_cast<uint8_t>(k[i] >> (8 * b));
+        for (uint32_t gy = 0; gy < 8; ++gy)
+          for (uint32_t gx = 0; gx < 4; ++gx) {
+            uint32_t index = 0;
+            for (uint32_t ty = 0; ty < 4; ++ty)
+              for (uint32_t tx = 0; tx < 8; ++tx, ++index) {
+                context.group_id[0] = gx, context.group_id[1] = gy, context.thread_id[0] = tx, context.thread_id[1] = ty;
+                context.dispatch_id[0] = gx * 8 + tx, context.dispatch_id[1] = gy * 4 + ty;
+                context.group_index = index;
+                p.run_compute(context, constants);
+              }
+          }
+      };
+      std::vector<uint8_t> a0, a1, a2, b0, b1, b2;
+      run(*reference, &a0, &a1, &a2);
+      run(*translated, &b0, &b1, &b2);
+      CHECK(a0 == b0 && a1 == b1 && a2 == b2);
+      CHECK(b0[0] != 0 && b2[0] == 0 && b2[1] == 4);   // (the counters reached 1024: 0x400)
+      printf("  dxil dxil_cs_fill: %s\n", a0 == b0 && a1 == b1 && a2 == b2 ? "same buffers" : "buffers differ");
+    }
+  }
+
+  // Shader resource views of buffers (t#: read-only storage buffers after the u# ones).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_cs_srv.dxil", &translated));
+    if (translated) {
+      CHECK(translated->storage_kind(graphics::kMaxUavBuffers) == D3d9Program::BufferKind::Structured && translated->storage_kind(graphics::kMaxUavBuffers + 1) == D3d9Program::BufferKind::Raw &&
+            translated->storage_kind(0) == D3d9Program::BufferKind::Structured);
+      std::vector<uint32_t> src(1024 * 4), raw(1024), dst(1024, 0);
+      for (uint32_t i = 0; i < src.size(); ++i) src[i] = 0x01010101u * (i % 251) + i * 7;
+      for (uint32_t i = 0; i < raw.size(); ++i) raw[i] = 0x9E3779B9u * (i + 1);
+      graphics::ComputeContext context;
+      context.buffers[0] = ByteView(reinterpret_cast<uint8_t*>(dst.data()), dst.size() * 4);
+      context.buffers[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(src.data()), src.size() * 4);
+      context.buffers[graphics::kMaxUavBuffers + 1] = ByteView(reinterpret_cast<uint8_t*>(raw.data()), raw.size() * 4);
+      uint8_t constants[128] = {};
+      for (uint32_t y = 0; y < 32; ++y)
+        for (uint32_t x = 0; x < 32; ++x) {
+          context.thread_id[0] = x % 8, context.thread_id[1] = y % 4, context.dispatch_id[0] = x, context.dispatch_id[1] = y, context.group_index = (y % 4) * 8 + x % 8;
+          translated->run_compute(context, constants);
+        }
+      bool same = true;
+      for (uint32_t i = 0; i < 1024; ++i) same = same && dst[i] == src[4 * i] + src[4 * i + 3] * 3 + raw[i] + (raw[1023 - i] ^ src[4 * i + 1]);
+      CHECK(same);
+      printf("  dxil dxil_cs_srv: %s\n", same ? "buffer views read" : "buffer views differ");
+    }
+  }
+
+  // A compute shader with group-shared memory and barriers (a reduction in a loop): the buffer after every group has run.
+  {
+    UniquePointer<D3d9Program> reference, translated;
+    CHECK(load("dxil_cs_shared.dxbc", &reference) && load("dxil_cs_shared.dxil", &translated));
+    if (reference && translated) {
+      CHECK(translated->needs_group() && translated->shared_total_bytes() == 256);
+      auto run = [&](D3d9Program& p, std::vector<uint8_t>* picture) {
+        picture->assign(4096, 0);
+        graphics::ComputeContext context;
+        context.buffers[0] = ByteView(picture->data(), picture->size());
+        for (uint32_t gy = 0; gy < 4; ++gy)
+          for (uint32_t gx = 0; gx < 4; ++gx) {
+            context.group_id[0] = gx, context.group_id[1] = gy;
+            p.run_compute_group(context, nullptr);
+          }
+      };
+      std::vector<uint8_t> a, b;
+      run(*reference, &a);
+      run(*translated, &b);
+      CHECK(a == b);
+      printf("  dxil dxil_cs_shared: %s\n", a == b ? "same buffer" : "buffers differ");
+    }
+  }
+  // Truncated and with a bit flipped: refused or compiled, never a crash (and the sanitizers say nothing).
+  for (const char* name : {"dxil_ps_math.dxil", "dxil_ps_flow.dxil", "dxil_vs.dxil", "dxil_ps_tex.dxil", "dxil_cs_fill.dxil", "dxil_ps_loop.dxil", "dxil_cs_shared.dxil", "dxil_ps_more.dxil", "dxil_gs_copy.dxil", "dxil_ds_dent.dxil", "dxil_hs_tri.dxil", "dxil_hs_quad_cb.dxil", "dxil_hs_iso_cb.dxil"}) {
+    const std::vector<uint8_t> blob = read_blob(name);
+    for (size_t n = 0; n < blob.size(); n += 11) {
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(blob.data(), n), &program);
+    }
+    const size_t stride = getenv("DXIL_FUZZ_STRIDE") ? static_cast<size_t>(atoi(getenv("DXIL_FUZZ_STRIDE"))) : 37;   // (every bit when looking for something)
+    for (size_t bit = 0; bit < blob.size() * 8; bit += stride) {
+      std::vector<uint8_t> flipped = blob;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      UniquePointer<D3d9Program> program;
+      D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &program);
+    }
+  }
+}
+
+
+// Reserved (tiled) buffers: tiles mapped to places in heaps.
+void test_d3d12_reserved() {
+  Env e;
+  auto create = [&](uint32_t flags, uint64_t size, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.size = size, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, p = 0, q = 0, r = 0, none = 0;
+  CHECK(create(kAllocHeap, 4 * kTileBytes, 0, 0, &heap) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer, kTileBytes, heap, 0, &p) == status::kSuccess && create(kAllocVertexBuffer, kTileBytes, heap, 2 * kTileBytes, &q) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, 3 * kTileBytes, 0, 0, &r) == status::kSuccess);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, 3 * kTileBytes + 4, 0, 0, &none) == status::kInvalidParameter && create(kAllocVertexBuffer | kAllocReserved, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocQueryResult | kAllocReserved, kTileBytes, 0, 0, &none) == status::kInvalidParameter && create(kAllocHeap | kAllocReserved, kTileBytes, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocVertexBuffer | kAllocReserved, kTileBytes, heap, 0, &none) == status::kInvalidParameter);   // (reserved and placed)
+  AllocationDesc image;
+  image.flags = kAllocTexture | kAllocReserved, image.format = Format::A8R8G8B8, image.width = image.height = 8;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, image, &none) == status::kInvalidParameter);
+  // Mapping: tile 0 to the start of the heap, tile 1 to its third tile, tile 2 nowhere.
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 1, heap, 2 * kTileBytes, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 2, 0, 0, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 3, heap, 0, 1) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, r, 0, heap, 100, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 3 * kTileBytes, 2) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, p, 0, heap, 0, 1) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, 0x7777, 0, 1) == status::kInvalidHandle);
+  std::vector<uint8_t> a(kTileBytes), b(kTileBytes);
+  for (uint32_t i = 0; i < kTileBytes; ++i) a[i] = static_cast<uint8_t>(i % 251 + 1), b[i] = static_cast<uint8_t>(i % 241 + 2);
+  CHECK(e.write(p, ConstByteView(a.data(), a.size())) && e.write(q, ConstByteView(b.data(), b.size())));
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data.size() == 3 * kTileBytes);
+  bool good = true;
+  for (uint32_t i = 0; i < kTileBytes && good; ++i) good = lock.data[i] == a[i] && lock.data[kTileBytes + i] == b[i] && lock.data[2 * kTileBytes + i] == 0;   // (what is mapped, and nowhere: zeros)
+  CHECK(good);
+  e.kernel.unlock(kPid, r);
+  // Writes through the reserved buffer reach the heap (and its placed allocations); those to an unmapped tile are dropped.
+  CHECK(e.kernel.lock(kPid, r, 0, 0, &lock) == status::kSuccess);
+  lock.data[kTileBytes + 100] = 0x5A;
+  lock.data[2 * kTileBytes + 7] = 0x77;
+  e.kernel.unlock(kPid, r);
+  CHECK(e.kernel.lock(kPid, q, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[100] == 0x5A);
+  e.kernel.unlock(kPid, q);
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[2 * kTileBytes + 7] == 0);
+  e.kernel.unlock(kPid, r);
+  // The other way: what is written to the heap through a placed allocation shows through the reserved one.
+  a[5] = 0xEE;
+  CHECK(e.write(p, ConstByteView(a.data(), a.size())));
+  CHECK(e.kernel.lock(kPid, r, kLockReadOnly, 0, &lock) == status::kSuccess && lock.data[5] == 0xEE);
+  e.kernel.unlock(kPid, r);
+  // The GPU reads it: a triangle written through the placed allocation is drawn from the reserved buffer.
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8);
+  Handle pipe = make_colored_pipeline(e, false);
+  CHECK(write_triangle(e, p, 0, 0, 1));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, r}) == status::kSuccess && e.pixel(target, 4, 4) == 0xFF0000FFu);
+  // Unmapped, the same draw gets zero vertices (nothing drawn).
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, 0, 0, 1) == status::kSuccess);
+  CommandWriter w2(e.allocator);
+  w2.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w2.bind_pipeline(pipe);
+  w2.bind_vertex_buffer(1);
+  w2.push_constants(floats(identity, 16));
+  w2.draw(3);
+  w2.end_pass();
+  CHECK(e.render(w2, {target, r}) == status::kSuccess && e.pixel(target, 4, 4) == 0xFF000000u);
+}
+
 // Geometry shaders with adjacency input and instances.
 void test_geometry_extras() {
   HostAllocator allocator;
@@ -5120,6 +6518,48 @@ void test_geometry_extras() {
       D3d9Program::compile_dxbc(allocator, ConstByteView(flipped.data(), flipped.size()), &bad);
     }
   }
+}
+
+// Derivatives through the whole draw: the rasterizer hands each pixel the corners of its quad, so ddx_fine of a function of the interpolated coordinate is its slope per pixel.
+void test_derivative_draw() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_dxil_ps_deriv_show, sizeof b::k_dxil_ps_deriv_show);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 32, 32), vb = e.buffer(kAllocVertexBuffer, 6 * 28);
+  const float corners[6][4] = {{-0.9f, -0.9f, 0, 0}, {0.9f, -0.9f, 1, 0}, {-0.9f, 0.9f, 0, 1}, {-0.9f, 0.9f, 0, 1}, {0.9f, -0.9f, 1, 0}, {0.9f, 0.9f, 1, 1}};
+  float v[42];
+  for (uint32_t i = 0; i < 6; ++i) {
+    const float* c = corners[i];
+    const float one[7] = {c[0], c[1], 0.5f, c[2] / 2, c[3] / 2, 1, 1};
+    for (uint32_t k = 0; k < 7; ++k) v[7 * i + k] = one[k];
+  }
+  CHECK(e.write(vb, floats(v, 42)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1.0f, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(6);
+  w.end_pass();
+  { const NtStatus rs = e.render(w, {target, vb}); if (rs != status::kSuccess) printf("render status %x\n", static_cast<unsigned>(rs)); CHECK(rs == status::kSuccess); }
+  // (at the middle u = v = 0.5: d(u v / 4 + u u) / du = 1.125 per unit, 1 / 28.8 unit per pixel, times 8 and 255: about 80; the blue one is a function of v only)
+  const uint32_t pixel = e.pixel(target, 16, 16);
+  const uint32_t red = (pixel >> 16) & 0xFF, blue = pixel & 0xFF;
+  CHECK(red >= 70 && red <= 90 && blue == 0);
+  // (the same pair of pixels of a quad gets the same value: fine derivatives are per row)
+  CHECK(((e.pixel(target, 16, 16) >> 16) & 0xFF) == ((e.pixel(target, 17, 16) >> 16) & 0xFF));
 }
 
 // Alpha to coverage on the CPU renderer: a quad of whole pixels keeps round(alpha * 4) of the 4 samples, so the resolved red is that many quarters (a GPU dithers fractions from pixel to pixel,
@@ -5185,6 +6625,7 @@ void test_conformance() {
       case SceneVerdict::Refused: ++l.refused; printf("  conformance: %s refused at %s\n", r.name, r.step); break;
       case SceneVerdict::Broken: ++l.broken; printf("  conformance: %s broken at %s: %x\n", r.name, r.step, static_cast<unsigned>(r.status)); break;
     }
+    if (!(r.device_picture && r.reference_picture && !r.reference_failed)) printf("  conformance scene failed: %s (%s) %x dev=%d ref=%d rf=%d\n", r.name, r.step, static_cast<unsigned>(r.status), !!r.device_picture, !!r.reference_picture, !!r.reference_failed);
     CHECK(r.device_picture && r.reference_picture && !r.reference_failed);
     if (__builtin_strstr(r.name, "float render target")) {
       // Where the two triangles overlap the target holds 2.5 in red (x 0.4 = 1.0); a clamping target would hold 1.0 there (x 0.4 = 0.4). One triangle alone gives 1.5 (x 0.4 = 0.6).
@@ -5724,11 +7165,24 @@ void test_dxbc_integers() {
         const uint32_t got[4] = {__builtin_bit_cast(uint32_t, c.x), __builtin_bit_cast(uint32_t, c.y), __builtin_bit_cast(uint32_t, c.z), __builtin_bit_cast(uint32_t, c.w)};
         CHECK(got[0] == 100 / 7 && got[1] == 1 && got[2] == 0xFFFFFFFFu / 2 && got[3] == 0xFFFFFFFFu);   // (x / 0 is all ones)
       }
+      // (the high word of a product: umul r5 (high), r6 (low))
       DxbcAsm high = dx_pixel_shader();
-      high.ins(81, {dx_dst(kOpTemp, 5, 0xF), dx_dst(kOpTemp, 6, 0xF), dx_src(kOpTemp, 1), dx_src(kOpTemp, 2)});   // the high word of a product is not taken
+      high.ins(54, {dx_dst(kOpTemp, 1, 0xF), dx_imm_bits(100, 7, 0xFFFFFFFFu, 9)});
+      high.ins(54, {dx_dst(kOpTemp, 2, 0xF), dx_imm_bits(7, 7, 2, 0)});
+      high.ins(81, {dx_dst(kOpTemp, 5, 0xF), dx_dst(kOpTemp, 6, 0xF), dx_src(kOpTemp, 1), dx_src(kOpTemp, 2)});
+      high.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 5)});
       high.ins(62, {});
-      compile_dxbc(allocator, high.build(), &st);
-      CHECK(st == status::kNotSupported);
+      DxbcAsm wrapped = high;
+      wrapped.code.insert(wrapped.code.begin(), {104u | (2u << 24), 8u});
+      UniquePointer<D3d9Program> hp = compile_dxbc(allocator, wrapped.build(), &st);
+      CHECK(st == status::kSuccess && hp);
+      if (hp) {
+        uint8_t constants[128] = {};
+        graphics::Vec4 varyings[4] = {}, c = {};
+        hp->run_fragment(varyings, constants, nullptr, &c);
+        const uint32_t got[4] = {__builtin_bit_cast(uint32_t, c.x), __builtin_bit_cast(uint32_t, c.y), __builtin_bit_cast(uint32_t, c.z), __builtin_bit_cast(uint32_t, c.w)};
+        CHECK(got[0] == 0 && got[1] == 0 && got[2] == 1 && got[3] == 0);
+      }
     }
   }
   CHECK(allocator.live == 0);
@@ -6477,11 +7931,21 @@ int main() {
   test_root_signature_parse();
   test_d3d12_binding();
   test_d3d12_compute();
+  test_d3d12_buffer_views();
+  test_d3d12_buffer_views_in_draw();
+  test_pixel_shader_stores();
+  test_vertex_shader_stores();
+  test_geometry_shader_stores();
+  test_gather_register_offsets();
   test_d3d12_barriers();
   test_d3d12_heaps();
+  test_d3d12_reserved();
+  test_d3d12_reserved_texture();
+  test_dxil();
   test_compute_shared();
   test_geometry_extras();
   test_alpha_to_coverage();
+  test_derivative_draw();
   test_conformance();
   test_occlusion_queries();
   test_texture_kinds();

@@ -38,6 +38,7 @@
 #include "SystemInventory.hpp"
 #include "SystemNetworkDetails.hpp"
 #include "SystemWirelessDetails.hpp"
+#include "SystemBluetoothDetails.hpp"
 #include "BootLog.hpp"
 #include "Graphics/Logo/Logo.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -52,6 +53,8 @@
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
+#include "Hardware/Bus/Rtsx/RtsxDriver.hpp"
+#include "Hardware/StorageDevice/Sd/SdStorageDevice.hpp"
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
@@ -90,8 +93,23 @@
 #include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Mouse/I2c/PlatformI2cHid.hpp"
+#include "Hardware/Power/PowerManager.hpp"
+#include "Hardware/Tpm/TpmDriver.hpp"
+#include "Hardware/Power/Thermal.hpp"
+#include "Hardware/Bus/Ish/IshDriver.hpp"
+#include "Hardware/Pen/PenMouse.hpp"
+#include "Hardware/Sensor/AcpiAmbientLight.hpp"
+#include "Hardware/Sensor/SensorHub.hpp"
+#ifdef TCOS_BLUETOOTH
+#include "Hardware/Bluetooth/BluetoothService.hpp"
+#include "Hardware/Bluetooth/HidOverGatt.hpp"
+#include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
+#endif
 #ifdef TCOS_INTEL_WIFI
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
+#include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Kernel/Apic.hpp"
+#include "Kernel/Interrupts.hpp"
 #endif
 #ifdef TCOS_THUNDERBOLT
 #include "Hardware/Bus/Pci/PciMsi.hpp"
@@ -113,6 +131,10 @@
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
+#include "Hardware/Acpi/DellWmiHotkeys.hpp"
+#include "Hardware/Backlight/AcpiBacklight.hpp"
+#include "Hardware/Backlight/AcpiVideoKeys.hpp"
+#include "Hardware/Backlight/IntelPchBacklight.hpp"
 #include "Hardware/Acpi/IoApic.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
@@ -169,6 +191,15 @@ static void demo_task(void* context) {
 
 using bootlog::Entry;
 using bootlog::Level;
+
+#ifdef TCOS_INTEL_WIFI
+// The Wi-Fi card's MSI: the transport masks the card and says an interrupt came; the interface looks at the card on its next call.
+static kernel::Frame* on_wifi_interrupt(kernel::Frame* frame, void* radio) {
+  kernel::apic::eoi();
+  static_cast<hardware::IwlWirelessInterface*>(radio)->on_interrupt();
+  return frame;
+}
+#endif
 
 #ifdef TCOS_THUNDERBOLT
 // The Thunderbolt host interface's MSI: the driver reads the chip's notify registers (which lets it interrupt again) and counts; the desktop loop then reads the control channel.
@@ -692,7 +723,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           .text(renderer->accelerated() ? " (GPU accelerated)" : " (software)");
       if (system_graphics.accelerated()) {
         const int groups = check_2d_groups(system_graphics.device(), shared_allocator);
-        Entry(groups > 0 ? Level::Ok : groups == 0 ? Level::Warning : Level::Info, "Graphics").text("2D offscreen groups: ").text(groups > 2 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips)" : groups > 1 ? "ok (opacity, composite, blur and colour filters; clips approximated)" : groups > 0 ? "ok (opacity, composite; no filters on this device)" : groups == 0 ? "WRONG on this device" : "not supported by this device");
+        Entry(groups > 0 ? Level::Ok : groups == 0 ? Level::Warning : Level::Info, "Graphics").text("2D offscreen groups: ").text(groups > 3 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips, drop shadows)" : groups > 2 ? "ok (opacity, composite, blur and colour filters, rounded and mask clips)" : groups > 1 ? "ok (opacity, composite, blur and colour filters; clips approximated)" : groups > 0 ? "ok (opacity, composite; no filters on this device)" : groups == 0 ? "WRONG on this device" : "not supported by this device");
+      }
+      if (system_graphics.accelerated()) {
+        const int fills = check_2d_fills(system_graphics.device(), shared_allocator);
+        Entry(fills > 0 ? Level::Ok : Level::Warning, "Graphics").text("2D tiled pictures and conic gradients: ").text(fills > 0 ? "ok" : "WRONG on this device");
+      }
+      if (system_graphics.accelerated()) {
+        const int glyphs = check_2d_glyphs(system_graphics.device(), shared_allocator);
+        Entry(glyphs > 0 ? Level::Ok : glyphs == 0 ? Level::Warning : Level::Info, "Graphics").text("2D glyph atlas: ").text(glyphs > 0 ? "ok (kept on the GPU, tinted by the GPU)" : glyphs == 0 ? "WRONG on this device" : "not supported by this device");
       }
       if (!system_graphics.accelerated())
         Entry(system_gpu.virtio_gpu() || system_gpu.vmware_gpu() ? Level::Warning : Level::Info, "Graphics").text("no 3D acceleration: ").text(system_graphics.software_reason());
@@ -939,6 +978,27 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (info.read_only) e.text(", read-only");
     if (info.removable) e.text(", removable");
   }
+#ifdef TCOS_SDCARD
+  // The SD card slot of a Realtek card reader: a card put in is a removable storage device like a USB stick (the card is looked for by the same polling that watches the USB ports).
+  UniquePointer<hardware::RtsxDriver> card_reader;
+  UniquePointer<hardware::SdSlotSource> sd_slot;
+  if (paging_ok) {
+    for (uint32_t i = 0; i < pci.device_count() && !card_reader; ++i) {
+      hardware::PciDeviceInfo d;
+      if (!pci.pci_device(i, &d) || !hardware::RtsxDriver::supports(d)) continue;
+      card_reader = UniquePointer<hardware::RtsxDriver>::make(shared_allocator, shared_allocator);
+      if (!card_reader) break;
+      const hardware::RtsxDriver::Outcome outcome = card_reader->start(pci, d, register_mapper);
+      Entry(outcome == hardware::RtsxDriver::Outcome::Started ? Level::Ok : Level::Warning, "Storage").text("SD card reader: ").text(hardware::RtsxDriver::outcome_name(outcome));
+      if (outcome == hardware::RtsxDriver::Outcome::Started) {
+        sd_slot = UniquePointer<hardware::SdSlotSource>::make(shared_allocator, *card_reader->host(), shared_allocator);
+        if (sd_slot) storage.add_source(sd_slot.get());
+      } else {
+        card_reader = UniquePointer<hardware::RtsxDriver>();
+      }
+    }
+  }
+#endif
 #ifdef TCOS_SELFTESTS
   if (!run_storage_demo(storage, shared_allocator)) console::puts("  storage self-check incomplete\n");
   if (!run_filesystem_demo(storage, shared_allocator)) console::puts("  filesystem self-check incomplete\n");
@@ -1007,6 +1067,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);
+#ifdef TCOS_BLUETOOTH
+  hardware::HidOverGatt bluetooth_hid(shared_allocator);      // Bluetooth keyboards and mice: a profile for the Bluetooth manager and a source of input devices for SystemInput (it outlives both)
+#endif
   input.set_vmmdev(guest.virtualbox());
   input.initialize();
   // The touchpad and the touchscreen of a laptop are HID devices on an I2C bus behind the chipset (ACPI PNP0C50): found through the ACPI tables, and added to the mouse.
@@ -1014,14 +1077,38 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SystemAcpiHost i2c_acpi_host(&pci, paging_ok ? &mmio : nullptr);
   hardware::MmioI2cRegisterSource i2c_registers(register_mapper);
   hardware::PlatformI2cHid i2c_hid(shared_allocator, pci, i2c_registers, register_mapper, clock, i2c_acpi_host);
+  // Pens and sensors: any driver adds its devices here; the pen is also an absolute mouse, so every program works with it.
+  hardware::CompositePen pens;
+  hardware::PenMouse pen_mouse(pens);
+  hardware::SensorHub sensors;
+  input.mice().add(&pen_mouse);
+  i2c_hid.set_pens(&pens);
+  i2c_hid.set_sensors(&sensors);
   if (paging_ok && i2c_acpi_tables.initialize()) {
     const uint32_t started = i2c_hid.start(i2c_acpi_tables, input.mice());
     for (uint32_t i = 0; i < i2c_hid.report_count(); ++i) {
       const hardware::PlatformI2cHid::Report& r = i2c_hid.report(i);
-      Entry(r.outcome == hardware::PlatformI2cHid::Outcome::Started ? Level::Ok : Level::Warning, "Input").text("I2C HID ").text(r.device).text(": ").text(hardware::PlatformI2cHid::outcome_name(r.outcome));
+      Entry(r.outcome == hardware::PlatformI2cHid::Outcome::Started ? Level::Ok : Level::Warning, "Input").text("I2C HID ").text(r.device).text(": ").text(hardware::PlatformI2cHid::outcome_name(r.outcome)).text(r.pen ? ", with a pen" : "");
+      if (r.sensors) Entry(Level::Ok, "Sensor").text("I2C HID ").text(r.device).text(": ").dec(r.sensors).text(" sensor(s)");
     }
     if (started) Entry(Level::Info, "Input").dec(started).text(" pointing device(s) on I2C");
   }
+#ifdef TCOS_ISH
+  // The Intel sensor hub: its sensors (accelerometer, gyroscope, magnetometer, ambient light) join the I2C and ACPI ones in the sensor hub.
+  UniquePointer<hardware::IshDriver> ish;
+  if (paging_ok) {
+    for (uint32_t i = 0; i < pci.device_count() && !ish; ++i) {
+      hardware::PciDeviceInfo d;
+      if (!pci.pci_device(i, &d) || !hardware::IshDriver::supports(d)) continue;
+      ish = UniquePointer<hardware::IshDriver>::make(shared_allocator, shared_allocator);
+      if (!ish) break;
+      const hardware::IshDriver::Outcome outcome = ish->start(pci, d, register_mapper, &sensors);
+      Entry(outcome == hardware::IshDriver::Outcome::Started ? Level::Ok : Level::Warning, "Sensor").text("Intel sensor hub: ").text(hardware::IshDriver::outcome_name(outcome));
+      if (outcome == hardware::IshDriver::Outcome::Started) Entry(Level::Info, "Sensor").dec(ish->sensor_count()).text(" sensor(s) through the ISH");
+      else ish = UniquePointer<hardware::IshDriver>();
+    }
+  }
+#endif
   Entry(input.keyboards().count() ? Level::Ok : Level::Warning, "Input").dec(input.keyboards().count()).text(" keyboards");
   for (uint32_t i = 0; i < input.keyboards().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.keyboards().at(i)->name());
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
@@ -1137,11 +1224,35 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // Network shares (SMB, NFS, SFTP, FTPS): folders of the explorer's tree whose contents are the shares of the servers the user goes to.
     TimingEntropy timing_entropy;
     crypto::CpuEntropySource cpu_entropy;
+    crypto::IEntropySource* tpm_entropy_source = nullptr;      // the TPM's generator, where the system has a TPM and was built to use it
+    uint8_t tpm_seed[32] = {};
+    bool have_tpm_seed = false;
+#ifdef TCOS_TPM
+    hardware::TpmDriver tpm(shared_allocator);
+    UniquePointer<hardware::TpmEntropySource> tpm_entropy;
+    if (paging_ok) {
+      hardware::AcpiTables tpm_tables(st);
+      const ConstByteView table = tpm_tables.initialize() ? tpm_tables.find("TPM2") : ConstByteView();
+      const hardware::TpmDriver::Outcome outcome = tpm.start(table, register_mapper);
+      Entry(outcome == hardware::TpmDriver::Outcome::Started ? Level::Ok : Level::Info, "TPM").text(outcome == hardware::TpmDriver::Outcome::Started ? tpm.device()->transport_name() : "").text(outcome == hardware::TpmDriver::Outcome::Started ? ": started" : hardware::TpmDriver::outcome_name(outcome));
+      if (outcome == hardware::TpmDriver::Outcome::Started) {
+        uint32_t manufacturer = 0, firmware = 0;
+        if (tpm.device()->property(hardware::tpm::kPtManufacturer, &manufacturer) && tpm.device()->property(hardware::tpm::kPtFirmwareVersion1, &firmware)) {
+          char vendor[5] = {static_cast<char>(manufacturer >> 24), static_cast<char>(manufacturer >> 16), static_cast<char>(manufacturer >> 8), static_cast<char>(manufacturer), 0};
+          for (char& c : vendor) if (c && (c < 0x20 || c > 0x7E)) c = '?';
+          Entry(Level::Info, "TPM").text("manufacturer ").text(vendor).text(", firmware ").dec(firmware >> 16).text(".").dec(firmware & 0xFFFF);
+        }
+        have_tpm_seed = tpm.device()->get_random(ByteView(tpm_seed, sizeof tpm_seed));
+        tpm_entropy = UniquePointer<hardware::TpmEntropySource>::make(shared_allocator, *tpm.device());
+        if (tpm_entropy) tpm_entropy_source = tpm_entropy.get();
+      }
+    }
+#endif
     crypto::IEntropySource& smb_entropy = crypto::CpuEntropySource::available() ? static_cast<crypto::IEntropySource&>(cpu_entropy)
-        : guest.entropy() ? *guest.entropy() : static_cast<crypto::IEntropySource&>(timing_entropy);
+        : guest.entropy() ? *guest.entropy() : tpm_entropy_source ? *tpm_entropy_source : static_cast<crypto::IEntropySource&>(timing_entropy);
     crypto::DrbgRandom smb_random(smb_entropy);
     crypto::DrbgRandom web_random(smb_entropy);   // crypto.getRandomValues() and the keys web pages make
-    if (web_random.initialize()) browser::set_system_random(&web_random);
+    if (web_random.initialize(ConstByteView(tpm_seed, have_tpm_seed ? sizeof tpm_seed : 0))) browser::set_system_random(&web_random);   // (the TPM's bytes are added to the seed)
     network::StackSetNetwork smb_network(stacks);
     // Databases (PostgreSQL) for the programs that want them, reached over the same interfaces. TLS needs a trust store, which this system does not ship:
     // connections are plain until one is given (SystemDatabases::transport().set_tls()).
@@ -1174,6 +1285,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_INTEL_WIFI
     // The Intel Wireless-AC 9560 (and the rest of the 9000 series) as a network interface: the firmware from /firmware is started, and the card then scans and joins networks through the
     // Wi-Fi window; its network stack gets an address (DHCP) whenever it is joined. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
+    UniquePointer<hardware::PciMsi> wifi_msi;                       // the card's MSI, when the machine delivers it
     if (clock_ok && paging_ok) {
       hardware::FileSystemFirmwareSource wifi_firmware(explorer_files.file_system(), shared_allocator);
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
@@ -1193,6 +1305,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (wifi->initialize()) {
           hardware::IwlWirelessInterface* radio = wifi.get();
           const hardware::MacAddress mac = radio->mac_address();
+          // MSI: the handler, then the message to the core that runs this; kept only if the answer to a command of the card interrupts. Else the card is polled, as before.
+          const uint32_t wifi_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
+          if (wifi_apic_id <= 0xFF) {
+            kernel::set_interrupt_handler(kernel::kVectorWifi, &on_wifi_interrupt, radio);
+            wifi_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
+            bool interrupts = wifi_msi && wifi_msi->enable(d.address, 0xFEE00000u | (wifi_apic_id << 12), kernel::kVectorWifi) && radio->use_interrupts(true) && radio->verify_interrupts();
+            if (!interrupts) {
+              radio->use_interrupts(false);
+              wifi_msi = UniquePointer<hardware::PciMsi>();
+              kernel::set_interrupt_handler(kernel::kVectorWifi, nullptr, nullptr);
+            }
+            Entry(interrupts ? Level::Ok : Level::Info, "Wi-Fi").text(interrupts ? "interrupts: MSI" : "no interrupt from the card: polled");
+          }
           stacks.stop_service();                                       // (a stack for it; the others keep theirs)
           if (network.adopt(util::move(wifi)) && stacks.add(*radio)) {
             Entry e(Level::Ok, "Wi-Fi");
@@ -1207,6 +1332,46 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           Entry(Level::Warning, "Wi-Fi").text("Intel Wireless-AC not started: ").text(wifi->failure());
         }
         break;
+      }
+    }
+#endif
+#ifdef TCOS_BLUETOOTH
+    // The Bluetooth controllers on the USB ports (the Intel one on the Wireless-AC 9560 among them): its firmware, /firmware/ibt-*.sfi (the name without Linux's intel/ directory), is
+    // loaded and the controller brought up. Nothing is scanned, paired or connected. Opt-in (-DTCOS_BLUETOOTH=ON): none of it has run on a real controller.
+    struct BluetoothFirmwareFiles final : hardware::IBluetoothFirmwareSource {
+      hardware::FileSystemFirmwareSource files;
+      BluetoothFirmwareFiles(filesystem::IFileSystem& file_system, allocators::IAllocator& allocator) : files(file_system, allocator) {}
+      bool read(const char* name, ByteBuffer& out) override {
+        const char prefix[] = "intel/";
+        uint32_t skip = 0;
+        while (prefix[skip] && name[skip] == prefix[skip]) ++skip;
+        return files.read(name + (prefix[skip] ? 0 : skip), out);
+      }
+    } bluetooth_files(explorer_files.file_system(), shared_allocator);
+    hardware::FileBluetoothBonds bluetooth_bonds(explorer_files.file_system(), shared_allocator);
+    if (!smb_random.ready()) smb_random.initialize();
+    UniquePointer<hardware::BluetoothService> bluetooth = UniquePointer<hardware::BluetoothService>::make(shared_allocator, &usb, &bluetooth_files, shared_allocator, smb_random.ready() ? &smb_random : nullptr, &bluetooth_bonds);
+    uint32_t bluetooth_bonds_saved = 0;
+    UniquePointer<SystemBluetoothDetails> bluetooth_details;
+    if (bluetooth && paging_ok) {
+      bluetooth_details = UniquePointer<SystemBluetoothDetails>::make(shared_allocator, *bluetooth);      // (the window's view of it, and the pairing questions)
+      inventory.set_bluetooth(bluetooth.get());
+      bluetooth->add_profile(&bluetooth_hid);
+      input.add_source(&bluetooth_hid);
+      bluetooth->start();
+      bluetooth_bonds_saved = bluetooth->bonds().count();
+      for (uint32_t i = 0; i < bluetooth->count(); ++i) {
+        const hardware::BluetoothService::Entry* e = bluetooth->entry(i);
+        Entry log(e->state == hardware::BluetoothState::Ready ? Level::Ok : Level::Warning, "Bluetooth");
+        if (e->state == hardware::BluetoothState::Ready) {
+          const hardware::hci::BdAddr& a = e->controller->info().address;
+          log.text("controller ");
+          for (int b = 5; b >= 0; --b) log.hex2(a.b[b]).text(b > 0 ? ":" : "");
+          log.text(", ready");
+        } else {
+          log.text("controller not started: ").text(e->message);
+          if (e->firmware[0]) log.text(" (").text(e->firmware).text(")");
+        }
       }
     }
 #endif
@@ -1575,6 +1740,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_device_details(&inventory);
     desktop.set_network_details(&network_details);
     desktop.set_wireless_details(&wireless_details);
+#ifdef TCOS_BLUETOOTH
+    if (bluetooth_details) desktop.set_bluetooth_details(bluetooth_details.get());
+#endif
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
     desktop.set_capture_hub(capture_hub.get());
     desktop.set_midi_output(&usb_midi);
@@ -1677,6 +1845,95 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         Entry(Level::Info, "Thunderbolt").text(controller ? "the controller names no wake event in the ACPI tables" : "the controller is not described in the ACPI tables");
     }
 #endif
+    // The screen's brightness (the Fn keys and the firmware's brightness notifications): the panel's ACPI methods if the tables have them, else the PWM of the PCH as the firmware left it.
+    hardware::AcpiBacklight* acpi_backlight_ptr = nullptr;
+    UniquePointer<hardware::AcpiBacklight> acpi_backlight;
+    UniquePointer<hardware::AcpiVideoKeys> acpi_video_keys;
+    UniquePointer<hardware::IntelPchBacklight> pch_backlight;
+    UniquePointer<hardware::DellWmiHotkeys> dell_hotkeys;
+#ifdef TCOS_ACPI_EVENTS
+    if (acpi_events) {
+      acpi::Node* panels[4];
+      const uint32_t found = hardware::AcpiBacklight::find_devices(acpi_events->interpreter(), panels, 4);
+      for (uint32_t i = 0; i < found && !acpi_backlight; ++i) {
+        auto candidate = UniquePointer<hardware::AcpiBacklight>::make(shared_allocator, acpi_events->interpreter(), panels[i]);
+        if (candidate && candidate->initialize()) acpi_backlight = static_cast<UniquePointer<hardware::AcpiBacklight>&&>(candidate);
+      }
+      if (acpi_backlight) {
+        acpi_backlight_ptr = acpi_backlight.get();
+        desktop.set_backlight(acpi_backlight.get());
+        acpi_video_keys = UniquePointer<hardware::AcpiVideoKeys>::make(shared_allocator, *acpi_backlight,
+            [](void* d, bool brighter) { static_cast<desktop::Desktop*>(d)->adjust_brightness(brighter ? 10 : -10); }, &desktop);
+        if (acpi_video_keys) acpi_events->add_listener(acpi_video_keys.get());
+        Entry(Level::Ok, "Display").text("backlight: ACPI, ").dec(acpi_backlight->steps()).text(" levels");
+      }
+      // Dell's hotkeys (ACPI-WMI): mute and, when the video extensions do not report the brightness keys themselves, brightness.
+      dell_hotkeys = UniquePointer<hardware::DellWmiHotkeys>::make(shared_allocator, acpi_events->interpreter(),
+          [](void* d, uint8_t key) { if (key != hardware::kDellMicMute) static_cast<desktop::Desktop*>(d)->handle_media_key(key); }, &desktop, !acpi_backlight_ptr);
+      if (dell_hotkeys && dell_hotkeys->scan() != 0 && acpi_events->add_listener(dell_hotkeys.get()))
+        Entry(Level::Ok, "Keyboard").text("Dell hotkeys through ACPI-WMI (").dec(dell_hotkeys->device_count()).text(" device)");
+    }
+#endif
+    if (!acpi_backlight_ptr) {
+      hardware::IntelRenderHardware render;
+      if (hardware::IntelGpu* intel = system_gpu.intel_gpu(); intel && intel->render_hardware(&render) && render.registers) {
+        pch_backlight = UniquePointer<hardware::IntelPchBacklight>::make(shared_allocator, *render.registers);
+        if (pch_backlight && pch_backlight->initialize()) {
+          desktop.set_backlight(pch_backlight.get());
+          Entry(Level::Ok, "Display").text("backlight: Intel PCH PWM");
+        }
+      }
+    }
+#ifdef TCOS_ACPI_EVENTS
+    // The ambient light sensor of the firmware (ACPI0008) next to the sensor hubs found on I2C.
+    UniquePointer<hardware::AcpiAmbientLight> acpi_light;
+    if (acpi_events) {
+      acpi::Node* lights[2];
+      const uint32_t found = hardware::AcpiAmbientLight::find_devices(acpi_events->interpreter(), lights, 2);
+      for (uint32_t i = 0; i < found && !acpi_light; ++i) {
+        auto candidate = UniquePointer<hardware::AcpiAmbientLight>::make(shared_allocator, acpi_events->interpreter(), lights[i]);
+        if (candidate && candidate->initialize()) acpi_light = static_cast<UniquePointer<hardware::AcpiAmbientLight>&&>(candidate);
+      }
+      if (acpi_light && sensors.add(acpi_light.get())) Entry(Level::Ok, "Sensor").text("ambient light sensor through ACPI");
+    }
+#endif
+#ifdef TCOS_POWER
+    // Power management: the processor's speed range and idle states under a profile that follows the battery, and a ceiling on the speed when something runs hot.
+    hardware::HostMsr host_msr;
+    hardware::CpuPowerCaps power_caps = hardware::probe_cpu_power_caps();
+    hardware::CpuPower cpu_power(host_msr);
+    struct CpuCeiling final : hardware::IThermalActuator {
+      hardware::CpuPower* cpu = nullptr;
+      bool set_ceiling_percent(uint32_t percent) override { return cpu && cpu->set_ceiling_percent(percent); }
+    } cpu_ceiling;
+    cpu_ceiling.cpu = &cpu_power;
+    hardware::PowerManager power_manager(cpu_power, power_caps, kernel::set_idle_mwait_hint);
+    hardware::ThermalManager thermal(&cpu_ceiling);
+    hardware::CpuThermalSource cpu_thermal(&pci);
+    thermal.add(&cpu_thermal);
+    UniquePointer<hardware::AcpiThermalZone> thermal_zones[4];
+    const bool power_ok = cpu_power.initialize(power_caps);
+    if (power_ok) {
+      power_manager.start();
+      Entry(Level::Ok, "Power").text(cpu_power.uses_hwp() ? "hardware P-states: ratios " : "SpeedStep: ratios ").dec(cpu_power.lowest_ratio()).text(" to ").dec(cpu_power.highest_ratio()).text(" (x100 MHz), profile ").text(hardware::power_profile_name(power_manager.profile()));
+      Entry(Level::Info, "Power").text("idle cores wait with ").text(hardware::CpuPower::idle_hint(power_caps, power_manager.profile()) == 0xFFFFFFFFu ? "HLT" : "MWAIT");
+    } else {
+      Entry(Level::Info, "Power").text("no speed control on this processor (a virtual machine, or no HWP / SpeedStep)");
+    }
+#ifdef TCOS_ACPI_EVENTS
+    if (acpi_events) {
+      acpi::Node* zones[4];
+      const uint32_t found = hardware::AcpiThermalZone::find_zones(acpi_events->interpreter(), zones, 4);
+      for (uint32_t i = 0; i < found; ++i) {
+        thermal_zones[i] = UniquePointer<hardware::AcpiThermalZone>::make(shared_allocator, acpi_events->interpreter(), zones[i]);
+        if (thermal_zones[i]) thermal.add(thermal_zones[i].get());
+      }
+      if (found) Entry(Level::Info, "Power").dec(found).text(" ACPI thermal zone(s)");
+    }
+#endif
+    uint64_t power_battery_ms = 0;
+    bool thermal_warned = false;
+#endif
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);
@@ -1769,6 +2026,49 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
       }
 #endif
+#ifdef TCOS_BLUETOOTH
+      if (bluetooth) {
+        static uint32_t bluetooth_idle = 0;
+        if (++bluetooth_idle >= 25) {                                // (about every 100 ms: events read, controllers plugged in or pulled out noticed)
+          bluetooth_idle = 0;
+          bluetooth->step(true);
+          if (bluetooth->bonds().count() != bluetooth_bonds_saved) {                  // (a device was paired: the keys are kept)
+            bluetooth_bonds_saved = bluetooth->bonds().count();
+            bluetooth->save_bonds();
+          }
+        }
+      }
+#endif
+#ifdef TCOS_ISH
+      if (ish) ish->poll();
+#endif
+#ifdef TCOS_POWER
+      {
+        const uint64_t now_ms = hardware::uptime_us() / 1000;
+        if (power_ok && now_ms - power_battery_ms >= 10000) {                   // the battery is a few reads of the embedded controller: every ten seconds
+          power_battery_ms = now_ms;
+          const desktop::TaskBattery tb = monitor.battery();
+          hardware::BatteryStatus status;
+          status.present = tb.present;
+          status.percent = tb.percent;
+          status.state = tb.state == desktop::ChargeState::Charging ? hardware::BatteryState::Charging : tb.state == desktop::ChargeState::Discharging ? hardware::BatteryState::Discharging :
+                         tb.state == desktop::ChargeState::Full ? hardware::BatteryState::Full : tb.state == desktop::ChargeState::NotCharging ? hardware::BatteryState::NotCharging : hardware::BatteryState::Unknown;
+          if (power_manager.update(status, now_ms)) desktop.notify("Power", power_manager.profile() == hardware::PowerProfile::PowerSaver ? "Battery is low: power saver profile" : "Balanced power profile", gui::NoticeKind::Information);
+        }
+        if (thermal.poll(now_ms)) {
+          if (thermal.ceiling_percent() < 100 && !thermal_warned) {
+            thermal_warned = true;
+            desktop.notify("Temperature", "The machine is hot; the processor is slowed down", gui::NoticeKind::Warning);
+          } else if (thermal.ceiling_percent() == 100) {
+            thermal_warned = false;
+          }
+        }
+        if (thermal.critical() && !desktop.shutdown_requested()) {
+          desktop.notify("Temperature", "Critical temperature: shutting down", gui::NoticeKind::Error);
+          desktop.request_shutdown();
+        }
+      }
+#endif
 #ifdef TCOS_ACPI_EVENTS
       if (acpi_events) {
         static uint32_t acpi_idle = 0;
@@ -1797,6 +2097,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           acpi_seen.lid_closed = acpi_buttons.lid_closed;
           acpi_seen.lid_opened = acpi_buttons.lid_opened;
           Entry(Level::Info, "ACPI").text(closed ? "lid closed" : "lid opened");
+          desktop.set_display_blanked(closed);                       // (the backlight goes out with the lid)
           desktop.notify(StringView("Lid"), StringView(closed ? "The lid was closed" : "The lid was opened"), gui::NoticeKind::Information);
         }
       }
@@ -1921,6 +2222,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   Entry(Level::Ok, "Shutdown").text("threads stopped");
   i2c_hid.stop(input.mice());
+  input.mice().remove(&pen_mouse);
   input.shutdown();
   guest.shutdown();
   hyperv.shutdown();

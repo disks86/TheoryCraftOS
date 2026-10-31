@@ -99,7 +99,7 @@ struct Shot {
   }
   uint32_t px(uint32_t x, uint32_t y) const { return image.frame(0)[y * width + x]; }
   // The same list drawn by the device renderer (on the software device): its offscreen groups move the transformed content. Returns the frame.
-  std::vector<uint32_t> via_device() const {
+  std::vector<uint32_t> via_device(browser::IObjectPainter* pictures = nullptr) const {
     graphics::SoftwareDevice device(g_alloc, nullptr);
     graphics::DeviceRenderer2D renderer(device, g_alloc, {width, height});
     std::vector<uint32_t> frame(static_cast<size_t>(width) * height, 0);
@@ -107,7 +107,7 @@ struct Shot {
     const uint32_t paper = list.background() ? list.background() : 0xFFFFFFFFu;
     renderer.set_blend(graphics::BlendMode::Replace);
     renderer.fill_rect(graphics::Rect2D{0, 0, width, height}, paper);
-    paint::DisplayPainter painter(g_alloc, *g_fonts, nullptr);
+    paint::DisplayPainter painter(g_alloc, *g_fonts, pictures);
     painter.paint(renderer, list, 0, 0, graphics::Rect2D{0, 0, width, height});
     renderer.read_pixels(ArrayView<uint32_t>(frame.data(), frame.size()));
     return frame;
@@ -407,6 +407,86 @@ static void test_shadows_on_device() {
     if (far * 25 >= inked) printf("shadow page differs: far %u inked %u: %s\n", far, inked, body);
     CHECK(far * 25 < inked);
   }
+}
+
+// text-shadow blur and filter: drop-shadow() through the device renderer's group filters agree with the CPU's.
+static void test_text_and_drop_shadows_on_device() {
+  const char* pages[] = {
+      "<div style='margin:20px;font:24px sans-serif;color:#fff;background:#222;width:90px;height:40px;text-shadow:2px 2px 4px #f00'>Shade</div>",
+      "<div style='margin:20px;font:26px sans-serif;color:#036;text-shadow:0 0 6px #fa0, 1px 1px 0 #000'>Glow</div>",
+      "<div style='margin:25px;width:40px;height:30px;background:#e22;filter:drop-shadow(6px 5px 4px #000)'></div>",
+      "<div style='margin:20px;width:40px;height:30px;border-radius:15px;background:#2a6;filter:drop-shadow(0 0 6px rgba(0,0,200,.9)) brightness(1.2)'></div>",
+      "<div style='margin:25px;width:30px;height:30px;background:#e22;filter:drop-shadow(4px 4px 0 #00f)'></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 140, 100);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 40)) ++far;
+      }
+    CHECK(inked > 200);
+    if (far * 12 >= inked) printf("shadow page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 12 < inked);
+  }
+}
+
+// Conic and hinted gradients through the device renderer (wedges, extra stops) agree with the CPU's pixel by pixel colors, to a small error.
+static void test_special_gradients_on_device() {
+  const char* pages[] = {
+      "<div style='width:100px;height:100px;background:conic-gradient(#f00 0%,#f00 25%,#0f0 25%,#0f0 50%,#00f 50%,#00f 75%,#ff0 75%,#ff0 100%)'></div>",
+      "<div style='width:100px;height:100px;background:conic-gradient(from 40deg at 30% 60%,#000,#fff,#08f,#000)'></div>",
+      "<div style='width:100px;height:100px;background:repeating-conic-gradient(#f00 0 10%,#00f 10% 20%)'></div>",
+      "<div style='width:80px;height:80px;border-radius:40px;background:conic-gradient(#f00,#00f)'></div>",
+      "<div style='width:100px;height:30px;background:linear-gradient(90deg,#f00,30%,#00f)'></div>",
+      "<div style='width:100px;height:60px;background:radial-gradient(circle at 50% 50%,#fff,70%,#036)'></div>",
+      "<div style='width:100px;height:30px;background:repeating-linear-gradient(90deg,#f00,20%,#00f 40px)'></div>",
+  };
+  for (const char* body : pages) {
+    Shot cpu(page(body), 120, 120);
+    const std::vector<uint32_t> gpu = cpu.via_device();
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 14)) ++far;
+      }
+    CHECK(inked > 2000);
+    if (far * 40 > inked) printf("gradient page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 40 <= inked);   // (hard edges and the rim of the shapes may differ by a pixel)
+  }
+}
+
+// Border line styles: dashes leave gaps, dots are round or square, double has two lines, groove and ridge two shades. With TCOS_HASH set the frames are hashed to the
+// output (to compare two builds of the painter).
+static void test_border_styles() {
+  const char* styles[] = {"dashed", "dotted", "double", "groove", "ridge", "inset", "outset", "solid"};
+  for (const char* style : styles) {
+    for (const int width : {1, 2, 3, 6}) {
+      for (const char* extra : {"", "border-radius:12px;", "border-color:#c00 #0a0 #00c #aa0;", "border-top-width:0;"}) {
+        char body[400];
+        snprintf(body, sizeof body, "<div style='margin:10px;width:90px;height:50px;background:#fff;border:%dpx %s #036;%s'></div>", width, style, extra);
+        Shot s(page(body), 130, 90);
+        if (getenv("TCOS_HASH")) {
+          uint64_t h = 1469598103934665603ull;
+          for (uint32_t y = 0; y < s.height; ++y)
+            for (uint32_t x = 0; x < s.width; ++x) h = (h ^ s.px(x, y)) * 1099511628211ull;
+          printf("HASH %s %d [%s] %016llx\n", style, width, extra, static_cast<unsigned long long>(h));
+        }
+      }
+    }
+  }
+  // the straight part of a dashed side has ink and gaps
+  Shot d(page("<div style='margin:10px;width:90px;height:50px;border:3px dashed #000'></div>"), 130, 90);
+  int inked = 0, gaps = 0;
+  for (uint32_t x = 30; x < 90; ++x) (d.px(x, 11) != 0xFFFFFFFFu ? inked : gaps)++;
+  CHECK(inked > 15 && gaps > 10);
+  Shot o(page("<div style='margin:10px;width:90px;height:50px;border:6px double #000'></div>"), 130, 90);
+  CHECK(o.px(50, 10) != 0xFFFFFFFFu && o.px(50, 12) == 0xFFFFFFFFu && o.px(50, 15) != 0xFFFFFFFFu);   // two lines with a gap between
 }
 
 static void test_transforms() {
@@ -815,12 +895,22 @@ struct TestPictures final : browser::IObjectPainter {
     const std::string u = text(url);
     if (u == "tile.png") { *w = 8; *h = 8; return true; }
     if (u == "wide.png") { *w = 100; *h = 50; return true; }
+    if (u == "pattern.png") { *w = 6; *h = 4; return true; }
     return false;
   }
   void paint_background_image(graphics::IRenderer2D& r, StringView url, int32_t x, int32_t y, uint32_t w, uint32_t h, const browser::Rect2D& clip) override {
     calls.push_back({text(url), x, y, w, h, clip});
     r.push_clip_rect(clip);
-    r.fill_rect(graphics::Rect2D{x, y, w, h}, text(url) == "tile.png" ? 0xFFFF0000u : 0xFF00AA00u);
+    if (text(url) == "pattern.png") {   // four colours, one in each quarter, and a translucent stripe
+      const uint32_t hw = w / 2, hh = h / 2;
+      r.fill_rect(graphics::Rect2D{x, y, hw, hh}, 0xFFFF0000u);
+      r.fill_rect(graphics::Rect2D{x + static_cast<int32_t>(hw), y, w - hw, hh}, 0xFF00AA00u);
+      r.fill_rect(graphics::Rect2D{x, y + static_cast<int32_t>(hh), hw, h - hh}, 0xFF0000FFu);
+      r.fill_rect(graphics::Rect2D{x + static_cast<int32_t>(hw), y + static_cast<int32_t>(hh), w - hw, h - hh}, 0xFFFFFF00u);
+      r.fill_rect(graphics::Rect2D{x, y + 1, w, 1}, 0x80000000u);
+    } else {
+      r.fill_rect(graphics::Rect2D{x, y, w, h}, text(url) == "tile.png" ? 0xFFFF0000u : 0xFF00AA00u);
+    }
     r.pop_clip();
   }
   bool has(int32_t x, int32_t y, uint32_t w, uint32_t h) const {
@@ -829,6 +919,35 @@ struct TestPictures final : browser::IObjectPainter {
     return false;
   }
 };
+
+// Patterns of a picture (many tiles) through the device renderer: one texture the sampler repeats, the same pixels as the CPU's copies.
+static void test_tiled_backgrounds_on_device() {
+  const char* pages[] = {
+      "<div style='width:100px;height:60px;background:url(pattern.png)'></div>",
+      "<div style='margin:7px;width:90px;height:50px;background:url(pattern.png) 3px 2px'></div>",
+      "<div style='width:100px;height:60px;background:url(pattern.png) 0 0/12px 8px'></div>",
+      "<div style='width:100px;height:40px;background:url(pattern.png) repeat-x 0 0/3px 4px'></div>",
+      "<div style='width:96px;height:60px;border-radius:20px;background:url(pattern.png) 5px 5px'></div>",
+      "<div style='width:100px;height:60px;background:url(pattern.png) round 0 0/9px 7px'></div>",
+  };
+  for (const char* body : pages) {
+    TestPictures pictures;
+    Shot cpu(page(body), 120, 80, &pictures);
+    TestPictures again;
+    const std::vector<uint32_t> gpu = cpu.via_device(&again);
+    uint32_t far = 0, inked = 0;
+    for (uint32_t y = 0; y < cpu.height; ++y)
+      for (uint32_t x = 0; x < cpu.width; ++x) {
+        const uint32_t a = cpu.px(x, y), b = gpu[y * cpu.width + x];
+        if (a != 0xFFFFFFFFu) ++inked;
+        if (!near_color(a, b, 2)) ++far;
+      }
+    CHECK(inked > 300);
+    if (far * 100 > inked) printf("tiled page differs: far %u inked %u: %s\n", far, inked, body);
+    CHECK(far * 100 <= inked);   // (the `round` page may differ by a texel here and there)
+    CHECK(again.calls.size() <= 2);   // (the tile is painted once, not once per copy)
+  }
+}
 
 static void test_background_images() {
   // repeated by default: the tiles that show, and no others
@@ -942,6 +1061,10 @@ int main() {
     test_filters_on_device();
     test_clips_on_device();
     test_shadows_on_device();
+    test_text_and_drop_shadows_on_device();
+    test_tiled_backgrounds_on_device();
+    test_special_gradients_on_device();
+    test_border_styles();
     test_filters();
     test_shadows();
     test_gradients_more();

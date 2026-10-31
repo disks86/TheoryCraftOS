@@ -31,9 +31,15 @@ uint32_t nt_create_pipe(Process& p, const SyscallRequest& r);
 // ULONG ReadMode, ULONG CompletionMode, ULONG MaximumInstances, ULONG InboundQuota, ULONG OutboundQuota, PLARGE_INTEGER DefaultTimeout): one instance of a named pipe;
 // ShareAccess says the direction (FILE_SHARE_READ: the server writes, FILE_SHARE_WRITE: the server reads, both: duplex).
 uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r);
+// The name of the pipe a pipe handle is for, in UTF-8 and without the folder (empty for an anonymous pipe or the folder).
+bool pipe_handle_name(Process& p, uint64_t slot, String* name);
 // NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FsControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength): on a pipe,
-// FSCTL_PIPE_LISTEN, _DISCONNECT, _PEEK, _WAIT and _TRANSCEIVE.
+// FSCTL_PIPE_LISTEN, _DISCONNECT, _PEEK, _WAIT and _TRANSCEIVE; and the library's own calls for an operation that waits in a thread of its own (BEGIN_READ, BEGIN_WRITE,
+// BEGIN_LISTEN start it, AWAIT waits for it and gives the result, ACK says the result was acted on, CANCEL ends it).
 uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r);
+
+// NtCancelSynchronousIoFile(ThreadHandle, IoRequestToCancel, IoStatusBlock): ends the call a thread waits in on a pipe (STATUS_NOT_FOUND if there is none).
+uint32_t nt_cancel_synchronous_io_file(Process& p, const SyscallRequest& r);
 
 // For the file services:
 // A path like \??\pipe\name or \Device\NamedPipe\name opens a pipe (as a client) or the pipe folder: true if the name was one (*status and *handle are the answer).
@@ -50,5 +56,7 @@ uint32_t pipe_flush(Process& p, uint64_t slot);
 bool pipe_handle_gone_locked(Process& p, uint64_t slot);
 void pipe_token_add(uint64_t token);
 void pipe_token_release(uint64_t token);
+// A pipe handle was closed: the operations of the other end that this ended have been acted on when it returns.
+void pipe_closed(Process& p, uint64_t token);
 
 }  // namespace process::windowsabi

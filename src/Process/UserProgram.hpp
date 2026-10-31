@@ -85,6 +85,12 @@ class UserProgram final : public IModuleHost {
   bool module_name_at(uint64_t address, char (&name)[40]) const override;
   uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) override;
   uint32_t unload_module(uint64_t base) override;
+  uint32_t link_modules(uint64_t from, uint64_t to) override;
+
+  // A process created suspended has its imports unresolved and no loader list (PEB.Ldr) until a thread of it first runs; finish_loading() does both (and is a call that does
+  // nothing the second time). defer_loading() before load() asks for this.
+  void defer_loading(bool defer) { defer_loading_ = defer; }
+  void finish_loading();
 
   // The child's standard handles (RTL_USER_PROCESS_PARAMETERS): after load(), before it runs. 0 or -1 leaves the value as it was.
   bool set_standard_handles(const uint64_t handles[3]);
@@ -117,6 +123,9 @@ class UserProgram final : public IModuleHost {
   bool has_startup_ = false;
   uint32_t processor_count_ = 1;
   UniquePointer<Process> process_;
+  bool defer_loading_ = false, loading_pending_ = false;
+  UniquePointer<exe::PeFile> program_headers_;      // (kept while the program's imports wait to be bound)
+  uint64_t peb_ = 0, ldr_ = 0;
   ProgramStart start_;
   LoadedImage image_;
 };

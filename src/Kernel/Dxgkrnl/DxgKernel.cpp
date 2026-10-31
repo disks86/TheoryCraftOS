@@ -940,11 +940,12 @@ NtStatus Kernel::write_descriptor(ProcessId pid, Handle heap, uint32_t index, co
     SharedPointer<AllocRec> a = p->allocations.get(desc.allocation);
     if (!a || a->device != h->device) return status::kInvalidHandle;
     const Allocation& alloc = *a->allocation;
-    if (desc.kind == DescriptorKind::Srv ? (!alloc.is_image() || !(alloc.desc().flags & kAllocTexture))
+    const bool buffer_view = desc.kind == DescriptorKind::Srv && alloc.is_buffer();
+    if (desc.kind == DescriptorKind::Srv ? (buffer_view ? !(alloc.desc().flags & kAllocUnorderedAccess) : (!alloc.is_image() || !(alloc.desc().flags & kAllocTexture)))
         : desc.kind == DescriptorKind::Uav ? !(alloc.desc().flags & kAllocUnorderedAccess)
                                            : !alloc.is_buffer() || alloc.is_query_result())
       return status::kInvalidParameter;
-    if (desc.kind != DescriptorKind::Srv) {
+    if (desc.kind != DescriptorKind::Srv || buffer_view) {
       if (desc.offset > alloc.desc().size || desc.offset % 4 || desc.size > alloc.desc().size - desc.offset || desc.size % 4) return status::kInvalidParameter;
       d.offset = desc.offset;
       d.size = desc.size ? desc.size : alloc.desc().size - desc.offset;
@@ -970,6 +971,20 @@ NtStatus Kernel::copy_descriptors(ProcessId pid, Handle destination, uint32_t de
     for (uint32_t i = count; i-- > 0;) to->heap->at(destination_index + i) = from->heap->at(source_index + i);
   }
   return status::kSuccess;
+}
+
+NtStatus Kernel::update_tile_mappings(ProcessId pid, Handle reserved, uint32_t first_tile, Handle heap, uint64_t heap_offset, uint32_t tile_count) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  SharedPointer<AllocRec> r = p ? p->allocations.get(reserved) : SharedPointer<AllocRec>();
+  if (!r) return status::kInvalidHandle;
+  SharedPointer<Allocation> heap_allocation;
+  if (heap) {
+    SharedPointer<AllocRec> h = p->allocations.get(heap);
+    if (!h || h->device != r->device) return status::kInvalidHandle;
+    heap_allocation = h->allocation;
+  }
+  return r->allocation->manager().map_tiles(*r->allocation, first_tile, heap_allocation, heap_offset, tile_count);
 }
 
 NtStatus Kernel::destroy_shader(ProcessId pid, Handle shader) {

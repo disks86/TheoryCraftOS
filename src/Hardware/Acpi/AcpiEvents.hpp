@@ -128,6 +128,12 @@ class AcpiEvents {
   uint32_t wake_count() const { return wake_count_; }
 
   void set_listener(IAcpiNotifyListener* listener) { listener_ = listener; }
+  // Another one, for a second kind of news (the video extensions' brightness keys next to a device's wake-up). All hear every notification. False when the list is full.
+  bool add_listener(IAcpiNotifyListener* listener) {
+    for (IAcpiNotifyListener*& slot : more_listeners_)
+      if (!slot) { slot = listener; return true; }
+    return false;
+  }
 
   // The embedded controller's events: its ports and region are set up from the tables (_CRS, _REG), its GPE (_GPE) armed, and when that fires the controller is asked for its pending events
   // (status bit SCI_EVT, query command) and the method _Qxx of each runs. This is how a lid or a button of the laptop reaches the tables. False without a controller device (PNP0C09) or a _GPE.
@@ -202,7 +208,21 @@ class AcpiEvents {
   bool ready_ = false;
   Wake wake_[kMaxWake];
   uint32_t wake_count_ = 0;
+  struct Deferred {
+    bool button = false;
+    AcpiButton kind = AcpiButton::Power;
+    bool open = false;
+    acpi::Node* node = nullptr;
+    uint32_t value = 0;
+  };
+  static constexpr uint32_t kMaxDeferred = 64;
+  uint32_t poll_locked();
+  void queue_news(bool button, AcpiButton kind, bool open, acpi::Node* node, uint32_t value);
+  void flush_news();
+  Deferred deferred_[kMaxDeferred];
+  uint32_t deferred_count_ = 0;
   IAcpiNotifyListener* listener_ = nullptr;
+  IAcpiNotifyListener* more_listeners_[4] = {};
   IAcpiButtonListener* buttons_listener_ = nullptr;
   acpi::Node* ec_node_ = nullptr;
   uint32_t ec_gpe_ = 0, ec_events_ = 0;

@@ -78,6 +78,8 @@ class IModuleHost {
   // DLL_PROCESS_DETACH; they stay mapped until unload_module(). Returns an NTSTATUS.
   virtual uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;
   virtual uint32_t unload_module(uint64_t base) = 0;
+  // The library at `from` depends on the one at `to` (a forwarded export of `from` was resolved through it). An NTSTATUS.
+  virtual uint32_t link_modules(uint64_t from, uint64_t to) = 0;
 
  protected:
   IModuleHost() = default;
@@ -94,8 +96,14 @@ struct ChildSpec {
   ArrayView<const StringView> environment;      // "NAME=value" each
   bool suspended = false;                // it does not run until resume_process()
   bool inherit_handles = false;          // the child gets the parent's inheritable handles, at the same numbers
-  bool use_std_handles = false;          // the child's standard input, output and error are these handles of the parent (which are inherited too)
+  bool use_std_handles = false;          // the child's standard input, output and error are these values (0: none, ~0: invalid; handles of the parent are inherited with the rest)
   uint64_t std_handles[3] = {};
+  bool console_std[3] = {};              // the child's own console for this standard device is made inheritable (a pseudo console stands in for what it cannot have)
+  static constexpr uint32_t kMaxInheritList = 64;
+  bool restrict_inherit = false;         // only the handles in inherit_list (descriptor numbers) are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+  uint32_t inherit_list_count = 0;
+  uint64_t inherit_list[kMaxInheritList] = {};
+  bool copy_std[3] = {};                 // the parent's handle for this standard device is duplicated into the child at the same number (with its flags), inheriting or not
   StartupSpec startup;                   // the STARTUPINFO of the parent and the console of the child
 };
 
@@ -128,9 +136,13 @@ class IProcessRuntime {
   virtual void request_terminate(uint64_t id, uint32_t code) { (void)id; (void)code; }
   // Other processes (CreateProcess). The new process shares the console of this one. spawn_process returns an NTSTATUS (0xC0000002: not supported here).
   virtual uint64_t allocate_process_id() { return 0; }
+  // The same with the program `parent_pid` standing in for the parent (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS): the child inherits from it and is its child.
+  virtual uint32_t spawn_process_for(uint64_t parent_pid, const ChildSpec& spec) { (void)parent_pid; return spawn_process(spec); }
   virtual uint32_t spawn_process(const ChildSpec& spec) { (void)spec; return 0xC0000002u; }
   virtual bool terminate_process(uint64_t pid, uint32_t code) { (void)pid; (void)code; return false; }
   virtual bool resume_process(uint64_t pid) { (void)pid; return false; }
+  // A program made suspended whose first thread has not been resumed yet (it has run nothing).
+  virtual bool process_not_started(uint64_t pid) { (void)pid; return false; }
   // The machine: how many cores threads can run on, and the memory.
   virtual uint32_t processor_count() { return 1; }
   virtual void memory_status(uint64_t* total_bytes, uint64_t* free_bytes) { *total_bytes = *free_bytes = 0; }
@@ -147,12 +159,12 @@ class IProcessRuntime {
   // The core the calling thread runs on right now.
   virtual uint32_t current_processor() { return 0; }
   // The running programs (Toolhelp, EnumProcesses): returns how many entries it wrote.
-  struct ProcessEntry { uint64_t pid = 0, parent = 0; uint32_t threads = 0; char name[24] = {}; uint64_t memory_bytes = 0, create_time = 0; };
+  struct ProcessEntry { uint64_t pid = 0, parent = 0; uint32_t threads = 0; char name[24] = {}; uint64_t memory_bytes = 0, create_time = 0; uint32_t session = 1; };
   virtual uint32_t list_processes(ProcessEntry* out, uint32_t capacity) { (void)out; (void)capacity; return 0; }
   // Work on the memory and threads of another running program (by process id). The runtime takes that program's lock and gives up the caller's meanwhile; the work is done by
   // windowsabi::run_remote(). Returns an NTSTATUS.
   struct RemoteOp {
-    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo, MapView, Duplicate, GetContext, SetContext, SuspendThread } kind = Read;
+    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo, MapView, Duplicate, GetContext, SetContext, SuspendThread, TakeHandle, ReleaseThread } kind = Read;
     uint64_t address = 0, size = 0;       // Allocate/Free/Protect: in and out (as the NT services have them); Read/Write: the address; CreateThread: the start routine; thread calls: the thread id
     ByteView out;                         // Read: where the bytes go
     ConstByteView in;                     // Write: the bytes
@@ -269,6 +281,7 @@ class Process {
     uint64_t id = 0;
     bool used = false, started = false, finished = false;
     int32_t suspend_count = 0;                        // SuspendThread calls not yet undone (a thread created suspended starts at 1)
+    bool debug_hold = false;                          // a thread of a debugged program is not started until the debugger has continued the event that reported it (ReleaseThread)
     uint32_t exit_code = 259;                         // STILL_ACTIVE
     uint64_t extra_tls[kMaxTlsModules] = {};          // blocks of libraries loaded after the thread began: [index] = base (each is one region of extra_tls_size[index] bytes)
     uint64_t extra_tls_size[kMaxTlsModules] = {};
@@ -282,6 +295,7 @@ class Process {
     uint16_t description[kMaxDescriptionChars] = {};  // SetThreadDescription
     uint32_t description_bytes = 0;
     uint64_t teb = 0, region_base = 0, region_size = 0;      // the thread's TEB and the one region that holds its stack, TEB and TLS block
+    bool keep_stack = false;                          // the stack is a fiber now (ConvertThreadToFiber): it outlives the thread, only the TEB and the TLS block go when the thread ends
   };
   // What the program can set and read back about itself.
   uint32_t priority_class = 0x20;                     // NORMAL_PRIORITY_CLASS

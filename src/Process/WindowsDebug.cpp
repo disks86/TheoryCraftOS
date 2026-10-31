@@ -19,6 +19,7 @@
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsThreads.hpp"
 #include "Process/WindowsWait.hpp"
 
 namespace process::windowsabi {
@@ -38,6 +39,8 @@ constexpr uint32_t kMaxObjects = 8, kMaxEvents = 48, kMaxAttached = 16, kInfoByt
 
 struct Event {
   bool used = false, delivered = false, continued = false, blocking = false, orphan = false, deferred = false, hold = false;
+  bool suspended = false;      // the event's thread was suspended when it was posted (an attach reports what exists), and runs again when the event is continued
+  bool gated = false;          // the event's thread is a new one that has not started: it starts when the event is continued
   uint64_t seq = 0;      // the order the events were queued in
   uint32_t state = 0, status = kDbgNotHandled;
   uint64_t pid = 0, tid = 0, base = 0, start = 0, context = 0;      // context: the CONTEXT the thread waits with (an exception); base/start: the image base and start address of a process or thread, the base of a library
@@ -53,6 +56,44 @@ struct Attached { bool used = false; uint64_t pid = 0; uint32_t object = 0; bool
 DebugObject g_objects[kMaxObjects];
 uint64_t g_pending_kills[kMaxAttached];      // programs whose debugger is gone and asked for them to end with it (guarded like the rest; ended later, see debug_drain_kills)
 Attached g_attached[kMaxAttached];
+struct ThreadRef { uint64_t pid = 0, tid = 0; bool gated = false; };
+constexpr uint32_t kMaxResumes = 128;
+ThreadRef g_pending_resumes[kMaxResumes];      // threads held for an event that went with its debug object (guarded like the rest; resumed later, see debug_drain_kills)
+
+void resume_thread(IProcessRuntime* runtime, uint64_t pid, uint64_t tid) {
+  if (!runtime) return;
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::ResumeThread;
+  op.thread_id = tid;
+  runtime->remote_operation(pid, op);
+}
+void release_thread(IProcessRuntime* runtime, uint64_t pid, uint64_t tid) {
+  if (!runtime) return;
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::ReleaseThread;
+  op.thread_id = tid;
+  runtime->remote_operation(pid, op);
+}
+// What an event that is gone leaves to undo for its thread.
+void undo_hold(IProcessRuntime* runtime, const ThreadRef& r) { if (r.gated) release_thread(runtime, r.pid, r.tid); else resume_thread(runtime, r.pid, r.tid); }
+bool suspend_thread(IProcessRuntime* runtime, uint64_t pid, uint64_t tid) {
+  if (!runtime) return false;
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::SuspendThread;
+  op.thread_id = tid;
+  return runtime->remote_operation(pid, op) == kSuccess;
+}
+bool thread_is_suspended(IProcessRuntime* runtime, uint64_t pid, uint64_t tid) {
+  if (!runtime) return false;
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::ThreadStatus;
+  op.thread_id = tid;
+  return runtime->remote_operation(pid, op) == kSuccess && op.old_protect > 0;
+}
+// (the system lock held) Remembers a held thread whose event is gone.
+void defer_resume_locked(uint64_t pid, uint64_t tid, bool gated) {
+  for (ThreadRef& r : g_pending_resumes) if (r.pid == 0) { r.pid = pid; r.tid = tid; r.gated = gated; return; }
+}
 
 void put(uint8_t* at, uint64_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) at[i] = uint8_t(value >> (8 * i)); }
 
@@ -206,6 +247,13 @@ uint32_t attach(Process& p, DebugObject* debug_object_unused, uint32_t object_id
   new (snapshot) Snapshot();
   if (!take_snapshot(p, pid, snapshot)) { p.files().allocator().deallocate(snapshot); return kProcessIsTerminating; }
   uint32_t status = kSuccess;
+  // The threads the debugger is told about stay suspended until it has continued their events.
+  IProcessRuntime* runtime = p.runtime();
+  // (a program just made for the debugger, or suspended already, has not run: it waits for its first event as it is)
+  const bool hold = !children && runtime && !runtime->process_not_started(pid) && !thread_is_suspended(runtime, pid, snapshot->main_thread);
+  bool held_main = hold && suspend_thread(runtime, pid, snapshot->main_thread);
+  bool held[64] = {};
+  for (uint32_t i = 0; hold && i < snapshot->thread_count; ++i) if (snapshot->threads[i].id != snapshot->main_thread) held[i] = suspend_thread(runtime, pid, snapshot->threads[i].id);
   ISystemSync& sync = objects->sync();
   sync.lock();
   DebugObject* o = object_by_id(object_id);
@@ -216,7 +264,7 @@ uint32_t attach(Process& p, DebugObject* debug_object_unused, uint32_t object_id
   if (status == kSuccess && !slot) status = kNoResources;
   if (status == kSuccess) {
     slot->used = true; slot->pid = pid; slot->object = object_id; slot->children = children;
-    if (Event* e = post_locked(*o, kStateCreateProcess, pid, snapshot->main_thread, false)) { e->base = snapshot->base; e->start = snapshot->start; }
+    if (Event* e = post_locked(*o, kStateCreateProcess, pid, snapshot->main_thread, false)) { e->base = snapshot->base; e->start = snapshot->start; e->suspended = held_main; held_main = false; }
     // ntdll first, then the threads, then the other libraries
     for (uint32_t i = 0; i < snapshot->module_count; ++i) {
       const IProcessRuntime::ModuleEntry& m = snapshot->modules[i];
@@ -226,7 +274,7 @@ uint32_t attach(Process& p, DebugObject* debug_object_unused, uint32_t object_id
     for (uint32_t i = 0; i < snapshot->thread_count; ++i) {
       const IProcessRuntime::ThreadEntry& t = snapshot->threads[i];
       if (t.id == snapshot->main_thread) continue;
-      if (Event* e = post_locked(*o, kStateCreateThread, pid, t.id, false)) e->start = t.start_address;
+      if (Event* e = post_locked(*o, kStateCreateThread, pid, t.id, false)) { e->start = t.start_address; e->suspended = held[i]; held[i] = false; }
     }
     for (uint32_t i = 0; i < snapshot->module_count; ++i) {
       const IProcessRuntime::ModuleEntry& m = snapshot->modules[i];
@@ -236,6 +284,8 @@ uint32_t attach(Process& p, DebugObject* debug_object_unused, uint32_t object_id
     sync.notify_all();
   }
   sync.unlock();
+  if (held_main) resume_thread(runtime, pid, snapshot->main_thread);      // (what no event took over)
+  for (uint32_t i = 0; i < snapshot->thread_count; ++i) if (held[i]) resume_thread(runtime, pid, snapshot->threads[i].id);
   p.files().allocator().deallocate(snapshot);
   return status;
 }
@@ -270,7 +320,8 @@ void debug_object_freed_locked(uint32_t object) {
     if (!o.used || o.object != object) continue;
     for (Event& e : o.events) {
       if (!e.used) continue;
-      if (e.blocking && !e.orphan) { e.continued = true; e.status = kDbgContinue; e.delivered = true; }      // (the program that waits frees it)
+      if (e.suspended || e.gated) defer_resume_locked(e.pid, e.tid, e.gated);
+      if (e.blocking && !e.orphan) { e.continued = true; e.status = 0xC0000354u /* STATUS_DEBUGGER_INACTIVE: not handled */; e.delivered = true; }      // (the program that waits frees it)
       else e = Event();
     }
     o.used = false;
@@ -286,6 +337,11 @@ void debug_drain_kills(IProcessRuntime* runtime) {
   for (uint32_t i = 0; i < kMaxAttached; ++i) { pids[i] = g_pending_kills[i]; g_pending_kills[i] = 0; }
   objects->sync().unlock();
   for (uint64_t pid : pids) if (pid != 0) runtime->terminate_process(pid, 0xC0000354u);
+  ThreadRef resumes[kMaxResumes];
+  objects->sync().lock();
+  for (uint32_t i = 0; i < kMaxResumes; ++i) { resumes[i] = g_pending_resumes[i]; g_pending_resumes[i] = ThreadRef(); }
+  objects->sync().unlock();
+  for (const ThreadRef& r : resumes) if (r.pid != 0) undo_hold(runtime, r);
 }
 
 uint32_t debug_object_of(uint64_t pid) {
@@ -352,9 +408,10 @@ static uint32_t post_and_wait(Process& p, uint32_t state, uint64_t tid, const ui
   return answer;
 }
 
-static void post_plain(uint64_t pid, uint32_t state, uint64_t tid, uint64_t base, uint64_t start, uint32_t status) {
+static bool post_plain(uint64_t pid, uint32_t state, uint64_t tid, uint64_t base, uint64_t start, uint32_t status, bool gated = false) {
   ObjectManager* objects = system_objects();
-  if (!objects) return;
+  if (!objects) return false;
+  bool posted = false;
   ISystemSync& sync = objects->sync();
   sync.lock();
   const Attached* a = attachment_of(pid);
@@ -363,14 +420,20 @@ static void post_plain(uint64_t pid, uint32_t state, uint64_t tid, uint64_t base
     if (Event* e = post_locked(*o, state, pid, tid, false)) {
       e->base = base;
       e->start = start;
+      e->gated = gated;
+      posted = true;
       if (state == kStateExitThread || state == kStateExitProcess) put(e->info, status, 4);      // ExitStatus is at 0x18
       sync.notify_all();
     }
   }
   sync.unlock();
+  return posted;
 }
 
-void debug_thread_created(Process& p, uint64_t thread_id, uint64_t start) { if (debug_object_of(p.id())) post_plain(p.id(), kStateCreateThread, thread_id, 0, start, 0); }
+void debug_thread_created(Process& p, uint64_t thread_id, uint64_t start, bool held) {
+  const bool posted = debug_object_of(p.id()) != 0 && post_plain(p.id(), kStateCreateThread, thread_id, 0, start, 0, held);
+  if (held && !posted) release_debug_hold_in(p, thread_id);      // (nobody will continue it)
+}
 void debug_thread_exited(Process& p, uint64_t thread_id, uint32_t code) { if (debug_object_of(p.id())) post_plain(p.id(), kStateExitThread, thread_id, 0, 0, code); }
 void debug_module_loaded(Process& p, uint64_t base) { if (debug_object_of(p.id())) post_plain(p.id(), kStateLoadDll, p.runtime() ? p.runtime()->current_thread_id() : p.id(), base, 0, 0); }
 void debug_module_unloaded(Process& p, uint64_t base) { if (debug_object_of(p.id())) post_plain(p.id(), kStateUnloadDll, p.runtime() ? p.runtime()->current_thread_id() : p.id(), base, 0, 0); }
@@ -419,15 +482,23 @@ uint32_t nt_remove_process_debug(Process& p, const SyscallRequest& r) {
   sync.lock();
   Attached* a = attachment_of(pid);
   if (!a || a->object != o->object) { sync.unlock(); return kPortNotSet; }
+  ThreadRef resumes[kMaxEvents];
+  uint32_t resume_count = 0;
   for (Event& e : o->events) {      // what waits for an answer gets one; the rest of this program's events are dropped
     if (!e.used || e.pid != pid) continue;
-    if (e.blocking && !e.orphan) { e.continued = true; e.status = kDbgContinue; e.delivered = true; }
+    if ((e.suspended || e.gated) && resume_count < kMaxEvents) resumes[resume_count++] = {e.pid, e.tid, e.gated};
+    e.suspended = false;
+    e.gated = false;
+    if (e.blocking && !e.orphan) { e.continued = true; e.status = 0xC0000354u /* STATUS_DEBUGGER_INACTIVE: not handled */; e.delivered = true; }
     else e = Event();
   }
   *a = Attached();
   sync.notify_all();
   sync.unlock();
-  if (!exited) clear_being_debugged(p, pid);
+  if (!exited) {
+    for (uint32_t i = 0; i < resume_count; ++i) undo_hold(p.runtime(), resumes[i]);
+    clear_being_debugged(p, pid);
+  }
   return kSuccess;
 }
 
@@ -502,8 +573,11 @@ uint32_t nt_debug_continue(Process& p, const SyscallRequest& r) {
   ISystemSync& sync = objects->sync();
   sync.lock();
   status = kInvalidParameter;
+  bool resume = false, release = false;
   for (Event& e : o->events) {
     if (!e.used || !e.delivered || e.continued || e.pid != pid || e.tid != tid) continue;
+    if (answer != 0x40010001u && e.suspended) { resume = true; e.suspended = false; }
+    if (answer != 0x40010001u && e.gated) { release = true; e.gated = false; }
     if (answer == 0x40010001u) { e.delivered = false; e.deferred = true; }      // DBG_REPLY_LATER: the debugger gets the event again (when its thread runs)
     else if (e.blocking && !e.orphan) { e.continued = true; e.status = answer; }
     else e = Event();
@@ -512,6 +586,8 @@ uint32_t nt_debug_continue(Process& p, const SyscallRequest& r) {
   }
   sync.notify_all();
   sync.unlock();
+  if (resume) resume_thread(p.runtime(), pid, tid);
+  if (release) release_thread(p.runtime(), pid, tid);
   return status;
 }
 

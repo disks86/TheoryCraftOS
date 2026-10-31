@@ -196,6 +196,7 @@ class Parser {
 
   // --- Lexer
   bool at_end() const { return pos_ >= src_.size(); }
+  bool is_ident_escape(uint64_t ahead) const { return peek(ahead) == '\\' && peek(ahead + 1) == 'u'; }
   char peek(uint64_t ahead = 0) const { return pos_ + ahead < src_.size() ? src_[pos_ + ahead] : '\0'; }
 
   void skip_space(bool* newline) {
@@ -309,12 +310,29 @@ class Parser {
       return;
     }
     const char c = peek();
-    if (is_ident_start(c) || (c == '#' && is_ident_start(peek(1)))) {   // (#name: a private member, kept as a property whose name starts with #)
+    if (is_ident_start(c) || is_ident_escape(0) || (c == '#' && (is_ident_start(peek(1)) || is_ident_escape(1)))) {   // (#name: a private member, kept as a property whose name starts with #)
       const uint64_t start = pos_;
-      ++pos_;
+      if (c == '#') ++pos_;
       while (is_ident_part(peek())) ++pos_;
       t.kind = T::Ident;
-      t.text = src_.substr(start, pos_ - start);
+      if (peek() == '\\' && peek(1) == 'u') {   // a \uXXXX or \u{X} escape in the name (Angular's \u0275prov): the name is the decoded text
+        scratch_.clear();
+        scratch_.append(src_.substr(start, pos_ - start));
+        while (!at_end()) {
+          if (peek() == '\\' && peek(1) == 'u') {
+            ++pos_;   // (read_escape wants pos_ on the 'u' that follows the backslash)
+            read_escape(&scratch_);
+          } else if (is_ident_part(peek())) {
+            scratch_.push_back(peek());
+            ++pos_;
+          } else {
+            break;
+          }
+        }
+        t.text = arena_.copy(scratch_.view());
+      } else {
+        t.text = src_.substr(start, pos_ - start);
+      }
     } else if (is_digit(c) || (c == '.' && is_digit(peek(1)))) {
       lex_number(&t);
     } else if (c == '"' || c == '\'') {

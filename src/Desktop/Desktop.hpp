@@ -28,6 +28,7 @@
 #include "Desktop/DisplaySettings.hpp"
 #include "Desktop/DeviceProperties.hpp"
 #include "Desktop/NetworkProperties.hpp"
+#include "Desktop/BluetoothProperties.hpp"
 #include "Desktop/WirelessProperties.hpp"
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/CopyProgressDialog.hpp"
@@ -72,6 +73,7 @@
 #include "Gui/Windows/TabFrame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
+#include "Hardware/Backlight/IBacklight.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 
 namespace desktop {
@@ -130,6 +132,18 @@ class Desktop {
   void set_program_launcher(IProgramLauncher* launcher);
   Paint& paint() { return paint_; }
   MediaPlayer& media_player() { return media_player_; }
+  // The backlight the brightness keys change (nullptr: none, the keys do nothing). It must outlive the desktop.
+  void set_backlight(hardware::IBacklight* backlight) { backlight_ = backlight; }
+  // Changes the brightness by `delta_percent` (negative: darker) and shows the level. False without a backlight that takes it.
+  bool adjust_brightness(int delta_percent);
+  // Puts the backlight out (the lid was closed) and gives it back at the level it had. While it is out the brightness keys do nothing.
+  void set_display_blanked(bool blanked);
+  bool display_blanked() const { return blanked_; }
+  // The same for the master volume and the mute.
+  bool adjust_volume(int delta_percent);
+  bool toggle_mute();
+  // Key presses of the function row as the desktop acts on them: true if the key was one of those (and so is not for the focused program).
+  bool handle_media_key(uint8_t usage) { return on_media_key(usage); }
   Graphics3DTest& graphics_test() { return graphics_test_; }
   // The machine's graphics for the 3D test window (nullptr: it says there is none). They must outlive the desktop.
   void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics) { graphics_test_.set_graphics(kernel, graphics); }
@@ -276,6 +290,12 @@ class Desktop {
   // from the Wi-Fi Properties item in the computer manager's menu of a wireless adapter.
   void open_wireless_properties(uint32_t adapter);
   WirelessProperties& wireless_properties() { return wireless_properties_; }
+  // The Bluetooth adapters, for the Bluetooth window (nullptr: none). It must outlive the desktop.
+  void set_bluetooth_details(IBluetoothDetails* details) { bluetooth_properties_.set_details(details); }
+  // Opens the Bluetooth window of an adapter (its number: HardwareEntry::id) and starts the search for devices, or brings it forward showing that adapter. It is reached from the
+  // Bluetooth Settings item in the computer manager's menu of a Bluetooth adapter.
+  void open_bluetooth_properties(uint32_t adapter);
+  BluetoothProperties& bluetooth_properties() { return bluetooth_properties_; }
   // Opens the display settings window, or brings it forward. It is reached from the Displays group of the computer manager's hardware tree.
   void open_display_settings();
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
@@ -314,6 +334,8 @@ class Desktop {
   static void on_database_query(void* self, gui::Control&);
   static void on_web_browser(void* self, gui::Control&);
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
+  // The keys of the keyboard's function row (volume, mute, brightness, play/pause) and the same from other places (a button of the firmware's video extensions).
+  bool on_media_key(uint8_t usage);
   static void on_terminal(void* self, gui::Control&);
   static void on_calculator(void* self, gui::Control&);
   static void on_calendar(void* self, gui::Control&);
@@ -335,6 +357,7 @@ class Desktop {
   static void on_network_properties(void* self, gui::Control&);
   static void on_wireless_properties(void* self, gui::Control&);
   static void on_device_properties(void* self, gui::Control&);
+  static void on_bluetooth_properties(void* self, gui::Control&);
   static bool apply_changes_thunk(void* self);
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
@@ -418,6 +441,7 @@ class Desktop {
   NetworkProperties network_properties_;
   WirelessProperties wireless_properties_;
   DeviceProperties device_properties_;
+  BluetoothProperties bluetooth_properties_;
   gui::Frame about_;
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;
@@ -425,6 +449,10 @@ class Desktop {
   database::DatabaseManager* databases_ = nullptr;
   browser::IPageLoader* page_loader_ = nullptr;
   audio::AudioMixer* media_mixer_ = nullptr;
+  hardware::IBacklight* backlight_ = nullptr;
+  uint32_t osd_toast_ = 0;
+  bool blanked_ = false;
+  uint8_t level_before_blank_ = 50;
   hardware::SystemVideoCodecs* media_codecs_ = nullptr;
   const hardware::IClock* media_clock_ = nullptr;
   database::local::SystemSettings* settings_ = nullptr;
@@ -460,6 +488,7 @@ class Desktop {
   bool watching_ = false;  // the watchdog has its first sample
   uint32_t last_frames_ = 0;
   uint64_t stall_since_us_ = 0, stall_reported_us_ = 0;
+  uint64_t polled_quarter_ = ~0ull;  // the quarter second the Bluetooth window was last read in (pairing questions should not wait a whole second)
   uint64_t polled_second_ = ~0ull;  // the uptime second the source was last read in
   uint64_t shown_ = ~0ull;          // what the label shows, packed (see step())
   uint64_t now_us_ = 0;             // the latest uptime pump() was given (the explorer measures double clicks with it)

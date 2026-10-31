@@ -77,10 +77,11 @@ static BOOL cp_lookup(const DWORD *entries, DWORD count, WCHAR ch, UINT *mb) {
 
 static int cp_utf8_to_wide(DWORD flags, const BYTE *s, SIZE_T n, CpOut *o) {
   const BOOL strict = (flags & CPX_MB_ERR_INVALID_CHARS) != 0;
+  BOOL invalid_seen = FALSE;      /* (in strict mode the text is converted all the same, with U+FFFD, and the call fails at the end) */
   for (SIZE_T i = 0; i < n;) {
     const BYTE b = s[i];
     UINT ch = b;
-    SIZE_T need = 0;
+    SIZE_T need = 0, taken = 1;
     BOOL valid = TRUE;
     if (b >= 0x80) {
       UINT low = 0x80, high = 0xbf;
@@ -88,16 +89,23 @@ static int cp_utf8_to_wide(DWORD flags, const BYTE *s, SIZE_T n, CpOut *o) {
       else if (b >= 0xe0 && b <= 0xef) { need = 2; ch = b & 0x0f; if (b == 0xe0) low = 0xa0; if (b == 0xed) high = 0x9f; }
       else if (b >= 0xf0 && b <= 0xf4) { need = 3; ch = b & 0x07; if (b == 0xf0) low = 0x90; if (b == 0xf4) high = 0x8f; }
       else valid = FALSE;
-      if (valid && need > n - i - 1) valid = FALSE;
-      for (SIZE_T k = 1; valid && k <= need; ++k) {
+      SIZE_T k = 1;
+      for (; valid && k <= need; ++k) {
+        if (k >= n - i) { valid = FALSE; break; }      /* (the text ends inside the sequence) */
         const BYTE c = s[i + k];
-        if (c < (k == 1 ? low : 0x80) || c > (k == 1 ? high : 0xbf)) valid = FALSE; else ch = (ch << 6) | (c & 0x3f);
+        if (c < (k == 1 ? low : 0x80) || c > (k == 1 ? high : 0xbf)) {
+          valid = FALSE;
+          if ((c & 0xc0) == 0x80 && k == 1) ++k;      /* (a continuation byte that the lead byte does not take goes with it) */
+          break;
+        }
+        ch = (ch << 6) | (c & 0x3f);
       }
+      if (!valid && need) taken = k;
     }
     if (!valid) {
-      if (strict) return CPX_FAIL_INVALID;
+      invalid_seen = TRUE;
       if (!cp_put(o, 0xfffd)) return CPX_FAIL_OVERFLOW;
-      ++i;
+      i += taken;
       continue;
     }
     i += need + 1;
@@ -107,16 +115,16 @@ static int cp_utf8_to_wide(DWORD flags, const BYTE *s, SIZE_T n, CpOut *o) {
       cp_store(o, 0xdc00 + ((ch - 0x10000) & 0x3ff));
     } else if (!cp_put(o, ch)) return CPX_FAIL_OVERFLOW;
   }
-  return 0;
+  return strict && invalid_seen ? CPX_FAIL_INVALID : 0;
 }
 
 static int cp_wide_to_utf8(DWORD flags, const void *s, SIZE_T n, CpOut *o) {
+  BOOL invalid_seen = FALSE;
   for (SIZE_T i = 0; i < n; ++i) {
     UINT ch = cp_read_wide(s, i);
     if (ch >= 0xd800 && ch < 0xe000) {
       if (ch < 0xdc00 && i + 1 < n && (cp_read_wide(s, i + 1) & 0xfc00) == 0xdc00) { ch = 0x10000 + ((ch - 0xd800) << 10) + (cp_read_wide(s, i + 1) - 0xdc00); ++i; }
-      else if (flags & CPX_WC_ERR_INVALID_CHARS) return CPX_FAIL_INVALID;
-      else ch = 0xfffd;
+      else { invalid_seen = TRUE; ch = 0xfffd; }
     }
     BYTE out[4];
     SIZE_T count;
@@ -126,7 +134,7 @@ static int cp_wide_to_utf8(DWORD flags, const void *s, SIZE_T n, CpOut *o) {
     else { out[0] = (BYTE)(0xf0 | (ch >> 18)); out[1] = (BYTE)(0x80 | ((ch >> 12) & 0x3f)); out[2] = (BYTE)(0x80 | ((ch >> 6) & 0x3f)); out[3] = (BYTE)(0x80 | (ch & 0x3f)); count = 4; }
     if (!cp_put_bytes(o, out, count)) return CPX_FAIL_OVERFLOW;
   }
-  return 0;
+  return (flags & CPX_WC_ERR_INVALID_CHARS) && invalid_seen ? CPX_FAIL_INVALID : 0;
 }
 
 /* ---- UTF-7 (the quirks are those of Windows: a block ends at any directly encoded character, "+-" is a plus sign) ------------------------------------------ */
@@ -323,10 +331,7 @@ EXPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR sourc
 
 EXPORT UINT WINAPI GetACP(void) { return CP_UTF8; }
 EXPORT UINT WINAPI GetOEMCP(void) { return CP_UTF8; }
-EXPORT UINT WINAPI GetConsoleCP(void) { return CP_UTF8; }
-EXPORT UINT WINAPI GetConsoleOutputCP(void) { return CP_UTF8; }
-EXPORT BOOL WINAPI SetConsoleCP(UINT cp) { (void)cp; return TRUE; }
-EXPORT BOOL WINAPI SetConsoleOutputCP(UINT cp) { (void)cp; return TRUE; }
+/* (GetConsoleCP, SetConsoleCP and the output ones are in console.inc: the code pages belong to the console) */
 
 EXPORT BOOL WINAPI IsValidCodePage(UINT cp) { return cp == CP_UTF8 || cp == CPX_UTF7 || cp_find(cp) != NULL; }
 

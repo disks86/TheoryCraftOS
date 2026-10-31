@@ -459,7 +459,49 @@ uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, u
   return kSuccess;
 }
 
+uint32_t take_object_handle_from(Process& source, IProcessRuntime::RemoteOp& op) {
+  uint64_t slot = 0;
+  if (!slot_of(op.address, &slot) || source.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  const DescriptorKind kind = source.files().kind(slot);
+  const uint64_t token = source.files().token(slot);
+  if (kind != DescriptorKind::Pipe && !is_object_kind(kind)) return kNotImplemented;      // (the kinds with a count in the object manager or the pipes' ends)
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  op.type = uint32_t(kind);
+  op.argument = token;
+  op.protect = source.files().denied_access(slot);
+  if (kind == DescriptorKind::Pipe) pipe_token_add(token);
+  else objects->add_ref(uint32_t(token));
+  if (op.suspended && !source.files().protected_from_close(slot)) source.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
+  return kSuccess;
+}
+
 namespace {
+
+// NtDuplicateObject from a program other than the caller into the caller.
+uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t pid = 0;
+  if (!process_handle_info(p, r.args[0], &exited, &code, &pid)) return kInvalidHandle;
+  if (exited) return 0xC000010Au;      // STATUS_PROCESS_IS_TERMINATING
+  if (!p.runtime()) return kNotImplemented;
+  IProcessRuntime::RemoteOp op;
+  op.kind = IProcessRuntime::RemoteOp::TakeHandle;
+  op.address = r.args[1];
+  op.suspended = (options & 1) != 0;
+  const uint32_t status = p.runtime()->remote_operation(pid, op);
+  if (status != kSuccess) return status;
+  const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~uint32_t(desired_access));
+  uint64_t handle = 0;
+  uint32_t given = give_object_handle_in(p, op.type, op.argument, denied, (options & 4) ? false : (attributes & 2) != 0, &handle);
+  if (given == kSuccess && target_at != 0 && !p.write_user_u64(target_at, handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
+  if (given != kSuccess) {      // (the count the other program made for the copy)
+    if (DescriptorKind(op.type) == DescriptorKind::Pipe) pipe_token_release(op.argument);
+    else if (ObjectManager* objects = system_objects()) objects->release(uint32_t(op.argument));
+  }
+  return given;
+}
 
 // NtDuplicateObject into a program other than the caller (only the kinds of the object manager, which count their references).
 uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
@@ -498,7 +540,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &desired_access) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &options)) return kAccessViolation;
   const bool source_here = names_own_process(p, r.args[0]);
   const bool target_here = names_own_process(p, r.args[2]);
-  if (!source_here) return kNotImplemented;      // (a handle of another program cannot be read from here)
+  if (!source_here) return target_here ? duplicate_from_other(p, r, target_at, desired_access, attributes, options) : kNotImplemented;      // (between two other programs: not here)
   if (!target_here) return duplicate_to_other(p, r, target_at, desired_access, attributes, options);
   if (r.args[1] == ~uint64_t{1}) {      // the pseudo handle of the calling thread becomes a real handle to it
     const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();
@@ -522,11 +564,30 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
       p.close_descriptor(uint64_t(slot_for_process));
       return kAccessViolation;
     }
-    p.files().set_handle_flags(uint64_t(slot_for_process), (attributes & 2) != 0, false);
+    p.files().set_handle_flags(uint64_t(slot_for_process), (options & 4) ? false : (attributes & 2) != 0, false);      // (the pseudo handle has no attributes to keep)
     return kSuccess;
   }
   uint64_t slot = 0;
   if (!slot_of(r.args[1], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (!(options & 2) && p.files().kind(slot) == DescriptorKind::File) {      // a file handle cannot be copied with rights the original does not have
+    if (const OpenObject* opened = p.files().object(slot)) {
+      auto map_file_access = [](uint32_t a) {
+        if (a & 0x80000000u) a |= 0x120089u;      // GENERIC_READ
+        if (a & 0x40000000u) a |= 0x120116u;      // GENERIC_WRITE
+        if (a & 0x20000000u) a |= 0x1200A0u;      // GENERIC_EXECUTE
+        if (a & 0x10000000u) a |= 0x1F01FFu;      // GENERIC_ALL
+        return a & ~0xF0000000u;
+      };
+      if (map_file_access(uint32_t(desired_access)) & ~map_file_access(opened->granted_access)) return 0xC0000022u;      // STATUS_ACCESS_DENIED
+    }
+  }
+  if ((options & 1) && !p.files().protected_from_close(slot)) {      // DUPLICATE_CLOSE_SOURCE into this very process: the source goes first, so the handle keeps its number
+    if (target_at != 0 && !p.write_user_u64(target_at, r.args[1])) return kAccessViolation;
+    const uint32_t original = p.files().denied_access(slot);
+    p.files().set_denied_access(slot, (options & 2) ? original : (original | ~uint32_t(desired_access)));
+    p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
+    return kSuccess;
+  }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;
   if (is_object_kind(p.files().kind(slot))) if (ObjectManager* objects = system_objects()) objects->add_ref(uint32_t(p.files().token(slot)));
@@ -543,8 +604,8 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~uint32_t(desired_access)));
   }
   const bool same = (options & 4) != 0;      // DUPLICATE_SAME_ATTRIBUTES; otherwise the handle is inheritable if the attributes say OBJ_INHERIT
-  p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, false);
-  if (options & 1) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
+  p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, same && p.files().protected_from_close(slot));
+  if ((options & 1) && !p.files().protected_from_close(slot)) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE (a handle that cannot be closed stays)
   return kSuccess;
 }
 
@@ -737,7 +798,7 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   if (fs) reported |= kSecFile;
   else reported |= (flags & kSecReserve) ? kSecReserve : kSecCommit;
   const ObjectManager::Created c = objects->create_section(StringView(name, name_size), (flags & kSecImage) ? 0 : size, page, reported, fs, host.view());
-  if (c.id == 0) return c.status;
+  if (c.id == 0) return (fs && c.status == kNoResources) ? 0xC0000040u /* STATUS_SECTION_TOO_BIG: more than can be held */ : c.status;
   if (fs && !(flags & kSecImage)) objects->section_set_reported_size(c.id, size != 0 ? size : file_size);      // (a section of a file has the size it was asked for, not the pages')
   if (flags & kSecImage) {      // the file has to be a PE image this OS can run
     uint8_t* image = nullptr;
@@ -1078,13 +1139,39 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
   auto put32 = [&](uint32_t at, uint32_t v) { for (uint32_t i = 0; i < 4; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
   uint32_t size = 0;
   switch (info_class) {
-    case 0:      // OBJECT_BASIC_INFORMATION
+    case 0: {      // OBJECT_BASIC_INFORMATION
       put32(0, (p.files().inheritable(slot) ? 2u : 0u) | (p.files().protected_from_close(slot) ? 1u : 0u));      // Attributes (OBJ_INHERIT, a protected handle)
-      put32(4, 0x001F0FFF);      // GrantedAccess
+      uint32_t granted = 0x001F0FFF;
+      if (p.files().kind(slot) == DescriptorKind::Directory) if (const OpenObject* opened = p.files().object(slot)) if (opened->granted_access != 0) {      // a directory handle says what it was opened for
+        granted = opened->granted_access;
+        if (granted & 0x80000000u) granted |= 0x120089u;      // GENERIC_READ
+        if (granted & 0x40000000u) granted |= 0x120116u;      // GENERIC_WRITE
+        if (granted & 0x20000000u) granted |= 0x1200A0u;      // GENERIC_EXECUTE
+        if (granted & 0x10000000u) granted |= 0x1F01FFu;      // GENERIC_ALL
+        granted &= ~0xF0000000u;
+      }
+      put32(4, granted);      // GrantedAccess
       put32(8, 1);               // HandleCount
       put32(12, 1);              // PointerCount
       size = 56;
       break;
+    }
+    case 1: {    // OBJECT_NAME_INFORMATION: a UNICODE_STRING and its characters; the name an object was made with, in the directory of the session
+      ObjectManager* objects = system_objects();
+      char text[ObjectManager::kNameBytes];
+      const uint32_t chars = is_object_kind(p.files().kind(slot)) && objects ? objects->object_name(uint32_t(p.files().token(slot)), text, sizeof(text)) : 0;
+      static const char kPrefix[] = "\\BaseNamedObjects\\";
+      const uint32_t prefix = chars ? sizeof(kPrefix) - 1 : 0, bytes = 2 * (prefix + chars), need = 16 + bytes + 2;
+      if (returned != 0 && !p.write_user_u32(returned, need)) return kAccessViolation;
+      if (length < need) return 0xC0000004u;
+      uint8_t full[16 + 2 * (sizeof(kPrefix) + ObjectManager::kNameBytes)] = {};
+      full[0] = uint8_t(bytes); full[1] = uint8_t(bytes >> 8); full[2] = uint8_t(bytes + 2); full[3] = uint8_t((bytes + 2) >> 8);
+      const uint64_t text_at = r.args[2] + 16;
+      for (uint32_t i = 0; i < 8; ++i) full[8 + i] = uint8_t(text_at >> (8 * i));
+      for (uint32_t i = 0; i < prefix; ++i) full[16 + 2 * i] = uint8_t(kPrefix[i]);
+      for (uint32_t i = 0; i < chars; ++i) full[16 + 2 * (prefix + i)] = uint8_t(text[i]);
+      return p.write_user(r.args[2], ConstByteView(full, need)) ? kSuccess : kAccessViolation;
+    }
     case 2: {    // OBJECT_TYPE_INFORMATION (the name only: a UNICODE_STRING and its characters)
       const char* type = "File";
       switch (p.files().kind(slot)) {
@@ -1128,6 +1215,20 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
   if (returned != 0 && !p.write_user_u32(returned, size)) return kAccessViolation;
   if (length < size) return 0xC0000004u;
   return p.write_user(r.args[2], ConstByteView(out, size)) ? kSuccess : kAccessViolation;
+}
+
+// NtCompareObjects(First, Second): handles of one object have the same kind and the same object behind them (the token of the object manager, the open file, the process or thread).
+uint32_t nt_compare_objects(Process& p, const SyscallRequest& r) {
+  uint64_t first = 0, second = 0;
+  if (!slot_of(r.args[0], &first) || !slot_of(r.args[1], &second)) return kInvalidHandle;
+  ProcessFiles& files = p.files();
+  const DescriptorKind a = files.kind(first), b = files.kind(second);
+  if (a == DescriptorKind::Closed || b == DescriptorKind::Closed) return kInvalidHandle;
+  constexpr uint32_t kNotSameObject = 0xC00004D4u;
+  if (a != b) return kNotSameObject;
+  if (files.object(first) != files.object(second)) return kNotSameObject;
+  if (files.token(first) != files.token(second)) return kNotSameObject;      // (the terminal descriptors a console starts with have no token; the ones made later each have one)
+  return kSuccess;
 }
 
 // NtSetInformationObject(Handle, Class = 4, Buffer, Length): the handle flags.

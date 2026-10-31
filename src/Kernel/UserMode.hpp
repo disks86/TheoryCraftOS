@@ -58,6 +58,7 @@ struct UserThread {
   bool suspend_requested = false, terminate_requested = false;
   uint32_t terminate_code = 0;
   bool parked = false, redirected = false, context_dirty = false;
+  bool start_context_set = false;      // SetThreadContext before it ran: `saved` holds all the registers it starts with
   Frame* syscall_frame = nullptr;      // the registers of the system call it is in (where a wait that is asked to suspend parks)
   uint64_t stale_rip = 0, stale_address = 0;      // the last fault that was answered by rebuilding the page tables (see UserMode.cpp), to catch one that repeats
   uint32_t stale_count = 0;
@@ -133,8 +134,10 @@ struct Task final : process::IProcessRuntime {
   uint32_t list_modules(uint64_t pid, ModuleEntry* out, uint32_t capacity) override;
   uint64_t allocate_process_id() override;
   uint32_t spawn_process(const process::ChildSpec& spec) override;
+  uint32_t spawn_process_for(uint64_t parent_pid, const process::ChildSpec& spec) override;
   bool terminate_process(uint64_t pid, uint32_t code) override;
   bool resume_process(uint64_t pid) override;
+  bool process_not_started(uint64_t pid) override;
   // Frees the children that have ended; with `all`, stops the others first and waits for them.
   void reap_children(bool all);
   bool start_first_thread();

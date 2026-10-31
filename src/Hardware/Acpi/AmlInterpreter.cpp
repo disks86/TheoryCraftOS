@@ -171,6 +171,7 @@ struct AmlInterpreter::Impl {
     cur = &perm;
   }
 
+  kernel::RecursiveMutex lock;
   allocators::IAllocator& mem;
   IAmlHost& host;
   AmlInterpreter& owner;
@@ -1173,6 +1174,7 @@ AmlInterpreter::~AmlInterpreter() {
   }
 }
 
+kernel::RecursiveMutex& AmlInterpreter::mutex() { return impl_->lock; }
 Node* AmlInterpreter::root() const { return impl_ ? impl_->root_node : nullptr; }
 
 Value AmlInterpreter::Impl::eval_buffer(Frame& f) {
@@ -1978,6 +1980,7 @@ bool AmlInterpreter::Impl::load_block(Frame& f, Node* scope) {
 
 bool AmlInterpreter::load_table(ConstByteView table) {
   if (!impl_ || !impl_->root_node || table.size() < 36) return false;
+  kernel::ScopedRecursiveMutex guard(impl_->lock);
   Impl& m = *impl_;
   const uint32_t length = table[4] | (uint32_t{table[5]} << 8) | (uint32_t{table[6]} << 16) | (uint32_t{table[7]} << 24);
   if (length < 36 || length > table.size()) return false;
@@ -2034,6 +2037,7 @@ Node* AmlInterpreter::find(const char* path, Node* scope) const {
 
 bool AmlInterpreter::evaluate(Node* node, const Value* arguments, uint32_t argument_count, Value* result) {
   if (!impl_ || !node) return false;
+  kernel::ScopedRecursiveMutex guard(impl_->lock);
   Impl& m = *impl_;
   m.temp.reset();
   m.bad = false;
@@ -2056,6 +2060,8 @@ bool AmlInterpreter::evaluate(Node* node, const Value* arguments, uint32_t argum
 }
 
 bool AmlInterpreter::evaluate_integer(Node* node, uint64_t* out) {
+  if (!impl_) return false;
+  kernel::ScopedRecursiveMutex guard(impl_->lock);
   Value v;
   if (!evaluate(node, nullptr, 0, &v)) return false;
   if (v.kind == ValueKind::Integer) {
@@ -2075,6 +2081,7 @@ Node* AmlInterpreter::first_child(const Node* node) const { return node ? node->
 Node* AmlInterpreter::next_sibling(const Node* node) const { return node ? node->next : nullptr; }
 Node* AmlInterpreter::parent(const Node* node) const { return node ? node->parent : nullptr; }
 bool AmlInterpreter::is_device(const Node* node) const { return node && node->kind == NodeKind::Device; }
+bool AmlInterpreter::is_thermal_zone(const Node* node) const { return node && node->kind == NodeKind::ThermalZone; }
 bool AmlInterpreter::is_method(const Node* node) const { return node && node->kind == NodeKind::Method; }
 bool AmlInterpreter::is_region(const Node* node) const { return node && node->kind == NodeKind::Region; }
 const char* AmlInterpreter::name_of(const Node* node) const { return node ? node->name : "____"; }
@@ -2108,6 +2115,7 @@ bool id_matches(const Value& v, const char* id) {
 
 bool AmlInterpreter::device_has_id(Node* device, const char* id) {
   if (!impl_ || !device) return false;
+  kernel::ScopedRecursiveMutex guard(impl_->lock);
   Value v;
   if (Node* hid = impl_->child_named(device, "_HID")) {
     if (evaluate(hid, nullptr, 0, &v) && id_matches(v, id)) return true;

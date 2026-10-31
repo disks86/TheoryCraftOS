@@ -95,6 +95,9 @@ class IRenderer2D {
   // True if the drawing is done by a GPU rather than the CPU.
   virtual bool accelerated() const = 0;
   virtual Extent2D extent() const = 0;
+  // True if this renderer is best given gradients as plain stops (hints written out as a few extra stops, a repeat unrolled, a conic one as wedges): it draws those on the GPU
+  // but has no exact per-pixel gradient of its own. The CPU renderer says no, and callers that can color pixels themselves exactly then do.
+  virtual bool gradients_as_stops() const { return false; }
 
   virtual void set_clip(const Rect2D& clip) = 0;
   virtual void reset_clip() = 0;
@@ -127,6 +130,12 @@ class IRenderer2D {
   // The glyph blit: `source_rect` of `mask` tinted with `color` (its alpha scales the coverage), top left at
   // (x, y). Fully covered pixels of an opaque color are written directly.
   virtual void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) = 0;
+  // draw_mask for a glyph: `id` names the bitmap (the same id is always the same pixels), so a renderer may keep it between calls and need not be given it again to
+  // draw it; the pixels are `mask` as they are. The default draws the mask.
+  virtual void draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) {
+    (void)id;
+    draw_mask(mask, Rect2D{0, 0, mask.width, mask.height}, x, y, color);
+  }
   // Draws `source_rect` of `source` stretched over `dest`. Pixel centers of `dest` map linearly into
   // `source_rect`; samples never leave the rectangle (clamped at its edges).
   virtual void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) = 0;
@@ -140,6 +149,13 @@ class IRenderer2D {
     return false;
   }
 
+  // Fills `area` with copies of `tile` (all of the surface), the pattern repeating in both directions: each copy is `cell_w` x `cell_h` pixels (the tile stretched by
+  // nearest sampling, so equal sizes are the tile's own pixels), and the top left of one copy is at (origin_x, origin_y). Alpha blended like draw_image. Returns false, with
+  // nothing drawn, when this renderer cannot (the default; the device renderer under a layer's per-shape opacity, or without textures): the caller draws the copies itself.
+  virtual bool draw_image_tiled(const Surface& tile, int32_t origin_x, int32_t origin_y, uint32_t cell_w, uint32_t cell_h, const Rect2D& area) {
+    (void)tile, (void)origin_x, (void)origin_y, (void)cell_w, (void)cell_h, (void)area;
+    return false;
+  }
   // Offscreen groups. begin_group() starts a transparent picture covering `bounds` (target coordinates, clipped to the target): everything drawn until
   // the matching end_group() is drawn into it, with the same coordinates and the clip stack of the group alone (pushes left open are dropped), and
   // nothing reaches the target. end_group() then lays the picture over the target: a point (x, y) of it, in the coordinates it was drawn in, lands at
@@ -171,6 +187,12 @@ class IRenderer2D {
     (void)t;
     return false;
   }
+  // A drop shadow: the picture's alpha moved by (dx, dy) whole pixels, blurred (as group_blur does, sigma pixels) and tinted with `color` (0xAARRGGBB, its alpha scales the
+  // shadow), put under the picture.
+  virtual bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) {
+    (void)dx, (void)dy, (void)sigma, (void)color;
+    return false;
+  }
   // Erases the coverage of a rounded rectangle (anti-aliased like fill_rounded_rect) from a filter group's picture: what was there is multiplied by one minus the coverage.
   virtual bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) {
     (void)rect, (void)radii;
@@ -184,6 +206,14 @@ class IRenderer2D {
   // Fills `rect` with an elliptical gradient: offset 1 is the ellipse around `center` with half axes
   // `radii` (both must be positive, else the last stop's color fills).
   virtual void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) = 0;
+
+  // Fills `rect` with a conic (angular) gradient around `center`: the color at the angle that is `offset` turns clockwise from a start `start_turns` turns clockwise from straight up is
+  // found between the samples either side of it (linearly). Samples are sorted by offset, run from 0 to 1, and two with the same offset make a hard edge; any number up to 4096 is
+  // used. Returns false, with nothing drawn, when this renderer cannot (the default): the caller colors the pixels itself.
+  virtual bool fill_conic_gradient(const Rect2D& rect, Vec2 center, float start_turns, ArrayView<const GradientStop> samples) {
+    (void)rect, (void)center, (void)start_turns, (void)samples;
+    return false;
+  }
 
   // Clip stack. The effective clip is set_clip()'s rectangle intersected with every pushed entry (set_clip
   // and reset_clip do not touch the pushed ones). Every push is matched by one pop_clip(), whatever it

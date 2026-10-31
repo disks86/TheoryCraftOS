@@ -306,9 +306,8 @@ static void test_duplicate_and_close() {
     CHECK(p.call(WindowsSyscallNumber::NtClose, ev) == 0);
     CHECK(p.wait(copy, 0) == 0);      // the copy keeps the object
     CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 3) == 0);      // close the source
-    CHECK(p.wait(copy, 0) == 0xC0000008u);
-    CHECK(p.wait(p.memory.get64(kBase + 0x120), 0) == 0);
-    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, 0x1234, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0xC0000002u);      // another process
+    CHECK(p.memory.get64(kBase + 0x120) == copy && p.wait(copy, 0) == 0);      // the handle moved (same process: it keeps its number)
+    CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, 0x1234, copy, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0xC0000008u);      // another process (a handle that is none: a handle of a running one is taken from it)
     // the pseudo handle of the calling thread becomes a real one (what thread libraries do to find themselves again); it needs a thread record
     CHECK(p.call(WindowsSyscallNumber::NtDuplicateObject, ~uint64_t{0}, ~uint64_t{1}, ~uint64_t{0}, kBase + 0x120, 0, 0, 0) == 0xC0000008u);
     p.process.register_main_thread(1, 0x7FFD0000);
@@ -374,7 +373,8 @@ static void test_jobs() {
     CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, returned) == 48);
     CHECK(get32(p.memory, buffer + 36) == 1 && get32(p.memory, buffer + 40) == 1 && get32(p.memory, buffer + 44) == 0);      // total, active, terminated
     CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 3, buffer, 64, returned) == 0 && get32(p.memory, buffer) == 1 && get32(p.memory, buffer + 4) == 1 && p.memory.get64(buffer + 8) == 1);
-    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 3, buffer, 8, returned) == 0x80000005u);      // the list does not fit
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 3, buffer, 8, returned) == 0xC0000004u);      // not even room for one process id
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 3, buffer, 16, returned) == 0);      // one fits (the job has one process)
     CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 2, buffer, 10, returned) == 0xC0000004u);
     CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, 0, 2, buffer, 64, returned) == 0);      // no handle: the job of this process
     CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 7, buffer, 16, returned) == 0xC00000BBu);      // completion ports are not supported
@@ -409,11 +409,11 @@ static void test_jobs() {
     CHECK(p.call(WindowsSyscallNumber::NtTerminateJobObject, job, 7) == 0);
     CHECK(objects.job_kill_for(1, &code) && code == 7 && objects.job_kill_for(5, &code) && code == 7 && !objects.job_kill_for(6, &code));
     objects.process_exited(5, 7);
-    CHECK(!objects.job_kill_for(5, &code) && objects.job_of_process(5) == 0);
-    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, buffer + 40) == 1 && get32(p.memory, buffer + 44) == 1);
+    CHECK(!objects.job_kill_for(5, &code) && objects.job_of_process(5) == id);      // (it is still said to be in the job)
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, buffer + 40) == 1 && get32(p.memory, buffer + 44) == 0);
     objects.process_exited(1, 7);
     CHECK(!objects.job_kill_for(1, &code));
-    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, buffer + 40) == 0 && get32(p.memory, buffer + 44) == 2 && get32(p.memory, buffer + 36) == 2);
+    CHECK(p.call(WindowsSyscallNumber::NtQueryInformationJobObject, job, 1, buffer, 48, returned) == 0 && get32(p.memory, buffer + 40) == 0 && get32(p.memory, buffer + 44) == 0 && get32(p.memory, buffer + 36) == 2);      // (nothing counts as terminated)
     // a named job is found again; kill on close
     CHECK(p.call(WindowsSyscallNumber::NtOpenJobObject, kBase + 0x100, 0x1F001F, p.attributes("Job1")) == 0);
     const uint64_t again = p.out();

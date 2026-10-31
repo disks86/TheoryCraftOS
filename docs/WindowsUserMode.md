@@ -34,6 +34,16 @@ kernel32 for the registry.
 | `NtCreatePipe` | 55 |
 | `NtCreateNamedPipeFile` | 56 |
 | `NtFsControlFile` | 57 |
+| `NtCancelSynchronousIoFile` | 156 |
+
+A write that does not fit the buffer is queued whole, in the pipe's own queue (`ObjectManager::Pipe`, larger than the reported buffer): the other end sees its bytes at
+once (`PeekNamedPipe`, `ReadDataAvailable`), and the write is complete when enough was read to make room for all of it. A call that has to wait is an operation of the
+pipe with a tag: reads that wait are served in the order they were made, and cancelling one operation (`CancelIoEx`, `CancelIo`, closing the handle, the end of its process)
+takes back the bytes of a write that were not read. An overlapped call waits in a thread of its own in the library (`BEGIN_READ/WRITE/LISTEN/TRANSACT`, `AWAIT`, `ACK`,
+`CANCEL`, the library's own FSCTLs 0x11FFF0 and up); whoever finishes an operation does not return before that thread has completed the `OVERLAPPED`, so the event is set
+when the call that caused it returns. `TransactNamedPipe` writes without waiting and queues the read; `PIPE_NOWAIT` writes take what the waiting reads take and what fits.
+A pipe end can be tied to an I/O completion port: when a process ends while a call of it waits on the end, the kernel keeps the packet for the port. Not done: a completion
+for a call of another process that finishes normally is still posted by that process's own library (to the port tables of that process only).
 
 ## Mailslots
 

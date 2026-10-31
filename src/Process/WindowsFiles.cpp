@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsFiles.hpp"
+#include "Process/FileSecurity.hpp"
 #include "Process/DosWildcard.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsMailslots.hpp"
@@ -44,7 +45,7 @@ constexpr uint64_t kUnixToNtSeconds = 11644473600ull;
 constexpr uint64_t kUseFilePointer = 0xFFFFFFFFFFFFFFFEull, kWriteToEnd = 0xFFFFFFFFFFFFFFFFull;
 // NtCreateFile dispositions, options, access bits, Information results
 constexpr uint32_t kSupersede = 0, kOpen = 1, kCreate = 2, kOpenIf = 3, kOverwrite = 4, kOverwriteIf = 5;
-constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000;
+constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000, kOpenByFileId = 0x2000, kOpenReparsePoint = 0x200000;
 constexpr uint32_t kCannotDelete = 0xC0000121u, kUserMappedFile = 0xC0000243u;
 constexpr uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kGenericAll = 0x10000000u, kFileReadData = 1, kFileWriteData = 2, kFileAppendData = 4;
 constexpr uint64_t kFileSuperseded = 0, kFileOpened = 1, kFileCreated = 2, kFileOverwritten = 3;
@@ -91,20 +92,44 @@ StringView virtual_directory_of(StringView virtual_path) {
   return at <= 1 ? StringView("/") : virtual_path.first(at - 1);
 }
 
-// The entry's own name, the part virtual_directory_of leaves out: "/Windows/sub/x.txt" -> "x.txt".
-StringView virtual_leaf_of(StringView virtual_path) {
-  uint64_t at = virtual_path.size();
-  while (at > 0 && virtual_path[at - 1] != '/') --at;
-  return virtual_path.without_prefix(at);
+// After any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked, or a file's attributes, size or times changed): wakes
+// any FindFirstChangeNotification/ReadDirectoryChangesW handle watching the directory of `changed_path` or an ancestor of it whose filter asks for this kind of change, and
+// queues a FILE_ACTION_*/name record for the latter (see ObjectManager::notify_entry_changed). `changed_path` is the changed entry's own full virtual path; `action` one
+// of the FILE_ACTION_* constants below. A no-op if there is no ObjectManager yet (a host test that never made one; the real kernel always has).
+constexpr uint32_t kFileActionAdded = 1, kFileActionRemoved = 2, kFileActionModified = 3, kFileActionRenamedOldName = 4, kFileActionRenamedNewName = 5;
+
+// A thread of the program that waits for a ReadDirectoryChangesW request (kernel32 has one for each) completes it - fills the buffer, sets the event - and acknowledges
+// it; the one that made the change waits for that (a fifth of a second at most), so that a program that looks at the OVERLAPPED at once finds it complete.
+void await_watch_delivery(Process& p) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return;
+  const uint32_t s = wait_until(p, 200ull * 1000000, [&]() -> uint64_t { return objects->watches_delivered_locked() ? kSuccess : kWaitPending; });
+  if (s != kSuccess) {
+    objects->sync().lock();
+    objects->watches_forgive_locked();
+    objects->sync().unlock();
+  }
 }
 
-// After any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked): wakes any FindFirstChangeNotification/
-// ReadDirectoryChangesW handle watching `affected_directory` or an ancestor of it, and queues a FILE_ACTION_*/name record for the latter (see
-// ObjectManager::notify_path_changed). `changed_path` is the changed entry's own full virtual path; `action` one of the FILE_ACTION_* constants below.
-// A no-op if there is no ObjectManager yet (a host test that never made one; the real kernel always has).
-constexpr uint32_t kFileActionAdded = 1, kFileActionRemoved = 2, kFileActionRenamedOldName = 4, kFileActionRenamedNewName = 5;
-void notify_directory_changed(StringView changed_path, uint32_t action) {
-  if (ObjectManager* objects = system_objects()) objects->notify_path_changed(virtual_directory_of(changed_path), action, virtual_leaf_of(changed_path));
+void notify_directory_changed(Process& p, StringView changed_path, uint32_t action, bool is_directory) {
+  if (ObjectManager* objects = system_objects()) {
+    objects->notify_entry_changed(changed_path, action, is_directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName);
+    await_watch_delivery(p);
+  }
+}
+
+void notify_entry_modified(Process& p, StringView changed_path, uint32_t filter_mask) {
+  if (ObjectManager* objects = system_objects()) {
+    objects->notify_entry_changed(changed_path, kFileActionModified, filter_mask);
+    await_watch_delivery(p);
+  }
+}
+
+void notify_directory_renamed(Process& p, StringView old_path, StringView new_path, bool is_directory) {
+  if (ObjectManager* objects = system_objects()) {
+    objects->notify_entry_renamed(old_path, new_path, is_directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName);
+    await_watch_delivery(p);
+  }
 }
 
 // IO_STATUS_BLOCK { NTSTATUS Status (8 bytes with padding); ULONG_PTR Information; }
@@ -114,6 +139,17 @@ bool store_io_status(Process& p, uint64_t address, uint32_t status, uint64_t inf
 
 uint64_t file_time(uint64_t unix_seconds) { return unix_seconds ? (unix_seconds + kUnixToNtSeconds) * 10000000ull : 0; }
 
+// The time now as a FILETIME, and a file's exact times noted: after a write the last write time moves to now, a file made starts with now everywhere.
+uint64_t nt_now(Process& p) { return p.host().realtime_ns() / 100 + kUnixToNtSeconds * 10000000ull; }
+void note_times(Process& p, StringView virtual_path, uint32_t which) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return;
+  ObjectManager::FileTimes t;
+  t.created = t.accessed = t.written = nt_now(p);
+  objects->file_times_set(virtual_path, which, t);
+}
+
+
 void put(ByteView out, uint64_t at, uint64_t value, uint32_t bytes) {
   for (uint32_t i = 0; i < bytes; ++i) out[at + i] = static_cast<uint8_t>(value >> (8 * i));
 }
@@ -122,7 +158,7 @@ uint32_t attributes_of(const DirectoryEntry& e) {
   uint32_t a = e.type == NodeType::Directory ? kAttributeDirectory : 0;
   if (e.read_only) a |= kAttributeReadOnly;
   if (e.is_symlink) a |= kAttributeReparsePoint;
-  if (e.type != NodeType::Directory && !e.is_symlink) a |= kAttributeArchive;      // (not kept: a file always counts as one that has not been backed up)
+  if (e.type != NodeType::Directory) a |= kAttributeArchive;      // (not kept: a file always counts as one that has not been backed up)
   return a ? a : kAttributeNormal;
 }
 
@@ -159,6 +195,8 @@ uint32_t object_path(Process& p, uint64_t attributes, String* virtual_path) {
   PathResult result;
   if (root != 0) {
     uint64_t slot = 0;
+    if (text.empty() && handle_slot(root, &slot) && (files.kind(slot) == DescriptorKind::ConsoleInput || files.kind(slot) == DescriptorKind::ConsoleOutput || files.kind(slot) == DescriptorKind::ConsoleError))
+      return 0xC0000225u;      // STATUS_NOT_FOUND: nothing is below a console (asked for with no name)
     if (!handle_slot(root, &slot) || files.kind(slot) != DescriptorKind::Directory) return kInvalidHandle;
     result = files.resolve_from(files.object(slot)->path.view(), text.view(), virtual_path);
   } else {
@@ -171,6 +209,58 @@ uint32_t object_path(Process& p, uint64_t attributes, String* virtual_path) {
     case PathResult::UnknownDrive: return kObjectPathNotFound;
     default: return kObjectNameInvalid;
   }
+}
+
+// The file index (FileInternalInformation, the FileId of a directory listing, what OpenFileById opens): the file systems here have no inode numbers to give, so it is a hash of the
+// file's path (spelled in lower case), which names the same file for as long as it is there under that name. Never 0 and never with all ones in the low half.
+uint64_t file_id_of(StringView virtual_path) {
+  uint64_t hash = 0xCBF29CE484222325ull;
+  for (char c : virtual_path) {
+    hash ^= static_cast<uint8_t>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    hash *= 0x100000001B3ull;
+  }
+  if ((hash & 0xFFFFFFFFu) == 0xFFFFFFFFu) hash ^= 1;
+  return hash ? hash : 1;
+}
+
+// The path of the file whose index is `id`, looked for from `start` downwards (the directory a caller of OpenFileById names); the search is small and bounded.
+bool find_file_id(ProcessFiles& files, StringView start, uint64_t id, uint32_t depth, uint32_t* budget, String* found) {
+  if (file_id_of(start) == id) return found->assign(start);
+  if (depth == 0) return false;
+  String host(files.allocator());
+  UniquePointer<filesystem::IDirectory> directory;
+  if (!files.host_path_of(start, &host) || !files.file_system() || files.file_system()->open_directory(host.view(), &directory) != Status::Ok) return false;
+  DirectoryEntry entry;
+  while (*budget != 0 && directory->next(&entry) == Status::Ok) {
+    --*budget;
+    String child(files.allocator());
+    if (!child.assign(start) || (start != StringView("/") && !child.push_back('/')) || !child.append(entry.name.view())) return false;
+    if (file_id_of(child.view()) == id) return found->assign(child.view());
+    if (entry.type == NodeType::Directory && !entry.is_symlink && find_file_id(files, child.view(), id, depth - 1, budget, found)) return true;
+  }
+  return false;
+}
+
+// FILE_OPEN_BY_FILE_ID: the object name is the 8 bytes of a file index and the root directory the one to look in (the whole tree when there is none).
+uint32_t path_by_file_id(Process& p, uint64_t attributes, String* virtual_path) {
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return kObjectPathNotFound;
+  uint64_t root = 0, name = 0, buffer = 0, id = 0;
+  uint8_t header[8];
+  if (attributes == 0 || !p.read_user_u64(attributes + 8, &root) || !p.read_user_u64(attributes + 16, &name) || name == 0 || !p.read_user(name, ByteView(header, 8)) || !p.read_user_u64(name + 8, &buffer) ||
+      !p.read_user_u64(buffer, &id))
+    return kAccessViolation;
+  if ((header[0] | (header[1] << 8)) != 8) return kInvalidParameter;
+  String start(files.allocator());
+  if (root != 0) {
+    uint64_t slot = 0;
+    if (!handle_slot(root, &slot) || files.kind(slot) != DescriptorKind::Directory) return kInvalidHandle;
+    start.assign(files.object(slot)->path.view());
+  } else {
+    start.assign(StringView("/"));
+  }
+  uint32_t budget = 4096;
+  return find_file_id(files, start.view(), id, 4, &budget, virtual_path) ? kSuccess : kObjectNameNotFound;
 }
 
 // The status for a missing name: the path is wrong if the folder above is missing too.
@@ -192,6 +282,42 @@ uint32_t file_is_mapped(ProcessFiles& files, StringView virtual_path) {
   ObjectManager* objects = system_objects();
   String host(files.allocator());
   return objects && files.host_path_of(virtual_path, &host) ? objects->file_has_section(host.view()) : 0;
+}
+
+// --- security descriptors of files and directories (FileSecurity.hpp)
+
+constexpr uint32_t kInvalidSecurityDescriptor = 0xC0000079u;
+
+bool read_program_memory(void* context, uint64_t address, ByteView out) { return static_cast<Process*>(context)->read_user(address, out); }
+
+// The directory a node is in ("/a/b" is in "/a"; "/a" is in "/").
+StringView directory_part(StringView path) {
+  const uint64_t cut = path.rfind('/');
+  return cut == StringView::npos || cut == 0 ? StringView("/") : path.first(cut);
+}
+
+// Does the descriptor of the node (if it has one) grant `access`? A node with none grants everything.
+bool node_allows(ObjectManager* objects, StringView path, uint32_t access) {
+  if (!objects) return true;
+  filesecurity::Stored stored;
+  stored.size = objects->security_get(path, ByteView(stored.bytes, sizeof(stored.bytes)));
+  return stored.size == 0 || filesecurity::allows(stored, access);
+}
+
+// Adding a file or directory below `path` (its directory is that of the new node's name).
+uint32_t check_add_below(StringView new_path, bool directory) {
+  ObjectManager* objects = system_objects();
+  return node_allows(objects, directory_part(new_path), directory ? filesecurity::kFileAddSubdirectory : filesecurity::kFileAddFile) ? kSuccess : kAccessDenied;
+}
+
+// Opening a node that exists with `access`, or deleting it (DELETE; the right to delete a node can also come from its directory, which grants FILE_DELETE_CHILD).
+uint32_t check_open(StringView path, uint32_t access) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kSuccess;
+  const uint32_t desired = filesecurity::map_generic(access);
+  if (node_allows(objects, path, desired)) return kSuccess;
+  if ((desired & filesecurity::kDelete) && node_allows(objects, path, desired & ~filesecurity::kDelete) && node_allows(objects, directory_part(path), filesecurity::kFileDeleteChild)) return kSuccess;
+  return kAccessDenied;
 }
 
 uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t access, uint32_t disposition, uint32_t options, uint64_t* information, uint64_t* handle, uint32_t share = 7, uint32_t file_attributes = 0) {
@@ -225,18 +351,57 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
         if (!same) continue;
         const int64_t slot = files.open_device(n > 12 ? DescriptorKind::MountManager : DescriptorKind::Null);
         if (slot < 0) return kTooManyOpenedFiles;
+        uint8_t flag_bytes[4] = {};
+        if (p.read_user(object_attributes + 24, ByteView(flag_bytes, 4))) files.set_handle_flags(uint64_t(slot), (flag_bytes[0] & 2) != 0, false);      // OBJ_INHERIT
         *handle = (uint64_t(slot) + 1) * 4;
         *information = kFileOpened;
         return kSuccess;
       }
     }
   }
+  {      // \\Device\\ConDrv\\TcosIn / TcosOut / TcosErr: a new descriptor for the terminal (what a console that is made after the standard handles were closed gets); no other is the same object
+    uint64_t name_at = 0;
+    String text(files.allocator());
+    if (object_attributes != 0 && p.read_user_u64(object_attributes + 16, &name_at) && name_at != 0 && read_unicode_string(p, name_at, &text) == kSuccess) {
+      static const char kPrefix[] = "\\device\\condrv\\tcos";
+      const StringView name = text.view();
+      uint64_t n = 0;
+      while (kPrefix[n]) ++n;
+      bool same = name.size() > n;
+      for (uint64_t i = 0; same && i < n; ++i) same = (name[i] >= 'A' && name[i] <= 'Z' ? char(name[i] + 32) : name[i]) == kPrefix[i];
+      if (same) {
+        const StringView rest = name.without_prefix(n);
+        static uint64_t serial = 0;
+        const DescriptorKind kind = rest == StringView("In") ? DescriptorKind::ConsoleInput : rest == StringView("Out") ? DescriptorKind::ConsoleOutput : rest == StringView("Err") ? DescriptorKind::ConsoleError : DescriptorKind::Closed;
+        if (kind != DescriptorKind::Closed) {
+          const int64_t slot = files.open_token(kind, ++serial);
+          if (slot < 0) return kTooManyOpenedFiles;
+          *handle = (uint64_t(slot) + 1) * 4;
+          *information = kFileOpened;
+          return kSuccess;
+        }
+      }
+    }
+  }
   String virtual_path(files.allocator());
-  const uint32_t named = object_path(p, object_attributes, &virtual_path);
+  const uint32_t named = (options & kOpenByFileId) ? path_by_file_id(p, object_attributes, &virtual_path) : object_path(p, object_attributes, &virtual_path);
   if (named != kSuccess) return named;
   if (disposition > kOverwriteIf) return kInvalidParameter;
   if ((options & kDirectoryFile) && (options & kNonDirectoryFile)) return kInvalidParameter;
 
+  if ((options & kOpenReparsePoint) && disposition == kOpen) {      // a symbolic link opened itself
+    uint32_t link_slot = 0;
+    if (files.open_link(virtual_path.view(), &link_slot) == Status::Ok) {
+      if (files.kind(link_slot) == DescriptorKind::File) if (OpenObject* opened = files.object(link_slot)) opened->granted_access = access;
+      uint32_t object_flags = 0;
+      uint8_t flag_bytes[4];
+      if (p.read_user(object_attributes + 24, ByteView(flag_bytes, 4))) object_flags = flag_bytes[0] | (uint32_t{flag_bytes[1]} << 8) | (uint32_t{flag_bytes[2]} << 16) | (uint32_t{flag_bytes[3]} << 24);
+      files.set_handle_flags(link_slot, (object_flags & 2) != 0, false);
+      *handle = (uint64_t{link_slot} + 1) * 4;
+      *information = kFileOpened;
+      return kSuccess;
+    }
+  }
   OpenFlags f;
   const bool all = access & kGenericAll;
   f.write = all || (access & (kGenericWrite | kFileWriteData | kFileAppendData));
@@ -250,6 +415,19 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (f.truncate) f.write = true;
   DirectoryEntry before;
   const bool existed = files.stat(virtual_path.view(), &before) == Status::Ok;
+  // The descriptor a new node is made with, taken now so a bad one stops the call before anything is made; and what the descriptors of the nodes involved allow.
+  filesecurity::Stored new_descriptor;
+  if (!existed && f.create) {
+    uint64_t descriptor_at = 0;
+    if (object_attributes != 0 && p.read_user_u64(object_attributes + 0x20, &descriptor_at) && descriptor_at != 0) {
+      ObjectManager* store = system_objects();
+      if (!filesecurity::import_descriptor(read_program_memory, &p, descriptor_at, &new_descriptor)) return kInvalidSecurityDescriptor;
+      if (!store || !store->security_room()) return kNoResources;
+    }
+    if (const uint32_t allowed = check_add_below(virtual_path.view(), f.must_be_directory != 0); allowed != kSuccess) return allowed;
+  } else if (existed) {
+    if (const uint32_t allowed = check_open(virtual_path.view(), access); allowed != kSuccess) return allowed;
+  }
   if (existed && before.type == NodeType::Directory) {
     f.write = false;      // a directory is opened to be listed or queried
     f.truncate = false;
@@ -278,12 +456,21 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   } else if ((options & kDeleteOnClose) && !(access & (kGenericAll | 0x10000))) {
     return kAccessDenied;
   }
+  if (existed && before.type == NodeType::Directory && sharing && wanted && sharing->share_acquire(virtual_path.view(), nullptr, wanted, share) == ObjectManager::ShareResult::Violation)
+    return kSharingViolation;      // (a directory somebody holds open without sharing delete - the current directory of a program - cannot be removed or opened for deleting)
   uint32_t slot = 0;
   bool created = false;
   const Status status = files.open(virtual_path.view(), f, &slot, &created);
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return kTooManyOpenedFiles;
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
-  if (created) notify_directory_changed(virtual_path.view(), kFileActionAdded);
+  if (created) { notify_directory_changed(p, virtual_path.view(), kFileActionAdded, files.kind(slot) == DescriptorKind::Directory); note_times(p, virtual_path.view(), 7); }
+  if (created && new_descriptor.size != 0) {
+    if (ObjectManager* store = system_objects()) store->security_set(virtual_path.view(), ConstByteView(new_descriptor.bytes, new_descriptor.size));
+  }
+  else if (f.truncate && existed) {
+    note_times(p, virtual_path.view(), 4);
+    notify_entry_modified(p, virtual_path.view(), (before.size != 0 ? ObjectManager::kChangeSize : 0) | ObjectManager::kChangeLastWrite);
+  }
   if (created && (file_attributes & kAttributeReadOnly)) {
     filesystem::MetadataChange change;
     change.set_read_only = true;
@@ -296,9 +483,11 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (files.kind(slot) == DescriptorKind::File) {
     OpenObject* opened = files.object(slot);
     opened->granted_access = access;
+    if (opened->no_data_access) opened->readable = false;      // (a handle for attributes only reads nothing)
     opened->writable = (access & (kGenericAll | kGenericWrite | kFileWriteData | kFileAppendData)) != 0;      // (an overwrite writes through the file system's own handle, not the program's)
   }
-  if (sharing && wanted && files.kind(slot) == DescriptorKind::File) sharing->share_acquire(virtual_path.view(), files.object(slot), wanted, share);
+  if (files.kind(slot) == DescriptorKind::Directory) if (OpenObject* opened = files.object(slot)) opened->granted_access = access;
+  if (sharing && wanted && (files.kind(slot) == DescriptorKind::File || files.kind(slot) == DescriptorKind::Directory)) sharing->share_acquire(virtual_path.view(), files.object(slot), wanted, share);
   if (options & kDeleteOnClose) files.object(slot)->delete_on_close = true;
   uint32_t object_flags = 0;
   uint8_t flag_bytes[4];
@@ -366,6 +555,7 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   uint64_t done = 0;
   uint8_t chunk[kChunk];
   Status io = Status::Ok;
+  const uint64_t size_before = write ? files.size_of(object) : 0;
   while (done < length && io == Status::Ok) {
     const uint64_t n = length - done < sizeof(chunk) ? length - done : sizeof(chunk);
     uint64_t moved = 0;
@@ -380,6 +570,10 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
     if (io == Status::Ok && moved < n) break;      // end of the file
   }
   if (io != Status::Ok && done == 0) return nt_status(io);
+  if (write && done != 0) {
+    note_times(p, object.path.view(), 4);
+    notify_entry_modified(p, object.path.view(), (at + done > size_before ? ObjectManager::kChangeSize : 0) | ObjectManager::kChangeLastWrite);
+  }
   object.position = at + done;
   status = kSuccess;
   if (!write && done == 0 && length != 0) status = kEndOfFile;
@@ -390,10 +584,13 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
 
 
 void write_times(ByteView out, uint64_t at, const DirectoryEntry& e) {
-  put(out, at, file_time(e.created ? e.created : e.modified), 8);      // CreationTime
-  put(out, at + 8, file_time(e.modified), 8);                           // LastAccessTime
-  put(out, at + 16, file_time(e.modified), 8);                          // LastWriteTime
-  put(out, at + 24, file_time(e.modified), 8);                          // ChangeTime
+  const uint64_t modified = e.exact_modified ? e.exact_modified : file_time(e.modified);
+  const uint64_t created = e.exact_created ? e.exact_created : e.created ? file_time(e.created) : modified;
+  const uint64_t accessed = e.exact_accessed ? e.exact_accessed : e.accessed ? file_time(e.accessed) : modified;
+  put(out, at, created, 8);            // CreationTime
+  put(out, at + 8, accessed, 8);       // LastAccessTime
+  put(out, at + 16, modified, 8);      // LastWriteTime
+  put(out, at + 24, modified, 8);      // ChangeTime
 }
 
 uint64_t allocation_of(const DirectoryEntry& e) { return (e.size + 4095) & ~uint64_t{4095}; }
@@ -443,7 +640,7 @@ uint64_t to_utf16(StringView text, uint8_t* out, uint64_t capacity) {
 }
 
 // One directory entry in the layout of `info_class`, with NextEntryOffset left 0. Returns its size (unpadded), or 0 if the class is unknown.
-uint64_t build_directory_record(uint32_t info_class, const DirectoryEntry& e, uint64_t index, uint8_t* out, uint64_t capacity) {
+uint64_t build_directory_record(uint32_t info_class, const DirectoryEntry& e, uint64_t index, uint64_t file_id, uint8_t* out, uint64_t capacity) {
   uint8_t name[2 * (filesystem::kMaxNameLength + 1)];
   const uint64_t name_bytes = to_utf16(e.name.view(), name, sizeof(name));
   if (name_bytes == 0 && !e.name.empty()) return 0;
@@ -469,7 +666,7 @@ uint64_t build_directory_record(uint32_t info_class, const DirectoryEntry& e, ui
     put(v, 48, allocation_of(e), 8);                   // AllocationSize
     put(v, 56, attributes_of(e), 4);
     put(v, 60, name_bytes, 4);
-    if (info_class == kFileIdBothDirectoryInformation) put(v, 96, index + 1, 8);      // FileId
+    if (info_class == kFileIdBothDirectoryInformation) put(v, 96, file_id, 8);      // FileId
   }
   for (uint64_t i = 0; i < name_bytes; ++i) v[name_at + i] = name[i];
   return header + name_bytes;
@@ -532,7 +729,11 @@ uint32_t nt_close(Process& p, const SyscallRequest& r) {
   uint64_t slot = 0;
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   if (p.files().protected_from_close(slot)) return 0xC0000235u;      // STATUS_HANDLE_NOT_CLOSABLE
-  return p.close_descriptor(slot) ? kSuccess : kInvalidHandle;
+  const bool pipe = p.files().kind(slot) == DescriptorKind::Pipe;
+  const uint64_t token = p.files().token(slot);
+  if (!p.close_descriptor(slot)) return kInvalidHandle;
+  if (pipe) pipe_closed(p, token);      // (the calls of other threads that closing it ended are over when it returns)
+  return kSuccess;
 }
 
 uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
@@ -554,6 +755,30 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     if ((r.args[3] & 0xFFFFFFFFu) < sizeof b) return kInfoLengthMismatch;
     if (!p.write_user(r.args[2], ConstByteView(b, sizeof b))) return kAccessViolation;
     return store_io_status(p, r.args[1], kSuccess, sizeof b) ? kSuccess : kAccessViolation;
+  }
+  if ((kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError) && static_cast<uint32_t>(info_class) == 5)
+    return kInvalidDeviceRequest;      // FileStandardInformation: a console has no size
+  if (kind == DescriptorKind::Pipe && static_cast<uint32_t>(info_class) == kFileNameInformation) {      // "\\name": where a pipe is
+    String pipe_name(files.allocator()), windows_name(files.allocator());
+    if (!pipe_handle_name(p, slot, &pipe_name)) return kInvalidParameter;
+    if (pipe_name.empty()) {      // an anonymous pipe has a name too: "Win32Pipes.<process>.<number>"
+      static const char digits[] = "0123456789abcdef";
+      const uint32_t number = uint32_t(p.files().token(slot));
+      if (!pipe_name.assign("Win32Pipes.00000000.")) return kInvalidParameter;
+      for (int shift = 28; shift >= 0; shift -= 4) if (!pipe_name.push_back(digits[(number >> shift) & 15])) return kInvalidParameter;
+    }
+    if (!windows_name.push_back('\\') || !windows_name.append(pipe_name.view())) return kInvalidParameter;
+    uint8_t name[2 * (kMaxPath + 1)];
+    const uint64_t bytes = to_utf16(windows_name.view(), name, sizeof(name));
+    const uint64_t length = r.args[3] & 0xFFFFFFFFu;
+    if (length < 4) return kInfoLengthMismatch;
+    uint8_t out[4];
+    put(ByteView(out, 4), 0, bytes, 4);
+    if (!p.write_user(r.args[2], ConstByteView(out, 4))) return kAccessViolation;
+    const uint64_t room = length - 4 < bytes ? length - 4 : bytes;
+    if (room && !p.write_user(r.args[2] + 4, ConstByteView(name, room))) return kAccessViolation;
+    const uint32_t status = room < bytes ? kBufferOverflow : kSuccess;
+    return store_io_status(p, r.args[1], status, 4 + room) ? status : kAccessViolation;
   }
   if (kind == DescriptorKind::Pipe) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
@@ -586,6 +811,8 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       size = 24;
       break;
     case kFilePositionInformation: put(v, 0, object ? object->position : 0, 8); size = 8; break;
+    case 8: put(v, 0, object ? object->granted_access : 0, 4); size = 4; break;      // FileAccessInformation: the access the handle was opened with
+    case 6: put(v, 0, object ? file_id_of(object->path.view()) : 0, 8); size = 8; break;      // FileInternalInformation: the index of the file
     case kFileNetworkOpenInformation:
       write_times(v, 0, e);
       put(v, 32, allocation_of(e), 8);
@@ -597,8 +824,9 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       // The path on the volume, "\dir\file" (the root is "\").
       if (!object) return kInvalidParameter;
       uint8_t name[2 * (kMaxPath + 1)];
-      String windows_name(files.allocator());
-      for (char c : object->path.view()) if (!windows_name.push_back(c == '/' ? '\\' : c)) return kNoMemory;
+      String windows_name(files.allocator()), spelled(files.allocator());
+      if (!files.canonical_path(object->path.view(), &spelled)) spelled.assign(object->path.view());
+      for (char c : spelled.view()) if (!windows_name.push_back(c == '/' ? '\\' : c)) return kNoMemory;
       const uint64_t bytes = to_utf16(windows_name.view(), name, sizeof(name));
       if (length < 4) return kInfoLengthMismatch;
       uint8_t out[4];
@@ -656,8 +884,19 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (int64_t(value) < 0) return kInvalidParameter;
       if (value < files.size_of(*object) && file_is_mapped(files, object->path.view())) return kUserMappedFile;      // (a mapped file cannot be made shorter)
       status = nt_status(files.resize(*object, value));
+      if (status == kSuccess) {
+        note_times(p, object->path.view(), 4);
+        notify_entry_modified(p, object->path.view(), ObjectManager::kChangeSize | ObjectManager::kChangeLastWrite);
+      }
       break;
     case kFileAllocationInformation: break;      // nothing to change: sizes are exact
+    case 43: {      // FileIoPriorityHintInformation { IO_PRIORITY_HINT }: the hint is taken and has no effect
+      if (length < 4) return kInfoLengthMismatch;
+      uint8_t hint[4];
+      if (!p.read_user(address, ByteView(hint, 4))) return kAccessViolation;
+      if ((hint[0] | (hint[1] << 8) | (hint[2] << 16) | (uint32_t(hint[3]) << 24)) > 2) return kInvalidParameter;      // (VeryLow, Low, Normal; "Max" is no hint)
+      break;
+    }
     case kFileBasicInformation: {      // the times (0 or -1: leave as they are) and the read-only attribute (0: leave); the file system says if it keeps none of that
       if (length < 40) return kInfoLengthMismatch;
       if (!(object->granted_access & (0x100 /* FILE_WRITE_ATTRIBUTES */ | kGenericWrite | kGenericAll))) return kAccessDenied;
@@ -676,16 +915,35 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       const uint32_t attributes = raw[32] | (uint32_t{raw[33]} << 8) | (uint32_t{raw[34]} << 16) | (uint32_t{raw[35]} << 24);
       if (attributes != 0) { change.set_read_only = true; change.read_only = (attributes & kAttributeReadOnly) != 0; }
       if (change.set_created || change.set_modified || change.set_read_only) status = nt_status(files.set_metadata(object->path.view(), change));
+      if (status == kSuccess) {      // the exact times are kept here (the file systems keep seconds)
+        ObjectManager::FileTimes exact;
+        uint32_t which = 0;
+        auto exact_time = [&](uint32_t at, uint32_t bit, uint64_t* field) {
+          const uint64_t nt = le64(at);
+          if (nt == 0 || nt == ~uint64_t{0}) return;
+          *field = nt;
+          which |= bit;
+        };
+        exact_time(0, 1, &exact.created);
+        exact_time(8, 2, &exact.accessed);
+        exact_time(16, 4, &exact.written);
+        if (which != 0) if (ObjectManager* objects = system_objects()) objects->file_times_set(object->path.view(), which, exact);
+        const uint32_t touched = (attributes != 0 ? ObjectManager::kChangeAttributes : 0) | ((which & 1) ? ObjectManager::kChangeCreation : 0) | ((which & 2) ? ObjectManager::kChangeLastAccess : 0) |
+                                 ((which & 4) ? ObjectManager::kChangeLastWrite : 0);
+        if (touched != 0) notify_entry_modified(p, object->path.view(), touched);
+      }
       break;
     }
     case kFileDispositionInformation: {
       uint8_t flag = 0;
-      if (length < 1 || !p.read_user(address, ByteView(&flag, 1))) return kAccessViolation;
+      if (length < 1) return kInfoLengthMismatch;
+      if (!p.read_user(address, ByteView(&flag, 1))) return kAccessViolation;
       object->delete_on_close = flag != 0;
       break;
     }
     case kFileRenameInformation: {
       if (length < 20) return kInfoLengthMismatch;
+      if (!(object->granted_access & (0x10000 /* DELETE */ | kGenericAll))) return kAccessDenied;      // (a rename takes the right to delete)
       uint8_t header[20];
       if (!p.read_user(address, ByteView(header, 20))) return kAccessViolation;
       const uint64_t name_bytes = header[16] | (uint64_t{header[17]} << 8) | (uint64_t{header[18]} << 16) | (uint64_t{header[19]} << 24);
@@ -696,7 +954,8 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
       if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
       DirectoryEntry existing;
-      if (file_is_mapped(files, object->path.view())) return kSharingViolation;      // (a mapped file stays where it is)
+      if (directory_part(target.view()) != directory_part(object->path.view())) if (const uint32_t allowed = check_add_below(target.view(), files.kind(slot) == DescriptorKind::Directory); allowed != kSuccess) return allowed;
+      if (file_is_mapped(files, object->path.view()) == 1) return kSharingViolation;      // (a file with a data view stays where it is; a program image can be renamed)
       auto same_ignoring_case = [](StringView a, StringView b) {
         if (a.size() != b.size()) return false;
         for (uint64_t i = 0; i < a.size(); ++i) {
@@ -708,15 +967,26 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       const bool respelled = same_ignoring_case(object->path.view(), target.view()) && object->path.view() != target.view();
       if (!respelled && files.stat(target.view(), &existing) == Status::Ok) {
         if (!header[0]) return kObjectNameCollision;
-        status = nt_status(files.remove(target.view()));
+        if (existing.type == NodeType::Directory) return kAccessDenied;      // (a directory is never replaced)
+        const Status removed = files.remove(target.view());
+        status = removed == Status::Busy ? kAccessDenied : nt_status(removed);      // (a file somebody has open stays)
       }
       if (status == kSuccess) {
         String old_path(files.allocator());
         old_path.assign(object->path.view());
         status = nt_status(files.rename(object->path.view(), target.view()));
         if (status == kSuccess) {
-          notify_directory_changed(old_path.view(), kFileActionRenamedOldName);
-          notify_directory_changed(target.view(), kFileActionRenamedNewName);
+          notify_directory_renamed(p, old_path.view(), target.view(), files.kind(slot) == DescriptorKind::Directory);
+          if (ObjectManager* sharing = system_objects()) {      // the other opens of the file follow it to its new name
+            const void* others[8];
+            const uint32_t count = sharing->share_owners(old_path.view(), others, 8);
+            for (uint32_t i = 0; i < count && i < 8; ++i) {
+              OpenObject* other = const_cast<OpenObject*>(static_cast<const OpenObject*>(others[i]));
+              other->path.assign(target.view());
+              sharing->share_retarget(other, target.view());
+            }
+            sharing->share_retarget(object, target.view());
+          }
           object->path.assign(target.view());
         }
       }
@@ -733,6 +1003,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       String name(files.allocator()), target(files.allocator());
       if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
       if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
+      if (const uint32_t allowed = check_add_below(target.view(), false); allowed != kSuccess) return allowed;
       DirectoryEntry existing;
       if (files.stat(target.view(), &existing) == Status::Ok) {
         if (!header[0]) return kObjectNameCollision;
@@ -740,7 +1011,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       }
       if (status == kSuccess) {
         status = nt_status(files.create_hard_link(object->path.view(), target.view()));
-        if (status == kSuccess) notify_directory_changed(target.view(), kFileActionAdded);
+        if (status == kSuccess) notify_directory_changed(p, target.view(), kFileActionAdded, false);
       }
       break;
     }
@@ -779,7 +1050,11 @@ uint32_t nt_query_directory_file(Process& p, const SyscallRequest& r) {
     if (status == Status::EndOfDirectory) break;
     if (status != Status::Ok) return any ? kSuccess : nt_status(status);
     if (!pattern.empty() && !dos_wildcard_matches(pattern, entry.name.view())) continue;
-    const uint64_t size = build_directory_record(static_cast<uint32_t>(info_class), entry, ++object.directory_index, record, sizeof(record));
+    String entry_path(files.allocator());
+    if (entry.name.view() == StringView(".")) entry_path.assign(object.path.view());
+    else if (entry.name.view() == StringView("..")) entry_path.assign(virtual_directory_of(object.path.view()));
+    else if (entry_path.assign(object.path.view()) && (object.path.view() == StringView("/") || entry_path.push_back('/'))) entry_path.append(entry.name.view());
+    const uint64_t size = build_directory_record(static_cast<uint32_t>(info_class), entry, ++object.directory_index, file_id_of(entry_path.view()), record, sizeof(record));
     if (size == 0) return kInvalidInfoClass;
     const uint64_t padded = (size + 7) & ~uint64_t{7};
     if (used + size > length) {
@@ -818,6 +1093,7 @@ uint32_t nt_query_attributes_file(Process& p, const SyscallRequest& r) {
   const uint32_t named = object_path(p, r.args[0], &virtual_path);
   if (named != kSuccess) return named;
   DirectoryEntry e;
+  if (files.stat_link(virtual_path.view(), &e) == Status::Ok) return write_basic(p, r.args[1], e) ? kSuccess : kAccessViolation;      // (a link answers for itself)
   const Status status = files.stat(virtual_path.view(), &e);
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
   return write_basic(p, r.args[1], e) ? kSuccess : kAccessViolation;
@@ -839,7 +1115,10 @@ uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r) {
   if (files.resolve_from(virtual_directory_of(link_virtual.view()), raw_target.view(), &target_virtual) != PathResult::Ok) return kObjectNameInvalid;
   const bool target_is_directory = (r.args[2] & 0xFF) != 0;
   const Status status = files.create_symbolic_link(link_virtual.view(), target_virtual.view(), target_is_directory);
-  if (status == Status::Ok) notify_directory_changed(link_virtual.view(), kFileActionAdded);
+  if (status == Status::Ok) {
+    notify_directory_changed(p, link_virtual.view(), kFileActionAdded, target_is_directory);
+    if (ObjectManager* objects = system_objects()) objects->link_note(link_virtual.view(), raw_target.view());      // (the text of the target as the program wrote it)
+  }
   return status_for(files, status, link_virtual.view());
 }
 
@@ -850,6 +1129,7 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
   const uint32_t named = object_path(p, r.args[0], &virtual_path);
   if (named != kSuccess) return named;
   if (virtual_path.view() == StringView("/")) return kAccessDenied;
+  if (const uint32_t allowed = check_open(virtual_path.view(), filesecurity::kDelete); allowed != kSuccess) return allowed;
   if (ObjectManager* sharing = system_objects()) {
     if (!sharing->share_allows(virtual_path.view(), ObjectManager::kShareDelete)) return kSharingViolation;
     if (file_is_mapped(files, virtual_path.view())) return kCannotDelete;
@@ -861,8 +1141,10 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
       return kSuccess;
     }
   }
+  DirectoryEntry removed_entry;
+  const bool was_directory = files.stat(virtual_path.view(), &removed_entry) == Status::Ok && removed_entry.type == NodeType::Directory;
   const Status status = files.remove(virtual_path.view());
-  if (status == Status::Ok) notify_directory_changed(virtual_path.view(), kFileActionRemoved);
+  if (status == Status::Ok) notify_directory_changed(p, virtual_path.view(), kFileActionRemoved, was_directory);
   return status_for(files, status, virtual_path.view());
 }
 
@@ -906,38 +1188,55 @@ uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r) {
   if (!object) return kInvalidHandle;
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
+  length &= 0xFFFFFFFFu;
   if (object->change_watch == 0) {      // made on this handle's first call, and kept (not re-made) for the rest of its life
     const ObjectManager::Created c = objects->create_change_notification(object->path.view(), (watch_tree & 0xFF) != 0, static_cast<uint32_t>(filter));
     if (c.id == 0) return c.status;
     object->change_watch = c.id;
+    objects->watch_set_want_data(c.id, length != 0);      // (a first call without a buffer only ever learns that something changed)
   }
   const uint32_t watch_id = object->change_watch;
-  length &= 0xFFFFFFFFu;
-  if (r.args[1] == 2) {      // kernel32 starting an overlapped request: the watch is made, and what changed while nobody asked is forgotten
-    ObjectManager::WatchRecord stale[ObjectManager::kMaxWatchRecords];
-    uint32_t dropped = 0;
-    objects->take_watch_records(watch_id, stale, ObjectManager::kMaxWatchRecords, &dropped);
-    return kSuccess;
-  }
+  // kernel32 says what it wants in Event: nothing (wait for a change as long as it takes), 1 (a thread of its own waits for an overlapped request: a tenth of a second at a time,
+  // so that it comes back to look whether its handle is still open), 2 (an overlapped request starting: just make the watch), 5 (the same, and answer STATUS_PENDING at once if
+  // nothing changed), 6 (a thread is about to wait for the request) and 3 (that thread has completed it).
+  const uint64_t mode = r.args[1];
+  if (mode == 3) { objects->watch_ack(watch_id); return kSuccess; }
+  if (mode == 6) { objects->watch_wait_begin(watch_id); return kSuccess; }
+  if (mode == 2) return kSuccess;
   ObjectManager::WatchRecord records[ObjectManager::kMaxWatchRecords];
   uint32_t taken = 0;
-  // Event == 1 (kernel32's helper threads for overlapped requests): wait a tenth of a second and answer STATUS_TIMEOUT, so that the thread comes back to look whether its handle is still open.
-  const uint32_t status = wait_until(p, r.args[1] == 1 ? 100000000ull : ~uint64_t{0}, [&]() -> uint64_t {
+  bool overflowed = false;
+  auto attempt = [&]() -> uint64_t {
+    bool overflow = false, want_data = true;
+    if (!objects->take_watch_state_locked(watch_id, &overflow, &want_data, true)) return kInvalidHandle;
+    if (overflow) { overflowed = true; objects->take_watch_records_locked(watch_id, records, ObjectManager::kMaxWatchRecords, &taken); taken = 0; return kSuccess; }
     if (!objects->take_watch_records_locked(watch_id, records, ObjectManager::kMaxWatchRecords, &taken) || taken == 0) return kWaitPending;
     return kSuccess;
-  });
+  };
+  uint32_t status;
+  if (mode == 5) {
+    objects->sync().lock();
+    const uint64_t polled = attempt();
+    objects->sync().unlock();
+    if (polled == kWaitPending) return 0x103u;      // STATUS_PENDING
+    status = static_cast<uint32_t>(polled);
+  } else {
+    status = wait_until(p, mode == 1 ? 100000000ull : ~uint64_t{0}, attempt);
+  }
   if (status != kSuccess) return store_io_status(p, status_block, status, 0) ? status : kAccessViolation;
-  // FILE_NOTIFY_INFORMATION { ULONG NextEntryOffset; ULONG Action; ULONG FileNameLength (bytes); WCHAR FileName[]; }: as many whole records as fit in Length,
-  // longword-aligned (like NtQueryDirectoryFile's own record chaining); a buffer too small to hold every record this call drained loses the rest (real Windows
-  // instead keeps them for ERROR_MORE_DATA/the next overlapped completion - not implemented, acceptable given a bounded 32-pending-record cap per watch anyway).
+  // STATUS_NOTIFY_ENUM_DIR: more changed than the watch could keep or than fits in the buffer; look at the directory.
+  auto enumerate_directory = [&]() { return store_io_status(p, status_block, 0x10Cu, 0) ? 0x10Cu : kAccessViolation; };
+  if (overflowed) return enumerate_directory();
+  // FILE_NOTIFY_INFORMATION { ULONG NextEntryOffset; ULONG Action; ULONG FileNameLength (bytes); WCHAR FileName[]; }: every record the watch kept, longword-aligned (like
+  // NtQueryDirectoryFile's own record chaining); if they do not all fit in Length the answer is STATUS_NOTIFY_ENUM_DIR and they are lost, as on real Windows.
   uint8_t record[12 + 2 * (ObjectManager::kWatchNameBytes)];
   uint64_t used = 0, last_header = 0, last_size = 0;
   uint32_t written = 0;
   for (uint32_t i = 0; i < taken; ++i) {
     const uint64_t name_bytes = to_utf16(StringView(records[i].name, records[i].name_size), record + 12, sizeof(record) - 12);
     if (name_bytes == 0 && records[i].name_size != 0) continue;      // malformed name: skip it rather than fail the whole call
-    const uint64_t size = 12 + name_bytes, padded = (size + 7) & ~uint64_t{7};
-    if (used + size > length) break;
+    const uint64_t size = 12 + name_bytes, padded = (size + 3) & ~uint64_t{3};
+    if (size > length || used > length - size) return enumerate_directory();
     put(ByteView(record, 12), 0, 0, 4);      // NextEntryOffset: 0 unless a later record patches it (the last one really is 0, like a real one)
     put(ByteView(record, 12), 4, records[i].action, 4);
     put(ByteView(record, 12), 8, name_bytes, 4);
@@ -949,10 +1248,10 @@ uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r) {
     if (!p.write_user(buffer + used, ConstByteView(record, size))) return kAccessViolation;
     last_header = used;
     last_size = size;
-    used += used + padded > length ? size : padded;
+    used += padded;
     ++written;
   }
-  if (written == 0) return store_io_status(p, status_block, 0x10Cu, 0) ? 0x10Cu : kAccessViolation;      // STATUS_NOTIFY_ENUM_DIR: not even one change fits; look at the directory
+  if (written == 0) return enumerate_directory();
   return store_io_status(p, status_block, kSuccess, last_header + last_size) ? kSuccess : kAccessViolation;
 }
 
@@ -1022,12 +1321,65 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   const bool console = kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError;
   uint8_t b[8] = {};
   put(ByteView(b, 8), 0, console ? 0x50 : (kind == DescriptorKind::Pipe ? 0x11 : kind == DescriptorKind::Null ? 0x15 : kind == DescriptorKind::Mailslot ? 0x0c : 7), 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_NAMED_PIPE / FILE_DEVICE_DISK
+  if (console) put(ByteView(b, 8), 4, 0x20000, 4);      // Characteristics: FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL
   if (!p.write_user(r.args[2], ConstByteView(b, 8))) return kAccessViolation;
   return store_io_status(p, r.args[1], kSuccess, 8) ? kSuccess : kAccessViolation;
 }
 
 // NtDeviceIoControlFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, IoControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength).
 // The mount manager knows the one volume: its drive letter and its volume name, both pointing at the device of the volume.
+uint32_t file_fs_control(Process& p, uint64_t slot, uint64_t status_block, uint32_t code, uint64_t output, uint64_t output_length) {
+  constexpr uint32_t kGetReparsePoint = 0x900A8, kNotAReparsePoint = 0xC0000275u, kBufferTooSmall = 0xC0000023u, kSymlinkTag = 0xA000000Cu;
+  ProcessFiles& files = p.files();
+  OpenObject* object = files.object(slot);
+  if (code != kGetReparsePoint || !object) return kInvalidDeviceRequest;
+  if (!object->is_link) return kNotAReparsePoint;
+  // The text of the target as it was written, or the place it points to written out as a path of drive C.
+  DirectoryEntry entry;
+  String host_target(files.allocator()), raw(files.allocator());
+  if (files.stat_link(object->path.view(), &entry, &host_target) != Status::Ok) return kObjectNameNotFound;
+  char text[520];
+  const uint32_t text_size = system_objects() ? system_objects()->link_text(object->path.view(), text, sizeof(text)) : 0;
+  if (text_size != 0) {
+    raw.assign(StringView(text, text_size));
+  } else {
+    String inside(files.allocator());
+    if (!files.virtual_path_of_host(host_target.view(), &inside) || !raw.assign(StringView("C:"))) return kInvalidParameter;
+    for (char c : inside.view()) if (!raw.push_back(c == '/' ? '\\' : c)) return kNoMemory;
+    if (inside.view() == StringView("/")) raw.push_back('\\');
+  }
+  const bool rooted = !raw.empty() && (raw.view()[0] == '\\' || raw.view()[0] == '/');
+  const bool drive = raw.size() >= 2 && raw.view()[1] == ':';
+  const bool relative = !rooted && !drive;
+  String substitute(files.allocator());
+  if (relative) {
+    substitute.assign(raw.view());
+  } else {
+    String resolved(files.allocator());
+    if (files.resolve(raw.view(), &resolved) != PathResult::Ok || !substitute.assign(StringView("\\??\\C:"))) return kObjectNameInvalid;
+    if (resolved.view() == StringView("/")) substitute.push_back('\\');
+    else for (char c : resolved.view()) if (!substitute.push_back(c == '/' ? '\\' : c)) return kNoMemory;
+    if (resolved.view() != StringView("/") && (raw.view()[raw.size() - 1] == '\\' || raw.view()[raw.size() - 1] == '/')) substitute.push_back('\\');
+  }
+  uint8_t substitute_units[2 * 1100], print_units[2 * 600];
+  const uint64_t substitute_bytes = to_utf16(substitute.view(), substitute_units, sizeof(substitute_units)), print_bytes = to_utf16(raw.view(), print_units, sizeof(print_units));
+  if ((substitute_bytes == 0 && !substitute.empty()) || (print_bytes == 0 && !raw.empty())) return kInvalidParameter;
+  const uint64_t data_length = 12 + substitute_bytes + print_bytes, total = 8 + data_length;
+  if (output_length < total) return kBufferTooSmall;
+  uint8_t image[8 + 12 + 2 * 1100 + 2 * 600];
+  ByteView v(image, total);
+  v.fill(0);
+  put(v, 0, kSymlinkTag, 4);
+  put(v, 4, data_length, 2);
+  put(v, 8, 0, 2); put(v, 10, substitute_bytes, 2);      // SubstituteNameOffset, SubstituteNameLength
+  put(v, 12, substitute_bytes, 2); put(v, 14, print_bytes, 2);      // PrintNameOffset, PrintNameLength
+  put(v, 16, relative ? 1 : 0, 4);      // SYMLINK_FLAG_RELATIVE
+  for (uint64_t i = 0; i < substitute_bytes; ++i) v[20 + i] = substitute_units[i];
+  for (uint64_t i = 0; i < print_bytes; ++i) v[20 + substitute_bytes + i] = print_units[i];
+  if (!p.write_user(output, ConstByteView(image, total))) return kAccessViolation;
+  return store_io_status(p, status_block, kSuccess, total) ? kSuccess : kAccessViolation;
+}
+
 uint32_t nt_device_io_control_file(Process& p, const SyscallRequest& r) {
   uint64_t status_block = 0, code = 0, input = 0, input_length = 0, output = 0, output_length = 0;
   if (!argument(p, r, 4, &status_block) || !argument(p, r, 5, &code) || !argument(p, r, 6, &input) || !argument(p, r, 7, &input_length) || !argument(p, r, 8, &output) ||

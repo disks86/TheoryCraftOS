@@ -16,6 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsSystem.hpp"
+#include "Process/WindowsFiles.hpp"
+#include "Process/WindowsProcess.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 namespace process::windowsabi {
 
@@ -80,8 +83,17 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
       break;
     }
     case 5: {    // SYSTEM_PROCESS_INFORMATION for each program, one after the other: the entry (0x100 bytes), its threads (SYSTEM_THREAD_INFORMATION, 0x50 bytes each), the image name's characters
-      IProcessRuntime::ProcessEntry entries[32];
-      const uint32_t count = runtime ? runtime->list_processes(entries, 32) : 0;
+      IProcessRuntime::ProcessEntry entries[34];
+      uint32_t count = runtime ? runtime->list_processes(entries, 32) : 0;
+      {      // the processes of the system itself (session 0), which every list of Windows has
+        static const struct { uint64_t pid, parent; const char* name; } kSystemProcesses[2] = {{4, 0, "System"}, {0x1D4, 4, "services.exe"}};
+        for (const auto& sys : kSystemProcesses) {
+          IProcessRuntime::ProcessEntry& e = entries[count++];
+          e = IProcessRuntime::ProcessEntry();
+          e.pid = sys.pid; e.parent = sys.parent; e.session = 0;
+          for (uint32_t k = 0; sys.name[k] && k + 1 < sizeof e.name; ++k) e.name[k] = sys.name[k];
+        }
+      }
       for (uint32_t i = 1; i < count; ++i) {      // (in the order of their ids: a program just started comes after the ones that started it)
         IProcessRuntime::ProcessEntry moved = entries[i];
         uint32_t k = i;
@@ -111,6 +123,7 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
         put(0x48, 8, 4);                                            // BasePriority
         put(0x50, e.pid, 8);                                        // UniqueProcessId
         put(0x58, e.parent, 8);                                     // InheritedFromUniqueProcessId
+        put(0x64, e.session, 4);                                    // SessionId
         put(0x78, e.memory_bytes, 8);                               // VirtualSize
         put(0x90, e.memory_bytes, 8);                               // WorkingSetSize
         put(0xB8, e.memory_bytes, 8);                               // PagefileUsage
@@ -171,11 +184,173 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
       }
       return p.write_user(buffer, ConstByteView(out, total_size)) ? kSuccess : kAccessViolation;
     }
+    case 76: {   // SystemFirmwareTableInformation: SYSTEM_FIRMWARE_TABLE_INFORMATION {ProviderSignature, Action (0 enumerate, 1 get), TableID, TableBufferLength, TableBuffer[]}.
+      // The only provider is the raw SMBIOS one ('RSMB') with one table, ID 0: RawSMBIOSData (a 8 byte header: calling method, major, minor, DMI revision, table length), then the
+      // structures this system describes itself with: a System Information (type 1) and the end of the table (type 127). The OS reads no firmware tables of the machine.
+      constexpr uint32_t kHeader = 16, kRsmb = 0x52534D42u, kNoSuchFile = 0xC000000Fu, kTooSmall = 0xC0000023u, kBadParameter = 0xC000000Du;
+      static const uint8_t kStructures[] = {
+          1, 27, 0x01, 0x00, 1, 2, 0, 0,                                                         // System Information: manufacturer, product (string numbers), version, serial
+          0x54, 0x43, 0x4F, 0x53, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x10, 0x32, 0x54, 0x76,      // UUID
+          6, 0, 0,                                                                               // wake-up type, SKU number, family
+          'T', 'h', 'e', 'o', 'r', 'y', 'C', 'r', 'a', 'f', 't', 'O', 'S', 0,                    // string 1
+          'T', 'h', 'e', 'o', 'r', 'y', 'C', 'r', 'a', 'f', 't', ' ', 'P', 'C', 0,               // string 2
+          0,                                                                                     // end of the strings
+          127, 4, 0x00, 0x7F, 0, 0};                                                             // End Of Table
+      constexpr uint32_t kRaw = 8 + sizeof kStructures;
+      if (length < kHeader) return kInfoLengthMismatch;
+      uint8_t head[kHeader];
+      if (!p.read_user(buffer, ByteView(head, kHeader))) return kAccessViolation;
+      auto get32 = [&](uint32_t at) { return uint32_t(head[at]) | uint32_t(head[at + 1]) << 8 | uint32_t(head[at + 2]) << 16 | uint32_t(head[at + 3]) << 24; };
+      if (get32(0) != kRsmb) return kBadParameter;
+      const uint32_t action = get32(4), table = get32(8);
+      uint8_t data[kRaw] = {};
+      uint32_t data_size = 0;
+      if (action == 0) { data_size = 4; }            // the list of table IDs: 0
+      else if (action == 1) {
+        if (table != 0) return kNoSuchFile;
+        data[1] = 3;                                   // SMBIOS 3.0
+        data[4] = uint8_t(sizeof kStructures);
+        for (uint32_t k = 0; k < sizeof kStructures; ++k) data[8 + k] = kStructures[k];
+        data_size = kRaw;
+      } else return kBadParameter;
+      const uint32_t total_size = kHeader + data_size;
+      if (returned != 0 && !p.write_user_u32(returned, total_size)) return kAccessViolation;
+      if (length < total_size) return kTooSmall;
+      uint8_t out[kHeader + kRaw] = {};
+      for (uint32_t k = 0; k < 12; ++k) out[k] = head[k];
+      for (uint32_t k = 0; k < 4; ++k) out[12 + k] = uint8_t(data_size >> (8 * k));
+      for (uint32_t k = 0; k < data_size; ++k) out[kHeader + k] = data[k];
+      return p.write_user(buffer, ConstByteView(out, total_size)) ? kSuccess : kAccessViolation;
+    }
     default: return kInvalidInfoClass;
   }
   if (returned != 0 && !p.write_user_u32(returned, size)) return kAccessViolation;
   if (length < size) return kInfoLengthMismatch;
   return p.write_user(buffer, ConstByteView(a.bytes, size)) ? kSuccess : kAccessViolation;
+}
+
+namespace {
+
+constexpr uint32_t kBufferTooSmall = 0xC0000023u, kInvalidParameter = 0xC000000Du, kInvalidHandleStatus = 0xC0000008u, kNoMemory = 0xC0000017u;
+constexpr uint32_t kSystemLogicalProcessorInformationEx = 107, kSystemCpuSetInformation = 175, kSystemSupportedProcessorArchitectures2 = 230;
+
+// Little-endian numbers appended to a byte buffer; a failed append is remembered.
+class Writer {
+ public:
+  explicit Writer(ByteBuffer& out) : out_(out) {}
+  bool ok() const { return ok_; }
+  void u8(uint32_t v) { ok_ = ok_ && out_.put8(uint8_t(v)); }
+  void u16(uint32_t v) { ok_ = ok_ && out_.put16(v & 0xFFFF); }
+  void u32(uint32_t v) { ok_ = ok_ && out_.put32(v); }
+  void u64(uint64_t v) { u32(uint32_t(v)); u32(uint32_t(v >> 32)); }
+  void zeros(uint64_t n) { ok_ = ok_ && out_.put_zeros(n); }
+ private:
+  ByteBuffer& out_;
+  bool ok_ = true;
+};
+
+// GROUP_AFFINITY: the mask, the group (always 0) and 6 reserved bytes.
+void group_affinity(Writer& w, uint64_t mask) {
+  w.u64(mask);
+  w.u16(0);
+  w.zeros(6);
+}
+
+// SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX for the relations asked for (RelationAll is 0xFFFF): every logical processor is a core of its own in one package and one NUMA node.
+// A header is a relationship and the size of the entry (8 bytes); the entries are those of Windows 10 for a single processor group.
+void logical_processors(Writer& w, uint32_t relation, uint32_t cores) {
+  const uint64_t all = cores >= 64 ? ~uint64_t{0} : (uint64_t{1} << cores) - 1;
+  const bool every = relation == 0xFFFF;
+  auto processor_entry = [&](uint32_t kind, uint64_t mask, uint32_t flags) {      // RelationProcessorCore (0) and RelationProcessorPackage (3)
+    w.u32(kind); w.u32(48);
+    w.u8(flags); w.u8(0); w.zeros(20); w.u16(1);      // Flags, EfficiencyClass, Reserved, GroupCount
+    group_affinity(w, mask);
+  };
+  auto cache_entry = [&](uint32_t level, uint32_t size, uint32_t type, uint64_t mask) {
+    w.u32(2); w.u32(56);
+    w.u8(level); w.u8(level == 1 ? 8 : level == 2 ? 4 : 16); w.u16(64); w.u32(size); w.u32(type); w.zeros(18); w.u16(1);      // Level, Associativity, LineSize, CacheSize, Type, Reserved, GroupCount
+    group_affinity(w, mask);
+  };
+  for (uint32_t i = 0; i < cores; ++i) {
+    const uint64_t mask = uint64_t{1} << i;
+    if (every || relation == 0) processor_entry(0, mask, 0);
+    if (every || relation == 2) {
+      cache_entry(1, 32 * 1024, 2, mask);      // data
+      cache_entry(1, 32 * 1024, 1, mask);      // instruction
+      cache_entry(2, 256 * 1024, 0, mask);     // unified
+    }
+  }
+  if (every || relation == 2) cache_entry(3, 8 * 1024 * 1024, 0, all);
+  if (every || relation == 1) {      // RelationNumaNode
+    w.u32(1); w.u32(48);
+    w.u32(0); w.zeros(18); w.u16(1);      // NodeNumber, Reserved, GroupCount
+    group_affinity(w, all);
+  }
+  if (every || relation == 3) processor_entry(3, all, 1);      // (the package: PROCESSOR_RELATION flags 1 is LTP_PC_SMT, not set for a processor without hyper-threads; the package carries none)
+  if (every || relation == 4) {      // RelationGroup
+    w.u32(4); w.u32(80);
+    w.u16(1); w.u16(1); w.zeros(20);      // MaximumGroupCount, ActiveGroupCount, Reserved
+    w.u8(cores > 64 ? 64 : cores); w.u8(cores > 64 ? 64 : cores); w.zeros(38); w.u64(all);      // PROCESSOR_GROUP_INFO
+  }
+}
+
+}  // namespace
+
+// NtQuerySystemInformationEx(Class, Input, InputLength, Buffer, Length, ReturnLength). SystemLogicalProcessorInformationEx takes the relationship wanted as a DWORD; SystemCpuSetInformation
+// the handle of a process, and answers one SYSTEM_CPU_SET_INFORMATION (32 bytes) for each processor. The other classes are the ones of NtQuerySystemInformation.
+uint32_t nt_query_system_information_ex(Process& p, const SyscallRequest& r) {
+  uint64_t buffer_length = 0, returned = 0;
+  if (!argument(p, r, 4, &buffer_length) || !argument(p, r, 5, &returned)) return kAccessViolation;
+  const uint32_t info_class = uint32_t(r.args[0]), input_length = uint32_t(r.args[2]), length = uint32_t(buffer_length);
+  IProcessRuntime* runtime = p.runtime();
+  const uint32_t processors = runtime ? runtime->processor_count() : 1;
+  const uint32_t cores = processors > 255 ? 255 : processors;
+  if (info_class != kSystemLogicalProcessorInformationEx && info_class != kSystemCpuSetInformation && info_class != kSystemSupportedProcessorArchitectures2) {
+    SyscallRequest plain = r;      // the same question without an input
+    plain.args[0] = info_class;
+    plain.args[1] = r.args[3];
+    plain.args[2] = buffer_length;
+    plain.args[3] = returned;
+    return nt_query_system_information(p, plain);
+  }
+  uint8_t input[8] = {};
+  const uint32_t wanted_input = info_class == kSystemLogicalProcessorInformationEx ? 4 : 8;
+  if (input_length != wanted_input) return kInvalidParameter;
+  if (!p.read_user(r.args[1], ByteView(input, wanted_input))) return kAccessViolation;
+  uint64_t first = 0;
+  for (uint32_t i = 0; i < wanted_input; ++i) first |= uint64_t{input[i]} << (8 * i);
+  ByteBuffer answer(p.files().allocator());
+  Writer w(answer);
+  if (info_class == kSystemSupportedProcessorArchitectures2) {      // the machines of this system: x86-64 only, in kernel and user mode, for processes too
+    if (first != ~uint64_t{0} && !names_own_process(p, first)) {
+      bool exited = false;
+      uint32_t code = 0;
+      uint64_t pid = 0;
+      if (!process_handle_info(p, first, &exited, &code, &pid)) return kInvalidHandleStatus;
+    }
+    w.u32(0x8664u | (1u << 16) | (1u << 17) | (1u << 18) | (1u << 19));      // Machine, KernelMode, UserMode, Native, Process
+    w.u32(0);
+  } else if (info_class == kSystemCpuSetInformation) {
+    if (first != ~uint64_t{0} && !names_own_process(p, first)) {
+      bool exited = false;
+      uint32_t code = 0;
+      uint64_t pid = 0;
+      if (!process_handle_info(p, first, &exited, &code, &pid)) return kInvalidHandleStatus;
+    }
+    for (uint32_t i = 0; i < cores; ++i) {
+      w.u32(32); w.u32(0);      // Size, Type: CpuSetInformation
+      w.u32(0x100 + i); w.u16(0); w.u8(i); w.u8(i); w.u8(0); w.u8(0); w.u8(0); w.u8(0);      // Id, Group, LogicalProcessorIndex, CoreIndex, LastLevelCacheIndex, NumaNodeIndex, EfficiencyClass, flags
+      w.zeros(4); w.u64(0);      // Reserved, AllocationTag
+    }
+  } else {
+    const uint32_t relation = uint32_t(first);
+    if (relation > 4 && relation != 0xFFFF) return kInvalidParameter;
+    logical_processors(w, relation, cores > 64 ? 64 : cores);
+  }
+  if (!w.ok()) return kNoMemory;
+  if (returned != 0 && !p.write_user_u32(returned, uint32_t(answer.size()))) return kAccessViolation;
+  if (length < answer.size()) return info_class == kSystemCpuSetInformation ? kBufferTooSmall : kInfoLengthMismatch;
+  return p.write_user(r.args[3], answer.view()) ? kSuccess : kAccessViolation;
 }
 
 }  // namespace process::windowsabi
