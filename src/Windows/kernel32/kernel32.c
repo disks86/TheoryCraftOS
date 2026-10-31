@@ -4434,6 +4434,7 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "legacy.inc"
 #include "fmtmsg.inc"
 #include "time.inc"
+#include "comm.inc"
 #include "nls.inc"
 #include "nls2.inc"
 #include "idn.inc"
