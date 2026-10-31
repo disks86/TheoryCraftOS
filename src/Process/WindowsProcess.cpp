@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
@@ -324,8 +325,10 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   const uint32_t joined = objects->job_inherit(p.id(), spec.pid, (flags_arg & kBreakawayFromJob) != 0);      // the child belongs to the job of the one that starts it
   if (joined != kSuccess) { objects->release(created.id); return joined; }
   objects->add_ref(created.id);      // (one reference for each of the two handles)
+  token_inherit(parent_pid, spec.pid);      // (the child starts with a copy of the token of its parent)
   status = parent_pid == p.id() ? runtime->spawn_process(spec) : runtime->spawn_process_for(parent_pid, spec);
   if (status != kSuccess) {
+    token_process_exited(spec.pid);
     objects->job_forget(spec.pid);
     objects->release(created.id);
     objects->release(created.id);

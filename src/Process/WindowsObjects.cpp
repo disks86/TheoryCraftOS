@@ -39,7 +39,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -50,6 +50,7 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Job: return DescriptorKind::Job;
     case ObjectKind::ChangeNotification: return DescriptorKind::ChangeNotification;
     case ObjectKind::DebugObject: return DescriptorKind::DebugObject;
+    case ObjectKind::Token: return DescriptorKind::Token;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -1184,6 +1185,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Section: type = "Section"; break;
         case DescriptorKind::Job: type = "Job"; break;
         case DescriptorKind::DebugObject: type = "DebugObject"; break;
+        case DescriptorKind::Token: type = "Token"; break;
         case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
         case DescriptorKind::Mailslot: type = "Mailslot"; break;
         case DescriptorKind::Key: type = "Key"; break;

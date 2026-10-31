@@ -30,6 +30,7 @@
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsProcess.hpp"
 #include "Process/WindowsSystem.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -184,6 +185,8 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtResumeProcess: return windowsabi::nt_suspend_resume_process(process, r, false);
       case WindowsSyscallNumber::NtTcosDebugException: return windowsabi::nt_tcos_debug_exception(process, r);
       case WindowsSyscallNumber::NtTcosLinkModules: return windowsabi::nt_link_modules(process, r);
+      case WindowsSyscallNumber::NtTcosToken: return windowsabi::nt_tcos_token(process, r);
+      case WindowsSyscallNumber::NtTcosAccessCheck: return windowsabi::nt_tcos_access_check(process, r);
       case WindowsSyscallNumber::NtCancelSynchronousIoFile: return windowsabi::nt_cancel_synchronous_io_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);

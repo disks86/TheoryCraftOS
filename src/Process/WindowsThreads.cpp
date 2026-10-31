@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
@@ -724,6 +725,17 @@ uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
   if (!record) return kInvalidHandle;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
   uint8_t in[16] = {};
+  if (info_class == 5) {      // ThreadImpersonationToken: the thread impersonates the token (0: it stops)
+    if (length != 8) return kInfoLengthMismatch;
+    uint64_t token = 0;
+    if (!p.read_user_u64(r.args[2], &token)) return kAccessViolation;
+    SyscallRequest forward;
+    forward.args[0] = 5 /* TCOS_TOKEN_SET_THREAD */;
+    forward.args[1] = r.args[0];
+    forward.args[2] = token;
+    forward.user_stack = r.user_stack;
+    return nt_tcos_token(p, forward);
+  }
   if (info_class == 38) {      // ThreadNameInformation: the name is what the UNICODE_STRING in the buffer points to
     if (length != 16) return kInfoLengthMismatch;
     uint8_t head[16];

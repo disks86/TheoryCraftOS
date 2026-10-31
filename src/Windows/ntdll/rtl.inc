@@ -82,11 +82,11 @@ EXPORT void NTAPI RtlFreeUnicodeString(PUNICODE_STRING s) {
   s->Buffer = NULL;
 }
 EXPORT BOOLEAN NTAPI RtlCreateUnicodeStringFromAsciiz(PUNICODE_STRING dst, PCSTR src) {
-  const SIZE_T n = strlen(src);
+  const SIZE_T n = src ? strlen(src) : 0;      /* (a null string is an empty one, as RtlInitAnsiString makes it) */
   if (n > 0x7FFE) return FALSE;
   WCHAR *buffer = rtl_alloc((n + 1) * 2);
   if (!buffer) return FALSE;
-  for (SIZE_T i = 0; i <= n; i++) buffer[i] = (unsigned char)src[i];
+  for (SIZE_T i = 0; i <= n; i++) buffer[i] = src ? (unsigned char)src[i] : 0;
   dst->Buffer = buffer;
   dst->Length = (USHORT)(n * 2);
   dst->MaximumLength = (USHORT)(n * 2 + 2);

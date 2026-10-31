@@ -20,6 +20,7 @@
 
 #include <new>
 
+#include <initializer_list>
 #include "Utility/AllocatedView.hpp"
 
 namespace process {
@@ -1411,7 +1412,7 @@ struct ObjectManager::SecurityEntry {
   char path[260] = {};
   uint32_t path_size = 0;
   uint32_t size = 0;
-  uint8_t bytes[filesecurity::kMaxDescriptorBytes] = {};
+  uint8_t* bytes = nullptr;      // `size` bytes from the allocator
 };
 
 bool ObjectManager::security_room() {
@@ -1421,9 +1422,10 @@ bool ObjectManager::security_room() {
   return false;
 }
 
+// Keeps the blob under the key (a path, or the name of an object: "\x01..."). The room is bounded: kMaxSecurity entries, kMaxSecurityBytes in all.
 bool ObjectManager::security_set(StringView path, ConstByteView descriptor) {
   Locked hold(sync_);
-  if (!allocator_ || path.size() >= 260 || descriptor.size() > filesecurity::kMaxDescriptorBytes) return false;
+  if (!allocator_ || path.size() >= 260 || descriptor.size() > kMaxSecurityBlob) return false;
   if (!security_) {
     void* memory = allocator_->allocate(sizeof(SecurityEntry) * kMaxSecurity);
     if (!memory) return false;
@@ -1431,17 +1433,26 @@ bool ObjectManager::security_set(StringView path, ConstByteView descriptor) {
     for (uint32_t i = 0; i < kMaxSecurity; ++i) new (&security_[i]) SecurityEntry();
   }
   SecurityEntry* slot = nullptr;
+  uint64_t in_use = 0;
   for (uint32_t i = 0; i < kMaxSecurity; ++i) {
     SecurityEntry& e = security_[i];
-    if (e.used && same_name(e.path, e.path_size, path)) { slot = &e; break; }
+    if (e.used && same_name(e.path, e.path_size, path)) { slot = &e; continue; }
+    if (e.used) in_use += e.size;
     if (!e.used && !slot) slot = &e;
   }
-  if (!slot) return false;
+  if (!slot || in_use + descriptor.size() > kMaxSecurityBytes) return false;
+  uint8_t* bytes = nullptr;
+  if (descriptor.size() != 0) {
+    bytes = static_cast<uint8_t*>(allocator_->allocate(descriptor.size()));
+    if (!bytes) return false;
+    ByteView(bytes, descriptor.size()).copy_from(descriptor);
+  }
+  if (slot->bytes) allocator_->deallocate(slot->bytes);
+  slot->bytes = bytes;
   slot->used = true;
   for (uint32_t k = 0; k < path.size(); ++k) slot->path[k] = path[k];
   slot->path_size = static_cast<uint32_t>(path.size());
   slot->size = static_cast<uint32_t>(descriptor.size());
-  for (uint32_t k = 0; k < slot->size; ++k) slot->bytes[k] = descriptor[k];
   return true;
 }
 
@@ -1451,10 +1462,22 @@ uint32_t ObjectManager::security_get(StringView path, ByteView out) {
   for (uint32_t i = 0; i < kMaxSecurity; ++i) {
     const SecurityEntry& e = security_[i];
     if (!e.used || !same_name(e.path, e.path_size, path) || e.size > out.size()) continue;
-    for (uint32_t k = 0; k < e.size; ++k) out[k] = e.bytes[k];
+    if (e.size != 0) out.first(e.size).copy_from(ConstByteView(e.bytes, e.size));
     return e.size;
   }
   return 0;
+}
+
+uint32_t ObjectManager::security_size(StringView path) {
+  Locked hold(sync_);
+  if (!security_) return 0;
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) if (security_[i].used && same_name(security_[i].path, security_[i].path_size, path)) return security_[i].size;
+  return 0;
+}
+
+void ObjectManager::security_erase_locked(SecurityEntry& e) {
+  if (e.bytes && allocator_) allocator_->deallocate(e.bytes);
+  e = SecurityEntry();
 }
 
 void ObjectManager::security_move(StringView from, StringView to) {
@@ -1462,7 +1485,7 @@ void ObjectManager::security_move(StringView from, StringView to) {
   if (!security_ || to.size() >= 260) return;
   for (uint32_t i = 0; i < kMaxSecurity; ++i) {      // what was at the new name is replaced
     SecurityEntry& e = security_[i];
-    if (e.used && (same_name(e.path, e.path_size, to) || (e.path_size > to.size() && e.path[to.size()] == '/' && same_name(e.path, static_cast<uint32_t>(to.size()), to)))) e.used = false;
+    if (e.used && (same_name(e.path, e.path_size, to) || (e.path_size > to.size() && e.path[to.size()] == '/' && same_name(e.path, static_cast<uint32_t>(to.size()), to)))) security_erase_locked(e);
   }
   for (uint32_t i = 0; i < kMaxSecurity; ++i) {
     SecurityEntry& e = security_[i];
@@ -1472,7 +1495,7 @@ void ObjectManager::security_move(StringView from, StringView to) {
     if (!exact && !below) continue;
     char moved[260];
     const uint64_t tail = e.path_size - from.size();
-    if (to.size() + tail >= 260) { e.used = false; continue; }      // (it no longer fits a name: its protection is gone with it)
+    if (to.size() + tail >= 260) { security_erase_locked(e); continue; }      // (it no longer fits a name: its protection is gone with it)
     for (uint32_t k = 0; k < to.size(); ++k) moved[k] = to[k];
     for (uint64_t k = 0; k < tail; ++k) moved[to.size() + k] = e.path[from.size() + k];
     for (uint64_t k = 0; k < to.size() + tail; ++k) e.path[k] = moved[k];
@@ -1483,7 +1506,7 @@ void ObjectManager::security_move(StringView from, StringView to) {
 void ObjectManager::security_forget(StringView path) {
   Locked hold(sync_);
   if (!security_) return;
-  for (uint32_t i = 0; i < kMaxSecurity; ++i) if (security_[i].used && same_name(security_[i].path, security_[i].path_size, path)) security_[i].used = false;
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) if (security_[i].used && same_name(security_[i].path, security_[i].path_size, path)) security_erase_locked(security_[i]);
 }
 
 void ObjectManager::share_retarget(const void* owner, StringView new_path) {
@@ -1831,6 +1854,7 @@ void ObjectManager::add_ref(uint32_t id) {
 namespace windowsabi { void debug_object_freed_locked(uint32_t object); }
 
 void ObjectManager::free_object_locked(Object& o) {
+  forget_object_security_locked(static_cast<uint32_t>(&o - objects_) + 1);
   if (o.kind == ObjectKind::DebugObject) windowsabi::debug_object_freed_locked(static_cast<uint32_t>(&o - objects_) + 1);
   free_pipe_locked(o);
   free_section_locked(o);
@@ -2526,6 +2550,29 @@ void ObjectManager::mailslot_close_reader(uint32_t id) {
   Locked hold(sync_);
   Object* o = at(id);
   if (o && o->kind == ObjectKind::Mailslot) { free_mailslot_locked(*o); sync_.notify_all(); }      // writers still holding the id now see Gone
+}
+
+// The key under which the blobs of an object are kept: "\x01<tag>:<id>".
+uint32_t ObjectManager::object_key(char tag, uint32_t id, char (&out)[16]) {
+  uint32_t n = 0;
+  out[n++] = '\x01';
+  out[n++] = tag;
+  out[n++] = ':';
+  char digits[10];
+  uint32_t d = 0;
+  do { digits[d++] = char('0' + id % 10); id /= 10; } while (id);
+  while (d) out[n++] = digits[--d];
+  out[n] = 0;
+  return n;
+}
+
+void ObjectManager::forget_object_security_locked(uint32_t id) {
+  if (!security_) return;
+  for (const char tag : {'t', 's'}) {
+    char key[16];
+    const uint32_t n = object_key(tag, id, key);
+    for (uint32_t i = 0; i < kMaxSecurity; ++i) if (security_[i].used && same_name(security_[i].path, security_[i].path_size, StringView(key, n))) security_erase_locked(security_[i]);
+  }
 }
 
 }  // namespace process

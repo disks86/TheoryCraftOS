@@ -96,6 +96,8 @@ NT_SERVICE(NtWriteVirtualMemory);
 NT_SERVICE(NtCreateSymbolicLink);
 NT_SERVICE(NtTcosDebugException);
 NT_SERVICE(NtTcosLinkModules);
+NT_SERVICE(NtTcosToken);
+NT_SERVICE(NtTcosAccessCheck);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);

@@ -109,6 +109,8 @@
 #define NT_SERVICE_NtCreateSymbolicLink 86
 #define NT_SERVICE_NtTcosDebugException 501
 #define NT_SERVICE_NtTcosLinkModules 502
+#define NT_SERVICE_NtTcosToken 503
+#define NT_SERVICE_NtTcosAccessCheck 504
 #define NT_SERVICE_NtCreateSocket 87
 #define NT_SERVICE_NtBindSocket 88
 #define NT_SERVICE_NtConnectSocket 89
