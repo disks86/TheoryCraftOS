@@ -94,6 +94,8 @@ class IwlStationLink final : public IWifiLink, public IIwlNotificationHandler {
   WifiNetwork network_;
   uint8_t address_[6] = {};
   uint32_t tx_antennas_ = 1, rx_antennas_ = 1;
+  bool time_event_active_ = false;
+  uint32_t time_event_id_ = 0;
   bool prepared_ = false, have_ptk_ = false, phy_added_ = false;
   uint8_t tk_[16] = {};
   uint64_t pn_ = 0;

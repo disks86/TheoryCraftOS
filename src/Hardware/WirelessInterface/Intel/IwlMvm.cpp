@@ -36,6 +36,47 @@ uint32_t iwl_build_tx_ant_config(uint32_t valid_antennas, ByteView out) {
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
+uint32_t iwl_build_bt_config(ByteView out) {
+  ByteWriter w(out);
+  w.le32(kBtCoexNetwork);                          // mode
+  w.le32(kBtCoexHighBandRet);                      // enabled_modules
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+uint32_t iwl_build_time_event(const IwlTimeEvent& event, ByteView out) {
+  ByteWriter w(out);
+  w.le32(event.mac_id | (uint32_t{event.mac_color} << 8));   // id_and_color
+  w.le32(event.action);
+  w.le32(event.event);                             // id
+  w.le32(0);                                       // apply_time: now
+  w.le32(event.max_delay_tu);
+  w.le32(0);                                       // depends_on
+  w.le32(1);                                       // interval
+  w.le32(event.duration_tu);
+  w.u8(1);                                         // repeat
+  w.u8(kTeFragNone);                               // max_frags
+  w.le16(kTePolicyNotifyStart | kTePolicyNotifyEnd | kTePolicyStartImmediately);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
+}
+
+bool iwl_parse_time_event_response(ConstByteView payload, uint32_t* status, uint32_t* unique_id) {
+  ByteReader r(payload);
+  *status = r.le32();
+  r.le32();                                        // id
+  *unique_id = r.le32();
+  return r.ok();
+}
+
+bool iwl_parse_error_response(ConstByteView payload, IwlErrorResponse* out) {
+  ByteReader r(payload);
+  out->error_type = r.le32();
+  out->command = r.u8();
+  r.u8();
+  out->sequence = r.le16();
+  out->service = r.le32();
+  return r.ok();
+}
+
 uint32_t iwl_build_dqa_enable(uint32_t command_queue, ByteView out) {
   ByteWriter w(out);
   w.le32(command_queue);

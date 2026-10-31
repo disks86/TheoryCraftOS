@@ -57,14 +57,12 @@ bool IwlWirelessInterface::attach() {
   return true;
 }
 
-bool IwlWirelessInterface::initialize() {
-  kernel::ScopedMutex guard(mutex_);
-  if (started_) return true;
-  if (!in_.pci || !in_.mapper || !in_.firmware || !in_.clock || !in_.random) {
+bool IwlWirelessInterface::open_locked() {
+  if (!in_.firmware || !in_.clock || !in_.random || (!registers_ && (!in_.pci || !in_.mapper))) {
     failure_ = "not given what it needs to start";
     return false;
   }
-  const IwlDriver::Outcome outcome = driver_.start(*in_.pci, in_.device, *in_.mapper, *in_.firmware);
+  const IwlDriver::Outcome outcome = registers_ ? driver_.start_device(*registers_, integrated_, *in_.firmware) : driver_.start(*in_.pci, in_.device, *in_.mapper, *in_.firmware);
   if (outcome != IwlDriver::Outcome::Started) {
     failure_ = IwlDriver::outcome_name(outcome);
     return false;
@@ -72,19 +70,19 @@ bool IwlWirelessInterface::initialize() {
   return attach();
 }
 
+bool IwlWirelessInterface::initialize() {
+  kernel::ScopedMutex guard(mutex_);
+  if (started_) return true;
+  registers_ = nullptr;
+  return open_locked();
+}
+
 bool IwlWirelessInterface::start(IIwlRegisters& registers, bool integrated) {
   kernel::ScopedMutex guard(mutex_);
   if (started_) return true;
-  if (!in_.firmware || !in_.clock || !in_.random) {
-    failure_ = "not given what it needs to start";
-    return false;
-  }
-  const IwlDriver::Outcome outcome = driver_.start_device(registers, integrated, *in_.firmware);
-  if (outcome != IwlDriver::Outcome::Started) {
-    failure_ = IwlDriver::outcome_name(outcome);
-    return false;
-  }
-  return attach();
+  registers_ = &registers;
+  integrated_ = integrated;
+  return open_locked();
 }
 
 void IwlWirelessInterface::leave_locked() {
@@ -95,6 +93,10 @@ void IwlWirelessInterface::leave_locked() {
 
 void IwlWirelessInterface::shutdown() {
   kernel::ScopedMutex guard(mutex_);
+  shutdown_locked();
+}
+
+void IwlWirelessInterface::shutdown_locked() {
   if (!started_) return;
   leave_locked();
   started_ = false;
@@ -120,8 +122,32 @@ void IwlWirelessInterface::finish_connection(WifiResult result) const {
   status_.last_result = result;
 }
 
+// The firmware has stopped: everything is let go of (the commands that would say goodbye fail at once), and the card is started again unless it has already been started too often.
+void IwlWirelessInterface::recover() const {
+  IwlWirelessInterface* self = const_cast<IwlWirelessInterface*>(this);
+  const char* text = self->driver_.transport() ? self->driver_.transport()->failure_text() : "";
+  uint32_t n = 0;
+  for (; text[n] && n + 1 < sizeof failure_text_; ++n) failure_text_[n] = text[n];
+  failure_text_[n] = 0;
+  const uint64_t now = in_.clock->now_ms();
+  if (now - last_restart_ms_ > kRestartWindowMs) recent_restarts_ = 0;
+  self->shutdown_locked();
+  if (recent_restarts_ >= kMaxRecentRestarts) {
+    self->failure_ = "the firmware keeps failing";
+    return;
+  }
+  ++recent_restarts_;
+  ++restarts_;
+  last_restart_ms_ = now;
+  self->open_locked();
+}
+
 void IwlWirelessInterface::pump() const {
   if (!started_) return;
+  if (const_cast<IwlDriver&>(driver_).transport() && const_cast<IwlDriver&>(driver_).transport()->check_firmware()) {
+    recover();
+    return;
+  }
   IwlScanner* scanner = const_cast<IwlDriver&>(driver_).scanner();
   if (!scanner) return;
   scanner->poll();
