@@ -326,7 +326,9 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
 }
 
 // The address of an export, following forwarders ("NTDLL.RtlFoo", "NTDLL.#12"). 0 if there is none.
-uint64_t resolve_export(const ModuleSet& set, const Module& module, StringView name, bool by_ordinal, uint32_t ordinal, uint32_t depth, allocators::IAllocator& allocator) {
+// `hops` (if given) gets, for each forwarder followed, the module with the forwarded export and then the module it was forwarded to.
+uint64_t resolve_export(const ModuleSet& set, const Module& module, StringView name, bool by_ordinal, uint32_t ordinal, uint32_t depth, allocators::IAllocator& allocator,
+                        List<Module*>* hops = nullptr) {
   if (depth > 8 || !module.pe) return 0;
   const exe::PeExport* e = by_ordinal ? module.pe->find_export_by_ordinal(ordinal) : module.pe->find_export(name);
   if (!e) return 0;
@@ -345,9 +347,13 @@ uint64_t resolve_export(const ModuleSet& set, const Module& module, StringView n
       if (function[i] < '0' || function[i] > '9') return 0;
       number = number * 10 + static_cast<uint32_t>(function[i] - '0');
     }
-    return resolve_export(set, *target, StringView(), true, number, depth + 1, allocator);
+    const uint64_t found = resolve_export(set, *target, StringView(), true, number, depth + 1, allocator, hops);
+    if (found != 0 && hops) { hops->push_back(const_cast<Module*>(&module)); hops->push_back(const_cast<Module*>(target)); }
+    return found;
   }
-  return resolve_export(set, *target, function, false, 0, depth + 1, allocator);
+  const uint64_t found = resolve_export(set, *target, function, false, 0, depth + 1, allocator, hops);
+  if (found != 0 && hops) { hops->push_back(const_cast<Module*>(&module)); hops->push_back(const_cast<Module*>(target)); }
+  return found;
 }
 
 bool put_u64(AddressSpace& space, uint64_t address, uint64_t value) {
@@ -416,12 +422,7 @@ void dependencies_of(const ModuleSet& set, const Module& module, allocators::IAl
     if (!canonical_library_name(imp.dll.view(), &name)) continue;
     if (Module* d = set.find(name.view())) out->push_back(d);
   }
-  for (const exe::PeExport& e : module.pe->exports().view()) {
-    if (e.forwarder.empty()) continue;
-    const uint64_t dot = e.forwarder.view().find('.');
-    if (dot == StringView::npos || !canonical_library_name(e.forwarder.view().first(dot), &name)) continue;
-    if (Module* d = set.find(name.view())) out->push_back(d);
-  }
+  for (Module* d : module.forward_deps.view()) out->push_back(d);      // (a forwarded export is no dependency until it is resolved: see link_libraries)
 }
 
 void doom(const ModuleSet& set, allocators::IAllocator& allocator, Module& module, List<Module*>* out) {
@@ -433,6 +434,16 @@ void doom(const ModuleSet& set, allocators::IAllocator& allocator, Module& modul
     if (d->pinned || d->doomed || d->refs == 0) continue;
     if (--d->refs == 0) doom(set, allocator, *d, out);
   }
+}
+}  // namespace
+
+namespace {
+bool add_forward_dependency(Module& from, Module& to) {
+  if (&from == &to || from.pinned || to.pinned || from.doomed || to.doomed) return true;
+  for (Module* d : from.forward_deps.view()) if (d == &to) return true;
+  if (!from.forward_deps.push_back(&to)) return false;
+  ++to.refs;
+  return true;
 }
 }  // namespace
 
@@ -451,14 +462,42 @@ LoadStatus load_additional_library(AddressSpace& space, allocators::IAllocator& 
   if (status == LoadStatus::Ok) order(c, *requested, 0);
   if (status == LoadStatus::Ok) {      // the uses: one for the caller, one for each import of a new library
     ++requested->refs;
+    String name(allocator);
     for (uint64_t i = first; i < set->count(); ++i) {
+      Module& m = *set->modules_[i];
       List<Module*> dependencies(allocator);
-      dependencies_of(*set, *set->modules_[i], allocator, &dependencies);
+      dependencies_of(*set, m, allocator, &dependencies);
       for (Module* d : dependencies.view()) if (!d->pinned) ++d->refs;
+      if (m.no_bind) continue;
+      // Resolving an import through a forwarder makes the libraries on the way dependencies of the one that forwards; a forwarder to a library that was loaded for it does too.
+      for (const exe::PeImport& imp : m.pe->imports().view()) {
+        if (!canonical_library_name(imp.dll.view(), &name)) continue;
+        const Module* target = set->find(name.view());
+        if (!target) continue;
+        List<Module*> hops(allocator);
+        if (resolve_export(*set, *target, imp.name.view(), imp.by_ordinal, imp.ordinal, 0, allocator, &hops) == 0) continue;
+        for (uint64_t h = 0; h + 1 < hops.count(); h += 2) add_forward_dependency(*hops[h], *hops[h + 1]);
+      }
+      for (const exe::PeExport& e : m.pe->exports().view()) {
+        if (e.forwarder.empty()) continue;
+        const uint64_t dot = e.forwarder.view().find('.');
+        if (dot == StringView::npos || !canonical_library_name(e.forwarder.view().first(dot), &name)) continue;
+        Module* d = set->find(name.view());
+        bool added_now = false;
+        for (uint64_t k = first; d && k < set->count(); ++k) if (set->modules_[k].get() == d) added_now = true;
+        if (d && added_now) add_forward_dependency(m, *d);
+      }
     }
   }
   if (status != LoadStatus::Ok) set->drop_from(space, first);
   return status;
+}
+
+bool link_libraries(ModuleSet* set, uint64_t from, uint64_t to) {
+  Module* a = set->find_base(from);
+  Module* b = set->find_base(to);
+  if (!a || !b) return false;
+  return add_forward_dependency(*a, *b);
 }
 
 bool reference_library(ModuleSet* set, StringView canonical_name, uint64_t* base) {

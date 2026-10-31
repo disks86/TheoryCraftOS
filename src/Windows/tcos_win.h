@@ -471,6 +471,7 @@ IMPORT NTSTATUS NTAPI NtRemoveProcessDebug(HANDLE, HANDLE);
 IMPORT NTSTATUS NTAPI NtWaitForDebugEvent(HANDLE, BOOLEAN, PLARGE_INTEGER, PVOID);
 IMPORT NTSTATUS NTAPI NtSetInformationDebugObject(HANDLE, ULONG, PVOID, ULONG, PULONG);
 IMPORT NTSTATUS NTAPI NtTcosDebugException(PVOID, BOOLEAN, PVOID);
+IMPORT NTSTATUS NTAPI NtTcosLinkModules(PVOID, PVOID);      /* the library at the first base depends on the one at the second (a forwarded export was resolved through it) */
 IMPORT NTSTATUS NTAPI DbgUiConnectToDbg(void);
 IMPORT HANDLE NTAPI DbgUiGetThreadDebugObject(void);
 IMPORT NTSTATUS NTAPI DbgUiIssueRemoteBreakin(HANDLE);

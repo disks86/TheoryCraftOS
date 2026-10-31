@@ -239,6 +239,11 @@ uint32_t UserProgram::release_module(uint64_t base, LoadedModule* out, uint32_t 
   return 0;
 }
 
+uint32_t UserProgram::link_modules(uint64_t from, uint64_t to) {
+  if (!modules_) return 0xC00000BBu;
+  return link_libraries(modules_.get(), from, to) ? 0 : 0xC0000008u;
+}
+
 uint32_t UserProgram::unload_module(uint64_t base) {
   if (!modules_) return 0xC00000BBu;
   if (Module* m = modules_->find_base(base); m && process_) take_tls(space_, *process_, *m);

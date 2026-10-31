@@ -78,6 +78,8 @@ class IModuleHost {
   // DLL_PROCESS_DETACH; they stay mapped until unload_module(). Returns an NTSTATUS.
   virtual uint32_t release_module(uint64_t base, LoadedModule* out, uint32_t capacity, uint32_t* count) = 0;
   virtual uint32_t unload_module(uint64_t base) = 0;
+  // The library at `from` depends on the one at `to` (a forwarded export of `from` was resolved through it). An NTSTATUS.
+  virtual uint32_t link_modules(uint64_t from, uint64_t to) = 0;
 
  protected:
   IModuleHost() = default;

@@ -95,6 +95,7 @@ NT_SERVICE(NtReadVirtualMemory);
 NT_SERVICE(NtWriteVirtualMemory);
 NT_SERVICE(NtCreateSymbolicLink);
 NT_SERVICE(NtTcosDebugException);
+NT_SERVICE(NtTcosLinkModules);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);
@@ -434,12 +435,11 @@ static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->Im
 
 #define LDRP_MAPPED_ONLY 0x80000000u      /* loaded with DONT_RESOLVE_DLL_REFERENCES: no imports, no thread-local data, no entry point */
 #define LDRP_PROCESS_DETACH_CALLED 0x00080000u      /* the library has been told the process (or its use of it) ends: once only */
-/* The entry point of a library that is being attached runs under a guard: a fault nobody handles ends the call (the library failed to start) instead of the process. */
+/* The entry point of a library runs under a guard (whatever it is told, as it is by the loader of Windows): a fault nobody handles ends the call (the library failed to start) instead of the process. */
 static void **volatile g_init_guard;
 static volatile PVOID g_init_guard_teb;
 static BOOL call_library_entry(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
   BOOL (WINAPI *entry)(PVOID, DWORD, PVOID) = (BOOL (WINAPI *)(PVOID, DWORD, PVOID))m->EntryPoint;
-  if (reason != DLL_PROCESS_ATTACH) return entry(m->DllBase, reason, reserved);
   void *buffer[5];
   void **const outer = g_init_guard;
   PVOID const outer_teb = g_init_guard_teb;

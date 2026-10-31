@@ -799,6 +799,27 @@ static LDR_DATA_TABLE_ENTRY *module_by_name(LPCWSTR name) {
 PVOID NTAPI TcosFindModuleByFile(PCWSTR path);
 static BOOL has_separator(LPCWSTR name);
 static DWORD full_path_w(LPCWSTR in, WCHAR *out, DWORD capacity);
+EXPORT DWORD WINAPI GetLongPathNameW(LPCWSTR path, LPWSTR buffer, DWORD capacity);
+/* A library is known by its long name; one loaded by its 8.3 alias ("C:\\dir\\LONGNA~1.DLL") keeps being told by the spelling it was loaded with. */
+#define MODULE_SPELLINGS 8
+static struct { PVOID base; WCHAR path[260]; } g_module_spellings[MODULE_SPELLINGS];
+static void module_spelling_set(PVOID base, const WCHAR *spelled) {      /* NULL: the library is known by its own name */
+  int free_slot = -1;
+  for (int i = 0; i < MODULE_SPELLINGS; ++i) {
+    if (g_module_spellings[i].base == base) { g_module_spellings[i].base = NULL; }
+    if (!g_module_spellings[i].base && free_slot < 0) free_slot = i;
+  }
+  if (!spelled || free_slot < 0) return;
+  size_t_ n = 0;
+  for (; spelled[n] && n < 259; ++n) g_module_spellings[free_slot].path[n] = spelled[n];
+  g_module_spellings[free_slot].path[n] = 0;
+  g_module_spellings[free_slot].base = base;
+}
+static const WCHAR *module_spelling(PVOID base) {
+  for (int i = 0; i < MODULE_SPELLINGS; ++i) if (g_module_spellings[i].base == base) return g_module_spellings[i].path;
+  return NULL;
+}
+static BOOL has_tilde_name(const WCHAR *name) { for (; *name; ++name) if (*name == '~') return TRUE; return FALSE; }
 EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
   if (!name) return NtCurrentPeb()->ImageBaseAddress;
   LDR_DATA_TABLE_ENTRY *m = module_by_name(name);
@@ -807,6 +828,11 @@ EXPORT HMODULE WINAPI GetModuleHandleW(LPCWSTR name) {
     WCHAR full[PATH_CHARS];
     PVOID base;
     if (full_path_w(name, full, PATH_CHARS) && (base = TcosFindModuleByFile(full)) != NULL) return base;
+    if (has_tilde_name(name) && full_path_w(name, full, PATH_CHARS)) {
+      WCHAR expanded[PATH_CHARS];
+      const DWORD n = GetLongPathNameW(full, expanded, PATH_CHARS);
+      if (n != 0 && n < PATH_CHARS && (base = TcosFindModuleByFile(expanded)) != NULL) return base;
+    }
   }
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   return m->DllBase;
@@ -864,13 +890,15 @@ EXPORT BOOL WINAPI GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE *module)
 EXPORT DWORD WINAPI GetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD capacity) {
   LDR_DATA_TABLE_ENTRY *m = module_by_base(module ? module : NtCurrentPeb()->ImageBaseAddress);
   if (!m) { set_error(ERROR_MOD_NOT_FOUND); return 0; }
-  const DWORD length = m->FullDllName.Length / 2;
+  const WCHAR *spelled = module_spelling(m->DllBase);
+  const WCHAR *text = spelled ? spelled : m->FullDllName.Buffer;
+  const DWORD length = spelled ? (DWORD)wcslen(spelled) : m->FullDllName.Length / 2;
   if (length + 1 > capacity) {
-    if (capacity) { memcpy(buffer, m->FullDllName.Buffer, (capacity - 1) * 2); buffer[capacity - 1] = 0; }
+    if (capacity) { memcpy(buffer, text, (capacity - 1) * 2); buffer[capacity - 1] = 0; }
     set_error(ERROR_INSUFFICIENT_BUFFER);
     return capacity;
   }
-  memcpy(buffer, m->FullDllName.Buffer, length * 2);
+  memcpy(buffer, text, length * 2);
   buffer[length] = 0;
   set_error(ERROR_SUCCESS);
   return length;
@@ -925,12 +953,19 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
     LDR_DATA_TABLE_ENTRY *target = module_by_name(library);
     if (!target) return NULL;
     const char *function = forward + n + 1;
+    FARPROC resolved;
     if (function[0] == '#') {
       DWORD number = 0;
       for (const char *c = function + 1; *c >= '0' && *c <= '9'; ++c) number = number * 10 + (DWORD)(*c - '0');
-      return export_of(target->DllBase, NULL, number, depth + 1);
+      resolved = export_of(target->DllBase, NULL, number, depth + 1);
+    } else {
+      resolved = export_of(target->DllBase, function, 0, depth + 1);
     }
-    return export_of(target->DllBase, function, 0, depth + 1);
+    if (resolved) {      /* the library that forwards depends on the one it forwards to from now on (unless it stays as long as the process does) */
+      LDR_DATA_TABLE_ENTRY *self = module_by_base((HMODULE)module);
+      if (self && self->LoadCount != 0xFFFF && target->LoadCount != 0xFFFF) NtTcosLinkModules(module, target->DllBase);
+    }
+    return resolved;
   }
   return (FARPROC)(base + rva);
 }
@@ -1049,8 +1084,21 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     path[0] = 0;      /* (find_file may have left a name behind that is not a file) */
     unicode_string(&us, name);
   }
+  WCHAR spelled[PATH_CHARS];
+  spelled[0] = 0;
+  if (path[0] && has_tilde_name(path)) {      /* an 8.3 alias: the library is loaded as the long name, and told by this spelling */
+    WCHAR expanded[PATH_CHARS];
+    const DWORD n = GetLongPathNameW(path, expanded, PATH_CHARS);
+    if (n != 0 && n < PATH_CHARS) {
+      memcpy(spelled, path, ((size_t_)wcslen(path) + 1) * 2);
+      memcpy(path, expanded, ((size_t_)n + 1) * 2);
+      unicode_string(&us, path);
+    }
+  }
+  PVOID already_loaded = NULL;
   if (path[0] && !(flags & 0x62)) {      /* the file of a library that is loaded already (under another name, or moved): one more use of it */
     PVOID loaded = TcosFindModuleByFile(path);
+    already_loaded = loaded;
     LDR_DATA_TABLE_ENTRY *entry = loaded ? module_by_base(loaded) : NULL;
     if (entry) us = entry->FullDllName;
   }
@@ -1079,6 +1127,7 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
   ULONG ldr_flags = (flags & 1) ? 2 : 0;      /* DONT_RESOLVE_DLL_REFERENCES = LDR_DONT_RESOLVE_REFS */
   const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
   if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
+  if (!already_loaded && path[0]) module_spelling_set(handle, spelled[0] ? spelled : NULL);
   return (HMODULE)handle;
 }
 EXPORT HMODULE WINAPI LoadLibraryW(LPCWSTR name) { return LoadLibraryExW(name, NULL, 0); }
