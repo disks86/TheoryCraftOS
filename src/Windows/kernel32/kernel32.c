@@ -2539,7 +2539,13 @@ static BOOL disk_buffer_usable(HANDLE h, const void *buffer, DWORD length, BOOL 
 EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, LPOVERLAPPED overlapped) {
   if (written) *written = 0;
   if (!disk_buffer_usable(h, buffer, length, FALSE, ERROR_INVALID_USER_BUFFER)) return FALSE;
-  if (!overlapped) { BOOL handled; const BOOL result = console_write_hook(h, buffer, length, written, &handled); if (handled) return result; }
+  if (!overlapped) {      /* (probing for the console must not leave its own error behind: a write that works leaves the last error alone) */
+    const DWORD saved = TEB_LAST_ERROR(NtCurrentTeb());
+    BOOL handled;
+    const BOOL result = console_write_hook(h, buffer, length, written, &handled);
+    if (!handled || result) set_error(saved);
+    if (handled) return result;
+  }
   if (overlapped) {
     ULONG_PTR information = 0;
     NTSTATUS result = 0;
@@ -4435,6 +4441,7 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "fmtmsg.inc"
 #include "time.inc"
 #include "comm.inc"
+#include "profile.inc"
 #include "nls.inc"
 #include "nls2.inc"
 #include "idn.inc"

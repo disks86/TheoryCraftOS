@@ -100,6 +100,9 @@ EXPORT BOOL WINAPI OpenProcessToken(HANDLE process, DWORD access, PHANDLE token)
   *token = TOKEN_PSEUDO_HANDLE_;
   return TRUE;
 }
+/* Every thread runs as the one user, so impersonating oneself changes nothing (the levels are checked, as Windows does) and reverting has nothing to undo. */
+EXPORT BOOL WINAPI ImpersonateSelf(DWORD level) { if (level > 3) { TEB_LAST_ERROR(NtCurrentTeb()) = 1346 /* ERROR_BAD_IMPERSONATION_LEVEL */; return FALSE; } return TRUE; }
+EXPORT BOOL WINAPI RevertToSelf(void) { return TRUE; }
 EXPORT BOOL WINAPI OpenThreadToken(HANDLE thread, DWORD access, BOOL self, PHANDLE token) { (void)thread; (void)self; return OpenProcessToken(NULL, access, token); }
 typedef struct { DWORD LowPart; LONG HighPart; } LUID, *PLUID;
 /* Privileges: the names programs know them by and their numbers (the low part of the LUID). The user of this OS is a standard one: the privileges that a standard user's token holds
