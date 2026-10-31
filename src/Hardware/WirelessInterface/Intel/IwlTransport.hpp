@@ -77,6 +77,17 @@ class IwlTransport final : private IIwlPacketSink {
   // Notifications that arrive while a command is waited for (or in a poll without a handler) go here.
   void set_handler(IIwlNotificationHandler* handler) { default_handler_ = handler; }
 
+  // Interrupts (one MSI vector, the card in its classic mode): use_interrupts(true) unmasks the causes of CSR_INI_SET_MASK. on_interrupt() is for the interrupt handler: it only looks at
+  // the cause, masks the card and says an interrupt came (nothing else is safe there). The next poll() sees that, reads the causes - an error is noticed before they are acknowledged -,
+  // acknowledges them, unmasks, and handles the queues. Without interrupts (the default) everything is polled, as before.
+  void use_interrupts(bool on);
+  bool interrupts_enabled() const { return interrupts_on_; }
+  void on_interrupt();
+  bool interrupt_pending() const { return __atomic_load_n(&irq_pending_, __ATOMIC_ACQUIRE) != 0; }
+  uint32_t interrupt_count() const { return __atomic_load_n(&irq_count_, __ATOMIC_ACQUIRE); }
+  // Frames the card has delivered since the start (to tell whether interrupts are missed).
+  uint32_t frames_received() const { return frames_; }
+
   // The firmware stopped (a software assert or a hardware error reported by the card, a command that failed while the error bits were up): the transport has read its error log.
   // After this every command fails until stop() and start().
   bool firmware_failed() const { return failed_; }
@@ -103,6 +114,9 @@ class IwlTransport final : private IIwlPacketSink {
   IwlRxQueue rx_;
   IwlCommandQueue tx_;
   void capture_failure();
+  void service_interrupt();
+  bool interrupts_on_ = false;
+  uint32_t irq_pending_ = 0, irq_count_ = 0, frames_ = 0;
   IwlFwLoad load_;
   IwlAliveInfo alive_;
   IwlErrorLog error_log_;
