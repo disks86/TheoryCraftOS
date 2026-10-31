@@ -154,6 +154,22 @@ class Translator {
   void dst_null() { put(13u << 12); }
   void dst_scalar(const Val& v) { dst_temp(v.a, v.wide ? 3u << v.b : 1u << v.b); }
   bool float32(uint32_t type) const { return m_.is_float(type) && m_.types[type].width == 32; }
+  bool wide_type(uint32_t type) const { return (m_.is_float(type) && m_.types[type].width == 64) || m_.is_int(type, 64); }   // (a double or a 64-bit integer: a pair of words)
+  bool i64_binop(const Instruction& ins, const Val& a, const Val& b);
+  bool i64_compare(const Instruction& ins, const Val& a, const Val& b);
+  bool i64_cast(const Instruction& ins, const Val& a);
+  Val scratch_word();
+  Val scratch_wide() {
+    Val v;
+    v.kind = VK::Temp, v.wide = true;
+    if (!alloc_wide(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+    return v;
+  }
+  void word_op(uint32_t opcode, const Val& d, const Val& a, const Val& b);
+  void word_op1(uint32_t opcode, const Val& d, const Val& a);
+  void word_select(const Val& d, const Val& condition, const Val& a, const Val& b);
+  void divide_unsigned(const Val& a, const Val& b, const Val& quotient, const Val& remainder);
+  void negate64(const Val& r, const Val& a);
   Val low_word(const Val& v) const;
   Val high_word(const Val& v) const;
   Val new_wide(uint32_t id);
@@ -500,6 +516,8 @@ Val Translator::new_aggregate(uint32_t id) {
 
 bool Translator::alias_cast(const Instruction& ins) const {
   const uint32_t from = value_type(ins.operands[0]);
+  if (m_.is_int(ins.type, 64)) return false;                    // (a widening: the high word is made)
+  if (m_.is_int(from, 64)) return ins.code == 0 && !m_.is_int(ins.type, 1);   // (a truncation takes the low word)
   switch (ins.code) {
     case 11: return true;                                   // bitcast
     case 0: return !m_.is_int(ins.type, 1);                 // trunc (to a boolean is not an alias: the low bit)
@@ -612,7 +630,7 @@ bool Translator::phi_moves(uint32_t pred, uint32_t target) {
     for (uint32_t k = 0; k < phi.phi_count; ++k)
       if (m_.phi_blocks[phi.phi_first + k] == pred) incoming = m_.phi_values[phi.phi_first + k];
     if (incoming == kNone || count >= 15) return error(incoming == kNone ? status::kInvalidParameter : status::kNotSupported);
-    const bool double_phi = m_.is_float(phi.type) && m_.types[phi.type].width == 64;   // (a double moves as its two words)
+    const bool double_phi = wide_type(phi.type);   // (a double or a 64-bit integer moves as its two words)
     for (uint32_t word_index = 0; word_index < (double_phi ? 2u : 1u); ++word_index) {
       if (dry_) {
         note_use(incoming, pos_ + static_cast<int32_t>(count));
@@ -1118,10 +1136,434 @@ bool Translator::double_cast(const Instruction& ins, const Val& a) {
   return define(ins.result, r);
 }
 
+// --- 64-bit integers ---------------------------------------------------------------------------------------------------------------------------------------
+// A 64-bit integer is a pair of words as a double is (low word first); the operations are made of the 32-bit ones, with a mask (all ones) standing for a carry or a borrow.
+
+Val Translator::scratch_word() {
+  Val v;
+  v.kind = VK::Temp;
+  if (!alloc_scalar(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+  return v;
+}
+
+void Translator::word_op(uint32_t opcode, const Val& d, const Val& a, const Val& b) {
+  const uint32_t at = begin(opcode);
+  dst_scalar(d);
+  src(a), src(b);
+  finish(at);
+}
+
+void Translator::word_op1(uint32_t opcode, const Val& d, const Val& a) {
+  const uint32_t at = begin(opcode);
+  dst_scalar(d);
+  src(a);
+  finish(at);
+}
+
+void Translator::word_select(const Val& d, const Val& condition, const Val& a, const Val& b) {
+  const uint32_t at = begin(55);
+  dst_scalar(d);
+  src(condition), src(a), src(b);
+  finish(at);
+}
+
+// r = -a (two's complement of the pair): not both words, plus one carried through the low word.
+void Translator::negate64(const Val& r, const Val& a) {
+  const Val lo = low_word(a), hi = high_word(a), zero_word = Val(), carry = scratch_word(), inverted = scratch_word();
+  (void)zero_word;
+  Val zero, one;
+  zero.kind = VK::Imm, one.kind = VK::Imm, one.a = 1;
+  word_op1(40, low_word(r), lo);                    // ineg
+  word_op(32, carry, lo, zero);                     // ieq: the low word was zero (a carry into the high word)
+  word_op1(59, inverted, hi);                       // not
+  word_op1(40, carry, carry);                       // 1 where it was
+  word_op(30, high_word(r), inverted, carry);
+}
+
+// Unsigned 64-bit division by shifting and subtracting, 64 times round a loop.
+void Translator::divide_unsigned(const Val& a, const Val& b, const Val& quotient, const Val& remainder) {
+  Val zero, one, thirty_one;
+  zero.kind = VK::Imm, one.kind = VK::Imm, one.a = 1, thirty_one.kind = VK::Imm, thirty_one.a = 31;
+  Val count = scratch_word(), numerator_lo = scratch_word(), numerator_hi = scratch_word(), carry = scratch_word(), t = scratch_word(), u = scratch_word(), take = scratch_word();
+  Val q_lo = low_word(quotient), q_hi = high_word(quotient), r_lo = low_word(remainder), r_hi = high_word(remainder);
+  const Val b_lo = low_word(b), b_hi = high_word(b);
+  word_op1(54, q_lo, zero), word_op1(54, q_hi, zero), word_op1(54, r_lo, zero), word_op1(54, r_hi, zero);
+  word_op1(54, numerator_lo, low_word(a)), word_op1(54, numerator_hi, high_word(a));
+  Val sixty_four;
+  sixty_four.kind = VK::Imm, sixty_four.a = 64;
+  word_op1(54, count, sixty_four);
+  finish(begin(48));   // loop
+  {
+    // r = (r << 1) | the top bit of the numerator; the bit that left r is kept in carry
+    word_op(85, carry, r_hi, thirty_one);                       // ushr: bit 63 of r
+    word_op(41, r_hi, r_hi, one);                               // ishl
+    word_op(85, t, r_lo, thirty_one);
+    word_op(60, r_hi, r_hi, t);                                 // or
+    word_op(41, r_lo, r_lo, one);
+    word_op(85, t, numerator_hi, thirty_one);
+    word_op(60, r_lo, r_lo, t);
+    // numerator <<= 1
+    word_op(41, numerator_hi, numerator_hi, one);
+    word_op(85, t, numerator_lo, thirty_one);
+    word_op(60, numerator_hi, numerator_hi, t);
+    word_op(41, numerator_lo, numerator_lo, one);
+    // take = carry || r >= b (unsigned, 64-bit)
+    word_op(80, t, r_hi, b_hi);                                 // uge: hi >= b.hi
+    word_op(79, u, b_hi, r_hi);                                 // ult: b.hi < hi, strictly greater
+    word_op(80, take, r_lo, b_lo);                              // uge on the low words
+    {
+      Val equal = scratch_word();
+      word_op(32, equal, r_hi, b_hi);
+      word_op(1, take, take, equal);                            // equal high and r.lo >= b.lo
+    }
+    word_op(60, take, take, u);
+    word_op(60, take, take, carry);                             // (carry is 1 or 0; any non-zero bit counts)
+    (void)t;
+    // q = (q << 1) | take
+    word_op(85, t, q_lo, thirty_one);
+    word_op(41, q_hi, q_hi, one);
+    word_op(60, q_hi, q_hi, t);
+    word_op(41, q_lo, q_lo, one);
+    {
+      Val bit = scratch_word();
+      word_op(1, bit, take, one);
+      word_op(60, q_lo, q_lo, bit);
+    }
+    // if take: r -= b
+    {
+      const uint32_t at = begin(31, 1u << 18);   // if_nz
+      src(take);
+      finish(at);
+      Val negative = scratch_word(), borrow = scratch_word();
+      word_op1(40, negative, b_lo);
+      word_op(79, borrow, r_lo, b_lo);                          // the low words borrow
+      word_op(30, r_lo, r_lo, negative);
+      word_op1(40, negative, b_hi);
+      word_op(30, r_hi, r_hi, negative);
+      word_op(30, r_hi, r_hi, borrow);                          // (borrow is all ones: minus one)
+      finish(begin(21));                                        // endif
+    }
+    // count -= 1; leave when it is zero
+    Val minus_one;
+    minus_one.kind = VK::Imm, minus_one.a = 0xFFFFFFFFu;
+    word_op(30, count, count, minus_one);
+    {
+      const uint32_t at = begin(3, 0);   // breakc_z count
+      src(count);
+      finish(at);
+    }
+  }
+  finish(begin(22));   // endloop
+}
+
+bool Translator::i64_binop(const Instruction& ins, const Val& a, const Val& b) {
+  const Val r = new_wide(ins.result);
+  if (r.kind == VK::None) return false;
+  const Val alo = low_word(a), ahi = high_word(a), blo = low_word(b), bhi = high_word(b), rlo = low_word(r), rhi = high_word(r);
+  Val zero, one, thirty_one, thirty_two, sixty_three;
+  zero.kind = VK::Imm, one.kind = VK::Imm, one.a = 1, thirty_one.kind = VK::Imm, thirty_one.a = 31, thirty_two.kind = VK::Imm, thirty_two.a = 32, sixty_three.kind = VK::Imm, sixty_three.a = 63;
+  switch (ins.code) {
+    case 0: {   // add
+      Val carry = scratch_word();
+      word_op(30, rlo, alo, blo);
+      word_op(79, carry, rlo, alo);       // the sum is below an addend: a carry (all ones)
+      word_op(30, rhi, ahi, bhi);
+      word_op1(40, carry, carry);
+      word_op(30, rhi, rhi, carry);
+      break;
+    }
+    case 1: {   // sub
+      Val negative = scratch_word(), borrow = scratch_word();
+      word_op1(40, negative, blo);
+      word_op(30, rlo, alo, negative);
+      word_op(79, borrow, alo, blo);      // a borrow (all ones)
+      word_op1(40, negative, bhi);
+      word_op(30, rhi, ahi, negative);
+      word_op(30, rhi, rhi, borrow);
+      break;
+    }
+    case 2: {   // mul: the low 64 bits of the product
+      Val high = scratch_word(), cross = scratch_word();
+      const uint32_t at = begin(81);      // umul high, low
+      dst_scalar(high), dst_scalar(rlo);
+      src(alo), src(blo);
+      finish(at);
+      {
+        const uint32_t cross_at = begin(81);
+        dst_null();
+        dst_scalar(cross);
+        src(alo), src(bhi);
+        finish(cross_at);
+      }
+      word_op(30, high, high, cross);
+      {
+        const uint32_t cross_at = begin(81);
+        dst_null();
+        dst_scalar(cross);
+        src(ahi), src(blo);
+        finish(cross_at);
+      }
+      word_op(30, rhi, high, cross);
+      break;
+    }
+    case 3: case 5: {   // udiv / urem
+      Val quotient = scratch_wide(), remainder = scratch_wide();
+      if (quotient.kind == VK::None || remainder.kind == VK::None) return false;
+      divide_unsigned(a, b, quotient, remainder);
+      const Val& chosen = ins.code == 3 ? quotient : remainder;
+      word_op1(54, rlo, low_word(chosen)), word_op1(54, rhi, high_word(chosen));
+      break;
+    }
+    case 4: case 6: {   // sdiv / srem: on the magnitudes, the sign put back
+      Val abs_a = scratch_wide(), abs_b = scratch_wide(), quotient = scratch_wide(), remainder = scratch_wide(), negated = scratch_wide();
+      if (abs_a.kind == VK::None || abs_b.kind == VK::None || quotient.kind == VK::None || remainder.kind == VK::None || negated.kind == VK::None) return false;
+      Val sign_a = scratch_word(), sign_b = scratch_word();
+      word_op(42, sign_a, ahi, thirty_one);      // ishr: all ones for a negative a
+      word_op(42, sign_b, bhi, thirty_one);
+      negate64(negated, a);
+      word_select(low_word(abs_a), sign_a, low_word(negated), alo), word_select(high_word(abs_a), sign_a, high_word(negated), ahi);
+      negate64(negated, b);
+      word_select(low_word(abs_b), sign_b, low_word(negated), blo), word_select(high_word(abs_b), sign_b, high_word(negated), bhi);
+      divide_unsigned(abs_a, abs_b, quotient, remainder);
+      Val flip = scratch_word();
+      if (ins.code == 4) {
+        word_op(87, flip, sign_a, sign_b);       // the quotient is negative if the signs differ
+        negate64(negated, quotient);
+        word_select(rlo, flip, low_word(negated), low_word(quotient)), word_select(rhi, flip, high_word(negated), high_word(quotient));
+      } else {
+        negate64(negated, remainder);            // the remainder has the sign of a
+        word_select(rlo, sign_a, low_word(negated), low_word(remainder)), word_select(rhi, sign_a, high_word(negated), high_word(remainder));
+      }
+      break;
+    }
+    case 7: case 8: case 9: {   // shl / lshr / ashr by the low word of the count, taken modulo 64
+      Val s = scratch_word(), big = scratch_word(), s5 = scratch_word(), c31 = scratch_word(), t = scratch_word(), u = scratch_word(), low_small = scratch_word(), high_small = scratch_word(),
+          low_big = scratch_word(), high_big = scratch_word();
+      word_op(1, s, blo, sixty_three);
+      word_op(80, big, s, thirty_two);                      // uge: the count is 32 or more
+      word_op(1, s5, s, thirty_one);
+      word_op1(40, c31, s5);
+      word_op(30, c31, c31, thirty_one);                    // 31 - s5
+      if (ins.code == 7) {
+        word_op(41, low_small, alo, s5);
+        word_op(85, t, alo, one);
+        word_op(85, t, t, c31);
+        word_op(41, u, ahi, s5);
+        word_op(60, high_small, u, t);
+        word_op(41, high_big, alo, s5);
+        word_op1(54, low_big, zero);
+      } else {
+        word_op(85, t, alo, s5);
+        word_op(41, u, ahi, one);
+        word_op(41, u, u, c31);
+        word_op(60, low_small, t, u);
+        word_op(ins.code == 8 ? 85 : 42, high_small, ahi, s5);
+        word_op(ins.code == 8 ? 85 : 42, low_big, ahi, s5);
+        if (ins.code == 8) word_op1(54, high_big, zero);
+        else word_op(42, high_big, ahi, thirty_one);
+      }
+      word_select(rlo, big, low_big, low_small);
+      word_select(rhi, big, high_big, high_small);
+      break;
+    }
+    case 10: word_op(1, rlo, alo, blo), word_op(1, rhi, ahi, bhi); break;
+    case 11: word_op(60, rlo, alo, blo), word_op(60, rhi, ahi, bhi); break;
+    case 12: word_op(87, rlo, alo, blo), word_op(87, rhi, ahi, bhi); break;
+    default: return error(status::kNotSupported);
+  }
+  return define(ins.result, r);
+}
+
+bool Translator::i64_compare(const Instruction& ins, const Val& a, const Val& b) {
+  const Val alo = low_word(a), ahi = high_word(a), blo = low_word(b), bhi = high_word(b);
+  const Val r = new_scalar(ins.result, true);
+  if (r.kind == VK::None) return false;
+  Val equal = scratch_word(), t = scratch_word(), u = scratch_word(), low_less = scratch_word(), high_less = scratch_word();
+  if (equal.kind == VK::None || t.kind == VK::None || u.kind == VK::None || low_less.kind == VK::None || high_less.kind == VK::None) return false;
+  const uint32_t code = ins.code;
+  // eq / ne
+  if (code == 32 || code == 33) {
+    word_op(87, t, alo, blo), word_op(87, u, ahi, bhi), word_op(60, t, t, u);   // nonzero if different
+    Val zero;
+    zero.kind = VK::Imm;
+    word_op(code == 32 ? 32 : 39, r, t, zero);                                  // ieq / ine against zero
+    return define(ins.result, r);
+  }
+  // lt(a, b) = high_less || (high equal && low_less), the high words signed for the signed tests; the others from it
+  const bool is_signed = code >= 38;
+  const bool swap = code == 34 || code == 37 || code == 38 || code == 41;   // ugt, ule, sgt, sle: lt(b, a)
+  const bool invert = code == 35 || code == 37 || code == 39 || code == 41; // uge, ule, sge, sle: not lt
+  const Val xlo = swap ? blo : alo, xhi = swap ? bhi : ahi, ylo = swap ? alo : blo, yhi = swap ? ahi : bhi;
+  word_op(79, low_less, xlo, ylo);
+  word_op(is_signed ? 34 : 79, high_less, xhi, yhi);
+  word_op(32, equal, xhi, yhi);
+  word_op(1, t, equal, low_less);
+  word_op(60, t, t, high_less);
+  if (invert) {
+    Val all_ones;
+    all_ones.kind = VK::Imm, all_ones.a = 0xFFFFFFFFu;
+    word_op(87, r, t, all_ones);
+  } else {
+    word_op1(54, r, t);
+  }
+  return define(ins.result, r);
+}
+
+// Casts to and from 64-bit integers: widening, and the conversions to and from floating point through doubles.
+bool Translator::i64_cast(const Instruction& ins, const Val& a) {
+  const uint32_t from = value_type(ins.operands[0]);
+  Val zero, thirty_one;
+  zero.kind = VK::Imm, thirty_one.kind = VK::Imm, thirty_one.a = 31;
+  if (m_.is_int(ins.type, 64) && m_.is_int(from)) {   // zext / sext
+    const Val r = new_wide(ins.result);
+    if (r.kind == VK::None) return false;
+    if (m_.is_int(from, 1)) {   // (a boolean is a mask: zext gives 0 or 1)
+      Val one;
+      one.kind = VK::Imm, one.a = 1;
+      if (ins.code == 1) word_op(1, low_word(r), a, one), word_op1(54, high_word(r), zero);
+      else word_op1(54, low_word(r), a), word_op1(54, high_word(r), a);
+      return define(ins.result, r);
+    }
+    if (m_.types[from].width != 32 && m_.types[from].width != 64) return error(status::kNotSupported);
+    word_op1(54, low_word(r), a);
+    if (ins.code == 2) word_op(42, high_word(r), a, thirty_one);
+    else word_op1(54, high_word(r), zero);
+    return define(ins.result, r);
+  }
+  // float <-> 64-bit integer, through a double: hi * 2^32 + lo
+  Val two32;
+  two32.kind = VK::Imm, two32.wide = true, two32.a = 0, two32.c = 0x41F00000u;   // 4294967296.0
+  if (m_.is_int(from, 64) && m_.is_float(ins.type) && (ins.code == 5 || ins.code == 6)) {
+    Val high = scratch_wide(), low = scratch_wide(), sum = m_.types[ins.type].width == 64 ? new_wide(ins.result) : scratch_wide();
+    if (high.kind == VK::None || low.kind == VK::None || sum.kind == VK::None) return false;
+    {
+      const uint32_t at = begin(ins.code == 6 ? 215 : 216);   // itod / utod of the high word
+      dst_scalar(high);
+      src(high_word(a));
+      finish(at);
+    }
+    {
+      const uint32_t at = begin(216);
+      dst_scalar(low);
+      src(low_word(a));
+      finish(at);
+    }
+    {
+      const uint32_t at = begin(210);   // dfma high * 2^32 + low
+      dst_scalar(sum);
+      src(high), src(two32), src(low);
+      finish(at);
+    }
+    if (m_.types[ins.type].width == 64) return define(ins.result, sum);
+    const Val r = new_scalar(ins.result);
+    Val scratch;
+    scratch.kind = VK::Temp;
+    uint32_t reg = 0;
+    if (r.kind == VK::None || !alloc_reg(pos_ + 1, &reg)) return false;
+    scratch.a = reg, scratch.b = 0;
+    const uint32_t at = begin(201);   // dtof into x
+    dst_temp(reg, 1u);
+    src(sum);
+    finish(at);
+    word_op1(54, r, scratch);
+    return define(ins.result, r);
+  }
+  if (m_.is_int(ins.type, 64) && m_.is_float(from) && (ins.code == 3 || ins.code == 4)) {
+    // double d (from a float by ftod); the magnitude's high word is trunc(|d| / 2^32), the low word what is left; a negative value is negated at the end
+    Val d = a;
+    if (m_.types[from].width == 32) {
+      d = scratch_wide();
+      if (d.kind == VK::None) return false;
+      const uint32_t at = begin(202);
+      dst_scalar(d);
+      src(a);
+      finish(at);
+    }
+    const Val r = new_wide(ins.result);
+    Val magnitude = scratch_wide(), scaled = scratch_wide(), rest = scratch_wide(), high_d = scratch_wide(), negated = scratch_wide();
+    if (r.kind == VK::None || magnitude.kind == VK::None || scaled.kind == VK::None || rest.kind == VK::None || high_d.kind == VK::None || negated.kind == VK::None) return false;
+    Val inverse_two32;
+    inverse_two32.kind = VK::Imm, inverse_two32.wide = true, inverse_two32.a = 0, inverse_two32.c = 0x3DF00000u;   // 2^-32
+    {
+      const uint32_t at = begin(199);   // dmov |d|
+      dst_scalar(magnitude);
+      src(d, 2);
+      finish(at);
+    }
+    {
+      const uint32_t at = begin(194);   // dmul scaled = |d| * 2^-32
+      dst_scalar(scaled);
+      src(magnitude), src(inverse_two32);
+      finish(at);
+    }
+    Val high = scratch_word(), low = scratch_word();
+    uint32_t reg = 0;
+    if (!alloc_reg(pos_ + 1, &reg)) return false;
+    {
+      const uint32_t at = begin(214);   // dtou: the high word (into x)
+      dst_temp(reg, 1u);
+      src(scaled);
+      finish(at);
+    }
+    high.a = reg, high.b = 0;
+    {
+      const uint32_t at = begin(216);   // utod: the high word back to a double
+      dst_scalar(high_d);
+      src(high);
+      finish(at);
+    }
+    {
+      Val minus_two32;
+      minus_two32.kind = VK::Imm, minus_two32.wide = true, minus_two32.a = 0, minus_two32.c = 0xC1F00000u;
+      const uint32_t at = begin(210);   // dfma rest = high * -2^32 + |d|
+      dst_scalar(rest);
+      src(high_d), src(minus_two32), src(magnitude);
+      finish(at);
+    }
+    uint32_t reg2 = 0;
+    if (!alloc_reg(pos_ + 1, &reg2)) return false;
+    {
+      const uint32_t at = begin(214);   // dtou: the low word
+      dst_temp(reg2, 1u);
+      src(rest);
+      finish(at);
+    }
+    low.a = reg2, low.b = 0;
+    if (ins.code == 3) {
+      word_op1(54, low_word(r), low), word_op1(54, high_word(r), high);
+    } else {
+      // signed: negative inputs negate the pair
+      Val mag = scratch_wide();
+      if (mag.kind == VK::None) return false;
+      word_op1(54, low_word(mag), low), word_op1(54, high_word(mag), high);
+      negate64(negated, mag);
+      Val is_negative = scratch_word(), minus_zero = Val();
+      Val zero_d;
+      zero_d.kind = VK::Imm, zero_d.wide = true;
+      {
+        const uint32_t at = begin(197);   // dlt: d < 0 into component x of a register
+        uint32_t flag = 0;
+        if (!alloc_reg(pos_ + 1, &flag)) return false;
+        dst_temp(flag, 1u);
+        src(d), src(zero_d);
+        finish(at);
+        Val flag_word;
+        flag_word.kind = VK::Temp, flag_word.a = flag, flag_word.b = 0;
+        word_op1(54, is_negative, flag_word);
+      }
+      (void)minus_zero;
+      word_select(low_word(r), is_negative, low_word(negated), low_word(mag)), word_select(high_word(r), is_negative, high_word(negated), high_word(mag));
+    }
+    return define(ins.result, r);
+  }
+  return error(status::kNotSupported);
+}
+
 bool Translator::binop(const Instruction& ins) {
   const Val a = use(ins.operands[0]), b = use(ins.operands[1]);
   const bool floating = m_.is_float(ins.type);
   if (floating && m_.types[ins.type].width == 64) return double_binop(ins, a, b);
+  if (m_.is_int(ins.type, 64)) return i64_binop(ins, a, b);
   if (!floating && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 1)) return error(status::kNotSupported);   // (16 / 64-bit)
   if (floating && m_.types[ins.type].width != 32) return error(status::kNotSupported);
   const Val r = new_scalar(ins.result, m_.is_int(ins.type, 1));
@@ -1200,6 +1642,7 @@ bool Translator::compare(const Instruction& ins) {
   const uint32_t operand_type = value_type(ins.operands[0]);
   const bool floating = m_.is_float(operand_type);
   if (floating && m_.types[operand_type].width == 64) return double_compare(ins, a, b);
+  if (m_.is_int(operand_type, 64)) return i64_compare(ins, a, b);
   if (floating ? m_.types[operand_type].width != 32 : !m_.is_int(operand_type, 32) && !m_.is_int(operand_type, 1)) return error(status::kNotSupported);
   uint32_t opcode = 0;
   bool swap = false;
@@ -1243,9 +1686,11 @@ bool Translator::cast(const Instruction& ins) {
   if ((m_.is_float(from) && m_.types[from].width == 64) || (m_.is_float(ins.type) && m_.types[ins.type].width == 64)) return double_cast(ins, a);
   if (alias_cast(ins)) {
     Val v = a;
+    if (a.wide) v = low_word(a);
     v.is_mask = m_.is_int(ins.type, 1);
     return define(ins.result, v);
   }
+  if (m_.is_int(ins.type, 64) || m_.is_int(from, 64)) return i64_cast(ins, a);
   uint32_t opcode = 0;
   switch (ins.code) {
     case 3: opcode = 28; break;   // fptoui
@@ -2300,7 +2745,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else if (c->kind == ConstantKind::Int && (m_.is_int(type, 32) || m_.is_int(type, 8) || m_.is_int(type, 16))) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
       else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 32) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
       else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 64) v.kind = VK::Imm, v.wide = true, v.a = static_cast<uint32_t>(c->bits), v.c = static_cast<uint32_t>(c->bits >> 32);
-      else if ((c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) && m_.is_float(type) && m_.types[type].width == 64) v.kind = VK::Imm, v.wide = true;
+      else if (c->kind == ConstantKind::Int && m_.is_int(type, 64)) v.kind = VK::Imm, v.wide = true, v.a = static_cast<uint32_t>(c->bits), v.c = static_cast<uint32_t>(c->bits >> 32);
+      else if ((c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) && (m_.is_float(type) ? m_.types[type].width == 64 : m_.is_int(type, 64))) v.kind = VK::Imm, v.wide = true;
       else if (c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) v.kind = VK::Imm, v.a = 0;
     }
     if (!vals_.push_back(v) || !last_use_.push_back(-1) || !alias_of_.push_back(kNone) || !unsupported_.push_back(0) || !ptr_ok_.push_back(0)) return status::kNoMemory;
@@ -2336,7 +2782,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     for (uint32_t i = 0; i < blk.count; ++i) {
       const Instruction& phi = instruction_at(blk.first + i);
       if (phi.op != Op::Phi) break;
-      const bool double_phi = m_.is_float(phi.type) && m_.types[phi.type].width == 64;
+      const bool double_phi = wide_type(phi.type);
       if (!double_phi && (m_.is_float(phi.type) ? m_.types[phi.type].width != 32 : !m_.is_int(phi.type, 32) && !m_.is_int(phi.type, 1))) return status::kNotSupported;
       uint32_t reg = 0, comp = 0;
       if (!(double_phi ? alloc_wide(last_use_of(phi.result), &reg, &comp) : alloc_scalar(last_use_of(phi.result), &reg, &comp))) return status_;

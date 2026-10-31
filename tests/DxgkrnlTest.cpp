@@ -5494,6 +5494,36 @@ void test_dxil() {
       }
     }
   }
+  // 64-bit integers: add, subtract, multiply, divide, remainder (unsigned and signed), shifts, comparisons and conversions, against the same function in C++.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_int64.dxil", &translated));
+    if (translated) {
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
+        const uint64_t a = (uint64_t{static_cast<uint32_t>(cx * 4000000000.0f)} << 20) + uint64_t{static_cast<uint32_t>(cy * 3000000000.0f)} + 12345;
+        const uint64_t b = (uint64_t{static_cast<uint32_t>(cz * 100.0f)} << 3) + uint64_t{static_cast<uint32_t>(tx * 1000.0f)} + 7;
+        const uint64_t sum = a + b, diff = a - b, prod = a * b, quo = a / b, rem = a % b;
+        const uint64_t sh = (a << static_cast<uint32_t>(ty * 40.0f)) ^ (b >> 3) ^ (a >> static_cast<uint32_t>(cw * 50.0f));
+        const int64_t sa = static_cast<int64_t>(a) - static_cast<int64_t>(b << 30), sq = sa / static_cast<int64_t>(b + 3), sr = sa % static_cast<int64_t>(b + 3);
+        const uint64_t s5 = (a < b ? 1 : 0) + (a > b ? 2 : 0) + (sa < 0 ? 4 : 0) + (a >= b ? 8 : 0) + (static_cast<int64_t>(a) <= static_cast<int64_t>(b) ? 16 : 0) + (a == b ? 32 : 0) + (sa != 0 ? 64 : 0);
+        const float want[4] = {static_cast<float>(static_cast<uint32_t>(sum >> 32)) + static_cast<float>(static_cast<uint32_t>(sum)) * 0.0000001f,
+                               static_cast<float>(static_cast<uint32_t>(diff ^ (diff >> 32))) + static_cast<float>(static_cast<uint32_t>(prod >> 40)),
+                               static_cast<float>(static_cast<uint32_t>(quo)) + static_cast<float>(static_cast<uint32_t>(rem)) * 3.0f + static_cast<float>(static_cast<uint32_t>(sh >> 17)),
+                               static_cast<float>(static_cast<uint32_t>(sq >> 16)) + static_cast<float>(static_cast<uint32_t>(sr)) * 0.5f + static_cast<float>(static_cast<uint32_t>(s5)) + static_cast<float>(sa) * 1e-12f +
+                                   static_cast<float>(static_cast<int64_t>(a >> 3))};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  int64 #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;
@@ -6541,11 +6571,24 @@ void test_dxbc_integers() {
         const uint32_t got[4] = {__builtin_bit_cast(uint32_t, c.x), __builtin_bit_cast(uint32_t, c.y), __builtin_bit_cast(uint32_t, c.z), __builtin_bit_cast(uint32_t, c.w)};
         CHECK(got[0] == 100 / 7 && got[1] == 1 && got[2] == 0xFFFFFFFFu / 2 && got[3] == 0xFFFFFFFFu);   // (x / 0 is all ones)
       }
+      // (the high word of a product: umul r5 (high), r6 (low))
       DxbcAsm high = dx_pixel_shader();
-      high.ins(81, {dx_dst(kOpTemp, 5, 0xF), dx_dst(kOpTemp, 6, 0xF), dx_src(kOpTemp, 1), dx_src(kOpTemp, 2)});   // the high word of a product is not taken
+      high.ins(54, {dx_dst(kOpTemp, 1, 0xF), dx_imm_bits(100, 7, 0xFFFFFFFFu, 9)});
+      high.ins(54, {dx_dst(kOpTemp, 2, 0xF), dx_imm_bits(7, 7, 2, 0)});
+      high.ins(81, {dx_dst(kOpTemp, 5, 0xF), dx_dst(kOpTemp, 6, 0xF), dx_src(kOpTemp, 1), dx_src(kOpTemp, 2)});
+      high.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 5)});
       high.ins(62, {});
-      compile_dxbc(allocator, high.build(), &st);
-      CHECK(st == status::kNotSupported);
+      DxbcAsm wrapped = high;
+      wrapped.code.insert(wrapped.code.begin(), {104u | (2u << 24), 8u});
+      UniquePointer<D3d9Program> hp = compile_dxbc(allocator, wrapped.build(), &st);
+      CHECK(st == status::kSuccess && hp);
+      if (hp) {
+        uint8_t constants[128] = {};
+        graphics::Vec4 varyings[4] = {}, c = {};
+        hp->run_fragment(varyings, constants, nullptr, &c);
+        const uint32_t got[4] = {__builtin_bit_cast(uint32_t, c.x), __builtin_bit_cast(uint32_t, c.y), __builtin_bit_cast(uint32_t, c.z), __builtin_bit_cast(uint32_t, c.w)};
+        CHECK(got[0] == 0 && got[1] == 0 && got[2] == 1 && got[3] == 0);
+      }
     }
   }
   CHECK(allocator.live == 0);

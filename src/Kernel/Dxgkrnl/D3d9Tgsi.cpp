@@ -70,6 +70,7 @@ class TgsiEmitter {
 
   struct Imm {
     uint32_t bits[4];
+    bool integer = false;   // (used by an integer instruction: declared UINT32 whatever the bits look like)
   };
 
   // --- text
@@ -126,9 +127,10 @@ class TgsiEmitter {
   // --- immediates
   uint32_t imm4(const float v[4]) {
     Imm im;
+    im.integer = force_integer_;
     for (uint32_t k = 0; k < 4; ++k) im.bits[k] = __builtin_bit_cast(uint32_t, v[k]);
     for (uint64_t i = 0; i < imms_.count(); ++i) {
-      bool same = true;
+      bool same = imms_[i].integer == im.integer;
       for (uint32_t k = 0; k < 4; ++k) same = same && imms_[i].bits[k] == im.bits[k];
       if (same) return static_cast<uint32_t>(i);
     }
@@ -243,6 +245,7 @@ class TgsiEmitter {
   allocators::IAllocator& a_;
   String body_;
   List<Imm> imms_;
+  bool force_integer_ = false;   // the instruction being emitted reads its literals as integers
   uint32_t inst_ = 0;
   bool oom_ = false, unsupported_ = false;
   bool vertex_ = false, addr_used_ = false;
@@ -505,6 +508,7 @@ bool TgsiEmitter::compare(const Instr& ins) {
 }
 
 bool TgsiEmitter::instruction(const Instr& ins) {
+  force_integer_ = false;
   const uint16_t op = ins.op;
   relative_key_ = -2;
   switch (op) {
@@ -584,6 +588,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
   }
   if (ins.dst.mask == 0) return true;
 
+  force_integer_ = op >= kIntegerFirst && op <= kIntegerLast && op != kFtoI && op != kFtoU;
   bool direct = false;
   const String d = destination(ins.dst);
   String t = str();
@@ -642,6 +647,8 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kIAdd: simple = "UADD", sources = 2; break;
     case kINeg: simple = "INEG", sources = 1; break;
     case kIMul: case kUMul: simple = "UMUL", sources = 2; break;
+    case kUMulHi: simple = "UMUL_HI", sources = 2; break;
+    case kIMulHi: simple = "IMUL_HI", sources = 2; break;
     case kIMad: case kUMad: simple = "UMAD", sources = 3; break;
     case kIMin: simple = "IMIN", sources = 2; break;
     case kIMax: simple = "IMAX", sources = 2; break;
@@ -1424,7 +1431,7 @@ void TgsiEmitter::assemble(String* out) {
     add(*out, "IMM[");
     add_uint(*out, i);
     // A value that is no ordinary float (an integer literal: a denormal, or all ones, or a large one) is written as its bits.
-    bool integer = false;
+    bool integer = imms_[i].integer;
     for (uint32_t k = 0; k < 4; ++k) {
       const uint32_t exponent = (imms_[i].bits[k] >> 23) & 0xFF, mantissa = imms_[i].bits[k] & 0x7FFFFF;
       integer = integer || (exponent == 0 && mantissa != 0) || (p_.major_ >= 4 && exponent >= 0x9C);   // (a Shader Model 4 literal is typeless: one too large to write as a decimal is an integer, 0xFF000000 and the like)

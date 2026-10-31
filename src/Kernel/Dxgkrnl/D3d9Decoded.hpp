@@ -37,8 +37,8 @@ enum Opcode : uint16_t {
   kDiv = 0x1000, kSqrt, kSeq, kSne, kDp2, kFloor, kCeil, kTrunc, kRoundNe, kSin, kCos, kSelect, kIfNz, kIfZ, kDiscardNz, kDiscardZ,
   kDdx, kDdy, kDdxCoarse, kDdyCoarse,   // (derivatives over the 2 x 2 quad: fine takes the pair of the pixel's own row or column, coarse the quad's first)
   // Integer and bitwise instructions: the 32 bits of a register component are the integer (the interpreter keeps them in the float's bits), comparisons give all ones or zero.
-  kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe,
-  kIntegerFirst = kIAdd, kIntegerLast = kUGe,
+  kIAdd = 0x1100, kINeg, kIMul, kIMad, kIMin, kIMax, kUMin, kUMax, kUMul, kUMad, kUDiv, kURem, kIShl, kIShr, kUShr, kAnd, kOr, kXor, kNot, kFtoI, kFtoU, kItoF, kUtoF, kIEq, kINe, kILt, kIGe, kULt, kUGe, kUMulHi, kIMulHi,   // (the high word of a 32 x 32 product)
+  kIntegerFirst = kIAdd, kIntegerLast = kIMulHi,
   // Loops (Shader Model 4): `target` of a loop is the instruction after its endloop, of an endloop the one after its loop; break leaves, continue goes to the endloop.
   // Texture access of Shader Model 4: ld (src[0] the integer coordinates, x y in the first two components and the level in the last; src[1] the unit), sample_l (src[0] the
   // coordinate, src[1] the unit, src[2] the level), resinfo (src[0] the level, src[1] the unit; control: 0 floats, 1 reciprocals, 2 unsigned integers).

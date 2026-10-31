@@ -837,7 +837,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         break;
       }
       case kIAdd: case kINeg: case kIMul: case kIMad: case kIMin: case kIMax: case kUMin: case kUMax: case kUMul: case kUMad: case kUDiv: case kURem: case kIShl: case kIShr: case kUShr:
-      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: {
+      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: case kUMulHi: case kIMulHi: {
         if (ins.src_count > 1) b = fetch(ins.src[1], 0);
         if (ins.src_count > 2) c = fetch(ins.src[2], 0);
         for (int i = 0; i < 4; ++i) {
@@ -848,6 +848,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
             case kIAdd: out = x + y; break;
             case kINeg: out = 0u - x; break;
             case kIMul: case kUMul: out = x * y; break;
+            case kUMulHi: out = static_cast<uint32_t>((uint64_t{x} * uint64_t{y}) >> 32); break;
+            case kIMulHi: out = static_cast<uint32_t>(static_cast<uint64_t>((static_cast<int64_t>(sx) * static_cast<int64_t>(sy))) >> 32); break;
             case kIMad: case kUMad: out = x * y + z; break;
             case kIMin: out = static_cast<uint32_t>(sx < sy ? sx : sy); break;
             case kIMax: out = static_cast<uint32_t>(sx > sy ? sx : sy); break;

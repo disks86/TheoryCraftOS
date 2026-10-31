@@ -895,12 +895,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       Instr::Src source_a, source_b;
       if ((s = to_src(a, &source_a)) != status::kSuccess || (s = to_src(b, &source_b)) != status::kSuccess) return s;
       const bool divide = opcode == 78;
-      if (!divide && first.type != kOpNull) return status::kNotSupported;   // (the high word)
       for (int k = 0; k < 2; ++k) {
         const Operand& d = k == 0 ? first : second;
         if (d.type == kOpNull) continue;
         Instr one_ins;
-        one_ins.op = divide ? (k == 0 ? kUDiv : kURem) : (opcode == 38 ? kIMul : kUMul);
+        one_ins.op = divide ? (k == 0 ? kUDiv : kURem) : k == 0 ? (opcode == 38 ? kIMulHi : kUMulHi) : (opcode == 38 ? kIMul : kUMul);   // (the first destination of a product is the high word)
         one_ins.src[0] = source_a, one_ins.src[1] = source_b;
         one_ins.src_count = 2;
         s = to_dst(d, &one_ins.dst);

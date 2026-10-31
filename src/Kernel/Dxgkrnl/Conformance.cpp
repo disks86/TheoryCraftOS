@@ -479,6 +479,28 @@ void scene_dxil_double(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// 64-bit integers (dxil_ps_int64_show.hlsl): add, subtract, multiply, divide, shifts and comparisons of 64-bit values, shown as the bytes of their results.
+void scene_dxil_int64(Rig& rig, ArrayView<uint32_t> out) {
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_int64_show, sizeof b::k_dxil_ps_int64_show, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  float block[28];
+  for (uint32_t i = 0; i < 16; ++i) block[i] = kIdentity[i];
+  const uint32_t k[12] = {0xF2345678u, 0x000000DEu, 0x9ABCDEF1u, 0x00000012u, 0x0F1E2D3Cu, 0x00000007u, 0, 0, 3, 11, 0, 0};   // (a, b, the step of a, the base shifts)
+  for (uint32_t i = 0; i < 12; ++i) block[16 + i] = __builtin_bit_cast(float, k[i]);
+  w.push_constants(bytes_of(block, sizeof block));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
 void scene_render_to_texture(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
@@ -2368,6 +2390,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},
     {"Direct3D 12 DXIL comparison sampling (Shader Model 6)", scene_dxil_compare},
     {"Direct3D 12 DXIL double precision (Shader Model 6)", scene_dxil_double},
+    {"Direct3D 12 DXIL 64-bit integers (Shader Model 6)", scene_dxil_int64},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
