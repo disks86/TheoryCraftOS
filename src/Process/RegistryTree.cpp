@@ -52,8 +52,8 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
   keys_.push_back(static_cast<UniquePointer<RegKey>&&>(root));
   static const char* const kHives[] = {"MACHINE\\HARDWARE", "MACHINE\\SAM", "MACHINE\\SECURITY", "MACHINE\\SOFTWARE\\Classes", "MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
                                        "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "MACHINE\\SYSTEM\\CurrentControlSet\\Control", "MACHINE\\SYSTEM\\CurrentControlSet\\Services",
-                                       "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", "USER\\.DEFAULT", "USER\\S-1-5-21-0-0-0-1000\\Software\\Microsoft\\Windows\\CurrentVersion",
-                                       "USER\\S-1-5-21-0-0-0-1000\\Environment", "USER\\S-1-5-21-0-0-0-1000\\Volatile Environment", "USER\\S-1-5-21-0-0-0-1000\\Control Panel"};
+                                       "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug", "USER\\.DEFAULT", "USER\\S-1-5-21-0-0-0-1000\\Software\\Microsoft\\Windows\\CurrentVersion",
+                                       "USER\\S-1-5-21-0-0-0-1000\\Environment", "USER\\S-1-5-21-0-0-0-1000\\Volatile Environment", "USER\\S-1-5-21-0-0-0-1000\\Control Panel", "USER\\S-1-5-21-0-0-0-1000\\Control Panel\\International\\Geo"};
   for (const char* path : kHives) {      // every level, one after the other: a path is made one key at a time
     const StringView whole(path);
     for (uint64_t end = whole.find('\\'); ; end = whole.find('\\', end + 1)) {
@@ -79,6 +79,17 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
     text("SystemRoot", "C:\\Windows");
     text("PathName", "C:\\Windows");
     text("CSDVersion", "");
+  }
+  uint32_t geo = 0;
+  if (resolve(kRoot, StringView("USER\\S-1-5-21-0-0-0-1000\\Control Panel\\International\\Geo"), false, now, &geo, &created) == kRegSuccess) {      // the user's place (GetUserGeoID)
+    auto text = [&](const char* name, const char* value) {
+      ByteBuffer data(allocator_);
+      for (const char* c = value; *c; ++c) data.put16(static_cast<uint8_t>(*c));
+      data.put16(0);
+      set_value(geo, StringView(name), 1 /* REG_SZ */, data.view(), now);
+    };
+    text("Nation", "244");
+    text("Name", "US");
   }
   uint32_t profiles = 0;
   if (resolve(kRoot, StringView("MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList"), false, now, &profiles, &created) == kRegSuccess) {

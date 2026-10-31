@@ -182,7 +182,9 @@ EXPORT BOOLEAN WINAPI CreateSymbolicLinkW(LPCWSTR link, LPCWSTR target, DWORD fl
   UNICODE_STRING raw_target;
   raw_target.Buffer = (WCHAR *)target;
   raw_target.Length = raw_target.MaximumLength = (USHORT)(wcslen(target) * 2);
+  if (!(flags & SYMBOLIC_LINK_FLAG_DIRECTORY) && is_separator(link[wcslen(link) - 1])) { set_error(ERROR_INVALID_NAME); return FALSE; }      /* (a link to a file is not named as a folder) */
   const NTSTATUS status = NtCreateSymbolicLink(&link_attributes, &raw_target, (flags & SYMBOLIC_LINK_FLAG_DIRECTORY) ? 1 : 0);
+  if (NT_SUCCESS(status)) set_error(ERROR_SUCCESS);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOLEAN WINAPI CreateSymbolicLinkA(LPCSTR link, LPCSTR target, DWORD flags) {
@@ -258,6 +260,7 @@ EXPORT PVOID WINAPI ConvertThreadToFiberEx(PVOID parameter, DWORD flags) {
   f->actctx_stack = TEB_ACTCTX_STACK_PTR(NtCurrentTeb());
   TEB_FIBER_DATA(NtCurrentTeb()) = f;
   TEB_SAME_FLAGS(NtCurrentTeb()) |= 4;
+  NtSetInformationThread(NtCurrentThread(), 0x80, NULL, 0);      /* (the stack is a fiber's now: it stays if the thread ends before the fiber is switched to or deleted) */
   return f;
 }
 EXPORT PVOID WINAPI ConvertThreadToFiber(PVOID parameter) { return ConvertThreadToFiberEx(parameter, 0); }

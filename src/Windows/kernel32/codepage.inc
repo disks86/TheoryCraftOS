@@ -331,10 +331,7 @@ EXPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR sourc
 
 EXPORT UINT WINAPI GetACP(void) { return CP_UTF8; }
 EXPORT UINT WINAPI GetOEMCP(void) { return CP_UTF8; }
-EXPORT UINT WINAPI GetConsoleCP(void) { return CP_UTF8; }
-EXPORT UINT WINAPI GetConsoleOutputCP(void) { return CP_UTF8; }
-EXPORT BOOL WINAPI SetConsoleCP(UINT cp) { (void)cp; return TRUE; }
-EXPORT BOOL WINAPI SetConsoleOutputCP(UINT cp) { (void)cp; return TRUE; }
+/* (GetConsoleCP, SetConsoleCP and the output ones are in console.inc: the code pages belong to the console) */
 
 EXPORT BOOL WINAPI IsValidCodePage(UINT cp) { return cp == CP_UTF8 || cp == CPX_UTF7 || cp_find(cp) != NULL; }
 

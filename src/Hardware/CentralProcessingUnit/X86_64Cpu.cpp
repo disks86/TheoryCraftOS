@@ -18,6 +18,7 @@
 
 #include "Hardware/CentralProcessingUnit/X86_64Cpu.hpp"
 #include "Hardware/CentralProcessingUnit/Cpuid.hpp"
+#include "Kernel/Thread.hpp"
 
 // Implemented in X86_64Cpu.S.
 extern "C" {
@@ -98,6 +99,8 @@ void X86_64Cpu::shutdown() {
 }
 
 uint32_t X86_64Cpu::current_core() const {
+  // With the scheduler running the core knows its own number (the firmware call below costs microseconds, and spin locks ask for it twice every time).
+  if (kernel::running()) return kernel::current_core();
   efi::Uintn id = 0;
   if (mp_ && mp_->who_am_i(mp_, &id) == efi::kSuccess && id < cores_)
     return static_cast<uint32_t>(id);

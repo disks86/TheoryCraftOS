@@ -32,6 +32,9 @@ uint32_t image_header_status(ConstByteView file);
 uint32_t image_section_status(ConstByteView file, exe::PeFile& pe);
 // A view of the (not image) section `id` in `target`; and a handle for an object the caller already holds a reference for (kind and token as in the descriptor table).
 uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* base_in_out, uint64_t* view_in_out, uint32_t view_page);
+// RemoteOp::TakeHandle in the program that owns the handle op.address: its kind, token and denied rights come back in op.type, op.argument and op.protect, and the copy
+// is counted (op.suspended: the handle is closed after, DUPLICATE_CLOSE_SOURCE).
+uint32_t take_object_handle_from(Process& source, IProcessRuntime::RemoteOp& op);
 uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle);
 
 uint32_t nt_create_event(Process& p, const SyscallRequest& r);
@@ -64,6 +67,8 @@ uint32_t nt_flush_virtual_memory(Process& p, const SyscallRequest& r);
 // handle flags (inherit, protect from close).
 uint32_t nt_query_object(Process& p, const SyscallRequest& r);
 uint32_t nt_set_information_object(Process& p, const SyscallRequest& r);
+// NtCompareObjects(First, Second): STATUS_SUCCESS if the two handles are of the same object, STATUS_NOT_SAME_OBJECT if not.
+uint32_t nt_compare_objects(Process& p, const SyscallRequest& r);
 // NtSignalAndWaitForSingleObject(SignalHandle, WaitHandle, Alertable, Timeout).
 uint32_t nt_signal_and_wait(Process& p, const SyscallRequest& r);
 // Waitable timers: NtCreateTimer, NtOpenTimer, NtSetTimer (an APC routine runs in the thread that set the timer, while it waits alertably), NtCancelTimer, NtQueryTimer.

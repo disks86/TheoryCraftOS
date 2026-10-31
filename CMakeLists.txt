@@ -645,6 +645,7 @@ add_executable(BOOTX64
   src/Process/WindowsLocks.cpp
   src/Process/WindowsJobs.cpp
   src/Process/WindowsDebug.cpp
+  src/Process/FileSecurity.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
@@ -1029,7 +1030,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/comm.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/profile.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/appmodel.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
   windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
@@ -1042,7 +1043,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/advapi32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${advapi32_stubs} -Wl,--image-base=0x180600000 -o ${WINDOWS_DIR}/advapi32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/registry.inc
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/registry.inc ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/sddl.inc
             ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/advapi32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building advapi32.dll")
   windows_stub_flags(ws2_32_stubs ws2_32 0)

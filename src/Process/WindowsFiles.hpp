@@ -50,6 +50,9 @@ uint32_t nt_device_io_control_file(Process& p, const SyscallRequest& r);
 // FindFirstChangeNotification(W/A) - a handle that becomes signalled (like a manual-reset event) when a file or subdirectory is created, deleted, renamed or linked
 // directly under the named directory, or anywhere under it if WatchTree is nonzero. FindNextChangeNotification is NtResetEvent on the same handle; FindCloseChangeNotification
 // is NtClose. NotifyFilter is kept but not matched against: any of those changes signals the handle, regardless of which FILE_NOTIFY_CHANGE_* bits were asked for.
+// NtFsControlFile on a file handle (the pipe kinds are in WindowsPipes.cpp): FSCTL_GET_REPARSE_POINT of a symbolic link opened itself. `status_block`, `output` and
+// `output_length` are the call's arguments.
+uint32_t file_fs_control(Process& p, uint64_t slot, uint64_t status_block, uint32_t code, uint64_t output, uint64_t output_length);
 uint32_t nt_create_change_notification(Process& p, const SyscallRequest& r);
 // NtNotifyChangeDirectoryFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
 // ULONG CompletionFilter, BOOLEAN WatchTree): this OS's own real-named service, behind ReadDirectoryChangesW - unlike real Windows, synchronous (there is no real

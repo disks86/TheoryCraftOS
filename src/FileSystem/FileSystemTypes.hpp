@@ -110,6 +110,9 @@ struct DirectoryEntry {
   bool is_symlink = false;               // the entry itself is a symbolic link (stat()/open_file() still follow it; this is for listings)
   uint64_t modified = 0;                 // last change of the contents, seconds since 1970-01-01 UTC; 0 when the filesystem has none
   uint64_t created = 0;                  // the same for creation; 0 when unknown
+  uint64_t accessed = 0;                 // the same for the last access; 0 when unknown (no file system here keeps it: the layer above adds it)
+  // The times in 100 ns units since 1601 (a FILETIME), when the layer above knows them better than the seconds above; 0 when it does not.
+  uint64_t exact_created = 0, exact_modified = 0, exact_accessed = 0;
 };
 
 // What SetFileAttributes / SetFileTime change besides the contents; a field is only looked at when its `set_` flag is.

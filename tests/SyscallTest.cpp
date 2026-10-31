@@ -340,7 +340,7 @@ static void test_windows() {
   CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtDelayExecution, 0, 0))) == kNtAccessViolation);
 
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount)))) == kNtNoService);      // the first number past the list
-  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount - 2)))) == kNtNotImpl);      // the last service has no code yet
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount - 3)))) == kNtNotImpl);      // the last service without code (the two after it are this OS's own)
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase)))) == kNtNotImpl);          // win32k's first and last service
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd - 1)))) == kNtNotImpl);
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase - 1)))) == kNtNoService);     // the gap between the two tables

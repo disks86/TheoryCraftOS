@@ -105,6 +105,12 @@ uint32_t nt_release_module(Process& p, const SyscallRequest& r) {
   return kSuccess;
 }
 
+uint32_t nt_link_modules(Process& p, const SyscallRequest& r) {
+  IModuleHost* host = p.module_host();
+  if (!host) return kNotImplemented;
+  return host->link_modules(r.args[0], r.args[1]);
+}
+
 uint32_t nt_unload_module(Process& p, const SyscallRequest& r) {
   IModuleHost* host = p.module_host();
   if (!host) return kNotImplemented;

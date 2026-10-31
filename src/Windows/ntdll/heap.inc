@@ -30,6 +30,7 @@
 #define CHUNK_INFO 4ull      /* the block keeps user info (a value and flags) after its tail */
 #define CHUNK_UNUSED_SHIFT 44      /* 8 bits: how many bytes of the payload are not asked for */
 #define CHUNK_UFLAGS_SHIFT 52      /* 12 bits: the user flags (HEAP_SETTABLE_USER_FLAG1..3 are 0x200..0x800) */
+#define CHUNK_LFH_FREE (1ull << 52)      /* a free slot of the low-fragmentation heap: in use as far as the chunks around it know (it is not merged), but on the list of slots to hand out */
 typedef struct Chunk { ULONGLONG prev_size, size_flags; struct Chunk *next, *prev; } Chunk;
 
 #define REGION_ALIGN 0x10000ull
@@ -64,9 +65,13 @@ typedef struct Heap {
   LONG user_depth;
   Subheap first;
   Chunk free_list;
-  BYTE pad[0x800 - 0x100];      /* (the header is 0x800 bytes in all: the first chunk follows it) */
+  Chunk lfh_list;                  /* the free slots of the low-fragmentation heap, the newest first (the chunks' own links are used) */
+  ULONG lfh_active, lfh_count;     /* low fragmentation is on (a heap that asked for it, or got it by use, after enough allocations) */
+  SIZE_T lfh_bytes;
+  BYTE pad[0x800 - 0x100 - 0x30 - 16];      /* (the header is 0x800 bytes in all: the first chunk follows it) */
 } Heap;
 
+_Static_assert(sizeof(Heap) <= 0x800, "the header of a heap is 0x800 bytes");
 static Chunk *chunk_next(Chunk *c) { return (Chunk *)((BYTE *)c + CHUNK_SIZE(c)); }
 static void free_unlink(Chunk *c) { c->prev->next = c->next; c->next->prev = c->prev; }
 static void free_link(Heap *h, Chunk *c) { c->next = h->free_list.next; c->prev = &h->free_list; h->free_list.next->prev = c; h->free_list.next = c; }
@@ -161,6 +166,7 @@ static Heap *heap_new(ULONG flags, SIZE_T initial, SIZE_T maximum, int process_h
   h->maximum = maximum;
   h->next_region = 0x100000;
   h->free_list.next = h->free_list.prev = &h->free_list;
+  h->lfh_list.next = h->lfh_list.prev = &h->lfh_list;
   h->first.base = (BYTE *)base;
   h->first.reserve = reserve;
   h->first.committed = commit;
@@ -256,13 +262,9 @@ static PVOID large_alloc(Heap *h, ULONG flags, SIZE_T bytes) {
   return (BYTE *)base + LARGE_HEADER;      /* (fresh pages are zero) */
 }
 
-static PVOID heap_alloc_locked(Heap *h, ULONG flags, SIZE_T bytes) {
-  if (bytes > MAX_HEAP_BLOCK) return NULL;
-  if (heap_is_fixed(h) && bytes >= 0xFF000) return NULL;      /* (a fixed heap holds no very big blocks) */
-  if (bytes >= LARGE_MIN && !heap_is_fixed(h)) return large_alloc(h, flags, bytes);
-  const int info = (flags & 0x100) != 0;
-  const int big = *(ULONG *)((BYTE *)NtCurrentPeb() + 0xBC) != 0 || (flags & (HF_TAIL | HF_FREE));
-  const ULONGLONG need = chunk_need(h, bytes, info, big);
+/* A chunk of `need` bytes (or a little more) from the free chunks, marked in use; the caller sets the rest of its header. Commits more of a region, or adds one, if there is no
+ * free chunk that fits. */
+static Chunk *take_chunk(Heap *h, ULONGLONG need) {
   for (int attempt = 0; attempt < 3; ++attempt) {
     Chunk *chosen = NULL;
     for (Chunk *c = h->free_list.next; c != &h->free_list; c = c->next) {
@@ -275,21 +277,14 @@ static PVOID heap_alloc_locked(Heap *h, ULONG flags, SIZE_T bytes) {
       Chunk *c = chosen;
       const ULONGLONG size = CHUNK_SIZE(c);
       free_unlink(c);
-      const ULONGLONG extra_bits = (info ? CHUNK_INFO : 0) | (big ? CHUNK_BIG : 0) | ((ULONGLONG)(flags & 0xE00) << CHUNK_UFLAGS_SHIFT);
       if (size - need >= MIN_CHUNK) {      /* split: the rest stays free */
-        c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED) | extra_bits;
+        c->size_flags = need | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
         make_free(h, (Chunk *)((BYTE *)c + need), size - need, 1);
       } else {
-        c->size_flags = size | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED) | extra_bits;
+        c->size_flags = size | CHUNK_USED | (c->size_flags & CHUNK_PREV_USED);
         chunk_next(c)->size_flags |= CHUNK_PREV_USED;
       }
-      chunk_set_asked(h, c, bytes);
-      BYTE *user = (BYTE *)c + 16;
-      if (flags & HEAP_FLAG_ZERO_MEMORY) memset(user, 0, (size_t_)((h->flags & (HF_TAIL | 0x70000000u)) || info ? bytes : CHUNK_SIZE(c) - chunk_base(c)));      /* (all of the payload: the bytes after the size are zero too, unless a tail follows) */
-      else if (h->flags & HF_FREE) fill_dwords(user, bytes, 0xBAADF00Du);
-      if (h->flags & HF_TAIL) memset(user + bytes, 0xAB, (size_t_)TAIL_BYTES);
-      if (info) memset(chunk_info(h, c), 0, 16);
-      return user;
+      return c;
     }
     if (attempt == 0) {      /* commit more of the newest region */
       int grown = 0;
@@ -305,6 +300,97 @@ static PVOID heap_alloc_locked(Heap *h, ULONG flags, SIZE_T bytes) {
   return NULL;
 }
 
+/* The block of a chunk that was just taken: its header bits, the size that was asked for, and the contents. */
+static PVOID chunk_finish(Heap *h, Chunk *c, ULONG flags, SIZE_T bytes, int info, int big) {
+  const ULONGLONG extra_bits = (info ? CHUNK_INFO : 0) | (big ? CHUNK_BIG : 0) | ((ULONGLONG)(flags & 0xE00) << CHUNK_UFLAGS_SHIFT);
+  c->size_flags = (c->size_flags & (CHUNK_SIZE_MASK | CHUNK_USED | CHUNK_PREV_USED)) | extra_bits;
+  chunk_set_asked(h, c, bytes);
+  BYTE *user = (BYTE *)c + 16;
+  if (flags & HEAP_FLAG_ZERO_MEMORY) memset(user, 0, (size_t_)((h->flags & (HF_TAIL | 0x70000000u)) || info ? bytes : CHUNK_SIZE(c) - chunk_base(c)));      /* (all of the payload: the bytes after the size are zero too, unless a tail follows) */
+  else if (h->flags & HF_FREE) fill_dwords(user, bytes, 0xBAADF00Du);
+  if (h->flags & HF_TAIL) memset(user + bytes, 0xAB, (size_t_)TAIL_BYTES);
+  if (info) memset(chunk_info(h, c), 0, 16);
+  return user;
+}
+
+/* ---- the low-fragmentation heap: the slots of the sizes the program uses are kept in lists instead of being merged with their neighbours when they are freed, so a block
+ * freed is the block that comes back for the next one of its size. It starts after a number of allocations (the heap asked for it, or got it by use); a debugging heap
+ * does not have it. A slot a program frees stays a chunk in use (flagged), is reported as a free block by HeapWalk, and goes back to the free chunks when the lists are full. */
+#define LFH_MAX_CHUNK 0x4000ull
+#define LFH_MAX_COUNT 2048u
+#define LFH_MAX_BYTES (1u << 20)
+static int lfh_allowed(Heap *h) { return !heap_is_fixed(h) && !(h->flags & (HF_TAIL | HF_FREE | HF_NO_COALESCE | 0x70000000u)); }
+static void lfh_unlink(Heap *h, Chunk *c) { free_unlink(c); --h->lfh_count; h->lfh_bytes -= (SIZE_T)CHUNK_SIZE(c); }
+static void lfh_push(Heap *h, Chunk *c) {
+  c->size_flags |= CHUNK_LFH_FREE;
+  c->next = h->lfh_list.next; c->prev = &h->lfh_list;
+  h->lfh_list.next->prev = c; h->lfh_list.next = c;
+  ++h->lfh_count; h->lfh_bytes += (SIZE_T)CHUNK_SIZE(c);
+}
+static void chunk_release(Heap *h, Chunk *c);
+/* A slot goes on the list; the oldest slots leave it (and become free chunks) while there are too many. */
+static void lfh_cache(Heap *h, Chunk *c) {
+  lfh_push(h, c);
+  while (h->lfh_count > LFH_MAX_COUNT || h->lfh_bytes > LFH_MAX_BYTES) {
+    Chunk *old = h->lfh_list.prev;
+    if (old == &h->lfh_list) break;
+    lfh_unlink(h, old);
+    old->size_flags &= ~CHUNK_LFH_FREE;
+    chunk_release(h, old);
+  }
+}
+/* The newest slot of exactly this size, or NULL. */
+static Chunk *lfh_take(Heap *h, ULONGLONG need) {
+  for (Chunk *c = h->lfh_list.next; c != &h->lfh_list; c = c->next) {
+    if (CHUNK_SIZE(c) != need) continue;
+    lfh_unlink(h, c);
+    c->size_flags &= ~(CHUNK_LFH_FREE | CHUNK_INFO | CHUNK_BIG | (0xFFFull << CHUNK_UFLAGS_SHIFT) | (0xFFull << CHUNK_UNUSED_SHIFT));
+    return c;
+  }
+  return NULL;
+}
+/* No slot of this size: a run of them is cut from the free chunks at once (the first is handed out, the rest wait on the list, the lowest address first). */
+static Chunk *lfh_group(Heap *h, ULONGLONG need) {
+  const ULONGLONG slots = need <= 256 ? 32 : need <= 1024 ? 8 : 1;
+  Chunk *g = slots > 1 ? take_chunk(h, need * slots) : NULL;
+  if (!g) return take_chunk(h, need);
+  const ULONGLONG whole = CHUNK_SIZE(g);
+  ULONGLONG count = whole / need, left_over = whole - count * need;      /* (a run that took the tail of a free chunk too may be a little longer than the slots) */
+  ULONGLONG first = need;
+  if (left_over < MIN_CHUNK) { first += left_over; left_over = 0; }      /* (too little to be a chunk: the block handed out keeps it) */
+  g->size_flags = (g->size_flags & ~CHUNK_SIZE_MASK) | first;
+  BYTE *slot_at = (BYTE *)g + first;
+  Chunk *slot[64];
+  ULONGLONG made = 0;
+  for (ULONGLONG i = 1; i < count && made < 64; ++i, slot_at += need) {
+    Chunk *c = (Chunk *)slot_at;
+    c->size_flags = need | CHUNK_USED | CHUNK_PREV_USED;
+    slot[made++] = c;
+  }
+  while (made) lfh_push(h, slot[--made]);      /* (pushed last to first: the lowest address is the newest) */
+  if (left_over) {
+    Chunk *rest = (Chunk *)slot_at;
+    rest->size_flags = left_over | CHUNK_USED | CHUNK_PREV_USED;
+    chunk_release(h, rest);
+  }
+  return g;
+}
+
+static PVOID heap_alloc_locked(Heap *h, ULONG flags, SIZE_T bytes) {
+  if (bytes > MAX_HEAP_BLOCK) return NULL;
+  if (heap_is_fixed(h) && bytes >= 0xFF000) return NULL;      /* (a fixed heap holds no very big blocks) */
+  if (bytes >= LARGE_MIN && !heap_is_fixed(h)) return large_alloc(h, flags, bytes);
+  const int info = (flags & 0x100) != 0;
+  const int big = *(ULONG *)((BYTE *)NtCurrentPeb() + 0xBC) != 0 || (flags & (HF_TAIL | HF_FREE));
+  const ULONGLONG need = chunk_need(h, bytes, info, big);
+  Chunk *c = NULL;
+  if (h->lfh_active && need <= LFH_MAX_CHUNK) {
+    c = lfh_take(h, need);
+    if (!c) c = lfh_group(h, need);
+  } else c = take_chunk(h, need);
+  return c ? chunk_finish(h, c, flags, bytes, info, big) : NULL;
+}
+
 /* The address of a chunk of the heap that `memory` names, or NULL if it is not a block of a region (nothing is followed before the address is known to be in one). */
 static Chunk *heap_chunk_of(Heap *h, PVOID memory) {
   const ULONG_PTR p = (ULONG_PTR)memory;
@@ -313,7 +399,7 @@ static Chunk *heap_chunk_of(Heap *h, PVOID memory) {
     const ULONG_PTR first = (ULONG_PTR)s->base + s->header + 16, last = (ULONG_PTR)s->base + s->committed - 16;
     if (p < first || p >= last) continue;
     Chunk *c = (Chunk *)((BYTE *)memory - 16);
-    if (!(c->size_flags & CHUNK_USED) || CHUNK_SIZE(c) < MIN_CHUNK || (ULONG_PTR)c + CHUNK_SIZE(c) >= last + 16) return NULL;
+    if (!(c->size_flags & CHUNK_USED) || (c->size_flags & CHUNK_LFH_FREE) || CHUNK_SIZE(c) < MIN_CHUNK || (ULONG_PTR)c + CHUNK_SIZE(c) >= last + 16) return NULL;
     return c;
   }
   return NULL;
@@ -335,10 +421,16 @@ static BOOLEAN heap_free_locked(Heap *h, PVOID memory) {
   }
   Chunk *c = heap_chunk_of(h, memory);
   if (!c) return FALSE;
+  if (h->lfh_active && CHUNK_SIZE(c) <= LFH_MAX_CHUNK) { lfh_cache(h, c); return TRUE; }
+  chunk_release(h, c);
+  return TRUE;
+}
+/* A chunk in use becomes a free chunk, merged with the free chunks around it. */
+static void chunk_release(Heap *h, Chunk *c) {
   ULONGLONG size = CHUNK_SIZE(c);
   int prev_used = (c->size_flags & CHUNK_PREV_USED) != 0;
   Chunk *after = chunk_next(c);
-  if (h->flags & HF_NO_COALESCE) { make_free(h, c, size, prev_used); return TRUE; }
+  if (h->flags & HF_NO_COALESCE) { make_free(h, c, size, prev_used); return; }
   if (!(after->size_flags & CHUNK_USED)) {      /* merge with the free chunk after */
     size += CHUNK_SIZE(after);
     free_unlink(after);
@@ -351,7 +443,6 @@ static BOOLEAN heap_free_locked(Heap *h, PVOID memory) {
     c = before;
   }
   make_free(h, c, size, prev_used);
-  return TRUE;
 }
 
 /* How many bytes were asked for, or (SIZE_T)-1 if `memory` is not a block in use. */
@@ -421,22 +512,24 @@ static PVOID heap_realloc_locked(Heap *h, ULONG flags, PVOID memory, SIZE_T byte
         make_free(h, rest, rest_size, 1);
       }
       resized = 1;
-    } else if (flags & HEAP_FLAG_REALLOC_IN_PLACE) {
-      /* A big block may grow into the free chunk after it (a small one is never grown in place: it would be a low-fragmentation block on Windows). */
+    } else if ((flags & HEAP_FLAG_REALLOC_IN_PLACE) || (size >= 0x4000 && small_enough)) {
+      /* A big block grows into the free chunk after it when it can (a small one is never grown in place: it would be a low-fragmentation block on Windows); only a call
+       * that asks for it in place fails when it cannot, the others move the block. */
+      do {
       Chunk *after = chunk_next(c);
-      if (size < 0x4000 || !small_enough) return NULL;
+      if (size < 0x4000 || !small_enough) break;
       if (size + ((after->size_flags & CHUNK_USED) ? 0 : CHUNK_SIZE(after)) < need) {      /* at the end of a region, which can commit more */
         Chunk *end = (after->size_flags & CHUNK_USED) ? after : chunk_next(after);
-        if (CHUNK_SIZE(end) != 0) return NULL;
+        if (CHUNK_SIZE(end) != 0) break;
         for (Subheap *s = h->subheaps; s; s = s->next) {
           if ((BYTE *)c < s->base || (BYTE *)c >= s->base + s->committed) continue;
           const ULONGLONG got = size + ((after->size_flags & CHUNK_USED) ? 0 : CHUNK_SIZE(after));
-          if (!region_extend(h, s, (SIZE_T)(need - got + 16))) return NULL;
+          if (!region_extend(h, s, (SIZE_T)(need - got + 16))) break;
           break;
         }
         after = chunk_next(c);
       }
-      if ((after->size_flags & CHUNK_USED) || size + CHUNK_SIZE(after) < need) return NULL;
+      if ((after->size_flags & CHUNK_USED) || size + CHUNK_SIZE(after) < need) break;
       const ULONGLONG total = size + CHUNK_SIZE(after);
       free_unlink(after);
       if (total - need >= MIN_CHUNK) {
@@ -447,6 +540,8 @@ static PVOID heap_realloc_locked(Heap *h, ULONG flags, PVOID memory, SIZE_T byte
         chunk_next(c)->size_flags |= CHUNK_PREV_USED;
       }
       resized = 1;
+      } while (0);
+      if (!resized && (flags & HEAP_FLAG_REALLOC_IN_PLACE)) return NULL;
     }
     if (resized) {
       chunk_set_asked(h, c, bytes);
@@ -490,6 +585,7 @@ EXPORT PVOID NTAPI RtlAllocateHeap(PVOID heap, ULONG flags, SIZE_T bytes) {
   Heap *h = heap;
   if (!heap_ok(h)) { heap_error(6); return NULL; }
   void *held = heap_lock_for(h, flags, bytes < 0x4000);
+  if (h->compat == 2 && !h->lfh_active && h->allocations >= 0x11 && lfh_allowed(h)) h->lfh_active = 1;      /* (the pattern low fragmentation waits for: the 18th allocation) */
   PVOID r = heap_alloc_locked(h, flags, bytes);
   if (r && ++h->allocations >= 0x12 && h->compat == 0 && !(h->flags & HEAP_FLAG_NO_SERIALIZE) && !heap_is_fixed(h)) h->compat = 2;
   heap_unlock_for(h, held);
@@ -740,7 +836,9 @@ EXPORT NTSTATUS NTAPI RtlWalkHeap(PVOID heap, PVOID entry) {
         else c = chunk_next((Chunk *)((BYTE *)at - 16 - ((flags & 1) ? 0 : 16)));
         if (c && CHUNK_SIZE(c) == 0) { stage = 1; c = NULL; }      /* (the sentinel: what follows is the uncommitted part) */
         if (c) {
-          if (c->size_flags & CHUNK_USED) {
+          if (c->size_flags & CHUNK_LFH_FREE) {      /* a free slot of the low-fragmentation heap */
+            out.lpData = (BYTE *)c + 32; out.cbData = CHUNK_SIZE(c) - 16; out.cbOverhead = 16; out.wFlags = 0;
+          } else if (c->size_flags & CHUNK_USED) {
             const ULONGLONG asked = chunk_asked(h, c);
             const int lfh = h->compat == 2 && asked < 0x4000;
             out.lpData = (BYTE *)c + 16; out.cbData = asked; out.cbOverhead = lfh ? 8 : (BYTE)(CHUNK_SIZE(c) - asked); out.wFlags = lfh ? 0x8001 : WALK_BUSY;
