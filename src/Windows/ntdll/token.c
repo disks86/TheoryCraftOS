@@ -919,27 +919,38 @@ static NTSTATUS default_descriptor(HANDLE handle, BYTE **out, ULONG *length)
     PSECURITY_DESCRIPTOR sd = NULL;
     NTSTATUS status;
     mapping_for_handle(handle, &mapping);
-    if (mapping.GenericAll == 0x1fffff && mapping.GenericRead == 0x20410) {      /* a process: its administrators, the system, and (to be inherited by what it makes) the group of its user may read */
-        BYTE absolute_buffer[SECURITY_DESCRIPTOR_MIN_LENGTH], acl_buffer[256];
-        BYTE admin[16] = {1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0}, system_sid[12] = {1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0};
-        ACL *acl = (ACL *)acl_buffer;
-        HANDLE token;
-        TokenData *t = heap_new(sizeof(*t));
-        BYTE *pgroup_sid = NULL;
-        if (t && !token_of_caller(&token)) {
-            if (!read_token(token, TOKEN_QUERY, t) && t->has_pgroup) pgroup_sid = t->pgroup;
-            NtClose(token);
-        }
-        RtlCreateAcl(acl, sizeof(acl_buffer), ACL_REVISION);
-        RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x1fffff, admin);
-        RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x1fffff, system_sid);
-        if (pgroup_sid) RtlAddAccessAllowedAceEx(acl, ACL_REVISION, CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE, GENERIC_READ, pgroup_sid);
-        RtlCreateSecurityDescriptor(absolute_buffer, 1);
-        RtlSetDaclSecurityDescriptor(absolute_buffer, TRUE, acl, FALSE);
-        status = RtlNewSecurityObjectEx(NULL, absolute_buffer, &sd, NULL, FALSE, 0, NULL, &mapping);
-        heap_drop(t);
-    } else
-    status = RtlNewSecurityObjectEx(NULL, NULL, &sd, NULL, FALSE, 0, NULL, &mapping);
+    {
+        BOOL process = mapping.GenericAll == 0x1fffff && mapping.GenericRead == 0x20410, thread = mapping.GenericAll == 0x1fffff && mapping.GenericRead == 0x20048, token_object = mapping.GenericAll == 0xf01ff;
+        if (process || thread || token_object) {      /* a process, a thread or a token: it carries the integrity of its maker as a mandatory label; a process is open to its administrators and the system */
+            BYTE absolute_buffer[SECURITY_DESCRIPTOR_MIN_LENGTH], acl_buffer[256], sacl_buffer[128];
+            BYTE admin[16] = {1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0}, system_sid[12] = {1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0};
+            ACL *acl = (ACL *)acl_buffer, *sacl = (ACL *)sacl_buffer;
+            HANDLE token;
+            TokenData *t = heap_new(sizeof(*t));
+            BYTE *pgroup_sid = NULL;
+            const TSid *integrity = NULL;
+            if (t && !token_of_caller(&token)) {
+                if (!read_token(token, TOKEN_QUERY, t)) { if (t->has_pgroup) pgroup_sid = t->pgroup; integrity = integrity_group(t); }
+                NtClose(token);
+            }
+            RtlCreateSecurityDescriptor(absolute_buffer, 1);
+            if (process) {
+                RtlCreateAcl(acl, sizeof(acl_buffer), ACL_REVISION);
+                RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x1fffff, admin);
+                RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x1fffff, system_sid);
+                if (pgroup_sid) RtlAddAccessAllowedAceEx(acl, ACL_REVISION, CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE, GENERIC_READ, pgroup_sid);
+                RtlSetDaclSecurityDescriptor(absolute_buffer, TRUE, acl, FALSE);
+            }
+            if (integrity) {
+                RtlCreateAcl(sacl, sizeof(sacl_buffer), ACL_REVISION_DS);
+                RtlAddMandatoryAce(sacl, ACL_REVISION_DS, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, SYSTEM_MANDATORY_LABEL_ACE_TYPE, (PSID)integrity->sid);
+                RtlSetSaclSecurityDescriptor(absolute_buffer, TRUE, sacl, FALSE);
+            }
+            status = RtlNewSecurityObjectEx(NULL, absolute_buffer, &sd, NULL, FALSE, 0, NULL, &mapping);
+            heap_drop(t);
+        } else
+        status = RtlNewSecurityObjectEx(NULL, NULL, &sd, NULL, FALSE, 0, NULL, &mapping);
+    }
     if (status) return status;
     *length = RtlLengthSecurityDescriptor(sd);
     *out = sd;
@@ -1002,9 +1013,28 @@ static ULONG filter_descriptor(const BYTE *rel, SECURITY_INFORMATION info, BYTE 
         control |= s->Control & (SE_SACL_PRESENT | SE_SACL_DEFAULTED | SE_SACL_PROTECTED | SE_SACL_AUTO_INHERITED | SE_SACL_AUTO_INHERIT_REQ);
         if ((s->Control & SE_SACL_PRESENT) && s->Sacl) { n = ((ACL *)(rel + s->Sacl))->AclSize; if (at + n > capacity) return 0; memcpy(out + at, rel + s->Sacl, n); o->Sacl = at; at += n; }
     }
-    if (info & LABEL_SECURITY_INFORMATION) {      /* the mandatory label lives in the SACL */
-        control |= s->Control & (SE_SACL_PRESENT | SE_SACL_PROTECTED | SE_SACL_AUTO_INHERITED);
-        if (!o->Sacl && (s->Control & SE_SACL_PRESENT) && s->Sacl) { n = ((ACL *)(rel + s->Sacl))->AclSize; if (at + n > capacity) return 0; memcpy(out + at, rel + s->Sacl, n); o->Sacl = at; at += n; }
+    if ((info & LABEL_SECURITY_INFORMATION) && !(info & SACL_SECURITY_INFORMATION) && (s->Control & SE_SACL_PRESENT) && s->Sacl) {      /* the mandatory label lives in the SACL: an ACL of it alone */
+        ACL *acl = (ACL *)(out + at);
+        DWORD kept = 0, count = 0, i;
+        if (at + sizeof(ACL) > capacity) return 0;
+        memset(acl, 0, sizeof(ACL));
+        acl->AclRevision = ACL_REVISION_DS;
+        if ((s->Control & SE_SACL_PRESENT) && s->Sacl) {
+            const ACL *source = (const ACL *)(rel + s->Sacl);
+            const ACE_HEADER *ace = (const ACE_HEADER *)(source + 1);
+            for (i = 0; i < source->AceCount; ++i, ace = (const ACE_HEADER *)((const BYTE *)ace + ace->AceSize))
+                if (ace->AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE) {
+                    if (at + sizeof(ACL) + kept + ace->AceSize > capacity) return 0;
+                    memcpy((BYTE *)(acl + 1) + kept, ace, ace->AceSize);
+                    kept += ace->AceSize;
+                    count++;
+                }
+        }
+        acl->AceCount = (WORD)count;
+        acl->AclSize = (WORD)(sizeof(ACL) + kept);
+        o->Sacl = at;
+        at += acl->AclSize;
+        control |= SE_SACL_PRESENT | (s->Control & (SE_SACL_PROTECTED | SE_SACL_AUTO_INHERITED));
     }
     o->Control = control;
     return at;
@@ -1088,11 +1118,31 @@ static NTSTATUS merge_descriptor(const BYTE *object, ULONG object_length, SECURI
         else control |= old->Control & SE_DACL_PROTECTED;
         if (from_new && (info & (PROTECTED_DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION)) && !(info & DACL_SECURITY_INFORMATION)) {}
     }
-    {
-        BOOL from_new = (info & (SACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)) != 0;
+    if ((info & LABEL_SECURITY_INFORMATION) && !(info & SACL_SECURITY_INFORMATION)) {      /* only the mandatory label changes: the other ACEs of the SACL stay */
+        ACL *acl = (ACL *)(buf + at);
+        DWORD kept = 0, count = 0, i;
+        const ACL *lists[2] = { (old->Control & SE_SACL_PRESENT) && old->Sacl ? (const ACL *)(object + old->Sacl) : NULL, (m->Control & SE_SACL_PRESENT) && m->Sacl ? (const ACL *)(mod_rel + m->Sacl) : NULL };
+        int which;
+        memset(acl, 0, sizeof(ACL));
+        acl->AclRevision = ACL_REVISION_DS;
+        for (which = 0; which < 2; ++which) {
+            const ACL *source = lists[which];
+            const ACE_HEADER *ace;
+            if (!source) continue;
+            ace = (const ACE_HEADER *)(source + 1);
+            for (i = 0; i < source->AceCount; ++i, ace = (const ACE_HEADER *)((const BYTE *)ace + ace->AceSize))
+                if ((ace->AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE) == (which == 1)) { memcpy((BYTE *)(acl + 1) + kept, ace, ace->AceSize); kept += ace->AceSize; count++; }
+        }
+        acl->AceCount = (WORD)count;
+        acl->AclSize = (WORD)(sizeof(ACL) + kept);
+        n->Sacl = at;
+        at += acl->AclSize;
+        control |= SE_SACL_PRESENT | (old->Control & (SE_SACL_PROTECTED | SE_SACL_AUTO_INHERITED));
+    } else {
+        BOOL from_new = (info & SACL_SECURITY_INFORMATION) != 0;
         const SECURITY_DESCRIPTOR_RELATIVE *src = from_new ? m : old;
         const BYTE *base = from_new ? mod_rel : object;
-        if (src->Sacl) { len = ((ACL *)(base + src->Sacl))->AclSize; memcpy(buf + at, base + src->Sacl, len); n->Sacl = at; at += len; }
+        if (src->Sacl && (src->Control & SE_SACL_PRESENT)) { len = ((ACL *)(base + src->Sacl))->AclSize; memcpy(buf + at, base + src->Sacl, len); n->Sacl = at; at += len; }
         control |= src->Control & (SE_SACL_PRESENT | SE_SACL_DEFAULTED | SE_SACL_AUTO_INHERITED | SE_SACL_AUTO_INHERIT_REQ);
         if (from_new) { if (m->Control & SE_SACL_PROTECTED || (info & PROTECTED_SACL_SECURITY_INFORMATION)) control |= SE_SACL_PROTECTED; if (info & UNPROTECTED_SACL_SECURITY_INFORMATION) control &= ~SE_SACL_PROTECTED; }
         else control |= old->Control & SE_SACL_PROTECTED;
