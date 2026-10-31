@@ -20,7 +20,8 @@ typedef struct {
   BOOL used;
   HANDLE handle;      /* NULL: the original buffer (the standard output handle) */
   COORD size, cursor;
-  WORD attr;
+  WORD attr, popup;      /* popup: 0 is the default one */
+  void *from;         /* the buffer that was shown before this one was made the one that is: it is shown again when this one is closed */
   SMALL_RECT window;
   CONSOLE_CURSOR_INFO_ cursor_info;
   DWORD out_mode;
@@ -35,6 +36,7 @@ typedef struct {
 static BOOL con_buffer_or_main(HANDLE h);
 static ScreenBuffer g_local_screens[CON_MAX_BUFFERS];
 static ScreenBuffer *g_active_screen;
+static BOOL con_buffer_alive(HANDLE h);
 static CRITICAL_SECTION g_con_lock;
 static volatile LONG g_con_ready;
 static PHANDLER_ROUTINE g_ctrl_handlers[32];
@@ -224,6 +226,7 @@ static int con_alias_kind(HANDLE h) {      /* 1: an input alias, 2: an output al
 }
 static HANDLE con_open_alias(BOOL input, BOOL inherit) {      /* another handle to the console input or output (descriptors 0 and 1 are them) */
   HANDLE copy = NULL;
+  if (!con_attached()) { set_error(ERROR_INVALID_HANDLE); return INVALID_HANDLE_VALUE; }
   const NTSTATUS made = NtDuplicateObject(NtCurrentProcess(), (HANDLE)(ULONG_PTR)(input ? 4 : 8), NtCurrentProcess(), &copy, 0, inherit ? 2 : 0, 2 /* DUPLICATE_SAME_ACCESS */);
   if (!NT_SUCCESS(made)) { fail_nt(made); return INVALID_HANDLE_VALUE; }
   con_alias_add(copy, input);
@@ -278,6 +281,17 @@ EXPORT BOOL WINAPI SetConsoleInputExeNameA(LPCSTR name) {
 static BOOL con_is_output_only(HANDLE h) { return h && ((h == GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 2); }
 static BOOL con_is_input(HANDLE h) { return h && ((h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 1); }
 static BOOL con_buffer_alive(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }
+/* The buffer that is shown (the lock is held): when the one that was is closed, the one before it is. */
+static ScreenBuffer *con_active(void) {
+  while (g_active_screen && g_active_screen != con_screen(0) && !con_buffer_alive(g_active_screen->handle)) {
+    ScreenBuffer *dead = g_active_screen;
+    ScreenBuffer *next = (ScreenBuffer *)dead->from;
+    RtlFreeHeap(heap(), 0, dead->cells);
+    memset(dead, 0, sizeof(*dead));
+    g_active_screen = next && next->used ? next : con_screen(0);
+  }
+  return g_active_screen ? g_active_screen : con_screen(0);
+}
 /* The screen buffer a handle writes to (the lock is held), or NULL. */
 static ScreenBuffer *con_buffer(HANDLE h) {
   for (int i = 1; i < CON_MAX_BUFFERS; ++i) {
@@ -288,6 +302,7 @@ static ScreenBuffer *con_buffer(HANDLE h) {
     }
   }
   if (!h || con_is_input(h) || !con_std_is_console(h)) return NULL;
+  if (con_alias_kind(h) == 2) return con_active();      /* (a handle opened as CONOUT$ is the buffer that is shown) */
   return con_main();
 }
 #define WITH_BUFFER(h, sb, failure) con_lock(); ScreenBuffer *sb = con_buffer(h); if (!sb) { con_unlock(); set_error(ERROR_INVALID_HANDLE); return failure; }
@@ -750,12 +765,14 @@ static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD rea
 /* ---- code pages of the console (shared by its processes) ------------------------------------------------------------------------------------------------- */
 
 static UINT con_get_cp(int output) {
+  if (!con_attached()) { set_error(ERROR_INVALID_HANDLE); return 0; }      /* (no console: no code page of it) */
   con_lock();
   const DWORD cp = g_host ? (output ? g_host->output_cp : g_host->input_cp) : g_detached_cp[output];
   con_unlock();
   return cp ? cp : CP_UTF8;
 }
 static BOOL con_set_cp(int output, UINT cp) {
+  if (!con_attached()) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   if (cp == 0 || cp >= 0x10000u || !IsValidCodePage(cp)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   con_lock();
   DWORD *where = g_host ? (output ? &g_host->output_cp : &g_host->input_cp) : &g_detached_cp[output];
@@ -1025,7 +1042,7 @@ EXPORT BOOL WINAPI WriteConsoleA(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD
   con_unlock();
   if (!ours) {
     const int type = device_type(h);
-    if (type < 0 || type == 7 /* FILE_DEVICE_DISK: a file is no console */) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+    if (type < 0 || (type != 0x50 && type != 0x11) /* a file or the null device is no console */) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
     return WriteFile(h, buffer, length, written, NULL);
   }
   WCHAR wide[1024];
@@ -1062,7 +1079,7 @@ EXPORT BOOL WINAPI GetConsoleScreenBufferInfoEx(HANDLE h, CONSOLE_SCREEN_BUFFER_
   WITH_BUFFER(h, sb, FALSE)
   static const DWORD colors[16] = {0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xC0C0C0, 0x808080, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF};
   info->dwSize = sb->size; info->dwCursorPosition = sb->cursor; info->wAttributes = sb->attr; info->srWindow = sb->window;
-  info->dwMaximumWindowSize = sb->size; info->wPopupAttributes = 0xF5; info->bFullscreenSupported = FALSE;
+  info->dwMaximumWindowSize = sb->size; info->wPopupAttributes = sb->popup ? sb->popup : 0xF5; info->bFullscreenSupported = FALSE;
   for (int i = 0; i < 16; ++i) info->ColorTable[i] = colors[i];
   con_unlock();
   return TRUE;
@@ -1074,6 +1091,7 @@ EXPORT BOOL WINAPI SetConsoleScreenBufferInfoEx(HANDLE h, CONSOLE_SCREEN_BUFFER_
   if (info->dwSize.X != sb->size.X || info->dwSize.Y != sb->size.Y) ok = con_alloc_cells(sb, info->dwSize);
   if (ok) {
     sb->attr = info->wAttributes;
+    sb->popup = info->wPopupAttributes;
     sb->window = info->srWindow;
     sb->cursor = info->dwCursorPosition;
     if (sb->cursor.X >= sb->size.X) sb->cursor.X = (SHORT)(sb->size.X - 1);
@@ -1195,7 +1213,7 @@ EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECU
     }
     if (handle) {
       memset(sb, 0, sizeof(*sb));
-      sb->used = TRUE; sb->handle = handle; sb->attr = CON_DEFAULT_ATTR; sb->out_mode = main->out_mode;
+      sb->used = TRUE; sb->handle = handle; sb->attr = sb->popup = g_active_screen ? g_active_screen->attr : main->attr; sb->out_mode = main->out_mode;      /* (a new buffer takes the colours in use) */
       sb->cursor_info.size = 25; sb->cursor_info.visible = TRUE;
       if (!con_alloc_cells(sb, main->size)) { CloseHandle(handle); memset(sb, 0, sizeof(*sb)); handle = INVALID_HANDLE_VALUE; set_error(ERROR_NOT_ENOUGH_MEMORY); }
       else sb->window = main->window;
@@ -1206,6 +1224,7 @@ EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECU
 }
 EXPORT BOOL WINAPI SetConsoleActiveScreenBuffer(HANDLE h) {
   WITH_BUFFER(h, sb, FALSE)
+  if (sb != con_active()) sb->from = g_active_screen;
   g_active_screen = sb;
   con_unlock();
   return TRUE;
