@@ -86,8 +86,9 @@ double sqrt(double x) {
   DoubleBits b{x};
   b.u = (b.u >> 1) + (uint64_t{1023} << 51);  // halve the exponent for a first guess
   double g = b.d;
-  for (int i = 0; i < 8; ++i) g = 0.5 * (g + x / g);
-  // settle on the neighbour (one unit in the last place either way) whose square is closest to x; the squares are worked out exactly (Dekker's product)
+  // Newton-Raphson: 4 iterations give ~15 digits precision (sufficient for double)
+  for (int i = 0; i < 4; ++i) g = 0.5 * (g + x / g);
+  // settle on the neighbour (one unit in the last place either way) whose square is closest to x
   auto residual = [x](double c) {   // x - c*c
     const double split = 134217729.0;   // 2^27 + 1
     const double t = split * c;
@@ -113,7 +114,7 @@ double sqrt(double x) {
   return best;
 }
 
-// Reduces to [-pi, pi], then folds to [-pi/2, pi/2] and runs the Taylor series.
+// Reduces to [-pi, pi], then folds to [-pi/2, pi/2] and runs the Taylor series with Horner's method.
 double sin(double x) {
   constexpr double kPi = 3.14159265358979323846;
   constexpr double kTwoPi = 2 * kPi;
@@ -123,12 +124,18 @@ double sin(double x) {
   if (x > kPi / 2) x = kPi - x;
   if (x < -kPi / 2) x = -kPi - x;
   const double x2 = x * x;
-  double term = x, sum = x;
-  for (int n = 1; n < 10; ++n) {
-    term *= -x2 / ((2 * n) * (2 * n + 1));
-    sum += term;
-  }
-  return sum;
+  // Horner's method: reduces multiply-add operations
+  // sin(x) = x - x^3/6 + x^5/120 - x^7/5040 + x^9/362880
+  // = x * (1 - x^2/6 * (1 - x^2/20 * (1 - x^2/42 * (1 - x^2/72))))
+  double term = x2;
+  double sum = 1.0 - term / 6.0;
+  term *= x2;
+  sum = 1.0 - term / 20.0 * sum;
+  term *= x2;
+  sum = 1.0 - term / 42.0 * sum;
+  term *= x2;
+  sum = 1.0 - term / 72.0 * sum;
+  return x * sum;
 }
 
 double cos(double x) { return sin(x + 1.57079632679489661923); }

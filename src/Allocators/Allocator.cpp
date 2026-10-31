@@ -135,26 +135,34 @@ void Allocator::deallocate(void* ptr) {
 
   h->magic = Header::kFree;
   Header** list = list_for(h);
-  Header* prev = nullptr;
+  
+  // Fast path: check if we can merge forward (next block is free and contiguous)
+  auto end_of = [](Header* x) {
+    return reinterpret_cast<uint8_t*>(x) + x->blocks * kBlock;
+  };
+  
+  if (h->next && end_of(h) == reinterpret_cast<uint8_t*>(h->next)) {
+    h->blocks += h->next->blocks;
+    h->next = h->next->next;
+    h->next->magic = 0;  // Mark merged block as invalid
+  }
+  
+  // Find insertion point and check back merge
   Header* cur = *list;
+  if (cur && end_of(cur) == reinterpret_cast<uint8_t*>(h)) {
+    // Merge backward (previous block in list is contiguous)
+    cur->blocks += h->blocks;
+    cur->next = h->next;
+    h->magic = 0;
+    return;
+  }
+  
+  // Insert in sorted order
+  Header* prev = nullptr;
   while (cur && cur < h) { prev = cur; cur = cur->next; }
 
   h->next = cur;
   if (prev) prev->next = h; else *list = h;
-
-  auto end_of = [](Header* x) {
-    return reinterpret_cast<uint8_t*>(x) + x->blocks * kBlock;
-  };
-  if (cur && end_of(h) == reinterpret_cast<uint8_t*>(cur)) {  // merge forward
-    h->blocks += cur->blocks;
-    h->next = cur->next;
-    cur->magic = 0;
-  }
-  if (prev && end_of(prev) == reinterpret_cast<uint8_t*>(h)) {  // merge back
-    prev->blocks += h->blocks;
-    prev->next = h->next;
-    h->magic = 0;
-  }
 }
 
 uint64_t Allocator::free_bytes_of(const Header* list) {
