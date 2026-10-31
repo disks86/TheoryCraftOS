@@ -1156,6 +1156,22 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
       size = 56;
       break;
     }
+    case 1: {    // OBJECT_NAME_INFORMATION: a UNICODE_STRING and its characters; the name an object was made with, in the directory of the session
+      ObjectManager* objects = system_objects();
+      char text[ObjectManager::kNameBytes];
+      const uint32_t chars = is_object_kind(p.files().kind(slot)) && objects ? objects->object_name(uint32_t(p.files().token(slot)), text, sizeof(text)) : 0;
+      static const char kPrefix[] = "\\BaseNamedObjects\\";
+      const uint32_t prefix = chars ? sizeof(kPrefix) - 1 : 0, bytes = 2 * (prefix + chars), need = 16 + bytes + 2;
+      if (returned != 0 && !p.write_user_u32(returned, need)) return kAccessViolation;
+      if (length < need) return 0xC0000004u;
+      uint8_t full[16 + 2 * (sizeof(kPrefix) + ObjectManager::kNameBytes)] = {};
+      full[0] = uint8_t(bytes); full[1] = uint8_t(bytes >> 8); full[2] = uint8_t(bytes + 2); full[3] = uint8_t((bytes + 2) >> 8);
+      const uint64_t text_at = r.args[2] + 16;
+      for (uint32_t i = 0; i < 8; ++i) full[8 + i] = uint8_t(text_at >> (8 * i));
+      for (uint32_t i = 0; i < prefix; ++i) full[16 + 2 * i] = uint8_t(kPrefix[i]);
+      for (uint32_t i = 0; i < chars; ++i) full[16 + 2 * (prefix + i)] = uint8_t(text[i]);
+      return p.write_user(r.args[2], ConstByteView(full, need)) ? kSuccess : kAccessViolation;
+    }
     case 2: {    // OBJECT_TYPE_INFORMATION (the name only: a UNICODE_STRING and its characters)
       const char* type = "File";
       switch (p.files().kind(slot)) {

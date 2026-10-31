@@ -678,11 +678,19 @@ EXPORT HRESULT WINAPI CreatePseudoConsole(COORD size, HANDLE input, HANDLE outpu
   if (GetFileType(input) == FILE_TYPE_UNKNOWN || GetFileType(output) == FILE_TYPE_UNKNOWN) return (HRESULT)0x80070006;      /* E_HANDLE */
   HANDLE object = CreateEventW(NULL, TRUE, FALSE, NULL);
   if (!object) return (HRESULT)0x8007000E;      /* E_OUTOFMEMORY */
+  for (int i = 0; i < 8; ++i) if (!g_pseudo[i].object) { g_pseudo[i].object = object; g_pseudo[i].x = size.X < 0xFFF ? size.X : 0xFFF; g_pseudo[i].y = size.Y < 0xFFF ? size.Y : 0xFFF; break; }
   *console = object;
   return 0;
 }
-EXPORT HRESULT WINAPI ResizePseudoConsole(HANDLE console, COORD size) { (void)console; return size.X > 0 && size.Y > 0 ? 0 : (HRESULT)0x80070057; }
-EXPORT void WINAPI ClosePseudoConsole(HANDLE console) { CloseHandle(console); }
+EXPORT HRESULT WINAPI ResizePseudoConsole(HANDLE console, COORD size) {
+  if (size.X <= 0 || size.Y <= 0) return (HRESULT)0x80070057;
+  for (int i = 0; i < 8; ++i) if (g_pseudo[i].object == console) { g_pseudo[i].x = size.X < 0xFFF ? size.X : 0xFFF; g_pseudo[i].y = size.Y < 0xFFF ? size.Y : 0xFFF; }
+  return 0;
+}
+EXPORT void WINAPI ClosePseudoConsole(HANDLE console) {
+  for (int i = 0; i < 8; ++i) if (g_pseudo[i].object == console) g_pseudo[i].object = NULL;
+  CloseHandle(console);
+}
 
 /* GetProcessInformation: only the machine of the process (ProcessMachineTypeInfo) is answered. */
 EXPORT BOOL WINAPI GetProcessInformation(HANDLE process, int information_class, LPVOID information, DWORD size) {

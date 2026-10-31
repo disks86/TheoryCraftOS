@@ -65,10 +65,13 @@ EXPORT DWORD WINAPI GetTickCount(void);
 static BOOL console_write_hook(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD written, BOOL *handled);
 static BOOL console_read_hook(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read, BOOL *handled);
 static BOOL con_input_ready(void);
+static BOOL con_wait_polled(HANDLE h);
+static void con_sync_signals(void);
+static LONG con_unbound_kind(HANDLE h);
+static void con_handle_closed(HANDLE h);
 static BOOL con_is_input(HANDLE h);
 static void con_alias_add(HANDLE h, BOOL input);
 static void con_alias_forget(HANDLE h);
-static void con_screen_closed(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
@@ -1866,7 +1869,8 @@ static DWORD wait_result(NTSTATUS status) {
 EXPORT BOOL WINAPI SwitchToThread(void);
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable) {
   if ((ULONG_PTR)h >= 0xFFFFFFF4u && (ULONG_PTR)h <= 0xFFFFFFF6u) h = GetStdHandle((DWORD)(ULONG_PTR)h);      /* STD_INPUT_HANDLE and the others */
-  if (con_is_input(h)) {      /* the console input is ready when a key event is waiting: asked again until it is */
+  con_sync_signals();
+  if (con_wait_polled(h)) {      /* the console input is ready when a key event is waiting: asked again until it is */
     const DWORD start = GetTickCount();
     while (!con_input_ready()) {
       if (timeout_ms != INFINITE && GetTickCount() - start >= timeout_ms) return WAIT_TIMEOUT;
@@ -1884,11 +1888,12 @@ EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles,
   HANDLE mapped[64];      /* the STD_*_HANDLE numbers stand for the handles the process has for them */
   for (DWORD i = 0; i < count; ++i) mapped[i] = ((ULONG_PTR)handles[i] >= 0xFFFFFFF4u && (ULONG_PTR)handles[i] <= 0xFFFFFFF6u) ? GetStdHandle((DWORD)(ULONG_PTR)handles[i]) : handles[i];
   handles = mapped;
+  con_sync_signals();
   for (DWORD i = 0; i < count && !all; ++i) {
-    if (!con_is_input(handles[i])) continue;
+    if (!con_wait_polled(handles[i])) continue;
     HANDLE others[64];      /* a console input among the handles: the others are asked without waiting, in turns with it */
     DWORD index[64], n = 0;
-    for (DWORD k = 0; k < count; ++k) if (!con_is_input(handles[k])) { others[n] = handles[k]; index[n++] = k; }
+    for (DWORD k = 0; k < count; ++k) if (!con_wait_polled(handles[k])) { others[n] = handles[k]; index[n++] = k; }
     const DWORD start = GetTickCount();
     for (;;) {
       if (con_input_ready()) return WAIT_OBJECT_0 + i;
@@ -2336,6 +2341,12 @@ static const ProcThreadAttributeEntry *attribute_of(const ProcThreadAttributeLis
 }
 
 #define CON_ID_NO_WINDOW 0x1000000000000ull      /* in the number of a console: it has no window (CREATE_NO_WINDOW) */
+#define CON_ID_PSEUDO 0x2000000000000ull         /* it is a pseudo console: its size is in the bits above (12 bits each: width from bit 36, height from bit 50 up) */
+#define CON_ID_PSEUDO_X(id) ((int)(((id) >> 36) & 0xFFF))
+#define CON_ID_PSEUDO_Y(id) ((int)(((id) >> 50) & 0xFFF))
+
+/* The pseudo consoles that were made (CreatePseudoConsole): the object that stands for one and the size it has. */
+static struct { HANDLE object; SHORT x, y; } g_pseudo[8];
 
 /* Is the program a window program (IMAGE_SUBSYSTEM_WINDOWS_GUI)? Its header says; a file that cannot be read is taken for a console program. */
 static BOOL image_is_gui(LPCWSTR path) {
@@ -2364,6 +2375,15 @@ static HANDLE console_for_new_process(DWORD flags, BOOL gui, BOOL *fresh) {
   if (fresh) *fresh = TRUE;
   return (HANDLE)(ULONG_PTR)(0x100000000ull | (!new_console && (flags & 0x08000000) ? CON_ID_NO_WINDOW : 0) | ((ULONG_PTR)GetCurrentProcessId() << 8) |
                              (ULONG_PTR)(InterlockedIncrement(&counter) & 0xFF));
+}
+/* The console of a program started in a pseudo console: a new one of the size the pseudo console has. */
+static HANDLE console_for_pseudo(HANDLE pseudo) {
+  for (int i = 0; i < 8; ++i) {
+    if (g_pseudo[i].object != pseudo || !pseudo) continue;
+    ULONG_PTR id = (ULONG_PTR)console_for_new_process(0x10, FALSE, NULL);
+    return (HANDLE)(id | CON_ID_PSEUDO | ((ULONG_PTR)g_pseudo[i].x << 36) | ((ULONG_PTR)g_pseudo[i].y << 50));
+  }
+  return NULL;
 }
 EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes,
                                   BOOL inherit_handles, DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information) {
@@ -2447,7 +2467,11 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
       if (entry) { block.parent = *(HANDLE *)entry->value; nt_flags |= 0x40; }
       entry = attribute_of(attributes, 0x00020002);      /* HANDLE_LIST */
       if (entry) { block.inherit_list = entry->value; block.inherit_count = (ULONG)(entry->size / sizeof(HANDLE)); nt_flags |= 0x80; }
-      if (attribute_of(attributes, 0x00020016)) nt_flags |= 0x20;      /* PSEUDOCONSOLE */
+      entry = attribute_of(attributes, 0x00020016);      /* PSEUDOCONSOLE */
+      if (entry) {
+        nt_flags |= 0x20;
+        if (!(flags & 0x8) && !image_is_gui(image)) { HANDLE own = console_for_pseudo((HANDLE)entry->value); if (own) block.console = own; }
+      }
     }
   }
   const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
@@ -2541,7 +2565,7 @@ EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   overlapped_forget(h);
   con_alias_forget(h);
   const NTSTATUS status = NtClose(h);
-  if (NT_SUCCESS(status)) con_screen_closed(h);
+  if (NT_SUCCESS(status)) con_handle_closed(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI GetHandleInformation(HANDLE h, LPDWORD flags) {
@@ -2667,6 +2691,7 @@ EXPORT DWORD WINAPI GetFileType(HANDLE h) {
   if (type < 0) { set_error(ERROR_INVALID_HANDLE); return FILE_TYPE_UNKNOWN; }
   set_error(ERROR_SUCCESS);
   if (type == 0x0c) return FILE_TYPE_UNKNOWN;      /* a mailslot */
+  if (type != 0x50 && con_unbound_kind(h)) return FILE_TYPE_CHAR;      /* a handle of the console that is an event */
   return (type == 0x50 || type == 0x15) ? FILE_TYPE_CHAR : type == 0x11 ? FILE_TYPE_PIPE : FILE_TYPE_DISK;
 }
 
@@ -3555,6 +3580,11 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   }
   if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$") || equals_ignore_case(path, (const WCHAR *)L"CONIN$")) {      /* another handle to the console (descriptors 0 and 1 are it) */
     return con_open_alias(equals_ignore_case(path, (const WCHAR *)L"CONIN$"), sa && sa->bInheritHandle);
+  }
+  if (path[0] == '\\' && path[1] == '?' && path[2] == '?' && path[3] == '\\' &&
+      (equals_ignore_case(path + 4, (const WCHAR *)L"CONOUT$") || equals_ignore_case(path + 4, (const WCHAR *)L"CONIN$"))) {      /* the same by its NT name */
+    if (disposition == 0 || disposition > 5) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+    return con_open_alias(equals_ignore_case(path + 4, (const WCHAR *)L"CONIN$"), sa && sa->bInheritHandle);
   }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;

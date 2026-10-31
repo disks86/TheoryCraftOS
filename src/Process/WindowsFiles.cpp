@@ -194,6 +194,8 @@ uint32_t object_path(Process& p, uint64_t attributes, String* virtual_path) {
   PathResult result;
   if (root != 0) {
     uint64_t slot = 0;
+    if (handle_slot(root, &slot) && (files.kind(slot) == DescriptorKind::ConsoleInput || files.kind(slot) == DescriptorKind::ConsoleOutput || files.kind(slot) == DescriptorKind::ConsoleError))
+      return 0xC0000225u;      // STATUS_NOT_FOUND: nothing is below a console
     if (!handle_slot(root, &slot) || files.kind(slot) != DescriptorKind::Directory) return kInvalidHandle;
     result = files.resolve_from(files.object(slot)->path.view(), text.view(), virtual_path);
   } else {
@@ -677,6 +679,8 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     if (!p.write_user(r.args[2], ConstByteView(b, sizeof b))) return kAccessViolation;
     return store_io_status(p, r.args[1], kSuccess, sizeof b) ? kSuccess : kAccessViolation;
   }
+  if ((kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError) && static_cast<uint32_t>(info_class) == 5)
+    return kInvalidDeviceRequest;      // FileStandardInformation: a console has no size
   if (kind == DescriptorKind::Pipe && static_cast<uint32_t>(info_class) == kFileNameInformation) {      // "\\name": where a pipe is
     String pipe_name(files.allocator()), windows_name(files.allocator());
     if (!pipe_handle_name(p, slot, &pipe_name)) return kInvalidParameter;
@@ -1237,6 +1241,7 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   const bool console = kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError;
   uint8_t b[8] = {};
   put(ByteView(b, 8), 0, console ? 0x50 : (kind == DescriptorKind::Pipe ? 0x11 : kind == DescriptorKind::Null ? 0x15 : kind == DescriptorKind::Mailslot ? 0x0c : 7), 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_NAMED_PIPE / FILE_DEVICE_DISK
+  if (console) put(ByteView(b, 8), 4, 0x20000, 4);      // Characteristics: FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL
   if (!p.write_user(r.args[2], ConstByteView(b, 8))) return kAccessViolation;
   return store_io_status(p, r.args[1], kSuccess, 8) ? kSuccess : kAccessViolation;
 }

@@ -130,7 +130,7 @@ NT_SERVICE(NtQuerySystemTime);
 NT_SERVICE(NtAllocateVirtualMemory);
 NT_SERVICE(NtFreeVirtualMemory);
 NT_SERVICE(NtProtectVirtualMemory);
-NT_SERVICE(NtCreateFile);
+NT_SERVICE_RAW(NtCreateFile);
 NT_SERVICE(NtOpenFile);
 NT_SERVICE(NtQueryInformationFile);
 NT_SERVICE(NtSetInformationFile);
@@ -588,6 +588,86 @@ EXPORT NTSTATUS NTAPI NtWaitForSingleObject(HANDLE h, BOOLEAN alertable, PLARGE_
   const NTSTATUS status = RawNtWaitForSingleObject(h, alertable, timeout);
   if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
+}
+/* ---- console handles without a screen buffer ---------------------------------------------------------------------------------------------------------------- *
+ * "\Device\ConDrv\Input" and "\Output" (and CurrentIn, CurrentOut, "\??\CONIN$", "\??\CONOUT$") open a handle to the console of the process that is not bound to a screen buffer or to the
+ * standard handles. Here it is a named event (TcosConI_ or TcosConO_, the console, the process, a number): whoever owns the console sets it while the console has input waiting, and
+ * the name says what the handle is to any process it was duplicated into. kernel32.dll keeps the state; the handles made are listed here so that it finds them. */
+typedef struct { HANDLE handle; ULONG_PTR console; LONG kind; } ConEvent;      /* kind: 1 input, 2 output */
+#define CON_EVENTS 64
+static ConEvent g_con_events[CON_EVENTS];
+static volatile LONG g_con_event_lock, g_con_event_serial;
+static void con_event_lock(void) { while (__sync_lock_test_and_set(&g_con_event_lock, 1)) NtYieldExecution(); }
+static void con_event_unlock(void) { __sync_lock_release(&g_con_event_lock); }
+EXPORT void NTAPI RtlTcosConsoleEventNote(HANDLE h, ULONG_PTR console, LONG kind) {
+  con_event_lock();
+  int free_at = -1;
+  for (int i = 0; i < CON_EVENTS; ++i) {
+    if (g_con_events[i].handle == h) { free_at = i; break; }
+    if (!g_con_events[i].handle && free_at < 0) free_at = i;
+  }
+  if (free_at >= 0) { g_con_events[free_at].handle = h; g_con_events[free_at].console = console; g_con_events[free_at].kind = kind; }
+  con_event_unlock();
+}
+EXPORT void NTAPI RtlTcosConsoleEventForget(HANDLE h) {
+  con_event_lock();
+  for (int i = 0; i < CON_EVENTS; ++i) if (g_con_events[i].handle == h) g_con_events[i].handle = NULL;
+  con_event_unlock();
+}
+EXPORT int NTAPI RtlTcosConsoleEvents(ConEvent *out, int max) {
+  int n = 0;
+  con_event_lock();
+  for (int i = 0; i < CON_EVENTS && (!out || n < max); ++i) if (g_con_events[i].handle) { if (out) out[n] = g_con_events[i]; ++n; }      /* (no buffer: only how many) */
+  con_event_unlock();
+  return n;
+}
+static BOOL console_device_name(const UNICODE_STRING *name, LONG *kind) {
+  static const WCHAR *const names[] = {L"\\Device\\ConDrv\\Input", L"\\Device\\ConDrv\\CurrentIn", L"\\??\\CONIN$", L"\\Device\\ConDrv\\Output", L"\\Device\\ConDrv\\CurrentOut", L"\\??\\CONOUT$"};
+  if (!name || !name->Buffer) return FALSE;
+  for (int i = 0; i < 6; ++i) {
+    const WCHAR *t = names[i];
+    ULONG k = 0;
+    for (; t[k] && k < name->Length / 2; ++k) {
+      WCHAR a = name->Buffer[k], b = t[k];
+      if (a >= 'a' && a <= 'z') a = (WCHAR)(a - 32);
+      if (b >= 'a' && b <= 'z') b = (WCHAR)(b - 32);
+      if (a != b) break;
+    }
+    if (!t[k] && k == name->Length / 2) { *kind = i < 3 ? 1 : 2; return TRUE; }
+  }
+  return FALSE;
+}
+extern NTSTATUS NTAPI RawNtCreateFile(PHANDLE, ULONG, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+EXPORT NTSTATUS NTAPI NtCreateFile(PHANDLE handle, ULONG access, POBJECT_ATTRIBUTES attributes, PIO_STATUS_BLOCK iosb, PLARGE_INTEGER size, ULONG file_attributes, ULONG share, ULONG disposition,
+                                   ULONG options, PVOID ea, ULONG ea_length) {
+  LONG kind;
+  if (attributes && attributes->Length >= sizeof(OBJECT_ATTRIBUTES) && !attributes->RootDirectory && handle && iosb && console_device_name(attributes->ObjectName, &kind)) {
+    const ULONG_PTR console = (ULONG_PTR)NtCurrentPeb()->ProcessParameters->ConsoleHandle;
+    if (!console) return STATUS_INVALID_HANDLE;      /* (there is nothing to open without a console) */
+    static const WCHAR hex[] = L"0123456789abcdef";
+    WCHAR text[96] = L"\\BaseNamedObjects\\TcosConX_";
+    int n = 0;
+    while (text[n]) ++n;
+    text[n - 2] = kind == 1 ? 'I' : 'O';
+    for (int shift = 60; shift >= 0; shift -= 4) text[n++] = hex[(console >> shift) & 15];
+    text[n++] = '_';
+    const ULONG_PTR pid = TEB_CLIENT_PROCESS(NtCurrentTeb()), serial = (ULONG_PTR)__sync_add_and_fetch(&g_con_event_serial, 1);
+    for (int shift = 28; shift >= 0; shift -= 4) text[n++] = hex[(pid >> shift) & 15];
+    text[n++] = '_';
+    for (int shift = 12; shift >= 0; shift -= 4) text[n++] = hex[(serial >> shift) & 15];
+    text[n] = 0;
+    UNICODE_STRING name = { (USHORT)(n * 2), (USHORT)(n * 2 + 2), text };
+    OBJECT_ATTRIBUTES oa = { sizeof(oa), NULL, &name, (attributes->Attributes & 2) | 0x40, NULL, NULL };
+    HANDLE event = NULL;
+    const NTSTATUS made = NtCreateEvent(&event, 0x1F0003, &oa, 0 /* NotificationEvent */, FALSE);
+    if (!NT_SUCCESS(made)) return made;
+    RtlTcosConsoleEventNote(event, console, kind);
+    *handle = event;
+    iosb->Status = STATUS_SUCCESS;
+    iosb->Information = 1;      /* FILE_OPENED */
+    return STATUS_SUCCESS;
+  }
+  return RawNtCreateFile(handle, access, attributes, iosb, size, file_attributes, share, disposition, options, ea, ea_length);
 }
 EXPORT NTSTATUS NTAPI NtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtWaitForMultipleObjects(count, handles, type, alertable, timeout);
