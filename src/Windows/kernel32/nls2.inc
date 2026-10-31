@@ -292,8 +292,6 @@ EXPORT BOOL WINAPI IsNLSDefinedString(DWORD function, DWORD flags, NLSVERSIONINF
 #define GEOCLASS_REGION_ 14
 #define GEOID_WORLD 39070u
 #define GEOID_NETHERLANDS_ANTILLES 333u
-static DWORD g_user_nation = 244, g_user_region = GEOID_WORLD;
-static WCHAR g_user_geo_name[8] = {'U', 'S', 0};
 static int geo_find(DWORD geoid) {
   for (int i = 0; i < NLS_GEO_COUNT; ++i) if (k_geo_nations[i].geoid == geoid) return i;
   return -1;
@@ -416,25 +414,94 @@ EXPORT BOOL WINAPI EnumSystemGeoID(DWORD geo_class, DWORD parent, GEO_ENUMPROC_ 
   }
   return TRUE;
 }
+/* The user's place is kept in HKCU\Control Panel\International\Geo: Nation and Region (decimal strings) and Name (the ISO 3166 or UN M.49 name). */
+IMPORT NTSTATUS NTAPI RtlOpenCurrentUser(ULONG access, PHANDLE key);
+IMPORT NTSTATUS NTAPI NtSetValueKey(HANDLE key, PUNICODE_STRING name, ULONG title, ULONG type, PVOID data, ULONG size);
+static HANDLE geo_open_key(ULONG access) {
+  HANDLE root = NULL, key = NULL;
+  if (!NT_SUCCESS(RtlOpenCurrentUser(access, &root))) return NULL;
+  UNICODE_STRING path;
+  RtlInitUnicodeString(&path, L"Control Panel\\International\\Geo");
+  OBJECT_ATTRIBUTES attributes = {sizeof(attributes), root, &path, 0x40, NULL, NULL};
+  if (!NT_SUCCESS(NtOpenKey(&key, access, &attributes))) key = NULL;
+  NtClose(root);
+  return key;
+}
+static BOOL geo_read_value(const WCHAR *name, WCHAR *out, ULONG capacity) {
+  HANDLE key = geo_open_key(0x20019);
+  if (!key) return FALSE;
+  UNICODE_STRING value;
+  RtlInitUnicodeString(&value, name);
+  BYTE buffer[16 + 80] __attribute__((aligned(8)));
+  ULONG length = 0;
+  BOOL found = NT_SUCCESS(NtQueryValueKey(key, &value, 2 /* KeyValuePartialInformation */, buffer, sizeof(buffer), &length)) && length >= 12;
+  NtClose(key);
+  if (!found) return FALSE;
+  const AE_PARTIAL_VALUE *info = (const AE_PARTIAL_VALUE *)buffer;
+  if (info->Type != 1 /* REG_SZ */) return FALSE;
+  ULONG n = info->DataLength / 2;
+  if (n > (length - 12) / 2) n = (length - 12) / 2;
+  if (n >= capacity) n = capacity - 1;
+  memcpy(out, info->Data, n * 2);
+  out[n] = 0;
+  return TRUE;
+}
+static void geo_write_value(const WCHAR *name, const WCHAR *text) {
+  HANDLE key = geo_open_key(0x20006);
+  if (!key) return;
+  UNICODE_STRING value;
+  RtlInitUnicodeString(&value, name);
+  NtSetValueKey(key, &value, 0, 1 /* REG_SZ */, (PVOID)text, (ULONG)(wcslen(text) + 1) * 2);
+  NtClose(key);
+}
+static void geo_write_id(const WCHAR *name, DWORD geoid) {
+  WCHAR digits[12];
+  int n = 0;
+  char reversed[12];
+  do { reversed[n++] = (char)('0' + geoid % 10); geoid /= 10; } while (geoid && n < 11);
+  for (int i = 0; i < n; ++i) digits[i] = (WCHAR)(BYTE)reversed[n - 1 - i];
+  digits[n] = 0;
+  geo_write_value(name, digits);
+}
+static DWORD geo_read_id(const WCHAR *name) {
+  WCHAR text[24];
+  if (!geo_read_value(name, text, 24)) return GEOID_WORLD;
+  DWORD id = 0;
+  for (const WCHAR *c = text; *c >= '0' && *c <= '9'; ++c) id = id * 10 + (DWORD)(*c - '0');
+  return id;
+}
+/* The UN M.49 regions SetUserGeoName knows by name. */
+static const struct { const char *name; DWORD geoid; } k_geo_regions[] = {{"001", GEOID_WORLD}, {"011", 42483}, {"039", 47610}, {"150", 61642}, {"151", 47609}};
 EXPORT DWORD WINAPI GetUserGeoID(DWORD geo_class) {
-  if (geo_class == GEOCLASS_NATION_) return g_user_nation;
-  if (geo_class == GEOCLASS_REGION_) return g_user_region;
+  if (geo_class == GEOCLASS_NATION_) return geo_read_id(L"Nation");
+  if (geo_class == GEOCLASS_REGION_) return geo_read_id(L"Region");
   return 0xFFFFFFFFu;
 }
 EXPORT BOOL WINAPI SetUserGeoID(DWORD geoid) {
-  if (geo_find(geoid) < 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
-  g_user_nation = geoid;
   const int i = geo_find(geoid);
-  g_user_geo_name[0] = (WCHAR)(BYTE)k_geo_nations[i].iso2[0];
-  g_user_geo_name[1] = (WCHAR)(BYTE)k_geo_nations[i].iso2[1];
-  g_user_geo_name[2] = 0;
-  return TRUE;
+  if (i >= 0) {      /* a nation: its id and its name */
+    WCHAR iso[3] = {(WCHAR)(BYTE)k_geo_nations[i].iso2[0], (WCHAR)(BYTE)k_geo_nations[i].iso2[1], 0};
+    geo_write_id(L"Nation", geoid);
+    geo_write_value(L"Name", iso);
+    return TRUE;
+  }
+  for (unsigned r = 0; r < sizeof(k_geo_regions) / sizeof(k_geo_regions[0]); ++r) if (k_geo_regions[r].geoid == geoid) { geo_write_id(L"Region", geoid); return TRUE; }
+  if (geoid == GEOID_NETHERLANDS_ANTILLES) { geo_write_id(L"Nation", geoid); return TRUE; }      /* (a nation that is gone: it has no name) */
+  set_error(ERROR_INVALID_PARAMETER);
+  return FALSE;
 }
 EXPORT int WINAPI GetUserDefaultGeoName(LPWSTR name, int capacity) {
-  const int n = (int)wcslen(g_user_geo_name) + 1;
-  if (capacity < 0 || (capacity > 0 && !name) || (capacity > 0 && capacity < n)) { set_error(capacity > 0 ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_PARAMETER); return 0; }
-  if (capacity == 0) { if (name) { set_error(ERROR_INVALID_PARAMETER); return 0; } return n; }
-  memcpy(name, g_user_geo_name, (SIZE_T)n * 2);
+  if (capacity < 0 || (capacity > 0 && !name)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  WCHAR text[24];
+  if (!geo_read_value(L"Name", text, 24) || !text[0]) {      /* no name: the one of the nation */
+    const int i = geo_find(GetUserGeoID(GEOCLASS_NATION_));
+    if (i >= 0) { text[0] = (WCHAR)(BYTE)k_geo_nations[i].iso2[0]; text[1] = (WCHAR)(BYTE)k_geo_nations[i].iso2[1]; text[2] = 0; }
+    else { text[0] = '0'; text[1] = '0'; text[2] = '1'; text[3] = 0; }
+  }
+  const int n = (int)wcslen(text) + 1;
+  if (capacity == 0) return n;
+  if (capacity < n) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+  memcpy(name, text, (SIZE_T)n * 2);
   return n;
 }
 EXPORT BOOL WINAPI SetUserGeoName(LPWSTR name) {
@@ -442,19 +509,11 @@ EXPORT BOOL WINAPI SetUserGeoName(LPWSTR name) {
   const SIZE_T length = wcslen(name);
   if (length == 2) {
     for (int i = 0; i < NLS_GEO_COUNT; ++i)
-      if (nls_lower(name[0]) == (WCHAR)(k_geo_nations[i].iso2[0] | 0x20) && nls_lower(name[1]) == (WCHAR)(k_geo_nations[i].iso2[1] | 0x20)) {
-        g_user_nation = k_geo_nations[i].geoid;
-        g_user_region = GEOID_WORLD;
-        g_user_geo_name[0] = (WCHAR)(BYTE)k_geo_nations[i].iso2[0];
-        g_user_geo_name[1] = (WCHAR)(BYTE)k_geo_nations[i].iso2[1];
-        g_user_geo_name[2] = 0;
-        return TRUE;
-      }
+      if (nls_lower(name[0]) == (WCHAR)(k_geo_nations[i].iso2[0] | 0x20) && nls_lower(name[1]) == (WCHAR)(k_geo_nations[i].iso2[1] | 0x20)) return SetUserGeoID(k_geo_nations[i].geoid);
     if (nls_lower(name[0]) == 'x' && nls_lower(name[1]) == 'x') return TRUE;
-  } else if (length == 3 && name[0] >= '0' && name[0] <= '9') {
-    memcpy(g_user_geo_name, name, 4 * 2);
-    g_user_region = GEOID_WORLD;
-    return TRUE;
+  } else if (length == 3) {
+    for (unsigned r = 0; r < sizeof(k_geo_regions) / sizeof(k_geo_regions[0]); ++r)
+      if (name[0] == (WCHAR)(BYTE)k_geo_regions[r].name[0] && name[1] == (WCHAR)(BYTE)k_geo_regions[r].name[1] && name[2] == (WCHAR)(BYTE)k_geo_regions[r].name[2]) return SetUserGeoID(k_geo_regions[r].geoid);
   }
   set_error(ERROR_INVALID_PARAMETER);
   return FALSE;

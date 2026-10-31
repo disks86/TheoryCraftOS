@@ -236,13 +236,36 @@ static int nls_time_format(int locale, DWORD flags, const SYSTEMTIME *time, LPCW
   return nls_deliver(&o, out, capacity);
 }
 
-/* The narrow forms convert the picture and the result (the code page is UTF-8). */
-static int nls_narrow_result(int n, const WCHAR *wide, LPSTR out, int capacity) {
+/* The narrow forms convert the picture and the result. The code page is the system's (UTF-8) for the locale of the system and for LOCALE_USE_CP_ACP; any other locale
+ * has its own ANSI code page (Japanese 932, Polish 1250, ...), as on Windows. */
+EXPORT int WINAPI GetLocaleInfoW(LCID locale, LCTYPE type, LPWSTR buffer, int capacity);
+static UINT nls_ansi_codepage(LCID locale, DWORD flags) {
+  const UINT acp = CP_UTF8;
+  if ((flags & 0x40000000u /* LOCALE_USE_CP_ACP */) || nls_locale_of(locale) == nls_default_kind()) return acp;
+  DWORD number = 0;
+  if (GetLocaleInfoW(locale, 0x1004 /* IDEFAULTANSICODEPAGE */ | 0x20000000 /* RETURN_NUMBER */, (LPWSTR)&number, 2) == 0 || number == 0) return acp;
+  return number;
+}
+static WCHAR *to_wide_cp(UINT cp, LPCSTR text) {
+  if (!text) return NULL;
+  const int n = MultiByteToWideChar(cp, 0, text, -1, NULL, 0);
+  if (n <= 0) return NULL;
+  WCHAR *w = RtlAllocateHeap(heap(), 0, (SIZE_T)n * 2);
+  if (!w) { set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+  MultiByteToWideChar(cp, 0, text, -1, w, n);
+  return w;
+}
+static int nls_narrow_result(UINT cp, int n, const WCHAR *wide, LPSTR out, int capacity) {
   if (n == 0) return 0;
-  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+  WCHAR plain[1300];
+  if (cp != CP_UTF8 && n < 1300) {      /* (the narrow no-break space of today's French is the no-break space to an ANSI code page, not the plain space of the best fit) */
+    for (int i = 0; i < n; ++i) plain[i] = wide[i] == 0x202F ? 0xA0 : wide[i];
+    wide = plain;
+  }
+  const int needed = WideCharToMultiByte(cp, 0, wide, -1, NULL, 0, NULL, NULL);
   if (capacity == 0) return needed;
   if (capacity < needed) { set_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-  return WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, capacity, NULL, NULL);
+  return WideCharToMultiByte(cp, 0, wide, -1, out, capacity, NULL, NULL);
 }
 
 EXPORT int WINAPI GetDateFormatW(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCWSTR format, LPWSTR out, int capacity) {
@@ -260,19 +283,21 @@ EXPORT int WINAPI GetTimeFormatEx(LPCWSTR name, DWORD flags, const SYSTEMTIME *t
 }
 EXPORT int WINAPI GetDateFormatA(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCSTR format, LPSTR out, int capacity) {
   if (capacity < 0 || (capacity > 0 && !out)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  WCHAR *f = format ? to_wide(format) : NULL, wide[NLS_PICTURE_MAX];
+  const UINT cp = nls_ansi_codepage(locale, flags);
+  WCHAR *f = format ? to_wide_cp(cp, format) : NULL, wide[NLS_PICTURE_MAX];
   if (format && !f) return 0;
   const int n = nls_date_format(nls_locale_of(locale), flags, time, f, wide, NLS_PICTURE_MAX);
   free_wide(f);
-  return nls_narrow_result(n, wide, out, capacity);
+  return nls_narrow_result(cp, n, wide, out, capacity);
 }
 EXPORT int WINAPI GetTimeFormatA(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCSTR format, LPSTR out, int capacity) {
   if (capacity < 0 || (capacity > 0 && !out)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  WCHAR *f = format ? to_wide(format) : NULL, wide[NLS_PICTURE_MAX];
+  const UINT cp = nls_ansi_codepage(locale, flags);
+  WCHAR *f = format ? to_wide_cp(cp, format) : NULL, wide[NLS_PICTURE_MAX];
   if (format && !f) return 0;
   const int n = nls_time_format(nls_locale_of(locale), flags, time, f, wide, NLS_PICTURE_MAX);
   free_wide(f);
-  return nls_narrow_result(n, wide, out, capacity);
+  return nls_narrow_result(cp, n, wide, out, capacity);
 }
 
 /* ---- locale information ------------------------------------------------------------------------------------------------------------------------------------- */
@@ -345,16 +370,17 @@ EXPORT int WINAPI GetLocaleInfoA(LCID locale, LCTYPE type, LPSTR buffer, int cap
   WCHAR wide[80];
   const int n = GetLocaleInfoW(locale, type, wide, 80);
   if (n == 0) return 0;
-  const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+  const UINT cp = nls_ansi_codepage(locale, type);
+  const int needed = WideCharToMultiByte(cp, 0, wide, -1, NULL, 0, NULL, NULL);
   if (capacity > 0 && capacity < needed) {
     /* a buffer that is too short is filled as far as it goes (some programs rely on it) */
     BYTE tmp[400];
-    const int got = WideCharToMultiByte(CP_UTF8, 0, wide, -1, (LPSTR)tmp, sizeof(tmp), NULL, NULL);
+    const int got = WideCharToMultiByte(cp, 0, wide, -1, (LPSTR)tmp, sizeof(tmp), NULL, NULL);
     for (int i = 0; i < capacity && i < got; ++i) buffer[i] = (char)tmp[i];
     set_error(ERROR_INSUFFICIENT_BUFFER);
     return 0;
   }
-  return nls_narrow_result(n, wide, buffer, capacity);
+  return nls_narrow_result(cp, n, wide, buffer, capacity);
 }
 EXPORT int WINAPI GetLocaleInfoEx(LPCWSTR name, LCTYPE type, LPWSTR buffer, int capacity) { return nls_get_locale_info(nls_locale_of_name(name), type, buffer, capacity); }
 static BOOL nls_set_info(LCID locale, LCTYPE type, LPCWSTR value) {
@@ -619,22 +645,24 @@ EXPORT int WINAPI GetCurrencyFormatEx(LPCWSTR name, DWORD flags, LPCWSTR value, 
 }
 EXPORT int WINAPI GetNumberFormatA(LCID locale, DWORD flags, LPCSTR value, const NUMBERFMTA_ *format, LPSTR out, int capacity) {
   if (capacity < 0 || (capacity > 0 && !out) || !value) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  WCHAR *v = to_wide(value), *d = format && format->lpDecimalSep ? to_wide(format->lpDecimalSep) : NULL, *t = format && format->lpThousandSep ? to_wide(format->lpThousandSep) : NULL, wide[1200];
+  const UINT cp = nls_ansi_codepage(locale, flags);
+  WCHAR *v = to_wide_cp(cp, value), *d = format && format->lpDecimalSep ? to_wide_cp(cp, format->lpDecimalSep) : NULL, *t = format && format->lpThousandSep ? to_wide_cp(cp, format->lpThousandSep) : NULL, wide[1200];
   UINT fmt[4] = {};
   if (format) { fmt[0] = format->NumDigits; fmt[1] = format->LeadingZero; fmt[2] = format->Grouping; fmt[3] = format->NegativeOrder; }
   const int n = nls_number_or_currency(nls_locale_of(locale), flags, v, fmt, d, t, NULL, format != NULL, FALSE, wide, 1200);
   free_wide(v); free_wide(d); free_wide(t);
-  return nls_narrow_result(n, wide, out, capacity);
+  return nls_narrow_result(cp, n, wide, out, capacity);
 }
 EXPORT int WINAPI GetCurrencyFormatA(LCID locale, DWORD flags, LPCSTR value, const CURRENCYFMTA_ *format, LPSTR out, int capacity) {
   if (capacity < 0 || (capacity > 0 && !out) || !value) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  WCHAR *v = to_wide(value), *d = format && format->lpDecimalSep ? to_wide(format->lpDecimalSep) : NULL, *t = format && format->lpThousandSep ? to_wide(format->lpThousandSep) : NULL;
-  WCHAR *s = format && format->lpCurrencySymbol ? to_wide(format->lpCurrencySymbol) : NULL, wide[1200];
+  const UINT cp = nls_ansi_codepage(locale, flags);
+  WCHAR *v = to_wide_cp(cp, value), *d = format && format->lpDecimalSep ? to_wide_cp(cp, format->lpDecimalSep) : NULL, *t = format && format->lpThousandSep ? to_wide_cp(cp, format->lpThousandSep) : NULL;
+  WCHAR *s = format && format->lpCurrencySymbol ? to_wide_cp(cp, format->lpCurrencySymbol) : NULL, wide[1200];
   UINT fmt[5] = {};
   if (format) { fmt[0] = format->NumDigits; fmt[1] = format->LeadingZero; fmt[2] = format->Grouping; fmt[3] = format->NegativeOrder; fmt[4] = format->PositiveOrder; }
   const int n = nls_number_or_currency(nls_locale_of(locale), flags, v, fmt, d, t, s, format != NULL, TRUE, wide, 1200);
   free_wide(v); free_wide(d); free_wide(t); free_wide(s);
-  return nls_narrow_result(n, wide, out, capacity);
+  return nls_narrow_result(cp, n, wide, out, capacity);
 }
 
 /* ---- sorting -------------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -801,18 +829,18 @@ EXPORT int WINAPI CompareStringEx(LPCWSTR name, DWORD flags, LPCWSTR a, int an, 
   return nls_compare(flags, a, an, b, bn, TRUE);
 }
 EXPORT int WINAPI CompareStringA(DWORD locale, DWORD flags, LPCSTR a, int an, LPCSTR b, int bn) {
-  (void)locale;
   if (!a || !b) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const UINT cp = nls_ansi_codepage(locale, flags);
   if (an < 0) an = (int)strlen(a);
   if (bn < 0) bn = (int)strlen(b);
   WCHAR *wa = NULL, *wb = NULL;
   int result = 0;
-  const int la = an ? MultiByteToWideChar(CP_UTF8, 0, a, an, NULL, 0) : 0, lb = bn ? MultiByteToWideChar(CP_UTF8, 0, b, bn, NULL, 0) : 0;
+  const int la = an ? MultiByteToWideChar(cp, 0, a, an, NULL, 0) : 0, lb = bn ? MultiByteToWideChar(cp, 0, b, bn, NULL, 0) : 0;
   wa = RtlAllocateHeap(heap(), 0, ((SIZE_T)la + 1) * 2);
   wb = RtlAllocateHeap(heap(), 0, ((SIZE_T)lb + 1) * 2);
   if (wa && wb) {
-    if (la) MultiByteToWideChar(CP_UTF8, 0, a, an, wa, la);
-    if (lb) MultiByteToWideChar(CP_UTF8, 0, b, bn, wb, lb);
+    if (la) MultiByteToWideChar(cp, 0, a, an, wa, la);
+    if (lb) MultiByteToWideChar(cp, 0, b, bn, wb, lb);
     result = nls_compare(flags, wa, la, wb, lb, FALSE);
   } else set_error(ERROR_NOT_ENOUGH_MEMORY);
   RtlFreeHeap(heap(), 0, wa);
@@ -1061,10 +1089,11 @@ EXPORT int WINAPI LCMapStringA(LCID locale, DWORD flags, LPCSTR source, int coun
   if (count < 0) count = (int)strlen(source) + 1;
   if (dest == source && !(flags & (MAP_LOWERCASE | MAP_UPPERCASE))) { set_error(ERROR_INVALID_FLAGS); return 0; }
   if ((flags & (MAP_LOWERCASE | MAP_UPPERCASE)) == (MAP_LOWERCASE | MAP_UPPERCASE)) { set_error(ERROR_INVALID_FLAGS); return 0; }
-  const int wide_count = MultiByteToWideChar(CP_UTF8, 0, source, count, NULL, 0);
+  const UINT cp = nls_ansi_codepage(locale, flags);
+  const int wide_count = MultiByteToWideChar(cp, 0, source, count, NULL, 0);
   WCHAR *w = RtlAllocateHeap(heap(), 0, ((SIZE_T)wide_count + 1) * 2);
   if (!w) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
-  MultiByteToWideChar(CP_UTF8, 0, source, count, w, wide_count);
+  MultiByteToWideChar(cp, 0, source, count, w, wide_count);
   int result = 0;
   if (flags & MAP_SORTKEY) {
     result = LCMapStringW(locale, flags, w, wide_count, (LPWSTR)dest, capacity);
@@ -1075,10 +1104,10 @@ EXPORT int WINAPI LCMapStringA(LCID locale, DWORD flags, LPCSTR source, int coun
     else {
       const int m = LCMapStringW(locale, flags, w, wide_count, mapped, cap_wide);
       if (m > 0) {
-        const int needed = WideCharToMultiByte(CP_UTF8, 0, mapped, m, NULL, 0, NULL, NULL);
+        const int needed = WideCharToMultiByte(cp, 0, mapped, m, NULL, 0, NULL, NULL);
         if (capacity == 0) result = needed;
         else if (capacity < needed) set_error(ERROR_INSUFFICIENT_BUFFER);
-        else result = WideCharToMultiByte(CP_UTF8, 0, mapped, m, dest, capacity, NULL, NULL);
+        else result = WideCharToMultiByte(cp, 0, mapped, m, dest, capacity, NULL, NULL);
       }
       RtlFreeHeap(heap(), 0, mapped);
     }
@@ -1345,7 +1374,7 @@ EXPORT int WINAPI GetCalendarInfoA(LCID locale, DWORD calendar, DWORD type, LPST
   if (type & CALENDAR_RETURN_NUMBER) return nls_calendar_info(nls_locale_of(locale), calendar, type, NULL, 0, value) ? 4 : 0;
   WCHAR wide[80];
   const int n = nls_calendar_info(nls_locale_of(locale), calendar, type, wide, 80, value);
-  return nls_narrow_result(n, wide, buffer, capacity);
+  return nls_narrow_result(nls_ansi_codepage(locale, type), n, wide, buffer, capacity);
 }
 
 typedef BOOL (CALLBACK *CALINFO_ENUMPROCA_)(LPSTR);
