@@ -497,6 +497,7 @@ static void notify_all_modules(DWORD reason, PVOID reserved, int forward) {
 }
 
 static volatile LONG g_process_ending;
+static volatile LONG g_cs_taken_over;      /* a section its owner died holding was taken over while the process ended */
 static void fls_destroy_current(int free_structure);
 static volatile LONG g_heap_lock;
 static volatile LONG g_fls_lock;
@@ -535,8 +536,9 @@ EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
   for (;;) NtTerminateProcess(NtCurrentProcess(), status);
 }
 
-/* Is the process shutting down (ExitProcess has begun to tell the libraries)? */
-EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0; }
+/* Is the process shutting down (ExitProcess has begun to tell the libraries)? Windows answers FALSE once a library's detach has had to take over a section that a
+ * terminated thread still held (the loader test's phase 7), so that is what a takeover does here too. */
+EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0 && !g_cs_taken_over; }
 
 /* The thread ends (the libraries and the program are told); the process ends with its last thread. */
 EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
@@ -869,7 +871,7 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
     return STATUS_SUCCESS;
   }
   while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, -2)) {
-    if (g_process_ending) { cs->LockCount = -2; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
+    if (g_process_ending) { g_cs_taken_over = 1; cs->LockCount = -2; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
     if (cs->LockSemaphore) {      /* a section somebody gave a semaphore: the wait is on it, and a handle that is not one is an error that cannot be carried on from */
       LARGE_INTEGER none = { 0 };
       __sync_sub_and_fetch(&cs->LockCount, 4);
