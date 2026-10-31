@@ -19,6 +19,7 @@ typedef struct { ULONG cbSize, HistoryBufferSize, NumberOfHistoryBuffers, dwFlag
 typedef struct {
   BOOL used;
   HANDLE handle;      /* NULL: the original buffer (the standard output handle) */
+  DWORD access;       /* what the handle of a made buffer was asked for */
   COORD size, cursor;
   WORD attr, popup;      /* popup: 0 is the default one */
   void *from;         /* the buffer that was shown before this one was made the one that is: it is shown again when this one is closed */
@@ -162,9 +163,10 @@ static DWORD *con_history_ptr(void) { return g_host ? &g_host->history_size : g_
 #define g_con_in_mode (*con_in_mode_ptr())
 static ScreenBuffer *con_screen(int i) { return i == 0 && g_host ? &g_host->main : &g_local_screens[i]; }
 
+static void con_register_waits(void);
 static void con_lock(void) {
   if (g_con_ready != 2) {
-    if (InterlockedCompareExchange(&g_con_ready, 1, 0) == 0) { RtlInitializeCriticalSection(&g_con_lock); g_con_ready = 2; }
+    if (InterlockedCompareExchange(&g_con_ready, 1, 0) == 0) { RtlInitializeCriticalSection(&g_con_lock); g_con_ready = 2; con_register_waits(); }
     else while (g_con_ready != 2) NtYieldExecution();
   }
   EnterCriticalSection(&g_con_lock);
@@ -271,10 +273,11 @@ static BOOL con_std_is_console(HANDLE h) { return con_std_is_terminal(h) && con_
 /* The handles CreateFile made for "CONIN$" and "CONOUT$" (more handles to the console input and output, which then are not the standard handles). */
 static HANDLE g_con_alias[16];
 static BOOL g_con_alias_input[16];
+static HANDLE g_con_alias_bound[16];      /* for an output alias: the buffer that was shown when it was opened (its handle; NULL is the original buffer) */
 static void con_alias_add(HANDLE h, BOOL input) {
   for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h || !g_con_alias[i]) { g_con_alias[i] = h; g_con_alias_input[i] = input; return; }
 }
-static void con_alias_forget(HANDLE h) { for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h) g_con_alias[i] = NULL; }
+static void con_alias_forget(HANDLE h) { for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h) { g_con_alias[i] = NULL; g_con_alias_bound[i] = NULL; } }
 static int con_table_alias_kind(HANDLE h) {      /* 1: an input alias, 2: an output alias, 0: none (a handle that was closed and is a file now is none either) */
   for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h && h && device_type(h) == 0x50) return g_con_alias_input[i] ? 1 : 2;
   return 0;
@@ -285,12 +288,30 @@ static int con_alias_kind(HANDLE h) {
   if (!con_unbound_kind(h)) return 0;
   return con_attached() ? (int)con_unbound_kind(h) : 0;      /* (without a console the handles of it are of no use) */
 }
+/* The terminal handles of this process (they are the standard handles until the console is freed; a new console opens new ones). */
+static HANDLE g_term[3] = {(HANDLE)(ULONG_PTR)4, (HANDLE)(ULONG_PTR)8, (HANDLE)(ULONG_PTR)12};
+static HANDLE con_open_terminal(int which) {      /* 0 input, 1 output, 2 error */
+  static const WCHAR *const names[3] = {L"\\Device\\ConDrv\\TcosIn", L"\\Device\\ConDrv\\TcosOut", L"\\Device\\ConDrv\\TcosErr"};
+  UNICODE_STRING name;
+  unicode_string(&name, names[which]);
+  OBJECT_ATTRIBUTES attributes = { sizeof(attributes), NULL, &name, 0x40, NULL, NULL };
+  IO_STATUS_BLOCK iosb;
+  HANDLE h = NULL;
+  if (!NT_SUCCESS(NtCreateFile(&h, 0x100003 | 0x80, &attributes, &iosb, NULL, 0, 7, 1, 0x20, NULL, 0))) return NULL;
+  return h;
+}
 static HANDLE con_open_alias(BOOL input, BOOL inherit) {      /* another handle to the console input or output (descriptors 0 and 1 are them) */
   HANDLE copy = NULL;
   if (!con_attached()) { set_error(ERROR_INVALID_HANDLE); return INVALID_HANDLE_VALUE; }
-  const NTSTATUS made = NtDuplicateObject(NtCurrentProcess(), (HANDLE)(ULONG_PTR)(input ? 4 : 8), NtCurrentProcess(), &copy, 0, inherit ? 2 : 0, 2 /* DUPLICATE_SAME_ACCESS */);
+  const NTSTATUS made = NtDuplicateObject(NtCurrentProcess(), g_term[input ? 0 : 1], NtCurrentProcess(), &copy, 0, inherit ? 2 : 0, 2 /* DUPLICATE_SAME_ACCESS */);
   if (!NT_SUCCESS(made)) { fail_nt(made); return INVALID_HANDLE_VALUE; }
   con_alias_add(copy, input);
+  if (!input) {      /* an output handle opened as CONOUT$ is the buffer that is shown at that time */
+    con_lock();
+    HANDLE bound = g_active_screen && g_active_screen != con_screen(0) ? g_active_screen->handle : NULL;
+    con_unlock();
+    for (int i = 0; i < 16; ++i) if (g_con_alias[i] == copy) g_con_alias_bound[i] = bound;
+  }
   return copy;
 }
 /* OpenConsoleW(name, access, inherit, creation): the console's "CONIN$" or "CONOUT$" and nothing else; the access and the creation disposition are checked and then not needed. */
@@ -380,7 +401,14 @@ static ScreenBuffer *con_buffer(HANDLE h) {
     }
   }
   if (!h || con_is_input(h) || !con_std_is_console(h)) return NULL;
-  if (con_alias_kind(h) == 2) return con_active();      /* (a handle opened as CONOUT$ is the buffer that is shown) */
+  if (con_alias_kind(h) == 2) {      /* (a handle opened as CONOUT$ is the buffer that was shown when it was opened, while that is there; an unbound handle is the one shown) */
+    for (int i = 0; i < 16; ++i) {
+      if (g_con_alias[i] != h) continue;
+      if (!g_con_alias_bound[i]) return con_main();
+      for (int k = 1; k < CON_MAX_BUFFERS; ++k) if (con_screen(k)->used && con_screen(k)->handle == g_con_alias_bound[i] && con_buffer_alive(g_con_alias_bound[i])) return con_screen(k);
+    }
+    return con_active();
+  }
   return con_main();
 }
 #define WITH_BUFFER(h, sb, failure) con_lock(); ScreenBuffer *sb = con_buffer(h); if (!sb) { con_unlock(); set_error(ERROR_INVALID_HANDLE); return failure; }
@@ -564,7 +592,9 @@ static BOOL con_write_wide(HANDLE h, const WCHAR *w, DWORD length) {
     if (!show || n == 0) continue;
     const int bytes = WideCharToMultiByte(CP_UTF8, 0, host, (int)n, utf8, sizeof(utf8), NULL, NULL);
     IO_STATUS_BLOCK iosb;
-    if (bytes > 0 && !NT_SUCCESS(NtWriteFile(h, NULL, NULL, NULL, &iosb, utf8, (ULONG)bytes, NULL, NULL))) return FALSE;
+    HANDLE terminal = h;      /* (the handle of a screen buffer that was made is no terminal: the text goes out by the console's own) */
+    if (h != GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_ERROR_HANDLE) && device_type(h) != 0x50) terminal = g_term[1];
+    if (bytes > 0 && !NT_SUCCESS(NtWriteFile(terminal, NULL, NULL, NULL, &iosb, utf8, (ULONG)bytes, NULL, NULL))) return FALSE;
   }
   return TRUE;
 }
@@ -677,6 +707,9 @@ static void con_orphan_events(ULONG_PTR keep) {
 /* Does a wait on the handle look at the input of the console here? The standard input and the aliases of the console (CONIN$, CONOUT$) have no state of their own: they are ready when
  * the input is. The events above have one, which the kernel looks at. */
 static BOOL con_wait_polled(HANDLE h) { return h && ((h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_table_alias_kind(h) != 0); }
+IMPORT void NTAPI RtlTcosSetConsoleWait(BOOL (*handle)(HANDLE), BOOL (*ready)(void));
+static BOOL con_wait_ready(void) { return con_input_ready(); }
+static void con_register_waits(void) { RtlTcosSetConsoleWait(con_wait_polled, con_wait_ready); }
 /* A handle is closed. */
 static void con_screen_closed(HANDLE h);
 static void con_handle_closed(HANDLE h) {
@@ -917,6 +950,9 @@ EXPORT UINT WINAPI GetConsoleOutputCP(void) { return con_get_cp(1); }
 EXPORT BOOL WINAPI SetConsoleCP(UINT cp) { return con_set_cp(0, cp); }
 EXPORT BOOL WINAPI SetConsoleOutputCP(UINT cp) { return con_set_cp(1, cp); }
 
+/* The code page the A functions of the console use for characters, or 0 for the default (the bytes are UTF-8 for text written, and the characters below 256 as they are for cells). */
+static UINT con_a_cp(void) { return g_host && g_host->output_cp && g_host->output_cp != CP_UTF8 ? g_host->output_cp : 0; }
+
 /* ---- modes, titles, control events --------------------------------------------------------------------------------------------------------------------- */
 
 EXPORT BOOL WINAPI GetConsoleMode(HANDLE h, LPDWORD mode) {
@@ -1114,9 +1150,14 @@ static ULONG_PTR con_new_id(void) { return (ULONG_PTR)console_for_new_process(0x
 static void con_bind_std_handles(void) {
   RTL_USER_PROCESS_PARAMETERS *pp = parameters();
   const BOOL keep = (pp->WindowFlags & 0x100) != 0;
-  if (!keep || !pp->StandardInput) pp->StandardInput = (HANDLE)4;
-  if (!keep || !pp->StandardOutput) pp->StandardOutput = (HANDLE)8;
-  if (!keep || !pp->StandardError) pp->StandardError = (HANDLE)12;
+  HANDLE *std[3] = {&pp->StandardInput, &pp->StandardOutput, &pp->StandardError};
+  for (int i = 0; i < 3; ++i) {
+    DWORD flags;
+    if (keep && *std[i] && GetHandleInformation(*std[i], &flags)) continue;
+    HANDLE terminal = con_open_terminal(i);
+    if (terminal) { *std[i] = terminal; g_term[i] = terminal; }
+    else *std[i] = g_term[i];
+  }
 }
 static void con_reset_handlers(void) { con_lock(); g_ctrl_handler_count = 0; g_ctrl_ignored = FALSE; con_unlock(); }
 static BOOL con_join(ULONG_PTR id) {
@@ -1141,6 +1182,15 @@ EXPORT BOOL WINAPI FreeConsole(void) {
   g_host_mapping = NULL;
   parameters()->ConsoleHandle = NULL;
   con_directory_set(pid, 0);
+  /* the standard handles of the console go with it (those that are something else stay) */
+  RTL_USER_PROCESS_PARAMETERS *pp = parameters();
+  HANDLE *std[3] = {&pp->StandardInput, &pp->StandardOutput, &pp->StandardError};
+  for (int i = 0; i < 3; ++i) {
+    HANDLE h = *std[i];
+    BOOL again = FALSE;
+    for (int k = 0; k < i; ++k) if (*std[k] == h) again = TRUE;
+    if (h && !again && device_type(h) == 0x50) CloseHandle(h);
+  }
   return TRUE;
 }
 EXPORT BOOL WINAPI AllocConsole(void) {
@@ -1233,7 +1283,8 @@ EXPORT BOOL WINAPI WriteConsoleA(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD
   while (done < length) {
     DWORD n = length - done < 1000 ? length - done : 1000;
     while (n > 1 && done + n < length && (b[done + n] & 0xC0) == 0x80) --n;      /* (not inside a character) */
-    const int units = MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)b + done, (int)n, wide, 1024);
+    const UINT cp = con_a_cp();
+    const int units = MultiByteToWideChar(cp ? cp : CP_UTF8, 0, (LPCSTR)b + done, (int)n, wide, 1024);
     if (units > 0 && !con_write_wide(h, wide, (DWORD)units)) return FALSE;
     done += n;
   }
@@ -1394,7 +1445,7 @@ EXPORT BOOL WINAPI SetCurrentConsoleFontEx(HANDLE h, BOOL maximum, CONSOLE_FONT_
 }
 
 EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD flags, LPVOID data) {
-  (void)access; (void)share; (void)sa; (void)data;
+  (void)share; (void)sa; (void)data;
   if (flags != 1) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
   if (!con_attached()) { set_error(ERROR_INVALID_HANDLE); return INVALID_HANDLE_VALUE; }      /* (a screen buffer belongs to a console) */
   con_lock();
@@ -1415,7 +1466,7 @@ EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECU
     if (handle) {
       memset(sb, 0, sizeof(*sb));
       g_screens_made = 1;
-      sb->used = TRUE; sb->handle = handle; sb->attr = sb->popup = g_active_screen ? g_active_screen->attr : main->attr; sb->out_mode = main->out_mode;      /* (a new buffer takes the colours in use) */
+      sb->used = TRUE; sb->handle = handle; sb->access = access; sb->attr = sb->popup = g_active_screen ? g_active_screen->attr : main->attr; sb->out_mode = main->out_mode;      /* (a new buffer takes the colours in use) */
       sb->cursor_info.size = 25; sb->cursor_info.visible = TRUE;
       if (!con_alloc_cells(sb, main->size)) { CloseHandle(handle); memset(sb, 0, sizeof(*sb)); handle = INVALID_HANDLE_VALUE; set_error(ERROR_NOT_ENOUGH_MEMORY); }
       else sb->window = main->window;
@@ -1427,6 +1478,7 @@ EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECU
 }
 EXPORT BOOL WINAPI SetConsoleActiveScreenBuffer(HANDLE h) {
   WITH_BUFFER(h, sb, FALSE)
+  if (sb->handle && !(sb->access & (0x40000000u | 0x10000000u | 0x2))) { con_unlock(); set_error(ERROR_INVALID_HANDLE); return FALSE; }      /* (a buffer made for reading only cannot be shown) */
   if (sb != con_active()) sb->from = g_active_screen;
   g_active_screen = sb;
   con_unlock();
@@ -1474,7 +1526,14 @@ EXPORT BOOL WINAPI ReadConsoleOutputCharacterA(HANDLE h, LPSTR out, DWORD count,
   if (!w) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
   DWORD n = 0;
   const BOOL ok = read_cells(h, at, count, &n, w, NULL);
-  if (ok) { for (DWORD i = 0; i < n; ++i) out[i] = w[i] < 0x100 ? (char)w[i] : '?'; if (done) *done = n; }
+  if (ok) {
+    const UINT cp = con_a_cp();
+    for (DWORD i = 0; i < n; ++i) {
+      if (cp) { char c = '?'; BOOL lossy = FALSE; if (WideCharToMultiByte(cp, 0, &w[i], 1, &c, 1, NULL, &lossy) != 1) c = '?'; out[i] = c; }
+      else out[i] = w[i] < 0x100 ? (char)w[i] : '?';
+    }
+    if (done) *done = n;
+  }
   RtlFreeHeap(heap(), 0, w);
   return ok;
 }
@@ -1493,7 +1552,8 @@ EXPORT BOOL WINAPI WriteConsoleOutputCharacterW(HANDLE h, LPCWSTR chars, DWORD c
 EXPORT BOOL WINAPI WriteConsoleOutputCharacterA(HANDLE h, LPCSTR chars, DWORD count, COORD at, LPDWORD done) {
   WCHAR *w = RtlAllocateHeap(heap(), 0, ((SIZE_T)count + 1) * 2);
   if (!w) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
-  for (DWORD i = 0; i < count; ++i) w[i] = (BYTE)chars[i];
+  const UINT cp = con_a_cp();
+  for (DWORD i = 0; i < count; ++i) { if (cp) { WCHAR c = (BYTE)chars[i]; if (MultiByteToWideChar(cp, 0, &chars[i], 1, &c, 1) != 1) c = (BYTE)chars[i]; w[i] = c; } else w[i] = (BYTE)chars[i]; }
   const BOOL ok = write_cells(h, at, count, done, w, NULL);
   RtlFreeHeap(heap(), 0, w);
   return ok;

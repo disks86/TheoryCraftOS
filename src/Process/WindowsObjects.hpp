@@ -67,6 +67,8 @@ uint32_t nt_flush_virtual_memory(Process& p, const SyscallRequest& r);
 // handle flags (inherit, protect from close).
 uint32_t nt_query_object(Process& p, const SyscallRequest& r);
 uint32_t nt_set_information_object(Process& p, const SyscallRequest& r);
+// NtCompareObjects(First, Second): STATUS_SUCCESS if the two handles are of the same object, STATUS_NOT_SAME_OBJECT if not.
+uint32_t nt_compare_objects(Process& p, const SyscallRequest& r);
 // NtSignalAndWaitForSingleObject(SignalHandle, WaitHandle, Alertable, Timeout).
 uint32_t nt_signal_and_wait(Process& p, const SyscallRequest& r);
 // Waitable timers: NtCreateTimer, NtOpenTimer, NtSetTimer (an APC routine runs in the thread that set the timer, while it waits alertably), NtCancelTimer, NtQueryTimer.

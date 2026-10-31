@@ -584,7 +584,24 @@ static ULONG run_apcs(void) {
   return count;
 }
 EXPORT NTSTATUS NTAPI NtTestAlert(void) { run_apcs(); return STATUS_SUCCESS; }
+/* The handles of the input of a console are ready when the console has input waiting, which only kernel32.dll (that keeps the console) can say: it tells ntdll.dll which handles those are
+ * and how to ask. */
+static BOOL (*g_console_wait_handle)(HANDLE h);
+static BOOL (*g_console_wait_ready)(void);
+EXPORT void NTAPI RtlTcosSetConsoleWait(BOOL (*handle)(HANDLE), BOOL (*ready)(void)) { g_console_wait_handle = handle; g_console_wait_ready = ready; }
 EXPORT NTSTATUS NTAPI NtWaitForSingleObject(HANDLE h, BOOLEAN alertable, PLARGE_INTEGER timeout) {
+  if (g_console_wait_handle && g_console_wait_handle(h)) {
+    LONGLONG left = timeout ? timeout->QuadPart : 0;
+    if (timeout && left > 0) { LARGE_INTEGER now; NtQuerySystemTime(&now); left = now.QuadPart >= left ? 0 : -(left - now.QuadPart); }      /* (absolute: the time left) */
+    for (;;) {
+      if (g_console_wait_ready()) return STATUS_SUCCESS;
+      if (timeout && left >= 0) return (NTSTATUS)0x102;
+      LARGE_INTEGER step;
+      step.QuadPart = -50000;      /* 5 ms */
+      NtDelayExecution(alertable, &step);
+      if (timeout) left += 50000;
+    }
+  }
   const NTSTATUS status = RawNtWaitForSingleObject(h, alertable, timeout);
   if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;

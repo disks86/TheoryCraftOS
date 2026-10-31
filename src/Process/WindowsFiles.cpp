@@ -322,6 +322,30 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
       }
     }
   }
+  {      // \\Device\\ConDrv\\TcosIn / TcosOut / TcosErr: a new descriptor for the terminal (what a console that is made after the standard handles were closed gets); no other is the same object
+    uint64_t name_at = 0;
+    String text(files.allocator());
+    if (object_attributes != 0 && p.read_user_u64(object_attributes + 16, &name_at) && name_at != 0 && read_unicode_string(p, name_at, &text) == kSuccess) {
+      static const char kPrefix[] = "\\device\\condrv\\tcos";
+      const StringView name = text.view();
+      uint64_t n = 0;
+      while (kPrefix[n]) ++n;
+      bool same = name.size() > n;
+      for (uint64_t i = 0; same && i < n; ++i) same = (name[i] >= 'A' && name[i] <= 'Z' ? char(name[i] + 32) : name[i]) == kPrefix[i];
+      if (same) {
+        const StringView rest = name.without_prefix(n);
+        static uint64_t serial = 0;
+        const DescriptorKind kind = rest == StringView("In") ? DescriptorKind::ConsoleInput : rest == StringView("Out") ? DescriptorKind::ConsoleOutput : rest == StringView("Err") ? DescriptorKind::ConsoleError : DescriptorKind::Closed;
+        if (kind != DescriptorKind::Closed) {
+          const int64_t slot = files.open_token(kind, ++serial);
+          if (slot < 0) return kTooManyOpenedFiles;
+          *handle = (uint64_t(slot) + 1) * 4;
+          *information = kFileOpened;
+          return kSuccess;
+        }
+      }
+    }
+  }
   String virtual_path(files.allocator());
   const uint32_t named = (options & kOpenByFileId) ? path_by_file_id(p, object_attributes, &virtual_path) : object_path(p, object_attributes, &virtual_path);
   if (named != kSuccess) return named;

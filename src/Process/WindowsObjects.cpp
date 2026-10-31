@@ -1217,6 +1217,20 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
   return p.write_user(r.args[2], ConstByteView(out, size)) ? kSuccess : kAccessViolation;
 }
 
+// NtCompareObjects(First, Second): handles of one object have the same kind and the same object behind them (the token of the object manager, the open file, the process or thread).
+uint32_t nt_compare_objects(Process& p, const SyscallRequest& r) {
+  uint64_t first = 0, second = 0;
+  if (!slot_of(r.args[0], &first) || !slot_of(r.args[1], &second)) return kInvalidHandle;
+  ProcessFiles& files = p.files();
+  const DescriptorKind a = files.kind(first), b = files.kind(second);
+  if (a == DescriptorKind::Closed || b == DescriptorKind::Closed) return kInvalidHandle;
+  constexpr uint32_t kNotSameObject = 0xC00004D4u;
+  if (a != b) return kNotSameObject;
+  if (files.object(first) != files.object(second)) return kNotSameObject;
+  if (files.token(first) != files.token(second)) return kNotSameObject;      // (the terminal descriptors a console starts with have no token; the ones made later each have one)
+  return kSuccess;
+}
+
 // NtSetInformationObject(Handle, Class = 4, Buffer, Length): the handle flags.
 uint32_t nt_set_information_object(Process& p, const SyscallRequest& r) {
   uint64_t slot = 0;

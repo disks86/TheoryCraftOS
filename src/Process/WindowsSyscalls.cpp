@@ -188,6 +188,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);
       case WindowsSyscallNumber::NtSetInformationObject: return windowsabi::nt_set_information_object(process, r);
+      case WindowsSyscallNumber::NtCompareObjects: return windowsabi::nt_compare_objects(process, r);
       case WindowsSyscallNumber::NtReleaseModule: return windowsabi::nt_release_module(process, r);
       case WindowsSyscallNumber::NtUnloadModule: return windowsabi::nt_unload_module(process, r);
       case WindowsSyscallNumber::NtSetInformationProcess: return windowsabi::nt_set_information_process(process, r);
