@@ -585,8 +585,57 @@ EXPORT void WINAPI GetStartupInfoA(LPSTARTUPINFOA info) {
   memcpy(info, &cached, sizeof(cached));
 }
 
-EXPORT DWORD WINAPI GetVersion(void) { return (19045u << 16) | (0u << 8) | 10u; }
 NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info);
+IMPORT NTSTATUS NTAPI RtlQueryInformationActiveActivationContext(ULONG class, PVOID buffer, SIZE_T length, SIZE_T *retlen);
+/* What GetVersion and GetVersionEx tell a program: not the version of the system (RtlGetVersion and VerifyVersionInfo know that) but the one the program was made for. A
+ * manifest that lists the systems the program supports (supportedOS) gets the newest of them; without such a list the version in the program's own header decides: 10.0 or
+ * newer is 10.0, 6.3 up to there is 6.3, anything older is 6.2 (a program of Windows 7 or Vista without a manifest is told Windows 8). */
+typedef struct { DWORD major, minor, build; } ReportedVersion;
+static const struct { DWORD a; WORD b, c; BYTE d[8]; DWORD major, minor, build; } kSupportedOs[] = {
+  {0x8e0f7a12, 0xbfb3, 0x4fe8, {0xb9, 0xa5, 0x48, 0xfd, 0x50, 0xa1, 0x5a, 0x9a}, 10, 0, 19045},      /* Windows 10 */
+  {0x1f676c76, 0x80e1, 0x4239, {0x95, 0xbb, 0x83, 0xd0, 0xf6, 0xd0, 0xda, 0x78}, 6, 3, 9600},      /* Windows 8.1 */
+  {0x4a2f28e3, 0x53b9, 0x4441, {0xba, 0x9c, 0xd6, 0x9d, 0x4a, 0x4a, 0x6e, 0x38}, 6, 2, 9200},      /* Windows 8 */
+  {0x35138b9a, 0x5d96, 0x4fbd, {0x8e, 0x2d, 0xa2, 0x44, 0x02, 0x25, 0xf9, 0x3a}, 6, 1, 7601},      /* Windows 7 */
+  {0xe2011457, 0x1546, 0x43c5, {0xa5, 0xfe, 0x00, 0x8d, 0xee, 0xe3, 0xd3, 0xf0}, 6, 0, 6002},      /* Windows Vista */
+};
+static ReportedVersion reported_version(void) {
+  static volatile LONG state;      /* 0: not looked at, 1: being worked out, 2: done */
+  static ReportedVersion cached;
+  if (state != 2) {
+    if (__sync_bool_compare_and_swap(&state, 0, 1)) {
+      ReportedVersion r = {6, 2, 9200};
+      int found = 0;
+      BYTE buffer[8 + 32 * 16];
+      SIZE_T needed = 0;
+      if (NT_SUCCESS(RtlQueryInformationActiveActivationContext(6, buffer, sizeof(buffer), &needed))) {
+        const DWORD count = *(const DWORD *)buffer;
+        for (DWORD k = 0; k < count && k < 16; ++k) {
+          const BYTE *e = buffer + 8 + (size_t_)k * 32;
+          if (*(const DWORD *)(e + 16) != 1) continue;      /* supportedOS */
+          for (size_t_ g = 0; g < sizeof(kSupportedOs) / sizeof(kSupportedOs[0]); ++g) {
+            if (memcmp(e, &kSupportedOs[g].a, 4) || memcmp(e + 4, &kSupportedOs[g].b, 2) || memcmp(e + 6, &kSupportedOs[g].c, 2) || memcmp(e + 8, kSupportedOs[g].d, 8)) continue;
+            if (!found || kSupportedOs[g].major > r.major || (kSupportedOs[g].major == r.major && kSupportedOs[g].minor > r.minor)) { r.major = kSupportedOs[g].major; r.minor = kSupportedOs[g].minor; r.build = kSupportedOs[g].build; }
+            found = 1;
+          }
+        }
+      }
+      if (!found) {
+        const BYTE *base = (const BYTE *)NtCurrentPeb()->ImageBaseAddress;
+        const DWORD pe = *(const DWORD *)(base + 0x3C);
+        const DWORD image = ((DWORD)*(const WORD *)(base + pe + 24 + 0x28) << 16) | *(const WORD *)(base + pe + 24 + 0x2A);      /* the operating system version of the header */
+        if ((image >> 16) >= 10) { r.major = 10; r.minor = 0; r.build = 19045; }
+        else if ((image >> 16) > 6 || ((image >> 16) == 6 && (image & 0xFFFF) >= 3)) { r.major = 6; r.minor = 3; r.build = 9600; }
+      }
+      cached = r;
+      state = 2;
+    } else while (state != 2) NtYieldExecution();
+  }
+  return cached;
+}
+EXPORT DWORD WINAPI GetVersion(void) {
+  const ReportedVersion r = reported_version();
+  return (r.build << 16) | (r.minor << 8) | r.major;
+}
 /* GetVersionEx: the size says which structure; any other size is ERROR_INSUFFICIENT_BUFFER. The extended fields come from ntdll. */
 EXPORT BOOL WINAPI GetVersionExW(LPOSVERSIONINFOW v) {
   if (!v || (v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOW) && v->dwOSVersionInfoSize != sizeof(OSVERSIONINFOEXW))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
@@ -594,6 +643,8 @@ EXPORT BOOL WINAPI GetVersionExW(LPOSVERSIONINFOW v) {
   memset(&info, 0, sizeof(info));
   info.dwOSVersionInfoSize = v->dwOSVersionInfoSize;
   if (!NT_SUCCESS(RtlGetVersion((RTL_OSVERSIONINFOW *)&info))) { set_error(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  const ReportedVersion r = reported_version();
+  info.dwMajorVersion = r.major; info.dwMinorVersion = r.minor; info.dwBuildNumber = r.build;
   memcpy(v, &info, v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXW) ? sizeof(OSVERSIONINFOEXW) : sizeof(OSVERSIONINFOW));
   return TRUE;
 }
@@ -603,7 +654,8 @@ EXPORT BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA v) {
   memset(&info, 0, sizeof(info));
   info.dwOSVersionInfoSize = sizeof(info);
   RtlGetVersion((RTL_OSVERSIONINFOW *)&info);
-  v->dwMajorVersion = info.dwMajorVersion; v->dwMinorVersion = info.dwMinorVersion; v->dwBuildNumber = info.dwBuildNumber; v->dwPlatformId = info.dwPlatformId; v->szCSDVersion[0] = 0;
+  const ReportedVersion r = reported_version();
+  v->dwMajorVersion = r.major; v->dwMinorVersion = r.minor; v->dwBuildNumber = r.build; v->dwPlatformId = info.dwPlatformId; v->szCSDVersion[0] = 0;
   if (v->dwOSVersionInfoSize == sizeof(OSVERSIONINFOEXA)) {
     OSVERSIONINFOEXA *ex = (OSVERSIONINFOEXA *)v;
     ex->wServicePackMajor = info.wServicePackMajor; ex->wServicePackMinor = info.wServicePackMinor; ex->wSuiteMask = info.wSuiteMask; ex->wProductType = info.wProductType; ex->wReserved = 0;
@@ -4442,6 +4494,7 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "time.inc"
 #include "comm.inc"
 #include "profile.inc"
+#include "appmodel.inc"
 #include "nls.inc"
 #include "nls2.inc"
 #include "idn.inc"

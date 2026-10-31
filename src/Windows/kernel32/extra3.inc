@@ -1675,3 +1675,31 @@ EXPORT BOOL WINAPI BindIoCompletionCallback(HANDLE file, IO_COMPLETION_ROUTINE_ 
   LeaveCriticalSection(&g_atom_lock);
   return TRUE;
 }
+
+/* ---- firmware tables (SystemFirmwareTableInformation of NtQuerySystemInformation) ------------------------------------------------------------------------------ */
+
+/* The table (Action 1) or the list of table IDs (Action 0) of a provider: the call fills the request in the buffer; the answer is what follows the 16 byte header. */
+static UINT firmware_call(DWORD signature, DWORD action, DWORD table, void *buffer, DWORD size) {
+  ULONG needed = 0;
+  DWORD head[4] = {signature, action, table, 0};
+  NTSTATUS status = NtQuerySystemInformation(76, head, sizeof(head), &needed);
+  if (status != (NTSTATUS)0xC0000023 && !NT_SUCCESS(status)) { set_error(RtlNtStatusToDosError(status)); return 0; }
+  if (needed < sizeof(head)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  const DWORD data = needed - (DWORD)sizeof(head);
+  DWORD *request = RtlAllocateHeap(heap(), 0, needed);
+  if (!request) { set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+  request[0] = signature; request[1] = action; request[2] = table; request[3] = 0;
+  status = NtQuerySystemInformation(76, request, needed, &needed);
+  UINT result = 0;
+  if (!NT_SUCCESS(status)) set_error(RtlNtStatusToDosError(status));
+  else {
+    result = data;
+    if (buffer && size >= data) memcpy(buffer, request + 4, data);
+    else if (buffer) { set_error(ERROR_INSUFFICIENT_BUFFER); }
+    else if (size) { /* (a size without a buffer: only the length is wanted) */ }
+  }
+  RtlFreeHeap(heap(), 0, request);
+  return result;
+}
+EXPORT UINT WINAPI GetSystemFirmwareTable(DWORD signature, DWORD table, PVOID buffer, DWORD size) { return firmware_call(signature, 1, table, buffer, size); }
+EXPORT UINT WINAPI EnumSystemFirmwareTables(DWORD signature, PVOID buffer, DWORD size) { return firmware_call(signature, 0, 0, buffer, size); }

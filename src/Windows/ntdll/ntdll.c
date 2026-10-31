@@ -312,62 +312,81 @@ EXPORT VOID NTAPI RtlGetNtVersionNumbers(ULONG *major, ULONG *minor, ULONG *buil
   if (build) *build = 19045 | 0xF0000000u;      /* (the top bits say it is a free build) */
 }
 EXPORT ULONGLONG NTAPI VerSetConditionMask(ULONGLONG mask, ULONG type, UCHAR condition) {
-  if (type == 0) return mask;
-  static const ULONG kTypes[] = {1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80};      /* minor, major, build, platform, SP minor, SP major, suite, product type */
-  for (int bit = 0; bit < 8; bit++) {
-    if (!(type & kTypes[bit])) continue;
-    mask &= ~((ULONGLONG)7 << (bit * 3));
-    mask |= (ULONGLONG)(condition & 7) << (bit * 3);
-  }
+  condition &= 7;
+  if (type & 0x80) mask |= (ULONGLONG)condition << 21;      /* VER_PRODUCT_TYPE */
+  else if (type & 0x40) mask |= (ULONGLONG)condition << 18;      /* VER_SUITENAME */
+  else if (type & 0x20) mask |= (ULONGLONG)condition << 15;      /* VER_SERVICEPACKMAJOR */
+  else if (type & 0x10) mask |= (ULONGLONG)condition << 12;      /* VER_SERVICEPACKMINOR */
+  else if (type & 8) mask |= (ULONGLONG)condition << 9;      /* VER_PLATFORMID */
+  else if (type & 4) mask |= (ULONGLONG)condition << 6;      /* VER_BUILDNUMBER */
+  else if (type & 2) mask |= (ULONGLONG)condition << 3;      /* VER_MAJORVERSION */
+  else if (type & 1) mask |= (ULONGLONG)condition;      /* VER_MINORVERSION */
   return mask;
 }
-static BOOLEAN version_compare(ULONG have, ULONG want, UCHAR condition) {
-  switch (condition) {
-    case 1: return have == want;      /* VER_EQUAL */
-    case 2: return have > want;       /* VER_GREATER */
-    case 3: return have >= want;      /* VER_GREATER_EQUAL */
-    case 4: return have < want;       /* VER_LESS */
-    case 5: return have <= want;      /* VER_LESS_EQUAL */
-    default: return FALSE;
+/* The condition of a field of the chain (major, minor, service pack major, service pack minor), given the one before it: an EQUAL before it gives way to the new
+ * condition if that is one of the comparisons, a GREATER or LESS keeps what it said unless the new one is compatible (the way Windows does it). */
+static UCHAR version_update_condition(UCHAR *last, UCHAR condition) {
+  switch (*last) {
+    case 0: *last = condition; break;
+    case 1: if (condition >= 1 && condition <= 5) { *last = condition; return condition; } break;      /* VER_EQUAL */
+    case 2: case 3: if (condition >= 1 && condition <= 3) return condition; break;      /* VER_GREATER, VER_GREATER_EQUAL */
+    case 4: case 5: if (condition == 1 || (condition >= 4 && condition <= 5)) return condition; break;      /* VER_LESS, VER_LESS_EQUAL */
   }
+  if (!condition) *last |= 0x10;
+  return *last & 0xf;
 }
-/* Does this system meet the version asked for? The conditions are three bits per field in `mask`. Major, minor and the service pack numbers are one chain: a later field is
-   looked at only if the earlier one was equal (and its condition allows equality). STATUS_REVISION_MISMATCH if not. */
+static NTSTATUS version_compare_values(ULONG left, ULONG right, UCHAR condition) {
+  switch (condition) {
+    case 1: if (left != right) return STATUS_REVISION_MISMATCH; break;      /* VER_EQUAL */
+    case 2: if (left <= right) return STATUS_REVISION_MISMATCH; break;      /* VER_GREATER */
+    case 3: if (left < right) return STATUS_REVISION_MISMATCH; break;      /* VER_GREATER_EQUAL */
+    case 4: if (left >= right) return STATUS_REVISION_MISMATCH; break;      /* VER_LESS */
+    case 5: if (left > right) return STATUS_REVISION_MISMATCH; break;      /* VER_LESS_EQUAL */
+    default: return STATUS_REVISION_MISMATCH;
+  }
+  return STATUS_SUCCESS;
+}
+/* Does this system meet the version asked for? The conditions are three bits per field in `mask`. (Ported from Wine's version.c.) STATUS_REVISION_MISMATCH if not. */
 EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULONG types, ULONGLONG mask) {
-  RTL_OSVERSIONINFOEXW now;
-  now.dwOSVersionInfoSize = sizeof(now);
-  if (!info || !types) return STATUS_INVALID_PARAMETER;
-  if (!(types & 0xFF)) return STATUS_INVALID_PARAMETER;
-  RtlGetVersion((RTL_OSVERSIONINFOW *)&now);
-  const BOOLEAN extended = TRUE;      /* (the size in the structure is not looked at: the caller is trusted to have room for the fields it asks about) */
-  #define COND(bit) ((UCHAR)((mask >> ((bit) * 3)) & 7))
-  if (types & 0x80) { if (!extended || !version_compare(now.wProductType, info->wProductType, COND(7))) return STATUS_REVISION_MISMATCH; }
+  RTL_OSVERSIONINFOEXW ver;
+  NTSTATUS status;
+  ver.dwOSVersionInfoSize = sizeof(ver);
+  if ((status = RtlGetVersion((RTL_OSVERSIONINFOW *)&ver)) != STATUS_SUCCESS) return status;
+  if (!(types && mask) || !info) return STATUS_INVALID_PARAMETER;
+  if (types & 0x80) { status = version_compare_values(ver.wProductType, info->wProductType, (UCHAR)(mask >> 21 & 7)); if (status != STATUS_SUCCESS) return status; }
   if (types & 0x40) {      /* VER_SUITENAME: VER_AND needs every bit, VER_OR any */
-    const UCHAR c = COND(6);
-    if (!extended) return STATUS_REVISION_MISMATCH;
-    if (c == 6 /* VER_AND */) { if ((info->wSuiteMask & now.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; }
-    else if (c == 7 /* VER_OR */) { if (info->wSuiteMask && !(info->wSuiteMask & now.wSuiteMask)) return STATUS_REVISION_MISMATCH; }      /* (asking for none is met) */
-    else return STATUS_INVALID_PARAMETER;
-  }
-  if ((types & 8) && !version_compare(now.dwPlatformId, info->dwPlatformId, COND(3))) return STATUS_REVISION_MISMATCH;
-  if ((types & 4) && !version_compare(now.dwBuildNumber, info->dwBuildNumber, COND(2))) return STATUS_REVISION_MISMATCH;
-  if (types & 0x33) {
-    /* Major, minor, service pack major and minor are one chain. The first field whose values differ decides. While they are equal the next field is looked at; a condition
-       of EQUAL gives way to the next field's own condition, any other condition carries on to the fields after it. */
-    struct { ULONG bit_type; int bit; ULONG have, want; } chain[4] = {
-      {2, 1, now.dwMajorVersion, info->dwMajorVersion}, {1, 0, now.dwMinorVersion, info->dwMinorVersion},
-      {0x20, 5, now.wServicePackMajor, extended ? info->wServicePackMajor : 0}, {0x10, 4, now.wServicePackMinor, extended ? info->wServicePackMinor : 0}};
-    UCHAR c = 0;
-    BOOLEAN have_condition = FALSE, result = TRUE;
-    for (int i = 0; i < 4; i++) {
-      if (!(types & chain[i].bit_type)) continue;
-      if (!have_condition || c == 1) { c = COND(chain[i].bit); have_condition = TRUE; }
-      result = version_compare(chain[i].have, chain[i].want, c);
-      if (chain[i].have != chain[i].want) break;
+    switch (mask >> 18 & 7) {
+      case 6: if ((info->wSuiteMask & ver.wSuiteMask) != info->wSuiteMask) return STATUS_REVISION_MISMATCH; break;
+      case 7: if (!(info->wSuiteMask & ver.wSuiteMask) && info->wSuiteMask) return STATUS_REVISION_MISMATCH; break;
+      default: return STATUS_INVALID_PARAMETER;
     }
-    if (!result) return STATUS_REVISION_MISMATCH;
   }
-  #undef COND
+  if (types & 8) { status = version_compare_values(ver.dwPlatformId, info->dwPlatformId, (UCHAR)(mask >> 9 & 7)); if (status != STATUS_SUCCESS) return status; }
+  if (types & 4) { status = version_compare_values(ver.dwBuildNumber, info->dwBuildNumber, (UCHAR)(mask >> 6 & 7)); if (status != STATUS_SUCCESS) return status; }
+  if (types & (2 | 1 | 0x20 | 0x10)) {
+    UCHAR condition, last_condition = 0;
+    BOOLEAN do_next_check = TRUE;
+    if (types & 2) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask >> 3 & 7));
+      status = version_compare_values(ver.dwMajorVersion, info->dwMajorVersion, condition);
+      do_next_check = ver.dwMajorVersion == info->dwMajorVersion && condition >= 1 && condition <= 5;
+    }
+    if ((types & 1) && do_next_check) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask & 7));
+      status = version_compare_values(ver.dwMinorVersion, info->dwMinorVersion, condition);
+      do_next_check = ver.dwMinorVersion == info->dwMinorVersion && condition >= 1 && condition <= 5;
+    }
+    if ((types & 0x20) && do_next_check) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask >> 15 & 7));
+      status = version_compare_values(ver.wServicePackMajor, info->wServicePackMajor, condition);
+      do_next_check = ver.wServicePackMajor == info->wServicePackMajor && condition >= 1 && condition <= 5;
+    }
+    if ((types & 0x10) && do_next_check) {
+      condition = version_update_condition(&last_condition, (UCHAR)(mask >> 12 & 7));
+      status = version_compare_values(ver.wServicePackMinor, info->wServicePackMinor, condition);
+    }
+    if (status != STATUS_SUCCESS) return status;
+  }
   return STATUS_SUCCESS;
 }
 

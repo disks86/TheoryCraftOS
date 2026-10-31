@@ -184,6 +184,44 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
       }
       return p.write_user(buffer, ConstByteView(out, total_size)) ? kSuccess : kAccessViolation;
     }
+    case 76: {   // SystemFirmwareTableInformation: SYSTEM_FIRMWARE_TABLE_INFORMATION {ProviderSignature, Action (0 enumerate, 1 get), TableID, TableBufferLength, TableBuffer[]}.
+      // The only provider is the raw SMBIOS one ('RSMB') with one table, ID 0: RawSMBIOSData (a 8 byte header: calling method, major, minor, DMI revision, table length), then the
+      // structures this system describes itself with: a System Information (type 1) and the end of the table (type 127). The OS reads no firmware tables of the machine.
+      constexpr uint32_t kHeader = 16, kRsmb = 0x52534D42u, kNoSuchFile = 0xC000000Fu, kTooSmall = 0xC0000023u, kBadParameter = 0xC000000Du;
+      static const uint8_t kStructures[] = {
+          1, 27, 0x01, 0x00, 1, 2, 0, 0,                                                         // System Information: manufacturer, product (string numbers), version, serial
+          0x54, 0x43, 0x4F, 0x53, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x10, 0x32, 0x54, 0x76,      // UUID
+          6, 0, 0,                                                                               // wake-up type, SKU number, family
+          'T', 'h', 'e', 'o', 'r', 'y', 'C', 'r', 'a', 'f', 't', 'O', 'S', 0,                    // string 1
+          'T', 'h', 'e', 'o', 'r', 'y', 'C', 'r', 'a', 'f', 't', ' ', 'P', 'C', 0,               // string 2
+          0,                                                                                     // end of the strings
+          127, 4, 0x00, 0x7F, 0, 0};                                                             // End Of Table
+      constexpr uint32_t kRaw = 8 + sizeof kStructures;
+      if (length < kHeader) return kInfoLengthMismatch;
+      uint8_t head[kHeader];
+      if (!p.read_user(buffer, ByteView(head, kHeader))) return kAccessViolation;
+      auto get32 = [&](uint32_t at) { return uint32_t(head[at]) | uint32_t(head[at + 1]) << 8 | uint32_t(head[at + 2]) << 16 | uint32_t(head[at + 3]) << 24; };
+      if (get32(0) != kRsmb) return kBadParameter;
+      const uint32_t action = get32(4), table = get32(8);
+      uint8_t data[kRaw] = {};
+      uint32_t data_size = 0;
+      if (action == 0) { data_size = 4; }            // the list of table IDs: 0
+      else if (action == 1) {
+        if (table != 0) return kNoSuchFile;
+        data[1] = 3;                                   // SMBIOS 3.0
+        data[4] = uint8_t(sizeof kStructures);
+        for (uint32_t k = 0; k < sizeof kStructures; ++k) data[8 + k] = kStructures[k];
+        data_size = kRaw;
+      } else return kBadParameter;
+      const uint32_t total_size = kHeader + data_size;
+      if (returned != 0 && !p.write_user_u32(returned, total_size)) return kAccessViolation;
+      if (length < total_size) return kTooSmall;
+      uint8_t out[kHeader + kRaw] = {};
+      for (uint32_t k = 0; k < 12; ++k) out[k] = head[k];
+      for (uint32_t k = 0; k < 4; ++k) out[12 + k] = uint8_t(data_size >> (8 * k));
+      for (uint32_t k = 0; k < data_size; ++k) out[kHeader + k] = data[k];
+      return p.write_user(buffer, ConstByteView(out, total_size)) ? kSuccess : kAccessViolation;
+    }
     default: return kInvalidInfoClass;
   }
   if (returned != 0 && !p.write_user_u32(returned, size)) return kAccessViolation;
