@@ -497,3 +497,10 @@ EXPORT BOOL WINAPI GetSystemPowerStatus(BYTE *status) {      /* SYSTEM_POWER_STA
   memcpy(status + 8, &unknown, 4);
   return TRUE;
 }
+
+/* PrefetchVirtualMemory: a hint that the ranges are about to be used; everything here is in memory already, so the ranges are only checked to be there to be named. */
+EXPORT BOOL WINAPI PrefetchVirtualMemory(HANDLE process, ULONG_PTR count, PVOID entries, ULONG flags) {
+  (void)process;
+  if (count == 0 || !entries || flags != 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  return TRUE;
+}
