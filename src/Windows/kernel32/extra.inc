@@ -260,6 +260,7 @@ EXPORT PVOID WINAPI ConvertThreadToFiberEx(PVOID parameter, DWORD flags) {
   f->actctx_stack = TEB_ACTCTX_STACK_PTR(NtCurrentTeb());
   TEB_FIBER_DATA(NtCurrentTeb()) = f;
   TEB_SAME_FLAGS(NtCurrentTeb()) |= 4;
+  NtSetInformationThread(NtCurrentThread(), 0x80, NULL, 0);      /* (the stack is a fiber's now: it stays if the thread ends before the fiber is switched to or deleted) */
   return f;
 }
 EXPORT PVOID WINAPI ConvertThreadToFiber(PVOID parameter) { return ConvertThreadToFiberEx(parameter, 0); }

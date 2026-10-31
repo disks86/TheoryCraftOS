@@ -300,7 +300,10 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
   record.finished = true;
   record.exit_code = code;
   if (record.region_size && p.address_space()) {
-    p.address_space()->unmap(record.region_base, record.region_size);
+    // (the region is the stack, then the TEB and the TLS block: the stack of a thread that became a fiber may be switched to later, so only what follows it goes)
+    const bool keep = record.keep_stack && record.teb > record.region_base && record.teb - record.region_base < record.region_size;
+    const uint64_t from = keep ? record.teb : record.region_base;
+    p.address_space()->unmap(from, record.region_size - (from - record.region_base));
     record.region_size = 0;
   }
   for (uint32_t i = 0; i < kMaxTlsModules; ++i) {      // thread-local blocks of libraries loaded after the thread began
@@ -775,6 +778,10 @@ uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
       return p.runtime() && p.runtime()->set_affinity(record->id, mask) ? kSuccess : kInvalidParameter;
     }
     case 17: return length == 0 ? kSuccess : kInfoLengthMismatch;
+    case 0x80:     // this OS's own class: the thread's stack stays when the thread ends (the thread became a fiber, which another one may switch to after that)
+      if (length != 0) return kInfoLengthMismatch;
+      record->keep_stack = true;
+      return kSuccess;
     default: return kInvalidInfoClass;
   }
 }

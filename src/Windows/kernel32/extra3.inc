@@ -968,7 +968,7 @@ typedef RTL_WALK_ENTRY_ HEAPWALK_;
 #define TH32CS_SNAPMODULE_ 8
 #define TH32CS_SNAPMODULE32_ 0x10
 #define SNAP_MAX 8
-static BOOL IsHandleValid_(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }      /* (a snapshot's handle is an event) */
+static BOOL IsHandleValid_(HANDLE h) { DWORD flags; return GetHandleInformation(h, &flags); }      /* (not SetEvent: the value of a closed snapshot may belong to an event of the program by now, which must stay as it is) */
 typedef struct {
   HANDLE handle;
   DWORD process_count, process_next, thread_count, thread_next, module_count, module_next, heap_count, heap_next;

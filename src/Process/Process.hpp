@@ -295,6 +295,7 @@ class Process {
     uint16_t description[kMaxDescriptionChars] = {};  // SetThreadDescription
     uint32_t description_bytes = 0;
     uint64_t teb = 0, region_base = 0, region_size = 0;      // the thread's TEB and the one region that holds its stack, TEB and TLS block
+    bool keep_stack = false;                          // the stack is a fiber now (ConvertThreadToFiber): it outlives the thread, only the TEB and the TLS block go when the thread ends
   };
   // What the program can set and read back about itself.
   uint32_t priority_class = 0x20;                     // NORMAL_PRIORITY_CLASS
