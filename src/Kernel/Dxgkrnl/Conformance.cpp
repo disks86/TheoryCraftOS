@@ -101,6 +101,9 @@ class Rig {
     step("create_descriptor_heap", ok() ? kernel_.create_descriptor_heap(kProcess, device_, type, count, &h) : status_);
     return h;
   }
+  void map_tiles(Handle reserved, uint32_t first, Handle heap, uint64_t heap_offset, uint32_t count) {
+    step("update_tile_mappings", ok() ? kernel_.update_tile_mappings(kProcess, reserved, first, heap, heap_offset, count) : status_);
+  }
   void descriptor(Handle heap, uint32_t index, const DescriptorDesc& d) { step("write_descriptor", ok() ? kernel_.write_descriptor(kProcess, heap, index, d) : status_); }
   Handle buffer(uint32_t flags, ConstByteView contents) {
     AllocationDesc d;
@@ -499,6 +502,35 @@ void scene_dxil_int64(Rig& rig, ArrayView<uint32_t> out) {
   w.end_pass();
   rig.render(w, {target, vb});
   rig.read(target, out);
+}
+
+// A reserved (tiled) texture: 256 x 128 pixels, two 128 x 128 tiles, mapped to the places in a heap where two placed textures were filled (the second tile first), and drawn over the target.
+void scene_d3d12_tiled_texture(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_ps_tex, sizeof b::k_ps_tex, 1);
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 3 * 65536;
+  Handle heap = rig.create(hd);
+  AllocationDesc id;
+  id.flags = kAllocTexture, id.format = Format::A8R8G8B8, id.width = id.height = 128, id.heap = heap, id.heap_offset = 0;
+  Handle first = rig.create(id);
+  id.heap_offset = 2 * 65536;
+  Handle second = rig.create(id);
+  ByteBuffer one(rig.allocator()), two(rig.allocator());
+  for (uint32_t y = 0; y < 128; ++y)
+    for (uint32_t x = 0; x < 128; ++x) {
+      one.put32(0xFF000000u | (((x / 16) & 1) ? 0xF04020u : 0x2040F0u) | (((y / 16) & 1) ? 0x00008000u : 0u));
+      two.put32(0xFF000000u | (x * 2 << 16) | (y * 2 << 8) | 0x40u);
+    }
+  rig.write(first, one.view());
+  rig.write(second, two.view());
+  AllocationDesc rd;
+  rd.flags = kAllocTexture | kAllocReserved, rd.format = Format::A8R8G8B8, rd.width = 256, rd.height = 128;
+  Handle texture = rig.create(rd);
+  rig.map_tiles(texture, 0, heap, 2 * 65536, 1);   // (tile 0 is what the second placed texture holds, tile 1 the first)
+  rig.map_tiles(texture, 1, heap, 0, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Nearest, out);
 }
 
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
@@ -2391,6 +2423,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL comparison sampling (Shader Model 6)", scene_dxil_compare},
     {"Direct3D 12 DXIL double precision (Shader Model 6)", scene_dxil_double},
     {"Direct3D 12 DXIL 64-bit integers (Shader Model 6)", scene_dxil_int64},
+    {"Direct3D 12 reserved texture", scene_d3d12_tiled_texture},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},

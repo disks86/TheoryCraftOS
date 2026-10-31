@@ -4978,6 +4978,62 @@ void test_d3d12_buffer_views() {
   CHECK(run(vb) == status::kInvalidParameter);
 }
 
+
+// Reserved (tiled) textures: 128 x 128 tiles of 4-byte pixels mapped to places in a heap.
+void test_d3d12_reserved_texture() {
+  Env e;
+  auto create = [&](uint32_t flags, uint32_t width, uint32_t height, Handle heap, uint64_t offset, Handle* out) {
+    AllocationDesc d;
+    d.flags = flags, d.format = Format::A8R8G8B8, d.width = width, d.height = height, d.heap = heap, d.heap_offset = offset;
+    return e.kernel.create_allocation(kPid, e.dev, d, out);
+  };
+  Handle heap = 0, p = 0, q = 0, r = 0, none = 0;
+  CHECK(create(kAllocHeap, 0, 0, 0, 0, &heap) == status::kInvalidParameter);   // (a heap has a size, not a shape)
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 4 * kTileBytes;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, hd, &heap) == status::kSuccess);
+  CHECK(create(kAllocTexture, 128, 128, heap, 0, &p) == status::kSuccess && create(kAllocTexture, 128, 128, heap, 2 * kTileBytes, &q) == status::kSuccess);
+  CHECK(create(kAllocTexture | kAllocReserved, 256, 256, 0, 0, &r) == status::kSuccess);
+  CHECK(create(kAllocTexture | kAllocReserved, 200, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 0, 0, 0, &none) == status::kInvalidParameter);
+  CHECK(create(kAllocTexture | kAllocRenderTarget | kAllocReserved, 256, 256, 0, 0, &none) == status::kInvalidParameter && create(kAllocTexture | kAllocReserved, 256, 256, heap, 0, &none) == status::kInvalidParameter);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 0, heap, 0, 1) == status::kSuccess && e.kernel.update_tile_mappings(kPid, r, 3, heap, 2 * kTileBytes, 1) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, r, 4, heap, 0, 1) == status::kInvalidParameter && e.kernel.update_tile_mappings(kPid, r, 0, heap, 3 * kTileBytes, 2) == status::kInvalidParameter);
+  CHECK(e.fill(p, 0xFF112233u) && e.fill(q, 0xFF445566u));
+  // Reading it: tile 0 holds what the placed texture at the start of the heap does, tile 3 the other, the tiles between nothing.
+  CHECK(e.pixel(r, 10, 10) == 0xFF112233u && e.pixel(r, 127, 127) == 0xFF112233u && e.pixel(r, 128, 128) == 0xFF445566u && e.pixel(r, 255, 255) == 0xFF445566u);
+  CHECK(e.pixel(r, 200, 10) == 0 && e.pixel(r, 10, 200) == 0);
+  // Writing a pixel of tile 3 through the reserved texture: the placed texture shows it at the same place of its own; a write to an unmapped tile is dropped.
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, r, 0, 0, &lock) == status::kSuccess);
+  const uint32_t mark = 0xFF778899u;
+  ByteWriter(lock.data.subview((200u * 256 + 200) * 4, 4)).le32(mark);
+  ByteWriter(lock.data.subview((10u * 256 + 200) * 4, 4)).le32(mark);
+  e.kernel.unlock(kPid, r);
+  CHECK(e.pixel(q, 72, 72) == mark && e.pixel(r, 200, 10) == 0);
+  // And the GPU reads it: a triangle that shows the texture over the target gives one quadrant of each kind (two black, one of each colour).
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 20);
+  Handle pipe = make_colored_pipeline(e, true);
+  const float quad[15] = {-1, -1, 0.5f, 0, 0, 3, -1, 0.5f, 2, 0, -1, 3, 0.5f, 0, 2};
+  CHECK(e.write(vb, floats(quad, 15)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(2);
+  w.push_constants(floats(identity, 16));
+  w.bind_texture(0, 1, graphics::SamplerDesc());
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, r, vb}) == status::kSuccess);
+  unsigned first = 0, second = 0, black = 0;
+  for (uint32_t y : {2u, 6u})
+    for (uint32_t x : {2u, 6u}) {
+      const uint32_t c = e.pixel(target, x, y);
+      first += c == 0xFF112233u, second += c == 0xFF445566u || c == mark, black += (c & 0xFFFFFF) == 0;
+    }
+  CHECK(first == 1 && second == 1 && black == 2);
+}
+
 // Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
 void test_d3d12_barriers() {
   Env e;
@@ -7341,6 +7397,7 @@ int main() {
   test_d3d12_barriers();
   test_d3d12_heaps();
   test_d3d12_reserved();
+  test_d3d12_reserved_texture();
   test_dxil();
   test_compute_shared();
   test_geometry_extras();
