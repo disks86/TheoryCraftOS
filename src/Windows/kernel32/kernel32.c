@@ -2610,14 +2610,14 @@ static HANDLE g_std_override[3];
 static BOOL g_std_overridden[3];
 EXPORT HANDLE WINAPI GetStdHandle(DWORD which) {
   const int i = which == STD_INPUT_HANDLE ? 0 : which == STD_OUTPUT_HANDLE ? 1 : which == STD_ERROR_HANDLE ? 2 : -1;
-  if (i < 0) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (i < 0) { set_error(ERROR_INVALID_HANDLE); return INVALID_HANDLE_VALUE; }
   if (g_std_overridden[i]) return g_std_override[i];
   RTL_USER_PROCESS_PARAMETERS *p = parameters();
   return i == 0 ? p->StandardInput : i == 1 ? p->StandardOutput : p->StandardError;
 }
 EXPORT BOOL WINAPI SetStdHandle(DWORD which, HANDLE h) {
   const int i = which == STD_INPUT_HANDLE ? 0 : which == STD_OUTPUT_HANDLE ? 1 : which == STD_ERROR_HANDLE ? 2 : -1;
-  if (i < 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (i < 0) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   RTL_USER_PROCESS_PARAMETERS *p = parameters();      /* (the standard handles live in the process parameters, where the console functions look too) */
   if (i == 0) p->StandardInput = h; else if (i == 1) p->StandardOutput = h; else p->StandardError = h;
   g_std_override[i] = h;
@@ -3775,8 +3775,11 @@ EXPORT BOOL WINAPI SetEndOfFile(HANDLE h) {
   const NTSTATUS status = NtSetInformationFile(h, &iosb, &position, 8, 20);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
+EXPORT BOOL WINAPI FlushConsoleInputBuffer(HANDLE h);
 EXPORT BOOL WINAPI FlushFileBuffers(HANDLE h) {
   IO_STATUS_BLOCK iosb;
+  if (con_is_input(h)) return FlushConsoleInputBuffer(h);      /* the input of a console: what was typed and not read is dropped */
+  if (con_is_output_only(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   const NTSTATUS status = NtFlushBuffersFile(h, &iosb);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }

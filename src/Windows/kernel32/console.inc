@@ -637,6 +637,9 @@ static BOOL con_read_events(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD 
 }
 EXPORT BOOL WINAPI ReadConsoleInputW(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD read) { return con_read_events(h, out, length, read, TRUE, TRUE); }
 EXPORT BOOL WINAPI ReadConsoleInputA(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD read) { return con_read_events(h, out, length, read, TRUE, TRUE); }
+/* flags: CONSOLE_READ_NOREMOVE 1 (the events stay), CONSOLE_READ_NOWAIT 2 (an empty queue is answered with none). */
+EXPORT BOOL WINAPI ReadConsoleInputExW(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD read, USHORT flags) { return con_read_events(h, out, length, read, !(flags & 1), !(flags & 2)); }
+EXPORT BOOL WINAPI ReadConsoleInputExA(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD read, USHORT flags) { return con_read_events(h, out, length, read, !(flags & 1), !(flags & 2)); }
 EXPORT BOOL WINAPI PeekConsoleInputW(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD read) { return con_read_events(h, out, length, read, FALSE, FALSE); }
 EXPORT BOOL WINAPI PeekConsoleInputA(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD read) { return con_read_events(h, out, length, read, FALSE, FALSE); }
 EXPORT BOOL WINAPI GetNumberOfConsoleInputEvents(HANDLE h, LPDWORD count) {
@@ -1020,7 +1023,11 @@ EXPORT BOOL WINAPI WriteConsoleA(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD
   con_lock();
   const BOOL ours = con_buffer(h) != NULL;
   con_unlock();
-  if (!ours) return WriteFile(h, buffer, length, written, NULL);
+  if (!ours) {
+    const int type = device_type(h);
+    if (type < 0 || type == 7 /* FILE_DEVICE_DISK: a file is no console */) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+    return WriteFile(h, buffer, length, written, NULL);
+  }
   WCHAR wide[1024];
   DWORD done = 0;
   const BYTE *b = buffer;
@@ -1100,8 +1107,8 @@ EXPORT BOOL WINAPI SetConsoleCursorPosition(HANDLE h, COORD pos) {
   return ok;
 }
 EXPORT BOOL WINAPI GetConsoleCursorInfo(HANDLE h, CONSOLE_CURSOR_INFO_ *info) {
-  if (!info) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WITH_BUFFER(h, sb, FALSE)
+  if (!info) { con_unlock(); set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   *info = sb->cursor_info;
   con_unlock();
   return TRUE;
@@ -1144,16 +1151,29 @@ EXPORT BOOL WINAPI GetCurrentConsoleFont(HANDLE h, BOOL maximum, CONSOLE_FONT_IN
   info->nFont = 0; info->dwFontSize.X = 8; info->dwFontSize.Y = 16;
   return TRUE;
 }
-EXPORT COORD WINAPI GetConsoleFontSize(HANDLE h, DWORD font) { (void)h; (void)font; COORD c = {8, 16}; return c; }
+EXPORT DWORD WINAPI GetNumberOfConsoleFonts(void) { return 1; }
+EXPORT COORD WINAPI GetConsoleFontSize(HANDLE h, DWORD font) {
+  COORD c = {0, 0};
+  if (!con_buffer_or_main(h)) { set_error(ERROR_INVALID_HANDLE); return c; }
+  if (font >= 1) { set_error(ERROR_INVALID_PARAMETER); return c; }      /* (there is one font) */
+  c.X = 8; c.Y = 16;
+  return c;
+}
 EXPORT BOOL WINAPI GetCurrentConsoleFontEx(HANDLE h, BOOL maximum, CONSOLE_FONT_INFOEX_ *info) {
   (void)maximum;
-  if (!info || info->cbSize != sizeof(*info) || !con_buffer_or_main(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  if (!info || info->cbSize != sizeof(*info)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!con_buffer_or_main(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   info->nFont = 0; info->dwFontSize.X = 8; info->dwFontSize.Y = 16; info->FontFamily = 0x36; info->FontWeight = 400;
   static const WCHAR name[] = {'T', 'e', 'r', 'm', 'i', 'n', 'a', 'l', 0};
   memcpy(info->FaceName, name, sizeof(name));
   return TRUE;
 }
-EXPORT BOOL WINAPI SetCurrentConsoleFontEx(HANDLE h, BOOL maximum, CONSOLE_FONT_INFOEX_ *info) { (void)maximum; (void)info; return con_buffer_or_main(h) ? TRUE : (set_error(ERROR_INVALID_HANDLE), FALSE); }
+EXPORT BOOL WINAPI SetCurrentConsoleFontEx(HANDLE h, BOOL maximum, CONSOLE_FONT_INFOEX_ *info) {
+  (void)maximum;
+  if (!info || info->cbSize != sizeof(*info)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!con_buffer_or_main(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
+  return TRUE;
+}
 
 EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD flags, LPVOID data) {
   (void)access; (void)share; (void)sa; (void)data;
@@ -1263,12 +1283,14 @@ static BOOL block_io(HANDLE h, CHAR_INFO_ *data, COORD bufsize, COORD bufcoord, 
   if (!region || !data) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   WITH_BUFFER(h, sb, FALSE)
   SMALL_RECT r = *region;
+  if (r.Right < r.Left || r.Bottom < r.Top || bufcoord.X < 0 || bufcoord.Y < 0 || bufcoord.X >= bufsize.X || bufcoord.Y >= bufsize.Y) { con_unlock(); set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   /* clipped to the screen buffer and to the program's array */
   if (r.Left < 0) { bufcoord.X = (SHORT)(bufcoord.X - r.Left); r.Left = 0; }
   if (r.Top < 0) { bufcoord.Y = (SHORT)(bufcoord.Y - r.Top); r.Top = 0; }
   if (r.Right >= sb->size.X) r.Right = (SHORT)(sb->size.X - 1);
   if (r.Bottom >= sb->size.Y) r.Bottom = (SHORT)(sb->size.Y - 1);
   const int width = r.Right - r.Left + 1, height = r.Bottom - r.Top + 1;
+  if (width <= 0 || height <= 0 || r.Left > r.Right || r.Top > r.Bottom) { con_unlock(); return TRUE; }      /* (a rectangle outside the screen buffer: nothing to do, and it is left as it is) */
   BOOL ok = width > 0 && height > 0 && bufcoord.X >= 0 && bufcoord.Y >= 0 && bufcoord.X < bufsize.X && bufcoord.Y < bufsize.Y;
   if (ok) {
     const int w = width < bufsize.X - bufcoord.X ? width : bufsize.X - bufcoord.X, hh = height < bufsize.Y - bufcoord.Y ? height : bufsize.Y - bufcoord.Y;
@@ -1318,3 +1340,7 @@ static BOOL scroll_block(HANDLE h, const SMALL_RECT *scroll, const SMALL_RECT *c
 }
 EXPORT BOOL WINAPI ScrollConsoleScreenBufferW(HANDLE h, const SMALL_RECT *scroll, const SMALL_RECT *clip, COORD dest, const CHAR_INFO_ *fill) { return scroll_block(h, scroll, clip, dest, fill, FALSE); }
 EXPORT BOOL WINAPI ScrollConsoleScreenBufferA(HANDLE h, const SMALL_RECT *scroll, const SMALL_RECT *clip, COORD dest, const CHAR_INFO_ *fill) { return scroll_block(h, scroll, clip, dest, fill, TRUE); }
+
+/* Windows 10 no longer has these: they fail with E_NOTIMPL (the low word of it is the error). */
+EXPORT BOOL WINAPI GetConsoleFontInfo(HANDLE h, BOOL maximum, DWORD count, LPVOID info) { (void)h; (void)maximum; (void)count; (void)info; set_error(0x4001); return FALSE; }
+EXPORT BOOL WINAPI SetConsoleFont(HANDLE h, DWORD font) { (void)h; (void)font; set_error(0x4001); return FALSE; }
