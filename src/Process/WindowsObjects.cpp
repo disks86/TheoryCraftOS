@@ -1139,13 +1139,23 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
   auto put32 = [&](uint32_t at, uint32_t v) { for (uint32_t i = 0; i < 4; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
   uint32_t size = 0;
   switch (info_class) {
-    case 0:      // OBJECT_BASIC_INFORMATION
+    case 0: {      // OBJECT_BASIC_INFORMATION
       put32(0, (p.files().inheritable(slot) ? 2u : 0u) | (p.files().protected_from_close(slot) ? 1u : 0u));      // Attributes (OBJ_INHERIT, a protected handle)
-      put32(4, 0x001F0FFF);      // GrantedAccess
+      uint32_t granted = 0x001F0FFF;
+      if (p.files().kind(slot) == DescriptorKind::Directory) if (const OpenObject* opened = p.files().object(slot)) if (opened->granted_access != 0) {      // a directory handle says what it was opened for
+        granted = opened->granted_access;
+        if (granted & 0x80000000u) granted |= 0x120089u;      // GENERIC_READ
+        if (granted & 0x40000000u) granted |= 0x120116u;      // GENERIC_WRITE
+        if (granted & 0x20000000u) granted |= 0x1200A0u;      // GENERIC_EXECUTE
+        if (granted & 0x10000000u) granted |= 0x1F01FFu;      // GENERIC_ALL
+        granted &= ~0xF0000000u;
+      }
+      put32(4, granted);      // GrantedAccess
       put32(8, 1);               // HandleCount
       put32(12, 1);              // PointerCount
       size = 56;
       break;
+    }
     case 2: {    // OBJECT_TYPE_INFORMATION (the name only: a UNICODE_STRING and its characters)
       const char* type = "File";
       switch (p.files().kind(slot)) {

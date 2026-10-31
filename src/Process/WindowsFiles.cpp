@@ -380,6 +380,8 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   } else if ((options & kDeleteOnClose) && !(access & (kGenericAll | 0x10000))) {
     return kAccessDenied;
   }
+  if (existed && before.type == NodeType::Directory && sharing && wanted && sharing->share_acquire(virtual_path.view(), nullptr, wanted, share) == ObjectManager::ShareResult::Violation)
+    return kSharingViolation;      // (a directory somebody holds open without sharing delete - the current directory of a program - cannot be removed or opened for deleting)
   uint32_t slot = 0;
   bool created = false;
   const Status status = files.open(virtual_path.view(), f, &slot, &created);
@@ -405,7 +407,8 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     if (opened->no_data_access) opened->readable = false;      // (a handle for attributes only reads nothing)
     opened->writable = (access & (kGenericAll | kGenericWrite | kFileWriteData | kFileAppendData)) != 0;      // (an overwrite writes through the file system's own handle, not the program's)
   }
-  if (sharing && wanted && files.kind(slot) == DescriptorKind::File) sharing->share_acquire(virtual_path.view(), files.object(slot), wanted, share);
+  if (files.kind(slot) == DescriptorKind::Directory) if (OpenObject* opened = files.object(slot)) opened->granted_access = access;
+  if (sharing && wanted && (files.kind(slot) == DescriptorKind::File || files.kind(slot) == DescriptorKind::Directory)) sharing->share_acquire(virtual_path.view(), files.object(slot), wanted, share);
   if (options & kDeleteOnClose) files.object(slot)->delete_on_close = true;
   uint32_t object_flags = 0;
   uint8_t flag_bytes[4];

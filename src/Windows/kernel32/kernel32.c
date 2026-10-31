@@ -3355,10 +3355,24 @@ EXPORT BOOL WINAPI SetCurrentDirectoryW(LPCWSTR path) {
   WCHAR *fresh = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, room * 2);
   if (!fresh) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
   memcpy(fresh, full, (SIZE_T)(length + 1) * 2);
-  UNICODE_STRING *cwd = &parameters()->CurrentDirectoryPath;
+  /* The directory is held open (FILE_TRAVERSE, sharing read and write but not delete), as the real one is: it cannot be removed while it is the current one. */
+  HANDLE held = NULL;
+  {
+    WCHAR nt_buffer[PATH_CHARS + 8];
+    UNICODE_STRING nt_us;
+    OBJECT_ATTRIBUTES nt_attributes;
+    IO_STATUS_BLOCK iosb;
+    if (nt_name(full, nt_buffer, &nt_us, &nt_attributes) &&
+        !NT_SUCCESS(NtOpenFile(&held, 0x20 | 0x00100000 /* FILE_TRAVERSE | SYNCHRONIZE */, &nt_attributes, &iosb, 3, 0x1 | 0x20 /* FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT */)))
+      held = NULL;
+  }
+  RTL_USER_PROCESS_PARAMETERS *current = parameters();
+  UNICODE_STRING *cwd = &current->CurrentDirectoryPath;
   cwd->Buffer = fresh;
   cwd->Length = (USHORT)(length * 2);
   cwd->MaximumLength = (USHORT)(room * 2);
+  if (current->CurrentDirectoryHandle) NtClose(current->CurrentDirectoryHandle);
+  current->CurrentDirectoryHandle = held;
   return TRUE;
 }
 EXPORT BOOL WINAPI SetCurrentDirectoryA(LPCSTR path) {
@@ -3800,6 +3814,7 @@ EXPORT BOOL WINAPI DeleteFileA(LPCSTR path) { if (!path) { set_error(ERROR_PATH_
 
 EXPORT BOOL WINAPI CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
   (void)sa;
+  if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
@@ -3811,7 +3826,7 @@ EXPORT BOOL WINAPI CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
   NtClose(h);
   return TRUE;
 }
-EXPORT BOOL WINAPI CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa) { WCHAR *w = to_wide(path); const BOOL ok = w ? CreateDirectoryW(w, sa) : FALSE; free_wide(w); return ok; }
+EXPORT BOOL WINAPI CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa) { if (!path) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; } WCHAR *w = to_wide(path); const BOOL ok = w ? CreateDirectoryW(w, sa) : FALSE; free_wide(w); return ok; }
 EXPORT BOOL WINAPI RemoveDirectoryW(LPCWSTR path) {
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
