@@ -3052,6 +3052,14 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
         if (r.kind == 12) word(162u | (4u << 24)), word((7u << 12) | (1u << 20)), word(r.lower), word(r.stride);
         else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
       }
+      for (uint32_t i = 0; i < kMaxResources; ++i) {   // (and the unordered access views of both)
+        const Resource& r = res_[1][i];
+        if (!r.present) continue;
+        if (r.lower >= graphics::kMaxUavBuffers) return status::kNotSupported;
+        if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+        else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
+        else return status::kNotSupported;
+      }
       if (points_in < 1 || points_in > graphics::kMaxPatchControlPoints) return status::kNotSupported;
       for (uint32_t i = 0; i < input_count_; ++i) {
         const SigElement& e = inputs_[i];
@@ -3134,8 +3142,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
       else return status::kNotSupported;
     }
-  } else if (pixel || vertex || geometry) {
-    // (a pixel, vertex or geometry shader's unordered access views: buffers it writes)
+  } else if (pixel || vertex || geometry || domain) {
+    // (a pixel, vertex, geometry or domain shader's unordered access views: buffers it writes)
     for (uint32_t i = 0; i < kMaxResources; ++i) {
       const Resource& r = res_[1][i];
       if (!r.present) continue;

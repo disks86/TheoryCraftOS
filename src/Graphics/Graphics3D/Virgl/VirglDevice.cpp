@@ -697,7 +697,7 @@ uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
   const uint32_t wrap_t = sampler.address_v == AddressMode::Repeat ? virgl::kWrapRepeat : virgl::kWrapClampToEdge;
   const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
   // No mipmaps: the minification filter is the magnification one and no level is chosen between.
-  const uint32_t s0 = wrap_s | (wrap_t << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13);
+  const uint32_t s0 = wrap_s | (wrap_t << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13) | (1u << 19) /* seamless cube maps: Direct3D always filters across the edges of a cube */;
   const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, 0, 0, 0, 0, 0, 0, 0};
   if (!send_commands(cmd, 10)) return 0;
   sampler_states_[key] = handle;
@@ -1353,7 +1353,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           stream.put(patch_points);
           stream.put(0);   // draw id
         }
-        if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores || pipeline->desc().geometry_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
+        if (pipeline->desc().fragment_stores || pipeline->desc().vertex_stores || pipeline->desc().geometry_stores || pipeline->desc().tessellation_stores) {   // (what the shaders wrote is there for the next read, a transfer to the system included)
           stream.command(virgl::kMemoryBarrier, 0, 1);
           stream.put(0xFFFFFFFFu);
         }

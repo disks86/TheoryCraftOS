@@ -1250,7 +1250,7 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
 // Tessellates one patch: the hull shader makes the output control points and the factors, the tessellator the domain points and the primitives joining them, and the domain shader turns each
 // point into a vertex (a triangle's w is 1 - u - v; a quad's and an isoline's shader has no w). Triangles are drawn in the order the tessellator made them, the way a Direct3D pipeline
 // hands them to the rasterizer; a patch the tessellator culls draws nothing.
-void run_tessellation(const DrawState& s, Tessellator& tessellator, const SoftwareShaderModule& hull, const SoftwareShaderModule& domain, const ClipVertex* v, uint32_t count) {
+void run_tessellation(allocators::IAllocator& allocator, const DrawState& s, Tessellator& tessellator, const SoftwareShaderModule& hull, const SoftwareShaderModule& domain, const ClipVertex* v, uint32_t count) {
   const ShaderModuleDesc& hd = hull.desc();
   HullInputData input;
   input.storage = s.storage;
@@ -1268,13 +1268,30 @@ void run_tessellation(const DrawState& s, Tessellator& tessellator, const Softwa
   const bool triangles = hd.tess_domain == TessDomain::Triangle;
   const ArrayView<const Tessellator::Point> points = tessellator.points();
   const ArrayView<const uint16_t> indices = tessellator.indices();
+  // A domain shader that writes buffers runs once for each point the tessellator makes, as the hardware's does (not again for each triangle that uses the point): the vertices are kept.
+  const bool once = s.pipeline->desc().tessellation_stores;
+  ArrayView<ClipVertex> kept = once ? allocate_view<ClipVertex>(allocator, points.size()) : ArrayView<ClipVertex>();
+  ArrayView<uint8_t> have = once ? allocate_view<uint8_t>(allocator, points.size()) : ArrayView<uint8_t>();
+  struct Release {
+    allocators::IAllocator& allocator;
+    ArrayView<ClipVertex>& vertices;
+    ArrayView<uint8_t>& flags;
+    ~Release() {
+      release_view(allocator, vertices);
+      release_view(allocator, flags);
+    }
+  } release{allocator, kept, have};
+  if (once && (kept.empty() || have.empty())) return;
+  if (once) have.fill(0);
   auto vertex = [&](uint32_t index) {
+    if (once && have[index]) return kept[index];
     const Tessellator::Point p = points[index];
     ShaderIo io;
     ds(patch, p.u, p.v, triangles ? 1.0f - p.u - p.v : 0.0f, s.constants, &io);
     ClipVertex c;
     c.position = io.position;
     for (uint32_t k = 0; k < kMaxVaryings; ++k) c.varying[k] = io.varying[k];
+    if (once) kept[index] = c, have[index] = 1;
     return c;
   };
   const bool rasterize = !s.pipeline->desc().stream_output_count || s.pipeline->desc().rasterized_stream == 0;
@@ -1769,7 +1786,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             for (uint32_t k = 0; k < per_primitive; ++k)
               if (!vertex_at(t + k, instance, &v[k])) return false;
             if (patches) {
-              run_tessellation(s, *tessellator.get(), *hull, *domain, v, per_primitive);
+              run_tessellation(allocator_, s, *tessellator.get(), *hull, *domain, v, per_primitive);
               continue;
             }
             if (geometry) {
