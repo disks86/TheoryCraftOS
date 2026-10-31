@@ -561,11 +561,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     ConstByteView body = in.take(uint64_t{words - 1} * 4);
     if (!in.ok()) return status::kInvalidParameter;
     ByteReader p(body);
-    // Extended opcode tokens: sample offsets must be zero; the others (resource dimension, return type) change nothing.
+    // Extended opcode tokens: sample offsets are taken by gather4 only (and are zero for the rest); the others (resource dimension, return type) change nothing.
+    int32_t sample_offset[3] = {0, 0, 0};
     for (uint32_t ext = token; (ext >> 31) != 0;) {
       ext = p.le32();
       if (!p.ok()) return status::kInvalidParameter;
-      if ((ext & 0x3F) == 1 && ((ext >> 9) & 0xFFF) != 0) return status::kNotSupported;
+      if ((ext & 0x3F) == 1) {
+        for (uint32_t k = 0; k < 3; ++k) {
+          const int32_t value = static_cast<int32_t>((ext >> (9 + 4 * k)) & 0xF);
+          sample_offset[k] = value >= 8 ? value - 16 : value;
+        }
+        const bool gather = opcode == 109 || opcode == 126;
+        if ((sample_offset[0] || sample_offset[1] || sample_offset[2]) && (!gather || sample_offset[2])) return status::kNotSupported;
+      }
     }
     NtStatus s = status::kSuccess;
     switch (opcode) {
@@ -1036,12 +1044,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((s = to_src(value, &ins.src[1])) != status::kSuccess) return s;
         ins.src_count = 2;
       }
-    } else if (opcode == kSample4 || opcode == 109 || opcode == 73 || opcode == 74 || opcode == 108 || opcode == 70 || opcode == 71) {   // (sample, gather4, sample_d, sample_b, lod, sample_c, sample_c_lz)
+    } else if (opcode == kSample4 || opcode == 109 || opcode == 73 || opcode == 74 || opcode == 108 || opcode == 70 || opcode == 71 || opcode == 126 || opcode == 127 || opcode == 128) {   // (sample, gather4 and its variants, sample_d, sample_b, lod, sample_c, sample_c_lz)
       if (vertex || compute) return status::kNotSupported;   // (no textures in the vertex stage)
-      Operand d, coordinate, resource, sampler;
-      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess ||
-          (s = read_operand(p, &sampler)) != status::kSuccess)
-        return s;
+      Operand d, coordinate, resource, sampler, gather_offset;
+      const bool gather_op = opcode == 109 || opcode == 126 || opcode == 127 || opcode == 128;
+      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess) return s;
+      if ((opcode == 127 || opcode == 128) && (s = read_operand(p, &gather_offset)) != status::kSuccess) return s;   // (gather4_po: the offset in a register)
+      if ((s = read_operand(p, &resource)) != status::kSuccess || (s = read_operand(p, &sampler)) != status::kSuccess) return s;
       uint32_t unit = resource.index[0];
       if (v51) {
         // t[range][index]: the range's register, indexed from it
@@ -1055,7 +1064,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || sampler.type != kOpSampler) return status::kNotSupported;
       Operand extra[2];
       if ((opcode == 108 || opcode == 70 || opcode == 71) && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
-      if (opcode == 70 || opcode == 71) {   // sample_c: the reference value
+      if (opcode == 70 || opcode == 71 || opcode == 126 || opcode == 128) {   // sample_c, gather4_c: the reference value
         if ((s = read_operand(p, &extra[0])) != status::kSuccess) return s;
       }
       if (opcode == 73 || opcode == 74) {   // sample_d: the two gradients, sample_b: the bias (2D textures only)
@@ -1063,7 +1072,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if ((s = read_operand(p, &extra[k])) != status::kSuccess) return s;
         if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
       }
-      ins.op = opcode == 109 ? kTexGather : opcode == 73 ? kTexGrad : opcode == 74 ? kTexBias : opcode == 108 ? kTexQueryLod : (opcode == 70 || opcode == 71) ? kTexCompare : kTexLd;
+      ins.op = gather_op ? kTexGather : opcode == 73 ? kTexGrad : opcode == 74 ? kTexBias : opcode == 108 ? kTexQueryLod : (opcode == 70 || opcode == 71) ? kTexCompare : kTexLd;
       s = to_dst(d, &ins.dst);
       if (s != status::kSuccess) return s;
       s = to_src(coordinate, &ins.src[0]);
@@ -1090,11 +1099,25 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         program->uses_system_values_ = true;   // (the quad)
         if (resource.components == 2)
           for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
-      } else if (opcode == 109) {
-        // (the component to gather is the resource operand's single selected one; no gather of volumes, cubes and arrays)
-        if ((program->texture_kind_[unit] != graphics::TextureKind::Texture2D && program->texture_kind_[unit] != graphics::TextureKind::Texture2DArray && program->texture_kind_[unit] != graphics::TextureKind::TextureCube) || resource.components != 2)
-          return status::kNotSupported;   // (a volume has no gather)
-        ins.control = resource.swizzle[0];
+      } else if (gather_op) {
+        // The component to gather is the resource operand's single selected one (gather4_c always compares the red); the footprint may be offset in texels (a register, or the extended opcode token's
+        // constant) on 2D textures and arrays; the comparison (reference <= texel) is of the texels one by one. A volume has no gather.
+        const graphics::TextureKind kind = program->texture_kind_[unit];
+        const bool compare = opcode == 126 || opcode == 128, programmable = opcode == 127 || opcode == 128, offset_static = sample_offset[0] || sample_offset[1];
+        if ((kind != graphics::TextureKind::Texture2D && kind != graphics::TextureKind::Texture2DArray && kind != graphics::TextureKind::TextureCube) || resource.components != 2) return status::kNotSupported;
+        if ((programmable || offset_static) && kind == graphics::TextureKind::TextureCube) return status::kNotSupported;
+        ins.control = static_cast<uint8_t>((compare ? 0 : resource.swizzle[0]) | (compare ? 4 : 0) | (programmable ? 8 : 0) | (offset_static ? 16 : 0));
+        uint32_t next = 2;
+        if (programmable) {
+          s = to_src(gather_offset, &ins.src[next++]);
+          if (s != status::kSuccess) return s;
+        }
+        if (compare) {
+          s = to_src(extra[0], &ins.src[next++]);
+          if (s != status::kSuccess) return s;
+        }
+        ins.src_count = static_cast<uint8_t>(next);
+        ins.texel_offset[0] = static_cast<int8_t>(sample_offset[0]), ins.texel_offset[1] = static_cast<int8_t>(sample_offset[1]);
       } else if (resource.components == 2) {
         for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
       }

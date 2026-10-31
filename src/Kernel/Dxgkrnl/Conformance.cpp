@@ -2581,6 +2581,26 @@ void scene_dxil_pixel_stores(Rig& rig, ArrayView<uint32_t> out) {
     for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
 }
 
+// gather4 with constant offsets (dxil_ps_gather_off.hlsl) over the checker texture, and gather4_c (dxil_ps_gather_cmp.hlsl) over a texture whose red grows from the left.
+void scene_dxil_gather_offsets(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_gather_off, sizeof b::k_dxil_ps_gather_off, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle texture = checker(rig);
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
+void scene_dxil_gather_compare(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_gather_cmp, sizeof b::k_dxil_ps_gather_cmp, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16);
+  Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(texture, bytes_of(texels, sizeof texels));
+  textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2622,6 +2642,8 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL gather4 (Shader Model 6)", scene_dxil_gather},
     {"Direct3D 12 DXIL gather4 on layers of an image set (Shader Model 6)", scene_dxil_gather_array},
     {"Direct3D 12 DXIL gather4 on a cubemap (Shader Model 6)", scene_dxil_gather_cube},
+    {"Direct3D 12 DXIL gather4 with offsets (Shader Model 6)", scene_dxil_gather_offsets},
+    {"Direct3D 12 DXIL gather4 with a comparison (Shader Model 6)", scene_dxil_gather_compare},
     {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
     {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
     {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},

@@ -1048,7 +1048,16 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
             if (major == 0) major = 1;
             u = 0.5f * (sc / major + 1.0f), v = 0.5f * (tc / major + 1.0f);
           }
-          const float x = floor_(u * fw - 0.5f), y = floor_(v * fh - 0.5f);
+          // (an offset moves the footprint by whole texels: a register's x and y as integers, or the instruction's own)
+          float offset_x = static_cast<float>(ins.texel_offset[0]), offset_y = static_cast<float>(ins.texel_offset[1]);
+          uint32_t next = 2;
+          if (ins.control & 8) {
+            const Q o = fetch(ins.src[next++], 0);
+            offset_x = static_cast<float>(__builtin_bit_cast(int32_t, o.f[0])), offset_y = static_cast<float>(__builtin_bit_cast(int32_t, o.f[1]));
+          }
+          const bool compare = (ins.control & 4) != 0;
+          const float reference = compare ? fetch(ins.src[next], 0).f[0] : 0.0f;
+          const float x = floor_(u * fw - 0.5f) + offset_x, y = floor_(v * fh - 0.5f) + offset_y;
           const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
           for (uint32_t k = 0; k < 4; ++k) {
             float tx = xs[k], ty = ys[k];
@@ -1072,7 +1081,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
               t = s.textures->sample_lod(unit, (tx + 0.5f) / fw, (ty + 0.5f) / fh, 0.0f);
             }
             const float texel[4] = {t.x, t.y, t.z, t.w};
-            b.f[k] = texel[ins.control & 3];
+            b.f[k] = compare ? (reference <= t.x ? 1.0f : 0.0f) : texel[ins.control & 3];
           }
         }
         store(ins.dst, b);

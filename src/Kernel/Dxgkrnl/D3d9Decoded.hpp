@@ -111,6 +111,7 @@ struct D3d9Program::Instruction {
   uint8_t uav = 0;       // kBufLoad ..: the storage buffer slot
   uint32_t stride = 0;
   uint8_t tex_swizzle[4] = {0, 1, 2, 3};   // texld: which texel component each result component takes
+  int8_t texel_offset[2] = {0, 0};          // gather4: the static offset of the footprint, in texels (the extended opcode token's)
   Dst dst;
   Src src[4];
   uint8_t src_count = 0;

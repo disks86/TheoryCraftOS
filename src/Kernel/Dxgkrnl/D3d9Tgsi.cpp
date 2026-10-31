@@ -1141,10 +1141,31 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       add_uint(sampler, unit);
       add(sampler, "], ");
       add(sampler, dimension_name(p_.texture_kind(unit)));
+      if (ins.control & 8) {   // (an offset in a register: TGSI takes the texture offsets of an instruction as literals)
+        unsupported_ = true;
+        break;
+      }
+      if (ins.texel_offset[0] || ins.texel_offset[1]) {
+        const bool saved = force_integer_;
+        force_integer_ = true;
+        const uint32_t ox = static_cast<uint32_t>(static_cast<int32_t>(ins.texel_offset[0])), oy = static_cast<uint32_t>(static_cast<int32_t>(ins.texel_offset[1]));
+        add(sampler, ", IMM[");
+        add_uint(sampler, imm4_bits(ox, oy, 0, 0));
+        add(sampler, "].xyz");
+        force_integer_ = saved;
+      }
+      const bool compare = (ins.control & 4) != 0;
       String component = str();
       add(component, "IMM[");
       add_uint(component, imm4_bits(ins.control & 3, ins.control & 3, ins.control & 3, ins.control & 3));
       add(component, "].xxxx");
+      if (compare) {
+        // (gather4_c: the comparison reference <= texel of each of the four texels, made here as the sampler is not a comparison one)
+        const String texels = temp(kWork2), reference = operand(ins.src[2], 0, 1, nullptr, true);
+        line("TG4", &texels, &coordinate, &component, &sampler);
+        line("SGE", &t, &texels, &reference);
+        break;
+      }
       line("TG4", &t, &coordinate, &component, &sampler);
       break;
     }

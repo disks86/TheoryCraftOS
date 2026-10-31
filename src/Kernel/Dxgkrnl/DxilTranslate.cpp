@@ -70,7 +70,7 @@ struct Resource {
 enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
-  kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
+  kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureGatherCmp = 74, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
   kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kFma = 47, kMakeDouble = 101, kSplitDouble = 102, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
 };
 
@@ -243,7 +243,7 @@ class Translator {
   bool binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool sincos(const Instruction& ins, bool cosine);
-  bool texture_gather(const Instruction& ins);
+  bool texture_gather(const Instruction& ins, bool compare);
   // A lookup whose texture (args[1]) is an element of an array chosen by a variable: the lookup is made once for each element, behind a test of the index, into one result register.
   template <typename F>
   bool with_array(const Instruction& ins, F body) {
@@ -2355,28 +2355,42 @@ bool Translator::sample_bias_grad(const Instruction& ins, bool gradients) {
   return define(ins.result, r);
 }
 
-// gather4: the component of the four texels of the footprint named by the channel argument, picked by the swizzle of the resource operand.
-bool Translator::texture_gather(const Instruction& ins) {
+// gather4 (and gather4_c: the comparison of the four texels with a reference): the component of the four texels of the footprint named by the channel argument, picked by the swizzle of
+// the resource operand; constant offsets go in the extended opcode token.
+bool Translator::texture_gather(const Instruction& ins, bool compare) {
   Val srv, smp;
   uint64_t channel = 0;
-  if (ins.arg_count < 10 || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp) || !constant_int(ins.args[9], &channel) || channel > 3) return error(status::kNotSupported);
-  for (uint32_t k = 7; k < 9; ++k) {   // offsets: none
+  if (ins.arg_count < (compare ? 11u : 10u) || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp) || !constant_int(ins.args[9], &channel) || channel > 3) return error(status::kNotSupported);
+  int32_t offset[2] = {0, 0};
+  for (uint32_t k = 0; k < 2; ++k) {   // constant offsets, -8 .. 7 texels
     uint64_t v = 0;
-    const Constant* c = constant(ins.args[k]);
-    if (!c || (c->kind != ConstantKind::Undef && !(constant_int(ins.args[k], &v) && v == 0))) return error(status::kNotSupported);
+    const Constant* c = constant(ins.args[7 + k]);
+    if (!c) return error(status::kNotSupported);
+    if (c->kind != ConstantKind::Undef) {
+      if (!constant_int(ins.args[7 + k], &v)) return error(status::kNotSupported);
+      const int32_t value = static_cast<int32_t>(static_cast<uint32_t>(v));
+      if (value < -8 || value > 7) return error(status::kNotSupported);
+      offset[k] = value;
+    }
   }
   const Val r = new_aggregate(ins.result);
   uint32_t scratch = 0;
   if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
   const uint32_t kind = res_[0][srv.b].kind;   // (a cube takes a direction, an array the layer in the third component)
   if (kind != 2 && kind != 5 && kind != 7) return error(status::kNotSupported);
+  if ((offset[0] || offset[1]) && kind == 5) return error(status::kNotSupported);
   if (!pack(ins.args + 3, kind == 2 ? 2 : 3, scratch, false)) return false;
-  const uint32_t at = begin(109);
+  Val reference;
+  if (compare) reference = use(ins.args[10]);
+  const bool has_offset = offset[0] || offset[1];
+  const uint32_t at = begin(compare ? 126 : 109, has_offset ? 1u << 31 : 0u);
+  if (has_offset) put(1u | ((static_cast<uint32_t>(offset[0]) & 0xFu) << 9) | ((static_cast<uint32_t>(offset[1]) & 0xFu) << 13));
   dst_temp(r.a, 0xF);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
   put(scratch);
-  put(2u | (1u << 2) | (static_cast<uint32_t>(channel) * 0x55u << 4) | (7u << 12) | (1u << 20)), put(srv.c);
+  put(2u | (1u << 2) | ((compare ? 0u : static_cast<uint32_t>(channel)) * 0x55u << 4) | (7u << 12) | (1u << 20)), put(srv.c);
   src_sampler(smp.c);
+  if (compare) src(reference);
   finish(at);
   return define(ins.result, r);
 }
@@ -2741,7 +2755,8 @@ bool Translator::dx_call(const Instruction& ins) {
     case kSampleLevel: return with_array(ins, [&] { return sample(ins, true); });
     case kSampleBias: case kSampleGrad: return with_array(ins, [&] { return sample_bias_grad(ins, opcode == kSampleGrad); });
     case kTextureLoad: return with_array(ins, [&] { return texture_load(ins); });
-    case kTextureGather: return with_array(ins, [&] { return texture_gather(ins); });
+    case kTextureGather: return with_array(ins, [&] { return texture_gather(ins, false); });
+    case kTextureGatherCmp: return with_array(ins, [&] { return texture_gather(ins, true); });
     case kCalculateLod: return calculate_lod(ins);
     case kSampleCmp: case kSampleCmpLevelZero: return with_array(ins, [&] { return sample_compare(ins, opcode == kSampleCmpLevelZero); });
     case kThreadId: return thread_value(ins, 32, true);

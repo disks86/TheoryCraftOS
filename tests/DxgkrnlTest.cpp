@@ -5853,6 +5853,40 @@ void test_dxil() {
       }
     }
   }
+  // gather4 with constant offsets, and gather4_c (the comparison of each texel of the footprint): against the same footprint worked out in C++.
+  {
+    UniquePointer<D3d9Program> offsets, compared;
+    CHECK(load("dxil_ps_gather_off.dxil", &offsets) && load("dxil_ps_gather_cmp.dxil", &compared));
+    // (the fake texture's lookups give the middle of the texel halved: red (x + 0.5) / 16, green (y + 0.5) / 8)
+    auto footprint = [](float u, float v, int ox, int oy, float* red, float* green) {
+      const float x = __builtin_floorf(u * 8.0f - 0.5f) + static_cast<float>(ox), y = __builtin_floorf(v * 4.0f - 0.5f) + static_cast<float>(oy);
+      const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+      for (int k = 0; k < 4; ++k) red[k] = (xs[k] + 0.5f) / 16.0f, green[k] = (ys[k] + 0.5f) / 8.0f;
+    };
+    for (uint32_t n = 0; n < 200 && offsets && compared; ++n) {
+      graphics::Vec4 varyings[4] = {};
+      varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
+      varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+      uint8_t constants[128] = {};
+      graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+      CHECK(offsets->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room));
+      float r1[4], g1[4], r2[4], g2[4];
+      footprint(varyings[2].x, varyings[2].y, 1, -2, r1, g1);
+      footprint(varyings[2].x, varyings[2].y, -3, 2, r2, g2);
+      CHECK(close_to(room[0].x, r1[0]) && close_to(room[0].y, r1[3]) && close_to(room[0].z, g2[1]) && close_to(room[0].w, g2[2]));
+      room[0] = {};
+      CHECK(compared->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room));
+      float ra[4], ga[4], rb[4], gb[4];
+      footprint(varyings[2].x, varyings[2].y, 0, 0, ra, ga);
+      footprint(varyings[2].x, varyings[2].y, 1, 1, rb, gb);
+      auto pass = [](float reference, float texel) { return reference <= texel ? 1.0f : 0.0f; };
+      const float want[4] = {(pass(varyings[0].x, ra[0]) + pass(varyings[0].x, ra[1]) * 2) * 0.0625f, (pass(varyings[0].x, ra[2]) * 4 + pass(varyings[0].x, ra[3]) * 8) * 0.0625f,
+                             (pass(varyings[0].y, rb[0]) + pass(varyings[0].y, rb[1]) * 2) * 0.0625f, (pass(varyings[0].y, rb[2]) * 4 + pass(varyings[0].y, rb[3]) * 8) * 0.0625f};
+      const bool same = close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+      if (!same && n < 3) printf("  gather cmp #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+      CHECK(same);
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;
