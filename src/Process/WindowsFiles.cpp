@@ -194,8 +194,8 @@ uint32_t object_path(Process& p, uint64_t attributes, String* virtual_path) {
   PathResult result;
   if (root != 0) {
     uint64_t slot = 0;
-    if (handle_slot(root, &slot) && (files.kind(slot) == DescriptorKind::ConsoleInput || files.kind(slot) == DescriptorKind::ConsoleOutput || files.kind(slot) == DescriptorKind::ConsoleError))
-      return 0xC0000225u;      // STATUS_NOT_FOUND: nothing is below a console
+    if (text.empty() && handle_slot(root, &slot) && (files.kind(slot) == DescriptorKind::ConsoleInput || files.kind(slot) == DescriptorKind::ConsoleOutput || files.kind(slot) == DescriptorKind::ConsoleError))
+      return 0xC0000225u;      // STATUS_NOT_FOUND: nothing is below a console (asked for with no name)
     if (!handle_slot(root, &slot) || files.kind(slot) != DescriptorKind::Directory) return kInvalidHandle;
     result = files.resolve_from(files.object(slot)->path.view(), text.view(), virtual_path);
   } else {
