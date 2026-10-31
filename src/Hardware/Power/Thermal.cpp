@@ -55,6 +55,7 @@ uint32_t AcpiThermalZone::find_zones(acpi::AmlInterpreter& vm, acpi::Node** out,
 }
 
 bool AcpiThermalZone::temperature_of(const char* method, int32_t* millicelsius) {
+  kernel::ScopedRecursiveMutex guard(vm_.mutex());
   acpi::Node* n = child(vm_, zone_, method);
   uint64_t tenths;
   if (!n || !vm_.evaluate_integer(n, &tenths) || tenths < 2732 || tenths > 5000) return false;     // (0 K to 227 C: what is not a temperature is not one)

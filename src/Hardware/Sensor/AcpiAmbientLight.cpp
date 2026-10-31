@@ -51,6 +51,7 @@ bool AcpiAmbientLight::initialize() {
 }
 
 bool AcpiAmbientLight::read(SensorReading* out) {
+  kernel::ScopedRecursiveMutex guard(vm_.mutex());     // (the sequence number, and the interpreter shared with the event loop)
   uint64_t lux;
   acpi::Node* ali = method_of(vm_, device_, "_ALI");
   if (!ali || !vm_.evaluate_integer(ali, &lux)) return false;

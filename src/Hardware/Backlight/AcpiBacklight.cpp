@@ -92,6 +92,7 @@ uint32_t AcpiBacklight::level_for(uint8_t percent) const {
 }
 
 bool AcpiBacklight::percent(uint8_t* out) {
+  kernel::ScopedRecursiveMutex guard(vm_.mutex());     // the keys (interface thread) and the firmware's notifications (event loop) both come here; the interpreter's lock also covers our state
   if (count_ == 0) return false;
   uint64_t level = current_;
   acpi::Node* bqc = method("_BQC");
@@ -113,6 +114,7 @@ bool AcpiBacklight::percent(uint8_t* out) {
 }
 
 bool AcpiBacklight::set_percent(uint8_t percent) {
+  kernel::ScopedRecursiveMutex guard(vm_.mutex());     // the keys (interface thread) and the firmware's notifications (event loop) both come here; the interpreter's lock also covers our state
   if (count_ == 0) return false;
   acpi::Node* bcm = method("_BCM");
   if (!bcm) return false;

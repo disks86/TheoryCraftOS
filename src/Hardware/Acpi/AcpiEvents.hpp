@@ -208,6 +208,19 @@ class AcpiEvents {
   bool ready_ = false;
   Wake wake_[kMaxWake];
   uint32_t wake_count_ = 0;
+  struct Deferred {
+    bool button = false;
+    AcpiButton kind = AcpiButton::Power;
+    bool open = false;
+    acpi::Node* node = nullptr;
+    uint32_t value = 0;
+  };
+  static constexpr uint32_t kMaxDeferred = 64;
+  uint32_t poll_locked();
+  void queue_news(bool button, AcpiButton kind, bool open, acpi::Node* node, uint32_t value);
+  void flush_news();
+  Deferred deferred_[kMaxDeferred];
+  uint32_t deferred_count_ = 0;
   IAcpiNotifyListener* listener_ = nullptr;
   IAcpiNotifyListener* more_listeners_[4] = {};
   IAcpiButtonListener* buttons_listener_ = nullptr;
