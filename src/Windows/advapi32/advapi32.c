@@ -261,6 +261,7 @@ EXPORT BOOL WINAPI InitializeAcl(PVOID acl, DWORD size, DWORD revision) {
 /* ---- security identifiers as text ------------------------------------------------------------------------------------------------------------------------- */
 
 IMPORT HLOCAL WINAPI LocalAlloc(UINT flags, SIZE_T bytes);
+IMPORT HLOCAL WINAPI LocalFree(HLOCAL memory);
 static WCHAR *sid_text_number(WCHAR *out, ULONGLONG v, int hex) {
   char digits[24];
   int n = 0;
@@ -291,3 +292,5 @@ EXPORT BOOL WINAPI ConvertSidToStringSidW(PVOID sid_in, LPWSTR *text) {
   *text = out;
   return TRUE;
 }
+
+#include "sddl.inc"

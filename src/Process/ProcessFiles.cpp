@@ -275,6 +275,7 @@ bool ProcessFiles::close(uint64_t slot) {
     closing.object = SharedPointer<OpenObject>();      // the file must be closed before it can be removed
     if (host_path(virtual_path.view(), &path) && fs_->remove(path.view()) == Status::Ok) if (ObjectManager* objects = system_objects()) {
       objects->file_times_forget(virtual_path.view());
+      objects->security_forget(virtual_path.view());
       objects->notify_entry_changed(virtual_path.view(), 2 /* FILE_ACTION_REMOVED */, closing.kind == DescriptorKind::Directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName);
     }
   }
@@ -511,7 +512,7 @@ Status ProcessFiles::remove(StringView virtual_path) {
   if (!host_path(virtual_path, &path)) return Status::NotFound;
   if (virtual_path == StringView("/")) return Status::Busy;      // the root of the program's tree stays
   const Status status = fs_->remove(path.view());
-  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_forget(virtual_path); objects->link_forget(virtual_path); }
+  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_forget(virtual_path); objects->security_forget(virtual_path); objects->link_forget(virtual_path); }
   return status;
 }
 
@@ -528,7 +529,7 @@ Status ProcessFiles::rename(StringView from, StringView to) {
   }
   if (from == StringView("/")) return Status::Busy;
   const Status status = fs_->rename(a.view(), b.view());
-  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_move(from, to); objects->link_forget(from); }
+  if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_move(from, to); objects->security_move(from, to); objects->link_forget(from); }
   return status;
 }
 

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/Objects.hpp"
+#include "Process/FileSecurity.hpp"
 
 #include <new>
 
@@ -1403,6 +1404,86 @@ void ObjectManager::file_times_forget(StringView path) {
   Locked hold(sync_);
   if (!times_) return;
   for (uint32_t i = 0; i < kMaxTimes; ++i) if (times_[i].used && same_name(times_[i].path, times_[i].path_size, path)) times_[i].used = false;
+}
+
+struct ObjectManager::SecurityEntry {
+  bool used = false;
+  char path[260] = {};
+  uint32_t path_size = 0;
+  uint32_t size = 0;
+  uint8_t bytes[filesecurity::kMaxDescriptorBytes] = {};
+};
+
+bool ObjectManager::security_room() {
+  Locked hold(sync_);
+  if (!security_) return allocator_ != nullptr;
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) if (!security_[i].used) return true;
+  return false;
+}
+
+bool ObjectManager::security_set(StringView path, ConstByteView descriptor) {
+  Locked hold(sync_);
+  if (!allocator_ || path.size() >= 260 || descriptor.size() > filesecurity::kMaxDescriptorBytes) return false;
+  if (!security_) {
+    void* memory = allocator_->allocate(sizeof(SecurityEntry) * kMaxSecurity);
+    if (!memory) return false;
+    security_ = static_cast<SecurityEntry*>(memory);
+    for (uint32_t i = 0; i < kMaxSecurity; ++i) new (&security_[i]) SecurityEntry();
+  }
+  SecurityEntry* slot = nullptr;
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) {
+    SecurityEntry& e = security_[i];
+    if (e.used && same_name(e.path, e.path_size, path)) { slot = &e; break; }
+    if (!e.used && !slot) slot = &e;
+  }
+  if (!slot) return false;
+  slot->used = true;
+  for (uint32_t k = 0; k < path.size(); ++k) slot->path[k] = path[k];
+  slot->path_size = static_cast<uint32_t>(path.size());
+  slot->size = static_cast<uint32_t>(descriptor.size());
+  for (uint32_t k = 0; k < slot->size; ++k) slot->bytes[k] = descriptor[k];
+  return true;
+}
+
+uint32_t ObjectManager::security_get(StringView path, ByteView out) {
+  Locked hold(sync_);
+  if (!security_) return 0;
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) {
+    const SecurityEntry& e = security_[i];
+    if (!e.used || !same_name(e.path, e.path_size, path) || e.size > out.size()) continue;
+    for (uint32_t k = 0; k < e.size; ++k) out[k] = e.bytes[k];
+    return e.size;
+  }
+  return 0;
+}
+
+void ObjectManager::security_move(StringView from, StringView to) {
+  Locked hold(sync_);
+  if (!security_ || to.size() >= 260) return;
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) {      // what was at the new name is replaced
+    SecurityEntry& e = security_[i];
+    if (e.used && (same_name(e.path, e.path_size, to) || (e.path_size > to.size() && e.path[to.size()] == '/' && same_name(e.path, static_cast<uint32_t>(to.size()), to)))) e.used = false;
+  }
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) {
+    SecurityEntry& e = security_[i];
+    if (!e.used) continue;
+    const bool exact = same_name(e.path, e.path_size, from);
+    const bool below = e.path_size > from.size() && e.path[from.size()] == '/' && same_name(e.path, static_cast<uint32_t>(from.size()), from);
+    if (!exact && !below) continue;
+    char moved[260];
+    const uint64_t tail = e.path_size - from.size();
+    if (to.size() + tail >= 260) { e.used = false; continue; }      // (it no longer fits a name: its protection is gone with it)
+    for (uint32_t k = 0; k < to.size(); ++k) moved[k] = to[k];
+    for (uint64_t k = 0; k < tail; ++k) moved[to.size() + k] = e.path[from.size() + k];
+    for (uint64_t k = 0; k < to.size() + tail; ++k) e.path[k] = moved[k];
+    e.path_size = static_cast<uint32_t>(to.size() + tail);
+  }
+}
+
+void ObjectManager::security_forget(StringView path) {
+  Locked hold(sync_);
+  if (!security_) return;
+  for (uint32_t i = 0; i < kMaxSecurity; ++i) if (security_[i].used && same_name(security_[i].path, security_[i].path_size, path)) security_[i].used = false;
 }
 
 void ObjectManager::share_retarget(const void* owner, StringView new_path) {

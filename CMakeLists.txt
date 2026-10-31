@@ -626,6 +626,7 @@ add_executable(BOOTX64
   src/Process/WindowsLocks.cpp
   src/Process/WindowsJobs.cpp
   src/Process/WindowsDebug.cpp
+  src/Process/FileSecurity.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
@@ -1011,7 +1012,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/advapi32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${advapi32_stubs} -Wl,--image-base=0x180600000 -o ${WINDOWS_DIR}/advapi32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/registry.inc
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/registry.inc ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/sddl.inc
             ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/advapi32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building advapi32.dll")
   windows_stub_flags(ws2_32_stubs ws2_32 0)

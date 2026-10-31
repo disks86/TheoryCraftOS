@@ -232,6 +232,14 @@ class ObjectManager {
   void file_times_move(StringView from, StringView to);      // the file was renamed
   void file_times_forget(StringView path);                   // the file is gone
 
+  // --- security descriptors of files and directories (see FileSecurity.hpp), kept by path for as long as the node is there. A fixed number of nodes can have one: security_room() says
+  // whether another fits, security_set() whether this one did.
+  bool security_room();
+  bool security_set(StringView path, ConstByteView descriptor);
+  uint32_t security_get(StringView path, ByteView out);      // the size of the descriptor written to `out`, 0 if the node has none
+  void security_move(StringView from, StringView to);       // the node (and what is below it) was renamed
+  void security_forget(StringView path);                    // the node is gone
+
   // --- symbolic links as the program that made them wrote them: the file systems keep the place a link points to, the program also wants the text it gave (a reparse point
   // has it as the "print name", and a relative target stays relative). Kept by the link's path for as long as the link is there.
   void link_note(StringView link_path, StringView target_text);
@@ -413,7 +421,7 @@ class ObjectManager {
   PipeOp* pipe_find_op_locked(Pipe& p, uint32_t tag);
   void pipe_free_op_locked(Pipe& p, PipeOp& op);
   bool post_port_packet_locked(Pipe& p, uint32_t end, uint32_t status, uint32_t bytes);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 32;
 
   struct Watch {
     bool used = false;
@@ -450,6 +458,8 @@ class ObjectManager {
   ShareEntry* shares_ = nullptr;      // kMaxShares of them, made with the first
   struct TimesEntry;
   TimesEntry* times_ = nullptr;      // kMaxTimes of them, made with the first
+  struct SecurityEntry;
+  SecurityEntry* security_ = nullptr;      // kMaxSecurity of them, made with the first
   struct LinkEntry;
   LinkEntry* links_ = nullptr;      // kMaxLinkTexts of them, made with the first
   struct ImageEntry;

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsFiles.hpp"
+#include "Process/FileSecurity.hpp"
 #include "Process/DosWildcard.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsMailslots.hpp"
@@ -283,6 +284,42 @@ uint32_t file_is_mapped(ProcessFiles& files, StringView virtual_path) {
   return objects && files.host_path_of(virtual_path, &host) ? objects->file_has_section(host.view()) : 0;
 }
 
+// --- security descriptors of files and directories (FileSecurity.hpp)
+
+constexpr uint32_t kInvalidSecurityDescriptor = 0xC0000079u;
+
+bool read_program_memory(void* context, uint64_t address, ByteView out) { return static_cast<Process*>(context)->read_user(address, out); }
+
+// The directory a node is in ("/a/b" is in "/a"; "/a" is in "/").
+StringView directory_part(StringView path) {
+  const uint64_t cut = path.rfind('/');
+  return cut == StringView::npos || cut == 0 ? StringView("/") : path.first(cut);
+}
+
+// Does the descriptor of the node (if it has one) grant `access`? A node with none grants everything.
+bool node_allows(ObjectManager* objects, StringView path, uint32_t access) {
+  if (!objects) return true;
+  filesecurity::Stored stored;
+  stored.size = objects->security_get(path, ByteView(stored.bytes, sizeof(stored.bytes)));
+  return stored.size == 0 || filesecurity::allows(stored, access);
+}
+
+// Adding a file or directory below `path` (its directory is that of the new node's name).
+uint32_t check_add_below(StringView new_path, bool directory) {
+  ObjectManager* objects = system_objects();
+  return node_allows(objects, directory_part(new_path), directory ? filesecurity::kFileAddSubdirectory : filesecurity::kFileAddFile) ? kSuccess : kAccessDenied;
+}
+
+// Opening a node that exists with `access`, or deleting it (DELETE; the right to delete a node can also come from its directory, which grants FILE_DELETE_CHILD).
+uint32_t check_open(StringView path, uint32_t access) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kSuccess;
+  const uint32_t desired = filesecurity::map_generic(access);
+  if (node_allows(objects, path, desired)) return kSuccess;
+  if ((desired & filesecurity::kDelete) && node_allows(objects, path, desired & ~filesecurity::kDelete) && node_allows(objects, directory_part(path), filesecurity::kFileDeleteChild)) return kSuccess;
+  return kAccessDenied;
+}
+
 uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t access, uint32_t disposition, uint32_t options, uint64_t* information, uint64_t* handle, uint32_t share = 7, uint32_t file_attributes = 0) {
   ProcessFiles& files = p.files();
   {
@@ -378,6 +415,19 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (f.truncate) f.write = true;
   DirectoryEntry before;
   const bool existed = files.stat(virtual_path.view(), &before) == Status::Ok;
+  // The descriptor a new node is made with, taken now so a bad one stops the call before anything is made; and what the descriptors of the nodes involved allow.
+  filesecurity::Stored new_descriptor;
+  if (!existed && f.create) {
+    uint64_t descriptor_at = 0;
+    if (object_attributes != 0 && p.read_user_u64(object_attributes + 0x20, &descriptor_at) && descriptor_at != 0) {
+      ObjectManager* store = system_objects();
+      if (!filesecurity::import_descriptor(read_program_memory, &p, descriptor_at, &new_descriptor)) return kInvalidSecurityDescriptor;
+      if (!store || !store->security_room()) return kNoResources;
+    }
+    if (const uint32_t allowed = check_add_below(virtual_path.view(), f.must_be_directory != 0); allowed != kSuccess) return allowed;
+  } else if (existed) {
+    if (const uint32_t allowed = check_open(virtual_path.view(), access); allowed != kSuccess) return allowed;
+  }
   if (existed && before.type == NodeType::Directory) {
     f.write = false;      // a directory is opened to be listed or queried
     f.truncate = false;
@@ -414,6 +464,9 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return kTooManyOpenedFiles;
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
   if (created) { notify_directory_changed(p, virtual_path.view(), kFileActionAdded, files.kind(slot) == DescriptorKind::Directory); note_times(p, virtual_path.view(), 7); }
+  if (created && new_descriptor.size != 0) {
+    if (ObjectManager* store = system_objects()) store->security_set(virtual_path.view(), ConstByteView(new_descriptor.bytes, new_descriptor.size));
+  }
   else if (f.truncate && existed) {
     note_times(p, virtual_path.view(), 4);
     notify_entry_modified(p, virtual_path.view(), (before.size != 0 ? ObjectManager::kChangeSize : 0) | ObjectManager::kChangeLastWrite);
@@ -901,6 +954,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
       if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
       DirectoryEntry existing;
+      if (directory_part(target.view()) != directory_part(object->path.view())) if (const uint32_t allowed = check_add_below(target.view(), files.kind(slot) == DescriptorKind::Directory); allowed != kSuccess) return allowed;
       if (file_is_mapped(files, object->path.view()) == 1) return kSharingViolation;      // (a file with a data view stays where it is; a program image can be renamed)
       auto same_ignoring_case = [](StringView a, StringView b) {
         if (a.size() != b.size()) return false;
@@ -949,6 +1003,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       String name(files.allocator()), target(files.allocator());
       if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
       if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
+      if (const uint32_t allowed = check_add_below(target.view(), false); allowed != kSuccess) return allowed;
       DirectoryEntry existing;
       if (files.stat(target.view(), &existing) == Status::Ok) {
         if (!header[0]) return kObjectNameCollision;
@@ -1074,6 +1129,7 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
   const uint32_t named = object_path(p, r.args[0], &virtual_path);
   if (named != kSuccess) return named;
   if (virtual_path.view() == StringView("/")) return kAccessDenied;
+  if (const uint32_t allowed = check_open(virtual_path.view(), filesecurity::kDelete); allowed != kSuccess) return allowed;
   if (ObjectManager* sharing = system_objects()) {
     if (!sharing->share_allows(virtual_path.view(), ObjectManager::kShareDelete)) return kSharingViolation;
     if (file_is_mapped(files, virtual_path.view())) return kCannotDelete;

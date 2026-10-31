@@ -3728,6 +3728,7 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     }
   }
   if (sa && sa->bInheritHandle) attributes.Attributes |= 2;      /* OBJ_INHERIT */
+  if (sa) attributes.SecurityDescriptor = sa->lpSecurityDescriptor;      /* (kept for a file this call makes) */
   if (disposition == TRUNCATE_EXISTING && !(access & GENERIC_WRITE)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }      /* (it has to be able to write) */
   ULONG nt_disposition;
   switch (disposition) {
@@ -4009,12 +4010,12 @@ EXPORT BOOL WINAPI DeleteFileW(LPCWSTR path) {
 EXPORT BOOL WINAPI DeleteFileA(LPCSTR path) { if (!path) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; } WCHAR *w = to_wide(path); const BOOL ok = w ? DeleteFileW(w) : FALSE; free_wide(w); return ok; }
 
 EXPORT BOOL WINAPI CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
-  (void)sa;
   if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
   if (!nt_name(path, buffer, &name, &attributes)) return FALSE;
+  if (sa) attributes.SecurityDescriptor = sa->lpSecurityDescriptor;      /* (kept for the directory) */
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
   const NTSTATUS status = NtCreateFile(&h, FILE_LIST_DIRECTORY_ | SYNCHRONIZE, &attributes, &iosb, NULL, FILE_ATTRIBUTE_DIRECTORY, 7, FILE_CREATE_, FILE_DIRECTORY_FILE_ | FILE_SYNCHRONOUS_IO_NONALERT_, NULL, 0);
