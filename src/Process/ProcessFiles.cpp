@@ -273,7 +273,10 @@ bool ProcessFiles::close(uint64_t slot) {
     String path(*allocator_), virtual_path(*allocator_);
     virtual_path.assign(closing.object->path.view());
     closing.object = SharedPointer<OpenObject>();      // the file must be closed before it can be removed
-    if (host_path(virtual_path.view(), &path) && fs_->remove(path.view()) == Status::Ok) if (ObjectManager* objects = system_objects()) objects->file_times_forget(virtual_path.view());
+    if (host_path(virtual_path.view(), &path) && fs_->remove(path.view()) == Status::Ok) if (ObjectManager* objects = system_objects()) {
+      objects->file_times_forget(virtual_path.view());
+      objects->notify_entry_changed(virtual_path.view(), 2 /* FILE_ACTION_REMOVED */, closing.kind == DescriptorKind::Directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName);
+    }
   }
   return true;
 }

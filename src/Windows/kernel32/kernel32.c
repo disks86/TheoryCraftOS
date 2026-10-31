@@ -1586,6 +1586,7 @@ static DWORD WINAPI directory_request_thread(LPVOID parameter) {
   complete_overlapped(request.overlapped, status, iosb.Information);
   if (request.routine) NtQueueApcThread(request.caller, (PVOID)completion_apc, (ULONG_PTR)request.routine, (ULONG_PTR)request.overlapped, 0);
   else NtClose(request.caller);
+  NtNotifyChangeDirectoryFile(request.directory, (HANDLE)3, NULL, NULL, &iosb, NULL, 0, request.filter, request.subtree);      /* (whoever changed the directory waits for this) */
   return 0;
 }
 EXPORT BOOL WINAPI ReadDirectoryChangesW(HANDLE h, LPVOID buffer, DWORD length, BOOL watch_subtree, DWORD filter, LPDWORD bytes_returned, LPOVERLAPPED overlapped,
@@ -1593,17 +1594,29 @@ EXPORT BOOL WINAPI ReadDirectoryChangesW(HANDLE h, LPVOID buffer, DWORD length, 
   IO_STATUS_BLOCK iosb;
   if (filter == 0 || (filter & ~0x1FFu) || (!overlapped && (!buffer || length == 0))) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   if (overlapped) {
-    { const NTSTATUS registered = NtNotifyChangeDirectoryFile(h, (HANDLE)2, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree); if (!NT_SUCCESS(registered)) return fail_nt(registered); }      /* (this only makes the watch, so that changes from now on are kept) */
+    { const NTSTATUS registered = NtNotifyChangeDirectoryFile(h, (HANDLE)2, NULL, NULL, &iosb, buffer, length, filter, (BOOLEAN)watch_subtree); if (!NT_SUCCESS(registered)) return fail_nt(registered); }      /* (this only makes the watch, so that changes from now on are kept) */
+    overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
+    if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
+    iosb.Information = 0;
+    {      /* what changed since the last request completes this one at once */
+      const NTSTATUS polled = NtNotifyChangeDirectoryFile(h, (HANDLE)5, NULL, NULL, &iosb, buffer, length, filter, (BOOLEAN)watch_subtree);
+      if (polled != (NTSTATUS)0x103) {
+        if (!NT_SUCCESS(polled)) return fail_nt(polled);
+        complete_overlapped(overlapped, polled, iosb.Information);
+        if (routine) NtQueueApcThread(NtCurrentThread(), (PVOID)completion_apc, (ULONG_PTR)routine, (ULONG_PTR)overlapped, 0);
+        if (bytes_returned) *bytes_returned = 0;
+        return TRUE;
+      }
+    }
     DirectoryRequest *request = RtlAllocateHeap(heap(), 0, sizeof(*request));
     if (!request) { set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
     HANDLE caller = NULL;
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &caller, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) { RtlFreeHeap(heap(), 0, request); return FALSE; }
     request->directory = h; request->caller = caller; request->buffer = buffer; request->length = length; request->subtree = (BOOLEAN)watch_subtree;
     request->filter = filter; request->overlapped = overlapped; request->routine = routine;
-    overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
-    if (overlapped->hEvent) NtResetEvent((HANDLE)((ULONG_PTR)overlapped->hEvent & ~(ULONG_PTR)1), NULL);
+    NtNotifyChangeDirectoryFile(h, (HANDLE)6, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree);      /* (the thread is waited for) */
     HANDLE thread = CreateThread(NULL, 0, directory_request_thread, request, 0, NULL);
-    if (!thread) { NtClose(caller); RtlFreeHeap(heap(), 0, request); return FALSE; }
+    if (!thread) { NtNotifyChangeDirectoryFile(h, (HANDLE)3, NULL, NULL, &iosb, NULL, 0, filter, (BOOLEAN)watch_subtree); NtClose(caller); RtlFreeHeap(heap(), 0, request); return FALSE; }
     (void)thread;      /* the handle is not closed here: see the thread */
     if (bytes_returned) *bytes_returned = 0;
     return TRUE;
@@ -3611,7 +3624,7 @@ EXPORT void WINAPI FatalAppExitA(UINT action, LPCSTR text) { (void)action; (void
  * signalled like a manual-reset event when something changes under the watched directory - WaitForSingleObject/WaitForMultipleObjects already work on it unmodified.
  * FindNextChangeNotification re-arms it the same way ResetEvent does (it is reset(), not a separate NT service); FindCloseChangeNotification is just CloseHandle. */
 EXPORT HANDLE WINAPI FindFirstChangeNotificationW(LPCWSTR path, BOOL watch_subtree, DWORD notify_filter) {
-  if (!path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;
   OBJECT_ATTRIBUTES attributes;
@@ -3619,13 +3632,13 @@ EXPORT HANDLE WINAPI FindFirstChangeNotificationW(LPCWSTR path, BOOL watch_subtr
   HANDLE handle = NULL;
   const NTSTATUS status = NtCreateChangeNotification(&attributes, watch_subtree ? 1 : 0, notify_filter, &handle);
   if (!NT_SUCCESS(status)) {
-    set_error(status == STATUS_OBJECT_PATH_NOT_FOUND || status == STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_PATH_NOT_FOUND :
-              status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
+    set_error(status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
     return INVALID_HANDLE_VALUE;
   }
   return handle;
 }
 EXPORT HANDLE WINAPI FindFirstChangeNotificationA(LPCSTR path, BOOL watch_subtree, DWORD notify_filter) {
+  if (!path) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   WCHAR *w = to_wide(path);
   if (!w) return INVALID_HANDLE_VALUE;
   HANDLE h = FindFirstChangeNotificationW(w, watch_subtree, notify_filter);

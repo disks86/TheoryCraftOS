@@ -91,20 +91,44 @@ StringView virtual_directory_of(StringView virtual_path) {
   return at <= 1 ? StringView("/") : virtual_path.first(at - 1);
 }
 
-// The entry's own name, the part virtual_directory_of leaves out: "/Windows/sub/x.txt" -> "x.txt".
-StringView virtual_leaf_of(StringView virtual_path) {
-  uint64_t at = virtual_path.size();
-  while (at > 0 && virtual_path[at - 1] != '/') --at;
-  return virtual_path.without_prefix(at);
+// After any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked, or a file's attributes, size or times changed): wakes
+// any FindFirstChangeNotification/ReadDirectoryChangesW handle watching the directory of `changed_path` or an ancestor of it whose filter asks for this kind of change, and
+// queues a FILE_ACTION_*/name record for the latter (see ObjectManager::notify_entry_changed). `changed_path` is the changed entry's own full virtual path; `action` one
+// of the FILE_ACTION_* constants below. A no-op if there is no ObjectManager yet (a host test that never made one; the real kernel always has).
+constexpr uint32_t kFileActionAdded = 1, kFileActionRemoved = 2, kFileActionModified = 3, kFileActionRenamedOldName = 4, kFileActionRenamedNewName = 5;
+
+// A thread of the program that waits for a ReadDirectoryChangesW request (kernel32 has one for each) completes it - fills the buffer, sets the event - and acknowledges
+// it; the one that made the change waits for that (a fifth of a second at most), so that a program that looks at the OVERLAPPED at once finds it complete.
+void await_watch_delivery(Process& p) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return;
+  const uint32_t s = wait_until(p, 200ull * 1000000, [&]() -> uint64_t { return objects->watches_delivered_locked() ? kSuccess : kWaitPending; });
+  if (s != kSuccess) {
+    objects->sync().lock();
+    objects->watches_forgive_locked();
+    objects->sync().unlock();
+  }
 }
 
-// After any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked): wakes any FindFirstChangeNotification/
-// ReadDirectoryChangesW handle watching `affected_directory` or an ancestor of it, and queues a FILE_ACTION_*/name record for the latter (see
-// ObjectManager::notify_path_changed). `changed_path` is the changed entry's own full virtual path; `action` one of the FILE_ACTION_* constants below.
-// A no-op if there is no ObjectManager yet (a host test that never made one; the real kernel always has).
-constexpr uint32_t kFileActionAdded = 1, kFileActionRemoved = 2, kFileActionRenamedOldName = 4, kFileActionRenamedNewName = 5;
-void notify_directory_changed(StringView changed_path, uint32_t action) {
-  if (ObjectManager* objects = system_objects()) objects->notify_path_changed(virtual_directory_of(changed_path), action, virtual_leaf_of(changed_path));
+void notify_directory_changed(Process& p, StringView changed_path, uint32_t action, bool is_directory) {
+  if (ObjectManager* objects = system_objects()) {
+    objects->notify_entry_changed(changed_path, action, is_directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName);
+    await_watch_delivery(p);
+  }
+}
+
+void notify_entry_modified(Process& p, StringView changed_path, uint32_t filter_mask) {
+  if (ObjectManager* objects = system_objects()) {
+    objects->notify_entry_changed(changed_path, kFileActionModified, filter_mask);
+    await_watch_delivery(p);
+  }
+}
+
+void notify_directory_renamed(Process& p, StringView old_path, StringView new_path, bool is_directory) {
+  if (ObjectManager* objects = system_objects()) {
+    objects->notify_entry_renamed(old_path, new_path, is_directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName);
+    await_watch_delivery(p);
+  }
 }
 
 // IO_STATUS_BLOCK { NTSTATUS Status (8 bytes with padding); ULONG_PTR Information; }
@@ -361,8 +385,11 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   const Status status = files.open(virtual_path.view(), f, &slot, &created);
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return kTooManyOpenedFiles;
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
-  if (created) { notify_directory_changed(virtual_path.view(), kFileActionAdded); note_times(p, virtual_path.view(), 7); }
-  else if (f.truncate && existed) note_times(p, virtual_path.view(), 4);
+  if (created) { notify_directory_changed(p, virtual_path.view(), kFileActionAdded, files.kind(slot) == DescriptorKind::Directory); note_times(p, virtual_path.view(), 7); }
+  else if (f.truncate && existed) {
+    note_times(p, virtual_path.view(), 4);
+    notify_entry_modified(p, virtual_path.view(), (before.size != 0 ? ObjectManager::kChangeSize : 0) | ObjectManager::kChangeLastWrite);
+  }
   if (created && (file_attributes & kAttributeReadOnly)) {
     filesystem::MetadataChange change;
     change.set_read_only = true;
@@ -446,6 +473,7 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   uint64_t done = 0;
   uint8_t chunk[kChunk];
   Status io = Status::Ok;
+  const uint64_t size_before = write ? files.size_of(object) : 0;
   while (done < length && io == Status::Ok) {
     const uint64_t n = length - done < sizeof(chunk) ? length - done : sizeof(chunk);
     uint64_t moved = 0;
@@ -460,7 +488,10 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
     if (io == Status::Ok && moved < n) break;      // end of the file
   }
   if (io != Status::Ok && done == 0) return nt_status(io);
-  if (write && done != 0) note_times(p, object.path.view(), 4);
+  if (write && done != 0) {
+    note_times(p, object.path.view(), 4);
+    notify_entry_modified(p, object.path.view(), (at + done > size_before ? ObjectManager::kChangeSize : 0) | ObjectManager::kChangeLastWrite);
+  }
   object.position = at + done;
   status = kSuccess;
   if (!write && done == 0 && length != 0) status = kEndOfFile;
@@ -769,7 +800,10 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (int64_t(value) < 0) return kInvalidParameter;
       if (value < files.size_of(*object) && file_is_mapped(files, object->path.view())) return kUserMappedFile;      // (a mapped file cannot be made shorter)
       status = nt_status(files.resize(*object, value));
-      if (status == kSuccess) note_times(p, object->path.view(), 4);
+      if (status == kSuccess) {
+        note_times(p, object->path.view(), 4);
+        notify_entry_modified(p, object->path.view(), ObjectManager::kChangeSize | ObjectManager::kChangeLastWrite);
+      }
       break;
     case kFileAllocationInformation: break;      // nothing to change: sizes are exact
     case 43: {      // FileIoPriorityHintInformation { IO_PRIORITY_HINT }: the hint is taken and has no effect
@@ -810,6 +844,9 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
         exact_time(8, 2, &exact.accessed);
         exact_time(16, 4, &exact.written);
         if (which != 0) if (ObjectManager* objects = system_objects()) objects->file_times_set(object->path.view(), which, exact);
+        const uint32_t touched = (attributes != 0 ? ObjectManager::kChangeAttributes : 0) | ((which & 1) ? ObjectManager::kChangeCreation : 0) | ((which & 2) ? ObjectManager::kChangeLastAccess : 0) |
+                                 ((which & 4) ? ObjectManager::kChangeLastWrite : 0);
+        if (touched != 0) notify_entry_modified(p, object->path.view(), touched);
       }
       break;
     }
@@ -854,8 +891,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
         old_path.assign(object->path.view());
         status = nt_status(files.rename(object->path.view(), target.view()));
         if (status == kSuccess) {
-          notify_directory_changed(old_path.view(), kFileActionRenamedOldName);
-          notify_directory_changed(target.view(), kFileActionRenamedNewName);
+          notify_directory_renamed(p, old_path.view(), target.view(), files.kind(slot) == DescriptorKind::Directory);
           if (ObjectManager* sharing = system_objects()) {      // the other opens of the file follow it to its new name
             const void* others[8];
             const uint32_t count = sharing->share_owners(old_path.view(), others, 8);
@@ -889,7 +925,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       }
       if (status == kSuccess) {
         status = nt_status(files.create_hard_link(object->path.view(), target.view()));
-        if (status == kSuccess) notify_directory_changed(target.view(), kFileActionAdded);
+        if (status == kSuccess) notify_directory_changed(p, target.view(), kFileActionAdded, false);
       }
       break;
     }
@@ -994,7 +1030,7 @@ uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r) {
   const bool target_is_directory = (r.args[2] & 0xFF) != 0;
   const Status status = files.create_symbolic_link(link_virtual.view(), target_virtual.view(), target_is_directory);
   if (status == Status::Ok) {
-    notify_directory_changed(link_virtual.view(), kFileActionAdded);
+    notify_directory_changed(p, link_virtual.view(), kFileActionAdded, target_is_directory);
     if (ObjectManager* objects = system_objects()) objects->link_note(link_virtual.view(), raw_target.view());      // (the text of the target as the program wrote it)
   }
   return status_for(files, status, link_virtual.view());
@@ -1018,8 +1054,10 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {
       return kSuccess;
     }
   }
+  DirectoryEntry removed_entry;
+  const bool was_directory = files.stat(virtual_path.view(), &removed_entry) == Status::Ok && removed_entry.type == NodeType::Directory;
   const Status status = files.remove(virtual_path.view());
-  if (status == Status::Ok) notify_directory_changed(virtual_path.view(), kFileActionRemoved);
+  if (status == Status::Ok) notify_directory_changed(p, virtual_path.view(), kFileActionRemoved, was_directory);
   return status_for(files, status, virtual_path.view());
 }
 
@@ -1063,38 +1101,55 @@ uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r) {
   if (!object) return kInvalidHandle;
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
+  length &= 0xFFFFFFFFu;
   if (object->change_watch == 0) {      // made on this handle's first call, and kept (not re-made) for the rest of its life
     const ObjectManager::Created c = objects->create_change_notification(object->path.view(), (watch_tree & 0xFF) != 0, static_cast<uint32_t>(filter));
     if (c.id == 0) return c.status;
     object->change_watch = c.id;
+    objects->watch_set_want_data(c.id, length != 0);      // (a first call without a buffer only ever learns that something changed)
   }
   const uint32_t watch_id = object->change_watch;
-  length &= 0xFFFFFFFFu;
-  if (r.args[1] == 2) {      // kernel32 starting an overlapped request: the watch is made, and what changed while nobody asked is forgotten
-    ObjectManager::WatchRecord stale[ObjectManager::kMaxWatchRecords];
-    uint32_t dropped = 0;
-    objects->take_watch_records(watch_id, stale, ObjectManager::kMaxWatchRecords, &dropped);
-    return kSuccess;
-  }
+  // kernel32 says what it wants in Event: nothing (wait for a change as long as it takes), 1 (a thread of its own waits for an overlapped request: a tenth of a second at a time,
+  // so that it comes back to look whether its handle is still open), 2 (an overlapped request starting: just make the watch), 5 (the same, and answer STATUS_PENDING at once if
+  // nothing changed), 6 (a thread is about to wait for the request) and 3 (that thread has completed it).
+  const uint64_t mode = r.args[1];
+  if (mode == 3) { objects->watch_ack(watch_id); return kSuccess; }
+  if (mode == 6) { objects->watch_wait_begin(watch_id); return kSuccess; }
+  if (mode == 2) return kSuccess;
   ObjectManager::WatchRecord records[ObjectManager::kMaxWatchRecords];
   uint32_t taken = 0;
-  // Event == 1 (kernel32's helper threads for overlapped requests): wait a tenth of a second and answer STATUS_TIMEOUT, so that the thread comes back to look whether its handle is still open.
-  const uint32_t status = wait_until(p, r.args[1] == 1 ? 100000000ull : ~uint64_t{0}, [&]() -> uint64_t {
+  bool overflowed = false;
+  auto attempt = [&]() -> uint64_t {
+    bool overflow = false, want_data = true;
+    if (!objects->take_watch_state_locked(watch_id, &overflow, &want_data, true)) return kInvalidHandle;
+    if (overflow) { overflowed = true; objects->take_watch_records_locked(watch_id, records, ObjectManager::kMaxWatchRecords, &taken); taken = 0; return kSuccess; }
     if (!objects->take_watch_records_locked(watch_id, records, ObjectManager::kMaxWatchRecords, &taken) || taken == 0) return kWaitPending;
     return kSuccess;
-  });
+  };
+  uint32_t status;
+  if (mode == 5) {
+    objects->sync().lock();
+    const uint64_t polled = attempt();
+    objects->sync().unlock();
+    if (polled == kWaitPending) return 0x103u;      // STATUS_PENDING
+    status = static_cast<uint32_t>(polled);
+  } else {
+    status = wait_until(p, mode == 1 ? 100000000ull : ~uint64_t{0}, attempt);
+  }
   if (status != kSuccess) return store_io_status(p, status_block, status, 0) ? status : kAccessViolation;
-  // FILE_NOTIFY_INFORMATION { ULONG NextEntryOffset; ULONG Action; ULONG FileNameLength (bytes); WCHAR FileName[]; }: as many whole records as fit in Length,
-  // longword-aligned (like NtQueryDirectoryFile's own record chaining); a buffer too small to hold every record this call drained loses the rest (real Windows
-  // instead keeps them for ERROR_MORE_DATA/the next overlapped completion - not implemented, acceptable given a bounded 32-pending-record cap per watch anyway).
+  // STATUS_NOTIFY_ENUM_DIR: more changed than the watch could keep or than fits in the buffer; look at the directory.
+  auto enumerate_directory = [&]() { return store_io_status(p, status_block, 0x10Cu, 0) ? 0x10Cu : kAccessViolation; };
+  if (overflowed) return enumerate_directory();
+  // FILE_NOTIFY_INFORMATION { ULONG NextEntryOffset; ULONG Action; ULONG FileNameLength (bytes); WCHAR FileName[]; }: every record the watch kept, longword-aligned (like
+  // NtQueryDirectoryFile's own record chaining); if they do not all fit in Length the answer is STATUS_NOTIFY_ENUM_DIR and they are lost, as on real Windows.
   uint8_t record[12 + 2 * (ObjectManager::kWatchNameBytes)];
   uint64_t used = 0, last_header = 0, last_size = 0;
   uint32_t written = 0;
   for (uint32_t i = 0; i < taken; ++i) {
     const uint64_t name_bytes = to_utf16(StringView(records[i].name, records[i].name_size), record + 12, sizeof(record) - 12);
     if (name_bytes == 0 && records[i].name_size != 0) continue;      // malformed name: skip it rather than fail the whole call
-    const uint64_t size = 12 + name_bytes, padded = (size + 7) & ~uint64_t{7};
-    if (used + size > length) break;
+    const uint64_t size = 12 + name_bytes, padded = (size + 3) & ~uint64_t{3};
+    if (size > length || used > length - size) return enumerate_directory();
     put(ByteView(record, 12), 0, 0, 4);      // NextEntryOffset: 0 unless a later record patches it (the last one really is 0, like a real one)
     put(ByteView(record, 12), 4, records[i].action, 4);
     put(ByteView(record, 12), 8, name_bytes, 4);
@@ -1106,10 +1161,10 @@ uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r) {
     if (!p.write_user(buffer + used, ConstByteView(record, size))) return kAccessViolation;
     last_header = used;
     last_size = size;
-    used += used + padded > length ? size : padded;
+    used += padded;
     ++written;
   }
-  if (written == 0) return store_io_status(p, status_block, 0x10Cu, 0) ? 0x10Cu : kAccessViolation;      // STATUS_NOTIFY_ENUM_DIR: not even one change fits; look at the directory
+  if (written == 0) return enumerate_directory();
   return store_io_status(p, status_block, kSuccess, last_header + last_size) ? kSuccess : kAccessViolation;
 }
 

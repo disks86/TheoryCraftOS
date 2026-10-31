@@ -269,18 +269,33 @@ class ObjectManager {
 
   // --- change notifications (kind ChangeNotification; FindFirstChangeNotification/ReadDirectoryChangesW): a handle that becomes signalled, exactly like a manual-reset
   // event, when something is created, deleted, renamed or linked directly under the directory it watches (or anywhere under it, if `watch_subtree`). Reset it
-  // (FindNextChangeNotification) with reset_event(), which this kind shares with Event. `filter` is kept but not matched against: every one of those changes signals
-  // every watch of its directory, regardless of which FILE_NOTIFY_CHANGE_* bits it asked for (a simplification, like this OS's permissive registry access checks).
+  // (FindNextChangeNotification) with reset_event(), which this kind shares with Event. `filter` is matched against the kind of each change (see
+  // notify_entry_changed).
   // A watch also queues what changed (action + name), FILE_NOTIFY_INFORMATION-style, for ReadDirectoryChangesW - a plain FindFirstChangeNotification watch just never
   // drains that queue, relying only on `signaled`, so one mechanism serves both APIs exactly as it does on real Windows (both go through the same underlying service).
   static constexpr uint32_t kMaxWatches = 64, kWatchPathBytes = 512, kMaxWatchRecords = 32, kWatchNameBytes = 128;
   Created create_change_notification(StringView path, bool watch_subtree, uint32_t filter);
-  // Call after any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked): `affected_directory` is that directory's
-  // own virtual path (the parent of whatever changed, not the changed entry itself); `action` is a FILE_ACTION_* constant, `entry_name` the changed entry's own
-  // (not full-path) name. Signals every watch whose directory this is under (or equal to), and queues a record for it if there is room (a full queue just drops the
-  // record - `signaled` still fires, so a FindFirstChangeNotification-only watcher is unaffected, and ReadDirectoryChangesW already has to tolerate missed changes
-  // under real Windows too, documented as "if the buffer overflows").
-  void notify_path_changed(StringView affected_directory, uint32_t action, StringView entry_name);
+  // FILE_NOTIFY_CHANGE_* bits a change is matched against the watch's `filter` with (0: matches every watch).
+  static constexpr uint32_t kChangeFileName = 0x1, kChangeDirName = 0x2, kChangeAttributes = 0x4, kChangeSize = 0x8, kChangeLastWrite = 0x10, kChangeLastAccess = 0x20, kChangeCreation = 0x40, kChangeSecurity = 0x100;
+  // Call after any successful change to a directory's contents (a file or subdirectory created, deleted, linked, or its attributes, size or times changed): `changed_path`
+  // is the changed entry's own full virtual path; `action` is a FILE_ACTION_* constant; `filter_mask` says what kind of change it is (a file's or a directory's name, its
+  // attributes, size ...). Signals every watch whose directory this is under (or equal to) and whose filter has one of those bits, and queues a record for it if there is
+  // room (a full queue sets its overflow flag - `signaled` still fires, so a FindFirstChangeNotification-only watcher is unaffected, and ReadDirectoryChangesW then answers
+  // STATUS_NOTIFY_ENUM_DIR, as the real one does when its buffer overflows). A removed directory also signals the watches of that very directory.
+  void notify_entry_changed(StringView changed_path, uint32_t action, uint32_t filter_mask);
+  // A rename: a watch that covers both names gets the old-name and new-name records, one that covers only the old name a removal, only the new name an addition.
+  void notify_entry_renamed(StringView old_path, StringView new_path, uint32_t filter_mask);
+  // The first call of ReadDirectoryChangesW on a handle decides if the watch keeps what changed (a call with no buffer only ever learns that something did: STATUS_NOTIFY_ENUM_DIR).
+  void watch_set_want_data(uint32_t id, bool want_data);
+  // The watch's overflow flag and whether it keeps data; the overflow flag is cleared when `clear`. False if `id` is not a change-notification handle.
+  bool take_watch_state_locked(uint32_t id, bool* overflow, bool* want_data, bool clear);
+  // An overlapped ReadDirectoryChangesW request that a thread of the program waits for (kernel32 has one for each): it is armed (watch_wait_begin) when it is made, and
+  // while one is, a change leaves the watch owing an acknowledgement, which that thread gives (watch_ack) once it has completed the request. Whoever made the change waits for
+  // it, so that the OVERLAPPED is complete when the call that changed the directory returns.
+  void watch_wait_begin(uint32_t id);
+  void watch_ack(uint32_t id);
+  bool watches_delivered_locked();
+  void watches_forgive_locked();
   // Takes every record a ReadDirectoryChangesW-backed watch has queued (up to `capacity` of them) as parallel arrays; the watch's queue is cleared. False if `id`
   // is not a change-notification handle. Returns how many were taken in *count (0 with no error: nothing was queued).
   struct WatchRecord { uint32_t action = 0; char name[kWatchNameBytes] = {}; uint32_t name_size = 0; };
@@ -408,6 +423,8 @@ class ObjectManager {
     uint32_t filter = 0;
     WatchRecord records[kMaxWatchRecords];      // a ring, oldest first: ReadDirectoryChangesW's own queue (a plain FindFirstChangeNotification watch never drains it)
     uint32_t record_head = 0, record_count = 0;
+    bool overflow = false, want_data = true, owes_ack = false;
+    uint32_t waiters = 0;
   };
   void free_watch_locked(Object& o);
 

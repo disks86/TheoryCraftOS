@@ -2171,7 +2171,25 @@ ObjectManager::Created ObjectManager::create_change_notification(StringView path
   return result;
 }
 
-void ObjectManager::notify_path_changed(StringView affected_directory, uint32_t action, StringView entry_name) {
+namespace {
+
+// Where in the path `entry_path` (a full virtual path) the part below `directory` starts, if the entry is directly in `directory` or (with `subtree`) anywhere below it.
+bool watch_covers(StringView watched, bool subtree, StringView entry_path, uint64_t* name_start) {
+  if (watched.size() <= 1) {      // the root ("/"): every entry is under it
+    if (entry_path.size() < 2 || entry_path[0] != '/') return false;
+    if (!subtree) for (uint64_t k = 1; k < entry_path.size(); ++k) if (entry_path[k] == '/') return false;
+    *name_start = 1;
+    return true;
+  }
+  if (entry_path.size() <= watched.size() + 1 || entry_path[watched.size()] != '/' || entry_path.first(watched.size()) != watched) return false;
+  if (!subtree) for (uint64_t k = watched.size() + 1; k < entry_path.size(); ++k) if (entry_path[k] == '/') return false;
+  *name_start = watched.size() + 1;
+  return true;
+}
+
+}  // namespace
+
+void ObjectManager::notify_entry_changed(StringView changed_path, uint32_t action, uint32_t filter_mask) {
   Locked hold(sync_);
   if (!watches_) return;
   bool any = false;
@@ -2179,28 +2197,109 @@ void ObjectManager::notify_path_changed(StringView affected_directory, uint32_t 
     if (o.kind != ObjectKind::ChangeNotification || o.watch < 0) continue;
     Watch& w = watches_[o.watch];
     const StringView watched(w.path, w.path_size);
-    bool matches = affected_directory == watched;
-    if (!matches && w.subtree) {
-      matches = watched.size() <= 1 ||      // the root ("/"): every directory is under it
-                (affected_directory.size() > watched.size() && affected_directory[watched.size()] == '/' && affected_directory.first(watched.size()) == watched);
+    uint64_t start = 0;
+    if (!watch_covers(watched, w.subtree, changed_path, &start)) {
+      if (action == 2 /* FILE_ACTION_REMOVED */ && (filter_mask & kChangeDirName) && changed_path == watched) { o.signaled = true; any = true; }      // (the watched directory itself is gone)
+      continue;
     }
-    if (!matches) continue;
+    if (filter_mask != 0 && (w.filter & filter_mask) == 0) continue;
     o.signaled = true;
     any = true;
-    if (w.record_count < kMaxWatchRecords && entry_name.size() + affected_directory.size() < kWatchNameBytes) {      // a full queue just drops it: signaled (above) still fires
-      WatchRecord& r = w.records[(w.record_head + w.record_count) % kMaxWatchRecords];
-      r.action = action;
-      uint32_t n = 0;
-      if (affected_directory.size() > watched.size() && watched.size() > 1) {      // a change below the watched folder: the name is the path from it, with backslashes
-        for (uint64_t k = watched.size() + 1; k < affected_directory.size() && n + 1 < kWatchNameBytes; ++k) r.name[n++] = affected_directory[k] == '/' ? '\\' : affected_directory[k];
-        if (n + 1 < kWatchNameBytes) r.name[n++] = '\\';
+    if (!w.want_data) { w.overflow = true; if (w.waiters != 0) w.owes_ack = true; continue; }
+    const StringView name = changed_path.without_prefix(start);
+    bool duplicate = false;      // one record for a run of changes of the same entry
+    if (action == 3 && w.record_count != 0) {
+      const WatchRecord& last = w.records[(w.record_head + w.record_count - 1) % kMaxWatchRecords];
+      if (last.action == 3 && last.name_size == name.size()) {
+        duplicate = true;
+        for (uint64_t k = 0; k < name.size(); ++k) if (last.name[k] != (name[k] == '/' ? '\\' : name[k])) { duplicate = false; break; }
       }
-      for (uint64_t k = 0; k < entry_name.size() && n < kWatchNameBytes; ++k) r.name[n++] = entry_name[k];
+    }
+    if (duplicate) continue;
+    if (w.record_count >= kMaxWatchRecords || name.size() >= kWatchNameBytes) { w.overflow = true; if (w.waiters != 0) w.owes_ack = true; continue; }
+    WatchRecord& r = w.records[(w.record_head + w.record_count) % kMaxWatchRecords];
+    r.action = action;
+    uint32_t n = 0;
+    for (uint64_t k = 0; k < name.size(); ++k) r.name[n++] = name[k] == '/' ? '\\' : name[k];
+    r.name_size = n;
+    ++w.record_count;
+    if (w.waiters != 0) w.owes_ack = true;
+  }
+  if (any) sync_.notify_all();
+}
+
+void ObjectManager::notify_entry_renamed(StringView old_path, StringView new_path, uint32_t filter_mask) {
+  Locked hold(sync_);
+  if (!watches_) return;
+  bool any = false;
+  for (Object& o : objects_) {
+    if (o.kind != ObjectKind::ChangeNotification || o.watch < 0) continue;
+    Watch& w = watches_[o.watch];
+    if (filter_mask != 0 && (w.filter & filter_mask) == 0) continue;
+    const StringView watched(w.path, w.path_size);
+    uint64_t old_start = 0, new_start = 0;
+    const bool had = watch_covers(watched, w.subtree, old_path, &old_start), has = watch_covers(watched, w.subtree, new_path, &new_start);
+    if (!had && !has) continue;
+    o.signaled = true;
+    any = true;
+    if (!w.want_data) { w.overflow = true; if (w.waiters != 0) w.owes_ack = true; continue; }
+    const uint32_t first = had && has ? 4 /* RENAMED_OLD_NAME */ : had ? 2 /* REMOVED */ : 1 /* ADDED */;
+    const StringView names[2] = {first == 1 ? new_path.without_prefix(new_start) : old_path.without_prefix(old_start), new_path.without_prefix(new_start)};
+    const uint32_t count = had && has ? 2 : 1;
+    if (w.record_count + count > kMaxWatchRecords || names[0].size() >= kWatchNameBytes || names[1].size() >= kWatchNameBytes) { w.overflow = true; if (w.waiters != 0) w.owes_ack = true; continue; }
+    for (uint32_t i = 0; i < count; ++i) {
+      WatchRecord& r = w.records[(w.record_head + w.record_count) % kMaxWatchRecords];
+      r.action = i == 0 ? first : 5 /* RENAMED_NEW_NAME */;
+      uint32_t n = 0;
+      for (uint64_t k = 0; k < names[i].size(); ++k) r.name[n++] = names[i][k] == '/' ? '\\' : names[i][k];
       r.name_size = n;
       ++w.record_count;
     }
+    if (w.waiters != 0) w.owes_ack = true;
   }
   if (any) sync_.notify_all();
+}
+
+void ObjectManager::watch_set_want_data(uint32_t id, bool want_data) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (o && o->kind == ObjectKind::ChangeNotification && o->watch >= 0 && watches_) watches_[o->watch].want_data = want_data;
+}
+
+bool ObjectManager::take_watch_state_locked(uint32_t id, bool* overflow, bool* want_data, bool clear) {
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::ChangeNotification || o->watch < 0 || !watches_) return false;
+  Watch& w = watches_[o->watch];
+  *overflow = w.overflow;
+  *want_data = w.want_data;
+  if (clear) w.overflow = false;
+  return true;
+}
+
+void ObjectManager::watch_wait_begin(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (o && o->kind == ObjectKind::ChangeNotification && o->watch >= 0 && watches_) ++watches_[o->watch].waiters;
+}
+
+void ObjectManager::watch_ack(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::ChangeNotification || o->watch < 0 || !watches_) return;
+  Watch& w = watches_[o->watch];
+  if (w.waiters != 0) --w.waiters;
+  if (w.waiters == 0) w.owes_ack = false;
+}
+
+bool ObjectManager::watches_delivered_locked() {
+  if (!watches_) return true;
+  for (uint32_t i = 0; i < kMaxWatches; ++i) if (watches_[i].used && watches_[i].owes_ack) return false;
+  return true;
+}
+
+void ObjectManager::watches_forgive_locked() {
+  if (!watches_) return;
+  for (uint32_t i = 0; i < kMaxWatches; ++i) watches_[i].owes_ack = false;
 }
 
 bool ObjectManager::take_watch_records(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count) {
