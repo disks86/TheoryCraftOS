@@ -318,6 +318,8 @@ uint32_t open_with_descriptor(Process& p, char tag, uint64_t id, uint32_t desire
   return kSuccess;
 }
 
+bool caller_is_impersonating(Process& p) { return owner_object(g_thread_tokens, p.runtime() ? p.runtime()->current_thread_id() : p.id()) != 0; }
+
 bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted, uint32_t* status, bool backup_intent) {
   *granted = mapping.map(desired & ~kMaximumAllowed);
   *status = kSuccess;

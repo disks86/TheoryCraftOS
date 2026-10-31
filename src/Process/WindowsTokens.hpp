@@ -50,6 +50,9 @@ uint32_t open_with_descriptor(Process& p, char tag, uint64_t id, uint32_t desire
 inline const security::GenericMapping kProcessMapping = {0x20410, 0x20BEA, 0x121001, 0x1FFFFF};
 inline const security::GenericMapping kThreadMapping = {0x20048, 0x20037, 0x120000, 0x1FFFFF};
 
+// Does the calling thread impersonate a token?
+bool caller_is_impersonating(Process& p);
+
 // The generic mapping of files and directories.
 inline const security::GenericMapping kFileMapping = {0x120089, 0x120116, 0x1200A0, 0x1F01FF};
 

@@ -187,7 +187,7 @@ static DWORD build_blob(const TokenData *t, BYTE *out, DWORD capacity)
 }
 
 /* Reads a token object into data (allocated by the caller); `required` the rights the handle must hold. */
-static NTSTATUS read_token(HANDLE token, ACCESS_MASK required, TokenData *t)
+static NTSTATUS read_token_raw(HANDLE token, ACCESS_MASK required, TokenData *t)
 {
     BYTE *blob = heap_new(TCOS_TOKEN_MAX_BYTES);
     ULONG needed = 0;
@@ -198,7 +198,7 @@ static NTSTATUS read_token(HANDLE token, ACCESS_MASK required, TokenData *t)
     heap_drop(blob);
     return status;
 }
-static NTSTATUS write_token(HANDLE token, ACCESS_MASK required, TokenData *t)
+static NTSTATUS write_token_raw(HANDLE token, ACCESS_MASK required, TokenData *t)
 {
     BYTE *blob = heap_new(TCOS_TOKEN_MAX_BYTES);
     DWORD size;
@@ -210,6 +210,43 @@ static NTSTATUS write_token(HANDLE token, ACCESS_MASK required, TokenData *t)
     heap_drop(blob);
     return status;
 }
+
+/* The pseudo handles of tokens (-4 the token of the process, -5 the impersonation token of the thread, -6 the token that decides: the thread's, else the process's) stand for a real
+ * one for as long as a call takes. */
+static NTSTATUS resolve_token(HANDLE token, HANDLE *real, BOOL *temporary)
+{
+    NTSTATUS status;
+    LONG_PTR v = (LONG_PTR)token;
+    *real = token;
+    *temporary = FALSE;
+    if (v < -6 || v > -4) return STATUS_SUCCESS;
+    *temporary = TRUE;
+    if (v == -4) return NtOpenProcessToken((HANDLE)(LONG_PTR)-1, TOKEN_ALL, real);
+    status = NtOpenThreadToken((HANDLE)(LONG_PTR)-2, TOKEN_ALL, TRUE, real);
+    if (v == -6 && status == STATUS_NO_TOKEN_) return NtOpenProcessToken((HANDLE)(LONG_PTR)-1, TOKEN_ALL, real);
+    return status;
+}
+static NTSTATUS read_token(HANDLE token, ACCESS_MASK required, TokenData *t)
+{
+    HANDLE real;
+    BOOL temporary;
+    NTSTATUS status = resolve_token(token, &real, &temporary);
+    if (status) return status;
+    status = read_token_raw(real, temporary ? 0 : required, t);
+    if (temporary) NtClose(real);
+    return status;
+}
+static NTSTATUS write_token(HANDLE token, ACCESS_MASK required, TokenData *t)
+{
+    HANDLE real;
+    BOOL temporary;
+    NTSTATUS status = resolve_token(token, &real, &temporary);
+    if (status) return status;
+    status = write_token_raw(real, temporary ? 0 : required, t);
+    if (temporary) NtClose(real);
+    return status;
+}
+
 static NTSTATUS create_token(TokenData *t, ACCESS_MASK access, BOOL inherit, HANDLE *out)
 {
     BYTE *blob = heap_new(TCOS_TOKEN_MAX_BYTES);
@@ -271,7 +308,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtDuplicateToken(HANDLE source, ACCESS_MASK
     if (status) { heap_drop(t); return status; }
     qos_of(attr, &have_qos, &level, &qos_effective);
     if (type == TokenImpersonation) {
-        if (t->type == TokenPrimary) t->level = have_qos ? level : SecurityImpersonation;
+        if (t->type == TokenPrimary) t->level = have_qos ? level : SecurityAnonymous;
         else if (have_qos) { if (level > t->level) { heap_drop(t); return STATUS_BAD_IMPERSONATION_LEVEL_; } t->level = level; }
         if (t->level > SecurityDelegation) { heap_drop(t); return STATUS_INVALID_PARAMETER_; }
     } else {
@@ -284,9 +321,18 @@ __declspec(dllexport) NTSTATUS NTAPI NtDuplicateToken(HANDLE source, ACCESS_MASK
         t->npriv = kept;
     }
     t->token_id = next_luid();
-    if (!access) access = TOKEN_ALL;
+    if (!access) {      /* no rights asked for: those of the handle copied */
+        ULONG basic[14];
+        HANDLE real;
+        BOOL temporary;
+        access = TOKEN_ALL;
+        if (!resolve_token(source, &real, &temporary)) {
+            if (!NtQueryObject(real, 0, basic, sizeof(basic), NULL)) access = basic[1];
+            if (temporary) NtClose(real);
+        }
+    }
     status = create_token(t, access, attr && (attr->Attributes & OBJ_INHERIT), out);
-    if (!status && attr && attr->SecurityDescriptor) {
+    if (!status && attr && attr->SecurityDescriptor && ((SECURITY_DESCRIPTOR *)attr->SecurityDescriptor)->Control & SE_DACL_PRESENT) {
         ULONG length = RtlLengthSecurityDescriptor(attr->SecurityDescriptor);
         BYTE *rel = heap_new(length + 16);
         if (rel) {
@@ -510,7 +556,7 @@ static DWORD class_data(const TokenData *t, int class_, BYTE *buf, DWORD capacit
         }
         return need;
     }
-    case TokenLinkedToken: *status = STATUS_NO_TOKEN_; return 0;
+    case TokenLinkedToken: need = sizeof(HANDLE); *status = 0x7FFFFFFF; return need;      /* (made by the caller: it needs the handle) */
     default: *status = STATUS_INVALID_INFO_CLASS_; return 0;
     }
 #undef SIMPLE
@@ -530,6 +576,21 @@ __declspec(dllexport) NTSTATUS NTAPI NtQueryInformationToken(HANDLE token, TOKEN
     scratch = heap_new(TCOS_TOKEN_MAX_BYTES * 2);
     if (!scratch) { heap_drop(t); return STATUS_NO_MEMORY_; }
     need = class_data(t, class_, scratch, TCOS_TOKEN_MAX_BYTES * 2, &class_status);
+    if (class_status == 0x7FFFFFFF) {      /* the linked token: a copy of the token of the same integrity, to look at */
+        SECURITY_QUALITY_OF_SERVICE qos = { sizeof(qos), SecurityIdentification, SECURITY_STATIC_TRACKING, FALSE };
+        OBJECT_ATTRIBUTES attr;
+        HANDLE linked = NULL;
+        InitializeObjectAttributes(&attr, NULL, 0, NULL, NULL);
+        attr.SecurityQualityOfService = &qos;
+        heap_drop(t);
+        heap_drop(scratch);
+        *returned = sizeof(HANDLE);
+        if (length < sizeof(HANDLE)) return STATUS_BUFFER_TOO_SMALL_;
+        if (!info) return STATUS_ACCESS_VIOLATION_;
+        class_status = NtDuplicateToken(token, TOKEN_ALL, &attr, FALSE, TokenImpersonation, &linked);
+        if (!class_status) *(HANDLE *)info = linked;
+        return class_status;
+    }
     heap_drop(t);
     if (class_status) { heap_drop(scratch); return class_status; }
     *returned = need;
@@ -835,7 +896,14 @@ static NTSTATUS check_internal(PSECURITY_DESCRIPTOR sd, HANDLE token, ACCESS_MAS
             if (primary) { heap_drop(rel); return STATUS_NO_IMPERSONATION_TOKEN_; }
         }
     }
-    status = NtTcosAccessCheck(&args);
+    {
+        HANDLE real = token;
+        BOOL temporary = FALSE;
+        if (token && (status = resolve_token(token, &real, &temporary))) { heap_drop(rel); return status; }
+        args.token = (ULONGLONG)(ULONG_PTR)real;
+        status = NtTcosAccessCheck(&args);
+        if (temporary) NtClose(real);
+    }
     heap_drop(rel);
     if (status) return status;
     for (i = 0; i < 64; ++i) if (used & ((ULONGLONG)1 << i)) privilege_count++;
@@ -1062,8 +1130,49 @@ __declspec(dllexport) NTSTATUS NTAPI RtlQuerySecurityObject(PSECURITY_DESCRIPTOR
     return status;
 }
 
+static NTSTATUS NtQuerySecurityObject_real(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR result, ULONG length, PULONG needed);
 __declspec(dllexport) NTSTATUS NTAPI NtQuerySecurityObject(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR result, ULONG length, PULONG needed)
 {
+    HANDLE real;
+    BOOL temporary;
+    NTSTATUS status = resolve_token(handle, &real, &temporary);
+    if (status) return status;
+    status = NtQuerySecurityObject_real(real, info, result, length, needed);
+    if (temporary) NtClose(real);
+    return status;
+}
+static NTSTATUS NtQuerySecurityObject_real(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR result, ULONG length, PULONG needed)
+{
+    if ((info & LABEL_SECURITY_INFORMATION) && !(info & SACL_SECURITY_INFORMATION)) {      /* the label of a token is its integrity level, whatever descriptor was given to it */
+        GENERIC_MAPPING mapping;
+        mapping_for_handle(handle, &mapping);
+        if (mapping.GenericAll == 0xf01ff) {
+            TokenData *t = heap_new(sizeof(*t));
+            ULONG stored = 0;
+            NTSTATUS st = t ? read_token(handle, TOKEN_QUERY, t) : STATUS_NO_MEMORY_;
+            const TSid *il = st ? NULL : integrity_group(t);
+            if (!st && il) {
+                BYTE out[sizeof(SECURITY_DESCRIPTOR_RELATIVE) + 8 + 8 + 8 + MAX_SID_BYTES];
+                SECURITY_DESCRIPTOR_RELATIVE *o = (SECURITY_DESCRIPTOR_RELATIVE *)out;
+                ACL *acl = (ACL *)(out + sizeof(*o));
+                ULONG size;
+                NtTcosToken(TCOS_OBJECT_SD_GET, (ULONG_PTR)handle, 0, 0, 0, (ULONG_PTR)&stored);
+                memset(out, 0, sizeof(out));
+                RtlCreateAcl(acl, 8 + 8 + 8 + MAX_SID_BYTES, ACL_REVISION_DS);
+                RtlAddMandatoryAce(acl, ACL_REVISION_DS, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, SYSTEM_MANDATORY_LABEL_ACE_TYPE, (PSID)il->sid);
+                o->Revision = 1;
+                o->Control = SE_SELF_RELATIVE | SE_SACL_PRESENT | (stored ? 0 : SE_SACL_AUTO_INHERITED);
+                o->Sacl = sizeof(*o);
+                size = sizeof(*o) + acl->AclSize;
+                heap_drop(t);
+                *needed = size;
+                if (length < size) return STATUS_BUFFER_TOO_SMALL_;
+                memcpy(result, out, size);
+                return STATUS_SUCCESS;
+            }
+            heap_drop(t);
+        }
+    }
     BYTE *current = NULL, *tmp;
     ULONG current_length = 0, size;
     NTSTATUS status;
@@ -1175,7 +1284,18 @@ __declspec(dllexport) NTSTATUS NTAPI RtlSetSecurityObject(SECURITY_INFORMATION i
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS NtSetSecurityObject_real(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR sd);
 __declspec(dllexport) NTSTATUS NTAPI NtSetSecurityObject(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR sd)
+{
+    HANDLE real;
+    BOOL temporary;
+    NTSTATUS status = resolve_token(handle, &real, &temporary);
+    if (status) return status;
+    status = NtSetSecurityObject_real(real, info, sd);
+    if (temporary) NtClose(real);
+    return status;
+}
+static NTSTATUS NtSetSecurityObject_real(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR sd)
 {
     BYTE *current = NULL, *merged = NULL;
     ULONG current_length = 0, merged_length = 0;

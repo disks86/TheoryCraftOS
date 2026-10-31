@@ -22,6 +22,7 @@
 #include "Executable/PeFile.hpp"
 #include "Process/Objects.hpp"
 #include "Process/AccessCheck.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
@@ -194,6 +195,23 @@ uint32_t mapped_access(DescriptorKind kind, uint32_t desired) {
   return mapped & ~uint32_t{0x02000000u};
 }
 
+// The descriptor kept for an object limits what the calling thread may have of it: *desired becomes what it gets (MAXIMUM_ALLOWED asks for all the descriptor allows). 0, or why not.
+uint32_t restrict_by_descriptor(Process& p, uint32_t id, DescriptorKind kind, uint32_t* desired) {
+  ObjectManager* objects = system_objects();
+  KindAccess a;
+  if (!objects || !objects->allocator() || !kind_access(kind, &a)) return kSuccess;
+  char key[16];
+  const uint32_t n = ObjectManager::object_key('s', id, key);
+  const uint32_t size = objects->security_size(StringView(key, n));
+  if (size == 0) return kSuccess;
+  ByteBuffer sd(*objects->allocator());
+  if (!sd.put_zeros(size) || objects->security_get(StringView(key, n), sd.writable_view()) != size) return kAccessDeniedStatus;
+  uint32_t granted = 0, status = 0;
+  if (!caller_may(p, sd.view(), *desired, a.mapping, &granted, &status)) return status ? status : kAccessDeniedStatus;
+  if (*desired & kMaximumAllowed) *desired = granted;
+  return kSuccess;
+}
+
 uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, bool manual_reset, bool state, int32_t initial, int32_t maximum) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
@@ -219,10 +237,11 @@ uint32_t open_object(Process& p, const SyscallRequest& r, ObjectKind kind) {
   const uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &size);
   if (status != kSuccess) return status;
   if (size == 0) return kInvalidParameter;
-  uint32_t granted = 0;
+  uint32_t granted = 0, wanted = uint32_t(r.args[1]);
   const ObjectManager::Created c = objects->open(kind, StringView(name, size));
   if (c.id == 0) return c.status;
-  if (const uint32_t denied = map_sync_access(kind, uint32_t(r.args[1]), true, &granted)) { objects->release(c.id); return denied; }
+  if (const uint32_t refused = restrict_by_descriptor(p, c.id, descriptor_kind_of(kind), &wanted)) { objects->release(c.id); return refused; }
+  if (const uint32_t denied = map_sync_access(kind, wanted, true, &granted)) { objects->release(c.id); return denied; }
   const uint32_t given = give_handle(p, *objects, kind, c.id, r.args[0], kSuccess, wants_inherit(p, r.args[2]));
   if (given == kSuccess) restrict_handle(p, r.args[0], granted, kind);
   return given;
@@ -619,6 +638,10 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     p.files().set_denied_access(slot, (options & 2) ? original : (original | ~mapped_access(p.files().kind(slot), uint32_t(desired_access))));
     p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
     return kSuccess;
+  }
+  if (!(options & 2) && is_object_kind(p.files().kind(slot)) && caller_is_impersonating(p)) {      // a thread that impersonates is held to the descriptor of the object it copies a handle of
+    uint32_t wanted = uint32_t(desired_access);
+    if (const uint32_t refused = restrict_by_descriptor(p, uint32_t(p.files().token(slot)), p.files().kind(slot), &wanted)) return refused;
   }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;

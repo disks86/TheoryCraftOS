@@ -341,3 +341,42 @@ EXP BOOL WINAPI ConvertToAutoInheritPrivateObjectSecurity(PSECURITY_DESCRIPTOR p
     NTSTATUS status = RtlConvertToAutoInheritSecurityObject(parent, current, out, type, directory, mapping);
     return status ? nt_fail(status) : TRUE;
 }
+
+/* ---- a process that runs as another token -------------------------------------------------------------------------------------------------------------- */
+
+#include "../tcos_token.h"
+NTSTATUS NTAPI NtTcosToken(ULONG op, ULONG_PTR a, ULONG_PTR b, ULONG_PTR c, ULONG_PTR d, ULONG_PTR e);
+
+/* The process is made suspended, given the token, and runs on (or stays suspended if it was asked to). */
+static BOOL give_process_token(HANDLE token, DWORD flags, PROCESS_INFORMATION *pi)
+{
+    NTSTATUS status = NtTcosToken(TCOS_TOKEN_SET_PROCESS, (ULONG_PTR)pi->hProcess, (ULONG_PTR)token, 0, 0, 0);
+    if (status) {
+        DWORD error = RtlNtStatusToDosError(status);
+        TerminateProcess(pi->hProcess, 1);
+        CloseHandle(pi->hProcess);
+        CloseHandle(pi->hThread);
+        SetLastError(error);
+        return FALSE;
+    }
+    if (!(flags & CREATE_SUSPENDED)) ResumeThread(pi->hThread);
+    return TRUE;
+}
+EXP BOOL WINAPI CreateProcessAsUserW(HANDLE token, LPCWSTR application, LPWSTR command, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes, BOOL inherit,
+    DWORD flags, LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION information)
+{
+    PROCESS_INFORMATION local;
+    if (!information) information = &local;
+    if (!token) return CreateProcessW(application, command, process_attributes, thread_attributes, inherit, flags, environment, directory, startup, information);
+    if (!CreateProcessW(application, command, process_attributes, thread_attributes, inherit, flags | CREATE_SUSPENDED, environment, directory, startup, information)) return FALSE;
+    return give_process_token(token, flags, information);
+}
+EXP BOOL WINAPI CreateProcessAsUserA(HANDLE token, LPCSTR application, LPSTR command, LPSECURITY_ATTRIBUTES process_attributes, LPSECURITY_ATTRIBUTES thread_attributes, BOOL inherit,
+    DWORD flags, LPVOID environment, LPCSTR directory, LPSTARTUPINFOA startup, LPPROCESS_INFORMATION information)
+{
+    PROCESS_INFORMATION local;
+    if (!information) information = &local;
+    if (!token) return CreateProcessA(application, command, process_attributes, thread_attributes, inherit, flags, environment, directory, startup, information);
+    if (!CreateProcessA(application, command, process_attributes, thread_attributes, inherit, flags | CREATE_SUSPENDED, environment, directory, startup, information)) return FALSE;
+    return give_process_token(token, flags, information);
+}
