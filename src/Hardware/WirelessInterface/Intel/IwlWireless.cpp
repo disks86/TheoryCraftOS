@@ -213,6 +213,7 @@ void IwlWirelessInterface::pump() const {
   }
   if (!association_ || (status_.state != WifiState::Connecting && status_.state != WifiState::Connected)) return;
   association_->poll();
+  if (link_) link_->service();
   // a join is a conversation: each answer the card has already received moves it one step on, so run a few rounds rather than waiting for the next call
   for (uint32_t round = 0; round < 8 && status_.state == WifiState::Connecting; ++round) {
     const Ieee80211Association::State before = association_->state();
@@ -235,6 +236,12 @@ void IwlWirelessInterface::pump() const {
     default:
       break;
   }
+}
+
+uint32_t IwlWirelessInterface::link_speed_mbps() const {
+  if (!link_up()) return 0;
+  kernel::ScopedMutex guard(mutex_);
+  return link_ ? link_->data_rate_kbps() / 1000 : 0;
 }
 
 bool IwlWirelessInterface::link_up() const {

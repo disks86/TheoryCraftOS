@@ -82,7 +82,7 @@ class IwlWirelessInterface final : public IWirelessInterface, private IWifiDataS
   // INetworkInterface
   MacAddress mac_address() const override;
   bool link_up() const override;
-  uint32_t link_speed_mbps() const override { return link_up() ? 24 : 0; }
+  uint32_t link_speed_mbps() const override;
   LinkDuplex link_duplex() const override { return LinkDuplex::Unknown; }
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;

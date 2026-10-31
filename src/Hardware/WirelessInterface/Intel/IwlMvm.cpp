@@ -36,6 +36,26 @@ uint32_t iwl_build_tx_ant_config(uint32_t valid_antennas, ByteView out) {
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
+uint32_t iwl_build_link_quality(uint8_t station_id, uint32_t tx_antennas, const uint32_t rates[kLinkQualityTableSize], ByteView out) {
+  ByteWriter w(out);
+  const uint32_t antenna = tx_antennas & 7 ? tx_antennas & 7 : 1;
+  w.u8(station_id);
+  w.u8(0);                                         // reduced_tpc
+  w.le16(0);                                       // control (unused)
+  w.u8(0);                                         // flags: no RTS, colour 0
+  w.u8(0);                                         // mimo_delim
+  w.u8(static_cast<uint8_t>(antenna & 1 ? 1 : antenna & 2 ? 2 : 4));      // single_stream_ant_msk
+  w.u8(static_cast<uint8_t>(antenna));             // dual_stream_ant_msk
+  for (int ac = 0; ac < 4; ++ac) w.u8(0);          // initial_rate_index
+  w.le16(4000);                                    // agg_time_limit
+  w.u8(3);                                         // agg_disable_start_th
+  w.u8(1);                                         // agg_frame_cnt_limit: no aggregation
+  w.le32(0);                                       // reserved2
+  for (uint32_t i = 0; i < kLinkQualityTableSize; ++i) w.le32(rates[i]);
+  w.le32(0);                                       // ss_params: not valid
+  return w.ok() && w.position() == kLinkQualityBytes ? static_cast<uint32_t>(w.position()) : 0;
+}
+
 uint32_t iwl_build_bt_config(ByteView out) {
   ByteWriter w(out);
   w.le32(kBtCoexNetwork);                          // mode
@@ -248,10 +268,10 @@ uint32_t iwl_build_tx_prefix(const IwlTxParams& p, ByteView out) {
   w.le16(p.frame_bytes);                           // len
   const uint32_t mh_len = hdr_len + (p.protect ? 8 : 0);
   w.le16(static_cast<uint16_t>((mh_len / 2) << 8) | (hdr_len % 4 ? (1u << 13) : 0));      // offload_assist: the header size in words (and the padding bit)
-  w.le32((multicast ? 0u : kTxFlagAck) | kTxFlagSeqCtl);
+  w.le32((multicast ? 0u : kTxFlagAck) | kTxFlagSeqCtl | (p.data && p.station_rate ? kTxFlagStaRate : 0u));
   w.le32(0);                                       // scratch (the firmware's status word; its address is set by the queue)
   uint32_t rate;
-  if (p.data) rate = kRatePlcp24M;
+  if (p.data) rate = p.data_plcp;
   else rate = p.five_ghz ? kRatePlcp6M : (kRatePlcp1M | kRateCckV1);
   uint32_t antenna = p.tx_antennas & 7;
   antenna = antenna & 1 ? 1 : antenna & 2 ? 2 : 4;
@@ -277,10 +297,15 @@ uint32_t iwl_build_tx_prefix(const IwlTxParams& p, ByteView out) {
 
 bool iwl_parse_tx_response(ConstByteView payload, IwlTxResponse* out) {
   ByteReader r(payload);
-  const uint8_t frames = r.u8();
-  r.skip(39);                                      // up to the first frame's status (offset 40, the first four bytes were read above)
-  if (!r.ok() || frames == 0 || frames > 16) return false;
   IwlTxResponse t;
+  const uint8_t frames = r.u8();
+  r.skip(2);                                       // bt_kill_count, failure_rts
+  t.failure_frame = r.u8();
+  t.initial_rate = r.le32();
+  r.skip(26);                                      // up to the frame control (offset 34)
+  t.frame_control = r.le16();
+  r.skip(4);                                       // tx_queue, reserved: up to the first frame's status (offset 40)
+  if (!r.ok() || frames == 0 || frames > 16) return false;
   t.frame_count = frames;
   t.status = r.le16();
   r.skip(2);
