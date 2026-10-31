@@ -118,6 +118,30 @@ bool IwlStationLink::prepare(const IwlFirmware& firmware, const IwlNvmData& nvm,
   for (uint32_t i = 0; i < 6; ++i) spec.address[i] = network.bssid.bytes[i];
   spec.queue_mask = 1u << kDataQueue;
   if (!send_station(spec, error)) return false;
+  // keep the channel for the join (iwl_mvm_protect_session): a refusal does not stop the join, a failed firmware does
+  {
+    IwlTimeEvent event;
+    event.duration_tu = 500;
+    uint8_t te[kTimeEventBytes];
+    const uint32_t te_bytes = iwl_build_time_event(event, ByteView(te, sizeof te));
+    command = IwlHostCommand();
+    command.opcode = kTimeEventCommand;
+    command.data = ConstByteView(te, te_bytes);
+    uint8_t reply[16];
+    int32_t reply_length = 0;
+    const char* te_error = nullptr;
+    time_event_active_ = false;
+    if (send_command(command, ByteView(reply, sizeof reply), &reply_length, &te_error)) {
+      uint32_t status = 0, unique = 0;
+      if (iwl_parse_time_event_response(ConstByteView(reply, reply_length < 0 ? 0 : static_cast<uint32_t>(reply_length > 16 ? 16 : reply_length)), &status, &unique) && status != 0) {
+        time_event_id_ = unique;
+        time_event_active_ = true;
+      }
+    } else if (transport_.firmware_failed()) {
+      *error = te_error;
+      return false;
+    }
+  }
   prepared_ = true;
   have_ptk_ = false;
   pn_ = 0;
@@ -128,6 +152,18 @@ void IwlStationLink::teardown() {
   if (prepared_) {
     const char* error = nullptr;
     uint8_t out[24], response[16];
+    if (time_event_active_) {                                 // the protection may still be running
+      IwlTimeEvent event;
+      event.action = kCtxtActionRemove;
+      event.event = time_event_id_;
+      uint8_t te[kTimeEventBytes];
+      const uint32_t te_bytes = iwl_build_time_event(event, ByteView(te, sizeof te));
+      IwlHostCommand te_command;
+      te_command.opcode = kTimeEventCommand;
+      te_command.data = ConstByteView(te, te_bytes);
+      send_command(te_command, ByteView(response, sizeof response), nullptr, &error);
+      time_event_active_ = false;
+    }
     const uint8_t remove_station[4] = {kStationId, 0, 0, 0};
     IwlHostCommand command;
     command.opcode = 0x19;                                    // REMOVE_STA
