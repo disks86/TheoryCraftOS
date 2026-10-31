@@ -2628,6 +2628,41 @@ void scene_gather_register_offsets(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// A vertex shader that writes buffers (dxil_vs_uav.hlsl): 1023 vertices of degenerate triangles, each logging its position and number in a structured buffer and adding to a counter; the
+// picture shows the log.
+void scene_dxil_vertex_stores(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureVertexStores)) return void(rig.step("buffer writes by vertex shaders", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_dxil_vs_uav, sizeof b::k_dxil_vs_uav, b::k_ps_color, sizeof b::k_ps_color, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Vertex v[1023];
+  for (uint32_t i = 0; i < 1023; ++i) v[i] = {-0.95f + 1.9f * static_cast<float>(i % 32) / 31.0f, -0.95f + 1.9f * static_cast<float>(i / 32) / 31.0f, 0.25f + 0.5f * static_cast<float>(i % 3) / 2.0f, 1, 0, 0, 1};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 16;
+  Handle log = rig.create(d);
+  d.size = 16;
+  Handle counter = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_uav(0, 2, 0, kPixels * 16);
+  w.bind_uav(1, 3, 0, 16);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(1023);
+  w.end_pass();
+  rig.render(w, {target, vb, log, counter});
+  uint32_t words[kPixels * 4];
+  rig.read_words(log, ArrayView<uint32_t>(words, kPixels * 4));
+  for (uint32_t i = 0; i < kPixels; ++i) {
+    const float x = __builtin_bit_cast(float, words[4 * i]), y = __builtin_bit_cast(float, words[4 * i + 1]), z = __builtin_bit_cast(float, words[4 * i + 2]), id = __builtin_bit_cast(float, words[4 * i + 3]);
+    out[i] = (static_cast<uint32_t>(z * 255.0f) & 0xFF) << 24 | (static_cast<uint32_t>((x + 1.0f) * 127.0f) & 0xFF) << 16 | (static_cast<uint32_t>((y + 1.0f) * 127.0f) & 0xFF) << 8 | (static_cast<uint32_t>(id) & 0xFF);
+  }
+  if (rig.read_u64(counter, 0) != 1023)
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2684,6 +2719,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL buffer views in a pixel shader (Shader Model 6)", scene_dxil_pixel_buffers},
     {"Direct3D 12 DXIL buffer views in a vertex shader (Shader Model 6)", scene_dxil_vertex_buffers},
     {"Direct3D 12 DXIL buffer writes by a pixel shader (Shader Model 6)", scene_dxil_pixel_stores},
+    {"Direct3D 12 DXIL buffer writes by a vertex shader (Shader Model 6)", scene_dxil_vertex_stores},
     {"Direct3D 12 DXIL buffer views in the geometry stage (Shader Model 6)", scene_dxil_geometry_buffers},
     {"Direct3D 12 DXIL buffer views in the hull and domain stages (Shader Model 6)", scene_dxil_tess_buffers},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},

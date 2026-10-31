@@ -5184,6 +5184,54 @@ void test_pixel_shader_stores() {
 }
 
 
+
+// Vertex shaders that write buffers: each vertex logs itself at its number and bumps a counter.
+void test_vertex_shader_stores() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_dxil_vs_uav, sizeof b::k_dxil_vs_uav);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_ps_color, sizeof b::k_ps_color);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float tri[21] = {-0.5f, -0.25f, 0.5f, 0.9f, 0.3f, 0.2f, 1, 0.75f, -0.5f, 0.5f, 0.1f, 0.8f, 0.4f, 1, -0.125f, 0.5f, 0.5f, 0.4f, 0.2f, 0.9f, 1};
+  CHECK(e.write(vb, floats(tri, 21)));
+  Handle log = e.buffer(kAllocUnorderedAccess, 3 * 16), counter = e.buffer(kAllocUnorderedAccess, 16);
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  CommandWriter w(e.allocator);
+  w.bind_uav(0, 2, 0, 3 * 16);
+  w.bind_uav(1, 3, 0, 16);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, log, counter}) == status::kSuccess);
+  LockResult lock;
+  CHECK(e.kernel.lock(kPid, log, kLockReadOnly, 0, &lock) == status::kSuccess);
+  ByteReader in(lock.data);
+  bool same = true;
+  for (uint32_t v = 0; v < 3; ++v) {
+    const float x = __builtin_bit_cast(float, in.le32()), y = __builtin_bit_cast(float, in.le32()), z = __builtin_bit_cast(float, in.le32()), id = __builtin_bit_cast(float, in.le32());
+    same = same && x == tri[7 * v] && y == tri[7 * v + 1] && z == tri[7 * v + 2] && id == static_cast<float>(v);
+  }
+  CHECK(same);
+  e.kernel.unlock(kPid, log);
+  CHECK(e.kernel.lock(kPid, counter, kLockReadOnly, 0, &lock) == status::kSuccess);
+  CHECK(ByteReader(lock.data).le32() == 3);
+  e.kernel.unlock(kPid, counter);
+  CHECK(e.pixel(target, 4, 4) != 0);
+}
+
 // Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
 void test_d3d12_barriers() {
   Env e;
@@ -7829,6 +7877,7 @@ int main() {
   test_d3d12_buffer_views();
   test_d3d12_buffer_views_in_draw();
   test_pixel_shader_stores();
+  test_vertex_shader_stores();
   test_gather_register_offsets();
   test_d3d12_barriers();
   test_d3d12_heaps();

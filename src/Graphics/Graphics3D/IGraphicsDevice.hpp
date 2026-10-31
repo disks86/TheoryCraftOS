@@ -477,6 +477,7 @@ struct GraphicsPipelineDesc {
   VertexAttribute attributes[kMaxVertexAttributes] = {};
   uint32_t attribute_count = 0;
   uint32_t varying_count = 0;  // values passed from the vertex to the fragment shader
+  bool vertex_stores = false;    // the vertex shader writes storage buffers (kFeatureVertexStores)
   bool fragment_stores = false;  // the fragment shader writes storage buffers (kFeatureFragmentStores): it runs for every fragment the rasterizer makes, also those the depth test then fails
   uint32_t texture_count = 0;  // texture units 0 .. n-1 the fragment shader samples (at most kMaxTextureUnits); every one must be bound before a draw
   CullMode cull_mode = CullMode::Back;
@@ -630,6 +631,7 @@ enum DeviceFeature : uint32_t {
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
   kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
+  kFeatureVertexStores = 1u << 25,       // vertex shaders write unordered access buffers (the same bindings as kFeatureFragmentStores); GraphicsPipelineDesc::vertex_stores
   kFeatureFragmentStores = 1u << 24,     // pixel shaders write unordered access buffers (bind_storage_buffer in the slots u0 .. u3, also inside a pass); GraphicsPipelineDesc::fragment_stores
   kFeatureStorageInDraws = 1u << 23,     // read-only storage buffers (bind_storage_buffer in the slots after the unordered access ones, also inside a pass) read by vertex and pixel shaders
   kFeatureTimestampQueries = 1u << 22,   // QueryKind::Timestamp
