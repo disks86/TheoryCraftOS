@@ -2459,6 +2459,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   if (!block.title) { unicode_string(&title_string, image); block.title = &title_string; }      /* (a program without a title has its own path as the title) */
   BOOL fresh_console = FALSE;
   block.console = console_for_new_process(flags, image_is_gui(image), &fresh_console);
+  if (flags & 0x8 /* DETACHED_PROCESS */) nt_flags |= 0x200;      /* (a program without a console gets no standard handles it did not ask for) */
   if (fresh_console) {      /* (the standard handles of a console program with a console of its own are that console's: handles of the console it came from do not stay) */
     nt_flags |= 0x100;
     if (!(startup && (startup->dwFlags & 0x100))) {

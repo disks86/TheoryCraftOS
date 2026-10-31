@@ -32,7 +32,7 @@ constexpr uint32_t kSuccess = 0, kNotImplemented = 0xC0000002u, kAccessViolation
                    kNoMemory = 0xC0000017u, kObjectNameNotFound = 0xC0000034u, kInvalidImageFormat = 0xC000007Bu, kNoResources = 0xC000009Au,
                    kNameTooLong = 0xC0000106u;
 constexpr uint64_t kMaxImageBytes = 64ull << 20, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
-constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8, kExplicitStdHandles = 0x10, kPseudoConsole = 0x20, kHasParent = 0x40, kHasHandleList = 0x80, kFreshConsole = 0x100;
+constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8, kExplicitStdHandles = 0x10, kPseudoConsole = 0x20, kHasParent = 0x40, kHasHandleList = 0x80, kFreshConsole = 0x100, kDetachedProcess = 0x200;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
   if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
@@ -282,7 +282,7 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
     // The three values are what the child's process parameters get: the ones of the startup information (kUseStdHandles), or the parent's own. What the child can do with them
     // depends on what it inherits: with nothing inherited, a console program still gets copies of the parent's standard handles, a window program gets none; handles that mean
     // nothing in a child (a console for a window program, any when it has to do without) become 0. A value that names nothing in the parent is passed on as it is.
-    const bool use_startup = (flags_arg & kUseStdHandles) != 0, detached = startup_console == 0, inherit = spec.inherit_handles;
+    const bool use_startup = (flags_arg & kUseStdHandles) != 0, detached = (flags_arg & kDetachedProcess) != 0, inherit = spec.inherit_handles;
     const bool window_program = pe_subsystem(image.view()) == 2;      // IMAGE_SUBSYSTEM_WINDOWS_GUI
     spec.use_std_handles = true;
     for (uint32_t i = 0; i < 3; ++i) {
