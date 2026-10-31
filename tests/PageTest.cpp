@@ -3337,17 +3337,17 @@ static void test_search_params() {
            "x=1&y=two+words&z=%26%3D | x=5&z=%26%3D&new=n | 5,6 4 | x=5&z=%26%3D&new=n"));
   CHECK(js("", "var p = new URLSearchParams([['a', '1'], ['b', '2']]); var q = new URLSearchParams(p); q.append('c', '3'); console.log(p.toString(), q.toString()); try { new URLSearchParams([['a']]) } catch (e) { console.log(e.name) } console.log(new URLSearchParams().toString() === '', new URLSearchParams(null).size, new URLSearchParams('').size)",
            "a=1&b=2 a=1&b=2&c=3 | TypeError | true 0 0"));
-  CHECK(js("", "var p = new URLSearchParams('b=2&a=1&c=3&a=0'); var out = []; for (var e of p) out.push(e[0] + e[1]); console.log(out.join(), [...p].length, p.keys().join(), p.values().join(), p.entries()[1].join('=')); p.forEach(function (v, k, self) { out.push(k + ':' + v + (self === p)) }); console.log(out.slice(4).join())",
+  CHECK(js("", "var p = new URLSearchParams('b=2&a=1&c=3&a=0'); var out = []; for (var e of p) out.push(e[0] + e[1]); console.log(out.join(), [...p].length, Array.from(p.keys()).join(), Array.from(p.values()).join(), Array.from(p.entries())[1].join('=')); p.forEach(function (v, k, self) { out.push(k + ':' + v + (self === p)) }); console.log(out.slice(4).join())",
            "b2,a1,c3,a0 4 b,a,c,a 2,1,3,0 a=1 | b:2true,a:1true,c:3true,a:0true"));
-  CHECK(js("", "var p = new URLSearchParams('b=2&a=1&c=3&a=0'); p.sort(); console.log(p.toString()); var q = new URLSearchParams('z=1&\xC3\xA9=2&a=3'); q.sort(); console.log(q.keys().join())", "a=1&a=0&b=2&c=3 | a,z,\xC3\xA9"));
+  CHECK(js("", "var p = new URLSearchParams('b=2&a=1&c=3&a=0'); p.sort(); console.log(p.toString()); var q = new URLSearchParams('z=1&\xC3\xA9=2&a=3'); q.sort(); console.log(Array.from(q.keys()).join())", "a=1&a=0&b=2&c=3 | a,z,\xC3\xA9"));
   CHECK(js("", "var p = new URLSearchParams('q=a%2Bb+c%20d&%E2%82%AC=%e2%82%ac'); console.log(p.get('q'), p.get('\xE2\x82\xAC'), String(p), p instanceof URLSearchParams, Object.keys(p).length)", "a+b c d \xE2\x82\xAC q=a%2Bb+c+d&%E2%82%AC=%E2%82%AC true 0"));
 }
 
 static void test_headers() {
   CHECK(js("", "var h = new Headers({ 'Content-Type': 'text/plain', 'X-A': '1' }); h.append('x-a', '2'); console.log(h.get('content-type'), h.get('X-A'), h.has('x-a'), h.has('nope'), h.get('nope')); h.set('X-A', '3'); h.delete('content-type'); console.log(h.get('x-a'), h.has('content-type'))",
            "text/plain 1, 2 true false null | 3 false"));
-  CHECK(js("", "var h = new Headers([['B', '2'], ['a', '1'], ['b', '3']]); var out = []; h.forEach(function (v, k) { out.push(k + '=' + v) }); console.log(out.join(), h.keys().join(), h.values().join('|')); for (var e of h) out.push(e[0]); console.log(out.slice(2).join())", "a=1,b=2, 3 a,b 1|2, 3 | a,b"));
-  CHECK(js("", "var h = new Headers(); h.append('Set-Cookie', 'a=1'); h.append('Set-Cookie', 'b=2'); console.log(h.get('set-cookie'), h.getSetCookie().join('|'), h.entries().length); var c = new Headers(h); c.set('x', 'y'); console.log(h.has('x'), c.has('x'))", "a=1, b=2 a=1|b=2 2 | false true"));
+  CHECK(js("", "var h = new Headers([['B', '2'], ['a', '1'], ['b', '3']]); var out = []; h.forEach(function (v, k) { out.push(k + '=' + v) }); console.log(out.join(), Array.from(h.keys()).join(), Array.from(h.values()).join('|')); for (var e of h) out.push(e[0]); console.log(out.slice(2).join())", "a=1,b=2, 3 a,b 1|2, 3 | a,b"));
+  CHECK(js("", "var h = new Headers(); h.append('Set-Cookie', 'a=1'); h.append('Set-Cookie', 'b=2'); console.log(h.get('set-cookie'), h.getSetCookie().join('|'), Array.from(h.entries()).length); var c = new Headers(h); c.set('x', 'y'); console.log(h.has('x'), c.has('x'))", "a=1, b=2 a=1|b=2 2 | false true"));
   CHECK(js("", "var h = new Headers(); try { h.append('bad name', 'x') } catch (e) { console.log(e.name) } try { h.append('ok', 'a\\nb') } catch (e) { console.log(e.name) } h.append('v', '  padded  '); console.log(h.get('v') + '|'); try { new Headers(5) } catch (e) { console.log(e.name) } try { new Headers([['a']]) } catch (e) { console.log(e.name) }",
            "TypeError | TypeError | padded| | TypeError | TypeError"));
 }
@@ -4172,6 +4172,23 @@ static void test_messaging() {
   CHECK(async_is("var r = []; try { customElements.define('nodash', class extends HTMLElement {}); } catch (e) { r.push(e.name); } customElements.define('x-once', class extends HTMLElement {});"
                  "try { customElements.define('x-once', class extends HTMLElement {}); } catch (e) { r.push(e.name); } customElements.whenDefined('x-soon').then(function (c) { r.push(typeof c); console.log(r.join()); });"
                  "customElements.define('x-soon', class extends HTMLElement {});", "SyntaxError,NotSupportedError,function", nullptr, "https://app.example/"));
+  {   // ES5 custom elements (Polymer, Angular as YouTube ships them): the constructor is a function that asks Reflect.construct or HTMLElement.call for the element
+    CHECK(async_is("var made = 0; function Old() { var self = Reflect.construct(HTMLElement, [], this.constructor); self.built = ++made; return self; } Old.prototype = Object.create(HTMLElement.prototype); Old.prototype.constructor = Old;"
+                   "customElements.define('x-old', Old); document.body.innerHTML = '<x-old id=a></x-old>'; var a = document.getElementById('a');"
+                   "var b = new Old(); console.log(a.built, a instanceof Old, b.localName, b.built, made, document.querySelectorAll('x-old').length);", "1 true x-old 2 2 1", nullptr, "https://app.example/"));
+    CHECK(async_is("function Calls() { var g = HTMLElement.call(this) || this; g.inst = {ready: true}; return g; } Calls.prototype = Object.create(HTMLElement.prototype); Calls.prototype.constructor = Calls;"
+                   "Calls.prototype.connectedCallback = function () { console.log(this.inst.ready, this === document.getElementById('c')); };"
+                   "customElements.define('x-calls', Calls); document.body.innerHTML = '<x-calls id=c></x-calls>';", "true true", nullptr, "https://app.example/"));
+    CHECK(async_is("var r = []; try { new HTMLElement(); } catch (e) { r.push(e.message); } try { HTMLElement(); } catch (e) { r.push(e.message); } console.log(r.join('|'));", "Illegal constructor|Illegal constructor", nullptr, "https://app.example/"));
+    // the class decides what its names are: Polymer elements have an async() and a name of their own, plain elements keep the reflected attributes
+    CHECK(async_is("class P extends HTMLElement { async() { return 'method'; } get name() { return this._n || 'proto'; } set name(v) { this._n = v; } } customElements.define('x-pol', P);"
+                   "var e = document.createElement('x-pol'), d = document.createElement('div'); e.name = 'set';"
+                   "console.log(typeof e.async, e.async(), e.name, e.getAttribute('name'), typeof d.async, d.hidden);", "function method set null boolean false", nullptr, "https://app.example/"));
+  }
+  // the lists of the DOM are iterable the way the standard says (an iterator with next(), which transpiled code relies on)
+  CHECK(async_is("function walk(v) { var it = v[Symbol.iterator](), out = [], r; while (!(r = it.next()).done) out.push(Array.isArray(r.value) ? r.value.join('=') : r.value); return out.join(','); }"
+                 "var el = document.createElement('div'); el.className = 'a b';"
+                 "console.log(walk(el.classList), walk(new URLSearchParams('x=1&y=2')), walk(new Headers({k: 'v'})), walk(document.styleSheets), typeof new URLSearchParams('a=1').keys().next);", "a,b x=1,y=2 k=v  function", nullptr, "https://app.example/"));
   // shadow trees
   CHECK(async_is("var host = document.createElement('div'); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<p id=in>inside</p><slot></slot>';"
                  "document.body.appendChild(host); console.log(host.shadowRoot === root, root.host === host, root.mode, root.querySelector('#in').textContent, document.querySelector('#in'), root instanceof ShadowRoot, root instanceof DocumentFragment, host.childNodes.length);",
@@ -6256,6 +6273,7 @@ int main(int argc, char** argv) {
       media.width = 1280;
       media.height = 800;
       Page page(a, env, "https://app.example/", media, true);
+      if (getenv("PROBE_MEMORY") || getenv("PROBE_BUDGET")) page.set_script_limits(static_cast<uint64_t>(getenv("PROBE_BUDGET") ? atof(getenv("PROBE_BUDGET")) : 8) * 1000000, static_cast<uint64_t>(getenv("PROBE_MEMORY") ? atof(getenv("PROBE_MEMORY")) : 48) * (1u << 20));   // (megainstructions, MiB)
       struct rusage r0, r1;
       getrusage(RUSAGE_SELF, &r0);
       const bool loaded = page.load(html.c_str()); (void)loaded;
@@ -6273,6 +6291,27 @@ int main(int argc, char** argv) {
         struct rusage ru;
         getrusage(RUSAGE_SELF, &ru);
         printf("render_picture %d, peak rss %ld KiB, heap now %llu KiB peak %llu KiB\n", ok ? 1 : 0, ru.ru_maxrss, (unsigned long long)(a.bytes >> 10), (unsigned long long)(a.peak >> 10));
+        if (ok && getenv("PROBE_PNG")) {   // the page as a picture (the top 1280 x 800), written to the file
+          const int32_t w = 1280, h = 800;
+          media::Image image(a);
+          image.create(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+          graphics::Surface surface = image.surface(0);
+          graphics::SoftwareRenderer2D renderer(surface, nullptr, &a);
+          renderer.set_blend(graphics::BlendMode::Replace);
+          renderer.fill_rect(graphics::Rect2D{0, 0, w, h}, picture.list.background() ? picture.list.background() : 0xFFFFFFFFu);
+          paint::DisplayPainter painter(a, fonts, &page.objects());
+          painter.paint(renderer, picture.list, 0, 0, graphics::Rect2D{0, 0, w, h});
+          ByteBuffer png(a);
+          if (media::encode_png(image, 6, &png))
+            if (FILE* f = fopen(getenv("PROBE_PNG"), "wb")) { fwrite(png.view().data(), 1, png.view().size(), f); fclose(f); }
+          printf("page %d x %d, %llu display ops\n", picture.width(), picture.height(), (unsigned long long)picture.list.count());
+          if (getenv("PROBE_OPS"))
+            for (uint64_t i = 0; i < picture.list.count(); ++i) {
+              const paint::Op& op = picture.list.op(i);
+              const StringView t = op.kind == paint::OpKind::Text ? picture.list.text(op) : StringView();
+              printf("op %llu kind %d rect %d,%d %dx%d color %08x node %u %.*s\n", (unsigned long long)i, static_cast<int>(op.kind), op.rect.x, op.rect.y, op.rect.width, op.rect.height, op.color, op.node, static_cast<int>(t.size()), t.data());
+            }
+        }
       }
       printf("%.*s\nerrors: %u\n", static_cast<int>(page.log().size()), page.log().data(), page.errors());
       printf("fetched %zu, console %zu\n", env.fetched.size(), env.console_lines.size());

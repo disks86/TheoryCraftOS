@@ -283,7 +283,7 @@ bool style_method_name(StringView k) { return IS("getPropertyValue") || IS("setP
 bool style_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   dom::Node* n = style_node(o);
   const StringView k = key->view();
-  if (k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_') || style_method_name(k)) return false;
+  if (key->symbol || k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_') || style_method_name(k)) return false;   // (a symbol is not a property name: Symbol.iterator is the prototype's)
   StringView text;
   dom::get_attribute(n, "style", &text);
   if (IS("cssText")) {
@@ -1348,7 +1348,7 @@ dom::Node* computed_node(JsObject* o) { return static_cast<dom::Node*>(o->host_d
 
 bool computed_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   const StringView k = key->view();
-  if (k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return false;
+  if (key->symbol || k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return false;
   Value ignored;
   if (vm.get_plain(impl(vm).computed_proto, key, &ignored)) return false;   // (a method: no snapshot is needed to find it)
   const Value snap = computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o));

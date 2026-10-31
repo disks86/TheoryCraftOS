@@ -126,9 +126,9 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (typeof callback !== 'function') throw typeError("execute 'forEach' on 'URLSearchParams'", "parameter 1 is not of type 'Function'.");
     for (var i = 0; i < this.__list.length; i++) callback.call(thisArg, this.__list[i][1], this.__list[i][0], this);
   });
-  method(SP, 'keys', function () { return this.__list.map(function (p) { return p[0]; }); });
-  method(SP, 'values', function () { return this.__list.map(function (p) { return p[1]; }); });
-  method(SP, 'entries', function () { return this.__list.map(function (p) { return [p[0], p[1]]; }); });
+  method(SP, 'keys', function () { return this.__list.map(function (p) { return p[0]; })[ITER](); });
+  method(SP, 'values', function () { return this.__list.map(function (p) { return p[1]; })[ITER](); });
+  method(SP, 'entries', function () { return this.__list.map(function (p) { return [p[0], p[1]]; })[ITER](); });
   method(SP, ITER, function () { return this.entries(); });
   hide(g, '__make_search_params', function (url) {
     var sp = new URLSearchParams();
@@ -264,10 +264,10 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     var entries = sortedEntries(this);
     for (var i = 0; i < entries.length; i++) callback.call(thisArg, entries[i][1], entries[i][0], this);
   });
-  method(H, 'keys', function () { return sortedEntries(this).map(function (e) { return e[0]; }); });
-  method(H, 'values', function () { return sortedEntries(this).map(function (e) { return e[1]; }); });
-  method(H, 'entries', function () { return sortedEntries(this); });
-  method(H, ITER, function () { return sortedEntries(this); });
+  method(H, 'keys', function () { return sortedEntries(this).map(function (e) { return e[0]; })[ITER](); });
+  method(H, 'values', function () { return sortedEntries(this).map(function (e) { return e[1]; })[ITER](); });
+  method(H, 'entries', function () { return sortedEntries(this)[ITER](); });
+  method(H, ITER, function () { return sortedEntries(this)[ITER](); });
   // "Name: value\r\n" lines for the network
   method(H, '__block', function () {
     var out = '';
@@ -5876,7 +5876,9 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (!def || el.__ce !== undefined) return;
     Object.defineProperty(el, '__ce', { value: 1, writable: true });
     Object.setPrototypeOf(el, def.ctor.prototype);
+    Object.defineProperty(g, '__upgrading', { value: el, writable: true, configurable: true });   // (HTMLElement() hands this element out: the construction stack)
     try { __super_init(def.ctor, el); } catch (e) { reportError(e); }   // (new.target of a class constructor is def.ctor, as when super() runs it)
+    g.__upgrading = undefined;
     for (var i = 0; i < def.observed.length; i++) {
       var a = def.observed[i];
       if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a)]);
@@ -8331,10 +8333,10 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (g.HTMLIFrameElement && !('sandbox' in g.HTMLIFrameElement.prototype)) Object.defineProperty(g.HTMLIFrameElement.prototype, 'sandbox', { get: function () { return tokenList(this, 'sandbox', ['allow-forms', 'allow-modals', 'allow-popups', 'allow-same-origin', 'allow-scripts', 'allow-top-navigation']); }, set: function (v) { this.setAttribute('sandbox', String(v)); }, enumerable: true, configurable: true });
     if (g.HTMLOutputElement && !Object.prototype.hasOwnProperty.call(g.HTMLOutputElement.prototype, 'htmlFor')) Object.defineProperty(g.HTMLOutputElement.prototype, 'htmlFor', { get: function () { return tokenList(this, 'for'); }, set: function (v) { this.setAttribute('for', String(v)); }, enumerable: true, configurable: true });
     // iteration over a list of tokens
-    var listValues = function () { var o = []; for (var i = 0; i < this.length; i++) o.push(this.item(i)); return o; };
+    var listValues = function () { var o = []; for (var i = 0; i < this.length; i++) o.push(this.item(i)); return o[Symbol.iterator](); };
     method(PartList.prototype, 'values', listValues);
-    method(PartList.prototype, 'keys', function () { var o = []; for (var i = 0; i < this.length; i++) o.push(i); return o; });
-    method(PartList.prototype, 'entries', function () { var o = []; for (var i = 0; i < this.length; i++) o.push([i, this.item(i)]); return o; });
+    method(PartList.prototype, 'keys', function () { var o = []; for (var i = 0; i < this.length; i++) o.push(i); return o[Symbol.iterator](); });
+    method(PartList.prototype, 'entries', function () { var o = []; for (var i = 0; i < this.length; i++) o.push([i, this.item(i)]); return o[Symbol.iterator](); });
     Object.defineProperty(PartList.prototype, Symbol.iterator, { value: listValues, writable: true, configurable: true });
     var m = function (name, fn) { if (!(name in EP)) method(EP, name, fn); };
     m('scroll', function () { return this.scrollTo.apply(this, arguments); });
@@ -8664,7 +8666,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       var items = r.rules;
       defineGetter(list, 'length', function () { return items.length; });
       list.item = function (i) { return items[i >>> 0] || null; };
-      list[Symbol.iterator] = function () { return items.slice(); };
+      list[Symbol.iterator] = function () { return items.slice()[Symbol.iterator](); };
       for (var i = 0; i < items.length; i++) list[i] = items[i];
       return list;
     };
@@ -8765,7 +8767,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       defineGetter(CSSStyleDeclaration2.prototype, camel(p), accessorGet, accessorSet);
       if (camel(p) !== p) defineGetter(CSSStyleDeclaration2.prototype, p, accessorGet, accessorSet);
     });
-    method(CSSStyleDeclaration2.prototype, Symbol.iterator, function () { return this.__d.decls.map(function (d) { return d.name; }); });
+    method(CSSStyleDeclaration2.prototype, Symbol.iterator, function () { return this.__d.decls.map(function (d) { return d.name; })[Symbol.iterator](); });
 
     // --- sheets
     function initSheet(sheet, owner, options) {
@@ -8848,7 +8850,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       defineGetter(sl, 'length', function () { return out.length; });
       sl.item = function (i) { return out[i >>> 0] || null; };
       for (var k = 0; k < out.length; k++) sl[k] = out[k];
-      sl[Symbol.iterator] = function () { return out.slice(); };
+      sl[Symbol.iterator] = function () { return out.slice()[Symbol.iterator](); };
       return sl;
     };
     Object.defineProperty(DP, 'styleSheets', { get: list, configurable: true, enumerable: true });
