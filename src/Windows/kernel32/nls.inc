@@ -1291,7 +1291,7 @@ static BOOL nls_calendar_text(int kind, DWORD calendar, DWORD type, WCHAR *out /
   const char *text = NULL;
   switch (t) {
     case 0x01: text = calendar == 2 ? "2" : "1"; break;
-    case 0x02: text = calendar == 2 ? "Gregorian Calendar (U.S.)" : "Gregorian Calendar"; break;
+    case 0x02: text = "Gregorian Calendar"; break;      /* (the U.S. variant carries the same name: a program with a short buffer for it must not fail) */
     case 0x03: text = "0"; break;
     case 0x04: text = "A.D."; break;
     case 0x39: text = "AD"; break;
