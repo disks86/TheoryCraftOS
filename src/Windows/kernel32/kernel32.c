@@ -3519,13 +3519,13 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
   (void)template_file;
   if (!path || !path[0]) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
   /* The console by its device names. */
+  if (equals_ignore_case(path, (const WCHAR *)L"CON")) {      /* the console device: its input when it is opened to read, its output when it is opened to write, not both */
+    const BOOL reads = (access & 0x80000000u) != 0, writes = (access & 0x40000000u) != 0;
+    if (reads && writes) { set_error(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+    return con_open_alias(reads, sa && sa->bInheritHandle);
+  }
   if (equals_ignore_case(path, (const WCHAR *)L"CONOUT$") || equals_ignore_case(path, (const WCHAR *)L"CONIN$")) {      /* another handle to the console (descriptors 0 and 1 are it) */
-    const BOOL input = equals_ignore_case(path, (const WCHAR *)L"CONIN$");
-    HANDLE copy = NULL;
-    const NTSTATUS made = NtDuplicateObject(NtCurrentProcess(), (HANDLE)(ULONG_PTR)(input ? 4 : 8), NtCurrentProcess(), &copy, 0, (sa && sa->bInheritHandle) ? 2 : 0, 2 /* DUPLICATE_SAME_ACCESS */);
-    if (!NT_SUCCESS(made)) { fail_nt(made); return INVALID_HANDLE_VALUE; }
-    con_alias_add(copy, input);
-    return copy;
+    return con_open_alias(equals_ignore_case(path, (const WCHAR *)L"CONIN$"), sa && sa->bInheritHandle);
   }
   WCHAR buffer[PATH_CHARS + 8];
   UNICODE_STRING name;

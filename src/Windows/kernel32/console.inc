@@ -222,6 +222,59 @@ static int con_alias_kind(HANDLE h) {      /* 1: an input alias, 2: an output al
   for (int i = 0; i < 16; ++i) if (g_con_alias[i] == h && h && device_type(h) == 0x50) return g_con_alias_input[i] ? 1 : 2;
   return 0;
 }
+static HANDLE con_open_alias(BOOL input, BOOL inherit) {      /* another handle to the console input or output (descriptors 0 and 1 are them) */
+  HANDLE copy = NULL;
+  const NTSTATUS made = NtDuplicateObject(NtCurrentProcess(), (HANDLE)(ULONG_PTR)(input ? 4 : 8), NtCurrentProcess(), &copy, 0, inherit ? 2 : 0, 2 /* DUPLICATE_SAME_ACCESS */);
+  if (!NT_SUCCESS(made)) { fail_nt(made); return INVALID_HANDLE_VALUE; }
+  con_alias_add(copy, input);
+  return copy;
+}
+/* OpenConsoleW(name, access, inherit, creation): the console's "CONIN$" or "CONOUT$" and nothing else; the access and the creation disposition are checked and then not needed. */
+EXPORT HANDLE WINAPI OpenConsoleW(LPCWSTR name, DWORD access, BOOL inherit, DWORD creation) {
+  const BOOL input = name && equals_ignore_case(name, (const WCHAR *)L"CONIN$");
+  if (!name || !name[0]) { set_error(ERROR_PATH_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+  if ((!input && !equals_ignore_case(name, (const WCHAR *)L"CONOUT$")) || creation > 5 || (access & 0x0C000000u)) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  return con_open_alias(input, inherit);
+}
+/* The name of the program the console's input history is kept for. */
+static WCHAR g_input_exe[MAX_PATH];
+static void con_input_exe_default(void) {
+  if (g_input_exe[0]) return;
+  WCHAR module[MAX_PATH * 2];
+  const DWORD n = GetModuleFileNameW(NULL, module, MAX_PATH * 2);
+  DWORD start = n;
+  while (start > 0 && module[start - 1] != '\\') --start;
+  DWORD k = 0;
+  for (; start + k < n && k + 1 < MAX_PATH; ++k) g_input_exe[k] = module[start + k];
+  g_input_exe[k] = 0;
+}
+EXPORT BOOL WINAPI GetConsoleInputExeNameW(DWORD capacity, LPWSTR buffer) {
+  con_input_exe_default();
+  const DWORD n = (DWORD)wcslen(g_input_exe);
+  if (capacity > n && buffer) memcpy(buffer, g_input_exe, ((size_t_)n + 1) * 2);
+  else set_error(111 /* ERROR_BUFFER_OVERFLOW */);
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetConsoleInputExeNameA(DWORD capacity, LPSTR buffer) {
+  con_input_exe_default();
+  const DWORD n = (DWORD)wcslen(g_input_exe);
+  const DWORD need = (DWORD)WideCharToMultiByte(CP_ACP, 0, g_input_exe, (int)n, NULL, 0, NULL, NULL);
+  if (capacity > need && buffer) { WideCharToMultiByte(CP_ACP, 0, g_input_exe, (int)n, buffer, (int)capacity, NULL, NULL); buffer[need] = 0; }
+  else set_error(111 /* ERROR_BUFFER_OVERFLOW */);
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetConsoleInputExeNameW(LPCWSTR name) {
+  if (!name || !name[0] || wcslen(name) >= MAX_PATH) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  memcpy(g_input_exe, name, ((size_t_)wcslen(name) + 1) * 2);
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetConsoleInputExeNameA(LPCSTR name) {
+  if (!name || !name[0]) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  WCHAR wide[MAX_PATH];
+  const int n = MultiByteToWideChar(CP_ACP, 0, name, -1, wide, MAX_PATH);
+  if (n <= 0) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  return SetConsoleInputExeNameW(wide);
+}
 static BOOL con_is_output_only(HANDLE h) { return h && ((h == GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 2); }
 static BOOL con_is_input(HANDLE h) { return h && ((h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 1); }
 static BOOL con_buffer_alive(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }
