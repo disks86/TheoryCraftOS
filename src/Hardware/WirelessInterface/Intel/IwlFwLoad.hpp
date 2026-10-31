@@ -60,6 +60,9 @@ constexpr uint32_t kApmgPsCtrlMaskPowerSource = 0x03000000, kApmgPsCtrlPowerSour
 namespace iwl_csr {
 constexpr uint32_t kIntBitAlive = 1u << 0, kIntBitWakeup = 1u << 1, kIntBitRfKill = 1u << 7, kIntBitSwError = 1u << 25, kIntBitFhTx = 1u << 27, kIntBitHwError = 1u << 29,
                    kIntBitFhRx = 1u << 31;
+constexpr uint32_t kIntBitSwRx = 1u << 3, kIntBitCtKill = 1u << 6, kIntBitScd = 1u << 26;
+// CSR_INI_SET_MASK: the causes the driver wants interrupts for
+constexpr uint32_t kIniSetMask = kIntBitFhRx | kIntBitHwError | kIntBitFhTx | kIntBitSwError | kIntBitRfKill | kIntBitSwRx | kIntBitWakeup | kIntBitAlive | kIntBitCtKill | kIntBitScd;
 constexpr uint32_t kFhIntTxMask = 3;                           // transmit channels 0 and 1 (the service channel reports here)
 constexpr uint32_t kUcodeDrvGp1Clr = 0x05C, kUcodeSwBitRfKill = 2, kUcodeBitCmdBlocked = 4;
 }  // namespace iwl_csr

@@ -60,20 +60,30 @@ WifiResult Ieee80211Association::start(const WifiNetwork& network, ConstByteView
   return WifiResult::Ok;
 }
 
+bool Ieee80211Association::set_extra_elements(ConstByteView elements) {
+  if (elements.size() > kMaxExtraElements) {
+    extra_length_ = 0;
+    return false;
+  }
+  for (uint64_t i = 0; i < elements.size(); ++i) extra_[i] = elements[i];
+  extra_length_ = static_cast<uint32_t>(elements.size());
+  return true;
+}
+
 void Ieee80211Association::fail(const char* why) {
   state_ = State::Failed;
   failure_ = why;
 }
 
 void Ieee80211Association::send_step() {
-  uint8_t frame[160];
+  uint8_t frame[320];
   uint32_t n = 0;
   uint32_t ssid_length = 0;
   while (ssid_length < kMaxSsidLength && network_.ssid[ssid_length]) ++ssid_length;
   if (state_ == State::Authenticating) n = build_authentication(network_.bssid.bytes, our_address_, ByteView(frame, sizeof frame));
   else if (state_ == State::Associating)
     n = build_association_request(network_.bssid.bytes, our_address_, ConstByteView(reinterpret_cast<const uint8_t*>(network_.ssid), ssid_length), five_ghz(network_.channel),
-                                  ConstByteView(rsn_ie_, rsn_ie_length_), ByteView(frame, sizeof frame));
+                                  ConstByteView(rsn_ie_, rsn_ie_length_), ByteView(frame, sizeof frame), ConstByteView(extra_, extra_length_));
   step_started_ms_ = link_.now_ms();
   ++attempts_;
   if (n) link_.transmit(ConstByteView(frame, n));       // (a refused transmit is retried by the time-out)

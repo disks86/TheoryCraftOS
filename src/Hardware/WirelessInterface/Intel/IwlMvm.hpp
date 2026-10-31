@@ -23,6 +23,7 @@
 // The structures are written to a byte view in the firmware's little-endian packed layout; each builder returns the length, or 0 when the output is too small.
 #pragma once
 #include <stdint.h>
+#include "Hardware/WirelessInterface/Ieee80211Ht.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlRx.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -34,7 +35,7 @@ constexpr uint8_t kTxAntConfigCommand = 0x98, kAddStaCommand = 0x18, kMacContext
 constexpr uint8_t kLongGroup = 0x01, kScanConfigCommand = 0x0C, kScanRequestUmacCommand = 0x0D, kScanAbortUmacCommand = 0x0E, kScanCompleteUmacCommand = 0x0F;
 constexpr uint8_t kDataPathGroup = 0x05, kDqaEnableCommand = 0x00;
 constexpr uint8_t kRxMpduCommand = 0xC1;
-constexpr uint8_t kBtConfigCommand = 0x9B, kTimeEventCommand = 0x29, kTimeEventNotification = 0x2A, kReplyError = 0x02;
+constexpr uint8_t kLinkQualityCommand = 0x4E, kBtConfigCommand = 0x9B, kTimeEventCommand = 0x29, kTimeEventNotification = 0x2A, kReplyError = 0x02;
 constexpr uint32_t kBtCoexNetwork = 1, kBtCoexHighBandRet = 0x10;
 constexpr uint32_t kTimeEventBytes = 36, kTeBssStaAggressiveAssoc = 0;
 constexpr uint32_t kTePolicyNotifyStart = 1u << 0, kTePolicyNotifyEnd = 1u << 1, kTePolicyStartImmediately = 1u << 11, kTeFragNone = 0;
@@ -56,9 +57,16 @@ constexpr uint32_t kProbeRequestBytes = 512, kScanSsidEntryBytes = 34, kMaxScanS
 constexpr uint32_t kAddStaStatusMask = 0xFF, kAddStaSuccess = 0x1;
 constexpr uint32_t kPhyContextBytes = 36, kBindingBytes = 24, kStaKeyBytes = 64, kTxCommandHeaderBytes = 4, kTxParamBytes = 56, kCtxtInvalid = 0xFFFFFFFFu;
 constexpr uint32_t kStaFlagFatMask = 3u << 26, kStaFlagMimoMask = 3u << 28, kStaFlagRtsMimoProt = 1u << 17;
+constexpr uint32_t kStaFlagAggSizeShift = 19, kStaFlagAggSizeMask = 0xFu << 19, kStaFlagAggDensityShift = 23, kStaFlagAggDensityMask = 7u << 23;
 constexpr uint16_t kStaKeyCcm = 2, kStaKeyMapFlag = 1u << 3, kStaKeyIdPos = 8, kStaKeyMulticast = 1u << 14;
+constexpr uint32_t kLinkQualityBytes = 88, kLinkQualityTableSize = 16, kTxFlagStaRate = 1u << 4;
 constexpr uint32_t kTxFlagAck = 1u << 3, kTxFlagSeqCtl = 1u << 13, kTxSecCcm = 0x02;
 constexpr uint32_t kRateCckV1 = 1u << 9, kRateAntA = 1u << 14, kRatePlcp1M = 10, kRatePlcp6M = 13, kRatePlcp24M = 9;
+// rate_n_flags, version 1 (iwlwifi fw/api/rate.h): the PLCP signal (legacy) or the MCS (HT: 0-15 with the stream count in bit 3, VHT: 0-9 in bits 0-3 and the stream count less one in
+// bits 4-5) in the low byte, then the format bits, the channel width, the short guard interval and the antennas.
+constexpr uint32_t kRateHtV1 = 1u << 8, kRateVhtV1 = 1u << 26, kRateWidthShift = 11, kRateWidthMask = 3u << 11, kRateSgiV1 = 1u << 13, kRateAntB = 1u << 15, kRateVhtStreamsShift = 4;
+// Two rate_n_flags are the same transmission when this much of them is the same (the antennas, STBC, LDPC and beamforming bits are the firmware's to vary).
+constexpr uint32_t kRateIdentityMask = 0xFFu | kRateHtV1 | kRateCckV1 | kRateWidthMask | kRateSgiV1 | kRateVhtV1;
 constexpr uint32_t kTxLifeTimeInfinite = 0xFFFFFFFFu, kPmFrameNone = 0, kPmFrameMgmt = 2, kPmFrameAssoc = 3, kTidNonQos = 8;
 // scan general flags (UMAC_SCAN_GEN_FLAGS_*) and channel flags
 constexpr uint16_t kScanGenPassAll = 1u << 2, kScanGenPassive = 1u << 3, kScanGenPreConnect = 1u << 4, kScanGenIterComplete = 1u << 5, kScanGenAdaptiveDwell = 1u << 13;
@@ -131,10 +139,12 @@ uint32_t iwl_scan_request_bytes(uint32_t firmware_channel_slots);
 uint32_t iwl_build_scan_request(const IwlScanRequest& request, ByteView out);
 
 // The PHY context (PHY_CONTEXT_CMD version below 3: the 20 MHz channel and the chains) and the binding of a MAC context to it (BINDING_CONTEXT_CMD, version 1 layout).
-uint32_t iwl_build_phy_context(uint32_t action, uint8_t channel, bool five_ghz, uint32_t tx_antennas, uint32_t rx_antennas, ByteView out);
+// `channel` is the primary channel; `width` 0 20 MHz, 1 40, 2 80 and `control_position` as WifiPhyNegotiation::control_position() gives it.
+uint32_t iwl_build_phy_context(uint32_t action, uint8_t channel, bool five_ghz, uint32_t tx_antennas, uint32_t rx_antennas, ByteView out, uint8_t width = 0, uint8_t control_position = 0);
 uint32_t iwl_build_binding(uint32_t action, uint8_t phy_id, uint8_t mac_id, uint8_t mac_color, ByteView out);
 
-// A station entry for the access point (ADD_STA version 10, a plain legacy station without aggregation).
+// A station entry for the access point (ADD_STA version 10, without aggregation: every TID stays disabled for it). `ht` adds the HT / VHT parameters: the channel width, one or two
+// streams and the access point's A-MPDU limits (which the firmware wants even when we do not aggregate).
 struct IwlStationSpec {
   uint8_t station_id = 1;
   uint8_t mac_id = 0, mac_color = 0;
@@ -142,10 +152,19 @@ struct IwlStationSpec {
   uint32_t queue_mask = 0;
   bool modify = false;
   uint16_t association_id = 0;
+  bool ht = false;
+  uint8_t width = 0;                               // 0 20 MHz, 1 40, 2 80
+  uint8_t streams = 1;
+  uint8_t ampdu_exponent = 0, ampdu_density = 0;
 };
 uint32_t iwl_build_add_station(const IwlStationSpec& station, ByteView out);
 
 // ADD_STA_KEY (version 1 layout): a CCMP key for the station `station_id`. `multicast` marks the group key; `key_offset` is its slot in the firmware's key table.
+// LINK_QUALITY_CMD (iwl_lq_cmd, 88 bytes): the table of rates the firmware tries in turn for the frames of station `station_id` that are sent with TX_CMD_FLG_STA_RATE: rate_n_flags
+// of each try (OFDM: the PLCP signal and the antenna; HT / VHT: see iwl_rate_code). `mimo_delim` is the number of leading entries that use two streams. No aggregation, no RTS.
+uint32_t iwl_build_link_quality(uint8_t station_id, uint32_t tx_antennas, const uint32_t rates[iwl_mvm::kLinkQualityTableSize], ByteView out, uint32_t mimo_delim = 0);
+// The rate_n_flags of a step of the rate ladder, without the antennas (the caller adds them: one for one stream, two for two).
+uint32_t iwl_rate_code(const WifiRate& rate);
 uint32_t iwl_build_station_key(uint8_t station_id, uint8_t key_offset, uint8_t key_id, bool multicast, const uint8_t key[16], const uint8_t rsc[8], ByteView out);
 
 // The frame to send as TX_CMD (version 6): the device command header, the TX command and the 802.11 header, ready for IwlCommandQueue::enqueue_frame (the payload follows it
@@ -161,11 +180,17 @@ struct IwlTxParams {
   bool association_request = false;
   uint32_t tx_antennas = 1;
   uint8_t tk[16] = {};
+  // A data frame sent at the rates of the station's link quality table (TX_CMD_FLG_STA_RATE; `data_plcp` is then only the rate the table's first entry has), else at the fixed `data_plcp`.
+  bool station_rate = false;
+  uint32_t data_plcp = iwl_mvm::kRatePlcp24M;
 };
 uint32_t iwl_build_tx_prefix(const IwlTxParams& params, ByteView out);
 // The TX response (a notification of the TX command): the sequence it answers, the first frame's status and the ring position after the last frame it covers.
 struct IwlTxResponse {
   uint8_t frame_count = 0;
+  uint8_t failure_frame = 0;                       // transmissions that failed before the last one
+  uint32_t initial_rate = 0;                       // rate_n_flags of the first transmission
+  uint16_t frame_control = 0;                      // of the frame (to tell data from management)
   uint32_t status = 0;
   uint32_t next_index = 0;
   bool success() const { return (status & 0xFF) == 1 || (status & 0xFF) == 2; }
