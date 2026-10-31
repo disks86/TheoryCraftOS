@@ -159,11 +159,11 @@ uint32_t TlsSocket::send(ConstByteView data) {
   if (state_ != St::Open || sent_close_) return 0;
   uint32_t done = 0;
   while (done < data.size()) {
-    // Use larger chunks for better throughput
+    // room in the output queue for a whole record (header, explicit nonce, tag, inner type)
     const uint32_t chunk = static_cast<uint32_t>(data.size() - done < kMaxPlaintext ? data.size() - done : kMaxPlaintext);
-    if (out_.free_space() < chunk + 256) {
+    if (out_.free_space() < chunk + 64) {
       flush();
-      if (out_.free_space() < chunk + 256) break;
+      if (out_.free_space() < chunk + 64) break;
     }
     if (!send_record(kApplicationData, data.subview(done, chunk))) break;
     done += chunk;
@@ -193,8 +193,7 @@ void TlsSocket::abort() {
 
 void TlsSocket::flush() {
   if (!inner_ || out_.size() == 0) return;
-  // Use larger chunk for better throughput
-  uint8_t chunk[4096];
+  uint8_t chunk[1024];
   while (out_.size() > 0) {
     const uint32_t n = out_.peek(0, ByteView(chunk, sizeof chunk));
     const uint32_t sent = inner_->send(ConstByteView(chunk, n));
@@ -221,7 +220,7 @@ void TlsSocket::send_alert(uint8_t level, uint8_t description) {
 }
 
 bool TlsSocket::send_record(uint8_t type, ConstByteView data) {
-  const uint32_t n = write_.seal(type, data, tx_, sizeof(tx_));
+  const uint32_t n = write_.seal(type, data, tx_, sizeof tx_);
   if (n == 0 || out_.free_space() < n) return false;
   out_.write(ConstByteView(tx_, n));
   return true;

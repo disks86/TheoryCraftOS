@@ -40,12 +40,10 @@ struct Scheduler::Job {
 
 void Scheduler::job_main(void* argument) {
   Job* job = static_cast<Job*>(argument);
-  TaskFunction fn = job->fn;
-  void* context = job->context;
-  Scheduler* scheduler = job->scheduler;
-  scheduler->allocator_.deallocate(job);
-  fn(context);
-  __atomic_sub_fetch(&scheduler->active_, 1, __ATOMIC_SEQ_CST);
+  const Job copy = *job;
+  copy.scheduler->allocator_.deallocate(job);
+  copy.fn(copy.context);
+  __atomic_sub_fetch(&copy.scheduler->active_, 1, __ATOMIC_SEQ_CST);
 }
 
 bool Scheduler::run_next() {
@@ -60,11 +58,8 @@ bool Scheduler::run_next() {
   if (kernel::running()) {
     Job* job = static_cast<Job*>(allocator_.allocate(sizeof(Job)));
     if (job) {
-      // Perform atomic increment before storing to avoid race condition
+      *job = {this, task.fn, task.context};
       __atomic_add_fetch(&active_, 1, __ATOMIC_SEQ_CST);
-      job->scheduler = this;
-      job->fn = task.fn;
-      job->context = task.context;
       const hardware::CoreKind preferred = high ? hardware::CoreKind::Performance : hardware::CoreKind::Efficiency;
       kernel::Thread* thread = kernel::spawn(job_main, job, "task", -1, static_cast<int8_t>(preferred));
       if (thread) {
