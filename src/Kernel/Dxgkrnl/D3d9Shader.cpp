@@ -72,6 +72,7 @@ struct D3d9Program::State {
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
   const graphics::ComputeContext* compute = nullptr;
+  bool no_stores = false;              // a run for a neighbour's sake (a helper pixel): nothing is written
   const ByteView* storage = nullptr;   // the storage buffers: a compute shader's, or those a draw's shaders can read (kMaxStorageBuffers views)
   const graphics::GeometryInputData* geometry_in = nullptr;
   const graphics::HullInputData* hull_in = nullptr;        // a hull shader's input control points
@@ -127,7 +128,7 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }  // namespace
 
 uint32_t D3d9Program::required_features() const {
-  uint32_t kinds = 0;
+  uint32_t kinds = uses_fragment_stores_ ? graphics::kFeatureFragmentStores : 0u;
   for (graphics::TextureKind k : texture_kind_)
     if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
   if (stage_ == graphics::ShaderStage::Compute) kinds |= graphics::kFeatureCompute;
@@ -596,6 +597,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       other.constants = s.constants;
       other.textures = s.textures;
       other.storage = s.storage;
+      other.no_stores = true;
       for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
       other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
       other.fragment = f;
@@ -727,6 +729,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         };
         auto put_word = [&](uint64_t at, uint32_t value) {
           ByteView part;
+          if (s.no_stores || s.capture_at != ~uint64_t{0}) return;
           if (!buffer.try_subview(at, 4, &part)) return;   // (a write outside the buffer is dropped)
           ByteWriter(part).le32(value);
         };
@@ -1153,6 +1156,7 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
   s.fragment = &context;
   s.storage = context.storage;
+  s.no_stores = context.helper;
   execute(s);
   if (s.killed) return false;
   for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};

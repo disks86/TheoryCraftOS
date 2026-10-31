@@ -111,6 +111,7 @@ class D3d9Program {
   // zero), one that fetches texels, samples at a level or asks the size of a texture kFeatureTexelAccess.
   uint32_t required_features() const;
   bool uses_system_values() const { return uses_system_values_; }
+  bool uses_fragment_stores() const { return uses_fragment_stores_; }   // a pixel shader that writes buffers
   // How many colour outputs a pixel shader writes (a DXBC one: SV_Target0 .. n-1; the others: one). More than one needs kFeatureMultipleTargets, and `color` of run_fragment is then that many Vec4s.
   uint32_t color_output_count() const { return color_outputs_; }
   // The same with the system values (D3d9Binding hands these to the device beside the others).
@@ -175,7 +176,7 @@ class D3d9Program {
   bool uses_barrier_ = false;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
-  bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false;
+  bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false;
   uint32_t color_outputs_ = 1;
   uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;

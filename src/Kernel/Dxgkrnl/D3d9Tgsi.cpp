@@ -879,7 +879,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         shared_used_ = true;
       } else {
         add(buffer, "BUFFER[");
-        add_uint(buffer, compute_ ? ins.uav : ins.uav - graphics::kMaxUavBuffers);   // (a vertex or pixel shader numbers its views from 0: the host's binding points are the ones of the compute shader otherwise)
+        add_uint(buffer, compute_ ? ins.uav : ins.uav >= graphics::kMaxUavBuffers ? ins.uav - graphics::kMaxUavBuffers : ins.uav + graphics::kMaxSrvBuffers);   // (the other stages number the views from 0 and the unordered access buffers after them)
         add(buffer, "]");
         buffer_used_[ins.uav] = true;
       }
@@ -1493,11 +1493,18 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, ", FLOAT\n");
     }
   }
-  if (!compute_) {   // (the views of buffers a vertex, geometry, tessellation or pixel shader reads)
+  if (!compute_) {   // (the buffers a vertex, geometry, tessellation or pixel shader reads and writes: all the numbers up to the last, so that the host's binding points are the numbers)
+    uint32_t last = 0;
+    bool any = false;
     for (uint32_t i = 0; i < graphics::kMaxStorageBuffers; ++i) {
       if (!buffer_used_[i]) continue;
+      const uint32_t index = i >= graphics::kMaxUavBuffers ? i - graphics::kMaxUavBuffers : i + graphics::kMaxSrvBuffers;
+      last = any && last > index ? last : index;
+      any = true;
+    }
+    for (uint32_t index = 0; any && index <= last; ++index) {
       add(*out, "DCL BUFFER[");
-      add_uint(*out, i - graphics::kMaxUavBuffers);
+      add_uint(*out, index);
       add(*out, "]\n");
     }
   }

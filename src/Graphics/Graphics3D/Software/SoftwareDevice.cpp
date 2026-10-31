@@ -907,7 +907,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       if (pd.depth_test && !depth.empty())
         for (uint32_t k = 0; k < sample_count; ++k)
           if ((covered >> k & 1) && !depth_passes(pd.depth_compare, sample_z[k], depth[index * sample_count + k])) depth_pass &= ~(1u << k);
-      if (!depth_pass && !stencil_on) continue;   // (with a stencil test the depth result is needed after the shader)
+      if (!depth_pass && !stencil_on && !pd.fragment_stores) continue;   // (with a stencil test the depth result is needed after the shader; a shader that writes buffers runs whatever the depth test says)
 
       // Perspective-correct varyings: weights scaled by 1/w.
       const float p0 = b0 * v0->inv_w, p1 = b1 * v1->inv_w, p2 = b2 * v2->inv_w;
@@ -935,6 +935,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
           quad_context.position = {xs[k], ys[k], z, 1.0f};
           quad_context.front_facing = front;
           quad_context.primitive_id = s.primitive_id;
+          quad_context.helper = true;
           s.textures.start_recording();
           run_fragment_shader(s, quad_varying, quad_context, ignored);
           s.textures.stop_recording();
@@ -1583,7 +1584,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer: {
-        if ((in_pass && cmd.unit < kMaxUavBuffers) || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (a read-only view may change between draws)
+        if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         ByteView whole = cmd.buffer->map(), part;
         if (!whole.try_subview(cmd.offset, cmd.count, &part)) return false;
         storage[cmd.unit] = part;

@@ -2550,6 +2550,37 @@ void scene_dxil_tess_buffers(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// A pixel shader that writes buffers (dxil_ps_uav.hlsl): every pixel stores its coordinates in a structured buffer and adds to two atomic counters; the picture shows the buffer.
+void scene_dxil_pixel_stores(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureFragmentStores)) return void(rig.step("buffer writes in draws", status::kNotSupported));
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_uav, sizeof b::k_dxil_ps_uav, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  AllocationDesc d;
+  d.flags = kAllocUnorderedAccess, d.size = kPixels * 16;
+  Handle picture = rig.create(d);
+  d.size = 16;
+  Handle counters = rig.create(d);
+  CommandWriter w(rig.allocator());
+  w.bind_uav(0, 2, 0, kPixels * 16);
+  w.bind_uav(1, 3, 0, 16);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, picture, counters});
+  // The picture is the buffer: red and green the pixel's coordinates, blue the colour byte, alpha the last word; a counter that is not the number of pixels paints it over.
+  uint32_t words[kPixels * 4];
+  rig.read_words(picture, ArrayView<uint32_t>(words, kPixels * 4));
+  for (uint32_t i = 0; i < kPixels; ++i) out[i] = (words[4 * i + 3] & 0xFF) << 24 | (words[4 * i] * 8 & 0xFF) << 16 | (words[4 * i + 1] * 8 & 0xFF) << 8 | (words[4 * i + 2] & 0xFF);
+  if (rig.read_u64(counters, 0) != (uint64_t{kPixels} | (uint64_t{1536} << 32)))
+    for (uint32_t& pixel : out) pixel ^= 0x0000FF00u;
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2602,6 +2633,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL half floats and int16 (Shader Model 6)", scene_dxil_16bit},
     {"Direct3D 12 DXIL buffer views in a pixel shader (Shader Model 6)", scene_dxil_pixel_buffers},
     {"Direct3D 12 DXIL buffer views in a vertex shader (Shader Model 6)", scene_dxil_vertex_buffers},
+    {"Direct3D 12 DXIL buffer writes by a pixel shader (Shader Model 6)", scene_dxil_pixel_stores},
     {"Direct3D 12 DXIL buffer views in the geometry stage (Shader Model 6)", scene_dxil_geometry_buffers},
     {"Direct3D 12 DXIL buffer views in the hull and domain stages (Shader Model 6)", scene_dxil_tess_buffers},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},

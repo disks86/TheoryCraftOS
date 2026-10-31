@@ -1096,10 +1096,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
-        if ((in_pass && cmd.unit < kMaxUavBuffers) || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (a read-only view may change between draws)
+        if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         storage[cmd.unit] = {static_cast<VirglBuffer*>(cmd.buffer), cmd.offset, cmd.count};
         storage_dirty = true;
-        if (cmd.unit >= kMaxUavBuffers) draw_storage_dirty = true;
+        draw_storage_dirty = true;
         break;
       case RecordedCommand::Type::Dispatch: {
         if (in_pass || !compute) return false;
@@ -1263,10 +1263,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (indexed && !index_buffer) return false;
         if (pipeline->desc().stream_output_count && !begin_stream_output()) return false;
         if (draw_storage_dirty) {
-          // The views of buffers the vertex and pixel shaders read, from the host's binding point 0 (their TGSI numbers them that way); the compute shader's bindings are made again before a dispatch.
+          // The buffers the stages of a draw read and write, from the host's binding point 0: the views first (t0 .. t3), the unordered access buffers after them (u0 .. u3), the way their TGSI
+          // numbers them; the compute shader's bindings are made again before a dispatch.
+          StorageBinding host[kMaxStorageBuffers];
           uint32_t slots = 0;
-          for (uint32_t k = kMaxUavBuffers; k < kMaxStorageBuffers; ++k)
-            if (storage[k].buffer) slots = k + 1 - kMaxUavBuffers;
+          for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) {
+            host[k] = storage[k < kMaxSrvBuffers ? kMaxUavBuffers + k : k - kMaxSrvBuffers];
+            if (host[k].buffer) slots = k + 1;
+          }
           const GraphicsPipelineDesc& pd = pipeline->desc();
           const uint32_t stages[5] = {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval};
           for (uint32_t which = 0; which < 5; ++which) {
@@ -1276,10 +1280,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             stream.put(stage);
             stream.put(0);
             for (uint32_t k = 0; k < slots; ++k) {
-              const StorageBinding& view = storage[kMaxUavBuffers + k];
-              stream.put(static_cast<uint32_t>(view.offset));
-              stream.put(static_cast<uint32_t>(view.size));
-              stream.put(view.buffer ? view.buffer->id() : 0);
+              stream.put(static_cast<uint32_t>(host[k].offset));
+              stream.put(static_cast<uint32_t>(host[k].size));
+              stream.put(host[k].buffer ? host[k].buffer->id() : 0);
             }
           }
           storage_dirty = true;
@@ -1349,6 +1352,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (patches) {
           stream.put(patch_points);
           stream.put(0);   // draw id
+        }
+        if (pipeline->desc().fragment_stores) {   // (what the pixel shader wrote is there for the next read, a transfer to the system included)
+          stream.command(virgl::kMemoryBarrier, 0, 1);
+          stream.put(0xFFFFFFFFu);
         }
         break;
       }

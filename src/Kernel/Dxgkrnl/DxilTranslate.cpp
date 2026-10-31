@@ -3119,8 +3119,19 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
       else return status::kNotSupported;
     }
-  } else if (res_[1][0].present || res_[1][1].present) {
-    return status::kNotSupported;   // (unordered access views of the other stages)
+  } else if (pixel) {
+    // (a pixel shader's unordered access views: buffers it writes)
+    for (uint32_t i = 0; i < kMaxResources; ++i) {
+      const Resource& r = res_[1][i];
+      if (!r.present) continue;
+      if (r.lower >= graphics::kMaxUavBuffers) return status::kNotSupported;
+      if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
+      else return status::kNotSupported;
+    }
+  } else {
+    for (uint32_t i = 0; i < kMaxResources; ++i)
+      if (res_[1][i].present) return status::kNotSupported;   // (unordered access views of the other stages)
   }
   // constant buffers
   for (uint32_t i = 0; i < kMaxResources; ++i) {
