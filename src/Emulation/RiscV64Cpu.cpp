@@ -168,6 +168,7 @@ bool RiscV64Cpu::pending_syscall(process::SyscallAbi abi, process::SyscallReques
 }
 
 RiscV64Cpu::Step RiscV64Cpu::fail(uint8_t vector, uint64_t address) {
+  if (bus_) return sys_fail(vector, address);
   fault_.vector = vector;
   fault_.address = address;
   fault_.pc = instruction_start_;
@@ -176,6 +177,7 @@ RiscV64Cpu::Step RiscV64Cpu::fail(uint8_t vector, uint64_t address) {
 }
 
 bool RiscV64Cpu::load(GuestMemory& m, uint64_t address, uint32_t size, uint64_t* out) {
+  if (bus_) return sys_read(address, size, amo_ ? Access::Store : Access::Load, out);
   uint8_t raw[8] = {};
   if (!m.read(address, ByteView(raw, size))) {
     fail(14, address);
@@ -188,6 +190,7 @@ bool RiscV64Cpu::load(GuestMemory& m, uint64_t address, uint32_t size, uint64_t*
 }
 
 bool RiscV64Cpu::store(GuestMemory& m, uint64_t address, uint32_t size, uint64_t value) {
+  if (bus_) return sys_write(address, size, value);
   uint8_t raw[8];
   for (uint32_t i = 0; i < 8; ++i) raw[i] = static_cast<uint8_t>(value >> (8 * i));
   if (!m.write(address, ConstByteView(raw, size))) {
@@ -229,6 +232,24 @@ StopReason RiscV64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
 
 RiscV64Cpu::Step RiscV64Cpu::step(GuestMemory& m) {
   instruction_start_ = s_.pc;
+  if (bus_) {
+    if (s_.pc & 1) return sys_fail(0, s_.pc);      // (an instruction address misaligned)
+    uint64_t half, upper;
+    if (!sys_read(s_.pc, 2, Access::Fetch, &half)) return Step::Fault;
+    uint32_t insn = static_cast<uint32_t>(half);
+    uint32_t length = 2;
+    if ((insn & 3) == 3) {
+      if (!sys_read(s_.pc + 2, 2, Access::Fetch, &upper)) return Step::Fault;
+      insn |= static_cast<uint32_t>(upper) << 16;
+      length = 4;
+    }
+    raw_instruction_ = insn;
+    if (length == 2) {
+      insn = expand_compressed(insn);
+      if (insn == 0) return undefined();
+    }
+    return execute(m, insn, length);
+  }
   if (s_.pc & 1) return fail(13, s_.pc);
   uint8_t raw[4];
   if (!m.fetch(s_.pc, ByteView(raw, 2))) return fail(14, s_.pc);
@@ -389,6 +410,8 @@ RiscV64Cpu::Step RiscV64Cpu::execute(GuestMemory& m, uint32_t insn, uint32_t len
       return Step::Ok;
     }
   }
+  const uint32_t unit = bus_ ? sys_unit(insn) : 0;      // system mode: the F/D and V units can be switched off (mstatus.FS, VS) and track whether they were written
+  if (unit && !sys_unit_enabled(unit)) return undefined();
   switch (opcode) {
     case 0x37: set_x(rd, static_cast<uint64_t>(sext(insn & 0xFFFFF000u, 32))); break;      // lui
     case 0x17: set_x(rd, s_.pc + static_cast<uint64_t>(sext(insn & 0xFFFFF000u, 32))); break;      // auipc
@@ -595,6 +618,10 @@ RiscV64Cpu::Step RiscV64Cpu::execute(GuestMemory& m, uint32_t insn, uint32_t len
         if (r == Step::Syscall) s_.pc = next;      // (the call returns after the ecall)
         return r;
       }
+      if (jumped_) {
+        jumped_ = false;
+        return Step::Ok;
+      }
       break;
     }
     case 0x77: {      // OP-VE: the vector cryptography extensions
@@ -623,6 +650,7 @@ RiscV64Cpu::Step RiscV64Cpu::execute(GuestMemory& m, uint32_t insn, uint32_t len
     }
     default: return undefined();
   }
+  if (unit) sys_unit_dirty(unit);
   s_.pc = next;
   return Step::Ok;
 }
@@ -633,6 +661,7 @@ RiscV64Cpu::Step RiscV64Cpu::atomic(GuestMemory& m, uint32_t insn) {
   const uint32_t size = funct3 == 0 ? 1 : funct3 == 1 ? 2 : funct3 == 2 ? 4 : funct3 == 3 ? 8 : 16;      // (Zabha: bytes and halfwords; Zacas: amocas.q on 16 bytes)
   const uint64_t address = s_.x[rs1];
   if (address & (size - 1)) return fail(13, address);
+  struct AmoScope { bool& f; AmoScope(bool& x, bool on) : f(x) { f = on; } ~AmoScope() { f = false; } } amo_scope(amo_, funct5 != 2);      // (system mode: the load part of an AMO checks for write permission)
   auto widen = [&](uint64_t v) { return size == 1 ? static_cast<uint64_t>(sext(v, 8)) : size == 2 ? static_cast<uint64_t>(sext(v, 16)) : size == 4 ? static_cast<uint64_t>(sext(v, 32)) : v; };
   if (funct5 == 5) {      // Zacas: amocas
     if (size == 16) {      // amocas.q works on the register pairs (rd, rd+1) and (rs2, rs2+1)
@@ -698,6 +727,7 @@ RiscV64Cpu::Step RiscV64Cpu::atomic(GuestMemory& m, uint32_t insn) {
 RiscV64Cpu::Step RiscV64Cpu::system(uint32_t insn, uint32_t) {
   const uint32_t funct3 = field(insn, 14, 12);
   if (funct3 == 0) {
+    if (bus_) return sys_instruction(insn);
     if (insn == 0x00000073) return Step::Syscall;      // ecall
     if (insn == 0x00100073) return fail(3);            // ebreak
     if (insn == 0x00D00073 || insn == 0x01D00073) return Step::Ok;      // Zawrs: wrs.nto, wrs.sto (the reservation set is never lost, so they return at once)
@@ -715,6 +745,7 @@ RiscV64Cpu::Step RiscV64Cpu::system(uint32_t insn, uint32_t) {
 
 RiscV64Cpu::Step RiscV64Cpu::csr_access(uint32_t insn) {
   const uint32_t rd = field(insn, 11, 7), funct3 = field(insn, 14, 12), rs1 = field(insn, 19, 15), csr = insn >> 20;
+  if (bus_) return sys_csr(insn);
   if (funct3 == 4) return undefined();
   const bool immediate = funct3 >= 5;
   const uint64_t operand = immediate ? rs1 : s_.x[rs1];

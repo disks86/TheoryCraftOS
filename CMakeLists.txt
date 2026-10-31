@@ -712,6 +712,8 @@ add_executable(BOOTX64
   src/Emulation/RiscV64Cpu.cpp
   src/Emulation/RiscV64Fp.cpp
   src/Emulation/RiscV64Crypto.cpp
+  src/Emulation/RiscV64Privileged.cpp
+  src/Emulation/RiscV64Machine.cpp
   src/Emulation/RiscV64Vector.cpp
   src/Emulation/RiscV64VectorInt.cpp
   src/Emulation/RiscV64VectorBits.cpp

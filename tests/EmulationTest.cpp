@@ -34,6 +34,7 @@
 #include "Emulation/AArch64Cpu.hpp"
 #include "Emulation/RiscV64Cpu.hpp"
 #include "Emulation/RiscV64Crypto.hpp"
+#include "Emulation/RiscV64Machine.hpp"
 #include "Emulation/SoftFloat.hpp"
 #include "Emulation/X86_64Cpu.hpp"
 #include "Executable/ExecutableKind.hpp"
@@ -1503,6 +1504,79 @@ static void test_riscv64_robustness() {
   CHECK(runs > 120000);
 }
 
+static Bytes read_file(const char* path);
+
+// The privileged architecture. The image is a flat build of a payload from tests/riscv_sys that runs in machine mode, drops to supervisor and user mode, takes traps and interrupts
+// and prints what it sees through the UART; the expected text is what qemu-system-riscv64 printed for the same image (tests/riscv_sys.sh checks the two against each other).
+static void test_riscv64_system(const char* image_path, const char* expected_path, const char* what) {
+  const Bytes image = read_file(image_path), expected = read_file(expected_path);
+  CHECK(!image.empty() && !expected.empty());
+  const std::string want(expected.begin(), expected.end());
+  for (uint64_t slice : {uint64_t{64}, uint64_t{1} << 40}) {      // (the run loop's chunking must not change anything)
+    process::AddressSpace space(A);
+    RiscV64Machine machine(A, space, 64ull << 20);
+    CHECK(machine.ok() && machine.load(RiscV64Machine::kRamBase, ConstByteView(image.data(), image.size())));
+    machine.start(RiscV64Machine::kRamBase);
+    for (uint64_t done = 0; done < 200000000ull && !machine.finished(); done += slice < 64 ? 64 : 1000000) machine.run(slice < 64 ? 64 : 1000000);
+    CHECK(machine.finished() && machine.exit_code() == 0);
+    const std::string got(reinterpret_cast<const char*>(machine.console().data()), machine.console().size());
+    CHECK(got == want);
+    if (got != want) printf("  %s differs (%zu bytes against %zu)\n", what, got.size(), want.size());
+  }
+  // damaged images: a bit flipped in the first kilobytes (the trap handlers and the first tests) and a truncation; whatever happens, the machine must stay inside its memory
+  uint32_t runs = 0;
+  for (size_t i = 0; i < image.size() && i < 4096; i += 7) {
+    for (int bit = 0; bit < 8; bit += 3) {
+      Bytes damaged = image;
+      damaged[i] ^= uint8_t(1u << bit);
+      process::AddressSpace space(A);
+      RiscV64Machine machine(A, space, 8ull << 20);
+      CHECK(machine.ok() && machine.load(RiscV64Machine::kRamBase, ConstByteView(damaged.data(), damaged.size())));
+      machine.start(RiscV64Machine::kRamBase);
+      machine.run(20000);
+      ++runs;
+    }
+  }
+  for (size_t cut = 0; cut < image.size(); cut += image.size() / 40 + 1) {
+    process::AddressSpace space(A);
+    RiscV64Machine machine(A, space, 8ull << 20);
+    CHECK(machine.ok() && machine.load(RiscV64Machine::kRamBase, ConstByteView(image.data(), cut)));
+    machine.start(RiscV64Machine::kRamBase);
+    machine.run(20000);
+    ++runs;
+  }
+  CHECK(runs > 500);
+}
+
+// Random instruction words in every privilege level with random CSR contents (satp, PMP, delegation): nothing may fault the host.
+static void test_riscv64_system_random() {
+  uint64_t seed = 0x9E3779B97F4A7C15ull;
+  auto next = [&]() { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  process::AddressSpace space(A);
+  RiscV64Machine machine(A, space, 4ull << 20);
+  CHECK(machine.ok());
+  for (int i = 0; i < 3000; ++i) {
+    uint8_t page[4096];
+    for (uint8_t& b : page) b = uint8_t(next());
+    machine.load(RiscV64Machine::kRamBase, ConstByteView(page, sizeof(page)));
+    machine.start(RiscV64Machine::kRamBase);
+    RiscV64Cpu& cpu = machine.cpu();
+    RiscV64Cpu::System& sys = cpu.system_state();
+    sys.priv = uint8_t((next() % 3) == 0 ? 0 : (next() % 2) ? 1 : 3);
+    sys.satp = (next() % 2) ? (uint64_t{8 + next() % 3} << 60) | ((RiscV64Machine::kRamBase >> 12) + (next() % 600)) : 0;
+    sys.mstatus |= next() & 0x6000;
+    sys.medeleg = next() & 0xB3FF;
+    sys.mideleg = next() & 0x222;
+    sys.mie = next() & 0xAAA;
+    sys.mtvec = RiscV64Machine::kRamBase + 0x800 + (next() & 0x3FC);
+    sys.stvec = RiscV64Machine::kRamBase + 0xC00 + (next() & 0x3FC);
+    for (uint32_t r = 0; r < 4; ++r) { sys.pmpaddr[r] = (RiscV64Machine::kRamBase >> 2) + (next() & 0xFFFF); sys.pmpcfg[r] = uint8_t(next() & 0x1F); }
+    for (int r = 1; r < 32; ++r) cpu.state().x[r] = (r % 3 == 0) ? RiscV64Machine::kRamBase + (next() & 0xFFFF) : next();
+    machine.run(64);
+  }
+  CHECK(true);
+}
+
 static void test_softfloat_arm_extras() {
   using namespace softfloat;
   const int modes[4] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
@@ -1836,6 +1910,7 @@ int main(int argc, char** argv) {
   test_aarch64_robustness();
   test_riscv64();
   test_riscv64_crypto();
+  test_riscv64_system_random();
   test_riscv64_robustness();
   test_robustness();
   if (argc >= 3) test_program(argv[1], argv[2]);
@@ -1853,6 +1928,10 @@ int main(int argc, char** argv) {
   if (argc >= 21) test_x87_program(argv[19], argv[20], "SHA-512/SM4");
   if (argc >= 23) test_x87_program(argv[21], argv[22], "AVX-512");
   if (argc >= 25) test_x87_program(argv[23], argv[24], "AVX-512 FP16");
+  if (argc >= 29) {
+    test_riscv64_system(argv[25], argv[26], "privileged");
+    test_riscv64_system(argv[27], argv[28], "privileged, user mode");
+  }
   if (argc >= 13) test_avx_program(argv[11], argv[12]);      // (the SSE3/SSSE3/SSE4 program: the same kind of check)
   test_threads_without_support();
   if (argc < 3) printf("(no guest program given: skipping the whole-program tests)\n");

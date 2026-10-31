@@ -148,7 +148,16 @@ AArch64 uses, so files, pipes, `mmap` and `clone` are shared with every other ki
   group not aligned to EMUL, or a masked instruction writing v0 is an invalid instruction. The emulator does not check every register-overlap rule (an assembler or compiler never
   emits a violation, and the result of one is unspecified anyway).
 - **Newer extensions**, all checked against `qemu-riscv64 -cpu max` with `riscv_diff.sh` (0 mismatches): Zfh/Zfhmin (half precision, NaN-boxed with 48 ones), Zfa, Zfbfmin; scalar crypto (Zbkb, Zbkx, Zknd, Zkne, Zknh, Zksed, Zksh); Zcb, Zcmop, Zimop, Zawrs, Zihintntl and the cache-block hints; Zabha and Zacas (`amocas.b/h/w/d`); vector Zvfh, Zvfhmin, Zvfbfmin, Zvfbfwma (`SEW=16`), Zvbb, Zvkb, Zvbc, and the vector crypto set (Zvkned AES, Zvknha/b SHA-2, Zvksed SM4, Zvksh SM3, Zvkg GHASH; `RiscV64VectorCrypto.cpp`, helpers in `RiscV64Crypto.cpp`; element groups of 4, or 8 for SM3, `vl` and `vstart` must be multiples of them). `amocas.q` is implemented but not checked (qemu crashes on it). Zcmp is deliberately absent: its encodings are `c.fsdsp`/`c.fld` when Zcd is present, which this guest has.
-- **Not implemented** (an invalid-instruction fault, never a wrong result): H, RV32, privileged instructions, Zcmt, Zicfiss shadow-stack semantics (the mops write zero).
+- **Privileged architecture** (`RiscV64Privileged.cpp`, board in `RiscV64Machine.cpp`): off for the Linux user-mode guest above, on after `RiscV64Cpu::enable_system`. Machine, supervisor and user mode; the M and S CSRs (mstatus/sstatus with FS and VS tracking, misa,
+  medeleg/mideleg, mie/mip, mtvec/stvec, counters and counter-enables, menvcfg, Sstc's stimecmp, satp, PMP with 16 entries); exceptions and interrupts with delegation and vectored mode; `mret`, `sret`, `wfi`, `sfence.vma` (and the Svinval forms) with the
+  TSR / TW / TVM traps; Sv39, Sv48 and Sv57 translation with SUM, MXR, MPRV and Svade behaviour (a clear A or D bit is a page fault, the software sets it); access faults from PMP and from the bus. The F, D and V units trap when their mstatus field is Off and
+  mark it Dirty when they write (compares, `fclass` and `fmv.x.*` leave FS alone, as qemu does). `RiscV64Machine` is a one-hart board laid out like qemu's `virt`: RAM at 0x80000000, a CLINT (software interrupt, timer) at 0x2000000, a 16550 UART at 0x10000000,
+  the test finisher at 0x100000, an empty PLIC; time advances with the instructions run and `wfi` skips ahead to the next timer. `tests/riscv_sys.sh` runs the payloads in `tests/riscv_sys` (CSR WARL probes, mode switches, delegation, illegal-instruction traps, paging
+  faults of every kind, PMP including locked entries, timer / software / supervisor / Sstc interrupts, user mode under paging) on `qemu-system-riscv64 -M virt` and on the machine and compares what they print over the UART: identical. Two payload builds and qemu's output
+  are checked in (`tests/data/emulation/riscv-sys*`) so `EmulationTest` runs them under the sanitizers, together with bit-flipped and truncated images and random instruction words at random privilege levels.
+  **Not done**: PLIC and external interrupts, hardware A/D updating (Svadu), Svpbmt / Svnapot (the bits are reserved here), hardware performance counters (reads trap, as with `pmu-num=0`), Smepmp, the debug trigger module, multiple harts. OpenSBI or Linux has not been booted on it:
+  that needs a device tree and a block device or initramfs loader on top of the board.
+- **Not implemented** (an invalid-instruction fault, never a wrong result): H, RV32, Zcmt, Zicfiss shadow-stack semantics (the mops write zero).
 
 ## AVX, AVX2, FMA, BMI, F16C
 
@@ -400,7 +409,7 @@ for the expected output, and checks the emulator prints the same for the x86-64 
 against hand-assembled bytes, the soft-float against the host FPU (random and edge-case operands, all four rounding modes, results and flags compared bit for bit; the
 guest program also does double and float work), faults, architecture detection, and the truncation / bit-flip / random-byte robustness cases.
 
-`tests/riscv_diff.sh [int|mem|fp|comp|bit|half|crypto|zc|amo2|vint|vmem|vfp|vbit|vhalf|vcrypto|vaes|vsha|vsm|vgh] [--seeds N]` is the differential test of the RISC-V guest against `qemu-riscv64` (it needs clang with the riscv64 target, the rustup
+`tests/riscv_sys.sh` (privileged mode against qemu-system, see above) and `tests/riscv_diff.sh [int|mem|fp|comp|bit|half|crypto|zc|amo2|vint|vmem|vfp|vbit|vhalf|vcrypto|vaes|vsha|vsm|vgh] [--seeds N]` is the differential test of the RISC-V guest against `qemu-riscv64` (it needs clang with the riscv64 target, the rustup
 `ld.lld` and qemu, so it is not part of `run_host_tests.sh`): `tests/riscv_diff/gen.py` assembles thousands of random instructions with random register contents (x1..x30, f0..f31,
 fcsr and a 256-byte buffer) into one program that dumps the whole state after each, the program runs under qemu and under `tests/EmulationRun.cpp`, and `compare.py` requires
 identical state. About 105,000 cases (4 seeds of each mode: the integer set including M and the branches, loads/stores/LR/SC/AMOs, F and D with every rounding mode, the
