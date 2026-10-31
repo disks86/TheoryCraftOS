@@ -1167,6 +1167,7 @@ void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* 
   graphics::HullInputData upright = input;
   for (uint32_t k = 0; k < upright.control_points && k < graphics::kMaxPatchControlPoints; ++k) upright.position[k].y = -upright.position[k].y;
   s.hull_in = &upright;
+  s.storage = input.storage;
   // The control point phase once for each output control point, then the fork and join phases (which make the patch constants).
   for (uint32_t cp = 0; cp < tess_output_points_ && cp < graphics::kMaxPatchControlPoints; ++cp) {
     s.sys[kSysOutputControlPointId].f[0] = from_bits(cp);
@@ -1189,6 +1190,7 @@ void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, flo
   State s;
   s.constants = constants;
   s.patch_in = &patch;
+  s.storage = patch.storage;
   s.sys[kSysDomainLocation] = {{u, v, w, 0.0f}};
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
@@ -1203,6 +1205,7 @@ void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const u
   graphics::GeometryInputData upright = input;
   for (graphics::Vec4& p : upright.position) p.y = -p.y;
   s.geometry_in = &upright;
+  s.storage = input.storage;
   s.sys[kSysGsInstanceId].f[0] = from_bits(input.instance_id);
   s.geometry_out = output;
   output->count = 0;

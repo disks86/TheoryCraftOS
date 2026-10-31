@@ -1493,7 +1493,7 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, ", FLOAT\n");
     }
   }
-  if (!compute_ && !geometry_ && !hull_ && !domain_) {   // (the views of buffers a vertex or pixel shader reads)
+  if (!compute_) {   // (the views of buffers a vertex, geometry, tessellation or pixel shader reads)
     for (uint32_t i = 0; i < graphics::kMaxStorageBuffers; ++i) {
       if (!buffer_used_[i]) continue;
       add(*out, "DCL BUFFER[");

@@ -1234,6 +1234,7 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
 void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
   const ShaderModuleDesc& md = module.desc();
   GeometryInputData input;
+  input.storage = s.storage;
   for (uint32_t k = 0; k < count && k < kMaxGeometryInputVertices; ++k) {
     input.position[k] = v[k].position;
     for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
@@ -1251,6 +1252,7 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
 void run_tessellation(const DrawState& s, Tessellator& tessellator, const SoftwareShaderModule& hull, const SoftwareShaderModule& domain, const ClipVertex* v, uint32_t count) {
   const ShaderModuleDesc& hd = hull.desc();
   HullInputData input;
+  input.storage = s.storage;
   input.control_points = count;
   input.primitive_id = s.primitive_id;
   for (uint32_t k = 0; k < count && k < kMaxPatchControlPoints; ++k) {
@@ -1259,6 +1261,7 @@ void run_tessellation(const DrawState& s, Tessellator& tessellator, const Softwa
   }
   HullOutputData patch;
   hd.hull_function(input, s.constants, &patch);
+  patch.storage = s.storage;
   if (!tessellator.tessellate(hd.tess_domain, hd.tess_partitioning, hd.tess_output, patch.outer, patch.inner)) return;
   const DomainShaderFn ds = domain.desc().domain_function;
   const bool triangles = hd.tess_domain == TessDomain::Triangle;

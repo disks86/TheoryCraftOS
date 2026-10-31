@@ -1454,7 +1454,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->texture_count_ = d.texture_count;
   for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) pipeline->texture_kinds_[u] = fragment->texture_kind(u);
   pipeline->color_target_count_ = d.color_target_count;
-  pipeline->storage_mask_ = vertex->storage_mask_ | fragment->storage_mask_ | (geometry ? geometry->storage_mask_ : 0u);   // (the views of buffers their shaders read)
+  pipeline->storage_mask_ = vertex->storage_mask_ | fragment->storage_mask_ | (geometry ? geometry->storage_mask_ : 0u) | (hull ? hull->storage_mask_ : 0u) | (domain ? domain->storage_mask_ : 0u);   // (the views of buffers their shaders read)
   *out = pipeline;
   return status::kSuccess;
 }

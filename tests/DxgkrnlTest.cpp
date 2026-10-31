@@ -5916,6 +5916,53 @@ void test_dxil() {
     }
   }
 
+  // Views of buffers in a geometry shader and in the hull and domain shaders of a patch.
+  {
+    UniquePointer<D3d9Program> gs, hs, ds;
+    CHECK(load("dxil_gs_srv.dxil", &gs) && load("dxil_hs_srv.dxil", &hs) && load("dxil_ds_srv.dxil", &ds));
+    float table[16];
+    for (float& f : table) f = random(0.5f, 3.0f);
+    ByteView views[graphics::kMaxStorageBuffers];
+    views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(table), sizeof table);
+    if (gs) {
+      CHECK(gs->stage() == graphics::ShaderStage::Geometry && (gs->required_features() & graphics::kFeatureStorageInDraws));
+      for (uint32_t n = 0; n < 50; ++n) {
+        graphics::GeometryInputData in;
+        in.storage = views;
+        for (uint32_t v = 0; v < 3; ++v) {
+          in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
+          in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
+        }
+        graphics::GeometryOutputData out;
+        uint8_t constants[128] = {};
+        gs->run_geometry(in, constants, &out);
+        bool same = out.count == 3;
+        for (uint32_t v = 0; same && v < 3; ++v)
+          same = close_to(out.vertex[v].position.x, in.position[v].x + table[4 * v]) && close_to(out.vertex[v].position.y, in.position[v].y - table[4 * v + 1]) && close_to(out.vertex[v].position.w, in.position[v].w + table[4 * v + 3]) &&
+                 close_to(out.vertex[v].varying[0].x, in.varying[v][0].x * table[12]);
+        CHECK(same);
+      }
+    }
+    if (hs && ds) {
+      CHECK(hs->stage() == graphics::ShaderStage::Hull && ds->stage() == graphics::ShaderStage::Domain);
+      for (uint32_t n = 0; n < 50; ++n) {
+        graphics::HullInputData in;
+        in.storage = views;
+        in.control_points = 3;
+        for (uint32_t v = 0; v < 3; ++v) in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), 1};
+        graphics::HullOutputData patch;
+        uint8_t constants[128] = {};
+        hs->run_hull(in, constants, &patch);
+        CHECK(close_to(patch.outer[0], table[0]) && close_to(patch.outer[1], table[1]) && close_to(patch.outer[2], table[2]) && close_to(patch.inner[0], table[3]));
+        patch.storage = views;
+        const float u = random(0, 1), v = random(0, 1) * (1 - u), w = 1 - u - v;
+        graphics::ShaderIo io = {};
+        ds->run_domain(patch, u, v, w, constants, &io);
+        const graphics::Vec4 p0 = patch.control_point[0].position, p1 = patch.control_point[1].position, p2 = patch.control_point[2].position;
+        CHECK(close_to(io.position.x, p0.x * u + p1.x * v + p2.x * w + table[4] * u * v));
+      }
+    }
+  }
   // A domain shader: the vertex it makes of a patch at a point of the domain.
   {
     UniquePointer<D3d9Program> reference, translated;

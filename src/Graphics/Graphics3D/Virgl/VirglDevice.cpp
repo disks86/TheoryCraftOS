@@ -1267,7 +1267,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           uint32_t slots = 0;
           for (uint32_t k = kMaxUavBuffers; k < kMaxStorageBuffers; ++k)
             if (storage[k].buffer) slots = k + 1 - kMaxUavBuffers;
-          for (uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment}) {
+          const GraphicsPipelineDesc& pd = pipeline->desc();
+          const uint32_t stages[5] = {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval};
+          for (uint32_t which = 0; which < 5; ++which) {
+            if ((which == 2 && !pd.geometry_shader) || ((which == 3 || which == 4) && !pd.hull_shader)) continue;   // (only the stages the pipeline has)
+            const uint32_t stage = stages[which];
             stream.command(virgl::kSetShaderBuffers, 0, 2 + 3 * slots);
             stream.put(stage);
             stream.put(0);

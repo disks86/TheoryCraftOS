@@ -298,6 +298,7 @@ struct StreamOutputEntry {
   uint8_t stream = 0, output = 0, start_component = 0, component_count = 0, buffer = 0;
 };
 struct GeometryInputData {
+  const ByteView* storage = nullptr;   // the views of buffers the draw can read (kFeatureStorageInDraws), as for the vertex shader
   Vec4 position[kMaxGeometryInputVertices];
   Vec4 varying[kMaxGeometryInputVertices][kMaxVaryings];
   uint32_t primitive_id = 0;   // the number of the primitive in the draw
@@ -322,12 +323,14 @@ enum class TessDomain : uint8_t { Isoline, Triangle, Quad };
 enum class TessPartitioning : uint8_t { Integer, Pow2, FractionalOdd, FractionalEven };
 enum class TessOutput : uint8_t { TriangleCw, TriangleCcw, Point, Line };
 struct HullInputData {
+  const ByteView* storage = nullptr;
   uint32_t control_points = 0;
   uint32_t primitive_id = 0;
   Vec4 position[kMaxPatchControlPoints];
   Vec4 varying[kMaxPatchControlPoints][kMaxVaryings];
 };
 struct HullOutputData {
+  const ByteView* storage = nullptr;                // (the domain shader's views of buffers: the draw's)
   ShaderIo control_point[kMaxPatchControlPoints];   // the output control points
   Vec4 patch[kMaxPatchRegisters];                   // the patch constant registers (the tessellation factors are in the x of theirs)
   float outer[4] = {};                              // edge factors (triangle: the u = 0, v = 0 and w = 0 edges; quad: u = 0, v = 0, u = 1, v = 1; isoline: line density, line detail)

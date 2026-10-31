@@ -3030,6 +3030,13 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
         if (r.bytes == 0 || r.bytes % 16 || r.lower >= 14) return status::kNotSupported;
         word(89u | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (8u << 12) | (2u << 20)), word(r.lower), word(r.bytes / 16);
       }
+      for (uint32_t i = 0; i < kMaxResources; ++i) {   // (the views of buffers of both functions)
+        const Resource& r = res_[0][i];
+        if (!r.present) continue;
+        if ((r.kind != 11 && r.kind != 12) || r.lower >= graphics::kMaxSrvBuffers) return status::kNotSupported;
+        if (r.kind == 12) word(162u | (4u << 24)), word((7u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+        else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
+      }
       if (points_in < 1 || points_in > graphics::kMaxPatchControlPoints) return status::kNotSupported;
       for (uint32_t i = 0; i < input_count_; ++i) {
         const SigElement& e = inputs_[i];
@@ -3130,7 +3137,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     const Resource& r = res_[0][i];
     if (!r.present) continue;
     if (r.kind == 11 || r.kind == 12) {   // (a raw or structured buffer view: a read-only storage buffer of a compute shader)
-      if (r.lower >= graphics::kMaxSrvBuffers || geometry || domain) return status::kNotSupported;   // (the views are read by compute, vertex and pixel shaders)
+      if (r.lower >= graphics::kMaxSrvBuffers) return status::kNotSupported;
       if (r.kind == 12) word(162u | (4u << 24)), word((7u << 12) | (1u << 20)), word(r.lower), word(r.stride);
       else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
       continue;

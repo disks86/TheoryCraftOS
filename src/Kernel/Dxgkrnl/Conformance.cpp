@@ -2490,6 +2490,66 @@ TESS_SCENE(scene_dxil_tess,
            {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {5, 5, 5, 5}, {0, 0, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_tri_cb), TESS_BLOB(dxil_ds_noise), 3, {3, 6, 2, 4}, {0, 0, 0, 0}, kNoCull},
            {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {4, 4, 4, 4}, {4, 4, 0, 0}, kNoCull}, {TESS_BLOB(dxil_hs_quad_cb), TESS_BLOB(dxil_ds_quad), 4, {2, 3, 5, 8}, {4, 3, 0, 0}, kNoCull})
 
+// Views of buffers in a geometry shader (dxil_gs_srv.hlsl): the triangle's corners moved by a table, and its colour scaled.
+void scene_dxil_geometry_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureGeometryShaders | graphics::kFeatureStorageInDraws)) return void(rig.step("geometry shaders with buffers", status::kNotSupported));
+  namespace b = conformance_blobs;
+  const Vertex v[3] = {{-0.6f, -0.6f, 0.5f, 1, 0, 0, 1}, {0.6f, -0.6f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.6f, 0.5f, 0, 0, 1, 1}};
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle gs = rig.shader("create_shader (geometry)", ShaderKind::Dxbc, graphics::ShaderStage::Geometry, bytes_of(b::k_dxil_gs_srv, sizeof b::k_dxil_gs_srv));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.geometry_shader = gs;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  const float table[16] = {-0.3f, -0.1f, 0, 0, 0.2f, -0.3f, 0, 0, 0.3f, 0.2f, 0, 0, 0.8f, 0, 0, 0};
+  Handle buffer = rig.buffer(kAllocUnorderedAccess, bytes_of(table, sizeof table));
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, sizeof table);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, buffer});
+  rig.read(target, out);
+}
+
+// Views of buffers in a hull and a domain shader (dxil_hs_srv / dxil_ds_srv.hlsl): the tessellation factors and the bend of the edges come from a table.
+void scene_dxil_tess_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTessellation | graphics::kFeatureStorageInDraws)) return void(rig.step("tessellation with buffers", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle vs = rig.vertex_shader(bytes_of(b::k_vs, sizeof b::k_vs));
+  Handle ps = rig.pixel_shader(bytes_of(b::k_ps_color, sizeof b::k_ps_color));
+  Handle hs = rig.shader("create_shader (hull)", ShaderKind::Dxbc, graphics::ShaderStage::Hull, bytes_of(b::k_dxil_hs_srv, sizeof b::k_dxil_hs_srv));
+  Handle ds = rig.shader("create_shader (domain)", ShaderKind::Dxbc, graphics::ShaderStage::Domain, bytes_of(b::k_dxil_ds_srv, sizeof b::k_dxil_ds_srv));
+  PipelineDesc pd = colour_pipeline_desc(vs, ps);
+  pd.varying_count = 3;
+  pd.hull_shader = hs;
+  pd.domain_shader = ds;
+  pd.cull_mode = graphics::CullMode::None;
+  Handle pipe = rig.pipeline(pd);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  const Vertex v[3] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  const float table[8] = {4, 3, 5, 4, 0.5f, 0.6f, 0, 0};
+  Handle buffer = rig.buffer(kAllocUnorderedAccess, bytes_of(table, sizeof table));
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, sizeof table);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.set_topology(patch_list(3));
+  w.draw(3, 0);
+  w.end_pass();
+  rig.render(w, {target, vb, buffer});
+  rig.read(target, out);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2542,6 +2602,8 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL half floats and int16 (Shader Model 6)", scene_dxil_16bit},
     {"Direct3D 12 DXIL buffer views in a pixel shader (Shader Model 6)", scene_dxil_pixel_buffers},
     {"Direct3D 12 DXIL buffer views in a vertex shader (Shader Model 6)", scene_dxil_vertex_buffers},
+    {"Direct3D 12 DXIL buffer views in the geometry stage (Shader Model 6)", scene_dxil_geometry_buffers},
+    {"Direct3D 12 DXIL buffer views in the hull and domain stages (Shader Model 6)", scene_dxil_tess_buffers},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},
