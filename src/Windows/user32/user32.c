@@ -140,9 +140,6 @@ EXPORT int WINAPI wsprintfA(LPSTR buffer, LPCSTR format, ...) { va_list_ a; __bu
  * screen buffer shown (cells of the console font, 8 x 16) and put at a fixed place on a 1024 x 768 desktop whose task bar takes the lower 40 lines. */
 typedef struct { LONG left, top, right, bottom; } RECT_;
 IMPORT HANDLE WINAPI GetConsoleWindow(void);
-IMPORT HANDLE WINAPI CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPVOID security, DWORD creation, DWORD flags, HANDLE template_file);
-IMPORT BOOL WINAPI GetConsoleScreenBufferInfo(HANDLE console, PCONSOLE_SCREEN_BUFFER_INFO info);
-IMPORT BOOL WINAPI CloseHandle(HANDLE handle);
 IMPORT void WINAPI SetLastError(DWORD error);
 #define SCREEN_W 1024
 #define SCREEN_H 768
@@ -151,16 +148,13 @@ IMPORT void WINAPI SetLastError(DWORD error);
 #define FRAME 8
 
 EXPORT BOOL WINAPI IsWindow(HANDLE window) { return window && window == GetConsoleWindow(); }
-/* The size of the cells the console window shows, 0 x 0 if the console has no screen buffer to ask. */
+IMPORT BOOL WINAPI TcosConsoleWindowCells(LONG *columns, LONG *rows);
+/* The size of the cells the console window shows. */
 static BOOL console_client_size(LONG *width, LONG *height) {
-  HANDLE out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, 3, NULL, OPEN_EXISTING, 0, NULL);
-  if (out == INVALID_HANDLE_VALUE) return FALSE;
-  CONSOLE_SCREEN_BUFFER_INFO info;
-  const BOOL ok = GetConsoleScreenBufferInfo(out, &info);
-  CloseHandle(out);
-  if (!ok) return FALSE;
-  *width = (LONG)(info.srWindow.Right - info.srWindow.Left + 1) * 8;
-  *height = (LONG)(info.srWindow.Bottom - info.srWindow.Top + 1) * 16;
+  LONG columns, rows;
+  if (!TcosConsoleWindowCells(&columns, &rows)) return FALSE;
+  *width = columns * 8;
+  *height = rows * 16;
   return TRUE;
 }
 EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect) {

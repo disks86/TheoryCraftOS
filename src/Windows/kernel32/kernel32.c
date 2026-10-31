@@ -68,6 +68,7 @@ static BOOL con_input_ready(void);
 static BOOL con_is_input(HANDLE h);
 static void con_alias_add(HANDLE h, BOOL input);
 static void con_alias_forget(HANDLE h);
+static void con_screen_closed(HANDLE h);
 static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit);
 EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags, HANDLE template_file);
@@ -2437,7 +2438,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   block.console = console_for_new_process(flags, image_is_gui(image), &fresh_console);
   if (fresh_console) nt_flags |= 0x100;      /* (the standard handles of a console program with a console of its own are that console's) */
   /* the console flags (bit 0: Ctrl+C is ignored) are the ones of this process, and a new process group ignores it; the group is this process's own unless a new one starts */
-  block.words[10] = (parameters()->ConsoleFlags & 1) | ((flags & 0x200 /* CREATE_NEW_PROCESS_GROUP */) ? 1 : 0);
+  block.words[10] = (parameters()->ConsoleFlags & 1) | ((flags & 0x210 /* CREATE_NEW_PROCESS_GROUP, not with CREATE_NEW_CONSOLE */) == 0x200 ? 1 : 0);
   block.words[11] = (flags & 0x200) ? 0xFFFFFFFFu : *(ULONG *)((BYTE *)parameters() + 0x408);
   if ((flags & 0x80000 /* EXTENDED_STARTUPINFO_PRESENT */) && startup && startup->cb >= sizeof(STARTUPINFOW) + sizeof(PVOID)) {
     const ProcThreadAttributeList *attributes = *(ProcThreadAttributeList *const *)((const BYTE *)startup + sizeof(STARTUPINFOW));
@@ -2540,6 +2541,7 @@ EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
   overlapped_forget(h);
   con_alias_forget(h);
   const NTSTATUS status = NtClose(h);
+  if (NT_SUCCESS(status)) con_screen_closed(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI GetHandleInformation(HANDLE h, LPDWORD flags) {

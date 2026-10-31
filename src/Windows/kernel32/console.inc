@@ -281,16 +281,33 @@ EXPORT BOOL WINAPI SetConsoleInputExeNameA(LPCSTR name) {
 static BOOL con_is_output_only(HANDLE h) { return h && ((h == GetStdHandle(STD_OUTPUT_HANDLE) && h != GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 2); }
 static BOOL con_is_input(HANDLE h) { return h && ((h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_alias_kind(h) == 1); }
 static BOOL con_buffer_alive(HANDLE h) { return SetEvent(h) || GetLastError() != ERROR_INVALID_HANDLE; }
+static volatile LONG g_screens_made;      /* screen buffers have been made: CloseHandle has to look whether it closed one */
+/* A handle was closed: the screen buffer it was the handle of goes (unless another copy of the handle keeps it), and the one shown before it is shown again. A handle number that
+ * is used again soon after must not make a closed buffer look alive. */
+static void con_screen_closed(HANDLE h) {
+  if (!g_screens_made) return;
+  con_lock();
+  for (int i = 1; i < CON_MAX_BUFFERS; ++i) {
+    ScreenBuffer *sb = con_screen(i);
+    if (!sb->used || sb->handle != h || con_buffer_alive(h)) continue;
+    ScreenBuffer *next = (ScreenBuffer *)sb->from;
+    for (int k = 1; k < CON_MAX_BUFFERS; ++k) if (con_screen(k)->used && con_screen(k)->from == sb) con_screen(k)->from = next;      /* (what was shown before it is now before the next) */
+    if (g_active_screen == sb) g_active_screen = next && next->used ? next : NULL;
+    RtlFreeHeap(heap(), 0, sb->cells);
+    memset(sb, 0, sizeof(*sb));
+  }
+  con_unlock();
+}
 /* The buffer that is shown (the lock is held): when the one that was is closed, the one before it is. */
 static ScreenBuffer *con_active(void) {
-  while (g_active_screen && g_active_screen != con_screen(0) && !con_buffer_alive(g_active_screen->handle)) {
+  while (g_active_screen && g_active_screen != con_screen(0) && (!g_active_screen->used || !con_buffer_alive(g_active_screen->handle))) {
     ScreenBuffer *dead = g_active_screen;
     ScreenBuffer *next = (ScreenBuffer *)dead->from;
-    RtlFreeHeap(heap(), 0, dead->cells);
+    if (dead->used) RtlFreeHeap(heap(), 0, dead->cells);
     memset(dead, 0, sizeof(*dead));
-    g_active_screen = next && next->used ? next : con_screen(0);
+    g_active_screen = next && next->used ? next : NULL;
   }
-  return g_active_screen ? g_active_screen : con_screen(0);
+  return g_active_screen ? g_active_screen : con_main();      /* (the main buffer of a console is made when it is first needed) */
 }
 /* The screen buffer a handle writes to (the lock is held), or NULL. */
 static ScreenBuffer *con_buffer(HANDLE h) {
@@ -322,11 +339,19 @@ static void sb_scroll_up(ScreenBuffer *sb) {
 static void sb_line_down(ScreenBuffer *sb) {
   if (sb->cursor.Y + 1 >= sb->size.Y) sb_scroll_up(sb); else ++sb->cursor.Y;
 }
+/* Without ENABLE_WRAP_AT_EOL_OUTPUT the character after the one in the last column goes back to the column the write began in (Windows keeps the last column as it is). */
+static SHORT g_write_start;
+static BOOL g_edge_written;
 static void sb_put(ScreenBuffer *sb, WCHAR c) {
+  if (g_edge_written) {
+    g_edge_written = FALSE;
+    if (!(sb->out_mode & ENABLE_WRAP_AT_EOL_OUTPUT)) sb->cursor.X = g_write_start < sb->size.X ? g_write_start : 0;
+  }
   CHAR_INFO_ *cell = &sb->cells[(long)sb->cursor.Y * sb->size.X + sb->cursor.X];
   cell->ch = c; cell->attr = sb->attr;
   if (sb->cursor.X + 1 < sb->size.X) ++sb->cursor.X;
   else if (sb->out_mode & ENABLE_WRAP_AT_EOL_OUTPUT) { sb->cursor.X = 0; sb_line_down(sb); }
+  else g_edge_written = TRUE;
 }
 static void sb_clear(ScreenBuffer *sb, COORD from, long count) {      /* count cells from `from`, in reading order, with the current attributes */
   long i = (long)from.Y * sb->size.X + from.X;
@@ -414,6 +439,7 @@ static void sb_csi(ScreenBuffer *sb, WCHAR final) {
  * returns how many. */
 static DWORD sb_write(ScreenBuffer *sb, const WCHAR *s, DWORD n, WCHAR *host) {
   DWORD out = 0;
+  g_write_start = sb->cursor.X; g_edge_written = FALSE;
   const BOOL vt = (sb->out_mode & CON_VT_OUT) != 0, processed = (sb->out_mode & ENABLE_PROCESSED_OUTPUT) != 0;
   for (DWORD i = 0; i < n; ++i) {
     const WCHAR c = s[i];
@@ -444,6 +470,7 @@ static DWORD sb_write(ScreenBuffer *sb, const WCHAR *s, DWORD n, WCHAR *host) {
     if (vt && c == 0x1B) { sb->esc = 1; continue; }
     host[out++] = c;
     if (processed && c < 0x20) {
+      if (c != 7) g_edge_written = FALSE;
       switch (c) {
         case '\n': if (!(vt && (sb->out_mode & CON_NO_AUTO_RETURN))) sb->cursor.X = 0; sb_line_down(sb); break;
         case '\r': sb->cursor.X = 0; break;
@@ -553,12 +580,14 @@ static int con_fill_input(BOOL wait) {
   g_in_len = (DWORD)iosb.Information;
   return 1;
 }
+/* Is there an event for a wait on the input handle? The end of the input is not one: a console has no end, so a wait goes on (a read at the end still ends). */
 static BOOL con_input_ready(void) {
-  BOOL at_end;
   con_lock();
-  const BOOL ready = g_inject_count > 0 || g_in_pos < g_in_len || g_in_eof;
+  const BOOL ready = g_inject_count > 0 || g_in_pos < g_in_len;
   con_unlock();
-  return ready || con_input_ready_now(&at_end);
+  if (ready) return TRUE;
+  BOOL at_end;
+  return con_input_ready_now(&at_end) && !at_end;
 }
 static void key_for(WCHAR c, WORD *vk, WORD *scan, DWORD *state) {
   static const char rows[] = "QWERTYUIOP\0ASDFGHJKL\0ZXCVBNM";
@@ -609,7 +638,7 @@ static void make_key_record(INPUT_RECORD_ *r, WCHAR c, BOOL down) {
 /* The next event: from WriteConsoleInput, else made from the typed text (a key down, then up). The lock is held. */
 static BOOL con_next_record(INPUT_RECORD_ *r, BOOL consume) {
   if (g_inject_count > 0) {
-    *r = g_injected[g_inject_head];
+    memcpy(r, &g_injected[g_inject_head], sizeof(*r));      /* (the whole record, the padding too: a program compares records as bytes) */
     if (consume) { g_inject_head = (g_inject_head + 1) % CON_INJECT_MAX; --g_inject_count; }
     return TRUE;
   }
@@ -642,7 +671,12 @@ static BOOL con_read_events(HANDLE h, INPUT_RECORD_ *out, DWORD length, LPDWORD 
       con_lock();
       (void)got;
     }
-    while (n < length && con_next_record(&out[n], consume)) ++n;
+    /* (a peek walks the events as a read does and puts the queue back as it was) */
+    const DWORD saved_head = g_inject_head, saved_count = g_inject_count;
+    const DWORD saved_pos = g_in_pos;
+    const BOOL saved_up = g_in_up;
+    while (n < length && con_next_record(&out[n], TRUE)) ++n;
+    if (!consume) { g_inject_head = saved_head; g_inject_count = saved_count; g_in_pos = saved_pos; g_in_up = saved_up; }
     const BOOL eof = g_in_eof && g_in_pos >= g_in_len && g_inject_count == 0;
     con_unlock();
     if (n > 0 || !block || eof) break;
@@ -677,7 +711,7 @@ EXPORT BOOL WINAPI WriteConsoleInputW(HANDLE h, const INPUT_RECORD_ *in, DWORD l
     INPUT_RECORD_ *last = &g_injected[(g_inject_head + g_inject_count - 1) % CON_INJECT_MAX];
     if (last->EventType == 2 && last->Event.raw[12] == 1) { *last = in[0]; con_unlock(); if (written) *written = 1; return TRUE; }
   }
-  for (; n < length && g_inject_count < CON_INJECT_MAX; ++n) g_injected[(g_inject_head + g_inject_count++) % CON_INJECT_MAX] = in[n];
+  for (; n < length && g_inject_count < CON_INJECT_MAX; ++n) memcpy(&g_injected[(g_inject_head + g_inject_count++) % CON_INJECT_MAX], &in[n], sizeof(in[n]));
   con_unlock();
   if (written) *written = n;
   return TRUE;
@@ -686,7 +720,7 @@ EXPORT BOOL WINAPI WriteConsoleInputA(HANDLE h, const INPUT_RECORD_ *in, DWORD l
 EXPORT BOOL WINAPI FlushConsoleInputBuffer(HANDLE h) {
   if (!con_is_input(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
   con_lock();
-  g_inject_count = 0; g_in_pos = g_in_len = 0; g_in_up = FALSE;
+  g_inject_count = 0; g_in_pos = g_in_len = 0; g_in_up = FALSE; g_in_eof = FALSE;      /* (the end of the input is found again by the next read) */
   con_unlock();
   return TRUE;
 }
@@ -1008,6 +1042,16 @@ EXPORT HANDLE WINAPI GetConsoleWindow(void) {
   if (id & CON_ID_NO_WINDOW) return NULL;
   return (HANDLE)(ULONG_PTR)(0x10000 + (((id >> 8) ^ id) & 0xFFFF) * 4);
 }
+/* (for user32.dll) The size of the window of the screen buffer that is shown, in cells. */
+EXPORT BOOL WINAPI TcosConsoleWindowCells(LONG *columns, LONG *rows) {
+  if (!con_attached()) return FALSE;
+  con_lock();
+  ScreenBuffer *sb = g_active_screen ? g_active_screen : con_main();
+  const BOOL ok = sb != NULL;
+  if (ok) { *columns = sb->window.Right - sb->window.Left + 1; *rows = sb->window.Bottom - sb->window.Top + 1; }
+  con_unlock();
+  return ok;
+}
 /* The processes of the console (those that have ended are dropped from the list); the list is written only if it is big enough. */
 EXPORT DWORD WINAPI GetConsoleProcessList(LPDWORD list, DWORD count) {
   if (!list || !count) { set_error(ERROR_INVALID_PARAMETER); return 0; }
@@ -1198,12 +1242,17 @@ EXPORT COORD WINAPI GetConsoleFontSize(HANDLE h, DWORD font) {
   return c;
 }
 EXPORT BOOL WINAPI GetCurrentConsoleFontEx(HANDLE h, BOOL maximum, CONSOLE_FONT_INFOEX_ *info) {
-  (void)maximum;
   if (!info || info->cbSize != sizeof(*info)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   if (!con_buffer_or_main(h)) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  info->nFont = 0; info->dwFontSize.X = 8; info->dwFontSize.Y = 16; info->FontFamily = 0x36; info->FontWeight = 400;
+  info->nFont = 0; info->dwFontSize.X = CON_FONT_W; info->dwFontSize.Y = CON_FONT_H; info->FontFamily = 0x36; info->FontWeight = 400;
   static const WCHAR name[] = {'T', 'e', 'r', 'm', 'i', 'n', 'a', 'l', 0};
   memcpy(info->FaceName, name, sizeof(name));
+  if (maximum) {
+    con_lock();
+    ScreenBuffer *sb = con_buffer(h);
+    info->dwFontSize = con_max_window(sb ? sb->size : con_largest_window());
+    con_unlock();
+  }
   return TRUE;
 }
 EXPORT BOOL WINAPI SetCurrentConsoleFontEx(HANDLE h, BOOL maximum, CONSOLE_FONT_INFOEX_ *info) {
@@ -1233,6 +1282,7 @@ EXPORT HANDLE WINAPI CreateConsoleScreenBuffer(DWORD access, DWORD share, LPSECU
     }
     if (handle) {
       memset(sb, 0, sizeof(*sb));
+      g_screens_made = 1;
       sb->used = TRUE; sb->handle = handle; sb->attr = sb->popup = g_active_screen ? g_active_screen->attr : main->attr; sb->out_mode = main->out_mode;      /* (a new buffer takes the colours in use) */
       sb->cursor_info.size = 25; sb->cursor_info.visible = TRUE;
       if (!con_alloc_cells(sb, main->size)) { CloseHandle(handle); memset(sb, 0, sizeof(*sb)); handle = INVALID_HANDLE_VALUE; set_error(ERROR_NOT_ENOUGH_MEMORY); }
