@@ -1314,6 +1314,25 @@ void scene_dxil_gather_cube(Rig& rig, ArrayView<uint32_t> out) {
   sample_layered(rig, out, b::k_dxil_ps_gather_cube, sizeof b::k_dxil_ps_gather_cube, texture, v, 6);
 }
 
+// The same gather close to the edges of the faces: the footprint reaches over the edge, to the texels of the neighbouring face.
+void scene_dxil_gather_cube_edges(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::TextureCube, 6, [](uint32_t face) -> uint32_t {
+    static const uint32_t kColours[6] = {0xFF0000u, 0x00FFFFu, 0x00FF00u, 0xFF00FFu, 0x0000FFu, 0xFFFF00u};
+    return kColours[face];
+  });
+  Vertex v[36];
+  for (uint32_t face = 0; face < 6; ++face) {
+    const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(face / 3 * 16);
+    quad_pixels(v + 6 * face, x0, y0, x0 + 10, y0 + 16, [face](float u, float vv) {
+      const float a = -0.97f + 1.94f * u, c = -0.4f + 0.8f * vv, axis = face % 2 ? -1.0f : 1.0f;
+      return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+    });
+  }
+  sample_layered(rig, out, b::k_dxil_ps_gather_cube, sizeof b::k_dxil_ps_gather_cube, texture, v, 6);
+}
+
 // The same textures read with Load, SampleLevel and GetDimensions (ps_texel3d / ps_texelarray / ps_texelcube): the picture is the texel loaded, the texel sampled and the size.
 void scene_texel_3d(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
@@ -2795,6 +2814,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL gather4 (Shader Model 6)", scene_dxil_gather},
     {"Direct3D 12 DXIL gather4 on layers of an image set (Shader Model 6)", scene_dxil_gather_array},
     {"Direct3D 12 DXIL gather4 on a cubemap (Shader Model 6)", scene_dxil_gather_cube},
+    {"Direct3D 12 DXIL gather4 across the edges of a cubemap (Shader Model 6)", scene_dxil_gather_cube_edges},
     {"Direct3D 12 DXIL gather4 with offsets (Shader Model 6)", scene_dxil_gather_offsets},
     {"Direct3D 12 DXIL gather4 with a comparison (Shader Model 6)", scene_dxil_gather_compare},
     {"Direct3D 11 gather4 with the offset in a register (DXBC)", scene_gather_register_offsets},
