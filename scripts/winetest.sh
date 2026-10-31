@@ -80,7 +80,7 @@ QEMU
   cmake -S . -B build -DTCOS_USERMODE_DEMO=OFF -DTCOS_WINE_TEST_PROGRAM="$PWD/$out/winerun.exe" "-DTCOS_WINE_TEST_FILES=$(IFS=';'; echo "${files[*]}")" -DQEMU="$PWD/$out/qemu.sh" >/dev/null
   ninja -C build esp primary vars >"$out/build.log" 2>&1 || { tail -20 "$out/build.log"; exit 1; }
   ninja -C build run-std >/dev/null 2>&1 || true
-  sed -n '/Windows test program/,$p' build/debugcon.log | grep -v "^\[" | grep -v "^  \(test program\|Windows test program\)" >> "$out/$dll.log"
+  sed -n '/Windows test program/,$p' build/debugcon.log | { grep -av "^\[" || true; } | { grep -av "^  \(test program\|Windows test program\)" || true; } >> "$out/$dll.log"      # (-a: a console test writes control characters)
   # the tests that did not start in this round are the next round's; the one that started and never ended is recorded as hung
   last_started=$(grep "^=== .* start" build/debugcon.log | tail -1 | sed 's/^=== \(.*\) start$/\1/')
   if grep -q "WINERUN DONE" build/debugcon.log; then pending=(); break; fi
