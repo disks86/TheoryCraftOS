@@ -1090,7 +1090,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
       } else if (opcode == 109) {
         // (the component to gather is the resource operand's single selected one; no gather of volumes, cubes and arrays)
-        if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D || resource.components != 2) return status::kNotSupported;
+        if ((program->texture_kind_[unit] != graphics::TextureKind::Texture2D && program->texture_kind_[unit] != graphics::TextureKind::Texture2DArray && program->texture_kind_[unit] != graphics::TextureKind::TextureCube) || resource.components != 2)
+          return status::kNotSupported;   // (a volume has no gather)
         ins.control = resource.swizzle[0];
       } else if (resource.components == 2) {
         for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];

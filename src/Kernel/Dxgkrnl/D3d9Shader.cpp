@@ -1029,12 +1029,45 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         // the middle of its texel, so that the sampler's address mode (wrap, clamp, mirror) does what it does for any other lookup.
         b = {{0, 0, 0, 0}};
         const uint32_t unit = ins.src[1].number;
-        uint32_t w = 0, h = 0, levels = 0;
-        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
-          const float x = floor_(a.f[0] * static_cast<float>(w) - 0.5f), y = floor_(a.f[1] * static_cast<float>(h) - 0.5f);
+        uint32_t w = 0, h = 0, depth = 1, levels = 0;
+        const graphics::TextureKind kind = unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size_volume(unit, 0, &w, &h, &depth, &levels) && w && h) {
+          const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+          // (a cube: the direction picks a face and a place on it; the taps are looked up by the directions of their texel middles, kept on the face)
+          int face = 0;
+          float u = a.f[0], v = a.f[1];
+          if (kind == graphics::TextureKind::TextureCube) {
+            const float ax = a.f[0] < 0 ? -a.f[0] : a.f[0], ay = a.f[1] < 0 ? -a.f[1] : a.f[1], az = a.f[2] < 0 ? -a.f[2] : a.f[2];
+            float major, sc, tc;
+            if (ax >= ay && ax >= az) face = a.f[0] < 0, major = ax, sc = a.f[0] < 0 ? a.f[2] : -a.f[2], tc = -a.f[1];
+            else if (ay >= az) face = 2 + (a.f[1] < 0), major = ay, sc = a.f[0], tc = a.f[1] < 0 ? -a.f[2] : a.f[2];
+            else face = 4 + (a.f[2] < 0), major = az, sc = a.f[2] < 0 ? -a.f[0] : a.f[0], tc = -a.f[1];
+            if (major == 0) major = 1;
+            u = 0.5f * (sc / major + 1.0f), v = 0.5f * (tc / major + 1.0f);
+          }
+          const float x = floor_(u * fw - 0.5f), y = floor_(v * fh - 0.5f);
           const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
           for (uint32_t k = 0; k < 4; ++k) {
-            const graphics::Vec4 t = s.textures->sample_lod(unit, (xs[k] + 0.5f) / static_cast<float>(w), (ys[k] + 0.5f) / static_cast<float>(h), 0.0f);
+            float tx = xs[k], ty = ys[k];
+            graphics::Vec4 t;
+            if (kind == graphics::TextureKind::TextureCube) {
+              tx = tx < 0 ? 0 : tx > fw - 1 ? fw - 1 : tx, ty = ty < 0 ? 0 : ty > fh - 1 ? fh - 1 : ty;
+              const float sn = 2.0f * (tx + 0.5f) / fw - 1.0f, tn = 2.0f * (ty + 0.5f) / fh - 1.0f;
+              float d[3];
+              switch (face) {
+                case 0: d[0] = 1, d[1] = -tn, d[2] = -sn; break;
+                case 1: d[0] = -1, d[1] = -tn, d[2] = sn; break;
+                case 2: d[0] = sn, d[1] = 1, d[2] = tn; break;
+                case 3: d[0] = sn, d[1] = -1, d[2] = -tn; break;
+                case 4: d[0] = sn, d[1] = -tn, d[2] = 1; break;
+                default: d[0] = -sn, d[1] = -tn, d[2] = -1; break;
+              }
+              t = s.textures->sample_lod_volume(unit, d[0], d[1], d[2], 0.0f);
+            } else if (kind == graphics::TextureKind::Texture2DArray) {
+              t = s.textures->sample_lod_volume(unit, (tx + 0.5f) / fw, (ty + 0.5f) / fh, a.f[2], 0.0f);
+            } else {
+              t = s.textures->sample_lod(unit, (tx + 0.5f) / fw, (ty + 0.5f) / fh, 0.0f);
+            }
             const float texel[4] = {t.x, t.y, t.z, t.w};
             b.f[k] = texel[ins.control & 3];
           }

@@ -1285,6 +1285,35 @@ void scene_texture_cube(Rig& rig, ArrayView<uint32_t> out) {
   sample_layered(rig, out, b::k_ps_texcube, sizeof b::k_ps_texcube, texture, v, 6);
 }
 
+// gather4 of an array texture and of a cube texture (dxil_ps_gather_array / _cube.hlsl): the red and blue of the four texels of the footprint, in the layer or on the face the coordinate names.
+void scene_dxil_gather_array(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::Texture2DArray, 3, [](uint32_t layer) -> uint32_t { return layer == 0 ? 0xFF8000u : layer == 1 ? 0x00FF80u : 0x8000FFu; });
+  Vertex v[18];
+  for (uint32_t i = 0; i < 3; ++i)
+    quad_pixels(v + 6 * i, static_cast<float>(i * 10) + 1.2f, 0, static_cast<float>(i * 10) + 10.8f, 32, [i](float u, float vv) { return graphics::Vec3{u * 0.9f + 0.05f, vv * 0.9f + 0.05f, static_cast<float>(i)}; });
+  sample_layered(rig, out, b::k_dxil_ps_gather_array, sizeof b::k_dxil_ps_gather_array, texture, v, 3);
+}
+
+void scene_dxil_gather_cube(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureTextureKinds)) return void(rig.step("texture kinds", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle texture = layered_texture(rig, graphics::TextureKind::TextureCube, 6, [](uint32_t face) -> uint32_t {
+    static const uint32_t kColours[6] = {0xFF0000u, 0x00FFFFu, 0x00FF00u, 0xFF00FFu, 0x0000FFu, 0xFFFF00u};
+    return kColours[face];
+  });
+  Vertex v[36];
+  for (uint32_t face = 0; face < 6; ++face) {
+    const float x0 = static_cast<float>(1 + (face % 3) * 10), y0 = static_cast<float>(face / 3 * 16);
+    quad_pixels(v + 6 * face, x0, y0, x0 + 10, y0 + 16, [face](float u, float vv) {
+      const float a = -0.7f + 1.4f * u, c = -0.7f + 1.4f * vv, axis = face % 2 ? -1.0f : 1.0f;   // (well inside the face: the footprint stays on it)
+      return face < 2 ? graphics::Vec3{axis, c, a} : face < 4 ? graphics::Vec3{a, axis, c} : graphics::Vec3{a, c, axis};
+    });
+  }
+  sample_layered(rig, out, b::k_dxil_ps_gather_cube, sizeof b::k_dxil_ps_gather_cube, texture, v, 6);
+}
+
 // The same textures read with Load, SampleLevel and GetDimensions (ps_texel3d / ps_texelarray / ps_texelcube): the picture is the texel loaded, the texel sampled and the size.
 void scene_texel_3d(Rig& rig, ArrayView<uint32_t> out) {
   if (!rig.has(graphics::kFeatureTextureKinds | graphics::kFeatureTexelAccess)) return void(rig.step("texture kinds", status::kNotSupported));
@@ -2500,6 +2529,8 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL geometry shader (Shader Model 6)", scene_dxil_geometry},
     {"Direct3D 12 DXIL hull and domain shaders (Shader Model 6)", scene_dxil_tess},
     {"Direct3D 12 DXIL gather4 (Shader Model 6)", scene_dxil_gather},
+    {"Direct3D 12 DXIL gather4 on layers of an image set (Shader Model 6)", scene_dxil_gather_array},
+    {"Direct3D 12 DXIL gather4 on a cubemap (Shader Model 6)", scene_dxil_gather_cube},
     {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
     {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
     {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},

@@ -2368,7 +2368,9 @@ bool Translator::texture_gather(const Instruction& ins) {
   const Val r = new_aggregate(ins.result);
   uint32_t scratch = 0;
   if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
-  if (!pack(ins.args + 3, 2, scratch, false)) return false;
+  const uint32_t kind = res_[0][srv.b].kind;   // (a cube takes a direction, an array the layer in the third component)
+  if (kind != 2 && kind != 5 && kind != 7) return error(status::kNotSupported);
+  if (!pack(ins.args + 3, kind == 2 ? 2 : 3, scratch, false)) return false;
   const uint32_t at = begin(109);
   dst_temp(r.a, 0xF);
   put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));

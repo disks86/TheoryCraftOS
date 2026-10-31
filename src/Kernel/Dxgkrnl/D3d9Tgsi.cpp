@@ -1134,8 +1134,8 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         break;
       }
       sampler_used_[unit] = true;
-      const uint8_t xyxy[4] = {0, 1, 0, 1};
-      const String coordinate = operand(ins.src[0], 0, 0, xyxy, false);
+      const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
+      const String coordinate = operand(ins.src[0], 0, 0, p_.texture_kind(unit) == graphics::TextureKind::Texture2D ? xyxy : xyzz, false);
       String sampler = str();
       add(sampler, "SAMP[");
       add_uint(sampler, unit);
