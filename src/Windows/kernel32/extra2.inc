@@ -484,3 +484,16 @@ EXPORT BOOL WINAPI UnlockFileEx(HANDLE h, DWORD reserved, DWORD length_low, DWOR
   if (!overlapped) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   return unlock_range(h, ((ULONGLONG)overlapped->OffsetHigh << 32) | overlapped->Offset, ((ULONGLONG)length_high << 32) | length_low);
 }
+
+/* GetSystemPowerStatus: this machine is taken to run on mains power with no battery (nothing here reads one). */
+EXPORT BOOL WINAPI GetSystemPowerStatus(BYTE *status) {      /* SYSTEM_POWER_STATUS { BYTE AC, BatteryFlag, BatteryLifePercent, SystemStatusFlag; DWORD BatteryLifeTime, BatteryFullLifeTime; } */
+  if (!status) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  status[0] = 1;      /* AC_LINE_ONLINE */
+  status[1] = 128;      /* BATTERY_FLAG_NO_BATTERY */
+  status[2] = 255;      /* BATTERY_PERCENTAGE_UNKNOWN */
+  status[3] = 0;
+  const DWORD unknown = 0xFFFFFFFFu;      /* BATTERY_LIFE_UNKNOWN */
+  memcpy(status + 4, &unknown, 4);
+  memcpy(status + 8, &unknown, 4);
+  return TRUE;
+}
