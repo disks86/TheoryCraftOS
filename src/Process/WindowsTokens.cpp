@@ -452,13 +452,25 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
       return p.write_user(a[2], sd.view()) ? kSuccess : kAccessViolation;
     }
     case TCOS_OBJECT_SD_GET: case TCOS_OBJECT_SD_SET: {      // (op, handle, required, buffer, length-or-capacity, &needed)
-      if (!slot_of(a[1], &slot)) return kInvalidHandle;
-      const DescriptorKind kind = p.files().kind(slot);
-      if (kind == DescriptorKind::Closed) return kInvalidHandle;
       char key[300];
       uint32_t key_size = 0;
-      const uint64_t token = p.files().token(slot);
-      uint32_t granted_mask = ~p.files().denied_access(slot);
+      DescriptorKind kind = DescriptorKind::Closed;
+      uint64_t token = 0;
+      uint32_t granted_mask = 0xFFFFFFFFu;
+      if (a[1] == kCurrentProcess || a[1] == kCurrentThread) {      // the pseudo handles of the process and the thread that ask
+        kind = a[1] == kCurrentProcess ? DescriptorKind::Process : DescriptorKind::Thread;
+        token = a[1] == kCurrentProcess ? p.id() : (p.runtime() ? p.runtime()->current_thread_id() : p.id());
+        char k[16];
+        const uint32_t n = ObjectManager::object_key(a[1] == kCurrentProcess ? 'p' : 'h', uint32_t(token), k);
+        for (uint32_t i = 0; i < n; ++i) key[i] = k[i];
+        key_size = n;
+        slot = ProcessFiles::kMaxDescriptors;      // (no table entry)
+      } else {
+      if (!slot_of(a[1], &slot)) return kInvalidHandle;
+      kind = p.files().kind(slot);
+      if (kind == DescriptorKind::Closed) return kInvalidHandle;
+      token = p.files().token(slot);
+      granted_mask = ~p.files().denied_access(slot);
       switch (kind) {
         case DescriptorKind::File: case DescriptorKind::Directory: {
           OpenObject* o = p.files().object(slot);
@@ -502,6 +514,7 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
           break;
         }
         default: return kObjectTypeMismatch;
+      }
       }
       const uint32_t required = uint32_t(a[2]);
       if (required & ~granted_mask) return kAccessDenied;

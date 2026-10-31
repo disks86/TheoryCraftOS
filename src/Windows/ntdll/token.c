@@ -847,7 +847,7 @@ static NTSTATUS check_internal(PSECURITY_DESCRIPTOR sd, HANDLE token, ACCESS_MAS
         for (i = privilege_count = 0; i < 64; ++i)
             if (used & ((ULONGLONG)1 << i)) { privs->Privilege[privilege_count].Luid.LowPart = i; privs->Privilege[privilege_count].Luid.HighPart = 0; privs->Privilege[privilege_count].Attributes = SE_PRIVILEGE_USED_FOR_ACCESS; privilege_count++; }
         *privs_length = need;
-    } else { privs->PrivilegeCount = 0; privs->Control = 0; *privs_length = sizeof(PRIVILEGE_SET); }
+    } else { privs->PrivilegeCount = 0; privs->Control = 0; }
     *granted = out_granted;
     *access_status = (NTSTATUS)out_status;
     return STATUS_SUCCESS;
@@ -898,6 +898,8 @@ static void mapping_for_handle(HANDLE handle, GENERIC_MAPPING *m)
     };
     unsigned i;
     m->GenericRead = 0x120089; m->GenericWrite = 0x120116; m->GenericExecute = 0x1200a0; m->GenericAll = 0x1f01ff;      /* (a file) */
+    if (handle == (HANDLE)(LONG_PTR)-1) { m->GenericRead = 0x20410; m->GenericWrite = 0x20bea; m->GenericExecute = 0x121001; m->GenericAll = 0x1fffff; return; }      /* (the pseudo handles of the process and the thread) */
+    if (handle == (HANDLE)(LONG_PTR)-2) { m->GenericRead = 0x20048; m->GenericWrite = 0x20037; m->GenericExecute = 0x120000; m->GenericAll = 0x1fffff; return; }
     if (NtQueryObject(handle, 2, buf, sizeof(buf), &got)) return;
     bytes = *(USHORT *)buf;
     name = *(const WCHAR **)(buf + 8);
@@ -917,6 +919,26 @@ static NTSTATUS default_descriptor(HANDLE handle, BYTE **out, ULONG *length)
     PSECURITY_DESCRIPTOR sd = NULL;
     NTSTATUS status;
     mapping_for_handle(handle, &mapping);
+    if (mapping.GenericAll == 0x1fffff && mapping.GenericRead == 0x20410) {      /* a process: its administrators, the system, and (to be inherited by what it makes) the group of its user may read */
+        BYTE absolute_buffer[SECURITY_DESCRIPTOR_MIN_LENGTH], acl_buffer[256];
+        BYTE admin[16] = {1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0}, system_sid[12] = {1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0};
+        ACL *acl = (ACL *)acl_buffer;
+        HANDLE token;
+        TokenData *t = heap_new(sizeof(*t));
+        BYTE *pgroup_sid = NULL;
+        if (t && !token_of_caller(&token)) {
+            if (!read_token(token, TOKEN_QUERY, t) && t->has_pgroup) pgroup_sid = t->pgroup;
+            NtClose(token);
+        }
+        RtlCreateAcl(acl, sizeof(acl_buffer), ACL_REVISION);
+        RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x1fffff, admin);
+        RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x1fffff, system_sid);
+        if (pgroup_sid) RtlAddAccessAllowedAceEx(acl, ACL_REVISION, CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE, GENERIC_READ, pgroup_sid);
+        RtlCreateSecurityDescriptor(absolute_buffer, 1);
+        RtlSetDaclSecurityDescriptor(absolute_buffer, TRUE, acl, FALSE);
+        status = RtlNewSecurityObjectEx(NULL, absolute_buffer, &sd, NULL, FALSE, 0, NULL, &mapping);
+        heap_drop(t);
+    } else
     status = RtlNewSecurityObjectEx(NULL, NULL, &sd, NULL, FALSE, 0, NULL, &mapping);
     if (status) return status;
     *length = RtlLengthSecurityDescriptor(sd);

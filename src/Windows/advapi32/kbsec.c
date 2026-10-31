@@ -398,18 +398,14 @@ EXP BOOL WINAPI GetWindowsAccountDomainSid(PSID sid, PSID domain, DWORD *size)
 {
     SID *s = sid;
     DWORD need;
-    if (!sid || !size || !RtlValidSid(sid)) return win_fail(ERROR_INVALID_SID);
+    if (!sid || !RtlValidSid(sid)) return win_fail(ERROR_INVALID_SID);
     /* a domain account has the form S-1-5-21-a-b-c-rid */
     if (s->SubAuthorityCount < 5 || s->IdentifierAuthority.Value[5] != 5 || s->IdentifierAuthority.Value[0] || s->IdentifierAuthority.Value[1] || s->IdentifierAuthority.Value[2] ||
         s->IdentifierAuthority.Value[3] || s->IdentifierAuthority.Value[4] || s->SubAuthority[0] != 21) return win_fail(ERROR_NON_ACCOUNT_SID);
-    if (s->SubAuthorityCount != 5) {      /* (more than one relative identifier: the domain is the first 4) */
-        if (s->SubAuthorityCount > 5) {
-            /* fall through: still the first four subauthorities */
-        }
-    }
+    if (!size) return win_fail(ERROR_INVALID_PARAMETER);
     need = RtlLengthRequiredSid(4);
+    if (!domain) { *size = need; return win_fail(ERROR_INVALID_PARAMETER); }
     if (*size < need) { *size = need; return win_fail(ERROR_INSUFFICIENT_BUFFER); }
-    if (!domain) return win_fail(ERROR_INVALID_PARAMETER);
     memcpy(domain, sid, 8 + 4 * sizeof(DWORD));
     ((SID *)domain)->SubAuthorityCount = 4;
     *size = need;
@@ -417,27 +413,13 @@ EXP BOOL WINAPI GetWindowsAccountDomainSid(PSID sid, PSID domain, DWORD *size)
 }
 EXP BOOL WINAPI EqualDomainSid(PSID a, PSID b, BOOL *equal)
 {
-    BYTE da[sizeof(SID) + 16 * sizeof(DWORD)], db[sizeof(SID) + 16 * sizeof(DWORD)];
-    DWORD sa = sizeof(da), sb = sizeof(db);
+    SID *x = a, *y = b;
     if (!RtlValidSid(a) || !RtlValidSid(b)) return win_fail(ERROR_INVALID_SID);
     if (!equal) return win_fail(ERROR_INVALID_PARAMETER);
-    *equal = FALSE;
-    if (!GetWindowsAccountDomainSid(a, da, &sa) || !GetWindowsAccountDomainSid(b, db, &sb)) {
-        if (GetLastError() == ERROR_NON_ACCOUNT_SID) {
-            /* the well known SIDs of the same kind (a fixed SID in both): the same domain only when they are equal in the prefix */
-            SetLastError(ERROR_SUCCESS);
-            BYTE pa[sizeof(SID) + 16 * sizeof(DWORD)];
-            SID *x = a, *y = b;
-            if (x->SubAuthorityCount == y->SubAuthorityCount && x->SubAuthorityCount > 0) {
-                memcpy(pa, a, RtlLengthSid(a));
-                ((SID *)pa)->SubAuthorityCount--;
-                *equal = FALSE;
-            }
-            return TRUE;
-        }
-        return FALSE;
-    }
-    *equal = RtlEqualSid(da, db);
+    /* only the SIDs of the builtin domain (S-1-5-32-x) have a domain here; the others are not SIDs of an account of a domain */
+    if (x->SubAuthorityCount < 2 || x->IdentifierAuthority.Value[5] != 5 || x->SubAuthority[0] != 32) return win_fail(ERROR_NON_DOMAIN_SID);
+    *equal = y->SubAuthorityCount >= 2 && y->IdentifierAuthority.Value[5] == 5 && y->SubAuthority[0] == 32;
+    SetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
