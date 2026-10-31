@@ -77,6 +77,10 @@ add_executable(BOOTX64
   src/Hardware/CentralProcessingUnit/SystemCpu.cpp
   src/Hardware/CentralProcessingUnit/CpuTemperature.cpp
   src/Hardware/Power/CpuPower.cpp
+  src/Hardware/Tpm/TpmTis.cpp
+  src/Hardware/Tpm/TpmCrb.cpp
+  src/Hardware/Tpm/TpmDevice.cpp
+  src/Hardware/Tpm/TpmDriver.cpp
   src/Hardware/Power/PowerManager.cpp
   src/Hardware/Power/Thermal.cpp
   src/Hardware/CentralProcessingUnit/X86_64Cpu.S
@@ -1147,6 +1151,10 @@ endif()
 option(TCOS_SDCARD "Drive the SD card slot of a Realtek card reader (RTS525A, PCI 10EC:525A): a card put in becomes a removable storage device; not yet run on a real machine" OFF)
 if(TCOS_SDCARD)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_SDCARD)
+endif()
+option(TCOS_TPM "Talk to the TPM 2.0 the firmware presents (CRB through the ACPI TPM2 table, or the FIFO interface at 0xFED40000): Startup, its random numbers added to the seed of the system's generator (and its source when the CPU and the hypervisor give none); not yet run on a real machine" OFF)
+if(TCOS_TPM)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_TPM)
 endif()
 option(TCOS_ISH "Start the Intel Integrated Sensor Hub (PCI 8086:9D35 / A135): resets its IPC, brings up ISHTP and the HID client, adds the sensors to the sensor hub; not yet run on a real machine" OFF)
 if(TCOS_ISH)

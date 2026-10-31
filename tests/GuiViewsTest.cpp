@@ -5768,6 +5768,19 @@ static void test_desktop_media_keys() {
     light.refuse = true;
     light.level = 30;
     CHECK(!d.adjust_brightness(10) && light.level == 30);
+    // the lid: the backlight goes out and comes back at its level; the keys do nothing meanwhile
+    light.refuse = false;
+    light.level = 70;
+    d.set_display_blanked(true);
+    CHECK(light.level == 0 && d.display_blanked());
+    press(key::kBrightnessUp);
+    CHECK(light.level == 0);
+    d.set_display_blanked(true);
+    d.set_display_blanked(false);
+    CHECK(light.level == 70 && !d.display_blanked());
+    d.set_display_blanked(false);
+    CHECK(light.level == 70);
+    light.level = 30;
     // the keys work over a dialog as well
     d.ask_shut_down();
     light.refuse = false;
