@@ -74,6 +74,7 @@ struct VectorUnit {
   Step integer_wide();
   Step mask_and_permute();
   Step reductions();
+  bool bit_instruction(Step* step);      // RiscV64VectorBits.cpp: Zvbb, Zvkb, Zvbc
   Step floating();
   Step floating_convert();
   Step float_reduction();

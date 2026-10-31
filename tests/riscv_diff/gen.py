@@ -347,12 +347,13 @@ elif mode == 'comp':
         elif k == 28: add('c.nop\n c.nop')
         else: add(f'c.mv {d}, {s}\n c.add {d}, {d}')
 
-elif mode in ('vint', 'vmem', 'vfp'):
+elif mode in ('vint', 'vmem', 'vfp', 'vbit', 'vhalf'):
     import os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import genv
-    gen = {'vint': genv.int_case, 'vmem': genv.mem_case, 'vfp': genv.fp_case}[mode]
-    while len(cases) < (4000 if mode != 'vfp' else 5000):
+    genv.HALF = mode == 'vhalf'
+    gen = {'vint': genv.int_case, 'vmem': genv.mem_case, 'vfp': genv.fp_case, 'vbit': genv.bit_case, 'vhalf': genv.fp_case}[mode]
+    while len(cases) < (5000 if mode in ('vfp', 'vhalf') else 4000):
         c = gen()
         if c: add(c)
 
@@ -372,7 +373,7 @@ total = len(cases) * BLK
 for ci, text in enumerate(cases):
     blk = bytearray(BLK)
     for r in range(1, 31): blk[(r - 1) * 8:(r - 1) * 8 + 8] = struct.pack('<Q', r64())
-    for r in range(32): blk[INIT_F + r * 8:INIT_F + r * 8 + 8] = struct.pack('<Q', f64_half() if mode == 'half' else f64())
+    for r in range(32): blk[INIT_F + r * 8:INIT_F + r * 8 + 8] = struct.pack('<Q', f64_half() if mode in ('half', 'vhalf') else f64())
     fcsr = (random.randrange(0, 5) << 5) | (random.getrandbits(5) if random.random() < 0.3 else 0)
     blk[INIT_FCSR:INIT_FCSR + 8] = struct.pack('<Q', fcsr)
     for i in range(1024 if VEC else 256): blk[BUF + i] = random.getrandbits(8)
@@ -380,9 +381,10 @@ for ci, text in enumerate(cases):
         for r in range(32):
             k = random.random()
             if k < 0.4: lane = bytes(random.getrandbits(8) for _ in range(16))
-            elif mode == 'vfp' and k < 0.85:
-                width = random.choice([4, 8])
-                if width == 4: lane = b''.join(struct.pack('<I', random.choice(SF32) if random.random() < 0.5 else struct.unpack('<I', struct.pack('<f', random.uniform(-1000, 1000)))[0]) for _ in range(4))
+            elif mode in ('vfp', 'vhalf') and k < 0.85:
+                width = random.choice([2, 4, 8] if mode == 'vhalf' else [4, 8])
+                if width == 2: lane = b''.join(struct.pack('<H', random.choice(SF16) if random.random() < 0.5 else struct.unpack('<H', struct.pack('<e', random.uniform(-1000, 1000)))[0]) for _ in range(8))
+                elif width == 4: lane = b''.join(struct.pack('<I', random.choice(SF32) if random.random() < 0.5 else struct.unpack('<I', struct.pack('<f', random.uniform(-1000, 1000)))[0]) for _ in range(4))
                 else: lane = b''.join(struct.pack('<Q', random.choice(SF64) if random.random() < 0.5 else struct.unpack('<Q', struct.pack('<d', random.uniform(-1000, 1000)))[0]) for _ in range(2))
             else:
                 v = r64(); lane = struct.pack('<Q', v) * 2 if random.random() < 0.5 else struct.pack('<QQ', v, r64())
