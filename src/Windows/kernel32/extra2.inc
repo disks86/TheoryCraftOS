@@ -55,6 +55,7 @@ EXPORT BOOL WINAPI GetDiskFreeSpaceExA(LPCSTR directory, PULARGE_INTEGER availab
   return ok;
 }
 EXPORT BOOL WINAPI GetDiskFreeSpaceW(LPCWSTR root, LPDWORD sectors_per_cluster, LPDWORD bytes_per_sector, LPDWORD free_clusters, LPDWORD total_clusters) {
+  if (root && !root[0]) { set_error(ERROR_PATH_NOT_FOUND); return FALSE; }
   HANDLE h = open_volume(root);
   if (!h) return FALSE;
   IO_STATUS_BLOCK iosb;
