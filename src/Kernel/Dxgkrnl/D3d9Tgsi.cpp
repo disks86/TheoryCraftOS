@@ -941,6 +941,70 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("MOV", &w, &old_all);
       break;
     }
+    case kF32ToF16: case kF16ToF32: {
+      // The host has no PK2H / UP2H (they are accepted and do nothing), so the conversions are made of integer instructions: the rounding to nearest even, the subnormals, the infinities.
+      t = begin_result(ins, false, &direct);
+      auto whole = [&](uint32_t reg, char c) { String w = str(); add(w, "TEMP["); add_uint(w, reg); add(w, "]."); for (int k = 0; k < 4; ++k) add(w, StringView(&c, 1)); return w; };
+      auto one = [&](uint32_t reg, char c) { String w = str(); add(w, "TEMP["); add_uint(w, reg); add(w, "]."); add(w, StringView(&c, 1)); return w; };
+      auto constant = [&](uint32_t v) {
+        const bool saved = force_integer_;
+        force_integer_ = true;
+        String w = str(); add(w, "IMM["); add_uint(w, imm4_bits(v, v, v, v)); add(w, "].xxxx");
+        force_integer_ = saved;
+        return w;
+      };
+      const String a = operand(ins.src[0], 0, 0, nullptr, true);
+      const uint32_t r2 = kWork2, r3 = kWork3;
+      const String x2 = one(r2, 'x'), y2 = one(r2, 'y'), z2 = one(r2, 'z'), w2 = one(r2, 'w'), x3 = one(r3, 'x'), y3 = one(r3, 'y'), z3 = one(r3, 'z'), w3 = one(r3, 'w');
+      const String X2 = whole(r2, 'x'), Y2 = whole(r2, 'y'), Z2 = whole(r2, 'z'), W2 = whole(r2, 'w'), X3 = whole(r3, 'x'), Y3 = whole(r3, 'y'), Z3 = whole(r3, 'z'), W3 = whole(r3, 'w');
+      if (op == kF32ToF16) {
+        const String magnitude = constant(0x7FFFFFFFu);
+        line("AND", &x2, &a, &magnitude);                                               // u: the magnitude's bits
+        const String sign_bits = constant(0x80000000u), sixteen = constant(16), thirteen = constant(13), one_bit = constant(1);
+        line("AND", &y2, &a, &sign_bits);
+        line("USHR", &y2, &Y2, &sixteen);                                               // the sign, where a half has it
+        line("USHR", &z2, &X2, &thirteen);
+        line("AND", &z2, &Z2, &one_bit);                                                // the last kept bit of the fraction (ties go to even)
+        const String rebias = constant(0xC8000FFFu);
+        line("UADD", &w2, &X2, &rebias);                                                // the exponent rebased and the rounding bias added
+        line("UADD", &w2, &W2, &Z2);
+        line("USHR", &w2, &W2, &thirteen);                                              // the result for a normal number
+        const String half_f = splat(0.5f), denorm_bias = constant(0xC1000000u);
+        line("ADD", &x3, &X2, &half_f);                                                 // a subnormal or zero: add 0.5 and read the low bits
+        line("UADD", &x3, &X3, &denorm_bias);
+        const String inf_bits = constant(0x7F800000u), nan_half = constant(0x7E00u), inf_half = constant(0x7C00u);
+        line("USLT", &y3, &inf_bits, &X2);                                              // a NaN: more than infinity
+        line("UCMP", &y3, &Y3, &nan_half, &inf_half);
+        const String big = constant(0x47800000u), small = constant(0x38800000u);
+        line("USGE", &z3, &X2, &big);
+        line("USLT", &w3, &X2, &small);
+        line("UCMP", &w2, &W3, &X3, &W2);
+        line("UCMP", &w2, &Z3, &Y3, &W2);
+        line("OR", &w2, &W2, &Y2);
+        line("MOV", &t, &W2);
+      } else {
+        const String mask16 = constant(0xFFFFu), mask15 = constant(0x7FFFu), thirteen = constant(13), exp_mask = constant(0x0F800000u), rebias = constant(0x38000000u), zero_c = constant(0);
+        line("AND", &x2, &a, &mask16);                                                  // h
+        line("AND", &y2, &X2, &mask15);
+        line("SHL", &y2, &Y2, &thirteen);                                               // exponent and fraction in their float places
+        line("AND", &z2, &Y2, &exp_mask);
+        line("UADD", &y2, &Y2, &rebias);                                                // rebased
+        line("USEQ", &w2, &Z2, &exp_mask);                                              // infinity or NaN: the exponent goes on to all ones
+        line("UADD", &x3, &Y2, &rebias);
+        line("UCMP", &y3, &W2, &X3, &Y2);
+        const String hidden = constant(0x00800000u), denorm_unit = splat(-6.103515625e-05f);
+        line("UADD", &z3, &Y2, &hidden);                                                // a subnormal or zero: the hidden bit added and taken off again as a float
+        line("ADD", &z3, &Z3, &denorm_unit);
+        line("USEQ", &w3, &Z2, &zero_c);
+        line("UCMP", &y3, &W3, &Z3, &Y3);
+        const String sign_bit = constant(0x8000u), sixteen = constant(16);
+        line("AND", &x2, &X2, &sign_bit);
+        line("SHL", &x2, &X2, &sixteen);
+        line("OR", &y3, &Y3, &X2);
+        line("MOV", &t, &Y3);
+      }
+      break;
+    }
     case kTexQueryLod: {
       // lod: LODQ gives the clamped level in x and the unclamped in y
       const bool swizzled = ins.tex_swizzle[0] != 0 || ins.tex_swizzle[1] != 1 || ins.tex_swizzle[2] != 2 || ins.tex_swizzle[3] != 3;

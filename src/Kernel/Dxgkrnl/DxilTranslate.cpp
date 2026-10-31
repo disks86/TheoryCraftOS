@@ -153,7 +153,13 @@ class Translator {
   void dst_temp(uint32_t reg, uint32_t mask);
   void dst_null() { put(13u << 12); }
   void dst_scalar(const Val& v) { dst_temp(v.a, v.wide ? 3u << v.b : 1u << v.b); }
-  bool float32(uint32_t type) const { return m_.is_float(type) && m_.types[type].width == 32; }
+  // A float that is done in 32 bits: a half is one too, rounded to a half after each operation that makes one (narrow_result); a 16-bit integer is kept zero-extended in its 32 bits, wrapped after each operation.
+  bool float32(uint32_t type) const { return m_.is_float(type) && (m_.types[type].width == 32 || m_.types[type].width == 16); }
+  bool half_type(uint32_t type) const { return m_.is_float(type) && m_.types[type].width == 16; }
+  Val sign_extended_copy(const Val& v);   // a 16-bit integer's value as a signed 32-bit one, in a register of its own
+  bool narrow_result(const Instruction& ins);
+  bool translate_one(const Instruction& ins);
+  bool binop_words(const Instruction& ins, const Val& a, const Val& b);
   bool wide_type(uint32_t type) const { return (m_.is_float(type) && m_.types[type].width == 64) || m_.is_int(type, 64); }   // (a double or a 64-bit integer: a pair of words)
   bool i64_binop(const Instruction& ins, const Val& a, const Val& b);
   bool i64_compare(const Instruction& ins, const Val& a, const Val& b);
@@ -523,10 +529,10 @@ bool Translator::alias_cast(const Instruction& ins) const {
   if (m_.is_int(ins.type, 64)) return false;                    // (a widening: the high word is made)
   if (m_.is_int(from, 64)) return ins.code == 0 && !m_.is_int(ins.type, 1);   // (a truncation takes the low word)
   switch (ins.code) {
-    case 11: return true;                                   // bitcast
-    case 0: return !m_.is_int(ins.type, 1);                 // trunc (to a boolean is not an alias: the low bit)
+    case 11: return !(m_.types[from].kind == TypeKind::Half) && !(m_.types[ins.type].kind == TypeKind::Half);   // bitcast (a half is a value here and its bits are in an integer: converted)
+    case 0: return !m_.is_int(ins.type, 1) && !m_.is_int(ins.type, 16);   // trunc (to a boolean is not an alias: the low bit; to 16 bits it is wrapped)
     case 1: return !m_.is_int(from, 1);                     // zext from a narrow integer (a boolean becomes 0 or 1)
-    case 2: return m_.is_int(from, 1);                      // sext of a boolean: the mask already is all ones
+    case 2: return m_.is_int(from, 1) && m_.is_int(ins.type, 32);   // sext of a boolean: the mask already is all ones
     default: return false;
   }
 }
@@ -1080,6 +1086,13 @@ bool Translator::switch_region(const Instruction& t, uint32_t b, uint32_t stop) 
 // --- instructions ------------------------------------------------------------------------------------------------------------------------------------------------
 
 bool Translator::translate(const Instruction& ins) {
+  if (!translate_one(ins)) return false;
+  const bool aliasing_cast = ins.op == Op::Cast && alias_cast(ins);
+  if (!aliasing_cast && (ins.op == Op::Binop || ins.op == Op::Cast || ins.op == Op::Call || ins.op == Op::ExtractValue || ins.op == Op::Select) && (half_type(ins.type) || m_.is_int(ins.type, 16))) return narrow_result(ins);
+  return true;
+}
+
+bool Translator::translate_one(const Instruction& ins) {
   switch (ins.op) {
     case Op::Binop: return binop(ins);
     case Op::Cmp: return compare(ins);
@@ -1112,6 +1125,19 @@ bool Translator::translate(const Instruction& ins) {
       if (agg.kind == VK::Agg) {
         if (ins.index >= 4) return error(status::kNotSupported);   // (the status word of a sample)
         v.kind = VK::Temp, v.a = agg.a, v.b = agg.b + ins.index;
+      } else if (agg.kind == VK::CbAgg && (half_type(ins.type) || m_.is_int(ins.type, 16))) {
+        // sixteen-bit elements are packed two to a word of the register: the half the index names, shifted down and masked (a half then widened)
+        if (ins.index >= 8) return error(status::kNotSupported);
+        Val word;
+        word.kind = VK::Cb, word.a = agg.a, word.b = agg.b, word.c = ins.index / 2;
+        const Val r = new_scalar(ins.result);
+        if (r.kind == VK::None) return false;
+        Val shift, mask;
+        shift.kind = VK::Imm, shift.a = 16 * (ins.index & 1), mask.kind = VK::Imm, mask.a = 0xFFFFu;
+        word_op(85, r, word, shift);
+        word_op(1, r, r, mask);
+        if (half_type(ins.type)) word_op1(131, r, r);
+        return define(ins.result, r);
       } else if (agg.kind == VK::CbAgg) {
         if (ins.index >= (double_result ? 2u : 4u)) return error(status::kNotSupported);
         v.kind = VK::Cb, v.a = agg.a, v.b = agg.b, v.c = double_result ? ins.index * 2 : ins.index, v.wide = double_result;
@@ -1204,7 +1230,7 @@ bool Translator::double_cast(const Instruction& ins, const Val& a) {
       case 6: opcode = 215; break;   // sitofp
       default: return error(status::kNotSupported);
     }
-    if (ins.code == 8 ? !(m_.is_float(from) && m_.types[from].width == 32) : !m_.is_int(from, 32)) return error(status::kNotSupported);
+    if (ins.code == 8 ? !float32(from) : !m_.is_int(from, 32)) return error(status::kNotSupported);
     const Val r = new_wide(ins.result);
     if (r.kind == VK::None) return false;
     const uint32_t at = begin(opcode);
@@ -1220,7 +1246,7 @@ bool Translator::double_cast(const Instruction& ins, const Val& a) {
     case 4: opcode = 213; break;   // fptosi
     default: return error(status::kNotSupported);
   }
-  if (ins.code == 7 ? !(m_.is_float(ins.type) && m_.types[ins.type].width == 32) : !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
+  if (ins.code == 7 ? !float32(ins.type) : !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
   const Val r = new_scalar(ins.result);
   uint32_t scratch = 0;
   if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
@@ -1662,13 +1688,52 @@ bool Translator::i64_cast(const Instruction& ins, const Val& a) {
   return error(status::kNotSupported);
 }
 
+// A 16-bit integer's low half sign-extended: (x << 16) >> 16, in a register of its own.
+Val Translator::sign_extended_copy(const Val& v) {
+  Val t = scratch_word();
+  if (t.kind == VK::None) return t;
+  Val sixteen;
+  sixteen.kind = VK::Imm, sixteen.a = 16;
+  word_op(41, t, v, sixteen);
+  word_op(42, t, t, sixteen);
+  return t;
+}
+
+// After an instruction that makes a half, the result is rounded to one (the arithmetic itself is done in 32 bits); after one that makes a 16-bit integer, wrapped to 16 bits.
+bool Translator::narrow_result(const Instruction& ins) {
+  if (!ins.has_value || ins.result >= vals_.count()) return true;
+  const Val r = vals_[ins.result];
+  if (r.kind != VK::Temp || r.wide) return true;
+  if (half_type(ins.type)) {
+    word_op1(130, r, r);   // f32tof16: the half in the low bits
+    word_op1(131, r, r);   // and back
+  } else if (m_.is_int(ins.type, 16) && (ins.op == Op::Binop || ins.op == Op::Cast)) {
+    Val mask;
+    mask.kind = VK::Imm, mask.a = 0xFFFFu;
+    word_op(1, r, r, mask);
+  }
+  return true;
+}
+
 bool Translator::binop(const Instruction& ins) {
   const Val a = use(ins.operands[0]), b = use(ins.operands[1]);
   const bool floating = m_.is_float(ins.type);
   if (floating && m_.types[ins.type].width == 64) return double_binop(ins, a, b);
   if (m_.is_int(ins.type, 64)) return i64_binop(ins, a, b);
-  if (!floating && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 1)) return error(status::kNotSupported);   // (16 / 64-bit)
-  if (floating && m_.types[ins.type].width != 32) return error(status::kNotSupported);
+  if (!floating && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 16) && !m_.is_int(ins.type, 1)) return error(status::kNotSupported);
+  if (floating && !float32(ins.type)) return error(status::kNotSupported);
+  // (the signed operations of a 16-bit integer work on its sign-extended value)
+  const bool narrow_signed = m_.is_int(ins.type, 16) && (ins.code == 4 || ins.code == 6 || ins.code == 9);
+  if (narrow_signed) {
+    const Val sa = sign_extended_copy(a), sb = ins.code == 9 ? b : sign_extended_copy(b);
+    if (sa.kind == VK::None || sb.kind == VK::None) return false;
+    return binop_words(ins, sa, sb);
+  }
+  return binop_words(ins, a, b);
+}
+
+bool Translator::binop_words(const Instruction& ins, const Val& a, const Val& b) {
+  const bool floating = m_.is_float(ins.type);
   const Val r = new_scalar(ins.result, m_.is_int(ins.type, 1));
   if (r.kind == VK::None) return false;
   auto three = [&](uint32_t opcode, bool negate_b = false) {
@@ -1746,7 +1811,7 @@ bool Translator::compare(const Instruction& ins) {
   const bool floating = m_.is_float(operand_type);
   if (floating && m_.types[operand_type].width == 64) return double_compare(ins, a, b);
   if (m_.is_int(operand_type, 64)) return i64_compare(ins, a, b);
-  if (floating ? m_.types[operand_type].width != 32 : !m_.is_int(operand_type, 32) && !m_.is_int(operand_type, 1)) return error(status::kNotSupported);
+  if (floating ? !float32(operand_type) : !m_.is_int(operand_type, 32) && !m_.is_int(operand_type, 16) && !m_.is_int(operand_type, 1)) return error(status::kNotSupported);
   uint32_t opcode = 0;
   bool swap = false;
   if (floating) {
@@ -1774,11 +1839,17 @@ bool Translator::compare(const Instruction& ins) {
       default: return error(status::kNotSupported);
     }
   }
+  const bool signed_test = !floating && ins.code >= 38 && ins.code <= 41;
+  Val left = a, right = b;
+  if (signed_test && m_.is_int(operand_type, 16)) {   // (a 16-bit integer is compared as the signed number it is)
+    left = sign_extended_copy(a), right = sign_extended_copy(b);
+    if (left.kind == VK::None || right.kind == VK::None) return false;
+  }
   const Val r = new_scalar(ins.result, true);
   if (r.kind == VK::None) return false;
   const uint32_t at = begin(opcode);
   dst_scalar(r);
-  src(swap ? b : a), src(swap ? a : b);
+  src(swap ? right : left), src(swap ? left : right);
   finish(at);
   return define(ins.result, r);
 }
@@ -1794,6 +1865,49 @@ bool Translator::cast(const Instruction& ins) {
     return define(ins.result, v);
   }
   if (m_.is_int(ins.type, 64) || m_.is_int(from, 64)) return i64_cast(ins, a);
+  Val operand = a;
+  if (ins.code == 11 && (half_type(from) || half_type(ins.type))) {   // asuint16 / asfloat16
+    const Val r = new_scalar(ins.result);
+    if (r.kind == VK::None) return false;
+    if (half_type(from)) word_op1(130, r, a);
+    else word_op1(131, r, a);
+    return define(ins.result, r);
+  }
+  if ((ins.code == 7 || ins.code == 8) && float32(from) && float32(ins.type)) {   // fptrunc / fpext between half and float: a copy (the rounding follows)
+    const Val r = new_scalar(ins.result);
+    if (r.kind == VK::None) return false;
+    word_op1(54, r, a);
+    return define(ins.result, r);
+  }
+  if (ins.code == 0 && m_.is_int(ins.type, 16)) {   // trunc to 16 bits
+    const Val r = new_scalar(ins.result);
+    Val mask;
+    mask.kind = VK::Imm, mask.a = 0xFFFFu;
+    if (r.kind == VK::None) return false;
+    word_op(1, r, a, mask);
+    return define(ins.result, r);
+  }
+  if (ins.code == 2) {   // sext: from 16 bits to 32, or a boolean to 16 bits
+    const Val r = new_scalar(ins.result);
+    if (r.kind == VK::None) return false;
+    if (m_.is_int(from, 16)) {
+      Val sixteen;
+      sixteen.kind = VK::Imm, sixteen.a = 16;
+      word_op(41, r, a, sixteen);
+      word_op(42, r, r, sixteen);
+    } else if (m_.is_int(from, 1) && m_.is_int(ins.type, 16)) {
+      Val mask;
+      mask.kind = VK::Imm, mask.a = 0xFFFFu;
+      word_op(1, r, a, mask);
+    } else {
+      return error(status::kNotSupported);
+    }
+    return define(ins.result, r);
+  }
+  if (ins.code == 6 && m_.is_int(from, 16)) {   // sitofp of a 16-bit integer: of its signed value
+    operand = sign_extended_copy(a);
+    if (operand.kind == VK::None) return false;
+  }
   uint32_t opcode = 0;
   switch (ins.code) {
     case 3: opcode = 28; break;   // fptoui
@@ -1805,15 +1919,15 @@ bool Translator::cast(const Instruction& ins) {
       break;
     default: return error(status::kNotSupported);
   }
-  if ((ins.code >= 3 && ins.code <= 6) && ((m_.is_float(from) && m_.types[from].width != 32) || (m_.is_float(ins.type) && m_.types[ins.type].width != 32) ||
-                                         (m_.is_int(from) && m_.types[from].width != 32) || (m_.is_int(ins.type) && m_.types[ins.type].width != 32)))
+  if ((ins.code >= 3 && ins.code <= 6) && ((m_.is_float(from) && !float32(from)) || (m_.is_float(ins.type) && !float32(ins.type)) ||
+                                         (m_.is_int(from) && !m_.is_int(from, 32) && !m_.is_int(from, 16)) || (m_.is_int(ins.type) && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 16))))
     return error(status::kNotSupported);
   const Val r = new_scalar(ins.result, m_.is_int(ins.type, 1));
   if (r.kind == VK::None) return false;
   if (opcode) {
     const uint32_t at = begin(opcode);
     dst_scalar(r);
-    src(a);
+    src(operand);
     finish(at);
   } else {
     Val one;
@@ -2845,7 +2959,9 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     if (const Constant* c = constant(static_cast<uint32_t>(i))) {
       const uint32_t type = value_type(static_cast<uint32_t>(i));
       if ((c->kind == ConstantKind::Int && m_.is_int(type, 1)) ) v.kind = VK::Imm, v.a = c->bits & 1 ? 0xFFFFFFFFu : 0, v.is_mask = true;
-      else if (c->kind == ConstantKind::Int && (m_.is_int(type, 32) || m_.is_int(type, 8) || m_.is_int(type, 16))) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
+      else if (c->kind == ConstantKind::Int && (m_.is_int(type, 32) || m_.is_int(type, 8))) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
+      else if (c->kind == ConstantKind::Int && m_.is_int(type, 16)) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits) & 0xFFFFu;
+      else if (c->kind == ConstantKind::Float && half_type(type)) v.kind = VK::Imm, v.a = __builtin_bit_cast(uint32_t, graphics::half_to_float(static_cast<uint16_t>(c->bits)));
       else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 32) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
       else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 64) v.kind = VK::Imm, v.wide = true, v.a = static_cast<uint32_t>(c->bits), v.c = static_cast<uint32_t>(c->bits >> 32);
       else if (c->kind == ConstantKind::Int && m_.is_int(type, 64)) v.kind = VK::Imm, v.wide = true, v.a = static_cast<uint32_t>(c->bits), v.c = static_cast<uint32_t>(c->bits >> 32);
@@ -2886,7 +3002,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       const Instruction& phi = instruction_at(blk.first + i);
       if (phi.op != Op::Phi) break;
       const bool double_phi = wide_type(phi.type);
-      if (!double_phi && (m_.is_float(phi.type) ? m_.types[phi.type].width != 32 : !m_.is_int(phi.type, 32) && !m_.is_int(phi.type, 1))) return status::kNotSupported;
+      if (!double_phi && (m_.is_float(phi.type) ? !float32(phi.type) : !m_.is_int(phi.type, 32) && !m_.is_int(phi.type, 16) && !m_.is_int(phi.type, 1))) return status::kNotSupported;
       uint32_t reg = 0, comp = 0;
       if (!(double_phi ? alloc_wide(last_use_of(phi.result), &reg, &comp) : alloc_scalar(last_use_of(phi.result), &reg, &comp))) return status_;
       Val v;

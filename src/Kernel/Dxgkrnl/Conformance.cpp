@@ -551,6 +551,24 @@ void scene_dxil_return_in_loop(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// 16-bit types (dxil_ps_half_show.hlsl): halves rounded after each operation, 16-bit integers wrapped.
+void scene_dxil_16bit(Rig& rig, ArrayView<uint32_t> out) {
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_half_show, sizeof b::k_dxil_ps_half_show, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
 void scene_render_to_texture(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
@@ -2443,6 +2461,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL 64-bit integers (Shader Model 6)", scene_dxil_int64},
     {"Direct3D 12 reserved texture", scene_d3d12_tiled_texture},
     {"Direct3D 12 DXIL returns inside a loop (Shader Model 6)", scene_dxil_return_in_loop},
+    {"Direct3D 12 DXIL half floats and int16 (Shader Model 6)", scene_dxil_16bit},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},

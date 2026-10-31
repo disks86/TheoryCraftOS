@@ -1,6 +1,6 @@
 // Compiles an HLSL file to DXIL with a dxcompiler library (libdxcompiler.so): the way the tests/data/dxbc/dxil_*.dxil files were made.
 //   cc -o dxc_compile scripts/dxc_compile.c -ldl
-//   ./dxc_compile /path/to/libdxcompiler.so in.hlsl out.dxil ps_6_0 [entry]
+//   ./dxc_compile /path/to/libdxcompiler.so in.hlsl out.dxil ps_6_0 [entry [more dxc arguments, e.g. -enable-16bit-types]]
 // (-Vd: the validator of that library refuses the bitcode its own compiler writes for typed texture loads.)
 #include <dlfcn.h>
 #include <stdio.h>
@@ -28,11 +28,17 @@ int main(int argc, char** argv) {
   DxcBuffer buf = {src, (size_t)n, 65001};
   wchar_t prof[32], entry[32];
   mbstowcs(prof, argv[4], 32); mbstowcs(entry, argc > 5 ? argv[5] : "main", 32);
-  const wchar_t* args[] = {L"-T", prof, L"-E", entry, L"-Vd"};
+  const wchar_t* args[16] = {L"-T", prof, L"-E", entry, L"-Vd"};
+  unsigned arg_count = 5;
+  static wchar_t extra[8][64];
+  for (int i = 6; i < argc && arg_count < 16; ++i, ++arg_count) {
+    mbstowcs(extra[i - 6], argv[i], 64);
+    args[arg_count] = extra[i - 6];
+  }
   IUnk* result = 0;
   // IDxcCompiler3::Compile is slot 3
   typedef long (*CompileFn)(IUnk*, DxcBuffer*, const wchar_t**, unsigned, void*, const GUID_*, void**);
-  hr = ((CompileFn)compiler->v[3])(compiler, &buf, args, 5, 0, &iid_result, (void**)&result);
+  hr = ((CompileFn)compiler->v[3])(compiler, &buf, args, arg_count, 0, &iid_result, (void**)&result);
   if (hr) { fprintf(stderr, "compile: %lx\n", hr); return 1; }
   // IDxcOperationResult: GetStatus 3, GetResult 4, GetErrorBuffer 5
   int status = -1;

@@ -942,6 +942,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         store(ins.dst, b);
         break;
       }
+      case kF32ToF16: for (int i = 0; i < 4; ++i) r.f[i] = from_bits(graphics::float_to_half(a.f[i])); store(ins.dst, r); break;
+      case kF16ToF32: for (int i = 0; i < 4; ++i) r.f[i] = graphics::half_to_float(static_cast<uint16_t>(bits_of(a.f[i]) & 0xFFFFu)); store(ins.dst, r); break;
       case kDAdd: case kDMul: case kDDiv: case kDFma: case kDRcp: case kDMin: case kDMax: case kDMov: case kDMovc: {
         // doubles: the pairs the destination has in its mask (x y and / or z w)
         if (ins.src_count > 1) b = fetch(ins.src[1], 0);

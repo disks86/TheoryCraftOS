@@ -148,7 +148,7 @@ class Module {
 
   // The function bodies' results are in numbers above module_values per function: Function::first_value is where a function's start (its arguments).
   const Type* type_at(uint32_t id) const { return id < types.count() ? &types[id] : nullptr; }
-  bool is_float(uint32_t type) const { return type < types.count() && (types[type].kind == TypeKind::Float || types[type].kind == TypeKind::Double); }
+  bool is_float(uint32_t type) const { return type < types.count() && (types[type].kind == TypeKind::Float || types[type].kind == TypeKind::Double || types[type].kind == TypeKind::Half); }
   bool is_int(uint32_t type, uint32_t width = 0) const { return type < types.count() && types[type].kind == TypeKind::Int && (width == 0 || types[type].width == width); }
   const NamedMeta* find_named(StringView name) const {
     for (const NamedMeta& n : named.view())

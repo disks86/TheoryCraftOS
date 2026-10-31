@@ -5300,11 +5300,6 @@ void test_dxil() {
     UniquePointer<D3d9Program> translated;
     CHECK(load("dxil_ps_gather.dxil", &translated));
     if (translated) {
-      if (getenv("TGSI_DUMP")) {
-        String text(allocator);
-        translated->emit_tgsi(&text);
-        printf("%.*s\n", static_cast<int>(text.size()), text.data());
-      }
       for (uint32_t n = 0; n < 200; ++n) {
         graphics::Vec4 varyings[4] = {};
         varyings[2] = {random(0, 1), random(0, 1), 0, 0};
@@ -5636,6 +5631,46 @@ void test_dxil() {
         CHECK(same);
       }
       CHECK(inside > 100 && inside < 300);
+    }
+  }
+  // 16-bit types (min16 / native half, int16, uint16): results rounded to halves and wrapped to 16 bits after each operation, against the same function in C++.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_half.dxil", &translated));
+    if (translated) {
+      auto H = [](float x) { return graphics::half_to_float(graphics::float_to_half(x)); };
+      auto s16 = [](int32_t x) { return static_cast<int32_t>(static_cast<int16_t>(x)); };
+      unsigned checked = 0;
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 2), random(0, 2), random(0, 1), random(0, 1)};
+        varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+        const float hv[4] = {H(random(-2, 2)), H(random(-2, 2)), H(random(-2, 2)), H(random(-2, 2))};
+        const int16_t kv[4] = {static_cast<int16_t>(random(-100, 100)), static_cast<int16_t>(random(-300, 300)), static_cast<int16_t>(random(-20, 20)), static_cast<int16_t>(random(-100, 100))};
+        const int16_t divisor_shift = kv[2] == -3 ? 5 : kv[2];   // (a division by zero is for no one to compare)
+        uint8_t constants[128] = {};
+        ByteWriter cw(ByteView(constants, 16));
+        for (int i = 0; i < 4; ++i) cw.le16(graphics::float_to_half(hv[i]));
+        for (int i = 0; i < 4; ++i) cw.le16(static_cast<uint16_t>(i == 2 ? divisor_shift : kv[i]));
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw_ = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
+        const float a = H(cx), b = H(H(cy * 3.0f) + hv[0]);
+        const float s = H(H(a * b) + hv[1]), s_fused = H(a * b + hv[1]);
+        const float d = H(H(a + H(0.001f)) / H(b + H(1.5f)));
+        const float m = H((a > b ? a : b) - (a < hv[2] ? a : hv[2]));
+        const int32_t i = s16(s16(static_cast<int32_t>(cz * 200.0f)) - kv[0]), j = s16(s16(i * s16(static_cast<int32_t>(tx * 300.0f))) + kv[1]);
+        const uint32_t u = static_cast<uint16_t>(static_cast<int32_t>(ty * 60000.0f)), v = (u + static_cast<uint16_t>(static_cast<int32_t>(cw_ * 9000.0f))) & 0xFFFF;
+        const int32_t sh = s16(s16(j >> 3) + s16(i / s16(divisor_shift + 3)));
+        const float q = H(H(static_cast<float>(i)) * H(0.01f));
+        const float want[4] = {s * 0.1f + d, m + q, static_cast<float>(j) + static_cast<float>(sh) * 0.5f, static_cast<float>(v) + (u > v ? 1.0f : 0.0f) + (i < kv[3] ? 2.0f : 0.0f)};
+        const float want_fused[4] = {s_fused * 0.1f + d, want[1], want[2], want[3]};
+        const bool same = alive && (close_to(room[0].x, want[0]) || close_to(room[0].x, want_fused[0])) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 4) printf("  half #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+        ++checked;
+      }
+      CHECK(checked == 300);
     }
   }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
