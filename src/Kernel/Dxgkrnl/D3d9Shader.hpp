@@ -175,7 +175,7 @@ class D3d9Program {
   bool uses_barrier_ = false;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
-  bool uses_system_values_ = false, uses_texel_access_ = false;
+  bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false;
   uint32_t color_outputs_ = 1;
   uint32_t constant_registers_ = kPushConstantRegisters;
   List<Instruction> code_;

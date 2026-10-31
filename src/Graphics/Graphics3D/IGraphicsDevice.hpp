@@ -261,10 +261,12 @@ using TexturedFragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* c
 // (position: x and y window coordinates of the pixel's centre, z the depth, w one over the clip space w), whether the triangle faces the viewer (lines and points: true) and which
 // primitive of the draw it belongs to.
 struct VertexContext {
+  const ByteView* storage = nullptr;   // the storage buffers bound (kFeatureStorageInDraws): kMaxStorageBuffers views, the shader resource views of buffers in the slots after the unordered access ones
   uint32_t vertex_id = 0;     // the index of the vertex (or its number in a draw without indices), before the base vertex offset is added in
   uint32_t instance_id = 0;
 };
 struct FragmentContext {
+  const ByteView* storage = nullptr;   // ... as for the vertex shader
   Vec4 position;
   bool front_facing = true;
   uint32_t primitive_id = 0;
@@ -623,6 +625,7 @@ enum DeviceFeature : uint32_t {
   kFeatureLines = 1u << 4,         // set_primitive_topology: lines and points
   kFeatureFloatFormats = 1u << 6,      // Format::R16G16B16A16Float / R32G32B32A32Float images: colour attachments (also several at once) and sampled textures, without mipmaps; read_pixels_float / write_pixels_float
   kFeatureTessellation = 1u << 16,     // ShaderStage::Hull / Domain, GraphicsPipelineDesc::hull_shader / domain_shader, PrimitiveTopology::PatchList
+  kFeatureStorageInDraws = 1u << 23,     // read-only storage buffers (bind_storage_buffer in the slots after the unordered access ones, also inside a pass) read by vertex and pixel shaders
   kFeatureTimestampQueries = 1u << 22,   // QueryKind::Timestamp
   kFeatureStreamOutput = 1u << 21,       // GraphicsPipelineDesc::stream_output, ICommandBuffer::bind_stream_output, kBufferStreamOutput buffers, ShaderModuleDesc::geometry_streams
   kFeatureDepthResolve = 1u << 19,       // resolve_image of a multisampled depth image (sample 0)

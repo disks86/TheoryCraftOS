@@ -849,7 +849,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     VirglBuffer* buffer = nullptr;
     uint64_t offset = 0, size = 0;
   } storage[kMaxStorageBuffers];
-  bool storage_dirty = false, compute_constants_dirty = false;
+  bool storage_dirty = false, draw_storage_dirty = false, compute_constants_dirty = false;
   // Stream output: the buffers bound (kept here) and the host's target objects for them. The objects are made when a draw with stream output first needs them and live to the end of the submit:
   // the host's transform feedback goes on in them from draw to draw (the position in the buffers is the host's) and only ends when they are destroyed; it can only go on with the program it
   // began with, so another program that draws stream output ends it (and the buffers start again where they were bound). It makes the draws of other programs fail unless the targets are not
@@ -1096,9 +1096,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
-        if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
+        if ((in_pass && cmd.unit < kMaxUavBuffers) || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (a read-only view may change between draws)
         storage[cmd.unit] = {static_cast<VirglBuffer*>(cmd.buffer), cmd.offset, cmd.count};
         storage_dirty = true;
+        if (cmd.unit >= kMaxUavBuffers) draw_storage_dirty = true;
         break;
       case RecordedCommand::Type::Dispatch: {
         if (in_pass || !compute) return false;
@@ -1261,6 +1262,25 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         if (pipeline->desc().stream_output_count && !begin_stream_output()) return false;
+        if (draw_storage_dirty) {
+          // The views of buffers the vertex and pixel shaders read, from the host's binding point 0 (their TGSI numbers them that way); the compute shader's bindings are made again before a dispatch.
+          uint32_t slots = 0;
+          for (uint32_t k = kMaxUavBuffers; k < kMaxStorageBuffers; ++k)
+            if (storage[k].buffer) slots = k + 1 - kMaxUavBuffers;
+          for (uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment}) {
+            stream.command(virgl::kSetShaderBuffers, 0, 2 + 3 * slots);
+            stream.put(stage);
+            stream.put(0);
+            for (uint32_t k = 0; k < slots; ++k) {
+              const StorageBinding& view = storage[kMaxUavBuffers + k];
+              stream.put(static_cast<uint32_t>(view.offset));
+              stream.put(static_cast<uint32_t>(view.size));
+              stream.put(view.buffer ? view.buffer->id() : 0);
+            }
+          }
+          storage_dirty = true;
+          draw_storage_dirty = false;
+        }
         if (const uint32_t unit_count = pipeline->desc().texture_count) {
           for (uint32_t unit = 0; unit < unit_count; ++unit)
             if (!textures[unit] || textures[unit] == color || textures[unit] == depth) return false;   // unbound, or the image being drawn into

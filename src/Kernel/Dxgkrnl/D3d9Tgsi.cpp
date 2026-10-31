@@ -879,7 +879,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
         shared_used_ = true;
       } else {
         add(buffer, "BUFFER[");
-        add_uint(buffer, ins.uav);
+        add_uint(buffer, compute_ ? ins.uav : ins.uav - graphics::kMaxUavBuffers);   // (a vertex or pixel shader numbers its views from 0: the host's binding points are the ones of the compute shader otherwise)
         add(buffer, "]");
         buffer_used_[ins.uav] = true;
       }
@@ -1491,6 +1491,14 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "], ");
       add(*out, dimension_name(p_.texture_kind(i)));
       add(*out, ", FLOAT\n");
+    }
+  }
+  if (!compute_ && !geometry_ && !hull_ && !domain_) {   // (the views of buffers a vertex or pixel shader reads)
+    for (uint32_t i = 0; i < graphics::kMaxStorageBuffers; ++i) {
+      if (!buffer_used_[i]) continue;
+      add(*out, "DCL BUFFER[");
+      add_uint(*out, i - graphics::kMaxUavBuffers);
+      add(*out, "]\n");
     }
   }
   add(*out, "DCL CONST[0..");

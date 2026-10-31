@@ -551,6 +551,53 @@ void scene_dxil_return_in_loop(Rig& rig, ArrayView<uint32_t> out) {
   rig.read(target, out);
 }
 
+// Views of buffers in a pixel shader (dxil_ps_srv.hlsl): a structured buffer of uint4 and a byte address buffer, bound outside the pass to the slots after the unordered access ones.
+void scene_dxil_pixel_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStorageInDraws)) return void(rig.step("buffers in draws", status::kNotSupported));
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_srv, sizeof b::k_dxil_ps_srv, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  ByteBuffer structured(rig.allocator()), raw(rig.allocator());
+  for (uint32_t i = 0; i < 32 * 4; ++i) structured.put32(0x9E3779B9u * (i + 1));
+  for (uint32_t i = 0; i < 16; ++i) raw.put32(0x85EBCA6Bu * (i + 3));
+  Handle s = rig.buffer(kAllocUnorderedAccess, structured.view()), r = rig.buffer(kAllocUnorderedAccess, raw.view());
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, 32 * 16);
+  w.bind_uav(graphics::kMaxUavBuffers + 1, 3, 0, 16 * 4);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, s, r});
+  rig.read(target, out);
+}
+
+// A view of a buffer in a vertex shader (dxil_vs_srv.hlsl): the corners of a triangle moved by a table indexed by SV_VertexID.
+void scene_dxil_vertex_buffers(Rig& rig, ArrayView<uint32_t> out) {
+  if (!rig.has(graphics::kFeatureStorageInDraws | graphics::kFeatureSystemInputs)) return void(rig.step("buffers in draws", status::kNotSupported));
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_dxil_vs_srv, sizeof b::k_dxil_vs_srv, b::k_ps_color, sizeof b::k_ps_color, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  const Vertex v[3] = {{-0.6f, -0.6f, 0.5f, 1, 0, 0, 1}, {0.6f, -0.6f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.6f, 0.5f, 0, 0, 1, 1}};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  const float offsets[16] = {-0.2f, -0.1f, 0, 1.0f, 0.3f, -0.2f, 0, 0.5f, 0.0f, 0.3f, 0, 0.8f, 0, 0, 0, 1.0f};
+  Handle table = rig.buffer(kAllocUnorderedAccess, bytes_of(offsets, sizeof offsets));
+  CommandWriter w(rig.allocator());
+  w.bind_uav(graphics::kMaxUavBuffers, 2, 0, sizeof offsets);
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb, table});
+  rig.read(target, out);
+}
+
 // 16-bit types (dxil_ps_half_show.hlsl): halves rounded after each operation, 16-bit integers wrapped.
 void scene_dxil_16bit(Rig& rig, ArrayView<uint32_t> out) {
   const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
@@ -2462,6 +2509,8 @@ const Entry kScenes[] = {
     {"Direct3D 12 reserved texture", scene_d3d12_tiled_texture},
     {"Direct3D 12 DXIL returns inside a loop (Shader Model 6)", scene_dxil_return_in_loop},
     {"Direct3D 12 DXIL half floats and int16 (Shader Model 6)", scene_dxil_16bit},
+    {"Direct3D 12 DXIL buffer views in a pixel shader (Shader Model 6)", scene_dxil_pixel_buffers},
+    {"Direct3D 12 DXIL buffer views in a vertex shader (Shader Model 6)", scene_dxil_vertex_buffers},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},

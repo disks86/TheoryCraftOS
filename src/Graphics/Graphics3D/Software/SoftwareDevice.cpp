@@ -567,6 +567,7 @@ struct DrawState {
   Rect2D scissor;  // already clamped to the target
   TextureSet textures;
   const uint8_t* constants = nullptr;
+  const ByteView* storage = nullptr;   // the storage buffers the shaders of a draw can read
   uint8_t constants_storage[kMaxPushConstantBytes] = {};
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
   uint32_t sample_count = 1;   // samples per pixel of the pass's images
@@ -751,8 +752,10 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
 }
 
 // Runs the pipeline's fragment shader; false if it discarded the pixel.
-bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& context, Vec4* color) {
+bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& given, Vec4* color) {
   if (s.ps_invocations) ++*s.ps_invocations;
+  FragmentContext context = given;
+  context.storage = s.storage;
   if (s.pipeline->fragment_ex()) return s.pipeline->fragment_ex()(varying, context, s.constants, s.textures, color);
   if (s.pipeline->textured()) return s.pipeline->textured()(varying, s.constants, s.textures, color);
   return s.pipeline->fragment()(varying, s.constants, color);
@@ -1429,6 +1432,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   };
   const SoftwareComputePipeline* compute = nullptr;
   ByteView storage[kMaxStorageBuffers];
+  s.storage = storage;
   DrawState::StreamOutputTarget stream_output[kMaxStreamOutputBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
@@ -1576,7 +1580,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer: {
-        if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
+        if ((in_pass && cmd.unit < kMaxUavBuffers) || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (a read-only view may change between draws)
         ByteView whole = cmd.buffer->map(), part;
         if (!whole.try_subview(cmd.offset, cmd.count, &part)) return false;
         storage[cmd.unit] = part;
@@ -1727,6 +1731,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           VertexContext context;
           context.vertex_id = static_cast<uint32_t>(v);
           context.instance_id = cmd.first_instance + instance;
+          context.storage = s.storage;
           ++stat_vs;
           *out = run_vertex_shader(*s.pipeline, vertices, byte, instance_byte, s.constants, context);
           return true;

@@ -3128,7 +3128,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     const Resource& r = res_[0][i];
     if (!r.present) continue;
     if (r.kind == 11 || r.kind == 12) {   // (a raw or structured buffer view: a read-only storage buffer of a compute shader)
-      if (!compute || r.lower >= graphics::kMaxSrvBuffers) return status::kNotSupported;
+      if (r.lower >= graphics::kMaxSrvBuffers || geometry || domain) return status::kNotSupported;   // (the views are read by compute, vertex and pixel shaders)
       if (r.kind == 12) word(162u | (4u << 24)), word((7u << 12) | (1u << 20)), word(r.lower), word(r.stride);
       else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
       continue;

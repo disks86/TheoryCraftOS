@@ -5034,6 +5034,84 @@ void test_d3d12_reserved_texture() {
   CHECK(first == 1 && second == 1 && black == 2);
 }
 
+
+// Views of buffers in a draw through a root signature: the root descriptor (t0) and a table entry (t1) reach the pixel shader, and the picture is the one a direct bind gives.
+void test_d3d12_buffer_views_in_draw() {
+  Env e;
+  namespace b = conformance_blobs;
+  Handle vs = 0, ps = 0, pipe = 0;
+  ShaderDesc sd;
+  sd.kind = ShaderKind::Dxbc, sd.stage = graphics::ShaderStage::Vertex, sd.code = ConstByteView(b::k_vs, sizeof b::k_vs);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &vs) == status::kSuccess);
+  sd.stage = graphics::ShaderStage::Fragment, sd.code = ConstByteView(b::k_dxil_ps_srv, sizeof b::k_dxil_ps_srv);
+  CHECK(e.kernel.create_shader(kPid, e.dev, sd, &ps) == status::kSuccess);
+  PipelineDesc pd;
+  pd.vertex_shader = vs, pd.fragment_shader = ps, pd.vertex_stride = 28, pd.attribute_count = 2, pd.varying_count = 3;
+  pd.attributes[0] = {0, graphics::VertexFormat::Float3, 0};
+  pd.attributes[1] = {1, graphics::VertexFormat::Float4, 12};
+  pd.cull_mode = graphics::CullMode::None;
+  CHECK(e.kernel.create_pipeline(kPid, e.dev, pd, &pipe) == status::kSuccess);
+  Handle target = e.alloc(kTarget, Format::A8R8G8B8, 8, 8), vb = e.buffer(kAllocVertexBuffer, 3 * 28);
+  const float tri[21] = {-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1, 3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1, -1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1};
+  CHECK(e.write(vb, floats(tri, 21)));
+  Handle structured = e.buffer(kAllocUnorderedAccess, 32 * 16), raw = e.buffer(kAllocUnorderedAccess, 64);
+  std::vector<uint32_t> a(32 * 4), r(16);
+  for (uint32_t i = 0; i < a.size(); ++i) a[i] = 0x9E3779B9u * (i + 1);
+  for (uint32_t i = 0; i < r.size(); ++i) r[i] = 0x85EBCA6Bu * (i + 3);
+  CHECK(e.write(structured, ConstByteView(reinterpret_cast<const uint8_t*>(a.data()), 512)) && e.write(raw, ConstByteView(reinterpret_cast<const uint8_t*>(r.data()), 64)));
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  // direct
+  {
+    CommandWriter w(e.allocator);
+    w.bind_uav(graphics::kMaxUavBuffers, 2, 0, 512);
+    w.bind_uav(graphics::kMaxUavBuffers + 1, 3, 0, 64);
+    w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+    w.bind_pipeline(pipe);
+    w.bind_vertex_buffer(1);
+    w.push_constants(floats(identity, 16));
+    w.draw(3);
+    w.end_pass();
+    CHECK(e.render(w, {target, vb, structured, raw}) == status::kSuccess);
+  }
+  std::vector<uint32_t> direct;
+  for (uint32_t y = 0; y < 8; ++y)
+    for (uint32_t x = 0; x < 8; ++x) direct.push_back(e.pixel(target, x, y));
+  CHECK(direct[4 * 8 + 4] != 0);
+  // through a root signature: t0 a root descriptor, t1 a table entry
+  const std::vector<uint8_t> blob = serialize_signature(1, {{3, 0, {}, 0, 0, 0}, {0, 0, {{0, 1, 1, 0, 0}}}});
+  Handle sig = 0, views = 0;
+  CHECK(e.kernel.create_root_signature(kPid, e.dev, ConstByteView(blob.data(), blob.size()), &sig) == status::kSuccess);
+  CHECK(e.kernel.create_descriptor_heap(kPid, e.dev, DescriptorHeapType::CbvSrvUav, 1, &views) == status::kSuccess);
+  DescriptorDesc srv;
+  srv.kind = DescriptorKind::Srv, srv.allocation = raw;
+  CHECK(e.kernel.write_descriptor(kPid, views, 0, srv) == status::kSuccess);
+  CommandWriter w(e.allocator);
+  w.set_root_signature(sig);
+  w.set_descriptor_heaps({views});
+  w.set_root_descriptor(0, 2, 0);
+  w.set_root_table(1, 0);
+  w.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(floats(identity, 16));
+  w.draw(3);
+  w.end_pass();
+  CHECK(e.render(w, {target, vb, structured, raw}) == status::kSuccess);
+  bool same = true;
+  for (uint32_t y = 0; y < 8; ++y)
+    for (uint32_t x = 0; x < 8; ++x) same = same && e.pixel(target, x, y) == direct[y * 8 + x];
+  CHECK(same);
+  // A draw whose shader reads a view nobody bound is refused.
+  CommandWriter bad(e.allocator);
+  bad.begin_pass(0, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0);
+  bad.bind_pipeline(pipe);
+  bad.bind_vertex_buffer(1);
+  bad.push_constants(floats(identity, 16));
+  bad.draw(3);
+  bad.end_pass();
+  CHECK(e.render(bad, {target, vb}) == status::kInvalidParameter);
+}
+
 // Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
 void test_d3d12_barriers() {
   Env e;
@@ -5673,6 +5751,37 @@ void test_dxil() {
       CHECK(checked == 300);
     }
   }
+  // Views of buffers in a pixel shader (a structured and a byte address buffer, read by index): the FragmentContext carries the bound buffers.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_srv.dxil", &translated));
+    if (translated) {
+      CHECK((translated->required_features() & graphics::kFeatureStorageInDraws) != 0);
+      std::vector<uint32_t> structured(32 * 4), raw(16);
+      for (uint32_t i = 0; i < structured.size(); ++i) structured[i] = 0x9E3779B9u * (i + 1);
+      for (uint32_t i = 0; i < raw.size(); ++i) raw[i] = 0x85EBCA6Bu * (i + 3);
+      ByteView views[graphics::kMaxStorageBuffers];
+      views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(structured.data()), structured.size() * 4);
+      views[graphics::kMaxUavBuffers + 1] = ByteView(reinterpret_cast<uint8_t*>(raw.data()), raw.size() * 4);
+      for (uint32_t n = 0; n < 200; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0, 1), random(0, 1), random(0, 1), 0};
+        varyings[2] = {random(0, 1), 0, 0, 0};
+        graphics::FragmentContext context;
+        context.storage = views;
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, context, constants, &textures, room);
+        const uint32_t i = static_cast<uint32_t>(varyings[0].x * 7.99f) * 4 + static_cast<uint32_t>(varyings[0].y * 3.99f);
+        const uint32_t r = raw[static_cast<uint32_t>(varyings[2].x * 3.99f) + static_cast<uint32_t>(varyings[0].z * 3.99f)];
+        const float want[4] = {static_cast<float>(structured[4 * i] & 255) / 255.0f, static_cast<float>(structured[4 * i + 1] & 255) / 255.0f, static_cast<float>((structured[4 * i + 2] ^ r) & 255) / 255.0f,
+                               static_cast<float>((structured[4 * i + 3] + r) & 255) / 255.0f};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  ps srv #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;
@@ -5722,6 +5831,32 @@ void test_dxil() {
   }
 
 
+  // A view of a buffer in a vertex shader, indexed by SV_VertexID.
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_vs_srv.dxil", &translated));
+    if (translated) {
+      CHECK((translated->required_features() & graphics::kFeatureStorageInDraws) != 0);
+      float table[16];
+      for (float& f : table) f = random(-1, 1);
+      ByteView views[graphics::kMaxStorageBuffers];
+      views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(table), sizeof table);
+      for (uint32_t n = 0; n < 100; ++n) {
+        graphics::Vec4 attributes[4] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
+        graphics::VertexContext context;
+        context.vertex_id = n;
+        context.storage = views;
+        uint8_t constants[128] = {};
+        graphics::ShaderIo io = {};
+        translated->run_vertex_ex(attributes, constants, context, &io);
+        const float* d = table + 4 * (n & 3);
+        const bool same = close_to(io.position.x, attributes[0].x + d[0]) && close_to(io.position.y, -(attributes[0].y + d[1])) && close_to(io.position.z, attributes[0].z + d[2]) && close_to(io.varying[0].x, attributes[1].x * d[3]) &&
+                          close_to(io.varying[0].w, attributes[1].w * d[3]) && close_to(io.varying[2].x, attributes[0].x + d[3]) && close_to(io.varying[2].y, attributes[0].y + 0.5f);
+        if (!same && n < 3) printf("  vs srv #%u: %g %g %g wants %g %g %g\n", n, io.position.x, io.position.y, io.position.z, attributes[0].x + d[0], -(attributes[0].y + d[1]), attributes[0].z + d[2]);
+        CHECK(same);
+      }
+    }
+  }
   // A geometry shader: the vertices it emits and where it cut the strip.
   {
     UniquePointer<D3d9Program> reference, translated;
@@ -7487,6 +7622,7 @@ int main() {
   test_d3d12_binding();
   test_d3d12_compute();
   test_d3d12_buffer_views();
+  test_d3d12_buffer_views_in_draw();
   test_d3d12_barriers();
   test_d3d12_heaps();
   test_d3d12_reserved();

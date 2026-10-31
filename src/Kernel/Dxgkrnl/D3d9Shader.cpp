@@ -72,6 +72,7 @@ struct D3d9Program::State {
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
   const graphics::ComputeContext* compute = nullptr;
+  const ByteView* storage = nullptr;   // the storage buffers: a compute shader's, or those a draw's shaders can read (kMaxStorageBuffers views)
   const graphics::GeometryInputData* geometry_in = nullptr;
   const graphics::HullInputData* hull_in = nullptr;        // a hull shader's input control points
   const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
@@ -133,7 +134,7 @@ uint32_t D3d9Program::required_features() const {
   if (stage_ == graphics::ShaderStage::Geometry) kinds |= graphics::kFeatureGeometryShaders;
   if (stage_ == graphics::ShaderStage::Hull || stage_ == graphics::ShaderStage::Domain) kinds |= graphics::kFeatureTessellation;
   return kinds | (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
-         (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u);
+         (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u) | (uses_graphics_storage_ ? graphics::kFeatureStorageInDraws : 0u);
 }
 
 bool d3d9_op_writes_register(uint16_t op) {
@@ -594,6 +595,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       other.varyings = varyings;
       other.constants = s.constants;
       other.textures = s.textures;
+      other.storage = s.storage;
       for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
       other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
       other.fragment = f;
@@ -709,8 +711,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         if (s.geometry_out && ins.control < graphics::kMaxGeometryStreams && s.stream_vertices[ins.control]) s.geometry_cut[ins.control] = true;
         break;
       case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
-        if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories) break;
-        const ByteView buffer = ins.uav < graphics::kMaxStorageBuffers ? s.compute->buffers[ins.uav] : s.compute->shared[ins.uav - graphics::kMaxStorageBuffers];
+        if (ins.uav >= graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories || (ins.uav < graphics::kMaxStorageBuffers ? !s.storage : !s.compute)) break;
+        const ByteView buffer = ins.uav < graphics::kMaxStorageBuffers ? s.storage[ins.uav] : s.compute->shared[ins.uav - graphics::kMaxStorageBuffers];
         // The byte address: a raw buffer's is the address; a structured one's the structure number times the stride plus the offset (an atomic gives both in one register).
         uint64_t address = bits_of(a.f[0]);
         if (ins.stride) {
@@ -1097,6 +1099,7 @@ void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t*
   s.constants = constants;
   s.sys[kSysVertexId].f[0] = from_bits(context.vertex_id);
   s.sys[kSysInstanceId].f[0] = from_bits(context.instance_id);
+  s.storage = context.storage;
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};   // (Direct3D's +Y up to the device's +Y down)
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
@@ -1116,6 +1119,7 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysFrontFacing].f[0] = from_bits(context.front_facing ? 0xFFFFFFFFu : 0u);
   s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
   s.fragment = &context;
+  s.storage = context.storage;
   execute(s);
   if (s.killed) return false;
   for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};
@@ -1177,6 +1181,7 @@ void D3d9Program::run_compute(const graphics::ComputeContext& context, const uin
   State s;
   s.constants = constants;
   s.compute = &context;
+  s.storage = context.buffers;
   for (uint32_t k = 0; k < 3; ++k) {
     s.sys[kSysDispatchThreadId].f[k] = from_bits(context.dispatch_id[k]);
     s.sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
@@ -1214,6 +1219,7 @@ void D3d9Program::run_compute_group(const graphics::ComputeContext& context, con
       State* s = new (&states[constructed]) State();
       s->constants = constants;
       s->compute = &group;
+      s->storage = group.buffers;
       const uint32_t i = constructed;
       const uint32_t tx = i % thread_group_[0], ty = (i / thread_group_[0]) % thread_group_[1], tz = i / (thread_group_[0] * thread_group_[1]);
       const uint32_t id[3] = {tx, ty, tz};
