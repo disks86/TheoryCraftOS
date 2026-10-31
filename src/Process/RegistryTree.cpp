@@ -52,7 +52,7 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
   keys_.push_back(static_cast<UniquePointer<RegKey>&&>(root));
   static const char* const kHives[] = {"MACHINE\\HARDWARE", "MACHINE\\SAM", "MACHINE\\SECURITY", "MACHINE\\SOFTWARE\\Classes", "MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion",
                                        "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "MACHINE\\SYSTEM\\CurrentControlSet\\Control", "MACHINE\\SYSTEM\\CurrentControlSet\\Services",
-                                       "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", "USER\\.DEFAULT", "USER\\S-1-5-21-0-0-0-1000\\Software\\Microsoft\\Windows\\CurrentVersion",
+                                       "MACHINE\\SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current", "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", "MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug", "USER\\.DEFAULT", "USER\\S-1-5-21-0-0-0-1000\\Software\\Microsoft\\Windows\\CurrentVersion",
                                        "USER\\S-1-5-21-0-0-0-1000\\Environment", "USER\\S-1-5-21-0-0-0-1000\\Volatile Environment", "USER\\S-1-5-21-0-0-0-1000\\Control Panel"};
   for (const char* path : kHives) {      // every level, one after the other: a path is made one key at a time
     const StringView whole(path);

@@ -141,6 +141,8 @@ class IProcessRuntime {
   virtual uint32_t spawn_process(const ChildSpec& spec) { (void)spec; return 0xC0000002u; }
   virtual bool terminate_process(uint64_t pid, uint32_t code) { (void)pid; (void)code; return false; }
   virtual bool resume_process(uint64_t pid) { (void)pid; return false; }
+  // A program made suspended whose first thread has not been resumed yet (it has run nothing).
+  virtual bool process_not_started(uint64_t pid) { (void)pid; return false; }
   // The machine: how many cores threads can run on, and the memory.
   virtual uint32_t processor_count() { return 1; }
   virtual void memory_status(uint64_t* total_bytes, uint64_t* free_bytes) { *total_bytes = *free_bytes = 0; }
@@ -162,7 +164,7 @@ class IProcessRuntime {
   // Work on the memory and threads of another running program (by process id). The runtime takes that program's lock and gives up the caller's meanwhile; the work is done by
   // windowsabi::run_remote(). Returns an NTSTATUS.
   struct RemoteOp {
-    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo, MapView, Duplicate, GetContext, SetContext, SuspendThread, TakeHandle } kind = Read;
+    enum Kind : uint8_t { Read, Write, Allocate, Free, Protect, Query, CreateThread, ThreadStatus, TerminateThread, ResumeThread, Unmap, ProcessInfo, MapView, Duplicate, GetContext, SetContext, SuspendThread, TakeHandle, ReleaseThread } kind = Read;
     uint64_t address = 0, size = 0;       // Allocate/Free/Protect: in and out (as the NT services have them); Read/Write: the address; CreateThread: the start routine; thread calls: the thread id
     ByteView out;                         // Read: where the bytes go
     ConstByteView in;                     // Write: the bytes
@@ -279,6 +281,7 @@ class Process {
     uint64_t id = 0;
     bool used = false, started = false, finished = false;
     int32_t suspend_count = 0;                        // SuspendThread calls not yet undone (a thread created suspended starts at 1)
+    bool debug_hold = false;                          // a thread of a debugged program is not started until the debugger has continued the event that reported it (ReleaseThread)
     uint32_t exit_code = 259;                         // STILL_ACTIVE
     uint64_t extra_tls[kMaxTlsModules] = {};          // blocks of libraries loaded after the thread began: [index] = base (each is one region of extra_tls_size[index] bytes)
     uint64_t extra_tls_size[kMaxTlsModules] = {};

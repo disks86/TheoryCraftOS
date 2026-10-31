@@ -437,6 +437,7 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
     case IProcessRuntime::RemoteOp::TerminateThread: return terminate_thread_in(target, op.thread_id, uint32_t(op.size));
     case IProcessRuntime::RemoteOp::ResumeThread: return resume_thread_in(target, op.thread_id, &op.size);
     case IProcessRuntime::RemoteOp::SuspendThread: return suspend_thread_in(target, op.thread_id, &op.size);
+    case IProcessRuntime::RemoteOp::ReleaseThread: return release_debug_hold_in(target, op.thread_id);
     case IProcessRuntime::RemoteOp::GetContext: return context_in(target, op.thread_id, false, op.context);
     case IProcessRuntime::RemoteOp::SetContext: return context_in(target, op.thread_id, true, op.context);
     case IProcessRuntime::RemoteOp::Unmap: return unmap_view_in(target, op.address);

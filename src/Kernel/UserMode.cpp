@@ -1062,6 +1062,10 @@ bool Task::resume_process(uint64_t pid) {
   return with_child(*this, pid, [&](Child* c) { return resume_child(c); });
 }
 
+bool Task::process_not_started(uint64_t pid) {
+  return with_child(*this, pid, [&](Child* c) { return !c->started; });
+}
+
 void Task::reap_children(bool all) {
   Child** link = &children;
   while (*link) {

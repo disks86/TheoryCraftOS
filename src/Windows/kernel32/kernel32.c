@@ -2645,6 +2645,76 @@ EXPORT void WINAPI GetSystemTime(LPSYSTEMTIME st) { FILETIME ft; GetSystemTimeAs
 /* Exception handling lives in ntdll.dll (src/Windows/ntdll/except.inc); kernel32 gives programs the names they know. RtlUnwindEx, RtlVirtualUnwind and the others
  * are forwarded to ntdll by kernel32.def. */
 EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter) { return RtlSetUnhandledExceptionFilter(filter); }
+/* The post-mortem debugger of HKLM\Software\Microsoft\Windows NT\CurrentVersion\AeDebug: when the crashed program has no debugger and the key's Debugger value names one
+ * (and Auto is not 0), it is started with the process id and an event (inheritable) in place of the two %ld, and the crashed program waits until the debugger has
+ * attached and set the event, or has exited. TRUE: it attached (the exception then goes to it as a second chance). */
+VOID NTAPI RtlInitUnicodeString(PUNICODE_STRING dst, PCWSTR src);
+IMPORT NTSTATUS NTAPI NtOpenKey(PHANDLE, ULONG, POBJECT_ATTRIBUTES);
+IMPORT NTSTATUS NTAPI NtQueryValueKey(HANDLE, PUNICODE_STRING, ULONG, PVOID, ULONG, PULONG);
+typedef struct { ULONG TitleIndex, Type, DataLength; BYTE Data[1]; } AE_PARTIAL_VALUE;      /* (KEY_VALUE_PARTIAL_INFORMATION) */
+static BOOL ae_debug_value(HANDLE key, const WCHAR *name, WCHAR *out, ULONG capacity) {
+  UNICODE_STRING value;
+  RtlInitUnicodeString(&value, name);
+  BYTE buffer[16 + 1040] __attribute__((aligned(8)));
+  ULONG length = 0;
+  if (!NT_SUCCESS(NtQueryValueKey(key, &value, 2 /* KeyValuePartialInformation */, buffer, sizeof(buffer), &length)) || length < 12) return FALSE;
+  const AE_PARTIAL_VALUE *info = (const AE_PARTIAL_VALUE *)buffer;
+  ULONG n = info->DataLength / 2;
+  if (n > (length - 12) / 2) n = (length - 12) / 2;
+  if (n >= capacity) n = capacity - 1;
+  memcpy(out, info->Data, n * 2);
+  out[n] = 0;
+  return TRUE;
+}
+static SIZE_T ae_debug_put_number(WCHAR *at, ULONG64 number) {
+  WCHAR digits[24];
+  SIZE_T n = 0, k = 0;
+  do { digits[n++] = (WCHAR)('0' + number % 10); number /= 10; } while (number);
+  while (n) at[k++] = digits[--n];
+  return k;
+}
+static BOOL start_ae_debugger(void) {
+  static const WCHAR path[] = L"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug";
+  UNICODE_STRING name;
+  RtlInitUnicodeString(&name, path);
+  OBJECT_ATTRIBUTES attributes = {sizeof(attributes), NULL, &name, 0x40, NULL, NULL};
+  HANDLE key = NULL;
+  if (!NT_SUCCESS(NtOpenKey(&key, 0x20019, &attributes))) return FALSE;
+  WCHAR format[512], automatic[16], command[600];
+  BOOL have = ae_debug_value(key, L"Debugger", format, 512) && format[0];
+  if (have && ae_debug_value(key, L"Auto", automatic, 16) && automatic[0] == '0') have = FALSE;
+  NtClose(key);
+  if (!have) return FALSE;
+  SECURITY_ATTRIBUTES inheritable = {sizeof(inheritable), NULL, TRUE};
+  HANDLE event = CreateEventW(&inheritable, TRUE, FALSE, NULL);
+  if (!event) return FALSE;
+  SIZE_T n = 0;
+  int numbers = 0;
+  for (const WCHAR *c = format; *c && n < 560; ++c) {
+    if (c[0] == '%' && c[1] == 'l' && c[2] == 'd' && numbers < 2) {
+      n += ae_debug_put_number(command + n, numbers == 0 ? (ULONG64)GetCurrentProcessId() : (ULONG64)(ULONG_PTR)event);
+      ++numbers;
+      c += 2;
+    } else if (c[0] == '%' && c[1] == '%') {
+      command[n++] = '%';
+      ++c;
+    } else command[n++] = *c;
+  }
+  command[n] = 0;
+  STARTUPINFOW startup;
+  PROCESS_INFORMATION info;
+  memset(&startup, 0, sizeof(startup));
+  startup.cb = sizeof(startup);
+  BOOL attached = FALSE;
+  if (CreateProcessW(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &info)) {
+    HANDLE waits[2] = {event, info.hProcess};
+    attached = WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0;
+    CloseHandle(info.hThread);
+    CloseHandle(info.hProcess);
+  }
+  CloseHandle(event);
+  return attached;
+}
 EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) {
   LPTOP_LEVEL_EXCEPTION_FILTER filter = RtlSetUnhandledExceptionFilter(NULL);      /* (read it, put it back) */
   RtlSetUnhandledExceptionFilter(filter);
@@ -2653,6 +2723,7 @@ EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) {
   NtQueryInformationProcess(NtCurrentProcess(), 7 /* ProcessDebugPort */, &port, sizeof(port), NULL);
   if (port) return EXCEPTION_CONTINUE_SEARCH;      /* (the debugger gets the second chance) */
   if (filter) { const LONG answer = filter(info); if (answer != EXCEPTION_CONTINUE_SEARCH) return answer; }
+  if (!(GetErrorMode() & 0x0002u /* SEM_NOGPFAULTERRORBOX */) && start_ae_debugger()) return EXCEPTION_CONTINUE_SEARCH;      /* (the exception goes to the debugger that attached) */
   return EXCEPTION_EXECUTE_HANDLER;
 }
 EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD count, const ULONG_PTR *arguments) {
@@ -4633,7 +4704,8 @@ static const char *error_text(DWORD error) {
 /* ---- start ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
 EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
-  (void)module; (void)reserved; (void)reason;
+  (void)module; (void)reserved;
+  if (reason == DLL_PROCESS_ATTACH) RtlTcosSetUnhandledExceptionHook(UnhandledExceptionFilter);      /* (what runs when nothing handled an exception) */
   return TRUE;
 }
 

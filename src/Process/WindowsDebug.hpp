@@ -46,7 +46,8 @@ void debug_drain_kills(IProcessRuntime* runtime);
 // The CONTEXT (address in the program) of a thread that waits for the debugger at an exception.
 bool debug_stopped_context(uint64_t pid, uint64_t tid, uint64_t* address);
 // Events the program itself causes.
-void debug_thread_created(Process& p, uint64_t thread_id, uint64_t start);
+// (`held`: the thread is not started until the event is continued, see ThreadRecord::debug_hold)
+void debug_thread_created(Process& p, uint64_t thread_id, uint64_t start, bool held = false);
 void debug_thread_exited(Process& p, uint64_t thread_id, uint32_t code);
 void debug_module_loaded(Process& p, uint64_t base);
 void debug_module_unloaded(Process& p, uint64_t base);

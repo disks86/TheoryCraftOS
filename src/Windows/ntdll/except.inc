@@ -294,6 +294,9 @@ EXPORT ULONG NTAPI RtlRemoveVectoredExceptionHandler(PVOID cookie) {
 }
 EXPORT PVOID NTAPI RtlAddVectoredContinueHandler(ULONG first, PVOID handler) { (void)first; (void)handler; return NULL; }
 EXPORT ULONG NTAPI RtlRemoveVectoredContinueHandler(PVOID cookie) { (void)cookie; return 0; }
+/* kernel32's UnhandledExceptionFilter (which calls the top-level filter and starts the AeDebug debugger) takes the place of the bare top-level filter once it is loaded. */
+static LONG (WINAPI *g_unhandled_hook)(PEXCEPTION_POINTERS);
+EXPORT void NTAPI RtlTcosSetUnhandledExceptionHook(LONG (WINAPI *hook)(PEXCEPTION_POINTERS)) { g_unhandled_hook = hook; }
 EXPORT LPTOP_LEVEL_EXCEPTION_FILTER NTAPI RtlSetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter) {
   LPTOP_LEVEL_EXCEPTION_FILTER old = g_top_level_filter;
   g_top_level_filter = filter;
@@ -371,8 +374,11 @@ static __attribute__((noreturn, noinline)) void unhandled_exception(EXCEPTION_RE
   if (TEB_REMOTE_BREAK(NtCurrentTeb()) == 2) { TEB_REMOTE_BREAK(NtCurrentTeb()) = 0; NtContinue(context, FALSE); }      /* (so does the first breakpoint of a program) */
   if (debugger_handled(record, context, FALSE)) NtContinue(context, FALSE);
   if (g_init_guard && g_init_guard_teb == NtCurrentTeb()) __builtin_longjmp(g_init_guard, 1);      /* (a library's entry point failed: see call_library_entry) */
-  if (g_top_level_filter) {
-    EXCEPTION_POINTERS pointers = {record, context};
+  EXCEPTION_POINTERS pointers = {record, context};
+  if (g_unhandled_hook) {
+    if (g_unhandled_hook(&pointers) == EXCEPTION_CONTINUE_EXECUTION) NtContinue(context, FALSE);
+    if (debugger_handled(record, context, FALSE)) NtContinue(context, FALSE);      /* (a post-mortem debugger attached meanwhile) */
+  } else if (g_top_level_filter) {
     if (g_top_level_filter(&pointers) == EXCEPTION_CONTINUE_EXECUTION) NtContinue(context, FALSE);
   }
   report_unhandled(record);

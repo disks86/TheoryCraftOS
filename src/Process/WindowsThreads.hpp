@@ -46,6 +46,8 @@ uint32_t terminate_thread_in(Process& target, uint64_t thread_id, uint32_t code)
 uint32_t context_in(Process& target, uint64_t thread_id, bool set, X86Context* context);      // the registers of a thread that has not run or is parked
 uint32_t resume_thread_in(Process& target, uint64_t thread_id, uint64_t* previous_count);
 uint32_t suspend_thread_in(Process& target, uint64_t thread_id, uint64_t* previous_count);
+// A thread that was held for the debugger (see debug_hold) may run now (unless the program suspended it too).
+uint32_t release_debug_hold_in(Process& target, uint64_t thread_id);
 // A handle to a thread of another program (what CreateRemoteThread gave out) names a thread id; false if the handle is something else.
 bool remote_thread_handle(Process& p, uint64_t handle, uint64_t* thread_id);
 

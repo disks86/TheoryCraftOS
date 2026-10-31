@@ -104,15 +104,17 @@ uint32_t create_thread_in(Process& target, uint64_t start, uint64_t argument_val
   ts.stack_pointer = thread.stack_pointer;
   ts.gs_base = thread.teb;
   ts.id = id;
-  if (!runtime->start_thread(ts, suspended)) {
+  const bool gate = !suspended && debug_object_of(target.id()) != 0;      // (a thread of a debugged program does not run before its event is continued)
+  if (!runtime->start_thread(ts, suspended || gate)) {
     space->unmap(thread.region_base, thread.region_size);
     record->used = false;
     return kInsufficientResources;
   }
-  record->started = !suspended;
+  record->started = !(suspended || gate);
   record->suspend_count = suspended ? 1 : 0;
+  record->debug_hold = gate;
   *thread_id = id;
-  debug_thread_created(target, id, start);
+  debug_thread_created(target, id, start, gate);
   return kSuccess;
 }
 
@@ -141,10 +143,19 @@ uint32_t context_in(Process& target, uint64_t thread_id, bool set, X86Context* c
   return kSuccess;
 }
 
+// A thread that debugged (DbgUiSetThreadDebugObject keeps the handle in its TEB, at 0x1660) lets go of it when it ends; one that is ended from outside never gets to.
+static void close_thread_debug_object(Process& target, const Process::ThreadRecord& record) {
+  uint64_t handle = 0;
+  if (record.teb == 0 || !target.read_user_u64(record.teb + 0x1660, &handle) || handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return;
+  const uint64_t slot = handle / 4 - 1;
+  if (target.files().kind(slot) == DescriptorKind::DebugObject) target.close_descriptor(slot);
+}
+
 uint32_t terminate_thread_in(Process& target, uint64_t thread_id, uint32_t code) {
   Process::ThreadRecord* record = target.find_thread(thread_id);
   if (!record) return kInvalidHandle;
   if (record->finished) return kSuccess;
+  close_thread_debug_object(target, *record);
   if (!record->started) { end_thread(target, *record, code); return kSuccess; }
   if (!target.runtime()) return kNotImplemented;
   target.runtime()->request_terminate(record->id, code);
@@ -165,6 +176,18 @@ uint32_t suspend_thread_in(Process& target, uint64_t thread_id, uint64_t* previo
   return kSuccess;
 }
 
+uint32_t release_debug_hold_in(Process& target, uint64_t thread_id) {
+  Process::ThreadRecord* record = target.find_thread(thread_id);
+  if (!record || !target.runtime()) return kInvalidHandle;
+  if (!record->debug_hold) return kSuccess;
+  record->debug_hold = false;
+  if (!record->started && record->suspend_count == 0 && !record->finished) {
+    if (!target.runtime()->resume_thread(record->id)) return kInsufficientResources;
+    record->started = true;
+  }
+  return kSuccess;
+}
+
 uint32_t resume_thread_in(Process& target, uint64_t thread_id, uint64_t* previous_count) {
   Process::ThreadRecord* record = target.find_thread(thread_id);
   if (!record || !target.runtime()) return kInvalidHandle;
@@ -172,6 +195,7 @@ uint32_t resume_thread_in(Process& target, uint64_t thread_id, uint64_t* previou
   if (record->suspend_count > 0 && !record->finished) {
     if (--record->suspend_count == 0) {
       if (!record->started) {
+        if (record->debug_hold) return kSuccess;      // (it starts when the debugger has continued its event)
         if (!target.runtime()->resume_thread(record->id)) { ++record->suspend_count; return kInsufficientResources; }
         record->started = true;
       } else {
@@ -256,15 +280,17 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   ts.gs_base = thread.teb;
   ts.id = id;
   const bool suspended = (flags & kCreateSuspended) != 0;
-  if (!runtime->start_thread(ts, suspended)) {
+  const bool gate = !suspended && debug_object_of(p.id()) != 0;      // (a thread of a debugged program does not run before its event is continued)
+  if (!runtime->start_thread(ts, suspended || gate)) {
     p.files().close(uint64_t(slot));
     space->unmap(thread.region_base, thread.region_size);
     record->used = false;
     return kInsufficientResources;
   }
-  record->started = !suspended;
+  record->started = !(suspended || gate);
   record->suspend_count = suspended ? 1 : 0;
-  debug_thread_created(p, id, start);
+  record->debug_hold = gate;
+  debug_thread_created(p, id, start, gate);
   return kSuccess;
 }
 
@@ -309,6 +335,7 @@ uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r) {
     return kSuccess;
   }
   if (record->finished) return kSuccess;
+  close_thread_debug_object(p, *record);
   if (!record->started) {      // it never ran: nothing to stop
     end_thread(p, *record, code);
     return kSuccess;
@@ -405,6 +432,10 @@ uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
   if (record->suspend_count > 0 && !record->finished && p.runtime()) {
     if (--record->suspend_count == 0) {
       if (!record->started) {      // created suspended: it starts now
+        if (record->debug_hold) {      // (not before the debugger has continued the event that reports it)
+          if (r.args[1] != 0 && !put32(p, r.args[1], previous)) return kAccessViolation;
+          return kSuccess;
+        }
         if (!p.runtime()->resume_thread(record->id)) { ++record->suspend_count; return kInsufficientResources; }
         record->started = true;
       } else {
@@ -423,8 +454,15 @@ uint32_t remote_get_context(Process& p, uint64_t pid, uint64_t tid, X86Context* 
   IProcessRuntime::RemoteOp op;
   op.kind = IProcessRuntime::RemoteOp::GetContext;
   op.thread_id = tid; op.context = context;
-  uint32_t status = p.runtime()->remote_operation(pid, op);
-  if (status != 0xC000000Du) return status;      // (a thread that is suspended or stopped at a debug event answers at once)
+  // A thread that is suspended or stopped at a debug event keeps its registers still. One that merely waits in the kernel may look parked now and run a moment later (the
+  // registers read would then not be the ones written back), so it is suspended first like any thread that runs.
+  uint64_t ignored = 0;
+  IProcessRuntime::RemoteOp state;
+  state.kind = IProcessRuntime::RemoteOp::ThreadStatus;
+  state.thread_id = tid;
+  const bool still = debug_stopped_context(pid, tid, &ignored) || (p.runtime()->remote_operation(pid, state) == kSuccess && state.old_protect > 0);
+  uint32_t status = still ? p.runtime()->remote_operation(pid, op) : 0xC000000Du;
+  if (status != 0xC000000Du) return status;
   IProcessRuntime::RemoteOp stop;
   stop.kind = IProcessRuntime::RemoteOp::SuspendThread;
   stop.thread_id = tid;

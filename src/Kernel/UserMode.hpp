@@ -137,6 +137,7 @@ struct Task final : process::IProcessRuntime {
   uint32_t spawn_process_for(uint64_t parent_pid, const process::ChildSpec& spec) override;
   bool terminate_process(uint64_t pid, uint32_t code) override;
   bool resume_process(uint64_t pid) override;
+  bool process_not_started(uint64_t pid) override;
   // Frees the children that have ended; with `all`, stops the others first and waits for them.
   void reap_children(bool all);
   bool start_first_thread();
