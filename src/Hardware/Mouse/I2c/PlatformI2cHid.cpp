@@ -237,8 +237,36 @@ bool PlatformI2cHid::setup_device(acpi::Node* device, CompositeMouse& mice, Repo
     return true;
   }
   report->kind = p->pointer->kind();
-  if (!mice.add(p->pointer.get())) {
+  // a pen and sensors on the same device
+  if (pens_) {
+    p->pen = UniquePointer<I2cHidPen>::make(allocator_, *p->pointer, p->name);
+    if (p->pen && p->pen->initialize() && pens_->add(p->pen.get())) report->pen = true;
+    else p->pen.reset();
+  }
+  if (sensors_) {
+    SensorKind kinds[HidSensor::kMaxPerDevice];
+    uint8_t ids[HidSensor::kMaxPerDevice];
+    const uint32_t found = HidSensor::discover(p->pointer->map(), kinds, ids);
+    for (uint32_t i = 0; i < found; ++i) {
+      append(p->sensor_names[i], sizeof p->sensor_names[i], p->name);
+      append(p->sensor_names[i], sizeof p->sensor_names[i], " ");
+      append(p->sensor_names[i], sizeof p->sensor_names[i], sensor_kind_name(kinds[i]));
+      p->sensors[i] = UniquePointer<HidSensor>::make(allocator_, *p->pointer, kinds[i], ids[i], p->sensor_names[i]);
+      if (p->sensors[i] && p->sensors[i]->initialize() && sensors_->add(p->sensors[i].get())) ++report->sensors;
+      else p->sensors[i].reset();
+    }
+  }
+  p->as_mouse = report->kind != I2cHidPointer::Kind::Other;
+  if (!p->as_mouse && !report->pen && report->sensors == 0) {                       // nothing of the device is used
+    report->outcome = Outcome::NotAPointer;
+    p->pointer->shutdown();
+    return true;
+  }
+  if (p->as_mouse && !mice.add(p->pointer.get())) {
     report->outcome = Outcome::MouseFull;
+    if (p->pen) { pens_->remove(p->pen.get()); p->pen->shutdown(); }
+    for (auto& sensor : p->sensors)
+      if (sensor) { sensors_->remove(sensor.get()); sensor->shutdown(); }
     p->pointer->shutdown();
     return true;
   }
@@ -291,8 +319,12 @@ uint32_t PlatformI2cHid::start(const AcpiTables& acpi, CompositeMouse& mice) {
 
 void PlatformI2cHid::stop(CompositeMouse& mice) {
   for (uint64_t i = 0; i < pointers_.count(); ++i) {
-    mice.remove(pointers_[i]->pointer.get());
-    pointers_[i]->pointer->shutdown();
+    Pointer& p = *pointers_[i];
+    if (p.as_mouse) mice.remove(p.pointer.get());
+    if (p.pen) { if (pens_) pens_->remove(p.pen.get()); p.pen->shutdown(); }
+    for (auto& sensor : p.sensors)
+      if (sensor) { if (sensors_) sensors_->remove(sensor.get()); sensor->shutdown(); }
+    p.pointer->shutdown();
   }
   pointers_.clear();
 }

@@ -28,16 +28,19 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/I2c/HidInputMap.hpp"
+#include "Hardware/Bus/I2c/I2cHidClient.hpp"
 #include "Hardware/Bus/I2c/IAttentionLine.hpp"
+#include "Hardware/Hid/HidFunctionHost.hpp"
 #include "Hardware/Bus/I2c/I2cHidDevice.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/Mouse/IMouse.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace hardware {
 
-class I2cHidPointer final : public IMouse {
+class I2cHidPointer final : public IMouse, public IHidFunctionHost {
  public:
-  enum class Kind : uint8_t { None, Touchpad, Touchscreen, Mouse };
+  enum class Kind : uint8_t { None, Touchpad, Touchscreen, Mouse, Other };   // Other: no pointer, but a pen or sensors (clients)
   static constexpr uint32_t kMaxContacts = 10, kQueue = 64;
 
   I2cHidPointer(allocators::IAllocator& allocator, II2cMaster& bus, uint16_t address, uint16_t descriptor_register, IClock& clock, const char* name)
@@ -46,6 +49,15 @@ class I2cHidPointer final : public IMouse {
   void set_attention(IAttentionLine* line) { attention_ = line; }
   Kind kind() const { return kind_; }
   const I2cHidDevice& device() const { return device_; }
+  I2cHidDevice& device() { return device_; }
+  const HidInputMap& map() const override { return map_; }
+  // Pens and sensors of the same device: they are given every input report. Up to kMaxClients.
+  static constexpr uint32_t kMaxClients = 4;
+  bool add_client(II2cHidClient* client) override;
+  void remove_client(II2cHidClient* client) override;
+  bool set_feature(uint8_t id, ConstByteView report) override { return device_.set_feature(id, report); }
+  // Reads what the device has (as poll() does) without producing a mouse event; for the clients, which are fed from it. Safe to call from several threads.
+  void pump() override;
 
   const char* name() const override { return name_; }
   bool initialize() override;
@@ -68,6 +80,7 @@ class I2cHidPointer final : public IMouse {
   };
 
   bool read_one();
+  void read_pending(uint64_t now);
   void process(ConstByteView report);
   void process_mouse(ConstByteView report);
   void collect(ConstByteView report);
@@ -90,6 +103,8 @@ class I2cHidPointer final : public IMouse {
   uint32_t range_x_ = 0, range_y_ = 0;        // logical ranges
   int32_t min_x_ = 0, min_y_ = 0;
   float mm_per_x_ = 0.1f, mm_per_y_ = 0.1f;   // millimetres to a unit of the pad
+  kernel::Mutex mutex_;                       // the bus and the queues: the mouse side and the clients' sides read in turns
+  II2cHidClient* clients_[kMaxClients] = {};
   uint64_t next_read_ms_ = 0;
   uint32_t failures_ = 0;
   uint8_t buffer_[I2cHidDevice::kMaxInput] = {};

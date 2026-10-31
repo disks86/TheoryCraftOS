@@ -168,6 +168,7 @@ acpi::Node* AcpiEvents::find_pci_device(const IPciBus& pci, PciAddress address) 
 // --- wake events
 
 bool AcpiEvents::wake_source(acpi::Node* device, WakeSource* out) {
+  kernel::ScopedRecursiveMutex vm_guard(vm_.mutex());     // other threads use the interpreter too (brightness, sensors): what is read from it stays whole
   if (!ready_ || !device) return false;
   acpi::Node* prw = vm_.find("_PRW", device);
   if (!prw || vm_.parent(prw) != device) return false;
@@ -201,6 +202,7 @@ bool AcpiEvents::locate(uint32_t gpe, AcpiAddress* status_port, AcpiAddress* ena
 }
 
 bool AcpiEvents::enable_wake(acpi::Node* device) {
+  kernel::ScopedRecursiveMutex vm_guard(vm_.mutex());     // other threads use the interpreter too (brightness, sensors): what is read from it stays whole
   WakeSource source;
   AcpiAddress status, enable;
   uint8_t bit = 0;
@@ -222,6 +224,7 @@ bool AcpiEvents::enable_wake(acpi::Node* device) {
 }
 
 void AcpiEvents::disable_wake(acpi::Node* device) {
+  kernel::ScopedRecursiveMutex vm_guard(vm_.mutex());     // other threads use the interpreter too (brightness, sensors): what is read from it stays whole
   for (uint32_t i = 0; i < wake_count_; ++i) {
     if (wake_[i].device != device) continue;
     AcpiAddress status, enable;
@@ -245,7 +248,8 @@ void AcpiEvents::disable_wake(acpi::Node* device) {
 // --- events
 
 void AcpiEvents::deliver() {
-  // (the listener may call back into the events: take the list first)
+  // The listeners are called by poll() once it has let go of the interpreter: they post notices and change the brightness, which take locks of the interface that another thread
+  // may hold while it waits for the interpreter. Here the news is only queued.
   acpi::Node* nodes[kMaxNotifies];
   uint32_t values[kMaxNotifies], count = bridge_.count;
   for (uint32_t i = 0; i < count; ++i) {
@@ -258,8 +262,33 @@ void AcpiEvents::deliver() {
     for (uint32_t k = 0; k < button_count_; ++k)
       if (buttons_[k].device == nodes[i]) button_pressed(buttons_[k].kind);
   }
-  if (listener_)
-    for (uint32_t i = 0; i < count; ++i) listener_->on_notify(nodes[i], values[i]);
+  for (uint32_t i = 0; i < count; ++i) queue_news(false, AcpiButton::Power, false, nodes[i], values[i]);
+}
+
+void AcpiEvents::queue_news(bool button, AcpiButton kind, bool open, acpi::Node* node, uint32_t value) {
+  if (deferred_count_ == kMaxDeferred) return;                            // (more than a poll can produce: dropped)
+  deferred_[deferred_count_++] = Deferred{button, kind, open, node, value};
+}
+
+void AcpiEvents::flush_news() {
+  Deferred news[kMaxDeferred];
+  uint32_t count;
+  {
+    kernel::ScopedRecursiveMutex vm_guard(vm_.mutex());
+    count = deferred_count_;
+    for (uint32_t i = 0; i < count; ++i) news[i] = deferred_[i];
+    deferred_count_ = 0;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    const Deferred& n = news[i];
+    if (n.button) {
+      if (buttons_listener_) buttons_listener_->on_button(n.kind, n.open);
+      continue;
+    }
+    if (listener_) listener_->on_notify(n.node, n.value);
+    for (IAcpiNotifyListener* more : more_listeners_)
+      if (more) more->on_notify(n.node, n.value);
+  }
 }
 
 static char hex_digit(uint32_t v) { return static_cast<char>(v < 10 ? '0' + v : 'A' + (v - 10)); }
@@ -431,6 +460,7 @@ uint32_t AcpiEvents::enable_buttons() {
 }
 
 bool AcpiEvents::lid_open(bool* open) {
+  kernel::ScopedRecursiveMutex vm_guard(vm_.mutex());     // other threads use the interpreter too (brightness, sensors): what is read from it stays whole
   for (uint32_t i = 0; i < button_count_; ++i) {
     if (buttons_[i].kind != AcpiButton::Lid) continue;
     acpi::Node* lid = vm_.find("_LID", buttons_[i].device);
@@ -446,7 +476,7 @@ void AcpiEvents::button_pressed(AcpiButton kind) {
   if (!buttons_listener_) return;
   bool open = true;
   if (kind == AcpiButton::Lid && !lid_open(&open)) return;
-  buttons_listener_->on_button(kind, open);
+  queue_news(true, kind, open, nullptr, 0);
 }
 
 void AcpiEvents::enable_rtc_event(bool on) {
@@ -472,6 +502,16 @@ void AcpiEvents::poll_fixed_buttons() {
 }
 
 uint32_t AcpiEvents::poll() {
+  uint32_t handled;
+  {
+    kernel::ScopedRecursiveMutex vm_guard(vm_.mutex());   // other threads use the interpreter too (brightness, sensors): what is read from it stays whole
+    handled = poll_locked();
+  }
+  flush_news();
+  return handled;
+}
+
+uint32_t AcpiEvents::poll_locked() {
   if (!ready_) return 0;
   uint32_t before = handled_;
   poll_fixed_buttons();

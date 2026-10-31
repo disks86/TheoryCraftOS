@@ -312,6 +312,18 @@ class Vm {
   bool get_plain(JsObject* object, JsString* key, Value* out);
   void hold_collector() { ++gc_hold_; }
   void release_collector() { if (gc_hold_ > 0) --gc_hold_; }
+  // A built-in that only passes the call on (Function.prototype.call/apply, Reflect.construct) keeps no script value in a variable of its own: its arguments are on the
+  // VM stack. While one is on the way the collector may still run in the script it calls (transpiled code runs almost entirely below such calls).
+  class PassThrough {
+   public:
+    explicit PassThrough(Vm& vm, bool active = true) : vm_(vm), active_(active) { if (active_) ++vm_.pass_depth_; }
+    ~PassThrough() { if (active_) --vm_.pass_depth_; }
+    PassThrough(const PassThrough&) = delete;
+    PassThrough& operator=(const PassThrough&) = delete;
+   private:
+    Vm& vm_;
+    bool active_;
+  };
 
   // --- Called by the built-ins
   void collect();   // (only safe at the top level of the interpreter: the VM does this itself)
@@ -484,7 +496,7 @@ class Vm {
            *value_of_ = nullptr, *undefined_text_ = nullptr, *null_text_ = nullptr, *true_text_ = nullptr, *false_text_ = nullptr;
   // limits
   uint64_t budget_ = 0, instructions_ = 0;
-  uint32_t native_depth_ = 0;
+  uint32_t native_depth_ = 0, pass_depth_ = 0;   // (natives being called; those of them that only pass the call on)
   uint64_t random_state_ = 88172645463325252ull;
   double skew_ms_ = 0;
   void* user_ = nullptr;

@@ -115,4 +115,30 @@ bool I2cHidDevice::send_output(uint8_t id, ConstByteView report) {
   return bus_.transfer(address_, ConstByteView(message, at), ByteView());
 }
 
+bool I2cHidDevice::set_feature(uint8_t id, ConstByteView report) {
+  const uint32_t n = static_cast<uint32_t>(report.size());
+  if (descriptor_.command_register == 0 || descriptor_.data_register == 0 || n > kMaxInput - 16) return false;
+  uint8_t message[kMaxInput + 8];
+  uint32_t at = 0;
+  message[at++] = static_cast<uint8_t>(descriptor_.command_register);
+  message[at++] = static_cast<uint8_t>(descriptor_.command_register >> 8);
+  constexpr uint8_t kFeature = 3;
+  if (id < 0x0F) {
+    message[at++] = static_cast<uint8_t>((kFeature << 4) | id);
+    message[at++] = kOpcodeSetReport;
+  } else {
+    message[at++] = static_cast<uint8_t>((kFeature << 4) | 0x0F);
+    message[at++] = kOpcodeSetReport;
+    message[at++] = id;
+  }
+  message[at++] = static_cast<uint8_t>(descriptor_.data_register);
+  message[at++] = static_cast<uint8_t>(descriptor_.data_register >> 8);
+  const uint32_t length = n + 2 + (id ? 1 : 0);
+  message[at++] = static_cast<uint8_t>(length);
+  message[at++] = static_cast<uint8_t>(length >> 8);
+  if (id) message[at++] = id;
+  for (uint32_t i = 0; i < n; ++i) message[at++] = report[i];
+  return bus_.transfer(address_, ConstByteView(message, at), ByteView());
+}
+
 }  // namespace hardware

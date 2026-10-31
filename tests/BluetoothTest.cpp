@@ -585,6 +585,54 @@ static void test_service() {
   CHECK(a.live == 0);
 }
 
+// The real firmware files of the repository (intel/ibt-17-*.sfi of linux-firmware): the load walks them whole - every fragment ends on four bytes, the boot address comes out of the last
+// command - and a file cut or damaged anywhere is refused or loaded without a crash. Skipped when the file is not there (the tests run from the repository root).
+static void test_intel_real_firmware() {
+  const char* names[] = {"firmware/ibt-17-16-1.sfi", "firmware/ibt-17-0-1.sfi"};
+  for (const char* name : names) {
+    FILE* f = fopen(name, "rb");
+    if (!f) continue;
+    Bytes image;
+    uint8_t chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) image.insert(image.end(), chunk, chunk + n);
+    fclose(f);
+    CHECK(image.size() > 600000 && image[0] == 6);
+    Rig rig;
+    rig.host.controller.intel = true;
+    IntelBluetooth intel(rig.c());
+    CHECK(intel.identify() == IntelSetup::NeedFirmware);
+    rig.host.controller.payload_expected = static_cast<uint32_t>(image.size() - 644);
+    CHECK(intel.load_firmware(view(image)) == IntelSetup::Ok && intel.operational());
+    uint32_t data_fragments = 0, data_bytes = 0;
+    for (const Bytes& x : rig.host.controller.intel_fragments)
+      if (x[0] == 0x01) { ++data_fragments; data_bytes += static_cast<uint32_t>(x.size() - 1); CHECK((x.size() - 1) % 4 == 0 && x.size() <= 253); }
+    CHECK(data_bytes == image.size() - 644 && data_fragments > 2000);
+    bool reset_seen = false;
+    for (const Bytes& c : rig.host.controller.commands)
+      if (c.size() == 3 + 8 && c[0] == 0x01 && c[1] == 0xFC) { reset_seen = true; CHECK(c[3 + 4] == 0x00 && c[3 + 5] == 0x08 && c[3 + 6] == 0x04 && c[3 + 7] == 0x00); }       // 0x00040800
+    CHECK(reset_seen);
+    // cut at 1000 places and with 300 bits flipped in the header and the first commands: no crash, and a cut file is refused
+    for (size_t cut = 0; cut < image.size(); cut += image.size() / 1000 + 1) {
+      Rig r;
+      r.host.controller.intel = true;
+      IntelBluetooth i(r.c());
+      i.identify();
+      const IntelSetup result = i.load_firmware(ConstByteView(image.data(), cut));
+      CHECK(cut >= image.size() - 3 ? true : result == IntelSetup::BadFirmware);
+    }
+    for (size_t bit = 0; bit < 300 * 8; bit += 8 * 7 + 3) {
+      Bytes flipped = image;
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      Rig r;
+      r.host.controller.intel = true;
+      IntelBluetooth i(r.c());
+      i.identify();
+      i.load_firmware(view(flipped));
+    }
+  }
+}
+
 int main() {
   test_packets();
   test_usb_transport();
@@ -593,6 +641,7 @@ int main() {
   test_links();
   test_intel();
   test_service();
+  test_intel_real_firmware();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("bluetooth tests passed\n");
   return 0;

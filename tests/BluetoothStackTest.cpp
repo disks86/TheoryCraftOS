@@ -29,6 +29,8 @@
 #include "Hardware/Bluetooth/HciBluetoothAdapter.hpp"
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
 #include "Hardware/Hid/HidDescriptor.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
+#include "SystemBluetoothDetails.hpp"
 #include "Hardware/Keyboard/CompositeKeyboard.hpp"
 #include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Bluetooth/Smp.hpp"
@@ -827,6 +829,21 @@ static const uint8_t kKeyboardMouseMap[] = {
     0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08,
     0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0};
 
+static void test_key_maps() {
+  namespace key = hardware::key;
+  CHECK(hardware::usage_from_linux_key(113) == key::kMute && hardware::usage_from_linux_key(114) == key::kVolumeDown && hardware::usage_from_linux_key(115) == key::kVolumeUp &&
+        hardware::usage_from_linux_key(163) == key::kMediaNext && hardware::usage_from_linux_key(164) == key::kMediaPlayPause && hardware::usage_from_linux_key(165) == key::kMediaPrevious &&
+        hardware::usage_from_linux_key(166) == key::kMediaStop && hardware::usage_from_linux_key(224) == key::kBrightnessDown && hardware::usage_from_linux_key(225) == key::kBrightnessUp);
+}
+
+static void test_ps2_media_keys() {
+  namespace key = hardware::key;
+  CHECK(hardware::usage_from_scan_code_set1(0x30, true) == key::kVolumeUp && hardware::usage_from_scan_code_set1(0x2E, true) == key::kVolumeDown && hardware::usage_from_scan_code_set1(0x20, true) == key::kMute &&
+        hardware::usage_from_scan_code_set1(0x22, true) == key::kMediaPlayPause && hardware::usage_from_scan_code_set1(0x19, true) == key::kMediaNext && hardware::usage_from_scan_code_set1(0x10, true) == key::kMediaPrevious &&
+        hardware::usage_from_scan_code_set1(0x24, true) == key::kMediaStop);
+  CHECK(hardware::usage_from_scan_code_set1(0x30, false) != key::kVolumeUp);                                  // (the same code without the E0 prefix is B)
+}
+
 static void test_hid_descriptor() {
   using namespace hid;
   ReportMap map;
@@ -897,6 +914,39 @@ static void test_hid_descriptor() {
     ReportMap m;
     parse_report_map(ConstByteView(flipped, sizeof flipped), &m);
     for (uint32_t i = 0; i < m.report_count; ++i) { KeyboardDecoder k; PointerDecoder p; k.init(m.reports[i]); p.init(m.reports[i]); k.decode(ConstByteView(report, 8), &st); p.decode(ConstByteView(move, 4), &e); p.decode(ConstByteView(report, 1), &e); }
+  }
+  // the keys of the consumer page (volume, mute, transport): one bit each, and the usages map to the keyboard's key codes
+  {
+    const uint8_t consumer[] = {0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x07, 0x09, 0xE9, 0x09, 0xEA, 0x09, 0xE2, 0x09, 0xCD,
+                                0x09, 0xB5, 0x09, 0xB6, 0x09, 0xB7, 0x81, 0x02, 0x95, 0x01, 0x81, 0x03, 0xC0};
+    ReportMap cmap;
+    CHECK(parse_report_map(ConstByteView(consumer, sizeof consumer), &cmap) && cmap.report_count == 1 && cmap.reports[0].id == 3 && cmap.reports[0].app_page == 0x0C && cmap.reports[0].app_usage == 1);
+    ConsumerDecoder cd;
+    CHECK(cd.init(cmap.reports[0]) && cd.valid());
+    KeyboardState ck;
+    const uint8_t down[1] = {0x05};                                                    // volume up and mute
+    CHECK(cd.decode(ConstByteView(down, 1), &ck) && ck.key_count == 2 && ck.keys[0] == hardware::key::kVolumeUp && ck.keys[1] == hardware::key::kMute);
+    const uint8_t none[1] = {0};
+    CHECK(cd.decode(ConstByteView(none, 1), &ck) && ck.key_count == 0 && !cd.decode(ConstByteView(none, 0), &ck));
+    const uint8_t all[1] = {0x7F};
+    CHECK(cd.decode(ConstByteView(all, 1), &ck) && ck.key_count == 7);
+    CHECK(consumer_usage_to_key(0xE9) == hardware::key::kVolumeUp && consumer_usage_to_key(0xEA) == hardware::key::kVolumeDown && consumer_usage_to_key(0xCD) == hardware::key::kMediaPlayPause &&
+          consumer_usage_to_key(0x6F) == hardware::key::kBrightnessUp && consumer_usage_to_key(0x70) == hardware::key::kBrightnessDown && consumer_usage_to_key(0x1234) == 0);
+    ConsumerDecoder kbd_only;
+    CHECK(!kbd_only.init(*map.find(1)) && !kbd_only.valid());
+    for (size_t n = 0; n <= sizeof consumer; ++n) {
+      ReportMap m;
+      parse_report_map(ConstByteView(consumer, n), &m);
+      for (uint32_t i = 0; i < m.report_count; ++i) { ConsumerDecoder d; d.init(m.reports[i]); d.decode(ConstByteView(down, 1), &ck); }
+    }
+    for (size_t bit = 0; bit < sizeof consumer * 8; ++bit) {
+      uint8_t flipped[sizeof consumer];
+      memcpy(flipped, consumer, sizeof flipped);
+      flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      ReportMap m;
+      parse_report_map(ConstByteView(flipped, sizeof flipped), &m);
+      for (uint32_t i = 0; i < m.report_count; ++i) { ConsumerDecoder d; d.init(m.reports[i]); d.decode(ConstByteView(down, 1), &ck); d.decode(ConstByteView(all, 1), &ck); }
+    }
   }
   // a huge report size and count do not wrap
   const uint8_t huge[] = {0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x75, 0xFF, 0x96, 0xFF, 0xFF, 0x81, 0x02, 0x75, 0x20, 0x95, 0xFF, 0x81, 0x02, 0xC0};
@@ -1144,6 +1194,258 @@ static void test_profile_plugin() {
   CHECK(profiles.remove(&battery) && !profiles.remove(&battery) && profiles.count() == 0);
 }
 
+// The desktop's view of the adapters (SystemBluetoothDetails) over a real adapter: the device rows, and the pairing questions reaching the window and the answers going back.
+static void test_system_details() {
+  struct Manager final : IBluetoothManager {
+    IBluetoothAdapter* a = nullptr;
+    BluetoothProfileRegistry* profiles = nullptr;
+    bool reconnect = false;
+    bool auto_reconnect() const override { return reconnect; }
+    void set_auto_reconnect(bool on) override { reconnect = on; if (a) a->set_auto_reconnect(on); }
+    uint32_t adapter_count() const override { return a ? 1 : 0; }
+    IBluetoothAdapter* adapter(uint32_t i) override { return i == 0 ? a : nullptr; }
+    bool add_profile(IBluetoothProfile* p) override { return profiles->add(p); }
+    bool remove_profile(IBluetoothProfile* p) override { return profiles->remove(p); }
+  };
+  auto settle = [](HidWorld& w, SystemBluetoothDetails& d, desktop::BluetoothPromptKind* seen, uint32_t* number, int rounds) {
+    for (int i = 0; i < rounds; ++i) {
+      w.adapter->poll();
+      w.hogp.poll(w.sink);
+      desktop::BluetoothPrompt prompt;
+      if (d.prompt(0, &prompt)) { *seen = prompt.kind; *number = prompt.number; return true; }
+    }
+    return false;
+  };
+  {   // rows
+    HidWorld w;
+    w.make_peripheral();
+    Manager manager;
+    manager.a = w.adapter.get();
+    manager.profiles = &w.profiles;
+    SystemBluetoothDetails details(manager);
+    CHECK(details.is_bluetooth(0) && !details.is_bluetooth(1));
+    desktop::BluetoothAdapterInfo info;
+    CHECK(details.adapter(0, &info) && strcmp(info.name, "Bluetooth adapter") == 0 && strcmp(info.address, "66:55:44:33:22:11") == 0 && info.ready && !info.discovering && !details.adapter(1, &info));
+    CHECK(!info.auto_reconnect);
+    details.set_auto_reconnect(0, true);
+    CHECK(manager.reconnect && w.adapter->auto_reconnect() && details.adapter(0, &info) && info.auto_reconnect);
+    details.set_auto_reconnect(1, false);                              // (no such adapter: nothing changes)
+    CHECK(manager.reconnect);
+    details.set_auto_reconnect(0, false);
+    CHECK(!manager.reconnect && !w.adapter->auto_reconnect());
+    CHECK(details.set_discovery(0, true) && details.adapter(0, &info) && info.discovering);
+    w.advertise();
+    w.host.controller.inquiry();
+    w.adapter->poll();
+    desktop::BluetoothDeviceRow rows[desktop::IBluetoothDetails::kMaxDevices];
+    const uint32_t n = details.devices(0, rows, desktop::IBluetoothDetails::kMaxDevices);
+    CHECK(n == 6);
+    // the supported ones first, by signal: the keyboard (-53 dBm), then the beacon (-80 dBm), then the classic devices
+    CHECK(strcmp(rows[0].name, "Keyboard") == 0 && strcmp(rows[0].kind, "Keyboard") == 0 && rows[0].signal_percent == 94 && rows[0].supported && !rows[0].paired && strcmp(rows[0].address, "C6:C5:C4:C3:C2:C1") == 0 && rows[0].key[0] == 0xC1);
+    CHECK(strcmp(rows[1].kind, "Device") == 0 && rows[1].signal_percent == 40 && rows[1].name[0] == 0);
+    uint32_t classic = 0;
+    for (uint32_t i = 2; i < n; ++i) classic += !rows[i].supported;
+    CHECK(classic == 4);
+    bool saw_phone = false, saw_headset_ext = false;
+    for (uint32_t i = 2; i < n; ++i) { saw_phone = saw_phone || strcmp(rows[i].kind, "Phone") == 0; saw_headset_ext = saw_headset_ext || strcmp(rows[i].name, "Headset X") == 0; }
+    CHECK(saw_phone && saw_headset_ext);
+    CHECK(details.devices(0, rows, 2) == 2 && details.devices(1, rows, 2) == 0);
+    CHECK(details.connect(0, rows[2].key) == desktop::BluetoothResult::Unsupported && details.connect(1, rows[0].key) == desktop::BluetoothResult::NotReady);
+    uint8_t nobody[6] = {9, 9, 9, 9, 9, 9};
+    CHECK(details.connect(0, nobody) == desktop::BluetoothResult::NoSuchDevice);
+    details.set_discovery(0, false);
+    CHECK(details.adapter(0, &info) && !info.discovering);
+  }
+  struct Case { const char* name; uint8_t central_io_unused; uint8_t peripheral_io; bool mitm; int method; desktop::BluetoothPromptKind prompt; };
+  const Case cases[] = {
+      {"just works", 0, 3, false, 0, desktop::BluetoothPromptKind::None},
+      {"the host shows a passkey", 0, 2, true, 3, desktop::BluetoothPromptKind::ShowPasskey},
+      {"the device shows a passkey", 0, 0, true, 2, desktop::BluetoothPromptKind::EnterPasskey},
+      {"numbers to compare", 0, 1, true, 1, desktop::BluetoothPromptKind::ConfirmNumber},
+  };
+  for (const Case& c : cases) {
+    HidWorld w;
+    w.make_peripheral();
+    w.p->io_capability = c.peripheral_io;
+    w.p->want_mitm = c.mitm;
+    w.p->method = c.method;
+    w.p->passkey = 123456;
+    Manager manager;
+    manager.a = w.adapter.get();
+    manager.profiles = &w.profiles;
+    SystemBluetoothDetails details(manager);
+    struct Reader { SystemBluetoothDetails* details; desktop::BluetoothPromptKind kind = desktop::BluetoothPromptKind::None; uint32_t number = 0; } reader{&details};
+    if (c.prompt == desktop::BluetoothPromptKind::ShowPasskey) {      // (the pairing does not wait for the user to type: the peripheral reads the number off the screen when it needs it)
+      w.p->passkey_provider = [](void* context) -> uint32_t {
+        Reader& r = *static_cast<Reader*>(context);
+        desktop::BluetoothPrompt prompt;
+        if (r.details->prompt(0, &prompt)) { r.kind = prompt.kind; r.number = prompt.number; }
+        return r.number;
+      };
+      w.p->provider_context = &reader;
+    }
+    w.advertise();
+    w.adapter->poll();
+    uint8_t key[6];
+    memcpy(key, w.p->address, 6);
+    CHECK(details.connect(0, key) == desktop::BluetoothResult::Ok);
+    desktop::BluetoothPromptKind seen = desktop::BluetoothPromptKind::None;
+    uint32_t number = 0;
+    const bool asked = c.prompt == desktop::BluetoothPromptKind::ShowPasskey ? false : settle(w, details, &seen, &number, 600);
+    if (c.prompt == desktop::BluetoothPromptKind::ShowPasskey) {
+      for (int i = 0; i < 2000 && reader.kind == desktop::BluetoothPromptKind::None; ++i) { w.adapter->poll(); w.hogp.poll(w.sink); }
+      CHECK(reader.kind == desktop::BluetoothPromptKind::ShowPasskey && reader.number < 1000000);
+    } else if (c.prompt == desktop::BluetoothPromptKind::None) {
+      CHECK(!asked);
+    } else {
+      CHECK(asked && seen == c.prompt);
+      desktop::BluetoothPrompt prompt;
+      CHECK(details.prompt(0, &prompt) && strcmp(prompt.device, "Keyboard") == 0);
+      if (seen == desktop::BluetoothPromptKind::ConfirmNumber) {
+        details.answer_confirm(0, true);
+      } else {
+        details.answer_passkey(0, 123456);
+      }
+      CHECK(!details.prompt(0, &prompt));                              // (answered: the question is gone)
+    }
+    BluetoothDeviceInfo bt;
+    bool connected = false;
+    for (int i = 0; i < 2000 && !connected; ++i) {
+      w.adapter->poll();
+      w.hogp.poll(w.sink);
+      connected = w.adapter->find_device(w.peer(), &bt) && bt.state == BluetoothLinkState::Connected;
+    }
+    CHECK(connected && w.sink.keyboards.count() == 1);
+    if (c.method == 1) CHECK(number == w.p->numeric_value);
+    desktop::BluetoothDeviceRow rows[8];
+    CHECK(details.devices(0, rows, 8) >= 1 && rows[0].state == desktop::BluetoothDeviceState::Connected && rows[0].paired && strcmp(rows[0].profiles, "HID over GATT") == 0);
+    details.disconnect(0, key);
+    w.adapter->poll();
+    CHECK(details.devices(0, rows, 8) >= 1 && rows[0].state == desktop::BluetoothDeviceState::Disconnected && rows[0].paired);
+    details.forget(0, key);
+    CHECK(details.devices(0, rows, 8) >= 1 && !rows[0].paired);
+  }
+  {   // a numbers-to-compare question the user rejects fails the pairing, and the window sees the failure
+    HidWorld w;
+    w.make_peripheral();
+    w.p->io_capability = 1;
+    w.p->want_mitm = true;
+    w.p->method = 1;
+    Manager manager;
+    manager.a = w.adapter.get();
+    manager.profiles = &w.profiles;
+    SystemBluetoothDetails details(manager);
+    w.advertise();
+    w.adapter->poll();
+    uint8_t key[6];
+    memcpy(key, w.p->address, 6);
+    CHECK(details.connect(0, key) == desktop::BluetoothResult::Ok);
+    desktop::BluetoothPromptKind seen = desktop::BluetoothPromptKind::None;
+    uint32_t number = 0;
+    CHECK(settle(w, details, &seen, &number, 600) && seen == desktop::BluetoothPromptKind::ConfirmNumber);
+    details.answer_confirm(0, false);
+    CHECK(w.run_until(w.peer(), BluetoothLinkState::Failed));
+    desktop::BluetoothDeviceRow rows[8];
+    CHECK(details.devices(0, rows, 8) >= 1 && rows[0].state == desktop::BluetoothDeviceState::Failed && strstr(rows[0].failure, "numbers"));
+    desktop::BluetoothPrompt prompt;
+    CHECK(!details.prompt(0, &prompt));
+  }
+}
+
+// The auto-reconnect choice belongs to the service: kept in the bond file after the bonds, read back at start-up, followed by adapters that appear later.
+static void test_auto_reconnect_setting() {
+  TestAllocator a;
+  filesystem::RamFileSystem files(a);
+  FileBluetoothBonds storage(files, a);
+  TestRandom random;
+  struct Fw final : IBluetoothFirmwareSource { bool read(const char*, ByteBuffer&) override { return false; } } fw;
+  {   // off by default; switching it on is applied to the adapter and saved with the (empty) bonds
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(!service.auto_reconnect() && !service.entry(0)->adapter->auto_reconnect());
+    service.set_auto_reconnect(true);
+    CHECK(service.auto_reconnect() && service.entry(0)->adapter->auto_reconnect());
+    service.set_auto_reconnect(true);                                   // (no change: nothing to do)
+    // a bond is added: the next save keeps both
+    SmBond bond;
+    bond.used = true;
+    bond.address.b[0] = 9;
+    bond.address_type = 1;
+    bond.has_ltk = true;
+    CHECK(service.bonds().store(bond) && service.save_bonds());
+  }
+  {   // the next start finds the choice and the bond; an adapter that comes up is set from it
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(service.auto_reconnect() && service.bonds().count() == 1 && service.entry(0)->adapter->auto_reconnect());
+    service.set_auto_reconnect(false);
+    CHECK(!service.auto_reconnect() && !service.entry(0)->adapter->auto_reconnect());
+  }
+  {   // switched off again, and kept so
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(!service.auto_reconnect() && service.bonds().count() == 1);
+    // a controller that is plugged in later follows the choice
+    service.set_auto_reconnect(true);
+    Host second;
+    second.vendor = 0x0A5C;
+    bus.hosts.push_back(&second);
+    service.step(true);
+    CHECK(service.count() == 2 && service.entry(1)->adapter && service.entry(1)->adapter->auto_reconnect());
+  }
+  {   // a file from before there were settings, and damaged or cut ones: the default, and the bonds as far as they go
+    ByteBuffer file(a);
+    SmBondStore store;
+    SmBond bond;
+    bond.used = true;
+    bond.address.b[0] = 5;
+    bond.has_ltk = true;
+    store.store(bond);
+    CHECK(store.serialize(file) && file.size() == SmBondStore::kHeaderBytes + SmBondStore::kRecordBytes);
+    CHECK(storage.save(file.view()));
+    Host host;
+    host.vendor = 0x0A5C;
+    Bus bus;
+    bus.hosts = {&host};
+    {
+      BluetoothService service(&bus, &fw, a, &random, &storage);
+      service.start();
+      CHECK(!service.auto_reconnect() && service.bonds().count() == 1);
+    }
+    for (uint32_t cut = 1; cut <= 5; ++cut) {                          // the trailer cut short
+      ByteBuffer partial(a);
+      CHECK(partial.append(file.view()) && partial.put_tag("BTST") && partial.put8(1));
+      partial.truncate(partial.size() - cut);
+      CHECK(storage.save(partial.view()));
+      BluetoothService service(&bus, &fw, a, &random, &storage);
+      service.start();
+      CHECK(!service.auto_reconnect() && service.bonds().count() == 1);
+    }
+    ByteBuffer wrong(a);
+    CHECK(wrong.append(file.view()) && wrong.put_tag("XXXX") && wrong.put8(1) && storage.save(wrong.view()));
+    BluetoothService service(&bus, &fw, a, &random, &storage);
+    service.start();
+    CHECK(!service.auto_reconnect());
+    ByteBuffer on(a);
+    CHECK(on.append(file.view()) && on.put_tag("BTST") && on.put8(3) && storage.save(on.view()));
+    BluetoothService again(&bus, &fw, a, &random, &storage);
+    again.start();
+    CHECK(again.auto_reconnect());
+  }
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_crypto();
@@ -1155,9 +1457,13 @@ int main() {
   test_bonds_and_encryption();
   test_garbage();
   test_service_stack();
+  test_key_maps();
+  test_ps2_media_keys();
   test_hid_descriptor();
   test_hid_end_to_end();
   test_profile_plugin();
+  test_system_details();
+  test_auto_reconnect_setting();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("bluetooth stack tests passed\n");
   return 0;

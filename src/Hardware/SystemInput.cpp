@@ -21,6 +21,7 @@
 #include "Utility/String.hpp"
 #include "Hardware/Bus/Usb/Hid/UsbHidInterface.hpp"
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
+#include "Hardware/Keyboard/Usb/UsbHidConsumer.hpp"
 #include "Hardware/Keyboard/Usb/UsbHidKeyboard.hpp"
 #include "Hardware/Keyboard/Virtio/VirtioKeyboard.hpp"
 #include "Hardware/Mouse/Usb/UsbHidMouse.hpp"
@@ -76,15 +77,29 @@ uint32_t SystemInput::take_up(IUsbHostController& host_controller, uint32_t port
           release_last();
         }
       }
-    } else if (auto* m = make<UsbHidMouse>(*host, port, iface)) {
-      // Anything else HID: it is used if its report descriptor describes a pointer.
-      if (m->initialize() && mice_.add(m)) {
-        for (UsbHidMouse*& slot : usb_mice_)
-          if (!slot) { slot = m; break; }
-        ++taken;
-        notify(m->name(), "added");
-      } else {
+    } else {
+      // Anything else HID: media keys if its report descriptor has a consumer control collection, else a pointer if it describes one.
+      if (iface.is_boot_mouse()) {
+        // (a boot mouse is a mouse)
+      } else if (auto* c = make<UsbHidConsumer>(*host, port, iface)) {
+        if (c->initialize() && keyboards_.add(c)) {
+          for (UsbHidConsumer*& slot : usb_consumers_)
+            if (!slot) { slot = c; break; }
+          ++taken;
+          notify(c->name(), "added");
+          continue;
+        }
         release_last();
+      }
+      if (auto* m = make<UsbHidMouse>(*host, port, iface)) {
+        if (m->initialize() && mice_.add(m)) {
+          for (UsbHidMouse*& slot : usb_mice_)
+            if (!slot) { slot = m; break; }
+          ++taken;
+          notify(m->name(), "added");
+        } else {
+          release_last();
+        }
       }
     }
   }
@@ -124,6 +139,16 @@ uint32_t SystemInput::drop_removed() {
     if (!k || k->present()) continue;
     UsbHidKeyboard* gone = k;
     k = nullptr;
+    gone->release_all();
+    keyboards_.remove(gone);
+    notify(gone->name(), "removed");
+    destroy(gone);
+    ++dropped;
+  }
+  for (UsbHidConsumer*& c : usb_consumers_) {
+    if (!c || c->present()) continue;
+    UsbHidConsumer* gone = c;
+    c = nullptr;
     gone->release_all();
     keyboards_.remove(gone);
     notify(gone->name(), "removed");

@@ -31,16 +31,34 @@ void set_message(char (&out)[96], const char* text) {
 BluetoothService::BluetoothService(IUsbBus* usb, IBluetoothFirmwareSource* firmware, allocators::IAllocator& allocator, crypto::IRandom* random, IBluetoothBondStorage* bonds)
     : usb_(usb), firmware_(firmware), allocator_(allocator), random_(random), bond_storage_(bonds), entries_(allocator) {}
 
+// The file is the bonds (SmBondStore's form) followed by the settings: "BTST" and a byte of flags (bit 0: reconnect bonded devices automatically). A file without them (written before
+// there were settings) leaves the defaults.
 bool BluetoothService::save_bonds() {
   if (!bond_storage_) return false;
   ByteBuffer bytes(allocator_);
-  return bonds_.serialize(bytes) && bond_storage_->save(bytes.view());
+  if (!bonds_.serialize(bytes) || !bytes.put_tag("BTST") || !bytes.put8(auto_reconnect_ ? 1 : 0)) return false;
+  return bond_storage_->save(bytes.view());
+}
+
+void BluetoothService::set_auto_reconnect(bool on) {
+  if (on == auto_reconnect_) return;
+  auto_reconnect_ = on;
+  for (uint32_t i = 0; i < entries_.count(); ++i)
+    if (entries_[i]->adapter) entries_[i]->adapter->set_auto_reconnect(on);
+  save_bonds();
 }
 
 void BluetoothService::start() {
   if (bond_storage_) {
     ByteBuffer bytes(allocator_);
-    if (bond_storage_->load(bytes)) bonds_.parse(bytes.view());
+    if (bond_storage_->load(bytes)) {
+      bonds_.parse(bytes.view());
+      const ConstByteView all = bytes.view();
+      if (all.size() >= SmBondStore::kHeaderBytes && all[4] <= SmBondStore::kMaxBonds) {
+        const uint64_t at = SmBondStore::kHeaderBytes + uint64_t{all[4]} * SmBondStore::kRecordBytes;
+        if (all.size() >= at + 5 && all[at] == 'B' && all[at + 1] == 'T' && all[at + 2] == 'S' && all[at + 3] == 'T') auto_reconnect_ = (all[at + 4] & 1) != 0;
+      }
+    }
   }
   if (!usb_) return;
   // Every port counts as new once: what is plugged in now is taken, and the watcher then reports only what changes.
@@ -163,6 +181,7 @@ void BluetoothService::open(uint32_t bus_controller, IUsbHostController& host, u
       if (entry->security && entry->att) entry->att->set_security_handler(&SecurityManager::att_security, entry->security.get());
     }
     if (entry->gatt) entry->adapter = UniquePointer<HciBluetoothAdapter>::make(allocator_, *entry->controller, *entry->l2cap, *entry->att, *entry->gatt, entry->security.get(), bonds_, profiles_, allocator_);
+    if (entry->adapter && auto_reconnect_) entry->adapter->set_auto_reconnect(true);
   }
   set_message(entry->message, started == HciResult::Ok ? "ready" : started == HciResult::Timeout ? "the controller did not answer" : "bringing the controller up failed");
   entries_.push_back(util::move(entry));

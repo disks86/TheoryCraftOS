@@ -34,3 +34,6 @@ int check_2d_groups(graphics::IGraphicsDevice& device, allocators::IAllocator& a
 // Draws glyphs with the 2D renderer's glyph atlas on `device` and reads them back: 1 when they come out right (kept on the atlas, tinted by the GPU, in order with other
 // shapes), 0 when wrong, -1 when the device has no atlas.
 int check_2d_glyphs(graphics::IGraphicsDevice& device, allocators::IAllocator& allocator);
+
+// Draws a picture repeated by the sampler and a conic gradient as wedges with the 2D renderer on `device` and reads them back: 1 when right, 0 when wrong.
+int check_2d_fills(graphics::IGraphicsDevice& device, allocators::IAllocator& allocator);

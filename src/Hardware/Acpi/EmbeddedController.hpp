@@ -21,6 +21,7 @@
 // controller's events are found by the caller: status() shows SCI_EVT, query() asks which event it was.
 #pragma once
 #include <stdint.h>
+#include "Kernel/Sync.hpp"
 
 namespace hardware {
 
@@ -67,6 +68,7 @@ class EmbeddedController {
   void finish(bool ok) { failures_ = ok ? 0 : failures_ + 1; }
 
   IEcPorts& ports_;
+  kernel::Mutex mutex_;                // a transaction on the two ports is not interleaved with another (the battery's interpreter and the event interpreter share the controller)
   uint16_t data_port_ = 0, command_port_ = 0;
   uint32_t failures_ = 0;
 };

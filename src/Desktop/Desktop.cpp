@@ -75,6 +75,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       network_properties_(allocator),
       wireless_properties_(allocator),
       device_properties_(allocator),
+      bluetooth_properties_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
       database_url_(allocator),
@@ -191,6 +192,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   computer_manager_.on_open_network_properties({&Desktop::on_network_properties, this});
   computer_manager_.on_open_wireless_properties({&Desktop::on_wireless_properties, this});
   computer_manager_.on_open_device_properties({&Desktop::on_device_properties, this});
+  computer_manager_.on_open_bluetooth_properties({&Desktop::on_bluetooth_properties, this});
   input_.set_confine(&Desktop::confine_pointer, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
@@ -199,6 +201,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
 bool Desktop::on_shortcut(void* self, const KeyArgs& args) {
   namespace key = hardware::key;
   auto* d = static_cast<Desktop*>(self);
+  if (d->on_media_key(args.usage)) return true;   // (these work while a dialog is up, too)
   if (d->windows_.has_modal()) return false;   // a dialog wants an answer first
   if (args.usage == key::kTab && (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt))) {
     d->window_.close_popup();
@@ -218,6 +221,93 @@ bool Desktop::on_shortcut(void* self, const KeyArgs& args) {
     return true;
   }
   return false;
+}
+
+namespace {
+constexpr int kBrightnessStep = 10, kVolumeStep = 6;
+
+// "Brightness 70%" as a toast: one at a time, replacing the last so that holding the key does not stack them.
+void show_level(Desktop& d, uint32_t* toast, StringView title, uint32_t percent) {
+  if (*toast) d.toasts().dismiss(*toast);
+  char text[8];
+  uint32_t n = 0;
+  if (percent >= 100) text[n++] = '1';
+  if (percent >= 10) text[n++] = static_cast<char>('0' + (percent / 10) % 10);
+  text[n++] = static_cast<char>('0' + percent % 10);
+  text[n++] = '%';
+  *toast = d.notify(title, StringView(text, n), gui::NoticeKind::Information, 1200);
+}
+}  // namespace
+
+void Desktop::set_display_blanked(bool blanked) {
+  if (!backlight_) return;
+  if (blanked && !blanked_) {
+    uint8_t now = 50;
+    backlight_->percent(&now);
+    level_before_blank_ = now;
+    if (backlight_->set_percent(0)) blanked_ = true;
+  } else if (!blanked && blanked_) {
+    blanked_ = false;
+    backlight_->set_percent(level_before_blank_);
+  }
+}
+
+bool Desktop::adjust_brightness(int delta_percent) {
+  if (!backlight_ || blanked_) return false;
+  uint8_t now = 50;
+  backlight_->percent(&now);
+  int next = static_cast<int>(now) + delta_percent;
+  next = next < 0 ? 0 : next > 100 ? 100 : next;
+  if (!backlight_->set_percent(static_cast<uint8_t>(next))) return false;
+  backlight_->percent(&now);
+  show_level(*this, &osd_toast_, "Brightness", now);
+  return true;
+}
+
+bool Desktop::adjust_volume(int delta_percent) {
+  if (!media_mixer_) return false;
+  const int maximum = hardware::kAudioMaxVolume;
+  int next = static_cast<int>(media_mixer_->master_volume()) + delta_percent * maximum / 100;
+  next = next < 0 ? 0 : next > maximum ? maximum : next;
+  media_mixer_->set_master_volume(static_cast<uint8_t>(next));
+  if (media_mixer_->master_muted() && delta_percent > 0) media_mixer_->set_master_muted(false);
+  show_level(*this, &osd_toast_, "Volume", static_cast<uint32_t>(media_mixer_->master_volume()) * 100 / maximum);
+  return true;
+}
+
+bool Desktop::toggle_mute() {
+  if (!media_mixer_) return false;
+  const bool muted = !media_mixer_->master_muted();
+  media_mixer_->set_master_muted(muted);
+  if (osd_toast_) toasts_.dismiss(osd_toast_);
+  osd_toast_ = notify("Volume", muted ? "Muted" : "Sound on", gui::NoticeKind::Information, 1200);
+  return true;
+}
+
+bool Desktop::on_media_key(uint8_t usage) {
+  namespace key = hardware::key;
+  switch (usage) {
+    case key::kBrightnessUp: adjust_brightness(kBrightnessStep); return true;      // (consumed even without a backlight: the key is the desktop's)
+    case key::kBrightnessDown: adjust_brightness(-kBrightnessStep); return true;
+    case key::kVolumeUp: adjust_volume(kVolumeStep); return true;
+    case key::kVolumeDown: adjust_volume(-kVolumeStep); return true;
+    case key::kMute: toggle_mute(); return true;
+    case key::kMediaPlayPause:
+      if (audio::AudioPlayer* player = media_player_.audio_player()) {
+        if (player->playing()) player->pause(); else player->play();
+      }
+      return true;
+    case key::kMediaNext:
+      if (media_player_.manager()) media_player_.next_track();       // (only with the player open: the key is not for a window that is not there)
+      return media_player_.manager() != nullptr;
+    case key::kMediaPrevious:
+      if (media_player_.manager()) media_player_.previous_track();
+      return media_player_.manager() != nullptr;
+    case key::kMediaStop:
+      if (audio::AudioPlayer* player = media_player_.audio_player()) player->stop();
+      return true;
+    default: return false;
+  }
 }
 
 void Desktop::set_file_system(filesystem::IFileSystem* fs) {
@@ -833,6 +923,19 @@ void Desktop::on_device_properties(void* self, Control&) {
   d->open_device_properties(d->computer_manager_.device_group(), d->computer_manager_.device_id());
 }
 
+void Desktop::open_bluetooth_properties(uint32_t adapter) {
+  window_.locked([&] {
+    bluetooth_properties_.show_adapter(adapter);
+    if (bluetooth_properties_.manager()) bluetooth_properties_.activate();
+    else windows_.add_window(&bluetooth_properties_);
+  });
+}
+
+void Desktop::on_bluetooth_properties(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->open_bluetooth_properties(d->computer_manager_.bluetooth_adapter());
+}
+
 void Desktop::open_file_properties(StringView path) {
   window_.locked([&] {
     file_properties_.show(path);
@@ -1103,6 +1206,7 @@ void Desktop::pump(uint64_t uptime_us) {
   input_.pump();
   web_browser_.tick(uptime_us);
   toasts_.tick(uptime_us);
+  if (media_player_.manager()) window_.locked([&] { media_player_.pump(); });
   web_notifications_.pump();
   if (browser_store_ && browser_data_restored_ && uptime_us - last_browser_save_us_ > 30000000ull) {   // (the data of the browser is saved when it changed, at most every half minute)
     last_browser_save_us_ = uptime_us;
@@ -1134,6 +1238,11 @@ void Desktop::pump(uint64_t uptime_us) {
   if (monitors_ && second != polled_monitors_second_) {
     polled_monitors_second_ = second;
     if (monitors_->poll()) apply_monitor_changes();
+  }
+  const uint64_t quarter = uptime_us / 250000;
+  if (quarter != polled_quarter_) {
+    polled_quarter_ = quarter;
+    if (bluetooth_properties_.manager()) bluetooth_properties_.update();
   }
   if (second != polled_second_) {
     polled_second_ = second;

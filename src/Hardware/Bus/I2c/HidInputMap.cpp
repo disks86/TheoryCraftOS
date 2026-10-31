@@ -48,6 +48,8 @@ int32_t item_value(const uint8_t* p, uint32_t size, bool is_signed) {
 
 bool HidInputMap::parse(ConstByteView d) {
   fields_.clear();
+  features_.clear();
+  for (uint32_t& b : feature_bits_) b = 0;
   application_count_ = 0;
   uses_ids_ = false;
   for (uint32_t& b : report_bits_) b = 0;
@@ -63,6 +65,7 @@ bool HidInputMap::parse(ConstByteView d) {
   uint32_t usage_count = 0;
   uint32_t range_min = 0, range_max = 0;
   bool have_range = false;
+  uint8_t current_app = 0;
 
   uint64_t at = 0;
   while (at < d.size()) {
@@ -99,6 +102,7 @@ bool HidInputMap::parse(ConstByteView d) {
           if (unsigned_value == 0 || unsigned_value > 255) return false;
           uses_ids_ = true;
           if (report_bits_[g.report_id] == 0) report_bits_[g.report_id] = 8;           // (the id byte)
+          if (feature_bits_[g.report_id] == 0) feature_bits_[g.report_id] = 8;
           break;
         case 9: g.report_count = unsigned_value; break;
         case 10: if (pushed_count >= kMaxPushed) return false; pushed[pushed_count++] = g; break;
@@ -135,6 +139,7 @@ bool HidInputMap::parse(ConstByteView d) {
         if (depth == 0 && unsigned_value == 1 && application_count_ < kMaxApplications) {      // an application collection
           applications_[application_count_].usage_page = c.page;
           applications_[application_count_].usage = c.usage;
+          current_app = static_cast<uint8_t>(application_count_);
           ++application_count_;
         }
         stack[depth++] = c;
@@ -166,10 +171,39 @@ bool HidInputMap::parse(ConstByteView d) {
             f.unit = g.unit;
             f.unit_exponent = g.unit_exponent;
             f.slot = slot;
+            f.application = current_app;
             if (fields_.count() >= kMaxFields || !fields_.push_back(f)) return false;
           }
         }
         report_bits_[g.report_id] += static_cast<uint32_t>(bits);
+      } else if (tag == 11) {                                   // feature
+        const bool constant = unsigned_value & 1, variable = unsigned_value & 2;
+        const uint64_t bits = static_cast<uint64_t>(g.report_size) * g.report_count;
+        if (g.report_size > 32 || bits + feature_bits_[g.report_id] > kMaxReportBits) return false;
+        if (!constant) {
+          const uint32_t reports = variable ? g.report_count : 1;
+          for (uint32_t i = 0; i < reports; ++i) {
+            HidFeature f;
+            f.report_id = g.report_id;
+            f.application = current_app;
+            f.bit_offset = feature_bits_[g.report_id] + i * g.report_size;
+            f.bit_size = static_cast<uint8_t>(g.report_size);
+            f.logical_min = g.logical_min;
+            f.logical_max = g.logical_max;
+            if (variable) {
+              const uint32_t ui = usage_count == 0 ? 0 : (i < usage_count ? i : usage_count - 1);
+              f.owner_page = usage_count == 0 ? g.usage_page : usage_pages[ui];
+              f.owner_usage = usage_count == 0 ? 0 : static_cast<uint16_t>(usages[ui]);
+            } else {
+              f.is_array = true;
+              f.owner_page = depth > 0 ? stack[depth - 1].page : g.usage_page;
+              f.owner_usage = depth > 0 ? stack[depth - 1].usage : 0;
+              for (uint32_t u = 0; u < usage_count && f.usage_count < 8; ++u) f.usages[f.usage_count++] = static_cast<uint16_t>(usages[u]);
+            }
+            if (features_.count() >= kMaxFields || !features_.push_back(f)) return false;
+          }
+        }
+        feature_bits_[g.report_id] += static_cast<uint32_t>(bits);
       }
       usage_count = 0;
       have_range = false;

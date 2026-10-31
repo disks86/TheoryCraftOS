@@ -94,6 +94,17 @@ const ReflectedAttribute* find_reflected(StringView js) {
   return nullptr;
 }
 
+// A custom element's class says what its own names are: Polymer elements have an async() method, a `name` or `disabled` property of their own. Only the
+// prototypes between the element and HTMLElement.prototype are looked at (the script's; the built-in ones are not).
+bool defined_by_script(Vm& vm, DomBindings::Impl& c, JsObject* element, JsString* key) {
+  for (JsObject* p = element->proto; p && p != c.html_proto; p = p->proto) {
+    Value value;
+    uint8_t flags;
+    if (vm.own_property(p, key, &value, &flags)) return true;
+  }
+  return false;
+}
+
 // --- Small helpers -----------------------------------------------------------------------------------------------------
 
 bool is_container(const dom::Node* n) { return n->type == dom::NodeType::Element || n->type == dom::NodeType::Document || n->type == dom::NodeType::Fragment; }
@@ -620,6 +631,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return false;   // (token lists, and the flag of a style sheet: the script's accessors)
   if (in_svg_namespace(n) && svg_own_name(k)) return false;
   if (const ReflectedAttribute* r = find_reflected(k)) {
+    if (element && n->name.view().contains('-') && defined_by_script(vm, c, o, key)) return false;
     StringView v;
     const bool present = dom::get_attribute(n, r->attribute, &v);
     switch (IS("value") && n->is_tag("li") ? Reflect::Int : r->kind) {   // (an <li>'s value is a number)
@@ -786,6 +798,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return HostClass::Set::NotHandled;
   if (in_svg_namespace(n) && svg_own_name(k)) return HostClass::Set::NotHandled;
   if (const ReflectedAttribute* r = find_reflected(k)) {
+    if (n->is_element() && n->name.view().contains('-') && defined_by_script(vm, impl(vm), o, key)) return HostClass::Set::NotHandled;
     switch (r->kind) {
       case Reflect::Bool:
         if (Vm::to_boolean(value)) return done(dom::set_attribute(n, r->attribute, ""));
@@ -1481,6 +1494,26 @@ NATIVE(doc_has_focus) {
 
 NATIVE(illegal_constructor) { return vm.throw_error(ErrorKind::TypeError, "Illegal constructor"); }
 
+// HTMLElement itself: `new` on it is illegal, but Reflect.construct(HTMLElement, [], Registered) (what the ES5 custom element adapters and Polymer do in place of super())
+// reaches here with the element construct_element made for the registered class as `this`: that element is the result.
+// While an element is being upgraded (`__upgrading`, set by the custom elements script around the constructor) the constructor of that element is the one that is
+// running: HTMLElement answers with the element itself, not with a new one (the construction stack of the specification), so that what the constructor sets up
+// ends up on the element that is in the document.
+NATIVE(html_element_constructor) {
+  dom::Node* n = self.is_object() ? node_of(self) : nullptr;
+  if (!n || !n->is_element()) return vm.throw_error(ErrorKind::TypeError, "Illegal constructor");
+  *result = self;
+  Value upgrading;
+  if (vm.get_named(Value::make_object(vm.global()), "__upgrading", &upgrading) && upgrading.is_object() && upgrading.as_object()->proto == self.as_object()->proto) {
+    dom::Node* target = node_of(upgrading);
+    if (target && target->is_element()) {
+      vm.define_named(vm.global(), "__upgrading", Value(), 0);   // (taken: elements the constructor makes itself are new ones)
+      *result = upgrading;
+    }
+  }
+  return true;
+}
+
 // new EventTarget(): an object that has listeners and can be dispatched to (and the base of the script classes that are event targets).
 NATIVE(event_target_constructor) {
   if (!self.is_object() || self.as_object() == vm.global() || node_of(self)) return vm.throw_error(ErrorKind::TypeError, "Failed to construct 'EventTarget': Please use the 'new' operator.");
@@ -1955,7 +1988,7 @@ bool install_nodes(DomBindings::Impl& c) {
     make_class(c, "Window", illegal_constructor, window_proto);
     g->proto = window_proto;
   }
-  make_class(c, "HTMLElement", illegal_constructor, c.html_proto);
+  make_class(c, "HTMLElement", html_element_constructor, c.html_proto);
   {   // one interface for each kind of element, so instanceof tells an <input> from a <div>
     static const struct {
       const char* interface;

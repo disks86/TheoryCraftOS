@@ -72,6 +72,8 @@ struct D3d9Program::State {
   const uint8_t* constants = nullptr;
   const graphics::ITextureSet* textures = nullptr;
   const graphics::ComputeContext* compute = nullptr;
+  bool no_stores = false;              // a run for a neighbour's sake (a helper pixel): nothing is written
+  const ByteView* storage = nullptr;   // the storage buffers: a compute shader's, or those a draw's shaders can read (kMaxStorageBuffers views)
   const graphics::GeometryInputData* geometry_in = nullptr;
   const graphics::HullInputData* hull_in = nullptr;        // a hull shader's input control points
   const graphics::HullOutputData* patch_in = nullptr;      // a domain shader's patch (control points and constants)
@@ -83,6 +85,11 @@ struct D3d9Program::State {
   bool killed = false;
   bool at_barrier = false;     // the run stopped at a barrier ...
   uint64_t barrier_pc = 0;     // ... and goes on from this instruction
+  // Derivatives: the pixel's context (its quad) and, in a run made for the derivative of another pixel's value, the instruction whose source it hands back.
+  const graphics::FragmentContext* fragment = nullptr;
+  uint32_t derivative_depth = 0;
+  uint64_t capture_at = ~uint64_t{0};
+  Q captured = {{0, 0, 0, 0}};
 };
 
 D3d9Program::D3d9Program(allocators::IAllocator& allocator) : allocator_(allocator), code_(allocator), defs_(allocator), bools_(allocator) {}
@@ -121,14 +128,14 @@ int8_t semantic_slot(uint32_t usage, uint32_t index) {
 }  // namespace
 
 uint32_t D3d9Program::required_features() const {
-  uint32_t kinds = 0;
+  uint32_t kinds = uses_fragment_stores_ ? graphics::kFeatureFragmentStores : 0u;
   for (graphics::TextureKind k : texture_kind_)
     if (k != graphics::TextureKind::Texture2D) kinds = graphics::kFeatureTextureKinds;
   if (stage_ == graphics::ShaderStage::Compute) kinds |= graphics::kFeatureCompute;
   if (stage_ == graphics::ShaderStage::Geometry) kinds |= graphics::kFeatureGeometryShaders;
   if (stage_ == graphics::ShaderStage::Hull || stage_ == graphics::ShaderStage::Domain) kinds |= graphics::kFeatureTessellation;
   return kinds | (uses_system_values_ ? graphics::kFeatureSystemInputs : 0u) | (uses_texel_access_ ? graphics::kFeatureTexelAccess : 0u) |
-         (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u);
+         (color_outputs_ > 1 ? graphics::kFeatureMultipleTargets : 0u) | (uses_graphics_storage_ ? graphics::kFeatureStorageInDraws : 0u);
 }
 
 bool d3d9_op_writes_register(uint16_t op) {
@@ -445,6 +452,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
     return push_constant(index);
   };
   bool int_mode = false;   // the instruction being run works on integers: negate and abs of its sources are integer ones
+  bool double_mode = false;   // ... or on doubles: they act on the pair, through its high word
   auto fetch = [&](const Instr::Src& src, uint32_t offset) {
     Q v = {{0, 0, 0, 0}};
     switch (src.type) {
@@ -507,7 +515,14 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       default: break;
     }
     Q r = {{v.f[src.swizzle[0]], v.f[src.swizzle[1]], v.f[src.swizzle[2]], v.f[src.swizzle[3]]}};
-    if (src.modifier != kModNone) {
+    if (src.modifier != kModNone && double_mode) {
+      for (uint32_t pair = 0; pair < 2; ++pair) {
+        uint32_t high = bits_of(r.f[2 * pair + 1]);
+        if (src.modifier == kModAbs || src.modifier == kModAbsNeg) high &= 0x7FFFFFFFu;
+        if (src.modifier == kModNeg || src.modifier == kModAbsNeg) high ^= 0x80000000u;
+        r.f[2 * pair + 1] = from_bits(high);
+      }
+    } else if (src.modifier != kModNone) {
       for (float& c : r.f) {
         if (int_mode && (src.modifier == kModNeg || src.modifier == kModAbs || src.modifier == kModAbsNeg)) {
           int32_t x = __builtin_bit_cast(int32_t, c);
@@ -559,12 +574,50 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
     }
   };
 
+  // The difference along an axis of the value `a` of the instruction at `at`, over the pair of the quad (see kDdx): the other pixel's value is found by running the shader up to `at` on its
+  // varyings (a pixel run for this, which hands back what the instruction read: s.capture_at). Zero without a quad.
+  auto quad_difference = [&](const Q& a, uint64_t at, bool y_axis, bool coarse) {
+    Q zero = {{0, 0, 0, 0}};
+    const graphics::FragmentContext* f = s.fragment;
+    if (!f || !f->quad_fn || s.derivative_depth >= 2) return zero;
+    const uint32_t own = f->quad_corner & 3;
+    uint32_t corner[2];
+    if (!y_axis) corner[0] = coarse ? 0 : (own & 2), corner[1] = corner[0] + 1;
+    else corner[0] = coarse ? 0 : (own & 1), corner[1] = corner[0] + 2;
+    Q value[2];
+    for (uint32_t k = 0; k < 2; ++k) {
+      if (corner[k] == own) {
+        value[k] = a;
+        continue;
+      }
+      graphics::Vec4 varyings[graphics::kMaxVaryings] = {}, position = {};
+      f->quad_fn(f->quad_user, corner[k], varyings, &position);
+      State other = {};
+      other.varyings = varyings;
+      other.constants = s.constants;
+      other.textures = s.textures;
+      other.storage = s.storage;
+      other.no_stores = true;
+      for (uint32_t n = 0; n < kSysValueCount; ++n) other.sys[n] = s.sys[n];
+      other.sys[kSysPosition] = {{position.x, position.y, position.z, position.w}};
+      other.fragment = f;
+      other.derivative_depth = s.derivative_depth + 1;
+      other.capture_at = at;
+      execute(other, 0, at + 1);
+      value[k] = other.captured;
+    }
+    Q r = {{0, 0, 0, 0}};
+    for (int i = 0; i < 4; ++i) r.f[i] = value[1].f[i] - value[0].f[i];
+    return r;
+  };
+
   const uint64_t count = code_.count() < end ? code_.count() : end;
   uint32_t steps = 0;   // (a loop that never ends stops the program, not the machine)
   for (uint64_t pc = begin; pc < count;) {
     if (++steps > kMaxSteps) return;
     const Instr& ins = code_[pc++];
     int_mode = ins.op >= kIntegerFirst && ins.op <= kIntegerLast;
+    double_mode = ins.op >= kDoubleFirst && ins.op <= kDoubleLast;
     Q a = {{0, 0, 0, 0}}, b = a, c = a, r = a;
     if (ins.src_count > 0 && ins.op != kM4x4 && ins.op != kM4x3 && ins.op != kM3x4 && ins.op != kM3x3 && ins.op != kM3x2) a = fetch(ins.src[0], 0);
     switch (ins.op) {
@@ -598,11 +651,21 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         break;
       case kDiscardNz:
       case kDiscardZ:
-        if ((bits_of(a.f[0]) != 0) == (ins.op == kDiscardNz)) {
+        if ((bits_of(a.f[0]) != 0) == (ins.op == kDiscardNz) && s.capture_at == ~uint64_t{0}) {   // (a pixel run for a derivative goes on: a helper invocation)
           s.killed = true;
           return;
         }
         break;
+      case kRetEarly: return;
+      case kDdx: case kDdy: case kDdxCoarse: case kDdyCoarse: {
+        if (s.capture_at == pc - 1) {
+          s.captured = a;
+          return;
+        }
+        r = quad_difference(a, pc - 1, ins.op == kDdy || ins.op == kDdyCoarse, ins.op == kDdxCoarse || ins.op == kDdyCoarse);
+        store(ins.dst, r);
+        break;
+      }
       default: break;
     }
     switch (ins.op) {
@@ -650,8 +713,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         if (s.geometry_out && ins.control < graphics::kMaxGeometryStreams && s.stream_vertices[ins.control]) s.geometry_cut[ins.control] = true;
         break;
       case kBufLoad: case kBufStore: case kBufAtomic: case kBufImmAtomic: {
-        if (!s.compute || ins.uav >= graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories) break;
-        const ByteView buffer = ins.uav < graphics::kMaxStorageBuffers ? s.compute->buffers[ins.uav] : s.compute->shared[ins.uav - graphics::kMaxStorageBuffers];
+        if (ins.uav >= graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories || (ins.uav < graphics::kMaxStorageBuffers ? !s.storage : !s.compute)) break;
+        const ByteView buffer = ins.uav < graphics::kMaxStorageBuffers ? s.storage[ins.uav] : s.compute->shared[ins.uav - graphics::kMaxStorageBuffers];
         // The byte address: a raw buffer's is the address; a structured one's the structure number times the stride plus the offset (an atomic gives both in one register).
         uint64_t address = bits_of(a.f[0]);
         if (ins.stride) {
@@ -666,6 +729,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         };
         auto put_word = [&](uint64_t at, uint32_t value) {
           ByteView part;
+          if (s.no_stores || s.capture_at != ~uint64_t{0}) return;
           if (!buffer.try_subview(at, 4, &part)) return;   // (a write outside the buffer is dropped)
           ByteWriter(part).le32(value);
         };
@@ -779,7 +843,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         break;
       }
       case kIAdd: case kINeg: case kIMul: case kIMad: case kIMin: case kIMax: case kUMin: case kUMax: case kUMul: case kUMad: case kUDiv: case kURem: case kIShl: case kIShr: case kUShr:
-      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: {
+      case kAnd: case kOr: case kXor: case kNot: case kFtoI: case kFtoU: case kItoF: case kUtoF: case kIEq: case kINe: case kILt: case kIGe: case kULt: case kUGe: case kUMulHi: case kIMulHi: {
         if (ins.src_count > 1) b = fetch(ins.src[1], 0);
         if (ins.src_count > 2) c = fetch(ins.src[2], 0);
         for (int i = 0; i < 4; ++i) {
@@ -790,6 +854,8 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
             case kIAdd: out = x + y; break;
             case kINeg: out = 0u - x; break;
             case kIMul: case kUMul: out = x * y; break;
+            case kUMulHi: out = static_cast<uint32_t>((uint64_t{x} * uint64_t{y}) >> 32); break;
+            case kIMulHi: out = static_cast<uint32_t>(static_cast<uint64_t>((static_cast<int64_t>(sx) * static_cast<int64_t>(sy))) >> 32); break;
             case kIMad: case kUMad: out = x * y + z; break;
             case kIMin: out = static_cast<uint32_t>(sx < sy ? sx : sy); break;
             case kIMax: out = static_cast<uint32_t>(sx > sy ? sx : sy); break;
@@ -881,6 +947,181 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
         store(ins.dst, b);
         break;
       }
+      case kF32ToF16: for (int i = 0; i < 4; ++i) r.f[i] = from_bits(graphics::float_to_half(a.f[i])); store(ins.dst, r); break;
+      case kF16ToF32: for (int i = 0; i < 4; ++i) r.f[i] = graphics::half_to_float(static_cast<uint16_t>(bits_of(a.f[i]) & 0xFFFFu)); store(ins.dst, r); break;
+      case kDAdd: case kDMul: case kDDiv: case kDFma: case kDRcp: case kDMin: case kDMax: case kDMov: case kDMovc: {
+        // doubles: the pairs the destination has in its mask (x y and / or z w)
+        if (ins.src_count > 1) b = fetch(ins.src[1], 0);
+        if (ins.src_count > 2) c = fetch(ins.src[2], 0);
+        auto pair_of = [](const Q& q, uint32_t k) { return __builtin_bit_cast(double, uint64_t{bits_of(q.f[2 * k])} | uint64_t{bits_of(q.f[2 * k + 1])} << 32); };
+        for (uint32_t k = 0; k < 2; ++k) {
+          if ((ins.dst.mask >> (2 * k) & 3) != 3) continue;
+          double x = pair_of(a, k), y = ins.src_count > 1 ? pair_of(b, k) : 0.0, z = ins.src_count > 2 ? pair_of(c, k) : 0.0, v = 0.0;
+          switch (ins.op) {
+            case kDAdd: v = x + y; break;
+            case kDMul: v = x * y; break;
+            case kDDiv: v = x / y; break;
+            case kDFma: v = x * y + z; break;
+            case kDRcp: v = 1.0 / x; break;
+            case kDMin: v = (x != x) ? y : (y != y) ? x : (x < y ? x : y); break;
+            case kDMax: v = (x != x) ? y : (y != y) ? x : (x > y ? x : y); break;
+            case kDMov: v = x; break;
+            default: v = (bits_of(a.f[2 * k]) | bits_of(a.f[2 * k + 1])) != 0 ? y : z; break;   // dmovc: the condition is the pair's own bits, taken from the first source
+          }
+          const uint64_t bits = __builtin_bit_cast(uint64_t, v);
+          r.f[2 * k] = from_bits(static_cast<uint32_t>(bits)), r.f[2 * k + 1] = from_bits(static_cast<uint32_t>(bits >> 32));
+        }
+        store(ins.dst, r);
+        break;
+      }
+      case kDEq: case kDGe: case kDLt: case kDNe: case kDToF: case kDToI: case kDToU: {
+        // the result is a 32-bit value in component k for the double of the operand's pair k
+        b = ins.src_count > 1 ? fetch(ins.src[1], 0) : b;
+        auto pair_of = [](const Q& q, uint32_t k) { return __builtin_bit_cast(double, uint64_t{bits_of(q.f[2 * k])} | uint64_t{bits_of(q.f[2 * k + 1])} << 32); };
+        for (uint32_t k = 0; k < 2; ++k) {
+          if (!(ins.dst.mask >> k & 1)) continue;
+          const double x = pair_of(a, k), y = ins.src_count > 1 ? pair_of(b, k) : 0.0;
+          switch (ins.op) {
+            case kDEq: r.f[k] = from_bits(x == y ? 0xFFFFFFFFu : 0u); break;
+            case kDGe: r.f[k] = from_bits(x >= y ? 0xFFFFFFFFu : 0u); break;
+            case kDLt: r.f[k] = from_bits(x < y ? 0xFFFFFFFFu : 0u); break;
+            case kDNe: r.f[k] = from_bits(x != y ? 0xFFFFFFFFu : 0u); break;
+            case kDToF: r.f[k] = static_cast<float>(x); break;
+            case kDToI: r.f[k] = from_bits(x != x ? 0u : x >= 2147483647.0 ? 0x7FFFFFFFu : x <= -2147483648.0 ? 0x80000000u : static_cast<uint32_t>(static_cast<int32_t>(x))); break;
+            default: r.f[k] = from_bits(x != x || x <= 0.0 ? 0u : x >= 4294967295.0 ? 0xFFFFFFFFu : static_cast<uint32_t>(x)); break;
+          }
+        }
+        store(ins.dst, r);
+        break;
+      }
+      case kFToD: case kIToD: case kUToD: {
+        // the pair k of the destination from the source's component k
+        for (uint32_t k = 0; k < 2; ++k) {
+          if ((ins.dst.mask >> (2 * k) & 3) != 3) continue;
+          const double v = ins.op == kFToD ? static_cast<double>(a.f[k]) : ins.op == kIToD ? static_cast<double>(__builtin_bit_cast(int32_t, a.f[k])) : static_cast<double>(bits_of(a.f[k]));
+          const uint64_t bits = __builtin_bit_cast(uint64_t, v);
+          r.f[2 * k] = from_bits(static_cast<uint32_t>(bits)), r.f[2 * k + 1] = from_bits(static_cast<uint32_t>(bits >> 32));
+        }
+        store(ins.dst, r);
+        break;
+      }
+      case kTexCompare: {
+        // sample_c: the footprint's four texels compared with the reference (passing where reference <= texel), then filtered bilinearly by the position inside it
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        uint32_t w = 0, h = 0, levels = 0;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
+          const float reference = fetch(ins.src[2], 0).f[0];
+          const float px = a.f[0] * static_cast<float>(w) - 0.5f, py = a.f[1] * static_cast<float>(h) - 0.5f;
+          const float x = floor_(px), y = floor_(py), fx = px - x, fy = py - y;
+          float pass[2][2];   // [row][column]
+          for (uint32_t row = 0; row < 2; ++row)
+            for (uint32_t col = 0; col < 2; ++col) {
+              const graphics::Vec4 t = s.textures->sample_lod(unit, (x + static_cast<float>(col) + 0.5f) / static_cast<float>(w), (y + static_cast<float>(row) + 0.5f) / static_cast<float>(h), 0.0f);
+              pass[row][col] = reference <= t.x ? 1.0f : 0.0f;
+            }
+          const float top = pass[0][0] * (1.0f - fx) + pass[0][1] * fx, bottom = pass[1][0] * (1.0f - fx) + pass[1][1] * fx;
+          const float value = top * (1.0f - fy) + bottom * fy;
+          b = {{value, value, value, value}};
+        }
+        store(ins.dst, b);
+        break;
+      }
+      case kTexGather: {
+        // The four texels of the bilinear footprint of (u, v), component `control` of each: x (i0, j0 + 1), y (i1, j0 + 1), z (i1, j0), w (i0, j0). Each is looked up by a filtered sample at
+        // the middle of its texel, so that the sampler's address mode (wrap, clamp, mirror) does what it does for any other lookup.
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        uint32_t w = 0, h = 0, depth = 1, levels = 0;
+        const graphics::TextureKind kind = unit < graphics::kMaxTextureUnits ? texture_kind_[unit] : graphics::TextureKind::Texture2D;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size_volume(unit, 0, &w, &h, &depth, &levels) && w && h) {
+          const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+          // (a cube: the direction picks a face and a place on it; the taps are looked up by the directions of their texel middles, kept on the face)
+          int face = 0;
+          float u = a.f[0], v = a.f[1];
+          if (kind == graphics::TextureKind::TextureCube) {
+            const float ax = a.f[0] < 0 ? -a.f[0] : a.f[0], ay = a.f[1] < 0 ? -a.f[1] : a.f[1], az = a.f[2] < 0 ? -a.f[2] : a.f[2];
+            float major, sc, tc;
+            if (ax >= ay && ax >= az) face = a.f[0] < 0, major = ax, sc = a.f[0] < 0 ? a.f[2] : -a.f[2], tc = -a.f[1];
+            else if (ay >= az) face = 2 + (a.f[1] < 0), major = ay, sc = a.f[0], tc = a.f[1] < 0 ? -a.f[2] : a.f[2];
+            else face = 4 + (a.f[2] < 0), major = az, sc = a.f[2] < 0 ? -a.f[0] : a.f[0], tc = -a.f[1];
+            if (major == 0) major = 1;
+            u = 0.5f * (sc / major + 1.0f), v = 0.5f * (tc / major + 1.0f);
+          }
+          // (an offset moves the footprint by whole texels: a register's x and y as integers, or the instruction's own)
+          float offset_x = static_cast<float>(ins.texel_offset[0]), offset_y = static_cast<float>(ins.texel_offset[1]);
+          uint32_t next = 2;
+          if (ins.control & 8) {
+            const Q o = fetch(ins.src[next++], 0);
+            offset_x = static_cast<float>(__builtin_bit_cast(int32_t, o.f[0])), offset_y = static_cast<float>(__builtin_bit_cast(int32_t, o.f[1]));
+          }
+          const bool compare = (ins.control & 4) != 0;
+          const float reference = compare ? fetch(ins.src[next], 0).f[0] : 0.0f;
+          const float x = floor_(u * fw - 0.5f) + offset_x, y = floor_(v * fh - 0.5f) + offset_y;
+          const float xs[4] = {x, x + 1, x + 1, x}, ys[4] = {y + 1, y + 1, y, y};
+          for (uint32_t k = 0; k < 4; ++k) {
+            float tx = xs[k], ty = ys[k];
+            graphics::Vec4 t;
+            if (kind == graphics::TextureKind::TextureCube) {
+              tx = tx < 0 ? 0 : tx > fw - 1 ? fw - 1 : tx, ty = ty < 0 ? 0 : ty > fh - 1 ? fh - 1 : ty;
+              const float sn = 2.0f * (tx + 0.5f) / fw - 1.0f, tn = 2.0f * (ty + 0.5f) / fh - 1.0f;
+              float d[3];
+              switch (face) {
+                case 0: d[0] = 1, d[1] = -tn, d[2] = -sn; break;
+                case 1: d[0] = -1, d[1] = -tn, d[2] = sn; break;
+                case 2: d[0] = sn, d[1] = 1, d[2] = tn; break;
+                case 3: d[0] = sn, d[1] = -1, d[2] = -tn; break;
+                case 4: d[0] = sn, d[1] = -tn, d[2] = 1; break;
+                default: d[0] = -sn, d[1] = -tn, d[2] = -1; break;
+              }
+              t = s.textures->sample_lod_volume(unit, d[0], d[1], d[2], 0.0f);
+            } else if (kind == graphics::TextureKind::Texture2DArray) {
+              t = s.textures->sample_lod_volume(unit, (tx + 0.5f) / fw, (ty + 0.5f) / fh, a.f[2], 0.0f);
+            } else {
+              t = s.textures->sample_lod(unit, (tx + 0.5f) / fw, (ty + 0.5f) / fh, 0.0f);
+            }
+            const float texel[4] = {t.x, t.y, t.z, t.w};
+            b.f[k] = compare ? (reference <= t.x ? 1.0f : 0.0f) : texel[ins.control & 3];
+          }
+        }
+        store(ins.dst, b);
+        break;
+      }
+      case kTexGrad: case kTexBias: case kTexQueryLod: {
+        // sample_d (the gradients are given) and sample_b (they are the quad's differences of the coordinate): the level is log2 of the longer of the two gradients in texels, plus the bias
+        b = {{0, 0, 0, 0}};
+        const uint32_t unit = ins.src[1].number;
+        uint32_t w = 0, h = 0, levels = 0;
+        if (s.textures && unit < graphics::kMaxTextureUnits && s.textures->size(unit, 0, &w, &h, &levels) && w && h) {
+          Q gx, gy;
+          float bias = 0.0f;
+          if (ins.op == kTexGrad) {
+            gx = fetch(ins.src[2], 0), gy = fetch(ins.src[3], 0);
+          } else {
+            if (s.capture_at == pc - 1) {
+              s.captured = a;
+              return;
+            }
+            gx = quad_difference(a, pc - 1, false, false), gy = quad_difference(a, pc - 1, true, false);
+            if (ins.op == kTexBias) bias = fetch(ins.src[2], 0).f[0];
+          }
+          const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+          const float lx = sqrt_(gx.f[0] * gx.f[0] * fw * fw + gx.f[1] * gx.f[1] * fh * fh), ly = sqrt_(gy.f[0] * gy.f[0] * fw * fw + gy.f[1] * gy.f[1] * fh * fh);
+          const float rho = lx > ly ? lx : ly;
+          const float lod = (rho > 0.0f ? static_cast<float>(fmath::ln(rho) * 1.4426950408889634) : -126.0f) + bias;
+          graphics::Vec4 t;
+          if (ins.op == kTexQueryLod) {
+            const float top = static_cast<float>(levels - 1);
+            t = {lod < 0.0f ? 0.0f : lod > top ? top : lod, lod, 0.0f, 0.0f};
+          } else {
+            t = s.textures->sample_lod(unit, a.f[0], a.f[1], lod);
+          }
+          const float texel[4] = {t.x, t.y, t.z, t.w};
+          b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
+        }
+        store(ins.dst, b);
+        break;
+      }
       case kTexKill: {
         const Q t = fetch(ins.src[0], 0);
         if (t.f[0] < 0 || t.f[1] < 0 || t.f[2] < 0) {
@@ -903,6 +1144,7 @@ void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t*
   s.constants = constants;
   s.sys[kSysVertexId].f[0] = from_bits(context.vertex_id);
   s.sys[kSysInstanceId].f[0] = from_bits(context.instance_id);
+  s.storage = context.storage;
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};   // (Direct3D's +Y up to the device's +Y down)
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
@@ -921,6 +1163,9 @@ bool D3d9Program::run_fragment_ex(const graphics::Vec4* varyings, const graphics
   s.sys[kSysPosition] = {{context.position.x, context.position.y, context.position.z, context.position.w}};
   s.sys[kSysFrontFacing].f[0] = from_bits(context.front_facing ? 0xFFFFFFFFu : 0u);
   s.sys[kSysPrimitiveId].f[0] = from_bits(context.primitive_id);
+  s.fragment = &context;
+  s.storage = context.storage;
+  s.no_stores = context.helper;
   execute(s);
   if (s.killed) return false;
   for (uint32_t n = 0; n < color_outputs_; ++n) color[n] = {s.color[n].f[0], s.color[n].f[1], s.color[n].f[2], s.color[n].f[3]};
@@ -935,6 +1180,7 @@ void D3d9Program::run_hull(const graphics::HullInputData& input, const uint8_t* 
   graphics::HullInputData upright = input;
   for (uint32_t k = 0; k < upright.control_points && k < graphics::kMaxPatchControlPoints; ++k) upright.position[k].y = -upright.position[k].y;
   s.hull_in = &upright;
+  s.storage = input.storage;
   // The control point phase once for each output control point, then the fork and join phases (which make the patch constants).
   for (uint32_t cp = 0; cp < tess_output_points_ && cp < graphics::kMaxPatchControlPoints; ++cp) {
     s.sys[kSysOutputControlPointId].f[0] = from_bits(cp);
@@ -957,6 +1203,7 @@ void D3d9Program::run_domain(const graphics::HullOutputData& patch, float u, flo
   State s;
   s.constants = constants;
   s.patch_in = &patch;
+  s.storage = patch.storage;
   s.sys[kSysDomainLocation] = {{u, v, w, 0.0f}};
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};
@@ -971,6 +1218,7 @@ void D3d9Program::run_geometry(const graphics::GeometryInputData& input, const u
   graphics::GeometryInputData upright = input;
   for (graphics::Vec4& p : upright.position) p.y = -p.y;
   s.geometry_in = &upright;
+  s.storage = input.storage;
   s.sys[kSysGsInstanceId].f[0] = from_bits(input.instance_id);
   s.geometry_out = output;
   output->count = 0;
@@ -982,6 +1230,7 @@ void D3d9Program::run_compute(const graphics::ComputeContext& context, const uin
   State s;
   s.constants = constants;
   s.compute = &context;
+  s.storage = context.buffers;
   for (uint32_t k = 0; k < 3; ++k) {
     s.sys[kSysDispatchThreadId].f[k] = from_bits(context.dispatch_id[k]);
     s.sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
@@ -1019,6 +1268,7 @@ void D3d9Program::run_compute_group(const graphics::ComputeContext& context, con
       State* s = new (&states[constructed]) State();
       s->constants = constants;
       s->compute = &group;
+      s->storage = group.buffers;
       const uint32_t i = constructed;
       const uint32_t tx = i % thread_group_[0], ty = (i / thread_group_[0]) % thread_group_[1], tz = i / (thread_group_[0] * thread_group_[1]);
       const uint32_t id[3] = {tx, ty, tz};

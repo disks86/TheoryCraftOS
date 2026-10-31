@@ -107,8 +107,13 @@ NtStatus VidMm::create(const AllocationDesc& requested, SharedPointer<Allocation
   desc.flags &= ~kAllocTrackState;
   const bool reserved = (desc.flags & kAllocReserved) != 0;
   desc.flags &= ~kAllocReserved;
-  if (reserved && (heap || requested.heap || !(desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocUnorderedAccess | kAllocStreamOutput)) || (desc.flags & (kAllocQueryResult | kAllocConstantBuffer | kAllocHeap | kAllocShared)) ||
-                   desc.size == 0 || desc.size % kTileBytes)) return status::kInvalidParameter;
+  // A reserved resource is a buffer of whole tiles, or a plain texture of 4-byte pixels whose sides are whole tiles of kTileTexels (one level, one sample, not a target).
+  const bool reserved_texture = reserved && desc.flags == kAllocTexture;
+  if (reserved && (heap || requested.heap || (desc.flags & (kAllocQueryResult | kAllocConstantBuffer | kAllocHeap | kAllocShared))) ) return status::kInvalidParameter;
+  if (reserved && !reserved_texture && (!(desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocUnorderedAccess | kAllocStreamOutput)) || desc.size == 0 || desc.size % kTileBytes)) return status::kInvalidParameter;
+  if (reserved_texture && (!dxgk::is_color(desc.format) || dxgk::is_wide(desc.format) || pixel_bytes(desc.format) != 4 || desc.width == 0 || desc.height == 0 || desc.width % kTileTexels || desc.height % kTileTexels ||
+                           desc.mip_levels != 1 || desc.samples != 1 || desc.kind != graphics::TextureKind::Texture2D || desc.layers != 1))
+    return status::kInvalidParameter;
   if (track_state && (requested.initial_state & ~kStateMask)) return status::kInvalidParameter;
   if (desc.flags == 0 || (desc.flags & ~kKnownFlags)) return status::kInvalidParameter;
   const bool buffer = (desc.flags & (kAllocVertexBuffer | kAllocIndexBuffer | kAllocQueryResult | kAllocUnorderedAccess | kAllocStreamOutput | kAllocConstantBuffer | kAllocHeap)) != 0;
@@ -209,7 +214,7 @@ sized:
   }
   ++next_id_;
   if (reserved)
-    for (uint64_t i = 0; i < desc.size / kTileBytes; ++i)
+    for (uint64_t i = 0, tiles = reserved_texture ? uint64_t{desc.width / kTileTexels} * (desc.height / kTileTexels) : desc.size / kTileBytes; i < tiles; ++i)
       if (!a->tiles_.push_back(Allocation::TileBinding())) return status::kNoMemory;
   a->reserved_ = reserved;
   a->state_tracked_ = track_state;
@@ -291,7 +296,28 @@ bool VidMm::create_device_object(Allocation& a) {
   return a.image_ != nullptr;
 }
 
+namespace {
+// The bytes of tile `i` of a reserved texture are rows of kTileTexels pixels, one after the other in the heap; in the backing they are the rows of the tile's place in the picture.
+bool texture_tile_row(ByteView backing, const AllocationDesc& desc, uint64_t tile, uint32_t row, ByteView* picture_row) {
+  const uint64_t across = desc.width / kTileTexels, tx = tile % across, ty = tile / across, pitch = uint64_t{desc.width} * 4;
+  return backing.try_subview((ty * kTileTexels + row) * pitch + tx * kTileTexels * 4, kTileTexels * 4, picture_row);
+}
+}  // namespace
+
 void VidMm::gather_tiles(Allocation& a) {
+  if (a.is_image()) {
+    for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
+      const Allocation::TileBinding& b = a.tiles_[i];
+      for (uint32_t row = 0; row < kTileTexels; ++row) {
+        ByteView to;
+        if (!texture_tile_row(a.cpu_, a.desc(), i, row, &to)) continue;
+        ConstByteView from;
+        if (b.heap && b.heap->backing().try_subview(b.offset + uint64_t{row} * kTileTexels * 4, kTileTexels * 4, &from)) to.copy_from(from);
+        else to.fill(0);
+      }
+    }
+    return;
+  }
   for (uint64_t i = 0; i < a.tiles_.count(); ++i) {
     ByteView tile;
     if (!a.cpu_.try_subview(i * kTileBytes, kTileBytes, &tile)) continue;
@@ -307,7 +333,10 @@ void VidMm::scatter_tiles(Allocation& a) {
     const Allocation::TileBinding& b = a.tiles_[i];
     if (!b.heap) continue;
     ByteView from, to;
-    if (a.cpu_.try_subview(i * kTileBytes, kTileBytes, &from) && b.heap->cpu_.try_subview(b.offset, kTileBytes, &to)) to.copy_from(ConstByteView(from));
+    if (a.is_image()) {
+      for (uint32_t row = 0; row < kTileTexels; ++row)
+        if (texture_tile_row(a.cpu_, a.desc(), i, row, &from) && b.heap->cpu_.try_subview(b.offset + uint64_t{row} * kTileTexels * 4, kTileTexels * 4, &to)) to.copy_from(ConstByteView(from));
+    } else if (a.cpu_.try_subview(i * kTileBytes, kTileBytes, &from) && b.heap->cpu_.try_subview(b.offset, kTileBytes, &to)) to.copy_from(ConstByteView(from));
     // (what lies in the heap's memory under placed allocations is theirs to see: their device objects are stale now)
     for (Allocation* other : b.heap->placed_) other->device_stale_ = other->cpu_written_ = true;
   }

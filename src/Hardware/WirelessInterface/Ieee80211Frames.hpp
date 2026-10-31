@@ -36,8 +36,10 @@ constexpr uint16_t kEtherTypeEapol = 0x888E;
 
 // Management frame header (24 bytes) for a frame to / from the access point `bssid` with our address `sa`, into `w`-less raw bytes.
 uint32_t build_authentication(const uint8_t bssid[6], const uint8_t sa[6], ByteView out);
-// `ssid` (1-32 bytes), `five_ghz` picks the rate set, `rsn_ie` is our RSN element (id 48 included) or empty for an open network.
-uint32_t build_association_request(const uint8_t bssid[6], const uint8_t sa[6], ConstByteView ssid, bool five_ghz, ConstByteView rsn_ie, ByteView out);
+// `ssid` (1-32 bytes), `five_ghz` picks the rate set, `rsn_ie` is our RSN element (id 48 included) or empty for an open network, `extra_elements` are more elements, whole and
+// well formed, to put at the end (the HT / VHT capabilities, at most 96 bytes).
+uint32_t build_association_request(const uint8_t bssid[6], const uint8_t sa[6], ConstByteView ssid, bool five_ghz, ConstByteView rsn_ie, ByteView out,
+                                   ConstByteView extra_elements = ConstByteView());
 uint32_t build_deauthentication(const uint8_t bssid[6], const uint8_t sa[6], uint16_t reason, ByteView out);
 // An 802.11 data frame to the access point carrying an EAPOL frame (LLC/SNAP 0x888E, to-DS, not encrypted).
 uint32_t build_eapol_data(const uint8_t bssid[6], const uint8_t sa[6], ConstByteView eapol, ByteView out);

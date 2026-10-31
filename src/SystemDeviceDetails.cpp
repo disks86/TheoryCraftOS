@@ -414,6 +414,35 @@ bool SystemInventory::describe(HardwareGroup group, uint32_t id, desktop::Device
       add_size(sink, "Data sent", stats.bytes_sent, allocator_);
       return true;
     }
+    case HardwareGroup::Bluetooth: {
+      hardware::IBluetoothAdapter* a = bluetooth_ && id < bluetooth_->adapter_count() ? bluetooth_->adapter(id) : nullptr;
+      if (!a) return false;
+      set_title(out, a->name());
+      sink.add("Type", "Bluetooth adapter");
+      const hardware::hci::BdAddr& address = a->address();
+      static const char hex[] = "0123456789ABCDEF";
+      text.clear();
+      for (int i = 5; i >= 0; --i) {
+        text.push_back(hex[address.b[i] >> 4]);
+        text.push_back(hex[address.b[i] & 15]);
+        if (i > 0) text.push_back(':');
+      }
+      sink.add("Address", text.view());
+      sink.add_flag("Ready", a->ready());
+      sink.add_flag("Searching for devices", a->discovering());
+      sink.add_flag("Reconnects paired devices", a->auto_reconnect());
+      uint32_t connected = 0, paired = 0;
+      for (uint32_t i = 0; i < a->device_count(); ++i) {
+        hardware::BluetoothDeviceInfo info;
+        if (!a->device(i, &info)) continue;
+        connected += info.state == hardware::BluetoothLinkState::Connected;
+        paired += info.paired;
+      }
+      sink.add_number("Devices found", a->device_count());
+      sink.add_number("Devices connected", connected);
+      sink.add_number("Devices paired", paired);
+      return true;
+    }
     case HardwareGroup::Cameras: {
       hardware::ICamera* c = cameras_ && id < cameras_->count() ? cameras_->at(id) : nullptr;
       if (!c) return false;

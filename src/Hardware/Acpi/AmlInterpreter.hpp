@@ -27,6 +27,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Kernel/Sync.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace acpi {
@@ -100,6 +101,10 @@ class AmlInterpreter {
   Node* find(const char* path, Node* scope = nullptr) const;
   Node* root() const;
 
+  // The interpreter runs one evaluation at a time: evaluate(), evaluate_integer(), device_has_id() and load_table() take this lock themselves. A caller that uses what evaluate()
+  // returned (a package, a buffer: valid until the next evaluation) holds it for the evaluation and for the use, or another thread's evaluation can overwrite the value.
+  kernel::RecursiveMutex& mutex();
+
   // Reads the named value or runs the method. `result` (may be nullptr) is valid until the next evaluate().
   bool evaluate(Node* node, const Value* arguments, uint32_t argument_count, Value* result);
   bool evaluate(const char* path, Value* result) { Node* n = find(path); return n && evaluate(n, nullptr, 0, result); }
@@ -113,6 +118,7 @@ class AmlInterpreter {
   Node* parent(const Node* node) const;
   bool is_device(const Node* node) const;
   bool is_method(const Node* node) const;
+  bool is_thermal_zone(const Node* node) const;
   bool is_region(const Node* node) const;
   // The four-character name of a node (not zero-terminated).
   const char* name_of(const Node* node) const;

@@ -76,6 +76,13 @@ add_executable(BOOTX64
   src/Hardware/CentralProcessingUnit/Zhaoxin/ZhaoxinGenerations.cpp
   src/Hardware/CentralProcessingUnit/SystemCpu.cpp
   src/Hardware/CentralProcessingUnit/CpuTemperature.cpp
+  src/Hardware/Power/CpuPower.cpp
+  src/Hardware/Tpm/TpmTis.cpp
+  src/Hardware/Tpm/TpmCrb.cpp
+  src/Hardware/Tpm/TpmDevice.cpp
+  src/Hardware/Tpm/TpmDriver.cpp
+  src/Hardware/Power/PowerManager.cpp
+  src/Hardware/Power/Thermal.cpp
   src/Hardware/CentralProcessingUnit/X86_64Cpu.S
   src/Hardware/IoPort.cpp
   src/Hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
@@ -85,6 +92,9 @@ add_executable(BOOTX64
   src/Hardware/Acpi/EmbeddedController.cpp
   src/Hardware/Acpi/SystemAcpiHost.cpp
   src/Hardware/Acpi/AcpiEvents.cpp
+  src/Hardware/Acpi/DellWmiHotkeys.cpp
+  src/Hardware/Backlight/AcpiBacklight.cpp
+  src/Hardware/Backlight/IntelPchBacklight.cpp
   src/Hardware/Acpi/IoApic.cpp
   src/Hardware/Acpi/SystemAcpiPorts.cpp
   src/Hardware/Battery/AcpiBattery.cpp
@@ -115,6 +125,8 @@ add_executable(BOOTX64
   src/Hardware/Guest/VirtioBalloon.cpp
   src/Hardware/Guest/SystemGuestServices.cpp
   src/Hardware/Keyboard/Usb/UsbHidKeyboard.cpp
+  src/Hardware/Keyboard/Usb/UsbHidConsumer.cpp
+  src/Hardware/Hid/HidDescriptor.cpp
   src/Hardware/Keyboard/Virtio/VirtioKeyboard.cpp
   src/Hardware/Mouse/Usb/UsbHidMouse.cpp
   src/Hardware/Mouse/Virtio/VirtioMouse.cpp
@@ -225,6 +237,10 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/Ide/IdeStorageDevice.cpp
   src/Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
   src/Hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
+  src/Hardware/StorageDevice/Sd/SdCard.cpp
+  src/Hardware/StorageDevice/Sd/SdStorageDevice.cpp
+  src/Hardware/Bus/Rtsx/RtsxHost.cpp
+  src/Hardware/Bus/Rtsx/RtsxDriver.cpp
   src/FileSystemDemo.cpp
   src/SystemFileSystem.cpp
   src/Hardware/StorageDevice/Partition/PartitionScanner.cpp
@@ -475,6 +491,7 @@ add_executable(BOOTX64
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
+  src/Desktop/Playlist.cpp
   src/Desktop/FileDialog.cpp
   src/Desktop/ColorDialog.cpp
   src/Desktop/PrintDialog.cpp
@@ -503,6 +520,8 @@ add_executable(BOOTX64
   src/SystemDeviceDetails.cpp
   src/SystemNetworkDetails.cpp
   src/SystemWirelessDetails.cpp
+  src/SystemBluetoothDetails.cpp
+  src/Desktop/BluetoothProperties.cpp
   src/Desktop/NetworkProperties.cpp
   src/Desktop/DeviceProperties.cpp
   src/Desktop/WirelessProperties.cpp
@@ -745,10 +764,20 @@ add_executable(BOOTX64
   src/Hardware/Acpi/AcpiResources.cpp
   src/Hardware/Bus/I2c/DesignWareI2c.cpp
   src/Hardware/Bus/I2c/HidInputMap.cpp
+  src/Hardware/Bus/Ish/IshIpc.cpp
+  src/Hardware/Bus/Ish/Ishtp.cpp
+  src/Hardware/Bus/Ish/IshHid.cpp
+  src/Hardware/Bus/Ish/IshDriver.cpp
   src/Hardware/Bus/I2c/I2cHidDevice.cpp
   src/Hardware/Bus/I2c/IntelGpio.cpp
   src/Hardware/Bus/I2c/LpssI2c.cpp
   src/Hardware/Mouse/I2c/I2cHidPointer.cpp
+  src/Hardware/Pen/CompositePen.cpp
+  src/Hardware/Pen/PenMouse.cpp
+  src/Hardware/Pen/I2c/I2cHidPen.cpp
+  src/Hardware/Sensor/SensorHub.cpp
+  src/Hardware/Sensor/HidSensor.cpp
+  src/Hardware/Sensor/AcpiAmbientLight.cpp
   src/Hardware/Mouse/I2c/PlatformI2cHid.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltDevices.cpp
   src/Hardware/Bus/Pci/PciMsix.cpp
@@ -773,13 +802,14 @@ add_executable(BOOTX64
   src/Hardware/Bluetooth/Smp.cpp
   src/Hardware/Bluetooth/HciBluetoothAdapter.cpp
   src/Hardware/Bluetooth/HidOverGatt.cpp
-  src/Hardware/Hid/HidDescriptor.cpp
   src/Hardware/Bluetooth/HciPackets.cpp
   src/Hardware/Bluetooth/UsbHciTransport.cpp
   src/Hardware/Bluetooth/HciController.cpp
   src/Hardware/Bluetooth/IntelBluetooth.cpp
   src/Hardware/Bluetooth/BluetoothService.cpp
   src/Hardware/WirelessInterface/Intel/IwlDevices.cpp
+  src/Hardware/WirelessInterface/Intel/IwlErrorLog.cpp
+  src/Hardware/WirelessInterface/RateScaler.cpp
   src/Hardware/WirelessInterface/Intel/IwlFirmware.cpp
   src/Hardware/WirelessInterface/Intel/IwlPcie.cpp
   src/Hardware/WirelessInterface/Intel/IwlFwLoad.cpp
@@ -794,6 +824,7 @@ add_executable(BOOTX64
   src/Hardware/WirelessInterface/Intel/IwlLink.cpp
   src/Hardware/WirelessInterface/Intel/IwlWireless.cpp
   src/Hardware/WirelessInterface/Ieee80211Scan.cpp
+  src/Hardware/WirelessInterface/Ieee80211Ht.cpp
   src/Hardware/WirelessInterface/Ieee80211Frames.cpp
   src/Hardware/WirelessInterface/Ieee80211Association.cpp
   src/Hardware/WirelessInterface/Wpa2.cpp
@@ -1116,6 +1147,22 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_POWER "Power management: Intel hardware P-states / SpeedStep under a profile that follows the battery, MWAIT idle states, thermal throttling and shutdown at the critical temperature; not yet run on a real machine" OFF)
+if(TCOS_POWER)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_POWER)
+endif()
+option(TCOS_SDCARD "Drive the SD card slot of a Realtek card reader (RTS525A, PCI 10EC:525A): a card put in becomes a removable storage device; not yet run on a real machine" OFF)
+if(TCOS_SDCARD)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_SDCARD)
+endif()
+option(TCOS_TPM "Talk to the TPM 2.0 the firmware presents (CRB through the ACPI TPM2 table, or the FIFO interface at 0xFED40000): Startup, its random numbers added to the seed of the system's generator (and its source when the CPU and the hypervisor give none); not yet run on a real machine" OFF)
+if(TCOS_TPM)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_TPM)
+endif()
+option(TCOS_ISH "Start the Intel Integrated Sensor Hub (PCI 8086:9D35 / A135): resets its IPC, brings up ISHTP and the HID client, adds the sensors to the sensor hub; not yet run on a real machine" OFF)
+if(TCOS_ISH)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_ISH)
 endif()
 option(TCOS_BLUETOOTH "Start the Bluetooth controllers on the USB ports (Intel firmware from /firmware/ibt-*.sfi, bring-up, events; nothing is scanned or paired; not yet run on a real controller)" OFF)
 if(TCOS_BLUETOOTH)

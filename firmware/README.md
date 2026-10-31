@@ -17,8 +17,10 @@ boot volume (`<build>/esp/firmware`); on an installed machine copy the files to 
 | `vegam_rlc.bin` | Run list controller microcode, version 16 | Loaded by the SMC |
 | `vegam_sdma.bin`, `vegam_sdma1.bin` | DMA engine microcode (SDMA 3.1), version 4 | Loaded by the SMC |
 | `iwlwifi-9000-pu-b0-jf-b0-46.ucode` | Intel Wireless-AC 9560 (iwlwifi 9000 family, PU MAC with the JF radio; Dell XPS 15 9575), firmware core43, API 46 | The driver tries newer API numbers first and takes the first file it finds |
+| `ibt-17-16-1.sfi`, `ibt-17-0-1.sfi` | Intel Bluetooth firmware (USB 8087:0aaa and relatives) for the Wireless-AC 9560 (JfP, hardware variant 0x11): the bootloader names the file `ibt-<variant>-<hardware revision>-<firmware revision>.sfi`; revision 16 is the common one, 0 the older | The Bluetooth service reads `/firmware/<name>` without the `intel/` of Linux's path; the controller's log line says which one it asks for |
 | `LICENSE.amdgpu` | The license these files are distributed under | Must stay with them |
-| `LICENCE.iwlwifi_firmware` | The license the Intel file is distributed under | Must stay with it |
+| `LICENCE.iwlwifi_firmware` | The license the Intel Wi-Fi file is distributed under | Must stay with it |
+| `LICENCE.ibt_firmware` | The license the Intel Bluetooth files are distributed under | Must stay with them |
 
 The three VCN 1 images are byte-identical in linux-firmware today (same SHA-256 below); they are kept under all three names because that is how the
 driver names them and AMD may make them differ. The file for a machine is chosen the way the Linux amdgpu driver chooses it (`amdgpu_ucode_ip_version_decode`, soc15.c): revision >= 8 is
@@ -56,9 +58,20 @@ c729f89ade4fcd05c390f7bbf1fcb93eda47ac6911027c707add844181004b47  vegam_rlc.bin
 
 It is read by `src/Hardware/WirelessInterface/Intel/IwlFirmware` (`IwlTest` with `IWL_FIRMWARE_FILE=firmware/iwlwifi-9000-pu-b0-jf-b0-46.ucode` takes it apart and damages it): 13 runtime and 9 init sections, 57 command versions, which include the versions the driver writes (ADD_STA 10, SCAN_REQ_UMAC 8, ADD_STA_KEY 1, TX_CMD 6, PHY_CONTEXT 2). The file lists the legacy commands under the long group (1); `IwlFirmware::command_version_of` looks there too.
 
+`ibt-17-16-1.sfi` and `ibt-17-0-1.sfi` are `intel/ibt-17-16-1.sfi` and `intel/ibt-17-0-1.sfi` of linux-firmware (the `linux-firmware-intel` 20260916-1 package), decompressed from their `.zst` and otherwise unmodified; `LICENCE.ibt_firmware` is that package's license file for them. SHA-256 (675500 and 625216 bytes):
+
+```
+a0604a0685a322e0ab2c3bd019bf862498c7b2b440ca6f515e0c8d7f849ac517  ibt-17-16-1.sfi
+43f033a45d3e594ca135eba95774d7e15ab7f5f868eecc20e14724cb9200a4cd  ibt-17-0-1.sfi
+```
+
+Each is a 644 byte signed header (the CSS header, an RSA public key and a signature, which the controller's bootloader checks) followed by a run of HCI commands, 2727 and 2525 of them, the last the Write Boot Params command with the boot address 0x00040800. `src/Hardware/Bluetooth/IntelBluetooth` sends the header and the commands in fragments that end on four bytes (all of them do, with at most 248 bytes) and `BluetoothTest` loads both files through a model of the bootloader, cut and damaged. The `.ddc` configuration files of the package are not used. Files for other hardware variants (the Wireless-AC 9260's ThP, `ibt-18-*`, and the rest) are not included: if the log says a controller asks for another file, add it from linux-firmware.
+
 ## License
 
 These files are AMD's, not part of TheoryCraftOS, and are not covered by the AGPL that covers the rest of the repository. They are redistributed
 in binary form only, under `LICENSE.amdgpu` (reproduced here, as it requires). No reverse engineering, decompilation or disassembly is permitted.
 
 The Intel file is Intel's, redistributed in binary form only under `LICENCE.iwlwifi_firmware` (reproduced here, as it requires): the copyright notice and disclaimer travel with it, Intel's name may not be used to endorse anything, and no reverse engineering, decompilation or disassembly is permitted.
+
+The Intel Bluetooth files are Intel's too, redistributed in binary form only under `LICENCE.ibt_firmware` (reproduced here), with the same conditions.

@@ -46,13 +46,14 @@ constexpr uint32_t kNone = ~0u;
 constexpr uint32_t kSlots = 128;   // 32 temporaries of four components
 constexpr uint32_t kMaxResources = 16;
 
-enum class VK : uint8_t { None, Imm, Temp, Input, Cb, Agg, CbAgg, Handle, Sys, Ptr };
+enum class VK : uint8_t { None, Imm, Temp, Input, Cb, Agg, CbAgg, Handle, Sys, Ptr, HandleVar };
 
 // What a value of the function is, in the program being made.
 struct Val {
   VK kind = VK::None;
-  uint32_t a = 0, b = 0, c = 0;   // Imm: the bits; Temp / Agg: register (a), component (b); Input: register (a), component (b); Cb: slot (a), register (b), component (c); CbAgg: slot (a), register (b); Handle: class (a), register (b)
+  uint32_t a = 0, b = 0, c = 0;   // Imm: the bits; Temp / Agg: register (a), component (b); Input: register (a), component (b); Cb: slot (a), register (b), component (c); CbAgg: slot (a), register (b); Handle: class (a), register (b); HandleVar: class (a), range (b), the value of the index (c)
   bool is_mask = false;           // (a boolean: all ones or zero)
+  bool wide = false;              // (a double: the low word in component b, the high word in b + 1 - b is 0 or 2 -; an immediate has the low word in a and the high word in c)
   uint8_t d = 0;                  // Input: 0 an input register, 1 an input control point of a domain shader (v[vertex][register]), 2 a patch constant register
 };
 
@@ -69,8 +70,8 @@ struct Resource {
 enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
-  kCBufferLoadLegacy = 59, kSample = 60, kSampleLevel = 62, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
-  kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
+  kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureGatherCmp = 74, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
+  kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kFma = 47, kMakeDouble = 101, kSplitDouble = 102, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
 };
 
 class Translator {
@@ -151,7 +152,37 @@ class Translator {
   void src(const Val& v, uint32_t modifier = 0);
   void dst_temp(uint32_t reg, uint32_t mask);
   void dst_null() { put(13u << 12); }
-  void dst_scalar(const Val& v) { dst_temp(v.a, 1u << v.b); }
+  void dst_scalar(const Val& v) { dst_temp(v.a, v.wide ? 3u << v.b : 1u << v.b); }
+  // A float that is done in 32 bits: a half is one too, rounded to a half after each operation that makes one (narrow_result); a 16-bit integer is kept zero-extended in its 32 bits, wrapped after each operation.
+  bool float32(uint32_t type) const { return m_.is_float(type) && (m_.types[type].width == 32 || m_.types[type].width == 16); }
+  bool half_type(uint32_t type) const { return m_.is_float(type) && m_.types[type].width == 16; }
+  Val sign_extended_copy(const Val& v);   // a 16-bit integer's value as a signed 32-bit one, in a register of its own
+  bool narrow_result(const Instruction& ins);
+  bool translate_one(const Instruction& ins);
+  bool binop_words(const Instruction& ins, const Val& a, const Val& b);
+  bool wide_type(uint32_t type) const { return (m_.is_float(type) && m_.types[type].width == 64) || m_.is_int(type, 64); }   // (a double or a 64-bit integer: a pair of words)
+  bool i64_binop(const Instruction& ins, const Val& a, const Val& b);
+  bool i64_compare(const Instruction& ins, const Val& a, const Val& b);
+  bool i64_cast(const Instruction& ins, const Val& a);
+  Val scratch_word();
+  Val scratch_wide() {
+    Val v;
+    v.kind = VK::Temp, v.wide = true;
+    if (!alloc_wide(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+    return v;
+  }
+  void word_op(uint32_t opcode, const Val& d, const Val& a, const Val& b);
+  void word_op1(uint32_t opcode, const Val& d, const Val& a);
+  void word_select(const Val& d, const Val& condition, const Val& a, const Val& b);
+  void divide_unsigned(const Val& a, const Val& b, const Val& quotient, const Val& remainder);
+  void negate64(const Val& r, const Val& a);
+  Val low_word(const Val& v) const;
+  Val high_word(const Val& v) const;
+  Val new_wide(uint32_t id);
+  bool alloc_wide(int32_t until, uint32_t* reg, uint32_t* comp);
+  bool double_binop(const Instruction& ins, const Val& a, const Val& b);
+  bool double_compare(const Instruction& ins, const Val& a, const Val& b);
+  bool double_cast(const Instruction& ins, const Val& a);
   void src_resource(uint32_t reg);
   void src_sampler(uint32_t reg);
 
@@ -184,6 +215,10 @@ class Translator {
   // --- the walk over the blocks (twice: once to find what lives how long, once to emit)
   bool region(uint32_t start, uint32_t stop, uint32_t pred);
   bool visit_block(uint32_t block);
+  bool is_return_block(uint32_t block) const;
+  bool returns_directly(uint32_t block) const;   // ... or one that jumps to one
+  uint32_t loop_exit_of(uint32_t header, uint32_t latch) const;
+  bool inline_return(uint32_t block, uint32_t pred);
   bool analyze(const Instruction& ins);
   bool translate(const Instruction& ins);
   bool phi_moves(uint32_t pred, uint32_t target);
@@ -208,6 +243,49 @@ class Translator {
   bool binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg);
   bool sincos(const Instruction& ins, bool cosine);
+  bool texture_gather(const Instruction& ins, bool compare);
+  // A lookup whose texture (args[1]) is an element of an array chosen by a variable: the lookup is made once for each element, behind a test of the index, into one result register.
+  template <typename F>
+  bool with_array(const Instruction& ins, F body) {
+    if (ins.arg_count < 2) return error(status::kNotSupported);
+    const Val h = use(ins.args[1]);
+    if (h.kind != VK::HandleVar) return body();
+    const Resource& range = res_[0][h.b];
+    const Val result = new_aggregate(ins.result);
+    const Val index = use(h.c);
+    Val mask;
+    mask.kind = VK::Temp;
+    if (result.kind == VK::None || !alloc_scalar(pos_ + 1, &mask.a, &mask.b)) return false;
+    forced_result_ = result;
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < range.size; ++i) {
+      Val element, number;
+      element.kind = VK::Handle, element.a = 0, element.b = h.b, element.c = range.lower + i;
+      number.kind = VK::Imm, number.a = range.lower + i;
+      {
+        const uint32_t at = begin(32);   // ieq
+        dst_scalar(mask);
+        src(index), src(number);
+        finish(at);
+      }
+      {
+        const uint32_t at = begin(31, 1u << 18);   // if_nz
+        src(mask);
+        finish(at);
+      }
+      vals_[ins.args[1]] = element;
+      ok = body();
+      finish(begin(21));   // endif
+    }
+    vals_[ins.args[1]] = h;
+    forced_result_ = Val();
+    return ok && define(ins.result, result);
+  }
+  Val forced_result_;
+  bool calculate_lod(const Instruction& ins);
+  bool sample_compare(const Instruction& ins, bool level_zero);
+  bool sample_bias_grad(const Instruction& ins, bool gradients);
+  bool inverse_trig(const Instruction& ins, uint32_t opcode);
   bool trig(const Instruction& ins, uint32_t opcode);
   bool classify(const Instruction& ins, uint32_t opcode);
   bool signed_divide(const Instruction& ins, bool remainder, const Val& a, const Val& b, const Val& r);
@@ -275,6 +353,35 @@ class Translator {
 // --- operands --------------------------------------------------------------------------------------------------------------------------------------------------
 
 void Translator::src(const Val& v, uint32_t modifier) {
+  if (v.wide) {
+    // a double: the swizzle puts its pair (low, high) in positions 0 1 and again in 2 3
+    const uint32_t swizzle = (v.kind == VK::Cb ? v.c : v.b) & 2u, picked = swizzle | ((swizzle + 1) << 2) | (swizzle << 4) | ((swizzle + 1) << 6);
+    switch (v.kind) {
+      case VK::Imm: {
+        uint32_t high = v.c;
+        if (modifier == 1) high ^= 0x80000000u;
+        else if (modifier == 2) high &= 0x7FFFFFFFu;
+        else if (modifier == 3) high |= 0x80000000u;
+        put(2u | (4u << 12));
+        put(v.a), put(high), put(v.a), put(high);
+        return;
+      }
+      case VK::Temp:
+        put(2u | (1u << 2) | (picked << 4) | (1u << 20) | (modifier ? 1u << 31 : 0u));
+        if (modifier) put(1u | (modifier << 6));
+        put(v.a);
+        return;
+      case VK::Cb:
+        put(2u | (1u << 2) | (picked << 4) | (8u << 12) | (2u << 20) | (modifier ? 1u << 31 : 0u));
+        if (modifier) put(1u | (modifier << 6));
+        put(v.a);
+        put(v.b);
+        return;
+      default:
+        error(status::kNotSupported);
+        return;
+    }
+  }
   switch (v.kind) {
     case VK::Imm:   // (a modifier on a literal is made in the literal: negate, absolute value, negated absolute value)
       put(0x4001u);
@@ -358,6 +465,47 @@ bool Translator::alloc_reg(int32_t until, uint32_t* reg) {
   return error(status::kNotSupported);
 }
 
+bool Translator::alloc_wide(int32_t until, uint32_t* reg, uint32_t* comp) {
+  for (int pass = 0; pass < 2; ++pass)
+    for (uint32_t r = 0; r < kSlots / 4; ++r) {
+      bool partly = false;
+      for (uint32_t c = 0; c < 4; ++c) partly |= !slot_free(r * 4 + c);
+      if (pass == 0 && !partly) continue;
+      for (uint32_t c = 0; c < 4; c += 2)
+        if (slot_free(r * 4 + c) && slot_free(r * 4 + c + 1)) {
+          slots_[r * 4 + c].busy_until = slots_[r * 4 + c + 1].busy_until = until < pos_ ? pos_ : until;
+          *reg = r, *comp = c;
+          if (r + 1 > temps_) temps_ = r + 1;
+          return true;
+        }
+    }
+  return error(status::kNotSupported);
+}
+
+Val Translator::new_wide(uint32_t id) {
+  Val v;
+  v.kind = VK::Temp, v.wide = true;
+  if (!alloc_wide(last_use_of(id), &v.a, &v.b)) v.kind = VK::None;
+  return v;
+}
+
+// The two words of a double as 32-bit values.
+Val Translator::low_word(const Val& v) const {
+  Val r = v;
+  r.wide = false;
+  if (v.kind == VK::Imm) r.a = v.a, r.c = 0;
+  return r;
+}
+
+Val Translator::high_word(const Val& v) const {
+  Val r = v;
+  r.wide = false;
+  if (v.kind == VK::Imm) r.a = v.c, r.c = 0;
+  else if (v.kind == VK::Cb) r.c = v.c + 1;
+  else r.b = v.b + 1;
+  return r;
+}
+
 Val Translator::new_scalar(uint32_t id, bool mask) {
   Val v;
   v.kind = VK::Temp;
@@ -367,6 +515,7 @@ Val Translator::new_scalar(uint32_t id, bool mask) {
 }
 
 Val Translator::new_aggregate(uint32_t id) {
+  if (forced_result_.kind != VK::None) return forced_result_;
   Val v;
   v.kind = VK::Agg;
   if (!alloc_reg(last_use_of(id), &v.a)) v.kind = VK::None;
@@ -377,11 +526,13 @@ Val Translator::new_aggregate(uint32_t id) {
 
 bool Translator::alias_cast(const Instruction& ins) const {
   const uint32_t from = value_type(ins.operands[0]);
+  if (m_.is_int(ins.type, 64)) return false;                    // (a widening: the high word is made)
+  if (m_.is_int(from, 64)) return ins.code == 0 && !m_.is_int(ins.type, 1);   // (a truncation takes the low word)
   switch (ins.code) {
-    case 11: return true;                                   // bitcast
-    case 0: return !m_.is_int(ins.type, 1);                 // trunc (to a boolean is not an alias: the low bit)
+    case 11: return !(m_.types[from].kind == TypeKind::Half) && !(m_.types[ins.type].kind == TypeKind::Half);   // bitcast (a half is a value here and its bits are in an integer: converted)
+    case 0: return !m_.is_int(ins.type, 1) && !m_.is_int(ins.type, 16);   // trunc (to a boolean is not an alias: the low bit; to 16 bits it is wrapped)
     case 1: return !m_.is_int(from, 1);                     // zext from a narrow integer (a boolean becomes 0 or 1)
-    case 2: return m_.is_int(from, 1);                      // sext of a boolean: the mask already is all ones
+    case 2: return m_.is_int(from, 1) && m_.is_int(ins.type, 32);   // sext of a boolean: the mask already is all ones
     default: return false;
   }
 }
@@ -430,9 +581,13 @@ bool Translator::analyze(const Instruction& ins) {
       note_use(ins.operands[0], at);
       if (ins.result < alias_of_.count()) alias_of_[ins.result] = ins.operands[0];
       return true;
-    case Op::Call:
+    case Op::Call: {
       for (uint32_t k = 0; k < ins.arg_count; ++k) note_use(ins.args[k], at);
+      uint64_t dx_op = 0;
+      if (ins.arg_count >= 4 && constant_int(ins.args[0], &dx_op) && dx_op == kCreateHandle && ins.result < alias_of_.count()) alias_of_[ins.result] = ins.args[3];   // (a handle on a variable index keeps the index alive)
+      if (ins.arg_count >= 2 && constant_int(ins.args[0], &dx_op) && dx_op == kSplitDouble && ins.result < alias_of_.count()) alias_of_[ins.result] = ins.args[1];   // (the two words are the double's own registers)
       return true;
+    }
     case Op::Gep: {
       uint32_t slot = 0, bytes = 0;
       if (ins.arg_count == 2 && ins.result < ptr_ok_.count() && shared_slot(ins.operands[0], &slot, &bytes)) {
@@ -484,16 +639,23 @@ bool Translator::phi_moves(uint32_t pred, uint32_t target) {
     uint32_t incoming = kNone;
     for (uint32_t k = 0; k < phi.phi_count; ++k)
       if (m_.phi_blocks[phi.phi_first + k] == pred) incoming = m_.phi_values[phi.phi_first + k];
-    if (incoming == kNone || count >= 16) return error(incoming == kNone ? status::kInvalidParameter : status::kNotSupported);
-    if (dry_) {
-      note_use(incoming, pos_ + static_cast<int32_t>(count));
-    } else {
-      moves[count].from_id = incoming;
-      moves[count].to = vals_[phi.result];
-      if (moves[count].to.kind != VK::Temp) return error(status::kInvalidParameter);
-      moves[count].from = use(incoming);
+    if (incoming == kNone || count >= 15) return error(incoming == kNone ? status::kInvalidParameter : status::kNotSupported);
+    const bool double_phi = wide_type(phi.type);   // (a double or a 64-bit integer moves as its two words)
+    for (uint32_t word_index = 0; word_index < (double_phi ? 2u : 1u); ++word_index) {
+      if (dry_) {
+        note_use(incoming, pos_ + static_cast<int32_t>(count));
+      } else {
+        moves[count].from_id = incoming;
+        moves[count].to = vals_[phi.result];
+        if (moves[count].to.kind != VK::Temp) return error(status::kInvalidParameter);
+        moves[count].from = use(incoming);
+        if (double_phi) {
+          moves[count].to = word_index ? high_word(moves[count].to) : low_word(moves[count].to);
+          moves[count].from = word_index ? high_word(moves[count].from) : low_word(moves[count].from);
+        }
+      }
+      ++count;
     }
-    ++count;
   }
   if (dry_) {
     pos_ += static_cast<int32_t>(count);
@@ -579,6 +741,61 @@ uint32_t Translator::find_merge_of(const uint32_t* targets, uint32_t count) {
   return kNone;
 }
 
+// A block that ends the function.
+bool Translator::is_return_block(uint32_t b) const {
+  if (b >= f_.block_count) return false;
+  const Block& blk = block_at(b);
+  return blk.count != 0 && instruction_at(blk.first + blk.count - 1).op == Op::Ret;
+}
+
+// A block that ends the function, or that only jumps to one.
+bool Translator::returns_directly(uint32_t b) const {
+  if (is_return_block(b)) return true;
+  if (b >= f_.block_count) return false;
+  const Instruction& t = terminator(b);
+  return t.op == Op::Br && is_return_block(t.blocks[0]);
+}
+
+// The block a loop leaves to when it is not returning: the other way out of its latch, or else the first block past it that a block of the loop jumps to and that does not end the function.
+uint32_t Translator::loop_exit_of(uint32_t header, uint32_t latch) const {
+  const Instruction& t = terminator(latch);
+  if (t.op == Op::CondBr) {
+    if (t.blocks[0] == header) return t.blocks[1] > latch ? t.blocks[1] : kNone;
+    if (t.blocks[1] == header) return t.blocks[0] > latch ? t.blocks[0] : kNone;
+  }
+  uint32_t first_return = kNone;
+  for (uint32_t x = header; x <= latch && x < f_.block_count; ++x) {
+    uint32_t next[kMaxSuccessors], successors = 0;
+    successors_of(x, next, &successors);
+    for (uint32_t k = 0; k < successors; ++k) {
+      if (next[k] <= latch) continue;
+      if (!is_return_block(next[k])) return next[k];
+      if (first_return == kNone) first_return = next[k];
+    }
+  }
+  return first_return;
+}
+
+// A jump to a block that ends the function, from inside a loop: the moves into its phis, then the block itself, return included.
+bool Translator::inline_return(uint32_t b, uint32_t pred) {
+  if (!phi_moves(pred, b)) return false;
+  const Block& blk = block_at(b);
+  for (uint32_t i = 0; i + 1 < blk.count; ++i) {
+    const Instruction& ins = instruction_at(blk.first + i);
+    if (ins.op == Op::Phi) continue;
+    if (!(dry_ ? analyze(ins) : translate(ins)) || status_ != status::kSuccess) return false;
+    ++pos_;
+  }
+  const Instruction& t = terminator(b);
+  if (dry_) {
+    if (t.operands[0] != 0) note_use(t.operands[0], pos_);
+  } else {
+    finish(begin(62));   // ret
+  }
+  ++pos_;
+  return true;
+}
+
 bool Translator::visit_block(uint32_t b) {
   if (b >= f_.block_count || ++steps_ > 200000) return error(status::kNotSupported);
   if (visited_marks_[b]) return error(status::kNotSupported);
@@ -636,7 +853,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     if (b >= f_.block_count) return error(status::kInvalidParameter);
     if (latch_of_[b] != kNone && !(loops_.count() && loops_[loops_.count() - 1].header == b)) {
       // a loop begins: the moves into its phis were made on the edge that came here
-      if (loops_.count() >= 4 || !loops_.push_back({b, latch_of_[b], kNone, depth_, pos_})) return error(status::kNotSupported);
+      if (loops_.count() >= 4 || !loops_.push_back({b, latch_of_[b], loop_exit_of(b, latch_of_[b]), depth_, pos_})) return error(status::kNotSupported);
       simple(48);   // loop
       ++pos_;
     }
@@ -653,10 +870,9 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
       return true;
     };
     if (t.op == Op::Ret) {
-      if (loop_i >= 0) return error(status::kNotSupported);   // (a return inside a loop)
       if (dry_) {
         if (t.operands[0] != 0) note_use(t.operands[0], pos_);
-      } else if (if_depth_ == 0) {
+      } else if (if_depth_ == 0 || loop_i >= 0) {   // (inside a loop an arm that returns must really return: the loop goes on after it)
         finish(begin(62));   // (a return in an arm just ends the arm: nothing follows the join of an if whose other arm goes on)
       }
       ++pos_;
@@ -673,6 +889,7 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
         if (done) return true;
         continue;
       }
+      if (is_return_block(target)) return inline_return(target, b);   // a jump to a block that ends the function (numbered anywhere)
       if (loop_i >= 0 && target > top().latch) {   // a break
         if (top().exit != kNone && top().exit != target) return error(status::kNotSupported);
         top().exit = target;
@@ -691,6 +908,24 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
     if (t.op != Op::CondBr) return error(status::kNotSupported);
     const uint32_t tb = t.blocks[0], fb = t.blocks[1];
     if (tb == fb) return error(status::kNotSupported);
+    const bool t_leaves = returns_directly(tb) && !(loop_i >= 0 && tb == top().exit), f_leaves = returns_directly(fb) && !(loop_i >= 0 && fb == top().exit);
+    if (t_leaves != f_leaves || (t_leaves && is_return_block(tb) != is_return_block(fb))) {   // one way returns (a block that ends the function, or jumps to one, wherever it is numbered): the other is what follows
+      const bool t_returns = t_leaves && f_leaves ? is_return_block(tb) : t_leaves;
+      const uint32_t returns = t_returns ? tb : fb, goes_on = t_returns ? fb : tb;
+      if (goes_on <= b) return error(status::kNotSupported);
+      condition(t.operands[0], t_returns);
+      if (is_return_block(returns)) {
+        if (!inline_return(returns, b)) return false;
+      } else if (!region(returns, kNone, b)) {   // (an arm that does something first and then jumps to the block that returns)
+        return false;
+      }
+      end_if();
+      if (!phi_moves(b, goes_on)) return false;
+      if (goes_on == stop) return true;
+      if (stop != kNone && goes_on > stop) return error(status::kNotSupported);
+      b = goes_on;
+      continue;
+    }
     if (loop_i >= 0) {
       const bool t_back = tb == top().header, f_back = fb == top().header, t_out = tb > top().latch, f_out = fb > top().latch;
       if (t_back || f_back) {   // the latch: one way back to the top, the other out
@@ -710,7 +945,33 @@ bool Translator::region(uint32_t start, uint32_t stop, uint32_t pred) {
         if (done) return true;
         continue;
       }
-      if (t_out && f_out) return error(status::kNotSupported);
+      if (t_out && f_out) {   // both ways leave: one of them returns
+        const bool t_returns = tb != top().exit && is_return_block(tb), f_returns = fb != top().exit && is_return_block(fb);
+        if (t_returns == f_returns) return error(status::kNotSupported);
+        const uint32_t returns = t_returns ? tb : fb, leaves = t_returns ? fb : tb;
+        condition(t.operands[0], t_returns);
+        if (!inline_return(returns, b)) return false;
+        simple(18);   // else
+        if (!phi_moves(b, leaves)) return false;
+        if (top().exit != kNone && top().exit != leaves) return error(status::kNotSupported);
+        top().exit = leaves;
+        simple(2);    // break
+        end_if();
+        return true;
+      }
+      if ((t_out && tb != top().exit && is_return_block(tb)) || (f_out && fb != top().exit && is_return_block(fb))) {   // one way returns, the other goes on in the loop
+        const bool t_returns = t_out;
+        const uint32_t returns = t_returns ? tb : fb, in = t_returns ? fb : tb;
+        if (in <= b) return error(status::kNotSupported);
+        condition(t.operands[0], t_returns);
+        if (!inline_return(returns, b)) return false;
+        end_if();
+        if (!phi_moves(b, in)) return false;
+        if (in == stop) return true;
+        if (stop != kNone && in > stop) return error(status::kNotSupported);
+        b = in;
+        continue;
+      }
       if (t_out || f_out) {     // one way leaves the loop: a conditional break, then the loop goes on
         const uint32_t out = t_out ? tb : fb, in = t_out ? fb : tb;
         if (in <= b || (top().exit != kNone && top().exit != out)) return error(status::kNotSupported);
@@ -825,12 +1086,30 @@ bool Translator::switch_region(const Instruction& t, uint32_t b, uint32_t stop) 
 // --- instructions ------------------------------------------------------------------------------------------------------------------------------------------------
 
 bool Translator::translate(const Instruction& ins) {
+  if (!translate_one(ins)) return false;
+  const bool aliasing_cast = ins.op == Op::Cast && alias_cast(ins);
+  if (!aliasing_cast && (ins.op == Op::Binop || ins.op == Op::Cast || ins.op == Op::Call || ins.op == Op::ExtractValue || ins.op == Op::Select) && (half_type(ins.type) || m_.is_int(ins.type, 16))) return narrow_result(ins);
+  return true;
+}
+
+bool Translator::translate_one(const Instruction& ins) {
   switch (ins.op) {
     case Op::Binop: return binop(ins);
     case Op::Cmp: return compare(ins);
     case Op::Cast: return cast(ins);
     case Op::Select: {
       const Val cond = use(ins.operands[2]), a = use(ins.operands[0]), b = use(ins.operands[1]);
+      if (a.wide || b.wide) {   // (a double: the two words, each selected)
+        const Val r = new_wide(ins.result);
+        if (r.kind == VK::None) return false;
+        for (int word_index = 0; word_index < 2; ++word_index) {
+          const uint32_t at = begin(55);
+          dst_scalar(word_index ? high_word(r) : low_word(r));
+          src(cond), src(word_index ? high_word(a) : low_word(a)), src(word_index ? high_word(b) : low_word(b));
+          finish(at);
+        }
+        return define(ins.result, r);
+      }
       const Val r = new_scalar(ins.result);
       if (r.kind == VK::None) return false;
       const uint32_t at = begin(55);
@@ -842,12 +1121,26 @@ bool Translator::translate(const Instruction& ins) {
     case Op::ExtractValue: {
       const Val agg = use(ins.operands[0]);
       Val v;
+      const bool double_result = m_.is_float(ins.type) && m_.types[ins.type].width == 64;
       if (agg.kind == VK::Agg) {
         if (ins.index >= 4) return error(status::kNotSupported);   // (the status word of a sample)
-        v.kind = VK::Temp, v.a = agg.a, v.b = ins.index;
+        v.kind = VK::Temp, v.a = agg.a, v.b = agg.b + ins.index;
+      } else if (agg.kind == VK::CbAgg && (half_type(ins.type) || m_.is_int(ins.type, 16))) {
+        // sixteen-bit elements are packed two to a word of the register: the half the index names, shifted down and masked (a half then widened)
+        if (ins.index >= 8) return error(status::kNotSupported);
+        Val word;
+        word.kind = VK::Cb, word.a = agg.a, word.b = agg.b, word.c = ins.index / 2;
+        const Val r = new_scalar(ins.result);
+        if (r.kind == VK::None) return false;
+        Val shift, mask;
+        shift.kind = VK::Imm, shift.a = 16 * (ins.index & 1), mask.kind = VK::Imm, mask.a = 0xFFFFu;
+        word_op(85, r, word, shift);
+        word_op(1, r, r, mask);
+        if (half_type(ins.type)) word_op1(131, r, r);
+        return define(ins.result, r);
       } else if (agg.kind == VK::CbAgg) {
-        if (ins.index >= 4) return error(status::kNotSupported);
-        v.kind = VK::Cb, v.a = agg.a, v.b = agg.b, v.c = ins.index;
+        if (ins.index >= (double_result ? 2u : 4u)) return error(status::kNotSupported);
+        v.kind = VK::Cb, v.a = agg.a, v.b = agg.b, v.c = double_result ? ins.index * 2 : ins.index, v.wide = double_result;
       } else {
         return error(status::kNotSupported);
       }
@@ -874,11 +1167,573 @@ bool Translator::translate(const Instruction& ins) {
   }
 }
 
+// Arithmetic on doubles: dadd / dmul / ddiv on the pair.
+bool Translator::double_binop(const Instruction& ins, const Val& a, const Val& b) {
+  uint32_t opcode = 0;
+  bool negate_b = false;
+  switch (ins.code) {
+    case 0: opcode = 191; break;
+    case 1: opcode = 191, negate_b = true; break;
+    case 2: opcode = 194; break;
+    case 4: opcode = 209; break;
+    default: return error(status::kNotSupported);
+  }
+  const Val r = new_wide(ins.result);
+  if (r.kind == VK::None) return false;
+  const uint32_t at = begin(opcode);
+  dst_scalar(r);
+  src(a), src(b, negate_b ? 1u : 0u);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// A comparison of doubles: the 32-bit mask is made in component x of a register (dlt / dge / deq / dne read the pair at positions 0 1 for x), then moved to its place.
+bool Translator::double_compare(const Instruction& ins, const Val& a, const Val& b) {
+  uint32_t opcode = 0;
+  bool swap = false;
+  switch (ins.code) {
+    case 1: case 9: opcode = 195; break;                 // eq
+    case 6: case 14: opcode = 198; break;                // ne
+    case 4: case 12: opcode = 197; break;                // lt
+    case 5: case 13: opcode = 196, swap = true; break;   // a <= b is b >= a
+    case 2: case 10: opcode = 197, swap = true; break;   // a > b is b < a
+    case 3: case 11: opcode = 196; break;                // ge
+    default: return error(status::kNotSupported);
+  }
+  const Val r = new_scalar(ins.result, true);
+  uint32_t scratch = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  {
+    const uint32_t at = begin(opcode);
+    dst_temp(scratch, 1u);
+    src(swap ? b : a), src(swap ? a : b);
+    finish(at);
+  }
+  Val result;
+  result.kind = VK::Temp, result.a = scratch, result.b = 0;
+  const uint32_t at = begin(54);
+  dst_scalar(r);
+  src(result);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// Conversions between doubles and the 32-bit types (fpext, fptrunc, the integer ones).
+bool Translator::double_cast(const Instruction& ins, const Val& a) {
+  const uint32_t from = value_type(ins.operands[0]);
+  const bool to_double = m_.is_float(ins.type) && m_.types[ins.type].width == 64;
+  if (to_double) {
+    uint32_t opcode = 0;
+    switch (ins.code) {
+      case 8: opcode = 202; break;   // fpext
+      case 5: opcode = 216; break;   // uitofp
+      case 6: opcode = 215; break;   // sitofp
+      default: return error(status::kNotSupported);
+    }
+    if (ins.code == 8 ? !float32(from) : !m_.is_int(from, 32)) return error(status::kNotSupported);
+    const Val r = new_wide(ins.result);
+    if (r.kind == VK::None) return false;
+    const uint32_t at = begin(opcode);
+    dst_scalar(r);
+    src(a);
+    finish(at);
+    return define(ins.result, r);
+  }
+  uint32_t opcode = 0;
+  switch (ins.code) {
+    case 7: opcode = 201; break;   // fptrunc
+    case 3: opcode = 214; break;   // fptoui
+    case 4: opcode = 213; break;   // fptosi
+    default: return error(status::kNotSupported);
+  }
+  if (ins.code == 7 ? !float32(ins.type) : !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
+  const Val r = new_scalar(ins.result);
+  uint32_t scratch = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  {
+    const uint32_t at = begin(opcode);
+    dst_temp(scratch, 1u);   // (component x, from the pair at positions 0 1)
+    src(a);
+    finish(at);
+  }
+  Val result;
+  result.kind = VK::Temp, result.a = scratch, result.b = 0;
+  const uint32_t at = begin(54);
+  dst_scalar(r);
+  src(result);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// --- 64-bit integers ---------------------------------------------------------------------------------------------------------------------------------------
+// A 64-bit integer is a pair of words as a double is (low word first); the operations are made of the 32-bit ones, with a mask (all ones) standing for a carry or a borrow.
+
+Val Translator::scratch_word() {
+  Val v;
+  v.kind = VK::Temp;
+  if (!alloc_scalar(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+  return v;
+}
+
+void Translator::word_op(uint32_t opcode, const Val& d, const Val& a, const Val& b) {
+  const uint32_t at = begin(opcode);
+  dst_scalar(d);
+  src(a), src(b);
+  finish(at);
+}
+
+void Translator::word_op1(uint32_t opcode, const Val& d, const Val& a) {
+  const uint32_t at = begin(opcode);
+  dst_scalar(d);
+  src(a);
+  finish(at);
+}
+
+void Translator::word_select(const Val& d, const Val& condition, const Val& a, const Val& b) {
+  const uint32_t at = begin(55);
+  dst_scalar(d);
+  src(condition), src(a), src(b);
+  finish(at);
+}
+
+// r = -a (two's complement of the pair): not both words, plus one carried through the low word.
+void Translator::negate64(const Val& r, const Val& a) {
+  const Val lo = low_word(a), hi = high_word(a), zero_word = Val(), carry = scratch_word(), inverted = scratch_word();
+  (void)zero_word;
+  Val zero, one;
+  zero.kind = VK::Imm, one.kind = VK::Imm, one.a = 1;
+  word_op1(40, low_word(r), lo);                    // ineg
+  word_op(32, carry, lo, zero);                     // ieq: the low word was zero (a carry into the high word)
+  word_op1(59, inverted, hi);                       // not
+  word_op1(40, carry, carry);                       // 1 where it was
+  word_op(30, high_word(r), inverted, carry);
+}
+
+// Unsigned 64-bit division by shifting and subtracting, 64 times round a loop.
+void Translator::divide_unsigned(const Val& a, const Val& b, const Val& quotient, const Val& remainder) {
+  Val zero, one, thirty_one;
+  zero.kind = VK::Imm, one.kind = VK::Imm, one.a = 1, thirty_one.kind = VK::Imm, thirty_one.a = 31;
+  Val count = scratch_word(), numerator_lo = scratch_word(), numerator_hi = scratch_word(), carry = scratch_word(), t = scratch_word(), u = scratch_word(), take = scratch_word();
+  Val q_lo = low_word(quotient), q_hi = high_word(quotient), r_lo = low_word(remainder), r_hi = high_word(remainder);
+  const Val b_lo = low_word(b), b_hi = high_word(b);
+  word_op1(54, q_lo, zero), word_op1(54, q_hi, zero), word_op1(54, r_lo, zero), word_op1(54, r_hi, zero);
+  word_op1(54, numerator_lo, low_word(a)), word_op1(54, numerator_hi, high_word(a));
+  Val sixty_four;
+  sixty_four.kind = VK::Imm, sixty_four.a = 64;
+  word_op1(54, count, sixty_four);
+  finish(begin(48));   // loop
+  {
+    // r = (r << 1) | the top bit of the numerator; the bit that left r is kept in carry
+    word_op(85, carry, r_hi, thirty_one);                       // ushr: bit 63 of r
+    word_op(41, r_hi, r_hi, one);                               // ishl
+    word_op(85, t, r_lo, thirty_one);
+    word_op(60, r_hi, r_hi, t);                                 // or
+    word_op(41, r_lo, r_lo, one);
+    word_op(85, t, numerator_hi, thirty_one);
+    word_op(60, r_lo, r_lo, t);
+    // numerator <<= 1
+    word_op(41, numerator_hi, numerator_hi, one);
+    word_op(85, t, numerator_lo, thirty_one);
+    word_op(60, numerator_hi, numerator_hi, t);
+    word_op(41, numerator_lo, numerator_lo, one);
+    // take = carry || r >= b (unsigned, 64-bit)
+    word_op(80, t, r_hi, b_hi);                                 // uge: hi >= b.hi
+    word_op(79, u, b_hi, r_hi);                                 // ult: b.hi < hi, strictly greater
+    word_op(80, take, r_lo, b_lo);                              // uge on the low words
+    {
+      Val equal = scratch_word();
+      word_op(32, equal, r_hi, b_hi);
+      word_op(1, take, take, equal);                            // equal high and r.lo >= b.lo
+    }
+    word_op(60, take, take, u);
+    word_op(60, take, take, carry);                             // (carry is 1 or 0; any non-zero bit counts)
+    (void)t;
+    // q = (q << 1) | take
+    word_op(85, t, q_lo, thirty_one);
+    word_op(41, q_hi, q_hi, one);
+    word_op(60, q_hi, q_hi, t);
+    word_op(41, q_lo, q_lo, one);
+    {
+      Val bit = scratch_word();
+      word_op(1, bit, take, one);
+      word_op(60, q_lo, q_lo, bit);
+    }
+    // if take: r -= b
+    {
+      const uint32_t at = begin(31, 1u << 18);   // if_nz
+      src(take);
+      finish(at);
+      Val negative = scratch_word(), borrow = scratch_word();
+      word_op1(40, negative, b_lo);
+      word_op(79, borrow, r_lo, b_lo);                          // the low words borrow
+      word_op(30, r_lo, r_lo, negative);
+      word_op1(40, negative, b_hi);
+      word_op(30, r_hi, r_hi, negative);
+      word_op(30, r_hi, r_hi, borrow);                          // (borrow is all ones: minus one)
+      finish(begin(21));                                        // endif
+    }
+    // count -= 1; leave when it is zero
+    Val minus_one;
+    minus_one.kind = VK::Imm, minus_one.a = 0xFFFFFFFFu;
+    word_op(30, count, count, minus_one);
+    {
+      const uint32_t at = begin(3, 0);   // breakc_z count
+      src(count);
+      finish(at);
+    }
+  }
+  finish(begin(22));   // endloop
+}
+
+bool Translator::i64_binop(const Instruction& ins, const Val& a, const Val& b) {
+  const Val r = new_wide(ins.result);
+  if (r.kind == VK::None) return false;
+  const Val alo = low_word(a), ahi = high_word(a), blo = low_word(b), bhi = high_word(b), rlo = low_word(r), rhi = high_word(r);
+  Val zero, one, thirty_one, thirty_two, sixty_three;
+  zero.kind = VK::Imm, one.kind = VK::Imm, one.a = 1, thirty_one.kind = VK::Imm, thirty_one.a = 31, thirty_two.kind = VK::Imm, thirty_two.a = 32, sixty_three.kind = VK::Imm, sixty_three.a = 63;
+  switch (ins.code) {
+    case 0: {   // add
+      Val carry = scratch_word();
+      word_op(30, rlo, alo, blo);
+      word_op(79, carry, rlo, alo);       // the sum is below an addend: a carry (all ones)
+      word_op(30, rhi, ahi, bhi);
+      word_op1(40, carry, carry);
+      word_op(30, rhi, rhi, carry);
+      break;
+    }
+    case 1: {   // sub
+      Val negative = scratch_word(), borrow = scratch_word();
+      word_op1(40, negative, blo);
+      word_op(30, rlo, alo, negative);
+      word_op(79, borrow, alo, blo);      // a borrow (all ones)
+      word_op1(40, negative, bhi);
+      word_op(30, rhi, ahi, negative);
+      word_op(30, rhi, rhi, borrow);
+      break;
+    }
+    case 2: {   // mul: the low 64 bits of the product
+      Val high = scratch_word(), cross = scratch_word();
+      const uint32_t at = begin(81);      // umul high, low
+      dst_scalar(high), dst_scalar(rlo);
+      src(alo), src(blo);
+      finish(at);
+      {
+        const uint32_t cross_at = begin(81);
+        dst_null();
+        dst_scalar(cross);
+        src(alo), src(bhi);
+        finish(cross_at);
+      }
+      word_op(30, high, high, cross);
+      {
+        const uint32_t cross_at = begin(81);
+        dst_null();
+        dst_scalar(cross);
+        src(ahi), src(blo);
+        finish(cross_at);
+      }
+      word_op(30, rhi, high, cross);
+      break;
+    }
+    case 3: case 5: {   // udiv / urem
+      Val quotient = scratch_wide(), remainder = scratch_wide();
+      if (quotient.kind == VK::None || remainder.kind == VK::None) return false;
+      divide_unsigned(a, b, quotient, remainder);
+      const Val& chosen = ins.code == 3 ? quotient : remainder;
+      word_op1(54, rlo, low_word(chosen)), word_op1(54, rhi, high_word(chosen));
+      break;
+    }
+    case 4: case 6: {   // sdiv / srem: on the magnitudes, the sign put back
+      Val abs_a = scratch_wide(), abs_b = scratch_wide(), quotient = scratch_wide(), remainder = scratch_wide(), negated = scratch_wide();
+      if (abs_a.kind == VK::None || abs_b.kind == VK::None || quotient.kind == VK::None || remainder.kind == VK::None || negated.kind == VK::None) return false;
+      Val sign_a = scratch_word(), sign_b = scratch_word();
+      word_op(42, sign_a, ahi, thirty_one);      // ishr: all ones for a negative a
+      word_op(42, sign_b, bhi, thirty_one);
+      negate64(negated, a);
+      word_select(low_word(abs_a), sign_a, low_word(negated), alo), word_select(high_word(abs_a), sign_a, high_word(negated), ahi);
+      negate64(negated, b);
+      word_select(low_word(abs_b), sign_b, low_word(negated), blo), word_select(high_word(abs_b), sign_b, high_word(negated), bhi);
+      divide_unsigned(abs_a, abs_b, quotient, remainder);
+      Val flip = scratch_word();
+      if (ins.code == 4) {
+        word_op(87, flip, sign_a, sign_b);       // the quotient is negative if the signs differ
+        negate64(negated, quotient);
+        word_select(rlo, flip, low_word(negated), low_word(quotient)), word_select(rhi, flip, high_word(negated), high_word(quotient));
+      } else {
+        negate64(negated, remainder);            // the remainder has the sign of a
+        word_select(rlo, sign_a, low_word(negated), low_word(remainder)), word_select(rhi, sign_a, high_word(negated), high_word(remainder));
+      }
+      break;
+    }
+    case 7: case 8: case 9: {   // shl / lshr / ashr by the low word of the count, taken modulo 64
+      Val s = scratch_word(), big = scratch_word(), s5 = scratch_word(), c31 = scratch_word(), t = scratch_word(), u = scratch_word(), low_small = scratch_word(), high_small = scratch_word(),
+          low_big = scratch_word(), high_big = scratch_word();
+      word_op(1, s, blo, sixty_three);
+      word_op(80, big, s, thirty_two);                      // uge: the count is 32 or more
+      word_op(1, s5, s, thirty_one);
+      word_op1(40, c31, s5);
+      word_op(30, c31, c31, thirty_one);                    // 31 - s5
+      if (ins.code == 7) {
+        word_op(41, low_small, alo, s5);
+        word_op(85, t, alo, one);
+        word_op(85, t, t, c31);
+        word_op(41, u, ahi, s5);
+        word_op(60, high_small, u, t);
+        word_op(41, high_big, alo, s5);
+        word_op1(54, low_big, zero);
+      } else {
+        word_op(85, t, alo, s5);
+        word_op(41, u, ahi, one);
+        word_op(41, u, u, c31);
+        word_op(60, low_small, t, u);
+        word_op(ins.code == 8 ? 85 : 42, high_small, ahi, s5);
+        word_op(ins.code == 8 ? 85 : 42, low_big, ahi, s5);
+        if (ins.code == 8) word_op1(54, high_big, zero);
+        else word_op(42, high_big, ahi, thirty_one);
+      }
+      word_select(rlo, big, low_big, low_small);
+      word_select(rhi, big, high_big, high_small);
+      break;
+    }
+    case 10: word_op(1, rlo, alo, blo), word_op(1, rhi, ahi, bhi); break;
+    case 11: word_op(60, rlo, alo, blo), word_op(60, rhi, ahi, bhi); break;
+    case 12: word_op(87, rlo, alo, blo), word_op(87, rhi, ahi, bhi); break;
+    default: return error(status::kNotSupported);
+  }
+  return define(ins.result, r);
+}
+
+bool Translator::i64_compare(const Instruction& ins, const Val& a, const Val& b) {
+  const Val alo = low_word(a), ahi = high_word(a), blo = low_word(b), bhi = high_word(b);
+  const Val r = new_scalar(ins.result, true);
+  if (r.kind == VK::None) return false;
+  Val equal = scratch_word(), t = scratch_word(), u = scratch_word(), low_less = scratch_word(), high_less = scratch_word();
+  if (equal.kind == VK::None || t.kind == VK::None || u.kind == VK::None || low_less.kind == VK::None || high_less.kind == VK::None) return false;
+  const uint32_t code = ins.code;
+  // eq / ne
+  if (code == 32 || code == 33) {
+    word_op(87, t, alo, blo), word_op(87, u, ahi, bhi), word_op(60, t, t, u);   // nonzero if different
+    Val zero;
+    zero.kind = VK::Imm;
+    word_op(code == 32 ? 32 : 39, r, t, zero);                                  // ieq / ine against zero
+    return define(ins.result, r);
+  }
+  // lt(a, b) = high_less || (high equal && low_less), the high words signed for the signed tests; the others from it
+  const bool is_signed = code >= 38;
+  const bool swap = code == 34 || code == 37 || code == 38 || code == 41;   // ugt, ule, sgt, sle: lt(b, a)
+  const bool invert = code == 35 || code == 37 || code == 39 || code == 41; // uge, ule, sge, sle: not lt
+  const Val xlo = swap ? blo : alo, xhi = swap ? bhi : ahi, ylo = swap ? alo : blo, yhi = swap ? ahi : bhi;
+  word_op(79, low_less, xlo, ylo);
+  word_op(is_signed ? 34 : 79, high_less, xhi, yhi);
+  word_op(32, equal, xhi, yhi);
+  word_op(1, t, equal, low_less);
+  word_op(60, t, t, high_less);
+  if (invert) {
+    Val all_ones;
+    all_ones.kind = VK::Imm, all_ones.a = 0xFFFFFFFFu;
+    word_op(87, r, t, all_ones);
+  } else {
+    word_op1(54, r, t);
+  }
+  return define(ins.result, r);
+}
+
+// Casts to and from 64-bit integers: widening, and the conversions to and from floating point through doubles.
+bool Translator::i64_cast(const Instruction& ins, const Val& a) {
+  const uint32_t from = value_type(ins.operands[0]);
+  Val zero, thirty_one;
+  zero.kind = VK::Imm, thirty_one.kind = VK::Imm, thirty_one.a = 31;
+  if (m_.is_int(ins.type, 64) && m_.is_int(from)) {   // zext / sext
+    const Val r = new_wide(ins.result);
+    if (r.kind == VK::None) return false;
+    if (m_.is_int(from, 1)) {   // (a boolean is a mask: zext gives 0 or 1)
+      Val one;
+      one.kind = VK::Imm, one.a = 1;
+      if (ins.code == 1) word_op(1, low_word(r), a, one), word_op1(54, high_word(r), zero);
+      else word_op1(54, low_word(r), a), word_op1(54, high_word(r), a);
+      return define(ins.result, r);
+    }
+    if (m_.types[from].width != 32 && m_.types[from].width != 64) return error(status::kNotSupported);
+    word_op1(54, low_word(r), a);
+    if (ins.code == 2) word_op(42, high_word(r), a, thirty_one);
+    else word_op1(54, high_word(r), zero);
+    return define(ins.result, r);
+  }
+  // float <-> 64-bit integer, through a double: hi * 2^32 + lo
+  Val two32;
+  two32.kind = VK::Imm, two32.wide = true, two32.a = 0, two32.c = 0x41F00000u;   // 4294967296.0
+  if (m_.is_int(from, 64) && m_.is_float(ins.type) && (ins.code == 5 || ins.code == 6)) {
+    Val high = scratch_wide(), low = scratch_wide(), sum = m_.types[ins.type].width == 64 ? new_wide(ins.result) : scratch_wide();
+    if (high.kind == VK::None || low.kind == VK::None || sum.kind == VK::None) return false;
+    {
+      const uint32_t at = begin(ins.code == 6 ? 215 : 216);   // itod / utod of the high word
+      dst_scalar(high);
+      src(high_word(a));
+      finish(at);
+    }
+    {
+      const uint32_t at = begin(216);
+      dst_scalar(low);
+      src(low_word(a));
+      finish(at);
+    }
+    {
+      const uint32_t at = begin(210);   // dfma high * 2^32 + low
+      dst_scalar(sum);
+      src(high), src(two32), src(low);
+      finish(at);
+    }
+    if (m_.types[ins.type].width == 64) return define(ins.result, sum);
+    const Val r = new_scalar(ins.result);
+    Val scratch;
+    scratch.kind = VK::Temp;
+    uint32_t reg = 0;
+    if (r.kind == VK::None || !alloc_reg(pos_ + 1, &reg)) return false;
+    scratch.a = reg, scratch.b = 0;
+    const uint32_t at = begin(201);   // dtof into x
+    dst_temp(reg, 1u);
+    src(sum);
+    finish(at);
+    word_op1(54, r, scratch);
+    return define(ins.result, r);
+  }
+  if (m_.is_int(ins.type, 64) && m_.is_float(from) && (ins.code == 3 || ins.code == 4)) {
+    // double d (from a float by ftod); the magnitude's high word is trunc(|d| / 2^32), the low word what is left; a negative value is negated at the end
+    Val d = a;
+    if (m_.types[from].width == 32) {
+      d = scratch_wide();
+      if (d.kind == VK::None) return false;
+      const uint32_t at = begin(202);
+      dst_scalar(d);
+      src(a);
+      finish(at);
+    }
+    const Val r = new_wide(ins.result);
+    Val magnitude = scratch_wide(), scaled = scratch_wide(), rest = scratch_wide(), high_d = scratch_wide(), negated = scratch_wide();
+    if (r.kind == VK::None || magnitude.kind == VK::None || scaled.kind == VK::None || rest.kind == VK::None || high_d.kind == VK::None || negated.kind == VK::None) return false;
+    Val inverse_two32;
+    inverse_two32.kind = VK::Imm, inverse_two32.wide = true, inverse_two32.a = 0, inverse_two32.c = 0x3DF00000u;   // 2^-32
+    {
+      const uint32_t at = begin(199);   // dmov |d|
+      dst_scalar(magnitude);
+      src(d, 2);
+      finish(at);
+    }
+    {
+      const uint32_t at = begin(194);   // dmul scaled = |d| * 2^-32
+      dst_scalar(scaled);
+      src(magnitude), src(inverse_two32);
+      finish(at);
+    }
+    Val high = scratch_word(), low = scratch_word();
+    uint32_t reg = 0;
+    if (!alloc_reg(pos_ + 1, &reg)) return false;
+    {
+      const uint32_t at = begin(214);   // dtou: the high word (into x)
+      dst_temp(reg, 1u);
+      src(scaled);
+      finish(at);
+    }
+    high.a = reg, high.b = 0;
+    {
+      const uint32_t at = begin(216);   // utod: the high word back to a double
+      dst_scalar(high_d);
+      src(high);
+      finish(at);
+    }
+    {
+      Val minus_two32;
+      minus_two32.kind = VK::Imm, minus_two32.wide = true, minus_two32.a = 0, minus_two32.c = 0xC1F00000u;
+      const uint32_t at = begin(210);   // dfma rest = high * -2^32 + |d|
+      dst_scalar(rest);
+      src(high_d), src(minus_two32), src(magnitude);
+      finish(at);
+    }
+    uint32_t reg2 = 0;
+    if (!alloc_reg(pos_ + 1, &reg2)) return false;
+    {
+      const uint32_t at = begin(214);   // dtou: the low word
+      dst_temp(reg2, 1u);
+      src(rest);
+      finish(at);
+    }
+    low.a = reg2, low.b = 0;
+    if (ins.code == 3) {
+      word_op1(54, low_word(r), low), word_op1(54, high_word(r), high);
+    } else {
+      // signed: negative inputs negate the pair
+      Val mag = scratch_wide();
+      if (mag.kind == VK::None) return false;
+      word_op1(54, low_word(mag), low), word_op1(54, high_word(mag), high);
+      negate64(negated, mag);
+      Val is_negative = scratch_word(), minus_zero = Val();
+      Val zero_d;
+      zero_d.kind = VK::Imm, zero_d.wide = true;
+      {
+        const uint32_t at = begin(197);   // dlt: d < 0 into component x of a register
+        uint32_t flag = 0;
+        if (!alloc_reg(pos_ + 1, &flag)) return false;
+        dst_temp(flag, 1u);
+        src(d), src(zero_d);
+        finish(at);
+        Val flag_word;
+        flag_word.kind = VK::Temp, flag_word.a = flag, flag_word.b = 0;
+        word_op1(54, is_negative, flag_word);
+      }
+      (void)minus_zero;
+      word_select(low_word(r), is_negative, low_word(negated), low_word(mag)), word_select(high_word(r), is_negative, high_word(negated), high_word(mag));
+    }
+    return define(ins.result, r);
+  }
+  return error(status::kNotSupported);
+}
+
+// A 16-bit integer's low half sign-extended: (x << 16) >> 16, in a register of its own.
+Val Translator::sign_extended_copy(const Val& v) {
+  Val t = scratch_word();
+  if (t.kind == VK::None) return t;
+  Val sixteen;
+  sixteen.kind = VK::Imm, sixteen.a = 16;
+  word_op(41, t, v, sixteen);
+  word_op(42, t, t, sixteen);
+  return t;
+}
+
+// After an instruction that makes a half, the result is rounded to one (the arithmetic itself is done in 32 bits); after one that makes a 16-bit integer, wrapped to 16 bits.
+bool Translator::narrow_result(const Instruction& ins) {
+  if (!ins.has_value || ins.result >= vals_.count()) return true;
+  const Val r = vals_[ins.result];
+  if (r.kind != VK::Temp || r.wide) return true;
+  if (half_type(ins.type)) {
+    word_op1(130, r, r);   // f32tof16: the half in the low bits
+    word_op1(131, r, r);   // and back
+  } else if (m_.is_int(ins.type, 16) && (ins.op == Op::Binop || ins.op == Op::Cast)) {
+    Val mask;
+    mask.kind = VK::Imm, mask.a = 0xFFFFu;
+    word_op(1, r, r, mask);
+  }
+  return true;
+}
+
 bool Translator::binop(const Instruction& ins) {
   const Val a = use(ins.operands[0]), b = use(ins.operands[1]);
   const bool floating = m_.is_float(ins.type);
-  if (!floating && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 1)) return error(status::kNotSupported);   // (16 / 64-bit)
-  if (floating && m_.types[ins.type].width != 32) return error(status::kNotSupported);
+  if (floating && m_.types[ins.type].width == 64) return double_binop(ins, a, b);
+  if (m_.is_int(ins.type, 64)) return i64_binop(ins, a, b);
+  if (!floating && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 16) && !m_.is_int(ins.type, 1)) return error(status::kNotSupported);
+  if (floating && !float32(ins.type)) return error(status::kNotSupported);
+  // (the signed operations of a 16-bit integer work on its sign-extended value)
+  const bool narrow_signed = m_.is_int(ins.type, 16) && (ins.code == 4 || ins.code == 6 || ins.code == 9);
+  if (narrow_signed) {
+    const Val sa = sign_extended_copy(a), sb = ins.code == 9 ? b : sign_extended_copy(b);
+    if (sa.kind == VK::None || sb.kind == VK::None) return false;
+    return binop_words(ins, sa, sb);
+  }
+  return binop_words(ins, a, b);
+}
+
+bool Translator::binop_words(const Instruction& ins, const Val& a, const Val& b) {
+  const bool floating = m_.is_float(ins.type);
   const Val r = new_scalar(ins.result, m_.is_int(ins.type, 1));
   if (r.kind == VK::None) return false;
   auto three = [&](uint32_t opcode, bool negate_b = false) {
@@ -954,7 +1809,9 @@ bool Translator::compare(const Instruction& ins) {
   const Val a = use(ins.operands[0]), b = use(ins.operands[1]);
   const uint32_t operand_type = value_type(ins.operands[0]);
   const bool floating = m_.is_float(operand_type);
-  if (floating ? m_.types[operand_type].width != 32 : !m_.is_int(operand_type, 32) && !m_.is_int(operand_type, 1)) return error(status::kNotSupported);
+  if (floating && m_.types[operand_type].width == 64) return double_compare(ins, a, b);
+  if (m_.is_int(operand_type, 64)) return i64_compare(ins, a, b);
+  if (floating ? !float32(operand_type) : !m_.is_int(operand_type, 32) && !m_.is_int(operand_type, 16) && !m_.is_int(operand_type, 1)) return error(status::kNotSupported);
   uint32_t opcode = 0;
   bool swap = false;
   if (floating) {
@@ -982,11 +1839,17 @@ bool Translator::compare(const Instruction& ins) {
       default: return error(status::kNotSupported);
     }
   }
+  const bool signed_test = !floating && ins.code >= 38 && ins.code <= 41;
+  Val left = a, right = b;
+  if (signed_test && m_.is_int(operand_type, 16)) {   // (a 16-bit integer is compared as the signed number it is)
+    left = sign_extended_copy(a), right = sign_extended_copy(b);
+    if (left.kind == VK::None || right.kind == VK::None) return false;
+  }
   const Val r = new_scalar(ins.result, true);
   if (r.kind == VK::None) return false;
   const uint32_t at = begin(opcode);
   dst_scalar(r);
-  src(swap ? b : a), src(swap ? a : b);
+  src(swap ? right : left), src(swap ? left : right);
   finish(at);
   return define(ins.result, r);
 }
@@ -994,10 +1857,56 @@ bool Translator::compare(const Instruction& ins) {
 bool Translator::cast(const Instruction& ins) {
   const Val a = use(ins.operands[0]);
   const uint32_t from = value_type(ins.operands[0]);
+  if ((m_.is_float(from) && m_.types[from].width == 64) || (m_.is_float(ins.type) && m_.types[ins.type].width == 64)) return double_cast(ins, a);
   if (alias_cast(ins)) {
     Val v = a;
+    if (a.wide) v = low_word(a);
     v.is_mask = m_.is_int(ins.type, 1);
     return define(ins.result, v);
+  }
+  if (m_.is_int(ins.type, 64) || m_.is_int(from, 64)) return i64_cast(ins, a);
+  Val operand = a;
+  if (ins.code == 11 && (half_type(from) || half_type(ins.type))) {   // asuint16 / asfloat16
+    const Val r = new_scalar(ins.result);
+    if (r.kind == VK::None) return false;
+    if (half_type(from)) word_op1(130, r, a);
+    else word_op1(131, r, a);
+    return define(ins.result, r);
+  }
+  if ((ins.code == 7 || ins.code == 8) && float32(from) && float32(ins.type)) {   // fptrunc / fpext between half and float: a copy (the rounding follows)
+    const Val r = new_scalar(ins.result);
+    if (r.kind == VK::None) return false;
+    word_op1(54, r, a);
+    return define(ins.result, r);
+  }
+  if (ins.code == 0 && m_.is_int(ins.type, 16)) {   // trunc to 16 bits
+    const Val r = new_scalar(ins.result);
+    Val mask;
+    mask.kind = VK::Imm, mask.a = 0xFFFFu;
+    if (r.kind == VK::None) return false;
+    word_op(1, r, a, mask);
+    return define(ins.result, r);
+  }
+  if (ins.code == 2) {   // sext: from 16 bits to 32, or a boolean to 16 bits
+    const Val r = new_scalar(ins.result);
+    if (r.kind == VK::None) return false;
+    if (m_.is_int(from, 16)) {
+      Val sixteen;
+      sixteen.kind = VK::Imm, sixteen.a = 16;
+      word_op(41, r, a, sixteen);
+      word_op(42, r, r, sixteen);
+    } else if (m_.is_int(from, 1) && m_.is_int(ins.type, 16)) {
+      Val mask;
+      mask.kind = VK::Imm, mask.a = 0xFFFFu;
+      word_op(1, r, a, mask);
+    } else {
+      return error(status::kNotSupported);
+    }
+    return define(ins.result, r);
+  }
+  if (ins.code == 6 && m_.is_int(from, 16)) {   // sitofp of a 16-bit integer: of its signed value
+    operand = sign_extended_copy(a);
+    if (operand.kind == VK::None) return false;
   }
   uint32_t opcode = 0;
   switch (ins.code) {
@@ -1010,15 +1919,15 @@ bool Translator::cast(const Instruction& ins) {
       break;
     default: return error(status::kNotSupported);
   }
-  if ((ins.code >= 3 && ins.code <= 6) && ((m_.is_float(from) && m_.types[from].width != 32) || (m_.is_float(ins.type) && m_.types[ins.type].width != 32) ||
-                                         (m_.is_int(from) && m_.types[from].width != 32) || (m_.is_int(ins.type) && m_.types[ins.type].width != 32)))
+  if ((ins.code >= 3 && ins.code <= 6) && ((m_.is_float(from) && !float32(from)) || (m_.is_float(ins.type) && !float32(ins.type)) ||
+                                         (m_.is_int(from) && !m_.is_int(from, 32) && !m_.is_int(from, 16)) || (m_.is_int(ins.type) && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 16))))
     return error(status::kNotSupported);
   const Val r = new_scalar(ins.result, m_.is_int(ins.type, 1));
   if (r.kind == VK::None) return false;
   if (opcode) {
     const uint32_t at = begin(opcode);
     dst_scalar(r);
-    src(a);
+    src(operand);
     finish(at);
   } else {
     Val one;
@@ -1059,7 +1968,7 @@ bool Translator::pack(const uint32_t* ids, uint32_t count, uint32_t reg, bool) {
 
 bool Translator::unary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t source_arg, uint32_t modifier, bool saturate) {
   const Val a = use(ins.args[source_arg]);
-  if (!m_.is_float(ins.type)) return error(status::kNotSupported);
+  if (!float32(ins.type)) return error(status::kNotSupported);
   const Val r = new_scalar(ins.result);
   if (r.kind == VK::None) return false;
   const uint32_t at = begin(dxbc_opcode, saturate ? 1u << 13 : 0u);
@@ -1070,6 +1979,7 @@ bool Translator::unary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t so
 }
 
 bool Translator::binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg) {
+  if (!float32(ins.type) && !m_.is_int(ins.type, 32)) return error(status::kNotSupported);   // (doubles and the narrow types)
   const Val a = use(ins.args[first_arg]), b = use(ins.args[first_arg + 1]);
   const Val r = new_scalar(ins.result);
   if (r.kind == VK::None) return false;
@@ -1081,6 +1991,7 @@ bool Translator::binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t f
 }
 
 bool Translator::ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg) {
+  if (!float32(ins.type) && !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
   const Val a = use(ins.args[first_arg]), b = use(ins.args[first_arg + 1]), c = use(ins.args[first_arg + 2]);
   const Val r = new_scalar(ins.result);
   if (r.kind == VK::None) return false;
@@ -1107,7 +2018,7 @@ bool Translator::sincos(const Instruction& ins, bool cosine) {
 bool Translator::trig(const Instruction& ins, uint32_t opcode) {
   const Val x = use(ins.args[1]);
   const Val r = new_scalar(ins.result);
-  if (r.kind == VK::None || !m_.is_float(ins.type)) return error(status::kNotSupported);
+  if (r.kind == VK::None || !float32(ins.type)) return error(status::kNotSupported);
   auto scratch = [&]() {
     Val v;
     v.kind = VK::Temp;
@@ -1166,11 +2077,85 @@ bool Translator::trig(const Instruction& ins, uint32_t opcode) {
   return define(ins.result, r);
 }
 
+// acos, asin and atan from polynomials (Abramowitz and Stegun 4.4.46 for acos, a minimax one for atan after the reduction to [0, 1] by 1 / x), with the sign and range put back by movc.
+bool Translator::inverse_trig(const Instruction& ins, uint32_t opcode) {
+  const Val x = use(ins.args[1]);
+  const Val r = new_scalar(ins.result);
+  if (r.kind == VK::None || !float32(ins.type)) return error(status::kNotSupported);
+  auto scratch = [&]() {
+    Val v;
+    v.kind = VK::Temp;
+    if (!alloc_scalar(pos_ + 1, &v.a, &v.b)) v.kind = VK::None;
+    return v;
+  };
+  auto imm = [](float f) {
+    Val v;
+    v.kind = VK::Imm, v.a = __builtin_bit_cast(uint32_t, f);
+    return v;
+  };
+  auto emit3 = [&](uint32_t op, const Val& d, const Val& a, const Val& b, uint32_t mod_b = 0, uint32_t mod_a = 0) {
+    const uint32_t at = begin(op);
+    dst_scalar(d);
+    src(a, mod_a), src(b, mod_b);
+    finish(at);
+  };
+  auto emit4 = [&](uint32_t op, const Val& d, const Val& a, const Val& b, const Val& c) {
+    const uint32_t at = begin(op);
+    dst_scalar(d);
+    src(a), src(b), src(c);
+    finish(at);
+  };
+  const Val a = scratch(), p = scratch(), n = scratch(), q = scratch();
+  if (a.kind == VK::None || p.kind == VK::None || n.kind == VK::None || q.kind == VK::None) return false;
+  const Val zero = imm(0.0f), one = imm(1.0f), half_pi = imm(1.5707963267948966f);
+  {
+    const uint32_t at = begin(54);   // a = |x|
+    dst_scalar(a);
+    src(x, 2);
+    finish(at);
+  }
+  emit3(49, n, x, zero);   // n = x < 0
+  if (opcode == 17) {
+    const Val g = scratch(), inv = scratch(), r2 = scratch();
+    if (g.kind == VK::None || inv.kind == VK::None || r2.kind == VK::None) return false;
+    emit3(49, g, one, a);          // g = 1 < |x|
+    emit3(14, inv, one, a);
+    emit4(55, q, g, inv, a);       // q = g ? 1 / |x| : |x|
+    emit3(56, r2, q, q);
+    static const float c[5] = {0.0208351f, -0.0851330f, 0.1801410f, -0.3302995f, 0.9998660f};
+    emit4(50, p, r2, imm(c[0]), imm(c[1]));
+    for (int i = 2; i < 5; ++i) emit4(50, p, p, r2, imm(c[i]));
+    emit3(56, p, p, q);
+    emit3(0, inv, half_pi, p, 1);  // pi / 2 - p
+    emit4(55, p, g, inv, p);
+    emit3(0, q, zero, p, 1);       // -p
+    emit4(55, r, n, q, p);
+    return define(ins.result, r);
+  }
+  // acos(|x|) = sqrt(1 - |x|) * P(|x|)
+  static const float c[8] = {-0.0012624911f, 0.0066700901f, -0.0170881256f, 0.0308918810f, -0.0501743046f, 0.0889789874f, -0.2145988016f, 1.5707963050f};
+  emit4(50, p, a, imm(c[0]), imm(c[1]));
+  for (int i = 2; i < 8; ++i) emit4(50, p, p, a, imm(c[i]));
+  emit3(0, q, one, a, 1);
+  {
+    const uint32_t at = begin(75);   // sqrt
+    dst_scalar(q);
+    src(q);
+    finish(at);
+  }
+  emit3(56, p, p, q);                  // acos(|x|)
+  emit3(0, q, imm(3.14159265358979f), p, 1);   // pi - acos(|x|)
+  emit4(55, p, n, q, p);               // acos(x)
+  if (opcode == 15) return (emit3(0, r, p, zero), define(ins.result, r));
+  emit3(0, r, half_pi, p, 1);          // asin(x)
+  return define(ins.result, r);
+}
+
 // IsNaN, IsInf, IsFinite: masks.
 bool Translator::classify(const Instruction& ins, uint32_t opcode) {
   const Val x = use(ins.args[1]);
   const Val r = new_scalar(ins.result, true);
-  if (r.kind == VK::None || !m_.is_float(value_type(ins.args[1]))) return error(status::kNotSupported);
+  if (r.kind == VK::None || !float32(value_type(ins.args[1]))) return error(status::kNotSupported);
   Val infinity;
   infinity.kind = VK::Imm, infinity.a = 0x7F800000u;
   const uint32_t at = begin(opcode == 8 ? 57 : opcode == 9 ? 24 : 49);   // ne x, x / eq |x|, inf / lt |x|, inf
@@ -1283,6 +2268,133 @@ bool Translator::sample(const Instruction& ins, bool level) {
   return define(ins.result, r);
 }
 
+// SampleCmp / SampleCmpLevelZero of a 2D texture: the comparison filtered.
+bool Translator::sample_compare(const Instruction& ins, bool level_zero) {
+  Val srv, smp;
+  if (ins.arg_count < 11 || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp)) return error(status::kNotSupported);
+  for (uint32_t k = 7; k < 10; ++k) {   // offsets: none
+    uint64_t v = 0;
+    const Constant* c = constant(ins.args[k]);
+    if (!c || (c->kind != ConstantKind::Undef && !(constant_int(ins.args[k], &v) && v == 0))) return error(status::kNotSupported);
+  }
+  const Val r = new_aggregate(ins.result);   // (a ResRet: the comparison in every component)
+  uint32_t scratch = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  if (!pack(ins.args + 3, 2, scratch, false)) return false;
+  const Val reference = use(ins.args[10]);
+  const uint32_t at = begin(level_zero ? 71 : 70);
+  dst_temp(r.a, 0xF);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+  put(scratch);
+  src_resource(srv.c);
+  src_sampler(smp.c);
+  src(reference);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// CalculateLOD of a 2D texture: the lod instruction's x (clamped) or y (not).
+bool Translator::calculate_lod(const Instruction& ins) {
+  Val srv, smp;
+  uint64_t clamped = 0;
+  if (ins.arg_count < 7 || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp) || !constant_int(ins.args[6], &clamped)) return error(status::kNotSupported);
+  const Val r = new_scalar(ins.result);
+  uint32_t scratch = 0, result = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch) || !alloc_reg(pos_, &result)) return false;
+  if (!pack(ins.args + 3, 2, scratch, false)) return false;
+  {
+    const uint32_t at = begin(108);   // lod
+    dst_temp(result, 0xF);
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+    put(scratch);
+    src_resource(srv.c);
+    src_sampler(smp.c);
+    finish(at);
+  }
+  Val component;
+  component.kind = VK::Temp, component.a = result, component.b = clamped ? 0u : 1u;
+  const uint32_t at = begin(54);
+  dst_scalar(r);
+  src(component);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// sample_b (a bias) and sample_d (two gradients) of a 2D texture.
+bool Translator::sample_bias_grad(const Instruction& ins, bool gradients) {
+  Val srv, smp;
+  if (ins.arg_count < (gradients ? 17u : 12u) || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp)) return error(status::kNotSupported);
+  for (uint32_t k = 7; k < 10; ++k) {   // offsets: none
+    uint64_t v = 0;
+    const Constant* c = constant(ins.args[k]);
+    if (!c || (c->kind != ConstantKind::Undef && !(constant_int(ins.args[k], &v) && v == 0))) return error(status::kNotSupported);
+  }
+  const Val r = new_aggregate(ins.result);
+  uint32_t scratch = 0, dx = 0, dy = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  if (!pack(ins.args + 3, 2, scratch, false)) return false;
+  Val bias;
+  if (gradients) {
+    if (!alloc_reg(pos_, &dx) || !alloc_reg(pos_, &dy) || !pack(ins.args + 10, 2, dx, false) || !pack(ins.args + 13, 2, dy, false)) return false;
+  } else {
+    bias = use(ins.args[10]);
+  }
+  const uint32_t at = begin(gradients ? 73 : 74);
+  dst_temp(r.a, 0xF);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+  put(scratch);
+  src_resource(srv.c);
+  src_sampler(smp.c);
+  if (gradients) {
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20)), put(dx);
+    put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20)), put(dy);
+  } else {
+    src(bias);
+  }
+  finish(at);
+  return define(ins.result, r);
+}
+
+// gather4 (and gather4_c: the comparison of the four texels with a reference): the component of the four texels of the footprint named by the channel argument, picked by the swizzle of
+// the resource operand; constant offsets go in the extended opcode token.
+bool Translator::texture_gather(const Instruction& ins, bool compare) {
+  Val srv, smp;
+  uint64_t channel = 0;
+  if (ins.arg_count < (compare ? 11u : 10u) || !resource_of(ins.args[1], 0, &srv) || !resource_of(ins.args[2], 3, &smp) || !constant_int(ins.args[9], &channel) || channel > 3) return error(status::kNotSupported);
+  int32_t offset[2] = {0, 0};
+  for (uint32_t k = 0; k < 2; ++k) {   // constant offsets, -8 .. 7 texels
+    uint64_t v = 0;
+    const Constant* c = constant(ins.args[7 + k]);
+    if (!c) return error(status::kNotSupported);
+    if (c->kind != ConstantKind::Undef) {
+      if (!constant_int(ins.args[7 + k], &v)) return error(status::kNotSupported);
+      const int32_t value = static_cast<int32_t>(static_cast<uint32_t>(v));
+      if (value < -8 || value > 7) return error(status::kNotSupported);
+      offset[k] = value;
+    }
+  }
+  const Val r = new_aggregate(ins.result);
+  uint32_t scratch = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  const uint32_t kind = res_[0][srv.b].kind;   // (a cube takes a direction, an array the layer in the third component)
+  if (kind != 2 && kind != 5 && kind != 7) return error(status::kNotSupported);
+  if ((offset[0] || offset[1]) && kind == 5) return error(status::kNotSupported);
+  if (!pack(ins.args + 3, kind == 2 ? 2 : 3, scratch, false)) return false;
+  Val reference;
+  if (compare) reference = use(ins.args[10]);
+  const bool has_offset = offset[0] || offset[1];
+  const uint32_t at = begin(compare ? 126 : 109, has_offset ? 1u << 31 : 0u);
+  if (has_offset) put(1u | ((static_cast<uint32_t>(offset[0]) & 0xFu) << 9) | ((static_cast<uint32_t>(offset[1]) & 0xFu) << 13));
+  dst_temp(r.a, 0xF);
+  put(2u | (1u << 2) | (0xE4u << 4) | (1u << 20));
+  put(scratch);
+  put(2u | (1u << 2) | ((compare ? 0u : static_cast<uint32_t>(channel)) * 0x55u << 4) | (7u << 12) | (1u << 20)), put(srv.c);
+  src_sampler(smp.c);
+  if (compare) src(reference);
+  finish(at);
+  return define(ins.result, r);
+}
+
 bool Translator::texture_load(const Instruction& ins) {
   Val srv;
   if (ins.arg_count < 9 || !resource_of(ins.args[1], 0, &srv)) return error(status::kNotSupported);
@@ -1322,14 +2434,18 @@ bool Translator::thread_value(const Instruction& ins, uint32_t type, bool dimens
 }
 
 // A UAV operand with a write mask (a store's destination) or a full swizzle (a load's source).
+uint32_t srv_token() { return 2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20); }
+
 uint32_t uav_token(uint32_t mask, bool destination) {
   return destination ? (2u | (mask << 4) | (30u << 12) | (1u << 20)) : (2u | (1u << 2) | (0xE4u << 4) | (30u << 12) | (1u << 20));
 }
 
 bool Translator::buffer_load(const Instruction& ins) {
   Val h;
-  if (ins.arg_count < 4 || !resource_of(ins.args[1], 1, &h)) return error(status::kNotSupported);
-  const Resource& r = res_[1][h.b];
+  if (ins.arg_count < 4) return error(status::kNotSupported);
+  if (!resource_of(ins.args[1], use(ins.args[1]).a == 0 ? 0 : 1, &h)) return false;
+  const bool view = h.a == 0;   // (a shader resource view: t# in place of u#)
+  const Resource& r = res_[h.a][h.b];
   const bool structured = r.kind == 12;
   if (!structured && r.kind != 11) return error(status::kNotSupported);
   const Val index = use(ins.args[2]);
@@ -1341,13 +2457,13 @@ bool Translator::buffer_load(const Instruction& ins) {
     const uint32_t at = begin(167);        // ld_structured dst, index, offset, u#
     dst_temp(r_out.a, 0xF);
     src(index), src(offset);
-    put(uav_token(0, false)), put(slot);
+    put(view ? srv_token() : uav_token(0, false)), put(slot);
     finish(at);
   } else {
     const uint32_t at = begin(165);        // ld_raw dst, byte address, u#
     dst_temp(r_out.a, 0xF);
     src(index);
-    put(uav_token(0, false)), put(slot);
+    put(view ? srv_token() : uav_token(0, false)), put(slot);
     finish(at);
   }
   return define(ins.result, r_out);
@@ -1539,6 +2655,50 @@ bool Translator::dx_call(const Instruction& ins) {
     }
     case 8: case 9: case 10: return classify(ins, static_cast<uint32_t>(opcode));
     case 14: case 18: case 19: case 20: return trig(ins, static_cast<uint32_t>(opcode));
+    case 15: case 16: case 17: return inverse_trig(ins, static_cast<uint32_t>(opcode));
+    case kDerivCoarseX: return unary(ins, 122, 1);
+    case kDerivCoarseY: return unary(ins, 124, 1);
+    case kDerivFineX: return unary(ins, 123, 1);
+    case kDerivFineY: return unary(ins, 125, 1);
+    case kFma: {   // dfma (the float one is FMad)
+      const Val a = use(ins.args[1]), b = use(ins.args[2]), c = use(ins.args[3]);
+      const Val r = new_wide(ins.result);
+      if (r.kind == VK::None) return false;
+      const uint32_t at = begin(210);
+      dst_scalar(r);
+      src(a), src(b), src(c);
+      finish(at);
+      return define(ins.result, r);
+    }
+    case kMakeDouble: {   // the two words are the two halves of the pair
+      const Val lo = use(ins.args[1]), hi = use(ins.args[2]);
+      const Val r = new_wide(ins.result);
+      if (r.kind == VK::None) return false;
+      for (int word_index = 0; word_index < 2; ++word_index) {
+        const uint32_t at = begin(54);
+        dst_scalar(word_index ? high_word(r) : low_word(r));
+        src(word_index ? hi : lo);
+        finish(at);
+      }
+      return define(ins.result, r);
+    }
+    case kSplitDouble: {   // {low, high}: the pair itself, read by extractvalue
+      Val d = use(ins.args[1]);
+      if (d.kind != VK::Temp || !d.wide) {   // (a literal or a constant buffer element: into a register first)
+        const Val copy = new_wide(ins.result);
+        if (copy.kind == VK::None) return false;
+        for (int word_index = 0; word_index < 2; ++word_index) {
+          const uint32_t at = begin(54);
+          dst_scalar(word_index ? high_word(copy) : low_word(copy));
+          src(word_index ? high_word(d) : low_word(d));
+          finish(at);
+        }
+        d = copy;
+      }
+      Val agg;
+      agg.kind = VK::Agg, agg.a = d.a, agg.b = d.b;
+      return define(ins.result, agg);
+    }
     case kFAbs: return unary(ins, 54, 1, 2);
     case kSaturate: return unary(ins, 54, 1, 0, true);
     case kSin: return sincos(ins, false);
@@ -1566,8 +2726,14 @@ bool Translator::dx_call(const Instruction& ins) {
     case kDot4: return dot(ins, 4);
     case kCreateHandle: {
       uint64_t cls = 0, range = 0, index = 0;
+      if (ins.arg_count >= 4 && constant_int(ins.args[1], &cls) && constant_int(ins.args[2], &range) && !constant_int(ins.args[3], &index) && cls == 0 && range < kMaxResources && res_[0][range].present &&
+          res_[0][range].size != 0xFFFFFFFFu && res_[0][range].size >= 2 && res_[0][range].size <= 8) {
+        Val v;   // (a texture array indexed by a variable: the lookups that use it test the index)
+        v.kind = VK::HandleVar, v.a = 0, v.b = static_cast<uint32_t>(range), v.c = ins.args[3];
+        return define(ins.result, v);
+      }
       if (ins.arg_count < 4 || !constant_int(ins.args[1], &cls) || !constant_int(ins.args[2], &range) || !constant_int(ins.args[3], &index) || cls > 3 || range >= kMaxResources || !res_[cls][range].present)
-        return error(status::kNotSupported);   // (a resource array indexed by a variable)
+        return error(status::kNotSupported);   // (a resource array indexed by a variable: only a small array of textures)
       // (the index is the register: the range's lower bound for a single resource)
       const Resource& range_info = res_[cls][range];
       if (index < range_info.lower || (range_info.size != 0xFFFFFFFFu && index - range_info.lower >= range_info.size)) return error(status::kInvalidParameter);
@@ -1585,9 +2751,14 @@ bool Translator::dx_call(const Instruction& ins) {
       v.kind = VK::CbAgg, v.a = h.c, v.b = static_cast<uint32_t>(reg);
       return define(ins.result, v);
     }
-    case kSample: return sample(ins, false);
-    case kSampleLevel: return sample(ins, true);
-    case kTextureLoad: return texture_load(ins);
+    case kSample: return with_array(ins, [&] { return sample(ins, false); });
+    case kSampleLevel: return with_array(ins, [&] { return sample(ins, true); });
+    case kSampleBias: case kSampleGrad: return with_array(ins, [&] { return sample_bias_grad(ins, opcode == kSampleGrad); });
+    case kTextureLoad: return with_array(ins, [&] { return texture_load(ins); });
+    case kTextureGather: return with_array(ins, [&] { return texture_gather(ins, false); });
+    case kTextureGatherCmp: return with_array(ins, [&] { return texture_gather(ins, true); });
+    case kCalculateLod: return calculate_lod(ins);
+    case kSampleCmp: case kSampleCmpLevelZero: return with_array(ins, [&] { return sample_compare(ins, opcode == kSampleCmpLevelZero); });
     case kThreadId: return thread_value(ins, 32, true);
     case kGroupId: return thread_value(ins, 33, true);
     case kThreadIdInGroup: return thread_value(ins, 34, true);
@@ -1645,10 +2816,16 @@ bool Translator::dx_call(const Instruction& ins) {
       domain_used_ = true;
       return define(ins.result, v);
     }
-    case 97: case 98: {   // emitStream / cutStream (stream 0)
-      uint64_t stream = 1;
-      if (kind_ != 2 || ins.arg_count < 2 || !constant_int(ins.args[1], &stream) || stream != 0) return error(status::kNotSupported);
-      finish(begin(opcode == 97 ? 19 : 9));
+    case 97: case 98: {   // emitStream / cutStream
+      uint64_t stream = ~uint64_t{0};
+      if (kind_ != 2 || ins.arg_count < 2 || !constant_int(ins.args[1], &stream) || stream >= graphics::kMaxGeometryStreams || !(gs_[2] >> stream & 1)) return error(status::kNotSupported);
+      if (gs_[2] == 1) {
+        finish(begin(opcode == 97 ? 19 : 9));
+      } else {
+        const uint32_t at = begin(opcode == 97 ? 117 : 118);   // emit_stream / cut_stream m#
+        put((16u << 12) | (1u << 20)), put(static_cast<uint32_t>(stream));
+        finish(at);
+      }
       return true;
     }
     case kDiscard: {
@@ -1799,8 +2976,13 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     if (const Constant* c = constant(static_cast<uint32_t>(i))) {
       const uint32_t type = value_type(static_cast<uint32_t>(i));
       if ((c->kind == ConstantKind::Int && m_.is_int(type, 1)) ) v.kind = VK::Imm, v.a = c->bits & 1 ? 0xFFFFFFFFu : 0, v.is_mask = true;
-      else if (c->kind == ConstantKind::Int && (m_.is_int(type, 32) || m_.is_int(type, 8) || m_.is_int(type, 16))) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
+      else if (c->kind == ConstantKind::Int && (m_.is_int(type, 32) || m_.is_int(type, 8))) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
+      else if (c->kind == ConstantKind::Int && m_.is_int(type, 16)) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits) & 0xFFFFu;
+      else if (c->kind == ConstantKind::Float && half_type(type)) v.kind = VK::Imm, v.a = __builtin_bit_cast(uint32_t, graphics::half_to_float(static_cast<uint16_t>(c->bits)));
       else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 32) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
+      else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 64) v.kind = VK::Imm, v.wide = true, v.a = static_cast<uint32_t>(c->bits), v.c = static_cast<uint32_t>(c->bits >> 32);
+      else if (c->kind == ConstantKind::Int && m_.is_int(type, 64)) v.kind = VK::Imm, v.wide = true, v.a = static_cast<uint32_t>(c->bits), v.c = static_cast<uint32_t>(c->bits >> 32);
+      else if ((c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) && (m_.is_float(type) ? m_.types[type].width == 64 : m_.is_int(type, 64))) v.kind = VK::Imm, v.wide = true;
       else if (c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) v.kind = VK::Imm, v.a = 0;
     }
     if (!vals_.push_back(v) || !last_use_.push_back(-1) || !alias_of_.push_back(kNone) || !unsupported_.push_back(0) || !ptr_ok_.push_back(0)) return status::kNoMemory;
@@ -1812,7 +2994,7 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     uint32_t next[kMaxSuccessors], count = 0;
     successors_of(x, next, &count);
     for (uint32_t k = 0; k < count; ++k)
-      if (next[k] <= x && next[k] < f_.block_count && (latch_of_[next[k]] == kNone || latch_of_[next[k]] < x)) latch_of_[next[k]] = x;
+      if (next[k] <= x && next[k] < f_.block_count && !is_return_block(next[k]) && (latch_of_[next[k]] == kNone || latch_of_[next[k]] < x)) latch_of_[next[k]] = x;
   }
   for (uint64_t i = 0; i < values; ++i)
     if (!def_pos_.push_back(-1)) return status::kNoMemory;
@@ -1836,11 +3018,12 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     for (uint32_t i = 0; i < blk.count; ++i) {
       const Instruction& phi = instruction_at(blk.first + i);
       if (phi.op != Op::Phi) break;
-      if (m_.is_float(phi.type) ? m_.types[phi.type].width != 32 : !m_.is_int(phi.type, 32) && !m_.is_int(phi.type, 1)) return status::kNotSupported;
+      const bool double_phi = wide_type(phi.type);
+      if (!double_phi && (m_.is_float(phi.type) ? !float32(phi.type) : !m_.is_int(phi.type, 32) && !m_.is_int(phi.type, 16) && !m_.is_int(phi.type, 1))) return status::kNotSupported;
       uint32_t reg = 0, comp = 0;
-      if (!alloc_scalar(last_use_of(phi.result), &reg, &comp)) return status_;
+      if (!(double_phi ? alloc_wide(last_use_of(phi.result), &reg, &comp) : alloc_scalar(last_use_of(phi.result), &reg, &comp))) return status_;
       Val v;
-      v.kind = VK::Temp, v.a = reg, v.b = comp, v.is_mask = m_.is_int(phi.type, 1);
+      v.kind = VK::Temp, v.a = reg, v.b = comp, v.is_mask = m_.is_int(phi.type, 1), v.wide = double_phi;
       vals_[phi.result] = v;
     }
   }
@@ -1861,6 +3044,13 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
         if (!r.present) continue;
         if (r.bytes == 0 || r.bytes % 16 || r.lower >= 14) return status::kNotSupported;
         word(89u | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (8u << 12) | (2u << 20)), word(r.lower), word(r.bytes / 16);
+      }
+      for (uint32_t i = 0; i < kMaxResources; ++i) {   // (the views of buffers of both functions)
+        const Resource& r = res_[0][i];
+        if (!r.present) continue;
+        if ((r.kind != 11 && r.kind != 12) || r.lower >= graphics::kMaxSrvBuffers) return status::kNotSupported;
+        if (r.kind == 12) word(162u | (4u << 24)), word((7u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+        else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
       }
       if (points_in < 1 || points_in > graphics::kMaxPatchControlPoints) return status::kNotSupported;
       for (uint32_t i = 0; i < input_count_; ++i) {
@@ -1914,10 +3104,15 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     // (D3D10_SB_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency; the topologies: 1 point list, 3 line strip, 5 triangle strip)
     const uint32_t primitive = gs_[0];
     input_vertices = primitive == 1 ? 1 : primitive == 2 ? 2 : primitive == 3 ? 3 : primitive == 6 ? 4 : primitive == 7 ? 6 : 0;
-    if (!input_vertices || gs_[1] == 0 || gs_[1] > graphics::kMaxGeometryVertices || (gs_[3] != 1 && gs_[3] != 3 && gs_[3] != 5) || gs_[2] != 1) return status::kNotSupported;   // (stream 0 only)
+    if (!input_vertices || gs_[1] == 0 || gs_[1] > graphics::kMaxGeometryVertices || (gs_[3] != 1 && gs_[3] != 3 && gs_[3] != 5) || gs_[2] == 0 || gs_[2] > 15) return status::kNotSupported;
     word(93u | (primitive << 11) | (1u << 24));
     word(92u | (gs_[3] << 11) | (1u << 24));
     word(94u | (2u << 24)), word(gs_[1]);
+    if (gs_[2] != 1) {   // (more than the first stream: dcl_stream m0 .. m<highest>, which the other front end wants one after the other)
+      uint32_t streams = 0;
+      while (gs_[2] >> streams) ++streams;
+      for (uint32_t k = 0; k < streams; ++k) word(143u | (3u << 24)), word((16u << 12) | (1u << 20)), word(k);
+    }
     if (gs_[4] > 1) {
       if (gs_[4] > 32) return status::kNotSupported;
       word(206u | (2u << 24)), word(gs_[4]);
@@ -1939,8 +3134,19 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
       else return status::kNotSupported;
     }
-  } else if (res_[1][0].present || res_[1][1].present) {
-    return status::kNotSupported;   // (unordered access views of the other stages)
+  } else if (pixel) {
+    // (a pixel shader's unordered access views: buffers it writes)
+    for (uint32_t i = 0; i < kMaxResources; ++i) {
+      const Resource& r = res_[1][i];
+      if (!r.present) continue;
+      if (r.lower >= graphics::kMaxUavBuffers) return status::kNotSupported;
+      if (r.kind == 12) word(158u | (4u << 24)), word((30u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else if (r.kind == 11) word(157u | (3u << 24)), word((30u << 12) | (1u << 20)), word(r.lower);
+      else return status::kNotSupported;
+    }
+  } else {
+    for (uint32_t i = 0; i < kMaxResources; ++i)
+      if (res_[1][i].present) return status::kNotSupported;   // (unordered access views of the other stages)
   }
   // constant buffers
   for (uint32_t i = 0; i < kMaxResources; ++i) {
@@ -1956,10 +3162,18 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
   for (uint32_t i = 0; i < kMaxResources; ++i) {
     const Resource& r = res_[0][i];
     if (!r.present) continue;
+    if (r.kind == 11 || r.kind == 12) {   // (a raw or structured buffer view: a read-only storage buffer of a compute shader)
+      if (r.lower >= graphics::kMaxSrvBuffers) return status::kNotSupported;
+      if (r.kind == 12) word(162u | (4u << 24)), word((7u << 12) | (1u << 20)), word(r.lower), word(r.stride);
+      else word(161u | (3u << 24)), word((7u << 12) | (1u << 20)), word(r.lower);
+      continue;
+    }
     // (the kind: 2 texture 2D, 4 texture 3D, 5 cube, 7 2D array)
     const uint32_t dimension = r.kind == 2 ? 3 : r.kind == 4 ? 5 : r.kind == 5 ? 6 : r.kind == 7 ? 8 : 0;
-    if (!dimension || r.lower >= graphics::kMaxTextureUnits) return status::kNotSupported;
-    word(88u | (dimension << 11) | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower), word(0x5555u);
+    const uint32_t elements = r.size != 0xFFFFFFFFu && r.size >= 1 && r.size <= 8 ? r.size : 1;   // (an array: every element is declared)
+    if (!dimension || r.lower >= graphics::kMaxTextureUnits || elements > graphics::kMaxTextureUnits - r.lower) return status::kNotSupported;
+    for (uint32_t e = 0; e < elements; ++e)
+      word(88u | (dimension << 11) | (4u << 24)), word(2u | (1u << 2) | (0xE4u << 4) | (7u << 12) | (1u << 20)), word(r.lower + e), word(0x5555u);
   }
   for (uint32_t i = 0; i < input_count_; ++i) {
     const SigElement& e = inputs_[i];
@@ -2002,7 +3216,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
 }
 
 // The ISG1 / OSG1 signature part (32 bytes an element) as the ISGN / OSGN one (24).
-bool convert_signature(allocators::IAllocator& allocator, ConstByteView chunk, ByteBuffer* out) {
+// `streams`: the output signature of a geometry shader, whose entries keep the stream they belong to (the 28-byte OSG5 layout).
+bool convert_signature(allocators::IAllocator& allocator, ConstByteView chunk, ByteBuffer* out, bool streams = false) {
   ByteReader in(chunk);
   const uint32_t n = in.le32();
   const uint32_t key = in.le32();
@@ -2014,11 +3229,12 @@ bool convert_signature(allocators::IAllocator& allocator, ConstByteView chunk, B
     ConstByteView entry = in.take(32);
     if (!in.ok()) return false;
     ByteReader e(entry);
-    e.le32();
+    const uint32_t stream = e.le32();
     const uint32_t name = e.le32();
     if (name < table_at || name > chunk.size()) return false;
     const uint32_t index = e.le32(), sysval = e.le32(), type = e.le32(), reg = e.le32(), masks = e.le32() & 0xFFFF;
-    if (!out->put32(name - static_cast<uint32_t>(uint64_t{n} * 8)) || !out->put32(index) || !out->put32(sysval) || !out->put32(type) || !out->put32(reg) || !out->put32(masks)) return false;
+    if (streams && (stream >= graphics::kMaxGeometryStreams || !out->put32(stream))) return false;
+    if (!out->put32(name - static_cast<uint32_t>(uint64_t{n} * (streams ? 4 : 8))) || !out->put32(index) || !out->put32(sysval) || !out->put32(type) || !out->put32(reg) || !out->put32(masks)) return false;
   }
   if (table_at > chunk.size()) return false;
   (void)allocator;
@@ -2113,14 +3329,14 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   // the container: the converted signatures and the program
   ByteBuffer in_sig(allocator), out_sig(allocator);
   if (!isg1.empty() && !convert_signature(allocator, isg1, &in_sig)) return status::kInvalidParameter;
-  if (!osg1.empty() && !convert_signature(allocator, osg1, &out_sig)) return status::kInvalidParameter;
+  if (!osg1.empty() && !convert_signature(allocator, osg1, &out_sig, kind == 2)) return status::kInvalidParameter;
   struct Part {
     uint32_t fourcc;
     ConstByteView data;
   } parts[3];
   uint32_t part_count = 0;
   if (in_sig.size()) parts[part_count++] = {kFourIsgn, in_sig.view()};
-  if (out_sig.size()) parts[part_count++] = {kFourOsgn, out_sig.view()};
+  if (out_sig.size()) parts[part_count++] = {kind == 2 ? 0x3547534Fu : kFourOsgn, out_sig.view()};   // (OSG5 for the streams)
   parts[part_count++] = {kFourShex, shex.view()};
   ByteBuffer container(allocator);
   uint64_t size = 32 + uint64_t{part_count} * 4;

@@ -98,6 +98,14 @@ void set_thread_priority(Thread* thread, uint8_t priority);
 // scheduled (within a time slice if it runs on a core that is now excluded).
 bool set_thread_core_mask(Thread* thread, uint64_t mask);
 uint64_t online_core_mask();      // bit n: core n is online (the first 64)
+// Runs `fn(argument)` once on every online core (the first 64), the calling core included, with interrupts masked on that core while it runs: for the per-core registers (MSRs)
+// that a setting has to be written to on each core. The cores are interrupted, so `fn` must be short and must not block. Waits up to `timeout_us` for the others; false if some
+// core did not run it in time. One call at a time.
+bool run_on_every_core(void (*fn)(void*), void* argument, uint64_t timeout_us = 200000);
+// x86: idle cores wait with MONITOR / MWAIT and this hint in EAX (the C-state to ask for: 0x00 C1, 0x01 C1E, 0x10 C3, 0x20 C6 ... on Intel parts) instead of HLT. 0xFFFFFFFF goes back
+// to HLT. The caller checks that the processor has MWAIT with interrupts as break events (CPUID leaf 5) and, for a state where the local APIC timer stops, an always-running timer
+// (ARAT). Ignored on other architectures.
+void set_idle_mwait_hint(uint32_t hint);
 Thread* spawn(ThreadFunction fn, void* argument, const char* name = "thread", int32_t core = -1,
               int8_t preferred_kind = -1, uint32_t stack_bytes = kDefaultStackBytes);
 // Gives up the core until the scheduler picks this thread again.

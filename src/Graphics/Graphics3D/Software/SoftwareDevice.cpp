@@ -197,6 +197,16 @@ class SoftwareImage final : public IImage {
   }
   // What a pixel of this image keeps of a colour (WidePixels.hpp).
   Vec4 store_float(Vec4 c) const { return quantize_wide_pixel(desc_.format, c); }
+  bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) override {
+    if (color_.empty() || desc_.samples != 1 || !area.width || !area.height || pitch < area.width) return false;
+    const Extent2D e = desc_.extent;
+    if (uint64_t{static_cast<uint32_t>(area.x < 0 ? -1 : area.x)} + area.width > e.width || area.x < 0 || area.y < 0 || uint64_t{static_cast<uint32_t>(area.y)} + area.height > e.height) return false;
+    if (pixels.size() < uint64_t{area.height - 1} * pitch + area.width) return false;
+    const Surface s = surface(0);
+    for (uint32_t j = 0; j < area.height; ++j)
+      for (uint32_t i = 0; i < area.width; ++i) s.pixels[uint64_t{static_cast<uint32_t>(area.y) + j} * s.pitch + static_cast<uint32_t>(area.x) + i] = s.encode(pixels[uint64_t{j} * pitch + i]);
+    return true;
+  }
   bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
     if (color_.empty() || level >= desc_.mip_levels) return false;
     const Surface s = surface(level);
@@ -557,6 +567,7 @@ struct DrawState {
   Rect2D scissor;  // already clamped to the target
   TextureSet textures;
   const uint8_t* constants = nullptr;
+  const ByteView* storage = nullptr;   // the storage buffers the shaders of a draw can read
   uint8_t constants_storage[kMaxPushConstantBytes] = {};
   uint32_t primitive_id = 0;   // the primitive of the draw being rasterized (SV_PrimitiveID)
   uint32_t sample_count = 1;   // samples per pixel of the pass's images
@@ -741,8 +752,10 @@ void write_fragment(const DrawState& s, int32_t x, int32_t y, float z, bool dept
 }
 
 // Runs the pipeline's fragment shader; false if it discarded the pixel.
-bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& context, Vec4* color) {
+bool run_fragment_shader(const DrawState& s, const Vec4* varying, const FragmentContext& given, Vec4* color) {
   if (s.ps_invocations) ++*s.ps_invocations;
+  FragmentContext context = given;
+  context.storage = s.storage;
   if (s.pipeline->fragment_ex()) return s.pipeline->fragment_ex()(varying, context, s.constants, s.textures, color);
   if (s.pipeline->textured()) return s.pipeline->textured()(varying, s.constants, s.textures, color);
   return s.pipeline->fragment()(varying, s.constants, color);
@@ -894,7 +907,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       if (pd.depth_test && !depth.empty())
         for (uint32_t k = 0; k < sample_count; ++k)
           if ((covered >> k & 1) && !depth_passes(pd.depth_compare, sample_z[k], depth[index * sample_count + k])) depth_pass &= ~(1u << k);
-      if (!depth_pass && !stencil_on) continue;   // (with a stencil test the depth result is needed after the shader)
+      if (!depth_pass && !stencil_on && !pd.fragment_stores) continue;   // (with a stencil test the depth result is needed after the shader; a shader that writes buffers runs whatever the depth test says)
 
       // Perspective-correct varyings: weights scaled by 1/w.
       const float p0 = b0 * v0->inv_w, p1 = b1 * v1->inv_w, p2 = b2 * v2->inv_w;
@@ -922,6 +935,7 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
           quad_context.position = {xs[k], ys[k], z, 1.0f};
           quad_context.front_facing = front;
           quad_context.primitive_id = s.primitive_id;
+          quad_context.helper = true;
           s.textures.start_recording();
           run_fragment_shader(s, quad_varying, quad_context, ignored);
           s.textures.stop_recording();
@@ -935,6 +949,18 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       context.position = {px, py, z, b0 * v0->inv_w + b1 * v1->inv_w + b2 * v2->inv_w};
       context.front_facing = front;
       context.primitive_id = s.primitive_id;
+      // (the corners of the pixel's quad for the derivatives: the varyings, and depth and 1 / w, of the plane of the triangle at the corner's centre)
+      auto quad_source = [&](uint32_t corner, Vec4* out_varyings, Vec4* out_position) {
+        const float qx = static_cast<float>(x & ~1) + 0.5f + static_cast<float>(corner & 1), qy = static_cast<float>(y & ~1) + 0.5f + static_cast<float>(corner >> 1);
+        varyings_at(qx, qy, out_varyings);
+        const float l0 = -((qx - v1->x) * e0dy - (qy - v1->y) * e0dx), l1 = -((qx - v2->x) * e1dy - (qy - v2->y) * e1dx), l2 = -((qx - v0->x) * e2dy - (qy - v0->y) * e2dx);
+        const float a0 = l0 * inv_area, a1 = l1 * inv_area, a2 = l2 * inv_area;
+        *out_position = {qx, qy, a0 * v0->z + a1 * v1->z + a2 * v2->z, a0 * v0->inv_w + a1 * v1->inv_w + a2 * v2->inv_w};
+      };
+      using QuadSource = decltype(quad_source);
+      context.quad_fn = [](const void* user, uint32_t corner, Vec4* out_varyings, Vec4* out_position) { (*static_cast<const QuadSource*>(user))(corner, out_varyings, out_position); };
+      context.quad_user = &quad_source;
+      context.quad_corner = static_cast<uint32_t>(x & 1) | static_cast<uint32_t>(y & 1) << 1;
       if (!run_fragment_shader(s, varying, context, color)) continue;
       if (pd.alpha_to_coverage && pd.multisample && sample_count > 1) {
         // (the first round(alpha * samples) samples of the pixel keep what they covered)
@@ -1209,6 +1235,7 @@ void run_geometry_instance(const DrawState& s, const ShaderModuleDesc& md, const
 void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module, const ClipVertex* v, uint32_t count) {
   const ShaderModuleDesc& md = module.desc();
   GeometryInputData input;
+  input.storage = s.storage;
   for (uint32_t k = 0; k < count && k < kMaxGeometryInputVertices; ++k) {
     input.position[k] = v[k].position;
     for (uint32_t i = 0; i < kMaxVaryings; ++i) input.varying[k][i] = v[k].varying[i];
@@ -1226,6 +1253,7 @@ void run_geometry_shader(const DrawState& s, const SoftwareShaderModule& module,
 void run_tessellation(const DrawState& s, Tessellator& tessellator, const SoftwareShaderModule& hull, const SoftwareShaderModule& domain, const ClipVertex* v, uint32_t count) {
   const ShaderModuleDesc& hd = hull.desc();
   HullInputData input;
+  input.storage = s.storage;
   input.control_points = count;
   input.primitive_id = s.primitive_id;
   for (uint32_t k = 0; k < count && k < kMaxPatchControlPoints; ++k) {
@@ -1234,6 +1262,7 @@ void run_tessellation(const DrawState& s, Tessellator& tessellator, const Softwa
   }
   HullOutputData patch;
   hd.hull_function(input, s.constants, &patch);
+  patch.storage = s.storage;
   if (!tessellator.tessellate(hd.tess_domain, hd.tess_partitioning, hd.tess_output, patch.outer, patch.inner)) return;
   const DomainShaderFn ds = domain.desc().domain_function;
   const bool triangles = hd.tess_domain == TessDomain::Triangle;
@@ -1407,6 +1436,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   };
   const SoftwareComputePipeline* compute = nullptr;
   ByteView storage[kMaxStorageBuffers];
+  s.storage = storage;
   DrawState::StreamOutputTarget stream_output[kMaxStreamOutputBuffers];
   uint64_t query_samples = 0;
   uint32_t query_slot = 0;
@@ -1554,7 +1584,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer: {
-        if (in_pass || cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;
+        if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         ByteView whole = cmd.buffer->map(), part;
         if (!whole.try_subview(cmd.offset, cmd.count, &part)) return false;
         storage[cmd.unit] = part;
@@ -1705,6 +1735,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           VertexContext context;
           context.vertex_id = static_cast<uint32_t>(v);
           context.instance_id = cmd.first_instance + instance;
+          context.storage = s.storage;
           ++stat_vs;
           *out = run_vertex_shader(*s.pipeline, vertices, byte, instance_byte, s.constants, context);
           return true;

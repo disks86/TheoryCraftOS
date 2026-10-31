@@ -222,7 +222,59 @@ int glyphs_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
     ok = near(at(5, 5), 0xFFFF0000) && near(at(21, 5), 0xFF00FF00) && near(at(8, 5), 0xFF7F0028 /* half red over (0,0,80) */) && near(at(10, 5), 0xFF000050) &&
          near(at(37, 5), 0xFFFFFFFF) && near(at(37, 21), 0xFF808080) && near(at(40, 21), 0xFF404040) && near(at(43, 21), 0xFF000000);
   }
+  // a second glyph later: only its rectangle goes to the device (an update of part of the atlas), and the first one is still right
+  if (ok) {
+    const uint64_t sent = r.atlas_pixels_sent();
+    uint8_t cov2[8 * 8];
+    for (uint32_t k = 0; k < 64; ++k) cov2[k] = (k / 8) < 4 ? 255 : 0;
+    r.draw_glyph(78, MaskView{ConstByteView(cov2, sizeof cov2), 8, 8, 8}, 44, 36, rgb(255, 255, 0));
+    r.draw_glyph(77, m, 4, 20, rgb(0, 128, 255));   // (the first again: not sent again)
+    ok = r.read_pixels(px) && r.atlas_pixels_sent() == sent + 64;
+    if (ok) {
+      auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x]; };
+      ok = (at(45, 37) & 0xFFFFFF) == 0xFFFF00 && (at(45, 42) & 0xFFFFFF) == 0x000000 && (at(5, 5) & 0xFFFFFF) == 0xFF0000 && (at(5, 21) & 0xFFFFFF) == 0x0080FF;
+    }
+  }
   release_view(allocator, px);
+  return ok ? 1 : 0;
+}
+
+// A picture repeated by the sampler (draw_image_tiled) and a conic gradient as wedges: 1 ok, 0 wrong.
+int fills_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
+  constexpr uint32_t W = 64, H = 48;
+  DeviceRenderer2D r(device, allocator, {W, H});
+  ArrayView<uint32_t> px = allocate_view<uint32_t>(allocator, W * H);
+  ArrayView<uint32_t> tile_pixels = allocate_view<uint32_t>(allocator, 3 * 2);
+  if (!r.valid() || px.empty() || tile_pixels.empty()) {
+    release_view(allocator, px);
+    release_view(allocator, tile_pixels);
+    return 0;
+  }
+  const uint32_t colors[6] = {rgb(255, 0, 0), rgb(0, 255, 0), rgb(0, 0, 255), rgb(255, 255, 255), rgb(255, 255, 0), rgb(0, 255, 255)};
+  for (uint32_t i = 0; i < 6; ++i) tile_pixels[i] = colors[i];
+  Surface tile;
+  tile.pixels = tile_pixels;
+  tile.width = tile.pitch = 3;
+  tile.height = 2;
+  r.clear(rgb(0, 0, 0));
+  r.set_blend(BlendMode::Alpha);
+  bool ok = r.draw_image_tiled(tile, 1, 1, 3, 2, {1, 1, 18, 8});   // (6 x 4 copies)
+  const GradientStop quadrants[8] = {{0.0f, rgb(255, 0, 0)}, {0.25f, rgb(255, 0, 0)}, {0.25f, rgb(0, 255, 0)}, {0.5f, rgb(0, 255, 0)},
+                                     {0.5f, rgb(0, 0, 255)}, {0.75f, rgb(0, 0, 255)}, {0.75f, rgb(255, 255, 0)}, {1.0f, rgb(255, 255, 0)}};
+  ok = ok && r.fill_conic_gradient({24, 0, 40, 40}, {44, 20}, 0.0f, ArrayView<const GradientStop>(quadrants, 8)) && r.read_pixels(px);
+  if (ok) {
+    auto at = [&](uint32_t x, uint32_t y) { return px[y * W + x] & 0xFFFFFF; };
+    // tiles: pixel (x, y) shows the tile pixel ((x - 1) mod 3, (y - 1) mod 2); nothing outside the area
+    bool tiles = true;
+    for (uint32_t y = 1; y < 9; ++y)
+      for (uint32_t x = 1; x < 19; ++x) tiles = tiles && at(x, y) == (colors[((y - 1) % 2) * 3 + ((x - 1) % 3)] & 0xFFFFFF);
+    tiles = tiles && at(0, 1) == 0 && at(19, 1) == 0 && at(1, 9) == 0;
+    // conic: clockwise from the top, red, green, blue, yellow quarters around (44, 20): top right red, bottom right green, bottom left blue, top left yellow
+    const bool conic = at(54, 10) == 0xFF0000 && at(54, 30) == 0x00FF00 && at(34, 30) == 0x0000FF && at(34, 10) == 0xFFFF00;
+    ok = tiles && conic;
+  }
+  release_view(allocator, px);
+  release_view(allocator, tile_pixels);
   return ok ? 1 : 0;
 }
 
@@ -380,6 +432,8 @@ bool demo_3d(SystemGraphics& graphics, allocators::IAllocator& allocator, uint64
   return ok && first_frame_checked;
 }
 }  // namespace
+
+int check_2d_fills(IGraphicsDevice& device, allocators::IAllocator& allocator) { return fills_check(device, allocator); }
 
 int check_2d_glyphs(IGraphicsDevice& device, allocators::IAllocator& allocator) { return glyphs_check(device, allocator); }
 

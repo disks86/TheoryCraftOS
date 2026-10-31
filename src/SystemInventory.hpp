@@ -24,6 +24,7 @@
 #include "Desktop/HardwareInventory.hpp"
 #include "Utility/String.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
+#include "Hardware/Bluetooth/IBluetooth.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Camera/SystemCameras.hpp"
@@ -61,6 +62,7 @@ class SystemInventory final : public desktop::IHardwareInventory, public desktop
   void set_printers(hardware::SystemPrinters* printers) { printers_ = printers; }
   void set_cameras(hardware::SystemCameras* cameras) { cameras_ = cameras; }
   void set_pci(hardware::IPciBus* pci) { pci_ = pci; }
+  void set_bluetooth(hardware::IBluetoothManager* bluetooth) { bluetooth_ = bluetooth; }
 
   bool refresh() override;
   uint32_t count() const override { return current_.count(); }
@@ -69,7 +71,7 @@ class SystemInventory final : public desktop::IHardwareInventory, public desktop
 
  private:
   void collect(desktop::HardwareList* list);
-  void add(desktop::HardwareList* list, desktop::HardwareGroup group, StringView name, uint32_t id = 0, bool wireless = false);   // detail = scratch_
+  void add(desktop::HardwareList* list, desktop::HardwareGroup group, StringView name, uint32_t id = 0, bool wireless = false, bool bluetooth = false);   // detail = scratch_
   allocators::IAllocator& allocator_;
   desktop::HardwareList current_;
   String scratch_;
@@ -87,4 +89,5 @@ class SystemInventory final : public desktop::IHardwareInventory, public desktop
   hardware::SystemPrinters* printers_ = nullptr;
   hardware::SystemCameras* cameras_ = nullptr;
   hardware::IPciBus* pci_ = nullptr;
+  hardware::IBluetoothManager* bluetooth_ = nullptr;
 };

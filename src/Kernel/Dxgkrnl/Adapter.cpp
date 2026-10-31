@@ -432,9 +432,12 @@ class Adapter::StreamRunner {
 
   NtStatus bind_uav(ByteReader& p) {
     const uint32_t slot = p.le32(), index = p.le32(), offset = p.le32(), size = p.le32();
-    if (!exact(p) || in_pass_ || !(adapter_.caps_.features & graphics::kFeatureCompute) || slot >= graphics::kMaxStorageBuffers) return kBad;
+    const bool view = slot >= graphics::kMaxUavBuffers;   // (a shader resource view of a buffer: read-only, also by the shaders of a draw, and it may change between draws)
+    const bool draws_write = (adapter_.caps_.features & graphics::kFeatureFragmentStores) != 0;   // (pixel shaders write the unordered access ones: they are bound between draws too)
+    if (!exact(p) || slot >= graphics::kMaxStorageBuffers || (in_pass_ && !view && !draws_write) || !(adapter_.caps_.features & (graphics::kFeatureCompute | (view ? graphics::kFeatureStorageInDraws : graphics::kFeatureFragmentStores)))) return kBad;
     Allocation* a = alloc(index);
-    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
+    const bool read_only = slot >= graphics::kMaxUavBuffers;   // (the slots after u3 are shader resource views of buffers)
+    if (!a || !(a->desc().flags & kAllocUnorderedAccess) || !use(a, read_only ? state::kNonPixelShaderResource : state::kUnorderedAccess) || size == 0 || offset % 4 || size % 4 || offset > a->desc().size || size > a->desc().size - offset) return kBad;
     uav_bound_[slot] = true;
     uav_alloc_[slot] = a;
     if (!exec_) return status::kSuccess;
@@ -459,7 +462,7 @@ class Adapter::StreamRunner {
     if (s != status::kSuccess) return s;
     cb_->dispatch(x, y, z);
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
-      if (uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
+      if (uav_bound_[slot] && slot < graphics::kMaxUavBuffers) mm_.note_gpu_write(*uav_alloc_[slot]);
     return status::kSuccess;
   }
 
@@ -585,6 +588,8 @@ class Adapter::StreamRunner {
     for (uint32_t u = 0; u < pipeline_->texture_count(); ++u)
       if (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != pipeline_->texture_kind(u)) return kBad;   // (unbound, or a volume where the shader reads a 2D texture, ...)
     if (pipeline_->color_target_count() > pass_target_count_) return kBad;
+    for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
+      if ((pipeline_->storage_mask() >> slot & 1) && !uav_bound_[slot]) return kBad;   // (a buffer the shaders read must be bound)
     if (pipeline_->blends()) {   // (an integer target takes no blending)
       if (is_integer(pass_color_->desc().format)) return kBad;
       for (uint32_t n = 0; n + 1 < pass_target_count_; ++n)
@@ -633,7 +638,11 @@ class Adapter::StreamRunner {
     }
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
-    if (topology_ == Topology::TriangleStrip || topology_ == Topology::TriangleFan || topology_ == Topology::LineStrip) return draw_expanded(indexed, count, first, vertex_offset, instance_count, first_instance);
+    if (topology_ == Topology::TriangleStrip || topology_ == Topology::TriangleFan || topology_ == Topology::LineStrip) {
+      const NtStatus expanded = draw_expanded(indexed, count, first, vertex_offset, instance_count, first_instance);
+      if (expanded == status::kSuccess) note_storage_written();
+      return expanded;
+    }
     if (is_patch_list(topology_)) {
       set_device_topology(graphics::PrimitiveTopology::PatchList);
       if (device_patch_points_ != patch_points(topology_)) {
@@ -650,7 +659,15 @@ class Adapter::StreamRunner {
     if (indexed) cb_->draw_indexed(count, first, vertex_offset, instance_count, first_instance);
     else cb_->draw(count, first, instance_count, first_instance);
     note_stream_output_written();
+    note_storage_written();
     return status::kSuccess;
+  }
+
+  // The unordered access buffers the pipeline's pixel shader may have written are newer on the device than in the system.
+  void note_storage_written() {
+    if (!pipeline_->fragment_stores()) return;
+    for (uint32_t slot = 0; slot < graphics::kMaxUavBuffers; ++slot)
+      if ((pipeline_->storage_mask() >> slot & 1) && uav_bound_[slot]) mm_.note_gpu_write(*uav_alloc_[slot]);
   }
 
   void set_device_topology(graphics::PrimitiveTopology topology) {
@@ -880,8 +897,10 @@ class Adapter::StreamRunner {
       if (!a->is_buffer() || a->is_query_result() || !use(a, state::kVertexAndConstantBuffer)) return kBad;
     } else if (rp.type == RootParameterType::Uav) {
       if (!(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kUnorderedAccess)) return kBad;
+    } else if (rp.type == RootParameterType::Srv) {
+      if (!(a->desc().flags & kAllocUnorderedAccess) || !use(a, state::kNonPixelShaderResource)) return kBad;   // (a buffer: a storage buffer the shader only reads)
     } else {
-      return kBad;   // (a shader resource view of a buffer: no device has buffer shader resources)
+      return kBad;
     }
     arguments_[index].set = true;
     arguments_[index].allocation = a;
@@ -999,8 +1018,12 @@ class Adapter::StreamRunner {
         ByteView out(block, block_bytes);
         if (!out.copy_from(arg.allocation->backing().subview(arg.offset, block_bytes))) return kBad;
       } else if (rp.type == RootParameterType::Uav) {
-        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxStorageBuffers) return kBad;
+        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxUavBuffers) return kBad;
         const NtStatus s = lower_uav(rp.shader_register, arg.allocation, arg.offset, arg.allocation->desc().size - arg.offset);
+        if (s != status::kSuccess) return s;
+      } else if (rp.type == RootParameterType::Srv) {
+        if (rp.space != 0 || !arg.set || rp.shader_register >= graphics::kMaxSrvBuffers) return kBad;
+        const NtStatus s = lower_uav(graphics::kMaxUavBuffers + rp.shader_register, arg.allocation, arg.offset, arg.allocation->desc().size - arg.offset);
         if (s != status::kSuccess) return s;
       } else if (rp.type == RootParameterType::Table && !rp.sampler_table) {
         if (!arg.set || !view_heap_) return kBad;
@@ -1015,12 +1038,16 @@ class Adapter::StreamRunner {
             const Descriptor& d = view_heap_->at(at);
             const uint32_t reg = range.base_register + static_cast<uint32_t>(k);
             if (d.kind == DescriptorKind::None) continue;   // (a descriptor that was never written: not used by a shader that is right)
-            if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
+            if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv && d.allocation->is_buffer()) {
+              if (reg >= graphics::kMaxSrvBuffers) return kBad;
+              const NtStatus s = lower_uav(graphics::kMaxUavBuffers + reg, d.allocation.get(), d.offset, d.size);
+              if (s != status::kSuccess) return s;
+            } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
               if (reg >= graphics::kMaxTextureUnits) return kBad;
               const NtStatus s = lower_texture(reg, d.allocation.get(), sampler_for(reg));
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
-              if (reg >= graphics::kMaxStorageBuffers) return kBad;
+              if (reg >= graphics::kMaxUavBuffers) return kBad;
               const NtStatus s = lower_uav(reg, d.allocation.get(), d.offset, d.size);
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Cbv && d.kind == DescriptorKind::Cbv) {
@@ -1304,6 +1331,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       shader->tess_domain_ = program->tess_domain();
       for (uint32_t u = 0; u < graphics::kMaxStorageBuffers; ++u)
         if (program->storage_kind(u) != D3d9Program::BufferKind::None) shader->storage_mask_ |= 1u << u;
+      shader->fragment_stores_ = program->uses_fragment_stores();
       const NtStatus b = shader->d3d9_.bind(util::move(program), &md);
       if (b != status::kSuccess && !md.tgsi) return b;
       no_functions = b;   // (out of trampolines is no matter to a device that takes the text)
@@ -1400,6 +1428,7 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
   pd.varying_count = d.varying_count;
   pd.texture_count = d.texture_count;
+  pd.fragment_stores = fragment->fragment_stores_;
   pd.cull_mode = d.cull_mode;
   pd.front_face = d.front_face;
   pd.depth_test = d.depth_test;
@@ -1440,6 +1469,8 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   pipeline->texture_count_ = d.texture_count;
   for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) pipeline->texture_kinds_[u] = fragment->texture_kind(u);
   pipeline->color_target_count_ = d.color_target_count;
+  pipeline->fragment_stores_ = fragment->fragment_stores_;
+  pipeline->storage_mask_ = vertex->storage_mask_ | fragment->storage_mask_ | (geometry ? geometry->storage_mask_ : 0u) | (hull ? hull->storage_mask_ : 0u) | (domain ? domain->storage_mask_ : 0u);   // (the views of buffers their shaders read)
   *out = pipeline;
   return status::kSuccess;
 }

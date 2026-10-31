@@ -69,7 +69,7 @@ enum class Op : uint8_t {
   Binop, Cast, Cmp, Select, Call, Br, CondBr, Ret, Phi, ExtractValue, Load, Store, Alloca, Gep, Unreachable, Switch, Other
 };
 
-constexpr uint32_t kMaxCallArguments = 16;
+constexpr uint32_t kMaxCallArguments = 20;
 struct Instruction {
   Op op = Op::Other;
   uint32_t code = 0;            // Binop: the LLVM binary operator (0 add, 1 sub, 2 mul, 3 udiv, 4 sdiv, 5 urem, 6 srem, 7 shl, 8 lshr, 9 ashr, 10 and, 11 or, 12 xor); Cast: the cast opcode; Cmp: the predicate
@@ -148,7 +148,7 @@ class Module {
 
   // The function bodies' results are in numbers above module_values per function: Function::first_value is where a function's start (its arguments).
   const Type* type_at(uint32_t id) const { return id < types.count() ? &types[id] : nullptr; }
-  bool is_float(uint32_t type) const { return type < types.count() && types[type].kind == TypeKind::Float; }
+  bool is_float(uint32_t type) const { return type < types.count() && (types[type].kind == TypeKind::Float || types[type].kind == TypeKind::Double || types[type].kind == TypeKind::Half); }
   bool is_int(uint32_t type, uint32_t width = 0) const { return type < types.count() && types[type].kind == TypeKind::Int && (width == 0 || types[type].width == width); }
   const NamedMeta* find_named(StringView name) const {
     for (const NamedMeta& n : named.view())

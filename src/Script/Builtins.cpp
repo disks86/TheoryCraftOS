@@ -401,6 +401,14 @@ NATIVE(object_define_property) {
   if (accessor || (current_accessor && !has_value && !has_writable)) {
     vm.define_accessor(o, key, has_get ? getter : Value(), has_set ? setter : Value(), flags);
     vm.set_property_flags(o, key, static_cast<uint8_t>(flags & kNonConfigurable), kNonConfigurable);
+    if ((has_get && getter.is_undefined()) || (has_set && setter.is_undefined())) {   // (define_accessor keeps what it is given undefined for: a `get: undefined` takes the getter away)
+      Value pair;
+      uint8_t pair_flags;
+      if (vm.own_property(o, key, &pair, &pair_flags) && (pair_flags & kAccessor) && pair.is_object() && pair.as_object()->length >= 2) {
+        if (has_get && getter.is_undefined()) pair.as_object()->items[0] = Value();
+        if (has_set && setter.is_undefined()) pair.as_object()->items[1] = Value();
+      }
+    }
   } else {
     const bool new_writable = has_writable ? Vm::to_boolean(writable) : (!current_accessor && current_writable);
     flags = static_cast<uint8_t>(flags | (new_writable ? kWritable : 0));
@@ -774,12 +782,14 @@ NATIVE(object_value_of) {
 
 NATIVE(function_call) {
   if (!need_function(vm, self)) return false;
+  const Vm::PassThrough pass(vm);
   return vm.call(self, arg_at(args, argc, 0), argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0, result);
 }
 
 NATIVE(function_apply) {
   if (!need_function(vm, self)) return false;
   const Value list = arg_at(args, argc, 1);
+  const Vm::PassThrough pass(vm);
   if (list.is_object() && list.as_object()->okind == ObjKind::Array) vm.refresh_arguments(list.as_object());
   if (list.is_object() && list.as_object()->okind == ObjKind::Array) return vm.call(self, arg_at(args, argc, 0), list.as_object()->items, list.as_object()->length, result);
   return vm.call(self, arg_at(args, argc, 0), nullptr, 0, result);
@@ -1125,6 +1135,9 @@ bool array_each(Vm& vm, const Value& self, const Value* args, uint32_t argc, Val
   if (mode == Each::FindIndex) *result = num_value(-1);
   if (mode == Each::Some) *result = Value::make_bool(false);
   if (mode == Each::Every) *result = Value::make_bool(true);
+  // (the modes that make no value of their own in a variable, on an array that is the receiver itself: it, the callback and the arguments are on the VM stack, so the
+  // collector may run in the callback; the copy this_array() makes of an array-like is held by nothing)
+  const Vm::PassThrough pass(vm, a == self.as_object() && (mode == Each::ForEach || mode == Each::Some || mode == Each::Every || mode == Each::FindIndex));
   for (uint32_t i = 0; i < a->length; ++i) {
     const bool hole = a->items[i].is_hole();
     if (hole && mode != Each::Find && mode != Each::FindIndex) {   // (forEach, map, filter, some and every skip the holes; map keeps them)
@@ -2159,6 +2172,7 @@ NATIVE(promise_ctor) {
   JsObject* shared = vm.new_plain();   // (its `position` says that the promise has been resolved or rejected: only the first call counts)
   const Value fns[2] = {Value::make_object(vm.resolving_function(promise, shared, false)), Value::make_object(vm.resolving_function(promise, shared, true))};
   Value ignored;
+  const Vm::PassThrough pass(vm);   // (the promise, the resolving functions and the shared record are reachable from the stack while the executor runs: async code transpiled to ES5 runs in here)
   if (!vm.call(executor, Value(), fns, 2, &ignored)) {
     if (vm.halted()) return false;
     Value reason;
@@ -2251,6 +2265,7 @@ NATIVE(reflect_construct) {
   (void)self;
   const Value f = arg_at(args, argc, 0), list = arg_at(args, argc, 1), target = arg_at(args, argc, 2);
   if (!list.is_object() || list.as_object()->okind != ObjKind::Array) return vm.throw_error(ErrorKind::TypeError, "CreateListFromArrayLike called on non-object");
+  const Vm::PassThrough pass(vm);
   return vm.construct_with(f, list.as_object()->items, list.as_object()->length, target, result);
 }
 

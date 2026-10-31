@@ -122,6 +122,7 @@ enum AllocationFlags : uint32_t {
   kAllocQueryResult = 1u << 8,   // a buffer the results of occlusion queries are written to (CommandStream.hpp BeginQuery); system memory only, never resident, read by locking it
 };
 
+constexpr uint32_t kTileTexels = 128;   // ... a reserved texture of 4-byte pixels has tiles of kTileTexels x kTileTexels (so 64 KiB; the rows of a tile follow one another in the heap)
 constexpr uint32_t kTileBytes = 65536;   // the size of a tile of a reserved resource
 constexpr uint32_t kMaxTextureDimension = 4096;
 constexpr uint64_t kMaxBufferBytes = 256ull * 1024 * 1024;

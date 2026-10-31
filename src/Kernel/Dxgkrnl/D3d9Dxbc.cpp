@@ -45,7 +45,7 @@ enum DxbcOp : uint32_t {
   kDclResource4 = 88, kDclConstantBuffer4 = 89, kDclSampler4 = 90, kDclInput4 = 95, kDclInputSgv4 = 96, kDclInputSiv4 = 97, kDclInputPs4 = 98, kDclInputPsSgv4 = 99, kDclInputPsSiv4 = 100,
   kHsDecls4 = 113, kHsControlPointPhase4 = 114, kHsForkPhase4 = 115, kHsJoinPhase4 = 116, kDclInputControlPointCount4 = 147, kDclOutputControlPointCount4 = 148, kDclTessDomain4 = 149,
   kDclTessPartitioning4 = 150, kDclTessOutputPrimitive4 = 151, kDclHsMaxTessFactor4 = 152, kDclHsForkInstances4 = 153, kDclHsJoinInstances4 = 154,
-  kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclGsInstanceCount4 = 206, kDclThreadGroup4 = 155, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190, kDclTgsmRaw4 = 159, kDclTgsmStructured4 = 160,
+  kEmit4 = 19, kCut4 = 9, kDclOutputTopology4 = 92, kDclInputPrimitive4 = 93, kDclMaxOutputVertices4 = 94, kDclGsInstanceCount4 = 206, kDclThreadGroup4 = 155, kDclResourceRaw4 = 161, kDclResourceStructured4 = 162, kDclUavRaw4 = 157, kDclUavStructured4 = 158, kLdRaw4 = 165, kStoreRaw4 = 166, kLdStructured4 = 167, kStoreStructured4 = 168, kSync4 = 190, kDclTgsmRaw4 = 159, kDclTgsmStructured4 = 160,
   kDclOutput4 = 101, kDclOutputSgv4 = 102, kDclOutputSiv4 = 103, kDclTemps4 = 104, kDclIndexableTemp4 = 105, kDclGlobalFlags4 = 106,
 };
 // The texture a dcl_resource declares (D3D10_SB_RESOURCE_DIMENSION: 3 texture2d, 5 texture3d, 6 texturecube, 8 texture2darray); the others are not taken.
@@ -203,7 +203,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     for (uint32_t k = 0; k < slot; ++k) base += cb_size[k];
     return base;
   };
-  const bool vertex = program_type == 1;
+  const bool vertex = program_type == 1, pixel = program_type == 0;
   const bool compute = program_type == 5;
   const bool geometry = program_type == 2, hull = program_type == 3, domain = program_type == 4;
   const bool patch_stage = hull || domain;
@@ -470,6 +470,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       {41, kIShl, 2, false}, {42, kIShr, 2, false}, {85, kUShr, 2, false}, {1, kAnd, 2, false}, {60, kOr, 2, false}, {87, kXor, 2, false}, {59, kNot, 1, false},
       {27, kFtoI, 1, false}, {28, kFtoU, 1, false}, {43, kItoF, 1, false}, {86, kUtoF, 1, false}, {32, kIEq, 2, false}, {39, kINe, 2, false}, {34, kILt, 2, false}, {33, kIGe, 2, false},
       {79, kULt, 2, false}, {80, kUGe, 2, false},
+      {130, kF32ToF16, 1, false}, {131, kF16ToF32, 1, false},
+      // double precision (opcode numbers of d3d11tokenizedprogramformat.hpp)
+      {191, kDAdd, 2, false}, {192, kDMax, 2, false}, {193, kDMin, 2, false}, {194, kDMul, 2, false}, {195, kDEq, 2, false}, {196, kDGe, 2, false}, {197, kDLt, 2, false}, {198, kDNe, 2, false},
+      {199, kDMov, 1, false}, {200, kDMovc, 3, false}, {201, kDToF, 1, false}, {202, kFToD, 1, false}, {209, kDDiv, 2, false}, {210, kDFma, 3, false}, {211, kDRcp, 1, false},
+      {213, kDToI, 1, false}, {214, kDToU, 1, false}, {215, kIToD, 1, false}, {216, kUToD, 1, false},
+      // derivatives (Shader Model 4 has the one kind: fine here)
+      {11, kDdx, 1, false}, {12, kDdy, 1, false}, {122, kDdxCoarse, 1, false}, {123, kDdx, 1, false}, {124, kDdyCoarse, 1, false}, {125, kDdy, 1, false},
   };
 
   List<uint32_t> open_ifs(allocator);
@@ -554,11 +561,19 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
     ConstByteView body = in.take(uint64_t{words - 1} * 4);
     if (!in.ok()) return status::kInvalidParameter;
     ByteReader p(body);
-    // Extended opcode tokens: sample offsets must be zero; the others (resource dimension, return type) change nothing.
+    // Extended opcode tokens: sample offsets are taken by gather4 only (and are zero for the rest); the others (resource dimension, return type) change nothing.
+    int32_t sample_offset[3] = {0, 0, 0};
     for (uint32_t ext = token; (ext >> 31) != 0;) {
       ext = p.le32();
       if (!p.ok()) return status::kInvalidParameter;
-      if ((ext & 0x3F) == 1 && ((ext >> 9) & 0xFFF) != 0) return status::kNotSupported;
+      if ((ext & 0x3F) == 1) {
+        for (uint32_t k = 0; k < 3; ++k) {
+          const int32_t value = static_cast<int32_t>((ext >> (9 + 4 * k)) & 0xF);
+          sample_offset[k] = value >= 8 ? value - 16 : value;
+        }
+        const bool gather = opcode == 109 || opcode == 126;
+        if ((sample_offset[0] || sample_offset[1] || sample_offset[2]) && (!gather || sample_offset[2])) return status::kNotSupported;
+      }
     }
     NtStatus s = status::kSuccess;
     switch (opcode) {
@@ -780,15 +795,21 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         program->uav_stride_[slot] = opcode == kDclTgsmStructured4 ? first : 0;
         continue;
       }
-      case kDclUavRaw4: case kDclUavStructured4: {
+      case kDclUavRaw4: case kDclUavStructured4: case kDclResourceRaw4: case kDclResourceStructured4: {
+        // (a shader resource view of a buffer, t#, is a read-only storage buffer in the slot after the u# ones)
+        const bool srv = opcode == kDclResourceRaw4 || opcode == kDclResourceStructured4, structured_decl = opcode == kDclUavStructured4 || opcode == kDclResourceStructured4;
         Operand o;
         s = read_operand(p, &o);
         if (s != status::kSuccess) return s;
-        const uint32_t stride = opcode == kDclUavStructured4 ? p.le32() : 0;
-        if (!compute || !p.ok() || o.type != kOpUav || o.dims != 1 || o.index[0] >= graphics::kMaxStorageBuffers || program->uav_kind_[o.index[0]] != D3d9Program::BufferKind::None) return status::kNotSupported;
-        if (opcode == kDclUavStructured4 && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
-        program->uav_kind_[o.index[0]] = opcode == kDclUavRaw4 ? D3d9Program::BufferKind::Raw : D3d9Program::BufferKind::Structured;
-        program->uav_stride_[o.index[0]] = stride;
+        const uint32_t stride = structured_decl ? p.le32() : 0;
+        if ((!compute && !srv && !pixel) || !p.ok() || o.type != (srv ? kOpResource : kOpUav) || o.dims != 1 || o.index[0] >= (srv ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers)) return status::kNotSupported;
+        const uint32_t slot = srv ? graphics::kMaxUavBuffers + o.index[0] : o.index[0];
+        if (program->uav_kind_[slot] != D3d9Program::BufferKind::None) return status::kNotSupported;
+        if (structured_decl && (stride == 0 || stride > 2048 || stride % 4)) return status::kNotSupported;
+        program->uav_kind_[slot] = structured_decl ? D3d9Program::BufferKind::Structured : D3d9Program::BufferKind::Raw;
+        program->uav_stride_[slot] = stride;
+        if (!compute) program->uses_graphics_storage_ = program->uses_system_values_ = true;
+        if (pixel && !srv) program->uses_fragment_stores_ = true;   // (a view of a buffer in a vertex or pixel shader: the function that takes the context, and a device that binds them in draws)
         continue;
       }
       default: break;
@@ -802,6 +823,14 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         else if (phase == 2) program->hs_fork_end_ = program->code_.count();
         else if (phase == 3) program->hs_join_end_ = program->code_.count();
         else return status::kInvalidParameter;
+        continue;
+      }
+      if (open_ifs.count() || loops.count()) {
+        // (a return in the middle of the program: it ends the run there)
+        Instr early;
+        early.op = kRetEarly;
+        s = emit(early);
+        if (s != status::kSuccess) return s;
         continue;
       }
       returned = true;
@@ -885,12 +914,11 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       Instr::Src source_a, source_b;
       if ((s = to_src(a, &source_a)) != status::kSuccess || (s = to_src(b, &source_b)) != status::kSuccess) return s;
       const bool divide = opcode == 78;
-      if (!divide && first.type != kOpNull) return status::kNotSupported;   // (the high word)
       for (int k = 0; k < 2; ++k) {
         const Operand& d = k == 0 ? first : second;
         if (d.type == kOpNull) continue;
         Instr one_ins;
-        one_ins.op = divide ? (k == 0 ? kUDiv : kURem) : (opcode == 38 ? kIMul : kUMul);
+        one_ins.op = divide ? (k == 0 ? kUDiv : kURem) : k == 0 ? (opcode == 38 ? kIMulHi : kUMulHi) : (opcode == 38 ? kIMul : kUMul);   // (the first destination of a product is the high word)
         one_ins.src[0] = source_a, one_ins.src[1] = source_b;
         one_ins.src_count = 2;
         s = to_dst(d, &one_ins.dst);
@@ -957,7 +985,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
       program->uses_textures_ = true;
       program->uses_texel_access_ = true;
-    } else if (compute && ((opcode >= 165 && opcode <= 168) || (opcode >= 169 && opcode <= 177 && opcode != 172) || (opcode >= 180 && opcode <= 189 && opcode != 185))) {
+    } else if ((compute || pixel || opcode == kLdRaw4 || opcode == kLdStructured4) && ((opcode >= 165 && opcode <= 168) || (opcode >= 169 && opcode <= 177 && opcode != 172) || (opcode >= 180 && opcode <= 189 && opcode != 185))) {
       // Storage buffers: ld_raw / ld_structured (dst, address, [offset,] u#), store_raw / store_structured (u#.mask, address, [offset,] value), the atomics (u#, address, value) and the
       // immediate ones that return the old value (dst, u#, address, value).
       const bool load = opcode == kLdRaw4 || opcode == kLdStructured4, store = opcode == kStoreRaw4 || opcode == kStoreStructured4;
@@ -976,8 +1004,12 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((s = read_operand(p, &value)) != status::kSuccess) return s;
       }
       const bool group_shared = uav.type == kOpTgsm;
-      if ((uav.type != kOpUav && !group_shared) || uav.dims != 1 || uav.index[0] >= (group_shared ? graphics::kMaxSharedMemories : graphics::kMaxStorageBuffers)) return status::kNotSupported;
-      const uint32_t slot = group_shared ? graphics::kMaxStorageBuffers + uav.index[0] : uav.index[0];
+      const bool read_only_view = uav.type == kOpResource && load;   // (t#: a load only)
+      if (!compute && !pixel && !read_only_view) return status::kNotSupported;   // (outside compute and pixel shaders only the views are read)
+      if (!compute && uav.type == kOpTgsm) return status::kNotSupported;       // (group-shared memory is a compute shader's)
+      if ((uav.type != kOpUav && !group_shared && !read_only_view) || uav.dims != 1 || uav.index[0] >= (group_shared ? graphics::kMaxSharedMemories : read_only_view ? graphics::kMaxSrvBuffers : graphics::kMaxUavBuffers))
+        return status::kNotSupported;
+      const uint32_t slot = group_shared ? graphics::kMaxStorageBuffers + uav.index[0] : read_only_view ? graphics::kMaxUavBuffers + uav.index[0] : uav.index[0];
       const D3d9Program::BufferKind kind = program->uav_kind_[slot];
       if (kind == D3d9Program::BufferKind::None || ((load || store) && structured != (kind == D3d9Program::BufferKind::Structured))) return status::kNotSupported;   // (an atomic works on either kind)
       ins.uav = static_cast<uint8_t>(slot);
@@ -1012,12 +1044,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if ((s = to_src(value, &ins.src[1])) != status::kSuccess) return s;
         ins.src_count = 2;
       }
-    } else if (opcode == kSample4) {
+    } else if (opcode == kSample4 || opcode == 109 || opcode == 73 || opcode == 74 || opcode == 108 || opcode == 70 || opcode == 71 || opcode == 126 || opcode == 127 || opcode == 128) {   // (sample, gather4 and its variants, sample_d, sample_b, lod, sample_c, sample_c_lz)
       if (vertex || compute) return status::kNotSupported;   // (no textures in the vertex stage)
-      Operand d, coordinate, resource, sampler;
-      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess || (s = read_operand(p, &resource)) != status::kSuccess ||
-          (s = read_operand(p, &sampler)) != status::kSuccess)
-        return s;
+      Operand d, coordinate, resource, sampler, gather_offset;
+      const bool gather_op = opcode == 109 || opcode == 126 || opcode == 127 || opcode == 128;
+      if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess) return s;
+      if ((opcode == 127 || opcode == 128) && (s = read_operand(p, &gather_offset)) != status::kSuccess) return s;   // (gather4_po: the offset in a register)
+      if ((s = read_operand(p, &resource)) != status::kSuccess || (s = read_operand(p, &sampler)) != status::kSuccess) return s;
       uint32_t unit = resource.index[0];
       if (v51) {
         // t[range][index]: the range's register, indexed from it
@@ -1029,15 +1062,65 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         return status::kNotSupported;
       }
       if (resource.type != kOpResource || unit >= graphics::kMaxTextureUnits || sampler.type != kOpSampler) return status::kNotSupported;
-      ins.op = kTexLd;
+      Operand extra[2];
+      if ((opcode == 108 || opcode == 70 || opcode == 71) && program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+      if (opcode == 70 || opcode == 71 || opcode == 126 || opcode == 128) {   // sample_c, gather4_c: the reference value
+        if ((s = read_operand(p, &extra[0])) != status::kSuccess) return s;
+      }
+      if (opcode == 73 || opcode == 74) {   // sample_d: the two gradients, sample_b: the bias (2D textures only)
+        for (uint32_t k = 0; k < (opcode == 73 ? 2u : 1u); ++k)
+          if ((s = read_operand(p, &extra[k])) != status::kSuccess) return s;
+        if (program->texture_kind_[unit] != graphics::TextureKind::Texture2D) return status::kNotSupported;
+      }
+      ins.op = gather_op ? kTexGather : opcode == 73 ? kTexGrad : opcode == 74 ? kTexBias : opcode == 108 ? kTexQueryLod : (opcode == 70 || opcode == 71) ? kTexCompare : kTexLd;
       s = to_dst(d, &ins.dst);
       if (s != status::kSuccess) return s;
       s = to_src(coordinate, &ins.src[0]);
       if (s != status::kSuccess) return s;
       ins.src[1].type = kSampler, ins.src[1].number = static_cast<uint16_t>(unit);
       ins.src_count = 2;
-      if (resource.components == 2)
+      if (opcode == 73 || opcode == 74) {
+        for (uint32_t k = 0; k < (opcode == 73 ? 2u : 1u); ++k) {
+          s = to_src(extra[k], &ins.src[2 + k]);
+          if (s != status::kSuccess) return s;
+        }
+        ins.src_count = opcode == 73 ? 4 : 3;
+        if (resource.components == 2)
+          for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+        if (opcode == 74) program->uses_system_values_ = true;   // (the bias goes with the implicit derivatives: needs the quad)
+      } else if (opcode == 70 || opcode == 71) {
+        s = to_src(extra[0], &ins.src[2]);
+        if (s != status::kSuccess) return s;
+        ins.src_count = 3;
+        if (resource.components == 2)
+          for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+        program->uses_system_values_ = true;   // (the required-features path: the function with the texture set)
+      } else if (opcode == 108) {
+        program->uses_system_values_ = true;   // (the quad)
+        if (resource.components == 2)
+          for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+      } else if (gather_op) {
+        // The component to gather is the resource operand's single selected one (gather4_c always compares the red); the footprint may be offset in texels (a register, or the extended opcode token's
+        // constant) on 2D textures and arrays; the comparison (reference <= texel) is of the texels one by one. A volume has no gather.
+        const graphics::TextureKind kind = program->texture_kind_[unit];
+        const bool compare = opcode == 126 || opcode == 128, programmable = opcode == 127 || opcode == 128, offset_static = sample_offset[0] || sample_offset[1];
+        if ((kind != graphics::TextureKind::Texture2D && kind != graphics::TextureKind::Texture2DArray && kind != graphics::TextureKind::TextureCube) || resource.components != 2) return status::kNotSupported;
+        if ((programmable || offset_static) && kind == graphics::TextureKind::TextureCube) return status::kNotSupported;
+        ins.control = static_cast<uint8_t>((compare ? 0 : resource.swizzle[0]) | (compare ? 4 : 0) | (programmable ? 8 : 0) | (offset_static ? 16 : 0));
+        uint32_t next = 2;
+        if (programmable) {
+          s = to_src(gather_offset, &ins.src[next++]);
+          if (s != status::kSuccess) return s;
+        }
+        if (compare) {
+          s = to_src(extra[0], &ins.src[next++]);
+          if (s != status::kSuccess) return s;
+        }
+        ins.src_count = static_cast<uint8_t>(next);
+        ins.texel_offset[0] = static_cast<int8_t>(sample_offset[0]), ins.texel_offset[1] = static_cast<int8_t>(sample_offset[1]);
+      } else if (resource.components == 2) {
         for (uint32_t k = 0; k < 4; ++k) ins.tex_swizzle[k] = resource.swizzle[k];
+      }
       program->uses_textures_ = true;
     } else {
       const Alu* alu = nullptr;
@@ -1049,6 +1132,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (s != status::kSuccess) return s;
       ins.op = alu->op;
       ins.vector = alu->vector;
+      if (alu->op >= kDdx && alu->op <= kDdyCoarse) program->uses_system_values_ = true;   // (derivatives need the pixel's quad: the function that takes the FragmentContext)
       ins.mask_result = alu->op == kSeq || alu->op == kSne || alu->op == kSlt || alu->op == kSge;   // (all ones for true, as the integer instructions read them)
       s = to_dst(d, &ins.dst);
       if (s != status::kSuccess) return s;

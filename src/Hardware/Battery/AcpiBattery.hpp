@@ -25,6 +25,7 @@
 #include "Hardware/Acpi/AcpiHost.hpp"
 #include "Hardware/Acpi/AcpiTables.hpp"
 #include "Hardware/Acpi/AmlInterpreter.hpp"
+#include "Kernel/Sync.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace hardware {
@@ -55,7 +56,7 @@ class AcpiBattery {
   uint32_t tables_loaded() const { return tables_loaded_; }
   uint32_t tables_faulty() const { return tables_faulty_; }
   const char* last_load_error() const { return load_error_; }
-  // Reads the batteries now (a few reads of the embedded controller). `present` is false when the machine has none (or none is inserted).
+  // Reads the batteries now (a few reads of the embedded controller). Safe to call from several threads (one reads at a time). `present` is false when the machine has none (or none is inserted).
   BatteryStatus read();
 
  private:
@@ -73,6 +74,7 @@ class AcpiBattery {
   void set_up_controller(acpi::Node* ec);
   void run_init(acpi::Node* device);
 
+  kernel::Mutex read_mutex_;
   IAcpiHost& host_;
   acpi::AmlInterpreter vm_;
   Battery batteries_[kMaxBatteries];
