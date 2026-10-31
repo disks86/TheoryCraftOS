@@ -2601,6 +2601,33 @@ void scene_dxil_gather_compare(Rig& rig, ArrayView<uint32_t> out) {
   textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
 }
 
+// gather4_po (gather_po.dxbc, assembled by the host test): the footprint moved by an offset worked out from the colour in a register - a -4 .. 4 texel shift of a 4 x 4 ramp, clamped.
+void scene_gather_register_offsets(Rig& rig, ArrayView<uint32_t> out) {
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_gather_po, sizeof b::k_gather_po, 1);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  uint32_t texels[16];
+  for (uint32_t i = 0; i < 16; ++i) texels[i] = 0xFF000000u | ((26 + (i % 4) * 68) << 16) | ((20 + (i / 4) * 50) << 8);
+  Handle texture = rig.image(kAllocTexture, Format::A8R8G8B8, 4, 4);
+  rig.write(texture, bytes_of(texels, sizeof texels));
+  graphics::SamplerDesc sampler;
+  sampler.filter = graphics::Filter::Linear;
+  sampler.address_u = sampler.address_v = graphics::AddressMode::ClampToEdge;
+  auto vert = [](float x, float y, float u, float v) { return Vertex{x, y, 0.5f, u / 2, v / 2, 1, 1}; };
+  const Vertex v[6] = {vert(-0.9f, -0.9f, 0, 0), vert(0.9f, -0.9f, 1, 0), vert(-0.9f, 0.9f, 0, 1), vert(-0.9f, 0.9f, 0, 1), vert(0.9f, -0.9f, 1, 0), vert(0.9f, 0.9f, 1, 1)};
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.bind_texture(0, 2, sampler);
+  w.draw(6);
+  w.end_pass();
+  rig.render(w, {target, vb, texture});
+  rig.read(target, out);
+}
+
 const Entry kScenes[] = {
     {"Direct3D 9 vertex colours", scene_vertex_colours},
     {"Direct3D 9 Shader Model 3", scene_sm3},
@@ -2644,6 +2671,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL gather4 on a cubemap (Shader Model 6)", scene_dxil_gather_cube},
     {"Direct3D 12 DXIL gather4 with offsets (Shader Model 6)", scene_dxil_gather_offsets},
     {"Direct3D 12 DXIL gather4 with a comparison (Shader Model 6)", scene_dxil_gather_compare},
+    {"Direct3D 11 gather4 with the offset in a register (DXBC)", scene_gather_register_offsets},
     {"Direct3D 12 DXIL derivatives (Shader Model 6)", scene_dxil_derivatives},
     {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
     {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},

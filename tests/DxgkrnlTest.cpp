@@ -5183,6 +5183,7 @@ void test_pixel_shader_stores() {
   e.kernel.unlock(kPid, counters);
 }
 
+
 // Resource states: an allocation made with kAllocTrackState is used only in states that allow it.
 void test_d3d12_barriers() {
   Env e;
@@ -5361,6 +5362,58 @@ bool close_to(float a, float b) {
   if (a != a || b != b) return a != a && b != b;
   const float scale = 1.0f + (a < 0 ? -a : a);
   return (a - b < 0 ? b - a : a - b) <= 2e-4f * scale;
+}
+
+// gather4_po: the offset of the footprint in a register. The shader is assembled here (the compilers in reach do not make one): r1 = ftoi(v0.xy * 16 - 4); o0 = the red of the four texels
+// of the footprint moved by r1. The same bytes are tests/data/dxbc/gather_po.dxbc, which the conformance scenes carry (GEN_GATHER_PO=<path> writes it).
+std::vector<uint8_t> gather_po_shader() {
+  DxbcAsm a = dx_pixel_shader();
+  a.version_major = 4;
+  a.constant_buffer = 0;
+  a.ins(88, {dx_resource(0)}, 3u << 11);   // dcl_resource_texture2d t0
+  a.ins(56, {dx_dst(kOpTemp, 1, 0x3), dx_src(kOpInput, 0), dx_imm(16, 16, 16, 16)});
+  a.ins(0, {dx_dst(kOpTemp, 1, 0x3), dx_src(kOpTemp, 1), dx_imm(-4, -4, -4, -4)});
+  a.ins(27, {dx_dst(kOpTemp, 1, 0x3), dx_src(kOpTemp, 1)});   // ftoi
+  a.ins(127, {dx_dst(kOpTemp, 0, 0xF), dx_src(kOpInput, 2), dx_src(kOpTemp, 1), dx_resource(0, 0x00), dx_sampler(0)});   // gather4_po r0, v2, r1, t0.xxxx, s0
+  a.ins(54, {dx_dst(kOpOut, 0, 0xF), dx_src(kOpTemp, 0)});
+  a.ins(62, {});
+  return a.build();
+}
+
+void test_gather_register_offsets() {
+  HostAllocator allocator;
+  const std::vector<uint8_t> bytes = gather_po_shader();
+  if (const char* path = getenv("GEN_GATHER_PO")) {
+    if (FILE* f = fopen(path, "wb")) {
+      fwrite(bytes.data(), 1, bytes.size(), f);
+      fclose(f);
+    }
+  }
+  const std::vector<uint8_t> shipped = read_blob("gather_po.dxbc");
+  CHECK(shipped == bytes);   // (the blob of the conformance scenes is this shader)
+  NtStatus st = 0;
+  UniquePointer<D3d9Program> p = compile_dxbc(allocator, bytes, &st);
+  CHECK(st == status::kSuccess && p);
+  if (!p) return;
+  DxilTextures textures;
+  uint32_t seed = 99;
+  auto random = [&](float low, float high) {
+    seed = seed * 1664525u + 1013904223u;
+    return low + (high - low) * static_cast<float>(seed >> 8) / static_cast<float>(1u << 24);
+  };
+  for (uint32_t n = 0; n < 200; ++n) {
+    graphics::Vec4 varyings[4] = {};
+    varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
+    varyings[2] = {random(0, 1), random(0, 1), 0, 0};
+    uint8_t constants[128] = {};
+    graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+    CHECK(p->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room));
+    const int ox = static_cast<int>(varyings[0].x * 16.0f - 4.0f), oy = static_cast<int>(varyings[0].y * 16.0f - 4.0f);
+    const float x = __builtin_floorf(varyings[2].x * 8.0f - 0.5f) + static_cast<float>(ox), y = __builtin_floorf(varyings[2].y * 4.0f - 0.5f) + static_cast<float>(oy);
+    (void)y;
+    const float xs[4] = {x, x + 1, x + 1, x};
+    CHECK(close_to(room[0].x, (xs[0] + 0.5f) / 16.0f) && close_to(room[0].y, (xs[1] + 0.5f) / 16.0f) && close_to(room[0].z, (xs[2] + 0.5f) / 16.0f) && close_to(room[0].w, (xs[3] + 0.5f) / 16.0f));
+  }
 }
 
 void test_dxil() {
@@ -7776,6 +7829,7 @@ int main() {
   test_d3d12_buffer_views();
   test_d3d12_buffer_views_in_draw();
   test_pixel_shader_stores();
+  test_gather_register_offsets();
   test_d3d12_barriers();
   test_d3d12_heaps();
   test_d3d12_reserved();

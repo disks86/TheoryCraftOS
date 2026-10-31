@@ -1135,15 +1135,38 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       }
       sampler_used_[unit] = true;
       const uint8_t xyxy[4] = {0, 1, 0, 1}, xyzz[4] = {0, 1, 2, 2};
-      const String coordinate = operand(ins.src[0], 0, 0, p_.texture_kind(unit) == graphics::TextureKind::Texture2D ? xyxy : xyzz, false);
+      const bool flat = p_.texture_kind(unit) == graphics::TextureKind::Texture2D;
+      String coordinate = operand(ins.src[0], 0, 0, flat ? xyxy : xyzz, false);
       String sampler = str();
       add(sampler, "SAMP[");
       add_uint(sampler, unit);
       add(sampler, "], ");
       add(sampler, dimension_name(p_.texture_kind(unit)));
-      if (ins.control & 8) {   // (an offset in a register: TGSI takes the texture offsets of an instruction as literals)
-        unsupported_ = true;
-        break;
+      if (ins.control & 8) {
+        // An offset in a register (TGSI takes the offsets of an instruction as literals): the footprint is moved by moving the coordinate to where the corner of the footprint it should have
+        // is exactly between two texels - (floor(u * size - 0.5) + offset + 1) / size - which is as far as can be from a rounding at a texel's middle.
+        const String work = temp(kWork2), size = temp(kWork3), work_xy = temp(kWork2, ".xy"), work_xy_src = temp(kWork2, ".xyxy"), size_xy = temp(kWork3, ".xy"), size_xy_src = temp(kWork3, ".xyxy"),
+                     size_x = temp(kWork3, ".x"), size_y = temp(kWork3, ".y"), size_zw = temp(kWork3, ".zw"), size_zw_src = temp(kWork3, ".zwzw"), work_z = temp(kWork2, ".z");
+        const String offset = operand(ins.src[2], 0, 2, xyxy, false), level = zero(), half = splat(0.5f), minus_half = negate(half), one = splat(1.0f);
+        String queried = str();
+        add(queried, level.view());
+        add(queried, ", ");
+        add(queried, sampler.view());
+        line("TXQ", &size, &queried);
+        line("U2F", &size_xy, &size_xy_src);
+        line("I2F", &size_zw, &offset);
+        line("MUL", &work_xy, &coordinate, &size_xy_src);
+        line("ADD", &work_xy, &work_xy_src, &minus_half);
+        line("FLR", &work_xy, &work_xy_src);
+        line("ADD", &work_xy, &work_xy_src, &size_zw_src);
+        line("ADD", &work_xy, &work_xy_src, &one);
+        const String size_x_src = temp(kWork3, ".xxxx"), size_y_src = temp(kWork3, ".yyyy");
+        line("RCP", &size_x, &size_x_src);
+        line("RCP", &size_y, &size_y_src);
+        line("MUL", &work_xy, &work_xy_src, &size_xy_src);
+        if (!flat) line("MOV", &work_z, &coordinate);
+        coordinate = temp(kWork2, flat ? ".xyxy" : ".xyzz");
+        (void)work;
       }
       if (ins.texel_offset[0] || ins.texel_offset[1]) {
         const bool saved = force_integer_;
@@ -1161,7 +1184,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       add(component, "].xxxx");
       if (compare) {
         // (gather4_c: the comparison reference <= texel of each of the four texels, made here as the sampler is not a comparison one)
-        const String texels = temp(kWork2), reference = operand(ins.src[2], 0, 1, nullptr, true);
+        const String texels = temp(kWork3), reference = operand(ins.src[(ins.control & 8) ? 3 : 2], 0, 1, nullptr, true);
         line("TG4", &texels, &coordinate, &component, &sampler);
         line("SGE", &t, &texels, &reference);
         break;
