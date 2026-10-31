@@ -136,6 +136,9 @@ class Desktop {
   void set_backlight(hardware::IBacklight* backlight) { backlight_ = backlight; }
   // Changes the brightness by `delta_percent` (negative: darker) and shows the level. False without a backlight that takes it.
   bool adjust_brightness(int delta_percent);
+  // Puts the backlight out (the lid was closed) and gives it back at the level it had. While it is out the brightness keys do nothing.
+  void set_display_blanked(bool blanked);
+  bool display_blanked() const { return blanked_; }
   // The same for the master volume and the mute.
   bool adjust_volume(int delta_percent);
   bool toggle_mute();
@@ -448,6 +451,8 @@ class Desktop {
   audio::AudioMixer* media_mixer_ = nullptr;
   hardware::IBacklight* backlight_ = nullptr;
   uint32_t osd_toast_ = 0;
+  bool blanked_ = false;
+  uint8_t level_before_blank_ = 50;
   hardware::SystemVideoCodecs* media_codecs_ = nullptr;
   const hardware::IClock* media_clock_ = nullptr;
   database::local::SystemSettings* settings_ = nullptr;
