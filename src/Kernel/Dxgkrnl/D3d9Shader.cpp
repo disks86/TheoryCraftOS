@@ -450,6 +450,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
     return push_constant(index);
   };
   bool int_mode = false;   // the instruction being run works on integers: negate and abs of its sources are integer ones
+  bool double_mode = false;   // ... or on doubles: they act on the pair, through its high word
   auto fetch = [&](const Instr::Src& src, uint32_t offset) {
     Q v = {{0, 0, 0, 0}};
     switch (src.type) {
@@ -512,7 +513,14 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
       default: break;
     }
     Q r = {{v.f[src.swizzle[0]], v.f[src.swizzle[1]], v.f[src.swizzle[2]], v.f[src.swizzle[3]]}};
-    if (src.modifier != kModNone) {
+    if (src.modifier != kModNone && double_mode) {
+      for (uint32_t pair = 0; pair < 2; ++pair) {
+        uint32_t high = bits_of(r.f[2 * pair + 1]);
+        if (src.modifier == kModAbs || src.modifier == kModAbsNeg) high &= 0x7FFFFFFFu;
+        if (src.modifier == kModNeg || src.modifier == kModAbsNeg) high ^= 0x80000000u;
+        r.f[2 * pair + 1] = from_bits(high);
+      }
+    } else if (src.modifier != kModNone) {
       for (float& c : r.f) {
         if (int_mode && (src.modifier == kModNeg || src.modifier == kModAbs || src.modifier == kModAbsNeg)) {
           int32_t x = __builtin_bit_cast(int32_t, c);
@@ -605,6 +613,7 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
     if (++steps > kMaxSteps) return;
     const Instr& ins = code_[pc++];
     int_mode = ins.op >= kIntegerFirst && ins.op <= kIntegerLast;
+    double_mode = ins.op >= kDoubleFirst && ins.op <= kDoubleLast;
     Q a = {{0, 0, 0, 0}}, b = a, c = a, r = a;
     if (ins.src_count > 0 && ins.op != kM4x4 && ins.op != kM4x3 && ins.op != kM3x4 && ins.op != kM3x3 && ins.op != kM3x2) a = fetch(ins.src[0], 0);
     switch (ins.op) {
@@ -928,6 +937,62 @@ void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
           b = {{texel[ins.tex_swizzle[0]], texel[ins.tex_swizzle[1]], texel[ins.tex_swizzle[2]], texel[ins.tex_swizzle[3]]}};
         }
         store(ins.dst, b);
+        break;
+      }
+      case kDAdd: case kDMul: case kDDiv: case kDFma: case kDRcp: case kDMin: case kDMax: case kDMov: case kDMovc: {
+        // doubles: the pairs the destination has in its mask (x y and / or z w)
+        if (ins.src_count > 1) b = fetch(ins.src[1], 0);
+        if (ins.src_count > 2) c = fetch(ins.src[2], 0);
+        auto pair_of = [](const Q& q, uint32_t k) { return __builtin_bit_cast(double, uint64_t{bits_of(q.f[2 * k])} | uint64_t{bits_of(q.f[2 * k + 1])} << 32); };
+        for (uint32_t k = 0; k < 2; ++k) {
+          if ((ins.dst.mask >> (2 * k) & 3) != 3) continue;
+          double x = pair_of(a, k), y = ins.src_count > 1 ? pair_of(b, k) : 0.0, z = ins.src_count > 2 ? pair_of(c, k) : 0.0, v = 0.0;
+          switch (ins.op) {
+            case kDAdd: v = x + y; break;
+            case kDMul: v = x * y; break;
+            case kDDiv: v = x / y; break;
+            case kDFma: v = x * y + z; break;
+            case kDRcp: v = 1.0 / x; break;
+            case kDMin: v = (x != x) ? y : (y != y) ? x : (x < y ? x : y); break;
+            case kDMax: v = (x != x) ? y : (y != y) ? x : (x > y ? x : y); break;
+            case kDMov: v = x; break;
+            default: v = (bits_of(a.f[2 * k]) | bits_of(a.f[2 * k + 1])) != 0 ? y : z; break;   // dmovc: the condition is the pair's own bits, taken from the first source
+          }
+          const uint64_t bits = __builtin_bit_cast(uint64_t, v);
+          r.f[2 * k] = from_bits(static_cast<uint32_t>(bits)), r.f[2 * k + 1] = from_bits(static_cast<uint32_t>(bits >> 32));
+        }
+        store(ins.dst, r);
+        break;
+      }
+      case kDEq: case kDGe: case kDLt: case kDNe: case kDToF: case kDToI: case kDToU: {
+        // the result is a 32-bit value in component k for the double of the operand's pair k
+        b = ins.src_count > 1 ? fetch(ins.src[1], 0) : b;
+        auto pair_of = [](const Q& q, uint32_t k) { return __builtin_bit_cast(double, uint64_t{bits_of(q.f[2 * k])} | uint64_t{bits_of(q.f[2 * k + 1])} << 32); };
+        for (uint32_t k = 0; k < 2; ++k) {
+          if (!(ins.dst.mask >> k & 1)) continue;
+          const double x = pair_of(a, k), y = ins.src_count > 1 ? pair_of(b, k) : 0.0;
+          switch (ins.op) {
+            case kDEq: r.f[k] = from_bits(x == y ? 0xFFFFFFFFu : 0u); break;
+            case kDGe: r.f[k] = from_bits(x >= y ? 0xFFFFFFFFu : 0u); break;
+            case kDLt: r.f[k] = from_bits(x < y ? 0xFFFFFFFFu : 0u); break;
+            case kDNe: r.f[k] = from_bits(x != y ? 0xFFFFFFFFu : 0u); break;
+            case kDToF: r.f[k] = static_cast<float>(x); break;
+            case kDToI: r.f[k] = from_bits(x != x ? 0u : x >= 2147483647.0 ? 0x7FFFFFFFu : x <= -2147483648.0 ? 0x80000000u : static_cast<uint32_t>(static_cast<int32_t>(x))); break;
+            default: r.f[k] = from_bits(x != x || x <= 0.0 ? 0u : x >= 4294967295.0 ? 0xFFFFFFFFu : static_cast<uint32_t>(x)); break;
+          }
+        }
+        store(ins.dst, r);
+        break;
+      }
+      case kFToD: case kIToD: case kUToD: {
+        // the pair k of the destination from the source's component k
+        for (uint32_t k = 0; k < 2; ++k) {
+          if ((ins.dst.mask >> (2 * k) & 3) != 3) continue;
+          const double v = ins.op == kFToD ? static_cast<double>(a.f[k]) : ins.op == kIToD ? static_cast<double>(__builtin_bit_cast(int32_t, a.f[k])) : static_cast<double>(bits_of(a.f[k]));
+          const uint64_t bits = __builtin_bit_cast(uint64_t, v);
+          r.f[2 * k] = from_bits(static_cast<uint32_t>(bits)), r.f[2 * k + 1] = from_bits(static_cast<uint32_t>(bits >> 32));
+        }
+        store(ins.dst, r);
         break;
       }
       case kTexCompare: {

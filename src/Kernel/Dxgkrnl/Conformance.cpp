@@ -461,6 +461,24 @@ void scene_dxil_compare(Rig& rig, ArrayView<uint32_t> out) {
   textured_quad(rig, pipe, texture, target, graphics::Filter::Linear, out);
 }
 
+// Double precision (dxil_ps_double_show.hlsl): arithmetic, a select, a loop-carried sum, fma and conversions on doubles, shown as colours.
+void scene_dxil_double(Rig& rig, ArrayView<uint32_t> out) {
+  const Vertex v[3] = {{-1, -1, 0.5f, 0.9f, 0.3f, 0.2f, 1}, {3, -1, 0.5f, 0.1f, 0.8f, 0.4f, 1}, {-1, 3, 0.5f, 0.4f, 0.2f, 0.9f, 1}};
+  namespace b = conformance_blobs;
+  Handle pipe = dxbc_pipeline(rig, b::k_vs, sizeof b::k_vs, b::k_dxil_ps_double_show, sizeof b::k_dxil_ps_double_show, 0);
+  Handle target = rig.image(kAllocRenderTarget, Format::A8R8G8B8, kSize, kSize);
+  Handle vb = rig.buffer(kAllocVertexBuffer, bytes_of(v, sizeof v));
+  CommandWriter w(rig.allocator());
+  begin(w, 0, kNoAllocation, {0, 0, 0, 1});
+  w.bind_pipeline(pipe);
+  w.bind_vertex_buffer(1);
+  w.push_constants(bytes_of(kIdentity, sizeof kIdentity));
+  w.draw(3);
+  w.end_pass();
+  rig.render(w, {target, vb});
+  rig.read(target, out);
+}
+
 // Draw a picture into a texture, then draw the texture onto the screen: a Direct3D 9 render target that is also a texture, and every Direct3D 11 / 12 post-processing step.
 void scene_render_to_texture(Rig& rig, ArrayView<uint32_t> out) {
   namespace b = conformance_blobs;
@@ -2349,6 +2367,7 @@ const Entry kScenes[] = {
     {"Direct3D 12 DXIL sample_d and sample_b (Shader Model 6)", scene_dxil_grad},
     {"Direct3D 12 DXIL CalculateLevelOfDetail (Shader Model 6)", scene_dxil_lod},
     {"Direct3D 12 DXIL comparison sampling (Shader Model 6)", scene_dxil_compare},
+    {"Direct3D 12 DXIL double precision (Shader Model 6)", scene_dxil_double},
     {"Direct3D 12 DXIL textures picked by a variable index (Shader Model 6)", scene_dxil_texture_array},
     {"Direct3D 12 DXIL buffer shader resource views (Shader Model 6)", scene_dxil_compute_srv},
     {"Direct3D 12 DXIL group-shared memory, barriers and a loop (Shader Model 6)", scene_dxil_compute_shared},

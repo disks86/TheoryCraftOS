@@ -470,6 +470,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       {41, kIShl, 2, false}, {42, kIShr, 2, false}, {85, kUShr, 2, false}, {1, kAnd, 2, false}, {60, kOr, 2, false}, {87, kXor, 2, false}, {59, kNot, 1, false},
       {27, kFtoI, 1, false}, {28, kFtoU, 1, false}, {43, kItoF, 1, false}, {86, kUtoF, 1, false}, {32, kIEq, 2, false}, {39, kINe, 2, false}, {34, kILt, 2, false}, {33, kIGe, 2, false},
       {79, kULt, 2, false}, {80, kUGe, 2, false},
+      // double precision (opcode numbers of d3d11tokenizedprogramformat.hpp)
+      {191, kDAdd, 2, false}, {192, kDMax, 2, false}, {193, kDMin, 2, false}, {194, kDMul, 2, false}, {195, kDEq, 2, false}, {196, kDGe, 2, false}, {197, kDLt, 2, false}, {198, kDNe, 2, false},
+      {199, kDMov, 1, false}, {200, kDMovc, 3, false}, {201, kDToF, 1, false}, {202, kFToD, 1, false}, {209, kDDiv, 2, false}, {210, kDFma, 3, false}, {211, kDRcp, 1, false},
+      {213, kDToI, 1, false}, {214, kDToU, 1, false}, {215, kIToD, 1, false}, {216, kUToD, 1, false},
       // derivatives (Shader Model 4 has the one kind: fine here)
       {11, kDdx, 1, false}, {12, kDdy, 1, false}, {122, kDdxCoarse, 1, false}, {123, kDdx, 1, false}, {124, kDdyCoarse, 1, false}, {125, kDdy, 1, false},
   };

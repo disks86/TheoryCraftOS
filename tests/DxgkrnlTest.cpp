@@ -5471,6 +5471,29 @@ void test_dxil() {
       CHECK(partial > 20);
     }
   }
+  // Doubles: arithmetic, conversions, a select, a loop-carried sum, fma and comparisons, against the same function in C++ (doubles all the way, the float at the end).
+  {
+    UniquePointer<D3d9Program> translated;
+    CHECK(load("dxil_ps_double.dxil", &translated));
+    if (translated) {
+      for (uint32_t n = 0; n < 300; ++n) {
+        graphics::Vec4 varyings[4] = {};
+        varyings[0] = {random(0.1f, 2), random(0, 2), random(0, 1), 0};
+        graphics::Vec4 room[graphics::kMaxColorTargets] = {};
+        uint8_t constants[128] = {};
+        const bool alive = translated->run_fragment_ex(varyings, graphics::FragmentContext(), constants, &textures, room);
+        const double a = varyings[0].x, b = static_cast<double>(varyings[0].y) * 3.0 + a, d = b / (a + 1.5), e = varyings[0].z > 0.5f ? d : -a;
+        double sum = 0;
+        for (int i = 0; i < 4; ++i) sum += a * static_cast<double>(i);
+        const double f = a * b + 1.0;
+        const uint32_t u = static_cast<uint32_t>(b * 4.0);
+        const float want[4] = {static_cast<float>(d), static_cast<float>(e), static_cast<float>(sum), static_cast<float>(f) + static_cast<float>(u) + (a < b ? 100.0f : 0.0f)};
+        const bool same = alive && close_to(room[0].x, want[0]) && close_to(room[0].y, want[1]) && close_to(room[0].z, want[2]) && close_to(room[0].w, want[3]);
+        if (!same && n < 3) printf("  double #%u: %g %g %g %g wants %g %g %g %g\n", n, room[0].x, room[0].y, room[0].z, room[0].w, want[0], want[1], want[2], want[3]);
+        CHECK(same);
+      }
+    }
+  }
   // atan, asin and acos (polynomials in the translation): compared with libm within 1e-4.
   {
     UniquePointer<D3d9Program> translated;

@@ -53,6 +53,7 @@ struct Val {
   VK kind = VK::None;
   uint32_t a = 0, b = 0, c = 0;   // Imm: the bits; Temp / Agg: register (a), component (b); Input: register (a), component (b); Cb: slot (a), register (b), component (c); CbAgg: slot (a), register (b); Handle: class (a), register (b); HandleVar: class (a), range (b), the value of the index (c)
   bool is_mask = false;           // (a boolean: all ones or zero)
+  bool wide = false;              // (a double: the low word in component b, the high word in b + 1 - b is 0 or 2 -; an immediate has the low word in a and the high word in c)
   uint8_t d = 0;                  // Input: 0 an input register, 1 an input control point of a domain shader (v[vertex][register]), 2 a patch constant register
 };
 
@@ -70,7 +71,7 @@ enum DxOp : uint32_t {
   kLoadInput = 4, kStoreOutput = 5, kFAbs = 6, kSaturate = 7, kCos = 12, kSin = 13, kExp = 21, kFrc = 22, kLog = 23, kSqrt = 24, kRsqrt = 25, kRoundNe = 26, kRoundNi = 27, kRoundPi = 28, kRoundZ = 29,
   kFMax = 35, kFMin = 36, kIMax = 37, kIMin = 38, kUMax = 39, kUMin = 40, kIMul = 41, kUMul = 42, kFMad = 46, kIMad = 48, kUMad = 49, kDot2 = 54, kDot3 = 55, kDot4 = 56, kCreateHandle = 57,
   kCBufferLoadLegacy = 59, kCalculateLod = 81, kSample = 60, kSampleBias = 61, kSampleLevel = 62, kSampleGrad = 63, kSampleCmp = 64, kSampleCmpLevelZero = 65, kTextureGather = 73, kTextureLoad = 66, kBufferLoad = 68, kBufferStore = 69, kAtomicBinOp = 78, kBarrier = 80, kDiscard = 82,
-  kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
+  kDerivCoarseX = 83, kDerivCoarseY = 84, kDerivFineX = 85, kDerivFineY = 86, kFma = 47, kMakeDouble = 101, kSplitDouble = 102, kThreadId = 93, kGroupId = 94, kThreadIdInGroup = 95, kFlattenedThreadIdInGroup = 96,
 };
 
 class Translator {
@@ -151,7 +152,15 @@ class Translator {
   void src(const Val& v, uint32_t modifier = 0);
   void dst_temp(uint32_t reg, uint32_t mask);
   void dst_null() { put(13u << 12); }
-  void dst_scalar(const Val& v) { dst_temp(v.a, 1u << v.b); }
+  void dst_scalar(const Val& v) { dst_temp(v.a, v.wide ? 3u << v.b : 1u << v.b); }
+  bool float32(uint32_t type) const { return m_.is_float(type) && m_.types[type].width == 32; }
+  Val low_word(const Val& v) const;
+  Val high_word(const Val& v) const;
+  Val new_wide(uint32_t id);
+  bool alloc_wide(int32_t until, uint32_t* reg, uint32_t* comp);
+  bool double_binop(const Instruction& ins, const Val& a, const Val& b);
+  bool double_compare(const Instruction& ins, const Val& a, const Val& b);
+  bool double_cast(const Instruction& ins, const Val& a);
   void src_resource(uint32_t reg);
   void src_sampler(uint32_t reg);
 
@@ -318,6 +327,35 @@ class Translator {
 // --- operands --------------------------------------------------------------------------------------------------------------------------------------------------
 
 void Translator::src(const Val& v, uint32_t modifier) {
+  if (v.wide) {
+    // a double: the swizzle puts its pair (low, high) in positions 0 1 and again in 2 3
+    const uint32_t swizzle = (v.kind == VK::Cb ? v.c : v.b) & 2u, picked = swizzle | ((swizzle + 1) << 2) | (swizzle << 4) | ((swizzle + 1) << 6);
+    switch (v.kind) {
+      case VK::Imm: {
+        uint32_t high = v.c;
+        if (modifier == 1) high ^= 0x80000000u;
+        else if (modifier == 2) high &= 0x7FFFFFFFu;
+        else if (modifier == 3) high |= 0x80000000u;
+        put(2u | (4u << 12));
+        put(v.a), put(high), put(v.a), put(high);
+        return;
+      }
+      case VK::Temp:
+        put(2u | (1u << 2) | (picked << 4) | (1u << 20) | (modifier ? 1u << 31 : 0u));
+        if (modifier) put(1u | (modifier << 6));
+        put(v.a);
+        return;
+      case VK::Cb:
+        put(2u | (1u << 2) | (picked << 4) | (8u << 12) | (2u << 20) | (modifier ? 1u << 31 : 0u));
+        if (modifier) put(1u | (modifier << 6));
+        put(v.a);
+        put(v.b);
+        return;
+      default:
+        error(status::kNotSupported);
+        return;
+    }
+  }
   switch (v.kind) {
     case VK::Imm:   // (a modifier on a literal is made in the literal: negate, absolute value, negated absolute value)
       put(0x4001u);
@@ -401,6 +439,47 @@ bool Translator::alloc_reg(int32_t until, uint32_t* reg) {
   return error(status::kNotSupported);
 }
 
+bool Translator::alloc_wide(int32_t until, uint32_t* reg, uint32_t* comp) {
+  for (int pass = 0; pass < 2; ++pass)
+    for (uint32_t r = 0; r < kSlots / 4; ++r) {
+      bool partly = false;
+      for (uint32_t c = 0; c < 4; ++c) partly |= !slot_free(r * 4 + c);
+      if (pass == 0 && !partly) continue;
+      for (uint32_t c = 0; c < 4; c += 2)
+        if (slot_free(r * 4 + c) && slot_free(r * 4 + c + 1)) {
+          slots_[r * 4 + c].busy_until = slots_[r * 4 + c + 1].busy_until = until < pos_ ? pos_ : until;
+          *reg = r, *comp = c;
+          if (r + 1 > temps_) temps_ = r + 1;
+          return true;
+        }
+    }
+  return error(status::kNotSupported);
+}
+
+Val Translator::new_wide(uint32_t id) {
+  Val v;
+  v.kind = VK::Temp, v.wide = true;
+  if (!alloc_wide(last_use_of(id), &v.a, &v.b)) v.kind = VK::None;
+  return v;
+}
+
+// The two words of a double as 32-bit values.
+Val Translator::low_word(const Val& v) const {
+  Val r = v;
+  r.wide = false;
+  if (v.kind == VK::Imm) r.a = v.a, r.c = 0;
+  return r;
+}
+
+Val Translator::high_word(const Val& v) const {
+  Val r = v;
+  r.wide = false;
+  if (v.kind == VK::Imm) r.a = v.c, r.c = 0;
+  else if (v.kind == VK::Cb) r.c = v.c + 1;
+  else r.b = v.b + 1;
+  return r;
+}
+
 Val Translator::new_scalar(uint32_t id, bool mask) {
   Val v;
   v.kind = VK::Temp;
@@ -478,6 +557,7 @@ bool Translator::analyze(const Instruction& ins) {
       for (uint32_t k = 0; k < ins.arg_count; ++k) note_use(ins.args[k], at);
       uint64_t dx_op = 0;
       if (ins.arg_count >= 4 && constant_int(ins.args[0], &dx_op) && dx_op == kCreateHandle && ins.result < alias_of_.count()) alias_of_[ins.result] = ins.args[3];   // (a handle on a variable index keeps the index alive)
+      if (ins.arg_count >= 2 && constant_int(ins.args[0], &dx_op) && dx_op == kSplitDouble && ins.result < alias_of_.count()) alias_of_[ins.result] = ins.args[1];   // (the two words are the double's own registers)
       return true;
     }
     case Op::Gep: {
@@ -531,16 +611,23 @@ bool Translator::phi_moves(uint32_t pred, uint32_t target) {
     uint32_t incoming = kNone;
     for (uint32_t k = 0; k < phi.phi_count; ++k)
       if (m_.phi_blocks[phi.phi_first + k] == pred) incoming = m_.phi_values[phi.phi_first + k];
-    if (incoming == kNone || count >= 16) return error(incoming == kNone ? status::kInvalidParameter : status::kNotSupported);
-    if (dry_) {
-      note_use(incoming, pos_ + static_cast<int32_t>(count));
-    } else {
-      moves[count].from_id = incoming;
-      moves[count].to = vals_[phi.result];
-      if (moves[count].to.kind != VK::Temp) return error(status::kInvalidParameter);
-      moves[count].from = use(incoming);
+    if (incoming == kNone || count >= 15) return error(incoming == kNone ? status::kInvalidParameter : status::kNotSupported);
+    const bool double_phi = m_.is_float(phi.type) && m_.types[phi.type].width == 64;   // (a double moves as its two words)
+    for (uint32_t word_index = 0; word_index < (double_phi ? 2u : 1u); ++word_index) {
+      if (dry_) {
+        note_use(incoming, pos_ + static_cast<int32_t>(count));
+      } else {
+        moves[count].from_id = incoming;
+        moves[count].to = vals_[phi.result];
+        if (moves[count].to.kind != VK::Temp) return error(status::kInvalidParameter);
+        moves[count].from = use(incoming);
+        if (double_phi) {
+          moves[count].to = word_index ? high_word(moves[count].to) : low_word(moves[count].to);
+          moves[count].from = word_index ? high_word(moves[count].from) : low_word(moves[count].from);
+        }
+      }
+      ++count;
     }
-    ++count;
   }
   if (dry_) {
     pos_ += static_cast<int32_t>(count);
@@ -878,6 +965,17 @@ bool Translator::translate(const Instruction& ins) {
     case Op::Cast: return cast(ins);
     case Op::Select: {
       const Val cond = use(ins.operands[2]), a = use(ins.operands[0]), b = use(ins.operands[1]);
+      if (a.wide || b.wide) {   // (a double: the two words, each selected)
+        const Val r = new_wide(ins.result);
+        if (r.kind == VK::None) return false;
+        for (int word_index = 0; word_index < 2; ++word_index) {
+          const uint32_t at = begin(55);
+          dst_scalar(word_index ? high_word(r) : low_word(r));
+          src(cond), src(word_index ? high_word(a) : low_word(a)), src(word_index ? high_word(b) : low_word(b));
+          finish(at);
+        }
+        return define(ins.result, r);
+      }
       const Val r = new_scalar(ins.result);
       if (r.kind == VK::None) return false;
       const uint32_t at = begin(55);
@@ -889,12 +987,13 @@ bool Translator::translate(const Instruction& ins) {
     case Op::ExtractValue: {
       const Val agg = use(ins.operands[0]);
       Val v;
+      const bool double_result = m_.is_float(ins.type) && m_.types[ins.type].width == 64;
       if (agg.kind == VK::Agg) {
         if (ins.index >= 4) return error(status::kNotSupported);   // (the status word of a sample)
-        v.kind = VK::Temp, v.a = agg.a, v.b = ins.index;
+        v.kind = VK::Temp, v.a = agg.a, v.b = agg.b + ins.index;
       } else if (agg.kind == VK::CbAgg) {
-        if (ins.index >= 4) return error(status::kNotSupported);
-        v.kind = VK::Cb, v.a = agg.a, v.b = agg.b, v.c = ins.index;
+        if (ins.index >= (double_result ? 2u : 4u)) return error(status::kNotSupported);
+        v.kind = VK::Cb, v.a = agg.a, v.b = agg.b, v.c = double_result ? ins.index * 2 : ins.index, v.wide = double_result;
       } else {
         return error(status::kNotSupported);
       }
@@ -921,9 +1020,108 @@ bool Translator::translate(const Instruction& ins) {
   }
 }
 
+// Arithmetic on doubles: dadd / dmul / ddiv on the pair.
+bool Translator::double_binop(const Instruction& ins, const Val& a, const Val& b) {
+  uint32_t opcode = 0;
+  bool negate_b = false;
+  switch (ins.code) {
+    case 0: opcode = 191; break;
+    case 1: opcode = 191, negate_b = true; break;
+    case 2: opcode = 194; break;
+    case 4: opcode = 209; break;
+    default: return error(status::kNotSupported);
+  }
+  const Val r = new_wide(ins.result);
+  if (r.kind == VK::None) return false;
+  const uint32_t at = begin(opcode);
+  dst_scalar(r);
+  src(a), src(b, negate_b ? 1u : 0u);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// A comparison of doubles: the 32-bit mask is made in component x of a register (dlt / dge / deq / dne read the pair at positions 0 1 for x), then moved to its place.
+bool Translator::double_compare(const Instruction& ins, const Val& a, const Val& b) {
+  uint32_t opcode = 0;
+  bool swap = false;
+  switch (ins.code) {
+    case 1: case 9: opcode = 195; break;                 // eq
+    case 6: case 14: opcode = 198; break;                // ne
+    case 4: case 12: opcode = 197; break;                // lt
+    case 5: case 13: opcode = 196, swap = true; break;   // a <= b is b >= a
+    case 2: case 10: opcode = 197, swap = true; break;   // a > b is b < a
+    case 3: case 11: opcode = 196; break;                // ge
+    default: return error(status::kNotSupported);
+  }
+  const Val r = new_scalar(ins.result, true);
+  uint32_t scratch = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  {
+    const uint32_t at = begin(opcode);
+    dst_temp(scratch, 1u);
+    src(swap ? b : a), src(swap ? a : b);
+    finish(at);
+  }
+  Val result;
+  result.kind = VK::Temp, result.a = scratch, result.b = 0;
+  const uint32_t at = begin(54);
+  dst_scalar(r);
+  src(result);
+  finish(at);
+  return define(ins.result, r);
+}
+
+// Conversions between doubles and the 32-bit types (fpext, fptrunc, the integer ones).
+bool Translator::double_cast(const Instruction& ins, const Val& a) {
+  const uint32_t from = value_type(ins.operands[0]);
+  const bool to_double = m_.is_float(ins.type) && m_.types[ins.type].width == 64;
+  if (to_double) {
+    uint32_t opcode = 0;
+    switch (ins.code) {
+      case 8: opcode = 202; break;   // fpext
+      case 5: opcode = 216; break;   // uitofp
+      case 6: opcode = 215; break;   // sitofp
+      default: return error(status::kNotSupported);
+    }
+    if (ins.code == 8 ? !(m_.is_float(from) && m_.types[from].width == 32) : !m_.is_int(from, 32)) return error(status::kNotSupported);
+    const Val r = new_wide(ins.result);
+    if (r.kind == VK::None) return false;
+    const uint32_t at = begin(opcode);
+    dst_scalar(r);
+    src(a);
+    finish(at);
+    return define(ins.result, r);
+  }
+  uint32_t opcode = 0;
+  switch (ins.code) {
+    case 7: opcode = 201; break;   // fptrunc
+    case 3: opcode = 214; break;   // fptoui
+    case 4: opcode = 213; break;   // fptosi
+    default: return error(status::kNotSupported);
+  }
+  if (ins.code == 7 ? !(m_.is_float(ins.type) && m_.types[ins.type].width == 32) : !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
+  const Val r = new_scalar(ins.result);
+  uint32_t scratch = 0;
+  if (r.kind == VK::None || !alloc_reg(pos_, &scratch)) return false;
+  {
+    const uint32_t at = begin(opcode);
+    dst_temp(scratch, 1u);   // (component x, from the pair at positions 0 1)
+    src(a);
+    finish(at);
+  }
+  Val result;
+  result.kind = VK::Temp, result.a = scratch, result.b = 0;
+  const uint32_t at = begin(54);
+  dst_scalar(r);
+  src(result);
+  finish(at);
+  return define(ins.result, r);
+}
+
 bool Translator::binop(const Instruction& ins) {
   const Val a = use(ins.operands[0]), b = use(ins.operands[1]);
   const bool floating = m_.is_float(ins.type);
+  if (floating && m_.types[ins.type].width == 64) return double_binop(ins, a, b);
   if (!floating && !m_.is_int(ins.type, 32) && !m_.is_int(ins.type, 1)) return error(status::kNotSupported);   // (16 / 64-bit)
   if (floating && m_.types[ins.type].width != 32) return error(status::kNotSupported);
   const Val r = new_scalar(ins.result, m_.is_int(ins.type, 1));
@@ -1001,6 +1199,7 @@ bool Translator::compare(const Instruction& ins) {
   const Val a = use(ins.operands[0]), b = use(ins.operands[1]);
   const uint32_t operand_type = value_type(ins.operands[0]);
   const bool floating = m_.is_float(operand_type);
+  if (floating && m_.types[operand_type].width == 64) return double_compare(ins, a, b);
   if (floating ? m_.types[operand_type].width != 32 : !m_.is_int(operand_type, 32) && !m_.is_int(operand_type, 1)) return error(status::kNotSupported);
   uint32_t opcode = 0;
   bool swap = false;
@@ -1041,6 +1240,7 @@ bool Translator::compare(const Instruction& ins) {
 bool Translator::cast(const Instruction& ins) {
   const Val a = use(ins.operands[0]);
   const uint32_t from = value_type(ins.operands[0]);
+  if ((m_.is_float(from) && m_.types[from].width == 64) || (m_.is_float(ins.type) && m_.types[ins.type].width == 64)) return double_cast(ins, a);
   if (alias_cast(ins)) {
     Val v = a;
     v.is_mask = m_.is_int(ins.type, 1);
@@ -1106,7 +1306,7 @@ bool Translator::pack(const uint32_t* ids, uint32_t count, uint32_t reg, bool) {
 
 bool Translator::unary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t source_arg, uint32_t modifier, bool saturate) {
   const Val a = use(ins.args[source_arg]);
-  if (!m_.is_float(ins.type)) return error(status::kNotSupported);
+  if (!float32(ins.type)) return error(status::kNotSupported);
   const Val r = new_scalar(ins.result);
   if (r.kind == VK::None) return false;
   const uint32_t at = begin(dxbc_opcode, saturate ? 1u << 13 : 0u);
@@ -1117,6 +1317,7 @@ bool Translator::unary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t so
 }
 
 bool Translator::binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg) {
+  if (!float32(ins.type) && !m_.is_int(ins.type, 32)) return error(status::kNotSupported);   // (doubles and the narrow types)
   const Val a = use(ins.args[first_arg]), b = use(ins.args[first_arg + 1]);
   const Val r = new_scalar(ins.result);
   if (r.kind == VK::None) return false;
@@ -1128,6 +1329,7 @@ bool Translator::binary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t f
 }
 
 bool Translator::ternary(const Instruction& ins, uint32_t dxbc_opcode, uint32_t first_arg) {
+  if (!float32(ins.type) && !m_.is_int(ins.type, 32)) return error(status::kNotSupported);
   const Val a = use(ins.args[first_arg]), b = use(ins.args[first_arg + 1]), c = use(ins.args[first_arg + 2]);
   const Val r = new_scalar(ins.result);
   if (r.kind == VK::None) return false;
@@ -1154,7 +1356,7 @@ bool Translator::sincos(const Instruction& ins, bool cosine) {
 bool Translator::trig(const Instruction& ins, uint32_t opcode) {
   const Val x = use(ins.args[1]);
   const Val r = new_scalar(ins.result);
-  if (r.kind == VK::None || !m_.is_float(ins.type)) return error(status::kNotSupported);
+  if (r.kind == VK::None || !float32(ins.type)) return error(status::kNotSupported);
   auto scratch = [&]() {
     Val v;
     v.kind = VK::Temp;
@@ -1217,7 +1419,7 @@ bool Translator::trig(const Instruction& ins, uint32_t opcode) {
 bool Translator::inverse_trig(const Instruction& ins, uint32_t opcode) {
   const Val x = use(ins.args[1]);
   const Val r = new_scalar(ins.result);
-  if (r.kind == VK::None || !m_.is_float(ins.type)) return error(status::kNotSupported);
+  if (r.kind == VK::None || !float32(ins.type)) return error(status::kNotSupported);
   auto scratch = [&]() {
     Val v;
     v.kind = VK::Temp;
@@ -1291,7 +1493,7 @@ bool Translator::inverse_trig(const Instruction& ins, uint32_t opcode) {
 bool Translator::classify(const Instruction& ins, uint32_t opcode) {
   const Val x = use(ins.args[1]);
   const Val r = new_scalar(ins.result, true);
-  if (r.kind == VK::None || !m_.is_float(value_type(ins.args[1]))) return error(status::kNotSupported);
+  if (r.kind == VK::None || !float32(value_type(ins.args[1]))) return error(status::kNotSupported);
   Val infinity;
   infinity.kind = VK::Imm, infinity.a = 0x7F800000u;
   const uint32_t at = begin(opcode == 8 ? 57 : opcode == 9 ? 24 : 49);   // ne x, x / eq |x|, inf / lt |x|, inf
@@ -1780,6 +1982,45 @@ bool Translator::dx_call(const Instruction& ins) {
     case kDerivCoarseY: return unary(ins, 124, 1);
     case kDerivFineX: return unary(ins, 123, 1);
     case kDerivFineY: return unary(ins, 125, 1);
+    case kFma: {   // dfma (the float one is FMad)
+      const Val a = use(ins.args[1]), b = use(ins.args[2]), c = use(ins.args[3]);
+      const Val r = new_wide(ins.result);
+      if (r.kind == VK::None) return false;
+      const uint32_t at = begin(210);
+      dst_scalar(r);
+      src(a), src(b), src(c);
+      finish(at);
+      return define(ins.result, r);
+    }
+    case kMakeDouble: {   // the two words are the two halves of the pair
+      const Val lo = use(ins.args[1]), hi = use(ins.args[2]);
+      const Val r = new_wide(ins.result);
+      if (r.kind == VK::None) return false;
+      for (int word_index = 0; word_index < 2; ++word_index) {
+        const uint32_t at = begin(54);
+        dst_scalar(word_index ? high_word(r) : low_word(r));
+        src(word_index ? hi : lo);
+        finish(at);
+      }
+      return define(ins.result, r);
+    }
+    case kSplitDouble: {   // {low, high}: the pair itself, read by extractvalue
+      Val d = use(ins.args[1]);
+      if (d.kind != VK::Temp || !d.wide) {   // (a literal or a constant buffer element: into a register first)
+        const Val copy = new_wide(ins.result);
+        if (copy.kind == VK::None) return false;
+        for (int word_index = 0; word_index < 2; ++word_index) {
+          const uint32_t at = begin(54);
+          dst_scalar(word_index ? high_word(copy) : low_word(copy));
+          src(word_index ? high_word(d) : low_word(d));
+          finish(at);
+        }
+        d = copy;
+      }
+      Val agg;
+      agg.kind = VK::Agg, agg.a = d.a, agg.b = d.b;
+      return define(ins.result, agg);
+    }
     case kFAbs: return unary(ins, 54, 1, 2);
     case kSaturate: return unary(ins, 54, 1, 0, true);
     case kSin: return sincos(ins, false);
@@ -2058,6 +2299,8 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
       if ((c->kind == ConstantKind::Int && m_.is_int(type, 1)) ) v.kind = VK::Imm, v.a = c->bits & 1 ? 0xFFFFFFFFu : 0, v.is_mask = true;
       else if (c->kind == ConstantKind::Int && (m_.is_int(type, 32) || m_.is_int(type, 8) || m_.is_int(type, 16))) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
       else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 32) v.kind = VK::Imm, v.a = static_cast<uint32_t>(c->bits);
+      else if (c->kind == ConstantKind::Float && m_.is_float(type) && m_.types[type].width == 64) v.kind = VK::Imm, v.wide = true, v.a = static_cast<uint32_t>(c->bits), v.c = static_cast<uint32_t>(c->bits >> 32);
+      else if ((c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) && m_.is_float(type) && m_.types[type].width == 64) v.kind = VK::Imm, v.wide = true;
       else if (c->kind == ConstantKind::Null || c->kind == ConstantKind::Undef) v.kind = VK::Imm, v.a = 0;
     }
     if (!vals_.push_back(v) || !last_use_.push_back(-1) || !alias_of_.push_back(kNone) || !unsupported_.push_back(0) || !ptr_ok_.push_back(0)) return status::kNoMemory;
@@ -2093,11 +2336,12 @@ NtStatus Translator::run(uint32_t program_kind, ConstByteView isg1, ConstByteVie
     for (uint32_t i = 0; i < blk.count; ++i) {
       const Instruction& phi = instruction_at(blk.first + i);
       if (phi.op != Op::Phi) break;
-      if (m_.is_float(phi.type) ? m_.types[phi.type].width != 32 : !m_.is_int(phi.type, 32) && !m_.is_int(phi.type, 1)) return status::kNotSupported;
+      const bool double_phi = m_.is_float(phi.type) && m_.types[phi.type].width == 64;
+      if (!double_phi && (m_.is_float(phi.type) ? m_.types[phi.type].width != 32 : !m_.is_int(phi.type, 32) && !m_.is_int(phi.type, 1))) return status::kNotSupported;
       uint32_t reg = 0, comp = 0;
-      if (!alloc_scalar(last_use_of(phi.result), &reg, &comp)) return status_;
+      if (!(double_phi ? alloc_wide(last_use_of(phi.result), &reg, &comp) : alloc_scalar(last_use_of(phi.result), &reg, &comp))) return status_;
       Val v;
-      v.kind = VK::Temp, v.a = reg, v.b = comp, v.is_mask = m_.is_int(phi.type, 1);
+      v.kind = VK::Temp, v.a = reg, v.b = comp, v.is_mask = m_.is_int(phi.type, 1), v.wide = double_phi;
       vals_[phi.result] = v;
     }
   }

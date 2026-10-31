@@ -612,6 +612,25 @@ bool TgsiEmitter::instruction(const Instr& ins) {
     case kSne: simple = "SNE", sources = 2; break;
     case kDp2: simple = "DP2", sources = 2; break;
     case kFloor: simple = "FLR", sources = 1; break;
+    // doubles: a pair of components is a double (the destination's mask and the sources' swizzles say which)
+    case kDAdd: simple = "DADD", sources = 2; break;
+    case kDMul: simple = "DMUL", sources = 2; break;
+    case kDDiv: simple = "DDIV", sources = 2; break;
+    case kDFma: simple = "DFMA", sources = 3; break;
+    case kDRcp: simple = "DRCP", sources = 1; break;
+    case kDMin: simple = "DMIN", sources = 2; break;
+    case kDMax: simple = "DMAX", sources = 2; break;
+    case kDMov: simple = "DMOV", sources = 1; break;
+    case kDEq: simple = "DSEQ", sources = 2; break;
+    case kDGe: simple = "DSGE", sources = 2; break;
+    case kDLt: simple = "DSLT", sources = 2; break;
+    case kDNe: simple = "DSNE", sources = 2; break;
+    case kDToF: simple = "D2F", sources = 1; break;
+    case kDToI: simple = "D2I", sources = 1; break;
+    case kDToU: simple = "D2U", sources = 1; break;
+    case kFToD: simple = "F2D", sources = 1; break;
+    case kIToD: simple = "I2D", sources = 1; break;
+    case kUToD: simple = "U2D", sources = 1; break;
     case kDdx: simple = "DDX_FINE", sources = 1; break;
     case kDdy: simple = "DDY_FINE", sources = 1; break;
     case kDdxCoarse: simple = "DDX", sources = 1; break;
