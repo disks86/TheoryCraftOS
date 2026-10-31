@@ -124,6 +124,7 @@ void IwlScanner::shut_down() {
   aux_queue_.release();
   networks_.clear();
   rsn_records_.clear();
+  phy_records_.clear();
 }
 
 bool IwlScanner::start_scan(bool active, const char** error) {
@@ -174,6 +175,7 @@ bool IwlScanner::start_scan(bool active, const char** error) {
     // (the firmware may answer, report networks and even finish before the command call returns: the state is ready first)
     networks_.clear();
     rsn_records_.clear();
+    phy_records_.clear();
     scan_uid_ = request.uid;
     scanning_ = true;
     last_completed_ = false;
@@ -198,7 +200,30 @@ bool IwlScanner::rsn_element(const MacAddress& bssid, ConstByteView* element) co
   return false;
 }
 
-void IwlScanner::add_network(const WifiNetwork& network, ConstByteView rsn) {
+bool IwlScanner::phy_capabilities(const MacAddress& bssid, WifiPhyCapabilities* out) const {
+  for (uint64_t i = 0; i < phy_records_.count(); ++i)
+    if (phy_records_[i].bssid == bssid) {
+      *out = phy_records_[i].capabilities;
+      return true;
+    }
+  return false;
+}
+
+void IwlScanner::add_network(const WifiNetwork& network, ConstByteView rsn, const WifiPhyCapabilities& phy) {
+  {
+    bool known = false;
+    for (uint64_t i = 0; i < phy_records_.count() && !known; ++i) {
+      if (!(phy_records_[i].bssid == network.bssid)) continue;
+      known = true;
+      if (phy.ht && !phy_records_[i].capabilities.ht) phy_records_[i].capabilities = phy;       // (a probe response has more than a beacon of some access points)
+    }
+    if (!known && phy_records_.count() < kMaxNetworks) {
+      PhyRecord rec;
+      rec.bssid = network.bssid;
+      rec.capabilities = phy;
+      phy_records_.push_back(rec);
+    }
+  }
   if (rsn.size() != 0 && rsn.size() <= 64) {
     bool known = false;
     for (uint64_t i = 0; i < rsn_records_.count() && !known; ++i) known = rsn_records_[i].bssid == network.bssid;
@@ -227,7 +252,11 @@ void IwlScanner::on_notification(const IwlRxPacket& packet) {
     if (!iwl_parse_rx_mpdu(packet, &frame) || !frame.crc_ok) return;
     ++frames_seen_;
     WifiNetwork network;
-    if (wifi_parse_announcement(frame.frame, frame.channel, frame.signal_dbm, &network)) add_network(network, ieee80211::find_rsn_element(frame.frame));
+    if (wifi_parse_announcement(frame.frame, frame.channel, frame.signal_dbm, &network)) {
+      WifiPhyCapabilities phy;
+      if (!wifi_parse_phy_capabilities(frame.frame, &phy)) phy = WifiPhyCapabilities();
+      add_network(network, ieee80211::find_rsn_element(frame.frame), phy);
+    }
     return;
   }
   if (packet.group == 0 && packet.command == kScanCompleteUmacCommand) {

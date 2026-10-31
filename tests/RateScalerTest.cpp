@@ -174,8 +174,82 @@ static void test_inputs() {
   CHECK(high.success_chance(1) == 0 && high.success_chance(99) == 0 && high.success_chance(7) > 900);
 }
 
+// A ladder that is not the OFDM one (an HT / VHT link has up to 30 steps): the same behaviour over any number of rates.
+struct LadderChannel {
+  uint32_t percent[WifiRateScaler::kMaxRates] = {};
+  uint32_t seed = 777;
+  uint64_t now_ms = 0;
+  uint32_t random() { seed = seed * 1664525u + 1013904223u; return seed >> 8; }
+  void send(WifiRateScaler& s) {
+    uint8_t table[WifiRateScaler::kTableSize];
+    s.fill_table(table);
+    uint32_t attempts = 0;
+    bool ok = false;
+    for (uint32_t i = 0; i < 15 && !ok; ++i) {
+      ++attempts;
+      ok = (random() % 100) < percent[table[i]];
+    }
+    now_ms += 2;
+    s.on_result(ok, attempts, table[0], now_ms);
+  }
+};
+
+static void test_long_ladder() {
+  uint32_t kbps[30];
+  for (uint32_t i = 0; i < 30; ++i) kbps[i] = 6000 + i * 25000;
+  WifiRateScaler s;
+  s.start(80, ArrayView<const uint32_t>(kbps, 30));
+  CHECK(s.rate_count() == 30 && s.current() == 22 && s.current_kbps() == kbps[22] && s.take_changed());
+  s.start(5, ArrayView<const uint32_t>(kbps, 30));
+  CHECK(s.current() == 0);
+  s.start(50, ArrayView<const uint32_t>(kbps, 30));
+  CHECK(s.current() == 10);
+  uint8_t t[WifiRateScaler::kTableSize];
+  s.fill_table(t);
+  CHECK(t[0] == 10 && t[1] == 10 && t[2] == 9 && t[15] == 3);
+  {   // everything works: to the top, one probe at a time
+    LadderChannel c;
+    for (uint32_t i = 0; i < 30; ++i) c.percent[i] = 98;
+    s.start(40, ArrayView<const uint32_t>(kbps, 30));
+    for (int i = 0; i < 4000; ++i) c.send(s);
+    CHECK(s.current() == 29);
+  }
+  {   // the steps above 17 fail: it stays at or just below, with probes of the next now and then
+    LadderChannel c;
+    for (uint32_t i = 0; i < 30; ++i) c.percent[i] = i <= 17 ? 97 : 4;
+    s.start(90, ArrayView<const uint32_t>(kbps, 30));
+    for (int i = 0; i < 4000; ++i) c.send(s);
+    uint32_t good = 0;
+    for (int i = 0; i < 800; ++i) {
+      c.send(s);
+      good += s.current() >= 16 && s.current() <= 18;
+    }
+    CHECK(good > 700);
+  }
+  {   // a channel that gets worse step by step: down to the bottom
+    LadderChannel c;
+    for (uint32_t i = 0; i < 30; ++i) c.percent[i] = i == 0 ? 95 : 3;
+    s.start(90, ArrayView<const uint32_t>(kbps, 30));
+    for (int i = 0; i < 6000; ++i) c.send(s);
+    CHECK(s.current() == 0);
+  }
+  // too long or empty ladders fall back to the OFDM one
+  uint32_t many[WifiRateScaler::kMaxRates + 1] = {};
+  s.start(80, ArrayView<const uint32_t>(many, WifiRateScaler::kMaxRates + 1));
+  CHECK(s.rate_count() == WifiRateScaler::kRateCount && s.current() == 6 && s.current_kbps() == 48000);
+  s.start(80, ArrayView<const uint32_t>());
+  CHECK(s.rate_count() == WifiRateScaler::kRateCount);
+  // an unknown rate index (the count of the ladder) counts for the current one; one past it is not a rate
+  s.start(65, ArrayView<const uint32_t>(kbps, 30));
+  s.take_changed();
+  for (int i = 0; i < 16; ++i) s.on_result(false, 15, s.rate_count(), 0);
+  CHECK(s.current() < 15 && s.take_changed());
+  CHECK(s.success_chance(30) == 0 && s.success_chance(99) == 0);
+}
+
 int main() {
   test_start_and_table();
+  test_long_ladder();
   test_settles();
   test_changing_channel();
   test_inputs();

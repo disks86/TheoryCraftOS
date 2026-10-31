@@ -32,13 +32,23 @@ constexpr uint32_t kMaxBackoff = 8;
 constexpr uint32_t kForgetAfterWindows = 12;     // the channel changes: what was measured long ago says little
 }  // namespace
 
-void WifiRateScaler::start(uint32_t signal_percent) {
-  current_ = signal_percent >= 75 ? 6 : signal_percent >= 60 ? 5 : signal_percent >= 45 ? 4 : signal_percent >= 30 ? 2 : 0;
+void WifiRateScaler::start(uint32_t signal_percent) { start(signal_percent, ArrayView<const uint32_t>()); }
+
+void WifiRateScaler::start(uint32_t signal_percent, ArrayView<const uint32_t> kbps) {
+  if (kbps.size() == 0 || kbps.size() > kMaxRates) {
+    count_ = kRateCount;
+    for (uint32_t i = 0; i < kRateCount; ++i) kbps_[i] = kRatesKbps[i];
+    current_ = signal_percent >= 75 ? 6 : signal_percent >= 60 ? 5 : signal_percent >= 45 ? 4 : signal_percent >= 30 ? 2 : 0;
+  } else {
+    count_ = static_cast<uint32_t>(kbps.size());
+    for (uint32_t i = 0; i < count_; ++i) kbps_[i] = kbps[i];
+    current_ = signal_percent >= 75 ? count_ * 3 / 4 : signal_percent >= 60 ? count_ / 2 : signal_percent >= 45 ? count_ / 3 : signal_percent >= 30 ? count_ / 6 : 0;
+  }
   window_frames_ = window_ok_ = window_attempts_ = 0;
   window_started_ = false;
   probing_ = false;
   changed_ = true;
-  for (uint32_t i = 0; i < kRateCount; ++i) {
+  for (uint32_t i = 0; i < kMaxRates; ++i) {
     chance_[i] = 0;
     known_[i] = false;
     hold_[i] = 0;
@@ -63,7 +73,7 @@ void WifiRateScaler::fill_table(uint8_t indices[kTableSize]) const {
 void WifiRateScaler::on_result(bool success, uint32_t attempts, uint32_t rate_index, uint64_t now_ms) {
   if (attempts == 0) attempts = 1;
   if (attempts > kTableSize) attempts = kTableSize;
-  if (rate_index != current_ && rate_index < kRateCount) {
+  if (rate_index != current_ && rate_index < count_) {
     // a frame that started at another rate than the current one (sent before the table changed): it says nothing about the current rate
     return;
   }
@@ -89,11 +99,11 @@ void WifiRateScaler::evaluate(uint64_t) {
   // what is known about this rate: the new sample counts as much as the old
   chance_[c] = known_[c] ? (chance_[c] + p) / 2 : p;
   known_[c] = true;
-  for (uint32_t i = 0; i < kRateCount; ++i) {
+  for (uint32_t i = 0; i < count_; ++i) {
     if (i == c) { age_[i] = 0; continue; }
     if (known_[i] && ++age_[i] > kForgetAfterWindows) known_[i] = false;
   }
-  for (uint32_t i = 0; i < kRateCount; ++i)
+  for (uint32_t i = 0; i < count_; ++i)
     if (i != c && hold_[i] > 0 && !probing_) --hold_[i];
   if (probing_) {
     probing_ = false;
@@ -107,14 +117,14 @@ void WifiRateScaler::evaluate(uint64_t) {
     }
     return;
   }
-  const uint64_t goodput = uint64_t{p} * kRatesKbps[c];
-  if (c > 0 && (p < kPoor || (known_[c - 1] && uint64_t{chance_[c - 1]} * kRatesKbps[c - 1] > goodput))) {
+  const uint64_t goodput = uint64_t{p} * kbps_[c];
+  if (c > 0 && (p < kPoor || (known_[c - 1] && uint64_t{chance_[c - 1]} * kbps_[c - 1] > goodput))) {
     current_ = c - 1;                                              // down
     hold_[c] = backoff_[c];
     changed_ = true;
     return;
   }
-  if (c + 1 < kRateCount && p >= kGood && hold_[c + 1] == 0 && (!known_[c + 1] || uint64_t{chance_[c + 1]} * kRatesKbps[c + 1] > goodput)) {
+  if (c + 1 < count_ && p >= kGood && hold_[c + 1] == 0 && (!known_[c + 1] || uint64_t{chance_[c + 1]} * kbps_[c + 1] > goodput)) {
     probing_ = true;                                               // up, as a probe
     probe_from_ = c;
     current_ = c + 1;

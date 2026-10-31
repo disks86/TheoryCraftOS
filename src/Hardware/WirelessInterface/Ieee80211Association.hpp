@@ -55,6 +55,9 @@ class Ieee80211Association {
   // Starts joining `network` (its BSSID, SSID and channel from a scan). `ap_rsn_element` is the RSN element of its beacon (empty for an open network), `passphrase` the WPA2
   // passphrase, `snonce` 32 random bytes for the handshake, `our_address` our MAC address. WifiResult::Ok when under way; BadPassphrase, Unsupported, InvalidArgument otherwise.
   WifiResult start(const WifiNetwork& network, ConstByteView ap_rsn_element, StringView passphrase, const uint8_t snonce[wpa2::kNonceBytes], const uint8_t our_address[6]);
+  // More elements for the association request (HT / VHT capabilities; whole elements, at most kMaxExtraElements bytes), kept until the next start(). Set before start().
+  static constexpr uint32_t kMaxExtraElements = 96;
+  bool set_extra_elements(ConstByteView elements);
   // A frame the radio received from the air (the 802.11 frame without FCS).
   void on_frame(ConstByteView frame);
   // An EAPOL frame the radio already took out of a data frame (the hardware may have decrypted it).
@@ -83,6 +86,8 @@ class Ieee80211Association {
   uint8_t our_address_[6] = {};
   uint8_t rsn_ie_[24] = {};
   uint32_t rsn_ie_length_ = 0;
+  uint8_t extra_[kMaxExtraElements] = {};
+  uint32_t extra_length_ = 0;
   bool secure_ = false, handshake_silent_ = false;
   wpa2::Supplicant supplicant_;
   uint64_t step_started_ms_ = 0;

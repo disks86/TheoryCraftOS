@@ -22,6 +22,7 @@
 // that are read into the list of networks, and SCAN_COMPLETE_UMAC ends the scan. Only the firmware versions named in IwlMvm.hpp are spoken; others are refused with their version.
 #pragma once
 #include <stdint.h>
+#include "Hardware/WirelessInterface/Ieee80211Ht.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlMvm.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlTransport.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlNvm.hpp"
@@ -36,7 +37,7 @@ class IwlScanner final : private IIwlNotificationHandler {
   static constexpr uint32_t kCommandTimeoutUs = 2000000;
 
   IwlScanner(IwlTransport& transport, allocators::IAllocator& allocator)
-      : transport_(transport), allocator_(allocator), aux_queue_(transport.device(), allocator, iwl_tx::kAuxQueue, iwl_tx::kMcastFifo), networks_(allocator), rsn_records_(allocator) {}
+      : transport_(transport), allocator_(allocator), aux_queue_(transport.device(), allocator, iwl_tx::kAuxQueue, iwl_tx::kMcastFifo), networks_(allocator), rsn_records_(allocator), phy_records_(allocator) {}
   ~IwlScanner() { shut_down(); }
   IwlScanner(const IwlScanner&) = delete;
   IwlScanner& operator=(const IwlScanner&) = delete;
@@ -58,6 +59,8 @@ class IwlScanner final : private IIwlNotificationHandler {
   uint32_t frames_seen() const { return frames_seen_; }
   // The RSN element of the access point's beacon (id 48 included), as heard in the latest scan; false if it had none.
   bool rsn_element(const MacAddress& bssid, ConstByteView* element) const;
+  // The HT / VHT capabilities and operation of the access point as heard in the latest scan (ht and vht false for an access point without them); false if it is unknown.
+  bool phy_capabilities(const MacAddress& bssid, WifiPhyCapabilities* out) const;
   // Every notification is also passed on (the station link reads the frames and the transmit responses from the same stream).
   void set_forward(IIwlNotificationHandler* next) { forward_ = next; }
   uint8_t auxiliary_station_id() const { return 0; }
@@ -69,7 +72,11 @@ class IwlScanner final : private IIwlNotificationHandler {
     uint8_t length = 0;
     uint8_t element[64] = {};
   };
-  void add_network(const WifiNetwork& network, ConstByteView rsn);
+  struct PhyRecord {
+    MacAddress bssid{};
+    WifiPhyCapabilities capabilities;
+  };
+  void add_network(const WifiNetwork& network, ConstByteView rsn, const WifiPhyCapabilities& phy);
   bool send(const IwlHostCommand& command, ByteView response, int32_t* length, const char** error);
 
   IwlTransport& transport_;
@@ -77,6 +84,7 @@ class IwlScanner final : private IIwlNotificationHandler {
   IwlCommandQueue aux_queue_;
   List<WifiNetwork> networks_;
   List<RsnRecord> rsn_records_;
+  List<PhyRecord> phy_records_;
   IIwlNotificationHandler* forward_ = nullptr;
   const IwlFirmware* firmware_ = nullptr;
   IwlNvmData nvm_;

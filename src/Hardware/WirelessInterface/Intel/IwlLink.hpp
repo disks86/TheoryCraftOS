@@ -57,8 +57,9 @@ class IwlStationLink final : public IWifiLink, public IIwlNotificationHandler {
   void set_association(Ieee80211Association* association) { association_ = association; }
   void set_data_sink(IWifiDataSink* sink) { sink_ = sink; }
 
-  // The firmware's contexts and queue for `network`. `scanner` must be ready (its station interface exists). False with a message.
-  bool prepare(const IwlFirmware& firmware, const IwlNvmData& nvm, const WifiNetwork& network, const char** error);
+  // The firmware's contexts and queue for `network`. `scanner` must be ready (its station interface exists). `phy` is what wifi_negotiate_phy() chose for the access point: with
+  // HT or VHT in it the channel may be wider than 20 MHz and the rates are the ladder of the negotiated streams, width and guard interval. False with a message.
+  bool prepare(const IwlFirmware& firmware, const IwlNvmData& nvm, const WifiNetwork& network, const char** error, const WifiPhyNegotiation& phy = WifiPhyNegotiation());
   // Takes the access point's station and the binding out of the firmware and frees the queue (a disconnect); release() only drops our side.
   void teardown();
   void release();
@@ -73,6 +74,7 @@ class IwlStationLink final : public IWifiLink, public IIwlNotificationHandler {
   // inside a notification). Without the firmware's LINK_QUALITY_CMD, or after the firmware refuses the table, the fixed rate is used.
   bool rate_control() const { return rate_control_; }
   uint32_t data_rate_kbps() const { return rate_control_ ? scaler_.current_kbps() : 24000; }
+  const WifiPhyNegotiation& phy() const { return phy_; }
   uint32_t rate_changes() const { return rate_changes_; }
   // Sends the link quality table if the scaler changed it. Called by whoever drives the card, outside of notifications.
   void service();
@@ -103,6 +105,11 @@ class IwlStationLink final : public IWifiLink, public IIwlNotificationHandler {
   uint8_t address_[6] = {};
   uint32_t tx_antennas_ = 1, rx_antennas_ = 1;
   bool send_link_quality(const char** error);
+  void fill_station(IwlStationSpec* spec) const;
+  uint32_t index_of_rate(uint32_t rate_n_flags) const;
+  WifiPhyNegotiation phy_;
+  WifiRateLadder ladder_;
+  uint32_t codes_[WifiRateScaler::kMaxRates] = {};      // rate_n_flags of each rate of the scaler, without antennas
   WifiRateScaler scaler_;
   bool rate_control_ = false, lq_dirty_ = false;
   uint32_t lq_failures_ = 0, rate_changes_ = 0;
