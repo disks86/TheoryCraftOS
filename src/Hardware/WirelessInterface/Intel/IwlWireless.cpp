@@ -18,6 +18,7 @@
 
 
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
+#include "Kernel/Delay.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace hardware {
@@ -98,6 +99,7 @@ void IwlWirelessInterface::shutdown() {
 
 void IwlWirelessInterface::shutdown_locked() {
   if (!started_) return;
+  interrupts_ = gating_ = false;
   leave_locked();
   started_ = false;
   association_ = UniquePointer<Ieee80211Association>();
@@ -106,6 +108,34 @@ void IwlWirelessInterface::shutdown_locked() {
   release_view(*in_.allocator, ring_);
   results_.clear();
   status_ = WifiStatus();
+}
+
+bool IwlWirelessInterface::use_interrupts(bool on) {
+  kernel::ScopedMutex guard(mutex_);
+  IwlTransport* transport = driver_.transport();
+  if (!started_ || !transport) return false;
+  transport->use_interrupts(on);
+  interrupts_ = on && transport->interrupts_enabled();
+  gating_ = interrupts_;
+  missed_ = 0;
+  seen_interrupts_ = transport->interrupt_count();
+  last_look_ms_ = in_.clock->now_ms();
+  return interrupts_ == on;
+}
+
+// ECHO_CMD is answered by a frame, which is what the card interrupts for.
+bool IwlWirelessInterface::verify_interrupts() {
+  kernel::ScopedMutex guard(mutex_);
+  IwlTransport* transport = driver_.transport();
+  if (!started_ || !transport || !interrupts_) return false;
+  const uint32_t before = transport->interrupt_count();
+  IwlHostCommand echo;
+  echo.opcode = 0x03;
+  uint8_t response[16];
+  const char* error = nullptr;
+  if (transport->send_sync(echo, ByteView(response, sizeof response), 100000, &error) < 0) return false;
+  for (uint32_t i = 0; i < 20 && transport->interrupt_count() == before; ++i) delay_us(1000);
+  return transport->interrupt_count() != before;
 }
 
 MacAddress IwlWirelessInterface::mac_address() const {
@@ -144,7 +174,28 @@ void IwlWirelessInterface::recover() const {
 
 void IwlWirelessInterface::pump() const {
   if (!started_) return;
-  if (const_cast<IwlDriver&>(driver_).transport() && const_cast<IwlDriver&>(driver_).transport()->check_firmware()) {
+  IwlTransport* transport = const_cast<IwlDriver&>(driver_).transport();
+  if (transport && interrupts_ && gating_) {
+    // nothing is going on and nothing was said: do not look (the card interrupts for what arrives), except now and then
+    const bool idle = !scan_pending_ && status_.state != WifiState::Scanning && status_.state != WifiState::Connecting;
+    const uint64_t now = in_.clock->now_ms();
+    if (idle && !transport->interrupt_pending() && now - last_look_ms_ < kSafetyPollMs) return;
+    const bool safety = !transport->interrupt_pending();
+    last_look_ms_ = now;
+    const uint32_t frames_before = transport->frames_received();
+    if (transport->check_firmware()) {
+      recover();
+      return;
+    }
+    transport->poll(nullptr);
+    const bool found = transport->frames_received() != frames_before;
+    const bool interrupted = transport->interrupt_count() != seen_interrupts_;
+    seen_interrupts_ = transport->interrupt_count();
+    if (found && !safety) missed_ = 0;                                  // an interrupt told us, and there was something: they work
+    else if (found && safety && idle && !interrupted) {                 // frames nobody told us about
+      if (++missed_ >= kMissedBeforeGivingUp) gating_ = false;
+    }
+  } else if (transport && transport->check_firmware()) {
     recover();
     return;
   }

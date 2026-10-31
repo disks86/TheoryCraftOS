@@ -263,9 +263,17 @@ struct FakeIwl final : IIwlRegisters {
   std::function<void(uint32_t)> on_queue_doorbell, on_ring_programmed;
   uint32_t queue_wrptr[32] = {};
   bool force_radio = false;
+  std::function<void()> irq;                 // the MSI: called when an unmasked cause is set
+  bool interrupts_model = false;             // frames from the chip raise the receive cause
+  uint32_t int_reads = 0;
   bool w1c = false, fail_transfers = false, cpu_released = false, alive_never = false, extended_during = false;
 
+  void raise(uint32_t bits) {
+    regs[iwl_csr::kInt / 4] |= bits;
+    if ((regs[iwl_csr::kIntMask / 4] & regs[iwl_csr::kInt / 4]) && irq) irq();
+  }
   uint32_t read32(uint32_t offset) override {
+    if (offset == iwl_csr::kInt) ++int_reads;
     switch (offset) {
       case iwl_csr::kHbusPrphRdat: last_prph_read_address = prph_addr_r; return prph[(prph_addr_r & 0xFFFFF) / 4];
       case iwl_csr::kHbusMemRdat: return mem[(mem_r++) % 0x1000];
@@ -315,6 +323,7 @@ struct FakeIwl final : IIwlRegisters {
       return;
     }
     uint32_t& r = regs[(offset / 4) % 0x800];
+    if (offset == iwl_csr::kIntMask) { r = value; if ((value & regs[iwl_csr::kInt / 4]) && irq) irq(); return; }
     if (w1c && (offset == iwl_csr::kFhIntStatus || offset == iwl_csr::kInt)) { r &= ~value; return; }
     r = value;
     if (offset == iwl_csr::kHwIfConfig) {
@@ -538,6 +547,7 @@ struct FakeRxChip {
     ++taken;
     ++closed;
     *reinterpret_cast<uint16_t*>(prph64(0xA08200)) = static_cast<uint16_t>(closed % 256);
+    if (chip.interrupts_model) chip.raise(iwl_csr::kIntBitFhRx);
     return true;
   }
 };
@@ -1967,6 +1977,119 @@ static void test_firmware_recovery() {
   CHECK(fx.alloc.dma.empty());
 }
 
+// Interrupts: the card masks itself in the handler, the thread acknowledges and unmasks; an error is noticed before its bit is cleared; the interface looks at the card only when told
+// (and now and then), and gives the gating up when the card does not tell.
+static void test_interrupts() {
+  TestAllocator alloc;
+  const Bytes file = make_loadable_firmware(64);
+  IwlFirmware fw(alloc);
+  const char* error = nullptr;
+  CHECK(fw.parse(ConstByteView(file.data(), file.size()), &error));
+  {
+    FakeIwl chip;
+    chip.w1c = true;
+    chip.force_radio = true;
+    chip.regs[iwl_csr::kHwRev / 4] = (0x31u << 4) | 0x3;
+    chip.prph[(iwl_tx::kScdSramBase & 0xFFFFF) / 4] = 0x800000;
+    IwlTransport tp(chip, alloc, true);
+    FakeRxChip rxhw(chip);
+    FakeTxChip txhw(chip);
+    chip.on_alive = [&] { Bytes f; FakeRxChip::frame(f, 0, iwl_cmd::kAliveNotification, 0x8000, alive_payload(0xCAFE)); rxhw.deliver(f); };
+    chip.on_doorbell = [&] {
+      bool ok = false;
+      for (const Bytes& c : txhw.process(&ok)) { Bytes f; FakeRxChip::frame(f, c[1], c[0], static_cast<uint16_t>(c[2] | (c[3] << 8)), Bytes{0, 0, 0, 0}); rxhw.deliver(f); }
+    };
+    chip.irq = [&] { tp.on_interrupt(); };
+    CHECK(tp.start(fw, IwlImage::Regular, 5000, &error));
+    CHECK(!tp.interrupts_enabled() && chip.regs[iwl_csr::kIntMask / 4] == 0);
+    tp.on_interrupt();                                                         // not enabled: nothing happens
+    CHECK(tp.interrupt_count() == 0);
+    tp.use_interrupts(true);
+    chip.interrupts_model = true;
+    CHECK(tp.interrupts_enabled() && chip.regs[iwl_csr::kIntMask / 4] == iwl_csr::kIniSetMask);
+    tp.on_interrupt();                                                         // enabled, but the card has said nothing: not ours
+    CHECK(tp.interrupt_count() == 0 && !tp.interrupt_pending() && chip.regs[iwl_csr::kIntMask / 4] == iwl_csr::kIniSetMask);
+    Bytes f;
+    FakeRxChip::frame(f, 0, 0x77, 0x8000, Bytes{1});
+    rxhw.deliver(f);                                                           // a frame: the card raises its cause, the handler masks it
+    CHECK(tp.interrupt_pending() && tp.interrupt_count() == 1 && chip.regs[iwl_csr::kIntMask / 4] == 0);
+    NoteCollector notes;
+    CHECK(tp.poll(&notes) == 1 && notes.commands.size() == 1 && notes.commands[0] == 0x77);
+    CHECK(!tp.interrupt_pending() && chip.regs[iwl_csr::kIntMask / 4] == iwl_csr::kIniSetMask && (chip.regs[iwl_csr::kInt / 4] & iwl_csr::kIntBitFhRx) == 0 && tp.frames_received() >= 1);
+    // a command's answer interrupts too, and send_sync handles it
+    Bytes d{1};
+    IwlHostCommand c;
+    c.opcode = 0x21;
+    c.data = ConstByteView(d.data(), d.size());
+    uint8_t buf[16];
+    CHECK(tp.send_sync(c, ByteView(buf, sizeof buf), 2000, &error) == 4);
+    CHECK(chip.regs[iwl_csr::kIntMask / 4] == iwl_csr::kIniSetMask || tp.interrupt_pending());
+    tp.poll(nullptr);
+    CHECK(chip.regs[iwl_csr::kIntMask / 4] == iwl_csr::kIniSetMask);
+    // the firmware asserts: the handler masks, the thread reads the log before the cause is cleared, and the card stays masked
+    uint32_t* table = &chip.mem[0x1234 / 4];
+    table[0] = 1;
+    table[1] = 0x70;
+    chip.raise(iwl_csr::kIntBitSwError);
+    CHECK(tp.interrupt_pending() && !tp.firmware_failed());
+    tp.poll(nullptr);
+    CHECK(tp.firmware_failed() && tp.error_log().error_id() == 0x70 && chip.regs[iwl_csr::kIntMask / 4] == 0 && (chip.regs[iwl_csr::kInt / 4] & iwl_csr::kIntBitSwError) == 0);
+    tp.stop();
+    CHECK(!tp.interrupts_enabled());
+  }
+  {   // the interface
+    WifiFixture fx("hunter2hunter2");
+    IwlWirelessInterface::Inputs in;
+    in.firmware = &fx.source; in.allocator = &fx.alloc; in.clock = &fx.clock; in.random = &fx.random;
+    IwlWirelessInterface wifi(in);
+    CHECK(!wifi.use_interrupts(true) && !wifi.verify_interrupts());              // not started
+    CHECK(wifi.start(fx.chip, true));
+    CHECK(!wifi.verify_interrupts());                                              // not in interrupt mode yet
+    CHECK(wifi.use_interrupts(true) && wifi.interrupts_on() && wifi.interrupt_gating());
+    fx.chip.irq = [&] { wifi.on_interrupt(); };
+    fx.chip.interrupts_model = true;
+    CHECK(wifi.verify_interrupts());                                               // the answer to a command interrupted
+    // idle: calls do not touch the card until the safety time
+    fx.clock.us += 100000;
+    wifi.link_up();
+    const uint32_t base = fx.chip.int_reads;
+    for (int i = 0; i < 10; ++i) wifi.link_up();
+    CHECK(fx.chip.int_reads == base);
+    fx.clock.us += 60000;
+    wifi.link_up();
+    CHECK(fx.chip.int_reads > base);
+    // something arrives: the next call looks at once
+    const uint32_t base2 = fx.chip.int_reads;
+    Bytes f;
+    FakeRxChip::frame(f, 0, 0x77, 0x8000, Bytes{1});
+    fx.rxhw.deliver(f);
+    wifi.link_up();
+    CHECK(fx.chip.int_reads > base2 && wifi.interrupt_gating());
+    // a scan is not left to interrupts alone: it is polled as before
+    CHECK(wifi.start_scan());
+    for (int i = 0; i < 20 && wifi.status().state == WifiState::Scanning; ++i) {}
+    WifiNetwork nets[8];
+    CHECK(wifi.scan_results(ArrayView<WifiNetwork>(nets, 8)) == 2);
+    // the card stops interrupting: three safety looks that find frames end the gating
+    fx.chip.irq = nullptr;
+    for (int i = 0; i < 3; ++i) {
+      Bytes g;
+      FakeRxChip::frame(g, 0, 0x77, 0x8000, Bytes{1});
+      fx.rxhw.deliver(g);
+      CHECK(wifi.interrupt_gating() == (i < 3));
+      fx.clock.us += 60000;
+      wifi.link_up();
+    }
+    CHECK(!wifi.interrupt_gating() && wifi.interrupts_on());
+    const uint32_t base3 = fx.chip.int_reads;
+    wifi.link_up();
+    wifi.link_up();
+    CHECK(fx.chip.int_reads >= base3 + 2);                                        // polled on every call again
+    wifi.shutdown();
+    CHECK(!wifi.interrupts_on() && fx.alloc.dma.empty());
+  }
+}
+
 int main() {
   test_devices();
   test_firmware();
@@ -1986,6 +2109,7 @@ int main() {
   test_firmware_failure();
   test_wireless_interface();
   test_firmware_recovery();
+  test_interrupts();
   printf(g_failed ? "IwlTest: %d FAILED\n" : "IwlTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

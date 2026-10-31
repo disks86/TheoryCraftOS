@@ -189,6 +189,15 @@ static void demo_task(void* context) {
 using bootlog::Entry;
 using bootlog::Level;
 
+#ifdef TCOS_INTEL_WIFI
+// The Wi-Fi card's MSI: the transport masks the card and says an interrupt came; the interface looks at the card on its next call.
+static kernel::Frame* on_wifi_interrupt(kernel::Frame* frame, void* radio) {
+  kernel::apic::eoi();
+  static_cast<hardware::IwlWirelessInterface*>(radio)->on_interrupt();
+  return frame;
+}
+#endif
+
 #ifdef TCOS_THUNDERBOLT
 // The Thunderbolt host interface's MSI: the driver reads the chip's notify registers (which lets it interrupt again) and counts; the desktop loop then reads the control channel.
 static kernel::Frame* on_thunderbolt_interrupt(kernel::Frame* frame, void* driver) {
@@ -1273,6 +1282,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_INTEL_WIFI
     // The Intel Wireless-AC 9560 (and the rest of the 9000 series) as a network interface: the firmware from /firmware is started, and the card then scans and joins networks through the
     // Wi-Fi window; its network stack gets an address (DHCP) whenever it is joined. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
+    UniquePointer<hardware::PciMsi> wifi_msi;                       // the card's MSI, when the machine delivers it
     if (clock_ok && paging_ok) {
       hardware::FileSystemFirmwareSource wifi_firmware(explorer_files.file_system(), shared_allocator);
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
@@ -1292,6 +1302,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (wifi->initialize()) {
           hardware::IwlWirelessInterface* radio = wifi.get();
           const hardware::MacAddress mac = radio->mac_address();
+          // MSI: the handler, then the message to the core that runs this; kept only if the answer to a command of the card interrupts. Else the card is polled, as before.
+          const uint32_t wifi_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
+          if (wifi_apic_id <= 0xFF) {
+            kernel::set_interrupt_handler(kernel::kVectorWifi, &on_wifi_interrupt, radio);
+            wifi_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
+            bool interrupts = wifi_msi && wifi_msi->enable(d.address, 0xFEE00000u | (wifi_apic_id << 12), kernel::kVectorWifi) && radio->use_interrupts(true) && radio->verify_interrupts();
+            if (!interrupts) {
+              radio->use_interrupts(false);
+              wifi_msi = UniquePointer<hardware::PciMsi>();
+              kernel::set_interrupt_handler(kernel::kVectorWifi, nullptr, nullptr);
+            }
+            Entry(interrupts ? Level::Ok : Level::Info, "Wi-Fi").text(interrupts ? "interrupts: MSI" : "no interrupt from the card: polled");
+          }
           stacks.stop_service();                                       // (a stack for it; the others keep theirs)
           if (network.adopt(util::move(wifi)) && stacks.add(*radio)) {
             Entry e(Level::Ok, "Wi-Fi");

@@ -108,6 +108,7 @@ bool IwlTransport::start(const IwlFirmware& firmware, IwlImage image, uint32_t t
 
 void IwlTransport::stop() {
   running_ = false;
+  interrupts_on_ = false;
   waiting_ = false;
   rx_.release();
   tx_.release();
@@ -115,6 +116,31 @@ void IwlTransport::stop() {
     device_.disable_interrupts();
     device_.apm_stop();
   }
+}
+
+void IwlTransport::use_interrupts(bool on) {
+  interrupts_on_ = on && running_;
+  __atomic_store_n(&irq_pending_, 0u, __ATOMIC_RELEASE);
+  device_.write32(kIntMask, interrupts_on_ ? kIniSetMask : 0);
+}
+
+// Interrupt context: the registers only. The card is masked until the thread has looked at what it said; the cause bits stay set for it.
+void IwlTransport::on_interrupt() {
+  if (!interrupts_on_) return;
+  const uint32_t cause = device_.read32(kInt);
+  if (cause == 0 || cause == 0xFFFFFFFFu) return;                        // not ours, or the card is gone
+  device_.write32(kIntMask, 0);
+  __atomic_store_n(&irq_pending_, 1u, __ATOMIC_RELEASE);
+  __atomic_fetch_add(&irq_count_, 1u, __ATOMIC_ACQ_REL);
+}
+
+void IwlTransport::service_interrupt() {
+  __atomic_store_n(&irq_pending_, 0u, __ATOMIC_RELEASE);
+  const uint32_t cause = device_.read32(kInt), fh = device_.read32(kFhIntStatus);
+  if (cause != 0xFFFFFFFFu && (cause & (kIntBitSwError | kIntBitHwError))) capture_failure();   // (before the bits are cleared: check_firmware() looks at them too)
+  device_.write32(kInt, cause);                                           // acknowledged
+  device_.write32(kFhIntStatus, fh);
+  if (interrupts_on_ && !failed_) device_.write32(kIntMask, kIniSetMask);  // and the card may speak again
 }
 
 void IwlTransport::capture_failure() {
@@ -162,9 +188,11 @@ void IwlTransport::on_packet(const IwlRxPacket& packet) {
 }
 
 uint32_t IwlTransport::poll(IIwlNotificationHandler* handler) {
+  if (interrupts_on_ && interrupt_pending()) service_interrupt();
   IIwlNotificationHandler* saved = handler_;
   handler_ = handler ? handler : default_handler_;
   const uint32_t frames = rx_.poll(*this);
+  frames_ += frames;
   handler_ = saved;
   if (running_) check_firmware();
   return frames;
