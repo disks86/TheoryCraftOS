@@ -53,6 +53,8 @@
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
+#include "Hardware/Bus/Rtsx/RtsxDriver.hpp"
+#include "Hardware/StorageDevice/Sd/SdStorageDevice.hpp"
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
@@ -963,6 +965,27 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (info.read_only) e.text(", read-only");
     if (info.removable) e.text(", removable");
   }
+#ifdef TCOS_SDCARD
+  // The SD card slot of a Realtek card reader: a card put in is a removable storage device like a USB stick (the card is looked for by the same polling that watches the USB ports).
+  UniquePointer<hardware::RtsxDriver> card_reader;
+  UniquePointer<hardware::SdSlotSource> sd_slot;
+  if (paging_ok) {
+    for (uint32_t i = 0; i < pci.device_count() && !card_reader; ++i) {
+      hardware::PciDeviceInfo d;
+      if (!pci.pci_device(i, &d) || !hardware::RtsxDriver::supports(d)) continue;
+      card_reader = UniquePointer<hardware::RtsxDriver>::make(shared_allocator, shared_allocator);
+      if (!card_reader) break;
+      const hardware::RtsxDriver::Outcome outcome = card_reader->start(pci, d, register_mapper);
+      Entry(outcome == hardware::RtsxDriver::Outcome::Started ? Level::Ok : Level::Warning, "Storage").text("SD card reader: ").text(hardware::RtsxDriver::outcome_name(outcome));
+      if (outcome == hardware::RtsxDriver::Outcome::Started) {
+        sd_slot = UniquePointer<hardware::SdSlotSource>::make(shared_allocator, *card_reader->host(), shared_allocator);
+        if (sd_slot) storage.add_source(sd_slot.get());
+      } else {
+        card_reader = UniquePointer<hardware::RtsxDriver>();
+      }
+    }
+  }
+#endif
 #ifdef TCOS_SELFTESTS
   if (!run_storage_demo(storage, shared_allocator)) console::puts("  storage self-check incomplete\n");
   if (!run_filesystem_demo(storage, shared_allocator)) console::puts("  filesystem self-check incomplete\n");
