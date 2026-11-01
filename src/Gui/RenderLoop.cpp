@@ -61,10 +61,14 @@ void RenderLoop::run() {
       // watchdog: limit render time to prevent UI lockup from slow/hanging operations
       // If previous render took too long, enter a degraded mode to ensure UI responds
       if (last_render_time_us > kRenderTimeoutUs) {
-        // Render took too long previously, force a refresh to ensure UI responds
+        // The previous render was slow, so yield once instead of redrawing right away (a burst of
+        // pending changes coalesces into the next frame). Reset the counter on the way through:
+        // leaving it set would re-enter this branch every loop and never render again, so a single
+        // slow frame would freeze the window until the process restarted.
         window_.mark_dirty();
         kernel::sleep_us(kFramePauseUs);
         last_frame_us = hardware::uptime_us();
+        last_render_time_us = 0;
         continue;
       }
       

@@ -89,15 +89,17 @@ void Window::mark_dirty() {
 }
 
 void Window::render() {
+  graphics::IRenderer2D* r = nullptr;   // the renderer for this frame, captured under the UI lock and presented on after it: a swap of renderer_ by another thread cannot pull a different (or freed) renderer out from under us mid-frame
   {
     UiGuard lock(this);
+    r = renderer_;
     // Layout comes first and the flag is cleared after it: controls adjust themselves while laying out (scroll bars, visibility) and so ask for a
     // repaint, which this frame is about to give. Cleared before, those requests would start another frame, whose layout asks again, and a window
     // holding a grid or list would repaint non-stop. Changes made while we draw (below) still ask for the next frame.
     layout();
     __atomic_store_n(&dirty_, false, __ATOMIC_RELEASE);
     __atomic_store_n(&frame_interval_us_, uint64_t{0}, __ATOMIC_RELEASE);
-    Painter painter(*renderer_, theme_);
+    Painter painter(*r, theme_);
     paint_tree(painter);
     if (popup_) popup_->paint_tree(painter);
     if (drag_source_) {
@@ -160,8 +162,9 @@ void Window::render() {
     }
   }
   // Presenting needs no access to the controls: the UI may change while the frame goes out.
-  renderer_->reset_clip();
-  renderer_->present();
+  // Present on the same renderer we painted (captured under the lock above).
+  r->reset_clip();
+  r->present();
 }
 
 // --- Input -------------------------------------------------------------------
