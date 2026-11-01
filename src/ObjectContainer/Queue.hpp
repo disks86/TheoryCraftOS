@@ -97,7 +97,10 @@ class Queue final : public IObjectContainer<T> {
 
   template <class U>
   bool emplace(U&& value) {
-    if (size_ == storage_.size() && !reserve(storage_.size() ? storage_.size() * 2 : 8)) return false;
+    // Cap the doubled capacity so the arithmetic cannot wrap (a wrapped capacity would make
+    // reserve() a silent no-op and the placement-new land one slot past the allocation).
+    const uint64_t grown = storage_.size() <= UINT64_MAX / 2 ? storage_.size() * 2 : UINT64_MAX;
+    if (size_ == storage_.size() && !reserve(storage_.size() ? grown : 8)) return false;
     new (slot(size_)) T(static_cast<U&&>(value));
     ++size_;
     return true;

@@ -126,8 +126,11 @@ class List final : public IObjectContainer<T> {
   bool emplace_at(uint64_t index, U&& value) {
     if (index > size_) return false;
     
-    // Check for potential double allocation when growing
-    if (size_ == storage_.size() && !reserve(storage_.size() ? storage_.size() * 2 : 8)) 
+    // Check for potential double allocation when growing; cap the doubled capacity so the
+    // arithmetic cannot wrap (a wrapped capacity would make reserve() a silent no-op and the
+    // placement-new land one slot past the allocation). Matches ByteBuffer/String.
+    const uint64_t grown = storage_.size() <= UINT64_MAX / 2 ? storage_.size() * 2 : UINT64_MAX;
+    if (size_ == storage_.size() && !reserve(storage_.size() ? grown : 8))
       return false;
       
     // Open a gap: the last element moves into raw memory, the rest assign upward.
