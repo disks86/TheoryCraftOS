@@ -1,5 +1,17 @@
 # TheoryCraftOS
 
+## Goal
+The goal of this project is to produce a Computer Operating system with the following key features.
+- High stability
+- High performance
+- High Concurrency
+- Mega Kernel (Most common feature built into kernel instead of userland)
+- Simple desktop user experience
+- Run applications from Linux or Windows by emulating SYSCALL interface and any needed usermode libraries.
+- Run applications compiled for different architectures by using a binary recompiler.
+- Support a wide range of x86, ARM, and RISC-V hardware.
+- Support Hardware accerlators and special instructions whenever possible.
+
 ## Memory safety
 
 Write new code so that memory errors cannot happen, not so that they are unlikely:
