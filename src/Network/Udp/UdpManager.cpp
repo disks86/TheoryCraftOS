@@ -22,8 +22,11 @@
 namespace network {
 
 bool UdpManager::port_in_use(uint16_t port) const {
-  for (const SharedPointer<UdpSocket>& s : sockets_)
+  const uint64_t count = sockets_.count();
+  for (uint64_t i = count; i > 0; --i) {
+    const SharedPointer<UdpSocket>& s = sockets_[i - 1];
     if (s->local_port() == port && !s->closed()) return true;
+  }
   return false;
 }
 
