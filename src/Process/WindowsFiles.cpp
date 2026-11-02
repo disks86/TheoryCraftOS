@@ -484,6 +484,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (files.kind(slot) == DescriptorKind::File) {
     OpenObject* opened = files.object(slot);
     opened->granted_access = access;
+    opened->async_io = (options & 0x30) == 0;
     if (opened->no_data_access) opened->readable = false;      // (a handle for attributes only reads nothing)
     opened->writable = (access & (kGenericAll | kGenericWrite | kFileWriteData | kFileAppendData)) != 0;      // (an overwrite writes through the file system's own handle, not the program's)
   }
@@ -548,6 +549,7 @@ uint32_t file_io_core(Process& p, const SyscallRequest& r, bool write, const IoC
   uint64_t requested = 0;
   uint32_t status = read_offset(p, offset_pointer, &requested);
   if (status != kSuccess) return status;
+  if (int64_t(requested) < 0 && requested != kUseFilePointer && requested != kWriteToEnd) return kInvalidParameter;      // (a negative offset other than the two special ones)
   uint64_t at = requested == kUseFilePointer ? object.position : requested;
   if (requested == kWriteToEnd) {
     if (!write) return kInvalidParameter;
@@ -587,7 +589,17 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   if (p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
   IoCall call;
   if (const uint32_t refused = io_call_begin(p, slot, r, &call)) return refused;
-  return io_call_end(p, slot, call, file_io_core(p, r, write, call));
+  uint32_t status = file_io_core(p, r, write, call);
+  const OpenObject* opened = p.files().kind(slot) == DescriptorKind::File ? p.files().object(slot) : nullptr;
+  const bool asynchronous = opened && opened->async_io && !call.wait && (call.event_handle != 0 || call.apc != 0 || call.context != 0);
+  if (asynchronous && (status == kSuccess || status == kEndOfFile || (status >> 30) == 2)) {      // a handle opened for overlapped calls: the call is done here, but it answers as the file system would, pending
+    uint64_t information = 0;
+    if (call.status_block != 0) p.read_user_u64(call.status_block + 8, &information);
+    io_call_completed(p, slot, call, status, information);
+    return 0x103;
+  }
+  // (a read from a handle opened for synchronous calls does not queue its APC; a call that ran into the end of the file has still completed)
+  return io_call_end(p, slot, call, status, write || !opened, status == kEndOfFile);
 }
 
 // --- queries

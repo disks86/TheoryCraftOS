@@ -41,7 +41,7 @@ struct IoCall {
 uint32_t io_call_begin(Process& p, uint64_t slot, const SyscallRequest& r, IoCall* call);
 // The end of a call that did not wait (`status` is its result): a call that failed leaves the IO_STATUS_BLOCK as it was; one that went through signals the event, queues the
 // APC and tells the port. STATUS_PENDING is passed through. Returns `status`.
-uint32_t io_call_end(Process& p, uint64_t slot, const IoCall& call, uint32_t status);
+uint32_t io_call_end(Process& p, uint64_t slot, const IoCall& call, uint32_t status, bool apc_allowed = true, bool completes_with_error = false);
 // The completion port a handle is tied to (NtSetInformationFile FileCompletionInformation), with the key and the FILE_SKIP_* flags.
 bool io_handle_port(Process& p, uint64_t slot, uint32_t* port, uint64_t* key, uint32_t* flags);
 // The call ended before it returned (`status` is a success or a warning): the event is set, the APC queued for the calling thread, the port told.

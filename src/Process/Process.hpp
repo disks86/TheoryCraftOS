@@ -291,6 +291,7 @@ class Process {
     Apc apcs[kMaxApcs];
     uint32_t apc_count = 0;
     uint64_t start_address = 0;                       // where the thread began (the start routine), 0 if not known
+    uint32_t completion_port = 0;                     // the I/O completion port object the thread took a packet from last (while it is associated with one, its packets go before its APCs)
     int32_t priority = 0;                             // THREAD_PRIORITY_NORMAL; kept for the program to read back
     static constexpr uint32_t kMaxDescriptionChars = 255;
     uint16_t description[kMaxDescriptionChars] = {};  // SetThreadDescription

@@ -3723,7 +3723,7 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     options &= ~(ULONG)FILE_NON_DIRECTORY_FILE_;
     options |= FILE_DIRECTORY_FILE_;
   }
-  if (is_pipe && (flags & 0x40000000u /* FILE_FLAG_OVERLAPPED */)) options &= ~(ULONG)FILE_SYNCHRONOUS_IO_NONALERT_;
+  if (flags & 0x40000000u /* FILE_FLAG_OVERLAPPED: the calls on the handle are overlapped */) options &= ~(ULONG)FILE_SYNCHRONOUS_IO_NONALERT_;
   if (flags & 0x00200000u /* FILE_FLAG_OPEN_REPARSE_POINT */) options |= 0x00200000u;      /* FILE_OPEN_REPARSE_POINT: a link is opened itself */
   HANDLE handle = NULL;
   IO_STATUS_BLOCK iosb;

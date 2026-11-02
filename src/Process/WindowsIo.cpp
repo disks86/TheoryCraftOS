@@ -88,15 +88,19 @@ uint32_t io_call_begin(Process& p, uint64_t slot, const SyscallRequest& r, IoCal
   return kSuccess;
 }
 
-uint32_t io_call_end(Process& p, uint64_t slot, const IoCall& call, uint32_t status) {
+uint32_t io_call_end(Process& p, uint64_t slot, const IoCall& call, uint32_t status, bool apc_allowed, bool completes_with_error) {
   if (status == 0x103) return status;
-  if ((status >> 30) == 3 || status == kUserApc) {      // an error: nothing completes
+  if (((status >> 30) == 3 && !completes_with_error) || status == kUserApc) {      // an error: nothing completes
     if (call.saved) p.write_user(call.status_block, ConstByteView(call.status_block_before, 16));
     return status;
   }
   uint64_t information = 0;
   if (call.status_block != 0) p.read_user_u64(call.status_block + 8, &information);
-  if (call.event_handle != 0 || call.apc != 0 || call.context != 0) io_call_completed(p, slot, call, status, information);
+  if (call.event_handle != 0 || call.apc != 0 || call.context != 0) {
+    IoCall completed = call;
+    if (!apc_allowed) completed.apc = 0;
+    io_call_completed(p, slot, completed, status, information);
+  }
   if (call.event_object == 0 && p.files().kind(slot) == DescriptorKind::Pipe) pipe_handle_signal(p, slot);      // (a call that went through without an event of its own signals the file object)
   return status;
 }
@@ -246,19 +250,21 @@ uint32_t wait_port(Process& p, uint32_t port, uint64_t timeout_ns, bool alertabl
   sync.lock();
   for (;;) {
     if (objects->io_ready() != 0) { sync.unlock(); io_reap(p); sync.lock(); }
-    if (objects->port_depth_locked(port) != 0) {      // a packet that is there is taken before any queued call is run
-      while (*count < max && objects->port_remove_locked(port, &packets[*count])) ++*count;
-      sync.unlock();
-      return kSuccess;
-    }
-    if (alertable && runtime) {
+    Process::ThreadRecord* me = p.find_thread(waiter);
+    if (alertable && runtime) {      // an APC queued for the thread goes before a packet - until the thread has taken a packet from this port: after that the packets go first
       ObjectManager::TimerApc fired[8];
       uint32_t fired_count = 0;
       objects->take_timer_apcs_locked(waiter, fired, 8, &fired_count);
-      Process::ThreadRecord* me = p.find_thread(waiter);
       for (uint32_t i = 0; me && i < fired_count; ++i) Process::queue_apc(*me, Process::ThreadRecord::Apc{fired[i].routine, fired[i].context, fired[i].time & 0xFFFFFFFFu, fired[i].time >> 32});
-      if (me && me->apc_count > 0) { sync.unlock(); return kUserApc; }
+      if (me && me->apc_count > 0 && me->completion_port != port) { sync.unlock(); return kUserApc; }
     }
+    if (objects->port_depth_locked(port) != 0) {
+      while (*count < max && objects->port_remove_locked(port, &packets[*count])) ++*count;
+      if (me) me->completion_port = port;      // (the thread is associated with the port now)
+      sync.unlock();
+      return kSuccess;
+    }
+    if (alertable && runtime && me && me->apc_count > 0) { sync.unlock(); return kUserApc; }
     if (!objects->is_port_locked(port)) { sync.unlock(); return 0xC0000008u; }
     if (timeout_ns == 0) { sync.unlock(); return kTimeout; }
     uint64_t left = ~uint64_t{0};
