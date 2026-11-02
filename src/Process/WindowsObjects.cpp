@@ -41,7 +41,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -53,6 +53,8 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::ChangeNotification: return DescriptorKind::ChangeNotification;
     case ObjectKind::DebugObject: return DescriptorKind::DebugObject;
     case ObjectKind::Token: return DescriptorKind::Token;
+    case ObjectKind::KeyedEvent: return DescriptorKind::KeyedEvent;
+    case ObjectKind::IoCompletion: return DescriptorKind::IoCompletion;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -63,6 +65,8 @@ bool slot_of(uint64_t handle, uint64_t* slot) {
   *slot = handle / 4 - 1;
   return true;
 }
+
+constexpr char kSessionMark = 1;      // (the first character of a name in the directory of the session, Sessions/1/BaseNamedObjects)
 
 // The name in an OBJECT_ATTRIBUTES, as UTF-8 without the "\BaseNamedObjects\" in front. An object without a name has an empty one.
 uint32_t read_name(Process& p, uint64_t attributes, char* out, uint32_t capacity, uint32_t* size) {
@@ -108,6 +112,23 @@ uint32_t read_name(Process& p, uint64_t attributes, char* out, uint32_t capacity
   if (has_prefix) {
     for (uint32_t i = plen; i < n; ++i) out[i - plen] = out[i];
     n -= plen;
+  } else {
+    // "Sessions/<n>/BaseNamedObjects/Name" (with backslashes): the directory of a session; a name of it starts with kSessionMark (a name asked for later says which directory it is in).
+    static const char sessions[] = "\\sessions\\", base[] = "\\basenamedobjects\\";
+    uint32_t at = sizeof(sessions) - 1;
+    bool match = n > at;
+    for (uint32_t i = 0; match && i < at; ++i) match = (out[i] >= 'A' && out[i] <= 'Z' ? char(out[i] + 32) : out[i]) == sessions[i];
+    uint32_t digits = 0;
+    while (match && at + digits < n && out[at + digits] >= '0' && out[at + digits] <= '9') ++digits;
+    match = match && digits != 0;
+    at += digits;
+    for (uint32_t i = 0; match && i < sizeof(base) - 1; ++i) match = at + i < n && (out[at + i] >= 'A' && out[at + i] <= 'Z' ? char(out[at + i] + 32) : out[at + i]) == base[i];
+    if (match) {
+      at += sizeof(base) - 1;
+      for (uint32_t i = at; i < n; ++i) out[i - at + 1] = out[i];
+      out[0] = kSessionMark;
+      n = n - at + 1;
+    }
   }
   for (uint32_t i = 0; i < n; ++i) if (out[i] == '\\' ) return kNameInvalid;      // (a name has no folders)
   *size = n;
@@ -145,6 +166,8 @@ bool kind_access(DescriptorKind kind, KindAccess* out) {
     case DescriptorKind::Thread: *out = {0x1FFFFFu, {0x20048u, 0x20037u, 0x120000u, 0x1FFFFFu}}; return true;
     case DescriptorKind::Key: *out = {0xF003Fu, {0x20019u, 0x20006u, 0x20019u, 0xF003Fu}}; return true;
     case DescriptorKind::Token: *out = {0xF01FFu, {0x20018u, 0x200E0u, 0x20000u, 0xF01FFu}}; return true;
+    case DescriptorKind::KeyedEvent: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::IoCompletion: *out = {0x1F0003u, {0x120001u, 0x120002u, 0x120000u, 0x1F0003u}}; return true;
     case DescriptorKind::DebugObject: *out = {0x1F000Fu, {0x20001u, 0x20002u, 0x120000u, 0x1F000Fu}}; return true;
     case DescriptorKind::File: case DescriptorKind::Directory: case DescriptorKind::Pipe: *out = {0x1F01FFu, {0x120089u, 0x120116u, 0x1200A0u, 0x1F01FFu}}; return true;
     default: return false;
@@ -1025,6 +1048,11 @@ uint32_t nt_create_debug_object(Process& p, const SyscallRequest& r) {
   return status;
 }
 uint32_t nt_open_job_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Job); }
+// Keyed events and I/O completion ports are made and found by name here; the waiting and queueing of them is not done yet.
+uint32_t nt_create_keyed_event(Process& p, const SyscallRequest& r) { return r.args[3] != 0 ? kInvalidParameter : create_object(p, r, ObjectKind::KeyedEvent, false, false, 0, 0); }      // (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG Flags)
+uint32_t nt_open_keyed_event(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::KeyedEvent); }
+uint32_t nt_create_io_completion(Process& p, const SyscallRequest& r) { return create_object(p, r, ObjectKind::IoCompletion, false, false, 0, 0); }      // (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG Count)
+uint32_t nt_open_io_completion(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::IoCompletion); }
 
 namespace {
 
@@ -1293,16 +1321,19 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
       ObjectManager* objects = system_objects();
       char text[ObjectManager::kNameBytes];
       const uint32_t chars = is_object_kind(p.files().kind(slot)) && objects ? objects->object_name(uint32_t(p.files().token(slot)), text, sizeof(text)) : 0;
-      static const char kPrefix[] = "\\BaseNamedObjects\\";
-      const uint32_t prefix = chars ? sizeof(kPrefix) - 1 : 0, bytes = 2 * (prefix + chars), need = 16 + bytes + 2;
+      const bool in_session = chars != 0 && text[0] == kSessionMark;
+      const char* kPrefix = in_session ? "\\Sessions\\1\\BaseNamedObjects\\" : "\\BaseNamedObjects\\";
+      const uint32_t kPrefixSize = in_session ? 30 : 19;      // (with the end of the string)
+      const uint32_t skip = in_session ? 1 : 0;      // (the mark is not part of the name)
+      const uint32_t prefix = chars ? kPrefixSize - 1 : 0, bytes = 2 * (prefix + chars - skip), need = 16 + bytes + 2;
       if (returned != 0 && !p.write_user_u32(returned, need)) return kAccessViolation;
       if (length < need) return 0xC0000004u;
-      uint8_t full[16 + 2 * (sizeof(kPrefix) + ObjectManager::kNameBytes)] = {};
+      uint8_t full[16 + 2 * (32 + ObjectManager::kNameBytes)] = {};
       full[0] = uint8_t(bytes); full[1] = uint8_t(bytes >> 8); full[2] = uint8_t(bytes + 2); full[3] = uint8_t((bytes + 2) >> 8);
       const uint64_t text_at = r.args[2] + 16;
       for (uint32_t i = 0; i < 8; ++i) full[8 + i] = uint8_t(text_at >> (8 * i));
       for (uint32_t i = 0; i < prefix; ++i) full[16 + 2 * i] = uint8_t(kPrefix[i]);
-      for (uint32_t i = 0; i < chars; ++i) full[16 + 2 * (prefix + i)] = uint8_t(text[i]);
+      for (uint32_t i = skip; i < chars; ++i) full[16 + 2 * (prefix + i - skip)] = uint8_t(text[i]);
       return p.write_user(r.args[2], ConstByteView(full, need)) ? kSuccess : kAccessViolation;
     }
     case 2: {    // OBJECT_TYPE_INFORMATION (the name only: a UNICODE_STRING and its characters)
@@ -1317,6 +1348,8 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Section: type = "Section"; break;
         case DescriptorKind::Job: type = "Job"; break;
         case DescriptorKind::DebugObject: type = "DebugObject"; break;
+        case DescriptorKind::KeyedEvent: type = "KeyedEvent"; break;
+        case DescriptorKind::IoCompletion: type = "IoCompletion"; break;
         case DescriptorKind::Token: type = "Token"; break;
         case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
         case DescriptorKind::Mailslot: type = "Mailslot"; break;
