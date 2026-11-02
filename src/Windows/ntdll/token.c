@@ -332,7 +332,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtDuplicateToken(HANDLE source, ACCESS_MASK
         }
     }
     status = create_token(t, access, attr && (attr->Attributes & OBJ_INHERIT), out);
-    if (!status && attr && attr->SecurityDescriptor && ((SECURITY_DESCRIPTOR *)attr->SecurityDescriptor)->Control & SE_DACL_PRESENT) {
+    if (!status && attr && attr->SecurityDescriptor && (((SECURITY_DESCRIPTOR *)attr->SecurityDescriptor)->Control & (SE_DACL_PRESENT | SE_SACL_PRESENT)) == SE_DACL_PRESENT) {
         ULONG length = RtlLengthSecurityDescriptor(attr->SecurityDescriptor);
         BYTE *rel = heap_new(length + 16);
         if (rel) {
@@ -607,7 +607,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtQueryInformationToken(HANDLE token, TOKEN
                 e->npriv = 0;
                 for (i = 0; i < sizeof(limited_privileges); ++i) { e->priv[e->npriv].Luid.LowPart = limited_privileges[i]; e->priv[e->npriv].Luid.HighPart = 0; e->priv[e->npriv++].Attributes = limited_privileges[i] == 8 ? 0 : limited_privileges[i] == 23 && to_full ? 3 : 1; }
                 if (to_full) for (i = 0; i < sizeof(full_privileges); ++i) { e->priv[e->npriv].Luid.LowPart = full_privileges[i]; e->priv[e->npriv].Luid.HighPart = 0; e->priv[e->npriv++].Attributes = 0; }
-                RtlCreateAcl(acl, sizeof(e->dacl), ACL_REVISION);
+                RtlCreateAcl(acl, 64, ACL_REVISION);
                 RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x10000000, (PSID)admins);
                 RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x10000000, (PSID)system_sid);
                 e->has_dacl = TRUE;

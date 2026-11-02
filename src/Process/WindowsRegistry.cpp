@@ -151,6 +151,13 @@ uint32_t nt_create_key(Process& p, const SyscallRequest& r) {
   uint32_t disposition = 0;
   const uint32_t status = open_or_create(p, r, true, &disposition);
   if (status == kSuccess && disposition_at != 0 && !p.write_user_u32(disposition_at, disposition)) return kAccessViolation;
+  uint64_t handle = 0;
+  if (status == kSuccess && p.read_user_u64(r.args[0], &handle) && handle != 0) {      // the handle holds the rights asked for
+    static const security::GenericMapping kKeyMapping = {0x20019, 0x20006, 0x20019, 0xF003F};
+    uint32_t want = uint32_t(r.args[1]);
+    uint32_t rights = (want & 0x02000000u) ? kKeyMapping.all : kKeyMapping.map(want);
+    p.files().set_denied_access(handle / 4 - 1, ~rights);
+  }
   return status;
 }
 // A key that was opened is held to its descriptor (if it has one): the rights asked for must be allowed to the calling thread; if not, the handle is closed again.

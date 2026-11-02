@@ -471,7 +471,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
     note_times(p, virtual_path.view(), 4);
     notify_entry_modified(p, virtual_path.view(), (before.size != 0 ? ObjectManager::kChangeSize : 0) | ObjectManager::kChangeLastWrite);
   }
-  if (created && (file_attributes & kAttributeReadOnly)) {
+  if ((created || (existed && f.truncate)) && (file_attributes & kAttributeReadOnly)) {      // (a file that is overwritten takes the attributes asked for too)
     filesystem::MetadataChange change;
     change.set_read_only = true;
     change.read_only = true;

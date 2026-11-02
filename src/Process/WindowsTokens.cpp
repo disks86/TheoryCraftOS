@@ -507,7 +507,7 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
           if (!o || o->path.size() >= 260) return kInvalidHandle;
           for (uint64_t i = 0; i < o->path.size(); ++i) key[i] = o->path.view()[i];
           key_size = uint32_t(o->path.size());
-          granted_mask = o->granted_access;
+          granted_mask = o->granted_access == 0xFFFFFFFFu ? o->granted_access : (o->granted_access & kMaximumAllowed) ? 0xFFFFFFFFu : (kFileMapping.map(o->granted_access) | 0x100000u);      // (the generic rights spelled out; SYNCHRONIZE is not asked for)
           break;
         }
         case DescriptorKind::Process: {
