@@ -81,6 +81,10 @@ class RiscV64Cpu final : public IGuestCpu {
     uint64_t menvcfg = 0, senvcfg = 0, mcounteren = 0, scounteren = 0, mcountinhibit = 0, mcycle = 0, minstret = 0;
     uint64_t pmpaddr[16] = {};
     uint8_t pmpcfg[16] = {};
+    // the hypervisor extension: v is the virtualization mode (priv 0/1 with v set are VU and VS mode)
+    bool v = false;
+    uint64_t hstatus = uint64_t{2} << 32, hedeleg = 0, hideleg = 0, hvip = 0, hgeie = 0, hcounteren = 0, htimedelta = 0, henvcfg = 0, hgatp = 0, htval = 0, htinst = 0, mtval2 = 0, mtinst = 0;
+    uint64_t vsstatus = (uint64_t{2} << 32) | (uint64_t{2} << 34), vstvec = 0, vsscratch = 0, vsepc = 0, vscause = 0, vstval = 0, vsatp = 0, vstimecmp = 0;
   };
   System& system_state() { return sys_; }
   const System& system_state() const { return sys_; }
@@ -106,8 +110,13 @@ class RiscV64Cpu final : public IGuestCpu {
 
   // privileged mode (RiscV64Privileged.cpp)
   enum class Access : uint8_t { Fetch, Load, Store };
-  struct Translation { uint64_t physical; uint8_t cause; bool ok; };
+  struct Translation { uint64_t physical; uint8_t cause; bool ok; uint64_t tval2 = 0; bool guest = false; };
+  struct Walk { uint64_t address; uint8_t cause; bool ok; uint64_t tval2; };
   Translation translate(uint64_t address, Access access, uint32_t size);
+  Walk walk_stage(uint64_t address, Access access, uint64_t atp, bool gstage, uint8_t priv, bool sum, bool mxr, bool adue, bool pbmte, bool nested, uint8_t original_access);
+  Step virtual_instruction();
+  Step sys_hlv(uint32_t insn);
+  bool access_context(Access access, uint8_t* priv, bool* virt) const;
   bool pmp_allows(uint64_t physical, uint32_t size, Access access, uint8_t priv) const;
   bool sys_read(uint64_t address, uint32_t size, Access access, uint64_t* out);
   bool sys_write(uint64_t address, uint32_t size, uint64_t value);
@@ -142,7 +151,11 @@ class RiscV64Cpu final : public IGuestCpu {
   IRiscVBus* bus_ = nullptr;
   GuestMemory* placeholder_ = nullptr;
   uint32_t raw_instruction_ = 0;      // the instruction as fetched (the 16 bits of a compressed one), for xtval
-  uint64_t trap_cause_ = 0, trap_tval_ = 0;
+  uint64_t trap_cause_ = 0, trap_tval_ = 0, trap_tval2_ = 0;
+  bool trap_gva_ = false;      // the trap value is a guest virtual address
+  bool hlvx_ = false;
+  bool hlv_ = false;      // inside hlv / hsv: the access is made as the guest, with the privilege in hstatus.SPVP
+  uint8_t hlv_priv_ = 0;
   bool jumped_ = false;      // mret / sret set the pc themselves
   bool amo_ = false;      // inside an atomic: its load part checks for write permission
   GuestFault fault_;

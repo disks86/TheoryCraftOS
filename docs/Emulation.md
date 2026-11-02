@@ -157,8 +157,12 @@ AArch64 uses, so files, pipes, `mmap` and `clone` are shared with every other ki
   are checked in (`tests/data/emulation/riscv-sys*`) so `EmulationTest` runs them under the sanitizers, together with bit-flipped and truncated images and random instruction words at random privilege levels.
   Also there: Svpbmt (the type bits are checked, `menvcfg.PBMTE` on from reset), Svnapot (64 KiB pages) and Svadu (`menvcfg.ADUE`: the hart sets A and D itself, otherwise Svade's fault), all against qemu; and the PLIC (qemu virt's register layout, 96 sources, a machine and a
   supervisor context) with the UART's transmit-empty interrupt as source 10, which gives machine and supervisor external interrupts.
-  **Not done**: the H extension (hypervisor), hardware performance counters (reads trap, as with `pmu-num=0`), Smepmp, the debug trigger module, multiple harts, Zcmt/Zcmp (their encodings are `c.fsdsp`/`c.fld` with Zcd), other PLIC sources (no other devices exist), the APLIC/IMSIC. Booting OpenSBI or Linux was left out on purpose (no hardware to run it on; the aim is UEFI).
-- **Not implemented** (an invalid-instruction fault, never a wrong result): H, RV32, Zcmt, Zicfiss shadow-stack semantics (the mops write zero).
+  The **H extension** is there too: virtualization mode (VS and VU), the hypervisor and VS CSRs (hstatus, hedeleg/hideleg, hvip, hgatp, htimedelta, henvcfg, vsstatus ... vsatp, vstimecmp, mtval2), traps routed to M, HS or the guest, the VS interrupts, two-stage translation
+  (Sv39/48/57 for the guest, Sv39x4/48x4/57x4 for the host, implicit-access guest page faults with htval, Svadu/Svpbmt per stage), hlv / hsv / hlvx, hfence.vvma / hfence.gvma, and the virtual-instruction exception (wfi, sret, sfence.vma and satp under VTW / VTSR / VTVM, hypervisor
+  CSRs and counters from the guest). Payloads `sys5.S` to `sys7.S` check it against qemu with `h=true`. qemu cannot set `mstatus.MPV` with a CSR write, so the payloads enter the guest through HS mode (`hstatus.SPV` and `sret`) and `mstatus.MPV` writes are untested; qemu also leaves
+  some H CSRs sloppy (hstatus, vsepc and hie keep bits they should not), which the probes mask out; `mtinst` / `htinst` stay zero here (the architecture allows it; qemu fills in a transformed instruction).
+  **Not done**: guest external interrupts (GEILEN is 0: hgeie/hgeip are zero), the transformed instruction in htinst/mtinst, hardware performance counters (reads trap, as with `pmu-num=0`), Smepmp, the debug trigger module, multiple harts, Zcmt/Zcmp (their encodings are `c.fsdsp`/`c.fld` with Zcd), other PLIC sources (no other devices exist), the APLIC/IMSIC. Booting OpenSBI or Linux was left out on purpose (no hardware to run it on; the aim is UEFI).
+- **Not implemented** (an invalid-instruction fault, never a wrong result): RV32, Zcmt, Zicfiss shadow-stack semantics (the mops write zero).
 
 ## AVX, AVX2, FMA, BMI, F16C
 

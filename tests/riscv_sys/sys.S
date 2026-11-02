@@ -21,7 +21,7 @@ test_csrs:
   addi sp, sp, -16
   sd ra, 0(sp)
   CSRPROBE misa
-  CSRPROBE mstatus
+  CSRPROBE mstatus, 0xFFFFFF3FFFFFFFFF
   CSRPROBE medeleg, 0xFBFF
   CSRPROBE mideleg, 0x222
   CSRPROBE mie, 0xFFF
