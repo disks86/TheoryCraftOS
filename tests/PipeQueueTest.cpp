@@ -80,7 +80,7 @@ struct Fixture {
     std::vector<uint8_t> data(n, v);
     uint32_t tag = 0, moved = 0;
     Lock hold(sync);
-    const Result r = objects.pipe_begin_write_locked(id, code(end), ConstByteView(data.data(), data.size()), 7, async, &tag, &moved);
+    const Result r = objects.pipe_begin_write_locked(id, code(end), ConstByteView(data.data(), data.size()), 7, &tag, &moved);
     if (done) *done = moved;
     if (r == Result::Ok) { return 0; }
     CHECK(r == Result::WouldBlock);
@@ -89,9 +89,18 @@ struct Fixture {
   uint32_t read_async(uint32_t end, uint32_t length, bool message_mode) {
     uint32_t tag = 0;
     Lock hold(sync);
-    const Result r = objects.pipe_begin_read_locked(id, code(end), length, message_mode, 7, true, &tag);
+    const Result r = objects.pipe_begin_read_locked(id, code(end), length, message_mode, 7, &tag);
     if (r != Result::WouldBlock) return 0;
     return tag;
+  }
+  void read_all(uint32_t end) {      // takes everything that waits for this end
+    std::vector<uint8_t> sink(20000);
+    uint32_t got = 1;
+    while (got != 0) {
+      Lock hold(sync);
+      got = 0;
+      if (objects.pipe_read_locked(id, code(end), sink.data(), uint32_t(sink.size()), &got) != Result::Ok) break;
+    }
   }
   uint32_t available(uint32_t end, uint32_t* message = nullptr) {
     uint8_t probe[1];
@@ -259,7 +268,7 @@ static void test_transact() {
   const std::vector<uint8_t> abc = {'a', 'b', 'c'};
   {
     Fixture::Lock hold(f.sync);
-    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 100, true, 7, true, &tag) == Result::WouldBlock && tag != 0);
+    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 100, true, 7, &tag) == Result::WouldBlock && tag != 0);
   }
   std::vector<uint8_t> data;
   CHECK(f.read(1, 100, &data, true) == Result::Ok && data.size() == 3 && data[2] == 'c');
@@ -271,8 +280,8 @@ static void test_transact() {
   CHECK(f.write(1, 1, 'u') == 0);
   {
     Fixture::Lock hold(f.sync);
-    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 100, true, 7, true, &tag) == Result::Busy);
-    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 100, false, 7, true, &tag) == Result::InvalidState);
+    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 100, true, 7, &tag) == Result::Busy);
+    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 100, false, 7, &tag) == Result::InvalidState);
   }
   CHECK(f.read(0, 10, &data, true) == Result::Ok);
   // a write that waits for room stays when the answer is cancelled
@@ -280,7 +289,7 @@ static void test_transact() {
   const uint32_t pending = f.write(0, 2000, 'x');
   {
     Fixture::Lock hold(f.sync);
-    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 10, true, 7, true, &tag) == Result::WouldBlock);
+    CHECK(f.objects.pipe_begin_transact_locked(f.id, f.server, ConstByteView(abc.data(), 3), 10, true, 7, &tag) == Result::WouldBlock);
   }
   CHECK(f.cancel(0, tag));
   f.objects.pipe_op_release(f.id, tag);
@@ -289,34 +298,73 @@ static void test_transact() {
   {
     Fixture g(false);
     Fixture::Lock hold(g.sync);
-    CHECK(g.objects.pipe_begin_transact_locked(g.id, g.server, ConstByteView(abc.data(), 3), 10, true, 7, true, &tag) == Result::InvalidState);
+    CHECK(g.objects.pipe_begin_transact_locked(g.id, g.server, ConstByteView(abc.data(), 3), 10, true, 7, &tag) == Result::InvalidState);
   }
 }
 
-// The operations that other threads wait for: whoever finishes one waits until it was acted on.
-static void test_delivery() {
+// A call that waits becomes a request of the pipe (pipe_pend_locked): when the peer writes, the request ends with the bytes and the count, in the order calls finish; cancelling the
+// operation ends it with the status; closing the end cancels the calls of that end and breaks the ones of the other.
+static void test_requests() {
   Fixture f(false);
-  const uint32_t r = f.read_async(1, 100, false);
-  CHECK(r);
-  std::atomic<bool> got{false};
-  std::thread helper([&] {      // (the thread of the operation: waits for it, acts on it, releases it)
-    for (;;) {
-      std::vector<uint8_t> data;
-      uint32_t status = 0, transferred = 0;
-      const int p = f.poll(1, r, &status, &transferred, &data);
-      if (p == 2) { got = transferred == 5; std::this_thread::sleep_for(std::chrono::milliseconds(20)); f.objects.pipe_op_release(f.id, r); return; }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  });
-  CHECK(f.write(0, 5, 'z') == 0);
-  bool delivered = false;
-  for (int i = 0; i < 200 && !delivered; ++i) {
-    { Fixture::Lock hold(f.sync); delivered = f.objects.pipe_delivered_locked(f.id); }
-    if (!delivered) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const uint32_t read_tag = f.read_async(1, 100, false);
+  CHECK(read_tag);
+  io::IoRequest base;
+  base.owner = 7; base.thread = 70; base.status_block = 0x1000; base.buffer = 0x2000; base.buffer_length = 100;
+  uint32_t read_request = 0, write_request = 0;
+  {
+    Fixture::Lock hold(f.sync);
+    CHECK(f.objects.pipe_pend_locked(f.id, f.code(1), read_tag, base, true));
+    io::IoRequest* r = f.objects.io_find_locked(1);      // (the first request made by this manager)
+    CHECK(r && r->source == f.id && r->source_end == 1 && r->source_tag == read_tag && !r->completed);
+    read_request = r ? r->id : 0;
+    CHECK(!f.objects.pipe_file_signaled_locked(f.id, f.code(1)));      // (a call under way: the file object is not signalled)
   }
-  CHECK(delivered);
-  helper.join();
-  CHECK(got);
+  CHECK(f.write(0, 5, 'z') == 0);
+  io::IoRequest done[4];
+  CHECK(f.objects.io_ready() == 1);
+  CHECK(f.objects.io_take_completed(8, done, 4) == 0);      // (another process's)
+  CHECK(f.objects.io_take_completed(7, done, 4) == 1);
+  CHECK(done[0].id == read_request && done[0].status == 0 && done[0].information == 5 && done[0].data.size() == 5 && done[0].data[4] == 'z');
+  f.objects.io_dispose(done[0]);
+  CHECK(f.objects.io_ready() == 0);
+  // a write that does not fit waits as a request and is complete when the reader made room
+  const uint32_t write_tag = f.write(0, 9000, 'a');
+  CHECK(write_tag);
+  {
+    Fixture::Lock hold(f.sync);
+    io::IoRequest w = base;
+    w.buffer = 0; w.buffer_length = 0;
+    CHECK(f.objects.pipe_pend_locked(f.id, f.code(0), write_tag, w, true));
+    io::IoRequest* r = f.objects.io_find_locked(2);
+    CHECK(r && r->source_end == 0 && r->source_tag == write_tag);
+    write_request = r ? r->id : 0;
+  }
+  CHECK(f.objects.io_ready() == 0);
+  f.read_all(1);
+  CHECK(f.objects.io_ready() == 1);
+  CHECK(f.objects.io_take_completed(7, done, 4) == 1 && done[0].status == 0 && done[0].information == 9000 && done[0].data.empty());
+  f.objects.io_dispose(done[0]);
+  CHECK(write_request == 2);
+  // cancel by end: a read of the client waits and is cancelled with STATUS_CANCELLED; the request is cancelled with it
+  const uint32_t again = f.read_async(1, 10, false);
+  CHECK(again);
+  {
+    Fixture::Lock hold(f.sync);
+    CHECK(f.objects.pipe_pend_locked(f.id, f.code(1), again, base, true));
+    CHECK(f.objects.io_cancel_locked(f.id, 1, 7, 70, 0x1000, 0xC0000120u) == 1);
+    CHECK(f.objects.io_cancel_locked(f.id, 1, 7, 70, 0x1000, 0xC0000120u) == 0);      // (nothing is left)
+  }
+  CHECK(f.objects.io_take_completed(7, done, 4) == 1 && done[0].status == 0xC0000120u && done[0].information == 0);
+  f.objects.io_dispose(done[0]);
+  // the owner goes: its pending request is dropped
+  const uint32_t third = f.read_async(1, 10, false);
+  {
+    Fixture::Lock hold(f.sync);
+    CHECK(f.objects.pipe_pend_locked(f.id, f.code(1), third, base, true));
+  }
+  f.objects.io_owner_gone(7);
+  CHECK(f.objects.io_ready() == 0);
+  CHECK(f.objects.io_take_completed(7, done, 4) == 0);
 }
 
 // Several threads write, read and cancel at once; every byte that is written and not taken back is read, in order per writer.
@@ -374,8 +422,8 @@ int main() {
   test_break();
   puts("test_transact");
   test_transact();
-  puts("test_delivery");
-  test_delivery();
+  puts("test_requests");
+  test_requests();
   puts("test_threads");
   test_threads();
   if (g_failed) { printf("PipeQueueTest: %d failed\n", int(g_failed)); return 1; }

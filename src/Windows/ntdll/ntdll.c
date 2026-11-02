@@ -703,6 +703,12 @@ EXPORT NTSTATUS NTAPI NtDelayExecution(BOOLEAN alertable, PLARGE_INTEGER interva
   if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
   return status;
 }
+extern NTSTATUS NTAPI RawNtRemoveIoCompletionEx(HANDLE, PVOID, ULONG, PULONG, PLARGE_INTEGER, BOOLEAN);
+EXPORT NTSTATUS NTAPI NtRemoveIoCompletionEx(HANDLE port, PVOID entries, ULONG count, PULONG removed, PLARGE_INTEGER timeout, BOOLEAN alertable) {
+  const NTSTATUS status = RawNtRemoveIoCompletionEx(port, entries, count, removed, timeout, alertable);
+  if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */
+  return status;
+}
 EXPORT NTSTATUS NTAPI NtSignalAndWaitForSingleObject(HANDLE signal, HANDLE wait, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtSignalAndWaitForSingleObject(signal, wait, alertable, timeout);
   if (status == STATUS_USER_APC && !run_apcs()) return STATUS_SUCCESS;      /* (only routine-less ones) */

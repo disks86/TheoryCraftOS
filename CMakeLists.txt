@@ -642,6 +642,8 @@ add_executable(BOOTX64
   src/Process/WindowsSystem.cpp
   src/Process/WindowsModules.cpp
   src/Process/WindowsPipes.cpp
+  src/Process/WindowsIo.cpp
+  src/Process/IoRequest.cpp
   src/Process/WindowsLocks.cpp
   src/Process/WindowsJobs.cpp
   src/Process/WindowsDebug.cpp

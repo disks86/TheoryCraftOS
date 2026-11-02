@@ -24,6 +24,7 @@
 #include "Process/AccessCheck.hpp"
 #include "Process/WindowsTokens.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsIo.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsPipes.hpp"
@@ -456,6 +457,7 @@ uint32_t wait_for(Process& p, const Waitable* items, uint32_t count, bool all, u
   };
   sync.lock();
   for (;;) {
+    if (objects->io_ready() != 0) { sync.unlock(); io_reap(p); sync.lock(); }      // (calls that finished while this one waited are applied to the program: a wait for their event ends)
     if (alertable && runtime) {      // an APC queued for this thread (or a timer of its that fired) ends the wait; the caller's library runs it
       ObjectManager::TimerApc fired[8];
       uint32_t fired_count = 0;

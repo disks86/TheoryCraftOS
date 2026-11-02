@@ -76,7 +76,7 @@ bool Process::close_descriptor(uint64_t slot) {
   if (!files_.close(slot)) return false;
   if (is_object_kind(kind)) if (ObjectManager* objects = system_objects()) objects->release(uint32_t(token));
   if (kind == DescriptorKind::DebugObject) windowsabi::debug_drain_kills(runtime_);
-  if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_release(token);
+  if (kind == DescriptorKind::Pipe) { windowsabi::pipe_handle_closed(*this, token); windowsabi::pipe_token_release(token); }
   if (kind == DescriptorKind::Socket) windowsabi::socket_token_release(token);
   if (kind == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(token);
   if (kind == DescriptorKind::Key) windowsabi::key_token_release(token);

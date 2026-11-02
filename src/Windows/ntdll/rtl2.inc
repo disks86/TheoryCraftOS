@@ -1657,272 +1657,37 @@ EXPORT NTSTATUS NTAPI RtlFormatMessage(const WCHAR *src, ULONG width, BOOLEAN ig
   return RtlFormatMessageEx(src, width, ignore_inserts, ansi, is_array, args, buffer, size, retsize, 0);
 }
 
-/* ---- FSCTL_PIPE_LISTEN on a handle opened for overlapped calls ----------------------------------------------------------------------------------------------- */
-
-/* The kernel's calls wait; an overlapped listen is an operation of the pipe that is started by the caller (BEGIN_LISTEN) and waited for in a thread of its own (AWAIT),
- * which then completes the IO_STATUS_BLOCK, runs the APC in the calling thread and signals the event, and says so (ACK). Everything else, and a call that can be
- * answered at once, goes to the kernel as it is. */
+/* A call on a handle opened with FILE_SYNCHRONOUS_IO_ALERT waits alertably: an APC queued for the thread ends the wait (the kernel answers STATUS_USER_APC), the APC runs here, and the call
+ * fails with STATUS_CANCELLED. */
+extern NTSTATUS NTAPI RawNtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+extern NTSTATUS NTAPI RawNtWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
 extern NTSTATUS NTAPI RawNtFsControlFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, ULONG, PVOID, ULONG, PVOID, ULONG);
-static void file_io_completed(NTSTATUS status, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb);
-typedef struct { HANDLE pipe, event, caller; PVOID apc; PVOID context; PIO_STATUS_BLOCK iosb; PVOID buffer; ULONG tag, length; int slot; } PipeListen;
-/* The overlapped listens that wait (for NtCancelIoFile): state 1 while the operation waits, 0 when its thread is through with it. */
-#define PIPE_LISTEN_SLOTS 32
-static struct { HANDLE pipe; PIO_STATUS_BLOCK iosb; ULONG tag; volatile LONG state; } g_pipe_listens[PIPE_LISTEN_SLOTS];
-static volatile LONG g_pipe_listen_lock;
-static ULONG NTAPI pipe_listen_thread(PVOID parameter) {
-  PipeListen request = *(PipeListen *)parameter;
-  RtlFreeHeap(process_heap(), 0, parameter);
-  IO_STATUS_BLOCK b;
-  b.Information = 0;
-  NTSTATUS status = RawNtFsControlFile(request.pipe, NULL, NULL, NULL, &b, 0x11FFF3 /* AWAIT */, &request.tag, 4, request.buffer, request.length);
-  if (status == STATUS_PENDING) status = STATUS_SUCCESS;
-  request.iosb->Information = b.Information;
-  request.iosb->Status = status;
-  if (request.apc) NtQueueApcThread(request.caller, (PVOID)request.apc, (ULONG_PTR)request.context, (ULONG_PTR)request.iosb, 0);
-  if (request.caller) NtClose(request.caller);
-  if (request.event) NtSetEvent(request.event, NULL);
-  g_pipe_listens[request.slot].state = 2;      /* (completed: whoever cancelled it can go on) */
-  BYTE ack[5] = {(BYTE)request.tag, (BYTE)(request.tag >> 8), (BYTE)(request.tag >> 16), (BYTE)(request.tag >> 24), request.event ? 0 : 1};
-  RawNtFsControlFile(request.pipe, NULL, NULL, NULL, &b, 0x11FFF4 /* ACK */, ack, 5, NULL, 0);
-  g_pipe_listens[request.slot].state = 0;
-  return 0;
-}
-/* A listen on a handle that waits alertably (FILE_SYNCHRONOUS_IO_ALERT) is waited for by the calling thread, in an alertable wait on an event that the thread of the operation
- * sets; when an APC ends the wait, the operation is cancelled and the call fails with STATUS_CANCELLED. Both the caller and the thread let go of the shared request. */
-typedef struct { HANDLE pipe, wake; ULONG tag; volatile LONG refs, done; NTSTATUS status; } PipeAlertListen;
-static void pipe_alert_release(PipeAlertListen *r) {
-  if (__sync_sub_and_fetch(&r->refs, 1) != 0) return;
-  NtClose(r->wake);
-  RtlFreeHeap(process_heap(), 0, r);
-}
-static ULONG NTAPI pipe_alert_thread(PVOID parameter) {
-  PipeAlertListen *r = parameter;
-  IO_STATUS_BLOCK b;
-  b.Information = 0;
-  NTSTATUS status = RawNtFsControlFile(r->pipe, NULL, NULL, NULL, &b, 0x11FFF3 /* AWAIT */, &r->tag, 4, NULL, 0);
-  if (status == STATUS_PENDING) status = STATUS_SUCCESS;
-  r->status = status;
-  __sync_synchronize();
-  r->done = 1;
-  NtSetEvent(r->wake, NULL);
-  BYTE ack[5] = {(BYTE)r->tag, (BYTE)(r->tag >> 8), (BYTE)(r->tag >> 16), (BYTE)(r->tag >> 24), 1};
-  RawNtFsControlFile(r->pipe, NULL, NULL, NULL, &b, 0x11FFF4 /* ACK */, ack, 5, NULL, 0);
-  pipe_alert_release(r);
-  return 0;
-}
-static void pipe_give_up(HANDLE h, ULONG tag) {      /* ends an operation that was begun and has nobody to wait for it */
-  IO_STATUS_BLOCK b;
-  BYTE ack[5] = {(BYTE)tag, (BYTE)(tag >> 8), (BYTE)(tag >> 16), (BYTE)(tag >> 24), 1};
-  RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF5 /* CANCEL */, &tag, 4, NULL, 0);
-  RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF4 /* ACK */, ack, 5, NULL, 0);
-}
-/* An operation that was begun (BEGIN_LISTEN, BEGIN_READ) and now waits in a thread of its own, which completes the IO_STATUS_BLOCK, queues the APC for the calling thread and sets
- * the event; STATUS_PENDING, or the failure to start the thread (the operation is given up then). */
-static NTSTATUS pipe_overlapped_start(HANDLE h, ULONG tag, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length) {
-  HANDLE thread = NULL;
-  PipeListen *request = RtlAllocateHeap(process_heap(), 0, sizeof(*request));
-  int slot = -1;
-  while (__sync_lock_test_and_set(&g_pipe_listen_lock, 1)) NtYieldExecution();
-  for (int n = 0; n < PIPE_LISTEN_SLOTS && slot < 0; ++n) if (!g_pipe_listens[n].state) { slot = n; g_pipe_listens[n].pipe = h; g_pipe_listens[n].iosb = iosb; g_pipe_listens[n].tag = tag; g_pipe_listens[n].state = 1; }
-  __sync_lock_release(&g_pipe_listen_lock);
-  if (request && slot < 0) { RtlFreeHeap(process_heap(), 0, request); request = NULL; }
-  if (request) {
-    request->slot = slot;
-    request->pipe = h; request->event = event; request->caller = NULL; request->apc = apc; request->context = context; request->iosb = iosb; request->tag = tag;
-    request->buffer = buffer; request->length = length;
-    if (apc && !NT_SUCCESS(NtDuplicateObject(NtCurrentProcess(), NtCurrentThread(), NtCurrentProcess(), &request->caller, 0, 0, 2 /* DUPLICATE_SAME_ACCESS */))) request->caller = NULL;
-    if (!NT_SUCCESS(NtCreateThreadEx(&thread, 0x1FFFFF, NULL, NtCurrentProcess(), (PVOID)pipe_listen_thread, request, 0, 0, 0, 0, NULL))) thread = NULL;
-  }
-  if (!thread) {      /* nobody to wait for it: the operation is given up */
-    BYTE ack[5] = {(BYTE)tag, (BYTE)(tag >> 8), (BYTE)(tag >> 16), (BYTE)(tag >> 24), 1};
-    IO_STATUS_BLOCK b;
-    RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF5 /* CANCEL */, &tag, 4, NULL, 0);
-    RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF4 /* ACK */, ack, 5, NULL, 0);
-    if (slot >= 0) g_pipe_listens[slot].state = 0;
-    if (request) { if (request->caller) NtClose(request->caller); RtlFreeHeap(process_heap(), 0, request); }
-    return (NTSTATUS)0xC000009Au;
-  }
-  NtClose(thread);
-  return STATUS_PENDING;
-}
-/* A listen that went through: the IO_STATUS_BLOCK is filled, the event set and the APC queued. Any other answer leaves them alone. */
-static NTSTATUS pipe_listen_finished(NTSTATUS status, const IO_STATUS_BLOCK *b, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb) {
-  if (!NT_SUCCESS(status)) return status;
-  iosb->Information = b->Information;
-  iosb->Status = status;
-  file_io_completed(status, event, apc, context, iosb);
-  return status;
-}
-/* A listen the kernel waits for (the IO_STATUS_BLOCK is the kernel's to find, for CancelSynchronousIo): a refusal leaves the caller's copy as it was. */
-static NTSTATUS pipe_listen_sync(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID in, ULONG in_size, PVOID out, ULONG out_size) {
-  const IO_STATUS_BLOCK saved = *iosb;
-  const NTSTATUS status = RawNtFsControlFile(h, NULL, NULL, NULL, iosb, code, in, in_size, out, out_size);
-  if (!NT_SUCCESS(status)) { *iosb = saved; return status; }
-  const IO_STATUS_BLOCK done = *iosb;
-  return pipe_listen_finished(status, &done, event, apc, context, iosb);
-}
-/* For kernel32.dll: a read or write as the kernel does it, waiting, whatever the handle was opened for (its own overlapped calls on pipes are made another way). */
-extern NTSTATUS NTAPI RawNtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
-extern NTSTATUS NTAPI RawNtWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
-EXPORT NTSTATUS NTAPI RtlTcosReadFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
-  return RawNtReadFile(h, event, apc, context, iosb, buffer, length, offset, (PULONG)(ULONG_PTR)1);      /* (Key 1: wait) */
-}
-EXPORT NTSTATUS NTAPI RtlTcosWriteFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
-  return RawNtWriteFile(h, event, apc, context, iosb, buffer, length, offset, key);
-}
-/* For kernel32.dll, which runs its own overlapped calls on pipes: the call as the kernel does it, waiting, whatever the handle was opened for. */
-EXPORT NTSTATUS NTAPI RtlTcosFsControlFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID in, ULONG in_size, PVOID out, ULONG out_size) {
-  return RawNtFsControlFile(h, event, apc, context, iosb, code, in, in_size, out, out_size);
-}
-EXPORT NTSTATUS NTAPI NtFsControlFile(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID in, ULONG in_size, PVOID out, ULONG out_size) {
-  ULONG mode = 0x20;
-  IO_STATUS_BLOCK q, b;
-  const int listen = code == 0x110008 /* FSCTL_PIPE_LISTEN */ && in_size == 0, transceive = code == 0x11C017 /* FSCTL_PIPE_TRANSCEIVE */;
-  if (!iosb || (!listen && !transceive) || NtQueryInformationFile(h, &q, &mode, 4, 16 /* FileModeInformation */) != STATUS_SUCCESS) {
-    if (!event && !apc) return RawNtFsControlFile(h, NULL, NULL, NULL, iosb, code, in, in_size, out, out_size);
-    if (event) { const NTSTATUS reset = NtResetEvent(event, NULL); if (!NT_SUCCESS(reset)) return reset; }
-    const NTSTATUS status = RawNtFsControlFile(h, NULL, NULL, NULL, iosb, code, in, in_size, out, out_size);
-    if (NT_SUCCESS(status) && iosb) file_io_completed(status, event, apc, context, iosb);
-    return status;
-  }
-  if (event) { const NTSTATUS reset = NtResetEvent(event, NULL); if (!NT_SUCCESS(reset)) return reset; }
-  if (transceive) {      /* on a handle opened for overlapped calls the message goes at once and the answer is awaited in a thread */
-    if (mode & 0x30) {
-      const NTSTATUS status = RawNtFsControlFile(h, NULL, NULL, NULL, iosb, code, in, in_size, out, out_size);
-      if (NT_SUCCESS(status)) file_io_completed(status, event, apc, context, iosb);
-      return status;
-    }
-    ULONG tag = out_size;
-    b.Information = 0;
-    const NTSTATUS began = RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF6 /* BEGIN_TRANSACT */, in, in_size, &tag, 4);
-    if (began == STATUS_PENDING) return pipe_overlapped_start(h, tag, event, apc, context, iosb, out, out_size);
-    return began;
-  }
-  b.Information = 0;
-  if (mode & 0x20) return pipe_listen_sync(h, event, apc, context, iosb, code, in, in_size, out, out_size);
-  ULONG tag = 0;
-  const NTSTATUS began = RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF2 /* BEGIN_LISTEN */, NULL, 0, &tag, 4);
-  if (began != STATUS_PENDING) return pipe_listen_sync(h, event, apc, context, iosb, code, in, in_size, out, out_size);      /* (a client is there already, or the pipe does not wait) */
-  HANDLE thread = NULL;
-  if (mode & 0x10) {      /* FILE_SYNCHRONOUS_IO_ALERT */
-    PipeAlertListen *r = RtlAllocateHeap(process_heap(), 0, sizeof(*r));
-    if (r) {
-      r->pipe = h; r->wake = NULL; r->tag = tag; r->refs = 2; r->done = 0; r->status = 0;
-      if (!NT_SUCCESS(NtCreateEvent(&r->wake, 0x1F0003, NULL, 0 /* NotificationEvent */, FALSE)) || !NT_SUCCESS(NtCreateThreadEx(&thread, 0x1FFFFF, NULL, NtCurrentProcess(), (PVOID)pipe_alert_thread, r, 0, 0, 0, 0, NULL))) {
-        if (r->wake) NtClose(r->wake);
-        RtlFreeHeap(process_heap(), 0, r);
-        r = NULL;
-      }
-    }
-    if (!r) { pipe_give_up(h, tag); return (NTSTATUS)0xC000009Au; }
-    NtClose(thread);
-    NtWaitForSingleObject(r->wake, TRUE, NULL);
-    if (!r->done) {      /* an APC ended the wait */
-      RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF5 /* CANCEL */, &tag, 4, NULL, 0);
-      pipe_alert_release(r);
-      return (NTSTATUS)0xC0000120u;      /* STATUS_CANCELLED */
-    }
-    const NTSTATUS status = r->status;
-    pipe_alert_release(r);
-    b.Information = 0;
-    return pipe_listen_finished(status, &b, event, apc, context, iosb);
-  }
-  return pipe_overlapped_start(h, tag, event, apc, context, iosb, NULL, 0);
-}
-
-/* NtCancelIoFile and NtCancelIoFileEx end the overlapped listens of a handle (the ones of an IO_STATUS_BLOCK, for the Ex call with one): when they return, the listens are
- * complete with STATUS_CANCELLED - the IO_STATUS_BLOCK is filled, the event set, the APC queued. */
-static NTSTATUS pipe_cancel_listens(HANDLE h, PIO_STATUS_BLOCK only, ULONG *count) {
-  ULONG tags[PIPE_LISTEN_SLOTS];
-  int slots[PIPE_LISTEN_SLOTS], n = 0;
-  IO_STATUS_BLOCK b;
-  while (__sync_lock_test_and_set(&g_pipe_listen_lock, 1)) NtYieldExecution();
-  for (int i = 0; i < PIPE_LISTEN_SLOTS; ++i)
-    if (g_pipe_listens[i].state == 1 && g_pipe_listens[i].pipe == h && (!only || g_pipe_listens[i].iosb == only)) { slots[n] = i; tags[n] = g_pipe_listens[i].tag; ++n; }
-  __sync_lock_release(&g_pipe_listen_lock);
-  for (int i = 0; i < n; ++i) RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF5 /* CANCEL */, &tags[i], 4, NULL, 0);
-  for (int i = 0; i < n; ++i)
-    for (int spin = 0; spin < 200000 && g_pipe_listens[slots[i]].state == 1 && g_pipe_listens[slots[i]].tag == tags[i]; ++spin) NtYieldExecution();
-  *count = (ULONG)n;
-  return STATUS_SUCCESS;
-}
-EXPORT NTSTATUS NTAPI NtCancelIoFile(HANDLE h, PIO_STATUS_BLOCK iosb) {
-  ULONG count;
-  if (!iosb) return STATUS_ACCESS_VIOLATION;
-  pipe_cancel_listens(h, NULL, &count);
-  iosb->Status = STATUS_SUCCESS;
-  iosb->Information = 0;
-  return STATUS_SUCCESS;
-}
-EXPORT NTSTATUS NTAPI NtCancelIoFileEx(HANDLE h, PIO_STATUS_BLOCK only, PIO_STATUS_BLOCK iosb) {
-  ULONG count;
-  if (!iosb) return STATUS_ACCESS_VIOLATION;
-  pipe_cancel_listens(h, only, &count);
-  iosb->Information = 0;
-  iosb->Status = count ? STATUS_SUCCESS : (NTSTATUS)0xC0000225u;      /* STATUS_NOT_FOUND */
-  return iosb->Status;
-}
-
-/* ---- NtReadFile and NtWriteFile with an event or an APC ------------------------------------------------------------------------------------------------------ */
-
-/* The kernel's reads and writes are done when they return, whatever the event and the APC: an event is reset when the call starts and signalled when it is over, and an APC
- * is queued for the calling thread (it runs when that thread waits alertably). */
-extern NTSTATUS NTAPI RawNtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
-extern NTSTATUS NTAPI RawNtWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
-static void file_io_completed(NTSTATUS status, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb) {
-  if (status == STATUS_PENDING || (!NT_SUCCESS(status) && iosb->Status != status)) return;      /* (a call that was refused before it began completes nothing) */
-  if (apc) {
-    HANDLE self = NULL;
-    if (NT_SUCCESS(NtDuplicateObject(NtCurrentProcess(), NtCurrentThread(), NtCurrentProcess(), &self, 0, 0, 2 /* DUPLICATE_SAME_ACCESS */))) {
-      NtQueueApcThread(self, apc, (ULONG_PTR)context, (ULONG_PTR)iosb, 0);
-      NtClose(self);
-    }
-  }
-  if (event) NtSetEvent(event, NULL);
-}
-/* The kernel answers STATUS_PENDING, without doing anything, to a read of a pipe handle opened for overlapped calls that has nothing to read yet: the read is begun in the
- * kernel and waited for in a thread (when the data came in between, the read is made again). */
-static NTSTATUS pipe_read_overlapped(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
-  for (int attempt = 0; attempt < 4; ++attempt) {
-    ULONG tag = 0, want = length;
-    IO_STATUS_BLOCK b;
-    b.Information = 0;
-    const NTSTATUS began = RawNtFsControlFile(h, NULL, NULL, NULL, &b, 0x11FFF0 /* BEGIN_READ */, &want, 4, &tag, 4);
-    if (began == STATUS_PENDING) return pipe_overlapped_start(h, tag, event, apc, context, iosb, buffer, length);
-    const NTSTATUS status = RawNtReadFile(h, NULL, NULL, NULL, iosb, buffer, length, offset, key);
-    if (status != STATUS_PENDING) { file_io_completed(status, event, apc, context, iosb); return status; }
-  }
-  return STATUS_PENDING;
-}
-/* With an event or an APC a call checks the handle first (an event is not reset for a handle that is not there); a call that fails leaves the IO_STATUS_BLOCK and the event
- * as they were (a warning, such as a message that did not fit, is a result like the others). */
-static NTSTATUS file_io_begin(HANDLE h, HANDLE event) {
-  ULONG mode;
-  IO_STATUS_BLOCK q;
-  if (!event) return STATUS_SUCCESS;
-  if (NtQueryInformationFile(h, &q, &mode, 4, 16) == (NTSTATUS)0xC0000008u) return (NTSTATUS)0xC0000008u;      /* STATUS_INVALID_HANDLE */
-  return NtResetEvent(event, NULL);
+static NTSTATUS io_alerted(NTSTATUS status) {
+  if (status != STATUS_USER_APC) return status;
+  NtTestAlert();
+  return (NTSTATUS)0xC0000120u;      /* STATUS_CANCELLED */
 }
 EXPORT NTSTATUS NTAPI NtReadFile(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
-  if (!event && !apc) {
-    const NTSTATUS plain = RawNtReadFile(h, NULL, NULL, NULL, iosb, buffer, length, offset, key);
-    if (plain != STATUS_PENDING) return plain;
-    return pipe_read_overlapped(h, NULL, NULL, NULL, iosb, buffer, length, offset, key);
-  }
-  { const NTSTATUS begun = file_io_begin(h, event); if (!NT_SUCCESS(begun)) return begun; }
-  const IO_STATUS_BLOCK saved = *iosb;
-  const NTSTATUS status = RawNtReadFile(h, NULL, NULL, NULL, iosb, buffer, length, offset, key);
-  if (status == STATUS_PENDING) return pipe_read_overlapped(h, event, apc, context, iosb, buffer, length, offset, key);
-  if (((ULONG)status >> 30) == 3) { *iosb = saved; return status; }      /* (an error: nothing completes) */
-  file_io_completed(status, event, apc, context, iosb);
-  return status;
+  return io_alerted(RawNtReadFile(h, event, apc, context, iosb, buffer, length, offset, key));
 }
 EXPORT NTSTATUS NTAPI NtWriteFile(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
-  if (!event && !apc) return RawNtWriteFile(h, NULL, NULL, NULL, iosb, buffer, length, offset, key);
-  { const NTSTATUS begun = file_io_begin(h, event); if (!NT_SUCCESS(begun)) return begun; }
-  const IO_STATUS_BLOCK saved = *iosb;
-  const NTSTATUS status = RawNtWriteFile(h, NULL, NULL, NULL, iosb, buffer, length, offset, key);
-  if (((ULONG)status >> 30) == 3) { *iosb = saved; return status; }
-  file_io_completed(status, event, apc, context, iosb);
-  return status;
+  return io_alerted(RawNtWriteFile(h, event, apc, context, iosb, buffer, length, offset, key));
+}
+EXPORT NTSTATUS NTAPI NtFsControlFile(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID in, ULONG in_size, PVOID out, ULONG out_size) {
+  return io_alerted(RawNtFsControlFile(h, event, apc, context, iosb, code, in, in_size, out, out_size));
+}
+
+/* ---- helpers for kernel32.dll ---------------------------------------------------------------------------------------------------------------------------- */
+
+/* A read or write as the kernel does it, waiting, whatever the handle was opened for (Key 1; an event handle of 1 asks the same of a control call). */
+EXPORT NTSTATUS NTAPI RtlTcosReadFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
+  (void)key;
+  return NtReadFile(h, event, apc, context, iosb, buffer, length, offset, (PULONG)(ULONG_PTR)1);
+}
+EXPORT NTSTATUS NTAPI RtlTcosWriteFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
+  (void)key;
+  return NtWriteFile(h, event, apc, context, iosb, buffer, length, offset, (PULONG)(ULONG_PTR)1);
+}
+EXPORT NTSTATUS NTAPI RtlTcosFsControlFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID in, ULONG in_size, PVOID out, ULONG out_size) {
+  return NtFsControlFile(h, event ? event : (HANDLE)(ULONG_PTR)1, apc, context, iosb, code, in, in_size, out, out_size);
 }

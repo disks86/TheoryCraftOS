@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Process/Process.hpp"
+#include "Process/WindowsIo.hpp"
 #include "Process/Syscall.hpp"
 
 // Pipes: anonymous (CreatePipe) and named (\\.\pipe\name, CreateNamedPipe and CreateFile on it). A pipe handle is a descriptor of kind Pipe; reading, writing, FSCTLs and
@@ -34,8 +35,7 @@ uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r);
 // The name of the pipe a pipe handle is for, in UTF-8 and without the folder (empty for an anonymous pipe or the folder).
 bool pipe_handle_name(Process& p, uint64_t slot, String* name);
 // NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, FsControlCode, InputBuffer, InputBufferLength, OutputBuffer, OutputBufferLength): on a pipe,
-// FSCTL_PIPE_LISTEN, _DISCONNECT, _PEEK, _WAIT and _TRANSCEIVE; and the library's own calls for an operation that waits in a thread of its own (BEGIN_READ, BEGIN_WRITE,
-// BEGIN_LISTEN start it, AWAIT waits for it and gives the result, ACK says the result was acted on, CANCEL ends it).
+// FSCTL_PIPE_LISTEN, _DISCONNECT, _PEEK, _WAIT and _TRANSCEIVE (a listen and a transceive on a handle opened for overlapped calls wait in the kernel as requests of the pipe).
 uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r);
 
 // NtCancelSynchronousIoFile(ThreadHandle, IoRequestToCancel, IoStatusBlock): ends the call a thread waits in on a pipe (STATUS_NOT_FOUND if there is none).
@@ -45,7 +45,21 @@ uint32_t nt_cancel_synchronous_io_file(Process& p, const SyscallRequest& r);
 // A path like \??\pipe\name or \Device\NamedPipe\name opens a pipe (as a client) or the pipe folder: true if the name was one (*status and *handle are the answer).
 bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, uint32_t options, uint32_t* status, uint64_t* handle);
 // NtReadFile / NtWriteFile on a pipe handle.
-uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length, bool wait = false);
+// With `call` a read or write on a handle opened for overlapped calls that cannot be answered at once is queued on the pipe as a request (IoRequest.hpp) and answers
+// STATUS_PENDING; its outcome is applied to the program's memory by whoever of its threads next makes a call or wakes from a wait. `wait` (the library's Key 1) makes the call
+// wait whatever the handle was opened for.
+uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length, bool wait = false, const IoCall* call = nullptr);
+// The completion port a pipe handle's end is tied to, and tying it (NtSetInformationFile FileCompletionInformation); the FILE_SKIP_* flags.
+bool pipe_handle_port(Process& p, uint64_t slot, uint32_t* port, uint64_t* key, uint32_t* flags);
+uint32_t pipe_handle_set_port(Process& p, uint64_t slot, uint32_t port, uint64_t key);
+uint32_t pipe_handle_set_flags(Process& p, uint64_t slot, uint32_t flags);
+void pipe_handle_flags(Process& p, uint64_t slot, uint32_t* flags);
+// Cancels the calls on the end of a handle (see ObjectManager::io_cancel_locked); how many ended.
+uint32_t pipe_handle_cancel(Process& p, uint64_t slot, uint64_t thread, uint64_t status_block);
+// A call without an event of its own went through on the handle: the file object of its end is signalled (unless the handle keeps it from being).
+void pipe_handle_signal(Process& p, uint64_t slot);
+// A pipe handle of the process was closed and was its last to the end (`token` is the descriptor's): the calls the process still has pending on the end are cancelled.
+void pipe_handle_closed(Process& p, uint64_t token);
 // NtQueryInformationFile / NtSetInformationFile classes 23 (FilePipeInformation) and 24 (FilePipeLocalInformation) on a pipe handle.
 uint32_t pipe_query_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t status_block, uint64_t buffer, uint32_t length);
 uint32_t pipe_set_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t buffer, uint32_t length);
@@ -56,7 +70,5 @@ uint32_t pipe_flush(Process& p, uint64_t slot);
 bool pipe_handle_gone_locked(Process& p, uint64_t slot);
 void pipe_token_add(uint64_t token);
 void pipe_token_release(uint64_t token);
-// A pipe handle was closed: the operations of the other end that this ended have been acted on when it returns.
-void pipe_closed(Process& p, uint64_t token);
 
 }  // namespace process::windowsabi

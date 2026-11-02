@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsIo.hpp"
 #include "Process/WindowsTokens.hpp"
 #include "Process/DosWildcard.hpp"
 #include "Process/Objects.hpp"
@@ -507,7 +508,7 @@ uint32_t read_offset(Process& p, uint64_t pointer, uint64_t* value) {
   return p.read_user_u64(pointer, value) ? kSuccess : kAccessViolation;
 }
 
-uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
+uint32_t file_io_core(Process& p, const SyscallRequest& r, bool write, const IoCall& call) {
   uint64_t apc = 0, status_block = 0, buffer = 0, length = 0, offset_pointer = 0, key = 0;
   if (!argument(p, r, 2, &apc) || !argument(p, r, 8, &key) || !argument(p, r, 4, &status_block) || !argument(p, r, 5, &buffer) || !argument(p, r, 6, &length) || !argument(p, r, 7, &offset_pointer))
     return kAccessViolation;
@@ -516,10 +517,10 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   ProcessFiles& files = p.files();
   const DescriptorKind kind = files.kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
-  if (apc != 0) return kNotImplemented;      // asynchronous completion is not supported
+  (void)apc;
   length &= 0xFFFFFFFFu;
   if (length > kMaxIoBytes) length = kMaxIoBytes;
-  if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length, key == 1);      // (a Key of 1 is the library's: wait, as a handle opened for synchronous calls does)
+  if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length, key == 1 || call.wait, &call);      // (a Key of 1 is the library's: wait, as a handle opened for synchronous calls does)
   if (kind == DescriptorKind::Mailslot) return mailslot_io(p, slot, write, status_block, buffer, length);
   if (kind == DescriptorKind::Null) {      // the NUL device takes everything and has nothing to read
     const uint32_t status = write ? kSuccess : kEndOfFile;
@@ -578,6 +579,15 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   status = kSuccess;
   if (!write && done == 0 && length != 0) status = kEndOfFile;
   return store_io_status(p, status_block, status, done) ? status : kAccessViolation;
+}
+
+uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
+  uint64_t slot = 0;
+  if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
+  if (p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  IoCall call;
+  if (const uint32_t refused = io_call_begin(p, slot, r, &call)) return refused;
+  return io_call_end(p, slot, call, file_io_core(p, r, write, call));
 }
 
 // --- queries
@@ -729,10 +739,7 @@ uint32_t nt_close(Process& p, const SyscallRequest& r) {
   uint64_t slot = 0;
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   if (p.files().protected_from_close(slot)) return 0xC0000235u;      // STATUS_HANDLE_NOT_CLOSABLE
-  const bool pipe = p.files().kind(slot) == DescriptorKind::Pipe;
-  const uint64_t token = p.files().token(slot);
   if (!p.close_descriptor(slot)) return kInvalidHandle;
-  if (pipe) pipe_closed(p, token);      // (the calls of other threads that closing it ended are over when it returns)
   return kSuccess;
 }
 
@@ -753,6 +760,11 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: case DescriptorKind::ObjectDirectory: case DescriptorKind::SymbolicLink: case DescriptorKind::Token: return 0xC0000024u;
       default: break;
     }
+  }
+  if (static_cast<uint32_t>(info_class) == 41) {      // FileIoCompletionNotificationInformation
+    uint32_t io_status = 0;
+    uint64_t io_size = 0;
+    if (io_query_file_information(p, slot, 41, r.args[2], uint32_t(r.args[3]), &io_status, &io_size)) return io_status != kSuccess ? io_status : (store_io_status(p, r.args[1], io_status, io_size) ? io_status : kAccessViolation);
   }
   if (kind == DescriptorKind::ConsoleInput && static_cast<uint32_t>(info_class) == 24) {      // FilePipeLocalInformation: what the console input could give at once
     bool at_end = false;
@@ -867,6 +879,10 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
   if (r.args[0] == ~uint64_t{0}) return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH: -1 is the current process
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
+  if (files.kind(slot) != DescriptorKind::Closed && (static_cast<uint32_t>(info_class) == 30 || static_cast<uint32_t>(info_class) == 41)) {      // FileCompletionInformation, FileIoCompletionNotificationInformation
+    uint32_t io_status = 0;
+    if (io_set_file_information(p, slot, uint32_t(info_class), r.args[2], uint32_t(r.args[3]), &io_status)) return io_status != kSuccess ? io_status : (store_io_status(p, r.args[1], io_status, 0) ? io_status : kAccessViolation);
+  }
   if (files.kind(slot) == DescriptorKind::Pipe) {
     if (static_cast<uint32_t>(info_class) != 23) return kInvalidInfoClass;
     const uint32_t pipe_status = pipe_set_information(p, slot, 23, r.args[2], uint32_t(r.args[3]));

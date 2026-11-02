@@ -18,6 +18,7 @@
 #include "Process/WindowsPipes.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsIo.hpp"
 #include "Process/WindowsWait.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -31,10 +32,9 @@ constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle 
                    kInfoLengthMismatch = 0xC0000004u, kTimeout = 0x102, kAlerted = 0x101, kNoMemory = 0xC0000017u, kNoResources = 0xC000009Au;
 constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kPending = kWaitPending;
-constexpr uint32_t kNotSupported = 0xC00000BBu;      // (what the library's BEGIN calls answer when the call is to be made the usual way)
 constexpr uint32_t kNotFound = 0xC0000225u;
-// The library's own FSCTLs (see nt_fs_control_file).
-constexpr uint32_t kFsctlBeginRead = 0x11FFF0, kFsctlBeginWrite = 0x11FFF1, kFsctlBeginListen = 0x11FFF2, kFsctlAwait = 0x11FFF3, kFsctlAck = 0x11FFF4, kFsctlCancel = 0x11FFF5, kFsctlBeginTransact = 0x11FFF6, kFsctlGetProcess = 0x11FFF7, kFsctlSetPort = 0x11FFF8, kFsctlTakePort = 0x11FFF9;
+// The library's own FSCTL (see nt_fs_control_file): the process of the other end.
+constexpr uint32_t kFsctlGetProcess = 0x11FFF7;
 
 // The token of a pipe descriptor: bits 0..31 the object, 32..55 the end code, 57 FILE_SYNCHRONOUS_IO_ALERT, 58 opened without FILE_SYNCHRONOUS_IO_*, 59 message read mode, 60 read, 61 write, 62 non-blocking,
 // 63 the pipe folder itself.
@@ -115,32 +115,33 @@ bool wants_inherit(Process& p, uint64_t attributes) {
   return attributes != 0 && p.read_user(attributes + 24, ByteView(raw, 4)) && (raw[0] & 2) != 0;
 }
 
-// The operations of other threads that this call finished have been acted on (so that their results are there when the call returns); a thread that does not come is given
-// up on after a second.
-void await_delivery(Process& p, uint32_t id) {
-  ObjectManager* objects = system_objects();
-  if (!objects) return;
-  const uint32_t s = wait_until(p, 1000ull * 1000000, [&]() -> uint64_t { return objects->pipe_delivered_locked(id) ? kSuccess : kPending; });
-  if (s == kTimeout) {
-    objects->sync().lock();
-    objects->pipe_forgive_locked(id);
-    objects->sync().unlock();
-  }
-}
-
 // A call that waits in the kernel for this thread: while it does the file object is not signalled, and CancelSynchronousIo can end it.
 class SyncWait {
  public:
-  SyncWait(Process& p, uint32_t id, uint32_t end_code, uint64_t iosb = 0) : objects_(system_objects()) {
-    if (objects_) slot_ = objects_->pipe_sync_begin(id, end_code, p.runtime() ? p.runtime()->current_thread_id() : p.id(), iosb);
+  // `alertable`: the handle was opened with FILE_SYNCHRONOUS_IO_ALERT, so an APC queued for the thread ends the wait.
+  SyncWait(Process& p, uint32_t id, uint32_t end_code, uint64_t iosb = 0, bool alertable = false) : objects_(system_objects()), process_(p), alertable_(alertable) {
+    thread_ = p.runtime() ? p.runtime()->current_thread_id() : p.id();
+    if (objects_) slot_ = objects_->pipe_sync_begin(id, end_code, thread_, iosb);
   }
   ~SyncWait() { if (objects_) objects_->pipe_sync_end(slot_); }
   SyncWait(const SyncWait&) = delete;
   SyncWait& operator=(const SyncWait&) = delete;
   bool cancelled_locked() const { return objects_ && objects_->pipe_sync_cancelled_locked(slot_); }
+  // Why the wait must end (0: it goes on): CancelSynchronousIo (STATUS_CANCELLED), or an APC for an alertable wait (STATUS_USER_APC: the library runs it and answers STATUS_CANCELLED).
+  uint64_t interrupt_locked() const {
+    if (cancelled_locked()) return kCancelled;
+    if (alertable_) {
+      Process::ThreadRecord* t = process_.find_thread(thread_);
+      if (t && t->apc_count > 0) return 0xC0;
+    }
+    return 0;
+  }
 
  private:
   ObjectManager* objects_;
+  Process& process_;
+  bool alertable_;
+  uint64_t thread_ = 0;
   uint32_t slot_ = 0;
 };
 
@@ -149,7 +150,7 @@ uint32_t wait_operation(Process& p, uint32_t id, uint32_t end_code, uint32_t tag
   ObjectManager* objects = system_objects();
   bool finished = false;
   const uint32_t s = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t {
-    if (waiting && waiting->cancelled_locked()) return kCancelled;
+    if (waiting) { const uint64_t interrupted = waiting->interrupt_locked(); if (interrupted) return interrupted; }
     switch (objects->pipe_op_poll_locked(id, end_code, tag, result)) {
       case ObjectManager::PipeOpPoll::Pending: return kPending;
       case ObjectManager::PipeOpPoll::Done: finished = true; return kSuccess;
@@ -165,11 +166,13 @@ uint32_t wait_operation(Process& p, uint32_t id, uint32_t end_code, uint32_t tag
   return s;
 }
 
-}  // namespace
 
-void pipe_closed(Process& p, uint64_t token) {
-  if (!(token & kFolder)) await_delivery(p, token_id(token));
+// The request of a call that waits on the operation `tag` of the end of a handle (see ObjectManager::pipe_pend_locked), with the system lock held.
+bool pend_call(ObjectManager* objects, const io::IoRequest& request, bool event_given, uint64_t token, uint32_t tag) {
+  return objects->pipe_pend_locked(token_id(token), token_end(token), tag, request, !event_given);
 }
+
+}  // namespace
 
 bool pipe_handle_gone_locked(Process& p, uint64_t slot) {
   ObjectManager* objects = system_objects();
@@ -278,11 +281,10 @@ bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, 
   *status = give_pipe_handle(p, make_token(c.id, c.end_code, read || !write, write) | ((options & 0x30) ? 0 : kAsyncIo) | ((options & 0x10) ? kAlertIo : 0), inherit, handle);
   if (*status == kSuccess) set_pipe_rights(p, *handle, access);
   if (*status != kSuccess) objects->release_pipe_end(c.id, c.end_code);
-  await_delivery(p, c.id);      // (a ConnectNamedPipe that waited has its answer when the client's open returns)
   return true;
 }
 
-uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length, bool wait) {
+uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length, bool wait, const IoCall* call) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
   const uint64_t token = p.files().token(slot);
@@ -293,7 +295,27 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
   uint8_t chunk[8192];
   uint64_t done = 0;
   uint32_t status = kSuccess;
-  if (write && length == 0) {      // (an empty write still tells a broken pipe from a good one)
+  bool handled = false;
+  const bool overlapped = call && !wait && (token & kAsyncIo) && !no_wait;      // (a call that may be left waiting in the kernel)
+  if (write && overlapped && length != 0 && length <= ObjectManager::kMaxPipeWrite) {      // the write is queued whole; if it does not fit at once the call waits for room
+    ByteBuffer staging(p.files().allocator());
+    if (!staging.put_zeros(length)) return kNoMemory;
+    if (!p.read_user(buffer, staging.writable_view())) return kAccessViolation;
+    uint32_t tag = 0, moved = 0;
+    const io::IoRequest pending = io_new_request(p, slot, *call, 0, 0);
+    objects->sync().lock();
+    const ObjectManager::PipeResult res = objects->pipe_begin_write_locked(id, end, staging.view(), p.id(), &tag, &moved);
+    if (res == ObjectManager::PipeResult::WouldBlock && tag != 0) {
+      const bool queued = pend_call(objects, pending, call->event_object != 0, token, tag);
+      objects->sync().unlock();
+      return queued ? 0x103u : kNoResources;
+    }
+    objects->sync().unlock();
+    if (res == ObjectManager::PipeResult::Ok) { done = moved; handled = true; }
+    else if (res != ObjectManager::PipeResult::WouldBlock) { status = result_status(res, false, true); handled = true; }
+  }
+  if (handled) {
+  } else if (write && length == 0) {      // (an empty write still tells a broken pipe from a good one)
     status = wait_until(p, 0, [&]() -> uint64_t {
       uint32_t moved = 0;
       const ObjectManager::PipeResult res = objects->pipe_write_locked(id, end, chunk, 0, &moved);
@@ -329,13 +351,13 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
       ObjectManager::PipeResult res = ObjectManager::PipeResult::Ok;
       const uint32_t queued = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t {
         tag = 0;
-        res = objects->pipe_begin_write_locked(id, end, piece, p.id(), false, &tag, &moved);
+        res = objects->pipe_begin_write_locked(id, end, piece, p.id(), &tag, &moved);
         return res == ObjectManager::PipeResult::WouldBlock && tag == 0 ? kPending : kSuccess;      // (no room in the tables: later)
       });
       if (queued != kSuccess) { failure = queued; break; }
       if (res == ObjectManager::PipeResult::WouldBlock) {
         ObjectManager::PipeOpResult result;
-        SyncWait waiting(p, id, end);
+        SyncWait waiting(p, id, end, 0, (token & kAlertIo) != 0);
         failure = wait_operation(p, id, end, tag, &result, &waiting);
         objects->pipe_op_release(id, tag);
         objects->pipe_op_free_data(result.data);
@@ -349,6 +371,7 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
     status = done > 0 ? kSuccess : failure;
   } else if (length != 0) {
     bool first = true;
+    uint32_t retries = 0;
     while (done < length) {      // (what is there now, up to the length: only the first read waits)
       const uint32_t want = uint32_t(length - done < sizeof(chunk) ? length - done : sizeof(chunk));
       uint32_t got = 0;
@@ -358,10 +381,22 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
         return result_status(res, false, false);
       };
       uint32_t s = wait_until(p, 0, attempt);
-      if (s == kTimeout && first && !no_wait && (token & kAsyncIo) && !wait) return 0x103;      // STATUS_PENDING: the library waits for the data in a thread (BEGIN_READ), the call does nothing
+      if (s == kTimeout && first && overlapped) {      // nothing to read yet: the call waits in the kernel, as a request of the pipe
+        uint32_t tag = 0;
+        const io::IoRequest pending = io_new_request(p, slot, *call, buffer, uint32_t(length));
+        objects->sync().lock();
+        const ObjectManager::PipeResult res = objects->pipe_begin_read_locked(id, end, uint32_t(length), (token & kMessageRead) != 0, p.id(), &tag);
+        if (res == ObjectManager::PipeResult::WouldBlock) {
+          const bool queued = pend_call(objects, pending, call->event_object != 0, token, tag);
+          objects->sync().unlock();
+          return queued ? 0x103u : kNoResources;
+        }
+        objects->sync().unlock();
+        if (++retries < 8) continue;      // (the data came in between: read again)
+      }
       if (s == kTimeout && first && !no_wait) {      // (nothing to read yet: the call waits)
-        SyncWait waiting(p, id, end);
-        s = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t { return waiting.cancelled_locked() ? uint64_t{kCancelled} : attempt(); });
+        SyncWait waiting(p, id, end, 0, (token & kAlertIo) != 0);
+        s = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t { return waiting.interrupt_locked() ? waiting.interrupt_locked() : attempt(); });
       }
       if (s != kSuccess && s != kMoreData) {
         if (first) status = s == kTimeout ? kPipeEmpty : s;
@@ -375,6 +410,18 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
     }
   } else {      // a read of no bytes: waits for something to read (or for the pipe to break) and takes nothing
     uint32_t got = 0;
+    if (overlapped) {      // (an overlapped one waits in the kernel, as a request of the pipe, and ends with no bytes when there is something to read)
+      uint32_t tag = 0;
+      const io::IoRequest pending = io_new_request(p, slot, *call, buffer, 0);
+      objects->sync().lock();
+      const ObjectManager::PipeResult res = objects->pipe_begin_read_locked(id, end, 0, (token & kMessageRead) != 0, p.id(), &tag);
+      if (res == ObjectManager::PipeResult::WouldBlock) {
+        const bool queued = pend_call(objects, pending, call->event_object != 0, token, tag);
+        objects->sync().unlock();
+        return queued ? 0x103u : kNoResources;
+      }
+      objects->sync().unlock();
+    }
     status = wait_until(p, no_wait ? 0 : ~uint64_t{0}, [&]() -> uint64_t {
       const ObjectManager::PipeResult res = objects->pipe_read_locked(id, end, chunk, 0, &got, true, nullptr, (token & kMessageRead) != 0);
       if (res == ObjectManager::PipeResult::WouldBlock) return kPending;
@@ -382,9 +429,8 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
     });
     if (status == kTimeout) status = kPipeEmpty;
   }
-  await_delivery(p, id);      // (the calls of other threads that this one finished are over before it returns)
   if (status != kSuccess) {
-    if (status_block != 0) {
+    if (status_block != 0 && status != 0xC0) {
       uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
       if (status == kMoreData) for (uint32_t i = 0; i < 8; ++i) iosb[8 + i] = uint8_t(done >> (8 * i));      // (the part that was read)
       p.write_user(status_block, ConstByteView(iosb, 16));
@@ -411,7 +457,7 @@ uint32_t pipe_flush(Process& p, uint64_t slot) {
   if (res == ObjectManager::PipeResult::Ok) return kSuccess;
   if (res != ObjectManager::PipeResult::WouldBlock) return kNoResources;
   ObjectManager::PipeOpResult result;
-  SyncWait waiting(p, id, end);
+  SyncWait waiting(p, id, end, 0, (token & kAlertIo) != 0);
   const uint32_t status = wait_operation(p, id, end, tag, &result, &waiting);
   objects->pipe_op_release(id, tag);
   return status;
@@ -520,23 +566,14 @@ bool pipe_handle_name(Process& p, uint64_t slot, String* name) {
   return name->assign(StringView(text, size));
 }
 
-uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
+namespace {
+uint32_t fs_control_core(Process& p, const SyscallRequest& r, uint64_t slot, const IoCall& call) {
   uint64_t status_block = 0, code = 0, input = 0, input_length = 0, output = 0, output_length = 0;
   if (!argument(p, r, 4, &status_block) || !argument(p, r, 5, &code) || !argument(p, r, 6, &input) || !argument(p, r, 7, &input_length) || !argument(p, r, 8, &output) ||
       !argument(p, r, 9, &output_length))
     return kAccessViolation;
-  uint64_t slot = 0;
-  if (!slot_of(r.args[0], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
   if (p.files().kind(slot) == DescriptorKind::File) return file_fs_control(p, slot, status_block, uint32_t(code), output, output_length & 0xFFFFFFFFu);
   ObjectManager* objects = system_objects();
-  if (p.files().kind(slot) == DescriptorKind::Semaphore && uint32_t(code) == kFsctlTakePort) {      // (the library's own) a packet the kernel kept for the port: { u32 bytes, u32 status, u64 key, u64 overlapped }
-    ObjectManager::PortPacket packet;
-    if (!objects || output_length < 24 || !objects->port_take_foreign(uint32_t(p.files().token(slot)), &packet)) return kNotFound;
-    uint8_t out[24] = {};
-    for (uint32_t i = 0; i < 4; ++i) { out[i] = uint8_t(packet.bytes >> (8 * i)); out[4 + i] = uint8_t(packet.status >> (8 * i)); }
-    for (uint32_t i = 0; i < 8; ++i) { out[8 + i] = uint8_t(packet.key >> (8 * i)); out[16 + i] = uint8_t(packet.overlapped >> (8 * i)); }
-    return p.write_user(output, ConstByteView(out, 24)) ? kSuccess : kAccessViolation;
-  }
   if (p.files().kind(slot) != DescriptorKind::Pipe) return kInvalidDeviceRequest;
   if (!objects) return kNotImplemented;
   const uint64_t token = p.files().token(slot);
@@ -556,6 +593,18 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
         status = res == ObjectManager::PipeResult::Ok ? kSuccess : 0x103u;
         break;
       }
+      if ((token & kAsyncIo) && !call.wait && !(token & kNoWait)) {      // an overlapped listen waits in the kernel, as a request of the pipe
+        uint32_t tag = 0;
+        const io::IoRequest pending = io_new_request(p, slot, call, 0, 0);
+        objects->sync().lock();
+        const ObjectManager::PipeResult res = objects->pipe_begin_listen_locked(id, p.id(), &tag);
+        if (res == ObjectManager::PipeResult::WouldBlock) {
+          const bool queued = pend_call(objects, pending, call.event_object != 0, token, tag);
+          objects->sync().unlock();
+          return queued ? 0x103u : kNoResources;
+        }
+        objects->sync().unlock();      // (a client is there already: the usual way tells)
+      }
       bool first = true;
       auto attempt = [&]() -> uint64_t {
         const ObjectManager::PipeResult res = objects->pipe_listen_locked(id);
@@ -568,55 +617,10 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       };
       status = wait_until(p, 0, attempt);
       if (status == kTimeout && !(token & kNoWait)) {      // (nobody is there yet: the call waits)
-        SyncWait waiting(p, id, end, status_block);
-        status = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t { return waiting.cancelled_locked() ? uint64_t{kCancelled} : attempt(); });
+        SyncWait waiting(p, id, end, status_block, (token & kAlertIo) != 0);
+        status = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t { return waiting.interrupt_locked() ? waiting.interrupt_locked() : attempt(); });
       }
       if (status == kTimeout) status = 0xC00000B3u;      // STATUS_PIPE_LISTENING: a pipe that does not wait says that nobody is there yet
-      break;
-    }
-    case kFsctlBeginRead:      // (the library's own) start a read that may have to wait: { u32 length } -> { u32 tag }; STATUS_PENDING if it waits, kNotSupported if not
-    case kFsctlBeginWrite:      // { the bytes } -> { u32 tag }; STATUS_PENDING if the write is queued and not complete, success (with the count) if it went, kNotSupported to write the usual way
-    case kFsctlBeginListen: {      // -> { u32 tag }
-      if ((token & kFolder) || output_length < 4) { status = kInvalidParameter; break; }
-      uint32_t tag = 0, length = 0;
-      ObjectManager::PipeResult res = ObjectManager::PipeResult::Ok;
-      status = kNotSupported;
-      if (uint32_t(code) == kFsctlBeginRead) {
-        uint8_t raw[4];
-        if (input_length < 4 || !p.read_user(input, ByteView(raw, 4))) { status = kInvalidParameter; break; }
-        length = raw[0] | (uint32_t{raw[1]} << 8) | (uint32_t{raw[2]} << 16) | (uint32_t{raw[3]} << 24);
-        if (token & kNoWait) break;
-        objects->sync().lock();
-        res = objects->pipe_begin_read_locked(id, end, length, (token & kMessageRead) != 0, p.id(), true, &tag);
-        objects->sync().unlock();
-      } else if (uint32_t(code) == kFsctlBeginListen) {
-        if ((end & 1) || (token & kNoWait)) { status = (end & 1) ? kInvalidDeviceRequest : kNotSupported; break; }
-        objects->sync().lock();
-        res = objects->pipe_begin_listen_locked(id, p.id(), true, &tag);
-        objects->sync().unlock();
-      } else {
-        if ((token & kNoWait) || input_length > ObjectManager::kMaxPipeWrite) break;
-        ByteBuffer data(p.files().allocator());
-        if (!data.put_zeros(input_length)) { status = kNoMemory; break; }
-        if (input_length != 0 && !p.read_user(input, data.writable_view())) return kAccessViolation;
-        uint32_t moved = 0;
-        objects->sync().lock();
-        res = objects->pipe_begin_write_locked(id, end, data.view(), p.id(), true, &tag, &moved);
-        objects->sync().unlock();
-        if (res == ObjectManager::PipeResult::Ok) { status = kSuccess; information = moved; await_delivery(p, id); break; }
-        if (res != ObjectManager::PipeResult::WouldBlock) { status = result_status(res, false, true); break; }
-        if (tag == 0) break;      // (no room in the tables: the usual way waits for it)
-      }
-      if (res != ObjectManager::PipeResult::WouldBlock) { if (uint32_t(code) == kFsctlBeginWrite) break; status = kNotSupported; break; }
-      const uint8_t out_tag[4] = {uint8_t(tag), uint8_t(tag >> 8), uint8_t(tag >> 16), uint8_t(tag >> 24)};
-      if (!p.write_user(output, ConstByteView(out_tag, 4))) {
-        objects->sync().lock();
-        objects->pipe_op_cancel_locked(id, end, tag, kCancelled);
-        objects->sync().unlock();
-        objects->pipe_op_release(id, tag);
-        return kAccessViolation;
-      }
-      status = 0x103;      // STATUS_PENDING
       break;
     }
     case kFsctlGetProcess: {      // (the library's own) { u32 which: 0 the client, 1 the server } -> { u32 process id }
@@ -632,56 +636,9 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       status = kSuccess;
       break;
     }
-    case kFsctlSetPort: {      // (the library's own) { u64 port handle, u64 key }: calls of a process that ends while they wait are reported to the port
-      uint8_t raw[16];
-      uint64_t port_slot = 0;
-      if ((token & kFolder) || input_length < 16 || !p.read_user(input, ByteView(raw, 16))) { status = kInvalidParameter; break; }
-      uint64_t handle = 0, key = 0;
-      for (uint32_t i = 0; i < 8; ++i) { handle |= uint64_t{raw[i]} << (8 * i); key |= uint64_t{raw[8 + i]} << (8 * i); }
-      if (!slot_of(handle, &port_slot) || p.files().kind(port_slot) != DescriptorKind::Semaphore) { status = kInvalidHandle; break; }
-      objects->pipe_set_port(id, end, uint32_t(p.files().token(port_slot)), key);
-      status = kSuccess;
-      break;
-    }
-    case kFsctlAwait: {      // { u32 tag }: waits for the operation, gives a read's bytes in the output buffer; its status, the count in Information
-      uint8_t raw[4];
-      if (token & kFolder) break;
-      if (input_length < 4 || !p.read_user(input, ByteView(raw, 4))) { status = kInvalidParameter; break; }
-      const uint32_t tag = raw[0] | (uint32_t{raw[1]} << 8) | (uint32_t{raw[2]} << 16) | (uint32_t{raw[3]} << 24);
-      ObjectManager::PipeOpResult result;
-      status = wait_operation(p, id, end, tag, &result);
-      information = result.transferred;
-      if (!result.data.empty()) {
-        const uint64_t n = result.transferred < output_length ? result.transferred : output_length;
-        if (n != 0 && !p.write_user(output, ConstByteView(result.data).first(n))) status = kAccessViolation;
-        information = n;
-        objects->pipe_op_free_data(result.data);
-      }
-      break;
-    }
-    case kFsctlAck: {      // { u32 tag }: the thread that waited for the operation has acted on its result
-      uint8_t raw[4];
-      if (input_length < 4 || !p.read_user(input, ByteView(raw, 4))) { status = kInvalidParameter; break; }
-      objects->pipe_op_release(id, raw[0] | (uint32_t{raw[1]} << 8) | (uint32_t{raw[2]} << 16) | (uint32_t{raw[3]} << 24));
-      if (input_length >= 5 && p.read_user(input + 4, ByteView(raw, 1)) && raw[0] != 0) objects->pipe_set_file_signaled(id, end, true);      // (it had no event of its own: the file is signalled)
-      status = kSuccess;
-      break;
-    }
-    case kFsctlCancel: {      // { u32 tag }: ends the operation (CancelIoEx); its owner has its answer when this returns
-      uint8_t raw[4];
-      if (token & kFolder) break;
-      if (input_length < 4 || !p.read_user(input, ByteView(raw, 4))) { status = kInvalidParameter; break; }
-      objects->sync().lock();
-      const ObjectManager::PipeResult res = objects->pipe_op_cancel_locked(id, end, raw[0] | (uint32_t{raw[1]} << 8) | (uint32_t{raw[2]} << 16) | (uint32_t{raw[3]} << 24), kCancelled);
-      objects->sync().unlock();
-      status = res == ObjectManager::PipeResult::Ok ? kSuccess : kNotFound;
-      await_delivery(p, id);
-      break;
-    }
     case 0x110004:      // FSCTL_PIPE_DISCONNECT
       if ((token & kFolder) || (token_end(token) & 1)) break;
       status = objects->pipe_disconnect(id) ? kSuccess : kPipeDisconnected;
-      await_delivery(p, id);
       break;
     case 0x11400C: {    // FSCTL_PIPE_PEEK: FILE_PIPE_PEEK_BUFFER { State, ReadDataAvailable, NumberOfMessages, MessageLength, Data[] }
       if (token & kFolder) break;
@@ -704,7 +661,7 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       if (res == ObjectManager::PipeResult::NotConnected) { status = kPipeDisconnected; break; }
       if (!p.write_user(output, ConstByteView(head, 16)) || (got != 0 && !p.write_user(output + 16, peeked.view().first(got)))) return kAccessViolation;
       information = 16 + got;
-      status = kSuccess;
+      status = message_length > got ? kMoreData : kSuccess;      // (part of a message: the bytes are there, and the call says there is more; message_length is 0 for a byte pipe)
       break;
     }
     case 0x110018: {    // FSCTL_PIPE_WAIT: FILE_PIPE_WAIT_FOR_BUFFER { LARGE_INTEGER Timeout; ULONG NameLength; BOOLEAN TimeoutSpecified; WCHAR Name[] }
@@ -742,40 +699,27 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       if (status == kTimeout) status = 0xC00000B5u;      // STATUS_IO_TIMEOUT (ERROR_SEM_TIMEOUT)
       break;
     }
-    case 0x11C017:      // FSCTL_PIPE_TRANSCEIVE: write the input as a message, then read the answer into the output
-    case kFsctlBeginTransact: {      // (the library's own) the same for an overlapped call: { u32 read length } -> { u32 tag } in the output, STATUS_PENDING; the answer is awaited
+    case 0x11C017: {      // FSCTL_PIPE_TRANSCEIVE: write the input as a message, then read the answer into the output (an overlapped call waits in the kernel as a request of the pipe)
       if (token & kFolder) break;
-      const bool library = uint32_t(code) == kFsctlBeginTransact;
-      uint64_t read_length = output_length;
-      if (library) {
-        uint8_t raw[4];
-        if (output_length < 4 || !p.read_user(output, ByteView(raw, 4))) { status = kInvalidParameter; break; }
-        read_length = raw[0] | (uint32_t{raw[1]} << 8) | (uint32_t{raw[2]} << 16) | (uint32_t{raw[3]} << 24);
-      }
+      const uint64_t read_length = output_length;
       if (input_length > ObjectManager::kMaxPipeWrite) { status = kNoResources; break; }
       ByteBuffer data(p.files().allocator());
       if (!data.put_zeros(input_length)) { status = kNoMemory; break; }
       if (input_length != 0 && !p.read_user(input, data.writable_view())) return kAccessViolation;
       uint32_t tag = 0;
+      const bool overlapped = (token & kAsyncIo) && !call.wait;      // (a call that waits in the kernel as a request of the pipe)
+      const io::IoRequest pending = io_new_request(p, slot, call, output, uint32_t(output_length));
       objects->sync().lock();
-      const ObjectManager::PipeResult res = objects->pipe_begin_transact_locked(id, end, data.view(), uint32_t(read_length > 0xFFFFFFFFu ? 0xFFFFFFFFu : read_length), (token & kMessageRead) != 0, p.id(), library, &tag);
+      const ObjectManager::PipeResult res = objects->pipe_begin_transact_locked(id, end, data.view(), uint32_t(read_length > 0xFFFFFFFFu ? 0xFFFFFFFFu : read_length), (token & kMessageRead) != 0, p.id(), &tag);
+      if (res == ObjectManager::PipeResult::WouldBlock && overlapped) {
+        const bool queued = pend_call(objects, pending, call.event_object != 0, token, tag);
+        objects->sync().unlock();
+        return queued ? 0x103u : kNoResources;
+      }
       objects->sync().unlock();
       if (res != ObjectManager::PipeResult::WouldBlock) { status = result_status(res, false, true); break; }
-      await_delivery(p, id);      // (reads of the other end that waited have the message)
-      if (library) {
-        const uint8_t out_tag[4] = {uint8_t(tag), uint8_t(tag >> 8), uint8_t(tag >> 16), uint8_t(tag >> 24)};
-        if (!p.write_user(output, ConstByteView(out_tag, 4))) {
-          objects->sync().lock();
-          objects->pipe_op_cancel_locked(id, end, tag, kCancelled);
-          objects->sync().unlock();
-          objects->pipe_op_release(id, tag);
-          return kAccessViolation;
-        }
-        status = 0x103;      // STATUS_PENDING
-        break;
-      }
       ObjectManager::PipeOpResult result;
-      SyncWait waiting(p, id, end);
+      SyncWait waiting(p, id, end, 0, (token & kAlertIo) != 0);
       status = wait_operation(p, id, end, tag, &result, &waiting);
       objects->pipe_op_release(id, tag);
       information = result.transferred;
@@ -789,12 +733,78 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
     }
     default: status = kInvalidDeviceRequest; break;
   }
-  if (status_block != 0) {
+  if (status_block != 0 && status != 0xC0) {
     uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
     for (uint32_t i = 0; i < 8; ++i) iosb[8 + i] = uint8_t(information >> (8 * i));
     p.write_user(status_block, ConstByteView(iosb, 16));
   }
   return status;
+}
+}  // namespace
+
+uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
+  uint64_t slot = 0;
+  if (!slot_of(r.args[0], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  IoCall call;
+  if (const uint32_t refused = io_call_begin(p, slot, r, &call)) return refused;
+  return io_call_end(p, slot, call, fs_control_core(p, r, slot, call));
+}
+
+bool pipe_handle_port(Process& p, uint64_t slot, uint32_t* port, uint64_t* key, uint32_t* flags) {
+  ObjectManager* objects = system_objects();
+  const uint64_t token = p.files().token(slot);
+  return objects && !(token & kFolder) && objects->pipe_port(token_id(token), token_end(token), port, key, flags);
+}
+
+uint32_t pipe_handle_set_port(Process& p, uint64_t slot, uint32_t port, uint64_t key) {
+  ObjectManager* objects = system_objects();
+  const uint64_t token = p.files().token(slot);
+  if (!objects) return kNotImplemented;
+  if (token & kFolder) return kInvalidParameter;
+  return objects->pipe_set_port(token_id(token), token_end(token), port, key) ? kSuccess : kInvalidParameter;
+}
+
+uint32_t pipe_handle_set_flags(Process& p, uint64_t slot, uint32_t flags) {
+  ObjectManager* objects = system_objects();
+  const uint64_t token = p.files().token(slot);
+  if (!objects) return kNotImplemented;
+  if (token & kFolder) return kInvalidParameter;
+  objects->pipe_set_port_flags(token_id(token), token_end(token), flags);
+  return kSuccess;
+}
+
+void pipe_handle_flags(Process& p, uint64_t slot, uint32_t* flags) {
+  uint32_t port = 0;
+  uint64_t key = 0;
+  *flags = 0;
+  pipe_handle_port(p, slot, &port, &key, flags);
+}
+
+uint32_t pipe_handle_cancel(Process& p, uint64_t slot, uint64_t thread, uint64_t status_block) {
+  ObjectManager* objects = system_objects();
+  const uint64_t token = p.files().token(slot);
+  if (!objects || (token & kFolder)) return 0;
+  objects->sync().lock();
+  const uint32_t n = objects->io_cancel_locked(token_id(token), token_end(token) & 1, p.id(), thread, status_block, kCancelled);
+  objects->sync().unlock();
+  return n;
+}
+
+void pipe_handle_signal(Process& p, uint64_t slot) {
+  ObjectManager* objects = system_objects();
+  const uint64_t token = p.files().token(slot);
+  if (objects && !(token & kFolder)) objects->io_signal_source(token_id(token), token_end(token) & 1);
+}
+
+void pipe_handle_closed(Process& p, uint64_t token) {
+  ObjectManager* objects = system_objects();
+  if (!objects || (token & kFolder)) return;
+  const uint64_t mask = 0x00FFFFFFFFFFFFFFull;      // (the object and the end code: the flags are the handle's)
+  for (uint64_t slot = 0; slot < Process::kMaxDescriptors; ++slot)
+    if (p.files().kind(slot) == DescriptorKind::Pipe && (p.files().token(slot) & mask) == (token & mask)) return;      // (another handle of the process holds the file object)
+  objects->sync().lock();
+  objects->io_cancel_locked(token_id(token), token_end(token) & 1, p.id(), 0, 0, kCancelled, true);
+  objects->sync().unlock();
 }
 
 }  // namespace process::windowsabi

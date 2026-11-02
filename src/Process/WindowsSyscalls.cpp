@@ -17,6 +17,7 @@
  */
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsIo.hpp"
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsThreads.hpp"
 #include "Process/WindowsLocks.hpp"
@@ -166,10 +167,26 @@ class WindowsSyscalls final : public ISyscallInterface {
   SyscallAbi abi() const override { return SyscallAbi::Windows; }
   UserArch arch() const override { return UserArch::X86_64; }
 
+  // The calls that waited in the kernel and finished since (the answer of another thread, another program, the end of a handle) are applied to this program's memory before
+  // the call begins and once it is over, so that whatever the program looks at next is there.
   uint64_t dispatch(Process& process, const SyscallRequest& r) const override {
+    windowsabi::io_reap_if_needed(process);
+    const uint64_t result = dispatch_service(process, r);
+    windowsabi::io_reap_if_needed(process);
+    return result;
+  }
+
+  uint64_t dispatch_service(Process& process, const SyscallRequest& r) const {
     if (r.number > 0xFFFFFFFFu) return kStatusInvalidSystemService;
     refresh_shared_user_data(process.host());
     switch (static_cast<WindowsSyscallNumber>(r.number)) {
+      case WindowsSyscallNumber::NtCancelIoFile: return windowsabi::nt_cancel_io_file(process, r);
+      case WindowsSyscallNumber::NtCancelIoFileEx: return windowsabi::nt_cancel_io_file_ex(process, r);
+      case WindowsSyscallNumber::NtSetIoCompletion: return windowsabi::nt_set_io_completion(process, r);
+      case WindowsSyscallNumber::NtSetIoCompletionEx: return windowsabi::nt_set_io_completion_ex(process, r);
+      case WindowsSyscallNumber::NtRemoveIoCompletion: return windowsabi::nt_remove_io_completion(process, r);
+      case WindowsSyscallNumber::NtRemoveIoCompletionEx: return windowsabi::nt_remove_io_completion_ex(process, r);
+      case WindowsSyscallNumber::NtQueryIoCompletion: return windowsabi::nt_query_io_completion(process, r);
       case WindowsSyscallNumber::NtReadFile: return windowsabi::nt_read_file(process, r);
       case WindowsSyscallNumber::NtWriteFile: return windowsabi::nt_write_file(process, r);
       case WindowsSyscallNumber::NtClose: return windowsabi::nt_close(process, r);
