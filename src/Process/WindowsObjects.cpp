@@ -187,6 +187,12 @@ uint32_t resolve_name(Process& p, ObjectManager& objects, uint64_t attributes, b
     request.has_root = true;
     request.root_path = StringView(root_path, n);
   }
+  {      // \Device\NamedPipe (and what is below it) belongs to the pipe file system, not to the object manager's directories: it is of the wrong type
+    static const char device[] = "\\Device\\NamedPipe";
+    bool same = root == 0 && size >= sizeof(device) - 1 && (size == sizeof(device) - 1 || name[sizeof(device) - 1] == '\\');
+    for (uint32_t i = 0; same && i < sizeof(device) - 1; ++i) same = (name[i] | 0x20) == (device[i] | 0x20);
+    if (same) return kTypeMismatch;
+  }
   request.name_given = true;
   request.name = StringView(name, size);
   ManagerLookup lookup(objects);
@@ -1592,6 +1598,13 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
           for (uint32_t i = 0; i < n; ++i) text[i] = full.view()[i];
           chars = n;
         }
+      } else if (objects && kind == DescriptorKind::Pipe) {      // "\Device\NamedPipe\name"; an unnamed instance, the pipe device and its directory have no path
+        char flat[ObjectManager::kNameBytes];
+        const uint32_t flat_size = (p.files().token(slot) >> 63) ? 0 : objects->object_name(uint32_t(p.files().token(slot)), flat, sizeof(flat));
+        if (flat_size == 0 || flat[0] == 1) return 0xC0000039u;      // STATUS_OBJECT_PATH_INVALID
+        static const char prefix[] = "\\Device\\NamedPipe\\";
+        for (uint32_t i = 0; prefix[i] && chars < sizeof(text); ++i) text[chars++] = prefix[i];
+        for (uint32_t i = 0; i < flat_size && chars < sizeof(text); ++i) text[chars++] = flat[i];
       } else if (objects && is_object_kind(kind)) {
         char flat[ObjectManager::kNameBytes];
         const uint32_t flat_size = objects->object_name(uint32_t(p.files().token(slot)), flat, sizeof(flat));
