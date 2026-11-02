@@ -35,6 +35,9 @@ uint32_t nt_set_context_thread(Process& p, const SyscallRequest& r);
 void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code);
 uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_queue_apc_thread(Process& p, const SyscallRequest& r);
+// NtQueueApcThreadEx(Thread, ReserveHandle, Routine, A1, A2, A3) and NtQueueApcThreadEx2(Thread, ReserveHandle, Flags, Routine, A1, A2, A3): the reserve handle is 0, a flag value
+// or a reserve object (allocated with NtAllocateReserveObject) that is in use until the APC has run.
+uint32_t nt_queue_apc_thread_ex(Process& p, const SyscallRequest& r, bool with_flags);
 uint32_t nt_dequeue_apc(Process& p, const SyscallRequest& r);
 uint32_t nt_open_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r);

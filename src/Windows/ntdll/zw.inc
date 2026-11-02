@@ -135,7 +135,6 @@ ZW_SERVICE(NtCreateTimer2, ZwCreateTimer2);
 ZW_SERVICE(NtCreateTokenEx, ZwCreateTokenEx);
 ZW_SERVICE(NtCreateTransaction, ZwCreateTransaction);
 ZW_SERVICE(NtCreateTransactionManager, ZwCreateTransactionManager);
-ZW_SERVICE(NtCreateUserProcess, ZwCreateUserProcess);
 ZW_SERVICE(NtCreateWaitCompletionPacket, ZwCreateWaitCompletionPacket);
 ZW_SERVICE(NtCreateWaitablePort, ZwCreateWaitablePort);
 ZW_SERVICE(NtCreateWnfStateName, ZwCreateWnfStateName);

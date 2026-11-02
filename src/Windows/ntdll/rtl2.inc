@@ -1185,6 +1185,7 @@ static const ULONG g_params_strings[8] = {0x38, 0x50, 0x60, 0x70, 0xB0, 0xC0, 0x
 static ULONG_PTR params_align(ULONG_PTR v, ULONG to) { return (v + to - 1) & ~(ULONG_PTR)(to - 1); }
 
 /* RtlCreateProcessParameters: one heap block with the header, the strings (kept as offsets from the block: not normalized) and then the environment. */
+PVOID NTAPI RtlNormalizeProcessParams(PVOID params);
 EXPORT NTSTATUS NTAPI RtlCreateProcessParametersEx(PVOID *result, const UNICODE_STRING *image, const UNICODE_STRING *dll_path, const UNICODE_STRING *current_directory, const UNICODE_STRING *command_line,
                                                    PWSTR environment, const UNICODE_STRING *title, const UNICODE_STRING *desktop, const UNICODE_STRING *shell, const UNICODE_STRING *runtime, ULONG flags) {
   static const UNICODE_STRING empty = {0, 2, NULL}, none = {0, 0, NULL};
@@ -1233,8 +1234,8 @@ EXPORT NTSTATUS NTAPI RtlCreateProcessParametersEx(PVOID *result, const UNICODE_
   *(PVOID *)(block + 0x80) = block + size;
   memcpy(block + size, env, env_chars * 2);
   *(SIZE_T *)(block + 0x3F0) = total - size;
-  (void)flags;
   *result = block;
+  if (flags & 1 /* RTL_USER_PROC_PARAMS_NORMALIZED */) RtlNormalizeProcessParams(block);
   return STATUS_SUCCESS;
 }
 EXPORT NTSTATUS NTAPI RtlCreateProcessParameters(PVOID *result, const UNICODE_STRING *image, const UNICODE_STRING *dll_path, const UNICODE_STRING *current_directory, const UNICODE_STRING *command_line,

@@ -55,7 +55,7 @@ uint64_t Process::syscall(const SyscallRequest& request) {
 }
 
 namespace {
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve; }
 }  // namespace
 
 Process::~Process() {

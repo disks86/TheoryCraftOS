@@ -64,7 +64,6 @@ NT_SERVICE(NtDuplicateObject);
 NT_SERVICE(NtSuspendThread);
 NT_SERVICE(NtGetContextThread);
 NT_SERVICE(NtSetContextThread);
-NT_SERVICE(NtCreateUserProcess);
 NT_SERVICE(NtQueueApcThread);
 NT_SERVICE(NtDequeueApc);
 NT_SERVICE_RAW(NtSignalAndWaitForSingleObject);
@@ -543,9 +542,10 @@ EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
 EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0 && !g_cs_taken_over; }
 
 /* The thread ends (the libraries and the program are told); the process ends with its last thread. */
+static int thread_skips_attach(void) { return (*(USHORT *)((BYTE *)NtCurrentTeb() + 0x17EE) & 0x08) != 0; }      /* TEB.SameTebFlags.SkipThreadAttach */
 EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
   fls_destroy_current(0);
-  if (!g_process_ending) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
+  if (!g_process_ending && !thread_skips_attach()) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
   fls_destroy_current(1);
   RtlFreeThreadActivationContextStack();
   { HANDLE *debug_object = (HANDLE *)((BYTE *)NtCurrentTeb() + 0x1660); if (*debug_object) { NtClose(*debug_object); *debug_object = NULL; } }      /* (a thread that debugged lets go of it) */
@@ -561,9 +561,11 @@ static void reset_floating_point(void) {
 }
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
   reset_floating_point();
-  if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)((BYTE *)NtCurrentTeb() + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
-  fls_thread_begins();
-  notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
+  if (!thread_skips_attach()) {      /* (a thread made with THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH has neither thread-local storage nor a call to the libraries) */
+    if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)((BYTE *)NtCurrentTeb() + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
+    fls_thread_begins();
+    notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
+  }
   RtlExitUserThread((NTSTATUS)start(parameter));
 }
 
@@ -936,6 +938,7 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "rtl2.inc"
 #include "rtl3.inc"
 #include "atom.inc"
+#include "ps.inc"
 #include "sec.inc"
 #include "uilang.inc"
 #include "normalize.inc"

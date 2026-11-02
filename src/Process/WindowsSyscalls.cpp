@@ -167,6 +167,9 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtUnlockFile: return windowsabi::nt_unlock_file(process, r);
       case WindowsSyscallNumber::NtCreateJobObject: return windowsabi::nt_create_job_object(process, r);
       case WindowsSyscallNumber::NtOpenJobObject: return windowsabi::nt_open_job_object(process, r);
+      case WindowsSyscallNumber::NtAllocateReserveObject: return windowsabi::nt_allocate_reserve_object(process, r);
+      case WindowsSyscallNumber::NtQueueApcThreadEx: return windowsabi::nt_queue_apc_thread_ex(process, r, false);
+      case WindowsSyscallNumber::NtQueueApcThreadEx2: return windowsabi::nt_queue_apc_thread_ex(process, r, true);
       case WindowsSyscallNumber::NtCreateKeyedEvent: return windowsabi::nt_create_keyed_event(process, r);
       case WindowsSyscallNumber::NtOpenKeyedEvent: return windowsabi::nt_open_keyed_event(process, r);
       case WindowsSyscallNumber::NtCreateIoCompletion: return windowsabi::nt_create_io_completion(process, r);

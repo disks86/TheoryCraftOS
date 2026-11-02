@@ -178,7 +178,7 @@ def do_build(out, names):
     report = {"built": [], "compile_failed": [], "link_failed": []}
     for dll in dll_dirs(names):
         src = os.path.join(HERE, dll)
-        files = [x for x in sorted(glob.glob(os.path.join(src, "*.c"))) if os.path.basename(x) != "dummy.c"]
+        files = [x for x in sorted(glob.glob(os.path.join(src, "*.c"))) if os.path.basename(x) not in ("dummy.c", "testdll.c")]
         objdir = os.path.join(OUT, "obj", dll)
         os.makedirs(objdir, exist_ok=True)
 
@@ -193,25 +193,26 @@ def do_build(out, names):
         # resources (the manifests and menus some tests look for in their own image) go into every program of the DLL
         resources = []
         # a test library (dummy.c, dummy.spec) is built and put into the programs as the resource TESTDLL "dummy.dll", which tests write out as a file and load
-        dummy_c, dummy_spec = os.path.join(src, "dummy.c"), os.path.join(src, "dummy.spec")
-        if os.path.exists(dummy_c) and os.path.exists(dummy_spec):
-            exports = re.findall(r"^@\s+\w+\s+(\w+)", open(dummy_spec).read(), re.M)
-            deff = os.path.join(objdir, "dummy.def")
-            with open(deff, "w") as f:
-                f.write("LIBRARY dummy.dll\nEXPORTS\n" + "".join("  %s\n" % e for e in exports))
-            dobj = os.path.join(objdir, "dummy_lib.o")
-            dll_path = os.path.join(objdir, "dummy.dll")
-            r = compile_one(dummy_c, dobj, dll_gen)
-            if r.returncode == 0:
-                r = run([CC, "-shared", "-nostdlib", "-nostartfiles", "-o", dll_path, dobj, deff, "-Wl,--entry=DllMain", "-lkernel32"])
-            if r.returncode == 0:
-                drc = os.path.join(objdir, "dummy_dll.rc")
-                with open(drc, "w") as f:
-                    f.write('"dummy.dll" TESTDLL "%s"\n' % dll_path.replace("\\", "/"))
-                ro = os.path.join(objdir, "dummy_dll_rc.o")
-                r = run([CC.replace("gcc", "windres"), "-O", "coff", "-o", ro, drc])
+        for libname in ("dummy", "testdll"):
+            dummy_c, dummy_spec = os.path.join(src, libname + ".c"), os.path.join(src, libname + ".spec")
+            if os.path.exists(dummy_c) and os.path.exists(dummy_spec):
+                exports = re.findall(r"^@\s+(\w+)\s+(\w+)", open(dummy_spec).read(), re.M)
+                deff = os.path.join(objdir, libname + ".def")
+                with open(deff, "w") as f:
+                    f.write("LIBRARY %s.dll\nEXPORTS\n" % libname + "".join("  %s%s\n" % (e[1], " DATA" if e[0] == "extern" else "") for e in exports))
+                dobj = os.path.join(objdir, libname + "_lib.o")
+                dll_path = os.path.join(objdir, libname + ".dll")
+                r = compile_one(dummy_c, dobj, dll_gen)
                 if r.returncode == 0:
-                    resources.append(ro)
+                    r = run([CC, "-shared", "-nostdlib", "-nostartfiles", "-o", dll_path, dobj, deff, "-Wl,--entry=DllMain", "-lkernel32"])
+                if r.returncode == 0:
+                    drc = os.path.join(objdir, libname + "_dll.rc")
+                    with open(drc, "w") as f:
+                        f.write('"%s.dll" TESTDLL "%s"\n' % (libname, dll_path.replace("\\", "/")))
+                    ro = os.path.join(objdir, libname + "_dll_rc.o")
+                    r = run([CC.replace("gcc", "windres"), "-O", "coff", "-o", ro, drc])
+                    if r.returncode == 0:
+                        resources.append(ro)
         for rc in sorted(glob.glob(os.path.join(src, "*.rc"))):
             ro = os.path.join(objdir, os.path.basename(rc)[:-3] + "_rc.o")
             r = run([CC.replace("gcc", "windres"), "-I", os.path.join(HERE, "include"), "-I", src, "-I", os.path.join(OUT, "gen"), "-D__WINESRC__", "--preprocessor-arg=-w",

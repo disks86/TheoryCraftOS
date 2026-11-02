@@ -2511,7 +2511,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
       }
     }
   }
-  const NTSTATUS status = NtCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
+  const NTSTATUS status = TcosCreateUserProcess(&process, &thread, &image_name, &command, cwd_pointer, environment ? environment : GetEnvironmentStringsW(), nt_flags, &process_id,
                                               &thread_id, std_in, std_out, std_err, &block);
   if (!NT_SUCCESS(status)) {
     if (status == (NTSTATUS)0xC000007B) set_error(ERROR_BAD_EXE_FORMAT);

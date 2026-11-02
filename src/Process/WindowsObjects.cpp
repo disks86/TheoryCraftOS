@@ -41,7 +41,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -55,6 +55,7 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Token: return DescriptorKind::Token;
     case ObjectKind::KeyedEvent: return DescriptorKind::KeyedEvent;
     case ObjectKind::IoCompletion: return DescriptorKind::IoCompletion;
+    case ObjectKind::Reserve: return DescriptorKind::Reserve;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -167,6 +168,7 @@ bool kind_access(DescriptorKind kind, KindAccess* out) {
     case DescriptorKind::Key: *out = {0xF003Fu, {0x20019u, 0x20006u, 0x20019u, 0xF003Fu}}; return true;
     case DescriptorKind::Token: *out = {0xF01FFu, {0x20018u, 0x200E0u, 0x20000u, 0xF01FFu}}; return true;
     case DescriptorKind::KeyedEvent: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::Reserve: *out = {0x1F0001u, {0x20001u, 0x20000u, 0x120000u, 0x1F0001u}}; return true;
     case DescriptorKind::IoCompletion: *out = {0x1F0003u, {0x120001u, 0x120002u, 0x120000u, 0x1F0003u}}; return true;
     case DescriptorKind::DebugObject: *out = {0x1F000Fu, {0x20001u, 0x20002u, 0x120000u, 0x1F000Fu}}; return true;
     case DescriptorKind::File: case DescriptorKind::Directory: case DescriptorKind::Pipe: *out = {0x1F01FFu, {0x120089u, 0x120116u, 0x1200A0u, 0x1F01FFu}}; return true;
@@ -1048,6 +1050,24 @@ uint32_t nt_create_debug_object(Process& p, const SyscallRequest& r) {
   return status;
 }
 uint32_t nt_open_job_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Job); }
+// NtAllocateReserveObject(PHANDLE, POBJECT_ATTRIBUTES, MEMORY_RESERVE_TYPE: 0 user APC, 1 I/O completion)
+uint32_t nt_allocate_reserve_object(Process& p, const SyscallRequest& r) {
+  if (r.args[2] > 1) return kInvalidParameter;
+  SyscallRequest forward = r;
+  forward.args[2] = r.args[1];      // (create_object takes the attributes from the third argument)
+  return create_object(p, forward, ObjectKind::Reserve, false, false, 0, int32_t(r.args[2]));
+}
+// The reserve object a handle names, for an APC that uses it (kSuccess and *id; STATUS_INVALID_HANDLE; STATUS_OBJECT_TYPE_MISMATCH; STATUS_INVALID_PARAMETER_2 when it is in use).
+uint32_t reserve_take_handle(Process& p, uint64_t handle, uint32_t* id) {
+  uint64_t slot = 0;
+  if (!slot_of(handle, &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (p.files().kind(slot) != DescriptorKind::Reserve) return 0xC0000024u;
+  ObjectManager* objects = system_objects();
+  if (!objects) return kInvalidHandle;
+  *id = uint32_t(p.files().token(slot));
+  return objects->reserve_take(*id);
+}
+void reserve_give_back(uint32_t id) { if (ObjectManager* objects = system_objects()) objects->reserve_give_back(id); }
 // Keyed events and I/O completion ports are made and found by name here; the waiting and queueing of them is not done yet.
 uint32_t nt_create_keyed_event(Process& p, const SyscallRequest& r) { return r.args[3] != 0 ? kInvalidParameter : create_object(p, r, ObjectKind::KeyedEvent, false, false, 0, 0); }      // (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG Flags)
 uint32_t nt_open_keyed_event(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::KeyedEvent); }
@@ -1350,6 +1370,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::DebugObject: type = "DebugObject"; break;
         case DescriptorKind::KeyedEvent: type = "KeyedEvent"; break;
         case DescriptorKind::IoCompletion: type = "IoCompletion"; break;
+        case DescriptorKind::Reserve: type = "UserApcReserve"; break;
         case DescriptorKind::Token: type = "Token"; break;
         case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
         case DescriptorKind::Mailslot: type = "Mailslot"; break;

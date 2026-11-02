@@ -45,7 +45,7 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve };
 
 class ObjectManager {
  public:
@@ -344,6 +344,8 @@ class ObjectManager {
   // Arms the timer: due at `due_ns` on the clock of sync().now_ns() (periodic every `period_ns`, 0: once). With a `routine`, `thread` gets it as an APC each time it fires.
   uint32_t set_timer(uint32_t id, uint64_t due_ns, uint64_t period_ns, uint64_t thread, uint64_t routine, uint64_t context, bool* was_signaled);
   uint32_t cancel_timer(uint32_t id, bool* was_signaled);
+  uint32_t reserve_take(uint32_t id);      // (kind Reserve) see Objects.cpp
+  void reserve_give_back(uint32_t id);
   uint32_t query_timer(uint32_t id, uint64_t* remaining_ns, bool* signaled);
   // The timers that fired for `thread` since it asked (the lock must be held). Their routines are returned in `out`; the number in *count.
   void take_timer_apcs_locked(uint64_t thread, TimerApc* out, uint32_t capacity, uint32_t* count);
