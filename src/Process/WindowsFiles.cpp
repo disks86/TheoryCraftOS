@@ -745,6 +745,14 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   ProcessFiles& files = p.files();
   const DescriptorKind kind = files.kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
+  if (static_cast<uint32_t>(info_class) == 8 || static_cast<uint32_t>(info_class) == 41) {      // FileAccessInformation, FileIoCompletionNotificationInformation: only of a file
+    switch (kind) {
+      case DescriptorKind::Event: case DescriptorKind::Mutex: case DescriptorKind::Semaphore: case DescriptorKind::Process: case DescriptorKind::Thread: case DescriptorKind::Timer:
+      case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: case DescriptorKind::DebugObject: case DescriptorKind::KeyedEvent:
+      case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: case DescriptorKind::ObjectDirectory: case DescriptorKind::SymbolicLink: case DescriptorKind::Token: return 0xC0000024u;
+      default: break;
+    }
+  }
   if (kind == DescriptorKind::ConsoleInput && static_cast<uint32_t>(info_class) == 24) {      // FilePipeLocalInformation: what the console input could give at once
     bool at_end = false;
     const uint64_t available = p.host().console_input_available(&at_end);
@@ -812,6 +820,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       break;
     case kFilePositionInformation: put(v, 0, object ? object->position : 0, 8); size = 8; break;
     case 8: put(v, 0, object ? object->granted_access : 0, 4); size = 4; break;      // FileAccessInformation: the access the handle was opened with
+    case 41: put(v, 0, 0, 4); size = 4; break;      // FileIoCompletionNotificationInformation: no flags set
     case 6: put(v, 0, object ? file_id_of(object->path.view()) : 0, 8); size = 8; break;      // FileInternalInformation: the index of the file
     case kFileNetworkOpenInformation:
       write_times(v, 0, e);
@@ -1280,7 +1289,7 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
   switch (kind) {      // an event, a section, a thread ... is not a file
     case DescriptorKind::Event: case DescriptorKind::Mutex: case DescriptorKind::Semaphore: case DescriptorKind::Process: case DescriptorKind::Thread: case DescriptorKind::Timer:
-    case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: case DescriptorKind::DebugObject: case DescriptorKind::KeyedEvent: case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH
+    case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: case DescriptorKind::DebugObject: case DescriptorKind::KeyedEvent: case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: case DescriptorKind::ObjectDirectory: case DescriptorKind::SymbolicLink: return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH
     default: break;
   }
   const uint32_t volume_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the argument is not defined)

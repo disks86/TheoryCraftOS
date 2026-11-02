@@ -36,12 +36,12 @@ namespace {
 
 constexpr uint32_t kUserApc = 0xC0, kSuccess = 0, kTimeout = 0x102, kAlerted = 0x101, kAbandonedWait0 = 0x80, kNotImplemented = 0xC0000002u, kInvalidHandle = 0xC0000008u,
                    kInvalidParameter = 0xC000000Du, kAccessViolation = 0xC0000005u, kTypeMismatch = 0xC0000024u, kNoResources = 0xC000009Au,
-                   kNameInvalid = 0xC0000033u, kNameTooLong = 0xC0000106u;
+                   kNameInvalid = 0xC0000033u, kNameTooLong = 0xC0000106u, kNameExistsStatus = 0x40000000u;
 constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve || k == DescriptorKind::ObjectDirectory || k == DescriptorKind::SymbolicLink; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -56,6 +56,8 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::KeyedEvent: return DescriptorKind::KeyedEvent;
     case ObjectKind::IoCompletion: return DescriptorKind::IoCompletion;
     case ObjectKind::Reserve: return DescriptorKind::Reserve;
+    case ObjectKind::Directory: return DescriptorKind::ObjectDirectory;
+    case ObjectKind::SymbolicLink: return DescriptorKind::SymbolicLink;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -67,23 +69,19 @@ bool slot_of(uint64_t handle, uint64_t* slot) {
   return true;
 }
 
-constexpr char kSessionMark = 1;      // (the first character of a name in the directory of the session, Sessions/1/BaseNamedObjects)
-
-// The name in an OBJECT_ATTRIBUTES, as UTF-8 without the "\BaseNamedObjects\" in front. An object without a name has an empty one.
-uint32_t read_name(Process& p, uint64_t attributes, char* out, uint32_t capacity, uint32_t* size) {
+// The name in an UNICODE_STRING, as UTF-8. 0x80000002 (STATUS_DATATYPE_MISALIGNMENT) for characters at an odd address.
+uint32_t read_unicode_string(Process& p, uint64_t string_at, char* out, uint32_t capacity, uint32_t* size) {
   *size = 0;
-  if (attributes == 0) return kSuccess;
-  uint64_t name_at = 0;
-  if (!p.read_user_u64(attributes + 16, &name_at)) return kAccessViolation;
-  if (name_at == 0) return kSuccess;
   uint8_t header[16];
-  if (!p.read_user(name_at, ByteView(header, sizeof(header)))) return kAccessViolation;
+  if (!p.read_user(string_at, ByteView(header, sizeof(header)))) return kAccessViolation;
   const uint32_t bytes = uint32_t(header[0]) | uint32_t(header[1]) << 8;
   uint64_t buffer = 0;
   for (int i = 0; i < 8; ++i) buffer |= uint64_t{header[8 + i]} << (8 * i);
   if (bytes == 0) return kSuccess;
-  if (bytes % 2 != 0 || bytes > 2 * 256) return kNameTooLong;
-  uint8_t units[2 * 256];
+  if (buffer % 2 != 0) return 0x80000002u;
+  if (bytes % 2 != 0 || bytes >= 65534) return kNameInvalid;
+  if (bytes > 2 * ObjectManager::kNameBytes) return kNameTooLong;
+  uint8_t units[2 * ObjectManager::kNameBytes];
   if (!p.read_user(buffer, ByteView(units, bytes))) return kAccessViolation;
   uint32_t n = 0;
   for (uint32_t i = 0; i < bytes / 2; ++i) {
@@ -101,39 +99,98 @@ uint32_t read_name(Process& p, uint64_t attributes, char* out, uint32_t capacity
     if (n + len >= capacity) return kNameTooLong;
     for (uint32_t k = 0; k < len; ++k) out[n++] = encoded[k];
   }
-  // Names are in the object directory of the session: "\BaseNamedObjects\Name" is "Name".
-  static const char prefix[] = "\\BaseNamedObjects\\";
-  const uint32_t plen = sizeof(prefix) - 1;
-  bool has_prefix = n >= plen;
-  for (uint32_t i = 0; has_prefix && i < plen; ++i) {
-    const char a = out[i] >= 'A' && out[i] <= 'Z' ? char(out[i] + 32) : out[i];
-    const char b = prefix[i] >= 'A' && prefix[i] <= 'Z' ? char(prefix[i] + 32) : prefix[i];
-    has_prefix = a == b;
-  }
-  if (has_prefix) {
-    for (uint32_t i = plen; i < n; ++i) out[i - plen] = out[i];
-    n -= plen;
-  } else {
-    // "Sessions/<n>/BaseNamedObjects/Name" (with backslashes): the directory of a session; a name of it starts with kSessionMark (a name asked for later says which directory it is in).
-    static const char sessions[] = "\\sessions\\", base[] = "\\basenamedobjects\\";
-    uint32_t at = sizeof(sessions) - 1;
-    bool match = n > at;
-    for (uint32_t i = 0; match && i < at; ++i) match = (out[i] >= 'A' && out[i] <= 'Z' ? char(out[i] + 32) : out[i]) == sessions[i];
-    uint32_t digits = 0;
-    while (match && at + digits < n && out[at + digits] >= '0' && out[at + digits] <= '9') ++digits;
-    match = match && digits != 0;
-    at += digits;
-    for (uint32_t i = 0; match && i < sizeof(base) - 1; ++i) match = at + i < n && (out[at + i] >= 'A' && out[at + i] <= 'Z' ? char(out[at + i] + 32) : out[at + i]) == base[i];
-    if (match) {
-      at += sizeof(base) - 1;
-      for (uint32_t i = at; i < n; ++i) out[i - at + 1] = out[i];
-      out[0] = kSessionMark;
-      n = n - at + 1;
-    }
-  }
-  for (uint32_t i = 0; i < n; ++i) if (out[i] == '\\' ) return kNameInvalid;      // (a name has no folders)
   *size = n;
   return kSuccess;
+}
+
+// UTF-8 to the UTF-16 units of a Windows string; the number of units (the text is cut at `capacity`).
+uint32_t utf8_to_utf16(StringView text, uint16_t* out, uint32_t capacity) {
+  uint32_t n = 0;
+  for (uint64_t i = 0; i < text.size() && n < capacity;) {
+    const uint8_t c = uint8_t(text[i]);
+    uint32_t cp = c, extra = 0;
+    if (c >= 0xF0) { cp = c & 7; extra = 3; }
+    else if (c >= 0xE0) { cp = c & 15; extra = 2; }
+    else if (c >= 0xC0) { cp = c & 31; extra = 1; }
+    ++i;
+    for (uint32_t k = 0; k < extra && i < text.size(); ++k, ++i) cp = (cp << 6) | (uint8_t(text[i]) & 0x3F);
+    if (cp >= 0x10000 && n + 2 <= capacity) { cp -= 0x10000; out[n++] = uint16_t(0xD800 + (cp >> 10)); out[n++] = uint16_t(0xDC00 + (cp & 0x3FF)); }
+    else if (cp < 0x10000) out[n++] = uint16_t(cp);
+  }
+  return n;
+}
+
+// The walk of the object manager's names (ObjectPath.hpp) with the objects of the system behind it.
+class ManagerLookup final : public objpath::ILookup {
+ public:
+  explicit ManagerLookup(ObjectManager& objects) : objects_(objects) {}
+  bool find(StringView flat, bool case_insensitive, objpath::Entry* out) override { return objects_.lookup_entry(flat, case_insensitive, out); }
+
+ private:
+  ObjectManager& objects_;
+};
+
+// What OBJECT_ATTRIBUTES (and the walk of its name) says.
+struct Named {
+  objpath::Resolved res;
+  uint32_t same_object = 0;     // an empty name below a handle: the object of that handle itself (its object id), of the descriptor kind below
+  DescriptorKind same_kind = DescriptorKind::Closed;
+  bool anonymous = false;      // no name: an object nobody can find by name
+  bool openif = false;         // OBJ_OPENIF
+  StringView flat() const { return anonymous ? StringView() : StringView(res.flat, res.flat_size); }
+  objpath::EntryKind exists() const { return anonymous ? objpath::EntryKind::None : res.entry.kind; }
+};
+
+constexpr uint32_t kObjOpenIf = 0x80, kObjOpenLink = 0x100, kObjCaseInsensitive = 0x40;
+
+uint32_t resolve_name(Process& p, ObjectManager& objects, uint64_t attributes, bool creating, bool open_link, Named* out) {
+  if (attributes == 0) {
+    if (!creating) return kInvalidParameter;
+    out->anonymous = true;
+    return kSuccess;
+  }
+  uint8_t head[48];
+  if (!p.read_user(attributes, ByteView(head, sizeof(head)))) return kAccessViolation;
+  auto u32 = [&](int at) { return uint32_t(head[at]) | uint32_t(head[at + 1]) << 8 | uint32_t(head[at + 2]) << 16 | uint32_t(head[at + 3]) << 24; };
+  auto u64 = [&](int at) { return uint64_t(u32(at)) | uint64_t(u32(at + 4)) << 32; };
+  if (u32(0) != sizeof(head)) return kInvalidParameter;
+  const uint64_t root = u64(8), name_at = u64(16);
+  const uint32_t flags = u32(24);
+  out->openif = (flags & kObjOpenIf) != 0;
+  objpath::ResolveRequest request;
+  request.case_insensitive = (flags & kObjCaseInsensitive) != 0;
+  request.open_link = open_link || (flags & kObjOpenLink) != 0;
+  char name[ObjectManager::kNameBytes + 1];
+  uint32_t size = 0;
+  if (name_at == 0) {
+    if (root != 0) return kNameInvalid;
+    if (!creating) return objpath::kStatusPathSyntaxBad;
+    out->anonymous = true;
+    return kSuccess;
+  }
+  if (const uint32_t status = read_unicode_string(p, name_at, name, ObjectManager::kNameBytes, &size)) return status;
+  if (size == 0 && creating) { out->anonymous = true; return kSuccess; }      // (an empty name makes an object without a name, whatever the directory)
+  char root_path[objpath::kMaxPath];
+  if (root != 0) {
+    uint64_t slot = 0;
+    if (!slot_of(root, &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+    if (size == 0) {      // (the handle itself is what is opened)
+      if (!is_object_kind(p.files().kind(slot))) return kTypeMismatch;
+      out->same_object = uint32_t(p.files().token(slot));
+      out->same_kind = p.files().kind(slot);
+      return kSuccess;
+    }
+    if (p.files().kind(slot) != DescriptorKind::ObjectDirectory) return kTypeMismatch;
+    const uint32_t n = objects.object_text(uint32_t(p.files().token(slot)), root_path, sizeof(root_path));
+    if (n == 0) return objpath::kStatusPathNotFound;
+    request.has_root = true;
+    request.root_path = StringView(root_path, n);
+  }
+  request.name_given = true;
+  request.name = StringView(name, size);
+  ManagerLookup lookup(objects);
+  objpath::resolve(lookup, request, &out->res);
+  return out->res.status;
 }
 
 // Puts a handle for the object in the process's table and writes it to *handle_at.
@@ -256,18 +313,32 @@ uint32_t object_access_for_process(uint64_t pid, uint32_t id, DescriptorKind kin
   return result.status == 0 ? kSuccess : (result.status ? result.status : kAccessDeniedStatus);
 }
 
-uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, bool manual_reset, bool state, int32_t initial, int32_t maximum) {
+// Makes the object (or finds the one with the name). `text` is kept with it (a directory's path, a link's target).
+uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, bool manual_reset, bool state, int32_t initial, int32_t maximum, StringView text = StringView(), bool collide = true) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
-  char name[ObjectManager::kNameBytes + 1];
-  uint32_t size = 0;
-  const uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &size);
-  if (status != kSuccess) return status;
+  if (!p.write_user_u64(r.args[0], 0)) return kAccessViolation;      // (no handle, until there is one)
+  Named n;
+  if (const uint32_t status = resolve_name(p, *objects, r.args[2], true, kind == ObjectKind::SymbolicLink, &n)) return status;
+  const bool directory_or_link = n.exists() == objpath::EntryKind::Directory || n.exists() == objpath::EntryKind::Link;
+  const bool same_kind = (kind == ObjectKind::Directory && n.exists() == objpath::EntryKind::Directory) || (kind == ObjectKind::SymbolicLink && n.exists() == objpath::EntryKind::Link);
+  if (directory_or_link && !same_kind) return kTypeMismatch;
+  if (n.exists() == objpath::EntryKind::Object && n.res.entry.object_kind != uint8_t(kind)) return kTypeMismatch;
   uint32_t granted = 0;
   if (const uint32_t denied = map_sync_access(kind, uint32_t(r.args[1]), false, &granted)) return denied;
   const uint64_t owner = p.runtime() ? p.runtime()->current_thread_id() : p.id();
-  const ObjectManager::Created c = objects->create(kind, StringView(name, size), manual_reset, state, initial, maximum, owner);
+  if (kind == ObjectKind::Directory && !n.anonymous) text = StringView(n.res.path, n.res.path_size);      // (a directory keeps its path: names below it are walked from there)
+  ObjectManager::Created c;
+  if (same_kind && n.res.entry.builtin) {      // a directory or link that is always there: a handle to it, as an object that has no name of its own
+    if (collide && !n.openif) return objpath::kStatusNameCollision;
+    c = objects->create(kind, StringView(), false, false, 0, 0, owner, StringView(n.res.entry.text, n.res.entry.text_size));
+    if (c.id != 0) c.status = kNameExistsStatus;
+  } else {
+    c = objects->create(kind, n.flat(), manual_reset, state, initial, maximum, owner, text);
+  }
   if (c.id == 0) return c.status;
+  if (collide && c.status == kNameExistsStatus && !n.openif) { objects->release(c.id); return objpath::kStatusNameCollision; }
+  if (kind == ObjectKind::SymbolicLink && c.status == kNameExistsStatus) c.status = kSuccess;      // (a link that was there is opened, and that is not told)
   const uint32_t given = give_handle(p, *objects, kind, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
   if (given == kSuccess || given == c.status) restrict_handle(p, r.args[0], granted, kind);
   return given;
@@ -276,13 +347,26 @@ uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, boo
 uint32_t open_object(Process& p, const SyscallRequest& r, ObjectKind kind) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
-  char name[ObjectManager::kNameBytes + 1];
-  uint32_t size = 0;
-  const uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &size);
-  if (status != kSuccess) return status;
-  if (size == 0) return kInvalidParameter;
+  if (!p.write_user_u64(r.args[0], 0)) return kAccessViolation;
+  Named n;
+  if (const uint32_t status = resolve_name(p, *objects, r.args[2], false, kind == ObjectKind::SymbolicLink, &n)) return status;
   uint32_t granted = 0, wanted = uint32_t(r.args[1]);
-  const ObjectManager::Created c = objects->open(kind, StringView(name, size));
+  ObjectManager::Created c;
+  if (n.same_object != 0) {      // an empty name below a handle: a new handle to the object of that handle, if it is of the kind asked for
+    if ((kind != ObjectKind::Directory && kind != ObjectKind::SymbolicLink) || n.same_kind != descriptor_kind_of(kind)) return kTypeMismatch;      // (only these two are opened by an empty name below themselves)
+    objects->add_ref(n.same_object);
+    c.id = n.same_object;
+  } else {
+  const objpath::EntryKind want = kind == ObjectKind::Directory ? objpath::EntryKind::Directory : kind == ObjectKind::SymbolicLink ? objpath::EntryKind::Link : objpath::EntryKind::Object;
+  if (n.res.entry.kind == objpath::EntryKind::None) return objpath::kStatusNameNotFound;
+  if (n.res.entry.kind != want || (want == objpath::EntryKind::Object && n.res.entry.object_kind != uint8_t(kind))) return kTypeMismatch;
+  if (n.res.entry.builtin) {      // (a handle to a place that is always there)
+    const bool root_dir = kind == ObjectKind::Directory;
+    c = objects->create(kind, StringView(), false, false, 0, 0, 0, root_dir ? StringView(n.res.path, n.res.path_size) : StringView(n.res.entry.text, n.res.entry.text_size));
+  } else {
+    c = objects->open(kind, n.flat());
+  }
+  }
   if (c.id == 0) return c.status;
   if (const uint32_t refused = restrict_by_descriptor(p, c.id, descriptor_kind_of(kind), &wanted)) { objects->release(c.id); return refused; }
   if (const uint32_t denied = map_sync_access(kind, wanted, true, &granted)) { objects->release(c.id); return denied; }
@@ -918,10 +1002,10 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   const uint32_t page = uint32_t(page_protection);
   bool copy = false;
   if (protection_of_page(page, &copy) == 0 || page == kPageExecute) return kInvalidParameter;      // (no access and execute-only sections do not exist)
-  char name[ObjectManager::kNameBytes + 1];
-  uint32_t name_size = 0;
-  uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &name_size);
-  if (status != kSuccess) return status;
+  if (!p.write_user_u64(r.args[0], 0)) return kAccessViolation;
+  Named named;
+  if (const uint32_t status = resolve_name(p, *objects, r.args[2], true, false, &named)) return status;
+  if (named.exists() == objpath::EntryKind::Directory || named.exists() == objpath::EntryKind::Link) return kTypeMismatch;
   uint64_t size = 0;
   if (r.args[3] != 0 && !p.read_user_u64(r.args[3], &size)) return kAccessViolation;
   filesystem::IFileSystem* fs = nullptr;
@@ -954,7 +1038,8 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   uint32_t reported = flags & (kSecNoCache | kSecWriteCombine | kSecImage);
   if (fs) reported |= kSecFile;
   else reported |= (flags & kSecReserve) ? kSecReserve : kSecCommit;
-  const ObjectManager::Created c = objects->create_section(StringView(name, name_size), (flags & kSecImage) ? 0 : size, page, reported, fs, host.view());
+  const ObjectManager::Created c = objects->create_section(named.flat(), (flags & kSecImage) ? 0 : size, page, reported, fs, host.view());
+  if (c.id != 0 && c.status == kNameExistsStatus && !named.openif) { objects->release(c.id); return objpath::kStatusNameCollision; }
   if (c.id == 0) return (fs && c.status == kNoResources) ? 0xC0000040u /* STATUS_SECTION_TOO_BIG: more than can be held */ : c.status;
   if (fs && !(flags & kSecImage)) objects->section_set_reported_size(c.id, size != 0 ? size : file_size);      // (a section of a file has the size it was asked for, not the pages')
   if (flags & kSecImage) {      // the file has to be a PE image this OS can run
@@ -1073,6 +1158,158 @@ uint32_t nt_create_keyed_event(Process& p, const SyscallRequest& r) { return r.a
 uint32_t nt_open_keyed_event(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::KeyedEvent); }
 uint32_t nt_create_io_completion(Process& p, const SyscallRequest& r) { return create_object(p, r, ObjectKind::IoCompletion, false, false, 0, 0); }      // (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG Count)
 uint32_t nt_open_io_completion(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::IoCompletion); }
+
+// --- directories and symbolic links of the object namespace (see ObjectPath.hpp)
+uint32_t nt_create_directory_object(Process& p, const SyscallRequest& r) { return create_object(p, r, ObjectKind::Directory, false, false, 0, 0, StringView(), true); }      // (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)
+uint32_t nt_open_directory_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::Directory); }
+uint32_t nt_open_symbolic_link_object(Process& p, const SyscallRequest& r) { return open_object(p, r, ObjectKind::SymbolicLink); }
+// (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PUNICODE_STRING LinkTarget)
+uint32_t nt_create_symbolic_link_object(Process& p, const SyscallRequest& r) {
+  uint8_t header[4];
+  if (r.args[2] == 0 || r.args[3] == 0 || !p.read_user(r.args[3], ByteView(header, sizeof(header)))) return kAccessViolation;
+  const uint32_t length = uint32_t(header[0]) | uint32_t(header[1]) << 8, maximum = uint32_t(header[2]) | uint32_t(header[3]) << 8;
+  if (length == 0 || maximum < length) return kInvalidParameter;
+  char target[ObjectManager::kNameBytes + 1];
+  uint32_t size = 0;
+  if (const uint32_t status = read_unicode_string(p, r.args[3], target, ObjectManager::kNameBytes, &size)) return status;
+  return create_object(p, r, ObjectKind::SymbolicLink, false, false, 0, 0, StringView(target, size), true);
+}
+
+uint32_t typed_handle(Process& p, uint64_t handle, DescriptorKind kind, uint32_t* id) {
+  uint64_t slot = 0;
+  if (!slot_of(handle, &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (p.files().kind(slot) != kind) return kTypeMismatch;
+  *id = uint32_t(p.files().token(slot));
+  return kSuccess;
+}
+
+// NtQuerySymbolicLinkObject(Handle, PUNICODE_STRING LinkTarget, PULONG ReturnedLength): the target as the characters of the string (with an end mark the Length does not count).
+uint32_t nt_query_symbolic_link_object(Process& p, const SyscallRequest& r) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  uint32_t id = 0;
+  if (const uint32_t status = typed_handle(p, r.args[0], DescriptorKind::SymbolicLink, &id)) return status;
+  char text[ObjectManager::kNameBytes];
+  const uint32_t n = objects->object_text(id, text, sizeof(text));
+  uint16_t units[ObjectManager::kNameBytes];
+  const uint32_t count = utf8_to_utf16(StringView(text, n), units, ObjectManager::kNameBytes);
+  const uint32_t full = 2 * count + 2;
+  uint8_t header[16];
+  if (!p.read_user(r.args[1], ByteView(header, sizeof(header)))) return kAccessViolation;
+  const uint32_t maximum = uint32_t(header[2]) | uint32_t(header[3]) << 8;
+  uint64_t buffer = 0;
+  for (int i = 0; i < 8; ++i) buffer |= uint64_t{header[8 + i]} << (8 * i);
+  if (r.args[2] != 0 && !p.write_user_u32(r.args[2], full)) return kAccessViolation;
+  if (maximum < full) return 0xC0000023u;      // STATUS_BUFFER_TOO_SMALL
+  uint8_t out[2 * ObjectManager::kNameBytes + 2] = {};
+  for (uint32_t i = 0; i < count; ++i) { out[2 * i] = uint8_t(units[i]); out[2 * i + 1] = uint8_t(units[i] >> 8); }
+  if (!p.write_user(buffer, ConstByteView(out, full))) return kAccessViolation;
+  const uint8_t length[2] = {uint8_t(2 * count), uint8_t((2 * count) >> 8)};
+  return p.write_user(r.args[1], ConstByteView(length, 2)) ? kSuccess : kAccessViolation;
+}
+
+const char* object_type_name(ObjectKind kind) {
+  switch (kind) {
+    case ObjectKind::Event: return "Event";
+    case ObjectKind::Mutex: return "Mutant";
+    case ObjectKind::Semaphore: return "Semaphore";
+    case ObjectKind::Process: return "Process";
+    case ObjectKind::Timer: return "Timer";
+    case ObjectKind::Section: return "Section";
+    case ObjectKind::Job: return "Job";
+    case ObjectKind::ChangeNotification: return "ChangeNotification";
+    case ObjectKind::Mailslot: case ObjectKind::Pipe: return "File";
+    case ObjectKind::DebugObject: return "DebugObject";
+    case ObjectKind::Token: return "Token";
+    case ObjectKind::KeyedEvent: return "KeyedEvent";
+    case ObjectKind::IoCompletion: return "IoCompletion";
+    case ObjectKind::Reserve: return "UserApcReserve";
+    case ObjectKind::Directory: return "Directory";
+    case ObjectKind::SymbolicLink: return "SymbolicLink";
+    default: return "Object";
+  }
+}
+
+// NtQueryDirectoryObject(Handle, Buffer, Length, ReturnSingleEntry, RestartScan, Context, ReturnLength): DIRECTORY_BASIC_INFORMATION entries (name, type name), then an empty
+// entry, then the characters. `*Context` is the number of the entry to give next.
+uint32_t nt_query_directory_object(Process& p, const SyscallRequest& r) {
+  constexpr uint32_t kEntry = 32, kNoMoreEntries = 0x8000001Au, kMoreEntries = 0x105u, kBufferTooSmall = 0xC0000023u, kLimit = 4096;
+  uint64_t single_at = 0, restart_at = 0, context_at = 0, returned_at = 0;
+  if (!argument(p, r, 3, &single_at) || !argument(p, r, 4, &restart_at) || !argument(p, r, 5, &context_at) || !argument(p, r, 6, &returned_at)) return kAccessViolation;
+  const bool single = (single_at & 0xFF) != 0, restart = (restart_at & 0xFF) != 0;
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  uint32_t id = 0;
+  if (const uint32_t status = typed_handle(p, r.args[0], DescriptorKind::ObjectDirectory, &id)) return status;
+  uint8_t raw[4];
+  if (context_at == 0 || !p.read_user(context_at, ByteView(raw, 4))) return kAccessViolation;
+  const uint32_t context = uint32_t(raw[0]) | uint32_t(raw[1]) << 8 | uint32_t(raw[2]) << 16 | uint32_t(raw[3]) << 24;
+  const uint32_t length = uint32_t(r.args[2]) < kLimit ? uint32_t(r.args[2]) : kLimit;
+  const uint32_t start = restart ? 0 : context;
+  char dir_text[objpath::kMaxPath], flat[objpath::kMaxPath];
+  uint32_t flat_size = 0;
+  bool have_dir = false;
+  if (const uint32_t dir_size = objects->object_text(id, dir_text, sizeof(dir_text))) {
+    objpath::Path path;
+    have_dir = path.parse(StringView(dir_text, dir_size)) && path.to_flat(flat, sizeof(flat), &flat_size);
+  }
+  struct Item { char name[ObjectManager::kNameBytes]; uint32_t name_size = 0; ObjectKind kind = ObjectKind::None; uint16_t units[ObjectManager::kNameBytes]; uint32_t unit_count = 0; StringView type; };
+  auto fetch = [&](uint32_t index, Item* item) {
+    if (!have_dir || !objects->directory_child(StringView(flat, flat_size), index, item->name, sizeof(item->name), &item->name_size, &item->kind)) return false;
+    item->unit_count = utf8_to_utf16(StringView(item->name, item->name_size), item->units, ObjectManager::kNameBytes);
+    item->type = StringView(object_type_name(item->kind));
+    return true;
+  };
+  auto strings_of = [](const Item& item) { return 2 * item.unit_count + 2 + 2 * uint32_t(item.type.size()) + 2; };
+  // How many entries fit: the entries and the empty one are kEntry bytes each, the characters follow.
+  Item item;
+  uint32_t count = 0, string_bytes = 0, first_needed = 0;
+  bool more = false;
+  while (fetch(start + count, &item)) {
+    if (count == 0) first_needed = 2 * kEntry + strings_of(item);
+    if (uint64_t{kEntry} * (count + 2) + string_bytes + strings_of(item) > length) { more = true; break; }
+    string_bytes += strings_of(item);
+    ++count;
+    if (single) break;
+  }
+  auto set_context = [&](uint32_t value) {
+    const uint8_t ctx[4] = {uint8_t(value), uint8_t(value >> 8), uint8_t(value >> 16), uint8_t(value >> 24)};
+    return p.write_user(context_at, ConstByteView(ctx, 4));
+  };
+  uint8_t out[kLimit] = {};
+  if (count == 0) {      // nothing to give: the empty entry alone
+    uint32_t status = kNoMoreEntries;
+    if (more) {
+      if (single) {
+        if (returned_at != 0 && !p.write_user_u32(returned_at, first_needed)) return kAccessViolation;
+        return kBufferTooSmall;
+      }
+      status = kMoreEntries;
+    }
+    if (length >= kEntry && !p.write_user(r.args[1], ConstByteView(out, kEntry))) return kAccessViolation;
+    if (returned_at != 0 && !p.write_user_u32(returned_at, kEntry)) return kAccessViolation;
+    if (status == kMoreEntries && !set_context(start)) return kAccessViolation;
+    return status;
+  }
+  auto put16 = [&](uint32_t at, uint32_t v) { out[at] = uint8_t(v); out[at + 1] = uint8_t(v >> 8); };
+  auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t i = 0; i < 8; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
+  uint32_t used = kEntry * (count + 1);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (!fetch(start + i, &item)) return kBufferTooSmall;      // (the directory changed under us)
+    const uint32_t name_bytes = 2 * item.unit_count, type_bytes = 2 * uint32_t(item.type.size());
+    if (uint64_t{used} + name_bytes + type_bytes + 4 > kLimit) return kBufferTooSmall;
+    put16(i * kEntry, name_bytes); put16(i * kEntry + 2, name_bytes + 2); put64(i * kEntry + 8, r.args[1] + used);
+    for (uint32_t k = 0; k < item.unit_count; ++k) put16(used + 2 * k, item.units[k]);
+    used += name_bytes + 2;
+    put16(i * kEntry + 16, type_bytes); put16(i * kEntry + 18, type_bytes + 2); put64(i * kEntry + 24, r.args[1] + used);
+    for (uint32_t k = 0; k < item.type.size(); ++k) put16(used + 2 * k, uint8_t(item.type[k]));
+    used += type_bytes + 2;
+  }
+  if (!p.write_user(r.args[1], ConstByteView(out, used))) return kAccessViolation;
+  if (returned_at != 0 && !p.write_user_u32(returned_at, used)) return kAccessViolation;
+  if (!set_context(start + count)) return kAccessViolation;
+  return more && !single ? kMoreEntries : kSuccess;
+}
 
 namespace {
 
@@ -1337,23 +1574,38 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
       size = 56;
       break;
     }
-    case 1: {    // OBJECT_NAME_INFORMATION: a UNICODE_STRING and its characters; the name an object was made with, in the directory of the session
+    case 1: {    // OBJECT_NAME_INFORMATION: a UNICODE_STRING and its characters; the absolute path of the name an object was made with
       ObjectManager* objects = system_objects();
-      char text[ObjectManager::kNameBytes];
-      const uint32_t chars = is_object_kind(p.files().kind(slot)) && objects ? objects->object_name(uint32_t(p.files().token(slot)), text, sizeof(text)) : 0;
-      const bool in_session = chars != 0 && text[0] == kSessionMark;
-      const char* kPrefix = in_session ? "\\Sessions\\1\\BaseNamedObjects\\" : "\\BaseNamedObjects\\";
-      const uint32_t kPrefixSize = in_session ? 30 : 19;      // (with the end of the string)
-      const uint32_t skip = in_session ? 1 : 0;      // (the mark is not part of the name)
-      const uint32_t prefix = chars ? kPrefixSize - 1 : 0, bytes = 2 * (prefix + chars - skip), need = 16 + bytes + 2;
+      char text[objpath::kMaxPath];
+      uint32_t chars = 0;
+      const DescriptorKind kind = p.files().kind(slot);
+      if (objects && kind == DescriptorKind::ObjectDirectory) {
+        chars = objects->object_text(uint32_t(p.files().token(slot)), text, sizeof(text));
+      } else if (kind == DescriptorKind::Key) {
+        String full(p.files().allocator());
+        if (key_full_name(p, p.files().token(slot), &full)) {
+          const uint32_t n = full.size() < sizeof(text) ? uint32_t(full.size()) : uint32_t(sizeof(text));
+          for (uint32_t i = 0; i < n; ++i) text[i] = full.view()[i];
+          chars = n;
+        }
+      } else if (objects && is_object_kind(kind)) {
+        char flat[ObjectManager::kNameBytes];
+        const uint32_t flat_size = objects->object_name(uint32_t(p.files().token(slot)), flat, sizeof(flat));
+        objpath::Path path;
+        if (flat_size != 0 && objpath::flat_to_path(StringView(flat, flat_size), &path)) path.format(text, sizeof(text), &chars);
+      }
+      uint16_t units[objpath::kMaxPath];
+      const uint32_t count = utf8_to_utf16(StringView(text, chars), units, objpath::kMaxPath);
+      const uint32_t bytes = 2 * count, need = count == 0 ? 16 : 16 + bytes + 2;      // (an object without a name is an empty string with no characters)
       if (returned != 0 && !p.write_user_u32(returned, need)) return kAccessViolation;
       if (length < need) return 0xC0000004u;
-      uint8_t full[16 + 2 * (32 + ObjectManager::kNameBytes)] = {};
-      full[0] = uint8_t(bytes); full[1] = uint8_t(bytes >> 8); full[2] = uint8_t(bytes + 2); full[3] = uint8_t((bytes + 2) >> 8);
-      const uint64_t text_at = r.args[2] + 16;
-      for (uint32_t i = 0; i < 8; ++i) full[8 + i] = uint8_t(text_at >> (8 * i));
-      for (uint32_t i = 0; i < prefix; ++i) full[16 + 2 * i] = uint8_t(kPrefix[i]);
-      for (uint32_t i = skip; i < chars; ++i) full[16 + 2 * (prefix + i - skip)] = uint8_t(text[i]);
+      uint8_t full[16 + 2 * objpath::kMaxPath + 2] = {};
+      if (count != 0) {
+        full[0] = uint8_t(bytes); full[1] = uint8_t(bytes >> 8); full[2] = uint8_t(bytes + 2); full[3] = uint8_t((bytes + 2) >> 8);
+        const uint64_t text_at = r.args[2] + 16;
+        for (uint32_t i = 0; i < 8; ++i) full[8 + i] = uint8_t(text_at >> (8 * i));
+      }
+      for (uint32_t i = 0; i < count; ++i) { full[16 + 2 * i] = uint8_t(units[i]); full[16 + 2 * i + 1] = uint8_t(units[i] >> 8); }
       return p.write_user(r.args[2], ConstByteView(full, need)) ? kSuccess : kAccessViolation;
     }
     case 2: {    // OBJECT_TYPE_INFORMATION (the name only: a UNICODE_STRING and its characters)
@@ -1375,6 +1627,8 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
         case DescriptorKind::Mailslot: type = "Mailslot"; break;
         case DescriptorKind::Key: type = "Key"; break;
+        case DescriptorKind::ObjectDirectory: type = "Directory"; break;
+        case DescriptorKind::SymbolicLink: type = "SymbolicLink"; break;
         default: break;
       }
       uint32_t n = 0;

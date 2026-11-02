@@ -57,18 +57,22 @@ void ObjectManager::notify() {
   sync_.notify_all();
 }
 
-ObjectManager::Object* ObjectManager::find_locked(StringView name) {
+ObjectManager::Object* ObjectManager::find_locked(StringView name, bool case_insensitive) {
   if (name.empty()) return nullptr;
+  Object* similar = nullptr;
   for (Object& o : objects_) {
     if (o.kind == ObjectKind::None || o.name_size == 0) continue;
     if (o.kind == ObjectKind::Pipe) continue;      // (pipes have a namespace of their own)
-    if (o.name_size == name.size() && StringView(o.name, o.name_size) == name) return &o;      // (the names of kernel objects are case sensitive)
+    if (o.name_size != name.size()) continue;
+    if (StringView(o.name, o.name_size) == name) return &o;      // (the names of kernel objects are case sensitive, unless OBJ_CASE_INSENSITIVE is asked for)
+    if (case_insensitive && StringView(o.name, o.name_size).equals_ignore_case(name)) similar = &o;
   }
-  return nullptr;
+  return similar;
 }
 
-ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner) {
+ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner, StringView text) {
   Created result;
+  if (text.size() >= kNameBytes) { result.status = kNameTooLong; return result; }
   if (kind == ObjectKind::None || name.size() >= kNameBytes) { result.status = name.size() >= kNameBytes ? kNameTooLong : kInvalid; return result; }
   if (kind == ObjectKind::Semaphore && (maximum <= 0 || initial < 0 || initial > maximum)) { result.status = kInvalid; return result; }
   Locked hold(sync_);
@@ -87,6 +91,8 @@ ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, b
     o.references = 1;
     for (uint32_t k = 0; k < name.size(); ++k) o.name[k] = name[k];
     o.name_size = static_cast<uint32_t>(name.size());
+    for (uint32_t k = 0; k < text.size(); ++k) o.text[k] = text[k];
+    o.text_size = static_cast<uint32_t>(text.size());
     o.manual_reset = manual_reset;
     if (kind == ObjectKind::Event) o.signaled = initial_state;
     if (kind == ObjectKind::Mutex && initial_state) { o.owner = owner; o.recursion = 1; }
@@ -1860,6 +1866,49 @@ ObjectManager::Created ObjectManager::open(ObjectKind kind, StringView name) {
   ++o->references;
   result.id = static_cast<uint32_t>(o - objects_) + 1;
   return result;
+}
+
+bool ObjectManager::lookup_entry(StringView flat, bool case_insensitive, objpath::Entry* out) {
+  Locked hold(sync_);
+  const Object* o = find_locked(flat, case_insensitive);
+  if (!o) return false;
+  *out = objpath::Entry();
+  for (uint32_t i = 0; i < o->name_size && i < objpath::kMaxPath; ++i) out->flat[i] = o->name[i];
+  out->flat_size = o->name_size < objpath::kMaxPath ? o->name_size : objpath::kMaxPath;
+  switch (o->kind) {
+    case ObjectKind::Directory: out->kind = objpath::EntryKind::Directory; break;
+    case ObjectKind::SymbolicLink: out->kind = objpath::EntryKind::Link; break;
+    default: out->kind = objpath::EntryKind::Object; out->object_kind = static_cast<uint8_t>(o->kind); break;
+  }
+  for (uint32_t i = 0; i < o->text_size && i < objpath::kMaxPath; ++i) out->text[i] = o->text[i];
+  out->text_size = o->text_size < objpath::kMaxPath ? o->text_size : objpath::kMaxPath;
+  return true;
+}
+
+uint32_t ObjectManager::object_text(uint32_t id, char* out, uint32_t capacity) {
+  Locked hold(sync_);
+  const Object* o = at(id);
+  if (!o || o->text_size == 0 || o->text_size > capacity) return 0;
+  for (uint32_t i = 0; i < o->text_size; ++i) out[i] = o->text[i];
+  return o->text_size;
+}
+
+bool ObjectManager::directory_child(StringView directory, uint32_t index, char* name, uint32_t capacity, uint32_t* name_size, ObjectKind* kind) {
+  Locked hold(sync_);
+  uint32_t seen = 0;
+  for (const Object& o : objects_) {
+    if (o.kind == ObjectKind::None || o.kind == ObjectKind::Pipe || o.name_size == 0) continue;
+    StringView parent, leaf;
+    objpath::split_flat(StringView(o.name, o.name_size), &parent, &leaf);
+    if (parent != directory || leaf.empty()) continue;
+    if (seen++ != index) continue;
+    if (leaf.size() > capacity) return false;
+    for (uint32_t i = 0; i < leaf.size(); ++i) name[i] = leaf[i];
+    *name_size = static_cast<uint32_t>(leaf.size());
+    *kind = o.kind;
+    return true;
+  }
+  return false;
 }
 
 void ObjectManager::add_ref(uint32_t id) {

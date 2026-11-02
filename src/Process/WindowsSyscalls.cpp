@@ -173,6 +173,12 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtCreateKeyedEvent: return windowsabi::nt_create_keyed_event(process, r);
       case WindowsSyscallNumber::NtOpenKeyedEvent: return windowsabi::nt_open_keyed_event(process, r);
       case WindowsSyscallNumber::NtCreateIoCompletion: return windowsabi::nt_create_io_completion(process, r);
+      case WindowsSyscallNumber::NtCreateDirectoryObject: return windowsabi::nt_create_directory_object(process, r);
+      case WindowsSyscallNumber::NtOpenDirectoryObject: return windowsabi::nt_open_directory_object(process, r);
+      case WindowsSyscallNumber::NtQueryDirectoryObject: return windowsabi::nt_query_directory_object(process, r);
+      case WindowsSyscallNumber::NtCreateSymbolicLinkObject: return windowsabi::nt_create_symbolic_link_object(process, r);
+      case WindowsSyscallNumber::NtOpenSymbolicLinkObject: return windowsabi::nt_open_symbolic_link_object(process, r);
+      case WindowsSyscallNumber::NtQuerySymbolicLinkObject: return windowsabi::nt_query_symbolic_link_object(process, r);
       case WindowsSyscallNumber::NtOpenIoCompletion: return windowsabi::nt_open_io_completion(process, r);
       case WindowsSyscallNumber::NtAssignProcessToJobObject: return windowsabi::nt_assign_process_to_job_object(process, r);
       case WindowsSyscallNumber::NtTerminateJobObject: return windowsabi::nt_terminate_job_object(process, r);

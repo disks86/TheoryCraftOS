@@ -544,7 +544,7 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
           break;
         }
         case DescriptorKind::Event: case DescriptorKind::Mutex: case DescriptorKind::Semaphore: case DescriptorKind::Timer: case DescriptorKind::Section: case DescriptorKind::Job:
-        case DescriptorKind::DebugObject: case DescriptorKind::ChangeNotification: case DescriptorKind::Token: case DescriptorKind::KeyedEvent: case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: {
+        case DescriptorKind::DebugObject: case DescriptorKind::ChangeNotification: case DescriptorKind::Token: case DescriptorKind::KeyedEvent: case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: case DescriptorKind::ObjectDirectory: case DescriptorKind::SymbolicLink: {
           char k[16];
           const uint32_t n = ObjectManager::object_key('s', uint32_t(token), k);
           for (uint32_t i = 0; i < n; ++i) key[i] = k[i];

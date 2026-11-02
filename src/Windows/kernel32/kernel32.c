@@ -1424,13 +1424,15 @@ EXPORT ULONGLONG WINAPI GetTickCount64(void);
 typedef struct { OBJECT_ATTRIBUTES attributes; UNICODE_STRING string; WCHAR text[300]; } NamedAttributes;
 static POBJECT_ATTRIBUTES named_attributes(NamedAttributes *n, LPCWSTR name, BOOL inherit) {
   if ((!name || !*name) && !inherit) return NULL;
-  static const WCHAR prefix[] = L"\\BaseNamedObjects\\";
+  /* A name is in the object directory of the session, "\Sessions\1\BaseNamedObjects" (Local\ says so too); Global\ puts it in "\BaseNamedObjects". */
+  static const WCHAR local_prefix[] = L"\\Sessions\\1\\BaseNamedObjects\\", global_prefix[] = L"\\BaseNamedObjects\\";
+  const WCHAR *prefix = local_prefix;
   unsigned length = 0;
-  for (; prefix[length]; ++length) n->text[length] = prefix[length];
   const WCHAR *skip = name;
   if (!name || !*name) skip = NULL;      /* (only the inherit flag was asked for) */
   else if ((name[0] == 'L' || name[0] == 'l') && (name[1] == 'o' || name[1] == 'O') && (name[2] == 'c' || name[2] == 'C') && (name[3] == 'a' || name[3] == 'A') && (name[4] == 'l' || name[4] == 'L') && name[5] == '\\') skip = name + 6;
-  else if ((name[0] == 'G' || name[0] == 'g') && (name[1] == 'l' || name[1] == 'L') && (name[2] == 'o' || name[2] == 'O') && (name[3] == 'b' || name[3] == 'B') && (name[4] == 'a' || name[4] == 'A') && (name[5] == 'l' || name[5] == 'L') && name[6] == '\\') skip = name + 7;
+  else if ((name[0] == 'G' || name[0] == 'g') && (name[1] == 'l' || name[1] == 'L') && (name[2] == 'o' || name[2] == 'O') && (name[3] == 'b' || name[3] == 'B') && (name[4] == 'a' || name[4] == 'A') && (name[5] == 'l' || name[5] == 'L') && name[6] == '\\') { skip = name + 7; prefix = global_prefix; }
+  if (skip) for (; prefix[length]; ++length) n->text[length] = prefix[length];
   if (!skip) length = 0;
   else for (; *skip && length < 299; ++skip) n->text[length++] = *skip;
   n->text[length] = 0;
@@ -1440,7 +1442,7 @@ static POBJECT_ATTRIBUTES named_attributes(NamedAttributes *n, LPCWSTR name, BOO
   n->attributes.Length = sizeof(OBJECT_ATTRIBUTES);
   n->attributes.RootDirectory = NULL;
   n->attributes.ObjectName = length ? &n->string : NULL;
-  n->attributes.Attributes = 0x40 | (inherit ? 2 : 0);      /* OBJ_CASE_INSENSITIVE, OBJ_INHERIT */
+  n->attributes.Attributes = 0x80 | (inherit ? 2 : 0);      /* OBJ_OPENIF, OBJ_INHERIT (names are case sensitive) */
   n->attributes.SecurityDescriptor = NULL;
   n->attributes.SecurityQualityOfService = NULL;
   return &n->attributes;

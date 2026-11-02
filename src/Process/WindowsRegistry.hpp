@@ -38,5 +38,7 @@ uint32_t nt_flush_key(Process& p, const SyscallRequest& r);
 // Closing, duplicating or inheriting a key handle.
 void key_token_add(uint64_t token);
 void key_token_release(uint64_t token);
+// The full path of the key a key handle's token names (\Registry\Machine\...); false if there is none.
+bool key_full_name(Process& p, uint64_t token, String* out);
 
 }  // namespace process::windowsabi

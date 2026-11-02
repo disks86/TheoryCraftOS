@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/ObjectPath.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/StringView.hpp"
 
@@ -45,12 +46,12 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, Directory, SymbolicLink };
 
 class ObjectManager {
  public:
   static constexpr uint32_t kCapacity = 1024;
-  static constexpr uint32_t kNameBytes = 128;
+  static constexpr uint32_t kNameBytes = 256;
 
   explicit ObjectManager(ISystemSync& sync) : sync_(sync) {}
   ~ObjectManager();
@@ -68,8 +69,14 @@ class ObjectManager {
     uint32_t status = 0;
     uint32_t end_code = 0;     // pipes: which end the handle is (see below)
   };
-  Created create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner);
+  // `text` is kept with the object: a symbolic link's target, a directory's absolute path (see ObjectPath.hpp).
+  Created create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner, StringView text = StringView());
   Created open(ObjectKind kind, StringView name);
+  // The namespace of the Windows ABI (ObjectPath.hpp): what is at a flat name, the text kept with an object, and the objects in a directory.
+  bool lookup_entry(StringView flat, bool case_insensitive, objpath::Entry* out);
+  uint32_t object_text(uint32_t id, char* out, uint32_t capacity);      // its length, 0 if it has none
+  // The `index`-th object (in the order they were made) directly in the directory with the flat name `directory`: its name, kind and the name of its type.
+  bool directory_child(StringView directory, uint32_t index, char* name, uint32_t capacity, uint32_t* name_size, ObjectKind* kind);
   // A process (waited for by its parent): signalled when it has ended. `pid` finds it again when the process ends.
   Created create_process(uint64_t pid);
 
@@ -365,6 +372,8 @@ class ObjectManager {
     uint32_t references = 0;
     char name[kNameBytes] = {};
     uint32_t name_size = 0;
+    char text[kNameBytes] = {};            // symbolic link: its target; directory: its absolute path
+    uint32_t text_size = 0;
     bool manual_reset = false, signaled = false, abandoned = false;
     bool dying = false;                    // no handle is left, but a thread waits for it or a mutex is owned: it goes with the last of those
     int32_t count = 0, maximum = 0;        // semaphore
@@ -382,7 +391,7 @@ class ObjectManager {
     uint64_t fired_at = 0;
   };
   Object* at(uint32_t id) { return id >= 1 && id <= kCapacity && objects_[id - 1].kind != ObjectKind::None ? &objects_[id - 1] : nullptr; }
-  Object* find_locked(StringView name);
+  Object* find_locked(StringView name, bool case_insensitive = false);
   void fire_timer_locked(Object& o, uint64_t now);
   void free_object_locked(Object& o);
   void finish_dying_locked(Object& o);

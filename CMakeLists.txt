@@ -646,6 +646,7 @@ add_executable(BOOTX64
   src/Process/WindowsJobs.cpp
   src/Process/WindowsDebug.cpp
   src/Process/AccessCheck.cpp
+  src/Process/ObjectPath.cpp
   src/Process/WindowsTokens.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
