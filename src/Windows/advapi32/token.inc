@@ -190,6 +190,7 @@ EXP BOOL WINAPI CheckTokenMembership(HANDLE token, PSID sid, PBOOL is_member)
     TOKEN_USER *user;
     BOOL member = FALSE, restricted = FALSE;
     if (!sid || !is_member) return win_fail(ERROR_INVALID_PARAMETER);
+    *is_member = FALSE;
     if (!RtlValidSid(sid)) return win_fail(ERROR_INVALID_SID);
     if (!token) {
         if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE, TRUE, &own)) {

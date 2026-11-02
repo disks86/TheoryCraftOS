@@ -635,13 +635,25 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if ((options & 1) && !p.files().protected_from_close(slot)) {      // DUPLICATE_CLOSE_SOURCE into this very process: the source goes first, so the handle keeps its number
     if (target_at != 0 && !p.write_user_u64(target_at, r.args[1])) return kAccessViolation;
     const uint32_t original = p.files().denied_access(slot);
-    p.files().set_denied_access(slot, (options & 2) ? original : (original | ~mapped_access(p.files().kind(slot), uint32_t(desired_access))));
+    p.files().set_denied_access(slot, (options & 2) ? original : (p.files().kind(slot) == DescriptorKind::File || p.files().kind(slot) == DescriptorKind::Directory ? original : 0u) | ~mapped_access(p.files().kind(slot), uint32_t(desired_access)));
     p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
     return kSuccess;
   }
   if (!(options & 2) && caller_is_impersonating(p)) {      // a thread that impersonates may not copy a handle with more rights than the handle holds
     KindAccess a;
     if (kind_access(p.files().kind(slot), &a) && (mapped_access(p.files().kind(slot), uint32_t(desired_access)) & a.valid & p.files().denied_access(slot))) return kAccessDeniedStatus;
+  }
+  if (!(options & 2) && p.files().kind(slot) == DescriptorKind::Process) {      // more rights to a process than its handle holds: what its descriptor allows
+    bool exited = false;
+    uint32_t code = 0;
+    uint64_t pid = 0;
+    ObjectManager* objects = system_objects();
+    uint32_t granted = 0;
+    if (objects && objects->query_process(uint32_t(p.files().token(slot)), &exited, &code, &pid) && pid < (uint64_t{1} << 20)) {
+      KindAccess a;
+      if (kind_access(DescriptorKind::Process, &a) && (mapped_access(DescriptorKind::Process, uint32_t(desired_access)) & a.valid & p.files().denied_access(slot)))
+        if (const uint32_t refused = open_with_descriptor(p, 'p', pid, uint32_t(desired_access), kProcessMapping, &granted)) return refused;
+    }
   }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;
@@ -656,7 +668,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   }
   {      // DUPLICATE_SAME_ACCESS keeps the rights; otherwise the copy has the ones asked for (the rights of a section are the ones MapViewOfFile checks)
     const uint32_t original = p.files().denied_access(slot);
-    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~mapped_access(p.files().kind(slot), uint32_t(desired_access))));
+    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (p.files().kind(slot) == DescriptorKind::File || p.files().kind(slot) == DescriptorKind::Directory ? original : 0u) | ~mapped_access(p.files().kind(slot), uint32_t(desired_access)));
   }
   const bool same = (options & 4) != 0;      // DUPLICATE_SAME_ATTRIBUTES; otherwise the handle is inheritable if the attributes say OBJ_INHERIT
   p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, same && p.files().protected_from_close(slot));

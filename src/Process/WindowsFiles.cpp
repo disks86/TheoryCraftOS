@@ -300,6 +300,10 @@ bool node_allows(Process& p, StringView path, uint32_t access, uint32_t* granted
   ObjectManager* objects = system_objects();
   uint32_t got = 0, status = 0;
   if (granted) *granted = kFileMapping.map(access & ~kMaximumAllowedAccess);
+  if (!(access & kMaximumAllowedAccess)) {      // (waiting for a file is always allowed to whoever has it open)
+    access = kFileMapping.map(access) & ~0x100000u;
+    if (access == 0) return true;
+  }
   if (!objects || !objects->allocator()) return true;
   const uint32_t size = objects->security_size(path);
   if (size == 0) return true;

@@ -589,17 +589,31 @@ __declspec(dllexport) NTSTATUS NTAPI NtQueryInformationToken(HANDLE token, TOKEN
         if (length < sizeof(HANDLE)) return STATUS_BUFFER_TOO_SMALL_;
         if (!info) return STATUS_ACCESS_VIOLATION_;
         if (!has_link) { *(HANDLE *)info = NULL; return STATUS_SUCCESS; }
-        {      /* the other token of the pair: a copy of this one that is elevated (Full) at high integrity, to be looked at (identification level) */
+        {      /* the other token of the pair, as it was made (changes of this one are not in it): elevated (Full, high integrity, the privileges of an administrator) when this one
+                  is limited, and the limited one when this is the elevated; to be looked at (identification level) */
+            static const BYTE limited_privileges[] = {19, 23, 25, 33, 34, 35};
+            static const BYTE full_privileges[] = {5, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 22, 24, 28, 29, 30, 36};
+            static const BYTE admins[16] = {1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0}, system_sid[12] = {1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0};
             TokenData *e = heap_new(sizeof(*e));
-            TSid *il;
             class_status = e ? read_token(token, TOKEN_QUERY, e) : STATUS_NO_MEMORY_;
             if (!class_status) {
-                static const BYTE high[12] = {1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x30, 0, 0};
-                il = (TSid *)integrity_group(e);
-                if (il) memcpy(il->sid, high, sizeof(high));
+                BOOL to_full = e->elevation_type != 2;
+                TSid *il = (TSid *)integrity_group(e);
+                ACL *acl = (ACL *)e->dacl;
+                DWORD i;
+                BYTE level_sid[12] = {1, 1, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0};
+                st32(level_sid + 8, to_full ? 0x3000 : 0x2000);
+                if (il) memcpy(il->sid, level_sid, sizeof(level_sid));
+                e->npriv = 0;
+                for (i = 0; i < sizeof(limited_privileges); ++i) { e->priv[e->npriv].Luid.LowPart = limited_privileges[i]; e->priv[e->npriv].Luid.HighPart = 0; e->priv[e->npriv++].Attributes = limited_privileges[i] == 23 && to_full ? 3 : 1; }
+                if (to_full) for (i = 0; i < sizeof(full_privileges); ++i) { e->priv[e->npriv].Luid.LowPart = full_privileges[i]; e->priv[e->npriv].Luid.HighPart = 0; e->priv[e->npriv++].Attributes = 0; }
+                RtlCreateAcl(acl, sizeof(e->dacl), ACL_REVISION);
+                RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x10000000, (PSID)admins);
+                RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x10000000, (PSID)system_sid);
+                e->has_dacl = TRUE;
                 e->type = TokenImpersonation;
                 e->level = SecurityIdentification;
-                e->elevation_type = 2;      /* TokenElevationTypeFull */
+                e->elevation_type = to_full ? 2 : 3;
                 e->token_id = next_luid();
                 class_status = create_token(e, TOKEN_ALL, FALSE, &linked);
             }
@@ -723,7 +737,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtAdjustPrivilegesToken(HANDLE token, BOOLE
         }
     }
     needed = 4 + 12 * prev_count;
-    if (returned) *returned = previous ? needed : 0;
+    if (returned && previous) *returned = needed;
     if (previous) {
         if (length < needed) { heap_drop(t); return STATUS_BUFFER_TOO_SMALL_; }
         previous->PrivilegeCount = prev_count;
@@ -1103,7 +1117,7 @@ static ULONG filter_descriptor(const BYTE *rel, SECURITY_INFORMATION info, BYTE 
         DWORD kept = 0, count = 0, i;
         if (at + sizeof(ACL) > capacity) return 0;
         memset(acl, 0, sizeof(ACL));
-        acl->AclRevision = ACL_REVISION_DS;
+        acl->AclRevision = 3;
         if ((s->Control & SE_SACL_PRESENT) && s->Sacl) {
             const ACL *source = (const ACL *)(rel + s->Sacl);
             const ACE_HEADER *ace = (const ACE_HEADER *)(source + 1);
@@ -1176,7 +1190,7 @@ static NTSTATUS NtQuerySecurityObject_real(HANDLE handle, SECURITY_INFORMATION i
                 NtTcosToken(TCOS_OBJECT_SD_GET, (ULONG_PTR)handle, 0, 0, 0, (ULONG_PTR)&stored);
                 memset(out, 0, sizeof(out));
                 RtlCreateAcl(acl, 8 + 8 + 8 + MAX_SID_BYTES, ACL_REVISION_DS);
-                RtlAddMandatoryAce(acl, ACL_REVISION_DS, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, SYSTEM_MANDATORY_LABEL_ACE_TYPE, (PSID)il->sid);
+                { static const BYTE medium[12] = {1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x20, 0, 0}; RtlAddMandatoryAce(acl, ACL_REVISION_DS, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, SYSTEM_MANDATORY_LABEL_ACE_TYPE, (PSID)medium); }
                 o->Revision = 1;
                 o->Control = SE_SELF_RELATIVE | SE_SACL_PRESENT | (stored ? 0 : SE_SACL_AUTO_INHERITED);
                 o->Sacl = sizeof(*o);
@@ -1250,7 +1264,7 @@ static NTSTATUS merge_descriptor(const BYTE *object, ULONG object_length, SECURI
         const ACL *lists[2] = { (old->Control & SE_SACL_PRESENT) && old->Sacl ? (const ACL *)(object + old->Sacl) : NULL, (m->Control & SE_SACL_PRESENT) && m->Sacl ? (const ACL *)(mod_rel + m->Sacl) : NULL };
         int which;
         memset(acl, 0, sizeof(ACL));
-        acl->AclRevision = ACL_REVISION_DS;
+        acl->AclRevision = 3;
         for (which = 0; which < 2; ++which) {
             const ACL *source = lists[which];
             const ACE_HEADER *ace;
@@ -1332,6 +1346,18 @@ static NTSTATUS NtSetSecurityObject_real(HANDLE handle, SECURITY_INFORMATION inf
     status = merge_descriptor(current, current_length, info, sd, &merged, &merged_length);
     heap_drop(current);
     if (status) return status;
+    if (info & DACL_SECURITY_INFORMATION) {      /* the generic rights in the ACEs are the specific ones of the type of object */
+        SECURITY_DESCRIPTOR_RELATIVE *rel = (SECURITY_DESCRIPTOR_RELATIVE *)merged;
+        if ((rel->Control & SE_DACL_PRESENT) && rel->Dacl) {
+            GENERIC_MAPPING mapping;
+            ACL *acl = (ACL *)(merged + rel->Dacl);
+            ACE_HEADER *ace = (ACE_HEADER *)(acl + 1);
+            DWORD i;
+            mapping_for_handle(handle, &mapping);
+            for (i = 0; i < acl->AceCount; ++i, ace = (ACE_HEADER *)((BYTE *)ace + ace->AceSize))
+                if (ace->AceType <= 3 && !(ace->AceFlags & INHERIT_ONLY_ACE)) RtlMapGenericMask(&((ACCESS_ALLOWED_ACE *)ace)->Mask, &mapping);
+        }
+    }
     status = NtTcosToken(TCOS_OBJECT_SD_SET, (ULONG_PTR)handle, required, (ULONG_PTR)merged, merged_length, 0);
     heap_drop(merged);
     return status;
@@ -1624,6 +1650,7 @@ __declspec(dllexport) void NTAPI RtlTcosNewObjectSecurity(HANDLE handle, const O
         }
     }
     if (!creator && !parent) return;
+    if (creator && (((SECURITY_DESCRIPTOR *)creator)->Control & SE_SELF_RELATIVE ? (((SECURITY_DESCRIPTOR_RELATIVE *)creator)->Control & SE_DACL_PRESENT) : (((SECURITY_DESCRIPTOR *)creator)->Control & SE_DACL_PRESENT))) flags &= ~SEF_DACL_AUTO_INHERIT;      /* (a descriptor of its own: the parent adds nothing to it) */
     if (RtlNewSecurityObjectEx(parent, creator, (PSECURITY_DESCRIPTOR *)&made, NULL, container, flags, NULL, (PGENERIC_MAPPING)&sd_mappings[kind]) == 0) {
         length = RtlLengthSecurityDescriptor(made);
         NtTcosToken(TCOS_OBJECT_SD_SET, (ULONG_PTR)handle, 0, (ULONG_PTR)made, length, 0);

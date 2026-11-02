@@ -1801,6 +1801,7 @@ EXPORT HANDLE WINAPI CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, D
 EXPORT HANDLE WINAPI OpenFileMappingW(DWORD access, BOOL inherit, LPCWSTR name) {
   NamedAttributes n;
   HANDLE h = NULL;
+  if (access == FILE_MAP_COPY_) access = 4;      /* (FILE_MAP_COPY is SECTION_QUERY: what is asked for is to read the view) */
   const NTSTATUS status = NtOpenSection(&h, access, named_attributes(&n, name, inherit));
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   return h;

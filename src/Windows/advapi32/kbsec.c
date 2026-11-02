@@ -417,8 +417,8 @@ EXP BOOL WINAPI EqualDomainSid(PSID a, PSID b, BOOL *equal)
     if (!RtlValidSid(a) || !RtlValidSid(b)) return win_fail(ERROR_INVALID_SID);
     if (!equal) return win_fail(ERROR_INVALID_PARAMETER);
     /* only the SIDs of the builtin domain (S-1-5-32-x) have a domain here; the others are not SIDs of an account of a domain */
-    if (x->SubAuthorityCount < 2 || x->IdentifierAuthority.Value[5] != 5 || x->SubAuthority[0] != 32) return win_fail(ERROR_NON_DOMAIN_SID);
-    *equal = y->SubAuthorityCount >= 2 && y->IdentifierAuthority.Value[5] == 5 && y->SubAuthority[0] == 32;
+    if (x->SubAuthorityCount < 1 || x->IdentifierAuthority.Value[5] != 5 || x->SubAuthority[0] != 32) return win_fail(ERROR_NON_DOMAIN_SID);
+    *equal = y->SubAuthorityCount >= 1 && y->IdentifierAuthority.Value[5] == 5 && y->SubAuthority[0] == 32;
     SetLastError(ERROR_SUCCESS);
     return TRUE;
 }

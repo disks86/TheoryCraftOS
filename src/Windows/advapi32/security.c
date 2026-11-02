@@ -22,6 +22,17 @@
 #include <wchar.h>
 
 HANDLE ADVAPI_KeyHandle(HKEY key);
+
+/* Is the handle one of a registry key? (the name of its type is Key) */
+static BOOL is_key_handle(HANDLE handle)
+{
+    BYTE buffer[256];
+    ULONG got;
+    const WCHAR *name;
+    if (NtQueryObject( handle, 2 /* ObjectTypeInformation */, buffer, sizeof(buffer), &got )) return FALSE;
+    name = *(const WCHAR **)(buffer + 8);
+    return *(USHORT *)buffer == 6 && name && (name[0] | 0x20) == 'k' && (name[1] | 0x20) == 'e' && (name[2] | 0x20) == 'y';
+}
 static DWORD trustee_to_sid(DWORD nDestinationSidLength, PSID pDestinationSid, PTRUSTEEW pTrustee);
 
 typedef struct _MAX_SID
@@ -1505,6 +1516,7 @@ __declspec(dllexport) DWORD WINAPI GetSecurityInfo( HANDLE handle, SE_OBJECT_TYP
             key = NULL;
         }
 
+        if (type == SE_REGISTRY_KEY && !is_key_handle( handle )) { if (key) RegCloseKey( key ); return ERROR_INVALID_HANDLE; }
         status = NtQuerySecurityObject( handle, SecurityInfo, NULL, 0, &size );
         if (status != STATUS_SUCCESS && status != STATUS_BUFFER_TOO_SMALL)
         {

@@ -318,6 +318,16 @@ uint32_t open_with_descriptor(Process& p, char tag, uint64_t id, uint32_t desire
   return kSuccess;
 }
 
+bool caller_privilege_enabled(Process& p, uint32_t low) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !objects->allocator()) return true;
+  ByteBuffer blob(*objects->allocator());
+  security::TokenView token;
+  bool enabled = false;
+  if (!caller_token_blob(p, blob) || !token.parse(blob.view())) return true;
+  return token.has_privilege(low, &enabled) && enabled;
+}
+
 bool caller_is_impersonating(Process& p) { return owner_object(g_thread_tokens, p.runtime() ? p.runtime()->current_thread_id() : p.id()) != 0; }
 
 bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted, uint32_t* status, bool backup_intent) {
