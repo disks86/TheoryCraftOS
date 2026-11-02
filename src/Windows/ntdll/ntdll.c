@@ -935,6 +935,7 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "libc.inc"
 #include "rtl2.inc"
 #include "rtl3.inc"
+#include "atom.inc"
 #include "sec.inc"
 #include "uilang.inc"
 #include "normalize.inc"
