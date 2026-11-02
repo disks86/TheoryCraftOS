@@ -34,7 +34,7 @@ constexpr uint64_t kSupervisorInterrupts = (1u << 1) | (1u << 5) | (1u << 9);   
 constexpr uint64_t kMachineInterrupts = (1u << 3) | (1u << 7) | (1u << 11);
 constexpr uint64_t kMedelegWritable = 0xB3FF;      // not the machine ecall (11), the reserved 10 and 14
 constexpr uint64_t kMisa = (uint64_t{2} << 62) | (1u << 0) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20) | (1u << 21);      // A C D F I M S U V
-constexpr uint64_t kEnvcfgStce = uint64_t{1} << 63;
+constexpr uint64_t kEnvcfgStce = uint64_t{1} << 63, kEnvcfgPbmte = uint64_t{1} << 62, kEnvcfgAdue = uint64_t{1} << 61;
 constexpr uint64_t kPpnMask = (uint64_t{1} << 44) - 1;
 
 uint64_t with_sd(uint64_t status) {
@@ -50,6 +50,7 @@ void RiscV64Cpu::enable_system(IRiscVBus& bus, GuestMemory& placeholder, uint64_
   placeholder_ = &placeholder;
   sys_ = System();
   sys_.mstatus = kUxl | kSxl;
+  sys_.menvcfg = kEnvcfgPbmte;      // (Svpbmt is on from reset)
   s_ = State();
   s_.pc = pc;
   retired_ = 0;
@@ -105,14 +106,18 @@ RiscV64Cpu::Translation RiscV64Cpu::translate(uint64_t address, Access access, u
     const int64_t folded = static_cast<int64_t>(address << (64 - va_bits)) >> (64 - va_bits);
     if (static_cast<uint64_t>(folded) != address) return {0, page_fault, false};
     uint64_t table = (sys_.satp & kPpnMask) << 12;
-    uint64_t pte = 0;
+    uint64_t pte = 0, pte_address = 0;
     uint32_t level = levels;
     for (;;) {
       --level;
       const uint64_t entry_address = table + (((address >> (12 + 9 * level)) & 511) << 3);
+      pte_address = entry_address;
       if (!pmp_allows(entry_address, 8, Access::Load, 1)) return {0, access_fault, false};
       if (!bus_->read(entry_address, 8, &pte)) return {0, access_fault, false};
-      if (!(pte & 1) || ((pte & 2) == 0 && (pte & 4) != 0) || (pte >> 54) != 0) return {0, page_fault, false};
+      const uint64_t pbmt = (pte >> 61) & 3;
+      if (!(pte & 1) || ((pte & 2) == 0 && (pte & 4) != 0) || ((pte >> 54) & 0x7F) != 0) return {0, page_fault, false};
+      if (pbmt != 0 && (!(sys_.menvcfg & kEnvcfgPbmte) || pbmt == 3)) return {0, page_fault, false};      // Svpbmt: the type bits are reserved unless enabled, and 3 always
+      if ((pte & 0xE) == 0 && (pte >> 61) != 0) return {0, page_fault, false};      // (a pointer has no N or PBMT bits)
       if (pte & 0xE) break;      // a leaf
       if (level == 0) return {0, page_fault, false};
       table = ((pte >> 10) & kPpnMask) << 12;
@@ -124,9 +129,19 @@ RiscV64Cpu::Translation RiscV64Cpu::translate(uint64_t address, Access access, u
     if (!allowed) return {0, page_fault, false};
     const uint64_t ppn = (pte >> 10) & kPpnMask;
     if (level > 0 && (ppn & ((uint64_t{1} << (9 * level)) - 1)) != 0) return {0, page_fault, false};      // (a misaligned superpage)
-    if (!(pte & 0x40) || (access == Access::Store && !(pte & 0x80))) return {0, page_fault, false};      // accessed / dirty clear: a fault, the software sets them
+    uint64_t effective_ppn = ppn;
+    if (pte >> 63) {      // Svnapot: a 64 KiB region, whose PPN ends in 0b1000
+      if (level != 0 || (ppn & 0xF) != 8) return {0, page_fault, false};
+      effective_ppn = (ppn & ~uint64_t{0xF}) | ((address >> 12) & 0xF);
+    }
+    const bool need_dirty = access == Access::Store;
+    if (!(pte & 0x40) || (need_dirty && !(pte & 0x80))) {
+      if (!(sys_.menvcfg & kEnvcfgAdue)) return {0, page_fault, false};      // Svade: the software sets the bits
+      pte |= 0x40 | (need_dirty ? 0x80 : 0);      // Svadu: the hart sets them
+      if (!pmp_allows(pte_address, 8, Access::Store, 1) || !bus_->write(pte_address, 8, pte)) return {0, access_fault, false};
+    }
     const uint64_t offset_mask = (uint64_t{1} << (12 + 9 * level)) - 1;
-    physical = ((ppn << 12) & ~offset_mask) | (address & offset_mask);
+    physical = ((effective_ppn << 12) & ~offset_mask) | (address & offset_mask);
   }
   if (!pmp_allows(physical, size, access, priv)) return {0, access_fault, false};
   return {physical, 0, true};
@@ -455,7 +470,7 @@ bool RiscV64Cpu::sys_csr_write(uint32_t csr, uint64_t v) {
     case 0x304: sys_.mie = v & (kSupervisorInterrupts | kMachineInterrupts); return true;
     case 0x305: sys_.mtvec = (v & 3) > 1 ? sys_.mtvec : (v & ~uint64_t{2}); return true;
     case 0x306: sys_.mcounteren = v & 7; return true;
-    case 0x30A: sys_.menvcfg = v & (kEnvcfgStce | 0xF1); return true;
+    case 0x30A: sys_.menvcfg = v & (kEnvcfgStce | kEnvcfgPbmte | kEnvcfgAdue | 0xF1); return true;
     case 0x320: sys_.mcountinhibit = v & 5; return true;
     case 0x340: sys_.mscratch = v; return true;
     case 0x341: sys_.mepc = v & ~uint64_t{1}; return true;

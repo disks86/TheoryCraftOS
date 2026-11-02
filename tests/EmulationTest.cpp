@@ -1932,6 +1932,10 @@ int main(int argc, char** argv) {
     test_riscv64_system(argv[25], argv[26], "privileged");
     test_riscv64_system(argv[27], argv[28], "privileged, user mode");
   }
+  if (argc >= 33) {
+    test_riscv64_system(argv[29], argv[30], "Svpbmt, Svnapot, Svadu");
+    test_riscv64_system(argv[31], argv[32], "PLIC");
+  }
   if (argc >= 13) test_avx_program(argv[11], argv[12]);      // (the SSE3/SSSE3/SSE4 program: the same kind of check)
   test_threads_without_support();
   if (argc < 3) printf("(no guest program given: skipping the whole-program tests)\n");

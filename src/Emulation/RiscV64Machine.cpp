@@ -37,8 +37,34 @@ bool RiscV64Machine::run(uint64_t max_instructions) {
   return finished_;
 }
 
+void RiscV64Machine::plic_refresh() {
+  for (uint32_t i = 1; i < kSources; ++i) {
+    const uint32_t word = i / 32, bit = uint32_t{1} << (i % 32);
+    const bool line = source_line(i), rose = line && !(plic_line_[word] & bit);      // (the PLIC latches a rising edge; a claim is the only thing that clears it)
+    if (line) plic_line_[word] |= bit;
+    else plic_line_[word] &= ~bit;
+    if (rose) plic_pending_[word] |= bit;
+  }
+}
+
+uint32_t RiscV64Machine::plic_best(uint32_t context) const {
+  uint32_t best = 0, best_priority = 0;
+  for (uint32_t i = 1; i < kSources; ++i) {
+    const uint32_t word = i / 32, bit = uint32_t{1} << (i % 32);
+    if (!(plic_pending_[word] & bit) || (plic_claimed_[word] & bit) || !(plic_enable_[context][word] & bit)) continue;
+    if (plic_priority_[i] > plic_threshold_[context] && plic_priority_[i] > best_priority) {
+      best = i;
+      best_priority = plic_priority_[i];
+    }
+  }
+  return best;
+}
+
 uint64_t RiscV64Machine::interrupts() {
+  plic_refresh();
   uint64_t pending = 0;
+  if (plic_best(0)) pending |= uint64_t{1} << 11;
+  if (plic_best(1)) pending |= uint64_t{1} << 9;
   if (msip_ & 1) pending |= uint64_t{1} << 3;
   if (time() >= mtimecmp_) pending |= uint64_t{1} << 7;
   return pending;
@@ -77,7 +103,10 @@ bool RiscV64Machine::read(uint64_t address, uint32_t size, uint64_t* out) {
     switch (address - kUart) {
       case 0: v = (uart_lcr_ & 0x80) ? uart_dll_ : 0; break;
       case 1: v = (uart_lcr_ & 0x80) ? uart_dlm_ : uart_ier_; break;
-      case 2: v = 0xC1; break;
+      case 2:
+        if ((uart_ier_ & 2) && uart_thr_pending_) { v = 0x02; uart_thr_pending_ = false; }
+        else v = 0x01;
+        break;
       case 3: v = uart_lcr_; break;
       case 4: v = uart_mcr_; break;
       case 5: v = 0x60; break;
@@ -87,7 +116,29 @@ bool RiscV64Machine::read(uint64_t address, uint32_t size, uint64_t* out) {
     *out = v;
     return size == 1;
   }
-  if (address >= 0xC000000ull && address < 0x10000000ull) { *out = 0; return true; }      // the PLIC: no sources
+  if (address >= 0xC000000ull && address < 0x10000000ull) {      // the PLIC
+    plic_refresh();
+    const uint64_t offset = address - 0xC000000ull;
+    uint64_t v = 0;
+    if (offset < 4 * kSources) v = plic_priority_[offset / 4];
+    else if (offset >= 0x1000 && offset < 0x1000 + 4 * (kSources / 32)) v = plic_pending_[(offset - 0x1000) / 4];
+    else if (offset >= 0x2000 && offset < 0x2000 + 0x80 * kContexts) {
+      const uint64_t word = ((offset - 0x2000) % 0x80) / 4;
+      if (word < kSources / 32) v = plic_enable_[(offset - 0x2000) / 0x80][word];
+    } else if (offset >= 0x200000 && offset < 0x200000 + 0x1000 * kContexts) {
+      const uint32_t context = static_cast<uint32_t>((offset - 0x200000) / 0x1000);
+      if ((offset & 0xFFF) == 0) v = plic_threshold_[context];
+      else if ((offset & 0xFFF) == 4) {      // claim: the best source, now pending no more
+        v = plic_best(context);
+        if (v) {
+          plic_pending_[v / 32] &= ~(uint32_t{1} << (v % 32));
+          plic_claimed_[v / 32] |= uint32_t{1} << (v % 32);
+        }
+      }
+    }
+    *out = v;
+    return true;
+  }
   if (address == kFinisher) { *out = 0; return size == 4; }
   return false;
 }
@@ -113,8 +164,13 @@ bool RiscV64Machine::write(uint64_t address, uint32_t size, uint64_t value) {
     if (size != 1) return false;
     const uint8_t v = static_cast<uint8_t>(value);
     switch (address - kUart) {
-      case 0: if (uart_lcr_ & 0x80) uart_dll_ = v; else uart_out_.put8(v); break;
-      case 1: if (uart_lcr_ & 0x80) uart_dlm_ = v; else uart_ier_ = v & 0xF; break;
+      case 0: if (uart_lcr_ & 0x80) uart_dll_ = v; else { uart_out_.put8(v); uart_thr_pending_ = true; } break;
+      case 1:
+        if (uart_lcr_ & 0x80) { uart_dlm_ = v; break; }
+        if ((v & 2) && !(uart_ier_ & 2)) uart_thr_pending_ = true;      // (enabling the interrupt with an empty holding register raises it)
+        if (!(v & 2)) uart_thr_pending_ = false;
+        uart_ier_ = v & 0xF;
+        break;
       case 3: uart_lcr_ = v; break;
       case 4: uart_mcr_ = v & 0x1F; break;
       case 7: uart_scr_ = v; break;
@@ -122,7 +178,20 @@ bool RiscV64Machine::write(uint64_t address, uint32_t size, uint64_t value) {
     }
     return true;
   }
-  if (address >= 0xC000000ull && address < 0x10000000ull) return true;
+  if (address >= 0xC000000ull && address < 0x10000000ull) {
+    const uint64_t offset = address - 0xC000000ull;
+    const uint32_t v = static_cast<uint32_t>(value);
+    if (offset < 4 * kSources) plic_priority_[offset / 4] = offset < 4 ? 0 : v & 7;
+    else if (offset >= 0x2000 && offset < 0x2000 + 0x80 * kContexts) {
+      const uint64_t word = ((offset - 0x2000) % 0x80) / 4;
+      if (word < kSources / 32) plic_enable_[(offset - 0x2000) / 0x80][word] = v;
+    } else if (offset >= 0x200000 && offset < 0x200000 + 0x1000 * kContexts) {
+      const uint32_t context = static_cast<uint32_t>((offset - 0x200000) / 0x1000);
+      if ((offset & 0xFFF) == 0) plic_threshold_[context] = v & 7;
+      else if ((offset & 0xFFF) == 4 && v < kSources) plic_claimed_[v / 32] &= ~(uint32_t{1} << (v % 32));      // complete
+    }
+    return true;
+  }
   if (address == kFinisher && size == 4) {
     const uint32_t v = static_cast<uint32_t>(value);
     if ((v & 0xFFFF) == 0x5555) { finished_ = true; exit_code_ = 0; }

@@ -143,6 +143,19 @@ mtrap:
   sw zero, 0(t0)
   j 30f
 22:
+  li t0, 11
+  bne a1, t0, 23f
+  li t0, 0x10000001               # silence the UART, then claim, log and complete the PLIC source (context 0 = this hart's machine mode)
+  sb zero, 0(t0)
+  li t0, 0xC200004
+  lw a0, 0(t0)
+  sw a0, 8(sp)                    # (a0 is restored below; keep the claim id for the log)
+  call puthex
+  li t0, 0xC200004
+  lw a0, 8(sp)
+  sw a0, 0(t0)
+  j 30f
+23:
   li t0, 1
   sll t0, t0, a1
   csrc mip, t0
@@ -247,6 +260,19 @@ strap:
   csrc sie, t0                    # and no more supervisor timer interrupts
   j 30f
 21:
+  li t0, 9
+  bne a1, t0, 22f
+  li t0, 0x10000001
+  sb zero, 0(t0)
+  li t0, 0xC201004                # context 1 = this hart's supervisor mode
+  lw a0, 0(t0)
+  sw a0, 8(sp)
+  call puthex
+  li t0, 0xC201004
+  lw a0, 8(sp)
+  sw a0, 0(t0)
+  j 30f
+22:
   li t0, 1
   sll t0, t0, a1
   csrc sip, t0

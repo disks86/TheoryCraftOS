@@ -155,8 +155,9 @@ AArch64 uses, so files, pipes, `mmap` and `clone` are shared with every other ki
   the test finisher at 0x100000, an empty PLIC; time advances with the instructions run and `wfi` skips ahead to the next timer. `tests/riscv_sys.sh` runs the payloads in `tests/riscv_sys` (CSR WARL probes, mode switches, delegation, illegal-instruction traps, paging
   faults of every kind, PMP including locked entries, timer / software / supervisor / Sstc interrupts, user mode under paging) on `qemu-system-riscv64 -M virt` and on the machine and compares what they print over the UART: identical. Two payload builds and qemu's output
   are checked in (`tests/data/emulation/riscv-sys*`) so `EmulationTest` runs them under the sanitizers, together with bit-flipped and truncated images and random instruction words at random privilege levels.
-  **Not done**: PLIC and external interrupts, hardware A/D updating (Svadu), Svpbmt / Svnapot (the bits are reserved here), hardware performance counters (reads trap, as with `pmu-num=0`), Smepmp, the debug trigger module, multiple harts. OpenSBI or Linux has not been booted on it:
-  that needs a device tree and a block device or initramfs loader on top of the board.
+  Also there: Svpbmt (the type bits are checked, `menvcfg.PBMTE` on from reset), Svnapot (64 KiB pages) and Svadu (`menvcfg.ADUE`: the hart sets A and D itself, otherwise Svade's fault), all against qemu; and the PLIC (qemu virt's register layout, 96 sources, a machine and a
+  supervisor context) with the UART's transmit-empty interrupt as source 10, which gives machine and supervisor external interrupts.
+  **Not done**: the H extension (hypervisor), hardware performance counters (reads trap, as with `pmu-num=0`), Smepmp, the debug trigger module, multiple harts, Zcmt/Zcmp (their encodings are `c.fsdsp`/`c.fld` with Zcd), other PLIC sources (no other devices exist), the APLIC/IMSIC. Booting OpenSBI or Linux was left out on purpose (no hardware to run it on; the aim is UEFI).
 - **Not implemented** (an invalid-instruction fault, never a wrong result): H, RV32, Zcmt, Zicfiss shadow-stack semantics (the mops write zero).
 
 ## AVX, AVX2, FMA, BMI, F16C
