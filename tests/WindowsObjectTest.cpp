@@ -105,7 +105,30 @@ struct Prog {
     memory.put64(attr, 0x30);
     memory.put64(attr + 8, 0);
     memory.put64(attr + 16, unicode);
+    memory.put64(attr + 24, 0x80);      // OBJ_OPENIF, as kernel32 asks: an existing name is opened (and told), not refused
     return attr;
+  }
+  // A UNICODE_STRING for `text` (UTF-8, ASCII only here) at `unicode`, its characters at `chars`; `spare` is added to the MaximumLength.
+  uint64_t unicode_string(const std::string& text, uint64_t unicode, uint64_t chars, uint32_t spare = 2) {
+    for (size_t i = 0; i < text.size(); ++i) { memory.bytes[chars - kBase + 2 * i] = uint8_t(text[i]); memory.bytes[chars - kBase + 2 * i + 1] = 0; }
+    memory.put64(unicode, uint64_t(text.size() * 2) | (uint64_t(text.size() * 2 + spare) << 16));
+    memory.put64(unicode + 8, chars);
+    return unicode;
+  }
+  // OBJECT_ATTRIBUTES for a path (or a name below `root`), at kBase + 0x400.
+  uint64_t path_attributes(const std::string& path, uint64_t root = 0, uint32_t flags = 0x80) {
+    const uint64_t attr = kBase + 0x400;
+    unicode_string(path, kBase + 0x600, kBase + 0x800);
+    memory.put64(attr, 0x30);
+    memory.put64(attr + 8, root);
+    memory.put64(attr + 16, kBase + 0x600);
+    memory.put64(attr + 24, flags);
+    return attr;
+  }
+  std::string text_at(uint64_t chars, uint32_t units) {
+    std::string out;
+    for (uint32_t i = 0; i < units; ++i) out.push_back(char(memory.bytes[chars - kBase + 2 * i]));
+    return out;
   }
   uint32_t call(WindowsSyscallNumber n, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0, uint64_t a6 = 0) {
     SyscallRequest r;
@@ -438,7 +461,59 @@ static void test_jobs() {
   set_system_objects(nullptr);
 }
 
+// Directories and symbolic links of the object namespace: names below a directory handle, through a link, the listing, the link's target.
+static void test_directories() {
+  SystemSync sync;
+  ObjectManager objects(sync);
+  set_system_objects(&objects);
+  {
+    Prog p(1);
+    CHECK(p.call(WindowsSyscallNumber::NtCreateDirectoryObject, kBase + 0x100, 3, p.path_attributes("\\BaseNamedObjects\\Dir", 0, 0)) == 0);
+    const uint64_t dir = p.out();
+    CHECK(p.call(WindowsSyscallNumber::NtCreateDirectoryObject, kBase + 0x100, 3, p.path_attributes("\\BaseNamedObjects\\Dir", 0, 0)) == 0xC0000035u);      // the name is taken
+    CHECK(p.call(WindowsSyscallNumber::NtCreateDirectoryObject, kBase + 0x100, 3, p.path_attributes("\\BaseNamedObjects\\Dir", 0, 0x80)) == 0x40000000u);
+    CHECK(p.call(WindowsSyscallNumber::NtClose, p.out()) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtCreateEvent, kBase + 0x100, 0x1F0003, p.path_attributes("Child", dir), 0, 0) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, p.path_attributes("\\BaseNamedObjects\\Dir\\Child")) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, p.path_attributes("\\BaseNamedObjects\\Nothing\\Child")) == 0xC000003Au);
+    CHECK(p.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, p.path_attributes("Dir\\Child")) == 0xC000003Bu);      // not absolute, and no directory
+    CHECK(p.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, p.path_attributes("Dir\\Child", 0x1234)) == 0xC0000008u);      // not a handle
+    CHECK(p.call(WindowsSyscallNumber::NtOpenMutant, kBase + 0x100, 0x1F0001, p.path_attributes("\\BaseNamedObjects\\Dir\\Child")) == 0xC0000024u);      // an event
+    CHECK(p.call(WindowsSyscallNumber::NtOpenMutant, kBase + 0x100, 0x1F0001, p.path_attributes("\\BaseNamedObjects\\Dir")) == 0xC0000024u);      // a directory
+    // the listing: one entry named Child of the type Event
+    CHECK(p.call(WindowsSyscallNumber::NtQueryDirectoryObject, dir, kBase + 0xA00, 0x200, 1, 1, kBase + 0x180, kBase + 0x188) == 0);
+    CHECK(p.memory.get64(kBase + 0x180) == 1);
+    const uint64_t name_chars = p.memory.get64(kBase + 0xA00 + 8), type_chars = p.memory.get64(kBase + 0xA00 + 24);
+    CHECK(p.text_at(name_chars, 5) == "Child" && p.text_at(type_chars, 5) == "Event");
+    CHECK(p.call(WindowsSyscallNumber::NtQueryDirectoryObject, dir, kBase + 0xA00, 0x200, 1, 0, kBase + 0x180, kBase + 0x188) == 0x8000001Au);      // no more
+    CHECK(p.call(WindowsSyscallNumber::NtQueryDirectoryObject, dir, kBase + 0xA00, 0x20, 1, 1, kBase + 0x180, kBase + 0x188) == 0xC0000023u);      // too small
+    CHECK(p.call(WindowsSyscallNumber::NtQueryDirectoryObject, 0, kBase + 0xA00, 0x200, 1, 1, kBase + 0x180, kBase + 0x188) == 0xC0000008u);
+    // a link to the directory, followed by names below it
+    p.unicode_string("\\BaseNamedObjects\\Dir", kBase + 0x680, kBase + 0xC00);
+    CHECK(p.call(WindowsSyscallNumber::NtCreateSymbolicLinkObject, kBase + 0x100, 1, p.path_attributes("\\BaseNamedObjects\\Alias", 0, 0), kBase + 0x680) == 0);
+    const uint64_t link = p.out();
+    CHECK(p.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, p.path_attributes("\\BaseNamedObjects\\Alias\\Child")) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtOpenDirectoryObject, kBase + 0x100, 3, p.path_attributes("\\BaseNamedObjects\\Alias")) == 0);      // followed to the directory
+    CHECK(p.call(WindowsSyscallNumber::NtOpenSymbolicLinkObject, kBase + 0x100, 1, p.path_attributes("\\BaseNamedObjects\\Alias")) == 0);
+    CHECK(p.call(WindowsSyscallNumber::NtCreateEvent, kBase + 0x100, 0x1F0003, p.path_attributes("Child", link), 0, 0) == 0xC0000024u);      // a link is no directory
+    // the target: the characters with an end mark, and the length told when the string is too small
+    p.unicode_string("", kBase + 0xB00, kBase + 0xB40, 0);
+    p.memory.put64(kBase + 0xB00, uint64_t(0x80) << 16);
+    CHECK(p.call(WindowsSyscallNumber::NtQuerySymbolicLinkObject, link, kBase + 0xB00, kBase + 0x190) == 0);
+    const uint32_t units = 21;      // \BaseNamedObjects\Dir
+    CHECK(p.memory.get64(kBase + 0xB00) % 0x10000 == 2 * units && p.text_at(kBase + 0xB40, units) == "\\BaseNamedObjects\\Dir");
+    p.memory.put64(kBase + 0xB00, uint64_t(2 * units) << 16);
+    CHECK(p.call(WindowsSyscallNumber::NtQuerySymbolicLinkObject, link, kBase + 0xB00, kBase + 0x190) == 0xC0000023u && p.memory.get64(kBase + 0x190) % 0x100000000ull == 2 * units + 2);
+    // a link to the root makes \??\GLOBALROOT
+    CHECK(p.call(WindowsSyscallNumber::NtOpenEvent, kBase + 0x100, 0x1F0003, p.path_attributes("\\??\\GLOBALROOT\\BaseNamedObjects\\Dir\\Child")) == 0);
+    // a handle to a symbolic link is not a directory
+    CHECK(p.call(WindowsSyscallNumber::NtQueryDirectoryObject, link, kBase + 0xA00, 0x200, 1, 1, kBase + 0x180, kBase + 0x188) == 0xC0000024u);
+  }
+  set_system_objects(nullptr);
+}
+
 int main() {
+  test_directories();
   test_jobs();
   test_events();
   test_names_between_processes();

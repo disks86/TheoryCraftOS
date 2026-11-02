@@ -17,6 +17,7 @@
  */
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsIo.hpp"
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsThreads.hpp"
 #include "Process/WindowsLocks.hpp"
@@ -29,6 +30,7 @@
 #include "Process/WindowsModules.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsStartup.hpp"
 #include "Process/WindowsSystem.hpp"
 #include "Process/WindowsTokens.hpp"
 #include "Process/Process.hpp"
@@ -92,19 +94,61 @@ uint32_t nt_delay_execution(Process& process, const SyscallRequest& r) {
 }
 
 // NtQueryTimerResolution(PULONG Minimum, PULONG Maximum, PULONG Current) and NtSetTimerResolution(ULONG Desired, BOOLEAN Set, PULONG Current): the system's clock ticks
-// are a 10 ms scheduler tick with a finer clock; asking for a finer period is accepted and changes nothing.
+// are a 10 ms scheduler tick with a finer clock. A program may ask for a period between the maximum (finest) and the minimum (coarsest) resolution; the current
+// resolution is the finest of what was asked for (one request per program, replaced by the next, taken back with Set = FALSE) and the system's own 10 ms.
+constexpr uint32_t kTimerMinimum = 156250, kTimerMaximum = 10000, kTimerInitial = 10000, kStatusTimerResolutionNotSet = 0xC0000245u;
+struct TimerRequests {
+  static constexpr uint32_t kSlots = 32;
+  uint64_t pid[kSlots] = {};
+  uint32_t value[kSlots] = {};
+  uint8_t lock = 0;
+};
+TimerRequests g_timer_requests;
+struct TimerRequestsLock {      // (a few instructions long; it spins without masking interrupts)
+  TimerRequestsLock() { while (__atomic_exchange_n(&g_timer_requests.lock, 1, __ATOMIC_ACQUIRE)) {} }
+  ~TimerRequestsLock() { __atomic_store_n(&g_timer_requests.lock, 0, __ATOMIC_RELEASE); }
+};
+uint32_t current_timer_resolution() {      // (with the lock held)
+  uint32_t best = kTimerInitial;
+  for (uint32_t i = 0; i < TimerRequests::kSlots; ++i) if (g_timer_requests.value[i] != 0 && g_timer_requests.value[i] < best) best = g_timer_requests.value[i];
+  return best;
+}
+
 uint32_t nt_query_timer_resolution(Process& process, const SyscallRequest& r) {
-  const uint32_t values[3] = {156250, 10000, 10000};
+  uint32_t current = 0;
+  { TimerRequestsLock lock; current = current_timer_resolution(); }
+  const uint32_t values[3] = {kTimerMinimum, kTimerMaximum, current};
+  for (uint32_t i = 0; i < 3; ++i) if (r.args[i] == 0) return kStatusAccessViolation;
   for (uint32_t i = 0; i < 3; ++i) {
-    if (r.args[i] == 0) continue;
     uint8_t raw[4] = {uint8_t(values[i]), uint8_t(values[i] >> 8), uint8_t(values[i] >> 16), uint8_t(values[i] >> 24)};
     if (!process.write_user(r.args[i], ConstByteView(raw, 4))) return kStatusAccessViolation;
   }
   return kStatusSuccess;
 }
 uint32_t nt_set_timer_resolution(Process& process, const SyscallRequest& r) {
-  if (r.args[2] != 0 && !process.write_user_u32(r.args[2], 10000)) return kStatusAccessViolation;
-  return kStatusSuccess;
+  if (r.args[2] == 0) return kStatusAccessViolation;
+  uint32_t desired = uint32_t(r.args[0]), current = 0, status = kStatusSuccess;
+  const bool set = (r.args[1] & 0xFF) != 0;
+  {
+    TimerRequestsLock lock;
+    uint32_t slot = TimerRequests::kSlots, free_slot = TimerRequests::kSlots;
+    for (uint32_t i = 0; i < TimerRequests::kSlots; ++i) {
+      if (g_timer_requests.value[i] != 0 && g_timer_requests.pid[i] == process.id()) slot = i;
+      if (g_timer_requests.value[i] == 0 && free_slot == TimerRequests::kSlots) free_slot = i;
+    }
+    if (set) {
+      if (desired < kTimerMaximum) desired = kTimerMaximum;
+      if (desired > kTimerMinimum) desired = kTimerMinimum;
+      if (slot == TimerRequests::kSlots) slot = free_slot;
+      if (slot != TimerRequests::kSlots) { g_timer_requests.pid[slot] = process.id(); g_timer_requests.value[slot] = desired; }
+    } else if (slot == TimerRequests::kSlots) {
+      status = kStatusTimerResolutionNotSet;
+    } else {
+      g_timer_requests.value[slot] = 0;
+    }
+    current = current_timer_resolution();
+  }
+  return process.write_user_u32(r.args[2], current) ? status : kStatusAccessViolation;
 }
 
 // NtQueryPerformanceCounter(PLARGE_INTEGER Counter, PLARGE_INTEGER Frequency): 100 ns ticks, so the frequency is 10 MHz.
@@ -123,9 +167,26 @@ class WindowsSyscalls final : public ISyscallInterface {
   SyscallAbi abi() const override { return SyscallAbi::Windows; }
   UserArch arch() const override { return UserArch::X86_64; }
 
+  // The calls that waited in the kernel and finished since (the answer of another thread, another program, the end of a handle) are applied to this program's memory before
+  // the call begins and once it is over, so that whatever the program looks at next is there.
   uint64_t dispatch(Process& process, const SyscallRequest& r) const override {
+    windowsabi::io_reap_if_needed(process);
+    const uint64_t result = dispatch_service(process, r);
+    windowsabi::io_reap_if_needed(process);
+    return result;
+  }
+
+  uint64_t dispatch_service(Process& process, const SyscallRequest& r) const {
     if (r.number > 0xFFFFFFFFu) return kStatusInvalidSystemService;
+    refresh_shared_user_data(process.host());
     switch (static_cast<WindowsSyscallNumber>(r.number)) {
+      case WindowsSyscallNumber::NtCancelIoFile: return windowsabi::nt_cancel_io_file(process, r);
+      case WindowsSyscallNumber::NtCancelIoFileEx: return windowsabi::nt_cancel_io_file_ex(process, r);
+      case WindowsSyscallNumber::NtSetIoCompletion: return windowsabi::nt_set_io_completion(process, r);
+      case WindowsSyscallNumber::NtSetIoCompletionEx: return windowsabi::nt_set_io_completion_ex(process, r);
+      case WindowsSyscallNumber::NtRemoveIoCompletion: return windowsabi::nt_remove_io_completion(process, r);
+      case WindowsSyscallNumber::NtRemoveIoCompletionEx: return windowsabi::nt_remove_io_completion_ex(process, r);
+      case WindowsSyscallNumber::NtQueryIoCompletion: return windowsabi::nt_query_io_completion(process, r);
       case WindowsSyscallNumber::NtReadFile: return windowsabi::nt_read_file(process, r);
       case WindowsSyscallNumber::NtWriteFile: return windowsabi::nt_write_file(process, r);
       case WindowsSyscallNumber::NtClose: return windowsabi::nt_close(process, r);
@@ -173,6 +234,12 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtCreateKeyedEvent: return windowsabi::nt_create_keyed_event(process, r);
       case WindowsSyscallNumber::NtOpenKeyedEvent: return windowsabi::nt_open_keyed_event(process, r);
       case WindowsSyscallNumber::NtCreateIoCompletion: return windowsabi::nt_create_io_completion(process, r);
+      case WindowsSyscallNumber::NtCreateDirectoryObject: return windowsabi::nt_create_directory_object(process, r);
+      case WindowsSyscallNumber::NtOpenDirectoryObject: return windowsabi::nt_open_directory_object(process, r);
+      case WindowsSyscallNumber::NtQueryDirectoryObject: return windowsabi::nt_query_directory_object(process, r);
+      case WindowsSyscallNumber::NtCreateSymbolicLinkObject: return windowsabi::nt_create_symbolic_link_object(process, r);
+      case WindowsSyscallNumber::NtOpenSymbolicLinkObject: return windowsabi::nt_open_symbolic_link_object(process, r);
+      case WindowsSyscallNumber::NtQuerySymbolicLinkObject: return windowsabi::nt_query_symbolic_link_object(process, r);
       case WindowsSyscallNumber::NtOpenIoCompletion: return windowsabi::nt_open_io_completion(process, r);
       case WindowsSyscallNumber::NtAssignProcessToJobObject: return windowsabi::nt_assign_process_to_job_object(process, r);
       case WindowsSyscallNumber::NtTerminateJobObject: return windowsabi::nt_terminate_job_object(process, r);
@@ -241,6 +308,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtYieldExecution: process.block_yield(); return kStatusSuccess;
       case WindowsSyscallNumber::NtDelayExecution: return nt_delay_execution(process, r);
       case WindowsSyscallNumber::NtQuerySystemTime: return nt_query_system_time(process, r);
+      case WindowsSyscallNumber::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter: return (r.args[1] == 0 || r.args[2] == 0) ? 0xC0000005u : 0xC00000BBu;      // no auxiliary counter: STATUS_NOT_SUPPORTED
       case WindowsSyscallNumber::NtAllocateVirtualMemory: return windowsabi::nt_allocate_virtual_memory(process, r);
       case WindowsSyscallNumber::NtFreeVirtualMemory: return windowsabi::nt_free_virtual_memory(process, r);
       case WindowsSyscallNumber::NtProtectVirtualMemory: return windowsabi::nt_protect_virtual_memory(process, r);

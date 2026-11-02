@@ -94,6 +94,8 @@ EXPORT DWORD WINAPI GetMaximumProcessorCount(WORD group) { return GetActiveProce
 EXPORT WORD WINAPI GetActiveProcessorGroupCount(void) { return 1; }
 EXPORT WORD WINAPI GetMaximumProcessorGroupCount(void) { return 1; }
 EXPORT BOOL WINAPI QueryUnbiasedInterruptTime(PULONGLONG t) { if (!t) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *t = GetTickCount64() * 10000; return TRUE; }
+EXPORT LONG WINAPI ConvertAuxiliaryCounterToPerformanceCounter(ULONGLONG aux, PULONGLONG perf, PULONGLONG error) { return 0x80004001; }      /* E_NOTIMPL: no auxiliary counter */
+EXPORT LONG WINAPI ConvertPerformanceCounterToAuxiliaryCounter(ULONGLONG perf, PULONGLONG aux, PULONGLONG error) { return 0x80004001; }
 EXPORT DWORD WINAPI GetProcessIdOfThread(HANDLE thread) {
   BYTE info[48];
   if (!NT_SUCCESS(NtQueryInformationThread(thread, 0, info, sizeof(info), NULL))) { set_error(ERROR_INVALID_HANDLE); return 0; }

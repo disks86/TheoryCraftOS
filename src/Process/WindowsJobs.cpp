@@ -123,15 +123,6 @@ uint32_t nt_query_information_job_object(Process& p, const SyscallRequest& r) {
       put(b, 112, info.process_memory_limit, 8); put(b, 120, info.job_memory_limit, 8);
       size = 144;
       break;
-    case 0x80: {      // this OS's own class: the oldest event of the completion port (message, process id, key)
-      uint32_t message = 0;
-      uint64_t pid = 0, key = 0;
-      if (length < 24) return kInfoLengthMismatch;
-      if (!objects->job_take_event(job, &message, &pid, &key)) return 0x8000001Au;      // STATUS_NO_MORE_ENTRIES
-      put(b, 0, message, 4); put(b, 8, pid, 8); put(b, 16, key, 8);
-      size = 24;
-      break;
-    }
     default: return info_class == 7 ? kNotSupported : kInvalidInfoClass;
   }
   if (returned != 0 && !p.write_user_u32(returned, size)) return kAccessViolation;
@@ -163,10 +154,17 @@ uint32_t nt_set_information_job_object(Process& p, const SyscallRequest& r) {
     case 6:
       if (length != 4) return kInfoLengthMismatch;
       return p.read_user(r.args[2], ByteView(b, 4)) ? kSuccess : kAccessViolation;      // (accepted; nothing about windows or time is enforced)
-    case 7: {      // JobObjectAssociateCompletionPortInformation { CompletionKey, CompletionPort }: the port itself lives with the program that made it (kernel32 reads the events)
+    case 7: {      // JobObjectAssociateCompletionPortInformation { CompletionKey, CompletionPort }: the port is an I/O completion object: the events are its packets
       if (length != 16) return kInfoLengthMismatch;
       if (!p.read_user(r.args[2], ByteView(b, 16))) return kAccessViolation;
-      return objects->job_set_port(job, get(b, 0, 8), get(b, 8, 8) != 0);
+      const uint64_t port_handle = get(b, 8, 8);
+      uint32_t port_object = 0;
+      if (port_handle != 0) {      // the port: an I/O completion object of this program
+        const uint64_t port_slot = port_handle / 4 - 1;
+        if (port_handle % 4 != 0 || port_slot >= Process::kMaxDescriptors || p.files().kind(port_slot) != DescriptorKind::IoCompletion) return kInvalidHandle;
+        port_object = uint32_t(p.files().token(port_slot));
+      }
+      return objects->job_set_port(job, get(b, 0, 8), port_object);
     }
     default: return kInvalidInfoClass;
   }

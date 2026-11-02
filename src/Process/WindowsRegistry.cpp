@@ -181,6 +181,12 @@ uint32_t open_key_checked(Process& p, const SyscallRequest& r) {
 uint32_t nt_open_key(Process& p, const SyscallRequest& r) { return open_key_checked(p, r); }
 uint32_t nt_open_key_ex(Process& p, const SyscallRequest& r) { return open_key_checked(p, r); }
 
+bool key_full_name(Process& p, uint64_t token, String* out) {
+  Guard guard;
+  RegistryTree* t = tree(p);
+  return t && t->full_name(static_cast<uint32_t>(token), out);
+}
+
 uint32_t nt_query_key(Process& p, const SyscallRequest& r) {
   // NtQueryKey(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG Length, PULONG ResultLength)
   uint64_t result = 0;

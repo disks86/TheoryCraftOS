@@ -69,12 +69,14 @@ struct WindowsStartupInput {
 
 // KUSER_SHARED_DATA is mapped here in every Windows process; programs and ntdll read the version and the processor count from it.
 constexpr uint64_t kSharedUserDataAddress = 0x7FFE0000ull;
+// Brings the clocks of KUSER_SHARED_DATA (InterruptTime, SystemTime, TickCount) up to date; a Windows program's system services do it on entry.
+void refresh_shared_user_data(IProcessHost& host);
 // Standard handles as the NT services hand them out (see WindowsSyscalls.cpp): input, output, error.
 constexpr uint64_t kStdInputHandle = 4, kStdOutputHandle = 8, kStdErrorHandle = 12;
 
 // Maps and fills the PEB, the TEB, the process parameters, the shared data page and the static TLS block of a loaded PE image, in one new region of the
 // address space. The image's TLS directory is honoured (the template is copied, the zero fill is zero, the index variable becomes 0, the TEB points at the
-// block); TLS callbacks are not run. Reports a version of Windows 10 (10.0.19045). The shared data is a snapshot, not a live clock.
+// block); TLS callbacks are not run. Reports a version of Windows 10 (10.0.19045). The clocks of the shared data are kept by refresh_shared_user_data().
 LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, const LoadedImage& image, const WindowsStartupInput& input, WindowsStartup* out);
 
 // A new thread of a Windows program: one region of the address space holding its stack, its TEB and its static TLS block (copied from the template, as the first

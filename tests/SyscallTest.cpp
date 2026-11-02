@@ -308,9 +308,9 @@ static void test_windows() {
   stack_args(mem, kBase + 0x200, kBase + 0x100, 0x1FFFFFFFFull);                                 // upper half of Length is ignored: 0x1FFFFFFFF -> 4 GiB-1
   host.out.clear();
   CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtWriteFile, 8))) == kNtSuccess && host.out.size() == 0x1F00);   // bounded by the mapping
-  // an APC routine is not supported
+  // an APC routine is queued for the calling thread when the call is over (a program without thread records has none to queue it for: the write is still done)
   stack_args(mem, kBase + 0x200, kBase + 0x100, 5);
-  CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtWriteFile, 8, 0, 0x1234))) == kNtNotImpl);
+  CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtWriteFile, 8, 0, 0x1234))) == kNtSuccess);
   // the stack itself unreadable
   SyscallRequest bad = nt(WindowsSyscallNumber::NtWriteFile, 8);
   bad.user_stack = 0xDEAD0000;

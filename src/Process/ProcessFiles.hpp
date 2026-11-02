@@ -41,7 +41,7 @@ constexpr uint64_t kMaxPath = 4096;
 PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String* out);
 
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key, MountManager, DebugObject, Token, KeyedEvent, IoCompletion, Reserve };
+enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key, MountManager, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, ObjectDirectory, SymbolicLink };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -73,6 +73,10 @@ struct OpenObject {
   filesystem::DirectoryEntry pending;
   bool has_pending = false;          // an entry that was read but did not fit and waits for the next call
   uint32_t change_watch = 0;         // ReadDirectoryChangesW's own change-notification object for this directory handle, made on its first call; 0 = none yet
+  bool async_io = false;             // opened without FILE_SYNCHRONOUS_IO_ALERT / _NONALERT: a call with an event or an APC answers STATUS_PENDING
+  uint32_t io_port = 0;              // the I/O completion port the file object is tied to (a referenced port object; 0: none), the key it was tied with, and the FILE_SKIP_* flags
+  uint64_t io_key = 0;
+  uint32_t io_flags = 0;
 };
 
 // The descriptor table and file operations of one process. Console descriptors 0..2 exist from the start; the file system is attached once.

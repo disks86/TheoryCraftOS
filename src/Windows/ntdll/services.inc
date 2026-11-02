@@ -287,7 +287,7 @@ NT_SERVICE(NtRegisterThreadTerminatePort);
 NT_SERVICE(NtReleaseKeyedEvent);
 NT_SERVICE(NtReleaseWorkerFactoryWorker);
 NT_SERVICE(NtRemoveIoCompletion);
-NT_SERVICE(NtRemoveIoCompletionEx);
+NT_SERVICE_RAW(NtRemoveIoCompletionEx);
 NT_SERVICE(NtRemoveProcessDebug);
 NT_SERVICE(NtRenameKey);
 NT_SERVICE(NtRenameTransactionManager);

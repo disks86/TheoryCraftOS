@@ -98,6 +98,47 @@ static void reserve_stack_floor(AddressSpace& space, uint64_t base) {
   if (space.protect(base, kFloor, 0)) space.set_attributes(base, kFloor, attributes);
 }
 
+namespace {
+
+// The page behind KUSER_SHARED_DATA. It belongs to the kernel and is never freed, so the sharing needs no counting. Several cores may refresh it at once: each KSYSTEM_TIME
+// is written in the order that lets a reader (High1Time, LowPart, High2Time until High1Time == High2Time) tell a torn value, and a value never goes backwards.
+class SharedUserDataPage final : public SharedMemory {
+ public:
+  void retain() override {}
+  void release() override {}
+  uint8_t* data() { return page_; }
+
+ private:
+  alignas(4096) uint8_t page_[4096] = {};
+};
+SharedUserDataPage g_shared_user_data;
+
+// Writes `value` into the KSYSTEM_TIME at `offset` unless the time there is already later.
+void store_system_time(uint8_t* page, uint32_t offset, uint64_t value) {
+  uint32_t* t = reinterpret_cast<uint32_t*>(page + offset);      // (the page is aligned and the offsets are multiples of 4)
+  const uint64_t seen = uint64_t(__atomic_load_n(&t[1], __ATOMIC_ACQUIRE)) << 32 | __atomic_load_n(&t[0], __ATOMIC_ACQUIRE);
+  if (value < seen) return;
+  __atomic_store_n(&t[2], uint32_t(value >> 32), __ATOMIC_RELEASE);      // High2Time first, High1Time last
+  __atomic_store_n(&t[0], uint32_t(value), __ATOMIC_RELEASE);
+  __atomic_store_n(&t[1], uint32_t(value >> 32), __ATOMIC_RELEASE);
+}
+
+void store_u32(uint8_t* page, uint32_t offset, uint32_t value) { __atomic_store_n(reinterpret_cast<uint32_t*>(page + offset), value, __ATOMIC_RELAXED); }
+
+bool map_shared_user_data(AddressSpace& space, uint32_t processor_count) {
+  uint8_t* page = g_shared_user_data.data();
+  store_u32(page, 0x04, 1u << 24);                          // TickCountMultiplier: TickCount counts milliseconds
+  store_u32(page, 0x260, 19045);                            // NtBuildNumber
+  store_u32(page, 0x264, 1);                                // NtProductType: workstation
+  store_u32(page, 0x268, 1u | 9u << 16);                    // ProductTypeIsValid (a byte, 0x268) and NativeProcessorArchitecture (0x26A): PROCESSOR_ARCHITECTURE_AMD64
+  store_u32(page, 0x26C, 10);                               // NtMajorVersion
+  store_u32(page, 0x270, 0);                                // NtMinorVersion
+  store_u32(page, 0x3C0, processor_count);                  // ActiveProcessorCount
+  return space.map_shared(kSharedUserDataAddress, 4096, kProtRead, g_shared_user_data.data(), &g_shared_user_data);
+}
+
+}  // namespace
+
 LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, const LoadedImage& image, const WindowsStartupInput& input, WindowsStartup* out) {
   if (!input.allocator || input.stack_top < input.stack_size) return LoadStatus::Malformed;
   allocators::IAllocator& allocator = *input.allocator;
@@ -294,18 +335,8 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   }
   if (!w.ok()) return LoadStatus::Malformed;
 
-  // --- KUSER_SHARED_DATA
-  if (!space.map(kSharedUserDataAddress, kPage, kProtRead)) return LoadStatus::OutOfMemory;
-  Writer shared(space);
-  shared.u32(kSharedUserDataAddress + 0x04, 0x0FA00000);          // TickCountMultiplier
-  shared.u16(kSharedUserDataAddress + 0x26, 9);                   // NativeProcessorArchitecture: PROCESSOR_ARCHITECTURE_AMD64
-  shared.u32(kSharedUserDataAddress + 0x260, 19045);              // NtBuildNumber
-  shared.u32(kSharedUserDataAddress + 0x264, 1);                  // NtProductType: workstation
-  shared.u8(kSharedUserDataAddress + 0x268, 1);                   // ProductTypeIsValid
-  shared.u32(kSharedUserDataAddress + 0x26C, 10);                 // NtMajorVersion
-  shared.u32(kSharedUserDataAddress + 0x270, 0);                  // NtMinorVersion
-  shared.u32(kSharedUserDataAddress + 0x3C0, input.processor_count);      // ActiveProcessorCount
-  if (!shared.ok()) return LoadStatus::Malformed;
+  // --- KUSER_SHARED_DATA: one page of the kernel's that every Windows process maps (read-only); refresh_shared_user_data() keeps its clocks running
+  if (!map_shared_user_data(space, input.processor_count)) return LoadStatus::OutOfMemory;
 
   for (uint32_t i = 0; i < tls_count; ++i) out->tls[i] = tls[i];
   out->tls_count = tls_count;
@@ -351,6 +382,19 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   out->region_base = base;
   out->region_size = total;
   return LoadStatus::Ok;
+}
+
+}  // namespace process
+
+namespace process {
+
+// 100 ns units since 1601 for the wall clock; the interrupt time and the tick count run from the boot.
+void refresh_shared_user_data(IProcessHost& host) {
+  uint8_t* page = g_shared_user_data.data();
+  const uint64_t interrupt = host.monotonic_ns() / 100;
+  store_system_time(page, 0x08, interrupt);                                                    // InterruptTime
+  store_system_time(page, 0x14, host.realtime_ns() / 100 + 11644473600ull * 10000000ull);      // SystemTime
+  store_system_time(page, 0x320, interrupt / 10000);                                          // TickCount (milliseconds)
 }
 
 }  // namespace process

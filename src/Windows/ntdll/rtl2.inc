@@ -86,19 +86,42 @@ EXPORT void NTAPI RtlSecondsSince1980ToTime(ULONG seconds, LONGLONG *time) { *ti
 
 EXPORT BOOLEAN NTAPI RtlQueryPerformanceCounter(PLARGE_INTEGER counter) { LARGE_INTEGER f; NtQueryPerformanceCounter(counter, &f); return TRUE; }
 EXPORT BOOLEAN NTAPI RtlQueryPerformanceFrequency(PLARGE_INTEGER frequency) { LARGE_INTEGER c; NtQueryPerformanceCounter(&c, frequency); return TRUE; }
+/* KUSER_SHARED_DATA (0x7ffe0000): the kernel refreshes the clocks in it whenever a program enters it (a system service). Asking for the performance counter is the
+ * cheapest way to have it brought up to date. The KSYSTEM_TIME fields are read the way Windows does: High1Time, LowPart, High2Time until the two halves agree. */
+static ULONGLONG read_user_shared_time(ULONG offset) {
+  volatile LONG *t = (volatile LONG *)(0x7ffe0000ull + offset);
+  LONG high;
+  ULONG low;
+  do { high = t[1]; low = (ULONG)t[0]; } while (high != t[2]);
+  return ((ULONGLONG)(ULONG)high << 32) | low;
+}
+extern NTSTATUS NTAPI RawNtQuerySystemTime(PLARGE_INTEGER);
+/* The system time is read from KUSER_SHARED_DATA too, so it never runs behind the page (the service brings the page up to date). */
+EXPORT NTSTATUS NTAPI NtQuerySystemTime(PLARGE_INTEGER time) {
+  LARGE_INTEGER c, f;
+  if (!time) return RawNtQuerySystemTime(time);
+  NtQueryPerformanceCounter(&c, &f);
+  time->QuadPart = (LONGLONG)read_user_shared_time(0x14);
+  return STATUS_SUCCESS;
+}
 EXPORT BOOLEAN NTAPI RtlQueryUnbiasedInterruptTime(ULONGLONG *time) {
   if (!time) { TEB_LAST_ERROR(NtCurrentTeb()) = 87; return FALSE; }      /* ERROR_INVALID_PARAMETER */
   LARGE_INTEGER c, f;
   NtQueryPerformanceCounter(&c, &f);
-  const ULONGLONG hz = (ULONGLONG)f.QuadPart, ticks = (ULONGLONG)c.QuadPart;
-  *time = hz ? (ticks / hz) * 10000000u + (ticks % hz) * 10000000u / hz : 0;
+  *time = read_user_shared_time(0x08) - *(volatile ULONGLONG *)(0x7ffe0000ull + 0x3b0);      /* InterruptTime - InterruptTimeBias */
   return TRUE;
 }
+/* The tick count: milliseconds (the kernel's TickCountMultiplier is 1 << 24, so a tick is a millisecond). */
 EXPORT ULONG NTAPI NtGetTickCount(void) {
   LARGE_INTEGER c, f;
   NtQueryPerformanceCounter(&c, &f);
-  return f.QuadPart ? (ULONG)((ULONGLONG)c.QuadPart / ((ULONGLONG)f.QuadPart / 1000)) : 0;
+  return (ULONG)((read_user_shared_time(0x320) * *(volatile ULONG *)(0x7ffe0000ull + 4)) >> 24);
 }
+
+/* ---- the time zone (the system runs on UTC; the kernel answers both classes) ---------------------------------------------------------------------------------- */
+
+EXPORT NTSTATUS NTAPI RtlQueryTimeZoneInformation(PVOID info) { return NtQuerySystemInformation(44, info, 172, NULL); }      /* SystemCurrentTimeZoneInformation */
+EXPORT NTSTATUS NTAPI RtlQueryDynamicTimeZoneInformation(PVOID info) { return NtQuerySystemInformation(102, info, 432, NULL); }      /* SystemDynamicTimeZoneInformation */
 
 /* ---- the thread error mode ------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -1632,4 +1655,39 @@ finish:
 }
 EXPORT NTSTATUS NTAPI RtlFormatMessage(const WCHAR *src, ULONG width, BOOLEAN ignore_inserts, BOOLEAN ansi, BOOLEAN is_array, void *args, WCHAR *buffer, ULONG size, ULONG *retsize) {
   return RtlFormatMessageEx(src, width, ignore_inserts, ansi, is_array, args, buffer, size, retsize, 0);
+}
+
+/* A call on a handle opened with FILE_SYNCHRONOUS_IO_ALERT waits alertably: an APC queued for the thread ends the wait (the kernel answers STATUS_USER_APC), the APC runs here, and the call
+ * fails with STATUS_CANCELLED. */
+extern NTSTATUS NTAPI RawNtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+extern NTSTATUS NTAPI RawNtWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+extern NTSTATUS NTAPI RawNtFsControlFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, ULONG, PVOID, ULONG, PVOID, ULONG);
+static NTSTATUS io_alerted(NTSTATUS status) {
+  if (status != STATUS_USER_APC) return status;
+  NtTestAlert();
+  return (NTSTATUS)0xC0000120u;      /* STATUS_CANCELLED */
+}
+EXPORT NTSTATUS NTAPI NtReadFile(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
+  return io_alerted(RawNtReadFile(h, event, apc, context, iosb, buffer, length, offset, key));
+}
+EXPORT NTSTATUS NTAPI NtWriteFile(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
+  return io_alerted(RawNtWriteFile(h, event, apc, context, iosb, buffer, length, offset, key));
+}
+EXPORT NTSTATUS NTAPI NtFsControlFile(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID in, ULONG in_size, PVOID out, ULONG out_size) {
+  return io_alerted(RawNtFsControlFile(h, event, apc, context, iosb, code, in, in_size, out, out_size));
+}
+
+/* ---- helpers for kernel32.dll ---------------------------------------------------------------------------------------------------------------------------- */
+
+/* A read or write as the kernel does it, waiting, whatever the handle was opened for (Key 1; an event handle of 1 asks the same of a control call). */
+EXPORT NTSTATUS NTAPI RtlTcosReadFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
+  (void)key;
+  return NtReadFile(h, event, apc, context, iosb, buffer, length, offset, (PULONG)(ULONG_PTR)1);
+}
+EXPORT NTSTATUS NTAPI RtlTcosWriteFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, PVOID buffer, ULONG length, PLARGE_INTEGER offset, PULONG key) {
+  (void)key;
+  return NtWriteFile(h, event, apc, context, iosb, buffer, length, offset, (PULONG)(ULONG_PTR)1);
+}
+EXPORT NTSTATUS NTAPI RtlTcosFsControlFileBlocking(HANDLE h, HANDLE event, PVOID apc, PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID in, ULONG in_size, PVOID out, ULONG out_size) {
+  return NtFsControlFile(h, event ? event : (HANDLE)(ULONG_PTR)1, apc, context, iosb, code, in, in_size, out, out_size);
 }

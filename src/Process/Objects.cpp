@@ -57,18 +57,22 @@ void ObjectManager::notify() {
   sync_.notify_all();
 }
 
-ObjectManager::Object* ObjectManager::find_locked(StringView name) {
+ObjectManager::Object* ObjectManager::find_locked(StringView name, bool case_insensitive) {
   if (name.empty()) return nullptr;
+  Object* similar = nullptr;
   for (Object& o : objects_) {
     if (o.kind == ObjectKind::None || o.name_size == 0) continue;
     if (o.kind == ObjectKind::Pipe) continue;      // (pipes have a namespace of their own)
-    if (o.name_size == name.size() && StringView(o.name, o.name_size) == name) return &o;      // (the names of kernel objects are case sensitive)
+    if (o.name_size != name.size()) continue;
+    if (StringView(o.name, o.name_size) == name) return &o;      // (the names of kernel objects are case sensitive, unless OBJ_CASE_INSENSITIVE is asked for)
+    if (case_insensitive && StringView(o.name, o.name_size).equals_ignore_case(name)) similar = &o;
   }
-  return nullptr;
+  return similar;
 }
 
-ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner) {
+ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner, StringView text) {
   Created result;
+  if (text.size() >= kNameBytes) { result.status = kNameTooLong; return result; }
   if (kind == ObjectKind::None || name.size() >= kNameBytes) { result.status = name.size() >= kNameBytes ? kNameTooLong : kInvalid; return result; }
   if (kind == ObjectKind::Semaphore && (maximum <= 0 || initial < 0 || initial > maximum)) { result.status = kInvalid; return result; }
   Locked hold(sync_);
@@ -87,11 +91,27 @@ ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, b
     o.references = 1;
     for (uint32_t k = 0; k < name.size(); ++k) o.name[k] = name[k];
     o.name_size = static_cast<uint32_t>(name.size());
+    for (uint32_t k = 0; k < text.size(); ++k) o.text[k] = text[k];
+    o.text_size = static_cast<uint32_t>(text.size());
     o.manual_reset = manual_reset;
     if (kind == ObjectKind::Event) o.signaled = initial_state;
     if (kind == ObjectKind::Mutex && initial_state) { o.owner = owner; o.recursion = 1; }
     if (kind == ObjectKind::Semaphore) { o.count = initial; o.maximum = maximum; }
     if (kind == ObjectKind::Reserve) o.maximum = maximum;      // (the type: 0 a user APC, 1 an I/O completion)
+    if (kind == ObjectKind::IoCompletion) {
+      if (!ports_ && allocator_) {
+        void* memory = allocator_->allocate(sizeof(PortState) * kMaxPorts);
+        if (memory) ports_ = new (memory) PortState[kMaxPorts];
+      }
+      int32_t slot = -1;
+      for (uint32_t j = 0; ports_ && j < kMaxPorts && slot < 0; ++j) if (!ports_[j].used) slot = int32_t(j);
+      void* queue_memory = slot >= 0 ? allocator_->allocate(sizeof(io::CompletionQueue)) : nullptr;
+      if (slot < 0 || !queue_memory) { o = Object(); result.status = kNoResources; return result; }
+      ports_[slot].used = true;
+      ports_[slot].object = i + 1;
+      ports_[slot].queue = new (queue_memory) io::CompletionQueue(*allocator_);
+      o.port = slot;
+    }
     if (kind == ObjectKind::Job) {
       if (!jobs_ && allocator_) {
         void* memory = allocator_->allocate(sizeof(Job) * kJobMaxJobs);
@@ -206,9 +226,10 @@ struct ObjectManager::PipeOp {
   PipeOpKind kind = PipeOpKind::None;
   uint8_t end = 0;      // the end that made the call
   uint8_t state = 0;      // 0 free, 1 pending, 2 finished, 3 finished and its result taken
-  bool message_mode = false, async = false, counted = false, detached = false;      // (detached: nobody waits for it; it goes when it is over)
+  bool message_mode = false, detached = false;      // (detached: nobody waits for it; it goes when it is over)
   uint32_t status = 0, length = 0, transferred = 0;      // (length: what a read asks for, what a write has in all)
   uint64_t owner = 0;      // the process that made the call
+  uint32_t request = 0;      // the IoRequest that waits for it (0: none): it ends with the operation, and takes its data
   ByteView data;      // a read that was answered: what it took
 };
 
@@ -223,10 +244,12 @@ struct ObjectManager::Pipe {
   Record records[2][kRecords];
   uint32_t record_head[2] = {}, record_count[2] = {};
   PipeOp ops[kOps];
-  uint32_t next_tag = 1, undelivered = 0;      // (undelivered: operations finished whose thread has not acted on that yet)
+  uint32_t next_tag = 1;
   uint32_t end_refs[2] = {};
-  uint32_t port_semaphore[2] = {};      // the completion port each end is tied to (a semaphore object), and the key
+  uint32_t stale_refs = 0;      // the handles of a client the server disconnected (they keep the object, and see a disconnected pipe)
+  uint32_t port_object[2] = {};      // the completion port each end is tied to (a referenced port object), the key, and the FILE_SKIP_* flags
   uint64_t port_key[2] = {};
+  uint32_t port_flags[2] = {};
   uint64_t process_id[2] = {};      // the processes of the server and the client
   uint64_t listen_order = 0;      // when it started to listen: the client goes to the instance that has listened longest
   bool file_signaled[2] = {true, true};      // (the event of each end's file object)
@@ -242,7 +265,7 @@ struct ObjectManager::Pipe {
 };
 
 namespace {
-constexpr uint32_t kPipeBusy = 0xC00000AEu;
+constexpr uint32_t kPipeBusy = 0xC00000AEu, kInstanceNotAvailable = 0xC00000ABu;
 constexpr uint32_t kDefaultPipeBuffer = 4096, kMaxPipeBuffer = 1u << 20;
 constexpr uint32_t kMaxPipeQueue = 32u << 20;      // what a direction may hold in all (the buffer and the writes that wait)
 constexpr uint32_t kStatusCancelled = 0xC0000120u, kStatusBroken = 0xC000014Bu, kStatusDisconnected = 0xC00000B0u, kStatusMoreData = 0x80000005u, kStatusNoMemory = 0xC0000017u;
@@ -281,6 +304,11 @@ ObjectManager::~ObjectManager() {
     }
     if (allocator_) allocator_->deallocate(pipes_);      // (Pipe is plain data: nothing to destroy)
   }
+  if (ports_) {
+    for (uint32_t i = 0; i < kMaxPorts; ++i) if (ports_[i].queue) { ports_[i].queue->~CompletionQueue(); allocator_->deallocate(ports_[i].queue); }
+    if (allocator_) allocator_->deallocate(ports_);
+  }
+  if (requests_) { requests_->~IoRequestTable(); if (allocator_) allocator_->deallocate(requests_); }
   if (jobs_ && allocator_) allocator_->deallocate(jobs_);
   if (locks_ && allocator_) allocator_->deallocate(locks_);
   if (shares_ && allocator_) allocator_->deallocate(shares_);
@@ -306,6 +334,7 @@ ObjectManager::Pipe* ObjectManager::pipe_of(uint32_t id) {
 void ObjectManager::free_pipe_locked(Object& o) {
   if (o.pipe < 0 || !pipes_) return;
   Pipe& p = pipes_[o.pipe];
+  for (uint32_t& port : p.port_object) if (port != 0) { release_locked(port); port = 0; }
   if (allocator_) {
     for (ByteView& d : p.data) release_view(*allocator_, d);
     for (PipeOp& op : p.ops) release_view(*allocator_, op.data);
@@ -313,7 +342,7 @@ void ObjectManager::free_pipe_locked(Object& o) {
   p = Pipe();
 }
 
-ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type, uint64_t pid) {
+ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type, uint64_t pid, uint32_t disposition) {
   Created result;
   if (!allocator_ || name.size() >= kNameBytes || access < kPipeInbound || access > kPipeDuplex) { result.status = !allocator_ ? 0xC0000002u : kInvalid; return result; }
   Locked hold(sync_);
@@ -325,14 +354,16 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
   }
   uint32_t instances = 0;
   if (!name.empty()) {
+    const Pipe* first = nullptr;
     for (Object& o : objects_) {
-      if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
+      if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name) || pipes_[o.pipe].end_refs[0] == 0) continue;      // (an instance with no server end left is gone, though a client may still hold it)
       ++instances;
-      const Pipe& other = pipes_[o.pipe];
-      if (other.access != access) { result.status = 0xC0000022u; return result; }      // (every instance of a pipe has the same access)
-      if (other.max_instances != 0 && instances >= other.max_instances) { result.status = kPipeBusy; return result; }
+      if (!first) first = &pipes_[o.pipe];
+      if (pipes_[o.pipe].max_instances != 0 && instances >= pipes_[o.pipe].max_instances) { result.status = kInstanceNotAvailable; return result; }      // (the limit the pipe was made with)
     }
-    if (max_instances != 0 && instances >= max_instances) { result.status = kPipeBusy; return result; }
+    if (max_instances != 0 && instances >= max_instances) { result.status = kInstanceNotAvailable; return result; }
+    if (first && (disposition == 2 || first->access != access)) { result.status = 0xC0000022u; return result; }      // FILE_CREATE: the name is taken; every instance of a pipe has the same access (STATUS_ACCESS_DENIED)
+    if (disposition == 1 && instances == 0) { result.status = 0xC0000034u; return result; }      // FILE_OPEN: STATUS_OBJECT_NAME_NOT_FOUND
   }
   int32_t pipe_index = -1;
   for (uint32_t i = 0; i < kMaxPipes && pipe_index < 0; ++i) if (!pipes_[i].used) pipe_index = static_cast<int32_t>(i);
@@ -402,6 +433,7 @@ ObjectManager::Created ObjectManager::connect_pipe(StringView name, bool want_re
     p.disconnected = false;
     p.end_refs[1] = 1;
     p.process_id[1] = pid;
+    if (p.port_object[1] != 0) { release_locked(p.port_object[1]); p.port_object[1] = 0; p.port_flags[1] = 0; }      // (the port was tied to the client before)
     ++p.generation;
     ++o.references;
     for (PipeOp& op : p.ops) if (op.state == 1 && op.kind == PipeOpKind::Listen) pipe_finish_locked(p, op, 0, 0);      // (a ConnectNamedPipe that waits is over)
@@ -421,52 +453,39 @@ void ObjectManager::add_pipe_end(uint32_t id, uint32_t end_code) {
   Object* o = at(id);
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
-  if (!o || !p || !p->end_of(end_code, &end)) return;
+  if (!o || !p) return;
+  if (p->end_of(end_code, &end) && p->end_refs[end] > 0) ++p->end_refs[end];
+  else if ((end_code & 1) && !p->anonymous) ++p->stale_refs;      // (a handle of a client the server disconnected, or of an earlier client)
+  else if (p->end_of(end_code, &end)) ++p->end_refs[end];
+  else return;
   ++o->references;
-  ++p->end_refs[end];
 }
 
 void ObjectManager::release_pipe_end(uint32_t id, uint32_t end_code) {
-  uint32_t ports[8], port_count = 0;
-  {
-    Locked hold(sync_);
-    Object* o = at(id);
-    Pipe* p = pipe_of(id);
-    uint32_t end = 0;
-    if (!o || !p || !p->end_of(end_code, &end) || p->end_refs[end] == 0) return;
-    --p->end_refs[end];
-    if (p->end_refs[end] == 0) {      // what this end waits for is given up, and the other end gets nothing more from it
-      for (PipeOp& op : p->ops) {
-        if (op.state != 1 || op.end != end) continue;
-        if (op.async && !op.detached && p->port_semaphore[end] != 0 && port_count < 8 && post_port_packet_locked(*p, end, kStatusCancelled, 0)) ports[port_count++] = p->port_semaphore[end];      // (the port hears of it)
-        op.async = false;      // (the handles that waited are closed: nobody can act on them)
-      }
-      pipe_fail_ops_locked(*p, static_cast<int>(end), kStatusCancelled);
-      pipe_fail_ops_locked(*p, static_cast<int>(1 - end), kStatusBroken);
-      pipe_clear_queue_locked(*p, 1 - end);
+  Locked hold(sync_);
+  Object* o = at(id);
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!o || !p) return;
+  if (!p->end_of(end_code, &end) || p->end_refs[end] == 0) {      // a handle of a client the server disconnected: it only holds the object
+    if ((end_code & 1) && p->stale_refs > 0) {
+      --p->stale_refs;
+      if (o->references > 0 && --o->references == 0) { free_pipe_locked(*o); *o = Object(); }
     }
-    sync_.notify_all();      // the other end sees the end of the data
-    if (o->references > 0 && --o->references == 0) {
-      free_pipe_locked(*o);
-      *o = Object();
-    }
+    return;
   }
-  for (uint32_t k = 0; k < port_count; ++k) {
-    int32_t previous = 0;
-    release_semaphore(ports[k], 1, &previous);
+  --p->end_refs[end];
+  if (p->end_refs[end] == 0) {      // what this end waits for is given up, and the other end gets nothing more from it
+    pipe_fail_ops_locked(*p, static_cast<int>(end), kStatusCancelled);
+    pipe_fail_ops_locked(*p, static_cast<int>(1 - end), kStatusBroken);
+    pipe_clear_queue_locked(*p, 1 - end);
+    if (p->port_object[end] != 0) { release_locked(p->port_object[end]); p->port_object[end] = 0; }
   }
-}
-
-// The packet for a call of the end that was cancelled, kept for the port the end is tied to (False if the table is full).
-bool ObjectManager::post_port_packet_locked(Pipe& p, uint32_t end, uint32_t status, uint32_t bytes) {
-  if (foreign_count_ >= kMaxForeignPackets) return false;
-  ForeignPacket& f = foreign_[(foreign_head_ + foreign_count_++) % kMaxForeignPackets];
-  f.semaphore = p.port_semaphore[end];
-  f.packet.bytes = bytes;
-  f.packet.status = status;
-  f.packet.key = p.port_key[end];
-  f.packet.overlapped = 0;
-  return true;
+  sync_.notify_all();      // the other end sees the end of the data
+  if (o->references > 0 && --o->references == 0) {
+    free_pipe_locked(*o);
+    *o = Object();
+  }
 }
 
 // ---- the queues and operations of a pipe
@@ -529,17 +548,24 @@ ObjectManager::PipeOp* ObjectManager::pipe_find_op_locked(Pipe& p, uint32_t tag)
 }
 
 void ObjectManager::pipe_free_op_locked(Pipe& p, PipeOp& op) {
-  if (op.counted && p.undelivered > 0) --p.undelivered;
   if (allocator_) release_view(*allocator_, op.data);
   op = PipeOp();
   sync_.notify_all();
 }
 
 void ObjectManager::pipe_finish_locked(Pipe& p, PipeOp& op, uint32_t status, uint32_t transferred) {
+  if (op.request != 0) {      // the call waits in the kernel for its answer: the request ends, and its owner applies the outcome
+    ByteView data = op.data;
+    op.data = ByteView();
+    const uint32_t request = op.request;
+    op.request = 0;
+    if (!requests_ || !requests_->complete(request, status, transferred, data)) { if (allocator_) release_view(*allocator_, data); }
+    pipe_free_op_locked(p, op);
+    return;
+  }
   op.state = 2;
   op.status = status;
   op.transferred = transferred;
-  if (op.async && !op.counted) { op.counted = true; ++p.undelivered; }
   if (op.detached) pipe_free_op_locked(p, op);
   sync_.notify_all();
 }
@@ -676,6 +702,7 @@ ObjectManager::PipeResult ObjectManager::pipe_read_locked(uint32_t id, uint32_t 
   if (message_length) *message_length = 0;
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
+  if (p && !p->end_of(end_code, &end) && (end_code & 1)) return PipeResult::NotConnected;      // (a client of an earlier connection)
   if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
   if (end == 1 && !p->connected) return p->disconnected ? PipeResult::NotConnected : PipeResult::Broken;
   const uint32_t q = 1 - end;      // the queue the other end writes
@@ -727,7 +754,7 @@ ObjectManager::PipeResult ObjectManager::pipe_listen_locked(uint32_t id) {
   return PipeResult::WouldBlock;
 }
 
-ObjectManager::PipeResult ObjectManager::pipe_begin_read_locked(uint32_t id, uint32_t end_code, uint32_t length, bool message_mode, uint64_t owner, bool async, uint32_t* tag) {
+ObjectManager::PipeResult ObjectManager::pipe_begin_read_locked(uint32_t id, uint32_t end_code, uint32_t length, bool message_mode, uint64_t owner, uint32_t* tag) {
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
   if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
@@ -738,13 +765,11 @@ ObjectManager::PipeResult ObjectManager::pipe_begin_read_locked(uint32_t id, uin
   if (!op) return PipeResult::NoResources;
   op->length = length;
   op->message_mode = message_mode;
-  op->async = async;
-  if (async) p->file_signaled[op->end] = false;      // (the call is not over: the handle is not signalled)
   *tag = op->tag;
   return PipeResult::WouldBlock;
 }
 
-ObjectManager::PipeResult ObjectManager::pipe_begin_write_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint64_t owner, bool async, uint32_t* tag, uint32_t* done) {
+ObjectManager::PipeResult ObjectManager::pipe_begin_write_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint64_t owner, uint32_t* tag, uint32_t* done) {
   *done = 0;
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
@@ -773,13 +798,11 @@ ObjectManager::PipeResult ObjectManager::pipe_begin_write_locked(uint32_t id, ui
     pipe_free_op_locked(*p, *op);
     return PipeResult::Ok;
   }
-  op->async = async;
-  if (async) p->file_signaled[op->end] = false;      // (the call is not over: the handle is not signalled)
   *tag = op->tag;
   return PipeResult::WouldBlock;
 }
 
-ObjectManager::PipeResult ObjectManager::pipe_begin_transact_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t read_length, bool message_mode, uint64_t owner, bool async,
+ObjectManager::PipeResult ObjectManager::pipe_begin_transact_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t read_length, bool message_mode, uint64_t owner,
                                                                     uint32_t* tag) {
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
@@ -799,8 +822,6 @@ ObjectManager::PipeResult ObjectManager::pipe_begin_transact_locked(uint32_t id,
   const uint32_t read_tag = read->tag;
   read->length = read_length;
   read->message_mode = true;
-  read->async = async;
-  if (async) p->file_signaled[end] = false;
   PipeOp* write = data.empty() ? nullptr : pipe_new_op_locked(*p, PipeOpKind::Write, end, owner);
   if (!data.empty() && !write) { pipe_free_op_locked(*p, *read); return PipeResult::NoResources; }
   if (!pipe_append_locked(*p, q, data, write ? write->tag : 0)) {
@@ -814,7 +835,7 @@ ObjectManager::PipeResult ObjectManager::pipe_begin_transact_locked(uint32_t id,
   return PipeResult::WouldBlock;
 }
 
-ObjectManager::PipeResult ObjectManager::pipe_begin_listen_locked(uint32_t id, uint64_t owner, bool async, uint32_t* tag) {
+ObjectManager::PipeResult ObjectManager::pipe_begin_listen_locked(uint32_t id, uint64_t owner, uint32_t* tag) {
   Pipe* p = pipe_of(id);
   if (!p) return PipeResult::Broken;
   if (p->connected) return PipeResult::Ok;
@@ -823,8 +844,6 @@ ObjectManager::PipeResult ObjectManager::pipe_begin_listen_locked(uint32_t id, u
   if (p->disconnected) { p->listen_order = ++pipe_sequence_; sync_.notify_all(); }      // (it can take a client again, after the ones that listened before)
   p->listening = true;
   p->disconnected = false;
-  op->async = async;
-  if (async) p->file_signaled[op->end] = false;      // (the call is not over: the handle is not signalled)
   *tag = op->tag;
   return PipeResult::WouldBlock;
 }
@@ -875,65 +894,77 @@ void ObjectManager::pipe_op_free_data(ByteView& data) {
   if (allocator_) release_view(*allocator_, data);
 }
 
-bool ObjectManager::pipe_delivered_locked(uint32_t id) {
-  Pipe* p = pipe_of(id);
-  return !p || p->undelivered == 0;
-}
-
-void ObjectManager::pipe_forgive_locked(uint32_t id) {
-  Pipe* p = pipe_of(id);
-  if (!p) return;
-  p->undelivered = 0;
-  for (PipeOp& op : p->ops) op.counted = false;
-}
-
 void ObjectManager::pipe_owner_gone(uint64_t pid) {
-  uint32_t ports[8], port_count = 0;
-  {
-    Locked hold(sync_);
-    if (!pipes_) return;
-    for (uint32_t i = 0; i < kMaxPipes; ++i) {
-      Pipe& p = pipes_[i];
-      if (!p.used) continue;
-      for (PipeOp& op : p.ops) {
-        if (op.state == 0 || op.owner != pid) continue;
-        if ((op.state == 1 || op.state == 2) && op.async && !op.detached && p.port_semaphore[op.end] != 0 && port_count < 8 && post_port_packet_locked(p, op.end, op.state == 1 ? kStatusCancelled : op.status, op.state == 1 ? 0 : op.transferred))
-          ports[port_count++] = p.port_semaphore[op.end];      // (the port hears of a call that was not taken up: it was cancelled, or its result was never acted on)
-        op.async = false;      // (nobody is left to act on it)
-        if (op.state == 1) pipe_cancel_op_locked(p, op, kStatusCancelled);
-        pipe_free_op_locked(p, op);
-      }
+  io_owner_gone(pid);
+  Locked hold(sync_);
+  if (!pipes_) return;
+  for (uint32_t i = 0; i < kMaxPipes; ++i) {
+    Pipe& p = pipes_[i];
+    if (!p.used) continue;
+    for (PipeOp& op : p.ops) {
+      if (op.state == 0 || op.owner != pid) continue;
+      if (op.state == 1) pipe_cancel_op_locked(p, op, kStatusCancelled);
+      if (op.state != 0) pipe_free_op_locked(p, op);
     }
   }
-  for (uint32_t k = 0; k < port_count; ++k) {
-    int32_t previous = 0;
-    release_semaphore(ports[k], 1, &previous);
-  }
 }
 
-void ObjectManager::pipe_set_port(uint32_t id, uint32_t end_code, uint32_t semaphore_object, uint64_t key) {
+bool ObjectManager::pipe_set_port(uint32_t id, uint32_t end_code, uint32_t port_object, uint64_t key) {
+  Locked hold(sync_);
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  Object* port = at(port_object);
+  if (!p || !p->end_of(end_code, &end) || !port || port->kind != ObjectKind::IoCompletion) return false;
+  if (p->port_object[end] != 0) return false;      // (an end is tied once)
+  ++port->references;
+  p->port_object[end] = port_object;
+  p->port_key[end] = key;
+  p->port_flags[end] = 0;
+  return true;
+}
+
+void ObjectManager::pipe_set_port_flags(uint32_t id, uint32_t end_code, uint32_t flags) {
   Locked hold(sync_);
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
   if (!p || !p->end_of(end_code, &end)) return;
-  p->port_semaphore[end] = semaphore_object;
-  p->port_key[end] = key;
+  p->port_flags[end] = flags;
+  if (flags & 2) { p->file_signaled[end] = false; sync_.notify_all(); }      // FILE_SKIP_SET_EVENT_ON_HANDLE: the file object is never signalled again
 }
 
-bool ObjectManager::port_take_foreign(uint32_t semaphore_object, PortPacket* packet) {
+bool ObjectManager::pipe_port(uint32_t id, uint32_t end_code, uint32_t* port_object, uint64_t* key, uint32_t* flags) {
   Locked hold(sync_);
-  for (uint32_t i = 0; i < foreign_count_; ++i) {
-    ForeignPacket& f = foreign_[(foreign_head_ + i) % kMaxForeignPackets];
-    if (f.semaphore != semaphore_object) continue;
-    *packet = f.packet;
-    for (uint32_t k = i; k + 1 < foreign_count_; ++k) foreign_[(foreign_head_ + k) % kMaxForeignPackets] = foreign_[(foreign_head_ + k + 1) % kMaxForeignPackets];
-    --foreign_count_;
-    return true;
-  }
-  return false;
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end) || p->port_object[end] == 0) return false;
+  *port_object = p->port_object[end];
+  *key = p->port_key[end];
+  *flags = p->port_flags[end];
+  return true;
 }
 
-uint32_t ObjectManager::pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread) {
+bool ObjectManager::pipe_pend_locked(uint32_t id, uint32_t end_code, uint32_t tag, const io::IoRequest& request, bool signal_file) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!p || !p->end_of(end_code, &end)) return false;
+  PipeOp* op = pipe_find_op_locked(*p, tag);
+  if (!op || op->end != end || op->state != 1) return false;
+  io::IoRequest* r = io_add_locked(request);
+  if (!r) {
+    pipe_cancel_op_locked(*p, *op, kStatusCancelled);
+    if (PipeOp* left = pipe_find_op_locked(*p, tag)) pipe_free_op_locked(*p, *left);
+    return false;
+  }
+  r->source = id;
+  r->source_end = end;
+  r->source_tag = tag;
+  op->request = r->id;
+  (void)signal_file;
+  p->file_signaled[end] = false;      // (the file object is not signalled while a call is under way; one that has no event of its own signals it when it ends)
+  return true;
+}
+
+uint32_t ObjectManager::pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread, uint64_t iosb) {
   Locked hold(sync_);
   for (uint32_t i = 0; i < kMaxSyncWaits; ++i) {
     SyncWait& w = sync_waits_[i];
@@ -941,6 +972,7 @@ uint32_t ObjectManager::pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t
     w = SyncWait();
     w.used = true;
     w.thread = thread;
+    w.iosb = iosb;
     w.pipe = id;
     w.end_code = end_code;
     Pipe* p = pipe_of(id);
@@ -964,10 +996,10 @@ void ObjectManager::pipe_sync_end(uint32_t slot) {
   sync_.notify_all();
 }
 
-bool ObjectManager::pipe_cancel_synchronous(uint64_t thread) {
+bool ObjectManager::pipe_cancel_synchronous(uint64_t thread, uint64_t iosb) {
   Locked hold(sync_);
   bool found = false;
-  for (SyncWait& w : sync_waits_) if (w.used && w.thread == thread && !w.cancelled) { w.cancelled = true; found = true; }
+  for (SyncWait& w : sync_waits_) if (w.used && w.thread == thread && !w.cancelled && (iosb == 0 || w.iosb == 0 || w.iosb == iosb)) { w.cancelled = true; found = true; }
   if (found) sync_.notify_all();
   return found;
 }
@@ -981,11 +1013,12 @@ bool ObjectManager::pipe_disconnect(uint32_t id) {
   p->disconnected = true;
   if (p->connected) {
     p->connected = false;
-    o->references = o->references > p->end_refs[1] ? o->references - p->end_refs[1] : 0;
-    p->end_refs[1] = 0;      // (the client's handles stay in its table, but see a broken pipe: their end no longer counts)
+    p->stale_refs += p->end_refs[1];      // (the client's handles stay in its table and see a disconnected pipe; they keep the object alive)
+    p->end_refs[1] = 0;
   }
   p->listening = false;
   p->client_seen = false;
+  if (p->port_object[1] != 0) { release_locked(p->port_object[1]); p->port_object[1] = 0; p->port_flags[1] = 0; }
   pipe_fail_ops_locked(*p, -1, kStatusDisconnected);
   pipe_clear_queue_locked(*p, 0);
   pipe_clear_queue_locked(*p, 1);
@@ -1005,6 +1038,26 @@ uint32_t ObjectManager::pipe_pending_locked(uint32_t id, uint32_t end_code) {
   uint32_t end = 0;
   if (!p || !p->end_of(end_code, &end) || p->end_refs[1 - end] == 0 || !p->connected) return 0;
   return p->count[end];
+}
+
+uint32_t ObjectManager::pipe_state_locked(uint32_t id, uint32_t end_code) {
+  Pipe* p = pipe_of(id);
+  if (!p) return 0;
+  uint32_t end = 0;
+  const bool valid = p->end_of(end_code, &end) && p->end_refs[end] > 0;
+  if (p->anonymous) return p->end_refs[end ? 0 : 1] == 0 ? 4 : 3;
+  if (end_code & 1) {      // a client
+    if (!valid || !p->connected) return 1;
+    return p->end_refs[0] == 0 ? 4 : 3;
+  }
+  if (p->connected) return p->end_refs[1] == 0 ? 4 : 3;
+  return p->disconnected ? 1 : 2;
+}
+
+uint32_t ObjectManager::pipe_end_refs_locked(uint32_t id, uint32_t end_code) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  return p && p->end_of(end_code, &end) ? p->end_refs[end] : 0;
 }
 
 bool ObjectManager::pipe_file_signaled_locked(uint32_t id, uint32_t end_code) {
@@ -1121,8 +1174,8 @@ bool ObjectManager::pipe_info(uint32_t id, PipeInfo* out) {
   out->out_size = p->anonymous ? p->capacity[0] : p->requested_size[0];
   out->in_size = p->anonymous ? p->capacity[1] : p->requested_size[1];
   out->max_instances = p->max_instances;
-  out->instances = 0;
-  for (const Object& other : objects_) if (other.kind == ObjectKind::Pipe && o->name_size != 0 && other.name_size == o->name_size && same_name(other.name, other.name_size, StringView(o->name, o->name_size))) ++out->instances;
+  out->instances = 0;      // (an instance whose server end is closed is no instance any more, though a client may still hold it)
+  for (const Object& other : objects_) if (other.kind == ObjectKind::Pipe && other.pipe >= 0 && pipes_[other.pipe].end_refs[0] > 0 && o->name_size != 0 && other.name_size == o->name_size && same_name(other.name, other.name_size, StringView(o->name, o->name_size))) ++out->instances;
   if (p->anonymous) out->instances = 1;
   return true;
 }
@@ -1862,6 +1915,49 @@ ObjectManager::Created ObjectManager::open(ObjectKind kind, StringView name) {
   return result;
 }
 
+bool ObjectManager::lookup_entry(StringView flat, bool case_insensitive, objpath::Entry* out) {
+  Locked hold(sync_);
+  const Object* o = find_locked(flat, case_insensitive);
+  if (!o) return false;
+  *out = objpath::Entry();
+  for (uint32_t i = 0; i < o->name_size && i < objpath::kMaxPath; ++i) out->flat[i] = o->name[i];
+  out->flat_size = o->name_size < objpath::kMaxPath ? o->name_size : objpath::kMaxPath;
+  switch (o->kind) {
+    case ObjectKind::Directory: out->kind = objpath::EntryKind::Directory; break;
+    case ObjectKind::SymbolicLink: out->kind = objpath::EntryKind::Link; break;
+    default: out->kind = objpath::EntryKind::Object; out->object_kind = static_cast<uint8_t>(o->kind); break;
+  }
+  for (uint32_t i = 0; i < o->text_size && i < objpath::kMaxPath; ++i) out->text[i] = o->text[i];
+  out->text_size = o->text_size < objpath::kMaxPath ? o->text_size : objpath::kMaxPath;
+  return true;
+}
+
+uint32_t ObjectManager::object_text(uint32_t id, char* out, uint32_t capacity) {
+  Locked hold(sync_);
+  const Object* o = at(id);
+  if (!o || o->text_size == 0 || o->text_size > capacity) return 0;
+  for (uint32_t i = 0; i < o->text_size; ++i) out[i] = o->text[i];
+  return o->text_size;
+}
+
+bool ObjectManager::directory_child(StringView directory, uint32_t index, char* name, uint32_t capacity, uint32_t* name_size, ObjectKind* kind) {
+  Locked hold(sync_);
+  uint32_t seen = 0;
+  for (const Object& o : objects_) {
+    if (o.kind == ObjectKind::None || o.kind == ObjectKind::Pipe || o.name_size == 0) continue;
+    StringView parent, leaf;
+    objpath::split_flat(StringView(o.name, o.name_size), &parent, &leaf);
+    if (parent != directory || leaf.empty()) continue;
+    if (seen++ != index) continue;
+    if (leaf.size() > capacity) return false;
+    for (uint32_t i = 0; i < leaf.size(); ++i) name[i] = leaf[i];
+    *name_size = static_cast<uint32_t>(leaf.size());
+    *kind = o.kind;
+    return true;
+  }
+  return false;
+}
+
 void ObjectManager::add_ref(uint32_t id) {
   Locked hold(sync_);
   if (Object* o = at(id)) ++o->references;
@@ -1877,6 +1973,7 @@ void ObjectManager::free_object_locked(Object& o) {
   free_job_locked(o);
   free_watch_locked(o);
   free_mailslot_locked(o);
+  free_port_locked(o);
   o = Object();
 }
 
@@ -1887,6 +1984,10 @@ void ObjectManager::finish_dying_locked(Object& o) {
 
 void ObjectManager::release(uint32_t id) {
   Locked hold(sync_);
+  release_locked(id);
+}
+
+void ObjectManager::release_locked(uint32_t id) {
   Object* o = at(id);
   if (!o || o->references == 0) return;
   if (--o->references == 0) {
@@ -2067,6 +2168,7 @@ void ObjectManager::job_flag_all_locked(Job& j, uint32_t code) {
 void ObjectManager::free_job_locked(Object& o) {
   if (o.kind != ObjectKind::Job || o.job < 0 || !jobs_) return;
   Job& j = jobs_[o.job];
+  if (j.port_object != 0) { release_locked(j.port_object); j.port_object = 0; j.port_set = false; }
   if (j.info.limit_flags & kJobLimitKillOnClose) job_flag_all_locked(j, 1);
   for (JobMember& m : j.members) {      // the members stay members of nothing; those flagged keep their flag (it is found by their process id)
     if (m.pid == 0) continue;
@@ -2083,6 +2185,12 @@ void ObjectManager::free_job_locked(Object& o) {
 
 void ObjectManager::job_event_locked(Job& j, uint32_t message, uint64_t pid) {
   if (!j.port_set) return;
+  if (j.port_object != 0) {      // JOB_OBJECT_MSG_*: a packet at the port (the key, the process id as the OVERLAPPED, the message as the byte count)
+    io::Packet packet;
+    packet.key = j.port_key; packet.context = pid; packet.information = message;
+    port_post_locked(j.port_object, packet);
+    return;
+  }
   if (j.event_count == Job::kMaxEvents) { j.event_head = (j.event_head + 1) % Job::kMaxEvents; --j.event_count; }      // (the oldest is lost)
   j.events[(j.event_head + j.event_count++) % Job::kMaxEvents] = JobEvent{message, pid};
 }
@@ -2210,28 +2318,27 @@ uint32_t ObjectManager::job_set(uint32_t job, const JobInfo& in, bool extended) 
   return kSuccess;
 }
 
-uint32_t ObjectManager::job_set_port(uint32_t job, uint64_t key, bool present) {
+uint32_t ObjectManager::job_set_port(uint32_t job, uint64_t key, uint32_t port_object) {
   Locked hold(sync_);
   Job* j = job_of(job);
   if (!j) return kInvalidHandle;
-  if (!present) { j->port_set = false; j->event_head = j->event_count = 0; return kSuccess; }
+  if (port_object == 0) {
+    if (j->port_object != 0) release_locked(j->port_object);
+    j->port_object = 0;
+    j->port_set = false;
+    j->event_head = j->event_count = 0;
+    return kSuccess;
+  }
   if (j->port_set) return kInvalid;
+  Object* port = at(port_object);
+  if (!port || port->kind != ObjectKind::IoCompletion) return kInvalidHandle;
+  ++port->references;
+  j->port_object = port_object;
   j->port_set = true;
   j->port_key = key;
   j->event_head = j->event_count = 0;
   for (const JobMember& m : j->members) if (m.pid != 0 && !m.gone) job_event_locked(*j, 6, m.pid);      // (the processes that are in the job already)
   return kSuccess;
-}
-
-bool ObjectManager::job_take_event(uint32_t job, uint32_t* message, uint64_t* pid, uint64_t* key) {
-  Locked hold(sync_);
-  Job* j = job_of(job);
-  if (!j || !j->port_set || j->event_count == 0) return false;
-  const JobEvent& e = j->events[j->event_head];
-  *message = e.message; *pid = e.pid; *key = j->port_key;
-  j->event_head = (j->event_head + 1) % Job::kMaxEvents;
-  --j->event_count;
-  return true;
 }
 
 bool ObjectManager::job_kill_for(uint64_t pid, uint32_t* code) {
@@ -2589,6 +2696,174 @@ void ObjectManager::forget_object_security_locked(uint32_t id) {
     const uint32_t n = object_key(tag, id, key);
     for (uint32_t i = 0; i < kMaxSecurity; ++i) if (security_[i].used && same_name(security_[i].path, security_[i].path_size, StringView(key, n))) security_erase_locked(security_[i]);
   }
+}
+
+}  // namespace process
+
+// ---- I/O requests and completion ports
+
+namespace process {
+
+io::IoRequestTable* ObjectManager::request_table() {
+  if (!requests_ && allocator_) {
+    void* memory = allocator_->allocate(sizeof(io::IoRequestTable));
+    if (memory) requests_ = new (memory) io::IoRequestTable(*allocator_);
+  }
+  return requests_;
+}
+
+void ObjectManager::free_port_locked(Object& o) {
+  if (o.kind != ObjectKind::IoCompletion || o.port < 0 || !ports_) return;
+  PortState& port = ports_[o.port];
+  if (port.queue) { port.queue->~CompletionQueue(); if (allocator_) allocator_->deallocate(port.queue); }
+  port = PortState();
+  o.port = -1;
+}
+
+io::CompletionQueue* ObjectManager::port_queue_locked(uint32_t port_object) {
+  Object* o = at(port_object);
+  return o && o->kind == ObjectKind::IoCompletion && o->port >= 0 && ports_ ? ports_[o->port].queue : nullptr;
+}
+
+bool ObjectManager::is_port(uint32_t id) {
+  Locked hold(sync_);
+  return port_queue_locked(id) != nullptr;
+}
+
+bool ObjectManager::port_post_locked(uint32_t port_object, const io::Packet& packet) {
+  io::CompletionQueue* queue = port_queue_locked(port_object);
+  if (!queue || !queue->post(packet)) return false;
+  sync_.notify_all();
+  return true;
+}
+
+bool ObjectManager::port_post(uint32_t port_object, const io::Packet& packet) {
+  Locked hold(sync_);
+  return port_post_locked(port_object, packet);
+}
+
+bool ObjectManager::port_remove_locked(uint32_t port_object, io::Packet* out) {
+  io::CompletionQueue* queue = port_queue_locked(port_object);
+  return queue && queue->remove(out);
+}
+
+uint64_t ObjectManager::port_depth_locked(uint32_t port_object) {
+  io::CompletionQueue* queue = port_queue_locked(port_object);
+  return queue ? queue->depth() : 0;
+}
+
+io::IoRequest* ObjectManager::io_add_locked(const io::IoRequest& request) {
+  io::IoRequestTable* table = request_table();
+  if (!table) return nullptr;
+  io::IoRequest* made = table->add(request);
+  if (!made) return nullptr;
+  if (made->event_object != 0) { if (Object* e = at(made->event_object)) ++e->references; else made->event_object = 0; }
+  if (made->port_object != 0) { if (Object* e = at(made->port_object)) ++e->references; else made->port_object = 0; }
+  return made;
+}
+
+io::IoRequest* ObjectManager::io_find_locked(uint32_t id) { return requests_ ? requests_->find(id) : nullptr; }
+
+bool ObjectManager::io_complete_locked(uint32_t id, uint32_t status, uint64_t information, ByteView data) {
+  if (!requests_ || !requests_->complete(id, status, information, data)) return false;
+  sync_.notify_all();
+  return true;
+}
+
+uint32_t ObjectManager::io_ready() const { return requests_ ? requests_->ready() : 0; }
+
+uint32_t ObjectManager::io_take_completed(uint64_t owner, io::IoRequest* out, uint32_t capacity) {
+  Locked hold(sync_);
+  return requests_ ? requests_->take_completed(owner, out, capacity) : 0;
+}
+
+void ObjectManager::io_dispose(io::IoRequest& request) {
+  Locked hold(sync_);
+  if (request.event_object != 0) { release_locked(request.event_object); request.event_object = 0; }
+  if (request.port_object != 0) { release_locked(request.port_object); request.port_object = 0; }
+  if (allocator_) release_view(*allocator_, request.data);
+}
+
+uint32_t ObjectManager::io_cancel_locked(uint32_t source, uint32_t end, uint64_t owner, uint64_t thread, uint64_t status_block, uint32_t status, bool closing) {
+  if (!requests_) return 0;
+  uint32_t tags[io::IoRequestTable::kMaxRequests > 256 ? 256 : io::IoRequestTable::kMaxRequests];
+  uint32_t count = 0;
+  requests_->for_each([&](io::IoRequest& r) {
+    if (r.completed || r.source != source || r.source_end != end || r.source_tag == 0 || count >= sizeof(tags) / sizeof(tags[0])) return;
+    if ((owner != 0 && r.owner != owner) || (thread != 0 && r.thread != thread) || (status_block != 0 && r.status_block != status_block)) return;
+    r.on_close = closing;
+    tags[count++] = r.source_tag;
+  });
+  Pipe* p = pipe_of(source);
+  uint32_t cancelled = 0;
+  for (uint32_t i = 0; p && i < count; ++i) {
+    PipeOp* op = pipe_find_op_locked(*p, tags[i]);
+    if (!op || op->state != 1 || op->end != end || op->request == 0) continue;
+    pipe_cancel_op_locked(*p, *op, status);
+    ++cancelled;
+  }
+  return cancelled;
+}
+
+uint32_t ObjectManager::io_cancel_thread(uint64_t thread) {
+  Locked hold(sync_);
+  if (!requests_ || !pipes_) return 0;
+  uint32_t cancelled = 0;
+  for (uint32_t i = 0; i < kMaxPipes; ++i) {
+    Pipe& p = pipes_[i];
+    if (!p.used) continue;
+    for (PipeOp& op : p.ops) {
+      if (op.state != 1 || op.request == 0) continue;
+      io::IoRequest* r = requests_->find(op.request);
+      if (!r || r->thread != thread) continue;
+      pipe_cancel_op_locked(p, op, kStatusCancelled);
+      ++cancelled;
+    }
+  }
+  return cancelled;
+}
+
+void ObjectManager::io_owner_gone(uint64_t pid) {
+  Locked hold(sync_);
+  if (!requests_) return;
+  // The calls still pending are ended on the objects they wait on, with no answer for a process that is gone; every request is then dropped, and a port that is tied to the
+  // call and has a context for it hears the outcome (cancelled for a call that was not over), as NT reports a call that ends with the process.
+  if (pipes_) {
+    for (uint32_t i = 0; i < kMaxPipes; ++i) {
+      Pipe& p = pipes_[i];
+      if (!p.used) continue;
+      for (PipeOp& op : p.ops) {
+        if (op.state != 1 || op.request == 0) continue;
+        io::IoRequest* r = requests_->find(op.request);
+        if (!r || r->owner != pid) continue;
+        pipe_cancel_op_locked(p, op, kStatusCancelled);
+      }
+    }
+  }
+  io::IoRequest gone[16];
+  for (;;) {
+    const uint32_t n = requests_->remove_owner(pid, gone, 16);
+    if (n == 0) break;
+    for (uint32_t k = 0; k < n; ++k) {
+      io::IoRequest& r = gone[k];
+      if (r.port_object != 0 && r.port_context != 0) {
+        io::Packet packet;
+        packet.key = r.port_key; packet.context = r.port_context; packet.information = r.completed ? r.information : 0; packet.status = r.completed ? r.status : kStatusCancelled;
+        port_post_locked(r.port_object, packet);
+      }
+      if (r.event_object != 0) release_locked(r.event_object);
+      if (r.port_object != 0) release_locked(r.port_object);
+    }
+  }
+}
+
+bool ObjectManager::io_signal_source(uint32_t source, uint32_t end) {
+  Locked hold(sync_);
+  Pipe* p = pipe_of(source);
+  if (!p || end > 1 || (p->port_flags[end] & 2)) return false;
+  p->file_signaled[end] = true;
+  sync_.notify_all();
+  return true;
 }
 
 }  // namespace process

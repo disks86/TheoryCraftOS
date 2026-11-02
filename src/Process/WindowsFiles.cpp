@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsIo.hpp"
 #include "Process/WindowsTokens.hpp"
 #include "Process/DosWildcard.hpp"
 #include "Process/Objects.hpp"
@@ -332,7 +333,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   ProcessFiles& files = p.files();
   {
     uint32_t pipe_status = 0;
-    if (pipe_open_by_name(p, object_attributes, access, &pipe_status, handle)) {      // \\.\pipe\name
+    if (pipe_open_by_name(p, object_attributes, access, options, &pipe_status, handle)) {      // \\.\pipe\name
       if (pipe_status == kSuccess) *information = 1;      // FILE_OPENED
       return pipe_status;
     }
@@ -483,6 +484,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (files.kind(slot) == DescriptorKind::File) {
     OpenObject* opened = files.object(slot);
     opened->granted_access = access;
+    opened->async_io = (options & 0x30) == 0;
     if (opened->no_data_access) opened->readable = false;      // (a handle for attributes only reads nothing)
     opened->writable = (access & (kGenericAll | kGenericWrite | kFileWriteData | kFileAppendData)) != 0;      // (an overwrite writes through the file system's own handle, not the program's)
   }
@@ -507,19 +509,19 @@ uint32_t read_offset(Process& p, uint64_t pointer, uint64_t* value) {
   return p.read_user_u64(pointer, value) ? kSuccess : kAccessViolation;
 }
 
-uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
-  uint64_t apc = 0, status_block = 0, buffer = 0, length = 0, offset_pointer = 0;
-  if (!argument(p, r, 2, &apc) || !argument(p, r, 4, &status_block) || !argument(p, r, 5, &buffer) || !argument(p, r, 6, &length) || !argument(p, r, 7, &offset_pointer))
+uint32_t file_io_core(Process& p, const SyscallRequest& r, bool write, const IoCall& call) {
+  uint64_t apc = 0, status_block = 0, buffer = 0, length = 0, offset_pointer = 0, key = 0;
+  if (!argument(p, r, 2, &apc) || !argument(p, r, 8, &key) || !argument(p, r, 4, &status_block) || !argument(p, r, 5, &buffer) || !argument(p, r, 6, &length) || !argument(p, r, 7, &offset_pointer))
     return kAccessViolation;
   uint64_t slot = 0;
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
   const DescriptorKind kind = files.kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
-  if (apc != 0) return kNotImplemented;      // asynchronous completion is not supported
+  (void)apc;
   length &= 0xFFFFFFFFu;
   if (length > kMaxIoBytes) length = kMaxIoBytes;
-  if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length);
+  if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length, key == 1 || call.wait, &call);      // (a Key of 1 is the library's: wait, as a handle opened for synchronous calls does)
   if (kind == DescriptorKind::Mailslot) return mailslot_io(p, slot, write, status_block, buffer, length);
   if (kind == DescriptorKind::Null) {      // the NUL device takes everything and has nothing to read
     const uint32_t status = write ? kSuccess : kEndOfFile;
@@ -547,6 +549,7 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   uint64_t requested = 0;
   uint32_t status = read_offset(p, offset_pointer, &requested);
   if (status != kSuccess) return status;
+  if (int64_t(requested) < 0 && requested != kUseFilePointer && requested != kWriteToEnd) return kInvalidParameter;      // (a negative offset other than the two special ones)
   uint64_t at = requested == kUseFilePointer ? object.position : requested;
   if (requested == kWriteToEnd) {
     if (!write) return kInvalidParameter;
@@ -578,6 +581,25 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   status = kSuccess;
   if (!write && done == 0 && length != 0) status = kEndOfFile;
   return store_io_status(p, status_block, status, done) ? status : kAccessViolation;
+}
+
+uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
+  uint64_t slot = 0;
+  if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
+  if (p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  IoCall call;
+  if (const uint32_t refused = io_call_begin(p, slot, r, &call)) return refused;
+  uint32_t status = file_io_core(p, r, write, call);
+  const OpenObject* opened = p.files().kind(slot) == DescriptorKind::File ? p.files().object(slot) : nullptr;
+  const bool asynchronous = opened && opened->async_io && !call.wait && (call.event_handle != 0 || call.apc != 0 || call.context != 0);
+  if (asynchronous && (status == kSuccess || status == kEndOfFile || (status >> 30) == 2)) {      // a handle opened for overlapped calls: the call is done here, but it answers as the file system would, pending
+    uint64_t information = 0;
+    if (call.status_block != 0) p.read_user_u64(call.status_block + 8, &information);
+    io_call_completed(p, slot, call, status, information);
+    return 0x103;
+  }
+  // (a read from a handle opened for synchronous calls does not queue its APC; a call that ran into the end of the file has still completed)
+  return io_call_end(p, slot, call, status, write || !opened, status == kEndOfFile);
 }
 
 // --- queries
@@ -729,10 +751,7 @@ uint32_t nt_close(Process& p, const SyscallRequest& r) {
   uint64_t slot = 0;
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   if (p.files().protected_from_close(slot)) return 0xC0000235u;      // STATUS_HANDLE_NOT_CLOSABLE
-  const bool pipe = p.files().kind(slot) == DescriptorKind::Pipe;
-  const uint64_t token = p.files().token(slot);
   if (!p.close_descriptor(slot)) return kInvalidHandle;
-  if (pipe) pipe_closed(p, token);      // (the calls of other threads that closing it ended are over when it returns)
   return kSuccess;
 }
 
@@ -741,10 +760,24 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   uint64_t info_class = 0;
   if (!argument(p, r, 4, &info_class)) return kAccessViolation;
   uint64_t slot = 0;
+  if (r.args[0] == ~uint64_t{0}) return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH: -1 is the current process
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
   const DescriptorKind kind = files.kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
+  if (static_cast<uint32_t>(info_class) == 8 || static_cast<uint32_t>(info_class) == 41) {      // FileAccessInformation, FileIoCompletionNotificationInformation: only of a file
+    switch (kind) {
+      case DescriptorKind::Event: case DescriptorKind::Mutex: case DescriptorKind::Semaphore: case DescriptorKind::Process: case DescriptorKind::Thread: case DescriptorKind::Timer:
+      case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: case DescriptorKind::DebugObject: case DescriptorKind::KeyedEvent:
+      case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: case DescriptorKind::ObjectDirectory: case DescriptorKind::SymbolicLink: case DescriptorKind::Token: return 0xC0000024u;
+      default: break;
+    }
+  }
+  if (static_cast<uint32_t>(info_class) == 41) {      // FileIoCompletionNotificationInformation
+    uint32_t io_status = 0;
+    uint64_t io_size = 0;
+    if (io_query_file_information(p, slot, 41, r.args[2], uint32_t(r.args[3]), &io_status, &io_size)) return io_status != kSuccess ? io_status : (store_io_status(p, r.args[1], io_status, io_size) ? io_status : kAccessViolation);
+  }
   if (kind == DescriptorKind::ConsoleInput && static_cast<uint32_t>(info_class) == 24) {      // FilePipeLocalInformation: what the console input could give at once
     bool at_end = false;
     const uint64_t available = p.host().console_input_available(&at_end);
@@ -760,7 +793,8 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     return kInvalidDeviceRequest;      // FileStandardInformation: a console has no size
   if (kind == DescriptorKind::Pipe && static_cast<uint32_t>(info_class) == kFileNameInformation) {      // "\\name": where a pipe is
     String pipe_name(files.allocator()), windows_name(files.allocator());
-    if (!pipe_handle_name(p, slot, &pipe_name)) return kInvalidParameter;
+    if ((r.args[3] & 0xFFFFFFFFu) < 8) return kInfoLengthMismatch;      // (a FILE_NAME_INFORMATION is the length and at least one character)
+    if (!pipe_handle_name(p, slot, &pipe_name)) return kInvalidParameter;      // (not for the pipe device or its directory)
     if (pipe_name.empty()) {      // an anonymous pipe has a name too: "Win32Pipes.<process>.<number>"
       static const char digits[] = "0123456789abcdef";
       const uint32_t number = uint32_t(p.files().token(slot));
@@ -771,7 +805,8 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     uint8_t name[2 * (kMaxPath + 1)];
     const uint64_t bytes = to_utf16(windows_name.view(), name, sizeof(name));
     const uint64_t length = r.args[3] & 0xFFFFFFFFu;
-    if (length < 4) return kInfoLengthMismatch;
+    if (length < 8) return kInfoLengthMismatch;      // (a FILE_NAME_INFORMATION is the length and at least one character)
+    if (const uint32_t gone = pipe_client_state_status(p, slot)) return gone;
     uint8_t out[4];
     put(ByteView(out, 4), 0, bytes, 4);
     if (!p.write_user(r.args[2], ConstByteView(out, 4))) return kAccessViolation;
@@ -782,7 +817,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   }
   if (kind == DescriptorKind::Pipe) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
-    if (pipe_class == 8 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
+    if (pipe_class == 5 || pipe_class == 8 || pipe_class == 16 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
   }
   if (kind == DescriptorKind::Mailslot) {
     const uint32_t mailslot_class = static_cast<uint32_t>(info_class);
@@ -812,6 +847,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
       break;
     case kFilePositionInformation: put(v, 0, object ? object->position : 0, 8); size = 8; break;
     case 8: put(v, 0, object ? object->granted_access : 0, 4); size = 4; break;      // FileAccessInformation: the access the handle was opened with
+    case 41: put(v, 0, 0, 4); size = 4; break;      // FileIoCompletionNotificationInformation: no flags set
     case 6: put(v, 0, object ? file_id_of(object->path.view()) : 0, 8); size = 8; break;      // FileInternalInformation: the index of the file
     case kFileNetworkOpenInformation:
       write_times(v, 0, e);
@@ -854,8 +890,13 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
   uint64_t info_class = 0;
   if (!argument(p, r, 4, &info_class)) return kAccessViolation;
   uint64_t slot = 0;
+  if (r.args[0] == ~uint64_t{0}) return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH: -1 is the current process
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
+  if (files.kind(slot) != DescriptorKind::Closed && (static_cast<uint32_t>(info_class) == 30 || static_cast<uint32_t>(info_class) == 41)) {      // FileCompletionInformation, FileIoCompletionNotificationInformation
+    uint32_t io_status = 0;
+    if (io_set_file_information(p, slot, uint32_t(info_class), r.args[2], uint32_t(r.args[3]), &io_status)) return io_status != kSuccess ? io_status : (store_io_status(p, r.args[1], io_status, 0) ? io_status : kAccessViolation);
+  }
   if (files.kind(slot) == DescriptorKind::Pipe) {
     if (static_cast<uint32_t>(info_class) != 23) return kInvalidInfoClass;
     const uint32_t pipe_status = pipe_set_information(p, slot, 23, r.args[2], uint32_t(r.args[3]));
@@ -1280,7 +1321,7 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
   switch (kind) {      // an event, a section, a thread ... is not a file
     case DescriptorKind::Event: case DescriptorKind::Mutex: case DescriptorKind::Semaphore: case DescriptorKind::Process: case DescriptorKind::Thread: case DescriptorKind::Timer:
-    case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: case DescriptorKind::DebugObject: case DescriptorKind::KeyedEvent: case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH
+    case DescriptorKind::Section: case DescriptorKind::Job: case DescriptorKind::Key: case DescriptorKind::ChangeNotification: case DescriptorKind::DebugObject: case DescriptorKind::KeyedEvent: case DescriptorKind::IoCompletion: case DescriptorKind::Reserve: case DescriptorKind::ObjectDirectory: case DescriptorKind::SymbolicLink: return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH
     default: break;
   }
   const uint32_t volume_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the argument is not defined)

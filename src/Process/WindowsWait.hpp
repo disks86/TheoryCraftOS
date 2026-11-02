@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
+#include "Process/WindowsIo.hpp"
 
 namespace process::windowsabi {
 
@@ -34,6 +35,7 @@ inline uint32_t wait_until(Process& p, uint64_t timeout_ns, Attempt&& attempt) {
   const uint64_t started = p.host().monotonic_ns();
   sync.lock();
   for (;;) {
+    if (objects->io_ready() != 0) { sync.unlock(); io_reap(p); sync.lock(); }      // (calls that finished while this one waited are applied to the program)
     const uint64_t status = attempt();
     if (status != kWaitPending) { sync.unlock(); return uint32_t(status); }
     uint64_t left = ~uint64_t{0};

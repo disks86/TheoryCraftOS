@@ -20,6 +20,8 @@
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/ObjectPath.hpp"
+#include "Process/IoRequest.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/StringView.hpp"
 
@@ -45,12 +47,12 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, Directory, SymbolicLink };
 
 class ObjectManager {
  public:
   static constexpr uint32_t kCapacity = 1024;
-  static constexpr uint32_t kNameBytes = 128;
+  static constexpr uint32_t kNameBytes = 256;
 
   explicit ObjectManager(ISystemSync& sync) : sync_(sync) {}
   ~ObjectManager();
@@ -68,8 +70,14 @@ class ObjectManager {
     uint32_t status = 0;
     uint32_t end_code = 0;     // pipes: which end the handle is (see below)
   };
-  Created create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner);
+  // `text` is kept with the object: a symbolic link's target, a directory's absolute path (see ObjectPath.hpp).
+  Created create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner, StringView text = StringView());
   Created open(ObjectKind kind, StringView name);
+  // The namespace of the Windows ABI (ObjectPath.hpp): what is at a flat name, the text kept with an object, and the objects in a directory.
+  bool lookup_entry(StringView flat, bool case_insensitive, objpath::Entry* out);
+  uint32_t object_text(uint32_t id, char* out, uint32_t capacity);      // its length, 0 if it has none
+  // The `index`-th object (in the order they were made) directly in the directory with the flat name `directory`: its name, kind and the name of its type.
+  bool directory_child(StringView directory, uint32_t index, char* name, uint32_t capacity, uint32_t* name_size, ObjectKind* kind);
   // A process (waited for by its parent): signalled when it has ended. `pid` finds it again when the process ends.
   Created create_process(uint64_t pid);
 
@@ -80,7 +88,7 @@ class ObjectManager {
   allocators::IAllocator* allocator() const { return allocator_; }
   static constexpr uint32_t kPipeInbound = 1, kPipeOutbound = 2, kPipeDuplex = 3;      // the server's direction (PIPE_ACCESS_*); anonymous pipes are outbound
   // `name` empty: an anonymous pipe, already connected. Otherwise a new instance of the pipe of that name (up to `max_instances` of them, 0: no limit), not connected.
-  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false, uint64_t pid = 0);
+  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false, uint64_t pid = 0, uint32_t disposition = 3);
   // A client connects to an instance of the named pipe that is not connected yet (status 0xC0000034 if no pipe has the name, 0xC00000AE if all are connected).
   // `want_read` / `want_write`: what the client asks for; an instance whose direction does not allow it is refused (0xC0000022) and stays unconnected.
   Created connect_pipe(StringView name, bool want_read, bool want_write, uint64_t pid = 0);
@@ -102,8 +110,8 @@ class ObjectManager {
   bool pipe_disconnect(uint32_t id);      // false if nothing was connected      // the server ends the connection (the instance can listen again)
   // --- operations. A call that has to wait is an operation of the pipe, with a tag: it is served in the order it was made (reads), a write that does not fit is queued whole,
   // as the other end sees it at once (peeking, ReadDataAvailable), and is complete when enough was read to make room. An operation is cancelled by its tag, which takes back
-  // the bytes of a write that have not been read. `async` marks an operation that another thread of its owner waits for with pipe_op_poll_locked: whoever completes it
-  // waits until that thread has acted on it (pipe_op_release), so that its result is there when the call that completed it returns.
+  // the bytes of a write that have not been read. The call that made an operation either waits for it itself (pipe_op_poll_locked, pipe_op_release) or hands it to an IoRequest
+  // (pipe_pend_locked), which ends with it and carries its outcome to the program.
   enum class PipeOpKind : uint8_t { None, Read, Write, Flush, Listen };
   enum class PipeOpPoll { Missing, Pending, Done };
   struct PipeOpResult {
@@ -112,33 +120,38 @@ class ObjectManager {
   };
   static constexpr uint32_t kMaxPipeWrite = 8u << 20;      // the longest write that is queued as one (longer ones are cut)
   // Read: Ok/error when it can be answered now (nothing was queued), WouldBlock when it was queued as `tag`.
-  PipeResult pipe_begin_read_locked(uint32_t id, uint32_t end_code, uint32_t length, bool message_mode, uint64_t owner, bool async, uint32_t* tag);
+  PipeResult pipe_begin_read_locked(uint32_t id, uint32_t end_code, uint32_t length, bool message_mode, uint64_t owner, uint32_t* tag);
   // Write: Ok when all of it went at once (`done` bytes, no operation), WouldBlock when it is queued as `tag`, or why not.
-  PipeResult pipe_begin_write_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint64_t owner, bool async, uint32_t* tag, uint32_t* done);
+  PipeResult pipe_begin_write_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint64_t owner, uint32_t* tag, uint32_t* done);
   // TransactNamedPipe: `data` is written as a message that does not make it wait (it is queued like any write, but nobody waits for it) and then a read of at most
   // `read_length` is queued as `tag` (WouldBlock). InvalidState if the pipe is not a message pipe read as messages, Busy if there is something to read already.
-  PipeResult pipe_begin_transact_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t read_length, bool message_mode, uint64_t owner, bool async, uint32_t* tag);
-  PipeResult pipe_begin_listen_locked(uint32_t id, uint64_t owner, bool async, uint32_t* tag);
+  PipeResult pipe_begin_transact_locked(uint32_t id, uint32_t end_code, ConstByteView data, uint32_t read_length, bool message_mode, uint64_t owner, uint32_t* tag);
+  PipeResult pipe_begin_listen_locked(uint32_t id, uint64_t owner, uint32_t* tag);
   // Waits until what this end wrote has been read: Ok at once, WouldBlock when queued as `tag`.
   PipeResult pipe_begin_flush_locked(uint32_t id, uint32_t end_code, uint64_t owner, uint32_t* tag);
   PipeOpPoll pipe_op_poll_locked(uint32_t id, uint32_t end_code, uint32_t tag, PipeOpResult* result);      // Done: the result is moved out, the operation stays until released
   PipeResult pipe_op_cancel_locked(uint32_t id, uint32_t end_code, uint32_t tag, uint32_t status);      // Ok if it was pending (now finished with `status`), else Broken
   void pipe_op_release(uint32_t id, uint32_t tag);      // takes the operation away (what the thread that waited for it has done)
   void pipe_op_free_data(ByteView& data);
-  bool pipe_delivered_locked(uint32_t id);      // no operation is finished that its thread has not yet acted on
-  void pipe_forgive_locked(uint32_t id);      // gives up waiting for them
   void pipe_owner_gone(uint64_t pid);      // the process ended: what it waits for is cancelled
   // A thread that waits in the kernel for a call on a pipe end (one that is not an operation of the pipe): while it does, the file object is not signalled, and
   // CancelSynchronousIo can end the call. begin returns a slot (1 and up), 0 if there is none.
-  uint32_t pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread);
+  uint32_t pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread, uint64_t iosb = 0);
   bool pipe_sync_cancelled_locked(uint32_t slot);
   void pipe_sync_end(uint32_t slot);
-  bool pipe_cancel_synchronous(uint64_t thread);      // false if the thread waits for no call
-  // A pipe end tied to an I/O completion port (a semaphore object that the library's port is counted by): when a process ends while a call of it waits on the end, the packet for
-  // that call cannot be queued by the process, so the kernel keeps it for the port (port_take_foreign) and releases the semaphore once.
-  struct PortPacket { uint32_t bytes = 0, status = 0; uint64_t key = 0, overlapped = 0; };
-  void pipe_set_port(uint32_t id, uint32_t end_code, uint32_t semaphore_object, uint64_t key);
-  bool port_take_foreign(uint32_t semaphore_object, PortPacket* packet);
+  bool pipe_cancel_synchronous(uint64_t thread, uint64_t iosb = 0);      // false if the thread waits for no call
+  // A pipe end tied to an I/O completion port (NtSetInformationFile FileCompletionInformation): the port object is referenced while it is tied. `flags` are the
+  // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (1) and FILE_SKIP_SET_EVENT_ON_HANDLE (2) of FileIoCompletionNotificationInformation.
+  bool pipe_set_port(uint32_t id, uint32_t end_code, uint32_t port_object, uint64_t key);
+  void pipe_set_port_flags(uint32_t id, uint32_t end_code, uint32_t flags);
+  bool pipe_port(uint32_t id, uint32_t end_code, uint32_t* port_object, uint64_t* key, uint32_t* flags);      // false if the end is not tied to a port
+  // A call that waits on the pending operation `tag` of an end becomes the request made from `request` (see IoRequest.hpp): when the operation ends, the request ends with its
+  // outcome (and, for a read, its data). `signal_file`: the call has no event of its own, so the file object is not signalled until it ends. False if the request cannot be
+  // queued; the operation is cancelled then.
+  bool pipe_pend_locked(uint32_t id, uint32_t end_code, uint32_t tag, const io::IoRequest& request, bool signal_file);
+  uint32_t pipe_end_refs_locked(uint32_t id, uint32_t end_code);
+  // FILE_PIPE_DISCONNECTED_STATE 1, _LISTENING_STATE 2, _CONNECTED_STATE 3, _CLOSING_STATE 4 of an end (0 if there is no such pipe).
+  uint32_t pipe_state_locked(uint32_t id, uint32_t end_code);      // the handles (of every process) that hold the end
   bool pipe_client_gone_locked(uint32_t id, uint32_t end_code);      // a client end whose server disconnected it
   // The event of the file object of an end: set when it is made, reset when an operation that waits is started on it, set when one that was started without an event of its
   // own is over (what a wait on the handle looks at).
@@ -162,7 +175,29 @@ class ObjectManager {
   bool query_process(uint32_t id, bool* exited, uint32_t* code, uint64_t* pid);
   void add_ref(uint32_t id);
   void release(uint32_t id);
+  void release_locked(uint32_t id);
   ObjectKind kind(uint32_t id);
+
+  // --- I/O requests and completion ports (IoRequest.hpp). The _locked calls need the system lock; the others take it.
+  io::IoRequest* io_add_locked(const io::IoRequest& request);      // takes a reference on the request's event and port objects; nullptr if there is no room
+  io::IoRequest* io_find_locked(uint32_t id);
+  bool io_complete_locked(uint32_t id, uint32_t status, uint64_t information, ByteView data = ByteView());
+  uint32_t io_ready() const;      // finished requests nobody has taken (no lock)
+  // The finished requests of a process, oldest first (they leave the table; the caller applies them, then io_dispose()s each).
+  uint32_t io_take_completed(uint64_t owner, io::IoRequest* out, uint32_t capacity);
+  void io_dispose(io::IoRequest& request);      // lets go of the data and of the references the request held
+  // Cancels the pending requests on an end of an object (`end`: 0/1 as the pipe has it) that were made by `owner` (0: any process), by `thread` (0: any thread) and, when
+  // `status_block` is not 0, with that IO_STATUS_BLOCK; they end with `status`. How many there were.
+  uint32_t io_cancel_locked(uint32_t source, uint32_t end, uint64_t owner, uint64_t thread, uint64_t status_block, uint32_t status, bool closing = false);
+  uint32_t io_cancel_thread(uint64_t thread);      // a thread ended: what it has pending on any object is cancelled
+  void io_owner_gone(uint64_t pid);      // a process ended: its requests are dropped; those that have a completion port with a context report to it
+  bool io_signal_source(uint32_t source, uint32_t end);      // the file object of an end is signalled (a call without an event of its own completed)
+  bool is_port(uint32_t id);
+  bool is_port_locked(uint32_t id) { return port_queue_locked(id) != nullptr; }
+  bool port_post(uint32_t port_object, const io::Packet& packet);
+  bool port_post_locked(uint32_t port_object, const io::Packet& packet);
+  bool port_remove_locked(uint32_t port_object, io::Packet* out);
+  uint64_t port_depth_locked(uint32_t port_object);
 
   // --- operations on one object (they take the lock and wake the waiters). They return an NTSTATUS.
   uint32_t set_event(uint32_t id, int32_t* previous);
@@ -277,8 +312,7 @@ class ObjectManager {
   bool job_kill_for(uint64_t pid, uint32_t* code);                  // lock-free: has this process been flagged to end?
   // A completion port (JobObjectAssociateCompletionPortInformation): the job keeps the JOB_OBJECT_MSG_* events (new process, exit, no process left) for whoever reads them
   // from the port. NTSTATUS: invalid parameter if a port is associated already (and `present`). Associating queues a new-process event for each process in the job.
-  uint32_t job_set_port(uint32_t job, uint64_t key, bool present);
-  bool job_take_event(uint32_t job, uint32_t* message, uint64_t* pid, uint64_t* key);      // the oldest event; false if there is none
+  uint32_t job_set_port(uint32_t job, uint64_t key, uint32_t port_object);      // port_object 0: no port. The events are packets of the port (key, process id as the context, the message as the information).
 
   // --- change notifications (kind ChangeNotification; FindFirstChangeNotification/ReadDirectoryChangesW): a handle that becomes signalled, exactly like a manual-reset
   // event, when something is created, deleted, renamed or linked directly under the directory it watches (or anywhere under it, if `watch_subtree`). Reset it
@@ -365,6 +399,8 @@ class ObjectManager {
     uint32_t references = 0;
     char name[kNameBytes] = {};
     uint32_t name_size = 0;
+    char text[kNameBytes] = {};            // symbolic link: its target; directory: its absolute path
+    uint32_t text_size = 0;
     bool manual_reset = false, signaled = false, abandoned = false;
     bool dying = false;                    // no handle is left, but a thread waits for it or a mutex is owned: it goes with the last of those
     int32_t count = 0, maximum = 0;        // semaphore
@@ -376,13 +412,14 @@ class ObjectManager {
     int32_t job = -1;                      // job: its index in jobs_
     int32_t watch = -1;                    // change notification: its index in watches_
     int32_t mailslot = -1;                 // mailslot: its index in mailslots_
+    int32_t port = -1;                     // I/O completion port: its index in ports_
     uint64_t due_ns = 0, period_ns = 0;    // timer: when it fires next, how often
     uint64_t apc_thread = 0, apc_routine = 0, apc_context = 0;      // timer: the APC it queues
     bool armed = false, apc_pending = false;
     uint64_t fired_at = 0;
   };
   Object* at(uint32_t id) { return id >= 1 && id <= kCapacity && objects_[id - 1].kind != ObjectKind::None ? &objects_[id - 1] : nullptr; }
-  Object* find_locked(StringView name);
+  Object* find_locked(StringView name, bool case_insensitive = false);
   void fire_timer_locked(Object& o, uint64_t now);
   void free_object_locked(Object& o);
   void finish_dying_locked(Object& o);
@@ -402,6 +439,7 @@ class ObjectManager {
     JobMember members[kJobMaxMembers];
     bool port_set = false;      // a completion port is associated: the events below wait to be taken
     uint64_t port_key = 0;
+    uint32_t port_object = 0;      // the port object (referenced) the events go to
     static constexpr uint32_t kMaxEvents = 32;
     JobEvent events[kMaxEvents];
     uint32_t event_head = 0, event_count = 0;
@@ -427,7 +465,6 @@ class ObjectManager {
   PipeOp* pipe_new_op_locked(Pipe& p, PipeOpKind kind, uint32_t end, uint64_t owner);
   PipeOp* pipe_find_op_locked(Pipe& p, uint32_t tag);
   void pipe_free_op_locked(Pipe& p, PipeOp& op);
-  bool post_port_packet_locked(Pipe& p, uint32_t end, uint32_t status, uint32_t bytes);
   static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 2048;
 
   struct Watch {
@@ -448,13 +485,16 @@ class ObjectManager {
   void free_mailslot_locked(Object& o);
 
   ISystemSync& sync_;
-  struct SyncWait { uint64_t thread = 0; uint32_t pipe = 0, end_code = 0; bool used = false, cancelled = false; };
+  struct SyncWait { uint64_t thread = 0, iosb = 0; uint32_t pipe = 0, end_code = 0; bool used = false, cancelled = false; };
   static constexpr uint32_t kMaxSyncWaits = 64;
   SyncWait sync_waits_[kMaxSyncWaits];
-  struct ForeignPacket { uint32_t semaphore = 0; PortPacket packet; };
-  static constexpr uint32_t kMaxForeignPackets = 64;
-  ForeignPacket foreign_[kMaxForeignPackets];
-  uint32_t foreign_head_ = 0, foreign_count_ = 0;
+  io::IoRequestTable* requests_ = nullptr;      // made with the first request
+  struct PortState { bool used = false; uint32_t object = 0; io::CompletionQueue* queue = nullptr; };
+  static constexpr uint32_t kMaxPorts = 128;
+  PortState* ports_ = nullptr;      // kMaxPorts of them, made with the first port
+  io::IoRequestTable* request_table();      // (locked) made when needed
+  io::CompletionQueue* port_queue_locked(uint32_t port_object);
+  void free_port_locked(Object& o);
   uint64_t pipe_sequence_ = 0;      // numbers the instances of pipes in the order they start to listen
   allocators::IAllocator* allocator_ = nullptr;
   Object objects_[kCapacity];
