@@ -37,6 +37,8 @@ bool caller_token_blob(Process& p, ByteBuffer& out);
 bool process_token_blob(uint64_t pid, ByteBuffer& out);
 // A new process (the child) starts with a copy of the token of its parent.
 void token_inherit(uint64_t parent_pid, uint64_t child_pid);
+// A thread has ended: its impersonation token is let go.
+void token_thread_ended(uint64_t tid);
 // The process has ended.
 void token_process_exited(uint64_t pid);
 
@@ -52,6 +54,9 @@ inline const security::GenericMapping kThreadMapping = {0x20048, 0x20037, 0x1200
 
 // Is the privilege (the low part of its LUID) held and enabled in the token of the calling thread?
 bool caller_privilege_enabled(Process& p, uint32_t low);
+
+// A thread that impersonates at a level below SecurityImpersonation cannot open anything: STATUS_BAD_IMPERSONATION_LEVEL for it, 0 for any other.
+uint32_t impersonation_gate(Process& p);
 
 // Does the calling thread impersonate a token?
 bool caller_is_impersonating(Process& p);

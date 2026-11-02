@@ -321,6 +321,7 @@ uint32_t check_add_below(Process& p, StringView new_path, bool directory) {
 
 // Opening a node that exists with `access`, or deleting it (DELETE; the right to delete a node can also come from its directory, which grants FILE_DELETE_CHILD).
 uint32_t check_open(Process& p, StringView path, uint32_t access, uint32_t* granted = nullptr, bool backup = false) {
+  if (const uint32_t gate = impersonation_gate(p)) return gate;
   if (node_allows(p, path, access, granted, backup)) return kSuccess;
   const uint32_t mapped = kFileMapping.map(access & ~kMaximumAllowedAccess);
   if ((mapped & kDeleteAccess) && !(access & kMaximumAllowedAccess) && ((mapped & ~kDeleteAccess) == 0 || node_allows(p, path, mapped & ~kDeleteAccess)) && node_allows(p, directory_part(path), kFileDeleteChild)) { if (granted) *granted = mapped; return kSuccess; }

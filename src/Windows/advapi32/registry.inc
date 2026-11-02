@@ -84,7 +84,7 @@ static HANDLE handle_of(HKEY key) {
 
 HANDLE ADVAPI_KeyHandle(HKEY key) { return handle_of(key); }      /* (security.c: the handle behind a key, predefined or not) */
 
-static LSTATUS open_or_create(HKEY key, LPCWSTR sub, BOOL create, DWORD options, PHKEY result, LPDWORD disposition) {
+static LSTATUS open_or_create(HKEY key, LPCWSTR sub, BOOL create, DWORD options, PHKEY result, LPDWORD disposition, REGSAM access) {
   if (!result) return ERROR_INVALID_PARAMETER;
   HANDLE root = handle_of(key);
   if (!root) return ERROR_INVALID_HANDLE;
@@ -112,21 +112,21 @@ static LSTATUS open_or_create(HKEY key, LPCWSTR sub, BOOL create, DWORD options,
       ULONG dispo = 0;
       if (NT_SUCCESS(NtCreateKey(&hh, 0xF003F, &above, 0, NULL, 0, &dispo))) NtClose(hh);
     }
-    status = NtCreateKey(&h, 0xF003F, &attributes, 0, NULL, options, &made);
+    status = NtCreateKey(&h, access ? access : 0xF003F, &attributes, 0, NULL, options, &made);
   }
-  else status = NtOpenKey(&h, 0x20019, &attributes);
+  else status = NtOpenKey(&h, access ? access : 0x20019, &attributes);
   if (!NT_SUCCESS(status)) return status == 0xC0000034u ? ERROR_FILE_NOT_FOUND : nt_error(status);
   *result = (HKEY)h;
   if (disposition) *disposition = made;
   return ERROR_SUCCESS;
 }
 
-EXPORT LSTATUS WINAPI RegOpenKeyExW(HKEY key, LPCWSTR sub, DWORD options, REGSAM access, PHKEY result) { (void)options; (void)access; return open_or_create(key, sub, FALSE, 0, result, NULL); }
+EXPORT LSTATUS WINAPI RegOpenKeyExW(HKEY key, LPCWSTR sub, DWORD options, REGSAM access, PHKEY result) { (void)options; return open_or_create(key, sub, FALSE, 0, result, NULL, access); }
 EXPORT LSTATUS WINAPI RegOpenKeyW(HKEY key, LPCWSTR sub, PHKEY result) { return RegOpenKeyExW(key, sub, 0, 0, result); }
 EXPORT LSTATUS WINAPI RegCreateKeyExW(HKEY key, LPCWSTR sub, DWORD reserved, LPWSTR class_name, DWORD options, REGSAM access, LPSECURITY_ATTRIBUTES sa, PHKEY result,
                                       LPDWORD disposition) {
-  (void)reserved; (void)class_name; (void)access; (void)sa;
-  return open_or_create(key, sub ? sub : L"", TRUE, options, result, disposition);
+  (void)reserved; (void)class_name; (void)sa;
+  return open_or_create(key, sub ? sub : L"", TRUE, options, result, disposition, access);
 }
 EXPORT LSTATUS WINAPI RegCreateKeyW(HKEY key, LPCWSTR sub, PHKEY result) { return RegCreateKeyExW(key, sub, 0, NULL, 0, 0, NULL, result, NULL); }
 EXPORT LSTATUS WINAPI RegCloseKey(HKEY key) {
@@ -227,7 +227,7 @@ EXPORT LSTATUS WINAPI RegDeleteValueW(HKEY key, LPCWSTR name) {
 EXPORT LSTATUS WINAPI RegDeleteKeyW(HKEY key, LPCWSTR sub) {
   if (!sub) return ERROR_INVALID_PARAMETER;
   HKEY opened = NULL;
-  LSTATUS status = open_or_create(key, sub, FALSE, 0, &opened, NULL);
+  LSTATUS status = open_or_create(key, sub, FALSE, 0, &opened, NULL, 0);
   if (status != ERROR_SUCCESS) return status;
   status = nt_error(NtDeleteKey((HANDLE)opened));
   RegCloseKey(opened);

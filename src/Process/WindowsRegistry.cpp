@@ -155,6 +155,7 @@ uint32_t nt_create_key(Process& p, const SyscallRequest& r) {
 }
 // A key that was opened is held to its descriptor (if it has one): the rights asked for must be allowed to the calling thread; if not, the handle is closed again.
 uint32_t open_key_checked(Process& p, const SyscallRequest& r) {
+  if (const uint32_t gate = impersonation_gate(p)) return gate;
   if ((r.args[1] & 0x01000000u) && !caller_privilege_enabled(p, 8 /* SeSecurityPrivilege */)) return 0xC0000061u;      // STATUS_PRIVILEGE_NOT_HELD
   uint32_t status = open_or_create(p, r, false, nullptr);
   uint64_t handle = 0;

@@ -591,8 +591,8 @@ __declspec(dllexport) NTSTATUS NTAPI NtQueryInformationToken(HANDLE token, TOKEN
         if (!has_link) { *(HANDLE *)info = NULL; return STATUS_SUCCESS; }
         {      /* the other token of the pair, as it was made (changes of this one are not in it): elevated (Full, high integrity, the privileges of an administrator) when this one
                   is limited, and the limited one when this is the elevated; to be looked at (identification level) */
-            static const BYTE limited_privileges[] = {19, 23, 25, 33, 34, 35};
-            static const BYTE full_privileges[] = {5, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 22, 24, 28, 29, 30, 36};
+            static const BYTE limited_privileges[] = {8, 19, 23, 25, 33, 34, 35};
+            static const BYTE full_privileges[] = {5, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 22, 24, 28, 29, 30, 36};
             static const BYTE admins[16] = {1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0}, system_sid[12] = {1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0};
             TokenData *e = heap_new(sizeof(*e));
             class_status = e ? read_token(token, TOKEN_QUERY, e) : STATUS_NO_MEMORY_;
@@ -605,7 +605,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtQueryInformationToken(HANDLE token, TOKEN
                 st32(level_sid + 8, to_full ? 0x3000 : 0x2000);
                 if (il) memcpy(il->sid, level_sid, sizeof(level_sid));
                 e->npriv = 0;
-                for (i = 0; i < sizeof(limited_privileges); ++i) { e->priv[e->npriv].Luid.LowPart = limited_privileges[i]; e->priv[e->npriv].Luid.HighPart = 0; e->priv[e->npriv++].Attributes = limited_privileges[i] == 23 && to_full ? 3 : 1; }
+                for (i = 0; i < sizeof(limited_privileges); ++i) { e->priv[e->npriv].Luid.LowPart = limited_privileges[i]; e->priv[e->npriv].Luid.HighPart = 0; e->priv[e->npriv++].Attributes = limited_privileges[i] == 8 ? 0 : limited_privileges[i] == 23 && to_full ? 3 : 1; }
                 if (to_full) for (i = 0; i < sizeof(full_privileges); ++i) { e->priv[e->npriv].Luid.LowPart = full_privileges[i]; e->priv[e->npriv].Luid.HighPart = 0; e->priv[e->npriv++].Attributes = 0; }
                 RtlCreateAcl(acl, sizeof(e->dacl), ACL_REVISION);
                 RtlAddAccessAllowedAceEx(acl, ACL_REVISION, 0, 0x10000000, (PSID)admins);
@@ -1653,7 +1653,7 @@ __declspec(dllexport) void NTAPI RtlTcosNewObjectSecurity(HANDLE handle, const O
     if (creator && (((SECURITY_DESCRIPTOR *)creator)->Control & SE_SELF_RELATIVE ? (((SECURITY_DESCRIPTOR_RELATIVE *)creator)->Control & SE_DACL_PRESENT) : (((SECURITY_DESCRIPTOR *)creator)->Control & SE_DACL_PRESENT))) flags &= ~SEF_DACL_AUTO_INHERIT;      /* (a descriptor of its own: the parent adds nothing to it) */
     if (RtlNewSecurityObjectEx(parent, creator, (PSECURITY_DESCRIPTOR *)&made, NULL, container, flags, NULL, (PGENERIC_MAPPING)&sd_mappings[kind]) == 0) {
         length = RtlLengthSecurityDescriptor(made);
-        NtTcosToken(TCOS_OBJECT_SD_SET, (ULONG_PTR)handle, 0, (ULONG_PTR)made, length, 0);
+        NtTcosToken(kind == SD_THREAD ? TCOS_THREAD_SD_SET : TCOS_OBJECT_SD_SET, (ULONG_PTR)handle, 0, (ULONG_PTR)made, length, 0);
         RtlFreeHeap(RtlProcessHeap(), 0, made);
     }
     heap_drop(parent);

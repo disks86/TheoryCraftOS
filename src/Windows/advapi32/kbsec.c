@@ -167,6 +167,7 @@ EXP DWORD WINAPI SetSecurityDescriptorRMControl(PSECURITY_DESCRIPTOR sd, PUCHAR 
 }
 EXP BOOL WINAPI MakeSelfRelativeSD(PSECURITY_DESCRIPTOR absolute, PSECURITY_DESCRIPTOR relative, LPDWORD length)
 {
+    if (absolute && (((SECURITY_DESCRIPTOR *)absolute)->Control & SE_SELF_RELATIVE)) return win_fail(ERROR_BAD_DESCRIPTOR_FORMAT);
     NTSTATUS status = RtlMakeSelfRelativeSD(absolute, relative, length);
     return status ? nt_fail(status) : TRUE;
 }

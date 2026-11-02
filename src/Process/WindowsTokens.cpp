@@ -71,12 +71,12 @@ bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
   const SidBuf group = make_sid(5, {21, 0, 0, 0, 513});
   struct G { SidBuf sid; uint32_t attrs; };
   const G groups[] = {
-      {make_sid(1, {0}), 7}, {make_sid(2, {0}), 7}, {make_sid(2, {1}), 7}, {make_sid(5, {32, 544}), 0xF}, {make_sid(5, {32, 545}), 7}, {make_sid(5, {4}), 7}, {make_sid(5, {11}), 7},
+      {make_sid(5, {21, 0, 0, 0, 513}), 7}, {make_sid(1, {0}), 7}, {make_sid(2, {0}), 7}, {make_sid(2, {1}), 7}, {make_sid(5, {32, 544}), 0xF}, {make_sid(5, {32, 545}), 7}, {make_sid(5, {4}), 7}, {make_sid(5, {11}), 7},
       {make_sid(5, {15}), 7}, {make_sid(5, {64, 10}), 7}, {make_sid(5, {5, 0, 0x3E7}), 0xC0000007u}, {make_sid(16, {8192}), 0x60},
   };
   struct P { uint32_t low, attrs; };
   // The privileges a standard user's token holds, all disabled to start with (what the program enables, it asks for).
-  const P privileges[] = {{19, 1}, {23, 1}, {25, 1}, {33, 1}, {34, 1}, {35, 1}};
+  const P privileges[] = {{8, 0}, {19, 1}, {23, 1}, {25, 1}, {33, 1}, {34, 1}, {35, 1}};
   const SidBuf admins = make_sid(5, {32, 544}), system_sid = make_sid(5, {18});
   constexpr uint32_t kGroupCount = sizeof(groups) / sizeof(groups[0]), kPrivilegeCount = sizeof(privileges) / sizeof(privileges[0]);
   // Layout: header, user, owner (the user is the owner), primary group, groups (the table, then the SIDs), privileges, default DACL.
@@ -277,7 +277,8 @@ bool caller_token_blob(Process& p, ByteBuffer& out) {
 }
 
 void token_inherit(uint64_t parent_pid, uint64_t child_pid) {
-  const uint32_t parent = owner_object(g_process_tokens, parent_pid);
+  uint32_t parent = owner_object(g_process_tokens, parent_pid);
+  if (parent == 0) parent = process_token_object(parent_pid);      // (the parent has the default token, made now, so that the child has the same)
   if (parent == 0) return;
   ObjectManager* objects = system_objects();
   if (!objects || !objects->allocator()) return;
@@ -288,6 +289,8 @@ void token_inherit(uint64_t parent_pid, uint64_t child_pid) {
   if (set_owner(g_process_tokens, child_pid, copy)) { objects->release(copy); return; }
   objects->release(copy);
 }
+
+void token_thread_ended(uint64_t tid) { set_owner(g_thread_tokens, tid, 0); }
 
 void token_process_exited(uint64_t pid) {
   set_owner(g_process_tokens, pid, 0);
@@ -303,6 +306,7 @@ void token_process_exited(uint64_t pid) {
 }
 
 uint32_t open_with_descriptor(Process& p, char tag, uint64_t id, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted) {
+  if (const uint32_t gate = impersonation_gate(p)) return gate;
   ObjectManager* objects = system_objects();
   uint32_t status = 0;
   *granted = mapping.map(desired & ~kMaximumAllowed);
@@ -328,6 +332,15 @@ bool caller_privilege_enabled(Process& p, uint32_t low) {
   return token.has_privilege(low, &enabled) && enabled;
 }
 
+uint32_t impersonation_gate(Process& p) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !objects->allocator() || !caller_is_impersonating(p)) return kSuccess;
+  ByteBuffer blob(*objects->allocator());
+  security::TokenView token;
+  if (!caller_token_blob(p, blob) || !token.parse(blob.view())) return kSuccess;
+  return token.is_impersonation() && token.level() < 2 ? security::kStatusBadImpersonationLevel : kSuccess;
+}
+
 bool caller_is_impersonating(Process& p) { return owner_object(g_thread_tokens, p.runtime() ? p.runtime()->current_thread_id() : p.id()) != 0; }
 
 bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted, uint32_t* status, bool backup_intent) {
@@ -336,7 +349,7 @@ bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const se
   if (descriptor.empty()) return true;
   ObjectManager* objects = system_objects();
   ByteBuffer blob(*objects->allocator());
-  if (!caller_token_blob(p, blob)) return true;      // (no token can be had: nothing to hold against the caller)
+  if (!caller_token_blob(p, blob)) { *status = kAccessDenied; return false; }      // (no token can be had: nothing is allowed)
   security::TokenView token;
   if (!token.parse(blob.view())) { *status = kAccessDenied; return false; }
   const security::CheckResult r = security::access_check(descriptor, token, desired, mapping, backup_intent ? security::kBackupIntent : 0);
@@ -468,7 +481,7 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
       if (!sd.put_zeros(size) || objects->security_get(parent, sd.writable_view()) != size) return kNoResources;
       return p.write_user(a[2], sd.view()) ? kSuccess : kAccessViolation;
     }
-    case TCOS_OBJECT_SD_GET: case TCOS_OBJECT_SD_SET: {      // (op, handle, required, buffer, length-or-capacity, &needed)
+    case TCOS_THREAD_SD_SET: case TCOS_OBJECT_SD_GET: case TCOS_OBJECT_SD_SET: {      // (op, handle, required, buffer, length-or-capacity, &needed)
       char key[300];
       uint32_t key_size = 0;
       DescriptorKind kind = DescriptorKind::Closed;
@@ -503,7 +516,7 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
           uint64_t pid = 0;
           if (!objects->query_process(uint32_t(token), &exited, &code, &pid)) return kInvalidHandle;
           char k[16];
-          const uint32_t n = ObjectManager::object_key(pid >= (uint64_t{1} << 20) ? 'h' : 'p', uint32_t(pid), k);
+          const uint32_t n = ObjectManager::object_key(pid >= (uint64_t{1} << 20) || op == TCOS_THREAD_SD_SET ? 'h' : 'p', uint32_t(pid), k);
           for (uint32_t i = 0; i < n; ++i) key[i] = k[i];
           key_size = n;
           break;

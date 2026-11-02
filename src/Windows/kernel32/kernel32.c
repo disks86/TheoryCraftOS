@@ -2454,7 +2454,8 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   /* STARTF_USESTDHANDLES (0x100): the child's standard handles are the ones in the startup information (inheritable handles of this process, or the console's). */
   const BOOL debug_start = (flags & (0x1 | 0x2) /* DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS */) != 0;
   if (debug_start && !NT_SUCCESS(DbgUiConnectToDbg())) { set_error(ERROR_ACCESS_DENIED); return FALSE; }
-  ULONG nt_flags = ((flags & CREATE_SUSPENDED) || debug_start ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
+  const BOOL has_descriptors = (process_attributes && process_attributes->lpSecurityDescriptor) || (thread_attributes && thread_attributes->lpSecurityDescriptor);
+  ULONG nt_flags = ((flags & CREATE_SUSPENDED) || debug_start || has_descriptors ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
   /* the standard handles of the child: the ones of the startup information, none for a program without a console, or those of this program (the kernel decides which of them the
      child can have, by what it inherits) */
   HANDLE std_in, std_out, std_err;
@@ -2526,6 +2527,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     OBJECT_ATTRIBUTES made = { sizeof(made), NULL, NULL, 0, thread_attributes->lpSecurityDescriptor, NULL };
     RtlTcosNewObjectSecurity(thread, &made, FALSE, 11 /* a thread */);
   }
+  if (has_descriptors && !(flags & CREATE_SUSPENDED) && !debug_start) NtResumeThread(thread, NULL);      /* (it was held until its descriptors were there) */
   if (debug_start) {      /* attached before it runs its first instruction; its children too, unless DEBUG_ONLY_THIS_PROCESS */
     const NTSTATUS attached = NtDebugActiveProcess(process, DbgUiGetThreadDebugObject());
     if (NT_SUCCESS(attached) && (flags & 0x1) && !(flags & 0x2)) { ULONG inherit = 1; NtSetInformationProcess(process, 31, &inherit, sizeof(inherit)); }

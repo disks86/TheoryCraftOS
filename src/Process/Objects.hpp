@@ -240,7 +240,7 @@ class ObjectManager {
   bool security_set(StringView path, ConstByteView descriptor);
   uint32_t security_get(StringView path, ByteView out);      // the size of the descriptor written to `out`, 0 if the node has none or it does not fit
   uint32_t security_size(StringView path);      // the size of the descriptor kept, 0 if none
-  static constexpr uint32_t kMaxSecurityBlob = 16384, kMaxSecurityBytes = 1u << 20;      // the longest blob, and all of them together
+  static constexpr uint32_t kMaxSecurityBlob = 16384, kMaxSecurityBytes = 4u << 20;      // the longest blob, and all of them together
   static uint32_t object_key(char tag, uint32_t id, char (&out)[16]);      // the key of an object's blob: 't' its token, 's' its security descriptor
   void security_move(StringView from, StringView to);       // the node (and what is below it) was renamed
   void security_forget(StringView path);                    // the node is gone
@@ -426,7 +426,7 @@ class ObjectManager {
   PipeOp* pipe_find_op_locked(Pipe& p, uint32_t tag);
   void pipe_free_op_locked(Pipe& p, PipeOp& op);
   bool post_port_packet_locked(Pipe& p, uint32_t end, uint32_t status, uint32_t bytes);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 512;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 2048;
 
   struct Watch {
     bool used = false;

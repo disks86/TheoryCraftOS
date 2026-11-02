@@ -32,7 +32,7 @@ static const struct { char name[3]; DWORD value; } sddl_rights[] = {
 };
 #define SDDL_BIT_RIGHTS 17      /* the first entries: one right each (the mandatory label ones follow) */
 static const struct { char name[3]; BYTE value; } sddl_ace_flags[] = {
-    {"CI", CONTAINER_INHERIT_ACE}, {"OI", OBJECT_INHERIT_ACE}, {"NP", NO_PROPAGATE_INHERIT_ACE}, {"IO", INHERIT_ONLY_ACE}, {"ID", INHERITED_ACE}, {"SA", SUCCESSFUL_ACCESS_ACE_FLAG}, {"FA", FAILED_ACCESS_ACE_FLAG},
+    {"OI", OBJECT_INHERIT_ACE}, {"CI", CONTAINER_INHERIT_ACE}, {"NP", NO_PROPAGATE_INHERIT_ACE}, {"IO", INHERIT_ONLY_ACE}, {"ID", INHERITED_ACE}, {"SA", SUCCESSFUL_ACCESS_ACE_FLAG}, {"FA", FAILED_ACCESS_ACE_FLAG},
     {"TP", 0x40}, {"CR", 0x80},
 };
 static const struct { char name[3]; BYTE value; BOOL object; } sddl_ace_types[] = {

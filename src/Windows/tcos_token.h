@@ -39,6 +39,7 @@ enum {
   TCOS_OBJECT_SD_SET = 7,         /* (handle, required access, descriptor, length) */
   TCOS_TOKEN_SET_PROCESS = 8,     /* (process handle, token handle): the token a process runs as (a process that has not started, as CreateProcessAsUser makes it) */
   TCOS_TOKEN_CALLER = 9,          /* (&handle): the token the caller's access is decided by: the impersonation token of the thread, else the token of the process */
+  TCOS_THREAD_SD_SET = 12,        /* (handle of a thread, 0, descriptor, length): like TCOS_OBJECT_SD_SET for a thread that is named by a process handle (the first thread has the id of its process) */
   TCOS_FILE_PARENT_SD = 11        /* (handle of a file, buffer, capacity, &needed): the descriptor kept for the directory the file is in, needed 0 if none */
 };
 

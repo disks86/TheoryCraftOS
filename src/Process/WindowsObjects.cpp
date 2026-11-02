@@ -197,6 +197,7 @@ uint32_t mapped_access(DescriptorKind kind, uint32_t desired) {
 
 // The descriptor kept for an object limits what the calling thread may have of it: *desired becomes what it gets (MAXIMUM_ALLOWED asks for all the descriptor allows). 0, or why not.
 uint32_t restrict_by_descriptor(Process& p, uint32_t id, DescriptorKind kind, uint32_t* desired) {
+  if (const uint32_t gate = impersonation_gate(p)) return gate;
   ObjectManager* objects = system_objects();
   KindAccess a;
   if (!objects || !objects->allocator() || !kind_access(kind, &a)) return kSuccess;

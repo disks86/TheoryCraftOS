@@ -300,6 +300,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
 void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
   record.finished = true;
   record.exit_code = code;
+  token_thread_ended(record.id);      // (its impersonation token goes with it)
   if (record.region_size && p.address_space()) {
     // (the region is the stack, then the TEB and the TLS block: the stack of a thread that became a fiber may be switched to later, so only what follows it goes)
     const bool keep = record.keep_stack && record.teb > record.region_base && record.teb - record.region_base < record.region_size;
