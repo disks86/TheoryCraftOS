@@ -90,11 +90,15 @@ mtrap:
   call puthex
   csrr a0, mstatus
   call puthex
+  csrr a0, 0x34B                   # mtval2
+  call puthex
   csrr a1, mcause
   bltz a1, 20f                     # an interrupt: silence the source, do not skip anything
   li t0, 8
   beq a1, t0, 5f
   li t0, 9
+  beq a1, t0, 5f
+  li t0, 10
   bne a1, t0, 6f
 5:
   la t0, resume_hook               # an ecall from a lower mode returns to the machine-mode code that entered it
@@ -184,7 +188,7 @@ bad_vector:
 
 # ---- the supervisor-mode trap handler (traps delegated to it) -----------------------------------------------------------------------------------
 .balign 4
-strap:
+.macro STRAP_BODY extras
   csrrw sp, sscratch, sp
   addi sp, sp, -96
   sd ra, 0(sp)
@@ -209,6 +213,12 @@ strap:
   call puthex
   csrr a0, sstatus
   call puthex
+  .if \extras
+  csrr a0, 0x643                  # htval
+  call puthex
+  csrr a0, 0x600                  # hstatus
+  call puthex
+  .endif
   csrr a1, scause
   bltz a1, 20f
   li t0, 8
@@ -287,6 +297,13 @@ strap:
   addi sp, sp, 96
   csrrw sp, sscratch, sp
   sret
+.endm
+.balign 4
+strap:
+  STRAP_BODY 1
+.balign 4
+vstrap:
+  STRAP_BODY 0
 
 # ---- leaving machine mode ------------------------------------------------------------------------------------------------------------------------
 .macro ENTER target, mode
@@ -326,6 +343,31 @@ strap:
   li t2, \n
   bltu t1, t2, 1b
 .endm
+
+.macro ENTERG target, mode          # enter the guest (V = 1) at a label, in VS (1) or VU (0) mode: through HS mode, whose sret takes hstatus.SPV (qemu cannot set mstatus.MPV by a CSR write)
+  la t0, \target
+  la t1, g_target
+  sd t0, 0(t1)
+  li t0, \mode
+  la t1, g_mode
+  sd t0, 0(t1)
+  ENTER hs_hop, 1
+.endm
+
+hs_hop:
+  la t0, g_target
+  ld t0, 0(t0)
+  csrw sepc, t0
+  la t1, g_mode
+  ld t1, 0(t1)
+  li t2, 0x100
+  csrc sstatus, t2
+  beqz t1, 1f
+  csrs sstatus, t2
+1:
+  li t2, 0x80
+  csrs 0x600, t2                  # hstatus.SPV
+  sret
 
 .macro ENTERV target, mode          # like ENTER, for a target given as a number (a virtual address)
   la t0, 1f
@@ -384,6 +426,8 @@ resume_hook: .dword 0
 fault_hook: .dword 0
 s_hook: .dword 0
 irq_count: .dword 0
+g_target: .dword 0
+g_mode: .dword 0
 s_final: .dword 0
 satp_value: .dword 0
 .balign 16

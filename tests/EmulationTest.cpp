@@ -1563,6 +1563,13 @@ static void test_riscv64_system_random() {
     RiscV64Cpu& cpu = machine.cpu();
     RiscV64Cpu::System& sys = cpu.system_state();
     sys.priv = uint8_t((next() % 3) == 0 ? 0 : (next() % 2) ? 1 : 3);
+    sys.v = sys.priv != 3 && (next() % 2);
+    sys.hedeleg = next() & 0xB1FF;
+    sys.hideleg = next() & 0x444;
+    sys.hstatus |= next() & 0x7003C0;
+    sys.vsatp = (next() % 2) ? (uint64_t{8 + next() % 3} << 60) | ((RiscV64Machine::kRamBase >> 12) + (next() % 600)) : 0;
+    sys.hgatp = (next() % 2) ? (uint64_t{8 + next() % 3} << 60) | (((RiscV64Machine::kRamBase >> 12) + (next() % 600)) & ~uint64_t{3}) : 0;
+    sys.vstvec = RiscV64Machine::kRamBase + 0xE00;
     sys.satp = (next() % 2) ? (uint64_t{8 + next() % 3} << 60) | ((RiscV64Machine::kRamBase >> 12) + (next() % 600)) : 0;
     sys.mstatus |= next() & 0x6000;
     sys.medeleg = next() & 0xB3FF;
@@ -1935,6 +1942,11 @@ int main(int argc, char** argv) {
   if (argc >= 33) {
     test_riscv64_system(argv[29], argv[30], "Svpbmt, Svnapot, Svadu");
     test_riscv64_system(argv[31], argv[32], "PLIC");
+  }
+  if (argc >= 39) {
+    test_riscv64_system(argv[33], argv[34], "hypervisor, traps and CSRs");
+    test_riscv64_system(argv[35], argv[36], "hypervisor, two-stage translation");
+    test_riscv64_system(argv[37], argv[38], "hypervisor, wide tables, atomics, clock");
   }
   if (argc >= 13) test_avx_program(argv[11], argv[12]);      // (the SSE3/SSSE3/SSE4 program: the same kind of check)
   test_threads_without_support();

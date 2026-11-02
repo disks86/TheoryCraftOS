@@ -733,6 +733,7 @@ RiscV64Cpu::Step RiscV64Cpu::system(uint32_t insn, uint32_t) {
     if (insn == 0x00D00073 || insn == 0x01D00073) return Step::Ok;      // Zawrs: wrs.nto, wrs.sto (the reservation set is never lost, so they return at once)
     return undefined();
   }
+  if (funct3 == 4 && bus_ && (insn >> 31) == 0) return sys_hlv(insn);
   if (funct3 == 4) {      // Zimop: mop.r.n and mop.rr.n write zero to rd (no instruction redefines them here)
     const bool mop_r = (insn >> 31) == 1 && ((insn >> 28) & 3) == 0 && ((insn >> 22) & 0xF) == 7 && !((insn >> 25) & 1);
     const bool mop_rr = (insn >> 31) == 1 && ((insn >> 28) & 3) == 0 && ((insn >> 25) & 1);
