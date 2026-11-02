@@ -58,6 +58,9 @@ bool caller_privilege_enabled(Process& p, uint32_t low);
 // A thread that impersonates at a level below SecurityImpersonation cannot open anything: STATUS_BAD_IMPERSONATION_LEVEL for it, 0 for any other.
 uint32_t impersonation_gate(Process& p);
 
+// Does the token the calling thread acts as lack something that another of its user has (a group that only denies, restricting SIDs)?
+bool caller_reduced(Process& p);
+
 // Does the calling thread impersonate a token?
 bool caller_is_impersonating(Process& p);
 

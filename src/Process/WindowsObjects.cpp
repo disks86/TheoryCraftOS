@@ -562,11 +562,11 @@ uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t targ
   op.suspended = (options & 1) != 0;
   const uint32_t status = p.runtime()->remote_operation(pid, op);
   if (status != kSuccess) return status;
-  if (!(options & 2) && caller_is_impersonating(p) && is_object_kind(DescriptorKind(op.type))) {      // a thread that impersonates is held to the descriptor of the object
-    uint32_t wanted = uint32_t(desired_access);
-    if (const uint32_t refused = restrict_by_descriptor(p, uint32_t(op.argument), DescriptorKind(op.type), &wanted)) {
+  if (!(options & 2) && caller_reduced(p) && is_object_kind(DescriptorKind(op.type))) {      // a thread that impersonates is held to the descriptor of the object
+    KindAccess a;
+    if (kind_access(DescriptorKind(op.type), &a) && (mapped_access(DescriptorKind(op.type), uint32_t(desired_access)) & a.valid & op.protect)) {
       if (ObjectManager* objects = system_objects()) objects->release(uint32_t(op.argument));
-      return refused;
+      return kAccessDeniedStatus;
     }
   }
   const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~mapped_access(DescriptorKind(op.type), uint32_t(desired_access)));
@@ -596,9 +596,9 @@ uint32_t duplicate_between_others(Process& p, const SyscallRequest& r, uint64_t 
   if (const uint32_t status = p.runtime()->remote_operation(source_pid, take)) return status;
   ObjectManager* objects = system_objects();
   if (!objects || !is_object_kind(DescriptorKind(take.type))) return kNotImplemented;
-  if (!(options & 2) && caller_is_impersonating(p)) {
-    uint32_t wanted = uint32_t(desired_access);
-    if (const uint32_t refused = restrict_by_descriptor(p, uint32_t(take.argument), DescriptorKind(take.type), &wanted)) { objects->release(uint32_t(take.argument)); return refused; }
+  if (!(options & 2) && caller_is_impersonating(p) && caller_reduced(p)) {
+    KindAccess a;
+    if (kind_access(DescriptorKind(take.type), &a) && (mapped_access(DescriptorKind(take.type), uint32_t(desired_access)) & a.valid & take.protect)) { objects->release(uint32_t(take.argument)); return kAccessDeniedStatus; }
   }
   IProcessRuntime::RemoteOp put;
   put.kind = IProcessRuntime::RemoteOp::Duplicate;
@@ -631,9 +631,12 @@ uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target
   op.type = uint32_t(kind);
   op.argument = id;
   op.protect = (options & 2) ? original : (original | ~mapped_access(kind, uint32_t(desired_access)));
-  if (!(options & 2)) {      // the token of the program that gets the copy decides whether it may have what it asks for
-    uint32_t granted = 0;
-    if (const uint32_t refused = object_access_for_process(pid, id, kind, uint32_t(desired_access), &granted)) return refused;
+  if (!(options & 2)) {      // a program that runs under a restricted token only gets the rights the handle holds
+    ByteBuffer blob(*objects->allocator());
+    security::TokenView token;
+    KindAccess a;
+    if (process_token_blob(pid, blob) && token.parse(blob.view()) && token.is_reduced() && kind_access(kind, &a) &&
+        (mapped_access(kind, uint32_t(desired_access)) & a.valid & original)) return kAccessDeniedStatus;
   }
   op.suspended = (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0;
   objects->add_ref(id);
@@ -700,7 +703,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
     return kSuccess;
   }
-  if (!(options & 2) && caller_is_impersonating(p)) {      // a thread that impersonates may not copy a handle with more rights than the handle holds
+  if (!(options & 2) && caller_reduced(p)) {      // a thread that impersonates may not copy a handle with more rights than the handle holds
     KindAccess a;
     if (kind_access(p.files().kind(slot), &a) && (mapped_access(p.files().kind(slot), uint32_t(desired_access)) & a.valid & p.files().denied_access(slot))) return kAccessDeniedStatus;
   }

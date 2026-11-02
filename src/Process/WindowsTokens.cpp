@@ -341,6 +341,14 @@ uint32_t impersonation_gate(Process& p) {
   return token.is_impersonation() && token.level() < 2 ? security::kStatusBadImpersonationLevel : kSuccess;
 }
 
+bool caller_reduced(Process& p) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !objects->allocator()) return false;
+  ByteBuffer blob(*objects->allocator());
+  security::TokenView token;
+  return caller_token_blob(p, blob) && token.parse(blob.view()) && token.is_reduced();
+}
+
 bool caller_is_impersonating(Process& p) { return owner_object(g_thread_tokens, p.runtime() ? p.runtime()->current_thread_id() : p.id()) != 0; }
 
 bool caller_may(Process& p, ConstByteView descriptor, uint32_t desired, const security::GenericMapping& mapping, uint32_t* granted, uint32_t* status, bool backup_intent) {

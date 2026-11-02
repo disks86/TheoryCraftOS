@@ -60,6 +60,8 @@ class TokenView {
   // Does the token's identity include the SID: the user, or a group that is enabled (or, `deny`, one that only denies)?
   bool has_sid(ConstByteView sid, bool deny, bool restricted_list) const;
   ConstByteView default_dacl() const { return default_dacl_; }
+  // Was the token made less than another (a group that only denies, or restricting SIDs)?
+  bool is_reduced() const;
 
  private:
   ConstByteView blob_, user_, owner_, primary_group_, default_dacl_;

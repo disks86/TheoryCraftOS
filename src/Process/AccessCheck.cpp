@@ -170,6 +170,15 @@ bool TokenView::has_privilege(uint32_t low, bool* enabled) const {
   }
   return false;
 }
+bool TokenView::is_reduced() const {
+  if (restricted_count_ != 0) return true;
+  for (uint32_t i = 0; i < group_count_; ++i) {
+    uint32_t attributes;
+    if (!group(i, &attributes).empty() && (attributes & kGroupUseForDenyOnly)) return true;
+  }
+  return (user_attributes_ & kGroupUseForDenyOnly) != 0;
+}
+
 uint32_t TokenView::integrity_level() const {
   for (uint32_t i = 0; i < group_count_; ++i) {
     uint32_t attributes;

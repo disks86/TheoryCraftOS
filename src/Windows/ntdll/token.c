@@ -1188,6 +1188,13 @@ static NTSTATUS NtQuerySecurityObject_real(HANDLE handle, SECURITY_INFORMATION i
                 ACL *acl = (ACL *)(out + sizeof(*o));
                 ULONG size;
                 NtTcosToken(TCOS_OBJECT_SD_GET, (ULONG_PTR)handle, 0, 0, 0, (ULONG_PTR)&stored);
+                if (stored) {      /* a descriptor was given: only a label (an SACL) in it makes this one the label of the user's */
+                    BYTE *kept = heap_new(stored);
+                    ULONG got = stored;
+                    stored = 0;
+                    if (kept && !NtTcosToken(TCOS_OBJECT_SD_GET, (ULONG_PTR)handle, 0, (ULONG_PTR)kept, got, (ULONG_PTR)&got)) stored = (((SECURITY_DESCRIPTOR_RELATIVE *)kept)->Control & SE_SACL_PRESENT) ? 1 : 0;
+                    heap_drop(kept);
+                }
                 memset(out, 0, sizeof(out));
                 RtlCreateAcl(acl, 8 + 8 + 8 + MAX_SID_BYTES, ACL_REVISION_DS);
                 { static const BYTE medium[12] = {1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x20, 0, 0}; RtlAddMandatoryAce(acl, ACL_REVISION_DS, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, SYSTEM_MANDATORY_LABEL_ACE_TYPE, (PSID)medium); }
