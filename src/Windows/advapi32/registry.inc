@@ -82,6 +82,8 @@ static HANDLE handle_of(HKEY key) {
   return (HANDLE)key;
 }
 
+HANDLE ADVAPI_KeyHandle(HKEY key) { return handle_of(key); }      /* (security.c: the handle behind a key, predefined or not) */
+
 static LSTATUS open_or_create(HKEY key, LPCWSTR sub, BOOL create, DWORD options, PHKEY result, LPDWORD disposition) {
   if (!result) return ERROR_INVALID_PARAMETER;
   HANDLE root = handle_of(key);
@@ -124,8 +126,7 @@ EXPORT LSTATUS WINAPI RegOpenKeyW(HKEY key, LPCWSTR sub, PHKEY result) { return 
 EXPORT LSTATUS WINAPI RegCreateKeyExW(HKEY key, LPCWSTR sub, DWORD reserved, LPWSTR class_name, DWORD options, REGSAM access, LPSECURITY_ATTRIBUTES sa, PHKEY result,
                                       LPDWORD disposition) {
   (void)reserved; (void)class_name; (void)access; (void)sa;
-  if (!sub) return ERROR_INVALID_PARAMETER;
-  return open_or_create(key, sub, TRUE, options, result, disposition);
+  return open_or_create(key, sub ? sub : L"", TRUE, options, result, disposition);
 }
 EXPORT LSTATUS WINAPI RegCreateKeyW(HKEY key, LPCWSTR sub, PHKEY result) { return RegCreateKeyExW(key, sub, 0, NULL, 0, 0, NULL, result, NULL); }
 EXPORT LSTATUS WINAPI RegCloseKey(HKEY key) {
@@ -596,3 +597,21 @@ EXPORT LSTATUS WINAPI RegSetKeyValueA(HKEY key, LPCSTR sub, LPCSTR name, DWORD t
   return status;
 }
 
+
+/* The security of a key: its descriptor, as that of any object. */
+IMPORT NTSTATUS NTAPI NtQuerySecurityObject(HANDLE, DWORD, PVOID, ULONG, PULONG);
+IMPORT NTSTATUS NTAPI NtSetSecurityObject(HANDLE, DWORD, PVOID);
+EXPORT LSTATUS WINAPI RegGetKeySecurity(HKEY key, DWORD info, PVOID sd, LPDWORD length) {
+  HANDLE h = handle_of(key);
+  if (!h) return ERROR_INVALID_HANDLE;
+  if (!length) return ERROR_INVALID_PARAMETER;
+  ULONG needed = 0;
+  const NTSTATUS status = NtQuerySecurityObject(h, info, sd, *length, &needed);
+  *length = needed;
+  return nt_error(status);
+}
+EXPORT LSTATUS WINAPI RegSetKeySecurity(HKEY key, DWORD info, PVOID sd) {
+  HANDLE h = handle_of(key);
+  if (!h) return ERROR_INVALID_HANDLE;
+  return nt_error(NtSetSecurityObject(h, info, sd));
+}

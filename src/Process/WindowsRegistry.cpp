@@ -19,6 +19,7 @@
 #include "Process/Objects.hpp"
 #include "Process/RegistryTree.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Utility/Utf16.hpp"
 #include <new>
 
@@ -151,8 +152,24 @@ uint32_t nt_create_key(Process& p, const SyscallRequest& r) {
   if (status == kSuccess && disposition_at != 0 && !p.write_user_u32(disposition_at, disposition)) return kAccessViolation;
   return status;
 }
-uint32_t nt_open_key(Process& p, const SyscallRequest& r) { return open_or_create(p, r, false, nullptr); }
-uint32_t nt_open_key_ex(Process& p, const SyscallRequest& r) { return open_or_create(p, r, false, nullptr); }
+// A key that was opened is held to its descriptor (if it has one): the rights asked for must be allowed to the calling thread; if not, the handle is closed again.
+uint32_t open_key_checked(Process& p, const SyscallRequest& r) {
+  uint32_t status = open_or_create(p, r, false, nullptr);
+  uint64_t handle = 0;
+  if (status != kSuccess || !p.read_user_u64(r.args[0], &handle) || handle == 0) return status;
+  const uint64_t slot = handle / 4 - 1;
+  uint32_t granted = 0;
+  static const security::GenericMapping kKeyMapping = {0x20019, 0x20006, 0x20019, 0xF003F};
+  if (const uint32_t refused = open_with_descriptor(p, 'k', p.files().token(slot), uint32_t(r.args[1]), kKeyMapping, &granted)) {
+    p.close_descriptor(slot);
+    p.write_user_u64(r.args[0], 0);
+    return refused;
+  }
+  p.files().set_denied_access(slot, ~granted);
+  return kSuccess;
+}
+uint32_t nt_open_key(Process& p, const SyscallRequest& r) { return open_key_checked(p, r); }
+uint32_t nt_open_key_ex(Process& p, const SyscallRequest& r) { return open_key_checked(p, r); }
 
 uint32_t nt_query_key(Process& p, const SyscallRequest& r) {
   // NtQueryKey(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG Length, PULONG ResultLength)
@@ -346,9 +363,17 @@ uint32_t nt_set_value_key(Process& p, const SyscallRequest& r) {
 uint32_t nt_delete_key(Process& p, const SyscallRequest& r) {
   uint32_t id = 0;
   if (!key_of(p, r.args[0], &id)) return kInvalidHandle;
-  Guard guard;
-  RegistryTree* t = tree(p);
-  return t ? t->delete_key(id) : kNoMemory;
+  uint32_t status;
+  {
+    Guard guard;
+    RegistryTree* t = tree(p);
+    status = t ? t->delete_key(id) : kNoMemory;
+  }
+  if (status == kSuccess) if (ObjectManager* objects = system_objects()) {      // the descriptor kept for the key goes with it
+    char key[16];
+    objects->security_forget(StringView(key, ObjectManager::object_key('k', id, key)));
+  }
+  return status;
 }
 
 uint32_t nt_delete_value_key(Process& p, const SyscallRequest& r) {

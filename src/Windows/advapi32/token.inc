@@ -257,8 +257,7 @@ EXP BOOL WINAPI AccessCheckByTypeResultList(PSECURITY_DESCRIPTOR sd, PSID princi
 
 EXP BOOL WINAPI GetKernelObjectSecurity(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR sd, DWORD length, LPDWORD needed)
 {
-    DWORD dummy;
-    NTSTATUS status = NtQuerySecurityObject(handle, info, sd, length, needed ? needed : &dummy);
+    NTSTATUS status = NtQuerySecurityObject(handle, info, sd, length, needed);
     return status ? nt_fail(status) : TRUE;
 }
 EXP BOOL WINAPI SetKernelObjectSecurity(HANDLE handle, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR sd)
@@ -347,6 +346,16 @@ EXP BOOL WINAPI ConvertToAutoInheritPrivateObjectSecurity(PSECURITY_DESCRIPTOR p
 #include "../tcos_token.h"
 NTSTATUS NTAPI NtTcosToken(ULONG op, ULONG_PTR a, ULONG_PTR b, ULONG_PTR c, ULONG_PTR d, ULONG_PTR e);
 
+/* The token must be a real handle with the right to be assigned and to be queried. */
+static BOOL check_process_token(HANDLE token)
+{
+    ULONG basic[14];
+    if ((LONG_PTR)token >= -6 && (LONG_PTR)token <= -4) return win_fail(ERROR_INVALID_HANDLE);
+    if (NtQueryObject(token, 0, basic, sizeof(basic), NULL)) return win_fail(ERROR_INVALID_HANDLE);
+    if ((basic[1] & (TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY)) != (TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY)) return win_fail(ERROR_ACCESS_DENIED);
+    return TRUE;
+}
+
 /* The process is made suspended, given the token, and runs on (or stays suspended if it was asked to). */
 static BOOL give_process_token(HANDLE token, DWORD flags, PROCESS_INFORMATION *pi)
 {
@@ -368,6 +377,7 @@ EXP BOOL WINAPI CreateProcessAsUserW(HANDLE token, LPCWSTR application, LPWSTR c
     PROCESS_INFORMATION local;
     if (!information) information = &local;
     if (!token) return CreateProcessW(application, command, process_attributes, thread_attributes, inherit, flags, environment, directory, startup, information);
+    if (!check_process_token(token)) return FALSE;
     if (!CreateProcessW(application, command, process_attributes, thread_attributes, inherit, flags | CREATE_SUSPENDED, environment, directory, startup, information)) return FALSE;
     return give_process_token(token, flags, information);
 }
@@ -377,6 +387,28 @@ EXP BOOL WINAPI CreateProcessAsUserA(HANDLE token, LPCSTR application, LPSTR com
     PROCESS_INFORMATION local;
     if (!information) information = &local;
     if (!token) return CreateProcessA(application, command, process_attributes, thread_attributes, inherit, flags, environment, directory, startup, information);
+    if (!check_process_token(token)) return FALSE;
     if (!CreateProcessA(application, command, process_attributes, thread_attributes, inherit, flags | CREATE_SUSPENDED, environment, directory, startup, information)) return FALSE;
     return give_process_token(token, flags, information);
+}
+
+/* ImpersonateNamedPipeClient: the server thread takes on the identity of the client of the pipe. Every program of this system runs as the one user, so that identity is the token of
+ * this process (the clients' own tokens are not passed along the connection); the call is refused for what is not a pipe that has a client. */
+EXP BOOL WINAPI ImpersonateNamedPipeClient(HANDLE pipe)
+{
+    DWORD available;
+    HANDLE process_token, copy;
+    BOOL ret;
+    if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_INVALID_HANDLE) return FALSE;
+        if (error != ERROR_BROKEN_PIPE) return FALSE;
+    }
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &process_token)) return FALSE;
+    ret = DuplicateTokenEx(process_token, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenImpersonation, &copy);
+    CloseHandle(process_token);
+    if (!ret) return FALSE;
+    ret = set_thread_token(GetCurrentThread(), copy);
+    CloseHandle(copy);
+    return ret;
 }

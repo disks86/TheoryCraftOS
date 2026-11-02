@@ -639,9 +639,9 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
     p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
     return kSuccess;
   }
-  if (!(options & 2) && is_object_kind(p.files().kind(slot)) && caller_is_impersonating(p)) {      // a thread that impersonates is held to the descriptor of the object it copies a handle of
-    uint32_t wanted = uint32_t(desired_access);
-    if (const uint32_t refused = restrict_by_descriptor(p, uint32_t(p.files().token(slot)), p.files().kind(slot), &wanted)) return refused;
+  if (!(options & 2) && caller_is_impersonating(p)) {      // a thread that impersonates may not copy a handle with more rights than the handle holds
+    KindAccess a;
+    if (kind_access(p.files().kind(slot), &a) && (mapped_access(p.files().kind(slot), uint32_t(desired_access)) & a.valid & p.files().denied_access(slot))) return kAccessDeniedStatus;
   }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;

@@ -580,6 +580,7 @@ __declspec(dllexport) NTSTATUS NTAPI NtQueryInformationToken(HANDLE token, TOKEN
         SECURITY_QUALITY_OF_SERVICE qos = { sizeof(qos), SecurityIdentification, SECURITY_STATIC_TRACKING, FALSE };
         OBJECT_ATTRIBUTES attr;
         HANDLE linked = NULL;
+        BOOL has_link = t->elevation_type != 1;      /* (a token that was not split into two has no other) */
         InitializeObjectAttributes(&attr, NULL, 0, NULL, NULL);
         attr.SecurityQualityOfService = &qos;
         heap_drop(t);
@@ -587,7 +588,23 @@ __declspec(dllexport) NTSTATUS NTAPI NtQueryInformationToken(HANDLE token, TOKEN
         *returned = sizeof(HANDLE);
         if (length < sizeof(HANDLE)) return STATUS_BUFFER_TOO_SMALL_;
         if (!info) return STATUS_ACCESS_VIOLATION_;
-        class_status = NtDuplicateToken(token, TOKEN_ALL, &attr, FALSE, TokenImpersonation, &linked);
+        if (!has_link) { *(HANDLE *)info = NULL; return STATUS_SUCCESS; }
+        {      /* the other token of the pair: a copy of this one that is elevated (Full) at high integrity, to be looked at (identification level) */
+            TokenData *e = heap_new(sizeof(*e));
+            TSid *il;
+            class_status = e ? read_token(token, TOKEN_QUERY, e) : STATUS_NO_MEMORY_;
+            if (!class_status) {
+                static const BYTE high[12] = {1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x30, 0, 0};
+                il = (TSid *)integrity_group(e);
+                if (il) memcpy(il->sid, high, sizeof(high));
+                e->type = TokenImpersonation;
+                e->level = SecurityIdentification;
+                e->elevation_type = 2;      /* TokenElevationTypeFull */
+                e->token_id = next_luid();
+                class_status = create_token(e, TOKEN_ALL, FALSE, &linked);
+            }
+            heap_drop(e);
+        }
         if (!class_status) *(HANDLE *)info = linked;
         return class_status;
     }

@@ -21,6 +21,7 @@
 #include "security.h"
 #include <wchar.h>
 
+HANDLE ADVAPI_KeyHandle(HKEY key);
 static DWORD trustee_to_sid(DWORD nDestinationSidLength, PSID pDestinationSid, PTRUSTEEW pTrustee);
 
 typedef struct _MAX_SID
@@ -1438,7 +1439,7 @@ __declspec(dllexport) DWORD WINAPI GetSecurityInfo( HANDLE handle, SE_OBJECT_TYP
     BOOL present, defaulted;
     HKEY key = NULL;
 
-    if (!handle)
+    if (!handle && type != SE_WINDOW_OBJECT)
         return ERROR_INVALID_HANDLE;
 
     /* A NULL descriptor is allowed if any one of the other pointers is not NULL */
@@ -1469,7 +1470,19 @@ __declspec(dllexport) DWORD WINAPI GetSecurityInfo( HANDLE handle, SE_OBJECT_TYP
         break;
 
     case SE_WINDOW_OBJECT:
-        return ERROR_CALL_NOT_IMPLEMENTED;
+    {
+        /* a desktop or a window station has no kernel object here: it has the default descriptor of its maker */
+        GENERIC_MAPPING mapping = { 0x20001, 0x20002, 0x20000, 0xf037f };
+        PSECURITY_DESCRIPTOR made = NULL;
+        NTSTATUS made_status = RtlNewSecurityObjectEx( NULL, NULL, &made, NULL, FALSE, 0, NULL, &mapping );
+        if (made_status) return RtlNtStatusToDosError( made_status );
+        size = RtlLengthSecurityDescriptor( made );
+        sd = LocalAlloc( 0, size );
+        if (sd) memcpy( sd, made, size );
+        RtlFreeHeap( RtlProcessHeap(), 0, made );
+        if (!sd) return ERROR_NOT_ENOUGH_MEMORY;
+        break;
+    }
 
     case SE_KERNEL_OBJECT:
     case SE_FILE_OBJECT:
@@ -1487,7 +1500,9 @@ __declspec(dllexport) DWORD WINAPI GetSecurityInfo( HANDLE handle, SE_OBJECT_TYP
             if ((ret = RegCreateKeyExW( handle, NULL, 0, NULL, 0, access, NULL, &key, NULL )))
                 return ret;
 
-            handle = key;
+            handle = ADVAPI_KeyHandle( key );
+            if (!handle) return ERROR_INVALID_HANDLE;
+            key = NULL;
         }
 
         status = NtQuerySecurityObject( handle, SecurityInfo, NULL, 0, &size );

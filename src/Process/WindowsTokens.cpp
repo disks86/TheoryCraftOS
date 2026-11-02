@@ -72,7 +72,7 @@ bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
   struct G { SidBuf sid; uint32_t attrs; };
   const G groups[] = {
       {make_sid(1, {0}), 7}, {make_sid(2, {0}), 7}, {make_sid(2, {1}), 7}, {make_sid(5, {32, 544}), 0xF}, {make_sid(5, {32, 545}), 7}, {make_sid(5, {4}), 7}, {make_sid(5, {11}), 7},
-      {make_sid(5, {15}), 7}, {make_sid(5, {64, 10}), 7}, {make_sid(5, {5, 0, 0x3E7}), 0xC0000007u}, {make_sid(16, {12288}), 0x60},
+      {make_sid(5, {15}), 7}, {make_sid(5, {64, 10}), 7}, {make_sid(5, {5, 0, 0x3E7}), 0xC0000007u}, {make_sid(16, {8192}), 0x60},
   };
   struct P { uint32_t low, attrs; };
   // The privileges a standard user's token holds, all disabled to start with (what the program enables, it asks for).
@@ -90,7 +90,7 @@ bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
   h.modified_id = token_id;
   h.expiration = 0x7FFFFFFFFFFFFFFFull;
   h.session = 1;
-  h.elevation_type = 1;
+  h.elevation_type = 3;      // limited: medium integrity, with an elevated token linked to it
   h.flags = TCOS_TOKEN_FLAG_VIRT_ALLOWED;
   h.mandatory_policy = 1;
   for (int i = 0; i < 8; ++i) h.source_name[i] = uint8_t("User32  "[i]);
