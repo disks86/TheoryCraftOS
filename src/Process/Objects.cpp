@@ -91,6 +91,7 @@ ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, b
     if (kind == ObjectKind::Event) o.signaled = initial_state;
     if (kind == ObjectKind::Mutex && initial_state) { o.owner = owner; o.recursion = 1; }
     if (kind == ObjectKind::Semaphore) { o.count = initial; o.maximum = maximum; }
+    if (kind == ObjectKind::Reserve) o.maximum = maximum;      // (the type: 0 a user APC, 1 an I/O completion)
     if (kind == ObjectKind::Job) {
       if (!jobs_ && allocator_) {
         void* memory = allocator_->allocate(sizeof(Job) * kJobMaxJobs);
@@ -1787,6 +1788,22 @@ uint32_t ObjectManager::set_timer(uint32_t id, uint64_t due_ns, uint64_t period_
   o->apc_pending = false;
   sync_.notify_all();      // whoever waits for it looks at the new time
   return kSuccess;
+}
+
+// A reserve object (NtAllocateReserveObject) holds the memory of one queued APC: taken for a user APC reserve (0: it is free, kSuccess; 0xC00000F0 busy; 0xC0000024 wrong type)
+// and given back when the APC has run.
+uint32_t ObjectManager::reserve_take(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Reserve || o->maximum != 0) return 0xC0000024u;
+  if (o->signaled) return 0xC00000F0u;      // STATUS_INVALID_PARAMETER_2
+  o->signaled = true;
+  return kSuccess;
+}
+void ObjectManager::reserve_give_back(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (o && o->kind == ObjectKind::Reserve) o->signaled = false;
 }
 
 uint32_t ObjectManager::cancel_timer(uint32_t id, bool* was_signaled) {

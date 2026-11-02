@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsObjects.hpp"
 #include "Process/WindowsTokens.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
@@ -271,6 +272,11 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   }
   record->teb = thread.teb;
   record->start_address = start;
+  record->hidden_from_debugger = (flags & 4) != 0;      // THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER
+  if (flags & 2) {      // THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH: TEB.SameTebFlags.SkipThreadAttach (ntdll then neither tells the libraries about the thread nor gives it thread-local storage)
+    const uint8_t same_teb_flags[2] = {0x08, 0x00};
+    p.write_user(thread.teb + 0x17EE, ConstByteView(same_teb_flags, 2));
+  }
   record->region_base = thread.region_base;
   record->region_size = thread.region_size;
   ThreadStart ts;
@@ -571,6 +577,31 @@ uint32_t nt_queue_apc_thread(Process& p, const SyscallRequest& r) {
   return kSuccess;
 }
 
+uint32_t nt_queue_apc_thread_ex(Process& p, const SyscallRequest& r, bool with_flags) {
+  uint64_t routine = 0, a1 = 0, a2 = 0, a3 = 0, flags = 0;
+  const uint32_t first = with_flags ? 3 : 2;
+  if (with_flags && !windowsabi::argument(p, r, 2, &flags)) return kAccessViolation;
+  if (!windowsabi::argument(p, r, first, &routine) || !windowsabi::argument(p, r, first + 1, &a1) || !windowsabi::argument(p, r, first + 2, &a2) || !windowsabi::argument(p, r, first + 3, &a3))
+    return kAccessViolation;
+  if (flags & ~uint64_t{1}) return 0xC00000EFu;      // STATUS_INVALID_PARAMETER_3
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  const uint64_t reserve_handle = r.args[1];
+  uint32_t reserve = 0;
+  if (reserve_handle > 1) {      // (0 and 1, QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC, are not handles; 0x10000, QUEUE_USER_APC_CALLBACK_DATA_CONTEXT, is not one that can be used here)
+    if (reserve_handle == 0x10000) return kInvalidHandle;
+    if (reserve_handle == ~uint64_t{0} || reserve_handle == ~uint64_t{1}) return 0xC0000024u;      // (the pseudo handles of the process and the thread)
+    if (const uint32_t status = reserve_take_handle(p, reserve_handle, &reserve)) return status;
+  }
+  if (record->finished) { if (reserve) reserve_give_back(reserve); return 0xC0000001u; }
+  Process::ThreadRecord::Apc apc{routine, a1, a2, a3};
+  apc.reserve = reserve;
+  if (!Process::queue_apc(*record, apc)) { if (reserve) reserve_give_back(reserve); return kInsufficientResources; }
+  if (p.runtime()) p.runtime()->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();
+  return kSuccess;
+}
+
 // NtDequeueApc(PVOID Out): takes the oldest APC queued for the calling thread: four 64-bit numbers (routine, argument 1, 2, 3). STATUS_NO_MORE_ENTRIES if there is none. ntdll
 // builds NtTestAlert and the delivery after an alertable wait on it.
 uint32_t nt_dequeue_apc(Process& p, const SyscallRequest& r) {
@@ -585,6 +616,7 @@ uint32_t nt_dequeue_apc(Process& p, const SyscallRequest& r) {
     Process::queue_apc(*record, apc);      // (it stays queued)
     return kAccessViolation;
   }
+  if (apc.reserve) reserve_give_back(apc.reserve);
   return kSuccess;
 }
 
@@ -704,6 +736,7 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
     }
     case 9: put(0, record->start_address, 8); size = 8; break;      // ThreadQuerySetWin32StartAddress
     case 12: put(0, p.live_threads() <= 1 ? 1 : 0, 4); size = 4; break;      // ThreadAmILastThread
+    case 17: put(0, record->hidden_from_debugger ? 1 : 0, 1); size = 1; break;      // ThreadHideFromDebugger
     case 35: put(0, uint32_t(record->suspend_count), 4); size = 4; break;      // ThreadSuspendCount
     default: return kInvalidInfoClass;
   }
@@ -786,7 +819,7 @@ uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
       if (p.runtime() && (mask & ~p.runtime()->affinity(0))) p.runtime()->set_affinity(~uint64_t{0}, ~uint64_t{0});      // (a mask the process was not allowed: the process's own goes back to every processor)
       return p.runtime() && p.runtime()->set_affinity(record->id, mask) ? kSuccess : kInvalidParameter;
     }
-    case 17: return length == 0 ? kSuccess : kInfoLengthMismatch;
+    case 17: if (length != 0) return kInfoLengthMismatch; record->hidden_from_debugger = true; return kSuccess;
     case 0x80:     // this OS's own class: the thread's stack stays when the thread ends (the thread became a fiber, which another one may switch to after that)
       if (length != 0) return kInfoLengthMismatch;
       record->keep_stack = true;

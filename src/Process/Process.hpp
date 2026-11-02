@@ -285,7 +285,8 @@ class Process {
     uint32_t exit_code = 259;                         // STILL_ACTIVE
     uint64_t extra_tls[kMaxTlsModules] = {};          // blocks of libraries loaded after the thread began: [index] = base (each is one region of extra_tls_size[index] bytes)
     uint64_t extra_tls_size[kMaxTlsModules] = {};
-    struct Apc { uint64_t routine = 0, a1 = 0, a2 = 0, a3 = 0; };      // an asynchronous procedure call waiting for the thread (QueueUserAPC, a timer, ReadFileEx)
+    struct Apc { uint64_t routine = 0, a1 = 0, a2 = 0, a3 = 0; uint32_t reserve = 0; };      // (reserve: the reserve object whose memory it uses, given back when it runs)
+    // An asynchronous procedure call waiting for the thread (QueueUserAPC, a timer, ReadFileEx)
     static constexpr uint32_t kMaxApcs = 32;
     Apc apcs[kMaxApcs];
     uint32_t apc_count = 0;
@@ -295,6 +296,7 @@ class Process {
     uint16_t description[kMaxDescriptionChars] = {};  // SetThreadDescription
     uint32_t description_bytes = 0;
     uint64_t teb = 0, region_base = 0, region_size = 0;      // the thread's TEB and the one region that holds its stack, TEB and TLS block
+    bool hidden_from_debugger = false;                // ThreadHideFromDebugger (also THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER)
     bool keep_stack = false;                          // the stack is a fiber now (ConvertThreadToFiber): it outlives the thread, only the TEB and the TLS block go when the thread ends
   };
   // What the program can set and read back about itself.
