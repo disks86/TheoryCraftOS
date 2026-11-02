@@ -52,7 +52,9 @@ bool BrowserStore::save(browser::CookieJar& cookies, browser::StorageHub& local_
     const StringView origin = local_storage.origin_name(o);
     browser::StorageArea& area = local_storage.area_at(o);
     for (uint32_t k = 0; ok && k < area.count(); ++k) {
-      const DbParam params[] = {DbParam::from_text(origin), DbParam::from_text(area.key(k)), DbParam::from_text(area.value_at(k))};
+      const String key = area.key(k);       // (the copies must outlive the run() that reads them: key() and value_at() return owned Strings)
+      const String value = area.value_at(k);
+      const DbParam params[] = {DbParam::from_text(origin), DbParam::from_text(key), DbParam::from_text(value)};
       ok = run("INSERT INTO web_local_storage VALUES (?, ?, ?)", ArrayView<const DbParam>(params, 3));
     }
   }

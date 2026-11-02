@@ -49,8 +49,8 @@ const uint8_t kRsqrt7[128] = {
     65, 64, 63, 63, 62, 61, 60, 59, 59, 58, 57, 56, 56, 55, 54, 53,
 };
 
-Format format_of(uint32_t bits) { return bits == 32 ? Format::F32 : Format::F64; }
-bool format_bits_unsupported(uint32_t bits) { return bits != 32 && bits != 64; }
+Format format_of(uint32_t bits) { return bits == 16 ? Format::F16 : bits == 32 ? Format::F32 : Format::F64; }
+bool format_bits_unsupported(uint32_t bits) { return bits != 16 && bits != 32 && bits != 64; }
 
 uint64_t integer_to_float(Format f, uint64_t bits, uint32_t width, bool is_signed, Env& env) {
   uint64_t v = is_signed ? static_cast<uint64_t>(sext(bits, width)) : bits;
@@ -73,7 +73,7 @@ uint64_t float_to_integer(Format f, uint64_t bits, uint32_t width, bool is_signe
 }  // namespace
 
 RiscV64Cpu::Step VectorUnit::floating() {
-  if (sew != 32 && sew != 64 && !(funct6 == 18 && sew == 16)) return undefined();      // (half precision is Zvfh; only the 16-bit integer sides of conversions are allowed)
+  if (sew != 16 && sew != 32 && sew != 64 && !(funct6 == 18 && sew == 8)) return undefined();      // (SEW 8 only for the conversions between 8-bit integers and half precision)
   const bool vf = funct3 == 5;
   if (funct6 == 18) return floating_convert();
   const Format f = format_of(sew);
@@ -83,7 +83,7 @@ RiscV64Cpu::Step VectorUnit::floating() {
   env.arm = true;
   env.tininess_after = true;
   const bool rounding_ok = c.rounding_mode(7, &env.mode);
-  const uint64_t scalar = vf ? (sew == 32 ? c.read_single(vs1) : s.f[vs1]) : 0;
+  const uint64_t scalar = vf ? (sew == 32 ? c.read_single(vs1) : sew == 16 ? c.read_half(vs1) : s.f[vs1]) : 0;
   const uint64_t sign = sign_bit_of(f);
 
   auto finish = [&](Step r) {
@@ -140,6 +140,7 @@ RiscV64Cpu::Step VectorUnit::floating() {
         if (vs1 != 0) return undefined();
         const uint64_t v = get(vs2, sew_bytes, 0);
         if (sew == 32) c.write_single(vd, v);
+        else if (sew == 16) c.write_half(vd, v);
         else s.f[vd] = v;
         return ok();
       }
@@ -196,7 +197,7 @@ RiscV64Cpu::Step VectorUnit::floating() {
     }
     case 18: return floating_convert();
     case 1: case 3: case 5: case 7: case 49: case 51: return float_reduction();
-    case 48: case 50: case 52: case 54: case 56: case 60: case 61: case 62: case 63: return float_wide();
+    case 48: case 50: case 52: case 54: case 56: case 59: case 60: case 61: case 62: case 63: return float_wide();
     default: return undefined();
   }
 }
@@ -204,7 +205,7 @@ RiscV64Cpu::Step VectorUnit::floating() {
 RiscV64Cpu::Step VectorUnit::float_reduction() {
   const bool widening = funct6 == 49 || funct6 == 51;
   if (funct3 != 1 || s.vstart != 0) return undefined();
-  if (widening && sew != 32) return undefined();
+  if (widening && sew != 32 && sew != 16) return undefined();
   Env env;
   env.arm = true;
   env.tininess_after = true;
@@ -212,13 +213,13 @@ RiscV64Cpu::Step VectorUnit::float_reduction() {
   const uint32_t regs = regs_of(lmul_log);
   if (!group_ok(vs2, regs)) return undefined();
   if (vl == 0) return ok();
-  const Format f = format_of(sew), acc_format = widening ? Format::F64 : f;
+  const Format f = format_of(sew), acc_format = widening ? (sew == 16 ? Format::F32 : Format::F64) : f;
   const uint32_t acc_bytes = widening ? sew_bytes * 2 : sew_bytes;
   uint64_t acc = get(vs1, acc_bytes, 0);
   for (uint64_t i = 0; i < vl; ++i) {
     if (!active(i)) continue;
     uint64_t x = get(vs2, sew_bytes, i);
-    if (widening) x = convert(Format::F32, Format::F64, x, env);
+    if (widening) x = convert(f, acc_format, x, env);
     switch (funct6) {
       case 5: acc = minmax(acc_format, acc, x, false, env); break;
       case 7: acc = minmax(acc_format, acc, x, true, env); break;
@@ -233,7 +234,7 @@ RiscV64Cpu::Step VectorUnit::float_reduction() {
 
 
 uint64_t VectorUnit::estimate7(Format f, uint64_t a, bool reciprocal, Env& env) {
-  const uint32_t fraction_bits = f == Format::F32 ? 23 : 52, exponent_bits = f == Format::F32 ? 8 : 11;
+  const uint32_t fraction_bits = f == Format::F16 ? 10 : f == Format::F32 ? 23 : 52, exponent_bits = f == Format::F16 ? 5 : f == Format::F32 ? 8 : 11;
   const int64_t bias = (int64_t{1} << (exponent_bits - 1)) - 1, exponent_max = (int64_t{1} << exponent_bits) - 1;
   const uint64_t fraction_mask = (uint64_t{1} << fraction_bits) - 1;
   const bool negative = (a >> (fraction_bits + exponent_bits)) & 1;
@@ -241,7 +242,7 @@ uint64_t VectorUnit::estimate7(Format f, uint64_t a, bool reciprocal, Env& env) 
   uint64_t fraction = a & fraction_mask;
   const uint64_t sign = static_cast<uint64_t>(negative) << (fraction_bits + exponent_bits);
   const uint64_t infinity = static_cast<uint64_t>(exponent_max) << fraction_bits;
-  const uint64_t nan = f == Format::F32 ? kCanonicalSingle : kCanonicalDouble;
+  const uint64_t nan = canonical_nan(f);
   if (biased == exponent_max && fraction != 0) {
     if (!((fraction >> (fraction_bits - 1)) & 1)) env.flags |= kInvalid;
     return nan;
@@ -290,7 +291,7 @@ uint64_t VectorUnit::estimate7(Format f, uint64_t a, bool reciprocal, Env& env) 
 }
 
 RiscV64Cpu::Step VectorUnit::float_wide() {
-  if (sew != 32 || lmul_log > 2) return undefined();
+  if ((sew != 32 && sew != 16) || lmul_log > 2 || (funct6 == 59 && sew != 16)) return undefined();      // (funct6 59: Zvfbfwma's vfwmaccbf16)
   const bool vf = funct3 == 5;
   const bool wide_source = funct6 == 52 || funct6 == 54;
   Env env;
@@ -300,35 +301,60 @@ RiscV64Cpu::Step VectorUnit::float_wide() {
   const uint32_t regs = regs_of(lmul_log), wide_regs = regs_of(lmul_log + 1);
   if (!group_ok(vd, wide_regs) || !group_ok(vs2, wide_source ? wide_regs : regs) || (!vf && !group_ok(vs1, regs)) || (!vm && vd == 0)) return undefined();
   if (s.vstart >= vl) return ok();
-  const Format d = Format::F64;
-  const uint64_t single = vf ? c.read_single(vs1) : 0;
+  const Format d = sew == 16 ? Format::F32 : Format::F64, src = funct6 == 59 ? Format::BF16 : sew == 16 ? Format::F16 : Format::F32;
+  const uint32_t wide_bytes = sew_bytes * 2;
+  const uint64_t single = vf ? (sew == 16 ? c.read_half(vs1) : c.read_single(vs1)) : 0;      // (an unboxed BFloat16 scalar reads as the half precision NaN pattern, as in qemu)
   for (uint64_t i = s.vstart; i < vl; ++i) {
     if (!active(i)) {
-      if (ma) ones(vd, 8, i, i + 1);
+      if (ma) ones(vd, wide_bytes, i, i + 1);
       continue;
     }
-    const uint64_t a = wide_source ? get(vs2, 8, i) : convert(Format::F32, d, get(vs2, 4, i), env);
-    const uint64_t b = convert(Format::F32, d, vf ? single : get(vs1, 4, i), env);
-    const uint64_t old = get(vd, 8, i);
+    const uint64_t a = wide_source ? get(vs2, wide_bytes, i) : convert(src, d, get(vs2, sew_bytes, i), env);
+    const uint64_t b = convert(src, d, vf ? single : get(vs1, sew_bytes, i), env);
+    const uint64_t old = get(vd, wide_bytes, i);
     uint64_t r;
     switch (funct6) {
       case 48: case 52: r = add(d, a, b, env); break;
       case 50: case 54: r = softfloat::sub(d, a, b, env); break;
       case 56: r = mul(d, a, b, env); break;
+      case 59: r = fused_multiply_add(d, b, a, old, env); break;      // vfwmaccbf16
       case 60: r = fused_multiply_add(d, b, a, old, env); break;
       case 61: r = fused_multiply_add(d, negate(d, b), a, negate(d, old), env); break;
       case 62: r = fused_multiply_add(d, b, a, negate(d, old), env); break;
       default: r = fused_multiply_add(d, negate(d, b), a, old, env); break;
     }
-    put(vd, 8, i, canonical(d, r));
+    put(vd, wide_bytes, i, canonical(d, r));
   }
-  tail(vd, wide_regs, 8, vl);
+  tail(vd, wide_regs, wide_bytes, vl);
   c.fp_finish(env);
   return ok();
 }
 
 RiscV64Cpu::Step VectorUnit::floating_convert() {
   if (funct3 != 1) return undefined();
+  if ((vs1 == 13 || vs1 == 29) && sew == 16) {      // Zvfbfmin: vfwcvtbf16.f.f.v (BFloat16 to single) and vfncvtbf16.f.f.w (single to BFloat16)
+    const bool widening_bf = vs1 == 13;
+    if (lmul_log > 2) return undefined();
+    const uint32_t src_regs = regs_of(lmul_log + (widening_bf ? 0 : 1)), dst_regs = regs_of(lmul_log + (widening_bf ? 1 : 0));
+    if (!group_ok(vd, dst_regs) || !group_ok(vs2, src_regs) || (!vm && vd == 0)) return undefined();
+    Env env;
+    env.arm = true;
+    env.tininess_after = true;
+    if (!c.rounding_mode(7, &env.mode)) return undefined();
+    if (s.vstart >= vl) return ok();
+    const uint32_t dst_bytes = widening_bf ? 4 : 2, src_bytes = widening_bf ? 2 : 4;
+    for (uint64_t i = s.vstart; i < vl; ++i) {
+      if (!active(i)) {
+        if (ma) ones(vd, dst_bytes, i, i + 1);
+        continue;
+      }
+      const uint64_t x = get(vs2, src_bytes, i);
+      put(vd, dst_bytes, i, widening_bf ? canonical(Format::F32, convert(Format::BF16, Format::F32, x, env)) : canonical(Format::BF16, convert(Format::F32, Format::BF16, x, env)));
+    }
+    tail(vd, dst_regs, dst_bytes, vl);
+    c.fp_finish(env);
+    return ok();
+  }
   const uint32_t sel = vs1, kind = sel & 7;
   const bool widening = sel >= 8 && sel < 16, narrowing = sel >= 16 && sel < 24;
   if (sel >= 24) return undefined();
@@ -376,7 +402,7 @@ RiscV64Cpu::Step VectorUnit::floating_convert() {
       const uint32_t accumulated = env.flags;
       env.flags = 0;
       r = canonical(format_of(dst_bits), convert(format_of(src_bits), format_of(dst_bits), x, env));
-      if (sel == 21 && (env.flags & kInexact) && !is_nan(format_of(dst_bits), r) && (r & 0x7FFFFFFFu) != 0x7F800000u) r |= 1;      // round to odd
+      if (sel == 21 && (env.flags & kInexact) && !is_nan(format_of(dst_bits), r) && (r & (dst_bits == 16 ? 0x7FFFu : 0x7FFFFFFFu)) != (dst_bits == 16 ? 0x7C00u : 0x7F800000u)) r |= 1;      // round to odd
       env.flags |= accumulated;
     }
     put(vd, dst_bytes, i, r);

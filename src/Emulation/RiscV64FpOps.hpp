@@ -24,17 +24,18 @@ namespace rvfp {
 
 using namespace softfloat;
 
-constexpr uint64_t kCanonicalSingle = 0x7FC00000u, kCanonicalDouble = 0x7FF8000000000000ull;
+constexpr uint64_t kCanonicalSingle = 0x7FC00000u, kCanonicalDouble = 0x7FF8000000000000ull, kCanonicalHalf = 0x7E00u, kCanonicalBFloat = 0x7FC0u;
+
+inline uint64_t canonical_nan(Format f) { return f == Format::F32 ? kCanonicalSingle : f == Format::F64 ? kCanonicalDouble : f == Format::F16 ? kCanonicalHalf : kCanonicalBFloat; }
 
 // Every NaN a RISC-V floating-point operation computes is the canonical NaN, whatever the payload of its operands.
-inline uint64_t canonical(Format f, uint64_t bits) { return is_nan(f, bits) ? (f == Format::F32 ? kCanonicalSingle : kCanonicalDouble) : bits; }
+inline uint64_t canonical(Format f, uint64_t bits) { return is_nan(f, bits) ? canonical_nan(f) : bits; }
 
-inline uint64_t sign_bit_of(Format f) { return f == Format::F32 ? 0x80000000u : 0x8000000000000000ull; }
+inline uint64_t sign_bit_of(Format f) { return f == Format::F32 ? 0x80000000u : f == Format::F64 ? 0x8000000000000000ull : 0x8000u; }
 
 // FCLASS: one bit of the result for each of the ten classes.
 inline uint64_t classify(Format f, uint64_t bits) {
-  const bool single = f == Format::F32;
-  const uint32_t man_bits = single ? 23 : 52, exp_bits = single ? 8 : 11;
+  const uint32_t man_bits = f == Format::F32 ? 23 : f == Format::F64 ? 52 : f == Format::F16 ? 10 : 7, exp_bits = f == Format::F64 ? 11 : f == Format::F16 ? 5 : 8;
   const bool negative = (bits >> (man_bits + exp_bits)) & 1;
   const uint64_t exponent = (bits >> man_bits) & ((uint64_t{1} << exp_bits) - 1), mantissa = bits & ((uint64_t{1} << man_bits) - 1);
   if (exponent == (uint64_t{1} << exp_bits) - 1) {
@@ -51,9 +52,9 @@ inline uint64_t classify(Format f, uint64_t bits) {
 // FMIN / FMAX: a number beats a NaN, two NaNs give the canonical NaN, -0 is below +0, and a signaling NaN raises invalid.
 inline uint64_t minmax(Format f, uint64_t x, uint64_t y, bool is_max, Env& env) {
   const bool nx = is_nan(f, x), ny = is_nan(f, y);
-  const uint64_t quiet = f == Format::F32 ? 0x400000u : 0x8000000000000ull;
+  const uint64_t quiet = f == Format::F32 ? 0x400000u : f == Format::F64 ? 0x8000000000000ull : f == Format::F16 ? 0x200u : 0x40u;
   if ((nx && !(x & quiet)) || (ny && !(y & quiet))) env.flags |= kInvalid;
-  if (nx && ny) return f == Format::F32 ? kCanonicalSingle : kCanonicalDouble;
+  if (nx && ny) return canonical_nan(f);
   if (nx) return y;
   if (ny) return x;
   const Order order = compare(f, x, y, false, env);

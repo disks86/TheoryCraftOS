@@ -614,6 +614,10 @@ RiscV64Cpu::Step RiscV64Cpu::vector(GuestMemory& m, uint32_t insn) {
   VectorUnit u(*this, m, insn);
   if (u.funct3 == 7) return u.configure();
   if (!u.prepare()) return undefined();
+  if (u.funct3 != 1 && u.funct3 != 5) {
+    Step bits_result;
+    if (u.bit_instruction(&bits_result)) return bits_result;
+  }
   switch (u.funct3) {
     case 0: case 3: case 4: return u.integer();
     case 2: case 6: return u.opm();

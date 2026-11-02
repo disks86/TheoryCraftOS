@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuTopology.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace hardware {
 
@@ -51,23 +52,32 @@ class GpuManager {
   uint32_t count() const { return topology_.count(); }
   bool is_hybrid() const { return topology_.is_hybrid(); }
 
+  // The render lease: wake/sleep is serialized so two cores may take and drop it at the same time
+  // (the wake on the first lease and the sleep on the last never race). Guarded by `lock_`
+  // (a blocking Mutex: wake() may settle the GPU for a while while holding it, and it works before
+  // the scheduler comes up); wake()/sleep() assume the caller already holds it.
+  //
   // The adapter that carries the screen, or -1.
   int32_t display_index() const { return topology_.boot_index(); }
   // Picks the adapter for this work (see gpu_select()); does not wake it.
   int32_t select(const GpuSelectionInput& input) const { return gpu_select(topology_, input); }
 
   // Takes a lease on the adapter, waking it if it slept. False for a bad index or a device that would not wake.
+  // Thread-safe: two cores may call it in parallel.
   bool acquire(uint32_t index);
   // Gives a lease back; the adapter sleeps when the last one goes (unless it carries the display).
+  // Thread-safe: two cores may call it in parallel, and the sleep happens exactly once on the last lease.
   void release(uint32_t index);
-  uint32_t leases(uint32_t index) const { return index < topology_.count() ? leases_[index] : 0; }
+  uint32_t leases(uint32_t index) const { kernel::ScopedMutex g(lock_); return index < topology_.count() ? leases_[index] : 0; }
   // True while the adapter is powered down by this manager.
-  bool asleep(uint32_t index) const { return index < topology_.count() && asleep_[index]; }
+  bool asleep(uint32_t index) const { kernel::ScopedMutex g(lock_); return index < topology_.count() && asleep_[index]; }
 
  private:
+  // Called only with `lock_` held (by acquire/release), or before any other thread exists (initialize).
   bool wake(uint32_t index);
   void sleep(uint32_t index);
 
+  mutable kernel::Mutex lock_;   // serializes the lease count and asleep/wake/sleep transitions across cores
   const IPciBus& pci_;
   DelayFn delay_;
   GpuTopology topology_;

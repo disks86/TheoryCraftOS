@@ -23,6 +23,7 @@
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/RenderNode.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace graphics {
 
@@ -35,13 +36,15 @@ class Renderer2DSlot {
 
   // The renderer, built for `target`'s size as it is now; nullptr if `target` is null or memory ran out. With `allow_device` and an accelerated
   // `node` the GPU draws; otherwise (or when `allow_device` is false, because the picture is shown through something other than the GPU's own
-  // screen) the CPU does and `target` receives the finished picture.
+  // screen) the CPU does and `target` receives the finished picture. Thread-safe: two cores may call it at once and both get the same one.
   IRenderer2D* get(RenderNode& node, hardware::IGraphicsProcessingUnit* target, bool allow_device);
-  // Throws the renderer away; the next get() builds one for the target's size as it is then. Nothing may be using the old renderer.
+  // Throws the renderer away; the next get() builds one for the target's size as it is then. Serialized with get(), so it cannot tear a
+  // concurrent build; the caller still must ensure nothing is drawing on the renderer it hands out.
   void reset();
 
  private:
   allocators::IAllocator& allocator_;
+  kernel::Mutex lock_;   // serializes get()/reset(): two cores must not build or tear the slot down together
   Surface backbuffer_;
   SoftwareRenderer2D* software_ = nullptr;
   DeviceRenderer2D* device_ = nullptr;

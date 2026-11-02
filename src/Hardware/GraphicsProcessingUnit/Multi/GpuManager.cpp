@@ -56,6 +56,7 @@ void GpuManager::initialize() {
 }
 
 bool GpuManager::acquire(uint32_t index) {
+  kernel::ScopedMutex g(lock_);   // the lease count and the asleep/wake decision must not race across cores
   if (index >= topology_.count()) return false;
   if (leases_[index] == UINT32_MAX) return false;
   if (asleep_[index] && !wake(index)) return false;
@@ -64,6 +65,7 @@ bool GpuManager::acquire(uint32_t index) {
 }
 
 void GpuManager::release(uint32_t index) {
+  kernel::ScopedMutex g(lock_);   // exactly one core may take the last lease and put the adapter to sleep
   if (index >= topology_.count() || leases_[index] == 0) return;
   if (--leases_[index] == 0 && static_cast<int32_t>(index) != topology_.boot_index() && topology_.adapter(index).kind == GpuKind::Discrete) sleep(index);
 }

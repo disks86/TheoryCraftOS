@@ -23,17 +23,16 @@ namespace browser {
 
 // --- StorageArea -------------------------------------------------------------------------------------------------
 
-bool StorageArea::get(StringView key, StringView* value) const {
+bool StorageArea::get(StringView key, String* value) const {
+  kernel::ScopedMutex lock(mutex_);
   for (uint64_t i = 0; i < keys_.count(); ++i) {
-    if (keys_[i].view().equals(key)) {
-      *value = values_[i].view();
-      return true;
-    }
+    if (keys_[i].view().equals(key)) return value->assign(values_[i].view());
   }
   return false;
 }
 
 bool StorageArea::set(StringView key, StringView value) {
+  kernel::ScopedMutex lock(mutex_);
   uint64_t total = key.size() + value.size();
   int64_t at = -1;
   for (uint64_t i = 0; i < keys_.count(); ++i) {
@@ -55,6 +54,7 @@ bool StorageArea::set(StringView key, StringView value) {
 }
 
 bool StorageArea::remove(StringView key) {
+  kernel::ScopedMutex lock(mutex_);
   for (uint64_t i = 0; i < keys_.count(); ++i) {
     if (keys_[i].view().equals(key)) {
       keys_.remove_at(i);
@@ -68,18 +68,21 @@ bool StorageArea::remove(StringView key) {
 
 
 uint64_t StorageArea::bytes() const {
+  kernel::ScopedMutex lock(mutex_);
   uint64_t total = 0;
   for (uint64_t i = 0; i < keys_.count(); ++i) total += keys_[i].size() + values_[i].size();
   return total;
 }
 
 uint64_t StorageHub::version() const {
+  kernel::ScopedMutex lock(mutex_);
   uint64_t sum = origins_.count() + clears_;
   for (uint64_t i = 0; i < origins_.count(); ++i) sum += origins_[i]->area.version();
   return sum;
 }
 
 StorageArea& StorageHub::area(StringView origin) {
+  kernel::ScopedMutex lock(mutex_);
   for (uint64_t i = 0; i < origins_.count(); ++i)
     if (origins_[i]->origin.equals(origin)) return origins_[i]->area;
   auto fresh = UniquePointer<Origin>::make(allocator_, allocator_, origin);
@@ -88,12 +91,14 @@ StorageArea& StorageHub::area(StringView origin) {
 }
 
 void PageHub::post(HubEvent&& event) {
+  kernel::ScopedMutex lock(mutex_);
   event.serial = ++serial_;
   if (events_.count() >= kBacklog) events_.remove_at(0);
   events_.push_back(util::move(event));
 }
 
 bool PageHub::next(uint32_t page, StringView origin, uint64_t* seen, HubEvent* out) {
+  kernel::ScopedMutex lock(mutex_);
   for (uint64_t i = 0; i < events_.count(); ++i) {
     HubEvent& e = events_[i];
     if (e.serial <= *seen) continue;
@@ -117,6 +122,7 @@ bool PageHub::next(uint32_t page, StringView origin, uint64_t* seen, HubEvent* o
 }
 
 bool PageHub::pending(uint32_t page, StringView origin, uint64_t seen) const {
+  kernel::ScopedMutex lock(mutex_);
   for (uint64_t i = 0; i < events_.count(); ++i) {
     const HubEvent& e = events_[i];
     if (e.serial > seen && e.source != page && e.origin.equals(origin)) return true;

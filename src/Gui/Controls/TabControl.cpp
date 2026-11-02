@@ -34,9 +34,10 @@ int32_t TabControl::add_page(StringView title, Control* page) {
   }
   page->set_dock(DockStyle::Fill);
   const int32_t index = static_cast<int32_t>(pages_.count()) - 1;
+  const bool was_empty = selected_ < 0;
   page->set_visible(index == 0);
-  if (selected_ < 0) selected_ = 0;
-  invalidate();
+  if (was_empty) selected_ = 0;
+  if (was_empty) invalidate();  // only invalidate if we actually made a change (first page or visible change)
   return index;
 }
 

@@ -23,6 +23,7 @@
 namespace graphics {
 
 IRenderer2D* Renderer2DSlot::get(RenderNode& node, hardware::IGraphicsProcessingUnit* target, bool allow_device) {
+  kernel::ScopedMutex g(lock_);  // one build or teardown at a time, even from two cores
   if (software_) return software_;
   if (device_) return device_;
   if (!target) return nullptr;
@@ -43,7 +44,7 @@ IRenderer2D* Renderer2DSlot::get(RenderNode& node, hardware::IGraphicsProcessing
   void* memory = allocator_.allocate(sizeof(SoftwareRenderer2D));
   if (!backbuffer_.valid() || !memory) {
     release_view(allocator_, backbuffer_.pixels);
-    allocator_.deallocate(memory);
+    if (memory) allocator_.deallocate(memory);   // memory may be null here (deallocate() would ignore it, but be explicit)
     return nullptr;
   }
   for (uint32_t& p : backbuffer_.pixels) p = 0;
@@ -51,6 +52,7 @@ IRenderer2D* Renderer2DSlot::get(RenderNode& node, hardware::IGraphicsProcessing
 }
 
 void Renderer2DSlot::reset() {
+  kernel::ScopedMutex g(lock_);  // never destroy a renderer while a get() on the same slot is building it
   if (software_) {
     software_->~SoftwareRenderer2D();
     allocator_.deallocate(software_);

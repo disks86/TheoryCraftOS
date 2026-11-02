@@ -38,8 +38,11 @@ SharedPointer<TcpSocket> TcpManager::spawn(TcpSocket* listener, Ipv4Address remo
 }
 
 bool TcpManager::listening_on(uint16_t port) const {
-  for (const SharedPointer<TcpSocket>& s : sockets_)
+  const uint64_t count = sockets_.count();
+  for (uint64_t i = count; i > 0; --i) {
+    const SharedPointer<TcpSocket>& s = sockets_[i - 1];
     if (s->state() == TcpState::Listen && s->local_port() == port) return true;
+  }
   return false;
 }
 
@@ -168,11 +171,12 @@ void TcpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteVi
 
 void TcpManager::poll() {
   const uint64_t now = ip_.now_ms();
-  for (uint64_t i = 0; i < sockets_.count(); ++i) sockets_[i]->on_timer(now);
+  const uint64_t count = sockets_.count();
+  for (uint64_t i = 0; i < count; ++i) sockets_[i]->on_timer(now);
 
   // Clean up. A connection nobody holds any more (use_count 1 = only this list)
   // is closed; one that is closed and unreferenced is forgotten.
-  for (uint64_t i = sockets_.count(); i > 0; --i) {
+  for (uint64_t i = count; i > 0; --i) {
     SharedPointer<TcpSocket>& s = sockets_[i - 1];
     if (s.use_count() != 1) continue;
     switch (s->state()) {

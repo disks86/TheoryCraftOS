@@ -41,17 +41,19 @@ class SpinLock {
   // lock held by the code it interrupted.
   void lock() {
     const uint64_t flags = kernel::irq_save();
-    // Check for recursive locking attempt
-    if (locked_ && owner_core_ == cpu_.current_core()) {
+    // Check for recursive locking attempt. locked_ and owner_core_ are also touched by other
+    // cores, so read them atomically (plain reads would be a data race with their atomic ops).
+    if (__atomic_load_n(&locked_, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&owner_core_, __ATOMIC_ACQUIRE) == cpu_.current_core()) {
       // Recursive lock attempt - this would deadlock!
       kernel::panic("Recursive spinlock attempt detected", nullptr);
     }
-    
+
     while (__atomic_exchange_n(&locked_, 1, __ATOMIC_ACQUIRE)) {
       // Wait with plain loads until it looks free; only then retry the exchange.
       while (__atomic_load_n(&locked_, __ATOMIC_RELAXED)) cpu_.pause();
     }
-    owner_core_ = cpu_.current_core();
+    set_owner(cpu_.current_core());
     saved_flags_ = flags;
   }
   bool try_lock() {
@@ -60,24 +62,28 @@ class SpinLock {
       kernel::irq_restore(flags);
       return false;
     }
-    owner_core_ = cpu_.current_core();
+    set_owner(cpu_.current_core());
     saved_flags_ = flags;
     return true;
   }
   void unlock() {
     const uint64_t flags = saved_flags_;
-    // Verify that the unlocking core is the same one that locked it
-    if (owner_core_ != cpu_.current_core()) {
+    // Verify that the unlocking core is the same one that locked it (atomic read).
+    if (__atomic_load_n(&owner_core_, __ATOMIC_ACQUIRE) != cpu_.current_core()) {
       kernel::panic("Unlocking from wrong core", nullptr);
     }
     // Forget the owner BEFORE letting go: once the lock is free another core can take it and record itself as the owner, and clearing the field after
     // that would wipe its entry (and its own unlock would then panic with "Unlocking from wrong core").
-    owner_core_ = 0xFFFFFFFF;  // Invalid core id
+    set_owner(0xFFFFFFFFu);  // Invalid core id
     __atomic_store_n(&locked_, 0, __ATOMIC_RELEASE);
     kernel::irq_restore(flags);
   }
 
  private:
+  // Atomically record the owning core. Both locked_ and owner_core_ are touched by more than one
+  // core over the lock's life, so every access to them goes through atomic builtins (never plain).
+  void set_owner(uint32_t core) { __atomic_store_n(&owner_core_, core, __ATOMIC_RELEASE); }
+
   const hardware::ICentralProcessingUnit& cpu_;
   uint32_t locked_ = 0;
   uint32_t owner_core_ = 0xFFFFFFFF;  // Track which core owns the lock, 0xFFFFFFFF = invalid

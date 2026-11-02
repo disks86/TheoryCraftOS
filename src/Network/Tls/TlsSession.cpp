@@ -45,6 +45,9 @@ bool same_server(const TlsTicket& t, const char* lower, bool quic) {
 
 bool TlsSessionCache::store(const TlsTicket& ticket) {
   kernel::ScopedMutex lock(mutex_);
+  // A ticket must fit the fixed arrays in TlsTicket (ticket/psk are not growable), otherwise the
+  // copy below would run past them. Refuse a malformed one instead of corrupting memory.
+  if (ticket.ticket_length > kMaxTicketBytes || ticket.psk_length > sizeof(ticket.psk)) return false;
   // too many for this server: the oldest goes
   uint32_t same = 0;
   for (uint64_t i = 0; i < tickets_.count(); ++i)
@@ -82,16 +85,20 @@ bool TlsSessionCache::take(StringView server_name, bool quic, uint64_t now_ms, T
     if (!same_server(t, lower, quic)) continue;
     const bool expired = now_ms < t.received_ms || (now_ms - t.received_ms) / 1000 >= t.lifetime_s;
     if (!expired) {
+      // Bound the copy by the fixed array sizes on both sides (a well-formed stored ticket is
+      // always within them, but this keeps the public read path safe against any oversized one).
+      const uint32_t tlen = t.ticket_length < kMaxTicketBytes ? t.ticket_length : static_cast<uint32_t>(kMaxTicketBytes);
+      const uint32_t plen = t.psk_length < sizeof(out->psk) ? t.psk_length : static_cast<uint32_t>(sizeof(out->psk));
       out->quic = t.quic;
       for (uint32_t k = 0; k < sizeof out->server_name; ++k) out->server_name[k] = t.server_name[k];
       out->suite_id = t.suite_id;
       out->lifetime_s = t.lifetime_s;
       out->age_add = t.age_add;
       out->received_ms = t.received_ms;
-      out->ticket_length = t.ticket_length;
-      for (uint32_t k = 0; k < t.ticket_length; ++k) out->ticket[k] = t.ticket[k];
-      out->psk_length = t.psk_length;
-      for (uint32_t k = 0; k < t.psk_length; ++k) out->psk[k] = t.psk[k];
+      out->ticket_length = tlen;
+      for (uint32_t k = 0; k < tlen; ++k) out->ticket[k] = t.ticket[k];
+      out->psk_length = static_cast<uint8_t>(plen);
+      for (uint32_t k = 0; k < plen; ++k) out->psk[k] = t.psk[k];
     }
     tickets_.remove_at(i - 1);   // (an expired one is of no use to anyone, a good one is used up)
     if (!expired) return true;
