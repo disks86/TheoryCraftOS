@@ -26,7 +26,7 @@ namespace process::windowsabi {
 namespace {
 
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du, kInvalidDeviceRequest = 0xC0000010u,
-                   kAccessDenied = 0xC0000022u, kObjectNameNotFound = 0xC0000034u, kPipeBusy = 0xC00000AEu, kPipeConnected = 0xC00000AFu, kPipeDisconnected = 0xC00000B0u,
+                   kAccessDenied = 0xC0000022u, kObjectNameNotFound = 0xC0000034u, kPipeBusy = 0xC00000AEu, kPipeConnected = 0xC00000B2u, kPipeDisconnected = 0xC00000B0u,
                    kPipeClosing = 0xC00000B1u, kPipeBroken = 0xC000014Bu, kPipeEmpty = 0xC00000D9u, kNotImplemented = 0xC0000002u, kInvalidInfoClass = 0xC0000003u,
                    kInfoLengthMismatch = 0xC0000004u, kTimeout = 0x102, kAlerted = 0x101, kNoMemory = 0xC0000017u, kNoResources = 0xC000009Au;
 constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
@@ -36,10 +36,11 @@ constexpr uint32_t kNotFound = 0xC0000225u;
 // The library's own FSCTLs (see nt_fs_control_file).
 constexpr uint32_t kFsctlBeginRead = 0x11FFF0, kFsctlBeginWrite = 0x11FFF1, kFsctlBeginListen = 0x11FFF2, kFsctlAwait = 0x11FFF3, kFsctlAck = 0x11FFF4, kFsctlCancel = 0x11FFF5, kFsctlBeginTransact = 0x11FFF6, kFsctlGetProcess = 0x11FFF7, kFsctlSetPort = 0x11FFF8, kFsctlTakePort = 0x11FFF9;
 
-// The token of a pipe descriptor: bits 0..31 the object, 32..55 the end code, 60 read, 61 write, 62 non-blocking, 63 the pipe folder itself.
+// The token of a pipe descriptor: bits 0..31 the object, 32..55 the end code, 57 FILE_SYNCHRONOUS_IO_ALERT, 58 opened without FILE_SYNCHRONOUS_IO_*, 59 message read mode, 60 read, 61 write, 62 non-blocking,
+// 63 the pipe folder itself.
 constexpr uint32_t kCancelled = 0xC0000120u;      // STATUS_CANCELLED
 constexpr uint32_t kMoreData = 0x80000005u;      // STATUS_BUFFER_OVERFLOW (ERROR_MORE_DATA): part of a message was read
-constexpr uint64_t kMessageRead = 1ull << 59, kRead = 1ull << 60, kWrite = 1ull << 61, kNoWait = 1ull << 62, kFolder = 1ull << 63;
+constexpr uint64_t kAlertIo = 1ull << 57, kAsyncIo = 1ull << 58, kMessageRead = 1ull << 59, kRead = 1ull << 60, kWrite = 1ull << 61, kNoWait = 1ull << 62, kFolder = 1ull << 63;
 uint64_t make_token(uint32_t id, uint32_t end_code, bool read, bool write) { return id | (uint64_t{end_code} << 32) | (read ? kRead : 0) | (write ? kWrite : 0); }
 uint32_t token_id(uint64_t token) { return uint32_t(token); }
 uint32_t token_end(uint64_t token) { return uint32_t((token >> 32) & 0xFFFFFF); }
@@ -130,8 +131,8 @@ void await_delivery(Process& p, uint32_t id) {
 // A call that waits in the kernel for this thread: while it does the file object is not signalled, and CancelSynchronousIo can end it.
 class SyncWait {
  public:
-  SyncWait(Process& p, uint32_t id, uint32_t end_code) : objects_(system_objects()) {
-    if (objects_) slot_ = objects_->pipe_sync_begin(id, end_code, p.runtime() ? p.runtime()->current_thread_id() : p.id());
+  SyncWait(Process& p, uint32_t id, uint32_t end_code, uint64_t iosb = 0) : objects_(system_objects()) {
+    if (objects_) slot_ = objects_->pipe_sync_begin(id, end_code, p.runtime() ? p.runtime()->current_thread_id() : p.id(), iosb);
   }
   ~SyncWait() { if (objects_) objects_->pipe_sync_end(slot_); }
   SyncWait(const SyncWait&) = delete;
@@ -213,18 +214,23 @@ uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r) {
   String name(p.files().allocator());
   if (!pipe_name(p, r.args[2], &name) || name.empty()) return 0xC0000033u;
   { uint64_t slashes = 0; for (const char ch : name.view()) if (ch == '\\') ++slashes; if (slashes > 1 || (slashes == 1 && name.view()[name.size() - 1] != '\\')) return 0xC0000033u; }      // (a trailing backslash is part of the name; no other folders)      // STATUS_OBJECT_NAME_INVALID
+  uint64_t disposition = 0, options = 0;
+  if (!argument(p, r, 5, &disposition) || !argument(p, r, 6, &options)) return kAccessViolation;
+  if (uint32_t(disposition) > 3) return kInvalidParameter;      // FILE_OVERWRITE and FILE_OVERWRITE_IF make no sense for a pipe
   const uint32_t direction = uint32_t(share) & 3;      // FILE_SHARE_READ: clients read (the server writes); FILE_SHARE_WRITE: clients write (the server reads)
   uint32_t access = 0;
   if (direction == 1) access = ObjectManager::kPipeOutbound;
   else if (direction == 2) access = ObjectManager::kPipeInbound;
   else if (direction == 3) access = ObjectManager::kPipeDuplex;
   else return kInvalidParameter;
-  const ObjectManager::Created c = objects->create_pipe(name.view(), uint32_t(out_quota), uint32_t(in_quota), uint32_t(max_instances) == 0xFFFFFFFFu ? 0 : uint32_t(max_instances), access, (pipe_type & 1) != 0, p.id());
+  const ObjectManager::Created c = objects->create_pipe(name.view(), uint32_t(out_quota), uint32_t(in_quota), uint32_t(max_instances) == 0xFFFFFFFFu ? 0 : uint32_t(max_instances), access, (pipe_type & 1) != 0, p.id(), uint32_t(disposition));
   if (c.id == 0) return c.status;
   uint64_t handle = 0;
   uint64_t server_token = make_token(c.id, 0, (access & ObjectManager::kPipeInbound) != 0, (access & ObjectManager::kPipeOutbound) != 0);
   if ((pipe_type & 1) && (read_mode & 1)) server_token |= kMessageRead;
   if (completion & 1) server_token |= kNoWait;
+  if (!(options & 0x30)) server_token |= kAsyncIo;      // (not FILE_SYNCHRONOUS_IO_ALERT or _NONALERT: the calls are overlapped)
+  if (options & 0x10) server_token |= kAlertIo;
   uint32_t status = give_pipe_handle(p, server_token, wants_inherit(p, r.args[2]), &handle);
   if (status != kSuccess) { objects->release_pipe_end(c.id, 0); return status; }
   set_pipe_rights(p, handle, uint32_t(r.args[1]));
@@ -236,26 +242,27 @@ uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_cancel_synchronous_io_file(Process& p, const SyscallRequest& r) {
-  // NtCancelSynchronousIoFile(ThreadHandle, PIO_STATUS_BLOCK IoRequestToCancel, PIO_STATUS_BLOCK IoStatusBlock): ends the call the thread waits in on a pipe
+  // NtCancelSynchronousIoFile(ThreadHandle, PIO_STATUS_BLOCK IoRequestToCancel, PIO_STATUS_BLOCK IoStatusBlock): ends the call the thread waits in on a pipe (the one of the
+  // given IO_STATUS_BLOCK if there is one)
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
+  uint8_t probe[16];
+  if (r.args[2] == 0 || !p.read_user(r.args[2], ByteView(probe, 16))) return kAccessViolation;
   uint64_t thread = 0;
-  if (r.args[0] == ~uint64_t{1} || r.args[0] == 0) {
+  if (r.args[0] == ~uint64_t{1}) {
     thread = p.runtime() ? p.runtime()->current_thread_id() : p.id();
   } else {
     uint64_t slot = 0;
     if (!slot_of(r.args[0], &slot) || p.files().kind(slot) != DescriptorKind::Thread) return kInvalidHandle;
     thread = p.files().token(slot);
   }
-  const uint32_t status = objects->pipe_cancel_synchronous(thread) ? kSuccess : kNotFound;
-  if (r.args[2] != 0) {
-    uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
-    p.write_user(r.args[2], ConstByteView(iosb, 16));
-  }
+  const uint32_t status = objects->pipe_cancel_synchronous(thread, r.args[1]) ? kSuccess : kNotFound;
+  uint8_t iosb[16] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
+  p.write_user(r.args[2], ConstByteView(iosb, 16));
   return status;
 }
 
-bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, uint32_t* status, uint64_t* handle) {
+bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, uint32_t options, uint32_t* status, uint64_t* handle) {
   String name(p.files().allocator());
   if (!pipe_name(p, object_attributes, &name)) return false;
   ObjectManager* objects = system_objects();
@@ -268,13 +275,14 @@ bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, 
   const bool read = (access & (0x80000000u | 0x1)) != 0, write = (access & (0x40000000u | 0x2 | 0x4)) != 0;      // GENERIC_READ/FILE_READ_DATA, GENERIC_WRITE/FILE_WRITE_DATA/FILE_APPEND_DATA
   const ObjectManager::Created c = objects->connect_pipe(name.view(), read, write, p.id());
   if (c.id == 0) { *status = c.status; return true; }
-  *status = give_pipe_handle(p, make_token(c.id, c.end_code, read || !write, write), inherit, handle);
+  *status = give_pipe_handle(p, make_token(c.id, c.end_code, read || !write, write) | ((options & 0x30) ? 0 : kAsyncIo) | ((options & 0x10) ? kAlertIo : 0), inherit, handle);
+  if (*status == kSuccess) set_pipe_rights(p, *handle, access);
   if (*status != kSuccess) objects->release_pipe_end(c.id, c.end_code);
   await_delivery(p, c.id);      // (a ConnectNamedPipe that waited has its answer when the client's open returns)
   return true;
 }
 
-uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length) {
+uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length, bool wait) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
   const uint64_t token = p.files().token(slot);
@@ -350,6 +358,7 @@ uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, u
         return result_status(res, false, false);
       };
       uint32_t s = wait_until(p, 0, attempt);
+      if (s == kTimeout && first && !no_wait && (token & kAsyncIo) && !wait) return 0x103;      // STATUS_PENDING: the library waits for the data in a thread (BEGIN_READ), the call does nothing
       if (s == kTimeout && first && !no_wait) {      // (nothing to read yet: the call waits)
         SyncWait waiting(p, id, end);
         s = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t { return waiting.cancelled_locked() ? uint64_t{kCancelled} : attempt(); });
@@ -434,14 +443,19 @@ uint32_t pipe_query_information(Process& p, uint64_t slot, uint32_t info_class, 
         if (write) mask |= kWriteSet;
       }
     }
-    put32(0, mask);
+    put32(0, mask & ~p.files().denied_access(slot));      // (only what the handle was opened with)
+    size = 4;
+  } else if (info_class == 16) {      // FileModeInformation: FILE_SYNCHRONOUS_IO_NONALERT unless the handle was opened for overlapped calls
+    put32(0, (token & kAsyncIo) ? 0 : (token & kAlertIo) ? 0x10 : 0x20);
     size = 4;
   } else if (info_class == 23) {      // FILE_PIPE_INFORMATION { ReadMode, CompletionMode }
+    if (p.files().denied_access(slot) & 0x80) return kAccessDenied;      // (needs FILE_READ_ATTRIBUTES)
     put32(0, (token & kMessageRead) ? 1 : 0);
     put32(4, (token & kNoWait) ? 1 : 0);
     size = 8;
   } else if (info_class == 24) {      // FILE_PIPE_LOCAL_INFORMATION
     if (token & kFolder) return kInvalidDeviceRequest;
+    if (p.files().denied_access(slot) & 0x80) return kAccessDenied;      // (needs FILE_READ_ATTRIBUTES)
     ObjectManager::PipeInfo info;
     if (!objects->pipe_info(token_id(token), &info)) return kInvalidHandle;
     const uint32_t end = token_end(token) & 1;
@@ -482,6 +496,7 @@ uint32_t pipe_query_information(Process& p, uint64_t slot, uint32_t info_class, 
 uint32_t pipe_set_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t buffer, uint32_t length) {
   if (info_class != 23) return kInvalidInfoClass;
   if (length < 8) return kInfoLengthMismatch;
+  if (p.files().denied_access(slot) & 0x100) return kAccessDenied;      // (needs FILE_WRITE_ATTRIBUTES)
   uint8_t raw[8];
   if (!p.read_user(buffer, ByteView(raw, 8))) return kAccessViolation;
   uint64_t token = p.files().token(slot);
@@ -533,7 +548,7 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
   switch (uint32_t(code)) {
     case 0x110008: {      // FSCTL_PIPE_LISTEN: wait for a client
       if (token & kFolder) break;
-      if (token_end(token) & 1) { status = kInvalidDeviceRequest; break; }
+      if (token_end(token) & 1) { status = 0xC00000AFu; break; }      // STATUS_ILLEGAL_FUNCTION: a client cannot listen
       if (input_length == 4) {      // (the library's own: only say that the server listens, without waiting for the client)
         objects->sync().lock();
         const ObjectManager::PipeResult res = objects->pipe_listen_locked(id);
@@ -553,7 +568,7 @@ uint32_t nt_fs_control_file(Process& p, const SyscallRequest& r) {
       };
       status = wait_until(p, 0, attempt);
       if (status == kTimeout && !(token & kNoWait)) {      // (nobody is there yet: the call waits)
-        SyncWait waiting(p, id, end);
+        SyncWait waiting(p, id, end, status_block);
         status = wait_until(p, ~uint64_t{0}, [&]() -> uint64_t { return waiting.cancelled_locked() ? uint64_t{kCancelled} : attempt(); });
       }
       if (status == kTimeout) status = 0xC00000B3u;      // STATUS_PIPE_LISTENING: a pipe that does not wait says that nobody is there yet

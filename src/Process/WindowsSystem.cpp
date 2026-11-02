@@ -29,7 +29,8 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 
 // A buffer the answer is built in; every field is little-endian at a fixed offset.
 struct Answer {
-  uint8_t bytes[320] = {};
+  uint8_t bytes[448] = {};
+  void put_text(uint32_t at, const char* text) { for (uint32_t i = 0; text[i]; ++i) put(at + 2 * i, uint8_t(text[i]), 2); }
   void put(uint32_t at, uint64_t value, uint32_t size) { for (uint32_t i = 0; i < size; ++i) bytes[at + i] = uint8_t(value >> (8 * i)); }
 };
 
@@ -80,6 +81,14 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
       a.put(0, now - since_boot, 8);     // BootTime
       a.put(8, now, 8);                  // CurrentTime
       size = 48;
+      break;
+    }
+    case 44:     // SystemCurrentTimeZoneInformation: a RTL_TIME_ZONE_INFORMATION (172 bytes), and
+    case 102: {  // SystemDynamicTimeZoneInformation: the same with the key name (128 characters) and DynamicDaylightTimeDisabled (432 bytes). The system runs on UTC.
+      a.put_text(4, "@tzres.dll,-112");      // StandardName
+      a.put_text(88, "@tzres.dll,-111");     // DaylightName
+      if (info_class == 102) a.put_text(172, "UTC");      // TimeZoneKeyName
+      size = info_class == 102 ? 432 : 172;
       break;
     }
     case 5: {    // SYSTEM_PROCESS_INFORMATION for each program, one after the other: the entry (0x100 bytes), its threads (SYSTEM_THREAD_INFORMATION, 0x50 bytes each), the image name's characters

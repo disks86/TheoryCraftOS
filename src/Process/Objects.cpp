@@ -319,7 +319,7 @@ void ObjectManager::free_pipe_locked(Object& o) {
   p = Pipe();
 }
 
-ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type, uint64_t pid) {
+ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type, uint64_t pid, uint32_t disposition) {
   Created result;
   if (!allocator_ || name.size() >= kNameBytes || access < kPipeInbound || access > kPipeDuplex) { result.status = !allocator_ ? 0xC0000002u : kInvalid; return result; }
   Locked hold(sync_);
@@ -334,11 +334,13 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
     for (Object& o : objects_) {
       if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
       ++instances;
+      if (disposition == 2) { result.status = 0xC0000022u; return result; }      // FILE_CREATE: the name is taken (STATUS_ACCESS_DENIED)
       const Pipe& other = pipes_[o.pipe];
       if (other.access != access) { result.status = 0xC0000022u; return result; }      // (every instance of a pipe has the same access)
       if (other.max_instances != 0 && instances >= other.max_instances) { result.status = kPipeBusy; return result; }
     }
     if (max_instances != 0 && instances >= max_instances) { result.status = kPipeBusy; return result; }
+    if (disposition == 1 && instances == 0) { result.status = 0xC0000034u; return result; }      // FILE_OPEN: STATUS_OBJECT_NAME_NOT_FOUND
   }
   int32_t pipe_index = -1;
   for (uint32_t i = 0; i < kMaxPipes && pipe_index < 0; ++i) if (!pipes_[i].used) pipe_index = static_cast<int32_t>(i);
@@ -939,7 +941,7 @@ bool ObjectManager::port_take_foreign(uint32_t semaphore_object, PortPacket* pac
   return false;
 }
 
-uint32_t ObjectManager::pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread) {
+uint32_t ObjectManager::pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread, uint64_t iosb) {
   Locked hold(sync_);
   for (uint32_t i = 0; i < kMaxSyncWaits; ++i) {
     SyncWait& w = sync_waits_[i];
@@ -947,6 +949,7 @@ uint32_t ObjectManager::pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t
     w = SyncWait();
     w.used = true;
     w.thread = thread;
+    w.iosb = iosb;
     w.pipe = id;
     w.end_code = end_code;
     Pipe* p = pipe_of(id);
@@ -970,10 +973,10 @@ void ObjectManager::pipe_sync_end(uint32_t slot) {
   sync_.notify_all();
 }
 
-bool ObjectManager::pipe_cancel_synchronous(uint64_t thread) {
+bool ObjectManager::pipe_cancel_synchronous(uint64_t thread, uint64_t iosb) {
   Locked hold(sync_);
   bool found = false;
-  for (SyncWait& w : sync_waits_) if (w.used && w.thread == thread && !w.cancelled) { w.cancelled = true; found = true; }
+  for (SyncWait& w : sync_waits_) if (w.used && w.thread == thread && !w.cancelled && (iosb == 0 || w.iosb == 0 || w.iosb == iosb)) { w.cancelled = true; found = true; }
   if (found) sync_.notify_all();
   return found;
 }

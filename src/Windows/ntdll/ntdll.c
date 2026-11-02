@@ -41,8 +41,8 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
   __asm__(".text\n.globl " #zw "\n" #zw ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##nt) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
 #define _STR(x) _STR2(x)
 #define _STR2(x) #x
-NT_SERVICE(NtReadFile);
-NT_SERVICE(NtWriteFile);
+NT_SERVICE_RAW(NtReadFile);
+NT_SERVICE_RAW(NtWriteFile);
 NT_SERVICE(NtCreateThreadEx);
 NT_SERVICE(NtTerminateThread);
 NT_SERVICE_RAW(NtWaitForSingleObject);
@@ -120,12 +120,12 @@ NT_SERVICE(NtQueryObject);
 NT_SERVICE(NtSetInformationObject);
 NT_SERVICE(NtCreatePipe);
 NT_SERVICE_RAW(NtCreateNamedPipeFile);
-NT_SERVICE(NtFsControlFile);
+NT_SERVICE_RAW(NtFsControlFile);
 NT_SERVICE(NtClose);
 NT_SERVICE(NtTerminateProcess);
 NT_SERVICE(NtYieldExecution);
 NT_SERVICE_RAW(NtDelayExecution);
-NT_SERVICE(NtQuerySystemTime);
+NT_SERVICE_RAW(NtQuerySystemTime);
 #include "services.inc"      /* the rest of the services: generated, the kernel answers STATUS_NOT_IMPLEMENTED for the ones it has no code for */
 #include "zw.inc"
 NT_SERVICE(NtAllocateVirtualMemory);
@@ -272,7 +272,7 @@ EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
     case 0xC0000056u: return 303;                       /* ERROR_DELETE_PENDING */
     case 0xC000007Bu: return 193;                       /* ERROR_BAD_EXE_FORMAT */
     case 0xC00000AEu: return 231;                       /* ERROR_PIPE_BUSY */
-    case 0xC00000AFu: return 535;                       /* ERROR_PIPE_CONNECTED */
+    case 0xC00000B2u: return 535;                       /* ERROR_PIPE_CONNECTED */
     case 0xC00000B0u: return 233;                       /* ERROR_PIPE_NOT_CONNECTED */
     case 0xC00000B1u: return 232;                       /* ERROR_NO_DATA (the pipe is being closed) */
     case 0xC00000B5u: return 121;                       /* ERROR_SEM_TIMEOUT */
