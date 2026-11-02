@@ -16,7 +16,7 @@ for src in "${payloads[@]}"; do
   clang -I tests/riscv_sys --target=riscv64-unknown-elf -march=rv64gcv_zba_zbb_zbs_zicsr_zifencei -mabi=lp64d -nostdlib -c "$src" -o "$work/$name.o"
   "$lld" -static -nostdlib -Ttext=0x80000000 -e _start "$work/$name.o" -o "$work/$name.elf"
   llvm-objcopy -O binary "$work/$name.elf" "$work/$name.bin"
-  timeout 60 qemu-system-riscv64 -M virt -cpu ${QEMU_CPU:-rv64,h=false,v=true,vlen=128,sstc=true,svadu=false,svade=true,sscofpmf=false,pmu-num=0} -m 64M -bios none -nographic -monitor none -serial file:"$work/$name.q.txt" -kernel "$work/$name.elf" -display none || true
+  timeout 60 qemu-system-riscv64 -M virt -cpu ${QEMU_CPU:-rv64,h=false,v=true,vlen=128,sstc=true,svadu=true,svade=true,svpbmt=true,svnapot=true,sscofpmf=false,pmu-num=0} -m 64M -bios none -nographic -monitor none -serial file:"$work/$name.q.txt" -kernel "$work/$name.elf" -display none || true
   "$work/sysrun" "$work/$name.bin" > "$work/$name.e.txt" || true
   if diff -q "$work/$name.q.txt" "$work/$name.e.txt" > /dev/null; then echo "== $name: identical ($(wc -l < "$work/$name.q.txt") lines)"; else echo "== $name: DIFFERENT"; diff "$work/$name.q.txt" "$work/$name.e.txt" | head -${DIFF_LINES:-30}; fail=1; fi
 done

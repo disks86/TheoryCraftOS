@@ -58,6 +58,15 @@ class RiscV64Machine final : public IRiscVBus {
   uint64_t ticks_ = 0, mtimecmp_ = ~uint64_t{0};
   uint32_t msip_ = 0;
   uint8_t uart_ier_ = 0, uart_lcr_ = 0, uart_mcr_ = 0, uart_scr_ = 0, uart_dll_ = 0, uart_dlm_ = 0;
+  // the PLIC (qemu virt's layout: 96 sources, a machine and a supervisor context for the one hart) and the UART's transmit-empty line, source 10
+  static constexpr uint32_t kSources = 96, kContexts = 2, kUartSource = 10;
+  bool source_line(uint32_t source) const { return source == kUartSource && (uart_ier_ & 2) && uart_thr_pending_; }
+  void plic_refresh();
+  uint32_t plic_best(uint32_t context) const;
+  uint32_t plic_priority_[kSources] = {};
+  uint32_t plic_pending_[kSources / 32] = {}, plic_claimed_[kSources / 32] = {}, plic_line_[kSources / 32] = {}, plic_enable_[kContexts][kSources / 32] = {};
+  uint32_t plic_threshold_[kContexts] = {};
+  bool uart_thr_pending_ = false;
   bool finished_ = false;
   uint32_t exit_code_ = 0;
 };
