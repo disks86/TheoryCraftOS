@@ -29,6 +29,7 @@
 #include "Browser/Fetcher.hpp"
 #include "Browser/Media.hpp"
 #include "Dom/Dom.hpp"
+#include "Kernel/Sync.hpp"
 #include "Script/Vm.hpp"
 
 namespace browser {
@@ -40,30 +41,53 @@ class PageObjects;
 class CacheStore;
 class ServiceWorkerHub;
 
-// A set of named strings: localStorage and sessionStorage.
+// A set of named strings: localStorage and sessionStorage. Shared by every page of one origin, and the pages run on threads of
+// their own (as CacheStore says), so every access takes the lock: text is copied out under it, and nothing keeps a view into
+// the lists, which grow and shrink.
 class StorageArea {
  public:
   explicit StorageArea(allocators::IAllocator& allocator) : allocator_(allocator), keys_(allocator), values_(allocator) {}
-  uint32_t count() const { return static_cast<uint32_t>(keys_.count()); }
-  StringView key(uint32_t i) const { return i < keys_.count() ? keys_[i].view() : StringView(); }
-  bool get(StringView key, StringView* value) const;
+  uint32_t count() const {
+    kernel::ScopedMutex lock(mutex_);
+    return static_cast<uint32_t>(keys_.count());
+  }
+  // The key at `index` ("" beyond the end).
+  String key(uint32_t i) const {
+    kernel::ScopedMutex lock(mutex_);
+    String out(allocator_);
+    if (i < keys_.count()) out.assign(keys_[i].view());
+    return out;
+  }
+  // Copies the value of `key` into `*value` (under the lock, so it outlives any concurrent change). False if there is none.
+  bool get(StringView key, String* value) const;
   // False if memory ran out or the storage limit (about 5 MB) was passed.
   bool set(StringView key, StringView value);
   bool remove(StringView key);
   void clear() {
+    kernel::ScopedMutex lock(mutex_);
     if (keys_.count() != 0) ++version_;
     keys_.clear();
     values_.clear();
   }
   // Goes up with every change (for whoever saves the storage), and the bytes it holds (keys and values).
-  uint64_t version() const { return version_; }
+  uint64_t version() const {
+    kernel::ScopedMutex lock(mutex_);
+    return version_;
+  }
   uint64_t bytes() const;
-  StringView value_at(uint32_t i) const { return i < values_.count() ? values_[i].view() : StringView(); }
+  // The value at `index` ("" beyond the end).
+  String value_at(uint32_t i) const {
+    kernel::ScopedMutex lock(mutex_);
+    String out(allocator_);
+    if (i < values_.count()) out.assign(values_[i].view());
+    return out;
+  }
 
  private:
   allocators::IAllocator& allocator_;
   List<String> keys_, values_;
   uint64_t version_ = 0;
+  mutable kernel::Mutex mutex_;   // (the pages of the origin share this area on their own threads)
 };
 
 // What a page puts on the clipboard in one go: plain text, html and a picture (PNG bytes); `has_` says which are given.

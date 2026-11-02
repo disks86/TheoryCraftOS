@@ -128,7 +128,7 @@ for t in "${WANTED[@]}"; do
     CookieTest) build_and_run CookieTest tests/CookieTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Browser/WebUrl.cpp src/Browser/CookieJar.cpp src/Browser/PublicSuffix.cpp ;;
     PrefetchTest) ASAN_OPTIONS=detect_leaks=0 build_and_run PrefetchTest tests/PrefetchTest.cpp tests/HostThreads.cpp src/Browser/ResourcePrefetcher.cpp -pthread ;;
     FetcherTest) build_and_run FetcherTest tests/FetcherTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Browser/WebUrl.cpp src/Browser/CookieJar.cpp src/Browser/PublicSuffix.cpp src/Browser/Fetcher.cpp ;;
-    HistoryTest) build_and_run HistoryTest tests/HistoryTest.cpp tests/KernelStubs.cpp src/Browser/SessionHistory.cpp src/Browser/PageHub.cpp ;;
+    HistoryTest) build_and_run HistoryTest tests/HistoryTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Browser/SessionHistory.cpp src/Browser/PageHub.cpp ;;
     CssTest) build_and_run CssTest tests/CssTest.cpp tests/KernelStubs.cpp src/Browser/HtmlDocument.cpp src/Browser/Renderer.cpp src/Browser/RendererBoxes.cpp src/Browser/Media.cpp src/Dom/*.cpp src/Browser/Css.cpp src/Browser/PageLayout.cpp src/Browser/Url.cpp src/Network/Http/HttpUrl.cpp ;;
     UrlTest) build_and_run UrlTest tests/UrlTest.cpp tests/KernelStubs.cpp src/Browser/WebUrl.cpp ;;
     ScriptTest) build_and_run ScriptTest tests/ScriptTest.cpp tests/KernelStubs.cpp src/Script/*.cpp src/Regex/Regex.cpp src/Math/FloatMath.cpp ;;

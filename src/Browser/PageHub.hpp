@@ -32,23 +32,37 @@ class StorageHub {
   explicit StorageHub(allocators::IAllocator& allocator) : allocator_(allocator), origins_(allocator), fallback_(allocator) {}
   // The storage of an origin ("https://example.com"; "null" for pages without one), made when first asked for.
   StorageArea& area(StringView origin);
-  uint32_t origin_count() const { return static_cast<uint32_t>(origins_.count()); }
+  uint32_t origin_count() const {
+    kernel::ScopedMutex lock(mutex_);
+    return static_cast<uint32_t>(origins_.count());
+  }
   void clear() {
+    kernel::ScopedMutex lock(mutex_);
     origins_.clear();
     ++clears_;
   }
   // Empties every origin's storage (the areas stay: pages hold references to them).
   void clear_all() {
+    kernel::ScopedMutex lock(mutex_);
     for (uint64_t i = 0; i < origins_.count(); ++i) origins_[i]->area.clear();
     ++clears_;
   }
   // For saving: goes up whenever anything in any origin changed; and the origins with their storage.
   uint64_t version() const;
-  StringView origin_name(uint32_t i) const { return i < origins_.count() ? origins_[i]->origin.view() : StringView(); }
-  StorageArea& area_at(uint32_t i) { return origins_[i]->area; }
+  StringView origin_name(uint32_t i) const {
+    kernel::ScopedMutex lock(mutex_);
+    return i < origins_.count() ? origins_[i]->origin.view() : StringView();
+  }
+  StorageArea& area_at(uint32_t i) {
+    kernel::ScopedMutex lock(mutex_);
+    return origins_[i]->area;
+  }
   uint64_t total_bytes() const {
     uint64_t sum = 0;
-    for (uint64_t i = 0; i < origins_.count(); ++i) sum += origins_[i]->area.bytes();
+    {
+      kernel::ScopedMutex lock(mutex_);
+      for (uint64_t i = 0; i < origins_.count(); ++i) sum += origins_[i]->area.bytes();
+    }
     return sum;
   }
 
@@ -62,6 +76,7 @@ class StorageHub {
   List<UniquePointer<Origin>> origins_;
   StorageArea fallback_;
   uint64_t clears_ = 0;
+  mutable kernel::Mutex mutex_;   // (guarding origins_ and clears_; always taken before an area's own lock)
 };
 
 struct HubEvent {
@@ -84,9 +99,15 @@ class PageHub {
   explicit PageHub(allocators::IAllocator& allocator) : allocator_(allocator), events_(allocator) {}
 
   // Pages register to get an id (it tells whose events are their own).
-  uint32_t add_page() { return ++next_page_; }
+  uint32_t add_page() {
+    kernel::ScopedMutex lock(mutex_);
+    return ++next_page_;
+  }
   void post(HubEvent&& event);
-  uint64_t serial() const { return serial_; }
+  uint64_t serial() const {
+    kernel::ScopedMutex lock(mutex_);
+    return serial_;
+  }
   // The next event after *seen that was not made by `page`, in its origin and storage group (group 0: any for broadcasts). False when there is none.
   bool next(uint32_t page, StringView origin, uint64_t* seen, HubEvent* out);
   // Are there events a page that has seen up to `seen` has not looked at?
@@ -97,6 +118,7 @@ class PageHub {
   List<HubEvent> events_;
   uint64_t serial_ = 0;
   uint32_t next_page_ = 0;
+  mutable kernel::Mutex mutex_;   // (events_ and serial_ are shared by every page, on their own threads)
 };
 
 }  // namespace browser

@@ -261,7 +261,7 @@ void storage_notify(Vm& vm, JsObject* o, const String* key, const String* old_va
 // Sets a value and reports the change, if it is one. False after throwing (the quota).
 bool storage_put(Vm& vm, JsObject* o, StringView key, StringView value) {
   StorageArea* a = area_of(o);
-  StringView existing;
+  String existing(vm.allocator());
   String old_copy(vm.allocator()), key_copy(vm.allocator()), value_copy(vm.allocator());
   const bool had = a->get(key, &existing);
   if (had) old_copy.assign(existing);
@@ -280,7 +280,7 @@ bool storage_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     *out = num_value(area_of(o)->count());
     return true;
   }
-  StringView v;
+  String v(vm.allocator());
   if (area_of(o)->get(k, &v)) {
     *out = str_value(vm, v);
     return true;
@@ -299,7 +299,7 @@ HostClass::Set storage_set(Vm& vm, JsObject* o, JsString* key, const Value& valu
 // Removes a key and reports it.
 void storage_drop(Vm& vm, JsObject* o, StringView key) {
   StorageArea* a = area_of(o);
-  StringView existing;
+  String existing(vm.allocator());
   if (!a->get(key, &existing)) return;
   String old_copy(vm.allocator()), key_copy(vm.allocator());
   old_copy.assign(existing);
@@ -330,7 +330,7 @@ NATIVE(storage_get_item) {
   JsObject* o = this_storage(vm, self);
   String key(vm.allocator());
   if (!o || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
-  StringView v;
+  String v(vm.allocator());
   *result = area_of(o)->get(key.view(), &v) ? str_value(vm, v) : Value::make_null();
   return true;
 }

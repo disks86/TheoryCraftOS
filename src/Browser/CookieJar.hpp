@@ -82,8 +82,15 @@ class CookieJar {
   }
   // count() and at() are for the thread that shows the cookies; store(), header_for(), remove_expired(), remove_host() and clear() may be called from several threads
   // at once (the browser's download threads set and send cookies while the page runs).
-  uint32_t count() const { return static_cast<uint32_t>(cookies_.count()); }
-  const Cookie& at(uint32_t index) const { return cookies_[index]; }
+  uint32_t count() const {
+    kernel::ScopedMutex lock(mutex_);
+    return static_cast<uint32_t>(cookies_.count());
+  }
+  // (no callers today; if a display thread reads it while a worker stores, copy it out instead of holding the reference)
+  const Cookie& at(uint32_t index) const {
+    kernel::ScopedMutex lock(mutex_);
+    return cookies_[index];
+  }
   // Removes all cookies of a host (and its subdomains).
   void remove_host(StringView host);
 
@@ -100,7 +107,7 @@ class CookieJar {
   void bump() { __atomic_add_fetch(&version_, 1, __ATOMIC_ACQ_REL); }
 
   allocators::IAllocator& allocator_;
-  kernel::Mutex mutex_;   // guards cookies_ and next_order_
+  mutable kernel::Mutex mutex_;   // guards cookies_ and next_order_ (mutable: count() and at() are const)
   List<Cookie> cookies_;
   uint64_t next_order_ = 1;
   uint64_t version_ = 0;
