@@ -31,6 +31,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(cmake/jit.cmake)
+
 if(TCOS_ARCH STREQUAL "aarch64")
   include(cmake/aarch64.cmake)
   return()
@@ -54,6 +56,9 @@ add_executable(BOOTX64
   src/UserModeDemo.cpp
   src/Kernel/Apic.cpp
   src/Kernel/Paging.cpp
+  src/Jit/CrossCoreTlbShootdown.cpp
+  src/Jit/KernelCodeMemory.cpp
+  ${TCOS_JIT_PORTABLE_SOURCES}
   src/Hardware/MmioMapper.cpp
   src/Hardware/Bus/Pci/PciBar.cpp
   src/Kernel/ThreadScheduler.cpp

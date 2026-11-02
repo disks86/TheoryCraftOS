@@ -61,6 +61,11 @@ class IPagingHost {
   virtual void write_pat(uint64_t value) = 0;
   virtual void invalidate_page(uint64_t address) = 0;
   virtual void invalidate_all() = 0;        // flush this core's translations
+  // Brackets a change to the tables. The firmware may keep its own page tables read-only (CR0.WP set, the tables' pages mapped RO), which would fault the writes: the
+  // real host switches write protection off on this core, with interrupts masked so that nothing else runs meanwhile, and end_table_edit() puts both back
+  // (the token carries what to restore). A pretend host has nothing to do.
+  virtual uint64_t begin_table_edit() { return 0; }
+  virtual void end_table_edit(uint64_t) {}
 
  protected:
   IPagingHost() = default;

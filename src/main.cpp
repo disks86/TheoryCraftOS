@@ -16,6 +16,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Jit/CodePageSource.hpp"
+#include "Jit/CrossCoreTlbShootdown.hpp"
+#include "Jit/KernelCodeMemory.hpp"
+#include "Jit/JitSelfTest.hpp"
+#include "Jit/KernelJit.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Firmware.hpp"
 #include "Allocators/Allocator.hpp"
@@ -569,6 +574,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // containers. (Two separate wrappers would use two locks and not exclude each other.)
   allocators::ThreadSafeAllocator shared_allocator(allocator, cpu);
 
+  // Code memory for the JIT compilers (emulator, JavaScript and WebAssembly VMs): up to 16 MiB of code in 2 MiB windows taken on first use, W^X through
+  // the page tables, with the other cores' TLBs flushed by inter-processor interrupt. Nothing is allocated until something compiles.
+  jit::CodePool jit_pool(shared_allocator, 8);
+  jit::CrossCoreTlbShootdown jit_shootdown(kernel::cpu_paging_host());
+  jit::KernelCodeMemory jit_code(paging, jit_pool, kernel::cpu_paging_host().nx_enabled(), &jit_shootdown);
+  if (paging_ok) jit::set_kernel_code_memory(&jit_code);
+
   // Then the display, so everything after it appears on screen. Falls back to the
   // firmware text console if no GPU class can drive a framebuffer.
   hardware::SystemPciBus system_pci(st, shared_allocator);
@@ -653,6 +665,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) {
       if (virtio->enable_interrupts()) Entry(Level::Ok, "GPU").text("virtio-gpu commands complete by interrupt (MSI-X)");
       else Entry(Level::Info, "GPU").text("virtio-gpu has no usable interrupt; waiting for commands by polling");
+    }
+    // The JIT's code memory, checked once the cores run: compile a small program, switch its pages to executable through the page tables, run it.
+    if (paging_ok) {
+      uint64_t jit_bytes = 0;
+      const jit::SelfTestResult jit_result = jit::jit_self_test(shared_allocator, jit_code, &jit_bytes);
+      Entry e(jit_result == jit::SelfTestResult::Passed ? Level::Ok : Level::Fault, "JIT");
+      e.text("self test ").text(jit::self_test_result_name(jit_result));
+      if (jit_result == jit::SelfTestResult::Passed) e.text(": ").dec(jit_bytes).text(" bytes of code run, ").text(jit_code.nx_enforced() ? "W^X enforced (NX)" : "no NX: W^X not enforced");
     }
 #ifdef TCOS_SELFTESTS
     if (!run_kernel_demo(shared_allocator)) console::puts("  kernel self-check incomplete\n");

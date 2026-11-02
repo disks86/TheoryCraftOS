@@ -60,6 +60,7 @@ add_executable(BOOTAA64
   src/Hardware/GraphicsProcessingUnit/Broadcom/V3dGpuMemory.cpp
   src/Hardware/GraphicsProcessingUnit/Broadcom/V3dSelfTest.cpp
   src/Hardware/VideoCodec/Broadcom/RpiHevcBlock.cpp
+  ${TCOS_JIT_PORTABLE_SOURCES}
 )
 target_include_directories(BOOTAA64 PRIVATE src)
 set_target_properties(BOOTAA64 PROPERTIES SUFFIX ".efi" LINKER_LANGUAGE CXX)
