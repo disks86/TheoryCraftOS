@@ -52,14 +52,42 @@ bool slot_of(uint64_t handle, uint64_t* slot) {
   return true;
 }
 
-// The pipe name in an OBJECT_ATTRIBUTES, when it is one: the part after "\\??\\pipe\\" or "\\Device\\NamedPipe\\" in UTF-8 (empty for the folder; *device: the path had no backslash after
-// the pipe device, so it names the device itself). False if the path is something else.
-bool pipe_name(Process& p, uint64_t attributes, String* name, bool* device = nullptr) {
+// What an OBJECT_ATTRIBUTES names, when it names a pipe: a full path ("\\??\\pipe\\name", "\\Device\\NamedPipe\\name"), a name below the handle of the pipe directory, or - with an empty
+// name below the handle of a pipe - that instance. *name is the part after the pipe device in UTF-8 (empty: the directory or, with *device, the device itself); `status` is not 0
+// when the reference is refused (below the device, a name below an instance). The name is taken as it is: "/" is no separator, "." and ".." are names, a last backslash is part of it.
+struct PipeRef {
+  String name;
+  bool device = false, instance = false;      // (instance: the name is the one of the instance a handle names)
+  uint32_t status = 0;
+  explicit PipeRef(allocators::IAllocator& allocator) : name(allocator) {}
+};
+
+bool pipe_reference(Process& p, uint64_t attributes, PipeRef* ref) {
   if (attributes == 0) return false;
-  uint64_t name_at = 0;
-  if (!p.read_user_u64(attributes + 16, &name_at) || name_at == 0) return false;
+  uint64_t name_at = 0, root = 0;
+  if (!p.read_user_u64(attributes + 16, &name_at)) return false;
+  p.read_user_u64(attributes + 8, &root);
   String text(p.files().allocator());
-  if (read_unicode_string_argument(p, name_at, &text) != kSuccess) return false;
+  if (name_at != 0 && read_unicode_string_argument(p, name_at, &text) != kSuccess) return false;
+  uint64_t root_slot = 0;
+  if (root != 0) {
+    if (!slot_of(root, &root_slot) || p.files().kind(root_slot) != DescriptorKind::Pipe) return false;
+    const uint64_t token = p.files().token(root_slot);
+    if (token & kFolder) {
+      if (token & kDevice) { ref->status = 0xC0000033u; return true; }      // (nothing is below the device: STATUS_OBJECT_NAME_INVALID)
+      ref->name.assign(text.view());
+      return true;
+    }
+    if (!text.empty()) { ref->status = 0xC0000033u; return true; }
+    ObjectManager* objects = system_objects();
+    char instance[ObjectManager::kNameBytes];
+    const uint32_t size = objects ? objects->object_name(token_id(token), instance, sizeof(instance)) : 0;
+    if (size == 0) { ref->status = 0xC0000033u; return true; }
+    ref->name.assign(StringView(instance, size));
+    ref->instance = true;
+    return true;
+  }
+  if (name_at == 0) return false;
   static const char* const prefixes[] = {"\\??\\pipe\\", "\\Device\\NamedPipe\\", "\\??\\pipe", "\\Device\\NamedPipe"};
   for (const char* prefix : prefixes) {
     uint64_t n = 0;
@@ -72,12 +100,15 @@ bool pipe_name(Process& p, uint64_t attributes, String* name, bool* device = nul
       same = a == b;
     }
     if (!same) continue;
-    if (device) *device = prefix[n - 1] != '\\';
-    name->assign(text.view().without_prefix(n));      // (the name is taken as it is: "/" is no separator, "." and ".." are names, a last backslash is part of it)
+    ref->device = prefix[n - 1] != '\\';
+    ref->name.assign(text.view().without_prefix(n));
     return true;
   }
   return false;
 }
+
+// The name of an unnamed pipe instance (one made below the pipe directory with no name): nobody can ask for it by name, a handle to the instance is the way to it.
+bool is_hidden_name(StringView name) { return name.size() > 0 && name[0] == '\x01'; }
 
 uint32_t result_status(ObjectManager::PipeResult r, bool server, bool write) {
   switch (r) {
@@ -217,8 +248,18 @@ uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r) {
     return kAccessViolation;
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
-  String name(p.files().allocator());
-  if (!pipe_name(p, r.args[2], &name) || name.empty()) return 0xC0000033u;
+  PipeRef ref(p.files().allocator());
+  if (!pipe_reference(p, r.args[2], &ref)) return 0xC0000033u;
+  if (ref.status) return ref.status;
+  String& name = ref.name;
+  uint64_t root_handle = 0;
+  p.read_user_u64(r.args[2] + 8, &root_handle);
+  if (name.empty() && root_handle != 0 && !ref.instance) {      // below the pipe directory with no name: an instance that only its handle leads to
+    static uint32_t g_unnamed = 0;
+    const uint32_t number = __atomic_add_fetch(&g_unnamed, 1, __ATOMIC_RELAXED);
+    if (!name.assign("\x01unnamed.") || !name.append_uint(number)) return kNoMemory;
+  }
+  if (name.empty() || ref.instance) return 0xC0000033u;
   uint64_t disposition = 0, options = 0;
   if (!argument(p, r, 5, &disposition) || !argument(p, r, 6, &options)) return kAccessViolation;
   if (uint32_t(disposition) > 3) return kInvalidParameter;      // FILE_OVERWRITE and FILE_OVERWRITE_IF make no sense for a pipe
@@ -268,9 +309,11 @@ uint32_t nt_cancel_synchronous_io_file(Process& p, const SyscallRequest& r) {
 }
 
 bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, uint32_t options, uint32_t* status, uint64_t* handle) {
-  String name(p.files().allocator());
-  bool device = false;
-  if (!pipe_name(p, object_attributes, &name, &device)) return false;
+  PipeRef ref(p.files().allocator());
+  if (!pipe_reference(p, object_attributes, &ref)) return false;
+  if (ref.status) { *status = ref.status; return true; }
+  String& name = ref.name;
+  const bool device = ref.device;
   ObjectManager* objects = system_objects();
   if (!objects) { *status = kNotImplemented; return true; }
   const bool inherit = wants_inherit(p, object_attributes);
@@ -278,9 +321,10 @@ bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, 
     *status = give_pipe_handle(p, kFolder | (device ? kDevice : 0), inherit, handle);
     return true;
   }
+  if (is_hidden_name(name.view()) && !ref.instance) { *status = kObjectNameNotFound; return true; }      // (no name leads to an instance without one)
   const bool read = (access & (0x80000000u | 0x1)) != 0, write = (access & (0x40000000u | 0x2 | 0x4)) != 0;      // GENERIC_READ/FILE_READ_DATA, GENERIC_WRITE/FILE_WRITE_DATA/FILE_APPEND_DATA
   const ObjectManager::Created c = objects->connect_pipe(name.view(), read, write, p.id());
-  if (c.id == 0) { *status = c.status; return true; }
+  if (c.id == 0) { *status = ref.instance && c.status == kPipeBusy ? 0xC00000ACu : c.status; return true; }      // (an instance that is taken is not available; no instance is all busy)
   *status = give_pipe_handle(p, make_token(c.id, c.end_code, read || !write, write) | ((options & 0x30) ? 0 : kAsyncIo) | ((options & 0x10) ? kAlertIo : 0), inherit, handle);
   if (*status == kSuccess) set_pipe_rights(p, *handle, access);
   if (*status != kSuccess) objects->release_pipe_end(c.id, c.end_code);
@@ -702,17 +746,17 @@ uint32_t fs_control_core(Process& p, const SyscallRequest& r, uint64_t slot, con
     case 0x110018: {    // FSCTL_PIPE_WAIT: FILE_PIPE_WAIT_FOR_BUFFER { LARGE_INTEGER Timeout; ULONG NameLength; BOOLEAN TimeoutSpecified; WCHAR Name[] }
       if (!(token & kFolder)) break;
       if (token & kDevice) { status = 0xC00000AFu; break; }      // (the device itself cannot wait for a pipe: STATUS_ILLEGAL_FUNCTION)
-      if (input_length < 20 || input_length > 20 + 2 * 256) { status = kInvalidParameter; break; }
-      uint8_t raw[20 + 2 * 256];
+      if (input_length < 14 || input_length > 14 + 2 * 256) { status = kInvalidParameter; break; }
+      uint8_t raw[14 + 2 * 256];
       if (!p.read_user(input, ByteView(raw, input_length))) return kAccessViolation;
       uint64_t timeout = 0;
       for (uint32_t i = 0; i < 8; ++i) timeout |= uint64_t{raw[i]} << (8 * i);
       const uint32_t name_bytes = raw[8] | (uint32_t{raw[9]} << 8) | (uint32_t{raw[10]} << 16) | (uint32_t{raw[11]} << 24);
-      if (name_bytes % 2 != 0 || name_bytes > input_length - 20) { status = kInvalidParameter; break; }
+      if (name_bytes % 2 != 0 || name_bytes > input_length - 14) { status = kInvalidParameter; break; }
       char name[256 + 1];
       uint32_t n = 0;
       for (uint32_t i = 0; i < name_bytes / 2 && n < 256; ++i) {
-        const uint32_t unit = raw[20 + 2 * i] | (uint32_t{raw[21 + 2 * i]} << 8);
+        const uint32_t unit = raw[14 + 2 * i] | (uint32_t{raw[15 + 2 * i]} << 8);
         if (unit >= 0x80) { status = kInvalidParameter; n = 0xFFFF; break; }
         name[n++] = char(unit);
       }

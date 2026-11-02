@@ -3054,8 +3054,8 @@ EXPORT BOOL WINAPI WaitNamedPipeW(LPCWSTR name, DWORD timeout_ms) {
   IO_STATUS_BLOCK iosb;
   NTSTATUS status = NtOpenFile(&h, 0x80100000u, &folder_attributes, &iosb, 3, 0x20);
   if (!NT_SUCCESS(status)) return fail_nt(status);
-  BYTE request[20 + 2 * 256];
-  memset(request, 0, 20);
+  BYTE request[14 + 2 * 256];
+  memset(request, 0, 14);
   LARGE_INTEGER timeout;
   /* NMPWAIT_USE_DEFAULT_WAIT 0 (the pipe's own), NMPWAIT_WAIT_FOREVER 0xFFFFFFFF */
   timeout.QuadPart = timeout_ms == 0xFFFFFFFFu ? (LONGLONG)0x8000000000000000ull : -10000ll * timeout_ms;
@@ -3063,8 +3063,8 @@ EXPORT BOOL WINAPI WaitNamedPipeW(LPCWSTR name, DWORD timeout_ms) {
   const DWORD name_bytes = (DWORD)(n * 2);
   memcpy(request + 8, &name_bytes, 4);
   request[12] = timeout_ms != 0;      /* TimeoutSpecified */
-  memcpy(request + 20, leaf, n * 2);
-  status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_WAIT_, request, 20 + name_bytes, NULL, 0);
+  memcpy(request + 14, leaf, n * 2);      /* (FILE_PIPE_WAIT_FOR_BUFFER: Timeout, NameLength, TimeoutSpecified, then the name at 14) */
+  status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_WAIT_, request, 14 + name_bytes, NULL, 0);
   NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
