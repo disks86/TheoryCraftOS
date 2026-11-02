@@ -781,7 +781,8 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     return kInvalidDeviceRequest;      // FileStandardInformation: a console has no size
   if (kind == DescriptorKind::Pipe && static_cast<uint32_t>(info_class) == kFileNameInformation) {      // "\\name": where a pipe is
     String pipe_name(files.allocator()), windows_name(files.allocator());
-    if (!pipe_handle_name(p, slot, &pipe_name)) return kInvalidParameter;
+    if ((r.args[3] & 0xFFFFFFFFu) < 8) return kInfoLengthMismatch;      // (a FILE_NAME_INFORMATION is the length and at least one character)
+    if (!pipe_handle_name(p, slot, &pipe_name)) return kInvalidParameter;      // (not for the pipe device or its directory)
     if (pipe_name.empty()) {      // an anonymous pipe has a name too: "Win32Pipes.<process>.<number>"
       static const char digits[] = "0123456789abcdef";
       const uint32_t number = uint32_t(p.files().token(slot));

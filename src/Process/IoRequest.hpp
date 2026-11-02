@@ -103,6 +103,7 @@ class IoRequestTable {
 struct Packet {
   uint64_t key = 0, context = 0, information = 0;
   uint32_t status = 0;
+  uint64_t status_block = 0, owner = 0;      // a call cancelled by the close of a handle: the IO_STATUS_BLOCK of the process that made it is written when the packet is taken (0: none)
 };
 
 class CompletionQueue {

@@ -53,8 +53,7 @@ bool slot_of(uint64_t handle, uint64_t* slot) {
 }
 
 // The pipe name in an OBJECT_ATTRIBUTES, when it is one: the part after "\\??\\pipe\\" or "\\Device\\NamedPipe\\" in UTF-8 (empty for the folder; *device: the path had no backslash after
-// the pipe device, so it names the device itself), normalized as NPFS does: "/" is "\\", "." and ".." components are resolved, a last backslash is part of the name. False if the path
-// is something else.
+// the pipe device, so it names the device itself). False if the path is something else.
 bool pipe_name(Process& p, uint64_t attributes, String* name, bool* device = nullptr) {
   if (attributes == 0) return false;
   uint64_t name_at = 0;
@@ -74,29 +73,7 @@ bool pipe_name(Process& p, uint64_t attributes, String* name, bool* device = nul
     }
     if (!same) continue;
     if (device) *device = prefix[n - 1] != '\\';
-    const StringView rest = text.view().without_prefix(n);
-    // components: split at backslashes (and slashes), "." dropped, ".." takes the one before away
-    String out(p.files().allocator());
-    uint64_t starts[64], count = 0;
-    bool trailing = !rest.empty() && (rest[rest.size() - 1] == '\\' || rest[rest.size() - 1] == '/');
-    uint64_t i = 0;
-    while (i < rest.size()) {
-      while (i < rest.size() && (rest[i] == '\\' || rest[i] == '/')) ++i;
-      uint64_t j = i;
-      while (j < rest.size() && rest[j] != '\\' && rest[j] != '/') ++j;
-      const uint64_t length = j - i;
-      if (length == 0) break;
-      if (length == 1 && rest[i] == '.') { i = j; continue; }
-      if (length == 2 && rest[i] == '.' && rest[i + 1] == '.') { if (count > 0) { --count; out.truncate(starts[count]); } i = j; continue; }
-      if (count == 64) return false;
-      starts[count] = out.size();
-      if (count > 0 && !out.push_back('\\')) return false;
-      ++count;
-      for (uint64_t k = i; k < j; ++k) if (!out.push_back(rest[k])) return false;
-      i = j;
-    }
-    if (trailing && !out.push_back('\\')) return false;
-    name->assign(out.view());
+    name->assign(text.view().without_prefix(n));      // (the name is taken as it is: "/" is no separator, "." and ".." are names, a last backslash is part of it)
     return true;
   }
   return false;
@@ -607,7 +584,7 @@ uint32_t pipe_set_information(Process& p, uint64_t slot, uint32_t info_class, ui
 
 bool pipe_handle_name(Process& p, uint64_t slot, String* name) {
   ObjectManager* objects = system_objects();
-  if (!objects || p.files().kind(slot) != DescriptorKind::Pipe) return false;
+  if (!objects || p.files().kind(slot) != DescriptorKind::Pipe || (p.files().token(slot) & kFolder)) return false;
   char text[ObjectManager::kNameBytes];
   const uint32_t size = objects->object_name(token_id(p.files().token(slot)), text, sizeof(text));
   return name->assign(StringView(text, size));
@@ -636,7 +613,7 @@ uint32_t fs_control_core(Process& p, const SyscallRequest& r, uint64_t slot, con
       case 0x110000: case 0x110010: case 0x110020: status = 0xC00000BBu; break;      // ASSIGN_EVENT, QUERY_EVENT, SET_CLIENT_PROCESS: STATUS_NOT_SUPPORTED
       case 0x110004: case 0x11C017: status = kPipeDisconnected; break;      // DISCONNECT, TRANSCEIVE
       case 0x110008: case 0x11001C: status = 0xC00000AFu; break;      // LISTEN, IMPERSONATE: STATUS_ILLEGAL_FUNCTION
-      case 0x11400C: case 0x110024: case 0x110040: status = kInvalidParameter; break;      // PEEK, QUERY_CLIENT_PROCESS, GET_CONNECTION_ATTRIBUTE
+      case 0x11400C: case 0x110024: case 0x110030: status = kInvalidParameter; break;      // PEEK, QUERY_CLIENT_PROCESS, GET_CONNECTION_ATTRIBUTE
       default: status = kInvalidDeviceRequest; break;
     }
   }

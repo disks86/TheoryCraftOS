@@ -734,13 +734,15 @@ uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target
   if (!slot_of(r.args[1], &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
   const DescriptorKind kind = p.files().kind(slot);
   ObjectManager* objects = system_objects();
-  if (!is_object_kind(kind) || !objects) return kNotImplemented;
-  const uint32_t id = uint32_t(p.files().token(slot));
+  const bool pipe = kind == DescriptorKind::Pipe;      // (a pipe handle is copied with its token: the other program holds the end too)
+  if ((!is_object_kind(kind) && !pipe) || !objects) return kNotImplemented;
+  const uint64_t token = p.files().token(slot);
+  const uint32_t id = uint32_t(token);
   const uint32_t original = p.files().denied_access(slot);
   IProcessRuntime::RemoteOp op;
   op.kind = IProcessRuntime::RemoteOp::Duplicate;
   op.type = uint32_t(kind);
-  op.argument = id;
+  op.argument = pipe ? token : id;
   op.protect = (options & 2) ? original : (original | ~mapped_access(kind, uint32_t(desired_access)));
   if (!(options & 2)) {      // a program that runs under a restricted token only gets the rights the handle holds
     ByteBuffer blob(*objects->allocator());
@@ -750,9 +752,9 @@ uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target
         (mapped_access(kind, uint32_t(desired_access)) & a.valid & original)) return kAccessDeniedStatus;
   }
   op.suspended = (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0;
-  objects->add_ref(id);
+  if (pipe) pipe_token_add(token); else objects->add_ref(id);
   const uint32_t status = p.runtime()->remote_operation(pid, op);
-  if (status != kSuccess) { objects->release(id); return status; }
+  if (status != kSuccess) { if (pipe) pipe_token_release(token); else objects->release(id); return status; }
   if (target_at != 0 && !p.write_user_u64(target_at, op.address)) return kAccessViolation;      // (the copy stays, as the handle was already made)
   if (options & 1) p.close_descriptor(slot);      // DUPLICATE_CLOSE_SOURCE
   return kSuccess;

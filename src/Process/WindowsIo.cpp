@@ -166,7 +166,7 @@ void io_reap(Process& p) {
         const uint64_t count = r.data.size() < r.buffer_length ? r.data.size() : r.buffer_length;
         if (count != 0) p.write_user(r.buffer, ConstByteView(r.data).first(count));
       }
-      store_status_block(p, r.status_block, r.status, r.information);
+      if (!r.on_close) store_status_block(p, r.status_block, r.status, r.information);
       if (!r.on_close) {
         if (r.event_object != 0) objects->set_event(r.event_object, nullptr);
         else objects->io_signal_source(r.source, r.source_end);
@@ -175,6 +175,7 @@ void io_reap(Process& p) {
       if (r.port_object != 0 && r.port_context != 0 && !(r.on_close && r.event_object != 0)) {
         io::Packet packet;
         packet.key = r.port_key; packet.context = r.port_context; packet.information = r.information; packet.status = r.status;
+        if (r.on_close) { packet.status_block = r.status_block; packet.owner = r.owner; }
         objects->port_post(r.port_object, packet);
       }
       objects->io_dispose(r);
@@ -326,6 +327,7 @@ uint32_t nt_remove_io_completion(Process& p, const SyscallRequest& r) {
   uint32_t got = 0;
   const uint32_t status = wait_port(p, port, timeout, false, &packet, 1, &got);
   if (status != kSuccess) return status;
+  if (packet.status_block != 0 && packet.owner == p.id()) store_status_block(p, packet.status_block, packet.status, packet.information);      // (a call cancelled by the close of a handle: its IO_STATUS_BLOCK is written now)
   if ((r.args[1] != 0 && !p.write_user_u64(r.args[1], packet.key)) || (r.args[2] != 0 && !p.write_user_u64(r.args[2], packet.context)) || !store_status_block(p, r.args[3], packet.status, packet.information)) return kAccessViolation;
   return kSuccess;
 }
@@ -350,6 +352,7 @@ uint32_t nt_remove_io_completion_ex(Process& p, const SyscallRequest& r) {
   }
   for (uint32_t i = 0; i < got; ++i) {      // FILE_IO_COMPLETION_INFORMATION { KeyContext, ApcContext, IoStatusBlock (Status, Information) }: 32 bytes
     const uint64_t at = r.args[1] + uint64_t{i} * 32;
+    if (packets[i].status_block != 0 && packets[i].owner == p.id()) store_status_block(p, packets[i].status_block, packets[i].status, packets[i].information);
     if (!p.write_user_u64(at, packets[i].key) || !p.write_user_u64(at + 8, packets[i].context) || !store_status_block(p, at + 16, packets[i].status, packets[i].information)) return kAccessViolation;
   }
   if (removed_at != 0 && !p.write_user_u32(removed_at, got)) return kAccessViolation;
