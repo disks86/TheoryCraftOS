@@ -2633,7 +2633,15 @@ EXPORT BOOL WINAPI SetHandleInformation(HANDLE h, DWORD mask, DWORD flags) {
 
 EXPORT BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *counter) { LARGE_INTEGER f; return NT_SUCCESS(NtQueryPerformanceCounter(counter, &f)); }
 EXPORT BOOL WINAPI QueryPerformanceFrequency(LARGE_INTEGER *frequency) { LARGE_INTEGER c; return NT_SUCCESS(NtQueryPerformanceCounter(&c, frequency)); }
-EXPORT ULONGLONG WINAPI GetTickCount64(void) { LARGE_INTEGER c, f; NtQueryPerformanceCounter(&c, &f); return (ULONGLONG)c.QuadPart / 10000; }
+EXPORT ULONGLONG WINAPI GetTickCount64(void) {      /* (from KUSER_SHARED_DATA, as Windows does; the system service brings it up to date: TickCount, in milliseconds when the multiplier is 1 << 24) */
+  LARGE_INTEGER c, f;
+  volatile LONG *t = (volatile LONG *)(0x7ffe0000ull + 0x320);
+  LONG high;
+  ULONG low;
+  NtQueryPerformanceCounter(&c, &f);
+  do { high = t[1]; low = (ULONG)t[0]; } while (high != t[2]);
+  return ((((ULONGLONG)(ULONG)high << 32) | low) * *(volatile ULONG *)(0x7ffe0000ull + 4)) >> 24;
+}
 EXPORT DWORD WINAPI GetTickCount(void) { return (DWORD)GetTickCount64(); }
 EXPORT void WINAPI GetSystemTimeAsFileTime(LPFILETIME ft) {
   LARGE_INTEGER t;
@@ -2856,7 +2864,7 @@ EXPORT BOOL WINAPI WriteFile(HANDLE h, LPCVOID buffer, DWORD length, LPDWORD wri
   }
   if (written) *written = 0;
   iosb.Information = 0;
-  const NTSTATUS status = NtWriteFile(h, NULL, NULL, NULL, &iosb, (PVOID)buffer, length, pointer, NULL);
+  const NTSTATUS status = RtlTcosWriteFileBlocking(h, NULL, NULL, NULL, &iosb, (PVOID)buffer, length, pointer, NULL);
   if (!NT_SUCCESS(status)) return fail_nt(status);      /* (a call that fails at once leaves the OVERLAPPED as it set it: still pending) */
   complete_overlapped(overlapped, status, iosb.Information);
   port_note(h, overlapped, iosb.Information);
@@ -2939,7 +2947,7 @@ EXPORT HANDLE WINAPI CreateNamedPipeW(LPCWSTR name, DWORD open_mode, DWORD pipe_
   timeout.QuadPart = -10000ll * (timeout_ms ? timeout_ms : 50);
   HANDLE h = NULL;
   IO_STATUS_BLOCK iosb;
-  const NTSTATUS status = NtCreateNamedPipeFile(&h, 0x00100000u /* SYNCHRONIZE */ | ((open_mode & 1) ? 0x80000000u : 0) | ((open_mode & 2) ? 0x40000000u : 0) | (open_mode & (0x00040000u | 0x00080000u | 0x01000000u)) /* WRITE_DAC, WRITE_OWNER, ACCESS_SYSTEM_SECURITY */, &attributes, &iosb, share, 3 /* FILE_OPEN_IF */, 0x20,
+  const NTSTATUS status = NtCreateNamedPipeFile(&h, 0x00100000u /* SYNCHRONIZE */ | ((open_mode & 1) ? 0x80000000u : 0) | ((open_mode & 2) ? 0x40000000u : 0) | (open_mode & (0x00040000u | 0x00080000u | 0x01000000u)) /* WRITE_DAC, WRITE_OWNER, ACCESS_SYSTEM_SECURITY */, &attributes, &iosb, share, 3 /* FILE_OPEN_IF */, (open_mode & 0x40000000u) ? 0 : 0x20 /* FILE_SYNCHRONOUS_IO_NONALERT unless FILE_FLAG_OVERLAPPED */,
                                                 (pipe_mode & 4) ? 1 : 0, (pipe_mode & 2) ? 1 : 0, (pipe_mode & 1) ? 1 : 0, max_instances == 255 ? 0xFFFFFFFFu : max_instances,
                                                 in_size, out_size, &timeout);
   if (!NT_SUCCESS(status)) { fail_nt(status); return INVALID_HANDLE_VALUE; }
@@ -3055,7 +3063,7 @@ EXPORT BOOL WINAPI ConnectNamedPipe(HANDLE h, LPOVERLAPPED overlapped) {
   if (pipe_start_overlapped(2, h, NULL, 0, overlapped, NULL)) return FALSE;
   IO_STATUS_BLOCK iosb;
   if (overlapped) overlapped->Internal = (ULONG_PTR)STATUS_PENDING;
-  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_LISTEN_, NULL, 0, NULL, 0);
+  const NTSTATUS status = RtlTcosFsControlFileBlocking(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_LISTEN_, NULL, 0, NULL, 0);
   if (NT_SUCCESS(status)) complete_overlapped(overlapped, status, 0);      /* (a call that fails, such as one on a pipe already connected, leaves the OVERLAPPED pending) */
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -3094,7 +3102,7 @@ EXPORT BOOL WINAPI TransactNamedPipe(HANDLE h, LPVOID in, DWORD in_size, LPVOID 
   }
   IO_STATUS_BLOCK iosb;
   iosb.Information = 0;
-  const NTSTATUS status = NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_TRANSCEIVE_, in, in_size, out, out_size);
+  const NTSTATUS status = RtlTcosFsControlFileBlocking(h, NULL, NULL, NULL, &iosb, FSCTL_PIPE_TRANSCEIVE_, in, in_size, out, out_size);
   complete_overlapped(overlapped, status, iosb.Information);
   if (!NT_SUCCESS(status)) return fail_nt(status);
   if (read) *read = (DWORD)iosb.Information;
@@ -3333,7 +3341,7 @@ EXPORT BOOL WINAPI ReadFile(HANDLE h, LPVOID buffer, DWORD length, LPDWORD read,
   }
   if (read) *read = 0;
   iosb.Information = 0;
-  const NTSTATUS status = NtReadFile(h, NULL, NULL, NULL, &iosb, buffer, length, pointer, NULL);
+  const NTSTATUS status = RtlTcosReadFileBlocking(h, NULL, NULL, NULL, &iosb, buffer, length, pointer, NULL);
   if (status == STATUS_BUFFER_OVERFLOW) {      /* a message read in part: the bytes are there, the call says there is more */
     if (read && !overlapped) *read = (DWORD)iosb.Information;
     complete_overlapped(overlapped, status, iosb.Information);
@@ -3787,6 +3795,7 @@ EXPORT HANDLE WINAPI CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECU
     options &= ~(ULONG)FILE_NON_DIRECTORY_FILE_;
     options |= FILE_DIRECTORY_FILE_;
   }
+  if (is_pipe && (flags & 0x40000000u /* FILE_FLAG_OVERLAPPED */)) options &= ~(ULONG)FILE_SYNCHRONOUS_IO_NONALERT_;
   if (flags & 0x00200000u /* FILE_FLAG_OPEN_REPARSE_POINT */) options |= 0x00200000u;      /* FILE_OPEN_REPARSE_POINT: a link is opened itself */
   HANDLE handle = NULL;
   IO_STATUS_BLOCK iosb;

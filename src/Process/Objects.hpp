@@ -80,7 +80,7 @@ class ObjectManager {
   allocators::IAllocator* allocator() const { return allocator_; }
   static constexpr uint32_t kPipeInbound = 1, kPipeOutbound = 2, kPipeDuplex = 3;      // the server's direction (PIPE_ACCESS_*); anonymous pipes are outbound
   // `name` empty: an anonymous pipe, already connected. Otherwise a new instance of the pipe of that name (up to `max_instances` of them, 0: no limit), not connected.
-  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false, uint64_t pid = 0);
+  Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false, uint64_t pid = 0, uint32_t disposition = 3);
   // A client connects to an instance of the named pipe that is not connected yet (status 0xC0000034 if no pipe has the name, 0xC00000AE if all are connected).
   // `want_read` / `want_write`: what the client asks for; an instance whose direction does not allow it is refused (0xC0000022) and stays unconnected.
   Created connect_pipe(StringView name, bool want_read, bool want_write, uint64_t pid = 0);
@@ -130,10 +130,10 @@ class ObjectManager {
   void pipe_owner_gone(uint64_t pid);      // the process ended: what it waits for is cancelled
   // A thread that waits in the kernel for a call on a pipe end (one that is not an operation of the pipe): while it does, the file object is not signalled, and
   // CancelSynchronousIo can end the call. begin returns a slot (1 and up), 0 if there is none.
-  uint32_t pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread);
+  uint32_t pipe_sync_begin(uint32_t id, uint32_t end_code, uint64_t thread, uint64_t iosb = 0);
   bool pipe_sync_cancelled_locked(uint32_t slot);
   void pipe_sync_end(uint32_t slot);
-  bool pipe_cancel_synchronous(uint64_t thread);      // false if the thread waits for no call
+  bool pipe_cancel_synchronous(uint64_t thread, uint64_t iosb = 0);      // false if the thread waits for no call
   // A pipe end tied to an I/O completion port (a semaphore object that the library's port is counted by): when a process ends while a call of it waits on the end, the packet for
   // that call cannot be queued by the process, so the kernel keeps it for the port (port_take_foreign) and releases the semaphore once.
   struct PortPacket { uint32_t bytes = 0, status = 0; uint64_t key = 0, overlapped = 0; };
@@ -446,7 +446,7 @@ class ObjectManager {
   void free_mailslot_locked(Object& o);
 
   ISystemSync& sync_;
-  struct SyncWait { uint64_t thread = 0; uint32_t pipe = 0, end_code = 0; bool used = false, cancelled = false; };
+  struct SyncWait { uint64_t thread = 0, iosb = 0; uint32_t pipe = 0, end_code = 0; bool used = false, cancelled = false; };
   static constexpr uint32_t kMaxSyncWaits = 64;
   SyncWait sync_waits_[kMaxSyncWaits];
   struct ForeignPacket { uint32_t semaphore = 0; PortPacket packet; };

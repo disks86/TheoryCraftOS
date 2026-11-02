@@ -332,7 +332,7 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   ProcessFiles& files = p.files();
   {
     uint32_t pipe_status = 0;
-    if (pipe_open_by_name(p, object_attributes, access, &pipe_status, handle)) {      // \\.\pipe\name
+    if (pipe_open_by_name(p, object_attributes, access, options, &pipe_status, handle)) {      // \\.\pipe\name
       if (pipe_status == kSuccess) *information = 1;      // FILE_OPENED
       return pipe_status;
     }
@@ -508,8 +508,8 @@ uint32_t read_offset(Process& p, uint64_t pointer, uint64_t* value) {
 }
 
 uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
-  uint64_t apc = 0, status_block = 0, buffer = 0, length = 0, offset_pointer = 0;
-  if (!argument(p, r, 2, &apc) || !argument(p, r, 4, &status_block) || !argument(p, r, 5, &buffer) || !argument(p, r, 6, &length) || !argument(p, r, 7, &offset_pointer))
+  uint64_t apc = 0, status_block = 0, buffer = 0, length = 0, offset_pointer = 0, key = 0;
+  if (!argument(p, r, 2, &apc) || !argument(p, r, 8, &key) || !argument(p, r, 4, &status_block) || !argument(p, r, 5, &buffer) || !argument(p, r, 6, &length) || !argument(p, r, 7, &offset_pointer))
     return kAccessViolation;
   uint64_t slot = 0;
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
@@ -519,7 +519,7 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   if (apc != 0) return kNotImplemented;      // asynchronous completion is not supported
   length &= 0xFFFFFFFFu;
   if (length > kMaxIoBytes) length = kMaxIoBytes;
-  if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length);
+  if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length, key == 1);      // (a Key of 1 is the library's: wait, as a handle opened for synchronous calls does)
   if (kind == DescriptorKind::Mailslot) return mailslot_io(p, slot, write, status_block, buffer, length);
   if (kind == DescriptorKind::Null) {      // the NUL device takes everything and has nothing to read
     const uint32_t status = write ? kSuccess : kEndOfFile;
@@ -741,6 +741,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   uint64_t info_class = 0;
   if (!argument(p, r, 4, &info_class)) return kAccessViolation;
   uint64_t slot = 0;
+  if (r.args[0] == ~uint64_t{0}) return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH: -1 is the current process
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
   const DescriptorKind kind = files.kind(slot);
@@ -782,7 +783,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   }
   if (kind == DescriptorKind::Pipe) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
-    if (pipe_class == 8 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
+    if (pipe_class == 8 || pipe_class == 16 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
   }
   if (kind == DescriptorKind::Mailslot) {
     const uint32_t mailslot_class = static_cast<uint32_t>(info_class);
@@ -854,6 +855,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
   uint64_t info_class = 0;
   if (!argument(p, r, 4, &info_class)) return kAccessViolation;
   uint64_t slot = 0;
+  if (r.args[0] == ~uint64_t{0}) return 0xC0000024u;      // STATUS_OBJECT_TYPE_MISMATCH: -1 is the current process
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
   if (files.kind(slot) == DescriptorKind::Pipe) {

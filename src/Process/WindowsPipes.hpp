@@ -43,9 +43,9 @@ uint32_t nt_cancel_synchronous_io_file(Process& p, const SyscallRequest& r);
 
 // For the file services:
 // A path like \??\pipe\name or \Device\NamedPipe\name opens a pipe (as a client) or the pipe folder: true if the name was one (*status and *handle are the answer).
-bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, uint32_t* status, uint64_t* handle);
+bool pipe_open_by_name(Process& p, uint64_t object_attributes, uint32_t access, uint32_t options, uint32_t* status, uint64_t* handle);
 // NtReadFile / NtWriteFile on a pipe handle.
-uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length);
+uint32_t pipe_io(Process& p, uint64_t slot, bool write, uint64_t status_block, uint64_t buffer, uint64_t length, bool wait = false);
 // NtQueryInformationFile / NtSetInformationFile classes 23 (FilePipeInformation) and 24 (FilePipeLocalInformation) on a pipe handle.
 uint32_t pipe_query_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t status_block, uint64_t buffer, uint32_t length);
 uint32_t pipe_set_information(Process& p, uint64_t slot, uint32_t info_class, uint64_t buffer, uint32_t length);
