@@ -50,8 +50,20 @@ static ULONG64 *int_register(CONTEXT *c, unsigned index) { return &c->Rax + inde
 
 /* ---- finding the function of an address --------------------------------------------------------------------------------------------------------------------- */
 
-typedef struct { PRUNTIME_FUNCTION table; ULONG count; ULONG64 base; } FunctionTable;
-static FunctionTable g_function_tables[32];
+/* The tables of functions added at run time (RtlAddFunctionTable, RtlAddGrowableFunctionTable, RtlInstallFunctionTableCallback), after Wine's: a list of ranges of addresses, each
+ * with a table of RUNTIME_FUNCTIONs (relative to the range's base; `count` of them are in use) or a callback that finds the function. */
+typedef struct DynamicTable {
+  struct DynamicTable *next;
+  ULONG64 base, end;
+  PRUNTIME_FUNCTION table;
+  ULONG count, max_count;
+  PRUNTIME_FUNCTION (NTAPI *callback)(ULONG64 pc, PVOID context);
+  PVOID context;
+} DynamicTable;
+static DynamicTable *g_dynamic_tables;
+static volatile int g_dynamic_lock;
+static void dynamic_lock(void) { while (__atomic_exchange_n(&g_dynamic_lock, 1, __ATOMIC_ACQUIRE)) __builtin_ia32_pause(); }
+static void dynamic_unlock(void) { __atomic_store_n(&g_dynamic_lock, 0, __ATOMIC_RELEASE); }
 
 static PRUNTIME_FUNCTION find_in_table(PRUNTIME_FUNCTION table, ULONG count, ULONG64 rva) {
   ULONG low = 0, high = count;
@@ -62,6 +74,12 @@ static PRUNTIME_FUNCTION find_in_table(PRUNTIME_FUNCTION table, ULONG count, ULO
     else return &table[mid];
   }
   return NULL;
+}
+/* The entry that describes the function; an entry chained to another one (UnwindData with bit 0 set) is followed. */
+static PRUNTIME_FUNCTION find_function_info(PRUNTIME_FUNCTION table, ULONG count, ULONG64 base, ULONG64 pc) {
+  PRUNTIME_FUNCTION f = find_in_table(table, count, pc - base);
+  while (f && (f->UnwindData & 1)) f = (PRUNTIME_FUNCTION)(base + (f->UnwindData & ~1u));
+  return f;
 }
 
 /* The module of the loader lists that holds `pc`: its base, or 0. */
@@ -83,113 +101,272 @@ EXPORT PVOID NTAPI RtlPcToFileHeader(PVOID pc, PVOID *base) {
   return (PVOID)b;
 }
 
-EXPORT PRUNTIME_FUNCTION NTAPI RtlLookupFunctionEntry(ULONG64 pc, PULONG64 base, PUNWIND_HISTORY_TABLE history) {
-  (void)history;
-  for (unsigned i = 0; i < 32; ++i) {
-    const FunctionTable *t = &g_function_tables[i];
-    if (!t->table || pc < t->base) continue;
-    PRUNTIME_FUNCTION f = find_in_table(t->table, t->count, pc - t->base);
-    if (f) { if (base) *base = t->base; return f; }
-  }
+/* The table of exception data of the module that holds `pc` (its base, and the size in bytes of the table); NULL, with the base left alone, if no module holds it. */
+EXPORT PRUNTIME_FUNCTION NTAPI RtlLookupFunctionTable(ULONG64 pc, PULONG64 base, PULONG length) {
   const ULONG64 image = module_of(pc, NULL);
-  if (base) *base = image;
   if (!image) return NULL;
+  *base = image;
   const BYTE *pe = (const BYTE *)image;
   const ULONG nt = *(const ULONG *)(pe + 0x3C);
   const ULONG rva = *(const ULONG *)(pe + nt + 24 + 0x70 + 3 * 8);        /* DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION] */
   const ULONG size = *(const ULONG *)(pe + nt + 24 + 0x70 + 3 * 8 + 4);
-  if (!rva || size < sizeof(RUNTIME_FUNCTION)) return NULL;
-  return find_in_table((PRUNTIME_FUNCTION)(pe + rva), size / sizeof(RUNTIME_FUNCTION), pc - image);
+  if (length) *length = rva ? size : 0;
+  return rva ? (PRUNTIME_FUNCTION)(pe + rva) : NULL;
 }
 
-EXPORT BOOLEAN NTAPI RtlAddFunctionTable(PRUNTIME_FUNCTION table, ULONG count, ULONG64 base) {
-  for (unsigned i = 0; i < 32; ++i) {
-    if (g_function_tables[i].table) continue;
-    g_function_tables[i].table = table;
-    g_function_tables[i].count = count;
-    g_function_tables[i].base = base;
-    return TRUE;
+EXPORT PRUNTIME_FUNCTION NTAPI RtlLookupFunctionEntry(ULONG64 pc, PULONG64 base, PUNWIND_HISTORY_TABLE history) {
+  (void)history;
+  ULONG size = 0;
+  ULONG64 image = 0;
+  PRUNTIME_FUNCTION table = RtlLookupFunctionTable(pc, &image, &size);
+  if (table) {
+    if (base) *base = image;
+    return find_function_info(table, size / sizeof(RUNTIME_FUNCTION), image, pc);
   }
-  return FALSE;
+  PRUNTIME_FUNCTION found = NULL;
+  int in_range = 0;
+  dynamic_lock();
+  for (DynamicTable *t = g_dynamic_tables; t; t = t->next) {
+    if (pc < t->base || pc >= t->end) continue;
+    in_range = 1;
+    image = t->base;
+    if (t->callback) {
+      PRUNTIME_FUNCTION (NTAPI *callback)(ULONG64, PVOID) = t->callback;
+      PVOID context = t->context;
+      dynamic_unlock();      /* (the callback may do anything) */
+      found = callback(pc, context);
+      if (found && base) *base = image;
+      return found;
+    }
+    found = find_function_info(t->table, t->count, t->base, pc);
+    break;
+  }
+  dynamic_unlock();
+  if (found) { if (base) *base = image; return found; }
+  if (!in_range && base) *base = 0;
+  return NULL;
+}
+
+EXPORT NTSTATUS NTAPI RtlAddGrowableFunctionTable(PVOID *handle, PRUNTIME_FUNCTION functions, ULONG count, ULONG max_count, ULONG64 base, ULONG64 end) {
+  DynamicTable *t = RtlAllocateHeap(RtlProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*t));
+  if (!t) return STATUS_NO_MEMORY;
+  t->base = base; t->end = end; t->table = functions; t->count = count; t->max_count = max_count;
+  dynamic_lock();
+  DynamicTable **tail = &g_dynamic_tables;
+  while (*tail) tail = &(*tail)->next;
+  *tail = t;
+  dynamic_unlock();
+  *handle = t;
+  return STATUS_SUCCESS;
+}
+EXPORT void NTAPI RtlGrowFunctionTable(PVOID handle, ULONG count) {
+  dynamic_lock();
+  for (DynamicTable *t = g_dynamic_tables; t; t = t->next) if (t == handle) { if (count > t->count && count <= t->max_count) t->count = count; break; }
+  dynamic_unlock();
+}
+static DynamicTable *dynamic_remove(int by_handle, PVOID key) {
+  dynamic_lock();
+  for (DynamicTable **p = &g_dynamic_tables; *p; p = &(*p)->next) {
+    if (by_handle ? (PVOID)*p == key : (PVOID)(*p)->table == key) { DynamicTable *t = *p; *p = t->next; dynamic_unlock(); return t; }
+  }
+  dynamic_unlock();
+  return NULL;
+}
+EXPORT void NTAPI RtlDeleteGrowableFunctionTable(PVOID handle) {
+  DynamicTable *t = dynamic_remove(1, handle);
+  if (t) RtlFreeHeap(RtlProcessHeap(), 0, t);
+}
+EXPORT BOOLEAN NTAPI RtlAddFunctionTable(PRUNTIME_FUNCTION table, ULONG count, ULONG64 base) {
+  PVOID handle;
+  return RtlAddGrowableFunctionTable(&handle, table, count, 0, base, count ? base + table[count - 1].EndAddress : base) == STATUS_SUCCESS;
 }
 EXPORT BOOLEAN NTAPI RtlDeleteFunctionTable(PRUNTIME_FUNCTION table) {
-  for (unsigned i = 0; i < 32; ++i) if (g_function_tables[i].table == table) { g_function_tables[i].table = NULL; return TRUE; }
-  return FALSE;
+  DynamicTable *t = dynamic_remove(0, table);
+  if (!t) return FALSE;
+  RtlFreeHeap(RtlProcessHeap(), 0, t);
+  return TRUE;
 }
 EXPORT BOOLEAN NTAPI RtlInstallFunctionTableCallback(ULONG64 id, ULONG64 base, ULONG length, PVOID callback, PVOID context, PCWSTR out_of_process) {
-  (void)id; (void)base; (void)length; (void)callback; (void)context; (void)out_of_process;
-  return FALSE;      /* tables made on demand are not supported */
+  (void)out_of_process;
+  if ((id & 3) != 3) return FALSE;      /* both low bits must be set */
+  DynamicTable *t = RtlAllocateHeap(RtlProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*t));
+  if (!t) return FALSE;
+  t->base = base; t->end = base + length; t->table = (PRUNTIME_FUNCTION)id; t->callback = (PRUNTIME_FUNCTION (NTAPI *)(ULONG64, PVOID))callback; t->context = context;
+  dynamic_lock();
+  DynamicTable **tail = &g_dynamic_tables;
+  while (*tail) tail = &(*tail)->next;
+  *tail = t;
+  dynamic_unlock();
+  return TRUE;
 }
 
 /* ---- unwinding one frame -------------------------------------------------------------------------------------------------------------------------------------- */
 
 static void remember(KNONVOLATILE_CONTEXT_POINTERS *ptrs, unsigned reg, ULONG64 *where) { if (ptrs) ptrs->Integer[reg] = where; }
 
-/* Undoes what the function's prologue did to `c` (the registers on the way into the function from the point `c` is at), following the unwind codes of `f`. `pc_rva` is where the
- * context is in the function: inside the prologue only the codes that ran are undone. Returns the language handler of the kinds in `type` (and its data), if the function has one. */
-static PEXCEPTION_ROUTINE unwind_function(ULONG type, ULONG64 base, ULONG64 pc_rva, const RUNTIME_FUNCTION *f, CONTEXT *c, PVOID *data, PULONG64 frame_ret, KNONVOLATILE_CONTEXT_POINTERS *ptrs, int top) {
-  const UNWIND_INFO_HEADER *info = (const UNWIND_INFO_HEADER *)(base + f->UnwindData);
-  const BYTE *codes = (const BYTE *)(info + 1);
-  const unsigned count = info->CountOfCodes;
-  const unsigned frame_register = info->FrameRegOffset & 15, frame_offset = info->FrameRegOffset >> 4;
-  const ULONG prolog_offset = (pc_rva != ~(ULONG64)0 && pc_rva < (ULONG64)f->BeginAddress + info->SizeOfProlog) ? (ULONG)(pc_rva - f->BeginAddress) : 0xFFFFFFFFu;
-  /* The frame register only counts once the prologue has set it. */
-  unsigned effective_frame_register = frame_register;
-  for (unsigned i = 0; i < count && frame_register; ) {
-    const BYTE op = codes[2 * i + 1] & 15, inf = codes[2 * i + 1] >> 4;
-    if (op == UWOP_SET_FPREG && prolog_offset < codes[2 * i]) effective_frame_register = 0;
-    i += (op == UWOP_ALLOC_LARGE) ? (inf ? 3 : 2) : (op == UWOP_SAVE_NONVOL || op == UWOP_SAVE_XMM128 || op == UWOP_EPILOG) ? 2 : (op == UWOP_SAVE_NONVOL_FAR || op == UWOP_SAVE_XMM128_FAR) ? 3 : 1;
+static int unwind_opcode_size(BYTE code, BYTE info) {
+  switch (code) {
+    case UWOP_ALLOC_LARGE: return 2 + (info != 0);
+    case UWOP_SAVE_NONVOL: case UWOP_SAVE_XMM128: case UWOP_EPILOG: return 2;
+    case UWOP_SAVE_NONVOL_FAR: case UWOP_SAVE_XMM128_FAR: return 3;
+    default: return 1;
   }
-  const ULONG64 frame = effective_frame_register ? *int_register(c, effective_frame_register) - (ULONG64)frame_offset * 16 : c->Rsp;
-  if (top && frame_ret) *frame_ret = frame;
-  int machine_frame = 0;
-  for (unsigned i = 0; i < count; ) {
-    const BYTE offset = codes[2 * i], op = codes[2 * i + 1] & 15, inf = codes[2 * i + 1] >> 4;
-    unsigned slots = 1;
-    switch (op) {
-      case UWOP_ALLOC_LARGE: slots = inf ? 3 : 2; break;
-      case UWOP_SAVE_NONVOL: case UWOP_SAVE_XMM128: case UWOP_EPILOG: slots = 2; break;
-      case UWOP_SAVE_NONVOL_FAR: case UWOP_SAVE_XMM128_FAR: slots = 3; break;
-      default: break;
-    }
-    if (prolog_offset < offset) { i += slots; continue; }      /* this part of the prologue had not run yet */
-    switch (op) {
-      case UWOP_PUSH_NONVOL: { ULONG64 *where = (ULONG64 *)c->Rsp; *int_register(c, inf) = *where; remember(ptrs, inf, where); c->Rsp += 8; break; }
-      case UWOP_ALLOC_LARGE: {
-        const ULONG64 size = inf ? (ULONG64)(*(const USHORT *)(codes + 2 * (i + 1)) | (ULONG64)*(const USHORT *)(codes + 2 * (i + 2)) << 16) : (ULONG64)*(const USHORT *)(codes + 2 * (i + 1)) * 8;
-        c->Rsp += size;
-        break;
-      }
-      case UWOP_ALLOC_SMALL: c->Rsp += (ULONG64)inf * 8 + 8; break;
-      case UWOP_SET_FPREG: c->Rsp = *int_register(c, frame_register) - (ULONG64)frame_offset * 16; break;
-      case UWOP_SAVE_NONVOL: { ULONG64 *where = (ULONG64 *)(frame + (ULONG64)*(const USHORT *)(codes + 2 * (i + 1)) * 8); *int_register(c, inf) = *where; remember(ptrs, inf, where); break; }
-      case UWOP_SAVE_NONVOL_FAR: {
-        ULONG64 *where = (ULONG64 *)(frame + (*(const USHORT *)(codes + 2 * (i + 1)) | (ULONG64)*(const USHORT *)(codes + 2 * (i + 2)) << 16));
-        *int_register(c, inf) = *where;
-        remember(ptrs, inf, where);
-        break;
-      }
-      case UWOP_SAVE_XMM128: { const M128A *where = (const M128A *)(frame + (ULONG64)*(const USHORT *)(codes + 2 * (i + 1)) * 16); CONTEXT_XMM(c, inf) = *where; if (ptrs) ptrs->Xmm[inf] = (ULONG64 *)where; break; }
-      case UWOP_SAVE_XMM128_FAR: {
-        const M128A *where = (const M128A *)(frame + (*(const USHORT *)(codes + 2 * (i + 1)) | (ULONG64)*(const USHORT *)(codes + 2 * (i + 2)) << 16));
-        CONTEXT_XMM(c, inf) = *where;
-        if (ptrs) ptrs->Xmm[inf] = (ULONG64 *)where;
-        break;
-      }
-      case UWOP_PUSH_MACHFRAME: {
-        const ULONG64 *mf = (const ULONG64 *)(c->Rsp + (inf ? 8 : 0));      /* with an error code first when inf is 1 */
-        c->Rip = mf[0];
-        c->Rsp = mf[3];
-        machine_frame = 1;
-        break;
-      }
-      default: break;
-    }
-    i += slots;
+}
+
+/* The start of the function a (possibly chained) entry belongs to. */
+static const BYTE *unwind_main_function_start(const RUNTIME_FUNCTION *f, ULONG64 base) {
+  while (f->UnwindData) {
+    const UNWIND_INFO_HEADER *info = (const UNWIND_INFO_HEADER *)(base + f->UnwindData);
+    if (!(info->VersionFlags >> 3 & UNW_FLAG_CHAININFO)) break;
+    f = (const RUNTIME_FUNCTION *)((const BYTE *)(info + 1) + 2 * ((info->CountOfCodes + 1) & ~1u));
   }
-  const ULONG64 *tail = (const ULONG64 *)(codes + 2 * ((count + 1) & ~1u));
-  if (info->VersionFlags >> 3 & UNW_FLAG_CHAININFO) {      /* the rest is described by the function this one continues */
-    return unwind_function(type, base, ~(ULONG64)0, (const RUNTIME_FUNCTION *)tail, c, data, frame_ret, ptrs, 0);
+  return (const BYTE *)(base + f->BeginAddress);
+}
+static int unwind_in_function(const BYTE *pc, ULONG64 base, const RUNTIME_FUNCTION *function) {
+  ULONG64 pc_base = 0;
+  if ((ULONG64)(pc - (const BYTE *)base) >= function->BeginAddress && (ULONG64)(pc - (const BYTE *)base) < function->EndAddress) return 1;
+  const RUNTIME_FUNCTION *f = RtlLookupFunctionEntry((ULONG64)pc, &pc_base, NULL);
+  return f && unwind_main_function_start(f, pc_base) == unwind_main_function_start(function, base);
+}
+
+/* Is `pc` at the start of a function epilogue (adds to rsp or lea of rsp, pops, then ret or a jump out of the function)? */
+static int unwind_inside_epilog(const BYTE *pc, ULONG64 base, const RUNTIME_FUNCTION *function) {
+  if ((pc[0] & 0xf8) == 0x48) {      /* add or lea first, with rex.W */
+    switch (pc[1]) {
+      case 0x81: if (pc[0] == 0x48 && pc[2] == 0xc4) { pc += 7; break; } return 0;      /* add $nnnn,%rsp */
+      case 0x83: if (pc[0] == 0x48 && pc[2] == 0xc4) { pc += 4; break; } return 0;      /* add $n,%rsp */
+      case 0x8d:      /* lea n(reg),%rsp */
+        if (pc[0] & 0x06) return 0;
+        if (((pc[2] >> 3) & 7) != 4) return 0;
+        if ((pc[2] & 7) == 4) return 0;
+        if ((pc[2] >> 6) == 1) { pc += 4; break; }
+        if ((pc[2] >> 6) == 2) { pc += 7; break; }
+        return 0;
+    }
+  }
+  for (;;) {
+    BYTE rex = 0;
+    if ((*pc & 0xf0) == 0x40) rex = *pc++ & 0x0f;
+    switch (*pc) {
+      case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f: ++pc; continue;      /* pop */
+      case 0xc2: case 0xc3: return 1;      /* ret */
+      case 0xe9: { LONG rel; memcpy(&rel, pc + 1, 4); pc += 5 + rel; return !unwind_in_function(pc, base, function); }      /* jmp nnnn */
+      case 0xeb: pc += 2 + (signed char)pc[1]; return !unwind_in_function(pc, base, function);      /* jmp n */
+      case 0xf3: return pc[1] == 0xc3;      /* rep; ret */
+      case 0xff:      /* jmp */
+        if (rex && rex != 8) return 0;
+        if (pc[1] == 0x25) return 1;
+        return rex && ((pc[1] >> 3) & 7) == 4;
+    }
+    return 0;
+  }
+}
+
+/* Runs the epilogue at `pc` on the context (it was checked with unwind_inside_epilog). */
+static void unwind_interpret_epilog(const BYTE *pc, CONTEXT *c, KNONVOLATILE_CONTEXT_POINTERS *ptrs) {
+  for (;;) {
+    BYTE rex = 0;
+    if ((*pc & 0xf0) == 0x40) rex = *pc++ & 0x0f;
+    switch (*pc) {
+      case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f: {
+        const unsigned reg = *pc - 0x58 + (rex & 1) * 8;
+        ULONG64 *where = (ULONG64 *)c->Rsp;
+        *int_register(c, reg) = *where;
+        remember(ptrs, reg, where);
+        c->Rsp += 8;
+        ++pc;
+        continue;
+      }
+      case 0x81: { LONG n; memcpy(&n, pc + 2, 4); c->Rsp += n; pc += 6; continue; }      /* add $nnnn,%rsp */
+      case 0x83: c->Rsp += (signed char)pc[2]; pc += 3; continue;      /* add $n,%rsp */
+      case 0x8d:
+        if ((pc[1] >> 6) == 1) { c->Rsp = *int_register(c, (pc[1] & 7) + (rex & 1) * 8) + (signed char)pc[2]; pc += 3; }      /* lea n(reg),%rsp */
+        else { LONG n; memcpy(&n, pc + 2, 4); c->Rsp = *int_register(c, (pc[1] & 7) + (rex & 1) * 8) + n; pc += 6; }
+        continue;
+      case 0xc2: { USHORT n; memcpy(&n, pc + 1, 2); c->Rip = *(const ULONG64 *)c->Rsp; c->Rsp += 8 + n; return; }      /* ret $nn */
+      case 0xe9: case 0xeb: case 0xc3: case 0xf3: case 0xff: c->Rip = *(const ULONG64 *)c->Rsp; c->Rsp += 8; return;
+    }
+    return;
+  }
+}
+
+/* RtlVirtualUnwind2 (after Wine's): undoes what the function did to `c` from the point `pc` it is at (a prologue part way, a body, an epilogue) and moves `c` to the caller. */
+EXPORT NTSTATUS NTAPI RtlVirtualUnwind2(ULONG type, ULONG_PTR base, ULONG_PTR pc, PRUNTIME_FUNCTION function, CONTEXT *c, BOOLEAN *machine_frame_unwound, PVOID *data, ULONG_PTR *frame_ret,
+                                        KNONVOLATILE_CONTEXT_POINTERS *ptrs, ULONG_PTR *limit_low, ULONG_PTR *limit_high, PEXCEPTION_ROUTINE *handler_ret, ULONG flags) {
+  (void)limit_low; (void)limit_high; (void)flags;
+  ULONG64 frame = c->Rsp;
+  int machine_frame = 0, chained = 0;
+  ULONG prolog_offset;
+  const UNWIND_INFO_HEADER *info;
+  const ULONG *tail;
+  if (frame_ret) *frame_ret = frame;
+  if (machine_frame_unwound) *machine_frame_unwound = FALSE;
+  if (!function) {      /* a leaf function: only the return address is on the stack */
+    c->Rip = *(const ULONG64 *)c->Rsp;
+    c->Rsp += 8;
+    c->ContextFlags |= CONTEXT_UNWOUND_TO_CALL;
+    if (type && data) *data = NULL;
+    if (handler_ret) *handler_ret = NULL;
+    return STATUS_SUCCESS;
+  }
+  for (;;) {
+    info = (const UNWIND_INFO_HEADER *)(base + function->UnwindData);
+    const BYTE *codes = (const BYTE *)(info + 1);
+    const unsigned count = info->CountOfCodes;
+    tail = (const ULONG *)(codes + 2 * ((count + 1) & ~1u));
+    const unsigned version = info->VersionFlags & 7, flag_bits = info->VersionFlags >> 3;
+    if (version != 1 && version != 2) return (NTSTATUS)0xC00000FFu;      /* STATUS_BAD_FUNCTION_TABLE */
+    const unsigned frame_register = info->FrameRegOffset & 15, frame_offset = info->FrameRegOffset >> 4;
+    if (frame_register) frame = *int_register(c, frame_register) - (ULONG64)frame_offset * 16;
+    if (pc >= base + function->BeginAddress && pc < base + function->BeginAddress + info->SizeOfProlog) {      /* inside the prologue */
+      prolog_offset = (ULONG)(pc - base - function->BeginAddress);
+    } else {
+      prolog_offset = ~0u;
+      if (!chained && count && unwind_inside_epilog((const BYTE *)pc, base, function)) {
+        unwind_interpret_epilog((const BYTE *)pc, c, ptrs);
+        if (frame_ret) *frame_ret = frame_register ? c->Rsp - 8 : frame;
+        if (handler_ret) *handler_ret = NULL;
+        c->ContextFlags |= CONTEXT_UNWOUND_TO_CALL;
+        return STATUS_SUCCESS;
+      }
+    }
+    for (unsigned i = 0; i < count; i += unwind_opcode_size(codes[2 * i + 1] & 15, codes[2 * i + 1] >> 4)) {
+      const BYTE offset = codes[2 * i], op = codes[2 * i + 1] & 15, inf = codes[2 * i + 1] >> 4;
+      if (prolog_offset < offset) continue;      /* this part of the prologue had not run yet */
+      switch (op) {
+        case UWOP_PUSH_NONVOL: { ULONG64 *where = (ULONG64 *)c->Rsp; *int_register(c, inf) = *where; remember(ptrs, inf, where); c->Rsp += 8; break; }
+        case UWOP_ALLOC_LARGE: c->Rsp += inf ? (ULONG64)(*(const USHORT *)(codes + 2 * (i + 1)) | (ULONG64)*(const USHORT *)(codes + 2 * (i + 2)) << 16) : (ULONG64)*(const USHORT *)(codes + 2 * (i + 1)) * 8; break;
+        case UWOP_ALLOC_SMALL: c->Rsp += (ULONG64)inf * 8 + 8; break;
+        case UWOP_SET_FPREG: c->Rsp = frame; if (frame_ret) *frame_ret = frame; break;
+        case UWOP_SAVE_NONVOL: { ULONG64 *where = (ULONG64 *)(frame + (ULONG64)*(const USHORT *)(codes + 2 * (i + 1)) * 8); *int_register(c, inf) = *where; remember(ptrs, inf, where); break; }
+        case UWOP_SAVE_NONVOL_FAR: {
+          ULONG64 *where = (ULONG64 *)(frame + (*(const USHORT *)(codes + 2 * (i + 1)) | (ULONG64)*(const USHORT *)(codes + 2 * (i + 2)) << 16));
+          *int_register(c, inf) = *where;
+          remember(ptrs, inf, where);
+          break;
+        }
+        case UWOP_SAVE_XMM128: { const M128A *where = (const M128A *)(frame + (ULONG64)*(const USHORT *)(codes + 2 * (i + 1)) * 16); memcpy(&CONTEXT_XMM(c, inf), where, sizeof(M128A)); if (ptrs) ptrs->Xmm[inf] = (ULONG64 *)where; break; }
+        case UWOP_SAVE_XMM128_FAR: {
+          const M128A *where = (const M128A *)(frame + (*(const USHORT *)(codes + 2 * (i + 1)) | (ULONG64)*(const USHORT *)(codes + 2 * (i + 2)) << 16));
+          memcpy(&CONTEXT_XMM(c, inf), where, sizeof(M128A));
+          if (ptrs) ptrs->Xmm[inf] = (ULONG64 *)where;
+          break;
+        }
+        case UWOP_PUSH_MACHFRAME: {
+          if (flag_bits & UNW_FLAG_CHAININFO) break;
+          if (i + unwind_opcode_size(op, inf) < count) break;      /* (it must be the last code) */
+          if (inf) c->Rsp += 8;      /* (an error code first) */
+          c->Rip = *(const ULONG64 *)c->Rsp;
+          c->Rsp = *(const ULONG64 *)(c->Rsp + 24);
+          machine_frame = 1;
+          break;
+        }
+        default: break;      /* UWOP_EPILOG of version 2: nothing to do */
+      }
+    }
+    if (!(flag_bits & UNW_FLAG_CHAININFO)) break;
+    function = (const RUNTIME_FUNCTION *)tail;      /* go on with the chained entry */
+    chained = 1;
   }
   if (!machine_frame) {
     c->Rip = *(const ULONG64 *)c->Rsp;
@@ -197,16 +374,21 @@ static PEXCEPTION_ROUTINE unwind_function(ULONG type, ULONG64 base, ULONG64 pc_r
     c->ContextFlags |= CONTEXT_UNWOUND_TO_CALL;
   } else {
     c->ContextFlags &= ~(DWORD)CONTEXT_UNWOUND_TO_CALL;
+    if (machine_frame_unwound) *machine_frame_unwound = TRUE;
   }
-  if (!((info->VersionFlags >> 3) & type)) return NULL;
-  if (data) *data = (PVOID)((const ULONG *)tail + 1);
-  return (PEXCEPTION_ROUTINE)(base + *(const ULONG *)tail);
+  if (handler_ret) *handler_ret = NULL;
+  if (!((info->VersionFlags >> 3) & type)) return STATUS_SUCCESS;      /* no handler of that kind */
+  if (prolog_offset != ~0u) return STATUS_SUCCESS;      /* (inside the prologue) */
+  if (handler_ret) *handler_ret = (PEXCEPTION_ROUTINE)(base + tail[0]);
+  if (data) *data = (PVOID)(tail + 1);
+  return STATUS_SUCCESS;
 }
 
 EXPORT PEXCEPTION_ROUTINE NTAPI RtlVirtualUnwind(ULONG type, ULONG64 base, ULONG64 pc, PRUNTIME_FUNCTION function, CONTEXT *context, PVOID *data, PULONG64 frame, KNONVOLATILE_CONTEXT_POINTERS *pointers) {
-  if (data) *data = NULL;
-  if (frame) *frame = context->Rsp;
-  return unwind_function(type, base, pc - base, function, context, data, frame, pointers, 1);
+  PEXCEPTION_ROUTINE handler = NULL;
+  if (!RtlVirtualUnwind2(type, base, pc, function, context, NULL, data, frame, pointers, NULL, NULL, &handler, 0)) return handler;
+  context->Rip = 0;
+  return NULL;
 }
 
 /* One frame up for the dispatcher and the unwinder: fills `dc` for the frame that `c` is in and moves `c` to the frame's caller. A function without unwind information is a
