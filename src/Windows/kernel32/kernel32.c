@@ -2916,6 +2916,19 @@ static BOOL pipe_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT
   static const WCHAR nt_prefix[] = {'\\', '?', '?', '\\', 'p', 'i', 'p', 'e', '\\', 0};
   size_t_ i = 0;
   while (prefix[i] && (name[i] == prefix[i] || (name[i] | 0x20) == (prefix[i] | 0x20))) ++i;
+  if (prefix[i] == '\\' && !prefix[i + 1] && !name[i]) {      /* "\\.\pipe": the device itself, not its directory */
+    memcpy(buffer, nt_prefix, 8 * 2);
+    buffer[8] = 0;
+    us->Buffer = buffer;
+    us->Length = 8 * 2;
+    us->MaximumLength = 9 * 2;
+    attributes->Length = sizeof(OBJECT_ATTRIBUTES);
+    attributes->RootDirectory = NULL;
+    attributes->ObjectName = us;
+    attributes->Attributes = 0x40 | (inherit ? 2 : 0);
+    attributes->SecurityDescriptor = attributes->SecurityQualityOfService = NULL;
+    return TRUE;
+  }
   if (prefix[i]) { set_error(ERROR_INVALID_NAME); return FALSE; }
   const size_t_ rest = wcslen(name + i);
   if (rest > 250) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }

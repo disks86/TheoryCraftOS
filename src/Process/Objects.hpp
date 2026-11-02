@@ -149,6 +149,9 @@ class ObjectManager {
   // outcome (and, for a read, its data). `signal_file`: the call has no event of its own, so the file object is not signalled until it ends. False if the request cannot be
   // queued; the operation is cancelled then.
   bool pipe_pend_locked(uint32_t id, uint32_t end_code, uint32_t tag, const io::IoRequest& request, bool signal_file);
+  uint32_t pipe_end_refs_locked(uint32_t id, uint32_t end_code);
+  // FILE_PIPE_DISCONNECTED_STATE 1, _LISTENING_STATE 2, _CONNECTED_STATE 3, _CLOSING_STATE 4 of an end (0 if there is no such pipe).
+  uint32_t pipe_state_locked(uint32_t id, uint32_t end_code);      // the handles (of every process) that hold the end
   bool pipe_client_gone_locked(uint32_t id, uint32_t end_code);      // a client end whose server disconnected it
   // The event of the file object of an end: set when it is made, reset when an operation that waits is started on it, set when one that was started without an event of its
   // own is over (what a wait on the handle looks at).

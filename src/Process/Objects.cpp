@@ -246,6 +246,7 @@ struct ObjectManager::Pipe {
   PipeOp ops[kOps];
   uint32_t next_tag = 1;
   uint32_t end_refs[2] = {};
+  uint32_t stale_refs = 0;      // the handles of a client the server disconnected (they keep the object, and see a disconnected pipe)
   uint32_t port_object[2] = {};      // the completion port each end is tied to (a referenced port object), the key, and the FILE_SKIP_* flags
   uint64_t port_key[2] = {};
   uint32_t port_flags[2] = {};
@@ -264,7 +265,7 @@ struct ObjectManager::Pipe {
 };
 
 namespace {
-constexpr uint32_t kPipeBusy = 0xC00000AEu;
+constexpr uint32_t kPipeBusy = 0xC00000AEu, kInstanceNotAvailable = 0xC00000ABu;
 constexpr uint32_t kDefaultPipeBuffer = 4096, kMaxPipeBuffer = 1u << 20;
 constexpr uint32_t kMaxPipeQueue = 32u << 20;      // what a direction may hold in all (the buffer and the writes that wait)
 constexpr uint32_t kStatusCancelled = 0xC0000120u, kStatusBroken = 0xC000014Bu, kStatusDisconnected = 0xC00000B0u, kStatusMoreData = 0x80000005u, kStatusNoMemory = 0xC0000017u;
@@ -353,15 +354,15 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
   }
   uint32_t instances = 0;
   if (!name.empty()) {
+    const Pipe* first = nullptr;
     for (Object& o : objects_) {
-      if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
+      if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name) || pipes_[o.pipe].end_refs[0] == 0) continue;      // (an instance with no server end left is gone, though a client may still hold it)
       ++instances;
-      if (disposition == 2) { result.status = 0xC0000022u; return result; }      // FILE_CREATE: the name is taken (STATUS_ACCESS_DENIED)
-      const Pipe& other = pipes_[o.pipe];
-      if (other.access != access) { result.status = 0xC0000022u; return result; }      // (every instance of a pipe has the same access)
-      if (other.max_instances != 0 && instances >= other.max_instances) { result.status = kPipeBusy; return result; }
+      if (!first) first = &pipes_[o.pipe];
+      if (pipes_[o.pipe].max_instances != 0 && instances >= pipes_[o.pipe].max_instances) { result.status = kInstanceNotAvailable; return result; }      // (the limit the pipe was made with)
     }
-    if (max_instances != 0 && instances >= max_instances) { result.status = kPipeBusy; return result; }
+    if (max_instances != 0 && instances >= max_instances) { result.status = kInstanceNotAvailable; return result; }
+    if (first && (disposition == 2 || first->access != access)) { result.status = 0xC0000022u; return result; }      // FILE_CREATE: the name is taken; every instance of a pipe has the same access (STATUS_ACCESS_DENIED)
     if (disposition == 1 && instances == 0) { result.status = 0xC0000034u; return result; }      // FILE_OPEN: STATUS_OBJECT_NAME_NOT_FOUND
   }
   int32_t pipe_index = -1;
@@ -452,33 +453,38 @@ void ObjectManager::add_pipe_end(uint32_t id, uint32_t end_code) {
   Object* o = at(id);
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
-  if (!o || !p || !p->end_of(end_code, &end)) return;
+  if (!o || !p) return;
+  if (p->end_of(end_code, &end) && p->end_refs[end] > 0) ++p->end_refs[end];
+  else if ((end_code & 1) && !p->anonymous) ++p->stale_refs;      // (a handle of a client the server disconnected, or of an earlier client)
+  else if (p->end_of(end_code, &end)) ++p->end_refs[end];
+  else return;
   ++o->references;
-  ++p->end_refs[end];
 }
 
 void ObjectManager::release_pipe_end(uint32_t id, uint32_t end_code) {
-  {
-    Locked hold(sync_);
-    Object* o = at(id);
-    Pipe* p = pipe_of(id);
-    uint32_t end = 0;
-    if (!o || !p || !p->end_of(end_code, &end) || p->end_refs[end] == 0) return;
-    --p->end_refs[end];
-    if (p->end_refs[end] == 0) {      // what this end waits for is given up, and the other end gets nothing more from it
-      for (PipeOp& op : p->ops) {
-        if (op.state != 1 || op.end != end) continue;
-      }
-      pipe_fail_ops_locked(*p, static_cast<int>(end), kStatusCancelled);
-      pipe_fail_ops_locked(*p, static_cast<int>(1 - end), kStatusBroken);
-      pipe_clear_queue_locked(*p, 1 - end);
-      if (p->port_object[end] != 0) { release_locked(p->port_object[end]); p->port_object[end] = 0; }
+  Locked hold(sync_);
+  Object* o = at(id);
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  if (!o || !p) return;
+  if (!p->end_of(end_code, &end) || p->end_refs[end] == 0) {      // a handle of a client the server disconnected: it only holds the object
+    if ((end_code & 1) && p->stale_refs > 0) {
+      --p->stale_refs;
+      if (o->references > 0 && --o->references == 0) { free_pipe_locked(*o); *o = Object(); }
     }
-    sync_.notify_all();      // the other end sees the end of the data
-    if (o->references > 0 && --o->references == 0) {
-      free_pipe_locked(*o);
-      *o = Object();
-    }
+    return;
+  }
+  --p->end_refs[end];
+  if (p->end_refs[end] == 0) {      // what this end waits for is given up, and the other end gets nothing more from it
+    pipe_fail_ops_locked(*p, static_cast<int>(end), kStatusCancelled);
+    pipe_fail_ops_locked(*p, static_cast<int>(1 - end), kStatusBroken);
+    pipe_clear_queue_locked(*p, 1 - end);
+    if (p->port_object[end] != 0) { release_locked(p->port_object[end]); p->port_object[end] = 0; }
+  }
+  sync_.notify_all();      // the other end sees the end of the data
+  if (o->references > 0 && --o->references == 0) {
+    free_pipe_locked(*o);
+    *o = Object();
   }
 }
 
@@ -696,6 +702,7 @@ ObjectManager::PipeResult ObjectManager::pipe_read_locked(uint32_t id, uint32_t 
   if (message_length) *message_length = 0;
   Pipe* p = pipe_of(id);
   uint32_t end = 0;
+  if (p && !p->end_of(end_code, &end) && (end_code & 1)) return PipeResult::NotConnected;      // (a client of an earlier connection)
   if (!p || !p->end_of(end_code, &end)) return PipeResult::Broken;
   if (end == 1 && !p->connected) return p->disconnected ? PipeResult::NotConnected : PipeResult::Broken;
   const uint32_t q = 1 - end;      // the queue the other end writes
@@ -1006,8 +1013,8 @@ bool ObjectManager::pipe_disconnect(uint32_t id) {
   p->disconnected = true;
   if (p->connected) {
     p->connected = false;
-    o->references = o->references > p->end_refs[1] ? o->references - p->end_refs[1] : 0;
-    p->end_refs[1] = 0;      // (the client's handles stay in its table, but see a broken pipe: their end no longer counts)
+    p->stale_refs += p->end_refs[1];      // (the client's handles stay in its table and see a disconnected pipe; they keep the object alive)
+    p->end_refs[1] = 0;
   }
   p->listening = false;
   p->client_seen = false;
@@ -1031,6 +1038,26 @@ uint32_t ObjectManager::pipe_pending_locked(uint32_t id, uint32_t end_code) {
   uint32_t end = 0;
   if (!p || !p->end_of(end_code, &end) || p->end_refs[1 - end] == 0 || !p->connected) return 0;
   return p->count[end];
+}
+
+uint32_t ObjectManager::pipe_state_locked(uint32_t id, uint32_t end_code) {
+  Pipe* p = pipe_of(id);
+  if (!p) return 0;
+  uint32_t end = 0;
+  const bool valid = p->end_of(end_code, &end) && p->end_refs[end] > 0;
+  if (p->anonymous) return p->end_refs[end ? 0 : 1] == 0 ? 4 : 3;
+  if (end_code & 1) {      // a client
+    if (!valid || !p->connected) return 1;
+    return p->end_refs[0] == 0 ? 4 : 3;
+  }
+  if (p->connected) return p->end_refs[1] == 0 ? 4 : 3;
+  return p->disconnected ? 1 : 2;
+}
+
+uint32_t ObjectManager::pipe_end_refs_locked(uint32_t id, uint32_t end_code) {
+  Pipe* p = pipe_of(id);
+  uint32_t end = 0;
+  return p && p->end_of(end_code, &end) ? p->end_refs[end] : 0;
 }
 
 bool ObjectManager::pipe_file_signaled_locked(uint32_t id, uint32_t end_code) {
@@ -1147,8 +1174,8 @@ bool ObjectManager::pipe_info(uint32_t id, PipeInfo* out) {
   out->out_size = p->anonymous ? p->capacity[0] : p->requested_size[0];
   out->in_size = p->anonymous ? p->capacity[1] : p->requested_size[1];
   out->max_instances = p->max_instances;
-  out->instances = 0;
-  for (const Object& other : objects_) if (other.kind == ObjectKind::Pipe && o->name_size != 0 && other.name_size == o->name_size && same_name(other.name, other.name_size, StringView(o->name, o->name_size))) ++out->instances;
+  out->instances = 0;      // (an instance whose server end is closed is no instance any more, though a client may still hold it)
+  for (const Object& other : objects_) if (other.kind == ObjectKind::Pipe && other.pipe >= 0 && pipes_[other.pipe].end_refs[0] > 0 && o->name_size != 0 && other.name_size == o->name_size && same_name(other.name, other.name_size, StringView(o->name, o->name_size))) ++out->instances;
   if (p->anonymous) out->instances = 1;
   return true;
 }

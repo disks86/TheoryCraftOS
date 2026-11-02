@@ -792,7 +792,8 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     uint8_t name[2 * (kMaxPath + 1)];
     const uint64_t bytes = to_utf16(windows_name.view(), name, sizeof(name));
     const uint64_t length = r.args[3] & 0xFFFFFFFFu;
-    if (length < 4) return kInfoLengthMismatch;
+    if (length < 8) return kInfoLengthMismatch;      // (a FILE_NAME_INFORMATION is the length and at least one character)
+    if (const uint32_t gone = pipe_client_state_status(p, slot)) return gone;
     uint8_t out[4];
     put(ByteView(out, 4), 0, bytes, 4);
     if (!p.write_user(r.args[2], ConstByteView(out, 4))) return kAccessViolation;
@@ -803,7 +804,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   }
   if (kind == DescriptorKind::Pipe) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
-    if (pipe_class == 8 || pipe_class == 16 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
+    if (pipe_class == 5 || pipe_class == 8 || pipe_class == 16 || pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
   }
   if (kind == DescriptorKind::Mailslot) {
     const uint32_t mailslot_class = static_cast<uint32_t>(info_class);

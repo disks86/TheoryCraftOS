@@ -56,6 +56,8 @@ uint32_t pipe_handle_set_flags(Process& p, uint64_t slot, uint32_t flags);
 void pipe_handle_flags(Process& p, uint64_t slot, uint32_t* flags);
 // Cancels the calls on the end of a handle (see ObjectManager::io_cancel_locked); how many ended.
 uint32_t pipe_handle_cancel(Process& p, uint64_t slot, uint64_t thread, uint64_t status_block);
+// PIPE_DISCONNECTED for a handle of a client whose server disconnected it (what the queries of the pipe answer then), else 0.
+uint32_t pipe_client_state_status(Process& p, uint64_t slot);
 // A call without an event of its own went through on the handle: the file object of its end is signalled (unless the handle keeps it from being).
 void pipe_handle_signal(Process& p, uint64_t slot);
 // A pipe handle of the process was closed and was its last to the end (`token` is the descriptor's): the calls the process still has pending on the end are cancelled.

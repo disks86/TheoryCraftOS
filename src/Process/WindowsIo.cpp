@@ -84,7 +84,7 @@ uint32_t io_call_begin(Process& p, uint64_t slot, const SyscallRequest& r, IoCal
     const uint32_t status = objects->reset_event(call->event_object, &previous);
     if (status != kSuccess) return status;
   }
-  if ((call->event_handle != 0 || call->apc != 0) && call->status_block != 0) call->saved = p.read_user(call->status_block, ByteView(call->status_block_before, 16));
+  if ((call->event_handle != 0 || call->apc != 0 || p.files().kind(slot) == DescriptorKind::Pipe) && call->status_block != 0) call->saved = p.read_user(call->status_block, ByteView(call->status_block_before, 16));
   return kSuccess;
 }
 
