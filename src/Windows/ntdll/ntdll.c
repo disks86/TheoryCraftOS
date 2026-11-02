@@ -48,15 +48,15 @@ NT_SERVICE(NtTerminateThread);
 NT_SERVICE_RAW(NtWaitForSingleObject);
 NT_SERVICE(NtResumeThread);
 NT_SERVICE(NtQueryInformationThread);
-NT_SERVICE(NtCreateEvent);
+NT_SERVICE_RAW(NtCreateEvent);
 NT_SERVICE(NtOpenEvent);
 NT_SERVICE(NtSetEvent);
 NT_SERVICE(NtResetEvent);
 NT_SERVICE(NtPulseEvent);
-NT_SERVICE(NtCreateMutant);
+NT_SERVICE_RAW(NtCreateMutant);
 NT_SERVICE(NtOpenMutant);
 NT_SERVICE(NtReleaseMutant);
-NT_SERVICE(NtCreateSemaphore);
+NT_SERVICE_RAW(NtCreateSemaphore);
 NT_SERVICE(NtOpenSemaphore);
 NT_SERVICE(NtReleaseSemaphore);
 NT_SERVICE_RAW(NtWaitForMultipleObjects);
@@ -68,7 +68,7 @@ NT_SERVICE(NtCreateUserProcess);
 NT_SERVICE(NtQueueApcThread);
 NT_SERVICE(NtDequeueApc);
 NT_SERVICE_RAW(NtSignalAndWaitForSingleObject);
-NT_SERVICE(NtCreateTimer);
+NT_SERVICE_RAW(NtCreateTimer);
 NT_SERVICE(NtOpenTimer);
 NT_SERVICE(NtSetTimer);
 NT_SERVICE(NtCancelTimer);
@@ -77,14 +77,14 @@ NT_SERVICE(NtQueryTimerResolution);
 NT_SERVICE(NtSetTimerResolution);
 NT_SERVICE(NtOpenThread);
 NT_SERVICE(NtOpenProcess);
-NT_SERVICE(NtCreateSection);
+NT_SERVICE_RAW(NtCreateSection);
 NT_SERVICE(NtOpenSection);
 NT_SERVICE(NtMapViewOfSection);
 NT_SERVICE(NtUnmapViewOfSection);
 NT_SERVICE(NtFlushVirtualMemory);
 NT_SERVICE(NtLockFile);
 NT_SERVICE(NtUnlockFile);
-NT_SERVICE(NtCreateJobObject);
+NT_SERVICE_RAW(NtCreateJobObject);
 NT_SERVICE(NtOpenJobObject);
 NT_SERVICE(NtAssignProcessToJobObject);
 NT_SERVICE(NtTerminateJobObject);
@@ -96,6 +96,8 @@ NT_SERVICE(NtWriteVirtualMemory);
 NT_SERVICE(NtCreateSymbolicLink);
 NT_SERVICE(NtTcosDebugException);
 NT_SERVICE(NtTcosLinkModules);
+NT_SERVICE(NtTcosToken);
+NT_SERVICE(NtTcosAccessCheck);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);
@@ -118,7 +120,7 @@ NT_SERVICE(NtReleaseModule);
 NT_SERVICE(NtQueryObject);
 NT_SERVICE(NtSetInformationObject);
 NT_SERVICE(NtCreatePipe);
-NT_SERVICE(NtCreateNamedPipeFile);
+NT_SERVICE_RAW(NtCreateNamedPipeFile);
 NT_SERVICE(NtFsControlFile);
 NT_SERVICE(NtClose);
 NT_SERVICE(NtTerminateProcess);
@@ -654,6 +656,7 @@ static BOOL console_device_name(const UNICODE_STRING *name, LONG *kind) {
   }
   return FALSE;
 }
+extern void NTAPI RtlTcosNewObjectSecurity(HANDLE handle, const OBJECT_ATTRIBUTES *attributes, BOOLEAN container, int kind);
 extern NTSTATUS NTAPI RawNtCreateFile(PHANDLE, ULONG, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 EXPORT NTSTATUS NTAPI NtCreateFile(PHANDLE handle, ULONG access, POBJECT_ATTRIBUTES attributes, PIO_STATUS_BLOCK iosb, PLARGE_INTEGER size, ULONG file_attributes, ULONG share, ULONG disposition,
                                    ULONG options, PVOID ea, ULONG ea_length) {
@@ -684,7 +687,9 @@ EXPORT NTSTATUS NTAPI NtCreateFile(PHANDLE handle, ULONG access, POBJECT_ATTRIBU
     iosb->Information = 1;      /* FILE_OPENED */
     return STATUS_SUCCESS;
   }
-  return RawNtCreateFile(handle, access, attributes, iosb, size, file_attributes, share, disposition, options, ea, ea_length);
+  const NTSTATUS made = RawNtCreateFile(handle, access, attributes, iosb, size, file_attributes, share, disposition, options, ea, ea_length);
+  if (made == STATUS_SUCCESS && iosb && iosb->Information == 2 /* FILE_CREATED */) RtlTcosNewObjectSecurity(*handle, attributes, (options & 1 /* FILE_DIRECTORY_FILE */) != 0, 1);      /* (the descriptor of the new node) */
+  return made;
 }
 EXPORT NTSTATUS NTAPI NtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   const NTSTATUS status = RawNtWaitForMultipleObjects(count, handles, type, alertable, timeout);

@@ -22,6 +22,7 @@
 #include "Process/WindowsSockets.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsDebug.hpp"
+#include "Process/WindowsTokens.hpp"
 
 namespace process {
 
@@ -54,7 +55,7 @@ uint64_t Process::syscall(const SyscallRequest& request) {
 }
 
 namespace {
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token; }
 }  // namespace
 
 Process::~Process() {
@@ -93,6 +94,7 @@ void Process::terminate(uint32_t code) {
   host_.wake_blocked();
   if (runtime_) runtime_->notify();
   windowsabi::debug_process_exited(id_, code);
+  windowsabi::token_process_exited(id_);
   if (ObjectManager* objects = system_objects()) {      // what it owned is abandoned; whoever waits for it or for them looks again
     objects->abandon_process(id_);
     objects->pipe_owner_gone(id_);      // (what its threads wait for on a pipe is cancelled)

@@ -21,6 +21,8 @@
 #include "Process/ModuleLoader.hpp"
 #include "Executable/PeFile.hpp"
 #include "Process/Objects.hpp"
+#include "Process/AccessCheck.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
@@ -39,7 +41,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -50,6 +52,7 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Job: return DescriptorKind::Job;
     case ObjectKind::ChangeNotification: return DescriptorKind::ChangeNotification;
     case ObjectKind::DebugObject: return DescriptorKind::DebugObject;
+    case ObjectKind::Token: return DescriptorKind::Token;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -128,6 +131,26 @@ uint32_t give_handle(Process& p, ObjectManager& objects, ObjectKind kind, uint32
 }
 
 
+// The rights a handle of each kind can hold, and what its generic rights stand for (the generic mapping of the object type); false for a kind that is not told apart here.
+struct KindAccess { uint32_t valid; security::GenericMapping mapping; };
+bool kind_access(DescriptorKind kind, KindAccess* out) {
+  switch (kind) {
+    case DescriptorKind::Event: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::Mutex: *out = {0x1F0001u, {0x20001u, 0x20000u, 0x120000u, 0x1F0001u}}; return true;
+    case DescriptorKind::Semaphore: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::Timer: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
+    case DescriptorKind::Section: *out = {0xF001Fu, {0x20005u, 0x20002u, 0x20008u, 0xF001Fu}}; return true;
+    case DescriptorKind::Job: *out = {0x1F001Fu, {0x20004u, 0x20003u, 0x120000u, 0x1F001Fu}}; return true;
+    case DescriptorKind::Process: *out = {0x1FFFFFu, {0x20410u, 0x20BEAu, 0x121001u, 0x1FFFFFu}}; return true;
+    case DescriptorKind::Thread: *out = {0x1FFFFFu, {0x20048u, 0x20037u, 0x120000u, 0x1FFFFFu}}; return true;
+    case DescriptorKind::Key: *out = {0xF003Fu, {0x20019u, 0x20006u, 0x20019u, 0xF003Fu}}; return true;
+    case DescriptorKind::Token: *out = {0xF01FFu, {0x20018u, 0x200E0u, 0x20000u, 0xF01FFu}}; return true;
+    case DescriptorKind::DebugObject: *out = {0x1F000Fu, {0x20001u, 0x20002u, 0x120000u, 0x1F000Fu}}; return true;
+    case DescriptorKind::File: case DescriptorKind::Directory: case DescriptorKind::Pipe: *out = {0x1F01FFu, {0x120089u, 0x120116u, 0x1200A0u, 0x1F01FFu}}; return true;
+    default: return false;
+  }
+}
+
 // The rights a handle to a synchronization object can have: the object's own ("query state", and "modify state" for all but mutexes), the standard ones and SYNCHRONIZE.
 // Generic requests are mapped to them; what is asked for that is not among them is refused. `granted` gets what the handle will hold.
 constexpr uint32_t kAccessDeniedStatus = 0xC0000022u, kPrivilegeNotHeld = 0xC0000061u, kSynchronize = 0x100000u, kMaximumAllowed = 0x2000000u, kAccessSystemSecurity = 0x1000000u;
@@ -154,12 +177,58 @@ void restrict_handle(Process& p, uint64_t handle_at, uint32_t granted, ObjectKin
   uint64_t handle = 0, slot = 0;
   if (!p.read_user_u64(handle_at, &handle) || !slot_of(handle, &slot)) return;
   const bool modifiable = kind != ObjectKind::Mutex;
-  p.files().set_denied_access(slot, ~granted & (0x1F0001u | (modifiable ? 2u : 0u)));
+  (void)modifiable;
+  p.files().set_denied_access(slot, ~granted);
 }
 // Does the handle (a slot) hold the rights?
 bool handle_allows(Process& p, uint64_t handle, uint32_t rights) {
   uint64_t slot = 0;
   return !slot_of(handle, &slot) || (p.files().denied_access(slot) & rights) == 0;
+}
+
+// The rights asked for in a duplicate, with the generic ones as the specific ones of the kind (MAXIMUM_ALLOWED asks for all).
+uint32_t mapped_access(DescriptorKind kind, uint32_t desired) {
+  KindAccess a;
+  if (!kind_access(kind, &a)) return desired;
+  uint32_t mapped = a.mapping.map(desired);
+  if (desired & 0x02000000u) mapped = a.valid;
+  return mapped & ~uint32_t{0x02000000u};
+}
+
+// The descriptor kept for an object limits what the calling thread may have of it: *desired becomes what it gets (MAXIMUM_ALLOWED asks for all the descriptor allows). 0, or why not.
+uint32_t restrict_by_descriptor(Process& p, uint32_t id, DescriptorKind kind, uint32_t* desired) {
+  if (const uint32_t gate = impersonation_gate(p)) return gate;
+  ObjectManager* objects = system_objects();
+  KindAccess a;
+  if (!objects || !objects->allocator() || !kind_access(kind, &a)) return kSuccess;
+  char key[16];
+  const uint32_t n = ObjectManager::object_key('s', id, key);
+  const uint32_t size = objects->security_size(StringView(key, n));
+  if (size == 0) return kSuccess;
+  ByteBuffer sd(*objects->allocator());
+  if (!sd.put_zeros(size) || objects->security_get(StringView(key, n), sd.writable_view()) != size) return kAccessDeniedStatus;
+  uint32_t granted = 0, status = 0;
+  if (!caller_may(p, sd.view(), *desired, a.mapping, &granted, &status)) return status ? status : kAccessDeniedStatus;
+  if (*desired & kMaximumAllowed) *desired = granted;
+  return kSuccess;
+}
+
+// The same for a program other than the caller: its own token (the one of the process) decides.
+uint32_t object_access_for_process(uint64_t pid, uint32_t id, DescriptorKind kind, uint32_t desired, uint32_t* granted) {
+  ObjectManager* objects = system_objects();
+  KindAccess a;
+  if (!objects || !objects->allocator() || !kind_access(kind, &a)) return kSuccess;
+  char key[16];
+  const uint32_t n = ObjectManager::object_key('s', id, key);
+  const uint32_t size = objects->security_size(StringView(key, n));
+  if (size == 0) return kSuccess;
+  ByteBuffer sd(*objects->allocator()), blob(*objects->allocator());
+  if (!sd.put_zeros(size) || objects->security_get(StringView(key, n), sd.writable_view()) != size) return kAccessDeniedStatus;
+  security::TokenView token;
+  if (!process_token_blob(pid, blob) || !token.parse(blob.view())) return kSuccess;
+  const security::CheckResult result = security::access_check(sd.view(), token, desired, a.mapping);
+  *granted = result.granted;
+  return result.status == 0 ? kSuccess : (result.status ? result.status : kAccessDeniedStatus);
 }
 
 uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, bool manual_reset, bool state, int32_t initial, int32_t maximum) {
@@ -187,10 +256,11 @@ uint32_t open_object(Process& p, const SyscallRequest& r, ObjectKind kind) {
   const uint32_t status = read_name(p, r.args[2], name, ObjectManager::kNameBytes, &size);
   if (status != kSuccess) return status;
   if (size == 0) return kInvalidParameter;
-  uint32_t granted = 0;
+  uint32_t granted = 0, wanted = uint32_t(r.args[1]);
   const ObjectManager::Created c = objects->open(kind, StringView(name, size));
   if (c.id == 0) return c.status;
-  if (const uint32_t denied = map_sync_access(kind, uint32_t(r.args[1]), true, &granted)) { objects->release(c.id); return denied; }
+  if (const uint32_t refused = restrict_by_descriptor(p, c.id, descriptor_kind_of(kind), &wanted)) { objects->release(c.id); return refused; }
+  if (const uint32_t denied = map_sync_access(kind, wanted, true, &granted)) { objects->release(c.id); return denied; }
   const uint32_t given = give_handle(p, *objects, kind, c.id, r.args[0], kSuccess, wants_inherit(p, r.args[2]));
   if (given == kSuccess) restrict_handle(p, r.args[0], granted, kind);
   return given;
@@ -492,7 +562,14 @@ uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t targ
   op.suspended = (options & 1) != 0;
   const uint32_t status = p.runtime()->remote_operation(pid, op);
   if (status != kSuccess) return status;
-  const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~uint32_t(desired_access));
+  if (!(options & 2) && caller_reduced(p) && is_object_kind(DescriptorKind(op.type))) {      // a thread that impersonates is held to the descriptor of the object
+    KindAccess a;
+    if (kind_access(DescriptorKind(op.type), &a) && (mapped_access(DescriptorKind(op.type), uint32_t(desired_access)) & a.valid & op.protect)) {
+      if (ObjectManager* objects = system_objects()) objects->release(uint32_t(op.argument));
+      return kAccessDeniedStatus;
+    }
+  }
+  const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~mapped_access(DescriptorKind(op.type), uint32_t(desired_access)));
   uint64_t handle = 0;
   uint32_t given = give_object_handle_in(p, op.type, op.argument, denied, (options & 4) ? false : (attributes & 2) != 0, &handle);
   if (given == kSuccess && target_at != 0 && !p.write_user_u64(target_at, handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
@@ -504,6 +581,37 @@ uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t targ
 }
 
 // NtDuplicateObject into a program other than the caller (only the kinds of the object manager, which count their references).
+// A handle of one other program copied into a third (or the same other) program: taken out of the first, then put into the second.
+uint32_t duplicate_between_others(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t source_pid = 0, target_pid = 0;
+  if (!process_handle_info(p, r.args[0], &exited, &code, &source_pid) || exited) return kInvalidHandle;
+  if (!process_handle_info(p, r.args[2], &exited, &code, &target_pid) || exited) return kInvalidHandle;
+  if (!p.runtime()) return kNotImplemented;
+  IProcessRuntime::RemoteOp take;
+  take.kind = IProcessRuntime::RemoteOp::TakeHandle;
+  take.address = r.args[1];
+  take.suspended = (options & 1) != 0;
+  if (const uint32_t status = p.runtime()->remote_operation(source_pid, take)) return status;
+  ObjectManager* objects = system_objects();
+  if (!objects || !is_object_kind(DescriptorKind(take.type))) return kNotImplemented;
+  if (!(options & 2) && caller_is_impersonating(p) && caller_reduced(p)) {
+    KindAccess a;
+    if (kind_access(DescriptorKind(take.type), &a) && (mapped_access(DescriptorKind(take.type), uint32_t(desired_access)) & a.valid & take.protect)) { objects->release(uint32_t(take.argument)); return kAccessDeniedStatus; }
+  }
+  IProcessRuntime::RemoteOp put;
+  put.kind = IProcessRuntime::RemoteOp::Duplicate;
+  put.type = take.type;
+  put.argument = take.argument;
+  put.protect = (options & 2) ? take.protect : (take.protect | ~mapped_access(DescriptorKind(take.type), uint32_t(desired_access)));
+  put.suspended = (options & 4) ? false : (attributes & 2) != 0;
+  const uint32_t status = p.runtime()->remote_operation(target_pid, put);
+  if (status != kSuccess) { objects->release(uint32_t(take.argument)); return status; }
+  if (target_at != 0 && !p.write_user_u64(target_at, put.address)) return kAccessViolation;
+  return kSuccess;
+}
+
 uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
   bool exited = false;
   uint32_t code = 0;
@@ -522,7 +630,14 @@ uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target
   op.kind = IProcessRuntime::RemoteOp::Duplicate;
   op.type = uint32_t(kind);
   op.argument = id;
-  op.protect = (options & 2) ? original : (original | ~uint32_t(desired_access));
+  op.protect = (options & 2) ? original : (original | ~mapped_access(kind, uint32_t(desired_access)));
+  if (!(options & 2)) {      // a program that runs under a restricted token only gets the rights the handle holds
+    ByteBuffer blob(*objects->allocator());
+    security::TokenView token;
+    KindAccess a;
+    if (process_token_blob(pid, blob) && token.parse(blob.view()) && token.is_reduced() && kind_access(kind, &a) &&
+        (mapped_access(kind, uint32_t(desired_access)) & a.valid & original)) return kAccessDeniedStatus;
+  }
   op.suspended = (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0;
   objects->add_ref(id);
   const uint32_t status = p.runtime()->remote_operation(pid, op);
@@ -540,7 +655,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &desired_access) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &options)) return kAccessViolation;
   const bool source_here = names_own_process(p, r.args[0]);
   const bool target_here = names_own_process(p, r.args[2]);
-  if (!source_here) return target_here ? duplicate_from_other(p, r, target_at, desired_access, attributes, options) : kNotImplemented;      // (between two other programs: not here)
+  if (!source_here) return target_here ? duplicate_from_other(p, r, target_at, desired_access, attributes, options) : duplicate_between_others(p, r, target_at, desired_access, attributes, options);
   if (!target_here) return duplicate_to_other(p, r, target_at, desired_access, attributes, options);
   if (r.args[1] == ~uint64_t{1}) {      // the pseudo handle of the calling thread becomes a real handle to it
     const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();
@@ -584,9 +699,25 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if ((options & 1) && !p.files().protected_from_close(slot)) {      // DUPLICATE_CLOSE_SOURCE into this very process: the source goes first, so the handle keeps its number
     if (target_at != 0 && !p.write_user_u64(target_at, r.args[1])) return kAccessViolation;
     const uint32_t original = p.files().denied_access(slot);
-    p.files().set_denied_access(slot, (options & 2) ? original : (original | ~uint32_t(desired_access)));
+    p.files().set_denied_access(slot, (options & 2) ? original : (p.files().kind(slot) == DescriptorKind::File || p.files().kind(slot) == DescriptorKind::Directory ? original : 0u) | ~mapped_access(p.files().kind(slot), uint32_t(desired_access)));
     p.files().set_handle_flags(slot, (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0, (options & 4) != 0 && p.files().protected_from_close(slot));
     return kSuccess;
+  }
+  if (!(options & 2) && caller_reduced(p)) {      // a thread that impersonates may not copy a handle with more rights than the handle holds
+    KindAccess a;
+    if (kind_access(p.files().kind(slot), &a) && (mapped_access(p.files().kind(slot), uint32_t(desired_access)) & a.valid & p.files().denied_access(slot))) return kAccessDeniedStatus;
+  }
+  if (!(options & 2) && p.files().kind(slot) == DescriptorKind::Process) {      // more rights to a process than its handle holds: what its descriptor allows
+    bool exited = false;
+    uint32_t code = 0;
+    uint64_t pid = 0;
+    ObjectManager* objects = system_objects();
+    uint32_t granted = 0;
+    if (objects && objects->query_process(uint32_t(p.files().token(slot)), &exited, &code, &pid) && pid < (uint64_t{1} << 20)) {
+      KindAccess a;
+      if (kind_access(DescriptorKind::Process, &a) && (mapped_access(DescriptorKind::Process, uint32_t(desired_access)) & a.valid & p.files().denied_access(slot)))
+        if (const uint32_t refused = open_with_descriptor(p, 'p', pid, uint32_t(desired_access), kProcessMapping, &granted)) return refused;
+    }
   }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;
@@ -601,7 +732,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   }
   {      // DUPLICATE_SAME_ACCESS keeps the rights; otherwise the copy has the ones asked for (the rights of a section are the ones MapViewOfFile checks)
     const uint32_t original = p.files().denied_access(slot);
-    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (original | ~uint32_t(desired_access)));
+    p.files().set_denied_access(uint64_t(copy), (options & 2) ? original : (p.files().kind(slot) == DescriptorKind::File || p.files().kind(slot) == DescriptorKind::Directory ? original : 0u) | ~mapped_access(p.files().kind(slot), uint32_t(desired_access)));
   }
   const bool same = (options & 4) != 0;      // DUPLICATE_SAME_ATTRIBUTES; otherwise the handle is inheritable if the attributes say OBJ_INHERIT
   p.files().set_handle_flags(uint64_t(copy), same ? p.files().inheritable(slot) : (attributes & 2) != 0, same && p.files().protected_from_close(slot));
@@ -753,6 +884,7 @@ uint32_t image_section_status(ConstByteView file, exe::PeFile& pe) {
 
 // NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER MaximumSize, ULONG PageProtection, ULONG AllocationAttributes, HANDLE FileHandle): memory to map into
 // address spaces, shared by name; with a file handle it is the file's contents (written back by FlushViewOfFile, when the last view goes and when the section does).
+uint32_t section_rights(uint32_t access);
 uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
   uint64_t page_protection = 0, attributes = 0, file_handle = 0;
   if (!argument(p, r, 4, &page_protection) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &file_handle)) return kAccessViolation;
@@ -816,7 +948,10 @@ uint32_t nt_create_section(Process& p, const SyscallRequest& r) {
     if (!AddressSpace::round_up(pe.size_of_image(), &image_rounded) || size > image_rounded) { objects->release(c.id); return 0xC0000040u; }      // STATUS_SECTION_TOO_BIG
     objects->section_set_reported_size(c.id, size != 0 ? size : image_rounded);
   }
-  return give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
+  const uint32_t given = give_handle(p, *objects, ObjectKind::Section, c.id, r.args[0], c.status, wants_inherit(p, r.args[2]));
+  uint64_t handle = 0, slot = 0;
+  if ((given == kSuccess || given == c.status) && p.read_user_u64(r.args[0], &handle) && slot_of(handle, &slot)) p.files().set_denied_access(slot, ~section_rights(uint32_t(r.args[1])));      // (the handle holds the rights it was made for)
+  return given;
 }
 // The rights an access mask asks for, with the generic ones spelled out (a section: query 1, write 2, read 4, execute 8, extend size 0x10).
 uint32_t section_rights(uint32_t access) {
@@ -1142,13 +1277,11 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
     case 0: {      // OBJECT_BASIC_INFORMATION
       put32(0, (p.files().inheritable(slot) ? 2u : 0u) | (p.files().protected_from_close(slot) ? 1u : 0u));      // Attributes (OBJ_INHERIT, a protected handle)
       uint32_t granted = 0x001F0FFF;
-      if (p.files().kind(slot) == DescriptorKind::Directory) if (const OpenObject* opened = p.files().object(slot)) if (opened->granted_access != 0) {      // a directory handle says what it was opened for
-        granted = opened->granted_access;
-        if (granted & 0x80000000u) granted |= 0x120089u;      // GENERIC_READ
-        if (granted & 0x40000000u) granted |= 0x120116u;      // GENERIC_WRITE
-        if (granted & 0x20000000u) granted |= 0x1200A0u;      // GENERIC_EXECUTE
-        if (granted & 0x10000000u) granted |= 0x1F01FFu;      // GENERIC_ALL
-        granted &= ~0xF0000000u;
+      KindAccess kind_rights;
+      if (kind_access(p.files().kind(slot), &kind_rights)) granted = kind_rights.valid & ~p.files().denied_access(slot);      // what the handle holds of what the kind has
+      if (p.files().kind(slot) == DescriptorKind::File || p.files().kind(slot) == DescriptorKind::Directory) if (const OpenObject* opened = p.files().object(slot)) if (opened->granted_access != 0xFFFFFFFFu) {      // a file or directory handle says what it was opened for
+        granted = kind_rights.mapping.map(opened->granted_access & ~0x02000000u) & kind_rights.valid & ~p.files().denied_access(slot);
+        if (opened->granted_access & 0x02000000u) granted = kind_rights.valid & ~p.files().denied_access(slot);
       }
       put32(4, granted);      // GrantedAccess
       put32(8, 1);               // HandleCount
@@ -1184,6 +1317,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Section: type = "Section"; break;
         case DescriptorKind::Job: type = "Job"; break;
         case DescriptorKind::DebugObject: type = "DebugObject"; break;
+        case DescriptorKind::Token: type = "Token"; break;
         case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
         case DescriptorKind::Mailslot: type = "Mailslot"; break;
         case DescriptorKind::Key: type = "Key"; break;

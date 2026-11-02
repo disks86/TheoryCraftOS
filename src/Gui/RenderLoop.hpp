@@ -25,30 +25,34 @@
 namespace gui {
 
 class RenderLoop {
- public:
-  explicit RenderLoop(Window& window) : window_(window) {}
-  ~RenderLoop() { stop(); }
-  RenderLoop(const RenderLoop&) = delete;
-  RenderLoop& operator=(const RenderLoop&) = delete;
+  public:
+    explicit RenderLoop(Window& window) : window_(window) {}
+    ~RenderLoop() { stop(); }
+    RenderLoop(const RenderLoop&) = delete;
+    RenderLoop& operator=(const RenderLoop&) = delete;
 
-  // Starts the thread; false if threads are unavailable (kernel not started) or it already runs.
-  bool start();
-  // Ends the thread and waits for it. After this the caller may use the window's renderer again.
-  void stop();
-  bool running() const { return __atomic_load_n(&thread_, __ATOMIC_ACQUIRE) != nullptr; }
-  // Frames drawn so far.
-  uint32_t frames() const { return __atomic_load_n(&frames_, __ATOMIC_ACQUIRE); }
+    // Starts the thread; false if threads are unavailable (kernel not started) or it already runs.
+    bool start();
+    // Ends the thread and waits for it. After this the caller may use the window's renderer again.
+    void stop();
+    bool running() const { return __atomic_load_n(&thread_, __ATOMIC_ACQUIRE) != nullptr; }
+    // Frames drawn so far.
+    uint32_t frames() const { return __atomic_load_n(&frames_, __ATOMIC_ACQUIRE); }
+    // Last render time in microseconds (0 if not yet rendered).
+    uint64_t last_render_time_us() const { return __atomic_load_n(&last_render_time_us_, __ATOMIC_ACQUIRE); }
 
-  static constexpr uint64_t kFramePauseUs = 8000;
+    static constexpr uint64_t kFramePauseUs = 8000;
 
- private:
-  static void thread_main(void* loop);
-  void run();
+  private:
+    static void thread_main(void* loop);
+    void run();
 
-  Window& window_;
-  kernel::Thread* thread_ = nullptr;
-  bool stop_ = false;
-  uint32_t frames_ = 0;
+    Window& window_;
+    kernel::Thread* thread_ = nullptr;
+    bool stop_ = false;
+    uint32_t frames_ = 0;
+    // Tracks last render time for watchdog purposes; accessed atomically.
+    uint64_t last_render_time_us_ = 0;
 };
 
 }  // namespace gui

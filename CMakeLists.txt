@@ -645,7 +645,8 @@ add_executable(BOOTX64
   src/Process/WindowsLocks.cpp
   src/Process/WindowsJobs.cpp
   src/Process/WindowsDebug.cpp
-  src/Process/FileSecurity.cpp
+  src/Process/AccessCheck.cpp
+  src/Process/WindowsTokens.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
@@ -1028,8 +1029,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/libntdll.a
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${ntdll_stubs} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
-            -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/heap.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl3.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/sec.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/normalize.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/uilang.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/locale_names.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/unidata.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/actctx.inc
+            -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/security.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/token.c
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/security.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/security.h ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/token.c ${CMAKE_SOURCE_DIR}/src/Windows/ntsec.h ${CMAKE_SOURCE_DIR}/src/Windows/tcos_token.h ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/heap.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl3.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/sec.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/normalize.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/uilang.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/locale_names.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/unidata.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/actctx.inc
     COMMENT "Building ntdll.dll")
   windows_stub_flags(kernel32_stubs kernel32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
@@ -1047,8 +1048,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   windows_stub_flags(advapi32_stubs advapi32 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/advapi32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${advapi32_stubs} -Wl,--image-base=0x180600000 -o ${WINDOWS_DIR}/advapi32.dll
-            ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/registry.inc ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/sddl.inc
+            ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/security.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/kbsec.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/lsa.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/registry.inc ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/security.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/kbsec.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/lsa.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/sddl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/token.inc ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/security.h ${CMAKE_SOURCE_DIR}/src/Windows/ntsec.h
             ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/advapi32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building advapi32.dll")
   windows_stub_flags(ws2_32_stubs ws2_32 0)

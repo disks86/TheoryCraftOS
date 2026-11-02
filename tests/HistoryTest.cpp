@@ -120,7 +120,7 @@ static void test_hubs() {
     StorageArea& two = hub.area("https://two.example");
     one.set("k", "v1");
     two.set("k", "v2");
-    StringView v;
+    String v(a);
     CHECK(&one != &two && &hub.area("https://one.example") == &one && one.get("k", &v) && v.equals("v1") && two.get("k", &v) && v.equals("v2") && hub.origin_count() == 2);
     // (the areas stay where they are as more origins come)
     for (int i = 0; i < 50; ++i) hub.area(("https://o" + std::to_string(i) + ".example").c_str());

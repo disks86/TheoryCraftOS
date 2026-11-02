@@ -90,6 +90,17 @@ uint32_t result_status(ObjectManager::PipeResult r, bool server, bool write) {
   }
 }
 
+// The rights of a pipe handle: the ones asked for (the generic rights as those of a file), or all when none were named.
+void set_pipe_rights(Process& p, uint64_t handle, uint32_t desired) {
+  uint32_t rights = desired & 0x01FFFFFFu;
+  if (desired & 0x80000000u) rights |= 0x120089u;
+  if (desired & 0x40000000u) rights |= 0x120116u;
+  if (desired & 0x20000000u) rights |= 0x1200A0u;
+  if (desired & 0x10000000u) rights |= 0x1F01FFu;
+  if (desired & 0x02000000u) rights = 0x1F01FFu;
+  p.files().set_denied_access(handle / 4 - 1, ~rights);
+}
+
 uint32_t give_pipe_handle(Process& p, uint64_t token, bool inherit, uint64_t* handle) {
   const int64_t slot = p.files().open_token(DescriptorKind::Pipe, token);
   if (slot < 0) return kNoResources;
@@ -216,6 +227,7 @@ uint32_t nt_create_named_pipe_file(Process& p, const SyscallRequest& r) {
   if (completion & 1) server_token |= kNoWait;
   uint32_t status = give_pipe_handle(p, server_token, wants_inherit(p, r.args[2]), &handle);
   if (status != kSuccess) { objects->release_pipe_end(c.id, 0); return status; }
+  set_pipe_rights(p, handle, uint32_t(r.args[1]));
   if (!p.write_user_u64(r.args[0], handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
   uint8_t iosb[16] = {};
   iosb[8] = 2;      // FILE_CREATED

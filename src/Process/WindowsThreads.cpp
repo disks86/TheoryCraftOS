@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
@@ -299,6 +300,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
 void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
   record.finished = true;
   record.exit_code = code;
+  token_thread_ended(record.id);      // (its impersonation token goes with it)
   if (record.region_size && p.address_space()) {
     // (the region is the stack, then the TEB and the TLS block: the stack of a thread that became a fiber may be switched to later, so only what follows it goes)
     const bool keep = record.keep_stack && record.teb > record.region_base && record.teb - record.region_base < record.region_size;
@@ -611,19 +613,15 @@ uint32_t nt_open_thread(Process& p, const SyscallRequest& r) {
   }
   Process::ThreadRecord* record = p.find_thread(thread_id);
   if (!record || record->finished) return 0xC000000Bu;      // STATUS_INVALID_CID
+  uint32_t granted = 0;
+  if (const uint32_t refused = open_with_descriptor(p, 'h', thread_id, uint32_t(r.args[1]), kThreadMapping, &granted)) return refused;
   const int64_t slot = p.files().open_token(DescriptorKind::Thread, thread_id);
   if (slot < 0) return kInsufficientResources;
   uint8_t attributes[4] = {};
   if (r.args[2] != 0) p.read_user(r.args[2] + 24, ByteView(attributes, 4));
   p.files().set_handle_flags(uint64_t(slot), (attributes[0] & 2) != 0, false);
   {      // the rights asked for (generic ones mapped); the others are denied to the handle
-    uint32_t want = uint32_t(r.args[1]);
-    if (want & 0x80000000u) want |= 0x20000 | 0x40 | 0x800;      // GENERIC_READ: READ_CONTROL, query information
-    if (want & 0x40000000u) want |= 0x20000 | 0x20 | 0x2 | 0x1 | 0x4 | 0x10 | 0x400;      // GENERIC_WRITE
-    if (want & 0x20000000u) want |= 0x20000 | 0x100000 | 0x800 | 0x2;      // GENERIC_EXECUTE
-    if (want & 0x10000000u) want |= 0x1FFFFF;      // GENERIC_ALL
-    if (want & 0x2000000u) want = 0x1FFFFF;      // MAXIMUM_ALLOWED
-    p.files().set_denied_access(uint64_t(slot), ~want & 0x1FFFFFu);
+    p.files().set_denied_access(uint64_t(slot), ~granted & 0x1FFFFFu);
   }
   if (!p.write_user_u64(r.args[0], (uint64_t(slot) + 1) * 4)) { p.files().close(uint64_t(slot)); return kAccessViolation; }
   return kSuccess;
@@ -724,6 +722,17 @@ uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r) {
   if (!record) return kInvalidHandle;
   const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
   uint8_t in[16] = {};
+  if (info_class == 5) {      // ThreadImpersonationToken: the thread impersonates the token (0: it stops)
+    if (length != 8) return kInfoLengthMismatch;
+    uint64_t token = 0;
+    if (!p.read_user_u64(r.args[2], &token)) return kAccessViolation;
+    SyscallRequest forward;
+    forward.args[0] = 5 /* TCOS_TOKEN_SET_THREAD */;
+    forward.args[1] = r.args[0];
+    forward.args[2] = token;
+    forward.user_stack = r.user_stack;
+    return nt_tcos_token(p, forward);
+  }
   if (info_class == 38) {      // ThreadNameInformation: the name is what the UNICODE_STRING in the buffer points to
     if (length != 16) return kInfoLengthMismatch;
     uint8_t head[16];

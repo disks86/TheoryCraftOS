@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
@@ -324,8 +325,10 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   const uint32_t joined = objects->job_inherit(p.id(), spec.pid, (flags_arg & kBreakawayFromJob) != 0);      // the child belongs to the job of the one that starts it
   if (joined != kSuccess) { objects->release(created.id); return joined; }
   objects->add_ref(created.id);      // (one reference for each of the two handles)
+  token_inherit(parent_pid, spec.pid);      // (the child starts with a copy of the token of its parent)
   status = parent_pid == p.id() ? runtime->spawn_process(spec) : runtime->spawn_process_for(parent_pid, spec);
   if (status != kSuccess) {
+    token_process_exited(spec.pid);
     objects->job_forget(spec.pid);
     objects->release(created.id);
     objects->release(created.id);
@@ -581,6 +584,8 @@ uint32_t nt_open_process(Process& p, const SyscallRequest& r) {
   uint64_t pid = 0;
   for (uint32_t i = 0; i < 8; ++i) pid |= uint64_t{id[i]} << (8 * i);
   const bool exists = pid == p.id() || (p.runtime() && p.runtime()->process_exists(pid));
+  uint32_t granted = 0;
+  if (exists) if (const uint32_t refused = open_with_descriptor(p, 'p', pid, uint32_t(r.args[1]), kProcessMapping, &granted)) return refused;
   const ObjectManager::Created c = objects->open_process(pid, exists);
   if (c.id == 0) return c.status == 0xC0000034u ? 0xC000000Bu : c.status;      // STATUS_INVALID_CID
   uint8_t attributes[4] = {};
@@ -589,12 +594,7 @@ uint32_t nt_open_process(Process& p, const SyscallRequest& r) {
   const uint32_t status = give_handle(p, *objects, c.id, r.args[0], &slot);
   if (status == kSuccess) {
     p.files().set_handle_flags(slot, (attributes[0] & 2) != 0, false);
-    uint32_t want = uint32_t(r.args[1]);      // the rights asked for (the generic ones spelled out); the handle lacks the others
-    if (want & 0x80000000u) want |= 0x20000 | 0x10 | 0x400;      // GENERIC_READ: READ_CONTROL, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION
-    if (want & 0x40000000u) want |= 0x20000 | 0x2 | 0x8 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200;      // GENERIC_WRITE
-    if (want & 0x20000000u) want |= 0x120000 | 0x1000;      // GENERIC_EXECUTE
-    if (want & 0x12000000u) want = 0x1FFFFF;      // GENERIC_ALL, MAXIMUM_ALLOWED
-    p.files().set_denied_access(slot, ~want & 0x1FFFFFu);
+    p.files().set_denied_access(slot, ~granted & 0x1FFFFFu);      // the rights asked for (the generic ones spelled out, and allowed by the descriptor of the process); the handle lacks the others
   }
   return status;
 }

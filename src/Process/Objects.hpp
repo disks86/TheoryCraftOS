@@ -45,7 +45,7 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token };
 
 class ObjectManager {
  public:
@@ -77,6 +77,7 @@ class ObjectManager {
   // read side of CreatePipe). Each end is counted separately: the other side sees the end of the data / a broken pipe when no handle to it is left. The buffers come from the
   // allocator given to set_allocator().
   void set_allocator(allocators::IAllocator* allocator) { allocator_ = allocator; }
+  allocators::IAllocator* allocator() const { return allocator_; }
   static constexpr uint32_t kPipeInbound = 1, kPipeOutbound = 2, kPipeDuplex = 3;      // the server's direction (PIPE_ACCESS_*); anonymous pipes are outbound
   // `name` empty: an anonymous pipe, already connected. Otherwise a new instance of the pipe of that name (up to `max_instances` of them, 0: no limit), not connected.
   Created create_pipe(StringView name, uint32_t out_size, uint32_t in_size, uint32_t max_instances, uint32_t access, bool message_type = false, uint64_t pid = 0);
@@ -232,11 +233,15 @@ class ObjectManager {
   void file_times_move(StringView from, StringView to);      // the file was renamed
   void file_times_forget(StringView path);                   // the file is gone
 
-  // --- security descriptors of files and directories (see FileSecurity.hpp), kept by path for as long as the node is there. A fixed number of nodes can have one: security_room() says
-  // whether another fits, security_set() whether this one did.
+  // --- security blobs, kept by key for as long as what they belong to is there: the self-relative security descriptors (AccessCheck.hpp) of files and directories (the key is the path) and
+  // of kernel objects, processes, threads and registry keys (object_key()), and the blobs of tokens (src/Windows/tcos_token.h). A bounded number can be kept (kMaxSecurity, together
+  // kMaxSecurityBytes): security_set() says whether this one fit.
   bool security_room();
   bool security_set(StringView path, ConstByteView descriptor);
-  uint32_t security_get(StringView path, ByteView out);      // the size of the descriptor written to `out`, 0 if the node has none
+  uint32_t security_get(StringView path, ByteView out);      // the size of the descriptor written to `out`, 0 if the node has none or it does not fit
+  uint32_t security_size(StringView path);      // the size of the descriptor kept, 0 if none
+  static constexpr uint32_t kMaxSecurityBlob = 16384, kMaxSecurityBytes = 4u << 20;      // the longest blob, and all of them together
+  static uint32_t object_key(char tag, uint32_t id, char (&out)[16]);      // the key of an object's blob: 't' its token, 's' its security descriptor
   void security_move(StringView from, StringView to);       // the node (and what is below it) was renamed
   void security_forget(StringView path);                    // the node is gone
 
@@ -421,7 +426,7 @@ class ObjectManager {
   PipeOp* pipe_find_op_locked(Pipe& p, uint32_t tag);
   void pipe_free_op_locked(Pipe& p, PipeOp& op);
   bool post_port_packet_locked(Pipe& p, uint32_t end, uint32_t status, uint32_t bytes);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 32;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 2048;
 
   struct Watch {
     bool used = false;
@@ -459,6 +464,8 @@ class ObjectManager {
   struct TimesEntry;
   TimesEntry* times_ = nullptr;      // kMaxTimes of them, made with the first
   struct SecurityEntry;
+  void security_erase_locked(SecurityEntry& e);
+  void forget_object_security_locked(uint32_t id);
   SecurityEntry* security_ = nullptr;      // kMaxSecurity of them, made with the first
   struct LinkEntry;
   LinkEntry* links_ = nullptr;      // kMaxLinkTexts of them, made with the first

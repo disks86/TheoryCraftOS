@@ -162,7 +162,7 @@ int main() {
       header.clear();
       cookies.header_for(url_of(a, "https://sub.example.com/a/x"), kNow, CookieJar::Site::SameSite, true, &header);
       CHECK(header.empty());   // (HttpOnly stayed HttpOnly)
-      StringView value;
+      String value(a);
       CHECK(local.area("https://example.com").get("theme", &value) && value.equals("dark"));
       CHECK(local.area("https://example.com").get("tab\tkey", &value) && value.equals("line\nbreak \"quoted\" 'single' \xC3\xA9"));
       CHECK(local.area("https://other.example:8443").get("k", &value) && value.equals("v") && local.origin_count() == 2);
