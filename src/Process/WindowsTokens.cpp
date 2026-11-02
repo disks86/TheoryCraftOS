@@ -547,7 +547,9 @@ uint32_t nt_tcos_token(Process& p, const SyscallRequest& r) {
       }
       }
       const uint32_t required = uint32_t(a[2]);
+      if (kind == DescriptorKind::Key && (required & 0x01000000u)) granted_mask |= 0x01000000u;      // (the privilege decides on a key, not the rights of the handle)
       if (required & ~granted_mask) return kAccessDenied;
+      if ((required & 0x01000000u) && !caller_privilege_enabled(p, 8 /* SeSecurityPrivilege */)) return 0xC0000061u;      // STATUS_PRIVILEGE_NOT_HELD (checked when the descriptor is used)
       if (op == TCOS_OBJECT_SD_GET) {
         const uint32_t size = objects->security_size(StringView(key, key_size));
         if (a[5] != 0 && !p.write_user_u32(a[5], size)) return kAccessViolation;

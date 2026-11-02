@@ -213,6 +213,24 @@ uint32_t restrict_by_descriptor(Process& p, uint32_t id, DescriptorKind kind, ui
   return kSuccess;
 }
 
+// The same for a program other than the caller: its own token (the one of the process) decides.
+uint32_t object_access_for_process(uint64_t pid, uint32_t id, DescriptorKind kind, uint32_t desired, uint32_t* granted) {
+  ObjectManager* objects = system_objects();
+  KindAccess a;
+  if (!objects || !objects->allocator() || !kind_access(kind, &a)) return kSuccess;
+  char key[16];
+  const uint32_t n = ObjectManager::object_key('s', id, key);
+  const uint32_t size = objects->security_size(StringView(key, n));
+  if (size == 0) return kSuccess;
+  ByteBuffer sd(*objects->allocator()), blob(*objects->allocator());
+  if (!sd.put_zeros(size) || objects->security_get(StringView(key, n), sd.writable_view()) != size) return kAccessDeniedStatus;
+  security::TokenView token;
+  if (!process_token_blob(pid, blob) || !token.parse(blob.view())) return kSuccess;
+  const security::CheckResult result = security::access_check(sd.view(), token, desired, a.mapping);
+  *granted = result.granted;
+  return result.status == 0 ? kSuccess : (result.status ? result.status : kAccessDeniedStatus);
+}
+
 uint32_t create_object(Process& p, const SyscallRequest& r, ObjectKind kind, bool manual_reset, bool state, int32_t initial, int32_t maximum) {
   ObjectManager* objects = system_objects();
   if (!objects) return kNotImplemented;
@@ -544,7 +562,14 @@ uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t targ
   op.suspended = (options & 1) != 0;
   const uint32_t status = p.runtime()->remote_operation(pid, op);
   if (status != kSuccess) return status;
-  const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~uint32_t(desired_access));
+  if (!(options & 2) && caller_is_impersonating(p) && is_object_kind(DescriptorKind(op.type))) {      // a thread that impersonates is held to the descriptor of the object
+    uint32_t wanted = uint32_t(desired_access);
+    if (const uint32_t refused = restrict_by_descriptor(p, uint32_t(op.argument), DescriptorKind(op.type), &wanted)) {
+      if (ObjectManager* objects = system_objects()) objects->release(uint32_t(op.argument));
+      return refused;
+    }
+  }
+  const uint32_t denied = (options & 2) ? op.protect : (op.protect | ~mapped_access(DescriptorKind(op.type), uint32_t(desired_access)));
   uint64_t handle = 0;
   uint32_t given = give_object_handle_in(p, op.type, op.argument, denied, (options & 4) ? false : (attributes & 2) != 0, &handle);
   if (given == kSuccess && target_at != 0 && !p.write_user_u64(target_at, handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
@@ -556,6 +581,37 @@ uint32_t duplicate_from_other(Process& p, const SyscallRequest& r, uint64_t targ
 }
 
 // NtDuplicateObject into a program other than the caller (only the kinds of the object manager, which count their references).
+// A handle of one other program copied into a third (or the same other) program: taken out of the first, then put into the second.
+uint32_t duplicate_between_others(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
+  bool exited = false;
+  uint32_t code = 0;
+  uint64_t source_pid = 0, target_pid = 0;
+  if (!process_handle_info(p, r.args[0], &exited, &code, &source_pid) || exited) return kInvalidHandle;
+  if (!process_handle_info(p, r.args[2], &exited, &code, &target_pid) || exited) return kInvalidHandle;
+  if (!p.runtime()) return kNotImplemented;
+  IProcessRuntime::RemoteOp take;
+  take.kind = IProcessRuntime::RemoteOp::TakeHandle;
+  take.address = r.args[1];
+  take.suspended = (options & 1) != 0;
+  if (const uint32_t status = p.runtime()->remote_operation(source_pid, take)) return status;
+  ObjectManager* objects = system_objects();
+  if (!objects || !is_object_kind(DescriptorKind(take.type))) return kNotImplemented;
+  if (!(options & 2) && caller_is_impersonating(p)) {
+    uint32_t wanted = uint32_t(desired_access);
+    if (const uint32_t refused = restrict_by_descriptor(p, uint32_t(take.argument), DescriptorKind(take.type), &wanted)) { objects->release(uint32_t(take.argument)); return refused; }
+  }
+  IProcessRuntime::RemoteOp put;
+  put.kind = IProcessRuntime::RemoteOp::Duplicate;
+  put.type = take.type;
+  put.argument = take.argument;
+  put.protect = (options & 2) ? take.protect : (take.protect | ~mapped_access(DescriptorKind(take.type), uint32_t(desired_access)));
+  put.suspended = (options & 4) ? false : (attributes & 2) != 0;
+  const uint32_t status = p.runtime()->remote_operation(target_pid, put);
+  if (status != kSuccess) { objects->release(uint32_t(take.argument)); return status; }
+  if (target_at != 0 && !p.write_user_u64(target_at, put.address)) return kAccessViolation;
+  return kSuccess;
+}
+
 uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target_at, uint64_t desired_access, uint64_t attributes, uint64_t options) {
   bool exited = false;
   uint32_t code = 0;
@@ -574,7 +630,11 @@ uint32_t duplicate_to_other(Process& p, const SyscallRequest& r, uint64_t target
   op.kind = IProcessRuntime::RemoteOp::Duplicate;
   op.type = uint32_t(kind);
   op.argument = id;
-  op.protect = (options & 2) ? original : (original | ~uint32_t(desired_access));
+  op.protect = (options & 2) ? original : (original | ~mapped_access(kind, uint32_t(desired_access)));
+  if (!(options & 2)) {      // the token of the program that gets the copy decides whether it may have what it asks for
+    uint32_t granted = 0;
+    if (const uint32_t refused = object_access_for_process(pid, id, kind, uint32_t(desired_access), &granted)) return refused;
+  }
   op.suspended = (options & 4) ? p.files().inheritable(slot) : (attributes & 2) != 0;
   objects->add_ref(id);
   const uint32_t status = p.runtime()->remote_operation(pid, op);
@@ -592,7 +652,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &desired_access) || !argument(p, r, 5, &attributes) || !argument(p, r, 6, &options)) return kAccessViolation;
   const bool source_here = names_own_process(p, r.args[0]);
   const bool target_here = names_own_process(p, r.args[2]);
-  if (!source_here) return target_here ? duplicate_from_other(p, r, target_at, desired_access, attributes, options) : kNotImplemented;      // (between two other programs: not here)
+  if (!source_here) return target_here ? duplicate_from_other(p, r, target_at, desired_access, attributes, options) : duplicate_between_others(p, r, target_at, desired_access, attributes, options);
   if (!target_here) return duplicate_to_other(p, r, target_at, desired_access, attributes, options);
   if (r.args[1] == ~uint64_t{1}) {      // the pseudo handle of the calling thread becomes a real handle to it
     const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();
