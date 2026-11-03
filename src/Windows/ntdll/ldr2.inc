@@ -439,3 +439,27 @@ EXPORT NTSTATUS NTAPI LdrQueryImageFileExecutionOptionsEx(PUNICODE_STRING image,
 EXPORT NTSTATUS NTAPI LdrQueryImageFileExecutionOptions(PUNICODE_STRING image, PCWSTR option, ULONG type, PVOID buffer, ULONG size, PULONG returned) {
   return LdrQueryImageFileExecutionOptionsEx(image, option, type, buffer, size, returned, FALSE);
 }
+
+/* ---- message tables (RT_MESSAGETABLE resources): MESSAGE_RESOURCE_DATA { NumberOfBlocks; blocks of { LowId, HighId, OffsetToEntries } } of entries { Length, Flags (1: unicode), Text } ---- */
+
+EXPORT NTSTATUS NTAPI RtlFindMessage(PVOID module, ULONG type, ULONG language, ULONG id, const BYTE **entry) {
+  LDR_RESOURCE_INFO_ info = {type, 1 /* RT_MESSAGETABLE ids start at 1 */, language};
+  const BYTE *data_entry = NULL;
+  NTSTATUS status = LdrFindResource_U(module, &info, 3, (PVOID *)&data_entry);
+  if (!NT_SUCCESS(status)) return status;
+  const BYTE *table = NULL;
+  ULONG size = 0;
+  status = LdrAccessResource(module, data_entry, (PVOID *)&table, &size);
+  if (!NT_SUCCESS(status)) return status;
+  const ULONG blocks = *(const ULONG *)table;
+  for (ULONG i = 0; i < blocks; ++i) {
+    const BYTE *block = table + 4 + 12 * (SIZE_T)i;
+    const ULONG low = *(const ULONG *)block, high = *(const ULONG *)(block + 4), offset = *(const ULONG *)(block + 8);
+    if (id < low || id > high) continue;
+    const BYTE *p = table + offset;
+    for (ULONG k = low; k < id; ++k) p += *(const USHORT *)p;
+    *entry = p;
+    return STATUS_SUCCESS;
+  }
+  return (NTSTATUS)0xC0000109;      /* STATUS_MESSAGE_NOT_FOUND */
+}

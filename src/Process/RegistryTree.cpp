@@ -141,7 +141,7 @@ uint32_t RegistryTree::new_key(uint32_t parent, StringView name, uint64_t now) {
     keys_.remove_at(id);
     return ~0u;
   }
-  if (RegKey* p = key(parent)) p->write_time = now;
+  if (RegKey* p = key(parent)) { p->write_time = now; ++p->changes; ++total_changes; }
   return id;
 }
 
@@ -213,10 +213,50 @@ uint32_t RegistryTree::delete_key(uint32_t id) {
   k->deleted = true;
   RegKey* parent = key(k->parent);
   if (parent) {
+    { ++parent->changes; ++total_changes; }
     for (uint64_t i = 0; i < parent->subkeys.count(); ++i) if (parent->subkeys[i] == id) { parent->subkeys.remove_at(i); break; }
   }
   drop_if_unused(id);
   return kRegSuccess;
+}
+
+uint32_t RegistryTree::rename_key(uint32_t id, StringView name, uint64_t now) {
+  RegKey* k = key(id);
+  if (!k || k->deleted) return kRegKeyDeleted;
+  if (id == kRoot) return kRegInvalidParameter;
+  if (!valid_key_name(name)) return kRegInvalidParameter;
+  const uint32_t clash = find_child(k->parent, name);
+  if (clash != ~0u && clash != id) return kRegNameCollision;
+  RegKey* parent = key(k->parent);
+  if (!parent) return kRegKeyDeleted;
+  for (uint64_t i = 0; i < parent->subkeys.count(); ++i) if (parent->subkeys[i] == id) { parent->subkeys.remove_at(i); break; }
+  if (!k->name.assign(name)) return kRegNoMemory;
+  if (!link_child(k->parent, id)) return kRegNoMemory;
+  k->write_time = now;
+  parent->write_time = now;
+  note_change(id);
+  note_change(k->parent);
+  return kRegSuccess;
+}
+
+uint32_t RegistryTree::open_handles_below(uint32_t id) const {
+  const RegKey* k = key(id);
+  if (!k || k->deleted) return 0;
+  uint32_t n = k->open_handles;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) n += open_handles_below(k->subkeys[i]);
+  return n;
+}
+
+uint64_t RegistryTree::change_count(uint32_t id) const {
+  const RegKey* k = key(id);
+  if (!k || k->deleted) return 0;
+  uint64_t n = k->changes;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) n += change_count(k->subkeys[i]);
+  return n;
+}
+
+void RegistryTree::note_change(uint32_t id) {
+  if (RegKey* k = key(id)) { ++k->changes; ++total_changes; }
 }
 
 const RegValue* RegistryTree::find_value(uint32_t id, StringView name) const {
@@ -241,6 +281,7 @@ uint32_t RegistryTree::set_value(uint32_t id, StringView name, uint32_t type, Co
       replacement->type = type;
       v = static_cast<UniquePointer<RegValue>&&>(replacement);
       k->write_time = now;
+      { ++k->changes; ++total_changes; }
       return kRegSuccess;
     }
   }
@@ -249,6 +290,7 @@ uint32_t RegistryTree::set_value(uint32_t id, StringView name, uint32_t type, Co
   fresh->type = type;
   if (!k->values.push_back(static_cast<UniquePointer<RegValue>&&>(fresh))) return kRegNoMemory;
   k->write_time = now;
+  { ++k->changes; ++total_changes; }
   return kRegSuccess;
 }
 
@@ -260,6 +302,7 @@ uint32_t RegistryTree::delete_value(uint32_t id, StringView name, uint64_t now) 
     if (v && names_equal(v->name.view(), name)) {
       k->values.remove_at(i);
       k->write_time = now;
+      { ++k->changes; ++total_changes; }
       return kRegSuccess;
     }
   }

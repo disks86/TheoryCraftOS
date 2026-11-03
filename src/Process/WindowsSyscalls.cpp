@@ -45,6 +45,7 @@ namespace process {
 
 namespace {
 
+constexpr uint32_t kStatusObjectNameNotFound = 0xC0000034u;
 constexpr uint32_t kStatusSuccess = 0, kStatusNoYield = 0x40000024u, kStatusNotImplemented = 0xC0000002u, kStatusInvalidHandle = 0xC0000008u,
                    kStatusInvalidParameter = 0xC000000Du, kStatusAccessViolation = 0xC0000005u, kStatusEndOfFile = 0xC0000011u, kStatusAccessDenied = 0xC0000022u,
                    kStatusNoMemory = 0xC0000017u, kStatusConflictingAddresses = 0xC0000018u, kStatusUnableToFreeVm = 0xC000001Au, kStatusInvalidPageProtection = 0xC0000045u;
@@ -373,6 +374,21 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSetSystemTime: case WindowsSyscallNumber::NtSetSystemInformation: case WindowsSyscallNumber::NtLoadDriver: case WindowsSyscallNumber::NtUnloadDriver:
       case WindowsSyscallNumber::NtShutdownSystem: case WindowsSyscallNumber::NtInitiatePowerAction: case WindowsSyscallNumber::NtSetSystemPowerState:
       case WindowsSyscallNumber::NtCreatePagingFile: case WindowsSyscallNumber::NtSystemDebugControl: case WindowsSyscallNumber::NtSetLdtEntries:
+        return windowsabi::nt_privilege_not_held(process, r);
+      case WindowsSyscallNumber::NtQueryMultipleValueKey: return windowsabi::nt_query_multiple_value_key(process, r);
+      case WindowsSyscallNumber::NtRenameKey: return windowsabi::nt_rename_key(process, r);
+      case WindowsSyscallNumber::NtSetInformationKey: return windowsabi::nt_set_information_key(process, r);
+      case WindowsSyscallNumber::NtQueryOpenSubKeys: return windowsabi::nt_query_open_sub_keys(process, r);
+      case WindowsSyscallNumber::NtNotifyChangeKey: return windowsabi::nt_notify_change_key(process, r);
+      case WindowsSyscallNumber::NtQueryLicenseValue: return kStatusObjectNameNotFound;
+      case WindowsSyscallNumber::NtQueryEaFile: case WindowsSyscallNumber::NtSetEaFile: return 0xC000004Fu;      // STATUS_EAS_NOT_SUPPORTED
+      case WindowsSyscallNumber::NtQueryQuotaInformationFile: case WindowsSyscallNumber::NtSetQuotaInformationFile: return 0xC00000BBu;
+      case WindowsSyscallNumber::NtSetVolumeInformationFile: case WindowsSyscallNumber::NtSetInformationSymbolicLink: return 0xC00000BBu;
+      case WindowsSyscallNumber::NtLoadKey: case WindowsSyscallNumber::NtLoadKey2: case WindowsSyscallNumber::NtLoadKey3: case WindowsSyscallNumber::NtLoadKeyEx:
+      case WindowsSyscallNumber::NtUnloadKey: case WindowsSyscallNumber::NtUnloadKey2: case WindowsSyscallNumber::NtUnloadKeyEx: case WindowsSyscallNumber::NtSaveKey:
+      case WindowsSyscallNumber::NtSaveKeyEx: case WindowsSyscallNumber::NtSaveMergedKeys: case WindowsSyscallNumber::NtRestoreKey: case WindowsSyscallNumber::NtReplaceKey:
+      case WindowsSyscallNumber::NtCompactKeys: case WindowsSyscallNumber::NtCompressKey: case WindowsSyscallNumber::NtLockRegistryKey: case WindowsSyscallNumber::NtFreezeRegistry:
+      case WindowsSyscallNumber::NtThawRegistry: case WindowsSyscallNumber::NtInitializeRegistry:      // hives are not kept in files: nothing can be loaded, saved or replaced
         return windowsabi::nt_privilege_not_held(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.

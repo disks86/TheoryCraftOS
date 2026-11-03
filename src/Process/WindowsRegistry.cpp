@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsRegistry.hpp"
+#include "Process/WindowsWait.hpp"
 #include "Process/Objects.hpp"
 #include "Process/RegistryTree.hpp"
 #include "Process/WindowsFiles.hpp"
@@ -39,7 +40,11 @@ RegistryTree* g_tree = nullptr;
 struct Guard {
   ISystemSync* sync;
   Guard() : sync(system_objects() ? &system_objects()->sync() : nullptr) { if (sync) sync->lock(); }
-  ~Guard() { if (sync) sync->unlock(); }
+  ~Guard() {
+    static uint64_t seen = 0;      // (with the lock held) a change anywhere in the tree wakes the threads that wait for one (NtNotifyChangeKey)
+    if (sync && g_tree && g_tree->total_changes != seen) { seen = g_tree->total_changes; sync->notify_all(); }
+    if (sync) sync->unlock();
+  }
   Guard(const Guard&) = delete;
   Guard& operator=(const Guard&) = delete;
 };
@@ -405,6 +410,133 @@ uint32_t nt_delete_value_key(Process& p, const SyscallRequest& r) {
 uint32_t nt_flush_key(Process& p, const SyscallRequest& r) {
   uint32_t id = 0;
   return key_of(p, r.args[0], &id) ? kSuccess : kInvalidHandle;      // (nothing is kept on disk)
+}
+
+
+uint32_t nt_query_multiple_value_key(Process& p, const SyscallRequest& r) {
+  uint64_t length_at = 0, required_at = 0;
+  if (!argument(p, r, 4, &length_at) || !argument(p, r, 5, &required_at)) return kAccessViolation;
+  uint32_t id = 0;
+  if (!key_of(p, r.args[0], &id)) return kInvalidHandle;
+  const uint32_t count = static_cast<uint32_t>(r.args[2]);
+  uint64_t raw_length = 0;
+  if (count == 0 || count > 1024 || length_at == 0) return kInvalidParameter;
+  uint8_t four[4];
+  if (!p.read_user(length_at, ByteView(four, 4))) return kAccessViolation;
+  raw_length = uint32_t(four[0]) | uint32_t(four[1]) << 8 | uint32_t(four[2]) << 16 | uint32_t(four[3]) << 24;
+  Guard guard;
+  RegistryTree* t = tree(p);
+  if (!t) return kNoMemory;
+  const RegKey* k = t->key(id);
+  if (!k) return kInvalidHandle;
+  if (k->deleted) return kRegKeyDeleted;
+  ByteBuffer data(p.files().allocator());
+  struct Entry { uint32_t length, offset, type; };
+  List<Entry> entries(p.files().allocator());
+  uint32_t status = kSuccess;
+  for (uint32_t i = 0; i < count; ++i) {      // KEY_VALUE_ENTRY: PUNICODE_STRING ValueName; ULONG DataLength; ULONG DataOffset; ULONG Type  (24 bytes)
+    uint8_t record[8];
+    if (!p.read_user(r.args[1] + uint64_t{i} * 24, ByteView(record, 8))) return kAccessViolation;
+    uint64_t name_at = 0;
+    for (int b = 0; b < 8; ++b) name_at |= uint64_t{record[b]} << (8 * b);
+    String name(p.files().allocator());
+    if (name_at != 0) { const uint32_t s = read_unicode_string_argument(p, name_at, &name); if (s != kSuccess) return s; }
+    const RegValue* v = t->find_value(id, name.view());
+    if (!v) return kRegNameNotFound;
+    while (data.size() % 8 != 0) if (!data.put8(0)) return kNoMemory;
+    Entry e{static_cast<uint32_t>(v->data.size()), static_cast<uint32_t>(data.size()), v->type};
+    if (!data.append(v->data.view()) || !entries.push_back(e)) return kNoMemory;
+  }
+  if (required_at != 0 && !p.write_user_u32(required_at, static_cast<uint32_t>(data.size()))) return kAccessViolation;
+  if (data.size() > raw_length) { p.write_user_u32(length_at, static_cast<uint32_t>(data.size())); status = kBufferOverflow; }
+  else {
+    if (data.size() != 0 && !p.write_user(r.args[3], data.view())) return kAccessViolation;
+    p.write_user_u32(length_at, static_cast<uint32_t>(data.size()));
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint64_t at = r.args[1] + uint64_t{i} * 24;
+    if (!p.write_user_u32(at + 8, entries[i].length) || !p.write_user_u32(at + 12, status == kSuccess ? entries[i].offset : 0) || !p.write_user_u32(at + 16, entries[i].type)) return kAccessViolation;
+  }
+  return status;
+}
+
+uint32_t nt_rename_key(Process& p, const SyscallRequest& r) {
+  uint32_t id = 0;
+  if (!key_of(p, r.args[0], &id)) return kInvalidHandle;
+  String name(p.files().allocator());
+  if (r.args[1] == 0) return kAccessViolation;
+  const uint32_t s = read_unicode_string_argument(p, r.args[1], &name);
+  if (s != kSuccess) return s;
+  Guard guard;
+  RegistryTree* t = tree(p);
+  if (!t) return kNoMemory;
+  return t->rename_key(id, name.view(), now_filetime(p));
+}
+
+uint32_t nt_set_information_key(Process& p, const SyscallRequest& r) {
+  uint32_t id = 0;
+  if (!key_of(p, r.args[0], &id)) return kInvalidHandle;
+  const uint32_t info_class = static_cast<uint32_t>(r.args[1]), length = static_cast<uint32_t>(r.args[3]);
+  if (info_class > 5) return kInvalidParameter;
+  const uint32_t needed = info_class == 0 ? 8 : 4;
+  if (length < needed) return 0xC0000004u;      // STATUS_INFO_LENGTH_MISMATCH
+  uint8_t raw[8];
+  if (!p.read_user(r.args[2], ByteView(raw, needed))) return kAccessViolation;
+  Guard guard;
+  RegistryTree* t = tree(p);
+  if (!t) return kNoMemory;
+  RegKey* k = t->key(id);
+  if (!k) return kInvalidHandle;
+  if (k->deleted) return kRegKeyDeleted;
+  if (info_class == 0) {      // KeyWriteTimeInformation
+    uint64_t time = 0;
+    for (int b = 0; b < 8; ++b) time |= uint64_t{raw[b]} << (8 * b);
+    k->write_time = time;
+  }
+  return kSuccess;
+}
+
+uint32_t nt_query_open_sub_keys(Process& p, const SyscallRequest& r) {
+  uint32_t base = 0;
+  bool inherit = false;
+  String path(p.files().allocator());
+  uint32_t status = read_attributes(p, r.args[0], &base, &path, &inherit);
+  if (status != kSuccess) return status;
+  Guard guard;
+  RegistryTree* t = tree(p);
+  if (!t) return kNoMemory;
+  uint32_t id = 0;
+  status = t->resolve(base, path.view(), false, now_filetime(p), &id, nullptr);
+  if (status != kSuccess) return status;
+  return p.write_user_u32(r.args[1], t->open_handles_below(id)) ? kSuccess : kAccessViolation;
+}
+
+uint32_t nt_notify_change_key(Process& p, const SyscallRequest& r) {
+  uint64_t filter = 0, watch_tree = 0, buffer = 0, size = 0, asynchronous = 0;
+  if (!argument(p, r, 5, &filter) || !argument(p, r, 6, &watch_tree) || !argument(p, r, 7, &buffer) || !argument(p, r, 8, &size) || !argument(p, r, 9, &asynchronous)) return kAccessViolation;
+  uint32_t id = 0;
+  if (!key_of(p, r.args[0], &id)) return kInvalidHandle;
+  if ((filter & 0xFFFFFFFFu) == 0 || (filter & 0xFFFFFFFFu & ~0x1Fu) != 0) return kInvalidParameter;
+  (void)buffer; (void)size;
+  uint64_t before = 0;
+  {
+    Guard guard;
+    RegistryTree* t = tree(p);
+    if (!t) return kNoMemory;
+    const RegKey* k = t->key(id);
+    if (!k) return kInvalidHandle;
+    if (k->deleted) return kRegKeyDeleted;
+    before = (watch_tree & 0xFF) ? t->change_count(id) : k->changes;
+  }
+  if ((asynchronous & 0xFF) != 0) return 0x103u;      // STATUS_PENDING (a program that wants to know waits for the key in a thread of its own)
+  const bool subtree = (watch_tree & 0xFF) != 0;
+  return wait_until(p, ~uint64_t{0}, [&]() -> uint64_t {
+    RegistryTree* t = g_tree;
+    const RegKey* k = t ? t->key(id) : nullptr;
+    if (!k || k->deleted) return kRegKeyDeleted;
+    const uint64_t now = subtree ? t->change_count(id) : k->changes;
+    return now != before ? uint64_t{kSuccess} : kWaitPending;
+  });
 }
 
 }  // namespace process::windowsabi

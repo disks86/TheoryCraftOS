@@ -41,4 +41,13 @@ void key_token_release(uint64_t token);
 // The full path of the key a key handle's token names (\Registry\Machine\...); false if there is none.
 bool key_full_name(Process& p, uint64_t token, String* out);
 
+// NtQueryMultipleValueKey(Key, KEY_VALUE_ENTRY*, Count, Buffer, PULONG BufferLength, PULONG Required): several values at once, their data one after the other in the buffer.
+uint32_t nt_query_multiple_value_key(Process& p, const SyscallRequest& r);
+uint32_t nt_rename_key(Process& p, const SyscallRequest& r);               // (Key, PUNICODE_STRING NewName)
+uint32_t nt_set_information_key(Process& p, const SyscallRequest& r);      // (Key, KEY_SET_INFORMATION_CLASS, Buffer, Length): the write time and the flags that are kept
+uint32_t nt_query_open_sub_keys(Process& p, const SyscallRequest& r);      // (POBJECT_ATTRIBUTES, PULONG HandleCount)
+// NtNotifyChangeKey(Key, Event, ApcRoutine, ApcContext, IoStatusBlock, CompletionFilter, WatchTree, Buffer, BufferSize, Asynchronous): a call that is not asynchronous waits until
+// something under the key changes; an asynchronous one sets the event when it does (the status block is not written).
+uint32_t nt_notify_change_key(Process& p, const SyscallRequest& r);
+
 }  // namespace process::windowsabi

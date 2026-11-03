@@ -49,6 +49,7 @@ struct RegKey {
   uint32_t open_handles = 0;
   bool deleted = false;
   bool volatile_key = false;
+  uint64_t changes = 0;                      // how often a value or a subkey of this key was set, made, deleted or renamed
 };
 
 class RegistryTree {
@@ -72,6 +73,14 @@ class RegistryTree {
 
   // NtDeleteKey: a key with subkeys cannot be deleted (kRegCannotDelete), the root neither.
   uint32_t delete_key(uint32_t id);
+  // NtRenameKey: the key keeps its place in the tree under another name (kRegNameCollision if a sibling has it). The write time of the key and its parent change.
+  uint32_t rename_key(uint32_t id, StringView name, uint64_t now);
+  // The handles open on the key and everything below it (NtQueryOpenSubKeys).
+  uint32_t open_handles_below(uint32_t id) const;
+  // A number that grows with every change of a value or a key anywhere under `id` (the key's own and its subkeys'), for NtNotifyChangeKey to see that something happened.
+  uint64_t change_count(uint32_t id) const;
+  void note_change(uint32_t id);
+  uint64_t total_changes = 0;      // every change counted by the keys, so that a waiter can be woken after any call that changed something
 
   const RegValue* find_value(uint32_t id, StringView name) const;
   uint32_t set_value(uint32_t id, StringView name, uint32_t type, ConstByteView data, uint64_t now);
