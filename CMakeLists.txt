@@ -25,6 +25,8 @@ if(NOT CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(TheoryCraftOS LANGUAGES C CXX ASM)
+# win32k: every .cpp of src/Process/Win32k (the Direct3D thunks in Dxg/ too) is part of the kernel; new files are picked up when CMake is configured again.
+file(GLOB WIN32K_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/Process/Win32k/*.cpp ${CMAKE_SOURCE_DIR}/src/Process/Win32k/Dxg/*.cpp)
 set(TCOS_SMP 4 CACHE STRING "Cores of the QEMU machine of the run targets")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -665,6 +667,7 @@ add_executable(BOOTX64
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp
+  ${WIN32K_SOURCES}
   src/Process/WindowsRegistry.cpp
   src/Process/RegistryTree.cpp
   src/Process/DosWildcard.cpp
