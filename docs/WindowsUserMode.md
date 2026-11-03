@@ -219,6 +219,28 @@ file deleted via `FILE_DISPOSITION_INFORMATION`/delete-on-close firing at the po
 do), watching anything outside the RAM file system, and a `ReadDirectoryChangesW` buffer too small to hold every change already queued when it is called losing the
 rest instead of returning them on a later call (each watch keeps only its most recent 32 pending changes anyway, so this is a narrow edge case).
 
+## Common dialogs (comdlg32.dll)
+
+`src/Windows/comdlg32/comdlg32.c`. Windows draws the common dialogs as windows of the program; user32/gdi32 are not implemented here, so the dialogs that need a person
+are shown by the desktop and the program's thread waits. **`NtTcosCommonDialog`** (service 505, this OS's own; layout in `src/Process/WindowsDialogs.hpp`) takes one 72-byte
+request (kind: open file / save file / colour, title, start path as a DOS path, filter list, initial colour, result buffer) and answers *chosen* or *cancelled*:
+`WindowsDialogs.cpp` maps the DOS paths to the OS file system through the process's drive C: (`/Windows`) and back, and hands a `process::CommonDialogRequest` to
+`IProcessHost::common_dialogs()` (`ICommonDialogs::run`, blocking). `desktop::Terminal` is the implementation for programs started from it: it opens the desktop's shared
+`FileDialog` or `ColorDialog` and waits (a `kernel::ConditionVariable`) for the dialog's close handler. Answers: `STATUS_NOT_SUPPORTED` when the program has no screen (a
+headless run, or a second dialog while one is open), `STATUS_BUFFER_TOO_SMALL` (with the length) for a short result buffer, `STATUS_OBJECT_PATH_NOT_FOUND` when the user
+picked a file outside C:. Host test: `WindowsDialogTest` (fake screen, truncations and bit flips of the request).
+
+In the DLL: `GetOpenFileName`/`GetSaveFileName` (A and W; both structure sizes; filter lists reduced to extensions for the dialog; `lpstrInitialDir`/initial name; the answer
+in `lpstrFile` with `nFileOffset`/`nFileExtension`, `lpstrFileTitle`, `nFilterIndex`; default extension rules as Windows (plain extension of the filter wins, wildcard filters
+use `lpstrDefExt`, `*.` adds nothing); `OFN_EXTENSIONDIFFERENT`; `OFN_NOCHANGEDIR`; a short `lpstrFile` gets `FNERR_BUFFERTOOSMALL` and the needed size in its first WORD),
+`ChooseColor`, `GetFileTitle`, `CommDlgExtendedError` (per thread, reset by every call), and the structure checks of `ChooseFont`, `FindText`/`ReplaceText`, `PrintDlg`,
+`PrintDlgEx`, `PageSetupDlg` with Windows' error codes (`CDERR_*`, `FRERR_BUFFERLENGTHZERO`, `E_INVALIDARG`/`E_HANDLE`). Without windows these cannot do more: the font
+chooser ends with `CFERR_NOFONTS`, Find/Replace (modeless windows) with `CDERR_DIALOGFAILURE`, the print and page setup dialogs with `PDERR_NODEFAULTPRN` (a Windows
+program has no spooler or printers). Not done: hook procedures and templates (accepted, never called), `OFN_ALLOWMULTISELECT` with several files (the file dialog picks one),
+creating a new name in an Open dialog (`FileDialog` takes only existing files), the 8-filter limit of `FileDialog`, the COM `IFileDialog` (itemdlg), the data exports
+`dwLBSubclass`/`dwOKSubclass`. Own checks in the Wine test harness: `scripts/winetest.sh comdlg32 tcos` (`tests/windows/wine/comdlg32/tcos.c`); Wine's own comdlg32 tests
+need real windows.
+
 ## Exceptions and the machine
 
 | Service | Number |

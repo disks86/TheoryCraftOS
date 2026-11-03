@@ -17,6 +17,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include "Process/CommonDialog.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/StartupSpec.hpp"
 #include "Process/Syscall.hpp"
@@ -207,6 +208,8 @@ class IProcessHost {
   virtual uint64_t console_input_available(bool* at_end) { *at_end = false; return 0; }
   // Optional: the process ended while one of its threads may be blocked in read_console() or sleep_ns(): make that return.
   virtual void wake_blocked() {}
+  // Optional: the screen the program's common dialogs (Windows comdlg32) are shown on; nullptr when it has none.
+  virtual ICommonDialogs* common_dialogs() { return nullptr; }
 
  protected:
   IProcessHost() = default;
