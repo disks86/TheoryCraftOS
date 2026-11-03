@@ -664,6 +664,7 @@ add_executable(BOOTX64
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp
   src/Process/WindowsMisc.cpp
+  src/Process/WindowsPorts.cpp
   src/Process/WindowsRegistry.cpp
   src/Process/RegistryTree.cpp
   src/Process/DosWildcard.cpp

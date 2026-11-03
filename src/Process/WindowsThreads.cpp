@@ -677,6 +677,39 @@ uint32_t nt_open_thread(Process& p, const SyscallRequest& r) {
   return kSuccess;
 }
 
+// NtGetNextThread(Process, Thread, DesiredAccess, HandleAttributes, Flags, PHANDLE NewThread): a handle to the thread that follows `Thread` (the first when it is null) among the
+// threads of the process that have not ended; flag 1 walks backwards. Only the calling process can be walked.
+uint32_t nt_get_next_thread(Process& p, const SyscallRequest& r) {
+  uint64_t flags = 0, out = 0;
+  if (!windowsabi::argument(p, r, 4, &flags) || !windowsabi::argument(p, r, 5, &out)) return kAccessViolation;
+  if (r.args[0] != ~uint64_t{0} && r.args[0] != 0) return kInvalidHandle;
+  if (flags & ~uint64_t{1}) return kInvalidParameter;
+  const bool backwards = (flags & 1) != 0;
+  uint64_t after = 0;
+  if (r.args[1] != 0) {
+    Process::ThreadRecord* from = thread_of(p, r.args[1]);
+    if (!from) return kInvalidHandle;
+    after = from->id;
+  }
+  // The live threads in the order they were made (their ids grow).
+  Process::ThreadRecord* best = nullptr;
+  for (uint32_t i = 0; i < Process::kMaxThreads; ++i) {
+    Process::ThreadRecord* t = p.thread_at(i);
+    if (!t || !t->used || t->finished) continue;
+    if (after != 0 && (backwards ? t->id >= after : t->id <= after)) continue;
+    if (!best || (backwards ? t->id > best->id : t->id < best->id)) best = t;
+  }
+  if (!best) return 0x8000001Au;      // STATUS_NO_MORE_ENTRIES
+  uint32_t granted = 0;
+  if (const uint32_t refused = open_with_descriptor(p, 'h', best->id, uint32_t(r.args[2]), kThreadMapping, &granted)) return refused;
+  const int64_t slot = p.files().open_token(DescriptorKind::Thread, best->id);
+  if (slot < 0) return kInsufficientResources;
+  p.files().set_handle_flags(uint64_t(slot), (r.args[3] & 2) != 0, false);
+  p.files().set_denied_access(uint64_t(slot), ~granted & 0x1FFFFFu);
+  if (!p.write_user_u64(out, (uint64_t(slot) + 1) * 4)) { p.files().close(uint64_t(slot)); return kAccessViolation; }
+  return kSuccess;
+}
+
 // NtQueryInformationThread(Thread, Class, Buffer, Length, ReturnLength): basic information (0), times (1), the start address (9), whether it is the last thread (12),
 // and the suspend count (35).
 uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {

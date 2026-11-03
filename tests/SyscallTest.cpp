@@ -350,7 +350,7 @@ static void test_windows() {
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd - 1)))) == kNtNotImpl);
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase - 1)))) == kNtNoService);     // the gap between the two tables
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd)))) == kNtNoService);
-  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(99)))) == kNtNotImpl);                            // the first service without code
+  CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtCreateEnclave))) == kNtNotImpl);                            // a service without code
   SyscallRequest wide = nt(WindowsSyscallNumber::NtYieldExecution);
   wide.number |= 0x100000000ull;                                 // decoders mask this; a raw caller gets "no such service"
   CHECK(st(p.syscall(wide)) == kNtNoService);

@@ -117,6 +117,105 @@ static void test_group_cancel(void)
     pTpReleasePool(pool);
 }
 
+/* ---- LPC ports: a server thread accepts a connection and answers a request with the text upside down ---- */
+
+typedef struct { USHORT DataLength, TotalLength, Type, DataInfoOffset; ULONG_PTR Process, Thread; ULONG MessageId; ULONG pad; ULONG_PTR ClientViewSize; } PM;
+typedef struct { PM header; char text[64]; } PMSG;
+static NTSTATUS (WINAPI *pNtCreatePort)(HANDLE *, OBJECT_ATTRIBUTES *, ULONG, ULONG, ULONG);
+static NTSTATUS (WINAPI *pNtConnectPort)(HANDLE *, UNICODE_STRING *, void *, void *, void *, ULONG *, void *, ULONG *);
+static NTSTATUS (WINAPI *pNtListenPort)(HANDLE, PM *);
+static NTSTATUS (WINAPI *pNtAcceptConnectPort)(HANDLE *, void *, PM *, BOOLEAN, void *, void *);
+static NTSTATUS (WINAPI *pNtCompleteConnectPort)(HANDLE);
+static NTSTATUS (WINAPI *pNtRequestWaitReplyPort)(HANDLE, PM *, PM *);
+static NTSTATUS (WINAPI *pNtReplyWaitReceivePort)(HANDLE, void **, PM *, PM *);
+static NTSTATUS (WINAPI *pNtRequestPort)(HANDLE, PM *);
+static void (WINAPI *pRtlInitUnicodeString)(UNICODE_STRING *, const WCHAR *);
+static HANDLE g_lpc_ready;
+static const WCHAR lpc_name[] = L"\\RPC Control\\TcosTestPort";
+
+static DWORD WINAPI lpc_server(void *arg)
+{
+    HANDLE port = NULL, comm = NULL;
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES attr;
+    PMSG request, reply;
+    NTSTATUS status;
+    void *context = NULL;
+    int i;
+
+    pRtlInitUnicodeString(&name, lpc_name);
+    InitializeObjectAttributes(&attr, &name, 0, 0, NULL);
+    status = pNtCreatePort(&port, &attr, 100, 0x100, 0);
+    ok(!status, "NtCreatePort %lx\n", status);
+    SetEvent(g_lpc_ready);
+    memset(&request, 0, sizeof(request));
+    status = pNtListenPort(port, &request.header);
+    ok(!status, "NtListenPort %lx\n", status);
+    ok(request.header.Type == 10, "connection request type %u\n", request.header.Type);
+    ok(request.header.DataLength == 5 && !memcmp(request.text, "hello", 5), "connection info %u\n", request.header.DataLength);
+    memcpy(request.text, "welcome", 8);
+    request.header.DataLength = 8;
+    request.header.TotalLength = sizeof(PM) + 8;
+    status = pNtAcceptConnectPort(&comm, (void *)0x1234, &request.header, TRUE, NULL, NULL);
+    ok(!status, "NtAcceptConnectPort %lx\n", status);
+    status = pNtCompleteConnectPort(comm);
+    ok(!status, "NtCompleteConnectPort %lx\n", status);
+    memset(&request, 0, sizeof(request));
+    status = pNtReplyWaitReceivePort(port, &context, NULL, &request.header);
+    ok(!status, "NtReplyWaitReceivePort %lx\n", status);
+    ok(request.header.Type == 1 && context == (void *)0x1234, "request type %u context %p\n", request.header.Type, context);
+    for (i = 0; i < 3; i++) reply.text[i] = request.text[2 - i];
+    reply.header = request.header;
+    reply.header.DataLength = 3;
+    reply.header.TotalLength = sizeof(PM) + 3;
+    memset(&request, 0, sizeof(request));
+    status = pNtReplyWaitReceivePort(port, &context, &reply.header, &request.header);
+    ok(!status && request.header.Type == 3 && !memcmp(request.text, "dgm", 3), "datagram: status %lx type %u\n", status, request.header.Type);
+    CloseHandle(comm);
+    CloseHandle(port);
+    return 0;
+}
+
+static void test_lpc(void)
+{
+    HANDLE thread, client = NULL;
+    UNICODE_STRING name;
+    PMSG request, reply;
+    ULONG max_length = 0, info_length;
+    char info[64];
+    NTSTATUS status;
+
+    g_lpc_ready = CreateEventA(NULL, FALSE, FALSE, NULL);
+    thread = CreateThread(NULL, 0, lpc_server, NULL, 0, NULL);
+    ok(WaitForSingleObject(g_lpc_ready, 5000) == WAIT_OBJECT_0, "server did not start\n");
+    pRtlInitUnicodeString(&name, lpc_name);
+    memcpy(info, "hello", 5);
+    info_length = 5;
+    status = pNtConnectPort(&client, &name, NULL, NULL, NULL, &max_length, info, &info_length);
+    ok(!status, "NtConnectPort %lx\n", status);
+    ok(info_length == 5 && !memcmp(info, "welcome", 5), "answer %lu %.5s\n", info_length, info);
+    ok(max_length == 0x100, "max length %lx\n", max_length);
+    memset(&request, 0, sizeof(request));
+    request.header.DataLength = 3;
+    request.header.TotalLength = sizeof(PM) + 3;
+    memcpy(request.text, "abc", 3);
+    memset(&reply, 0, sizeof(reply));
+    status = pNtRequestWaitReplyPort(client, &request.header, &reply.header);
+    ok(!status, "NtRequestWaitReplyPort %lx\n", status);
+    ok(reply.header.DataLength == 3 && !memcmp(reply.text, "cba", 3), "reply %.3s\n", reply.text);
+    ok(reply.header.MessageId == request.header.MessageId || request.header.MessageId == 0, "message ids\n");
+    request.header.DataLength = 3;
+    memcpy(request.text, "dgm", 3);
+    status = pNtRequestPort(client, &request.header);
+    ok(!status, "NtRequestPort %lx\n", status);
+    ok(WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0, "server did not end\n");
+    CloseHandle(thread);
+    CloseHandle(client);
+    CloseHandle(g_lpc_ready);
+    status = pNtConnectPort(&client, &name, NULL, NULL, NULL, &max_length, NULL, NULL);
+    ok(status == STATUS_OBJECT_NAME_NOT_FOUND || status == 0xC0000041, "connect to a closed port %lx\n", status);
+}
+
 START_TEST(tcos_ntdll)
 {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
@@ -125,4 +224,14 @@ START_TEST(tcos_ntdll)
 #undef X
     test_work();
     test_group_cancel();
+    pNtCreatePort = (void *)GetProcAddress(ntdll, "NtCreatePort");
+    pNtConnectPort = (void *)GetProcAddress(ntdll, "NtConnectPort");
+    pNtListenPort = (void *)GetProcAddress(ntdll, "NtListenPort");
+    pNtAcceptConnectPort = (void *)GetProcAddress(ntdll, "NtAcceptConnectPort");
+    pNtCompleteConnectPort = (void *)GetProcAddress(ntdll, "NtCompleteConnectPort");
+    pNtRequestWaitReplyPort = (void *)GetProcAddress(ntdll, "NtRequestWaitReplyPort");
+    pNtReplyWaitReceivePort = (void *)GetProcAddress(ntdll, "NtReplyWaitReceivePort");
+    pNtRequestPort = (void *)GetProcAddress(ntdll, "NtRequestPort");
+    pRtlInitUnicodeString = (void *)GetProcAddress(ntdll, "RtlInitUnicodeString");
+    test_lpc();
 }

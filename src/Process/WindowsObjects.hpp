@@ -37,6 +37,14 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
 uint32_t take_object_handle_from(Process& source, IProcessRuntime::RemoteOp& op);
 uint32_t give_object_handle_in(Process& target, uint32_t kind, uint64_t token, uint32_t denied, bool inherit, uint64_t* handle);
 
+// Ports (WindowsPorts.cpp): make a named port object (a handle is written to handle_at; *id is its object), find one by the UNICODE_STRING at `unicode_name` (a reference is taken), give the
+// process a handle for an object it holds a reference of (the reference goes to the handle, or is given up on failure), the object of a port handle, and make an unnamed port.
+uint32_t port_create_object(Process& p, uint64_t handle_at, uint64_t attributes, uint32_t* id);
+uint32_t port_find_by_name(Process& p, uint64_t unicode_name, uint32_t* id);
+uint32_t port_give_handle(Process& p, uint32_t id, uint64_t handle_at);
+uint32_t port_object_of(Process& p, uint64_t handle, uint32_t* id);
+uint32_t port_make_anonymous(uint32_t* id);
+
 uint32_t nt_create_event(Process& p, const SyscallRequest& r);
 uint32_t nt_open_event(Process& p, const SyscallRequest& r);
 uint32_t nt_set_event(Process& p, const SyscallRequest& r);

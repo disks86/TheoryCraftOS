@@ -27,6 +27,7 @@
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
 #include "Process/WindowsMisc.hpp"
+#include "Process/WindowsPorts.hpp"
 #include "Process/WindowsSockets.hpp"
 #include "Process/WindowsModules.hpp"
 #include "Process/WindowsPipes.hpp"
@@ -375,6 +376,30 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtShutdownSystem: case WindowsSyscallNumber::NtInitiatePowerAction: case WindowsSyscallNumber::NtSetSystemPowerState:
       case WindowsSyscallNumber::NtCreatePagingFile: case WindowsSyscallNumber::NtSystemDebugControl: case WindowsSyscallNumber::NtSetLdtEntries:
         return windowsabi::nt_privilege_not_held(process, r);
+      case WindowsSyscallNumber::NtCreatePort: case WindowsSyscallNumber::NtCreateWaitablePort: return windowsabi::nt_create_port(process, r);
+      case WindowsSyscallNumber::NtConnectPort: return windowsabi::nt_connect_port(process, r, false);
+      case WindowsSyscallNumber::NtSecureConnectPort: return windowsabi::nt_connect_port(process, r, true);
+      case WindowsSyscallNumber::NtListenPort: return windowsabi::nt_listen_port(process, r);
+      case WindowsSyscallNumber::NtAcceptConnectPort: return windowsabi::nt_accept_connect_port(process, r);
+      case WindowsSyscallNumber::NtCompleteConnectPort: return windowsabi::nt_complete_connect_port(process, r);
+      case WindowsSyscallNumber::NtRequestPort: return windowsabi::nt_request_port(process, r);
+      case WindowsSyscallNumber::NtRequestWaitReplyPort: return windowsabi::nt_request_wait_reply_port(process, r);
+      case WindowsSyscallNumber::NtReplyPort: return windowsabi::nt_reply_port(process, r);
+      case WindowsSyscallNumber::NtReplyWaitReceivePort: return windowsabi::nt_reply_wait_receive_port(process, r, false);
+      case WindowsSyscallNumber::NtReplyWaitReceivePortEx: return windowsabi::nt_reply_wait_receive_port(process, r, true);
+      case WindowsSyscallNumber::NtReplyWaitReplyPort: return windowsabi::nt_reply_wait_reply_port(process, r);
+      case WindowsSyscallNumber::NtQueryInformationPort: return windowsabi::nt_query_information_port(process, r);
+      case WindowsSyscallNumber::NtRegisterThreadTerminatePort: return windowsabi::nt_alpc_validate_port(process, r);
+      case WindowsSyscallNumber::NtAlpcCreatePort: return windowsabi::nt_alpc_create_port(process, r);
+      case WindowsSyscallNumber::NtAlpcConnectPort: return windowsabi::nt_alpc_connect_port(process, r);
+      case WindowsSyscallNumber::NtAlpcAcceptConnectPort: return windowsabi::nt_alpc_accept_connect_port(process, r);
+      case WindowsSyscallNumber::NtAlpcSendWaitReceivePort: return windowsabi::nt_alpc_send_wait_receive_port(process, r);
+      case WindowsSyscallNumber::NtAlpcDisconnectPort: return windowsabi::nt_alpc_disconnect_port(process, r);
+      case WindowsSyscallNumber::NtAlpcQueryInformation: return windowsabi::nt_alpc_query_information(process, r);
+      case WindowsSyscallNumber::NtAlpcSetInformation: return windowsabi::nt_alpc_set_information(process, r);
+      case WindowsSyscallNumber::NtAlpcCancelMessage: case WindowsSyscallNumber::NtAlpcCreateSecurityContext: case WindowsSyscallNumber::NtAlpcDeleteSecurityContext:
+      case WindowsSyscallNumber::NtAlpcRevokeSecurityContext: return windowsabi::nt_alpc_validate_port(process, r);
+      case WindowsSyscallNumber::NtGetNextThread: return windowsabi::nt_get_next_thread(process, r);
       case WindowsSyscallNumber::NtQueryMultipleValueKey: return windowsabi::nt_query_multiple_value_key(process, r);
       case WindowsSyscallNumber::NtRenameKey: return windowsabi::nt_rename_key(process, r);
       case WindowsSyscallNumber::NtSetInformationKey: return windowsabi::nt_set_information_key(process, r);

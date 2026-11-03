@@ -42,6 +42,7 @@ uint32_t nt_queue_apc_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_queue_apc_thread_ex(Process& p, const SyscallRequest& r, bool with_flags);
 uint32_t nt_dequeue_apc(Process& p, const SyscallRequest& r);
 uint32_t nt_open_thread(Process& p, const SyscallRequest& r);
+uint32_t nt_get_next_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r);
 // Threads of another program (CreateRemoteThread): called on that program, with its lock held (see IProcessRuntime::remote_operation). The thread is started (or left suspended); the
 // caller gets a handle to it that can be waited for.

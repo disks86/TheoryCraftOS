@@ -47,7 +47,7 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, Directory, SymbolicLink };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, Directory, SymbolicLink, Port };
 
 class ObjectManager {
  public:

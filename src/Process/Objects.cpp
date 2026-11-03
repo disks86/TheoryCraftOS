@@ -2000,7 +2000,9 @@ void ObjectManager::release_locked(uint32_t id) {
       o->name_size = 0;
       return;
     }
+    const bool was_port = o->kind == ObjectKind::Port;
     free_object_locked(*o);
+    if (was_port) sync_.notify_all();      // (the other end of a port sees it go)
   }
 }
 

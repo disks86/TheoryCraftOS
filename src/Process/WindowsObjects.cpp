@@ -42,7 +42,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve || k == DescriptorKind::ObjectDirectory || k == DescriptorKind::SymbolicLink; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification || k == DescriptorKind::DebugObject || k == DescriptorKind::Token || k == DescriptorKind::KeyedEvent || k == DescriptorKind::IoCompletion || k == DescriptorKind::Reserve || k == DescriptorKind::ObjectDirectory || k == DescriptorKind::SymbolicLink || k == DescriptorKind::Port; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -59,6 +59,7 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Reserve: return DescriptorKind::Reserve;
     case ObjectKind::Directory: return DescriptorKind::ObjectDirectory;
     case ObjectKind::SymbolicLink: return DescriptorKind::SymbolicLink;
+    case ObjectKind::Port: return DescriptorKind::Port;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -233,6 +234,7 @@ bool kind_access(DescriptorKind kind, KindAccess* out) {
     case DescriptorKind::Token: *out = {0xF01FFu, {0x20018u, 0x200E0u, 0x20000u, 0xF01FFu}}; return true;
     case DescriptorKind::KeyedEvent: *out = {0x1F0003u, {0x20001u, 0x20002u, 0x120000u, 0x1F0003u}}; return true;
     case DescriptorKind::Reserve: *out = {0x1F0001u, {0x20001u, 0x20000u, 0x120000u, 0x1F0001u}}; return true;
+    case DescriptorKind::Port: *out = {0x1F0001u, {0x20001u, 0x20001u, 0x120000u, 0x1F0001u}}; return true;
     case DescriptorKind::IoCompletion: *out = {0x1F0003u, {0x120001u, 0x120002u, 0x120000u, 0x1F0003u}}; return true;
     case DescriptorKind::DebugObject: *out = {0x1F000Fu, {0x20001u, 0x20002u, 0x120000u, 0x1F000Fu}}; return true;
     case DescriptorKind::File: case DescriptorKind::Directory: case DescriptorKind::Pipe: *out = {0x1F01FFu, {0x120089u, 0x120116u, 0x1200A0u, 0x1F01FFu}}; return true;
@@ -538,6 +540,63 @@ uint32_t wait_for(Process& p, const Waitable* items, uint32_t count, bool all, u
 }
 
 }  // namespace
+
+// Ports (WindowsPorts.cpp). A port is an object of the manager like the others; these three make one by its OBJECT_ATTRIBUTES, find one by a UNICODE_STRING name, and give
+// the process a handle for an object it holds a reference of.
+uint32_t port_create_object(Process& p, uint64_t handle_at, uint64_t attributes, uint32_t* id) {
+  SyscallRequest forward;
+  forward.args[0] = handle_at;
+  forward.args[1] = 0x1F0001;
+  forward.args[2] = attributes;
+  if (const uint32_t status = create_object(p, forward, ObjectKind::Port, false, false, 0, 0, StringView(), true)) return status;
+  uint64_t handle = 0, slot = 0;
+  if (!p.read_user_u64(handle_at, &handle) || !slot_of(handle, &slot)) return kAccessViolation;
+  *id = uint32_t(p.files().token(slot));
+  return kSuccess;
+}
+uint32_t port_find_by_name(Process& p, uint64_t unicode_name, uint32_t* id) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  char name[ObjectManager::kNameBytes + 1];
+  uint32_t size = 0;
+  if (const uint32_t status = read_unicode_string(p, unicode_name, name, ObjectManager::kNameBytes, &size)) return status;
+  if (size == 0) return kNameInvalid;
+  objpath::ResolveRequest request;
+  request.case_insensitive = true;
+  request.name_given = true;
+  request.name = StringView(name, size);
+  ManagerLookup lookup(*objects);
+  objpath::Resolved res;
+  objpath::resolve(lookup, request, &res);
+  if (res.status != kSuccess) return res.status;
+  if (res.entry.kind == objpath::EntryKind::None) return objpath::kStatusNameNotFound;
+  if (res.entry.kind != objpath::EntryKind::Object || res.entry.object_kind != uint8_t(ObjectKind::Port)) return kTypeMismatch;
+  const ObjectManager::Created c = objects->open(ObjectKind::Port, StringView(res.flat, res.flat_size));
+  if (c.id == 0) return c.status;
+  *id = c.id;
+  return kSuccess;
+}
+uint32_t port_give_handle(Process& p, uint32_t id, uint64_t handle_at) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  return give_handle(p, *objects, ObjectKind::Port, id, handle_at, kSuccess, false);
+}
+uint32_t port_object_of(Process& p, uint64_t handle, uint32_t* id) {
+  uint64_t slot = 0;
+  if (!slot_of(handle, &slot) || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (p.files().kind(slot) != DescriptorKind::Port) return kTypeMismatch;
+  *id = uint32_t(p.files().token(slot));
+  return kSuccess;
+}
+// A port object without a name, for the communication ports a connection makes; the caller holds the reference the call gives.
+uint32_t port_make_anonymous(uint32_t* id) {
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  const ObjectManager::Created c = objects->create(ObjectKind::Port, StringView(), false, false, 0, 0, 0);
+  if (c.id == 0) return c.status;
+  *id = c.id;
+  return kSuccess;
+}
 
 // NtCreateEvent(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, EVENT_TYPE (0: notification = manual reset, 1: synchronization = auto reset), BOOLEAN InitialState)
 uint32_t nt_create_event(Process& p, const SyscallRequest& r) {
@@ -1245,6 +1304,7 @@ const char* object_type_name(ObjectKind kind) {
     case ObjectKind::Reserve: return "UserApcReserve";
     case ObjectKind::Directory: return "Directory";
     case ObjectKind::SymbolicLink: return "SymbolicLink";
+    case ObjectKind::Port: return "Port";
     default: return "Object";
   }
 }
@@ -1655,6 +1715,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Key: type = "Key"; break;
         case DescriptorKind::ObjectDirectory: type = "Directory"; break;
         case DescriptorKind::SymbolicLink: type = "SymbolicLink"; break;
+        case DescriptorKind::Port: type = "Port"; break;
         default: break;
       }
       uint32_t n = 0;
