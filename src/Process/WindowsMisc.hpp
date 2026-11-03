@@ -49,6 +49,14 @@ uint32_t nt_power_information(Process& p, const SyscallRequest& r);
 uint32_t nt_set_thread_execution_state(Process& p, const SyscallRequest& r);
 uint32_t nt_raise_hard_error(Process& p, const SyscallRequest& r);
 uint32_t nt_query_interval_profile(Process& p, const SyscallRequest& r);
+// Windows notification facility state (WNF): named pieces of state that programs publish and read. The names are made by NtCreateWnfStateName; each keeps its latest data
+// and a change stamp that grows with every update. Subscriptions are not delivered.
+uint32_t nt_create_wnf_state_name(Process& p, const SyscallRequest& r);      // (PWNF_STATE_NAME, Lifetime, DataScope, PersistData, TypeId, MaximumStateSize, SecurityDescriptor)
+uint32_t nt_update_wnf_state_data(Process& p, const SyscallRequest& r);      // (StateName, Buffer, Length, TypeId, ExplicitScope, MatchingChangeStamp, CheckStamp)
+uint32_t nt_query_wnf_state_data(Process& p, const SyscallRequest& r);       // (StateName, TypeId, ExplicitScope, PWNF_CHANGE_STAMP, Buffer, PULONG BufferSize)
+uint32_t nt_delete_wnf_state_data(Process& p, const SyscallRequest& r);      // (StateName, ExplicitScope)
+uint32_t nt_delete_wnf_state_name(Process& p, const SyscallRequest& r);      // (StateName)
+uint32_t nt_query_wnf_state_name_information(Process& p, const SyscallRequest& r);   // (StateName, NameInfoClass, ExplicitScope, Buffer, BufferSize)
 // Services that succeed without doing anything (the caches and write buffers they flush do not exist here) or that only validate their arguments.
 uint32_t nt_succeed(Process& p, const SyscallRequest& r);
 uint32_t nt_make_object_temporary(Process& p, const SyscallRequest& r);

@@ -26,7 +26,7 @@ namespace {
 
 constexpr uint32_t kSuccess = 0, kTimeout = 0x102, kAlerted = 0x101, kUserApc = 0xC0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u,
                    kInvalidParameter = 0xC000000Du, kNotImplemented = 0xC0000002u, kInvalidInfoClass = 0xC0000003u, kInfoLengthMismatch = 0xC0000004u,
-                   kObjectTypeMismatch = 0xC0000024u, kInsufficientResources = 0xC000009Au, kInvalidCid = 0xC000000Bu, kPrivilegeNotHeld = 0xC0000061u,
+                   kObjectTypeMismatch = 0xC0000024u, kInsufficientResources = 0xC000009Au, kInvalidCid = 0xC000000Bu, kPrivilegeNotHeld = 0xC0000061u, kObjectNameNotFound = 0xC0000034u,
                    kNotSupported = 0xC00000BBu, kBufferTooSmall = 0xC0000023u, kInvalidParameter1 = 0xC00000EFu, kInvalidParameter2 = 0xC00000F0u;
 constexpr uint64_t kUnixToNt = 11644473600ull;      // 1601-01-01 to 1970-01-01, in seconds
 
@@ -385,6 +385,156 @@ uint32_t nt_make_object_temporary(Process& p, const SyscallRequest& r) {
 uint32_t nt_make_object_permanent(Process& p, const SyscallRequest& r) {
   if (r.args[0] == 0 || r.args[0] % 4 != 0 || r.args[0] / 4 > Process::kMaxDescriptors || p.files().kind(r.args[0] / 4 - 1) == DescriptorKind::Closed) return kInvalidHandle;
   return kPrivilegeNotHeld;
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------- WNF
+
+namespace {
+
+constexpr uint32_t kWnfEntries = 64, kWnfData = 1024;
+struct WnfState {
+  bool used = false, has_data = false;
+  uint32_t name[2] = {};
+  uint32_t stamp = 0, size = 0, maximum = kWnfData;
+  uint8_t data[kWnfData];
+};
+WnfState g_wnf[kWnfEntries];
+uint32_t g_wnf_sequence = 1;
+
+struct WnfLock {
+  ISystemSync* sync;
+  WnfLock() : sync(system_objects() ? &system_objects()->sync() : nullptr) { if (sync) sync->lock(); }
+  ~WnfLock() { if (sync) sync->unlock(); }
+  WnfLock(const WnfLock&) = delete;
+  WnfLock& operator=(const WnfLock&) = delete;
+};
+
+bool read_name(Process& p, uint64_t at, uint32_t* name) {
+  uint8_t raw[8];
+  if (at == 0 || !p.read_user(at, ByteView(raw, 8))) return false;
+  name[0] = uint32_t(raw[0]) | uint32_t(raw[1]) << 8 | uint32_t(raw[2]) << 16 | uint32_t(raw[3]) << 24;
+  name[1] = uint32_t(raw[4]) | uint32_t(raw[5]) << 8 | uint32_t(raw[6]) << 16 | uint32_t(raw[7]) << 24;
+  return true;
+}
+WnfState* wnf_find(const uint32_t* name, bool create) {
+  for (WnfState& s : g_wnf) if (s.used && s.name[0] == name[0] && s.name[1] == name[1]) return &s;
+  if (!create) return nullptr;
+  for (WnfState& s : g_wnf) {
+    if (s.used) continue;
+    s = WnfState();
+    s.used = true;
+    s.name[0] = name[0];
+    s.name[1] = name[1];
+    return &s;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+uint32_t nt_create_wnf_state_name(Process& p, const SyscallRequest& r) {
+  uint64_t persist = 0, type_id = 0, maximum = 0;
+  if (!argument(p, r, 3, &persist) || !argument(p, r, 4, &type_id) || !argument(p, r, 5, &maximum)) return kAccessViolation;
+  if (r.args[0] == 0) return kAccessViolation;
+  const uint32_t lifetime = uint32_t(r.args[1]), scope = uint32_t(r.args[2]);
+  if (lifetime > 3) return kInvalidParameter2;
+  if (scope > 4) return 0xC00000EFu + 1;      // STATUS_INVALID_PARAMETER_3
+  if (uint32_t(maximum) > 4096) return kInvalidParameter;
+  WnfLock lock;
+  const uint32_t sequence = g_wnf_sequence++;
+  // a name is a version, its lifetime and scope, whether it is kept, and a number that is not used twice
+  uint32_t name[2] = {0x41C64E6Du ^ (sequence << 4) ^ (uint32_t(persist & 1) << 3) ^ lifetime, 0xA3BC0074u ^ (scope << 4) ^ (1u << 28) ^ sequence};
+  WnfState* s = wnf_find(name, true);
+  if (!s) return kInsufficientResources;
+  s->maximum = uint32_t(maximum) && uint32_t(maximum) < kWnfData ? uint32_t(maximum) : kWnfData;
+  uint8_t out[8];
+  for (int i = 0; i < 4; ++i) { out[i] = uint8_t(name[0] >> (8 * i)); out[4 + i] = uint8_t(name[1] >> (8 * i)); }
+  if (!p.write_user(r.args[0], ConstByteView(out, 8))) { s->used = false; return kAccessViolation; }
+  return kSuccess;
+}
+
+uint32_t nt_update_wnf_state_data(Process& p, const SyscallRequest& r) {
+  uint64_t type_id = 0, scope = 0, matching = 0, check = 0;
+  if (!argument(p, r, 3, &type_id) || !argument(p, r, 4, &scope) || !argument(p, r, 5, &matching) || !argument(p, r, 6, &check)) return kAccessViolation;
+  uint32_t name[2];
+  if (!read_name(p, r.args[0], name)) return kAccessViolation;
+  const uint32_t length = uint32_t(r.args[2]);
+  if (length > 4096 || (length != 0 && r.args[1] == 0)) return kInvalidParameter;
+  uint8_t buffer[kWnfData];
+  if (length > kWnfData) return 0xC000004Fu;
+  if (length != 0 && !p.read_user(r.args[1], ByteView(buffer, length))) return kAccessViolation;
+  WnfLock lock;
+  WnfState* s = wnf_find(name, true);      // (a name that is not known is made: the well-known ones are never created by a program)
+  if (!s) return kInsufficientResources;
+  if (length > s->maximum) return 0xC000004Fu;      // STATUS_INVALID_BUFFER_SIZE (the data is longer than the state may be)
+  if ((check & 0xFFFFFFFFu) != 0 && uint32_t(matching) != s->stamp) return 0xC0000001u;
+  for (uint32_t i = 0; i < length; ++i) s->data[i] = buffer[i];
+  s->size = length;
+  s->has_data = true;
+  ++s->stamp;
+  system_objects()->sync().notify_all();
+  return kSuccess;
+}
+
+uint32_t nt_query_wnf_state_data(Process& p, const SyscallRequest& r) {
+  uint64_t stamp_at = 0, buffer_at = 0, size_at = 0;
+  if (!argument(p, r, 3, &stamp_at) || !argument(p, r, 4, &buffer_at) || !argument(p, r, 5, &size_at)) return kAccessViolation;
+  uint32_t name[2];
+  if (!read_name(p, r.args[0], name) || size_at == 0) return kAccessViolation;
+  uint8_t raw[4];
+  if (!p.read_user(size_at, ByteView(raw, 4))) return kAccessViolation;
+  const uint32_t capacity = uint32_t(raw[0]) | uint32_t(raw[1]) << 8 | uint32_t(raw[2]) << 16 | uint32_t(raw[3]) << 24;
+  uint8_t copy[kWnfData];
+  uint32_t size = 0, stamp = 0;
+  {
+    WnfLock lock;
+    const WnfState* s = wnf_find(name, false);
+    if (s) { size = s->size; stamp = s->stamp; for (uint32_t i = 0; i < size; ++i) copy[i] = s->data[i]; }
+  }
+  if (stamp_at != 0 && !p.write_user_u32(stamp_at, stamp)) return kAccessViolation;
+  if (!p.write_user_u32(size_at, size)) return kAccessViolation;
+  if (size > capacity) return kBufferTooSmall;
+  if (size != 0 && (buffer_at == 0 || !p.write_user(buffer_at, ConstByteView(copy, size)))) return kAccessViolation;
+  return kSuccess;
+}
+
+uint32_t nt_delete_wnf_state_data(Process& p, const SyscallRequest& r) {
+  uint32_t name[2];
+  if (!read_name(p, r.args[0], name)) return kAccessViolation;
+  WnfLock lock;
+  WnfState* s = wnf_find(name, false);
+  if (!s) return kObjectNameNotFound;
+  s->size = 0;
+  s->has_data = false;
+  ++s->stamp;
+  return kSuccess;
+}
+
+uint32_t nt_delete_wnf_state_name(Process& p, const SyscallRequest& r) {
+  uint32_t name[2];
+  if (!read_name(p, r.args[0], name)) return kAccessViolation;
+  WnfLock lock;
+  WnfState* s = wnf_find(name, false);
+  if (!s) return kObjectNameNotFound;
+  s->used = false;
+  return kSuccess;
+}
+
+// WnfInfoStateNameExist (0), WnfInfoSubscribersPresent (1), WnfInfoIsQuiescent (2): each a BOOLEAN-sized answer in a ULONG.
+uint32_t nt_query_wnf_state_name_information(Process& p, const SyscallRequest& r) {
+  uint64_t size = 0;
+  if (!argument(p, r, 4, &size)) return kAccessViolation;
+  uint32_t name[2];
+  if (!read_name(p, r.args[0], name)) return kAccessViolation;
+  if (uint32_t(r.args[1]) > 2) return kInvalidInfoClass;
+  if (uint32_t(size) != 4) return kInfoLengthMismatch;
+  uint32_t answer = 0;
+  {
+    WnfLock lock;
+    answer = uint32_t(r.args[1]) == 0 ? (wnf_find(name, false) != nullptr ? 1 : 0) : (uint32_t(r.args[1]) == 2 ? 1 : 0);
+  }
+  return p.write_user_u32(r.args[3], answer) ? kSuccess : kAccessViolation;
 }
 
 }  // namespace process::windowsabi

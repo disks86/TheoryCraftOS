@@ -399,6 +399,12 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtAlpcSetInformation: return windowsabi::nt_alpc_set_information(process, r);
       case WindowsSyscallNumber::NtAlpcCancelMessage: case WindowsSyscallNumber::NtAlpcCreateSecurityContext: case WindowsSyscallNumber::NtAlpcDeleteSecurityContext:
       case WindowsSyscallNumber::NtAlpcRevokeSecurityContext: return windowsabi::nt_alpc_validate_port(process, r);
+      case WindowsSyscallNumber::NtCreateWnfStateName: return windowsabi::nt_create_wnf_state_name(process, r);
+      case WindowsSyscallNumber::NtUpdateWnfStateData: return windowsabi::nt_update_wnf_state_data(process, r);
+      case WindowsSyscallNumber::NtQueryWnfStateData: return windowsabi::nt_query_wnf_state_data(process, r);
+      case WindowsSyscallNumber::NtDeleteWnfStateData: return windowsabi::nt_delete_wnf_state_data(process, r);
+      case WindowsSyscallNumber::NtDeleteWnfStateName: return windowsabi::nt_delete_wnf_state_name(process, r);
+      case WindowsSyscallNumber::NtQueryWnfStateNameInformation: return windowsabi::nt_query_wnf_state_name_information(process, r);
       case WindowsSyscallNumber::NtGetNextThread: return windowsabi::nt_get_next_thread(process, r);
       case WindowsSyscallNumber::NtQueryMultipleValueKey: return windowsabi::nt_query_multiple_value_key(process, r);
       case WindowsSyscallNumber::NtRenameKey: return windowsabi::nt_rename_key(process, r);

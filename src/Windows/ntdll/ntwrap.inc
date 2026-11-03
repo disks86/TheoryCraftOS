@@ -201,3 +201,23 @@ EXPORT PVOID NTAPI AlpcGetMessageAttribute(PVOID message, ULONG attribute) {
   return (BYTE *)message + AlpcGetHeaderSize(allocated & ~(attribute | (attribute - 1)));
 }
 EXPORT ULONG NTAPI AlpcMaxAllowedMessageLength(void) { return 0x7FFFFFFFu; }
+
+/* ---- WNF state: the Rtl calls over the services (a state name is passed by value: it is 64 bits) ---- */
+
+NTSTATUS NTAPI NtUpdateWnfStateData(const ULONGLONG *name, const void *buffer, ULONG length, const void *type_id, const void *scope, ULONG matching, ULONG check);
+NTSTATUS NTAPI NtQueryWnfStateData(const ULONGLONG *name, const void *type_id, const void *scope, ULONG *stamp, void *buffer, ULONG *size);
+typedef NTSTATUS (NTAPI *WNF_USER_CALLBACK_)(ULONGLONG name, ULONG stamp, PVOID type_id, PVOID context, const void *buffer, ULONG size);
+EXPORT NTSTATUS NTAPI RtlPublishWnfStateData(ULONGLONG name, const void *type_id, const void *buffer, ULONG length, const void *scope) { return NtUpdateWnfStateData(&name, buffer, length, type_id, scope, 0, 0); }
+EXPORT NTSTATUS NTAPI RtlTestAndPublishWnfStateData(ULONGLONG name, const void *type_id, const void *buffer, ULONG length, const void *scope, ULONG matching, ULONG check) { return NtUpdateWnfStateData(&name, buffer, length, type_id, scope, matching, check); }
+EXPORT NTSTATUS NTAPI RtlQueryWnfStateData(ULONG *stamp, ULONGLONG name, WNF_USER_CALLBACK_ callback, PVOID context, PVOID type_id) {
+  BYTE data[1024];
+  ULONG size = sizeof(data), change = 0;
+  const NTSTATUS status = NtQueryWnfStateData(&name, type_id, NULL, &change, data, &size);
+  if (!NT_SUCCESS(status)) return status;
+  if (stamp) *stamp = change;
+  return callback ? callback(name, change, type_id, context, data, size) : STATUS_SUCCESS;
+}
+EXPORT NTSTATUS NTAPI RtlQueryWnfStateDataWithExplicitScope(ULONG *stamp, ULONGLONG name, WNF_USER_CALLBACK_ callback, PVOID context, PVOID type_id, const void *scope) { (void)scope; return RtlQueryWnfStateData(stamp, name, callback, context, type_id); }
+EXPORT LONG NTAPI RtlWnfCompareChangeStamp(ULONG a, ULONG b) { return a < b ? -1 : (a > b ? 1 : 0); }
+EXPORT BOOLEAN NTAPI RtlEqualWnfChangeStamps(ULONG a, ULONG b) { return a == b; }
+EXPORT void NTAPI RtlWnfDllUnloadCallback(PVOID module) { (void)module; }
