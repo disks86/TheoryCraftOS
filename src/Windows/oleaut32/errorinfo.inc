@@ -157,7 +157,15 @@ static void ei_set_current(IErrorInfo *fresh) {
   if (old) IErrorInfo_Release(old);
 }
 
+/* ole32.dll holds the thread's error object when it has the functions (its GetErrorInfo and this one then see the same object); the local slot is the fallback. */
+static FARPROC ei_ole32_proc(const char *name) {
+  HMODULE module = LoadLibraryA("ole32.dll");
+  return module ? GetProcAddress(module, name) : NULL;
+}
+
 EXPORT HRESULT WINAPI SetErrorInfo(ULONG reserved, IErrorInfo *info) {
+  HRESULT (WINAPI *forward)(ULONG, IErrorInfo *) = (void *)ei_ole32_proc("SetErrorInfo");
+  if (forward && (void *)forward != (void *)SetErrorInfo) return forward(reserved, info);
   if (reserved) return E_INVALIDARG;
   if (!ei_tls_ready()) return E_OUTOFMEMORY;
   if (info) IErrorInfo_AddRef(info);
@@ -166,6 +174,8 @@ EXPORT HRESULT WINAPI SetErrorInfo(ULONG reserved, IErrorInfo *info) {
 }
 
 EXPORT HRESULT WINAPI GetErrorInfo(ULONG reserved, IErrorInfo **info) {
+  HRESULT (WINAPI *forward)(ULONG, IErrorInfo **) = (void *)ei_ole32_proc("GetErrorInfo");
+  if (forward && (void *)forward != (void *)GetErrorInfo) return forward(reserved, info);
   if (reserved || !info) return E_INVALIDARG;
   *info = NULL;
   if (!ei_tls_ready()) return S_FALSE;
