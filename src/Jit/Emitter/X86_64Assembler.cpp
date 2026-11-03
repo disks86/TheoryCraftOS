@@ -99,7 +99,12 @@ void X86_64Assembler::pop(X86Reg r) {
 
 void X86_64Assembler::memory(uint8_t opcode, bool wide, X86Reg reg, X86Reg base, int32_t disp) {
   rex(wide, reg, base);
-  code_.emit8(opcode);
+  memory_operand(opcode, reg, base, disp);
+}
+
+// The ModRM byte (and SIB, displacement) of [base+disp] after the opcode `opcode` has been emitted by the caller or is emitted here.
+void X86_64Assembler::memory_operand(uint8_t opcode, X86Reg reg, X86Reg base, int32_t disp, bool opcode_done) {
+  if (!opcode_done) code_.emit8(opcode);
   // mod: 00 no displacement (not allowed with rbp/r13 as base), 01 disp8, 10 disp32. rsp/r12 as base need a SIB byte.
   const bool no_disp = disp == 0 && low(base) != 5;
   const bool small = disp >= -128 && disp <= 127;
@@ -110,6 +115,34 @@ void X86_64Assembler::memory(uint8_t opcode, bool wide, X86Reg reg, X86Reg base,
     if (small) code_.emit8(static_cast<uint8_t>(disp));
     else code_.emit32(static_cast<uint32_t>(disp));
   }
+}
+
+void X86_64Assembler::memory2(uint8_t first, uint8_t second, bool wide, X86Reg reg, X86Reg base, int32_t disp) {
+  rex(wide, reg, base);
+  code_.emit8(first);
+  memory_operand(second, reg, base, disp);
+}
+
+void X86_64Assembler::mov_store8(X86Reg base, int32_t disp, X86Reg src) {
+  rex(false, src, base, true);   // (a REX prefix makes the register operand sil / dil / spl / bpl, not dh / bh ...)
+  code_.emit8(0x88);
+  memory_operand(0x88, src, base, disp, true);
+}
+
+void X86_64Assembler::mov_store16(X86Reg base, int32_t disp, X86Reg src) {
+  code_.emit8(0x66);
+  rex(false, src, base);
+  code_.emit8(0x89);
+  memory_operand(0x89, src, base, disp, true);
+}
+
+void X86_64Assembler::sse(uint8_t prefix, uint8_t opcode, bool wide, uint8_t reg, uint8_t rm) {
+  code_.emit8(prefix);
+  const uint8_t value = static_cast<uint8_t>(0x40 | (wide ? 8 : 0) | ((reg & 8) ? 4 : 0) | ((rm & 8) ? 1 : 0));
+  if (value != 0x40) code_.emit8(value);
+  code_.emit8(0x0F);
+  code_.emit8(opcode);
+  code_.emit8(static_cast<uint8_t>(0xC0 | (reg & 7) << 3 | (rm & 7)));
 }
 
 void X86_64Assembler::branch(uint8_t first, uint8_t second, bool two_bytes, Label target) {

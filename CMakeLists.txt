@@ -337,6 +337,7 @@ add_executable(BOOTX64
   src/Wasm/WasmDecode.cpp
   src/Wasm/WasmRun.cpp
   src/Wasm/WasmSimd.cpp
+  src/Wasm/WasmJit.cpp
   src/Browser/WebPrelude.cpp
   src/Browser/WebUrl.cpp
   src/Browser/CookieJar.cpp
@@ -360,6 +361,7 @@ add_executable(BOOTX64
   src/Script/Parser.cpp
   src/Script/Compiler.cpp
   src/Script/Vm.cpp
+  src/Script/VmJit.cpp
   src/Script/Builtins.cpp
   src/Script/RegExp.cpp
   src/Script/TypedArray.cpp

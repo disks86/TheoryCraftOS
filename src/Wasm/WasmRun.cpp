@@ -20,6 +20,7 @@
 // locals are the bottom of its part of the stack (the arguments of the call are already there), the operands are above them. Calls between WebAssembly functions
 // do not recurse in C++ (frames are kept in a table), only calls out to the host and back in do.
 #include "Wasm/WasmInternal.hpp"
+#include "Wasm/WasmJit.hpp"
 #include "Wasm/WasmNumeric.hpp"
 
 namespace wasm {
@@ -68,7 +69,11 @@ int64_t Table::grow(uint32_t delta, uint64_t init) {
 class Machine {
  public:
   static constexpr uint32_t kStackSlots = 262144, kMaxFrames = 30000, kMaxHostDepth = 120;
-  explicit Machine(Store& store) : store_(store) {}
+  explicit Machine(Store& store) : store_(store), jit_(store.allocator()) {
+    jit_.set_enabled(store.jit_enabled_);
+    jit_.set_threshold(store.jit_threshold_);
+    jit_.set_call_helper(&Machine::jit_call, this);
+  }
   ~Machine() {
     store_.allocator().deallocate(stack_);
     store_.allocator().deallocate(frames_);
@@ -81,6 +86,7 @@ class Machine {
     Instance* inst;
     const Instr* pc;   // where the function resumes after a call it made
     Slot* fp;
+    FuncInst* func;    // what runs in the frame (the JIT keeps its code per function)
   };
   bool prepare() {
     if (stack_) return true;
@@ -97,6 +103,18 @@ class Machine {
     return true;
   }
   Status execute(uint32_t entry_depth, const char** trap);
+  // Compiled code calling a function (see JitCallSite): the callee's frame starts at `base`, where the arguments already are.
+  static constexpr uint32_t kMaxJitNesting = 20;   // native recursion: a compiled caller, this helper and a nested execute() per level
+  uint32_t call_in_place(FuncInst& f, Slot* base);
+  static uint64_t jit_call(void* state, uint64_t site, uint64_t index);
+  struct {
+    Status status = Status::Ok;
+    const char* trap = nullptr;
+  } jit_fault_;
+  uint32_t jit_nesting_ = 0;
+ public:
+  uint64_t jit_calls_ = 0;   // calls compiled code made through call_in_place
+ private:
 
   Store& store_;
   Slot* stack_ = nullptr;
@@ -104,6 +122,9 @@ class Machine {
   Slot* sp_ = nullptr;    // the top of the stack of the running code, as far as a nested call needs to know
   uint32_t depth_ = 0;
   uint32_t host_depth_ = 0;
+  WasmJit jit_;
+ public:
+  WasmJit& jit() { return jit_; }
 };
 
 Store::Store(allocators::IAllocator& allocator)
@@ -531,6 +552,19 @@ bool Store::instantiate(const SharedPointer<Module>& module, ArrayView<const Ext
   return true;
 }
 
+void Store::set_jit(bool enabled, uint32_t hot_threshold) {
+  jit_enabled_ = enabled;
+  jit_threshold_ = hot_threshold;
+  if (machine_) {
+    machine_->jit().set_enabled(enabled);
+    machine_->jit().set_threshold(hot_threshold);
+  }
+}
+
+uint64_t Store::jit_regions() const { return machine_ ? machine_->jit().compiled_regions() : 0; }
+uint64_t Store::jit_calls() const { return machine_ ? machine_->jit_calls_ : 0; }
+uint64_t Store::jit_entries() const { return machine_ ? machine_->jit().entries() : 0; }
+
 Status Store::invoke(FuncInst& function, const Slot* args, Slot* results, const char** trap) {
   if (!machine_) {
     machine_ = UniquePointer<Machine>::make(allocator_, *this);
@@ -580,6 +614,7 @@ Status Machine::invoke(FuncInst& f, const Slot* args, Slot* results, const char*
   for (uint32_t i = c->nparams; i < c->nlocals; ++i) base[i] = Slot();
   Frame& fr = frames_[depth_++];
   fr.code = c;
+  fr.func = &f;
   fr.inst = f.instance;
   fr.pc = nullptr;
   fr.fp = base;
@@ -593,6 +628,64 @@ Status Machine::invoke(FuncInst& f, const Slot* args, Slot* results, const char*
   depth_ = entry;
   sp_ = base;
   return st;
+}
+
+uint32_t Machine::call_in_place(FuncInst& f, Slot* base) {
+  const FuncCode* c = f.code;
+  if (!c) {   // a function of the host: what the interpreter does for a call to one, with the arguments where they are
+    const uint32_t np = f.sig->nparams, nr = f.sig->nresults;
+    if (base < stack_ || base + np + 1 > stack_ + kStackSlots) return 1;
+    SmallArray<Slot, 8> tmp(store_.allocator(), nr);
+    if (!tmp.ok() || !store_.host()) return 1;
+    sp_ = base + np;   // (a host function that calls back into the store must not overwrite the arguments)
+    const bool ok = store_.host()->call(store_, f, base, tmp.data());
+    sp_ = base;
+    if (!ok) {
+      jit_fault_.status = store_.has_pending_exception() ? Status::Exception : Status::HostError;
+      jit_fault_.trap = nullptr;
+      return 2;
+    }
+    for (uint32_t i = 0; i < nr; ++i) base[i] = tmp[i];
+    ++jit_calls_;
+    return 0;
+  }
+  if (jit_nesting_ >= kMaxJitNesting || host_depth_ >= kMaxHostDepth || depth_ >= kMaxFrames) return 1;
+  if (base < stack_ || base + c->nlocals + c->max_stack > stack_ + kStackSlots) return 1;
+  const uint32_t entry = depth_;
+  for (uint32_t i = c->nparams; i < c->nlocals; ++i) base[i] = Slot();
+  Frame& fr = frames_[depth_++];
+  fr.code = c;
+  fr.func = &f;
+  fr.inst = f.instance;
+  fr.pc = nullptr;
+  fr.fp = base;
+  sp_ = base + c->nlocals;
+  ++host_depth_;
+  ++jit_nesting_;
+  ++jit_calls_;
+  const char* trap = nullptr;
+  const Status st = execute(entry, &trap);
+  --jit_nesting_;
+  --host_depth_;
+  depth_ = entry;
+  sp_ = base;
+  if (st == Status::Ok) return 0;
+  jit_fault_.status = st;
+  jit_fault_.trap = trap;
+  return 2;
+}
+
+uint64_t Machine::jit_call(void* state, uint64_t site_address, uint64_t index) {
+  // The site is what the translator made for this call instruction (see WasmJit.cpp); it lives as long as the compiled code that holds its address.
+  JitCallSite& site = *reinterpret_cast<JitCallSite*>(static_cast<uintptr_t>(site_address));
+  Machine& m = *static_cast<Machine*>(site.machine);
+  FuncInst* callee = site.callee;
+  if (!callee) {   // call_indirect: whatever is wrong with the entry, the interpreter finds it and traps
+    if (index >= site.table->items.count()) return 1;
+    callee = func_from_ref(site.table->items[index]);
+    if (!callee || callee->sig != site.sig) return 1;
+  }
+  return m.call_in_place(*callee, static_cast<Slot*>(state) + site.args_slot);
 }
 
 #define TRAP(msg)     \
@@ -609,9 +702,14 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
   const FuncCode* code = frame->code;
   Instance* inst = frame->inst;
   Slot* fp = frame->fp;
+  FuncInst* func = frame->func;
   Slot* sp = sp_;
   const Instr* base_pc = code->code.view().data();
   const Instr* pc = base_pc;
+  // (the instruction being run is reached through a pointer declared here and not a reference declared in the loop, so that the handling of a failed call from
+  // compiled code, which sits before the fetch, can jump to the exception code)
+  const Instr* in_ptr = pc;
+#define in (*in_ptr)
   Memory* mem0 = inst->memories.count() ? inst->memories[0] : nullptr;
   Slot* const stack_end = stack_ + kStackSlots;
   uint32_t fuel = 4096;
@@ -619,9 +717,42 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
   ExnObj* ex = nullptr;   // the exception being thrown
   bool tail = false;
   Status result = Status::Trap;
+  // The JIT: at a few points (the entry of a function, after a call returned, a backward branch, after compiled code left for an instruction it does not do) the
+  // interpreter offers to hand the frame to compiled code. `probe` counts the instructions until the next offer: 1 is at once, 2 after the next instruction.
+  uint32_t probe = jit_.enabled() ? 1 : 0;
+  const uint32_t probe_enabled = probe;
 
   for (;;) {
-    const Instr& in = *pc++;
+    if (probe && --probe == 0) {
+      uint64_t jx = 0;
+      const uint32_t height = static_cast<uint32_t>(sp - fp) - code->nlocals;
+      if (jit_.enter(*func, static_cast<uint32_t>(pc - base_pc), height, fp, &jx)) {
+        pc = base_pc + kJitExitPc(jx);
+        sp = fp + code->nlocals + kJitExitHeight(jx);
+        if (jx & kJitExitReturn) goto do_return;   // a tail call compiled code made came back: its results are the function's
+        if (jx & kJitExitFault) {   // a call compiled code made failed: carry on as if the interpreter had made it
+          if (jit_fault_.status == Status::Trap) TRAP(jit_fault_.trap);
+          if (jit_fault_.status == Status::Exception) {
+            ex = store_.take_pending_exception();
+            goto throw_exception;
+          }
+          sp_ = sp;
+          result = jit_fault_.status;
+          goto unwind;
+        }
+        probe = 2;
+        if (jx & kJitExitTick) {   // a loop ran for a long time: the host's tick, then straight back in
+          probe = 1;
+          if (store_.host() && !store_.host()->tick(4096)) {
+            sp_ = sp;
+            result = Status::HostError;
+            goto unwind;
+          }
+        }
+        continue;
+      }
+    }
+    in_ptr = pc++;
     switch (in.op) {
       case 0x00: TRAP(kTrapUnreachable);
       case 0x01: break;
@@ -645,6 +776,7 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
           for (uint32_t i = 0; i < arity; ++i) dest[i] = sp[static_cast<int64_t>(i) - arity];
           sp = dest + arity;
         }
+        if (in.a < static_cast<uint32_t>(pc - base_pc)) probe = probe_enabled;
         if (in.a < static_cast<uint32_t>(pc - base_pc) && --fuel == 0) {
           fuel = 4096;
           if (store_.host() && !store_.host()->tick(4096)) {
@@ -666,6 +798,7 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
           for (uint32_t i = 0; i < t.arity; ++i) dest[i] = sp[static_cast<int64_t>(i) - t.arity];
           sp = dest + t.arity;
         }
+        if (t.pc < static_cast<uint32_t>(pc - base_pc)) probe = probe_enabled;
         if (t.pc < static_cast<uint32_t>(pc - base_pc) && --fuel == 0) {
           fuel = 4096;
           if (store_.host() && !store_.host()->tick(4096)) {
@@ -688,11 +821,13 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
         }
         frame = &frames_[depth_ - 1];
         code = frame->code;
+        func = frame->func;
         inst = frame->inst;
         fp = frame->fp;
         base_pc = code->code.view().data();
         pc = frame->pc;
         mem0 = inst->memories.count() ? inst->memories[0] : nullptr;
+        probe = probe_enabled;
         break;
       }
       case 0x10:
@@ -1219,14 +1354,17 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
       frame = &frames_[depth_++];
     }
     frame->code = c;
+    frame->func = callee;
     frame->inst = callee->instance;
     frame->fp = nfp;
     code = c;
+    func = callee;
     inst = callee->instance;
     fp = nfp;
     base_pc = code->code.view().data();
     pc = base_pc;
     mem0 = inst->memories.count() ? inst->memories[0] : nullptr;
+    probe = probe_enabled;
     continue;
   }
 
@@ -1284,6 +1422,7 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
       }
       frame = &frames_[depth_ - 1];
       code = frame->code;
+      func = frame->func;
       inst = frame->inst;
       fp = frame->fp;
       base_pc = code->code.view().data();
@@ -1300,5 +1439,6 @@ trapped:
 unwind:
   return result;
 }
+#undef in
 
 }  // namespace wasm
