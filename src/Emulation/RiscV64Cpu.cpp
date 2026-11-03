@@ -150,6 +150,8 @@ uint32_t expand_compressed(uint32_t c) {
 
 }  // namespace
 
+uint32_t riscv_expand_compressed(uint32_t compressed) { return expand_compressed(compressed); }
+
 // --- state ---------------------------------------------------------------------------------------------------------------------------------
 
 void RiscV64Cpu::reset(const process::ProgramStart& start) {
@@ -211,11 +213,28 @@ UniquePointer<IGuestCpu> RiscV64Cpu::clone_for_thread(allocators::IAllocator& al
   return UniquePointer<IGuestCpu>(static_cast<UniquePointer<RiscV64Cpu>&&>(copy));
 }
 
+void RiscV64Cpu::jit_fault(uint64_t pc, uint64_t address) {
+  instruction_start_ = pc;
+  fail(14, address);
+}
+
 StopReason RiscV64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
-  for (uint64_t i = 0; i < max_instructions; ++i) {
+  uint64_t done = 0;
+  while (done < max_instructions) {
+    if (jit_usable() && max_instructions - done >= IRiscVJit::kLongestBlock) {
+      uint64_t retired = 0;
+      const IRiscVJit::Result result = jit_->run(*this, memory, max_instructions - done, &retired);
+      if (result != IRiscVJit::Result::NotRun) {
+        retired_ += retired;
+        done += retired;
+        if (result == IRiscVJit::Result::Faulted) return StopReason::Fault;
+        if (retired != 0) continue;
+      }
+    }
     const Step r = step(memory);
     if (r == Step::Fault) return StopReason::Fault;
     ++retired_;
+    ++done;
     if (r == Step::Syscall) return StopReason::Syscall;
   }
   // Threads take turns: a turn never ends inside an LR..SC sequence (another thread could store to the word and the SC would still succeed, where real hardware loses

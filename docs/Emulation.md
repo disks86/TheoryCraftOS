@@ -397,10 +397,53 @@ An emulated program can have threads, for both ABIs. `EmulatedProcess` (`src/Emu
   x86-64 and AArch64, run on real host threads at several slice lengths, clean under ASan/UBSan and ThreadSanitizer. `tests/emulated_windows.sh` runs
   `tests/windows/emuthreads.c` (threads, critical sections, events, TLS, `TerminateThread`) on the emulator with the OS's own ntdll/kernel32.
 
+## Translated code (JIT)
+
+Hot blocks of an x86-64, RISC-V or AArch64 guest run as machine code for the CPU the kernel runs on, through the shared pipeline of [`src/Jit`](Jit.md):
+`guest code -> front end -> IR -> back end -> code memory -> code cache`. The interpreter stays: it is the reference, and it runs everything the front ends do not
+translate, one instruction at a time (a block ends in front of such an instruction, the interpreter steps it, and the next block starts after it).
+
+| File (`src/EmulationJit/`) | What it is |
+| --- | --- |
+| `GuestJit.hpp/.cpp` | `enable_jit(cpu, allocator, code_memory, options)`: gives a cpu an engine for its architecture (`GuestJitOptions`: hot threshold, block length, exact flags). `ProgramRunner` calls it when `jit::kernel_code_memory()` exists. |
+| `JitCore.hpp` | the part that is the same for every guest: `CodeCache`, `HotnessTracker`, the back end for the host CPU, `JitDispatcher`, and the flush when `GuestMemory::layout_generation()` (the `AddressSpace` generation) moved. |
+| `JitMemoryHelpers.hpp` | the helpers translated code calls for guest memory (`guest_load/store<State, Size>`): the only way generated code touches guest memory, so every access is checked by `GuestMemory` like the interpreter's. A failed access sets `State::jit.fault`; the block tests it after each access. |
+| `X86_64Jit*`, `RiscV64Jit*`, `AArch64Jit*` | the front ends (decoder + IR builder) and engines. x86-64 has its decoder in `X86_64JitDecode`. |
+
+How a cpu uses it: `X86_64Cpu::run()` (and the other two) asks `jit_->run()` before each interpreter step when at least 32 instructions of budget are left (a block is at
+most 32 instructions, so the budget is never overshot and tiny slices still stop at any instruction). The block gets the cpu's register `State` as its state block
+(`GuestJitLink jit` sits right after the registers: fault flag and details, retired count, the `GuestMemory*`, pending-flag operands), keeps guest registers in virtual
+registers, loads them on first use and writes the changed ones back at every exit. A block ends at a branch, a call/return, an instruction it does not translate, an
+unreadable or guest-writable page, or after 32 instructions.
+
+Rules that make it equivalent to the interpreter:
+- **Faults are precise.** Every memory access is followed by a test of the fault flag that jumps to a per-instruction stub; the stub writes back the registers and flags as they were *before* the instruction, sets RIP/PC to it and exits. Instructions do all their loads, then compute, then store, then update registers, so nothing is half done. (The interpreter had one imprecision the differential test found: an ALU instruction whose memory write faulted had already changed the flags; fixed.)
+- **Only code the guest cannot write is translated** (`GuestMemory::writable()`); RWX pages stay interpreted. `mmap`/`munmap`/`mprotect` move `AddressSpace::generation()`, which flushes the cache and the hotness counters.
+- **No JIT while the interpreter has extra state to feed:** x86-64 with CET shadow stacks, the data cache model or an LWP session; RISC-V in system mode (a bus).
+- **Threads share one engine** (it is per address space); guest threads take turns on the process lock, so the engine is never entered concurrently.
+
+x86-64 front end (`X86_64Jit.cpp`): mov, lea, movzx/movsx/movsxd, add/or/and/sub/xor/cmp, test, not/neg/inc/dec, imul (2 and 3 operand), shifts by an immediate, push/pop,
+call/jmp/ret/jcc (direct and through a register or memory), setcc, cmovcc, cdq/cqo/cdqe, leave, nops and endbr, in 8/16/32/64-bit with REX, the 66 prefix, FS/GS
+overrides and RIP-relative addressing. adc/sbb, rotates, shifts by CL, mul/div, xchg, string instructions, SSE/AVX/x87, `lock` and the system instructions are
+interpreted. **Flags are lazy**: a flag-writing instruction leaves its operands behind, and flags are computed (by `X86_64Cpu::jit_compute_flags()`, the interpreter's own
+routines) only when something reads them: a conditional branch, setcc or cmov evaluates the condition straight from the operands (`cmp; jl` is one compare), and at a block exit
+only if the code after it can read them (it looks at the next instructions: a register-only instruction that overwrites all six flags first means they are dead).
+`GuestJitOptions::exact_flags` turns the exit-time elimination off; with it on RFLAGS is exact whenever the cpu stops, otherwise it may be stale at a stop caused only by the
+budget running out (no guest-visible difference: faults, system calls and context captures always see exact flags).
+
+RISC-V front end: RV64I and `mul`/`mulw`, compressed encodings (expanded by `riscv_expand_compressed`), fence. Divide/remainder, `mulh*`, atomics, F/D, V, Zb*, CSRs and
+system instructions are interpreted. AArch64 front end: add/sub (immediate, shifted and extended register, with flags), logical (immediate and shifted), move wide,
+bitfield (`ubfx`, `lsl`, `sxtw`...), `adr/adrp`, variable shifts, `madd/msub/smaddl/umaddl`, `csel/csinc/csinv/csneg`, `b/bl/b.cond/cbz/tbz/br/blr/ret`, loads and stores of
+general registers (immediate, register offset, literal, pre/post-index, pairs; Top Byte Ignore is applied), hints. Flags are lazy as on x86-64, but always computed at
+a block exit (no look-ahead yet). Exclusives, atomics, divides, `extr`, `ccmp`, `adc/sbc`, FP, SIMD, SVE and system instructions are interpreted.
+
+Not done: block chaining (every block exit returns to `run()` and looks the next block up), inline guest-memory fast paths (every access is a helper call), translation of
+the vector/FP instruction sets (they stay interpreted), AArch64 look-ahead for dead flags, a persistent translation cache, running the JIT'd code on real hardware (tested in the host
+test and in the kernel link only; the kernel's `ICodeMemory` has been booted in QEMU by the self test, but no emulated program has run through it).
+
 ## What an emulated program cannot do yet
 - Windows exceptions only work for x86-64 Windows programs (the only kind there is), and `SuspendThread`, `Get/SetThreadContext` and thread-targeted APCs are missing.
-- Speed: a plain interpreter, tens of times slower than native. The seam for a translator (decode once into blocks, cache by address, invalidate on
-  `AddressSpace::generation()`) is `IGuestCpu::run()`.
+- Speed: the integer core of the three guests is translated (see above); everything else (FP, SIMD, x87, atomics, divides) is interpreted, tens of times slower than native.
 - Only x86-64, AArch64 and RISC-V (RV64GC) guests exist; a 32-bit guest (x86, Arm, RV32) needs its own `IGuestCpu`. AArch64 and RISC-V Windows programs are refused with a clear message.
 - The AArch64 and RISC-V kernel builds do not yet contain the shell, `ProgramRunner` or the process layer, so nothing launches programs there yet;
   the emulator core compiles for both targets (checked with clang `--target=aarch64-linux-gnu` / `riscv64-linux-gnu`) and `ProgramRunner` already
@@ -408,6 +451,13 @@ An emulated program can have threads, for both ABIs. `EmulatedProcess` (`src/Emu
 - Nothing has been run in QEMU yet: the host test and the x86-64 kernel build are what exist.
 
 ## Tests
+
+`tests/run_host_tests.sh EmulationJitTest` is the test of the JIT: random instruction streams from each guest's translated subset (and random words, which end blocks in
+interesting places) run on a cpu with and without translated code and must finish with the same registers, flags, memory, fault and instruction count (some of the runs are
+stopped and resumed at awkward points, some with blocks cut to a few instructions); every condition code after every flag-setting operation on edge-value operands (x86-64 and
+AArch64); hand-written cases (a loop, a fault in the middle of a block, self-modifying code that must not be translated, a remapped code page); and the whole programs of
+`EmulationTest` (the Linux test program, threads, x87, SSE4.2, for the three guests) with translated code in slices of 20000, 1000 and 37 instructions. It runs under ASan/UBSan.
+`JIT_SEEDS=n JIT_FIRST_SEED=m` set how many streams; `JIT_BISECT=seed` and `JIT_BLOCKS=seed` find the first differing instruction of a failing seed.
 
 `tests/run_host_tests.sh EmulationTest` builds a freestanding Linux program (`tests/data/emulation/guest.c`) with the host compiler, runs it natively
 for the expected output, and checks the emulator prints the same for the x86-64 build and for the checked-in AArch64 build, also when run in tiny slices. It also covers instruction semantics

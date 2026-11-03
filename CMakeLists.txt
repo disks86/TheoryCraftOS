@@ -676,6 +676,11 @@ add_executable(BOOTX64
   src/Emulation/GuestCpu.cpp
   src/Emulation/EmulatedProcess.cpp
   src/Emulation/X86_64Cpu.cpp
+  src/EmulationJit/AArch64Jit.cpp
+  src/EmulationJit/GuestJit.cpp
+  src/EmulationJit/RiscV64Jit.cpp
+  src/EmulationJit/X86_64Jit.cpp
+  src/EmulationJit/X86_64JitDecode.cpp
   src/Emulation/SoftFloat.cpp
   src/Emulation/SoftFloatExt.cpp
   src/Emulation/SoftFloatExtMath.cpp

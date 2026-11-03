@@ -18,9 +18,26 @@
 #pragma once
 #include <stdint.h>
 #include "Emulation/GuestCpu.hpp"
+#include "Emulation/GuestJitLink.hpp"
+#include "Utility/SharedPointer.hpp"
 #include "Emulation/SoftFloat.hpp"
 
 namespace emulation {
+
+class AArch64Cpu;
+
+// Translated code for the AArch64 guest (src/EmulationJit), used like IX86Jit: the cpu asks it to run the block at pc before interpreting an instruction.
+class IAArch64Jit {
+ public:
+  enum class Result : uint8_t { NotRun, Ran, Faulted };
+  virtual Result run(AArch64Cpu& cpu, GuestMemory& memory, uint64_t budget, uint64_t* retired) = 0;
+  static constexpr uint64_t kLongestBlock = 32;
+  virtual uint64_t blocks_entered() const = 0;
+
+ protected:
+  IAArch64Jit() = default;
+  ~IAArch64Jit() = default;
+};
 
 // An AArch64 (A64) user-mode interpreter: the integer instruction set, loads and stores (including pairs, exclusives and the LSE atomics), scalar floating point
 // (soft-float, with fused multiply-add and the AArch64 NaN rules), and a subset of Advanced SIMD that covers what compilers emit for integer and floating-point loops
@@ -38,6 +55,7 @@ class AArch64Cpu final : public IGuestCpu {
     uint64_t x[31] = {};
     uint64_t sp = 0, pc = 0;
     uint32_t nzcv = 0;      // N Z C V in bits 31..28, as in the NZCV register
+    GuestJitLink jit;       // (see GuestJitLink.hpp; the word after nzcv is padding, which translated code may overwrite with its 8-byte store of nzcv)
     Vec v[32];
     uint32_t fpcr = 0, fpsr = 0;
     uint64_t tpidr_el0 = 0;
@@ -66,6 +84,15 @@ class AArch64Cpu final : public IGuestCpu {
 
   State& state() { return s_; }
   const State& state() const { return s_; }
+
+  // Translated code (see IAArch64Jit). Threads cloned from this cpu share it.
+  void set_jit(SharedPointer<IAArch64Jit> jit) { jit_ = static_cast<SharedPointer<IAArch64Jit>&&>(jit); }
+  uint64_t jit_blocks_entered() const { return jit_ ? jit_->blocks_entered() : 0; }
+  // For translated code. The flags it left pending: state().jit.flag_op = (kind << 8) | operand size in bytes, kind 0 an addition of flag_a and flag_b, 1 a subtraction,
+  // 2 a logical operation whose result is flag_a; this computes them into NZCV the way the interpreter does.
+  void jit_compute_flags();
+  // A guest memory access of translated code failed: records the fault the way the interpreter would, restartable at `pc`.
+  void jit_fault(uint64_t pc, uint64_t address);
 
  private:
   enum class Step : uint8_t { Ok, Syscall, Fault };
@@ -148,6 +175,7 @@ class AArch64Cpu final : public IGuestCpu {
   void fp_write(uint32_t r, softfloat::Format f, uint64_t bits);      // a scalar write clears the rest of the register
   uint64_t fp_default_nan_fix(softfloat::Format f, uint64_t bits) const;
 
+  SharedPointer<IAArch64Jit> jit_;
   State s_;
   GuestFault fault_;
   uint64_t retired_ = 0;

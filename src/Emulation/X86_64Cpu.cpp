@@ -580,8 +580,12 @@ X86_64Cpu::Step X86_64Cpu::step_op(GuestMemory& m, uint8_t op) {
     if (form < 2) {      // r/m, reg
       if (!read_rm(m, size, &a)) return Step::Fault;
       b = get_reg(d_.reg, size);
+      const uint64_t flags_before = s_.rflags;
       const uint64_t r = alu(kind, a, b, size);
-      if (kind != 7 && !write_rm(m, size, r)) return Step::Fault;
+      if (kind != 7 && !write_rm(m, size, r)) {
+        s_.rflags = flags_before;      // (an instruction that faults changes nothing)
+        return Step::Fault;
+      }
     } else {             // reg, r/m
       if (!read_rm(m, size, &b)) return Step::Fault;
       a = get_reg(d_.reg, size);
@@ -655,8 +659,12 @@ X86_64Cpu::Step X86_64Cpu::step_op(GuestMemory& m, uint8_t op) {
       uint64_t a = 0;
       if (!read_rm(m, size, &a)) return Step::Fault;
       const uint32_t kind = d_.reg & 7;
+      const uint64_t flags_before = s_.rflags;
       const uint64_t r = alu(kind, a, imm, size);
-      if (kind != 7 && !write_rm(m, size, r)) return Step::Fault;
+      if (kind != 7 && !write_rm(m, size, r)) {
+        s_.rflags = flags_before;
+        return Step::Fault;
+      }
       advance();
       return Step::Ok;
     }
@@ -865,8 +873,12 @@ X86_64Cpu::Step X86_64Cpu::step_op(GuestMemory& m, uint8_t op) {
       const uint32_t kind = d_.reg & 7;
       uint64_t v = 0;
       if (!read_rm(m, size, &v)) return Step::Fault;
+      const uint64_t flags_before = s_.rflags;
       const uint64_t r = shift(kind, v, count, size);
-      if (!write_rm(m, size, r)) return Step::Fault;
+      if (!write_rm(m, size, r)) {
+        s_.rflags = flags_before;
+        return Step::Fault;
+      }
       advance();
       return Step::Ok;
     }
@@ -1009,10 +1021,14 @@ X86_64Cpu::Step X86_64Cpu::step_group_f(GuestMemory& m, uint8_t op) {
   if (!read_rm(m, size, &v)) return Step::Fault;
   if (op >= 0xFE) {      // inc, dec: keep CF
     if (kind > 1) return fail(6);
+    const uint64_t flags_before = s_.rflags;
     const uint64_t carry = s_.rflags & kCarry;
     const uint64_t r = alu(kind == 0 ? 0 : 5, v, 1, size);
     s_.rflags = (s_.rflags & ~kCarry) | carry;
-    if (!write_rm(m, size, r)) return Step::Fault;
+    if (!write_rm(m, size, r)) {
+      s_.rflags = flags_before;
+      return Step::Fault;
+    }
     s_.rip += d_.position;
     return Step::Ok;
   }
@@ -1024,8 +1040,12 @@ X86_64Cpu::Step X86_64Cpu::step_group_f(GuestMemory& m, uint8_t op) {
       if (!write_rm(m, size, ~v)) return Step::Fault;
       break;
     case 3: {
+      const uint64_t flags_before = s_.rflags;
       const uint64_t r = alu(5, 0, v, size);
-      if (!write_rm(m, size, r)) return Step::Fault;
+      if (!write_rm(m, size, r)) {
+        s_.rflags = flags_before;
+        return Step::Fault;
+      }
       s_.rflags = (s_.rflags & ~kCarry) | ((v & mask_of(size)) != 0 ? kCarry : 0);
       break;
     }
@@ -2244,14 +2264,57 @@ UniquePointer<IGuestCpu> X86_64Cpu::clone_for_thread(allocators::IAllocator& all
   return UniquePointer<IGuestCpu>(static_cast<UniquePointer<X86_64Cpu>&&>(copy));
 }
 
+// --- translated code ------------------------------------------------------------------------------------------------------------------------
+
+void X86_64Cpu::jit_compute_flags() {
+  const uint32_t kind = static_cast<uint32_t>(s_.jit.flag_op >> 8), size = static_cast<uint32_t>(s_.jit.flag_op & 0xFF);
+  const uint64_t a = s_.jit.flag_a, b = s_.jit.flag_b;
+  if (kind < 8) {
+    alu(kind, a, b, size);
+  } else if (kind == 9 || kind == 10) {      // inc, dec: keep CF
+    const uint64_t carry = s_.rflags & kCarry;
+    alu(kind == 9 ? 0 : 5, a, 1, size);
+    s_.rflags = (s_.rflags & ~kCarry) | carry;
+  } else if (kind == 11) {      // neg
+    alu(5, 0, a, size);
+    s_.rflags = (s_.rflags & ~kCarry) | ((a & mask_of(size)) != 0 ? kCarry : 0);
+  } else if (kind == 12) {      // imul r, r/m (flags only; the product is the translated code's)
+    uint64_t hi = 0, lo = 0;
+    multiply_signed(sign_extend(a, size), sign_extend(b, size), &hi, &lo);
+    const int64_t full = static_cast<int64_t>(lo);
+    const bool overflow = size == 8 ? (static_cast<int64_t>(hi) != (full >> 63)) : (sign_extend(lo, size) != full);
+    s_.rflags = (s_.rflags & ~(kCarry | kOverflow)) | (overflow ? (kCarry | kOverflow) : 0);
+    set_result_flags(lo, size);
+  } else if (kind >= 16) {      // shifts and rotates by an immediate count
+    shift(kind - 16, a, static_cast<uint32_t>(b), size);
+  }
+}
+
+void X86_64Cpu::jit_fault(uint64_t pc, uint64_t address, uint32_t error) {
+  instruction_start_ = pc;
+  fail(14, address, error);
+}
+
 // --- running ---------------------------------------------------------------------------------------------------------------------------------
 
 StopReason X86_64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
-  for (uint64_t i = 0; i < max_instructions; ++i) {
+  uint64_t done = 0;
+  while (done < max_instructions) {
+    if (jit_usable() && max_instructions - done >= IX86Jit::kLongestBlock) {
+      uint64_t retired = 0;
+      const IX86Jit::Result result = jit_->run(*this, memory, max_instructions - done, &retired);
+      if (result != IX86Jit::Result::NotRun) {
+        retired_ += retired;
+        done += retired;
+        if (result == IX86Jit::Result::Faulted) return StopReason::Fault;
+        if (retired != 0) continue;
+      }
+    }
     dme_count_ = 0;
     const Step step_result = step(memory);
     if (step_result == Step::Fault) return StopReason::Fault;
     ++retired_;
+    ++done;
     if (lwp_.cb != 0 && (lwp_.flags & 0x7C) && !lwp_retire(memory, instruction_start_)) return StopReason::Fault;
     if (step_result == Step::Syscall) return StopReason::Syscall;
   }

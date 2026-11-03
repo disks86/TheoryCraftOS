@@ -1,8 +1,8 @@
 # Just-in-time compilation (`src/Jit`)
 
-Shared infrastructure for the places that will generate machine code at run time: the architecture emulator (`src/Emulation`, x86-64 / AArch64 /
-RISC-V guests) and the JavaScript / WebAssembly virtual machines (`src/Script`, `src/Wasm`). Nothing is wired into those yet; this is the
-pipeline they plug into.
+Shared infrastructure for the places that generate machine code at run time: the architecture emulator (`src/Emulation`, x86-64 / AArch64 /
+RISC-V guests) and the JavaScript / WebAssembly virtual machines (`src/Script`, `src/Wasm`). The emulator is wired in (`src/EmulationJit`, see
+[Emulation.md](Emulation.md#translated-code-jit)); the VMs are not yet. This is the pipeline they plug into.
 
 ```
 guest code --IJitFrontend--> IrBlock --IJitBackend--> machine code --ICodeMemory--> CompiledBlock --CodeCache--> run
@@ -46,7 +46,7 @@ When the guest writes to translated code (self-modifying code, `munmap`, `mprote
 * Real-hardware validation of `KernelCodeMemory` (host-tested against a fake CPU only); `PageTables` is not thread safe against other users (the MMIO mapper), only against itself through `KernelCodeMemory`.
 * Allocator: interval splitting (a value lives in one place for its whole life, so a long-lived value in a busy block ends up in memory), operands taken straight from memory or as immediates (x86 `op reg, [mem]` / `op reg, imm`; constants are materialised into registers), real-hardware validation of the RISC-V/Arm instruction synchronisation. Splitting needs liveness holes and split-point moves on a non-SSA IR with loops; it is worth doing together with the first real front end, which will show which blocks suffer.
 * A `ProtectedCodeMemory` page protector for x86 is not needed (`KernelCodeMemory`); AArch64 relies on the firmware offering the memory attribute protocol (if it does not, regions are plain memory and `protections_enforced()` says so; a firmware that also enforces NX on data would then fault, which the boot self test shows). Boot-services time only: after `ExitBootServices` the protocol is gone.
-* Front ends for the emulator and the VMs.
+* Front ends for the JavaScript / WebAssembly VMs (the emulator has its own in `src/EmulationJit`: integer subsets of the x86-64, RISC-V and AArch64 guests). IR gaps the emulator front ends worked around: no division, no multiply-high, no select, no operands from memory or immediates (constants are `Const` instructions), no block chaining, no direct guest-memory access (every access is a `Helper` call).
 
 Boot tests: `tests/jit_boot_test.sh [x86_64] [aarch64] [riscv64]` builds each image, boots it under QEMU with the edk2 firmware and checks the `JIT: self test passed` line (real page tables, real NX, SMP).
 

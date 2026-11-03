@@ -1002,11 +1002,37 @@ AArch64Cpu::Step AArch64Cpu::step(GuestMemory& m) {
   return result;
 }
 
+void AArch64Cpu::jit_compute_flags() {
+  const uint32_t kind = static_cast<uint32_t>(s_.jit.flag_op >> 8);
+  const bool sf = (s_.jit.flag_op & 0xFF) == 8;
+  const uint64_t a = s_.jit.flag_a, b = s_.jit.flag_b;
+  if (kind == 0) add_with_carry(a, b, 0, sf, true);
+  else if (kind == 1) add_with_carry(a, ~b, 1, sf, true);
+  else set_nzcv_from(a, sf);
+}
+
+void AArch64Cpu::jit_fault(uint64_t pc, uint64_t address) {
+  instruction_start_ = pc;
+  fail(14, address);
+}
+
 StopReason AArch64Cpu::run(GuestMemory& memory, uint64_t max_instructions) {
-  for (uint64_t i = 0; i < max_instructions; ++i) {
+  uint64_t done = 0;
+  while (done < max_instructions) {
+    if (jit_ && max_instructions - done >= IAArch64Jit::kLongestBlock) {
+      uint64_t retired = 0;
+      const IAArch64Jit::Result result = jit_->run(*this, memory, max_instructions - done, &retired);
+      if (result != IAArch64Jit::Result::NotRun) {
+        retired_ += retired;
+        done += retired;
+        if (result == IAArch64Jit::Result::Faulted) return StopReason::Fault;
+        if (retired != 0) continue;
+      }
+    }
     const Step r = step(memory);
     if (r == Step::Fault) return StopReason::Fault;
     ++retired_;
+    ++done;
     if (r == Step::Syscall) { s_.streaming = false; return StopReason::Syscall; }      // (a system call leaves streaming mode, as on Linux)
   }
   // The slice is over. Threads take turns, so another one could write the word a pending LDXR read and the STXR would still succeed (real hardware loses the reservation

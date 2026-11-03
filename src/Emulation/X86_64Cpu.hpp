@@ -18,7 +18,9 @@
 #pragma once
 #include <stdint.h>
 #include "Emulation/GuestCpu.hpp"
+#include "Emulation/GuestJitLink.hpp"
 #include "Emulation/SoftFloatExt.hpp"
+#include "Utility/SharedPointer.hpp"
 
 namespace emulation {
 
@@ -29,6 +31,24 @@ namespace emulation {
 // Flags are computed eagerly after every instruction that sets them. Execution is one instruction per decode (no translation cache yet): the dispatch is a plain
 // switch, which keeps it simple enough to test against compiler output and leaves room for a block translator behind the same IGuestCpu interface.
 struct EvexOp;
+class X86_64Cpu;
+
+// Translated code for the x86-64 guest (src/EmulationJit): the cpu asks it to run the block at RIP before it interprets an instruction. It is an interface so that the
+// interpreter does not depend on the JIT libraries; without one every instruction is interpreted.
+class IX86Jit {
+ public:
+  enum class Result : uint8_t { NotRun, Ran, Faulted };
+  // Runs the translated block that starts at the cpu's RIP, translating it first when it has become hot. Needs `budget` to be at least the longest block (it never
+  // retires more instructions than that). Adds what it retired to *retired. After Faulted the cpu's fault() is set (a page fault, restartable at RIP).
+  virtual Result run(X86_64Cpu& cpu, GuestMemory& memory, uint64_t budget, uint64_t* retired) = 0;
+  static constexpr uint64_t kLongestBlock = 32;
+  // How many translated blocks have been entered so far (for tests and statistics).
+  virtual uint64_t blocks_entered() const = 0;
+
+ protected:
+  IX86Jit() = default;
+  ~IX86Jit() = default;
+};
 
 class X86_64Cpu final : public IGuestCpu {
  public:
@@ -58,6 +78,7 @@ class X86_64Cpu final : public IGuestCpu {
     uint64_t rip = 0;
     uint64_t rflags = 2;
     uint64_t fs_base = 0, gs_base = 0;
+    GuestJitLink jit;      // (see GuestJitLink.hpp)
     Xmm xmm[17];      // XMM0..15 (the low halves of YMM0..15) and a scratch slot that the AVX code uses
     YmmHigh ymm_high[16];      // bits 255:128 of YMM0..15 (and 511:256 of ZMM0..15)
     Xmm evex_lo[16];           // XMM16..31
@@ -102,6 +123,15 @@ class X86_64Cpu final : public IGuestCpu {
 
   State& state() { return s_; }
   const State& state() const { return s_; }
+
+  // Translated code (see IX86Jit). Threads cloned from this cpu share it. Null (the default) interprets everything.
+  void set_jit(SharedPointer<IX86Jit> jit) { jit_ = static_cast<SharedPointer<IX86Jit>&&>(jit); }
+  uint64_t jit_blocks_entered() const { return jit_ ? jit_->blocks_entered() : 0; }
+  // For translated code. The flags it left pending: the operation and operands are in state().jit (flag_op = (kind << 8) | operand size; kinds 0..7 are the alu
+  // operations, 9 inc, 10 dec, 11 neg, 12 one-operand-pair imul, 16 + n the shift /n by the count in flag_b); this computes them into RFLAGS the way the interpreter does.
+  void jit_compute_flags();
+  // A guest memory access of translated code failed: records the page fault the way the interpreter would, restartable at `pc`.
+  void jit_fault(uint64_t pc, uint64_t address, uint32_t error);
 
  private:
   enum class Step : uint8_t { Ok, Syscall, Fault };
@@ -332,6 +362,9 @@ class X86_64Cpu final : public IGuestCpu {
   void cache_access(uint64_t address, uint32_t size, bool is_load);
   struct Cet { bool enabled = false, wrss = false; uint64_t ssp = 0; };
   Cet cet_;
+  SharedPointer<IX86Jit> jit_;
+  // Translated code covers only the plain integer machine: no shadow stack, data cache model or profiling session to feed.
+  bool jit_usable() const { return jit_ && !cet_.enabled && !dcache_on_ && lwp_.cb == 0; }
   struct UserMsr { bool present = false, writable = false; uint32_t index = 0; uint64_t value = 0; };
   UserMsr user_msrs_[16];
   int64_t pasid_ = -1;      // IA32_PASID: the PASID, or -1 while its valid bit is clear

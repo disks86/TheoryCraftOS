@@ -41,6 +41,10 @@ class GuestMemory {
   bool write(uint64_t address, ConstByteView data) { return space_.write(address, data); }
   // Reading instructions needs the execute permission, not the read one.
   bool fetch(uint64_t address, ByteView out) const { return space_.check(address, out.size(), process::kProtExecute) && space_.read_privileged(address, out); }
+  // For the translator: only code on pages the guest cannot write is translated (it cannot change under the cache without a protect or unmap), and `layout_generation()`
+  // moves whenever the mappings or permissions change, which is when translated code must be thrown away.
+  bool writable(uint64_t address, uint64_t size) const { return space_.check(address, size, process::kProtWrite); }
+  uint64_t layout_generation() const { return space_.generation(); }
   // How many bytes from `address` on can be fetched (up to `limit`), for decoding an instruction near the end of a mapping.
   uint64_t fetchable(uint64_t address, uint64_t limit) const;
 
