@@ -164,6 +164,7 @@ void install_monitors();
 void install_keyboard();
 void install_input();
 void install_shell();
+void install_dwm();
 // Per-family process teardown (system lock held) and window teardown.
 void menus_process_exited(uint64_t pid);
 void cursors_process_exited(uint64_t pid);
@@ -173,10 +174,12 @@ void settings_process_exited(uint64_t pid);
 void keyboard_process_exited(uint64_t pid);
 void input_process_exited(uint64_t pid);
 void shell_process_exited(uint64_t pid);
+void dwm_process_exited(uint64_t pid);
 void clipboard_window_destroyed(uint32_t hwnd);
 void menu_window_destroyed(uint32_t hwnd);
 void keyboard_window_destroyed(uint32_t hwnd);
 void shell_window_destroyed(uint32_t hwnd);
+void dwm_window_destroyed(uint32_t hwnd);
 
 // --- Functions of one family that others use.
 uint32_t monitor_handle();                                    // the one monitor

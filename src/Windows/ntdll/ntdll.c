@@ -99,6 +99,7 @@ NT_SERVICE(NtTcosLinkModules);
 NT_SERVICE(NtTcosToken);
 NT_SERVICE(NtTcosAccessCheck);
 NT_SERVICE(NtTcosCommonDialog);
+NT_SERVICE(NtTcosDwm);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);

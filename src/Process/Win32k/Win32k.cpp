@@ -38,6 +38,7 @@ struct Table {
   uint32_t duplicate_numbers[kMaxDuplicates] = {};
   ProcessExitHook exit_hooks[kMaxExitHooks] = {};
   uint32_t exit_hook_count = 0;
+  Handler dwm_handler = nullptr;
   bool installed = false;
   uint64_t thread_override = 0;
 };
@@ -185,6 +186,12 @@ bool register_handler(WindowsSyscallNumber number, Handler handler, bool locked)
   return true;
 }
 
+bool register_dwm_handler(Handler handler) {
+  if (!handler || g_table.dwm_handler) return false;
+  g_table.dwm_handler = handler;
+  return true;
+}
+
 Handler handler_of(uint32_t service) { return service >= kServiceBase && service < kServiceEnd ? g_table.handlers[service - kServiceBase] : nullptr; }
 uint32_t registered_count() { return g_table.registered; }
 uint32_t duplicate_registrations() { return g_table.duplicates; }
@@ -197,6 +204,16 @@ allocators::IAllocator* system_allocator() {
 void set_thread_override(uint64_t tid) { g_table.thread_override = tid; }
 
 bool dispatch(Process& process, const SyscallRequest& request, uint64_t* result) {
+  if (request.number == uint32_t(WindowsSyscallNumber::NtTcosDwm)) {
+    ObjectManager* objects = objects_or_null();
+    if (!g_table.dwm_handler || !objects) return false;
+    Call call(process, request);
+    ISystemSync& sync = objects->sync();
+    sync.lock();
+    *result = g_table.dwm_handler(call);
+    sync.unlock();
+    return true;
+  }
   if (request.number < kServiceBase || request.number >= kServiceEnd) return false;
   const uint32_t index = uint32_t(request.number) - kServiceBase;
   const Handler handler = g_table.handlers[index];

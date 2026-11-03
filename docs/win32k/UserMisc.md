@@ -86,7 +86,16 @@ bridge to the kernel's text clipboard (`src/Kernel/Clipboard.hpp`), not wired ye
 * Needing queue/input state of the window manager: GetKeyboardState/SetKeyboardState/GetKeyState/GetAsyncKeyState, GetMouseMovePointsEx, touch/gesture/pointer message
   services (GetTouchInputInfo, GetGestureInfo, GetPointerInfoList, Inject*), WaitForInputIdle, BlockInput.
 * Other: GetGuiResources/QueryUserCounters (the GDI object count is not in the contract), DisplayConfigSetDeviceInfo, SetDisplayConfig, ChangeDisplaySettingsEx flags for secondary
-  displays (there is one), auto-rotation, Mag*/Dwm* services, session and logon services, ShellHandwriting*, the interactive-control services, the IME hot-key/info services.
+  displays (there is one), auto-rotation, Mag* services and the remote-session Dwm* ones (DwmGetRemoteSession*), session and logon services, ShellHandwriting*, the interactive-control services, the IME hot-key/info services.
+
+## Desktop window manager (`Win32kUserMiscDwm.cpp`)
+
+The state behind `dwmapi.dll` (src/Windows/dwmapi). Windows keeps it in dwm.exe; here it is win32k's. `NtTcosDwm` (service 506, outside the win32k range: `register_dwm_handler`)
+stores per-window values (`SetProp`/`GetProp`: the `DWMWA_*` attributes, frame margins, blur behind, iconic bitmaps; only the window's process may set, anyone may read;
+`DWMWA_EXTENDED_FRAME_BOUNDS` is the window rectangle) and thumbnails (`RegisterThumbnail`/`UnregisterThumbnail`/`UpdateThumbnail`/`ThumbnailSourceSize`; a process sees only its
+own; destroyed with their destination window or process). The real services `NtUserDwmValidateWindow`, `DwmWindowNotificationsEnabled`, `DwmLockScreenUpdates` (nested),
+`DwmKernelStartup`/`Shutdown` (one compositor at a time) and `Get/SetWindowCompositionAttribute` are recorded state. Nothing is composited from these values yet: they are what a
+program set and reads back. Tests: `test_dwm` in `tests/Win32kMiscTest.cpp`.
 
 ## Contract additions
 

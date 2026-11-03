@@ -164,6 +164,8 @@ using Handler = uint64_t (*)(Call&);
 // handler that talks to a component with a lock of its own (the Direct3D kernel) registers with locked = false and takes care of everything itself. False if the number is
 // outside the win32k range or already has a handler (the first one stays).
 bool register_handler(WindowsSyscallNumber number, Handler handler, bool locked = true);
+// NtTcosDwm (dwmapi.dll's one service, outside the win32k range): the module that implements it registers its handler here. False if there is one already.
+bool register_dwm_handler(Handler handler);
 // The handler of a service, null if there is none.
 Handler handler_of(uint32_t service);
 // How many services have a handler / which numbers still have none (for the tests and the documentation).

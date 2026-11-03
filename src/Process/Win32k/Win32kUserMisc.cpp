@@ -98,6 +98,7 @@ void process_exited_hook(uint64_t pid) {
   keyboard_process_exited(pid);
   input_process_exited(pid);
   shell_process_exited(pid);
+  dwm_process_exited(pid);
   Records* r = g_records.get();
   if (!r) return;
   ObjectCursor cursor;
@@ -118,6 +119,7 @@ void window_destroyed(uint32_t hwnd) {
   clipboard_window_destroyed(hwnd);
   keyboard_window_destroyed(hwnd);
   shell_window_destroyed(hwnd);
+  dwm_window_destroyed(hwnd);
   menu_window_destroyed(hwnd);
 }
 
@@ -135,6 +137,7 @@ void install_user_misc() {
   user_misc::install_keyboard();
   user_misc::install_input();
   user_misc::install_shell();
+  user_misc::install_dwm();
 }
 
 }  // namespace process::win32k

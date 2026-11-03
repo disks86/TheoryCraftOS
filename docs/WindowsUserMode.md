@@ -400,6 +400,15 @@ Nothing a program links against is missing, even where nothing is implemented ye
 - **Gaps.** Only functions are stubbed (not data exports such as `_environ`), and names that are not C identifiers (C++ decorated names) are left out. kernelbase.dll and `api-ms-win-*` still fold into kernel32.dll (see `canonical_library_name()`), so their extra exports are not listed.
 
 
+## dwmapi.dll
+
+`src/Windows/dwmapi/dwmapi.c` implements the Desktop Window Manager API: `DwmIsCompositionEnabled` (always on), `DwmGetColorizationColor`, `DwmFlush` and `DwmGetCompositionTimingInfo`
+(a fixed 60 Hz refresh counted from the performance counter), `DwmSet/GetWindowAttribute` (the attribute table of the SDK: sizes, ranges, read-only attributes, defaults),
+`DwmExtendFrameIntoClientArea`, `DwmEnableBlurBehindWindow`, the thumbnail functions, the iconic-bitmap functions, `DwmDefWindowProc` (never handles) and the frame-duration calls.
+The state lives in win32k and is reached with one service, **`NtTcosDwm`** (service 506; see `docs/win32k/UserMisc.md`). Still stubs: the MIL/graphics-stream, contact/gesture and
+`Dwmp*` exports, `DwmSetPresentParameters`, `DwmTransitionOwnedWindow`, and `SetThreadDpiAwarenessContext`. Nothing composites from the stored values yet. Not run under QEMU with
+a Windows program; the kernel half is covered by `test_dwm` in `Win32kMiscTest`.
+
 ## gdi32.dll
 
 `src/Windows/gdi32` is a real library: the GDI API of wingdi.h (A and W forms, DCs and their attributes, pens, brushes, bitmaps, DIBs, regions, clipping, palettes, paths, text and

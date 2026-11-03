@@ -73,6 +73,11 @@ namespace process::win32k::user {
 __attribute__((weak)) bool is_window(uint32_t hwnd) { return find_window(hwnd) != nullptr; }
 __attribute__((weak)) uint64_t window_thread(uint32_t hwnd) { const FakeWindow* w = find_window(hwnd); return w ? w->tid : 0; }
 __attribute__((weak)) uint64_t window_process(uint32_t hwnd) { const FakeWindow* w = find_window(hwnd); return w ? w->pid : 0; }
+__attribute__((weak)) bool window_screen_rect(uint32_t hwnd, gdi::Rect* rect) {
+  if (!find_window(hwnd)) return false;
+  *rect = gdi::Rect{10, 20, 10 + int32_t(hwnd & 0xFF) * 4, 20 + 50};      // (the width depends on the window)
+  return true;
+}
 __attribute__((weak)) uint32_t desktop_window() { return 0x10010; }
 __attribute__((weak)) uint32_t focus_window() { return g_focus; }
 __attribute__((weak)) bool post_message(uint32_t hwnd, uint32_t message, uint64_t wparam, uint64_t lparam) {
@@ -1279,7 +1284,90 @@ void test_shell_and_calls() {
   X(LogicalToPerMonitorDPIPhysicalPoint) X(PerMonitorDPIPhysicalToLogicalPoint) X(SystemParametersInfo) X(SystemParametersInfoForDpi) X(SetSysColors) X(GetDoubleClickTime) \
   X(SetDoubleClickTime) X(SwapMouseButton) X(UpdatePerUserSystemParameters) X(ScaleSystemMetricForDPIWithoutCache) X(SetShellWindowEx) X(SetProgmanWindow) \
   X(SetTaskmanWindow) X(RegisterShellHookWindow) X(DeregisterShellHookWindow) X(GetProcessDefaultLayout) X(SetProcessDefaultLayout) X(ShutdownBlockReasonCreate) \
-  X(ShutdownBlockReasonQuery) X(ShutdownReasonDestroy) X(SetWindowDisplayAffinity) X(GetWindowDisplayAffinity) X(MessageBeep)
+  X(ShutdownBlockReasonQuery) X(ShutdownReasonDestroy) X(SetWindowDisplayAffinity) X(GetWindowDisplayAffinity) X(MessageBeep) X(DwmValidateWindow) X(DwmWindowNotificationsEnabled) \
+  X(DwmLockScreenUpdates) X(DwmKernelStartup) X(DwmKernelShutdown) X(SetWindowCompositionAttribute) X(GetWindowCompositionAttribute)
+// NtTcosDwm(op, a, b, c, d): the service of dwmapi.dll.
+void test_dwm() {
+  Program p(190);
+  setup(p);
+  set_thread_override(1);
+  new_window(0x71001, 190, 1);
+  new_window(0x71002, 190, 1);
+  new_window(0x71003, 191, 9);
+  auto dwm = [&](uint32_t op, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0) { return p.call32(N::NtTcosDwm, op, a, b, c, d); };
+  const uint32_t kOk = 0, kNotFound = 0xC0000225u, kBadWindow = 0xC0000300u, kDenied = 0xC0000022u, kBadParam = 0xC000000Du, kMismatch = 0xC0000004u, kBadHandle = 0xC0000008u;
+  // values of windows
+  p.memory.put32(kA, 0x1234);
+  CHECK(dwm(2, 0x71001, 20, kB, 4) == kNotFound);
+  CHECK(dwm(1, 0x71001, 20, kA, 4) == kOk && dwm(2, 0x71001, 20, kB, 4) == kOk && p.memory.get32(kB) == 0x1234);
+  CHECK(dwm(2, 0x71001, 20, kB, 8) == kMismatch && dwm(2, 0x71002, 20, kB, 4) == kNotFound);
+  CHECK(dwm(1, 0x71003, 20, kA, 4) == kDenied && dwm(1, 0x99999, 20, kA, 4) == kBadWindow && dwm(2, 0x99999, 20, kB, 4) == kBadWindow);
+  CHECK(dwm(1, 0x71001, 20, kA, 0) == kBadParam && dwm(1, 0x71001, 20, kA, 65) == kBadParam);
+  p.memory.put32(kA, 0x5678);
+  CHECK(dwm(1, 0x71001, 20, kA, 4) == kOk && dwm(2, 0x71001, 20, kB, 4) == kOk && p.memory.get32(kB) == 0x5678);      // replaced, not added
+  CHECK(dwm(2, 0x71003, 20, kB, 4) == kNotFound);      // anyone may read
+  CHECK(dwm(2, 0x71002, 9, kB, 16) == kOk && int32_t(p.memory.get32(kB)) == 10 && int32_t(p.memory.get32(kB + 8)) == 10 + 0x02 * 4);      // the extended frame bounds are the window rectangle
+  CHECK(dwm(2, 0x71002, 9, kB, 8) == kMismatch);
+  // the window goes: its values go with it
+  drop_window(0x71002);
+  CHECK(dwm(2, 0x71002, 9, kB, 16) == kBadWindow);
+  new_window(0x71002, 190, 1);
+  CHECK(dwm(2, 0x71002, 20, kB, 4) == kNotFound);
+  // thumbnails
+  CHECK(dwm(3, 0x71001, 0x71001, kC) == kBadParam && dwm(3, 0x71003, 0x71002, kC) == kDenied && dwm(3, 0x71001, 0x99999, kC) == kBadWindow && dwm(3, 0x99999, 0x71002, kC) == kBadWindow);
+  CHECK(dwm(3, 0x71001, 0x71002, kC) == kOk);
+  const uint32_t thumbnail = p.memory.get32(kC);
+  CHECK(thumbnail != 0);
+  for (uint32_t i = 0; i < 48; ++i) p.memory.put8(kD + i, uint8_t(i));
+  CHECK(dwm(5, thumbnail, kD) == kOk && dwm(5, 0xDEAD, kD) == kBadHandle);
+  CHECK(dwm(6, thumbnail, kE) == kOk && int32_t(p.memory.get32(kE)) == 4 * 2 && int32_t(p.memory.get32(kE + 4)) == 50);
+  Program other(191);
+  other.process.set_gs_base(kTeb);
+  CHECK(other.call32(N::NtTcosDwm, 5, thumbnail, kD) == kBadHandle && other.call32(N::NtTcosDwm, 4, thumbnail) == kBadHandle);      // another process's thumbnail is none of its business
+  CHECK(dwm(4, thumbnail) == kOk && dwm(4, thumbnail) == kBadHandle && dwm(6, thumbnail, kE) == kBadHandle);
+  CHECK(dwm(3, 0x71001, 0x71002, kC) == kOk && p.memory.get32(kC) != thumbnail);      // (a new handle: the generation moved on)
+  const uint32_t second = p.memory.get32(kC);
+  drop_window(0x71001);      // the destination goes: so does the thumbnail
+  CHECK(dwm(6, second, kE) == kBadHandle);
+  new_window(0x71001, 190, 1);
+  CHECK(dwm(3, 0x71001, 0x71002, kC) == kOk);
+  drop_window(0x71002);      // the source goes: the thumbnail stays but has nothing to show
+  CHECK(dwm(6, p.memory.get32(kC), kE) == kBadWindow);
+  CHECK(dwm(99) == kBadParam);
+  // the services of the compositor
+  CHECK(p.call(N::NtUserDwmValidateWindow, 0x71001, 0) == 1 && p.call(N::NtUserDwmValidateWindow, 0x99999, 0) == 0 && last_error(p) == kErrorInvalidWindowHandle);
+  CHECK(p.call(N::NtUserDwmWindowNotificationsEnabled, 0x71001) == 1);
+  clear_error(p);
+  CHECK(p.call(N::NtUserDwmLockScreenUpdates, 0) == 0 && last_error(p) == kErrorInvalidParameter);
+  CHECK(p.call(N::NtUserDwmLockScreenUpdates, 1) == 1 && p.call(N::NtUserDwmLockScreenUpdates, 1) == 1 && p.call(N::NtUserDwmLockScreenUpdates, 0) == 1 && p.call(N::NtUserDwmLockScreenUpdates, 0) == 1);
+  CHECK(p.call32(N::NtUserDwmKernelShutdown) == 0xC0000184u);
+  CHECK(p.call32(N::NtUserDwmKernelStartup) == kOk && p.call32(N::NtUserDwmKernelStartup) == kDenied && p.call32(N::NtUserDwmKernelShutdown) == kOk);
+  // composition attributes: {attrib, pad, data, size}
+  p.memory.put32(kF, 0x7);
+  p.memory.put32(kF + 4, 0);
+  p.memory.put64(kF + 8, kG);
+  p.memory.put64(kF + 16, 4);
+  p.memory.put32(kG, 0xABCD);
+  clear_error(p);
+  CHECK(p.call(N::NtUserGetWindowCompositionAttribute, 0x71001, kF) == 0 && last_error(p) == kErrorInvalidParameter);      // never set
+  CHECK(p.call(N::NtUserSetWindowCompositionAttribute, 0x71001, kF) == 1);
+  p.memory.put32(kG, 0);
+  CHECK(p.call(N::NtUserGetWindowCompositionAttribute, 0x71001, kF) == 1 && p.memory.get32(kG) == 0xABCD);
+  CHECK(p.call(N::NtUserSetWindowCompositionAttribute, 0x71003, kF) == 0 && last_error(p) == kErrorAccessDenied);
+  p.memory.put32(kF, 0);
+  CHECK(p.call(N::NtUserSetWindowCompositionAttribute, 0x71001, kF) == 0 && last_error(p) == kErrorInvalidParameter);
+  // a process that ends takes its thumbnails with it
+  new_window(0x71002, 190, 1);
+  CHECK(dwm(3, 0x71001, 0x71002, kC) == kOk);
+  const uint32_t third = p.memory.get32(kC);
+  CHECK(dwm(6, third, kE) == kOk);
+  win32k::process_exited(190);
+  CHECK(dwm(6, third, kE) == kBadHandle);
+  drop_window(0x71001);
+  drop_window(0x71002);
+  drop_window(0x71003);
+}
+
 void test_registration() {
   CHECK(duplicate_registrations() == 0);
   static const WindowsSyscallNumber numbers[] = {
@@ -1313,5 +1401,6 @@ int main() {
   test_keyboard();
   test_input();
   test_shell_and_calls();
+  test_dwm();
   return finish("Win32kMiscTest");
 }

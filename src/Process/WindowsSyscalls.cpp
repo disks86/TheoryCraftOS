@@ -270,6 +270,11 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtTcosToken: return windowsabi::nt_tcos_token(process, r);
       case WindowsSyscallNumber::NtTcosAccessCheck: return windowsabi::nt_tcos_access_check(process, r);
       case WindowsSyscallNumber::NtTcosCommonDialog: return windowsabi::nt_tcos_common_dialog(process, r);
+      case WindowsSyscallNumber::NtTcosDwm: {      // the desktop window manager's service (dwmapi.dll): it is win32k's, so without win32k it is not there
+        bool handled = false;
+        if (g_win32k_dispatch) { const uint64_t result = g_win32k_dispatch(process, r, &handled); if (handled) return result; }
+        return kStatusNotImplemented;
+      }
       case WindowsSyscallNumber::NtCancelSynchronousIoFile: return windowsabi::nt_cancel_synchronous_io_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);
