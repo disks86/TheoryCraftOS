@@ -4691,3 +4691,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "idn.inc"
 #include "actctx.inc"
 #include "rsrcupdate.inc"
+#include "resenum.inc"

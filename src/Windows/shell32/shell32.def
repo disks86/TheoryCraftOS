@@ -1,0 +1,72 @@
+LIBRARY shell32.dll
+EXPORTS
+StrChrA = shlwapi.StrChrA
+StrChrIA = shlwapi.StrChrIA
+StrChrIW = shlwapi.StrChrIW
+StrChrW = shlwapi.StrChrW
+StrCmpNA = shlwapi.StrCmpNA
+StrCmpNIA = shlwapi.StrCmpNIA
+StrCmpNIW = shlwapi.StrCmpNIW
+StrCmpNW = shlwapi.StrCmpNW
+StrCpyNA = shlwapi.StrCpyNA
+StrCpyNW = shlwapi.StrCpyNW
+StrNCmpA = shlwapi.StrNCmpA
+StrNCmpIA = shlwapi.StrNCmpIA
+StrNCmpIW = shlwapi.StrNCmpIW
+StrNCmpW = shlwapi.StrNCmpW
+StrNCpyA = shlwapi.StrNCpyA
+StrNCpyW = shlwapi.StrNCpyW
+StrRChrA = shlwapi.StrRChrA
+StrRChrIA = shlwapi.StrRChrIA
+StrRChrIW = shlwapi.StrRChrIW
+StrRChrW = shlwapi.StrRChrW
+StrRStrA = shlwapi.StrRStrA
+StrRStrIA = shlwapi.StrRStrIA
+StrRStrIW = shlwapi.StrRStrIW
+StrRStrW = shlwapi.StrRStrW
+StrStrA = shlwapi.StrStrA
+StrStrIA = shlwapi.StrStrIA
+StrStrIW = shlwapi.StrStrIW
+StrStrW = shlwapi.StrStrW
+IsProcessDPIAware = user32.IsProcessDPIAware
+MonitorFromWindow = user32.MonitorFromWindow
+GetSystemWow64DirectoryA = kernel32.GetSystemWow64DirectoryA
+IsWow64Process = kernel32.IsWow64Process
+; ordinals that programs import by number
+SHAllocShared @7
+SHLockShared @8
+SHUnlockShared @9
+SHFreeShared @10
+ILFindLastID @16
+ILRemoveLastID @17
+ILClone @18
+ILCloneFirst @19
+ILIsEqual @21
+ILIsParent @23
+ILFindChild @24
+ILCombine @25
+ILLoadFromStream @26
+ILSaveToStream @27
+SHILCreateFromPath @28
+PathIsExe @43
+PathQualify @49
+PathResolve @51
+DriveType @64
+IsNetDrive @66
+SHGetSetSettings @68
+SHCreateStdEnumFmtEtc @74
+PathYetAnotherMakeUniqueName @75
+PathGetShortPath @92
+SHRestricted @100
+IsLFNDrive @119
+ILGetSize @152
+ILGetNext @153
+ILAppendID @154
+ILFree @155
+SHCreateDirectory @165
+PathCleanupSpec @171
+SHValidateUNC @173
+SHFree @195
+SHAlloc @196
+ReadCabinetState @651
+WriteCabinetState @652

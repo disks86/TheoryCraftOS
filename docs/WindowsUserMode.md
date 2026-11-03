@@ -294,6 +294,37 @@ rest instead of returning them on a later call (each watch keeps only its most r
   done yet.
   A call to an import that nothing provides stops the program with a message saying which one.
 
+## The shell (shell32.dll) and COM (ole32.dll)
+
+`src/Windows/shell32` is a real DLL (the rest of the shell libraries are still stubs): freestanding C over kernel32, advapi32's registry and user32, built against
+mingw-w64's headers. One file per part (see the comment at the top of `shell32.c`). What works:
+
+- **Folders.** Known folders and CSIDLs (`folders.inc`): `SHGetFolderPath*`, `SHGetKnownFolderPath`, `SHSetKnownFolderPath` (redirection in `HKCU\...\Explorer\User Shell Folders`),
+  `SHGetSpecialFolderPath`, the item-list forms, and `IKnownFolderManager`/`IKnownFolder`. The profile is `%USERPROFILE%` (`C:\Users\Default`); the per-user and common
+  folders are made on first use, Windows/System32/Fonts and the like are not. Virtual folders (This PC, Recycle Bin, Network, Control Panel, Printers) have GUID items and no path.
+- **Item lists and folders** (`pidl.inc`, `items.inc`): the `IL*` functions, `SHParseDisplayName`, `SHBindToParent`, `SHGetNameFromIDList`, `IShellFolder`/`IShellFolder2`/`IPersistFolder3` for
+  the desktop, This PC and file system folders, `IEnumIDList`, `IShellItem`, `IShellItemArray`, and a data object with `CF_HDROP` and "Shell IDList Array". The item formats are this OS's
+  own (documented at the top of `pidl.inc`; programs treat them as opaque). The desktop folder is `C:\Users\Default\Desktop` (the public desktop is enumerated too).
+- **File operations** (`fileop.inc`): `SHFileOperation` (copy, move, rename, delete with wildcards, several sources, `FOF_RENAMEONCOLLISION`, name mappings, the `DE_*` codes), the
+  recycle bin (`C:\$Recycle.Bin\<SID>` with `$I`/`$R` files; `SHQueryRecycleBin`, `SHEmptyRecycleBin`), `SHCreateDirectoryEx`, unique names, `PathResolve`, `PathCleanupSpec`. There are no
+  dialogs: where Windows would ask, the answer is yes.
+- **ShellExecute** (`exec.inc`): `ShellExecute[Ex]`, `FindExecutable`, associations from `HKEY_CLASSES_ROOT` (extension -> class -> `shell\<verb>\command`, `%1 %L %* %2-%9 %~N`, the shell's own
+  rules for splitting parameters), programs started with CreateProcess, URL protocols from the registry. No DDE.
+- **Shortcuts** (`link.inc`): `CLSID_ShellLink` with `IShellLinkW/A`, `IPersistFile`, `IPersistStream`, `IShellLinkDataList` (flags only); files are written with a target list and Unicode strings,
+  read with or without LinkInfo; hostile input is bounds-checked (test: truncations and bit flips).
+- Also: `SHGetFileInfo` (names, attributes, executable type), drag and drop (`DragQueryFile`), change notifications (in-process), notification-icon bookkeeping, shared memory
+  (`SHAllocShared`...), `CommandLineToArgvW`, the She* helpers, drive helpers, `SHGetMalloc`.
+- **Not provided** (they answer with a failure, never crash): everything that needs a window system or icons (`SHBrowseForFolder`, `ExtractIcon*` pictures, `SHGetImageList`, context menus,
+  views, property sheets, `Shell_NotifyIcon` display), `SHGetFileInfo`'s icon, DDE, the property store, `IShellItem2`, libraries, network shares.
+
+`src/Windows/ole32` is the COM runtime of one process: `CoTaskMem*`, apartments (counted per thread), GUID/ProgID strings, `CoGetClassObject`/`CoCreateInstance` for in-process servers (the registry's
+`InprocServer32`, `CoRegisterClassObject`, and shell32's own classes without registry entries), bind contexts, `CreateStreamOnHGlobal`, `ReleaseStgMedium`, `PropVariantClear`. There is no RPC,
+so out-of-process servers, marshalling, monikers and the clipboard are still stubs. shlwapi gained `StrRetTo*`, `SHStrDup`, the `SH*Value` registry helpers, `SHCreateStreamOnFile`, `AssocQueryString`;
+kernel32 gained `EnumResource*` and `GetBinaryType`; user32 the `Char*`/`IsChar*` functions. No new NT system services were needed: everything above sits on the existing file, registry, section and process services.
+
+Tests: `tests/windows/shell32test.c` (168 checks; run it as `shell32_own.exe` through `scripts/winetest.sh shell32 own`, with `WINETEST_EXTRA=<procchild.exe>` for the ShellExecute checks) and Wine's
+`tests/windows/wine/shell32` (status in the table of `tests/windows/wine/README.md`).
+
 ## Stubs: every service and every export is in place
 
 Nothing a program links against is missing, even where nothing is implemented yet (`scripts/gen-windows-stubs.py` produced the lists from the mingw-w64 import libraries, which name the exports of the real DLLs).
