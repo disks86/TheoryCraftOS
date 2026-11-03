@@ -75,6 +75,7 @@ static BOOL wequal_ignore_case(const WCHAR *a, const WCHAR *b) {
 }
 
 #include "registry.inc"
+#include "registry2.inc"
 
 /* ---- the user name, and crypto randomness ---------------------------------------------------------------------------------------------------------------- */
 
@@ -95,9 +96,11 @@ EXPORT BOOL WINAPI GetUserNameA(LPSTR buffer, LPDWORD capacity) {
 /* CryptAcquireContext / CryptGenRandom / CryptReleaseContext: a program that only wants non-predictable bytes (not a cryptographic guarantee: there is no entropy
  * driver here yet, matching kernel32's own GetCurrentProcessId()-seeded sources elsewhere) gets them; anything about named key containers or providers is refused. */
 #define PROV_RSA_FULL_ 1
+#define PROV_RSA_AES_ 24
+BOOL TCOS_FillRandom(BYTE *out, DWORD length);
 EXPORT BOOL WINAPI CryptAcquireContextW(HANDLE *provider, LPCWSTR container, LPCWSTR provider_name, DWORD provider_type, DWORD flags) {
   (void)container; (void)provider_name;
-  if (provider_type != 0 && provider_type != PROV_RSA_FULL_) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+  if (provider_type != 0 && provider_type != PROV_RSA_FULL_ && provider_type != PROV_RSA_AES_) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
   (void)flags;
   if (!provider) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   *provider = (HANDLE)(ULONG_PTR)0x435259;      /* "CRY": a pseudo-handle, like the token above */
@@ -110,6 +113,7 @@ EXPORT BOOL WINAPI CryptAcquireContextA(HANDLE *provider, LPCSTR container, LPCS
 EXPORT BOOL WINAPI CryptReleaseContext(HANDLE provider, DWORD flags) { (void)provider; (void)flags; return TRUE; }
 EXPORT BOOL WINAPI CryptGenRandom(HANDLE provider, DWORD length, BYTE *buffer) {
   (void)provider;
+  if (TCOS_FillRandom(buffer, length)) return TRUE;      /* the system's random source; the generator below only if there is none */
   static ULONGLONG state;
   if (!state) state = GetTickCount64() ^ ((ULONGLONG)GetCurrentProcessId() << 32) ^ 0x9E3779B97F4A7C15ull;
   for (DWORD i = 0; i < length; ++i) {

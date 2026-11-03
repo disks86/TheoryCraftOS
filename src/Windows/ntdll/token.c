@@ -399,6 +399,46 @@ __declspec(dllexport) NTSTATUS NTAPI NtFilterToken(HANDLE source, ULONG flags, T
     return status;
 }
 
+/* The thread becomes ANONYMOUS LOGON (S-1-5-7): a token that has no privilege and the groups Everyone and Anonymous Logon. It is made from the caller's own, so that the session and
+ * the rest are the same, and set as the impersonation token of the thread. */
+__declspec(dllexport) NTSTATUS NTAPI NtImpersonateAnonymousToken(HANDLE thread)
+{
+    static const BYTE anonymous[12] = {1, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0};
+    static const BYTE everyone[12] = {1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+    TokenData *t;
+    HANDLE source, anon;
+    NTSTATUS status;
+    if (!(t = heap_new(sizeof(*t)))) return STATUS_NO_MEMORY_;
+    status = NtOpenProcessToken(NtCurrentProcess(), TOKEN_QUERY, &source);
+    if (!status) { status = read_token(source, TOKEN_QUERY, t); NtClose(source); }
+    if (status) { heap_drop(t); return status; }
+    t->type = TokenImpersonation;
+    t->level = SecurityImpersonation;
+    memset(&t->user, 0, sizeof(t->user));
+    memcpy(t->user.sid, anonymous, sizeof(anonymous));
+    t->user.attrs = 0;
+    memset(t->groups, 0, sizeof(t->groups));
+    memcpy(t->groups[0].sid, everyone, sizeof(everyone));
+    t->groups[0].attrs = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    memcpy(t->groups[1].sid, anonymous, sizeof(anonymous));
+    t->groups[1].attrs = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    t->ngroups = 2;
+    t->npriv = 0;
+    t->nrestr = 0;
+    t->has_owner = FALSE;
+    t->has_pgroup = FALSE;
+    t->has_dacl = FALSE;
+    t->elevation_type = 1;      /* TokenElevationTypeDefault */
+    t->flags = 0;
+    t->token_id = next_luid();
+    t->auth_id = 0x3e6;         /* ANONYMOUS_LOGON_LUID */
+    status = create_token(t, TOKEN_ALL, FALSE, &anon);
+    heap_drop(t);
+    if (status) return status;
+    status = NtSetInformationThread(thread, ThreadImpersonationToken, &anon, sizeof(anon));
+    NtClose(anon);
+    return status;
+}
 __declspec(dllexport) NTSTATUS NTAPI NtCompareTokens(HANDLE first, HANDLE second, PBOOLEAN equal)
 {
     TokenData *a, *b;
@@ -972,6 +1012,95 @@ __declspec(dllexport) NTSTATUS NTAPI NtAccessCheckByTypeResultList(PSECURITY_DES
     if (!status && types)
         for (i = 0; i < type_count; ++i) { granted[i] = granted[0]; access_status[i] = access_status[0]; }
     return status;
+}
+
+/* ---- audit alarms ------------------------------------------------------------------------------------------------------------------------------------ */
+/* Nothing is audited here: the security event log has no policy that asks for it (LsaSetInformationPolicy keeps the audit settings, but no object access event is ever raised).
+ * The services still do what they promise to their caller: they refuse a thread without SeAuditPrivilege, an access check for the AndAuditAlarm ones is a real one (with the
+ * thread's effective token, or the client token), and an object that was opened does not ask for an audit on close. */
+#define SE_AUDIT_PRIVILEGE_LOW 21
+static NTSTATUS audit_gate(void)
+{
+    PRIVILEGE_SET set;
+    BOOLEAN held = FALSE;
+    NTSTATUS status;
+    memset(&set, 0, sizeof(set));
+    set.PrivilegeCount = 1;
+    set.Privilege[0].Luid.LowPart = SE_AUDIT_PRIVILEGE_LOW;
+    status = NtPrivilegeCheck((HANDLE)(LONG_PTR)-6, &set, &held);
+    if (status) return status;
+    return held ? STATUS_SUCCESS : STATUS_PRIVILEGE_NOT_HELD_;
+}
+static NTSTATUS audit_check(PSECURITY_DESCRIPTOR sd, HANDLE token, ACCESS_MASK desired, PGENERIC_MAPPING mapping, PACCESS_MASK granted, PNTSTATUS access_status, PBOOLEAN on_close, ULONG count)
+{
+    BYTE buffer[sizeof(PRIVILEGE_SET) + 8 * sizeof(LUID_AND_ATTRIBUTES)];
+    ULONG length = sizeof(buffer), i;
+    NTSTATUS status;
+    if (!sd || !mapping || !granted || !access_status || !on_close) return STATUS_ACCESS_VIOLATION_;
+    status = audit_gate();
+    if (status) return status;
+    status = check_internal(sd, token ? token : (HANDLE)(LONG_PTR)-6, desired, mapping, (PPRIVILEGE_SET)buffer, &length, granted, access_status, FALSE);
+    if (status) return status;
+    for (i = 1; i < count; ++i) { granted[i] = granted[0]; access_status[i] = access_status[0]; }
+    *on_close = FALSE;
+    return STATUS_SUCCESS;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtAccessCheckAndAuditAlarm(PUNICODE_STRING subsystem, PVOID handle_id, PUNICODE_STRING type_name, PUNICODE_STRING object_name, PSECURITY_DESCRIPTOR sd,
+    ACCESS_MASK desired, PGENERIC_MAPPING mapping, BOOLEAN creation, PACCESS_MASK granted, PNTSTATUS access_status, PBOOLEAN on_close)
+{
+    (void)subsystem; (void)handle_id; (void)type_name; (void)object_name; (void)creation;
+    return audit_check(sd, NULL, desired, mapping, granted, access_status, on_close, 1);
+}
+__declspec(dllexport) NTSTATUS NTAPI NtAccessCheckByTypeAndAuditAlarm(PUNICODE_STRING subsystem, PVOID handle_id, PUNICODE_STRING type_name, PUNICODE_STRING object_name, PSECURITY_DESCRIPTOR sd,
+    PSID principal, ACCESS_MASK desired, ULONG audit_type, ULONG flags, POBJECT_TYPE_LIST types, ULONG type_count, PGENERIC_MAPPING mapping, BOOLEAN creation, PACCESS_MASK granted,
+    PNTSTATUS access_status, PBOOLEAN on_close)
+{
+    (void)subsystem; (void)handle_id; (void)type_name; (void)object_name; (void)principal; (void)audit_type; (void)flags; (void)types; (void)type_count; (void)creation;
+    return audit_check(sd, NULL, desired, mapping, granted, access_status, on_close, 1);
+}
+__declspec(dllexport) NTSTATUS NTAPI NtAccessCheckByTypeResultListAndAuditAlarm(PUNICODE_STRING subsystem, PVOID handle_id, PUNICODE_STRING type_name, PUNICODE_STRING object_name,
+    PSECURITY_DESCRIPTOR sd, PSID principal, ACCESS_MASK desired, ULONG audit_type, ULONG flags, POBJECT_TYPE_LIST types, ULONG type_count, PGENERIC_MAPPING mapping, BOOLEAN creation,
+    PACCESS_MASK granted, PNTSTATUS access_status, PBOOLEAN on_close)
+{
+    (void)subsystem; (void)handle_id; (void)type_name; (void)object_name; (void)principal; (void)audit_type; (void)flags; (void)types; (void)creation;
+    return audit_check(sd, NULL, desired, mapping, granted, access_status, on_close, type_count ? type_count : 1);
+}
+__declspec(dllexport) NTSTATUS NTAPI NtAccessCheckByTypeResultListAndAuditAlarmByHandle(PUNICODE_STRING subsystem, PVOID handle_id, HANDLE client_token, PUNICODE_STRING type_name,
+    PUNICODE_STRING object_name, PSECURITY_DESCRIPTOR sd, PSID principal, ACCESS_MASK desired, ULONG audit_type, ULONG flags, POBJECT_TYPE_LIST types, ULONG type_count,
+    PGENERIC_MAPPING mapping, BOOLEAN creation, PACCESS_MASK granted, PNTSTATUS access_status, PBOOLEAN on_close)
+{
+    (void)subsystem; (void)handle_id; (void)type_name; (void)object_name; (void)principal; (void)audit_type; (void)flags; (void)types; (void)creation;
+    return audit_check(sd, client_token, desired, mapping, granted, access_status, on_close, type_count ? type_count : 1);
+}
+__declspec(dllexport) NTSTATUS NTAPI NtOpenObjectAuditAlarm(PUNICODE_STRING subsystem, PVOID handle_id, PUNICODE_STRING type_name, PUNICODE_STRING object_name, PSECURITY_DESCRIPTOR sd,
+    HANDLE client_token, ACCESS_MASK desired, ACCESS_MASK granted, PPRIVILEGE_SET privileges, BOOLEAN creation, BOOLEAN access_granted, PBOOLEAN on_close)
+{
+    NTSTATUS status = audit_gate();
+    (void)subsystem; (void)handle_id; (void)type_name; (void)object_name; (void)sd; (void)client_token; (void)desired; (void)granted; (void)privileges; (void)creation; (void)access_granted;
+    if (status) return status;
+    if (!on_close) return STATUS_ACCESS_VIOLATION_;
+    *on_close = FALSE;
+    return STATUS_SUCCESS;
+}
+__declspec(dllexport) NTSTATUS NTAPI NtCloseObjectAuditAlarm(PUNICODE_STRING subsystem, PVOID handle_id, BOOLEAN on_close)
+{
+    (void)subsystem; (void)handle_id; (void)on_close;
+    return audit_gate();
+}
+__declspec(dllexport) NTSTATUS NTAPI NtDeleteObjectAuditAlarm(PUNICODE_STRING subsystem, PVOID handle_id, BOOLEAN on_close)
+{
+    (void)subsystem; (void)handle_id; (void)on_close;
+    return audit_gate();
+}
+__declspec(dllexport) NTSTATUS NTAPI NtPrivilegeObjectAuditAlarm(PUNICODE_STRING subsystem, PVOID handle_id, HANDLE client_token, ACCESS_MASK desired, PPRIVILEGE_SET privileges, BOOLEAN granted)
+{
+    (void)subsystem; (void)handle_id; (void)client_token; (void)desired; (void)privileges; (void)granted;
+    return audit_gate();
+}
+__declspec(dllexport) NTSTATUS NTAPI NtPrivilegedServiceAuditAlarm(PUNICODE_STRING subsystem, PUNICODE_STRING service, HANDLE client_token, PPRIVILEGE_SET privileges, BOOLEAN granted)
+{
+    (void)subsystem; (void)service; (void)client_token; (void)privileges; (void)granted;
+    return audit_gate();
 }
 
 /* ---- security descriptors of objects --------------------------------------------------------------------------------------------------------------- */
@@ -1619,6 +1748,16 @@ ZW_ALIAS(ZwPrivilegeCheck, NtPrivilegeCheck);
 ZW_ALIAS(ZwAllocateLocallyUniqueId, NtAllocateLocallyUniqueId);
 ZW_ALIAS(ZwCreateToken, NtCreateToken);
 ZW_ALIAS(ZwAccessCheck, NtAccessCheck);
+ZW_ALIAS(ZwImpersonateAnonymousToken, NtImpersonateAnonymousToken);
+ZW_ALIAS(ZwAccessCheckAndAuditAlarm, NtAccessCheckAndAuditAlarm);
+ZW_ALIAS(ZwAccessCheckByTypeAndAuditAlarm, NtAccessCheckByTypeAndAuditAlarm);
+ZW_ALIAS(ZwAccessCheckByTypeResultListAndAuditAlarm, NtAccessCheckByTypeResultListAndAuditAlarm);
+ZW_ALIAS(ZwAccessCheckByTypeResultListAndAuditAlarmByHandle, NtAccessCheckByTypeResultListAndAuditAlarmByHandle);
+ZW_ALIAS(ZwOpenObjectAuditAlarm, NtOpenObjectAuditAlarm);
+ZW_ALIAS(ZwCloseObjectAuditAlarm, NtCloseObjectAuditAlarm);
+ZW_ALIAS(ZwDeleteObjectAuditAlarm, NtDeleteObjectAuditAlarm);
+ZW_ALIAS(ZwPrivilegeObjectAuditAlarm, NtPrivilegeObjectAuditAlarm);
+ZW_ALIAS(ZwPrivilegedServiceAuditAlarm, NtPrivilegedServiceAuditAlarm);
 ZW_ALIAS(ZwAccessCheckByType, NtAccessCheckByType);
 ZW_ALIAS(ZwAccessCheckByTypeResultList, NtAccessCheckByTypeResultList);
 ZW_ALIAS(ZwQuerySecurityObject, NtQuerySecurityObject);

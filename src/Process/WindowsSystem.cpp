@@ -18,6 +18,7 @@
 #include "Process/WindowsSystem.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace process::windowsabi {
@@ -45,6 +46,15 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
   if (runtime) runtime->memory_status(&total, &available);
   Answer a;
   uint32_t size = 0;
+  if (info_class == 0x1000) {      // this OS's own: Length bytes from the system's random source (what RtlGenRandom, BCryptGenRandom and CryptGenRandom are made of)
+    if (length == 0 || length > 0x10000) return 0xC000000Du;
+    ByteBuffer bytes(p.files().allocator());
+    if (!bytes.put_zeros(length)) return 0xC0000017u;
+    if (!p.host().random_bytes(bytes.writable_view())) return 0xC00000BBu;      // STATUS_NOT_SUPPORTED: no source
+    if (!p.write_user(buffer, bytes.view())) return 0xC0000005u;
+    if (returned != 0 && !p.write_user_u32(returned, length)) return 0xC0000005u;
+    return 0;
+  }
   switch (info_class) {
     case 0: {      // SYSTEM_BASIC_INFORMATION
       const uint64_t pages = total / 4096;
@@ -360,6 +370,25 @@ uint32_t nt_query_system_information_ex(Process& p, const SyscallRequest& r) {
   if (returned != 0 && !p.write_user_u32(returned, uint32_t(answer.size()))) return kAccessViolation;
   if (length < answer.size()) return info_class == kSystemCpuSetInformation ? kBufferTooSmall : kInfoLengthMismatch;
   return p.write_user(r.args[3], answer.view()) ? kSuccess : kAccessViolation;
+}
+
+namespace {
+volatile uint32_t g_shutdown_request = 0;      // 0 none, 1 shut down, 2 restart
+}  // namespace
+
+uint32_t nt_shutdown_system(Process& p, const SyscallRequest& r) {
+  const uint32_t action = static_cast<uint32_t>(r.args[0]);
+  if (action > 2) return 0xC000000Du;                                  // STATUS_INVALID_PARAMETER
+  if (!caller_privilege_enabled(p, 19 /* SeShutdownPrivilege */)) return 0xC0000061u;      // STATUS_PRIVILEGE_NOT_HELD
+  __atomic_store_n(&g_shutdown_request, action == 1 ? 2u : 1u, __ATOMIC_RELEASE);
+  return 0;
+}
+
+bool take_system_shutdown(bool* restart) {
+  const uint32_t request = __atomic_exchange_n(&g_shutdown_request, 0u, __ATOMIC_ACQ_REL);
+  if (request == 0) return false;
+  *restart = request == 2;
+  return true;
 }
 
 }  // namespace process::windowsabi

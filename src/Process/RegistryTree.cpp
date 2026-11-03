@@ -141,7 +141,7 @@ uint32_t RegistryTree::new_key(uint32_t parent, StringView name, uint64_t now) {
     keys_.remove_at(id);
     return ~0u;
   }
-  if (RegKey* p = key(parent)) { p->write_time = now; ++p->changes; ++total_changes; }
+  if (RegKey* p = key(parent)) p->write_time = now;
   return id;
 }
 
@@ -213,50 +213,10 @@ uint32_t RegistryTree::delete_key(uint32_t id) {
   k->deleted = true;
   RegKey* parent = key(k->parent);
   if (parent) {
-    { ++parent->changes; ++total_changes; }
     for (uint64_t i = 0; i < parent->subkeys.count(); ++i) if (parent->subkeys[i] == id) { parent->subkeys.remove_at(i); break; }
   }
   drop_if_unused(id);
   return kRegSuccess;
-}
-
-uint32_t RegistryTree::rename_key(uint32_t id, StringView name, uint64_t now) {
-  RegKey* k = key(id);
-  if (!k || k->deleted) return kRegKeyDeleted;
-  if (id == kRoot) return kRegInvalidParameter;
-  if (!valid_key_name(name)) return kRegInvalidParameter;
-  const uint32_t clash = find_child(k->parent, name);
-  if (clash != ~0u && clash != id) return kRegNameCollision;
-  RegKey* parent = key(k->parent);
-  if (!parent) return kRegKeyDeleted;
-  for (uint64_t i = 0; i < parent->subkeys.count(); ++i) if (parent->subkeys[i] == id) { parent->subkeys.remove_at(i); break; }
-  if (!k->name.assign(name)) return kRegNoMemory;
-  if (!link_child(k->parent, id)) return kRegNoMemory;
-  k->write_time = now;
-  parent->write_time = now;
-  note_change(id);
-  note_change(k->parent);
-  return kRegSuccess;
-}
-
-uint32_t RegistryTree::open_handles_below(uint32_t id) const {
-  const RegKey* k = key(id);
-  if (!k || k->deleted) return 0;
-  uint32_t n = k->open_handles;
-  for (uint64_t i = 0; i < k->subkeys.count(); ++i) n += open_handles_below(k->subkeys[i]);
-  return n;
-}
-
-uint64_t RegistryTree::change_count(uint32_t id) const {
-  const RegKey* k = key(id);
-  if (!k || k->deleted) return 0;
-  uint64_t n = k->changes;
-  for (uint64_t i = 0; i < k->subkeys.count(); ++i) n += change_count(k->subkeys[i]);
-  return n;
-}
-
-void RegistryTree::note_change(uint32_t id) {
-  if (RegKey* k = key(id)) { ++k->changes; ++total_changes; }
 }
 
 const RegValue* RegistryTree::find_value(uint32_t id, StringView name) const {
@@ -281,7 +241,6 @@ uint32_t RegistryTree::set_value(uint32_t id, StringView name, uint32_t type, Co
       replacement->type = type;
       v = static_cast<UniquePointer<RegValue>&&>(replacement);
       k->write_time = now;
-      { ++k->changes; ++total_changes; }
       return kRegSuccess;
     }
   }
@@ -290,7 +249,6 @@ uint32_t RegistryTree::set_value(uint32_t id, StringView name, uint32_t type, Co
   fresh->type = type;
   if (!k->values.push_back(static_cast<UniquePointer<RegValue>&&>(fresh))) return kRegNoMemory;
   k->write_time = now;
-  { ++k->changes; ++total_changes; }
   return kRegSuccess;
 }
 
@@ -302,11 +260,166 @@ uint32_t RegistryTree::delete_value(uint32_t id, StringView name, uint64_t now) 
     if (v && names_equal(v->name.view(), name)) {
       k->values.remove_at(i);
       k->write_time = now;
-      { ++k->changes; ++total_changes; }
       return kRegSuccess;
     }
   }
   return kRegNameNotFound;
+}
+
+uint32_t RegistryTree::rename_key(uint32_t id, StringView new_name, uint64_t now) {
+  RegKey* k = key(id);
+  if (!k || k->deleted) return kRegKeyDeleted;
+  if (id == kRoot || k->parent == kRoot) return kRegCannotDelete;
+  if (!valid_key_name(new_name)) return kRegInvalidParameter;
+  const uint32_t clash = find_child(k->parent, new_name);
+  if (clash != ~0u) return clash == id && compare_names(k->name.view(), new_name) == 0 ? kRegSuccess : kRegNameCollision;
+  RegKey* parent = key(k->parent);
+  if (!parent) return kRegKeyDeleted;
+  for (uint64_t i = 0; i < parent->subkeys.count(); ++i) if (parent->subkeys[i] == id) { parent->subkeys.remove_at(i); break; }
+  if (!k->name.assign(new_name) || !link_child(k->parent, id)) return kRegNoMemory;
+  k->write_time = now;
+  parent->write_time = now;
+  return kRegSuccess;
+}
+
+uint32_t RegistryTree::delete_tree(uint32_t id) {
+  RegKey* k = key(id);
+  if (!k || k->deleted) return kRegKeyDeleted;
+  if (id == kRoot) return kRegCannotDelete;
+  while (k->subkeys.count() != 0) {      // (delete_key takes the child out of the list, so the last one is always the next)
+    const uint32_t child = k->subkeys[k->subkeys.count() - 1];
+    const uint32_t status = alive(child) ? delete_tree(child) : kRegSuccess;
+    if (status != kRegSuccess) return status;
+    if (k->subkeys.count() != 0 && k->subkeys[k->subkeys.count() - 1] == child) k->subkeys.remove_at(k->subkeys.count() - 1);
+  }
+  return delete_key(id);
+}
+
+bool RegistryTree::has_open_handles(uint32_t id) const {
+  const RegKey* k = key(id);
+  if (!k || k->deleted) return false;
+  if (k->open_handles != 0) return true;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (has_open_handles(k->subkeys[i])) return true;
+  return false;
+}
+
+uint32_t RegistryTree::count_open_keys(uint32_t id) const {
+  const RegKey* k = key(id);
+  if (!k || k->deleted) return 0;
+  uint32_t n = k->open_handles != 0 ? 1 : 0;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) n += count_open_keys(k->subkeys[i]);
+  return n;
+}
+
+namespace {
+constexpr uint32_t kImageMagic = 0x48524354u;      // "TCRH"
+constexpr uint32_t kImageVersion = 1;
+bool put_text(ByteBuffer* out, StringView text) { return text.size() <= 0xFFFFFFFFu && out->put32(static_cast<uint32_t>(text.size())) && out->append(ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size())); }
+}  // namespace
+
+bool RegistryTree::save_node(uint32_t id, ByteBuffer* out, uint32_t depth) const {
+  const RegKey* k = key(id);
+  if (!k || k->deleted || depth > kRegMaxDepth) return false;
+  if (!put_text(out, k->name.view()) || !out->put32(k->volatile_key ? 1u : 0u) || !out->put32(static_cast<uint32_t>(k->write_time)) || !out->put32(static_cast<uint32_t>(k->write_time >> 32))) return false;
+  if (!out->put32(static_cast<uint32_t>(k->values.count()))) return false;
+  for (uint64_t i = 0; i < k->values.count(); ++i) {
+    const UniquePointer<RegValue>& v = k->values[i];
+    if (!v || !put_text(out, v->name.view()) || !out->put32(v->type) || !out->put32(static_cast<uint32_t>(v->data.size())) || !out->append(v->data.view())) return false;
+  }
+  uint32_t live = 0;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (alive(k->subkeys[i])) ++live;
+  if (!out->put32(live)) return false;
+  for (uint64_t i = 0; i < k->subkeys.count(); ++i) if (alive(k->subkeys[i]) && !save_node(k->subkeys[i], out, depth + 1)) return false;
+  return true;
+}
+
+bool RegistryTree::save(uint32_t id, ByteBuffer* out) const {
+  return out->put32(kImageMagic) && out->put32(kImageVersion) && save_node(id, out, 0);
+}
+
+// Walks one node without making anything: every length is checked against what is left, so that restore() can run on an image that is known to parse.
+bool RegistryTree::check_node(ByteReader& in, uint32_t depth) {
+  if (depth > kRegMaxDepth) return false;
+  const uint32_t name_size = in.le32();
+  if (!in.ok() || name_size > in.remaining()) return false;
+  const ConstByteView name = in.take(name_size);
+  if (depth != 0 && !valid_key_name(StringView(reinterpret_cast<const char*>(name.data()), name.size()))) return false;
+  in.le32();
+  in.le64();
+  const uint32_t values = in.le32();
+  if (!in.ok() || values > in.remaining() / 12) return false;
+  for (uint32_t i = 0; i < values; ++i) {
+    const uint32_t value_name = in.le32();
+    if (!in.ok() || value_name > in.remaining()) return false;
+    const ConstByteView text = in.take(value_name);
+    if (utf16_units(StringView(reinterpret_cast<const char*>(text.data()), text.size())) > kRegMaxValueNameChars) return false;
+    in.le32();
+    const uint32_t size = in.le32();
+    if (!in.ok() || size > kRegMaxValueBytes || size > in.remaining()) return false;
+    in.skip(size);
+  }
+  const uint32_t subkeys = in.le32();
+  if (!in.ok() || subkeys > in.remaining() / 24) return false;
+  for (uint32_t i = 0; i < subkeys; ++i) if (!check_node(in, depth + 1)) return false;
+  return in.ok();
+}
+
+bool RegistryTree::valid_image(ConstByteView image) {
+  ByteReader in(image);
+  if (in.le32() != kImageMagic || in.le32() != kImageVersion || !in.ok()) return false;
+  return check_node(in, 0) && in.at_end();
+}
+
+uint32_t RegistryTree::restore_node(uint32_t id, ByteReader& in, uint64_t now, uint32_t depth) {
+  const uint32_t name_size = in.le32();
+  in.skip(name_size);      // (the top key keeps its own name; a subkey's name was read by the caller)
+  const uint32_t flags = in.le32();
+  in.le64();
+  if (RegKey* k = key(id)) k->volatile_key = (flags & 1) != 0;
+  const uint32_t values = in.le32();
+  for (uint32_t i = 0; i < values; ++i) {
+    const uint32_t value_name = in.le32();
+    const ConstByteView text = in.take(value_name);
+    const uint32_t type = in.le32();
+    const uint32_t size = in.le32();
+    const ConstByteView data = in.take(size);
+    if (!in.ok()) return kRegInvalidParameter;
+    const uint32_t status = set_value(id, StringView(reinterpret_cast<const char*>(text.data()), text.size()), type, data, now);
+    if (status != kRegSuccess) return status;
+  }
+  const uint32_t subkeys = in.le32();
+  for (uint32_t i = 0; i < subkeys; ++i) {
+    ByteReader peek = in;      // the child's name comes first in its node: read it here, then let the child's own pass skip it
+    const uint32_t child_name = peek.le32();
+    const ConstByteView text = peek.take(child_name);
+    if (!peek.ok()) return kRegInvalidParameter;
+    const StringView name(reinterpret_cast<const char*>(text.data()), text.size());
+    uint32_t child = find_child(id, name);
+    if (child == ~0u) child = new_key(id, name, now);
+    if (child == ~0u) return kRegNoMemory;
+    const uint32_t status = restore_node(child, in, now, depth + 1);
+    if (status != kRegSuccess) return status;
+  }
+  return in.ok() ? kRegSuccess : kRegInvalidParameter;
+}
+
+uint32_t RegistryTree::restore(uint32_t id, ConstByteView image, bool replace, uint64_t now) {
+  if (!alive(id)) return kRegKeyDeleted;
+  if (!valid_image(image)) return kRegInvalidParameter;
+  if (replace) {
+    RegKey* k = key(id);
+    k->values.clear();
+    while (k->subkeys.count() != 0) {
+      const uint32_t child = k->subkeys[k->subkeys.count() - 1];
+      const uint64_t before = k->subkeys.count();
+      if (alive(child)) delete_tree(child);
+      if (k->subkeys.count() == before) k->subkeys.remove_at(before - 1);
+    }
+  }
+  ByteReader in(image);
+  in.le32();
+  in.le32();
+  return restore_node(id, in, now, 0);
 }
 
 RegistryTree::Statistics RegistryTree::statistics(uint32_t id) const {

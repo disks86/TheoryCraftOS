@@ -2085,6 +2085,14 @@ void ObjectManager::abandon_thread(uint64_t thread) {
 void ObjectManager::abandon_process(uint64_t process) {
   Locked hold(sync_);
   bool any = false;
+  for (Object& o : objects_) {      // the registry watches the process left behind
+    if (o.kind != ObjectKind::ChangeNotification || o.watch < 0 || !watches_) continue;
+    Watch& w = watches_[o.watch];
+    if (w.event_object == 0 || w.owner != process) continue;
+    release_locked(w.event_object);
+    w.event_object = 0;
+    release_locked(static_cast<uint32_t>(&o - objects_) + 1);
+  }
   for (Object& o : objects_) {
     if (o.kind != ObjectKind::Mutex || o.owner == 0 || (o.owner & 0xFFFFF) != process) continue;      // (a thread id carries its process's id in the low 20 bits)
     o.owner = 0;
@@ -2441,10 +2449,35 @@ bool watch_covers(StringView watched, bool subtree, StringView entry_path, uint6
 
 }  // namespace
 
+ObjectManager::Created ObjectManager::create_key_watch(StringView path, bool watch_subtree, uint32_t filter, uint32_t event_object, uint64_t owner) {
+  Created result = create_change_notification(path, watch_subtree, filter);
+  if (result.id == 0) return result;
+  Locked hold(sync_);
+  Object* o = at(result.id);
+  if (!o || o->watch < 0) return result;
+  Watch& w = watches_[o->watch];
+  w.want_data = false;
+  if (event_object != 0) {
+    Object* event = at(event_object);
+    if (!event || event->kind != ObjectKind::Event) { release_locked(result.id); result.id = 0; result.status = kInvalidHandle; return result; }
+    ++event->references;
+    w.event_object = event_object;
+    w.owner = owner;
+  }
+  return result;
+}
+
+bool ObjectManager::key_watch_fired_locked(uint32_t id) {
+  Object* o = at(id);
+  return o && o->kind == ObjectKind::ChangeNotification && o->signaled;
+}
+
 void ObjectManager::notify_entry_changed(StringView changed_path, uint32_t action, uint32_t filter_mask) {
   Locked hold(sync_);
   if (!watches_) return;
   bool any = false;
+  uint32_t finished[16];
+  uint32_t finished_count = 0;
   for (Object& o : objects_) {
     if (o.kind != ObjectKind::ChangeNotification || o.watch < 0) continue;
     Watch& w = watches_[o.watch];
@@ -2457,6 +2490,12 @@ void ObjectManager::notify_entry_changed(StringView changed_path, uint32_t actio
     if (filter_mask != 0 && (w.filter & filter_mask) == 0) continue;
     o.signaled = true;
     any = true;
+    if (w.event_object != 0 && finished_count < 16) {      // a registry watch of the kernel: it signals its event, and it is over
+      if (Object* event = at(w.event_object)) { event->signaled = true; release_locked(w.event_object); }
+      w.event_object = 0;
+      finished[finished_count++] = static_cast<uint32_t>(&o - objects_) + 1;
+      continue;
+    }
     if (!w.want_data) { w.overflow = true; if (w.waiters != 0) w.owes_ack = true; continue; }
     const StringView name = changed_path.without_prefix(start);
     bool duplicate = false;      // one record for a run of changes of the same entry
@@ -2477,6 +2516,7 @@ void ObjectManager::notify_entry_changed(StringView changed_path, uint32_t actio
     ++w.record_count;
     if (w.waiters != 0) w.owes_ack = true;
   }
+  for (uint32_t i = 0; i < finished_count; ++i) release_locked(finished[i]);
   if (any) sync_.notify_all();
 }
 

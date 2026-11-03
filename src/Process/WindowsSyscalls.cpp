@@ -349,6 +349,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSetValueKey: return windowsabi::nt_set_value_key(process, r);
       case WindowsSyscallNumber::NtDeleteKey: return windowsabi::nt_delete_key(process, r);
       case WindowsSyscallNumber::NtDeleteValueKey: return windowsabi::nt_delete_value_key(process, r);
+      case WindowsSyscallNumber::NtShutdownSystem: return windowsabi::nt_shutdown_system(process, r);
       case WindowsSyscallNumber::NtFlushKey: return windowsabi::nt_flush_key(process, r);
       case WindowsSyscallNumber::NtAlertThread: return windowsabi::nt_alert_thread(process, r);
       case WindowsSyscallNumber::NtAlertResumeThread: return windowsabi::nt_alert_resume_thread(process, r);
@@ -381,7 +382,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtMakeTemporaryObject: return windowsabi::nt_make_object_temporary(process, r);
       case WindowsSyscallNumber::NtMakePermanentObject: return windowsabi::nt_make_object_permanent(process, r);
       case WindowsSyscallNumber::NtSetSystemTime: case WindowsSyscallNumber::NtSetSystemInformation: case WindowsSyscallNumber::NtLoadDriver: case WindowsSyscallNumber::NtUnloadDriver:
-      case WindowsSyscallNumber::NtShutdownSystem: case WindowsSyscallNumber::NtInitiatePowerAction: case WindowsSyscallNumber::NtSetSystemPowerState:
+      case WindowsSyscallNumber::NtInitiatePowerAction: case WindowsSyscallNumber::NtSetSystemPowerState:
       case WindowsSyscallNumber::NtCreatePagingFile: case WindowsSyscallNumber::NtSystemDebugControl: case WindowsSyscallNumber::NtSetLdtEntries:
         return windowsabi::nt_privilege_not_held(process, r);
       case WindowsSyscallNumber::NtCreatePort: case WindowsSyscallNumber::NtCreateWaitablePort: return windowsabi::nt_create_port(process, r);
@@ -414,21 +415,29 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtDeleteWnfStateName: return windowsabi::nt_delete_wnf_state_name(process, r);
       case WindowsSyscallNumber::NtQueryWnfStateNameInformation: return windowsabi::nt_query_wnf_state_name_information(process, r);
       case WindowsSyscallNumber::NtGetNextThread: return windowsabi::nt_get_next_thread(process, r);
-      case WindowsSyscallNumber::NtQueryMultipleValueKey: return windowsabi::nt_query_multiple_value_key(process, r);
-      case WindowsSyscallNumber::NtRenameKey: return windowsabi::nt_rename_key(process, r);
-      case WindowsSyscallNumber::NtSetInformationKey: return windowsabi::nt_set_information_key(process, r);
-      case WindowsSyscallNumber::NtQueryOpenSubKeys: return windowsabi::nt_query_open_sub_keys(process, r);
-      case WindowsSyscallNumber::NtNotifyChangeKey: return windowsabi::nt_notify_change_key(process, r);
       case WindowsSyscallNumber::NtQueryLicenseValue: return kStatusObjectNameNotFound;
       case WindowsSyscallNumber::NtQueryEaFile: case WindowsSyscallNumber::NtSetEaFile: return 0xC000004Fu;      // STATUS_EAS_NOT_SUPPORTED
       case WindowsSyscallNumber::NtQueryQuotaInformationFile: case WindowsSyscallNumber::NtSetQuotaInformationFile: return 0xC00000BBu;
       case WindowsSyscallNumber::NtSetVolumeInformationFile: case WindowsSyscallNumber::NtSetInformationSymbolicLink: return 0xC00000BBu;
-      case WindowsSyscallNumber::NtLoadKey: case WindowsSyscallNumber::NtLoadKey2: case WindowsSyscallNumber::NtLoadKey3: case WindowsSyscallNumber::NtLoadKeyEx:
-      case WindowsSyscallNumber::NtUnloadKey: case WindowsSyscallNumber::NtUnloadKey2: case WindowsSyscallNumber::NtUnloadKeyEx: case WindowsSyscallNumber::NtSaveKey:
-      case WindowsSyscallNumber::NtSaveKeyEx: case WindowsSyscallNumber::NtSaveMergedKeys: case WindowsSyscallNumber::NtRestoreKey: case WindowsSyscallNumber::NtReplaceKey:
-      case WindowsSyscallNumber::NtCompactKeys: case WindowsSyscallNumber::NtCompressKey: case WindowsSyscallNumber::NtLockRegistryKey: case WindowsSyscallNumber::NtFreezeRegistry:
       case WindowsSyscallNumber::NtThawRegistry: case WindowsSyscallNumber::NtInitializeRegistry:      // hives are not kept in files: nothing can be loaded, saved or replaced
         return windowsabi::nt_privilege_not_held(process, r);
+      case WindowsSyscallNumber::NtRenameKey: return windowsabi::nt_rename_key(process, r);
+      case WindowsSyscallNumber::NtQueryMultipleValueKey: return windowsabi::nt_query_multiple_value_key(process, r);
+      case WindowsSyscallNumber::NtSetInformationKey: return windowsabi::nt_set_information_key(process, r);
+      case WindowsSyscallNumber::NtNotifyChangeKey: return windowsabi::nt_notify_change_key(process, r);
+      case WindowsSyscallNumber::NtNotifyChangeMultipleKeys: return windowsabi::nt_notify_change_multiple_keys(process, r);
+      case WindowsSyscallNumber::NtSaveKey: return windowsabi::nt_save_key(process, r);
+      case WindowsSyscallNumber::NtSaveKeyEx: return windowsabi::nt_save_key_ex(process, r);
+      case WindowsSyscallNumber::NtRestoreKey: return windowsabi::nt_restore_key(process, r);
+      case WindowsSyscallNumber::NtReplaceKey: return windowsabi::nt_replace_key(process, r);
+      case WindowsSyscallNumber::NtLoadKey: case WindowsSyscallNumber::NtLoadKey2: return windowsabi::nt_load_key(process, r);
+      case WindowsSyscallNumber::NtLoadKeyEx: case WindowsSyscallNumber::NtLoadKey3: return windowsabi::nt_load_key_ex(process, r);
+      case WindowsSyscallNumber::NtUnloadKey: case WindowsSyscallNumber::NtUnloadKey2: case WindowsSyscallNumber::NtUnloadKeyEx: return windowsabi::nt_unload_key(process, r);
+      case WindowsSyscallNumber::NtQueryOpenSubKeys: return windowsabi::nt_query_open_sub_keys(process, r);
+      case WindowsSyscallNumber::NtCompactKeys: return windowsabi::nt_compact_keys(process, r);
+      case WindowsSyscallNumber::NtLockRegistryKey: return windowsabi::nt_lock_registry_key(process, r);
+      case WindowsSyscallNumber::NtCreateKeyTransacted: return windowsabi::nt_create_key_transacted(process, r);
+      case WindowsSyscallNumber::NtOpenKeyTransacted: case WindowsSyscallNumber::NtOpenKeyTransactedEx: return windowsabi::nt_open_key_transacted(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.
       default:
