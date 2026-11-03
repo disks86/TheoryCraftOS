@@ -219,7 +219,7 @@ uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   f.exclusive = flags & kOExcl;
   f.truncate = (flags & kOTrunc) && f.write;
   f.append = flags & kOAppend;
-  f.must_be_directory = flags & (arch == UserArch::X86_64 ? 0x10000u : 0x4000u);      // O_DIRECTORY
+  f.must_be_directory = flags & (arch == UserArch::AArch64 ? 0x4000u : 0x10000u);      // O_DIRECTORY (AArch64 has its own value; the generic ABIs of x86-64, RISC-V and LoongArch share one)
   uint32_t slot = 0;
   const Status status = files.open(virtual_path.view(), f, &slot);
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return error(kEmfile);

@@ -23,7 +23,7 @@
 namespace jit {
 
 // The CPU a back end generates code for.
-enum class HostArch : uint8_t { X86_64, AArch64, RiscV64 };
+enum class HostArch : uint8_t { X86_64, AArch64, RiscV64, LoongArch64 };
 
 // The CPU this kernel is built for (and so the only one whose output can be entered), None for a build that has no back end to run.
 constexpr HostArch native_host_arch() {
@@ -31,6 +31,8 @@ constexpr HostArch native_host_arch() {
   return HostArch::X86_64;
 #elif defined(__aarch64__)
   return HostArch::AArch64;
+#elif defined(__loongarch64)
+  return HostArch::LoongArch64;
 #else
   return HostArch::RiscV64;
 #endif

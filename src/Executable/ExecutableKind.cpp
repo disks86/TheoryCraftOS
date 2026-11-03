@@ -41,6 +41,7 @@ Architecture identify_architecture(ConstByteView head) {
       case 62: return Architecture::X86_64;
       case 183: return Architecture::AArch64;
       case 243: return Architecture::RiscV64;
+      case 258: return Architecture::LoongArch64;
       case 3: return Architecture::X86_32;
       case 40: return Architecture::Arm32;
       default: return Architecture::Other;
@@ -55,6 +56,7 @@ Architecture identify_architecture(ConstByteView head) {
     switch (machine) {
       case kPeMachineAmd64: return Architecture::X86_64;
       case kPeMachineArm64: return Architecture::AArch64;
+      case kPeMachineLoongArch64: return Architecture::LoongArch64;
       case kPeMachineI386: return Architecture::X86_32;
       case kPeMachineArm: return Architecture::Arm32;
       default: return Architecture::Other;
@@ -68,6 +70,7 @@ StringView architecture_name(Architecture arch) {
     case Architecture::X86_64: return "x86-64";
     case Architecture::AArch64: return "AArch64";
     case Architecture::RiscV64: return "RISC-V 64";
+    case Architecture::LoongArch64: return "LoongArch 64";
     case Architecture::X86_32: return "x86 (32-bit)";
     case Architecture::Arm32: return "ARM (32-bit)";
     case Architecture::Other: return "an unknown CPU";

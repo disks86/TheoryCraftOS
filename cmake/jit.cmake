@@ -27,9 +27,11 @@ set(TCOS_JIT_PORTABLE_SOURCES
   src/Jit/UefiPageProtector.cpp
   src/Jit/KernelJit.cpp
   src/Jit/Backend/AArch64Backend.cpp
+  src/Jit/Backend/LoongArch64Backend.cpp
   src/Jit/Backend/RiscV64Backend.cpp
   src/Jit/Backend/X86_64Backend.cpp
   src/Jit/Emitter/AArch64Assembler.cpp
+  src/Jit/Emitter/LoongArch64Assembler.cpp
   src/Jit/Emitter/CodeBuffer.cpp
   src/Jit/Emitter/RiscV64Assembler.cpp
   src/Jit/Emitter/X86_64Assembler.cpp

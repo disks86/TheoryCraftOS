@@ -99,6 +99,30 @@ constexpr Vector kVectorMax = 128;
 constexpr uint64_t kSstatusSie = 1u << 1;
 constexpr uint64_t kSstatusSpie = 1u << 5;
 constexpr uint64_t kSstatusSpp = 1u << 8;
+#elif defined(__loongarch64)
+// The register state of an interrupted context, as Arch/LoongArch64/Trap.S saves it on the interrupted stack (lowest
+// address first). A handler returns the frame to resume: the same one, or another context's - which is how threads are
+// switched. Only the integer registers are saved: the image is built for the soft-float ABI, so no kernel code touches
+// floating-point state. x[i] holds register r(i+1) (x[2] is sp, x[3] is a0); r0 is not saved. The assembly relies on
+// these offsets (x at 0, era at 248, prmd at 256).
+struct alignas(16) Frame {
+  uint64_t x[31];    // r1..r31 (x[2] is sp: the interrupted stack pointer, informational - resuming uses the frame's own address)
+  uint64_t era;      // where to resume
+  uint64_t prmd;     // CRMD to resume with: PPLV (privilege) and PIE (interrupt enable)
+  uint64_t estat;    // pending interrupts, exception code (bits 21:16) and sub-code
+  uint64_t badv;     // faulting address
+  uint64_t reserved_;
+};
+static_assert(sizeof(Frame) == 288);
+
+// Vectors are ESTAT.IS interrupt bit numbers plus a pseudo vector for the exception that is not an interrupt.
+using Vector = uint16_t;
+constexpr Vector kVectorTimer = 11;     // the per-core timer: preemption tick
+constexpr Vector kVectorWakeup = 12;    // inter-processor interrupt: look for work
+constexpr Vector kVectorYield = 67;     // pseudo vector: the BREAK that gives up the core
+constexpr Vector kVectorMax = 128;
+constexpr uint64_t kPrmdPie = 1u << 2;  // interrupts enabled when the frame is resumed (PPLV 0: stay in the kernel)
+constexpr uint64_t kCrmdIe = 1u << 2;
 #endif
 
 using InterruptHandler = Frame* (*)(Frame* frame, void* context);
@@ -164,6 +188,22 @@ inline bool irq_enabled() {
   __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
   return sstatus & kSstatusSie;
 }
+#elif defined(__loongarch64)
+// CRMD.IE is the interrupt enable. The saved value is CRMD itself. csrxchg replaces the masked bits and returns the old register.
+inline uint64_t irq_save() { return __builtin_loongarch_csrxchg_d(0, kCrmdIe, 0x0); }
+inline void irq_restore(uint64_t crmd) {
+  if (crmd & kCrmdIe) (void)__builtin_loongarch_csrxchg_d(kCrmdIe, kCrmdIe, 0x0);
+  __asm__ volatile("" ::: "memory");
+}
+inline void irq_enable() {
+  (void)__builtin_loongarch_csrxchg_d(kCrmdIe, kCrmdIe, 0x0);
+  __asm__ volatile("" ::: "memory");
+}
+inline void irq_disable() {
+  (void)__builtin_loongarch_csrxchg_d(0, kCrmdIe, 0x0);
+  __asm__ volatile("" ::: "memory");
+}
+inline bool irq_enabled() { return __builtin_loongarch_csrrd_d(0x0) & kCrmdIe; }
 #else
 #error "No interrupt flag helpers for this architecture"
 #endif
@@ -176,6 +216,8 @@ inline void cpu_relax() {
   __asm__ volatile("yield");
 #elif defined(__riscv)
   __asm__ volatile(".4byte 0x0100000F");   // Zihintpause: a FENCE encoding that is a plain hint on cores without it
+#elif defined(__loongarch64)
+  __asm__ volatile("nop" ::: "memory");    // (no pause instruction; the memory clobber keeps the loop reading memory)
 #endif
 }
 

@@ -25,7 +25,7 @@
 namespace exe {
 
 // IMAGE_FILE_HEADER.Machine
-constexpr uint16_t kPeMachineI386 = 0x014C, kPeMachineAmd64 = 0x8664, kPeMachineArm = 0x01C4, kPeMachineArm64 = 0xAA64;
+constexpr uint16_t kPeMachineI386 = 0x014C, kPeMachineAmd64 = 0x8664, kPeMachineArm = 0x01C4, kPeMachineArm64 = 0xAA64, kPeMachineLoongArch64 = 0x6264;
 // IMAGE_FILE_HEADER.Characteristics
 constexpr uint16_t kPeExecutableImage = 0x0002, kPeDll = 0x2000;
 // Section characteristics

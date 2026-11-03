@@ -130,6 +130,9 @@ static void test_selection() {
   Bytes rv = elf_header(243);
   CHECK(elf.parse(ConstByteView(rv.data(), rv.size())));
   CHECK(bind_executable(elf, &b) && b.arch == UserArch::RiscV64);
+  Bytes la = elf_header(258);
+  CHECK(elf.parse(ConstByteView(la.data(), la.size())));
+  CHECK(bind_executable(elf, &b) && b.abi == SyscallAbi::Linux && b.arch == UserArch::LoongArch64 && b.interface && b.interface->arch() == UserArch::LoongArch64);
 
   b = ProcessBinding{};
   Bytes bsd = elf_header(62, 2, 1, 9);           // FreeBSD
@@ -174,6 +177,8 @@ static void test_decode() {
   for (int i = 0; i < 32; ++i) x[i] = 100 + i;
   CHECK(decode_aarch64_linux(ArrayView<const uint64_t>(x, 31), &q) && q.number == 108 && q.args[0] == 100 && q.args[5] == 105);
   CHECK(decode_riscv64_linux(ArrayView<const uint64_t>(x, 32), &q) && q.number == 117 && q.args[0] == 110 && q.args[5] == 115);
+  CHECK(decode_loongarch64_linux(ArrayView<const uint64_t>(x, 32), &q) && q.number == 111 && q.args[0] == 104 && q.args[5] == 109);
+  CHECK(!decode_loongarch64_linux(ArrayView<const uint64_t>(x, 12), &q));
   CHECK(!decode_aarch64_linux(ArrayView<const uint64_t>(x, 8), &q));
   CHECK(!decode_riscv64_linux(ArrayView<const uint64_t>(x, 17), &q));
 }

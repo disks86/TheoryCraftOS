@@ -102,6 +102,15 @@ bool CodeBuffer::apply(const Fixup& fixup, uint64_t target) {
       const uint32_t imm = ((i >> 12) & 1u) << 31 | ((i >> 5) & 0x3Fu) << 25 | ((i >> 1) & 0xFu) << 8 | ((i >> 11) & 1u) << 7;
       return patch32(fixup.at, (word & 0x01FFF07Fu) | imm);
     }
+    case FixupKind::LaB26: {
+      if (from_base % 4 != 0 || !fits_signed(from_base / 4, 26) || !read32(fixup.at, &word)) return false;
+      const uint32_t n = static_cast<uint32_t>(from_base / 4);
+      return patch32(fixup.at, (word & 0xFC000000u) | (n & 0xFFFFu) << 10 | (n >> 16 & 0x3FFu));
+    }
+    case FixupKind::LaBranch16: {
+      if (from_base % 4 != 0 || !fits_signed(from_base / 4, 16) || !read32(fixup.at, &word)) return false;
+      return patch32(fixup.at, (word & ~(0xFFFFu << 10)) | (static_cast<uint32_t>(from_base / 4) & 0xFFFFu) << 10);
+    }
   }
   return false;
 }
