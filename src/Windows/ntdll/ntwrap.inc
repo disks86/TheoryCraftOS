@@ -173,3 +173,31 @@ static NTSTATUS boundary_add(BOUNDARY_ *b, const BYTE *sid, ULONG length) {
 }
 EXPORT NTSTATUS NTAPI RtlAddSIDToBoundaryDescriptor(PVOID *descriptor, PVOID sid) { return boundary_add(*descriptor, sid, RtlLengthSid(sid)); }
 EXPORT NTSTATUS NTAPI RtlAddIntegrityLabelToBoundaryDescriptor(PVOID *descriptor, PVOID sid) { return boundary_add(*descriptor, sid, RtlLengthSid(sid)); }
+
+/* ---- ALPC message attributes: a header of two masks followed by the attributes that are allocated, the one with the highest bit first ---- */
+
+EXPORT SIZE_T NTAPI AlpcGetHeaderSize(ULONG flags) {
+  SIZE_T size = 8;      /* ALPC_MESSAGE_ATTRIBUTES: AllocatedAttributes and ValidAttributes */
+  if (flags & 0x80000000u) size += 24;      /* security */
+  if (flags & 0x40000000u) size += 32;      /* data view */
+  if (flags & 0x20000000u) size += 32;      /* context */
+  if (flags & 0x10000000u) size += 24;      /* handle */
+  if (flags & 0x08000000u) size += 24;      /* token */
+  if (flags & 0x04000000u) size += 8;       /* direct */
+  if (flags & 0x02000000u) size += 8;       /* work on behalf of */
+  return size;
+}
+EXPORT NTSTATUS NTAPI AlpcInitializeMessageAttribute(ULONG attributes, PVOID message, SIZE_T buffer_size, SIZE_T *required) {
+  const SIZE_T size = AlpcGetHeaderSize(attributes);
+  if (required) *required = size;
+  if (buffer_size < size) return (NTSTATUS)0xC0000023;      /* STATUS_BUFFER_TOO_SMALL */
+  if (message) { ((ULONG *)message)[0] = attributes; ((ULONG *)message)[1] = 0; }
+  return STATUS_SUCCESS;
+}
+EXPORT PVOID NTAPI AlpcGetMessageAttribute(PVOID message, ULONG attribute) {
+  if (!attribute || (attribute & (attribute - 1)) || !(attribute & 0xFE000000u)) return NULL;
+  const ULONG allocated = ((const ULONG *)message)[0];
+  if (!(allocated & attribute)) return NULL;
+  return (BYTE *)message + AlpcGetHeaderSize(allocated & ~(attribute | (attribute - 1)));
+}
+EXPORT ULONG NTAPI AlpcMaxAllowedMessageLength(void) { return 0x7FFFFFFFu; }

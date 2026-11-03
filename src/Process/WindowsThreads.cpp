@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsPorts.hpp"
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsTokens.hpp"
 #include "Process/AddressSpace.hpp"
@@ -321,6 +322,7 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
   }
   if (ObjectManager* objects = system_objects()) { objects->abandon_thread(record.id); objects->io_cancel_thread(record.id); objects->process_exited(record.id, code); }      // (the second: a handle to the thread from another program)
   debug_thread_exited(p, record.id, code);
+  ports_thread_ended(p.id(), record.id);      // (a server of a port the thread registered with is told)
   if (p.live_threads() == 0) p.terminate(code);
   if (p.runtime()) p.runtime()->notify();
   if (ObjectManager* objects = system_objects()) objects->notify();

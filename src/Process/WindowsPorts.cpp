@@ -201,6 +201,8 @@ uint32_t nt_alpc_create_port(Process& p, const SyscallRequest& r) {
   uint32_t max_message = 0;
   if (r.args[2] != 0) {      // ALPC_PORT_ATTRIBUTES: Flags, SecurityQos (12 bytes), then MaxMessageLength at 0x10
     uint8_t raw[8];
+    if (!p.read_user(r.args[2], ByteView(raw, 4))) return kAccessViolation;
+    if (get32m(raw, 0) & 0x100000u) return kInvalidParameter;      // (a flag that does not exist)
     if (!p.read_user(r.args[2] + 0x10, ByteView(raw, 8))) return kAccessViolation;
     max_message = get32m(raw, 0);
   }
@@ -660,6 +662,49 @@ uint32_t nt_query_information_port(Process& p, const SyscallRequest& r) {
   if (length != 0 && !p.write_user(r.args[2], ConstByteView(zero, length))) return kAccessViolation;
   if (result_at != 0 && !p.write_user_u32(result_at, length)) return kAccessViolation;
   return kSuccess;
+}
+
+namespace {
+struct Termination { bool used = false; uint32_t object = 0; uint64_t pid = 0, tid = 0; };
+Termination g_terminations[64];
+}  // namespace
+
+uint32_t nt_register_thread_terminate_port(Process& p, const SyscallRequest& r) {
+  uint32_t object = 0;
+  if (const uint32_t status = port_object_of(p, r.args[0], &object)) return status;
+  SystemLock lock;
+  for (Termination& t : g_terminations) if (t.used && t.object == object && t.pid == p.id() && t.tid == me_thread(p)) return kSuccess;
+  for (Termination& t : g_terminations) {
+    if (t.used) continue;
+    t = Termination{true, object, p.id(), me_thread(p)};
+    return kSuccess;
+  }
+  return kInsufficientResources;
+}
+
+void ports_thread_ended(uint64_t process, uint64_t thread) {
+  SystemLock lock;
+  if (!lock.sync) return;
+  for (Termination& t : g_terminations) {
+    if (!t.used || t.pid != process || t.tid != thread) continue;
+    t.used = false;
+    const int port = find_port_locked(t.object);
+    if (port < 0) continue;
+    const int peer = peer_locked(port);
+    if (peer < 0) continue;
+    const int slot = new_slot_locked();
+    if (slot < 0) continue;
+    Slot& s = g_slots[slot];
+    s.length = kHeader;
+    put16(s.data, 0, 0);
+    put16(s.data, 2, kHeader);
+    s.pid = process; s.tid = thread;
+    put16(s.data, 4, 6 /* LPC_CLIENT_DIED */);
+    put64m(s.data, 8, process); put64m(s.data, 16, thread);
+    put32m(s.data, 24, g_next_message++);
+    if (!queue_push_locked(peer, slot)) free_slot_locked(slot);
+    else lock.sync->notify_all();
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------- ALPC messages

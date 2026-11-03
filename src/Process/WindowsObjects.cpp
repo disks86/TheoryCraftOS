@@ -1304,7 +1304,7 @@ const char* object_type_name(ObjectKind kind) {
     case ObjectKind::Reserve: return "UserApcReserve";
     case ObjectKind::Directory: return "Directory";
     case ObjectKind::SymbolicLink: return "SymbolicLink";
-    case ObjectKind::Port: return "Port";
+    case ObjectKind::Port: return "ALPC Port";
     default: return "Object";
   }
 }
@@ -1715,7 +1715,7 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Key: type = "Key"; break;
         case DescriptorKind::ObjectDirectory: type = "Directory"; break;
         case DescriptorKind::SymbolicLink: type = "SymbolicLink"; break;
-        case DescriptorKind::Port: type = "Port"; break;
+        case DescriptorKind::Port: type = "ALPC Port"; break;
         default: break;
       }
       uint32_t n = 0;

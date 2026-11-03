@@ -37,6 +37,9 @@ uint32_t nt_request_wait_reply_port(Process& p, const SyscallRequest& r);   // (
 uint32_t nt_reply_port(Process& p, const SyscallRequest& r);                // (PortHandle, PPORT_MESSAGE Reply)
 uint32_t nt_reply_wait_receive_port(Process& p, const SyscallRequest& r, bool with_timeout);   // (PortHandle, PVOID* PortContext, PPORT_MESSAGE Reply, PPORT_MESSAGE Receive[, Timeout])
 uint32_t nt_reply_wait_reply_port(Process& p, const SyscallRequest& r);     // (PortHandle, PPORT_MESSAGE Reply)
+// NtRegisterThreadTerminatePort(PortHandle): when the calling thread ends the other end of the port gets an LPC_CLIENT_DIED message.
+uint32_t nt_register_thread_terminate_port(Process& p, const SyscallRequest& r);
+void ports_thread_ended(uint64_t process, uint64_t thread);
 uint32_t nt_query_information_port(Process& p, const SyscallRequest& r);    // (PortHandle, Class, Buffer, Length, PULONG ReturnLength)
 
 uint32_t nt_alpc_create_port(Process& p, const SyscallRequest& r);          // (PHANDLE, POBJECT_ATTRIBUTES, PALPC_PORT_ATTRIBUTES)

@@ -389,7 +389,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtReplyWaitReceivePortEx: return windowsabi::nt_reply_wait_receive_port(process, r, true);
       case WindowsSyscallNumber::NtReplyWaitReplyPort: return windowsabi::nt_reply_wait_reply_port(process, r);
       case WindowsSyscallNumber::NtQueryInformationPort: return windowsabi::nt_query_information_port(process, r);
-      case WindowsSyscallNumber::NtRegisterThreadTerminatePort: return windowsabi::nt_alpc_validate_port(process, r);
+      case WindowsSyscallNumber::NtRegisterThreadTerminatePort: return windowsabi::nt_register_thread_terminate_port(process, r);
       case WindowsSyscallNumber::NtAlpcCreatePort: return windowsabi::nt_alpc_create_port(process, r);
       case WindowsSyscallNumber::NtAlpcConnectPort: return windowsabi::nt_alpc_connect_port(process, r);
       case WindowsSyscallNumber::NtAlpcAcceptConnectPort: return windowsabi::nt_alpc_accept_connect_port(process, r);
