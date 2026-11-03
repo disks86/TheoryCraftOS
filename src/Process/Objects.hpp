@@ -350,6 +350,13 @@ class ObjectManager {
   // The same for a caller that holds the system lock already (the attempt of wait_until); the mutex is not recursive.
   bool take_watch_records_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count);
 
+  // --- registry key notifications (NtNotifyChangeKey): the same watches, over the names of the registry. A key's path is spelled "/:registry/MACHINE/SOFTWARE/X" (':' is a
+  // character no file name has, so a file never matches it); the registry calls notify_entry_changed() with the key's path and a leaf below it ("name" for a subkey, "\x01" for
+  // a value or the key itself). `filter` bits are REG_NOTIFY_CHANGE_*. With `event_object` (an Event, referenced here) the watch belongs to the kernel: the first matching change signals
+  // the event and the watch goes (one shot, also when `owner` - a process id - ends first). Without, the caller waits for it (key_watch_fired_locked) and releases it.
+  Created create_key_watch(StringView path, bool watch_subtree, uint32_t filter, uint32_t event_object, uint64_t owner);
+  bool key_watch_fired_locked(uint32_t id);
+
   // --- mailslots (kind Mailslot; CreateMailslot/CreateFile(\\.\mailslot\name)): one reader (the handle CreateMailslot returns) and any number of writers, all on this
   // machine - there is no network broadcast here, unlike a real mailslot's domain-wide one. A writer's message is queued whole (never split across reads) until the
   // reader takes it; closing the reader destroys the mailslot (a writer with a handle still open then sees it as gone). `read_timeout_100ns`: ~0 (MAILSLOT_WAIT_FOREVER,
@@ -477,6 +484,8 @@ class ObjectManager {
     uint32_t record_head = 0, record_count = 0;
     bool overflow = false, want_data = true, owes_ack = false;
     uint32_t waiters = 0;
+    uint32_t event_object = 0;      // a registry watch of the kernel: the event it signals once (0: none), and the process it belongs to
+    uint64_t owner = 0;
   };
   void free_watch_locked(Object& o);
 

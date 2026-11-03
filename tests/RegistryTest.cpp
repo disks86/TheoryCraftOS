@@ -80,6 +80,40 @@ int main() {
   tree.release_handle(other);
   CHECK(tree.delete_key(RegistryTree::kRoot) == kRegCannotDelete);
 
+
+  // rename, hive images, trees
+  {
+    uint32_t src = 0, kid = 0, copy = 0, v = 0;
+    CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Img", true, 20, &src, &created) == kRegSuccess);
+    CHECK(tree.resolve(src, "Child", true, 20, &kid, &created) == kRegSuccess && tree.resolve(kid, "Leaf", true, 20, &v, &created) == kRegSuccess);
+    CHECK(tree.set_value(src, "Top", 4, ConstByteView(reinterpret_cast<const uint8_t*>("\x07\x00\x00\x00"), 4), 20) == kRegSuccess);
+    CHECK(tree.set_value(v, "Deep", 3, ConstByteView(reinterpret_cast<const uint8_t*>("abc"), 3), 20) == kRegSuccess);
+    ByteBuffer image(allocator);
+    CHECK(tree.save(src, &image) && RegistryTree::valid_image(image.view()));
+    CHECK(tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Img2", true, 21, &copy, &created) == kRegSuccess);
+    CHECK(tree.restore(copy, image.view(), false, 22) == kRegSuccess);
+    uint32_t leaf2 = 0;
+    CHECK(tree.resolve(copy, "child\\leaf", false, 22, &leaf2, &created) == kRegSuccess && tree.find_value(leaf2, "deep") && tree.find_value(copy, "top"));
+    CHECK(tree.rename_key(copy, "Img3", 23) == kRegSuccess && tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Img3\\Child", false, 23, &leaf2, &created) == kRegSuccess);
+    CHECK(tree.rename_key(copy, "IMG", 23) == kRegNameCollision && tree.rename_key(RegistryTree::kRoot, "x", 1) == kRegCannotDelete);
+    // truncation and bit flips never crash and are refused or accepted whole
+    const ConstByteView whole = image.view();
+    for (uint64_t cut = 0; cut < whole.size(); ++cut) CHECK(!RegistryTree::valid_image(whole.first(cut)));
+    for (uint64_t at = 0; at < whole.size(); ++at) {
+      ByteBuffer flipped(allocator);
+      flipped.append(whole);
+      flipped.writable_view()[at] ^= 0x80;
+      if (RegistryTree::valid_image(flipped.view())) { uint32_t scratch = 0; tree.resolve(RegistryTree::kRoot, "MACHINE\\Software\\Scratch", true, 24, &scratch, &created); tree.restore(scratch, flipped.view(), true, 24); tree.delete_tree(scratch); }
+    }
+    // a tree goes at once; replace empties the key first
+    tree.add_handle(kid);
+    CHECK(tree.has_open_handles(src) && tree.count_open_keys(src) == 1);
+    CHECK(tree.restore(src, image.view(), true, 25) == kRegSuccess && tree.resolve(src, "Child", false, 25, &other, &created) == kRegSuccess && other != kid);
+    tree.release_handle(kid);
+    CHECK(tree.delete_tree(src) == kRegSuccess && !tree.alive(src) && !tree.alive(other));
+    CHECK(tree.delete_tree(RegistryTree::kRoot) == kRegCannotDelete);
+  }
+
   // limits
   char longname[300];
   for (int i = 0; i < 299; ++i) longname[i] = 'a';

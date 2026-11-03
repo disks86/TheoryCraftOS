@@ -35,6 +35,23 @@ uint32_t nt_set_value_key(Process& p, const SyscallRequest& r);
 uint32_t nt_delete_key(Process& p, const SyscallRequest& r);
 uint32_t nt_delete_value_key(Process& p, const SyscallRequest& r);
 uint32_t nt_flush_key(Process& p, const SyscallRequest& r);
+uint32_t nt_rename_key(Process& p, const SyscallRequest& r);
+uint32_t nt_query_multiple_value_key(Process& p, const SyscallRequest& r);
+uint32_t nt_set_information_key(Process& p, const SyscallRequest& r);
+uint32_t nt_notify_change_key(Process& p, const SyscallRequest& r);
+uint32_t nt_notify_change_multiple_keys(Process& p, const SyscallRequest& r);
+uint32_t nt_save_key(Process& p, const SyscallRequest& r);
+uint32_t nt_save_key_ex(Process& p, const SyscallRequest& r);
+uint32_t nt_restore_key(Process& p, const SyscallRequest& r);
+uint32_t nt_replace_key(Process& p, const SyscallRequest& r);
+uint32_t nt_load_key(Process& p, const SyscallRequest& r);       // NtLoadKey, NtLoadKey2
+uint32_t nt_load_key_ex(Process& p, const SyscallRequest& r);    // NtLoadKeyEx, NtLoadKey3
+uint32_t nt_unload_key(Process& p, const SyscallRequest& r);     // NtUnloadKey, NtUnloadKey2, NtUnloadKeyEx
+uint32_t nt_query_open_sub_keys(Process& p, const SyscallRequest& r);
+uint32_t nt_compact_keys(Process& p, const SyscallRequest& r);
+uint32_t nt_lock_registry_key(Process& p, const SyscallRequest& r);
+uint32_t nt_create_key_transacted(Process& p, const SyscallRequest& r);
+uint32_t nt_open_key_transacted(Process& p, const SyscallRequest& r);
 // Closing, duplicating or inheriting a key handle.
 void key_token_add(uint64_t token);
 void key_token_release(uint64_t token);

@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
+#include "Utility/ByteStream.hpp"
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -40,8 +41,9 @@ struct RegValue {
 };
 
 struct RegKey {
-  explicit RegKey(allocators::IAllocator& allocator) : name(allocator), subkeys(allocator), values(allocator) {}
+  explicit RegKey(allocators::IAllocator& allocator) : name(allocator), hive_file(allocator), subkeys(allocator), values(allocator) {}
   String name;
+  String hive_file;                          // a hive loaded with NtLoadKey: the cleaned virtual path of its file (written back by NtFlushKey and NtUnloadKey)
   uint32_t parent = 0;
   List<uint32_t> subkeys;                    // ids, in alphabetical order without regard to case
   List<UniquePointer<RegValue>> values;      // in the order they were made
@@ -49,6 +51,7 @@ struct RegKey {
   uint32_t open_handles = 0;
   bool deleted = false;
   bool volatile_key = false;
+  bool loaded_hive = false;
 };
 
 class RegistryTree {
@@ -81,6 +84,24 @@ class RegistryTree {
   struct Statistics { uint32_t subkeys = 0, values = 0, max_subkey_name_bytes = 0, max_value_name_bytes = 0, max_value_data_bytes = 0; };
   Statistics statistics(uint32_t id) const;
 
+  // NtRenameKey: the key keeps its values and subkeys under another name. kRegNameCollision if a sibling has that name; the root and the hives directly under it cannot be renamed.
+  uint32_t rename_key(uint32_t id, StringView new_name, uint64_t now);
+  // Deletes the key and everything under it (a key with open handles stays until the last is closed, like delete_key). The root cannot be deleted.
+  uint32_t delete_tree(uint32_t id);
+  // True if the key or a key under it has a handle open (NtUnloadKey refuses such a hive).
+  bool has_open_handles(uint32_t id) const;
+
+  // Hive images (NtSaveKey, NtRestoreKey, NtLoadKey): the key with all its values and subkeys as one block of bytes, in this registry's own format ("TCRH", a version, then
+  // the keys depth first: name, flags, write time, values, subkeys). `restore` reads one into key `id`: the image's top key's values are set on it, its subkeys are made under it.
+  // `replace`: the key's own values and subkeys are deleted first, else the two are merged (what the image holds wins). kRegInvalidParameter for an image that does not parse;
+  // nothing is changed in that case when `replace` is false or the image is checked first (it always is).
+  bool save(uint32_t id, ByteBuffer* out) const;
+  static bool valid_image(ConstByteView image);
+  uint32_t restore(uint32_t id, ConstByteView image, bool replace, uint64_t now);
+
+  // NtQueryOpenSubKeys: how many keys at or under `id` have a handle open.
+  uint32_t count_open_keys(uint32_t id) const;
+
   static bool names_equal(StringView a, StringView b);
   static bool valid_key_name(StringView name);
 
@@ -89,6 +110,9 @@ class RegistryTree {
   uint32_t find_child(uint32_t parent, StringView name) const;
   bool link_child(uint32_t parent, uint32_t child);
   void drop_if_unused(uint32_t id);
+  bool save_node(uint32_t id, ByteBuffer* out, uint32_t depth) const;
+  static bool check_node(ByteReader& in, uint32_t depth);
+  uint32_t restore_node(uint32_t id, ByteReader& in, uint64_t now, uint32_t depth);
 
   allocators::IAllocator& allocator_;
   List<UniquePointer<RegKey>> keys_;
