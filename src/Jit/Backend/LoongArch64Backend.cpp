@@ -221,6 +221,8 @@ bool LoongArch64Backend::compile(const IrBlock& block, CodeBuffer& out) {
         as.jirl(LaRa, kScratch, 0);
         write(inst.dst, LaA0);
         break;
+      case IrOp::LoadPtr: case IrOp::StorePtr: case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: case IrOp::FSetCond: case IrOp::I2F: case IrOp::F2I: case IrOp::F2D: case IrOp::D2F:
+        return false;   // (pointer access and floating point are not lowered for LoongArch yet: the block stays interpreted)
       case IrOp::Label:
         if (!out.bind(labels[static_cast<uint64_t>(inst.imm)])) return false;
         break;

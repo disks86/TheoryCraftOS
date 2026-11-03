@@ -17,6 +17,7 @@
  */
 #include "Jit/JitRuntime.hpp"
 #include "Jit/Backend/AArch64Backend.hpp"
+#include "Jit/Backend/LoongArch64Backend.hpp"
 #include "Jit/Backend/RiscV64Backend.hpp"
 #include "Jit/Backend/X86_64Backend.hpp"
 #include "Jit/KernelJit.hpp"
@@ -29,6 +30,7 @@ UniquePointer<IJitBackend> make_backend(allocators::IAllocator& allocator) {
   switch (native_host_arch()) {
     case HostArch::X86_64: return UniquePointer<IJitBackend>(UniquePointer<X86_64Backend>::make(allocator, allocator));
     case HostArch::AArch64: return UniquePointer<IJitBackend>(UniquePointer<AArch64Backend>::make(allocator, allocator, 32u, false));
+    case HostArch::LoongArch64: return UniquePointer<IJitBackend>(UniquePointer<LoongArch64Backend>::make(allocator, allocator));
     case HostArch::RiscV64: return UniquePointer<IJitBackend>(UniquePointer<RiscV64Backend>::make(allocator, allocator, 32u, false));
   }
   return UniquePointer<IJitBackend>();
