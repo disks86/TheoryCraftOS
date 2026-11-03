@@ -646,11 +646,6 @@ EXPORT PVOID NTAPI LdrProcessRelocationBlock(void *page, UINT count, USHORT *rel
   }
   return relocs;
 }
-EXPORT NTSTATUS NTAPI RtlDeleteTimer(HANDLE queue, HANDLE timer, HANDLE event) {
-  (void)queue; (void)event;
-  if (!timer) return 0xC00000EFu;      /* STATUS_INVALID_PARAMETER_1 */
-  return 0xC000000Du;
-}
 
 /* ---- compression (LZNT1) ---------------------------------------------------------------------------------------------------------------------------------- */
 

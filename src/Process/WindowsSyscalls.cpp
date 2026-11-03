@@ -27,6 +27,8 @@
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
+#include "Process/WindowsMisc.hpp"
+#include "Process/WindowsPorts.hpp"
 #include "Process/WindowsSockets.hpp"
 #include "Process/WindowsModules.hpp"
 #include "Process/WindowsPipes.hpp"
@@ -49,6 +51,7 @@ void (*g_win32k_process_exited)(uint64_t pid) = nullptr;
 
 namespace {
 
+constexpr uint32_t kStatusObjectNameNotFound = 0xC0000034u;
 constexpr uint32_t kStatusSuccess = 0, kStatusNoYield = 0x40000024u, kStatusNotImplemented = 0xC0000002u, kStatusInvalidHandle = 0xC0000008u,
                    kStatusInvalidParameter = 0xC000000Du, kStatusAccessViolation = 0xC0000005u, kStatusEndOfFile = 0xC0000011u, kStatusAccessDenied = 0xC0000022u,
                    kStatusNoMemory = 0xC0000017u, kStatusConflictingAddresses = 0xC0000018u, kStatusUnableToFreeVm = 0xC000001Au, kStatusInvalidPageProtection = 0xC0000045u;
@@ -348,6 +351,76 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtDeleteValueKey: return windowsabi::nt_delete_value_key(process, r);
       case WindowsSyscallNumber::NtShutdownSystem: return windowsabi::nt_shutdown_system(process, r);
       case WindowsSyscallNumber::NtFlushKey: return windowsabi::nt_flush_key(process, r);
+      case WindowsSyscallNumber::NtAlertThread: return windowsabi::nt_alert_thread(process, r);
+      case WindowsSyscallNumber::NtAlertResumeThread: return windowsabi::nt_alert_resume_thread(process, r);
+      case WindowsSyscallNumber::NtWaitForKeyedEvent: return windowsabi::nt_wait_for_keyed_event(process, r);
+      case WindowsSyscallNumber::NtReleaseKeyedEvent: return windowsabi::nt_release_keyed_event(process, r);
+      case WindowsSyscallNumber::NtClearEvent: return windowsabi::nt_clear_event(process, r);
+      case WindowsSyscallNumber::NtQueryEvent: return windowsabi::nt_query_event(process, r);
+      case WindowsSyscallNumber::NtQueryMutant: return windowsabi::nt_query_mutant(process, r);
+      case WindowsSyscallNumber::NtQuerySemaphore: return windowsabi::nt_query_semaphore(process, r);
+      case WindowsSyscallNumber::NtSetEventBoostPriority: return windowsabi::nt_set_event_boost_priority(process, r);
+      case WindowsSyscallNumber::NtGetCurrentProcessorNumberEx: return windowsabi::nt_get_current_processor_number_ex(process, r);
+      case WindowsSyscallNumber::NtQueryDefaultLocale: return windowsabi::nt_query_default_locale(process, r);
+      case WindowsSyscallNumber::NtSetDefaultLocale: return windowsabi::nt_set_default_locale(process, r);
+      case WindowsSyscallNumber::NtQueryDefaultUILanguage: return windowsabi::nt_query_default_ui_language(process, r);
+      case WindowsSyscallNumber::NtSetDefaultUILanguage: return windowsabi::nt_set_default_ui_language(process, r);
+      case WindowsSyscallNumber::NtQueryInstallUILanguage: return windowsabi::nt_query_install_ui_language(process, r);
+      case WindowsSyscallNumber::NtIsUILanguageComitted: case WindowsSyscallNumber::NtFlushInstallUILanguage: case WindowsSyscallNumber::NtFlushInstructionCache:
+      case WindowsSyscallNumber::NtFlushWriteBuffer: case WindowsSyscallNumber::NtSetDebugFilterState: case WindowsSyscallNumber::NtSetIntervalProfile:
+      case WindowsSyscallNumber::NtLockVirtualMemory: case WindowsSyscallNumber::NtUnlockVirtualMemory: case WindowsSyscallNumber::NtCloseObjectAuditAlarm:
+      case WindowsSyscallNumber::NtDeleteObjectAuditAlarm: case WindowsSyscallNumber::NtOpenObjectAuditAlarm: case WindowsSyscallNumber::NtPrivilegeObjectAuditAlarm:
+      case WindowsSyscallNumber::NtPrivilegedServiceAuditAlarm: case WindowsSyscallNumber::NtDisplayString: case WindowsSyscallNumber::NtSetDefaultHardErrorPort:
+      case WindowsSyscallNumber::NtTraceEvent: case WindowsSyscallNumber::NtDisableLastKnownGood: case WindowsSyscallNumber::NtEnableLastKnownGood:
+        return windowsabi::nt_succeed(process, r);
+      case WindowsSyscallNumber::NtQueryDebugFilterState: case WindowsSyscallNumber::NtQueryIntervalProfile: return windowsabi::nt_query_interval_profile(process, r);
+      case WindowsSyscallNumber::NtAllocateUuids: return windowsabi::nt_allocate_uuids(process, r);
+      case WindowsSyscallNumber::NtSetUuidSeed: return windowsabi::nt_set_uuid_seed(process, r);
+      case WindowsSyscallNumber::NtPowerInformation: return windowsabi::nt_power_information(process, r);
+      case WindowsSyscallNumber::NtSetThreadExecutionState: return windowsabi::nt_set_thread_execution_state(process, r);
+      case WindowsSyscallNumber::NtRaiseHardError: return windowsabi::nt_raise_hard_error(process, r);
+      case WindowsSyscallNumber::NtMakeTemporaryObject: return windowsabi::nt_make_object_temporary(process, r);
+      case WindowsSyscallNumber::NtMakePermanentObject: return windowsabi::nt_make_object_permanent(process, r);
+      case WindowsSyscallNumber::NtSetSystemTime: case WindowsSyscallNumber::NtSetSystemInformation: case WindowsSyscallNumber::NtLoadDriver: case WindowsSyscallNumber::NtUnloadDriver:
+      case WindowsSyscallNumber::NtInitiatePowerAction: case WindowsSyscallNumber::NtSetSystemPowerState:
+      case WindowsSyscallNumber::NtCreatePagingFile: case WindowsSyscallNumber::NtSystemDebugControl: case WindowsSyscallNumber::NtSetLdtEntries:
+        return windowsabi::nt_privilege_not_held(process, r);
+      case WindowsSyscallNumber::NtCreatePort: case WindowsSyscallNumber::NtCreateWaitablePort: return windowsabi::nt_create_port(process, r);
+      case WindowsSyscallNumber::NtConnectPort: return windowsabi::nt_connect_port(process, r, false);
+      case WindowsSyscallNumber::NtSecureConnectPort: return windowsabi::nt_connect_port(process, r, true);
+      case WindowsSyscallNumber::NtListenPort: return windowsabi::nt_listen_port(process, r);
+      case WindowsSyscallNumber::NtAcceptConnectPort: return windowsabi::nt_accept_connect_port(process, r);
+      case WindowsSyscallNumber::NtCompleteConnectPort: return windowsabi::nt_complete_connect_port(process, r);
+      case WindowsSyscallNumber::NtRequestPort: return windowsabi::nt_request_port(process, r);
+      case WindowsSyscallNumber::NtRequestWaitReplyPort: return windowsabi::nt_request_wait_reply_port(process, r);
+      case WindowsSyscallNumber::NtReplyPort: return windowsabi::nt_reply_port(process, r);
+      case WindowsSyscallNumber::NtReplyWaitReceivePort: return windowsabi::nt_reply_wait_receive_port(process, r, false);
+      case WindowsSyscallNumber::NtReplyWaitReceivePortEx: return windowsabi::nt_reply_wait_receive_port(process, r, true);
+      case WindowsSyscallNumber::NtReplyWaitReplyPort: return windowsabi::nt_reply_wait_reply_port(process, r);
+      case WindowsSyscallNumber::NtQueryInformationPort: return windowsabi::nt_query_information_port(process, r);
+      case WindowsSyscallNumber::NtRegisterThreadTerminatePort: return windowsabi::nt_register_thread_terminate_port(process, r);
+      case WindowsSyscallNumber::NtAlpcCreatePort: return windowsabi::nt_alpc_create_port(process, r);
+      case WindowsSyscallNumber::NtAlpcConnectPort: return windowsabi::nt_alpc_connect_port(process, r);
+      case WindowsSyscallNumber::NtAlpcAcceptConnectPort: return windowsabi::nt_alpc_accept_connect_port(process, r);
+      case WindowsSyscallNumber::NtAlpcSendWaitReceivePort: return windowsabi::nt_alpc_send_wait_receive_port(process, r);
+      case WindowsSyscallNumber::NtAlpcDisconnectPort: return windowsabi::nt_alpc_disconnect_port(process, r);
+      case WindowsSyscallNumber::NtAlpcQueryInformation: return windowsabi::nt_alpc_query_information(process, r);
+      case WindowsSyscallNumber::NtAlpcSetInformation: return windowsabi::nt_alpc_set_information(process, r);
+      case WindowsSyscallNumber::NtAlpcCancelMessage: case WindowsSyscallNumber::NtAlpcCreateSecurityContext: case WindowsSyscallNumber::NtAlpcDeleteSecurityContext:
+      case WindowsSyscallNumber::NtAlpcRevokeSecurityContext: return windowsabi::nt_alpc_validate_port(process, r);
+      case WindowsSyscallNumber::NtCreateWnfStateName: return windowsabi::nt_create_wnf_state_name(process, r);
+      case WindowsSyscallNumber::NtUpdateWnfStateData: return windowsabi::nt_update_wnf_state_data(process, r);
+      case WindowsSyscallNumber::NtQueryWnfStateData: return windowsabi::nt_query_wnf_state_data(process, r);
+      case WindowsSyscallNumber::NtDeleteWnfStateData: return windowsabi::nt_delete_wnf_state_data(process, r);
+      case WindowsSyscallNumber::NtDeleteWnfStateName: return windowsabi::nt_delete_wnf_state_name(process, r);
+      case WindowsSyscallNumber::NtQueryWnfStateNameInformation: return windowsabi::nt_query_wnf_state_name_information(process, r);
+      case WindowsSyscallNumber::NtGetNextThread: return windowsabi::nt_get_next_thread(process, r);
+      case WindowsSyscallNumber::NtQueryLicenseValue: return kStatusObjectNameNotFound;
+      case WindowsSyscallNumber::NtQueryEaFile: case WindowsSyscallNumber::NtSetEaFile: return 0xC000004Fu;      // STATUS_EAS_NOT_SUPPORTED
+      case WindowsSyscallNumber::NtQueryQuotaInformationFile: case WindowsSyscallNumber::NtSetQuotaInformationFile: return 0xC00000BBu;
+      case WindowsSyscallNumber::NtSetVolumeInformationFile: case WindowsSyscallNumber::NtSetInformationSymbolicLink: return 0xC00000BBu;
+      case WindowsSyscallNumber::NtThawRegistry: case WindowsSyscallNumber::NtInitializeRegistry:      // hives are not kept in files: nothing can be loaded, saved or replaced
+        return windowsabi::nt_privilege_not_held(process, r);
       case WindowsSyscallNumber::NtRenameKey: return windowsabi::nt_rename_key(process, r);
       case WindowsSyscallNumber::NtQueryMultipleValueKey: return windowsabi::nt_query_multiple_value_key(process, r);
       case WindowsSyscallNumber::NtSetInformationKey: return windowsabi::nt_set_information_key(process, r);

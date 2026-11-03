@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsThreads.hpp"
+#include "Process/WindowsPorts.hpp"
 #include "Process/WindowsObjects.hpp"
 #include "Process/WindowsTokens.hpp"
 #include "Process/AddressSpace.hpp"
@@ -321,6 +322,7 @@ void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
   }
   if (ObjectManager* objects = system_objects()) { objects->abandon_thread(record.id); objects->io_cancel_thread(record.id); objects->process_exited(record.id, code); }      // (the second: a handle to the thread from another program)
   debug_thread_exited(p, record.id, code);
+  ports_thread_ended(p.id(), record.id);      // (a server of a port the thread registered with is told)
   if (p.live_threads() == 0) p.terminate(code);
   if (p.runtime()) p.runtime()->notify();
   if (ObjectManager* objects = system_objects()) objects->notify();
@@ -403,6 +405,24 @@ uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r) {
 }
 
 // NtResumeThread(HANDLE Thread, PULONG PreviousSuspendCount)
+// NtAlertThread(HANDLE): the thread's next alertable wait ends with STATUS_ALERTED (or its current one does).
+uint32_t nt_alert_thread(Process& p, const SyscallRequest& r) {
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  if (record->finished) return 0xC0000001u;
+  record->alert_pending = true;
+  if (p.runtime()) p.runtime()->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();
+  return kSuccess;
+}
+
+// NtAlertResumeThread(HANDLE, PULONG PreviousSuspendCount)
+uint32_t nt_alert_resume_thread(Process& p, const SyscallRequest& r) {
+  const uint32_t status = nt_resume_thread(p, r);
+  if (status != kSuccess) return status;
+  return nt_alert_thread(p, r);
+}
+
 uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
   if (thread_handle_lacks(p, r.args[0], 0x2)) return 0xC0000022u;
   uint64_t remote_id = 0;
@@ -656,6 +676,39 @@ uint32_t nt_open_thread(Process& p, const SyscallRequest& r) {
     p.files().set_denied_access(uint64_t(slot), ~granted & 0x1FFFFFu);
   }
   if (!p.write_user_u64(r.args[0], (uint64_t(slot) + 1) * 4)) { p.files().close(uint64_t(slot)); return kAccessViolation; }
+  return kSuccess;
+}
+
+// NtGetNextThread(Process, Thread, DesiredAccess, HandleAttributes, Flags, PHANDLE NewThread): a handle to the thread that follows `Thread` (the first when it is null) among the
+// threads of the process that have not ended; flag 1 walks backwards. Only the calling process can be walked.
+uint32_t nt_get_next_thread(Process& p, const SyscallRequest& r) {
+  uint64_t flags = 0, out = 0;
+  if (!windowsabi::argument(p, r, 4, &flags) || !windowsabi::argument(p, r, 5, &out)) return kAccessViolation;
+  if (r.args[0] != ~uint64_t{0} && r.args[0] != 0) return kInvalidHandle;
+  if (flags & ~uint64_t{1}) return kInvalidParameter;
+  const bool backwards = (flags & 1) != 0;
+  uint64_t after = 0;
+  if (r.args[1] != 0) {
+    Process::ThreadRecord* from = thread_of(p, r.args[1]);
+    if (!from) return kInvalidHandle;
+    after = from->id;
+  }
+  // The live threads in the order they were made (their ids grow).
+  Process::ThreadRecord* best = nullptr;
+  for (uint32_t i = 0; i < Process::kMaxThreads; ++i) {
+    Process::ThreadRecord* t = p.thread_at(i);
+    if (!t || !t->used || t->finished) continue;
+    if (after != 0 && (backwards ? t->id >= after : t->id <= after)) continue;
+    if (!best || (backwards ? t->id > best->id : t->id < best->id)) best = t;
+  }
+  if (!best) return 0x8000001Au;      // STATUS_NO_MORE_ENTRIES
+  uint32_t granted = 0;
+  if (const uint32_t refused = open_with_descriptor(p, 'h', best->id, uint32_t(r.args[2]), kThreadMapping, &granted)) return refused;
+  const int64_t slot = p.files().open_token(DescriptorKind::Thread, best->id);
+  if (slot < 0) return kInsufficientResources;
+  p.files().set_handle_flags(uint64_t(slot), (r.args[3] & 2) != 0, false);
+  p.files().set_denied_access(uint64_t(slot), ~granted & 0x1FFFFFu);
+  if (!p.write_user_u64(out, (uint64_t(slot) + 1) * 4)) { p.files().close(uint64_t(slot)); return kAccessViolation; }
   return kSuccess;
 }
 

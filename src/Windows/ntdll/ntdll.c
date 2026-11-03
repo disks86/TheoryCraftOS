@@ -39,6 +39,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 /* A Zw name of a service: in user mode it is the same call as the Nt one. */
 #define ZW_SERVICE(nt, zw)                                                                                                                                    \
   __asm__(".text\n.globl " #zw "\n" #zw ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##nt) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
+#define ZW_ALIAS(nt, zw) __asm__(".text\n.globl " #zw "\n" #zw ":\n jmp " #nt "\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
 #define _STR(x) _STR2(x)
 #define _STR2(x) #x
 NT_SERVICE_RAW(NtReadFile);
@@ -951,6 +952,13 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "uilang.inc"
 #include "normalize.inc"
 #include "reg.inc"
+#include "sync.inc"
+#include "threadpool.inc"
+#include "etw.inc"
+#include "rtlx1.inc"
+#include "rtlx2.inc"
+#include "rtlx3.inc"
+#include "ntwrap.inc"
 
 /* ---- critical sections (one thread: they only count) ---------------------------------------------------------------------------------------------------- */
 
@@ -1792,6 +1800,8 @@ EXPORT NTSTATUS NTAPI LdrEnumerateLoadedModules(PVOID unknown, LdrEnumProc callb
   loader_unlock();
   return STATUS_SUCCESS;
 }
+
+#include "ldr2.inc"
 
 /* ntdll's own entry point: nothing to set up (the heap is made when first used). */
 EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {

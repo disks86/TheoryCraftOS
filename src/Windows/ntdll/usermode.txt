@@ -1,0 +1,16 @@
+NtQueryFullAttributesFile
+NtQueryInformationByName
+NtQueryDirectoryFileEx
+NtFlushBuffersFileEx
+NtReadFileScatter
+NtWriteFileGather
+NtNotifyChangeDirectoryFileEx
+NtMapViewOfSectionEx
+NtUnmapViewOfSectionEx
+NtCreateSectionEx
+NtReadVirtualMemoryEx
+NtContinueEx
+NtCreateDirectoryObjectEx
+NtCreatePrivateNamespace
+NtOpenPrivateNamespace
+NtDeletePrivateNamespace

@@ -2000,7 +2000,9 @@ void ObjectManager::release_locked(uint32_t id) {
       o->name_size = 0;
       return;
     }
+    const bool was_port = o->kind == ObjectKind::Port;
     free_object_locked(*o);
+    if (was_port) sync_.notify_all();      // (the other end of a port sees it go)
   }
 }
 
@@ -2114,6 +2116,28 @@ bool ObjectManager::ready_locked(uint32_t id, uint64_t waiter) {
     case ObjectKind::Job: return false;      // (it is signalled when a time limit runs out, which is not kept here)
     default: return true;
   }
+}
+
+bool ObjectManager::object_state_locked(uint32_t id, uint64_t waiter, ObjectState* out) {
+  Object* o = at(id);
+  if (!o) return false;
+  out->kind = o->kind;
+  out->manual_reset = o->manual_reset;
+  out->signaled = o->signaled || o->pulses > 0;
+  out->abandoned = o->abandoned;
+  out->owned_by_waiter = o->kind == ObjectKind::Mutex && o->owner == waiter && o->recursion > 0;
+  out->count = o->count;
+  out->maximum = o->maximum;
+  out->recursion = o->recursion;
+  return true;
+}
+
+uint32_t ObjectManager::clear_event(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Event) return kInvalidHandle;
+  o->signaled = false;
+  return kSuccess;
 }
 
 void ObjectManager::acquire_locked(uint32_t id, uint64_t waiter, bool* abandoned) {

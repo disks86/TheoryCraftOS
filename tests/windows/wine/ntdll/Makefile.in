@@ -23,6 +23,7 @@ SOURCES = \
 	rtlstr.c \
 	string.c \
 	sync.c \
+	tcos_ntdll.c \
 	testdll.c \
 	testdll.spec \
 	thread.c \
