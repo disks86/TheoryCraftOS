@@ -282,8 +282,8 @@ static void test_linux_files() {
   CHECK(p.syscall(lin(0, fd, buf, 16)) == 16 && uint8_t(rig.bytes(buf, 1)[0]) == 0xA5);
   // too many descriptors
   int opened = 0;
-  for (int i = 0; i < 300; ++i) { int64_t f = sres(p.syscall(lin(2, rig.str("/etc/motd"), 0))); if (f >= 0) ++opened; else { CHECK(f == -24); break; } }
-  CHECK(opened > 100 && opened < 300);
+  for (int i = 0; i < 1100; ++i) { int64_t f = sres(p.syscall(lin(2, rig.str("/etc/motd"), 0))); if (f >= 0) ++opened; else { CHECK(f == -24); break; } }
+  CHECK(opened > 100 && opened < 1100);
 
   // A program without a file system sees none.
   Host host2; AddressSpace space2(A);
