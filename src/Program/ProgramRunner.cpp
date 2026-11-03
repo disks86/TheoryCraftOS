@@ -368,6 +368,7 @@ void KernelProgramLauncher::run(const ProgramLaunch& launch, IProgramSink& sink,
   run.host = &host;
   uint32_t code = 0;
   String message(allocator_);
+  host.set_common_dialogs(sink.common_dialogs());
   sink.program_started(&control);
   const RunResult result = run_program(run, &code, &message);
   sink.program_ended();
