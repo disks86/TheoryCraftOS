@@ -1293,6 +1293,13 @@ void test_registration() {
 
 }  // namespace
 
+namespace process::win32k {
+// (this test runs without the other modules: their installers are empty here)
+void install_gdi() {}
+void install_user() {}
+void install_composition() {}
+}  // namespace process::win32k
+
 int main() {
   System sys;      // (one system for all the tests: the module keeps its state for the lifetime of the allocator it was made with)
   gdi::set_screen_size(1024, 768);

@@ -227,8 +227,8 @@ void install_shell() {
   register_handler(N::NtUserShutdownBlockReasonCreate, svc_shutdown_block_reason_create);
   register_handler(N::NtUserShutdownBlockReasonQuery, svc_shutdown_block_reason_query);
   register_handler(N::NtUserShutdownReasonDestroy, svc_shutdown_reason_destroy);
-  register_handler(N::NtUserSetWindowDisplayAffinity, svc_set_window_display_affinity);
-  register_handler(N::NtUserGetWindowDisplayAffinity, svc_get_window_display_affinity);
+  if (!handler_of(uint32_t(N::NtUserSetWindowDisplayAffinity))) register_handler(N::NtUserSetWindowDisplayAffinity, svc_set_window_display_affinity);      // (the window manager has its own when both modules are installed)
+  if (!handler_of(uint32_t(N::NtUserGetWindowDisplayAffinity))) register_handler(N::NtUserGetWindowDisplayAffinity, svc_get_window_display_affinity);      // (the window manager has its own when both modules are installed)
   register_handler(N::NtUserMessageBeep, svc_message_beep);
 }
 

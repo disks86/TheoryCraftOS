@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/Win32k/Win32kGdi.hpp"
 #include <new>
 #include "Process/AddressSpace.hpp"
@@ -505,7 +506,28 @@ Dc* dc_arg(Call& c, uint32_t handle) {
 
 }  // namespace gdi
 
+namespace {
+// The system colour brushes and pens of user_misc (GetSysColorBrush / GetSysColorPen): solid GDI objects of a colour owned by the asking process.
+uint32_t make_solid_brush(uint64_t pid, uint32_t colorref) {
+  gdi::Brush* b = gdi::make_object<gdi::Brush>(gdi::kObjBrush, pid);
+  if (!b) return 0;
+  b->style = 0;
+  b->color = colorref;
+  return b->handle;
+}
+uint32_t make_solid_pen(uint64_t pid, uint32_t colorref) {
+  gdi::Pen* p = gdi::make_object<gdi::Pen>(gdi::kObjPen, pid);
+  if (!p) return 0;
+  p->style = 0;
+  p->width = 1;
+  p->color = colorref;
+  return p->handle;
+}
+}  // namespace
+
 void install_gdi() {
+  user_misc::set_solid_brush_factory(make_solid_brush);
+  user_misc::set_solid_pen_factory(make_solid_pen);
   register_process_exit_hook(gdi::on_process_exit);
   gdi::register_region_services();
   gdi::register_object_services();

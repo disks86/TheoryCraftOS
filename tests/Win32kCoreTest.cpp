@@ -69,6 +69,7 @@ static void test_call_helpers() {
 
 static void test_table() {
   System sys;
+  for (uint32_t i = 0; i < duplicate_registrations() && i < 64; ++i) printf("duplicate registration of service %u\n", duplicate_service(i));
   CHECK(duplicate_registrations() == 0);
   // a number nobody implements answers STATUS_NOT_IMPLEMENTED; one outside the win32k range is none of win32k's business
   Program prog(12);

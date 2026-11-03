@@ -486,10 +486,10 @@ void install_cursors() {
   register_handler(N::NtUserSetSystemCursor, svc_set_system_cursor);
   // These call into the window manager's cursor functions, which take the system lock themselves: the handlers take it only where they touch their own state.
   register_handler(N::NtUserGetCursorInfo, svc_get_cursor_info, false);
-  register_handler(N::NtUserGetCursorPos, svc_get_cursor_pos, false);
-  register_handler(N::NtUserSetCursorPos, svc_set_cursor_pos, false);
-  register_handler(N::NtUserClipCursor, svc_clip_cursor, false);
-  register_handler(N::NtUserGetClipCursor, svc_get_clip_cursor, false);
+  if (!handler_of(uint32_t(N::NtUserGetCursorPos))) register_handler(N::NtUserGetCursorPos, svc_get_cursor_pos, false);      // (the window manager has its own when both modules are installed)
+  if (!handler_of(uint32_t(N::NtUserSetCursorPos))) register_handler(N::NtUserSetCursorPos, svc_set_cursor_pos, false);      // (the window manager has its own when both modules are installed)
+  if (!handler_of(uint32_t(N::NtUserClipCursor))) register_handler(N::NtUserClipCursor, svc_clip_cursor, false);      // (the window manager has its own when both modules are installed)
+  if (!handler_of(uint32_t(N::NtUserGetClipCursor))) register_handler(N::NtUserGetClipCursor, svc_get_clip_cursor, false);      // (the window manager has its own when both modules are installed)
 }
 
 }  // namespace process::win32k::user_misc
