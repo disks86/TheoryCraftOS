@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
+#include "Process/Process.hpp"
 #include "Utility/ArrayView.hpp"
 
 // What the other win32k modules (and the kernel) use of the GDI module (Win32kGdi*.cpp). The GDI module implements everything declared here; it may add more below the
@@ -64,5 +65,53 @@ uint32_t create_bitmap(uint64_t pid, int32_t width, int32_t height, ArrayView<co
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // (the GDI module's own declarations follow)
+
+
+// --- Fonts. Text is drawn with the built-in 8x16 bitmap font scaled to the requested size; a provider makes real fonts (TrueType from src/Font) available: the kernel registers one
+// and GDI asks it first for every font the program selects.
+struct GdiFontRequest {
+  ArrayView<const char16_t> face;      // lfFaceName
+  int32_t height = 0;                  // the cell height in device pixels
+  int32_t width = 0;                   // 0: the face's natural width
+  int32_t weight = 400;
+  bool italic = false;
+  uint8_t charset = 1, pitch_family = 0;
+};
+struct GdiFontMetrics {
+  int32_t ascent = 0, descent = 0, internal_leading = 0, external_leading = 0, ave_width = 0, max_width = 0;      // device pixels
+  bool fixed_pitch = false;
+};
+struct GdiGlyph {
+  int32_t advance = 0;                 // pixels to the next glyph
+  int32_t left = 0, top = 0;           // the bitmap's top-left corner relative to the pen position on the baseline (top: pixels above the baseline)
+  int32_t width = 0, height = 0;
+  ConstByteView coverage;              // width * height bytes of 8-bit coverage, valid until the next call
+};
+class IGdiFontProvider {
+ public:
+  virtual bool match(const GdiFontRequest& request, uint32_t* face) = 0;
+  virtual bool metrics(uint32_t face, int32_t pixel_height, GdiFontMetrics* out) = 0;
+  virtual bool glyph(uint32_t face, int32_t pixel_height, char32_t character, GdiGlyph* out) = 0;
+  // GetFontData: copies the bytes of an sfnt table (table 0: the whole file) into `out`; returns how many, or -1 if there is no such table.
+  virtual int64_t font_data(uint32_t /*face*/, uint32_t /*table*/, uint32_t /*offset*/, ByteView /*out*/) { return -1; }
+
+ protected:
+  IGdiFontProvider() = default;
+  ~IGdiFontProvider() = default;
+};
+void set_font_provider(IGdiFontProvider* provider);
+
+// --- DIB sections live in the memory of the process that made them. The default places them in the process's own address space (Process::address_space()); a host with no address
+// space (the unit tests) installs these hooks, which hand out an address the process can read and write through Process::read_user / write_user.
+struct DibMemory {
+  bool (*allocate)(Process& process, uint64_t bytes, uint64_t* address) = nullptr;
+  void (*release)(Process& process, uint64_t address, uint64_t bytes) = nullptr;
+};
+void set_dib_memory(const DibMemory* hooks);      // null: the default; the table must stay alive
+
+// GetStockObject(index): the HGDIOBJ (0 for an index outside 0..19).
+uint32_t stock_object(int index);
+// Drops every GDI object and the screen (the unit tests call this between systems; the kernel never needs to).
+void shutdown();
 
 }  // namespace process::win32k::gdi
