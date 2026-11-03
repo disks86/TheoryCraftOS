@@ -43,6 +43,14 @@ class X86_64Assembler {
   void mov_load32(X86Reg dst, X86Reg base, int32_t disp) { memory(0x8B, false, dst, base, disp); }    // zero-extending 32-bit load
   void mov_store32(X86Reg base, int32_t disp, X86Reg src) { memory(0x89, false, src, base, disp); }
   void lea(X86Reg dst, X86Reg base, int32_t disp) { memory(0x8D, true, dst, base, disp); }
+  // Narrow loads (zero or sign extended to 64 bits) and stores of the low 8 / 16 / 32 bits.
+  void mov_load8_zx(X86Reg dst, X86Reg base, int32_t disp) { memory2(0x0F, 0xB6, true, dst, base, disp); }   // movzx r64, byte [base+disp]
+  void mov_load16_zx(X86Reg dst, X86Reg base, int32_t disp) { memory2(0x0F, 0xB7, true, dst, base, disp); }
+  void mov_load8_sx(X86Reg dst, X86Reg base, int32_t disp) { memory2(0x0F, 0xBE, true, dst, base, disp); }   // movsx r64, byte [base+disp]
+  void mov_load16_sx(X86Reg dst, X86Reg base, int32_t disp) { memory2(0x0F, 0xBF, true, dst, base, disp); }
+  void mov_load32_sx(X86Reg dst, X86Reg base, int32_t disp) { memory(0x63, true, dst, base, disp); }         // movsxd r64, dword [base+disp]
+  void mov_store8(X86Reg base, int32_t disp, X86Reg src);
+  void mov_store16(X86Reg base, int32_t disp, X86Reg src);
 
   // Arithmetic and logic, two-operand: dst = dst op src.
   void add_rr(X86Reg dst, X86Reg src) { alu_rr(0x01, dst, src); }
@@ -68,6 +76,20 @@ class X86_64Assembler {
   void shl_ri(X86Reg r, uint8_t n) { shift_ri(4, r, n); }
   void shr_ri(X86Reg r, uint8_t n) { shift_ri(5, r, n); }
   void sar_ri(X86Reg r, uint8_t n) { shift_ri(7, r, n); }
+  // Scalar double precision SSE2 on xmm0..xmm15 (given by number). movq moves the 64 bits between a general and an xmm register.
+  void movq_to_xmm(uint8_t xmm, X86Reg src) { sse(0x66, 0x6E, true, xmm, static_cast<uint8_t>(src)); }
+  void movq_from_xmm(X86Reg dst, uint8_t xmm) { sse(0x66, 0x7E, true, xmm, static_cast<uint8_t>(dst)); }
+  void addsd(uint8_t dst, uint8_t src) { sse(0xF2, 0x58, false, dst, src); }
+  void mulsd(uint8_t dst, uint8_t src) { sse(0xF2, 0x59, false, dst, src); }
+  void subsd(uint8_t dst, uint8_t src) { sse(0xF2, 0x5C, false, dst, src); }
+  void divsd(uint8_t dst, uint8_t src) { sse(0xF2, 0x5E, false, dst, src); }
+  void ucomisd(uint8_t a, uint8_t b) { sse(0x66, 0x2E, false, a, b); }                                // flags of a compared with b (unordered: ZF=PF=CF=1)
+  void movd_to_xmm(uint8_t xmm, X86Reg src) { sse(0x66, 0x6E, false, xmm, static_cast<uint8_t>(src)); }      // the low 32 bits
+  void movd_from_xmm(X86Reg dst, uint8_t xmm) { sse(0x66, 0x7E, false, xmm, static_cast<uint8_t>(dst)); }   // zero extended
+  void cvtss2sd(uint8_t dst, uint8_t src) { sse(0xF3, 0x5A, false, dst, src); }
+  void cvtsd2ss(uint8_t dst, uint8_t src) { sse(0xF2, 0x5A, false, dst, src); }
+  void cvtsi2sd(uint8_t dst, X86Reg src) { sse(0xF2, 0x2A, true, dst, static_cast<uint8_t>(src)); }   // xmm = (double) signed 64-bit register
+  void cvttsd2si(X86Reg dst, uint8_t src) { sse(0xF2, 0x2C, true, static_cast<uint8_t>(dst), src); }  // truncating; 0x8000000000000000 when it does not fit
   // dst = (flags satisfy cond) ? 1 : 0, as a full 64-bit value.
   void setcc(X86Cond cond, X86Reg dst);
 
@@ -93,6 +115,9 @@ class X86_64Assembler {
   void shift_cl(uint8_t ext, X86Reg r) { opcode_ext(0xD3, ext, r); }
   void shift_ri(uint8_t ext, X86Reg r, uint8_t n);
   void memory(uint8_t opcode, bool wide, X86Reg reg, X86Reg base, int32_t disp);
+  void memory_operand(uint8_t opcode, X86Reg reg, X86Reg base, int32_t disp, bool opcode_done = false);
+  void memory2(uint8_t first, uint8_t second, bool wide, X86Reg reg, X86Reg base, int32_t disp);   // the same with a two byte opcode
+  void sse(uint8_t prefix, uint8_t opcode, bool wide, uint8_t reg, uint8_t rm);                      // prefix [REX] 0F opcode, register to register
   void branch(uint8_t first, uint8_t second, bool two_bytes, Label target);
 
   CodeBuffer& code_;

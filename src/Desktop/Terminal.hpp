@@ -21,6 +21,7 @@
 // explorer and dropped on the window becomes the current folder (as if "cd" had been typed); a file dropped there has its path put on the
 // command line. Ctrl+N, Ctrl+S, Ctrl+V and Ctrl+L do the same as the menu items. Commands run on the window's handler thread.
 #pragma once
+#include "Desktop/ColorDialog.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/ProgramLauncher.hpp"
 #include "Desktop/Shell.hpp"
@@ -43,6 +44,8 @@ class Terminal : public gui::Frame, private IProgramSink {
   void set_program_launcher(IProgramLauncher* launcher) { launcher_ = launcher; }
   // The dialog that Save Output As uses (nullptr: none). It must outlive the terminal.
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
+  // The dialog that a program's colour chooser uses (nullptr: programs cannot choose colours). Programs' file choosers use the file dialog above. Both must outlive the terminal.
+  void set_color_dialog(ColorDialog* dialog) { color_dialog_ = dialog; }
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
   // A path in the output that exists - absolute, or relative to the current folder - can be clicked; this fires with opened_path() set to its full
   // path (the desktop opens a folder in a file explorer and a file in the program for it).
@@ -86,7 +89,18 @@ class Terminal : public gui::Frame, private IProgramSink {
   static void program_line(void* self, StringView text);
   static void program_interrupt(void* self);
   static void program_end_of_input(void* self);
+  // The common dialogs of the program that is running (Windows GetOpenFileName, GetSaveFileName, ChooseColor): shown in the desktop's shared dialogs; the program's thread (this
+  // window's handler thread) waits for the user.
+  class DialogBridge final : public process::ICommonDialogs {
+   public:
+    explicit DialogBridge(Terminal& terminal) : terminal_(terminal) {}
+    bool run(const process::CommonDialogRequest& request, process::CommonDialogReply* reply) override;
+
+   private:
+    Terminal& terminal_;
+  };
   // IProgramSink
+  process::ICommonDialogs* common_dialogs() override { return &dialogs_; }
   void program_output(StringView text) override { view_.write(text); }
   void program_started(IProgramControl* control) override;
   void program_ended() override;
@@ -99,6 +113,8 @@ class Terminal : public gui::Frame, private IProgramSink {
   Shell shell_;
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
+  ColorDialog* color_dialog_ = nullptr;
+  DialogBridge dialogs_{*this};
   IProgramLauncher* launcher_ = nullptr;
   IProgramControl* running_ = nullptr;      // the program that is running, while one is
   gui::NoticeDialog* notices_ = nullptr;

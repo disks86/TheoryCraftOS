@@ -22,6 +22,7 @@ set(TCOS_JIT_PORTABLE_SOURCES
   src/Jit/CodePageSource.cpp
   src/Jit/CrossCoreInstructionSync.cpp
   src/Jit/JitCompiler.cpp
+  src/Jit/JitRuntime.cpp
   src/Jit/JitSelfTest.cpp
   src/Jit/ProtectedCodeMemory.cpp
   src/Jit/UefiPageProtector.cpp

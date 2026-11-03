@@ -28,13 +28,17 @@ namespace jit {
 // Limits: at most 4095 spill slots per block (the slot offset is a scaled 12-bit immediate; a front end ends a block long before that).
 class AArch64Backend final : public IJitBackend {
  public:
-  explicit AArch64Backend(allocators::IAllocator& allocator, uint32_t max_registers = 32) : allocator_(allocator), max_registers_(max_registers) {}
+  // `floating_point` false makes the back end decline blocks that use the IR's floating point operations (pointer access needs no such thing): for an image whose
+  // kernel neither enables nor saves the floating point registers across a task switch, generated code must not touch them.
+  explicit AArch64Backend(allocators::IAllocator& allocator, uint32_t max_registers = 32, bool floating_point = true)
+      : allocator_(allocator), max_registers_(max_registers), floating_point_(floating_point) {}
   HostArch arch() const override { return HostArch::AArch64; }
   bool compile(const IrBlock& block, CodeBuffer& out) override;
 
  private:
   allocators::IAllocator& allocator_;
   uint32_t max_registers_;
+  bool floating_point_;
 };
 
 }  // namespace jit

@@ -20,6 +20,14 @@
 
 namespace jit {
 
+// The interpreter does floating point with the host's own arithmetic. An image built without it (the AArch64 and RISC-V kernels use no floating point registers and link
+// no soft float library) cannot, and its interpreter reports a block that uses these operations as one it cannot run.
+#if defined(__x86_64__) || (defined(__ARM_FP) && !defined(__ARM_FEATURE_GENERAL_REGS_ONLY)) || (defined(__riscv_flen) && __riscv_flen >= 64)
+#define JIT_IR_HOST_FP 1
+#else
+#define JIT_IR_HOST_FP 0
+#endif
+
 bool eval_cond(IrCond cond, uint64_t a, uint64_t b) {
   const int64_t sa = static_cast<int64_t>(a), sb = static_cast<int64_t>(b);
   switch (cond) {
@@ -47,6 +55,7 @@ bool reads_a_impl(IrOp op) {
     case IrOp::Move: case IrOp::Add: case IrOp::Sub: case IrOp::Mul: case IrOp::And: case IrOp::Or: case IrOp::Xor:
     case IrOp::Shl: case IrOp::Shr: case IrOp::Sar: case IrOp::Not: case IrOp::Neg: case IrOp::SetCond:
     case IrOp::StoreState: case IrOp::Helper: case IrOp::BranchIf: case IrOp::ExitValue:
+    case IrOp::LoadPtr: case IrOp::StorePtr: case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: case IrOp::FSetCond: case IrOp::I2F: case IrOp::F2I: case IrOp::F2D: case IrOp::D2F:
       return true;
     default: return false;
   }
@@ -55,6 +64,7 @@ bool reads_b_impl(IrOp op) {
   switch (op) {
     case IrOp::Add: case IrOp::Sub: case IrOp::Mul: case IrOp::And: case IrOp::Or: case IrOp::Xor:
     case IrOp::Shl: case IrOp::Shr: case IrOp::Sar: case IrOp::SetCond: case IrOp::Helper: case IrOp::BranchIf:
+    case IrOp::StorePtr: case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: case IrOp::FSetCond:
       return true;
     default: return false;
   }
@@ -63,6 +73,7 @@ bool writes_dst_impl(IrOp op) {
   switch (op) {
     case IrOp::Const: case IrOp::Move: case IrOp::Add: case IrOp::Sub: case IrOp::Mul: case IrOp::And: case IrOp::Or: case IrOp::Xor:
     case IrOp::Shl: case IrOp::Shr: case IrOp::Sar: case IrOp::Not: case IrOp::Neg: case IrOp::SetCond: case IrOp::LoadState: case IrOp::Helper:
+    case IrOp::LoadPtr: case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: case IrOp::FSetCond: case IrOp::I2F: case IrOp::F2I: case IrOp::F2D: case IrOp::D2F:
       return true;
     default: return false;
   }
@@ -81,8 +92,63 @@ uint64_t apply(IrOp op, uint64_t a, uint64_t b) {
     case IrOp::Sar: return static_cast<uint64_t>(static_cast<int64_t>(a) >> (b & 63));
     case IrOp::Not: return ~a;
     case IrOp::Neg: return uint64_t{0} - a;
+#if JIT_IR_HOST_FP
+    case IrOp::FAdd: return __builtin_bit_cast(uint64_t, __builtin_bit_cast(double, a) + __builtin_bit_cast(double, b));
+    case IrOp::FSub: return __builtin_bit_cast(uint64_t, __builtin_bit_cast(double, a) - __builtin_bit_cast(double, b));
+    case IrOp::FMul: return __builtin_bit_cast(uint64_t, __builtin_bit_cast(double, a) * __builtin_bit_cast(double, b));
+    case IrOp::FDiv: return __builtin_bit_cast(uint64_t, __builtin_bit_cast(double, a) / __builtin_bit_cast(double, b));
+    case IrOp::I2F: return __builtin_bit_cast(uint64_t, static_cast<double>(static_cast<int64_t>(a)));
+    case IrOp::F2D: return __builtin_bit_cast(uint64_t, static_cast<double>(__builtin_bit_cast(float, static_cast<uint32_t>(a))));
+    case IrOp::D2F: return __builtin_bit_cast(uint32_t, static_cast<float>(__builtin_bit_cast(double, a)));
+    case IrOp::F2I: {
+      const double x = __builtin_bit_cast(double, a);
+      if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) return static_cast<uint64_t>(INT64_MIN);   // (also a NaN)
+      return static_cast<uint64_t>(static_cast<int64_t>(x));
+    }
+#endif
     default: return 0;
   }
+}
+
+#if JIT_IR_HOST_FP
+bool eval_fcond(IrCond cond, uint64_t a, uint64_t b) {
+  const double x = __builtin_bit_cast(double, a), y = __builtin_bit_cast(double, b);
+  switch (cond) {
+    case IrCond::Eq: return x == y;
+    case IrCond::Ne: return x != y;
+    case IrCond::Lt: return x < y;
+    case IrCond::Le: return x <= y;
+    case IrCond::Gt: return x > y;
+    case IrCond::Ge: return x >= y;
+    default: return false;
+  }
+}
+#endif
+
+// The one place that turns an address in a register into memory (see IrBuilder::helper_address for the same idea with functions): the front end that
+// emitted the LoadPtr / StorePtr made the address valid for the width.
+uint64_t load_at(uint64_t address, IrMem mem) {
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(address));
+  uint64_t v = 0;
+  uint32_t n = 8;
+  switch (mem) {
+    case IrMem::U8: case IrMem::S8: n = 1; break;
+    case IrMem::U16: case IrMem::S16: n = 2; break;
+    case IrMem::U32: case IrMem::S32: n = 4; break;
+    case IrMem::U64: n = 8; break;
+  }
+  for (uint32_t k = 0; k < n; ++k) v |= static_cast<uint64_t>(p[k]) << (8 * k);
+  switch (mem) {
+    case IrMem::S8: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(v)));
+    case IrMem::S16: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(v)));
+    case IrMem::S32: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v)));
+    default: return v;
+  }
+}
+void store_at(uint64_t address, IrMem mem, uint64_t value) {
+  uint8_t* p = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(address));
+  const uint32_t n = mem == IrMem::U8 ? 1 : mem == IrMem::U16 ? 2 : mem == IrMem::U32 ? 4 : 8;
+  for (uint32_t k = 0; k < n; ++k) p[k] = static_cast<uint8_t>(value >> (8 * k));
 }
 
 }  // namespace
@@ -120,6 +186,12 @@ bool validate(allocators::IAllocator& allocator, const IrBlock& block) {
         break;
       case IrOp::Helper:
         if (inst.imm == 0) ok = false;
+        break;
+      case IrOp::StorePtr:
+        if (inst.mem > IrMem::U64) ok = false;
+        break;
+      case IrOp::FSetCond:
+        if (inst.cond > IrCond::Ge) ok = false;
         break;
       case IrOp::Label:
         if (inst.imm < 0 || static_cast<uint64_t>(inst.imm) >= block.label_count || placed[static_cast<uint64_t>(inst.imm)]) ok = false;
@@ -190,6 +262,16 @@ bool interpret(allocators::IAllocator& allocator, const IrBlock& block, ByteView
         regs[inst.dst] = fn(state.data(), a, b);
         break;
       }
+      case IrOp::LoadPtr: regs[inst.dst] = load_at(a + static_cast<uint64_t>(inst.imm), inst.mem); break;
+      case IrOp::StorePtr: store_at(a + static_cast<uint64_t>(inst.imm), inst.mem, b); break;
+#if JIT_IR_HOST_FP
+      case IrOp::FSetCond: regs[inst.dst] = eval_fcond(inst.cond, a, b) ? 1 : 0; break;
+#else
+      case IrOp::FSetCond: case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: case IrOp::I2F: case IrOp::F2I: case IrOp::F2D: case IrOp::D2F:
+        release_view(allocator, regs);
+        release_view(allocator, label_at);
+        return false;   // (no floating point on this image)
+#endif
       case IrOp::Label: break;
       case IrOp::Jump: pc = label_at[static_cast<uint64_t>(inst.imm)]; break;
       case IrOp::BranchIf:

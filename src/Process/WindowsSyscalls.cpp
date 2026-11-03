@@ -23,6 +23,7 @@
 #include "Process/WindowsLocks.hpp"
 #include "Process/WindowsJobs.hpp"
 #include "Process/WindowsDebug.hpp"
+#include "Process/WindowsDialogs.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
@@ -41,6 +42,10 @@
 // ntdll we load into it holds the stubs ("mov r10, rcx; mov eax, number; syscall; ret"), so the numbers below are this OS's own (see
 // WindowsSyscallNumber), not those of any one Windows build, which change from release to release. Results are NTSTATUS values.
 namespace process {
+
+// win32k (src/Process/Win32k) hooks itself in here when install()ed; without it the services of win32k answer STATUS_NOT_IMPLEMENTED.
+uint64_t (*g_win32k_dispatch)(Process&, const SyscallRequest&, bool* handled) = nullptr;
+void (*g_win32k_process_exited)(uint64_t pid) = nullptr;
 
 namespace {
 
@@ -261,6 +266,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtTcosLinkModules: return windowsabi::nt_link_modules(process, r);
       case WindowsSyscallNumber::NtTcosToken: return windowsabi::nt_tcos_token(process, r);
       case WindowsSyscallNumber::NtTcosAccessCheck: return windowsabi::nt_tcos_access_check(process, r);
+      case WindowsSyscallNumber::NtTcosCommonDialog: return windowsabi::nt_tcos_common_dialog(process, r);
       case WindowsSyscallNumber::NtCancelSynchronousIoFile: return windowsabi::nt_cancel_synchronous_io_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);
@@ -310,6 +316,10 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtQuerySystemTime: return nt_query_system_time(process, r);
       case WindowsSyscallNumber::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter: return (r.args[1] == 0 || r.args[2] == 0) ? 0xC0000005u : 0xC00000BBu;      // no auxiliary counter: STATUS_NOT_SUPPORTED
       case WindowsSyscallNumber::NtAllocateVirtualMemory: return windowsabi::nt_allocate_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtAllocateVirtualMemoryEx: return windowsabi::nt_allocate_virtual_memory_ex(process, r);
+      case WindowsSyscallNumber::NtSetInformationVirtualMemory: return windowsabi::nt_set_information_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtAlertThreadByThreadId: return windowsabi::nt_alert_thread_by_thread_id(process, r);
+      case WindowsSyscallNumber::NtWaitForAlertByThreadId: return windowsabi::nt_wait_for_alert_by_thread_id(process, r);
       case WindowsSyscallNumber::NtFreeVirtualMemory: return windowsabi::nt_free_virtual_memory(process, r);
       case WindowsSyscallNumber::NtProtectVirtualMemory: return windowsabi::nt_protect_virtual_memory(process, r);
       case WindowsSyscallNumber::NtReadVirtualMemory: return windowsabi::nt_read_virtual_memory(process, r);
@@ -339,7 +349,13 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtFlushKey: return windowsabi::nt_flush_key(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.
-      default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return is_service(r.number) ? kStatusNotImplemented : kStatusInvalidSystemService;
+      default:
+        if (r.number >= kWin32kServiceBase && r.number < kWin32kServiceEnd && g_win32k_dispatch) {
+          bool handled = false;
+          const uint64_t result = g_win32k_dispatch(process, r, &handled);
+          if (handled) return result;
+        }
+        process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return is_service(r.number) ? kStatusNotImplemented : kStatusInvalidSystemService;
     }
   }
 };

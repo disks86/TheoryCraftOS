@@ -19,6 +19,7 @@
 #include "Desktop/Terminal.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace desktop {
 
@@ -294,6 +295,68 @@ bool Terminal::on_key(const KeyArgs& args) {
     }
   }
   return Frame::on_key(args);
+}
+
+// --- The running program's common dialogs ---------------------------------------------------
+
+namespace {
+
+// What the thread of the program waits on while a dialog is up; the dialog's result handler (on the dialog's own handler thread) wakes it.
+struct DialogWait {
+  kernel::Mutex mutex;
+  kernel::ConditionVariable ready;
+  bool done = false;
+};
+
+void dialog_done(void* context, Control&) {
+  auto* wait = static_cast<DialogWait*>(context);
+  kernel::ScopedMutex lock(wait->mutex);
+  wait->done = true;
+  wait->ready.notify_all();
+}
+
+void wait_for(DialogWait& wait) {
+  kernel::ScopedMutex lock(wait.mutex);
+  while (!wait.done) wait.ready.wait(wait.mutex);
+}
+
+}  // namespace
+
+bool Terminal::DialogBridge::run(const process::CommonDialogRequest& request, process::CommonDialogReply* reply) {
+  using Request = process::CommonDialogRequest;
+  WindowManager* manager = terminal_.manager();
+  if (!manager) return false;
+  DialogWait wait;
+  const Handler done{&dialog_done, &wait};
+  if (request.kind == Request::Kind::Color) {
+    ColorDialog* dialog = terminal_.color_dialog_;
+    if (!dialog) return false;
+    if (!dialog->show(*manager, request.title.view(), 0xFF000000u | request.color, done)) {
+      dialog->on_closed(Handler());
+      return false;
+    }
+    wait_for(wait);
+    reply->accepted = dialog->accepted();
+    reply->color = dialog->color() & 0xFFFFFFu;
+    return true;
+  }
+  FileDialog* dialog = terminal_.dialog_;
+  if (!dialog) return false;
+  FileDialog::Filter filters[FileDialog::kMaxFilters];
+  const uint32_t count = request.filter_count < FileDialog::kMaxFilters ? request.filter_count : FileDialog::kMaxFilters;
+  for (uint32_t i = 0; i < count; ++i) filters[i] = {request.filters[i].name.c_str(), request.filters[i].extensions.c_str()};
+  const bool save = request.kind == Request::Kind::SaveFile;
+  const StringView title = request.title.empty() ? StringView(save ? "Save As" : "Open") : request.title.view();
+  if (!dialog->show(*manager, save ? FileDialog::Mode::Save : FileDialog::Mode::Open, title, filters, count, request.start_path.view(), done)) {
+    dialog->on_closed(Handler());
+    return false;
+  }
+  wait_for(wait);
+  reply->accepted = dialog->accepted();
+  if (reply->accepted) reply->path.assign(dialog->selected_path());
+  const int32_t chosen = dialog->type_box().selected_index();
+  reply->filter_index = chosen < 0 ? 0 : static_cast<uint32_t>(chosen);
+  return true;
 }
 
 }  // namespace desktop

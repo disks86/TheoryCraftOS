@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Executable/ExecutableKind.hpp"
+#include "Process/CommonDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/FixedString.hpp"
@@ -47,6 +48,8 @@ class IProgramSink {
   // The program is about to start / has ended; `control` is valid in between.
   virtual void program_started(IProgramControl* control) = 0;
   virtual void program_ended() = 0;
+  // Where the program's common dialogs (file and colour choosers) are shown, if the sink can show them; the program's thread waits in run() for the answer.
+  virtual process::ICommonDialogs* common_dialogs() { return nullptr; }
 
  protected:
   IProgramSink() = default;

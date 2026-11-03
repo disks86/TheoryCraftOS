@@ -39,6 +39,9 @@ $cc -O1 -Wall -Wextra -o "$out/apctest.exe" tests/windows/apctest.c
 echo "built $out/apctest.exe (APCs, alertable waits, waitable timers, OpenProcess; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/mmaptest.exe" tests/windows/mmaptest.c
 echo "built $out/mmaptest.exe (file mappings; procchild.exe in System32)"
+x86_64-w64-mingw32-windres tests/windows/batchtest.rc -O coff -o "$out/batchtest_rc.o"
+$cc -O1 -Wall -Wextra -Wno-unused-parameter -o "$out/batchtest.exe" tests/windows/batchtest.c "$out/batchtest_rc.o" -lpsapi -lsynchronization -lmincore
+echo "built $out/batchtest.exe (WaitOnAddress, resources, VirtualAlloc2, settings, packages, aliases, file names, backup streams, namespaces, durations)"
 $cc -O1 -Wall -Wextra -o "$out/extratest.exe" tests/windows/extratest.c
 echo "built $out/extratest.exe (fibers, thread pool, timer queues, volumes, ini files, small things)"
 $cc -O1 -Wall -Wextra -o "$out/nlstest.exe" tests/windows/nlstest.c

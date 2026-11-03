@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Process/Win32k/Win32k.hpp"
 #include "Jit/CodePageSource.hpp"
 #include "Jit/CrossCoreTlbShootdown.hpp"
 #include "Jit/KernelCodeMemory.hpp"
@@ -707,6 +708,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The CPU renderer as an adapter of its own (Windows has its "WARP" one) next to the display GPU's, so the 3D test can draw on either and compare.
   if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);
+  process::win32k::install_dxg();      // (the NtGdiDdDDI* services of win32u.dll reach the kernel-mode Direct3D driver)
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
   if (dxg_adapters > 1)
     for (uint32_t i = 0; i + 1 < dxg_adapters; ++i) {

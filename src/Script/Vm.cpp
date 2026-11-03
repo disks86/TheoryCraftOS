@@ -17,6 +17,7 @@
  */
 
 #include "Script/Vm.hpp"
+#include "Script/VmJit.hpp"
 #ifdef TCOS_ERROR_LINES
 #include <stdio.h>
 #endif
@@ -114,7 +115,16 @@ Vm::Vm(allocators::IAllocator& allocator, IHost* host)
   for (int i = 1; i < 5; ++i) error_protos_[i] = new_object(error_proto_);
   ok_ = empty_ && global_ && error_protos_[4] && install_builtins(*this);
   if (!ok_) halted_ = true;
+  jit_ = UniquePointer<VmJit>::make(allocator_, *this);
 }
+
+void Vm::set_jit(bool enabled, uint32_t hot_threshold) {
+  if (!jit_) return;
+  jit_->set_enabled(enabled);
+  jit_->set_threshold(hot_threshold);
+}
+uint64_t Vm::jit_regions() const { return jit_ ? jit_->compiled_regions() : 0; }
+uint64_t Vm::jit_entries() const { return jit_ ? jit_->entries() : 0; }
 
 Vm::~Vm() {
   Cell* c = cells_;
@@ -3031,11 +3041,16 @@ bool Vm::execute(uint32_t entry_depth) {
   const Instr* instrs;
   uint32_t pc;
   Frame* fp;
+  // The JIT (VmJit.hpp): at a few points (a frame was entered or came back, a backward jump, after compiled code left for an instruction it does not do) the loop
+  // offers to hand over to compiled code. `probe` counts the instructions until the next offer: 1 is at once, 2 after the next instruction.
+  const uint32_t probe_on = jit_ && jit_->enabled() ? 1 : 0;
+  uint32_t probe = probe_on;
 reload:
   fp = &frames_[frames_.count() - 1];
   code = fp->code;
   instrs = &code->code[0];
   pc = fp->pc;
+  probe = probe_on;
   for (;;) {
     if (halted_) {
       has_exception_ = true;
@@ -3054,6 +3069,21 @@ reload:
     if (gc_wanted_ && native_depth_ == pass_depth_ && gc_hold_ == 0) {
       fp->pc = pc;
       collect();
+    }
+    if (probe && --probe == 0) {
+      uint64_t jx = 0;
+      if (jit_->enter(pc, &jx)) {
+        pc = kScriptExitPc(jx);
+        sp_ = fp->base + kScriptExitHeight(jx);
+        fp->pc = pc;
+        if (jx & kScriptExitException) THROW_PENDING();   // (a helper failed: the exception is pending and pc is after the instruction)
+        probe = 2;
+        if (jx & kScriptExitTick) {   // a loop ran for a while: charge the budget, then straight back in
+          probe = 1;
+          charge(4096 * 8);
+        }
+        continue;
+      }
     }
     const Instr in = instrs[pc++];
     fp->pc = pc;
@@ -3419,12 +3449,21 @@ reload:
       }
       case Opc::Typeof: stack_[sp_ - 1] = Value::make_string(intern(type_of(stack_[sp_ - 1]))); break;
       case Opc::Void: stack_[sp_ - 1] = Value(); break;
-      case Opc::Jump: pc = static_cast<uint32_t>(in.a); break;
+      case Opc::Jump:
+        pc = static_cast<uint32_t>(in.a);
+        if (pc < fp->pc) probe = probe_on;   // (backward: a loop)
+        break;
       case Opc::JumpIfFalse:
-        if (!to_boolean(stack_[--sp_])) pc = static_cast<uint32_t>(in.a);
+        if (!to_boolean(stack_[--sp_])) {
+          pc = static_cast<uint32_t>(in.a);
+          if (pc < fp->pc) probe = probe_on;
+        }
         break;
       case Opc::JumpIfTrue:
-        if (to_boolean(stack_[--sp_])) pc = static_cast<uint32_t>(in.a);
+        if (to_boolean(stack_[--sp_])) {
+          pc = static_cast<uint32_t>(in.a);
+          if (pc < fp->pc) probe = probe_on;
+        }
         break;
       case Opc::CheckReturn:
         if (is_generator_return(stack_[sp_ - 1])) pc = static_cast<uint32_t>(in.a);

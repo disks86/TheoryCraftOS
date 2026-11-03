@@ -25,10 +25,10 @@ bool RiscV64Assembler::i_type(uint32_t opcode, uint32_t funct3, RvReg rd, RvReg 
   return true;
 }
 
-bool RiscV64Assembler::sd(RvReg base, int32_t offset, RvReg src) {
+bool RiscV64Assembler::store(uint32_t funct3, RvReg base, int32_t offset, RvReg src) {
   if (offset < -2048 || offset > 2047) return false;
   const uint32_t imm = static_cast<uint32_t>(offset) & 0xFFFu;
-  emit(0x23u | (imm & 0x1Fu) << 7 | 3u << 12 | static_cast<uint32_t>(base) << 15 | static_cast<uint32_t>(src) << 20 | (imm >> 5) << 25);
+  emit(0x23u | (imm & 0x1Fu) << 7 | funct3 << 12 | static_cast<uint32_t>(base) << 15 | static_cast<uint32_t>(src) << 20 | (imm >> 5) << 25);
   return true;
 }
 

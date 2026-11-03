@@ -219,17 +219,21 @@ static DWORD wide_result_to_ansi(const WCHAR *w, DWORD length, LPSTR buffer, DWO
 
 /* ---- memory ------------------------------------------------------------------------------------------------------------------------------------------- */
 
+static void watch_note(LPVOID base, SIZE_T size);      /* (extra4.inc: regions allocated with MEM_WRITE_WATCH) */
+static void watch_forget(LPVOID base);
 EXPORT LPVOID WINAPI VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protect) {
   PVOID base = address;
   SIZE_T bytes = size;
   const NTSTATUS status = NtAllocateVirtualMemory(NtCurrentProcess(), &base, 0, &bytes, type, protect);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  if (type & 0x200000) watch_note(base, bytes);
   return base;
 }
 EXPORT BOOL WINAPI VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
   PVOID base = address;
   SIZE_T bytes = size;
   const NTSTATUS status = NtFreeVirtualMemory(NtCurrentProcess(), &base, &bytes, type);
+  if (NT_SUCCESS(status) && (type & 0x8000)) watch_forget(base);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI VirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
@@ -1859,12 +1863,14 @@ EXPORT LPVOID WINAPI VirtualAllocEx(HANDLE process, LPVOID address, SIZE_T size,
   SIZE_T bytes = size;
   const NTSTATUS status = NtAllocateVirtualMemory(process, &base, 0, &bytes, type, protect);
   if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  if ((type & 0x200000) && process == NtCurrentProcess()) watch_note(base, bytes);
   return base;
 }
 EXPORT BOOL WINAPI VirtualFreeEx(HANDLE process, LPVOID address, SIZE_T size, DWORD type) {
   PVOID base = address;
   SIZE_T bytes = size;
   const NTSTATUS status = NtFreeVirtualMemory(process, &base, &bytes, type);
+  if (NT_SUCCESS(status) && (type & 0x8000)) watch_forget(base);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI VirtualProtectEx(HANDLE process, LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
@@ -3908,7 +3914,12 @@ EXPORT BOOL WINAPI GetFileInformationByHandle(HANDLE h, LPBY_HANDLE_FILE_INFORMA
   info->dwVolumeSerialNumber = 1;
   info->nFileSizeLow = *(DWORD *)(standard + 8);
   info->nFileSizeHigh = *(DWORD *)(standard + 12);
-  info->nNumberOfLinks = 1;
+  info->nNumberOfLinks = *(DWORD *)(standard + 16);
+  BYTE internal[8];      /* FileInternalInformation: the index of the file, the same through every hard link */
+  if (NT_SUCCESS(NtQueryInformationFile(h, &iosb, internal, sizeof(internal), 6))) {
+    info->nFileIndexLow = *(DWORD *)internal;
+    info->nFileIndexHigh = *(DWORD *)(internal + 4);
+  }
   return TRUE;
 }
 EXPORT BOOL WINAPI GetFileTime(HANDLE h, LPFILETIME created, LPFILETIME accessed, LPFILETIME written) {
@@ -4691,4 +4702,4 @@ EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
 #include "idn.inc"
 #include "actctx.inc"
 #include "rsrcupdate.inc"
-#include "resenum.inc"
+#include "extra4.inc"

@@ -44,6 +44,8 @@ struct RamFileSystem::Content {
   uint32_t open_count = 0;
   uint64_t created = 0, modified = 0;    // seconds since 1970 UTC (0: no clock when it was made)
   bool read_only = false;
+  uint64_t id = 0;          // the file's identity, the same through every hard link
+  uint32_t links = 0;       // directory entries that name this data
 };
 
 struct RamFileSystem::Node {
@@ -52,7 +54,7 @@ struct RamFileSystem::Node {
     name.assign(node_name);
     created = modified = unix_time_now();
   }
-  ~Node() = default;
+  ~Node() { if (content && content->links) --content->links; }
 
   allocators::IAllocator& allocator;
   Node* parent;
@@ -173,6 +175,8 @@ void RamFileSystem::describe(const Node& node, DirectoryEntry* entry) {
   entry->read_only = file_node ? node.content->read_only : false;
   entry->modified = file_node ? node.content->modified : node.modified;
   entry->created = file_node ? node.content->created : node.created;
+  entry->file_id = file_node ? node.content->id : 0;
+  entry->link_count = file_node ? node.content->links : 0;
 }
 
 Status RamFileSystem::follow_symlink(const Node& link, Node* from, Node** node, uint32_t* hops) {
@@ -285,6 +289,8 @@ Status RamFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<IF
       node->content = SharedPointer<Content>::make(allocator_, allocator_);
       if (!node->content) { parent->children.remove_at(parent->children.count() - 1); return Status::OutOfMemory; }
       node->content->created = node->content->modified = unix_time_now();
+      node->content->id = (uint64_t{1} << 62) | ++next_file_id_;
+      node->content->links = 1;
     } else {
       node = parent->children[at].get();
       if (node->type == NodeType::Symlink) {
@@ -411,6 +417,7 @@ Status RamFileSystem::create_hard_link(StringView existing, StringView link) {
   found = add_child(*parent, leaf, NodeType::File, &created);
   if (found != Status::Ok) return found;
   created->content = target->content;      // the new name shares the same data, size, times and read-only flag
+  ++created->content->links;
   return Status::Ok;
 }
 

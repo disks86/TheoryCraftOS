@@ -17,6 +17,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include "Process/CommonDialog.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/StartupSpec.hpp"
 #include "Process/Syscall.hpp"
@@ -207,6 +208,8 @@ class IProcessHost {
   virtual uint64_t console_input_available(bool* at_end) { *at_end = false; return 0; }
   // Optional: the process ended while one of its threads may be blocked in read_console() or sleep_ns(): make that return.
   virtual void wake_blocked() {}
+  // Optional: the screen the program's common dialogs (Windows comdlg32) are shown on; nullptr when it has none.
+  virtual ICommonDialogs* common_dialogs() { return nullptr; }
 
  protected:
   IProcessHost() = default;
@@ -290,6 +293,7 @@ class Process {
     static constexpr uint32_t kMaxApcs = 32;
     Apc apcs[kMaxApcs];
     uint32_t apc_count = 0;
+    bool alerted = false;                             // NtAlertThreadByThreadId was called and NtWaitForAlertByThreadId has not taken it yet (WaitOnAddress)
     uint64_t start_address = 0;                       // where the thread began (the start routine), 0 if not known
     uint32_t completion_port = 0;                     // the I/O completion port object the thread took a packet from last (while it is associated with one, its packets go before its APCs)
     int32_t priority = 0;                             // THREAD_PRIORITY_NORMAL; kept for the program to read back
