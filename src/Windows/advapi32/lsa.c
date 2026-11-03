@@ -175,15 +175,6 @@ __declspec(dllexport) NTSTATUS WINAPI LsaGetUserName(PUNICODE_STRING *user_name,
  * LsaAddAccountRights [ADVAPI32.@]
  *
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaAddAccountRights(
-    LSA_HANDLE policy,
-    PSID sid,
-    PLSA_UNICODE_STRING rights,
-    ULONG count)
-{
-    
-    return STATUS_SUCCESS;
-}
 
 /******************************************************************************
  * LsaClose [ADVAPI32.@]
@@ -197,8 +188,10 @@ __declspec(dllexport) NTSTATUS WINAPI LsaAddAccountRights(
  *  Success: STATUS_SUCCESS.
  *  Failure: NTSTATUS code.
  */
+BOOL lsa_close_object(LSA_HANDLE);
 __declspec(dllexport) NTSTATUS WINAPI LsaClose(IN LSA_HANDLE ObjectHandle)
 {
+    if (lsa_close_object(ObjectHandle)) return STATUS_SUCCESS;
     
     return STATUS_SUCCESS;
 }
@@ -232,47 +225,16 @@ __declspec(dllexport) NTSTATUS WINAPI LsaDeleteTrustedDomain(LSA_HANDLE policy, 
  * LsaEnumerateAccountRights [ADVAPI32.@]
  *
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaEnumerateAccountRights(
-    LSA_HANDLE policy,
-    PSID sid,
-    PLSA_UNICODE_STRING *rights,
-    PULONG count)
-{
-    
-    *rights = 0;
-    *count = 0;
-    return STATUS_OBJECT_NAME_NOT_FOUND;
-}
 
 /******************************************************************************
  * LsaEnumerateAccounts [ADVAPI32.@]
  *
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaEnumerateAccounts(
-    LSA_HANDLE policy,
-    PLSA_ENUMERATION_HANDLE context,
-    PVOID *buffer,
-    ULONG maxlen,
-    PULONG count)
-{
-    
-    if (count) *count = 0;
-    return STATUS_NO_MORE_ENTRIES;
-}
 
 /******************************************************************************
  * LsaEnumerateAccountsWithUserRight [ADVAPI32.@]
  *
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaEnumerateAccountsWithUserRight(
-    LSA_HANDLE policy,
-    PLSA_UNICODE_STRING rights,
-    PVOID *buffer,
-    PULONG count)
-{
-    
-    return STATUS_NO_MORE_ENTRIES;
-}
 
 /******************************************************************************
  * LsaEnumerateTrustedDomains [ADVAPI32.@]
@@ -967,16 +929,6 @@ __declspec(dllexport) NTSTATUS WINAPI LsaRegisterPolicyChangeNotification(
  * LsaRemoveAccountRights [ADVAPI32.@]
  *
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaRemoveAccountRights(
-    LSA_HANDLE policy,
-    PSID sid,
-    BOOLEAN all,
-    PLSA_UNICODE_STRING rights,
-    ULONG count)
-{
-    
-    return STATUS_SUCCESS;
-}
 
 /******************************************************************************
  * LsaRetrievePrivateData [ADVAPI32.@]
@@ -992,14 +944,6 @@ __declspec(dllexport) NTSTATUS WINAPI LsaRemoveAccountRights(
  *  Success: STATUS_SUCCESS.
  *  Failure: STATUS_OBJECT_NAME_NOT_FOUND or NTSTATUS code.
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaRetrievePrivateData(
-    IN LSA_HANDLE PolicyHandle,
-    IN PLSA_UNICODE_STRING KeyName,
-    OUT PLSA_UNICODE_STRING* PrivateData)
-{
-    
-    return STATUS_OBJECT_NAME_NOT_FOUND;
-}
 
 /******************************************************************************
  * LsaSetInformationPolicy [ADVAPI32.@]
@@ -1039,14 +983,6 @@ __declspec(dllexport) NTSTATUS WINAPI LsaSetInformationPolicy(
  *  Success: STATUS_SUCCESS
  *  Failure: NTSTATUS code.
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaSetSecret(
-    IN LSA_HANDLE SecretHandle,
-    IN PLSA_UNICODE_STRING EncryptedCurrentValue,
-    IN PLSA_UNICODE_STRING EncryptedOldValue)
-{
-    
-    return STATUS_SUCCESS;
-}
 
 /******************************************************************************
  * LsaSetTrustedDomainInfoByName [ADVAPI32.@]
@@ -1090,14 +1026,6 @@ __declspec(dllexport) NTSTATUS WINAPI LsaSetTrustedDomainInformation(
  *  Success: STATUS_SUCCESS.
  *  Failure: STATUS_OBJECT_NAME_NOT_FOUND or NTSTATUS code.
  */
-__declspec(dllexport) NTSTATUS WINAPI LsaStorePrivateData(
-    IN LSA_HANDLE PolicyHandle,
-    IN PLSA_UNICODE_STRING KeyName,
-    IN PLSA_UNICODE_STRING PrivateData)
-{
-    
-    return STATUS_OBJECT_NAME_NOT_FOUND;
-}
 
 /******************************************************************************
  * LsaUnregisterPolicyChangeNotification [ADVAPI32.@]
@@ -1160,10 +1088,3 @@ __declspec(dllexport) NTSTATUS WINAPI LsaLookupPrivilegeDisplayName(LSA_HANDLE h
  * AuditQuerySystemPolicy [ADVAPI32.@]
  *
  */
-__declspec(dllexport) BOOLEAN WINAPI AuditQuerySystemPolicy(const GUID* guids, ULONG count, AUDIT_POLICY_INFORMATION** policy)
-{
-
-    
-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return FALSE;
-}
