@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Process/Win32k/Win32k.hpp"
 #include "Program/EmulatedTask.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Delay.hpp"
@@ -95,6 +96,7 @@ bool ensure_system_objects(allocators::IAllocator& allocator) {
   process::ObjectManager* objects = new (objects_memory) process::ObjectManager(*sync);
   objects->set_allocator(&allocator);
   process::set_system_objects(objects);      // (lives as long as the system does)
+  process::win32k::install();
   return true;
 }
 
