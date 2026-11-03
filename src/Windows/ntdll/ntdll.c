@@ -952,6 +952,7 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "sync.inc"
 #include "threadpool.inc"
 #include "etw.inc"
+#include "rtlx1.inc"
 
 /* ---- critical sections (one thread: they only count) ---------------------------------------------------------------------------------------------------- */
 
