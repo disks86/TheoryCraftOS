@@ -210,6 +210,95 @@ bool X86_64Backend::compile(const IrBlock& block, CodeBuffer& out) {
         as.call_r(rax);
         write(inst.dst, rax);
         break;
+      case IrOp::LoadPtr: {
+        if (inst.imm < INT32_MIN || inst.imm > INT32_MAX) return false;
+        const int32_t disp = static_cast<int32_t>(inst.imm);
+        const X86Reg base = read(rax, inst.a);
+        const X86Reg d = target(inst.dst);
+        switch (inst.mem) {
+          case IrMem::U8: as.mov_load8_zx(d, base, disp); break;
+          case IrMem::U16: as.mov_load16_zx(d, base, disp); break;
+          case IrMem::U32: as.mov_load32(d, base, disp); break;
+          case IrMem::U64: as.mov_load(d, base, disp); break;
+          case IrMem::S8: as.mov_load8_sx(d, base, disp); break;
+          case IrMem::S16: as.mov_load16_sx(d, base, disp); break;
+          case IrMem::S32: as.mov_load32_sx(d, base, disp); break;
+        }
+        write(inst.dst, d);
+        break;
+      }
+      case IrOp::StorePtr: {
+        if (inst.imm < INT32_MIN || inst.imm > INT32_MAX) return false;
+        const int32_t disp = static_cast<int32_t>(inst.imm);
+        const X86Reg base = read(rax, inst.a);
+        const X86Reg value = read(rcx, inst.b);
+        switch (inst.mem) {
+          case IrMem::U8: as.mov_store8(base, disp, value); break;
+          case IrMem::U16: as.mov_store16(base, disp, value); break;
+          case IrMem::U32: as.mov_store32(base, disp, value); break;
+          case IrMem::U64: as.mov_store(base, disp, value); break;
+          default: return false;
+        }
+        break;
+      }
+      case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: {
+        as.movq_to_xmm(0, read(rax, inst.a));
+        as.movq_to_xmm(1, read(rcx, inst.b));
+        if (inst.op == IrOp::FAdd) as.addsd(0, 1);
+        else if (inst.op == IrOp::FSub) as.subsd(0, 1);
+        else if (inst.op == IrOp::FMul) as.mulsd(0, 1);
+        else as.divsd(0, 1);
+        as.movq_from_xmm(rax, 0);
+        write(inst.dst, rax);
+        break;
+      }
+      case IrOp::FSetCond: {
+        // ucomisd sets ZF, PF, CF to 1 when a number is a NaN, so "above" and "above or equal" (CF = 0) are false for it; less than is greater than with the
+        // operands swapped. Equality has to rule out the unordered case through PF.
+        const bool swap = inst.cond == IrCond::Lt || inst.cond == IrCond::Le;
+        as.movq_to_xmm(swap ? 1 : 0, read(rax, inst.a));
+        as.movq_to_xmm(swap ? 0 : 1, read(rcx, inst.b));
+        as.ucomisd(0, 1);
+        switch (inst.cond) {
+          case IrCond::Gt: case IrCond::Lt: as.setcc(X86Cond::A, rax); break;
+          case IrCond::Ge: case IrCond::Le: as.setcc(X86Cond::Ae, rax); break;
+          case IrCond::Eq:
+            as.setcc(X86Cond::E, rax);
+            as.setcc(X86Cond::Np, rcx);
+            as.and_rr(rax, rcx);
+            break;
+          case IrCond::Ne:
+            as.setcc(X86Cond::Ne, rax);
+            as.setcc(X86Cond::P, rcx);
+            as.or_rr(rax, rcx);
+            break;
+          default: return false;
+        }
+        write(inst.dst, rax);
+        break;
+      }
+      case IrOp::I2F:
+        as.cvtsi2sd(0, read(rax, inst.a));
+        as.movq_from_xmm(rax, 0);
+        write(inst.dst, rax);
+        break;
+      case IrOp::F2D:
+        as.movd_to_xmm(0, read(rax, inst.a));
+        as.cvtss2sd(0, 0);
+        as.movq_from_xmm(rax, 0);
+        write(inst.dst, rax);
+        break;
+      case IrOp::D2F:
+        as.movq_to_xmm(0, read(rax, inst.a));
+        as.cvtsd2ss(0, 0);
+        as.movd_from_xmm(rax, 0);
+        write(inst.dst, rax);
+        break;
+      case IrOp::F2I:
+        as.movq_to_xmm(0, read(rax, inst.a));
+        as.cvttsd2si(rax, 0);
+        write(inst.dst, rax);
+        break;
       case IrOp::Label:
         if (!out.bind(labels[static_cast<uint64_t>(inst.imm)])) return false;
         break;

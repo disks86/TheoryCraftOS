@@ -221,6 +221,107 @@ bool RiscV64Backend::compile(const IrBlock& block, CodeBuffer& out) {
         as.jalr(RvRa, kScratch, 0);
         write(inst.dst, RvA0);
         break;
+      case IrOp::LoadPtr: case IrOp::StorePtr: {
+        // The address a + imm: the offset goes in the instruction when it fits, otherwise the sum is made in t2.
+        const RvReg a = read(kT0, inst.a);
+        RvReg address = a;
+        int32_t offset = 0;
+        if (inst.imm >= -2048 && inst.imm <= 2047) {
+          offset = static_cast<int32_t>(inst.imm);
+        } else {
+          as.li(kScratch, inst.imm);
+          as.add(kScratch, a, kScratch);
+          address = kScratch;
+        }
+        if (inst.op == IrOp::StorePtr) {
+          const RvReg v = read(kT1, inst.b);
+          switch (inst.mem) {
+            case IrMem::U8: as.sb(address, offset, v); break;
+            case IrMem::U16: as.sh(address, offset, v); break;
+            case IrMem::U32: as.sw(address, offset, v); break;
+            case IrMem::U64: as.sd(address, offset, v); break;
+            default: return false;
+          }
+          break;
+        }
+        const RvReg d = target(inst.dst);
+        switch (inst.mem) {
+          case IrMem::U8: as.lbu(d, address, offset); break;
+          case IrMem::U16: as.lhu(d, address, offset); break;
+          case IrMem::U32: as.lwu(d, address, offset); break;
+          case IrMem::U64: as.ld(d, address, offset); break;
+          case IrMem::S8: as.lb(d, address, offset); break;
+          case IrMem::S16: as.lh(d, address, offset); break;
+          case IrMem::S32: as.lw(d, address, offset); break;
+        }
+        write(inst.dst, d);
+        break;
+      }
+      case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: {
+        if (!floating_point_) return false;
+        as.fmv_d_x(0, read(kT0, inst.a));
+        as.fmv_d_x(1, read(kT1, inst.b));
+        if (inst.op == IrOp::FAdd) as.fadd_d(0, 0, 1);
+        else if (inst.op == IrOp::FSub) as.fsub_d(0, 0, 1);
+        else if (inst.op == IrOp::FMul) as.fmul_d(0, 0, 1);
+        else as.fdiv_d(0, 0, 1);
+        as.fmv_x_d(kT0, 0);
+        write(inst.dst, kT0);
+        break;
+      }
+      case IrOp::FSetCond: {
+        if (!floating_point_) return false;
+        as.fmv_d_x(0, read(kT0, inst.a));
+        as.fmv_d_x(1, read(kT1, inst.b));
+        const RvReg d = target(inst.dst);
+        // feq / flt / fle give 0 when either operand is a NaN, which is what the IR wants for all but "not equal".
+        switch (inst.cond) {
+          case IrCond::Eq: as.feq_d(d, 0, 1); break;
+          case IrCond::Ne: as.feq_d(d, 0, 1); as.xori(d, d, 1); break;
+          case IrCond::Lt: as.flt_d(d, 0, 1); break;
+          case IrCond::Le: as.fle_d(d, 0, 1); break;
+          case IrCond::Gt: as.flt_d(d, 1, 0); break;
+          case IrCond::Ge: as.fle_d(d, 1, 0); break;
+          default: return false;
+        }
+        write(inst.dst, d);
+        break;
+      }
+      case IrOp::I2F:
+        if (!floating_point_) return false;
+        as.fcvt_d_l(0, read(kT0, inst.a));
+        as.fmv_x_d(kT0, 0);
+        write(inst.dst, kT0);
+        break;
+      case IrOp::F2I: {
+        if (!floating_point_) return false;
+        as.fmv_d_x(0, read(kT0, inst.a));
+        as.fcvt_l_d_rtz(kT0, 0);
+        // A NaN and anything too big positive give INT64_MAX (which is not a double): the IR says INT64_MIN for those.
+        const Label fits = out.new_label();
+        as.li(kT1, INT64_MAX);
+        as.branch(RvBranch::Ne, kT0, kT1, fits);
+        as.li(kT0, INT64_MIN);
+        if (!out.bind(fits)) return false;
+        write(inst.dst, kT0);
+        break;
+      }
+      case IrOp::F2D:
+        if (!floating_point_) return false;
+        as.fmv_w_x(0, read(kT0, inst.a));
+        as.fcvt_d_s(0, 0);
+        as.fmv_x_d(kT0, 0);
+        write(inst.dst, kT0);
+        break;
+      case IrOp::D2F:
+        if (!floating_point_) return false;
+        as.fmv_d_x(0, read(kT0, inst.a));
+        as.fcvt_s_d(0, 0);
+        as.fmv_x_w(kT0, 0);
+        as.slli(kT0, kT0, 32);   // (fmv.x.w sign extends: the IR wants the upper half zero)
+        as.srli(kT0, kT0, 32);
+        write(inst.dst, kT0);
+        break;
       case IrOp::Label:
         if (!out.bind(labels[static_cast<uint64_t>(inst.imm)])) return false;
         break;

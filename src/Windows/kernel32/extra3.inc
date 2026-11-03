@@ -693,8 +693,9 @@ EXPORT void WINAPI ClosePseudoConsole(HANDLE console) {
 }
 
 /* GetProcessInformation: only the machine of the process (ProcessMachineTypeInfo) is answered. */
+static BOOL process_information(HANDLE process, int information_class, LPVOID information, DWORD size, BOOL set);      /* (extra4.inc: the settings a program keeps about itself) */
 EXPORT BOOL WINAPI GetProcessInformation(HANDLE process, int information_class, LPVOID information, DWORD size) {
-  if (information_class != 9 /* ProcessMachineTypeInfo */) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (information_class != 9 /* ProcessMachineTypeInfo */) return process_information(process, information_class, information, size, FALSE);
   if (size != 8) { set_error(ERROR_BAD_LENGTH); return FALSE; }
   DWORD machines[8] = {};
   const NTSTATUS status = NtQuerySystemInformationEx(230 /* SystemSupportedProcessorArchitectures2 */, &process, sizeof(process), machines, sizeof(machines), NULL);

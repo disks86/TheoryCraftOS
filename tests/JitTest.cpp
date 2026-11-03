@@ -127,6 +127,36 @@ void test_x86_encodings() {
       {[](X86_64Assembler& s) { s.ret(); }, {0xc3}},
       {[](X86_64Assembler& s) { s.call_r(R::Rax); }, {0xff, 0xd0}},
       {[](X86_64Assembler& s) { s.jmp_r(R::R11); }, {0x41, 0xff, 0xe3}},
+      // narrow memory access and scalar double SSE2 (bytes from llvm-mc)
+      {[](X86_64Assembler& s) { s.mov_load8_zx(R::Rax, R::Rbx, 8); }, {0x48, 0x0f, 0xb6, 0x43, 0x08}},
+      {[](X86_64Assembler& s) { s.mov_load16_zx(R::R9, R::R12, 0); }, {0x4d, 0x0f, 0xb7, 0x0c, 0x24}},
+      {[](X86_64Assembler& s) { s.mov_load8_sx(R::Rax, R::R13, 300); }, {0x49, 0x0f, 0xbe, 0x85, 0x2c, 0x01, 0x00, 0x00}},
+      {[](X86_64Assembler& s) { s.mov_load16_sx(R::Rcx, R::Rbp, -16); }, {0x48, 0x0f, 0xbf, 0x4d, 0xf0}},
+      {[](X86_64Assembler& s) { s.mov_load32_sx(R::Rax, R::Rax, 4); }, {0x48, 0x63, 0x40, 0x04}},
+      {[](X86_64Assembler& s) { s.mov_store8(R::Rax, 3, R::Rsi); }, {0x40, 0x88, 0x70, 0x03}},
+      {[](X86_64Assembler& s) { s.mov_store8(R::R12, 3, R::R10); }, {0x45, 0x88, 0x54, 0x24, 0x03}},
+      {[](X86_64Assembler& s) { s.mov_store16(R::Rbx, 8, R::Rcx); }, {0x66, 0x89, 0x4b, 0x08}},
+      {[](X86_64Assembler& s) { s.mov_store16(R::R13, 0, R::R9); }, {0x66, 0x45, 0x89, 0x4d, 0x00}},
+      {[](X86_64Assembler& s) { s.movq_to_xmm(0, R::Rax); }, {0x66, 0x48, 0x0f, 0x6e, 0xc0}},
+      {[](X86_64Assembler& s) { s.movq_to_xmm(1, R::R10); }, {0x66, 0x49, 0x0f, 0x6e, 0xca}},
+      {[](X86_64Assembler& s) { s.movq_from_xmm(R::Rax, 0); }, {0x66, 0x48, 0x0f, 0x7e, 0xc0}},
+      {[](X86_64Assembler& s) { s.movq_from_xmm(R::R11, 1); }, {0x66, 0x49, 0x0f, 0x7e, 0xcb}},
+      {[](X86_64Assembler& s) { s.addsd(0, 1); }, {0xf2, 0x0f, 0x58, 0xc1}},
+      {[](X86_64Assembler& s) { s.mulsd(0, 1); }, {0xf2, 0x0f, 0x59, 0xc1}},
+      {[](X86_64Assembler& s) { s.subsd(0, 1); }, {0xf2, 0x0f, 0x5c, 0xc1}},
+      {[](X86_64Assembler& s) { s.divsd(0, 1); }, {0xf2, 0x0f, 0x5e, 0xc1}},
+      {[](X86_64Assembler& s) { s.ucomisd(0, 1); }, {0x66, 0x0f, 0x2e, 0xc1}},
+      {[](X86_64Assembler& s) { s.ucomisd(1, 0); }, {0x66, 0x0f, 0x2e, 0xc8}},
+      {[](X86_64Assembler& s) { s.cvtsi2sd(0, R::Rax); }, {0xf2, 0x48, 0x0f, 0x2a, 0xc0}},
+      {[](X86_64Assembler& s) { s.cvtsi2sd(0, R::R9); }, {0xf2, 0x49, 0x0f, 0x2a, 0xc1}},
+      {[](X86_64Assembler& s) { s.cvttsd2si(R::Rax, 0); }, {0xf2, 0x48, 0x0f, 0x2c, 0xc0}},
+      {[](X86_64Assembler& s) { s.cvttsd2si(R::R10, 1); }, {0xf2, 0x4c, 0x0f, 0x2c, 0xd1}},
+      {[](X86_64Assembler& s) { s.movd_to_xmm(0, R::Rax); }, {0x66, 0x0f, 0x6e, 0xc0}},
+      {[](X86_64Assembler& s) { s.movd_to_xmm(1, R::R10); }, {0x66, 0x41, 0x0f, 0x6e, 0xca}},
+      {[](X86_64Assembler& s) { s.movd_from_xmm(R::Rax, 0); }, {0x66, 0x0f, 0x7e, 0xc0}},
+      {[](X86_64Assembler& s) { s.movd_from_xmm(R::R11, 1); }, {0x66, 0x41, 0x0f, 0x7e, 0xcb}},
+      {[](X86_64Assembler& s) { s.cvtss2sd(0, 0); }, {0xf3, 0x0f, 0x5a, 0xc0}},
+      {[](X86_64Assembler& s) { s.cvtsd2ss(0, 0); }, {0xf2, 0x0f, 0x5a, 0xc0}},
   };
   int n = 0;
   for (const Case& c : cases) {
@@ -177,6 +207,30 @@ void test_a64_encodings() {
       {[](AArch64Assembler& s) { s.blr(8); }, {0x00, 0x01, 0x3f, 0xd6}},
       {[](AArch64Assembler& s) { s.ret(); }, {0xc0, 0x03, 0x5f, 0xd6}},
       {[](AArch64Assembler& s) { s.brk(0); }, {0x00, 0x00, 0x20, 0xd4}},
+      {[](AArch64Assembler& s) { s.ldrb(3, 4); }, {0x83, 0x00, 0x40, 0x39}},
+      {[](AArch64Assembler& s) { s.ldrh(3, 4); }, {0x83, 0x00, 0x40, 0x79}},
+      {[](AArch64Assembler& s) { s.ldr_w(3, 4); }, {0x83, 0x00, 0x40, 0xb9}},
+      {[](AArch64Assembler& s) { s.ldrsb(3, 4); }, {0x83, 0x00, 0x80, 0x39}},
+      {[](AArch64Assembler& s) { s.ldrsh(3, 4); }, {0x83, 0x00, 0x80, 0x79}},
+      {[](AArch64Assembler& s) { s.ldrsw(3, 4); }, {0x83, 0x00, 0x80, 0xb9}},
+      {[](AArch64Assembler& s) { s.strb(3, 4); }, {0x83, 0x00, 0x00, 0x39}},
+      {[](AArch64Assembler& s) { s.strh(3, 4); }, {0x83, 0x00, 0x00, 0x79}},
+      {[](AArch64Assembler& s) { s.str_w(3, 4); }, {0x83, 0x00, 0x00, 0xb9}},
+      {[](AArch64Assembler& s) { s.fmov_to_d(0, 3); }, {0x60, 0x00, 0x67, 0x9e}},
+      {[](AArch64Assembler& s) { s.fmov_to_d(1, 4); }, {0x81, 0x00, 0x67, 0x9e}},
+      {[](AArch64Assembler& s) { s.fmov_from_d(3, 0); }, {0x03, 0x00, 0x66, 0x9e}},
+      {[](AArch64Assembler& s) { s.fadd(0, 0, 1); }, {0x00, 0x28, 0x61, 0x1e}},
+      {[](AArch64Assembler& s) { s.fsub(0, 0, 1); }, {0x00, 0x38, 0x61, 0x1e}},
+      {[](AArch64Assembler& s) { s.fmul(0, 0, 1); }, {0x00, 0x08, 0x61, 0x1e}},
+      {[](AArch64Assembler& s) { s.fdiv(0, 0, 1); }, {0x00, 0x18, 0x61, 0x1e}},
+      {[](AArch64Assembler& s) { s.fcmp(0, 1); }, {0x00, 0x20, 0x61, 0x1e}},
+      {[](AArch64Assembler& s) { s.fcmp(0, 0); }, {0x00, 0x20, 0x60, 0x1e}},
+      {[](AArch64Assembler& s) { s.scvtf(0, 3); }, {0x60, 0x00, 0x62, 0x9e}},
+      {[](AArch64Assembler& s) { s.fcvtzs(3, 0); }, {0x03, 0x00, 0x78, 0x9e}},
+      {[](AArch64Assembler& s) { s.fmov_to_s(0, 3); }, {0x60, 0x00, 0x27, 0x1e}},
+      {[](AArch64Assembler& s) { s.fcvt_s_to_d(0, 0); }, {0x00, 0xc0, 0x22, 0x1e}},
+      {[](AArch64Assembler& s) { s.fcvt_d_to_s(0, 0); }, {0x00, 0x40, 0x62, 0x1e}},
+      {[](AArch64Assembler& s) { s.fmov_from_s(3, 0); }, {0x03, 0x00, 0x26, 0x1e}},
   };
   int n = 0;
   for (const Case& c : cases) {
@@ -281,6 +335,31 @@ void test_rv_encodings() {
       {[](RiscV64Assembler& s) { s.jalr(RvRa, RvA0, 0); }, {0xe7, 0x00, 0x05, 0x00}},
       {[](RiscV64Assembler& s) { s.ret(); }, {0x67, 0x80, 0x00, 0x00}},
       {[](RiscV64Assembler& s) { s.ebreak(); }, {0x73, 0x00, 0x10, 0x00}},
+      {[](RiscV64Assembler& s) { s.lb(5, 6, 0); }, {0x83, 0x02, 0x03, 0x00}},
+      {[](RiscV64Assembler& s) { s.lh(5, 6, 0); }, {0x83, 0x12, 0x03, 0x00}},
+      {[](RiscV64Assembler& s) { s.lw(5, 6, 0); }, {0x83, 0x22, 0x03, 0x00}},
+      {[](RiscV64Assembler& s) { s.lbu(5, 6, 0); }, {0x83, 0x42, 0x03, 0x00}},
+      {[](RiscV64Assembler& s) { s.lhu(5, 6, 0); }, {0x83, 0x52, 0x03, 0x00}},
+      {[](RiscV64Assembler& s) { s.lwu(5, 6, 0); }, {0x83, 0x62, 0x03, 0x00}},
+      {[](RiscV64Assembler& s) { s.sb(6, 0, 5); }, {0x23, 0x00, 0x53, 0x00}},
+      {[](RiscV64Assembler& s) { s.sh(6, 0, 5); }, {0x23, 0x10, 0x53, 0x00}},
+      {[](RiscV64Assembler& s) { s.sw(6, 0, 5); }, {0x23, 0x20, 0x53, 0x00}},
+      {[](RiscV64Assembler& s) { s.fmv_d_x(0, 5); }, {0x53, 0x80, 0x02, 0xf2}},
+      {[](RiscV64Assembler& s) { s.fmv_d_x(1, 6); }, {0xd3, 0x00, 0x03, 0xf2}},
+      {[](RiscV64Assembler& s) { s.fmv_x_d(5, 0); }, {0xd3, 0x02, 0x00, 0xe2}},
+      {[](RiscV64Assembler& s) { s.fadd_d(0, 0, 1); }, {0x53, 0x70, 0x10, 0x02}},
+      {[](RiscV64Assembler& s) { s.fsub_d(0, 0, 1); }, {0x53, 0x70, 0x10, 0x0a}},
+      {[](RiscV64Assembler& s) { s.fmul_d(0, 0, 1); }, {0x53, 0x70, 0x10, 0x12}},
+      {[](RiscV64Assembler& s) { s.fdiv_d(0, 0, 1); }, {0x53, 0x70, 0x10, 0x1a}},
+      {[](RiscV64Assembler& s) { s.feq_d(5, 0, 1); }, {0xd3, 0x22, 0x10, 0xa2}},
+      {[](RiscV64Assembler& s) { s.flt_d(5, 0, 1); }, {0xd3, 0x12, 0x10, 0xa2}},
+      {[](RiscV64Assembler& s) { s.fle_d(5, 0, 1); }, {0xd3, 0x02, 0x10, 0xa2}},
+      {[](RiscV64Assembler& s) { s.fcvt_d_l(0, 5); }, {0x53, 0xf0, 0x22, 0xd2}},
+      {[](RiscV64Assembler& s) { s.fcvt_l_d_rtz(5, 0); }, {0xd3, 0x12, 0x20, 0xc2}},
+      {[](RiscV64Assembler& s) { s.fmv_w_x(0, 5); }, {0x53, 0x80, 0x02, 0xf0}},
+      {[](RiscV64Assembler& s) { s.fcvt_d_s(0, 0); }, {0x53, 0x00, 0x00, 0x42}},
+      {[](RiscV64Assembler& s) { s.fcvt_s_d(0, 0); }, {0x53, 0x70, 0x10, 0x40}},
+      {[](RiscV64Assembler& s) { s.fmv_x_w(5, 0); }, {0xd3, 0x02, 0x00, 0xe0}},
   };
   int n = 0;
   for (const Case& c : cases) {
@@ -540,6 +619,102 @@ void run_random(X86CallingConvention cc, int programs, uint32_t max_registers) {
       seed = seed * 6364136223846793005ull + 1442695040888963407ull;
     }
     mem.release(region);
+  }
+  CHECK(mem.live == 0);
+}
+
+// Pointer access and double precision operations against the IR interpreter: every width, with values that are awkward for floating point (NaN, infinities,
+// signed zeros, out of range for the integer conversion), on every register budget so that both register and memory operands are exercised.
+void test_backend_pointers_and_floats() {
+  if (!g_can_run) return;
+  TestAllocator a;
+  HostCodeMemory mem;
+  const double values[] = {0.0, -0.0, 1.0, -1.5, 2.5, 1e300, -1e300, 9.3e18, -9.3e18, 4294967296.5, 0.1, 3.0, __builtin_inf(), -__builtin_inf(), __builtin_nan("")};
+  const IrOp fops[] = {IrOp::FAdd, IrOp::FSub, IrOp::FMul, IrOp::FDiv};
+  const IrCond fconds[] = {IrCond::Eq, IrCond::Ne, IrCond::Lt, IrCond::Le, IrCond::Gt, IrCond::Ge};
+  for (uint32_t regs : {32u, 3u, 1u}) {
+    // state: 0 a, 1 b (double bit patterns), 2 buffer address, 3 integer; 4.. results
+    IrBlock block(a);
+    IrBuilder b(block);
+    b.set_state_size(8 * 40);
+    const uint32_t x = b.load_state(0), y = b.load_state(8), buf = b.load_state(16), n = b.load_state(24);
+    int slot = 4;
+    for (IrOp op : fops) b.store_state(8 * slot++, b.binary(op, x, y));
+    for (IrCond c : fconds) b.store_state(8 * slot++, b.fsetcond(c, x, y));
+    b.store_state(8 * slot++, b.unary(IrOp::F2I, x));
+    b.store_state(8 * slot++, b.unary(IrOp::I2F, n));
+    b.store_state(8 * slot++, b.unary(IrOp::F2D, x));
+    b.store_state(8 * slot++, b.unary(IrOp::D2F, x));
+    b.store_state(8 * slot++, b.unary(IrOp::D2F, b.unary(IrOp::F2D, n)));
+    // every width, signed and not, from the buffer (which holds a pattern) and stored back at other offsets
+    const IrMem loads[] = {IrMem::U8, IrMem::U16, IrMem::U32, IrMem::U64, IrMem::S8, IrMem::S16, IrMem::S32};
+    for (IrMem m : loads) b.store_state(8 * slot++, b.load_ptr(m, buf, 3));
+    b.store_ptr(IrMem::U8, buf, 64, n);
+    b.store_ptr(IrMem::U16, buf, 72, n);
+    b.store_ptr(IrMem::U32, buf, 80, n);
+    b.store_ptr(IrMem::U64, buf, 88, n);
+    b.store_state(8 * slot++, b.load_ptr(IrMem::U64, buf, 64));
+    b.store_state(8 * slot++, b.load_ptr(IrMem::U64, buf, 72));
+    b.store_state(8 * slot++, b.load_ptr(IrMem::U64, buf, 80));
+    b.store_state(8 * slot++, b.load_ptr(IrMem::U64, buf, 88));
+    b.exit_value(b.constant(7));
+    CHECK(validate(a, block));
+    CodeRegion region;
+    JitEntry fn = compile_ir(mem, a, block, &region, native_x86_calling_convention(), regs);
+    CHECK(fn != nullptr);
+    if (!fn) return;
+    for (double xv : values) {
+      for (double yv : values) {
+        for (uint64_t iv : {uint64_t{0}, uint64_t{0x80}, uint64_t{0xFFFFFFFFFFFFFFFFull}, uint64_t{0x123456789ABCDEF0ull}}) {
+          alignas(8) uint8_t native_buf[128], ref_buf[128];
+          for (int i = 0; i < 128; ++i) native_buf[i] = ref_buf[i] = static_cast<uint8_t>(i * 29 + 0x85);
+          alignas(8) uint8_t native[8 * 40] = {}, ref[8 * 40] = {};
+          auto fill = [&](uint8_t* st, uint8_t* buffer) {
+            const uint64_t xb = __builtin_bit_cast(uint64_t, xv), yb = __builtin_bit_cast(uint64_t, yv), addr = reinterpret_cast<uintptr_t>(buffer);
+            __builtin_memcpy(st, &xb, 8);
+            __builtin_memcpy(st + 8, &yb, 8);
+            __builtin_memcpy(st + 16, &addr, 8);
+            __builtin_memcpy(st + 24, &iv, 8);
+          };
+          fill(native, native_buf);
+          fill(ref, ref_buf);
+          uint64_t want = 0;
+          CHECK(interpret(a, block, ByteView(ref, sizeof ref), 100000, &want));
+          const uint64_t got = fn(native);
+          bool same = got == want && __builtin_memcmp(native_buf, ref_buf, 128) == 0;
+          for (int w = 4; w < slot && same; ++w) {
+            same = __builtin_memcmp(native + 8 * w, ref + 8 * w, 8) == 0;
+          }
+          if (!same) {
+            printf("pointer/float block (%u registers) x=%g y=%g n=%llx differs\n", regs, xv, yv, (unsigned long long)iv);
+            for (int w = 4; w < slot; ++w)
+              if (__builtin_memcmp(native + 8 * w, ref + 8 * w, 8)) printf("  word %d: native %llx interpreter %llx\n", w, (unsigned long long)*(uint64_t*)(native + 8 * w), (unsigned long long)*(uint64_t*)(ref + 8 * w));
+            ++g_failed;
+            mem.release(region);
+            return;
+          }
+        }
+      }
+    }
+    mem.release(region);
+  }
+  // The interpreter's own idea of the conversions, spelled out.
+  {
+    IrBlock block(a);
+    IrBuilder b(block);
+    b.set_state_size(16);
+    const uint32_t x = b.load_state(0);
+    b.store_state(8, b.unary(IrOp::F2I, x));
+    b.exit(0);
+    for (auto [in, out] : {std::pair<double, int64_t>{2.9, 2}, {-2.9, -2}, {__builtin_nan(""), INT64_MIN}, {1e19, INT64_MIN}, {-9223372036854775808.0, INT64_MIN}, {9223372036854774784.0, 9223372036854774784ll}}) {
+      alignas(8) uint8_t st[16] = {};
+      __builtin_memcpy(st, &in, 8);
+      uint64_t ignored = 0;
+      CHECK(interpret(a, block, ByteView(st, 16), 100, &ignored));
+      int64_t got;
+      __builtin_memcpy(&got, st + 8, 8);
+      CHECK(got == out);
+    }
   }
   CHECK(mem.live == 0);
 }
@@ -885,6 +1060,7 @@ int main() {
   test_ir_interpret();
   test_backend_fixed();
   test_register_allocator();
+  test_backend_pointers_and_floats();
   test_backend_loops();
   test_backend_random();
   test_backend_win64_codegen();

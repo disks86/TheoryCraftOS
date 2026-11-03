@@ -24,7 +24,9 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "Jit/KernelJit.hpp"
 #include "Wasm/Wasm.hpp"
+#include "JitHost.hpp"
 
 using namespace wasm;
 
@@ -102,11 +104,16 @@ static std::vector<std::string> split(const std::string& line) {
   return out;
 }
 
-static void test_vectors(const char* path) {
+static jit::HostCodeMemory g_code_memory;
+
+// Every call of the vector file, run by the interpreter alone (`jit` false) or with the JIT compiling every region at its first visit (so that nearly everything that
+// can be compiled runs as machine code).
+static void test_vectors(const char* path, bool jit) {
   FILE* f = fopen(path, "rb");
   CHECK(f != nullptr);
   if (!f) return;
   Store store(A);
+  store.set_jit(jit, 1);
   Instance* inst = nullptr;
   std::string line;
   int number = 0, calls = 0, valids = 0, invalids = 0, modules = 0, reported = 0;
@@ -195,7 +202,13 @@ static void test_vectors(const char* path) {
     }
   }
   fclose(f);
-  printf("vectors: %d modules, %d calls, %d valid and %d invalid modules checked\n", modules, calls, valids, invalids);
+  printf("vectors (%s): %d modules, %d calls, %d valid and %d invalid modules checked", jit ? "jit" : "interpreter", modules, calls, valids, invalids);
+  if (jit) printf("; %llu regions compiled, entered %llu times", (unsigned long long)store.jit_regions(), (unsigned long long)store.jit_entries());
+  printf("\n");
+  if (jit && jit::kernel_code_memory()) {
+    CHECK(store.jit_regions() > 0);
+    CHECK(store.jit_entries() > 0);
+  }
 }
 
 
@@ -507,7 +520,9 @@ static void test_damage() {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
-  test_vectors(argc > 1 ? argv[1] : "tests/data/wasm_vectors.txt");
+  jit::set_kernel_code_memory(&g_code_memory);
+  test_vectors(argc > 1 ? argv[1] : "tests/data/wasm_vectors.txt", false);
+  test_vectors(argc > 1 ? argv[1] : "tests/data/wasm_vectors.txt", true);
   if (argc > 1) return g_failed ? 1 : 0;   // (a vector file of its own: only that)
   test_host_functions();
   test_linking();

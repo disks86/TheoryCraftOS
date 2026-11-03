@@ -122,6 +122,8 @@ struct FunctionCode {
   bool strict = false;                  // strict mode code: `this` is not made the global object, failed writes and deletes throw, assigning to an undeclared name is an error
   bool library = false;                 // the host's own scripts (the preludes): Object.defineProperty leaves a property configurable unless told otherwise
   JsString* name = nullptr;
+  uint32_t jit_id = 0;                  // what the JIT calls this function (0: not looked at yet)
+  uint8_t jit_state = 0;                // 0 not looked at, 1 can be compiled, 2 cannot (see VmJit.hpp)
 };
 
 }  // namespace script

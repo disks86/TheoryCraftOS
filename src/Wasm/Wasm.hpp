@@ -306,6 +306,8 @@ struct FuncInst {
   uint32_t host_id = 0;   // for a function of the host: which one
   void* host = nullptr;
   uint32_t handle = 0;    // the number the host's registry gave this function when it first handed it out (0: none yet)
+  uint32_t jit_id = 0;    // what the JIT calls this function (0: not looked at yet)
+  uint8_t jit_state = 0;  // 0 not looked at, 1 can be compiled, 2 cannot (see WasmJit.hpp)
 };
 
 // An exception tag: the types of what an exception with it carries. Two tags are the same only if they are the same object.
@@ -417,6 +419,13 @@ class Store {
   // The value of export number `index` of the module.
   static ExternVal export_value(const Instance& instance, const Export& e);
 
+  // The JIT (WasmJit.hpp): on by default when the kernel has executable code memory. A point is compiled after `hot_threshold` visits (1 compiles at once, which is
+  // what the tests use to make the compiled code run).
+  void set_jit(bool enabled, uint32_t hot_threshold = 40);
+  uint64_t jit_regions() const;   // regions compiled so far
+  uint64_t jit_entries() const;   // times compiled code was entered
+  uint64_t jit_calls() const;     // calls from compiled code to other functions that were run in place
+
   // Calls a function. `args` has sig->nparams values; `results` gets sig->nresults. On a trap `*trap` is a static message.
   Status invoke(FuncInst& function, const Slot* args, Slot* results, const char** trap);
 
@@ -439,6 +448,8 @@ class Store {
   List<UniquePointer<Instance>> instances_;
   UniquePointer<Machine> machine_;
   uint64_t pages_in_use_ = 0, page_budget_ = 4096;
+  bool jit_enabled_ = true;
+  uint32_t jit_threshold_ = 40;
   bool (*memory_resize_)(Memory&, uint64_t) = nullptr;
   void* memory_host_ = nullptr;
 };

@@ -857,6 +857,7 @@ static void test_links() {
     CHECK_STATUS(fs.stat("/dir/original.txt", &e1), Status::Ok);
     CHECK_STATUS(fs.stat("/dir/also.txt", &e2), Status::Ok);
     CHECK(e1.size == 7 && e2.size == 7 && !e1.is_symlink && !e2.is_symlink);
+    CHECK(e1.file_id != 0 && e1.file_id == e2.file_id && e1.link_count == 2 && e2.link_count == 2);      // both names are one file with two names
     MetadataChange ro;
     ro.set_read_only = true;
     ro.read_only = true;
@@ -865,6 +866,8 @@ static void test_links() {
     // removing one name keeps the data alive through the other
     CHECK_STATUS(fs.remove("/dir/original.txt"), Status::Ok);
     CHECK(read_all(fs, "/dir/also.txt", buffer, sizeof(buffer), &length) && length == 7 && !memcmp(buffer, "HELLO!!", 7));
+    CHECK_STATUS(fs.stat("/dir/also.txt", &e2), Status::Ok);
+    CHECK(e2.file_id == e1.file_id && e2.link_count == 1);      // the name that is left is the same file, now with one name
     CHECK_STATUS(fs.remove("/dir/also.txt"), Status::Ok);
 
     // a symbolic link: relative (resolved against its own directory) and absolute (resolved from the root)

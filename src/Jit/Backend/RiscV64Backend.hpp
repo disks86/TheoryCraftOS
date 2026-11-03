@@ -30,13 +30,17 @@ namespace jit {
 // share that reach. A front end ends a block long before that.
 class RiscV64Backend final : public IJitBackend {
  public:
-  explicit RiscV64Backend(allocators::IAllocator& allocator, uint32_t max_registers = 32) : allocator_(allocator), max_registers_(max_registers) {}
+  // `floating_point` false makes the back end decline blocks that use the IR's floating point operations (pointer access needs no such thing): for an image whose
+  // kernel neither enables nor saves the floating point registers across a task switch, generated code must not touch them.
+  explicit RiscV64Backend(allocators::IAllocator& allocator, uint32_t max_registers = 32, bool floating_point = true)
+      : allocator_(allocator), max_registers_(max_registers), floating_point_(floating_point) {}
   HostArch arch() const override { return HostArch::RiscV64; }
   bool compile(const IrBlock& block, CodeBuffer& out) override;
 
  private:
   allocators::IAllocator& allocator_;
   uint32_t max_registers_;
+  bool floating_point_;
 };
 
 }  // namespace jit
