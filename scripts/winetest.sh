@@ -32,6 +32,7 @@ if [ $# -gt 0 ]; then tests=("$@"); else tests=($(cd "$out" && ls "${dll}"_*.exe
 pending=()
 for t in "${tests[@]}"; do pending+=("$t"); done
 : > "$out/$dll.log"
+rm -f "$out/$dll.hang"
 round=0
 while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
   round=$((round+1))
@@ -59,7 +60,9 @@ while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
 #!/bin/sh
 # Runs QEMU without a display until the program prints WINERUN DONE, the debug console is silent for ${WINETEST_QUIET:-90} s, or 40 minutes pass; then stops it.
 log=$(dirname "$0")/../debugcon.log
-/usr/bin/qemu-system-x86_64 -display none -enable-kvm "$@" >/dev/null 2>&1 &
+mon=/tmp/tcos-qemu-mon-$$.sock
+rm -f "$mon"
+/usr/bin/qemu-system-x86_64 -display none -enable-kvm -monitor unix:"$mon",server,nowait "$@" >/dev/null 2>"$(dirname "$0")/qemu-err.txt" &
 pid=$!
 n=0; quiet=0; last=0
 while kill -0 $pid 2>/dev/null && [ $n -lt 2400 ]; do
@@ -67,7 +70,12 @@ while kill -0 $pid 2>/dev/null && [ $n -lt 2400 ]; do
   size=$(stat -c %s "$log" 2>/dev/null || echo 0)
   if grep -q "=== .* start" "$log" 2>/dev/null; then
     if [ "$size" = "$last" ]; then quiet=$((quiet+1)); else quiet=0; last=$size; fi
-    [ $quiet -ge ${WINETEST_QUIET:-90} ] && break
+    if [ $quiet -ge ${WINETEST_QUIET:-90} ]; then
+      # Hung: ask the QEMU monitor where every CPU is (registers, twice a second apart) so the stall can be located in the kernel (image base is in the log)
+      { echo "--- HANG DUMP (qemu monitor) ---"; grep -a TCOS_IMAGE_BASE "$log" | head -1
+        for i in 1 2; do (echo "info registers -a"; sleep 1) | socat - UNIX-CONNECT:"$mon" 2>/dev/null; done; } > "$(dirname "$0")/hang-dump.txt" 2>&1
+      break
+    fi
   fi
   sleep 1; n=$((n+1))
 done
@@ -80,6 +88,7 @@ QEMU
   cmake -S . -B build -DTCOS_USERMODE_DEMO=OFF -DTCOS_WINE_TEST_PROGRAM="$PWD/$out/winerun.exe" "-DTCOS_WINE_TEST_FILES=$(IFS=';'; echo "${files[*]}")" -DQEMU="$PWD/$out/qemu.sh" >/dev/null
   ninja -C build esp primary vars >"$out/build.log" 2>&1 || { tail -20 "$out/build.log"; exit 1; }
   ninja -C build run-std >/dev/null 2>&1 || true
+  [ -s "$out/hang-dump.txt" ] && { cat "$out/hang-dump.txt" >> "$out/$dll.hang"; rm -f "$out/hang-dump.txt"; }
   sed -n '/Windows test program/,$p' build/debugcon.log | { grep -av "^\[" || true; } | { grep -av "^  \(test program\|Windows test program\)" || true; } >> "$out/$dll.log"      # (-a: a console test writes control characters)
   # the tests that did not start in this round are the next round's; the one that started and never ended is recorded as hung
   last_started=$(grep "^=== .* start" build/debugcon.log | tail -1 | sed 's/^=== \(.*\) start$/\1/')

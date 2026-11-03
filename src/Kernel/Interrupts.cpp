@@ -23,6 +23,8 @@
 #include "Kernel/Apic.hpp"
 #include "Kernel/UserEntry.hpp"
 
+#include <atomic>
+
 extern "C" {
 extern const uint64_t tcos_isr_table[256];
 kernel::Frame* tcos_interrupt_dispatch(kernel::Frame* frame);
@@ -158,6 +160,9 @@ void interrupts_restore_firmware() {
 
 void panic(const char* what, const Frame* frame) {
   __asm__ volatile("cli");
+  // Only the first core to fault reports: the others usually fault because of it (or at the same moment), and their text would be interleaved with the first's.
+  static std::atomic<bool> panicking{false};
+  if (panicking.exchange(true)) for (;;) __asm__ volatile("hlt");
   console::break_lock();
   console::puts("\n*** KERNEL PANIC: ");
   console::puts(what);
@@ -182,6 +187,13 @@ void panic(const char* what, const Frame* frame) {
     console::puts(" rdx ");
     console::put_hex(frame->rdx);
     console::puts("\n");
+    // The words at the top of the stack of the faulting code (return addresses to resolve against TCOS_IMAGE_BASE); only a kernel stack, 8-byte aligned.
+    if (frame->rsp >= 0x1000 && (frame->rsp & 7) == 0 && (frame->cs & 3) == 0) {
+      console::puts("stack");
+      const uint64_t* words = reinterpret_cast<const uint64_t*>(frame->rsp);      // (the panicking core's own stack; a diagnostic read of 16 words)
+      for (uint32_t i = 0; i < 16; ++i) { console::puts(" "); console::put_hex(words[i]); }
+      console::puts("\n");
+    }
   }
   hardware::PvPanic::notify_panic();  // tell the host before the machine goes quiet
   for (;;) __asm__ volatile("hlt");

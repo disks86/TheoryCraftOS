@@ -54,6 +54,7 @@ struct alignas(4096) Core {
   uint32_t slice = kSliceTicks;
   Thread* current = nullptr;
   Thread* idle = nullptr;
+  Thread* leaving = nullptr;      // x86-64: the thread this core switched away from, still running its interrupt return on that thread's stack (see finish_switch)
   uint64_t busy_ticks = 0, idle_ticks = 0;
   uint64_t kernel_entries = 0;      // interrupts of this core taken from ring 3 or the kernel that went through the scheduler (see wait_for_kernel_entry)
 #if defined(__x86_64__)
@@ -339,13 +340,27 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
     if (!prev->is_idle && c->slice > 0 && eligible(prev, c, false) && (!wanted || wanted->priority <= prev->priority)) return frame;
   }
   prev->saved = frame;
+#if defined(__x86_64__)
+  // This core is still on prev's stack (below the saved frame: the return addresses of the handlers that called this) until the interrupt stub has loaded the next
+  // frame. If prev were visible to another core before that, that core could resume it and its calls would overwrite those return addresses. So prev only becomes
+  // runnable (and reapable: on_cpu) in finish_switch(), which the stub calls on the new thread's stack.
+  if (prev->state == ThreadState::Running) prev->state = ThreadState::Ready;
+  if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(prev->priority), prev);      // (so that it competes for this core as before; taken out again below)
+#else
   prev->on_cpu = false;
   if (prev->state == ThreadState::Running) prev->state = ThreadState::Ready;
   if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(prev->priority), prev);
+#endif
 
   Thread* next = find_eligible(c);
   if (next) list_remove(run_queue(next->priority), next);
   else next = c->idle;
+#if defined(__x86_64__)
+  if (next != prev) {
+    if (prev->state == ThreadState::Ready && !prev->is_idle) list_remove(run_queue(prev->priority), prev);      // (finish_switch queues it)
+    c->leaving = prev;
+  }
+#endif
   next->state = ThreadState::Running;
   next->on_cpu = true;
   c->current = next;
@@ -365,6 +380,22 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   c->slice = kSliceTicks;
   return next->saved;
 }
+
+#if defined(__x86_64__)
+// Called by the interrupt stub (Interrupts.S) on the stack of the thread that now runs, after the old thread's stack is no longer in use by this core: the old thread
+// leaves the core (on_cpu false, so it can be reaped or joined) and, when it is ready, joins the run queue where another core can take it. A thread that was made ready
+// meanwhile (state Ready, on_cpu still true) was not queued by make_ready_locked, so it is queued here.
+void finish_switch() {
+  Core* c = this_core();
+  if (!c->leaving) return;
+  const uint64_t flags = lock_irq();
+  Thread* prev = c->leaving;
+  c->leaving = nullptr;
+  prev->on_cpu = false;
+  if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(prev->priority), prev);
+  unlock_irq(flags);
+}
+#endif
 
 [[noreturn]] void park_core(Core* c) {
   c->parked = true;
@@ -624,6 +655,10 @@ void ap_main(void* context) {
 #endif
 
 }  // namespace
+
+#if defined(__x86_64__)
+extern "C" void tcos_finish_switch() { finish_switch(); }      // (called from isr_common in Interrupts.S)
+#endif
 
 // ---------------------------------------------------------------- public API
 

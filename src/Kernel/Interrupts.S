@@ -74,6 +74,9 @@ isr_common:
     cld
     call tcos_interrupt_dispatch
     mov rsp, rax
+    sub rsp, 32                     /* the old thread is left: it becomes runnable for other cores only now (finish_switch in ThreadScheduler.cpp) */
+    call tcos_finish_switch
+    add rsp, 32
 isr_resume:
     fxrstor [rsp]
     add rsp, 512
