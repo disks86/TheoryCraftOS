@@ -46,6 +46,13 @@ inline uint64_t rdtsc() {
   __asm__ volatile("rdtime %0" : "=r"(count)::"memory");
   return count;
 }
+#elif defined(__loongarch64)
+// The stable counter (RDTIME.D, counter id 0): constant rate, shared by all cores.
+inline uint64_t rdtsc() {
+  uint64_t count;
+  __asm__ volatile("rdtime.d %0, $zero" : "=r"(count)::"memory");
+  return count;
+}
 #endif
 inline void cpu_pause() { kernel::cpu_relax(); }
 }  // namespace

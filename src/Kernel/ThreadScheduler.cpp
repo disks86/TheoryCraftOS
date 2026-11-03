@@ -28,6 +28,9 @@
 #elif defined(__riscv) && __riscv_xlen == 64
 #include "Arch/RiscV64/Sbi.hpp"
 #include "Arch/RiscV64/Timer.hpp"
+#elif defined(__loongarch64)
+#include "Arch/LoongArch64/Csr.hpp"
+#include "Arch/LoongArch64/Timer.hpp"
 #endif
 #include "Kernel/Thread.hpp"
 #if defined(__x86_64__)
@@ -210,6 +213,29 @@ uint64_t swap_core_pointer(Core* c) {
 void restore_core_pointer(uint64_t old) { write_core_pointer(old); }
 uint64_t this_hardware_id() { return arch_riscv64::boot_hart_id(); }   // the boot hart; the other harts read tp (see ap_main)
 uint64_t with_interrupts_enabled(uint64_t sstatus) { return sstatus | kSstatusSie; }
+#elif defined(__loongarch64)
+// The core's own record hangs off CSR.SAVE1, the way x86 uses GS (the trap entry saves registers on the stack and uses no SAVE register).
+uint64_t read_core_pointer() { return arch_loongarch64::csr_read<arch_loongarch64::kCsrSave1>(); }
+void write_core_pointer(uint64_t v) { arch_loongarch64::csr_write<arch_loongarch64::kCsrSave1>(v); }
+Core* this_core() { return reinterpret_cast<Core*>(read_core_pointer()); }
+
+void send_wakeup(uint64_t core) { arch_loongarch64::send_ipi(static_cast<uint32_t>(core), 1); }
+void stop_tick() { stimer::stop(); }
+void ack_tick() { stimer::rearm(); }
+void ack_wakeup() { arch_loongarch64::ack_ipi(); }   // clearing the IPI status ends the pending interrupt
+[[noreturn]] void halt_forever() { for (;;) { irq_disable(); __asm__ volatile("idle 0"); } }
+// IDLE may not wake for an interrupt that is already pending while it is masked, so interrupts are unmasked first;
+// an interrupt between the unmask and IDLE is taken at once, and at worst the next tick ends the wait.
+void idle_wait() { irq_enable(); __asm__ volatile("idle 0"); }
+void start_tick(uint32_t hz) { stimer::start(hz); }
+uint64_t swap_core_pointer(Core* c) {
+  const uint64_t old = read_core_pointer();
+  write_core_pointer(reinterpret_cast<uint64_t>(c));
+  return old;
+}
+void restore_core_pointer(uint64_t old) { write_core_pointer(old); }
+uint64_t this_hardware_id() { return arch_loongarch64::this_core_id(); }   // the id the IPI unit and the ACPI MADT use
+uint64_t with_interrupts_enabled(uint64_t crmd) { return crmd | kCrmdIe; }
 #endif
 
 inline void pause_hint() { cpu_relax(); }
@@ -515,6 +541,13 @@ void build_initial_frame(Thread* t, uint32_t stack_bytes) {
   f->sepc = reinterpret_cast<uint64_t>(&thread_main);
   f->scause = f->stval = 0;
   f->sstatus = kSstatusSpp | kSstatusSpie;   // sret returns to supervisor mode with interrupts enabled
+#elif defined(__loongarch64)
+  for (uint64_t& r : f->x) r = 0;
+  f->x[3] = reinterpret_cast<uint64_t>(t);   // a0 (r4): first argument
+  f->x[2] = reinterpret_cast<uint64_t>(f) + sizeof(Frame);   // sp (r3): where the stack is once the frame is popped
+  f->era = reinterpret_cast<uint64_t>(&thread_main);
+  f->estat = f->badv = 0;
+  f->prmd = kPrmdPie;   // ertn returns to PLV0 with interrupts enabled
 #endif
   t->saved = f;
 }
@@ -642,6 +675,26 @@ void ap_main(void* context) {
   c->self = c;
   c->index = start->core;
   c->apic_id = arch_riscv64::this_hart_id();
+  c->kind = g.cpu->core_kind(start->core);
+  write_core_pointer(reinterpret_cast<uint64_t>(c));
+  Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
+  if (!idle) halt_forever();
+  c->idle = c->current = idle;
+  c->online = true;
+  __atomic_add_fetch(&g.aps_ready, 1, __ATOMIC_SEQ_CST);
+  start_tick(g.tick_hz);
+  for (;;) idle_wait();
+}
+#elif defined(__loongarch64)
+// What each other core runs, forever, after the mailbox start and Arch/LoongArch64/Secondary.S gave it a stack.
+void ap_main(void* context) {
+  const ApStart* start = static_cast<ApStart*>(context);
+  while (!__atomic_load_n(&g.go, __ATOMIC_ACQUIRE)) pause_hint();
+  Core* c = &g.cores[start->core];
+  interrupts_load(false);
+  c->self = c;
+  c->index = start->core;
+  c->apic_id = this_hardware_id();
   c->kind = g.cpu->core_kind(start->core);
   write_core_pointer(reinterpret_cast<uint64_t>(c));
   Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
@@ -874,7 +927,7 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
     irq_restore(flags);
     return false;
   }
-#if defined(__x86_64__) || defined(__riscv)
+#if defined(__x86_64__) || defined(__riscv) || defined(__loongarch64)
   set_interrupt_handler(kVectorTimer, on_timer, nullptr);
 #else
   set_interrupt_handler(static_cast<Vector>(gtimer::interrupt()), on_timer, nullptr);
@@ -963,6 +1016,8 @@ void yield() {
   __asm__ volatile("int %0" ::"i"(kVectorYield) : "memory");
 #elif defined(__aarch64__)
   __asm__ volatile("svc #0" ::: "memory");   // a synchronous exception: the dispatcher calls the yield handler
+#elif defined(__loongarch64)
+  __asm__ volatile("break 0" ::: "memory");  // a synchronous exception (always 4 bytes, the handler skips it): the dispatcher calls the yield handler
 #else
   // A synchronous exception: the dispatcher calls the yield handler. An ECALL would reach the SBI firmware
   // instead, so EBREAK (always 4 bytes here, the handler skips it) is the self-trap.

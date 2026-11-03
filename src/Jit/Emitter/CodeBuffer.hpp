@@ -36,9 +36,11 @@ enum class FixupKind : uint8_t {
   A64Branch19,       // B.cond/CBZ/CBNZ: imm19 at bit 5, in instructions
   RvJal20,           // JAL: the J-type immediate, in bytes (a multiple of 2)
   RvBranch12,        // BEQ/BNE/BLT/...: the B-type immediate, in bytes (a multiple of 2)
+  LaB26,             // LoongArch B/BL: offs26 (bits 9:0 at bit 10, bits 25:16 at bit 0), in instructions
+  LaBranch16,        // LoongArch BEQ/BNE/BLT/BGE/BLTU/BGEU: offs16 at bit 10, in instructions
 };
 
-// The bytes of a function being generated, with labels. Emitters (X86_64Assembler, AArch64Assembler, RiscV64Assembler) append instructions;
+// The bytes of a function being generated, with labels. Emitters (X86_64Assembler, AArch64Assembler, RiscV64Assembler, LoongArch64Assembler) append instructions;
 // finish() patches every jump once all labels are bound and says whether each distance fitted its encoding. Every method that grows
 // the buffer returns false when memory ran out; once one has failed the buffer is `failed()` and finish() fails too, so an emitter may
 // ignore the results of single calls and check once at the end.

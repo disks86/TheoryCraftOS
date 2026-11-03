@@ -86,6 +86,26 @@ class DebugConsole final : public IHardware {
  private:
   static inline bool enabled_ = false;
 };
+#elif defined(__loongarch64)
+// A 16550-compatible UART whose base address comes from the ACPI SPCR table (set_base(), see Arch/LoongArch64/Uart.hpp). It is
+// usually the same serial port the UEFI text console already writes to, so the mirror is off until something needs it (a kernel
+// panic, when firmware services are unusable); until a base is known the output is dropped. Defined in Arch/LoongArch64/Uart.cpp.
+class DebugConsole final : public IHardware {
+ public:
+  constexpr DebugConsole() = default;
+
+  const char* name() const override { return "16550 debug UART"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+
+  static void set_base(uint64_t mmio_base) { base_ = mmio_base; }
+  static void set_enabled(bool enabled) { enabled_ = enabled; }
+  void put(char c) const;
+
+ private:
+  static inline uint64_t base_ = 0;
+  static inline bool enabled_ = false;
+};
 #else
 #error "No debug console for this architecture"
 #endif

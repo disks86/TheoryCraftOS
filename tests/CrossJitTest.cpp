@@ -15,16 +15,17 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// Cross test for jit::AArch64Backend and jit::RiscV64Backend, which cannot be run on an x86-64 host directly: "gen" compiles random IR programs for the
-// other CPU and writes them with their input state to a cases file; tests/data/jit/cross_runner.c runs them under qemu-aarch64 / qemu-riscv64; "check" interprets the same programs on this machine
+// Cross test for jit::AArch64Backend, jit::RiscV64Backend and jit::LoongArch64Backend, which cannot be run on an x86-64 host directly: "gen" compiles random IR programs for the
+// other CPU and writes them with their input state to a cases file; tests/data/jit/cross_runner.c runs them under qemu-aarch64 / qemu-riscv64 / qemu-loongarch64; "check" interprets the same programs on this machine
 // and compares the exit values and final states. tests/run_host_tests.sh drives the three steps.
-//   CrossJitTest gen <dir> <helper-address> <aarch64|riscv64>      CrossJitTest check <dir> <helper-address> <aarch64|riscv64>
+//   CrossJitTest gen <dir> <helper-address> <aarch64|riscv64|loongarch64>      CrossJitTest check <dir> <helper-address> <aarch64|riscv64|loongarch64>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
 #include <vector>
 #include "Jit/Backend/AArch64Backend.hpp"
+#include "Jit/Backend/LoongArch64Backend.hpp"
 #include "Jit/Backend/RiscV64Backend.hpp"
 #include "tests/JitRandom.hpp"
 
@@ -99,7 +100,7 @@ int main(int argc, char** argv) {
   const bool gen = strcmp(argv[1], "gen") == 0;
   std::string dir = argv[2];
   const uint64_t address = strtoull(argv[3], nullptr, 16);
-  const bool riscv = strcmp(argv[4], "riscv64") == 0;
+  const bool riscv = strcmp(argv[4], "riscv64") == 0, loongarch = strcmp(argv[4], "loongarch64") == 0;
   Alloc a;
   const int total = kRandomPrograms + kLoopPrograms + 1;
   if (gen) {
@@ -116,7 +117,8 @@ int main(int argc, char** argv) {
       const uint32_t limit = limits[i % 8];
       AArch64Backend arm(a, limit);
       RiscV64Backend rv(a, limit);
-      IJitBackend& backend = riscv ? static_cast<IJitBackend&>(rv) : static_cast<IJitBackend&>(arm);
+      LoongArch64Backend la(a, limit);
+      IJitBackend& backend = riscv ? static_cast<IJitBackend&>(rv) : loongarch ? static_cast<IJitBackend&>(la) : static_cast<IJitBackend&>(arm);
       CodeBuffer code(a);
       if (!backend.compile(block, code)) { printf("program %d did not compile\n", i); return 1; }
       std::vector<uint8_t> state(state_size);

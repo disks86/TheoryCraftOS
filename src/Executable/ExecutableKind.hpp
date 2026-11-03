@@ -26,7 +26,7 @@ namespace exe {
 enum class ExecutableKind : uint8_t { None, Elf, Pe };
 
 // The CPU an executable was built for, as its header says. Other is a machine this OS has no name for (or a header too short to tell).
-enum class Architecture : uint8_t { Unknown, X86_64, AArch64, RiscV64, X86_32, Arm32, Other };
+enum class Architecture : uint8_t { Unknown, X86_64, AArch64, RiscV64, X86_32, Arm32, Other, LoongArch64 };
 
 // How many bytes from the start of a file identify it (the PE signature sits where the DOS header says, normally in the first few hundred bytes).
 constexpr uint64_t kIdentifyBytes = 4096;

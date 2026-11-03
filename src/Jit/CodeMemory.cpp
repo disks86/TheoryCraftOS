@@ -40,6 +40,10 @@ void flush_instruction_cache(ConstByteView code) {
   // FENCE.I synchronises this hart only. Other harts that may run the code need an inter-processor FENCE.I (SBI remote fence) before they enter it:
   // that is the job of the ITlbShootdown-style hook of the code memory that makes the region executable.
   __asm__ volatile("fence rw, rw\n\tfence.i" ::: "memory");
+#elif defined(__loongarch64)
+  // IBAR waits for earlier stores to reach the instruction fetch of this core. Other cores need the inter-processor
+  // synchronisation of the code memory (CrossCoreInstructionSync) before they enter the code.
+  __asm__ volatile("dbar 0\n\tibar 0" ::: "memory");
 #else
 #error "No instruction cache flush for this architecture"
 #endif

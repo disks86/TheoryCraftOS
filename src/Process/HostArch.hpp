@@ -29,6 +29,8 @@ constexpr UserArch native_arch() {
   return UserArch::AArch64;
 #elif defined(__riscv) && __riscv_xlen == 64
   return UserArch::RiscV64;
+#elif defined(__loongarch64)
+  return UserArch::LoongArch64;
 #else
   return UserArch::None;
 #endif
@@ -40,6 +42,7 @@ constexpr UserArch user_arch_for(exe::Architecture arch) {
     case exe::Architecture::X86_64: return UserArch::X86_64;
     case exe::Architecture::AArch64: return UserArch::AArch64;
     case exe::Architecture::RiscV64: return UserArch::RiscV64;
+    case exe::Architecture::LoongArch64: return UserArch::LoongArch64;
     default: return UserArch::None;
   }
 }

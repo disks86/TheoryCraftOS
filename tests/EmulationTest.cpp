@@ -1865,6 +1865,7 @@ static void test_dispatch() {
   CHECK(machine(62) == Architecture::X86_64);
   CHECK(machine(183) == Architecture::AArch64);
   CHECK(machine(243) == Architecture::RiscV64);
+  CHECK(machine(258) == Architecture::LoongArch64);
   CHECK(machine(3) == Architecture::X86_32);
   CHECK(machine(40) == Architecture::Arm32);
   CHECK(machine(999) == Architecture::Other);
@@ -1882,12 +1883,14 @@ static void test_dispatch() {
   };
   CHECK(pe_machine(0x8664) == Architecture::X86_64);
   CHECK(pe_machine(0xAA64) == Architecture::AArch64);
+  CHECK(pe_machine(0x6264) == Architecture::LoongArch64);
   CHECK(pe_machine(0x014C) == Architecture::X86_32);
   CHECK(pe_machine(0x1234) == Architecture::Other);
 
   using process::UserArch;
   CHECK(process::user_arch_for(Architecture::X86_64) == UserArch::X86_64);
   CHECK(process::user_arch_for(Architecture::X86_32) == UserArch::None);
+  CHECK(process::user_arch_for(Architecture::LoongArch64) == UserArch::LoongArch64);
   CHECK(process::needs_emulation(UserArch::None) == false);
 #if defined(__x86_64__)
   CHECK(process::native_arch() == UserArch::X86_64);
@@ -1897,6 +1900,7 @@ static void test_dispatch() {
   CHECK(can_emulate(UserArch::X86_64) && can_emulate(UserArch::AArch64) && can_emulate(UserArch::RiscV64) && !can_emulate(UserArch::None));
   CHECK(create_guest_cpu(UserArch::RiscV64, A) && create_guest_cpu(UserArch::RiscV64, A)->arch() == UserArch::RiscV64);
   CHECK(!create_guest_cpu(UserArch::None, A));
+  CHECK(!can_emulate(UserArch::LoongArch64) && !create_guest_cpu(UserArch::LoongArch64, A));      // (no LoongArch emulator yet)
   CHECK(create_guest_cpu(UserArch::X86_64, A));
 }
 

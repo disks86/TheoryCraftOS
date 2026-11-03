@@ -17,6 +17,7 @@
  */
 #include "Jit/JitSelfTest.hpp"
 #include "Jit/Backend/AArch64Backend.hpp"
+#include "Jit/Backend/LoongArch64Backend.hpp"
 #include "Jit/Backend/RiscV64Backend.hpp"
 #include "Jit/Backend/X86_64Backend.hpp"
 #include "Jit/JitCompiler.hpp"
@@ -61,8 +62,10 @@ SelfTestResult jit_self_test(allocators::IAllocator& allocator, ICodeMemory& mem
   X86_64Backend x86(allocator);
   AArch64Backend arm(allocator);
   RiscV64Backend riscv(allocator);
+  LoongArch64Backend loongarch(allocator);
   IJitBackend* backend = native_host_arch() == HostArch::X86_64 ? static_cast<IJitBackend*>(&x86)
-                         : native_host_arch() == HostArch::AArch64 ? static_cast<IJitBackend*>(&arm) : static_cast<IJitBackend*>(&riscv);
+                         : native_host_arch() == HostArch::AArch64 ? static_cast<IJitBackend*>(&arm)
+                         : native_host_arch() == HostArch::LoongArch64 ? static_cast<IJitBackend*>(&loongarch) : static_cast<IJitBackend*>(&riscv);
 
   CodeCache cache(allocator, 16);
   if (!cache.ok()) return SelfTestResult::CompileFailed;

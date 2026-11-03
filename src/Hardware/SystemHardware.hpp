@@ -42,6 +42,13 @@ using SystemRam = UefiRandomAccessMemory;
 namespace hardware {
 using SystemRam = UefiRandomAccessMemory;
 }  // namespace hardware
+#elif defined(__loongarch64)
+// The LoongArch image has no CPU class of its own beyond Arch/LoongArch64/Cpu.hpp, which main.cpp includes.
+#include "Hardware/RandomAccessMemory/UefiRandomAccessMemory.hpp"
+
+namespace hardware {
+using SystemRam = UefiRandomAccessMemory;
+}  // namespace hardware
 #else
 #error "No hardware classes for this architecture"
 #endif

@@ -83,6 +83,7 @@ StringView machine_name(UserArch arch) {
   switch (arch) {
     case UserArch::X86_64: return "x86_64";
     case UserArch::AArch64: return "aarch64";
+    case UserArch::LoongArch64: return "loongarch64";
     default: return "riscv64";
   }
 }
@@ -323,11 +324,11 @@ class LinuxSyscalls final : public ISyscallInterface {
 
 namespace {
 // Constant-initialised: no run-time setup, nothing to guard.
-constexpr LinuxSyscalls kX86(UserArch::X86_64), kArm(UserArch::AArch64), kRiscV(UserArch::RiscV64);
+constexpr LinuxSyscalls kX86(UserArch::X86_64), kArm(UserArch::AArch64), kRiscV(UserArch::RiscV64), kLoong(UserArch::LoongArch64);
 }  // namespace
 
 const ISyscallInterface& linux_interface(UserArch arch) {
-  return arch == UserArch::X86_64 ? kX86 : arch == UserArch::AArch64 ? kArm : kRiscV;
+  return arch == UserArch::X86_64 ? kX86 : arch == UserArch::AArch64 ? kArm : arch == UserArch::LoongArch64 ? kLoong : kRiscV;
 }
 
 }  // namespace process

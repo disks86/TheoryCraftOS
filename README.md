@@ -110,6 +110,33 @@ cmake -S . -B build-riscv64 -DTCOS_ARCH=riscv64 -G Ninja
 cmake --build build-riscv64 --target run   # QEMU "virt"; the log appears on the serial console in your terminal
 ```
 
+## LoongArch (work in progress)
+
+Any LA64 machine with UEFI firmware is the target. Like RISC-V, LLVM cannot emit LoongArch PE/COFF, so the image is a position-independent ELF
+linked with `ld.lld` (`scripts/loongarch64-uefi.ld`) and rewritten by `scripts/elf2efi.py` as a PE32+ `BOOTLOONGARCH64.EFI` (machine `0x6264`, base
+relocations from the ELF's `R_LARCH_RELATIVE`). It is built for the soft-float LP64S ABI, and holds the same first milestone as the RISC-V image:
+the portable layers (console, RAM, allocator, ACPI tables, the firmware framebuffer), exception handling (`src/Arch/LoongArch64/Trap.S`: one
+page-aligned `CSR.EENTRY`, registers saved in a `kernel::Frame`, `BREAK` as the yield), the per-core timer tick (`CSR.TCFG`, frequency from CPUCFG 4/5),
+inter-processor interrupts and the preemptive thread scheduler, and the other cores, which are started the way the firmware parks them: entry
+address and context in the IOCSR mailbox, then an IPI (cores come from the ACPI MADT CORE_PIC entries). The debug UART for a kernel panic comes
+from the ACPI SPCR table. The JIT has a LoongArch back end (`LoongArch64Backend`), and ELF / PE programs for LoongArch are recognised and bound to
+the Linux system-call interface (generic numbering, `syscall 0`, number in a7).
+
+Not done: UEFI hands over in direct address translation (no page permissions), so the JIT's W^X is not enforced and user mode (PLV3) is not set up;
+no LoongArch guest emulator (`needs_emulation` programs for LoongArch cannot run on other hosts yet); no EIOINTC/PCH-PIC interrupt controllers, PCIe
+or drivers. The image has been built and its exception, timer, IPI and second-core code run on QEMU without firmware (`tests/loongarch_boot.sh`), but it has
+not been booted through a LoongArch UEFI firmware (none is installed here) or on real hardware.
+
+Needs `clang` (loongarch64 target), `ld.lld` (rustup's `gcc-ld/ld.lld` works), Python 3, mingw-w64's libstdc++ headers, `qemu-system-loongarch64` and
+the edk2 `QEMU_EFI.fd`/`QEMU_VARS.fd` (`/usr/share/edk2/loongarch64`):
+
+```
+cmake -S . -B build-loongarch64 -DTCOS_ARCH=loongarch64 -G Ninja
+cmake --build build-loongarch64 --target run   # QEMU "virt"; the log appears on the serial console in your terminal
+tests/loongarch_boot.sh                        # firmware-free check of the exception / timer / IPI / second-core code
+tests/run_host_tests.sh LoongArch64JitTest     # the JIT back end, run under qemu-loongarch64
+```
+
 ## Debugging in QEMU
 
 `scripts/gdb-proxy.py` rebuilds `BOOTX64`, starts QEMU frozen at reset with a gdbstub on :2159 and bridges gdb to it. It

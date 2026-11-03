@@ -58,8 +58,10 @@ uint64_t sys_clone(Process& p, UserArch arch, const uint64_t* a) {
   if (!runtime || !runtime->supports_linux_threads()) return error(kEnosys);
   const uint64_t flags = a[0], stack = a[1], parent_tid = a[2];
   // x86-64: clone(flags, stack, parent_tid, child_tid, tls); the generic table (AArch64, RISC-V): clone(flags, stack, parent_tid, tls, child_tid)
-  const uint64_t child_tid = arch == UserArch::X86_64 ? a[3] : a[4];
-  const uint64_t tls = arch == UserArch::X86_64 ? a[4] : a[3];
+  // x86-64 and LoongArch take (flags, stack, parent_tid, child_tid, tls); AArch64 and RISC-V swap the last two.
+  const bool tls_last = arch == UserArch::X86_64 || arch == UserArch::LoongArch64;
+  const uint64_t child_tid = tls_last ? a[3] : a[4];
+  const uint64_t tls = tls_last ? a[4] : a[3];
   if ((flags & 0xFF) != 0) return error(kEinval);      // an exit signal means fork-like semantics
   if ((flags & kCloneRequired) != kCloneRequired || (flags & ~(kCloneAllowed | 0xFF)) != 0) return error(kEnosys);
   Process::LinuxThreadState& state = p.linux_threads();

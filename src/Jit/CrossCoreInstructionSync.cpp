@@ -29,6 +29,8 @@ void synchronise_this_core(void*) {
   __asm__ volatile("dsb ish\n\tisb" ::: "memory");
 #elif defined(__riscv)
   __asm__ volatile("fence rw, rw\n\tfence.i" ::: "memory");
+#elif defined(__loongarch64)
+  __asm__ volatile("dbar 0\n\tibar 0" ::: "memory");
 #else
 #error "No instruction stream synchronisation for this architecture"
 #endif

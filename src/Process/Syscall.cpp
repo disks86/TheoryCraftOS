@@ -42,7 +42,7 @@ SyscallAbi abi_for_executable(exe::ExecutableKind kind) {
 const ISyscallInterface* syscall_interface(SyscallAbi abi, UserArch arch) {
   switch (abi) {
     case SyscallAbi::Linux:
-      if (arch == UserArch::X86_64 || arch == UserArch::AArch64 || arch == UserArch::RiscV64) return &linux_interface(arch);
+      if (arch == UserArch::X86_64 || arch == UserArch::AArch64 || arch == UserArch::RiscV64 || arch == UserArch::LoongArch64) return &linux_interface(arch);
       return nullptr;
     case SyscallAbi::Windows: return arch == UserArch::X86_64 ? &windows_interface() : nullptr;
     default: return nullptr;
@@ -51,7 +51,7 @@ const ISyscallInterface* syscall_interface(SyscallAbi abi, UserArch arch) {
 
 namespace {
 constexpr uint8_t kOsAbiSysV = 0, kOsAbiGnu = 3;
-constexpr uint16_t kElfMachineX86_64 = 62, kElfMachineAArch64 = 183, kElfMachineRiscV = 243;
+constexpr uint16_t kElfMachineX86_64 = 62, kElfMachineAArch64 = 183, kElfMachineRiscV = 243, kElfMachineLoongArch = 258;
 }  // namespace
 
 bool bind_executable(const exe::ElfFile& elf, ProcessBinding* out) {
@@ -63,6 +63,7 @@ bool bind_executable(const exe::ElfFile& elf, ProcessBinding* out) {
     case kElfMachineX86_64: arch = UserArch::X86_64; break;
     case kElfMachineAArch64: arch = UserArch::AArch64; break;
     case kElfMachineRiscV: arch = UserArch::RiscV64; break;
+    case kElfMachineLoongArch: arch = UserArch::LoongArch64; break;
     default: return false;
   }
   const ISyscallInterface* interface = syscall_interface(SyscallAbi::Linux, arch);
@@ -111,6 +112,15 @@ bool decode_riscv64_linux(ArrayView<const uint64_t> x, SyscallRequest* out) {
   SyscallRequest request;
   request.number = x[17];
   for (uint32_t i = 0; i < 6; ++i) request.args[i] = x[10 + i];
+  *out = request;
+  return true;
+}
+
+bool decode_loongarch64_linux(ArrayView<const uint64_t> x, SyscallRequest* out) {
+  if (x.size() < 32) return false;
+  SyscallRequest request;
+  request.number = x[11];
+  for (uint32_t i = 0; i < 6; ++i) request.args[i] = x[4 + i];
   *out = request;
   return true;
 }

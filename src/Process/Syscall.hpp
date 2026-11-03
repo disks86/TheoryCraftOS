@@ -30,7 +30,7 @@ namespace process {
 // system services that ntdll.dll's stubs invoke). The two never mix inside one process.
 enum class SyscallAbi : uint8_t { None, Linux, Windows };
 // The CPU the program was built for; selects the register convention and, for Linux, the number table.
-enum class UserArch : uint8_t { None, X86_64, AArch64, RiscV64 };
+enum class UserArch : uint8_t { None, X86_64, AArch64, RiscV64, LoongArch64 };
 
 StringView abi_name(SyscallAbi abi);
 // ELF -> Linux, PE -> Windows, anything else -> None.
@@ -86,5 +86,7 @@ bool decode_x86_64(SyscallAbi abi, const X86UserRegisters& regs, SyscallRequest*
 bool decode_aarch64_linux(ArrayView<const uint64_t> x, SyscallRequest* out);
 // RISC-V ECALL (Linux only): number in a7 (x17), arguments a0..a5 (x10..x15). `x` holds x0..x31.
 bool decode_riscv64_linux(ArrayView<const uint64_t> x, SyscallRequest* out);
+// LoongArch SYSCALL (Linux only): number in a7 (r11), arguments a0..a5 (r4..r9). `x` holds r0..r31.
+bool decode_loongarch64_linux(ArrayView<const uint64_t> x, SyscallRequest* out);
 
 }  // namespace process

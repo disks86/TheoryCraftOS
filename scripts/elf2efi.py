@@ -15,9 +15,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Rewrites a position-independent RISC-V 64 ELF executable (linked at 0 with scripts/riscv64-uefi.ld) as a UEFI PE32+
+"""Rewrites a position-independent RISC-V 64 or LoongArch 64 ELF executable (linked at 0 with scripts/riscv64-uefi.ld or
+scripts/loongarch64-uefi.ld) as a UEFI PE32+
 application, the way EDK2's GenFw does: .text/.rodata/.data/.bss become PE sections at the same addresses, and the
-ELF's R_RISCV_RELATIVE relocations become a PE base relocation table (IMAGE_REL_BASED_DIR64) after their addends are
+ELF's R_RISCV_RELATIVE / R_LARCH_RELATIVE relocations become a PE base relocation table (IMAGE_REL_BASED_DIR64) after their addends are
 written into the image, because the PE loader adds the load delta to the value already there.
 
 usage: elf2efi.py input.elf output.efi
@@ -25,10 +26,11 @@ usage: elf2efi.py input.elf output.efi
 import struct
 import sys
 
-R_RISCV_RELATIVE = 3
+R_RELATIVE = 3   # R_RISCV_RELATIVE and R_LARCH_RELATIVE have the same number
 PAGE = 0x1000
 FILE_ALIGN = 0x200
-MACHINE_RISCV64 = 0x5064
+# ELF e_machine -> PE machine (EM_RISCV 243 -> 0x5064, EM_LOONGARCH 258 -> 0x6264)
+MACHINES = {243: (0x5064, 'RISC-V'), 258: (0x6264, 'LoongArch')}
 SUBSYSTEM_EFI_APPLICATION = 10
 IMAGE_REL_BASED_ABSOLUTE = 0
 IMAGE_REL_BASED_DIR64 = 10
@@ -50,8 +52,8 @@ def read_elf(path):
         fail("not a little-endian ELF64 file")
     (e_type, e_machine, _, e_entry, _, e_shoff, _, _, _, _, e_shentsize, e_shnum, e_shstrndx) = struct.unpack_from(
         "<HHIQQQIHHHHHH", data, 16)
-    if e_machine != 243:
-        fail("not a RISC-V ELF file")
+    if e_machine not in MACHINES:
+        fail("not a RISC-V or LoongArch ELF file")
     if e_type != 3:
         fail("not a position-independent executable (link with -pie)")
     raw = [struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + i * e_shentsize) for i in range(e_shnum)]
@@ -60,13 +62,13 @@ def read_elf(path):
     for (name, kind, flags, addr, offset, size, _, _, _, _) in raw:
         text = names[name:names.index(b"\0", name)].decode()
         sections[text] = dict(kind=kind, flags=flags, addr=addr, offset=offset, size=size)
-    return data, e_entry, sections
+    return data, e_entry, sections, MACHINES[e_machine][0]
 
 
 def main():
     if len(sys.argv) != 3:
         fail("usage: elf2efi.py input.elf output.efi")
-    data, entry, elf = read_elf(sys.argv[1])
+    data, entry, elf, pe_machine = read_elf(sys.argv[1])
 
     # Lay the sections out at their ELF addresses and apply the relative relocations to the file contents.
     present = [(name, flags) for (name, flags) in SECTIONS if name in elf and elf[name]["size"] > 0]
@@ -87,7 +89,7 @@ def main():
     if rela:
         for i in range(rela["size"] // 24):
             (offset, info, addend) = struct.unpack_from("<QQq", data, rela["offset"] + i * 24)
-            if info & 0xFFFFFFFF != R_RISCV_RELATIVE:
+            if info & 0xFFFFFFFF != R_RELATIVE:
                 fail("unsupported dynamic relocation type %d at %#x" % (info & 0xFFFFFFFF, offset))
             if offset + 8 > image_end:
                 fail("relocation outside the image: %#x" % offset)
@@ -134,7 +136,7 @@ def main():
     dos = bytearray(0x40)
     dos[0:2] = b"MZ"
     struct.pack_into("<I", dos, 0x3C, 0x40)
-    coff = struct.pack("<4sHHIIIHH", b"PE\0\0", MACHINE_RISCV64, len(sections), 0, 0, 0, 240, 0x0022)
+    coff = struct.pack("<4sHHIIIHH", b"PE\0\0", pe_machine, len(sections), 0, 0, 0, 240, 0x0022)
     optional = struct.pack("<HBBIIIII", 0x20B, 0, 0, size_code, size_init, size_uninit, entry, base_of_code)
     optional += struct.pack("<QIIHHHHHHIIIIHHQQQQII", 0, PAGE, FILE_ALIGN, 0, 0, 0, 0, 0, 0, 0, size_of_image,
                             headers_size, 0, SUBSYSTEM_EFI_APPLICATION, 0, 0x100000, 0x1000, 0x100000, 0x1000, 0, 16)
