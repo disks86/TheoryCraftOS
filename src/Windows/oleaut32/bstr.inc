@@ -29,9 +29,68 @@ static void bstr_terminate(char *block, UINT bytes) {
   memset(block + BSTR_HEADER + bytes, 0, bstr_block_size(bytes) - BSTR_HEADER - bytes);
 }
 
+/* The BSTR cache of Windows: freed strings are kept in rings of 6 per 16-byte size class and handed out again first-in first-out. A string freed twice, or read after
+ * its free, therefore still works as long as it sits in the cache (programs depend on that, and Wine's tests check it). OANOCACHE in the environment, or SetOaNoCache,
+ * turns it off; OACleanup empties it. */
+#define BSTR_CLASS 16u
+#define BSTR_CLASSES 4096u
+#define BSTR_RING 6u
+#define BSTR_SEARCH 2u
+static struct { unsigned head, count; void *block[BSTR_RING]; } bstr_cache[BSTR_CLASSES];
+static volatile LONG bstr_cache_lock;
+static volatile LONG bstr_cache_state;      /* 0: not looked at yet, 1: on, 2: off */
+
+static void bstr_lock(void) { while (__sync_lock_test_and_set(&bstr_cache_lock, 1)) Sleep(0); }
+static void bstr_unlock(void) { __sync_lock_release(&bstr_cache_lock); }
+static BOOL bstr_cache_on(void) {
+  if (bstr_cache_state == 0) bstr_cache_state = GetEnvironmentVariableA("OANOCACHE", NULL, 0) ? 2 : 1;
+  return bstr_cache_state == 1;
+}
+static void bstr_cache_flush(void) {
+  bstr_lock();
+  for (unsigned c = 0; c < BSTR_CLASSES; c++) {
+    while (bstr_cache[c].count) { oa_free(bstr_cache[c].block[bstr_cache[c].head]); bstr_cache[c].head = (bstr_cache[c].head + 1) % BSTR_RING; bstr_cache[c].count--; }
+  }
+  bstr_unlock();
+}
+static void *bstr_cache_take(SIZE_T size) {
+  if (!bstr_cache_on()) return NULL;
+  void *found = NULL;
+  bstr_lock();
+  /* (a class holds blocks from its size up to the next class's, so the first class that can fit is the one of `size` itself, and the block is checked) */
+  for (unsigned c = (unsigned)(size / BSTR_CLASS), end = c + BSTR_SEARCH + 1; c < end && c < BSTR_CLASSES && !found; c++) {
+    if (!bstr_cache[c].count || HeapSize(GetProcessHeap(), 0, bstr_cache[c].block[bstr_cache[c].head]) < size) continue;
+    found = bstr_cache[c].block[bstr_cache[c].head];
+    bstr_cache[c].head = (bstr_cache[c].head + 1) % BSTR_RING;
+    bstr_cache[c].count--;
+  }
+  bstr_unlock();
+  return found;
+}
+static void bstr_release(char *block) {
+  if (bstr_cache_on()) {
+    const SIZE_T size = HeapSize(GetProcessHeap(), 0, block);
+    const SIZE_T c = size == (SIZE_T)-1 ? 0 : size / BSTR_CLASS;
+    if (c && c < BSTR_CLASSES) {
+      bstr_lock();
+      unsigned i;
+      for (i = 0; i < bstr_cache[c].count; i++) if (bstr_cache[c].block[(bstr_cache[c].head + i) % BSTR_RING] == block) break;
+      if (i < bstr_cache[c].count) { bstr_unlock(); return; }      /* already there: a second free does nothing */
+      if (bstr_cache[c].count < BSTR_RING) {
+        bstr_cache[c].block[(bstr_cache[c].head + bstr_cache[c].count++) % BSTR_RING] = block;
+        bstr_unlock();
+        return;
+      }
+      bstr_unlock();
+    }
+  }
+  oa_free(block);
+}
+
 static BSTR bstr_alloc_bytes(const void *source, UINT bytes) {
   if (bytes > BSTR_MAX_BYTES - 1) return NULL;
-  char *block = oa_alloc(bstr_block_size(bytes));
+  char *block = bstr_cache_take(bstr_block_size(bytes));
+  if (!block) block = oa_alloc(bstr_block_size(bytes));
   if (!block) return NULL;
   if (source) memcpy(block + BSTR_HEADER, source, bytes);
   else memset(block + BSTR_HEADER, 0, bytes);
@@ -48,7 +107,7 @@ EXPORT BSTR WINAPI SysAllocStringLen(const OLECHAR *string, UINT length) {
   return bstr_alloc_bytes(string, length * (UINT)sizeof(WCHAR));
 }
 EXPORT BSTR WINAPI SysAllocStringByteLen(LPCSTR string, UINT length) { return bstr_alloc_bytes(string, length); }
-EXPORT void WINAPI SysFreeString(BSTR string) { if (string) oa_free(BSTR_BLOCK(string)); }
+EXPORT void WINAPI SysFreeString(BSTR string) { if (string) bstr_release(BSTR_BLOCK(string)); }
 EXPORT UINT WINAPI SysStringByteLen(BSTR string) { return string ? *(DWORD *)((char *)string - sizeof(DWORD)) : 0; }
 EXPORT UINT WINAPI SysStringLen(BSTR string) { return SysStringByteLen(string) / sizeof(WCHAR); }
 EXPORT INT WINAPI SysReAllocStringLen(BSTR *string, const OLECHAR *source, UINT length) {
@@ -69,7 +128,12 @@ EXPORT INT WINAPI SysReAllocStringLen(BSTR *string, const OLECHAR *source, UINT 
   /* The source points into the old string (or there is none): the new one is made first. */
   BSTR fresh = bstr_alloc_bytes(NULL, bytes);
   if (!fresh) return FALSE;
-  if (source) memcpy(fresh, source, bytes);
+  if (source) {
+    /* (a source inside the old string is not read past the old string's end) */
+    UINT n = bytes;
+    if (aliased && n > SysStringByteLen(old)) n = SysStringByteLen(old);
+    memcpy(fresh, source, n);
+  }
   SysFreeString(old);
   *string = fresh;
   return TRUE;

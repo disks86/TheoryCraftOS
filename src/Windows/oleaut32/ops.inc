@@ -860,12 +860,13 @@ EXPORT HRESULT WINAPI VarRound(LPVARIANT in, int decimals, LPVARIANT result) { r
 
 EXPORT HRESULT WINAPI VarBstrCat(BSTR left, BSTR right, LPBSTR out) {
   if (!out) return E_POINTER;
-  const UINT ll = SysStringLen(left), rl = SysStringLen(right);
-  if (ll > 0x7fffffffu - rl) return E_OUTOFMEMORY;
-  BSTR joined = SysAllocStringLen(NULL, ll + rl);
+  /* by bytes: strings made from ANSI bytes may have an odd count */
+  const UINT lb = SysStringByteLen(left), rb = SysStringByteLen(right);
+  if (lb > 0xFFFFFFFFu - rb) return E_OUTOFMEMORY;
+  BSTR joined = SysAllocStringByteLen(NULL, lb + rb);
   if (!joined) return E_OUTOFMEMORY;
-  if (ll) memcpy(joined, left, ll * sizeof(WCHAR));
-  if (rl) memcpy(joined + ll, right, rl * sizeof(WCHAR));
+  if (lb) memcpy(joined, left, lb);
+  if (rb) memcpy((char *)joined + lb, right, rb);
   *out = joined;
   return S_OK;
 }
