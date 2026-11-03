@@ -98,6 +98,7 @@ NT_SERVICE(NtTcosDebugException);
 NT_SERVICE(NtTcosLinkModules);
 NT_SERVICE(NtTcosToken);
 NT_SERVICE(NtTcosAccessCheck);
+NT_SERVICE(NtTcosCommonDialog);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);
@@ -944,6 +945,7 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "libc.inc"
 #include "rtl2.inc"
 #include "rtl3.inc"
+#include "addr.inc"
 #include "atom.inc"
 #include "ps.inc"
 #include "sec.inc"

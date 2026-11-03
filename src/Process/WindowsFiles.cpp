@@ -224,6 +224,9 @@ uint64_t file_id_of(StringView virtual_path) {
   return hash ? hash : 1;
 }
 
+// The index of a name that a file system listed or reported: its own identity when it has one (hard links share it), else the hash of the path.
+uint64_t entry_file_id(const DirectoryEntry& entry, StringView virtual_path) { return entry.file_id != 0 ? entry.file_id : file_id_of(virtual_path); }
+
 // The path of the file whose index is `id`, looked for from `start` downwards (the directory a caller of OpenFileById names); the search is small and bounded.
 bool find_file_id(ProcessFiles& files, StringView start, uint64_t id, uint32_t depth, uint32_t* budget, String* found) {
   if (file_id_of(start) == id) return found->assign(start);
@@ -236,7 +239,7 @@ bool find_file_id(ProcessFiles& files, StringView start, uint64_t id, uint32_t d
     --*budget;
     String child(files.allocator());
     if (!child.assign(start) || (start != StringView("/") && !child.push_back('/')) || !child.append(entry.name.view())) return false;
-    if (file_id_of(child.view()) == id) return found->assign(child.view());
+    if (entry_file_id(entry, child.view()) == id) return found->assign(child.view());
     if (entry.type == NodeType::Directory && !entry.is_symlink && find_file_id(files, child.view(), id, depth - 1, budget, found)) return true;
   }
   return false;
@@ -840,7 +843,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     case kFileStandardInformation:
       put(v, 0, allocation_of(e), 8);
       put(v, 8, e.size, 8);
-      put(v, 16, 1, 4);                                             // NumberOfLinks
+      put(v, 16, e.link_count ? e.link_count : 1, 4);               // NumberOfLinks
       v[20] = object && object->delete_on_close ? 1 : 0;            // DeletePending
       v[21] = e.type == NodeType::Directory ? 1 : 0;                // Directory
       size = 24;
@@ -848,7 +851,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     case kFilePositionInformation: put(v, 0, object ? object->position : 0, 8); size = 8; break;
     case 8: put(v, 0, object ? object->granted_access : 0, 4); size = 4; break;      // FileAccessInformation: the access the handle was opened with
     case 41: put(v, 0, 0, 4); size = 4; break;      // FileIoCompletionNotificationInformation: no flags set
-    case 6: put(v, 0, object ? file_id_of(object->path.view()) : 0, 8); size = 8; break;      // FileInternalInformation: the index of the file
+    case 6: put(v, 0, object ? entry_file_id(e, object->path.view()) : 0, 8); size = 8; break;      // FileInternalInformation: the index of the file
     case kFileNetworkOpenInformation:
       write_times(v, 0, e);
       put(v, 32, allocation_of(e), 8);
@@ -1095,7 +1098,7 @@ uint32_t nt_query_directory_file(Process& p, const SyscallRequest& r) {
     if (entry.name.view() == StringView(".")) entry_path.assign(object.path.view());
     else if (entry.name.view() == StringView("..")) entry_path.assign(virtual_directory_of(object.path.view()));
     else if (entry_path.assign(object.path.view()) && (object.path.view() == StringView("/") || entry_path.push_back('/'))) entry_path.append(entry.name.view());
-    const uint64_t size = build_directory_record(static_cast<uint32_t>(info_class), entry, ++object.directory_index, file_id_of(entry_path.view()), record, sizeof(record));
+    const uint64_t size = build_directory_record(static_cast<uint32_t>(info_class), entry, ++object.directory_index, entry_file_id(entry, entry_path.view()), record, sizeof(record));
     if (size == 0) return kInvalidInfoClass;
     const uint64_t padded = (size + 7) & ~uint64_t{7};
     if (used + size > length) {

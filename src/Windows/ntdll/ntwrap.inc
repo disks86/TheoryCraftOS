@@ -101,11 +101,6 @@ static NTSTATUS wrap_check_extended(const EXTENDED_PARAMETER_ *parameters, ULONG
   for (ULONG i = 0; i < count; ++i) if ((parameters[i].type & 0xFF) < 1 || (parameters[i].type & 0xFF) > 8) return STATUS_INVALID_PARAMETER;
   return STATUS_SUCCESS;
 }
-EXPORT NTSTATUS NTAPI NtAllocateVirtualMemoryEx(HANDLE process, PVOID *base, PSIZE_T size, ULONG type, ULONG protect, EXTENDED_PARAMETER_ *parameters, ULONG count) {
-  NTSTATUS status = wrap_check_extended(parameters, count);
-  if (!NT_SUCCESS(status)) return status;
-  return NtAllocateVirtualMemory(process, base, 0, size, type, protect);
-}
 EXPORT NTSTATUS NTAPI NtMapViewOfSectionEx(HANDLE section, HANDLE process, PVOID *base, PLARGE_INTEGER offset, PSIZE_T size, ULONG type, ULONG protect, EXTENDED_PARAMETER_ *parameters, ULONG count) {
   NTSTATUS status = wrap_check_extended(parameters, count);
   if (!NT_SUCCESS(status)) return status;
@@ -123,11 +118,6 @@ EXPORT NTSTATUS NTAPI NtCreateSectionEx(PHANDLE section, ULONG access, POBJECT_A
 EXPORT NTSTATUS NTAPI NtReadVirtualMemoryEx(HANDLE process, PVOID base, PVOID buffer, SIZE_T size, PSIZE_T read, ULONG flags) {
   if (flags & ~1u) return STATUS_INVALID_PARAMETER;
   return NtReadVirtualMemory(process, base, buffer, size, read);
-}
-/* VmPrefetchInformation (0) and VmPagePriorityInformation (1) are hints; the others change how memory is kept, which cannot be done here. */
-EXPORT NTSTATUS NTAPI NtSetInformationVirtualMemory(HANDLE process, ULONG information_class, ULONG_PTR count, PVOID entries, PVOID information, ULONG length) {
-  (void)process; (void)count; (void)entries; (void)information; (void)length;
-  return information_class <= 1 ? STATUS_SUCCESS : (NTSTATUS)0xC00000BB;
 }
 /* NtContinueEx(PCONTEXT, PVOID Argument): the argument is a BOOLEAN for the test alert, or (when it is a pointer) a CONTINUE_ARGUMENT whose first word holds flags (bit 0: test alert). */
 EXPORT NTSTATUS NTAPI NtContinueEx(PVOID context, PVOID argument) {

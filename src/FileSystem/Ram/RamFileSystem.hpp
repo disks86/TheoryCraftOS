@@ -66,6 +66,7 @@ class RamFileSystem final : public IFileSystem {
 
   // Resolves `path` from this filesystem's root, following symbolic links at every component including the last (so the Node returned, if any, is never itself a
   // Symlink). `hops` counts links followed so far across the whole call (TooManyLinks past a limit); callers from outside start it at 0.
+  uint64_t next_file_id_ = 0;      // file identities (DirectoryEntry::file_id) are handed out in order
   Status resolve(StringView path, Node** node, uint32_t* hops);
   Status resolve(StringView path, Node** node) { uint32_t hops = 0; return resolve(path, node, &hops); }
   // The same, but `path` is taken relative to `start` rather than to the root (a relative symbolic link's target is resolved this way, from the link's own directory).

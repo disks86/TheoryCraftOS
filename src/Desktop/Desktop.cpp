@@ -473,6 +473,7 @@ void Desktop::setup_terminal(Terminal& terminal) {
   terminal.set_app_kind(kAppTerminal);
   terminal.set_notices(&notice_dialog_);
   terminal.set_file_dialog(&file_dialog_);
+  terminal.set_color_dialog(&color_dialog_);
   terminal.on_new_terminal({&Desktop::on_new_terminal, this});
   terminal.on_open_path({&Desktop::on_terminal_path, this});
   terminal.set_program_launcher(program_launcher_);

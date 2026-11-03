@@ -47,6 +47,9 @@ class ProgramHost final : public process::IProcessHost {
   void yield() override;
   bool random_bytes(ByteView out) override;
   void unhandled_syscall(process::SyscallAbi abi, uint64_t number) override;
+  // The screen the program's common dialogs go to (nullptr: none, the program is told they are not supported). It must outlive the program.
+  void set_common_dialogs(process::ICommonDialogs* dialogs) { dialogs_ = dialogs; }
+  process::ICommonDialogs* common_dialogs() override { return dialogs_; }
 
   // --- Input and Ctrl+C (any thread)
   // Queues text for the program to read (a line includes its "\n"). Dropped once kMaxInput bytes wait unread.
@@ -75,6 +78,7 @@ class ProgramHost final : public process::IProcessHost {
   crypto::DrbgRandom random_;
   String unhandled_;
   uint32_t unhandled_count_ = 0;
+  process::ICommonDialogs* dialogs_ = nullptr;
   String input_;
   bool input_closed_ = false;
   bool interrupted_ = false;

@@ -25,8 +25,6 @@
 namespace process::windowsabi {
 
 // Threads wait for each other by id (what ntdll builds SRW locks, condition variables and WaitOnAddress from).
-uint32_t nt_alert_thread_by_thread_id(Process& p, const SyscallRequest& r);      // (ULONG_PTR ThreadId)
-uint32_t nt_wait_for_alert_by_thread_id(Process& p, const SyscallRequest& r);    // (PVOID Address, PLARGE_INTEGER Timeout)
 // NtWaitForKeyedEvent / NtReleaseKeyedEvent (HANDLE KeyedEvent, PVOID Key, BOOLEAN Alertable, PLARGE_INTEGER Timeout): a release and a wait with the same key meet; whichever comes
 // first waits for the other.
 uint32_t nt_wait_for_keyed_event(Process& p, const SyscallRequest& r);

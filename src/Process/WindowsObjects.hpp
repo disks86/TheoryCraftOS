@@ -100,6 +100,10 @@ uint32_t nt_cancel_timer(Process& p, const SyscallRequest& r);
 uint32_t nt_query_timer(Process& p, const SyscallRequest& r);
 // NtDelayExecution of an alertable sleep: ends early with STATUS_USER_APC (0xC0) when an APC is queued for the thread.
 uint32_t alertable_delay(Process& p, uint64_t nanoseconds);
+// NtAlertThreadByThreadId(ThreadId) and NtWaitForAlertByThreadId(Address, PLARGE_INTEGER Timeout): the park/unpark pair that WaitOnAddress and the user-mode locks are made of.
+// An alert that arrives before the wait is kept, so the wait ends at once; a wait ends with STATUS_ALERTED (0x101) or STATUS_TIMEOUT.
+uint32_t nt_alert_thread_by_thread_id(Process& p, const SyscallRequest& r);
+uint32_t nt_wait_for_alert_by_thread_id(Process& p, const SyscallRequest& r);
 // NtDuplicateObject(SourceProcess, SourceHandle, TargetProcess, PHANDLE Target, Access, Attributes, Options): within the calling process.
 uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r);
 

@@ -25,6 +25,7 @@
 #include "Process/WindowsTokens.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsIo.hpp"
+#include "Process/WindowsWait.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsPipes.hpp"
@@ -931,6 +932,28 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
 uint32_t alertable_delay(Process& p, uint64_t nanoseconds) {
   const uint32_t status = wait_for(p, nullptr, 0, false, nanoseconds, true);
   return status == kTimeout ? kSuccess : status;
+}
+
+uint32_t nt_alert_thread_by_thread_id(Process& p, const SyscallRequest& r) {
+  Process::ThreadRecord* record = p.find_thread(r.args[0]);
+  if (!record || record->finished) return 0xC000000Bu;      // STATUS_INVALID_CID
+  record->alerted = true;
+  if (p.runtime()) p.runtime()->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();
+  return kSuccess;
+}
+
+uint32_t nt_wait_for_alert_by_thread_id(Process& p, const SyscallRequest& r) {
+  bool fault = false;
+  const uint64_t timeout = timeout_ns_of(p, r.args[1], &fault);
+  if (fault) return kAccessViolation;
+  Process::ThreadRecord* me = p.find_thread(p.runtime() ? p.runtime()->current_thread_id() : p.id());
+  if (!me) return kInvalidHandle;
+  return wait_until(p, timeout, [&]() -> uint64_t {
+    if (!me->alerted) return kWaitPending;
+    me->alerted = false;
+    return 0x101u;      // STATUS_ALERTED
+  });
 }
 
 // NtSignalAndWaitForSingleObject(SignalHandle, WaitHandle, Alertable, Timeout): sets the event / releases the mutex or semaphore, then waits (one step to the others).

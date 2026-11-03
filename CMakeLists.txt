@@ -25,6 +25,8 @@ if(NOT CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(TheoryCraftOS LANGUAGES C CXX ASM)
+# win32k: every .cpp of src/Process/Win32k (the Direct3D thunks in Dxg/ too) is part of the kernel; new files are picked up when CMake is configured again.
+file(GLOB WIN32K_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/Process/Win32k/*.cpp ${CMAKE_SOURCE_DIR}/src/Process/Win32k/Dxg/*.cpp)
 set(TCOS_SMP 4 CACHE STRING "Cores of the QEMU machine of the run targets")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -341,6 +343,7 @@ add_executable(BOOTX64
   src/Wasm/WasmDecode.cpp
   src/Wasm/WasmRun.cpp
   src/Wasm/WasmSimd.cpp
+  src/Wasm/WasmJit.cpp
   src/Browser/WebPrelude.cpp
   src/Browser/WebUrl.cpp
   src/Browser/CookieJar.cpp
@@ -364,6 +367,7 @@ add_executable(BOOTX64
   src/Script/Parser.cpp
   src/Script/Compiler.cpp
   src/Script/Vm.cpp
+  src/Script/VmJit.cpp
   src/Script/Builtins.cpp
   src/Script/RegExp.cpp
   src/Script/TypedArray.cpp
@@ -659,12 +663,14 @@ add_executable(BOOTX64
   src/Process/AccessCheck.cpp
   src/Process/ObjectPath.cpp
   src/Process/WindowsTokens.cpp
+  src/Process/WindowsDialogs.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp
   src/Process/WindowsMisc.cpp
   src/Process/WindowsPorts.cpp
+  ${WIN32K_SOURCES}
   src/Process/WindowsRegistry.cpp
   src/Process/RegistryTree.cpp
   src/Process/DosWildcard.cpp
@@ -1055,7 +1061,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
             ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/comm.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/profile.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/appmodel.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/comm.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/profile.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/appmodel.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra4.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
   windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
@@ -1091,6 +1097,10 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMENT "Building win32u.dll")
   set(WINDOWS_LIBRARIES ntdll kernel32 msvcrt advapi32 ws2_32 win32u ${WINDOWS_STUB_LIBRARIES})
   set(_stub_image_base 0x180A00000)
+  # shell32.dll uses the registry (advapi32) and the window system (user32); the string functions it shares with shlwapi are forwarders in shell32.def.
+  set(WINDOWS_IMPORTS_shell32 advapi32 user32 ole32)
+  set(WINDOWS_IMPORTS_shlwapi advapi32)
+  set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     windows_stub_flags(_flags ${_library} 0)
     # A library with code of its own (src/Windows/<dll>/<dll>.c and the .inc files next to it) is linked over kernel32.dll; the stubs fill in what it does not define yet.
@@ -1101,6 +1111,22 @@ if(TCOS_ARCH STREQUAL "x86_64")
       file(GLOB _own_incs ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.inc)
       set(_own_sources ${_own} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll)
       set(_own_depends ${_own} ${_own_incs} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS})
+      if(_library STREQUAL "ole32")
+        # ole32.dll reads the class registry through advapi32.dll and includes mingw's headers (its interface definitions).
+        list(APPEND _own_sources ${WINDOWS_DIR}/advapi32.dll)
+        list(APPEND _own_depends ${WINDOWS_DIR}/advapi32.dll)
+      endif()
+      # <dll>.def: forwarders to other libraries (and exports that the C code cannot spell).
+      set(_own_def ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.def)
+      if(EXISTS ${_own_def})
+        list(APPEND _own_sources ${_own_def})
+        list(APPEND _own_depends ${_own_def})
+      endif()
+      # Libraries this one imports besides kernel32.dll (a list in WINDOWS_IMPORTS_<dll>).
+      foreach(_import ${WINDOWS_IMPORTS_${_library}})
+        list(APPEND _own_sources ${WINDOWS_DIR}/${_import}.dll)
+        list(APPEND _own_depends ${WINDOWS_DIR}/${_import}.dll)
+      endforeach()
     endif()
     add_custom_command(OUTPUT ${WINDOWS_DIR}/${_library}.dll
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1300,6 +1326,14 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     set(QEMU_AUDIO_DRIVER ${QEMU_AUDIO_DRIVER} CACHE STRING "QEMU -audiodev driver for the guest's sound card")
   endif()
   message(STATUS "QEMU audio backend: ${QEMU_AUDIO_DRIVER}")
+  # A UNIX socket path is limited to 107 bytes: a long build directory (a deep worktree) gets its socket under /tmp.
+  string(LENGTH "${CMAKE_BINARY_DIR}/qmp.sock" _qmp_length)
+  if(_qmp_length GREATER 100)
+    string(MD5 _qmp_hash "${CMAKE_BINARY_DIR}")
+    set(TCOS_QMP_SOCKET /tmp/tcos-qmp-${_qmp_hash}.sock)
+  else()
+    set(TCOS_QMP_SOCKET ${CMAKE_BINARY_DIR}/qmp.sock)
+  endif()
   set(QEMU_COMMON
     ${QEMU} -machine q35 -smp ${TCOS_SMP} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
     -rtc base=localtime  # the taskbar clock shows local time
@@ -1319,7 +1353,7 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -device isa-debugcon,iobase=0x402,chardev=dbg
     -serial null
     # `scripts/qemu-status.py` asks this socket why the VM is paused.
-    -qmp unix:${CMAKE_BINARY_DIR}/qmp.sock,server=on,wait=off
+    -qmp unix:${TCOS_QMP_SOCKET},server=on,wait=off
   )
   add_custom_target(vars
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OVMF_VARS} ${CMAKE_BINARY_DIR}/OVMF_VARS.fd

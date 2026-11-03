@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Process/Win32k/Win32k.hpp"
 #include "Kernel/UserMode.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Delay.hpp"
@@ -485,6 +486,7 @@ bool init(allocators::IAllocator& allocator) {
     g.objects = new (objects_memory) process::ObjectManager(*g.sync);
     g.objects->set_allocator(&allocator);
     process::set_system_objects(g.objects);
+    process::win32k::install();
   }
   g.nx = (rdmsr(kMsrEfer) & kEferNxe) != 0;
 

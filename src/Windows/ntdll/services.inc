@@ -375,3 +375,5 @@ NT_SERVICE(NtWaitHighEventPair);
 NT_SERVICE(NtWaitLowEventPair);
 NT_SERVICE(NtWorkerFactoryWorkerReady);
 NT_SERVICE(NtWriteRequestData);
+NT_SERVICE(NtAllocateVirtualMemoryEx);
+NT_SERVICE(NtSetInformationVirtualMemory);

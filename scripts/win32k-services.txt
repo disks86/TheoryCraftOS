@@ -1540,3 +1540,6 @@ NtUserYieldTask
 NtUserZapActiveAndFocus
 NtValidateCompositionSurfaceHandle
 NtVisualCaptureBits
+NtUserTcosGetUpcall
+NtUserTcosUpcallDone
+NtUserTcosResume

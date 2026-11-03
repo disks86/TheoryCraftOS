@@ -474,8 +474,26 @@ EXPORT ULONG NTAPI RtlRemoveVectoredExceptionHandler(PVOID cookie) {
   }
   return 0;
 }
-EXPORT PVOID NTAPI RtlAddVectoredContinueHandler(ULONG first, PVOID handler) { (void)first; (void)handler; return NULL; }
-EXPORT ULONG NTAPI RtlRemoveVectoredContinueHandler(PVOID cookie) { (void)cookie; return 0; }
+/* The continue handlers see an exception that was handled, just before the thread goes on (their answer does not change that). */
+static VECTORED_HANDLER g_continue_handlers[16];
+EXPORT PVOID NTAPI RtlAddVectoredContinueHandler(ULONG first, PVOID handler_arg) {
+  VECTORED_HANDLER handler = (VECTORED_HANDLER)handler_arg;
+  unsigned n = 0;
+  while (n < 16 && g_continue_handlers[n]) ++n;
+  if (n == 16 || !handler) return NULL;
+  if (first) for (unsigned i = n; i > 0; --i) g_continue_handlers[i] = g_continue_handlers[i - 1];
+  g_continue_handlers[first ? 0 : n] = handler;
+  return (PVOID)handler;
+}
+EXPORT ULONG NTAPI RtlRemoveVectoredContinueHandler(PVOID cookie) {
+  for (unsigned i = 0; i < 16; ++i) {
+    if (g_continue_handlers[i] != (VECTORED_HANDLER)cookie) continue;
+    for (unsigned j = i; j < 15; ++j) g_continue_handlers[j] = g_continue_handlers[j + 1];
+    g_continue_handlers[15] = NULL;
+    return 1;
+  }
+  return 0;
+}
 /* kernel32's UnhandledExceptionFilter (which calls the top-level filter and starts the AeDebug debugger) takes the place of the bare top-level filter once it is loaded. */
 static LONG (WINAPI *g_unhandled_hook)(PEXCEPTION_POINTERS);
 EXPORT void NTAPI RtlTcosSetUnhandledExceptionHook(LONG (WINAPI *hook)(PEXCEPTION_POINTERS)) { g_unhandled_hook = hook; }
@@ -488,7 +506,14 @@ EXPORT LPTOP_LEVEL_EXCEPTION_FILTER NTAPI RtlSetUnhandledExceptionFilter(LPTOP_L
 /* ---- dispatching an exception ------------------------------------------------------------------------------------------------------------------------------- */
 
 /* The handlers of the frames from the one `context` is in, outwards. TRUE: a handler wants the thread to go on with `context` (which it may have changed). FALSE: nobody handled it. */
+static BOOLEAN dispatch_exception(EXCEPTION_RECORD *record, CONTEXT *context);
 EXPORT BOOLEAN NTAPI RtlDispatchException(EXCEPTION_RECORD *record, CONTEXT *context) {
+  if (!dispatch_exception(record, context)) return FALSE;
+  EXCEPTION_POINTERS pointers = {record, context};
+  for (unsigned i = 0; i < 16 && g_continue_handlers[i]; ++i) g_continue_handlers[i](&pointers);
+  return TRUE;
+}
+static BOOLEAN dispatch_exception(EXCEPTION_RECORD *record, CONTEXT *context) {
   EXCEPTION_POINTERS pointers = {record, context};
   for (unsigned i = 0; i < 16 && g_vectored[i]; ++i) {
     if (g_vectored[i](&pointers) == EXCEPTION_CONTINUE_EXECUTION) return TRUE;

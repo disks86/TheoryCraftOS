@@ -63,29 +63,6 @@ bool object_of(Process& p, uint64_t handle, DescriptorKind kind, uint32_t* id) {
 
 }  // namespace
 
-uint32_t nt_alert_thread_by_thread_id(Process& p, const SyscallRequest& r) {
-  Process::ThreadRecord* t = p.find_thread(r.args[0]);
-  if (!t) return kInvalidCid;
-  if (t->finished) return kSuccess;      // (a thread that has ended can still be named)
-  t->alert_pending = true;
-  if (p.runtime()) p.runtime()->notify();
-  if (ObjectManager* objects = system_objects()) objects->notify();
-  return kSuccess;
-}
-
-uint32_t nt_wait_for_alert_by_thread_id(Process& p, const SyscallRequest& r) {
-  bool fault = false;
-  const uint64_t timeout = timeout_of(p, r.args[1], &fault);
-  if (fault) return kAccessViolation;
-  const uint64_t me = current_thread(p);
-  return wait_until(p, timeout, [&]() -> uint64_t {
-    Process::ThreadRecord* t = p.find_thread(me);
-    if (!t) return kInvalidCid;
-    if (t->alert_pending) { t->alert_pending = false; return kAlerted; }
-    return kWaitPending;
-  });
-}
-
 namespace {
 
 // The threads that wait in NtWaitForKeyedEvent and NtReleaseKeyedEvent (guarded by the system lock): a release and a wait with the same object and key are a pair.

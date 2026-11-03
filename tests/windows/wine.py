@@ -152,6 +152,13 @@ def guid_library(out):
 
     with ThreadPoolExecutor(8) as ex:
         objs = [o for o in ex.map(one, headers) if o]
+    # GUIDs that Wine headers only declare (Wine libuuid defines them): the ole32 tests use CLSID_ManualResetEvent and IID_IObjContext
+    extra = os.path.join(objdir, "extra.c")
+    with open(extra, "w") as f:
+        f.write('#include <stdarg.h>\n#include <windef.h>\nconst GUID CLSID_ManualResetEvent = {0x00000146, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};\nconst GUID IID_IObjContext = {0x000001c6, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};\n')
+    if not run([CC] + flags() + ["-c", "-o", extra[:-2] + ".o", extra]).returncode:
+        run([CC.replace("gcc", "objcopy"), "--weaken", extra[:-2] + ".o"])
+        objs.append(extra[:-2] + ".o")
     run([CC.replace("gcc", "ar"), "rcs", lib] + objs)
     return lib
 

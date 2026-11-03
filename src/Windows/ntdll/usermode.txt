@@ -5,12 +5,10 @@ NtFlushBuffersFileEx
 NtReadFileScatter
 NtWriteFileGather
 NtNotifyChangeDirectoryFileEx
-NtAllocateVirtualMemoryEx
 NtMapViewOfSectionEx
 NtUnmapViewOfSectionEx
 NtCreateSectionEx
 NtReadVirtualMemoryEx
-NtSetInformationVirtualMemory
 NtContinueEx
 NtCreateDirectoryObjectEx
 NtCreatePrivateNamespace

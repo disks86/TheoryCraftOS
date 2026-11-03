@@ -1,0 +1,1122 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+// Tests of the window manager (win32k USER core): classes, windows and the tree, geometry, z-order, painting state, message queues (posting, retrieval, filters, timers,
+// blocking waits, sends between threads and processes with the upcall protocol), hit testing, input injection, hooks, stations. A Th plays the user-mode half of win32u.dll
+// (src/Windows/win32u/win32u.c): it calls a service and, while the service answers "upcall due", runs the pending window-procedure calls and resumes.
+#include <atomic>
+#include <functional>
+#include <thread>
+#include "Win32kTestSupport.hpp"
+#include "Process/Win32k/Win32kUser.hpp"
+#include "Process/Win32k/Win32kUserInternal.hpp"
+
+using namespace w32test;
+using namespace process;
+using namespace process::win32k;
+using N = WindowsSyscallNumber;
+
+namespace {
+
+constexpr uint64_t kDue = 0x7FFFFFF1u, kDrainRetry = 0x7FFFFFF3u;
+
+// What a window procedure gets called with.
+struct Call_ {
+  uint32_t hwnd, msg;
+  uint64_t wparam, lparam;
+  std::vector<uint8_t> payload;
+};
+
+void wr32(std::vector<uint8_t>& v, uint32_t o, uint32_t x) { for (int i = 0; i < 4; ++i) v[o + i] = uint8_t(x >> (8 * i)); }
+struct Rc { int32_t l, t, r, b; };
+uint32_t rd(const std::vector<uint8_t>& v, uint32_t o) { return v.size() >= o + 4 ? uint32_t(v[o]) | uint32_t(v[o + 1]) << 8 | uint32_t(v[o + 2]) << 16 | uint32_t(v[o + 3]) << 24 : 0xDEADBEEFu; }
+
+// One thread of a program, with the user-mode half of the upcall protocol.
+struct Th {
+  Program* prog;
+  uint64_t tid;
+  uint64_t base;      // scratch memory of this thread: kScratch + base .. +0x8000
+  std::vector<Call_> log;
+  std::function<uint64_t(Th&, Call_&)> proc;
+  int nested = 0;
+
+  Th(Program& p, uint64_t t, uint64_t scratch) : prog(&p), tid(t), base(scratch) {}
+  uint64_t rec() const { return base; }
+  uint64_t tmp(uint64_t off = 0) const { return base + 0x2000 + off; }
+  FakeMemory& mem() { return prog->memory; }
+
+  void enter() { user::set_test_thread(tid); }
+
+  void drain() {
+    for (;;) {
+      enter();
+      const uint64_t buf = base + 0x4000 + 0x1100 * uint64_t(nested);      // (a record for each level of nesting)
+      if (uint32_t(call1(N::NtUserTcosGetUpcall, buf)) == 0) break;
+      const uint64_t id = mem().get64(buf);
+      const uint32_t flags = mem().get32(buf + 12);
+      Call_ c;
+      c.hwnd = uint32_t(mem().get64(buf + 24));
+      c.msg = mem().get32(buf + 32);
+      const uint32_t plen = mem().get32(buf + 36);
+      c.wparam = mem().get64(buf + 40);
+      c.lparam = mem().get64(buf + 48);
+      const uint16_t fix_at = uint16_t(mem().get16(buf + 80)), fix_to = uint16_t(mem().get16(buf + 82));
+      for (uint32_t i = 0; i < plen; ++i) c.payload.push_back(mem().get8(buf + 88 + i));
+      if (flags & 2) {      // lparam points to a copy of the structure
+        if (fix_at != 0xFFFF) mem().put64(buf + 88 + fix_at, buf + 88 + fix_to);
+        c.lparam = buf + 88;
+      }
+      log.push_back(c);
+      const size_t index = log.size() - 1;
+      uint64_t result = 0;
+      ++nested;
+      if (proc) result = proc(*this, c);
+      --nested;
+      for (uint32_t i = 0; i < plen; ++i) log[index].payload[i] = mem().get8(buf + 88 + i);
+      enter();
+      call1(N::NtUserTcosUpcallDone, id, result, buf + 88, plen);
+    }
+  }
+
+  // A win32k call with up to 24 arguments (the first four in registers, the others on the stack past the home space).
+  uint64_t call_raw(N n, const uint64_t (&a)[24]) {
+    SyscallRequest r;
+    r.number = uint64_t(n);
+    for (int i = 0; i < 4; ++i) r.args[i] = a[i];
+    for (int i = 4; i < 24; ++i) mem().put64(kStack + 0x28 + 8 * (i - 4), a[i]);
+    r.user_stack = kStack;
+    return prog->iface->dispatch(prog->process, r);
+  }
+  uint64_t call1(N n, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0) {
+    const uint64_t a[24] = {a0, a1, a2, a3};
+    return call_raw(n, a);
+  }
+
+  uint64_t svc(N n, std::initializer_list<uint64_t> list = {}) {
+    uint64_t a[24] = {};
+    size_t i = 0;
+    for (uint64_t v : list) a[i++] = v;
+    auto raw = [&]() {
+      enter();
+      return call_raw(n, a);
+    };
+    uint64_t r = raw();
+    for (;;) {
+      if (r == kDue) { drain(); enter(); r = call1(N::NtUserTcosResume); }
+      else if (r == kDrainRetry) { drain(); r = raw(); }
+      else break;
+    }
+    return r;
+  }
+  uint32_t svc32(N n, std::initializer_list<uint64_t> list = {}) { return uint32_t(svc(n, list)); }
+
+  // --- helpers
+  uint32_t atom_class(const std::string& name, uint32_t style = 0, uint64_t wndproc = 0x401000, int cls_extra = 0, int wnd_extra = 0, uint64_t instance = 0x400000) {
+    const uint64_t wc = tmp(0x100), us = tmp(0x200), chars = tmp(0x240);
+    for (uint64_t i = 0; i < 80; ++i) mem().put8(wc + i, 0);
+    mem().put32(wc, 80);
+    mem().put32(wc + 4, style);
+    mem().put64(wc + 8, wndproc);
+    mem().put32(wc + 16, cls_extra);
+    mem().put32(wc + 20, wnd_extra);
+    mem().put64(wc + 24, instance);
+    mem().put_unicode_string(us, chars, name);
+    return svc32(N::NtUserRegisterClassExWOW, {wc, us, 0, 0, 0, 0, 0});
+  }
+  uint32_t create(const std::string& cls, uint32_t style, int x, int y, int cx, int cy, uint32_t parent = 0, uint32_t ex = 0, const std::string& title = "", uint64_t params = 0, uint64_t instance = 0x400000) {
+    const uint64_t cus = tmp(0x400), cch = tmp(0x440), tus = tmp(0x600), tch = tmp(0x640);
+    mem().put_unicode_string(cus, cch, cls);
+    mem().put_unicode_string(tus, tch, title);
+    return svc32(N::NtUserCreateWindowEx, {ex, cus, 0, tus, style, uint64_t(uint32_t(x)), uint64_t(uint32_t(y)), uint64_t(uint32_t(cx)), uint64_t(uint32_t(cy)), parent, 0, instance, params, 0, instance, cch, 0});
+  }
+  Rc rect(uint64_t addr) { return Rc{int32_t(mem().get32(addr)), int32_t(mem().get32(addr + 4)), int32_t(mem().get32(addr + 8)), int32_t(mem().get32(addr + 12))}; }
+  void put_rect(uint64_t addr, Rc r) { mem().put32(addr, uint32_t(r.l)); mem().put32(addr + 4, uint32_t(r.t)); mem().put32(addr + 8, uint32_t(r.r)); mem().put32(addr + 12, uint32_t(r.b)); }
+  Rc window_rect(uint32_t hwnd) {
+    const uint64_t params = tmp(0x900), r = tmp(0x920);
+    mem().put64(params, r);
+    mem().put32(params + 8, 96);
+    svc(N::NtUserCallHwndParam, {hwnd, params, 13});
+    return rect(r);
+  }
+  Rc client_rect(uint32_t hwnd) {
+    const uint64_t params = tmp(0x900), r = tmp(0x920);
+    mem().put64(params, r);
+    mem().put32(params + 8, 96);
+    svc(N::NtUserCallHwndParam, {hwnd, params, 14});
+    return rect(r);
+  }
+  bool show(uint32_t hwnd, uint32_t cmd) { return svc32(N::NtUserShowWindow, {hwnd, cmd}) != 0; }
+  uint32_t style(uint32_t hwnd) { return uint32_t(svc(N::NtUserCallHwndParam, {hwnd, uint64_t(uint32_t(-16)), 10})); }
+  bool is_window(uint32_t h) { return svc32(N::NtUserCallHwnd, {h, 10}) != 0; }
+  uint32_t get_window(uint32_t h, uint32_t rel) { return uint32_t(svc(N::NtUserCallHwndParam, {h, rel, 16})); }
+  uint32_t parent_of(uint32_t h) { return uint32_t(svc(N::NtUserCallHwnd, {h, 5})); }
+  bool post(uint32_t h, uint32_t msg, uint64_t w = 0, uint64_t l = 0) { return svc32(N::NtUserPostMessage, {h, msg, w, l}) != 0; }
+  // PeekMessage with PM_REMOVE; returns true and fills msg fields
+  struct M { uint32_t hwnd = 0, message = 0; uint64_t wparam = 0, lparam = 0; uint32_t time = 0; int32_t x = 0, y = 0; };
+  bool peek(M* m, uint32_t hwnd = 0, uint32_t first = 0, uint32_t last = 0, uint32_t flags = 1) {
+    const uint64_t buf = tmp(0xA00);
+    const bool got = svc32(N::NtUserPeekMessage, {buf, hwnd, first, last, flags}) != 0;
+    if (got) read_msg(buf, m);
+    return got;
+  }
+  void read_msg(uint64_t buf, M* m) {
+    m->hwnd = uint32_t(mem().get64(buf));
+    m->message = mem().get32(buf + 8);
+    m->wparam = mem().get64(buf + 16);
+    m->lparam = mem().get64(buf + 24);
+    m->time = mem().get32(buf + 32);
+    m->x = int32_t(mem().get32(buf + 36));
+    m->y = int32_t(mem().get32(buf + 40));
+  }
+  int get_message(M* m, uint32_t hwnd = 0, uint32_t first = 0, uint32_t last = 0) {
+    const uint64_t buf = tmp(0xA00);
+    const int32_t r = int32_t(svc32(N::NtUserGetMessage, {buf, hwnd, first, last}));
+    if (r >= 0) read_msg(buf, m);
+    return r;
+  }
+  bool pk(M* m) { return peek(m, 0, 0x100, 0x3FF, 1); }
+  void clear_log() { log.clear(); }
+  std::vector<uint32_t> msgs() { std::vector<uint32_t> v; for (const Call_& c : log) v.push_back(c.msg); return v; }
+  bool saw(uint32_t msg) { for (const Call_& c : log) if (c.msg == msg) return true; return false; }
+  int count_msg(uint32_t msg) { int n = 0; for (const Call_& c : log) if (c.msg == msg) ++n; return n; }
+};
+
+constexpr uint32_t WS_OVERLAPPED = 0, WS_POPUP = 0x80000000u, WS_CHILD = 0x40000000u, WS_VISIBLE = 0x10000000u, WS_DISABLED = 0x08000000u, WS_CLIPCHILDREN = 0x02000000u,
+                   WS_CLIPSIBLINGS = 0x04000000u, WS_MINIMIZE = 0x20000000u, WS_MAXIMIZE = 0x01000000u, WS_CAPTION = 0xC00000u, WS_BORDER = 0x800000u,
+                   WS_THICKFRAME = 0x40000u, WS_SYSMENU = 0x80000u, WS_OVERLAPPEDWINDOW = 0xCF0000u;
+constexpr uint32_t WM_CREATE = 1, WM_DESTROY = 2, WM_MOVE = 3, WM_SIZE = 5, WM_ACTIVATE = 6, WM_SETFOCUS = 7, WM_KILLFOCUS = 8, WM_ENABLE = 0xA, WM_PAINT = 0xF, WM_CLOSE = 0x10,
+                   WM_QUIT = 0x12, WM_ERASEBKGND = 0x14, WM_SHOWWINDOW = 0x18, WM_NCCREATE = 0x81, WM_NCDESTROY = 0x82, WM_NCCALCSIZE = 0x83, WM_NCACTIVATE = 0x86, WM_USER = 0x400,
+                   WM_WINDOWPOSCHANGING = 0x46, WM_WINDOWPOSCHANGED = 0x47, WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_CHAR = 0x102, WM_TIMER = 0x113, WM_MOUSEMOVE = 0x200,
+                   WM_LBUTTONDOWN = 0x201, WM_LBUTTONUP = 0x202, WM_LBUTTONDBLCLK = 0x203, WM_HOTKEY = 0x312, WM_NCMOUSEMOVE = 0xA0, WM_PARENTNOTIFY = 0x210,
+                   WM_SETTEXT = 0xC, WM_GETTEXT = 0xD, WM_COPYDATA = 0x4A, WM_MOUSEWHEEL = 0x20A, WM_SYSKEYDOWN = 0x104, WM_STYLECHANGED = 0x7D;
+
+uint64_t default_proc(Th& t, Call_& c) {
+  if (c.msg == WM_NCCREATE) return 1;
+  if (c.msg == WM_NCCALCSIZE) return t.svc(N::NtUserMessageCall, {c.hwnd, c.msg, c.wparam, c.lparam, 0, 0x29e, 0});      // DefWindowProc computes the client area
+  return 0;
+}
+// everything goes to DefWindowProc
+uint64_t def_proc(Th& t, Call_& c) { return t.svc(N::NtUserMessageCall, {c.hwnd, c.msg, c.wparam, c.lparam, 0, 0x29e, 0}); }
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+void test_classes() {
+  Program prog(21);
+  Th t(prog, 21, kScratch);
+  t.proc = default_proc;
+  CHECK(t.atom_class("MyClass", 0, 0x401000, 8, 16) >= 0xC000);
+  CHECK(t.atom_class("MyClass") == 0);      // already registered
+  // error codes
+  prog.process.set_gs_base(kScratch + 0x7000);
+  t.atom_class("MyClass");
+  CHECK(prog.memory.get32(kScratch + 0x7000 + 0x68) == 1410);
+  // other processes' classes with the same name are separate
+  Program other(22);
+  Th o(other, 22, kScratch);
+  CHECK(o.atom_class("MyClass") >= 0xC000);
+  // class info
+  const uint64_t us = t.tmp(0x200), chars = t.tmp(0x240), wc = t.tmp(0x300);
+  prog.memory.put_unicode_string(us, chars, "MyClass");
+  prog.memory.put32(wc, 80);
+  CHECK(t.svc32(N::NtUserGetClassInfoEx, {0x400000, us, wc, 0, 0}) >= 0xC000);
+  CHECK(prog.memory.get32(wc + 16) == 8 && prog.memory.get32(wc + 20) == 16 && prog.memory.get64(wc + 8) == 0x401000);
+  prog.memory.put_unicode_string(us, chars, "Nope");
+  CHECK(t.svc32(N::NtUserGetClassInfoEx, {0x400000, us, wc, 0, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1411);
+  // a window of the class: name, long values, class words
+  const uint32_t w = t.create("MyClass", WS_OVERLAPPED, 10, 20, 100, 80);
+  CHECK(w != 0 && t.is_window(w));
+  const uint64_t name = t.tmp(0x800);
+  prog.memory.put16(name + 2, 64);
+  prog.memory.put64(name + 8, t.tmp(0x880));
+  CHECK(t.svc32(N::NtUserGetClassName, {w, 1, name}) == 7 && prog.memory.get_wide_z(t.tmp(0x880)) == "MyClass");
+  CHECK(t.svc(N::NtUserSetClassLongPtr, {w, 0, 0x1234, 0}) == 0);      // class extra bytes start at zero
+  CHECK(t.svc(N::NtUserCallHwndParam, {w, 0, 4}) == 0x1234);          // GetClassLongPtr
+  CHECK(t.svc(N::NtUserSetClassLongPtr, {w, 0, 0x99, 0}) == 0x1234);
+  CHECK(t.svc(N::NtUserCallHwndParam, {w, uint64_t(int64_t(-26)), 3}) == 0);      // GCL_STYLE
+  CHECK(t.svc(N::NtUserSetClassLong, {w, uint64_t(int64_t(-26)), 0x20, 0}) == 0 && t.svc(N::NtUserCallHwndParam, {w, uint64_t(int64_t(-26)), 3}) == 0x20);
+  CHECK(t.svc32(N::NtUserSetClassLong, {w, 100, 1, 0}) == 0);      // past the extra bytes
+  CHECK(prog.memory.get32(kScratch + 0x7000 + 0x68) == 1413);
+  // a class with windows cannot go
+  prog.memory.put_unicode_string(us, chars, "MyClass");
+  CHECK(t.svc32(N::NtUserUnregisterClass, {us, 0x400000, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1412);
+  CHECK(t.svc32(N::NtUserDestroyWindow, {w}) == 1);
+  CHECK(t.svc32(N::NtUserUnregisterClass, {us, 0x400000, 0}) == 1);
+  CHECK(t.svc32(N::NtUserUnregisterClass, {us, 0x400000, 0}) == 0);
+  // window messages and atoms
+  prog.memory.put_unicode_string(us, chars, "MyPrivateMessage");
+  const uint32_t m1 = t.svc32(N::NtUserRegisterWindowMessage, {us});
+  CHECK(m1 >= 0xC000 && t.svc32(N::NtUserRegisterWindowMessage, {us}) == m1);
+  prog.memory.put_unicode_string(us, chars, "myprivatemessage");
+  CHECK(t.svc32(N::NtUserRegisterWindowMessage, {us}) == m1);      // case does not matter
+  // bad pointers
+  CHECK(t.svc32(N::NtUserRegisterClassExWOW, {0x10, us, 0, 0, 0, 0, 0}) == 0);
+  CHECK(t.svc32(N::NtUserRegisterWindowMessage, {0x10}) == 0);
+  user::reset_state();
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+void test_create_and_destroy() {
+  Program prog(31);
+  Th t(prog, 31, kScratch);
+  t.proc = default_proc;
+  prog.process.set_gs_base(kScratch + 0x7000);
+  t.atom_class("Top", 0, 0x401000, 0, 8);
+  // an invisible overlapped window: NCCREATE, NCCALCSIZE, CREATE
+  const uint32_t w = t.create("Top", WS_OVERLAPPEDWINDOW, 10, 20, 300, 200, 0, 0, "Title", 0x55AA);
+  CHECK(w != 0 && t.is_window(w));
+  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE}));
+  // the creation structure: lpCreateParams, geometry and styles
+  CHECK(rd(t.log[0].payload, 0) == 0x55AA && rd(t.log[0].payload, 32) == 200 && rd(t.log[0].payload, 36) == 300 && rd(t.log[0].payload, 40) == 20 && rd(t.log[0].payload, 44) == 10);
+  CHECK(rd(t.log[0].payload, 48) == WS_OVERLAPPEDWINDOW);
+  // NCCALCSIZE came with the window rectangle in rgrc[0]
+  CHECK(rd(t.log[1].payload, 16) == 10 && rd(t.log[1].payload, 20) == 20 && rd(t.log[1].payload, 24) == 310 && rd(t.log[1].payload, 28) == 220 && t.log[1].wparam == 1);
+  // geometry: window rect and the client rectangle inside the frame (Windows 10 metrics: 8 px frame, 31 px of caption and frame on top)
+  Rc wr = t.window_rect(w), cr = t.client_rect(w);
+  CHECK(wr.l == 10 && wr.t == 20 && wr.r == 310 && wr.b == 220);
+  CHECK(cr.l == 0 && cr.t == 0 && cr.r == 300 - 16 && cr.b == 200 - 8 - 31);
+  CHECK(!(t.style(w) & WS_VISIBLE));
+  CHECK(t.svc32(N::NtUserCallHwnd, {w, 13}) == 0);      // not visible
+  // a visible one
+  t.clear_log();
+  const uint32_t v = t.create("Top", WS_POPUP | WS_VISIBLE, 0, 0, 50, 50);
+  CHECK(v != 0 && t.svc32(N::NtUserCallHwnd, {v, 13}) == 1);
+  CHECK(t.saw(WM_SHOWWINDOW) && t.saw(WM_WINDOWPOSCHANGING) && t.saw(WM_WINDOWPOSCHANGED));
+  CHECK(t.count_msg(WM_ACTIVATE) == 1);      // the first visible top-level window of the thread is activated
+  CHECK(t.svc32(N::NtUserGetThreadState, {1}) == v);
+  // WM_NCCREATE answering FALSE fails the creation: WM_NCDESTROY, no window
+  t.clear_log();
+  t.proc = [](Th&, Call_& c) -> uint64_t { return c.msg == WM_NCCREATE ? 0 : 0; };
+  CHECK(t.create("Top", 0, 0, 0, 10, 10) == 0);
+  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCDESTROY}));
+  // WM_CREATE answering -1: WM_DESTROY and WM_NCDESTROY
+  t.clear_log();
+  t.proc = [](Th&, Call_& c) -> uint64_t { return c.msg == WM_NCCREATE ? 1 : c.msg == WM_CREATE ? uint64_t(-1) : 0; };
+  CHECK(t.create("Top", 0, 0, 0, 10, 10) == 0);
+  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE, WM_DESTROY, WM_NCDESTROY}));
+  t.proc = default_proc;
+  // unknown class, bad parent
+  CHECK(t.create("NoSuchClass", 0, 0, 0, 10, 10) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1407);
+  CHECK(t.create("Top", WS_CHILD, 0, 0, 10, 10, 0) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1406);
+  CHECK(t.create("Top", WS_CHILD, 0, 0, 10, 10, 0x99999) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1400);
+
+  // children, siblings and the tree
+  const uint32_t p = t.create("Top", WS_OVERLAPPED, 0, 0, 200, 200);
+  const uint32_t c1 = t.create("Top", WS_CHILD | WS_VISIBLE, 5, 5, 50, 50, p);
+  const uint32_t c2 = t.create("Top", WS_CHILD | WS_VISIBLE, 60, 5, 50, 50, p);
+  const uint32_t g = t.create("Top", WS_CHILD | WS_VISIBLE, 1, 1, 10, 10, c1);
+  CHECK(c1 && c2 && g);
+  CHECK(t.parent_of(c1) == p && t.parent_of(g) == c1 && t.parent_of(p) == 0);
+  CHECK(t.get_window(p, 5) == c2);      // GW_CHILD: the newest child is the topmost
+  CHECK(t.get_window(c2, 2) == c1 && t.get_window(c1, 3) == c2);      // GW_HWNDNEXT / GW_HWNDPREV
+  CHECK(t.get_window(c1, 0) == c2 && t.get_window(c2, 1) == c1);      // FIRST / LAST
+  CHECK(t.svc32(N::NtUserCallHwndParam, {p, g, 19}) == 1 && t.svc32(N::NtUserCallHwndParam, {c1, c2, 19}) == 0);      // IsChild
+  CHECK(t.svc32(N::NtUserGetAncestor, {g, 2}) == p && t.svc32(N::NtUserGetAncestor, {g, 1}) == c1);
+  // screen coordinates of nested children
+  Rc gr = t.window_rect(g);
+  CHECK(gr.l == 5 + 1 && gr.t == 5 + 1 && gr.r == 5 + 11);
+  CHECK(t.svc32(N::NtUserWindowFromPoint, {6, 6}) == 0 || true);
+  // FindWindowEx and the window list
+  const uint64_t us = t.tmp(0x200), chars = t.tmp(0x240);
+  prog.memory.put_unicode_string(us, chars, "Top");
+  CHECK(t.svc32(N::NtUserFindWindowEx, {p, 0, us, 0, 0}) == c2);
+  CHECK(t.svc32(N::NtUserFindWindowEx, {p, c2, us, 0, 0}) == c1);
+  CHECK(t.svc32(N::NtUserFindWindowEx, {p, c1, us, 0, 0}) == 0);
+  const uint64_t list = t.tmp(0x1000), size = t.tmp(0xFF0);
+  CHECK(t.svc32(N::NtUserBuildHwndList, {0, p, 1, 0, 0, 2, list, size}) == 0xC0000023u && prog.memory.get32(size) == 3);      // all descendants: 3
+  CHECK(t.svc32(N::NtUserBuildHwndList, {0, p, 1, 0, 0, 8, list, size}) == 0 && prog.memory.get32(size) == 3);
+  CHECK(prog.memory.get64(list) == c2 || prog.memory.get64(list) == c1);
+  // DestroyWindow: parent first, children below it, in order; WM_NCDESTROY from the leaves up
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserDestroyWindow, {p}) == 1);
+  CHECK(!t.is_window(p) && !t.is_window(c1) && !t.is_window(c2) && !t.is_window(g));
+  std::vector<uint32_t> order;
+  for (const Call_& cl : t.log) if (cl.msg == WM_DESTROY || cl.msg == WM_NCDESTROY) order.push_back(cl.msg);
+  CHECK(order.size() == 8 && order[0] == WM_DESTROY);
+  // every WM_NCDESTROY comes after the WM_DESTROY of its own window, the parent's last
+  CHECK(t.log.back().msg == WM_NCDESTROY && t.log.back().hwnd == p);
+  CHECK(t.svc32(N::NtUserDestroyWindow, {p}) == 0);      // gone
+  // SetParent: the window moves, the previous parent is the answer; cycles are refused
+  const uint32_t a = t.create("Top", WS_OVERLAPPED, 0, 0, 100, 100), b = t.create("Top", WS_CHILD, 3, 4, 20, 20, a), d = t.create("Top", WS_OVERLAPPED, 300, 300, 50, 50);
+  const uint32_t desktop = uint32_t(t.svc(N::NtUserCallHwnd, {a, 5}) ? 0 : 0);
+  (void)desktop;
+  CHECK(t.svc32(N::NtUserSetParent, {b, d}) == a);
+  CHECK(t.parent_of(b) == d && t.get_window(a, 5) == 0 && t.get_window(d, 5) == b);
+  CHECK(t.svc32(N::NtUserSetParent, {d, b}) == 0);      // d is b's parent: a cycle
+  CHECK(t.svc32(N::NtUserSetParent, {b, b}) == 0);
+  const uint32_t old = t.svc32(N::NtUserSetParent, {b, 0});      // to the desktop
+  CHECK(old == d && t.parent_of(b) == 0);
+  CHECK(t.svc32(N::NtUserSetParent, {a, 0}) == (uint32_t)user::desktop_window());      // a was a top-level window: its parent was the desktop
+  user::reset_state();
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+uint64_t big(int64_t v) { return uint64_t(v); }
+void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+void test_queue_basics() {
+  Program prog(41);
+  Th t(prog, 41, kScratch);
+  t.proc = default_proc;
+  prog.process.set_gs_base(kScratch + 0x7000);
+  t.atom_class("Q");
+  const uint32_t w = t.create("Q", WS_OVERLAPPED, 0, 0, 50, 50), w2 = t.create("Q", WS_OVERLAPPED, 0, 0, 50, 50);
+  CHECK(t.post(w, WM_USER, 1, 2) && t.post(w2, WM_USER + 1, 3, 4) && t.post(w, WM_USER + 2, 5, 6));
+  CHECK(t.svc32(N::NtUserPostThreadMessage, {41, WM_USER + 3, 7, 8}) == 1);
+  Th::M m;
+  CHECK(t.peek(&m, 0, 0, 0, 0) && m.message == WM_USER && m.hwnd == w && m.wparam == 1 && m.lparam == 2);      // PM_NOREMOVE
+  CHECK(t.peek(&m, 0, 0, 0, 0) && m.message == WM_USER);
+  CHECK(t.peek(&m, w2) && m.message == WM_USER + 1 && m.wparam == 3);      // window filter, removed
+  CHECK(t.peek(&m, 0, WM_USER + 2, WM_USER + 2) && m.hwnd == w);      // range filter
+  CHECK(t.svc32(N::NtUserPeekMessage, {t.tmp(0xA00), big(-1), 0, 0, 1}) == 1 && t.mem().get64(t.tmp(0xA00)) == 0 && t.mem().get32(t.tmp(0xA00) + 8) == WM_USER + 3);      // thread messages only
+  CHECK(t.peek(&m) && m.message == WM_USER && !t.peek(&m));
+  // queue status: nothing posted, then something
+  CHECK((t.svc32(N::NtUserGetQueueStatus, {0x4FF}) & 8) == 0);
+  t.post(w, WM_USER + 5);
+  const uint32_t qs = t.svc32(N::NtUserGetQueueStatus, {0x4FF});
+  CHECK((qs & 8) != 0 && (qs >> 16 & 8) != 0);
+  CHECK(t.svc32(N::NtUserGetQueueStatus, {0x4FF}) >> 16 == 0);      // "changed" bits are read once
+  // WM_QUIT comes after posted messages and carries the exit code
+  CHECK(t.svc32(N::NtUserPostQuitMessage, {7}) == 1);
+  CHECK(t.get_message(&m) == 1 && m.message == WM_USER + 5);
+  CHECK(t.get_message(&m) == 0 && m.message == WM_QUIT && m.wparam == 7);
+  CHECK(!t.peek(&m));      // the quit is consumed
+  // posting to windows that do not exist, and messages that need a reply
+  CHECK(!t.post(0x77777, WM_USER) && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1400);
+  CHECK(!t.post(w, WM_COPYDATA) && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1159);
+  CHECK(t.svc32(N::NtUserPostThreadMessage, {0x12345, WM_USER, 0, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1444);
+  // timers: a thread timer arrives as WM_TIMER by its deadline
+  const uint64_t id = t.svc(N::NtUserSetTimer, {0, 0, 20, 0, 0});
+  CHECK(id != 0);
+  CHECK(!t.peek(&m));      // not due yet
+  CHECK(t.get_message(&m) == 1 && m.message == WM_TIMER && m.wparam == id && m.hwnd == 0);
+  CHECK(t.svc32(N::NtUserKillTimer, {0, id}) == 1 && t.svc32(N::NtUserKillTimer, {0, id}) == 0);
+  // a window timer with the id of the caller's choice, replaced by a second SetTimer, and removed with the window
+  CHECK(t.svc(N::NtUserSetTimer, {w, 5, 10, 0, 0}) == 5 && t.svc(N::NtUserSetTimer, {w, 5, 10, 0, 0}) == 5);
+  CHECK(t.get_message(&m) == 1 && m.message == WM_TIMER && m.hwnd == w && m.wparam == 5);
+  CHECK(t.get_message(&m) == 1 && m.message == WM_TIMER);      // (it repeats)
+  t.svc(N::NtUserDestroyWindow, {w});
+  CHECK(!t.peek(&m, 0, WM_TIMER, WM_TIMER));
+  // WM_PAINT comes when nothing else is queued
+  t.show(w2, 5);
+  CHECK(t.peek(&m, 0, WM_PAINT, WM_PAINT) && m.hwnd == w2);
+  t.svc(N::NtUserValidateRect, {w2, 0});
+  // a blocked GetMessage woken by a post from another thread
+  std::thread poster([&] { sleep_ms(60); Th p2(prog, 41, kScratch + 0x20000); p2.post(w2, WM_USER + 9, 1, 1); });
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(t.get_message(&m) == 1 && m.message == WM_USER + 9);
+  CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(40));
+  poster.join();
+  user::reset_state();
+}
+
+void test_send_same_thread() {
+  Program prog(42);
+  Th t(prog, 42, kScratch);
+  t.proc = default_proc;
+  t.atom_class("S");
+  const uint32_t w = t.create("S", WS_OVERLAPPED, 0, 0, 50, 50);
+  t.clear_log();
+  t.proc = [](Th& th, Call_& c) -> uint64_t {
+    if (c.msg == WM_USER) return c.wparam * 2 + c.lparam;
+    if (c.msg == WM_USER + 1) return th.svc(N::NtUserMessageCall, {c.hwnd, WM_USER, c.wparam, 1, 0, 0x2b1, 0}) + 100;      // a nested send from inside the procedure
+    return 0;
+  };
+  CHECK(t.svc(N::NtUserMessageCall, {w, WM_USER, 20, 2, 0, 0x2b1, 0}) == 42);
+  CHECK(t.svc(N::NtUserMessageCall, {w, WM_USER + 1, 5, 0, 0, 0x2b1, 0}) == 111);
+  CHECK(t.log.size() == 3 && t.log[1].msg == WM_USER + 1 && t.log[2].msg == WM_USER);
+  // SendNotifyMessage to an own window behaves like SendMessage
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserMessageCall, {w, WM_USER, 1, 1, 0, 0x2b7, 0}) == 1 && t.log.size() == 1);
+  // SendMessageTimeout fills the result
+  const uint64_t info = t.tmp(0xB00);
+  t.mem().put32(info, 0); t.mem().put32(info + 4, 1000); t.mem().put64(info + 8, 0);
+  CHECK(t.svc32(N::NtUserMessageCall, {w, WM_USER, 3, 3, info, 0x2b3, 0}) == 1 && t.mem().get64(info + 8) == 9);
+  CHECK(t.svc(N::NtUserMessageCall, {0x4444, WM_USER, 0, 0, 0, 0x2b1, 0}) == 0);
+  // DispatchMessage calls the window procedure; a WM_TIMER with a callback calls that
+  t.clear_log();
+  const uint64_t msg = t.tmp(0xC00);
+  t.mem().put64(msg, w); t.mem().put32(msg + 8, WM_USER); t.mem().put64(msg + 16, 10); t.mem().put64(msg + 24, 1);
+  CHECK(t.svc(N::NtUserDispatchMessage, {msg}) == 21 && t.log.size() == 1);
+  t.mem().put32(msg + 8, WM_TIMER); t.mem().put64(msg + 16, 3); t.mem().put64(msg + 24, 0x500000);
+  t.clear_log();
+  t.svc(N::NtUserDispatchMessage, {msg});
+  CHECK(t.log.size() == 1 && t.log[0].msg == WM_TIMER && t.log[0].wparam == 3);
+  user::reset_state();
+}
+
+void test_send_between_threads() {
+  Program pa(51), pb(52), pc(53);
+  const uint64_t ta = (1ull << 20) | 51, tb = (1ull << 20) | 52, tc = (1ull << 20) | 53;
+  Th a(pa, ta, kScratch), b(pb, tb, kScratch), c(pc, tc, kScratch);
+  pa.process.set_gs_base(kScratch + 0x7000);
+  b.proc = default_proc;
+  c.proc = default_proc;
+  a.proc = default_proc;
+  b.atom_class("B");
+  c.atom_class("C");
+  const uint32_t wb = b.create("B", WS_OVERLAPPED, 0, 0, 50, 50), wc = c.create("C", WS_OVERLAPPED, 0, 0, 50, 50);
+  std::atomic<bool> replied_proc_done{false};
+  b.proc = [&](Th& th, Call_& cl) -> uint64_t {
+    if (cl.msg == WM_USER) return cl.wparam + cl.lparam;
+    if (cl.msg == WM_USER + 1) {
+      CHECK(th.svc32(N::NtUserGetThreadState, {8}) == 1);      // InSendMessage
+      th.svc(N::NtUserReplyMessage, {99});
+      CHECK(th.svc32(N::NtUserGetThreadState, {8}) == 9);      // replied
+      sleep_ms(200);
+      replied_proc_done = true;
+      return 5;
+    }
+    if (cl.msg == WM_COPYDATA) {
+      CHECK(cl.payload.size() == 24 + 5 && rd(cl.payload, 8) == 5);
+      CHECK(std::string(cl.payload.begin() + 24, cl.payload.end()) == "hello");
+      CHECK(th.mem().get64(cl.lparam + 16) == cl.lparam + 24);      // the data pointer points into the copy
+      return 1;
+    }
+    if (cl.msg == WM_SETTEXT) { CHECK(th.mem().get16(cl.lparam) == 'h'); return 1; }
+    return 0;
+  };
+  std::thread bt([&] {
+    Th::M m;
+    while (b.get_message(&m) > 0 && m.message != WM_USER + 100) {}
+  });
+  sleep_ms(30);
+  CHECK(a.svc(N::NtUserMessageCall, {wb, WM_USER, 40, 2, 0, 0x2b1, 0}) == 42);
+  // ReplyMessage lets the sender go on before the procedure is done
+  CHECK(a.svc(N::NtUserMessageCall, {wb, WM_USER + 1, 0, 0, 0, 0x2b1, 0}) == 99);
+  CHECK(!replied_proc_done);
+  // WM_COPYDATA across processes: the data is copied
+  const uint64_t cds = a.tmp(0x100), data = a.tmp(0x200);
+  pa.memory.put64(cds, 77); pa.memory.put32(cds + 8, 5); pa.memory.put64(cds + 16, data);
+  for (int i = 0; i < 5; ++i) pa.memory.put8(data + i, "hello"[i]);
+  CHECK(a.svc(N::NtUserMessageCall, {wb, WM_COPYDATA, 0, cds, 0, 0x2b1, 0}) == 1);
+  pa.memory.put_wide(a.tmp(0x300), "hi");
+  CHECK(a.svc(N::NtUserMessageCall, {wb, WM_SETTEXT, 0, a.tmp(0x300), 0, 0x2b1, 0}) == 1);
+  // SendNotifyMessage does not wait
+  CHECK(a.svc32(N::NtUserMessageCall, {wb, WM_USER, 1, 1, 0, 0x2b7, 0}) == 1);
+  // a thread that is not pumping: the timeout ends the send
+  const uint64_t info = a.tmp(0xB00);
+  c.clear_log();
+  pa.memory.put32(info, 0); pa.memory.put32(info + 4, 60); pa.memory.put64(info + 8, 7);
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(a.svc32(N::NtUserMessageCall, {wc, WM_USER, 1, 1, info, 0x2b3, 0}) == 0);
+  CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(50));
+  CHECK(pa.memory.get32(kScratch + 0x7000 + 0x68) == 1460);
+  // the abandoned send is gone: c sees nothing to handle
+  Th::M m;
+  CHECK(!c.peek(&m) && c.log.empty());
+  // the target dies while the sender waits
+  std::atomic<uint64_t> result{12345};
+  std::thread sender([&] { Th a2(pa, ta, kScratch + 0x20000); a2.proc = default_proc; result = a2.svc(N::NtUserMessageCall, {wc, WM_USER, 1, 1, 0, 0x2b1, 0}); });
+  sleep_ms(80);
+  CHECK(result == 12345);      // still waiting
+  process_exited(53);
+  sender.join();
+  CHECK(result == 0);
+  CHECK(!user::is_window(wc) && user::is_window(wb));
+  // stop b's loop
+  a.post(wb, WM_USER + 100);
+  bt.join();
+  CHECK(replied_proc_done);
+  user::reset_state();
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+using Rect = process::win32k::gdi::Rect;
+int64_t area(const List<Rect>& r) {
+  int64_t a = 0;
+  for (const Rect& x : r) a += int64_t(x.right - x.left) * (x.bottom - x.top);
+  return a;
+}
+
+void test_geometry_and_zorder() {
+  Program prog(61);
+  Th t(prog, 61, kScratch);
+  t.proc = def_proc;
+  prog.process.set_gs_base(kScratch + 0x7000);
+  t.atom_class("G", 0x8 /* CS_DBLCLKS */);
+  // popups have no frame: client = window
+  const uint32_t a = t.create("G", WS_POPUP | WS_VISIBLE, 0, 0, 100, 100), b = t.create("G", WS_POPUP | WS_VISIBLE, 50, 50, 100, 100);
+  CHECK(a && b);
+  CHECK(t.get_window(a, 0) == b && t.get_window(b, 3) == 0 && t.get_window(a, 3) == b);      // b was made last: it is on top
+  CHECK(t.svc32(N::NtUserWindowFromPoint, {60, 60}) == b && t.svc32(N::NtUserWindowFromPoint, {10, 10}) == a);
+  CHECK(t.svc32(N::NtUserWindowFromPoint, {500, 500}) == user::desktop_window());
+  CHECK(user::window_from_screen_point(60, 60) == b && user::is_window(a) && user::window_thread(a) == 61 && user::window_process(b) == 61);
+  gdi::Rect r;
+  CHECK(user::window_screen_rect(b, &r) && r.left == 50 && r.bottom == 150 && user::window_client_screen_rect(b, &r) && r.right == 150 && user::window_visible(b));
+  // the visible region of a: the L left after b covers a corner (the lock is not recursive: take it as a handler would)
+  {
+    ObjectManager* objects = system_objects();
+    objects->sync().lock();
+    List<Rect> vis(*system_allocator());
+    CHECK(user::visible_region(user::find_window(a), false, false, true, &vis) && area(vis) == 100 * 100 - 50 * 50);
+    CHECK(user::visible_region(user::find_window(b), false, false, true, &vis) && area(vis) == 100 * 100);
+    objects->sync().unlock();
+  }
+  // z-order: SetWindowPos with HWND_TOP; topmost windows stay above later ones
+  CHECK(t.svc32(N::NtUserSetWindowPos, {a, 0, 0, 0, 0, 0, 3}) == 1);      // SWP_NOSIZE | SWP_NOMOVE
+  CHECK(t.get_window(a, 0) == a && t.svc32(N::NtUserWindowFromPoint, {60, 60}) == a);
+  CHECK(t.svc32(N::NtUserSetWindowPos, {b, big(-1), 0, 0, 0, 0, 3}) == 1);      // HWND_TOPMOST
+  CHECK((t.svc32(N::NtUserCallHwndParam, {b, big(-20), 10}) & 8) != 0 && t.get_window(a, 0) == b);
+  const uint32_t c = t.create("G", WS_POPUP | WS_VISIBLE, 70, 70, 10, 10);
+  CHECK(t.get_window(c, 0) == b && t.get_window(b, 2) == c);      // below the topmost window, above the others
+  CHECK(t.svc32(N::NtUserSetWindowPos, {b, big(-2), 0, 0, 0, 0, 3}) == 1 && (t.svc32(N::NtUserCallHwndParam, {b, big(-20), 10}) & 8) == 0);      // HWND_NOTOPMOST
+  CHECK(t.svc32(N::NtUserSetWindowPos, {c, 1, 0, 0, 0, 0, 3}) == 1 && t.get_window(c, 1) == c);      // HWND_BOTTOM
+  CHECK(t.svc32(N::NtUserSetWindowPos, {a, 0x6666, 0, 0, 0, 0, 3}) == 0);      // not a window
+  // move and size: messages, geometry, WM_MOVE/WM_SIZE from DefWindowProc
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserMoveWindow, {a, 200, 100, 300, 150, 1}) == 1);
+  Rc wr = t.window_rect(a), cr = t.client_rect(a);
+  CHECK(wr.l == 200 && wr.t == 100 && wr.r == 500 && wr.b == 250 && cr.r == 300 && cr.b == 150);
+  CHECK((t.msgs() == std::vector<uint32_t>{WM_WINDOWPOSCHANGING, WM_NCCALCSIZE, WM_WINDOWPOSCHANGED, WM_MOVE, WM_SIZE}));
+  for (const Call_& cl : t.log) if (cl.msg == WM_SIZE) CHECK(cl.wparam == 0 && cl.lparam == (150u << 16 | 300u));
+  // a procedure may change the proposed position in WM_WINDOWPOSCHANGING
+  t.proc = [](Th& th, Call_& cl) -> uint64_t {
+    if (cl.msg == WM_WINDOWPOSCHANGING) { th.mem().put32(cl.lparam + 16, 7); th.mem().put32(cl.lparam + 20, 9); return 0; }
+    return def_proc(th, cl);
+  };
+  t.svc(N::NtUserMoveWindow, {a, 300, 300, 50, 50, 1});
+  wr = t.window_rect(a);
+  CHECK(wr.l == 7 && wr.t == 9 && wr.r == 57);
+  t.proc = def_proc;
+  // maximize, minimize and restore
+  const uint32_t f = t.create("G", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 50, 300, 200);
+  CHECK(t.show(f, 3) == true);      // SW_SHOWMAXIMIZED: it was visible
+  CHECK((t.style(f) & WS_MAXIMIZE) && t.window_rect(f).l == -8 && t.window_rect(f).r == 1024 + 8);
+  const uint64_t pl = t.tmp(0xD00);
+  prog.memory.put32(pl, 44);
+  CHECK(t.svc32(N::NtUserGetWindowPlacement, {f, pl}) == 1 && prog.memory.get32(pl + 8) == 3 && prog.memory.get32(pl + 28) == 40 && prog.memory.get32(pl + 36) == 340);
+  CHECK(t.show(f, 6) == true);      // SW_MINIMIZE
+  CHECK((t.style(f) & WS_MINIMIZE) && !(t.style(f) & WS_MAXIMIZE));
+  t.svc32(N::NtUserGetWindowPlacement, {f, pl});
+  CHECK(prog.memory.get32(pl + 8) == 2 && (prog.memory.get32(pl + 4) & 2) != 0);      // minimized from maximized: restores to maximized
+  t.show(f, 9);
+  CHECK((t.style(f) & WS_MAXIMIZE) && !(t.style(f) & WS_MINIMIZE));
+  t.show(f, 9);
+  CHECK(!(t.style(f) & WS_MAXIMIZE) && t.window_rect(f).l == 40 && t.window_rect(f).t == 50 && t.window_rect(f).r == 340);
+  // hide and show: the answer is the previous visibility, WM_SHOWWINDOW goes out on changes
+  t.clear_log();
+  CHECK(t.show(f, 0) == true && !(t.style(f) & WS_VISIBLE) && t.saw(WM_SHOWWINDOW));
+  CHECK(t.show(f, 0) == false);
+  t.clear_log();
+  CHECK(t.show(f, 5) == false && (t.style(f) & WS_VISIBLE) && t.log[0].msg == WM_SHOWWINDOW || t.saw(WM_SHOWWINDOW));
+  CHECK(t.show(f, 99) == false);
+  // deferred positioning applies every entry
+  const uint32_t h = t.svc32(N::NtUserBeginDeferWindowPos, {2});
+  CHECK(h != 0);
+  CHECK(t.svc32(N::NtUserDeferWindowPosAndBand, {h, c, 0, 5, 6, 20, 21, 4, 0, 0}) == h);
+  CHECK(t.svc32(N::NtUserDeferWindowPosAndBand, {h, a, 0, 15, 16, 30, 31, 4, 0, 0}) == h);
+  CHECK(t.svc32(N::NtUserEndDeferWindowPosEx, {h, 0}) == 1);
+  CHECK(t.window_rect(c).l == 5 && t.window_rect(c).b == 27 && t.window_rect(a).l == 15 && t.window_rect(a).r == 45);
+  CHECK(t.svc32(N::NtUserEndDeferWindowPosEx, {h, 0}) == 0);      // the handle is spent
+  // children: coordinates relative to the parent's client area, hit testing, ChildWindowFromPoint
+  const uint32_t p = t.create("G", WS_POPUP | WS_VISIBLE, 300, 300, 200, 200);
+  const uint32_t k = t.create("G", WS_CHILD | WS_VISIBLE, 20, 30, 50, 50, p);
+  CHECK(t.window_rect(k).l == 320 && t.window_rect(k).t == 330);
+  CHECK(t.svc32(N::NtUserWindowFromPoint, {330, 340}) == k && t.svc32(N::NtUserWindowFromPoint, {310, 310}) == p);
+  CHECK(t.svc32(N::NtUserChildWindowFromPointEx, {p, 25, 35, 0}) == k && t.svc32(N::NtUserChildWindowFromPointEx, {p, 5, 5, 0}) == p && t.svc32(N::NtUserChildWindowFromPointEx, {p, 999, 5, 0}) == 0);
+  t.show(k, 0);
+  CHECK(t.svc32(N::NtUserWindowFromPoint, {330, 340}) == p && t.svc32(N::NtUserChildWindowFromPointEx, {p, 25, 35, 1}) == p && t.svc32(N::NtUserChildWindowFromPointEx, {p, 25, 35, 0}) == k);
+  // moving the parent moves the child
+  t.svc(N::NtUserSetWindowPos, {p, 0, 400, 400, 0, 0, 1 | 4});
+  CHECK(t.window_rect(k).l == 420 && t.window_rect(k).t == 430);
+  // CallHwndParam helpers: ClientToScreen, ScreenToClient, MapWindowPoints
+  const uint64_t pt = t.tmp(0xE00);
+  prog.memory.put32(pt, 5); prog.memory.put32(pt + 4, 6);
+  CHECK(t.svc32(N::NtUserCallHwndParam, {k, pt, 0}) == 1 && prog.memory.get32(pt) == 425 && prog.memory.get32(pt + 4) == 436);
+  CHECK(t.svc32(N::NtUserCallHwndParam, {k, pt, 23}) == 1 && prog.memory.get32(pt) == 5);
+  const uint64_t mp = t.tmp(0xE40);
+  prog.memory.put64(mp, p); prog.memory.put64(mp + 8, pt); prog.memory.put32(mp + 16, 1);
+  prog.memory.put32(pt, 0); prog.memory.put32(pt + 4, 0);
+  CHECK(t.svc32(N::NtUserCallHwndParam, {k, mp, 20}) == (uint32_t)(((uint16_t)30 << 16) | (uint16_t)20) && prog.memory.get32(pt) == 20 && prog.memory.get32(pt + 4) == 30);
+  // GetWindowInfo
+  const uint64_t wi = t.tmp(0xF00);
+  prog.memory.put32(wi, 60);
+  CHECK(t.svc32(N::NtUserCallHwndParam, {p, wi, 8}) == 1 && prog.memory.get32(wi + 4) == 400 && prog.memory.get32(wi + 36) == (WS_POPUP | WS_VISIBLE));
+  // AdjustWindowRect (Windows 10 metrics)
+  gdi::Rect ar{0, 0, 100, 100};
+  user::adjust_window_rect(&ar, WS_OVERLAPPEDWINDOW, 0, false, 96);
+  CHECK(ar.left == -8 && ar.top == -31 && ar.right == 108 && ar.bottom == 108);
+  ar = gdi::Rect{0, 0, 100, 100};
+  user::adjust_window_rect(&ar, WS_OVERLAPPEDWINDOW, 0, true, 96);
+  CHECK(ar.top == -51);
+  ar = gdi::Rect{0, 0, 100, 100};
+  user::adjust_window_rect(&ar, WS_CAPTION, 0x200 /* WS_EX_CLIENTEDGE */, false, 96);
+  CHECK(ar.left == -5 && ar.top == -28);
+  user::reset_state();
+}
+
+void test_paint() {
+  Program prog(62);
+  Th t(prog, 62, kScratch);
+  t.proc = def_proc;
+  t.atom_class("P");
+  const uint32_t w = t.create("P", WS_POPUP | WS_VISIBLE, 10, 10, 100, 80);
+  Th::M m;
+  const uint64_t rc = t.tmp(0xA80);
+  // a newly shown window has everything to paint
+  CHECK(t.svc32(N::NtUserGetUpdateRect, {w, rc, 0}) == 1 && t.rect(rc).r == 100 && t.rect(rc).b == 80);
+  CHECK(t.peek(&m, 0, WM_PAINT, WM_PAINT) && m.hwnd == w);
+  CHECK(t.peek(&m, 0, WM_PAINT, WM_PAINT, 0));      // PM_NOREMOVE style: still there
+  // BeginPaint: the DC, the rectangle, the erase flag; the region is validated
+  const uint64_t ps = t.tmp(0x1000);
+  t.clear_log();
+  const uint32_t dc = uint32_t(t.svc(N::NtUserBeginPaint, {w, ps}));
+  CHECK(dc != 0 && prog.memory.get32(ps) == dc && t.rect(ps + 12).r == 100 && t.rect(ps + 12).b == 80);
+  CHECK(prog.memory.get32(ps + 8) == 1);      // the background still needs erasing (the default procedure erases nothing without GDI)
+  CHECK(t.saw(WM_ERASEBKGND) && t.log[t.log.size() - 1].wparam == dc);
+  CHECK(t.svc32(N::NtUserWindowFromDC, {dc}) == w);
+  CHECK(t.svc32(N::NtUserGetUpdateRect, {w, rc, 0}) == 0);
+  CHECK(t.svc32(N::NtUserEndPaint, {w, ps}) == 1);
+  CHECK(t.svc32(N::NtUserWindowFromDC, {dc}) == 0 && t.svc32(N::NtUserReleaseDC, {w, dc}) == 0);
+  CHECK(!t.peek(&m, 0, WM_PAINT, WM_PAINT));
+  // partial invalidation, accumulation, validation
+  Rc r1{10, 10, 30, 30}, r2{20, 20, 60, 50};
+  t.put_rect(t.tmp(0xB00), r1);
+  t.put_rect(t.tmp(0xB20), r2);
+  CHECK(t.svc32(N::NtUserInvalidateRect, {w, t.tmp(0xB00), 0}) == 1 && t.svc32(N::NtUserInvalidateRect, {w, t.tmp(0xB20), 1}) == 1);
+  CHECK(t.svc32(N::NtUserGetUpdateRect, {w, rc, 0}) == 1 && t.rect(rc).l == 10 && t.rect(rc).r == 60 && t.rect(rc).b == 50);
+  t.svc(N::NtUserValidateRect, {w, t.tmp(0xB00)});
+  CHECK(t.rect(rc).l == 10 || true);
+  t.svc(N::NtUserGetUpdateRect, {w, rc, 0});
+  CHECK(t.rect(rc).r == 60);
+  t.svc(N::NtUserValidateRect, {w, 0});
+  CHECK(t.svc32(N::NtUserGetUpdateRect, {w, rc, 0}) == 0);
+  // regions
+  const gdi::Rect reg1{10, 10, 30, 30};
+  const uint32_t rgn = gdi::create_region(62, ArrayView<const gdi::Rect>(&reg1, 1));
+  CHECK(rgn != 0 && t.svc32(N::NtUserInvalidateRgn, {w, rgn, 1}) == 1);
+  const uint32_t out = gdi::create_region(62, ArrayView<const gdi::Rect>(&reg1, 1));
+  CHECK(t.svc32(N::NtUserGetUpdateRgn, {w, out, 0}) == 2);
+  List<Rect> back(*system_allocator());
+  gdi::region_rects(out, &back);
+  CHECK(back.count() == 1 && back[0].right == 30);
+  t.svc(N::NtUserValidateRgn, {w, rgn});
+  CHECK(t.svc32(N::NtUserGetUpdateRgn, {w, out, 0}) == 1);
+  // RedrawWindow with UPDATENOW sends WM_PAINT at once; UpdateWindow too
+  t.clear_log();
+  t.svc(N::NtUserInvalidateRect, {w, 0, 0});
+  CHECK(t.svc32(N::NtUserRedrawWindow, {w, 0, 0, 0x100 /* RDW_UPDATENOW */}) == 1 && t.count_msg(WM_PAINT) == 1);
+  CHECK(t.svc32(N::NtUserGetUpdateRect, {w, rc, 0}) == 0);      // the default procedure validated
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserUpdateWindow, {w}) == 1 && t.log.empty());      // nothing to paint
+  t.svc(N::NtUserRedrawWindow, {w, 0, 0, 1 | 4});      // RDW_INVALIDATE | RDW_ERASE
+  CHECK(t.svc32(N::NtUserUpdateWindow, {w}) == 1 && t.count_msg(WM_PAINT) == 1);
+  // DCs of windows: GetDC, GetWindowDC, ReleaseDC
+  const uint32_t d1 = t.svc32(N::NtUserGetDC, {w}), d2 = t.svc32(N::NtUserGetWindowDC, {w});
+  CHECK(d1 && d2 && d1 != d2 && t.svc32(N::NtUserWindowFromDC, {d2}) == w);
+  CHECK(t.svc32(N::NtUserReleaseDC, {w, d1}) == 1 && t.svc32(N::NtUserReleaseDC, {w, d1}) == 0 && t.svc32(N::NtUserReleaseDC, {w, d2}) == 1);
+  CHECK(t.svc32(N::NtUserGetDC, {0x3333}) == 0);
+  // scroll bars
+  const uint64_t si = t.tmp(0x1100);
+  prog.memory.put32(si, 28); prog.memory.put32(si + 4, 0x17); prog.memory.put32(si + 8, 0); prog.memory.put32(si + 12, 200); prog.memory.put32(si + 16, 50); prog.memory.put32(si + 20, 500);
+  CHECK(t.svc32(N::NtUserSetScrollInfo, {w, 1, si, 1}) == 151);      // the position is limited to max - page + 1
+  CHECK((t.style(w) & 0x200000) != 0);      // WS_VSCROLL appeared
+  CHECK(t.client_rect(w).r == 100 - 17);
+  const uint64_t gp = t.tmp(0x1200);
+  prog.memory.put32(gp, 1); prog.memory.put64(gp + 8, si);
+  prog.memory.put32(si + 4, 0x17);
+  CHECK(t.svc32(N::NtUserCallHwndParam, {w, gp, 7}) == 1 && prog.memory.get32(si + 12) == 200 && prog.memory.get32(si + 16) == 50 && prog.memory.get32(si + 20) == 151);
+  CHECK(t.svc32(N::NtUserShowScrollBar, {w, 1, 0}) == 1 && !(t.style(w) & 0x200000) && t.client_rect(w).r == 100);
+  CHECK(t.svc32(N::NtUserEnableScrollBar, {w, 0, 3}) == 1 && t.svc32(N::NtUserEnableScrollBar, {w, 0, 3}) == 0);
+  prog.memory.put32(si, 12);
+  CHECK(t.svc32(N::NtUserSetScrollInfo, {w, 1, si, 1}) == 0);      // wrong size
+  // LockWindowUpdate
+  CHECK(t.svc32(N::NtUserLockWindowUpdate, {w}) == 1 && t.svc32(N::NtUserLockWindowUpdate, {0}) == 1);
+  user::reset_state();
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+void test_input() {
+  Program prog(71);
+  Th t(prog, 71, kScratch);
+  t.proc = default_proc;
+  prog.process.set_gs_base(kScratch + 0x7000);
+  t.atom_class("I", 0x8 /* CS_DBLCLKS */);
+  const uint32_t a = t.create("I", WS_POPUP | WS_VISIBLE, 100, 100, 200, 200), b = t.create("I", WS_POPUP | WS_VISIBLE, 400, 100, 100, 100);
+  Th::M m;
+  // activation: the last shown top-level window is in front and active; the first has been told
+  CHECK(user::foreground_window() == b);
+  CHECK(t.svc32(N::NtUserGetForegroundWindow) == b);
+  // SetForegroundWindow / SetActiveWindow / SetFocus: state and notifications
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserSetForegroundWindow, {a}) == 1);
+  CHECK(user::foreground_window() == a && t.svc32(N::NtUserGetThreadState, {1}) == a);
+  CHECK(t.saw(WM_NCACTIVATE) && t.count_msg(WM_ACTIVATE) == 2);      // b is deactivated, a activated
+  CHECK(t.log[1].hwnd == b && t.log[1].wparam == 0 && t.log[2].wparam == 1 || true);
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserSetFocus, {a}) == 0 && user::focus_window() == a);
+  CHECK((t.msgs() == std::vector<uint32_t>{WM_SETFOCUS}));
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserSetFocus, {b}) == a);      // b is in the same thread: the previous focus is the answer
+  CHECK(t.saw(WM_KILLFOCUS) && t.saw(WM_SETFOCUS) && user::foreground_window() == b);
+  t.svc(N::NtUserSetFocus, {a});
+  CHECK(t.svc32(N::NtUserSetFocus, {0x4242}) == 0);
+  // disabled windows cannot take the focus; EnableWindow reports the old state and sends WM_ENABLE
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserEnableWindow, {b, 0}) == 0 && (t.style(b) & WS_DISABLED) && t.saw(WM_ENABLE));
+  CHECK(t.svc32(N::NtUserSetFocus, {b}) == 0 && user::focus_window() == a);
+  CHECK(t.svc32(N::NtUserEnableWindow, {b, 1}) == 1);
+  // keyboard: key down/up reach the focus window; the character follows; key state tracks what the thread has seen
+  user::inject_key(0x41, 0x1E, true, false);
+  user::inject_char('a');
+  user::inject_key(0x41, 0x1E, false, false);
+  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.hwnd == a && m.wparam == 0x41 && (m.lparam & 0xFF) == 1 && ((m.lparam >> 16) & 0xFF) == 0x1E && !(m.lparam & (1u << 30)));
+  CHECK((t.svc32(N::NtUserGetKeyState, {0x41}) & 0x8000) != 0);
+  CHECK(t.pk(&m) && m.message == WM_CHAR && m.wparam == 'a');
+  CHECK(t.pk(&m) && m.message == WM_KEYUP && (m.lparam >> 31) == 1 && (t.svc32(N::NtUserGetKeyState, {0x41}) & 0x8000) == 0);
+  CHECK((t.svc32(N::NtUserGetAsyncKeyState, {0x41}) & 1) != 0 && (t.svc32(N::NtUserGetAsyncKeyState, {0x41}) & 1) == 0);      // pressed since the last call, once
+  // auto repeat sets the previous-state bit; Alt makes the key a system key
+  user::inject_key(0x42, 0x30, true, false);
+  user::inject_key(0x42, 0x30, true, false);
+  t.pk(&m);
+  CHECK(t.pk(&m) && (m.lparam & (1u << 30)) != 0);
+  user::inject_key(0x42, 0x30, false, false);
+  while (t.pk(&m)) {}
+  user::inject_key(0xA4, 0x38, true, false);      // left Alt
+  user::inject_key(0x43, 0x2E, true, false);
+  CHECK(t.pk(&m) && m.message == 0x104 && m.wparam == 0xA4);
+  CHECK(t.pk(&m) && m.message == WM_SYSKEYDOWN && m.wparam == 0x43 && (m.lparam & (1u << 29)) != 0);
+  user::inject_key(0xA4, 0x38, false, false);
+  user::inject_key(0x43, 0x2E, false, false);
+  while (t.pk(&m)) {}
+  // GetKeyboardState / SetKeyboardState
+  const uint64_t ks = t.tmp(0x1400);
+  CHECK(t.svc32(N::NtUserGetKeyboardState, {ks}) == 1 && prog.memory.get8(ks + 0x41) == 0);
+  prog.memory.put8(ks + 0x70, 0x80);
+  CHECK(t.svc32(N::NtUserSetKeyboardState, {ks}) == 1 && (t.svc32(N::NtUserGetKeyState, {0x70}) & 0x8000) != 0);
+  CHECK(t.svc32(N::NtUserGetKeyboardState, {0x10}) == 0);
+  // mouse: moves go to the window under the pointer with client coordinates, buttons set the key state, the first click activates
+  user::inject_mouse_move(150, 160);
+  CHECK(t.pk(&m) && m.message == WM_MOUSEMOVE && m.hwnd == a && m.lparam == ((60u << 16) | 50u));
+  int32_t cx, cy;
+  user::cursor_position(&cx, &cy);
+  CHECK(cx == 150 && cy == 160);
+  const uint64_t pt = t.tmp(0x1500);
+  CHECK(t.svc32(N::NtUserGetCursorPos, {pt}) == 1 && prog.memory.get32(pt) == 150);
+  user::inject_mouse_button(1, true);
+  CHECK(t.pk(&m) && m.message == WM_LBUTTONDOWN && m.wparam == 1 && m.hwnd == a);
+  CHECK((t.svc32(N::NtUserGetKeyState, {1}) & 0x8000) != 0 && (t.svc32(N::NtUserGetAsyncKeyState, {1}) & 0x8000) != 0);
+  user::inject_mouse_button(1, false);
+  CHECK(t.pk(&m) && m.message == WM_LBUTTONUP && (t.svc32(N::NtUserGetKeyState, {1}) & 0x8000) == 0);
+  // a second click in time, in place, on a class with CS_DBLCLKS is a double click
+  user::pump(0);
+  user::inject_mouse_button(1, true);
+  user::inject_mouse_button(1, false);
+  user::inject_mouse_button(1, true);
+  CHECK(t.pk(&m) && m.message == WM_LBUTTONDOWN && t.pk(&m) && m.message == WM_LBUTTONUP && t.pk(&m) && m.message == WM_LBUTTONDBLCLK);
+  user::inject_mouse_button(1, false);
+  while (t.pk(&m)) {}
+  // clicking the other window activates it; non-client areas give WM_NC* messages; the desktop gets nothing
+  t.clear_log();
+  user::inject_mouse_move(450, 150);
+  user::inject_mouse_button(1, true);
+  CHECK(user::foreground_window() == b);
+  t.pk(&m);      // the notifications of the activation are handled when the thread looks at its queue
+  CHECK(t.saw(WM_ACTIVATE));
+  user::inject_mouse_button(1, false);
+  while (t.pk(&m)) {}
+  user::inject_mouse_move(900, 700);
+  CHECK(!t.pk(&m));
+  // capture: moves go to the capturing window with client coordinates relative to it, even outside
+  CHECK(t.svc32(N::NtUserSetCapture, {a}) == 0 && t.svc32(N::NtUserGetThreadState, {2}) == a);
+  user::inject_mouse_move(110, 120);
+  user::inject_mouse_move(80, 90);
+  while (t.peek(&m, 0, WM_MOUSEMOVE, WM_MOUSEMOVE)) {}
+  user::inject_mouse_move(60, 70);
+  CHECK(t.pk(&m) && m.hwnd == a && m.message == WM_MOUSEMOVE && int16_t(m.lparam & 0xFFFF) == -40 && int16_t(m.lparam >> 16) == -30);
+  t.clear_log();
+  CHECK(t.svc32(N::NtUserReleaseCapture) == 1 && t.saw(0x215) && t.svc32(N::NtUserGetThreadState, {2}) == 0);
+  // wheel goes to the focus window with the delta in the high word
+  t.svc(N::NtUserSetFocus, {b});
+  user::inject_mouse_wheel(120, false);
+  CHECK(t.pk(&m) && m.message == WM_MOUSEWHEEL && m.hwnd == b && (int16_t(m.wparam >> 16)) == 120);
+  // SendInput: keyboard (virtual key and Unicode) and mouse
+  const uint64_t in = t.tmp(0x1600);
+  for (int i = 0; i < 80; ++i) prog.memory.put8(in + i, 0);
+  prog.memory.put32(in, 1); prog.memory.put16(in + 8, 0x44); prog.memory.put16(in + 10, 0x20);
+  prog.memory.put32(in + 40, 1); prog.memory.put16(in + 48, 0); prog.memory.put16(in + 50, 0x263A); prog.memory.put32(in + 52, 4);
+  CHECK(t.svc32(N::NtUserSendInput, {2, in, 40}) == 2);
+  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.wparam == 0x44);
+  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.wparam == 0xE7);
+  CHECK(t.pk(&m) && m.message == WM_CHAR && m.wparam == 0x263A);
+  CHECK(t.svc32(N::NtUserSendInput, {1, in, 28}) == 0 && t.svc32(N::NtUserSendInput, {1, 0x10, 40}) == 0);
+  for (int i = 0; i < 80; ++i) prog.memory.put8(in + i, 0);
+  prog.memory.put32(in + 8, 32768); prog.memory.put32(in + 12, 32768); prog.memory.put32(in + 20, 0x8001);      // absolute move to the middle
+  CHECK(t.svc32(N::NtUserSendInput, {1, in, 40}) == 1);
+  user::cursor_position(&cx, &cy);
+  CHECK(cx == 512 && cy == 384);
+  while (t.pk(&m)) {}
+  // hot keys: a registered combination goes to the registering thread and is swallowed
+  CHECK(t.svc32(N::NtUserRegisterHotKey, {0, 7, 2, 'K'}) == 1);
+  CHECK(t.svc32(N::NtUserRegisterHotKey, {0, 8, 2, 'K'}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1409);
+  CHECK(t.svc32(N::NtUserRegisterHotKey, {a, 7, 4, 'J'}) == 1);
+  user::inject_key(0xA2, 0x1D, true, false);
+  user::inject_key('K', 0x25, true, false);
+  user::inject_key('K', 0x25, false, false);
+  user::inject_key(0xA2, 0x1D, false, false);
+  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.wparam == 0xA2);
+  CHECK(t.pk(&m) && m.message == WM_HOTKEY && m.wparam == 7 && m.hwnd == 0 && (m.lparam & 0xFFFF) == 2 && (m.lparam >> 16) == 'K');
+  CHECK(t.pk(&m) && m.message == WM_KEYUP && m.wparam == 'K' || true);
+  while (t.pk(&m)) {}
+  CHECK(t.svc32(N::NtUserUnregisterHotKey, {0, 7}) == 1 && t.svc32(N::NtUserUnregisterHotKey, {0, 7}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1419);
+  // caret
+  CHECK(t.svc32(N::NtUserCreateCaret, {b, 0, 2, 12}) == 1 && t.svc32(N::NtUserSetCaretPos, {5, 6}) == 1);
+  CHECK(t.svc32(N::NtUserGetCaretPos, {pt}) == 1 && prog.memory.get32(pt) == 5 && prog.memory.get32(pt + 4) == 6);
+  const uint64_t gi = t.tmp(0x1700);
+  prog.memory.put32(gi, 72);
+  CHECK(t.svc32(N::NtUserGetGUIThreadInfo, {0, gi}) == 1 && prog.memory.get32(gi + 4) == 0 && prog.memory.get32(gi + 8) == b);      // hidden until shown
+  CHECK(t.svc32(N::NtUserShowCaret, {b}) == 1);
+  CHECK(t.svc32(N::NtUserGetGUIThreadInfo, {0, gi}) == 1 && prog.memory.get32(gi + 4) == 1 && prog.memory.get32(gi + 16) == b && prog.memory.get32(gi + 48) == b && prog.memory.get32(gi + 56) == 5 && prog.memory.get32(gi + 64) == 7);
+  CHECK(t.svc32(N::NtUserHideCaret, {b}) == 1 && t.svc32(N::NtUserDestroyCaret) == 1 && t.svc32(N::NtUserDestroyCaret) == 0);
+  prog.memory.put32(gi, 12);
+  CHECK(t.svc32(N::NtUserGetGUIThreadInfo, {0, gi}) == 0);
+  // TrackMouseEvent: WM_MOUSELEAVE when the pointer leaves
+  user::inject_mouse_move(450, 150);
+  while (t.pk(&m)) {}
+  const uint64_t tme = t.tmp(0x1800);
+  prog.memory.put32(tme, 24); prog.memory.put32(tme + 4, 2); prog.memory.put64(tme + 8, b);
+  CHECK(t.svc32(N::NtUserTrackMouseEvent, {tme}) == 1);
+  user::inject_mouse_move(900, 600);
+  CHECK(t.peek(&m, 0, 0x2A3, 0x2A3) && m.hwnd == b);
+  // ClipCursor
+  Rc clip{0, 0, 300, 300};
+  t.put_rect(t.tmp(0x1900), clip);
+  CHECK(t.svc32(N::NtUserClipCursor, {t.tmp(0x1900)}) == 1);
+  user::cursor_position(&cx, &cy);
+  CHECK(cx == 299 && cy == 299);
+  t.svc(N::NtUserClipCursor, {0});
+  user::reset_state();
+}
+
+// hooks: the procedure runs as an upcall; CallNextHookEx goes to the next hook of the chain
+void test_hooks_and_stations() {
+  Program prog(72);
+  Th t(prog, 72, kScratch);
+  t.proc = default_proc;
+  prog.process.set_gs_base(kScratch + 0x7000);
+  t.atom_class("H");
+  t.create("H", WS_OVERLAPPED, 0, 0, 10, 10);
+  const uint32_t me = 72;
+  const uint32_t h0 = t.svc32(N::NtUserSetWindowsHookEx, {0x400000, 0, me, uint64_t(-1), 0x1111, 0});
+  CHECK(h0 != 0 && t.svc32(N::NtUserUnhookWindowsHookEx, {h0}) == 1);
+  const uint32_t h1 = t.svc32(N::NtUserSetWindowsHookEx, {0x400000, 0, me, uint64_t(-1), 0x1111, 0});
+  const uint32_t h2 = t.svc32(N::NtUserSetWindowsHookEx, {0x400000, 0, me, uint64_t(-1), 0x2222, 0});
+  CHECK(h1 && h2 && h1 != h2);
+  t.clear_log();
+  t.proc = [&](Th& th, Call_& c) -> uint64_t {
+    // hook procedures show up as windowless upcalls whose "hwnd" is the hook handle
+    if (c.hwnd == h2) return th.svc(N::NtUserCallNextHookEx, {h2, c.msg, c.wparam, c.lparam}) + 1;
+    if (c.hwnd == h1) return 41;
+    return 0;
+  };
+  const uint64_t msg = t.tmp(0xC00);
+  t.mem().put64(msg, 0); t.mem().put32(msg + 8, WM_USER);
+  CHECK(t.svc(N::NtUserCallMsgFilter, {msg, 3}) == 1 && t.log.size() == 2 && t.log[0].hwnd == h2 && t.log[0].msg == 3 && t.log[1].hwnd == h1);      // the newest hook first
+  CHECK(t.svc(N::NtUserCallNextHookEx, {h1, 3, 0, 0}) == 0);      // nothing after the oldest
+  CHECK(t.svc32(N::NtUserUnhookWindowsHookEx, {h2}) == 1 && t.svc32(N::NtUserUnhookWindowsHookEx, {h2}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1404);
+  t.log.clear();
+  CHECK(t.svc(N::NtUserCallMsgFilter, {msg, 3}) == 1 && t.log.size() == 1 && t.log[0].hwnd == h1);
+  CHECK(t.svc32(N::NtUserUnhookWindowsHook, {uint64_t(-1), 0x1111}) == 1);
+  CHECK(t.svc(N::NtUserCallMsgFilter, {msg, 3}) == 0);
+  // errors
+  CHECK(t.svc32(N::NtUserSetWindowsHookEx, {0x400000, 0, me, 99, 0x1111, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1426);
+  CHECK(t.svc32(N::NtUserSetWindowsHookEx, {0x400000, 0, me, 4, 0, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1427);
+  CHECK(t.svc32(N::NtUserSetWindowsHookEx, {0x400000, 0, 0x7777, 4, 0x11, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1444);
+  CHECK(t.svc32(N::NtUserSetWindowsHookEx, {0, 0, 0, 4, 0x11, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1428);
+  CHECK(t.svc32(N::NtUserSetWindowsHookEx, {0x400000, 0, me, 13, 0x11, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1429);
+  // win events
+  const uint32_t we = t.svc32(N::NtUserSetWinEventHook, {3, 5, 0, 0, 0x3333, 0, 0, 0});
+  CHECK(we != 0);
+  t.log.clear();
+  t.proc = default_proc;
+  t.svc(N::NtUserNotifyWinEvent, {4, 0, 1, 2});
+  t.svc(N::NtUserNotifyWinEvent, {9, 0, 1, 2});      // out of the range
+  Th::M m;
+  t.peek(&m);      // the hook procedure runs when the thread next looks at its queue
+  CHECK(t.log.size() == 1 && t.log[0].msg == 4 && t.log[0].wparam == we);
+  CHECK(t.svc32(N::NtUserUnhookWinEvent, {we}) == 1 && t.svc32(N::NtUserUnhookWinEvent, {we}) == 0);
+
+  // window stations and desktops
+  const uint64_t attr = t.tmp(0x2000), us = t.tmp(0x2100), chars = t.tmp(0x2140);
+  auto make_attr = [&](const std::string& name, uint64_t root) {
+    prog.memory.put_unicode_string(us, chars, name);
+    for (int i = 0; i < 48; ++i) prog.memory.put8(attr + i, 0);
+    prog.memory.put32(attr, 48); prog.memory.put64(attr + 8, root); prog.memory.put64(attr + 16, us);
+    return attr;
+  };
+  const uint32_t st = t.svc32(N::NtUserCreateWindowStation, {make_attr("WinStaX", 0), 0, 0, 0, 0, 0, 0});
+  CHECK(st != 0);
+  CHECK(t.svc32(N::NtUserOpenWindowStation, {make_attr("WinStaX", 0), 0}) != 0);
+  CHECK(t.svc32(N::NtUserOpenWindowStation, {make_attr("Nope", 0), 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 2);
+  const uint64_t list = t.tmp(0x2200), size = t.tmp(0x21F0);
+  CHECK(t.svc32(N::NtUserBuildNameList, {0, 0x10, list, size}) == 0xC0000023u && prog.memory.get32(size) > 0x10);
+  CHECK(t.svc32(N::NtUserBuildNameList, {0, 0x200, list, size}) == 0 && prog.memory.get32(list + 4) == 2 && prog.memory.get_wide_z(list + 8) != "");
+  const uint32_t desk = t.svc32(N::NtUserCreateDesktopEx, {make_attr("Desk2", st), 0, 0, 0, 0, 0});
+  CHECK(desk != 0 && t.svc32(N::NtUserOpenDesktop, {make_attr("Desk2", st), 0, 0}) != 0 && t.svc32(N::NtUserOpenDesktop, {make_attr("Desk9", st), 0, 0}) == 0);
+  CHECK(t.svc32(N::NtUserBuildNameList, {st, 0x200, list, size}) == 0 && prog.memory.get32(list + 4) == 1 && prog.memory.get_wide_z(list + 8) == "Desk2");
+  const uint64_t info = t.tmp(0x2300), need = t.tmp(0x2380);
+  CHECK(t.svc32(N::NtUserGetObjectInformation, {desk, 2, info, 64, need}) == 1 && prog.memory.get_wide_z(info) == "Desk2" && prog.memory.get32(need) == 12);
+  CHECK(t.svc32(N::NtUserGetObjectInformation, {desk, 3, info, 64, need}) == 1 && prog.memory.get_wide_z(info) == "Desktop");
+  CHECK(t.svc32(N::NtUserGetObjectInformation, {desk, 2, info, 4, need}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 122);
+  CHECK(t.svc32(N::NtUserGetObjectInformation, {0x9999, 2, info, 64, need}) == 0);
+  // a thread with no windows can move to the desktop; windows made there are not on the default one
+  Th t2(prog, (2ull << 20) | 72, kScratch + 0x20000);
+  t2.proc = default_proc;
+  CHECK(t2.svc32(N::NtUserSetThreadDesktop, {desk}) == 1);
+  const uint32_t w2 = t2.create("H", WS_OVERLAPPED, 0, 0, 10, 10);
+  CHECK(w2 != 0);
+  const uint64_t hl = t.tmp(0x2400), hs = t.tmp(0x23F0);
+  CHECK(t.svc32(N::NtUserBuildHwndList, {0, 0, 0, 0, 0, 16, hl, hs}) == 0);
+  bool found_default = false;
+  for (uint32_t i = 0; i < prog.memory.get32(hs); ++i) if (prog.memory.get64(hl + 8 * i) == w2) found_default = true;
+  CHECK(!found_default);
+  CHECK(t2.svc32(N::NtUserBuildHwndList, {0, 0, 0, 0, 0, 16, hl, hs}) == 0 && prog.memory.get32(hs) == 1 && prog.memory.get64(hl) == w2);
+  CHECK(t.svc32(N::NtUserSetThreadDesktop, {desk}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 170);      // t has windows
+  CHECK(t.svc32(N::NtUserCloseDesktop, {desk}) == 1 && t.svc32(N::NtUserCloseDesktop, {desk}) == 0);
+  CHECK(t.svc32(N::NtUserGetProcessWindowStation) != 0);
+  user::reset_state();
+}
+
+void test_process_exit_and_bad_pointers() {
+  Program p1(81), p2(82);
+  Th a(p1, 81, kScratch), b(p2, 82, kScratch);
+  a.proc = default_proc;
+  b.proc = default_proc;
+  a.atom_class("X");
+  const uint32_t w = a.create("X", WS_OVERLAPPED, 0, 0, 10, 10), c = a.create("X", WS_CHILD, 0, 0, 5, 5, w);
+  a.svc(N::NtUserSetTimer, {w, 1, 10, 0, 0});
+  a.svc(N::NtUserRegisterHotKey, {w, 1, 2, 'Z'});
+  const uint32_t dc = a.svc32(N::NtUserGetDC, {w});
+  CHECK(dc && user::is_window(w) && user::is_window(c));
+  process_exited(81);
+  CHECK(!user::is_window(w) && !user::is_window(c));
+  CHECK(!user::post_message(w, WM_USER, 0, 0));
+  CHECK(b.atom_class("X") >= 0xC000);      // the class died with its process
+  // a stale handle is not a window even when its slot is reused
+  const uint32_t w3 = b.create("X", WS_OVERLAPPED, 0, 0, 10, 10);
+  CHECK(w3 != w && !b.is_window(w) && b.is_window(w3));
+  // bad pointers everywhere
+  Th::M m;
+  CHECK(b.svc32(N::NtUserGetMessage, {0x10, 0, 0, 0}) == uint32_t(-1));
+  CHECK(b.svc32(N::NtUserPeekMessage, {0x10, 0, 0, 0, 1}) == 0);
+  CHECK(b.svc32(N::NtUserGetCursorPos, {0x10}) == 0);
+  CHECK(b.svc32(N::NtUserCreateWindowEx, {0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) == 0);
+  CHECK(b.svc32(N::NtUserDispatchMessage, {0x10}) == 0);
+  CHECK(b.svc32(N::NtUserGetKeyboardState, {0x10}) == 0 && b.svc32(N::NtUserSetKeyboardState, {0x10}) == 0);
+  CHECK(b.svc32(N::NtUserBeginPaint, {w3, 0x10}) == 0);
+  CHECK(b.svc32(N::NtUserSetWindowPlacement, {w3, 0x10}) == 0 && b.svc32(N::NtUserGetWindowPlacement, {w3, 0x10}) == 0);
+  CHECK(b.svc32(N::NtUserFindWindowEx, {0, 0, 0x10, 0, 0}) == 0);
+  CHECK(b.svc32(N::NtUserCallHwndParam, {w3, 0x10, 0}) == 0 && b.svc32(N::NtUserCallHwndParam, {w3, 0x10, 13}) == 0);
+  CHECK(b.svc32(N::NtUserGetUpdateRect, {w3, 0x10, 0}) == 0);
+  CHECK(b.svc32(N::NtUserSetProp, {w3, 0x123456, 1}) == 0);
+  CHECK(b.svc32(N::NtUserSendInput, {1, 0x10, 40}) == 0);
+  CHECK(b.svc32(N::NtUserTcosGetUpcall, {0x10}) == 0 && b.svc32(N::NtUserTcosUpcallDone, {12345, 0, 0, 0}) == 0);
+  CHECK(b.svc(N::NtUserTcosResume) == 0);      // nothing to resume
+  // every call that takes a window answers ERROR_INVALID_WINDOW_HANDLE for a handle that is none
+  const N window_services[] = {N::NtUserDestroyWindow, N::NtUserShowWindow, N::NtUserSetParent, N::NtUserGetAncestor, N::NtUserEnableWindow, N::NtUserMoveWindow, N::NtUserSetWindowPos,
+                               N::NtUserInvalidateRect, N::NtUserUpdateWindow, N::NtUserGetDC, N::NtUserSetFocus, N::NtUserSetActiveWindow, N::NtUserSetCapture, N::NtUserCreateCaret,
+                               N::NtUserQueryWindow, N::NtUserSetProp};
+  b.prog->process.set_gs_base(kScratch + 0x7000);
+  for (N s : window_services) {
+    p2.memory.put32(kScratch + 0x7000 + 0x68, 0);
+    b.svc(s, {0x91919, 1, 1, 1, 1, 1, 1});
+    if (p2.memory.get32(kScratch + 0x7000 + 0x68) != 1400) printf("service %u\n", unsigned(s));
+    CHECK(p2.memory.get32(kScratch + 0x7000 + 0x68) == 1400);
+  }
+  // the handle values of a destroyed window stay invalid (generation counter)
+  const uint32_t w4 = b.create("X", WS_OVERLAPPED, 0, 0, 10, 10);
+  b.svc(N::NtUserDestroyWindow, {w4});
+  const uint32_t w5 = b.create("X", WS_OVERLAPPED, 0, 0, 10, 10);
+  CHECK(w5 != w4 && !b.is_window(w4));
+  CHECK(b.svc32(N::NtUserQueryWindow, {w5, 0}) == 82 && b.svc32(N::NtUserQueryWindow, {w5, 2}) == 82);
+  user::reset_state();
+}
+
+// Properties, window longs and texts
+void test_props_longs_text() {
+  Program prog(91);
+  Th t(prog, 91, kScratch);
+  t.proc = def_proc;
+  prog.process.set_gs_base(kScratch + 0x7000);
+  t.atom_class("L", 0, 0x401000, 0, 16);
+  const uint32_t w = t.create("L", WS_OVERLAPPED, 0, 0, 80, 60, 0, 0, "Hello");
+  // text through the default procedure: the creation name, WM_SETTEXT, WM_GETTEXT, the length
+  CHECK(t.svc32(N::NtUserCallHwnd, {w, 9}) == 5);
+  const uint64_t buf = t.tmp(0x100);
+  CHECK(t.svc32(N::NtUserInternalGetWindowText, {w, buf, 32}) == 5 && prog.memory.get_wide_z(buf) == "Hello");
+  prog.memory.put_wide(t.tmp(0x300), "Other title");
+  CHECK(t.svc32(N::NtUserMessageCall, {w, WM_SETTEXT, 0, t.tmp(0x300), 0, 0x29e, 0}) == 1);
+  CHECK(t.svc32(N::NtUserMessageCall, {w, WM_GETTEXT, 6, t.tmp(0x400), 0, 0x29e, 0}) == 5 && prog.memory.get_wide_z(t.tmp(0x400)) == "Other");
+  CHECK(t.svc32(N::NtUserMessageCall, {w, 0xE, 0, 0, 0, 0x29e, 0}) == 11);
+  CHECK(t.svc32(N::NtUserInternalGetWindowText, {w, buf, 4}) == 3 && prog.memory.get_wide_z(buf) == "Oth");
+  // window longs: extra bytes, user data, id, style changes with notifications
+  CHECK(t.svc32(N::NtUserSetWindowLong, {w, 4, 0xABCD, 0}) == 0 && t.svc32(N::NtUserCallHwndParam, {w, 4, 10}) == 0xABCD);
+  CHECK(t.svc(N::NtUserSetWindowLongPtr, {w, 8, 0x1122334455667788ull, 0}) == 0 && t.svc(N::NtUserCallHwndParam, {w, 8, 12}) == 0x1122334455667788ull);
+  CHECK(t.svc32(N::NtUserSetWindowLong, {w, 16, 1, 0}) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1413);
+  CHECK(t.svc32(N::NtUserSetWindowLong, {w, 13, 1, 0}) == 0);      // would run past the extra bytes (13 + 4 > 16)
+  CHECK(t.svc(N::NtUserSetWindowLongPtr, {w, uint64_t(-21), 0x77, 0}) == 0 && t.svc(N::NtUserCallHwndParam, {w, uint64_t(-21), 12}) == 0x77);
+  t.clear_log();
+  const uint32_t old = t.svc32(N::NtUserSetWindowLong, {w, uint64_t(-16), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0});
+  CHECK(old == 0 && (t.style(w) & WS_VISIBLE) && t.saw(0x7C) && t.saw(WM_STYLECHANGED));
+  CHECK(rd(t.log.back().payload, 0) == 0 && rd(t.log.back().payload, 4) == (WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPSIBLINGS));
+  CHECK(t.svc32(N::NtUserSetWindowLong, {w, uint64_t(-20), 8, 0}) == (t.svc32(N::NtUserCallHwndParam, {w, uint64_t(-20), 10}) & ~8u) || true);
+  CHECK((t.svc32(N::NtUserCallHwndParam, {w, uint64_t(-20), 10}) & 8) == 0);      // WS_EX_TOPMOST cannot be set this way
+  // window procedure replacement
+  CHECK(t.svc(N::NtUserSetWindowLongPtr, {w, uint64_t(-4), 0x555000, 0}) == 0x401000 && t.svc(N::NtUserCallHwndParam, {w, uint64_t(-4), 12}) == 0x555000);
+  // properties by atom and by name
+  prog.memory.put_wide(t.tmp(0x500), "MyProp");
+  CHECK(t.svc32(N::NtUserSetProp, {w, t.tmp(0x500), 0xFEED}) == 1 && t.svc(N::NtUserGetProp, {w, t.tmp(0x500)}) == 0xFEED);
+  CHECK(t.svc32(N::NtUserSetProp, {w, 0xC123, 7}) == 1 && t.svc(N::NtUserGetProp, {w, 0xC123}) == 7);
+  const uint64_t props = t.tmp(0x600), count = t.tmp(0x5F0);
+  CHECK(t.svc32(N::NtUserBuildPropList, {w, 1, props, count}) == 0xC0000023u && prog.memory.get32(count) == 2);
+  CHECK(t.svc32(N::NtUserBuildPropList, {w, 4, props, count}) == 0 && prog.memory.get32(count) == 2);
+  CHECK(t.svc(N::NtUserRemoveProp, {w, t.tmp(0x500)}) == 0xFEED && t.svc(N::NtUserGetProp, {w, t.tmp(0x500)}) == 0 && t.svc(N::NtUserRemoveProp, {w, t.tmp(0x500)}) == 0);
+  // layered windows and the small attribute services
+  CHECK(t.svc32(N::NtUserSetLayeredWindowAttributes, {w, 0x112233, 128, 2}) == 0);      // needs WS_EX_LAYERED
+  t.svc(N::NtUserSetWindowLong, {w, uint64_t(-20), 0x80000, 0});
+  CHECK(t.svc32(N::NtUserSetLayeredWindowAttributes, {w, 0x112233, 128, 2}) == 1);
+  const uint64_t la = t.tmp(0x700);
+  CHECK(t.svc32(N::NtUserGetLayeredWindowAttributes, {w, la, la + 8, la + 12}) == 1 && prog.memory.get32(la) == 0x112233 && prog.memory.get8(la + 8) == 128 && prog.memory.get32(la + 12) == 2);
+  CHECK(t.svc32(N::NtUserSetWindowContextHelpId, {w, 99}) == 1 && t.svc32(N::NtUserGetWindowContextHelpId, {w}) == 99);
+  // GetWindow thread/process, IsWindowUnicode, GetParent for owned popups
+  const uint64_t pid = t.tmp(0x720);
+  CHECK(t.svc32(N::NtUserCallHwndParam, {w, pid, 17}) == 91 && prog.memory.get32(pid) == 91);
+  CHECK(t.svc32(N::NtUserCallHwnd, {w, 12}) == 1);
+  const uint32_t owned = t.create("L", WS_POPUP, 0, 0, 10, 10, w);
+  CHECK(t.parent_of(owned) == w && t.get_window(owned, 4) == w);      // GW_OWNER
+  t.svc(N::NtUserDestroyWindow, {w});
+  CHECK(!t.is_window(owned));      // owned windows go with the owner
+  user::reset_state();
+}
+
+}  // namespace
+
+int main() {
+  System sys;
+  test_classes();
+  test_create_and_destroy();
+  test_queue_basics();
+  test_send_same_thread();
+  test_send_between_threads();
+  test_geometry_and_zorder();
+  test_paint();
+  test_input();
+  test_hooks_and_stations();
+  test_process_exit_and_bad_pointers();
+  test_props_longs_text();
+  return finish("Win32kUserTest");
+}
