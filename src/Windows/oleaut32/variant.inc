@@ -59,7 +59,7 @@ EXPORT HRESULT WINAPI VariantClear(VARIANTARG *variant) {
 EXPORT HRESULT WINAPI VariantCopy(VARIANTARG *dest, VARIANTARG *src) {
   if (!dest || !src) return DISP_E_BADVARTYPE;
   const VARTYPE vt = V_VT(src);
-  if (!variant_valid_type(vt)) return DISP_E_BADVARTYPE;
+  if (!variant_valid_type(vt) || (vt & VT_TYPEMASK) == VT_CLSID) return DISP_E_BADVARTYPE;
   if (dest == src) return S_OK;
   HRESULT hr = VariantClear(dest);
   if (FAILED(hr)) return hr;
@@ -78,11 +78,12 @@ EXPORT HRESULT WINAPI VariantCopy(VARIANTARG *dest, VARIANTARG *src) {
   }
   switch (vt) {
     case VT_BSTR:
-      if (V_BSTR(src)) {
+      {
+        /* (a NULL BSTR is the empty string, which a copy makes a real one) */
         BSTR copy = SysAllocStringByteLen((LPCSTR)V_BSTR(src), SysStringByteLen(V_BSTR(src)));
         if (!copy) return E_OUTOFMEMORY;
         V_BSTR(dest) = copy;
-      } else V_BSTR(dest) = NULL;
+      }
       break;
     case VT_UNKNOWN: V_UNKNOWN(dest) = V_UNKNOWN(src); if (V_UNKNOWN(src)) IUnknown_AddRef(V_UNKNOWN(src)); break;
     case VT_DISPATCH: V_DISPATCH(dest) = V_DISPATCH(src); if (V_DISPATCH(src)) IDispatch_AddRef(V_DISPATCH(src)); break;
@@ -115,7 +116,11 @@ EXPORT HRESULT WINAPI VariantCopyInd(VARIANT *dest, VARIANTARG *src) {
   if (!dest || !src) return E_INVALIDARG;
   const VARTYPE vt = V_VT(src);
   if (!(vt & VT_BYREF)) return VariantCopy(dest, src);
-  if (!variant_valid_type(vt)) return DISP_E_BADVARTYPE;
+  {
+    const VARTYPE base = vt & VT_TYPEMASK;
+    const BOOL valid = (vt & VT_ARRAY) || (base > VT_NULL && base != 15 && base < VT_VOID && !(vt & (VT_VECTOR | VT_RESERVED)));
+    if (!valid) return E_INVALIDARG;
+  }
   if (vt == (VT_VARIANT | VT_BYREF)) {
     VARIANT *inner = V_VARIANTREF(src);
     if (!inner) return E_INVALIDARG;

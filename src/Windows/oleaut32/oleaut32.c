@@ -171,4 +171,17 @@ static double oa_pow(double x, double y) {
 #include "marshal.inc"
 #endif
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved) { (void)instance; (void)reason; (void)reserved; return TRUE; }
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved) {
+  (void)instance;
+#ifdef OA_ERRORINFO_DLLMAIN
+  switch (reason) {
+    case DLL_PROCESS_ATTACH: errorinfo_process_attach(); break;
+    case DLL_THREAD_DETACH: errorinfo_thread_detach(); break;
+    case DLL_PROCESS_DETACH: if (!reserved) errorinfo_process_detach(); break;
+    default: break;
+  }
+#else
+  (void)reason;
+#endif
+  return TRUE;
+}

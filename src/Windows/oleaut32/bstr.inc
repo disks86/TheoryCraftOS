@@ -16,19 +16,27 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* BSTRs: a DWORD byte count, the characters, and a NUL character that the count leaves out. The pointer is to the first character. */
+/* BSTRs: a DWORD byte count (in the last four of eight header bytes, so that the characters are aligned to 8), the characters, and a NUL character that the count leaves out. The pointer is to the first character. */
 
-#define BSTR_MAX_BYTES (0xFFFFFFFFu - sizeof(DWORD) - sizeof(WCHAR))
+#define BSTR_HEADER 8u
+#define BSTR_MAX_BYTES (0xFFFFFFFFu - BSTR_HEADER - sizeof(WCHAR))
+#define BSTR_BLOCK(b) ((char *)(b) - BSTR_HEADER)
+
+/* The terminator is the whole WCHAR after the last byte, so an odd byte count has a zero padding byte as well. */
+static SIZE_T bstr_block_size(UINT bytes) { return BSTR_HEADER + (((SIZE_T)bytes + 1) & ~(SIZE_T)1) + sizeof(WCHAR); }
+static void bstr_terminate(char *block, UINT bytes) {
+  *(DWORD *)(block + BSTR_HEADER - sizeof(DWORD)) = bytes;
+  memset(block + BSTR_HEADER + bytes, 0, bstr_block_size(bytes) - BSTR_HEADER - bytes);
+}
 
 static BSTR bstr_alloc_bytes(const void *source, UINT bytes) {
-  if (bytes > BSTR_MAX_BYTES) return NULL;
-  char *block = oa_alloc(sizeof(DWORD) + (SIZE_T)bytes + sizeof(WCHAR));
+  if (bytes > BSTR_MAX_BYTES - 1) return NULL;
+  char *block = oa_alloc(bstr_block_size(bytes));
   if (!block) return NULL;
-  *(DWORD *)block = bytes;
-  if (source) memcpy(block + sizeof(DWORD), source, bytes);
-  else memset(block + sizeof(DWORD), 0, bytes);
-  *(WCHAR *)(block + sizeof(DWORD) + bytes) = 0;
-  return (BSTR)(block + sizeof(DWORD));
+  if (source) memcpy(block + BSTR_HEADER, source, bytes);
+  else memset(block + BSTR_HEADER, 0, bytes);
+  bstr_terminate(block, bytes);
+  return (BSTR)(block + BSTR_HEADER);
 }
 
 EXPORT BSTR WINAPI SysAllocString(const OLECHAR *string) {
@@ -40,24 +48,28 @@ EXPORT BSTR WINAPI SysAllocStringLen(const OLECHAR *string, UINT length) {
   return bstr_alloc_bytes(string, length * (UINT)sizeof(WCHAR));
 }
 EXPORT BSTR WINAPI SysAllocStringByteLen(LPCSTR string, UINT length) { return bstr_alloc_bytes(string, length); }
-EXPORT void WINAPI SysFreeString(BSTR string) { if (string) oa_free((char *)string - sizeof(DWORD)); }
+EXPORT void WINAPI SysFreeString(BSTR string) { if (string) oa_free(BSTR_BLOCK(string)); }
 EXPORT UINT WINAPI SysStringByteLen(BSTR string) { return string ? *(DWORD *)((char *)string - sizeof(DWORD)) : 0; }
 EXPORT UINT WINAPI SysStringLen(BSTR string) { return SysStringByteLen(string) / sizeof(WCHAR); }
 EXPORT INT WINAPI SysReAllocStringLen(BSTR *string, const OLECHAR *source, UINT length) {
   if (!string) return FALSE;
-  if (length > BSTR_MAX_BYTES / sizeof(WCHAR)) return FALSE;
+  if (length > BSTR_MAX_BYTES / sizeof(WCHAR) - 1) return FALSE;
   BSTR old = *string;
-  /* The source may point into the old string, so the new one is made first. */
-  BSTR fresh = bstr_alloc_bytes(NULL, length * (UINT)sizeof(WCHAR));
-  if (!fresh) return FALSE;
-  if (source) {
-    UINT keep = length;
-    memcpy(fresh, source, keep * sizeof(WCHAR));
-  } else if (old) {
-    UINT keep = SysStringLen(old);
-    if (keep > length) keep = length;
-    memcpy(fresh, old, keep * sizeof(WCHAR));
+  const UINT bytes = length * (UINT)sizeof(WCHAR);
+  const BOOL aliased = old && source && (const char *)source >= (const char *)old - BSTR_HEADER && (const char *)source <= (const char *)old + SysStringByteLen(old) + sizeof(WCHAR);
+  if (old && !aliased) {
+    /* in place: the block is resized (a smaller one stays where it is) */
+    char *block = oa_realloc(BSTR_BLOCK(old), bstr_block_size(bytes));
+    if (!block) return FALSE;
+    if (source) memcpy(block + BSTR_HEADER, source, bytes);
+    bstr_terminate(block, bytes);
+    *string = (BSTR)(block + BSTR_HEADER);
+    return TRUE;
   }
+  /* The source points into the old string (or there is none): the new one is made first. */
+  BSTR fresh = bstr_alloc_bytes(NULL, bytes);
+  if (!fresh) return FALSE;
+  if (source) memcpy(fresh, source, bytes);
   SysFreeString(old);
   *string = fresh;
   return TRUE;
