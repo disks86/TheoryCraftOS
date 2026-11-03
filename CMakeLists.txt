@@ -1105,6 +1105,11 @@ if(TCOS_ARCH STREQUAL "x86_64")
       file(GLOB _own_incs ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.inc)
       set(_own_sources ${_own} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll)
       set(_own_depends ${_own} ${_own_incs} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS})
+      if(_library STREQUAL "ole32")
+        # ole32.dll reads the class registry through advapi32.dll and includes mingw's headers (its interface definitions).
+        list(APPEND _own_sources ${WINDOWS_DIR}/advapi32.dll)
+        list(APPEND _own_depends ${WINDOWS_DIR}/advapi32.dll)
+      endif()
     endif()
     add_custom_command(OUTPUT ${WINDOWS_DIR}/${_library}.dll
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1304,6 +1309,14 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     set(QEMU_AUDIO_DRIVER ${QEMU_AUDIO_DRIVER} CACHE STRING "QEMU -audiodev driver for the guest's sound card")
   endif()
   message(STATUS "QEMU audio backend: ${QEMU_AUDIO_DRIVER}")
+  # A UNIX socket path is limited to 107 bytes: a long build directory (a deep worktree) gets its socket under /tmp.
+  string(LENGTH "${CMAKE_BINARY_DIR}/qmp.sock" _qmp_length)
+  if(_qmp_length GREATER 100)
+    string(MD5 _qmp_hash "${CMAKE_BINARY_DIR}")
+    set(TCOS_QMP_SOCKET /tmp/tcos-qmp-${_qmp_hash}.sock)
+  else()
+    set(TCOS_QMP_SOCKET ${CMAKE_BINARY_DIR}/qmp.sock)
+  endif()
   set(QEMU_COMMON
     ${QEMU} -machine q35 -smp ${TCOS_SMP} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
     -rtc base=localtime  # the taskbar clock shows local time
@@ -1323,7 +1336,7 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -device isa-debugcon,iobase=0x402,chardev=dbg
     -serial null
     # `scripts/qemu-status.py` asks this socket why the VM is paused.
-    -qmp unix:${CMAKE_BINARY_DIR}/qmp.sock,server=on,wait=off
+    -qmp unix:${TCOS_QMP_SOCKET},server=on,wait=off
   )
   add_custom_target(vars
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OVMF_VARS} ${CMAKE_BINARY_DIR}/OVMF_VARS.fd
