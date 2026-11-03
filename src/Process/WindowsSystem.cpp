@@ -46,6 +46,15 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r) {
   if (runtime) runtime->memory_status(&total, &available);
   Answer a;
   uint32_t size = 0;
+  if (info_class == 0x1000) {      // this OS's own: Length bytes from the system's random source (what RtlGenRandom, BCryptGenRandom and CryptGenRandom are made of)
+    if (length == 0 || length > 0x10000) return 0xC000000Du;
+    ByteBuffer bytes(p.files().allocator());
+    if (!bytes.put_zeros(length)) return 0xC0000017u;
+    if (!p.host().random_bytes(bytes.writable_view())) return 0xC00000BBu;      // STATUS_NOT_SUPPORTED: no source
+    if (!p.write_user(buffer, bytes.view())) return 0xC0000005u;
+    if (returned != 0 && !p.write_user_u32(returned, length)) return 0xC0000005u;
+    return 0;
+  }
   switch (info_class) {
     case 0: {      // SYSTEM_BASIC_INFORMATION
       const uint64_t pages = total / 4096;
