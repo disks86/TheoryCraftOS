@@ -69,6 +69,7 @@ tcos_trap_entry:
     mv   a0, sp
     call tcos_trap_dispatch
     mv   sp, a0
+    call tcos_finish_switch         /* the old thread is left: it becomes runnable for other cores only now (finish_switch in ThreadScheduler.cpp); the call runs below the frame of the thread that now runs */
     ld   t0, 248(sp)
     csrw sepc, t0
     ld   t0, 256(sp)

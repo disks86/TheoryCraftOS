@@ -62,6 +62,7 @@ tcos_exception_common_el\el:
     mov  x0, sp
     bl   tcos_exception_dispatch
     mov  sp, x0
+    bl   tcos_finish_switch         /* the old thread is left: it becomes runnable for other cores only now (finish_switch in ThreadScheduler.cpp); the call runs below the frame of the thread that now runs */
     ldp  x2, x3, [sp, #256]
     msr  elr_el\el, x2
     msr  spsr_el\el, x3
