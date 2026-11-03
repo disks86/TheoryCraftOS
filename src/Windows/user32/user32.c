@@ -19,6 +19,7 @@
 /* user32.dll for TheoryCraftOS: the parts that are implemented (wsprintf so far); every other export is a stub (src/Windows/stubs/user32.inc).
  * Behaviour checked with Wine's tests (tests/windows/wine/user32). Built freestanding over kernel32.dll with the OS's mingw compiler. */
 #include "../tcos_win.h"
+#include "../tcos_syscalls.h"
 
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
@@ -147,6 +148,41 @@ IMPORT void WINAPI SetLastError(DWORD error);
 #define CAPTION_H 23
 #define FRAME 8
 
+/* The device contexts of the screen and the system colours, over win32k (NtUserGetDC: a null window is the screen) and gdi32's solid brushes. */
+#define USER32_SERVICE(name) __asm__(".text\n.p2align 4\nuser32_" #name ":\n mov %rcx, %r10\n mov $" U32_STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n")
+#define U32_STR(x) U32_STR2(x)
+#define U32_STR2(x) #x
+USER32_SERVICE(NtUserGetDC);
+USER32_SERVICE(NtUserGetDCEx);
+USER32_SERVICE(NtUserGetWindowDC);
+USER32_SERVICE(NtUserReleaseDC);
+USER32_SERVICE(NtUserCallNoParam);
+USER32_SERVICE(NtGdiCreateSolidBrush);
+extern ULONG_PTR user32_NtUserGetDC(HANDLE window) __asm__("user32_NtUserGetDC");
+extern ULONG_PTR user32_NtUserGetDCEx(HANDLE window, HANDLE clip, DWORD flags) __asm__("user32_NtUserGetDCEx");
+extern ULONG_PTR user32_NtUserGetWindowDC(HANDLE window) __asm__("user32_NtUserGetWindowDC");
+extern ULONG_PTR user32_NtUserReleaseDC(HANDLE dc) __asm__("user32_NtUserReleaseDC");
+extern ULONG_PTR user32_NtUserCallNoParam(DWORD function) __asm__("user32_NtUserCallNoParam");
+extern ULONG_PTR user32_NtGdiCreateSolidBrush(ULONG color, HANDLE brush) __asm__("user32_NtGdiCreateSolidBrush");
+EXPORT HANDLE WINAPI GetDesktopWindow(void) { return (HANDLE)user32_NtUserCallNoParam(0 /* GetDesktopWindow */); }
+EXPORT HANDLE WINAPI GetDC(HANDLE window) { return (HANDLE)user32_NtUserGetDC(window); }
+EXPORT HANDLE WINAPI GetDCEx(HANDLE window, HANDLE clip, DWORD flags) { return (HANDLE)user32_NtUserGetDCEx(window, clip, flags); }
+EXPORT HANDLE WINAPI GetWindowDC(HANDLE window) { return (HANDLE)user32_NtUserGetWindowDC(window); }
+EXPORT int WINAPI ReleaseDC(HANDLE window, HANDLE dc) { (void)window; return dc && (user32_NtUserReleaseDC(dc) & 0xFFFFFFFFu) ? 1 : 0; }
+static const DWORD system_colors[31] = {
+    0x00C0C0C0, 0x00A56E3A, 0x00C0C0C0, 0x00C0C0C0, 0x00FFFFFF, 0x00FFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00A0A0A0, 0x00DADAD2, 0x00C0C0C0,
+    0x00808080, 0x00A56E3A, 0x00FFFFFF, 0x00C0C0C0, 0x00808080, 0x00808080, 0x00000000, 0x00C0C0C0, 0x00FFFFFF, 0x00000000, 0x00C0C0C0, 0x00000000,
+    0x00E1FFFF, 0x00E0E0E0, 0x00C0C0C0, 0x00D2B48C, 0x00C0C0C0, 0x00FF0000, 0x00FFFFFF};
+EXPORT DWORD WINAPI GetSysColor(int index) {
+  if (index < 0 || index > 30) return 0;
+  return system_colors[index];
+}
+EXPORT HANDLE WINAPI GetSysColorBrush(int index) {
+  static HANDLE brushes[31];
+  if (index < 0 || index > 30) return NULL;
+  if (!brushes[index]) brushes[index] = (HANDLE)user32_NtGdiCreateSolidBrush(system_colors[index], NULL);
+  return brushes[index];
+}
 EXPORT BOOL WINAPI IsWindow(HANDLE window) { return window && window == GetConsoleWindow(); }
 IMPORT BOOL WINAPI TcosConsoleWindowCells(LONG *columns, LONG *rows);
 /* The size of the cells the console window shows. */

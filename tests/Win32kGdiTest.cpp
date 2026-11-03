@@ -98,6 +98,14 @@ static uint32_t pb(Fixture& f, uint32_t dc, int x, int y) {
 static void test_objects() {
   Fixture f(21);
   // stock objects
+  {      // gdi32.dll names the stock objects without a call (GetStockObject in src/Windows/gdi32/object.inc): the handles must follow its table
+    static const uint8_t slot[20] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 10, 11, 12, 13, 14, 19, 15, 16, 17, 18};
+    static const uint8_t type[20] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x30, 0x30, 0x30, 0, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A, 0x08, 0x0A, 0x0A, 0x10, 0x30};
+    for (int i = 0; i < 20; ++i) {
+      if (i == 9) { CHECK(gdi::stock_object(i) == 0); continue; }
+      CHECK(gdi::stock_object(i) == (0x01000000u | 0x00800000u | (uint32_t(type[i]) << 16) | slot[i]));
+    }
+  }
   const uint32_t white = gdi::stock_object(0), black_pen = gdi::stock_object(7), null_brush = gdi::stock_object(5);
   CHECK(white && black_pen && null_brush && white != black_pen);
   CHECK(((white >> 16) & 0x7F) == 0x10 && (white & 0x800000) && ((black_pen >> 16) & 0x7F) == 0x30);

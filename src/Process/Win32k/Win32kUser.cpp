@@ -24,7 +24,10 @@ namespace process::win32k::user {
 namespace {
 
 UniquePointer<State> g_state;
-thread_local uint64_t g_thread_override = 0;
+#if __STDC_HOSTED__
+thread_local      // (host tests drive several threads; the kernel has no thread-local storage and never sets the override)
+#endif
+uint64_t g_thread_override = 0;
 
 int32_t min32(int32_t a, int32_t b) { return a < b ? a : b; }
 int32_t max32(int32_t a, int32_t b) { return a > b ? a : b; }

@@ -55,3 +55,6 @@ size_t strlen(const char* s) {
   return n;
 }
 }
+
+// Globals with destructors (the win32k modules' state pointers) register them with atexit; the kernel never exits, so there is nothing to run.
+extern "C" int atexit(void (*)(void)) { return 0; }
