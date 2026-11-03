@@ -390,4 +390,17 @@ struct MpServices {
 constexpr Guid kMpServicesGuid = {
     0x3fdda605, 0xa76e, 0x4f46, {0xad, 0x29, 0x12, 0xf4, 0x53, 0x1b, 0x3d, 0x08}};
 
+// EFI_MEMORY_ATTRIBUTE_PROTOCOL (UEFI 2.10): changes the read-only / no-execute attributes of memory in the firmware's own page tables. How an image on AArch64
+// (and a RISC-V firmware that enables paging) makes memory executable or writable: it owns no page-table code of its own there.
+constexpr uint64_t kMemoryRp = 0x2000;       // EFI_MEMORY_RP: not readable
+constexpr uint64_t kMemoryXp = 0x4000;       // EFI_MEMORY_XP: not executable
+constexpr uint64_t kMemoryRo = 0x20000;      // EFI_MEMORY_RO: not writable
+struct MemoryAttributeProtocol {
+  Status (*get_memory_attributes)(MemoryAttributeProtocol*, uint64_t base, uint64_t length, uint64_t* attributes);
+  Status (*set_memory_attributes)(MemoryAttributeProtocol*, uint64_t base, uint64_t length, uint64_t attributes);     // sets the given bits
+  Status (*clear_memory_attributes)(MemoryAttributeProtocol*, uint64_t base, uint64_t length, uint64_t attributes);   // clears the given bits
+};
+constexpr Guid kMemoryAttributeGuid = {
+    0xf4560cf6, 0x40ec, 0x4b4a, {0xa1, 0x92, 0xbf, 0x1d, 0x57, 0xd0, 0xb1, 0x89}};
+
 }  // namespace efi

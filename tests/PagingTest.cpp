@@ -49,6 +49,9 @@ struct FakeCpu final : IPagingHost {
   bool five = false, nx = true, gb = true, pat = true;
   uint64_t pat_msr = 0x0007040600070406ull;
   int full_flushes = 0, writes = 0;
+  int edits_begun = 0, edits_ended = 0;
+  uint64_t begin_table_edit() override { ++edits_begun; return 0x1234; }
+  void end_table_edit(uint64_t token) override { if (token == 0x1234) ++edits_ended; }
   FakeCpu() { root_table = static_cast<uint64_t*>(aligned_alloc(4096, 4096)); memset(root_table, 0, 4096); }
   std::vector<void*> owned;   // tables the "firmware" made
   ~FakeCpu() { free(root_table); for (void* p : owned) free(p); }
@@ -105,6 +108,7 @@ int main() {
     uc.cache = CacheMode::Uncached;
     uc.executable = false;
     CHECK(pt.map(0xFEE00000, 4096, uc));
+    CHECK(cpu.edits_begun >= 1 && cpu.edits_begun == cpu.edits_ended);   // every change to the tables is bracketed (the firmware's tables may be read-only)
     CHECK(pt.query(0xFEE00000, &m) && m.present && m.page_size == 4096 && m.physical == 0xFEE00000 && m.attributes.cache == CacheMode::Uncached && !m.attributes.executable && m.attributes.writable);
     CHECK(pt.query(0xFEDFF000, &m) && m.page_size == 2 * kMiB && m.attributes.cache == CacheMode::WriteBack && m.attributes.executable);   // neighbours keep their mapping...
     CHECK(pt.query(0xFEE01000, &m) && m.physical == 0xFEE01000 && m.attributes.cache == CacheMode::WriteBack);

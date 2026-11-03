@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Paging.hpp"
+#include "Kernel/Interrupts.hpp"
 
 namespace kernel {
 
@@ -41,6 +42,8 @@ bool is_leaf(uint64_t entry, int level) { return level == 1 || (level <= 3 && (e
 namespace {
 class CpuPagingHost final : public IPagingHost {
  public:
+  static constexpr uint64_t kCr0Wp = uint64_t{1} << 16;
+  static constexpr uint64_t kWpWasSet = uint64_t{1} << 62;   // (above anything RFLAGS uses)
   uint64_t root() override {
     uint64_t v;
     __asm__ volatile("movq %%cr3, %0" : "=r"(v));
@@ -67,6 +70,22 @@ class CpuPagingHost final : public IPagingHost {
   }
   uint64_t read_pat() override { return rdmsr(0x277); }
   void write_pat(uint64_t value) override { wrmsr(0x277, value); }
+  uint64_t begin_table_edit() override {
+    const uint64_t flags = kernel::irq_save();
+    uint64_t cr0;
+    __asm__ volatile("movq %%cr0, %0" : "=r"(cr0));
+    if (!(cr0 & kCr0Wp)) return flags;
+    __asm__ volatile("movq %0, %%cr0" ::"r"(cr0 & ~kCr0Wp) : "memory");
+    return flags | kWpWasSet;
+  }
+  void end_table_edit(uint64_t token) override {
+    if (token & kWpWasSet) {
+      uint64_t cr0;
+      __asm__ volatile("movq %%cr0, %0" : "=r"(cr0));
+      __asm__ volatile("movq %0, %%cr0" ::"r"(cr0 | kCr0Wp) : "memory");
+    }
+    kernel::irq_restore(token & ~kWpWasSet);
+  }
   void invalidate_page(uint64_t address) override { __asm__ volatile("invlpg (%0)" ::"r"(address) : "memory"); }
   void invalidate_all() override {
     uint64_t v;
@@ -251,8 +270,10 @@ bool PageTables::apply(uint64_t address, uint64_t bytes, const PageAttributes& a
     if (index >= 4 && !pat_) return false;
   }
   changed_ = false;
+  const uint64_t edit = host_.begin_table_edit();
   const bool ok = walk(as_table(host_.root()), 4, 0, start, end, a, mode);
   if (changed_) host_.invalidate_all();
+  host_.end_table_edit(edit);
   return ok;
 }
 

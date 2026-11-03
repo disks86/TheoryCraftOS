@@ -26,6 +26,8 @@ add_executable(BOOTRISCV64
   src/Arch/RiscV64/Trap.S
   src/Arch/RiscV64/Secondary.S
   src/Arch/RiscV64/Cpu.cpp
+  src/Arch/RiscV64/PageProtector.cpp
+  src/Arch/RiscV64/PagingHost.cpp
   src/Kernel/ThreadScheduler.cpp
   src/Kernel/Sync.cpp
   src/Kernel/Firmware.cpp
@@ -42,6 +44,7 @@ add_executable(BOOTRISCV64
   src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Font8x16.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
+  ${TCOS_JIT_PORTABLE_SOURCES}
 )
 target_include_directories(BOOTRISCV64 PRIVATE src)
 set_target_properties(BOOTRISCV64 PROPERTIES SUFFIX ".efi" LINKER_LANGUAGE CXX)

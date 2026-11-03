@@ -36,6 +36,12 @@
 #include "Hardware/Platform/RaspberryPi/RaspberryPiPlatform.hpp"
 #include "Hardware/VideoCodec/Broadcom/RpiHevcBlock.hpp"
 #include "Hardware/SystemHardware.hpp"
+#include "Jit/CodePageSource.hpp"
+#include "Jit/CrossCoreInstructionSync.hpp"
+#include "Jit/JitSelfTest.hpp"
+#include "Jit/KernelJit.hpp"
+#include "Jit/ProtectedCodeMemory.hpp"
+#include "Jit/UefiPageProtector.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Thread.hpp"
@@ -129,6 +135,25 @@ void smp_check() {
   }
   Entry(online == cores && right == n ? Level::Ok : Level::Fault, "SMP").dec(online).text(" of ").dec(cores).text(" cores online, ")
       .dec(right).text(" pinned threads ran on their own core");
+}
+
+// The JIT's code memory on this image: pages from a code pool, protections through the firmware's memory attribute protocol, then a compile-and-run check.
+// The objects live in the caller's frame (main never returns) and are registered for the compilers that will want them.
+struct JitHandles {
+  jit::CodePool pool;
+  jit::CrossCoreInstructionSync sync;
+  jit::UefiPageProtector protector;   // (the firmware's memory attribute protocol)
+  jit::ProtectedCodeMemory memory;
+  JitHandles(allocators::IAllocator& allocator, efi::SystemTable* st) : pool(allocator, 8), protector(st), memory(pool, protector, &sync) {}
+};
+
+void jit_check(JitHandles& jit_handles, allocators::IAllocator& allocator) {
+  jit::set_kernel_code_memory(&jit_handles.memory);
+  uint64_t bytes = 0;
+  const jit::SelfTestResult result = jit::jit_self_test(allocator, jit_handles.memory, &bytes);
+  Entry e(result == jit::SelfTestResult::Passed ? Level::Ok : Level::Fault, "JIT");
+  e.text("self test ").text(jit::self_test_result_name(result));
+  if (result == jit::SelfTestResult::Passed) e.text(": ").dec(bytes).text(" bytes of code run, memory protections ").text(jit_handles.memory.protections_enforced() ? "enforced (W^X)" : "not available");
 }
 
 void scheduler_check(allocators::IAllocator& allocator, hardware::AArch64Cpu& cpu) {
@@ -264,9 +289,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     Entry(Level::Info, "CPU").dec(cpu.core_count()).text(" core(s), PSCI via ")
         .text(conduit == arch_aarch64::PsciConduit::Hvc ? "HVC" : conduit == arch_aarch64::PsciConduit::Smc ? "SMC" : "nothing");
   }
+  JitHandles jit_handles(shared_allocator, st);   // (lives as long as main, which registers it)
   if (acpi_ok && kernel::gic::init_boot_core(acpi)) {
     Entry(Level::Ok, "GIC").text("version ").dec(kernel::gic::version());
     scheduler_check(shared_allocator, cpu);
+    jit_check(jit_handles, shared_allocator);
   } else {
     Entry(Level::Warning, "GIC").text("not found; running without interrupts");
   }

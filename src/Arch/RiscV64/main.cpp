@@ -29,6 +29,13 @@
 #include "Hardware/DebugConsole.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
 #include "Hardware/SystemHardware.hpp"
+#include "Jit/CodePageSource.hpp"
+#include "Jit/CrossCoreInstructionSync.hpp"
+#include "Jit/JitSelfTest.hpp"
+#include "Jit/KernelJit.hpp"
+#include "Arch/RiscV64/PageProtector.hpp"
+#include "Jit/ProtectedCodeMemory.hpp"
+#include "Jit/UefiPageProtector.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Thread.hpp"
@@ -134,6 +141,25 @@ void smp_check() {
       .dec(right).text(" pinned threads ran on their own core");
 }
 
+// The JIT's code memory on this image: pages from a code pool, protections through the firmware's memory attribute protocol, then a compile-and-run check.
+// The objects live in the caller's frame (main never returns) and are registered for the compilers that will want them.
+struct JitHandles {
+  jit::CodePool pool;
+  jit::CrossCoreInstructionSync sync;
+  arch_riscv64::PageProtector protector;   // (the firmware leaves paging on and data no-execute: the page tables are changed directly)
+  jit::ProtectedCodeMemory memory;
+  JitHandles(allocators::IAllocator& allocator, efi::SystemTable*) : pool(allocator, 8), protector(arch_riscv64::cpu_paging_host(), allocator), memory(pool, protector, &sync) {}
+};
+
+void jit_check(JitHandles& jit_handles, allocators::IAllocator& allocator) {
+  jit::set_kernel_code_memory(&jit_handles.memory);
+  uint64_t bytes = 0;
+  const jit::SelfTestResult result = jit::jit_self_test(allocator, jit_handles.memory, &bytes);
+  Entry e(result == jit::SelfTestResult::Passed ? Level::Ok : Level::Fault, "JIT");
+  e.text("self test ").text(jit::self_test_result_name(result));
+  if (result == jit::SelfTestResult::Passed) e.text(": ").dec(bytes).text(" bytes of code run, memory protections ").text(jit_handles.memory.protections_enforced() ? "enforced (W^X)" : "not available");
+}
+
 void scheduler_check(allocators::IAllocator& allocator, hardware::RiscV64Cpu& cpu) {
   if (!kernel::start(cpu, allocator, 1000)) {
     Entry(Level::Fault, "Kernel").text("could not start threads");
@@ -216,8 +242,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (acpi_ok) cpu.discover(acpi, shared_allocator);
 
   Entry(Level::Info, "CPU").dec(cpu.core_count()).text(" hart(s)");
+  JitHandles jit_handles(shared_allocator, st);   // (lives as long as main, which registers it)
   if (kernel::stimer::available()) {
     scheduler_check(shared_allocator, cpu);
+    jit_check(jit_handles, shared_allocator);
   } else {
     Entry(Level::Warning, "Timer").text("no SBI timer; running without interrupts");
   }
