@@ -1,2 +1,8 @@
 LIBRARY advapi32.dll
 EXPORTS
+CreateEventExA = kernel32.CreateEventExA
+GetComputerNameExA = kernel32.GetComputerNameExA
+GetSystemPreferredUILanguages = kernel32.GetSystemPreferredUILanguages
+GetThreadUILanguage = kernel32.GetThreadUILanguage
+GetUserDefaultUILanguage = kernel32.GetUserDefaultUILanguage
+IsWow64Process = kernel32.IsWow64Process

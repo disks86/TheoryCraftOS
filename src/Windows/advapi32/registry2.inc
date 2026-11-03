@@ -474,3 +474,32 @@ EXPORT LSTATUS WINAPI RegQueryReflectionKey(HKEY key, BOOL *disabled) {
   *disabled = FALSE;
   return ERROR_SUCCESS;
 }
+
+/* LoadStringW: a string of the string table of a module; with no buffer (capacity 0) the buffer is made to point at the string in the module's own memory. */
+EXPORT int WINAPI LoadStringW(HMODULE module, UINT id, LPWSTR buffer, int capacity) {
+  HRSRC r;
+  const WCHAR *p;
+  DWORD total, at = 0;
+  if (!module) module = NULL;
+  r = FindResourceExW(module, (LPCWSTR)(ULONG_PTR)6, (LPCWSTR)(ULONG_PTR)(id / 16 + 1), 0);
+  if (!r) { SetLastError(1814); return 0; }
+  p = (const WCHAR *)LoadResource(module, r);
+  total = SizeofResource(module, r) / 2;
+  if (!p) return 0;
+  for (UINT i = 0; i < 16; ++i) {
+    DWORD n;
+    if (at >= total) return 0;
+    n = p[at++];
+    if (n > total - at) return 0;
+    if (i == id % 16) {
+      if (capacity == 0) { if (buffer) *(const WCHAR **)buffer = p + at; return (int)n; }
+      if (!buffer || capacity < 0) return 0;
+      if ((int)n > capacity - 1) n = (DWORD)capacity - 1;
+      memcpy(buffer, p + at, n * 2);
+      buffer[n] = 0;
+      return (int)n;
+    }
+    at += n;
+  }
+  return 0;
+}
