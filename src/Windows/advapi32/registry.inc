@@ -278,18 +278,18 @@ EXPORT LSTATUS WINAPI RegEnumKeyExW(HKEY key, DWORD index, LPWSTR name, LPDWORD 
   HANDLE h = handle_of(key);
   if (!h) return ERROR_INVALID_HANDLE;
   if (!name || !name_capacity) return ERROR_INVALID_PARAMETER;
-  BYTE *buffer = RtlAllocateHeap(heap(), 0, 20 + 1024);
+  BYTE *buffer = RtlAllocateHeap(heap(), 0, 24 + 1024);
   if (!buffer) return ERROR_NOT_ENOUGH_MEMORY;
   ULONG needed = 0;
-  const NTSTATUS status = NtEnumerateKey(h, index, 1, buffer, 20 + 1024, &needed);      /* KeyNodeInformation */
+  const NTSTATUS status = NtEnumerateKey(h, index, 1, buffer, 24 + 1024, &needed);      /* KeyNodeInformation */
   LSTATUS result = ERROR_SUCCESS;
   if (status == 0x8000001Au) result = ERROR_NO_MORE_ITEMS;
   else if (!NT_SUCCESS(status)) result = nt_error(status);
   else {
-    const DWORD chars = *(DWORD *)(buffer + 16) / 2;
+    const DWORD chars = *(DWORD *)(buffer + 20) / 2;      /* KEY_NODE_INFORMATION: the time, TitleIndex, ClassOffset, ClassLength, NameLength (at 20), Name (at 24) */
     if (chars >= *name_capacity) { result = ERROR_MORE_DATA; }
     else {
-      memcpy(name, buffer + 20, chars * 2);
+      memcpy(name, buffer + 24, chars * 2);
       name[chars] = 0;
       *name_capacity = chars;
       if (write_time) { write_time->dwLowDateTime = *(DWORD *)buffer; write_time->dwHighDateTime = *(DWORD *)(buffer + 4); }

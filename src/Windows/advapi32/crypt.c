@@ -548,7 +548,7 @@ typedef struct {
     DWORD magic;
     ALG_ID alg;
     DWORD key_length, mode, padding;
-    BYTE key[32], iv[16], salt[16];
+    BYTE key[32], iv[16], iv_start[16], salt[16];      /* iv: the chaining state; iv_start: where a message begins (the state goes back to it after the final block) */
     DWORD salt_length, effective_bits;
     Aes aes;
     Rc4 rc4;
@@ -971,7 +971,7 @@ __declspec(dllexport) BOOL WINAPI CryptSetKeyParam(HCRYPTKEY h, DWORD param, con
     if (flags) { SetLastError(NTE_BAD_FLAGS_); return FALSE; }
     if (!data) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     switch (param) {
-    case KP_IV: if (!block_size_of(k->alg)) { SetLastError(NTE_BAD_TYPE_); return FALSE; } memcpy(k->iv, data, 16); k->iv_set = TRUE; return TRUE;
+    case KP_IV: if (!block_size_of(k->alg)) { SetLastError(NTE_BAD_TYPE_); return FALSE; } memcpy(k->iv, data, 16); memcpy(k->iv_start, data, 16); k->iv_set = TRUE; return TRUE;
     case KP_MODE: {
         DWORD m = *(const DWORD *)data;
         if (!block_size_of(k->alg) || (m != CRYPT_MODE_CBC && m != CRYPT_MODE_ECB)) { SetLastError(NTE_BAD_DATA_); return FALSE; }
@@ -1027,7 +1027,7 @@ __declspec(dllexport) BOOL WINAPI CryptEncrypt(HCRYPTKEY key, HCRYPTHASH hash, B
             aes_encrypt_block(&k->aes, blk, p + off);
             memcpy(previous, p + off, 16);
         }
-        memcpy(k->iv, previous, 16);
+        if (final) memcpy(k->iv, k->iv_start, 16); else memcpy(k->iv, previous, 16);
         *size = padded;
     }
     return TRUE;
@@ -1062,7 +1062,7 @@ __declspec(dllexport) BOOL WINAPI CryptDecrypt(HCRYPTKEY key, HCRYPTHASH hash, B
             memcpy(p + off, plain, 16);
             memcpy(previous, cipher, 16);
         }
-        memcpy(k->iv, previous, 16);
+        if (final) memcpy(k->iv, k->iv_start, 16); else memcpy(k->iv, previous, 16);
         if (final) {
             BYTE pad = p[len - 1];
             DWORD i;

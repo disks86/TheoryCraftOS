@@ -143,21 +143,31 @@ disposition and options are converted from their Win32 constants.
 | `NtReleaseModule` | 52 |
 | `NtUnloadModule` | 51 |
 
-## The registry
+## The registry and advapi32.dll
 
-`advapi32.dll` (`src/Windows/advapi32/advapi32.c`) implements the registry entirely over kernel32.dll's file functions, with no NT services of its own: a key is a
-directory under `C:\Windows\System32\config\<hive>`, and a value is one file in that directory, holding a small `[type, length, data]` header the value's own bytes follow;
-the unnamed "default" value of a key is the file named `(Default)`. The five predefined keys (`HKEY_LOCAL_MACHINE`, `HKEY_CURRENT_USER`, `HKEY_CLASSES_ROOT`, `HKEY_USERS`,
-`HKEY_CURRENT_CONFIG`) are fixed pseudo-handles mapping to the hive directories (made, with their parents, the first time something is created under them); there is no
-separate per-user hive, so `HKEY_CURRENT_USER` is just another one of the five, and `HKEY_CLASSES_ROOT` does not merge with `HKLM\Software\Classes` the way the real one does.
-This makes the registry an ordinary part of the file system, shared by every process like the real one (not per-process), and exactly as persistent as whatever is mounted
-there (nothing, on the RAM file system the boot demo uses, like everything else in it). `RegOpenKeyEx`, `RegCreateKeyEx`, `RegCloseKey`, `RegQueryValueEx`/`RegGetValue`,
-`RegSetValueEx`, `RegDeleteValue`, `RegDeleteKey` (only on a key with no subkeys, like the real one), `RegEnumKeyEx`, `RegEnumValue`, `RegQueryInfoKey` and `RegFlushKey`
-(a no-op: there is no cache) all work, for `REG_SZ`, `REG_EXPAND_SZ` (no `%VAR%` expansion), `REG_MULTI_SZ`, `REG_DWORD`, `REG_QWORD` and `REG_BINARY`. Not provided:
-security descriptors and access checks (any access is granted), `REG_DWORD_BIG_ENDIAN`, volatile keys (a key made "volatile" is not treated specially: it persists exactly
-like any other, as far as the mounted file system does), remote registries, and registry change notifications. `advapi32.dll` also has `GetUserName` (one fixed user),
-`OpenProcessToken`/`GetTokenInformation` (enough to answer "what user" and "is it elevated", always yes: there is no UAC), and `CryptAcquireContext`/`CryptGenRandom`/
-`CryptReleaseContext` (bytes that are not predictable in practice but are not a cryptographic guarantee, since there is no entropy driver for programs yet).
+The registry is the kernel's (`src/Process/RegistryTree.cpp`, `WindowsRegistry.cpp`): one tree in memory shared by every program, reached by the NT services `NtCreateKey`,
+`NtOpenKey`, `NtQueryKey`, `NtEnumerateKey`, `NtSetValueKey` ... and, new, `NtRenameKey`, `NtQueryMultipleValueKey`, `NtNotifyChangeKey`, `NtSaveKey(Ex)`, `NtRestoreKey`,
+`NtReplaceKey`, `NtLoadKey*`, `NtUnloadKey*`, `NtQueryOpenSubKeys`, `NtSetInformationKey`. A hive file (`RegSaveKey`) is this OS's own format ("TCRH", see `RegistryTree::save`),
+not Windows' regf; saving needs SeBackupPrivilege, restoring/loading SeRestorePrivilege. A loaded hive is written back by `RegFlushKey` and `RegUnLoadKey`. A change to a key signals
+the watches of `NtNotifyChangeKey` (an event given with an asynchronous call is signalled by the kernel once). Transacted calls only check for a transaction handle.
+`NtShutdownSystem` (SeShutdownPrivilege) asks the desktop loop to shut down or restart; `NtImpersonateAnonymousToken`, the `Nt*AuditAlarm` services and a system random source
+(`NtQuerySystemInformation` class 0x1000) are in ntdll.dll / the kernel too.
+
+`advapi32.dll` is a set of files in `src/Windows/advapi32`: `registry.inc`/`registry2.inc` (registry), `security.c`/`kbsec.c`/`secext.c` (security, trustees, audit alarms, logon,
+shutdown), `lsa.c`/`policy.c`/`lsa_ns.c` (the LSA: account rights, secrets, private data, audit policy kept in `HKLM\SECURITY\Policy`; trust and forest functions answer
+STATUS_NOT_SUPPORTED), `scm.c` (services), `eventlog.c`, `etw.c`, `crypt.c`, `cred.c`, `perf.c`, `misc.c`.
+
+* **Services**: the database is `HKLM\SYSTEM\CurrentControlSet\Services\<name>`; what runs is in `...\Control\TcosServiceState\<name>`. `StartService` starts the services it depends
+  on, puts the name in the environment (`TCOS_SERVICE_NAME`) of the new process and creates it from `ImagePath`; its `StartServiceCtrlDispatcher` claims the state and runs
+  `ServiceMain`. `ControlService` signals the named event `TcosSvcCtl_<name>`. Drivers cannot be loaded. There is no boot-time SCM: nothing is started automatically.
+* **Event log**: files `C:\Windows\System32\winevt\Logs\<Log>.evt` of real `EVENTLOGRECORD`s; `Elf*` are the native forms.
+* **ETW**: sessions are registry keys plus a log file; providers hear of sessions through a watched generation counter; `ProcessTrace` replays the file.
+* **CryptoAPI**: MD4/MD5/SHA-1/SHA-2/HMAC, RC4, AES-128/192/256 (ECB/CBC, PKCS #5), key derivation, plain-text key blobs. No RSA (CryptSignHash answers NTE_BAD_ALGID).
+* **Credentials**: `Cred*` over `HKCU\Software\Microsoft\TcosCredentials`.
+* Not provided (they answer an error, never success): EFS, WMI blocks, the RPC stubs (`BaseReg*`, `I_Sc*`), Safer, software installation by policy, the DES password hash helpers
+  (`SystemFunction001`..`035`), performance counter queries (providers work), wait chains.
+
+Test: `tests/windows/advapitest.c` (also acts as its own service).
 
 ## Job objects
 
