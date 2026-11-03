@@ -18,6 +18,8 @@
 #include "Program/ProgramRunner.hpp"
 #include "Program/ProgramHost.hpp"
 #include "Emulation/GuestCpu.hpp"
+#include "EmulationJit/GuestJit.hpp"
+#include "Jit/KernelJit.hpp"
 #include "Executable/ExecutableKind.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
@@ -247,6 +249,8 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
       fail(message, "no emulator for this program's CPU");
       return RunResult::CouldNotRun;
     }
+    // Hot blocks of an x86-64, RISC-V or AArch64 guest run as translated code where the kernel has executable memory for it.
+    if (jit::ICodeMemory* code_memory = jit::kernel_code_memory()) emulation::enable_jit(*cpu.get(), allocator, *code_memory);
     EmulatedTask task(program, static_cast<UniquePointer<emulation::IGuestCpu>&&>(cpu), allocator);
     if (!task.start("emulated")) {
       fail(message, "could not start the program (out of memory)");

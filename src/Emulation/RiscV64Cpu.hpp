@@ -17,9 +17,30 @@
  */
 #pragma once
 #include "Emulation/GuestCpu.hpp"
+#include "Emulation/GuestJitLink.hpp"
+#include "Utility/SharedPointer.hpp"
 #include "Emulation/SoftFloat.hpp"
 
 namespace emulation {
+
+class RiscV64Cpu;
+
+// Translated code for the RISC-V guest (src/EmulationJit), used like IX86Jit: the cpu asks it to run the block at pc before interpreting an instruction. Only for user-mode
+// guests; a cpu in system mode (a bus) always interprets.
+class IRiscVJit {
+ public:
+  enum class Result : uint8_t { NotRun, Ran, Faulted };
+  virtual Result run(RiscV64Cpu& cpu, GuestMemory& memory, uint64_t budget, uint64_t* retired) = 0;
+  static constexpr uint64_t kLongestBlock = 32;
+  virtual uint64_t blocks_entered() const = 0;
+
+ protected:
+  IRiscVJit() = default;
+  ~IRiscVJit() = default;
+};
+
+// The 32-bit instruction a 16-bit compressed one stands for; 0 if it is illegal or reserved.
+uint32_t riscv_expand_compressed(uint32_t compressed);
 
 // The physical side of a RISC-V machine, for the privileged (system) mode: memory and devices behind physical addresses. An access that no device claims returns false, which the
 // CPU reports as an access fault.
@@ -46,6 +67,7 @@ class RiscV64Cpu final : public IGuestCpu {
   struct State {
     uint64_t x[32] = {};
     uint64_t pc = 0;
+    GuestJitLink jit;      // (see GuestJitLink.hpp)
     uint64_t f[32] = {};      // single-precision values live NaN-boxed in the low half
     uint32_t fcsr = 0;        // fflags in bits 4:0, frm in bits 7:5
     // The vector extension: VLEN = 128 bits, ELEN = 64. The 32 registers are one flat byte array (register n starts at 16 * n), which makes register groups plain slices.
@@ -92,6 +114,12 @@ class RiscV64Cpu final : public IGuestCpu {
 
   State& state() { return s_; }
   const State& state() const { return s_; }
+
+  // Translated code (see IRiscVJit). Threads cloned from this cpu share it.
+  void set_jit(SharedPointer<IRiscVJit> jit) { jit_ = static_cast<SharedPointer<IRiscVJit>&&>(jit); }
+  uint64_t jit_blocks_entered() const { return jit_ ? jit_->blocks_entered() : 0; }
+  // A guest memory access of translated code failed: records the fault the way the interpreter would, restartable at `pc`.
+  void jit_fault(uint64_t pc, uint64_t address);
 
  private:
   enum class Step : uint8_t { Ok, Syscall, Fault };
@@ -146,6 +174,8 @@ class RiscV64Cpu final : public IGuestCpu {
   uint64_t read_half(uint32_t r) const { return (s_.f[r] >> 16) == 0xFFFFFFFFFFFFull ? (s_.f[r] & 0xFFFFu) : 0x7E00u; }      // (Zfh: an unboxed half is the canonical NaN)
   void write_half(uint32_t r, uint64_t bits) { s_.f[r] = 0xFFFFFFFFFFFF0000ull | (bits & 0xFFFFu); }
 
+  SharedPointer<IRiscVJit> jit_;
+  bool jit_usable() const { return jit_ && !bus_; }
   State s_;
   System sys_;
   IRiscVBus* bus_ = nullptr;
