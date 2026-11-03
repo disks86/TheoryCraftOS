@@ -1,0 +1,58 @@
+# win32u Direct3D services (NtGdiDdDDI*, NtDxgk*)
+
+Code: `src/Process/Win32k/Dxg/` (`Win32kDxg.cpp` installs; `DxgAdapters`, `DxgAllocations`, `DxgSync`, `DxgWork`, `DxgUnsupported`, `DxgCore`; structure
+offsets in `DxgLayouts.hpp`). Test: `tests/Win32kDxgTest.cpp` (`tests/run_host_tests.sh Win32kDxgTest`, ASan + UBSan). The services map the D3DKMT thunks of gdi32 /
+d3d9 / dxgi onto `dxgk::Kernel` (`dxgk::system_kernel()`; without one every service answers STATUS_NO_SUCH_DEVICE).
+
+Rules: all handlers register with `locked = false` (dxgk has its own lock). One dxgk process per caller (`Call::pid()`), opened on first use, closed by the
+process-exit hook. Every structure is read once into a `UserBlock` (Windows x64 layout, offsets in `DxgLayouts.hpp`, checked against the SDK headers in
+`tests/windows/wine/include`); pointers and counts inside are bounds-checked (arrays <= 32/256 entries, blobs <= 64 KiB, wrapping address arithmetic refused). A NULL
+structure pointer is STATUS_INVALID_PARAMETER, an unreadable one STATUS_ACCESS_VIOLATION, a zero handle STATUS_INVALID_PARAMETER. dxgk statuses pass through.
+Blocking waits use neither the system lock nor a dxgk wait hook: they poll `wait_sync_cpu(timeout 0)` and sleep in the host, and end when the process exits.
+
+## Implemented (50)
+
+Adapters and devices: OpenAdapterFromLuid, OpenAdapterFromDeviceName (name of adapter n: `\\?\DISPLAY#TCOSDXG#<n>#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}`),
+CloseAdapter, EnumAdapters, EnumAdapters2, NtDxgkEnumAdapters3, QueryAdapterInfo (UMDRIVERPRIVATE = adapter caps blob, GETSEGMENTSIZE, ADAPTERGUID, DRIVERVERSION = WDDM 1.3,
+ADAPTERTYPE, PHYSICALADAPTERCOUNT, all-zero capability queries; other types STATUS_INVALID_PARAMETER), QueryVideoMemoryInfo (own process only), CreateDevice (no
+device-level DMA buffers), DestroyDevice, GetDeviceState (execution, reset), GetDisplayModeList, SetDisplayMode (the mode with the size of the primary allocation),
+WaitForVerticalBlankEvent (fixed 60 Hz), SetQueuedLimit (recorded), WaitForIdle, TrimProcessCommitment, SetVidPnSourceOwner and CheckVidPnExclusiveOwnership (semantics and
+statuses as Windows has them, from Wine's d3dkmt test), Evict.
+
+Contexts and work: CreateContext (maps a 96 KiB region: 64 KiB DMA buffer = the command stream of CommandStream.hpp, 1024 allocation-list entries, an unused patch list),
+CreateContextVirtual (no buffers, cannot Render), DestroyContext, Get/SetContextSchedulingPriority and the InProcess pair (**recorded only**: dxgk cannot change a context's
+priority), Render (copies from the mapped buffer), Present (flip, or blt without stretching), Escape (DRIVERPRIVATE = the dxgk escape ABI, reply in the same buffer).
+
+Allocations: CreateAllocation(2), DestroyAllocation(2), Lock(2), Unlock(2), QueryAllocationResidency, QueryResourceInfo, OpenResource(2).
+
+Synchronization: CreateSynchronizationObject(2), DestroySynchronizationObject, Signal/WaitForSynchronizationObjectFromCpu, SignalSynchronizationObject,
+WaitForSynchronizationObject, Signal/WaitForSynchronizationObjectFromGpu.
+
+### Private driver data of an allocation (the miniport ABI)
+
+18 little-endian words (`AllocWord`): version (1), dxgk flags, format (`dxgk::Format`), width, height, mips, size lo/hi, texture kind, samples, layers, initial state,
+heap handle, heap offset lo/hi; **out**: pitch, backing bytes lo/hi (CreateAllocation writes them back; OpenResource hands the same data to other processes). Smaller blobs
+are STATUS_INVALID_PARAMETER. `Primary` adds kAllocPresent, CreateShared adds kAllocShared.
+
+### Mapping notes
+
+- Lock: dxgk's backing is not in the process, so Lock maps a region of the process's address space with a copy; Unlock copies back unless ReadOnly. `PrivateDriverData`
+  is the subresource (mip level). Needs an `AddressSpace` (else STATUS_NOT_SUPPORTED). Destroying the allocation, the device or the process drops the view.
+- Resources and global shares live in this layer: `hResource` = 0xE0000000 | n; `hGlobalShare` = a layer id; one dxgk share token per allocation; runtime and driver data
+  are kept and returned by QueryResourceInfo / OpenResource. The share ends when the owner destroys the resource or exits.
+- Sync: a mutex is a semaphore with limit 1. The legacy Signal/Wait (no value) are for semaphores and mutexes (a fence gives STATUS_INVALID_PARAMETER). Not available
+  (STATUS_NOT_SUPPORTED): CPU-notification and monitored fences (need an NT event / a mapped fence value), Shared / NtSecuritySharing / CrossAdapter objects, WaitFromCpu with
+  `hAsyncEvent`.
+
+## Answer STATUS_NOT_SUPPORTED (72)
+
+Hardware features the adapters lack (`DxgUnsupported.cpp`): multi-plane overlay and overlays, output duplication, protected sessions, WDDM 2 hardware contexts and queues,
+paging queues, GPU virtual addresses, SubmitCommand, doorbells, tracked workloads, native fences, present-to-HW-queue, Miracast (NetDisp*), display mux, DisplayPort, Vail.
+
+## Left unregistered (STATUS_NOT_IMPLEMENTED)
+
+OpenAdapterFromHdc (needs HDC -> display from the GDI module), ShareObjects / OpenResourceFromNtHandle / named NT-handle services / keyed mutexes (no NT-handle object for
+dxgk objects), OpenSynchronizationObject (no sync sharing in dxgk), MakeResident and CreatePagingQueue (the paging queue needs a fence address), QueryStatistics,
+SignalSynchronizationObjectFromGpu2, services whose layout is not in the headers at hand (Get/SetProperties, IsFeatureEnabled, PinResources, ...), swap chain and DispMgr
+services, GetPresentHistory, allocation priorities, and the DirectDraw fullscreen-sprite / QueryVisRgnUniqueness services (this service list has no other legacy DDraw
+calls). Missing in `dxgk::Kernel`: a context priority setter, sync-object sharing, a way to map allocation memory into a process.
