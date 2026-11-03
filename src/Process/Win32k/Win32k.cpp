@@ -28,13 +28,14 @@ namespace win32k {
 namespace {
 
 constexpr uint32_t kServices = kServiceEnd - kServiceBase;
-constexpr uint32_t kMaxExitHooks = 16;
+constexpr uint32_t kMaxExitHooks = 16, kMaxDuplicates = 64;
 constexpr uint32_t kTebLastError = 0x68;
 
 struct Table {
   Handler handlers[kServices] = {};
   bool locked[kServices] = {};
   uint32_t registered = 0, duplicates = 0;
+  uint32_t duplicate_numbers[kMaxDuplicates] = {};
   ProcessExitHook exit_hooks[kMaxExitHooks] = {};
   uint32_t exit_hook_count = 0;
   bool installed = false;
@@ -177,7 +178,7 @@ bool register_handler(WindowsSyscallNumber number, Handler handler, bool locked)
   const uint32_t n = uint32_t(number);
   if (n < kServiceBase || n >= kServiceEnd || !handler) return false;
   const uint32_t index = n - kServiceBase;
-  if (g_table.handlers[index]) { ++g_table.duplicates; return false; }
+  if (g_table.handlers[index]) { if (g_table.duplicates < kMaxDuplicates) g_table.duplicate_numbers[g_table.duplicates] = n; ++g_table.duplicates; return false; }
   g_table.handlers[index] = handler;
   g_table.locked[index] = locked;
   ++g_table.registered;
@@ -187,6 +188,7 @@ bool register_handler(WindowsSyscallNumber number, Handler handler, bool locked)
 Handler handler_of(uint32_t service) { return service >= kServiceBase && service < kServiceEnd ? g_table.handlers[service - kServiceBase] : nullptr; }
 uint32_t registered_count() { return g_table.registered; }
 uint32_t duplicate_registrations() { return g_table.duplicates; }
+uint32_t duplicate_service(uint32_t index) { return index < g_table.duplicates && index < kMaxDuplicates ? g_table.duplicate_numbers[index] : 0; }
 
 allocators::IAllocator* system_allocator() {
   ObjectManager* objects = objects_or_null();

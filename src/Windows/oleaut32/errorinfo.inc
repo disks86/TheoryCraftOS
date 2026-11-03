@@ -270,8 +270,8 @@ EXPORT HRESULT WINAPI GetActiveObject(REFCLSID clsid, void *reserved, IUnknown *
 
 /* ---- small exports --------------------------------------------------------------------------------------------------------------------------------- */
 EXPORT ULONG WINAPI OaBuildVersion(void) { return 0x000A0000u; }
-EXPORT void WINAPI OACleanup(void) {}          /* (no caches to empty: BSTRs and the like are plain heap blocks) */
-EXPORT void WINAPI SetOaNoCache(void) {}
+EXPORT void WINAPI OACleanup(void) { bstr_cache_flush(); }
+EXPORT void WINAPI SetOaNoCache(void) { bstr_cache_state = 2; bstr_cache_flush(); }
 
 EXPORT void WINAPI ClearCustData(CUSTDATA *data) {
   if (!data) return;

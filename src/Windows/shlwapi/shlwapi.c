@@ -191,3 +191,21 @@ EXPORT DWORD WINAPI StrCatChainW(LPWSTR dst, DWORD max, DWORD offset, LPCWSTR sr
   dst[offset] = 0;
   return offset;
 }
+
+/* ---- the shell's helpers: STRRET, the registry, streams on files, associations ---------------------------------------------------------------------------------------- */
+
+typedef LONG HRESULT_;
+typedef BYTE *LPBYTE;
+IMPORT int memcmp(const void *, const void *, size_t_);
+#define HRESULT_FROM_WIN32_(e) ((LONG)(e) <= 0 ? (LONG)(e) : (LONG)(((e) & 0xFFFF) | 0x80070000))
+#define ERROR_KEY_HAS_CHILDREN 1020
+#define E_OUTOFMEMORY_VALUE E_OUTOFMEMORY_
+IMPORT DWORD WINAPI GetLastError(void);
+/* a\b\c into out (a buffer of MAX_PATH_ * 2 characters), cut when too long */
+static void swprintf_(WCHAR *out, const WCHAR *a, const WCHAR *b, const WCHAR *c, const WCHAR *d) {
+  size_t_ n = 0;
+  const WCHAR *parts[4] = {a, b, c, d};
+  for (int i = 0; i < 4; ++i) for (const WCHAR *p = parts[i]; *p && n + 1 < MAX_PATH_ * 2; ++p) out[n++] = *p;
+  out[n] = 0;
+}
+#include "shell.inc"

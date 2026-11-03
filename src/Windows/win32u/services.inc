@@ -1557,3 +1557,6 @@ NT_SERVICE(NtUserYieldTask);
 NT_SERVICE(NtUserZapActiveAndFocus);
 NT_SERVICE(NtValidateCompositionSurfaceHandle);
 NT_SERVICE(NtVisualCaptureBits);
+NT_SERVICE(NtUserTcosGetUpcall);
+NT_SERVICE(NtUserTcosUpcallDone);
+NT_SERVICE(NtUserTcosResume);

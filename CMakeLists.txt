@@ -1095,6 +1095,10 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMENT "Building win32u.dll")
   set(WINDOWS_LIBRARIES ntdll kernel32 msvcrt advapi32 ws2_32 win32u ${WINDOWS_STUB_LIBRARIES})
   set(_stub_image_base 0x180A00000)
+  # shell32.dll uses the registry (advapi32) and the window system (user32); the string functions it shares with shlwapi are forwarders in shell32.def.
+  set(WINDOWS_IMPORTS_shell32 advapi32 user32 ole32)
+  set(WINDOWS_IMPORTS_shlwapi advapi32)
+  set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     windows_stub_flags(_flags ${_library} 0)
     # A library with code of its own (src/Windows/<dll>/<dll>.c and the .inc files next to it) is linked over kernel32.dll; the stubs fill in what it does not define yet.
@@ -1110,6 +1114,17 @@ if(TCOS_ARCH STREQUAL "x86_64")
         list(APPEND _own_sources ${WINDOWS_DIR}/advapi32.dll)
         list(APPEND _own_depends ${WINDOWS_DIR}/advapi32.dll)
       endif()
+      # <dll>.def: forwarders to other libraries (and exports that the C code cannot spell).
+      set(_own_def ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.def)
+      if(EXISTS ${_own_def})
+        list(APPEND _own_sources ${_own_def})
+        list(APPEND _own_depends ${_own_def})
+      endif()
+      # Libraries this one imports besides kernel32.dll (a list in WINDOWS_IMPORTS_<dll>).
+      foreach(_import ${WINDOWS_IMPORTS_${_library}})
+        list(APPEND _own_sources ${WINDOWS_DIR}/${_import}.dll)
+        list(APPEND _own_depends ${WINDOWS_DIR}/${_import}.dll)
+      endforeach()
     endif()
     add_custom_command(OUTPUT ${WINDOWS_DIR}/${_library}.dll
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}

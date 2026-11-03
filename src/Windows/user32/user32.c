@@ -187,3 +187,65 @@ EXPORT BOOL WINAPI SystemParametersInfoW(UINT action, UINT param, PVOID data, UI
   SetLastError(ERROR_INVALID_PARAMETER);
   return FALSE;
 }
+
+/* ---- characters ------------------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The ANSI code page is single-byte here, so a character is a byte; wide letters are the Latin-1, Greek and Cyrillic ones that kernel32's case tables know. */
+static unsigned char_upper(unsigned c) {
+  if (c >= 'a' && c <= 'z') return c - 32;
+  if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 32;
+  if (c == 0xFF) return 0x178;
+  if (c >= 0x3B1 && c <= 0x3C9 && c != 0x3C2) return c - 32;
+  if (c >= 0x430 && c <= 0x44F) return c - 32;
+  if (c >= 0x450 && c <= 0x45F) return c - 80;
+  return c;
+}
+static unsigned char_lower(unsigned c) {
+  if (c >= 'A' && c <= 'Z') return c + 32;
+  if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 32;
+  if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) return c + 32;
+  if (c >= 0x410 && c <= 0x42F) return c + 32;
+  if (c >= 0x400 && c <= 0x40F) return c + 80;
+  return c;
+}
+static int char_is_alpha(unsigned c) { return char_upper(c) != char_lower(c) || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == 0xAA || c == 0xB5 || c == 0xBA || c == 0xDF || c == 0xFF; }
+
+EXPORT LPSTR WINAPI CharNextA(LPCSTR p) { return (LPSTR)(*p ? p + 1 : p); }
+EXPORT LPSTR WINAPI CharNextExA(WORD code_page, LPCSTR p, DWORD flags) { (void)code_page; (void)flags; return CharNextA(p); }
+EXPORT LPWSTR WINAPI CharNextW(LPCWSTR p) { return (LPWSTR)(*p ? p + 1 : p); }
+EXPORT LPSTR WINAPI CharPrevA(LPCSTR start, LPCSTR p) { return (LPSTR)(p > start ? p - 1 : start); }
+EXPORT LPSTR WINAPI CharPrevExA(WORD code_page, LPCSTR start, LPCSTR p, DWORD flags) { (void)code_page; (void)flags; return CharPrevA(start, p); }
+EXPORT LPWSTR WINAPI CharPrevW(LPCWSTR start, LPCWSTR p) { return (LPWSTR)(p > start ? p - 1 : start); }
+/* a single character in the low word is converted; a pointer is a string, converted in place */
+EXPORT LPSTR WINAPI CharUpperA(LPSTR s) {
+  if (((ULONG_PTR)s >> 16) == 0) return (LPSTR)(ULONG_PTR)char_upper((BYTE)(ULONG_PTR)s);
+  for (LPSTR p = s; *p; ++p) *p = (char)char_upper((BYTE)*p);
+  return s;
+}
+EXPORT LPSTR WINAPI CharLowerA(LPSTR s) {
+  if (((ULONG_PTR)s >> 16) == 0) return (LPSTR)(ULONG_PTR)char_lower((BYTE)(ULONG_PTR)s);
+  for (LPSTR p = s; *p; ++p) *p = (char)char_lower((BYTE)*p);
+  return s;
+}
+EXPORT LPWSTR WINAPI CharUpperW(LPWSTR s) {
+  if (((ULONG_PTR)s >> 16) == 0) return (LPWSTR)(ULONG_PTR)char_upper((WCHAR)(ULONG_PTR)s);
+  for (LPWSTR p = s; *p; ++p) *p = (WCHAR)char_upper(*p);
+  return s;
+}
+EXPORT LPWSTR WINAPI CharLowerW(LPWSTR s) {
+  if (((ULONG_PTR)s >> 16) == 0) return (LPWSTR)(ULONG_PTR)char_lower((WCHAR)(ULONG_PTR)s);
+  for (LPWSTR p = s; *p; ++p) *p = (WCHAR)char_lower(*p);
+  return s;
+}
+EXPORT DWORD WINAPI CharUpperBuffA(LPSTR s, DWORD n) { DWORD i = 0; for (; s && i < n; ++i) s[i] = (char)char_upper((BYTE)s[i]); return i; }
+EXPORT DWORD WINAPI CharLowerBuffA(LPSTR s, DWORD n) { DWORD i = 0; for (; s && i < n; ++i) s[i] = (char)char_lower((BYTE)s[i]); return i; }
+EXPORT DWORD WINAPI CharUpperBuffW(LPWSTR s, DWORD n) { DWORD i = 0; for (; s && i < n; ++i) s[i] = (WCHAR)char_upper(s[i]); return i; }
+EXPORT DWORD WINAPI CharLowerBuffW(LPWSTR s, DWORD n) { DWORD i = 0; for (; s && i < n; ++i) s[i] = (WCHAR)char_lower(s[i]); return i; }
+EXPORT BOOL WINAPI IsCharAlphaA(CHAR c) { return char_is_alpha((BYTE)c); }
+EXPORT BOOL WINAPI IsCharAlphaW(WCHAR c) { return char_is_alpha(c); }
+EXPORT BOOL WINAPI IsCharAlphaNumericA(CHAR c) { return char_is_alpha((BYTE)c) || ((BYTE)c >= '0' && (BYTE)c <= '9'); }
+EXPORT BOOL WINAPI IsCharAlphaNumericW(WCHAR c) { return char_is_alpha(c) || (c >= '0' && c <= '9'); }
+EXPORT BOOL WINAPI IsCharUpperA(CHAR c) { return char_is_alpha((BYTE)c) && char_lower((BYTE)c) != (BYTE)c; }
+EXPORT BOOL WINAPI IsCharUpperW(WCHAR c) { return char_is_alpha(c) && char_lower(c) != c; }
+EXPORT BOOL WINAPI IsCharLowerA(CHAR c) { return char_is_alpha((BYTE)c) && char_upper((BYTE)c) != (BYTE)c; }
+EXPORT BOOL WINAPI IsCharLowerW(WCHAR c) { return char_is_alpha(c) && char_upper(c) != c; }

@@ -6,6 +6,7 @@
 #   tlscbtest.exe: TLS callbacks for the process and its threads
 #   threadtest.exe: CreateThread and friends, critical sections, events, mutexes, TLS (clang)
 #   sehtest.exe: __try/__except/__finally and RaiseException (clang, which has structured exception handling in C)
+#   shell32test.exe: shell32.dll and ole32.dll (folders, item id lists, file operations, ShellExecute, shortcuts)
 # Usage: tests/windows/build.sh [output-dir]   (default: build/windows-tests)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -69,6 +70,8 @@ $cc -O1 -Wall -Wextra -o "$out/mailslottest.exe" tests/windows/mailslottest.c
 echo "built $out/mailslottest.exe (CreateMailslot/GetMailslotInfo/SetMailslotInfo)"
 $cc -O1 -Wall -Wextra -o "$out/socktest.exe" tests/windows/socktest.c -lws2_32
 echo "built $out/socktest.exe (ws2_32: TCP/UDP loopback, non-blocking connect, select)"
+$cc -O1 -Wall -Wextra -Wno-unused-parameter -o "$out/shell32test.exe" tests/windows/shell32test.c -lshell32 -lole32 -lshlwapi -ladvapi32 -luuid
+echo "built $out/shell32test.exe (shell32 and ole32: command lines, special folders, item id lists, shell items, file operations, ShellExecute, shortcuts; procchild.exe in System32)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c
 echo "built $out/suspendtest.exe (SuspendThread, thread contexts, TerminateThread)"
 if command -v clang >/dev/null; then

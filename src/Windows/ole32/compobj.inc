@@ -694,6 +694,17 @@ static HRESULT get_registered_class(REFCLSID clsid, DWORD context, REFIID riid, 
 
 typedef HRESULT (WINAPI *DllGetClassObjectFn)(REFCLSID, REFIID, void **);
 
+/* The classes shell32.dll serves (its DllGetClassObject): shortcuts, shell items, the desktop and file system folders, My Computer, the known-folder manager. */
+static BOOL is_shell32_class(REFCLSID clsid) {
+  static const GUID classes[] = {
+    {0x00021401, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, {0x9AC9FBE1, 0xE0A2, 0x4AD6, {0xB4, 0xEE, 0xE2, 0x12, 0x01, 0x3E, 0xA9, 0x17}},
+    {0x00021400, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, {0xF3364BA0, 0x65B9, 0x11CE, {0xA9, 0xBA, 0x00, 0xAA, 0x00, 0x4A, 0xE8, 0x37}},
+    {0x20D04FE0, 0x3AEA, 0x1069, {0xA2, 0xD8, 0x08, 0x00, 0x2B, 0x30, 0x30, 0x9D}}, {0x4DF0C730, 0xDF9D, 0x4AE3, {0x91, 0x53, 0xAA, 0x6B, 0x82, 0xE9, 0x79, 0x5A}},
+  };
+  for (size_t i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) if (IsEqualGUID(&classes[i], clsid)) return TRUE;
+  return FALSE;
+}
+
 static HRESULT load_class_from_dll(const WCHAR *path, REFCLSID clsid, REFIID riid, void **out) {
   WCHAR full[MAX_PATH];
   HMODULE m;
@@ -727,6 +738,7 @@ EXPORT HRESULT WINAPI CoGetClassObject(REFCLSID rclsid, DWORD context, LPVOID se
     if (context & CLSCTX_INPROC_SERVER) {
       clsid_key_path(&clsid, W('I', 'n', 'p', 'r', 'o', 'c', 'S', 'e', 'r', 'v', 'e', 'r', '3', '2'), path);
       if (reg_class_string(path, NULL, dll, MAX_PATH * 2) == ERROR_SUCCESS && dll[0]) return load_class_from_dll(dll, &clsid, riid, out);
+      if (is_shell32_class(&clsid)) return load_class_from_dll(W('s', 'h', 'e', 'l', 'l', '3', '2', '.', 'd', 'l', 'l'), &clsid, riid, out);      /* (a fresh system registers none of these) */
     }
     if (context & CLSCTX_INPROC_HANDLER) {
       clsid_key_path(&clsid, W('I', 'n', 'p', 'r', 'o', 'c', 'H', 'a', 'n', 'd', 'l', 'e', 'r', '3', '2'), path);

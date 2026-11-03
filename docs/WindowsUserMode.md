@@ -359,10 +359,42 @@ activation-context entry points, calendar helpers such as `GetCalendarDateFormat
 import library), the compiler intrinsics the import library lists (`_InterlockedXxx`, `__readmsr`, ...: not exports of a real kernel32.dll), `CheckTokenMembershipEx`,
 `GetStringScripts` / `VerifyScripts`, `GetMappedFileName` of a data view (only program images are named), `SetVolumeLabel` (answers `ERROR_ACCESS_DENIED`: no service sets the label).
 
+## The shell (shell32.dll) and COM (ole32.dll)
+
+`src/Windows/shell32` is a real DLL (the rest of the shell libraries are still stubs): freestanding C over kernel32, advapi32's registry and user32, built against
+mingw-w64's headers. One file per part (see the comment at the top of `shell32.c`). What works:
+
+- **Folders.** Known folders and CSIDLs (`folders.inc`): `SHGetFolderPath*`, `SHGetKnownFolderPath`, `SHSetKnownFolderPath` (redirection in `HKCU\...\Explorer\User Shell Folders`),
+  `SHGetSpecialFolderPath`, the item-list forms, and `IKnownFolderManager`/`IKnownFolder`. The profile is `%USERPROFILE%` (`C:\Users\Default`); the per-user and common
+  folders are made on first use, Windows/System32/Fonts and the like are not. Virtual folders (This PC, Recycle Bin, Network, Control Panel, Printers) have GUID items and no path.
+- **Item lists and folders** (`pidl.inc`, `items.inc`): the `IL*` functions, `SHParseDisplayName`, `SHBindToParent`, `SHGetNameFromIDList`, `IShellFolder`/`IShellFolder2`/`IPersistFolder3` for
+  the desktop, This PC and file system folders, `IEnumIDList`, `IShellItem`, `IShellItemArray`, and a data object with `CF_HDROP` and "Shell IDList Array". The item formats are this OS's
+  own (documented at the top of `pidl.inc`; programs treat them as opaque). The desktop folder is `C:\Users\Default\Desktop` (the public desktop is enumerated too).
+- **File operations** (`fileop.inc`): `SHFileOperation` (copy, move, rename, delete with wildcards, several sources, `FOF_RENAMEONCOLLISION`, name mappings, the `DE_*` codes), the
+  recycle bin (`C:\$Recycle.Bin\<SID>` with `$I`/`$R` files; `SHQueryRecycleBin`, `SHEmptyRecycleBin`), `SHCreateDirectoryEx`, unique names, `PathResolve`, `PathCleanupSpec`. There are no
+  dialogs: where Windows would ask, the answer is yes.
+- **ShellExecute** (`exec.inc`): `ShellExecute[Ex]`, `FindExecutable`, associations from `HKEY_CLASSES_ROOT` (extension -> class -> `shell\<verb>\command`, `%1 %L %* %2-%9 %~N`, the shell's own
+  rules for splitting parameters), programs started with CreateProcess, URL protocols from the registry. No DDE.
+- **Shortcuts** (`link.inc`): `CLSID_ShellLink` with `IShellLinkW/A`, `IPersistFile`, `IPersistStream`, `IShellLinkDataList` (flags only); files are written with a target list and Unicode strings,
+  read with or without LinkInfo; hostile input is bounds-checked (test: truncations and bit flips).
+- Also: `SHGetFileInfo` (names, attributes, executable type), drag and drop (`DragQueryFile`), change notifications (in-process), notification-icon bookkeeping, shared memory
+  (`SHAllocShared`...), `CommandLineToArgvW`, the She* helpers, drive helpers, `SHGetMalloc`.
+- **Not provided** (they answer with a failure, never crash): everything that needs a window system or icons (`SHBrowseForFolder`, `ExtractIcon*` pictures, `SHGetImageList`, context menus,
+  views, property sheets, `Shell_NotifyIcon` display), `SHGetFileInfo`'s icon, DDE, the property store, `IShellItem2`, libraries, network shares.
+
+`src/Windows/ole32` is the COM runtime of one process: `CoTaskMem*`, apartments (counted per thread), GUID/ProgID strings, `CoGetClassObject`/`CoCreateInstance` for in-process servers (the registry's
+`InprocServer32`, `CoRegisterClassObject`, and shell32's own classes without registry entries), bind contexts, `CreateStreamOnHGlobal`, `ReleaseStgMedium`, `PropVariantClear`. There is no RPC,
+so out-of-process servers, marshalling, monikers and the clipboard are still stubs. shlwapi gained `StrRetTo*`, `SHStrDup`, the `SH*Value` registry helpers, `SHCreateStreamOnFile`, `AssocQueryString`;
+user32 the `Char*`/`IsChar*` functions. No new NT system services were needed: everything above sits on the existing file, registry, section and process services.
+
+Tests: `tests/windows/shell32test.c` (168 checks; run it as `shell32_own.exe` through `scripts/winetest.sh shell32 own`, with `WINETEST_EXTRA=<procchild.exe>` for the ShellExecute checks) and Wine's
+`tests/windows/wine/shell32` (status in the table of `tests/windows/wine/README.md`).
+
 ## Stubs: every service and every export is in place
 
 Nothing a program links against is missing, even where nothing is implemented yet (`scripts/gen-windows-stubs.py` produced the lists from the mingw-w64 import libraries, which name the exports of the real DLLs).
 
 - **System services.** `src/Windows/tcos_syscalls.h` and `WindowsSyscallNumber` number all 500 `Nt*` services of ntdll.dll (0-98 are the implemented ones, the rest follow in alphabetical order; a number never changes once given). A number below `kWindowsServiceCount` that has no code answers `STATUS_NOT_IMPLEMENTED`; a number above it is `STATUS_INVALID_SYSTEM_SERVICE`. ntdll.dll has the stub of every service (`ntdll/services.inc`) and the `Zw*` twin of each (`ntdll/zw.inc`). The 1540 services of win32k (`NtUser*`, `NtGdi*`, `NtDxgk*`, ...) are a second table numbered from 0x1000 (`kWin32kServiceBase`, as Windows does), named in `scripts/win32k-services.txt` (taken from Wine's `win32u.spec`); their stubs are the exports of `win32u.dll` (`src/Windows/win32u`). user32.dll and gdi32.dll do not call them yet.
+- **win32k services.** The kernel side lives in `src/Process/Win32k` (framework `Win32k.hpp`: service table, `Call`, system lock, process-exit hooks; modules: GDI, window manager, user-misc, composition/other, and the Direct3D thunks in `Dxg/`, installed by `win32k::install()` / `install_dxg()`). About 720 of the 1539 services have handlers (GDI 168, window manager 146 + 3 private upcall services, user-misc ~119, composition 165, Direct3D 122); the rest still answer `STATUS_NOT_IMPLEMENTED`. The window procedure upcalls are done by `win32u.c` (wrapper exports around renamed raw stubs). Per-module design, gaps and the lists of unimplemented services: `docs/win32k/*.md`. Tests: `tests/run_host_tests.sh Win32kCoreTest Win32kGdiTest Win32kUserTest Win32kMiscTest Win32kCompositionTest Win32kDxgTest` (the misc test runs alone, with fakes for the other modules).
 - **Exports.** `src/Windows/stubs/<dll>.inc` lists, per DLL, the exports that are not implemented; `stubs/stubs.c` compiles them into functions that return `STATUS_NOT_IMPLEMENTED` (ntdll.dll) or 0 (all the others). To implement one, write it in the DLL and delete its line from the list (a duplicate is a link error). The five real DLLs link their list in; the other libraries (user32, gdi32, shell32, ole32, ... 71 in all, see `WINDOWS_STUB_LIBRARIES` in `CMakeLists.txt`) are DLLs of nothing but stubs. All of them are files of `/Windows/Windows/System32`.
 - **Gaps.** Only functions are stubbed (not data exports such as `_environ`), and names that are not C identifiers (C++ decorated names) are left out. kernelbase.dll and `api-ms-win-*` still fold into kernel32.dll (see `canonical_library_name()`), so their extra exports are not listed.

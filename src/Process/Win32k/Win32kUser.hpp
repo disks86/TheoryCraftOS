@@ -58,6 +58,25 @@ bool adjust_window_rect(gdi::Rect* rect, uint32_t style, uint32_t ex_style, bool
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // (the window manager's own declarations follow)
 
+// For host tests: drops the whole state of the window manager (the next call makes a fresh one with the allocator of the system then current), and makes the calling host
+// thread act as `tid` (0: ask the process runtime as usual). Not used by the kernel.
+void reset_state();
+void set_test_thread(uint64_t tid);
+// The upcall protocol the user-mode half of win32u.dll uses (docs/win32k/User.md): the layout NtUserTcosGetUpcall fills in (all little endian, 8-byte aligned).
+struct UpcallRecord {
+  uint64_t id;
+  uint32_t kind, flags;
+  uint64_t proc;
+  uint64_t hwnd;
+  uint32_t msg, payload_len;
+  uint64_t wparam, lparam;
+  uint64_t extra[3];
+  uint16_t fix_at, fix_to;
+  uint32_t reserved;
+  uint8_t payload[4096];
+};
+constexpr uint64_t kUpcallDueValue = 0x7FFFFFF1u, kDrainRetryValue = 0x7FFFFFF3u;
+
 }  // namespace process::win32k::user
 
 // What the window manager and the GDI module use of the rest of USER (Win32kUserMisc*.cpp: menus, cursors and icons, clipboard, monitors, settings, ...). Implemented by the

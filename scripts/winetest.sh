@@ -55,6 +55,8 @@ while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
   cp "$out/winerun.exe" "$out/winver.exe"; files+=("$PWD/$out/winver.exe")
   cp "$out/winerun.exe" "$out/explorer.exe"; files+=("$PWD/$out/explorer.exe")      # (C:\Windows\explorer.exe: another program image to load)
   cp "$out/winerun.exe" "$out/regedit.exe"; files+=("$PWD/$out/regedit.exe")      # (C:\Windows\regedit.exe: a program file the file tests open)
+  # more files for System32 (programs the tests start, say procchild.exe), given with WINETEST_EXTRA="path path ..."
+  for extra in ${WINETEST_EXTRA:-}; do files+=("$extra"); done
   cp "$out/winerun.exe" "$out/iexplore.exe"; files+=("$PWD/$out/iexplore.exe")      # (C:\Program Files\Internet Explorer\iexplore.exe: a program the process tests start)
   cat > "$out/qemu.sh" <<'QEMU'
 #!/bin/sh
@@ -62,7 +64,10 @@ while [ ${#pending[@]} -gt 0 ] && [ $round -lt 40 ]; do
 log=$(dirname "$0")/../debugcon.log
 mon=/tmp/tcos-qemu-mon-$$.sock
 rm -f "$mon"
-/usr/bin/qemu-system-x86_64 -display none -enable-kvm -monitor unix:"$mon",server,nowait "$@" >/dev/null 2>"$(dirname "$0")/qemu-err.txt" &
+# (the QMP socket of the run target is left out: its path is too long for QEMU when the checkout is deep, and nothing here uses it)
+args=(); skip=0
+for a in "$@"; do if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else args+=("$a"); fi; done
+/usr/bin/qemu-system-x86_64 -display none -enable-kvm -monitor unix:"$mon",server,nowait "${args[@]}" >/dev/null 2>"$(dirname "$0")/qemu-err.txt" &
 pid=$!
 n=0; quiet=0; last=0
 while kill -0 $pid 2>/dev/null && [ $n -lt 2400 ]; do

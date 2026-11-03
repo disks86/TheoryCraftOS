@@ -169,6 +169,7 @@ Handler handler_of(uint32_t service);
 // How many services have a handler / which numbers still have none (for the tests and the documentation).
 uint32_t registered_count();
 uint32_t duplicate_registrations();
+uint32_t duplicate_service(uint32_t index);      // the service number of the index-th refused duplicate registration (0 past the end; the first 64 are kept)
 
 // Runs a service. False if no handler is registered for the number (the caller answers STATUS_NOT_IMPLEMENTED).
 bool dispatch(Process& process, const SyscallRequest& request, uint64_t* result);
