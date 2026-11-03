@@ -82,7 +82,7 @@ struct OpenObject {
 // The descriptor table and file operations of one process. Console descriptors 0..2 exist from the start; the file system is attached once.
 class ProcessFiles {
  public:
-  static constexpr uint32_t kMaxDescriptors = 256;
+  static constexpr uint32_t kMaxDescriptors = 1024;
 
   explicit ProcessFiles(PathStyle style);
   ProcessFiles(const ProcessFiles&) = delete;

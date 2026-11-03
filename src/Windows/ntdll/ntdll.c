@@ -949,6 +949,9 @@ EXPORT PVOID NTAPI RtlProcessHeap(void) { return process_heap(); }
 #include "uilang.inc"
 #include "normalize.inc"
 #include "reg.inc"
+#include "sync.inc"
+#include "threadpool.inc"
+#include "etw.inc"
 
 /* ---- critical sections (one thread: they only count) ---------------------------------------------------------------------------------------------------- */
 
@@ -1790,6 +1793,8 @@ EXPORT NTSTATUS NTAPI LdrEnumerateLoadedModules(PVOID unknown, LdrEnumProc callb
   loader_unlock();
   return STATUS_SUCCESS;
 }
+
+#include "ldr2.inc"
 
 /* ntdll's own entry point: nothing to set up (the heap is made when first used). */
 EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {

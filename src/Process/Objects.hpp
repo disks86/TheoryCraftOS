@@ -389,6 +389,14 @@ class ObjectManager {
 
   // --- waiting (the caller holds the lock: sync().lock())
   bool ready_locked(uint32_t id, uint64_t waiter);
+  // What NtQueryEvent / NtQueryMutant / NtQuerySemaphore report about an object (the lock must be held). False if there is no such object.
+  struct ObjectState {
+    ObjectKind kind = ObjectKind::None;
+    bool manual_reset = false, signaled = false, abandoned = false, owned_by_waiter = false;
+    int32_t count = 0, maximum = 0, recursion = 0;
+  };
+  bool object_state_locked(uint32_t id, uint64_t waiter, ObjectState* out);
+  uint32_t clear_event(uint32_t id);      // NtClearEvent: like reset_event() but for events only
   // Takes what a finished wait takes (the mutex, a unit of the semaphore, the auto-reset event's signal). *abandoned: the mutex was abandoned by its last owner.
   void acquire_locked(uint32_t id, uint64_t waiter, bool* abandoned);
   void waiting_locked(uint32_t id, int32_t delta);      // a waiter starts (+1) or stops (-1) waiting for the object

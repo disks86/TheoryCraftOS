@@ -248,7 +248,7 @@ static void test_blocking_between_processes() {
     CHECK(a.make_mutex("Lock", true, &ma) == 0 && b.make_mutex("Lock", false, &mb) == 0x40000000u);
     CHECK(b.wait(mb, 0) == 0x102);      // owned by the other process
     CHECK(a.wait(ma, 0) == 0);          // (its owner may take it again)
-    CHECK(a.call(WindowsSyscallNumber::NtReleaseMutant, ma, kBase + 0x500) == 0 && a.memory.get64(kBase + 0x500) == 2);
+    CHECK(a.call(WindowsSyscallNumber::NtReleaseMutant, ma, kBase + 0x500) == 0 && (a.memory.get64(kBase + 0x500) & 0xFFFFFFFFu) == 0xFFFFFFFFu);
     status = 0xFFFFFFFF;
     started = false;
     std::thread locker([&] { started = true; status = b.wait(mb, 5000); });

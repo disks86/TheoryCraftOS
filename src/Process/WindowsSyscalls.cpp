@@ -26,6 +26,7 @@
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
+#include "Process/WindowsMisc.hpp"
 #include "Process/WindowsSockets.hpp"
 #include "Process/WindowsModules.hpp"
 #include "Process/WindowsPipes.hpp"
@@ -337,6 +338,42 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtDeleteKey: return windowsabi::nt_delete_key(process, r);
       case WindowsSyscallNumber::NtDeleteValueKey: return windowsabi::nt_delete_value_key(process, r);
       case WindowsSyscallNumber::NtFlushKey: return windowsabi::nt_flush_key(process, r);
+      case WindowsSyscallNumber::NtAlertThreadByThreadId: return windowsabi::nt_alert_thread_by_thread_id(process, r);
+      case WindowsSyscallNumber::NtWaitForAlertByThreadId: return windowsabi::nt_wait_for_alert_by_thread_id(process, r);
+      case WindowsSyscallNumber::NtAlertThread: return windowsabi::nt_alert_thread(process, r);
+      case WindowsSyscallNumber::NtAlertResumeThread: return windowsabi::nt_alert_resume_thread(process, r);
+      case WindowsSyscallNumber::NtWaitForKeyedEvent: return windowsabi::nt_wait_for_keyed_event(process, r);
+      case WindowsSyscallNumber::NtReleaseKeyedEvent: return windowsabi::nt_release_keyed_event(process, r);
+      case WindowsSyscallNumber::NtClearEvent: return windowsabi::nt_clear_event(process, r);
+      case WindowsSyscallNumber::NtQueryEvent: return windowsabi::nt_query_event(process, r);
+      case WindowsSyscallNumber::NtQueryMutant: return windowsabi::nt_query_mutant(process, r);
+      case WindowsSyscallNumber::NtQuerySemaphore: return windowsabi::nt_query_semaphore(process, r);
+      case WindowsSyscallNumber::NtSetEventBoostPriority: return windowsabi::nt_set_event_boost_priority(process, r);
+      case WindowsSyscallNumber::NtGetCurrentProcessorNumberEx: return windowsabi::nt_get_current_processor_number_ex(process, r);
+      case WindowsSyscallNumber::NtQueryDefaultLocale: return windowsabi::nt_query_default_locale(process, r);
+      case WindowsSyscallNumber::NtSetDefaultLocale: return windowsabi::nt_set_default_locale(process, r);
+      case WindowsSyscallNumber::NtQueryDefaultUILanguage: return windowsabi::nt_query_default_ui_language(process, r);
+      case WindowsSyscallNumber::NtSetDefaultUILanguage: return windowsabi::nt_set_default_ui_language(process, r);
+      case WindowsSyscallNumber::NtQueryInstallUILanguage: return windowsabi::nt_query_install_ui_language(process, r);
+      case WindowsSyscallNumber::NtIsUILanguageComitted: case WindowsSyscallNumber::NtFlushInstallUILanguage: case WindowsSyscallNumber::NtFlushInstructionCache:
+      case WindowsSyscallNumber::NtFlushWriteBuffer: case WindowsSyscallNumber::NtSetDebugFilterState: case WindowsSyscallNumber::NtSetIntervalProfile:
+      case WindowsSyscallNumber::NtLockVirtualMemory: case WindowsSyscallNumber::NtUnlockVirtualMemory: case WindowsSyscallNumber::NtCloseObjectAuditAlarm:
+      case WindowsSyscallNumber::NtDeleteObjectAuditAlarm: case WindowsSyscallNumber::NtOpenObjectAuditAlarm: case WindowsSyscallNumber::NtPrivilegeObjectAuditAlarm:
+      case WindowsSyscallNumber::NtPrivilegedServiceAuditAlarm: case WindowsSyscallNumber::NtDisplayString: case WindowsSyscallNumber::NtSetDefaultHardErrorPort:
+      case WindowsSyscallNumber::NtTraceEvent: case WindowsSyscallNumber::NtDisableLastKnownGood: case WindowsSyscallNumber::NtEnableLastKnownGood:
+        return windowsabi::nt_succeed(process, r);
+      case WindowsSyscallNumber::NtQueryDebugFilterState: case WindowsSyscallNumber::NtQueryIntervalProfile: return windowsabi::nt_query_interval_profile(process, r);
+      case WindowsSyscallNumber::NtAllocateUuids: return windowsabi::nt_allocate_uuids(process, r);
+      case WindowsSyscallNumber::NtSetUuidSeed: return windowsabi::nt_set_uuid_seed(process, r);
+      case WindowsSyscallNumber::NtPowerInformation: return windowsabi::nt_power_information(process, r);
+      case WindowsSyscallNumber::NtSetThreadExecutionState: return windowsabi::nt_set_thread_execution_state(process, r);
+      case WindowsSyscallNumber::NtRaiseHardError: return windowsabi::nt_raise_hard_error(process, r);
+      case WindowsSyscallNumber::NtMakeTemporaryObject: return windowsabi::nt_make_object_temporary(process, r);
+      case WindowsSyscallNumber::NtMakePermanentObject: return windowsabi::nt_make_object_permanent(process, r);
+      case WindowsSyscallNumber::NtSetSystemTime: case WindowsSyscallNumber::NtSetSystemInformation: case WindowsSyscallNumber::NtLoadDriver: case WindowsSyscallNumber::NtUnloadDriver:
+      case WindowsSyscallNumber::NtShutdownSystem: case WindowsSyscallNumber::NtInitiatePowerAction: case WindowsSyscallNumber::NtSetSystemPowerState:
+      case WindowsSyscallNumber::NtCreatePagingFile: case WindowsSyscallNumber::NtSystemDebugControl: case WindowsSyscallNumber::NtSetLdtEntries:
+        return windowsabi::nt_privilege_not_held(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.
       default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return is_service(r.number) ? kStatusNotImplemented : kStatusInvalidSystemService;

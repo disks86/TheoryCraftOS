@@ -403,6 +403,24 @@ uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r) {
 }
 
 // NtResumeThread(HANDLE Thread, PULONG PreviousSuspendCount)
+// NtAlertThread(HANDLE): the thread's next alertable wait ends with STATUS_ALERTED (or its current one does).
+uint32_t nt_alert_thread(Process& p, const SyscallRequest& r) {
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  if (record->finished) return 0xC0000001u;
+  record->alert_pending = true;
+  if (p.runtime()) p.runtime()->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();
+  return kSuccess;
+}
+
+// NtAlertResumeThread(HANDLE, PULONG PreviousSuspendCount)
+uint32_t nt_alert_resume_thread(Process& p, const SyscallRequest& r) {
+  const uint32_t status = nt_resume_thread(p, r);
+  if (status != kSuccess) return status;
+  return nt_alert_thread(p, r);
+}
+
 uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
   if (thread_handle_lacks(p, r.args[0], 0x2)) return 0xC0000022u;
   uint64_t remote_id = 0;

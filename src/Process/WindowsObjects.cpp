@@ -246,7 +246,7 @@ constexpr uint32_t kAccessDeniedStatus = 0xC0000022u, kPrivilegeNotHeld = 0xC000
 uint32_t map_sync_access(ObjectKind kind, uint32_t desired, bool opening, uint32_t* granted) {
   const bool modifiable = kind != ObjectKind::Mutex;
   const uint32_t all = 0x1F0001u | (modifiable ? 2u : 0u);
-  if (kind != ObjectKind::Event && kind != ObjectKind::Mutex && kind != ObjectKind::Semaphore && kind != ObjectKind::Timer) { *granted = all; return kSuccess; }
+  if (kind != ObjectKind::Event && kind != ObjectKind::Mutex && kind != ObjectKind::Semaphore && kind != ObjectKind::Timer && kind != ObjectKind::KeyedEvent) { *granted = all; return kSuccess; }
   uint32_t access = desired;
   if (access & 0x80000000u) access |= 0x20001u;      // GENERIC_READ
   if (access & 0x40000000u) access |= modifiable ? 0x20002u : 0x20000u;      // GENERIC_WRITE
@@ -389,6 +389,13 @@ uint32_t object_of(Process& p, uint64_t handle, DescriptorKind kind) {
   return uint32_t(p.files().token(slot));
 }
 
+// Why a handle is no use for a call: it names an object of another kind (STATUS_OBJECT_TYPE_MISMATCH) or no object (STATUS_INVALID_HANDLE).
+uint32_t bad_object_status(Process& p, uint64_t handle) {
+  uint64_t slot = 0;
+  if (handle == ~uint64_t{0} || handle == ~uint64_t{1}) return kTypeMismatch;
+  return slot_of(handle, &slot) && p.files().kind(slot) != DescriptorKind::Closed ? kTypeMismatch : kInvalidHandle;
+}
+
 uint32_t put_previous(Process& p, uint64_t address, int32_t value) {
   if (address == 0) return kSuccess;
   const uint8_t raw[4] = {uint8_t(value), uint8_t(value >> 8), uint8_t(value >> 16), uint8_t(value >> 24)};
@@ -471,6 +478,7 @@ uint32_t wait_for(Process& p, const Waitable* items, uint32_t count, bool all, u
       Process::ThreadRecord* me = p.find_thread(waiter);
       for (uint32_t i = 0; me && i < fired_count; ++i) Process::queue_apc(*me, Process::ThreadRecord::Apc{fired[i].routine, fired[i].context, fired[i].time & 0xFFFFFFFFu, fired[i].time >> 32});
       if (me && me->apc_count > 0) { sync.unlock(); return kUserApc; }
+      if (me && me->alert_pending) { me->alert_pending = false; sync.unlock(); return kAlerted; }      // (NtAlertThread)
     }
     int64_t chosen = -1;
     if (all) {
@@ -545,7 +553,7 @@ uint32_t nt_set_event(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Event);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects || !id) return objects ? bad_object_status(p, r.args[0]) : kNotImplemented;
   int32_t previous = 0;
   const uint32_t status = objects->set_event(id, &previous);
   return status != kSuccess ? status : put_previous(p, r.args[1], previous);
@@ -567,7 +575,7 @@ uint32_t nt_pulse_event(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Event);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects || !id) return objects ? bad_object_status(p, r.args[0]) : kNotImplemented;
   int32_t previous = 0;
   const uint32_t status = objects->pulse_event(id, &previous);
   return status != kSuccess ? status : put_previous(p, r.args[1], previous);
@@ -579,10 +587,10 @@ uint32_t nt_open_mutant(Process& p, const SyscallRequest& r) { return open_objec
 uint32_t nt_release_mutant(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Mutex);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects || !id) return objects ? bad_object_status(p, r.args[0]) : kNotImplemented;
   int32_t previous = 0;
   const uint32_t status = objects->release_mutex(id, p.runtime() ? p.runtime()->current_thread_id() : p.id(), &previous);
-  return status != kSuccess ? status : put_previous(p, r.args[1], previous);
+  return status != kSuccess ? status : put_previous(p, r.args[1], 1 - previous);      // (the count of a mutant: 1 when free, one less for each time it is held)
 }
 
 // NtCreateSemaphore(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, LONG InitialCount, LONG MaximumCount)
@@ -596,7 +604,7 @@ uint32_t nt_release_semaphore(Process& p, const SyscallRequest& r) {
   if (!handle_allows(p, r.args[0], 2)) return kAccessDeniedStatus;
   ObjectManager* objects = system_objects();
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Semaphore);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects || !id) return objects ? bad_object_status(p, r.args[0]) : kNotImplemented;
   int32_t previous = 0;
   const uint32_t status = objects->release_semaphore(id, int32_t(uint32_t(r.args[1])), &previous);
   return status != kSuccess ? status : put_previous(p, r.args[2], previous);
@@ -607,6 +615,7 @@ uint32_t nt_wait_for_single_object(Process& p, const SyscallRequest& r) {
   if (r.args[0] == ~uint64_t{0} || r.args[0] == ~uint64_t{1}) w.type = Waitable::Never;      // the pseudo handles of the running process and thread: signalled when it ends, and it is running
   else if (!resolve(p, r.args[0], &w)) {
     uint64_t slot = 0;
+    if (slot_of(r.args[0], &slot) && (is_object_kind(p.files().kind(slot)) || p.files().kind(slot) == DescriptorKind::Thread) && (p.files().denied_access(slot) & 0x100000u)) return kAccessDeniedStatus;      // (no SYNCHRONIZE right)
     return slot_of(r.args[0], &slot) && p.files().kind(slot) != DescriptorKind::Closed ? kTypeMismatch : kInvalidHandle;
   }
   bool fault = false;
@@ -904,7 +913,7 @@ uint32_t nt_set_timer(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &resume) || !argument(p, r, 5, &period) || !argument(p, r, 6, &previous_at)) return kAccessViolation;
   ObjectManager* objects = system_objects();
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Timer);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects || !id) return objects ? bad_object_status(p, r.args[0]) : kNotImplemented;
   uint64_t raw = 0;
   if (r.args[1] == 0 || !p.read_user_u64(r.args[1], &raw)) return kAccessViolation;
   const int32_t period_ms = int32_t(uint32_t(period));
@@ -927,7 +936,7 @@ uint32_t nt_set_timer(Process& p, const SyscallRequest& r) {
 uint32_t nt_cancel_timer(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Timer);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects || !id) return objects ? bad_object_status(p, r.args[0]) : kNotImplemented;
   bool was = false;
   const uint32_t status = objects->cancel_timer(id, &was);
   if (status != kSuccess) return status;
@@ -940,7 +949,7 @@ uint32_t nt_query_timer(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &returned)) return kAccessViolation;
   ObjectManager* objects = system_objects();
   const uint32_t id = object_of(p, r.args[0], DescriptorKind::Timer);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects || !id) return objects ? bad_object_status(p, r.args[0]) : kNotImplemented;
   if (uint32_t(r.args[1]) != 0) return 0xC0000003u;
   if (uint32_t(r.args[3]) < 16) return 0xC0000004u;
   uint64_t remaining = 0;
