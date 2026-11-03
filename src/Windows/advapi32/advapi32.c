@@ -75,6 +75,7 @@ static BOOL wequal_ignore_case(const WCHAR *a, const WCHAR *b) {
 }
 
 #include "registry.inc"
+#include "registry2.inc"
 
 /* ---- the user name, and crypto randomness ---------------------------------------------------------------------------------------------------------------- */
 

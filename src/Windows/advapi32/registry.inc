@@ -377,7 +377,6 @@ EXPORT LSTATUS WINAPI RegDeleteTreeW(HKEY key, LPCWSTR sub) {
   if (opened != key) { RegCloseKey(opened); result = RegDeleteKeyW(key, sub); }
   return result;
 }
-EXPORT LSTATUS WINAPI RegNotifyChangeKeyValue(HKEY key, BOOL watch_subtree, DWORD filter, HANDLE event, BOOL asynchronous) { (void)watch_subtree; (void)filter; (void)event; (void)asynchronous; return handle_of(key) ? ERROR_SUCCESS : ERROR_INVALID_HANDLE; }
 
 /* ---- ANSI forms ----------------------------------------------------------------------------------------------------------------------------------------------- */
 
