@@ -26,6 +26,8 @@
 
 namespace process {
 
+extern void (*g_win32k_process_exited)(uint64_t pid);      // (WindowsSyscalls.cpp; set by win32k::install())
+
 void (*g_process_log)(const char* text) = nullptr;
 void process_log(StringView text) {
   if (!g_process_log) return;
@@ -95,6 +97,7 @@ void Process::terminate(uint32_t code) {
   if (runtime_) runtime_->notify();
   windowsabi::debug_process_exited(id_, code);
   windowsabi::token_process_exited(id_);
+  if (g_win32k_process_exited) g_win32k_process_exited(id_);      // (its windows, device contexts and other win32k objects go)
   if (ObjectManager* objects = system_objects()) {      // what it owned is abandoned; whoever waits for it or for them looks again
     objects->abandon_process(id_);
     objects->pipe_owner_gone(id_);      // (what its threads wait for on a pipe is cancelled)

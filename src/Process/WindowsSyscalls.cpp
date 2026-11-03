@@ -42,6 +42,10 @@
 // WindowsSyscallNumber), not those of any one Windows build, which change from release to release. Results are NTSTATUS values.
 namespace process {
 
+// win32k (src/Process/Win32k) hooks itself in here when install()ed; without it the services of win32k answer STATUS_NOT_IMPLEMENTED.
+uint64_t (*g_win32k_dispatch)(Process&, const SyscallRequest&, bool* handled) = nullptr;
+void (*g_win32k_process_exited)(uint64_t pid) = nullptr;
+
 namespace {
 
 constexpr uint32_t kStatusSuccess = 0, kStatusNoYield = 0x40000024u, kStatusNotImplemented = 0xC0000002u, kStatusInvalidHandle = 0xC0000008u,
@@ -339,7 +343,13 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtFlushKey: return windowsabi::nt_flush_key(process, r);
       case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       // A service of the list that has no code yet answers like a real kernel does for a call it does not support; a number outside the list is no service.
-      default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return is_service(r.number) ? kStatusNotImplemented : kStatusInvalidSystemService;
+      default:
+        if (r.number >= kWin32kServiceBase && r.number < kWin32kServiceEnd && g_win32k_dispatch) {
+          bool handled = false;
+          const uint64_t result = g_win32k_dispatch(process, r, &handled);
+          if (handled) return result;
+        }
+        process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return is_service(r.number) ? kStatusNotImplemented : kStatusInvalidSystemService;
     }
   }
 };
