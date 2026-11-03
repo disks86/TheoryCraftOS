@@ -163,7 +163,6 @@ NT_SERVICE(NtGetNextThread);
 NT_SERVICE(NtGetNotificationResourceManager);
 NT_SERVICE(NtGetPlugPlayEvent);
 NT_SERVICE(NtGetWriteWatch);
-NT_SERVICE(NtImpersonateAnonymousToken);
 NT_SERVICE(NtImpersonateClientOfPort);
 NT_SERVICE(NtImpersonateThread);
 NT_SERVICE(NtInitializeEnclave);

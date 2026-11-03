@@ -336,6 +336,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSetValueKey: return windowsabi::nt_set_value_key(process, r);
       case WindowsSyscallNumber::NtDeleteKey: return windowsabi::nt_delete_key(process, r);
       case WindowsSyscallNumber::NtDeleteValueKey: return windowsabi::nt_delete_value_key(process, r);
+      case WindowsSyscallNumber::NtShutdownSystem: return windowsabi::nt_shutdown_system(process, r);
       case WindowsSyscallNumber::NtFlushKey: return windowsabi::nt_flush_key(process, r);
       case WindowsSyscallNumber::NtRenameKey: return windowsabi::nt_rename_key(process, r);
       case WindowsSyscallNumber::NtQueryMultipleValueKey: return windowsabi::nt_query_multiple_value_key(process, r);

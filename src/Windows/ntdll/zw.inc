@@ -186,7 +186,6 @@ ZW_SERVICE(NtGetNextThread, ZwGetNextThread);
 ZW_SERVICE(NtGetNotificationResourceManager, ZwGetNotificationResourceManager);
 ZW_SERVICE(NtGetPlugPlayEvent, ZwGetPlugPlayEvent);
 ZW_SERVICE(NtGetWriteWatch, ZwGetWriteWatch);
-ZW_SERVICE(NtImpersonateAnonymousToken, ZwImpersonateAnonymousToken);
 ZW_SERVICE(NtImpersonateClientOfPort, ZwImpersonateClientOfPort);
 ZW_SERVICE(NtImpersonateThread, ZwImpersonateThread);
 ZW_SERVICE(NtInitializeEnclave, ZwInitializeEnclave);

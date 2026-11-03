@@ -1373,50 +1373,6 @@ __declspec(dllexport) BOOL WINAPI LookupAccountNameW( LPCWSTR lpSystemName, LPCW
     return FALSE;
 }
 
-/******************************************************************************
- * AccessCheckAndAuditAlarmA [ADVAPI32.@]
- */
-__declspec(dllexport) BOOL WINAPI AccessCheckAndAuditAlarmA(LPCSTR Subsystem, LPVOID HandleId, LPSTR ObjectTypeName,
-  LPSTR ObjectName, PSECURITY_DESCRIPTOR SecurityDescriptor, DWORD DesiredAccess,
-  PGENERIC_MAPPING GenericMapping, BOOL ObjectCreation, LPDWORD GrantedAccess,
-  LPBOOL AccessStatus, LPBOOL pfGenerateOnClose)
-{
-	
-	return TRUE;
-}
-
-__declspec(dllexport) BOOL WINAPI ObjectCloseAuditAlarmA(LPCSTR SubsystemName, LPVOID HandleId, BOOL GenerateOnClose)
-{
-    
-
-    return TRUE;
-}
-
-__declspec(dllexport) BOOL WINAPI ObjectOpenAuditAlarmA(LPCSTR SubsystemName, LPVOID HandleId, LPSTR ObjectTypeName,
-  LPSTR ObjectName, PSECURITY_DESCRIPTOR pSecurityDescriptor, HANDLE ClientToken, DWORD DesiredAccess,
-  DWORD GrantedAccess, PPRIVILEGE_SET Privileges, BOOL ObjectCreation, BOOL AccessGranted,
-  LPBOOL GenerateOnClose)
-{
-	
-
-    return TRUE;
-}
-
-__declspec(dllexport) BOOL WINAPI ObjectPrivilegeAuditAlarmA( LPCSTR SubsystemName, LPVOID HandleId, HANDLE ClientToken,
-  DWORD DesiredAccess, PPRIVILEGE_SET Privileges, BOOL AccessGranted)
-{
-    
-
-    return TRUE;
-}
-
-__declspec(dllexport) BOOL WINAPI PrivilegedServiceAuditAlarmA( LPCSTR SubsystemName, LPCSTR ServiceName, HANDLE ClientToken,
-                                   PPRIVILEGE_SET Privileges, BOOL AccessGranted)
-{
-    
-
-    return TRUE;
-}
 
 #define HKEY_SPECIAL_ROOT_FIRST   HKEY_CLASSES_ROOT
 #define HKEY_SPECIAL_ROOT_LAST    HKEY_DYN_DATA

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Process/WindowsSystem.hpp"
 #include "Jit/CodePageSource.hpp"
 #include "Jit/CrossCoreTlbShootdown.hpp"
 #include "Jit/KernelCodeMemory.hpp"
@@ -1079,6 +1080,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // VMware: the host's power and window-size commands over the backdoor message channel (the pointer is taken up with the input devices).
   hardware::VmwareTools vmware_tools;
   bool vmware_restart = false;
+  bool program_restart = false;      // a Windows program called NtShutdownSystem(restart)
   if (hardware::Backdoor::probe()) {
     Entry(Level::Ok, "VMware").text("backdoor, version ").dec(hardware::Backdoor::version()).text(", product ").dec(hardware::Backdoor::product());
     if (vmware_tools.start()) Entry(Level::Ok, "VMware").text("tools channel: power commands and window size");
@@ -1975,6 +1977,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       if (hyperv.take_shutdown_request(&hyperv_restart)) desktop.request_shutdown();   // the Hyper-V manager asked
       if (vmware_tools.take_shutdown_request(&vmware_restart)) desktop.request_shutdown();   // so did VMware
+      if (process::windowsabi::take_system_shutdown(&program_restart)) desktop.request_shutdown();   // so did a Windows program (InitiateSystemShutdown, ExitWindowsEx)
 #ifdef TCOS_AMD_VEGAM
       if (vega_m) {   // the Vega M's interrupt ring: faults wedge the ring they came from. With MSI the ring is read when an interrupt came (and now and then in case one was lost)
         static uint32_t vega_seen = 0, vega_idle = 0;
@@ -2277,6 +2280,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     Entry(Level::Warning, "Shutdown").text("virtio-gpu: ").dec(virtio->timeouts()).text(" commands timed out (the host display was not answering)");
   Entry(Level::Ok, "Shutdown").text("powering off");
 
-  st->runtime_services->reset_system((hyperv_restart || vmware_restart) ? efi::ResetType::Cold : efi::ResetType::Shutdown, efi::kSuccess, 0, nullptr);
+  st->runtime_services->reset_system((hyperv_restart || vmware_restart || program_restart) ? efi::ResetType::Cold : efi::ResetType::Shutdown, efi::kSuccess, 0, nullptr);
   for (;;) cpu.halt();
 }

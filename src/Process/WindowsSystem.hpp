@@ -29,4 +29,10 @@ uint32_t nt_query_system_information(Process& p, const SyscallRequest& r);
 // NtQuerySystemInformationEx(Class, Input, InputLength, Buffer, Length, ReturnLength): the logical processors (107) and the CPU sets (175), else as NtQuerySystemInformation.
 uint32_t nt_query_system_information_ex(Process& p, const SyscallRequest& r);
 
+// NtShutdownSystem(SHUTDOWN_ACTION): 0 shut down, 1 restart, 2 power off. The calling thread needs SeShutdownPrivilege enabled. The request is kept for the desktop's loop, which
+// closes everything down in order and then resets the machine (take_system_shutdown).
+uint32_t nt_shutdown_system(Process& p, const SyscallRequest& r);
+// True once if a program asked for the system to shut down; *restart says whether it should come back up.
+bool take_system_shutdown(bool* restart);
+
 }  // namespace process::windowsabi

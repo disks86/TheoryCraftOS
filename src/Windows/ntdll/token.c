@@ -399,6 +399,46 @@ __declspec(dllexport) NTSTATUS NTAPI NtFilterToken(HANDLE source, ULONG flags, T
     return status;
 }
 
+/* The thread becomes ANONYMOUS LOGON (S-1-5-7): a token that has no privilege and the groups Everyone and Anonymous Logon. It is made from the caller's own, so that the session and
+ * the rest are the same, and set as the impersonation token of the thread. */
+__declspec(dllexport) NTSTATUS NTAPI NtImpersonateAnonymousToken(HANDLE thread)
+{
+    static const BYTE anonymous[12] = {1, 1, 0, 0, 0, 0, 0, 5, 7, 0, 0, 0};
+    static const BYTE everyone[12] = {1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0};
+    TokenData *t;
+    HANDLE source, anon;
+    NTSTATUS status;
+    if (!(t = heap_new(sizeof(*t)))) return STATUS_NO_MEMORY_;
+    status = NtOpenProcessToken(NtCurrentProcess(), TOKEN_QUERY, &source);
+    if (!status) { status = read_token(source, TOKEN_QUERY, t); NtClose(source); }
+    if (status) { heap_drop(t); return status; }
+    t->type = TokenImpersonation;
+    t->level = SecurityImpersonation;
+    memset(&t->user, 0, sizeof(t->user));
+    memcpy(t->user.sid, anonymous, sizeof(anonymous));
+    t->user.attrs = 0;
+    memset(t->groups, 0, sizeof(t->groups));
+    memcpy(t->groups[0].sid, everyone, sizeof(everyone));
+    t->groups[0].attrs = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    memcpy(t->groups[1].sid, anonymous, sizeof(anonymous));
+    t->groups[1].attrs = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    t->ngroups = 2;
+    t->npriv = 0;
+    t->nrestr = 0;
+    t->has_owner = FALSE;
+    t->has_pgroup = FALSE;
+    t->has_dacl = FALSE;
+    t->elevation_type = 1;      /* TokenElevationTypeDefault */
+    t->flags = 0;
+    t->token_id = next_luid();
+    t->auth_id = 0x3e6;         /* ANONYMOUS_LOGON_LUID */
+    status = create_token(t, TOKEN_ALL, FALSE, &anon);
+    heap_drop(t);
+    if (status) return status;
+    status = NtSetInformationThread(thread, ThreadImpersonationToken, &anon, sizeof(anon));
+    NtClose(anon);
+    return status;
+}
 __declspec(dllexport) NTSTATUS NTAPI NtCompareTokens(HANDLE first, HANDLE second, PBOOLEAN equal)
 {
     TokenData *a, *b;
@@ -1708,6 +1748,7 @@ ZW_ALIAS(ZwPrivilegeCheck, NtPrivilegeCheck);
 ZW_ALIAS(ZwAllocateLocallyUniqueId, NtAllocateLocallyUniqueId);
 ZW_ALIAS(ZwCreateToken, NtCreateToken);
 ZW_ALIAS(ZwAccessCheck, NtAccessCheck);
+ZW_ALIAS(ZwImpersonateAnonymousToken, NtImpersonateAnonymousToken);
 ZW_ALIAS(ZwAccessCheckAndAuditAlarm, NtAccessCheckAndAuditAlarm);
 ZW_ALIAS(ZwAccessCheckByTypeAndAuditAlarm, NtAccessCheckByTypeAndAuditAlarm);
 ZW_ALIAS(ZwAccessCheckByTypeResultListAndAuditAlarm, NtAccessCheckByTypeResultListAndAuditAlarm);
