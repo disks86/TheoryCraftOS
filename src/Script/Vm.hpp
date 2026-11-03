@@ -23,8 +23,11 @@
 #pragma once
 #include "Script/Bytecode.hpp"
 #include "Utility/String.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace script {
+
+class VmJit;
 
 enum class ErrorKind : uint8_t { Error, TypeError, RangeError, ReferenceError, SyntaxError };
 
@@ -75,6 +78,12 @@ class Vm {
   }
   uint64_t heap_bytes() const { return heap_bytes_; }
   uint64_t memory_limit() const { return memory_limit_; }
+
+  // --- The JIT (VmJit.hpp): on by default when the kernel has executable code memory. A point is compiled after `hot_threshold` visits (1 compiles at once, which is what
+  // the tests use to make the compiled code run).
+  void set_jit(bool enabled, uint32_t hot_threshold = 40);
+  uint64_t jit_regions() const;   // regions compiled so far
+  uint64_t jit_entries() const;   // times compiled code was entered
 
   // --- Running
   // Runs top-level code (a FunctionCode from the compiler) with `this` the global object. False if it threw (see take_exception()) or hit a limit.
@@ -354,6 +363,7 @@ class Vm {
 
  private:
   friend bool install_builtins(Vm& vm);
+  friend class VmJit;
   struct Frame {
     FunctionCode* code;
     uint32_t pc;
@@ -502,6 +512,7 @@ class Vm {
   void* user_ = nullptr;
   void* extension_ = nullptr;
   uint32_t gc_hold_ = 0;
+  UniquePointer<VmJit> jit_;
 };
 
 // Defines the global functions and objects (Object, Array, String, Math, JSON, console, ...). Called by the Vm constructor.

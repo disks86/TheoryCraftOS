@@ -23,11 +23,16 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "Jit/KernelJit.hpp"
 #include "Script/Engine.hpp"
+#include "JitHost.hpp"
 
 using namespace script;
 
 static int g_failed = 0;
+static jit::HostCodeMemory g_code_memory;
+static bool g_jit = false;   // the whole suite runs twice: by the interpreter alone, then with every region compiled at its first visit
+static uint64_t g_regions = 0, g_entries = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
 struct TestAllocator final : allocators::IAllocator {
@@ -57,9 +62,12 @@ static std::string eval(const char* source) {
   {
     TestHost host;
     Engine e(a, &host);
+    e.vm().set_jit(g_jit, 1);
     String error(a), result(a);
     if (e.run(source, &error, &result)) out = std::string(result.c_str());
     else out = std::string("ERR: ") + error.c_str();
+    g_regions += e.vm().jit_regions();
+    g_entries += e.vm().jit_entries();
   }
   if (a.live != 0) {
     printf("   leak (%d cells) after: %s\n", a.live, source);
@@ -380,6 +388,8 @@ static void test_limits_and_collector() {
     {
       TestHost host;
       Engine e(a, &host);
+      e.vm().set_jit(g_jit, 1);
+    e.vm().set_jit(g_jit, 1);
       e.set_limits(200000, 32u << 20);
       String error(a), result(a);
       CHECK(!e.run("while (true) {}", &error, &result) && std::string(error.c_str()).find("ran too long") != std::string::npos);
@@ -412,6 +422,7 @@ static void test_damaged_programs() {
   {
     TestHost host;
     Engine e(a, &host);
+    e.vm().set_jit(g_jit, 1);
     e.set_limits(100000, 16u << 20);
     String error(a), result(a);
     const uint64_t n = strlen(kProgram);
@@ -465,6 +476,7 @@ static void test_host_integration() {
   {
     TestHost host;
     Engine e(a, &host);
+    e.vm().set_jit(g_jit, 1);
     String error(a), result(a);
     CHECK(e.run("console.log('hi', 1, [1, 'a'], { x: 1 }); console.warn('w'); console.error(new Error('e'));", &error, &result));
     CHECK(host.console_lines.size() == 3 && host.console_lines[0] == "0:hi 1 [1, 'a'] {x: 1}" && host.console_lines[1] == "2:w" && host.console_lines[2] == "3:Error: e");
@@ -493,6 +505,7 @@ static std::string eval_after(const char* setup, const char* check, std::vector<
   {
     TestHost host;
     Engine e(a, &host);
+    e.vm().set_jit(g_jit, 1);
     String error(a), result(a);
     if (!e.run(setup, &error, &result)) out = std::string("ERR: ") + error.c_str();
     else if (e.run(check, &error, &result)) out = std::string(result.c_str());
@@ -522,6 +535,7 @@ static bool timed(const char* setup, const char* check, const char* expected) {
   {
     TestHost host;
     Engine e(a, &host);
+    e.vm().set_jit(g_jit, 1);
     String error(a), result(a);
     if (!e.run(setup, &error, &result)) out = std::string("ERR: ") + error.c_str();
     else {
@@ -566,6 +580,8 @@ static void test_promises() {
     {
       TestHost host;
       Engine e(a, &host);
+      e.vm().set_jit(g_jit, 1);
+    e.vm().set_jit(g_jit, 1);
       String error(a), result(a);
       CHECK(e.run("var log = []; setTimeout(() => log.push('timer1'), 0); setTimeout(() => { log.push('timer2'); Promise.resolve().then(() => log.push('micro-in-timer2')); }, 0); setTimeout(() => log.push('timer3'), 0); Promise.resolve().then(() => log.push('micro'));", &error, &result));
       CHECK(e.run_timers(10, &error) == 0);
@@ -961,8 +977,86 @@ static void test_json() {
   CHECK(is("var s = ''; for (var i = 0; i < 600; i++) s += '['; try { JSON.parse(s); } catch (e) { e.name; }", "SyntaxError"));
 }
 
-int main() {
-  setvbuf(stdout, nullptr, _IONBF, 0);
+
+// Scripts that make the JIT work: hot loops over numbers, arrays, bit operations, mixed types, exceptions from inside compiled code, long loops. Each is run by the
+// interpreter alone and with every region compiled at its first visit; the answers must be the same.
+static std::string eval_with(const char* source, bool use_jit, uint64_t* regions = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    TestHost host;
+    Engine e(a, &host);
+    e.vm().set_jit(use_jit, 1);
+    String error(a), result(a);
+    if (e.run(source, &error, &result)) out = std::string(result.c_str());
+    else out = std::string("ERR: ") + error.c_str();
+    if (regions) *regions = e.vm().jit_regions();
+  }
+  if (a.live != 0) {
+    printf("   leak (%d cells) after: %s\n", a.live, source);
+    ++g_failed;
+  }
+  return out;
+}
+
+static void test_jit_scripts() {
+  static const char* const scripts[] = {
+      "function f(n){var s=0;for(var i=0;i<n;i++){s+=i*2-1;}return s;} f(100000)",
+      "function f(n){var s=0.5;for(var i=1;i<=n;i++){s=s+1/i;}return s;} f(5000)",
+      "function f(n){var a=[];for(var i=0;i<n;i++)a[i]=i*i;var s=0;for(var j=0;j<a.length;j++)s+=a[j];return s;} f(3000)",
+      "function f(n){var h=0;for(var i=0;i<n;i++){h=((h<<5)-h+i)|0;h^=h>>>3;}return h;} f(20000)",
+      "function f(n){var h=1;for(var i=0;i<n;i++){h=(h*31+i)&0xFFFFFFFF;h=h>>>0;}return h;} f(20000)",
+      "function f(n){var h=0;for(var i=0;i<n;i++){h=h+(i*4294967296.5)|0;}return h;} f(300)",
+      "function f(n){var s='';for(var i=0;i<n;i++){s+=i;}return s.length;} f(500)",
+      "function f(n){var c=0;for(var i=0;i<n;i++){if(i%3==0||i%5==0)c++;}return c;} f(5000)",
+      "function f(n){var c=0;for(var i=0;i<n;i++){if(i<10&&i>2||i===77)c+=2;else if(!(i&1))c+=1;}return c;} f(3000)",
+      "function f(){var x=NaN,c=0;for(var i=0;i<20;i++){if(x==x)c++;if(x<1)c++;if(!x)c+=10;}return c;} f()",
+      "function f(){var a=[1,2,3];var s=0;for(var i=-2;i<6;i++){s+=a[i]||100;}return s;} f()",
+      "function f(){var a=[1,,3,undefined];var s='';for(var i=0;i<5;i++){s+=a[i]+',';}return s;} f()",
+      "function f(){var a=[0,0,0];for(var i=0;i<6;i++){a[i]=i+0.5;}return a.length+':'+a.join('|');} f()",
+      "function f(){var o={x:1,y:2};var s=0;for(var i=0;i<1000;i++){s+=o.x+o.y;o.x=o.x+1;}return s;} f()",
+      "function f(){var s=0;for(var i=0;i<500;i++){try{if(i%100==99)null.x;s+=i;}catch(e){s-=1;}}return s;} f()",
+      "function f(){var s=0;for(var i=0;i<100;i++){s+=Math.floor(i/3)+Math.max(i,50);}return s;} f()",
+      "function g(x){return x*2;} function f(){var s=0;for(var i=0;i<2000;i++){s+=g(i);}return s;} f()",
+      "function f(){var i=0;do{i+=3;}while(i<1000);var j=100;while(j>0){j-=7;}return i+':'+j;} f()",
+      "function f(){var s=0;for(var i=0;i<10;i++){for(var k=0;k<i;k++){s+=k^i;}}return s;} f()",
+      "function f(){var a='5';var s=0;for(var i=0;i<30;i++){s+=a*2+(a-1)+(a>3?1:0)+(a+1).length;}return s;} f()",
+      "function f(){var n=0;for(var i=0;i<30;i++){n+=-i+(+i)+~i+(i++)+(i--)-(--i);}return n;} f()",
+      "function f(){var v=[3,1,2];var m=0;for(var i=0;i<v.length;i++){m=v[i]>m?v[i]:m;}return m;} f()",
+      "function f(){var x;var s=0;for(var i=0;i<20;i++){x=i%2?undefined:null;s+=(x??5);}return s;} f()",
+      "function f(){let s=0;for(let i=0;i<10;i++){const k=i*2;s+=k;}return s;} f()",
+      "function f(){var s=0;for(var i=0;i<100000;i++){s=(s+i)%1000003;}return s;} f()",
+      "var t=0;for(var i=0;i<3000;i++){t+=i%7;} t",
+      "var a=[];for(var i=0;i<400;i++){a.push(i*3);} var s=0;for(var k=0;k<a.length;k++){s+=a[k];} s",
+      "function f(){var u=new Uint8Array(16);for(var i=0;i<40;i++){u[i%16]=u[i%16]+i;}var s=0;for(var j=0;j<16;j++)s+=u[j];return s;} f()",
+      "function f(){var s=0;for(var i=0;i<50;i++){s+=typeof i==='number'?1:0;s+=(''+i).length;}return s;} f()",
+      "function f(){var big=0;for(var i=0;i<60;i++){big=big*2+1;}return big+':'+(big|0)+':'+(big>>>1);} f()",
+      "function f(){var z=0;for(var i=0;i<5;i++){z=z-0;}return 1/z+':'+(1/-z)+':'+(-z);} f()",
+  };
+  for (const char* script : scripts) {
+    uint64_t regions = 0;
+    const std::string want = eval_with(script, false);
+    const std::string got = eval_with(script, true, &regions);
+    if (want != got) {
+      printf("JIT differs on: %s\n   interpreter: %s\n   jit:         %s\n", script, want.c_str(), got.c_str());
+      ++g_failed;
+    }
+  }
+  // A loop that never ends is stopped by the budget whether or not it is compiled.
+  for (bool use_jit : {false, true}) {
+    TestAllocator a;
+    TestHost host;
+    Engine e(a, &host);
+    e.vm().set_jit(use_jit, 1);
+    e.set_limits(200000, 64u << 20);
+    String error(a), result(a);
+    CHECK(!e.run("var i=0; while(true){i=i+1;}", &error, &result));
+    CHECK(std::string(error.c_str()).find("too long") != std::string::npos);
+    if (use_jit) CHECK(e.vm().jit_regions() > 0);
+  }
+}
+
+static void run_all() {
   test_expressions();
   test_variables_and_functions();
   test_control_flow();
@@ -990,8 +1084,22 @@ int main() {
   test_async_generators();
   test_eval_and_timers();
   test_async_functions();
+  test_jit_scripts();
+}
+
+int main() {
+  setvbuf(stdout, nullptr, _IONBF, 0);
+  jit::set_kernel_code_memory(&g_code_memory);
+  g_jit = false;
+  run_all();
+  const int failed_interpreted = g_failed;
+  g_jit = true;
+  run_all();
+  printf("with the JIT: %llu regions compiled in the scripts of eval(), entered %llu times\n", (unsigned long long)g_regions, (unsigned long long)g_entries);
+  CHECK(g_regions > 0);
+  CHECK(g_entries > 0);
   if (g_failed) {
-    printf("%d check(s) failed\n", g_failed);
+    printf("%d check(s) failed (%d without the JIT)\n", g_failed, failed_interpreted);
     return 1;
   }
   printf("script tests passed\n");

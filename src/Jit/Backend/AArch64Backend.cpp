@@ -192,6 +192,111 @@ bool AArch64Backend::compile(const IrBlock& block, CodeBuffer& out) {
         as.blr(kScratch);
         write(inst.dst, 0);
         break;
+      case IrOp::LoadPtr: case IrOp::StorePtr: {
+        // The address a + imm goes to x16 (x17 holds a large offset); the access itself has no offset.
+        const A64Reg a = read(0, inst.a);
+        A64Reg address = a;
+        if (inst.imm != 0) {
+          as.mov_imm(17, static_cast<uint64_t>(inst.imm));
+          as.add_rr(kScratch, a, 17);
+          address = kScratch;
+        }
+        if (inst.op == IrOp::StorePtr) {
+          const A64Reg v = read(1, inst.b);
+          switch (inst.mem) {
+            case IrMem::U8: as.strb(v, address); break;
+            case IrMem::U16: as.strh(v, address); break;
+            case IrMem::U32: as.str_w(v, address); break;
+            case IrMem::U64: as.str(v, address, 0); break;
+            default: return false;
+          }
+          break;
+        }
+        const A64Reg d = target(inst.dst);
+        switch (inst.mem) {
+          case IrMem::U8: as.ldrb(d, address); break;
+          case IrMem::U16: as.ldrh(d, address); break;
+          case IrMem::U32: as.ldr_w(d, address); break;
+          case IrMem::U64: as.ldr(d, address, 0); break;
+          case IrMem::S8: as.ldrsb(d, address); break;
+          case IrMem::S16: as.ldrsh(d, address); break;
+          case IrMem::S32: as.ldrsw(d, address); break;
+        }
+        write(inst.dst, d);
+        break;
+      }
+      case IrOp::FAdd: case IrOp::FSub: case IrOp::FMul: case IrOp::FDiv: {
+        if (!floating_point_) return false;
+        as.fmov_to_d(0, read(0, inst.a));
+        as.fmov_to_d(1, read(1, inst.b));
+        if (inst.op == IrOp::FAdd) as.fadd(0, 0, 1);
+        else if (inst.op == IrOp::FSub) as.fsub(0, 0, 1);
+        else if (inst.op == IrOp::FMul) as.fmul(0, 0, 1);
+        else as.fdiv(0, 0, 1);
+        as.fmov_from_d(0, 0);
+        write(inst.dst, 0);
+        break;
+      }
+      case IrOp::FSetCond: {
+        if (!floating_point_) return false;
+        as.fmov_to_d(0, read(0, inst.a));
+        as.fmov_to_d(1, read(1, inst.b));
+        as.fcmp(0, 1);
+        // fcmp of a NaN sets N=0 Z=0 C=1 V=1, which makes each of these false (and "not equal" true), as the IR defines.
+        A64Cond cond = A64Cond::Eq;
+        switch (inst.cond) {
+          case IrCond::Eq: cond = A64Cond::Eq; break;
+          case IrCond::Ne: cond = A64Cond::Ne; break;
+          case IrCond::Lt: cond = A64Cond::Mi; break;
+          case IrCond::Le: cond = A64Cond::Ls; break;
+          case IrCond::Gt: cond = A64Cond::Gt; break;
+          case IrCond::Ge: cond = A64Cond::Ge; break;
+          default: return false;
+        }
+        const A64Reg d = target(inst.dst);
+        as.cset(d, cond);
+        write(inst.dst, d);
+        break;
+      }
+      case IrOp::I2F:
+        if (!floating_point_) return false;
+        as.scvtf(0, read(0, inst.a));
+        as.fmov_from_d(0, 0);
+        write(inst.dst, 0);
+        break;
+      case IrOp::F2I: {
+        if (!floating_point_) return false;
+        as.fmov_to_d(0, read(0, inst.a));
+        as.fcvtzs(0, 0);
+        // fcvtzs saturates and turns a NaN into 0; the IR says INT64_MIN for a NaN and for anything that does not fit (2^63-1 is not a double, so a result of INT64_MAX
+        // is an overflow).
+        const Label ordered = out.new_label(), fits = out.new_label();
+        as.fcmp(0, 0);   // (d0 still holds the operand)
+        as.b_cond(A64Cond::Vc, ordered);
+        as.mov_imm(0, static_cast<uint64_t>(INT64_MIN));
+        if (!out.bind(ordered)) return false;
+        as.mov_imm(1, static_cast<uint64_t>(INT64_MAX));
+        as.cmp_rr(0, 1);
+        as.b_cond(A64Cond::Ne, fits);
+        as.mov_imm(0, static_cast<uint64_t>(INT64_MIN));
+        if (!out.bind(fits)) return false;
+        write(inst.dst, 0);
+        break;
+      }
+      case IrOp::F2D:
+        if (!floating_point_) return false;
+        as.fmov_to_s(0, read(0, inst.a));
+        as.fcvt_s_to_d(0, 0);
+        as.fmov_from_d(0, 0);
+        write(inst.dst, 0);
+        break;
+      case IrOp::D2F:
+        if (!floating_point_) return false;
+        as.fmov_to_d(0, read(0, inst.a));
+        as.fcvt_d_to_s(0, 0);
+        as.fmov_from_s(0, 0);
+        write(inst.dst, 0);
+        break;
       case IrOp::Label:
         if (!out.bind(labels[static_cast<uint64_t>(inst.imm)])) return false;
         break;

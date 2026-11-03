@@ -61,6 +61,31 @@ class AArch64Assembler {
   // Loads and stores of 64 bits at [base + offset]; the offset is a multiple of 8 in 0..32760.
   bool ldr(A64Reg rt, A64Reg base, uint32_t offset) { return memory(0xF9400000u, rt, base, offset); }
   bool str(A64Reg rt, A64Reg base, uint32_t offset) { return memory(0xF9000000u, rt, base, offset); }
+  // Narrow loads (zero or sign extended to 64 bits) and stores of the low 8 / 16 / 32 bits at [base] (no offset: the back end puts the address in a register).
+  void ldrb(A64Reg rt, A64Reg base) { emit(0x39400000u | base << 5 | rt); }
+  void ldrh(A64Reg rt, A64Reg base) { emit(0x79400000u | base << 5 | rt); }
+  void ldr_w(A64Reg rt, A64Reg base) { emit(0xB9400000u | base << 5 | rt); }
+  void ldrsb(A64Reg rt, A64Reg base) { emit(0x39800000u | base << 5 | rt); }
+  void ldrsh(A64Reg rt, A64Reg base) { emit(0x79800000u | base << 5 | rt); }
+  void ldrsw(A64Reg rt, A64Reg base) { emit(0xB9800000u | base << 5 | rt); }
+  void strb(A64Reg rt, A64Reg base) { emit(0x39000000u | base << 5 | rt); }
+  void strh(A64Reg rt, A64Reg base) { emit(0x79000000u | base << 5 | rt); }
+  void str_w(A64Reg rt, A64Reg base) { emit(0xB9000000u | base << 5 | rt); }
+
+  // Scalar double precision floating point on d0..d31 (given by number); fmov moves the bits between a general and a floating point register.
+  void fmov_to_d(uint8_t d, A64Reg x) { emit(0x9E670000u | x << 5 | d); }
+  void fmov_from_d(A64Reg x, uint8_t d) { emit(0x9E660000u | d << 5 | x); }
+  void fadd(uint8_t d, uint8_t n, uint8_t m) { emit(0x1E602800u | m << 16 | n << 5 | d); }
+  void fsub(uint8_t d, uint8_t n, uint8_t m) { emit(0x1E603800u | m << 16 | n << 5 | d); }
+  void fmul(uint8_t d, uint8_t n, uint8_t m) { emit(0x1E600800u | m << 16 | n << 5 | d); }
+  void fdiv(uint8_t d, uint8_t n, uint8_t m) { emit(0x1E601800u | m << 16 | n << 5 | d); }
+  void fcmp(uint8_t n, uint8_t m) { emit(0x1E602000u | m << 16 | n << 5); }          // unordered: N=0 Z=0 C=1 V=1
+  void scvtf(uint8_t d, A64Reg x) { emit(0x9E620000u | x << 5 | d); }                 // d = (double) signed 64-bit x
+  void fcvtzs(A64Reg x, uint8_t d) { emit(0x9E780000u | d << 5 | x); }                // truncating, saturating; a NaN gives 0
+  void fmov_to_s(uint8_t s, A64Reg w) { emit(0x1E270000u | w << 5 | s); }             // the low 32 bits
+  void fmov_from_s(A64Reg w, uint8_t s) { emit(0x1E260000u | s << 5 | w); }           // zero extended (a write to w clears the upper half)
+  void fcvt_s_to_d(uint8_t d, uint8_t s) { emit(0x1E22C000u | s << 5 | d); }
+  void fcvt_d_to_s(uint8_t s, uint8_t d) { emit(0x1E624000u | d << 5 | s); }
   // STP rt, rt2, [sp, #-bytes]! and LDP rt, rt2, [sp], #bytes: push and pop a pair (bytes a multiple of 8 in 8..504).
   void stp_push(A64Reg rt, A64Reg rt2, uint32_t bytes) { pair(0xA9800000u, rt, rt2, -static_cast<int32_t>(bytes)); }
   void ldp_pop(A64Reg rt, A64Reg rt2, uint32_t bytes) { pair(0xA8C00000u, rt, rt2, static_cast<int32_t>(bytes)); }
