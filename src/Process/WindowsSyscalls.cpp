@@ -316,6 +316,10 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtQuerySystemTime: return nt_query_system_time(process, r);
       case WindowsSyscallNumber::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter: return (r.args[1] == 0 || r.args[2] == 0) ? 0xC0000005u : 0xC00000BBu;      // no auxiliary counter: STATUS_NOT_SUPPORTED
       case WindowsSyscallNumber::NtAllocateVirtualMemory: return windowsabi::nt_allocate_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtAllocateVirtualMemoryEx: return windowsabi::nt_allocate_virtual_memory_ex(process, r);
+      case WindowsSyscallNumber::NtSetInformationVirtualMemory: return windowsabi::nt_set_information_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtAlertThreadByThreadId: return windowsabi::nt_alert_thread_by_thread_id(process, r);
+      case WindowsSyscallNumber::NtWaitForAlertByThreadId: return windowsabi::nt_wait_for_alert_by_thread_id(process, r);
       case WindowsSyscallNumber::NtFreeVirtualMemory: return windowsabi::nt_free_virtual_memory(process, r);
       case WindowsSyscallNumber::NtProtectVirtualMemory: return windowsabi::nt_protect_virtual_memory(process, r);
       case WindowsSyscallNumber::NtReadVirtualMemory: return windowsabi::nt_read_virtual_memory(process, r);

@@ -113,6 +113,10 @@ struct DirectoryEntry {
   uint64_t accessed = 0;                 // the same for the last access; 0 when unknown (no file system here keeps it: the layer above adds it)
   // The times in 100 ns units since 1601 (a FILETIME), when the layer above knows them better than the seconds above; 0 when it does not.
   uint64_t exact_created = 0, exact_modified = 0, exact_accessed = 0;
+  // The identity of the file behind the name, when the file system knows one: every hard link to the same data reports the same id, and link_count says how many names it has.
+  // 0 for both when it does not (the layer above then makes an index of the path and counts one link).
+  uint64_t file_id = 0;
+  uint32_t link_count = 0;
 };
 
 // What SetFileAttributes / SetFileTime change besides the contents; a field is only looked at when its `set_` flag is.

@@ -43,6 +43,8 @@ constexpr uint8_t page_access(uint32_t page) {
 // NtReadVirtualMemory(Process, BaseAddress, Buffer, Size, PSIZE_T Read) and NtWriteVirtualMemory(Process, BaseAddress, Buffer, Size, PSIZE_T Written). Reading and writing
 // stop at the first page that is not committed and answer STATUS_PARTIAL_COPY (0x8000000D) with the count.
 uint32_t nt_allocate_virtual_memory(Process& p, const SyscallRequest& r);
+uint32_t nt_allocate_virtual_memory_ex(Process& p, const SyscallRequest& r);
+uint32_t nt_set_information_virtual_memory(Process& p, const SyscallRequest& r);
 uint32_t nt_free_virtual_memory(Process& p, const SyscallRequest& r);
 uint32_t nt_protect_virtual_memory(Process& p, const SyscallRequest& r);
 uint32_t nt_query_virtual_memory(Process& p, const SyscallRequest& r);

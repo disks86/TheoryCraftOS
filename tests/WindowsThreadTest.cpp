@@ -526,7 +526,64 @@ static void test_process_lists() {
   CHECK(s.call(WindowsSyscallNumber::NtQuerySystemInformation, 0x80, out, 8 + 2 * 112, returned) == 0 && s.memory.get32(out) == 0);      // no such process: an empty list
 }
 
+// NtAlertThreadByThreadId / NtWaitForAlertByThreadId (WaitOnAddress): an alert that comes first is kept, and a wait with nothing to wake it times out.
+static void test_alert_by_thread_id() {
+  Setup s;
+  CHECK(s.call(WindowsSyscallNumber::NtAlertThreadByThreadId, 7) == 0);
+  CHECK(s.call(WindowsSyscallNumber::NtWaitForAlertByThreadId, 0x1000, 0) == 0x101u);      // STATUS_ALERTED at once, with no timeout at all
+  s.memory.put64(kBase + 0x200, uint64_t(-30000));      // 3 ms, relative
+  CHECK(s.call(WindowsSyscallNumber::NtWaitForAlertByThreadId, 0x1000, kBase + 0x200) == 0x102u);      // nothing alerted the thread: STATUS_TIMEOUT
+  CHECK(s.call(WindowsSyscallNumber::NtAlertThreadByThreadId, 99) == 0xC000000Bu);      // STATUS_INVALID_CID
+  CHECK(s.call(WindowsSyscallNumber::NtAlertThreadByThreadId, 7) == 0 && s.call(WindowsSyscallNumber::NtAlertThreadByThreadId, 7) == 0);      // (two alerts are one)
+  CHECK(s.call(WindowsSyscallNumber::NtWaitForAlertByThreadId, 0x1000, kBase + 0x200) == 0x101u);
+  CHECK(s.call(WindowsSyscallNumber::NtWaitForAlertByThreadId, 0x1000, kBase + 0x200) == 0x102u);
+}
+
+// NtAllocateVirtualMemoryEx with address requirements, and NtSetInformationVirtualMemory.
+static void test_extended_memory() {
+  Setup s;
+  const uint64_t base_at = kBase + 0x300, size_at = kBase + 0x308, params_at = kBase + 0x400, requirements_at = kBase + 0x500;
+  const uint64_t sp = kBase + 0x1000;
+  auto allocate = [&](uint64_t type, uint64_t protect, uint64_t parameters, uint64_t count) {
+    s.memory.put64(sp + 0x28, protect);
+    s.memory.put64(sp + 0x30, parameters);
+    s.memory.put64(sp + 0x38, count);
+    SyscallRequest r;
+    r.number = uint64_t(WindowsSyscallNumber::NtAllocateVirtualMemoryEx);
+    r.args[0] = ~uint64_t{0}; r.args[1] = base_at; r.args[2] = size_at; r.args[3] = type;
+    r.user_stack = sp;
+    return uint32_t(s.iface->dispatch(s.process, r));
+  };
+  s.memory.put64(base_at, 0); s.memory.put64(size_at, 0x10000);
+  CHECK(allocate(0x3000, 0x04, 0, 0) == 0 && s.memory.get64(base_at) != 0 && s.memory.get64(size_at) == 0x10000);
+  s.memory.put64(base_at, 0); s.memory.put64(size_at, 0x10000);
+  s.memory.put64(params_at, 1);      // MemExtendedParameterAddressRequirements
+  s.memory.put64(params_at + 8, requirements_at);
+  s.memory.put64(requirements_at, 0); s.memory.put64(requirements_at + 8, 0); s.memory.put64(requirements_at + 16, 0x200000);
+  CHECK(allocate(0x3000, 0x04, params_at, 1) == 0 && (s.memory.get64(base_at) & 0x1FFFFF) == 0 && s.memory.get64(base_at) != 0);
+  s.memory.put64(requirements_at + 16, 0x3000);      // not a power of two
+  s.memory.put64(base_at, 0); s.memory.put64(size_at, 0x10000);
+  CHECK(allocate(0x3000, 0x04, params_at, 1) == 0xC000000Du);
+  s.memory.put64(params_at, 4);      // a user physical pages handle is not supported
+  CHECK(allocate(0x3000, 0x04, params_at, 1) == 0xC00000BBu);
+  s.memory.put64(params_at, 9);      // not a kind
+  CHECK(allocate(0x3000, 0x04, params_at, 1) == 0xC000000Du);
+  // NtSetInformationVirtualMemory(process, class, entries, ranges, info, length): VmPrefetchInformation with one range
+  s.memory.put64(kBase + 0x600, 0x10000000); s.memory.put64(kBase + 0x608, 0x2000);
+  s.memory.put64(sp + 0x28, kBase + 0x700); s.memory.put64(sp + 0x30, 4);
+  SyscallRequest r;
+  r.number = uint64_t(WindowsSyscallNumber::NtSetInformationVirtualMemory);
+  r.args[0] = ~uint64_t{0}; r.args[1] = 0; r.args[2] = 1; r.args[3] = kBase + 0x600; r.user_stack = sp;
+  CHECK(uint32_t(s.iface->dispatch(s.process, r)) == 0);
+  r.args[1] = 9;
+  CHECK(uint32_t(s.iface->dispatch(s.process, r)) == 0xC0000003u);      // STATUS_INVALID_INFO_CLASS
+  r.args[1] = 0; r.args[2] = 0;
+  CHECK(uint32_t(s.iface->dispatch(s.process, r)) == 0xC000000Du);
+}
+
 int main() {
+  test_alert_by_thread_id();
+  test_extended_memory();
   test_remote_memory();
   test_process_lists();
   test_create();
