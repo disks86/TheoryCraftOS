@@ -135,7 +135,9 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
     *size_io = reset_size;
     return kStatusSuccess;
   }
-  if (!(type & (kMemCommit | kMemReserve)) || (type & ~uint32_t{kMemCommit | kMemReserve | 0x100000 /*MEM_TOP_DOWN: the search direction is ours to choose*/})) return kStatusInvalidParameter;
+  constexpr uint32_t kMemWriteWatch = 0x200000;      // (kernel32 remembers which regions were asked to be watched: the pages are reported as written)
+  if (!(type & (kMemCommit | kMemReserve)) || (type & ~uint32_t{kMemCommit | kMemReserve | kMemWriteWatch | 0x100000 /*MEM_TOP_DOWN: the search direction is ours to choose*/})) return kStatusInvalidParameter;
+  if ((type & kMemWriteWatch) && !(type & kMemReserve)) return kStatusInvalidParameter;      // MEM_WRITE_WATCH goes with MEM_RESERVE
   if (!page_protection(protect, &prot)) return kStatusInvalidPageProtection;
   if (!space) return kStatusNoMemory;
   if (size == 0) return kStatusInvalidParameter;
@@ -476,6 +478,96 @@ uint32_t nt_allocate_virtual_memory(Process& process, const SyscallRequest& r) {
   }
   if (status != kStatusSuccess) return status;
   return process.write_user_u64(r.args[1], base) && process.write_user_u64(r.args[3], size) ? kStatusSuccess : kStatusAccessViolation;
+}
+
+// NtAllocateVirtualMemoryEx(Process, PVOID* Base, PSIZE_T Size, ULONG Type, ULONG Protect, PMEM_EXTENDED_PARAMETER Parameters, ULONG Count) (VirtualAlloc2, VirtualAllocExNuma):
+// the allocation of NtAllocateVirtualMemory with extended parameters. Address requirements (type 1: lowest/highest address, alignment) are honoured; a NUMA node (2), a partition
+// (3) and attribute flags (5) are accepted and have no effect on this machine's one memory; a physical-pages handle (4) is not supported.
+uint32_t nt_allocate_virtual_memory_ex(Process& process, const SyscallRequest& r) {
+  uint64_t protect = 0, parameters = 0, count = 0, base = 0, size = 0, pid = 0;
+  bool remote = false;
+  if (!argument(process, r, 4, &protect) || !argument(process, r, 5, &parameters) || !argument(process, r, 6, &count)) return kStatusAccessViolation;
+  count = uint32_t(count);
+  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid, 0x8);      // PROCESS_VM_OPERATION
+  if (resolved != kStatusSuccess) return resolved;
+  if (!process.read_user_u64(r.args[1], &base) || !process.read_user_u64(r.args[2], &size)) return kStatusAccessViolation;
+  if (count > 64 || (count != 0 && parameters == 0)) return kStatusInvalidParameter;
+  uint64_t lowest = 0, highest = 0, alignment = 0;
+  for (uint64_t i = 0; i < count; ++i) {
+    uint8_t entry[16];
+    if (!process.read_user(parameters + i * 16, ByteView(entry))) return kStatusAccessViolation;
+    const uint8_t kind = entry[0];
+    if (kind == 1) {
+      uint64_t pointer = 0;
+      for (int k = 0; k < 8; ++k) pointer |= uint64_t(entry[8 + k]) << (8 * k);
+      uint64_t fields[3] = {};
+      if (!process.read_user_u64(pointer, &fields[0]) || !process.read_user_u64(pointer + 8, &fields[1]) || !process.read_user_u64(pointer + 16, &fields[2])) return kStatusAccessViolation;
+      lowest = fields[0]; highest = fields[1]; alignment = fields[2];
+      if (alignment != 0 && ((alignment & (alignment - 1)) != 0 || alignment < 0x1000)) return kStatusInvalidParameter;
+      if (highest != 0 && highest < lowest) return kStatusInvalidParameter;
+    } else if (kind == 4) {
+      return 0xC00000BBu;      // STATUS_NOT_SUPPORTED (user physical pages)
+    } else if (kind == 0 || kind > 5) {
+      return kStatusInvalidParameter;
+    }
+  }
+  auto allocate = [&](uint64_t* b, uint64_t* s, uint32_t type, uint32_t prot) -> uint32_t {
+    if (!remote) return vm_allocate(process, b, s, type, prot);
+    IProcessRuntime::RemoteOp op;
+    op.kind = IProcessRuntime::RemoteOp::Allocate;
+    op.address = *b; op.size = *s; op.type = type; op.protect = prot;
+    const uint32_t status = process.runtime()->remote_operation(pid, op);
+    *b = op.address; *s = op.size;
+    return status;
+  };
+  auto release = [&](uint64_t b) {
+    uint64_t rb = b, rs = 0;
+    if (!remote) { vm_free(process, &rb, &rs, 0x8000u); return; }
+    IProcessRuntime::RemoteOp op;
+    op.kind = IProcessRuntime::RemoteOp::Free;
+    op.address = b; op.size = 0; op.type = 0x8000u;
+    process.runtime()->remote_operation(pid, op);
+  };
+  const uint32_t type = uint32_t(r.args[3]);
+  uint32_t status;
+  if (base == 0 && alignment > 0x10000) {      // reserve more than needed to find an aligned spot, give it back and take exactly that spot
+    uint64_t probe = 0, probe_size = size + alignment;
+    if (probe_size < size) return kStatusInvalidParameter;
+    status = allocate(&probe, &probe_size, 0x2000u, 1);
+    if (status != kStatusSuccess) return status;
+    release(probe);
+    base = (probe + alignment - 1) & ~(alignment - 1);
+  }
+  status = allocate(&base, &size, type, uint32_t(protect));
+  if (status != kStatusSuccess) return status;
+  if ((lowest != 0 && base < lowest) || (highest != 0 && base + size - 1 > highest) || (alignment != 0 && (base & (alignment - 1)) != 0)) {
+    release(base);
+    return kStatusNoMemory;
+  }
+  return process.write_user_u64(r.args[1], base) && process.write_user_u64(r.args[2], size) ? kStatusSuccess : kStatusAccessViolation;
+}
+
+// NtSetInformationVirtualMemory(Process, VmInformationClass, NumberOfEntries, PMEMORY_RANGE_ENTRY Entries, PVOID Info, ULONG InfoLength) (PrefetchVirtualMemory,
+// OfferVirtualMemory/ReclaimVirtualMemory/DiscardVirtualMemory, SetProcessValidCallTargets): prefetching, page priorities and call-target lists are hints a machine with one
+// kind of memory and no control-flow guard can only accept; the entries are checked to be inside the address space.
+uint32_t nt_set_information_virtual_memory(Process& process, const SyscallRequest& r) {
+  uint64_t info = 0, length = 0, pid = 0;
+  bool remote = false;
+  if (!argument(process, r, 4, &info) || !argument(process, r, 5, &length)) return kStatusAccessViolation;
+  const uint32_t resolved = resolve(process, r.args[0], &remote, &pid, 0x8);      // PROCESS_VM_OPERATION
+  if (resolved != kStatusSuccess) return resolved;
+  const uint32_t klass = uint32_t(r.args[1]);
+  if (klass > 4) return 0xC0000003u;      // STATUS_INVALID_INFO_CLASS
+  const uint64_t entries = r.args[2];
+  if (entries == 0 || entries > 4096) return kStatusInvalidParameter;
+  for (uint64_t i = 0; i < entries; ++i) {
+    uint64_t at = 0, bytes = 0;
+    if (!process.read_user_u64(r.args[3] + i * 16, &at) || !process.read_user_u64(r.args[3] + i * 16 + 8, &bytes)) return kStatusAccessViolation;
+    if (at >= 0x800000000000ull || bytes == 0 || bytes > 0x800000000000ull - at) return kStatusInvalidParameter;      // (zero-length or beyond the user half)
+  }
+  if (klass == 0 && length != 4) return kStatusInvalidParameter;      // VmPrefetchInformation: ULONG flags
+  if (klass == 1 && length != 4) return kStatusInvalidParameter;      // VmPagePriorityInformation: ULONG priority
+  return kStatusSuccess;
 }
 
 // NtFreeVirtualMemory(Process, PVOID* Base, PSIZE_T Size, ULONG FreeType)

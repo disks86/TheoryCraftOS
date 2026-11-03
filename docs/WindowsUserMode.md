@@ -316,6 +316,39 @@ need real windows.
   done yet.
   A call to an import that nothing provides stops the program with a message saying which one.
 
+## The kernel32 export audit (the last batch)
+
+`src/Windows/kernel32/extra4.inc` carries the exports of a real kernel32.dll/kernelbase.dll that were still stubs (about 450 of them; `src/Windows/stubs/kernel32.inc` now lists only
+what cannot or should not be implemented, see below). Two system services came with it, and two more were made to serve `VirtualAlloc2`:
+
+- **`NtAlertThreadByThreadId` / `NtWaitForAlertByThreadId`** (118, 491; `WindowsObjects.cpp`): a flag on the thread's record. An alert that arrives before the wait is kept, so the
+  wait ends at once. ntdll's `RtlWaitOnAddress` / `RtlWakeAddressSingle` / `RtlWakeAddressAll` (`ntdll/addr.inc`: one list of waiters under a spin lock, each waiter's node on its
+  own stack) are made of them, and kernel32's `WaitOnAddress` / `WakeByAddressSingle` / `WakeByAddressAll` of those.
+- **`NtAllocateVirtualMemoryEx`** (124; `WindowsMemory.cpp`): address requirements (lowest/highest address, alignment up to any power of two: more than needed is reserved, given back
+  and the aligned spot taken at once, under the process lock), NUMA node, partition and attribute parameters (accepted, no effect), another process by handle. `VirtualAlloc2`,
+  `VirtualAlloc2FromApp`, `VirtualAllocExNuma`, `VirtualAllocFromApp` use it. A user-physical-pages parameter answers `STATUS_NOT_SUPPORTED`.
+- **`NtSetInformationVirtualMemory`** (443): prefetch, page priority and call-target lists are checked (ranges inside the user half, lengths) and accepted.
+- **Continue handlers**: `RtlAddVectoredContinueHandler` / `RemoveVectoredContinueHandler` (ntdll `except.inc`) run after any handler that resumed execution.
+
+In kernel32 (all in user mode, over the services above): resource enumeration (`EnumResource{Types,Names,Languages}{A,W,ExA,ExW}`), `GetBinaryType`, the file-API code page flag,
+`SetEnvironmentStringsA`, write watch (`GetWriteWatch` reports every page of a `MEM_WRITE_WATCH` region as written: a superset, which is what a collector needs), offer/reclaim/discard,
+the NUMA functions (one node), processor groups (one), working set size, shutdown parameters, affinity update mode, DEP and mitigation policies (kept, one-way), `Get/SetProcessInformation`,
+`Get/SetThreadInformation` (memory priority, power throttling), ideal processor, CPU sets (ids 256 + processor index) and their masks, packages (a process is never packaged:
+`APPMODEL_ERROR_NO_PACKAGE`; the name parsers and formatters work), application recovery and restart registration, the `Wer*` registrations (accepted and dropped),
+`RaiseFailFastException`, power requests and `SetThreadExecutionState`, tape and firmware-variable functions (the answers of a machine without them), console aliases (`AddConsoleAlias`,
+`GetConsoleAlias*`, per program), `FindFirstFileNameW` / `FindNextFileNameW` (hard links: the volume is walked when the file has more than one), `BackupRead` / `BackupWrite` / `BackupSeek`
+(the data stream only), `ReadDirectoryChangesExW` (extended records made from the standard ones, synchronous calls), `GetFileInformationByName`, the transacted file functions (there is
+no transaction manager: they fail with `ERROR_INVALID_HANDLE`/`ERROR_TRANSACTIONAL_CONFLICT`), thread pool I/O (`CreateThreadpoolIo` and friends: a port and a thread of their own per
+object), `SetTimerQueueTimer`, `RegisterWaitForSingleObjectEx`, private namespaces and boundary descriptors (a namespace is a directory object, so "Alias\\Name" works), memory resource
+notifications, psapi (`K32QueryWorkingSet(Ex)`, `K32GetPerformanceInfo`, mapped file names of program images), `GetDurationFormat(Ex)`, `GetUILanguageInfo`, `IsValidUILanguage`,
+`EnumSystemGeoNames`, `VerLanguageName`, extended `CONTEXT` (`InitializeContext(2)`, `LocateXStateFeature`, `Get/SetXStateFeaturesMask`, `CopyContext`), enclaves / I/O rings / user-mode
+scheduling / thread profiling (`ERROR_NOT_SUPPORTED`).
+
+**Still stubs** (`stubs/kernel32.inc`): the undocumented internals of Windows (`Base*`, `Basep*`, `Quirk*`, `Termsrv*`, `Nls*`, `Reg*`, `Werp*`, VDM and 16-bit DOS support, the `*Worker`
+activation-context entry points, calendar helpers such as `GetCalendarDateFormat`), the process snapshot API (`Pss*`), the LZ file compression functions (lz32.dll's, listed here by the
+import library), the compiler intrinsics the import library lists (`_InterlockedXxx`, `__readmsr`, ...: not exports of a real kernel32.dll), `CheckTokenMembershipEx`,
+`GetStringScripts` / `VerifyScripts`, `GetMappedFileName` of a data view (only program images are named), `SetVolumeLabel` (answers `ERROR_ACCESS_DENIED`: no service sets the label).
+
 ## Stubs: every service and every export is in place
 
 Nothing a program links against is missing, even where nothing is implemented yet (`scripts/gen-windows-stubs.py` produced the lists from the mingw-w64 import libraries, which name the exports of the real DLLs).

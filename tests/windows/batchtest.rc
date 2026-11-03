@@ -1,0 +1,9 @@
+#include <windows.h>
+/* Resources for batchtest.c: RCDATA named ALPHA in two languages and numbered 7, and a type of its own. */
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+ALPHA RCDATA { "one", 0 }
+7 RCDATA { "seven", 0 }
+LANGUAGE LANG_GERMAN, SUBLANG_GERMAN
+ALPHA RCDATA { "eins", 0 }
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+BETA TESTDATA { "beta", 0 }
