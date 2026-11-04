@@ -61,8 +61,8 @@ static int url_is_file(const WCHAR *url) { const int n = url_scheme_length(url);
 /* ---- output --------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 static HRESULT_ url_return(const WCHAR *text, int n, WCHAR *out, DWORD *length) {
-  if (!out || !length) return E_INVALIDARG_;
-  if ((DWORD)n + 1 > *length) { *length = (DWORD)n + 1; return E_POINTER_; }
+  if (!length) return E_INVALIDARG_;
+  if (!out || (DWORD)n + 1 > *length) { *length = (DWORD)n + 1; return E_POINTER_; }
   for (int i = 0; i < n; ++i) out[i] = text[i];
   out[n] = 0;
   *length = (DWORD)n;
@@ -70,7 +70,7 @@ static HRESULT_ url_return(const WCHAR *text, int n, WCHAR *out, DWORD *length) 
 }
 static int url_wide(LPCSTR a, WCHAR *w, int capacity) { return MultiByteToWideChar(CP_ACP, 0, a, -1, w, capacity); }
 static HRESULT_ url_return_a(const WCHAR *text, int n, LPSTR out, DWORD *length, HRESULT_ hr) {
-  if (!out || !length) return E_INVALIDARG_;
+  if (!length) return E_INVALIDARG_;
   char narrow[URL_MAX * 3];
   WCHAR copy[URL_MAX + 1];
   if (n > URL_MAX) n = URL_MAX;
@@ -78,7 +78,7 @@ static HRESULT_ url_return_a(const WCHAR *text, int n, LPSTR out, DWORD *length,
   copy[n] = 0;
   const int bytes = WideCharToMultiByte(CP_ACP, 0, copy, -1, narrow, sizeof(narrow), NULL, NULL);
   if (bytes <= 0) return E_FAIL__;
-  if ((DWORD)bytes > *length) { *length = (DWORD)bytes; return E_POINTER_; }
+  if (!out || (DWORD)bytes > *length) { *length = (DWORD)bytes; return E_POINTER_; }
   for (int i = 0; i < bytes; ++i) out[i] = narrow[i];
   *length = (DWORD)bytes - 1;
   return hr;
@@ -113,7 +113,7 @@ static int url_escape(const WCHAR *url, DWORD flags, WCHAR *out) {
     return n;
   }
   const int segment = (flags & F_ESCAPE_SEGMENT_ONLY) != 0;
-  int scheme = 0, hierarchical = 0, is_file = 0, is_web = 0, opaque = 0, extra = 0;
+  int scheme = 0, hierarchical = 0, is_file = 0, is_web = 0, opaque = 0, extra = 0, known = 0;
   if (!segment) {
     const int sl = url_scheme_length(url);
     if (sl) {
@@ -121,6 +121,7 @@ static int url_escape(const WCHAR *url, DWORD flags, WCHAR *out) {
       is_file = s && s->scheme == 9;
       is_web = s && (s->scheme == 2 || s->scheme == 11);
       opaque = s && s->opaque;
+      known = s && !s->opaque && s->scheme != 9 && s->scheme != 10;      /* (a web scheme: its ? and # still end the part that is escaped) */
       for (int i = 0; i < sl; ++i) out[n++] = url[i];
       out[n++] = ':';
       url += sl + 1;
@@ -154,17 +155,18 @@ static int url_escape(const WCHAR *url, DWORD flags, WCHAR *out) {
   for (; *url; ++url) {
     if (n >= limit - 12) return -1;
     const unsigned c = *url;
-    if (!segment && !opaque && !extra && (c == '?' || (c == '#' && !is_file)) && !(scheme && !hierarchical)) { if (flags & F_DONT_ESCAPE_EXTRA_INFO) extra = 1; else extra = 1; }
+    if (!segment && !opaque && !extra && (c == '?' || (c == '#' && !is_file)) && !(scheme && !hierarchical && !known)) extra = 1;
     if (extra) { out[n++] = (WCHAR)c; continue; }
     if (c == '%') { if (flags & F_ESCAPE_PERCENT) n = url_emit_escaped(out, n, '%'); else out[n++] = '%'; continue; }
     if (c == '/' || c == '\\') {
-      if (segment || (scheme && !hierarchical) || opaque) { n = url_emit_escaped(out, n, c); continue; }
+      if (segment || (scheme && !hierarchical) || opaque) { n = url_emit_escaped(out, n, (known && !segment && c == '\\') ? '/' : c); continue; }
       if (c == '\\') { if (is_file || is_web) out[n++] = '/'; else n = url_emit_escaped(out, n, '\\'); }
       else out[n++] = '/';
       continue;
     }
     if (c == '?' || c == '#') { n = url_emit_escaped(out, n, c); continue; }
     if (c == '#') { n = url_emit_escaped(out, n, c); continue; }
+    if (c >= 0x7f && c <= 0xff && !(flags & F_ESCAPE_AS_UTF8)) { n = url_emit_escaped(out, n, c); continue; }      /* (a Latin-1 character is escaped as one byte, anything higher is left alone) */
     if (url_unsafe(c) || (c > 0x7e && (flags & F_ESCAPE_AS_UTF8))) {
       if (c > 0x7e) n = url_emit_utf8(out, n, &url); else n = url_emit_escaped(out, n, c);
     } else out[n++] = (WCHAR)c;
@@ -173,7 +175,7 @@ static int url_escape(const WCHAR *url, DWORD flags, WCHAR *out) {
   return n;
 }
 EXPORT HRESULT_ WINAPI UrlEscapeW(LPCWSTR url, LPWSTR out, DWORD *length, DWORD flags) {
-  if (!url || !out || !length) return E_INVALIDARG_;
+  if (!url || !out || !length || !*length) return E_INVALIDARG_;
   WCHAR work[URL_MAX + 1];
   const int n = url_escape(url, flags, work);
   if (n < 0) return E_INVALIDARG_;
@@ -181,7 +183,8 @@ EXPORT HRESULT_ WINAPI UrlEscapeW(LPCWSTR url, LPWSTR out, DWORD *length, DWORD 
 }
 EXPORT HRESULT_ WINAPI UrlEscapeA(LPCSTR url, LPSTR out, DWORD *length, DWORD flags) {
   WCHAR wide[URL_MAX + 1], work[URL_MAX + 1];
-  if (!url || !out || !length || !url_wide(url, wide, URL_MAX)) return E_INVALIDARG_;
+  if (!url || !out || !length || !*length || !url_wide(url, wide, URL_MAX)) return E_INVALIDARG_;
+  if (flags & F_ESCAPE_AS_UTF8) return E_NOTIMPL_;      /* (not in the ANSI form) */
   const int n = url_escape(wide, flags, work);
   if (n < 0) return E_INVALIDARG_;
   return url_return_a(work, n, out, length, 0);
@@ -464,7 +467,8 @@ EXPORT HRESULT_ WINAPI UrlCreateFromPathW(LPCWSTR path, LPWSTR out, DWORD *lengt
   } else {
     static const WCHAR file[] = {'f', 'i', 'l', 'e', ':', 0};
     for (int i = 0; file[i]; ++i) work[n++] = file[i];
-    if ((path[0] == '\\' && path[1] != '\\') || (((path[0] | 0x20) >= 'a' && (path[0] | 0x20) <= 'z') && path[1] == ':')) { work[n++] = '/'; work[n++] = '/'; work[n++] = '/'; }
+    if (path[0] == '\\' && path[1] != '\\') { work[n++] = '/'; work[n++] = '/'; }
+    else if (((path[0] | 0x20) >= 'a' && (path[0] | 0x20) <= 'z') && path[1] == ':') { work[n++] = '/'; work[n++] = '/'; work[n++] = '/'; }
     else if (path[0] == '\\' && path[1] == '\\') { work[n++] = '/'; work[n++] = '/'; path += 2; }
     WCHAR tmp[URL_MAX + 1];
     int t = 0;
@@ -540,13 +544,23 @@ EXPORT HRESULT_ WINAPI UrlCombineW(LPCWSTR base, LPCWSTR relative, LPWSTR out, D
   WCHAR work[URL_MAX + 1], b[URL_MAX + 1], r[URL_MAX + 1];
   int n = 0;
   const DWORD canon_flags = flags & ~0u;
+  /* a relative URL with the scheme of the base and no slash after it is a path relative to the base */
+  WCHAR rel_buf[URL_MAX + 1];
+  {
+    const int rs = url_scheme_length(relative), bs = url_scheme_length(base);
+    if (rs && bs == rs && relative[rs + 1] != '/' && relative[rs + 1] != '\\' && !((relative[0] | 0x20) == 'm' && (relative[1] | 0x20) == 'k' && rs == 2)) {
+      int same = 1;
+      for (int i = 0; i < rs; ++i) if (up_char(relative[i]) != up_char(base[i])) same = 0;
+      if (same) { int k = 0; for (const WCHAR *p = relative + rs + 1; *p && k < URL_MAX; ++p) rel_buf[k++] = *p; rel_buf[k] = 0; relative = rel_buf; }
+    }
+  }
   if (url_scheme_length(relative) || (((relative[0] | 0x20) >= 'a' && (relative[0] | 0x20) <= 'z') && relative[1] == ':' && (relative[2] == '\\' || relative[2] == '/'))) {
     n = url_canonicalize(relative, canon_flags, work);
     if (n < 0) return E_INVALIDARG_;
     return url_return(work, n, out, length);
   }
   if (!*base) { n = url_canonicalize(relative, canon_flags, work); if (n < 0) return E_INVALIDARG_; return url_return(work, n, out, length); }
-  if (url_canonicalize(base, canon_flags | F_DONT_SIMPLIFY, b) < 0) return E_INVALIDARG_;
+  if (url_canonicalize(base, canon_flags, b) < 0) return E_INVALIDARG_;
   int rn = 0;
   for (; relative[rn] && rn < URL_MAX; ++rn) r[rn] = relative[rn] == '\\' ? '/' : relative[rn];
   r[rn] = 0;
@@ -558,12 +572,28 @@ EXPORT HRESULT_ WINAPI UrlCombineW(LPCWSTR base, LPCWSTR relative, LPWSTR out, D
     for (int i = 0; i < cut; ++i) work[n++] = b[i];
     for (int i = 0; i < rn; ++i) work[n++] = r[i];
   } else {
+    const UrlScheme *bs = sl ? url_find_scheme(b, sl) : NULL;
     int cut = bn;
-    for (int i = 0; i < bn; ++i) if (b[i] == '?' || b[i] == '#') { cut = i; break; }
+    for (int i = 0; i < bn; ++i) {
+      if (b[i] == '?') { cut = i; break; }
+      if (b[i] == '#') {
+        /* in a file: URL a # is part of the path, unless it follows a name ending in .htm or .html */
+        int start = i;
+        while (start > 0 && b[start - 1] != '/') --start;
+        if (!(bs && bs->scheme == 9) || ucn_ends_html(b + start, i - start)) { cut = i; break; }
+      }
+    }
     int authority_end = 0;
     if (sl && b[sl + 1] == '/' && b[sl + 2] == '/') { authority_end = sl + 3; while (authority_end < cut && b[authority_end] != '/') ++authority_end; }
     else if (sl) authority_end = sl + 1;
-    if (r[0] == '/' && r[1] == '/') {
+    if (bs && bs->scheme == 10 && r[0] == '/' && r[1] != '/') {      /* mk:@store::/file: a path from the root stays inside the part before "::" */
+      for (int i = sl + 1; i + 1 < cut; ++i) if (b[i] == ':' && b[i + 1] == ':') { authority_end = i + 2; break; }
+    }
+    if (sl && !bs && b[sl + 1] != '/' && r[0] != '/') {
+      /* a scheme we do not know, and a base that is not a path: the relative part replaces everything after the colon */
+      for (int i = 0; i < sl + 1; ++i) work[n++] = b[i];
+      for (int i = 0; i < rn; ++i) work[n++] = r[i];
+    } else if (r[0] == '/' && r[1] == '/') {
       for (int i = 0; i < sl + 1; ++i) work[n++] = b[i];
       for (int i = 0; i < rn; ++i) work[n++] = r[i];
     } else if (r[0] == '/') {
