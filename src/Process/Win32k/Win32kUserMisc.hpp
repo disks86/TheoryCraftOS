@@ -213,6 +213,8 @@ bool accelerator_entries(uint32_t table, List<AcceleratorEntry>* out);
 void shell_hook_windows(List<uint32_t>* out);
 // The input context associated with a window (AssociateInputContext; 0 = none).
 uint32_t window_input_context(uint32_t hwnd);
+// The same but 0xFFFFFFFF for a window nothing was associated with (it uses the default context of its thread), 0 for one with the IME switched off.
+uint32_t window_input_context_raw(uint32_t hwnd);
 // The system cursors and icons by their OCR_/OIC_ id (OCR_NORMAL 32512, OCR_IBEAM 32513, ... OIC_SAMPLE 32512 ...): the handle of the stock object, made on first use.
 uint32_t system_cursor(uint64_t pid, uint32_t ocr_id);
 uint32_t system_icon(uint64_t pid, uint32_t oic_id);

@@ -1063,11 +1063,74 @@ void test_keyboard() {
   CHECK(p.call(N::NtUserSetAppImeLevel, 0x50001, 3) == 1 && p.call(N::NtUserGetAppImeLevel, 0x50001) == 3 && p.call(N::NtUserGetAppImeLevel, 0x50002) == 0);
   clear_error(p);
   CHECK(p.call(N::NtUserSetAppImeLevel, 0x99999, 3) == 0 && last_error(p) == kErrorInvalidWindowHandle);
+  // switching the IME off for a window is an association with nothing; a window nothing was associated with uses the default context of its thread
+  CHECK(user_misc::window_input_context_raw(0x50001) == 0xFFFFFFFFu && user_misc::window_input_context_raw(0x50002) == 0xFFFFFFFFu);
+  const uint64_t c3 = p.call(N::NtUserCreateInputContext, 7), c4 = p.call(N::NtUserCreateInputContext, 8);
+  CHECK(c3 != 0 && c4 != 0 && c3 != c4 && p.call(N::NtUserQueryInputContext, c3, 2) == 160);
+  CHECK(p.call(N::NtUserAssociateInputContext, 0x50001, c3, 0) == 0 && user_misc::window_input_context_raw(0x50001) == c3);
+  CHECK(p.call(N::NtUserAssociateInputContext, 0x50001, 0, 0) == 0 && user_misc::window_input_context_raw(0x50001) == 0);
+  // the contexts of a thread
+  p.memory.put32(kD, 0);
+  CHECK(p.call(N::NtUserBuildHimcList, 0, 8, kE, kD) == 2 && p.memory.get32(kD) == 2);
+  CHECK((p.memory.get64(kE) == c3 && p.memory.get64(kE + 8) == c4) || (p.memory.get64(kE) == c4 && p.memory.get64(kE + 8) == c3));
+  CHECK(p.call(N::NtUserBuildHimcList, 0, 1, kE, kD) == 1 && p.memory.get32(kD) == 2);      // room for one: the other is counted
+  CHECK(p.call(N::NtUserBuildHimcList, 0, 0, 0, kD) == 0 && p.memory.get32(kD) == 2);
+  CHECK(p.call(N::NtUserBuildHimcList, 7, 8, kE, kD) == 0 && p.memory.get32(kD) == 0);      // another thread has none
+  CHECK(p.call(N::NtUserBuildHimcList, 0xFFFFFFFFu, 8, kE, kD) == 2);
+  p.call(N::NtUserUpdateInputContext, c4, 1, 7);
+  CHECK(p.call(N::NtUserBuildHimcList, 7, 8, kE, kD) == 1 && p.memory.get64(kE) == c4);
+  // hot keys
+  CHECK(p.call(N::NtUserGetImeHotKey, 0x10, kE, kE + 4, kE + 8) == 0);
+  CHECK(p.call(N::NtUserSetImeHotKey, 0x10, 3, 0x20, 0x04090409, 0) == 1 && p.call(N::NtUserSetImeHotKey, 0x11, 1, 0x21, 0x04090409, 0) == 1);
+  CHECK(p.call(N::NtUserGetImeHotKey, 0x10, kE, kE + 4, kE + 8) == 1 && p.memory.get32(kE) == 3 && p.memory.get32(kE + 4) == 0x20 && p.memory.get64(kE + 8) == 0x04090409);
+  CHECK(p.call(N::NtUserSetImeHotKey, 0x10, 5, 0x22, 0x04090409, 0) == 1 && p.call(N::NtUserGetImeHotKey, 0x10, kE, 0, 0) == 1 && p.memory.get32(kE) == 5);
+  CHECK(p.call(N::NtUserSetImeHotKey, 0x10, 0, 0, 0, 1) == 1 && p.call(N::NtUserGetImeHotKey, 0x10, kE, kE + 4, kE + 8) == 0);
+  clear_error(p);
+  CHECK(p.call(N::NtUserSetImeHotKey, 0x10, 0, 0, 0, 1) == 0 && last_error(p) == kErrorInvalidParameter && p.call(N::NtUserSetImeHotKey, 0x10, 0, 0, 0, 9) == 0);
+  CHECK(p.call(N::NtUserSetImeHotKey, 0, 0, 0, 0, 2) == 1 && p.call(N::NtUserGetImeHotKey, 0x11, kE, kE + 4, kE + 8) == 0);
+  // IMEINFOEX: by layout, by file name
+  for (uint32_t i = 0; i < 352; i += 4) p.memory.put32(kF + i, 0);
+  p.memory.put64(kF, 0x04090409);
+  clear_error(p);
+  CHECK(p.call(N::NtUserGetImeInfoEx, kF, 0) == 0 && last_error(p) == kErrorInvalidKeyboardHandle && p.call(N::NtUserGetImeInfoEx, kF, 5) == 0);
+  p.memory.put_wide(kF + 188, "Test.IME");
+  p.memory.put_wide(kF + 88, "A test IME");
+  CHECK(p.call(N::NtUserSetImeInfoEx, kF) == 1 && p.call(N::NtUserSetImeInfoEx, kF) == 1);      // (a second call replaces)
+  for (uint32_t i = 0; i < 352; i += 4) p.memory.put32(kG + i, 0);
+  p.memory.put64(kG, 0x04090409);
+  CHECK(p.call(N::NtUserGetImeInfoEx, kG, 0) == 1 && p.memory.get_wide_z(kG + 88) == "A test IME" && p.memory.get_wide_z(kG + 188) == "Test.IME");
+  for (uint32_t i = 0; i < 352; i += 4) p.memory.put32(kG + i, 0);
+  p.memory.put_wide(kG + 188, "test.ime");
+  CHECK(p.call(N::NtUserGetImeInfoEx, kG, 1) == 1 && p.memory.get64(kG) == 0x04090409);      // by file name, ignoring case
+  p.memory.put_wide(kG + 188, "other.ime");
+  CHECK(p.call(N::NtUserGetImeInfoEx, kG, 1) == 0);
+  p.memory.put64(kF, 0x11110000);
+  CHECK(p.call(N::NtUserSetImeInfoEx, kF) == 0 && last_error(p) == kErrorInvalidKeyboardHandle);      // neither loaded nor an IME layout
+  p.memory.put64(kF, 0xE0010411);
+  CHECK(p.call(N::NtUserSetImeInfoEx, kF) == 1);
+  // status and the small ones
+  CHECK(p.call(N::NtUserNotifyIMEStatus, 0x50001, 1, 9) == 1 && p.call(N::NtUserNotifyIMEStatus, 0x50001, 0, 0) == 1);
+  clear_error(p);
+  CHECK(p.call(N::NtUserNotifyIMEStatus, 0x99999, 1, 9) == 0 && last_error(p) == kErrorInvalidWindowHandle);
+  CHECK(p.call(N::NtUserGetIMEShowStatus) == 0 && p.call(N::NtUserBroadcastImeShowStatusChange, 0x50001, 1) == 1 && p.call(N::NtUserGetIMEShowStatus) == 1 && p.call(N::NtUserCheckImeShowStatusInThread, 0x50001) == 1);
+  CHECK(p.call(N::NtUserBroadcastImeShowStatusChange, 0x50001, 0) == 1 && p.call(N::NtUserGetIMEShowStatus) == 0);
+  CHECK(p.call(N::NtUserNlsKbdSendIMENotification, 1, 2) == 1 && p.call(N::NtUserUpdatePerUserImmEnabling) == 1);
+  CHECK(p.call(N::NtUserSetImeOwnerWindow, 0x50001, 1) == 1 && p.call(N::NtUserSetImeOwnerWindow, 0x99999, 1) == 0);
+  CHECK(p.call(N::NtUserSetThreadLayoutHandles, 0x04090409, 0) == 1 && p.call(N::NtUserSetThreadLayoutHandles, 0x12345678, 0) == 0 && last_error(p) == kErrorInvalidKeyboardHandle);
+  p.call(N::NtUserDestroyInputContext, c3);
+  p.call(N::NtUserDestroyInputContext, c4);
   drop_window(0x50001);
   drop_window(0x50002);
   const uint64_t ctx2 = p.call(N::NtUserCreateInputContext, 5);
   win32k::process_exited(160);
   CHECK(p.call(N::NtUserQueryInputContext, ctx2, 0) == 0);
+  // a thread without IME cannot make contexts; the process ending lifts that
+  clear_error(p);
+  CHECK(p.call(N::NtUserDisableThreadIme, 0) == 1);
+  CHECK(p.call(N::NtUserCreateInputContext, 1) == 0 && last_error(p) == kErrorAccessDenied);
+  win32k::process_exited(160);
+  CHECK(p.call(N::NtUserCreateInputContext, 1) != 0);
+  win32k::process_exited(160);
   set_thread_override(0);
 }
 
@@ -1276,7 +1339,9 @@ void test_shell_and_calls() {
   X(InitializeTouchInjection) X(GetPointerDevices) X(GetKeyboardLayout) X(GetKeyboardLayoutList) X(GetKeyboardLayoutName) X(GetKeyboardType) \
   X(ActivateKeyboardLayout) X(LoadKeyboardLayoutEx) X(UnloadKeyboardLayout) X(MapVirtualKeyEx) X(VkKeyScanEx) X(ToUnicodeEx) \
   X(GetKeyNameText) X(CreateInputContext) X(DestroyInputContext) X(UpdateInputContext) X(QueryInputContext) X(AssociateInputContext) \
-  X(GetAppImeLevel) X(SetAppImeLevel) X(CreateMenu) X(CreatePopupMenu) X(DestroyMenu) X(RemoveMenu) \
+  X(GetAppImeLevel) X(SetAppImeLevel) X(GetImeInfoEx) X(SetImeInfoEx) X(GetImeHotKey) X(SetImeHotKey) X(BuildHimcList) X(NotifyIMEStatus) \
+  X(DisableThreadIme) X(BroadcastImeShowStatusChange) X(GetIMEShowStatus) X(CheckImeShowStatusInThread) X(NlsKbdSendIMENotification) X(UpdatePerUserImmEnabling) \
+  X(SetImeOwnerWindow) X(SetThreadLayoutHandles) X(CreateMenu) X(CreatePopupMenu) X(DestroyMenu) X(RemoveMenu) \
   X(DeleteMenu) X(CheckMenuItem) X(EnableMenuItem) X(HiliteMenuItem) X(SetMenuDefaultItem) X(SetMenuContextHelpId) \
   X(SetMenuFlagRtoL) X(ThunkedMenuInfo) X(ThunkedMenuItemInfo) X(SetMenu) X(DrawMenuBar) X(GetSystemMenu) \
   X(SetSystemMenu) X(EnumDisplaySettings) X(ChangeDisplaySettings) X(EnumDisplayDevices) X(GetDisplayConfigBufferSizes) X(QueryDisplayConfig) \

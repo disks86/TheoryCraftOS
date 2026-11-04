@@ -1101,6 +1101,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_shell32 advapi32 user32 ole32)
   set(WINDOWS_IMPORTS_shlwapi advapi32)
   set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
+  set(WINDOWS_IMPORTS_imm32 win32u)      # (the services of win32k: input contexts, hot keys)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     windows_stub_flags(_flags ${_library} 0)
     # A library with code of its own (src/Windows/<dll>/<dll>.c and the .inc files next to it) is linked over kernel32.dll; the stubs fill in what it does not define yet.

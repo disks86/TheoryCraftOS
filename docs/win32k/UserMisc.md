@@ -86,7 +86,19 @@ bridge to the kernel's text clipboard (`src/Kernel/Clipboard.hpp`), not wired ye
 * Needing queue/input state of the window manager: GetKeyboardState/SetKeyboardState/GetKeyState/GetAsyncKeyState, GetMouseMovePointsEx, touch/gesture/pointer message
   services (GetTouchInputInfo, GetGestureInfo, GetPointerInfoList, Inject*), WaitForInputIdle, BlockInput.
 * Other: GetGuiResources/QueryUserCounters (the GDI object count is not in the contract), DisplayConfigSetDeviceInfo, SetDisplayConfig, ChangeDisplaySettingsEx flags for secondary
-  displays (there is one), auto-rotation, Mag* services and the remote-session Dwm* ones (DwmGetRemoteSession*), session and logon services, ShellHandwriting*, the interactive-control services, the IME hot-key/info services.
+  displays (there is one), auto-rotation, Mag* services and the remote-session Dwm* ones (DwmGetRemoteSession*), session and logon services, ShellHandwriting*, the interactive-control services, the IME UI services beyond those under *Input method manager* below.
+
+## Input method manager (`Win32kUserMiscKeyboard.cpp`)
+
+The state behind `imm32.dll` (src/Windows/imm32). `CreateInputContext(client ptr)` makes a handle owned by the calling process and thread; `QueryInputContext(h, 0/1/2)` gives the
+client pointer, thread id and process id; `UpdateInputContext(h, 0/1, v)` changes the client pointer / thread. `AssociateInputContext(hwnd, h, flags)` records the context of a window
+(the window must belong to the context's thread; context 0 is stored and means the IME is off for the window); `CallHwnd(GetWindowInputContext)` answers it, or 0xFFFFFFFF for a window
+nothing was associated with (imm32 then uses the default context of the window's thread). `BuildHimcList(tid, count, out, &needed)` lists the process's contexts of a thread (0: the caller,
+-1: all). `Get/SetImeInfoEx` keep the 352-byte `IMEINFOEX` of a layout (set only for a loaded layout or an IME layout, 0xE.......; get by layout or by IME file name). `Get/SetImeHotKey`
+is a table of hot keys (action 0 sets, 1 deletes, 2 empties it). `NotifyIMEStatus`, `BroadcastImeShowStatusChange`/`GetIMEShowStatus`/`CheckImeShowStatusInThread` and
+`SetImeOwnerWindow` are recorded state; `DisableThreadIme(tid)` (-1: the process) drops the thread's associations and makes later `CreateInputContext` calls fail with
+`ERROR_ACCESS_DENIED` until the process ends; `SetThreadLayoutHandles` sets the thread's layout to a loaded one. Contexts, associations and the disabled threads go with their
+process; window entries with the window. Tests: `test_keyboard` in `tests/Win32kMiscTest.cpp`.
 
 ## Desktop window manager (`Win32kUserMiscDwm.cpp`)
 

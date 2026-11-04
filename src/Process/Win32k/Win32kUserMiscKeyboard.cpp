@@ -205,14 +205,30 @@ struct InputContext {
   uint64_t pid, tid, client_ptr = 0;
   InputContext(allocators::IAllocator&, uint64_t owner, uint64_t thread) : pid(owner), tid(thread) {}
 };
-struct Association { uint32_t hwnd, context; };
+struct Association { uint32_t hwnd, context; };      // context 0: IME switched off for the window (ImmAssociateContext(hwnd, NULL))
 struct ImeLevel { uint32_t hwnd, level; };
+constexpr uint32_t kNoAssociation = 0xFFFFFFFFu;      // what GetWindowInputContext answers for a window nothing was associated with: it uses the default context of its thread
+
+// IMEINFOEX (imm32): the description of an installed IME, kept as the bytes the program gave. hkl first, wszImeFile at 188.
+constexpr uint32_t kImeInfoExSize = 352, kImeFileOffset = 188, kImeFileChars = 80;
+struct ImeInfo {
+  uint64_t hkl;
+  uint8_t bytes[kImeInfoExSize];
+};
+struct ImeHotKey { uint32_t id, modifiers, vk, hkl; };
+struct ImeWindowStatus { uint32_t hwnd, open, conversion; };
+struct DisabledImeThread { uint64_t pid, tid; };      // tid 0xFFFFFFFF: every thread of the process
 
 struct ImeState {
   Registry<InputContext> contexts;
   List<Association> associations;
   List<ImeLevel> levels;
-  explicit ImeState(allocators::IAllocator& a) : contexts(a, 0x0004), associations(a), levels(a) {}
+  List<ImeInfo> infos;
+  List<ImeHotKey> hotkeys;
+  List<ImeWindowStatus> statuses;
+  List<DisabledImeThread> disabled;
+  uint32_t show_status = 0;
+  explicit ImeState(allocators::IAllocator& a) : contexts(a, 0x0004), associations(a), levels(a), infos(a), hotkeys(a), statuses(a), disabled(a) {}
 };
 
 UniquePointer<KeyboardState> g_keyboard;
@@ -388,10 +404,16 @@ uint64_t svc_get_key_name_text(Call& c) {
 }
 
 // --- input contexts
+bool thread_ime_disabled(ImeState& s, uint64_t pid, uint64_t tid) {
+  for (const DisabledImeThread& d : s.disabled.view()) if (d.pid == pid && (d.tid == tid || d.tid == 0xFFFFFFFFu)) return true;
+  return false;
+}
+
 uint64_t svc_create_input_context(Call& c) {
   ImeState* s = ime();
   if (!s) return 0;
   uint32_t handle = 0;
+  if (thread_ime_disabled(*s, c.pid(), c.tid())) return c.fail(kErrorAccessDenied);
   InputContext* ctx = s->contexts.create(&handle, c.pid(), c.tid());
   if (!ctx) return c.fail(kErrorNoMoreUserHandles);
   ctx->client_ptr = c.arg(0);
@@ -427,6 +449,7 @@ uint64_t svc_query_input_context(Call& c) {
   switch (c.arg32(1)) {
     case 0: return ctx->client_ptr;
     case 1: return ctx->tid;
+    case 2: return ctx->pid;
     default: return c.fail(kErrorInvalidParameter);
   }
 }
@@ -441,13 +464,13 @@ uint64_t svc_associate_input_context(Call& c) {
     if (!ctx || ctx->tid != user::window_thread(hwnd)) return kAicrFailed;
   }
   bool replaced = false;
-  for (uint64_t i = 0; i < s->associations.count(); ++i) {
-    if (s->associations[i].hwnd != hwnd) continue;
+  for (Association& a : s->associations.view()) {
+    if (a.hwnd != hwnd) continue;
     replaced = true;
-    if (context == 0) s->associations.remove_at(i); else s->associations[i].context = context;
+    a.context = context;
     break;
   }
-  if (!replaced && context != 0) s->associations.push_back(Association{hwnd, context});
+  if (!replaced && !s->associations.push_back(Association{hwnd, context})) return kAicrFailed;
   return user::focus_window() == hwnd ? kAicrFocusChanged : kAicrOk;
 }
 
@@ -469,7 +492,163 @@ uint64_t svc_set_app_ime_level(Call& c) {
   return s->levels.push_back(ImeLevel{hwnd, level}) ? 1 : c.fail(kErrorNotEnoughMemory);
 }
 
+
+// BOOL NtUserGetImeInfoEx(IMEINFOEX*, IMEINFOEXCLASS): 0 = by the layout in the structure, 1 = by the IME file name in it.
+uint64_t svc_get_ime_info_ex(Call& c) {
+  ImeState* s = ime();
+  if (!s || c.arg(0) == 0) return c.fail(kErrorInvalidParameter);
+  uint8_t request[kImeInfoExSize];
+  if (!c.read(c.arg(0), ByteView(request, kImeInfoExSize))) return c.fail(kErrorNoAccess);
+  uint64_t hkl = 0;
+  for (int i = 7; i >= 0; --i) hkl = hkl << 8 | request[i];
+  const uint32_t by = c.arg32(1);
+  if (by > 1) return c.fail(kErrorInvalidParameter);
+  for (const ImeInfo& info : s->infos.view()) {
+    bool match = false;
+    if (by == 0) {
+      match = info.hkl == hkl;
+    } else {
+      match = true;
+      for (uint32_t i = 0; i < kImeFileChars; ++i) {
+        uint16_t a = uint16_t(request[kImeFileOffset + 2 * i] | request[kImeFileOffset + 2 * i + 1] << 8), b = uint16_t(info.bytes[kImeFileOffset + 2 * i] | info.bytes[kImeFileOffset + 2 * i + 1] << 8);
+        if (a >= 'A' && a <= 'Z') a = uint16_t(a + 32);
+        if (b >= 'A' && b <= 'Z') b = uint16_t(b + 32);
+        if (a != b) { match = false; break; }
+        if (a == 0) break;
+      }
+    }
+    if (!match) continue;
+    return c.write(c.arg(0), ConstByteView(info.bytes, kImeInfoExSize)) ? 1 : c.fail(kErrorNoAccess);
+  }
+  return c.fail(kErrorInvalidKeyboardHandle);
+}
+
+// BOOL NtUserSetImeInfoEx(IMEINFOEX*): the IME of a layout publishes its description (imm32 does it after loading the IME).
+uint64_t svc_set_ime_info_ex(Call& c) {
+  ImeState* s = ime();
+  KeyboardState* k = kb();
+  if (!s || !k || c.arg(0) == 0) return c.fail(kErrorInvalidParameter);
+  ImeInfo info{};
+  if (!c.read(c.arg(0), ByteView(info.bytes, kImeInfoExSize))) return c.fail(kErrorNoAccess);
+  for (int i = 7; i >= 0; --i) info.hkl = info.hkl << 8 | info.bytes[i];
+  const uint32_t hkl = uint32_t(info.hkl);
+  if (info.hkl != hkl || (!is_loaded(*k, hkl) && (hkl >> 28) != 0xE)) return c.fail(kErrorInvalidKeyboardHandle);
+  for (ImeInfo& have : s->infos.view()) if (have.hkl == info.hkl) { have = info; return 1; }
+  return s->infos.push_back(info) ? 1 : c.fail(kErrorNotEnoughMemory);
+}
+
+// BOOL NtUserGetImeHotKey(id, UINT* modifiers, UINT* vk, HKL*)
+uint64_t svc_get_ime_hot_key(Call& c) {
+  ImeState* s = ime();
+  if (!s) return 0;
+  for (const ImeHotKey& h : s->hotkeys.view()) {
+    if (h.id != c.arg32(0)) continue;
+    if ((c.arg(1) && !c.write_u32(c.arg(1), h.modifiers)) || (c.arg(2) && !c.write_u32(c.arg(2), h.vk)) || (c.arg(3) && !c.write_u64(c.arg(3), h.hkl))) return c.fail(kErrorNoAccess);
+    return 1;
+  }
+  return 0;
+}
+
+// BOOL NtUserSetImeHotKey(id, modifiers, vk, HKL, action): 0 sets, 1 deletes, 2 resets the table.
+uint64_t svc_set_ime_hot_key(Call& c) {
+  ImeState* s = ime();
+  if (!s) return 0;
+  const uint32_t id = c.arg32(0), action = c.arg32(4);
+  if (action == 2) { s->hotkeys.clear(); return 1; }
+  if (action > 1) return c.fail(kErrorInvalidParameter);
+  for (uint64_t i = 0; i < s->hotkeys.count(); ++i) {
+    if (s->hotkeys[i].id != id) continue;
+    if (action == 1) { s->hotkeys.remove_at(i); return 1; }
+    s->hotkeys[i] = ImeHotKey{id, c.arg32(1), c.arg32(2), c.arg32(3)};
+    return 1;
+  }
+  if (action == 1) return c.fail(kErrorInvalidParameter);
+  return s->hotkeys.push_back(ImeHotKey{id, c.arg32(1), c.arg32(2), c.arg32(3)}) ? 1 : c.fail(kErrorNotEnoughMemory);
+}
+
+// UINT NtUserBuildHimcList(DWORD tid, DWORD count, HIMC* out, UINT* needed): the contexts of a thread (0: the calling thread; -1: every thread of the process). Returns how many were written.
+uint64_t svc_build_himc_list(Call& c) {
+  ImeState* s = ime();
+  if (!s) return 0;
+  const uint32_t tid = c.arg32(0), count = c.arg32(1);
+  List<uint32_t> all(*c.allocator());
+  s->contexts.handles(&all);
+  uint32_t matching = 0, written = 0;
+  for (uint32_t h : all.view()) {
+    InputContext* ctx = s->contexts.find(h);
+    if (!ctx || ctx->pid != c.pid()) continue;
+    if (tid != 0xFFFFFFFFu && ctx->tid != (tid ? tid : c.tid())) continue;
+    ++matching;
+    if (written < count && c.arg(2) != 0) {
+      if (!c.write_u64(c.arg(2) + uint64_t{written} * 8, h)) return c.fail(kErrorNoAccess);
+      ++written;
+    }
+  }
+  if (c.arg(3) && !c.write_u32(c.arg(3), matching)) return c.fail(kErrorNoAccess);
+  return written;
+}
+
+// void NtUserNotifyIMEStatus(HWND, open, conversion mode): what the shell shows of the IME of the focus window.
+uint64_t svc_notify_ime_status(Call& c) {
+  ImeState* s = ime();
+  const uint32_t hwnd = c.arg32(0);
+  if (!s) return 0;
+  if (!user::is_window(hwnd)) return c.fail(kErrorInvalidWindowHandle);
+  for (ImeWindowStatus& w : s->statuses.view()) if (w.hwnd == hwnd) { w.open = c.arg32(1) != 0; w.conversion = c.arg32(2); return 1; }
+  return s->statuses.push_back(ImeWindowStatus{hwnd, c.arg32(1) != 0, c.arg32(2)}) ? 1 : c.fail(kErrorNotEnoughMemory);
+}
+
+// BOOL NtUserDisableThreadIme(tid): tid -1 is every thread of the process. The default contexts of the thread are gone for good.
+uint64_t svc_disable_thread_ime(Call& c) {
+  ImeState* s = ime();
+  if (!s) return 0;
+  const uint32_t tid = c.arg32(0);
+  if (tid != 0 && tid != 0xFFFFFFFFu && tid != c.tid()) {
+    ThreadRecord* t = find_thread_record(tid);
+    if (t && t->pid != c.pid()) return c.fail(kErrorAccessDenied);
+  }
+  const uint64_t target = tid == 0 ? c.tid() : tid;
+  if (!thread_ime_disabled(*s, c.pid(), target) && !s->disabled.push_back(DisabledImeThread{c.pid(), target})) return c.fail(kErrorNotEnoughMemory);
+  List<uint32_t> all(*c.allocator());
+  s->contexts.handles(&all);
+  for (uint32_t h : all.view()) {
+    InputContext* ctx = s->contexts.find(h);
+    if (!ctx || ctx->pid != c.pid() || (target != 0xFFFFFFFFu && ctx->tid != target)) continue;
+    for (uint64_t i = 0; i < s->associations.count();) { if (s->associations[i].context == h) s->associations.remove_at(i); else ++i; }
+  }
+  return 1;
+}
+
+uint64_t svc_broadcast_ime_show_status(Call& c) { ImeState* s = ime(); if (s) s->show_status = c.arg32(1) != 0; return 1; }
+uint64_t svc_get_ime_show_status(Call&) { ImeState* s = ime(); return s ? s->show_status : 0; }
+uint64_t svc_check_ime_show_status(Call&) { ImeState* s = ime(); return s ? s->show_status : 0; }
+uint64_t svc_nls_ime_notification(Call&) { return 1; }
+uint64_t svc_update_per_user_imm(Call&) { return 1; }
+
+// BOOL NtUserSetImeOwnerWindow(HWND, BOOL): the window an IME window belongs to; nothing is shown, so only the handle is checked.
+uint64_t svc_set_ime_owner_window(Call& c) {
+  if (!user::is_window(c.arg32(0))) return c.fail(kErrorInvalidWindowHandle);
+  return 1;
+}
+
+// BOOL NtUserSetThreadLayoutHandles(HKL new, HKL old): the layout the thread's IME runs with.
+uint64_t svc_set_thread_layout_handles(Call& c) {
+  KeyboardState* k = kb();
+  const uint32_t hkl = c.arg32(0);
+  ThreadRecord* t = thread_record(c.tid(), c.pid());
+  if (!k || !t) return 0;
+  if (!is_loaded(*k, hkl)) return c.fail(kErrorInvalidKeyboardHandle);
+  t->layout = hkl;
+  return 1;
+}
+
 }  // namespace
+
+uint32_t window_input_context_raw(uint32_t hwnd) {
+  if (!g_ime) return kNoAssociation;
+  for (const Association& a : g_ime->associations.view()) if (a.hwnd == hwnd) return a.context;
+  return kNoAssociation;
+}
 
 uint32_t window_input_context(uint32_t hwnd) {
   if (!g_ime) return 0;
@@ -483,10 +662,12 @@ void keyboard_window_destroyed(uint32_t hwnd) {
   if (!g_ime) return;
   for (uint64_t i = 0; i < g_ime->associations.count();) { if (g_ime->associations[i].hwnd == hwnd) g_ime->associations.remove_at(i); else ++i; }
   for (uint64_t i = 0; i < g_ime->levels.count();) { if (g_ime->levels[i].hwnd == hwnd) g_ime->levels.remove_at(i); else ++i; }
+  for (uint64_t i = 0; i < g_ime->statuses.count();) { if (g_ime->statuses[i].hwnd == hwnd) g_ime->statuses.remove_at(i); else ++i; }
 }
 
 void keyboard_process_exited(uint64_t pid) {
   if (!g_ime) return;
+  for (uint64_t i = 0; i < g_ime->disabled.count();) { if (g_ime->disabled[i].pid == pid) g_ime->disabled.remove_at(i); else ++i; }
   List<uint32_t> all(*system_allocator());
   g_ime->contexts.handles(&all);
   for (uint32_t h : all.view()) {
@@ -517,6 +698,20 @@ void install_keyboard() {
   register_handler(N::NtUserAssociateInputContext, svc_associate_input_context);
   register_handler(N::NtUserGetAppImeLevel, svc_get_app_ime_level);
   register_handler(N::NtUserSetAppImeLevel, svc_set_app_ime_level);
+  register_handler(N::NtUserGetImeInfoEx, svc_get_ime_info_ex);
+  register_handler(N::NtUserSetImeInfoEx, svc_set_ime_info_ex);
+  register_handler(N::NtUserGetImeHotKey, svc_get_ime_hot_key);
+  register_handler(N::NtUserSetImeHotKey, svc_set_ime_hot_key);
+  register_handler(N::NtUserBuildHimcList, svc_build_himc_list);
+  register_handler(N::NtUserNotifyIMEStatus, svc_notify_ime_status);
+  register_handler(N::NtUserDisableThreadIme, svc_disable_thread_ime);
+  register_handler(N::NtUserBroadcastImeShowStatusChange, svc_broadcast_ime_show_status);
+  register_handler(N::NtUserGetIMEShowStatus, svc_get_ime_show_status);
+  register_handler(N::NtUserCheckImeShowStatusInThread, svc_check_ime_show_status);
+  register_handler(N::NtUserNlsKbdSendIMENotification, svc_nls_ime_notification);
+  register_handler(N::NtUserUpdatePerUserImmEnabling, svc_update_per_user_imm);
+  register_handler(N::NtUserSetImeOwnerWindow, svc_set_ime_owner_window);
+  register_handler(N::NtUserSetThreadLayoutHandles, svc_set_thread_layout_handles);
 }
 
 }  // namespace process::win32k::user_misc

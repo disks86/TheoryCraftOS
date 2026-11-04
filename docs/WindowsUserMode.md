@@ -409,6 +409,24 @@ The state lives in win32k and is reached with one service, **`NtTcosDwm`** (serv
 `Dwmp*` exports, `DwmSetPresentParameters`, `DwmTransitionOwnedWindow`, and `SetThreadDpiAwarenessContext`. Nothing composites from the stored values yet. Not run under QEMU with
 a Windows program; the kernel half is covered by `test_dwm` in `Win32kMiscTest`.
 
+## imm32.dll
+
+`src/Windows/imm32/imm32.c` implements the Input Method Manager. As in Windows an input context is two objects: the handle (`HIMC`) belongs to win32k (`NtUserCreateInputContext`,
+`DestroyInputContext`, `UpdateInputContext`, `QueryInputContext`, `AssociateInputContext`; the association of windows with contexts; see `docs/win32k/UserMisc.md`), and the
+`INPUTCONTEXT` with its `HIMCC` components (composition string, candidate info, guide line, private data, message buffer) lives in the process, in a client structure win32k keeps a
+pointer to. The default context of a thread is made the first time one of its windows is asked for its context (`ImmGetContext`); `ImmAssociateContext(hwnd, NULL)` switches the IME off
+for a window; the contexts of a thread go with the thread. Done: contexts (`ImmCreateContext`/`DestroyContext`/`GetContext`/`AssociateContext(Ex)`/`EnumInputContext`/`LockIMC` ...), the
+`HIMCC` functions, open and conversion status, status/composition/candidate window positions, composition font (A and W), `ImmGenerateMessage`, the composition-string, candidate-list and
+guide-line getters (A forms convert strings, attributes, clauses and positions), IME information (`ImmIsIME`, `ImmGetProperty`, `ImmGetDescription`, `ImmGetIMEFileName`,
+`ImmGetImeInfoEx` over win32k's `IMEINFOEX` table), hot keys, `ImmDisableIME`, `ImmIsUIMessage`, `GetKeyboardLayoutCP`, `SendInput` (the export imm32 re-exports) and the
+`CtfImm*` exports that are answers without the text services framework.
+No IME module is ever loaded (the one layout win32k has, US English, has none), so the functions that are the IME's answer as Windows does without one: `ImmNotifyIME`,
+`ImmSetCompositionString`, `ImmEscape`, `ImmConfigureIME`, `ImmGetConversionList`, the word registration, `ImmProcessKey` and `ImmTranslateMessage` fail or return 0. The composition
+getters read what is in the context (empty unless a program wrote into it through `ImmLockIMC`). `ImmGetDefaultIMEWnd` answers NULL: the default IME window ("IME" class) is not made, and
+user32 has no window functions yet, so the window-based paths (`ImmGetContext`, `ImmAssociateContext`, the `WM_IME_NOTIFY` sent to the context's window) are covered only by the kernel
+half. Still stubs: `CtfImmGetGlobalIMEStatus`, `CtfImmGetGuidAtom`, `CtfImmNotify`, `CtfImmSetDefaultRemoteKeyboardLayout`. The kernel half is covered by `test_keyboard` in
+`Win32kMiscTest`; the user-mode half by `tests/windows/imm32test.c` (run with `scripts/winetest.sh imm32 tcos` after putting the built `imm32test.exe` in `build/winetests/imm32_tcos.exe`).
+
 ## gdi32.dll
 
 `src/Windows/gdi32` is a real library: the GDI API of wingdi.h (A and W forms, DCs and their attributes, pens, brushes, bitmaps, DIBs, regions, clipping, palettes, paths, text and

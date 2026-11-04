@@ -90,6 +90,8 @@ uint32_t monitor_from_point(int32_t x, int32_t y, uint32_t flags);
 uint32_t dpi_for_monitor(uint32_t monitor);                         // 96 unless the display settings say otherwise
 gdi::Rect monitor_rect(uint32_t monitor, bool work_area);           // the monitor's rectangle / its work area
 bool is_menu(uint32_t handle);
+// The input context associated with a window (AssociateInputContext): 0xFFFFFFFF for a window nothing was associated with, 0 for one with the IME switched off.
+uint32_t window_input_context_raw(uint32_t hwnd);
 // The menu bar of a window changed (SetMenu) or a window went: the menu module drops what depended on the window. The window manager calls this when it destroys a window.
 void window_destroyed(uint32_t hwnd);
 

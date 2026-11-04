@@ -858,7 +858,7 @@ uint64_t nt_call_hwnd(Call& call) {
       if (w->style & wn::WS_POPUP) return w->owner ? w->owner->handle : 0;
       return 0;
     case kGetWindowDpiAwarenessContext: return w->dpi_context ? w->dpi_context : 0x6010u;
-    case kGetWindowInputContext: return 0;
+    case kGetWindowInputContext: return user_misc::window_input_context_raw(w->handle);
     case kGetWindowSysSubMenu: return w->sys_menu;
     case kGetWindowTextLength: return w->text.size();
     case kIsWindowEnabled: return is_enabled(w);
