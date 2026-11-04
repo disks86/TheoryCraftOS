@@ -42,6 +42,9 @@ typedef struct Chunk {
   UINT size;
   struct Indirect *indirect;   /* not a stream: ExecuteIndirect, made into one when the list is executed (the arguments are read then) */
   UINT queries;                /* queries begun in the stream (the kernel takes 64) */
+  struct Resource *pred;       /* predication: the 64-bit value that decides whether the chunk runs */
+  UINT64 pred_off;
+  int pred_op;
   UINT allocs[CHUNK_ALLOCS];
   UINT nalloc;
 } Chunk;
@@ -54,6 +57,13 @@ typedef struct RootArg {
   UINT64 offset;
   UINT64 gpu;          /* a table's first descriptor (GPU handle) */
 } RootArg;
+
+typedef struct SoTarget {
+  UINT alloc;
+  UINT64 offset;
+  struct Resource *fill;       /* BufferFilledSizeLocation */
+  UINT64 fill_offset;
+} SoTarget;
 
 typedef struct Binding {
   RootSig *rs;
@@ -94,6 +104,16 @@ struct CmdList {
   /* the state of the recording */
   Pso *pso;
   int query_open;
+  Resource *pred;              /* the predication in force */
+  UINT64 pred_off;
+  int pred_op;
+  SoTarget so[4];              /* the stream output targets */
+  int so_dirty;
+  int so_started[4];           /* sent in this list (a target sent again after a new chunk appends where the last draws ended) */
+  UINT sent_so_alloc[4];
+  UINT64 sent_so_offset[4];
+  SoTarget fills[16];
+  UINT nfills;
   Binding gfx, cs;
   DescHeap *heaps[2];
   DescHeap *heaps_used[8];       /* every shader-visible heap the list set: their kernel copies are brought up to date when it is executed */
@@ -158,8 +178,12 @@ static int chunk_new(CmdList *l) {
   if (!c) return 0;
   c->bytes = mem_alloc(CHUNK_BYTES + 256);
   if (!c->bytes) { mem_free(c); return 0; }
+  c->pred = l->pred;
+  c->pred_off = l->pred_off;
+  c->pred_op = l->pred_op;
   l->chunks[l->nchunks++] = c;
   l->sent_valid = 0;
+  l->sent_so_alloc[0] = l->sent_so_alloc[1] = l->sent_so_alloc[2] = l->sent_so_alloc[3] = 0;
   l->sent_binding = 0;
   l->sent_pipeline = 0;
   l->sent_topology = 0xFFFFFFFFu;
@@ -304,7 +328,7 @@ static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UI
   w[n++] = bits_of(depth);
   w[n++] = stencil;
   /* (the other colour targets, when the pass has them; clears of those are separate passes) */
-  for (UINT i = 1; i < l->rtv_count && i < 4 && flags != 0xFFFFFFFFu; ++i) w[n++] = alloc_index(l, l->rtv[i]);
+  for (UINT i = 1; i < l->rtv_count && i < 4 && flags != 0xFFFFFFFFu && color_alloc == l->rtv[0]; ++i) w[n++] = alloc_index(l, l->rtv[i]);
   packet(l, OP_BEGIN_PASS, w, n);
 }
 
@@ -312,17 +336,31 @@ static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UI
 static int ensure_pass(CmdList *l) {
   static const float zero[4] = {0, 0, 0, 0};
   if (l->pass_open) return 1;
-  if (l->rtv_count == 0 || !l->rtv[0]) return 0;
+  UINT color = l->rtv_count ? l->rtv[0] : 0, depth = l->dsv;
+  if (!color && l->pso && l->pso->so_entries) {
+    /* stream output without a target: the kernel's passes have one, a 1 x 1 target of the device's that nothing is rasterized into */
+    if (!l->d.dev->null_target) {
+      KmtAllocDesc ad;
+      memset(&ad, 0, sizeof ad);
+      ad.flags = KA_RENDER_TARGET | KA_TEXTURE;
+      ad.format = KF_A8R8G8B8;
+      ad.width = ad.height = 1;
+      kmt_create_allocation(l->d.dev->kdev, &ad, &l->d.dev->null_target, NULL, NULL);
+    }
+    color = l->d.dev->null_target;
+    depth = 0;
+  }
+  if (!color) return 0;
   UINT flags = 0;
-  float depth = 1.0f;
+  float depth_value = 1.0f;
   UINT stencil = 0;
-  if (l->dsv && l->pending_clear && l->pending_alloc == l->dsv) {
+  if (depth && l->pending_clear && l->pending_alloc == depth) {
     flags = l->pending_flags;
-    depth = l->pending_depth;
+    depth_value = l->pending_depth;
     stencil = l->pending_stencil;
     l->pending_clear = 0;
   }
-  begin_pass_packet(l, l->rtv[0], l->dsv, flags, zero, depth, stencil);
+  begin_pass_packet(l, color, depth, flags, zero, depth_value, stencil);
   l->pass_open = 1;
   /* a new pass forgets what was bound (a device may have its own idea of what carries over) */
   l->sent_pipeline = 0;
@@ -422,6 +460,17 @@ static int prepare_draw(CmdList *l, int indexed) {
     packet(l, OP_BIND_PIPELINE, &pipeline, 1);
     l->sent_pipeline = pipeline;
   }
+  for (UINT s = 0; s < 4; ++s) {
+    const SoTarget *t = &l->so[s];
+    if (t->alloc == l->sent_so_alloc[s] && !(t->alloc && l->so_dirty)) continue;
+    UINT w[3] = {s, t->alloc ? alloc_index(l, t->alloc) : 0xFFFFFFFFu, 0};
+    /* (the first time a bind is sent it starts at the view's offset; sent again after a new chunk it goes on from where the draws before ended) */
+    w[2] = !t->alloc ? 0 : l->so_started[s] && !l->so_dirty ? 0xFFFFFFFFu : (UINT)t->offset;
+    packet(l, OP_SET_STREAM_OUTPUT, w, 3);
+    l->sent_so_alloc[s] = t->alloc;
+    l->so_started[s] = t->alloc != 0;
+  }
+  l->so_dirty = 0;
   const UINT topology = topology_code(l->topology);
   if (topology != l->sent_topology) {
     packet(l, OP_SET_TOPOLOGY, &topology, 1);
@@ -530,7 +579,6 @@ static void STDMETHODCALLTYPE list_IASetVertexBuffers(CmdList *l, UINT start, UI
   l->vb_stride = views[0].StrideInBytes;
   l->vb_size = views[0].SizeInBytes;
 }
-static void STDMETHODCALLTYPE list_SOSetTargets(CmdList *l, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {}
 
 static void STDMETHODCALLTYPE list_OMSetRenderTargets(CmdList *l, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv) {
   end_pass(l);
@@ -709,7 +757,6 @@ static void STDMETHODCALLTYPE list_CopyResource(CmdList *l, ID3D12Resource *dst,
     packet(l, OP_COPY_REGION, payload, 8);
   }
 }
-static void STDMETHODCALLTYPE list_CopyTiles(CmdList *l, ID3D12Resource *r, const D3D12_TILED_RESOURCE_COORDINATE *c, const D3D12_TILE_REGION_SIZE *s, ID3D12Resource *b, UINT64 o, D3D12_TILE_COPY_FLAGS f) {}
 static void STDMETHODCALLTYPE list_ResolveSubresource(CmdList *l, ID3D12Resource *d, UINT ds, ID3D12Resource *s, UINT ss, DXGI_FORMAT f) {}
 
 /* ---- barriers, queries, markers ------------------------------------------------------------------------------------------------------------------------------------ */
@@ -724,7 +771,6 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(CmdList *l, UINT count, const
     packet(l, OP_RESOURCE_BARRIER, w, 6);
   }
 }
-static void STDMETHODCALLTYPE list_SetPredication(CmdList *l, ID3D12Resource *b, UINT64 o, D3D12_PREDICATION_OP op) {}
 static void STDMETHODCALLTYPE list_SetMarker(CmdList *l, UINT m, const void *d, UINT s) {}
 static void STDMETHODCALLTYPE list_BeginEvent(CmdList *l, UINT m, const void *d, UINT s) {}
 static void STDMETHODCALLTYPE list_EndEvent(CmdList *l) {}

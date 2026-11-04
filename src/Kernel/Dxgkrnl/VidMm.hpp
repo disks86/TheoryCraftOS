@@ -76,6 +76,9 @@ class Allocation {
   // Where level `level` starts in the backing and how many bytes it has; false for a level the allocation does not have.
   bool level_range(uint32_t level, uint64_t* offset, uint64_t* bytes) const;
 
+  // A stream output buffer: how far the last stream output into it got (an offset in the buffer).
+  uint64_t stream_output_filled() const { return buffer_ ? buffer_->stream_output_filled() : so_filled_; }
+
   graphics::IImage* image() const { return image_; }
   graphics::IBuffer* buffer() const { return buffer_; }
   uint32_t lock_count() const { return lock_count_; }

@@ -21,6 +21,7 @@
 /* The private fence handles and the like are in the other parts; the device is made here. */
 static void dev_destroy(DxObj *o) {
   Dev *d = (Dev *)o;
+  if (d->null_target) kmt_destroy_allocation(d->kdev, d->null_target);
   if (d->kdev) kmt_destroy_device(d->kdev);
   if (d->adapter) kmt_close_adapter(d->adapter);
 }

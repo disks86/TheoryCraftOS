@@ -4991,6 +4991,28 @@ void test_d3d12_copies_and_escapes() {
   CHECK(escape({99}, 0) == status::kNotSupported);
 }
 
+// A reserved texture with a mip chain has the tiles of its standard levels and one more for the mip tail; stream output offsets are asked with an escape.
+void test_reserved_mip_tail() {
+  Env e;
+  AllocationDesc td;
+  td.flags = kAllocTexture | kAllocReserved, td.format = Format::A8R8G8B8, td.width = 256, td.height = 256, td.mip_levels = 9;
+  Handle texture = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, td, &texture) == status::kSuccess);
+  AllocationDesc hd;
+  hd.flags = kAllocHeap, hd.size = 7 * 65536;
+  Handle heap = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, hd, &heap) == status::kSuccess);
+  CHECK(e.kernel.update_tile_mappings(kPid, texture, 0, heap, 0, 6) == status::kSuccess);      // 4 + 1 tiles of the standard levels and the tail
+  CHECK(e.kernel.update_tile_mappings(kPid, texture, 0, heap, 0, 7) == status::kInvalidParameter);
+  td.mip_levels = 10;
+  Handle bad = 0;
+  CHECK(e.kernel.create_allocation(kPid, e.dev, td, &bad) == status::kInvalidParameter);      // (more levels than the size has)
+  Handle buffer = e.buffer(kAllocVertexBuffer, 64);
+  uint32_t request[2] = {14, buffer}, reply[4] = {};
+  uint32_t reply_bytes = 0;
+  CHECK(e.kernel.escape(kPid, e.dev, ConstByteView(reinterpret_cast<const uint8_t*>(request), 8), ByteView(reinterpret_cast<uint8_t*>(reply), 16), &reply_bytes) == status::kInvalidParameter);   // (not a stream output buffer)
+}
+
 // Root unordered access views and root constants for a compute shader.
 void test_d3d12_compute() {
   Env e;
@@ -8099,6 +8121,7 @@ int main() {
   test_root_signature_parse();
   test_d3d12_binding();
   test_d3d12_copies_and_escapes();
+  test_reserved_mip_tail();
   test_d3d12_compute();
   test_d3d12_buffer_views();
   test_d3d12_buffer_views_in_draw();

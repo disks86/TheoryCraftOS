@@ -329,6 +329,8 @@ struct Pso {
   DXGI_FORMAT rtv_formats[8];
   DXGI_FORMAT dsv_format;
   D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
+  UINT so_entries, so_rasterized, so_strides[4];
+  UINT so_entry[16][2];        /* the words of the kernel's description of each captured output */
   PsoPipe pipes[MAX_PSO_PIPELINES];
   UINT pipe_count;
   UINT compute_pipe;
@@ -388,7 +390,8 @@ static int vertex_floats(DXGI_FORMAT f) {
 static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
   extern const ID3D12PipelineStateVtbl pso_vtbl;
   if (!desc || !desc->pRootSignature || !desc->VS.pShaderBytecode) return E_INVALIDARG;
-  if (desc->SampleDesc.Count > 1 || desc->StreamOutput.NumEntries) return DXGI_ERROR_UNSUPPORTED;
+  if (desc->SampleDesc.Count > 1) return DXGI_ERROR_UNSUPPORTED;
+  if (desc->StreamOutput.NumEntries > 16 || desc->StreamOutput.NumStrides > 4) return DXGI_ERROR_UNSUPPORTED;
   Pso *p = dobj_new(sizeof *p, This, &pso_vtbl, g_pso_iids, pso_destroy);
   if (!p) return E_OUTOFMEMORY;
   p->rs = (RootSig *)desc->pRootSignature;
@@ -401,7 +404,11 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   p->dsv_format = desc->DSVFormat;
   p->topology_type = desc->PrimitiveTopologyType;
   HRESULT hr = make_shader(This, &desc->VS, 0, &p->shaders[0]);
-  if (SUCCEEDED(hr)) hr = make_shader(This, &desc->PS, 1, &p->shaders[1]);
+  if (SUCCEEDED(hr)) {
+    /* (a pipeline with no pixel shader - stream output without rasterizing - gets one that the kernel's pipeline needs and nothing uses) */
+    D3D12_SHADER_BYTECODE null_ps = {g_null_pixel_shader, sizeof g_null_pixel_shader};
+    hr = make_shader(This, desc->PS.pShaderBytecode ? &desc->PS : &null_ps, 1, &p->shaders[1]);
+  }
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->GS, 3, &p->shaders[2]);
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->HS, 4, &p->shaders[3]);
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->DS, 5, &p->shaders[4]);
@@ -430,6 +437,25 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   p->varyings = found_out ? n_out : 3;
   if (p->varyings > 4) p->varyings = 4;
   p->textures = p->rs->textures;
+  /* stream output: the captured outputs by their register in the output signature of the last stage before the rasterizer (the geometry shader, else the vertex shader) */
+  if (desc->StreamOutput.NumEntries) {
+    const D3D12_SHADER_BYTECODE *last = desc->GS.pShaderBytecode ? &desc->GS : &desc->VS;
+    SigElement so_outputs[16];
+    int so_found = 0;
+    const UINT so_n = dxbc_signature(last->pShaderBytecode, last->BytecodeLength, 1, so_outputs, 16, &so_found);
+    p->so_entries = desc->StreamOutput.NumEntries;
+    p->so_rasterized = desc->StreamOutput.RasterizedStream;
+    for (UINT i = 0; i < desc->StreamOutput.NumStrides; ++i) p->so_strides[i] = desc->StreamOutput.pBufferStrides[i];
+    for (UINT i = 0; i < p->so_entries; ++i) {
+      const D3D12_SO_DECLARATION_ENTRY *e = &desc->StreamOutput.pSODeclaration[i];
+      UINT reg = 0xFFFFFFFFu;
+      for (UINT k = 0; e->SemanticName && k < so_n; ++k)
+        if (ieq(so_outputs[k].name, e->SemanticName) && so_outputs[k].index == e->SemanticIndex) reg = so_outputs[k].reg;
+      if (reg == 0xFFFFFFFFu || e->OutputSlot > 3 || e->Stream > 3 || e->StartComponent > 3 || e->ComponentCount == 0 || e->ComponentCount > 4) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+      p->so_entry[i][0] = e->Stream | (reg << 8) | ((UINT)e->StartComponent << 16) | ((UINT)e->ComponentCount << 24);
+      p->so_entry[i][1] = e->OutputSlot;
+    }
+  }
   return query_out((IUnknown *)p, riid, out);
 }
 
@@ -483,7 +509,7 @@ static UINT pso_pipeline(Pso *p, UINT stride, UINT stencil_ref) {
   if (p->compute) return p->compute_pipe;
   for (UINT i = 0; i < p->pipe_count; ++i)
     if (p->pipes[i].stride == stride && p->pipes[i].stencil_ref == stencil_ref) return p->pipes[i].handle;
-  UINT r[96];
+  UINT r[160];
   UINT w = 0;
   const D3D12_RENDER_TARGET_BLEND_DESC *rt = &p->blend.RenderTarget[0];
   r[w++] = ESC_CREATE_PIPELINE;
@@ -541,6 +567,12 @@ static UINT pso_pipeline(Pso *p, UINT stride, UINT stencil_ref) {
   r[w++] = p->shaders[2];
   r[w++] = p->shaders[3];
   r[w++] = p->shaders[4];
+  if (p->so_entries) {
+    r[w++] = p->so_entries;
+    r[w++] = p->so_rasterized;
+    for (UINT i = 0; i < 4; ++i) r[w++] = p->so_strides[i];
+    for (UINT i = 0; i < p->so_entries; ++i) { r[w++] = p->so_entry[i][0]; r[w++] = p->so_entry[i][1]; }
+  }
   UINT reply[1] = {0};
   if (!KMT_OK(dev_escape(p->d.dev, r, w, reply, 1))) return 0;
   if (p->pipe_count == MAX_PSO_PIPELINES) {

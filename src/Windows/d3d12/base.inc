@@ -29,7 +29,7 @@ typedef struct Pso Pso;
 /* ---- the kernel's allocation flags and formats (src/Kernel/Dxgkrnl/DxgTypes.hpp) ------------------------------------------------------------------------------------------- */
 
 enum {
-  KA_VERTEX = 1u << 0, KA_INDEX = 1u << 1, KA_TEXTURE = 1u << 2, KA_RENDER_TARGET = 1u << 3, KA_DEPTH = 1u << 4, KA_PRESENT = 1u << 5, KA_STAGING = 1u << 6, KA_QUERY = 1u << 8, KA_UAV = 1u << 9,
+  KA_VERTEX = 1u << 0, KA_INDEX = 1u << 1, KA_TEXTURE = 1u << 2, KA_RENDER_TARGET = 1u << 3, KA_DEPTH = 1u << 4, KA_PRESENT = 1u << 5, KA_STAGING = 1u << 6, KA_QUERY = 1u << 8, KA_UAV = 1u << 9, KA_STREAM_OUTPUT = 1u << 10,
   KA_HEAP = 1u << 13, KA_RESERVED = 1u << 14,
 };
 enum {
@@ -163,7 +163,7 @@ static Resource *va_find(UINT64 va, UINT64 *offset) {
 enum {
   ESC_CREATE_SHADER = 1, ESC_CREATE_PIPELINE = 2, ESC_DESTROY_SHADER = 3, ESC_DESTROY_PIPELINE = 4, ESC_CREATE_COMPUTE_PIPELINE = 5, ESC_CREATE_ROOT_SIGNATURE = 6,
   ESC_DESTROY_ROOT_SIGNATURE = 7, ESC_CREATE_DESCRIPTOR_HEAP = 8, ESC_DESTROY_DESCRIPTOR_HEAP = 9, ESC_WRITE_DESCRIPTORS = 10, ESC_COPY_DESCRIPTORS = 11, ESC_UPDATE_TILE_MAPPINGS = 12,
-  ESC_QUERY_SYNC = 13,
+  ESC_QUERY_SYNC = 13, ESC_QUERY_STREAM_OUTPUT = 14,
 };
 
 static UINT bits_of(float f) { UINT u; memcpy(&u, &f, 4); return u; }
@@ -179,7 +179,9 @@ struct Dev {
   UINT64 segments[3];
   int software;
   LONG removed;
+  UINT null_target;        /* a 1 x 1 render target: the pass of a draw that has no target (stream output only) */
 };
+#define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, NULL};
 

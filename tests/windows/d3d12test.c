@@ -1130,6 +1130,217 @@ static void test_tiled(Scene *c) {
   ID3D12Heap_Release(heap);
 }
 
+static void scene_translated(Scene *c, ID3D12GraphicsCommandList *list, float tx) {
+  float m[16];
+  memcpy(m, kIdentity, sizeof m);
+  m[0] = m[5] = 0.5f;
+  m[3] = tx;
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, m, 0);
+}
+
+static void test_predication(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 2, 0};
+  ID3D12QueryHeap *heap = NULL;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&heap));
+  ID3D12Resource *predicate = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!heap || !predicate || !list) { CHECK(0); return; }
+  /* predicate[0] = 1 (something was visible), predicate[1] = 0 (nothing was) */
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  scene_translated(c, list, 0.5f);
+  ID3D12GraphicsCommandList_BeginQuery(list, heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0);
+  ID3D12GraphicsCommandList_BeginQuery(list, heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+  ID3D12GraphicsCommandList_EndQuery(list, heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, heap, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 0, 2, predicate, 0);
+  scene_run(c, list);
+  /* skipped (zero, EQUAL_ZERO) on the left, executed (non-zero) on the right: only the right triangle is drawn */
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, c->pso));
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_SetPredication(list, predicate, 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  scene_translated(c, list, -0.5f);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_SetPredication(list, predicate, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  scene_translated(c, list, 0.5f);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const int left = scene_coloured(c, 0, 0, 32, 64), right = scene_coloured(c, 32, 0, 64, 64);
+  printf("predication: %d pixels left, %d right\n", left, right);
+  CHECK(left == 0 && right > 150);
+  /* NOT_EQUAL_ZERO runs the commands when the value is zero: the left triangle appears, the unpredicated clear in between is not affected */
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, c->pso));
+  scene_begin(c, list, 0);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_SetPredication(list, predicate, 8, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+  scene_translated(c, list, -0.5f);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_SetPredication(list, predicate, 0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);      /* (skipped: the value is not zero) */
+  ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const int left2 = scene_coloured(c, 0, 0, 32, 64), right2 = scene_coloured(c, 32, 0, 64, 64);
+  printf("predication: %d pixels left, %d right\n", left2, right2);
+  CHECK(left2 > 150 && right2 == right);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12Resource_Release(predicate);
+  ID3D12QueryHeap_Release(heap);
+}
+
+static void test_stream_output(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12Resource *target = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_STREAM_OUT);
+  ID3D12Resource *filled = make_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12Resource *back = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!target || !filled || !back) { CHECK(0); return; }
+  /* a pipeline that captures the vertex shader's COLOR output (four floats a vertex) and rasterizes nothing */
+  D3D12_SO_DECLARATION_ENTRY entry = {0, "COLOR", 0, 0, 4, 0};
+  UINT stride = 16;
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.StreamOutput.pSODeclaration = &entry;
+  pd.StreamOutput.NumEntries = 1;
+  pd.StreamOutput.pBufferStrides = &stride;
+  pd.StreamOutput.NumStrides = 1;
+  pd.StreamOutput.RasterizedStream = D3D12_SO_NO_RASTERIZED_STREAM;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!pso || !list) { CHECK(0); return; }
+  D3D12_STREAM_OUTPUT_BUFFER_VIEW view = {ID3D12Resource_GetGPUVirtualAddress(target) + 16, 128, ID3D12Resource_GetGPUVirtualAddress(filled)};
+  D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &view);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 0, target, 0, 128);
+  scene_run(c, list);
+  const float *f = NULL;
+  CHECK_HR(ID3D12Resource_Map(back, 0, NULL, (void **)&f));
+  if (f) {
+    printf("stream output: %g %g %g %g | %g %g %g %g | %g %g %g %g\n", f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+    CHECK(f[0] == 0 && f[4] == 1 && f[5] == 0 && f[6] == 0 && f[7] == 1);      /* (the view starts 16 bytes in) */
+    CHECK(f[8] == 0 && f[9] == 1 && f[10] == 0 && f[11] == 1);
+    CHECK(f[12] == 0 && f[13] == 0 && f[14] == 1 && f[15] == 1);
+    CHECK(f[16] == 0);
+    ID3D12Resource_Unmap(back, 0, NULL);
+  }
+  /* the bytes written went to the filled-size location */
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, pso));
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, back, 0, filled, 0, 16);
+  scene_run(c, list);
+  const UINT64 *bytes = NULL;
+  CHECK_HR(ID3D12Resource_Map(back, 0, NULL, (void **)&bytes));
+  if (bytes) {
+    printf("stream output: %llu bytes written\n", (unsigned long long)bytes[0]);
+    CHECK(bytes[0] == 48);
+    ID3D12Resource_Unmap(back, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12PipelineState_Release(pso);
+  ID3D12Resource_Release(back);
+  ID3D12Resource_Release(filled);
+  ID3D12Resource_Release(target);
+}
+
+/* A tiled texture with a mip chain: 256 x 256 has two standard levels (4 and 1 tiles) and a tail for the other seven. */
+static void test_mip_tails(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 256, 256, 1, 9, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *texture = NULL, *clone = NULL;
+  CHECK_HR(ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&texture));
+  CHECK_HR(ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&clone));
+  if (!texture || !clone) { CHECK(0); return; }
+  UINT total = 0, nsub = 9;
+  D3D12_PACKED_MIP_INFO packed;
+  D3D12_TILE_SHAPE shape;
+  D3D12_SUBRESOURCE_TILING tilings[9];
+  ID3D12Device_GetResourceTiling(dev, texture, &total, &packed, &shape, &nsub, 0, tilings);
+  printf("mip tail: %u tiles, %u standard + %u packed mips, the tail at tile %u\n", total, packed.NumStandardMips, packed.NumPackedMips, packed.StartTileIndexInOverallResource);
+  CHECK(total == 6 && packed.NumStandardMips == 2 && packed.NumPackedMips == 7 && packed.NumTilesForPackedMips == 1 && packed.StartTileIndexInOverallResource == 5);
+  CHECK(shape.WidthInTexels == 128 && shape.HeightInTexels == 128 && nsub == 9);
+  CHECK(tilings[0].WidthInTiles == 2 && tilings[0].HeightInTiles == 2 && tilings[0].StartTileIndexInOverallResource == 0);
+  CHECK(tilings[1].WidthInTiles == 1 && tilings[1].StartTileIndexInOverallResource == 4 && tilings[2].StartTileIndexInOverallResource == 0xFFFFFFFFu);
+
+  D3D12_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.SizeInBytes = 6 * 65536;
+  hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  hd.Properties.CreationNodeMask = hd.Properties.VisibleNodeMask = 1;
+  hd.Alignment = 65536;
+  ID3D12Heap *heap = NULL;
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  ID3D12Resource *upload = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 6 * 65536, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *down = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 6 * 65536, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!heap || !upload || !down) { CHECK(0); return; }
+  /* all six tiles to the heap in order; the pattern of every tile differs */
+  D3D12_TILED_RESOURCE_COORDINATE start = {0, 0, 0, 0};
+  D3D12_TILE_REGION_SIZE size = {6, FALSE, 0, 0, 0};
+  D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+  UINT heap_start = 0, count = 6;
+  ID3D12CommandQueue_UpdateTileMappings(c->queue, texture, 1, &start, &size, heap, 1, &flags, &heap_start, &count, D3D12_TILE_MAPPING_FLAG_NONE);
+  UINT8 *p = NULL;
+  CHECK_HR(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+  for (UINT t = 0; t < 6; ++t)
+    for (UINT i = 0; i < 65536; ++i) p[t * 65536 + i] = (UINT8)(t * 40 + i * 7);
+  ID3D12Resource_Unmap(upload, 0, NULL);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  ID3D12GraphicsCommandList_CopyTiles(list, texture, &start, &size, upload, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+  scene_run(c, list);
+  /* the same through a second texture whose mapping was copied from the first, read back out of the tiles */
+  D3D12_TILE_REGION_SIZE all = {6, FALSE, 0, 0, 0};
+  ID3D12CommandQueue_CopyTileMappings(c->queue, clone, &start, texture, &start, &all, D3D12_TILE_MAPPING_FLAG_NONE);
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, NULL));
+  ID3D12GraphicsCommandList_CopyTiles(list, clone, &start, &size, down, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+  scene_run(c, list);
+  const UINT8 *q = NULL;
+  CHECK_HR(ID3D12Resource_Map(down, 0, NULL, (void **)&q));
+  int same[6] = {1, 1, 1, 1, 1, 1};
+  if (q)
+    for (UINT t = 0; t < 6; ++t) {
+      /* (the tail tile holds only the 21844 bytes of the packed levels) */
+      const UINT n = t == 5 ? 21844 : 65536;
+      for (UINT i = 0; i < n; ++i) same[t] &= q[t * 65536 + i] == (UINT8)(t * 40 + i * 7);
+    }
+  printf("mip tail: tiles round-trip %d %d %d %d %d %d\n", same[0], same[1], same[2], same[3], same[4], same[5]);
+  for (UINT t = 0; t < 6; ++t) CHECK(q && same[t]);
+  if (q) ID3D12Resource_Unmap(down, 0, NULL);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12Resource_Release(down);
+  ID3D12Resource_Release(upload);
+  ID3D12Heap_Release(heap);
+  ID3D12Resource_Release(clone);
+  ID3D12Resource_Release(texture);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -1142,6 +1353,9 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_indirect(&c);
   test_bundle(&c);
   test_tiled(&c);
+  test_predication(&c);
+  test_stream_output(&c);
+  test_mip_tails(&c);
 }
 
 int main(void) {

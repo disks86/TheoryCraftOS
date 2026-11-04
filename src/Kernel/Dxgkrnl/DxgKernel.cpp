@@ -468,6 +468,16 @@ NtStatus Kernel::destroy_allocation(ProcessId pid, Handle allocation) {
   return status::kSuccess;
 }
 
+NtStatus Kernel::query_stream_output(ProcessId pid, Handle allocation, uint64_t* offset) {
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+  if (!rec) return status::kInvalidHandle;
+  if (!(rec->allocation->desc().flags & kAllocStreamOutput)) return status::kInvalidParameter;
+  *offset = rec->allocation->stream_output_filled();
+  return status::kSuccess;
+}
+
 NtStatus Kernel::query_allocation(ProcessId pid, Handle allocation, AllocationInfo* out) {
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);
@@ -1067,6 +1077,18 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       const uint32_t lo = in.le32(), hi = in.le32(), count = in.le32();
       if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
       return update_tile_mappings(pid, reserved, first, heap, lo | (uint64_t{hi} << 32), count);
+    }
+    case EscapeOp::QueryStreamOutput: {
+      const Handle allocation = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      if (reply.size() < 8) return status::kBufferTooSmall;
+      uint64_t offset = 0;
+      const NtStatus st = query_stream_output(pid, allocation, &offset);
+      if (st == status::kSuccess) {
+        out.le32(static_cast<uint32_t>(offset));
+        out.le32(static_cast<uint32_t>(offset >> 32));
+      }
+      return st;
     }
     case EscapeOp::QuerySync: {
       const Handle sync = in.le32();

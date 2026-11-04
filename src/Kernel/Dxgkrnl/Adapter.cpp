@@ -780,7 +780,7 @@ class Adapter::StreamRunner {
   // A plain buffer (not a heap, a reserved buffer or a query result): what CopyBuffer and CopyBufferImage move bytes of.
   // (the results of queries can be a source: Direct3D 12's ResolveQueryData)
   static bool copyable_buffer(const Allocation* a, bool allow_query = false) {
-    return a && a->is_buffer() && !a->reserved() && !(a->desc().flags & kAllocHeap) && (allow_query || !(a->desc().flags & kAllocQueryResult));
+    return a && a->is_buffer() && !(a->desc().flags & kAllocHeap) && (allow_query || !(a->desc().flags & kAllocQueryResult));
   }
 
   NtStatus copy_buffer(ByteReader& p) {
