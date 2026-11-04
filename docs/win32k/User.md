@@ -78,3 +78,19 @@ wrapper the window is ANSI). A window with procedure 0 (the desktop) is never ca
 * Threads that end are noticed when their process ends (process-exit hook) or when a send to them finds the thread record finished; a per-thread exit hook is missing.
 * Not done: WM_ERASEBKGND painting (needs a fill in the GDI contract), the visible-region update of device contexts held across moves is done on SetWindowPos only for the
   window moved, WM_GETMINMAXINFO on maximize, tooltips/hover (WM_MOUSEHOVER), foreground lock, input contexts.
+
+## The user-mode half: user32.dll
+
+`src/Windows/user32/window.inc` (included by `user32.c`) is the window system of user32.dll over win32u.dll. It makes the same objects kernel-mode code makes: RegisterClass(Ex), CreateWindow(Ex),
+DestroyWindow, Show/Move/SetWindowPos, parent/owner/tree functions, styles and longs, text, properties, focus/activation/capture, painting entry points, the message functions (Send/Post/
+Peek/Get/Dispatch/Translate, SendMessageTimeout, SendNotifyMessage, DefWindowProc, CallWindowProc), timers, enumeration (BuildHwndList), placement, defer-window-pos, key and cursor state, the
+system metrics (NtUserCallOneParam). Calls follow Wine's `ntuser` interface (the codes of `NtUserCallHwnd` etc. are in the enums at the top of the file).
+
+* Classes: the controls' classes (Button, Static, Edit, ListBox, ComboBox, ScrollBar, #32770, MDIClient, ...) are registered on first use with the styles Windows has; their procedure is the default
+  window procedure (no control behaviour yet: a Button is a plain window with text and style).
+* ANSI: the window manager only knows Unicode; every window is a Unicode window. A functions convert what they send (`a_to_w`); a procedure given to RegisterClassA / SetWindowLongA is held behind
+  one of 64 thunks (`ansi_wrap`) that converts what it receives (`w_to_a`); the A getters answer the program's own procedure. Converted: WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH, WM_CREATE /
+  WM_NCCREATE, the character messages. `IsWindowUnicode` is "the procedure is not a thunk". Not done: Wine's WINPROC handles (GetWindowLongPtrA does not return a handle for an A procedure), the
+  other messages with strings (WM_SETTINGCHANGE, list/combo/edit messages, ...).
+* The console window (kernel32's GetConsoleWindow) is the one window that is not win32k's: IsWindow, GetClientRect and GetWindowRect still answer for it by themselves.
+* Tests: `tests/windows/user32test.c` (build with tests/windows/build.sh, copy to `build/winetests/user32_tcos.exe`, `scripts/winetest.sh user32 tcos`), Wine's `user32` win/class/msg suites.

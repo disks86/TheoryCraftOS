@@ -52,6 +52,9 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | kernel32 locale | 150 (stopped early) | about 4600, runs to the end (en-US and the invariant locale only; no normalization, locale enumeration, geo info or code pages) |
 | ntdll reg (NT registry services) | 133 | about 90 (needs an in-kernel registry: done; registry links, RtlQueryRegistryValues not) |
 | advapi32 registry | not run | 166, runs to the end |
+| user32 win | not run (no windows) | 29 of the suite (runs to the end): GetAncestor/IsChild/GetParent follow Windows, focus/activation checks after SetForegroundWindow, a few FindWindow cases |
+| user32 class | not run | 243 (stops at an access violation near the end): ANSI procedure handles (Wine's WINPROC handles; user32 uses thunks), icons/cursors (no cursor or icon functions in user32 yet), class atoms stay in the atom table after UnregisterClass, dialog classes |
+| user32 msg | not run | hangs in test_messages (kernel side: ShowWindow/maximize with WM_GETMINMAXINFO is not done; the cause of the hang is not found), 400+ failures before it: minimized window position (-32000), radio button/control behaviour (the Button, Static ... classes have no control code), mouse input (SendInput is a stub) |
 | kernel32 atom | 9422 (hung) | 0 (needed user32 wsprintf, now in src/Windows/user32) |
 | kernel32 virtual | 10983 | 0 (passes; the child-process phase hung or lost the child once in four runs) |
 | kernel32 heap | 3463 (hung) | about 285 before test_heap_sizes (Global/Local memory done; HeapWalk regions, HeapQueryInformation, heap flags/debug heap and Windows' internal sub-heap sizes are not) |
