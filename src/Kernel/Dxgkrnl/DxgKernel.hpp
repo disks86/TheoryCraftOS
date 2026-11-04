@@ -64,7 +64,19 @@ class IWaitHook {
 //                    buffers and for each entry two words: stream | output << 8 | start component << 16 | component count << 24, and the buffer)
 //   DestroyShader / DestroyPipeline   handle
 //   CreateComputePipeline   shader (a Compute stage shader)                                                                           reply: handle
-enum class EscapeOp : uint32_t { CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5 };
+//   Direct3D 12 objects (D3d12.hpp), what d3d12.dll makes its root signatures, descriptor heaps and tiled resources of:
+//   CreateRootSignature     byte_count, the serialized root signature (padded to a word)                                               reply: handle
+//   DestroyRootSignature / DestroyDescriptorHeap   handle
+//   CreateDescriptorHeap    type (0 views, 1 samplers), count                                                                          reply: handle
+//   WriteDescriptors        heap, count, then per descriptor 14 words: index, kind (a DescriptorKind: 0 clear, 1 SRV, 2 UAV, 3 CBV, 4 sampler), allocation handle, offset (lo, hi), size (lo, hi),
+//                           and the sampler: filter, address_u, address_v, mip_filter, lod_bias (float), min_lod, max_lod
+//   CopyDescriptors         destination heap, destination index, source heap, source index, count
+//   UpdateTileMappings      reserved allocation, first tile, heap (0: unmap), heap offset (lo, hi), tile count
+//   QuerySync               sync object handle                                                                                        reply: the value (lo, hi) - a fence's counter (D3D12's GetCompletedValue), a semaphore's count
+enum class EscapeOp : uint32_t {
+  CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5,
+  CreateRootSignature = 6, DestroyRootSignature = 7, CreateDescriptorHeap = 8, DestroyDescriptorHeap = 9, WriteDescriptors = 10, CopyDescriptors = 11, UpdateTileMappings = 12, QuerySync = 13,
+};
 
 // A render target lent to a compositor that draws on the same device (Kernel::acquire_image).
 struct AcquiredImage {
@@ -176,6 +188,7 @@ class Kernel {
   struct ShareToken;
   Process* find_process(ProcessId pid);
   bool pump_locked();
+  NtStatus escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteReader& in, ByteWriter& out, ByteView reply);
   void destroy_device_locked(Process& p, Handle device);
   void close_process_locked(ProcessId pid);
   NtStatus create_shader_locked(Process& p, Handle device, const ShaderDesc& desc, Handle* shader);

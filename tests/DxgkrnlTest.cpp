@@ -4887,6 +4887,110 @@ void test_d3d12_binding() {
   CHECK(e.kernel.destroy_descriptor_heap(kPid, small) == status::kSuccess && e.kernel.destroy_descriptor_heap(kPid, small) == status::kInvalidHandle);
 }
 
+// The buffer copies (CopyBuffer, CopyBufferImage) of the stream and the escapes that make Direct3D 12 objects, as d3d12.dll uses them.
+void test_d3d12_copies_and_escapes() {
+  Env e;
+  auto bytes_of = [](const std::vector<uint8_t>& v) { return ConstByteView(v.data(), v.size()); };
+  std::vector<uint8_t> pattern(64);
+  for (uint32_t i = 0; i < 64; ++i) pattern[i] = static_cast<uint8_t>(i * 3 + 1);
+  Handle a = e.buffer(kAllocVertexBuffer, 64), b = e.buffer(kAllocVertexBuffer, 64);
+  CHECK(e.write(a, bytes_of(pattern)));
+  {
+    CommandWriter w(e.allocator);
+    w.copy_buffer(1, 8, 0, 16, 32);
+    CHECK(e.render(w, {a, b}) == status::kSuccess);
+  }
+  auto read = [&](Handle h, uint32_t offset) {
+    LockResult r;
+    uint8_t v = 0xEE;
+    if (e.kernel.lock(kPid, h, kLockReadOnly, 0, &r) == status::kSuccess) {
+      v = r.data[offset];
+      e.kernel.unlock(kPid, h);
+    }
+    return v;
+  };
+  CHECK(read(b, 8) == pattern[16] && read(b, 39) == pattern[47] && read(b, 7) == 0 && read(b, 40) == 0);
+  // refused: out of range, overlapping inside one buffer, an image, a pass in progress
+  Handle img = e.alloc(kTexture, Format::A8R8G8B8, 4, 4);
+  for (int bad = 0; bad < 4; ++bad) {
+    CommandWriter w(e.allocator);
+    if (bad == 0) w.copy_buffer(1, 40, 0, 0, 32);
+    if (bad == 1) w.copy_buffer(0, 0, 0, 16, 32);
+    if (bad == 2) w.copy_buffer(2, 0, 0, 0, 16);
+    if (bad == 3) { w.begin_pass(2, kNoAllocation, 0, {0, 0, 0, 1}, 1, 0); w.copy_buffer(1, 0, 0, 0, 4); w.end_pass(); }
+    CHECK(e.render(w, {a, b, img}) == status::kInvalidParameter);
+  }
+  // a buffer to a texture and back: rows 20 bytes apart, a 3 x 2 rectangle at (1, 1) of a 4 x 4 image
+  CHECK(e.fill(img, 0));
+  Handle staging = e.buffer(kAllocVertexBuffer, 128), back = e.buffer(kAllocVertexBuffer, 128);
+  std::vector<uint8_t> rows(128, 0);
+  for (uint32_t r = 0; r < 2; ++r)
+    for (uint32_t x = 0; x < 12; ++x) rows[8 + r * 20 + x] = static_cast<uint8_t>(0x10 + r * 0x20 + x);
+  CHECK(e.write(staging, bytes_of(rows)));
+  {
+    CommandWriter w(e.allocator);
+    w.copy_buffer_to_image(0, 0, 0, 1, 1, 3, 2, 1, 8, 20);
+    CHECK(e.render(w, {img, staging}) == status::kSuccess);
+  }
+  CHECK(e.pixel(img, 0, 0) == 0 && e.pixel(img, 1, 1) == 0x13121110u && e.pixel(img, 3, 1) == 0x1B1A1918u && e.pixel(img, 1, 2) == 0x33323130u && e.pixel(img, 1, 3) == 0);
+  {
+    CommandWriter w(e.allocator);
+    w.copy_image_to_buffer(0, 0, 0, 1, 1, 3, 2, 1, 32, 16);
+    CHECK(e.render(w, {img, back}) == status::kSuccess);
+  }
+  CHECK(read(back, 32) == 0x10 && read(back, 43) == 0x1B && read(back, 48) == 0x30 && read(back, 59) == 0x3B && read(back, 44) == 0);
+  // refused: a rectangle outside the image, a pitch that is too short, a missing level, a buffer too small
+  for (int bad = 0; bad < 4; ++bad) {
+    CommandWriter w(e.allocator);
+    if (bad == 0) w.copy_buffer_to_image(0, 0, 0, 2, 0, 3, 1, 1, 0, 16);
+    if (bad == 1) w.copy_buffer_to_image(0, 0, 0, 0, 0, 3, 1, 1, 0, 8);
+    if (bad == 2) w.copy_buffer_to_image(0, 1, 0, 0, 0, 1, 1, 1, 0, 4);
+    if (bad == 3) w.copy_buffer_to_image(0, 0, 0, 0, 0, 4, 4, 1, 0, 16);
+    CHECK(e.render(w, {img, e.buffer(kAllocVertexBuffer, 32)}) == status::kInvalidParameter);
+  }
+
+  // the escapes: a root signature (RTS0 free serialized form, version 1.0, no parameters), a descriptor heap, descriptors, a fence's value
+  auto escape = [&](std::vector<uint32_t> request, uint32_t reply_words, std::vector<uint32_t>* reply = nullptr) {
+    std::vector<uint32_t> buffer(std::max<size_t>(request.size(), reply_words) + 1, 0);
+    std::copy(request.begin(), request.end(), buffer.begin());
+    uint32_t reply_bytes = 0;
+    const NtStatus st = e.kernel.escape(kPid, e.dev, ConstByteView(reinterpret_cast<const uint8_t*>(request.data()), request.size() * 4),
+                                        ByteView(reinterpret_cast<uint8_t*>(buffer.data()), buffer.size() * 4), &reply_bytes);
+    if (reply) reply->assign(buffer.begin(), buffer.begin() + reply_bytes / 4);
+    return st;
+  };
+  std::vector<uint32_t> reply;
+  const uint32_t empty_signature[6] = {1, 0, 24, 0, 24, 0};
+  std::vector<uint32_t> create_signature = {6, sizeof empty_signature};
+  create_signature.insert(create_signature.end(), empty_signature, empty_signature + 6);
+  CHECK(escape(create_signature, 1, &reply) == status::kSuccess && reply.size() == 1 && reply[0] != 0);
+  const uint32_t signature = reply.empty() ? 0 : reply[0];
+  CHECK(escape({7, signature}, 0) == status::kSuccess && escape({7, signature}, 0) == status::kInvalidHandle);
+  CHECK(escape({6, 3, 0x01020304}, 1) == status::kInvalidParameter);
+  CHECK(escape({8, 0, 4}, 1, &reply) == status::kSuccess && reply.size() == 1);
+  const uint32_t heap = reply.empty() ? 0 : reply[0];
+  CHECK(escape({8, 2, 4}, 1) == status::kInvalidParameter);
+  // two descriptors: a constant buffer view of a vertex buffer range (index 1), a cleared one (index 2)
+  std::vector<uint32_t> write = {10, heap, 2};
+  const uint32_t d1[14] = {1, 3, a, 16, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0}, d2[14] = {2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  write.insert(write.end(), d1, d1 + 14);
+  write.insert(write.end(), d2, d2 + 14);
+  CHECK(escape(write, 0) == status::kSuccess);
+  CHECK(escape({11, heap, 0, heap, 1, 2}, 0) == status::kSuccess);
+  CHECK(escape({11, heap, 3, heap, 1, 2}, 0) == status::kInvalidParameter);
+  CHECK(escape({10, heap, 1, 9, 3, a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0) == status::kInvalidParameter);      // (a descriptor past the heap)
+  CHECK(escape({9, heap}, 0) == status::kSuccess && escape({9, heap}, 0) == status::kInvalidHandle);
+  Handle fence = 0;
+  CHECK(e.kernel.create_sync(kPid, e.dev, SyncType::Fence, 5, 0, &fence) == status::kSuccess);
+  CHECK(escape({13, fence}, 2, &reply) == status::kSuccess && reply.size() == 2 && reply[0] == 5 && reply[1] == 0);
+  const uint64_t value = 0x100000007ull;
+  Handle handles[1] = {fence};
+  CHECK(e.kernel.signal_sync_cpu(kPid, ArrayView<const Handle>(handles, 1), ArrayView<const uint64_t>(&value, 1)) == status::kSuccess);
+  CHECK(escape({13, fence}, 2, &reply) == status::kSuccess && reply.size() == 2 && reply[0] == 7 && reply[1] == 1);
+  CHECK(escape({13, 0x7777}, 2) == status::kInvalidHandle);
+  CHECK(escape({99}, 0) == status::kNotSupported);
+}
+
 // Root unordered access views and root constants for a compute shader.
 void test_d3d12_compute() {
   Env e;
@@ -7994,6 +8098,7 @@ int main() {
   test_stream_output_extras();
   test_root_signature_parse();
   test_d3d12_binding();
+  test_d3d12_copies_and_escapes();
   test_d3d12_compute();
   test_d3d12_buffer_views();
   test_d3d12_buffer_views_in_draw();

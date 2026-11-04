@@ -34,6 +34,14 @@ WaitForSynchronizationObject, Signal/WaitForSynchronizationObjectFromGpu.
 heap handle, heap offset lo/hi; **out**: pitch, backing bytes lo/hi (CreateAllocation writes them back; OpenResource hands the same data to other processes). Smaller blobs
 are STATUS_INVALID_PARAMETER. `Primary` adds kAllocPresent, CreateShared adds kAllocShared.
 
+### Direct3D 12 through Escape and Render
+
+d3d12.dll (`docs/WindowsUserMode.md`) needs no extra service: `NtGdiDdDDIEscape` (driver private data, `DxgKernel.hpp` `EscapeOp`) carries shaders and pipelines (1 .. 5) and the Direct3D 12 objects:
+`CreateRootSignature` 6, `DestroyRootSignature` 7, `CreateDescriptorHeap` 8, `DestroyDescriptorHeap` 9, `WriteDescriptors` 10 (up to 4096 descriptors a call, 14 words each), `CopyDescriptors` 11,
+`UpdateTileMappings` 12 and `QuerySync` 13 (the value of a fence or the count of a semaphore: the kernel has no mapped fence value). The command stream has two ops beyond the draws:
+`CopyBuffer` and `CopyBufferImage`, run on the CPU copies of the allocations after the device work before them (a pass may not be open; the ranges are checked; a heap, reserved or query
+buffer is refused).
+
 ### Mapping notes
 
 - Lock: dxgk's backing is not in the process, so Lock maps a region of the process's address space with a copy; Unlock copies back unless ReadOnly. `PrivateDriverData`

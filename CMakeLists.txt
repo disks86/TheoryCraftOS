@@ -1089,7 +1089,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
     COMMENT "Building ws2_32.dll")
   # The other system libraries of Windows (user32.dll, gdi32.dll ...): files with every export in place, none of them implemented yet. They are only stubs (see above).
   set(WINDOWS_STUB_LIBRARIES user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi
-      dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 dxgi dwrite shcore
+      dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
       avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
       activeds normaliz sensapi authz rasapi32)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
@@ -1103,6 +1103,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   # shell32.dll uses the registry (advapi32) and the window system (user32); the string functions it shares with shlwapi are forwarders in shell32.def.
   set(WINDOWS_IMPORTS_shell32 advapi32 user32 ole32)
   set(WINDOWS_IMPORTS_shlwapi advapi32)
+  set(WINDOWS_IMPORTS_dxgi gdi32 user32)      # (the D3DKMT thunks, the display size and the window's device context)
+  set(WINDOWS_IMPORTS_d3d12 gdi32)      # (the D3DKMT thunks of the kernel's Direct3D)
   set(WINDOWS_IMPORTS_shcore advapi32 ole32 win32u)      # (the registry, CoTaskMemAlloc, the DPI services of win32k)
   set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
   set(WINDOWS_IMPORTS_imm32 win32u)      # (the services of win32k: input contexts, hot keys)
