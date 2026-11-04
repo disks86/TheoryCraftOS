@@ -26,7 +26,6 @@
 #include <initializer_list>
 #include <new>
 #include "Math/FloatMath.hpp"
-#include <cstdlib>
 #include "Script/Number.hpp"
 
 namespace script {
@@ -2348,6 +2347,15 @@ void Vm::describe(const Value& v, String* out, uint32_t depth) {
   out->push_back('}');
 }
 
+// Debugging a site: build with -DTCOS_JS_STACKS to add the frames an error was made in (the kernel has no environment to ask).
+static constexpr bool js_stacks_enabled() {
+#ifdef TCOS_JS_STACKS
+  return true;
+#else
+  return false;
+#endif
+}
+
 void Vm::take_exception(String* text) {
   text->clear();
   if (halted_ && !halt_reason_.empty()) {
@@ -2355,7 +2363,7 @@ void Vm::take_exception(String* text) {
     text->append(halt_reason_.view());
   } else {
     describe(exception_, text, 0);
-    if (getenv("TCOS_JS_STACKS") && exception_.is_object() && exception_.as_object()->okind == ObjKind::Error) {   // (debugging a site: TCOS_JS_STACKS=1 adds the frames the error was made in, the lines after the first of its stack)
+    if (js_stacks_enabled() && exception_.is_object() && exception_.as_object()->okind == ObjKind::Error) {   // (debugging a site: TCOS_JS_STACKS=1 adds the frames the error was made in, the lines after the first of its stack)
       Value stack;
       if (get(exception_, intern("stack"), &stack) && stack.is_string()) {
         const StringView all = stack.as_string()->view();
