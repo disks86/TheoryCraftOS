@@ -98,6 +98,7 @@ SVC NtUserSetClassLong(ULONG_PTR hwnd, ULONG_PTR index, ULONG_PTR value, ULONG_P
 SVC NtUserSetClassLongPtr(ULONG_PTR hwnd, ULONG_PTR index, ULONG_PTR value, ULONG_PTR ansi);
 SVC NtUserSetClassWord(ULONG_PTR hwnd, ULONG_PTR index, ULONG_PTR value);
 SVC NtUserRegisterWindowMessage(ULONG_PTR name);
+SVC NtUserGetAtomName(ULONG_PTR atom, ULONG_PTR name);
 SVC NtUserWindowFromPoint(ULONG_PTR x, ULONG_PTR y);
 SVC NtUserSetProp(ULONG_PTR hwnd, ULONG_PTR name, ULONG_PTR data);
 SVC NtUserGetProp(ULONG_PTR hwnd, ULONG_PTR name);
@@ -158,11 +159,13 @@ static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags
  * window with its text, style and messages kept by the window manager). Made when the process first registers, creates or looks for a class. */
 static void builtin_classes(void) {
   static volatile LONG done;
-  static const WCHAR *const names[] = {L"Button", L"Static", L"Edit", L"ListBox", L"ComboBox", L"ComboLBox", L"ScrollBar", L"#32770", L"MDIClient", L"IME", L"SysLink", L"tooltips_class32"};
+  static const struct { const WCHAR *name; UINT style; int wnd_extra; } classes[] = {
+      {L"Button", 0x8b, 0}, {L"ComboBox", 0x8b, 0}, {L"Edit", 0x88, 0}, {L"ListBox", 0x88, 0}, {L"MDIClient", 0, 0}, {L"ScrollBar", 0x8b, 0}, {L"Static", 0x88, 0},
+      {L"ComboLBox", 0x808, 0}, {L"#32768", 0x20808, 0}, {L"#32770", 0x808, 30}, {L"#32771", 0x803, 0}, {L"#32772", 0, 0}, {L"IME", 0, 0}, {L"SysLink", 0x8, 0}, {L"tooltips_class32", 0x8, 0}};
   if (__sync_lock_test_and_set(&done, 1)) return;
-  for (size_t_ i = 0; i < sizeof names / sizeof names[0]; ++i) {
-    WNDCLASSEX_ wc = {sizeof wc, 0x4000 /* CS_GLOBALCLASS */ | 8 /* CS_DBLCLKS */, builtin_proc, 0, names[i][0] == L'#' ? 30 : 0, GetModuleHandleW(L"user32.dll"), NULL, NULL, NULL, NULL, names[i], NULL};
-    register_class(&wc, names[i], 0);
+  for (size_t_ i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
+    WNDCLASSEX_ wc = {sizeof wc, 0x4000 /* CS_GLOBALCLASS */ | classes[i].style, builtin_proc, 0, classes[i].wnd_extra, GetModuleHandleW(L"user32.dll"), NULL, NULL, NULL, NULL, classes[i].name, NULL};
+    register_class(&wc, classes[i].name, 0);
   }
 }
 
@@ -201,43 +204,47 @@ EXPORT BOOL WINAPI UnregisterClassA(const char *name, HANDLE instance) {
   wide_free(w, name);
   return r;
 }
-static BOOL class_info(HANDLE instance, const WCHAR *name, WNDCLASSEX_ *wc, BOOL ansi) {
+/* Answers the class atom (nonzero on success, like Windows). The hInstance of the result is the one asked for, except for the classes of user32 itself (0). */
+static DWORD class_info(HANDLE instance, const WCHAR *name, WNDCLASSEX_ *wc, BOOL ansi) {
   UNICODE_STRING us;
   ULONG_PTR menu = 0;
   builtin_classes();
-  if (!name || !wc) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!name || !wc) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
   us_name(&us, name);
   wc->lpszClassName = name;
   wc->lpszMenuName = NULL;
   const ATOM atom = (ATOM)NtUserGetClassInfoEx((ULONG_PTR)instance, (ULONG_PTR)&us, (ULONG_PTR)wc, (ULONG_PTR)&menu, ansi);
-  if (!atom) return FALSE;
+  if (!atom) return 0;
   wc->lpszMenuName = (const void *)menu;
-  return TRUE;
+  wc->hInstance = wc->hInstance == GetModuleHandleW(L"user32.dll") ? NULL : instance;
+  return atom;
 }
-EXPORT BOOL WINAPI GetClassInfoExW(HANDLE instance, const WCHAR *name, WNDCLASSEX_ *wc) { if (wc && wc->cbSize != sizeof *wc) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; } return class_info(instance, name, wc, FALSE); }
-EXPORT BOOL WINAPI GetClassInfoExA(HANDLE instance, const char *name, WNDCLASSEX_ *wc) {
-  if (wc && wc->cbSize != sizeof *wc) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+EXPORT DWORD WINAPI GetClassInfoExW(HANDLE instance, const WCHAR *name, WNDCLASSEX_ *wc) { if (wc && wc->cbSize != sizeof *wc) { SetLastError(ERROR_INVALID_PARAMETER); return 0; } return class_info(instance, name, wc, FALSE); }
+EXPORT DWORD WINAPI GetClassInfoExA(HANDLE instance, const char *name, WNDCLASSEX_ *wc) {
+  if (wc && wc->cbSize != sizeof *wc) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
   WCHAR *w = wide_of(name);
-  const BOOL r = name ? class_info(instance, w, wc, TRUE) : (SetLastError(ERROR_INVALID_PARAMETER), FALSE);
+  const DWORD r = name ? class_info(instance, w, wc, TRUE) : (SetLastError(ERROR_INVALID_PARAMETER), 0);
   if (r) wc->lpszClassName = name;
   wide_free(w, name);
   return r;
 }
-EXPORT BOOL WINAPI GetClassInfoW(HANDLE instance, const WCHAR *name, WNDCLASS_ *wc) {
+EXPORT DWORD WINAPI GetClassInfoW(HANDLE instance, const WCHAR *name, WNDCLASS_ *wc) {
   WNDCLASSEX_ ex;
   ex.cbSize = sizeof ex;
-  if (!wc || !class_info(instance, name, &ex, FALSE)) return FALSE;
+  const DWORD atom = wc ? class_info(instance, name, &ex, FALSE) : 0;
+  if (!atom) return 0;
   wc->style = ex.style; wc->lpfnWndProc = ex.lpfnWndProc; wc->cbClsExtra = ex.cbClsExtra; wc->cbWndExtra = ex.cbWndExtra; wc->hInstance = ex.hInstance; wc->hIcon = ex.hIcon;
   wc->hCursor = ex.hCursor; wc->hbrBackground = ex.hbrBackground; wc->lpszMenuName = ex.lpszMenuName; wc->lpszClassName = ex.lpszClassName;
-  return TRUE;
+  return atom;
 }
-EXPORT BOOL WINAPI GetClassInfoA(HANDLE instance, const char *name, WNDCLASS_ *wc) {
+EXPORT DWORD WINAPI GetClassInfoA(HANDLE instance, const char *name, WNDCLASS_ *wc) {
   WNDCLASSEX_ ex;
   ex.cbSize = sizeof ex;
-  if (!wc || !GetClassInfoExA(instance, name, &ex)) return FALSE;
+  const DWORD atom = wc ? GetClassInfoExA(instance, name, &ex) : 0;
+  if (!atom) return 0;
   wc->style = ex.style; wc->lpfnWndProc = ex.lpfnWndProc; wc->cbClsExtra = ex.cbClsExtra; wc->cbWndExtra = ex.cbWndExtra; wc->hInstance = ex.hInstance; wc->hIcon = ex.hIcon;
   wc->hCursor = ex.hCursor; wc->hbrBackground = ex.hbrBackground; wc->lpszMenuName = ex.lpszMenuName; wc->lpszClassName = ex.lpszClassName;
-  return TRUE;
+  return atom;
 }
 EXPORT int WINAPI GetClassNameW(HANDLE hwnd, LPWSTR buffer, int count) {
   UNICODE_STRING us;
@@ -454,3 +461,22 @@ EXPORT BOOL WINAPI AdjustWindowRectEx(RECT_ *rect, DWORD style, BOOL menu, DWORD
   return (NtUserCallTwoParam((ULONG_PTR)rect, (ULONG_PTR)&params, 7 /* AdjustWindowRect */) & 0xFFFFFFFFu) != 0;
 }
 EXPORT BOOL WINAPI AdjustWindowRect(RECT_ *rect, DWORD style, BOOL menu) { return AdjustWindowRectEx(rect, style, menu, 0); }
+
+/* Clipboard format names are atoms of the window manager's table (the same table the class names use). */
+EXPORT UINT WINAPI RegisterClipboardFormatW(const WCHAR *name) { return RegisterWindowMessageW(name); }
+EXPORT UINT WINAPI RegisterClipboardFormatA(const char *name) { return RegisterWindowMessageA(name); }
+EXPORT int WINAPI GetClipboardFormatNameW(UINT format, LPWSTR buffer, int count) {
+  UNICODE_STRING us;
+  if (format < 0xC000 || !buffer || count <= 0) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+  us.Length = 0; us.MaximumLength = (USHORT)(count > 32767 ? 65534 : count * 2); us.Buffer = buffer;
+  return (int)(NtUserGetAtomName(format, (ULONG_PTR)&us) & 0xFFFFFFFFu);
+}
+EXPORT int WINAPI GetClipboardFormatNameA(UINT format, LPSTR buffer, int count) {
+  WCHAR wide[260];
+  if (!buffer || count <= 0) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+  const int n = GetClipboardFormatNameW(format, wide, 260);
+  if (!n) return 0;
+  const int bytes = WideCharToMultiByte(65001, 0, wide, n, buffer, count - 1, NULL, NULL);
+  buffer[bytes] = 0;
+  return bytes;
+}

@@ -63,7 +63,7 @@ Class* find_class_for_process(uint64_t pid, uint32_t atom, uint64_t instance, bo
   for (Class& c : state().classes) {
     if (c.dead || c.atom != atom) continue;
     if (!(c.pid == pid || c.is_system || (c.style & wn::CS_GLOBALCLASS))) continue;
-    if (check_instance && instance != 0 && c.instance != 0 && c.instance != instance && !c.is_system && !(c.style & wn::CS_GLOBALCLASS)) continue;
+    if (check_instance && !c.is_system && !(c.style & wn::CS_GLOBALCLASS) && (c.instance & ~uint64_t{0xFFFF}) != (instance & ~uint64_t{0xFFFF})) continue;      // (a local class is found by its module; the low 16 bits of the handle do not count)
     return &c;
   }
   return nullptr;
@@ -110,6 +110,7 @@ void create_system_classes() {
     return c;
   };
   s.desktop_class = make(wn::ATOM_DESKTOP, "#32769");
+  if (s.desktop_class) s.desktop_class->style |= 0x8 /* CS_DBLCLKS */;
   const uint32_t message_atom = atom_add(ArrayView<const char16_t>(u"Message", 7));
   s.message_class = make(message_atom, "Message");
 }
