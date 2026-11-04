@@ -567,7 +567,13 @@ void Window::stop_handler_thread() {
     count = worker_count_;
   }
   queue_signal_.release(count);  // the threads first run what is queued, then see the flag
-  for (uint32_t i = 0; i < count; ++i) kernel::join(workers_[i].thread);
+  // A handler can be stuck for good (a network wait, a lock): shutdown must not wait for it for ever. A worker that does not end within the limit is left
+  // behind (the kernel stops all threads shortly after), so it is not joined and its slot is not reused.
+  constexpr uint64_t kJoinLimitUs = 3000000;
+  bool all_ended = true;
+  for (uint32_t i = 0; i < count; ++i)
+    if (!kernel::join(workers_[i].thread, kJoinLimitUs)) all_ended = false;
+  if (!all_ended) return;   // (handler_stop_ stays set: nothing new is queued, and the stuck handler still owns its slot)
   kernel::ScopedMutex lock(queue_mutex_);
   for (Worker& worker : workers_) worker = Worker();
   worker_count_ = 0;

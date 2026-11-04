@@ -44,7 +44,7 @@ void RenderLoop::stop() {
   __atomic_store_n(&stop_, true, __ATOMIC_RELEASE);
   window_.mark_dirty();  // wakes it from its wait
   window_.mark_dirty();
-  kernel::join(thread);
+  if (!kernel::join(thread, 3000000)) return;   // stuck in a frame (the GPU, the UI lock): not waited for at shutdown; thread_ stays set, so the renderer is not reused
   __atomic_store_n(&thread_, static_cast<kernel::Thread*>(nullptr), __ATOMIC_RELEASE);
 }
 
