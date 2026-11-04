@@ -389,6 +389,11 @@ uint64_t nt_set_parent(Call& call) {
     parent = find_window(uint32_t(p));
     if (!parent) return call.fail(kErrorInvalidWindowHandle);
   }
+  // (no cycles: the new parent must not be the window, one of its descendants, or a window owned by one of them)
+  for (const Window* x = parent; x; x = x->owner ? x->owner : x->parent) {
+    if (x == w) return call.fail(kErrorInvalidParameter);
+    if (!x->owner && !x->parent) break;
+  }
   if (parent == w || is_child_of(w, parent)) return call.fail(kErrorInvalidParameter);
   Queue* q = queue_of(call, true);
   (void)q;
@@ -406,7 +411,7 @@ uint64_t nt_get_ancestor(Call& call) {
   const uint32_t type = call.arg32(1);
   if (w->desktop->root == w) return 0;
   switch (type) {
-    case wn::GA_PARENT: return w->parent && w->parent != w->desktop->root ? w->parent->handle : 0;
+    case wn::GA_PARENT: return w->parent ? w->parent->handle : 0;      // (a top-level window's parent is the desktop)
     case wn::GA_ROOT: {
       Window* r = top_level_of(w);
       return r && r->parent ? r->handle : 0;
@@ -553,7 +558,7 @@ uint64_t window_get_long(Call& call, Window* w, int32_t offset, uint32_t size) {
     case wn::GWL_WNDPROC: v = w->wndproc; break;
     case wn::GWL_USERDATA: v = w->userdata; break;
     case wn::GWL_HWNDPARENT:
-      v = (w->style & wn::WS_CHILD) ? (w->parent && w->parent->parent ? w->parent->handle : 0) : (w->owner ? w->owner->handle : 0);
+      v = ((w->style & wn::WS_CHILD) && !(w->style & wn::WS_POPUP)) ? (w->parent && w->parent->parent ? w->parent->handle : 0) : (w->owner ? w->owner->handle : 0);
       break;
     default: return call.fail(kErrorInvalidIndex);
   }
@@ -960,7 +965,9 @@ uint64_t nt_call_hwnd_param(Call& call) {
   }
   if (code == kIsChild) {
     Window* child = find_window(uint32_t(param));
-    return w && child && is_child_of(w, child);
+    if (!w || !child) return 0;
+    for (Window* p = child; p && (p->style & wn::WS_CHILD) && p->parent; p = p->parent) if (p->parent == w) return 1;      // (only through child windows: the desktop is nobody's parent)
+    return 0;
   }
   if (!w) return call.fail(kErrorInvalidWindowHandle);
   switch (code) {
