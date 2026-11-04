@@ -18,7 +18,7 @@
 /* The Url* functions of shlwapi.dll (included by shlwapi.c, after the path functions). Everything works on wide strings; the ANSI functions convert in and out.
    Checked with Wine's tests (tests/windows/wine/shlwapi/url.c). */
 
-#define URL_MAX 2084
+#define URL_MAX 8400
 #define E_FAIL__ ((HRESULT_)0x80004005)
 #define URL_E_INVALID_SYNTAX_ ((HRESULT_)0x80041001)
 
@@ -400,43 +400,8 @@ EXPORT HRESULT_ WINAPI UrlGetPartA(LPCSTR url, LPSTR out, DWORD *length, DWORD p
 
 /* ---- canonical form, combining, comparing ------------------------------------------------------------------------------------------------------------------------ */
 
-/* Collapses "." and ".." in the path of a hierarchical URL (between the authority and any ? or #). */
-static int url_simplify(WCHAR *url, int n) {
-  int path = 0;
-  const int sl = url_scheme_length(url);
-  if (sl) { path = sl + 1; if (url[path] == '/' && url[path + 1] == '/') { path += 2; if (url[path] == '/' && url_is_file(url)) {} else while (path < n && url[path] != '/' && url[path] != '?' && url[path] != '#') ++path; } }
-  if (sl && !(url[sl + 1] == '/')) return n;
-  int end = path;
-  while (end < n && url[end] != '?' && url[end] != '#') ++end;
-  /* root of the path: the path of "file:///c:/x" starts after the drive */
-  WCHAR work[URL_MAX + 1];
-  int w = 0;
-  for (int i = 0; i < path; ++i) work[w++] = url[i];
-  const int root = w;
-  int i = path;
-  while (i < end) {
-    int s = i;
-    while (i < end && url[i] != '/') ++i;
-    const int len = i - s;
-    const int sep = i < end;
-    if (len == 0) { if (w == root || work[w - 1] != '/') work[w++] = '/'; if (sep) ++i; continue; }
-    if (len == 1 && url[s] == '.') { if (sep) ++i; else if (w > root && work[w - 1] != '/') {} continue; }
-    if (len == 2 && url[s] == '.' && url[s + 1] == '.') {
-      if (w > root) { if (work[w - 1] == '/') --w; while (w > root && work[w - 1] != '/') --w; }
-      if (!sep && w == root) work[w++] = '/';
-      if (sep) ++i;
-      continue;
-    }
-    for (int k = 0; k < len; ++k) work[w++] = url[s + k];
-    if (sep) { work[w++] = '/'; ++i; }
-  }
-  for (int k = end; k < n; ++k) work[w++] = url[k];
-  work[w] = 0;
-  for (int k = 0; k <= w; ++k) url[k] = work[k];
-  return w;
-}
 static int url_canonicalize(const WCHAR *url, DWORD flags, WCHAR *out) {
-  WCHAR work[URL_MAX + 1], escaped[URL_MAX + 1], clean[URL_MAX + 1];
+  WCHAR work[URL_MAX + 1], escaped[URL_MAX + 1], clean[URL_MAX + 1], dos[URL_MAX + 1];
   int n = 0;
   /* leading and trailing spaces and control characters go, and tab, newline and return anywhere */
   const WCHAR *first = url, *end = url;
@@ -446,35 +411,29 @@ static int url_canonicalize(const WCHAR *url, DWORD flags, WCHAR *out) {
   for (const WCHAR *p = first; p < end && n < URL_MAX; ++p) if (*p != '\t' && *p != '\n' && *p != '\r') clean[n++] = *p;
   clean[n] = 0;
   const WCHAR *src = clean;
-  if (flags & F_UNESCAPE) { n = url_unescape(src, flags & F_DONT_ESCAPE_EXTRA_INFO, work); if (n < 0) return -1; src = work; }
-  /* a path that is a DOS path becomes a file URL */
-  WCHAR dos[URL_MAX + 1];
-  if (!url_scheme_length(src) && ((src[0] >= 'a' && src[0] <= 'z') || (src[0] >= 'A' && src[0] <= 'Z')) && src[1] == ':' && (src[2] == '\\' || src[2] == '/')) {
-    DWORD l = URL_MAX;
-    if (UrlCreateFromPathW(src, dos, &l, 0) < 0) return -1;
-    src = dos;
-  }
-  if (flags & (F_ESCAPE_UNSAFE | F_ESCAPE_SPACES_ONLY)) {
+  /* a DOS or UNC path is the file URL of that path (and its unsafe characters are escaped, unless the caller asks for the path form or for unescaping) */
+  const int converted = ucn_dos_to_url(clean, n, dos);
+  const int file_flags = (flags & (F_FILE_USE_PATHURL | 0x80000000u)) != 0;
+  if (converted >= 0) { src = dos; n = converted; }
+  const int sl0 = url_scheme_length(src);
+  const UrlScheme *s0 = sl0 ? url_find_scheme(src, sl0) : NULL;
+  DWORD unescape = flags & F_UNESCAPE;
+  if (s0 && s0->scheme == 9 && (flags & F_FILE_USE_PATHURL)) unescape = F_UNESCAPE;      /* (a path is not percent-encoded) */
+  if (unescape) { n = url_unescape(src, flags & F_DONT_ESCAPE_EXTRA_INFO, work); if (n < 0) return -1; src = work; }
+  if (converted >= 0 && !file_flags && !unescape) n = url_escape(src, F_ESCAPE_UNSAFE | F_ESCAPE_PERCENT, escaped);
+  else if (flags & (F_ESCAPE_UNSAFE | F_ESCAPE_SPACES_ONLY)) {
     const DWORD escape_flags = (flags & F_ESCAPE_UNSAFE) ? (flags & (F_DONT_ESCAPE_EXTRA_INFO | F_ESCAPE_PERCENT)) : (F_ESCAPE_SPACES_ONLY | (flags & F_DONT_ESCAPE_EXTRA_INFO));
     n = url_escape(src, escape_flags, escaped);
-    if (n < 0) return -1;
   } else {
     n = 0;
     while (src[n] && n < URL_MAX) { escaped[n] = src[n]; ++n; }
     escaped[n] = 0;
   }
-  const int sl = url_scheme_length(escaped);
-  const UrlScheme *s = sl ? url_find_scheme(escaped, sl) : NULL;
-  if (!s || s->scheme != 9) return url_canon_core(escaped, n, flags, out);
-  /* file: URLs: the scheme is lower case; a backslash in the path is a slash */
-  for (int i = 0; i < sl; ++i) if (escaped[i] >= 'A' && escaped[i] <= 'Z') escaped[i] = (WCHAR)(escaped[i] + 32);
-  for (int i = sl; escaped[i] && escaped[i] != '?' && escaped[i] != '#'; ++i) if (escaped[i] == '\\') escaped[i] = '/';
-  if (!(flags & F_DONT_SIMPLIFY)) n = url_simplify(escaped, n);
-  for (int i = 0; i <= n; ++i) out[i] = escaped[i];
-  return n;
+  if (n < 0) return -1;
+  return url_canon_core(escaped, n, flags, out);
 }
 EXPORT HRESULT_ WINAPI UrlCanonicalizeW(LPCWSTR url, LPWSTR out, DWORD *length, DWORD flags) {
-  if (!url || !out || !length) return E_INVALIDARG_;
+  if (!url || !out || !length || !*length) return E_INVALIDARG_;
   WCHAR work[URL_MAX + 1];
   if (!*url) { if (*length < 1) { *length = 1; return E_POINTER_; } out[0] = 0; *length = 0; return 0; }
   const int n = url_canonicalize(url, flags, work);
@@ -483,7 +442,7 @@ EXPORT HRESULT_ WINAPI UrlCanonicalizeW(LPCWSTR url, LPWSTR out, DWORD *length, 
 }
 EXPORT HRESULT_ WINAPI UrlCanonicalizeA(LPCSTR url, LPSTR out, DWORD *length, DWORD flags) {
   WCHAR wide[URL_MAX + 1], work[URL_MAX + 1];
-  if (!url || !out || !length || !url_wide(url, wide, URL_MAX)) return E_INVALIDARG_;
+  if (!url || !out || !length || !*length || !url_wide(url, wide, URL_MAX)) return E_INVALIDARG_;
   if (!*url) { if (*length < 1) { *length = 1; return E_POINTER_; } out[0] = 0; *length = 0; return 0; }
   const int n = url_canonicalize(wide, flags, work);
   if (n < 0) return E_INVALIDARG_;
