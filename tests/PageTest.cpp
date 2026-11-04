@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <malloc.h>
 #include <sys/resource.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -466,6 +467,7 @@ struct FakeEnvironment final : IPageEnvironment {
     return true;
   }
   uint64_t now_ms() override { return clock; }
+  uint64_t monotonic_us() override { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return static_cast<uint64_t>(ts.tv_sec) * 1000000u + static_cast<uint64_t>(ts.tv_nsec) / 1000u; }
   void console(int, StringView t) override { console_lines.push_back(std::string(t.data(), t.size())); }
   StorageHub* shared_local = nullptr;   // (another window's: windows share localStorage and tell each other about changes)
   PageHub* shared_hub = nullptr;
@@ -580,6 +582,31 @@ static void test_style() {
   CHECK(js("<select id=s></select>", "var o = new Option('Label', 'v1', false, true); document.getElementById('s').appendChild(o); console.log(o.textContent, o.value, o instanceof HTMLOptionElement, o.selected, document.getElementById('s').value)", "Label v1 true true v1"));
   CHECK(js("<div id=d>x</div>", "var d = document.getElementById('d'); console.log(d.onclick, window.onerror, typeof new XMLSerializer().serializeToString(d), new XMLSerializer().serializeToString(d), document.implementation.createHTMLDocument('t').title, history instanceof History, new Map([[1, 2]]).get(1))", "null null string <div xmlns=\"http://www.w3.org/1999/xhtml\" id=\"d\">x</div> t true 2"));
   CHECK(js("<p id=p>x</p>", "var p = document.getElementById('p'); console.log(getComputedStyle(p).color, getComputedStyle(p).display, getComputedStyle(p).marginTop, getComputedStyle(p).textAlign)", "rgb(0, 0, 0) block 16px start"));
+  // long strings built a piece at a time share a buffer: the branches of one prefix and the old values stay as they were, and the hash of an appended string is the one
+  // of the same text made another way (a property key)
+  CHECK(js("<p>x</p>",
+           "var base = 'x'.repeat(300), a = base + 'A', b = base + 'B', a2 = a + 'C', a3 = a + 'D', o = {};"
+           "o[a2] = 1; o[a3] = 2;"
+           "var s = ''; for (var i = 0; i < 3000; i++) s += String.fromCharCode(97 + i % 26);"
+           "var snap = s; s += 'Z'; var key = {}; key[s] = 7; var again = s.slice(0, 3000) + 'Z';"
+           "console.log(a.length, b.length, a2.length, a.slice(-2), b.slice(-2), a2.slice(-3), a3.slice(-3), a2 === a + 'C', a3 === a + 'D', o[base + 'AC'], o[base + 'AD'], a2 in o,"
+           "snap.length, s.length, s.charAt(2999), s.charAt(3000), key[again], s.indexOf('xyz'), snap === s.slice(0, 3000), JSON.stringify(a2).length)",
+           "301 301 302 xA xB xAC xAD true true 1 2 true 3000 3001 j Z 7 23 true 304"));
+  // the rules are read again when a <style> element changes or comes, and not when the page changes some other way
+  CHECK(js("<style id=st>p { color: red }</style><p id=p>x</p>",
+           "var p = document.getElementById('p'), st = document.getElementById('st'), r = [];"
+           "r.push(getComputedStyle(p).color); document.body.appendChild(document.createElement('div')); p.className = 'k'; r.push(getComputedStyle(p).color);"
+           "st.textContent = 'p { color: blue }'; r.push(getComputedStyle(p).color);"
+           "var n = document.createElement('style'); n.textContent = 'p.k { color: green }'; document.head.appendChild(n); r.push(getComputedStyle(p).color);"
+           "n.remove(); r.push(getComputedStyle(p).color); console.log(r.join(' | '))",
+           "rgb(255, 0, 0) | rgb(255, 0, 0) | rgb(0, 0, 255) | rgb(0, 128, 0) | rgb(0, 0, 255)"));
+  // the computed styles are kept while the page is as it was, and not longer: one object read twice around a change, and an ancestor's change seen from its child
+  CHECK(js("<style>.red { color: rgb(255, 0, 0) } .box { display: none }</style><div id=d class=box><p id=p>x</p></div>",
+           "var d = document.getElementById('d'), p = document.getElementById('p'), c = getComputedStyle(p), cd = getComputedStyle(d);"
+           "var a = c.color + ',' + c.display + ',' + c.color + ',' + cd.display;"
+           "d.className = 'red'; p.style.fontWeight = 'bold';"
+           "console.log(a, c.color, c.fontWeight, cd.display, cd.color, getComputedStyle(p).color)",
+           "rgb(0, 0, 0),block,rgb(0, 0, 0),none rgb(255, 0, 0) 700 block rgb(255, 0, 0) rgb(255, 0, 0)"));
   CHECK(is("<html><body><p id=p>x</p><script>console.log(getComputedStyle(document.getElementById('p')).color)</script></body></html>", "rgb(232, 232, 232)") == false || true);
   CHECK(js("<p>x</p>", "console.log(CSS.escape('a.b#c'), CSS.escape('1a'), typeof CSS.supports)", "a\\.b\\#c \\31 a function"));
 }
@@ -6293,7 +6320,18 @@ int main(int argc, char** argv) {
       const bool loaded = page.load(html.c_str()); (void)loaded;
       getrusage(RUSAGE_SELF, &r1);
       printf("heap after load %llu KiB (peak %llu)\nload returned %d\nrss start %ld KiB, after load %ld KiB\n", (unsigned long long)(a.bytes >> 10), (unsigned long long)(a.peak >> 10), loaded ? 1 : 0, r0.ru_maxrss, r1.ru_maxrss);
-      settle_page(page, env, 20000);
+      { String t(a); page.timing_summary(&t); printf("timing after load: %.*s\n", static_cast<int>(t.size()), t.view().data()); }
+      if (getenv("PROBE_FIRSTDRAW")) {   // what the browser does before the timers run: the first picture
+        font::FontSet fonts0(a);
+        fonts0.add_bundled_fonts();
+        PagePicture first(a);
+        const bool ok0 = page.render_picture(&first, fonts0);
+        String t(a);
+        page.timing_summary(&t);
+        printf("first draw %d: %.*s\n", ok0 ? 1 : 0, static_cast<int>(t.size()), t.view().data());
+        fflush(stdout);
+      }
+      settle_page(page, env, getenv("PROBE_SETTLE") ? atoi(getenv("PROBE_SETTLE")) : 20000);
       if (getenv("PROBE_RENDER")) {
         struct rusage before;
         getrusage(RUSAGE_SELF, &before);
@@ -6304,6 +6342,7 @@ int main(int argc, char** argv) {
         const bool ok = page.render_picture(&picture, fonts);
         struct rusage ru;
         getrusage(RUSAGE_SELF, &ru);
+        { String t(a); page.timing_summary(&t); printf("timing: %.*s\n", static_cast<int>(t.size()), t.view().data()); }
         printf("render_picture %d, peak rss %ld KiB, heap now %llu KiB peak %llu KiB\n", ok ? 1 : 0, ru.ru_maxrss, (unsigned long long)(a.bytes >> 10), (unsigned long long)(a.peak >> 10));
         if (ok && getenv("PROBE_PNG")) {   // the page as a picture (the top 1280 x 800), written to the file
           const int32_t w = 1280, h = 800;

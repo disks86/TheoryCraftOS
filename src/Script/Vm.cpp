@@ -30,6 +30,8 @@
 
 namespace script {
 
+constexpr uint32_t kAppendBufferMin = 256;   // results of a + b at least this long are built in a buffer that can grow (Vm::concat_shared)
+
 namespace {
 
 uint32_t hash_text(StringView s) {
@@ -186,6 +188,10 @@ void Vm::halt(StringView reason) {
 void Vm::link(Cell* cell, uint64_t size) {
   cell->next = cells_;
   cells_ = cell;
+  account_bytes(size);
+}
+
+void Vm::account_bytes(uint64_t size) {
   heap_bytes_ += size;
   if (heap_bytes_ > gc_threshold_) gc_wanted_ = true;
   if (heap_bytes_ > memory_limit_ && !halted_) {
@@ -198,7 +204,9 @@ void Vm::link(Cell* cell, uint64_t size) {
 void Vm::free_cell(Cell* cell) {
   switch (cell->kind) {
     case CellKind::String: {
-      allocator_.deallocate(static_cast<JsString*>(cell)->wide);
+      JsString* str = static_cast<JsString*>(cell);
+      allocator_.deallocate(str->wide);
+      if (str->shared && --str->shared->refs == 0) allocator_.deallocate(str->shared);
       allocator_.deallocate(cell);
       break;
     }
@@ -451,6 +459,7 @@ JsString* Vm::concat(JsString* a, JsString* b) {
     halt("string too long");
     return empty_;
   }
+  if (total >= kAppendBufferMin) return concat_shared(a, b, static_cast<uint32_t>(total));
   void* mem = allocator_.allocate(sizeof(JsString) + total + 1);
   if (!mem) {
     halt("out of memory");
@@ -465,6 +474,51 @@ JsString* Vm::concat(JsString* a, JsString* b) {
   s->hash = hash_text(StringView(d, total));
   s->binary = a->binary || b->binary;   // (raw bytes stay raw)
   link(s, sizeof(JsString) + total + 1);
+  return s;
+}
+
+// a + b for a long result. Building a string a piece at a time (s += c, thousands of times) would copy and hash all of it for every piece; instead the result goes in
+// a buffer with room to grow, which the next append to it can use as it is. The hash goes on from the hash of `a` (FNV-1a reads the bytes in order).
+JsString* Vm::concat_shared(JsString* a, JsString* b, uint32_t total) {
+  StringBuffer* buffer = a->shared;
+  uint32_t hash;
+  if (buffer && buffer->used == a->length && total < buffer->capacity) {   // a is the longest string in its buffer, and b fits after it
+    char* d = buffer->bytes();
+    for (uint32_t i = 0; i < b->length; ++i) d[a->length + i] = b->data()[i];
+    hash = a->hash;
+    for (uint32_t i = 0; i < b->length; ++i) hash = (hash ^ static_cast<uint8_t>(d[a->length + i])) * 16777619u;
+    buffer->used = total;
+    d[total] = 0;
+  } else {
+    const uint32_t capacity = total <= (32u << 20) ? total * 2 : (64u << 20) + 1;   // (strings stop at 64 MiB)
+    void* mem = allocator_.allocate(sizeof(StringBuffer) + uint64_t{capacity} + 1);
+    if (!mem) {
+      halt("out of memory");
+      return empty_;
+    }
+    buffer = new (mem) StringBuffer();
+    buffer->capacity = capacity;
+    buffer->used = total;
+    char* d = buffer->bytes();
+    for (uint32_t i = 0; i < a->length; ++i) d[i] = a->data()[i];
+    for (uint32_t i = 0; i < b->length; ++i) d[a->length + i] = b->data()[i];
+    d[total] = 0;
+    hash = hash_text(StringView(d, total));
+    account_bytes(uint64_t{capacity} + 1);
+  }
+  void* mem = allocator_.allocate(sizeof(JsString) + 1);
+  if (!mem) {
+    if (buffer->refs == 0) allocator_.deallocate(buffer);
+    halt("out of memory");
+    return empty_;
+  }
+  JsString* s = new (mem) JsString();
+  s->length = total;
+  s->hash = hash;
+  s->binary = a->binary || b->binary;   // (raw bytes stay raw)
+  s->shared = buffer;
+  ++buffer->refs;
+  link(s, sizeof(JsString) + 1);
   return s;
 }
 
@@ -1274,7 +1328,11 @@ void Vm::sweep() {
       *link_to = c;
       link_to = &c->next;
       switch (c->kind) {
-        case CellKind::String: bytes += sizeof(JsString) + static_cast<JsString*>(c)->length + 1; break;
+        case CellKind::String: {
+          const JsString* str = static_cast<JsString*>(c);
+          bytes += sizeof(JsString) + (str->shared ? uint64_t{str->shared->capacity} / str->shared->refs : uint64_t{str->length}) + 1;   // (a shared buffer is counted once between its strings)
+          break;
+        }
         case CellKind::Env: bytes += sizeof(Env) + sizeof(Value) * static_cast<Env*>(c)->count; break;
         case CellKind::Object: {
           JsObject* o = static_cast<JsObject*>(c);

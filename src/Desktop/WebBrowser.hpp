@@ -243,6 +243,7 @@ class WebBrowser : public gui::Frame {
     void close_pip() override;
     bool set_fullscreen(bool on) override;
     uint64_t now_ms() override;
+    uint64_t monotonic_us() override;
     void console(int, StringView) override {}
     browser::StorageHub& local_storage_hub() override;
     browser::StorageHub& session_storage_hub() override { return session_; }
@@ -444,6 +445,7 @@ class WebBrowser : public gui::Frame {
   uint32_t reported_errors_ = 0;
   uint32_t script_errors_ = 0;
   String script_log_;
+  String load_timing_;   // where the time of the last page load went (Page::timing_summary)
   browser::SessionHistory history_;
   browser::CookieJar own_jar_;   // (the cookies, when the window is not given a jar to share)
   String current_, request_target_, status_text_;

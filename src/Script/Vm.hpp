@@ -388,6 +388,8 @@ class Vm {
   // heap
   void* alloc_cell(uint64_t size);
   void link(Cell* cell, uint64_t size);
+  void account_bytes(uint64_t size);   // `size` more bytes are held (a collection is wanted when there are many)
+  JsString* concat_shared(JsString* a, JsString* b, uint32_t total);
   void mark(Cell* cell);
   void mark_value(const Value& v);
   void mark_object(JsObject* o);

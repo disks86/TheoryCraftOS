@@ -636,6 +636,12 @@ class StyleSheet {
   // The rules read from now on belong to a shadow tree (the serial of its root; 0: the document): they apply to what is in that tree, and to its host through :host.
   void set_scope(uint32_t shadow_root_serial) { scope_ = shadow_root_serial; }
   void clear();
+  // Forgets what working out styles made (custom property scopes, kept texts) and keeps the rules: for a document whose style sources did not change.
+  void reset_derived() {
+    scopes_.clear();
+    kept_.clear();
+    for (uint32_t& slot : text_index_) slot = 0;
+  }
   uint32_t rule_count() const { return static_cast<uint32_t>(rules_.count()); }
   // Does a rule depend on the pointer (:hover, :active, :focus-within)? Then the page is drawn again when the pointer moves on to another element.
   bool uses_pointer_state() const { return pointer_state_; }

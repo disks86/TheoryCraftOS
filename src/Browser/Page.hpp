@@ -103,6 +103,7 @@ class IPageEnvironment : public IObjectEnvironment {
   }
   virtual void notification_close(uint32_t number) { (void)number; }
   virtual uint64_t now_ms() = 0;                 // milliseconds since 1970 (0 without a clock)
+  virtual uint64_t monotonic_us() { return 0; }  // microseconds since some fixed moment, for timing the phases of a page load (0 without a clock)
   virtual void console(int level, StringView text) = 0;
   // Web Storage: the hub of localStorage (all origins, all windows) and the one of this tab's sessionStorage; and what the pages share to talk to each other.
   virtual StorageHub& local_storage_hub() = 0;
@@ -275,6 +276,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // What scripts printed (one line each, errors included), how many errors they had and the first of them.
   StringView log() const { return log_.view(); }
   uint32_t errors() const { return errors_; }
+  // Where the time of the load went: the downloads, the scripts, the style/layout/paint passes (empty without a monotonic clock).
+  void timing_summary(String* out) const;
   StringView first_error() const { return first_error_.view(); }
 
   // --- script::IHost
@@ -489,6 +492,12 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   List<Fetched> scripts_, sheets_;
   PageObjects objects_;
   uint32_t errors_ = 0;
+  // Time spent per phase of the load, in microseconds (see timing_summary).
+  struct PhaseTimes {
+    uint64_t load = 0, fetch = 0, fetch_count = 0, fetch_bytes = 0, slowest_fetch = 0, script = 0, script_count = 0, slowest_script = 0, events = 0;
+    uint64_t styles_fetch = 0, styles = 0, boxes = 0, layout = 0, paint = 0, observers = 0, intersection = 0, observers_end = 0, render = 0;
+  } phase_;
+  String slowest_fetch_url_{allocator_}, slowest_script_name_{allocator_};
   uint64_t rendered_version_ = 0;
   bool caret_visible_ = true, caret_dirty_ = false;   // the blink phase, and whether it changed since the last render
   bool loading_ = true, engine_failed_ = false;
@@ -499,6 +508,11 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   struct BoxRect {
     double x = 0, y = 0, width = 0, height = 0, content_width = 0, content_height = 0, padding_left = 0, padding_top = 0;
   };
+  // The computed style of elements scripts asked for: getComputedStyle walks every ancestor, and each is a pass over all the rules. Good while the style sheet
+  // (so the document and the media) and the focus are as they were; keyed by node (the nodes of other documents have serials of their own).
+  Dictionary<const dom::Node*, Style> computed_cache_;
+  uint32_t computed_cache_focus_ = 0;
+  static constexpr uint64_t kMaxComputedStyles = 4096;
   Dictionary<uint32_t, BoxRect> geometry_;   // node serial -> its box on the page as the last picture laid it out
   bool geometry_ready_ = false;
   int32_t scroll_y_ = 0;
@@ -531,6 +545,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   UniquePointer<PageObjectEnv> object_env_;   // what the page's pictures and videos fetch through (kept: PageObjects holds on to it)
   IObjectEnvironment& object_environment();
   void deliver_sw_events();
+  bool load_document(StringView html);
   bool fetch_text_via_sw(StringView address, const char* destination, uint64_t limit, String* text);
   String storage_origin_;
   String state_json_;           // history.state: the state of the entry this page is on, as JSON
@@ -554,6 +569,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint32_t next_socket_ = 1;
   IWebSocket* socket_of(uint32_t id);
   uint64_t style_cache_version_ = 0;
+  uint64_t style_sources_ = 0;   // style_sources_fingerprint() of what style_cache_ was read from
   MediaEnvironment style_cache_media_;
   bool style_cache_valid_ = false;
   // what the scripts run in (destroyed first)
