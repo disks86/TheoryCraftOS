@@ -437,6 +437,48 @@ static void test_load_and_start() {
     CHECK(!run(n, boot_inputs(m), page, runtime).ok); }
 }
 
+static void test_power_down() {
+  for (uint16_t id : {0x7D1D, 0x643E, 0xB03E}) {
+    SimNpu n(id);
+    const bool mtl = n.platform.buttress == IntelNpuButtress::Mtl;
+    const uint64_t reset = mtl ? 0x50 : 0x160, d0i3 = mtl ? 0x60 : 0x164, status = mtl ? 0x44 : 0x154;
+    uint32_t resets = 0;
+    auto base = n.btrs.on_write;
+    n.btrs.on_write = [&, base](SimBar& b, uint64_t off, uint32_t v) {
+      if (off == reset && (v & 1)) { b.regs[off] = v & ~1u; ++resets; return; }
+      base(b, off, v);
+    };
+    IntelNpuHw h = n.hw();
+    h.read_info();
+    CHECK(h.power_up().ok && h.is_idle() == ((n.btrs.regs[status] & 3) == 3));
+    n.btrs.regs[status] |= 2;
+    CHECK(h.is_idle() && h.wait_idle());
+    IntelNpuResult r = h.power_down();
+    CHECK(r.ok && resets == 1 && !(n.btrs.regs[status] & 1) && (n.btrs.regs[d0i3] & 4));   // reset, work point off (not ready), D0i3 requested
+    CHECK(!h.is_idle());
+    // Each step is tried even when an earlier one failed; the first failure is the one reported.
+    n.btrs.regs[reset] = 1;   // a reset that never finishes
+    n.btrs.on_write = nullptr;
+    IntelNpuResult bad = h.power_down();
+    CHECK(!bad.ok && bad.failed == IntelNpuStep::Reset);
+    CHECK(std::string(intel_npu_step_name(IntelNpuStep::Reset)) == "IP reset" && std::string(intel_npu_step_name(IntelNpuStep::D0i3)) == "D0i3");
+    // The performance counter, as two halves.
+    n.ip.regs[id == 0x7D1D ? 0x06029000 : 0x01029008] = 0x11223344;
+    n.ip.regs[(id == 0x7D1D ? 0x06029000 : 0x01029008) + 4] = 0x55;
+    CHECK(h.perf_counter() == 0x5511223344ull);
+    // Before the CPU starts: translation-buffer stream ids valid, page walks snoop as asked.
+    h.prepare_boot(true);
+    CHECK(n.ip.regs[0x00360004] == (id == 0x7D1D ? 0x33u : 0x3Fu) && (n.ip.regs[0x00360000] & 8));
+    CHECK(id == 0x7D1D ? !(n.ip.regs[0x00360000] & 0x20) : (n.ip.regs[0x00360000] & 0x20));
+    h.prepare_boot(false);
+    CHECK(id == 0x7D1D ? (n.ip.regs[0x00360000] & 0x20) != 0 : !(n.ip.regs[0x00360000] & 0x20));
+  }
+  IntelNpuPlatform none;
+  SimBar a, b;
+  IntelNpuHw nh(a, b, none);
+  CHECK(!nh.power_down().ok && !nh.is_idle() && !nh.ip_reset() && nh.perf_counter() == 0);
+}
+
 // Whatever the registers read, every sequence ends (with a result or a refusal) and never touches an offset outside the windows.
 static void test_chaos() {
   const uint16_t ids[] = {0x7D1D, 0x643E, 0xB03E, 0xD71D};
@@ -464,6 +506,7 @@ int main() {
   test_firmware_corruption();
   test_boot_params();
   test_load_and_start();
+  test_power_down();
   test_chaos();
   if (g_failed) { printf("IntelNpuHwTest: %d failed\n", g_failed); return 1; }
   printf("IntelNpuHwTest: ok\n");

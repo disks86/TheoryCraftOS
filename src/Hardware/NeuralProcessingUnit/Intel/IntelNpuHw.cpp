@@ -56,6 +56,12 @@ constexpr uint32_t kIdleGenEnable = 1u << 0, kDpuActive = 1u << 0;
 constexpr uint32_t kLoadingDone = 1u << 0;
 constexpr uint32_t kCpuNocTopMmio = 1u << 0;
 constexpr uint32_t kLeonRstRun0 = 1u << 0, kLeonResume0 = 1u << 1, kLeonRstVec = 0xFFFFFFF0u;
+constexpr uint64_t kMtlIpReset = 0x50, kLnlIpReset = 0x160;
+constexpr uint32_t kIpResetTrigger = 1u << 0, kLnlDisableClockRelinquish = 1u << 12;
+constexpr uint64_t kTcuPtwOverrides = 0x00360000, kTbuMmuSsidV = 0x00360004;
+constexpr uint32_t kPtwSnoopEn = 1u << 3, kPtwAwSnoop = 1u << 4, kPtwArSnoop = 1u << 5;   // the 40xx names; the 37xx bits are the NOSNOOP overrides, inverted
+constexpr uint32_t kTbuMmuSsidV37 = 0x33, kTbuMmuSsidV40 = 0x3F;
+constexpr uint64_t kPerfCounter37 = 0x06029000, kPerfCounter40 = 0x01029008;
 constexpr uint32_t kTileFuseValid = 1u << 0;
 constexpr uint32_t kTileFuseConfigShift = 1, kTileFuseConfigMask = 0x7Fu;
 constexpr uint32_t kAllOnes = 0xFFFFFFFFu;
@@ -72,6 +78,9 @@ const char* intel_npu_step_name(IntelNpuStep step) {
     case IntelNpuStep::Axi: return "host AXI";
     case IntelNpuStep::TopNoc: return "top NoC";
     case IntelNpuStep::CpuNoc: return "CPU NoC";
+    case IntelNpuStep::Reset: return "IP reset";
+    case IntelNpuStep::D0i3: return "D0i3";
+    case IntelNpuStep::Idle: return "idle";
   }
   return "unknown";
 }
@@ -146,6 +155,67 @@ bool IntelNpuHw::d0i3_disable() {
   if (!poll(btrs_, reg, kD0i3InProgress, 0)) return false;
   btrs_.write32(reg, btrs_.read32(reg) & ~kD0i3I3);
   return poll(btrs_, reg, kD0i3InProgress, 0);
+}
+
+bool IntelNpuHw::d0i3_enable() {
+  const uint64_t reg = platform_.buttress == IntelNpuButtress::Mtl ? kMtlD0i3 : kLnlD0i3;
+  if (!poll(btrs_, reg, kD0i3InProgress, 0)) return false;
+  btrs_.write32(reg, btrs_.read32(reg) | kD0i3I3);
+  if (!poll(btrs_, reg, kD0i3InProgress, 0)) return false;
+  btrs_.read32(reg);  // ivpu waits 5 us for the transition to complete; a read back takes about that long
+  return true;
+}
+
+bool IntelNpuHw::ip_reset() {
+  if (!platform_.valid()) return false;
+  const bool mtl = platform_.buttress == IntelNpuButtress::Mtl;
+  const uint64_t reg = mtl ? kMtlIpReset : kLnlIpReset;
+  if (!mtl) btrs_.write32(kLnlVpuStatus, btrs_.read32(kLnlVpuStatus) | kLnlDisableClockRelinquish);
+  if (!poll(btrs_, reg, kIpResetTrigger, 0)) return false;
+  btrs_.write32(reg, btrs_.read32(reg) | kIpResetTrigger);
+  return poll(btrs_, reg, kIpResetTrigger, 0);
+}
+
+bool IntelNpuHw::is_idle() {
+  if (!platform_.valid()) return false;
+  const uint32_t status = btrs_.read32(platform_.buttress == IntelNpuButtress::Mtl ? kMtlVpuStatus : kLnlVpuStatus);
+  return status != kAllOnes && (status & (kStatusReady | kStatusIdle)) == (kStatusReady | kStatusIdle);
+}
+
+bool IntelNpuHw::wait_idle() {
+  return platform_.valid() && poll(btrs_, platform_.buttress == IntelNpuButtress::Mtl ? kMtlVpuStatus : kLnlVpuStatus, kStatusIdle, kStatusIdle);
+}
+
+uint64_t IntelNpuHw::perf_counter() {
+  if (!platform_.valid()) return 0;
+  const uint64_t reg = platform_.ip == IntelNpuIp::Ip37xx ? kPerfCounter37 : kPerfCounter40;
+  const uint32_t high = ip_.read32(reg + 4);
+  const uint32_t low = ip_.read32(reg);
+  return (uint64_t{high} << 32) | low;
+}
+
+void IntelNpuHw::prepare_boot(bool snoop) {
+  if (!platform_.valid()) return;
+  uint32_t ptw = ip_.read32(kTcuPtwOverrides);
+  if (platform_.ip == IntelNpuIp::Ip37xx) {
+    ptw |= kPtwSnoopEn;                       // NOSNOOP_OVERRIDE_EN
+    ptw &= ~kPtwAwSnoop;                      // AW_NOSNOOP_OVERRIDE
+    ptw = snoop ? (ptw & ~kPtwArSnoop) : (ptw | kPtwArSnoop);
+  } else {
+    ptw |= kPtwSnoopEn | kPtwAwSnoop;         // SNOOP_OVERRIDE_EN, AW_SNOOP_OVERRIDE
+    ptw = snoop ? (ptw | kPtwArSnoop) : (ptw & ~kPtwArSnoop);
+  }
+  ip_.write32(kTcuPtwOverrides, ptw);
+  ip_.write32(kTbuMmuSsidV, ip_.read32(kTbuMmuSsidV) | (platform_.ip == IntelNpuIp::Ip37xx ? kTbuMmuSsidV37 : kTbuMmuSsidV40));
+}
+
+IntelNpuResult IntelNpuHw::power_down() {
+  if (!platform_.valid() || platform_.buttress == IntelNpuButtress::Unknown) return IntelNpuResult::fail(IntelNpuStep::Info);
+  IntelNpuResult result;
+  if (!ip_reset()) result = IntelNpuResult::fail(IntelNpuStep::Reset);
+  if (!work_point(false) && result.ok) result = IntelNpuResult::fail(IntelNpuStep::WorkPoint);
+  if (!d0i3_enable() && result.ok) result = IntelNpuResult::fail(IntelNpuStep::D0i3);
+  return result;
 }
 
 // ivpu_hw_btrs_wp_drive: wait for the previous request to finish, write the payload, set SEND, wait for it to be taken, then wait for the PLL to lock

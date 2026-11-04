@@ -216,6 +216,32 @@ IntelNpuJobResult IntelNpuJobTracker::complete(const IntelNpuJsm::JobDone& done)
   return r;
 }
 
+uint32_t IntelNpuJobTracker::abort_context(uint32_t ssid) {
+  uint32_t n = 0;
+  for (auto& entry : jobs_) {
+    Tracked& t = entry.value;
+    if (t.ssid != ssid || t.done) continue;
+    t.done = true;
+    t.status = IntelNpuJsm::kStatusAborted;
+    t.outcome = IntelNpuJobOutcome::Aborted;
+    ++n;
+  }
+  return n;
+}
+
+uint32_t IntelNpuJobTracker::abort_all() {
+  uint32_t n = 0;
+  for (auto& entry : jobs_) {
+    Tracked& t = entry.value;
+    if (t.done) continue;
+    t.done = true;
+    t.status = IntelNpuJsm::kStatusAborted;
+    t.outcome = IntelNpuJobOutcome::Aborted;
+    ++n;
+  }
+  return n;
+}
+
 bool IntelNpuJobTracker::take_result(uint32_t job_id, IntelNpuJobResult* result) {
   Tracked* t = jobs_.find(job_id);
   if (!t || !t->done) return false;
@@ -255,7 +281,10 @@ void IntelNpuJobDoneSink::on_message(void* context, const IntelNpuIpcHeader&, co
   const IntelNpuJobResult r = sink->tracker->complete(IntelNpuJsm::parse_job_done(*message));
   sink->last = r;
   if (r.outcome == IntelNpuJobOutcome::Completed) ++sink->completed;
-  else if (r.outcome == IntelNpuJobOutcome::ContextFault) ++sink->faults;
+  else if (r.outcome == IntelNpuJobOutcome::ContextFault) {
+    ++sink->faults;
+    if (sink->fault_count < IntelNpuJobDoneSink::kMaxFaultedContexts) sink->faulted_contexts[sink->fault_count++] = r.ssid;
+  }
   else ++sink->ignored;
 }
 

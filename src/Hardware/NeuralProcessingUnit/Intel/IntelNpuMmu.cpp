@@ -352,6 +352,22 @@ bool IntelNpuAddressSpace::allocate(uint64_t lo, uint64_t hi, uint64_t size, uin
   return allocate_aligned(lo, hi, size, kPage, address);
 }
 
+bool IntelNpuAddressSpace::reserve(uint64_t address, uint64_t size) {
+  if (size == 0 || (address & (kPage - 1)) != 0 || (size & (kPage - 1)) != 0 || address < start_ || address > end_ || size > end_ - address) return false;
+  const uint64_t end = address + size;
+  for (uint64_t i = 0; i < free_.count(); ++i) {
+    const Range r = free_[i];
+    if (address < r.start || end > r.end) continue;
+    if (address == r.start && end == r.end) return free_.remove_at(i);
+    if (address == r.start) { free_[i].start = end; return true; }
+    if (end == r.end) { free_[i].end = address; return true; }
+    if (!free_.insert(i + 1, Range{end, r.end})) return false;
+    free_[i].end = address;
+    return true;
+  }
+  return false;
+}
+
 bool IntelNpuAddressSpace::release(uint64_t address, uint64_t size) {
   if (size == 0 || address < start_ || address > end_ || size > end_ - address) return false;
   const uint64_t end = address + size;

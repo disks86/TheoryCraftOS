@@ -125,6 +125,8 @@ class IntelNpuAddressSpace {
   IntelNpuAddressSpace(allocators::IAllocator& allocator, uint64_t start, uint64_t end);
   // Finds `size` bytes (a multiple of the page size) inside [lo, hi) of the space. False if there is no room.
   bool allocate(uint64_t lo, uint64_t hi, uint64_t size, uint64_t* address);
+  // Takes a specific range (a fixed address the firmware asks for). False, and nothing changes, if any of it is not free.
+  bool reserve(uint64_t address, uint64_t size);
   // Gives a range back. Ranges that were not handed out are refused (false), and nothing changes.
   bool release(uint64_t address, uint64_t size);
   uint64_t free_bytes() const;
