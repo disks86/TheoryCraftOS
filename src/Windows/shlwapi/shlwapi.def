@@ -26,8 +26,6 @@ OrdinalNotImplemented165=ShlwapiOrdinalNotImplemented @165 NONAME
 OrdinalNotImplemented167=ShlwapiOrdinalNotImplemented @167 NONAME
 OrdinalNotImplemented175=ShlwapiOrdinalNotImplemented @175 NONAME
 OrdinalNotImplemented257=ShlwapiOrdinalNotImplemented @257 NONAME
-OrdinalNotImplemented353=ShlwapiOrdinalNotImplemented @353 NONAME
-OrdinalNotImplemented354=ShlwapiOrdinalNotImplemented @354 NONAME
 OrdinalNotImplemented404=ShlwapiOrdinalNotImplemented @404 NONAME
 OrdinalNotImplemented476=ShlwapiOrdinalNotImplemented @476 NONAME
 OrdinalNotImplemented484=ShlwapiOrdinalNotImplemented @484 NONAME
@@ -41,3 +39,5 @@ SKSetValueW @517
 SKDeleteValueW @518
 SKAllocValueW @519
 GetShellSecurityDescriptor @475
+SHFormatDateTimeA @353
+SHFormatDateTimeW @354

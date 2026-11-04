@@ -601,3 +601,43 @@ EXPORT void *WINAPI GetShellSecurityDescriptor(const ShellUserPermission *const 
   for (int i = 0; i < made; ++i) shell_sid_free(sids[i], current[i]);
   return block;
 }
+
+/* ---- SHFormatDateTime (ordinals 353 and 354) ------------------------------------------------------------------------------------------------------------------------- */
+
+IMPORT BOOL WINAPI FileTimeToLocalFileTime(const FILETIME *utc, LPFILETIME local);
+IMPORT BOOL WINAPI FileTimeToSystemTime(const FILETIME *file_time, LPSYSTEMTIME st);
+IMPORT int WINAPI GetDateFormatW(DWORD locale, DWORD flags, const SYSTEMTIME *st, LPCWSTR format, LPWSTR out, int capacity);
+IMPORT int WINAPI GetTimeFormatW(DWORD locale, DWORD flags, const SYSTEMTIME *st, LPCWSTR format, LPWSTR out, int capacity);
+
+#define FDTF_SHORTTIME_ 0x1
+#define FDTF_LONGTIME_ 0x8
+#define FDTF_SHORTDATE_ 0x2
+#define FDTF_LONGDATE_ 0x4
+
+/* The time is UTC; the result is the date (long beats short) then a space then the time (long beats short), in the user's locale. Returns the characters written including the NUL. */
+EXPORT int WINAPI SHFormatDateTimeW(const FILETIME *utc, DWORD *flags_in, LPWSTR out, UINT capacity) {
+  WCHAR date[128], time_text[128];
+  FILETIME local;
+  SYSTEMTIME st;
+  const DWORD flags = flags_in ? *flags_in : (FDTF_SHORTDATE_ | FDTF_SHORTTIME_);
+  size_t_ n = 0;
+  if (!out || !capacity || !utc) return 0;
+  if (!FileTimeToLocalFileTime(utc, &local) || !FileTimeToSystemTime(&local, &st)) return 0;
+  date[0] = time_text[0] = 0;
+  if (flags & (FDTF_LONGDATE_ | FDTF_SHORTDATE_)) GetDateFormatW(0x0400 /* LOCALE_USER_DEFAULT */, (flags & FDTF_LONGDATE_) ? 2 /* DATE_LONGDATE */ : 1 /* DATE_SHORTDATE */, &st, NULL, date, 128);
+  if (flags & (FDTF_LONGTIME_ | FDTF_SHORTTIME_)) GetTimeFormatW(0x0400, (flags & FDTF_LONGTIME_) ? 0 : 2 /* TIME_NOSECONDS */, &st, NULL, time_text, 128);
+  const size_t_ date_length = wcslen(date), time_length = wcslen(time_text), total = date_length + time_length + (date_length && time_length ? 1 : 0);
+  if (total + 1 > capacity) return 0;
+  memcpy(out, date, date_length * sizeof(WCHAR));
+  n = date_length;
+  if (date_length && time_length) out[n++] = ' ';
+  memcpy(out + n, time_text, time_length * sizeof(WCHAR));
+  out[total] = 0;
+  return (int)total + 1;
+}
+EXPORT int WINAPI SHFormatDateTimeA(const FILETIME *utc, DWORD *flags, LPSTR out, UINT capacity) {
+  WCHAR wide[300];
+  if (!out || !capacity) return 0;
+  if (!SHFormatDateTimeW(utc, flags, wide, 300)) return 0;
+  return WideCharToMultiByte(CP_ACP, 0, wide, -1, out, (int)capacity, NULL, NULL);
+}

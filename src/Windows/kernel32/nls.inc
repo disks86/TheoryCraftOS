@@ -284,6 +284,7 @@ EXPORT int WINAPI GetTimeFormatEx(LPCWSTR name, DWORD flags, const SYSTEMTIME *t
 EXPORT int WINAPI GetDateFormatA(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCSTR format, LPSTR out, int capacity) {
   if (capacity < 0 || (capacity > 0 && !out)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   const UINT cp = nls_ansi_codepage(locale, flags);
+  flags &= ~0x40000000u;      /* (LOCALE_USE_CP_ACP only picks the code page) */
   WCHAR *f = format ? to_wide_cp(cp, format) : NULL, wide[NLS_PICTURE_MAX];
   if (format && !f) return 0;
   const int n = nls_date_format(nls_locale_of(locale), flags, time, f, wide, NLS_PICTURE_MAX);
@@ -293,6 +294,7 @@ EXPORT int WINAPI GetDateFormatA(LCID locale, DWORD flags, const SYSTEMTIME *tim
 EXPORT int WINAPI GetTimeFormatA(LCID locale, DWORD flags, const SYSTEMTIME *time, LPCSTR format, LPSTR out, int capacity) {
   if (capacity < 0 || (capacity > 0 && !out)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
   const UINT cp = nls_ansi_codepage(locale, flags);
+  flags &= ~0x40000000u;      /* (LOCALE_USE_CP_ACP only picks the code page) */
   WCHAR *f = format ? to_wide_cp(cp, format) : NULL, wide[NLS_PICTURE_MAX];
   if (format && !f) return 0;
   const int n = nls_time_format(nls_locale_of(locale), flags, time, f, wide, NLS_PICTURE_MAX);
