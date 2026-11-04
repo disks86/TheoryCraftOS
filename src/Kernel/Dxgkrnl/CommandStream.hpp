@@ -51,6 +51,9 @@
 //   BindUav          slot, allocation_index, offset, size   (a storage buffer for compute shaders, outside a pass: slot below kMaxStorageBuffers, a kAllocUnorderedAccess buffer, offset and size multiples of 4)
 //   Dispatch         groups_x, groups_y, groups_z   (outside a pass, with a compute pipeline bound by BindPipeline and every storage slot its shader uses bound; each count at most kMaxDispatchGroups)
 //   ResolveRegion    destination_index, source_index   (outside a pass: the samples of a multisampled colour render target averaged into an ordinary image of the same format and size, the adapter's kFeatureMultisample)
+//   CopyBuffer       dst_index, dst_offset, src_index, src_offset, bytes   (outside a pass: between two buffer allocations (not heaps; reserved buffers are refused); the ranges lie in the buffers, a copy inside one buffer must not overlap)
+//   CopyBufferImage  direction (0 buffer to image, 1 image to buffer), image_index, level, layer, x, y, width, height, buffer_index, buffer_offset, row_pitch   (outside a pass: a rectangle of one level of a colour image
+//                    (any kind: `layer` is the array slice or volume depth, 0 for a 2D image) and rows of the buffer, `row_pitch` bytes apart from `buffer_offset` on (at least width * the bytes of a pixel); a multisampled or depth image is refused)
 //   EndQuery         (the count of fragments that passed the depth and stencil tests since BeginQuery is written there - a little-endian 64-bit number - once the stream has run)
 #pragma once
 #include "Kernel/Dxgkrnl/DxgTypes.hpp"
@@ -88,6 +91,8 @@ enum class Op : uint16_t {
   SetRootDescriptor,
   SetRootTable,
   ResourceBarrier,
+  CopyBuffer,
+  CopyBufferImage,
 };
 
 // How the vertices (or indices) of a draw make triangles (D3D10 IASetPrimitiveTopology / D3D9 primitive types); the default is a list. A strip or fan is expanded to a list of
@@ -195,6 +200,13 @@ class CommandWriter {
       for (uint32_t w : {b.type, b.allocation, b.before, b.after, b.flags}) ok_ &= bytes_.put32(w);
   }
   void transition(uint32_t allocation, uint32_t before, uint32_t after) { resource_barrier({Barrier{0, allocation, before, after, 0}}); }
+  void copy_buffer(uint32_t dst, uint32_t dst_offset, uint32_t src, uint32_t src_offset, uint32_t bytes) { packet(Op::CopyBuffer, {dst, dst_offset, src, src_offset, bytes}); }
+  void copy_buffer_to_image(uint32_t image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t buffer, uint32_t offset, uint32_t row_pitch) {
+    packet(Op::CopyBufferImage, {0, image, level, layer, x, y, width, height, buffer, offset, row_pitch});
+  }
+  void copy_image_to_buffer(uint32_t image, uint32_t level, uint32_t layer, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t buffer, uint32_t offset, uint32_t row_pitch) {
+    packet(Op::CopyBufferImage, {1, image, level, layer, x, y, width, height, buffer, offset, row_pitch});
+  }
   void bind_uav(uint32_t slot, uint32_t allocation, uint32_t offset, uint32_t size) { packet(Op::BindUav, {slot, allocation, offset, size}); }
   void dispatch(uint32_t x, uint32_t y = 1, uint32_t z = 1) { packet(Op::Dispatch, {x, y, z}); }
   // `mode`: a graphics::ResolveMode (0 average, 1 sample 0, 2 least, 3 greatest); a depth buffer needs 1 or the adapter's kFeatureResolveModes. Left out (0, two words), it is the average of a colour target.

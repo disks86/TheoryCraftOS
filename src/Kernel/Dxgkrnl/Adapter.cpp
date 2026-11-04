@@ -226,6 +226,8 @@ class Adapter::StreamRunner {
       case Op::SetRootDescriptor: return set_root_descriptor(p);
       case Op::SetRootTable: return set_root_table(p);
       case Op::ResourceBarrier: return resource_barrier(p);
+      case Op::CopyBuffer: return copy_buffer(p);
+      case Op::CopyBufferImage: return copy_buffer_image(p);
       case Op::Dispatch: return dispatch(p);
       case Op::SetTopology: {
         const uint32_t topology = p.le32();
@@ -773,6 +775,72 @@ class Adapter::StreamRunner {
     if (s == status::kSuccess) s = copy_region_cpu(mm_, *dst, dx, dy, *src, sx, sy, w, h);
     unbind_textures_of(dst);
     return s;
+  }
+
+  // A plain buffer (not a heap, a reserved buffer or a query result): what CopyBuffer and CopyBufferImage move bytes of.
+  static bool copyable_buffer(const Allocation* a) { return a && a->is_buffer() && !a->reserved() && !(a->desc().flags & (kAllocHeap | kAllocQueryResult)); }
+
+  NtStatus copy_buffer(ByteReader& p) {
+    const uint32_t di = p.le32(), doff = p.le32(), si = p.le32(), soff = p.le32(), bytes = p.le32();
+    if (!exact(p) || in_pass_) return kBad;
+    Allocation* dst = alloc(di);
+    Allocation* src = alloc(si);
+    if (!copyable_buffer(dst) || !copyable_buffer(src) || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
+    if (uint64_t{doff} + bytes > dst->desc().size || uint64_t{soff} + bytes > src->desc().size) return kBad;
+    if (dst == src && doff < soff + uint64_t{bytes} && soff < doff + uint64_t{bytes}) return kBad;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*src) || !mm_.read_back(*dst)) return status::kInvalidDeviceState;
+    ByteView to;
+    ConstByteView from;
+    if (!dst->writable_backing().try_subview(doff, bytes, &to) || !src->backing().try_subview(soff, bytes, &from)) return status::kInvalidDeviceState;
+    to.copy_from(from);
+    mm_.note_cpu_write(*dst);
+    return status::kSuccess;
+  }
+
+  NtStatus copy_buffer_image(ByteReader& p) {
+    const uint32_t direction = p.le32(), ii = p.le32(), level = p.le32(), layer = p.le32(), x = p.le32(), y = p.le32(), w = p.le32(), h = p.le32(), bi = p.le32(), boff = p.le32(), pitch = p.le32();
+    if (!exact(p) || in_pass_ || direction > 1 || w == 0 || h == 0) return kBad;
+    Allocation* image = alloc(ii);
+    Allocation* buffer = alloc(bi);
+    if (!image || !image->is_image() || image->is_depth() || image->desc().samples != 1 || !copyable_buffer(buffer)) return kBad;
+    if (!use(image, direction == 0 ? state::kCopyDest : state::kCopySource) || !use(buffer, direction == 0 ? state::kCopySource : state::kCopyDest)) return kBad;
+    const bool plain = image->desc().kind == graphics::TextureKind::Texture2D;
+    if (level >= image->mip_levels() || layer >= image->layers() || (!plain && level != 0)) return kBad;
+    const uint32_t level_w = plain ? graphics::mip_extent(image->desc().width, level) : image->desc().width;
+    const uint32_t level_h = plain ? graphics::mip_extent(image->desc().height, level) : image->desc().height;
+    const uint32_t pixel = pixel_bytes(image->desc().format);
+    const uint64_t row_bytes = uint64_t{w} * pixel;
+    if (uint64_t{x} + w > level_w || uint64_t{y} + h > level_h || pitch < row_bytes) return kBad;
+    if (uint64_t{boff} + uint64_t{pitch} * (h - 1) + row_bytes > buffer->desc().size) return kBad;
+    uint64_t level_offset = 0, level_bytes = 0;
+    if (!image->level_range(level, &level_offset, &level_bytes)) return kBad;
+    if (!exec_) return status::kSuccess;
+    NtStatus s = flush();
+    if (s != status::kSuccess) return s;
+    if (!mm_.read_back(*image) || !mm_.read_back(*buffer)) return status::kInvalidDeviceState;
+    const uint64_t layer_bytes = uint64_t{level_w} * level_h * pixel;
+    for (uint32_t row = 0; row < h; ++row) {
+      const uint64_t image_at = level_offset + layer_bytes * layer + (uint64_t{y + row} * level_w + x) * pixel;
+      const uint64_t buffer_at = uint64_t{boff} + uint64_t{pitch} * row;
+      ByteView to;
+      ConstByteView from;
+      if (direction == 0) {
+        if (!image->writable_backing().try_subview(image_at, row_bytes, &to) || !buffer->backing().try_subview(buffer_at, row_bytes, &from)) return status::kInvalidDeviceState;
+      } else {
+        if (!buffer->writable_backing().try_subview(buffer_at, row_bytes, &to) || !image->backing().try_subview(image_at, row_bytes, &from)) return status::kInvalidDeviceState;
+      }
+      to.copy_from(from);
+    }
+    if (direction == 0) {
+      mm_.note_cpu_write(*image);
+      unbind_textures_of(image);
+    } else {
+      mm_.note_cpu_write(*buffer);
+    }
+    return status::kSuccess;
   }
 
   NtStatus generate_mipmaps(ByteReader& p) {

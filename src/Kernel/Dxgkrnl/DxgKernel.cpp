@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
+#include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Graphics/Graphics3D/Mipmaps.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Move.hpp"
@@ -999,7 +1000,105 @@ NtStatus Kernel::destroy_pipeline(ProcessId pid, Handle pipeline) {
   return p && p->pipelines.remove(pipeline) ? status::kSuccess : status::kInvalidHandle;
 }
 
+NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteReader& in, ByteWriter& out, ByteView reply) {
+  switch (static_cast<EscapeOp>(op)) {
+    case EscapeOp::CreateRootSignature: {
+      const uint32_t bytes = in.le32();
+      ConstByteView blob = in.take(bytes);
+      if (!in.ok()) return status::kInvalidParameter;
+      if (reply.size() < 4) return status::kBufferTooSmall;
+      Handle h = 0;
+      const NtStatus st = create_root_signature(pid, device, blob, &h);
+      if (st == status::kSuccess) out.le32(h);
+      return st;
+    }
+    case EscapeOp::DestroyRootSignature:
+    case EscapeOp::DestroyDescriptorHeap: {
+      const Handle h = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      return static_cast<EscapeOp>(op) == EscapeOp::DestroyRootSignature ? destroy_root_signature(pid, h) : destroy_descriptor_heap(pid, h);
+    }
+    case EscapeOp::CreateDescriptorHeap: {
+      const uint32_t type = in.le32(), count = in.le32();
+      if (!in.ok() || !in.at_end() || type > 1) return status::kInvalidParameter;
+      if (reply.size() < 4) return status::kBufferTooSmall;
+      Handle h = 0;
+      const NtStatus st = create_descriptor_heap(pid, device, static_cast<DescriptorHeapType>(type), count, &h);
+      if (st == status::kSuccess) out.le32(h);
+      return st;
+    }
+    case EscapeOp::WriteDescriptors: {
+      const Handle heap = in.le32();
+      const uint32_t count = in.le32();
+      if (!in.ok() || count > 4096) return status::kInvalidParameter;
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t index = in.le32(), kind = in.le32(), allocation = in.le32(), off_lo = in.le32(), off_hi = in.le32(), size_lo = in.le32(), size_hi = in.le32();
+        const uint32_t filter = in.le32(), au = in.le32(), av = in.le32(), mip = in.le32(), bias = in.le32(), min_lod = in.le32(), max_lod = in.le32();
+        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::Sampler) || filter > 1 || au > 1 || av > 1 || mip > 2) return status::kInvalidParameter;
+        DescriptorDesc d;
+        d.kind = static_cast<DescriptorKind>(kind);
+        d.allocation = allocation;
+        d.offset = off_lo | (uint64_t{off_hi} << 32);
+        d.size = size_lo | (uint64_t{size_hi} << 32);
+        d.sampler.filter = static_cast<graphics::Filter>(filter);
+        d.sampler.address_u = static_cast<graphics::AddressMode>(au);
+        d.sampler.address_v = static_cast<graphics::AddressMode>(av);
+        d.sampler.mip_filter = static_cast<graphics::MipFilter>(mip);
+        d.sampler.lod_bias = bits_float(bias);
+        d.sampler.min_lod = bits_float(min_lod);
+        d.sampler.max_lod = bits_float(max_lod);
+        const NtStatus st = write_descriptor(pid, heap, index, d);
+        if (st != status::kSuccess) return st;
+      }
+      return in.at_end() ? status::kSuccess : status::kInvalidParameter;
+    }
+    case EscapeOp::CopyDescriptors: {
+      const Handle dst = in.le32();
+      const uint32_t dst_index = in.le32();
+      const Handle src = in.le32();
+      const uint32_t src_index = in.le32(), count = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      return copy_descriptors(pid, dst, dst_index, src, src_index, count);
+    }
+    case EscapeOp::UpdateTileMappings: {
+      const Handle reserved = in.le32();
+      const uint32_t first = in.le32();
+      const Handle heap = in.le32();
+      const uint32_t lo = in.le32(), hi = in.le32(), count = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      return update_tile_mappings(pid, reserved, first, heap, lo | (uint64_t{hi} << 32), count);
+    }
+    case EscapeOp::QuerySync: {
+      const Handle sync = in.le32();
+      if (!in.ok() || !in.at_end()) return status::kInvalidParameter;
+      if (reply.size() < 8) return status::kBufferTooSmall;
+      uint64_t value = 0;
+      const NtStatus st = query_sync(pid, sync, &value);
+      if (st == status::kSuccess) {
+        out.le32(static_cast<uint32_t>(value));
+        out.le32(static_cast<uint32_t>(value >> 32));
+      }
+      return st;
+    }
+    default: return status::kNotSupported;
+  }
+}
+
 NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, ByteView reply, uint32_t* reply_bytes) {
+  {
+    // (the Direct3D 12 operations call the public methods, which take the lock themselves)
+    ByteReader peek(request);
+    const uint32_t first = peek.le32();
+    if (peek.ok() && first >= static_cast<uint32_t>(EscapeOp::CreateRootSignature)) {
+      *reply_bytes = 0;
+      ByteWriter w(reply);
+      const NtStatus st = escape_d3d12(pid, device, first, peek, w, reply);
+      if (st != status::kSuccess) return st;
+      if (!w.ok()) return status::kBufferTooSmall;
+      *reply_bytes = static_cast<uint32_t>(w.position());
+      return status::kSuccess;
+    }
+  }
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);
   DeviceObject* d = p ? p->devices.raw(device) : nullptr;

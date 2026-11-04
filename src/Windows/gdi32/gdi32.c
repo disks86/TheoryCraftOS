@@ -36,6 +36,9 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 #define GDI_SERVICE(name)                                                                                                                                     \
   __asm__(".text\n.globl " #name "\n" #name ":\n mov %rcx, %r10\n mov $" GDI_STR(NT_SERVICE_##name) ", %eax\n syscall\n cmp $0xC0000002, %eax\n jne 1f\n xor %eax, %eax\n1: ret\n");
+/* The Direct3D thunks (D3DKMT*) pass the status of the kernel on as it is: a service the kernel does not implement is STATUS_NOT_IMPLEMENTED, not success. */
+#define DXG_SERVICE(name)                                                                                                                                     \
+  __asm__(".text\n.globl " #name "\n" #name ":\n mov %rcx, %r10\n mov $" GDI_STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n");
 #define GDI_STR(x) GDI_STR2(x)
 #define GDI_STR2(x) #x
 
