@@ -39,8 +39,10 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | ntdll rtlstr | 8+, hung | 4 + RtlIsTextUnicode (not done) |
 | ntdll error (RtlNtStatusToDosError) | 633 | 155 |
 | ntdll string (C library in ntdll) | crash | 14 |
-| shlwapi string | 16751 | about 150 (needs ordinal exports and StrRetTo*/StrFromTimeInterval) |
-| lz32 lzexpand | 117 | 17 |
+| shlwapi string | 16751 | 0 (wnsprintf, StrFromTimeInterval, StrFormatByteSizeEx, StrRetToBSTR, ordinals 345/346/399/400 through shlwapi.def) |
+| shlwapi path | not run | 14 (was 25386 and a crash): PathIsValidChar (455/456), PathCreateFromUrl*, PathCommonPrefix, PathUndecorate, PathUnExpandEnvStrings, PathCanonicalize only splits at backslashes; left: PathMatchSpec "* .ext" |
+| shlwapi url | crash | 2248, runs to the end: Url* family is in src/Windows/shlwapi/url.inc; Windows' exact UrlCanonicalize/UrlEscape quirks ("//" -> "///", "wine://" -> "wine:///"), UrlHash and HashData (a 256-byte table) are not done |
+| lz32 lzexpand | 117 | 0 |
 | kernel32 format_msg | 591 | 270 |
 | kernel32 time | 786 | 1 |
 | kernel32 locale | 150 (stopped early) | about 4600, runs to the end (en-US and the invariant locale only; no normalization, locale enumeration, geo info or code pages) |
