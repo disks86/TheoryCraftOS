@@ -93,9 +93,8 @@ const char* intel_npu_step_name(IntelNpuStep step);
 
 // The hardware side of the Linux ivpu driver as far as the host goes: reading the fuses, asking the buttress for a work point, bringing the
 // IP block's clocks, reset, power island and NoC queues up, and starting the NPU's CPU at a firmware entry point (ivpu_hw_btrs.c, ivpu_hw_ip.c,
-// ivpu_hw.c: ivpu_hw_power_up). The firmware image, its boot parameters and the load-power-up-boot sequence are in IntelNpuFirmware.hpp. The NPU MMU, its page tables and contexts are in IntelNpuMmu.hpp. Not here yet:
-// the IPC and job queues (the "JSM" messages and the
-// ready message the firmware sends), interrupts, and the power-down/reset path.
+// ivpu_hw.c: ivpu_hw_power_up). The firmware image, its boot parameters and the load-power-up-boot sequence are in IntelNpuFirmware.hpp. The NPU MMU, its page tables and contexts are in IntelNpuMmu.hpp; the message channel (IntelNpuIpc.hpp), JSM messages (IntelNpuJsm.hpp), job queues and
+// doorbells (IntelNpuJobs.hpp) and interrupts (IntelNpuIrq.hpp) are beside it. Not here yet: the power-down/reset path and the device object that ties them together.
 // `ip` is BAR 0, `buttress` is BAR 4 (ivpu's regv and regb).
 class IntelNpuHw {
  public:
@@ -103,6 +102,8 @@ class IntelNpuHw {
   static constexpr uint32_t kPollAttempts = 200000;
   // How much of BAR 0 / BAR 4 the code touches.
   static uint64_t ip_window(IntelNpuIp ip);
+  // How much of BAR 0 the whole driver touches: also the MMU (0x200000), the interrupt controller, the IPC FIFOs and the doorbells (up to 255 of them, 4 KiB apart).
+  static uint64_t operational_window(IntelNpuIp ip);
   static constexpr uint64_t kButtressWindow = 0x1000;
 
   IntelNpuHw(INpuRegisters& ip, INpuRegisters& buttress, const IntelNpuPlatform& platform)
