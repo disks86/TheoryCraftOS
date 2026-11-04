@@ -400,6 +400,36 @@ Nothing a program links against is missing, even where nothing is implemented ye
 - **Gaps.** Only functions are stubbed (not data exports such as `_environ`), and names that are not C identifiers (C++ decorated names) are left out. kernelbase.dll and `api-ms-win-*` still fold into kernel32.dll (see `canonical_library_name()`), so their extra exports are not listed.
 
 
+## dbghelp.dll
+
+`src/Windows/dbghelp` (`dbghelp.c` and the `.inc` files it includes; `dbghelp.h` and `minidumpapiset.h` are Wine's headers, adapted to mingw's `windows.h`) implements the image helpers, the
+symbol handler, the x64 stack walker and minidumps in user mode. **No new system call was needed**: it runs over `ReadProcessMemory`, `VirtualQueryEx`, the process snapshot, the
+module list (`K32EnumProcessModules`), `NtQueryInformationThread` (the TEB) and the thread context calls, which cross process boundaries already.
+
+- **Image helpers** (`image.inc`): `ImageNtHeader`, `ImageRvaToSection/Va`, `ImageDirectoryEntryToData(Ex)`, `GetTimestampForLoadedLibrary`, `ImagehlpApiVersion(Ex)`.
+- **Symbol handler** (`symbols.inc`, `lookup.inc`): one list of modules per process handle (`SymInitialize`, `SymLoadModule(Ex)`, `SymUnloadModule`, `SymRefreshModuleList`, `SymCleanup`,
+  options, search path, `SymGetModuleInfo(W)64`, `SymEnumerateModules`). A module is read from the memory of the process or from its file; its symbols are the PE export table and the
+  **COFF symbol table** of the file (what mingw's linker leaves in an unstripped image), kept sorted by address. `SymFromAddr/Name/Index(W)`, `SymEnumSymbols(Ex)(W)`, `SymSearch(W)`,
+  `SymNext/Prev`, the `IMAGEHLP_SYMBOL64` forms, `SymAddSymbol`/`SymDeleteSymbol` (virtual symbols), `SymMatchString/FileName`. A module is found for any address in a process
+  (`SymGetModuleBase64` loads it when the symbol handler does not have it yet). Module loading follows Windows: loading at a base that is taken answers 0 with `ERROR_SUCCESS`, a base
+  inside an older module replaces it, a base of 0 takes the file's own (`ERROR_INVALID_ADDRESS` if taken, `ERROR_NO_MORE_FILES` if there is no file), the size the caller gives wins.
+- **Unwinding** (`stack.inc`): `StackWalk64`/`StackWalkEx` for AMD64: the UNWIND_INFO interpreter (pushes, allocations, frame register, saved registers, chained and indirect entries,
+  machine frames) reading through the caller's memory routine, the function table from `SymFunctionTableAccess64` (a copy of each module's `.pdata`). A pc inside an epilogue is not
+  recognised; the walk is right from call sites, bodies and prologs.
+- **Minidumps** (`dump.inc`): `MiniDumpWriteDump` of any process the caller can read (thread list with contexts and stacks, module list, system and miscellaneous information, memory list or,
+  with `MiniDumpWithFullMemory`, the 64-bit memory list; exception, memory-info, thread-info and thread-name streams; user streams) and `MiniDumpReadDumpStream`.
+- **Names and files** (`undname.inc`, `paths.inc`): `UnDecorateSymbolName(W)` for the common MSVC signatures (global and member functions, static data, builtin types, pointers, references,
+  classes with scopes, constructors, destructors; anything else falls back to the qualified name), `MakeSureDirectoryPathExists`, `SearchTreeForFile`, `EnumDirTree`, `FindFileInPath`,
+  `FindExecutableImage`, `FindDebugInfoFile`, `EnumerateLoadedModules*`.
+- **Not done.** PDB, DWARF and CodeView readers (so no lines, types, locals, source files: those calls fail with `ERROR_MOD_NOT_FOUND`/`ERROR_NOT_SUPPORTED`), symbol servers (`SymSrv*`, the
+  index functions of Wine's `path.c`), the callback of `MiniDumpWriteDump`, handle data and token streams, 32-bit `StackWalk`, inline frames, the debugger-extension exports.
+- **Gotcha.** ntdll.dll's stub list has names that are kernel32.dll's (`OpenThread`, `QueueUserAPC`, `IsWow64Process`, ...). A DLL that links `libntdll.a` before `kernel32.dll` imports the stub
+  (which answers `STATUS_NOT_IMPLEMENTED`) for such a name; dbghelp.dll finds `OpenThread` by name for that reason.
+- **Tests.** `scripts/winetest.sh dbghelp tcos` runs `tests/windows/wine/dbghelp/tcos.c` (193 checks: image helpers, symbols of kernel32's exports and of the test program's COFF table, the stack
+  walk through three frames, name decoding, directories, minidumps of the process itself in both modes, read back). Wine's own tests: `dbghelp` 89 -> 17 failed checks (the rest need files this OS does not have, a 32-bit process, and
+  `STATUS_INVALID_CID` from a bogus process handle); `minidump` crashed with an access violation and now runs through (56 failed: the callback, the debug-event exception tests, `kernelbase.dll` as a
+  module of its own); `path` is unchanged at 457 (all of it symbol-server and PDB indexing: `SymSrv*`).
+
 ## dwmapi.dll
 
 `src/Windows/dwmapi/dwmapi.c` implements the Desktop Window Manager API: `DwmIsCompositionEnabled` (always on), `DwmGetColorizationColor`, `DwmFlush` and `DwmGetCompositionTimingInfo`
