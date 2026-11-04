@@ -18,6 +18,8 @@
 
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/NeuralProcessingUnit/Intel/IntelNpuHw.hpp"
+#include "Hardware/RegisterMapper.hpp"
 #include "Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.hpp"
 #include "Utility/FixedString.hpp"
 
@@ -33,6 +35,11 @@ class SystemNeuralProcessingUnit {
   INeuralProcessingUnit& npu() { return *active_; }
   // One line for the boot log: which NPU hardware was found (vendor and platform) and that the computation still runs on the CPU, or that there is none.
   const char* description() const { return description_.c_str(); }
+  // Looks at an Intel NPU's fuse and status registers (read only; nothing is powered up or written) and adds what they say to description(). Needs the
+  // device's memory decoding to be on, as the firmware leaves it. Does nothing for other NPUs or without a mapper.
+  void probe_registers(const IPciBus& pci, IRegisterMapper* mmio);
+  // What probe_registers found; valid is false when it did not run or the registers did not answer.
+  const IntelNpuInfo& intel_info() const { return intel_info_; }
   // True when a hardware NPU is on the bus (its work still runs on the CPU until a native driver exists).
   bool hardware_present() const { return hardware_present_; }
 
@@ -40,7 +47,10 @@ class SystemNeuralProcessingUnit {
   // Vendor classes add no data, so the software NPU's size covers them all.
   alignas(16) unsigned char storage_[sizeof(SoftwareNeuralProcessingUnit)];
   INeuralProcessingUnit* active_ = nullptr;
-  FixedString<96> description_;
+  FixedString<192> description_;
+  PciDeviceInfo intel_device_;
+  IntelNpuInfo intel_info_;
+  bool intel_found_ = false;
   bool hardware_present_ = false;
 };
 
