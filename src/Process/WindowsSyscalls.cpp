@@ -24,6 +24,7 @@
 #include "Process/WindowsJobs.hpp"
 #include "Process/WindowsDebug.hpp"
 #include "Process/WindowsDialogs.hpp"
+#include "Process/WindowsFonts.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsMemory.hpp"
@@ -275,6 +276,7 @@ class WindowsSyscalls final : public ISyscallInterface {
         if (g_win32k_dispatch) { const uint64_t result = g_win32k_dispatch(process, r, &handled); if (handled) return result; }
         return kStatusNotImplemented;
       }
+      case WindowsSyscallNumber::NtTcosFont: return windowsabi::nt_tcos_font(process, r);
       case WindowsSyscallNumber::NtCancelSynchronousIoFile: return windowsabi::nt_cancel_synchronous_io_file(process, r);
       case WindowsSyscallNumber::NtFsControlFile: return windowsabi::nt_fs_control_file(process, r);
       case WindowsSyscallNumber::NtQueryObject: return windowsabi::nt_query_object(process, r);

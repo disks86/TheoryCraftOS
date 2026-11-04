@@ -145,6 +145,8 @@ class FontSet {
 
   // The parsed font of a face id (loads it if needed); nullptr for the special faces or a broken font.
   const TrueTypeFont* font_of(uint32_t face);
+  // The sfnt file of a face (decoded if it was bundled as WOFF), valid for the life of the FontSet; empty for a special or broken face.
+  ConstByteView sfnt_of(uint32_t face);
   bool face_info(uint32_t face, FaceInfo* out) const;
   uint32_t face_count() const { return static_cast<uint32_t>(faces_.count()); }
 

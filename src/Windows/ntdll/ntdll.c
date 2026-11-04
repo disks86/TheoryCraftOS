@@ -100,6 +100,7 @@ NT_SERVICE(NtTcosToken);
 NT_SERVICE(NtTcosAccessCheck);
 NT_SERVICE(NtTcosCommonDialog);
 NT_SERVICE(NtTcosDwm);
+NT_SERVICE(NtTcosFont);
 NT_SERVICE(NtCreateSocket);
 NT_SERVICE(NtBindSocket);
 NT_SERVICE(NtConnectSocket);

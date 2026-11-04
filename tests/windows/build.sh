@@ -37,6 +37,8 @@ $cc -O1 -Wall -Wextra -o "$out/pipetest.exe" tests/windows/pipetest.c
 echo "built $out/pipetest.exe (pipes, handle inheritance, redirected standard handles; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/advapitest.exe" tests/windows/advapitest.c -ladvapi32
 echo "built $out/advapitest.exe (advapi32: hive files, notification, CryptoAPI, event log, ETW, credentials, services, LSA, audit; it starts itself as a service)"
+$cc -O1 -Wall -Wextra -o "$out/dwritetest.exe" tests/windows/dwritetest.c -ldwrite
+echo "built $out/dwritetest.exe (dwrite.dll: fonts, layout, analysis; scripts/winetest.sh dwrite own runs it)"
 $cc -O1 -Wall -Wextra -o "$out/apctest.exe" tests/windows/apctest.c
 echo "built $out/apctest.exe (APCs, alertable waits, waitable timers, OpenProcess; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/mmaptest.exe" tests/windows/mmaptest.c
