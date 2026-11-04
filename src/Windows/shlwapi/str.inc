@@ -95,10 +95,10 @@ EXPORT CHAR_T *WINAPI FN(StrRStrI)(const CHAR_T *s, const CHAR_T *end, const CHA
   if (!s || !find || !*find) return NULL;
   const size_t_ n = LEN(find);
   if (!end) end = s + LEN(s);
-  for (; s < end + n && *s; ++s) {
+  for (; s < end && *s; ++s) {      /* (a match has to start before `end`) */
     size_t_ k = 0;
     while (k < n && s[k] && UPC(s[k]) == UPC(find[k])) ++k;
-    if (k == n && s <= end) found = (CHAR_T *)s;
+    if (k == n) found = (CHAR_T *)s;
   }
   return found;
 }
@@ -143,7 +143,7 @@ EXPORT int WINAPI FN(StrToInt)(const CHAR_T *s) {
 #define STIF_SUPPORT_HEX_ 1
 EXPORT BOOL WINAPI FN(StrToInt64Ex)(const CHAR_T *s, DWORD flags, INT64_ *out) {
   if (!s || !out) return FALSE;
-  while (*s == ' ' || (*s >= 9 && *s <= 13)) ++s;
+  while (*s == ' ' || *s == '\t' || *s == '\n') ++s;
   int neg = 0;
   if (*s == '-') { neg = 1; ++s; } else if (*s == '+') ++s;
   ULONGLONG v = 0;
@@ -158,7 +158,7 @@ EXPORT BOOL WINAPI FN(StrToInt64Ex)(const CHAR_T *s, DWORD flags, INT64_ *out) {
       any = 1;
     }
     if (!any) return FALSE;
-    *out = (INT64_)(neg ? 0 - v : v);
+    *out = (INT64_)v;      /* (the sign of a hex number is dropped) */
     return TRUE;
   }
   if (!(*s >= '0' && *s <= '9')) return FALSE;
@@ -418,22 +418,54 @@ EXPORT void WINAPI FN(PathQuoteSpaces)(CHAR_T *path) {
   path[n + 2] = 0;
 }
 EXPORT void WINAPI FN(PathUnquoteSpaces)(CHAR_T *path) {
-  if (!path) return;
+  if (!path || path[0] != '"') return;
   const size_t_ n = LEN(path);
-  if (n >= 2 && path[0] == '"' && path[n - 1] == '"') {
-    memmove(path, path + 1, (n - 2) * sizeof(CHAR_T));
-    path[n - 2] = 0;
+  if (path[n - 1] != '"') return;      /* (the first quote and the last one go; a lone quote leaves an empty string) */
+  path[n - 1] = 0;
+  memmove(path, path + 1, n * sizeof(CHAR_T));
+}
+/* "name[123].txt" is the decorated form of "name.txt": digits in brackets that end the name (before the extension), after at least one character. */
+EXPORT void WINAPI FN(PathUndecorate)(CHAR_T *path) {
+  if (!path) return;
+  CHAR_T *name = path, *ext = NULL;
+  for (CHAR_T *p = path; *p; ++p) { if (*p == '\\') { name = p + 1; ext = NULL; } else if (*p == '.') ext = p; }
+  CHAR_T *end = ext ? ext : path + LEN(path);
+  if (end - name < 3 || end[-1] != ']') return;
+  CHAR_T *p = end - 1;
+  while (p > name && UV(p[-1]) >= '0' && UV(p[-1]) <= '9') --p;
+  if (p <= name || p[-1] != '[') return;
+  CHAR_T *open = p - 1;
+  if (open == name) return;
+  memmove(open, end, (LEN(end) + 1) * sizeof(CHAR_T));
+}
+/* The longest folder prefix both paths share ("C:\\one\\two" and "C:\\one\\three": "C:\\one", 6); a bare "C:" counts as "C:\\". */
+EXPORT int WINAPI FN(PathCommonPrefix)(const CHAR_T *file1, const CHAR_T *file2, CHAR_T *out) {
+  if (!file1 || !file2) return 0;
+  if (out) *out = 0;
+  const CHAR_T *a = file1, *b = file2;
+  const int unc1 = file1[0] == '\\' && file1[1] == '\\', unc2 = file2[0] == '\\' && file2[1] == '\\';
+  if (unc1 != unc2) return 0;
+  if (unc1) { a += 2; b += 2; }
+  int length = 0;
+  for (;;) {
+    if ((!*a || *a == '\\') && (!*b || *b == '\\')) length = (int)(a - file1);
+    if (!*a || UPC(*a) != UPC(*b)) break;
+    ++a; ++b;
   }
+  if (length == 2) ++length;
+  if (out) { for (int i = 0; i < length; ++i) out[i] = file1[i]; out[length] = 0; }
+  return length;
 }
-EXPORT BOOL WINAPI FN(PathBuildRoot)(CHAR_T *root, int drive) {
-  if (!root || drive < 0 || drive > 25) return FALSE;
+EXPORT CHAR_T *WINAPI FN(PathBuildRoot)(CHAR_T *root, int drive) {
+  if (!root || drive < 0 || drive > 25) return root;
   root[0] = (CHAR_T)('A' + drive); root[1] = ':'; root[2] = '\\'; root[3] = 0;
-  return TRUE;
+  return root;
 }
+/* A name that is all upper case is shown in lower case except for its first letter; one with a lower case letter is left alone (and answers FALSE). */
 EXPORT BOOL WINAPI FN(PathMakePretty)(CHAR_T *path) {
-  if (!path || !*path) return FALSE;
+  if (!path) return FALSE;
   for (CHAR_T *p = path; *p; ++p) if (UV(*p) >= 'a' && UV(*p) <= 'z') return FALSE;
-  for (CHAR_T *p = path; *p; ++p) if (UV(*p) >= 'A' && UV(*p) <= 'Z') *p = (CHAR_T)(UV(*p) + 32);
+  for (CHAR_T *p = path; *p; ++p) if (p != path && UV(*p) >= 'A' && UV(*p) <= 'Z') *p = (CHAR_T)(UV(*p) + 32);
   return TRUE;
 }
 EXPORT BOOL WINAPI FN(PathFileExists)(const CHAR_T *path) {
@@ -452,30 +484,31 @@ EXPORT BOOL WINAPI FN(PathIsSameRoot)(const CHAR_T *a, const CHAR_T *b) {
   return ra - a == rb - b && FN(StrCmpNI)(a, b, (int)(ra - a)) == 0;
 }
 
-/* Collapses "." and ".." and repeated separators; the root (a drive, a server and share, or a backslash) is kept. Returns the length, or -1 when it does not fit. */
+/* Collapses "." and ".." between backslashes (a forward slash is part of a name here, as in Windows); the root (a drive, a server and share, or a backslash) is kept. Returns the length, or -1 when it does not fit. */
 static int CAT(canonical_, SUF)(const CHAR_T *src, CHAR_T *out, int capacity) {
   CHAR_T work[MAX_PATH_ + 4];
   int n = 0, root = 0;
   if (!*src) { work[n++] = '\\'; root = 1; }
-  else if (SEP(src[0]) && SEP(src[1])) { work[n++] = '\\'; work[n++] = '\\'; src += 2; root = 2; }
-  else if (SEP(src[0])) { work[n++] = '\\'; ++src; root = 1; }
+  else if (src[0] == '\\' && src[1] == '\\') { work[n++] = '\\'; work[n++] = '\\'; src += 2; root = 2; }
+  else if (src[0] == '\\') { work[n++] = '\\'; ++src; root = 1; }
   else if (src[0] && src[1] == ':') {
     work[n++] = src[0]; work[n++] = ':'; src += 2;
-    if (SEP(*src)) { work[n++] = '\\'; ++src; }
+    if (*src == '\\') { work[n++] = '\\'; ++src; }
     root = n;
   }
   int trailing_sep = 0;
   while (*src) {
-    if (SEP(*src)) { trailing_sep = 1; ++src; continue; }
+    if (*src == '\\') { trailing_sep = 1; ++src; continue; }
     trailing_sep = 0;
     const CHAR_T *start = src;
-    while (*src && !SEP(*src)) ++src;
+    while (*src && *src != '\\') ++src;
     const int len = (int)(src - start);
-    if (len == 1 && start[0] == '.') { trailing_sep = SEP(*src) || !*src ? 0 : 0; continue; }
+    if (len == 1 && start[0] == '.') continue;
     if (len == 2 && start[0] == '.' && start[1] == '.') {
       if (n > root) {
         if (work[n - 1] == '\\') --n;
         while (n > root && work[n - 1] != '\\') --n;
+        if (n > root && work[n - 1] == '\\') --n;      /* (the separator before the dropped name goes too; the next name brings its own) */
       }
       continue;
     }
@@ -483,7 +516,7 @@ static int CAT(canonical_, SUF)(const CHAR_T *src, CHAR_T *out, int capacity) {
     else if (n > root && n && work[n - 1] == '\\' && n == root) {}
     if (n + len >= MAX_PATH_) return -1;
     for (int k = 0; k < len; ++k) work[n++] = start[k];
-    if (SEP(*src)) trailing_sep = 1;
+    if (*src == '\\') trailing_sep = 1;
   }
   if (trailing_sep && n && work[n - 1] != '\\' && n + 1 < MAX_PATH_) work[n++] = '\\';
   if (n >= capacity) return -1;
@@ -492,22 +525,22 @@ static int CAT(canonical_, SUF)(const CHAR_T *src, CHAR_T *out, int capacity) {
   return n;
 }
 EXPORT BOOL WINAPI FN(PathCanonicalize)(CHAR_T *dst, const CHAR_T *src) {
-  if (!dst) return FALSE;
+  if (!dst || !src) { SetLastError(ERROR_INVALID_PARAMETER_); return FALSE; }
   *dst = 0;
-  if (!src) { SetLastError(ERROR_INVALID_PARAMETER_); return FALSE; }
   return CAT(canonical_, SUF)(src, dst, MAX_PATH_) >= 0;
 }
 EXPORT CHAR_T *WINAPI FN(PathCombine)(CHAR_T *dst, const CHAR_T *dir, const CHAR_T *file) {
   CHAR_T work[MAX_PATH_ * 2];
   if (!dst) return NULL;
-  *dst = 0;
-  if ((!dir || !*dir) && (!file || !*file)) return NULL;
+  if (!dir && !file) { *dst = 0; return NULL; }
   const CHAR_T *use_file = file && *file ? file : NULL;
-  if (!use_file) {      /* only a directory */
-    return CAT(canonical_, SUF)(dir, dst, MAX_PATH_) >= 0 ? dst : (*dst = 0, (CHAR_T *)NULL);
+  if (!use_file) {      /* only a directory (none at all: the root) */
+    static const CHAR_T none[1] = {0};
+    return CAT(canonical_, SUF)(dir ? dir : none, dst, MAX_PATH_) >= 0 ? dst : (*dst = 0, (CHAR_T *)NULL);
   }
   if (!dir || !*dir || !FN(PathIsRelative)(use_file) || (SEP(use_file[0]) && SEP(use_file[1]))) {
-    if (dir && *dir && FN(PathIsRelative)(use_file) == 0 && 0) {}
+    /* a rooted file with a directory that has no root of its own loses its backslash */
+    if (dir && *dir && use_file[0] == '\\' && use_file[1] != '\\' && dir[1] != ':' && dir[0] != '\\') use_file++;
     /* a rooted file ("\\b") takes the drive of the directory */
     if (dir && *dir && use_file[0] == '\\' && use_file[1] != '\\' && dir[1] == ':') {
       work[0] = dir[0]; work[1] = ':';
@@ -520,7 +553,7 @@ EXPORT CHAR_T *WINAPI FN(PathCombine)(CHAR_T *dst, const CHAR_T *dir, const CHAR
   }
   size_t_ n = 0;
   for (const CHAR_T *p = dir; *p && n < MAX_PATH_ * 2 - 3; ++p) work[n++] = *p;
-  if (n && work[n - 1] != '\\' && work[n - 1] != '/') work[n++] = '\\';
+  if (n && work[n - 1] != '\\') work[n++] = '\\';
   for (const CHAR_T *p = use_file; *p && n < MAX_PATH_ * 2 - 1; ++p) work[n++] = *p;
   work[n] = 0;
   return CAT(canonical_, SUF)(work, dst, MAX_PATH_) >= 0 ? dst : (*dst = 0, (CHAR_T *)NULL);

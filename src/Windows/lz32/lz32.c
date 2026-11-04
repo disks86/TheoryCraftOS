@@ -156,9 +156,7 @@ EXPORT void WINAPI LZClose(INT handle) {
   if (z) { _lclose(z->file); z->in_use = 0; }
   else _lclose(handle);
 }
-EXPORT INT WINAPI LZRead(INT handle, CHAR *buffer, INT length) {
-  LZ *z = lz_of(handle);
-  if (!z) return (INT)_lread(handle, buffer, (UINT)length);
+static INT lz_read(LZ *z, CHAR *buffer, INT length) {
   INT n = 0;
   while (n < length) {
     const int b = out_byte(z);
@@ -166,6 +164,13 @@ EXPORT INT WINAPI LZRead(INT handle, CHAR *buffer, INT length) {
     buffer[n++] = (CHAR)b;
   }
   return n;
+}
+/* (Windows answers LZERROR_READ for a read that starts at the end of the data.) */
+EXPORT INT WINAPI LZRead(INT handle, CHAR *buffer, INT length) {
+  LZ *z = lz_of(handle);
+  if (!z) return (INT)_lread(handle, buffer, (UINT)length);
+  const INT n = lz_read(z, buffer, length);
+  return n == 0 && length > 0 ? LZERROR_READ : n;
 }
 EXPORT LONG WINAPI LZSeek(INT handle, LONG offset, INT origin) {
   LZ *z = lz_of(handle);
@@ -184,7 +189,8 @@ EXPORT LONG WINAPI LZCopy(INT source, INT dest) {
   LONG total = 0;
   CHAR chunk[1024];
   for (;;) {
-    const INT n = LZRead(source, chunk, sizeof(chunk));
+    LZ *z = lz_of(source);
+    const INT n = z ? lz_read(z, chunk, sizeof(chunk)) : LZRead(source, chunk, sizeof(chunk));
     if (n < 0) return n;
     if (n == 0) break;
     if (_lwrite(dest, chunk, (UINT)n) != (UINT)n) return LZERROR_WRITE;
@@ -215,12 +221,16 @@ EXPORT INT WINAPI LZOpenFileA(LPSTR name, LPOFSTRUCT of, WORD style) {
   if (file == (HFILE)-1 && !(style & 0x100)) {      /* not there: the compressed file may be */
     char other[260];
     OFSTRUCT again;
-    if (compressed_name(name, other) && OpenFile(other, &again, style) != (HFILE)-1) {
-      *of = again;
-      file = OpenFile(other, of, style);
+    if (compressed_name(name, other)) {
+      if (OpenFile(other, &again, style) != (HFILE)-1) {
+        *of = again;
+        file = OpenFile(other, of, style);
+      } else {
+        memcpy(of->szPathName, again.szPathName, sizeof(of->szPathName));      /* (the path of the last name tried is the one reported) */
+      }
     }
   }
-  if (file == (HFILE)-1 || (style & (0x4000 | 0x100 | 0x200 | 0x1000))) return (INT)file;      /* (a test of existence, a parse, a delete or a create has no LZ file) */
+  if (file == (HFILE)-1 || (style & (0x4000 | 0x100 | 0x200 | 0x1000)) || (style & 3)) return (INT)file;      /* (only a file opened to read is an LZ file) */      /* (a test of existence, a parse, a delete or a create has no LZ file) */
   const INT lz = LZInit((INT)file);
   if (lz < 0) { _lclose((int)file); return lz; }
   return lz;

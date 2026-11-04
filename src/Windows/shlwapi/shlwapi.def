@@ -1,0 +1,8 @@
+LIBRARY shlwapi.dll
+EXPORTS
+SHAnsiToAnsi @345
+SHUnicodeToUnicode @346
+StrCpyNXA @399
+StrCpyNXW @400
+PathIsValidCharA @455
+PathIsValidCharW @456

@@ -94,10 +94,16 @@ EXPORT HRESULT_ WINAPI StrRetToBufW(STRRET_ *s, const void *pidl, LPWSTR buffer,
       s->u.pOleStr = NULL;
       break;
     }
-    case STRRET_CSTR_: if (!MultiByteToWideChar(CP_ACP, 0, s->u.cStr, -1, buffer, (int)capacity)) { buffer[0] = 0; hr = E_FAIL_; } break;
-    case STRRET_OFFSET_:
-      if (!pidl || !MultiByteToWideChar(CP_ACP, 0, (const char *)pidl + s->u.uOffset, -1, buffer, (int)capacity)) { buffer[0] = 0; hr = E_FAIL_; }
+    case STRRET_CSTR_:
+    case STRRET_OFFSET_: {
+      WCHAR whole[MAX_PATH_ * 4];
+      const char *text = s->uType == STRRET_CSTR_ ? s->u.cStr : pidl ? (const char *)pidl + s->u.uOffset : NULL;
+      if (!text || !MultiByteToWideChar(CP_ACP, 0, text, -1, whole, (int)(sizeof(whole) / sizeof(whole[0])))) { buffer[0] = 0; hr = E_FAIL_; break; }
+      UINT i = 0;
+      for (; whole[i] && i + 1 < capacity; ++i) buffer[i] = whole[i];      /* (a string that does not fit is cut) */
+      buffer[i] = 0;
       break;
+    }
     default: buffer[0] = 0; hr = E_FAIL_; break;
   }
   return hr;
@@ -116,6 +122,16 @@ EXPORT HRESULT_ WINAPI StrRetToBufA(STRRET_ *s, const void *pidl, LPSTR buffer, 
   if (hr) return hr;
   if (!WideCharToMultiByte(CP_ACP, 0, wide, -1, buffer, (int)capacity, NULL, NULL)) { buffer[capacity - 1] = 0; }
   return 0;
+}
+IMPORT void *WINAPI SysAllocStringLen(const WCHAR *string, UINT length);
+EXPORT HRESULT_ WINAPI StrRetToBSTR(STRRET_ *s, const void *pidl, void **out) {
+  WCHAR buffer[MAX_PATH_ * 4];
+  if (!s || !out) return E_FAIL_;
+  *out = NULL;
+  const HRESULT_ hr = StrRetToBufW(s, pidl, buffer, (UINT)(sizeof(buffer) / sizeof(buffer[0])));
+  if (hr) return hr;
+  *out = SysAllocStringLen(buffer, (UINT)wcslen(buffer));
+  return *out ? 0 : E_OUTOFMEMORY_;
 }
 EXPORT HRESULT_ WINAPI StrRetToStrW(STRRET_ *s, const void *pidl, LPWSTR *out) {
   WCHAR buffer[MAX_PATH_ * 4];
@@ -564,8 +580,8 @@ EXPORT BOOL WINAPI PathIsNetworkPathA(LPCSTR path) {
 EXPORT BOOL WINAPI PathIsURLW(LPCWSTR path) {
   if (!path) return FALSE;
   size_t_ i = 0;
-  while (path[i] && ((path[i] | 0x20) >= 'a' && (path[i] | 0x20) <= 'z')) ++i;
-  return i >= 2 && path[i] == ':' && path[i + 1] == '/' && path[i + 2] == '/';
+  while (path[i] && (((path[i] | 0x20) >= 'a' && (path[i] | 0x20) <= 'z') || (path[i] >= '0' && path[i] <= '9') || path[i] == '+' || path[i] == '-' || path[i] == '.')) ++i;
+  return i >= 2 && path[i] == ':';      /* (a scheme of two characters or more: "c:" is a drive) */
 }
 EXPORT BOOL WINAPI PathIsURLA(LPCSTR path) {
   WCHAR *w = to_wide_dup(path);

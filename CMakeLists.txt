@@ -1102,7 +1102,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(_stub_image_base 0x180A00000)
   # shell32.dll uses the registry (advapi32) and the window system (user32); the string functions it shares with shlwapi are forwarders in shell32.def.
   set(WINDOWS_IMPORTS_shell32 advapi32 user32 ole32)
-  set(WINDOWS_IMPORTS_shlwapi advapi32)
+  set(WINDOWS_IMPORTS_shlwapi advapi32 oleaut32)
   set(WINDOWS_IMPORTS_dxgi gdi32 user32)      # (the D3DKMT thunks, the display size and the window's device context)
   set(WINDOWS_IMPORTS_d3d12 gdi32)      # (the D3DKMT thunks of the kernel's Direct3D)
   set(WINDOWS_IMPORTS_shcore advapi32 ole32 win32u)      # (the registry, CoTaskMemAlloc, the DPI services of win32k)
