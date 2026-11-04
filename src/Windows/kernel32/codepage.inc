@@ -311,7 +311,10 @@ EXPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR sourc
     if (default_char || used_default) { set_error(ERROR_INVALID_PARAMETER); return 0; }
     if (flags) { set_error(ERROR_INVALID_FLAGS); return 0; }
   } else if (cp == CP_UTF8) {
-    if (flags & ~CPX_WC_ERR_INVALID_CHARS) { set_error(ERROR_INVALID_FLAGS); return 0; }
+    if (flags & ~CPX_WC_ERR_INVALID_CHARS) {
+      if (code_page == CP_UTF8 || (flags & ~CPX_WC_VALID)) { set_error(ERROR_INVALID_FLAGS); return 0; }
+      flags &= CPX_WC_ERR_INVALID_CHARS;      /* (the ANSI code page is UTF-8 here: the single-byte flags have nothing to do, they are not an error as they are for CP_UTF8) */
+    }
   } else {
     table = cp_find(cp);
     if (!table) { set_error(ERROR_INVALID_PARAMETER); return 0; }

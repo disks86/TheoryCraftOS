@@ -589,6 +589,8 @@ EXPORT BOOL WINAPI FN(PathMatchSpec)(const CHAR_T *path, const CHAR_T *spec) {
     size_t_ n = 0;
     while (*spec && *spec != ';' && n + 1 < MAX_PATH_) pattern[n++] = *spec++;
     pattern[n] = 0;
+    /* Windows lets one space after a '*' or a '.' go unmatched ("* .ext" and "*. ext" match "a.ext", "* . ext" does not) */
+    for (size_t_ i = 1; i < n; ++i) if (pattern[i] == ' ' && (pattern[i - 1] == '*' || pattern[i - 1] == '.')) { memmove(pattern + i, pattern + i + 1, (n - i) * sizeof(CHAR_T)); --n; break; }
     if (*spec == ';') ++spec;
     if (n && CAT(wild_, SUF)(pattern, path)) return TRUE;
   }
