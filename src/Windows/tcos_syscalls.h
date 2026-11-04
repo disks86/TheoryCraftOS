@@ -114,6 +114,7 @@
 #define NT_SERVICE_NtTcosCommonDialog 505
 #define NT_SERVICE_NtTcosDwm 506
 #define NT_SERVICE_NtTcosCrypto 507
+#define NT_SERVICE_NtTcosFont 508
 #define NT_SERVICE_NtCreateSocket 87
 #define NT_SERVICE_NtBindSocket 88
 #define NT_SERVICE_NtConnectSocket 89
@@ -2071,7 +2072,7 @@
 #define NT_SERVICE_NtUserTcosGetUpcall 5636
 #define NT_SERVICE_NtUserTcosUpcallDone 5637
 #define NT_SERVICE_NtUserTcosResume 5638
-#define NT_SERVICE_COUNT 508
+#define NT_SERVICE_COUNT 509
 #define NT_SERVICE_WIN32K_BASE 4096
 #define NT_SERVICE_WIN32K_END 5639
 #endif

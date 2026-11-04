@@ -322,6 +322,8 @@ TrueTypeFont* FontSet::load(uint32_t face_id) {
 
 const TrueTypeFont* FontSet::font_of(uint32_t face) { return load(face); }
 
+ConstByteView FontSet::sfnt_of(uint32_t face) { return load(face) ? faces_[face]->loaded->storage.view() : ConstByteView(); }
+
 bool FontSet::face_info(uint32_t face, FaceInfo* out) const {
   if (face >= faces_.count()) return false;
   const Face& f = *faces_[face];

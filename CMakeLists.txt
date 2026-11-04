@@ -426,6 +426,7 @@ add_executable(BOOTX64
   src/Font/GlyphCache.cpp
   src/Font/FontSet.cpp
   src/Font/Shaper.cpp
+  src/Font/SystemFontService.cpp
   src/Font/FontDataSans.cpp
   src/Font/FontDataSerif.cpp
   src/Font/FontDataMono.cpp
@@ -665,6 +666,7 @@ add_executable(BOOTX64
   src/Process/WindowsTokens.cpp
   src/Process/WindowsCrypto.cpp
   src/Process/WindowsDialogs.cpp
+  src/Process/WindowsFonts.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp

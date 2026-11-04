@@ -469,6 +469,25 @@ Still stubs: the `SHTaskPool*` functions; the WinRT stream functions report `E_N
 Side changes: `GetProcAddress` now loads the library a forwarder names (it only followed forwarders into libraries already loaded); `SHCreateStreamOnFile` shares read and write by
 default and `SetSize` on a read-only stream only moves the position; the registry seeds `HKLM\\...\\CurrentVersion\\Explorer\\Shell Folders` (the Common * folders).
 
+## dwrite.dll
+
+`src/Windows/dwrite` implements DirectWrite (the `IDWriteFactory` interface family of dwrite.h, `DWriteCreateFactory`) over the kernel's font system. The fonts are the kernel's
+(`src/Font`: the bundled Liberation/Noto faces and any font a program adds), reached with one service, **`NtTcosFont`** (service 508; request layout and operations in
+`src/Process/WindowsFonts.hpp`, implemented by `font::SystemFontService` in `src/Font/SystemFontService.cpp`, installed in `src/main.cpp`): face information and names, code point to
+glyph, glyph advances and boxes, kerning, outlines, anti-aliased glyph bitmaps, the bytes of the sfnt file (the DLL reads tables itself) and adding a font file.
+
+What the DLL does itself: the COM objects (font collection, family, font, face, localized strings, font files and their loaders, text format, text layout, text analyzer, glyph run
+analysis, GDI interop with the bitmap render target, rendering parameters, typography, number substitution, the ellipsis trimming sign), the CSS-style font matching, and the layout
+(clusters, fallback to the wide-coverage face, kerning, line breaking at spaces/hyphens/ideographs, wrapping modes, alignment incl. justification, tab stops, trimming, line
+spacing, hit testing, `Draw` through the program's `IDWriteTextRenderer`). The system collection lists the families the bundled faces stand in for (Arial, Segoe UI, Times New Roman,
+Courier New, Consolas, Liberation *, TCOS *, ...). A font file a program refers to (path or its own loader) is added to the kernel's fonts once and then is an ordinary face; a
+system face's file has a loader that streams the kernel's copy and answers a synthetic path (`C:\Windows\Fonts\tcos-N.ttf`).
+
+Not done: bidirectional reordering and complex-script shaping (clusters are code points plus combining marks, kerning from the `kern` table, no GSUB/GPOS/ligatures; a right-to-left
+reading direction only mirrors the alignment), font simulations, colour and variable fonts, CFF outlines, the DirectWrite 1.1+ interfaces (`IDWriteFactory1`..), ClearType sub-pixel
+rendering (the 3x1 texture carries grey coverage). Tests: `test_*` in `tests/WindowsFontTest.cpp` (the service, host), `tests/windows/dwritetest.c` (228 checks through the real DLL
+in QEMU: `scripts/winetest.sh dwrite own`); Wine's analyzer/font tests are mostly about bidi, scripts and Windows 10 interfaces and still fail (157 / 325 checks).
+
 ## gdi32.dll
 
 `src/Windows/gdi32` is a real library: the GDI API of wingdi.h (A and W forms, DCs and their attributes, pens, brushes, bitmaps, DIBs, regions, clipping, palettes, paths, text and

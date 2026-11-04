@@ -18,6 +18,8 @@
 
 #include "Process/WindowsSystem.hpp"
 #include "Process/Win32k/Win32k.hpp"
+#include "Process/WindowsFonts.hpp"
+#include "Font/SystemFontService.hpp"
 #include "Jit/CodePageSource.hpp"
 #include "Jit/CrossCoreTlbShootdown.hpp"
 #include "Jit/KernelCodeMemory.hpp"
@@ -710,6 +712,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);
   process::win32k::install_dxg();      // (the NtGdiDdDDI* services of win32u.dll reach the kernel-mode Direct3D driver)
+  // The system's fonts for DirectWrite (dwrite.dll reaches them with NtTcosFont); lives as long as the system does.
+  static font::SystemFontService system_fonts(shared_allocator);
+  process::windowsabi::set_font_service(&system_fonts);
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
   if (dxg_adapters > 1)
     for (uint32_t i = 0; i + 1 < dxg_adapters; ++i) {
