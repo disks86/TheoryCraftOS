@@ -809,6 +809,341 @@ static void test_device_queries(ID3D12Device *dev) {
   CHECK(FAILED(D3D12GetDebugInterface(&IID_ID3D12Debug, (void **)&debug)) && debug == NULL);
 }
 
+/* Queries, indirect execution, bundles and tiled resources on the triangle of test_triangle. */
+typedef struct Scene {
+  ID3D12Device *dev;
+  ID3D12CommandQueue *queue;
+  ID3D12Fence *fence;
+  UINT64 *fence_value;
+  ID3D12Resource *target, *readback, *vb;
+  ID3D12DescriptorHeap *rtv_heap;
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+  ID3D12RootSignature *rs;
+  ID3D12PipelineState *pso;
+  ID3D12CommandAllocator *allocator;
+} Scene;
+
+static int scene_make(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+  CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&c->target));
+  c->readback = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 64 * 256 + 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  c->vb = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!c->target || !c->readback || !c->vb) return 0;
+  const float verts[3][7] = {{-0.8f, -0.8f, 0.5f, 1, 0, 0, 1}, {0.8f, -0.8f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.8f, 0.5f, 0, 0, 1, 1}};
+  void *mapped = NULL;
+  CHECK_HR(ID3D12Resource_Map(c->vb, 0, NULL, &mapped));
+  if (mapped) memcpy(mapped, verts, sizeof verts);
+  ID3D12Resource_Unmap(c->vb, 0, NULL);
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&c->rtv_heap));
+  c->rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(c->rtv_heap);
+  ID3D12Device_CreateRenderTargetView(dev, c->target, NULL, c->rtv);
+  D3D12_ROOT_PARAMETER param;
+  memset(&param, 0, sizeof param);
+  param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  param.Constants.Num32BitValues = 16;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {1, &param, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ID3DBlob *blob = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  if (blob) CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&c->rs));
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.PS.pShaderBytecode = dx_ps_color_dxbc;
+  pd.PS.BytecodeLength = sizeof dx_ps_color_dxbc;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&c->pso));
+  CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&c->allocator));
+  if (blob) ID3D10Blob_Release(blob);
+  return c->rs && c->pso && c->allocator;
+}
+
+static void scene_begin(Scene *c, ID3D12GraphicsCommandList *list, int clear) {
+  const float black[4] = {0, 0, 0, 1};
+  D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  D3D12_RECT sc = {0, 0, 64, 64};
+  ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &c->rtv, FALSE, NULL);
+  if (clear) ID3D12GraphicsCommandList_ClearRenderTargetView(list, c->rtv, black, 0, NULL);
+  ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+  ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+}
+
+static void scene_state(Scene *c, ID3D12GraphicsCommandList *list, D3D12_GPU_VIRTUAL_ADDRESS vb) {
+  D3D12_VERTEX_BUFFER_VIEW vbv = {vb, 256, 28};
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetPipelineState(list, c->pso);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+}
+
+static void scene_read_target(Scene *c, ID3D12GraphicsCommandList *list) {
+  D3D12_TEXTURE_COPY_LOCATION dst, src;
+  memset(&dst, 0, sizeof dst);
+  memset(&src, 0, sizeof src);
+  dst.pResource = c->readback;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  dst.PlacedFootprint.Footprint.Width = 64;
+  dst.PlacedFootprint.Footprint.Height = 64;
+  dst.PlacedFootprint.Footprint.Depth = 1;
+  dst.PlacedFootprint.Footprint.RowPitch = 256;
+  src.pResource = c->target;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+}
+
+static void scene_run(Scene *c, ID3D12GraphicsCommandList *list) {
+  CHECK_HR(ID3D12GraphicsCommandList_Close(list));
+  ID3D12CommandList *lists[1] = {(ID3D12CommandList *)list};
+  ID3D12CommandQueue_ExecuteCommandLists(c->queue, 1, lists);
+  wait_fence(c->queue, c->fence, c->fence_value);
+}
+
+static int scene_coloured(Scene *c, int x0, int y0, int x1, int y1) {
+  const UINT32 *pixels = NULL;
+  int n = 0;
+  if (FAILED(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels)) || !pixels) return -1;
+  for (int y = y0; y < y1; ++y)
+    for (int x = x0; x < x1; ++x) n += (pixels[y * 64 + x] & 0xFFFFFF) != 0;
+  ID3D12Resource_Unmap(c->readback, 0, NULL);
+  return n;
+}
+
+static void test_queries(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
+  ID3D12QueryHeap *occlusion = NULL, *timestamps = NULL;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&occlusion));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  CHECK_HR(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&timestamps));
+  qd.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+  ID3D12QueryHeap *stats = NULL;
+  CHECK(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&stats) == DXGI_ERROR_UNSUPPORTED && stats == NULL);
+  ID3D12Resource *results = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!occlusion || !timestamps || !results || !list) { CHECK(0); return; }
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_EndQuery(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0);
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1);
+  ID3D12GraphicsCommandList_BeginQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 2);
+  ID3D12GraphicsCommandList_EndQuery(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 2);
+  ID3D12GraphicsCommandList_EndQuery(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, occlusion, D3D12_QUERY_TYPE_OCCLUSION, 0, 3, results, 0);
+  ID3D12GraphicsCommandList_ResolveQueryData(list, timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, results, 64);
+  scene_run(c, list);
+  const UINT64 *r = NULL;
+  CHECK_HR(ID3D12Resource_Map(results, 0, NULL, (void **)&r));
+  if (r) {
+    printf("queries: occlusion %llu, binary %llu, empty %llu, timestamps %llu %llu\n", (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2], (unsigned long long)r[8], (unsigned long long)r[9]);
+    CHECK(r[0] > 600 && r[0] < 2000);
+    CHECK(r[1] == 1);
+    CHECK(r[2] == 0);
+    CHECK(r[9] >= r[8]);
+    ID3D12Resource_Unmap(results, 0, NULL);
+  }
+  UINT64 frequency = 0;
+  CHECK_HR(ID3D12CommandQueue_GetTimestampFrequency(c->queue, &frequency));
+  CHECK(frequency != 0);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12Resource_Release(results);
+  ID3D12QueryHeap_Release(occlusion);
+  ID3D12QueryHeap_Release(timestamps);
+}
+
+static void test_indirect(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  /* each command: the matrix (16 root constants) and a draw: two triangles, one in each half of the target */
+  D3D12_INDIRECT_ARGUMENT_DESC args[2];
+  memset(args, 0, sizeof args);
+  args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+  args[0].Constant.RootParameterIndex = 0;
+  args[0].Constant.DestOffsetIn32BitValues = 0;
+  args[0].Constant.Num32BitValuesToSet = 16;
+  args[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+  D3D12_COMMAND_SIGNATURE_DESC sd = {16 * 4 + 16, 2, args, 0};
+  ID3D12CommandSignature *sig = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandSignature(dev, &sd, c->rs, &IID_ID3D12CommandSignature, (void **)&sig));
+  ID3D12Resource *arguments = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  ID3D12Resource *count = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  if (!sig || !arguments || !count) { CHECK(0); return; }
+  BYTE *p = NULL;
+  CHECK_HR(ID3D12Resource_Map(arguments, 0, NULL, (void **)&p));
+  for (int i = 0; i < 2; ++i) {
+    float m[16];
+    memcpy(m, kIdentity, sizeof m);
+    m[0] = m[5] = 0.5f;
+    m[3] = i ? 0.5f : -0.5f;      /* (the constant buffer holds the matrix by columns: the translation of mul(position, m) is the fourth value) */
+    memcpy(p + i * sd.ByteStride, m, sizeof m);
+    const UINT draw[4] = {3, 1, 0, 0};
+    memcpy(p + i * sd.ByteStride + sizeof m, draw, sizeof draw);
+  }
+  ID3D12Resource_Unmap(arguments, 0, NULL);
+  CHECK_HR(ID3D12Resource_Map(count, 0, NULL, (void **)&p));
+  *(UINT *)p = 2;
+  ID3D12Resource_Unmap(count, 0, NULL);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_ExecuteIndirect(list, sig, 4, arguments, 0, count, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const int left = scene_coloured(c, 0, 0, 32, 64), right = scene_coloured(c, 32, 0, 64, 64), middle = scene_coloured(c, 31, 40, 33, 64);
+  printf("indirect: %d pixels left, %d right, %d in the middle\n", left, right, middle);
+
+  CHECK(left > 150 && right > 150 && middle == 0);
+  /* a count of 1 draws one */
+  CHECK_HR(ID3D12Resource_Map(count, 0, NULL, (void **)&p));
+  *(UINT *)p = 1;
+  ID3D12Resource_Unmap(count, 0, NULL);
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, c->pso));
+  scene_begin(c, list, 1);
+  scene_state(c, list, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_ExecuteIndirect(list, sig, 4, arguments, 0, count, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  CHECK(scene_coloured(c, 0, 0, 32, 64) > 150 && scene_coloured(c, 32, 0, 64, 64) == 0);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12Resource_Release(count);
+  ID3D12Resource_Release(arguments);
+  ID3D12CommandSignature_Release(sig);
+}
+
+static void test_bundle(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  ID3D12CommandAllocator *balloc = NULL;
+  ID3D12GraphicsCommandList *bundle = NULL, *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_BUNDLE, &IID_ID3D12CommandAllocator, (void **)&balloc));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, balloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&bundle));
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!bundle || !list) { CHECK(0); return; }
+  scene_state(c, bundle, ID3D12Resource_GetGPUVirtualAddress(c->vb));
+  ID3D12GraphicsCommandList_DrawInstanced(bundle, 3, 1, 0, 0);
+  CHECK_HR(ID3D12GraphicsCommandList_Close(bundle));
+  /* the bundle twice in one list, with a clear between: it takes the targets from the list */
+  scene_begin(c, list, 1);
+  ID3D12GraphicsCommandList_ExecuteBundle(list, bundle);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const int n = scene_coloured(c, 0, 0, 64, 64);
+  printf("bundle: %d coloured pixels\n", n);
+  CHECK(n > 600 && n < 2000);
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, NULL));
+  scene_begin(c, list, 1);
+  scene_read_target(c, list);      /* (cleared, nothing drawn) */
+  scene_run(c, list);
+  CHECK(scene_coloured(c, 0, 0, 64, 64) == 0);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12GraphicsCommandList_Release(bundle);
+  ID3D12CommandAllocator_Release(balloc);
+}
+
+static void test_tiled(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS opts;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof opts));
+  CHECK(opts.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_1);
+  D3D12_HEAP_DESC hd;
+  memset(&hd, 0, sizeof hd);
+  hd.SizeInBytes = 2 * 65536;
+  hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  hd.Properties.CreationNodeMask = hd.Properties.VisibleNodeMask = 1;
+  hd.Alignment = 65536;
+  hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ID3D12Heap *heap = NULL;
+  CHECK_HR(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+  D3D12_RESOURCE_DESC bd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, 65536, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *placed = NULL, *reserved = NULL;
+  if (heap) CHECK_HR(ID3D12Device_CreatePlacedResource(dev, heap, 0, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&placed));
+  bd.Width = 2 * 65536;
+  CHECK_HR(ID3D12Device_CreateReservedResource(dev, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&reserved));
+  if (!heap || !placed || !reserved) { CHECK(0); return; }
+  UINT tiles = 0;
+  ID3D12Device_GetResourceTiling(dev, reserved, &tiles, NULL, NULL, NULL, 0, NULL);
+  CHECK(tiles == 2);
+  /* the triangle goes to the heap through the placed buffer; the reserved buffer's second tile is that tile of the heap */
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(c->dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, c->pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!list) return;
+  ID3D12GraphicsCommandList_CopyBufferRegion(list, placed, 0, c->vb, 0, 256);
+  scene_run(c, list);
+  const D3D12_GPU_VIRTUAL_ADDRESS base = ID3D12Resource_GetGPUVirtualAddress(reserved);
+  /* before the mapping: both tiles read as zero, so a draw from the second one makes nothing */
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, c->pso));
+  scene_begin(c, list, 1);
+  scene_state(c, list, base + 65536);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  CHECK(scene_coloured(c, 0, 0, 64, 64) == 0);
+  D3D12_TILED_RESOURCE_COORDINATE start = {1, 0, 0, 0};
+  D3D12_TILE_REGION_SIZE size = {1, FALSE, 0, 0, 0};
+  D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+  UINT heap_start = 0, count = 1;
+  ID3D12CommandQueue_UpdateTileMappings(c->queue, reserved, 1, &start, &size, heap, 1, &flags, &heap_start, &count, D3D12_TILE_MAPPING_FLAG_NONE);
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, c->pso));
+  scene_begin(c, list, 1);
+  scene_state(c, list, base + 65536);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const int mapped = scene_coloured(c, 0, 0, 64, 64);
+  printf("tiled: %d coloured pixels with the tile mapped\n", mapped);
+  CHECK(mapped > 600 && mapped < 2000);
+  /* unmapped again (a NULL range) */
+  flags = D3D12_TILE_RANGE_FLAG_NULL;
+  ID3D12CommandQueue_UpdateTileMappings(c->queue, reserved, 1, &start, &size, NULL, 1, &flags, NULL, &count, D3D12_TILE_MAPPING_FLAG_NONE);
+  CHECK_HR(ID3D12GraphicsCommandList_Reset(list, c->allocator, c->pso));
+  scene_begin(c, list, 1);
+  scene_state(c, list, base + 65536);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  CHECK(scene_coloured(c, 0, 0, 64, 64) == 0);
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12Resource_Release(reserved);
+  ID3D12Resource_Release(placed);
+  ID3D12Heap_Release(heap);
+}
+
+static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
+  Scene c;
+  memset(&c, 0, sizeof c);
+  c.dev = dev;
+  c.queue = queue;
+  c.fence = fence;
+  c.fence_value = fence_value;
+  if (!scene_make(&c)) { CHECK(0); return; }
+  test_queries(&c);
+  test_indirect(&c);
+  test_bundle(&c);
+  test_tiled(&c);
+}
+
 int main(void) {
   IDXGIAdapter1 *adapter = NULL;
   test_dxgi(&adapter);
@@ -835,6 +1170,7 @@ int main(void) {
     test_texture(dev, queue, fence, &value);
     test_depth(dev, queue, fence, &value);
     test_compute(dev, queue, fence, &value);
+    test_extras(dev, queue, fence, &value);
     test_swap_chain(adapter, dev, queue);
   }
   if (fence) ID3D12Fence_Release(fence);

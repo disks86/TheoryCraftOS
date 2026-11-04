@@ -214,6 +214,26 @@ const ID3D12PipelineStateVtbl pso_vtbl = {
     .GetDevice = (__typeof__(((ID3D12PipelineStateVtbl *)0)->GetDevice))dobj_GetDevice,
     .GetCachedBlob = (__typeof__(((ID3D12PipelineStateVtbl *)0)->GetCachedBlob))pso_GetCachedBlob,
 };
+const ID3D12QueryHeapVtbl qheap_vtbl = {
+    .QueryInterface = (__typeof__(((ID3D12QueryHeapVtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((ID3D12QueryHeapVtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((ID3D12QueryHeapVtbl *)0)->Release))obj_Release,
+    .GetPrivateData = (__typeof__(((ID3D12QueryHeapVtbl *)0)->GetPrivateData))obj_GetPrivateData,
+    .SetPrivateData = (__typeof__(((ID3D12QueryHeapVtbl *)0)->SetPrivateData))obj_SetPrivateData,
+    .SetPrivateDataInterface = (__typeof__(((ID3D12QueryHeapVtbl *)0)->SetPrivateDataInterface))obj_SetPrivateDataInterface,
+    .SetName = (__typeof__(((ID3D12QueryHeapVtbl *)0)->SetName))dobj_SetName,
+    .GetDevice = (__typeof__(((ID3D12QueryHeapVtbl *)0)->GetDevice))dobj_GetDevice,
+};
+const ID3D12CommandSignatureVtbl sig_vtbl = {
+    .QueryInterface = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->Release))obj_Release,
+    .GetPrivateData = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->GetPrivateData))obj_GetPrivateData,
+    .SetPrivateData = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->SetPrivateData))obj_SetPrivateData,
+    .SetPrivateDataInterface = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->SetPrivateDataInterface))obj_SetPrivateDataInterface,
+    .SetName = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->SetName))dobj_SetName,
+    .GetDevice = (__typeof__(((ID3D12CommandSignatureVtbl *)0)->GetDevice))dobj_GetDevice,
+};
 const ID3D10BlobVtbl blob_vtbl = {
     .QueryInterface = (__typeof__(((ID3D10BlobVtbl *)0)->QueryInterface))obj_QueryInterface,
     .AddRef = (__typeof__(((ID3D10BlobVtbl *)0)->AddRef))obj_AddRef,

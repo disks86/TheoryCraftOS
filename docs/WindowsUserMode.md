@@ -449,14 +449,18 @@ functions named `<prefix>_<Method>` in the sources (run it after adding a method
   copy of an upload buffer goes to the kernel before every execution, a readback buffer is read when it is mapped; GPU addresses are made up (a 64 KiB aligned range per buffer).
   The kernel's model limits what a program can do: one vertex buffer, four float vertex attributes, two sampled textures per draw, four unordered access buffers, 64 KiB of shader per
   pipeline, no depth-only pass (a depth clear waits for the next pass with a colour target), no multisampling or 1D textures, mip chains and arrays only on sampled textures, buffer SRVs only on
-  buffers made with unordered access, no texture UAVs, no resource state validation (barriers are ignored but aliasing ones). Not implemented: queries, predication, `ExecuteIndirect`, bundles,
-  stream output, reserved/tiled resources, shared handles, `WriteToSubresource`, the debug layer, root signature deserializers.
+  buffers made with unordered access, no texture UAVs, no resource state validation (barriers are ignored but aliasing ones). Also (`extras.inc`): **queries** (occlusion, binary occlusion, timestamps; `ResolveQueryData` is a `CopyBuffer` from the query buffer), **`ExecuteIndirect`** (the kernel has no indirect
+  draw: the list keeps a copy of its state at the call and the commands are recorded when the list is executed, after the argument buffer's producers ran; draw, indexed draw, dispatch, root
+  constants and views, vertex and index buffer arguments, with a count buffer), **bundles** (the calls are logged and made again on the list that executes the bundle) and **tiled
+  resources** (`CreateReservedResource` of buffers and of 4-byte colour textures in whole 128 x 128 tiles with one mip level, `UpdateTileMappings` with regions, boxes and range flags,
+  `GetResourceTiling`; tier 1). Not implemented: pipeline statistics and stream output queries, predication, stream output, `CopyTileMappings`, `CopyTiles`, mip tails, shared handles,
+  `WriteToSubresource`, the debug layer, root signature deserializers.
 - **New in the kernel for them** (no new system call number: the work goes through `NtGdiDdDDIEscape` and `NtGdiDdDDIRender`): the stream ops `CopyBuffer` and `CopyBufferImage` (buffer to
   buffer, rectangle of a mip level or layer of an image to and from rows of a buffer) and the escapes `CreateRootSignature`, `CreateDescriptorHeap`, `WriteDescriptors`, `CopyDescriptors`,
   `UpdateTileMappings`, `QuerySync` (a fence's value; Direct3D 12's `GetCompletedValue`) and the destroy ones (`DxgKernel.hpp`). Host tests: `DxgkrnlTest` `test_d3d12_copies_and_escapes`.
 - **Tests.** `tests/emulated_dx.sh` builds the host emulator with the kernel's Direct3D under it (win32k + `dxgk::Kernel` with the CPU renderer) and runs `tests/windows/d3d12test.c`, the real
   DLLs end to end: adapters and outputs, a triangle with a root signature and pipeline state read back, a textured quad (descriptor table, static sampler), depth testing with an index buffer and a
-  root constant buffer view, a compute shader, copies, fences and events, the swap chain, the serializer and device queries (156 checks). Not validated on a real GPU or by Wine's tests.
+  root constant buffer view, a compute shader, copies, fences and events, the swap chain, the serializer and device queries (229 checks: with queries, indirect execution, a bundle and a tiled vertex buffer). Not validated on a real GPU or by Wine's tests.
 
 ## dwmapi.dll
 

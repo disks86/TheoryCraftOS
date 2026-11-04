@@ -62,7 +62,7 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       memset(o, 0, sizeof *o);
       o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
       o->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
-      o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+      o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_1;
       o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
       o->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
       return S_OK;

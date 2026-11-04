@@ -134,8 +134,6 @@ static HRESULT STDMETHODCALLTYPE queue_QueryInterface(DxObj *o, REFIID riid, voi
 }
 static HRESULT STDMETHODCALLTYPE queue_GetDevice(Queue *This, REFIID riid, void **out) { return dobj_GetDevice(&This->d, riid, out); }
 
-static void STDMETHODCALLTYPE queue_UpdateTileMappings(Queue *This, ID3D12Resource *r, UINT n, const D3D12_TILED_RESOURCE_COORDINATE *c, const D3D12_TILE_REGION_SIZE *s, ID3D12Heap *h, UINT ranges,
-                                                       const D3D12_TILE_RANGE_FLAGS *f, const UINT *offsets, const UINT *counts, D3D12_TILE_MAPPING_FLAGS flags) {}
 static void STDMETHODCALLTYPE queue_CopyTileMappings(Queue *This, ID3D12Resource *d, const D3D12_TILED_RESOURCE_COORDINATE *dc, ID3D12Resource *s, const D3D12_TILED_RESOURCE_COORDINATE *sc,
                                                      const D3D12_TILE_REGION_SIZE *size, D3D12_TILE_MAPPING_FLAGS flags) {}
 static void STDMETHODCALLTYPE queue_SetMarker(Queue *This, UINT m, const void *d, UINT s) {}
@@ -160,7 +158,18 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(Queue *This, UINT count,
     CmdList *l = (CmdList *)lists[i];
     if (!l || !l->closed) continue;
     for (UINT k = 0; k < l->nheaps_used; ++k) dheap_sync(l->heaps_used[k]);
-    for (UINT k = 0; k < l->nchunks; ++k) run_chunk(This, l->chunks[k]);
+    for (UINT k = 0; k < l->nchunks; ++k) {
+      if (l->chunks[k]->indirect) {
+        CmdList *t = indirect_expand(l->chunks[k]->indirect);
+        if (!t) continue;
+        for (UINT m = 0; m < t->nchunks; ++m) run_chunk(This, t->chunks[m]);
+        list_free_recording(t);
+        mem_free(t->chunks);
+        mem_free(t);
+      } else {
+        run_chunk(This, l->chunks[k]);
+      }
+    }
   }
   LeaveCriticalSection(&This->lock);
 }
@@ -187,8 +196,6 @@ static HRESULT STDMETHODCALLTYPE queue_GetClockCalibration(Queue *This, UINT64 *
 }
 static D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE queue_GetDesc(Queue *This, D3D12_COMMAND_QUEUE_DESC *ret) { *ret = This->desc; return ret; }
 
-static HRESULT STDMETHODCALLTYPE dev_CreateQueryHeap(Dev *This, const D3D12_QUERY_HEAP_DESC *desc, REFIID riid, void **out) { return DXGI_ERROR_UNSUPPORTED; }
-static HRESULT STDMETHODCALLTYPE dev_CreateCommandSignature(Dev *This, const D3D12_COMMAND_SIGNATURE_DESC *desc, ID3D12RootSignature *rs, REFIID riid, void **out) { return DXGI_ERROR_UNSUPPORTED; }
 
 /* ---- the presenter ---------------------------------------------------------------------------------------------------------------------------------------------------------- */
 

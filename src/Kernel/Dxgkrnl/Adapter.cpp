@@ -778,14 +778,17 @@ class Adapter::StreamRunner {
   }
 
   // A plain buffer (not a heap, a reserved buffer or a query result): what CopyBuffer and CopyBufferImage move bytes of.
-  static bool copyable_buffer(const Allocation* a) { return a && a->is_buffer() && !a->reserved() && !(a->desc().flags & (kAllocHeap | kAllocQueryResult)); }
+  // (the results of queries can be a source: Direct3D 12's ResolveQueryData)
+  static bool copyable_buffer(const Allocation* a, bool allow_query = false) {
+    return a && a->is_buffer() && !a->reserved() && !(a->desc().flags & kAllocHeap) && (allow_query || !(a->desc().flags & kAllocQueryResult));
+  }
 
   NtStatus copy_buffer(ByteReader& p) {
     const uint32_t di = p.le32(), doff = p.le32(), si = p.le32(), soff = p.le32(), bytes = p.le32();
     if (!exact(p) || in_pass_) return kBad;
     Allocation* dst = alloc(di);
     Allocation* src = alloc(si);
-    if (!copyable_buffer(dst) || !copyable_buffer(src) || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
+    if (!copyable_buffer(dst) || !copyable_buffer(src, true) || !use(dst, state::kCopyDest) || !use(src, state::kCopySource)) return kBad;
     if (uint64_t{doff} + bytes > dst->desc().size || uint64_t{soff} + bytes > src->desc().size) return kBad;
     if (dst == src && doff < soff + uint64_t{bytes} && soff < doff + uint64_t{bytes}) return kBad;
     if (!exec_) return status::kSuccess;

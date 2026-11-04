@@ -47,6 +47,8 @@ SPECS = {
         ('ID3D12DescriptorHeap', 'dheap_vtbl', ['dheap', 'dobj', 'obj']),
         ('ID3D12RootSignature', 'rs_vtbl', ['rs', 'dobj', 'obj']),
         ('ID3D12PipelineState', 'pso_vtbl', ['pso', 'dobj', 'obj']),
+        ('ID3D12QueryHeap', 'qheap_vtbl', ['qheap', 'dobj', 'obj']),
+        ('ID3D12CommandSignature', 'sig_vtbl', ['sig', 'dobj', 'obj']),
         ('ID3D10Blob', 'blob_vtbl', ['blob', 'obj']),
     ],
 }

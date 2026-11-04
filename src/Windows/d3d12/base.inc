@@ -29,7 +29,7 @@ typedef struct Pso Pso;
 /* ---- the kernel's allocation flags and formats (src/Kernel/Dxgkrnl/DxgTypes.hpp) ------------------------------------------------------------------------------------------- */
 
 enum {
-  KA_VERTEX = 1u << 0, KA_INDEX = 1u << 1, KA_TEXTURE = 1u << 2, KA_RENDER_TARGET = 1u << 3, KA_DEPTH = 1u << 4, KA_PRESENT = 1u << 5, KA_STAGING = 1u << 6, KA_UAV = 1u << 9,
+  KA_VERTEX = 1u << 0, KA_INDEX = 1u << 1, KA_TEXTURE = 1u << 2, KA_RENDER_TARGET = 1u << 3, KA_DEPTH = 1u << 4, KA_PRESENT = 1u << 5, KA_STAGING = 1u << 6, KA_QUERY = 1u << 8, KA_UAV = 1u << 9,
   KA_HEAP = 1u << 13, KA_RESERVED = 1u << 14,
 };
 enum {
