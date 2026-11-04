@@ -30,5 +30,9 @@ void bounds_violation(const char* what, uint64_t index, uint64_t size) {
   console::puts(", size ");
   console::put_dec(static_cast<int64_t>(size));
   console::puts(")\n");
+  // Where the check failed: the address inside the caller (the accessors are inline), to resolve against TCOS_IMAGE_BASE.
+  console::puts("at ");
+  console::put_hex(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+  console::puts("\n");
   kernel::panic("out-of-bounds access stopped", nullptr);
 }
