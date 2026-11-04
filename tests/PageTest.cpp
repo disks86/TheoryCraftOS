@@ -6204,6 +6204,15 @@ static void test_webrtc() {
     CHECK(log.find("denied NotAllowedError") != std::string::npos && log.find("state denied") != std::string::npos && log.find("tx 1 recvonly audio") != std::string::npos);
     CHECK(log.find("video NotSupportedError") != std::string::npos && log.find("[\"audio/PCMU\",\"audio/PCMA\"] null") != std::string::npos);
   }
+  {   // the timing line of a page that fetched and ran nothing (the slowest file and script names are empty)
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    page.load("<html><body><p>plain</p></body></html>");
+    String t(a);
+    page.timing_summary(&t);
+    CHECK(t.size() > 0 && t.view().find("load ") == 0);
+  }
   CHECK(a.live == 0);
 }
 

@@ -340,6 +340,11 @@ bool Page::fetch_text_via_sw(StringView address, const char* destination, uint64
   return ok;
 }
 
+// The first `limit` bytes of `text` (substr() stops the OS when asked for more than there is).
+static StringView head(StringView text, uint64_t limit) {
+  return text.substr(0, text.size() < limit ? text.size() : limit);
+}
+
 static void append_ms(String* out, uint64_t us) {
   out->append_uint(us / 1000);
   out->append("ms");
@@ -359,7 +364,7 @@ void Page::timing_summary(String* out) const {
   out->append(" KiB; slowest ");
   append_ms(out, phase_.slowest_fetch);
   out->append(" ");
-  out->append(slowest_fetch_url_.view().substr(0, 80));
+  out->append(head(slowest_fetch_url_.view(), 80));
   out->append("), scripts ");
   append_ms(out, phase_.script);
   out->append(" (");
@@ -367,7 +372,7 @@ void Page::timing_summary(String* out) const {
   out->append(" run; slowest ");
   append_ms(out, phase_.slowest_script);
   out->append(" ");
-  out->append(slowest_script_name_.view().substr(0, 80));
+  out->append(head(slowest_script_name_.view(), 80));
   out->append("), load events and module scripts ");
   append_ms(out, phase_.events);
   out->append("]; render ");
