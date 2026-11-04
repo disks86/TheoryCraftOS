@@ -21,8 +21,10 @@
 #include "Hardware/CentralProcessingUnit/Intel/IntelAlderLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelArrowLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelBroadwellCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelCannonLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelCascadeLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelClearwaterForestCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelCoffeeLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelCoffeeLakeRefreshCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelCometLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelConroeCpu.hpp"
@@ -35,6 +37,8 @@
 #include "Hardware/CentralProcessingUnit/Intel/IntelIceLakeClientCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelIceLakeServerCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelIvyBridgeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelKabyLakeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelKabyLakeRefreshCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelKnightsMillCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelLakefieldCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelLunarLakeCpu.hpp"
@@ -54,6 +58,7 @@
 #include "Hardware/CentralProcessingUnit/Intel/IntelTigerLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelTremontCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelWestmereCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelWhiskeyLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelWildcatLakeCpu.hpp"
 
 namespace hardware {
@@ -101,7 +106,13 @@ constexpr GenerationRule kRules[] = {
     rule<IntelClearwaterForestCpu>(6, 0xDD, 0xDD),
     rule<IntelDiamondRapidsCpu>(19, 0x01, 0x01),
     // Client parts from Skylake's successors on. Steppings separate the 8th, 9th and 10th generations that share a model.
+    rule<IntelKabyLakeCpu>(6, 0x8E, 0x8E, 0x0, 0x9),
+    rule<IntelKabyLakeCpu>(6, 0x9E, 0x9E, 0x0, 0x9),
+    rule<IntelKabyLakeRefreshCpu>(6, 0x8E, 0x8E, 0xA, 0xA),
+    rule<IntelWhiskeyLakeCpu>(6, 0x8E, 0x8E, 0xB, 0xB),
+    rule<IntelCoffeeLakeCpu>(6, 0x9E, 0x9E, 0xA, 0xB),
     rule<IntelCoffeeLakeRefreshCpu>(6, 0x9E, 0x9E, 0xC, 0xD),
+    rule<IntelCannonLakeCpu>(6, 0x66, 0x66),
     rule<IntelCometLakeCpu>(6, 0x8E, 0x8E, 0xC, 0xD),
     rule<IntelCometLakeCpu>(6, 0xA5, 0xA6),
     rule<IntelIceLakeClientCpu>(6, 0x7D, 0x7E),
@@ -116,6 +127,7 @@ constexpr GenerationRule kRules[] = {
     rule<IntelRaptorLakeCpu>(6, 0xB7, 0xB7),
     rule<IntelRaptorLakeCpu>(6, 0xBA, 0xBA),
     rule<IntelRaptorLakeCpu>(6, 0xBF, 0xBF),
+    rule<IntelRaptorLakeCpu>(6, 0xD7, 0xD7),  // Bartlett Lake
     rule<IntelMeteorLakeCpu>(6, 0xAA, 0xAA),
     rule<IntelMeteorLakeCpu>(6, 0xAC, 0xAC),
     rule<IntelArrowLakeCpu>(6, 0xB5, 0xB5),
