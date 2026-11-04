@@ -1090,7 +1090,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   # The other system libraries of Windows (user32.dll, gdi32.dll ...): files with every export in place, none of them implemented yet. They are only stubs (see above).
   set(WINDOWS_STUB_LIBRARIES user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
-      avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
+      vulkan-1 avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
       activeds normaliz sensapi authz rasapi32)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
   add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
@@ -1108,8 +1108,14 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_shcore advapi32 ole32 win32u)      # (the registry, CoTaskMemAlloc, the DPI services of win32k)
   set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
   set(WINDOWS_IMPORTS_imm32 win32u)      # (the services of win32k: input contexts, hot keys)
+  set(WINDOWS_IMPORTS_vulkan-1 gdi32 user32)      # (the D3DKMT services of the kernel-mode Direct3D layer, the window size)
+  set(WINDOWS_STUB_RESULT_vulkan-1 0xFFFFFFF8u)   # (VK_ERROR_FEATURE_NOT_PRESENT for the exports that are not implemented)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
-    windows_stub_flags(_flags ${_library} 0)
+    if(DEFINED WINDOWS_STUB_RESULT_${_library})
+      windows_stub_flags(_flags ${_library} ${WINDOWS_STUB_RESULT_${_library}})
+    else()
+      windows_stub_flags(_flags ${_library} 0)
+    endif()
     # A library with code of its own (src/Windows/<dll>/<dll>.c and the .inc files next to it) is linked over kernel32.dll; the stubs fill in what it does not define yet.
     set(_own ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.c)
     set(_own_sources "")

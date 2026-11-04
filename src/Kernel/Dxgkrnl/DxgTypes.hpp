@@ -181,6 +181,10 @@ struct AdapterCaps {
   bool textures = false;             // sampled images (texture units; max_texture_units says how many pipelines may use)
   bool programmable_vertex = false;  // a vertex shader of any program (as a function, TGSI or Direct3D 9 tokens), not only the device's fixed transform
   bool programmable_pixel = false;   // the same for a pixel shader; false: the device has fixed pixel kernels (see D3d9Devices.cpp) and takes only shaders that are exactly one
+  uint32_t sample_counts = 0;        // graphics::DeviceInfo::sample_counts: bit n set: allocations of n samples
+  uint32_t device_kind = 0;          // graphics::DeviceKind: 0 software rasterizer, 1 virtual GPU, 2 GPU
+  uint32_t vendor_id = 0;            // PCI vendor of the GPU behind the device (0x10005: the CPU renderer), from its name; a Vulkan driver reports it as VkPhysicalDeviceProperties::vendorID
+  uint32_t device_id = 0;            // a number of the device within its vendor (what the kind of device says; the OS has no marketing ids for them)
   char name[64] = {};
 };
 

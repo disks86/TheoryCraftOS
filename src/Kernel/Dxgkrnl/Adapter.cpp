@@ -1263,6 +1263,25 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
   caps_.features = info.features;
   const char* name = config.name ? config.name : info.name;
   for (uint32_t i = 0; name && name[i] && i + 1 < sizeof(caps_.name); ++i) caps_.name[i] = name[i];
+  caps_.sample_counts = info.sample_counts;
+  caps_.device_kind = static_cast<uint32_t>(info.kind);
+  // The vendor the name says (the names are those of the devices in src/Graphics/Graphics3D); the virtual GPUs have their hypervisor's.
+  auto name_has = [&](const char* part) {
+    for (uint32_t i = 0; caps_.name[i]; ++i) {
+      uint32_t k = 0;
+      while (part[k] && caps_.name[i + k] == part[k]) ++k;
+      if (!part[k]) return true;
+    }
+    return false;
+  };
+  if (info.kind == graphics::DeviceKind::Software) caps_.vendor_id = 0x10005, caps_.device_id = 1;
+  else if (name_has("Intel")) caps_.vendor_id = 0x8086, caps_.device_id = 9;
+  else if (name_has("Radeon") || name_has("AMD")) caps_.vendor_id = 0x1002, caps_.device_id = 0x694C;
+  else if (name_has("NVIDIA")) caps_.vendor_id = 0x10DE, caps_.device_id = 1;
+  else if (name_has("VMware")) caps_.vendor_id = 0x15AD, caps_.device_id = 0x0405;
+  else if (name_has("virgl")) caps_.vendor_id = 0x1AF4, caps_.device_id = 0x1050;
+  else if (name_has("Raspberry") || name_has("V3D")) caps_.vendor_id = 0x14E4, caps_.device_id = 0x2711;
+  else caps_.vendor_id = 0x10005, caps_.device_id = 2;
 
   // What the device accepts beyond the basics, found by trying: a stencil plane, a mipmapped texture.
   graphics::ImageDesc probe;
