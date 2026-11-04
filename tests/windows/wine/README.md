@@ -45,7 +45,7 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | shlwapi istream | 3008 + crash | 0 (file streams follow Windows: write-only streams are readable, CREATE/CREATE_NEW dispositions, lock and revert are E_NOTIMPL, Stat returns the name; SHCreateMemStream in misc.inc) |
 | shlwapi shreg | 15 | 1 (the test's `Software` key is not in the OS's registry): SHRegGetValue, SHCopyKey, the HUSKEY family (reg.inc), SHQueryValueEx sizes and truncation |
 | shlwapi assoc | 10 | 1 (needs a `.html` association in the registry): AssocCreate / IQueryAssociations, default verb |
-| shlwapi ordinal | 18 + crash | 160, runs to the end: SHAllocShared family, FDSA, SHSearchMapInt, SHPackDispParams, ConnectToConnectionPoint (misc.inc). The rest of the ordinal-only exports (SHSetWindowBits, SHFormatDateTime, SHGetIniString, SK*, GetShellSecurityDescriptor ...) are parked on a no-op in shlwapi.def so that a lookup by number does not land on an unrelated export |
+| shlwapi ordinal | 18 + crash | 21 left: window-system functions (SHSetWindowBits, SHSetParentHwnd, SHCreateWorkerWindowA: user mode has no windows), GetAcceptLanguagesA, SHGetObjectCompatFlags, SHPropertyBag_ReadLONG, and one ini check (SHSetIniStringW adding a section after a read test; a standalone repro of the same calls is correct). The SK* and HRESULT results were wrong because `HRESULT_FROM_WIN32_` evaluated its argument twice (SKDeleteValueW deleted twice); it is a function now |
 | lz32 lzexpand | 117 | 0 |
 | kernel32 format_msg | 591 | 270 |
 | kernel32 time | 786 | 1 |

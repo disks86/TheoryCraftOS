@@ -197,7 +197,8 @@ EXPORT DWORD WINAPI StrCatChainW(LPWSTR dst, DWORD max, DWORD offset, LPCWSTR sr
 typedef LONG HRESULT_;
 typedef BYTE *LPBYTE;
 IMPORT int memcmp(const void *, const void *, size_t_);
-#define HRESULT_FROM_WIN32_(e) ((LONG)(e) <= 0 ? (LONG)(e) : (LONG)(((e) & 0xFFFF) | 0x80070000))
+static inline LONG hresult_from_win32(LONG e) { return e <= 0 ? e : (LONG)((e & 0xFFFF) | 0x80070000); }      /* (a function: the argument is often a call with side effects) */
+#define HRESULT_FROM_WIN32_(e) hresult_from_win32((LONG)(e))
 #define ERROR_KEY_HAS_CHILDREN 1020
 #define E_OUTOFMEMORY_VALUE E_OUTOFMEMORY_
 IMPORT DWORD WINAPI GetLastError(void);
