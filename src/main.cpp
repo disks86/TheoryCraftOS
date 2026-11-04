@@ -2216,8 +2216,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     const uint32_t kept = desktop.save_session();   // what is open now, for the next start
     Entry(Level::Info, "Desktop").text("saved ").dec(kept).text(" window(s) for the next session");
     guest.stop_service();  // (VirtualBox's resize requests touch the desktop)
+    Entry(Level::Info, "Shutdown").text("guest services stopped");
     input.stop_service();  // (its notices touch the desktop)
+    Entry(Level::Info, "Shutdown").text("input service stopped");
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
+    Entry(Level::Info, "Shutdown").text("desktop threads stopped");
     });
   } else {
     console::puts("No desktop (no graphics display). Press any key to shut down.\n");
