@@ -66,6 +66,8 @@ struct RenderOptions {
 
 // Reads the style sheets of the document, in the order they come, into `sheet`.
 bool collect_style_sheets(dom::Document& doc, const RenderOptions& options, StyleSheet* sheet);
+// A number for what collect_style_sheets reads (the <style> and <link> elements, in order, and the text of the sheets they name): the same number, the same rules.
+uint64_t style_sources_fingerprint(dom::Document& doc, const RenderOptions& options);
 
 // (Forms are drawn as text: [ a field ], [ Button ], [x] a box, (*) a radio button, [ a list v ], the controls of a form being text that can be clicked.)
 // Renders the whole page into `out` (replacing what it had). False if memory ran out.

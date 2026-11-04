@@ -136,6 +136,7 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       rtc_ids_(allocator),
       rtc_sources_(allocator),
       workers_(allocator),
+      computed_cache_(allocator),
       geometry_(allocator) {
   address_.assign(address);
   style_cache_media_ = media;
@@ -320,12 +321,74 @@ bool Page::sw_fetch_bytes(StringView address, StringView destination, uint64_t l
 }
 
 bool Page::fetch_text_via_sw(StringView address, const char* destination, uint64_t limit, String* text) {
-  if (sw_client_ != 0) {
+  const uint64_t started = env_.monotonic_us();
+  bool ok;
+  if (sw_client_ != 0 && env_.service_workers() && env_.service_workers()->client_controller(sw_client_, nullptr) != 0) {
     ByteBuffer bytes(allocator_);
-    if (env_.service_workers() && env_.service_workers()->client_controller(sw_client_, nullptr) != 0)
-      return sw_fetch_bytes(address, destination, limit, &bytes) && text->assign(StringView(bytes.view()));
+    ok = sw_fetch_bytes(address, destination, limit, &bytes) && text->assign(StringView(bytes.view()));
+  } else {
+    ok = env_.fetch_text(address, limit, text);
   }
-  return env_.fetch_text(address, limit, text);
+  const uint64_t took = env_.monotonic_us() - started;
+  phase_.fetch += took;
+  ++phase_.fetch_count;
+  phase_.fetch_bytes += text->size();
+  if (took > phase_.slowest_fetch) {
+    phase_.slowest_fetch = took;
+    slowest_fetch_url_.assign(address);
+  }
+  return ok;
+}
+
+static void append_ms(String* out, uint64_t us) {
+  out->append_uint(us / 1000);
+  out->append("ms");
+}
+
+// One line for the status bar and the console: "load 5200ms (downloads 3100ms/12 files 4MiB, slowest ...; scripts ...)".
+void Page::timing_summary(String* out) const {
+  if (phase_.load == 0 && phase_.render == 0) return;
+  out->append("load ");
+  append_ms(out, phase_.load);
+  out->append(" [downloads ");
+  append_ms(out, phase_.fetch);
+  out->append(" (");
+  out->append_uint(phase_.fetch_count);
+  out->append(" files, ");
+  out->append_uint(phase_.fetch_bytes >> 10);
+  out->append(" KiB; slowest ");
+  append_ms(out, phase_.slowest_fetch);
+  out->append(" ");
+  out->append(slowest_fetch_url_.view().substr(0, 80));
+  out->append("), scripts ");
+  append_ms(out, phase_.script);
+  out->append(" (");
+  out->append_uint(phase_.script_count);
+  out->append(" run; slowest ");
+  append_ms(out, phase_.slowest_script);
+  out->append(" ");
+  out->append(slowest_script_name_.view().substr(0, 80));
+  out->append("), load events and module scripts ");
+  append_ms(out, phase_.events);
+  out->append("]; render ");
+  append_ms(out, phase_.render);
+  out->append(" [style sheets download ");
+  append_ms(out, phase_.styles_fetch);
+  out->append(", style rules ");
+  append_ms(out, phase_.styles);
+  out->append(", boxes ");
+  append_ms(out, phase_.boxes);
+  out->append(", layout ");
+  append_ms(out, phase_.layout);
+  out->append(", paint ");
+  append_ms(out, phase_.paint);
+  out->append(", resize observers ");
+  append_ms(out, phase_.observers);
+  out->append(", intersection observers ");
+  append_ms(out, phase_.intersection);
+  out->append(", rest ");
+  append_ms(out, phase_.observers_end);
+  out->append("]");
 }
 
 // What the service worker hub has to say to this document, as events of navigator.serviceWorker.
@@ -390,11 +453,19 @@ void Page::prefetch_resources(StringView html) {
 }
 
 bool Page::load(StringView html) {
+  const uint64_t load_started = env_.monotonic_us();
+  const bool loaded = load_document(html);
+  phase_.load = env_.monotonic_us() - load_started;
+  return loaded;
+}
+
+bool Page::load_document(StringView html) {
   prefetch_resources(html);
   loading_ = true;
   const bool ok = dom::build_document(doc_, html, scripts_enabled_ ? static_cast<dom::IScriptRunner*>(this) : nullptr);
   loading_ = false;
   if (!ok) return false;
+  const uint64_t events_started = env_.monotonic_us();
   if (scripts_enabled_ && !engine_) {   // (a page whose only scripts are modules or import maps: the parser left them to the module loader)
     for (dom::Node* n = doc_.root(); n; n = dom::next_in_tree(n, doc_.root())) {
       StringView type;
@@ -429,6 +500,7 @@ bool Page::load(StringView html) {
       note_error(text.view());
     }
   }
+  phase_.events = env_.monotonic_us() - events_started;
   if (address_.view().find('#') != StringView::npos) fragment_pending_ = true;
   for (dom::Node* n = doc_.root(); n; n = dom::next_in_tree(n, doc_.root())) {   // autofocus
     if (n->is_element() && dom::has_attribute(n, "autofocus") && dom::is_focusable(n)) {
@@ -455,7 +527,22 @@ void Page::run(dom::Node* script, StringView source, String* written) {
   bindings_->set_current_script(script);
   written_.clear();
   String error(allocator_);
+  const uint64_t started = env_.monotonic_us();
   if (!engine_->run(source, &error, nullptr)) note_error(error.view());
+  const uint64_t took = env_.monotonic_us() - started;
+  phase_.script += took;
+  ++phase_.script_count;
+  if (took > phase_.slowest_script) {
+    phase_.slowest_script = took;
+    StringView src;
+    slowest_script_name_.clear();
+    if (script && dom::get_attribute(script, "src", &src)) slowest_script_name_.assign(src);
+    else {
+      slowest_script_name_.append("inline, ");
+      slowest_script_name_.append_uint(source.size() >> 10);
+      slowest_script_name_.append(" KiB");
+    }
+  }
   if (bindings_->errors()) {
     String text(allocator_);
     bindings_->take_error(&text);
@@ -549,7 +636,6 @@ void Page::fetch_pending_styles() {
 
 const StyleSheet& Page::style_sheet() {
   if (!style_cache_valid_ || style_cache_version_ != doc_.version() || style_cache_media_ != media_) {
-    style_cache_.clear();
     RenderOptions options;
     options.media = media_;
     options.styles = this;
@@ -559,7 +645,17 @@ const StyleSheet& Page::style_sheet() {
         ":fullscreen { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100% !important;"
         " height: 100% !important; max-width: none !important; max-height: none !important; margin: 0 !important; box-sizing: border-box !important; z-index: 2147483647 !important; }";
     if (!fullscreen_stack_.empty()) options.extra_css = StringView(kFullscreenCss);
-    collect_style_sheets(doc_, options, &style_cache_);
+    computed_cache_.clear();
+    // Scripts change the page all the time, and the style sheets almost never: when the <style> and <link> elements are as they were, so are the rules (the page
+    // changing is no reason to read megabytes of CSS again).
+    const uint64_t sources = style_sources_fingerprint(doc_, options);
+    if (style_cache_valid_ && style_cache_media_ == media_ && sources == style_sources_) {
+      style_cache_.reset_derived();
+    } else {
+      style_cache_.clear();
+      collect_style_sheets(doc_, options, &style_cache_);
+      style_sources_ = sources;
+    }
     style_cache_.set_container_sizes(this);
     style_cache_version_ = doc_.version();
     style_cache_media_ = media_;
@@ -610,8 +706,24 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
   uint32_t depth = 0;
   for (const dom::Node* n = element; n && n->is_element() && depth < 512; n = n->parent) chain[depth++] = n;
   const StyleSheet& sheet = style_sheet();
+  if (computed_cache_focus_ != focus_ || computed_cache_.count() > kMaxComputedStyles) {
+    computed_cache_.clear();
+    computed_cache_focus_ = focus_;
+  }
   Style s;
-  for (uint32_t i = depth; i > 0; --i) {
+  uint32_t known = depth;   // chain[known..depth) is above the nearest ancestor whose style is kept: s starts as that one's
+  for (uint32_t i = 0; i < depth; ++i) {
+    if (const Style* hit = computed_cache_.find(chain[i])) {
+      s = *hit;
+      known = i;
+      break;
+    }
+  }
+  if (known == 0) {
+    *out = s;
+    return true;
+  }
+  for (uint32_t i = known; i > 0; --i) {
     const dom::Node* n = chain[i - 1];
     const Style parent = s;
     s = derive_style(parent, n, sheet);
@@ -626,6 +738,7 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
       s.background = s.own_background_color;
       s.background_block = s.display != Display::Inline;
     }
+    computed_cache_.put(n, s);
   }
   *out = s;
   return true;
@@ -656,17 +769,27 @@ bool Page::render(HtmlDocument* out) {
 }
 
 bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
+  const uint64_t render_started = env_.monotonic_us();
+  uint64_t mark = render_started;
+  auto lap = [&](uint64_t* into) {
+    const uint64_t now = env_.monotonic_us();
+    *into += now - mark;
+    mark = now;
+  };
   prune_fullscreen();
   fetch_pending_styles();
+  lap(&phase_.styles_fetch);
   sync_frames();
   objects_.set_now(env_.now_ms());
   objects_.sync(doc_, object_environment(), address_.view(), media_);
   style_sheet();
   style_cache_.set_viewport(media_.width, media_.height);
+  lap(&phase_.styles);
   layout::BuildOptions build;
   build.objects = &objects_;
   layout::FontMeasurer measurer(fonts, &style_cache_);
   bool ok = layout::build_box_tree(doc_, style_cache_, build, &out->tree);
+  lap(&phase_.boxes);
   if (ok) {
     layout::LayoutOptions layout_options;
     layout_options.viewport_width = layout::LayoutUnit::from_px(media_.width);
@@ -675,6 +798,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
     layout_options.sheet = &style_cache_;
     ok = layout::layout_tree(out->tree, layout_options);
   }
+  lap(&phase_.layout);
   if (ok) {
     paint::PaintOptions paint_options;
     paint_options.measurer = &measurer;
@@ -686,6 +810,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
   }
   if (ok) resolve_scroll_target(out->tree);
   if (ok) record_geometry(out->tree);
+  lap(&phase_.paint);
   out->document = &doc_;
   out->viewport_width = media_.width;
   rendered_version_ = doc_.version();
@@ -694,9 +819,13 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
   deliver_object_events();
   if (ok && bindings_) {   // (what is on screen has changed: intersection observers look again)
     bindings_->call_hook("__ro_run", nullptr, 0);   // (resize observers first, then intersection observers)
+    lap(&phase_.observers);
     bindings_->call_hook("__io_run", nullptr, 0);
+    lap(&phase_.intersection);
     flush_errors();
   }
+  lap(&phase_.observers_end);
+  phase_.render += env_.monotonic_us() - render_started;
   return ok;
 }
 

@@ -402,6 +402,43 @@ bool collect_style_sheets(dom::Document& doc, const RenderOptions& options, Styl
   return true;
 }
 
+uint64_t style_sources_fingerprint(dom::Document& doc, const RenderOptions& options) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  auto mix_text = [&](StringView t) {
+    mix(t.size());
+    for (uint64_t i = 0; i < t.size(); ++i) mix(static_cast<uint8_t>(t[i]));
+  };
+  mix_text(options.extra_css);
+  List<const dom::Node*> roots(doc.allocator());
+  roots.push_back(doc.root());
+  for (uint64_t r = 0; r < roots.count() && r < 200; ++r) {
+    mix(r == 0 ? 0 : roots[r]->serial);
+    for (const dom::Node* n = roots[r]; n; n = dom::next_in_tree(n, roots[r])) {
+      if (!n->is_element()) continue;
+      if (n->shadow) roots.push_back(n->shadow);
+      const bool style = n->is_tag("style"), link = n->is_tag("link") && options.styles;
+      if (!style && !link) continue;
+      mix(n->serial);
+      for (const char* name : {"type", "media", "rel", "disabled"}) {
+        StringView v;
+        if (dom::get_attribute(n, name, &v)) mix_text(v);
+        else mix(0xFFFFFFFFull);
+      }
+      if (style) {
+        String css(doc.allocator());
+        dom::text_content(n, &css);
+        mix_text(css.view());
+      } else {
+        const StringView css = options.styles->linked(n);   // (a fetched sheet never changes: where it is and how long it is say which)
+        mix(reinterpret_cast<uintptr_t>(css.data()));
+        mix(css.size());
+      }
+    }
+  }
+  return h;
+}
+
 void document_title(const dom::Document& doc, String* out) {
   out->clear();
   for (const dom::Node* n = doc.root(); n; n = dom::next_in_tree(n, doc.root())) {

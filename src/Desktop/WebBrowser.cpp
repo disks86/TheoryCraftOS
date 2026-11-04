@@ -26,6 +26,7 @@
 #include "Dom/LegacyEncodings.hpp"
 #include "Media/ImageCodecs.hpp"
 #include "Desktop/FileStatus.hpp"
+#include "Kernel/Delay.hpp"
 #include "Gui/Window.hpp"
 #include "Gui/Windows/TabFrame.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -208,6 +209,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       request_type_(allocator),
       request_body_(allocator),
       script_log_(allocator),
+      load_timing_(allocator),
       history_(allocator),
       own_jar_(allocator),
       current_(allocator),
@@ -871,6 +873,7 @@ void WebBrowser::show(Fetched& page) {
     }
     html = synthetic.view();
   }
+  load_timing_.clear();
   bool ok = true;
   media_ = current_media();
   apply_fullscreen(false);   // (a page that was fullscreen is gone)
@@ -889,6 +892,17 @@ void WebBrowser::show(Fetched& page) {
     else say("Reading the page...");
     ok = live_->load(html) && live_->render_picture(picture.get(), layout_fonts());
     if (ok) page_.set_object_painter(&live_->objects());
+    if (ok && scripts) {   // where the time went, for a page that feels slow
+      String timing(allocator());
+      live_->timing_summary(&timing);
+      if (!timing.empty()) {
+        load_timing_.assign(timing.view());
+        String line(allocator());
+        line.append("timing: ");
+        line.append(timing.view());
+        live_->console(1, line.view());   // (into the script log)
+      }
+    }
     double seconds = 0;
     String target(allocator());
     if (ok && scripts_enabled_ && live_->meta_refresh(&seconds, &target) && seconds < 1e6) {   // <meta http-equiv=refresh>
@@ -946,6 +960,10 @@ void WebBrowser::present(UniquePointer<browser::PagePicture> picture, bool keep_
     message.append(": ");
   }
   message.append(cut ? "Done (the page is cut off)." : "Done.");
+  if (!keep_scroll && !load_timing_.empty()) {
+    message.append(" ");
+    message.append(load_timing_.view());
+  }
   if (errors > 0) {
     message.truncate(message.size() - 1);
     message.append(" - ");
@@ -1600,6 +1618,7 @@ void WebBrowser::apply_fullscreen(bool on) {
   invalidate();
 }
 uint64_t WebBrowser::Env::now_ms() { return owner_.page_clock_ms(); }
+uint64_t WebBrowser::Env::monotonic_us() { return hardware::uptime_us(); }
 
 // Following a link to "#something" on the page shown: the address changes, the history entry too; "#" and "#top" scroll to the top.
 void WebBrowser::apply_hash(StringView hash) {

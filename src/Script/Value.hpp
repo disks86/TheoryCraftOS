@@ -112,6 +112,15 @@ struct Cell {
 };
 
 // An immutable string of bytes (the page's text is ASCII; other bytes are kept as they are), NUL-terminated after `length`.
+// The bytes of a string that was built by appending to another (s += c in a loop): the strings made along the way share this buffer, each using the first `length` bytes
+// of it. Only the longest of them (length == used) can be extended in place, so no string ever sees its bytes change. Freed with the last string using it.
+struct StringBuffer {
+  uint32_t refs = 0;   // strings using the buffer
+  uint32_t used = 0;   // bytes filled
+  uint32_t capacity = 0;
+  char* bytes() { return reinterpret_cast<char*>(this + 1); }
+};
+
 struct JsString : Cell {
   uint32_t length = 0;
   uint32_t hash = 0;
@@ -126,9 +135,10 @@ struct JsString : Cell {
   uint32_t units = 0;      // the length in characters (UTF-16 code units for text), once kind is set
   uint32_t map_unit = 0, map_byte = 0;   // the last place a character offset was turned into a byte offset (text only): the next one starts from there
   uint16_t* wide = nullptr;   // the code units of a text string, made when a script indexes into it (freed with the string)
+  StringBuffer* shared = nullptr;   // where the bytes are, for a string made by appending (see Vm::concat); otherwise they follow the header
   JsString() : Cell(CellKind::String) {}
-  char* data() { return reinterpret_cast<char*>(this + 1); }
-  const char* data() const { return reinterpret_cast<const char*>(this + 1); }
+  char* data() { return shared ? shared->bytes() : reinterpret_cast<char*>(this + 1); }
+  const char* data() const { return shared ? shared->bytes() : reinterpret_cast<const char*>(this + 1); }
   StringView view() const { return StringView(data(), length); }
 };
 

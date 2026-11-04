@@ -637,7 +637,7 @@ void position_list_text(StringView value, String* out) {
   }
 }
 
-Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo);
+Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full = true);
 extern const HostClass kComputedClass;
 
 PseudoElement computed_pseudo(JsObject* o) { return static_cast<PseudoElement>(o->position); }   // (a computed style keeps its pseudo-element here)
@@ -887,7 +887,8 @@ bool pseudo_content_text(const dom::Node* n, StringView raw, String* out) {
   return true;
 }
 
-Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo) {
+// `full`: with the custom properties, the indexes and cssText as well (the light one has the properties of the standard list, which is what nearly every read wants).
+Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full) {
   Vm& vm = c.vm;
   JsObject* o = vm.new_plain();
   Style s;
@@ -1309,7 +1310,7 @@ Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement 
   set("borderSpacing", t.view());
   set("tableLayout", s.table_fixed ? "fixed" : "auto");
   set("captionSide", s.caption_bottom ? "bottom" : "top");
-  if (sheet) {   // the custom properties that apply (the nearest declaration of a name wins)
+  if (full && sheet) {   // the custom properties that apply (the nearest declaration of a name wins)
     StringView cname, cvalue;
     uint32_t at = s.custom_scope;
     for (uint32_t guard = 0; guard < 4096 && sheet->custom_property_at(at, &cname, &cvalue, &at); ++guard) {
@@ -1317,7 +1318,7 @@ Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement 
       if (!vm.get_plain(o, vm.intern(cname), &existing)) vm.define(o, vm.intern(cname), str_value(vm, cvalue.trimmed()), kEnumerable);
     }
   }
-  {   // length and the indexes list the properties (the names the item() method gives)
+  if (full) {   // length and the indexes list the properties (the names the item() method gives)
     JsObject* keys = vm.own_keys(o);
     uint32_t count = 0;
     String css_text(vm.allocator());   // cssText: every property, as `name: value;`
@@ -1344,6 +1345,38 @@ Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement 
   return Value::make_object(o);
 }
 
+// The snapshot of an element's computed style, from the last few asked for while the document is as it was: a snapshot holds every property, the custom properties
+// that apply and the cssText, so a page that asks again and again (every ancestor of every observed element ...) would make thousands of strings each time. The ring is
+// kept on the prototype of computed styles, which is marked: groups of three in an array (node and pseudo-element, document version, snapshot), a place for each node.
+constexpr uint32_t kSnapshotPlaces = 64;
+
+Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full) {
+  Vm& vm = c.vm;
+  if (!element) return build_computed_snapshot(c, element, pseudo, full);
+  JsString* const ring_key = vm.intern("__snapshots");
+  Value found;
+  JsObject* ring = nullptr;
+  if (vm.get_plain(c.computed_proto, ring_key, &found) && found.is_object()) {
+    ring = found.as_object();
+  } else {
+    ring = vm.new_array(kSnapshotPlaces * 3);
+    for (uint32_t i = 0; i < kSnapshotPlaces * 3; ++i) vm.array_push(ring, Value());
+    vm.define(c.computed_proto, ring_key, Value::make_object(ring), 0);
+  }
+  const double who = static_cast<double>(element->serial) * 8 + static_cast<double>(static_cast<uint8_t>(pseudo)) * 2 + (full ? 1 : 0);
+  const double version = static_cast<double>(c.doc.version());
+  Value* slot = ring->items + 3 * (element->serial % kSnapshotPlaces);
+  if (ring->length == kSnapshotPlaces * 3 && slot[0].is_number() && slot[0].u.number == who && slot[1].is_number() && slot[1].u.number == version && slot[2].is_object()) return slot[2];
+  const Value snap = build_computed_snapshot(c, element, pseudo, full);
+  if (ring->length == kSnapshotPlaces * 3 && snap.is_object()) {
+    slot = ring->items + 3 * (element->serial % kSnapshotPlaces);   // (the ring is not moved by building, but be sure)
+    slot[0] = Value::make_number(who);
+    slot[1] = Value::make_number(version);
+    slot[2] = snap;
+  }
+  return snap;
+}
+
 dom::Node* computed_node(JsObject* o) { return static_cast<dom::Node*>(o->host_data); }
 
 bool computed_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
@@ -1351,7 +1384,8 @@ bool computed_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (key->symbol || k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return false;
   Value ignored;
   if (vm.get_plain(impl(vm).computed_proto, key, &ignored)) return false;   // (a method: no snapshot is needed to find it)
-  const Value snap = computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o));
+  const bool listing = k[0] == '-' || (k[0] >= '0' && k[0] <= '9') || k.equals("length") || k.equals("cssText");   // (what only the full snapshot has)
+  const Value snap = computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o), listing);
   return snap.is_object() && vm.get_plain(snap.as_object(), key, out);
 }
 
