@@ -22,7 +22,7 @@
 namespace hardware {
 
 // Intel's NPU ("VPU"), the neural engine in Core Ultra processors: Meteor Lake,
-// Arrow Lake, Lunar Lake and Panther Lake. This class names the device; the
+// Arrow Lake, Lunar Lake, Panther Lake and Wildcat Lake. This class names the device; the
 // computation still runs on the CPU until a native driver exists, and this is
 // where it will go.
 class IntelNpu final : public SoftwareNeuralProcessingUnit {
@@ -39,6 +39,7 @@ class IntelNpu final : public SoftwareNeuralProcessingUnit {
       case 0xAD1D: return "Arrow Lake";
       case 0x643E: return "Lunar Lake";
       case 0xB03E: return "Panther Lake";
+      case 0xFD3E: return "Wildcat Lake";
       default: return nullptr;
     }
   }

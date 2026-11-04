@@ -57,7 +57,11 @@ static bool cpu_is(uint32_t family, uint32_t model, uint32_t stepping, const cha
 
 static void test_cpu() {
   CHECK(cpu_is(6, 0x9E, 0xC, "Intel Coffee Lake Refresh") && cpu_is(6, 0x9E, 0xD, "Intel Coffee Lake Refresh"));
-  CHECK(cpu_name(6, 0x9E, 0xB) == nullptr);  // 8th gen: not a generation this table names
+  // 8th gen: Kaby Lake Refresh, Whiskey Lake, Coffee Lake and Cannon Lake; 7th gen Kaby Lake keeps its stepping range.
+  CHECK(cpu_is(6, 0x9E, 0xA, "Intel Coffee Lake") && cpu_is(6, 0x9E, 0xB, "Intel Coffee Lake"));
+  CHECK(cpu_is(6, 0x8E, 0xA, "Intel Kaby Lake Refresh") && cpu_is(6, 0x8E, 0xB, "Intel Whiskey Lake"));
+  CHECK(cpu_is(6, 0x8E, 0x9, "Intel Kaby Lake") && cpu_is(6, 0x9E, 0x9, "Intel Kaby Lake"));
+  CHECK(cpu_is(6, 0x66, 0x3, "Intel Cannon Lake") && cpu_is(6, 0xD7, 0x1, "Intel Raptor Lake"));
   CHECK(cpu_is(6, 0x8E, 0xC, "Intel Comet Lake") && cpu_is(6, 0xA5, 0x2, "Intel Comet Lake") && cpu_is(6, 0xA6, 0x0, "Intel Comet Lake"));
   CHECK(cpu_is(6, 0x7E, 0x5, "Intel Ice Lake (client)") && cpu_is(6, 0x7D, 0x1, "Intel Ice Lake (client)"));
   CHECK(cpu_is(6, 0x6A, 0x6, "Intel Ice Lake-SP"));  // the Xeon keeps its own model
@@ -87,6 +91,7 @@ static void test_gpu() {
   // Kaby Lake-G (Dell XPS 15 9575, Core i7-8705G): HD Graphics 630, an integrated Gen9.5 with HEVC and VP9 decode.
   CHECK(intel_gpu_identify(0x591B).architecture == A::Gen9_5 && !intel_gpu_identify(0x591B).discrete && intel_gpu_identify(0x591B).media_hevc && intel_gpu_identify(0x591B).media_vp9);
   CHECK(intel_gpu_identify(0x58FF).architecture == A::Unknown && intel_gpu_identify(0x5940).architecture == A::Unknown);
+  CHECK(intel_gpu_identify(0x5A52).architecture == A::Gen10 && intel_gpu_identify(0x5A3F).architecture == A::Unknown);
   CHECK(intel_gpu_identify(0x8A52).architecture == A::Gen11 && intel_gpu_identify(0x4E55).architecture == A::Gen11);
   CHECK(intel_gpu_identify(0x9A49).architecture == A::XeLp && intel_gpu_identify(0x4C8A).architecture == A::XeLp);
   CHECK(intel_gpu_identify(0x4680).architecture == A::XeLp && intel_gpu_identify(0xA780).architecture == A::XeLp);
@@ -178,6 +183,7 @@ static void test_media_engine() {
 static void test_npu() {
   CHECK(strcmp(IntelNpu::platform(0x7D1D), "Meteor Lake") == 0 && strcmp(IntelNpu::platform(0xAD1D), "Arrow Lake") == 0);
   CHECK(strcmp(IntelNpu::platform(0x643E), "Lunar Lake") == 0 && strcmp(IntelNpu::platform(0xB03E), "Panther Lake") == 0);
+  CHECK(strcmp(IntelNpu::platform(0xFD3E), "Wildcat Lake") == 0);
   CHECK(IntelNpu::matches(0x7D1D) && !IntelNpu::matches(0x0000) && !IntelNpu::matches(0x1502));   // AMD's device ID is not Intel's
   for (uint32_t id = 0; id <= 0xFFFF; ++id) CHECK((IntelNpu::platform(static_cast<uint16_t>(id)) != nullptr) == IntelNpu::matches(static_cast<uint16_t>(id)));
 }

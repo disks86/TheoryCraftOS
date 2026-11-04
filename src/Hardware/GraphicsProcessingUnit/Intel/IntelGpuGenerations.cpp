@@ -40,6 +40,8 @@ constexpr Range kRanges[] = {
     {0x3E90, 0x3EAF, make(A::Gen9_5, "Intel UHD Graphics (Gen9.5, Coffee/Whiskey Lake)", false, false, false)},
     {0x87C0, 0x87CF, make(A::Gen9_5, "Intel UHD Graphics (Gen9.5, Coffee Lake ULX)", false, false, false)},
     {0x9B21, 0x9BFF, make(A::Gen9_5, "Intel UHD Graphics (Gen9.5, Comet Lake)", false, false, false)},
+    // Gen10 (Cannon Lake, 8th gen i3-8121U)
+    {0x5A40, 0x5A5F, make(A::Gen10, "Intel UHD Graphics (Gen10, Cannon Lake)", false, false, false)},
     // Gen11
     {0x8A50, 0x8A7F, make(A::Gen11, "Intel Iris Plus / UHD Graphics (Gen11, Ice Lake)", false, false, false)},
     {0x9840, 0x9841, make(A::Gen11, "Intel UHD Graphics (Gen11, Lakefield)", false, false, false)},
