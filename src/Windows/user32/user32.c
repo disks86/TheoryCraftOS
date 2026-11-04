@@ -212,16 +212,8 @@ EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect) {
   rect->left = 100; rect->top = 100; rect->right = 100 + w + 2 * FRAME; rect->bottom = 100 + h + CAPTION_H + 2 * FRAME;
   return TRUE;
 }
-/* SM_CXSCREEN, SM_CYSCREEN, SM_CYCAPTION, SM_CXFRAME/SM_CYFRAME: the numbers of the desktop above; the others are 0. */
-EXPORT int WINAPI GetSystemMetrics(int index) {
-  switch (index) {
-    case 0: return SCREEN_W;
-    case 1: return SCREEN_H;
-    case 4: return CAPTION_H;
-    case 32: case 33: return FRAME;
-    default: return 0;
-  }
-}
+/* The metrics are the window manager's (Windows 10 values at 96 dpi). */
+EXPORT int WINAPI GetSystemMetrics(int index) { return (int)(NtUserCallOneParam((ULONG_PTR)(LONG_PTR)index, 9 /* GetSystemMetrics */) & 0xFFFFFFFFu); }
 EXPORT BOOL WINAPI SystemParametersInfoW(UINT action, UINT param, PVOID data, UINT flags) {
   (void)param; (void)flags;
   if (action == 0x30 /* SPI_GETWORKAREA */ && data) { RECT_ *r = data; r->left = 0; r->top = 0; r->right = SCREEN_W; r->bottom = WORK_H; return TRUE; }

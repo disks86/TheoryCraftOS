@@ -148,6 +148,142 @@ static void wide_free(WCHAR *w, const char *original) { if (w && original && ((U
 /* ---- classes ------------------------------------------------------------------------------------------------------------------------------------------------------ */
 static LONG_PTR WINAPI builtin_proc(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 0); }
 
+/* ---- ANSI and Unicode ------------------------------------------------------------------------------------------------------------------------------------------------ *
+ * The window manager only knows Unicode: every window is a Unicode window and the messages carry Unicode text. The A functions convert what they send (a_to_w) and a window procedure
+ * registered with RegisterClassA / SetWindowLongA is held behind a thunk (one of a fixed set of functions, each bound to the program's procedure) that converts what it receives (w_to_a).
+ * Only the messages that carry text or characters are converted: WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH, WM_CREATE / WM_NCCREATE (CREATESTRUCT) and the character messages. The A
+ * getters answer the program's own procedure, never the thunk. */
+typedef LONG_PTR (*MsgFn)(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
+static int is_char_message(UINT m) { return m == 0x102 || m == 0x103 || m == 0x106 || m == 0x107 || m == 0x120 || m == 0x286; }
+static ULONG_PTR char_to_wide(ULONG_PTR w) {
+  char bytes[2];
+  WCHAR wide[2];
+  int n = 1;
+  if (w > 0xFF) { bytes[0] = (char)(w >> 8); bytes[1] = (char)w; n = 2; } else bytes[0] = (char)w;
+  return MultiByteToWideChar(65001, 0, bytes, n, wide, 2) >= 1 ? (w & ~(ULONG_PTR)0xFFFF) | wide[0] : w;
+}
+static ULONG_PTR char_to_ansi(ULONG_PTR w) {
+  WCHAR wide = (WCHAR)w;
+  char bytes[8];
+  const int n = WideCharToMultiByte(65001, 0, &wide, 1, bytes, 8, NULL, NULL);
+  if (n == 1) return (w & ~(ULONG_PTR)0xFFFF) | (BYTE)bytes[0];
+  if (n == 2) return (w & ~(ULONG_PTR)0xFFFF) | ((BYTE)bytes[0] << 8) | (BYTE)bytes[1];
+  return (w & ~(ULONG_PTR)0xFFFF) | '?';
+}
+static char *narrow_of(const WCHAR *s) {
+  if (!s || ((ULONG_PTR)s >> 16) == 0) return (char *)s;
+  const int n = WideCharToMultiByte(65001, 0, s, -1, NULL, 0, NULL, NULL);
+  char *a = u32_alloc((SIZE_T)n + 1);
+  if (a) WideCharToMultiByte(65001, 0, s, -1, a, n, NULL, NULL);
+  return a;
+}
+static void narrow_free(char *a, const WCHAR *original) { if (a && original && ((ULONG_PTR)original >> 16) != 0) u32_free(a); }
+typedef struct { ULONG_PTR create_params, instance, menu, parent; int cy, cx, y, x; LONG style; const void *name, *cls; DWORD ex_style; } CreateStruct_;
+
+/* A caller, W callee. */
+static LONG_PTR a_to_w(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
+  LONG_PTR result;
+  if (message == 0x000C /* WM_SETTEXT */ && lparam) {
+    WCHAR *w = wide_of((const char *)lparam);
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)w);
+    wide_free(w, (const char *)lparam);
+    return result;
+  }
+  if (message == 0x000D /* WM_GETTEXT */ && lparam && wparam) {
+    WCHAR *w = u32_alloc((SIZE_T)wparam * 2);
+    if (!w) return 0;
+    w[0] = 0;
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)w);
+    char *out = (char *)lparam;
+    int bytes = 0;
+    if (result > 0) bytes = WideCharToMultiByte(65001, 0, w, (int)result, out, (int)wparam - 1, NULL, NULL);
+    out[bytes] = 0;
+    u32_free(w);
+    return bytes;
+  }
+  if (message == 0x000E /* WM_GETTEXTLENGTH */) {
+    const LONG_PTR chars = fn(ctx, hwnd, message, 0, 0);
+    if (chars <= 0) return chars;
+    WCHAR *w = u32_alloc(((SIZE_T)chars + 1) * 2);
+    if (!w) return chars;
+    w[0] = 0;
+    const LONG_PTR got = fn(ctx, hwnd, 0x000D, (ULONG_PTR)chars + 1, (LONG_PTR)w);
+    const int bytes = got > 0 ? WideCharToMultiByte(65001, 0, w, (int)got, NULL, 0, NULL, NULL) : 0;
+    u32_free(w);
+    return bytes;
+  }
+  if ((message == 0x0001 /* WM_CREATE */ || message == 0x0081 /* WM_NCCREATE */) && lparam) {
+    CreateStruct_ *a = (CreateStruct_ *)lparam, w = *a;
+    WCHAR *name = wide_of(a->name), *cls = wide_of(a->cls);
+    w.name = name; w.cls = cls;
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)&w);
+    w.name = a->name; w.cls = a->cls;
+    *a = w;
+    wide_free(name, a->name); wide_free(cls, a->cls);
+    return result;
+  }
+  if (is_char_message(message)) wparam = char_to_wide(wparam);
+  return fn(ctx, hwnd, message, wparam, lparam);
+}
+
+/* W caller, A callee. */
+static LONG_PTR w_to_a(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
+  LONG_PTR result;
+  if (message == 0x000C && lparam) {
+    char *a = narrow_of((const WCHAR *)lparam);
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)a);
+    narrow_free(a, (const WCHAR *)lparam);
+    return result;
+  }
+  if (message == 0x000D && lparam && wparam) {
+    char *a = u32_alloc((SIZE_T)wparam * 4 + 4);
+    if (!a) return 0;
+    a[0] = 0;
+    result = fn(ctx, hwnd, message, wparam * 4, (LONG_PTR)a);
+    int chars = 0;
+    if (result > 0) chars = MultiByteToWideChar(65001, 0, a, (int)result, (WCHAR *)lparam, (int)wparam - 1);
+    ((WCHAR *)lparam)[chars] = 0;
+    u32_free(a);
+    return chars;
+  }
+  if ((message == 0x0001 || message == 0x0081) && lparam) {
+    CreateStruct_ *w = (CreateStruct_ *)lparam, a = *w;
+    char *name = narrow_of(w->name), *cls = narrow_of(w->cls);
+    a.name = name; a.cls = cls;
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)&a);
+    a.name = w->name; a.cls = w->cls;
+    *w = a;
+    narrow_free(name, w->name); narrow_free(cls, w->cls);
+    return result;
+  }
+  if (is_char_message(message)) wparam = char_to_ansi(wparam);
+  return fn(ctx, hwnd, message, wparam, lparam);
+}
+
+#define THUNK_LIST(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24) X(25) X(26) X(27) X(28) X(29) \
+  X(30) X(31) X(32) X(33) X(34) X(35) X(36) X(37) X(38) X(39) X(40) X(41) X(42) X(43) X(44) X(45) X(46) X(47) X(48) X(49) X(50) X(51) X(52) X(53) X(54) X(55) X(56) X(57) X(58) X(59) X(60) X(61) X(62) X(63)
+#define THUNK_COUNT 64
+static WNDPROC_ g_ansi_procs[THUNK_COUNT];      /* the programs' A procedures, one per thunk (0 = free) */
+static LONG_PTR call_ansi_proc(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return ((WNDPROC_)ctx)(hwnd, message, wparam, lparam); }
+#define DEFINE_THUNK(n) static LONG_PTR WINAPI ansi_thunk_##n(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return w_to_a(call_ansi_proc, (void *)g_ansi_procs[n], hwnd, message, wparam, lparam); }
+THUNK_LIST(DEFINE_THUNK)
+#define THUNK_ENTRY(n) ansi_thunk_##n,
+static WNDPROC_ const g_thunks[THUNK_COUNT] = {THUNK_LIST(THUNK_ENTRY)};
+static int thunk_slot(WNDPROC_ proc) { for (int i = 0; i < THUNK_COUNT; ++i) if (g_thunks[i] == proc) return i; return -1; }
+/* The thunk for an A procedure (made on first use; a procedure that is already a thunk stays as it is; with no thunk left the procedure itself is used). */
+static WNDPROC_ ansi_wrap(WNDPROC_ proc) {
+  if (!proc || thunk_slot(proc) >= 0) return proc;
+  for (int i = 0; i < THUNK_COUNT; ++i) if (g_ansi_procs[i] == proc) return g_thunks[i];
+  for (int i = 0; i < THUNK_COUNT; ++i) {
+    WNDPROC_ expected = NULL;
+    if (__atomic_compare_exchange_n(&g_ansi_procs[i], &expected, proc, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return g_thunks[i];
+  }
+  return proc;
+}
+static ULONG_PTR ansi_unwrap(ULONG_PTR value) { const int slot = thunk_slot((WNDPROC_)value); return slot >= 0 ? (ULONG_PTR)g_ansi_procs[slot] : value; }
+
+EXPORT LONG_PTR WINAPI SendMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
+EXPORT LONG_PTR WINAPI SendMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
 static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags) {
   UNICODE_STRING us;
   ULONG_PTR menu[3] = {0, 0, 0};
@@ -180,7 +316,8 @@ EXPORT ATOM WINAPI RegisterClassExA(const WNDCLASSEX_ *wc) {
   WNDCLASSEX_ copy = *wc;
   WCHAR *name = wide_of(wc->lpszClassName);
   copy.lpszClassName = name;
-  const ATOM atom = register_class(&copy, name, 1);
+  copy.lpfnWndProc = (WNDPROC_)ansi_wrap(wc->lpfnWndProc);
+  const ATOM atom = register_class(&copy, name, 0);
   wide_free(name, wc->lpszClassName);
   return atom;
 }
@@ -213,7 +350,8 @@ static DWORD class_info(HANDLE instance, const WCHAR *name, WNDCLASSEX_ *wc, BOO
   us_name(&us, name);
   wc->lpszClassName = name;
   wc->lpszMenuName = NULL;
-  const ATOM atom = (ATOM)NtUserGetClassInfoEx((ULONG_PTR)instance, (ULONG_PTR)&us, (ULONG_PTR)wc, (ULONG_PTR)&menu, ansi);
+  const ATOM atom = (ATOM)NtUserGetClassInfoEx((ULONG_PTR)instance, (ULONG_PTR)&us, (ULONG_PTR)wc, (ULONG_PTR)&menu, 0);
+  if (atom && ansi) wc->lpfnWndProc = (WNDPROC_)ansi_unwrap((ULONG_PTR)wc->lpfnWndProc);
   if (!atom) return 0;
   wc->lpszMenuName = (const void *)menu;
   wc->hInstance = wc->hInstance == GetModuleHandleW(L"user32.dll") ? NULL : instance;
@@ -261,16 +399,26 @@ EXPORT int WINAPI GetClassNameA(HANDLE hwnd, LPSTR buffer, int count) {
   buffer[bytes] = 0;
   return bytes;
 }
-static ULONG_PTR class_get(HANDLE hwnd, int index, int code) { return NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)code); }
+static ULONG_PTR class_get(HANDLE hwnd, int index, int code) {
+  const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)code);
+  const int ansi = code == CHP_GET_CLASS_LONG_A || code == CHP_GET_CLASS_LONG_PTR_A;
+  return ansi && index == -24 /* GCL_WNDPROC */ ? ansi_unwrap(v) : v;
+}
 EXPORT DWORD WINAPI GetClassLongW(HANDLE hwnd, int index) { return (DWORD)class_get(hwnd, index, CHP_GET_CLASS_LONG_W); }
 EXPORT DWORD WINAPI GetClassLongA(HANDLE hwnd, int index) { return (DWORD)class_get(hwnd, index, CHP_GET_CLASS_LONG_A); }
 EXPORT ULONG_PTR WINAPI GetClassLongPtrW(HANDLE hwnd, int index) { return class_get(hwnd, index, CHP_GET_CLASS_LONG_PTR_W); }
 EXPORT ULONG_PTR WINAPI GetClassLongPtrA(HANDLE hwnd, int index) { return class_get(hwnd, index, CHP_GET_CLASS_LONG_PTR_A); }
 EXPORT WORD WINAPI GetClassWord(HANDLE hwnd, int index) { return (WORD)class_get(hwnd, index, CHP_GET_CLASS_WORD); }
 EXPORT DWORD WINAPI SetClassLongW(HANDLE hwnd, int index, LONG value) { return (DWORD)NtUserSetClassLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0); }
-EXPORT DWORD WINAPI SetClassLongA(HANDLE hwnd, int index, LONG value) { return (DWORD)NtUserSetClassLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 1); }
+EXPORT DWORD WINAPI SetClassLongA(HANDLE hwnd, int index, LONG value) {
+  const ULONG_PTR in = index == -24 ? (ULONG_PTR)ansi_wrap((WNDPROC_)(ULONG_PTR)(DWORD)value) : (ULONG_PTR)(DWORD)value;
+  return (DWORD)NtUserSetClassLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0);
+}
 EXPORT ULONG_PTR WINAPI SetClassLongPtrW(HANDLE hwnd, int index, LONG_PTR value) { return NtUserSetClassLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 0); }
-EXPORT ULONG_PTR WINAPI SetClassLongPtrA(HANDLE hwnd, int index, LONG_PTR value) { return NtUserSetClassLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 1); }
+EXPORT ULONG_PTR WINAPI SetClassLongPtrA(HANDLE hwnd, int index, LONG_PTR value) {
+  const ULONG_PTR in = index == -24 ? (ULONG_PTR)ansi_wrap((WNDPROC_)value) : (ULONG_PTR)value;
+  return ansi_unwrap(NtUserSetClassLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0));
+}
 EXPORT WORD WINAPI SetClassWord(HANDLE hwnd, int index, WORD value) { return (WORD)NtUserSetClassWord((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, value); }
 
 EXPORT UINT WINAPI RegisterWindowMessageW(const WCHAR *name) {
@@ -298,7 +446,7 @@ static HANDLE create_window(DWORD ex_style, const WCHAR *class_name, const WCHAR
   if (!instance) instance = GetModuleHandleW(NULL);
   return (HANDLE)NtUserCreateWindowEx(ex_style, (ULONG_PTR)&class_us, (ULONG_PTR)&version_us, title ? (ULONG_PTR)&title_us : 0, style, (ULONG_PTR)(LONG_PTR)x, (ULONG_PTR)(LONG_PTR)y,
                                        (ULONG_PTR)(LONG_PTR)cx, (ULONG_PTR)(LONG_PTR)cy, (ULONG_PTR)parent, (ULONG_PTR)menu, (ULONG_PTR)instance, (ULONG_PTR)params, 0, (ULONG_PTR)instance,
-                                       (ULONG_PTR)class_name, ansi);
+                                       (ULONG_PTR)class_name, 0);
 }
 EXPORT HANDLE WINAPI CreateWindowExW(DWORD ex_style, const WCHAR *class_name, const WCHAR *title, DWORD style, int x, int y, int cx, int cy, HANDLE parent, HANDLE menu, HANDLE instance, void *params) {
   return create_window(ex_style, class_name, title, style, x, y, cx, cy, parent, menu, instance, params, FALSE);
@@ -312,7 +460,10 @@ EXPORT HANDLE WINAPI CreateWindowExA(DWORD ex_style, const char *class_name, con
 EXPORT BOOL WINAPI DestroyWindow(HANDLE hwnd) { return (NtUserDestroyWindow((ULONG_PTR)hwnd) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI IsWindowVisible(HANDLE hwnd) { return (NtUserCallHwnd((ULONG_PTR)hwnd, CH_IS_VISIBLE) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI IsWindowEnabled(HANDLE hwnd) { return (NtUserCallHwnd((ULONG_PTR)hwnd, CH_IS_ENABLED) & 0xFFFFFFFFu) != 0; }
-EXPORT BOOL WINAPI IsWindowUnicode(HANDLE hwnd) { return (NtUserCallHwnd((ULONG_PTR)hwnd, CH_IS_UNICODE) & 0xFFFFFFFFu) != 0; }
+EXPORT BOOL WINAPI IsWindowUnicode(HANDLE hwnd) {      /* (an A window is one whose procedure is a thunk) */
+  if (!NtUserCallHwnd((ULONG_PTR)hwnd, CH_IS_WINDOW)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
+  return thunk_slot((WNDPROC_)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)-4, CHP_GET_WINDOW_LONG_PTR_W)) < 0;
+}
 EXPORT BOOL WINAPI EnableWindow(HANDLE hwnd, BOOL enable) { return (NtUserEnableWindow((ULONG_PTR)hwnd, enable) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd) { return (NtUserShowWindow((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)cmd) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI ShowWindowAsync(HANDLE hwnd, int cmd) { return (NtUserShowWindowAsync((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)cmd) & 0xFFFFFFFFu) != 0; }
@@ -330,14 +481,27 @@ EXPORT HANDLE WINAPI GetTopWindow(HANDLE hwnd) { return GetWindow(hwnd ? hwnd : 
 EXPORT BOOL WINAPI IsChild(HANDLE parent, HANDLE hwnd) { return (NtUserCallHwndParam((ULONG_PTR)parent, (ULONG_PTR)hwnd, CHP_IS_CHILD) & 0xFFFFFFFFu) != 0; }
 EXPORT DWORD WINAPI GetWindowThreadProcessId(HANDLE hwnd, LPDWORD process) { return (DWORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)process, CHP_GET_WINDOW_THREAD); }
 EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index) { return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_W); }
-EXPORT LONG WINAPI GetWindowLongA(HANDLE hwnd, int index) { return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_A); }
+EXPORT LONG WINAPI GetWindowLongA(HANDLE hwnd, int index) {
+  const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_A);
+  return (LONG)(index == -4 /* GWL_WNDPROC */ ? ansi_unwrap(v) : v);
+}
 EXPORT LONG_PTR WINAPI GetWindowLongPtrW(HANDLE hwnd, int index) { return (LONG_PTR)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_W); }
-EXPORT LONG_PTR WINAPI GetWindowLongPtrA(HANDLE hwnd, int index) { return (LONG_PTR)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_A); }
+EXPORT LONG_PTR WINAPI GetWindowLongPtrA(HANDLE hwnd, int index) {
+  const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_A);
+  return (LONG_PTR)(index == -4 ? ansi_unwrap(v) : v);
+}
 EXPORT WORD WINAPI GetWindowWord(HANDLE hwnd, int index) { return (WORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_WORD); }
 EXPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value) { return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0); }
-EXPORT LONG WINAPI SetWindowLongA(HANDLE hwnd, int index, LONG value) { return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 1); }
+EXPORT LONG WINAPI SetWindowLongA(HANDLE hwnd, int index, LONG value) {
+  const ULONG_PTR in = index == -4 ? (ULONG_PTR)ansi_wrap((WNDPROC_)(ULONG_PTR)(DWORD)value) : (ULONG_PTR)(DWORD)value;
+  return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0);
+}
 EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value) { return (LONG_PTR)NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 0); }
-EXPORT LONG_PTR WINAPI SetWindowLongPtrA(HANDLE hwnd, int index, LONG_PTR value) { return (LONG_PTR)NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 1); }
+EXPORT LONG_PTR WINAPI SetWindowLongPtrA(HANDLE hwnd, int index, LONG_PTR value) {
+  const ULONG_PTR in = index == -4 ? (ULONG_PTR)ansi_wrap((WNDPROC_)value) : (ULONG_PTR)value;
+  const ULONG_PTR old = NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0);
+  return (LONG_PTR)(index == -4 ? ansi_unwrap(old) : old);
+}
 EXPORT WORD WINAPI SetWindowWord(HANDLE hwnd, int index, WORD value) { return (WORD)NtUserSetWindowWord((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, value); }
 EXPORT BOOL WINAPI ClientToScreen(HANDLE hwnd, POINT_ *p) { return p && (NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)p, CHP_CLIENT_TO_SCREEN) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI ScreenToClient(HANDLE hwnd, POINT_ *p) { return p && (NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)p, CHP_SCREEN_TO_CLIENT) & 0xFFFFFFFFu) != 0; }
@@ -366,20 +530,20 @@ EXPORT HANDLE WINAPI FindWindowExA(HANDLE parent, HANDLE child, const char *clas
 EXPORT HANDLE WINAPI FindWindowA(const char *class_name, const char *title) { return FindWindowExA(NULL, NULL, class_name, title); }
 
 /* The text of a window: kept by the window manager; the A functions convert. */
-EXPORT int WINAPI GetWindowTextLengthW(HANDLE hwnd) { return (int)NtUserMessageCall((ULONG_PTR)hwnd, 0x000E /* WM_GETTEXTLENGTH */, 0, 0, 0, MC_SEND_MESSAGE, 0); }
-EXPORT int WINAPI GetWindowTextLengthA(HANDLE hwnd) { return (int)NtUserMessageCall((ULONG_PTR)hwnd, 0x000E, 0, 0, 0, MC_SEND_MESSAGE, 1); }
+EXPORT int WINAPI GetWindowTextLengthW(HANDLE hwnd) { return (int)SendMessageW(hwnd, 0x000E /* WM_GETTEXTLENGTH */, 0, 0); }
+EXPORT int WINAPI GetWindowTextLengthA(HANDLE hwnd) { return (int)SendMessageA(hwnd, 0x000E, 0, 0); }
 EXPORT int WINAPI GetWindowTextW(HANDLE hwnd, LPWSTR buffer, int count) {
   if (!buffer || count <= 0) return 0;
   buffer[0] = 0;
-  return (int)NtUserMessageCall((ULONG_PTR)hwnd, 0x000D /* WM_GETTEXT */, (ULONG_PTR)count, (ULONG_PTR)buffer, 0, MC_SEND_MESSAGE, 0);
+  return (int)SendMessageW(hwnd, 0x000D /* WM_GETTEXT */, (ULONG_PTR)count, (LONG_PTR)buffer);
 }
 EXPORT int WINAPI GetWindowTextA(HANDLE hwnd, LPSTR buffer, int count) {
   if (!buffer || count <= 0) return 0;
   buffer[0] = 0;
-  return (int)NtUserMessageCall((ULONG_PTR)hwnd, 0x000D, (ULONG_PTR)count, (ULONG_PTR)buffer, 0, MC_SEND_MESSAGE, 1);
+  return (int)SendMessageA(hwnd, 0x000D, (ULONG_PTR)count, (LONG_PTR)buffer);
 }
-EXPORT BOOL WINAPI SetWindowTextW(HANDLE hwnd, LPCWSTR text) { return (NtUserMessageCall((ULONG_PTR)hwnd, 0x000C /* WM_SETTEXT */, 0, (ULONG_PTR)text, 0, MC_SEND_MESSAGE, 0) & 0xFFFFFFFFu) != 0; }
-EXPORT BOOL WINAPI SetWindowTextA(HANDLE hwnd, LPCSTR text) { return (NtUserMessageCall((ULONG_PTR)hwnd, 0x000C, 0, (ULONG_PTR)text, 0, MC_SEND_MESSAGE, 1) & 0xFFFFFFFFu) != 0; }
+EXPORT BOOL WINAPI SetWindowTextW(HANDLE hwnd, LPCWSTR text) { return SendMessageW(hwnd, 0x000C /* WM_SETTEXT */, 0, (LONG_PTR)text) != 0; }
+EXPORT BOOL WINAPI SetWindowTextA(HANDLE hwnd, LPCSTR text) { return SendMessageA(hwnd, 0x000C, 0, (LONG_PTR)text) != 0; }
 
 /* Properties (SetProp ...): the name is a string or an atom. */
 EXPORT BOOL WINAPI SetPropW(HANDLE hwnd, LPCWSTR name, HANDLE data) { return (NtUserSetProp((ULONG_PTR)hwnd, (ULONG_PTR)name, (ULONG_PTR)data) & 0xFFFFFFFFu) != 0; }
@@ -409,28 +573,46 @@ EXPORT BOOL WINAPI UpdateWindow(HANDLE hwnd) { return (NtUserUpdateWindow((ULONG
 EXPORT BOOL WINAPI GetUpdateRect(HANDLE hwnd, void *rect, BOOL erase) { return (NtUserGetUpdateRect((ULONG_PTR)hwnd, (ULONG_PTR)rect, erase) & 0xFFFFFFFFu) != 0; }
 
 /* ---- messages ------------------------------------------------------------------------------------------------------------------------------------------------------ */
-EXPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 0); }
-EXPORT LONG_PTR WINAPI DefWindowProcA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 1); }
-/* The procedure is called directly (Wine's WINPROC handles of ANSI/Unicode conversion are not done). */
+static LONG_PTR def_proc_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { (void)ctx; return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 0); }
+EXPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return def_proc_w(NULL, hwnd, message, wparam, lparam); }
+EXPORT LONG_PTR WINAPI DefWindowProcA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return a_to_w(def_proc_w, NULL, hwnd, message, wparam, lparam); }
+/* The procedure is called directly: a W caller of a thunk gives it Unicode (what it takes), an A caller of a thunk gives the program's procedure its own A messages; an A caller of a window
+ * procedure of the system (Unicode) converts. */
+static LONG_PTR call_w_proc(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return ((WNDPROC_)ctx)(hwnd, message, wparam, lparam); }
 EXPORT LONG_PTR WINAPI CallWindowProcW(WNDPROC_ proc, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return proc(hwnd, message, wparam, lparam); }
-EXPORT LONG_PTR WINAPI CallWindowProcA(WNDPROC_ proc, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return proc(hwnd, message, wparam, lparam); }
-EXPORT LONG_PTR WINAPI SendMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_MESSAGE, 0); }
-EXPORT LONG_PTR WINAPI SendMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_MESSAGE, 1); }
-static LONG_PTR send_timeout(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam, UINT flags, UINT timeout, ULONG_PTR *result, BOOL ansi) {
-  struct { UINT flags, timeout; ULONG_PTR result; } info = {flags, timeout, 0};
-  if (result) *result = 0;
-  const ULONG_PTR ok = NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, (ULONG_PTR)&info, MC_SEND_MESSAGE_TIMEOUT, ansi);
-  if (result) *result = info.result;
+EXPORT LONG_PTR WINAPI CallWindowProcA(WNDPROC_ proc, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
+  const int slot = thunk_slot(proc);
+  if (slot >= 0) return g_ansi_procs[slot](hwnd, message, wparam, lparam);
+  if (proc == builtin_proc) return a_to_w(call_w_proc, (void *)proc, hwnd, message, wparam, lparam);
+  return proc(hwnd, message, wparam, lparam);
+}
+static LONG_PTR send_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { (void)ctx; return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_MESSAGE, 0); }
+EXPORT LONG_PTR WINAPI SendMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return send_w(NULL, hwnd, message, wparam, lparam); }
+EXPORT LONG_PTR WINAPI SendMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return a_to_w(send_w, NULL, hwnd, message, wparam, lparam); }
+typedef struct { UINT flags, timeout; ULONG_PTR *result; } TimeoutArgs;
+static LONG_PTR send_timeout_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
+  TimeoutArgs *a = ctx;
+  struct { UINT flags, timeout; ULONG_PTR result; } info = {a->flags, a->timeout, 0};
+  if (a->result) *a->result = 0;
+  const ULONG_PTR ok = NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, (ULONG_PTR)&info, MC_SEND_MESSAGE_TIMEOUT, 0);
+  if (a->result) *a->result = info.result;
   return (LONG_PTR)ok;
 }
-EXPORT LONG_PTR WINAPI SendMessageTimeoutW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam, UINT flags, UINT timeout, ULONG_PTR *result) { return send_timeout(hwnd, message, wparam, lparam, flags, timeout, result, FALSE); }
-EXPORT LONG_PTR WINAPI SendMessageTimeoutA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam, UINT flags, UINT timeout, ULONG_PTR *result) { return send_timeout(hwnd, message, wparam, lparam, flags, timeout, result, TRUE); }
-EXPORT BOOL WINAPI SendNotifyMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_NOTIFY, 0) & 0xFFFFFFFFu) != 0; }
-EXPORT BOOL WINAPI SendNotifyMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_NOTIFY, 1) & 0xFFFFFFFFu) != 0; }
+EXPORT LONG_PTR WINAPI SendMessageTimeoutW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam, UINT flags, UINT timeout, ULONG_PTR *result) {
+  TimeoutArgs a = {flags, timeout, result};
+  return send_timeout_w(&a, hwnd, message, wparam, lparam);
+}
+EXPORT LONG_PTR WINAPI SendMessageTimeoutA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam, UINT flags, UINT timeout, ULONG_PTR *result) {
+  TimeoutArgs a = {flags, timeout, result};
+  return a_to_w(send_timeout_w, &a, hwnd, message, wparam, lparam);
+}
+static LONG_PTR notify_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { (void)ctx; return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_NOTIFY, 0); }
+EXPORT BOOL WINAPI SendNotifyMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (notify_w(NULL, hwnd, message, wparam, lparam) & 0xFFFFFFFFu) != 0; }
+EXPORT BOOL WINAPI SendNotifyMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (a_to_w(notify_w, NULL, hwnd, message, wparam, lparam) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI PostMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (NtUserPostMessage((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam) & 0xFFFFFFFFu) != 0; }
-EXPORT BOOL WINAPI PostMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return PostMessageW(hwnd, message, wparam, lparam); }
+EXPORT BOOL WINAPI PostMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return PostMessageW(hwnd, message, is_char_message(message) ? char_to_wide(wparam) : wparam, lparam); }
 EXPORT BOOL WINAPI PostThreadMessageW(DWORD thread, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (NtUserPostThreadMessage(thread, message, wparam, (ULONG_PTR)lparam) & 0xFFFFFFFFu) != 0; }
-EXPORT BOOL WINAPI PostThreadMessageA(DWORD thread, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return PostThreadMessageW(thread, message, wparam, lparam); }
+EXPORT BOOL WINAPI PostThreadMessageA(DWORD thread, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return PostThreadMessageW(thread, message, is_char_message(message) ? char_to_wide(wparam) : wparam, lparam); }
 EXPORT void WINAPI PostQuitMessage(int code) { NtUserPostQuitMessage((ULONG_PTR)(LONG_PTR)code); }
 EXPORT BOOL WINAPI ReplyMessage(LONG_PTR result) { return (NtUserReplyMessage((ULONG_PTR)result) & 0xFFFFFFFFu) != 0; }
 EXPORT int WINAPI GetMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last) {
@@ -480,3 +662,96 @@ EXPORT int WINAPI GetClipboardFormatNameA(UINT format, LPSTR buffer, int count) 
   buffer[bytes] = 0;
   return bytes;
 }
+
+/* ---- more of the window manager's services -------------------------------------------------------------------------------------------------------------------------- */
+SVC NtUserGetWindowPlacement(ULONG_PTR hwnd, ULONG_PTR placement);
+SVC NtUserSetWindowPlacement(ULONG_PTR hwnd, ULONG_PTR placement);
+SVC NtUserBeginDeferWindowPos(ULONG_PTR count);
+SVC NtUserDeferWindowPosAndBand(ULONG_PTR dwp, ULONG_PTR hwnd, ULONG_PTR after, ULONG_PTR x, ULONG_PTR y, ULONG_PTR cx, ULONG_PTR cy, ULONG_PTR flags, ULONG_PTR unknown1, ULONG_PTR unknown2);
+SVC NtUserEndDeferWindowPosEx(ULONG_PTR dwp, ULONG_PTR async);
+SVC NtUserRedrawWindow(ULONG_PTR hwnd, ULONG_PTR rect, ULONG_PTR region, ULONG_PTR flags);
+SVC NtUserInvalidateRgn(ULONG_PTR hwnd, ULONG_PTR region, ULONG_PTR erase);
+SVC NtUserValidateRgn(ULONG_PTR hwnd, ULONG_PTR region);
+SVC NtUserGetUpdateRgn(ULONG_PTR hwnd, ULONG_PTR region, ULONG_PTR erase);
+SVC NtUserLockWindowUpdate(ULONG_PTR hwnd);
+SVC NtUserChildWindowFromPointEx(ULONG_PTR parent, ULONG_PTR x, ULONG_PTR y, ULONG_PTR flags);
+SVC NtUserGetGUIThreadInfo(ULONG_PTR thread, ULONG_PTR info);
+SVC NtUserGetKeyState(ULONG_PTR vk);
+SVC NtUserGetAsyncKeyState(ULONG_PTR vk);
+SVC NtUserGetKeyboardState(ULONG_PTR buffer);
+SVC NtUserSetKeyboardState(ULONG_PTR buffer);
+SVC NtUserGetCursorPos(ULONG_PTR point);
+SVC NtUserSetCursorPos(ULONG_PTR x, ULONG_PTR y);
+SVC NtUserAttachThreadInput(ULONG_PTR from, ULONG_PTR to, ULONG_PTR attach);
+SVC NtUserBuildHwndList(ULONG_PTR desktop, ULONG_PTR parent, ULONG_PTR children, ULONG_PTR non_immersive, ULONG_PTR thread, ULONG_PTR count, ULONG_PTR buffer, ULONG_PTR needed);
+
+EXPORT BOOL WINAPI IsWindow(HANDLE window);
+#define BOOL_OF(x) (((x) & 0xFFFFFFFFu) != 0)
+#define WS_MINIMIZE_ 0x20000000u
+#define WS_MAXIMIZE_ 0x01000000u
+EXPORT BOOL WINAPI GetWindowPlacement(HANDLE hwnd, void *placement) { return BOOL_OF(NtUserGetWindowPlacement((ULONG_PTR)hwnd, (ULONG_PTR)placement)); }
+EXPORT BOOL WINAPI SetWindowPlacement(HANDLE hwnd, const void *placement) { return BOOL_OF(NtUserSetWindowPlacement((ULONG_PTR)hwnd, (ULONG_PTR)placement)); }
+EXPORT BOOL WINAPI IsIconic(HANDLE hwnd) { return (GetWindowLongW(hwnd, -16) & WS_MINIMIZE_) != 0; }
+EXPORT BOOL WINAPI IsZoomed(HANDLE hwnd) { return (GetWindowLongW(hwnd, -16) & WS_MAXIMIZE_) != 0; }
+EXPORT BOOL WINAPI CloseWindow(HANDLE hwnd) { ShowWindow(hwnd, 6 /* SW_MINIMIZE */); return TRUE; }
+EXPORT BOOL WINAPI OpenIcon(HANDLE hwnd) { if (!IsIconic(hwnd)) return FALSE; ShowWindow(hwnd, 9 /* SW_RESTORE */); return TRUE; }
+EXPORT BOOL WINAPI BringWindowToTop(HANDLE hwnd) { return SetWindowPos(hwnd, NULL /* HWND_TOP */, 0, 0, 0, 0, 0x3 /* SWP_NOSIZE | SWP_NOMOVE */); }
+EXPORT HANDLE WINAPI GetLastActivePopup(HANDLE hwnd) { return (HANDLE)NtUserCallHwnd((ULONG_PTR)hwnd, 3); }
+EXPORT HANDLE WINAPI ChildWindowFromPointEx(HANDLE parent, POINT_ p, UINT flags) { return (HANDLE)NtUserChildWindowFromPointEx((ULONG_PTR)parent, (ULONG_PTR)(LONG_PTR)p.x, (ULONG_PTR)(LONG_PTR)p.y, flags); }
+EXPORT HANDLE WINAPI ChildWindowFromPoint(HANDLE parent, POINT_ p) { return ChildWindowFromPointEx(parent, p, 0); }
+
+EXPORT HANDLE WINAPI BeginDeferWindowPos(int count) { return (HANDLE)NtUserBeginDeferWindowPos((ULONG_PTR)(LONG_PTR)count); }
+EXPORT HANDLE WINAPI DeferWindowPos(HANDLE dwp, HANDLE hwnd, HANDLE after, int x, int y, int cx, int cy, UINT flags) {
+  return (HANDLE)NtUserDeferWindowPosAndBand((ULONG_PTR)dwp, (ULONG_PTR)hwnd, (ULONG_PTR)after, (ULONG_PTR)(LONG_PTR)x, (ULONG_PTR)(LONG_PTR)y, (ULONG_PTR)(LONG_PTR)cx, (ULONG_PTR)(LONG_PTR)cy, flags, 0, 0);
+}
+EXPORT BOOL WINAPI EndDeferWindowPos(HANDLE dwp) { return BOOL_OF(NtUserEndDeferWindowPosEx((ULONG_PTR)dwp, 0)); }
+EXPORT BOOL WINAPI RedrawWindow(HANDLE hwnd, const void *rect, HANDLE region, UINT flags) { return BOOL_OF(NtUserRedrawWindow((ULONG_PTR)hwnd, (ULONG_PTR)rect, (ULONG_PTR)region, flags)); }
+EXPORT BOOL WINAPI InvalidateRgn(HANDLE hwnd, HANDLE region, BOOL erase) { return BOOL_OF(NtUserInvalidateRgn((ULONG_PTR)hwnd, (ULONG_PTR)region, erase)); }
+EXPORT BOOL WINAPI ValidateRgn(HANDLE hwnd, HANDLE region) { return BOOL_OF(NtUserValidateRgn((ULONG_PTR)hwnd, (ULONG_PTR)region)); }
+EXPORT int WINAPI GetUpdateRgn(HANDLE hwnd, HANDLE region, BOOL erase) { return (int)NtUserGetUpdateRgn((ULONG_PTR)hwnd, (ULONG_PTR)region, erase); }
+EXPORT BOOL WINAPI LockWindowUpdate(HANDLE hwnd) { return BOOL_OF(NtUserLockWindowUpdate((ULONG_PTR)hwnd)); }
+
+/* Windows of a desktop, a parent or a thread: the window manager lists the handles, the callback is called for those that still exist. */
+static HANDLE *list_windows(HANDLE parent, BOOL recursive, DWORD thread, ULONG *count) {
+  ULONG capacity = 64, needed = 0;
+  for (;;) {
+    HANDLE *list = u32_alloc((SIZE_T)capacity * sizeof(HANDLE));
+    if (!list) return NULL;
+    const LONG status = (LONG)NtUserBuildHwndList(0, (ULONG_PTR)parent, recursive, 0, thread, capacity, (ULONG_PTR)list, (ULONG_PTR)&needed);
+    if (status >= 0) { *count = needed; return list; }
+    u32_free(list);
+    if ((ULONG)status != 0x80000005u && (ULONG)status != 0xC0000023u) return NULL;      /* (anything but "buffer too small") */
+    if (needed <= capacity) needed = capacity * 2;
+    capacity = needed;
+  }
+}
+typedef BOOL (WINAPI *WNDENUMPROC_)(HANDLE, LONG_PTR);
+static BOOL enum_list(HANDLE *list, ULONG count, WNDENUMPROC_ proc, LONG_PTR lparam) {
+  BOOL result = TRUE;
+  if (!list) return FALSE;
+  for (ULONG i = 0; i < count && result; ++i) if (IsWindow(list[i])) result = proc(list[i], lparam);
+  u32_free(list);
+  return result;
+}
+EXPORT BOOL WINAPI EnumWindows(WNDENUMPROC_ proc, LONG_PTR lparam) { ULONG n = 0; HANDLE *l = list_windows(NULL, FALSE, 0, &n); return enum_list(l, n, proc, lparam); }
+EXPORT BOOL WINAPI EnumThreadWindows(DWORD thread, WNDENUMPROC_ proc, LONG_PTR lparam) { ULONG n = 0; HANDLE *l = list_windows(NULL, FALSE, thread, &n); return enum_list(l, n, proc, lparam); }
+EXPORT BOOL WINAPI EnumChildWindows(HANDLE parent, WNDENUMPROC_ proc, LONG_PTR lparam) {
+  ULONG n = 0;
+  if (!parent) parent = GetDesktopWindow();
+  HANDLE *l = list_windows(parent, TRUE, 0, &n);
+  return enum_list(l, n, proc, lparam);
+}
+
+/* The state of the calling thread (NtUserGetThreadState) and of the keyboard and the cursor. */
+EXPORT BOOL WINAPI InSendMessage(void) { return (NtUserGetThreadState(8) & 1) != 0; }
+EXPORT DWORD WINAPI InSendMessageEx(void *reserved) { (void)reserved; return (DWORD)NtUserGetThreadState(8); }
+EXPORT DWORD WINAPI GetMessageTime(void) { return (DWORD)NtUserGetThreadState(9); }
+EXPORT LONG_PTR WINAPI GetMessageExtraInfo(void) { return (LONG_PTR)NtUserGetThreadState(7); }
+EXPORT BOOL WINAPI GetGUIThreadInfo(DWORD thread, void *info) { return BOOL_OF(NtUserGetGUIThreadInfo(thread, (ULONG_PTR)info)); }
+EXPORT SHORT WINAPI GetKeyState(int vk) { return (SHORT)NtUserGetKeyState((ULONG_PTR)(LONG_PTR)vk); }
+EXPORT SHORT WINAPI GetAsyncKeyState(int vk) { return (SHORT)NtUserGetAsyncKeyState((ULONG_PTR)(LONG_PTR)vk); }
+EXPORT BOOL WINAPI GetKeyboardState(BYTE *state) { return BOOL_OF(NtUserGetKeyboardState((ULONG_PTR)state)); }
+EXPORT BOOL WINAPI SetKeyboardState(BYTE *state) { return BOOL_OF(NtUserSetKeyboardState((ULONG_PTR)state)); }
+EXPORT BOOL WINAPI GetCursorPos(POINT_ *p) { return p && BOOL_OF(NtUserGetCursorPos((ULONG_PTR)p)); }
+EXPORT BOOL WINAPI SetCursorPos(int x, int y) { return BOOL_OF(NtUserSetCursorPos((ULONG_PTR)(LONG_PTR)x, (ULONG_PTR)(LONG_PTR)y)); }
+EXPORT BOOL WINAPI AttachThreadInput(DWORD from, DWORD to, BOOL attach) { return BOOL_OF(NtUserAttachThreadInput(from, to, attach)); }
