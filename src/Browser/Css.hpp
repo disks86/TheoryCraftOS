@@ -621,7 +621,7 @@ class IContainerSizes {
 
 class StyleSheet {
  public:
-  static constexpr uint32_t kMaxRules = 10000;
+  static constexpr uint32_t kMaxRules = 250000;   // (a big site's one style sheet has 30000 and more)
 
   explicit StyleSheet(allocators::IAllocator& allocator)
       : allocator_(allocator), pool_(allocator), selectors_(allocator), declarations_(allocator), rules_(allocator), scopes_(allocator), kept_(allocator),

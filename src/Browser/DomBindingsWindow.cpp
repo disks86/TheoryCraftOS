@@ -881,6 +881,21 @@ NATIVE(fs_request) {
   *result = bool_value(n && impl(vm).host.fullscreen_request(n));
   return true;
 }
+// __host_get(object, name): what the host answers for an attribute of the object (the accessors on the interfaces' prototypes read through this, so that a script
+// that takes `Object.getOwnPropertyDescriptor(Node.prototype, 'childNodes').get` and calls it on a node gets the node's child list); undefined if it has none.
+NATIVE(host_get) {
+  (void)self;
+  const Value target = arg_at(args, argc, 0);
+  String name(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 1), &name)) return false;
+  *result = Value();
+  if (!target.is_object()) return true;
+  JsObject* o = target.as_object();
+  if (!o->host || !o->host->get) return true;
+  Value found;
+  if (o->host->get(vm, o, vm.intern(name.view()), &found)) *result = found;
+  return true;
+}
 // __make_node(document, kind, nameOrTarget, data): kind 7 a processing instruction, 4 a CDATA section.
 NATIVE(make_node) {
   (void)self;
@@ -1195,6 +1210,7 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__fs_supported", fs_supported, 0);
   vm.define_native(g, "__fs_request", fs_request, 1);
   vm.define_native(g, "__fs_exit", fs_exit, 0);
+  vm.define_native(g, "__host_get", host_get, 2);
   vm.define_native(g, "__fs_element", fs_element, 0);
 
   // location and history

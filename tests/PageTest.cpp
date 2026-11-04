@@ -18,6 +18,7 @@
 
 // Host-side tests for the page: the DOM as scripts see it (the tree, attributes, styles, class lists, markup, selectors, events with their phases, timers,
 // location and storage, matchMedia, getComputedStyle), pages that change after they are drawn, and clicks, resizes and timers delivered to a loaded page.
+#include <unistd.h>
 #include <malloc.h>
 #include <sys/resource.h>
 #include <stdio.h>
@@ -118,6 +119,17 @@ static const char kWptReporter[] = R"JS(
 }());
 )JS";
 
+// PROBE_LIVE=host: a file the probe's directory lacks is fetched once from https://<host>/ with curl and kept there (a big site loads its chunks on demand).
+static void probe_mirror(const std::string& rel, const std::string& path) {
+  const char* host = getenv("PROBE_LIVE");
+  if (!host || rel.empty() || access(path.c_str(), F_OK) == 0) return;
+  for (char c : rel)
+    if (!isalnum(static_cast<unsigned char>(c)) && !strchr("/._=,~+%-", c)) return;   // (the name goes to a shell: only plain characters)
+  const size_t slash = path.rfind('/');
+  if (system(("mkdir -p '" + path.substr(0, slash) + "'").c_str()) != 0) return;
+  if (system(("curl -sf -m 60 -A 'Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)' -o '" + path + "' 'https://" + host + "/" + rel + "' || rm -f '" + path + "'").c_str()) != 0) return;
+}
+
 // A network that hands out canned answers keyed by "METHOD url" (404 for anything else) and remembers what was sent.
 struct FakeNet final : IPageLoader {
   struct Answer {
@@ -143,6 +155,7 @@ struct FakeNet final : IPageLoader {
       const size_t cut = rel.find_first_of("?#");
       if (cut != std::string::npos) rel.resize(cut);
       const std::string path = std::string(getenv("PROBE_ROOT")) + "/" + rel;
+      probe_mirror(rel, path);
       if (getenv("WPT_REAL_FILE") && rel == "resources/testharnessreport.js") {   // (the real WPT runs: the results of the harness go to the log)
         a.status = 200;
         a.headers = "Content-Type: application/javascript\r\n";
@@ -154,8 +167,8 @@ struct FakeNet final : IPageLoader {
         while ((c = fgetc(f)) != EOF) a.body.push_back(static_cast<char>(c));
         fclose(f);
         auto ends = [&](const char* suffix) { const size_t n = strlen(suffix); return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0; };
-        a.headers = ends(".js") || ends(".mjs") ? "Content-Type: application/javascript\r\n" : ends(".json") ? "Content-Type: application/json\r\n" : ends(".svg") ? "Content-Type: image/svg+xml\r\n"
-                  : ends(".xml") ? "Content-Type: application/xml\r\n" : ends(".css") ? "Content-Type: text/css\r\n" : ends(".txt") ? "Content-Type: text/plain\r\n" : ends(".xhtml") ? "Content-Type: application/xhtml+xml\r\n" : "Content-Type: text/html\r\n";
+        a.headers = ends(".js") || ends(".mjs") || path.find("/_/js/") != std::string::npos ? "Content-Type: application/javascript\r\n" : ends(".json") ? "Content-Type: application/json\r\n" : ends(".svg") ? "Content-Type: image/svg+xml\r\n"
+                  : ends(".xml") ? "Content-Type: application/xml\r\n" : ends(".css") || path.find("/_/ss/") != std::string::npos ? "Content-Type: text/css\r\n" : ends(".txt") ? "Content-Type: text/plain\r\n" : ends(".xhtml") ? "Content-Type: application/xhtml+xml\r\n" : "Content-Type: text/html\r\n";
       }
     }
     if (request.headers.contains("If-None-Match")) {   // a revalidation: the answer "<key>#304" if the test has one
@@ -320,6 +333,7 @@ struct FakeEnvironment final : IPageEnvironment {
         text->assign(StringView(kWptReporter, strlen(kWptReporter)));
         return true;
       }
+      probe_mirror(rel, std::string(getenv("PROBE_ROOT")) + "/" + rel);
       if (FILE* f = fopen((std::string(getenv("PROBE_ROOT")) + "/" + rel).c_str(), "rb")) {
         std::string body;
         int c;

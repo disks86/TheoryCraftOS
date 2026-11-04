@@ -28,7 +28,7 @@
 namespace regex {
 
 // ---- limits
-constexpr uint32_t kMaxGroups = 32;                  // capture groups, group 0 (the whole match) included
+constexpr uint32_t kMaxGroups = 256;                 // capture groups, group 0 (the whole match) included
 constexpr uint32_t kLoopSlotBase = kMaxGroups * 2;   // slots below this are capture positions, above it loop guards
 constexpr uint32_t kMaxLoops = 64;                   // loops over a body that can match nothing
 constexpr uint32_t kMaxSlots = kLoopSlotBase + kMaxLoops;
