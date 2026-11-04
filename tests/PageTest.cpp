@@ -20,6 +20,7 @@
 // location and storage, matchMedia, getComputedStyle), pages that change after they are drawn, and clicks, resizes and timers delivered to a loaded page.
 #include <unistd.h>
 #include <malloc.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <stdio.h>
@@ -29,6 +30,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "Allocators/Allocator.hpp"
 #include "Browser/Page.hpp"
 #include "Dom/LegacyEncodings.hpp"
 #include "Browser/CacheStore.hpp"
@@ -49,18 +51,47 @@ using namespace browser;
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
+// PROBE_KALLOC=1 runs the page on the kernel's own Allocator (a first-fit free list in 64-byte blocks) over a 6 GiB mapping, to see what the kernel pays for the same workload.
+struct KernelHeap {
+  struct Ram final : hardware::IRandomAccessMemory {
+    void* region = nullptr;
+    uint64_t bytes = 0;
+    const char* name() const override { return "probe ram"; }
+    bool initialize() override { return true; }
+    void shutdown() override {}
+    uint64_t total_bytes() const override { return bytes; }
+    uint64_t usable_bytes() const override { return bytes; }
+    void* base() const override { return region; }
+  };
+  Ram ram;
+  allocators::Allocator allocator{ram};
+  bool ready = false;
+  static KernelHeap* get() {
+    static KernelHeap heap;
+    if (!heap.ready) {
+      heap.ready = true;
+      if (!getenv("PROBE_KALLOC")) return nullptr;
+      heap.ram.bytes = 6ull << 30;
+      heap.ram.region = mmap(reinterpret_cast<void*>(0x300000000ull), heap.ram.bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+      if (heap.ram.region == MAP_FAILED || !heap.allocator.initialize()) { printf("PROBE_KALLOC: no heap\n"); exit(1); }
+    }
+    return heap.ram.region ? &heap : nullptr;
+  }
+};
+
 struct TestAllocator final : allocators::IAllocator {
   int live = 0;
   uint64_t bytes = 0, peak = 0;   // (what is held now and the most it was: the PROBE_HTML runs print them)
+  KernelHeap* kernel = KernelHeap::get();
   void* allocate(uint64_t size) override {
     ++live;
-    void* p = malloc(size);
-    bytes += malloc_usable_size(p);
+    void* p = kernel ? kernel->allocator.allocate(size) : malloc(size);
+    bytes += kernel ? size : malloc_usable_size(p);
     if (bytes > peak) peak = bytes;
     return p;
   }
   void* allocate_aligned(uint64_t size, uint64_t) override { return allocate(size); }
-  void deallocate(void* p) override { if (p) { --live; bytes -= malloc_usable_size(p); free(p); } }
+  void deallocate(void* p) override { if (p) { --live; if (kernel) kernel->allocator.deallocate(p); else { bytes -= malloc_usable_size(p); free(p); } } }
 };
 
 // A video for the tests: 64 x 48, two seconds, a picture that changes with the position.

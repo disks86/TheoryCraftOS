@@ -67,6 +67,7 @@ struct Name {
 }  // namespace
 
 bool run_utility_demo(allocators::Allocator& allocator, scheduling::ICPUScheduler& scheduler) {
+  allocator.trim();   // (the size stacks back into the list, so the two readings compare)
   const uint64_t free_before = allocator.free_bytes();
   bool all_ok = true;
 
@@ -116,6 +117,7 @@ bool run_utility_demo(allocators::Allocator& allocator, scheduling::ICPUSchedule
     all_ok &= ok;
   }
 
+  allocator.trim();
   const bool freed = allocator.free_bytes() == free_before;
   report("no memory left allocated", freed);
   return all_ok && freed;

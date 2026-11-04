@@ -26,6 +26,8 @@ struct alignas(Allocator::kBlockSize) Allocator::Header {
   static constexpr uint64_t kUsed = 0x55534544'55534544;
   // Sits just before an over-aligned pointer and leads back to the real block.
   static constexpr uint64_t kAligned = 0x414C4947'414C4947;
+  // A free block on a size stack (it counts as free for deallocate(): a second free is ignored).
+  static constexpr uint64_t kSmall = 0x534D414C'4C424C4B;
 
   uint64_t magic;
   uint64_t blocks;  // run length including this header block
@@ -49,6 +51,8 @@ bool Allocator::initialize() {
   static_assert(sizeof(Header) == kBlockSize, "header must fill exactly one block");
   free_low_ = free_high_ = nullptr;
   total_bytes_ = 0;
+  for (auto& pool : small_) for (Header*& top : pool) top = nullptr;
+  small_free_[0] = small_free_[1] = 0;
   auto start = reinterpret_cast<uint64_t>(ram_.base());
   uint64_t end = start + ram_.usable_bytes();
   start = (start + kBlock - 1) & ~(kBlock - 1);
@@ -115,24 +119,95 @@ void* Allocator::allocate_aligned_from(Header** list, uint64_t size, uint64_t al
   return reinterpret_cast<void*>(aligned);
 }
 
+void* Allocator::allocate_small(int pool, Header** list, uint64_t size) {
+  const uint64_t need = 1 + (size + kBlock - 1) / kBlock;
+  Header*& top = small_[pool][need];
+  if (!top) {   // refill: one run from the list, cut into blocks of this size
+    uint64_t count = kSlabBytes / (need * kBlock);
+    if (count < 4) count = 4;
+    auto* slab = static_cast<uint8_t*>(allocate_from(list, need * count * kBlock - kBlock));
+    if (!slab) return allocate_from(list, size);   // (too fragmented for a slab: this one block, as before)
+    auto* first = reinterpret_cast<Header*>(slab - kBlock);
+    const uint64_t blocks = first->blocks;   // need * count, or one more when the list could not split the last block off
+    for (uint64_t i = 0; i < count; ++i) {
+      auto* h = reinterpret_cast<Header*>(reinterpret_cast<uint8_t*>(first) + i * need * kBlock);
+      h->blocks = need + (i + 1 == count ? blocks - need * count : 0);
+      h->magic = Header::kSmall;
+      Header*& stack = small_[pool][h->blocks];
+      h->next = stack;
+      stack = h;
+      small_free_[pool] += h->blocks * kBlock;
+    }
+  }
+  Header* h = top;
+  if (!h) return nullptr;
+  top = h->next;
+  small_free_[pool] -= h->blocks * kBlock;
+  h->magic = Header::kUsed;
+  h->next = nullptr;
+  return reinterpret_cast<uint8_t*>(h) + kBlock;
+}
+
+void* Allocator::allocate_general(int pool, Header** list, uint64_t size) {
+  if (size == 0 || size > UINT64_MAX - 2 * kBlock) return nullptr;
+  if (1 + (size + kBlock - 1) / kBlock <= kSmallBlocks) return allocate_small(pool, list, size);
+  return allocate_from(list, size);
+}
+
 void* Allocator::allocate(uint64_t size) {
-  if (void* p = allocate_from(&free_high_, size)) return p;
-  return allocate_from(&free_low_, size);
+  if (size == 0 || size > UINT64_MAX - 2 * kBlock) return nullptr;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (void* p = allocate_general(1, &free_high_, size)) return p;
+    if (void* p = allocate_general(0, &free_low_, size)) return p;
+    flush_small();   // the stacks may hold the memory this needs, in pieces
+  }
+  return nullptr;
 }
 
 void* Allocator::allocate_aligned(uint64_t size, uint64_t alignment) {
-  if (void* p = allocate_aligned_from(&free_high_, size, alignment)) return p;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (void* p = allocate_aligned_from(&free_high_, size, alignment)) return p;
+    if (void* p = allocate_aligned_from(&free_low_, size, alignment)) return p;
+    flush_small();
+  }
+  return nullptr;
+}
+
+void* Allocator::allocate_dma(uint64_t size, uint64_t alignment) {
+  if (void* p = allocate_aligned_from(&free_low_, size, alignment)) return p;
+  flush_small();
   return allocate_aligned_from(&free_low_, size, alignment);
 }
 
-void* Allocator::allocate_dma(uint64_t size, uint64_t alignment) { return allocate_aligned_from(&free_low_, size, alignment); }
+void Allocator::flush_small() {
+  for (int pool = 0; pool < 2; ++pool) {
+    for (Header*& top : small_[pool]) {
+      while (Header* h = top) {
+        top = h->next;
+        insert_free(h);
+      }
+    }
+    small_free_[pool] = 0;
+  }
+}
 
 void Allocator::deallocate(void* ptr) {
   if (!ptr) return;
   auto* h = reinterpret_cast<Header*>(static_cast<uint8_t*>(ptr) - kBlock);
   if (h->magic == Header::kAligned) h = h->next;  // over-aligned: free the real block
   if (h->magic != Header::kUsed) return;  // not ours, or a double free
+  if (h->blocks >= 2 && h->blocks <= kSmallBlocks) {   // a size stack: no list walk
+    const int pool = pool_of(h);
+    h->magic = Header::kSmall;
+    h->next = small_[pool][h->blocks];
+    small_[pool][h->blocks] = h;
+    small_free_[pool] += h->blocks * kBlock;
+    return;
+  }
+  insert_free(h);
+}
 
+void Allocator::insert_free(Header* h) {
   h->magic = Header::kFree;
   Header** list = list_for(h);
   Header* prev = nullptr;
@@ -163,8 +238,8 @@ uint64_t Allocator::free_bytes_of(const Header* list) {
   return total;
 }
 
-uint64_t Allocator::free_bytes() const { return free_bytes_of(free_low_) + free_bytes_of(free_high_); }
-uint64_t Allocator::free_bytes_low() const { return free_bytes_of(free_low_); }
-uint64_t Allocator::free_bytes_high() const { return free_bytes_of(free_high_); }
+uint64_t Allocator::free_bytes() const { return free_bytes_low() + free_bytes_high(); }   // (what sits on the size stacks is free too)
+uint64_t Allocator::free_bytes_low() const { return free_bytes_of(free_low_) + small_free_[0]; }
+uint64_t Allocator::free_bytes_high() const { return free_bytes_of(free_high_) + small_free_[1]; }
 
 }  // namespace allocators
