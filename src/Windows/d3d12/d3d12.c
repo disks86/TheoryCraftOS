@@ -28,8 +28,9 @@
  *   - the limits of the kernel's pipeline model: one vertex buffer, four float vertex attributes, two sampled textures per draw, four unordered access buffers, no depth-only
  *     passes (a clear of a depth buffer waits for the next pass with a colour target), no multisampling, no 1D textures, mip chains and arrays only on sampled textures, no
  *     texture UAVs, no buffer SRVs outside compute, sampler addresses repeat and clamp only
- *   - queries, predication, indirect execution (ExecuteIndirect, command signatures), bundles, stream output, tiled and reserved resources, shared handles, resource state
- *     validation (barriers are accepted and not looked at, except aliasing), the debug layer, the versioned root signature deserializer
+ *   - pipeline statistics and stream output queries, predication, stream output, tiled textures beyond the kernel's (4-byte colour pixels, one mip level), CopyTileMappings and
+ *     CopyTiles, shared handles, resource state validation (barriers are accepted and not looked at, except aliasing), the debug layer, the root signature deserializers
+ *     (queries are occlusion, binary occlusion and timestamps; ExecuteIndirect is made when the list is executed; bundles replay their calls: extras.inc)
  *   - Shader Model 6.x features beyond what the kernel's DXIL translator reads (it reads vertex, pixel, geometry, hull, domain and compute shaders; see Dxg.md)
  * Built freestanding over kernel32.dll, gdi32.dll and dxgi.dll's interfaces with the OS's mingw compiler. */
 #define INITGUID
@@ -56,6 +57,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #include "heaps.inc"
 #include "pso.inc"
 #include "cmdlist.inc"
+#include "extras.inc"
 #include "queue.inc"
 #include "device.inc"
 

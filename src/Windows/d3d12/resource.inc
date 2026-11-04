@@ -45,6 +45,7 @@ struct Resource {
   int dirty;
   UINT64 sum;                  /* of the shadow as the kernel has it */
   int pushed;
+  int reserved;                /* a tiled resource: the tiles are mapped to heaps with UpdateTileMappings */
   HeapObj *heap;               /* placed: the heap (a reference) */
   struct Resource *next_cpu;   /* the list of the resources with a shadow */
 };
@@ -175,7 +176,7 @@ static int heap_cpu_access(const D3D12_HEAP_PROPERTIES *p, int *upload, int *rea
   }
 }
 
-static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset, int present,
+static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS hflags, const D3D12_RESOURCE_DESC *desc, HeapObj *heap, UINT64 heap_offset, int mode,
                              Resource **out) {
   extern const ID3D12ResourceVtbl res_vtbl;
   KmtAllocDesc ad;
@@ -184,7 +185,9 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
   ad.samples = 1;
   ad.layers = 1;
   if (desc->SampleDesc.Count > 1) return DXGI_ERROR_UNSUPPORTED;
-  if (desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
+  /* (mode: 0 an ordinary resource, 2 a reserved one, which has the 64 KiB layouts) */
+  const int reserved = mode == 2;
+  if (!reserved && desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN && desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
   Resource *r = dobj_new(sizeof *r, dev, &res_vtbl, g_resource_iids, resource_destroy);
   if (!r) return E_OUTOFMEMORY;
   r->desc = *desc;
@@ -197,6 +200,7 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     ad.flags = KA_VERTEX | KA_INDEX | ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? KA_UAV : 0);
     ad.size = KALIGN(desc->Width, 16);
     if (ad.size < 16) ad.size = 16;
+    if (reserved) { ad.size = KALIGN(desc->Width, KTILE_BYTES); ad.flags |= KA_RESERVED; r->reserved = 1; }
   } else {
     const FormatInfo *fi = format_info(desc->Format);
     UINT depth_or_array = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
@@ -215,7 +219,12 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     const int target = (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
     if ((r->kind != 0 || r->mips > 1) && (target || want_depth || (r->kind != 0 && r->mips > 1))) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
-    if (present) ad.flags |= KA_PRESENT;
+    if (reserved) {
+      /* (the kernel's reserved textures: 4-byte colour pixels, whole tiles, one mip level, only sampled) */
+      if (fi->bytes != 4 || fi->depth || !(fi->kernel <= KF_X8B8G8R8 || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB) || desc->Width % 128 || desc->Height % 128 || r->mips != 1 || r->kind != 0 || target || want_depth) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      ad.flags = KA_TEXTURE | KA_RESERVED;
+      r->reserved = 1;
+    }
     ad.format = fi->kernel;
     ad.width = (UINT)desc->Width;
     ad.height = desc->Height;
@@ -235,7 +244,7 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
   if (!KMT_OK(st)) { hr = hr_from(st); goto fail; }
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     r->va = va_register(r, desc->Width);
-    if (cpu) {
+    if (cpu && !reserved) {
       r->shadow = mem_alloc((SIZE_T)desc->Width);
       if (!r->shadow) { hr = E_OUTOFMEMORY; goto fail; }
       EnterCriticalSection(&g_lock);
@@ -270,9 +279,6 @@ static HRESULT STDMETHODCALLTYPE dev_CreatePlacedResource(Dev *This, ID3D12Heap 
   return query_out((IUnknown *)r, riid, out);
 }
 
-static HRESULT STDMETHODCALLTYPE dev_CreateReservedResource(Dev *This, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out) {
-  return DXGI_ERROR_UNSUPPORTED;
-}
 
 static void heap_destroy(DxObj *o) {
   HeapObj *h = (HeapObj *)o;
@@ -319,14 +325,6 @@ static D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE dev_GetResourceAllocati
 static void STDMETHODCALLTYPE dev_GetCopyableFootprints(Dev *This, const D3D12_RESOURCE_DESC *desc, UINT first, UINT count, UINT64 base, D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts,
                                                         UINT *rows, UINT64 *row_sizes, UINT64 *total) {
   get_footprints(desc, first, count, base, layouts, rows, row_sizes, total);
-}
-
-static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *This, ID3D12Resource *resource, UINT *total_tiles, D3D12_PACKED_MIP_INFO *packed, D3D12_TILE_SHAPE *shape, UINT *subresource_count,
-                                                    UINT first, D3D12_SUBRESOURCE_TILING *tilings) {
-  if (total_tiles) *total_tiles = 0;
-  if (packed) memset(packed, 0, sizeof *packed);
-  if (shape) memset(shape, 0, sizeof *shape);
-  if (subresource_count) *subresource_count = 0;
 }
 
 /* ---- ID3D12Resource ----------------------------------------------------------------------------------------------------------------------------------------------------------- */

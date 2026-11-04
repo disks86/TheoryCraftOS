@@ -36,9 +36,12 @@
 #define ROOM_BYTES 4096
 #define ROOM_ALLOCS 24
 
+struct Indirect;
 typedef struct Chunk {
   BYTE *bytes;
   UINT size;
+  struct Indirect *indirect;   /* not a stream: ExecuteIndirect, made into one when the list is executed (the arguments are read then) */
+  UINT queries;                /* queries begun in the stream (the kernel takes 64) */
   UINT allocs[CHUNK_ALLOCS];
   UINT nalloc;
 } Chunk;
@@ -62,18 +65,35 @@ typedef struct CmdAlloc {
   D3D12_COMMAND_LIST_TYPE type;
 } CmdAlloc;
 
-typedef struct Dirty { unsigned all : 1; } Dirty;
+typedef struct CmdList CmdList;
+enum { B_PSO = 1, B_TOPOLOGY, B_STENCIL_REF, B_INDEX_BUFFER, B_VERTEX_BUFFERS, B_HEAPS, B_GRAPHICS_SIGNATURE, B_COMPUTE_SIGNATURE, B_GRAPHICS_CONSTANTS, B_COMPUTE_CONSTANTS,
+       B_GRAPHICS_CBV, B_GRAPHICS_SRV, B_GRAPHICS_UAV, B_COMPUTE_CBV, B_COMPUTE_SRV, B_COMPUTE_UAV, B_GRAPHICS_TABLE, B_COMPUTE_TABLE, B_DRAW, B_DRAW_INDEXED, B_DISPATCH, B_INDIRECT };
+static void bundle_log(CmdList *l, UINT id, const UINT64 a[6], const UINT *data, UINT ndata);
+#define BUNDLE_LOG(l, id, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, NULL, 0); return; } } while (0)
+#define BUNDLE_LOG_DATA(l, id, data, n, ...) do { if ((l)->bundle) { UINT64 a_[6] = {__VA_ARGS__}; bundle_log((l), (id), a_, (data), (n)); return; } } while (0)
 
-typedef struct CmdList {
+/* What a bundle records: the calls, made again on the list that executes it (a bundle sets no targets, viewports or barriers and takes what the caller has set). */
+typedef struct LogEntry {
+  UINT id;
+  UINT64 a[6];
+  UINT *data;
+  UINT ndata;
+} LogEntry;
+
+struct CmdList {
   DObj d;
   D3D12_COMMAND_LIST_TYPE type;
   int closed;
+  int bundle;
+  LogEntry *log;
+  UINT nlog, cap_log;
   Chunk **chunks;
   UINT nchunks, cap_chunks;
   IUnknown **refs;
   UINT nrefs, cap_refs;
   /* the state of the recording */
   Pso *pso;
+  int query_open;
   Binding gfx, cs;
   DescHeap *heaps[2];
   DescHeap *heaps_used[8];       /* every shader-visible heap the list set: their kernel copies are brought up to date when it is executed */
@@ -105,7 +125,7 @@ typedef struct CmdList {
   int sent_viewport, sent_scissor;
   int sent_binding;            /* 0 none, 1 graphics, 2 compute */
   int dirty_gfx, dirty_cs, dirty_heaps;
-} CmdList;
+};
 
 static const GUID *const g_alloc_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12Pageable, &IID_ID3D12CommandAllocator, NULL};
 static const GUID *const g_list_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12CommandList, &IID_ID3D12GraphicsCommandList, NULL};
@@ -168,10 +188,11 @@ static UINT alloc_index(CmdList *l, UINT handle) {
 }
 
 /* Starts a new chunk when the current one cannot take a sequence of commands needing `bytes` and `allocs`. Only between passes. */
+static void end_pass(CmdList *l);
 static void ensure_room(CmdList *l, UINT bytes, UINT allocs) {
   Chunk *c = chunk_cur(l);
   if (c && c->size + bytes <= CHUNK_BYTES && c->nalloc + allocs <= CHUNK_ALLOCS) return;
-  if (l->pass_open) { packet(l, 2, NULL, 0); l->pass_open = 0; }
+  end_pass(l);
   chunk_new(l);
 }
 
@@ -181,6 +202,7 @@ enum { OP_BEGIN_PASS = 1, OP_END_PASS, OP_BIND_PIPELINE, OP_BIND_VB, OP_BIND_IB,
 
 static void end_pass(CmdList *l) {
   if (!l->pass_open) return;
+  if (l->query_open) { packet(l, OP_END_QUERY, NULL, 0); l->query_open = 0; }
   packet(l, OP_END_PASS, NULL, 0);
   l->pass_open = 0;
 }
@@ -200,9 +222,16 @@ static void keep(CmdList *l, IUnknown *o) {
   l->refs[l->nrefs++] = o;
 }
 
+static void indirect_free(struct Indirect *i);
 static void list_free_recording(CmdList *l) {
-  for (UINT i = 0; i < l->nchunks; ++i) { mem_free(l->chunks[i]->bytes); mem_free(l->chunks[i]); }
+  for (UINT i = 0; i < l->nchunks; ++i) {
+    if (l->chunks[i]->indirect) indirect_free(l->chunks[i]->indirect);
+    mem_free(l->chunks[i]->bytes);
+    mem_free(l->chunks[i]);
+  }
   l->nchunks = 0;
+  for (UINT i = 0; i < l->nlog; ++i) mem_free(l->log[i].data);
+  l->nlog = 0;
   for (UINT i = 0; i < l->nrefs; ++i) l->refs[i]->lpVtbl->Release(l->refs[i]);
   l->nrefs = 0;
 }
@@ -218,17 +247,19 @@ static void list_destroy(DxObj *o) {
   list_free_recording(l);
   mem_free(l->chunks);
   mem_free(l->refs);
+  mem_free(l->log);
   dobj_child_destroy(o);
 }
 
 static HRESULT STDMETHODCALLTYPE dev_CreateCommandList(Dev *This, UINT mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial, REFIID riid, void **out) {
   extern const ID3D12GraphicsCommandListVtbl list_vtbl;
-  if (!allocator || (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY)) return E_INVALIDARG;
+  if (!allocator || (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE && type != D3D12_COMMAND_LIST_TYPE_COPY && type != D3D12_COMMAND_LIST_TYPE_BUNDLE)) return E_INVALIDARG;
   CmdList *l = dobj_new(sizeof *l, This, &list_vtbl, g_list_iids, list_destroy);
   if (!l) return E_OUTOFMEMORY;
   l->type = type;
+  l->bundle = type == D3D12_COMMAND_LIST_TYPE_BUNDLE;
   list_reset_state(l);
-  if (!chunk_new(l)) { dx_Release(OBJ(l)); return E_OUTOFMEMORY; }
+  if (!l->bundle && !chunk_new(l)) { dx_Release(OBJ(l)); return E_OUTOFMEMORY; }
   if (initial) { l->pso = (Pso *)initial; keep(l, (IUnknown *)initial); }
   return query_out((IUnknown *)l, riid, out);
 }
@@ -245,7 +276,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(CmdList *This, ID3D12CommandAllocato
   list_free_recording(This);
   list_reset_state(This);
   This->closed = 0;
-  if (!chunk_new(This)) return E_OUTOFMEMORY;
+  if (!This->bundle && !chunk_new(This)) return E_OUTOFMEMORY;
   if (initial) { This->pso = (Pso *)initial; keep(This, (IUnknown *)initial); }
   return S_OK;
 }
@@ -425,7 +456,7 @@ static int prepare_draw(CmdList *l, int indexed) {
 
 /* ---- drawing and dispatching ------------------------------------------------------------------------------------------------------------------------------------------- */
 
-static void STDMETHODCALLTYPE list_DrawInstanced(CmdList *l, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) {
+static void STDMETHODCALLTYPE list_DrawInstanced(CmdList *l, UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) { BUNDLE_LOG(l, B_DRAW, vertices, instances, first_vertex, first_instance);
   if (!vertices || !instances || !prepare_draw(l, 0)) return;
   if (instances == 1 && first_instance == 0) {
     UINT w[2] = {vertices, first_vertex};
@@ -435,7 +466,7 @@ static void STDMETHODCALLTYPE list_DrawInstanced(CmdList *l, UINT vertices, UINT
     packet(l, OP_DRAW_INSTANCED, w, 4);
   }
 }
-static void STDMETHODCALLTYPE list_DrawIndexedInstanced(CmdList *l, UINT indices, UINT instances, UINT first_index, INT base_vertex, UINT first_instance) {
+static void STDMETHODCALLTYPE list_DrawIndexedInstanced(CmdList *l, UINT indices, UINT instances, UINT first_index, INT base_vertex, UINT first_instance) { BUNDLE_LOG(l, B_DRAW_INDEXED, indices, instances, first_index, (UINT)base_vertex, first_instance);
   if (!indices || !instances || !l->ib_alloc || !prepare_draw(l, 1)) return;
   if (instances == 1 && first_instance == 0) {
     UINT w[3] = {indices, first_index, (UINT)base_vertex};
@@ -445,7 +476,7 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(CmdList *l, UINT indices
     packet(l, OP_DRAW_INDEXED_INSTANCED, w, 5);
   }
 }
-static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) {
+static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) { BUNDLE_LOG(l, B_DISPATCH, x, y, z);
   if (!l->pso || !l->pso->compute || !l->cs.rs || !x || !y || !z) return;
   end_pass(l);
   ensure_room(l, ROOM_BYTES, ROOM_ALLOCS);
@@ -459,15 +490,14 @@ static void STDMETHODCALLTYPE list_Dispatch(CmdList *l, UINT x, UINT y, UINT z) 
   UINT w[3] = {x, y, z};
   packet(l, OP_DISPATCH, w, 3);
 }
-static void STDMETHODCALLTYPE list_ExecuteIndirect(CmdList *l, ID3D12CommandSignature *sig, UINT max, ID3D12Resource *args, UINT64 args_offset, ID3D12Resource *count, UINT64 count_offset) {}
 
 /* ---- state setting -------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
-static void STDMETHODCALLTYPE list_SetPipelineState(CmdList *l, ID3D12PipelineState *p) {
+static void STDMETHODCALLTYPE list_SetPipelineState(CmdList *l, ID3D12PipelineState *p) { keep(l, (IUnknown *)p); BUNDLE_LOG(l, B_PSO, (UINT64)(UINT_PTR)p);
   l->pso = (Pso *)p;
   keep(l, (IUnknown *)p);
 }
-static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(CmdList *l, D3D12_PRIMITIVE_TOPOLOGY t) { l->topology = t; }
+static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(CmdList *l, D3D12_PRIMITIVE_TOPOLOGY t) { BUNDLE_LOG(l, B_TOPOLOGY, t); l->topology = t; }
 static void STDMETHODCALLTYPE list_RSSetViewports(CmdList *l, UINT n, const D3D12_VIEWPORT *v) {
   if (!n || !v) return;
   l->viewport = v[0];
@@ -481,8 +511,8 @@ static void STDMETHODCALLTYPE list_RSSetScissorRects(CmdList *l, UINT n, const D
   l->sent_scissor = 0;
 }
 static void STDMETHODCALLTYPE list_OMSetBlendFactor(CmdList *l, const FLOAT factor[4]) {}
-static void STDMETHODCALLTYPE list_OMSetStencilRef(CmdList *l, UINT ref) { l->stencil_ref = ref; }
-static void STDMETHODCALLTYPE list_IASetIndexBuffer(CmdList *l, const D3D12_INDEX_BUFFER_VIEW *view) {
+static void STDMETHODCALLTYPE list_OMSetStencilRef(CmdList *l, UINT ref) { BUNDLE_LOG(l, B_STENCIL_REF, ref); l->stencil_ref = ref; }
+static void STDMETHODCALLTYPE list_IASetIndexBuffer(CmdList *l, const D3D12_INDEX_BUFFER_VIEW *view) { BUNDLE_LOG(l, B_INDEX_BUFFER, view ? view->BufferLocation : 0, view ? view->SizeInBytes : 0, view ? view->Format : 0);
   if (!view || !view->BufferLocation) { l->ib_alloc = 0; return; }
   UINT64 offset = 0;
   Resource *r = va_find(view->BufferLocation, &offset);
@@ -490,7 +520,7 @@ static void STDMETHODCALLTYPE list_IASetIndexBuffer(CmdList *l, const D3D12_INDE
   l->ib_offset = offset;
   l->ib_format = view->Format;
 }
-static void STDMETHODCALLTYPE list_IASetVertexBuffers(CmdList *l, UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW *views) {
+static void STDMETHODCALLTYPE list_IASetVertexBuffers(CmdList *l, UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW *views) { BUNDLE_LOG(l, B_VERTEX_BUFFERS, start, count, views && count ? views[0].BufferLocation : 0, views && count ? views[0].SizeInBytes : 0, views && count ? views[0].StrideInBytes : 0);
   if (start != 0 || !count) return;      /* (one vertex buffer: slot 0) */
   if (!views || !views[0].BufferLocation) { l->vb_alloc = 0; return; }
   UINT64 offset = 0;
@@ -517,7 +547,7 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(CmdList *l, UINT count, co
   }
 }
 
-static void STDMETHODCALLTYPE list_SetDescriptorHeaps(CmdList *l, UINT count, ID3D12DescriptorHeap *const *heaps) {
+static void STDMETHODCALLTYPE list_SetDescriptorHeaps(CmdList *l, UINT count, ID3D12DescriptorHeap *const *heaps) { if (l->bundle) { for (UINT k = 0; k < count; ++k) keep(l, (IUnknown *)heaps[k]); } BUNDLE_LOG(l, B_HEAPS, count, count > 0 ? (UINT64)(UINT_PTR)heaps[0] : 0, count > 1 ? (UINT64)(UINT_PTR)heaps[1] : 0);
   l->heaps[0] = l->heaps[1] = NULL;
   for (UINT i = 0; i < count; ++i) {
     DescHeap *h = (DescHeap *)heaps[i];
@@ -539,8 +569,8 @@ static void set_signature(CmdList *l, Binding *b, ID3D12RootSignature *rs, int *
   keep(l, (IUnknown *)rs);
   *dirty = 1;
 }
-static void STDMETHODCALLTYPE list_SetGraphicsRootSignature(CmdList *l, ID3D12RootSignature *rs) { set_signature(l, &l->gfx, rs, &l->dirty_gfx); }
-static void STDMETHODCALLTYPE list_SetComputeRootSignature(CmdList *l, ID3D12RootSignature *rs) { set_signature(l, &l->cs, rs, &l->dirty_cs); }
+static void STDMETHODCALLTYPE list_SetGraphicsRootSignature(CmdList *l, ID3D12RootSignature *rs) { keep(l, (IUnknown *)rs); BUNDLE_LOG(l, B_GRAPHICS_SIGNATURE, (UINT64)(UINT_PTR)rs); set_signature(l, &l->gfx, rs, &l->dirty_gfx); }
+static void STDMETHODCALLTYPE list_SetComputeRootSignature(CmdList *l, ID3D12RootSignature *rs) { keep(l, (IUnknown *)rs); BUNDLE_LOG(l, B_COMPUTE_SIGNATURE, (UINT64)(UINT_PTR)rs); set_signature(l, &l->cs, rs, &l->dirty_cs); }
 
 static RootArg *root_arg(Binding *b, UINT index) { return index < 16 ? &b->args[index] : NULL; }
 
@@ -569,18 +599,18 @@ static void set_table(Binding *b, int *dirty, UINT index, UINT64 gpu) {
   a->gpu = gpu;
   *dirty = 1;
 }
-static void STDMETHODCALLTYPE list_SetGraphicsRoot32BitConstant(CmdList *l, UINT i, UINT v, UINT dst) { set_constants(l, &l->gfx, &l->dirty_gfx, i, 1, &v, dst); }
-static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstant(CmdList *l, UINT i, UINT v, UINT dst) { set_constants(l, &l->cs, &l->dirty_cs, i, 1, &v, dst); }
-static void STDMETHODCALLTYPE list_SetGraphicsRoot32BitConstants(CmdList *l, UINT i, UINT n, const void *d, UINT dst) { set_constants(l, &l->gfx, &l->dirty_gfx, i, n, d, dst); }
-static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstants(CmdList *l, UINT i, UINT n, const void *d, UINT dst) { set_constants(l, &l->cs, &l->dirty_cs, i, n, d, dst); }
-static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(CmdList *l, UINT i, UINT64 a) { set_view(&l->gfx, &l->dirty_gfx, i, 2, a); }
-static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(CmdList *l, UINT i, UINT64 a) { set_view(&l->cs, &l->dirty_cs, i, 2, a); }
-static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(CmdList *l, UINT i, UINT64 a) { set_view(&l->gfx, &l->dirty_gfx, i, 3, a); }
-static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(CmdList *l, UINT i, UINT64 a) { set_view(&l->cs, &l->dirty_cs, i, 3, a); }
-static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(CmdList *l, UINT i, UINT64 a) { set_view(&l->gfx, &l->dirty_gfx, i, 4, a); }
-static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(CmdList *l, UINT i, UINT64 a) { set_view(&l->cs, &l->dirty_cs, i, 4, a); }
-static void STDMETHODCALLTYPE list_SetGraphicsRootDescriptorTable(CmdList *l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { set_table(&l->gfx, &l->dirty_gfx, i, h.ptr); }
-static void STDMETHODCALLTYPE list_SetComputeRootDescriptorTable(CmdList *l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { set_table(&l->cs, &l->dirty_cs, i, h.ptr); }
+static void STDMETHODCALLTYPE list_SetGraphicsRoot32BitConstant(CmdList *l, UINT i, UINT v, UINT dst) { BUNDLE_LOG_DATA(l, B_GRAPHICS_CONSTANTS, &v, 1, i, dst); set_constants(l, &l->gfx, &l->dirty_gfx, i, 1, &v, dst); }
+static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstant(CmdList *l, UINT i, UINT v, UINT dst) { BUNDLE_LOG_DATA(l, B_COMPUTE_CONSTANTS, &v, 1, i, dst); set_constants(l, &l->cs, &l->dirty_cs, i, 1, &v, dst); }
+static void STDMETHODCALLTYPE list_SetGraphicsRoot32BitConstants(CmdList *l, UINT i, UINT n, const void *d, UINT dst) { BUNDLE_LOG_DATA(l, B_GRAPHICS_CONSTANTS, d, n, i, dst); set_constants(l, &l->gfx, &l->dirty_gfx, i, n, d, dst); }
+static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstants(CmdList *l, UINT i, UINT n, const void *d, UINT dst) { BUNDLE_LOG_DATA(l, B_COMPUTE_CONSTANTS, d, n, i, dst); set_constants(l, &l->cs, &l->dirty_cs, i, n, d, dst); }
+static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(CmdList *l, UINT i, UINT64 a) { BUNDLE_LOG(l, B_GRAPHICS_CBV, i, a); set_view(&l->gfx, &l->dirty_gfx, i, 2, a); }
+static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(CmdList *l, UINT i, UINT64 a) { BUNDLE_LOG(l, B_COMPUTE_CBV, i, a); set_view(&l->cs, &l->dirty_cs, i, 2, a); }
+static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(CmdList *l, UINT i, UINT64 a) { BUNDLE_LOG(l, B_GRAPHICS_SRV, i, a); set_view(&l->gfx, &l->dirty_gfx, i, 3, a); }
+static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(CmdList *l, UINT i, UINT64 a) { BUNDLE_LOG(l, B_COMPUTE_SRV, i, a); set_view(&l->cs, &l->dirty_cs, i, 3, a); }
+static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(CmdList *l, UINT i, UINT64 a) { BUNDLE_LOG(l, B_GRAPHICS_UAV, i, a); set_view(&l->gfx, &l->dirty_gfx, i, 4, a); }
+static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(CmdList *l, UINT i, UINT64 a) { BUNDLE_LOG(l, B_COMPUTE_UAV, i, a); set_view(&l->cs, &l->dirty_cs, i, 4, a); }
+static void STDMETHODCALLTYPE list_SetGraphicsRootDescriptorTable(CmdList *l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { BUNDLE_LOG(l, B_GRAPHICS_TABLE, i, h.ptr); set_table(&l->gfx, &l->dirty_gfx, i, h.ptr); }
+static void STDMETHODCALLTYPE list_SetComputeRootDescriptorTable(CmdList *l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) { BUNDLE_LOG(l, B_COMPUTE_TABLE, i, h.ptr); set_table(&l->cs, &l->dirty_cs, i, h.ptr); }
 
 /* ---- clears -------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -694,10 +724,6 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(CmdList *l, UINT count, const
     packet(l, OP_RESOURCE_BARRIER, w, 6);
   }
 }
-static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsCommandList *bundle) {}
-static void STDMETHODCALLTYPE list_BeginQuery(CmdList *l, ID3D12QueryHeap *h, D3D12_QUERY_TYPE t, UINT i) {}
-static void STDMETHODCALLTYPE list_EndQuery(CmdList *l, ID3D12QueryHeap *h, D3D12_QUERY_TYPE t, UINT i) {}
-static void STDMETHODCALLTYPE list_ResolveQueryData(CmdList *l, ID3D12QueryHeap *h, D3D12_QUERY_TYPE t, UINT s, UINT n, ID3D12Resource *d, UINT64 o) {}
 static void STDMETHODCALLTYPE list_SetPredication(CmdList *l, ID3D12Resource *b, UINT64 o, D3D12_PREDICATION_OP op) {}
 static void STDMETHODCALLTYPE list_SetMarker(CmdList *l, UINT m, const void *d, UINT s) {}
 static void STDMETHODCALLTYPE list_BeginEvent(CmdList *l, UINT m, const void *d, UINT s) {}
