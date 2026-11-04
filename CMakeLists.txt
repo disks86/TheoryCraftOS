@@ -284,6 +284,7 @@ add_executable(BOOTX64
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuIpc.cpp
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuJobs.cpp
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuIrq.cpp
+  src/Hardware/NeuralProcessingUnit/Intel/IntelNpuDevice.cpp
   src/Math/FloatMath.cpp
   src/Spreadsheet/Sheet.cpp
   src/Database/DatabaseTypes.cpp

@@ -18,10 +18,14 @@
 
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Allocators/IAllocator.hpp"
+#include "Hardware/NeuralProcessingUnit/Intel/IntelNpuDevice.hpp"
 #include "Hardware/NeuralProcessingUnit/Intel/IntelNpuHw.hpp"
 #include "Hardware/RegisterMapper.hpp"
 #include "Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.hpp"
+#include "Utility/ArrayView.hpp"
 #include "Utility/FixedString.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace hardware {
 
@@ -40,6 +44,12 @@ class SystemNeuralProcessingUnit {
   void probe_registers(const IPciBus& pci, IRegisterMapper* mmio);
   // What probe_registers found; valid is false when it did not run or the registers did not answer.
   const IntelNpuInfo& intel_info() const { return intel_info_; }
+  // Brings the Intel NPU up with a firmware image (intel/vpu/vpu_*_v1.bin; the kernel does not carry one): powers the IP block, turns on the MMU, boots the
+  // firmware and waits for it. `firmware` must stay alive while the device is used. `system_time_us` is the wall clock. Returns None on success; otherwise the
+  // device is left off and description() says why. Without the call nothing is powered up and work stays on the CPU.
+  IntelNpuDeviceError start_intel_device(const IPciBus& pci, IRegisterMapper* mmio, allocators::IAllocator& allocator, ConstByteView firmware, uint64_t system_time_us);
+  // The running device, or null.
+  IntelNpuDevice* intel_device() { return intel_dev_.get(); }
   // True when a hardware NPU is on the bus (its work still runs on the CPU until a native driver exists).
   bool hardware_present() const { return hardware_present_; }
 
@@ -51,6 +61,8 @@ class SystemNeuralProcessingUnit {
   PciDeviceInfo intel_device_;
   IntelNpuInfo intel_info_;
   bool intel_found_ = false;
+  UniquePointer<MmioNpuRegisters> intel_ip_regs_, intel_btrs_regs_;
+  UniquePointer<IntelNpuDevice> intel_dev_;
   bool hardware_present_ = false;
 };
 

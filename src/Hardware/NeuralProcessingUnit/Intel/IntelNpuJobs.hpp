@@ -124,6 +124,7 @@ class IntelNpuQueueManager {
 enum class IntelNpuJobOutcome : uint8_t {
   Unknown,       // not a job we have in flight
   Completed,     // done; `status` is the firmware's result (0 = success)
+  Aborted,       // the host gave up on it (context fault, reset, shutdown); `status` is IntelNpuJsm::kStatusAborted
   ContextFault,  // the job hit a fault that needs the engine reset (and the context aborted)
 };
 
@@ -145,6 +146,9 @@ class IntelNpuJobTracker {
   IntelNpuJobResult complete(const IntelNpuJsm::JobDone& done);
   // Has this job been reported done? (And remove it from the table.)
   bool take_result(uint32_t job_id, IntelNpuJobResult* result);
+  // The host gives up on jobs (a faulted context, a reset, shutdown): they become Aborted results to take. Returns how many were still running.
+  uint32_t abort_context(uint32_t ssid);
+  uint32_t abort_all();
   uint64_t in_flight() const { return jobs_.count(); }
   static uint32_t context_of(uint32_t job_id) { return (job_id >> 8) + 1; }
 
@@ -164,6 +168,9 @@ struct IntelNpuJobDoneSink {
   IntelNpuJobTracker* tracker = nullptr;
   uint32_t completed = 0, faults = 0, ignored = 0;
   IntelNpuJobResult last;
+  static constexpr uint32_t kMaxFaultedContexts = 8;
+  uint32_t faulted_contexts[kMaxFaultedContexts] = {};  // contexts whose jobs returned a fault needing an engine reset, in order, until the owner clears fault_count
+  uint32_t fault_count = 0;
   static void on_message(void* context, const IntelNpuIpcHeader& header, const IntelNpuJsmMessage* message);
 };
 

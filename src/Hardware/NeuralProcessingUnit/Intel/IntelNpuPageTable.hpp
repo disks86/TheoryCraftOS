@@ -29,6 +29,10 @@ namespace hardware {
 // buttress forces snooping). x86 only.
 void intel_npu_flush_cache(ConstByteView bytes);
 
+// The bus (DMA) address of memory from IAllocator::allocate_dma: the kernel identity maps RAM and the DMA pool is below 4 GiB, so it is the pointer value. The one
+// place a pointer becomes an address; only for memory that came from allocate_dma.
+uint64_t intel_npu_bus_address(const void* dma_memory);
+
 // A piece of host memory the NPU may be given access to: a bus (DMA) address and a length, both multiples of the page size.
 struct IntelNpuDmaExtent {
   uint64_t bus_addr = 0;

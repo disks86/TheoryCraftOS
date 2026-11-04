@@ -62,12 +62,12 @@ class IntelNpuJsm {
   static constexpr uint32_t kEngineCompute = 0;
   // Message types (vpu_ipc_msg_type).
   static constexpr uint32_t kEngineReset = 0x1100, kEnginePreempt = 0x1101, kRegisterDb = 0x1102, kUnregisterDb = 0x1103, kQueryEngineHeartbeat = 0x1104,
-                            kSsidRelease = 0x110E, kCreateCmdQueue = 0x1114, kDestroyCmdQueue = 0x1115, kSetContextSchedProperties = 0x1116,
+                            kSsidRelease = 0x110E, kCreateCmdQueue = 0x1114, kDestroyCmdQueue = 0x1115, kSetPriorityBandSetup = 0x1113, kSetContextSchedProperties = 0x1116,
                             kHwsRegisterDb = 0x1117, kHwsEngineResume = 0x111B, kFreqConfig = 0x111F, kPwrD0i3Enter = 0x1202;
   static constexpr uint32_t kJobDone = 0x2100;
   static constexpr uint32_t kEngineResetDone = 0x2200, kEnginePreemptDone = 0x2201, kRegisterDbDone = 0x2202, kUnregisterDbDone = 0x2203,
                             kQueryEngineHeartbeatDone = 0x2204, kSsidReleaseDone = 0x220E, kCreateCmdQueueRsp = 0x2215, kDestroyCmdQueueRsp = 0x2216,
-                            kSetContextSchedPropertiesRsp = 0x2217, kHwsEngineResumeDone = 0x221C, kFreqConfigRsp = 0x221F, kPwrD0i3EnterDone = 0x2302;
+                            kSetPriorityBandSetupRsp = 0x2214, kSetContextSchedPropertiesRsp = 0x2217, kHwsEngineResumeDone = 0x221C, kFreqConfigRsp = 0x221F, kPwrD0i3EnterDone = 0x2302;
   // Scheduling priority bands (vpu_job_scheduling_priority_band).
   static constexpr uint32_t kBandIdle = 0, kBandNormal = 1, kBandFocus = 2, kBandRealtime = 3, kBandCount = 4;
 
@@ -85,6 +85,14 @@ class IntelNpuJsm {
   static IntelNpuJsmMessage hws_destroy_cmdq(uint32_t ssid, uint64_t cmdq_id);
   static IntelNpuJsmMessage hws_set_context_sched_properties(uint32_t ssid, uint64_t cmdq_id, uint32_t priority_band);
   static IntelNpuJsmMessage hws_resume_engine(uint32_t engine);
+  // The hardware scheduler's priority bands: per band (idle, normal, focus, realtime) the grace period, process grace period and process quantum, in microseconds.
+  struct PriorityBands {
+    uint32_t grace_period[kBandCount] = {0, 50000, 50000, 0};
+    uint32_t process_grace_period[kBandCount] = {50000, 50000, 50000, 50000};
+    uint32_t process_quantum[kBandCount] = {160000, 300000, 200000, 200000};
+    uint32_t normal_band_percentage = 10;
+  };
+  static IntelNpuJsmMessage priority_band_setup(const PriorityBands& bands);
   static IntelNpuJsmMessage freq_config(uint32_t min_ratio, uint32_t pn_ratio, uint32_t max_ratio);
 
   // The reply type a request is answered with, 0 for a type that is not a request this class knows.

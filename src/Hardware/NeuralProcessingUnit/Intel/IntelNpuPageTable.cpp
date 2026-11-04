@@ -31,6 +31,8 @@ constexpr uint32_t kUpperShifts[3] = {39, 30, 21};  // the index bits of the top
 constexpr uint64_t index_at(uint64_t vpu_addr, uint32_t shift) { return (vpu_addr >> shift) & (IntelNpuPageTable::kEntries - 1); }
 }  // namespace
 
+uint64_t intel_npu_bus_address(const void* dma_memory) { return bus_address_of(dma_memory); }
+
 void intel_npu_flush_cache(ConstByteView bytes) {
   constexpr uint64_t kLine = 64;
   if (bytes.empty()) return;

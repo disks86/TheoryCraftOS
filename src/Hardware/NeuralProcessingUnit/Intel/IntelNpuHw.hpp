@@ -81,7 +81,7 @@ struct IntelNpuInfo {
   uint32_t sw_version = 0;       // HOST_SS_SW_VERSION (Lunar Lake and newer)
 };
 
-enum class IntelNpuStep : uint8_t { None, Info, WorkPoint, HostSs, ClockAck, PowerDomain, Axi, TopNoc, CpuNoc };
+enum class IntelNpuStep : uint8_t { None, Info, WorkPoint, HostSs, ClockAck, PowerDomain, Axi, TopNoc, CpuNoc, Reset, D0i3, Idle };
 
 struct IntelNpuResult {
   bool ok = true;
@@ -94,7 +94,7 @@ const char* intel_npu_step_name(IntelNpuStep step);
 // The hardware side of the Linux ivpu driver as far as the host goes: reading the fuses, asking the buttress for a work point, bringing the
 // IP block's clocks, reset, power island and NoC queues up, and starting the NPU's CPU at a firmware entry point (ivpu_hw_btrs.c, ivpu_hw_ip.c,
 // ivpu_hw.c: ivpu_hw_power_up). The firmware image, its boot parameters and the load-power-up-boot sequence are in IntelNpuFirmware.hpp. The NPU MMU, its page tables and contexts are in IntelNpuMmu.hpp; the message channel (IntelNpuIpc.hpp), JSM messages (IntelNpuJsm.hpp), job queues and
-// doorbells (IntelNpuJobs.hpp) and interrupts (IntelNpuIrq.hpp) are beside it. Not here yet: the power-down/reset path and the device object that ties them together.
+// doorbells (IntelNpuJobs.hpp) and interrupts (IntelNpuIrq.hpp) are beside it. IntelNpuDevice.hpp ties everything into boot, submit, suspend and recover.
 // `ip` is BAR 0, `buttress` is BAR 4 (ivpu's regv and regb).
 class IntelNpuHw {
  public:
@@ -119,11 +119,27 @@ class IntelNpuHw {
   // Starts the NPU's CPU at `entry_point` (a VPU address of the firmware's cold-boot entry), as ivpu_hw_ip_soc_cpu_boot() does. After power_up().
   IntelNpuResult boot(uint64_t entry_point);
 
+  // The step before the CPU starts (ivpu_hw_boot_fw): the page-table-walk cache attributes (`snoop`: the NPU may snoop the CPU caches) and the stream-id
+  // validity of the translation buffers, without which the MMU is not consulted. After power_up() and the MMU's enable(), before boot().
+  void prepare_boot(bool snoop);
+  // ivpu_hw_power_down(): resets the IP block, drops the work point and enters D0i3. Every step is tried; the first one that failed is reported. Run the
+  // quiesce (interrupts off, MMU marked off, IPC off) before.
+  IntelNpuResult power_down();
+  // The IP block's reset through the buttress (ivpu_hw_btrs_ip_reset).
+  bool ip_reset();
+  // Ready and idle, as the buttress reports it.
+  bool is_idle();
+  // Waits for the idle bit.
+  bool wait_idle();
+  // The NPU's free-running performance counter (64 bits), read as two halves; 0 on a platform without one.
+  uint64_t perf_counter();
+
   static uint32_t ratio_to_mhz(IntelNpuButtress buttress, uint32_t ratio);
 
  private:
   bool poll(INpuRegisters& r, uint64_t offset, uint32_t mask, uint32_t expected) const;
   bool d0i3_disable();
+  bool d0i3_enable();
   bool work_point(bool enable);
   bool host_ss_configure();
   bool power_domain_enable();

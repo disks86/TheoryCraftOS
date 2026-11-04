@@ -116,6 +116,16 @@ IntelNpuJsmMessage IntelNpuJsm::hws_set_context_sched_properties(uint32_t ssid, 
   return m;
 }
 IntelNpuJsmMessage IntelNpuJsm::hws_resume_engine(uint32_t engine) { IntelNpuJsmMessage m = make(kHwsEngineResume); m.put32(0, engine); return m; }
+IntelNpuJsmMessage IntelNpuJsm::priority_band_setup(const PriorityBands& bands) {
+  IntelNpuJsmMessage m = make(kSetPriorityBandSetup);
+  for (uint32_t i = 0; i < kBandCount; ++i) {
+    m.put32(4 * i, bands.grace_period[i]);
+    m.put32(16 + 4 * i, bands.process_quantum[i]);
+    m.put32(32 + 4 * i, bands.process_grace_period[i]);
+  }
+  m.put32(48, bands.normal_band_percentage);
+  return m;
+}
 IntelNpuJsmMessage IntelNpuJsm::freq_config(uint32_t min_ratio, uint32_t pn_ratio, uint32_t max_ratio) {
   IntelNpuJsmMessage m = make(kFreqConfig);
   m.put32(0, min_ratio);
@@ -135,6 +145,7 @@ uint32_t IntelNpuJsm::response_type(uint32_t request_type) {
     case kSsidRelease: return kSsidReleaseDone;
     case kCreateCmdQueue: return kCreateCmdQueueRsp;
     case kDestroyCmdQueue: return kDestroyCmdQueueRsp;
+    case kSetPriorityBandSetup: return kSetPriorityBandSetupRsp;
     case kSetContextSchedProperties: return kSetContextSchedPropertiesRsp;
     case kHwsEngineResume: return kHwsEngineResumeDone;
     case kFreqConfig: return kFreqConfigRsp;
@@ -155,6 +166,7 @@ const char* IntelNpuJsm::type_name(uint32_t type) {
     case kSsidRelease: return "SSID_RELEASE";
     case kCreateCmdQueue: return "CREATE_CMD_QUEUE";
     case kDestroyCmdQueue: return "DESTROY_CMD_QUEUE";
+    case kSetPriorityBandSetup: return "SET_PRIORITY_BAND_SETUP";
     case kSetContextSchedProperties: return "SET_CONTEXT_SCHED_PROPERTIES";
     case kHwsRegisterDb: return "HWS_REGISTER_DB";
     case kHwsEngineResume: return "HWS_ENGINE_RESUME";

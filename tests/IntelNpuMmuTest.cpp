@@ -275,6 +275,16 @@ static void test_address_space() {
   CHECK(!s.allocate(0x1800000, 0x1810000, 0x1000, &w));                      // that window is used up
   CHECK(!s.allocate(0x3000000, 0x4000000, 0x1000, &w) && !s.allocate(0x1900000, 0x1900000, 0x1000, &w));
   CHECK(!s.allocate(~0ull - 0x800, ~0ull, 0x1000, &w));                      // near the top of the address space: no wrap
+  // Fixed addresses: carved out of a free range, refused when any of it is taken.
+  { IntelNpuAddressSpace f(a, 0x2000000, 0x3000000);
+    CHECK(f.reserve(0x2100000, 0x10000) && f.free_ranges() == 2 && f.free_bytes() == 0x1000000 - 0x10000);
+    CHECK(!f.reserve(0x2100000, 0x1000) && !f.reserve(0x20FF000, 0x2000) && !f.reserve(0x2000800, 0x1000) && !f.reserve(0x2000000, 0) && !f.reserve(0x2FFF000, 0x2000) && !f.reserve(0x1000000, 0x1000));
+    uint64_t g = 0;
+    CHECK(f.allocate(0x2100000, 0x2110000, 0x1000, &g) == false);        // that window is taken now
+    CHECK(f.reserve(0x2000000, 0x1000) && f.reserve(0x2FFF000, 0x1000) && f.free_ranges() == 2);   // from the start and from the end of a range
+    CHECK(f.reserve(0x2001000, 0xFF000) && f.free_ranges() == 1);   // a whole range at once
+    CHECK(f.release(0x2100000, 0x10000) && f.free_ranges() == 1 && f.free_bytes() == 0x2FFF000 - 0x2100000);   // joins its neighbour
+  }
   // Release and merge.
   CHECK(s.release(x, 0x1000) && s.release(z, 0x2000));
   CHECK(!s.release(z, 0x2000));                                              // twice

@@ -213,6 +213,10 @@ static void test_jsm() {
   CHECK(m.type() == 0x1115 && m.get32(0) == 4 && m.get64(8) == 33);
   m = J::hws_set_context_sched_properties(4, 33, 2);
   CHECK(m.type() == 0x1116 && m.get32(0) == 4 && m.get64(8) == 33 && m.get32(16) == 2 && m.get64(32) == 20000 && m.get64(40) == 10000 && m.get64(48) == 0);
+  { IntelNpuJsm::PriorityBands bands;
+    bands.grace_period[1] = 111; bands.process_quantum[2] = 222; bands.process_grace_period[3] = 333; bands.normal_band_percentage = 25;
+    m = J::priority_band_setup(bands);
+    CHECK(m.type() == 0x1113 && m.get32(4) == 111 && m.get32(16 + 8) == 222 && m.get32(32 + 12) == 333 && m.get32(48) == 25 && J::response_type(0x1113) == 0x2214); }
   m = J::freq_config(8, 16, 48);
   CHECK(m.type() == 0x111F && m.get32(0) == 8 && m.get32(4) == 16 && m.get32(8) == 48);
   CHECK(J::engine_preempt(0, 3).get32(4) == 3 && J::ssid_release(6).get32(0) == 6 && J::unregister_db(8).get32(0) == 8 && J::pwr_d0i3_enter().get32(0) == 1);

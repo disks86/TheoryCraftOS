@@ -79,4 +79,42 @@ void SystemNeuralProcessingUnit::probe_registers(const IPciBus& pci, IRegisterMa
   if (intel_info_.tile_disable_mask) description_.append(", tiles fused off");
 }
 
+IntelNpuDeviceError SystemNeuralProcessingUnit::start_intel_device(const IPciBus& pci, IRegisterMapper* mmio, allocators::IAllocator& allocator,
+                                                                  ConstByteView firmware, uint64_t system_time_us) {
+  constexpr uint16_t kPciCommand = 0x04, kPciRevision = 0x08;
+  constexpr uint32_t kMemorySpace = 1u << 1;
+  constexpr uint8_t kIpBar = 0, kButtressBar = 4;
+  if (!intel_found_ || !mmio || intel_dev_ || !(pci.read32(intel_device_.address, kPciCommand) & kMemorySpace)) return IntelNpuDeviceError::BadState;
+  const IntelNpuPlatform platform = intel_npu_platform(intel_device_.device_id);
+  const uint64_t ip_base = pci.memory_bar(intel_device_.address, kIpBar);
+  const uint64_t btrs_base = pci.memory_bar(intel_device_.address, kButtressBar);
+  MmioRegion ip, btrs;
+  if (ip_base == 0 || btrs_base == 0 || !mmio->map_registers(ip_base, IntelNpuHw::operational_window(platform.ip), &ip) ||
+      !mmio->map_registers(btrs_base, IntelNpuHw::kButtressWindow, &btrs))
+    return IntelNpuDeviceError::Registers;
+  intel_ip_regs_ = UniquePointer<MmioNpuRegisters>::make(allocator, ip);
+  intel_btrs_regs_ = UniquePointer<MmioNpuRegisters>::make(allocator, btrs);
+  if (!intel_ip_regs_ || !intel_btrs_regs_) return IntelNpuDeviceError::Memory;
+  IntelNpuDeviceConfig config;
+  config.ip = intel_ip_regs_.get();
+  config.buttress = intel_btrs_regs_.get();
+  config.allocator = &allocator;
+  config.device_id = intel_device_.device_id;
+  config.revision = static_cast<uint8_t>(pci.read32(intel_device_.address, kPciRevision) & 0xFF);
+  config.pci_bus = intel_device_.address.bus;
+  config.snoop = false;   // flush shared memory: the NPU is not assumed to snoop the CPU caches
+  UniquePointer<IntelNpuDevice> device = UniquePointer<IntelNpuDevice>::make(allocator, config);
+  if (!device) return IntelNpuDeviceError::Memory;
+  IntelNpuDeviceError error = device->load_firmware(firmware);
+  if (error == IntelNpuDeviceError::None) error = device->start(system_time_us);
+  if (error != IntelNpuDeviceError::None) {
+    description_.append("; firmware not started: ");
+    description_.append(intel_npu_device_error_name(error));
+    return error;   // the device (off again) is destroyed here, before the register wrappers it points at
+  }
+  intel_dev_ = util::move(device);
+  description_.append("; firmware running");
+  return IntelNpuDeviceError::None;
+}
+
 }  // namespace hardware
