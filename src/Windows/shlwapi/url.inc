@@ -396,6 +396,8 @@ EXPORT HRESULT_ WINAPI UrlGetPartA(LPCSTR url, LPSTR out, DWORD *length, DWORD p
   return url_return_a(work, n, out, length, 0);
 }
 
+#include "urlcanon.inc"
+
 /* ---- canonical form, combining, comparing ------------------------------------------------------------------------------------------------------------------------ */
 
 /* Collapses "." and ".." in the path of a hierarchical URL (between the authority and any ? or #). */
@@ -434,10 +436,16 @@ static int url_simplify(WCHAR *url, int n) {
   return w;
 }
 static int url_canonicalize(const WCHAR *url, DWORD flags, WCHAR *out) {
-  WCHAR work[URL_MAX + 1], escaped[URL_MAX + 1];
+  WCHAR work[URL_MAX + 1], escaped[URL_MAX + 1], clean[URL_MAX + 1];
   int n = 0;
-  const WCHAR *src = url;
-  while (*src == ' ') ++src;
+  /* leading and trailing spaces and control characters go, and tab, newline and return anywhere */
+  const WCHAR *first = url, *end = url;
+  while (*end) ++end;
+  while (first < end && *first <= 0x20) ++first;
+  while (end > first && end[-1] <= 0x20) --end;
+  for (const WCHAR *p = first; p < end && n < URL_MAX; ++p) if (*p != '\t' && *p != '\n' && *p != '\r') clean[n++] = *p;
+  clean[n] = 0;
+  const WCHAR *src = clean;
   if (flags & F_UNESCAPE) { n = url_unescape(src, flags & F_DONT_ESCAPE_EXTRA_INFO, work); if (n < 0) return -1; src = work; }
   /* a path that is a DOS path becomes a file URL */
   WCHAR dos[URL_MAX + 1];
@@ -446,16 +454,21 @@ static int url_canonicalize(const WCHAR *url, DWORD flags, WCHAR *out) {
     if (UrlCreateFromPathW(src, dos, &l, 0) < 0) return -1;
     src = dos;
   }
-  const DWORD escape_flags = (flags & F_ESCAPE_UNSAFE) ? (flags & (F_DONT_ESCAPE_EXTRA_INFO | F_ESCAPE_PERCENT)) : (F_ESCAPE_SPACES_ONLY);
-  n = url_escape(src, escape_flags | ((flags & F_ESCAPE_UNSAFE) ? 0 : 0), escaped);
-  if (n < 0) return -1;
-  /* the scheme is lower case; a backslash in the path of a web or file URL is a slash */
+  if (flags & (F_ESCAPE_UNSAFE | F_ESCAPE_SPACES_ONLY)) {
+    const DWORD escape_flags = (flags & F_ESCAPE_UNSAFE) ? (flags & (F_DONT_ESCAPE_EXTRA_INFO | F_ESCAPE_PERCENT)) : (F_ESCAPE_SPACES_ONLY | (flags & F_DONT_ESCAPE_EXTRA_INFO));
+    n = url_escape(src, escape_flags, escaped);
+    if (n < 0) return -1;
+  } else {
+    n = 0;
+    while (src[n] && n < URL_MAX) { escaped[n] = src[n]; ++n; }
+    escaped[n] = 0;
+  }
   const int sl = url_scheme_length(escaped);
   const UrlScheme *s = sl ? url_find_scheme(escaped, sl) : NULL;
+  if (!s || s->scheme != 9) return url_canon_core(escaped, n, flags, out);
+  /* file: URLs: the scheme is lower case; a backslash in the path is a slash */
   for (int i = 0; i < sl; ++i) if (escaped[i] >= 'A' && escaped[i] <= 'Z') escaped[i] = (WCHAR)(escaped[i] + 32);
-  if (s && (s->scheme == 2 || s->scheme == 11 || s->scheme == 9 || s->scheme == 1)) {
-    for (int i = sl; escaped[i] && escaped[i] != '?' && escaped[i] != '#'; ++i) if (escaped[i] == '\\') escaped[i] = '/';
-  }
+  for (int i = sl; escaped[i] && escaped[i] != '?' && escaped[i] != '#'; ++i) if (escaped[i] == '\\') escaped[i] = '/';
   if (!(flags & F_DONT_SIMPLIFY)) n = url_simplify(escaped, n);
   for (int i = 0; i <= n; ++i) out[i] = escaped[i];
   return n;
