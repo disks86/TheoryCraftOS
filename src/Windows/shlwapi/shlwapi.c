@@ -508,3 +508,5 @@ EXPORT HRESULT_ WINAPI PathCreateFromUrlA(LPCSTR url, LPSTR path, DWORD *length,
   *length = (DWORD)bytes - 1;
   return 0;
 }
+
+#include "url.inc"
