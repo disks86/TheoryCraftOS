@@ -60,6 +60,7 @@ void fill_task(void* context) {
 
 bool run_concurrent_demo(allocators::Allocator& allocator, allocators::IAllocator& shared,
                          hardware::ICentralProcessingUnit& cpu, scheduling::ICPUScheduler& scheduler) {
+  allocator.trim();   // (the size stacks back into the list, so the two readings compare)
   const uint64_t free_before = allocator.free_bytes();
   bool all_ok = true;
   {
@@ -103,6 +104,7 @@ bool run_concurrent_demo(allocators::Allocator& allocator, allocators::IAllocato
     report("nothing lost or duplicated (counts, sums, atomic counter)", ok);
     all_ok &= ok;
   }
+  allocator.trim();
   const bool freed = allocator.free_bytes() == free_before;
   report("no memory left allocated", freed);
   return all_ok && freed;

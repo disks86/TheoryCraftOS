@@ -38,6 +38,7 @@ void report(const char* what, bool ok) {
 }  // namespace
 
 bool run_container_demo(allocators::Allocator& allocator) {
+  allocator.trim();   // (the size stacks back into the list, so the two readings compare)
   const uint64_t free_before = allocator.free_bytes();
   bool all_ok = true;
 
@@ -173,6 +174,7 @@ bool run_container_demo(allocators::Allocator& allocator) {
     all_ok &= ok;
   }
 
+  allocator.trim();
   const bool freed = allocator.free_bytes() == free_before;
   report("no memory left allocated", freed);
   return all_ok && freed;

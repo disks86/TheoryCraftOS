@@ -69,6 +69,7 @@ int main() {
   void* p = a.allocate(1000);
   CHECK(p && is_low(p) && !a.allocate(0));
   a.deallocate(p);
+  a.trim();   // (freed small blocks wait on a size stack; a leak check compares after they are back in the list)
   CHECK(a.free_bytes() == low_free);
 
   // A high region: ordinary allocations go there first, DMA allocations stay low.
@@ -87,6 +88,7 @@ int main() {
   a.deallocate(r);
   a.deallocate(d);
   a.deallocate(d2);
+  a.trim();
   CHECK(a.free_bytes_low() == low_free && a.free_bytes_high() == high_free);
 
   // When the high pool cannot satisfy a request the low pool does; DMA never uses the high one.
@@ -159,11 +161,50 @@ int main() {
       for (uint64_t k = 0; k < b.size; k += 61) CHECK(b.p[k] == b.tag);
       c.deallocate(b.p);
     }
+    c.trim();
     CHECK(c.free_bytes() == before);
     // with everything freed one allocation can take a whole pool again
     void* whole = c.allocate(3 * kMiB + 512 * 1024);
     CHECK(whole);
     c.deallocate(whole);
+  }
+  {   // small blocks wait on size stacks: reuse is immediate, a double free is ignored, and nothing stays stranded
+    void* region = map_at(0x500000000ull, 16 * kMiB);
+    CHECK(region != nullptr);
+    if (region) {
+      FakeRam ram2;
+      ram2.region = region;
+      ram2.bytes = 16 * kMiB;
+      allocators::Allocator s(ram2);
+      CHECK(s.initialize());
+      void* first = s.allocate(100);
+      s.deallocate(first);
+      void* again = s.allocate(100);
+      CHECK(first && again == first);   // (the block that was just freed comes straight back)
+      s.deallocate(again);
+      s.deallocate(again);              // (a second free of the same pointer does nothing)
+      void* x = s.allocate(100);
+      void* y = s.allocate(100);
+      CHECK(x && y && x != y);
+      s.deallocate(x);
+      s.deallocate(y);
+      // Fill the pool with blocks of several small sizes, free every other one, then the rest.
+      std::vector<void*> held;
+      const uint64_t sizes[] = {8, 40, 100, 300, 1000, 2000};
+      for (uint64_t i = 0; void* b = s.allocate(sizes[i % 6]); ++i) {
+        memset(b, 0x5A, sizes[i % 6]);
+        held.push_back(b);
+      }
+      CHECK(held.size() > 10000);
+      for (size_t i = 0; i < held.size(); i += 2) s.deallocate(held[i]);
+      for (size_t i = 1; i < held.size(); i += 2) s.deallocate(held[i]);
+      // All of it is free but sits in pieces on the stacks: a request for most of the pool still succeeds.
+      void* big = s.allocate(12 * kMiB);
+      CHECK(big != nullptr);
+      s.deallocate(big);
+      s.trim();
+      CHECK(s.free_bytes() > 15 * kMiB);
+    }
   }
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
