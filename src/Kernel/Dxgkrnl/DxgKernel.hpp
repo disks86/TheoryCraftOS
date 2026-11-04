@@ -62,6 +62,9 @@ class IWaitHook {
 //                    write mask, per-instance bits of the attributes, then the number of colour outputs, then for independent blending a flag and the nine words
 //                    (custom, enable, four factors, two ops, write mask) of the blend state of each of targets 1 .. 3, then multisample, then the geometry shader (0: none), then the hull and domain shaders (0: none) - one word each; then stream output: the number of entries, and for more than none the rasterized stream (-1: none), the strides of the four
 //                    buffers and for each entry two words: stream | output << 8 | start component << 16 | component count << 24, and the buffer)
+//                    then, if the pipeline has more than four vertex attributes, a vertex buffer other than 0 or a fifth to eighth colour target with independent blending: the number of attributes beyond the fourth, for
+//                    each three words (location, format | slot << 8, offset), the per-instance bits of those (bit n: the (4 + n)th attribute), the slots of the first four attributes (four bits each), the number
+//                    of further vertex buffer strides (slots 1 ..), then those strides, then the number of further blend states and nine words (as above) for each, of targets 4 ...)
 //   DestroyShader / DestroyPipeline   handle
 //   CreateComputePipeline   shader (a Compute stage shader)                                                                           reply: handle
 //   Direct3D 12 objects (D3d12.hpp), what d3d12.dll makes its root signatures, descriptor heaps and tiled resources of:

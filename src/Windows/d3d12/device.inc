@@ -52,6 +52,15 @@ static D3D12_HEAP_PROPERTIES *STDMETHODCALLTYPE dev_GetCustomHeapProperties(Dev 
   return ret;
 }
 
+/* The feature level the adapter's limits (what the kernel's graphics device takes, DeviceInfo::limits) allow: 11_0 needs 16 vertex inputs, 16 interpolants, 16 texture units and 8 render targets,
+ * 10_0 the same but fewer interpolants (the ones it needs are 16 as well), and below that 9_3 (4 render targets, 16 textures) or 9_1. */
+static D3D_FEATURE_LEVEL dev_feature_level(const Dev *d) {
+  const KmtCaps *c = &d->caps;
+  if (c->max_vertex_attributes >= 16 && c->max_varyings >= 16 && c->max_texture_units >= 16 && c->max_color_targets >= 8) return D3D_FEATURE_LEVEL_11_0;
+  if (c->max_texture_units >= 16 && c->max_color_targets >= 4 && c->max_varyings >= 8) return D3D_FEATURE_LEVEL_9_3;
+  return D3D_FEATURE_LEVEL_9_1;
+}
+
 /* What the device can do: Direct3D 12 on feature level 11_0 with the tiers at their lowest. The limits that are lower than the levels' (texture units, vertex attributes, ...) are
  * those of the kernel's pipeline model: docs/win32k/Dxg.md and d3d12.c say which. */
 static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATURE feature, void *data, UINT size) {
@@ -80,9 +89,10 @@ static HRESULT STDMETHODCALLTYPE dev_CheckFeatureSupport(Dev *This, D3D12_FEATUR
       D3D12_FEATURE_DATA_FEATURE_LEVELS *f = data;
       if (size != sizeof *f) return E_INVALIDARG;
       D3D_FEATURE_LEVEL best = (D3D_FEATURE_LEVEL)0;
+      const D3D_FEATURE_LEVEL top = dev_feature_level(This);
       for (UINT i = 0; i < f->NumFeatureLevels; ++i)
-        if (f->pFeatureLevelsRequested[i] <= D3D_FEATURE_LEVEL_11_0 && f->pFeatureLevelsRequested[i] > best) best = f->pFeatureLevelsRequested[i];
-      f->MaxSupportedFeatureLevel = best ? best : D3D_FEATURE_LEVEL_11_0;
+        if (f->pFeatureLevelsRequested[i] <= top && f->pFeatureLevelsRequested[i] > best) best = f->pFeatureLevelsRequested[i];
+      f->MaxSupportedFeatureLevel = best ? best : top;
       return best ? S_OK : E_INVALIDARG;
     }
     case D3D12_FEATURE_FORMAT_SUPPORT: {

@@ -65,8 +65,8 @@ struct D3d9Program::State {
   Q r[kMaxTemps];
   Q a0;
   Q pos;
-  Q var[graphics::kMaxVaryings];
-  Q color[graphics::kMaxColorTargets];
+  Q var[graphics::kMaxVaryings] = {};          // (outputs the shader does not write are zero, not what the stack held)
+  Q color[graphics::kMaxColorTargets] = {};
   const graphics::Vec4* attributes = nullptr;
   const graphics::Vec4* varyings = nullptr;
   const uint8_t* constants = nullptr;

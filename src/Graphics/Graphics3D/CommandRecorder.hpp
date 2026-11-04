@@ -44,7 +44,7 @@ struct RecordedCommand {
   int32_t vertex_offset = 0;
   uint32_t instance_count = 1, first_instance = 0;
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;   // SetTopology
-  uint32_t unit = 0;       // BindTexture; the slot of BeginQuery
+  uint32_t unit = 0;       // BindTexture; the slot of BeginQuery; the slot of BindVertexBuffer
   IImage* image = nullptr;
   IImage* image2 = nullptr;   // Resolve: the source (image is the destination)
   SamplerDesc sampler;
@@ -72,11 +72,14 @@ class CommandRecorder : public ICommandBuffer {
     c.pipeline = pipeline;
     add(c);
   }
-  void bind_vertex_buffer(IBuffer* buffer, uint64_t offset) override {
+  void bind_vertex_buffer(IBuffer* buffer, uint64_t offset) override { bind_vertex_buffer_slot(0, buffer, offset); }
+  // (a replaying device reads the slot from `unit`; one with a single vertex buffer never gets another than 0)
+  void bind_vertex_buffer_slot(uint32_t slot, IBuffer* buffer, uint64_t offset) override {
     RecordedCommand c;
     c.type = RecordedCommand::Type::BindVertexBuffer;
     c.buffer = buffer;
     c.offset = offset;
+    c.unit = slot;
     add(c);
   }
   void bind_index_buffer(IBuffer* buffer, IndexType type, uint64_t offset) override {

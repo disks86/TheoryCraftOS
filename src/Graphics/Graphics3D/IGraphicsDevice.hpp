@@ -37,13 +37,34 @@
 
 namespace graphics {
 
-constexpr uint32_t kMaxVertexAttributes = 4;
-constexpr uint32_t kMaxVaryings = 4;
+// --- Capacities and limits ---
+// The kMax constants are the sizes of the arrays in the structures shared by the devices and the shader translators: the most any device could be asked for. What a device really
+// takes is what it says in DeviceInfo::limits (the CPU renderer takes all of the capacity; a GPU backend takes what its encoder and the hardware can, see kBase* below); the kernel
+// checks the pipelines and bindings it is given against those, never against the capacities.
+constexpr uint32_t kMaxVertexAttributes = 16;
+constexpr uint32_t kMaxVaryings = 16;           // values passed from the vertex to the fragment shader
+constexpr uint32_t kMaxVertexBuffers = 8;       // vertex buffers (input slots) bound at once
 // The most a command buffer may carry as shader constants; what a device really takes is DeviceInfo::max_push_constant_bytes (most take 128: eight vec4s).
 constexpr uint32_t kMaxPushConstantBytes = 4096;
-constexpr uint32_t kMaxTextureUnits = 2;
-// The colour images one render pass can draw into at once (kFeatureMultipleTargets): RenderPassBegin::color and up to three more.
-constexpr uint32_t kMaxColorTargets = 4;
+constexpr uint32_t kMaxTextureUnits = 16;
+// The colour images one render pass can draw into at once (kFeatureMultipleTargets): RenderPassBegin::color and up to seven more.
+constexpr uint32_t kMaxColorTargets = 8;
+// What the backends written for fixed pipelines (virgl, SVGA3D, Intel Gen9, Radeon Vega M, V3D) take: their encoders and fixed kernels were made for these numbers, so they say so in
+// DeviceInfo::limits (the defaults). A backend that can take more says it.
+constexpr uint32_t kBaseVertexAttributes = 4;
+constexpr uint32_t kBaseVaryings = 4;
+constexpr uint32_t kBaseTextureUnits = 2;
+constexpr uint32_t kBaseColorTargets = 4;
+constexpr uint32_t kBaseVertexBuffers = 1;
+
+// What a device can do in the dimensions the kMax constants size. The defaults are the kBase values.
+struct DeviceLimits {
+  uint32_t vertex_attributes = kBaseVertexAttributes;   // vertex shader inputs (VertexAttribute::location is below this)
+  uint32_t varyings = kBaseVaryings;                    // GraphicsPipelineDesc::varying_count
+  uint32_t texture_units = kBaseTextureUnits;           // GraphicsPipelineDesc::texture_count, bind_texture units
+  uint32_t color_targets = kBaseColorTargets;           // kFeatureMultipleTargets: colour images of a pass
+  uint32_t vertex_buffers = kBaseVertexBuffers;         // bind_vertex_buffer_slot slots
+};
 
 // --- Resources ---------------------------------------------------------------
 
@@ -441,6 +462,7 @@ struct VertexAttribute {
   VertexFormat format;
   uint32_t offset;  // bytes from the start of the vertex
   bool per_instance = false;   // kFeatureInstancing: the attribute steps with the instance, not the vertex (element number = the instance, at the same stride)
+  uint8_t slot = 0;            // the vertex buffer it is read from (below DeviceLimits::vertex_buffers); slot 0's stride is GraphicsPipelineDesc::vertex_stride
 };
 
 // The stencil test of a pipeline, one state for front and back faces: a fragment passes when (reference & compare_mask) <compare> (stored & compare_mask); what is written back
@@ -474,6 +496,7 @@ struct GraphicsPipelineDesc {
   const IShaderModule* vertex_shader = nullptr;
   const IShaderModule* fragment_shader = nullptr;
   uint32_t vertex_stride = 0;
+  uint32_t slot_strides[kMaxVertexBuffers] = {};   // the stride of vertex buffer n for n >= 1 (slot_strides[0] is not used)
   VertexAttribute attributes[kMaxVertexAttributes] = {};
   uint32_t attribute_count = 0;
   uint32_t varying_count = 0;  // values passed from the vertex to the fragment shader
@@ -557,6 +580,10 @@ class ICommandBuffer {
   virtual void begin_render_pass(const RenderPassBegin& pass) = 0;
   virtual void bind_pipeline(const IPipeline* pipeline) = 0;
   virtual void bind_vertex_buffer(IBuffer* buffer, uint64_t offset = 0) = 0;
+  // Vertex buffer `slot` (below DeviceLimits::vertex_buffers; the attributes of a pipeline name their slot). A device with one vertex buffer takes slot 0 only.
+  virtual void bind_vertex_buffer_slot(uint32_t slot, IBuffer* buffer, uint64_t offset = 0) {
+    if (slot == 0) bind_vertex_buffer(buffer, offset);
+  }
   virtual void bind_index_buffer(IBuffer* buffer, IndexType type, uint64_t offset = 0) = 0;
   // Sets the shader constants (at most kMaxPushConstantBytes, a multiple of 16).
   virtual void push_constants(const void* data, uint32_t size) = 0;
@@ -664,6 +691,7 @@ struct DeviceInfo {
   uint32_t max_push_constant_bytes = 128;   // what push_constants() may be given (a multiple of 16, up to kMaxPushConstantBytes)
   uint32_t features = 0;                    // DeviceFeature bits
   uint32_t sample_counts = 0;               // kFeatureMultisample: bit n set: ImageDesc::samples = n is supported
+  DeviceLimits limits;                      // vertex attributes, varyings, texture units, colour targets and vertex buffers the device takes
 };
 
 class IGraphicsDevice {

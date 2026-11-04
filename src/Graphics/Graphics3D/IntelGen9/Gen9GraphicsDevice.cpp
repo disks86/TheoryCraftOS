@@ -436,10 +436,10 @@ IPipeline* Gen9GraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
     // A vertex shader function with one of the two fragment kernels: up to four attributes of any float format, the kernel reads one varying.
     const bool kernel_textured = fs->program() == EuProgram::TexturedFragment;
     if (!kernel_textured && fs->program() != EuProgram::ColoredFragment) return nullptr;
-    if (desc.texture_count != (kernel_textured ? 1u : 0u) || desc.attribute_count == 0 || desc.attribute_count > kMaxVertexAttributes || desc.vertex_stride == 0 || desc.vertex_stride > 2048) return nullptr;
-    if (fs->varying() >= kMaxVaryings) return nullptr;
+    if (desc.texture_count != (kernel_textured ? 1u : 0u) || desc.attribute_count == 0 || desc.attribute_count > kBaseVertexAttributes || desc.vertex_stride == 0 || desc.vertex_stride > 2048) return nullptr;
+    if (fs->varying() >= kBaseVaryings) return nullptr;
     for (uint32_t i = 0; i < desc.attribute_count; ++i)
-      if (desc.attributes[i].location >= kMaxVertexAttributes || desc.attributes[i].offset > 2000) return nullptr;
+      if (desc.attributes[i].location >= kBaseVertexAttributes || desc.attributes[i].offset > 2000) return nullptr;
     return make<Gen9Pipeline>(allocator_, desc, 0, 0, kernel_textured, vs->function(), fs->varying());
   }
   // The coloured pair (a float3 position and a float4 colour) or the textured pair (a float3 position and a float2 texture coordinate, one texture).
@@ -590,7 +590,7 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
       if (base > vertices.size() || attribute_end > vertices.size() - base) return false;
       if (vertex_function) {
         // The vertex shader function, with the attributes it reads by location (unset components are 0, 0, 0, 1).
-        Vec4 attributes[kMaxVertexAttributes];
+        Vec4 attributes[kBaseVertexAttributes];
         for (Vec4& a : attributes) a = {0, 0, 0, 1};
         for (uint32_t a = 0; a < pd.attribute_count; ++a) {
           const VertexAttribute& attribute = pd.attributes[a];

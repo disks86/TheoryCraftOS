@@ -117,6 +117,10 @@ class D3d9Program {
   bool uses_fragment_stores() const { return uses_fragment_stores_; }   // a pixel shader that writes buffers
   // How many colour outputs a pixel shader writes (a DXBC one: SV_Target0 .. n-1; the others: one). More than one needs kFeatureMultipleTargets, and `color` of run_fragment is then that many Vec4s.
   uint32_t color_output_count() const { return color_outputs_; }
+  // The texture units the shader declares (bit n: unit n) - the device must have them (DeviceLimits::texture_units).
+  uint32_t texture_unit_mask() const { return texture_unit_mask_; }
+  // A DXBC vertex shader: the vertex inputs it declares (v0 .. v<n-1>) - the device must have that many (DeviceLimits::vertex_attributes).
+  uint32_t attributes_used() const { return attributes_used_; }
   // The same with the system values (D3d9Binding hands these to the device beside the others).
   void run_vertex_ex(const graphics::Vec4* attributes, const uint8_t* constants, const graphics::VertexContext& context, graphics::ShaderIo* out) const;
   bool run_fragment_ex(const graphics::Vec4* varyings, const graphics::FragmentContext& context, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const;
@@ -129,7 +133,8 @@ class D3d9Program {
   // The same program as TGSI text for a device that runs shaders on a GPU (virgl), following ShaderModuleDesc::tgsi: vertex inputs IN[n] are attribute locations, varyings
   // GENERIC[0..3] are the four of the mapping above, CONST[0..7] the push constants and the shader's `def`s immediates, the position gets the same Y flip as run_vertex. kNotSupported for
   // what the text cannot say (see D3d9Tgsi.cpp), kNoMemory.
-  NtStatus emit_tgsi(String* out) const;
+  // `varyings`: how many interpolants the host's vertex and pixel shaders declare (DeviceLimits::varyings).
+  NtStatus emit_tgsi(String* out, uint32_t varyings = graphics::kBaseVaryings) const;
 
   // For a vertex shader: whether it is the matrix transform of the fixed vertex kernel, found by running it on test vectors against the built-in shader. `colour_varying` is the varying
   // the colour attribute goes to.
@@ -177,6 +182,7 @@ class D3d9Program {
   uint32_t uav_stride_[graphics::kMaxStorageBuffers + graphics::kMaxSharedMemories] = {};
   uint32_t shared_bytes_[graphics::kMaxSharedMemories] = {};
   bool uses_barrier_ = false;
+  uint32_t texture_unit_mask_ = 0, attributes_used_ = 0;
   graphics::TextureKind texture_kind_[graphics::kMaxTextureUnits] = {};
   uint8_t texture_samples_[graphics::kMaxTextureUnits] = {};   // the sample count a multisampled texture was declared with
   bool uses_system_values_ = false, uses_texel_access_ = false, uses_graphics_storage_ = false, uses_fragment_stores_ = false, uses_vertex_stores_ = false, uses_geometry_stores_ = false, uses_tessellation_stores_ = false;

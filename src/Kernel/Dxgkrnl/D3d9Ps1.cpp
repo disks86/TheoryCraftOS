@@ -249,7 +249,7 @@ NtStatus D3d9Program::compile_ps1(allocators::IAllocator& allocator, ConstByteVi
         ins.op = kTexLd;
         uint32_t stage = 0;
         if (v14) {
-          if (raw_type != kTemp || raw_number >= graphics::kMaxTextureUnits) return status::kNotSupported;
+          if (raw_type != kTemp || raw_number >= graphics::kBaseTextureUnits) return status::kNotSupported;
           stage = raw_number;
           s = read_src(in, &ins.src[0]);
           if (s != status::kSuccess) return s;
@@ -258,7 +258,7 @@ NtStatus D3d9Program::compile_ps1(allocators::IAllocator& allocator, ConstByteVi
             ins.src[0].modifier = kModNone;
           }
         } else {
-          if (raw_type != kAddrTex || raw_number >= graphics::kMaxTextureUnits) return status::kNotSupported;
+          if (raw_type != kAddrTex || raw_number >= graphics::kBaseTextureUnits) return status::kNotSupported;
           stage = raw_number;
           ins.src[0].type = kAddrTex, ins.src[0].slot = static_cast<int8_t>(2 + stage);
           ins.dst.type = kTemp, ins.dst.number = static_cast<uint16_t>(kTextureTempBase + stage);
