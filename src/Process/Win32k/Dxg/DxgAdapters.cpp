@@ -285,6 +285,8 @@ uint32_t query_adapter_info(Session& s, Call& call, uint64_t arg) {
       uint8_t name[64] = {};
       for (uint32_t i = 0; i < 63 && caps.name[i]; ++i) name[i] = static_cast<uint8_t>(caps.name[i]);
       out.append(ConstByteView(name, 64));
+      // After the name (a user-mode driver that reads only the head does not see them): the multisample counts, the kind of device, the vendor and device numbers. The Vulkan driver reports them.
+      for (uint32_t w : {caps.sample_counts, caps.device_kind, caps.vendor_id, caps.device_id}) out.put32(w);
       break;
     }
     case kQaiWddm12Caps: case kQaiWddm13Caps: case kQaiWddm20Caps: case kQaiDirectFlipSupport: case kQaiMultiPlaneOverlaySupport: case kQaiMultiPlaneOverlayHudSupport:
@@ -299,8 +301,10 @@ uint32_t query_adapter_info(Session& s, Call& call, uint64_t arg) {
       return kStatusInvalidParameter;
   }
   if (needed == 0) needed = static_cast<uint32_t>(out.size());
+  // The capabilities blob grew at its tail: a caller that asks for the 96 bytes it always did gets them.
+  if (type == kQaiDriverPrivate && size >= 96 && size < needed) needed = size;
   if (size < needed) return status::kBufferTooSmall;
-  return call.write(data, out.view()) ? status::kSuccess : kStatusAccessViolation;
+  return call.write(data, out.view().first(needed)) ? status::kSuccess : kStatusAccessViolation;
 }
 
 uint32_t query_video_memory_info(Session& s, Call& call, uint64_t arg) {

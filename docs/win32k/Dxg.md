@@ -28,6 +28,16 @@ Allocations: CreateAllocation(2), DestroyAllocation(2), Lock(2), Unlock(2), Quer
 Synchronization: CreateSynchronizationObject(2), DestroySynchronizationObject, Signal/WaitForSynchronizationObjectFromCpu, SignalSynchronizationObject,
 WaitForSynchronizationObject, Signal/WaitForSynchronizationObjectFromGpu.
 
+### Adapter capabilities (QueryAdapterInfo type 0, UMDRIVERPRIVATE)
+
+112 bytes: 8 words (max texture dimension, vertex attributes, varyings, texture units, push constant bytes, vertex stride, flags, `DeviceFeature` bits), the adapter's
+name (64 bytes), then 4 words added for the Vulkan driver: multisample counts (`DeviceInfo::sample_counts`), kind of device (0 CPU renderer, 1 virtual GPU, 2 GPU), PCI vendor
+and a device number (`Adapter::Adapter` finds the vendor from the device's name: Intel 8086, AMD 1002, VMware 15AD, virtio 1AF4, Broadcom 14E4, the CPU renderer 10005). A caller
+that asks for 96 bytes gets the first 96. [WindowsVulkan.md](../WindowsVulkan.md) is the user of all of it.
+
+gdi32.dll has a `D3DKMT*` thunk for every `NtGdiDdDDI*` service (before the Vulkan driver only 47 existed and `D3DKMTCreateContext`, `Render`, `Lock`, `Present` ... were stubs that
+answered success without doing anything).
+
 ### Private driver data of an allocation (the miniport ABI)
 
 18 little-endian words (`AllocWord`): version (1), dxgk flags, format (`dxgk::Format`), width, height, mips, size lo/hi, texture kind, samples, layers, initial state,
