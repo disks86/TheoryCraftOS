@@ -62,12 +62,7 @@ typedef struct { DWORD64 start, size; } RANGE;
 typedef struct { NTSTATUS exit_status; PVOID teb; HANDLE process_id, thread_id; ULONG_PTR affinity; LONG priority, base_priority; } DTHREAD_BASIC;
 __declspec(dllimport) NTSTATUS NTAPI RtlGetVersion(PRTL_OSVERSIONINFOW);
 
-/* kernel32's OpenThread, found by name: ntdll.dll's stub list has an OpenThread of its own (that answers STATUS_NOT_IMPLEMENTED), and the link takes that one. */
-static HANDLE open_thread(DWORD access, DWORD id) {
-  typedef HANDLE(WINAPI * OPEN_THREAD)(DWORD, BOOL, DWORD);
-  OPEN_THREAD f = (OPEN_THREAD)GetProcAddress(GetModuleHandleA("kernel32.dll"), "OpenThread");
-  return f ? f(access, FALSE, id) : NULL;
-}
+#define open_thread(access, id) OpenThread((access), FALSE, (id))
 
 static BOOL file_write(HANDLE file, const void *data, SIZE_T n) {
   const BYTE *p = data;

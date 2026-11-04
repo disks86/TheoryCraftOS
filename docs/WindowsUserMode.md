@@ -423,8 +423,7 @@ module list (`K32EnumProcessModules`), `NtQueryInformationThread` (the TEB) and 
   `FindExecutableImage`, `FindDebugInfoFile`, `EnumerateLoadedModules*`.
 - **Not done.** PDB, DWARF and CodeView readers (so no lines, types, locals, source files: those calls fail with `ERROR_MOD_NOT_FOUND`/`ERROR_NOT_SUPPORTED`), symbol servers (`SymSrv*`, the
   index functions of Wine's `path.c`), the callback of `MiniDumpWriteDump`, handle data and token streams, 32-bit `StackWalk`, inline frames, the debugger-extension exports.
-- **Gotcha.** ntdll.dll's stub list has names that are kernel32.dll's (`OpenThread`, `QueueUserAPC`, `IsWow64Process`, ...). A DLL that links `libntdll.a` before `kernel32.dll` imports the stub
-  (which answers `STATUS_NOT_IMPLEMENTED`) for such a name; dbghelp.dll finds `OpenThread` by name for that reason.
+- **Gotcha (fixed).** mingw's ntdll import library lists some of kernel32.dll's functions (`OpenThread`, `QueueUserAPC`, `IsWow64Process`, ...), which had given ntdll.dll stubs of them that shadowed the real ones in any DLL linking `libntdll.a` first. `scripts/gen-windows-stubs.py` now leaves kernel32's names out of ntdll's list.
 - **Tests.** `scripts/winetest.sh dbghelp tcos` runs `tests/windows/wine/dbghelp/tcos.c` (193 checks: image helpers, symbols of kernel32's exports and of the test program's COFF table, the stack
   walk through three frames, name decoding, directories, minidumps of the process itself in both modes, read back). Wine's own tests: `dbghelp` 89 -> 17 failed checks (the rest need files this OS does not have, a 32-bit process, and
   `STATUS_INVALID_CID` from a bogus process handle); `minidump` crashed with an access violation and now runs through (56 failed: the callback, the debug-event exception tests, `kernelbase.dll` as a
