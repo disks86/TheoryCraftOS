@@ -177,11 +177,12 @@ EXPORT HRESULT_ WINAPI SHStrDupA(LPCSTR s, LPWSTR *out) {
 
 /* ---- registry helpers --------------------------------------------------------------------------------------------------------------------------------------------- */
 
+EXPORT LSTATUS_ WINAPI SHQueryValueExW(HKEY key, LPCWSTR value, LPDWORD reserved, LPDWORD type, LPVOID data, LPDWORD size);
 EXPORT LSTATUS_ WINAPI SHGetValueW(HKEY root, LPCWSTR subkey, LPCWSTR value, LPDWORD type, LPVOID data, LPDWORD size) {
   HKEY key;
   LSTATUS_ r = RegOpenKeyExW(root, subkey, 0, KEY_READ_, &key);
   if (r) return r;
-  r = RegQueryValueExW(key, value, NULL, type, data, size);
+  r = SHQueryValueExW(key, value, NULL, type, data, size);
   RegCloseKey(key);
   return r;
 }
@@ -246,10 +247,15 @@ EXPORT LSTATUS_ WINAPI SHQueryValueExW(HKEY key, LPCWSTR value, LPDWORD reserved
   r = RegQueryValueExW(key, value, NULL, NULL, (LPBYTE)raw, &got);
   if (!r) {
     raw[got / sizeof(WCHAR)] = 0;
-    const DWORD n = ExpandEnvironmentStringsW(raw, NULL, 0);
+    const DWORD n = ExpandEnvironmentStringsW(raw, NULL, 0), expanded_bytes = n * sizeof(WCHAR), biggest = expanded_bytes > need ? expanded_bytes : need;
     if (size) {
-      if (!data || *size < n * sizeof(WCHAR)) { r = data ? ERROR_MORE_DATA : 0; *size = n * sizeof(WCHAR); }
-      else { ExpandEnvironmentStringsW(raw, data, *size / sizeof(WCHAR)); *size = n * sizeof(WCHAR); }
+      if (!data) *size = biggest;
+      else if (*size < expanded_bytes) {
+        /* too small: the caller is told the larger of the two sizes; a string that fits unexpanded but would grow is not left half-written */
+        r = ERROR_MORE_DATA;
+        if (expanded_bytes > need && *size >= need) *(WCHAR *)data = 0;
+        *size = biggest;
+      } else { ExpandEnvironmentStringsW(raw, data, *size / sizeof(WCHAR)); *size = expanded_bytes; }
     }
   }
   task_free(raw);
@@ -261,8 +267,10 @@ EXPORT LSTATUS_ WINAPI SHQueryValueExA(HKEY key, LPCSTR value, LPDWORD reserved,
   BYTE *wide = task_alloc(wide_size ? wide_size : 2);
   LSTATUS_ r = ERROR_OUTOFMEMORY;
   if ((!value || v) && wide) {
+    if (wide_size) *(WCHAR *)wide = 1;
     r = SHQueryValueExW(key, v, reserved, &t, data ? wide : NULL, &wide_size);
     if (type) *type = t;
+    if (r == ERROR_MORE_DATA && data && size && *size && !*(WCHAR *)wide) *(char *)data = 0;
     if (!r && data && t == REG_SZ_) {
       const int n = WideCharToMultiByte(CP_ACP, 0, (LPCWSTR)wide, -1, data, size ? (int)*size : 0, NULL, NULL);
       if (!n) r = ERROR_MORE_DATA; else if (size) *size = (DWORD)n;
@@ -618,7 +626,7 @@ static BOOL assoc_value(const WCHAR *key, const WCHAR *value, WCHAR *out, DWORD 
 EXPORT HRESULT_ WINAPI AssocQueryStringW(DWORD flags, DWORD what, LPCWSTR assoc, LPCWSTR extra, LPWSTR out, DWORD *size) {
   WCHAR class_name[MAX_PATH_], key[MAX_PATH_ * 2], value[MAX_PATH_ * 2];
   (void)flags;
-  if (!assoc || !size || (*size && !out && *size)) return E_INVALIDARG_;
+  if (!assoc || !size) return E_INVALIDARG_;
   /* the class: the extension's, or the name given */
   if (assoc[0] == '.') { if (!assoc_value(assoc, NULL, class_name, MAX_PATH_)) { memcpy(class_name, assoc, (wcslen(assoc) + 1) * sizeof(WCHAR)); } }
   else { if (wcslen(assoc) >= MAX_PATH_) return E_INVALIDARG_; memcpy(class_name, assoc, (wcslen(assoc) + 1) * sizeof(WCHAR)); }
@@ -629,6 +637,23 @@ EXPORT HRESULT_ WINAPI AssocQueryStringW(DWORD flags, DWORD what, LPCWSTR assoc,
     case ASSOCSTR_COMMAND_: case ASSOCSTR_EXECUTABLE_:
       swprintf_(key, class_name, L"\\shell\\", verb, L"\\command");
       found = assoc_value(key, NULL, value, MAX_PATH_ * 2);
+      if (!found && !(extra && *extra)) {
+        /* no "open": the verb the class names as its default, else its first verb */
+        WCHAR shell_key[MAX_PATH_ * 2], first[MAX_PATH_];
+        swprintf_(shell_key, class_name, L"\\shell", L"", L"");
+        WCHAR default_verb[MAX_PATH_];
+        BOOL have_verb = assoc_value(shell_key, NULL, default_verb, MAX_PATH_);
+        if (!have_verb) {
+          HKEY shell;
+          DWORD n = MAX_PATH_;
+          if (!RegOpenKeyExW(HKEY_CLASSES_ROOT_, shell_key, 0, KEY_READ_, &shell)) {
+            have_verb = !RegEnumKeyExW(shell, 0, first, &n, NULL, NULL, NULL, NULL);
+            RegCloseKey(shell);
+          }
+          if (have_verb) memcpy(default_verb, first, (wcslen(first) + 1) * sizeof(WCHAR));
+        }
+        if (have_verb) { swprintf_(key, class_name, L"\\shell\\", default_verb, L"\\command"); found = assoc_value(key, NULL, value, MAX_PATH_ * 2); }
+      }
       if (found && what == ASSOCSTR_EXECUTABLE_) {
         /* the program: the first word of the command, quotes taken off */
         WCHAR *p = value, *start = value;
