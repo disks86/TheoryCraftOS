@@ -21,6 +21,8 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
+#include "Hardware/NeuralProcessingUnit/Intel/IntelNpuFirmware.hpp"
 #include "Hardware/NeuralProcessingUnit/Intel/IntelNpuHw.hpp"
 
 using namespace hardware;
@@ -205,6 +207,236 @@ static void test_boot() {
   CHECK(hn.boot(0x1000).ok && nvl.ip.regs.count(0x01010030) == 0);
 }
 
+
+// ---- Firmware image, boot parameters and the load-and-boot sequence ----
+
+using Bytes = std::vector<uint8_t>;
+static void st32(Bytes& b, size_t off, uint32_t v) { for (int i = 0; i < 4; ++i) b[off + i] = static_cast<uint8_t>(v >> (8 * i)); }
+static void st64(Bytes& b, size_t off, uint64_t v) { for (int i = 0; i < 8; ++i) b[off + i] = static_cast<uint8_t>(v >> (8 * i)); }
+static uint32_t ld32(ConstByteView b, size_t off) { uint32_t v = 0; for (int i = 0; i < 4; ++i) v |= uint32_t{b[off + i]} << (8 * i); return v; }
+static uint64_t ld64(ConstByteView b, size_t off) { return ld32(b, off) | (uint64_t{ld32(b, off + 4)} << 32); }
+
+// A firmware file for `ip` the way Intel's make_std_fw_image lays it out: 4 KiB header, 4 KiB version page, then the image.
+static Bytes make_firmware(IntelNpuIp ip) {
+  const uint64_t base = IntelNpuMemoryMap::for_ip(ip).runtime.start;
+  const uint32_t image_size = 0x4000;
+  Bytes f(IntelNpuFirmware::kFileImageOffset + image_size);
+  st32(f, 0, 1);                      // header_version
+  st32(f, 4, 1);                      // image_format
+  st64(f, 8, base + 0x2000);          // image_load_address
+  st32(f, 16, image_size);
+  st64(f, 20, base + 0x2000);         // entry_point
+  st64(f, 64, base + 0x1000);         // firmware_version_load_address
+  st32(f, 72, 32);                    // firmware_version_size
+  st64(f, 76, base);                  // boot_params_load_address
+  st32(f, 84 + 4 * 0, (3u << 16) | 29);   // boot API
+  st32(f, 84 + 4 * 4, (3u << 16) | 34);   // JSM API
+  st32(f, 148, 0x2000 + 0x10000);     // runtime_size
+  st32(f, 152, 0x1800);               // shave_nn_fw_size
+  st32(f, 156, 0x3000); st32(f, 160, 0x5000);  // preemption sizes
+  st64(f, 188, base + 0x2000); st32(f, 196, 0x1000);  // read-only section
+  const char* v = "FW 2026.1 test";
+  for (size_t i = 0; v[i]; ++i) f[4096 + i] = static_cast<uint8_t>(v[i]);
+  for (size_t i = 0; i < image_size; ++i) f[IntelNpuFirmware::kFileImageOffset + i] = static_cast<uint8_t>(i * 7 + 1);
+  return f;
+}
+static IntelNpuFirmware parse(const Bytes& f, IntelNpuIp ip, uint32_t sched = kIntelNpuSchedAuto) { return IntelNpuFirmware::parse(ConstByteView(f.data(), f.size()), ip, sched); }
+
+static void test_firmware_parse() {
+  using E = IntelNpuFirmwareError;
+  const IntelNpuIp ips[] = {IntelNpuIp::Ip37xx, IntelNpuIp::Ip40xx, IntelNpuIp::Ip50xx, IntelNpuIp::Ip60xx};
+  for (IntelNpuIp ip : ips) {
+    const uint64_t base = IntelNpuMemoryMap::for_ip(ip).runtime.start;
+    const Bytes f = make_firmware(ip);
+    const IntelNpuFirmware fw = parse(f, ip);
+    CHECK(fw.valid() && fw.runtime_addr == base + 0x2000 && fw.runtime_size == 0x10000 && fw.image_size == 0x4000 && fw.image.size() == 0x4000);
+    CHECK(fw.boot_params_addr == base && fw.fw_version_addr == base + 0x1000 && fw.fw_version_size == 4096 && fw.cold_boot_entry_point == base + 0x2000);
+    CHECK(fw.shave_nn_size == 0x2000 && fw.image[1] == 8 && fw.version.size() == 14 && fw.version[0] == 'F');
+    CHECK(fw.sched_mode == kIntelNpuSchedHw && fw.primary_preempt_buf_size == 0x3000 && fw.secondary_preempt_buf_size == 0x5000);
+    CHECK(fw.read_only_addr == base + 0x2000 && fw.read_only_size == 0x1000);
+    CHECK(IntelNpuFirmware::api_major(fw.api_version[4]) == 3 && IntelNpuFirmware::api_minor(fw.api_version[4]) == 34);
+  }
+  const IntelNpuIp ip = IntelNpuIp::Ip40xx;
+  const uint64_t base = IntelNpuMemoryMap::for_ip(ip).runtime.start;
+  auto mutated = [&](auto fn) { Bytes f = make_firmware(ip); fn(f); return parse(f, ip).error; };
+  CHECK(mutated([](Bytes& f) { st32(f, 0, 2); }) == E::HeaderVersion);
+  CHECK(mutated([&](Bytes& f) { st64(f, 76, base - 0x1000); }) == E::BootParamsAddress);
+  CHECK(mutated([&](Bytes& f) { st64(f, 76, ~0ull - 100); }) == E::BootParamsAddress);   // wraps
+  CHECK(mutated([](Bytes& f) { st32(f, 72, 5000); }) == E::VersionSize);
+  CHECK(mutated([&](Bytes& f) { st64(f, 64, base + (64u << 20)); }) == E::VersionAddress);
+  CHECK(mutated([](Bytes& f) { st32(f, 148, 0x1000); }) == E::RuntimeSize);              // smaller than the two pages: ivpu would wrap
+  CHECK(mutated([](Bytes& f) { st32(f, 148, 0x2000 + 0x10001); }) == E::RuntimeSize);    // not page aligned
+  CHECK(mutated([&](Bytes& f) { st64(f, 8, base + 0x2001); }) == E::RuntimeSize);
+  CHECK(mutated([](Bytes& f) { st32(f, 16, 0x4001); }) == E::ImageSize);                 // beyond the file
+  CHECK(mutated([](Bytes& f) { st32(f, 16, 0xFFFFFFF0u); }) == E::ImageSize);
+  CHECK(mutated([](Bytes& f) { st32(f, 148, 0x2000 + 0x3000); }) == E::ImageSize);       // runtime smaller than the image
+  CHECK(mutated([&](Bytes& f) { st64(f, 20, base + 0x2000 + 0x3001); }) == E::EntryPoint);  // less than a page left in the image
+  CHECK(mutated([&](Bytes& f) { st64(f, 20, base); }) == E::EntryPoint);
+  CHECK(mutated([](Bytes& f) { st32(f, 152, (2u << 20) + 1); }) == E::ShaveSize);
+  CHECK(mutated([&](Bytes& f) { st64(f, 188, base + 0x5000); st32(f, 196, 0x2000); }) == E::ReadOnlySection);
+  CHECK(mutated([&](Bytes& f) { st64(f, 188, 0); st32(f, 196, 0xFFFFFFFFu); }) == E::None);  // no section: its size is ignored
+  CHECK(mutated([](Bytes& f) { st32(f, 84, (2u << 16) | 99); }) == E::BootApiVersion);
+  CHECK(mutated([](Bytes& f) { st32(f, 84 + 16, 1u << 16); }) == E::JsmApiVersion);
+  CHECK(std::string(intel_npu_firmware_error_name(E::EntryPoint)) == "entry point outside the image");
+  // 37xx has a different runtime range: a 40xx image is not valid there.
+  CHECK(parse(make_firmware(IntelNpuIp::Ip40xx), IntelNpuIp::Ip37xx).error == E::BootParamsAddress);
+
+  // Scheduler selection.
+  { Bytes f = make_firmware(ip); st32(f, 84 + 16, (3u << 16) | 23); const IntelNpuFirmware o = parse(f, ip);
+    CHECK(o.valid() && o.sched_mode == kIntelNpuSchedOs && o.primary_preempt_buf_size == 0);          // OS scheduling has no preemption buffers
+    CHECK(parse(f, ip, kIntelNpuSchedHw).sched_mode == kIntelNpuSchedHw);
+    CHECK(parse(f, IntelNpuIp::Ip40xx, kIntelNpuSchedOs).sched_mode == kIntelNpuSchedOs); }
+  { Bytes f = make_firmware(IntelNpuIp::Ip60xx); st32(f, 84 + 16, (3u << 16) | 23);
+    CHECK(parse(f, IntelNpuIp::Ip60xx, kIntelNpuSchedOs).sched_mode == kIntelNpuSchedHw); }               // 60xx has no OS scheduler
+  { Bytes f = make_firmware(ip); st32(f, 156, 100); st32(f, 164, 0); CHECK(parse(f, ip).primary_preempt_buf_size == 0);   // too small
+    st32(f, 156, 0x1001); st32(f, 164, 0); CHECK(parse(f, ip).primary_preempt_buf_size == 0x2000);                        // rounded up
+    st32(f, 164, 64u << 20); CHECK(parse(f, ip).primary_preempt_buf_size == 0); }                                         // max too big
+  { Bytes f = make_firmware(ip); for (size_t i = 0; i < 4096; ++i) f[4096 + i] = 'x'; const IntelNpuFirmware o = parse(f, ip);
+    CHECK(o.valid() && o.version.size() == 255); }                                                       // an unterminated version is cut, not overrun
+}
+
+// Every prefix of a good file and every single-bit change of its header either parses into something inside the file or is refused.
+static void test_firmware_corruption() {
+  const IntelNpuIp ip = IntelNpuIp::Ip40xx;
+  const Bytes f = make_firmware(ip);
+  for (size_t n = 0; n < f.size(); ++n) {
+    const IntelNpuFirmware fw = IntelNpuFirmware::parse(ConstByteView(f.data(), n), ip);
+    CHECK(!fw.valid() && fw.error == (n <= IntelNpuFirmware::kFileImageOffset ? IntelNpuFirmwareError::TooSmall : IntelNpuFirmwareError::ImageSize));
+  }
+  uint32_t accepted = 0;
+  for (size_t byte = 0; byte < 204; ++byte)
+    for (int bit = 0; bit < 8; ++bit) {
+      Bytes g = f;
+      g[byte] ^= static_cast<uint8_t>(1u << bit);
+      const IntelNpuFirmware fw = parse(g, ip);
+      if (!fw.valid()) continue;
+      ++accepted;
+      CHECK(fw.image.data() >= g.data() && fw.image.data() + fw.image.size() <= g.data() + g.size());
+      CHECK(fw.version.data() >= g.data() && fw.version.data() + fw.version.size() <= g.data() + g.size());
+      const IntelNpuMemoryMap m = IntelNpuMemoryMap::for_ip(ip);
+      CHECK(m.runtime.contains(fw.runtime_addr, fw.runtime_size) && fw.runtime_size >= fw.image_size);
+      CHECK(fw.cold_boot_entry_point >= fw.runtime_addr && fw.cold_boot_entry_point + 4096 <= fw.runtime_addr + fw.image_size);
+    }
+  CHECK(accepted > 0);  // flips of ignored fields (format, version string, reserved) must not be refused
+}
+
+static IntelNpuBootInputs boot_inputs(const IntelNpuMemoryMap& m) {
+  IntelNpuBootInputs in;
+  in.pci_bus = 0; in.si_stepping = 4; in.device_id = 0x643E; in.sku = 0x55; in.tile_fuse = 0;
+  in.min_ratio = 8; in.pn_ratio = 0x10; in.max_ratio = 0x30;
+  in.ipc_rx_addr = m.global.start; in.ipc_rx_size = 0x2000;
+  in.crit_log_addr = m.global.start + 0x10000; in.crit_log_size = 0x1000;
+  in.verbose_log_addr = m.global.start + 0x20000; in.verbose_log_size = 0x8000;
+  in.shave_nn_addr = m.shave.start; in.trace_level = 2; in.telemetry_base = 0x1234; in.telemetry_size = 0x80; in.telemetry_enable = true;
+  in.uses_ecc_mca_signal = true; in.disable_d0i2 = true; in.system_time_us = 1789000000123456ull;
+  return in;
+}
+
+static void test_boot_params() {
+  using O = IntelNpuBoot;
+  const IntelNpuIp ip = IntelNpuIp::Ip40xx;
+  const IntelNpuMemoryMap m = IntelNpuMemoryMap::for_ip(ip);
+  const IntelNpuFirmware fw = parse(make_firmware(ip), ip);
+  Bytes page(4096, 0xAA);
+  ByteView pv(page.data(), page.size());
+  const IntelNpuBootInputs in = boot_inputs(m);
+  CHECK(O::build_cold(pv, fw, ip, m, in) == IntelNpuBootParamsError::None);
+  ConstByteView p(page.data(), page.size());
+  CHECK(ld32(p, O::kMagic) == 0x10000 && ld32(p, O::kBootType) == 0 && ld32(p, O::kVpuId) == 0 && ld32(p, O::kSiStepping) == 4);
+  CHECK(ld64(p, O::kSharedBase) == 0x90000000ull && ld32(p, O::kSharedSize) == 256u << 20);
+  CHECK(ld64(p, O::kIpcHeaderStart) == m.global.start && ld32(p, O::kIpcHeaderSize) == 0x1000);
+  CHECK(ld64(p, O::kIpcPayloadStart) == m.global.start + 0x1000 && ld32(p, O::kIpcPayloadSize) == 0x1000);
+  CHECK(ld64(p, O::kPioBase) == 0 && ld32(p, O::kPioSize) == 0);                       // only 37xx has the aliased PIO window
+  CHECK(ld32(p, O::kAutoconfig) == 1 && p[O::kCacheDefaults + 2] == 1 && p[O::kCacheDefaults + 3] == 1);   // 0x80000000 >> 31
+  CHECK(ld64(p, O::kShaveNnBase) == m.shave.start && ld32(p, O::kWatchdogMss) == 32 && ld32(p, O::kWatchdogNce) == 33);
+  CHECK(ld64(p, O::kDeviceId) == 0x643E && ld64(p, O::kSku) == 0x55 && ld64(p, O::kFeatureExclusion) == 0);
+  CHECK(ld32(p, O::kMinRatio) == 8 && ld32(p, O::kPnRatio) == 0x10 && ld32(p, O::kMaxRatio) == 0x30);
+  CHECK(ld32(p, O::kTraceLevel) == 2 && ld32(p, O::kTraceDestination) == 2 && ld64(p, O::kTraceFormats) == 1 && ld64(p, O::kTraceHwComponents) == ~0ull);
+  CHECK(ld64(p, O::kCritBufAddr) == in.crit_log_addr && ld32(p, O::kCritBufSize) == 0x1000 && ld64(p, O::kVerboseBufAddr) == in.verbose_log_addr && ld32(p, O::kVerboseBufSize) == 0x8000);
+  CHECK(ld64(p, O::kTelemetryBase) == 0x1234 && ld64(p, O::kTelemetrySize) == 0x80 && ld32(p, O::kTelemetryEnable) == 1);
+  CHECK(ld32(p, O::kSchedulingMode) == 1 && ld32(p, O::kFocusPresentTimer) == 1000 && ld32(p, O::kD0i3DelayedEntry) == 1);
+  CHECK(ld32(p, O::kPowerProfile) == 2 && ld32(p, O::kEccMcaSignal) == 3 && ld64(p, O::kSystemTime) == in.system_time_us);
+  uint32_t nonzero = 0;
+  for (size_t i = 0; i < page.size(); ++i) nonzero += page[i] != 0;
+  CHECK(nonzero < 120);  // the 0xAA fill is gone: the whole page was written
+  // 37xx: aliased PIO window is the user range; OS scheduler leaves the focus timer at zero.
+  { const IntelNpuIp i37 = IntelNpuIp::Ip37xx; const IntelNpuMemoryMap m37 = IntelNpuMemoryMap::for_ip(i37);
+    Bytes f37 = make_firmware(i37); st32(f37, 84 + 16, (3u << 16) | 10);
+    const IntelNpuFirmware w = parse(f37, i37);
+    Bytes pg(4096); ByteView v(pg.data(), pg.size()); IntelNpuBootInputs in37 = boot_inputs(m37);
+    CHECK(O::build_cold(v, w, i37, m37, in37) == IntelNpuBootParamsError::None);
+    ConstByteView c(pg.data(), pg.size());
+    CHECK(ld64(c, O::kPioBase) == 0xa0000000ull && ld32(c, O::kPioSize) == 511u << 20 && ld32(c, O::kSchedulingMode) == 0 && ld32(c, O::kFocusPresentTimer) == 0);
+    CHECK(c[O::kCacheDefaults + 3] == 0x180000000ull >> 31); }
+  // No SHAVE NN section: the base stays zero.
+  { Bytes f = make_firmware(ip); st32(f, 152, 0); const IntelNpuFirmware w = parse(f, ip); Bytes pg(4096); ByteView v(pg.data(), pg.size());
+    IntelNpuBootInputs i2 = in; i2.shave_nn_addr = 0;
+    CHECK(O::build_cold(v, w, ip, m, i2) == IntelNpuBootParamsError::None && ld64(ConstByteView(pg.data(), pg.size()), O::kShaveNnBase) == 0); }
+  // Refusals.
+  using E = IntelNpuBootParamsError;
+  Bytes small(4095); ByteView sv(small.data(), small.size());
+  CHECK(O::build_cold(sv, fw, ip, m, in) == E::PageSize && O::update_warm(sv, 1, 2, 3) == E::PageSize);
+  { IntelNpuBootInputs b = in; b.ipc_rx_size = 0; CHECK(O::build_cold(pv, fw, ip, m, b) == E::IpcBuffer);
+    b = in; b.ipc_rx_size = 0x2001; CHECK(O::build_cold(pv, fw, ip, m, b) == E::IpcBuffer);
+    b = in; b.ipc_rx_addr = m.global.end - 0x1000; CHECK(O::build_cold(pv, fw, ip, m, b) == E::IpcBuffer);
+    b = in; b.ipc_rx_addr = ~0ull - 0x10; CHECK(O::build_cold(pv, fw, ip, m, b) == E::IpcBuffer);
+    b = in; b.crit_log_addr = 0x1000; CHECK(O::build_cold(pv, fw, ip, m, b) == E::LogBuffer);
+    b = in; b.verbose_log_size = 0; CHECK(O::build_cold(pv, fw, ip, m, b) == E::LogBuffer);
+    b = in; b.shave_nn_addr = m.shave.end - 0x1000; CHECK(O::build_cold(pv, fw, ip, m, b) == E::ShaveAddress); }
+  // Warm boot changes only the varying fields.
+  O::build_cold(pv, fw, ip, m, in);
+  Bytes before = page;
+  CHECK(O::update_warm(pv, 1000, 2000, 3000) == E::None);
+  CHECK(ld32(p, O::kBootType) == 1 && ld64(p, O::kD0i3Residency) == 1000 && ld64(p, O::kD0i3EntryTs) == 2000 && ld64(p, O::kSystemTime) == 3000 && ld64(p, O::kSaveRestoreRet) == 0);
+  uint32_t changed = 0;
+  for (size_t i = 0; i < page.size(); ++i) changed += page[i] != before[i];
+  CHECK(changed > 0 && changed < 8 + 8 + 8 + 4 + 1);
+}
+
+static void test_load_and_start() {
+  const IntelNpuIp ip = IntelNpuIp::Ip40xx;
+  const IntelNpuMemoryMap m = IntelNpuMemoryMap::for_ip(ip);
+  const Bytes file = make_firmware(ip);
+  const IntelNpuFirmware fw = parse(file, ip);
+  Bytes rt(fw.runtime_size, 0xAA);
+  ByteView rv(rt.data(), rt.size());
+  CHECK(IntelNpuBoot::load_image(rv, fw));
+  CHECK(fw.image_load_offset == 0 && rt[fw.image_load_offset] == file[IntelNpuFirmware::kFileImageOffset] && rt[fw.image_load_offset + 0x3FFF] == file[IntelNpuFirmware::kFileImageOffset + 0x3FFF]);
+  CHECK(rt.back() == 0 && rt[0x4000] == 0);  // the memory after the image is cleared too
+  Bytes wrong(fw.runtime_size - 1);
+  CHECK(!IntelNpuBoot::load_image(ByteView(wrong.data(), wrong.size()), fw) && !IntelNpuBoot::load_image(rv, IntelNpuFirmware()));
+
+  auto run = [&](SimNpu& n, const IntelNpuBootInputs& in, Bytes& page, Bytes& runtime) {
+    IntelNpuHw h = n.hw();
+    h.read_info();
+    IntelNpuBootMemory mem{ByteView(page.data(), page.size()), ByteView(runtime.data(), runtime.size())};
+    return intel_npu_start(h, fw, ip, m, in, mem);
+  };
+  { SimNpu n(0x643E); Bytes page(4096), runtime(fw.runtime_size);
+    n.btrs.regs[0x150] = 0x1 | (0x2u << 1);  // a tile fused off: it must reach the firmware through the page, not through the caller's inputs
+    IntelNpuBootInputs in = boot_inputs(m); in.min_ratio = in.max_ratio = in.pn_ratio = 1; in.tile_fuse = 0;
+    const IntelNpuStartResult r = run(n, in, page, runtime);
+    CHECK(r.ok && r.stage == IntelNpuStartStage::Done);
+    ConstByteView p(page.data(), page.size());
+    CHECK(ld32(p, IntelNpuBoot::kMinRatio) == 8 && ld32(p, IntelNpuBoot::kMaxRatio) == 0x30 && ld32(p, IntelNpuBoot::kPnRatio) == 0x10 && ld64(p, IntelNpuBoot::kFeatureExclusion) == 2);
+    CHECK(runtime[fw.image_load_offset] == file[IntelNpuFirmware::kFileImageOffset] && runtime[fw.image_load_offset + 5] == file[IntelNpuFirmware::kFileImageOffset + 5]);
+    CHECK(n.ip.writes64[0x40040] == (fw.cold_boot_entry_point << 3)); }          // the CPU was started at the firmware's entry point
+  { SimNpu n(0x643E); Bytes page(4096), runtime(fw.runtime_size); n.island_stuck = true;
+    const IntelNpuStartResult r = run(n, boot_inputs(m), page, runtime);
+    CHECK(!r.ok && r.stage == IntelNpuStartStage::PowerUp && r.hw_step == IntelNpuStep::PowerDomain && n.ip.writes64.empty()); }   // no CPU start after a failed power-up
+  { SimNpu n(0x643E); Bytes page(4096), runtime(fw.runtime_size); n.cpu_noc_refused = true;
+    const IntelNpuStartResult r = run(n, boot_inputs(m), page, runtime);
+    CHECK(!r.ok && r.stage == IntelNpuStartStage::CpuBoot && r.hw_step == IntelNpuStep::CpuNoc); }
+  { SimNpu n(0x643E); Bytes page(4096), runtime(fw.runtime_size); IntelNpuBootInputs in = boot_inputs(m); in.ipc_rx_size = 3;
+    const IntelNpuStartResult r = run(n, in, page, runtime);
+    CHECK(!r.ok && r.stage == IntelNpuStartStage::BootParams && r.params_error == IntelNpuBootParamsError::IpcBuffer && n.btrs.regs.count(0x13C) == 0 ); }  // nothing powered
+  { SimNpu n(0x643E); Bytes page(4096), runtime(fw.runtime_size - 4096);
+    const IntelNpuStartResult r = run(n, boot_inputs(m), page, runtime);
+    CHECK(!r.ok && r.stage == IntelNpuStartStage::Memory); }
+  { SimNpu n(0x643E); Bytes page(100), runtime(fw.runtime_size);
+    CHECK(!run(n, boot_inputs(m), page, runtime).ok); }
+}
+
 // Whatever the registers read, every sequence ends (with a result or a refusal) and never touches an offset outside the windows.
 static void test_chaos() {
   const uint16_t ids[] = {0x7D1D, 0x643E, 0xB03E, 0xD71D};
@@ -228,6 +460,10 @@ int main() {
   test_power_up();
   test_failures();
   test_boot();
+  test_firmware_parse();
+  test_firmware_corruption();
+  test_boot_params();
+  test_load_and_start();
   test_chaos();
   if (g_failed) { printf("IntelNpuHwTest: %d failed\n", g_failed); return 1; }
   printf("IntelNpuHwTest: ok\n");

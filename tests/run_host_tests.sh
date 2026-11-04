@@ -230,7 +230,7 @@ for t in "${WANTED[@]}"; do
     UsbMidiTest) build_and_run UsbMidiTest tests/UsbMidiTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp \
                    src/Midi/LiveSynth.cpp src/Math/FloatMath.cpp src/Hardware/MidiDevice/Usb/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp \
                    src/Audio/AudioPlayer.cpp ;;
-    IntelNpuHwTest) build_and_run IntelNpuHwTest tests/IntelNpuHwTest.cpp tests/KernelStubs.cpp src/Hardware/NeuralProcessingUnit/Intel/IntelNpuHw.cpp ;;
+    IntelNpuHwTest) build_and_run IntelNpuHwTest tests/IntelNpuHwTest.cpp tests/KernelStubs.cpp src/Hardware/NeuralProcessingUnit/Intel/IntelNpuHw.cpp src/Hardware/NeuralProcessingUnit/Intel/IntelNpuFirmware.cpp ;;
     IntelGenerationTest) build_and_run IntelGenerationTest tests/IntelGenerationTest.cpp tests/KernelStubs.cpp src/Hardware/CentralProcessingUnit/X86_64Cpu.cpp src/Hardware/CentralProcessingUnit/Intel/IntelX64Cpu.cpp src/Hardware/CentralProcessingUnit/Intel/IntelGenerations.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Intel/IntelMediaEngineHw.cpp ;;
     AmdGenerationTest) build_and_run AmdGenerationTest tests/AmdGenerationTest.cpp tests/KernelStubs.cpp src/Hardware/CentralProcessingUnit/X86_64Cpu.cpp src/Hardware/CentralProcessingUnit/AMD/AmdGenerations.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp ;;
     AmdDiscoveryTest) build_and_run AmdDiscoveryTest tests/AmdDiscoveryTest.cpp tests/KernelStubs.cpp src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp src/Hardware/VideoCodec/AMD/AmdMediaEngineHw.cpp ;;

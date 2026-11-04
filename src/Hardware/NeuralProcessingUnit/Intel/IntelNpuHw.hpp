@@ -93,8 +93,9 @@ const char* intel_npu_step_name(IntelNpuStep step);
 
 // The hardware side of the Linux ivpu driver as far as the host goes: reading the fuses, asking the buttress for a work point, bringing the
 // IP block's clocks, reset, power island and NoC queues up, and starting the NPU's CPU at a firmware entry point (ivpu_hw_btrs.c, ivpu_hw_ip.c,
-// ivpu_hw.c: ivpu_hw_power_up). Not here yet, because each needs the firmware image or the IOMMU-style MMU of the NPU: loading the firmware and its boot
-// parameters, the NPU MMU and its page tables, the IPC and job queues (the "JSM" messages), interrupts, and the power-down/reset path.
+// ivpu_hw.c: ivpu_hw_power_up). The firmware image, its boot parameters and the load-power-up-boot sequence are in IntelNpuFirmware.hpp. Not here yet:
+// the NPU MMU and its page tables (which must map the firmware's memory before the CPU starts), the IPC and job queues (the "JSM" messages and the
+// ready message the firmware sends), interrupts, and the power-down/reset path.
 // `ip` is BAR 0, `buttress` is BAR 4 (ivpu's regv and regb).
 class IntelNpuHw {
  public:
