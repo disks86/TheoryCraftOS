@@ -447,9 +447,15 @@ functions named `<prefix>_<Method>` in the sources (run it after adding a method
   texture copies with the footprints, clears, draws (instanced, indexed), dispatch, root constants / descriptors / tables, depth testing, blending, stencil, `Map` of upload and readback buffers,
   `CheckFeatureSupport`. A command list records the kernel's command stream (`CommandStream.hpp`) in chunks of at most 64 KiB and 1000 allocations and `ExecuteCommandLists` renders them; the CPU
   copy of an upload buffer goes to the kernel before every execution, a readback buffer is read when it is mapped; GPU addresses are made up (a 64 KiB aligned range per buffer).
-  The kernel's model limits what a program can do: one vertex buffer, four float vertex attributes, two sampled textures per draw, four unordered access buffers, 64 KiB of shader per
-  pipeline, no depth-only pass (a depth clear waits for the next pass with a colour target), no multisampling or 1D textures, mip chains and arrays only on sampled textures, buffer SRVs only on
-  buffers made with unordered access, no texture UAVs, no resource state validation (barriers are ignored but aliasing ones). Also (`extras.inc`): **queries** (occlusion, binary occlusion, timestamps; `ResolveQueryData` is a `CopyBuffer` from the query buffer), **`ExecuteIndirect`** (the kernel has no indirect
+  What a program can use is what the adapter's graphics device takes: `DeviceInfo::limits` (vertex inputs, interpolants, texture units, render targets, vertex buffers) reaches
+  the kernel's `AdapterCaps`, the UMDRIVERPRIVATE blob and `CheckFeatureSupport`, which says feature level 11_0 only when the device has 16 inputs, 16 interpolants, 16 texture units and
+  8 targets (else 9_3 or 9_1, and `D3D12CreateDevice` refuses a minimum level above it). The CPU renderer takes all of the capacity (16, 16, 16, 8 and 8 vertex buffers: up to 16 float vertex
+  attributes from up to 8 input slots, per-vertex or per-instance, 16 sampled textures, 8 render targets with independent blending); the GPU backends say what their encoders were made
+  for (virgl, SVGA3D, Gen9, Vega M, V3D: 4, 4, 2, 4 and 1), and a pipeline, shader or stream that needs more is refused with `DXGI_ERROR_UNSUPPORTED`. Still the kernel's model, whatever the
+  device: vertex attributes of one to four 32-bit floats, four unordered access and four buffer shader resource buffers (and those only on buffers made with unordered access), no depth-only
+  pass (a depth clear waits for the next pass with a colour target), no multisampling or 1D textures, mip chains and arrays only on sampled textures, no texture UAVs, sampler addresses
+  that repeat or clamp, and no resource state validation (barriers are ignored but aliasing ones).
+  Also (`extras.inc`): **queries** (occlusion, binary occlusion, timestamps; `ResolveQueryData` is a `CopyBuffer` from the query buffer), **`ExecuteIndirect`** (the kernel has no indirect
   draw: the list keeps a copy of its state at the call and the commands are recorded when the list is executed, after the argument buffer's producers ran; draw, indexed draw, dispatch, root
   constants and views, vertex and index buffer arguments, with a count buffer), **bundles** (the calls are logged and made again on the list that executes the bundle) and **tiled
   resources** (`CreateReservedResource` of buffers and of 4-byte colour textures in whole 128 x 128 tiles, with mip chains: the levels below a tile in either direction are the

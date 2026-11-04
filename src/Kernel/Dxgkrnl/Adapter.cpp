@@ -284,7 +284,7 @@ class Adapter::StreamRunner {
     // Further colour targets, one word each (the adapter's kFeatureMultipleTargets).
     Allocation* extras[graphics::kMaxColorTargets - 1] = {};
     uint32_t extra_count = 0;
-    while (!p.at_end() && p.ok() && extra_count < graphics::kMaxColorTargets - 1) {
+    while (!p.at_end() && p.ok() && extra_count < adapter_.caps_.max_color_targets - 1) {
       extras[extra_count] = alloc(p.le32());
       if (!extras[extra_count]) return kBad;
       ++extra_count;
@@ -470,16 +470,18 @@ class Adapter::StreamRunner {
 
   NtStatus bind_vertex_buffer(ByteReader& p) {
     const uint32_t index = p.le32(), offset = p.le32();
-    if (!exact(p)) return kBad;
+    uint32_t slot = 0;
+    if (!p.at_end()) slot = p.le32();      // (a third word: the vertex buffer slot, below the device's DeviceLimits::vertex_buffers)
+    if (!exact(p) || slot >= adapter_.caps_.max_vertex_buffers) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_buffer() || !(a->desc().flags & kAllocVertexBuffer) || offset > a->desc().size || !use(a, state::kVertexAndConstantBuffer)) return kBad;
-    vertex_ = a;
-    vertex_offset_ = offset;
+    vertex_[slot] = a;
+    vertex_offset_[slot] = offset;
     if (!exec_) return status::kSuccess;
     NtStatus s = resident(*a);
     if (s == status::kSuccess) s = ensure_cb();
     if (s != status::kSuccess) return s;
-    cb_->bind_vertex_buffer(a->buffer(), offset);
+    cb_->bind_vertex_buffer_slot(slot, a->buffer(), offset);
     return status::kSuccess;
   }
 
@@ -517,7 +519,7 @@ class Adapter::StreamRunner {
   NtStatus bind_texture(ByteReader& p) {
     const uint32_t unit = p.le32(), index = p.le32(), filter = p.le32(), au = p.le32(), av = p.le32(), mip = p.le32();
     const float bias = bits_float(p.le32()), min_lod = bits_float(p.le32()), max_lod = bits_float(p.le32());
-    if (!exact(p) || unit >= graphics::kMaxTextureUnits || filter > 1 || au > 1 || av > 1 || mip > 2) return kBad;
+    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || au > 1 || av > 1 || mip > 2) return kBad;
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return kBad;
     Allocation* a = alloc(index);
     if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->is_staging() || !use(a, state::kPixelShaderResource | state::kNonPixelShaderResource)) return kBad;
@@ -605,26 +607,30 @@ class Adapter::StreamRunner {
       if (made != pipeline_->geometry_input()) return kBad;
     }
     const bool vertices = pipeline_->attribute_count() > 0;
-    if (vertices && !vertex_) return kBad;
-    const uint64_t stride = pipeline_->vertex_stride();
+    // Every vertex buffer the attributes read is bound, and the vertices the draw reads (per vertex) and the instances (per instance) are inside it.
+    for (uint32_t slot = 0; slot < graphics::kMaxVertexBuffers; ++slot) {
+      if (!(pipeline_->vertex_slots() >> slot & 1)) continue;
+      if (!vertex_[slot]) return kBad;
+      const uint64_t stride = pipeline_->slot_stride(slot);
+      if (pipeline_->per_instance_slots() >> slot & 1) {
+        const uint64_t end = uint64_t{first_instance} + instance_count;
+        if (vertex_offset_[slot] + end * stride > vertex_[slot]->desc().size) return kBad;
+      }
+      if (!indexed && (pipeline_->per_vertex_slots() >> slot & 1)) {
+        const uint64_t end = uint64_t{first} + count;   // (times a stride of at most 2048: < 2^44)
+        if (vertex_offset_[slot] + end * stride > vertex_[slot]->desc().size) return kBad;
+      }
+    }
     if (indexed) {
       if (!index_) return kBad;
       const uint64_t end = uint64_t{first} + count;   // (< 2^33, times a 4-byte index < 2^35)
       if (index_offset_ + end * index_bytes_ > index_->desc().size) return kBad;
-    } else if (vertices) {
-      const uint64_t end = uint64_t{first} + count;   // (times a stride of at most 2048: < 2^44)
-      if (vertex_offset_ + end * stride > vertex_->desc().size) return kBad;
-    }
-    // The per-instance attributes are read from the instances' elements of the vertex buffer.
-    if (pipeline_->has_per_instance()) {
-      const uint64_t end = uint64_t{first_instance} + instance_count;
-      if (vertex_offset_ + end * stride > vertex_->desc().size) return kBad;
     }
     if (count == 0) return status::kSuccess;
     if (!exec_) return status::kSuccess;
 
-    if (indexed && vertices) {
-      // The index values: every vertex the draw can reach must be inside the vertex buffer.
+    if (indexed && vertices && pipeline_->per_vertex_slots()) {
+      // The index values: every vertex the draw can reach must be inside the vertex buffers.
       ByteReader in(index_->backing());
       in.skip(index_offset_ + uint64_t{first} * index_bytes_);
       int64_t highest = -1;
@@ -636,7 +642,8 @@ class Adapter::StreamRunner {
         if (!in.ok() || v < 0) return kBad;
         if (v > highest) highest = v;
       }
-      if (vertex_offset_ + static_cast<uint64_t>(highest + 1) * stride > vertex_->desc().size) return kBad;
+      for (uint32_t slot = 0; slot < graphics::kMaxVertexBuffers; ++slot)
+        if ((pipeline_->per_vertex_slots() >> slot & 1) && vertex_offset_[slot] + static_cast<uint64_t>(highest + 1) * pipeline_->slot_stride(slot) > vertex_[slot]->desc().size) return kBad;
     }
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
@@ -1114,7 +1121,7 @@ class Adapter::StreamRunner {
               const NtStatus s = lower_uav(graphics::kMaxUavBuffers + reg, d.allocation.get(), d.offset, d.size);
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Srv && d.kind == DescriptorKind::Srv) {
-              if (reg >= graphics::kMaxTextureUnits) return kBad;
+              if (reg >= adapter_.caps_.max_texture_units) return kBad;
               const NtStatus s = lower_texture(reg, d.allocation.get(), sampler_for(reg));
               if (s != status::kSuccess) return s;
             } else if (range.type == RangeType::Uav && d.kind == DescriptorKind::Uav) {
@@ -1222,8 +1229,8 @@ class Adapter::StreamRunner {
   Allocation* so_alloc_[graphics::kMaxStreamOutputBuffers] = {};
   bool uav_bound_[graphics::kMaxStorageBuffers] = {};
   Allocation* uav_alloc_[graphics::kMaxStorageBuffers] = {};
-  Allocation* vertex_ = nullptr;
-  uint64_t vertex_offset_ = 0;
+  Allocation* vertex_[graphics::kMaxVertexBuffers] = {};
+  uint64_t vertex_offset_[graphics::kMaxVertexBuffers] = {};
   Allocation* index_ = nullptr;
   uint64_t index_offset_ = 0;
   uint32_t index_bytes_ = 2;
@@ -1243,9 +1250,13 @@ Adapter::Adapter(allocators::IAllocator& allocator, graphics::IGraphicsDevice& d
     : allocator_(allocator), device_(device), display_(config.display), index_(index), luid_(luid), vidmm_(allocator, device, config.local_memory_budget, config.system_memory_limit), contexts_(allocator) {
   const graphics::DeviceInfo info = device.info();
   caps_.max_texture_dimension = kMaxTextureDimension;
-  caps_.max_vertex_attributes = graphics::kMaxVertexAttributes;
-  caps_.max_varyings = graphics::kMaxVaryings;
-  caps_.max_texture_units = graphics::kMaxTextureUnits;
+  // What the device takes (DeviceInfo::limits, never more than the capacity of the structures).
+  auto limit = [](uint32_t value, uint32_t capacity) { return value < capacity ? value : capacity; };
+  caps_.max_vertex_attributes = limit(info.limits.vertex_attributes, graphics::kMaxVertexAttributes);
+  caps_.max_varyings = limit(info.limits.varyings, graphics::kMaxVaryings);
+  caps_.max_texture_units = limit(info.limits.texture_units, graphics::kMaxTextureUnits);
+  caps_.max_color_targets = limit(info.limits.color_targets, graphics::kMaxColorTargets);
+  caps_.max_vertex_buffers = limit(info.limits.vertex_buffers, graphics::kMaxVertexBuffers);
   caps_.max_push_constant_bytes = info.max_push_constant_bytes < graphics::kMaxPushConstantBytes ? info.max_push_constant_bytes : graphics::kMaxPushConstantBytes;
   caps_.max_vertex_stride = kMaxVertexStride;
   caps_.accelerated = info.accelerated;
@@ -1334,12 +1345,15 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
       const NtStatus s = desc.kind == ShaderKind::Dxbc ? D3d9Program::compile_dxbc(allocator_, desc.code, &program) : D3d9Program::compile(allocator_, desc.code, &program);
       if (s != status::kSuccess) return s;
       if (program->constant_bytes() > caps_.max_push_constant_bytes) return status::kNotSupported;
+      if (program->attributes_used() > caps_.max_vertex_attributes) return status::kNotSupported;      // (a vertex input the device does not have)
+      if (program->texture_unit_mask() >> caps_.max_texture_units) return status::kNotSupported;      // (a texture unit the device does not have)
+      if (program->stage() == graphics::ShaderStage::Fragment && program->color_output_count() > caps_.max_color_targets) return status::kNotSupported;
       if (program->required_features() & ~caps_.features) return status::kNotSupported;   // (system values, texel access: the device must have them)   // (more constants than this device is given)
       // A GPU device (virgl) takes the shader as TGSI text; the others run it through the interpreter's native function. Both are given: each device uses what it understands.
       // A shader the text cannot say (see D3d9Tgsi.cpp) is still fine for the interpreter.
       const graphics::ShaderStage stage = program->stage();
       String text(allocator_);
-      const NtStatus t = program->emit_tgsi(&text);
+      const NtStatus t = program->emit_tgsi(&text, caps_.max_varyings);
       if (t == status::kNoMemory) return t;
       if (t == status::kSuccess) {
         shader->text_ = allocate_view<uint8_t>(allocator_, text.size() + 1);
@@ -1438,13 +1452,17 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
 NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<ShaderObject>& vertex, const SharedPointer<ShaderObject>& fragment, SharedPointer<PipelineObject>* out,
                                   const SharedPointer<ShaderObject>& geometry, const SharedPointer<ShaderObject>& hull, const SharedPointer<ShaderObject>& domain) {
   if (!vertex || !fragment || vertex->stage() != graphics::ShaderStage::Vertex || fragment->stage() != graphics::ShaderStage::Fragment) return status::kInvalidParameter;
-  if (d.vertex_stride > kMaxVertexStride || d.attribute_count > graphics::kMaxVertexAttributes || d.varying_count > graphics::kMaxVaryings || d.texture_count > graphics::kMaxTextureUnits)
+  if (d.vertex_stride > kMaxVertexStride || d.attribute_count > caps_.max_vertex_attributes || d.varying_count > caps_.max_varyings || d.texture_count > caps_.max_texture_units)
     return status::kInvalidParameter;
-  if (d.attribute_count > 0 && d.vertex_stride == 0) return status::kInvalidParameter;
+  for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s)
+    if (d.slot_strides[s] > kMaxVertexStride) return status::kInvalidParameter;
+  uint32_t vertex_slots = 0, instance_slots = 0;
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
     const graphics::VertexAttribute& a = d.attributes[i];
-    if (a.location >= graphics::kMaxVertexAttributes || static_cast<uint32_t>(a.format) > static_cast<uint32_t>(graphics::VertexFormat::Float4)) return status::kInvalidParameter;
-    if (a.offset > d.vertex_stride || vertex_format_bytes(a.format) > d.vertex_stride - a.offset) return status::kInvalidParameter;
+    if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) > static_cast<uint32_t>(graphics::VertexFormat::Float4)) return status::kInvalidParameter;
+    const uint32_t stride = a.slot == 0 ? d.vertex_stride : d.slot_strides[a.slot];
+    if (stride == 0 || a.offset > stride || vertex_format_bytes(a.format) > stride - a.offset) return status::kInvalidParameter;
+    (a.per_instance ? instance_slots : vertex_slots) |= 1u << a.slot;
   }
   const graphics::StencilState& st = d.stencil;
   if (static_cast<uint32_t>(d.cull_mode) > 2 || static_cast<uint32_t>(d.front_face) > 1 || static_cast<uint32_t>(st.compare) > 7 || static_cast<uint32_t>(st.fail_op) > 7 ||
@@ -1491,13 +1509,14 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if ((bs.custom || d.depth_compare != graphics::CompareOp::LessEqual) && !(caps_.features & graphics::kFeatureBlendState)) return status::kNotSupported;
   for (uint32_t i = 0; i < d.attribute_count; ++i)
     if (d.attributes[i].per_instance && !(caps_.features & graphics::kFeatureInstancing)) return status::kNotSupported;
-  if (d.color_target_count == 0 || d.color_target_count > graphics::kMaxColorTargets) return status::kInvalidParameter;
+  if (d.color_target_count == 0 || d.color_target_count > caps_.max_color_targets) return status::kInvalidParameter;
   if (d.color_target_count > 1 && !(caps_.features & graphics::kFeatureMultipleTargets)) return status::kNotSupported;
 
   graphics::GraphicsPipelineDesc pd;
   pd.vertex_shader = vertex->module();
   pd.fragment_shader = fragment->module();
   pd.vertex_stride = d.vertex_stride;
+  for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s) pd.slot_strides[s] = d.slot_strides[s];
   pd.attribute_count = d.attribute_count;
   for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
   pd.varying_count = d.varying_count;
@@ -1541,6 +1560,9 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   if (geometry) pipeline->geometry_input_ = geometry->geometry_input();
   for (uint32_t e = 0; e < d.stream_output_count; ++e) pipeline->stream_output_buffers_ |= 1u << d.stream_output[e].buffer;
   pipeline->stride_ = d.vertex_stride;
+  pipeline->vertex_slot_mask_ = vertex_slots;
+  pipeline->instance_slot_mask_ = instance_slots;
+  for (uint32_t s = 1; s < graphics::kMaxVertexBuffers; ++s) pipeline->slot_strides_[s] = d.slot_strides[s];
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;
   pipeline->texture_count_ = d.texture_count;

@@ -104,6 +104,11 @@ class PipelineObject {
   PipelineObject& operator=(const PipelineObject&) = delete;
   const graphics::IPipeline* pipeline() const { return pipeline_; }
   uint32_t vertex_stride() const { return stride_; }
+  // The vertex buffers (slots) the attributes read, which of them per vertex and which per instance, and the stride of each.
+  uint32_t vertex_slots() const { return vertex_slot_mask_ | instance_slot_mask_; }
+  uint32_t per_vertex_slots() const { return vertex_slot_mask_; }
+  uint32_t per_instance_slots() const { return instance_slot_mask_; }
+  uint32_t slot_stride(uint32_t slot) const { return slot == 0 ? stride_ : slot_strides_[slot]; }
   uint32_t attribute_count() const { return attribute_count_; }
   uint32_t texture_count() const { return texture_count_; }
   uint32_t color_target_count() const { return color_target_count_; }
@@ -143,6 +148,7 @@ class PipelineObject {
   bool fragment_stores_ = false, vertex_stores_ = false, geometry_stores_ = false, tessellation_stores_ = false;
   SharedPointer<ShaderObject> vertex_, fragment_;   // (kept alive for as long as the pipeline is)
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};
+  uint32_t vertex_slot_mask_ = 0, instance_slot_mask_ = 0, slot_strides_[graphics::kMaxVertexBuffers] = {};
   uint32_t stride_ = 0, attribute_count_ = 0, texture_count_ = 0, color_target_count_ = 1;
 };
 

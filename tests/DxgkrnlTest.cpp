@@ -1286,7 +1286,7 @@ void test_d3d9_bytecode() {
         UniquePointer<D3d9Program> p;
         if (D3d9Program::compile(e.allocator, ConstByteView(t.data(), t.size()), &p) == status::kSuccess) {
           ++compiled;
-          graphics::Vec4 attrs[4] = {}, vary[4] = {};
+          graphics::Vec4 attrs[16] = {}, vary[16] = {};
           graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
           graphics::Vec4& color = color_room[0];
           alignas(16) uint8_t constants[128] = {};
@@ -1748,7 +1748,7 @@ struct TgsiCheck {
         for (unsigned k = 0; k < 4; ++k) m.cst[i][k] = kConstants[set][i][k];
       bool same = true;
       if (program->stage() == graphics::ShaderStage::Vertex) {
-        graphics::Vec4 attributes[4];
+        graphics::Vec4 attributes[16];
         for (unsigned i = 0; i < 4; ++i) {
           attributes[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
           for (unsigned k = 0; k < 4; ++k) m.in[i][k] = kInputs[set][i][k];
@@ -1764,7 +1764,7 @@ struct TgsiCheck {
             for (unsigned k = 0; k < 4; ++k) same = same && near_value(m.out[o][k], want[o][k]);
         }
       } else {
-        graphics::Vec4 varyings[4];
+        graphics::Vec4 varyings[16];
         for (unsigned i = 0; i < 4; ++i) {
           varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
           for (unsigned k = 0; k < 4; ++k) m.in[i][k] = kInputs[set][i][k];
@@ -2191,7 +2191,7 @@ int roundtrip_agrees(HostAllocator& allocator, const D3d9Program& original, cons
     uint8_t constants[128];
     for (unsigned i = 0; i < 8; ++i)
       for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-    graphics::Vec4 values[4];
+    graphics::Vec4 values[16];
     for (unsigned i = 0; i < 4; ++i) values[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
     auto same = [](const graphics::Vec4& x, const graphics::Vec4& y) {
       const float xs[4] = {x.x, x.y, x.z, x.w}, ys[4] = {y.x, y.y, y.z, y.w};
@@ -2246,7 +2246,7 @@ void test_dxbc() {
         uint8_t constants[128];
         for (unsigned i = 0; i < 8; ++i)
           for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-        graphics::Vec4 attributes[4];
+        graphics::Vec4 attributes[16];
         for (unsigned i = 0; i < 4; ++i) attributes[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
         graphics::ShaderIo a = {}, b = {};
         pd->run_vertex(attributes, constants, &a);
@@ -2342,7 +2342,7 @@ void test_dxbc() {
           uint8_t constants[128];
           for (unsigned i = 0; i < 8; ++i)
             for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-          graphics::Vec4 varyings[4];
+          graphics::Vec4 varyings[16];
           for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
           graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
           graphics::Vec4& color = color_room[0];
@@ -2406,7 +2406,7 @@ void test_dxbc() {
       uint8_t constants[128];
       for (unsigned i = 0; i < 8; ++i)
         for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-      graphics::Vec4 varyings[4];
+      graphics::Vec4 varyings[16];
       for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
       *alive = p->run_fragment(varyings, constants, &textures, color);
       if (set == 0) {
@@ -2637,7 +2637,7 @@ void test_dxbc_real() {
       uint8_t constants[128];
       for (unsigned i = 0; i < 8; ++i)
         for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-      graphics::Vec4 attributes[4], varyings[4];
+      graphics::Vec4 attributes[16], varyings[16];
       for (unsigned i = 0; i < 4; ++i) attributes[i] = varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
       const float(*in)[4] = kInputs[set];
       const float(*cb)[4] = kConstants[set];
@@ -2744,7 +2744,7 @@ void test_dxbc_real() {
           ++compiled;
           String text(allocator);
           p->emit_tgsi(&text);
-          graphics::Vec4 v[4] = {}, col[graphics::kMaxColorTargets];
+          graphics::Vec4 v[16] = {}, col[graphics::kMaxColorTargets];
           uint8_t constants[128] = {};
           p->run_fragment(v, constants, &textures, col);
           graphics::ShaderIo io;
@@ -2756,9 +2756,9 @@ void test_dxbc_real() {
           context.dispatch_id[0] = context.dispatch_id[1] = 5;
           p->run_compute(context, constants);
           // (a geometry shader, given a triangle)
-          graphics::GeometryInputData in;
+          graphics::GeometryInputData in = {};
           for (uint32_t k = 0; k < 3; ++k) in.position[k] = {static_cast<float>(k), 1.0f, 0.5f, 1.0f};
-          graphics::GeometryOutputData out;
+          graphics::GeometryOutputData out = {};
           p->run_geometry(in, constants, &out);
           CHECK(out.count <= graphics::kMaxGeometryVertices);
           // (a hull and a domain shader, given a patch)
@@ -2816,7 +2816,7 @@ void test_device_forms() {
           uint8_t constants[128];
           for (unsigned i = 0; i < 8; ++i)
             for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-          graphics::Vec4 attributes[4];
+          graphics::Vec4 attributes[16];
           for (unsigned i = 0; i < 4; ++i) attributes[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
           graphics::ShaderIo a = {}, b = {};
           program->run_vertex(attributes, constants, &a);
@@ -2905,7 +2905,7 @@ void test_device_forms() {
             memcpy(constants + 4 * i, &f, 4);
             words[i] = __builtin_bit_cast(uint32_t, f);
           }
-          graphics::Vec4 attributes[4] = {{0.3f, -0.4f, 0.7f, 1.0f}, {0.1f, 0.2f, 0.3f, 0.4f}, {}, {}};
+          graphics::Vec4 attributes[16] = {{0.3f, -0.4f, 0.7f, 1.0f}, {0.1f, 0.2f, 0.3f, 0.4f}, {}, {}};
           graphics::ShaderIo shader_out = {}, kernel_out = {};
           p->run_vertex(attributes, constants, &shader_out);
           graphics::kernel_matrix_words(words, k == VertexKernel::MatrixRows, true);
@@ -3040,7 +3040,7 @@ void test_sm3_and_sm51() {
         uint8_t constants[128];
         for (unsigned i = 0; i < 8; ++i)
           for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-        graphics::Vec4 values[4];
+        graphics::Vec4 values[16];
         for (unsigned i = 0; i < 4; ++i) values[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
         if (a->stage() == graphics::ShaderStage::Vertex) {
           graphics::ShaderIo x = {}, y = {};
@@ -3113,7 +3113,7 @@ void test_sm3_and_sm51() {
         uint8_t constants[128];
         for (unsigned i = 0; i < 8; ++i)
           for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-        graphics::Vec4 values[4];
+        graphics::Vec4 values[16];
         for (unsigned i = 0; i < 4; ++i) values[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
         graphics::ShaderIo x = {}, y = {};
         v3->run_vertex(values, constants, &x);
@@ -3144,7 +3144,7 @@ void test_sm3_and_sm51() {
         uint8_t constants[128];
         for (unsigned i = 0; i < 8; ++i)
           for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-        graphics::Vec4 values[4];
+        graphics::Vec4 values[16];
         for (unsigned i = 0; i < 4; ++i) values[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
         graphics::ShaderIo x = {}, y = {};
         v3->run_vertex(values, constants, &x);
@@ -3178,7 +3178,7 @@ void test_sm3_and_sm51() {
           uint8_t constants[128];
           for (unsigned i = 0; i < 8; ++i)
             for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-          graphics::Vec4 values[4];
+          graphics::Vec4 values[16];
           for (unsigned i = 0; i < 4; ++i) values[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
           graphics::ShaderIo x = {}, y = {}, reference = {};
           v1->run_vertex(values, constants, &x);
@@ -3233,7 +3233,7 @@ void test_ps1() {
         uint8_t constants[128];
         for (unsigned i = 0; i < 8; ++i)
           for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-        graphics::Vec4 varyings[4];
+        graphics::Vec4 varyings[16];
         for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
         graphics::Vec4 got = {};
         const bool alive = p->run_fragment(varyings, constants, &textures, &got);
@@ -3363,7 +3363,7 @@ void test_ps1() {
           uint8_t constants[128];
           for (unsigned i = 0; i < 8; ++i)
             for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-          graphics::Vec4 varyings[4];
+          graphics::Vec4 varyings[16];
           for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
           graphics::Vec4 c = {};
           ok = ok && p->run_fragment(varyings, constants, nullptr, &c);
@@ -3411,7 +3411,7 @@ void test_ps1() {
           ++compiled;
           String text(allocator);
           p->emit_tgsi(&text);
-          graphics::Vec4 v[4] = {}, c;
+          graphics::Vec4 v[16] = {}, c;
           uint8_t constants[128] = {};
           p->run_fragment(v, constants, &textures, &c);
         } else {
@@ -5013,6 +5013,111 @@ void test_reserved_mip_tail() {
   CHECK(e.kernel.escape(kPid, e.dev, ConstByteView(reinterpret_cast<const uint8_t*>(request), 8), ByteView(reinterpret_cast<uint8_t*>(reply), 16), &reply_bytes) == status::kInvalidParameter);   // (not a stream output buffer)
 }
 
+// The software renderer behind a device that reports the limits of the fixed pipelines (DeviceInfo::limits at their defaults): what the device takes is checked against what it says.
+class NarrowDevice final : public graphics::IGraphicsDevice {
+ public:
+  explicit NarrowDevice(graphics::IGraphicsDevice& inner) : inner_(inner) {}
+  graphics::DeviceInfo info() const override {
+    graphics::DeviceInfo i = inner_.info();
+    i.limits = graphics::DeviceLimits();
+    return i;
+  }
+  graphics::IBuffer* create_buffer(uint64_t size, uint32_t usage) override { return inner_.create_buffer(size, usage); }
+  void destroy_buffer(graphics::IBuffer* b) override { inner_.destroy_buffer(b); }
+  graphics::IImage* create_image(const graphics::ImageDesc& d) override { return inner_.create_image(d); }
+  void destroy_image(graphics::IImage* i) override { inner_.destroy_image(i); }
+  graphics::IShaderModule* create_shader_module(const graphics::ShaderModuleDesc& d) override { return inner_.create_shader_module(d); }
+  void destroy_shader_module(graphics::IShaderModule* m) override { inner_.destroy_shader_module(m); }
+  graphics::IPipeline* create_graphics_pipeline(const graphics::GraphicsPipelineDesc& d) override { return inner_.create_graphics_pipeline(d); }
+  graphics::IPipeline* create_compute_pipeline(const graphics::IShaderModule* s) override { return inner_.create_compute_pipeline(s); }
+  void destroy_pipeline(graphics::IPipeline* p) override { inner_.destroy_pipeline(p); }
+  graphics::ICommandBuffer* create_command_buffer() override { return inner_.create_command_buffer(); }
+  void destroy_command_buffer(graphics::ICommandBuffer* c) override { inner_.destroy_command_buffer(c); }
+  bool submit(graphics::ICommandBuffer* c) override { return inner_.submit(c); }
+  bool present(graphics::IImage* i) override { return inner_.present(i); }
+
+ private:
+  graphics::IGraphicsDevice& inner_;
+};
+
+void test_device_limits() {
+  HostAllocator allocator;
+  FakeScreen screen(8, 6);
+  graphics::SoftwareDevice software(allocator, &screen);
+  NarrowDevice narrow(software);
+  Kernel kernel(allocator);
+  AdapterConfig config;
+  config.display = &screen;
+  Handle adapter = 0, dev = 0, ctx = 0;
+  CHECK(kernel.add_adapter(narrow, config) == 0);
+  CHECK(kernel.open_process(kPid) == status::kSuccess && kernel.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess);
+  CHECK(kernel.create_device(kPid, adapter, &dev) == status::kSuccess && kernel.create_context(kPid, dev, ContextPriority::Normal, &ctx) == status::kSuccess);
+  AdapterCaps caps;
+  CHECK(kernel.query_adapter_caps(kPid, adapter, &caps) == status::kSuccess);
+  CHECK(caps.max_vertex_attributes == 4 && caps.max_varyings == 4 && caps.max_texture_units == 2 && caps.max_color_targets == 4 && caps.max_vertex_buffers == 1);
+  // the software renderer itself takes the whole capacity
+  Kernel full(allocator);
+  full.add_adapter(software, config);
+  AdapterCaps all;
+  CHECK(full.open_process(kPid) == status::kSuccess);
+  Handle fa = 0;
+  CHECK(full.open_adapter_from_index(kPid, 0, &fa) == status::kSuccess && full.query_adapter_caps(kPid, fa, &all) == status::kSuccess);
+  CHECK(all.max_vertex_attributes == graphics::kMaxVertexAttributes && all.max_varyings == graphics::kMaxVaryings && all.max_texture_units == graphics::kMaxTextureUnits &&
+        all.max_color_targets == graphics::kMaxColorTargets && all.max_vertex_buffers == graphics::kMaxVertexBuffers);
+
+  Handle vs = 0, fs = 0;
+  CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs) == status::kSuccess);
+  CHECK(kernel.create_shader(kPid, dev, {ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs) == status::kSuccess);
+  auto pipeline = [&](auto change) {
+    graphics::GraphicsPipelineDesc d;
+    graphics::describe_colored_pipeline(&d);
+    PipelineDesc pd;
+    pd.vertex_shader = vs, pd.fragment_shader = fs;
+    pd.vertex_stride = d.vertex_stride, pd.attribute_count = d.attribute_count, pd.varying_count = d.varying_count, pd.texture_count = d.texture_count;
+    for (uint32_t i = 0; i < d.attribute_count; ++i) pd.attributes[i] = d.attributes[i];
+    pd.cull_mode = graphics::CullMode::None;
+    change(pd);
+    Handle h = 0;
+    return kernel.create_pipeline(kPid, dev, pd, &h);
+  };
+  CHECK(pipeline([](PipelineDesc&) {}) == status::kSuccess);
+  CHECK(pipeline([](PipelineDesc& pd) { pd.attribute_count = 5; pd.vertex_stride = 80; for (uint32_t i = 0; i < 5; ++i) pd.attributes[i] = {i, graphics::VertexFormat::Float4, i * 16}; }) == status::kInvalidParameter);
+  CHECK(pipeline([](PipelineDesc& pd) { pd.attributes[1].slot = 1; pd.slot_strides[1] = 16; }) == status::kInvalidParameter);      // (a second vertex buffer)
+  CHECK(pipeline([](PipelineDesc& pd) { pd.texture_count = 3; }) == status::kInvalidParameter);
+  CHECK(pipeline([](PipelineDesc& pd) { pd.varying_count = 5; }) == status::kInvalidParameter);
+  CHECK(pipeline([](PipelineDesc& pd) { pd.color_target_count = 5; }) == status::kInvalidParameter);
+  // a pixel shader that samples four textures, and a vertex shader with five inputs, are not for this device either; the full renderer takes them
+  Handle ps4 = 0, vs6 = 0;
+  const std::vector<uint8_t> tex4 = read_blob("ps_tex4.dxbc"), attrs6 = read_blob("vs_attrs6.dxbc");
+  CHECK(kernel.create_shader(kPid, dev, {ShaderKind::Dxbc, graphics::ShaderStage::Fragment, ConstByteView(tex4.data(), tex4.size())}, &ps4) == status::kNotSupported);
+  CHECK(kernel.create_shader(kPid, dev, {ShaderKind::Dxbc, graphics::ShaderStage::Vertex, ConstByteView(attrs6.data(), attrs6.size())}, &vs6) == status::kNotSupported);
+  Handle full_dev = 0;
+  CHECK(full.create_device(kPid, fa, &full_dev) == status::kSuccess);
+  CHECK(full.create_shader(kPid, full_dev, {ShaderKind::Dxbc, graphics::ShaderStage::Fragment, ConstByteView(tex4.data(), tex4.size())}, &ps4) == status::kSuccess);
+  CHECK(full.create_shader(kPid, full_dev, {ShaderKind::Dxbc, graphics::ShaderStage::Vertex, ConstByteView(attrs6.data(), attrs6.size())}, &vs6) == status::kSuccess);
+  // the stream: a texture unit, a pass with more targets, a vertex buffer slot beyond the device's
+  Handle t0 = 0, rt = 0, rt2 = 0, rt3 = 0, rt4 = 0, rt5 = 0, vb = 0;
+  AllocationDesc td;
+  td.flags = kTexture, td.format = Format::A8R8G8B8, td.width = 4, td.height = 4;
+  CHECK(kernel.create_allocation(kPid, dev, td, &t0) == status::kSuccess);
+  td.flags = kTarget;
+  for (Handle* t : {&rt, &rt2, &rt3, &rt4, &rt5}) CHECK(kernel.create_allocation(kPid, dev, td, t) == status::kSuccess);
+  AllocationDesc bd;
+  bd.flags = kAllocVertexBuffer, bd.size = 64;
+  CHECK(kernel.create_allocation(kPid, dev, bd, &vb) == status::kSuccess);
+  auto run = [&](auto record) {
+    CommandWriter w(allocator);
+    record(w);
+    const Handle list[] = {t0, rt, rt2, vb, rt3, rt4, rt5};
+    return kernel.render(kPid, ctx, w.view(), ArrayView<const Handle>(list, 7));
+  };
+  CHECK(run([](CommandWriter& w) { w.bind_texture(1, 0, graphics::SamplerDesc()); }) == status::kSuccess);
+  CHECK(run([](CommandWriter& w) { w.bind_texture(2, 0, graphics::SamplerDesc()); }) == status::kInvalidParameter);
+  CHECK(run([](CommandWriter& w) { w.begin_pass_targets(1, {2, 4, 5}, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0); w.end_pass(); }) == status::kSuccess);      // (four targets)
+  CHECK(run([](CommandWriter& w) { w.begin_pass_targets(1, {2, 4, 5, 6}, kNoAllocation, kPassClearColor, {0, 0, 0, 1}, 1, 0); w.end_pass(); }) == status::kInvalidParameter);      // (a fifth)
+  CHECK(run([](CommandWriter& w) { w.bind_vertex_buffer(3, 0); }) == status::kSuccess);
+}
+
 // Root unordered access views and root constants for a compute shader.
 void test_d3d12_compute() {
   Env e;
@@ -5697,7 +5802,7 @@ void test_gather_register_offsets() {
     return low + (high - low) * static_cast<float>(seed >> 8) / static_cast<float>(1u << 24);
   };
   for (uint32_t n = 0; n < 200; ++n) {
-    graphics::Vec4 varyings[4] = {};
+    graphics::Vec4 varyings[16] = {};
     varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
     varyings[2] = {random(0, 1), random(0, 1), 0, 0};
     uint8_t constants[128] = {};
@@ -5734,7 +5839,7 @@ void test_dxil() {
     CHECK(translated->stage() == graphics::ShaderStage::Fragment && translated->color_output_count() == 1);
     unsigned alive_count = 0;
     for (uint32_t n = 0; n < 200; ++n) {
-      graphics::Vec4 varyings[4] = {};
+      graphics::Vec4 varyings[16] = {};
       varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
       varyings[2] = {random(0, 1), random(0, 1), 0, 0};
       graphics::FragmentContext context;
@@ -5762,7 +5867,7 @@ void test_dxil() {
     if (translated) {
       unsigned early = 0, checked = 0;
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(-1, 2), random(-1, 2), random(-1, 2), random(-1, 2)};
         varyings[2] = {n % 7 == 0 ? random(0, 0.1f) : random(0, 1), random(0, 1), 0, 0};
         const float cx = varyings[0].x, cy = varyings[0].y, cz = varyings[0].z, cw = varyings[0].w, tx = varyings[2].x, ty = varyings[2].y;
@@ -5798,7 +5903,7 @@ void test_dxil() {
     CHECK(load("dxil_ps_gather.dxil", &translated));
     if (translated) {
       for (uint32_t n = 0; n < 200; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[2] = {random(0, 1), random(0, 1), 0, 0};
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
         uint8_t constants[128] = {};
@@ -5848,7 +5953,7 @@ void test_dxil() {
           for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
           *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
         };
-        graphics::Vec4 varyings[4];
+        graphics::Vec4 varyings[16];
         for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
         uint8_t constants[128] = {};
@@ -5900,7 +6005,7 @@ void test_dxil() {
           for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
           *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
         };
-        graphics::Vec4 varyings[4];
+        graphics::Vec4 varyings[16];
         for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
         uint8_t constants[128] = {};
@@ -5951,7 +6056,7 @@ void test_dxil() {
           for (uint32_t i = 0; i < 4; ++i) varyings[i] = p.at(i, corner);
           *position = {static_cast<float>(corner & 1), static_cast<float>(corner >> 1), 0, 1};
         };
-        graphics::Vec4 varyings[4];
+        graphics::Vec4 varyings[16];
         for (uint32_t i = 0; i < 4; ++i) varyings[i] = plane.at(i, own);
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
         uint8_t constants[128] = {};
@@ -5973,7 +6078,7 @@ void test_dxil() {
     if (translated) {
       bool seen[2] = {};
       for (uint32_t n = 0; n < 200; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(0, 1), 0, 0, 0};
         varyings[2] = {random(0, 1), random(0, 1), 0, 0};
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
@@ -6004,7 +6109,7 @@ void test_dxil() {
       };
       unsigned partial = 0;
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
         varyings[2] = {random(0, 1), random(0, 1), 0, 0};
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
@@ -6025,7 +6130,7 @@ void test_dxil() {
     CHECK(load("dxil_ps_double.dxil", &translated));
     if (translated) {
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(0.1f, 2), random(0, 2), random(0, 1), 0};
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
         uint8_t constants[128] = {};
@@ -6048,7 +6153,7 @@ void test_dxil() {
     CHECK(load("dxil_ps_int64.dxil", &translated));
     if (translated) {
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
         varyings[2] = {random(0, 1), random(0, 1), 0, 0};
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
@@ -6079,7 +6184,7 @@ void test_dxil() {
     if (translated) {
       unsigned inside = 0;
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(-1.5f, 1), 0, 0, 0};
         varyings[2] = {random(0, 1), 0, 0, 0};
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
@@ -6108,7 +6213,7 @@ void test_dxil() {
     if (translated) {
       unsigned inside = 0;
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(-1.5f, 1), 0, 0, 0};
         varyings[2] = {random(0, 1), random(0, 1), 0, 0};
         graphics::Vec4 room[graphics::kMaxColorTargets] = {};
@@ -6139,7 +6244,7 @@ void test_dxil() {
       auto s16 = [](int32_t x) { return static_cast<int32_t>(static_cast<int16_t>(x)); };
       unsigned checked = 0;
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(0, 2), random(0, 2), random(0, 1), random(0, 1)};
         varyings[2] = {random(0, 1), random(0, 1), 0, 0};
         const float hv[4] = {H(random(-2, 2)), H(random(-2, 2)), H(random(-2, 2)), H(random(-2, 2))};
@@ -6183,7 +6288,7 @@ void test_dxil() {
       views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(structured.data()), structured.size() * 4);
       views[graphics::kMaxUavBuffers + 1] = ByteView(reinterpret_cast<uint8_t*>(raw.data()), raw.size() * 4);
       for (uint32_t n = 0; n < 200; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(0, 1), random(0, 1), random(0, 1), 0};
         varyings[2] = {random(0, 1), 0, 0, 0};
         graphics::FragmentContext context;
@@ -6212,7 +6317,7 @@ void test_dxil() {
       for (int k = 0; k < 4; ++k) red[k] = (xs[k] + 0.5f) / 16.0f, green[k] = (ys[k] + 0.5f) / 8.0f;
     };
     for (uint32_t n = 0; n < 200 && offsets && compared; ++n) {
-      graphics::Vec4 varyings[4] = {};
+      graphics::Vec4 varyings[16] = {};
       varyings[0] = {random(0, 0.5f), random(0, 0.5f), 0, 0};
       varyings[2] = {random(0, 1), random(0, 1), 0, 0};
       uint8_t constants[128] = {};
@@ -6242,7 +6347,7 @@ void test_dxil() {
     if (translated) {
       auto near = [](float a, float b) { return __builtin_fabsf(a - b) < 1e-4f; };
       for (uint32_t n = 0; n < 300; ++n) {
-        graphics::Vec4 varyings[4] = {};
+        graphics::Vec4 varyings[16] = {};
         varyings[0] = {random(0, 1), random(0, 1), random(0, 1), 0};
         if (n == 0) varyings[0] = {0.5f, 0.5f, 0.5f, 0};
         if (n == 1) varyings[0] = {1, 1, 1, 0};
@@ -6264,7 +6369,7 @@ void test_dxil() {
     if (reference && translated) {
       CHECK(translated->stage() == graphics::ShaderStage::Vertex);
       for (uint32_t n = 0; n < 100; ++n) {
-        graphics::Vec4 attributes[4] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
+        graphics::Vec4 attributes[16] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
         float constants_f[32];
         for (float& c : constants_f) c = random(-2, 2);
         uint8_t constants[128];
@@ -6295,7 +6400,7 @@ void test_dxil() {
       ByteView views[graphics::kMaxStorageBuffers];
       views[graphics::kMaxUavBuffers] = ByteView(reinterpret_cast<uint8_t*>(table), sizeof table);
       for (uint32_t n = 0; n < 100; ++n) {
-        graphics::Vec4 attributes[4] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
+        graphics::Vec4 attributes[16] = {{random(-1, 1), random(-1, 1), random(-1, 1), 1}, {random(0, 1), random(0, 1), random(0, 1), random(0, 1)}, {}, {}};
         graphics::VertexContext context;
         context.vertex_id = n;
         context.storage = views;
@@ -6318,13 +6423,13 @@ void test_dxil() {
       CHECK(translated->stage() == graphics::ShaderStage::Geometry && translated->geometry_input() == graphics::GeometryPrimitive::Triangle && translated->geometry_max_vertices() == 6 &&
             translated->geometry_output() == graphics::GeometryTopology::TriangleStrip);
       for (uint32_t n = 0; n < 100; ++n) {
-        graphics::GeometryInputData in;
+        graphics::GeometryInputData in = {};
         for (uint32_t v = 0; v < 3; ++v) {
           in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
           in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
           in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
         }
-        graphics::GeometryOutputData a, b;
+        graphics::GeometryOutputData a = {}, b = {};
         uint8_t constants[128] = {};
         reference->run_geometry(in, constants, &a);
         translated->run_geometry(in, constants, &b);
@@ -6345,13 +6450,13 @@ void test_dxil() {
     CHECK(load("dxil_gs_streams.dxbc", &reference) && load("dxil_gs_streams.dxil", &translated));
     if (reference && translated) {
       for (uint32_t n = 0; n < 100; ++n) {
-        graphics::GeometryInputData in;
+        graphics::GeometryInputData in = {};
         for (uint32_t v = 0; v < 3; ++v) {
           in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
           in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
           in.varying[v][2] = {random(0, 1), random(0, 1), 0, 0};
         }
-        graphics::GeometryOutputData a, b;
+        graphics::GeometryOutputData a = {}, b = {};
         uint8_t constants[128] = {};
         reference->run_geometry(in, constants, &a);
         translated->run_geometry(in, constants, &b);
@@ -6363,6 +6468,7 @@ void test_dxil() {
           if (a.stream[i] < 2) both_streams[a.stream[i]] = true;
         }
         if (!same && n == 0) printf("  streams: counts %u %u\n", a.count, b.count);
+        if (!same && n == 0) for (uint32_t i = 0; i < a.count; ++i) { printf("   %u: stream %u/%u restart %d/%d pos %g %g %g %g | %g %g %g %g\n", i, a.stream[i], b.stream[i], a.restart[i], b.restart[i], a.vertex[i].position.x, a.vertex[i].position.y, a.vertex[i].position.z, a.vertex[i].position.w, b.vertex[i].position.x, b.vertex[i].position.y, b.vertex[i].position.z, b.vertex[i].position.w); for (uint32_t k = 0; k < 4; ++k) printf("      var%u %g %g %g %g | %g %g %g %g\n", k, a.vertex[i].varying[k].x, a.vertex[i].varying[k].y, a.vertex[i].varying[k].z, a.vertex[i].varying[k].w, b.vertex[i].varying[k].x, b.vertex[i].varying[k].y, b.vertex[i].varying[k].z, b.vertex[i].varying[k].w); }
         CHECK(same && both_streams[0] && both_streams[1]);
       }
       printf("  dxil dxil_gs_streams: 100 triangles compared\n");
@@ -6380,13 +6486,13 @@ void test_dxil() {
     if (gs) {
       CHECK(gs->stage() == graphics::ShaderStage::Geometry && (gs->required_features() & graphics::kFeatureStorageInDraws));
       for (uint32_t n = 0; n < 50; ++n) {
-        graphics::GeometryInputData in;
+        graphics::GeometryInputData in = {};
         in.storage = views;
         for (uint32_t v = 0; v < 3; ++v) {
           in.position[v] = {random(-1, 1), random(-1, 1), random(0, 1), random(0.5f, 2)};
           in.varying[v][0] = {random(0, 1), random(0, 1), random(0, 1), random(0, 1)};
         }
-        graphics::GeometryOutputData out;
+        graphics::GeometryOutputData out = {};
         uint8_t constants[128] = {};
         gs->run_geometry(in, constants, &out);
         bool same = out.count == 3;
@@ -7095,7 +7201,7 @@ void test_dxbc_constant_buffers() {
         uint8_t constants[128];
         for (unsigned i = 0; i < 8; ++i)
           for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-        graphics::Vec4 varyings[4] = {}, c = {};
+        graphics::Vec4 varyings[16] = {}, c = {};
         p->run_fragment(varyings, constants, nullptr, &c);
         const int element = 1 + index;
         const bool inside = element >= 0 && element < 4;
@@ -7128,7 +7234,7 @@ void test_dxbc_constant_buffers() {
       CHECK(st == status::kSuccess && p);
       if (p) {
         uint8_t constants[128] = {};
-        graphics::Vec4 varyings[4] = {}, c = {};
+        graphics::Vec4 varyings[16] = {}, c = {};
         p->run_fragment(varyings, constants, nullptr, &c);
         CHECK(c.x == 3.0f + 1.0f && c.y == 6.0f + 2.0f && c.z == 9.0f + 3.0f && c.w == 2.0f);
       }
@@ -7263,7 +7369,7 @@ void test_dxbc_integers() {
           continue;
         }
         uint8_t constants[128] = {};
-        graphics::Vec4 varyings[4] = {}, c = {};
+        graphics::Vec4 varyings[16] = {}, c = {};
         p->run_fragment(varyings, constants, nullptr, &c);
         const float got_f[4] = {c.x, c.y, c.z, c.w};
         bool ok = true;
@@ -7305,7 +7411,7 @@ void test_dxbc_integers() {
       CHECK(st == status::kSuccess && p);
       if (p) {
         uint8_t constants[128] = {};
-        graphics::Vec4 varyings[4] = {}, c = {};
+        graphics::Vec4 varyings[16] = {}, c = {};
         p->run_fragment(varyings, constants, nullptr, &c);
         // ftoi: -2 3 INT_MAX INT_MIN, back as floats
         CHECK(c.x == -2.0f && c.y == 3.0f && c.z == 2147483648.0f && c.w == -2147483648.0f);
@@ -7325,7 +7431,7 @@ void test_dxbc_integers() {
         uint8_t constants[128];
         for (unsigned i = 0; i < 8; ++i)
           for (unsigned k = 0; k < 4; ++k) memcpy(constants + i * 16 + k * 4, &kConstants[set][i][k], 4);
-        graphics::Vec4 varyings[4], c = {};
+        graphics::Vec4 varyings[16], c = {};
         for (unsigned i = 0; i < 4; ++i) varyings[i] = {kInputs[set][i][0], kInputs[set][i][1], kInputs[set][i][2], kInputs[set][i][3]};
         p->run_fragment(varyings, constants, nullptr, &c);
         const float got[4] = {c.x, c.y, c.z, c.w};
@@ -7350,7 +7456,7 @@ void test_dxbc_integers() {
       CHECK(st == status::kSuccess && p);
       if (p) {
         uint8_t constants[128] = {};
-        graphics::Vec4 varyings[4] = {}, c = {};
+        graphics::Vec4 varyings[16] = {}, c = {};
         p->run_fragment(varyings, constants, nullptr, &c);
         const uint32_t got[4] = {__builtin_bit_cast(uint32_t, c.x), __builtin_bit_cast(uint32_t, c.y), __builtin_bit_cast(uint32_t, c.z), __builtin_bit_cast(uint32_t, c.w)};
         CHECK(got[0] == 100 / 7 && got[1] == 1 && got[2] == 0xFFFFFFFFu / 2 && got[3] == 0xFFFFFFFFu);   // (x / 0 is all ones)
@@ -7368,7 +7474,7 @@ void test_dxbc_integers() {
       CHECK(st == status::kSuccess && hp);
       if (hp) {
         uint8_t constants[128] = {};
-        graphics::Vec4 varyings[4] = {}, c = {};
+        graphics::Vec4 varyings[16] = {}, c = {};
         hp->run_fragment(varyings, constants, nullptr, &c);
         const uint32_t got[4] = {__builtin_bit_cast(uint32_t, c.x), __builtin_bit_cast(uint32_t, c.y), __builtin_bit_cast(uint32_t, c.z), __builtin_bit_cast(uint32_t, c.w)};
         CHECK(got[0] == 0 && got[1] == 0 && got[2] == 1 && got[3] == 0);
@@ -7389,7 +7495,7 @@ void test_dxbc_loops() {
       CHECK(st == status::kSuccess && p);
       if (!p) return;
       uint8_t constants[128] = {};
-      graphics::Vec4 varyings[4] = {};
+      graphics::Vec4 varyings[16] = {};
       p->run_fragment(varyings, constants, nullptr, out);
       if (!check_text) return;
       String text(allocator);
@@ -7933,7 +8039,7 @@ void test_dxbc_system_values() {
     unsigned vertex_cases = 0;
     for (uint32_t vertex_id = 0; vertex_id < 4; ++vertex_id)
       for (uint32_t instance_id = 0; instance_id < 5; ++instance_id) {
-        graphics::Vec4 attributes[4] = {{0.1f * static_cast<float>(vertex_id), -0.3f, 0.5f, 1}, {0.25f, -0.5f, 0, 0}, {}, {}};
+        graphics::Vec4 attributes[16] = {{0.1f * static_cast<float>(vertex_id), -0.3f, 0.5f, 1}, {0.25f, -0.5f, 0, 0}, {}, {}};
         graphics::VertexContext context;
         context.vertex_id = vertex_id, context.instance_id = instance_id;
         graphics::ShaderIo io = {};
@@ -7962,7 +8068,7 @@ void test_dxbc_system_values() {
     for (bool front : {true, false})
       for (float x : {0.5f, 5.5f, 17.5f})
         for (float uv : {0.0f, 0.3f, 0.9f}) {
-          graphics::Vec4 varyings[4] = {};
+          graphics::Vec4 varyings[16] = {};
           varyings[2] = {uv, 1.0f - uv, 0, 0};
           graphics::FragmentContext context;
           context.position = {x, 9.5f, 0.25f, 0.8f};
@@ -8001,7 +8107,7 @@ void test_dxbc_system_values() {
       unsigned cases = 0;
       for (float x : {0.0f, 0.2f, 0.55f, 0.99f})
         for (float y : {0.0f, 0.4f, 0.97f}) {
-          graphics::Vec4 varyings[4] = {};
+          graphics::Vec4 varyings[16] = {};
           varyings[0] = {0.5f, 0.25f, 0.75f, 1.0f};
           varyings[2] = {x, y, 0, 0};
           graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
@@ -8064,7 +8170,7 @@ void test_dxbc_system_values() {
         UniquePointer<D3d9Program> p = compile_dxbc(allocator, t, &st);
         if (st == status::kSuccess) {
           ++compiled;
-          graphics::Vec4 v[4] = {};
+          graphics::Vec4 v[16] = {};
           graphics::Vec4 color_room[graphics::kMaxColorTargets] = {};
           graphics::Vec4& color = color_room[0];
           uint8_t constants[128] = {};
@@ -8122,6 +8228,7 @@ int main() {
   test_d3d12_binding();
   test_d3d12_copies_and_escapes();
   test_reserved_mip_tail();
+  test_device_limits();
   test_d3d12_compute();
   test_d3d12_buffer_views();
   test_d3d12_buffer_views_in_draw();

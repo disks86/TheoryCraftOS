@@ -285,6 +285,7 @@ uint32_t query_adapter_info(Session& s, Call& call, uint64_t arg) {
       uint8_t name[64] = {};
       for (uint32_t i = 0; i < 63 && caps.name[i]; ++i) name[i] = static_cast<uint8_t>(caps.name[i]);
       out.append(ConstByteView(name, 64));
+      for (uint32_t w : {caps.max_color_targets, caps.max_vertex_buffers}) out.put32(w);      // (after the name: what a caller built before them reads is unchanged)
       break;
     }
     case kQaiWddm12Caps: case kQaiWddm13Caps: case kQaiWddm20Caps: case kQaiDirectFlipSupport: case kQaiMultiPlaneOverlaySupport: case kQaiMultiPlaneOverlayHudSupport:

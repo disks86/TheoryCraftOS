@@ -42,6 +42,15 @@ d3d12.dll (`docs/WindowsUserMode.md`) needs no extra service: `NtGdiDdDDIEscape`
 `CopyBuffer` and `CopyBufferImage`, run on the CPU copies of the allocations after the device work before them (a pass may not be open; the ranges are checked; a heap, reserved or query
 buffer is refused).
 
+### What the device takes
+
+`graphics::DeviceInfo::limits` (`DeviceLimits`: vertex attributes, varyings, texture units, colour targets, vertex buffers) is what a graphics device says it can do; the `kMax*` constants of
+`IGraphicsDevice.hpp` are only the capacity of the shared structures (16, 16, 16, 8, 8), and `kBase*` (4, 4, 2, 4, 1) what the fixed-pipeline backends were made for. `Adapter` copies the
+limits into `AdapterCaps` (the UMDRIVERPRIVATE blob has the colour targets and vertex buffers after the name) and holds pipelines, shaders (the texture units and vertex inputs a DXBC program declares,
+its colour outputs) and stream ops (texture units, extra pass targets, vertex buffer slots) to them. The escape `CreatePipeline` has an optional last part for attributes beyond four, vertex
+buffer slots and per-slot strides, and the blend state of targets 4 .. 7; `BindVertexBuffer` has an optional third word, the slot; `ICommandBuffer::bind_vertex_buffer_slot` is the device side.
+TGSI is emitted with the device's number of interpolants (the vertex and pixel shaders of a pipeline must agree on them).
+
 ### Mapping notes
 
 - Lock: dxgk's backing is not in the process, so Lock maps a region of the process's address space with a copy; Unlock copies back unless ReadOnly. `PrivateDriverData`

@@ -50,7 +50,7 @@ g++ -pthread "${objs[@]}" -o "$work/emurun"
 python3 - "$work/dxfixtures.h" <<'PY'
 import sys
 out = open(sys.argv[1], "w")
-for n in ("vs", "ps_color", "ps_tex", "cs_fill"):
+for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8"):
     data = open("tests/data/dxbc/%s.dxbc" % n, "rb").read()
     out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
 PY

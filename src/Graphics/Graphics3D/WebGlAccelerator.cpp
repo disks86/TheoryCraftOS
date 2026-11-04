@@ -48,7 +48,7 @@ void WebGlAccelerator::destroy_program_locked(Program& p) {
 }
 
 uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) {
-  if (attributes == 0 || attributes > kMaxVertexAttributes || varyings > kMaxVaryings || textures > webgl::kAccelMaxTextures) return 0;
+  if (attributes == 0 || attributes > kBaseVertexAttributes || varyings > kBaseVaryings || textures > webgl::kAccelMaxTextures) return 0;
   kernel::ScopedMutex guard(lock_);
   UniquePointer<Program> p = UniquePointer<Program>::make(allocator_);
   if (!p) return 0;

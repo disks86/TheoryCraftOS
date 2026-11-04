@@ -614,11 +614,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           if (!p.ok() || o.type != kOpResource || o.dims != 3) return status::kInvalidParameter;
           if (!resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= 8 || o.index[1] != o.index[2] || o.index[1] >= graphics::kMaxTextureUnits || space != 0) return status::kNotSupported;
           texture_register[o.index[0]] = static_cast<int32_t>(o.index[1]);
+          program->texture_unit_mask_ |= 1u << o.index[1];
           program->texture_kind_[o.index[1]] = kind;
           program->texture_samples_[o.index[1]] = static_cast<uint8_t>((token >> 16) & 0x7F);
           continue;
         }
         if (o.type != kOpResource || o.dims != 1 || !resource_kind((token >> 11) & 0x1F, &kind) || o.index[0] >= graphics::kMaxTextureUnits) return status::kNotSupported;   // two units
+        program->texture_unit_mask_ |= 1u << o.index[0];
         program->texture_kind_[o.index[0]] = kind;
         program->texture_samples_[o.index[0]] = static_cast<uint8_t>((token >> 16) & 0x7F);
         continue;
@@ -677,7 +679,10 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           in_sys[o.index[0]] = static_cast<int8_t>(sys);
           continue;
         }
-        if (o.type == kOpInput && vertex && o.index[0] >= graphics::kMaxVertexAttributes) return status::kNotSupported;
+        if (o.type == kOpInput && vertex) {
+          if (o.index[0] >= graphics::kMaxVertexAttributes) return status::kNotSupported;
+          if (o.index[0] + 1 > program->attributes_used_) program->attributes_used_ = o.index[0] + 1;
+        }
         continue;
       }
       case kDclIndexableTemp4: return status::kNotSupported;

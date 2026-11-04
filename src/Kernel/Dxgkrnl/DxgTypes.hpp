@@ -170,6 +170,8 @@ struct AdapterCaps {
   uint32_t max_vertex_attributes = 0;
   uint32_t max_varyings = 0;
   uint32_t max_texture_units = 0;
+  uint32_t max_color_targets = 0;
+  uint32_t max_vertex_buffers = 0;
   uint32_t max_push_constant_bytes = 0;
   uint32_t max_vertex_stride = 0;
   bool accelerated = false;   // a GPU draws (not the CPU)
@@ -230,6 +232,7 @@ struct PipelineDesc {
   Handle geometry_shader = 0;   // not 0: a geometry shader (stage Geometry) that runs between the vertex and the pixel shader; needs kFeatureGeometryShaders, and the draws must make what it takes
   Handle compute_shader = 0;   // not 0: a compute pipeline of that shader (stage Compute), and nothing else of the description is used; needs kFeatureCompute
   uint32_t vertex_stride = 0;
+  uint32_t slot_strides[graphics::kMaxVertexBuffers] = {};   // the stride of vertex buffer n for n >= 1 (the attributes name their slot; slot 0's stride is vertex_stride)
   graphics::VertexAttribute attributes[graphics::kMaxVertexAttributes] = {};
   uint32_t attribute_count = 0;
   uint32_t varying_count = 0;

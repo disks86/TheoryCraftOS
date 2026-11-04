@@ -1155,7 +1155,8 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
       desc.varying_count = in.le32();
       desc.texture_count = in.le32();
       const uint32_t cull = in.le32(), front = in.le32(), flags = in.le32();
-      for (graphics::VertexAttribute& a : desc.attributes) {
+      for (uint32_t ai = 0; ai < 4; ++ai) {      // (the first four attributes are in the base layout; more come in the last, optional part)
+        graphics::VertexAttribute& a = desc.attributes[ai];
         a.location = in.le32();
         const uint32_t format = in.le32();
         a.offset = in.le32();
@@ -1177,7 +1178,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
         desc.blend.src_alpha = static_cast<graphics::BlendFactor>(sa), desc.blend.dst_alpha = static_cast<graphics::BlendFactor>(da);
         desc.blend.color_op = static_cast<graphics::BlendOp>(cop), desc.blend.alpha_op = static_cast<graphics::BlendOp>(aop);
         desc.blend.write_mask = static_cast<uint8_t>(mask);
-        for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) desc.attributes[i].per_instance = (instance_bits >> i) & 1;
+        for (uint32_t i = 0; i < 4; ++i) desc.attributes[i].per_instance = (instance_bits >> i) & 1;
         if (!in.at_end()) {   // (and, after that, the number of colour outputs)
           desc.color_target_count = in.le32();
           if (!in.ok() || desc.color_target_count == 0 || desc.color_target_count > graphics::kMaxColorTargets) return status::kInvalidParameter;
@@ -1185,7 +1186,8 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
             const uint32_t independent = in.le32();
             if (!in.ok() || independent > 1) return status::kInvalidParameter;
             desc.independent_blend = independent != 0;
-            for (graphics::BlendState& t : desc.target_blend) {
+            for (uint32_t ti = 0; ti < 3; ++ti) {
+              graphics::BlendState& t = desc.target_blend[ti];
               const uint32_t tc = in.le32(), te = in.le32(), tsc = in.le32(), tdc = in.le32(), tsa = in.le32(), tda = in.le32(), tcop = in.le32(), taop = in.le32(), tmask = in.le32();
               if (!in.ok() || tc > 1 || te > 1 || tsc > 10 || tdc > 10 || tsa > 10 || tda > 10 || tcop > 4 || taop > 4 || tmask > 15) return status::kInvalidParameter;
               t.custom = tc != 0, t.enable = te != 0;
@@ -1222,6 +1224,39 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                     }
                     if (!in.ok()) return status::kInvalidParameter;
                     desc.stream_output_count = entries;
+                    if (!in.at_end()) {   // (and, after that, the vertex layout beyond four attributes and one vertex buffer, and the blend state of targets 4 .. 7)
+                      const uint32_t extra = in.le32();
+                      if (!in.ok() || extra > graphics::kMaxVertexAttributes - 4) return status::kInvalidParameter;
+                      for (uint32_t k = 0; k < extra; ++k) {
+                        graphics::VertexAttribute& a = desc.attributes[4 + k];
+                        a.location = in.le32();
+                        const uint32_t packed = in.le32();      // format | slot << 8
+                        a.offset = in.le32();
+                        if ((packed & 0xFF) > static_cast<uint32_t>(graphics::VertexFormat::Float4) || (packed >> 8) >= graphics::kMaxVertexBuffers) return status::kInvalidParameter;
+                        a.format = static_cast<graphics::VertexFormat>(packed & 0xFF);
+                        a.slot = static_cast<uint8_t>(packed >> 8);
+                      }
+                      const uint32_t instance_high = in.le32(), slots_low = in.le32(), strides = in.le32();      // (per_instance of the extra attributes, the slots of the first four: 4 bits each)
+                      if (!in.ok() || strides >= graphics::kMaxVertexBuffers) return status::kInvalidParameter;
+                      for (uint32_t k = 0; k < extra; ++k) desc.attributes[4 + k].per_instance = (instance_high >> k) & 1;
+                      for (uint32_t k = 0; k < 4; ++k) {
+                        desc.attributes[k].slot = static_cast<uint8_t>((slots_low >> (4 * k)) & 0xF);
+                        if (desc.attributes[k].slot >= graphics::kMaxVertexBuffers) return status::kInvalidParameter;
+                      }
+                      for (uint32_t k = 1; k <= strides; ++k) desc.slot_strides[k] = in.le32();
+                      const uint32_t more_blends = in.le32();
+                      if (!in.ok() || more_blends > graphics::kMaxColorTargets - 4) return status::kInvalidParameter;
+                      for (uint32_t k = 0; k < more_blends; ++k) {
+                        graphics::BlendState& t = desc.target_blend[3 + k];
+                        const uint32_t tc = in.le32(), te = in.le32(), tsc = in.le32(), tdc = in.le32(), tsa = in.le32(), tda = in.le32(), tcop = in.le32(), taop = in.le32(), tmask = in.le32();
+                        if (!in.ok() || tc > 1 || te > 1 || tsc > 10 || tdc > 10 || tsa > 10 || tda > 10 || tcop > 4 || taop > 4 || tmask > 15) return status::kInvalidParameter;
+                        t.custom = tc != 0, t.enable = te != 0;
+                        t.src_color = static_cast<graphics::BlendFactor>(tsc), t.dst_color = static_cast<graphics::BlendFactor>(tdc);
+                        t.src_alpha = static_cast<graphics::BlendFactor>(tsa), t.dst_alpha = static_cast<graphics::BlendFactor>(tda);
+                        t.color_op = static_cast<graphics::BlendOp>(tcop), t.alpha_op = static_cast<graphics::BlendOp>(taop);
+                        t.write_mask = static_cast<uint8_t>(tmask);
+                      }
+                    }
                   }
                 }
               }

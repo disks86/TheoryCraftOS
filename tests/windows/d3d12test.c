@@ -1341,6 +1341,302 @@ static void test_mip_tails(Scene *c) {
   ID3D12Resource_Release(texture);
 }
 
+/* The limits the adapter reports are what the pipelines can use: the software adapter takes sixteen vertex inputs, three vertex buffers here, four textures and eight render targets. */
+static ID3D12Resource *upload_floats(ID3D12Device *dev, const float *data, UINT count) {
+  ID3D12Resource *r = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 256 + count * 4, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  void *p = NULL;
+  if (r && SUCCEEDED(ID3D12Resource_Map(r, 0, NULL, &p)) && p) memcpy(p, data, count * 4);
+  if (r) ID3D12Resource_Unmap(r, 0, NULL);
+  return r;
+}
+
+static void test_attribute_slots(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  /* buffer 0: position and colour, buffer 1: uv and normal, buffer 2: an offset and a tint for each of two instances */
+  const float b0[3][7] = {{-0.3f, -0.3f, 0.5f, 1, 0, 0, 1}, {0.3f, -0.3f, 0.5f, 0, 1, 0, 1}, {0.0f, 0.3f, 0.5f, 0, 0, 1, 1}};
+  const float b1[3][5] = {{0, 0, 1, 1, 1}, {1, 0, 1, 1, 1}, {0.5f, 1, 1, 1, 1}};
+  const float b2[2][8] = {{-0.5f, 0, 0, 0, 0, 0, 0, 0}, {0.5f, 0, 0, 0, 0, 0, 0.5f, 0}};
+  ID3D12Resource *v0 = upload_floats(dev, &b0[0][0], 21), *v1 = upload_floats(dev, &b1[0][0], 15), *v2 = upload_floats(dev, &b2[0][0], 16);
+  if (!v0 || !v1 || !v2) { CHECK(0); return; }
+  D3D12_INPUT_ELEMENT_DESC layout[6] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"OFFSET", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+      {"TINT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = dx_vs_attrs6_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_attrs6_dxbc;
+  pd.PS.pShaderBytecode = dx_ps_color_dxbc;
+  pd.PS.BytecodeLength = sizeof dx_ps_color_dxbc;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 6;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!pso || !list) { CHECK(0); return; }
+  D3D12_VERTEX_BUFFER_VIEW views[3] = {{ID3D12Resource_GetGPUVirtualAddress(v0), 21 * 4, 28}, {ID3D12Resource_GetGPUVirtualAddress(v1), 15 * 4, 20}, {ID3D12Resource_GetGPUVirtualAddress(v2), 16 * 4, 32}};
+  scene_begin(c, list, 1);
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 3, views);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 2, 0, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const int left = scene_coloured(c, 0, 0, 32, 64), right = scene_coloured(c, 32, 0, 64, 64);
+  const UINT32 *pixels = NULL;
+  CHECK_HR(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels));
+  printf("slots: %d pixels left, %d right\n", left, right);
+  CHECK(left > 100 && right > 100 && left == right);
+  if (pixels) {
+    /* (a pixel inside each triangle: the tint of the second instance is blue, and the normal of buffer 1 (1,1,1) leaves the colours as they are) */
+    const UINT32 a = pixels[40 * 64 + 16], b = pixels[40 * 64 + 48];
+    printf("slots: %08x %08x\n", (unsigned)a, (unsigned)b);
+    CHECK((a & 0xFFFFFF) != 0 && (b & 0xFFFFFF) != 0 && (b & 0xFF) > (a & 0xFF) + 60);      /* (BGRA: the low byte is blue) */
+    ID3D12Resource_Unmap(c->readback, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12PipelineState_Release(pso);
+  ID3D12Resource_Release(v0);
+  ID3D12Resource_Release(v1);
+  ID3D12Resource_Release(v2);
+}
+
+static void test_four_textures(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+  ID3D12Resource *textures[4] = {0};
+  ID3D12Resource *upload = make_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 4 * 512, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+  const UINT32 texels[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};      /* red, green, blue, white (R8G8B8A8: 0xAABBGGRR) */
+  UINT8 *p = NULL;
+  if (!upload || FAILED(ID3D12Resource_Map(upload, 0, NULL, (void **)&p))) { CHECK(0); return; }
+  for (int i = 0; i < 4; ++i) memcpy(p + i * 512, &texels[i], 4);
+  ID3D12Resource_Unmap(upload, 0, NULL);
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  ID3D12DescriptorHeap *srv_heap = NULL;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&srv_heap));
+  D3D12_CPU_DESCRIPTOR_HANDLE srv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(srv_heap);
+  D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(srv_heap);
+  const UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!srv_heap || !list) { CHECK(0); return; }
+  for (int i = 0; i < 4; ++i) {
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&textures[i]));
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv;
+    memset(&sv, 0, sizeof sv);
+    sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE at = {srv.ptr + (SIZE_T)i * inc};
+    ID3D12Device_CreateShaderResourceView(dev, textures[i], &sv, at);
+    D3D12_TEXTURE_COPY_LOCATION dst, src;
+    memset(&dst, 0, sizeof dst);
+    memset(&src, 0, sizeof src);
+    dst.pResource = textures[i];
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = (UINT64)i * 512;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    src.PlacedFootprint.Footprint.Width = src.PlacedFootprint.Footprint.Height = src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = 256;
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+  }
+  D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+  D3D12_ROOT_PARAMETER params[2];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[0].DescriptorTable.NumDescriptorRanges = 1;
+  params[0].DescriptorTable.pDescriptorRanges = &range;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  params[1].Constants.Num32BitValues = 16;
+  D3D12_STATIC_SAMPLER_DESC ss;
+  memset(&ss, 0, sizeof ss);
+  ss.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  ss.MaxLOD = 1000.0f;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {2, params, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ID3DBlob *blob = NULL, *error = NULL;
+  CHECK_HR(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error));
+  ID3D12RootSignature *rs = NULL;
+  if (blob) CHECK_HR(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&rs));
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.PS.pShaderBytecode = dx_ps_tex4_dxbc;
+  pd.PS.BytecodeLength = sizeof dx_ps_tex4_dxbc;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1;
+  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  if (!rs || !pso) { CHECK(0); return; }
+  ID3D12DescriptorHeap *heaps[1] = {srv_heap};
+  D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+  scene_begin(c, list, 1);
+  ID3D12GraphicsCommandList_SetPipelineState(list, pso);
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
+  ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 0, srv_gpu);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 1, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  scene_read_target(c, list);
+  scene_run(c, list);
+  const UINT32 *pixels = NULL;
+  CHECK_HR(ID3D12Resource_Map(c->readback, 0, NULL, (void **)&pixels));
+  if (pixels) {
+    const UINT32 centre = pixels[40 * 64 + 32];
+    printf("textures: %08x\n", (unsigned)centre);
+    /* (the average of red, green, blue and white: a mid grey, 0.5 each; the vertex colour does not enter the pixel shader's result) */
+    const int r = (centre >> 16) & 0xFF, g = (centre >> 8) & 0xFF, b = centre & 0xFF;
+    CHECK(r >= 120 && r <= 135 && g >= 120 && g <= 135 && b >= 120 && b <= 135);
+    ID3D12Resource_Unmap(c->readback, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12PipelineState_Release(pso);
+  ID3D12RootSignature_Release(rs);
+  ID3D10Blob_Release(blob);
+  ID3D12DescriptorHeap_Release(srv_heap);
+  ID3D12Resource_Release(upload);
+  for (int i = 0; i < 4; ++i) if (textures[i]) ID3D12Resource_Release(textures[i]);
+}
+
+static void test_eight_targets(Scene *c) {
+  ID3D12Device *dev = c->dev;
+  D3D12_HEAP_PROPERTIES defaults = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+  D3D12_RESOURCE_DESC td = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET};
+  ID3D12Resource *targets[8] = {0};
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  ID3D12DescriptorHeap *rtv_heap = NULL;
+  CHECK_HR(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap));
+  ID3D12Resource *back = make_buffer(dev, D3D12_HEAP_TYPE_READBACK, 8 * 16384, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (!rtv_heap || !back) { CHECK(0); return; }
+  D3D12_CPU_DESCRIPTOR_HANDLE rtvs = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtv_heap);
+  const UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  for (int i = 0; i < 8; ++i) {
+    CHECK_HR(ID3D12Device_CreateCommittedResource(dev, &defaults, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&targets[i]));
+    D3D12_CPU_DESCRIPTOR_HANDLE at = {rtvs.ptr + (SIZE_T)i * inc};
+    ID3D12Device_CreateRenderTargetView(dev, targets[i], NULL, at);
+  }
+  D3D12_INPUT_ELEMENT_DESC layout[2] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+  memset(&pd, 0, sizeof pd);
+  pd.pRootSignature = c->rs;
+  pd.VS.pShaderBytecode = dx_vs_dxbc;
+  pd.VS.BytecodeLength = sizeof dx_vs_dxbc;
+  pd.PS.pShaderBytecode = dx_ps_mrt8_dxbc;
+  pd.PS.BytecodeLength = sizeof dx_ps_mrt8_dxbc;
+  pd.SampleMask = 0xFFFFFFFFu;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pd.BlendState.IndependentBlendEnable = TRUE;
+  for (int i = 0; i < 8; ++i) pd.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.InputLayout.pInputElementDescs = layout;
+  pd.InputLayout.NumElements = 2;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 8;
+  for (int i = 0; i < 8; ++i) pd.RTVFormats[i] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.SampleDesc.Count = 1;
+  ID3D12PipelineState *pso = NULL;
+  CHECK_HR(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+  ID3D12GraphicsCommandList *list = NULL;
+  CHECK_HR(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, c->allocator, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+  if (!pso || !list) { CHECK(0); return; }
+  const float black[4] = {0, 0, 0, 1};
+  D3D12_VIEWPORT vp = {0, 0, 64, 64, 0, 1};
+  D3D12_RECT sc = {0, 0, 64, 64};
+  D3D12_VERTEX_BUFFER_VIEW vbv = {ID3D12Resource_GetGPUVirtualAddress(c->vb), 256, 28};
+  ID3D12GraphicsCommandList_OMSetRenderTargets(list, 8, &rtvs, TRUE, NULL);
+  for (int i = 0; i < 8; ++i) {
+    D3D12_CPU_DESCRIPTOR_HANDLE at = {rtvs.ptr + (SIZE_T)i * inc};
+    ID3D12GraphicsCommandList_ClearRenderTargetView(list, at, black, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+  ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, c->rs);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 16, kIdentity, 0);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+  ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+  for (int i = 0; i < 8; ++i) {
+    D3D12_TEXTURE_COPY_LOCATION dst, src;
+    memset(&dst, 0, sizeof dst);
+    memset(&src, 0, sizeof src);
+    dst.pResource = back;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = (UINT64)i * 16384;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Width = dst.PlacedFootprint.Footprint.Height = 64;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = 256;
+    src.pResource = targets[i];
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+  }
+  scene_run(c, list);
+  const UINT8 *p = NULL;
+  CHECK_HR(ID3D12Resource_Map(back, 0, NULL, (void **)&p));
+  if (p) {
+    static const UINT32 want[8] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u, 0xFFFF00FFu, 0xFF00FFFFu, 0xFFFFFFFFu, 0xFF808080u};
+    int right = 0;
+    for (int i = 0; i < 8; ++i) {
+      const UINT32 pixel = *(const UINT32 *)(p + i * 16384 + 40 * 256 + 32 * 4);
+      const int dr = (int)((pixel >> 16) & 0xFF) - (int)((want[i] >> 16) & 0xFF), dg = (int)((pixel >> 8) & 0xFF) - (int)((want[i] >> 8) & 0xFF), db = (int)(pixel & 0xFF) - (int)(want[i] & 0xFF);
+      right += dr > -3 && dr < 3 && dg > -3 && dg < 3 && db > -3 && db < 3;
+    }
+    printf("targets: %d of 8 hold their colour\n", right);
+    CHECK(right == 8);
+    ID3D12Resource_Unmap(back, 0, NULL);
+  }
+  ID3D12GraphicsCommandList_Release(list);
+  ID3D12PipelineState_Release(pso);
+  ID3D12Resource_Release(back);
+  ID3D12DescriptorHeap_Release(rtv_heap);
+  for (int i = 0; i < 8; ++i) if (targets[i]) ID3D12Resource_Release(targets[i]);
+}
+
+static void test_limits(Scene *c) {
+  D3D12_FEATURE_DATA_FEATURE_LEVELS levels;
+  D3D_FEATURE_LEVEL asked[3] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
+  levels.NumFeatureLevels = 3;
+  levels.pFeatureLevelsRequested = asked;
+  CHECK_HR(ID3D12Device_CheckFeatureSupport(c->dev, D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof levels));
+  CHECK(levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_11_0);      /* (the software adapter takes what 11_0 needs) */
+  test_attribute_slots(c);
+  test_four_textures(c);
+  test_eight_targets(c);
+}
+
 static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 *fence_value) {
   Scene c;
   memset(&c, 0, sizeof c);
@@ -1356,6 +1652,7 @@ static void test_extras(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Fenc
   test_predication(&c);
   test_stream_output(&c);
   test_mip_tails(&c);
+  test_limits(&c);
 }
 
 int main(void) {

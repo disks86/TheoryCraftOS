@@ -1080,7 +1080,14 @@ void draw_triangle(const DrawState& s, const ClipVertex& a, const ClipVertex& b,
   for (uint32_t i = 1; i + 1 < n; ++i) raster_triangle(s, sv[0], sv[i], sv[i + 1], true);
 }
 
-ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView vertex_data, uint64_t byte_offset, uint64_t instance_byte_offset,
+// The vertex buffers a draw reads: what is bound to each slot and where the data starts.
+struct VertexStreams {
+  ConstByteView data[kMaxVertexBuffers];
+  uint64_t offset[kMaxVertexBuffers] = {};
+};
+
+// `vertex` is the vertex's number in the buffers, `instance` the instance's (for the per-instance attributes).
+ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStreams& streams, uint64_t vertex, uint64_t instance,
                              const uint8_t* constants, const VertexContext& context) {
   const GraphicsPipelineDesc& pd = pipeline.desc();
   Vec4 attributes[kMaxVertexAttributes];
@@ -1090,8 +1097,10 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, ConstByteView ver
     if (at.location >= kMaxVertexAttributes) continue;
     const uint32_t components = static_cast<uint32_t>(at.format) + 1;
     float v[4] = {0, 0, 0, 1};
-    const uint64_t base = at.per_instance ? instance_byte_offset : byte_offset;
-    for (uint32_t k = 0; k < components; ++k) v[k] = read_float(vertex_data, base + at.offset + 4 * k);
+    const uint32_t slot = at.slot < kMaxVertexBuffers ? at.slot : 0;
+    const uint32_t stride = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
+    const uint64_t base = streams.offset[slot] + (at.per_instance ? instance : vertex) * stride;
+    for (uint32_t k = 0; k < components; ++k) v[k] = read_float(streams.data[slot], base + at.offset + 4 * k);
     attributes[at.location] = {v[0], v[1], v[2], v[3]};
   }
   ShaderIo io;
@@ -1462,8 +1471,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
   uint64_t so_counts[2 * kMaxGeometryStreams] = {};
   uint64_t stat_ia_vertices = 0, stat_ia_primitives = 0, stat_vs = 0, stat_ps = 0;   // (what the draws since the query began did)
   bool query_open = false;
-  IBuffer* vertex_buffer = nullptr;
-  uint64_t vertex_offset = 0;
+  IBuffer* vertex_buffers[kMaxVertexBuffers] = {};
+  uint64_t vertex_offsets[kMaxVertexBuffers] = {};
   IBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
@@ -1674,8 +1683,9 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         s.pipeline = static_cast<const SoftwarePipeline*>(cmd.pipeline);
         break;
       case RecordedCommand::Type::BindVertexBuffer:
-        vertex_buffer = cmd.buffer;
-        vertex_offset = cmd.offset;
+        if (cmd.unit >= kMaxVertexBuffers) return false;
+        vertex_buffers[cmd.unit] = cmd.buffer;
+        vertex_offsets[cmd.unit] = cmd.offset;
         break;
       case RecordedCommand::Type::BindIndexBuffer:
         index_buffer = cmd.buffer;
@@ -1716,7 +1726,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::Draw:
       case RecordedCommand::Type::DrawIndexed: {
-        if (!in_pass || !s.pipeline || !vertex_buffer) return false;
+        if (!in_pass || !s.pipeline) return false;
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         const GraphicsPipelineDesc& pd = s.pipeline->desc();
@@ -1729,7 +1739,20 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             if (bound == extra) return false;
         }
         if (pd.color_target_count == 0 || pd.color_target_count > kMaxColorTargets || (pd.color_target_count > 1 && !s.extra_colors[pd.color_target_count - 2])) return false;
-        const ConstByteView vertices = ConstByteView(vertex_buffer->map());
+        // (the vertex buffers the attributes read: each one bound, and the vertices of the draw inside it)
+        VertexStreams streams;
+        uint32_t slots_used = 0;
+        for (uint32_t k = 0; k < pd.attribute_count; ++k) {
+          const uint32_t slot = pd.attributes[k].slot;
+          if (slot >= kMaxVertexBuffers || !vertex_buffers[slot]) return false;
+          slots_used |= 1u << slot;
+        }
+        if (slots_used == 0 && !vertex_buffers[0]) return false;
+        for (uint32_t slot = 0; slot < kMaxVertexBuffers; ++slot)
+          if (slots_used >> slot & 1) {
+            streams.data[slot] = ConstByteView(vertex_buffers[slot]->map());
+            streams.offset[slot] = vertex_offsets[slot];
+          }
         const ConstByteView indices = indexed ? ConstByteView(index_buffer->map()) : ConstByteView();
         const uint32_t index_size = index_type == IndexType::Uint16 ? 2 : 4;
         auto vertex_at = [&](uint32_t n, uint32_t instance, ClipVertex* out) {
@@ -1745,16 +1768,23 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
             v += cmd.first;
           }
           if (v < 0) return false;
-          const uint64_t byte = vertex_offset + static_cast<uint64_t>(v) * pd.vertex_stride;
-          if (byte + pd.vertex_stride > vertices.size()) return false;
-          // (per-instance attributes: the element numbered by the instance, in the same buffer at the same stride)
-          const uint64_t instance_byte = vertex_offset + (uint64_t{cmd.first_instance} + instance) * pd.vertex_stride;
+          // (per-instance attributes: the element numbered by the instance, in the same buffer at the same stride; every vertex fits in its buffer)
+          const uint64_t instance_number = uint64_t{cmd.first_instance} + instance;
+          for (uint32_t slot = 0; slot < kMaxVertexBuffers; ++slot) {
+            if (!(slots_used >> slot & 1)) continue;
+            const uint32_t stride = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
+            bool per_vertex = false, per_instance = false;
+            for (uint32_t k = 0; k < pd.attribute_count; ++k)
+              if (pd.attributes[k].slot == slot) (pd.attributes[k].per_instance ? per_instance : per_vertex) = true;
+            if (per_vertex && streams.offset[slot] + (static_cast<uint64_t>(v) + 1) * stride > streams.data[slot].size()) return false;
+            if (per_instance && streams.offset[slot] + (instance_number + 1) * stride > streams.data[slot].size()) return false;
+          }
           VertexContext context;
           context.vertex_id = static_cast<uint32_t>(v);
           context.instance_id = cmd.first_instance + instance;
           context.storage = s.storage;
           ++stat_vs;
-          *out = run_vertex_shader(*s.pipeline, vertices, byte, instance_byte, s.constants, context);
+          *out = run_vertex_shader(*s.pipeline, streams, static_cast<uint64_t>(v), instance_number, s.constants, context);
           return true;
         };
         const uint32_t instances = cmd.instance_count;

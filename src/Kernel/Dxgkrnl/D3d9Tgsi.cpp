@@ -52,7 +52,8 @@ class TgsiEmitter {
  public:
   using Instr = D3d9Program::Instruction;
 
-  TgsiEmitter(const D3d9Program& program, allocators::IAllocator& allocator) : p_(program), a_(allocator), body_(allocator), imms_(allocator) {}
+  // `varyings`: the interpolants the host's shaders declare (the number the device takes: the vertex and pixel shaders of a pipeline must agree on them).
+  TgsiEmitter(const D3d9Program& program, allocators::IAllocator& allocator, uint32_t varyings) : p_(program), a_(allocator), body_(allocator), imms_(allocator), varyings_(varyings) {}
 
   NtStatus run(String* out);
 
@@ -260,6 +261,7 @@ class TgsiEmitter {
   uint32_t current_cp_ = 0;   // a hull shader: the output control point the copy of the control point phase being written makes
   uint32_t max_attribute_ = 0;
   bool sampler_used_[graphics::kMaxTextureUnits] = {};
+  uint32_t varyings_;
 };
 
 String TgsiEmitter::operand(const Instr::Src& s, uint32_t offset, uint32_t slot, const uint8_t* perm, bool scalar) {
@@ -853,7 +855,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       add_uint(upright, 5 + ins.control);   // (a register for each stream, so that several can capture the position)
       add(upright, "]");
       line("MOV", &upright, &pos);
-      for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      for (uint32_t i = 0; i < varyings_; ++i) {
         String target = str();
         add(target, "OUT[");
         add_uint(target, i + 1);
@@ -1385,7 +1387,7 @@ void TgsiEmitter::write_control_point_outputs() {
   add_uint(o, current_cp_);
   add(o, "][0]");
   line("MOV", &o, &pos);
-  for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+  for (uint32_t i = 0; i < varyings_; ++i) {
     String target = str();
     add(target, "OUT[");
     add_uint(target, current_cp_);
@@ -1412,7 +1414,7 @@ void TgsiEmitter::assemble(String* out) {
     add_uint(*out, p_.geometry_instances_);
     add(*out, "\nDCL IN[][0], POSITION\n");
     if (sys_used_[kSysGsInstanceId]) add(*out, "DCL SV[0], INVOCATIONID\n");
-    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    for (uint32_t i = 0; i < varyings_; ++i) {
       add(*out, "DCL IN[][");
       add_uint(*out, i + 1);
       add(*out, "], GENERIC[");
@@ -1420,7 +1422,7 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "]\n");
     }
     add(*out, "DCL OUT[0], POSITION\n");
-    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    for (uint32_t i = 0; i < varyings_; ++i) {
       add(*out, "DCL OUT[");
       add_uint(*out, i + 1);
       add(*out, "], GENERIC[");
@@ -1453,7 +1455,7 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "DCL SV[0], TESSCOORD\n");
     }
     add(*out, "DCL IN[][0], POSITION\n");
-    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    for (uint32_t i = 0; i < varyings_; ++i) {
       add(*out, "DCL IN[][");
       add_uint(*out, i + 1);
       add(*out, "], GENERIC[");
@@ -1461,7 +1463,7 @@ void TgsiEmitter::assemble(String* out) {
       add(*out, "]\n");
     }
     add(*out, hull_ ? "DCL OUT[][0], POSITION\n" : "DCL OUT[0], POSITION\n");
-    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    for (uint32_t i = 0; i < varyings_; ++i) {
       add(*out, hull_ ? "DCL OUT[][" : "DCL OUT[");
       add_uint(*out, i + 1);
       add(*out, hull_ ? "], GENERIC[" : "], GENERIC[");
@@ -1498,7 +1500,7 @@ void TgsiEmitter::assemble(String* out) {
     if (sys_used_[kSysVertexId]) add(*out, "DCL SV[0], VERTEXID\n");
     if (sys_used_[kSysInstanceId]) add(*out, "DCL SV[1], INSTANCEID\n");
     add(*out, "DCL OUT[0], POSITION\n");
-    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    for (uint32_t i = 0; i < varyings_; ++i) {
       add(*out, "DCL OUT[");
       add_uint(*out, i + 1);
       add(*out, "], GENERIC[");
@@ -1589,7 +1591,7 @@ if (vertex_ || domain_) {
     String upright = str();
     add(upright, "OUT[5]");
     line("MOV", &upright, &pos);
-    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    for (uint32_t i = 0; i < varyings_; ++i) {
       String target = str();
       add(target, "OUT[");
       add_uint(target, i + 1);
@@ -1735,7 +1737,7 @@ NtStatus TgsiEmitter::run(String* out) {
   if (vertex_ || geometry_ || hull_ || domain_) {
     const String pos = temp(kPosition);
     line("MOV", &pos, &z);
-    for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+    for (uint32_t i = 0; i < varyings_; ++i) {
       const String v = temp(kVarying + i);
       line("MOV", &v, &z);
     }
@@ -1767,7 +1769,7 @@ NtStatus TgsiEmitter::run(String* out) {
       line("UIF", &cond);
       const String pos = temp(kPosition), id_reg = temp(kSys + kSysOutputControlPointId, ".x");
       line("MOV", &pos, &z);
-      for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) {
+      for (uint32_t i = 0; i < varyings_; ++i) {
         const String v = temp(kVarying + i);
         line("MOV", &v, &z);
       }
@@ -1845,8 +1847,8 @@ NtStatus TgsiEmitter::run(String* out) {
   return status::kSuccess;
 }
 
-NtStatus D3d9Program::emit_tgsi(String* out) const {
-  TgsiEmitter emitter(*this, allocator_);
+NtStatus D3d9Program::emit_tgsi(String* out, uint32_t varyings) const {
+  TgsiEmitter emitter(*this, allocator_, varyings < graphics::kMaxVaryings ? varyings : graphics::kMaxVaryings);
   return emitter.run(out);
 }
 

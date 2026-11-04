@@ -158,7 +158,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateCommandSignature(Dev *This, const D3D
     const D3D12_INDIRECT_ARGUMENT_TYPE t = desc->pArgumentDescs[i].Type;
     if (t > D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW) return DXGI_ERROR_UNSUPPORTED;
     if (t >= D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT && t != D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW && t != D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW) needs_signature = 1;
-    if (t == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW && desc->pArgumentDescs[i].VertexBuffer.Slot != 0) return DXGI_ERROR_UNSUPPORTED;
+    if (t == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW && desc->pArgumentDescs[i].VertexBuffer.Slot >= This->caps.max_vertex_buffers) return DXGI_ERROR_UNSUPPORTED;
   }
   const D3D12_INDIRECT_ARGUMENT_TYPE last = desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type;
   if (last != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW && last != D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && last != D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) return E_INVALIDARG;
@@ -266,7 +266,7 @@ static CmdList *indirect_expand(Indirect *in) {
           break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
           const D3D12_VERTEX_BUFFER_VIEW v = {*(const UINT64 *)p, w[2], w[3]};
-          list_IASetVertexBuffers(t, 0, 1, &v);
+          list_IASetVertexBuffers(t, a->VertexBuffer.Slot, 1, &v);
           p += 16;
           break;
         }
@@ -328,8 +328,14 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
         break;
       }
       case B_VERTEX_BUFFERS: {
-        const D3D12_VERTEX_BUFFER_VIEW v = {a[2], (UINT)a[3], (UINT)a[4]};
-        if (a[1]) list_IASetVertexBuffers(l, (UINT)a[0], (UINT)a[1], &v);
+        D3D12_VERTEX_BUFFER_VIEW v[8];
+        const UINT n = e->ndata / 4 < 8 ? e->ndata / 4 : 8;
+        for (UINT k = 0; k < n; ++k) {
+          v[k].BufferLocation = e->data[4 * k] | ((UINT64)e->data[4 * k + 1] << 32);
+          v[k].SizeInBytes = e->data[4 * k + 2];
+          v[k].StrideInBytes = e->data[4 * k + 3];
+        }
+        if (n) list_IASetVertexBuffers(l, (UINT)a[0], n, v);
         break;
       }
       case B_HEAPS: {

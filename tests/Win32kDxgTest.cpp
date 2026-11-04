@@ -310,9 +310,11 @@ void test_adapters() {
   CHECK(query(30, kE, 4) == kOk && w.get32(kE) == 1);
   CHECK(query(3, kE, 24) == kOk && w.get64(kE) == (64ull << 20));                     // dedicated video memory is the local budget
   CHECK(query(4, kE, 16) == kOk && w.get32(kE) == luid_low);
-  CHECK(query(0, kE, lay::kAllocPrivateBytes + 24) == kOk);                           // UMDRIVERPRIVATE: the capabilities (96 bytes)
+  CHECK(query(0, kE, lay::kAllocPrivateBytes + 32) == kOk);                           // UMDRIVERPRIVATE: the capabilities (104 bytes)
   CHECK(w.get32(kE) >= 2048 && (w.get32(kE + 24) & 1) == 0);
-  CHECK(query(0, kE, 95) == kBufferTooSmall);
+  // what the software renderer takes (DeviceInfo::limits): attributes, varyings, texture units, then after the name the colour targets and the vertex buffers
+  CHECK(w.get32(kE + 4) == 16 && w.get32(kE + 8) == 16 && w.get32(kE + 12) == 16 && w.get32(kE + 96) == 8 && w.get32(kE + 100) == 8);
+  CHECK(query(0, kE, 103) == kBufferTooSmall);
   w.put(kE, ConstByteView(reinterpret_cast<const uint8_t*>("\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"), 12));
   CHECK(query(17, kE, 12) == kOk && w.get32(kE) == 0 && w.get32(kE + 8) == 0);        // WDDM 1.2 caps: nothing
   CHECK(query(9999, kE, 4) == kInvalidParameter);

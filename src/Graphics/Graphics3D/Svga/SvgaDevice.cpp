@@ -358,8 +358,8 @@ IShaderModule* SvgaDevice::create_shader_module(const ShaderModuleDesc& desc) {
 void SvgaDevice::destroy_shader_module(IShaderModule* module) { destroy(allocator_, static_cast<SvgaShaderModule*>(module)); }
 
 IPipeline* SvgaDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
-  if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
-  if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes || desc.varying_count > kMaxVaryings) return nullptr;
+  if (desc.texture_count > kBaseTextureUnits || desc.fragment_shader == nullptr) return nullptr;
+  if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kBaseVertexAttributes || desc.varying_count > kBaseVaryings) return nullptr;
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment) return nullptr;
   return make<SvgaPipeline>(allocator_, desc);
 }
@@ -387,7 +387,7 @@ bool SvgaDevice::submit(ICommandBuffer* commands) {
   struct Bound {
     const SvgaImage* image = nullptr;
     SamplerDesc sampler;
-  } textures[kMaxTextureUnits];
+  } textures[kBaseTextureUnits];
   bool textures_dirty = false;
   const ConstByteView pool = recorder.constants();
   const uint32_t cid = kContext;
@@ -495,7 +495,7 @@ bool SvgaDevice::submit(ICommandBuffer* commands) {
         break;
       case RecordedCommand::Type::BindTexture: {
         const SvgaImage* image = static_cast<const SvgaImage*>(cmd.image);
-        if (cmd.unit >= kMaxTextureUnits || !image || !(image->usage() & kImageSampled) || image->format() == Format::D32Float) return false;
+        if (cmd.unit >= kBaseTextureUnits || !image || !(image->usage() & kImageSampled) || image->format() == Format::D32Float) return false;
         textures[cmd.unit].image = image;
         textures[cmd.unit].sampler = cmd.sampler;
         textures_dirty = true;
@@ -568,7 +568,7 @@ bool SvgaDevice::submit(ICommandBuffer* commands) {
         const GraphicsPipelineDesc& d = pipeline->desc();
         // The vertex declarations: each attribute is an array in the vertex buffer. Location 0 is the position and 1 the color by convention
         // (what the shaders declare); further locations are texture coordinates.
-        uint32_t body[3 + 9 * kMaxVertexAttributes + 7] = {cid, d.attribute_count, 1};
+        uint32_t body[3 + 9 * kBaseVertexAttributes + 7] = {cid, d.attribute_count, 1};
         uint32_t n = 3;
         const uint32_t vertex_count = cmd.count;
         const uint64_t first_vertex = indexed ? 0 : cmd.first;

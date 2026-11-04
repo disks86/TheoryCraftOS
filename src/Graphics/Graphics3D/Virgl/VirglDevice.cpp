@@ -473,7 +473,7 @@ class VirglPipeline final : public VirglPipelineBase {
       const auto* geometry = static_cast<const VirglShaderModule*>(desc.geometry_shader);
       if (!geometry->tgsi()) return;
       // The host gives a register one stream: a shader output that two streams capture cannot be had.
-      uint8_t streams_of_output[kMaxVaryings + 1] = {};
+      uint8_t streams_of_output[kBaseVaryings + 1] = {};
       for (uint32_t e = 0; e < desc.stream_output_count; ++e) {
         const StreamOutputEntry& entry = desc.stream_output[e];
         if (entry.output == 0) continue;
@@ -580,7 +580,7 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);  // s0: independent blend enable, alpha to coverage (no logic op, dither...)
     cmd[n++] = 0;  // s1
     cmd[n++] = blend_rt;
-    for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
+    for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kBaseColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
 
     // Depth and stencil (the same stencil state for both faces).
     const uint32_t depth_func = desc.depth_test ? static_cast<uint32_t>(desc.depth_compare) : virgl::kFuncAlways;   // (CompareOp is numbered as PIPE_FUNC)
@@ -767,9 +767,9 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 }
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
-  if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
-  if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes ||
-      desc.varying_count > kMaxVaryings)
+  if (desc.texture_count > kBaseTextureUnits || desc.fragment_shader == nullptr) return nullptr;
+  if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kBaseVertexAttributes ||
+      desc.varying_count > kBaseVaryings)
     return nullptr;
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment)
     return nullptr;
@@ -825,13 +825,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
 
   const VirglPipeline* pipeline = nullptr;
   VirglImage* color = nullptr;
-  VirglImage* extra_colors[kMaxColorTargets - 1] = {};
+  VirglImage* extra_colors[kBaseColorTargets - 1] = {};
   uint32_t target_count = 1;
   VirglImage* depth = nullptr;
   VirglBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
-  const VirglImage* textures[kMaxTextureUnits] = {};
-  SamplerDesc samplers[kMaxTextureUnits];
+  const VirglImage* textures[kBaseTextureUnits] = {};
+  SamplerDesc samplers[kBaseTextureUnits];
   bool textures_dirty = false;
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
@@ -988,10 +988,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (depth && (depth->format() != Format::D32Float || !depth->surface())) return false;
         const Extent2D e = color->extent();
         target_count = 1;
-        for (uint32_t n = 0; n + 1 < kMaxColorTargets; ++n) {
+        for (uint32_t n = 0; n + 1 < kBaseColorTargets; ++n) {
           extra_colors[n] = static_cast<VirglImage*>(cmd.pass.extra_colors[n]);
           if (!extra_colors[n]) {
-            for (uint32_t k = n + 1; k + 1 < kMaxColorTargets; ++k)
+            for (uint32_t k = n + 1; k + 1 < kBaseColorTargets; ++k)
               if (cmd.pass.extra_colors[k]) return false;   // (a gap)
             break;
           }
@@ -1004,7 +1004,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             if (extra_colors[k] == extra) return false;
           target_count = n + 2;
         }
-        for (uint32_t n = target_count - 1; n + 1 < kMaxColorTargets; ++n) extra_colors[n] = nullptr;
+        for (uint32_t n = target_count - 1; n + 1 < kBaseColorTargets; ++n) extra_colors[n] = nullptr;
         stream.command(virgl::kSetFramebufferState, 0, 2 + target_count);
         stream.put(target_count);
         stream.put(depth ? depth->surface() : 0);
@@ -1225,7 +1225,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       case RecordedCommand::Type::BindTexture: {
         const VirglImage* image = static_cast<const VirglImage*>(cmd.image);
-        if (cmd.unit >= kMaxTextureUnits || !image || !image->view()) return false;   // (only an image created with kImageSampled has a view)
+        if (cmd.unit >= kBaseTextureUnits || !image || !image->view()) return false;   // (only an image created with kImageSampled has a view)
         textures[cmd.unit] = image;
         samplers[cmd.unit] = cmd.sampler;
         textures_dirty = true;
@@ -1299,7 +1299,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             stream.put(virgl::kShaderFragment);
             stream.put(0);
             for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit]->view());
-            uint32_t states[kMaxTextureUnits];
+            uint32_t states[kBaseTextureUnits];
             for (uint32_t unit = 0; unit < unit_count; ++unit) {
               states[unit] = sampler_state(samplers[unit]);   // (created straight away, so it exists before the stream that uses it)
               if (!states[unit]) return false;

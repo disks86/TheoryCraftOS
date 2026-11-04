@@ -119,15 +119,14 @@ struct CmdList {
   DescHeap *heaps_used[8];       /* every shader-visible heap the list set: their kernel copies are brought up to date when it is executed */
   UINT nheaps_used;
   D3D12_PRIMITIVE_TOPOLOGY topology;
-  UINT vb_alloc, vb_stride;
-  UINT64 vb_offset, vb_size;
+  struct { UINT alloc, stride; UINT64 offset, size; } vb[8];      /* the vertex buffers (input slots) */
   UINT ib_alloc, ib_format;
   UINT64 ib_offset;
   D3D12_VIEWPORT viewport;
   D3D12_RECT scissor;
   int have_viewport, have_scissor;
   UINT stencil_ref;
-  UINT rtv[4];                 /* the kernel's allocations of the colour targets */
+  UINT rtv[8];                 /* the kernel's allocations of the colour targets */
   UINT rtv_count;
   UINT dsv;
   int pass_open;
@@ -139,8 +138,8 @@ struct CmdList {
   int sent_valid;
   UINT sent_pipeline;
   UINT sent_topology;
-  UINT sent_vb_alloc, sent_ib_alloc;
-  UINT64 sent_vb_offset, sent_ib_offset;
+  UINT sent_vb_alloc[8], sent_ib_alloc;
+  UINT64 sent_vb_offset[8], sent_ib_offset;
   UINT sent_ib_format;
   int sent_viewport, sent_scissor;
   int sent_binding;            /* 0 none, 1 graphics, 2 compute */
@@ -187,7 +186,8 @@ static int chunk_new(CmdList *l) {
   l->sent_binding = 0;
   l->sent_pipeline = 0;
   l->sent_topology = 0xFFFFFFFFu;
-  l->sent_vb_alloc = l->sent_ib_alloc = 0;
+  memset(l->sent_vb_alloc, 0, sizeof l->sent_vb_alloc);
+  l->sent_ib_alloc = 0;
   l->sent_viewport = l->sent_scissor = 0;
   l->dirty_heaps = 1;
   return 1;
@@ -316,7 +316,7 @@ static void STDMETHODCALLTYPE list_ClearState(CmdList *This, ID3D12PipelineState
 static SoftDesc *view_at(D3D12_CPU_DESCRIPTOR_HANDLE h) { return desc_at(h); }
 
 static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UINT flags, const float color[4], float depth, UINT stencil) {
-  UINT w[9 + 3];
+  UINT w[9 + 7];
   UINT n = 0;
   w[n++] = alloc_index(l, color_alloc);
   w[n++] = depth_alloc ? alloc_index(l, depth_alloc) : 0xFFFFFFFFu;
@@ -328,7 +328,7 @@ static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UI
   w[n++] = bits_of(depth);
   w[n++] = stencil;
   /* (the other colour targets, when the pass has them; clears of those are separate passes) */
-  for (UINT i = 1; i < l->rtv_count && i < 4 && flags != 0xFFFFFFFFu && color_alloc == l->rtv[0]; ++i) w[n++] = alloc_index(l, l->rtv[i]);
+  for (UINT i = 1; i < l->rtv_count && i < 8 && flags != 0xFFFFFFFFu && color_alloc == l->rtv[0]; ++i) w[n++] = alloc_index(l, l->rtv[i]);
   packet(l, OP_BEGIN_PASS, w, n);
 }
 
@@ -365,7 +365,8 @@ static int ensure_pass(CmdList *l) {
   /* a new pass forgets what was bound (a device may have its own idea of what carries over) */
   l->sent_pipeline = 0;
   l->sent_topology = 0xFFFFFFFFu;
-  l->sent_vb_alloc = l->sent_ib_alloc = 0;
+  memset(l->sent_vb_alloc, 0, sizeof l->sent_vb_alloc);
+  l->sent_ib_alloc = 0;
   l->sent_viewport = l->sent_scissor = 0;
   l->sent_binding = 0;
   return 1;
@@ -454,7 +455,10 @@ static int prepare_draw(CmdList *l, int indexed) {
     send_binding(l, &l->gfx, 1);
     l->dirty_heaps = 0;
   }
-  const UINT pipeline = pso_pipeline(l->pso, l->vb_alloc ? l->vb_stride : (l->pso->attr_count ? 0 : 0), l->stencil_ref);
+  UINT strides[8] = {0};
+  for (UINT slot = 0; slot < 8; ++slot)
+    if (l->pso->slots_used >> slot & 1) strides[slot] = l->vb[slot].stride;
+  const UINT pipeline = pso_pipeline(l->pso, strides, l->stencil_ref);
   if (!pipeline) return 0;
   if (pipeline != l->sent_pipeline) {
     packet(l, OP_BIND_PIPELINE, &pipeline, 1);
@@ -476,11 +480,13 @@ static int prepare_draw(CmdList *l, int indexed) {
     packet(l, OP_SET_TOPOLOGY, &topology, 1);
     l->sent_topology = topology;
   }
-  if (l->vb_alloc && (l->vb_alloc != l->sent_vb_alloc || l->vb_offset != l->sent_vb_offset)) {
-    UINT w[2] = {alloc_index(l, l->vb_alloc), (UINT)l->vb_offset};
-    packet(l, OP_BIND_VB, w, 2);
-    l->sent_vb_alloc = l->vb_alloc;
-    l->sent_vb_offset = l->vb_offset;
+  for (UINT slot = 0; slot < 8; ++slot) {
+    if (!(l->pso->slots_used >> slot & 1) || !l->vb[slot].alloc) continue;
+    if (l->vb[slot].alloc == l->sent_vb_alloc[slot] && l->vb[slot].offset == l->sent_vb_offset[slot]) continue;
+    UINT w[3] = {alloc_index(l, l->vb[slot].alloc), (UINT)l->vb[slot].offset, slot};
+    packet(l, OP_BIND_VB, w, slot ? 3 : 2);      /* (the slot is a third word, left out for the first buffer) */
+    l->sent_vb_alloc[slot] = l->vb[slot].alloc;
+    l->sent_vb_offset[slot] = l->vb[slot].offset;
   }
   if (indexed && l->ib_alloc && (l->ib_alloc != l->sent_ib_alloc || l->ib_offset != l->sent_ib_offset || l->ib_format != l->sent_ib_format)) {
     UINT w[3] = {alloc_index(l, l->ib_alloc), l->ib_format == DXGI_FORMAT_R32_UINT ? 1u : 0u, (UINT)l->ib_offset};
@@ -569,21 +575,37 @@ static void STDMETHODCALLTYPE list_IASetIndexBuffer(CmdList *l, const D3D12_INDE
   l->ib_offset = offset;
   l->ib_format = view->Format;
 }
-static void STDMETHODCALLTYPE list_IASetVertexBuffers(CmdList *l, UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW *views) { BUNDLE_LOG(l, B_VERTEX_BUFFERS, start, count, views && count ? views[0].BufferLocation : 0, views && count ? views[0].SizeInBytes : 0, views && count ? views[0].StrideInBytes : 0);
-  if (start != 0 || !count) return;      /* (one vertex buffer: slot 0) */
-  if (!views || !views[0].BufferLocation) { l->vb_alloc = 0; return; }
-  UINT64 offset = 0;
-  Resource *r = va_find(views[0].BufferLocation, &offset);
-  l->vb_alloc = r ? r->alloc : 0;
-  l->vb_offset = offset;
-  l->vb_stride = views[0].StrideInBytes;
-  l->vb_size = views[0].SizeInBytes;
+static void STDMETHODCALLTYPE list_IASetVertexBuffers(CmdList *l, UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW *views) {
+  if (l->bundle) {
+    /* (a bundle keeps the views, four values each: the address, the size and the stride) */
+    UINT packed[64];
+    UINT n = 0;
+    for (UINT i = 0; i < count && i < 8 && views; ++i) {
+      packed[n++] = (UINT)views[i].BufferLocation;
+      packed[n++] = (UINT)(views[i].BufferLocation >> 32);
+      packed[n++] = views[i].SizeInBytes;
+      packed[n++] = views[i].StrideInBytes;
+    }
+    UINT64 a_[6] = {start, count};
+    bundle_log(l, B_VERTEX_BUFFERS, a_, packed, n);
+    return;
+  }
+  for (UINT i = 0; i < count && start + i < 8; ++i) {
+    const UINT slot = start + i;
+    l->vb[slot].alloc = 0;
+    if (!views || !views[i].BufferLocation) continue;
+    UINT64 offset = 0;
+    Resource *r = va_find(views[i].BufferLocation, &offset);
+    l->vb[slot].alloc = r ? r->alloc : 0;
+    l->vb[slot].offset = offset;
+    l->vb[slot].stride = views[i].StrideInBytes;
+    l->vb[slot].size = views[i].SizeInBytes;
+  }
 }
-
 static void STDMETHODCALLTYPE list_OMSetRenderTargets(CmdList *l, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv) {
   end_pass(l);
   l->rtv_count = 0;
-  for (UINT i = 0; i < count && i < 4 && rtvs; ++i) {
+  for (UINT i = 0; i < count && i < 8 && i < l->d.dev->caps.max_color_targets && rtvs; ++i) {
     D3D12_CPU_DESCRIPTOR_HANDLE h = single ? (D3D12_CPU_DESCRIPTOR_HANDLE){rtvs[0].ptr + (SIZE_T)i * DESCRIPTOR_STRIDE} : rtvs[i];
     const SoftDesc *d = view_at(h);
     l->rtv[l->rtv_count++] = d && d->kind == DK_RTV ? d->alloc : 0;

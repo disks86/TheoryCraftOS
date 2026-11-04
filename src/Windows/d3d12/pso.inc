@@ -115,7 +115,8 @@ struct RootSig {
   UINT khandle;
   BYTE *blob;
   SIZE_T blob_size;
-  UINT textures;           /* the texture units the signature's SRV ranges reach (t0 .. t<n-1>) */
+  UINT textures;           /* the texture units the signature's SRV ranges reach (t0 .. t<n-1>); an unbounded range reaches as many as the device has */
+  int textures_unbounded;
   UINT parameter_count;
   UINT ptype[16];          /* of each parameter: D3D12_ROOT_PARAMETER_TYPE */
   UINT pconstants[16];     /* the 32-bit values of a constants parameter */
@@ -154,8 +155,9 @@ static void rs_scan(RootSig *r, const BYTE *b, SIZE_T n) {
       const BYTE *range = b + ranges + k * stride;
       if (rd32(range) != 0) continue;      /* SRV */
       const UINT num = rd32(range + 4), base = rd32(range + 8);
-      const UINT top = num == 0xFFFFFFFFu ? 2 : base + num;
-      if (top > r->textures) r->textures = top > 2 ? 2 : top;
+      if (num == 0xFFFFFFFFu) r->textures_unbounded = 1;
+      const UINT top = num == 0xFFFFFFFFu ? 0 : base + num;
+      if (top > r->textures) r->textures = top;
     }
   }
 }
@@ -310,9 +312,9 @@ EXPORT HRESULT WINAPI D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED
 /* ---- pipeline states ----------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 #define MAX_PSO_PIPELINES 8
-typedef struct PsoPipe { UINT stride, stencil_ref, handle; } PsoPipe;
+typedef struct PsoPipe { UINT strides[8], stencil_ref, handle; } PsoPipe;
 
-typedef struct Attr { UINT location, floats, offset, per_instance; } Attr;
+typedef struct Attr { UINT location, floats, offset, per_instance, slot; } Attr;
 
 struct Pso {
   DObj d;
@@ -320,13 +322,14 @@ struct Pso {
   RootSig *rs;
   UINT shaders[6];             /* vertex, pixel, geometry, hull, domain, compute (the kernel's handles; 0: none) */
   UINT attr_count;
-  Attr attrs[4];
+  Attr attrs[16];
   UINT varyings, textures;
   D3D12_BLEND_DESC blend;
   D3D12_RASTERIZER_DESC raster;
   D3D12_DEPTH_STENCIL_DESC depth;
   UINT render_targets;
   DXGI_FORMAT rtv_formats[8];
+  UINT slots_used;             /* the vertex buffers (input slots) the layout reads, as a mask */
   DXGI_FORMAT dsv_format;
   D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type;
   UINT so_entries, so_rasterized, so_strides[4];
@@ -417,26 +420,32 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   SigElement inputs[16], outputs[16];
   int found = 0, found_out = 0;
   const UINT n_in = dxbc_signature(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 0, inputs, 16, &found);
-  if (desc->InputLayout.NumElements > 4) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
-  UINT appended = 0;
+  const Dev *dev = This;
+  if (desc->InputLayout.NumElements > dev->caps.max_vertex_attributes || desc->InputLayout.NumElements > 16) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+  if (desc->NumRenderTargets > dev->caps.max_color_targets || desc->NumRenderTargets > 8) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+  UINT appended[8] = {0};
   for (UINT i = 0; i < desc->InputLayout.NumElements; ++i) {
     const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
     const int floats = vertex_floats(e->Format);
-    if (e->InputSlot != 0 || !floats) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+    if (e->InputSlot >= dev->caps.max_vertex_buffers || e->InputSlot >= 8 || !floats) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
     Attr *a = &p->attrs[p->attr_count++];
     a->floats = (UINT)floats;
+    a->slot = e->InputSlot;
     a->per_instance = e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
-    a->offset = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? appended : e->AlignedByteOffset;
-    appended = a->offset + (UINT)floats * 4;
+    a->offset = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? appended[e->InputSlot] : e->AlignedByteOffset;
+    appended[e->InputSlot] = a->offset + (UINT)floats * 4;
+    p->slots_used |= 1u << e->InputSlot;
     a->location = i;
     for (UINT k = 0; k < n_in; ++k)
       if (ieq(inputs[k].name, e->SemanticName) && inputs[k].index == e->SemanticIndex) { a->location = inputs[k].reg; break; }
+    if (a->location >= dev->caps.max_vertex_attributes) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
   }
   /* the interpolants between the stages: the kernel counts the registers the vertex shader writes, its position included */
   const UINT n_out = dxbc_signature(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 1, outputs, 16, &found_out);
   p->varyings = found_out ? n_out : 3;
-  if (p->varyings > 4) p->varyings = 4;
-  p->textures = p->rs->textures;
+  if (p->varyings > dev->caps.max_varyings) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+  p->textures = p->rs->textures_unbounded ? dev->caps.max_texture_units : p->rs->textures;
+  if (p->textures > dev->caps.max_texture_units) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
   /* stream output: the captured outputs by their register in the output signature of the last stage before the rasterizer (the geometry shader, else the vertex shader) */
   if (desc->StreamOutput.NumEntries) {
     const D3D12_SHADER_BYTECODE *last = desc->GS.pShaderBytecode ? &desc->GS : &desc->VS;
@@ -505,11 +514,12 @@ static UINT cmp_func(UINT f) { return f >= 1 && f <= 8 ? f - 1 : 7; }
 static UINT stencil_op(UINT o) { return o >= 1 && o <= 8 ? o - 1 : 0; }
 
 /* The kernel pipeline of the state for these draws, made when first needed. Returns 0 when the kernel refuses. */
-static UINT pso_pipeline(Pso *p, UINT stride, UINT stencil_ref) {
+static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref) {
   if (p->compute) return p->compute_pipe;
   for (UINT i = 0; i < p->pipe_count; ++i)
-    if (p->pipes[i].stride == stride && p->pipes[i].stencil_ref == stencil_ref) return p->pipes[i].handle;
-  UINT r[160];
+    if (p->pipes[i].stencil_ref == stencil_ref && memcmp(p->pipes[i].strides, strides, 8 * sizeof(UINT)) == 0) return p->pipes[i].handle;
+  const UINT stride = strides[0];
+  UINT r[320];
   UINT w = 0;
   const D3D12_RENDER_TARGET_BLEND_DESC *rt = &p->blend.RenderTarget[0];
   r[w++] = ESC_CREATE_PIPELINE;
@@ -546,10 +556,10 @@ static UINT pso_pipeline(Pso *p, UINT stride, UINT stencil_ref) {
   r[w++] = blend_op(rt->BlendOpAlpha);
   r[w++] = rt->RenderTargetWriteMask & 0xF;
   UINT instance_bits = 0;
-  for (UINT i = 0; i < p->attr_count; ++i)
+  for (UINT i = 0; i < p->attr_count && i < 4; ++i)
     if (p->attrs[i].per_instance) instance_bits |= 1u << i;
   r[w++] = instance_bits;
-  r[w++] = p->render_targets ? (p->render_targets > 4 ? 4 : p->render_targets) : 1;
+  r[w++] = p->render_targets ? p->render_targets : 1;
   r[w++] = p->blend.IndependentBlendEnable ? 1 : 0;
   for (UINT t = 1; t < 4; ++t) {
     const D3D12_RENDER_TARGET_BLEND_DESC *b = &p->blend.RenderTarget[p->blend.IndependentBlendEnable ? t : 0];
@@ -573,6 +583,43 @@ static UINT pso_pipeline(Pso *p, UINT stride, UINT stencil_ref) {
     for (UINT i = 0; i < 4; ++i) r[w++] = p->so_strides[i];
     for (UINT i = 0; i < p->so_entries; ++i) { r[w++] = p->so_entry[i][0]; r[w++] = p->so_entry[i][1]; }
   }
+  /* beyond four attributes, a vertex buffer other than the first, or colour targets 4 .. 7 with their own blending: the last part of the description */
+  UINT max_slot = 0;
+  for (UINT i = 0; i < p->attr_count; ++i)
+    if (p->attrs[i].slot > max_slot) max_slot = p->attrs[i].slot;
+  const UINT more_blends = p->blend.IndependentBlendEnable && p->render_targets > 4 ? p->render_targets - 4 : 0;
+  if (p->attr_count > 4 || max_slot > 0 || more_blends) {
+    if (!p->so_entries) r[w++] = 0;
+    const UINT extra = p->attr_count > 4 ? p->attr_count - 4 : 0;
+    r[w++] = extra;
+    UINT instance_high = 0;
+    for (UINT k = 0; k < extra; ++k) {
+      const Attr *a = &p->attrs[4 + k];
+      r[w++] = a->location;
+      r[w++] = (a->floats - 1) | (a->slot << 8);
+      r[w++] = a->offset;
+      if (a->per_instance) instance_high |= 1u << k;
+    }
+    r[w++] = instance_high;
+    UINT slots_low = 0;
+    for (UINT i = 0; i < p->attr_count && i < 4; ++i) slots_low |= p->attrs[i].slot << (4 * i);
+    r[w++] = slots_low;
+    r[w++] = max_slot;      /* the strides of slots 1 .. max_slot */
+    for (UINT sl = 1; sl <= max_slot; ++sl) r[w++] = strides[sl];
+    r[w++] = more_blends;
+    for (UINT k = 0; k < more_blends; ++k) {
+      const D3D12_RENDER_TARGET_BLEND_DESC *b = &p->blend.RenderTarget[4 + k];
+      r[w++] = b->BlendEnable ? 1 : 0;
+      r[w++] = b->BlendEnable ? 1 : 0;
+      r[w++] = blend_factor(b->SrcBlend);
+      r[w++] = blend_factor(b->DestBlend);
+      r[w++] = blend_factor(b->SrcBlendAlpha);
+      r[w++] = blend_factor(b->DestBlendAlpha);
+      r[w++] = blend_op(b->BlendOp);
+      r[w++] = blend_op(b->BlendOpAlpha);
+      r[w++] = b->RenderTargetWriteMask & 0xF;
+    }
+  }
   UINT reply[1] = {0};
   if (!KMT_OK(dev_escape(p->d.dev, r, w, reply, 1))) return 0;
   if (p->pipe_count == MAX_PSO_PIPELINES) {
@@ -581,7 +628,7 @@ static UINT pso_pipeline(Pso *p, UINT stride, UINT stencil_ref) {
     memmove(&p->pipes[0], &p->pipes[1], (MAX_PSO_PIPELINES - 1) * sizeof p->pipes[0]);
     p->pipe_count--;
   }
-  p->pipes[p->pipe_count].stride = stride;
+  memcpy(p->pipes[p->pipe_count].strides, strides, 8 * sizeof(UINT));
   p->pipes[p->pipe_count].stencil_ref = stencil_ref;
   p->pipes[p->pipe_count].handle = reply[0];
   p->pipe_count++;

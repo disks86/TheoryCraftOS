@@ -227,7 +227,7 @@ struct VegaGraphicsDevice::Scratch {
     for (ByteView& v : texture) release_view(allocator, v);
   }
   allocators::IAllocator& allocator;
-  ByteView area, target, depth, stencil, initial_target, initial_depth, initial_stencil, texture[kMaxTextureUnits];
+  ByteView area, target, depth, stencil, initial_target, initial_depth, initial_stencil, texture[kBaseTextureUnits];
   List<uint32_t> indices;
 };
 
@@ -247,8 +247,8 @@ struct VegaGraphicsDevice::DrawArgs {
   int32_t base_vertex = 0;
   const float* constants = nullptr;   // rows of four
   uint32_t constant_rows = 0;
-  VegaImage* textures[kMaxTextureUnits] = {};
-  SamplerDesc samplers[kMaxTextureUnits];
+  VegaImage* textures[kBaseTextureUnits] = {};
+  SamplerDesc samplers[kBaseTextureUnits];
 };
 
 VegaGraphicsDevice::VegaGraphicsDevice(allocators::IAllocator& allocator, hardware::AmdVegaM& card) : allocator_(allocator), card_(card) {
@@ -310,7 +310,7 @@ IPipeline* VegaGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
   const VegaModule* vs = static_cast<const VegaModule*>(desc.vertex_shader);
   const VegaModule* fs = static_cast<const VegaModule*>(desc.fragment_shader);
   if (!vs || !fs || vs->stage() != ShaderStage::Vertex || fs->stage() != ShaderStage::Fragment) return nullptr;
-  if (desc.color_target_count != 1 || desc.independent_blend || desc.texture_count > kMaxTextureUnits || desc.attribute_count > kMaxVertexAttributes || desc.vertex_stride == 0 || desc.vertex_stride % 4 != 0)
+  if (desc.color_target_count != 1 || desc.independent_blend || desc.texture_count > kBaseTextureUnits || desc.attribute_count > kBaseVertexAttributes || desc.vertex_stride == 0 || desc.vertex_stride % 4 != 0)
     return nullptr;
   for (uint32_t i = 0; i < desc.attribute_count; ++i)
     if (desc.attributes[i].location >= gcn::abi::kMaxAttributes || desc.attributes[i].per_instance || desc.attributes[i].offset % 4 != 0) return nullptr;
@@ -521,7 +521,7 @@ bool VegaGraphicsDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::BindTexture: {
         VegaImage* image = static_cast<VegaImage*>(cmd.image);
-        if (cmd.unit >= kMaxTextureUnits || !image) return fail("a bad texture binding");
+        if (cmd.unit >= kBaseTextureUnits || !image) return fail("a bad texture binding");
         a.textures[cmd.unit] = image;
         a.samplers[cmd.unit] = cmd.sampler;
         break;
