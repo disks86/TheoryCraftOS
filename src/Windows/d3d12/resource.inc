@@ -22,6 +22,11 @@
  * so a buffer in an upload or readback heap keeps its CPU copy here (`shadow`): Map hands that out; the copy goes to the kernel before the GPU work that may read it runs
  * (res_push, from ExecuteCommandLists), and a readback buffer is read from the kernel when it is mapped (res_pull). */
 
+typedef struct TileBind {
+  struct HeapObj *heap;      /* a reserved resource's tile: where it is (NULL: nowhere) */
+  UINT64 tile;
+} TileBind;
+
 typedef struct HeapObj {
   DObj d;
   D3D12_HEAP_DESC desc;
@@ -46,6 +51,8 @@ struct Resource {
   UINT64 sum;                  /* of the shadow as the kernel has it */
   int pushed;
   int reserved;                /* a tiled resource: the tiles are mapped to heaps with UpdateTileMappings */
+  TileBind *tile_map;          /* ... and where each tile is, as UpdateTileMappings left it (CopyTileMappings copies from here) */
+  UINT tile_count;
   HeapObj *heap;               /* placed: the heap (a reference) */
   struct Resource *next_cpu;   /* the list of the resources with a shadow */
 };
@@ -90,6 +97,74 @@ static void res_push_all(void) {
   LeaveCriticalSection(&g_lock);
 }
 
+static UINT mip_count_for(UINT w, UINT h) {
+  UINT n = 1, m = w > h ? w : h;
+  while (m > 1) { m >>= 1; ++n; }
+  return n;
+}
+static UINT mip_extent(UINT size, UINT level) { UINT v = size >> level; return v ? v : 1; }
+
+/* ---- the tiles of a reserved resource ---------------------------------------------------------------------------------------------------------------------------------- */
+
+#define TILE_TEXELS 128
+/* The tile numbering the kernel has (VidMm.cpp): a buffer is a row of 64 KiB tiles; a texture has the tiles of its standard mip levels (at least a tile in both directions), level after level,
+ * row by row, and then one tile for all the smaller levels together (the mip tail). */
+typedef struct TileLayout {
+  UINT standard;               /* the standard mip levels */
+  UINT mips;
+  UINT total;
+  UINT first[16], across[16], down[16];
+  UINT tail_first;             /* the tail tile (when standard < mips) */
+} TileLayout;
+
+static void tile_layout(const D3D12_RESOURCE_DESC *d, TileLayout *t) {
+  memset(t, 0, sizeof *t);
+  if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+    t->mips = 1;
+    t->total = t->across[0] = (UINT)((d->Width + KTILE_BYTES - 1) / KTILE_BYTES);
+    t->down[0] = 1;
+    return;
+  }
+  t->mips = d->MipLevels ? d->MipLevels : 1;
+  if (t->mips > 16) t->mips = 16;
+  while (t->standard < t->mips && mip_extent((UINT)d->Width, t->standard) >= TILE_TEXELS && mip_extent(d->Height, t->standard) >= TILE_TEXELS) {
+    const UINT l = t->standard++;
+    t->first[l] = t->total;
+    t->across[l] = (mip_extent((UINT)d->Width, l) + TILE_TEXELS - 1) / TILE_TEXELS;
+    t->down[l] = (mip_extent(d->Height, l) + TILE_TEXELS - 1) / TILE_TEXELS;
+    t->total += t->across[l] * t->down[l];
+  }
+  t->tail_first = t->total;
+  if (t->standard < t->mips) t->total++;
+}
+
+/* The linear number of the tile at a coordinate (Z is not used: textures are 2D); (UINT)-1 for one that is not there. */
+static UINT tile_number(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c) {
+  UINT n;
+  if (c.Subresource < t->standard) n = t->first[c.Subresource] + c.Y * t->across[c.Subresource] + c.X;
+  else if (c.Subresource < t->mips) n = t->tail_first + c.X;
+  else if (t->mips == 1 && t->standard == 0) n = c.X;
+  else return (UINT)-1;
+  return n < t->total ? n : (UINT)-1;
+}
+
+/* The tiles of a region, appended to out (at most `room`); returns the new count. */
+static UINT region_tiles(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c, D3D12_TILE_REGION_SIZE sz, UINT *out, UINT n, UINT room) {
+  if (sz.UseBox) {
+    for (UINT y = 0; y < sz.Height; ++y)
+      for (UINT x = 0; x < sz.Width && n < room; ++x) {
+        D3D12_TILED_RESOURCE_COORDINATE at = c;
+        at.X += x;
+        at.Y += y;
+        out[n++] = tile_number(t, at);
+      }
+  } else {
+    const UINT first = tile_number(t, c);
+    for (UINT k = 0; k < sz.NumTiles && n < room; ++k) out[n++] = first == (UINT)-1 ? first : first + k;
+  }
+  return n;
+}
+
 static void resource_destroy(DxObj *o) {
   Resource *r = (Resource *)o;
   EnterCriticalSection(&g_lock);
@@ -99,16 +174,10 @@ static void resource_destroy(DxObj *o) {
   if (r->va) va_unregister(r->va);
   if (r->alloc) kmt_destroy_allocation(r->d.dev->kdev, r->alloc);
   mem_free(r->shadow);
+  mem_free(r->tile_map);
   if (r->heap) dx_Release(OBJ(r->heap));
   dobj_child_destroy(o);
 }
-
-static UINT mip_count_for(UINT w, UINT h) {
-  UINT n = 1, m = w > h ? w : h;
-  while (m > 1) { m >>= 1; ++n; }
-  return n;
-}
-static UINT mip_extent(UINT size, UINT level) { UINT v = size >> level; return v ? v : 1; }
 
 /* ---- footprints ---------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -198,6 +267,8 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
     if (desc->Width == 0 || desc->Width > 256ull * 1024 * 1024) { hr = E_INVALIDARG; goto fail; }
     ad.flags = KA_VERTEX | KA_INDEX | ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? KA_UAV : 0);
+    /* (any buffer of the GPU's may be a stream output target: Direct3D 12 has no flag for it) */
+    if (!cpu && (dev->caps.features & DEV_FEATURE_STREAM_OUTPUT)) ad.flags |= KA_STREAM_OUTPUT;
     ad.size = KALIGN(desc->Width, 16);
     if (ad.size < 16) ad.size = 16;
     if (reserved) { ad.size = KALIGN(desc->Width, KTILE_BYTES); ad.flags |= KA_RESERVED; r->reserved = 1; }
@@ -221,7 +292,7 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     ad.flags = want_depth ? KA_DEPTH : (target ? (KA_RENDER_TARGET | KA_TEXTURE) : KA_TEXTURE);
     if (reserved) {
       /* (the kernel's reserved textures: 4-byte colour pixels, whole tiles, one mip level, only sampled) */
-      if (fi->bytes != 4 || fi->depth || !(fi->kernel <= KF_X8B8G8R8 || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB) || desc->Width % 128 || desc->Height % 128 || r->mips != 1 || r->kind != 0 || target || want_depth) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
+      if (fi->bytes != 4 || fi->depth || !(fi->kernel <= KF_X8B8G8R8 || fi->kernel == KF_BGRA8_SRGB || fi->kernel == KF_RGBA8_SRGB) || desc->Width % 128 || desc->Height % 128 || r->kind != 0 || target || want_depth) { hr = DXGI_ERROR_UNSUPPORTED; goto fail; }
       ad.flags = KA_TEXTURE | KA_RESERVED;
       r->reserved = 1;
     }
@@ -240,6 +311,13 @@ static HRESULT resource_make(Dev *dev, const D3D12_HEAP_PROPERTIES *props, D3D12
     dx_AddRef(OBJ(heap));
   }
   UINT pitch = 0;
+  if (reserved) {
+    TileLayout layout;
+    tile_layout(desc, &layout);
+    r->tile_count = layout.total;
+    r->tile_map = mem_alloc((SIZE_T)layout.total * sizeof(TileBind));
+    if (!r->tile_map) { hr = E_OUTOFMEMORY; goto fail; }
+  }
   NTSTATUS st = kmt_create_allocation(dev->kdev, &ad, &r->alloc, &pitch, &r->bytes);
   if (!KMT_OK(st)) { hr = hr_from(st); goto fail; }
   if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {

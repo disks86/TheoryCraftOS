@@ -452,15 +452,21 @@ functions named `<prefix>_<Method>` in the sources (run it after adding a method
   buffers made with unordered access, no texture UAVs, no resource state validation (barriers are ignored but aliasing ones). Also (`extras.inc`): **queries** (occlusion, binary occlusion, timestamps; `ResolveQueryData` is a `CopyBuffer` from the query buffer), **`ExecuteIndirect`** (the kernel has no indirect
   draw: the list keeps a copy of its state at the call and the commands are recorded when the list is executed, after the argument buffer's producers ran; draw, indexed draw, dispatch, root
   constants and views, vertex and index buffer arguments, with a count buffer), **bundles** (the calls are logged and made again on the list that executes the bundle) and **tiled
-  resources** (`CreateReservedResource` of buffers and of 4-byte colour textures in whole 128 x 128 tiles with one mip level, `UpdateTileMappings` with regions, boxes and range flags,
-  `GetResourceTiling`; tier 1). Not implemented: pipeline statistics and stream output queries, predication, stream output, `CopyTileMappings`, `CopyTiles`, mip tails, shared handles,
-  `WriteToSubresource`, the debug layer, root signature deserializers.
+  resources** (`CreateReservedResource` of buffers and of 4-byte colour textures in whole 128 x 128 tiles, with mip chains: the levels below a tile in either direction are the
+  **mip tail**, one tile; `UpdateTileMappings` with regions, boxes and range flags, `CopyTileMappings` (from the mapping the DLL keeps), `CopyTiles` in both directions (a tile is
+  64 KiB: the rows of a 128 x 128 block, or the packed levels one after the other), `GetResourceTiling` with the packed mip info; tier 1), **predication** (`SetPredication` cuts the list into chunks
+  that carry the predicate; the 64-bit value is read when a chunk is run and EQUAL_ZERO skips it when the value is zero, NOT_EQUAL_ZERO when it is not; the queries of a skipped chunk
+  are skipped with it) and **stream output** (`SOSetTargets`, pipeline states with a stream output declaration; the captured outputs are found by name in the output signature of the
+  geometry or vertex shader; a target starts at its view's offset; a pipeline with no pixel shader gets a do-nothing one and a draw with no render target a 1 x 1 one; the bytes written
+  go to `BufferFilledSizeLocation` after the list ran, counted from the view's start, so a program that relies on the hardware reading that value when it binds again starts over instead).
+  Not implemented: pipeline statistics and stream output *queries*, mip-tail tiles with more than one tile, mipmapped or array render targets, tiled depth or multisampled
+  resources, shared handles, `WriteToSubresource`, the debug layer, root signature deserializers.
 - **New in the kernel for them** (no new system call number: the work goes through `NtGdiDdDDIEscape` and `NtGdiDdDDIRender`): the stream ops `CopyBuffer` and `CopyBufferImage` (buffer to
-  buffer, rectangle of a mip level or layer of an image to and from rows of a buffer) and the escapes `CreateRootSignature`, `CreateDescriptorHeap`, `WriteDescriptors`, `CopyDescriptors`,
+  buffer, rectangle of a mip level or layer of an image to and from rows of a buffer) `CopyBuffer` reads and writes reserved buffers and query results, reserved textures have mip chains (`VidMm.cpp` `tile_spot`), and the escapes `QueryStreamOutput` (how far stream output got in a buffer), `CreateRootSignature`, `CreateDescriptorHeap`, `WriteDescriptors`, `CopyDescriptors`,
   `UpdateTileMappings`, `QuerySync` (a fence's value; Direct3D 12's `GetCompletedValue`) and the destroy ones (`DxgKernel.hpp`). Host tests: `DxgkrnlTest` `test_d3d12_copies_and_escapes`.
 - **Tests.** `tests/emulated_dx.sh` builds the host emulator with the kernel's Direct3D under it (win32k + `dxgk::Kernel` with the CPU renderer) and runs `tests/windows/d3d12test.c`, the real
   DLLs end to end: adapters and outputs, a triangle with a root signature and pipeline state read back, a textured quad (descriptor table, static sampler), depth testing with an index buffer and a
-  root constant buffer view, a compute shader, copies, fences and events, the swap chain, the serializer and device queries (229 checks: with queries, indirect execution, a bundle and a tiled vertex buffer). Not validated on a real GPU or by Wine's tests.
+  root constant buffer view, a compute shader, copies, fences and events, the swap chain, the serializer and device queries (283 checks: with queries, indirect execution, a bundle, tiled buffers and mip-chain textures, predication and stream output). Not validated on a real GPU or by Wine's tests.
 
 ## dwmapi.dll
 

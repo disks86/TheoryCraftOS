@@ -72,10 +72,11 @@ class IWaitHook {
 //                           and the sampler: filter, address_u, address_v, mip_filter, lod_bias (float), min_lod, max_lod
 //   CopyDescriptors         destination heap, destination index, source heap, source index, count
 //   UpdateTileMappings      reserved allocation, first tile, heap (0: unmap), heap offset (lo, hi), tile count
+//   QueryStreamOutput       allocation handle (a stream output buffer)                                                                 reply: how far stream output got in it (an offset, lo, hi)
 //   QuerySync               sync object handle                                                                                        reply: the value (lo, hi) - a fence's counter (D3D12's GetCompletedValue), a semaphore's count
 enum class EscapeOp : uint32_t {
   CreateShader = 1, CreatePipeline = 2, DestroyShader = 3, DestroyPipeline = 4, CreateComputePipeline = 5,
-  CreateRootSignature = 6, DestroyRootSignature = 7, CreateDescriptorHeap = 8, DestroyDescriptorHeap = 9, WriteDescriptors = 10, CopyDescriptors = 11, UpdateTileMappings = 12, QuerySync = 13,
+  CreateRootSignature = 6, DestroyRootSignature = 7, CreateDescriptorHeap = 8, DestroyDescriptorHeap = 9, WriteDescriptors = 10, CopyDescriptors = 11, UpdateTileMappings = 12, QuerySync = 13, QueryStreamOutput = 14,
 };
 
 // A render target lent to a compositor that draws on the same device (Kernel::acquire_image).
@@ -150,6 +151,8 @@ class Kernel {
   NtStatus create_sync(ProcessId pid, Handle device, SyncType type, uint64_t initial, uint64_t limit, Handle* sync);
   NtStatus destroy_sync(ProcessId pid, Handle sync);
   NtStatus query_sync(ProcessId pid, Handle sync, uint64_t* value);
+  // How far the last stream output into a kAllocStreamOutput allocation got (the offset the next appending one starts at).
+  NtStatus query_stream_output(ProcessId pid, Handle allocation, uint64_t* offset);
   NtStatus signal_sync_cpu(ProcessId pid, ArrayView<const Handle> syncs, ArrayView<const uint64_t> values);
   // Waits until all (or any) of the objects reach their values. kTimeout when they do not within `timeout_ns` (0: just look; ~0: forever). Without a wait hook it never sleeps.
   NtStatus wait_sync_cpu(ProcessId pid, ArrayView<const Handle> syncs, ArrayView<const uint64_t> values, bool wait_all, uint64_t timeout_ns);

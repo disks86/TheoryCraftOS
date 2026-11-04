@@ -27,8 +27,14 @@
  *
  * A bundle records the calls it gets (BUNDLE_LOG) and ExecuteBundle makes them on the list that executes it, so it takes the targets, viewport and the rest from that list.
  *
- * Tiled resources are the kernel's reserved allocations: buffers, and textures of 4-byte colour pixels with a size in tiles of 128 x 128 and one mip level. UpdateTileMappings maps their
- * 64 KiB tiles to places in heaps at once (the queue is synchronous, so that is in order with the lists executed before). Not done: CopyTileMappings, CopyTiles, mip tails. */
+ * Tiled resources are the kernel's reserved allocations: buffers, and textures of 4-byte colour pixels with a size in whole tiles of 128 x 128 (the levels below a tile in either direction
+ * are the mip tail, one tile). UpdateTileMappings maps their 64 KiB tiles to places in heaps at once (the queue is synchronous, so that is in order with the lists executed before) and
+ * keeps the mapping for CopyTileMappings; CopyTiles moves the bytes of tiles to and from a buffer with CopyBuffer / CopyBufferImage.
+ *
+ * Predication (SetPredication) cuts the list into chunks that carry the predicate: when a chunk is run its 64-bit value is read and the chunk is skipped or not.
+ *
+ * Stream output (SOSetTargets): a target is a buffer made with the kernel's stream output flag; it is bound before the draws and starts at the view's offset. A draw with no render target
+ * gets a 1 x 1 one of the device's, since the kernel's passes need one. After the list ran, BufferFilledSizeLocation gets the bytes written since the bind (kQueryStreamOutput). */
 
 /* ---- reading a buffer ----------------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -38,6 +44,16 @@ static int res_read(Resource *r, UINT64 offset, UINT64 n, void *dst) {
   void *data = NULL;
   if (!KMT_OK(kmt_lock(r->d.dev->kdev, r->alloc, 0, KMT_LOCK_READ_ONLY, &data))) return 0;
   memcpy(dst, (BYTE *)data + offset, (SIZE_T)n);
+  kmt_unlock(r->d.dev->kdev, r->alloc);
+  return 1;
+}
+
+static int res_write(Resource *r, UINT64 offset, const void *src, UINT64 n) {
+  if (!r || offset > r->desc.Width || n > r->desc.Width - offset) return 0;
+  if (r->shadow) { memcpy(r->shadow + offset, src, (SIZE_T)n); r->dirty = 1; return 1; }
+  void *data = NULL;
+  if (!KMT_OK(kmt_lock(r->d.dev->kdev, r->alloc, 0, 0, &data))) return 0;
+  memcpy((BYTE *)data + offset, src, (SIZE_T)n);
   kmt_unlock(r->d.dev->kdev, r->alloc);
   return 1;
 }
@@ -180,6 +196,9 @@ static void chunk_item(CmdList *l, Indirect *in) {
   Chunk *c = mem_alloc(sizeof *c);
   if (!c) { indirect_free(in); return; }
   c->indirect = in;
+  c->pred = l->pred;
+  c->pred_off = l->pred_off;
+  c->pred_op = l->pred_op;
   l->chunks[l->nchunks++] = c;
 }
 
@@ -227,6 +246,7 @@ static CmdList *indirect_expand(Indirect *in) {
   if (!t) { mem_free(data); return NULL; }
   memcpy(t, in->state, sizeof *t);
   t->dirty_gfx = t->dirty_cs = t->dirty_heaps = 1;
+  t->pred = NULL;      /* (the call as a whole is the predicated thing) */
   if (!chunk_new(t)) { mem_free(t); mem_free(data); return NULL; }
   const int compute = sig->args[sig->nargs - 1].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
   Binding *binding = compute ? &t->cs : &t->gfx;
@@ -342,8 +362,6 @@ static void STDMETHODCALLTYPE list_ExecuteBundle(CmdList *l, ID3D12GraphicsComma
 
 /* ---- tiled resources ----------------------------------------------------------------------------------------------------------------------------------------------------- */
 
-#define TILE_TEXELS 128
-
 static HRESULT STDMETHODCALLTYPE dev_CreateReservedResource(Dev *This, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out) {
   D3D12_HEAP_PROPERTIES props;
   Resource *r = NULL;
@@ -356,56 +374,75 @@ static HRESULT STDMETHODCALLTYPE dev_CreateReservedResource(Dev *This, const D3D
   return query_out((IUnknown *)r, riid, out);
 }
 
-/* The tiles across a resource (a buffer is one row). */
-static UINT tiles_across(const Resource *r) { return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? (UINT)((r->desc.Width + KTILE_BYTES - 1) / KTILE_BYTES) : (UINT)(r->desc.Width / TILE_TEXELS); }
-static UINT tiles_down(const Resource *r) { return r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : r->desc.Height / TILE_TEXELS; }
-
 static void STDMETHODCALLTYPE dev_GetResourceTiling(Dev *This, ID3D12Resource *resource, UINT *total, D3D12_PACKED_MIP_INFO *packed, D3D12_TILE_SHAPE *shape, UINT *count, UINT first,
                                                     D3D12_SUBRESOURCE_TILING *tilings) {
   const Resource *r = (const Resource *)resource;
   const int reserved = r && r->reserved;
-  if (total) *total = reserved ? tiles_across(r) * tiles_down(r) : 0;
-  if (packed) memset(packed, 0, sizeof *packed);
+  TileLayout t;
+  memset(&t, 0, sizeof t);
+  if (reserved) tile_layout(&r->desc, &t);
+  const int buffer = !reserved || r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+  if (total) *total = t.total;
+  if (packed) {
+    memset(packed, 0, sizeof *packed);
+    if (!buffer) {
+      packed->NumStandardMips = (UINT8)t.standard;
+      packed->NumPackedMips = (UINT8)(t.mips - t.standard);
+      packed->NumTilesForPackedMips = t.standard < t.mips ? 1 : 0;
+      packed->StartTileIndexInOverallResource = t.tail_first;
+    }
+  }
   if (shape) {
     memset(shape, 0, sizeof *shape);
-    if (reserved && r->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) { shape->WidthInTexels = TILE_TEXELS; shape->HeightInTexels = TILE_TEXELS; shape->DepthInTexels = 1; }
+    if (!buffer) { shape->WidthInTexels = TILE_TEXELS; shape->HeightInTexels = TILE_TEXELS; shape->DepthInTexels = 1; }
   }
   if (count) {
     const UINT room = *count;
-    *count = reserved && r->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : 0;
-    if (tilings && room && *count && first == 0) {
-      tilings[0].WidthInTiles = tiles_across(r);
-      tilings[0].HeightInTiles = (UINT16)tiles_down(r);
-      tilings[0].DepthInTiles = 1;
-      tilings[0].StartTileIndexInOverallResource = 0;
-    }
+    UINT n = buffer || first >= t.mips ? 0 : t.mips - first;
+    if (n > room) n = room;
+    if (tilings)
+      for (UINT i = 0; i < n; ++i) {
+        const UINT sub = first + i;
+        memset(&tilings[i], 0, sizeof tilings[i]);
+        if (sub < t.standard) {
+          tilings[i].WidthInTiles = t.across[sub];
+          tilings[i].HeightInTiles = (UINT16)t.down[sub];
+          tilings[i].DepthInTiles = 1;
+          tilings[i].StartTileIndexInOverallResource = t.first[sub];
+        } else {
+          tilings[i].StartTileIndexInOverallResource = 0xFFFFFFFFu;      /* (packed: no tiles of its own) */
+        }
+      }
+    *count = n;
   }
 }
 
+/* Maps `count` tiles of the resource from `first` to the heap from heap tile `heap_tile` on (a NULL heap: nowhere), in the kernel and in the copy kept here. */
 static void tile_flush(Dev *dev, Resource *r, UINT64 first, HeapObj *heap, UINT64 heap_tile, UINT64 count) {
   UINT request[7] = {ESC_UPDATE_TILE_MAPPINGS, r->alloc, (UINT)first, heap ? heap->alloc : 0, (UINT)(heap_tile * KTILE_BYTES), (UINT)((heap_tile * KTILE_BYTES) >> 32), (UINT)count};
-  dev_escape(dev, request, 7, NULL, 0);
+  if (!KMT_OK(dev_escape(dev, request, 7, NULL, 0))) return;
+  for (UINT64 k = 0; k < count && first + k < r->tile_count; ++k) {
+    r->tile_map[first + k].heap = heap;
+    r->tile_map[first + k].tile = heap_tile + k;
+  }
 }
+
+#define MAX_REGION_TILES 65536
 
 static void STDMETHODCALLTYPE queue_UpdateTileMappings(void *This, ID3D12Resource *resource, UINT regions, const D3D12_TILED_RESOURCE_COORDINATE *starts, const D3D12_TILE_REGION_SIZE *sizes,
                                                        ID3D12Heap *heap, UINT ranges, const D3D12_TILE_RANGE_FLAGS *flags, const UINT *heap_starts, const UINT *counts, D3D12_TILE_MAPPING_FLAGS mapping) {
   Resource *r = (Resource *)resource;
   HeapObj *h = (HeapObj *)heap;
   if (!r || !r->reserved) return;
-  const UINT across = tiles_across(r), down = tiles_down(r), total_tiles = across * down;
-  /* the tiles of the regions, in order */
-  UINT *tiles = mem_alloc((SIZE_T)65536 * 4);
+  TileLayout layout;
+  tile_layout(&r->desc, &layout);
+  UINT *tiles = mem_alloc((SIZE_T)MAX_REGION_TILES * 4);
   UINT n = 0;
   if (!tiles) return;
-  for (UINT i = 0; i < (regions ? regions : 1) && n < 65536; ++i) {
+  for (UINT i = 0; i < (regions ? regions : 1) && n < MAX_REGION_TILES; ++i) {
     const D3D12_TILED_RESOURCE_COORDINATE c = starts ? starts[i] : (D3D12_TILED_RESOURCE_COORDINATE){0, 0, 0, 0};
     const D3D12_TILE_REGION_SIZE sz = sizes ? sizes[i] : (D3D12_TILE_REGION_SIZE){1, FALSE, 0, 0, 0};
-    if (sz.UseBox) {
-      for (UINT y = 0; y < sz.Height; ++y)
-        for (UINT x = 0; x < sz.Width && n < 65536; ++x) tiles[n++] = (c.Y + y) * across + c.X + x;
-    } else {
-      for (UINT k = 0; k < sz.NumTiles && n < 65536; ++k) tiles[n++] = c.Y * across + c.X + k;
-    }
+    n = region_tiles(&layout, c, sz, tiles, n, MAX_REGION_TILES);
   }
   UINT pos = 0;
   UINT64 run_first = 0, run_heap = 0, run_len = 0;
@@ -416,7 +453,7 @@ static void STDMETHODCALLTYPE queue_UpdateTileMappings(void *This, ID3D12Resourc
     const UINT start = heap_starts ? heap_starts[j] : 0;
     for (UINT k = 0; k < c && pos < n; ++k, ++pos) {
       const UINT tile = tiles[pos];
-      if (tile >= total_tiles || f == D3D12_TILE_RANGE_FLAG_SKIP) {
+      if (tile >= layout.total || f == D3D12_TILE_RANGE_FLAG_SKIP) {
         if (run_len) { tile_flush(r->d.dev, r, run_first, run_unmap ? NULL : h, run_heap, run_len); run_len = 0; }
         continue;
       }
@@ -430,4 +467,129 @@ static void STDMETHODCALLTYPE queue_UpdateTileMappings(void *This, ID3D12Resourc
   }
   if (run_len) tile_flush(r->d.dev, r, run_first, run_unmap ? NULL : h, run_heap, run_len);
   mem_free(tiles);
+}
+
+static void STDMETHODCALLTYPE queue_CopyTileMappings(void *This, ID3D12Resource *dst, const D3D12_TILED_RESOURCE_COORDINATE *dst_start, ID3D12Resource *src,
+                                                     const D3D12_TILED_RESOURCE_COORDINATE *src_start, const D3D12_TILE_REGION_SIZE *size, D3D12_TILE_MAPPING_FLAGS flags) {
+  Resource *d = (Resource *)dst, *s = (Resource *)src;
+  if (!d || !s || !d->reserved || !s->reserved || !dst_start || !src_start || !size) return;
+  TileLayout dl, sl;
+  tile_layout(&d->desc, &dl);
+  tile_layout(&s->desc, &sl);
+  UINT *a = mem_alloc((SIZE_T)MAX_REGION_TILES * 8);
+  if (!a) return;
+  UINT *b = a + MAX_REGION_TILES;
+  const UINT na = region_tiles(&dl, *dst_start, *size, a, 0, MAX_REGION_TILES), nb = region_tiles(&sl, *src_start, *size, b, 0, MAX_REGION_TILES);
+  /* (the source's mapping is read first: the regions may overlap) */
+  TileBind *copy = mem_alloc((SIZE_T)(na < nb ? na : nb) * sizeof(TileBind) + 8);
+  const UINT n = na < nb ? na : nb;
+  if (copy) {
+    for (UINT k = 0; k < n; ++k) copy[k] = b[k] < s->tile_count ? s->tile_map[b[k]] : (TileBind){0, 0};
+    for (UINT k = 0; k < n; ++k)
+      if (a[k] < d->tile_count) tile_flush(d->d.dev, d, a[k], copy[k].heap, copy[k].tile, 1);
+    mem_free(copy);
+  }
+  mem_free(a);
+}
+
+static void emit_buffer_image(CmdList *l, UINT direction, const Resource *image, UINT level, UINT x, UINT y, UINT w, UINT h, const Resource *buffer, UINT64 offset, UINT pitch) {
+  UINT payload[11] = {direction, alloc_index(l, image->alloc), level, 0, x, y, w, h, alloc_index(l, buffer->alloc), (UINT)offset, pitch};
+  packet(l, OP_COPY_BUFFER_IMAGE, payload, 11);
+}
+
+static void STDMETHODCALLTYPE list_CopyTiles(CmdList *l, ID3D12Resource *resource, const D3D12_TILED_RESOURCE_COORDINATE *start, const D3D12_TILE_REGION_SIZE *size, ID3D12Resource *buffer,
+                                             UINT64 buffer_offset, D3D12_TILE_COPY_FLAGS flags) {
+  Resource *r = (Resource *)resource, *b = (Resource *)buffer;
+  if (l->bundle || !r || !b || !r->reserved || !start || !size) return;
+  const int to_resource = (flags & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE) != 0;
+  if (!to_resource && !(flags & D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER)) return;
+  TileLayout layout;
+  tile_layout(&r->desc, &layout);
+  UINT *tiles = mem_alloc((SIZE_T)MAX_REGION_TILES * 4);
+  if (!tiles) return;
+  const UINT n = region_tiles(&layout, *start, *size, tiles, 0, MAX_REGION_TILES);
+  end_pass(l);
+  for (UINT k = 0; k < n; ++k) {
+    const UINT tile = tiles[k];
+    const UINT64 at = buffer_offset + (UINT64)k * KTILE_BYTES;
+    if (tile >= layout.total || at + KTILE_BYTES > b->desc.Width || at > 0xFFFFFFFFu) continue;
+    ensure_room(l, 2048, 4);
+    if (r->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      UINT w[5];
+      if (to_resource) { w[0] = alloc_index(l, r->alloc); w[1] = tile * KTILE_BYTES; w[2] = alloc_index(l, b->alloc); w[3] = (UINT)at; }
+      else { w[0] = alloc_index(l, b->alloc); w[1] = (UINT)at; w[2] = alloc_index(l, r->alloc); w[3] = tile * KTILE_BYTES; }
+      w[4] = KTILE_BYTES;
+      packet(l, OP_COPY_BUFFER, w, 5);
+      continue;
+    }
+    UINT level = 0;
+    while (level < layout.standard && tile >= layout.first[level] + layout.across[level] * layout.down[level]) ++level;
+    if (level < layout.standard) {
+      const UINT local = tile - layout.first[level], tx = local % layout.across[level], ty = local / layout.across[level];
+      const UINT lw = mip_extent((UINT)r->desc.Width, level), lh = mip_extent(r->desc.Height, level);
+      const UINT x = tx * TILE_TEXELS, y = ty * TILE_TEXELS;
+      emit_buffer_image(l, to_resource ? 0 : 1, r, level, x, y, lw - x < TILE_TEXELS ? lw - x : TILE_TEXELS, lh - y < TILE_TEXELS ? lh - y : TILE_TEXELS, b, at, TILE_TEXELS * 4);
+    } else {
+      /* the mip tail: the packed levels one after the other, as in the backing */
+      UINT64 offset = at;
+      for (UINT lv = layout.standard; lv < layout.mips; ++lv) {
+        const UINT lw = mip_extent((UINT)r->desc.Width, lv), lh = mip_extent(r->desc.Height, lv);
+        emit_buffer_image(l, to_resource ? 0 : 1, r, lv, 0, 0, lw, lh, b, offset, lw * 4);
+        offset += (UINT64)lw * lh * 4;
+      }
+    }
+  }
+  mem_free(tiles);
+}
+
+/* ---- predication ------------------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+/* D3D12_PREDICATION_OP_EQUAL_ZERO skips the commands when the 64-bit value is zero, NOT_EQUAL_ZERO when it is not. */
+static int chunk_skipped(const Chunk *c) {
+  UINT64 v = 1;
+  if (!c->pred) return 0;
+  if (!res_read(c->pred, c->pred_off, 8, &v)) return 0;
+  return c->pred_op == D3D12_PREDICATION_OP_EQUAL_ZERO ? v == 0 : v != 0;
+}
+
+static void STDMETHODCALLTYPE list_SetPredication(CmdList *l, ID3D12Resource *buffer, UINT64 offset, D3D12_PREDICATION_OP op) {
+  if (l->bundle) return;
+  end_pass(l);
+  l->pred = (Resource *)buffer;
+  l->pred_off = offset;
+  l->pred_op = (int)op;
+  chunk_new(l);      /* (the chunk is the unit that is skipped) */
+}
+
+/* ---- stream output ------------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+static void STDMETHODCALLTYPE list_SOSetTargets(CmdList *l, UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
+  if (l->bundle) return;
+  for (UINT i = 0; i < count && start + i < 4; ++i) {
+    SoTarget *t = &l->so[start + i];
+    memset(t, 0, sizeof *t);
+    if (!views || !views[i].BufferLocation) continue;
+    UINT64 offset = 0;
+    Resource *r = va_find(views[i].BufferLocation, &offset);
+    if (!r) continue;
+    t->alloc = r->alloc;
+    t->offset = offset;
+    UINT64 fill_offset = 0;
+    t->fill = views[i].BufferFilledSizeLocation ? va_find(views[i].BufferFilledSizeLocation, &fill_offset) : NULL;
+    t->fill_offset = fill_offset;
+    if (t->fill && l->nfills < 16) l->fills[l->nfills++] = *t;
+  }
+  l->so_dirty = 1;
+}
+
+/* The bytes of each target the list wrote, into the places the program named (after the list ran). */
+static void list_apply_fills(CmdList *l) {
+  for (UINT i = 0; i < l->nfills; ++i) {
+    const SoTarget *t = &l->fills[i];
+    UINT request[2] = {ESC_QUERY_STREAM_OUTPUT, t->alloc}, reply[2] = {0, 0};
+    if (!KMT_OK(dev_escape(l->d.dev, request, 2, reply, 2))) continue;
+    UINT64 filled = reply[0] | ((UINT64)reply[1] << 32);
+    filled = filled > t->offset ? filled - t->offset : 0;
+    res_write(t->fill, t->fill_offset, &filled, 8);
+  }
 }
