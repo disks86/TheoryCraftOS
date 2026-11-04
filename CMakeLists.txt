@@ -285,6 +285,8 @@ add_executable(BOOTX64
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuJobs.cpp
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuIrq.cpp
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuDevice.cpp
+  src/Hardware/NeuralProcessingUnit/Intel/IntelNpuFirmwareFile.cpp
+  src/Hardware/NeuralProcessingUnit/Intel/IntelNpuExecutor.cpp
   src/Math/FloatMath.cpp
   src/Spreadsheet/Sheet.cpp
   src/Database/DatabaseTypes.cpp
@@ -1220,6 +1222,10 @@ endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_WIFI)
+endif()
+option(TCOS_INTEL_NPU "Start the Intel NPU (Meteor Lake and later) with the firmware from /Linux/lib/firmware/intel/vpu: power-up, MMU, firmware boot, interrupt by MSI, jobs through the executor; the tensor math stays on the CPU (it needs a graph compiler); not yet run on a real NPU" OFF)
+if(TCOS_INTEL_NPU)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_NPU)
 endif()
 option(TCOS_POWER "Power management: Intel hardware P-states / SpeedStep under a profile that follows the battery, MWAIT idle states, thermal throttling and shutdown at the critical temperature; not yet run on a real machine" OFF)
 if(TCOS_POWER)

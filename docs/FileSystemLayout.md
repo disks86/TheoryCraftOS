@@ -34,6 +34,9 @@ Linux processes see `/Linux` as `/`, with the Filesystem Hierarchy Standard fold
 and `var` (`cache`, `lib`, `log`, `tmp`). `dev`, `proc` and `sys` are plain empty folders for now. Use the `kWindows*` and `kLinux*`
 constants for the places programs are installed (`kWindowsSystem32`, `kLinuxBin`, ...).
 
+Device firmware follows the Linux convention: `/Linux/lib/firmware` (`kLinuxFirmware`), seen by Linux processes as `/lib/firmware`. The Intel NPU driver reads
+`/Linux/lib/firmware/intel/vpu/vpu_<generation>_v1.bin` (`kLinuxFirmwareIntelVpu`; the file comes from the linux-firmware package, the OS does not carry it).
+
 Other volumes (USB sticks, network shares) are folders of `/` named by their label.
 
 ## Rules for new code
