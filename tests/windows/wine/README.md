@@ -42,6 +42,10 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | shlwapi string | 16751 | 0 (wnsprintf, StrFromTimeInterval, StrFormatByteSizeEx, StrRetToBSTR, ordinals 345/346/399/400 through shlwapi.def) |
 | shlwapi path | not run | 14 (was 25386 and a crash): PathIsValidChar (455/456), PathCreateFromUrl*, PathCommonPrefix, PathUndecorate, PathUnExpandEnvStrings, PathCanonicalize only splits at backslashes; left: PathMatchSpec "* .ext" |
 | shlwapi url | crash | 2248, runs to the end: Url* family is in src/Windows/shlwapi/url.inc; Windows' exact UrlCanonicalize/UrlEscape quirks ("//" -> "///", "wine://" -> "wine:///"), UrlHash and HashData (a 256-byte table) are not done |
+| shlwapi istream | 3008 + crash | 0 (file streams follow Windows: write-only streams are readable, CREATE/CREATE_NEW dispositions, lock and revert are E_NOTIMPL, Stat returns the name; SHCreateMemStream in misc.inc) |
+| shlwapi shreg | 15 | 1 (the test's `Software` key is not in the OS's registry): SHRegGetValue, SHCopyKey, the HUSKEY family (reg.inc), SHQueryValueEx sizes and truncation |
+| shlwapi assoc | 10 | 1 (needs a `.html` association in the registry): AssocCreate / IQueryAssociations, default verb |
+| shlwapi ordinal | 18 + crash | 160, runs to the end: SHAllocShared family, FDSA, SHSearchMapInt, SHPackDispParams, ConnectToConnectionPoint (misc.inc). The rest of the ordinal-only exports (SHSetWindowBits, SHFormatDateTime, SHGetIniString, SK*, GetShellSecurityDescriptor ...) are parked on a no-op in shlwapi.def so that a lookup by number does not land on an unrelated export |
 | lz32 lzexpand | 117 | 0 |
 | kernel32 format_msg | 591 | 270 |
 | kernel32 time | 786 | 1 |
@@ -64,5 +68,5 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | kernel32 environ / module / file | crashed or hung | run to the end |
 
 Everything else was measured once and has not been worked on: ntdll alpc 1684, directory 784, file 354, sync 246, threadpool 244, reg 133 (the NT registry services), path 279;
-comm 763, version 92 (needs manifest-based version emulation); debugger, sync and thread tests hang or crash the machine; shlwapi url/istream/shreg/assoc; mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
+comm 763, version 92 (needs manifest-based version emulation); debugger, sync and thread tests hang or crash the machine; shlwapi url (UrlCanonicalize/UrlEscape quirk table), UrlHash/HashData (need Wine's 256-byte table), PathMatchSpec "* .ext"; mpr 211, psapi 123, userenv 68, secur32 53. Most of those are
 missing system services (the NT registry, object namespace, ALPC, thread pools, `NtQuerySystemInformation` classes) rather than missing library code.
