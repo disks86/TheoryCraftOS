@@ -276,6 +276,7 @@ add_executable(BOOTX64
   src/ConcurrentDemo.cpp
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
+  src/Hardware/NeuralProcessingUnit/Intel/IntelNpuHw.cpp
   src/Math/FloatMath.cpp
   src/Spreadsheet/Sheet.cpp
   src/Database/DatabaseTypes.cpp

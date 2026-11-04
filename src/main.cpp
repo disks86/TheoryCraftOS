@@ -794,6 +794,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // Neural processing unit: a hardware one if the machine has a known NPU,
   // otherwise matrix maths spread over the CPU cores by the scheduler.
   hardware::SystemNeuralProcessingUnit system_npu(pci, cpu, scheduler);
+  system_npu.probe_registers(pci, paging_ok ? &register_mapper : nullptr);  // Intel NPU: read the fuses (nothing is powered up)
   hardware::INeuralProcessingUnit& npu = system_npu.npu();
   Entry(Level::Ok, "NPU").text(npu.name()).text(", ").dec(npu.compute_units()).text(" compute units; ").text(system_npu.description());
 #ifdef TCOS_SELFTESTS
