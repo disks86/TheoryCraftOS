@@ -26,6 +26,7 @@
 #include <initializer_list>
 #include <new>
 #include "Math/FloatMath.hpp"
+#include <cstdlib>
 #include "Script/Number.hpp"
 
 namespace script {
@@ -2354,6 +2355,14 @@ void Vm::take_exception(String* text) {
     text->append(halt_reason_.view());
   } else {
     describe(exception_, text, 0);
+    if (getenv("TCOS_JS_STACKS") && exception_.is_object() && exception_.as_object()->okind == ObjKind::Error) {   // (debugging a site: TCOS_JS_STACKS=1 adds the frames the error was made in, the lines after the first of its stack)
+      Value stack;
+      if (get(exception_, intern("stack"), &stack) && stack.is_string()) {
+        const StringView all = stack.as_string()->view();
+        const uint64_t nl = all.find('\n');
+        if (nl != StringView::npos) text->append(all.substr(nl));
+      }
+    }
   }
 #ifdef TCOS_ERROR_LINES
   fprintf(stderr, "[js error at line %u] %s\n", throw_line_, text->c_str());

@@ -245,7 +245,9 @@ int main() {
   CHECK(error_of(a, "[b-a]") == Error::BadClassRange && full(a, "[\\d-z]+", "1-z"));  // after a shorthand the dash is a plain character
   {
     String many(a);
-    for (int i = 0; i < 40; ++i) many.append("(a)");
+    for (int i = 0; i < 100; ++i) many.append("(a)");   // (a big site's image-URL pattern has 90 groups)
+    CHECK(error_of(a, many.c_str()) == Error::None);
+    for (int i = 0; i < 200; ++i) many.append("(a)");
     CHECK(error_of(a, many.c_str()) == Error::TooManyGroups);
     String deep(a);
     for (int i = 0; i < 100; ++i) deep.append("(?:");
