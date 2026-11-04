@@ -1,0 +1,18 @@
+LIBRARY shcore.dll
+EXPORTS
+CommandLineToArgvW = shell32.CommandLineToArgvW
+IStream_Read = shlwapi.IStream_Read
+IStream_Reset = shlwapi.IStream_Reset
+IStream_Size = shlwapi.IStream_Size
+IStream_Write = shlwapi.IStream_Write
+SHCreateStreamOnFileA = shlwapi.SHCreateStreamOnFileA
+SHCreateStreamOnFileEx = shlwapi.SHCreateStreamOnFileEx
+SHCreateStreamOnFileW = shlwapi.SHCreateStreamOnFileW
+SHDeleteEmptyKeyW = shlwapi.SHDeleteEmptyKeyW
+SHDeleteKeyA = shlwapi.SHDeleteKeyA
+SHDeleteKeyW = shlwapi.SHDeleteKeyW
+SHDeleteValueW = shlwapi.SHDeleteValueW
+SHSetValueA = shlwapi.SHSetValueA
+SHSetValueW = shlwapi.SHSetValueW
+SHStrDupA = shlwapi.SHStrDupA
+SHStrDupW = shlwapi.SHStrDupW
