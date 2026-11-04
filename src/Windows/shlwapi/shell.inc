@@ -358,8 +358,9 @@ static const BYTE kIidSequential[16] = {0x0A, 0, 0x01, 0, 0, 0, 0, 0, 0xC0, 0, 0
 #define STG_E_INVALIDPOINTER_ ((LONG)0x80030009)
 #define STG_E_INVALIDPARAMETER_ ((LONG)0x80030057)
 #define STG_E_REVERTED_ ((LONG)0x80030102)
+#define STG_E_MEDIUMFULL_ ((LONG)0x80030070)
 
-typedef struct { const struct IStreamLikeVtbl *vtbl; LONG ref; HANDLE file; DWORD mode; } FileStream;
+typedef struct { const struct IStreamLikeVtbl *vtbl; LONG ref; HANDLE file; DWORD mode; WCHAR *name; } FileStream;
 static BOOL same_iid(const void *a, const BYTE *b) { return !memcmp(a, b, 16); }
 /* The GUIDs written as bytes: Data1..Data3 little-endian. */
 static HRESULT_ WINAPI fs_query(IStreamLike *self, const void *iid, void **out) {
@@ -375,30 +376,30 @@ static ULONG WINAPI fs_addref(IStreamLike *self) { return (ULONG)InterlockedIncr
 static ULONG WINAPI fs_release(IStreamLike *self) {
   FileStream *s = (FileStream *)self;
   const LONG n = InterlockedDecrement(&s->ref);
-  if (!n) { if (s->file != INVALID_HANDLE_VALUE) CloseHandle(s->file); task_free(s); }
+  if (!n) { if (s->file != INVALID_HANDLE_VALUE) CloseHandle(s->file); task_free(s->name); task_free(s); }
   return (ULONG)n;
 }
 static HRESULT_ WINAPI fs_read(IStreamLike *self, void *buffer, ULONG count, ULONG *read) {
   FileStream *s = (FileStream *)self;
   DWORD got = 0;
-  if (!buffer) return STG_E_INVALIDPOINTER_;
-  if (!ReadFile(s->file, buffer, count, &got, NULL)) { if (read) *read = 0; return HRESULT_FROM_WIN32_(GetLastError()); }
+  if (!buffer && count) return STG_E_INVALIDPOINTER_;
+  if (count && !ReadFile(s->file, buffer, count, &got, NULL)) { if (read) *read = 0; return HRESULT_FROM_WIN32_(GetLastError()); }
   if (read) *read = got;
   return got == count ? 0 : 1;
 }
 static HRESULT_ WINAPI fs_write(IStreamLike *self, const void *buffer, ULONG count, ULONG *written) {
   FileStream *s = (FileStream *)self;
   DWORD done = 0;
-  if (!buffer) return STG_E_INVALIDPOINTER_;
-  if ((s->mode & 3) == 0) { if (written) *written = 0; return STG_E_ACCESSDENIED_; }
-  if (!WriteFile(s->file, buffer, count, &done, NULL)) { if (written) *written = 0; return HRESULT_FROM_WIN32_(GetLastError()); }
+  if ((s->mode & 3) == 0) return STG_E_ACCESSDENIED_;
+  if (!buffer && count) return STG_E_INVALIDPOINTER_;
+  if (count && !WriteFile(s->file, buffer, count, &done, NULL)) { if (written) *written = 0; return HRESULT_FROM_WIN32_(GetLastError()); }
   if (written) *written = done;
   return 0;
 }
 static HRESULT_ WINAPI fs_seek(IStreamLike *self, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *out) {
   FileStream *s = (FileStream *)self;
   LARGE_INTEGER result;
-  if (origin > 2) return STG_E_INVALIDFUNCTION_;
+  if (origin > 2) return E_INVALIDARG_;
   if (!SetFilePointerEx(s->file, move, &result, origin)) return STG_E_INVALIDFUNCTION_;
   if (out) out->QuadPart = (ULONGLONG)result.QuadPart;
   return 0;
@@ -421,6 +422,7 @@ static HRESULT_ WINAPI fs_copy_to(IStreamLike *self, IStreamLike *dest, ULARGE_I
   BYTE buffer[1024];
   ULONGLONG left = count.QuadPart, total_read = 0, total_written = 0;
   HRESULT_ hr = 0;
+  if (!count.QuadPart) { if (read) read->QuadPart = 0; if (written) written->QuadPart = 0; return 0; }
   if (!dest) return STG_E_INVALIDPOINTER_;
   while (left) {
     ULONG got = 0, put = 0;
@@ -437,15 +439,19 @@ static HRESULT_ WINAPI fs_copy_to(IStreamLike *self, IStreamLike *dest, ULARGE_I
   return hr;
 }
 static HRESULT_ WINAPI fs_commit(IStreamLike *self, DWORD flags) { (void)flags; FlushFileBuffers(((FileStream *)self)->file); return 0; }
-static HRESULT_ WINAPI fs_revert(IStreamLike *self) { (void)self; return 0; }
-static HRESULT_ WINAPI fs_lock(IStreamLike *self, ULARGE_INTEGER a, ULARGE_INTEGER b, DWORD c) { (void)self; (void)a; (void)b; (void)c; return STG_E_INVALIDFUNCTION_; }
+static HRESULT_ WINAPI fs_revert(IStreamLike *self) { (void)self; return E_NOTIMPL_; }
+static HRESULT_ WINAPI fs_lock(IStreamLike *self, ULARGE_INTEGER a, ULARGE_INTEGER b, DWORD c) { (void)self; (void)a; (void)b; (void)c; return E_NOTIMPL_; }
 static HRESULT_ WINAPI fs_stat(IStreamLike *self, void *out, DWORD flags) {
   FileStream *s = (FileStream *)self;
   struct { LPWSTR name; DWORD type; ULARGE_INTEGER size; FILETIME modified, created, accessed; DWORD mode, locks; BYTE clsid[16]; DWORD state, reserved; } *st = out;
   LARGE_INTEGER size;
-  (void)flags;
   if (!out) return STG_E_INVALIDPOINTER_;
   memset(out, 0, sizeof(*st));
+  if (!(flags & 1) && s->name) {      /* (the name unless STATFLAG_NONAME: a copy the caller frees) */
+    st->name = task_alloc((wcslen(s->name) + 1) * sizeof(WCHAR));
+    if (!st->name) return E_OUTOFMEMORY_;
+    memcpy(st->name, s->name, (wcslen(s->name) + 1) * sizeof(WCHAR));
+  }
   st->type = 2;      /* STGTY_STREAM */
   if (GetFileSizeEx(s->file, &size)) st->size.QuadPart = (ULONGLONG)size.QuadPart;
   GetFileTime(s->file, &st->created, &st->accessed, &st->modified);
@@ -458,13 +464,13 @@ static const struct IStreamLikeVtbl g_file_stream_vtbl = {fs_query, fs_addref, f
 EXPORT HRESULT_ WINAPI SHCreateStreamOnFileEx(LPCWSTR path, DWORD mode, DWORD attributes, BOOL create, IStreamLike *template_stream, IStreamLike **out) {
   if (!out) return E_INVALIDARG_;
   *out = NULL;
-  if (!path || template_stream) return E_INVALIDARG_;
-  DWORD access = (mode & 3) == 0 ? 0x80000000u : ((mode & 3) == 1 ? 0x40000000u : 0xC0000000u);
+  if (!path) return HRESULT_FROM_WIN32_(ERROR_PATH_NOT_FOUND);
+  if (template_stream || (mode & 0x20000u)) return E_INVALIDARG_;      /* (STGM_CONVERT is not supported on a file) */
+  DWORD access = (mode & 3) == 0 ? 0x80000000u : 0xC0000000u;      /* (a write-only stream can still be read, as in Windows) */
   DWORD share = 0;
   switch (mode & 0x70) { case 0x40: share = 3; break; case 0x20: share = 1; break; case 0x30: share = 2; break; case 0x10: share = 0; break; default: share = 3; break; }
-  DWORD disposition = (mode & 0x1000) ? 2 /* CREATE_ALWAYS */ : (create ? 4 /* OPEN_ALWAYS */ : 3 /* OPEN_EXISTING */);
-  if (create && (mode & 0x1000)) disposition = 2;
-  HANDLE f = CreateFileW(path, access, share, NULL, disposition, attributes ? attributes : 0x80, NULL);
+  DWORD disposition = (mode & 0x1000) ? 2 /* CREATE_ALWAYS */ : (create ? 1 /* CREATE_NEW */ : 3 /* OPEN_EXISTING */);
+  HANDLE f = CreateFileW(path, access, share, NULL, disposition, attributes ? attributes : 0x80, NULL);      /* (STGM_DELETEONRELEASE and STGM_TRANSACTED are accepted and ignored, as in Windows) */
   if (f == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32_(GetLastError());
   FileStream *s = task_alloc(sizeof(*s));
   if (!s) { CloseHandle(f); return E_OUTOFMEMORY_; }
@@ -472,17 +478,22 @@ EXPORT HRESULT_ WINAPI SHCreateStreamOnFileEx(LPCWSTR path, DWORD mode, DWORD at
   s->ref = 1;
   s->file = f;
   s->mode = mode;
+  const WCHAR *base = path, *c = path;
+  for (; *c; ++c) if (*c == '\\' || *c == '/') base = c + 1;
+  s->name = task_alloc((wcslen(base) + 1) * sizeof(WCHAR));
+  if (s->name) memcpy(s->name, base, (wcslen(base) + 1) * sizeof(WCHAR));
   *out = (IStreamLike *)s;
   return 0;
 }
 EXPORT HRESULT_ WINAPI SHCreateStreamOnFileW(LPCWSTR path, DWORD mode, IStreamLike **out) {
   if (!out) return E_INVALIDARG_;
-  if (mode & 0x1000) {}
+  *out = NULL;
+  if (mode & (0x20000u | 0x10000u | 0x04000000u)) return E_INVALIDARG_;      /* (STGM_CONVERT, STGM_TRANSACTED, STGM_DELETEONRELEASE) */
   return SHCreateStreamOnFileEx(path, mode, 0, FALSE, NULL, out);
 }
 EXPORT HRESULT_ WINAPI SHCreateStreamOnFileA(LPCSTR path, DWORD mode, IStreamLike **out) {
   WCHAR *w = to_wide_dup(path);
-  const HRESULT_ hr = w ? SHCreateStreamOnFileW(w, mode, out) : E_INVALIDARG_;
+  const HRESULT_ hr = (w || !path) ? SHCreateStreamOnFileW(w, mode, out) : E_OUTOFMEMORY_;
   task_free(w);
   return hr;
 }

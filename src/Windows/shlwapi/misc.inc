@@ -304,3 +304,139 @@ EXPORT HRESULT_ WINAPI AssocCreate(GuidValue clsid, const GuidValue *iid, void *
   qa_release(self);
   return hr;
 }
+
+/* ---- SHCreateMemStream: a growable stream in memory; a clone shares the bytes and has its own position ----------------------------------------------------------------- */
+
+typedef struct { LONG ref; BYTE *data; size_t_ size, capacity; } MemData;
+typedef struct { const struct IStreamLikeVtbl *vtbl; LONG ref; MemData *shared; ULONGLONG pos; } MemStream;
+
+static void mem_data_release(MemData *d) { if (!InterlockedDecrement(&d->ref)) { task_free(d->data); task_free(d); } }
+static BOOL mem_reserve(MemData *d, size_t_ need) {
+  if (need <= d->capacity) return TRUE;
+  size_t_ cap = d->capacity ? d->capacity : 64;
+  while (cap < need) { if (cap > ((size_t_)-1) / 2) return FALSE; cap *= 2; }
+  BYTE *grown = task_alloc(cap);
+  if (!grown) return FALSE;
+  if (d->size) memcpy(grown, d->data, d->size);
+  task_free(d->data);
+  d->data = grown; d->capacity = cap;
+  return TRUE;
+}
+static HRESULT_ WINAPI ms_query(IStreamLike *self, const void *iid, void **out) {
+  static const GuidValue stream_iid = {0x0000000C, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}}, seq_iid = {0x0C733A30, 0x2A1C, 0x11CE, {0xAD, 0xE5, 0x00, 0xAA, 0x00, 0x44, 0x77, 0x3D}},
+                          unknown_iid = {0, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
+  if (!out) return E_POINTER_;
+  *out = NULL;
+  if (!memcmp(iid, &stream_iid, 16) || !memcmp(iid, &seq_iid, 16) || !memcmp(iid, &unknown_iid, 16)) { *out = self; InterlockedIncrement(&((MemStream *)self)->ref); return 0; }
+  return E_NOINTERFACE_;
+}
+static ULONG WINAPI ms_addref(IStreamLike *self) { return (ULONG)InterlockedIncrement(&((MemStream *)self)->ref); }
+static ULONG WINAPI ms_release(IStreamLike *self) {
+  MemStream *s = (MemStream *)self;
+  const LONG n = InterlockedDecrement(&s->ref);
+  if (!n) { mem_data_release(s->shared); task_free(s); }
+  return (ULONG)n;
+}
+static HRESULT_ WINAPI ms_read(IStreamLike *self, void *buffer, ULONG count, ULONG *read) {
+  MemStream *s = (MemStream *)self;
+  const MemData *d = s->shared;
+  ULONG got = 0;
+  if (!buffer && count) return STG_E_INVALIDPOINTER_;
+  if (s->pos < d->size) { const size_t_ left = d->size - (size_t_)s->pos; got = count < left ? count : (ULONG)left; if (got) memcpy(buffer, d->data + s->pos, got); s->pos += got; }
+  if (read) *read = got;
+  return got == count ? 0 : 1;
+}
+static HRESULT_ WINAPI ms_write(IStreamLike *self, const void *buffer, ULONG count, ULONG *written) {
+  MemStream *s = (MemStream *)self;
+  MemData *d = s->shared;
+  if (!buffer && count) return STG_E_INVALIDPOINTER_;
+  if (s->pos > (size_t_)-1 - count) return STG_E_MEDIUMFULL_;
+  const size_t_ end = (size_t_)s->pos + count;
+  if (!mem_reserve(d, end)) return E_OUTOFMEMORY_;
+  if (s->pos > d->size) memset(d->data + d->size, 0, (size_t_)s->pos - d->size);
+  if (count) memcpy(d->data + s->pos, buffer, count);
+  if (end > d->size) d->size = end;
+  s->pos = end;
+  if (written) *written = count;
+  return 0;
+}
+static HRESULT_ WINAPI ms_seek(IStreamLike *self, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *out) {
+  MemStream *s = (MemStream *)self;
+  LONGLONG base;
+  switch (origin) { case 0: base = 0; break; case 1: base = (LONGLONG)s->pos; break; case 2: base = (LONGLONG)s->shared->size; break; default: return STG_E_INVALIDFUNCTION_; }
+  const LONGLONG target = base + move.QuadPart;
+  if (target < 0) return STG_E_INVALIDFUNCTION_;
+  s->pos = (ULONGLONG)target;
+  if (out) out->QuadPart = s->pos;
+  return 0;
+}
+static HRESULT_ WINAPI ms_set_size(IStreamLike *self, ULARGE_INTEGER size) {
+  MemData *d = ((MemStream *)self)->shared;
+  if (size.QuadPart > (ULONGLONG)((size_t_)-1) / 2 || !mem_reserve(d, (size_t_)size.QuadPart)) return E_OUTOFMEMORY_;
+  if (size.QuadPart > d->size) memset(d->data + d->size, 0, (size_t_)size.QuadPart - d->size);
+  d->size = (size_t_)size.QuadPart;
+  return 0;
+}
+static HRESULT_ WINAPI ms_copy_to(IStreamLike *self, IStreamLike *dest, ULARGE_INTEGER count, ULARGE_INTEGER *read, ULARGE_INTEGER *written) {
+  BYTE buffer[1024];
+  ULONGLONG left = count.QuadPart, total_read = 0, total_written = 0;
+  HRESULT_ hr = 0;
+  if (!dest) return STG_E_INVALIDPOINTER_;
+  while (left) {
+    ULONG got = 0, put = 0;
+    hr = ms_read(self, buffer, left < sizeof(buffer) ? (ULONG)left : (ULONG)sizeof(buffer), &got);
+    if (hr < 0 || !got) { if (hr > 0) hr = 0; break; }
+    total_read += got;
+    hr = dest->vtbl->Write(dest, buffer, got, &put);
+    total_written += put;
+    if (hr < 0 || put != got) break;
+    left -= got;
+  }
+  if (read) read->QuadPart = total_read;
+  if (written) written->QuadPart = total_written;
+  return hr;
+}
+static HRESULT_ WINAPI ms_ok(IStreamLike *self, DWORD flags) { (void)self; (void)flags; return 0; }
+static HRESULT_ WINAPI ms_revert(IStreamLike *self) { (void)self; return 0; }
+static HRESULT_ WINAPI ms_lock(IStreamLike *self, ULARGE_INTEGER a, ULARGE_INTEGER b, DWORD c) { (void)self; (void)a; (void)b; (void)c; return STG_E_INVALIDFUNCTION_; }
+static HRESULT_ WINAPI ms_stat(IStreamLike *self, void *out, DWORD flags) {
+  struct { LPWSTR name; DWORD type; ULARGE_INTEGER size; FILETIME modified, created, accessed; DWORD mode, locks; BYTE clsid[16]; DWORD state, reserved; } *st = out;
+  (void)flags;
+  if (!out) return STG_E_INVALIDPOINTER_;
+  memset(out, 0, sizeof(*st));
+  st->type = 2;
+  st->size.QuadPart = ((MemStream *)self)->shared->size;
+  st->mode = 2;      /* STGM_READWRITE */
+  return 0;
+}
+static HRESULT_ WINAPI ms_clone(IStreamLike *self, IStreamLike **out) {
+  MemStream *s = (MemStream *)self;
+  if (!out) return E_POINTER_;
+  *out = NULL;
+  MemStream *c = task_alloc(sizeof(*c));
+  if (!c) return E_OUTOFMEMORY_;
+  *c = *s;
+  c->ref = 1;
+  InterlockedIncrement(&c->shared->ref);
+  *out = (IStreamLike *)c;
+  return 0;
+}
+static const struct IStreamLikeVtbl g_mem_stream_vtbl = {ms_query, ms_addref, ms_release, ms_read, ms_write, ms_seek, ms_set_size, ms_copy_to, ms_ok, ms_revert, ms_lock, ms_lock, ms_stat, ms_clone};
+
+EXPORT IStreamLike *WINAPI SHCreateMemStream(const BYTE *init, UINT size) {
+  MemStream *s = task_alloc(sizeof(*s));
+  MemData *d = task_alloc(sizeof(*d));
+  if (!s || !d) { task_free(s); task_free(d); return NULL; }
+  memset(d, 0, sizeof(*d));
+  d->ref = 1;
+  if (init && size) {
+    if (!mem_reserve(d, size)) { task_free(s); task_free(d); return NULL; }
+    memcpy(d->data, init, size);
+    d->size = size;
+  }
+  s->vtbl = &g_mem_stream_vtbl;
+  s->ref = 1;
+  s->shared = d;
+  s->pos = 0;
+  return (IStreamLike *)s;
+}
