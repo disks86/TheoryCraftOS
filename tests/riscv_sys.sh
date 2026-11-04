@@ -8,7 +8,7 @@ work=${TMPDIR:-/tmp}/tcos-rvsys
 mkdir -p "$work"
 lld=${LD_LLD:-$(find "$HOME/.rustup" -name ld.lld -path '*gcc-ld*' 2>/dev/null | head -1)}
 [ -n "$lld" ] || lld=$(command -v ld.lld) || { echo "no RISC-V-capable ld.lld found (set LD_LLD)"; exit 2; }
-g++ -std=c++20 -O1 -I src -w tests/RiscV64SystemRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/sysrun"
+g++ -std=c++20 -O1 -I src -w tests/RiscV64SystemRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/sysrun"
 payloads=("$@"); [ ${#payloads[@]} -gt 0 ] || payloads=(tests/riscv_sys/*.S)
 fail=0
 for src in "${payloads[@]}"; do

@@ -12,7 +12,7 @@ lld=${LD_LLD:-$(find "$HOME/.rustup" -name ld.lld -path '*gcc-ld*' 2>/dev/null |
 modes=(); seeds=3
 while [ $# -gt 0 ]; do case $1 in --seeds) seeds=$2; shift 2 ;; *) modes+=("$1"); shift ;; esac; done
 [ ${#modes[@]} -gt 0 ] || modes=(int mem fp comp bit)
-g++ -std=c++20 -O1 -I src -w tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/emurun"
+g++ -std=c++20 -O1 -I src -w tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/emurun"
 fail=0
 for mode in "${modes[@]}"; do
   for seed in $(seq 1 "$seeds"); do

@@ -38,6 +38,8 @@ $cc -O1 -Wall -Wextra -o "$out/pipetest.exe" tests/windows/pipetest.c
 echo "built $out/pipetest.exe (pipes, handle inheritance, redirected standard handles; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/advapitest.exe" tests/windows/advapitest.c -ladvapi32
 echo "built $out/advapitest.exe (advapi32: hive files, notification, CryptoAPI, event log, ETW, credentials, services, LSA, audit; it starts itself as a service)"
+$cc -O1 -Wall -Wextra -o "$out/dwritetest.exe" tests/windows/dwritetest.c -ldwrite
+echo "built $out/dwritetest.exe (dwrite.dll: fonts, layout, analysis; scripts/winetest.sh dwrite own runs it)"
 $cc -O1 -Wall -Wextra -o "$out/apctest.exe" tests/windows/apctest.c
 echo "built $out/apctest.exe (APCs, alertable waits, waitable timers, OpenProcess; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/mmaptest.exe" tests/windows/mmaptest.c
@@ -63,6 +65,8 @@ $cc -O1 -Wall -Wextra -o "$out/priotest.exe" tests/windows/priotest.c
 echo "built $out/priotest.exe (thread and process priority affects scheduling)"
 $cc -O1 -Wall -Wextra -o "$out/regtest.exe" tests/windows/regtest.c -ladvapi32
 echo "built $out/regtest.exe (the registry, over advapi32)"
+$cc -O1 -Wall -Wextra -o "$out/bcrypttest.exe" tests/windows/bcrypttest.c -lbcrypt
+echo "built $out/bcrypttest.exe (bcrypt: hashes, KDFs, AES, RC4, ECDH/ECDSA, key blobs)"
 $cc -O1 -Wall -Wextra -o "$out/locktest.exe" tests/windows/locktest.c
 echo "built $out/locktest.exe (byte-range locks; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/notifytest.exe" tests/windows/notifytest.c

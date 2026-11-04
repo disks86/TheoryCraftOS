@@ -788,15 +788,23 @@ EXPORT HRESULT WINAPI SHLoadInProc(REFCLSID clsid) {
   return hr;
 }
 EXPORT HRESULT WINAPI SHEnableServiceObject(REFCLSID clsid, BOOL enable) { (void)clsid; (void)enable; return S_OK; }
-static IUnknown *g_instance_explorer;
+/* The reference to the process (the explorer instance) is kept by shcore.dll: SetProcessReference / GetProcessReference. */
+static HMODULE shcore_module(void) { return LoadLibraryW(L"shcore.dll"); }
 EXPORT HRESULT WINAPI SHGetInstanceExplorer(IUnknown **out) {
+  HRESULT (WINAPI *get)(IUnknown **) = NULL;
   if (!out) return E_POINTER;
-  *out = g_instance_explorer;
-  if (*out) { IUnknown_AddRef(*out); return S_OK; }
-  return E_FAIL;
+  *out = NULL;
+  HMODULE core = shcore_module();
+  if (core) get = (HRESULT (WINAPI *)(IUnknown **))(void *)GetProcAddress(core, "GetProcessReference");
+  return get ? get(out) : E_FAIL;
 }
 EXPORT HRESULT WINAPI SHGetInstanceExplorerWorker(IUnknown **out) { return SHGetInstanceExplorer(out); }
-EXPORT void WINAPI SHSetInstanceExplorer(IUnknown *object) { g_instance_explorer = object; }
+EXPORT void WINAPI SHSetInstanceExplorer(IUnknown *object) {
+  void (WINAPI *set)(IUnknown *) = NULL;
+  HMODULE core = shcore_module();
+  if (core) set = (void (WINAPI *)(IUnknown *))(void *)GetProcAddress(core, "SetProcessReference");
+  if (set) set(object);
+}
 EXPORT LRESULT WINAPI SHShellFolderView_Message(HWND window, UINT message, LPARAM lparam) { (void)window; (void)message; (void)lparam; return 0; }
 EXPORT HRESULT WINAPI SHCreateShellFolderView(const SFV_CREATE *create, IShellView **out) { (void)create; if (out) *out = NULL; return E_NOTIMPL; }
 EXPORT HRESULT WINAPI SHCreateShellFolderViewEx(CSFV *create, IShellView **out) { (void)create; if (out) *out = NULL; return E_NOTIMPL; }

@@ -400,6 +400,35 @@ Nothing a program links against is missing, even where nothing is implemented ye
 - **Gaps.** Only functions are stubbed (not data exports such as `_environ`), and names that are not C identifiers (C++ decorated names) are left out. kernelbase.dll and `api-ms-win-*` still fold into kernel32.dll (see `canonical_library_name()`), so their extra exports are not listed.
 
 
+## dbghelp.dll
+
+`src/Windows/dbghelp` (`dbghelp.c` and the `.inc` files it includes; `dbghelp.h` and `minidumpapiset.h` are Wine's headers, adapted to mingw's `windows.h`) implements the image helpers, the
+symbol handler, the x64 stack walker and minidumps in user mode. **No new system call was needed**: it runs over `ReadProcessMemory`, `VirtualQueryEx`, the process snapshot, the
+module list (`K32EnumProcessModules`), `NtQueryInformationThread` (the TEB) and the thread context calls, which cross process boundaries already.
+
+- **Image helpers** (`image.inc`): `ImageNtHeader`, `ImageRvaToSection/Va`, `ImageDirectoryEntryToData(Ex)`, `GetTimestampForLoadedLibrary`, `ImagehlpApiVersion(Ex)`.
+- **Symbol handler** (`symbols.inc`, `lookup.inc`): one list of modules per process handle (`SymInitialize`, `SymLoadModule(Ex)`, `SymUnloadModule`, `SymRefreshModuleList`, `SymCleanup`,
+  options, search path, `SymGetModuleInfo(W)64`, `SymEnumerateModules`). A module is read from the memory of the process or from its file; its symbols are the PE export table and the
+  **COFF symbol table** of the file (what mingw's linker leaves in an unstripped image), kept sorted by address. `SymFromAddr/Name/Index(W)`, `SymEnumSymbols(Ex)(W)`, `SymSearch(W)`,
+  `SymNext/Prev`, the `IMAGEHLP_SYMBOL64` forms, `SymAddSymbol`/`SymDeleteSymbol` (virtual symbols), `SymMatchString/FileName`. A module is found for any address in a process
+  (`SymGetModuleBase64` loads it when the symbol handler does not have it yet). Module loading follows Windows: loading at a base that is taken answers 0 with `ERROR_SUCCESS`, a base
+  inside an older module replaces it, a base of 0 takes the file's own (`ERROR_INVALID_ADDRESS` if taken, `ERROR_NO_MORE_FILES` if there is no file), the size the caller gives wins.
+- **Unwinding** (`stack.inc`): `StackWalk64`/`StackWalkEx` for AMD64: the UNWIND_INFO interpreter (pushes, allocations, frame register, saved registers, chained and indirect entries,
+  machine frames) reading through the caller's memory routine, the function table from `SymFunctionTableAccess64` (a copy of each module's `.pdata`). A pc inside an epilogue is not
+  recognised; the walk is right from call sites, bodies and prologs.
+- **Minidumps** (`dump.inc`): `MiniDumpWriteDump` of any process the caller can read (thread list with contexts and stacks, module list, system and miscellaneous information, memory list or,
+  with `MiniDumpWithFullMemory`, the 64-bit memory list; exception, memory-info, thread-info and thread-name streams; user streams) and `MiniDumpReadDumpStream`.
+- **Names and files** (`undname.inc`, `paths.inc`): `UnDecorateSymbolName(W)` for the common MSVC signatures (global and member functions, static data, builtin types, pointers, references,
+  classes with scopes, constructors, destructors; anything else falls back to the qualified name), `MakeSureDirectoryPathExists`, `SearchTreeForFile`, `EnumDirTree`, `FindFileInPath`,
+  `FindExecutableImage`, `FindDebugInfoFile`, `EnumerateLoadedModules*`.
+- **Not done.** PDB, DWARF and CodeView readers (so no lines, types, locals, source files: those calls fail with `ERROR_MOD_NOT_FOUND`/`ERROR_NOT_SUPPORTED`), symbol servers (`SymSrv*`, the
+  index functions of Wine's `path.c`), the callback of `MiniDumpWriteDump`, handle data and token streams, 32-bit `StackWalk`, inline frames, the debugger-extension exports.
+- **Gotcha (fixed).** mingw's ntdll import library lists some of kernel32.dll's functions (`OpenThread`, `QueueUserAPC`, `IsWow64Process`, ...), which had given ntdll.dll stubs of them that shadowed the real ones in any DLL linking `libntdll.a` first. `scripts/gen-windows-stubs.py` now leaves kernel32's names out of ntdll's list.
+- **Tests.** `scripts/winetest.sh dbghelp tcos` runs `tests/windows/wine/dbghelp/tcos.c` (193 checks: image helpers, symbols of kernel32's exports and of the test program's COFF table, the stack
+  walk through three frames, name decoding, directories, minidumps of the process itself in both modes, read back). Wine's own tests: `dbghelp` 89 -> 17 failed checks (the rest need files this OS does not have, a 32-bit process, and
+  `STATUS_INVALID_CID` from a bogus process handle); `minidump` crashed with an access violation and now runs through (56 failed: the callback, the debug-event exception tests, `kernelbase.dll` as a
+  module of its own); `path` is unchanged at 457 (all of it symbol-server and PDB indexing: `SymSrv*`).
+
 ## dwmapi.dll
 
 `src/Windows/dwmapi/dwmapi.c` implements the Desktop Window Manager API: `DwmIsCompositionEnabled` (always on), `DwmGetColorizationColor`, `DwmFlush` and `DwmGetCompositionTimingInfo`
@@ -426,6 +455,56 @@ getters read what is in the context (empty unless a program wrote into it throug
 user32 has no window functions yet, so the window-based paths (`ImmGetContext`, `ImmAssociateContext`, the `WM_IME_NOTIFY` sent to the context's window) are covered only by the kernel
 half. Still stubs: `CtfImmGetGlobalIMEStatus`, `CtfImmGetGuidAtom`, `CtfImmNotify`, `CtfImmSetDefaultRemoteKeyboardLayout`. The kernel half is covered by `test_keyboard` in
 `Win32kMiscTest`; the user-mode half by `tests/windows/imm32test.c` (run with `scripts/winetest.sh imm32 tcos` after putting the built `imm32test.exe` in `build/winetests/imm32_tcos.exe`).
+
+## bcrypt.dll
+
+`src/Windows/bcrypt/bcrypt.c` implements the primitives of Cryptography API: Next Generation. The DLL keeps what CNG keeps in its callers' objects (providers, hash objects, keys, shared
+secrets; handles are pointers with a magic number, the pseudo-handles such as `BCRYPT_SHA256_ALG_HANDLE` are static objects) and the arithmetic is done by the kernel with `src/Crypto`, through
+one service, **`NtTcosCrypto`** (service 507, `src/Process/WindowsCrypto.cpp`). It takes a pointer to 14 numbers: the operation and its parameters (pointers into the program, lengths, codes).
+Operations: 1 hash/HMAC (MD4, MD5, SHA-1/224/256/384/512), 2 PBKDF2, 3 HKDF, 4 AES (ECB, CBC, CFB-128, CFB-8; the chaining value is written back), 5 AES-GCM (12 byte nonce, 16 byte tag),
+6 elliptic curves (P-256, P-384: new scalar, public point, ECDH, ECDSA sign and verify), 7 RSA verification (PKCS #1 v1.5, PSS). Every length is bounded, every pointer is checked, and a tag or signature that
+does not match is an NTSTATUS (`STATUS_AUTH_TAG_MISMATCH`, `STATUS_INVALID_SIGNATURE`), not output. Random bytes come from `NtQuerySystemInformation` class 0x1000.
+
+Done: `BCryptOpenAlgorithmProvider`/`Close`, `Get`/`SetProperty` (object, hash and block lengths, algorithm name, chaining mode, key length(s), tag lengths, signature length),
+`BCryptGenRandom`, hashes (`CreateHash`, `HashData`, `FinishHash`, `DuplicateHash`, `BCryptHash`; HMAC through `BCRYPT_ALG_HANDLE_HMAC_FLAG`; a hash object keeps its input until it is finished),
+`GenerateSymmetricKey`, `Import`/`ExportKey` (`KeyDataBlob`, ECC and RSA public blobs), `Encrypt`/`Decrypt` (AES with PKCS #7 padding, GCM with `BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO`, RC4 in the DLL),
+`GenerateKeyPair`/`FinalizeKeyPair`/`ImportKeyPair` (ECDSA and ECDH; imported points are checked to be on the curve and a private blob to match its point), `SignHash`/`VerifySignature`, `SecretAgreement`,
+`DeriveKey` (HASH, HMAC, TRUNCATE), `DeriveKeyPBKDF2`, `KeyDerivation` (PBKDF2 and HKDF), `EnumAlgorithms`, `FreeBuffer`, `GetFipsAlgorithmMode`.
+Not done (they answer `STATUS_NOT_SUPPORTED`, or stay stubs): MD2, DES/3DES/RC2, AES-CCM/CMAC/GMAC, P-521, RSA key generation, signing and encryption, wrapped keys, AES-GCM with a shortened tag
+on decryption or with chained calls, SP800-108/TLS PRF/CAPI KDFs, and the context and provider registration functions (`src/Windows/stubs/bcrypt.inc`). Tests: `SyscallTest` (known answers
+of every operation, bit flips and bad pointers) and `tests/windows/bcrypttest.c` (the DLL itself, run on the emulator with `tests/emulated_windows.sh tests/windows/bcrypttest.c`).
+
+## shcore.dll
+
+`src/Windows/shcore/shcore.c` implements the shell core library: DPI (`GetDpiForMonitor`, `Get/SetProcessDpiAwareness`, `GetScaleFactorForMonitor/Device`, `GetDpiForShellUIComponent`)
+over the existing win32k services `NtUserGetDpiForMonitor`, `NtUserGetSystemDpiForProcess` and `NtUserGet/SetProcessDpiAwarenessContext` (no new service was needed); the scale-change
+events and window notifications are signalled by a watcher thread that polls the system DPI every 250 ms while somebody is registered (win32k has no change notification).
+Also the truncating string copies (`SHAnsiToUnicode` ...), the registry helpers shlwapi lacked (`SHRegGetValue`, `SHEnumKeyEx`, `SHEnumValue`, `SHQueryInfoKey`, `SHCopyKey`,
+`SHRegGetPath/SetPath`, `SHRegGetInt`, ...), memory and registry streams (`SHCreateMemStream`, `SHOpenRegStream*`, `IStream_Copy/ReadStr/WriteStr`), the `IUnknown_*` helpers, the process
+reference (shell32's `SHGetInstanceExplorer` reads it), thread references and `SHCreateThread`, `IsOS` (a Windows 10 workstation), the explicit AppUserModelID (kept in the process
+parameters; shell32 forwards to it), and feature-state queries (always the default state). The shlwapi/shell32 functions that already exist are forwarders (`shcore.def`).
+Still stubs: the `SHTaskPool*` functions; the WinRT stream functions report `E_NOTIMPL` (no HSTRING / IRandomAccessStream). Tested with Wine's `shcore` test (240 checks, 0 failures) and `tests/windows/shcoretest.c` (65 checks; `scripts/winetest.sh shcore own`).
+Side changes: `GetProcAddress` now loads the library a forwarder names (it only followed forwarders into libraries already loaded); `SHCreateStreamOnFile` shares read and write by
+default and `SetSize` on a read-only stream only moves the position; the registry seeds `HKLM\\...\\CurrentVersion\\Explorer\\Shell Folders` (the Common * folders).
+
+## dwrite.dll
+
+`src/Windows/dwrite` implements DirectWrite (the `IDWriteFactory` interface family of dwrite.h, `DWriteCreateFactory`) over the kernel's font system. The fonts are the kernel's
+(`src/Font`: the bundled Liberation/Noto faces and any font a program adds), reached with one service, **`NtTcosFont`** (service 508; request layout and operations in
+`src/Process/WindowsFonts.hpp`, implemented by `font::SystemFontService` in `src/Font/SystemFontService.cpp`, installed in `src/main.cpp`): face information and names, code point to
+glyph, glyph advances and boxes, kerning, outlines, anti-aliased glyph bitmaps, the bytes of the sfnt file (the DLL reads tables itself) and adding a font file.
+
+What the DLL does itself: the COM objects (font collection, family, font, face, localized strings, font files and their loaders, text format, text layout, text analyzer, glyph run
+analysis, GDI interop with the bitmap render target, rendering parameters, typography, number substitution, the ellipsis trimming sign), the CSS-style font matching, and the layout
+(clusters, fallback to the wide-coverage face, kerning, line breaking at spaces/hyphens/ideographs, wrapping modes, alignment incl. justification, tab stops, trimming, line
+spacing, hit testing, `Draw` through the program's `IDWriteTextRenderer`). The system collection lists the families the bundled faces stand in for (Arial, Segoe UI, Times New Roman,
+Courier New, Consolas, Liberation *, TCOS *, ...). A font file a program refers to (path or its own loader) is added to the kernel's fonts once and then is an ordinary face; a
+system face's file has a loader that streams the kernel's copy and answers a synthetic path (`C:\Windows\Fonts\tcos-N.ttf`).
+
+Not done: bidirectional reordering and complex-script shaping (clusters are code points plus combining marks, kerning from the `kern` table, no GSUB/GPOS/ligatures; a right-to-left
+reading direction only mirrors the alignment), font simulations, colour and variable fonts, CFF outlines, the DirectWrite 1.1+ interfaces (`IDWriteFactory1`..), ClearType sub-pixel
+rendering (the 3x1 texture carries grey coverage). Tests: `test_*` in `tests/WindowsFontTest.cpp` (the service, host), `tests/windows/dwritetest.c` (228 checks through the real DLL
+in QEMU: `scripts/winetest.sh dwrite own`); Wine's analyzer/font tests are mostly about bidi, scripts and Windows 10 interfaces and still fail (157 / 325 checks).
 
 ## gdi32.dll
 

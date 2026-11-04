@@ -70,3 +70,5 @@ SHFree @195
 SHAlloc @196
 ReadCabinetState @651
 WriteCabinetState @652
+SetCurrentProcessExplicitAppUserModelID = shcore.SetCurrentProcessExplicitAppUserModelID
+GetCurrentProcessExplicitAppUserModelID = shcore.GetCurrentProcessExplicitAppUserModelID

@@ -13,8 +13,8 @@ lld=${LD_LLD:-$(find "$HOME/.rustup" -name ld.lld -path '*gcc-ld*' 2>/dev/null |
 modes=(); seeds=3; filter=""; perkey=4
 while [ $# -gt 0 ]; do case $1 in --seeds) seeds=$2; shift 2 ;; --filter) filter=$2; shift 2 ;; --perkey) perkey=$2; shift 2 ;; *) modes+=("$1"); shift ;; esac; done
 [ ${#modes[@]} -gt 0 ] || modes=(int fp neon mem)
-g++ -std=c++20 -O1 -I src -w tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/emurun" &
-g++ -std=c++20 -O1 -I src -w tests/aarch64_diff/probe.cpp src/Emulation/*.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/probe" &
+g++ -std=c++20 -O1 -I src -w tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/emurun" &
+g++ -std=c++20 -O1 -I src -w tests/aarch64_diff/probe.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -pthread -o "$work/probe" &
 wait
 # qprobe: runs each word under qemu and reports the ones it does not implement (SIGILL), so that instructions only LLVM knows are not compared
 clang --target=aarch64-linux-gnu -march=armv9.5-a -O1 -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -c tests/aarch64_diff/qprobe.c -o "$work/qprobe.o"

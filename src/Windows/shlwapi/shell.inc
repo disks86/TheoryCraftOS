@@ -383,7 +383,10 @@ static HRESULT_ WINAPI fs_set_size(IStreamLike *self, ULARGE_INTEGER size) {
   FileStream *s = (FileStream *)self;
   LARGE_INTEGER here, zero, target;
   zero.QuadPart = 0;
-  if ((s->mode & 3) == 0) return STG_E_ACCESSDENIED_;
+  if ((s->mode & 3) == 0) {      /* a read-only stream: it cannot cut or extend the file, but the position moves (as in Windows) */
+    target.QuadPart = (LONGLONG)size.QuadPart;
+    return SetFilePointerEx(s->file, target, NULL, 0) ? 0 : E_FAIL_;
+  }
   if (!SetFilePointerEx(s->file, zero, &here, 1)) return E_FAIL_;
   target.QuadPart = (LONGLONG)size.QuadPart;
   if (!SetFilePointerEx(s->file, target, NULL, 0) || !SetEndOfFile(s->file)) { SetFilePointerEx(s->file, here, NULL, 0); return E_FAIL_; }
@@ -434,7 +437,7 @@ EXPORT HRESULT_ WINAPI SHCreateStreamOnFileEx(LPCWSTR path, DWORD mode, DWORD at
   if (!path || template_stream) return E_INVALIDARG_;
   DWORD access = (mode & 3) == 0 ? 0x80000000u : ((mode & 3) == 1 ? 0x40000000u : 0xC0000000u);
   DWORD share = 0;
-  switch (mode & 0x70) { case 0x40: share = 3; break; case 0x20: share = 1; break; case 0x30: share = 2; break; case 0x10: share = 0; break; default: share = 1; break; }
+  switch (mode & 0x70) { case 0x40: share = 3; break; case 0x20: share = 1; break; case 0x30: share = 2; break; case 0x10: share = 0; break; default: share = 3; break; }
   DWORD disposition = (mode & 0x1000) ? 2 /* CREATE_ALWAYS */ : (create ? 4 /* OPEN_ALWAYS */ : 3 /* OPEN_EXISTING */);
   if (create && (mode & 0x1000)) disposition = 2;
   HANDLE f = CreateFileW(path, access, share, NULL, disposition, attributes ? attributes : 0x80, NULL);

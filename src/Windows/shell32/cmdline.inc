@@ -318,24 +318,7 @@ EXPORT BOOL WINAPI SHTestTokenMembership(HANDLE token, ULONG rid) {
 EXPORT BOOL WINAPI IsUserAnAdmin(void) { return SHTestTokenMembership(NULL, DOMAIN_ALIAS_RID_ADMINS); }
 EXPORT BOOL WINAPI IsNTAdmin(DWORD reserved, DWORD *unused) { (void)reserved; (void)unused; return IsUserAnAdmin(); }
 
-/* The identity of the program for the taskbar (a string of at most 128 characters, set once per process). */
-static WCHAR g_app_id[130];
-EXPORT HRESULT WINAPI SetCurrentProcessExplicitAppUserModelID(PCWSTR id) {
-  if (!id || !*id || wlen(id) > 128) return E_INVALIDARG;
-  EnterCriticalSection(&g_lock);
-  w_copy(g_app_id, ARRAY_LEN(g_app_id), id);
-  LeaveCriticalSection(&g_lock);
-  return S_OK;
-}
-EXPORT HRESULT WINAPI GetCurrentProcessExplicitAppUserModelID(PWSTR *id) {
-  if (!id) return E_INVALIDARG;
-  *id = NULL;
-  EnterCriticalSection(&g_lock);
-  if (g_app_id[0]) *id = w_task_dup(g_app_id);
-  LeaveCriticalSection(&g_lock);
-  if (!*id) return g_app_id[0] ? E_OUTOFMEMORY : E_FAIL;
-  return S_OK;
-}
+/* (SetCurrentProcessExplicitAppUserModelID and Get...: shcore.dll, see shell32.def) */
 
 /* ---- the DLL ------------------------------------------------------------------------------------------------------------------------------------------------ */
 

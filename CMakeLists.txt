@@ -426,6 +426,7 @@ add_executable(BOOTX64
   src/Font/GlyphCache.cpp
   src/Font/FontSet.cpp
   src/Font/Shaper.cpp
+  src/Font/SystemFontService.cpp
   src/Font/FontDataSans.cpp
   src/Font/FontDataSerif.cpp
   src/Font/FontDataMono.cpp
@@ -663,7 +664,9 @@ add_executable(BOOTX64
   src/Process/AccessCheck.cpp
   src/Process/ObjectPath.cpp
   src/Process/WindowsTokens.cpp
+  src/Process/WindowsCrypto.cpp
   src/Process/WindowsDialogs.cpp
+  src/Process/WindowsFonts.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp
@@ -1100,6 +1103,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   # shell32.dll uses the registry (advapi32) and the window system (user32); the string functions it shares with shlwapi are forwarders in shell32.def.
   set(WINDOWS_IMPORTS_shell32 advapi32 user32 ole32)
   set(WINDOWS_IMPORTS_shlwapi advapi32)
+  set(WINDOWS_IMPORTS_shcore advapi32 ole32 win32u)      # (the registry, CoTaskMemAlloc, the DPI services of win32k)
   set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
   set(WINDOWS_IMPORTS_imm32 win32u)      # (the services of win32k: input contexts, hot keys)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
@@ -1109,7 +1113,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
     set(_own_sources "")
     set(_own_depends "")
     if(EXISTS ${_own})
-      file(GLOB _own_incs ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.inc)
+      file(GLOB _own_incs ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.inc ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.h)
       set(_own_sources ${_own} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll)
       set(_own_depends ${_own} ${_own_incs} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS})
       if(_library STREQUAL "ole32")
