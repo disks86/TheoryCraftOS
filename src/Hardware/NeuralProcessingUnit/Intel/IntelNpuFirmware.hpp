@@ -27,8 +27,8 @@ namespace hardware {
 // Firmware images for Intel NPUs ("VPU") and everything the host hands the firmware before it starts, as the Linux ivpu driver does it (ivpu_fw.c,
 // vpu_boot_api.h): parsing and checking the image file, the NPU-side memory map the checks are made against, loading the image into the runtime
 // memory, filling the 4 KiB boot parameter page, and the load-power-up-boot sequence. All of it works on views the caller supplies; the NPU's own
-// MMU, which has to map those pages at the addresses below before the NPU's CPU runs, is not here yet, nor is the IPC channel the firmware reports
-// ready on (see IntelNpuHw).
+// MMU (IntelNpuMmu.hpp: intel_npu_map_firmware) has to map those pages at the addresses below before the NPU's CPU runs; the IPC channel the firmware reports
+// ready on is not here yet (see IntelNpuHw).
 
 // A range of the NPU's own 64-bit address space, [start, end).
 struct IntelNpuAddressRange {
