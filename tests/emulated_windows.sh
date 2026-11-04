@@ -13,7 +13,7 @@ if [ ! -f "$work/build/build.ninja" ]; then
 fi
 ninja -C "$work/build" windows_dlls > /dev/null
 cp "$work"/build/windows/*.dll "$work/sys32/"
-g++ -std=c++20 -O2 -pthread -I src -w tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -o "$work/emurun"
+g++ -std=c++20 -O2 -pthread -I src -w tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -o "$work/emurun"
 programs=("$@")
 [ ${#programs[@]} -gt 0 ] || programs=(tests/windows/emuthreads.c tests/windows/sehtest.c tests/windows/threadtest.c tests/windows/crttest.c tests/windows/cxxtest.cpp)
 fail=0
@@ -22,6 +22,7 @@ for src in "${programs[@]}"; do
   case $name in
     sehtest|threadtest) clang --target=x86_64-w64-mingw32 -fms-extensions -O1 -Wno-unused-function -I/usr/x86_64-w64-mingw32/include -L/usr/x86_64-w64-mingw32/lib -fuse-ld=bfd -o "$work/$name.exe" "$src" ;;
     cxxtest) x86_64-w64-mingw32-g++ -O1 -Wall -Wextra -static -o "$work/$name.exe" "$src" ;;
+    bcrypttest) x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/$name.exe" "$src" -lbcrypt ;;
     *) x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/$name.exe" "$src" ;;
   esac
   echo "== $name"

@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,6 +48,7 @@ struct H final : process::IProcessHost {
   bool read_console(ByteView, uint64_t* g) override { *g = 0; return true; }
   uint64_t realtime_ns() override { return 1700000000ull * 1000000000ull + now(); } uint64_t monotonic_ns() override { return now(); }
   void sleep_ns(uint64_t ns) override { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); } void yield() override { std::this_thread::yield(); }
+  bool random_bytes(ByteView o) override { std::lock_guard<std::mutex> g(m); static std::mt19937_64 rng(12345); for (uint8_t& b : o) b = uint8_t(rng()); return true; }
 };
 struct Sync final : process::ISystemSync {
   std::mutex m; std::condition_variable_any cv;

@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -76,6 +77,8 @@ struct FakeHost final : IProcessHost {
   uint64_t monotonic_ns() override { return mono; }
   void sleep_ns(uint64_t ns) override { slept += ns; }
   void yield() override { ++yields; }
+  uint64_t rng = 0x9E3779B97F4A7C15ull;
+  bool random_bytes(ByteView o) override { for (uint8_t& b : o) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; b = uint8_t(rng); } return true; }
 };
 
 static Bytes elf_header(uint16_t machine, uint8_t cls = 2, uint8_t data = 1, uint8_t osabi = 0, uint16_t type = 2) {
@@ -276,7 +279,7 @@ static void test_linux_generic_table() {
   CHECK(std::string("riscv64").size() == 7 && r.syscall(req(160, kBase)) == 0 && std::string((const char*)&mem2.bytes[65 * 4]) == "riscv64");
 }
 
-static const uint32_t kNtSuccess = 0, kNtInvalidHandle = 0xC0000008u, kNtAccessViolation = 0xC0000005u, kNtEof = 0xC0000011u, kNtDenied = 0xC0000022u,
+static const uint32_t kNtSuccess = 0, kNtInvalidParameter = 0xC000000Du, kNtInvalidHandle = 0xC0000008u, kNtAccessViolation = 0xC0000005u, kNtEof = 0xC0000011u, kNtDenied = 0xC0000022u,
                       kNtNoService = 0xC000001Cu, kNtNotImpl = 0xC0000002u;
 constexpr uint64_t kStack = kBase + 0x1000;
 
@@ -345,7 +348,7 @@ static void test_windows() {
   CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtDelayExecution, 0, 0))) == kNtAccessViolation);
 
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount)))) == kNtNoService);      // the first number past the list
-  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount - 4)))) == kNtNotImpl);      // the last service without code (the three after it are this OS's own)
+  CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWindowsServiceCount - 5)))) == kNtNotImpl);      // the last service without code (the four after it are this OS's own)
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase)))) == kNtNotImpl);          // win32k's first and last service
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceEnd - 1)))) == kNtNotImpl);
   CHECK(st(p.syscall(nt(static_cast<WindowsSyscallNumber>(kWin32kServiceBase - 1)))) == kNtNoService);     // the gap between the two tables
@@ -361,6 +364,103 @@ static void test_windows() {
 }
 
 // A Linux program cannot reach NT services and a PE program cannot reach Linux ones: the same number means different things.
+// NtTcosCrypto: known answers of the primitives bcrypt.dll is made of, then bad pointers and lengths.
+static std::string hex_of(const FakeMemory& m, uint64_t at, size_t n) {
+  std::string r;
+  for (size_t i = 0; i < n; ++i) { char b[3]; snprintf(b, sizeof b, "%02x", m.bytes[at - kBase + i]); r += b; }
+  return r;
+}
+static void test_crypto() {
+  FakeMemory mem; FakeHost host;
+  Process p(11, binding_for(SyscallAbi::Windows, UserArch::X86_64), mem, host);
+  filesystem::RamFileSystem fs(A);
+  p.files().attach(A, fs, StringView("/Windows"));
+  auto run = [&](std::initializer_list<uint64_t> words) {
+    uint64_t at = kBase;
+    for (uint64_t w : words) { mem.put64(at, w); at += 8; }
+    for (; at < kBase + 14 * 8; at += 8) mem.put64(at, 0);
+    return st(p.syscall(nt(WindowsSyscallNumber::NtTcosCrypto, kBase)));
+  };
+  const uint64_t D = kBase + 0x200, K = kBase + 0x400, O = kBase + 0x800, X = kBase + 0xA00, Y = kBase + 0xC00;
+  mem.put(D, "abc");
+  CHECK(run({1, 2, 0, D, 3, 0, 0, O}) == 0);      // SHA-256
+  CHECK(hex_of(mem, O, 32) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  CHECK(run({1, 6, 0, D, 3, 0, 0, O}) == 0 && hex_of(mem, O, 16) == "a448017aaf21d8525fc10ae87aa6729d");      // MD4
+  for (int i = 0; i < 20; ++i) mem.bytes[K - kBase + i] = 0x0b;
+  mem.put(D, "Hi There");
+  CHECK(run({1, 2, 1, D, 8, K, 20, O}) == 0);      // HMAC-SHA-256, RFC 4231 case 1
+  CHECK(hex_of(mem, O, 32) == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+  mem.put(K, "password"); mem.put(D, "salt");
+  CHECK(run({2, 1, K, 8, D, 4, 2, O, 20}) == 0 && hex_of(mem, O, 20) == "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957");      // PBKDF2-HMAC-SHA-1, RFC 6070
+  CHECK(run({2, 1, K, 8, D, 4, 0, O, 20}) == kNtInvalidParameter);      // no iterations
+  // HKDF-SHA-256, RFC 5869 case 1
+  for (int i = 0; i < 22; ++i) mem.bytes[K - kBase + i] = 0x0b;
+  for (int i = 0; i < 13; ++i) mem.bytes[D - kBase + i] = uint8_t(i);
+  for (int i = 0; i < 10; ++i) mem.bytes[X - kBase + i] = uint8_t(0xF0 + i);
+  CHECK(run({3, 2, 0, K, 22, D, 13, X, 10, 42, O}) == 0);
+  CHECK(hex_of(mem, O, 42) == "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+  // AES-128 (FIPS 197): ECB; CBC and CFB round trips, the chaining value comes back
+  for (int i = 0; i < 16; ++i) { mem.bytes[K - kBase + i] = uint8_t(i); mem.bytes[D - kBase + i] = uint8_t(i * 0x11); }
+  CHECK(run({4, 0, 1, K, 16, 0, D, O, 16}) == 0 && hex_of(mem, O, 16) == "69c4e0d86a7b0430d8cdb78070b4c55a");
+  CHECK(run({4, 0, 0, K, 16, 0, O, X, 16}) == 0 && hex_of(mem, X, 16) == hex_of(mem, D, 16));
+  for (uint32_t mode = 1; mode <= 3; ++mode) {
+    const uint32_t n = mode == 1 ? 32 : 37;
+    for (int i = 0; i < 16; ++i) mem.bytes[Y - kBase + i] = uint8_t(0xA0 + i);      // IV
+    for (uint32_t i = 0; i < n; ++i) mem.bytes[D - kBase + i] = uint8_t(i * 7 + 1);
+    CHECK(run({4, mode, 1, K, 16, Y, D, O, n}) == 0);
+    const std::string iv_after = hex_of(mem, Y, 16);
+    CHECK(mode == 3 || iv_after == hex_of(mem, O + n - 16, 16));      // (the last block of ciphertext)
+    CHECK(hex_of(mem, O, n) != hex_of(mem, D, n));
+    for (int i = 0; i < 16; ++i) mem.bytes[Y - kBase + i] = uint8_t(0xA0 + i);
+    CHECK(run({4, mode, 0, K, 16, Y, O, X, n}) == 0 && hex_of(mem, X, n) == hex_of(mem, D, n) && hex_of(mem, Y, 16) == iv_after);
+  }
+  CHECK(run({4, 1, 1, K, 16, Y, D, O, 17}) == kNtInvalidParameter);      // CBC wants whole blocks
+  CHECK(run({4, 1, 1, K, 15, Y, D, O, 16}) == kNtInvalidParameter);      // not an AES key
+  CHECK(run({4, 9, 1, K, 16, Y, D, O, 16}) == kNtInvalidParameter);
+  // AES-GCM: round trip, a flipped tag or data byte is refused, and nothing is released
+  for (int i = 0; i < 12; ++i) mem.bytes[Y - kBase + i] = uint8_t(i);
+  mem.put(D, "authenticated message");
+  const uint64_t AAD = kBase + 0x600, TAG = kBase + 0x700;
+  mem.put(AAD, "header");
+  CHECK(run({5, 1, K, 16, Y, 12, AAD, 6, D, 21, O, TAG}) == 0);
+  CHECK(hex_of(mem, O, 21) != hex_of(mem, D, 21));
+  CHECK(run({5, 0, K, 16, Y, 12, AAD, 6, O, 21, X, TAG}) == 0 && hex_of(mem, X, 21) == hex_of(mem, D, 21));
+  mem.bytes[TAG - kBase] ^= 1;
+  CHECK(run({5, 0, K, 16, Y, 12, AAD, 6, O, 21, X, TAG}) == 0xC000A002u);
+  mem.bytes[TAG - kBase] ^= 1; mem.bytes[O - kBase + 3] ^= 0x80;
+  CHECK(run({5, 0, K, 16, Y, 12, AAD, 6, O, 21, X, TAG}) == 0xC000A002u);
+  CHECK(run({5, 1, K, 16, Y, 8, AAD, 6, D, 21, O, TAG}) == 0xC00000BBu);      // only 12 byte nonces
+  // Elliptic curves: two key pairs agree on the secret; a signature checks and a changed digest does not
+  for (uint32_t curve = 0; curve <= 1; ++curve) {
+    const uint32_t fs = curve ? 48 : 32, ps = 1 + 2 * fs;
+    const uint64_t PA = kBase + 0x100, PB = kBase + 0x180, QA = kBase + 0x300, QB = kBase + 0x3A0, S1 = kBase + 0x500, S2 = kBase + 0x540, SIG = kBase + 0x600, DG = kBase + 0x700;
+    CHECK(run({6, 1, curve, 0, 0, 0, 0, 0, 0, PA}) == 0 && run({6, 1, curve, 0, 0, 0, 0, 0, 0, PB}) == 0);
+    CHECK(run({6, 2, curve, PA, fs, 0, 0, 0, 0, QA}) == 0 && run({6, 2, curve, PB, fs, 0, 0, 0, 0, QB}) == 0);
+    CHECK(mem.bytes[QA - kBase] == 4);
+    CHECK(run({6, 3, curve, PA, fs, QB, ps, 0, 0, S1}) == 0 && run({6, 3, curve, PB, fs, QA, ps, 0, 0, S2}) == 0);
+    CHECK(hex_of(mem, S1, fs) == hex_of(mem, S2, fs));
+    for (int i = 0; i < 32; ++i) mem.bytes[DG - kBase + i] = uint8_t(i * 5);
+    CHECK(run({6, 4, curve, PA, fs, DG, 32, 0, 0, SIG}) == 0);
+    CHECK(run({6, 5, curve, QA, ps, DG, 32, SIG, 2 * fs, 0}) == 0);
+    CHECK(run({6, 5, curve, QB, ps, DG, 32, SIG, 2 * fs, 0}) == 0xC000A000u);      // another key
+    mem.bytes[DG - kBase] ^= 1;
+    CHECK(run({6, 5, curve, QA, ps, DG, 32, SIG, 2 * fs, 0}) == 0xC000A000u);
+    mem.bytes[QB - kBase + 5] ^= 1;      // off the curve
+    CHECK(run({6, 3, curve, PA, fs, QB, ps, 0, 0, S1}) == kNtInvalidParameter);
+    CHECK(run({6, 5, curve, QA, ps, DG, 32, SIG, 2 * fs - 1, 0}) == 0xC000A000u);      // truncated signature
+  }
+  CHECK(run({6, 1, 5, 0, 0, 0, 0, 0, 0, O}) == kNtInvalidParameter);      // no such curve
+  // bad pointers, lengths and operations
+  CHECK(run({1, 2, 0, 0xDEAD0000, 3, 0, 0, O}) == kNtAccessViolation);
+  CHECK(run({1, 2, 0, D, 3, 0, 0, 0xDEAD0000}) == kNtAccessViolation);
+  CHECK(run({1, 2, 0, D, ~uint64_t{0}, 0, 0, O}) == kNtInvalidParameter);      // far too long
+  CHECK(run({1, 99, 0, D, 3, 0, 0, O}) == kNtInvalidParameter);                 // no such algorithm
+  CHECK(run({99}) == kNtInvalidParameter);
+  CHECK(st(p.syscall(nt(WindowsSyscallNumber::NtTcosCrypto, 0xDEAD0000))) == kNtAccessViolation);
+  CHECK(run({7, 0, 2, D, 0, D, 0, D, D, 0}) == kNtInvalidParameter);            // empty RSA key
+  CHECK(A.live >= 0);
+}
+
 static void test_isolation() {
   FakeMemory mem; FakeHost host;
   Process lin(1, binding_for(SyscallAbi::Linux, UserArch::X86_64), mem, host);
@@ -516,6 +616,7 @@ int main() {
   test_linux();
   test_linux_generic_table();
   test_windows();
+  test_crypto();
   test_isolation();
   test_service_numbers_agree();
   CHECK(A.live == 0);

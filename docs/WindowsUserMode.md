@@ -409,6 +409,24 @@ The state lives in win32k and is reached with one service, **`NtTcosDwm`** (serv
 `Dwmp*` exports, `DwmSetPresentParameters`, `DwmTransitionOwnedWindow`, and `SetThreadDpiAwarenessContext`. Nothing composites from the stored values yet. Not run under QEMU with
 a Windows program; the kernel half is covered by `test_dwm` in `Win32kMiscTest`.
 
+## bcrypt.dll
+
+`src/Windows/bcrypt/bcrypt.c` implements the primitives of Cryptography API: Next Generation. The DLL keeps what CNG keeps in its callers' objects (providers, hash objects, keys, shared
+secrets; handles are pointers with a magic number, the pseudo-handles such as `BCRYPT_SHA256_ALG_HANDLE` are static objects) and the arithmetic is done by the kernel with `src/Crypto`, through
+one service, **`NtTcosCrypto`** (service 507, `src/Process/WindowsCrypto.cpp`). It takes a pointer to 14 numbers: the operation and its parameters (pointers into the program, lengths, codes).
+Operations: 1 hash/HMAC (MD4, MD5, SHA-1/224/256/384/512), 2 PBKDF2, 3 HKDF, 4 AES (ECB, CBC, CFB-128, CFB-8; the chaining value is written back), 5 AES-GCM (12 byte nonce, 16 byte tag),
+6 elliptic curves (P-256, P-384: new scalar, public point, ECDH, ECDSA sign and verify), 7 RSA verification (PKCS #1 v1.5, PSS). Every length is bounded, every pointer is checked, and a tag or signature that
+does not match is an NTSTATUS (`STATUS_AUTH_TAG_MISMATCH`, `STATUS_INVALID_SIGNATURE`), not output. Random bytes come from `NtQuerySystemInformation` class 0x1000.
+
+Done: `BCryptOpenAlgorithmProvider`/`Close`, `Get`/`SetProperty` (object, hash and block lengths, algorithm name, chaining mode, key length(s), tag lengths, signature length),
+`BCryptGenRandom`, hashes (`CreateHash`, `HashData`, `FinishHash`, `DuplicateHash`, `BCryptHash`; HMAC through `BCRYPT_ALG_HANDLE_HMAC_FLAG`; a hash object keeps its input until it is finished),
+`GenerateSymmetricKey`, `Import`/`ExportKey` (`KeyDataBlob`, ECC and RSA public blobs), `Encrypt`/`Decrypt` (AES with PKCS #7 padding, GCM with `BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO`, RC4 in the DLL),
+`GenerateKeyPair`/`FinalizeKeyPair`/`ImportKeyPair` (ECDSA and ECDH; imported points are checked to be on the curve and a private blob to match its point), `SignHash`/`VerifySignature`, `SecretAgreement`,
+`DeriveKey` (HASH, HMAC, TRUNCATE), `DeriveKeyPBKDF2`, `KeyDerivation` (PBKDF2 and HKDF), `EnumAlgorithms`, `FreeBuffer`, `GetFipsAlgorithmMode`.
+Not done (they answer `STATUS_NOT_SUPPORTED`, or stay stubs): MD2, DES/3DES/RC2, AES-CCM/CMAC/GMAC, P-521, RSA key generation, signing and encryption, wrapped keys, AES-GCM with a shortened tag
+on decryption or with chained calls, SP800-108/TLS PRF/CAPI KDFs, and the context and provider registration functions (`src/Windows/stubs/bcrypt.inc`). Tests: `SyscallTest` (known answers
+of every operation, bit flips and bad pointers) and `tests/windows/bcrypttest.c` (the DLL itself, run on the emulator with `tests/emulated_windows.sh tests/windows/bcrypttest.c`).
+
 ## gdi32.dll
 
 `src/Windows/gdi32` is a real library: the GDI API of wingdi.h (A and W forms, DCs and their attributes, pens, brushes, bitmaps, DIBs, regions, clipping, palettes, paths, text and
