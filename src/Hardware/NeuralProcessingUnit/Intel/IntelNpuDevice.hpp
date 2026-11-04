@@ -112,6 +112,7 @@ class IntelNpuDevice {
   const IntelNpuInfo& info() const { return hw_.info(); }
   const IntelNpuFirmware& firmware() const { return firmware_; }
   uint32_t boot_count() const { return boot_count_; }
+  bool snoop() const { return config_.snoop; }
 
   // Created -> Loaded. Reads the fuses, parses the firmware file (which must stay alive: the image is copied at every boot) and allocates the memory the
   // firmware needs.

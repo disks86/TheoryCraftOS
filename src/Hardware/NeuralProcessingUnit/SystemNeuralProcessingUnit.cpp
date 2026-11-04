@@ -30,7 +30,8 @@ static_assert(sizeof(IntelNpu) == sizeof(SoftwareNeuralProcessingUnit) &&
 }
 
 SystemNeuralProcessingUnit::SystemNeuralProcessingUnit(const IPciBus& pci, ICentralProcessingUnit& cpu,
-                                                       scheduling::ICPUScheduler& scheduler) {
+                                                       scheduling::ICPUScheduler& scheduler)
+    : cpu_(cpu), scheduler_(scheduler) {
   PciDeviceInfo d;
   for (uint32_t i = 0; !active_ && pci.pci_device(i, &d); ++i) {
     if (d.vendor_id == IntelNpu::kPciVendor && IntelNpu::matches(d.device_id)) {
@@ -80,7 +81,8 @@ void SystemNeuralProcessingUnit::probe_registers(const IPciBus& pci, IRegisterMa
 }
 
 IntelNpuDeviceError SystemNeuralProcessingUnit::start_intel_device(const IPciBus& pci, IRegisterMapper* mmio, allocators::IAllocator& allocator,
-                                                                  ConstByteView firmware, uint64_t system_time_us) {
+                                                                  ConstByteView firmware, uint64_t system_time_us,
+                                                                  const IntelNpuExecutor::Config& executor_config) {
   constexpr uint16_t kPciCommand = 0x04, kPciRevision = 0x08;
   constexpr uint32_t kMemorySpace = 1u << 1;
   constexpr uint8_t kIpBar = 0, kButtressBar = 4;
@@ -113,6 +115,12 @@ IntelNpuDeviceError SystemNeuralProcessingUnit::start_intel_device(const IPciBus
     return error;   // the device (off again) is destroyed here, before the register wrappers it points at
   }
   intel_dev_ = util::move(device);
+  intel_exec_ = UniquePointer<IntelNpuExecutor>::make(allocator, *intel_dev_, allocator, executor_config);
+  if (intel_exec_) intel_accel_ = UniquePointer<IntelNpuAccelerator>::make(allocator, cpu_, scheduler_, *intel_exec_);
+  if (intel_accel_) {
+    intel_accel_->set_clock(executor_config.clock);
+    active_ = intel_accel_.get();
+  }
   description_.append("; firmware running");
   return IntelNpuDeviceError::None;
 }

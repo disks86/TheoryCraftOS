@@ -22,13 +22,19 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <deque>
 #include <functional>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
+#include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Hardware/NeuralProcessingUnit/Intel/IntelNpuDevice.hpp"
+#include "Hardware/NeuralProcessingUnit/Intel/IntelNpuExecutor.hpp"
+#include "Hardware/NeuralProcessingUnit/Intel/IntelNpuFirmwareFile.hpp"
 
 using namespace hardware;
 
@@ -105,7 +111,7 @@ struct SimNpu {
   uint32_t job_status = 0, fail_type = 0, force_result = 0;
   // state
   bool powered = false, alive = false;
-  uint32_t resets = 0, d0i3_entries = 0, cpu_starts = 0, wp_disables = 0;
+  uint32_t resets = 0, d0i3_entries = 0, cpu_starts = 0, wp_disables = 0, tx_count = 0;
   uint64_t entry_seen = 0;
   bool entry_has_image = false, boot_params_ok = false;
   uint32_t boot_cr0_when_started = 0;
@@ -309,6 +315,7 @@ struct SimNpu {
   }
 
   void on_tx(uint32_t slot_vpu) {
+    ++tx_count;
     if (!alive || fw_silent) return;
     const uint8_t* p = host(slot_vpu, kSlot);
     if (!p) return;
@@ -726,6 +733,137 @@ static void test_limits() {
   CHECK(r.alloc.dma.empty());
 }
 
+
+// ---- firmware files and the executor ----
+
+static bool put_file(filesystem::IFileSystem& fs, const char* path, const std::vector<uint8_t>& data) {
+  UniquePointer<filesystem::IFile> f;
+  if (fs.open_file(StringView(path), filesystem::OpenMode::CreateOrOpen, &f) != filesystem::Status::Ok || !f) return false;
+  uint64_t n = 0;
+  return data.empty() || f->write(0, ConstByteView(data.data(), data.size()), &n) == filesystem::Status::Ok;
+}
+
+static void test_firmware_file() {
+  TestAllocator alloc;
+  filesystem::RamFileSystem fs(alloc);
+  for (const char* dir : {"/Linux", "/Linux/lib", "/Linux/lib/firmware", "/Linux/lib/firmware/intel", "/Linux/lib/firmware/intel/vpu"}) CHECK(fs.create_directory(StringView(dir)) == filesystem::Status::Ok);
+  CHECK(std::string(filesystem::layout::kLinuxFirmwareIntelVpu) == "/Linux/lib/firmware/intel/vpu");
+  uint32_t count = 0;
+  const char* const* names = intel_npu_firmware_names(IntelNpuIp::Ip40xx, &count);
+  CHECK(count == 2 && std::string(names[0]) == "vpu_40xx_v1.bin" && std::string(names[1]) == "vpu_40xx_v0.0.bin");
+  CHECK(intel_npu_firmware_names(IntelNpuIp::Ip60xx, &count) && count == 1 && !intel_npu_firmware_names(IntelNpuIp::Unknown, &count) && count == 0);
+  ByteBuffer out(alloc);
+  FixedString<48> used;
+  CHECK(!intel_npu_read_firmware(fs, alloc, IntelNpuIp::Ip40xx, out, &used));   // nothing there
+  const std::vector<uint8_t> old_fw(100, 0x11), new_fw(5000, 0x22);
+  CHECK(put_file(fs, "/Linux/lib/firmware/intel/vpu/vpu_40xx_v0.0.bin", old_fw));
+  CHECK(intel_npu_read_firmware(fs, alloc, IntelNpuIp::Ip40xx, out, &used) && out.size() == 100 && std::string(used.c_str()) == "vpu_40xx_v0.0.bin" && out.view()[0] == 0x11);
+  CHECK(put_file(fs, "/Linux/lib/firmware/intel/vpu/vpu_40xx_v1.bin", new_fw));
+  CHECK(intel_npu_read_firmware(fs, alloc, IntelNpuIp::Ip40xx, out, &used) && out.size() == 5000 && std::string(used.c_str()) == "vpu_40xx_v1.bin" && out.view()[4999] == 0x22);   // the newest wins
+  CHECK(!intel_npu_read_firmware(fs, alloc, IntelNpuIp::Ip37xx, out, &used) && !intel_npu_read_firmware(fs, alloc, IntelNpuIp::Unknown, out, &used));
+  CHECK(put_file(fs, "/Linux/lib/firmware/intel/vpu/vpu_50xx_v1.bin", {}));   // an empty file is not firmware ...
+  CHECK(put_file(fs, "/Linux/lib/firmware/intel/vpu/vpu_50xx_v0.0.bin", old_fw));
+  CHECK(intel_npu_read_firmware(fs, alloc, IntelNpuIp::Ip50xx, out, nullptr) && out.size() == 100);   // ... the next name is tried
+}
+
+struct StepClock final : IClock {
+  mutable uint64_t t = 0;
+  uint64_t now_us() const override { return t += 100; }
+  const char* name() const override { return "step"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+};
+
+static uint64_t fake_wall(void* context) { ++*static_cast<int*>(context); return 1789000000000000ull; }
+
+static void test_executor() {
+  for (uint16_t id : {0x643E, 0x7D1D}) {
+    Rig r(id);
+    CHECK(r.boot());
+    StepClock clock;
+    int wall_calls = 0;
+    IntelNpuExecutor::Config cfg;
+    cfg.clock = &clock; cfg.wall_clock_us = &fake_wall; cfg.wall_context = &wall_calls; cfg.wait_tries = 50; cfg.idle_polls = 3;
+    {
+      IntelNpuExecutor ex(r.d(), r.alloc, cfg);
+      std::vector<uint8_t> stream(6000, 0xC3);
+      using St = IntelNpuExecutor::Status;
+      // A command stream goes to the NPU as one job: its pages are mapped read-only in a context of the executor's, and unmapped and freed afterwards.
+      const size_t dma_before = r.alloc.dma.size();
+      IntelNpuExecutor::Result res = ex.execute(ConstByteView(stream.data(), stream.size()));
+      CHECK(res.status == St::Ok && res.firmware_status == 0 && res.elapsed_us > 0 && ex.jobs_run() == 1 && ex.jobs_failed() == 0 && ex.busy_us() > 0);
+      CHECK(r.npu.doorbells.size() == 1 && r.d().jobs_in_flight() == 0);
+      const size_t after_first = r.alloc.dma.size();
+      CHECK(after_first > dma_before);   // the context's tables and the queue are kept ...
+      CHECK(ex.execute(ConstByteView(stream.data(), stream.size())).status == St::Ok && r.alloc.dma.size() == after_first);   // ... and the stream's pages are not
+      const uint64_t busy = ex.busy_us();
+      // The firmware reports an error status: Failed, with its code.
+      r.npu.job_status = 7;
+      res = ex.execute(ConstByteView(stream.data(), 100));
+      CHECK(res.status == St::Failed && res.firmware_status == 7 && ex.jobs_failed() == 1 && ex.busy_us() > busy);
+      // A status that needs an engine reset faults the executor's context; the next job gets a new one.
+      r.npu.job_status = 0xE;
+      res = ex.execute(ConstByteView(stream.data(), 100));
+      CHECK(res.status == St::Faulted && r.npu.resets_engine == 1);
+      r.npu.job_status = 0;
+      CHECK(ex.execute(ConstByteView(stream.data(), 100)).status == St::Ok);
+      // Nothing to run, or too much.
+      CHECK(ex.execute(ConstByteView()).status == St::Empty);
+      IntelNpuExecutor::Config small = cfg; small.max_command_bytes = 1000;
+      IntelNpuExecutor tiny(r.d(), r.alloc, small);
+      CHECK(tiny.execute(ConstByteView(stream.data(), 1001)).status == St::Empty && tiny.execute(ConstByteView(stream.data(), 1000)).status == St::Ok);
+      // The NPU stalls: after the wait it is reset (so that it cannot read freed memory) and the job reported as timed out.
+      r.npu.jobs_stall = true;
+      const uint32_t resets = r.npu.resets;
+      res = ex.execute(ConstByteView(stream.data(), 100));
+      CHECK(res.status == St::Timeout && r.npu.resets == resets + 1 && ex.recoveries() == 1 && wall_calls == 1 && r.d().state() == IntelNpuDeviceState::Running);
+      r.npu.jobs_stall = false;
+      CHECK(ex.execute(ConstByteView(stream.data(), 100)).status == St::Ok);   // working again after the reset
+      // Out of DMA memory for the stream.
+      r.alloc.dma_budget = 0;
+      CHECK(ex.execute(ConstByteView(stream.data(), 100)).status == St::NoMemory);
+      r.alloc.dma_budget = -1;
+      // poll(): looks at the device on an interrupt, now and then without one, and always when interrupts are not delivered.
+      const uint32_t before = r.npu.tx_count;
+      r.npu.icb_extra = 0;
+      IntelNpuServiceResult polled = ex.poll();
+      CHECK(!polled.handled);
+      r.npu.icb_extra = 0x40000000;   // the management watchdog
+      CHECK(!ex.poll().handled);      // no interrupt notified, idle count not reached: not looked at
+      ex.notify_interrupt();
+      polled = ex.poll();
+      CHECK(polled.handled && polled.recovery_needed && ex.recoveries() == 2 && r.d().state() == IntelNpuDeviceState::Running && r.d().boot_count() >= 3);
+      (void)before;
+      r.npu.icb_extra = 0x40000000;
+      IntelNpuExecutor::Config always = cfg; always.interrupts = false;
+      IntelNpuExecutor polling(r.d(), r.alloc, always);
+      CHECK(polling.poll().recovery_needed && polling.recoveries() == 1);
+      // A suspended device cannot run work.
+      CHECK(r.d().suspend() == IntelNpuDeviceError::None);
+      CHECK(ex.execute(ConstByteView(stream.data(), 100)).status == St::NotRunning && !ex.poll().handled);
+      CHECK(r.d().start() == IntelNpuDeviceError::None);
+      CHECK(ex.execute(ConstByteView(stream.data(), 100)).status == St::Ok);   // the executor's context survived the power cycle
+    }
+    r.dev.reset();
+    CHECK(r.alloc.dma.empty());
+  }
+  // Two threads: execute() from one, poll() from the other, take turns without breaking the device.
+  {
+    Rig r(0x643E);
+    CHECK(r.boot());
+    IntelNpuExecutor::Config cfg; cfg.wait_tries = 50; cfg.interrupts = false;
+    IntelNpuExecutor ex(r.d(), r.alloc, cfg);
+    std::vector<uint8_t> stream(3000, 1);
+    std::atomic<bool> stop{false};
+    std::thread poller([&] { while (!stop.load()) ex.poll(); });
+    uint32_t ok = 0;
+    for (int i = 0; i < 200; ++i) ok += ex.execute(ConstByteView(stream.data(), stream.size())).status == IntelNpuExecutor::Status::Ok;
+    stop = true;
+    poller.join();
+    CHECK(ok == 200 && ex.jobs_run() == 200);
+  }
+}
+
 static void test_chaos() {
   for (uint32_t seed = 1; seed <= 4; ++seed) {
     Rig r(kIds[seed % 4]);
@@ -764,6 +902,8 @@ int main() {
   test_suspend_resume_recover();
   test_boot_failures();
   test_limits();
+  test_firmware_file();
+  test_executor();
   test_chaos();
   if (g_failed) { printf("IntelNpuDeviceTest: %d failed\n", g_failed); return 1; }
   printf("IntelNpuDeviceTest: ok\n");

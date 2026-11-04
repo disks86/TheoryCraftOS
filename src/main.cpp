@@ -60,6 +60,7 @@
 #include "Graphics/SystemGraphics.hpp"
 #include "WebGl/Accelerator.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
+#include "Hardware/NeuralProcessingUnit/Intel/IntelNpuFirmwareFile.hpp"
 #include "Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
 #include "Hardware/Bus/Rtsx/RtsxDriver.hpp"
@@ -113,6 +114,10 @@
 #include "Hardware/Bluetooth/BluetoothService.hpp"
 #include "Hardware/Bluetooth/HidOverGatt.hpp"
 #include "Hardware/WirelessInterface/Intel/IwlDriver.hpp"      // (FileSystemFirmwareSource reads /firmware)
+#endif
+#ifdef TCOS_INTEL_NPU
+#include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Kernel/Apic.hpp"
 #endif
 #ifdef TCOS_INTEL_WIFI
 #include "Hardware/WirelessInterface/Intel/IwlWireless.hpp"
@@ -206,6 +211,16 @@ using bootlog::Level;
 static kernel::Frame* on_wifi_interrupt(kernel::Frame* frame, void* radio) {
   kernel::apic::eoi();
   static_cast<hardware::IwlWirelessInterface*>(radio)->on_interrupt();
+  return frame;
+}
+#endif
+
+#ifdef TCOS_INTEL_NPU
+// The Intel NPU's MSI: counts the interrupts and touches nothing else (the device is not thread safe); the desktop loop then has the executor look at the NPU.
+static uint32_t g_intel_npu_interrupts = 0;
+static kernel::Frame* on_intel_npu_interrupt(kernel::Frame* frame, void*) {
+  kernel::apic::eoi();
+  __atomic_fetch_add(&g_intel_npu_interrupts, 1, __ATOMIC_ACQ_REL);
   return frame;
 }
 #endif
@@ -413,6 +428,14 @@ static void sync_wall_clock(efi::SystemTable* st) {
   if (seconds <= 0) return;
   __atomic_store_n(&g_unix_us_at_boot, static_cast<uint64_t>(seconds) * 1000000ull - hardware::uptime_us(), __ATOMIC_RELAXED);
 }
+
+#ifdef TCOS_INTEL_NPU
+// The wall clock in microseconds, which the NPU's firmware keeps its time from (0 while the clock is unknown).
+static uint64_t wall_clock_microseconds(void*) {
+  const uint64_t at_boot = __atomic_load_n(&g_unix_us_at_boot, __ATOMIC_RELAXED);
+  return at_boot ? at_boot + hardware::uptime_us() : 0;
+}
+#endif
 
 static uint64_t wall_clock_seconds(void*) {
   const uint64_t at_boot = __atomic_load_n(&g_unix_us_at_boot, __ATOMIC_RELAXED);
@@ -1312,6 +1335,45 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     filesystem::set_unix_clock(wall_clock_seconds, nullptr);   // before the volumes are mounted: they stamp what they create
     SystemFileSystem explorer_files(shared_allocator, storage);
     desktop::KernelProgramLauncher program_launcher(shared_allocator);      // what the terminals run programs with
+#ifdef TCOS_INTEL_NPU
+    // The Intel NPU: the firmware from /Linux/lib/firmware/intel/vpu is loaded and started (power-up, MMU, boot, ready message), its interrupt is an MSI to this core, and from then
+    // on the executor runs jobs on it and the desktop loop services it. The tensor math of the NPU interface stays on the CPU (the NPU runs compiled graphs). Opt-in
+    // (-DTCOS_INTEL_NPU=ON): none of it has run on a real NPU, and there is no firmware file unless the user puts the linux-firmware one there.
+    UniquePointer<hardware::PciMsi> npu_msi;
+    bool npu_msi_working = false;
+    ByteBuffer npu_firmware(shared_allocator);                      // the image: read again at every boot of the NPU, so it lives as long as the device
+    if (clock_ok && paging_ok && system_npu.intel_present()) {
+      FixedString<48> npu_firmware_name;
+      if (!hardware::intel_npu_read_firmware(explorer_files.file_system(), shared_allocator, system_npu.intel_platform().ip, npu_firmware, &npu_firmware_name)) {
+        Entry(Level::Info, "NPU").text("no firmware in /Linux/lib/firmware/intel/vpu; the NPU stays off");
+      } else {
+        const hardware::PciAddress npu_address = system_npu.intel_address();
+        const uint32_t npu_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
+        if (npu_apic_id <= 0xFF) {
+          kernel::set_interrupt_handler(kernel::kVectorIntelNpu, &on_intel_npu_interrupt, nullptr);
+          npu_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
+          npu_msi_working = npu_msi && npu_msi->enable(npu_address, 0xFEE00000u | (npu_apic_id << 12), kernel::kVectorIntelNpu);
+          if (!npu_msi_working) {
+            npu_msi = UniquePointer<hardware::PciMsi>();
+            kernel::set_interrupt_handler(kernel::kVectorIntelNpu, nullptr, nullptr);
+          }
+        }
+        hardware::IntelNpuExecutor::Config npu_config;
+        npu_config.clock = &clock;
+        npu_config.wall_clock_us = &wall_clock_microseconds;
+        npu_config.interrupts = npu_msi_working;
+        const hardware::IntelNpuDeviceError npu_error = system_npu.start_intel_device(pci, &register_mapper, shared_allocator, npu_firmware.view(), wall_clock_microseconds(nullptr), npu_config);
+        if (npu_error == hardware::IntelNpuDeviceError::None) {
+          Entry(Level::Ok, "NPU").text("firmware ").text(npu_firmware_name.c_str()).text(" running, ").text(npu_msi_working ? "interrupts: MSI" : "interrupts: polled");
+        } else {
+          Entry(Level::Warning, "NPU").text("could not start the firmware: ").text(hardware::intel_npu_device_error_name(npu_error));
+          npu_msi = UniquePointer<hardware::PciMsi>();
+          npu_msi_working = false;
+          kernel::set_interrupt_handler(kernel::kVectorIntelNpu, nullptr, nullptr);
+        }
+      }
+    }
+#endif
 #ifdef TCOS_INTEL_WIFI
     // The Intel Wireless-AC 9560 (and the rest of the 9000 series) as a network interface: the firmware from /firmware is started, and the card then scans and joins networks through the
     // Wi-Fi window; its network stack gets an address (DHCP) whenever it is joined. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
@@ -1786,8 +1848,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemMonitor monitor(allocator, shared_allocator);
     monitor.set_gpu(gpu);
     if (system_npu.hardware_present()) {   // (the software NPU is the CPU: it has no meter of its own)
-      npu.set_clock(&clock);
-      monitor.set_npu(&npu);
+      hardware::INeuralProcessingUnit& npu_now = system_npu.npu();   // (the Intel accelerator, when its firmware runs, replaced the one taken at the start)
+      npu_now.set_clock(&clock);
+      monitor.set_npu(&npu_now);
     }
     monitor.set_pci(&pci);
     // The battery: only a machine whose ACPI tables describe one runs any AML (a laptop; a desktop or a virtual machine has none).
@@ -1986,6 +2049,18 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (hyperv.take_shutdown_request(&hyperv_restart)) desktop.request_shutdown();   // the Hyper-V manager asked
       if (vmware_tools.take_shutdown_request(&vmware_restart)) desktop.request_shutdown();   // so did VMware
       if (process::windowsabi::take_system_shutdown(&program_restart)) desktop.request_shutdown();   // so did a Windows program (InitiateSystemShutdown, ExitWindowsEx)
+#ifdef TCOS_INTEL_NPU
+      if (system_npu.intel_executor()) {   // the NPU's messages, MMU faults and watchdogs: looked at when its MSI came (and now and then in case one was lost); a hung NPU is reset
+        static uint32_t npu_recoveries = 0, npu_seen = 0;
+        const uint32_t npu_arrived = __atomic_load_n(&g_intel_npu_interrupts, __ATOMIC_ACQUIRE);
+        if (npu_arrived != npu_seen) {
+          npu_seen = npu_arrived;
+          system_npu.intel_executor()->notify_interrupt();
+        }
+        system_npu.intel_executor()->poll();
+        for (; npu_recoveries < system_npu.intel_executor()->recoveries(); ++npu_recoveries) Entry(Level::Warning, "NPU").text("reset after a fault or a hang");
+      }
+#endif
 #ifdef TCOS_AMD_VEGAM
       if (vega_m) {   // the Vega M's interrupt ring: faults wedge the ring they came from. With MSI the ring is read when an interrupt came (and now and then in case one was lost)
         static uint32_t vega_seen = 0, vega_idle = 0;

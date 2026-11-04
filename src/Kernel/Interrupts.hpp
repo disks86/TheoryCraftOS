@@ -46,6 +46,7 @@ constexpr uint8_t kVectorThunderbolt = 0x52; // MSI: the Thunderbolt host interf
 constexpr uint8_t kVectorThunderboltData = 0x54; // MSI-X: the Thunderbolt data rings (networking)
 constexpr uint8_t kVectorAcpiSci = 0x53;   // I/O APIC: the ACPI system control interrupt
 constexpr uint8_t kVectorWifi = 0x55;      // MSI: the Intel Wi-Fi card (receive, firmware errors)
+constexpr uint8_t kVectorIntelNpu = 0x56;  // MSI: the Intel NPU (message channel, MMU faults, watchdogs)
 constexpr uint8_t kVectorSpurious = 0xFF;
 constexpr uint64_t kRflagsInterrupts = 1u << 9;
 #elif defined(__aarch64__)

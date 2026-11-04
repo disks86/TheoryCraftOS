@@ -87,6 +87,9 @@ inline constexpr const char* kLinuxEtc = "/Linux/etc";
 inline constexpr const char* kLinuxHome = "/Linux/home";
 inline constexpr const char* kLinuxTmp = "/Linux/tmp";
 inline constexpr const char* kLinuxUsrBin = "/Linux/usr/bin";
+// Where device firmware is kept, as on Linux (/lib/firmware): the Intel NPU's is in intel/vpu.
+inline constexpr const char* kLinuxFirmware = "/Linux/lib/firmware";
+inline constexpr const char* kLinuxFirmwareIntelVpu = "/Linux/lib/firmware/intel/vpu";
 
 // The folders under /Windows (what C:\ holds on a Windows installation), parents before children.
 inline constexpr const char* kWindowsFolders[] = {
@@ -118,7 +121,7 @@ inline constexpr const char* kWindowsFolders[] = {
 // The folders under /Linux (the Filesystem Hierarchy Standard), parents before children. /dev, /proc and /sys are the places the kernel
 // presents devices and process information; here they start out empty.
 inline constexpr const char* kLinuxFolders[] = {
-    kLinuxBin, "/Linux/boot", "/Linux/dev", kLinuxEtc, "/Linux/etc/opt", kLinuxHome, "/Linux/lib", "/Linux/lib64", "/Linux/media",
+    kLinuxBin, "/Linux/boot", "/Linux/dev", kLinuxEtc, "/Linux/etc/opt", kLinuxHome, "/Linux/lib", kLinuxFirmware, "/Linux/lib/firmware/intel", kLinuxFirmwareIntelVpu, "/Linux/lib64", "/Linux/media",
     "/Linux/mnt", "/Linux/opt", "/Linux/proc", "/Linux/root", "/Linux/run", "/Linux/sbin", "/Linux/srv", "/Linux/sys", kLinuxTmp,
     "/Linux/usr", kLinuxUsrBin, "/Linux/usr/include", "/Linux/usr/lib", "/Linux/usr/lib64", "/Linux/usr/local", "/Linux/usr/local/bin",
     "/Linux/usr/local/lib", "/Linux/usr/sbin", "/Linux/usr/share", "/Linux/var", "/Linux/var/cache", "/Linux/var/lib", "/Linux/var/log",
