@@ -440,3 +440,164 @@ EXPORT IStreamLike *WINAPI SHCreateMemStream(const BYTE *init, UINT size) {
   s->pos = 0;
   return (IStreamLike *)s;
 }
+
+/* ---- ini files (ordinals 294 and 295) ---------------------------------------------------------------------------------------------------------------------------------- */
+
+IMPORT DWORD WINAPI GetPrivateProfileStringW(LPCWSTR section, LPCWSTR entry, LPCWSTR def_val, LPWSTR buffer, DWORD len, LPCWSTR filename);
+IMPORT BOOL WINAPI WritePrivateProfileStringW(LPCWSTR section, LPCWSTR entry, LPCWSTR value, LPCWSTR filename);
+
+/* With no key name it gives the first key of the section only (the length of that name). */
+EXPORT DWORD WINAPI SHGetIniStringW(LPCWSTR section, LPCWSTR key, LPWSTR out, DWORD size, LPCWSTR path) {
+  if (!size) return 0;
+  const DWORD n = GetPrivateProfileStringW(section, key, L"", out, size, path);
+  return key ? n : (DWORD)wcslen(out);
+}
+EXPORT BOOL WINAPI SHSetIniStringW(LPCWSTR section, LPCWSTR key, LPCWSTR value, LPCWSTR path) { return WritePrivateProfileStringW(section, key, value, path); }
+
+/* ---- shell keys (ordinals 491 and 516-519) ---------------------------------------------------------------------------------------------------------------------------- */
+
+IMPORT HANDLE WINAPI LocalAlloc(DWORD flags, SIZE_T bytes);
+IMPORT HANDLE WINAPI LocalFree(HANDLE memory);
+#define HANDLE_FREE_LOCAL(p) LocalFree((HANDLE)(p))
+
+/* flags: 1 = HKEY_CURRENT_USER, 2 = HKEY_LOCAL_MACHINE; bits 4-5 pick the folder (Explorer, Shell, ShellNoRoam, Classes). The folder itself is always there; the sub key only when asked to create. */
+EXPORT HKEY WINAPI SHGetShellKey(DWORD flags, LPCWSTR subkey, BOOL create) {
+  static const WCHAR *const folders[4] = {L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer", L"Software\\Microsoft\\Windows\\Shell", L"Software\\Microsoft\\Windows\\ShellNoRoam", L"Software\\Classes"};
+  WCHAR path[MAX_PATH_];
+  const WCHAR *folder = folders[(flags >> 4) & 3];
+  HKEY root = (flags & 2) ? HKEY_LOCAL_MACHINE_ : HKEY_CURRENT_USER_, folder_key, key = NULL;
+  if (RegCreateKeyExW(root, folder, 0, NULL, 0, KEY_ALL_ACCESS_, NULL, &folder_key, NULL)) return NULL;
+  if (!subkey || !*subkey) return folder_key;
+  (void)path;
+  const LSTATUS_ r = create ? RegCreateKeyExW(folder_key, subkey, 0, NULL, 0, KEY_ALL_ACCESS_, NULL, &key, NULL) : RegOpenKeyExW(folder_key, subkey, 0, KEY_ALL_ACCESS_, &key);
+  RegCloseKey(folder_key);
+  return r ? NULL : key;
+}
+static HRESULT_ sk_open(DWORD flags, LPCWSTR subkey, BOOL create, HKEY *key) {
+  *key = SHGetShellKey(flags, subkey, create);
+  return *key ? 0 : HRESULT_FROM_WIN32_(ERROR_FILE_NOT_FOUND);
+}
+EXPORT HRESULT_ WINAPI SKGetValueW(DWORD flags, LPCWSTR subkey, LPCWSTR value, LPDWORD type, LPVOID data, LPDWORD size) {
+  HKEY key;
+  HRESULT_ hr = sk_open(flags, subkey, FALSE, &key);
+  if (hr) return hr;
+  hr = HRESULT_FROM_WIN32_(RegQueryValueExW(key, value, NULL, type, data, size));
+  RegCloseKey(key);
+  return hr;
+}
+EXPORT HRESULT_ WINAPI SKSetValueW(DWORD flags, LPCWSTR subkey, LPCWSTR value, DWORD type, LPCVOID data, DWORD size) {
+  HKEY key;
+  HRESULT_ hr = sk_open(flags, subkey, TRUE, &key);
+  if (hr) return hr;
+  hr = HRESULT_FROM_WIN32_(RegSetValueExW(key, value, 0, type, data, size));
+  RegCloseKey(key);
+  return hr;
+}
+EXPORT HRESULT_ WINAPI SKDeleteValueW(DWORD flags, LPCWSTR subkey, LPCWSTR value) {
+  HKEY key;
+  HRESULT_ hr = sk_open(flags, subkey, FALSE, &key);
+  if (hr) return hr;
+  hr = HRESULT_FROM_WIN32_(RegDeleteValueW(key, value));
+  RegCloseKey(key);
+  return hr;
+}
+EXPORT HRESULT_ WINAPI SKAllocValueW(DWORD flags, LPCWSTR subkey, LPCWSTR value, LPDWORD type, LPVOID *data, LPDWORD size) {
+  HKEY key;
+  DWORD need = 0, t = 0;
+  HRESULT_ hr = sk_open(flags, subkey, FALSE, &key);
+  if (hr) return hr;
+  hr = HRESULT_FROM_WIN32_(RegQueryValueExW(key, value, NULL, &t, NULL, &need));
+  if (!hr) {
+    BYTE *buffer = (BYTE *)LocalAlloc(0x40 /* LPTR */, need + 2);
+    if (!buffer) hr = E_OUTOFMEMORY_;
+    else {
+      DWORD got = need;
+      hr = HRESULT_FROM_WIN32_(RegQueryValueExW(key, value, NULL, &t, buffer, &got));
+      if (hr) { HANDLE_FREE_LOCAL(buffer); }
+      else { *data = buffer; if (size) *size = got; if (type) *type = t; }
+    }
+  }
+  RegCloseKey(key);
+  return hr;
+}
+
+/* ---- GetShellSecurityDescriptor (ordinal 475) ------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct { BYTE authority[6]; DWORD rid0, rid1; } ShellUserSid;
+typedef struct { ShellUserSid sid; DWORD access_type; BOOL inherit; DWORD access_mask, inherit_mask, inherit_access_mask; } ShellUserPermission;
+
+IMPORT BOOL WINAPI AllocateAndInitializeSid(void *authority, BYTE count, DWORD r0, DWORD r1, DWORD r2, DWORD r3, DWORD r4, DWORD r5, DWORD r6, DWORD r7, void **sid);
+IMPORT void *WINAPI FreeSid(void *sid);
+IMPORT DWORD WINAPI GetLengthSid(void *sid);
+IMPORT BOOL WINAPI InitializeAcl(void *acl, DWORD length, DWORD revision);
+IMPORT BOOL WINAPI AddAce(void *acl, DWORD revision, DWORD start, void *ace, DWORD length);
+IMPORT BOOL WINAPI InitializeSecurityDescriptor(void *sd, DWORD revision);
+IMPORT BOOL WINAPI SetSecurityDescriptorDacl(void *sd, BOOL present, void *acl, BOOL defaulted);
+IMPORT BOOL WINAPI OpenProcessToken(HANDLE process, DWORD access, HANDLE *token);
+IMPORT BOOL WINAPI GetTokenInformation(HANDLE token, DWORD cls, void *info, DWORD length, DWORD *needed);
+IMPORT BOOL WINAPI CopySid(DWORD length, void *dst, void *src);
+
+/* The SID of a permission: all-zero authority and rids means the user the process runs as. The result must be released with FreeSid or LocalFree (current_user). */
+static void *shell_sid(const ShellUserSid *s, BOOL *current_user) {
+  static const BYTE zero[6] = {0};
+  void *sid = NULL;
+  *current_user = FALSE;
+  if (!memcmp(s->authority, zero, 6) && !s->rid0 && !s->rid1) {
+    HANDLE token;
+    BYTE buffer[128];
+    DWORD needed = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), 8 /* TOKEN_QUERY */, &token)) return NULL;
+    if (GetTokenInformation(token, 1 /* TokenUser */, buffer, sizeof(buffer), &needed)) {
+      void *user = *(void **)buffer;
+      const DWORD n = GetLengthSid(user);
+      sid = LocalAlloc(0, n);
+      if (sid) { CopySid(n, sid, user); *current_user = TRUE; }
+    }
+    CloseHandle(token);
+    return sid;
+  }
+  BYTE auth[6];
+  memcpy(auth, s->authority, 6);
+  const BYTE count = (BYTE)((s->rid0 != 0) + (s->rid1 != 0));
+  return AllocateAndInitializeSid(auth, count, s->rid0, s->rid1, 0, 0, 0, 0, 0, 0, &sid) ? sid : NULL;
+}
+static void shell_sid_free(void *sid, BOOL current_user) { if (current_user) LocalFree((HANDLE)sid); else FreeSid(sid); }
+
+EXPORT void *WINAPI GetShellSecurityDescriptor(const ShellUserPermission *const *permissions, int count) {
+  if (!permissions || count <= 0) return NULL;
+  enum { kSdSize = 64, kAceHeader = 8 };
+  void *sids[16];
+  BOOL current[16];
+  if (count > 16) return NULL;
+  DWORD acl_size = 8 /* ACL */;
+  int made = 0;
+  for (; made < count; ++made) {
+    sids[made] = shell_sid(&permissions[made]->sid, &current[made]);
+    if (!sids[made]) break;
+    acl_size += (kAceHeader + GetLengthSid(sids[made])) * (permissions[made]->inherit ? 2 : 1);
+  }
+  BYTE *block = NULL;
+  if (made == count) block = (BYTE *)LocalAlloc(0x40, kSdSize + acl_size);
+  if (block) {
+    BYTE *acl = block + kSdSize;
+    BOOL ok = InitializeSecurityDescriptor(block, 1) && InitializeAcl(acl, acl_size, 2);
+    for (int i = 0; ok && i < count; ++i) {
+      const ShellUserPermission *p = permissions[i];
+      const DWORD sid_length = GetLengthSid(sids[i]);
+      BYTE ace[kAceHeader + 68];
+      if (sid_length > 68) { ok = FALSE; break; }
+      for (int pass = 0; ok && pass < (p->inherit ? 2 : 1); ++pass) {
+        ace[0] = (BYTE)p->access_type;
+        ace[1] = pass ? (BYTE)p->inherit_mask : 0;
+        *(WORD *)(ace + 2) = (WORD)(kAceHeader + sid_length);
+        *(DWORD *)(ace + 4) = pass ? p->inherit_access_mask : p->access_mask;
+        memcpy(ace + kAceHeader, sids[i], sid_length);
+        ok = AddAce(acl, 2, 0xFFFFFFFFu, ace, kAceHeader + sid_length);
+      }
+    }
+    if (ok) ok = SetSecurityDescriptorDacl(block, TRUE, acl, FALSE);
+    if (!ok) { LocalFree((HANDLE)block); block = NULL; }
+  }
+  for (int i = 0; i < made; ++i) shell_sid_free(sids[i], current[i]);
+  return block;
+}
