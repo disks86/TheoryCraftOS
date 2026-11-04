@@ -24,13 +24,9 @@ IConnectionPoint_SimpleInvoke @284
 OrdinalNotImplemented14=ShlwapiOrdinalNotImplemented @14 NONAME
 OrdinalNotImplemented165=ShlwapiOrdinalNotImplemented @165 NONAME
 OrdinalNotImplemented167=ShlwapiOrdinalNotImplemented @167 NONAME
-OrdinalNotImplemented175=ShlwapiOrdinalNotImplemented @175 NONAME
 OrdinalNotImplemented257=ShlwapiOrdinalNotImplemented @257 NONAME
-OrdinalNotImplemented404=ShlwapiOrdinalNotImplemented @404 NONAME
 OrdinalNotImplemented476=ShlwapiOrdinalNotImplemented @476 NONAME
-OrdinalNotImplemented484=ShlwapiOrdinalNotImplemented @484 NONAME
 OrdinalNotImplemented496=ShlwapiOrdinalNotImplemented @496 NONAME
-OrdinalNotImplemented514=ShlwapiOrdinalNotImplemented @514 NONAME
 SHGetIniStringW @294
 SHSetIniStringW @295
 SHGetShellKey @491
@@ -41,3 +37,7 @@ SKAllocValueW @519
 GetShellSecurityDescriptor @475
 SHFormatDateTimeA @353
 SHFormatDateTimeW @354
+IUnknown_GetClassID @175
+SHIShellFolder_EnumObjects @404
+IUnknown_QueryServiceExec @484
+IUnknown_ProfferService @514

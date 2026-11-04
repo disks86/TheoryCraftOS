@@ -641,3 +641,61 @@ EXPORT int WINAPI SHFormatDateTimeA(const FILETIME *utc, DWORD *flags, LPSTR out
   if (!SHFormatDateTimeW(utc, flags, wide, 300)) return 0;
   return WideCharToMultiByte(CP_ACP, 0, wide, -1, out, (int)capacity, NULL, NULL);
 }
+
+/* ---- IUnknown_* helpers and SHIShellFolder_EnumObjects (ordinals 175, 404, 484, 514) -------------------------------------------------------------------------------- */
+
+static const GuidValue kIidServiceProvider = {0x6D5140C1, 0x7436, 0x11CE, {0x80, 0x34, 0x00, 0xAA, 0x00, 0x60, 0x09, 0xFA}},
+                       kIidOleCommandTarget = {0xB722BCCB, 0x4E68, 0x101B, {0xA2, 0xBC, 0x00, 0xAA, 0x00, 0x40, 0x47, 0x70}},
+                       kIidProfferService = {0xCB728B20, 0xF786, 0x11CE, {0x92, 0xAD, 0x00, 0xAA, 0x00, 0xA7, 0x4C, 0xD0}},
+                       kIidPersist = {0x0000010C, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}},
+                       kIidPersistFolder = {0x000214EA, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
+
+EXPORT HRESULT_ WINAPI IUnknown_GetClassID(void *unknown, void *clsid) {
+  void *persist = NULL;
+  memset(clsid, 0, 16);
+  if (!unknown) return E_FAIL_;
+  if (COM_CALL(unknown, 0, ComQuery, &kIidPersist, &persist) < 0 && COM_CALL(unknown, 0, ComQuery, &kIidPersistFolder, &persist) < 0) return E_FAIL_;
+  const HRESULT_ hr = COM_CALL(persist, 3, HRESULT_ (WINAPI *)(void *, void *), clsid);
+  COM_CALL(persist, 2, ComRelease);
+  return hr;
+}
+EXPORT HRESULT_ WINAPI SHIShellFolder_EnumObjects(void *folder, void *window, DWORD flags, void **out) {
+  return COM_CALL(folder, 4, HRESULT_ (WINAPI *)(void *, void *, DWORD, void **), window, flags, out);
+}
+EXPORT HRESULT_ WINAPI IUnknown_QueryServiceExec(void *unknown, const void *service, const void *group, DWORD command, DWORD options, void *in, void *out) {
+  void *provider = NULL, *target = NULL;
+  if (!unknown) return E_FAIL_;
+  HRESULT_ hr = COM_CALL(unknown, 0, ComQuery, &kIidServiceProvider, &provider);
+  if (hr < 0) return hr;
+  hr = COM_CALL(provider, 3, HRESULT_ (WINAPI *)(void *, const void *, const void *, void **), service, &kIidOleCommandTarget, &target);
+  if (hr >= 0) {
+    hr = COM_CALL(target, 4, HRESULT_ (WINAPI *)(void *, const void *, DWORD, DWORD, void *, void *), group, command, options, in, out);
+    COM_CALL(target, 2, ComRelease);
+  }
+  COM_CALL(provider, 2, ComRelease);
+  return hr;
+}
+EXPORT HRESULT_ WINAPI IUnknown_ProfferService(void *unknown, const void *service, void *provider_to_offer, DWORD *cookie) {
+  void *provider = NULL, *proffer = NULL;
+  if (!unknown) return E_FAIL_;
+  HRESULT_ hr = COM_CALL(unknown, 0, ComQuery, &kIidServiceProvider, &provider);
+  if (hr < 0) return hr;
+  hr = COM_CALL(provider, 3, HRESULT_ (WINAPI *)(void *, const void *, const void *, void **), &kIidProfferService, &kIidProfferService, &proffer);
+  if (hr >= 0) {
+    if (provider_to_offer) hr = COM_CALL(proffer, 3, HRESULT_ (WINAPI *)(void *, const void *, void *, DWORD *), service, provider_to_offer, cookie);
+    else if (cookie && *cookie) { hr = COM_CALL(proffer, 4, HRESULT_ (WINAPI *)(void *, DWORD), *cookie); if (hr >= 0) *cookie = 0; }
+    COM_CALL(proffer, 2, ComRelease);
+  }
+  COM_CALL(provider, 2, ComRelease);
+  return hr;
+}
+
+/* ---- DllGetVersion ------------------------------------------------------------------------------------------------------------------------------------------------ */
+
+typedef struct { DWORD size, major, minor, build, platform; } DllVersionInfo;
+EXPORT HRESULT_ WINAPI DllGetVersion(DllVersionInfo *info) {
+  if (!info || (info->size != sizeof(DllVersionInfo) && info->size != sizeof(DllVersionInfo) + 16)) return E_INVALIDARG_;
+  info->major = 6; info->minor = 0; info->build = 2900; info->platform = 2;      /* DLLVER_PLATFORM_NT */
+  if (info->size > sizeof(DllVersionInfo)) { DWORD *ex = (DWORD *)(info + 1); ex[0] = 0; ex[1] = 0; ex[2] = 6 << 16 | 0; ex[3] = 2900 << 16 | 0; }      /* (DLLVERSIONINFO2: the 64-bit version) */
+  return 0;
+}
