@@ -409,6 +409,19 @@ The state lives in win32k and is reached with one service, **`NtTcosDwm`** (serv
 `Dwmp*` exports, `DwmSetPresentParameters`, `DwmTransitionOwnedWindow`, and `SetThreadDpiAwarenessContext`. Nothing composites from the stored values yet. Not run under QEMU with
 a Windows program; the kernel half is covered by `test_dwm` in `Win32kMiscTest`.
 
+## shcore.dll
+
+`src/Windows/shcore/shcore.c` implements the shell core library: DPI (`GetDpiForMonitor`, `Get/SetProcessDpiAwareness`, `GetScaleFactorForMonitor/Device`, `GetDpiForShellUIComponent`)
+over the existing win32k services `NtUserGetDpiForMonitor`, `NtUserGetSystemDpiForProcess` and `NtUserGet/SetProcessDpiAwarenessContext` (no new service was needed); the scale-change
+events and window notifications are signalled by a watcher thread that polls the system DPI every 250 ms while somebody is registered (win32k has no change notification).
+Also the truncating string copies (`SHAnsiToUnicode` ...), the registry helpers shlwapi lacked (`SHRegGetValue`, `SHEnumKeyEx`, `SHEnumValue`, `SHQueryInfoKey`, `SHCopyKey`,
+`SHRegGetPath/SetPath`, `SHRegGetInt`, ...), memory and registry streams (`SHCreateMemStream`, `SHOpenRegStream*`, `IStream_Copy/ReadStr/WriteStr`), the `IUnknown_*` helpers, the process
+reference (shell32's `SHGetInstanceExplorer` reads it), thread references and `SHCreateThread`, `IsOS` (a Windows 10 workstation), the explicit AppUserModelID (kept in the process
+parameters; shell32 forwards to it), and feature-state queries (always the default state). The shlwapi/shell32 functions that already exist are forwarders (`shcore.def`).
+Still stubs: the `SHTaskPool*` functions; the WinRT stream functions report `E_NOTIMPL` (no HSTRING / IRandomAccessStream). Tested with Wine's `shcore` test (240 checks, 0 failures) and `tests/windows/shcoretest.c` (65 checks; `scripts/winetest.sh shcore own`).
+Side changes: `GetProcAddress` now loads the library a forwarder names (it only followed forwarders into libraries already loaded); `SHCreateStreamOnFile` shares read and write by
+default and `SetSize` on a read-only stream only moves the position; the registry seeds `HKLM\\...\\CurrentVersion\\Explorer\\Shell Folders` (the Common * folders).
+
 ## gdi32.dll
 
 `src/Windows/gdi32` is a real library: the GDI API of wingdi.h (A and W forms, DCs and their attributes, pens, brushes, bitmaps, DIBs, regions, clipping, palettes, paths, text and

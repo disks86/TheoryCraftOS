@@ -1100,6 +1100,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   # shell32.dll uses the registry (advapi32) and the window system (user32); the string functions it shares with shlwapi are forwarders in shell32.def.
   set(WINDOWS_IMPORTS_shell32 advapi32 user32 ole32)
   set(WINDOWS_IMPORTS_shlwapi advapi32)
+  set(WINDOWS_IMPORTS_shcore advapi32 ole32 win32u)      # (the registry, CoTaskMemAlloc, the DPI services of win32k)
   set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     windows_stub_flags(_flags ${_library} 0)

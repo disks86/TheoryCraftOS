@@ -931,6 +931,7 @@ EXPORT DWORD WINAPI GetModuleFileNameA(HMODULE module, LPSTR buffer, DWORD capac
 
 typedef struct { ULONG Characteristics, TimeDateStamp; USHORT MajorVersion, MinorVersion; ULONG Name, Base, NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals; } ExportDirectory;
 
+HMODULE WINAPI LoadLibraryW(const WCHAR *name);
 /* The address of an exported function of the image at `base`, by name or (name == NULL) ordinal; follows forwarders ("NTDLL.RtlFoo"). */
 static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) {
   const BYTE *base = module;
@@ -962,19 +963,25 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
     if (forward[n] != '.') return NULL;
     library[n] = 0;
     LDR_DATA_TABLE_ENTRY *target = module_by_name(library);
-    if (!target) return NULL;
+    HMODULE target_base = target ? (HMODULE)target->DllBase : NULL;
+    if (!target && n <= 50) {      /* (a forwarder loads the library it names; the loader's list shows only some of the libraries, so the handle is used) */
+      library[n] = '.'; library[n + 1] = 'd'; library[n + 2] = 'l'; library[n + 3] = 'l'; library[n + 4] = 0;
+      target_base = LoadLibraryW(library);
+      target = target_base ? module_by_base(target_base) : NULL;
+    }
+    if (!target_base) return NULL;
     const char *function = forward + n + 1;
     FARPROC resolved;
     if (function[0] == '#') {
       DWORD number = 0;
       for (const char *c = function + 1; *c >= '0' && *c <= '9'; ++c) number = number * 10 + (DWORD)(*c - '0');
-      resolved = export_of(target->DllBase, NULL, number, depth + 1);
+      resolved = export_of(target_base, NULL, number, depth + 1);
     } else {
-      resolved = export_of(target->DllBase, function, 0, depth + 1);
+      resolved = export_of(target_base, function, 0, depth + 1);
     }
     if (resolved) {      /* the library that forwards depends on the one it forwards to from now on (unless it stays as long as the process does) */
       LDR_DATA_TABLE_ENTRY *self = module_by_base((HMODULE)module);
-      if (self && self->LoadCount != 0xFFFF && target->LoadCount != 0xFFFF) NtTcosLinkModules(module, target->DllBase);
+      if (self && self->LoadCount != 0xFFFF && (!target || target->LoadCount != 0xFFFF)) NtTcosLinkModules(module, target_base);
     }
     return resolved;
   }
