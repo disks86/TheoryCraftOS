@@ -86,6 +86,16 @@ uint64_t IntelNpuHw::ip_window(IntelNpuIp ip) {
   }
 }
 
+uint64_t IntelNpuHw::operational_window(IntelNpuIp ip) {
+  switch (ip) {
+    case IntelNpuIp::Ip37xx: return 0x06400000;  // doorbells 0x06300000 + 255 * 0x1000
+    case IntelNpuIp::Ip40xx:
+    case IntelNpuIp::Ip50xx:
+    case IntelNpuIp::Ip60xx: return 0x01400000;  // doorbells 0x01300000 + 255 * 0x1000
+    default: return 0;
+  }
+}
+
 // The reference clock is 50 MHz; the ratio means 2/3 of it per step on Meteor/Arrow Lake and 1/2 on the later parts.
 uint32_t IntelNpuHw::ratio_to_mhz(IntelNpuButtress buttress, uint32_t ratio) {
   return buttress == IntelNpuButtress::Mtl ? ratio * kPllRefMhz * 2 / 3 : ratio * kPllRefMhz / 2;
