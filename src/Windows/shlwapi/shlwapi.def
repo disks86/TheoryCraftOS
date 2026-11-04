@@ -12,6 +12,9 @@ SHUnlockShared @9
 SHFreeShared @10
 SHMapHandle @11
 SHSearchMapInt @198
+SHSetWindowBits @165
+SHSetParentHwnd @167
+SHCreateWorkerWindowA @257
 FDSA_Initialize @208
 FDSA_Destroy @209
 FDSA_InsertItem @210
@@ -22,9 +25,6 @@ ConnectToConnectionPoint @168
 IConnectionPoint_InvokeWithCancel @283
 IConnectionPoint_SimpleInvoke @284
 OrdinalNotImplemented14=ShlwapiOrdinalNotImplemented @14 NONAME
-OrdinalNotImplemented165=ShlwapiOrdinalNotImplemented @165 NONAME
-OrdinalNotImplemented167=ShlwapiOrdinalNotImplemented @167 NONAME
-OrdinalNotImplemented257=ShlwapiOrdinalNotImplemented @257 NONAME
 OrdinalNotImplemented476=ShlwapiOrdinalNotImplemented @476 NONAME
 OrdinalNotImplemented496=ShlwapiOrdinalNotImplemented @496 NONAME
 SHGetIniStringW @294

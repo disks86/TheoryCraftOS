@@ -699,3 +699,77 @@ EXPORT HRESULT_ WINAPI DllGetVersion(DllVersionInfo *info) {
   if (info->size > sizeof(DllVersionInfo)) { DWORD *ex = (DWORD *)(info + 1); ex[0] = 0; ex[1] = 0; ex[2] = 6 << 16 | 0; ex[3] = 2900 << 16 | 0; }      /* (DLLVERSIONINFO2: the 64-bit version) */
   return 0;
 }
+
+/* ---- windows (user32) ------------------------------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct { UINT style; LONG_PTR (WINAPI *proc)(HANDLE, UINT, ULONG_PTR, LONG_PTR); int cls_extra, wnd_extra; HANDLE instance, icon, cursor, brush; const void *menu, *name; } WndClassS;
+IMPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index);
+IMPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value);
+IMPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value);
+IMPORT HANDLE WINAPI GetParent(HANDLE hwnd);
+IMPORT HANDLE WINAPI SetParent(HANDLE hwnd, HANDLE parent);
+IMPORT BOOL WINAPI GetClassInfoA(HANDLE instance, const char *name, WndClassS *wc);
+IMPORT BOOL WINAPI GetClassInfoW(HANDLE instance, const WCHAR *name, WndClassS *wc);
+IMPORT ATOM WINAPI RegisterClassA(const WndClassS *wc);
+IMPORT ATOM WINAPI RegisterClassW(const WndClassS *wc);
+IMPORT HANDLE WINAPI CreateWindowExA(DWORD ex_style, const char *cls, const char *title, DWORD style, int x, int y, int cx, int cy, HANDLE parent, HANDLE menu, HANDLE instance, void *param);
+IMPORT HANDLE WINAPI CreateWindowExW(DWORD ex_style, const WCHAR *cls, const WCHAR *title, DWORD style, int x, int y, int cx, int cy, HANDLE parent, HANDLE menu, HANDLE instance, void *param);
+IMPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
+IMPORT HANDLE WINAPI GetModuleHandleW(LPCWSTR name);
+#define GWL_STYLE_ (-16)
+#define WS_CHILD_ 0x40000000u
+#define WS_POPUP_ 0x80000000u
+
+/* Sets the bits of a window long that are in `mask` to the ones of `flags`; answers the old value (the call is skipped when nothing changes). */
+EXPORT LONG WINAPI SHSetWindowBits(HANDLE hwnd, int index, UINT mask, UINT flags) {
+  const LONG old = GetWindowLongW(hwnd, index);
+  const LONG value = (LONG)((flags & mask) | ((UINT)old & ~mask));
+  return value != old ? SetWindowLongW(hwnd, index, value) : old;
+}
+/* A window with a parent is a child, one without is a popup. */
+EXPORT HANDLE WINAPI SHSetParentHwnd(HANDLE hwnd, HANDLE parent) {
+  const HANDLE old = GetParent(hwnd);
+  if (old == parent) return old;      /* (nothing to change) */
+  SHSetWindowBits(hwnd, GWL_STYLE_, WS_CHILD_ | WS_POPUP_, parent ? WS_CHILD_ : WS_POPUP_);
+  SetParent(hwnd, parent);
+  return NULL;      /* (Windows answers nothing when the parent changed) */
+}
+EXPORT ATOM WINAPI SHRegisterClassA(const WndClassS *wc) {
+  WndClassS found;
+  if (GetClassInfoA(wc->instance, (const char *)wc->name, &found)) return 1;
+  return RegisterClassA(wc) != 0;
+}
+EXPORT ATOM WINAPI SHRegisterClassW(const WndClassS *wc) {
+  WndClassS found;
+  if (GetClassInfoW(wc->instance, (const WCHAR *)wc->name, &found)) return 1;
+  return RegisterClassW(wc) != 0;
+}
+/* The window is of the class "WorkerA"/"WorkerW" (made here once): a window with one pointer of extra space, `wnd_extra`, and the procedure `proc` when given. */
+EXPORT HANDLE WINAPI SHCreateWorkerWindowA(LONG_PTR (WINAPI *proc)(HANDLE, UINT, ULONG_PTR, LONG_PTR), HANDLE parent, DWORD ex_style, DWORD style, HANDLE menu, LONG_PTR wnd_extra) {
+  const HANDLE instance = GetModuleHandleW(L"shlwapi.dll");
+  WndClassS wc;
+  if (!GetClassInfoA(instance, "WorkerA", &wc)) {
+    WndClassS made = {0x4000 /* CS_GLOBALCLASS */, DefWindowProcW, 0, (int)sizeof(LONG_PTR), instance, NULL, NULL, (HANDLE)(LONG_PTR)(15 /* COLOR_BTNFACE */), NULL, "WorkerA"};
+    SHRegisterClassA(&made);
+  }
+  const HANDLE hwnd = CreateWindowExA(ex_style, "WorkerA", NULL, style, 0, 0, 0, 0, parent, menu, instance, NULL);
+  if (hwnd) {
+    SetWindowLongPtrW(hwnd, 0, wnd_extra);
+    if (proc) SetWindowLongPtrW(hwnd, -4 /* GWLP_WNDPROC */, (LONG_PTR)proc);
+  }
+  return hwnd;
+}
+EXPORT HANDLE WINAPI SHCreateWorkerWindowW(LONG_PTR (WINAPI *proc)(HANDLE, UINT, ULONG_PTR, LONG_PTR), HANDLE parent, DWORD ex_style, DWORD style, HANDLE menu, LONG_PTR wnd_extra) {
+  const HANDLE instance = GetModuleHandleW(L"shlwapi.dll");
+  WndClassS wc;
+  if (!GetClassInfoW(instance, L"WorkerW", &wc)) {
+    WndClassS made = {0x4000, DefWindowProcW, 0, (int)sizeof(LONG_PTR), instance, NULL, NULL, (HANDLE)(LONG_PTR)15, NULL, L"WorkerW"};
+    SHRegisterClassW(&made);
+  }
+  const HANDLE hwnd = CreateWindowExW(ex_style, L"WorkerW", NULL, style, 0, 0, 0, 0, parent, menu, instance, NULL);
+  if (hwnd) {
+    SetWindowLongPtrW(hwnd, 0, wnd_extra);
+    if (proc) SetWindowLongPtrW(hwnd, -4, (LONG_PTR)proc);
+  }
+  return hwnd;
+}

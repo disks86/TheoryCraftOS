@@ -183,7 +183,10 @@ EXPORT HANDLE WINAPI GetSysColorBrush(int index) {
   if (!brushes[index]) brushes[index] = (HANDLE)user32_NtGdiCreateSolidBrush(system_colors[index], NULL);
   return brushes[index];
 }
-EXPORT BOOL WINAPI IsWindow(HANDLE window) { return window && window == GetConsoleWindow(); }
+#include "window.inc"
+/* The console window is the one window that is not win32k's: it is answered for here (see above); every other handle is a window of the window manager. */
+static BOOL is_console_window(HANDLE window) { return window && window == GetConsoleWindow(); }
+EXPORT BOOL WINAPI IsWindow(HANDLE window) { return is_console_window(window) || (window && (NtUserCallHwnd((ULONG_PTR)window, CH_IS_WINDOW) & 0xFFFFFFFFu) != 0); }
 IMPORT BOOL WINAPI TcosConsoleWindowCells(LONG *columns, LONG *rows);
 /* The size of the cells the console window shows. */
 static BOOL console_client_size(LONG *width, LONG *height) {
@@ -195,14 +198,16 @@ static BOOL console_client_size(LONG *width, LONG *height) {
 }
 EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect) {
   LONG w, h;
-  if (!IsWindow(window) || !rect) { SetLastError(1400 /* ERROR_INVALID_WINDOW_HANDLE */); return FALSE; }
+  if (!rect) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!is_console_window(window)) { RECT_ *out = rect; return (NtUserCallHwndParam((ULONG_PTR)window, (ULONG_PTR)&out, CHP_GET_CLIENT_RECT) & 0xFFFFFFFFu) != 0; }
   if (!console_client_size(&w, &h)) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
   rect->left = rect->top = 0; rect->right = w; rect->bottom = h;
   return TRUE;
 }
 EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect) {
   LONG w, h;
-  if (!IsWindow(window) || !rect) { SetLastError(1400); return FALSE; }
+  if (!rect) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!is_console_window(window)) { RECT_ *out = rect; return (NtUserCallHwndParam((ULONG_PTR)window, (ULONG_PTR)&out, CHP_GET_WINDOW_RECT) & 0xFFFFFFFFu) != 0; }
   if (!console_client_size(&w, &h)) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
   rect->left = 100; rect->top = 100; rect->right = 100 + w + 2 * FRAME; rect->bottom = 100 + h + CAPTION_H + 2 * FRAME;
   return TRUE;

@@ -221,6 +221,7 @@ uint64_t nt_create_window_ex(Call& call) {
   w->pid = q->pid;
   w->style = style;
   w->ex_style = fix_ex_style(style, ex_style);
+  if (!(style & wn::WS_CHILD)) w->ex_style |= wn::WS_EX_WINDOWEDGE;      // (every window that is not a child has the raised edge, whatever its frame style)
   w->wndproc = cls->wndproc;
   w->unicode = !call.arg_bool(16);
   w->instance = call.arg(11);
@@ -854,8 +855,8 @@ uint64_t nt_call_hwnd(Call& call) {
     case kGetMDIClientInfo: return w->mdi_info;
     case kGetParent:
       if (w == w->desktop->root) return 0;
+      if (w->style & wn::WS_POPUP) return w->owner ? w->owner->handle : 0;      // (a popup is owned even when it also has WS_CHILD, as in Windows)
       if (w->style & wn::WS_CHILD) return w->parent && w->parent != w->desktop->root ? w->parent->handle : 0;
-      if (w->style & wn::WS_POPUP) return w->owner ? w->owner->handle : 0;
       return 0;
     case kGetWindowDpiAwarenessContext: return w->dpi_context ? w->dpi_context : 0x6010u;
     case kGetWindowInputContext: return user_misc::window_input_context_raw(w->handle);
