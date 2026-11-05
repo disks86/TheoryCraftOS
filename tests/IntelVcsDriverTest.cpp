@@ -122,7 +122,7 @@ static void test_batch_validation() {
   CHECK(!ok({(0x20u << 23) | 2u, 0, 0, 0, end}));              // MI_STORE_DWORD_IMM
   // MI_STORE_REGISTER_MEM: only the bitstream byte count of the first video box (Gen9 and Gen11/Xe-LP addresses), into the context's own address space.
   const uint32_t srm = (0x24u << 23) | 2u;
-  CHECK(ok({srm, 0x128A0, 0x1000, 0, end}) && ok({srm, 0x1C08A0, 0x1000, 0, end}));
+  CHECK(ok({srm, 0x128A0, 0x1000, 0, end}) && ok({srm, 0x1C08A0, 0x1000, 0, end}) && ok({srm, 0x1C28A0, 0x1000, 0, end}));   // (the HCP frame byte count of Xe-LP too)
   CHECK(!ok({srm, 0x128A4, 0x1000, 0, end}) && !ok({srm, 0x2000, 0x1000, 0, end}));   // another register
   CHECK(!ok({srm, 0x1C08A0, 0x1000, 1, end}));                  // an address above 4 GiB
   CHECK(!ok({srm, 0x1C08A0, 0x1000, end}));                     // cut short

@@ -18,50 +18,19 @@
 
 
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommands.hpp"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandBuilder.hpp"
 
 namespace hardware {
 namespace intel_enc {
 
 namespace {
 
-struct EncodeField {
-  uint8_t dw, lo, hi;
-};
+using namespace build;
 
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImages.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen11.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
 #include "Hardware/VideoCodec/Intel/IntelVdencTables.inc"
-
-// A command being filled in: the media driver's defaults, then fields by name.
-template <uint32_t N>
-class Command {
- public:
-  explicit Command(const uint32_t (&defaults)[N]) {
-    for (uint32_t i = 0; i < N; ++i) d_[i] = defaults[i];
-  }
-  void set(EncodeField f, uint32_t value) {
-    const uint32_t width = f.hi - f.lo + 1u;
-    const uint32_t mask = (width >= 32 ? 0xFFFFFFFFu : ((1u << width) - 1u)) << f.lo;
-    d_[f.dw] = (d_[f.dw] & ~mask) | ((value << f.lo) & mask);
-  }
-  void raw(uint32_t dw, uint32_t value) { d_[dw] = value; }
-  uint32_t get(uint32_t dw) const { return d_[dw]; }
-  // A buffer's address (low dword; the high dword stays 0 below 4 GiB) and its memory attributes dword.
-  void buffer(uint32_t dw, uint32_t address, uint32_t attributes) {
-    d_[dw] = address;
-    d_[dw + 1] = 0;
-    d_[dw + 2] = (d_[dw + 2] & ~0x7Fu) | attributes;
-  }
-  void emit(DwordWriter& w) const {
-    for (uint32_t i = 0; i < N; ++i) w.emit(d_[i]);
-  }
-
- private:
-  uint32_t d_[N];
-};
-
-constexpr uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 
 // log2(8) = 3 ... the media driver's 4.4 floating-point cost format: a 4-bit mantissa and a 4-bit exponent, saturating at `max`.
 uint8_t map44(uint32_t value, uint8_t max) {

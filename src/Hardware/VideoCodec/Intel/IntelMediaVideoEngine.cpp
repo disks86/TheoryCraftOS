@@ -62,7 +62,7 @@ bool IntelMediaVideoEngine::initialize() {
       if (gen12) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) |
                                           (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
-        info_.accelerated_encode_codecs = codec_mask(VideoCodec::H264);   // (VDEnc, constant quantiser)
+        info_.accelerated_encode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc);   // (VDEnc, constant quantiser)
       } else if (gen11) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) |
                                           (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
@@ -110,6 +110,10 @@ UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const Decoder
 UniquePointer<IVideoEncoder> IntelMediaVideoEngine::create_encoder(const EncoderConfig& config) {
   if (config.codec == VideoCodec::H264 && hardware_decode() && (info_.accelerated_encode_codecs & codec_mask(VideoCodec::H264))) {
     UniquePointer<IntelAvcVdencEncoder> session = UniquePointer<IntelAvcVdencEncoder>::make(allocator_, allocator_, *driver_, config);
+    if (session && session->prepare()) return UniquePointer<IVideoEncoder>(util::move(session));   // else the engine is busy with another session (or the size is not one it takes): the CPU does it
+  }
+  if (config.codec == VideoCodec::Hevc && hardware_decode() && (info_.accelerated_encode_codecs & codec_mask(VideoCodec::Hevc))) {
+    UniquePointer<IntelHevcVdencEncoder> session = UniquePointer<IntelHevcVdencEncoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoEncoder>(util::move(session));   // else the engine is busy with another session (or the size is not one it takes): the CPU does it
   }
   return SoftwareVideoCodec::create_encoder(config);
