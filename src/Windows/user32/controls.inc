@@ -217,6 +217,13 @@ enum { SS_LEFT_, SS_CENTER_, SS_RIGHT_, SS_ICON_, SS_BLACKRECT_, SS_GRAYRECT_, S
 #define DLGC_STATIC_ 0x100
 typedef struct { HANDLE parent, image, font; } StaticState;
 
+EXPORT BOOL WINAPI DrawIconEx(HANDLE hdc, int x, int y, HANDLE icon, int cx, int cy, UINT step, HANDLE background, UINT flags);
+IMPORT HANDLE WINAPI CreateCompatibleDC(HANDLE hdc);
+IMPORT BOOL WINAPI DeleteDC(HANDLE hdc);
+IMPORT BOOL WINAPI BitBlt(HANDLE hdc, int x, int y, int cx, int cy, HANDLE source, int sx, int sy, DWORD rop);
+typedef struct { LONG type, width, height, width_bytes; WORD planes, bits; void *data; } Bitmap_;
+IMPORT int WINAPI GetObjectW(HANDLE object, int size, void *buffer);
+#define SRCCOPY_ 0x00CC0020u
 static void static_paint(HANDLE hwnd, HANDLE hdc, StaticState *st) {
   RECT_ r;
   const LONG style = ctl_style(hwnd);
@@ -238,6 +245,23 @@ static void static_paint(HANDLE hwnd, HANDLE hdc, StaticState *st) {
         if (!(style & WS_DISABLED_)) SetBkMode(hdc, 1 /* TRANSPARENT */);
         else SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT_));
         ctl_text(hdc, text, &r, flags, NULL);
+      }
+      break;
+    }
+    case SS_ICON_: case SS_BITMAP_: {
+      FillRect(hdc, &r, brush);
+      if (st && st->image) {
+        if (type == SS_ICON_) DrawIconEx(hdc, 0, 0, st->image, 0, 0, 0, NULL, 3 | 4 /* DI_NORMAL | DI_DEFAULTSIZE */);
+        else {
+          Bitmap_ bm;
+          HANDLE mem = CreateCompatibleDC(hdc);
+          if (mem && GetObjectW(st->image, sizeof bm, &bm)) {
+            HANDLE old = SelectObject(mem, st->image);
+            BitBlt(hdc, 0, 0, bm.width, bm.height, mem, 0, 0, SRCCOPY_);
+            SelectObject(mem, old);
+          }
+          if (mem) DeleteDC(mem);
+        }
       }
       break;
     }

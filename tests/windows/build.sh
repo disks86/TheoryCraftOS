@@ -78,7 +78,7 @@ $cc -O1 -Wall -Wextra -o "$out/socktest.exe" tests/windows/socktest.c -lws2_32
 echo "built $out/socktest.exe (ws2_32: TCP/UDP loopback, non-blocking connect, select)"
 $cc -O1 -Wall -Wextra -o "$out/imm32test.exe" tests/windows/imm32test.c -limm32
 echo "built $out/imm32test.exe (imm32.dll without an IME: input contexts, their status, HIMCC blocks, composition string / candidate list / guide line getters)"
-$cc -O1 -Wall -Wextra -o "$out/user32test.exe" tests/windows/user32test.c -luser32
+$cc -O1 -Wall -Wextra -o "$out/user32test.exe" tests/windows/user32test.c -luser32 -lgdi32
 echo "built $out/user32test.exe (user32 windows over win32k: classes, creation messages, tree, text, posted/sent messages, loop, timers, enumeration)"
 $cc -O1 -Wall -Wextra -Wno-unused-parameter -o "$out/shell32test.exe" tests/windows/shell32test.c -lshell32 -lole32 -lshlwapi -ladvapi32 -luuid
 echo "built $out/shell32test.exe (shell32 and ole32: command lines, special folders, item id lists, shell items, file operations, ShellExecute, shortcuts; procchild.exe in System32)"

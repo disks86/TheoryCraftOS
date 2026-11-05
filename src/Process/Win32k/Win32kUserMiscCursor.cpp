@@ -182,6 +182,8 @@ uint64_t svc_find_existing(Call& c) {
   uint64_t id = 0, module_id = 0;
   if (c.arg(0) != 0 && !read_resource_name(c, c.arg(0), &module, &module_is_id, &module_id)) return c.fail(kErrorNoAccess);
   if (c.arg(1) != 0 && !read_resource_name(c, c.arg(1), &name, &is_id, &id)) return c.fail(kErrorNoAccess);
+  // user32's LoadCursor / LoadIcon of a system image (no module, an integer name): rsrc 1 asks for the system cursor, 2 for the system icon of that number
+  if (module.empty() && is_id && (c.arg(2) == 1 || c.arg(2) == 2) && id >= 32512 && id <= 32651) return c.arg(2) == 1 ? system_cursor(c.pid(), uint32_t(id)) : system_icon(c.pid(), uint32_t(id));
   List<uint32_t> all(*c.allocator());
   s->icons.handles(&all);
   for (uint32_t h : all.view()) {

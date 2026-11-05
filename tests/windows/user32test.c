@@ -176,6 +176,60 @@ static void test_controls(HINSTANCE instance) {
   CHECK(!IsWindow(edit) && !IsWindow(push));
 }
 
+static void test_icons_and_carets(HINSTANCE instance) {
+  /* system cursors and icons */
+  HCURSOR arrow = LoadCursorA(NULL, IDC_ARROW);
+  CHECK(arrow != NULL && LoadCursorA(NULL, IDC_ARROW) == arrow && LoadCursorA(NULL, IDC_IBEAM) != arrow);
+  CHECK(LoadIconA(NULL, IDI_APPLICATION) != NULL);
+  HCURSOR old = SetCursor(arrow);
+  (void)old;
+  CHECK(GetCursor() == arrow);
+  int count = ShowCursor(TRUE);
+  CHECK(ShowCursor(FALSE) == count - 1);
+
+  /* an icon made from bits: 8x8, 1 bit colour, AND mask and XOR image */
+  BYTE and_bits[8], xor_bits[8];
+  memset(and_bits, 0xFF, sizeof and_bits);
+  memset(xor_bits, 0x00, sizeof xor_bits);
+  and_bits[0] = 0x00;
+  xor_bits[0] = 0xFF;
+  HICON icon = CreateIcon(instance, 8, 8, 1, 4, and_bits, xor_bits);
+  ICONINFO info;
+  if (!icon) icon = CreateIcon(instance, 8, 8, 1, 1, and_bits, xor_bits);
+  CHECK(icon != NULL);
+  if (icon) {
+    CHECK(GetIconInfo(icon, &info) && info.fIcon && info.hbmMask != NULL);
+    BITMAP bm;
+    CHECK(GetObjectA(info.hbmMask, sizeof bm, &bm) && bm.bmWidth == 8);
+    DeleteObject(info.hbmMask);
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    HICON copy = CopyIcon(icon);
+    CHECK(copy != NULL && copy != icon);
+    if (copy) CHECK(DestroyIcon(copy));
+    HDC dc = GetDC(NULL);
+    CHECK(DrawIconEx(dc, 0, 0, icon, 8, 8, 0, NULL, DI_NORMAL));
+    ReleaseDC(NULL, dc);
+    CHECK(DestroyIcon(icon));
+  }
+  CHECK(!GetIconInfo((HICON)(ULONG_PTR)0x1234, &info));
+
+  /* carets belong to the thread's windows */
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = DefWindowProcA; wc.hInstance = instance; wc.lpszClassName = "TcosCaretClass";
+  RegisterClassA(&wc);
+  HWND hwnd = CreateWindowA("TcosCaretClass", "c", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 100, 100, NULL, NULL, instance, NULL);
+  CHECK(CreateCaret(hwnd, NULL, 2, 12));
+  CHECK(SetCaretPos(10, 20));
+  POINT p;
+  CHECK(GetCaretPos(&p) && p.x == 10 && p.y == 20);
+  CHECK(ShowCaret(hwnd) && HideCaret(hwnd));
+  CHECK(DestroyCaret());
+  CHECK(!SetCaretPos(1, 1));
+  CHECK(DestroyWindow(hwnd));
+  UnregisterClassA("TcosCaretClass", instance);
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -302,6 +356,7 @@ int main(void) {
   CHECK(CreateWindowExA(0, "TcosTestClass", NULL, 0, 0, 0, 1, 1, NULL, NULL, instance, NULL) == NULL && GetLastError() == ERROR_CANNOT_FIND_WND_CLASS);
 
   test_controls(instance);
+  test_icons_and_carets(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

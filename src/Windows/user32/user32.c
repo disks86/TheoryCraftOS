@@ -282,3 +282,5 @@ EXPORT BOOL WINAPI IsCharUpperA(CHAR c) { return char_is_alpha((BYTE)c) && char_
 EXPORT BOOL WINAPI IsCharUpperW(WCHAR c) { return char_is_alpha(c) && char_lower(c) != c; }
 EXPORT BOOL WINAPI IsCharLowerA(CHAR c) { return char_is_alpha((BYTE)c) && char_upper((BYTE)c) != (BYTE)c; }
 EXPORT BOOL WINAPI IsCharLowerW(WCHAR c) { return char_is_alpha(c) && char_upper(c) != c; }
+
+#include "icon.inc"
