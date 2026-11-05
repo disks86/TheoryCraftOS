@@ -43,6 +43,8 @@ class IntelEngineBuffers {
   bool leased() const { return leased_; }
   // Gives the lease back (and the batch buffer); nothing must be open.
   void release_lease();
+  // Gen11 (Ice Lake) engines take slightly longer MFX commands (see intel_mfx::AvcBuffers::gen11).
+  bool gen11() const { return driver_.generation() == intel_gt::Generation::Gen11; }
   bool engine_ready() const { return driver_.state() == intel_gt::VcsDriver::State::Ready; }
   ArrayView<uint32_t> batch_words() const { return batch_words_; }
 

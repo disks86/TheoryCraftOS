@@ -45,7 +45,9 @@ class ExeclistPort {
 
   // Gen11 and later (Gen12 here): the submit queue (ELSQ) takes two descriptors, written as two dwords each and started by a write to the control register; the CSB has
   // twelve entries, its write pointer is at dword 0x2f of the status page, and an entry is in the Gen12 format (the context IDs of the contexts switched to and from).
-  enum class Mode : uint8_t { Elsp, Elsq };
+  // Elsq11: Gen11 (Ice Lake) takes the same submit queue and has the same twelve-entry CSB, but its entries are still in the Gen8 format (one status dword whose
+  // bits say what happened, then the context ID).
+  enum class Mode : uint8_t { Elsp, Elsq, Elsq11 };
   static constexpr uint32_t kCsb12Entries = 12;
   static constexpr uint32_t kCsb12WriteDword = 0x2f;     // ICL_HWS_CSB_WRITE_INDEX
   static constexpr uint32_t kRingExeclistSqContents = 0x510;
@@ -80,8 +82,9 @@ class ExeclistPort {
   bool enable();
   // Hands the engine one context. Element 1 goes in first (empty), then element 0 starts the context.
   void submit(uint64_t descriptor);
-  uint32_t entries() const { return mode_ == Mode::Elsq ? kCsb12Entries : kCsbEntries; }
-  uint32_t write_dword() const { return mode_ == Mode::Elsq ? kCsb12WriteDword : kCsbWriteDword; }
+  bool queue() const { return mode_ != Mode::Elsp; }
+  uint32_t entries() const { return queue() ? kCsb12Entries : kCsbEntries; }
+  uint32_t write_dword() const { return queue() ? kCsb12WriteDword : kCsbWriteDword; }
 
   // Reads the new CSB entries. `started` counts entries that say a context began running, `completed` those that say one finished.
   struct Events {

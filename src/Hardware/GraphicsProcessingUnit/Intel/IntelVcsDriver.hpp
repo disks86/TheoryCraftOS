@@ -59,7 +59,7 @@ class AllocatorGpuMemory final : public IGpuMemory {
   allocators::IAllocator& allocator_;
 };
 
-// The first video engine of a Gen9 GPU (VCS0; Skylake through Coffee Lake and Comet Lake graphics) or of a Gen12 one (VD0; Xe-LP: Tiger Lake, Rocket Lake, Alder Lake
+// The first video engine of a Gen9 GPU (VCS0; Skylake through Coffee Lake and Comet Lake graphics), of a Gen11 one (VD0; Ice Lake) or of a Gen12 one (VD0; Xe-LP: Tiger Lake, Rocket Lake, Alder Lake
 // and Raptor Lake graphics, integrated parts), or the render engine of a Gen9 one (RCS0, Config::engine), driven through its execlist: one context, one
 // engine, one job at a time, polled to completion. It sets up everything the engine needs (global GTT entries for the ring, status page and context,
 // the context's own page tables, the register state image), takes a command batch and runs it.
@@ -94,7 +94,7 @@ class VcsDriver {
     IRegisterBank* registers = nullptr;   // the GPU's registers
     MmioRegion ggtt_table;                // the whole global GTT table
     uint64_t ggtt_first_page = 0;         // the first of the ggtt_pages_for(engine) pages of graphics address space this driver may use; it touches no others
-    Generation generation = Generation::Gen9;
+    Generation generation = Generation::Gen9;   // (Gen11: Ice Lake; the video engine only)
     Engine engine = Engine::Video;        // the render engine is Gen9 only; it needs ggtt_pages_for(Engine::Render) pages
     uint16_t device_id = 0;               // the GPU's PCI device ID and revision: which Gen9.5 workarounds the render engine gets (IntelGen9Setup.hpp)
     uint8_t revision = 0;
@@ -123,6 +123,7 @@ class VcsDriver {
   static bool batch_is_acceptable(ArrayView<const uint32_t> commands);
 
   uint32_t last_sequence() const { return seqno_; }
+  Generation generation() const { return config_.generation; }
 
   // Only one user at a time can have buffers in the context's address space: whoever starts a decode session takes the lease and gives it back at the end.
   bool try_lease() {
@@ -149,11 +150,11 @@ class VcsDriver {
   bool render() const { return config_.engine == Engine::Render; }
   ForcewakeDomain engine_domain() const {
     if (render()) return ForcewakeDomain::Render;
-    return config_.generation == Generation::Gen12 ? ForcewakeDomain::MediaVdbox0 : ForcewakeDomain::Media;
+    return config_.generation == Generation::Gen9 ? ForcewakeDomain::Media : ForcewakeDomain::MediaVdbox0;   // Gen11 and later: a well per video box
   }
   uint32_t engine_base() const {
     if (config_.engine_base) return config_.engine_base;
-    return render() ? kRcs0MmioBase : config_.generation == Generation::Gen12 ? kVd0MmioBase : kVcs0MmioBase;
+    return render() ? kRcs0MmioBase : config_.generation == Generation::Gen9 ? kVcs0MmioBase : kVd0MmioBase;
   }
   void write_job(uint64_t status_address, uint32_t sequence);
   void fail_init();

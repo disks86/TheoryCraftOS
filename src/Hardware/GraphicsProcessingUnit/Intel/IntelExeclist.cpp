@@ -52,7 +52,7 @@ bool ExeclistPort::enable() {
   // enable_execlists()
   registers_->write32(base_ + kRingHwstam, ~0u);
   // GFX_RUN_LIST_ENABLE; from Gen11 on the legacy ring mode is disabled instead
-  registers_->write32(base_ + kRingModeGen7, masked_enable(mode_ == Mode::Elsq ? kGen11DisableLegacyMode : 1u << 15));
+  registers_->write32(base_ + kRingModeGen7, masked_enable(queue() ? kGen11DisableLegacyMode : 1u << 15));
   registers_->write32(base_ + kRingMiMode, masked_disable(1u << 8));    // not STOP_RING
   registers_->write32(base_ + kRingHwsPga, status_ggtt_);
   registers_->read32(base_ + kRingHwsPga);
@@ -61,7 +61,7 @@ bool ExeclistPort::enable() {
 
 void ExeclistPort::submit(uint64_t descriptor) {
   if (!registers_) return;
-  if (mode_ == Mode::Elsq) {
+  if (queue()) {
     // Port 1 first (empty), then port 0 with the context: the low dword, then the high one; the queue is started by a write to the control register.
     registers_->write32(base_ + kRingExeclistSqContents + 8, 0);
     registers_->write32(base_ + kRingExeclistSqContents + 12, 0);
@@ -89,6 +89,23 @@ bool ExeclistPort::stop(uint32_t attempts) {
 ExeclistPort::Events ExeclistPort::poll() {
   Events e;
   if (status_.size() != kStatusPageDwords) return e;
+  if (mode_ == Mode::Elsq11) {
+    // Twelve Gen8-format entries: the status dword's bits say what the engine did.
+    const uint32_t tail = load(status_[kCsb12WriteDword]) & 0xF;
+    if (tail >= kCsb12Entries) return e;
+    uint32_t head = csb_head_;
+    while (head != tail) {
+      head = head + 1 == kCsb12Entries ? 0 : head + 1;
+      const uint32_t status = load(status_[kCsbFirstDword + head * 2]);
+      if (status == 0xFFFFFFFFu) { head = head == 0 ? kCsb12Entries - 1 : head - 1; break; }   // not written yet: look again later
+      e.status_or |= status;
+      if (status & (kStatusIdleToActive | kStatusPreempted)) ++e.started;
+      else ++e.completed;
+      if (status & kStatusActiveToIdle) ++e.idle;
+    }
+    csb_head_ = head;
+    return e;
+  }
   if (mode_ == Mode::Elsq) {
     const uint32_t tail = load(status_[kCsb12WriteDword]) & 0xF;
     if (tail >= kCsb12Entries) return e;

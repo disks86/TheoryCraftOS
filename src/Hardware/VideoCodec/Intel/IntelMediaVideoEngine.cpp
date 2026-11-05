@@ -45,18 +45,23 @@ bool IntelMediaVideoEngine::initialize() {
   // Gen9.5 and have not been written down for Gen12).
   const bool gen9 = gpu_.architecture == IntelGpuArchitecture::Gen9_5;
   const bool gen12 = gpu_.architecture == IntelGpuArchitecture::XeLp && !gpu_.discrete && gpu_.media_av1_decode && (status_.vdbox_awake & 1);
-  if (setup_.registers && setup_.memory && setup_.ggtt_table.valid() && (gen9 || gen12) && status_.vdbox_count() > 0) {
+  // Ice Lake (Gen11) and its relatives: the MFX engine's commands are those of Gen9 apart from two that grew (checked against the media driver's command definitions), so
+  // H.264, MPEG-2 and VC-1 run. Its HEVC and VP9 (HCP) commands differ in most of their layouts and are not written down here yet: they stay with the CPU.
+  const bool gen11 = gpu_.architecture == IntelGpuArchitecture::Gen11 && !gpu_.discrete && (status_.vdbox_awake & 1);
+  if (setup_.registers && setup_.memory && setup_.ggtt_table.valid() && (gen9 || gen11 || gen12) && status_.vdbox_count() > 0) {
     UniquePointer<intel_gt::VcsDriver> driver = UniquePointer<intel_gt::VcsDriver>::make(allocator_, *setup_.memory);
     intel_gt::VcsDriver::Config config;
     config.registers = setup_.registers;
     config.ggtt_table = setup_.ggtt_table;
     config.ggtt_first_page = setup_.ggtt_first_page;
-    config.generation = gen12 ? intel_gt::Generation::Gen12 : intel_gt::Generation::Gen9;
+    config.generation = gen12 ? intel_gt::Generation::Gen12 : gen11 ? intel_gt::Generation::Gen11 : intel_gt::Generation::Gen9;
     if (driver && driver->initialize(config)) {
       driver_ = util::move(driver);
       generation_ = config.generation;
       if (gen12) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::Av1);
+      } else if (gen11) {
+        info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1);
       } else {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) |
                                           (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
@@ -86,11 +91,11 @@ UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const Decoder
     UniquePointer<IntelMpeg2Decoder> session = UniquePointer<IntelMpeg2Decoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
   }
-  if (config.codec == VideoCodec::Hevc && hardware_decode() && gpu_.media_hevc) {
+  if (config.codec == VideoCodec::Hevc && hardware_decode() && gpu_.media_hevc && generation_ == intel_gt::Generation::Gen9) {
     UniquePointer<IntelHevcDecoder> session = UniquePointer<IntelHevcDecoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
   }
-  if (config.codec == VideoCodec::Vp9 && hardware_decode() && gpu_.media_vp9) {
+  if (config.codec == VideoCodec::Vp9 && hardware_decode() && gpu_.media_vp9 && generation_ == intel_gt::Generation::Gen9) {
     UniquePointer<IntelVp9Decoder> session = UniquePointer<IntelVp9Decoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
   }

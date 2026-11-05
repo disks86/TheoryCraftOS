@@ -51,7 +51,7 @@ constexpr uint32_t kVd0MmioBase = 0x1C0000;
 constexpr uint32_t kRcs0MmioBase = 0x2000;
 
 // Which generation's layouts a context follows.
-enum class Generation : uint8_t { Gen9, Gen12 };
+enum class Generation : uint8_t { Gen9, Gen11, Gen12 };
 
 // Fills the register state page for a Gen9 video engine (the context starts with every register at zero except the ones listed in the layout table), then sets
 // the context control and the engine's MI mode (ring not stopped). `mmio_base` is the engine's register base; `inhibit_restore` is true for a context that has
@@ -60,6 +60,10 @@ bool lrc_init_gen9_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhib
 // The same for the Gen9 render engine (gen9_rcs_offsets): the register list is the video engine's, but the third load (the render power/clock state register,
 // not the video engine's) is not posted.
 bool lrc_init_gen9_rcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
+
+// The same for a Gen11 (Ice Lake) video engine. The register list is the Gen9 one (the i915 driver uses gen9_xcs_offsets up to Gen11), the context control is set as Gen11
+// and later set it (no save-inhibit or render-state bits), and the ring MI mode is where Gen9 has it.
+bool lrc_init_gen11_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
 
 // The same for a Gen12 (Xe-LP) video engine: the shorter register list of gen12_xcs_offsets (the load commands also set the "from the command streamer's MMIO"
 // bit), the ring MI mode and batch buffer offset at the places Gen12 has them. As the i915 driver does (gt/intel_lrc.c).
@@ -87,6 +91,13 @@ constexpr uint64_t kDescriptorForceRestore = 1u << 2;
 constexpr uint64_t lrc_descriptor_gen12(uint32_t context_ggtt_address, uint32_t context_id, uint32_t engine_instance, uint32_t engine_class) {
   constexpr uint64_t kValid = 1u << 0, kPrivilege = 1u << 8, kAddressingShift = 3, kLegacy64 = 3;
   return (uint64_t{context_ggtt_address} & 0xFFFFF000u) | (kLegacy64 << kAddressingShift) | kValid | kPrivilege | (uint64_t{context_id & 0x7FF} << 37) |
+         (uint64_t{engine_instance & 0x3F} << 48) | (uint64_t{engine_class & 7} << 61);
+}
+// Gen11: the 32-bit legacy addressing mode of Gen9 (three-level tables, four page directories in the context) with the context ID, engine instance and engine class fields
+// where Gen12 has them (GEN11_SW_CTX_ID_SHIFT 37, GEN11_ENGINE_INSTANCE_SHIFT 48, GEN11_ENGINE_CLASS_SHIFT 61 of the i915 driver).
+constexpr uint64_t lrc_descriptor_gen11(uint32_t context_ggtt_address, uint32_t context_id, uint32_t engine_instance, uint32_t engine_class) {
+  constexpr uint64_t kValid = 1u << 0, kPrivilege = 1u << 8, kAddressingShift = 3, kLegacy32 = 1;
+  return (uint64_t{context_ggtt_address} & 0xFFFFF000u) | (kLegacy32 << kAddressingShift) | kValid | kPrivilege | (uint64_t{context_id & 0x7FF} << 37) |
          (uint64_t{engine_instance & 0x3F} << 48) | (uint64_t{engine_class & 7} << 61);
 }
 constexpr uint32_t kVideoDecodeClass = 1;

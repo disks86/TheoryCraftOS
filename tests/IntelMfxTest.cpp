@@ -121,6 +121,27 @@ static void test_headers_and_fields() {
   d = emit([&](DwordWriter& w) { emit_pipe_buf_addr_state(w, b); });
   CHECK(d[1] == 0x23456000 && d[2] == 1 && d[4] == 0 && d[5] == 0);
 
+  // Ice Lake: the pipe buffer command and the H.264 bitstream object grew (the media driver's MFX_PIPE_BUF_ADDR_STATE is 68 dwords there, MFD_AVC_BSD_OBJECT 7); their
+  // first 61 and 6 dwords are the Gen9 ones with only the length field changed, and the new dwords are zero. Nothing else in the MFX family changed size.
+  {
+    AvcBuffers g;
+    g.current_picture = 0x1'2345'6000ull; g.deblocking_enabled = true; g.mocs = 2; g.intra_row_store = 0x300000; g.reference_pictures[3] = 0x400000;
+    const std::vector<uint32_t> old_form = emit([&](DwordWriter& w) { emit_pipe_buf_addr_state(w, g); });
+    g.gen11 = true;
+    const std::vector<uint32_t> ice = emit([&](DwordWriter& w) { emit_pipe_buf_addr_state(w, g); });
+    CHECK(old_form.size() == 61 && ice.size() == 68 && (ice[0] & 0xFF) == 66 && (old_form[0] & 0xFF) == 59 && (ice[0] & ~0xFFu) == (old_form[0] & ~0xFFu));
+    bool same_prefix = true;
+    for (size_t k = 1; k < 61; ++k) same_prefix = same_prefix && ice[k] == old_form[k];
+    CHECK(same_prefix);
+    for (size_t k = 61; k < 68; ++k) CHECK(ice[k] == 0);
+    AvcSlice sl;
+    sl.data_size = 100; sl.data_offset = 8; sl.first_mb_bit_offset = 77; sl.last_slice = true;
+    const std::vector<uint32_t> bsd9 = emit([&](DwordWriter& w) { emit_avc_bsd_object(w, sl); });
+    const std::vector<uint32_t> bsd11 = emit([&](DwordWriter& w) { emit_avc_bsd_object(w, sl, true); });
+    CHECK(bsd9.size() == 6 && bsd11.size() == 7 && bsd11[0] == 0x71280005 && bsd9[0] == 0x71280004 && bsd11[6] == 0);
+    for (size_t k = 1; k < 6; ++k) CHECK(bsd11[k] == bsd9[k]);
+  }
+
   // The end marker: an odd count gets it directly, an even count a no-op first, so the batch is a whole number of quadwords.
   d = emit([](DwordWriter& w) { w.emit(7); emit_batch_end(w); });
   CHECK(d.size() == 2 && d[1] == kMiBatchBufferEnd);

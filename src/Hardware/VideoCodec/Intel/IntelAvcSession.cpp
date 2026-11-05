@@ -215,6 +215,7 @@ bool IntelAvcDecoder::decode_picture(ConstByteView packet, ArrayView<const H264S
 
   // The reference frames the engine is told about: the pictures marked for reference now, in slot order.
   intel_mfx::AvcPictureJob job;
+  job.buffers.gen11 = driver_.generation() == intel_gt::Generation::Gen11;
   int frame_store[h264::kMaxPictures];
   for (int& f : frame_store) f = -1;
   bool ok = true;

@@ -100,6 +100,10 @@ constexpr uint64_t kPrivatePatLow = 0x40E0, kPrivatePatHigh = 0x40E4;
 void program_private_pat(const MmioRegion& registers, const PatTable& table);
 void program_private_pat(IRegisterBank& registers, const PatTable& table);
 
+// Gen11 (Ice Lake, icl_setup_private_ppat) has the Gen9 table's eight entries too, but one register each (GEN10_PAT_INDEX(i) at 0x40E0 + 4 * i, the entry in the low byte)
+// instead of two registers with four packed entries. Index 3 is uncached and 4 write-back, as before.
+void program_icl_pat(IRegisterBank& registers);
+
 // Gen12 (Xe-LP) keeps its table in eight registers of its own, one per index. Index 3 is uncached and 4 write-back, which is what the page table entries above select.
 // Values as the i915 driver sets them (tgl_setup_private_ppat): index 0 write-back, 1 write-combining, 2 write-through, 3 uncached, 4-7 write-back.
 constexpr uint64_t kGen12PatIndexBase = 0x4800;

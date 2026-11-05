@@ -85,7 +85,7 @@ struct FakeGpu final : IRegisterBank {
   uint32_t csb_wp = 5;
   Generation gen = Generation::Gen9;
   uint32_t base = kBase;              // the engine's register base
-  uint32_t elsq[4] = {};              // Gen12: the submit queue contents (port 0 low, high, port 1 low, high)
+  uint32_t elsq[4] = {};              // Gen11 and Gen12: the submit queue contents (port 0 low, high, port 1 low, high)
   int tlb_invalidates = 0;
   int jobs = 0;
 
@@ -104,7 +104,7 @@ struct FakeGpu final : IRegisterBank {
   void write32(uint64_t offset, uint32_t value) override {
     if (offset == 0xA188 || offset == 0xA270 || offset == 0xA540 || offset == 0xA278) {
       const bool gt = offset == 0xA188, rcs = offset == 0xA278;
-      if ((offset == 0xA270 && gen == Generation::Gen12) || (offset == 0xA540 && gen == Generation::Gen9)) violation("forcewake domain of another generation");
+      if ((offset == 0xA270 && gen != Generation::Gen9) || (offset == 0xA540 && gen == Generation::Gen9)) violation("forcewake domain of another generation");
       if (offset != 0xA188 && (rcs != render)) violation("forcewake domain of another engine");
       const uint32_t ack_reg = gt ? 0x130044 : rcs ? 0x0D84 : offset == 0xA540 ? 0x0D50 : 0x0D88;
       const bool enable = (value & 1) && (value >> 16);
@@ -120,8 +120,8 @@ struct FakeGpu final : IRegisterBank {
     }
     regs[offset] = value;
     if (offset == base + ExeclistPort::kRingContextStatusPtr) csb_wp = value & 0xFF;
-    if (gen == Generation::Gen12 && offset >= base + ExeclistPort::kRingExeclistSqContents && offset < base + ExeclistPort::kRingExeclistSqContents + 16) elsq[(offset - base - ExeclistPort::kRingExeclistSqContents) / 4] = value;
-    if (gen == Generation::Gen12 && offset == base + ExeclistPort::kRingExeclistControl && (value & 1)) {
+    if (gen != Generation::Gen9 && offset >= base + ExeclistPort::kRingExeclistSqContents && offset < base + ExeclistPort::kRingExeclistSqContents + 16) elsq[(offset - base - ExeclistPort::kRingExeclistSqContents) / 4] = value;
+    if (gen != Generation::Gen9 && offset == base + ExeclistPort::kRingExeclistControl && (value & 1)) {
       if (elsq[2] != 0 || elsq[3] != 0) violation("port 1 was not empty");
       if (!hang) run((uint64_t{elsq[1]} << 32) | elsq[0]);
     }
@@ -232,6 +232,11 @@ struct FakeGpu final : IRegisterBank {
     const uint32_t id = static_cast<uint32_t>(desc >> 32);
     if (gen == Generation::Gen12) {
       if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 3 || (desc >> 61) != 1 || ((desc >> 48) & 0x3F) != 0 || ((desc >> 37) & 0x7FF) == 0x7FF) violation("descriptor flags");
+    } else if (gen == Generation::Gen11) {
+      // Valid, privileged, the 32-bit legacy mode, no bits in the Gen9 context ID place, a context ID at bit 37, instance 0 and class 1 (video decode).
+      if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 1 || (desc >> 61) != 1 || ((desc >> 48) & 0x3F) != 0 || ((desc >> 32) & 0x1F) != 0 || ((desc >> 37) & 0x7FF) == 0x7FF ||
+          ((desc >> 37) & 0x7FF) == 0)
+        violation("descriptor flags");
     } else if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 1) {
       violation("descriptor flags");
     }
@@ -240,6 +245,12 @@ struct FakeGpu final : IRegisterBank {
     uint32_t* regs_state = st;
     // The restore: a load header, then offset/value pairs. Check the pairs the driver set are where the engine looks for them.
     if (regs_state[kCtxRingStart - 1] != base + 0x38 || regs_state[kCtxRingTail - 1] != base + 0x30) violation("context image layout");
+    if (gen == Generation::Gen11) {
+      // The Gen9 register list (video engine), the context control Gen11 sets (no save-inhibit or render-state masks), the ring MI mode where Gen9 has it.
+      if (regs_state[0] != 0 || regs_state[1] >> 23 != 0x22 || regs_state[kCtxRingStart - 1] != base + 0x38) violation("Gen11 context image layout");
+      if (!(regs_state[kCtxContextControl] & (1u << 19)) || ((regs_state[kCtxContextControl] >> 16) & 0x6) != 0) violation("Gen11 context control");
+      if (regs_state[kCtxRingMiMode] != (1u << 24)) violation("ring MI mode in the context image");
+    }
     if (gen == Generation::Gen12) {
       if ((regs_state[1] & (1u << 19)) == 0 || regs_state[1] >> 23 != 0x22 || regs_state[33] >> 23 != 0x22 || regs_state[kCtxPdp0Udw - 1] != base + 0x274) violation("Gen12 context image layout");
       if (regs_state[0x61] != (1u << 24)) violation("ring MI mode in the context image");
@@ -321,6 +332,20 @@ struct FakeGpu final : IRegisterBank {
       }
       return;
     }
+    if (gen == Generation::Gen11) {
+      // Twelve entries in the Gen8 format: the status dword, then the context ID; the write pointer is a plain index at dword 0x2f.
+      uint32_t* wp11 = ggtt_dword(status_page + ExeclistPort::kCsb12WriteDword * 4, "csb pointer");
+      if (!wp11) return;
+      for (uint32_t status : {ExeclistPort::kStatusIdleToActive, ExeclistPort::kStatusComplete | ExeclistPort::kStatusActiveToIdle}) {
+        csb_wp = (csb_wp + 1) % ExeclistPort::kCsb12Entries;
+        uint32_t* e = ggtt_dword(status_page + (ExeclistPort::kCsbFirstDword + csb_wp * 2) * 4, "csb entry");
+        if (!e) return;
+        e[0] = status;
+        e[1] = id;
+        *wp11 = csb_wp;
+      }
+      return;
+    }
     uint32_t* wp = ggtt_dword(status_page + ExeclistPort::kCsbWriteDword * 4, "csb pointer");
     if (!wp) return;
     for (uint32_t status : {ExeclistPort::kStatusIdleToActive, ExeclistPort::kStatusComplete | ExeclistPort::kStatusActiveToIdle}) {
@@ -342,7 +367,7 @@ struct Rig {
   VcsDriver::Engine engine;
   explicit Rig(Generation g = Generation::Gen9, VcsDriver::Engine e = VcsDriver::Engine::Video) : generation(g), engine(e) {
     gpu.gen = g;
-    gpu.base = g == Generation::Gen12 ? kVd0MmioBase : kBase;
+    gpu.base = g != Generation::Gen9 ? kVd0MmioBase : kBase;
     if (e == VcsDriver::Engine::Render) {
       gpu.render = true;
       gpu.base = kRcs0MmioBase;

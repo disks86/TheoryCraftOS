@@ -97,7 +97,9 @@ void emit_surface_state(DwordWriter& w, uint32_t width, uint32_t height, const N
 }
 
 void emit_pipe_buf_addr_state(DwordWriter& w, const AvcBuffers& b) {
-  w.emit(kMfxPipeBufAddrState | (61 - 2));
+  // Gen11 is written in full (68 dwords: the compression bits of the references, the scaled reference and the slice size stream-out, zeros here); the Gen8/Gen9 form is the
+  // 61-dword prefix the reference driver has always sent.
+  w.emit(kMfxPipeBufAddrState | ((b.gen11 ? 68 : 61) - 2));
   // Pre-deblocking output (1-3) and post-deblocking output (4-6): the picture goes out one way or the other.
   address_or_zero(w, b.deblocking_enabled ? 0 : b.current_picture);
   w.emit(b.mocs);
@@ -112,6 +114,7 @@ void emit_pipe_buf_addr_state(DwordWriter& w, const AvcBuffers& b) {
   w.emit(b.mocs);                                       // 51
   zeros(w, 6);                                          // macroblock status and ILDB (52-57)
   zeros(w, 3);                                          // the second macroblock status (58-60)
+  if (b.gen11) zeros(w, 7);                             // reference picture compression (61), scaled reference (62-64), slice size stream-out (65-67)
 }
 
 void emit_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint32_t mocs) {
@@ -205,13 +208,14 @@ void emit_avc_slice_state(DwordWriter& w, const AvcPicture& p, const AvcSlice& s
   zeros(w, 4);
 }
 
-void emit_avc_bsd_object(DwordWriter& w, const AvcSlice& s) {
-  w.emit(kMfdAvcBsdObject | (6 - 2));
+void emit_avc_bsd_object(DwordWriter& w, const AvcSlice& s, bool gen11) {
+  w.emit(kMfdAvcBsdObject | ((gen11 ? 7 : 6) - 2));
   w.emit(s.data_size);
   w.emit(s.data_offset);
   w.emit(0);
   w.emit(((s.first_mb_bit_offset >> 3) << 16) | (1u << 7) | (uint32_t{s.last_slice} << 3) | (s.first_mb_bit_offset & 7));
   w.emit(0);
+  if (gen11) w.emit(0);                                 // the NAL type override: off
 }
 
 void emit_avc_phantom_slice(DwordWriter& w, const AvcPicture& p, bool has_next, uint32_t next_first_mb) {
