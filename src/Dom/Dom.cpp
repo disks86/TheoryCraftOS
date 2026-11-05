@@ -517,7 +517,13 @@ DomError set_attribute(Node* e, StringView name, StringView value) {
   } else {
     if (name.empty()) return DomError::HierarchyRequest;
     Attribute a(e->owner->allocator());
-    lowercase_into(name, &a.name);
+    // (names are lowercased only on elements of HTML: an svg keeps viewBox, also in a copy made with cloneNode)
+    const bool keeps_case = e->ns_set && !e->ns.view().equals("http://www.w3.org/1999/xhtml");
+    if (keeps_case) {
+      if (!a.name.assign(name)) return DomError::OutOfMemory;
+    } else {
+      lowercase_into(name, &a.name);
+    }
     if (!a.value.assign(value) || !e->attrs.push_back(util::move(a))) return DomError::OutOfMemory;
     record_attribute(e, name, nullptr);
   }

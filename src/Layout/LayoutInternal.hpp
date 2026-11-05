@@ -129,6 +129,7 @@ class LayoutContext {
   // The margin the box's top edge will have once it is collapsed with its first child's and so on down (a cheap guess made before the box is laid
   // out, so that the floats inside it can be placed at the right height).
   MarginPair estimate_top_margin(BoxId id, LayoutUnit cb_width);
+  void center_content(BoxId id, LayoutUnit shift);
   // Positioning (CSS 2.1 section 9.3): relative boxes move after they are placed; absolute and fixed boxes are laid out when their containing block
   // (the nearest positioned ancestor, or the viewport) is done.
   void apply_relative(Box& box);

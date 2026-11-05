@@ -156,6 +156,15 @@ static void test_caret() {
   CHECK(different == 0);
 }
 
+// A field drops the parts of its default look the page set itself: its border and its fill (YouTube's search input sits in a pill that draws the border).
+static void test_styled_field() {
+  Shot plain(page("<input style='width:100px'>"), 200, 60);
+  Shot styled(page("<input style='width:100px;border:none;background:transparent'>"), 200, 60);
+  Shot only_border(page("<input style='width:100px;border:0'>"), 200, 60);
+  Shot only_background(page("<input style='width:100px;background:#fff'>"), 200, 60);   // (the default border stays)
+  CHECK(plain.ink(0, 0, 200, 60) > 0 && styled.ink(0, 0, 200, 60) == 0 && only_border.ink(0, 0, 200, 60) == 0 && only_background.ink(0, 0, 200, 60) == plain.ink(0, 0, 200, 60));
+}
+
 static void test_boxes() {
   Shot a(page("<div style='width:100px;height:50px;background:#ff0000'></div>"));
   CHECK(a.rgb(10, 10) == 0xFF0000u && a.rgb(99, 49) == 0xFF0000u && a.rgb(100, 10) == 0xFFFFFFu && a.rgb(10, 50) == 0xFFFFFFu);
@@ -1060,6 +1069,7 @@ int main() {
     fonts.add_bundled_fonts();
     g_fonts = &fonts;
     test_caret();
+    test_styled_field();
     test_boxes();
     test_stacking();
     test_clip_and_opacity();

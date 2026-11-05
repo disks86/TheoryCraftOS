@@ -193,6 +193,13 @@ static bool probe_file(const std::string& address, std::string* body) {
   return true;
 }
 
+// PROBE: the Content-Type header of a file of the probe directory, from its name.
+static std::string probe_content_type(const std::string& path) {
+  auto ends = [&](const char* suffix) { const size_t n = strlen(suffix); return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0; };
+  return ends(".js") || ends(".mjs") || path.find("/_/js/") != std::string::npos ? "Content-Type: application/javascript\r\n" : ends(".json") ? "Content-Type: application/json\r\n" : ends(".svg") ? "Content-Type: image/svg+xml\r\n"
+         : ends(".xml") ? "Content-Type: application/xml\r\n" : ends(".css") || path.find("/_/ss/") != std::string::npos ? "Content-Type: text/css\r\n" : ends(".txt") ? "Content-Type: text/plain\r\n" : ends(".xhtml") ? "Content-Type: application/xhtml+xml\r\n" : "Content-Type: text/html\r\n";
+}
+
 // A network that hands out canned answers keyed by "METHOD url" (404 for anything else) and remembers what was sent.
 struct FakeNet final : IPageLoader {
   struct Answer {
@@ -229,9 +236,17 @@ struct FakeNet final : IPageLoader {
         int c;
         while ((c = fgetc(f)) != EOF) a.body.push_back(static_cast<char>(c));
         fclose(f);
-        auto ends = [&](const char* suffix) { const size_t n = strlen(suffix); return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0; };
-        a.headers = ends(".js") || ends(".mjs") || path.find("/_/js/") != std::string::npos ? "Content-Type: application/javascript\r\n" : ends(".json") ? "Content-Type: application/json\r\n" : ends(".svg") ? "Content-Type: image/svg+xml\r\n"
-                  : ends(".xml") ? "Content-Type: application/xml\r\n" : ends(".css") || path.find("/_/ss/") != std::string::npos ? "Content-Type: text/css\r\n" : ends(".txt") ? "Content-Type: text/plain\r\n" : ends(".xhtml") ? "Content-Type: application/xhtml+xml\r\n" : "Content-Type: text/html\r\n";
+        a.headers = probe_content_type(path);
+      }
+    } else if (it == answers.end() && getenv("PROBE_HTML") && key.compare(0, 12, "GET https://") == 0) {   // (PROBE: another host's file, as its server sends it to the page)
+      std::string body;
+      if (probe_file(key.substr(4), &body)) {
+        a.status = 200;
+        a.body = body;
+        std::string path = key;
+        const size_t cut = path.find_first_of("?#");
+        if (cut != std::string::npos) path.resize(cut);
+        a.headers = probe_content_type(path) + "Access-Control-Allow-Origin: *\r\n";   // (gstatic's icons are fetched by script: the real servers allow it)
       }
     }
     if (request.headers.contains("If-None-Match")) {   // a revalidation: the answer "<key>#304" if the test has one
@@ -6341,6 +6356,27 @@ static void test_webrtc() {
     CHECK(mask);
     int32_t w = 0, h = 0;
     CHECK(page.objects().background_image_size("icon.png", &w, &h) && w == 8 && h == 8);
+  }
+  {   // YouTube's icon loader: DOM lists are not arrays (it copies a list with concat only when `instanceof Array` is false), writing Attr.value changes the
+      // attribute, and an svg keeps the case of its attribute names through setAttribute and cloneNode
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    page.load("<html><body><div id=d><svg viewBox='0 0 2 2' id=s><path id=p d='M0 0'/></svg></div><script>\n"
+              "var s = document.getElementById('s'), all = s.getElementsByTagName('*');\n"
+              "var list = [s].concat(all instanceof Array ? all : Array.from(all));\n"
+              "console.log('lists ' + (all instanceof Array) + ' ' + (document.body.childNodes instanceof Array) + ' ' + (s.attributes instanceof Array) + ' ' + list.length + ' ' + list[1].localName + ' ' + typeof all.map + ' ' + typeof document.body.childNodes.forEach + ' ' + [].concat(Array.from(all)).length);\n"
+              "var at = s.attributes; for (var i = 0; i < at.length; i++) if (at[i].name === 'id') at[i].value += '_yt1';\n"
+              "console.log('attr ' + s.id + ' ' + (at[0] instanceof Attr) + ' ' + at[0].value);\n"
+              "s.setAttribute('preserveAspectRatio', 'none'); var c = s.cloneNode(true);\n"
+              "console.log('case ' + c.outerHTML.indexOf('viewBox=') + ' ' + c.outerHTML.indexOf('preserveAspectRatio=') + ' ' + c.getAttribute('viewbox'));\n"
+              "var e = document.createElement('div'); e.setAttribute('DATA-X', '1'); console.log('html ' + e.outerHTML);\n"
+              "</script></body></html>");
+    const std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("lists false false false 2 path undefined function 1") != std::string::npos);
+    CHECK(log.find("attr s_yt1 true 0 0 2 2") != std::string::npos);
+    CHECK(log.find("case 5 ") != std::string::npos && log.find("case 5 -1") == std::string::npos && log.find(" 0 0 2 2\n", log.find("case ")) != std::string::npos);
+    CHECK(log.find("html <div data-x=\"1\"></div>") != std::string::npos);
   }
   {   // a script that measures an element it just added gets the size the page lays out now, not the last picture's (YouTube's grid sizes itself that way)
     for (int with_fonts = 0; with_fonts < 2; ++with_fonts) {

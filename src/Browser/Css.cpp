@@ -1658,7 +1658,7 @@ void copy_property(Prop p, const Style& from, Style* to) {
     case pMarginTop: case pMarginRight: case pMarginBottom: case pMarginLeft: to->margin[p - pMarginTop] = from.margin[p - pMarginTop]; break;
     case pPaddingTop: case pPaddingRight: case pPaddingBottom: case pPaddingLeft: to->padding[p - pPaddingTop] = from.padding[p - pPaddingTop]; break;
     case pBorderTopWidth: case pBorderRightWidth: case pBorderBottomWidth: case pBorderLeftWidth: to->border_px100[p - pBorderTopWidth] = from.border_px100[p - pBorderTopWidth]; break;
-    case pBorderTopStyle: case pBorderRightStyle: case pBorderBottomStyle: case pBorderLeftStyle: to->border_style[p - pBorderTopStyle] = from.border_style[p - pBorderTopStyle]; break;
+    case pBorderTopStyle: case pBorderRightStyle: case pBorderBottomStyle: case pBorderLeftStyle: to->border_style[p - pBorderTopStyle] = from.border_style[p - pBorderTopStyle]; to->own_border |= from.own_border; break;
     case pBorderTopColor: case pBorderRightColor: case pBorderBottomColor: case pBorderLeftColor: to->border_color[p - pBorderTopColor] = from.border_color[p - pBorderTopColor]; break;
     case pFlexGrow: to->flex_grow_x100 = from.flex_grow_x100; break;
     case pFlexShrink: to->flex_shrink_x100 = from.flex_shrink_x100; break;
@@ -3741,11 +3741,11 @@ void CssApply::apply_value(Prop p, StringView value) {
     case pPaddingTop: case pPaddingRight: case pPaddingBottom: case pPaddingLeft:
       if (parse_length(value, false, &l) && l.kind == Length::Px && l.px100 >= 0) style->padding[p - pPaddingTop] = l;
       break;
-    case pBorder: border_shorthand(value, 0, 4); break;
-    case pBorderTop: border_shorthand(value, 0, 1); break;
-    case pBorderRight: border_shorthand(value, 1, 1); break;
-    case pBorderBottom: border_shorthand(value, 2, 1); break;
-    case pBorderLeft: border_shorthand(value, 3, 1); break;
+    case pBorder: border_shorthand(value, 0, 4); style->own_border = true; break;
+    case pBorderTop: border_shorthand(value, 0, 1); style->own_border = true; break;
+    case pBorderRight: border_shorthand(value, 1, 1); style->own_border = true; break;
+    case pBorderBottom: border_shorthand(value, 2, 1); style->own_border = true; break;
+    case pBorderLeft: border_shorthand(value, 3, 1); style->own_border = true; break;
     case pBorderWidthAll: four_sides(value, pBorderTopWidth, false); break;
     case pBorderStyleAll: four_sides(value, pBorderTopStyle, false); break;
     case pBorderColorAll: four_sides(value, pBorderTopColor, false); break;
@@ -3756,7 +3756,10 @@ void CssApply::apply_value(Prop p, StringView value) {
     }
     case pBorderTopStyle: case pBorderRightStyle: case pBorderBottomStyle: case pBorderLeftStyle: {
       BorderStyle bs;
-      if (border_style_of(value, &bs)) style->border_style[p - pBorderTopStyle] = bs;
+      if (border_style_of(value, &bs)) {
+        style->border_style[p - pBorderTopStyle] = bs;
+        style->own_border = true;
+      }
       break;
     }
     case pBorderTopColor: case pBorderRightColor: case pBorderBottomColor: case pBorderLeftColor:
