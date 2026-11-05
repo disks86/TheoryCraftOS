@@ -125,6 +125,7 @@ class VcsDriver {
 
   uint32_t last_sequence() const { return seqno_; }
   Generation generation() const { return config_.generation; }
+  bool xe_lpg() const { return config_.xe_lpg; }
 
   // Only one user at a time can have buffers in the context's address space: whoever starts a decode session takes the lease and gives it back at the end.
   bool try_lease() {

@@ -52,7 +52,8 @@ bool IntelMediaVideoEngine::initialize() {
   const bool gen11 = gpu_.architecture == IntelGpuArchitecture::Gen11 && !gpu_.discrete && (status_.vdbox_awake & 1);
   // Meteor Lake and Arrow Lake (Xe-LPG): the video boxes are on the media tile, and the setup's register bank is that tile's window (its engine, power wells, PAT and MOCS
   // are the Xe-LP ones at another place and with other values). The AVC, HEVC, VP9 and VDEnc commands are the same as Xe-LP's (checked field by field against the media
-  // driver's Xe_LPM_plus definitions); the AV1 ones (AVP) are not, MPEG-2 is not offered there and VC-1 never was, so those stay with the CPU.
+  // driver's Xe_LPM_plus definitions), and the AV1 ones (AVP) differ only in five commands that grew at the end (IntelAvpCommands.hpp). MPEG-2 is not offered there and VC-1
+  // never was, so those stay with the CPU.
   const bool xe_lpg = gpu_.architecture == IntelGpuArchitecture::XeLpg && !gpu_.discrete && (status_.vdbox_awake & 1);
   if (setup_.registers && setup_.memory && setup_.ggtt_table.valid() && (gen9 || gen11 || gen12 || xe_lpg) && status_.vdbox_count() > 0) {
     UniquePointer<intel_gt::VcsDriver> driver = UniquePointer<intel_gt::VcsDriver>::make(allocator_, *setup_.memory);
@@ -67,7 +68,8 @@ bool IntelMediaVideoEngine::initialize() {
       generation_ = config.generation;
       xe_lpg_ = xe_lpg;
       if (xe_lpg) {
-        info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
+        info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) |
+                                          (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
         info_.accelerated_encode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc);   // (VDEnc, constant quantiser)
       } else if (gen12) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) |
@@ -89,7 +91,7 @@ bool IntelMediaVideoEngine::initialize() {
 
 UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const DecoderConfig& config) {
   const bool xe_lp = generation_ == intel_gt::Generation::Gen12;
-  if (xe_lp && !xe_lpg_ && config.codec == VideoCodec::Av1 && hardware_decode()) {
+  if (xe_lp && config.codec == VideoCodec::Av1 && hardware_decode()) {
     UniquePointer<IntelAv1Decoder> session = UniquePointer<IntelAv1Decoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));   // else the engine is busy with another session: the CPU does it
     return SoftwareVideoCodec::create_decoder(config);

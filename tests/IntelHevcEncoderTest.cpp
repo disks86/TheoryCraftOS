@@ -674,7 +674,7 @@ void test_device(TestAllocator& a) {
   CHECK(rig.mem.live() == 1);
 
   // Meteor Lake: the media tile. The engine and its registers are the tile's (the simulated GPU stands for the tile's window); the probe looks at the tile's own place in
-  // the BAR. H.264 and H.265 encode run on it, AV1 and MPEG-2 decode stay with the CPU.
+  // the BAR. H.264 and H.265 encode run on it, MPEG-2 decode stays with the CPU.
   {
     Rig2 mtl;
     mtl.engine.write_stream = true;
@@ -691,7 +691,7 @@ void test_device(TestAllocator& a) {
       device.set_hardware(setup3);
       CHECK(device.initialize() && device.hardware_decode());
       const uint32_t decode = device.info().accelerated_decode_codecs;
-      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && !(decode & codec_mask(VideoCodec::Av1)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
+      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
       CHECK(device.info().accelerated_encode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)));
       EncoderConfig cfg;
       cfg.codec = VideoCodec::Hevc;
