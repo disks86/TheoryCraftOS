@@ -128,6 +128,7 @@ TCOS_WEAK gdi::Rect monitor_rect(uint32_t monitor, bool work_area) {
 }
 TCOS_WEAK bool is_menu(uint32_t handle) { (void)handle; return false; }
 TCOS_WEAK void window_destroyed(uint32_t hwnd) { (void)hwnd; }
+TCOS_WEAK bool attach_window_menu(uint32_t hwnd, uint32_t menu) { (void)hwnd; (void)menu; return false; }
 
 }  // namespace user_misc
 

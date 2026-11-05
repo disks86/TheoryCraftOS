@@ -228,6 +228,7 @@ uint64_t nt_create_window_ex(Call& call) {
   w->owner = owner;
   w->dpi_context = 0;
   if (style & wn::WS_CHILD) w->id = call.arg(10); else w->menu = call.arg(10);
+  if (!(style & wn::WS_CHILD) && w->menu != 0 && !user_misc::attach_window_menu(w->handle, uint32_t(w->menu))) w->menu = 0;      // (not a menu: no menu)
   window_text_set(w, title.view());
   for (int32_t i = 0; i < cls->cb_wnd_extra; ++i) w->extra.push_back(0);
   // geometry; CW_USEDEFAULT picks a default for overlapped windows
@@ -915,7 +916,7 @@ uint64_t get_scroll_info(Call& call, Window* w, uint64_t params) {
 
 uint64_t get_window_info(Call& call, Window* w, uint64_t address) {
   uint32_t size = 0;
-  if (!call.read_u32(address, &size) || size != 60) return call.fail(kErrorInvalidParameter);
+  if (!call.read_u32(address, &size)) return call.fail(kErrorInvalidParameter);      // (Windows ignores cbSize)
   uint8_t raw[60] = {};
   put32(raw, 0, 60);
   auto wr = [&](uint32_t o, const Rect& r) { put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom)); };
@@ -930,7 +931,7 @@ uint64_t get_window_info(Call& call, Window* w, uint64_t address) {
   put32(raw, 52, uint32_t(cl.top - win.top));
   raw[56] = uint8_t(w->cls ? w->cls->atom : 0);
   raw[57] = uint8_t((w->cls ? w->cls->atom : 0) >> 8);
-  raw[58] = 5;      // wCreatorVersion: Windows 5.00 style (0x0500)
+  raw[58] = 0;      // wCreatorVersion 0x0500
   raw[59] = 5;
   return call.write(address, ConstByteView(raw, 60)) ? 1 : call.fail(kErrorInvalidParameter);
 }

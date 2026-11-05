@@ -72,6 +72,7 @@ __attribute__((weak)) uint32_t create_bitmap(uint64_t, int32_t width, int32_t he
 
 namespace process::win32k::user {
 __attribute__((weak)) bool is_window(uint32_t hwnd) { return find_window(hwnd) != nullptr; }
+__attribute__((weak)) void set_window_menu(uint32_t hwnd, uint32_t menu) { (void)hwnd; (void)menu; }
 __attribute__((weak)) uint64_t window_thread(uint32_t hwnd) { const FakeWindow* w = find_window(hwnd); return w ? w->tid : 0; }
 __attribute__((weak)) uint64_t window_process(uint32_t hwnd) { const FakeWindow* w = find_window(hwnd); return w ? w->pid : 0; }
 __attribute__((weak)) bool window_screen_rect(uint32_t hwnd, gdi::Rect* rect) {
@@ -236,7 +237,7 @@ void test_menus() {
   put_mii(p.memory, kF, 0x2 | 0x20 | 0x100 | 0x40, 0x100, 0, 90, 0, 0xABCDEF, 0, 0);
   CHECK(thunk(p, m, 0xFFFFFFFFu, kByPos, kInsert, kF, kC) == 1);
   put_mii(p.memory, kF, 0x20 | 0x100 | 0x40, 0, 0, 0, 0, 0, kE, 10);
-  CHECK(thunk(p, m, 90, 0, kInfoW, kF) == 1 && p.memory.get64(kF + 48) == 0xABCDEF && p.memory.get32(kF + 8) == 0x100 && p.memory.get32(kF + 64) == 0);
+  CHECK(thunk(p, m, 90, 0, kInfoW, kF) == 1 && p.memory.get64(kF + 48) == 0xABCDEF && p.memory.get32(kF + 8) == 0x100 && p.memory.get32(kF + 64) == 5);      // (an owner-draw item keeps the string it was given)
   p.call(N::NtUserDeleteMenu, m, 90, 0);
 
   // default item

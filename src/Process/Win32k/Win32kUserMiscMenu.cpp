@@ -32,6 +32,8 @@ constexpr uint32_t kMnsValid = 0x80000000u | 0x40000000u | 0x20000000u | 0x10000
 constexpr uint32_t kMiiSize80 = 80, kMiiSize72 = 72, kMenuInfoSize = 40;
 constexpr uint32_t kMaxItemText = 0x10000, kMaxItems = 0xFFFF, kMaxDepth = 32;
 constexpr uint32_t kNotFound = 0xFFFFFFFFu;
+constexpr uint32_t kMftRightJustify = 0x4000;
+constexpr uint32_t kClassicCall = 0x40000000u;      // in the flags of ThunkedMenuItemInfo: the call comes from InsertMenu / AppendMenu / ModifyMenu (MF_BITMAP is allowed there)
 
 struct MenuItem {
   uint32_t id = 0, type = 0, state = 0, submenu = 0;
@@ -161,6 +163,9 @@ bool apply_mii(MenuState& s, Call& call, MenuItem& item, uint32_t menu_handle, c
     item.text.clear();
     item.text.append(text->view());
   }
+  // A string item given no string (a null pointer) is a separator, and a separator is disabled unless its state was given.
+  if (((mii.mask & kMiimString) || ((mii.mask & kMiimType) && is_string_item(item))) && mii.type_data == 0 && is_string_item(item)) item.type |= kMftSeparator;
+  if ((item.type & kMftSeparator) && !(mii.mask & kMiimState)) item.state |= kMfsGrayedBits;
   return true;
 }
 
@@ -365,6 +370,8 @@ enum Method : uint32_t { kSetMenuItemInfo, kInsertMenuItem, kCheckMenuRadioItem,
 uint64_t set_or_insert(Call& c, MenuState& s, uint32_t handle, uint32_t pos, uint32_t flags, bool insert, uint64_t info, uint64_t str) {
   Mii mii;
   if (!read_mii(c, info, &mii)) return 0;
+  // MIIM_TYPE is the old way to give the type and string: it cannot be combined with the new ones, and a bitmap type is not set with MIIM_FTYPE or next to MIIM_BITMAP.
+  if (((mii.mask & kMiimType) && (mii.mask & (kMiimString | kMiimFtype | kMiimBitmap))) || (!(flags & kClassicCall) && (mii.mask & kMiimFtype) && (mii.type & kMftBitmap))) return c.fail(kErrorInvalidParameter);
   WideString text(*c.allocator());
   bool have_text = false;
   if (!read_item_text(c, mii, str, &have_text, &text)) return 0;
@@ -382,6 +389,8 @@ uint64_t set_or_insert(Call& c, MenuState& s, uint32_t handle, uint32_t pos, uin
   } else if (find_item(s, &holder, pos, flags, &index) && holder == handle) {
     where = index;      // before the item with that id (an item in a submenu is not a position here: the new item is appended)
   }
+  // The system buttons of an MDI child (right-justified items with a magic bitmap) stay at the right end of a menu bar: an item appended goes before them.
+  if (where == menu->items.count()) while (where > 0 && (menu->items[where - 1]->type & kMftRightJustify) && menu->items[where - 1]->bmp_item >= 1 && menu->items[where - 1]->bmp_item <= 6) --where;
   MenuItem* item = nullptr;
   if (!insert_item(s, *menu, where, &item)) return c.fail(kErrorNotEnoughMemory);
   if (!(mii.mask & (kMiimType | kMiimFtype | kMiimString))) item->type = kMftString;
@@ -397,6 +406,7 @@ uint64_t set_or_insert(Call& c, MenuState& s, uint32_t handle, uint32_t pos, uin
 uint64_t get_item_info(Call& c, MenuState& s, MenuItem& item, uint64_t address, bool ansi) {
   Mii mii;
   if (!read_mii(c, address, &mii)) return 0;
+  if ((mii.mask & kMiimType) && (mii.mask & (kMiimString | kMiimFtype | kMiimBitmap))) return c.fail(kErrorInvalidParameter);
   bool ok = true;
   if (mii.mask & (kMiimType | kMiimFtype)) ok = ok && c.write_u32(address + 8, item.type);
   if (mii.mask & kMiimState) ok = ok && c.write_u32(address + 12, item.state);
@@ -406,14 +416,16 @@ uint64_t get_item_info(Call& c, MenuState& s, MenuItem& item, uint64_t address, 
   if (mii.mask & kMiimData) ok = ok && c.write_u64(address + 48, item.item_data);
   if ((mii.mask & kMiimBitmap) && mii.size == kMiiSize80) ok = ok && c.write_u64(address + 72, item.bmp_item);
   if (mii.mask & (kMiimString | kMiimType)) {
-    if (!is_string_item(item)) {
-      if (mii.mask & kMiimType) ok = ok && c.write_u64(address + 56, (item.type & kMftBitmap) ? item.bmp_item : item.item_data);
-      else {      // MIIM_STRING of an item without a string: an empty string
-        ok = ok && c.write_u32(address + 64, 0);
-        if (mii.type_data != 0 && mii.cch != 0) ok = ok && (ansi ? write8(c, mii.type_data, 0) : c.write_u16(mii.type_data, 0));
-      }
+    // An owner-draw item may carry a string as well (set with MIIM_STRING); the old MIIM_TYPE request answers the item's data in dwTypeData for the types without one.
+    const bool string_item = is_string_item(item), has_text = string_item || item.text.size() != 0;
+    const uint32_t length = has_text ? uint32_t(item.text.size()) : 0;
+    if ((mii.mask & kMiimType) && !string_item) {
+      ok = ok && c.write_u64(address + 56, (item.type & kMftBitmap) ? item.bmp_item : item.item_data) && c.write_u32(address + 64, length);
+    } else if (!has_text) {      // an empty string
+      ok = ok && c.write_u32(address + 64, 0);
+      if (mii.type_data != 0 && mii.cch != 0) ok = ok && (ansi ? write8(c, mii.type_data, 0) : c.write_u16(mii.type_data, 0));
     } else if (mii.type_data == 0) {
-      ok = ok && c.write_u32(address + 64, uint32_t(item.text.size()));      // no buffer: only the length
+      ok = ok && c.write_u32(address + 64, length);      // no buffer: only the length
     } else if (mii.cch != 0) {
       const uint32_t room = mii.cch - 1;
       const uint32_t n = item.text.size() < room ? uint32_t(item.text.size()) : room;
@@ -449,12 +461,15 @@ uint64_t svc_thunked_menu_item_info(Call& c) {
       uint64_t i1 = 0, i2 = 0, i3 = 0;
       MenuItem* a = find_item(*s, &h1, first, mode, &i1);
       MenuItem* b = find_item(*s, &h2, last, mode, &i2);
-      if (!a || !b || h1 != handle || h2 != handle) return c.fail(kErrorMenuItemNotFound);
+      if (!a || !b) return c.fail(kErrorMenuItemNotFound);
+      Menu* range = s->menus.find(h1);
       MenuItem* checked = find_item(*s, &h3, check, mode, &i3);
+      if (checked && h1 != h3) return c.fail(kErrorMenuItemNotFound);      // (the range starts in one menu, which may be a submenu, and the checked item is in it; the end of the range in another menu is the end of this one)
+      if (h2 != h1) i2 = range->items.count() - 1;
       bool found = false;
-      for (uint64_t i = i1; i <= i2 && i < menu->items.count(); ++i) {
-        MenuItem* item = menu->items[i];
-        if (checked && h3 == handle && item == checked) { item->state |= kMfsChecked; item->type |= kMftRadioCheck; found = true; }
+      for (uint64_t i = i1; i <= i2 && i < range->items.count(); ++i) {
+        MenuItem* item = range->items[i];
+        if (checked && h3 == h1 && item == checked) { item->state |= kMfsChecked; item->type |= kMftRadioCheck; found = true; }
         else item->state &= ~kMfsChecked;
       }
       return found ? 1 : 0;
@@ -494,6 +509,7 @@ uint64_t svc_set_menu(Call& c) {
     Menu* m = (c.arg(1) >> 32) == 0 ? s->menus.find(menu) : nullptr;
     if (!m) return c.fail(kErrorInvalidMenuHandle);
   }
+  user::set_window_menu(hwnd, menu);
   for (uint64_t i = 0; i < s->bars.count(); ++i) {
     if (s->bars[i].hwnd != hwnd) continue;
     if (menu == 0) s->bars.remove_at(i); else s->bars[i].menu = menu;
@@ -592,6 +608,14 @@ bool get_menu_info(Call& c, uint32_t handle, uint64_t info) {
   if (mask & kMimMenuData) ok = ok && c.write_u64(info + 32, m->menu_data);
   if (!ok) c.set_last_error(kErrorNoAccess);
   return ok;
+}
+
+bool attach_window_menu(uint32_t hwnd, uint32_t menu) {
+  MenuState* s = st();
+  if (!s || !s->menus.find(menu)) return false;
+  for (WindowMenu& w : s->bars.view()) if (w.hwnd == hwnd) { w.menu = menu; return true; }
+  s->bars.push_back(WindowMenu{hwnd, menu});
+  return true;
 }
 
 uint32_t window_menu(uint32_t hwnd) {

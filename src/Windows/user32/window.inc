@@ -397,16 +397,19 @@ EXPORT BOOL WINAPI InvalidateRect(HANDLE hwnd, const void *rect, BOOL erase);
 EXPORT BOOL WINAPI IsWindowVisible(HANDLE hwnd);
 EXPORT int WINAPI GetWindowTextW(HANDLE hwnd, LPWSTR buffer, int count);
 EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
+#include "hooks.inc"
 #include "controls.inc"
 #include "scroll.inc"
 #include "listbox.inc"
 #include "combo.inc"
 #include "dialog.inc"
+#include "menu.inc"
+#include "menuui.inc"
 static void builtin_classes(void) {
   static volatile LONG done;
   static const struct { const WCHAR *name; UINT style; int wnd_extra; WNDPROC_ proc; } classes[] = {
       {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 8, combo_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 8, listbox_proc}, {L"MDIClient", 0, 0, builtin_proc},
-      {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 8, listbox_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, DefDlgProcW},
+      {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 8, listbox_proc}, {L"#32768", 0x20808, 0, menu_proc}, {L"#32770", 0x808, 30, DefDlgProcW},
       {L"#32771", 0x803, 0, builtin_proc}, {L"#32772", 0, 0, builtin_proc}, {L"IME", 0, 0, builtin_proc}, {L"SysLink", 0x8, 0, builtin_proc}, {L"tooltips_class32", 0x8, 0, builtin_proc}};
   if (__sync_lock_test_and_set(&done, 1)) return;
   for (size_t_ i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
@@ -567,7 +570,10 @@ EXPORT HANDLE WINAPI CreateWindowExA(DWORD ex_style, const char *class_name, con
   wide_free(c, class_name); wide_free(t, title);
   return h;
 }
-EXPORT BOOL WINAPI DestroyWindow(HANDLE hwnd) { return (NtUserDestroyWindow((ULONG_PTR)hwnd) & 0xFFFFFFFFu) != 0; }
+EXPORT BOOL WINAPI DestroyWindow(HANDLE hwnd) {
+  if (HOOK_ACTIVE(WH_CBT) && IsWindow(hwnd) && hook_cbt(HCBT_DESTROYWND, (ULONG_PTR)hwnd, 0)) return FALSE;
+  return (NtUserDestroyWindow((ULONG_PTR)hwnd) & 0xFFFFFFFFu) != 0;
+}
 EXPORT BOOL WINAPI IsWindowVisible(HANDLE hwnd) { return (NtUserCallHwnd((ULONG_PTR)hwnd, CH_IS_VISIBLE) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI IsWindowEnabled(HANDLE hwnd) { return (NtUserCallHwnd((ULONG_PTR)hwnd, CH_IS_ENABLED) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI IsWindowUnicode(HANDLE hwnd) {      /* (an A window is one whose procedure is a thunk) */
@@ -575,7 +581,9 @@ EXPORT BOOL WINAPI IsWindowUnicode(HANDLE hwnd) {      /* (an A window is one wh
   return thunk_slot((WNDPROC_)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)-4, CHP_GET_WINDOW_LONG_PTR_W)) < 0;
 }
 EXPORT BOOL WINAPI EnableWindow(HANDLE hwnd, BOOL enable) { return (NtUserEnableWindow((ULONG_PTR)hwnd, enable) & 0xFFFFFFFFu) != 0; }
-EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd) { return (NtUserShowWindow((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)cmd) & 0xFFFFFFFFu) != 0; }
+EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd) {
+  if (HOOK_ACTIVE(WH_CBT) && (cmd == 2 || cmd == 3 || cmd == 6 || cmd == 9 || cmd == 7) && hook_cbt(HCBT_MINMAX, (ULONG_PTR)hwnd, cmd)) return FALSE;
+  return (NtUserShowWindow((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)cmd) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI ShowWindowAsync(HANDLE hwnd, int cmd) { return (NtUserShowWindowAsync((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)cmd) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI SetWindowPos(HANDLE hwnd, HANDLE after, int x, int y, int cx, int cy, UINT flags) {
   return (NtUserSetWindowPos((ULONG_PTR)hwnd, (ULONG_PTR)after, (ULONG_PTR)(LONG_PTR)x, (ULONG_PTR)(LONG_PTR)y, (ULONG_PTR)(LONG_PTR)cx, (ULONG_PTR)(LONG_PTR)cy, flags) & 0xFFFFFFFFu) != 0;
@@ -668,8 +676,17 @@ EXPORT HANDLE WINAPI GetFocus(void) { return (HANDLE)NtUserGetThreadState(0); }
 EXPORT HANDLE WINAPI GetActiveWindow(void) { return (HANDLE)NtUserGetThreadState(1); }
 EXPORT HANDLE WINAPI GetCapture(void) { return (HANDLE)NtUserGetThreadState(2); }
 EXPORT HANDLE WINAPI GetForegroundWindow(void) { return (HANDLE)NtUserGetForegroundWindow(); }
-EXPORT HANDLE WINAPI SetFocus(HANDLE hwnd) { return (HANDLE)NtUserSetFocus((ULONG_PTR)hwnd); }
-EXPORT HANDLE WINAPI SetActiveWindow(HANDLE hwnd) { return (HANDLE)NtUserSetActiveWindow((ULONG_PTR)hwnd); }
+EXPORT HANDLE WINAPI SetFocus(HANDLE hwnd) {
+  if (HOOK_ACTIVE(WH_CBT) && hwnd && hook_cbt(HCBT_SETFOCUS, (ULONG_PTR)hwnd, (LONG_PTR)GetFocus())) return NULL;
+  return (HANDLE)NtUserSetFocus((ULONG_PTR)hwnd);
+}
+EXPORT HANDLE WINAPI SetActiveWindow(HANDLE hwnd) {
+  if (HOOK_ACTIVE(WH_CBT) && hwnd) {
+    struct { BOOL mouse; HANDLE active; } cbt = {FALSE, GetActiveWindow()};
+    if (hook_cbt(HCBT_ACTIVATE, (ULONG_PTR)hwnd, (LONG_PTR)&cbt)) return NULL;
+  }
+  return (HANDLE)NtUserSetActiveWindow((ULONG_PTR)hwnd);
+}
 EXPORT BOOL WINAPI SetForegroundWindow(HANDLE hwnd) { return (NtUserSetForegroundWindow((ULONG_PTR)hwnd) & 0xFFFFFFFFu) != 0; }
 EXPORT HANDLE WINAPI SetCapture(HANDLE hwnd) { return (HANDLE)NtUserSetCapture((ULONG_PTR)hwnd); }
 EXPORT BOOL WINAPI ReleaseCapture(void) { return (NtUserReleaseCapture() & 0xFFFFFFFFu) != 0; }
@@ -683,7 +700,14 @@ EXPORT BOOL WINAPI UpdateWindow(HANDLE hwnd) { return (NtUserUpdateWindow((ULONG
 EXPORT BOOL WINAPI GetUpdateRect(HANDLE hwnd, void *rect, BOOL erase) { return (NtUserGetUpdateRect((ULONG_PTR)hwnd, (ULONG_PTR)rect, erase) & 0xFFFFFFFFu) != 0; }
 
 /* ---- messages ------------------------------------------------------------------------------------------------------------------------------------------------------ */
-static LONG_PTR def_proc_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { (void)ctx; return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 0); }
+static LONG_PTR def_proc_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
+  (void)ctx;
+  LONG_PTR result;
+  if (menu_def_before(hwnd, message, wparam, lparam, &result)) return result;
+  result = (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 0);
+  menu_def_after(hwnd, message, wparam, lparam, &result);
+  return result;
+}
 EXPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return def_proc_w(NULL, hwnd, message, wparam, lparam); }
 EXPORT LONG_PTR WINAPI DefWindowProcA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return a_to_w(def_proc_w, NULL, hwnd, message, wparam, lparam); }
 /* The procedure is called directly: a W caller of a thunk gives it Unicode (what it takes), an A caller of a thunk gives the program's procedure its own A messages; an A caller of a window
@@ -696,7 +720,14 @@ EXPORT LONG_PTR WINAPI CallWindowProcA(WNDPROC_ proc, HANDLE hwnd, UINT message,
   if (proc == builtin_proc || proc == static_proc || proc == button_proc || proc == edit_proc) return a_to_w(call_w_proc, (void *)proc, hwnd, message, wparam, lparam);
   return proc(hwnd, message, wparam, lparam);
 }
-static LONG_PTR send_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { (void)ctx; return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_MESSAGE, 0); }
+static LONG_PTR send_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
+  (void)ctx;
+  if (g_hook_count[WH_CALLWNDPROC + 1] == 0 && g_hook_count[WH_CALLWNDPROCRET + 1] == 0) return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_MESSAGE, 0);
+  hook_call_wnd_proc(hwnd, message, wparam, lparam);
+  const LONG_PTR result = (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_MESSAGE, 0);
+  hook_call_wnd_proc_ret(hwnd, message, wparam, lparam, result);
+  return result;
+}
 EXPORT LONG_PTR WINAPI SendMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return send_w(NULL, hwnd, message, wparam, lparam); }
 EXPORT LONG_PTR WINAPI SendMessageA(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return a_to_w(send_w, NULL, hwnd, message, wparam, lparam); }
 typedef struct { UINT flags, timeout; ULONG_PTR *result; } TimeoutArgs;
@@ -727,16 +758,29 @@ EXPORT void WINAPI PostQuitMessage(int code) { NtUserPostQuitMessage((ULONG_PTR)
 EXPORT BOOL WINAPI ReplyMessage(LONG_PTR result) { return (NtUserReplyMessage((ULONG_PTR)result) & 0xFFFFFFFFu) != 0; }
 EXPORT int WINAPI GetMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last) {
   if (!msg) { SetLastError(ERROR_INVALID_PARAMETER); return -1; }
-  return (int)(LONG)NtUserGetMessage((ULONG_PTR)msg, (ULONG_PTR)hwnd, first, last);
+  for (;;) {
+    const int r = (int)(LONG)NtUserGetMessage((ULONG_PTR)msg, (ULONG_PTR)hwnd, first, last);
+    if (r <= 0 || !(g_hook_count[WH_KEYBOARD + 1] | g_hook_count[WH_MOUSE + 1] | g_hook_count[WH_GETMESSAGE + 1]) || hook_filter_message(msg, TRUE)) return r;
+  }
 }
 EXPORT int WINAPI GetMessageA(MSG_ *msg, HANDLE hwnd, UINT first, UINT last) { return GetMessageW(msg, hwnd, first, last); }
 EXPORT BOOL WINAPI PeekMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last, UINT flags) {
   if (!msg) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-  return (NtUserPeekMessage((ULONG_PTR)msg, (ULONG_PTR)hwnd, first, last, flags) & 0xFFFFFFFFu) != 0;
+  for (;;) {
+    if (!(NtUserPeekMessage((ULONG_PTR)msg, (ULONG_PTR)hwnd, first, last, flags) & 0xFFFFFFFFu)) return FALSE;
+    if (!(g_hook_count[WH_KEYBOARD + 1] | g_hook_count[WH_MOUSE + 1] | g_hook_count[WH_GETMESSAGE + 1]) || hook_filter_message(msg, (flags & 1 /* PM_REMOVE */) != 0)) return TRUE;
+  }
 }
 EXPORT BOOL WINAPI PeekMessageA(MSG_ *msg, HANDLE hwnd, UINT first, UINT last, UINT flags) { return PeekMessageW(msg, hwnd, first, last, flags); }
 EXPORT BOOL WINAPI WaitMessage(void) { return (NtUserWaitMessage() & 0xFFFFFFFFu) != 0; }
-EXPORT LONG_PTR WINAPI DispatchMessageW(const MSG_ *msg) { return msg ? (LONG_PTR)NtUserDispatchMessage((ULONG_PTR)msg) : 0; }
+EXPORT LONG_PTR WINAPI DispatchMessageW(const MSG_ *msg) {
+  if (!msg) return 0;
+  if (g_hook_count[WH_CALLWNDPROC + 1] == 0 && g_hook_count[WH_CALLWNDPROCRET + 1] == 0) return (LONG_PTR)NtUserDispatchMessage((ULONG_PTR)msg);
+  hook_call_wnd_proc(msg->hwnd, msg->message, msg->wparam, msg->lparam);
+  const LONG_PTR result = (LONG_PTR)NtUserDispatchMessage((ULONG_PTR)msg);
+  hook_call_wnd_proc_ret(msg->hwnd, msg->message, msg->wparam, msg->lparam, result);
+  return result;
+}
 EXPORT LONG_PTR WINAPI DispatchMessageA(const MSG_ *msg) { return DispatchMessageW(msg); }
 EXPORT BOOL WINAPI TranslateMessage(const MSG_ *msg) { return msg && (NtUserTranslateMessage((ULONG_PTR)msg, 0) & 0xFFFFFFFFu) != 0; }
 EXPORT DWORD WINAPI GetMessagePos(void) { return (DWORD)NtUserGetMessagePos(); }

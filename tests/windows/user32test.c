@@ -520,6 +520,276 @@ static void test_clipboard(HINSTANCE instance) {
   UnregisterClassA("TcosClipClass", instance);
 }
 
+/* ---- hooks ---- */
+static int g_hook_calls[16], g_hook_discard, g_hook_chain;
+static HHOOK g_hook_handle[16];
+static UINT g_hook_last_msg;
+static LRESULT CALLBACK getmsg_hook(int code, WPARAM wparam, LPARAM lparam) {
+  ++g_hook_calls[WH_GETMESSAGE];
+  if (code >= 0) g_hook_last_msg = ((MSG *)lparam)->message;
+  return CallNextHookEx(g_hook_handle[WH_GETMESSAGE], code, wparam, lparam);
+}
+static LRESULT CALLBACK getmsg_hook2(int code, WPARAM wparam, LPARAM lparam) {
+  ++g_hook_chain;
+  return CallNextHookEx(NULL, code, wparam, lparam);
+}
+static LRESULT CALLBACK kbd_hook(int code, WPARAM wparam, LPARAM lparam) {
+  if (code == HC_ACTION) ++g_hook_calls[WH_KEYBOARD];
+  return g_hook_discard;
+}
+static LRESULT CALLBACK cwp_hook(int code, WPARAM wparam, LPARAM lparam) {
+  if (code == HC_ACTION && ((CWPSTRUCT *)lparam)->message == WM_USER + 7) { ++g_hook_calls[WH_CALLWNDPROC]; CHECK(wparam == 1); }
+  return CallNextHookEx(NULL, code, wparam, lparam);
+}
+static LRESULT CALLBACK cwpret_hook(int code, WPARAM wparam, LPARAM lparam) {
+  if (code == HC_ACTION && ((CWPRETSTRUCT *)lparam)->message == WM_USER + 7) { ++g_hook_calls[WH_CALLWNDPROCRET]; CHECK(((CWPRETSTRUCT *)lparam)->lResult == 77); }
+  return CallNextHookEx(NULL, code, wparam, lparam);
+}
+static LRESULT CALLBACK cbt_hook(int code, WPARAM wparam, LPARAM lparam) {
+  if (code == HCBT_DESTROYWND) { ++g_hook_calls[WH_CBT]; return g_hook_discard; }
+  return 0;
+}
+static LRESULT CALLBACK ret77_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+  if (msg == WM_USER + 7) return 77;
+  return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+static void test_hooks(HINSTANCE instance) {
+  DWORD tid = GetCurrentThreadId();
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = ret77_proc; wc.hInstance = instance; wc.lpszClassName = "TcosHookClass";
+  CHECK(RegisterClassA(&wc) != 0);
+  HWND hwnd = CreateWindowExA(0, "TcosHookClass", "hook", WS_OVERLAPPED, 0, 0, 50, 50, NULL, NULL, instance, NULL);
+  CHECK(hwnd != NULL);
+
+  CHECK(SetWindowsHookExA(99, getmsg_hook, NULL, tid) == NULL);
+  CHECK(SetWindowsHookExA(WH_GETMESSAGE, NULL, NULL, tid) == NULL);
+  CHECK(UnhookWindowsHookEx((HHOOK)0x1234) == FALSE);
+
+  /* WH_GETMESSAGE: a chain of two, the newest first; each sees the message PeekMessage returns */
+  g_hook_handle[WH_GETMESSAGE] = SetWindowsHookExA(WH_GETMESSAGE, getmsg_hook, NULL, tid);
+  CHECK(g_hook_handle[WH_GETMESSAGE] != NULL);
+  PostMessageA(hwnd, WM_USER + 1, 0, 0);
+  MSG msg;
+  CHECK(PeekMessageA(&msg, hwnd, WM_USER + 1, WM_USER + 1, PM_NOREMOVE));
+  CHECK(g_hook_calls[WH_GETMESSAGE] == 1 && g_hook_last_msg == WM_USER + 1);
+  CHECK(PeekMessageA(&msg, hwnd, WM_USER + 1, WM_USER + 1, PM_REMOVE));
+  CHECK(g_hook_calls[WH_GETMESSAGE] == 2);
+  HHOOK second = SetWindowsHookExA(WH_GETMESSAGE, getmsg_hook2, NULL, tid);
+  CHECK(second != NULL);
+  PostMessageA(hwnd, WM_USER + 2, 0, 0);
+  CHECK(GetMessageA(&msg, hwnd, WM_USER + 2, WM_USER + 2) == 1);
+  CHECK(g_hook_chain == 1 && g_hook_calls[WH_GETMESSAGE] == 3);
+  CHECK(UnhookWindowsHookEx(second));
+  CHECK(UnhookWindowsHookEx(g_hook_handle[WH_GETMESSAGE]));
+  CHECK(!UnhookWindowsHookEx(g_hook_handle[WH_GETMESSAGE]));
+  PostMessageA(hwnd, WM_USER + 3, 0, 0);
+  CHECK(PeekMessageA(&msg, hwnd, WM_USER + 3, WM_USER + 3, PM_REMOVE) && g_hook_calls[WH_GETMESSAGE] == 3);
+
+  /* WH_KEYBOARD: a nonzero result discards a removed message */
+  HHOOK kbd = SetWindowsHookExA(WH_KEYBOARD, kbd_hook, NULL, tid);
+  CHECK(kbd != NULL);
+  g_hook_discard = 1;
+  PostMessageA(hwnd, WM_KEYDOWN, 'A', 0);
+  CHECK(!PeekMessageA(&msg, hwnd, WM_KEYDOWN, WM_KEYDOWN, PM_REMOVE) && g_hook_calls[WH_KEYBOARD] == 1);
+  g_hook_discard = 0;
+  PostMessageA(hwnd, WM_KEYDOWN, 'B', 0);
+  CHECK(PeekMessageA(&msg, hwnd, WM_KEYDOWN, WM_KEYDOWN, PM_REMOVE) && msg.wParam == 'B' && g_hook_calls[WH_KEYBOARD] == 2);
+  CHECK(UnhookWindowsHookEx(kbd));
+
+  /* WH_CALLWNDPROC / WH_CALLWNDPROCRET for a sent message */
+  HHOOK cwp = SetWindowsHookExA(WH_CALLWNDPROC, cwp_hook, NULL, tid);
+  HHOOK cwpret = SetWindowsHookExA(WH_CALLWNDPROCRET, cwpret_hook, NULL, tid);
+  CHECK(cwp != NULL && cwpret != NULL);
+  CHECK(SendMessageA(hwnd, WM_USER + 7, 0, 0) == 77);
+  CHECK(g_hook_calls[WH_CALLWNDPROC] == 1 && g_hook_calls[WH_CALLWNDPROCRET] == 1);
+  CHECK(UnhookWindowsHookEx(cwp) && UnhookWindowsHookEx(cwpret));
+  CHECK(SendMessageA(hwnd, WM_USER + 7, 0, 0) == 77 && g_hook_calls[WH_CALLWNDPROC] == 1);
+
+  /* the old API removes by procedure */
+  CHECK(SetWindowsHookA(WH_GETMESSAGE, (HOOKPROC)getmsg_hook) != NULL);
+  CHECK(UnhookWindowsHook(WH_GETMESSAGE, (HOOKPROC)getmsg_hook));
+
+  /* WH_CBT can stop a window from being destroyed */
+  HHOOK cbt = SetWindowsHookExA(WH_CBT, cbt_hook, NULL, tid);
+  CHECK(cbt != NULL);
+  g_hook_discard = 1;
+  CHECK(!DestroyWindow(hwnd) && IsWindow(hwnd) && g_hook_calls[WH_CBT] == 1);
+  g_hook_discard = 0;
+  CHECK(DestroyWindow(hwnd) && !IsWindow(hwnd) && g_hook_calls[WH_CBT] == 2);
+  CHECK(UnhookWindowsHookEx(cbt));
+  CHECK(UnregisterClassA("TcosHookClass", instance));
+}
+
+/* ---- menus ---- */
+static int g_menu_stage, g_menu_commands[16], g_menu_command_count, g_menu_events[64], g_menu_event_count;
+static HMENU g_menu_under_test;
+static HWND g_menu_window;
+static LRESULT CALLBACK menu_owner_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+  if (msg == WM_COMMAND || msg == WM_SYSCOMMAND) { if (g_menu_command_count < 16) g_menu_commands[g_menu_command_count++] = (int)LOWORD(wparam); }
+  if ((msg == WM_INITMENU || msg == WM_INITMENUPOPUP || msg == WM_MENUSELECT || msg == WM_ENTERMENULOOP || msg == WM_EXITMENULOOP || msg == WM_UNINITMENUPOPUP) && g_menu_event_count < 64)
+    g_menu_events[g_menu_event_count++] = (int)msg;
+  return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+static void post_key(UINT vk) { PostMessageA(g_menu_window, WM_KEYDOWN, vk, 0); }
+static void CALLBACK menu_timer(HWND hwnd, UINT msg, UINT_PTR id, DWORD time) {
+  (void)msg; (void)time;
+  KillTimer(hwnd, id);
+  switch (g_menu_stage) {
+    case 1: post_key(VK_DOWN); post_key(VK_DOWN); post_key(VK_RETURN); break;
+    case 2: PostMessageA(g_menu_window, WM_CHAR, 'w', 0); break;
+    case 3: post_key(VK_DOWN); post_key(VK_ESCAPE); break;
+    case 4: post_key(VK_DOWN); post_key(VK_DOWN); post_key(VK_DOWN); post_key(VK_DOWN); post_key(VK_RIGHT); post_key(VK_DOWN); post_key(VK_RETURN); break;
+    case 5: {      /* the mouse: move to the third item and click */
+      RECT r;
+      CHECK(GetMenuItemRect(NULL, g_menu_under_test, 2, &r));
+      INPUT in[3];
+      memset(in, 0, sizeof in);
+      const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+      in[0].type = INPUT_MOUSE; in[0].mi.dx = (LONG)(((r.left + r.right) / 2) * 65535 / sw); in[0].mi.dy = (LONG)(((r.top + r.bottom) / 2) * 65535 / sh); in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+      in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+      in[2].type = INPUT_MOUSE; in[2].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+      SendInput(3, in, sizeof(INPUT));
+      break;
+    }
+    case 6: EndMenu(); break;
+    case 7: post_key(VK_DOWN); post_key(VK_RETURN); break;      /* a bar: the popup of the first item, then its first entry */
+    case 8: post_key(VK_RIGHT); post_key(VK_DOWN); post_key(VK_RETURN); break;
+    default: break;
+  }
+}
+static UINT run_track(HMENU menu, UINT flags, int stage) {
+  g_menu_stage = stage;
+  g_menu_under_test = menu;
+  CHECK(SetTimer(g_menu_window, 77, 30, menu_timer) != 0);
+  return (UINT)TrackPopupMenu(menu, flags, 40, 40, 0, g_menu_window, NULL);
+}
+static void test_menus(HINSTANCE instance) {
+  /* the data: classic calls, item info, ANSI and Unicode */
+  HMENU menu = CreatePopupMenu(), sub = CreatePopupMenu();
+  CHECK(menu && IsMenu(menu) && sub && !IsMenu((HMENU)0x1234));
+  CHECK(AppendMenuA(menu, MF_STRING, 100, "&One\tCtrl+1"));
+  CHECK(AppendMenuA(menu, MF_SEPARATOR, 0, NULL));
+  CHECK(AppendMenuA(menu, MF_STRING | MF_CHECKED, 101, "T&wo"));
+  CHECK(AppendMenuA(menu, MF_STRING | MF_GRAYED, 102, "Three"));
+  CHECK(AppendMenuA(sub, MF_STRING, 200, "Sub &A"));
+  CHECK(AppendMenuA(sub, MF_STRING, 201, "Sub &B"));
+  CHECK(AppendMenuA(menu, MF_POPUP, (UINT_PTR)sub, "&More"));
+  CHECK(GetMenuItemCount(menu) == 5);
+  CHECK(GetMenuItemCount((HMENU)0x1234) == -1);
+  char text[64];
+  CHECK(GetMenuStringA(menu, 0, text, sizeof text, MF_BYPOSITION) == 11 && !strcmp(text, "&One\tCtrl+1"));
+  CHECK(GetMenuStringA(menu, 101, text, sizeof text, MF_BYCOMMAND) == 4 && !strcmp(text, "T&wo"));
+  CHECK(GetMenuState(menu, 101, MF_BYCOMMAND) == MF_CHECKED);
+  CHECK((GetMenuState(menu, 102, MF_BYCOMMAND) & MF_GRAYED) != 0);
+  CHECK((GetMenuState(menu, 1, MF_BYPOSITION) & MF_SEPARATOR) != 0);
+  CHECK(GetSubMenu(menu, 4) == sub && GetMenuItemID(menu, 4) == (UINT)-1 && GetMenuItemID(menu, 0) == 100);
+  CHECK(GetMenuState(menu, 4, MF_BYPOSITION) == (UINT)(MF_POPUP | (2 << 8)));
+  CHECK(CheckMenuItem(menu, 100, MF_CHECKED) == 0 && CheckMenuItem(menu, 100, MF_UNCHECKED) == MF_CHECKED);
+  CHECK(EnableMenuItem(menu, 102, MF_ENABLED) == MF_GRAYED && !(GetMenuState(menu, 102, MF_BYCOMMAND) & MF_GRAYED));
+  EnableMenuItem(menu, 102, MF_GRAYED);
+  CHECK(CheckMenuRadioItem(menu, 100, 101, 100, MF_BYCOMMAND));
+  CHECK((GetMenuState(menu, 100, MF_BYCOMMAND) & MF_CHECKED) && !(GetMenuState(menu, 101, MF_BYCOMMAND) & MF_CHECKED));
+  MENUITEMINFOW mii;
+  WCHAR wide[32];
+  memset(&mii, 0, sizeof mii);
+  mii.cbSize = sizeof mii; mii.fMask = MIIM_ID | MIIM_STRING | MIIM_STATE; mii.dwTypeData = wide; mii.cch = 32;
+  CHECK(GetMenuItemInfoW(menu, 2, TRUE, &mii) && mii.wID == 101 && mii.cch == 4 && !wcscmp(wide, L"T&wo"));
+  memset(&mii, 0, sizeof mii);
+  mii.cbSize = sizeof mii; mii.fMask = MIIM_STRING | MIIM_ID; mii.dwTypeData = (LPWSTR)L"Renamed"; mii.wID = 111;
+  CHECK(SetMenuItemInfoW(menu, 2, TRUE, &mii));
+  CHECK(GetMenuStringW(menu, 111, wide, 32, MF_BYCOMMAND) == 7 && !wcscmp(wide, L"Renamed"));
+  CHECK(ModifyMenuA(menu, 111, MF_BYCOMMAND | MF_STRING | MF_CHECKED, 101, "T&wo"));
+  CHECK(InsertMenuA(menu, 0, MF_BYPOSITION | MF_STRING, 99, "First") && GetMenuItemID(menu, 0) == 99 && GetMenuItemCount(menu) == 6);
+  CHECK(DeleteMenu(menu, 99, MF_BYCOMMAND) && GetMenuItemCount(menu) == 5);
+  CHECK(!DeleteMenu(menu, 12345, MF_BYCOMMAND) && GetLastError() == 1456 /* ERROR_MENU_ITEM_NOT_FOUND */);
+  CHECK(SetMenuDefaultItem(menu, 100, FALSE) && GetMenuDefaultItem(menu, FALSE, 0) == 100);
+
+  /* the window the menus belong to */
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = menu_owner_proc; wc.hInstance = instance; wc.lpszClassName = "TcosMenuOwner";
+  CHECK(RegisterClassA(&wc) != 0);
+  g_menu_window = CreateWindowExA(0, "TcosMenuOwner", "menus", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 20, 20, 400, 300, NULL, NULL, instance, NULL);
+  CHECK(g_menu_window != NULL);
+
+  /* TrackPopupMenu with the keyboard: Down skips the separator, Return chooses */
+  g_menu_event_count = 0;
+  CHECK(run_track(menu, TPM_RETURNCMD, 1) == 101);
+  CHECK(g_menu_event_count >= 5 && g_menu_events[0] == WM_ENTERMENULOOP && g_menu_events[1] == WM_INITMENU && g_menu_events[2] == WM_INITMENUPOPUP);
+  CHECK(g_menu_events[g_menu_event_count - 1] == WM_EXITMENULOOP && g_menu_events[g_menu_event_count - 2] == WM_UNINITMENUPOPUP);
+  { int selects = 0; for (int i = 0; i < g_menu_event_count; ++i) if (g_menu_events[i] == WM_MENUSELECT) ++selects; CHECK(selects >= 3); }
+  CHECK(run_track(menu, TPM_RETURNCMD, 2) == 101);      /* the mnemonic */
+  CHECK(run_track(menu, TPM_RETURNCMD, 3) == 0);      /* Escape */
+  CHECK(run_track(menu, TPM_RETURNCMD, 4) == 201);      /* the submenu */
+  CHECK(run_track(menu, TPM_RETURNCMD, 6) == 0);      /* EndMenu */
+  CHECK(run_track(menu, TPM_RETURNCMD, 5) == 101);      /* the mouse */
+  { MSG m; g_menu_command_count = 0; CHECK(run_track(menu, 0, 1) == TRUE); CHECK(PeekMessageA(&m, g_menu_window, WM_COMMAND, WM_COMMAND, PM_REMOVE) && LOWORD(m.wParam) == 101); }
+  CHECK(!TrackPopupMenu(menu, 0, 0, 0, 0, NULL, NULL) && GetLastError() == ERROR_INVALID_WINDOW_HANDLE);
+  CHECK(!TrackPopupMenu((HMENU)0x1234, 0, 0, 0, 0, g_menu_window, NULL) && GetLastError() == 1401);
+  CHECK(!EndMenu());
+
+  /* a menu bar: the popup of the first item, Return on its first entry sends WM_COMMAND */
+  HMENU bar = CreateMenu(), file = CreatePopupMenu(), edit = CreatePopupMenu();
+  AppendMenuA(file, MF_STRING, 300, "&Open");
+  AppendMenuA(file, MF_STRING, 301, "&Save");
+  AppendMenuA(edit, MF_STRING, 310, "&Copy");
+  AppendMenuA(edit, MF_STRING, 311, "&Paste");
+  AppendMenuA(bar, MF_POPUP, (UINT_PTR)file, "&File");
+  AppendMenuA(bar, MF_POPUP, (UINT_PTR)edit, "&Edit");
+  RECT before, after;
+  GetClientRect(g_menu_window, &before);
+  CHECK(GetMenu(g_menu_window) == NULL && SetMenu(g_menu_window, bar) && GetMenu(g_menu_window) == bar);
+  GetClientRect(g_menu_window, &after);
+  CHECK(after.bottom < before.bottom);      /* the bar takes room from the client area */
+  MENUBARINFO mbi;
+  memset(&mbi, 0, sizeof mbi);
+  mbi.cbSize = sizeof mbi;
+  CHECK(GetMenuBarInfo(g_menu_window, OBJID_MENU, 0, &mbi) && mbi.hMenu == bar && mbi.rcBar.bottom > mbi.rcBar.top);
+  RECT item0, item1;
+  CHECK(GetMenuItemRect(g_menu_window, bar, 0, &item0) && GetMenuItemRect(g_menu_window, bar, 1, &item1));
+  CHECK(item0.right <= item1.left && item0.top == mbi.rcBar.top && item0.bottom <= mbi.rcBar.bottom);
+  POINT in_item1 = {(item1.left + item1.right) / 2, (item1.top + item1.bottom) / 2};
+  CHECK(MenuItemFromPoint(g_menu_window, bar, in_item1) == 1);
+  CHECK(SendMessageA(g_menu_window, WM_NCHITTEST, 0, MAKELPARAM(in_item1.x, in_item1.y)) == HTMENU);
+  g_menu_command_count = 0;
+  g_menu_stage = 7;
+  SetTimer(g_menu_window, 78, 30, menu_timer);
+  SendMessageA(g_menu_window, WM_SYSCOMMAND, SC_KEYMENU, 0);
+  CHECK(DrawMenuBar(g_menu_window));
+  { MSG m; CHECK(PeekMessageA(&m, g_menu_window, WM_COMMAND, WM_COMMAND, PM_REMOVE) && LOWORD(m.wParam) == 300); }
+  g_menu_stage = 8;
+  SetTimer(g_menu_window, 79, 30, menu_timer);
+  SendMessageA(g_menu_window, WM_SYSCOMMAND, SC_KEYMENU, 'f');      /* Alt+F: the File popup; Right goes to Edit, Down Return: Paste */
+  { MSG m; CHECK(PeekMessageA(&m, g_menu_window, WM_COMMAND, WM_COMMAND, PM_REMOVE) && LOWORD(m.wParam) == 311); }
+  CHECK(SetMenu(g_menu_window, NULL) && GetMenu(g_menu_window) == NULL);
+  CHECK(IsMenu(bar));      /* SetMenu does not destroy the old menu */
+
+  /* a menu from a template: the old format (a popup with entries and a separator) and the extended one */
+  static const WORD old_template[] = {0, 0,
+      0x0010, 'F', 'i', 'l', 'e', 0, 0x0000, 400, 'N', 'e', 'w', 0, 0x0000, 0, 0, 0x0000 | 0x0080, 401, 'Q', 0,
+      0x0090 & ~0x10, 402, 'L', 'a', 's', 't', 0};
+  HMENU loaded = LoadMenuIndirectA(old_template);
+  CHECK(loaded != NULL && GetMenuItemCount(loaded) >= 1);
+  if (loaded) {
+    HMENU file_menu = GetSubMenu(loaded, 0);
+    CHECK(file_menu != NULL && GetMenuItemCount(file_menu) == 3 && GetMenuItemID(file_menu, 0) == 400 && (GetMenuState(file_menu, 1, MF_BYPOSITION) & MF_SEPARATOR) != 0);
+    DestroyMenu(loaded);
+    CHECK(!IsMenu(loaded) && !IsMenu(file_menu));
+  }
+
+  /* the system menu */
+  HMENU sys = GetSystemMenu(g_menu_window, FALSE);
+  CHECK(sys != NULL && GetMenuItemCount(sys) >= 5);
+  CHECK(GetSystemMenu(g_menu_window, FALSE) == sys);
+  CHECK(GetMenuState(sys, SC_CLOSE, MF_BYCOMMAND) != (UINT)-1);
+
+  DestroyWindow(g_menu_window);
+  CHECK(!IsMenu(sys));      /* the window's menus go with it */
+  UnregisterClassA("TcosMenuOwner", instance);
+  DestroyMenu(menu);
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -651,6 +921,8 @@ int main(void) {
   test_list_and_combo(instance);
   test_dialogs(instance);
   test_clipboard(instance);
+  test_hooks(instance);
+  test_menus(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

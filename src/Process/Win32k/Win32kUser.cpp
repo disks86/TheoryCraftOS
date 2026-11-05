@@ -427,6 +427,10 @@ Window* window_at_point(int32_t x, int32_t y, bool skip_transparent, uint64_t ti
 // The window manager's contract with the rest of win32k
 
 bool is_window(uint32_t hwnd) { return state().windows.find(hwnd) != nullptr; }
+void set_window_menu(uint32_t hwnd, uint32_t menu) {
+  Window* w = find_window(hwnd);
+  if (w && !(w->style & wn::WS_CHILD)) w->menu = menu;
+}
 uint64_t window_thread(uint32_t hwnd) { Window* w = find_window(hwnd); return w ? w->thread : 0; }
 uint64_t window_process(uint32_t hwnd) { Window* w = find_window(hwnd); return w ? w->pid : 0; }
 bool window_screen_rect(uint32_t hwnd, gdi::Rect* rect) {

@@ -26,6 +26,7 @@ namespace process::win32k::user {
 
 // --- Windows.
 bool is_window(uint32_t hwnd);
+void set_window_menu(uint32_t hwnd, uint32_t menu);              // the menu of a top-level window (SetMenu); the caller changes the frame
 uint64_t window_thread(uint32_t hwnd);       // the thread that made the window (0 if there is no such window)
 uint64_t window_process(uint32_t hwnd);
 bool window_screen_rect(uint32_t hwnd, gdi::Rect* rect);        // GetWindowRect
@@ -94,6 +95,7 @@ bool is_menu(uint32_t handle);
 uint32_t window_input_context_raw(uint32_t hwnd);
 // The menu bar of a window changed (SetMenu) or a window went: the menu module drops what depended on the window. The window manager calls this when it destroys a window.
 void window_destroyed(uint32_t hwnd);
+bool attach_window_menu(uint32_t hwnd, uint32_t menu);                  // CreateWindowEx with a menu: the window owns it from now on (false: no such menu)
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // (the user-misc module's own declarations follow)

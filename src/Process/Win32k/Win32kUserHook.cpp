@@ -116,21 +116,36 @@ uint64_t hook_step(Call& call, Op& op) {
   return op.a[5] ? (op.first_result != 0) : op.first_result;      // CallMsgFilter answers a BOOL
 }
 
+// The handle (1 << 32) | (id + 1) stands for "the start of the chain of hooks with this id": user32 calls the hooks of an event (a message about to be returned, a window about to
+// be activated ...) in the thread with it.
 uint64_t nt_call_next_hook_ex(Call& call) {
   State& s = S();
-  Hook* current = s.hooks.find(call.arg32(0));
-  if (!current) return call.fail(kErrorInvalidHookHandle);
+  const bool head = (call.arg(0) >> 32) == 1;
+  Hook* current = head ? nullptr : s.hooks.find(call.arg32(0));
+  if (!head && !current) {      // (the handle is ignored by Windows: the hook procedure being run is the current one)
+    const uint64_t thread = thread_of(call);
+    const Upcall* running = nullptr;
+    for (const Upcall& u : s.upcalls) {
+      if (u.kind == kUpcallHook && u.state == Upcall::Delivered && u.thread == thread && (!running || u.id > running->id)) running = &u;
+    }
+    if (running) current = s.hooks.find(running->hwnd);
+  }
+  if (!head && !current) return call.fail(kErrorInvalidHookHandle);
   List<uint32_t> order(s.alloc);
-  chain(current->id, thread_of(call), call.pid(), order);
+  chain(head ? int32_t(call.arg32(0)) - 1 : current->id, thread_of(call), call.pid(), order);
   // the hook after `current` in the order
   uint32_t next = 0;
-  bool seen = false;
-  for (uint32_t h : order) {
-    if (seen) { next = h; break; }
-    if (h == current->handle) seen = true;
-  }
-  if (!seen) {      // the hook was removed while it ran, or belongs to another thread's chain: start from the ones older than it
-    for (uint32_t h : order) { Hook* x = s.hooks.find(h); if (x && x->seq < current->seq) { next = h; break; } }
+  if (head) {
+    if (order.count() != 0) next = order[0];
+  } else {
+    bool seen = false;
+    for (uint32_t h : order) {
+      if (seen) { next = h; break; }
+      if (h == current->handle) seen = true;
+    }
+    if (!seen) {      // the hook was removed while it ran, or belongs to another thread's chain: start from the ones older than it
+      for (uint32_t h : order) { Hook* x = s.hooks.find(h); if (x && x->seq < current->seq) { next = h; break; } }
+    }
   }
   if (next == 0) return 0;
   Hook* n = s.hooks.find(next);
