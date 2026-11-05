@@ -216,6 +216,7 @@ struct FakeGpu final : IRegisterBank {
       memcpy(&d, p, 4);
       dump.push_back(d);
       if (remaining) { --remaining; continue; }
+      if ((d & ~0x100u) == 0x68000000u) continue;   // MFX_WAIT: one dword
       if ((d >> 29) == 3) { remaining = (d & 0xFF) + 1; continue; }
       if ((d >> 23) == 0x26) { remaining = 3; continue; }
       if ((d >> 23) == 0x0A) {

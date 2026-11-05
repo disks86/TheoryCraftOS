@@ -184,7 +184,8 @@ bool IntelMpeg2Decoder::decode_picture(const mpeg2::OffloadPicture& picture) {
 
   DwordWriter w(buffers_.batch_words());
   emit_mi_flush(w);
-  emit_pipe_mode_select(w, kFormatMpeg2, /*post=*/false, /*pre=*/true);
+  if (b.gen11) emit_pipe_mode_select_gen11(w, kFormatMpeg2, /*post=*/false, /*pre=*/true);
+  else emit_pipe_mode_select(w, kFormatMpeg2, /*post=*/false, /*pre=*/true);
   emit_surface_state(w, width, height, buffers_.layout());
   emit_pipe_buf_addr_state(w, b);
   emit_bsp_buf_base_addr_state(w, b);

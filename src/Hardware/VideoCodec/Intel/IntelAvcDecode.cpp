@@ -118,7 +118,8 @@ AvcBatchError build_avc_decode_batch(const AvcPictureJob& job, ArrayView<uint32_
 
   DwordWriter w(out);
   emit_mi_flush(w);
-  emit_pipe_mode_select(w, buffers.deblocking_enabled, !buffers.deblocking_enabled);
+  if (buffers.gen11) emit_pipe_mode_select_gen11(w, kFormatAvc, buffers.deblocking_enabled, !buffers.deblocking_enabled);
+  else emit_pipe_mode_select(w, buffers.deblocking_enabled, !buffers.deblocking_enabled);
   emit_surface_state(w, picture.width_in_mbs * 16, picture.height_in_mbs * 16, layout);
   emit_pipe_buf_addr_state(w, buffers);
   emit_bsp_buf_base_addr_state(w, buffers);

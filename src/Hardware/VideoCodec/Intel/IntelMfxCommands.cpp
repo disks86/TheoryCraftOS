@@ -82,6 +82,14 @@ void emit_pipe_mode_select(DwordWriter& w, uint32_t format, bool post_deblocking
   zeros(w, 3);
 }
 
+void emit_mfx_wait_sync(DwordWriter& w) { w.emit(kHcpMfxWaitSync); }
+
+void emit_pipe_mode_select_gen11(DwordWriter& w, uint32_t format, bool post_deblocking_output, bool pre_deblocking_output) {
+  emit_mfx_wait_sync(w);
+  emit_pipe_mode_select(w, format, post_deblocking_output, pre_deblocking_output);
+  emit_mfx_wait_sync(w);
+}
+
 void emit_pipe_mode_select(DwordWriter& w, bool post_deblocking_output, bool pre_deblocking_output) {
   emit_pipe_mode_select(w, kFormatAvc, post_deblocking_output, pre_deblocking_output);
 }
@@ -298,7 +306,37 @@ void emit_vc1_bsd_object(DwordWriter& w, const Vc1BsdJob& job) {
 
 // --- HEVC
 
-HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2_ctb) {
+namespace {
+// The Ice Lake sizes (MhwVdboxHcpInterfaceG11::GetHevcBufferSize, 8-bit 4:2:0): row stores are counted per 16 samples of the picture whatever the coding tree block size, in
+// 64-byte lines, with a line count that grows with the block size.
+HevcBufferBytes hevc_buffer_bytes_gen11(uint32_t width, uint32_t height, uint32_t log2_ctb) {
+  constexpr uint64_t kLine = 64;
+  const uint32_t ctb = log2_ctb < 4 ? 4 : log2_ctb > 6 ? 6 : log2_ctb;
+  const uint64_t w16 = (uint64_t{width} + 15) / 16, h16 = (uint64_t{height} + 15) / 16;
+  const uint64_t base_units = uint64_t{1} << (ctb - 2);
+  const uint64_t dblk_row = (2 * base_units * 128 + 511) / 512;
+  const uint64_t dblk_col = (2 * base_units * 128 + 3 * 128 + 511) / 512;
+  const uint64_t meta = ctb == 6 ? 2 : 1;
+  static const uint64_t kSaoRow[3] = {2, 3, 5}, kSaoColumn[3] = {4, 5, 9};
+  HevcBufferBytes b;
+  b.deblocking_line = dblk_row * kLine * w16;
+  b.deblocking_tile_line = b.deblocking_line;
+  b.deblocking_tile_column = dblk_col * kLine * h16;
+  b.metadata_line = meta * kLine * w16;
+  b.metadata_tile_line = b.metadata_line;
+  b.metadata_tile_column = meta * kLine * h16;
+  b.sao_line = kSaoRow[ctb - 4] * kLine * w16;
+  b.sao_tile_line = b.sao_line;
+  b.sao_tile_column = kSaoColumn[ctb - 4] * kLine * h16;
+  const uint64_t mv_a = ((((uint64_t{width} + 63) >> 6) * ((uint64_t{height} + 15) >> 4)) + 1) & ~uint64_t{1};
+  const uint64_t mv_b = ((((uint64_t{width} + 31) >> 5) * ((uint64_t{height} + 31) >> 5)) + 1) & ~uint64_t{1};
+  b.motion_vector = (mv_a > mv_b ? mv_a : mv_b) * kLine;
+  return b;
+}
+}  // namespace
+
+HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2_ctb, bool gen11) {
+  if (gen11) return hevc_buffer_bytes_gen11(width, height, log2_ctb);
   const uint64_t ctb = uint64_t{1} << log2_ctb;
   const uint64_t w_ctbs = (width + ctb - 1) / ctb, h_ctbs = (height + ctb - 1) / ctb;
   HevcBufferBytes b;
@@ -316,18 +354,25 @@ HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2
   return b;
 }
 
-void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec) {
-  w.emit(kHcpPipeModeSelect | (6 - 2));                 // (the Kaby Lake layout: two more dwords than Skylake)
-  w.emit((codec << 5) | 0u);                            // decode, no status report
+void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec, bool gen11) {
+  if (gen11) emit_mfx_wait_sync(w);
+  w.emit(kHcpPipeModeSelect | (6 - 2));                 // (the Kaby Lake layout: two more dwords than Skylake; Ice Lake has the same six)
+  w.emit((codec << 5) | 0u);                            // decode, single pipe, no status report
   zeros(w, 2);
-  w.emit(codec == kHcpCodecVp9 ? 1u << 6 : 0u);
+  w.emit(!gen11 && codec == kHcpCodecVp9 ? 1u << 6 : 0u);   // (Gen9.5's VP9 mode switch ECO disable; no such bit on Gen11)
   w.emit(0);
+  if (gen11) emit_mfx_wait_sync(w);
 }
 
-void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id) {
-  w.emit(kHcpSurfaceState | (3 - 2));
+void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id, bool gen11) {
+  w.emit(kHcpSurfaceState | ((gen11 ? 4 : 3) - 2));
   w.emit((id << 28) | (layout.pitch - 1));
-  w.emit((kSurfacePlanar420 << 28) | layout.chroma_offset_rows);
+  if (gen11) {
+    w.emit((kSurfacePlanar420 << 27) | layout.chroma_offset_rows);   // the format field is five bits wide, from bit 27
+    w.emit(0xFFFF);                                      // default alpha (the media driver's value for 8-bit surfaces); the Cr offset is unused for NV12
+  } else {
+    w.emit((kSurfacePlanar420 << 28) | layout.chroma_offset_rows);
+  }
 }
 
 namespace {
@@ -339,7 +384,7 @@ void hcp_buffer(DwordWriter& w, uint64_t address, uint32_t mocs) {
 }  // namespace
 
 void emit_hevc_pipe_buf_addr_state(DwordWriter& w, const HevcBuffers& b) {
-  w.emit(kHcpPipeBufAddrState | (95 - 2));
+  w.emit(kHcpPipeBufAddrState | ((b.gen11 ? 121 : 95) - 2));
   hcp_buffer(w, b.current_picture, b.mocs);             // 1-3
   hcp_buffer(w, b.deblocking_line, b.mocs);             // 4-6
   hcp_buffer(w, b.deblocking_tile_line, b.mocs);
@@ -358,18 +403,20 @@ void emit_hevc_pipe_buf_addr_state(DwordWriter& w, const HevcBuffers& b) {
   for (uint32_t i = 0; i < kMaxHevcReferenceFrames; ++i) address_or_zero(w, b.motion_vector_references[i]);   // 66-81
   w.emit(0);                                            // 82
   for (uint32_t i = 0; i < 4; ++i) hcp_buffer(w, 0, b.mocs);   // 83-94, not used for HEVC
+  if (b.gen11) zeros(w, 26);                            // 95-120: the SAO stream-out, statistics, scalable-mode and encoder buffers, none used for single-pipe decoding
 }
 
-void emit_hcp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs) {
-  w.emit(kHcpIndObjBaseAddrState | (14 - 2));
+void emit_hcp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs, bool gen11) {
+  w.emit(kHcpIndObjBaseAddrState | ((gen11 ? 29 : 14) - 2));
   hcp_buffer(w, bitstream, mocs);                       // 1-3
   w.emit_address(bitstream + ((bitstream_bytes + 4095) & ~uint64_t{4095}));   // 4-5: the upper bound
   hcp_buffer(w, 0, mocs);                               // 6-8
   hcp_buffer(w, 0, mocs);                               // 9-11
   zeros(w, 2);                                          // 12-13
+  if (gen11) zeros(w, 15);                              // 14-28: the encoder's CU and probability buffers
 }
 
-void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b) { emit_hcp_ind_obj_base_addr_state(w, b.bitstream, b.bitstream_bytes, b.mocs); }
+void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b) { emit_hcp_ind_obj_base_addr_state(w, b.bitstream, b.bitstream_bytes, b.mocs, b.gen11); }
 
 namespace {
 void hevc_qm_state(DwordWriter& w, uint32_t size_id, uint32_t component, uint32_t pred_type, uint32_t dc, const uint8_t* matrix, uint32_t length) {
@@ -398,10 +445,11 @@ void emit_hevc_pic_state(DwordWriter& w, const HevcPicture& p) {
     min_pcm_minus3 = 0;
     max_pcm_minus3 = p.log2_ctb - 3 < 2 ? p.log2_ctb - 3 : 2;
   }
-  w.emit(kHcpPicState | (19 - 2));
+  w.emit(kHcpPicState | ((p.gen11 ? 38 : 19) - 2));
   w.emit(((p.height / min_cb - 1) << 16) | (p.width / min_cb - 1));
-  w.emit((max_pcm_minus3 << 10) | (min_pcm_minus3 << 8) | (p.log2_max_tb - 2) << 6 | (p.log2_min_tb - 2) << 4 | (p.log2_ctb - 3) << 2 | (p.log2_min_cb - 3));
-  w.emit(0);
+  w.emit((max_pcm_minus3 << 10) | (min_pcm_minus3 << 8) | (p.log2_max_tb - 2) << 6 | (p.log2_min_tb - 2) << 4 | (p.log2_ctb - 3) << 2 | (p.log2_min_cb - 3) |
+         (p.gen11 ? 1u << 29 : 0u));                    // Gen11: the chroma subsampling field (1: 4:2:0)
+  w.emit(p.gen11 ? 2u << 20 : 0u);                      // Gen11: log2 of the largest transform-skip block (2: 4x4, the default)
   w.emit((uint32_t{p.strong_intra_smoothing} << 26) | (uint32_t{p.transquant_bypass} << 25) | (uint32_t{p.amp} << 23) | (uint32_t{p.transform_skip} << 22) |
          (1u << 21) |                                   // (a frame: the bottom field flag is inverted)
          (uint32_t{p.weighted_pred} << 19) | (uint32_t{p.weighted_bipred} << 18) | (uint32_t{p.tiles} << 17) | (uint32_t{p.entropy_coding_sync} << 16) |
@@ -410,17 +458,18 @@ void emit_hevc_pic_state(DwordWriter& w, const HevcPicture& p) {
          (uint32_t{p.pcm} << 4) | (uint32_t{p.sao} << 3));
   w.emit((pcm_luma_minus1 << 20) | (pcm_chroma_minus1 << 16) | (p.max_transform_hierarchy_depth_inter << 13) | (p.max_transform_hierarchy_depth_intra << 10) |
          ((static_cast<uint32_t>(p.cr_qp_offset) & 0x1F) << 5) | (static_cast<uint32_t>(p.cb_qp_offset) & 0x1F));
-  zeros(w, 13);
+  zeros(w, p.gen11 ? 32 : 13);
 }
 
 void emit_hevc_tile_state(DwordWriter& w, const HevcPicture& p) {
   uint8_t cols[20] = {}, rows[24] = {};
   for (uint32_t i = 0; i < p.num_tile_columns && i < 19; ++i) cols[i + 1] = static_cast<uint8_t>(cols[i] + p.column_width[i]);
   for (uint32_t i = 0; i < p.num_tile_rows && i < 21; ++i) rows[i + 1] = static_cast<uint8_t>(rows[i] + p.row_height[i]);
-  w.emit(kHcpTileState | (13 - 2));
+  w.emit(kHcpTileState | ((p.gen11 ? 17 : 13) - 2));
   w.emit(((p.num_tile_columns - 1) << 5) | (p.num_tile_rows - 1));
   pack_bytes(w, ConstByteView(cols, 20), 5);
   pack_bytes(w, ConstByteView(rows, 24), 6);
+  if (p.gen11) zeros(w, 4);                             // the most significant bits of the tile positions (pictures wider than 256 coding tree blocks)
 }
 
 void emit_hevc_ref_idx_state(DwordWriter& w, uint32_t list, uint32_t count, const uint32_t entries[kMaxHevcRefIdx]) {
@@ -430,28 +479,29 @@ void emit_hevc_ref_idx_state(DwordWriter& w, uint32_t list, uint32_t count, cons
   for (uint32_t i = 0; i < 16; ++i) w.emit(i < n ? entries[i] : 0);
 }
 
-void emit_hevc_weightoffset_state(DwordWriter& w, uint32_t list, uint32_t count, const HevcWeights& t) {
+void emit_hevc_weightoffset_state(DwordWriter& w, uint32_t list, uint32_t count, const HevcWeights& t, bool gen11) {
   const uint32_t n = count < kMaxHevcRefIdx ? count : kMaxHevcRefIdx;
   auto b = [](int8_t v) { return static_cast<uint32_t>(static_cast<uint8_t>(v)); };
-  w.emit(kHcpWeightoffset | (34 - 2));
+  w.emit(kHcpWeightoffset | ((gen11 ? 42 : 34) - 2));
   w.emit(list);
   for (uint32_t i = 0; i < 16; ++i) w.emit(i < n ? (b(t.luma_offset[i]) << 8) | b(t.luma_weight[i]) : 0);
   for (uint32_t i = 0; i < 16; ++i)
     w.emit(i < n ? (b(t.chroma_offset[i][1]) << 24) | (b(t.chroma_weight[i][1]) << 16) | (b(t.chroma_offset[i][0]) << 8) | b(t.chroma_weight[i][0]) : 0);
+  if (gen11) zeros(w, 8);                               // the range extensions' wider offsets: unused with 8-bit video
 }
 
-void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s) {
-  w.emit(kHcpSliceState | (9 - 2));
+void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s, bool gen11) {
+  w.emit(kHcpSliceState | ((gen11 ? 11 : 9) - 2));
   w.emit((s.ver_pos << 16) | s.hor_pos);
   w.emit((s.next_ver_pos << 16) | s.next_hor_pos);
-  w.emit(((static_cast<uint32_t>(s.cr_qp_offset) & 0x1F) << 17) | ((static_cast<uint32_t>(s.cb_qp_offset) & 0x1F) << 12) | (static_cast<uint32_t>(s.qp) << 6) |
+  w.emit(((static_cast<uint32_t>(s.cr_qp_offset) & 0x1F) << 17) | ((static_cast<uint32_t>(s.cb_qp_offset) & 0x1F) << 12) | ((gen11 ? static_cast<uint32_t>(s.qp < 0 ? -s.qp : s.qp) & 0x3F : static_cast<uint32_t>(s.qp)) << 6) | (gen11 && s.qp < 0 ? 1u << 3 : 0u) |
          (uint32_t{s.temporal_mvp} << 5) | (uint32_t{s.dependent} << 4) | (uint32_t{s.last} << 2) | s.slice_type);
   w.emit((s.collocated_frame_store << 26) | ((s.max_merge_candidates - 1) << 23) | (uint32_t{s.cabac_init} << 22) | (s.luma_log2_weight_denom << 19) |
          ((s.chroma_log2_weight_denom & 7u) << 16) | (uint32_t{s.collocated_from_l0} << 15) | (uint32_t{s.low_delay} << 14) | (uint32_t{s.mvd_l1_zero} << 13) |
          (uint32_t{s.sao_luma} << 12) | (uint32_t{s.sao_chroma} << 11) | (uint32_t{s.loop_filter_across_slices} << 10) |
          ((static_cast<uint32_t>(s.beta_offset_div2) & 0xF) << 5) | ((static_cast<uint32_t>(s.tc_offset_div2) & 0xF) << 1) | uint32_t{s.deblocking_disabled});
   w.emit(s.header_bytes);
-  zeros(w, 3);
+  zeros(w, gen11 ? 5 : 3);
 }
 
 void emit_hevc_bsd_object(DwordWriter& w, const HevcSlice& s) {
@@ -481,7 +531,7 @@ Vp9BufferBytes vp9_buffer_bytes(uint32_t width, uint32_t height) {
 }
 
 void emit_vp9_pipe_buf_addr_state(DwordWriter& w, const Vp9Buffers& b) {
-  w.emit(kHcpPipeBufAddrState | (95 - 2));
+  w.emit(kHcpPipeBufAddrState | ((b.gen11 ? 121 : 95) - 2));
   hcp_buffer(w, b.current_picture, b.mocs);             // 1-3
   hcp_buffer(w, b.deblocking_line, b.mocs);             // 4-6
   hcp_buffer(w, b.deblocking_tile_line, b.mocs);
@@ -501,6 +551,7 @@ void emit_vp9_pipe_buf_addr_state(DwordWriter& w, const Vp9Buffers& b) {
   hcp_buffer(w, b.segment_id, b.mocs);                  // 86-88
   hcp_buffer(w, b.hvd_line, b.mocs);                    // 89-91
   hcp_buffer(w, b.hvd_tile, b.mocs);                    // 92-94
+  if (b.gen11) zeros(w, 26);                            // 95-120, as for HEVC
 }
 
 void emit_vp9_pic_state(DwordWriter& w, const Vp9Picture& p) {
@@ -531,9 +582,9 @@ void emit_vp9_pic_state(DwordWriter& w, const Vp9Picture& p) {
   w.emit(1u << 1);
 }
 
-void emit_vp9_segment_state(DwordWriter& w, const Vp9Segment& s, bool filter_enabled, bool intra_frame) {
+void emit_vp9_segment_state(DwordWriter& w, const Vp9Segment& s, bool filter_enabled, bool intra_frame, bool gen11) {
   const uint32_t reference = intra_frame ? 0 : s.reference;
-  w.emit(kHcpVp9SegmentState | (7 - 2));
+  w.emit(kHcpVp9SegmentState | ((gen11 ? 8 : 7) - 2));
   w.emit(s.id);
   w.emit((uint32_t{s.reference_enabled} << 3) | (reference << 1) | uint32_t{s.reference_skipped});
   if (filter_enabled) {
@@ -544,6 +595,7 @@ void emit_vp9_segment_state(DwordWriter& w, const Vp9Segment& s, bool filter_ena
   }
   w.emit((s.luma_ac << 16) | s.luma_dc);
   w.emit((s.chroma_ac << 16) | s.chroma_dc);
+  if (gen11) w.emit(0);                                 // the encoder's quantiser and loop filter deltas
 }
 
 void emit_vp9_bsd_object(DwordWriter& w, uint32_t data_size, uint32_t data_offset) {

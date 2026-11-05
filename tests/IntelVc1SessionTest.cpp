@@ -312,6 +312,7 @@ struct FakeDecoder {
       const uint32_t h = d[i];
       if (h == 0) { ++i; continue; }
       if ((h >> 23) == 0x0A) break;
+      if ((h & ~0x100u) == 0x68000000u) { ++i; continue; }   // MFX_WAIT (Ice Lake)
       if ((h >> 29) == 0) { i += (h & 0x3F) + 2; continue; }
       const size_t len = (h & 0xFF) + 2;
       if (i + len > d.size()) { problem("command runs past the batch"); return; }

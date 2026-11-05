@@ -182,6 +182,7 @@ static uint8_t pattern(long k, uint32_t i) { return uint8_t(k * 131 + i * 7 + 1)
 struct FakeDecoder {
   const Reference* reference = nullptr;
   bool check_content = true;
+  bool gen11 = false;   // Ice Lake: surface state 4 dwords, pipe buffer 121, indirect object 29, segment state 8
   std::map<uint64_t, long> painted;               // surface address -> the frame it last held
   std::map<long, uint64_t> address_of;            // frame -> the surface it was painted into
   std::map<long, std::pair<uint32_t, uint32_t>> size_of;
@@ -212,18 +213,19 @@ struct FakeDecoder {
       const uint32_t h = d[i];
       if (h == 0) { ++i; continue; }
       if ((h >> 23) == 0x0A) break;
+      if ((h & ~0x100u) == 0x68000000u) { ++i; continue; }   // MFX_WAIT (Ice Lake)
       if ((h >> 29) == 0) { i += (h & 0x3F) + 2; continue; }
       const size_t len = (h & 0xFF) + 2;
       if (i + len > d.size()) { problem("command runs past the batch"); return; }
       switch (h & 0xFFFF0000) {
         case kHcpPipeModeSelect: codec = (d[i + 1] >> 5) & 3; if (len != 6) problem("pipe mode select length"); break;
         case kHcpSurfaceState:
-          if (len != 3 || ((d[i + 2] >> 28) != 4)) problem("surface state");
+          if (len != (gen11 ? 4u : 3u) || ((d[i + 2] >> (gen11 ? 27 : 28)) != 4)) problem("surface state");
           surface_ids |= 1u << (d[i + 1] >> 28);
           pitch = (d[i + 1] & 0x1FFFF) + 1;
           break;
         case kHcpPipeBufAddrState:
-          if (len != 95) { problem("pipe buffer address length"); return; }
+          if (len != (gen11 ? 121u : 95u)) { problem("pipe buffer address length"); return; }
           cur = addr(d, i + 1);
           for (int k = 0; k < 6; ++k) lines[k] = addr(d, i + 4 + 3 * k);
           mv_cur = addr(d, i + 31);
@@ -235,9 +237,9 @@ struct FakeDecoder {
           for (int k = 22; k < 31; k += 3) if (addr(d, i + k)) problem("an SAO buffer in a VP9 batch");
           have_buf = true;
           break;
-        case kHcpIndObjBaseAddrState: bitstream = addr(d, i + 1); if (len != 14) problem("indirect object length"); break;
+        case kHcpIndObjBaseAddrState: bitstream = addr(d, i + 1); if (len != (gen11 ? 29u : 14u)) problem("indirect object length"); break;
         case kHcpVp9SegmentState: {
-          if (len != 7) { problem("segment state length"); return; }
+          if (len != (gen11 ? 8u : 7u)) { problem("segment state length"); return; }
           Segment s;
           for (int k = 0; k < 7; ++k) s.dw[k] = d[i + k];
           segments.push_back(s);
@@ -417,7 +419,10 @@ struct FakeDecoder {
 
 struct Rig2 : Rig {
   FakeDecoder engine;
-  Rig2() { gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
+  explicit Rig2(Generation g = Generation::Gen9) : Rig(g) {
+    engine.gen11 = g == Generation::Gen11;
+    gpu.on_batch = [this](FakeGpu& gp, const std::vector<uint32_t>& d) { engine.run(gp, d); };
+  }
 };
 
 static DecoderConfig i420_config() {
@@ -428,15 +433,15 @@ static DecoderConfig i420_config() {
 }
 
 // A stream the engine takes (`taken`) or one the CPU keeps whole.
-static void compare_stream(const char* name, bool taken) {
-  printf("  %s\n", name);
+static void compare_stream(const char* name, bool taken, Generation g = Generation::Gen9) {
+  printf("  %s%s\n", name, g == Generation::Gen11 ? " (Ice Lake)" : "");
   TestAllocator a;
   {
     Reference ref;
     CHECK(make_reference_file(a, name, &ref));
     if (ref.ends.empty()) return;
     printf("    %zu packets in, %zu frames decoded, %zu out\n", ref.ends.size(), ref.frames.size(), ref.out.pts.size());
-    Rig2 rig;
+    Rig2 rig(g);
     rig.engine.reference = &ref;
     {
       VcsDriver driver(rig.mem);
@@ -562,14 +567,16 @@ static void test_damaged_streams() {
 }
 
 // The device: VP9 sessions go to the engine, one at a time, everything else stays on the CPU.
-static void test_device() {
+static void test_device(Generation g = Generation::Gen9) {
+  const bool icl = g == Generation::Gen11;
+  printf("  device (%s)\n", icl ? "Ice Lake" : "Coffee Lake");
   TestAllocator a;
   Reference ref;
   CHECK(make_reference_file(a, "inter", &ref));
-  Rig2 rig;
+  Rig2 rig(g);
   rig.engine.reference = &ref;
   std::vector<uint32_t> regs(0x20000 / 4, 0);
-  regs[0x0D88 / 4] = 1;   // the video box answers the power request
+  regs[icl ? 0x0D50 / 4 : 0x0D88 / 4] = 1;   // the video box answers the power request
   const MmioRegion region(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4);
   IntelMediaVideoEngine::HardwareSetup setup;
   setup.registers = &rig.gpu;
@@ -577,7 +584,7 @@ static void test_device() {
   setup.ggtt_first_page = 100;
   setup.memory = &rig.mem;
   {
-    IntelMediaVideoEngine device(a, 0x3E92, region);   // Coffee Lake
+    IntelMediaVideoEngine device(a, icl ? 0x8A52 : 0x3E92, region);   // Ice Lake / Coffee Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
     CHECK(device.hardware_decode() && (device.info().accelerated_decode_codecs & codec_mask(VideoCodec::Vp9)));
@@ -611,13 +618,14 @@ int main() {
   // Streams the CPU keeps: 10- and 12-bit, 4:2:2, 4:4:0, 4:4:4.
   static const char* const kept[] = {"10bit", "12bit_444", "422", "440", "444"};
   for (const char* name : taken)
-    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) compare_stream(name, true);
+    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) { compare_stream(name, true); compare_stream(name, true, Generation::Gen11); }
   if (!getenv("ONLY")) {
     for (const char* name : kept) compare_stream(name, false);
     test_lease();
     test_hang();
     test_damaged_streams();
     test_device();
+    test_device(Generation::Gen11);
   }
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

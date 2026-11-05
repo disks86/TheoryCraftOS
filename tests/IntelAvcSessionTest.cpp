@@ -131,6 +131,7 @@ struct FakeDecoder {
       const uint32_t h = d[i];
       if (h == 0) { ++i; continue; }
       if ((h >> 23) == 0x0A) break;
+      if ((h & ~0x100u) == 0x68000000u) { ++i; continue; }   // MFX_WAIT (Ice Lake)
       if ((h >> 29) == 0) { i += (h & 0x3F) + 2; continue; }
       const size_t len = (h & 0xFF) + 2;
       if (i + len > d.size()) { problem("command runs past the batch"); return; }
@@ -644,7 +645,8 @@ static void test_device() {
   CHECK(a.live == 0);
 }
 
-// Ice Lake: the same stream through the hardware path of a Gen11 engine. The commands are the Gen9 ones with two that grew; the codecs offered are the MFX ones.
+// Ice Lake: the same stream through the hardware path of a Gen11 engine. The MFX commands are the Gen9 ones with two that grew (and the pipe mode select is
+// wrapped in MFX_WAITs); the HCP codecs (H.265, VP9) are offered too and tested in their own session tests.
 static void test_device_gen11() {
   File file("tests/data/h264_bframes.h264");
   CHECK(file.data != nullptr);
@@ -664,8 +666,7 @@ static void test_device_gen11() {
     IntelMediaVideoEngine device(a, 0x8A52, region);   // Ice Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
-    CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1)));
-    CHECK(!(device.info().accelerated_decode_codecs & codec_mask(VideoCodec::Hevc)) && !(device.info().accelerated_decode_codecs & codec_mask(VideoCodec::Vp9)));
+    CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp9)));
     std::vector<int64_t> hw_pts;
     {
       UniquePointer<IVideoDecoder> hw = device.create_decoder(i420_config());
@@ -675,10 +676,6 @@ static void test_device_gen11() {
       drain(*hw, &hw_pts, nullptr, nullptr, nullptr);
       CHECK(hw_pts.size() == 14 && rig.engine.pictures == 14);
     }
-    // HEVC and VP9 are the CPU's on this generation (their commands are not written for it yet).
-    DecoderConfig hevc;
-    hevc.codec = VideoCodec::Hevc;
-    CHECK(device.create_decoder(hevc) != nullptr && rig.engine.pictures == 14);
   }
   CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
   CHECK(rig.gpu.regs[0x40E0] == 0x07 && rig.gpu.regs[0xC904] != 0);   // the Gen11 PAT and MOCS tables were programmed

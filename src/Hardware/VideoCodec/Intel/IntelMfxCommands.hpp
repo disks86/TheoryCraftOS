@@ -90,6 +90,10 @@ constexpr uint32_t kHcpVp9PicState = hcp_header(0x30);
 constexpr uint32_t kHcpVp9SegmentState = hcp_header(0x32);
 constexpr uint32_t kHcpCodecHevc = 0, kHcpCodecVp9 = 1;
 
+// MFX_WAIT: a single dword; with the sync flag the video pipeline stalls until the commands before it are done. Gen11 wants one before and after the pipe mode select of
+// the MFX and HCP pipelines (the media driver: "for gen 11, we need to add MFX wait for both KIN and VRT before and after").
+constexpr uint32_t kHcpMfxWait = 0x68000000, kHcpMfxWaitSync = kHcpMfxWait | (1u << 8);
+
 // MI commands for the video ring.
 constexpr uint32_t kMiNoop = 0;
 constexpr uint32_t kMiBatchBufferEnd = 0x0Au << 23;
@@ -176,6 +180,9 @@ void emit_mi_flush(DwordWriter& w);             // video pipeline cache invalida
 void emit_batch_end(DwordWriter& w);            // MI_BATCH_BUFFER_END, with an MI_NOOP in front when the count so far is even, so the batch ends on a quadword
 void emit_pipe_mode_select(DwordWriter& w, bool post_deblocking_output, bool pre_deblocking_output);   // (H.264)
 void emit_pipe_mode_select(DwordWriter& w, uint32_t format, bool post_deblocking_output, bool pre_deblocking_output);
+// The same on Gen11 (Ice Lake), where the command is bracketed by two synchronising MFX_WAITs.
+void emit_pipe_mode_select_gen11(DwordWriter& w, uint32_t format, bool post_deblocking_output, bool pre_deblocking_output);
+void emit_mfx_wait_sync(DwordWriter& w);   // MFX_WAIT with the sync flag
 void emit_surface_state(DwordWriter& w, uint32_t width, uint32_t height, const Nv12TiledLayout& layout);
 void emit_pipe_buf_addr_state(DwordWriter& w, const AvcBuffers& b);
 void emit_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint32_t mocs);
@@ -278,6 +285,7 @@ struct HevcPicture {
   uint32_t max_transform_hierarchy_depth_inter = 0, max_transform_hierarchy_depth_intra = 0;
   uint32_t num_tile_columns = 1, num_tile_rows = 1;
   uint32_t column_width[20] = {}, row_height[22] = {};     // in coding tree blocks (the last included)
+  bool gen11 = false;                                      // Ice Lake's longer picture and tile state commands
 };
 
 // Graphics addresses of what a picture uses (0: none). The line and column buffers the engine keeps state in are sized by hevc_buffer_bytes().
@@ -292,6 +300,7 @@ struct HevcBuffers {
   uint64_t bitstream = 0;
   uint64_t bitstream_bytes = 0;
   uint32_t mocs = 2;
+  bool gen11 = false;                                      // Ice Lake: the pipe buffer and indirect object commands are longer (see emit_hevc_pipe_buf_addr_state)
 };
 
 // The sizes of the buffers an 8-bit picture of `width` x `height` luma samples with coding tree blocks of 1 << log2_ctb needs (the reference driver's formulas).
@@ -301,7 +310,8 @@ struct HevcBufferBytes {
   uint64_t sao_line = 0, sao_tile_line = 0, sao_tile_column = 0;
   uint64_t motion_vector = 0;                              // per picture
 };
-HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2_ctb);
+// `gen11`: the sizes the Ice Lake engine needs (the media driver's GetHevcBufferSize for that generation: larger for 32 and 64 sample coding tree blocks).
+HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2_ctb, bool gen11 = false);
 
 // Scaling lists in the engine's terms: 4x4 (6 x 16), 8x8, 16x16, 32x32 (two: intra, inter) as raster-order bytes, and the DC values of the big ones.
 struct HevcScaling {
@@ -337,9 +347,11 @@ constexpr uint32_t hevc_ref_idx_entry(uint32_t frame_store, bool long_term, int3
   return (1u << 15) | (long_term ? 1u << 13 : 0u) | (frame_store << 8) | (static_cast<uint32_t>(d) & 0xFF);
 }
 
-void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec);
+// Gen11: bracketed by MFX_WAITs, and the VP9 mode switch ECO bit of Gen9.5 (dword 4, bit 6) is gone.
+void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec, bool gen11 = false);
 // `id` 0 is the picture being decoded; VP9 describes its three reference pictures as 2 to 4.
-void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id = 0);
+// Gen11: four dwords, and the surface format is a five-bit field one bit lower (NV12 is 4 << 27 there, 4 << 28 before).
+void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id = 0, bool gen11 = false);
 void emit_hevc_pipe_buf_addr_state(DwordWriter& w, const HevcBuffers& b);
 void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b);
 void emit_hevc_qm_states(DwordWriter& w, const HevcScaling& s);
@@ -347,8 +359,8 @@ void emit_hevc_pic_state(DwordWriter& w, const HevcPicture& p);
 void emit_hevc_tile_state(DwordWriter& w, const HevcPicture& p);
 // `entries` are hevc_ref_idx_entry() values; only the first min(count, 15) are used.
 void emit_hevc_ref_idx_state(DwordWriter& w, uint32_t list, uint32_t count, const uint32_t entries[kMaxHevcRefIdx]);
-void emit_hevc_weightoffset_state(DwordWriter& w, uint32_t list, uint32_t count, const HevcWeights& weights);
-void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s);
+void emit_hevc_weightoffset_state(DwordWriter& w, uint32_t list, uint32_t count, const HevcWeights& weights, bool gen11 = false);   // (Gen11: 42 dwords)
+void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s, bool gen11 = false);   // (Gen11: 11 dwords, the quantisation parameter's sign in its own bit)
 void emit_hevc_bsd_object(DwordWriter& w, const HevcSlice& s);
 
 // --- VP9 (the HCP pipeline, Gen9.5 layouts of the reference driver's gen9_mfd.c). Profile 0 only: 8-bit 4:2:0.
@@ -363,6 +375,7 @@ struct Vp9Buffers {
   uint64_t probability = 0, segment_id = 0, hvd_line = 0, hvd_tile = 0;
   uint64_t bitstream = 0, bitstream_bytes = 0;
   uint32_t mocs = 2;
+  bool gen11 = false;
 };
 
 struct Vp9BufferBytes {
@@ -401,9 +414,9 @@ struct Vp9Segment {
 };
 
 void emit_vp9_pipe_buf_addr_state(DwordWriter& w, const Vp9Buffers& b);
-void emit_hcp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs);
+void emit_hcp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs, bool gen11 = false);   // (Gen11: 29 dwords)
 void emit_vp9_pic_state(DwordWriter& w, const Vp9Picture& p);
-void emit_vp9_segment_state(DwordWriter& w, const Vp9Segment& s, bool filter_enabled, bool intra_frame);
+void emit_vp9_segment_state(DwordWriter& w, const Vp9Segment& s, bool filter_enabled, bool intra_frame, bool gen11 = false);   // (Gen11: 8 dwords)
 // The frame's compressed header and tiles: `data_size` bytes at `data_offset` of the bitstream buffer.
 void emit_vp9_bsd_object(DwordWriter& w, uint32_t data_size, uint32_t data_offset);
 
