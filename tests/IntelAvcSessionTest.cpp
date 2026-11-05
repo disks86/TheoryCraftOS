@@ -109,6 +109,7 @@ struct FakeDecoder {
   std::map<uint64_t, int> painted_poc;
   std::map<uint64_t, uint64_t> painted_dmv;
   int pictures = 0, problems = 0;
+  bool gen11 = false;   // Ice Lake: the pipe buffer command is 68 dwords and the H.264 bitstream object 7 (Gen9: 61 and 6)
 
   static uint64_t addr(const std::vector<uint32_t>& d, size_t at) { return (uint64_t{d[at + 1]} << 32) | d[at]; }
 
@@ -135,6 +136,7 @@ struct FakeDecoder {
       if (i + len > d.size()) { problem("command runs past the batch"); return; }
       switch (h & 0xFFFF0000) {
         case kMfxPipeBufAddrState:
+          if (len != (gen11 ? 68u : 61u)) problem("pipe buffer address command length");
           out_pre = addr(d, i + 1);
           out_post = addr(d, i + 4);
           for (int k = 0; k < 16; ++k) ref_pic[k] = addr(d, i + 19 + 2 * k);
@@ -165,6 +167,7 @@ struct FakeDecoder {
           pending.current_poc = cur_poc[0];
           break;
         case kMfdAvcBsdObject:
+          if (len != (gen11 ? 7u : 6u)) problem("bitstream object length");
           if (d[i + 1] != 0) {  // a real slice (the phantom slice has no data)
             for (int l = 0; l < 2; ++l) {
               for (int k = 0; k < pending.count[l]; ++k) {
@@ -215,7 +218,10 @@ struct FakeDecoder {
 struct Rig2 : Rig {
   FakeDecoder engine;
   AllocatorGpuMemory* unused = nullptr;
-  Rig2() { gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
+  explicit Rig2(Generation g = Generation::Gen9) : Rig(g) {
+    engine.gen11 = g == Generation::Gen11;
+    gpu.on_batch = [this](FakeGpu& gp, const std::vector<uint32_t>& d) { engine.run(gp, d); };
+  }
 };
 
 // The CPU decoder's view of a stream.
@@ -638,6 +644,47 @@ static void test_device() {
   CHECK(a.live == 0);
 }
 
+// Ice Lake: the same stream through the hardware path of a Gen11 engine. The commands are the Gen9 ones with two that grew; the codecs offered are the MFX ones.
+static void test_device_gen11() {
+  File file("tests/data/h264_bframes.h264");
+  CHECK(file.data != nullptr);
+  if (!file.data) return;
+  const std::vector<ConstByteView> aus = split(file.view());
+  TestAllocator a;
+  Rig2 rig(Generation::Gen11);
+  std::vector<uint32_t> regs(0x20000 / 4, 0);
+  regs[0x0D50 / 4] = 1;   // the first video box answers the power request
+  const MmioRegion region(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4);
+  IntelMediaVideoEngine::HardwareSetup setup;
+  setup.registers = &rig.gpu;
+  setup.ggtt_table = rig.config().ggtt_table;
+  setup.ggtt_first_page = 100;
+  setup.memory = &rig.mem;
+  {
+    IntelMediaVideoEngine device(a, 0x8A52, region);   // Ice Lake
+    device.set_hardware(setup);
+    CHECK(device.initialize());
+    CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1)));
+    CHECK(!(device.info().accelerated_decode_codecs & codec_mask(VideoCodec::Hevc)) && !(device.info().accelerated_decode_codecs & codec_mask(VideoCodec::Vp9)));
+    std::vector<int64_t> hw_pts;
+    {
+      UniquePointer<IVideoDecoder> hw = device.create_decoder(i420_config());
+      CHECK(hw != nullptr);
+      for (size_t i = 0; i < aus.size(); ++i) feed(*hw, aus[i], static_cast<int64_t>(i) * 1000, &hw_pts, nullptr, nullptr, nullptr);
+      hw->flush();
+      drain(*hw, &hw_pts, nullptr, nullptr, nullptr);
+      CHECK(hw_pts.size() == 14 && rig.engine.pictures == 14);
+    }
+    // HEVC and VP9 are the CPU's on this generation (their commands are not written for it yet).
+    DecoderConfig hevc;
+    hevc.codec = VideoCodec::Hevc;
+    CHECK(device.create_decoder(hevc) != nullptr && rig.engine.pictures == 14);
+  }
+  CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
+  CHECK(rig.gpu.regs[0x40E0] == 0x07 && rig.gpu.regs[0xC904] != 0);   // the Gen11 PAT and MOCS tables were programmed
+  CHECK(rig.mem.live() == 1 && a.live == 0);
+}
+
 // A GPU as the PCI bus and the mapper show it, with plain memory behind the BAR: the plumbing finds the registers and the global GTT, picks free entries, and (only when
 // asked to) starts the engine driver. Plain memory cannot play the engine, so this checks the setup, not the decoding.
 struct PlainGpuPci final : IPciBus {
@@ -716,6 +763,7 @@ int main() {
   test_resize();
   test_damaged_streams();
   test_device();
+  test_device_gen11();
   test_system();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("intel avc session tests passed\n");

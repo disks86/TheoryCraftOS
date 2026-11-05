@@ -35,6 +35,10 @@ static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
 #include "FakeIntelGpu.hpp"
+
+// The generation the simulated engine has: the tests run once as Skylake-to-Coffee-Lake (Gen9) and once as Ice Lake (Gen11), which takes the same MFX commands apart from the
+// length of the pipe buffer address command.
+static Generation g_generation = Generation::Gen9;
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/Intel/IntelVc1Session.hpp"
 #include "Hardware/VideoCodec/Software/Vc1.hpp"
@@ -320,6 +324,7 @@ struct FakeDecoder {
           surf_chroma = d[i + 4] & 0xFFFF;
           break;
         case kMfxPipeBufAddrState:
+          if (len != (g_generation == Generation::Gen11 ? 68u : 61u)) problem("pipe buffer address command length");
           out_pre = addr(d, i + 1);
           out_post = addr(d, i + 4);
           for (int k = 0; k < 16; ++k) refs[k] = addr(d, i + 19 + 2 * k);
@@ -509,7 +514,7 @@ struct FakeDecoder {
 
 struct Rig2 : Rig {
   FakeDecoder engine;
-  Rig2() { gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
+  Rig2() : Rig(g_generation) { gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
 };
 
 static DecoderConfig config_for(const Stream& s) {
@@ -714,11 +719,15 @@ static void test_device() {
 int main() {
   static const char* const streams[] = {"simple_intra", "sm_intra", "sm_intra_lf", "sm_intra_q", "sm_intra_nu", "adv_intra", "adv_intra_lf", "adv_intra_odd", "sp_ipp", "sm_ipp", "sm_ipp_q", "sm_ipp_nu",
                                         "sm_ipb", "sm_ipb_f", "adv_ipp", "adv_ipb", "adv_ipp_odd", "adv_skip"};
-  for (const char* name : streams)
-    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) compare_stream(name);
-  test_lease_and_config();
-  test_hang();
-  test_damaged_streams();
+  for (const Generation generation : {Generation::Gen9, Generation::Gen11}) {
+    g_generation = generation;
+    for (const char* name : streams)
+      if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) compare_stream(name);
+    test_lease_and_config();
+    test_hang();
+    test_damaged_streams();
+  }
+  g_generation = Generation::Gen9;   // (the device test names a Coffee Lake GPU)
   test_device();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

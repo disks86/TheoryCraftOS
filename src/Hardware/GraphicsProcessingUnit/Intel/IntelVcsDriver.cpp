@@ -149,7 +149,11 @@ bool VcsDriver::initialize(const Config& config) {
   };
 
   if (config.generation == Generation::Gen12) program_gen12_pat(regs);
+  else if (config.generation == Generation::Gen11) program_icl_pat(regs);
   else program_private_pat(regs, gen9_private_pat());
+  // The video engines' MOCS tables: the media commands select entry 1, "whatever the page table entry says". Gen9's video engines come out of reset with it; Gen11 programs
+  // every engine's table (init_mocs_table) and so does this (Gen11 only: Gen9's video path has always run on the reset values).
+  if (config.generation == Generation::Gen11) gen9::program_mocs(regs, gen9::kVideoMocsBase);
   if (render()) {
     // The render engine's tables and workarounds, as i915 sets them before it uses the engine. (Settings of the GPU, not of this driver's memory: they stay if
     // initialisation fails later, and are the same the next time.)
@@ -198,8 +202,10 @@ bool VcsDriver::initialize(const Config& config) {
   // The context image: registers, page directories, ring.
   const uint64_t directories[4] = {ppgtt_.page_directory_dma(0), ppgtt_.page_directory_dma(1), ppgtt_.page_directory_dma(2), ppgtt_.page_directory_dma(3)};
   const bool gen12 = config.generation == Generation::Gen12;
+  const bool gen11 = config.generation == Generation::Gen11;
   const bool image = gen12 ? lrc_init_gen12_xcs(context_state_, engine_base(), true) && lrc_set_pml4(context_state_, ppgtt_.root_dma())
-                           : (render() ? lrc_init_gen9_rcs(context_state_, engine_base(), true) : lrc_init_gen9_xcs(context_state_, engine_base(), true)) &&
+                           : (render() ? lrc_init_gen9_rcs(context_state_, engine_base(), true)
+                                       : gen11 ? lrc_init_gen11_xcs(context_state_, engine_base(), true) : lrc_init_gen9_xcs(context_state_, engine_base(), true)) &&
                                  lrc_set_page_directories(context_state_, directories);
   if (!image || !lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), 0, 0)) {
     fail_init();
@@ -210,7 +216,7 @@ bool VcsDriver::initialize(const Config& config) {
   memory_fence();
 
   // From here the engine knows our status page.
-  port_.configure(regs, engine_base(), status_dwords_, static_cast<uint32_t>(status_ggtt_), gen12 ? ExeclistPort::Mode::Elsq : ExeclistPort::Mode::Elsp);
+  port_.configure(regs, engine_base(), status_dwords_, static_cast<uint32_t>(status_ggtt_), gen12 ? ExeclistPort::Mode::Elsq : gen11 ? ExeclistPort::Mode::Elsq11 : ExeclistPort::Mode::Elsp);
   if (!port_.enable()) { fail_init(); release_wells(); return false; }
   release_wells();
   state_ = State::Ready;
@@ -385,9 +391,9 @@ VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
 
   lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), static_cast<uint32_t>(old_tail), static_cast<uint32_t>(new_tail));
   memory_fence();
-  const uint64_t descriptor = config_.generation == Generation::Gen12
-                                  ? lrc_descriptor_gen12(static_cast<uint32_t>(context_ggtt_), kContextId, 0, kVideoDecodeClass)
-                                  : lrc_descriptor(static_cast<uint32_t>(context_ggtt_), kContextId);
+  const uint64_t descriptor = config_.generation == Generation::Gen12   ? lrc_descriptor_gen12(static_cast<uint32_t>(context_ggtt_), kContextId, 0, kVideoDecodeClass)
+                              : config_.generation == Generation::Gen11 ? lrc_descriptor_gen11(static_cast<uint32_t>(context_ggtt_), kContextId, 0, kVideoDecodeClass)
+                                                                         : lrc_descriptor(static_cast<uint32_t>(context_ggtt_), kContextId);
   port_.submit(descriptor | kDescriptorForceRestore);
 
   bool marker = false, idle = false;

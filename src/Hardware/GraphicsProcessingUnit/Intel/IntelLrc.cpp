@@ -94,6 +94,14 @@ bool lrc_init_gen9(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_r
 }  // namespace
 
 bool lrc_init_gen9_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) { return lrc_init_gen9(state, mmio_base, inhibit_restore, false); }
+
+bool lrc_init_gen11_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) {
+  if (!lrc_init_gen9(state, mmio_base, inhibit_restore, false)) return false;
+  // init_common_regs(): the synchronous switch inhibit on, the restore inhibited for a context that has never run; below Gen11 the driver also clears the save inhibit and
+  // render-state bits, from Gen11 on it leaves them to the hardware.
+  state[kCtxContextControl] = masked_enable(kCtxCtrlInhibitSynCtxSwitch) | masked_disable(kCtxCtrlRestoreInhibit) | (inhibit_restore ? kCtxCtrlRestoreInhibit : 0u);
+  return true;
+}
 bool lrc_init_gen9_rcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) { return lrc_init_gen9(state, mmio_base, inhibit_restore, true); }
 
 namespace {

@@ -180,7 +180,7 @@ AvcBatchError build_avc_decode_batch(const AvcPictureJob& job, ArrayView<uint32_
       emit_avc_weightoffset_state(w, t, table);
     }
     emit_avc_slice_state(w, picture, s);
-    emit_avc_bsd_object(w, s);
+    emit_avc_bsd_object(w, s, buffers.gen11);
   }
   emit_batch_end(w);
   *dwords = w.count();

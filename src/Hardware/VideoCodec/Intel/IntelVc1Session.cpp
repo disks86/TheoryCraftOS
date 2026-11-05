@@ -185,6 +185,7 @@ bool IntelVc1Decoder::decode_picture(const vc1::OffloadPicture& picture) {
 
   // Buffers: the references (the engine's reference array repeats forward, backward, forward, backward...), the output and the scratch memory.
   AvcBuffers b;
+  b.gen11 = buffers_.gen11();
   const uint64_t refs[2] = {have_forward ? forward : 0, have_backward ? backward : (have_forward ? forward : 0)};
   for (uint32_t i = 0; i < kMaxAvcReferenceFrames; ++i) b.reference_pictures[i] = refs[i & 1];
   uint32_t intra_row = 0, deblock_row = 0, bsd_mpc = 0;

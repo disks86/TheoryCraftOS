@@ -87,6 +87,11 @@ void program_private_pat(IRegisterBank& registers, const PatTable& table) {
   registers.write32(kPrivatePatHigh, table.high);
 }
 
+void program_icl_pat(IRegisterBank& registers) {
+  const PatTable table = gen9_private_pat();
+  for (uint32_t i = 0; i < 8; ++i) registers.write32(kPrivatePatLow + 4 * i, ((i < 4 ? table.low : table.high) >> (8 * (i & 3))) & 0xFF);
+}
+
 void program_gen12_pat(IRegisterBank& registers) {
   constexpr uint32_t kUncached = 0, kWriteCombining = 1, kWriteThrough = 2, kWriteBack = 3;
   const uint32_t values[8] = {kWriteBack, kWriteCombining, kWriteThrough, kUncached, kWriteBack, kWriteBack, kWriteBack, kWriteBack};

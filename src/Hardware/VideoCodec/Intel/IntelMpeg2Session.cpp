@@ -117,6 +117,7 @@ bool IntelMpeg2Decoder::decode_picture(const mpeg2::OffloadPicture& picture) {
   // The reference array, as the reference driver builds it (mpeg2_set_reference_surfaces): two entries for the frame (top) references, two more for the bottom field
   // references when the picture may predict by field. An absent reference repeats the first.
   AvcBuffers b;
+  b.gen11 = buffers_.gen11();
   const bool second_field = picture.second_field && pic.structure != mpeg2::kFramePicture;
   uint64_t refs[4] = {0, 0, 0, 0};
   auto fill = [&](uint32_t base, bool current_for_bottom) {

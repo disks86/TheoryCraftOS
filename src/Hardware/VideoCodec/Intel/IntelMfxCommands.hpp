@@ -156,6 +156,9 @@ struct AvcBuffers {
   uint64_t bitplane_read = 0;              // VC-1: the bit plane buffer
   bool deblocking_enabled = true;          // some slice has the loop filter on: output goes through the post-deblocking path
   uint32_t mocs = 2;                       // memory object control state dword (Gen9: use the page table's cache setting)
+  // Gen11 (Ice Lake) layouts: the pipe buffer address command grew by three dwords (the slice size stream-out buffer, unused) and the H.264 bitstream object by one (the NAL
+  // type override, unused). Everything else the MFX engine takes is the same size and layout as on Gen9.
+  bool gen11 = false;
 };
 
 // The surface layout the engine wants: NV12, Y-tiled, pitch a multiple of 128 bytes, rows a multiple of 32. The chroma plane starts `chroma_offset_rows` rows below the luma.
@@ -191,7 +194,7 @@ constexpr uint8_t avc_ref_idx_entry(uint32_t frame_store_id, bool long_term) {
 // Weights and offsets of one list: 32 entries of luma weight, luma offset, Cb weight, Cb offset, Cr weight, Cr offset.
 void emit_avc_weightoffset_state(DwordWriter& w, uint32_t list, const int16_t table[kMaxAvcRefIdx * 6]);
 void emit_avc_slice_state(DwordWriter& w, const AvcPicture& p, const AvcSlice& s);
-void emit_avc_bsd_object(DwordWriter& w, const AvcSlice& s);
+void emit_avc_bsd_object(DwordWriter& w, const AvcSlice& s, bool gen11 = false);
 // A slice that covers macroblocks no real slice does (the picture's first slice does not start at 0): the engine needs it to fill the gap.
 void emit_avc_phantom_slice(DwordWriter& w, const AvcPicture& p, bool has_next, uint32_t next_first_mb);
 
