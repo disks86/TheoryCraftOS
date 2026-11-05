@@ -178,6 +178,9 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // The same as render(), as pixels: lays the page out for the display's width in CSS pixels (media().width) with `fonts` and builds what is painted into `out`.
   // `fonts` is for this thread's measuring: the painter uses a font set of its own.
   bool render_picture(PagePicture* out, font::FontSet& fonts);
+  // The fonts script geometry (offsetWidth, getBoundingClientRect, ...) is measured with. With them, reading the size of an element after the page changed lays
+  // the page out again first, as a browser does; without them (or before the first picture) a script sees the sizes of the last picture. Must outlive the page.
+  void set_layout_fonts(font::FontSet* fonts) { layout_fonts_ = fonts; }
   // Has the tree changed, or the display (set_media()), since the last render()?
   bool changed() const;
   // Did something visible change that is not in the tree (a canvas drawn on, a video frame)? Then the view only needs painting again.
@@ -515,6 +518,12 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   static constexpr uint64_t kMaxComputedStyles = 4096;
   Dictionary<uint32_t, BoxRect> geometry_;   // node serial -> its box on the page as the last picture laid it out
   bool geometry_ready_ = false;
+  font::FontSet* layout_fonts_ = nullptr;   // (set_layout_fonts)
+  uint64_t geometry_version_ = 0;           // the document version geometry_ was recorded for
+  uint64_t geometry_cost_us_ = 0;           // what the last layout for a script took, and when it ended: layouts for scripts are held to a fifth of the time
+  uint64_t geometry_done_us_ = 0;
+  bool geometry_busy_ = false;
+  void refresh_geometry();
   int32_t scroll_y_ = 0;
   void record_geometry(const layout::BoxTree& tree);
   uint32_t scroll_node_ = 0;   // an element scrollIntoView() was called on: its place is worked out when the page is drawn

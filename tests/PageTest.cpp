@@ -6235,6 +6235,30 @@ static void test_webrtc() {
     CHECK(log.find("denied NotAllowedError") != std::string::npos && log.find("state denied") != std::string::npos && log.find("tx 1 recvonly audio") != std::string::npos);
     CHECK(log.find("video NotSupportedError") != std::string::npos && log.find("[\"audio/PCMU\",\"audio/PCMA\"] null") != std::string::npos);
   }
+  {   // a script that measures an element it just added gets the size the page lays out now, not the last picture's (YouTube's grid sizes itself that way)
+    for (int with_fonts = 0; with_fonts < 2; ++with_fonts) {
+      FakeEnvironment env(a);
+      env.clock = 1700000000000ull;
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/page.html", media, true);
+      font::FontSet fonts(a);
+      fonts.add_bundled_fonts();
+      if (with_fonts) page.set_layout_fonts(&fonts);
+      page.load("<html><body><div id=first style='width:200px;height:30px'></div>"
+                "<script>setTimeout(function () {\n"
+                "  var d = document.createElement('div'); d.style.width = '123px'; d.style.height = '45px'; document.body.appendChild(d);\n"
+                "  console.log('measured ' + d.offsetWidth + 'x' + d.offsetHeight + ' ' + document.getElementById('first').offsetWidth);\n"
+                "}, 10);</script></body></html>");
+      PagePicture picture(a);
+      CHECK(page.render_picture(&picture, fonts));   // (the first picture: scripts can measure from now on)
+      for (int i = 0; i < 5; ++i) {
+        env.clock += 10;
+        page.run_due_timers(env.clock);
+      }
+      const std::string log(page.log().data(), page.log().size());
+      CHECK(with_fonts ? log.find("measured 123x45 200") != std::string::npos : log.find("measured 0x0 200") != std::string::npos);
+    }
+  }
   {   // the timing line of a page that fetched and ran nothing (the slowest file and script names are empty)
     FakeEnvironment env(a);
     MediaEnvironment media;
@@ -6354,6 +6378,9 @@ int main(int argc, char** argv) {
       media.width = 1280;
       media.height = 800;
       Page page(a, env, "https://app.example/", media, true);
+      font::FontSet probe_fonts(a);   // (what scripts measure with once the page has changed; the probe's pictures use their own)
+      probe_fonts.add_bundled_fonts();
+      page.set_layout_fonts(&probe_fonts);
       if (getenv("PROBE_MEMORY") || getenv("PROBE_BUDGET")) page.set_script_limits(static_cast<uint64_t>(getenv("PROBE_BUDGET") ? atof(getenv("PROBE_BUDGET")) : 8) * 1000000, static_cast<uint64_t>(getenv("PROBE_MEMORY") ? atof(getenv("PROBE_MEMORY")) : 48) * (1u << 20));   // (megainstructions, MiB)
       struct rusage r0, r1;
       getrusage(RUSAGE_SELF, &r0);
