@@ -148,6 +148,8 @@ static void wide_free(WCHAR *w, const char *original) { if (w && original && ((U
 /* ---- classes ------------------------------------------------------------------------------------------------------------------------------------------------------ */
 static LONG_PTR WINAPI builtin_proc(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 0); }
 
+EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index);
+
 /* ---- ANSI and Unicode ------------------------------------------------------------------------------------------------------------------------------------------------ *
  * The window manager only knows Unicode: every window is a Unicode window and the messages carry Unicode text. The A functions convert what they send (a_to_w) and a window procedure
  * registered with RegisterClassA / SetWindowLongA is held behind a thunk (one of a fixed set of functions, each bound to the program's procedure) that converts what it receives (w_to_a).
@@ -180,6 +182,17 @@ static char *narrow_of(const WCHAR *s) {
 static void narrow_free(char *a, const WCHAR *original) { if (a && original && ((ULONG_PTR)original >> 16) != 0) u32_free(a); }
 typedef struct { ULONG_PTR create_params, instance, menu, parent; int cy, cx, y, x; LONG style; const void *name, *cls; DWORD ex_style; } CreateStruct_;
 
+/* The messages of list and combo boxes that carry a string the caller gives (an owner-drawn box without strings takes the pointer as item data and is left alone). */
+static int a_string_in_message(HANDLE hwnd, UINT message) {
+  const int list = message == 0x0180 || message == 0x0181 || message == 0x018C || message == 0x018F || message == 0x01A2;      /* LB_ADDSTRING, INSERT, SELECTSTRING, FINDSTRING, FINDSTRINGEXACT */
+  const int combo = message == 0x0143 || message == 0x014A || message == 0x014D || message == 0x014C || message == 0x0158;      /* CB_ADDSTRING, INSERT, SELECTSTRING, FINDSTRING, FINDSTRINGEXACT */
+  if (!list && !combo) return 0;
+  const LONG style = GetWindowLongW(hwnd, -16);
+  if (list && (style & 0x30) && !(style & 0x40)) return 0;
+  if (combo && (style & 0x10 /* CBS_OWNERDRAWFIXED */ || style & 0x20) && !(style & 0x200 /* CBS_HASSTRINGS */)) return 0;
+  return 1;
+}
+
 /* A caller, W callee. */
 static LONG_PTR a_to_w(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
   LONG_PTR result;
@@ -209,6 +222,33 @@ static LONG_PTR a_to_w(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR
     result = fn(ctx, hwnd, message, wparam, (LONG_PTR)w);
     int bytes = 0;
     if (result > 0) bytes = WideCharToMultiByte(65001, 0, w, (int)result, (char *)lparam, (int)room, NULL, NULL);
+    u32_free(w);
+    return bytes;
+  }
+  if (a_string_in_message(hwnd, message) && lparam) {      /* list and combo box strings in */
+    WCHAR *w = wide_of((const char *)lparam);
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)w);
+    wide_free(w, (const char *)lparam);
+    return result;
+  }
+  if ((message == 0x0189 /* LB_GETTEXT */ || message == 0x0148 /* CB_GETLBTEXT */) && lparam) {
+    const LONG_PTR chars = fn(ctx, hwnd, message == 0x0189 ? 0x018A : 0x0149, wparam, 0);
+    if (chars < 0) return chars;
+    WCHAR *w = u32_alloc(((SIZE_T)chars + 2) * 2);
+    if (!w) return -1;
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)w);
+    int bytes = 0;
+    if (result >= 0) { bytes = WideCharToMultiByte(65001, 0, w, (int)result, (char *)lparam, 0x7FFFFFFF, NULL, NULL); ((char *)lparam)[bytes] = 0; }
+    u32_free(w);
+    return result < 0 ? result : bytes;
+  }
+  if (message == 0x018A /* LB_GETTEXTLEN */ || message == 0x0149 /* CB_GETLBTEXTLEN */) {
+    const LONG_PTR chars = fn(ctx, hwnd, message, wparam, 0);
+    if (chars <= 0) return chars;
+    WCHAR *w = u32_alloc(((SIZE_T)chars + 2) * 2);
+    if (!w) return chars;
+    const LONG_PTR got = fn(ctx, hwnd, message == 0x018A ? 0x0189 : 0x0148, wparam, (LONG_PTR)w);
+    const int bytes = got > 0 ? WideCharToMultiByte(65001, 0, w, (int)got, NULL, 0, NULL, NULL) : (int)chars;
     u32_free(w);
     return bytes;
   }
@@ -308,6 +348,8 @@ static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags
 /* (the controls below use these before they are defined) */
 #define BOOL_OF(x) (((x) & 0xFFFFFFFFu) != 0)
 EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd);
+EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect);
+EXPORT BOOL WINAPI SetWindowPos(HANDLE hwnd, HANDLE after, int x, int y, int cx, int cy, UINT flags);
 EXPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
 EXPORT SHORT WINAPI GetKeyState(int vk);
 EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index);
@@ -329,10 +371,11 @@ EXPORT int WINAPI GetWindowTextW(HANDLE hwnd, LPWSTR buffer, int count);
 EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
 #include "controls.inc"
 #include "scroll.inc"
+#include "listbox.inc"
 static void builtin_classes(void) {
   static volatile LONG done;
   static const struct { const WCHAR *name; UINT style; int wnd_extra; WNDPROC_ proc; } classes[] = {
-      {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 0, builtin_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 0, builtin_proc}, {L"MDIClient", 0, 0, builtin_proc},
+      {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 0, builtin_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 8, listbox_proc}, {L"MDIClient", 0, 0, builtin_proc},
       {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 0, builtin_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, builtin_proc},
       {L"#32771", 0x803, 0, builtin_proc}, {L"#32772", 0, 0, builtin_proc}, {L"IME", 0, 0, builtin_proc}, {L"SysLink", 0x8, 0, builtin_proc}, {L"tooltips_class32", 0x8, 0, builtin_proc}};
   if (__sync_lock_test_and_set(&done, 1)) return;
