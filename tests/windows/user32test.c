@@ -230,6 +230,46 @@ static void test_icons_and_carets(HINSTANCE instance) {
   UnregisterClassA("TcosCaretClass", instance);
 }
 
+static int g_scroll_codes[16], g_scroll_count;
+static LRESULT CALLBACK scroll_parent_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_VSCROLL && g_scroll_count < 16) g_scroll_codes[g_scroll_count++] = LOWORD(wparam);
+  return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+static void test_scroll_bars(HINSTANCE instance) {
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = scroll_parent_proc; wc.hInstance = instance; wc.lpszClassName = "TcosScrollParent";
+  RegisterClassA(&wc);
+  HWND parent = CreateWindowA("TcosScrollParent", "s", WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_VSCROLL, 0, 0, 200, 200, NULL, NULL, instance, NULL);
+  /* the bars of a window */
+  SCROLLINFO si = {sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS, 0, 100, 10, 30, 0};
+  CHECK(SetScrollInfo(parent, SB_VERT, &si, TRUE) == 30);
+  SCROLLINFO got = {sizeof got, SIF_ALL, 0, 0, 0, 0, 0};
+  CHECK(GetScrollInfo(parent, SB_VERT, &got) && got.nMin == 0 && got.nMax == 100 && got.nPage == 10 && got.nPos == 30);
+  CHECK(SetScrollPos(parent, SB_VERT, 500, TRUE) == 30 && GetScrollPos(parent, SB_VERT) == 91);      /* (the position stops at max - page + 1) */
+  int lo = -1, hi = -1;
+  CHECK(SetScrollRange(parent, SB_VERT, 5, 50, TRUE) && GetScrollRange(parent, SB_VERT, &lo, &hi) && lo == 5 && hi == 50);
+  /* a scroll bar control keeps its own state and reports to its parent */
+  HWND bar = CreateWindowA("scrollbar", "", WS_CHILD | WS_VISIBLE | SBS_VERT, 150, 0, 16, 100, parent, (HMENU)5, instance, NULL);
+  CHECK(bar != NULL);
+  SendMessageA(bar, SBM_SETRANGE, 0, 100);
+  CHECK(SendMessageA(bar, SBM_SETPOS, 40, TRUE) == 0 && SendMessageA(bar, SBM_GETPOS, 0, 0) == 40);
+  int a = -1, b = -1;
+  SendMessageA(bar, SBM_GETRANGE, (WPARAM)&a, (LPARAM)&b);
+  CHECK(a == 0 && b == 100);
+  CHECK(GetScrollPos(bar, SB_CTL) == 40);
+  SCROLLINFO ci = {sizeof ci, SIF_PAGE | SIF_POS, 0, 0, 20, 90, 0};
+  CHECK(SetScrollInfo(bar, SB_CTL, &ci, TRUE) == 81);      /* (page 20: the top is 100 - 19) */
+  g_scroll_count = 0;
+  SendMessageA(bar, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(8, 4));      /* the upper arrow */
+  SendMessageA(bar, WM_LBUTTONUP, 0, MAKELPARAM(8, 4));
+  CHECK(g_scroll_count == 2 && g_scroll_codes[0] == SB_LINEUP && g_scroll_codes[1] == SB_ENDSCROLL);
+  CHECK(EnableScrollBar(bar, SB_CTL, ESB_DISABLE_BOTH));
+  CHECK(DestroyWindow(parent));
+  UnregisterClassA("TcosScrollParent", instance);
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -357,6 +397,7 @@ int main(void) {
 
   test_controls(instance);
   test_icons_and_carets(instance);
+  test_scroll_bars(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

@@ -306,6 +306,8 @@ static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags
 /* The classes of the controls and the dialog: global classes whose procedure is the default one (the control behaviour of Windows is not done: a Button, Static or Edit window is a plain
  * window with its text, style and messages kept by the window manager). Made when the process first registers, creates or looks for a class. */
 /* (the controls below use these before they are defined) */
+#define BOOL_OF(x) (((x) & 0xFFFFFFFFu) != 0)
+EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd);
 EXPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
 EXPORT SHORT WINAPI GetKeyState(int vk);
 EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index);
@@ -326,11 +328,12 @@ EXPORT BOOL WINAPI IsWindowVisible(HANDLE hwnd);
 EXPORT int WINAPI GetWindowTextW(HANDLE hwnd, LPWSTR buffer, int count);
 EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
 #include "controls.inc"
+#include "scroll.inc"
 static void builtin_classes(void) {
   static volatile LONG done;
   static const struct { const WCHAR *name; UINT style; int wnd_extra; WNDPROC_ proc; } classes[] = {
       {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 0, builtin_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 0, builtin_proc}, {L"MDIClient", 0, 0, builtin_proc},
-      {L"ScrollBar", 0x8b, 0, builtin_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 0, builtin_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, builtin_proc},
+      {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 0, builtin_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, builtin_proc},
       {L"#32771", 0x803, 0, builtin_proc}, {L"#32772", 0, 0, builtin_proc}, {L"IME", 0, 0, builtin_proc}, {L"SysLink", 0x8, 0, builtin_proc}, {L"tooltips_class32", 0x8, 0, builtin_proc}};
   if (__sync_lock_test_and_set(&done, 1)) return;
   for (size_t_ i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
@@ -720,7 +723,6 @@ SVC NtUserAttachThreadInput(ULONG_PTR from, ULONG_PTR to, ULONG_PTR attach);
 SVC NtUserBuildHwndList(ULONG_PTR desktop, ULONG_PTR parent, ULONG_PTR children, ULONG_PTR non_immersive, ULONG_PTR thread, ULONG_PTR count, ULONG_PTR buffer, ULONG_PTR needed);
 
 EXPORT BOOL WINAPI IsWindow(HANDLE window);
-#define BOOL_OF(x) (((x) & 0xFFFFFFFFu) != 0)
 #define WS_MINIMIZE_ 0x20000000u
 #define WS_MAXIMIZE_ 0x01000000u
 EXPORT BOOL WINAPI GetWindowPlacement(HANDLE hwnd, void *placement) { return BOOL_OF(NtUserGetWindowPlacement((ULONG_PTR)hwnd, (ULONG_PTR)placement)); }
