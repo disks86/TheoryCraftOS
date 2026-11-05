@@ -75,7 +75,7 @@ void sleep_us(uint64_t us) {
   nanosleep(&ts, nullptr);
 }
 
-Thread* spawn(ThreadFunction fn, void* argument, const char* name, int32_t, int8_t, uint32_t) {
+Thread* spawn(ThreadFunction fn, void* argument, const char* name, int32_t, int8_t, uint32_t, int32_t) {
   auto* t = new HostThread{};
   t->base.entry = fn;
   t->base.argument = argument;

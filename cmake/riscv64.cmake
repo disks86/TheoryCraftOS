@@ -29,6 +29,7 @@ add_executable(BOOTRISCV64
   src/Arch/RiscV64/PageProtector.cpp
   src/Arch/RiscV64/PagingHost.cpp
   src/Kernel/ThreadScheduler.cpp
+  src/CPUScheduler/IoAffinity.cpp
   src/Kernel/Sync.cpp
   src/Kernel/Firmware.cpp
   src/Kernel/Delay.cpp

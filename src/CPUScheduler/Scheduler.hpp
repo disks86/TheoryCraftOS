@@ -28,7 +28,7 @@ namespace scheduling {
 
 // Default task scheduler. Once kernel::start() has been called every task runs in
 // its own kernel thread (preemptible, may block, may run on any core; high-
-// performance tasks prefer Performance cores, efficiency tasks Efficiency cores).
+// performance tasks prefer Performance cores, efficiency tasks Efficiency cores; a task submitted for a device runs near that device's interrupts).
 // Before that - or if a thread cannot be created - a task runs to completion on
 // the calling core. The two task queues are ring buffers drawn from the
 // allocator, so they grow on demand instead of rejecting work after a fixed
@@ -47,7 +47,7 @@ class Scheduler final : public ICPUScheduler {
 
   Scheduler(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& allocator);
 
-  bool submit(TaskFunction fn, void* context, TaskQueue queue = TaskQueue::HighPerformance) override;
+  bool submit(TaskFunction fn, void* context, TaskQueue queue = TaskQueue::HighPerformance, int32_t io_device = -1) override;
   bool run_next() override;
   uint64_t pending() const override;
 
@@ -60,6 +60,7 @@ class Scheduler final : public ICPUScheduler {
   struct Task {
     TaskFunction fn;
     void* context;
+    int32_t io_device;
   };
 
   struct Job;
