@@ -51,6 +51,131 @@ static BOOL CALLBACK count_windows(HWND hwnd, LPARAM param) { (void)hwnd; ++*(in
 
 static DWORD WINAPI sender(void *param) { return (DWORD)SendMessageA((HWND)param, WM_USER + 2, 10, 5); }
 
+
+/* ---- the controls ------------------------------------------------------------------------------------------------------------------------------------------------ */
+static int g_commands, g_last_code, g_last_id, g_colors_static, g_colors_btn, g_colors_edit;
+static LRESULT CALLBACK parent_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  switch (message) {
+    case WM_COMMAND: ++g_commands; g_last_id = LOWORD(wparam); g_last_code = HIWORD(wparam); return 0;
+    case WM_CTLCOLORSTATIC: ++g_colors_static; break;
+    case WM_CTLCOLORBTN: ++g_colors_btn; break;
+    case WM_CTLCOLOREDIT: ++g_colors_edit; break;
+  }
+  return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+static void test_controls(HINSTANCE instance) {
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = parent_proc; wc.hInstance = instance; wc.lpszClassName = "TcosParentClass";
+  CHECK(RegisterClassA(&wc));
+  HWND parent = CreateWindowExA(0, "TcosParentClass", "parent", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 300, 200, NULL, NULL, instance, NULL);
+  CHECK(parent != NULL);
+  char text[64];
+
+  /* Static: text, the etched types and notification styles */
+  HWND st = CreateWindowA("static", "Hello", WS_CHILD | WS_VISIBLE, 5, 5, 100, 20, parent, (HMENU)10, instance, NULL);
+  CHECK(st && GetWindowTextA(st, text, sizeof text) == 5 && !strcmp(text, "Hello"));
+  CHECK(SendMessageA(st, WM_GETDLGCODE, 0, 0) == DLGC_STATIC);
+  CHECK(SendMessageA(st, WM_NCHITTEST, 0, 0) == HTTRANSPARENT);
+  CHECK(SendMessageA(st, WM_SETFONT, 0xcafe, 0) == 0 && SendMessageA(st, WM_GETFONT, 0, 0) == 0xcafe);
+  CHECK(SendMessageA(st, STM_SETIMAGE, IMAGE_BITMAP, 0x1234) == 0 && SendMessageA(st, STM_GETIMAGE, IMAGE_BITMAP, 0) == 0x1234);
+  HWND etched = CreateWindowA("static", "", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 40, 100, 10, parent, (HMENU)11, instance, NULL);
+  RECT r;
+  CHECK(etched && GetWindowLongA(etched, GWL_EXSTYLE) == WS_EX_STATICEDGE && GetClientRect(etched, &r) && r.bottom == 0 && r.right > 0);
+  g_colors_static = 0;
+  UpdateWindow(parent);
+  InvalidateRect(st, NULL, FALSE);
+  UpdateWindow(st);
+  CHECK(g_colors_static >= 1);      /* the static control asked its parent for its colours while painting */
+
+  /* Button: click, check states, auto check box and radio group, notifications */
+  HWND push = CreateWindowA("button", "OK", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 5, 60, 60, 20, parent, (HMENU)20, instance, NULL);
+  CHECK(push && (SendMessageA(push, WM_GETDLGCODE, 0, 0) & DLGC_UNDEFPUSHBUTTON));
+  g_commands = 0;
+  SendMessageA(push, BM_CLICK, 0, 0);
+  CHECK(g_commands == 1 && g_last_id == 20 && g_last_code == BN_CLICKED);
+  CHECK(!(SendMessageA(push, BM_GETSTATE, 0, 0) & BST_PUSHED));
+  SendMessageA(push, BM_SETSTATE, TRUE, 0);
+  CHECK(SendMessageA(push, BM_GETSTATE, 0, 0) & BST_PUSHED);
+  SendMessageA(push, BM_SETSTATE, FALSE, 0);
+  HWND check = CreateWindowA("button", "Check", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 5, 90, 80, 20, parent, (HMENU)21, instance, NULL);
+  CHECK(SendMessageA(check, BM_GETCHECK, 0, 0) == BST_UNCHECKED);
+  SendMessageA(check, BM_CLICK, 0, 0);
+  CHECK(SendMessageA(check, BM_GETCHECK, 0, 0) == BST_CHECKED);
+  SendMessageA(check, BM_CLICK, 0, 0);
+  CHECK(SendMessageA(check, BM_GETCHECK, 0, 0) == BST_UNCHECKED);
+  SendMessageA(check, BM_SETCHECK, BST_INDETERMINATE, 0);
+  CHECK(SendMessageA(check, BM_GETCHECK, 0, 0) == BST_UNCHECKED);      /* (a two-state box has no third state) */
+  HWND tri = CreateWindowA("button", "Tri", WS_CHILD | WS_VISIBLE | BS_AUTO3STATE, 5, 110, 80, 20, parent, (HMENU)22, instance, NULL);
+  SendMessageA(tri, BM_SETCHECK, BST_INDETERMINATE, 0);
+  CHECK(SendMessageA(tri, BM_GETCHECK, 0, 0) == BST_INDETERMINATE);
+  HWND radio1 = CreateWindowA("button", "A", WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON, 100, 60, 50, 20, parent, (HMENU)30, instance, NULL);
+  HWND radio2 = CreateWindowA("button", "B", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 100, 80, 50, 20, parent, (HMENU)31, instance, NULL);
+  SendMessageA(radio1, BM_SETCHECK, BST_CHECKED, 0);
+  CHECK(GetWindowLongA(radio1, GWL_STYLE) & WS_TABSTOP);
+  SendMessageA(radio2, BM_CLICK, 0, 0);
+  CHECK(SendMessageA(radio2, BM_GETCHECK, 0, 0) == BST_CHECKED && SendMessageA(radio1, BM_GETCHECK, 0, 0) == BST_UNCHECKED);
+  CHECK(!(GetWindowLongA(radio1, GWL_STYLE) & WS_TABSTOP) && (GetWindowLongA(radio2, GWL_STYLE) & WS_TABSTOP));
+  g_colors_btn = 0;
+  InvalidateRect(push, NULL, FALSE);
+  UpdateWindow(push);
+  CHECK(g_colors_btn >= 1);
+
+  /* Edit: text, selection, replacement, limits, notifications, lines, key input */
+  HWND edit = CreateWindowA("edit", "abc", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 5, 140, 120, 20, parent, (HMENU)40, instance, NULL);
+  CHECK(edit && GetWindowTextA(edit, text, sizeof text) == 3 && !strcmp(text, "abc"));
+  CHECK(SendMessageA(edit, WM_GETTEXTLENGTH, 0, 0) == 3);
+  g_commands = 0;
+  SendMessageA(edit, EM_SETSEL, 1, 2);
+  DWORD a = 9, b = 9;
+  SendMessageA(edit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+  CHECK(a == 1 && b == 2);
+  SendMessageA(edit, EM_REPLACESEL, 0, (LPARAM)"XYZ");
+  CHECK(GetWindowTextA(edit, text, sizeof text) == 5 && !strcmp(text, "aXYZc"));
+  CHECK(g_commands == 2 && g_last_code == EN_CHANGE);      /* EN_UPDATE, EN_CHANGE */
+  SendMessageA(edit, EM_SETSEL, 5, 5);
+  g_commands = 0;
+  SendMessageA(edit, WM_CHAR, 'd', 0);
+  CHECK(GetWindowTextA(edit, text, sizeof text) == 6 && !strcmp(text, "aXYZcd") && g_commands == 2);
+  SendMessageA(edit, WM_CHAR, 8, 0);      /* backspace */
+  CHECK(GetWindowTextA(edit, text, sizeof text) == 5 && !strcmp(text, "aXYZc"));
+  SendMessageA(edit, EM_SETLIMITTEXT, 6, 0);
+  CHECK(SendMessageA(edit, EM_GETLIMITTEXT, 0, 0) == 6);
+  g_commands = 0;
+  SendMessageA(edit, EM_SETSEL, 5, 5);
+  SendMessageA(edit, EM_REPLACESEL, 0, (LPARAM)"12345");
+  CHECK(SendMessageA(edit, WM_GETTEXTLENGTH, 0, 0) == 6 && g_commands == 3);      /* EN_MAXTEXT, EN_UPDATE, EN_CHANGE */
+  CHECK(SendMessageA(edit, EM_GETMODIFY, 0, 0) == TRUE);
+  SendMessageA(edit, EM_SETMODIFY, FALSE, 0);
+  CHECK(SendMessageA(edit, EM_GETMODIFY, 0, 0) == FALSE);
+  SendMessageA(edit, EM_SETREADONLY, TRUE, 0);
+  SendMessageA(edit, WM_CHAR, 'q', 0);
+  CHECK(SendMessageA(edit, WM_GETTEXTLENGTH, 0, 0) == 6);
+  CHECK(GetWindowLongA(edit, GWL_STYLE) & ES_READONLY);
+  CHECK(SendMessageA(edit, WM_GETDLGCODE, 0, 0) == (DLGC_WANTCHARS | DLGC_HASSETSEL | DLGC_WANTARROWS));
+  HWND multi = CreateWindowA("edit", "one\r\ntwo\r\nthree", WS_CHILD | WS_VISIBLE | ES_MULTILINE, 130, 140, 100, 40, parent, (HMENU)41, instance, NULL);
+  CHECK(SendMessageA(multi, EM_GETLINECOUNT, 0, 0) == 3);
+  CHECK(SendMessageA(multi, EM_LINEINDEX, 1, 0) == 5 && SendMessageA(multi, EM_LINEINDEX, 2, 0) == 10 && SendMessageA(multi, EM_LINEINDEX, 3, 0) == -1);
+  CHECK(SendMessageA(multi, EM_LINELENGTH, 5, 0) == 3 && SendMessageA(multi, EM_LINEFROMCHAR, 12, 0) == 2);
+  char line[16] = {8, 0};
+  CHECK(SendMessageA(multi, EM_GETLINE, 2, (LPARAM)line) == 5 && !memcmp(line, "three", 5));
+  CHECK(SendMessageA(multi, WM_GETDLGCODE, 0, 0) & DLGC_WANTALLKEYS);
+  SendMessageA(multi, WM_SETTEXT, 0, (LPARAM)"x");
+  CHECK(SendMessageA(multi, EM_GETLINECOUNT, 0, 0) == 1);
+  SendMessageA(multi, EM_SETSEL, 1, 1);
+  SendMessageA(multi, WM_CHAR, '\r', 0);
+  SendMessageA(multi, WM_CHAR, 'y', 0);
+  CHECK(GetWindowTextA(multi, text, sizeof text) == 4 && !memcmp(text, "x\r\ny", 4) && SendMessageA(multi, EM_GETLINECOUNT, 0, 0) == 2);
+  g_colors_edit = 0;
+  InvalidateRect(edit, NULL, FALSE);
+  UpdateWindow(edit);
+  CHECK(g_colors_edit + g_colors_static >= 1);
+
+  CHECK(DestroyWindow(parent));
+  CHECK(!IsWindow(edit) && !IsWindow(push));
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -131,8 +256,8 @@ int main(void) {
   HWND child2 = CreateWindowExA(0, "TcosTestClass", "c2", WS_CHILD | WS_VISIBLE, 50, 6, 40, 30, hwnd, (HMENU)2, instance, NULL);
   CHECK(child1 && child2 && GetParent(child1) == hwnd && GetAncestor(child1, GA_ROOT) == hwnd && IsChild(hwnd, child2) && !IsChild(child1, child2));
   CHECK(GetWindowLongA(child2, GWL_ID) == 2);
-  CHECK(GetWindow(hwnd, GW_CHILD) == child2 && GetWindow(child2, GW_HWNDNEXT) == child1 && GetWindow(child1, GW_HWNDPREV) == child2);      /* (the newest child is on top) */
-  CHECK(GetTopWindow(hwnd) == child2);
+  CHECK(GetWindow(hwnd, GW_CHILD) == child1 && GetWindow(child1, GW_HWNDNEXT) == child2 && GetWindow(child2, GW_HWNDPREV) == child1);      /* (a new child goes below the others) */
+  CHECK(GetTopWindow(hwnd) == child1 && GetWindow(child2, GW_HWNDLAST) == child2);
   int count = 0;
   CHECK(EnumChildWindows(hwnd, count_windows, (LPARAM)&count) && count == 2);
   count = 0;
@@ -175,6 +300,8 @@ int main(void) {
   CHECK(DestroyWindow(child1));
   CHECK(UnregisterClassA("TcosTestClass", instance));
   CHECK(CreateWindowExA(0, "TcosTestClass", NULL, 0, 0, 0, 1, 1, NULL, NULL, instance, NULL) == NULL && GetLastError() == ERROR_CANNOT_FIND_WND_CLASS);
+
+  test_controls(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

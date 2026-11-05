@@ -320,9 +320,9 @@ void test_create_and_destroy() {
   const uint32_t g = t.create("Top", WS_CHILD | WS_VISIBLE, 1, 1, 10, 10, c1);
   CHECK(c1 && c2 && g);
   CHECK(t.parent_of(c1) == p && t.parent_of(g) == c1 && t.parent_of(p) == 0);
-  CHECK(t.get_window(p, 5) == c2);      // GW_CHILD: the newest child is the topmost
-  CHECK(t.get_window(c2, 2) == c1 && t.get_window(c1, 3) == c2);      // GW_HWNDNEXT / GW_HWNDPREV
-  CHECK(t.get_window(c1, 0) == c2 && t.get_window(c2, 1) == c1);      // FIRST / LAST
+  CHECK(t.get_window(p, 5) == c1);      // GW_CHILD: the first child is the topmost (a new child goes below the others)
+  CHECK(t.get_window(c1, 2) == c2 && t.get_window(c2, 3) == c1);      // GW_HWNDNEXT / GW_HWNDPREV
+  CHECK(t.get_window(c2, 0) == c1 && t.get_window(c1, 1) == c2);      // FIRST / LAST
   CHECK(t.svc32(N::NtUserCallHwndParam, {p, g, 19}) == 1 && t.svc32(N::NtUserCallHwndParam, {c1, c2, 19}) == 0);      // IsChild
   CHECK(t.svc32(N::NtUserGetAncestor, {g, 2}) == p && t.svc32(N::NtUserGetAncestor, {g, 1}) == c1);
   // screen coordinates of nested children
@@ -332,9 +332,9 @@ void test_create_and_destroy() {
   // FindWindowEx and the window list
   const uint64_t us = t.tmp(0x200), chars = t.tmp(0x240);
   prog.memory.put_unicode_string(us, chars, "Top");
-  CHECK(t.svc32(N::NtUserFindWindowEx, {p, 0, us, 0, 0}) == c2);
-  CHECK(t.svc32(N::NtUserFindWindowEx, {p, c2, us, 0, 0}) == c1);
-  CHECK(t.svc32(N::NtUserFindWindowEx, {p, c1, us, 0, 0}) == 0);
+  CHECK(t.svc32(N::NtUserFindWindowEx, {p, 0, us, 0, 0}) == c1);
+  CHECK(t.svc32(N::NtUserFindWindowEx, {p, c1, us, 0, 0}) == c2);
+  CHECK(t.svc32(N::NtUserFindWindowEx, {p, c2, us, 0, 0}) == 0);
   const uint64_t list = t.tmp(0x1000), size = t.tmp(0xFF0);
   CHECK(t.svc32(N::NtUserBuildHwndList, {0, p, 1, 0, 0, 2, list, size}) == 0xC0000023u && prog.memory.get32(size) == 3);      // all descendants: 3
   CHECK(t.svc32(N::NtUserBuildHwndList, {0, p, 1, 0, 0, 8, list, size}) == 0 && prog.memory.get32(size) == 3);

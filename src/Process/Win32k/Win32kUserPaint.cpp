@@ -227,6 +227,23 @@ void invalidate_window(Window* w, const Rect* r, bool erase) {
   paint_region_changed(w);
 }
 
+// The area of a window that is not clipped away from its children (no WS_CLIPCHILDREN) is also the children's: they are invalidated where they overlap it, so they are painted with the parent.
+void invalidate_children(Window* w, const Rect& area) {
+  if ((w->style & wn::WS_CLIPCHILDREN) || rect_empty(area)) return;
+  int32_t wx = 0, wy = 0;
+  client_origin(w, &wx, &wy);
+  for (Window* c = w->first_child; c; c = c->next) {
+    if (!(c->style & wn::WS_VISIBLE)) continue;
+    int32_t cx = 0, cy = 0;
+    client_origin(c, &cx, &cy);
+    const Rect inside = rect_offset(area, wx - cx, wy - cy);      // (the area in the child's client coordinates)
+    const Rect mine = rect_intersect(inside, Rect{0, 0, c->client.right - c->client.left, c->client.bottom - c->client.top});
+    if (rect_empty(mine)) continue;
+    invalidate_window(c, &mine, false);
+    invalidate_children(c, mine);
+  }
+}
+
 void validate_window(Window* w, const Rect* r) {
   if (!r) {
     w->update.clear();
@@ -275,6 +292,8 @@ uint64_t invalidate_impl(Call& call, bool is_rgn, bool validate) {
     } else {
       if (whole) invalidate_window(w, nullptr, erase);
       else { for (const Rect& r : rects) invalidate_window(w, &r, false); if (erase && w->update.count()) w->erase_pending = true; }
+      if (whole) invalidate_children(w, Rect{0, 0, w->client.right - w->client.left, w->client.bottom - w->client.top});
+      else for (const Rect& r : rects) invalidate_children(w, r);
     }
   };
   if (call.arg(0) == 0) {
@@ -539,11 +558,10 @@ uint64_t nt_redraw_window(Call& call) {
 uint64_t nt_update_window(Call& call) {
   Window* w = window_arg(call, 0);
   if (!w) return 0;
-  if (w->update.count() == 0 && !w->paint_pending) return 1;
   Op* op = op_begin(call, paint_all_step);
   if (!op) return call.fail(kErrorNotEnoughMemory);
   op->a[0] = w->handle;
-  op->a[1] = wn::RDW_UPDATENOW;
+  op->a[1] = wn::RDW_UPDATENOW | wn::RDW_ALLCHILDREN;      // (the window and its children that have something to paint)
   op->a[2] = 1;
   return op_continue(call, *op);
 }

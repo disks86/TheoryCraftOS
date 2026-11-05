@@ -245,6 +245,8 @@ uint64_t nt_create_window_ex(Call& call) {
     Window* after = nullptr;
     if (!(w->ex_style & wn::WS_EX_TOPMOST) && !(style & wn::WS_CHILD)) {
       for (Window* c = parent->first_child; c && (c->ex_style & wn::WS_EX_TOPMOST); c = c->next) after = c;
+    } else if ((style & wn::WS_CHILD) && !(style & wn::WS_MAXIMIZE)) {      // a new child goes below its siblings (the dialog order is the creation order); a maximized one goes on top
+      for (Window* c = parent->first_child; c; c = c->next) after = c;
     }
     link_window(w, parent, after, false);
   }

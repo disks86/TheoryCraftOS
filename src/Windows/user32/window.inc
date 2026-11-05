@@ -183,7 +183,7 @@ typedef struct { ULONG_PTR create_params, instance, menu, parent; int cy, cx, y,
 /* A caller, W callee. */
 static LONG_PTR a_to_w(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
   LONG_PTR result;
-  if (message == 0x000C /* WM_SETTEXT */ && lparam) {
+  if ((message == 0x000C /* WM_SETTEXT */ || message == 0x00C2 /* EM_REPLACESEL */) && lparam) {
     WCHAR *w = wide_of((const char *)lparam);
     result = fn(ctx, hwnd, message, wparam, (LONG_PTR)w);
     wide_free(w, (const char *)lparam);
@@ -201,6 +201,18 @@ static LONG_PTR a_to_w(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR
     u32_free(w);
     return bytes;
   }
+  if (message == 0x00C4 /* EM_GETLINE: the first word of the buffer is its size */ && lparam) {
+    const UINT room = *(WORD *)lparam;
+    WCHAR *w = u32_alloc(((SIZE_T)room + 1) * 2);
+    if (!w) return 0;
+    *(WORD *)w = (WORD)room;
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)w);
+    int bytes = 0;
+    if (result > 0) bytes = WideCharToMultiByte(65001, 0, w, (int)result, (char *)lparam, (int)room, NULL, NULL);
+    u32_free(w);
+    return bytes;
+  }
+  if (message == 0x00CC /* EM_SETPASSWORDCHAR */) wparam = char_to_wide(wparam);
   if (message == 0x000E /* WM_GETTEXTLENGTH */) {
     const LONG_PTR chars = fn(ctx, hwnd, message, 0, 0);
     if (chars <= 0) return chars;
@@ -293,14 +305,36 @@ static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags
 
 /* The classes of the controls and the dialog: global classes whose procedure is the default one (the control behaviour of Windows is not done: a Button, Static or Edit window is a plain
  * window with its text, style and messages kept by the window manager). Made when the process first registers, creates or looks for a class. */
+/* (the controls below use these before they are defined) */
+EXPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
+EXPORT SHORT WINAPI GetKeyState(int vk);
+EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index);
+EXPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value);
+EXPORT LONG_PTR WINAPI GetWindowLongPtrW(HANDLE hwnd, int index);
+EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value);
+EXPORT HANDLE WINAPI GetParent(HANDLE hwnd);
+EXPORT HANDLE WINAPI GetWindow(HANDLE hwnd, UINT relation);
+EXPORT HANDLE WINAPI GetFocus(void);
+EXPORT HANDLE WINAPI SetFocus(HANDLE hwnd);
+EXPORT HANDLE WINAPI SetCapture(HANDLE hwnd);
+EXPORT HANDLE WINAPI GetCapture(void);
+EXPORT BOOL WINAPI ReleaseCapture(void);
+EXPORT HANDLE WINAPI BeginPaint(HANDLE hwnd, void *paint);
+EXPORT BOOL WINAPI EndPaint(HANDLE hwnd, const void *paint);
+EXPORT BOOL WINAPI InvalidateRect(HANDLE hwnd, const void *rect, BOOL erase);
+EXPORT BOOL WINAPI IsWindowVisible(HANDLE hwnd);
+EXPORT int WINAPI GetWindowTextW(HANDLE hwnd, LPWSTR buffer, int count);
+EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
+#include "controls.inc"
 static void builtin_classes(void) {
   static volatile LONG done;
-  static const struct { const WCHAR *name; UINT style; int wnd_extra; } classes[] = {
-      {L"Button", 0x8b, 0}, {L"ComboBox", 0x8b, 0}, {L"Edit", 0x88, 0}, {L"ListBox", 0x88, 0}, {L"MDIClient", 0, 0}, {L"ScrollBar", 0x8b, 0}, {L"Static", 0x88, 0},
-      {L"ComboLBox", 0x808, 0}, {L"#32768", 0x20808, 0}, {L"#32770", 0x808, 30}, {L"#32771", 0x803, 0}, {L"#32772", 0, 0}, {L"IME", 0, 0}, {L"SysLink", 0x8, 0}, {L"tooltips_class32", 0x8, 0}};
+  static const struct { const WCHAR *name; UINT style; int wnd_extra; WNDPROC_ proc; } classes[] = {
+      {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 0, builtin_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 0, builtin_proc}, {L"MDIClient", 0, 0, builtin_proc},
+      {L"ScrollBar", 0x8b, 0, builtin_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 0, builtin_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, builtin_proc},
+      {L"#32771", 0x803, 0, builtin_proc}, {L"#32772", 0, 0, builtin_proc}, {L"IME", 0, 0, builtin_proc}, {L"SysLink", 0x8, 0, builtin_proc}, {L"tooltips_class32", 0x8, 0, builtin_proc}};
   if (__sync_lock_test_and_set(&done, 1)) return;
   for (size_t_ i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
-    WNDCLASSEX_ wc = {sizeof wc, 0x4000 /* CS_GLOBALCLASS */ | classes[i].style, builtin_proc, 0, classes[i].wnd_extra, GetModuleHandleW(L"user32.dll"), NULL, NULL, NULL, NULL, classes[i].name, NULL};
+    WNDCLASSEX_ wc = {sizeof wc, 0x4000 /* CS_GLOBALCLASS */ | classes[i].style, classes[i].proc, 0, classes[i].wnd_extra, GetModuleHandleW(L"user32.dll"), NULL, NULL, NULL, NULL, classes[i].name, NULL};
     register_class(&wc, classes[i].name, 0);
   }
 }
@@ -583,7 +617,7 @@ EXPORT LONG_PTR WINAPI CallWindowProcW(WNDPROC_ proc, HANDLE hwnd, UINT message,
 EXPORT LONG_PTR WINAPI CallWindowProcA(WNDPROC_ proc, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
   const int slot = thunk_slot(proc);
   if (slot >= 0) return g_ansi_procs[slot](hwnd, message, wparam, lparam);
-  if (proc == builtin_proc) return a_to_w(call_w_proc, (void *)proc, hwnd, message, wparam, lparam);
+  if (proc == builtin_proc || proc == static_proc || proc == button_proc || proc == edit_proc) return a_to_w(call_w_proc, (void *)proc, hwnd, message, wparam, lparam);
   return proc(hwnd, message, wparam, lparam);
 }
 static LONG_PTR send_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { (void)ctx; return (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_SEND_MESSAGE, 0); }

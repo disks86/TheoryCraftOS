@@ -86,8 +86,13 @@ DestroyWindow, Show/Move/SetWindowPos, parent/owner/tree functions, styles and l
 Peek/Get/Dispatch/Translate, SendMessageTimeout, SendNotifyMessage, DefWindowProc, CallWindowProc), timers, enumeration (BuildHwndList), placement, defer-window-pos, key and cursor state, the
 system metrics (NtUserCallOneParam). Calls follow Wine's `ntuser` interface (the codes of `NtUserCallHwnd` etc. are in the enums at the top of the file).
 
-* Classes: the controls' classes (Button, Static, Edit, ListBox, ComboBox, ScrollBar, #32770, MDIClient, ...) are registered on first use with the styles Windows has; their procedure is the default
-  window procedure (no control behaviour yet: a Button is a plain window with text and style).
+* Classes: the built-in classes (Button, Static, Edit, ListBox, ComboBox, ScrollBar, #32770, MDIClient, ...) are registered on first use with the styles Windows has. `controls.inc` has the
+  procedures of **Static**, **Button** (push, check, 3-state, radio with groups, group box; BM_* messages, WM_COMMAND notifications, WM_CTLCOLORBTN) and **Edit** (single and multi line text model,
+  selection, EM_* messages, WM_CHAR / key input, EN_* notifications, plain painting) over gdi32 (user32 imports gdi32; FillRect, FrameRect, DrawFocusRect are exports). A control's state block
+  is kept in the window's private data (NtUserCallHwndParam GetPrivateData/SetPrivateData) and the control reports to the parent it was created with. The other classes (ListBox, ComboBox,
+  ScrollBar, dialog, ...) still use the default window procedure.
+* Painting: InvalidateRect on a window without WS_CLIPCHILDREN also invalidates the children it covers, and UpdateWindow paints the window and its children (win32k). New child windows go below
+  their siblings (a maximized child on top), as in Windows.
 * ANSI: the window manager only knows Unicode; every window is a Unicode window. A functions convert what they send (`a_to_w`); a procedure given to RegisterClassA / SetWindowLongA is held behind
   one of 64 thunks (`ansi_wrap`) that converts what it receives (`w_to_a`); the A getters answer the program's own procedure. Converted: WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH, WM_CREATE /
   WM_NCCREATE, the character messages. `IsWindowUnicode` is "the procedure is not a thunk". Not done: Wine's WINPROC handles (GetWindowLongPtrA does not return a handle for an A procedure), the
