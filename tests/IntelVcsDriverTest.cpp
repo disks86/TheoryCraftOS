@@ -120,6 +120,12 @@ static void test_batch_validation() {
   CHECK(!ok({0x18800101u, 0, 0, end}));                        // MI_BATCH_BUFFER_START
   CHECK(!ok({(0x22u << 23) | 1u, 0x2000, 0, end}));            // MI_LOAD_REGISTER_IMM
   CHECK(!ok({(0x20u << 23) | 2u, 0, 0, 0, end}));              // MI_STORE_DWORD_IMM
+  // MI_STORE_REGISTER_MEM: only the bitstream byte count of the first video box (Gen9 and Gen11/Xe-LP addresses), into the context's own address space.
+  const uint32_t srm = (0x24u << 23) | 2u;
+  CHECK(ok({srm, 0x128A0, 0x1000, 0, end}) && ok({srm, 0x1C08A0, 0x1000, 0, end}));
+  CHECK(!ok({srm, 0x128A4, 0x1000, 0, end}) && !ok({srm, 0x2000, 0x1000, 0, end}));   // another register
+  CHECK(!ok({srm, 0x1C08A0, 0x1000, 1, end}));                  // an address above 4 GiB
+  CHECK(!ok({srm, 0x1C08A0, 0x1000, end}));                     // cut short
   CHECK(!ok({0x7B000003u, 0, 0, 0, 0, end}));                  // a command of another pipeline (3D)
   CHECK(!ok({0x60000003u, 0, 0, 0, 0, end}));                  // not the MFX pipeline
   std::vector<uint32_t> big(VcsDriver::kBatchBytes / 4 + 1, noop);

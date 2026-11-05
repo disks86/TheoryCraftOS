@@ -30,7 +30,7 @@
 
 namespace hardware {
 
-// An H.264 encoding session on the video engine of a Gen9.5 Intel GPU (Kaby Lake, Coffee Lake, Comet Lake) in VDEnc mode. Each picture is converted to limited-range NV12
+// An H.264 encoding session on the video engine of a Gen9.5 (Kaby Lake, Coffee Lake, Comet Lake), Gen11 (Ice Lake) or Gen12 (Xe-LP) Intel GPU in VDEnc mode. Each picture is converted to limited-range NV12
 // and tiled into the engine's source surface; one batch (IntelEncodeCommands) describes the picture, the headers to insert and the slice, and the engine searches, decides,
 // codes and reconstructs on its own. The access unit is read back from the bitstream buffer, its size from the register the batch stored.
 //
@@ -59,6 +59,9 @@ class IntelAvcVdencEncoder final : public IVideoEncoder {
   uint32_t quantiser() const { return qp_; }
 
  private:
+  intel_enc::EncodeGeneration generation() const {
+    return buffers_.gen12() ? intel_enc::EncodeGeneration::Gen12 : buffers_.gen11() ? intel_enc::EncodeGeneration::Gen11 : intel_enc::EncodeGeneration::Gen9;
+  }
   bool build_batch(bool idr, uint32_t frame_num, uint32_t* words);
 
   allocators::IAllocator& allocator_;

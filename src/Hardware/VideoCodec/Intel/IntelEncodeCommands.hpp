@@ -28,16 +28,22 @@ namespace intel_enc {
 using intel_mfx::DwordWriter;
 using intel_mfx::Nv12TiledLayout;
 
-// H.264 encoding on the Gen9.5 video box (Kaby Lake, Coffee Lake, Comet Lake) in its low-power VDEnc mode: the fixed-function engine searches the motion, decides the
+// H.264 encoding on the video box of Gen9.5 (Kaby Lake, Coffee Lake, Comet Lake), Gen11 (Ice Lake) and Gen12 (Xe-LP: Tiger Lake and later) in its low-power VDEnc mode: the fixed-function engine searches the motion, decides the
 // macroblock modes and entropy-codes the slice data itself; the driver describes the picture, the buffers and the rate (here a fixed quantiser) and inserts the headers.
 // The commands are the ones the Intel media driver's CodechalVdencAvcState::ExecutePictureLevel / ExecuteSliceLevel send for a constant-QP frame; their bit layouts are
 // generated from the driver's hardware command definitions (tools/gen_intel_encode_commands.py) and the cost tables from its tables (tools/gen_intel_vdenc_tables.py).
+// The MFX (PAK) side and the picture/slice state are the same on every generation; what changed is the size of four VDEnc commands (pipe mode select on Xe-LP, DS reference
+// surface, pipe buffer addresses and walker from Ice Lake), the VDEnc control state Xe-LP starts a picture with, MFX_WAIT around the MFX pipe mode select (Gen11 and later), and
+// where the frame's bitstream byte count register lives.
 
 constexpr uint32_t kMocs = 2;              // memory object control state: the page table's cache setting (index 1)
 constexpr uint32_t kMfxSurfaceRecon = 0, kMfxSurfaceSource = 4, kMfxSurfaceDownscaledRecon = 5;
 constexpr uint32_t kMaxQp = 51;
+
+enum class EncodeGeneration : uint8_t { Gen9, Gen11, Gen12 };
 // MFC_BITSTREAM_BYTECOUNT_FRAME of the first video box: the size of the access unit the PAK has written.
-constexpr uint32_t kBitstreamByteCountRegister = 0x128A0;
+constexpr uint32_t kBitstreamByteCountRegisterGen9 = 0x128A0, kBitstreamByteCountRegisterGen11 = 0x1C08A0;
+constexpr uint32_t bitstream_byte_count_register(EncodeGeneration g) { return g == EncodeGeneration::Gen9 ? kBitstreamByteCountRegisterGen9 : kBitstreamByteCountRegisterGen11; }
 
 // The surfaces: the picture in whole macroblocks and its 4x down-scaled copy (the VDEnc motion search runs on that), both Y-tiled NV12.
 struct AvcEncodeLayout {
@@ -66,6 +72,7 @@ struct AvcEncodeScratchSizes {
 AvcEncodeScratchSizes avc_encode_scratch_sizes(uint32_t width_mbs, uint32_t height_mbs);
 
 struct AvcEncodePicture {
+  EncodeGeneration generation = EncodeGeneration::Gen9;
   uint32_t width_mbs = 0, height_mbs = 0;
   bool p_picture = false;                       // P (one reference), else I
   int32_t qp = 26;                              // the slice quantiser (0 .. 51)
@@ -93,7 +100,7 @@ struct AvcHeaderInsert {
 // the last must be the slice header.
 bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<const AvcHeaderInsert> headers);
 // What follows the slice: wait for the pipeline, store the bitstream size, end the batch.
-void emit_avc_vdenc_finish(DwordWriter& w, const AvcEncodeBuffers& b);
+void emit_avc_vdenc_finish(DwordWriter& w, const AvcEncodeBuffers& b, EncodeGeneration generation = EncodeGeneration::Gen9);
 
 }  // namespace intel_enc
 }  // namespace hardware

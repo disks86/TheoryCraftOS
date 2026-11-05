@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The VDEnc H.264 encoder (IntelAvcVdencEncoder) against a simulated Gen9.5 GPU. The simulated engine reads the command batch the way the hardware would: it checks the order
+// The VDEnc H.264 encoder (IntelAvcVdencEncoder) against a simulated Gen9.5, Gen11 and Xe-LP GPU. The simulated engine reads the command batch the way the hardware would: it checks the order
 // and length of every command and the fields that matter (codec and mode, the surfaces, the addresses, the picture and slice state, the headers to insert), then "encodes" by
 // writing what a valid stream looks like: the headers it was told to insert, then slice data of I_PCM macroblocks read from the source surface (I pictures) or one skip run (P
 // pictures), with the emulation prevention bytes the engine adds. The CPU decoder decodes the result: the pictures it shows must be the source pictures (in limited range) and
@@ -54,6 +54,7 @@ namespace {
 // Header words of the commands (dword 0 without the length).
 constexpr uint32_t kHMfxPipeMode = 0x70000000, kHMfxSurface = 0x70010000, kHMfxPipeBuf = 0x70020000, kHMfxIndObj = 0x70030000, kHMfxBsp = 0x70040000, kHMfxQm = 0x70070000,
                    kHMfxFqm = 0x70080000, kHPakInsert = 0x70480000, kHAvcImg = 0x71000000, kHAvcSlice = 0x71030000, kHAvcRefIdx = 0x71040000;
+constexpr uint32_t kHMfxWait = 0x68000000, kHVdencControl = 0x708B0000;
 constexpr uint32_t kHVdencPipeMode = 0x70800000, kHVdencSrc = 0x70810000, kHVdencRef = 0x70820000, kHVdencDs = 0x70830000, kHVdencPipeBuf = 0x70840000, kHVdencImg = 0x70850000,
                    kHVdencConstQpt = 0x70860000, kHVdencWalker = 0x70870000, kHVdFlush = 0x77800000;
 
@@ -81,6 +82,7 @@ class Bits {
 };
 
 struct FakeEncoder {
+  Generation gen = Generation::Gen9;
   int pictures = 0, problems = 0, keyframes = 0;
   std::vector<uint32_t> sizes;
   void problem(const char* what) { printf("    encoder model: %s\n", what); ++problems; }
@@ -103,8 +105,20 @@ struct FakeEncoder {
     auto field = [](uint32_t v, uint32_t lo, uint32_t hi) { return (v >> lo) & ((1u << (hi - lo + 1)) - 1u); };
     while (i < d.size() && (d[i] == 0 || (d[i] >> 23) == 0x26)) i += d[i] == 0 ? 1 : 4;   // the leading flush
 
+    // The command sizes of the generation (Gen11 and Xe-LP grew four VDEnc commands; Xe-LP starts with the VDEnc control state, both wait for the MFX pipe around its mode).
+    const bool gen9 = gen == Generation::Gen9, gen12 = gen == Generation::Gen12;
+    const uint32_t vdenc_mode_dw = gen12 ? 6 : 2, vdenc_ds_dw = gen9 ? 6 : 10, vdenc_buf_dw = gen9 ? 37 : gen12 ? 71 : 62, walker_dw = gen9 ? 4 : gen12 ? 27 : 10;
+    auto expect_wait = [&](const char* name) {
+      if (i < d.size() && (d[i] & ~0x100u) == kHMfxWait && (d[i] & 0x100u)) ++i; else problem(name);
+    };
+    if (gen12) {
+      const uint32_t* control = expect(kHVdencControl, 2, "VDENC_CONTROL_STATE");
+      if (!control || field(control[1], 1, 1) != 1) problem("VDEnc initialisation");
+    }
+    if (!gen9) expect_wait("MFX_WAIT before the pipe mode");
     const uint32_t* mode = expect(kHMfxPipeMode, 5, "MFX_PIPE_MODE_SELECT");
     if (!mode) return;
+    if (!gen9) expect_wait("MFX_WAIT after the pipe mode");
     if (field(mode[1], 0, 3) != 2 || field(mode[1], 4, 4) != 1 || field(mode[1], 13, 13) != 1 || field(mode[1], 7, 7) != 1) problem("pipe mode: AVC, encode, VDEnc, scaled surface");
     const bool deblocking = field(mode[1], 9, 9) == 1 && field(mode[1], 8, 8) == 0;
     const uint32_t* s0 = expect(kHMfxSurface, 6, "recon surface");
@@ -124,11 +138,13 @@ struct FakeEncoder {
     const uint32_t* ind = expect(kHMfxIndObj, 26, "MFX_IND_OBJ_BASE_ADDR_STATE");
     const uint32_t* bsp = expect(kHMfxBsp, 10, "MFX_BSP_BUF_BASE_ADDR_STATE");
     if (!buf || !ind || !bsp) return;
-    const uint32_t* vmode = expect(kHVdencPipeMode, 2, "VDENC_PIPE_MODE_SELECT");
+    const uint32_t* vmode = expect(kHVdencPipeMode, vdenc_mode_dw, "VDENC_PIPE_MODE_SELECT");
+    if (gen12 && vmode && (field(vmode[1], 7, 7) != 1 || field(vmode[3], 24, 27) != 7)) problem("Xe-LP TLB prefetch of the source");
     expect(kHVdencSrc, 6, "VDENC_SRC_SURFACE_STATE");
     expect(kHVdencRef, 6, "VDENC_REF_SURFACE_STATE");
-    expect(kHVdencDs, 6, "VDENC_DS_REF_SURFACE_STATE");
-    const uint32_t* vbuf = expect(kHVdencPipeBuf, 37, "VDENC_PIPE_BUF_ADDR_STATE");
+    const uint32_t* ds_state = expect(kHVdencDs, vdenc_ds_dw, "VDENC_DS_REF_SURFACE_STATE");
+    if (ds_state && !gen9 && (ds_state[6] != 0 || ds_state[7] != 0 || ds_state[8] != 0 || ds_state[9] != 0)) problem("second DS surface unused");
+    const uint32_t* vbuf = expect(kHVdencPipeBuf, vdenc_buf_dw, "VDENC_PIPE_BUF_ADDR_STATE");
     const uint32_t* cqpt = expect(kHVdencConstQpt, 61, "VDENC_CONST_QPT_STATE");
     const uint32_t* img = expect(kHAvcImg, 21, "MFX_AVC_IMG_STATE");
     const uint32_t* vimg = expect(kHVdencImg, 35, "VDENC_IMG_STATE");
@@ -183,16 +199,18 @@ struct FakeEncoder {
       if (inserts[k].slice_header || inserts[k].last || inserts[k].emulation) problem("parameter set insert");
     if (inserts.size() != (p_picture ? 1u : 3u)) problem("number of header inserts");
 
-    const uint32_t* walker = expect(kHVdencWalker, 4, "VDENC_WALKER_STATE");
+    const uint32_t* walker = expect(kHVdencWalker, walker_dw, "VDENC_WALKER_STATE");
     const uint32_t* flush = expect(kHVdFlush, 2, "VD_PIPELINE_FLUSH");
     if (!walker || !flush) return;
     if (field(walker[2], 0, 9) != mbs_h) problem("walker extent");
+    if (!gen9 && field(walker[5], 0, 15) + 1 != width) problem("walker width");
+    if (!gen9) for (uint32_t k = 6; k < 10; ++k) if (walker[k] != 0) problem("walker tile offsets unused");   // (later Xe-LP dwords carry driver defaults)
     if (field(flush[1], 1, 1) != 1 || field(flush[1], 17, 17) != 1) problem("pipeline flush");
     while (i < d.size() && d[i] == 0) ++i;
     if (i >= d.size() || (d[i] >> 23) != 0x26) { problem("flush before the status store"); return; }
     i += 4;
     uint32_t status_address = 0;
-    if (i + 4 <= d.size() && (d[i] >> 23) == 0x24 && d[i + 1] == 0x128A0) { status_address = d[i + 2]; i += 4; } else { problem("MI_STORE_REGISTER_MEM of the bitstream byte count"); return; }
+    if (i + 4 <= d.size() && (d[i] >> 23) == 0x24 && d[i + 1] == (gen9 ? 0x128A0u : 0x1C08A0u)) { status_address = d[i + 2]; i += 4; } else { problem("MI_STORE_REGISTER_MEM of the bitstream byte count"); return; }
     while (i < d.size() && d[i] == 0) ++i;
     if (i >= d.size() || (d[i] >> 23) != 0x0A) problem("batch end");
 
@@ -288,7 +306,7 @@ struct FakeEncoder {
 
 struct Rig2 : Rig {
   FakeEncoder engine;
-  Rig2() { gpu.on_batch = [this](FakeGpu& gp, const std::vector<uint32_t>& d) { engine.run(gp, d); }; }
+  explicit Rig2(Generation g = Generation::Gen9) : Rig(g) { engine.gen = g; gpu.on_batch = [this](FakeGpu& gp, const std::vector<uint32_t>& d) { engine.run(gp, d); }; }
 };
 
 void make_i420(VideoFrameBuffer& f, uint32_t w, uint32_t h, uint32_t seed) {
@@ -308,9 +326,9 @@ uint8_t limited_luma(uint32_t v) { return static_cast<uint8_t>(16 + (v * 219 + 1
 uint8_t limited_chroma(int32_t c) { return static_cast<uint8_t>(128 + ((c - 128) * 224 + (c >= 128 ? 127 : -127)) / 255); }
 
 // Encodes `count` pictures through the session, decodes the packets on the CPU and compares.
-void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality) {
-  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u\n", w, h, count, interval, quality);
-  Rig2 rig;
+void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, Generation g = Generation::Gen9) {
+  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, g == Generation::Gen12 ? " (Xe-LP)" : g == Generation::Gen11 ? " (Ice Lake)" : "");
+  Rig2 rig(g);
   EncoderConfig cfg;
   cfg.codec = VideoCodec::H264;
   cfg.width = w;
@@ -462,11 +480,12 @@ void test_hang(TestAllocator& a) {
   CHECK(e.statistics().errors == 1 && e.statistics().frames == 0);
 }
 
-void test_device(TestAllocator& a) {
-  printf("  through the media engine\n");
-  Rig2 rig;
+void test_device(TestAllocator& a, Generation g = Generation::Gen9) {
+  const char* name = g == Generation::Gen12 ? "Tiger Lake" : g == Generation::Gen11 ? "Ice Lake" : "Coffee Lake";
+  printf("  through the media engine (%s)\n", name);
+  Rig2 rig(g);
   std::vector<uint32_t> regs(0x20000 / 4, 0);
-  regs[0x0D88 / 4] = 1;   // the video box answers the power request
+  regs[(g == Generation::Gen9 ? 0x0D88 : 0x0D50) / 4] = 1;   // the video box answers the power request
   const MmioRegion region(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4);
   IntelMediaVideoEngine::HardwareSetup setup;
   setup.registers = &rig.gpu;
@@ -474,7 +493,7 @@ void test_device(TestAllocator& a) {
   setup.ggtt_first_page = 100;
   setup.memory = &rig.mem;
   {
-    IntelMediaVideoEngine device(a, 0x3E92, region);   // Coffee Lake
+    IntelMediaVideoEngine device(a, g == Generation::Gen12 ? 0x9A49 : g == Generation::Gen11 ? 0x8A52 : 0x3E92, region);   // Tiger Lake / Ice Lake / Coffee Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
     CHECK(device.hardware_decode() && device.info().accelerated_encode_codecs == codec_mask(VideoCodec::H264));
@@ -508,13 +527,23 @@ void test_device(TestAllocator& a) {
   }
   CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
   CHECK(rig.mem.live() == 1);
-  // Another generation: the CPU.
-  {
-    Rig2 rig2;
-    IntelMediaVideoEngine tiger(a, 0x9A49, region);
-    tiger.set_hardware(setup);
-    CHECK(tiger.initialize() && tiger.info().accelerated_encode_codecs == 0);
-  }
+}
+
+// A Tiger Lake whose first video box does not answer (the Gen9 power request register is all this one has): the CPU encodes.
+void test_no_video_box(TestAllocator& a) {
+  printf("  a video box that does not answer\n");
+  Rig2 rig(Generation::Gen12);
+  std::vector<uint32_t> regs(0x20000 / 4, 0);
+  regs[0x0D88 / 4] = 1;
+  const MmioRegion region(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4);
+  IntelMediaVideoEngine::HardwareSetup setup;
+  setup.registers = &rig.gpu;
+  setup.ggtt_table = rig.config().ggtt_table;
+  setup.ggtt_first_page = 100;
+  setup.memory = &rig.mem;
+  IntelMediaVideoEngine tiger(a, 0x9A49, region);
+  tiger.set_hardware(setup);
+  CHECK(tiger.initialize() && tiger.info().accelerated_encode_codecs == 0);
 }
 
 }  // namespace
@@ -525,9 +554,17 @@ int main() {
   encode_and_check(a, 72, 40, 4, 2, 40);     // a size that is not a macroblock multiple: cropped
   encode_and_check(a, 32, 32, 3, 1, 100);    // every picture a keyframe
   encode_and_check(a, 96, 64, 6, 6, 1);
+  for (Generation g : {Generation::Gen11, Generation::Gen12}) {
+    encode_and_check(a, 64, 48, 5, 3, 75, g);
+    encode_and_check(a, 72, 40, 4, 2, 40, g);
+    encode_and_check(a, 96, 64, 6, 6, 1, g);
+  }
   test_rejections(a);
   test_hang(a);
   test_device(a);
+  test_device(a, Generation::Gen11);
+  test_device(a, Generation::Gen12);
+  test_no_video_box(a);
   CHECK(a.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

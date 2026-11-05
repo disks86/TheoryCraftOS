@@ -95,6 +95,7 @@ bool IntelAvcVdencEncoder::build_batch(bool idr, uint32_t frame_num, uint32_t* w
   b.reference_ds4 = ds1;
 
   AvcEncodePicture p;
+  p.generation = generation();
   p.width_mbs = width_mbs_;
   p.height_mbs = height_mbs_;
   p.p_picture = !idr;
@@ -138,7 +139,7 @@ bool IntelAvcVdencEncoder::build_batch(bool idr, uint32_t frame_num, uint32_t* w
   intel_mfx::emit_mi_flush(w);
   emit_avc_vdenc_picture(w, p, b, layout_);
   if (!emit_avc_vdenc_slice(w, p, ArrayView<const AvcHeaderInsert>(inserts, count))) return false;
-  emit_avc_vdenc_finish(w, b);
+  emit_avc_vdenc_finish(w, b, p.generation);
   if (!w.ok()) return false;
   *words = static_cast<uint32_t>(w.count());
   return true;
