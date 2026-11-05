@@ -18,78 +18,87 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Allocators/PageFrameAllocator.hpp"
 #include "Hardware/RandomAccessMemory/IRandomAccessMemory.hpp"
 
 namespace allocators {
 
-// Default allocator: memory pools that carve RAM regions into blocks of one
-// cache line. Every allocation is a run of blocks preceded by a one-block
-// header, so returned pointers are cache-line aligned. Free runs are kept
-// address-ordered and coalesced on deallocate.
+// Default allocator, lock-free and safe from every core, thread and interrupt handler at once (no ThreadSafeAllocator needed).
 //
-// There are two pools: the low one (below 4 GiB, where initialize() puts the
-// RAM's main region) and the high one (add_region() puts everything at or above
-// 4 GiB there). allocate() and allocate_aligned() take from the high pool first,
-// so that the scarce low memory stays for what devices can only reach there;
-// allocate_dma() takes from the low pool only.
+// Memory comes from a PageFrameAllocator (LLFree): RAM is managed in 4 KiB frames, in a low pool (below 4 GiB, where initialize() puts
+// the RAM's main region) and a high one (add_region() puts everything at or above 4 GiB there). allocate() and allocate_aligned() take
+// from the high pool first, so that the scarce low memory stays for what devices can only reach there; allocate_dma() takes from the low
+// pool only.
 //
-// Small blocks (up to kSmallBlocks blocks with the header) skip the address-ordered list: each pool keeps a
-// stack of free blocks per size, so allocating and freeing one is a push or a pop, however fragmented the
-// pool is. A script engine makes millions of such blocks; walking the list for each was minutes of work.
-// An empty stack is refilled with a slab cut from the list, and when the list cannot satisfy a request the
-// stacks are emptied back into it (coalescing) and the request is tried again, so nothing stays stranded.
+//  - Requests up to kMaxSmall bytes come from size classes (32 bytes to 16 KiB). Each class carves spans of a few frames into objects;
+//    free objects sit on lists ("magazines"). Every core has one magazine per class, which a caller takes with one atomic exchange,
+//    uses privately and puts back with one compare-and-swap; a full or missing magazine goes to or comes from a small per-class depot of
+//    exchange slots. Exchanges hand out exclusive ownership, so there is no ABA problem and no lock, and a thread preempted (or an
+//    interrupt handler run) in the middle only makes the next caller on that core use the depot.
+//  - Larger requests, and those aligned to more than a frame, are whole frames from the frame allocator.
+// Every frame has a tag word (kept by the frame allocator) saying whether it heads a large allocation (and how many frames it has) or
+// belongs to a span (and where its header is), so allocations need no header: the memory is all payload, and page-aligned requests
+// cost one page.
+//
+// Spans whose objects are all free go back to the frame allocator when trim() runs, or by themselves when a request finds no memory.
+// Objects keep their natural alignment: a size that is a multiple of 2^k gets an address that is a multiple of min(2^k, 64), and
+// allocate_aligned() picks a class whose objects are multiples of the alignment (up to 4 KiB; beyond that it uses frames).
 class Allocator final : public IAllocator {
  public:
-  static constexpr uint64_t kBlockSize = 64;  // x86_64 cache line
+  static constexpr uint64_t kLowLimit = PageFrameAllocator::kLowLimit;  // what DMA-capable memory must stay below
+  static constexpr uint64_t kMaxSmall = 16 * 1024;                       // the largest request served from a size class
+  static constexpr uint32_t kClassCount = 35;
 
   explicit constexpr Allocator(hardware::IRandomAccessMemory& ram) : ram_(ram) {}
 
-  static constexpr uint64_t kLowLimit = 1ull << 32;  // what DMA-capable memory must stay below
-
   // Claims the RAM's usable region. Returns false if it is too small.
   bool initialize();
-  // Adds more memory (page-aligned, writable, mapped 1:1 and not used by anything else). A region that
-  // crosses 4 GiB is split there. False if it is too small to be worth a pool entry.
+  // Adds more memory (page-aligned, writable, mapped 1:1 and not used by anything else). A region that crosses 4 GiB is split there.
+  // False if it is too small to be worth an area.
   bool add_region(void* base, uint64_t bytes);
+  // Where the current core number comes from (kernel::current_core once the kernel runs): it picks the per-core magazines and the frame
+  // allocator's reservations. Without it every caller shares the first core's (still correct, only slower under contention).
+  void set_core_source(uint32_t (*core)());
 
   void* allocate(uint64_t size) override;
   void* allocate_aligned(uint64_t size, uint64_t alignment) override;
   void* allocate_dma(uint64_t size, uint64_t alignment) override;
   void deallocate(void* ptr) override;
 
-  // Returns the blocks held on the size stacks to the coalescing lists, so free_bytes() counts the memory as one run
-  // again (a leak check compares it before and after: call this before each reading). Costs a list walk per block.
-  void trim() { flush_small(); }
+  // Gives the frames of spans whose objects are all free back to the frame allocator, so free_bytes() counts them again (a leak check
+  // compares it before and after: call this before each reading). Walks every cached free object; one caller at a time does the work,
+  // a second returns at once.
+  void trim() { reclaim(); }
 
-  uint64_t total_bytes() const { return total_bytes_; }  // everything handed to the pools (headers included)
-  uint64_t free_bytes() const;       // payload bytes still available in both pools (sum over runs)
-  uint64_t free_bytes_low() const;   // ... in the pool below 4 GiB
-  uint64_t free_bytes_high() const;  // ... in the pool above
+  uint64_t total_bytes() const { return frames_.total_bytes(); }  // everything handed to the pools (metadata included)
+  uint64_t free_bytes() const { return frames_.free_bytes(); }    // free frames in both pools (objects cached in spans count as used)
+  uint64_t free_bytes_low() const { return frames_.free_bytes_low(); }    // ... in the pool below 4 GiB
+  uint64_t free_bytes_high() const { return frames_.free_bytes_high(); }  // ... in the pool above
+
+  PageFrameAllocator& frames() { return frames_; }
 
  private:
-  struct Header;
+  struct Span;
+  struct FreeObject;
+  struct Caches;
 
-  static constexpr uint64_t kSmallBlocks = 33;      // blocks (header included) of the largest size kept on a stack: 2 KiB of payload
-  static constexpr uint64_t kSlabBytes = 32 * 1024;  // what one refill cuts from the list, per size
-
-  void* allocate_small(int pool, Header** list, uint64_t size);
-  void* allocate_general(int pool, Header** list, uint64_t size);
-  void insert_free(Header* h);   // puts a free run on its pool's address-ordered list, merging with neighbours
-  void flush_small();            // moves every stacked block back to the lists
-  static int pool_of(const void* address) { return reinterpret_cast<uint64_t>(address) >= kLowLimit ? 1 : 0; }
-
-  void* allocate_from(Header** list, uint64_t size);
-  void* allocate_aligned_from(Header** list, uint64_t size, uint64_t alignment);
-  static uint64_t free_bytes_of(const Header* list);
-  void add_run(uint64_t start, uint64_t end);
-  Header** list_for(const void* address) { return reinterpret_cast<uint64_t>(address) >= kLowLimit ? &free_high_ : &free_low_; }
+  void* allocate_small(uint32_t cls, bool dma);
+  void* allocate_frames(uint64_t size, uint64_t alignment, bool dma);
+  void* allocate_with_reclaim(uint64_t size, uint64_t alignment, bool dma);
+  void free_small(Span* span, void* ptr);
+  FreeObject* new_span(uint32_t cls, bool dma);
+  FreeObject* depot_pop(bool dma, uint32_t cls);
+  void depot_push(bool dma, uint32_t cls, FreeObject* list);
+  FreeObject** core_cell(bool dma, uint32_t cls);
+  Span* span_of(const void* object) const;
+  bool add_area(uint64_t base, uint64_t bytes);
+  void reclaim();
 
   hardware::IRandomAccessMemory& ram_;
-  Header* free_low_ = nullptr;
-  Header* free_high_ = nullptr;
-  uint64_t total_bytes_ = 0;
-  Header* small_[2][kSmallBlocks + 1] = {};  // [pool: 0 low, 1 high][blocks]: free runs of exactly that many blocks
-  uint64_t small_free_[2] = {};              // bytes held on the stacks of each pool, headers included (a header is free memory too: it merges away when the block goes back to the list)
+  PageFrameAllocator frames_;
+  Caches* caches_ = nullptr;      // in the metadata of the first area
+  uint32_t (*core_)() = nullptr;
+  uint32_t reclaiming_ = 0;       // someone is in reclaim()
 };
 
 }  // namespace allocators

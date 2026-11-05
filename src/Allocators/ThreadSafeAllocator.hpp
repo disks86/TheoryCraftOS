@@ -23,9 +23,8 @@
 namespace allocators {
 
 // Makes any IAllocator usable from several cores at once by serializing its
-// calls with a SpinLock. (The default Allocator keeps unsynchronized free-list
-// state, so concurrent code - the Concurrent* containers on several cores,
-// smart pointers released on worker cores - must go through one of these.)
+// calls with a SpinLock. (The default Allocator is lock-free and needs no wrapper;
+// this is for allocators that keep unsynchronized state, such as a test's.)
 class ThreadSafeAllocator final : public IAllocator {
  public:
   ThreadSafeAllocator(IAllocator& inner, const hardware::ICentralProcessingUnit& cpu)

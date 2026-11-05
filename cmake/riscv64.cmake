@@ -38,6 +38,7 @@ add_executable(BOOTRISCV64
   src/GraphicsConsole.cpp
   src/runtime.cpp
   src/Allocators/Allocator.cpp
+  src/Allocators/PageFrameAllocator.cpp
   src/Hardware/TextConsole.cpp
   src/Hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
   src/Hardware/Acpi/AcpiTables.cpp

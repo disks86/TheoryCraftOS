@@ -51,7 +51,7 @@ using namespace browser;
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
-// PROBE_KALLOC=1 runs the page on the kernel's own Allocator (a first-fit free list in 64-byte blocks) over a 6 GiB mapping, to see what the kernel pays for the same workload.
+// PROBE_KALLOC=1 runs the page on the kernel's own Allocator (lock-free size classes over LLFree page frames) over a 6 GiB mapping, to see what the kernel pays for the same workload.
 struct KernelHeap {
   struct Ram final : hardware::IRandomAccessMemory {
     void* region = nullptr;

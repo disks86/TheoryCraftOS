@@ -38,8 +38,8 @@ namespace scheduling {
 //
 // Both queues are guarded by one SpinLock, and they allocate under it, so the
 // allocator is called from whichever core submits. It must therefore be safe to
-// call from several cores - pass a ThreadSafeAllocator shared with the rest of
-// the system. Room for kInitialCapacity tasks per queue is reserved up front so
+// call from several cores - the kernel's Allocator is (any other IAllocator can be
+// wrapped in a ThreadSafeAllocator). Room for kInitialCapacity tasks per queue is reserved up front so
 // that ordinary submission never allocates.
 class Scheduler final : public ICPUScheduler {
  public:

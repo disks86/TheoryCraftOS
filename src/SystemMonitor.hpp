@@ -19,7 +19,6 @@
 // The computer manager's view of the running machine: the kernel's threads and cores and the allocator's memory.
 #pragma once
 #include "Allocators/Allocator.hpp"
-#include "Allocators/ThreadSafeAllocator.hpp"
 #include "Desktop/ComputerManager.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
@@ -28,8 +27,8 @@
 
 class SystemMonitor final : public desktop::ISystemMonitor {
  public:
-  // `shared` is the thread-safe front of `heap`; reading the heap's statistics takes its lock.
-  SystemMonitor(allocators::Allocator& heap, allocators::ThreadSafeAllocator& shared) : heap_(heap), shared_(shared) {}
+  // `heap` is the kernel's allocator: the monitor allocates from it and reports its statistics.
+  explicit SystemMonitor(allocators::Allocator& heap) : heap_(heap) {}
 
   uint32_t ticks_per_second() const override;
   uint32_t core_count() const override;
@@ -52,7 +51,6 @@ class SystemMonitor final : public desktop::ISystemMonitor {
 
  private:
   allocators::Allocator& heap_;
-  allocators::ThreadSafeAllocator& shared_;
   hardware::IGraphicsProcessingUnit* gpu_ = nullptr;
   hardware::INeuralProcessingUnit* npu_ = nullptr;
   const hardware::IPciBus* pci_ = nullptr;

@@ -18,6 +18,8 @@
 
 #include "Kernel/Paging.hpp"
 #include "Kernel/Interrupts.hpp"
+#include "Kernel/Rcu.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace kernel {
 
@@ -26,14 +28,30 @@ namespace {
 constexpr uint64_t kPresent = 1ull << 0, kWritable = 1ull << 1, kUser = 1ull << 2, kWriteThrough = 1ull << 3, kCacheDisable = 1ull << 4,
                    kAccessed = 1ull << 5, kDirty = 1ull << 6, kPageSize = 1ull << 7, kGlobal = 1ull << 8, kPatSmall = 1ull << 7,
                    kPatLarge = 1ull << 12, kNoExecute = 1ull << 63;
+constexpr uint64_t kOwnedTable = 1ull << 9;   // (ignored by the CPU) on an entry that points to a table this class made, and may free
 constexpr uint64_t kAddressMask = 0x000FFFFFFFFFF000ull;
 constexpr uint64_t kMaxAddress = 1ull << 47;   // the lower half of the 48-bit space: identity mappings stay canonical
 
 constexpr uint64_t size_at(int level) { return 1ull << (12 + 9 * (level - 1)); }   // what one entry of a table at `level` covers
 constexpr uint32_t index_at(uint64_t address, int level) { return static_cast<uint32_t>((address >> (12 + 9 * (level - 1))) & 511); }
 
+// Tables are used by their physical address: the memory they are in is mapped 1:1, and a table is never freed once it was linked in (see walk()), so the
+// pointer stays valid for as long as anyone may follow it.
 uint64_t* as_table(uint64_t physical) { return reinterpret_cast<uint64_t*>(physical); }
+uint64_t table_address(const uint64_t* table) { return reinterpret_cast<uint64_t>(table) & kAddressMask; }
 bool is_leaf(uint64_t entry, int level) { return level == 1 || (level <= 3 && (entry & kPageSize)); }
+
+// Every entry is read and changed atomically: other cores edit the same tables at the same time, and the CPU itself sets the accessed and dirty bits with
+// locked writes, so a change is a compare-and-swap from the value it was decided on (and is decided again if that value is gone).
+uint64_t load_entry(const uint64_t* entry) { return __atomic_load_n(entry, __ATOMIC_ACQUIRE); }
+bool swap_entry(uint64_t* entry, uint64_t expected, uint64_t desired) {
+  return __atomic_compare_exchange_n(entry, &expected, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+bool has_write_combining(uint64_t pat) {
+  for (uint32_t i = 0; i < 8; ++i)
+    if (((pat >> (8 * i)) & 0xff) == 0x01) return true;
+  return false;
+}
 
 }  // namespace
 
@@ -86,6 +104,7 @@ class CpuPagingHost final : public IPagingHost {
     }
     kernel::irq_restore(token & ~kWpWasSet);
   }
+  bool can_wait() override { return kernel::irq_enabled(); }
   void invalidate_page(uint64_t address) override { __asm__ volatile("invlpg (%0)" ::"r"(address) : "memory"); }
   void invalidate_all() override {
     uint64_t v;
@@ -114,43 +133,60 @@ IPagingHost& cpu_paging_host() {
 namespace {
 uint64_t g_shared_pat = 0;
 }
-uint64_t shared_pat_value() { return g_shared_pat; }
+uint64_t shared_pat_value() { return __atomic_load_n(&g_shared_pat, __ATOMIC_ACQUIRE); }
 void load_shared_pat_on_this_core() {
-  if (g_shared_pat) cpu_paging_host().write_pat(g_shared_pat);
+  if (const uint64_t value = shared_pat_value()) cpu_paging_host().write_pat(value);
 }
+
+// One unlinked table (with what hangs below it), waiting for its grace period.
+struct PageTables::RetiredTable : RcuNode {
+  PageTables* owner = nullptr;
+  uint64_t table = 0;    // physical address
+  int level = 0;         // of the table's entries
+  bool owned = false;    // made here (else the firmware's: only its children may be ours)
+  UniquePointer<RetiredTable> self;   // the node owns itself until its callback has run
+};
+
+PageTables::PageTables(IPagingHost& host, allocators::IAllocator& allocator, RcuDomain* rcu)
+    : host_(host), allocator_(allocator), rcu_(rcu ? *rcu : rcu_default_domain()) {}
 
 bool PageTables::initialize() {
   if (host_.five_level()) return false;
   nx_ = host_.nx_enabled();
   gigabyte_ = host_.gigabyte_pages();
   pat_ = host_.pat_available();
-  if (pat_) pat_value_ = host_.read_pat();
-  wc_enabled_ = false;
-  for (uint32_t i = 0; i < 8; ++i)
-    if (((pat_value_ >> (8 * i)) & 0xff) == 0x01) wc_enabled_ = true;   // somebody already set one up
-  ready_ = true;
+  if (pat_) __atomic_store_n(&pat_value_, host_.read_pat(), __ATOMIC_RELEASE);   // (it may hold write-combining already: somebody set one up)
+  __atomic_store_n(&ready_, true, __ATOMIC_RELEASE);
   return true;
 }
 
 bool PageTables::enable_write_combining() {
-  if (!ready_ || !pat_) return false;
-  if (wc_enabled_) return true;
-  pat_value_ = (pat_value_ & ~(0xffull << 32)) | (0x01ull << 32);   // entry 4: write-combining
-  host_.write_pat(pat_value_);
-  g_shared_pat = pat_value_;
-  wc_enabled_ = true;
+  if (!__atomic_load_n(&ready_, __ATOMIC_ACQUIRE) || !pat_) return false;
+  uint64_t value = pat();
+  while (!has_write_combining(value)) {
+    const uint64_t wanted = (value & ~(0xffull << 32)) | (0x01ull << 32);   // entry 4: write-combining
+    if (__atomic_compare_exchange_n(&pat_value_, &value, wanted, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {   // (a loser sees the winner's value)
+      host_.write_pat(wanted);
+      __atomic_store_n(&g_shared_pat, wanted, __ATOMIC_RELEASE);
+      break;
+    }
+  }
   return true;
 }
 
+bool PageTables::write_combining_enabled() const { return has_write_combining(pat()); }
+
 void PageTables::load_pat() {
-  if (pat_ && wc_enabled_) host_.write_pat(pat_value_);
+  const uint64_t value = pat();
+  if (pat_ && has_write_combining(value)) host_.write_pat(value);
 }
 
 // Which PAT index (PAT bit, PCD, PWT) selects this memory type? The PAT holds, per index, 0 UC, 1 WC, 4 WT, 6 WB, 7 UC-.
 bool PageTables::pat_index_for(CacheMode mode, uint32_t* index) const {
   const uint8_t wanted = mode == CacheMode::WriteBack ? 6 : mode == CacheMode::WriteThrough ? 4 : mode == CacheMode::Uncached ? 0 : 1;
+  const uint64_t value = pat();
   for (uint32_t i = 0; i < 8; ++i)
-    if (((pat_value_ >> (8 * i)) & 0xff) == wanted) {
+    if (((value >> (8 * i)) & 0xff) == wanted) {
       *index = i;
       return true;
     }
@@ -158,7 +194,7 @@ bool PageTables::pat_index_for(CacheMode mode, uint32_t* index) const {
 }
 
 CacheMode PageTables::mode_of(uint32_t pat_index) const {
-  switch ((pat_value_ >> (8 * pat_index)) & 0xff) {
+  switch ((pat() >> (8 * pat_index)) & 0xff) {
     case 6: return CacheMode::WriteBack;
     case 4: case 5: return CacheMode::WriteThrough;
     case 1: return CacheMode::WriteCombining;
@@ -186,27 +222,46 @@ uint64_t* PageTables::new_table() {
   return t;
 }
 
-// Replaces a large page by a table of smaller pages that map the same thing in the same way.
-bool PageTables::split(uint64_t* entry, int level) {
+// Links a new, empty table into the entry, which was `seen` (not present).
+PageTables::Edit PageTables::install_table(uint64_t* entry, uint64_t seen, Change& change) {
   uint64_t* t = new_table();
-  if (!t) return false;
-  const uint64_t e = *entry;
+  if (!t) return Edit::NoMemory;
+  if (!swap_entry(entry, seen, table_address(t) | kPresent | kWritable | kOwnedTable)) {
+    allocator_.deallocate(t);   // somebody else changed the entry first; nobody saw this table
+    return Edit::Raced;
+  }
+  change.changed = true;
+  return Edit::Done;
+}
+
+// Replaces a large page (the entry, `seen`) by a table of smaller pages that map the same thing in the same way.
+PageTables::Edit PageTables::split(uint64_t* entry, uint64_t seen, int level, Change& change) {
+  uint64_t* t = new_table();
+  if (!t) return Edit::NoMemory;
   const uint64_t child_size = size_at(level - 1);
-  const uint64_t base = e & (level == 3 ? 0x000FFFFFC0000000ull : 0x000FFFFFFFE00000ull);
-  uint64_t flags = e & (kWritable | kUser | kWriteThrough | kCacheDisable | kAccessed | kDirty | kGlobal | kNoExecute);
-  const bool pat = e & kPatLarge;
+  const uint64_t base = seen & (level == 3 ? 0x000FFFFFC0000000ull : 0x000FFFFFFFE00000ull);
+  uint64_t flags = seen & (kWritable | kUser | kWriteThrough | kCacheDisable | kAccessed | kDirty | kGlobal | kNoExecute);
+  const bool pat = seen & kPatLarge;
   if (level == 2 && pat) flags |= kPatSmall;   // the PAT bit moves from bit 12 to bit 7
   if (level == 3) {
     flags |= kPageSize;                         // the pieces are 2 MiB pages: PAT stays in bit 12
     if (pat) flags |= kPatLarge;
   }
   for (uint64_t i = 0; i < 512; ++i) t[i] = ((base + i * child_size) & kAddressMask) | kPresent | flags;
-  *entry = (reinterpret_cast<uint64_t>(t) & kAddressMask) | kPresent | kWritable | (e & kUser);
-  changed_ = true;
-  return true;
+  if (!swap_entry(entry, seen, table_address(t) | kPresent | kWritable | kOwnedTable | (seen & kUser))) {
+    allocator_.deallocate(t);   // changed meanwhile (by another core, or the CPU set the dirty bit): decide again
+    return Edit::Raced;
+  }
+  change.changed = true;
+  return Edit::Done;
 }
 
-bool PageTables::walk(uint64_t* table, int level, uint64_t table_base, uint64_t start, uint64_t end, const PageAttributes& a, Mode mode) {
+// Each entry is handled in a loop: read it, decide, and make the change with a compare-and-swap; if the entry changed in between, read it again. Two
+// cores that need the same table (or the same large page split) both build one, one of them links it in and the other throws its copy away and uses
+// the winner's. A table that a change unlinks (a page mapped or unmapped over it as a whole) is not freed at once: another core may still be walking it
+// (its edits then simply come too late, as if they had happened before the change that unlinked it), and the CPUs may still cache it. It goes on the
+// change's list, and apply() retires it through RCU once the shootdown is done.
+bool PageTables::walk(uint64_t* table, int level, uint64_t table_base, uint64_t start, uint64_t end, const PageAttributes& a, Mode mode, Change& change) {
   const uint64_t span = size_at(level);   // what one entry covers
   for (uint64_t at = start; at < end;) {
     const uint32_t idx = index_at(at, level);
@@ -215,51 +270,95 @@ bool PageTables::walk(uint64_t* table, int level, uint64_t table_base, uint64_t 
     const uint64_t hi = end < entry_end ? end : entry_end;
     uint64_t* entry = &table[idx];
     const bool full = at == entry_base && hi == entry_end;
-    const bool present = *entry & kPresent;
     const bool may_be_leaf = level == 1 || (level == 2) || (level == 3 && gigabyte_);
 
-    if (mode == Mode::Remove) {
-      if (present) {
+    for (;;) {
+      const uint64_t e = load_entry(entry);
+      const bool present = e & kPresent;
+      if (mode == Mode::Remove) {
+        if (!present) break;
         if (full && level <= 3) {
-          *entry = 0;
-          changed_ = true;
-        } else {
-          if (is_leaf(*entry, level) && !split(entry, level)) return false;
-          if (!walk(as_table(*entry & kAddressMask), level - 1, entry_base, at, hi, a, mode)) return false;
+          if (!swap_entry(entry, e, 0)) continue;
+          change.changed = true;
+          if (!is_leaf(e, level)) unlinked(e, level, change);
+          break;
         }
+        if (is_leaf(e, level)) {
+          if (split(entry, e, level, change) == Edit::NoMemory) return false;
+          continue;   // now a table (ours or another core's)
+        }
+        if (!walk(as_table(e & kAddressMask), level - 1, entry_base, at, hi, a, mode, change)) return false;
+        break;
       }
-    } else if (full && may_be_leaf && !(present && !is_leaf(*entry, level) && mode == Mode::Missing)) {
-      // the whole entry is wanted as one page
-      if (!(present && mode == Mode::Missing)) {
-        *entry = leaf_entry(entry_base, level, a);
-        changed_ = true;
+      if (full && may_be_leaf && !(present && !is_leaf(e, level) && mode == Mode::Missing)) {
+        // the whole entry is wanted as one page
+        if (present && mode == Mode::Missing) break;
+        if (!swap_entry(entry, e, leaf_entry(entry_base, level, a))) continue;
+        change.changed = true;
+        if (present && !is_leaf(e, level)) unlinked(e, level, change);
+        break;
       }
-    } else {
       // part of the entry: it has to be a table
       if (!present) {
-        uint64_t* t = new_table();
-        if (!t) return false;
-        *entry = (reinterpret_cast<uint64_t>(t) & kAddressMask) | kPresent | kWritable;
-        changed_ = true;
-      } else if (is_leaf(*entry, level)) {
-        if (mode == Mode::Missing) {   // already mapped as a whole: leave it
-          at = hi;
-          continue;
-        }
-        if (!split(entry, level)) return false;
-      } else if (!(*entry & kWritable)) {
-        *entry |= kWritable;           // permissions are decided by the pages
-        changed_ = true;
+        if (install_table(entry, e, change) == Edit::NoMemory) return false;
+        continue;
       }
-      if (!walk(as_table(*entry & kAddressMask), level - 1, entry_base, at, hi, a, mode)) return false;
+      if (is_leaf(e, level)) {
+        if (mode == Mode::Missing) break;   // already mapped as a whole: leave it
+        if (split(entry, e, level, change) == Edit::NoMemory) return false;
+        continue;
+      }
+      if (!(e & kWritable)) {
+        __atomic_fetch_or(entry, kWritable, __ATOMIC_ACQ_REL);   // permissions are decided by the pages
+        change.changed = true;
+      }
+      if (!walk(as_table(e & kAddressMask), level - 1, entry_base, at, hi, a, mode, change)) return false;
+      break;
     }
     at = hi;
   }
   return true;
 }
 
+// `entry` (at `level`) pointed to a table and was just replaced: remember the table for freeing. If no node can be had for it, it is kept.
+void PageTables::unlinked(uint64_t entry, int level, Change& change) {
+  change.unlinked = true;
+  UniquePointer<RetiredTable> node = UniquePointer<RetiredTable>::make(allocator_);
+  if (!node) return;
+  RetiredTable* r = node.get();
+  r->owner = this;
+  r->table = entry & kAddressMask;
+  r->level = level - 1;
+  r->owned = entry & kOwnedTable;
+  r->callback = &free_retired;
+  r->next = change.retired;
+  r->self = util::move(node);
+  change.retired = r;
+}
+
+// Frees the tables this class made in the tree below `physical` (whose entries are at `level`), and that table itself if `owned`. Nothing can reach the
+// tree any more: the walk has it to itself.
+void PageTables::free_subtree(uint64_t physical, int level, bool owned) {
+  uint64_t* t = as_table(physical);
+  if (level > 1)
+    for (uint32_t i = 0; i < 512; ++i) {
+      const uint64_t e = load_entry(&t[i]);
+      if ((e & kPresent) && !is_leaf(e, level)) free_subtree(e & kAddressMask, level - 1, e & kOwnedTable);
+    }
+  if (owned) allocator_.deallocate(t);
+}
+
+void PageTables::free_retired(RcuNode* node) {
+  RetiredTable* r = static_cast<RetiredTable*>(node);
+  r->owner->free_subtree(r->table, r->level, r->owned);
+  drop(r);
+}
+
+// Frees the node (not the table).
+void PageTables::drop(RetiredTable* table) { UniquePointer<RetiredTable> gone = util::move(table->self); }
+
 bool PageTables::apply(uint64_t address, uint64_t bytes, const PageAttributes& a, Mode mode) {
-  if (!ready_ || bytes == 0) return false;
+  if (!__atomic_load_n(&ready_, __ATOMIC_ACQUIRE) || bytes == 0) return false;
   const uint64_t start = address & ~0xFFFull;
   if (bytes > kMaxAddress || address + bytes > kMaxAddress || address + bytes < address) return false;
   const uint64_t end = (address + bytes + 0xFFF) & ~0xFFFull;
@@ -269,12 +368,28 @@ bool PageTables::apply(uint64_t address, uint64_t bytes, const PageAttributes& a
     if (!pat_index_for(a.cache, &index)) return false;
     if (index >= 4 && !pat_) return false;
   }
-  changed_ = false;
-  const uint64_t edit = host_.begin_table_edit();
-  const bool ok = walk(as_table(host_.root()), 4, 0, start, end, a, mode);
-  if (changed_) host_.invalidate_all();
-  host_.end_table_edit(edit);
-  return ok;
+  ITlbShootdown* shootdown = __atomic_load_n(&shootdown_, __ATOMIC_ACQUIRE);
+  if (shootdown && !host_.can_wait()) shootdown = nullptr;
+  Change change;
+  bool ok;
+  {
+    RcuReader reader(rcu_);   // (other cores may free the tables this walk passes through only after it is done)
+    const uint64_t edit = host_.begin_table_edit();
+    ok = walk(as_table(host_.root()), 4, 0, start, end, a, mode, change);
+    if (change.changed && !shootdown) host_.invalidate_all();
+    host_.end_table_edit(edit);
+  }
+  // The shootdown runs with interrupts on again (it waits for the other cores). A table unlinked here may sit in any CPU's paging-structure caches,
+  // whatever range it covered, so that takes a flush of everything.
+  bool flushed = true;
+  if (change.changed && shootdown) flushed = change.unlinked ? shootdown->invalidate_range(0, kMaxAddress) : shootdown->invalidate_range(start, end - start);
+  for (RetiredTable* r = change.retired; r;) {
+    RetiredTable* next = static_cast<RetiredTable*>(r->next);
+    if (shootdown && flushed) rcu_.retire_node(*r);   // (no CPU caches it any more; the grace period waits for the software walks)
+    else drop(r);                                      // some CPU may still use it: keep the table
+    r = next;
+  }
+  return ok && flushed;
 }
 
 bool PageTables::map(uint64_t address, uint64_t bytes, const PageAttributes& attributes) { return apply(address, bytes, attributes, Mode::Replace); }
@@ -283,10 +398,11 @@ bool PageTables::unmap(uint64_t address, uint64_t bytes) { return apply(address,
 
 bool PageTables::query(uint64_t address, PageMapping* out) const {
   *out = PageMapping();
-  if (!ready_ || address >= kMaxAddress) return false;
+  if (!__atomic_load_n(&ready_, __ATOMIC_ACQUIRE) || address >= kMaxAddress) return false;
+  RcuReader reader(rcu_);
   const uint64_t* table = as_table(host_.root());
   for (int level = 4; level >= 1; --level) {
-    const uint64_t e = table[index_at(address, level)];
+    const uint64_t e = load_entry(&table[index_at(address, level)]);
     if (!(e & kPresent)) return true;   // answered: not present
     if (level > 1 && !is_leaf(e, level)) {
       table = as_table(e & kAddressMask);

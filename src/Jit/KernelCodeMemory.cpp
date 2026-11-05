@@ -24,10 +24,7 @@ bool KernelCodeMemory::set(const CodeRegion& region, bool writable, bool executa
   attributes.writable = writable;
   attributes.executable = executable;
   const uint64_t address = reinterpret_cast<uint64_t>(region.bytes.data());   // identity mapped: the address is the physical address
-  {
-    SpinFlagGuard guard(tables_lock_);
-    if (!tables_.map(address, region.bytes.size(), attributes)) return false;
-  }
+  if (!tables_.map(address, region.bytes.size(), attributes)) return false;   // (PageTables is lock-free: regions are made on whichever thread compiles)
   return !shootdown_ || shootdown_->invalidate_range(address, region.bytes.size());
 }
 

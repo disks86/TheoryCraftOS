@@ -22,7 +22,7 @@
 
 namespace jit {
 
-// The TLB shootdown for KernelCodeMemory: runs a flush of the range on every online core through the scheduler's run_on_every_core (an inter-processor
+// The kernel's TLB shootdown (kernel::PageTables::set_shootdown(), or a KernelCodeMemory of its own): runs a flush of the range on every online core through the scheduler's run_on_every_core (an inter-processor
 // interrupt to each other core, waiting until each has done it). Small ranges are flushed page by page (INVLPG), large ones with a full flush. Thread
 // context only, and not from inside a spin lock; before the scheduler runs it simply flushes this core.
 class CrossCoreTlbShootdown final : public ITlbShootdown {

@@ -19,7 +19,6 @@
 // ACPI tables) come up here, then exception handling, the per-core timer tick, the preemptive thread scheduler and the
 // other cores; the drivers are not part of this image yet.
 #include "Allocators/Allocator.hpp"
-#include "Allocators/ThreadSafeAllocator.hpp"
 #include "Arch/LoongArch64/Cpu.hpp"
 #include "Arch/LoongArch64/Csr.hpp"
 #include "Arch/LoongArch64/PageProtector.hpp"
@@ -192,7 +191,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Exception handling, the tick and the thread scheduler.
   hardware::LoongArch64Cpu cpu;
-  allocators::ThreadSafeAllocator shared_allocator(allocator, cpu);
+  // The allocator is lock-free and safe from every core as it is; it only needs to know which core calls (for its per-core caches).
+  allocators::IAllocator& shared_allocator = allocator;
+  allocator.set_core_source(kernel::current_core);
   if (acpi_ok) cpu.discover(acpi, shared_allocator);
 
   Entry(Level::Info, "CPU").dec(cpu.core_count()).text(" core(s)");

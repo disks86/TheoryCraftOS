@@ -36,7 +36,7 @@ bool SystemMonitor::core(uint32_t index, desktop::TaskCore* out) {
 }
 
 uint32_t SystemMonitor::threads(desktop::TaskThread* out, uint32_t capacity) {
-  ArrayView<kernel::ThreadInfo> info = allocate_view<kernel::ThreadInfo>(shared_, capacity);  // too big for a thread stack
+  ArrayView<kernel::ThreadInfo> info = allocate_view<kernel::ThreadInfo>(heap_, capacity);  // too big for a thread stack
   if (info.empty()) return 0;
   const uint32_t n = kernel::thread_snapshot(info.data(), static_cast<uint32_t>(info.size()));
   for (uint32_t i = 0; i < n; ++i) {
@@ -50,12 +50,12 @@ uint32_t SystemMonitor::threads(desktop::TaskThread* out, uint32_t capacity) {
     t.core = info[i].core;
     t.cpu_ticks = info[i].cpu_ticks;
   }
-  release_view(shared_, info);
+  release_view(heap_, info);
   return n;
 }
 
 uint32_t SystemMonitor::processes(desktop::TaskProcess* out, uint32_t capacity) {
-  ArrayView<kernel::usermode::ProcessInfo> info = allocate_view<kernel::usermode::ProcessInfo>(shared_, capacity);
+  ArrayView<kernel::usermode::ProcessInfo> info = allocate_view<kernel::usermode::ProcessInfo>(heap_, capacity);
   if (info.empty()) return 0;
   const uint32_t n = kernel::usermode::process_snapshot(info.data(), static_cast<uint32_t>(info.size()));
   for (uint32_t i = 0; i < n; ++i) {
@@ -71,16 +71,14 @@ uint32_t SystemMonitor::processes(desktop::TaskProcess* out, uint32_t capacity) 
     p.cpu_ticks = info[i].cpu_ticks;
     p.memory_bytes = info[i].memory_bytes;
   }
-  release_view(shared_, info);
+  release_view(heap_, info);
   return n;
 }
 
 desktop::TaskMemory SystemMonitor::memory() {
   desktop::TaskMemory m;
-  shared_.locked([&] {
-    m.total_bytes = heap_.total_bytes();
-    m.free_bytes = heap_.free_bytes();
-  });
+  m.total_bytes = heap_.total_bytes();   // (the allocator's counters are read without a lock)
+  m.free_bytes = heap_.free_bytes();
   return m;
 }
 
