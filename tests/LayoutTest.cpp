@@ -362,6 +362,10 @@ static void test_positioning() {
   CHECK(c.abs_x("k") == 7 && c.abs_y("k") == 50 + 5 && c.abs_x("f") == 0 && c.abs_y("f") == 0);
   Laid c2(page("<div style='height:50px'></div><div id=k style='position:absolute;top:5px;left:7px;width:1px;height:1px'></div>").c_str());
   CHECK(c2.abs_x("k") == 7 && c2.abs_y("k") == 5);
+  // a fixed box inside an absolute one that the viewport holds, too (YouTube's masthead): it is laid out after the absolute box finds it
+  Laid c3(page("<div id=app style='position:absolute;top:0;left:0;right:0'><div id=f style='position:fixed;top:3px;left:0;right:0'><div style='height:56px'></div></div>"
+               "<div style='margin-top:60px;height:10px'></div></div>").c_str());
+  CHECK(px(c3.at("f").width) == px(c3.at("app").width) && px(c3.at("f").height) == 56 && c3.abs_y("f") == 3);
 
   // auto offsets keep the place the box would have had in the flow
   Laid d(page("<div style='height:10px'></div><div id=k style='position:absolute;width:20px;height:5px'></div>").c_str());

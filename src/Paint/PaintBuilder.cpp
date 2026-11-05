@@ -167,8 +167,13 @@ class Builder {
             if (c.style.position != browser::Position::Absolute || chain.refs[k].positioned) e.clips.refs[e.clips.count++] = chain.refs[k];
         }
         failed_ |= !out->push_back(e);
-        // a positioned box without a z-index does not make a stacking context: the positioned boxes inside it belong to this one, too
-        if (!makes_context(c)) gather(cid, cx, cy, out, inside);
+        // a positioned box without a z-index does not make a stacking context: the positioned boxes inside it belong to this one, too. They are held by what holds
+        // it and by its own clip, not by the clips it escapes (an absolute box in a body of height 0 with overflow: auto).
+        if (!makes_context(c)) {
+          ClipChain below = e.clips;
+          if (inside.count > chain.count && below.count < kMaxClipRefs) below.refs[below.count++] = inside.refs[inside.count - 1];
+          gather(cid, cx, cy, out, below);
+        }
         continue;
       }
       if (c.floated || c.kind == BoxKind::InlineBlock || (c.kind == BoxKind::Replaced && c.is_inline_level())) continue;   // (painted as units, with what is in them)

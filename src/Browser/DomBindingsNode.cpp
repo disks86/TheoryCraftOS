@@ -94,10 +94,10 @@ const ReflectedAttribute* find_reflected(StringView js) {
   return nullptr;
 }
 
-// A custom element's class says what its own names are: Polymer elements have an async() method, a `name` or `disabled` property of their own. Only the
-// prototypes between the element and HTMLElement.prototype are looked at (the script's; the built-in ones are not).
-bool defined_by_script(Vm& vm, DomBindings::Impl& c, JsObject* element, JsString* key) {
-  for (JsObject* p = element->proto; p && p != c.html_proto; p = p->proto) {
+// A prototype the page made says what its own names are: a custom element's class (Polymer elements have an async() method, a `name` or `disabled` property
+// of their own), ShadyDOM's ShadyRoot (its firstChild and textContent are the logical tree's). Only the prototypes in front of the interfaces' are looked at.
+bool defined_by_script(Vm& vm, JsObject* object, JsString* key) {
+  for (JsObject* p = object->proto; p && !p->interface_proto; p = p->proto) {
     Value value;
     uint8_t flags;
     if (vm.own_property(p, key, &value, &flags)) return true;
@@ -631,7 +631,6 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return false;   // (token lists, and the flag of a style sheet: the script's accessors)
   if (in_svg_namespace(n) && svg_own_name(k)) return false;
   if (const ReflectedAttribute* r = find_reflected(k)) {
-    if (element && n->name.view().contains('-') && defined_by_script(vm, c, o, key)) return false;
     StringView v;
     const bool present = dom::get_attribute(n, r->attribute, &v);
     switch (IS("value") && n->is_tag("li") ? Reflect::Int : r->kind) {   // (an <li>'s value is a number)
@@ -798,7 +797,6 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return HostClass::Set::NotHandled;
   if (in_svg_namespace(n) && svg_own_name(k)) return HostClass::Set::NotHandled;
   if (const ReflectedAttribute* r = find_reflected(k)) {
-    if (n->is_element() && n->name.view().contains('-') && defined_by_script(vm, impl(vm), o, key)) return HostClass::Set::NotHandled;
     switch (r->kind) {
       case Reflect::Bool:
         if (Vm::to_boolean(value)) return done(dom::set_attribute(n, r->attribute, ""));
@@ -1618,7 +1616,18 @@ JsObject* make_class(DomBindings::Impl& c, const char* name, NativeFn ctor, JsOb
 
 }  // namespace
 
-const HostClass kNodeHostClass = {"Node", node_get, node_set, nullptr, nullptr};
+bool node_interface_get(Vm& vm, JsObject* o, JsString* key, Value* out) { return node_get(vm, o, key, out); }
+HostClass::Set node_interface_set(Vm& vm, JsObject* o, JsString* key, const Value& value) { return node_set(vm, o, key, value); }
+
+namespace {
+
+// An ordinary property access: the interface answers unless a prototype of the page's comes first with the name.
+bool node_get_property(Vm& vm, JsObject* o, JsString* key, Value* out) { return !defined_by_script(vm, o, key) && node_get(vm, o, key, out); }
+HostClass::Set node_set_property(Vm& vm, JsObject* o, JsString* key, const Value& value) { return defined_by_script(vm, o, key) ? HostClass::Set::NotHandled : node_set(vm, o, key, value); }
+
+}  // namespace
+
+const HostClass kNodeHostClass = {"Node", node_get_property, node_set_property, nullptr, nullptr};
 
 // --- Shadow trees
 

@@ -69,17 +69,20 @@ LayoutUnit LayoutContext::offset_in(BoxId from, BoxId ancestor, bool horizontal)
   return sum;
 }
 
+// Laying out a box can find more boxes for the same block (a fixed box inside an absolute one whose block is the viewport too): those are laid out in turn.
 void LayoutContext::layout_absolutes(BoxId containing_block) {
-  List<PendingAbsolute> mine(tree_.allocator());
-  List<PendingAbsolute> rest(tree_.allocator());
-  for (uint64_t i = 0; i < pending_abs_.count(); ++i) {
-    if (pending_abs_[i].containing_block == containing_block) failed_ |= !mine.push_back(pending_abs_[i]);
-    else failed_ |= !rest.push_back(pending_abs_[i]);
+  while (!failed_) {
+    List<PendingAbsolute> mine(tree_.allocator());
+    List<PendingAbsolute> rest(tree_.allocator());
+    for (const PendingAbsolute& p : pending_abs_) {
+      if (p.containing_block == containing_block) failed_ |= !mine.push_back(p);
+      else failed_ |= !rest.push_back(p);
+    }
+    if (mine.count() == 0) return;
+    pending_abs_.clear();
+    for (const PendingAbsolute& p : rest) failed_ |= !pending_abs_.push_back(p);
+    for (uint64_t i = 0; i < mine.count() && !failed_; ++i) layout_absolute(mine[i]);
   }
-  if (mine.count() == 0) return;
-  pending_abs_.clear();
-  for (uint64_t i = 0; i < rest.count(); ++i) failed_ |= !pending_abs_.push_back(rest[i]);
-  for (uint64_t i = 0; i < mine.count() && !failed_; ++i) layout_absolute(mine[i]);
 }
 
 void LayoutContext::layout_absolute(const PendingAbsolute& pending) {

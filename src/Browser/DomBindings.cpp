@@ -226,6 +226,26 @@ bool DomBindings::install() {
   return ok;
 }
 
+void DomBindings::mark_interfaces() {
+  Impl& c = *impl_;
+  for (JsObject* o : {c.node_proto, c.element_proto, c.html_proto, c.svg_proto, c.character_data_proto, c.text_proto, c.comment_proto, c.document_type_proto, c.document_proto,
+                      c.fragment_proto, c.shadow_root_proto})
+    if (o) o->interface_proto = true;
+  // Every constructor on the global object whose prototype is a node interface's (HTMLDivElement, SVGRectElement, CDATASection ...).
+  JsObject* global = vm_.global();
+  for (uint32_t i = 0; i < global->prop_count; ++i) {
+    const script::Prop& p = global->props[i];
+    if ((p.flags & script::kAccessor) || !p.value.is_object()) continue;
+    Value proto;
+    if (!vm_.get_plain(p.value.as_object(), vm_.prototype_name(), &proto) || !proto.is_object()) continue;
+    for (JsObject* q = proto.as_object(); q; q = q->proto)
+      if (q == c.node_proto) {
+        proto.as_object()->interface_proto = true;
+        break;
+      }
+  }
+}
+
 bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& init) {
   Impl& c = *impl_;
   vm_.hold_collector();

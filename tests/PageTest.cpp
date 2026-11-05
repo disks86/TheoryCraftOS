@@ -6251,6 +6251,29 @@ static void test_webrtc() {
     const std::string log(page.log().data(), page.log().size());
     CHECK(log.find("tc hello 1") != std::string::npos && log.find("ih <p>z</p> P") != std::string::npos && log.find("cls k k") != std::string::npos);
   }
+  {   // a prototype the page puts in front of the interfaces' answers first (ShadyDOM gives a stamped fragment ShadyRoot.prototype with __proto__ = and its own
+      // firstChild and textContent); the interfaces' accessors still reach the node itself
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    page.load("<html><body><div id=host></div><script>\n"
+              "var Root = function () {}; Root.prototype = Object.create(DocumentFragment.prototype);\n"
+              "var host = document.getElementById('host'), sets = [];\n"
+              "Object.defineProperty(Root.prototype, 'firstChild', {get: function () { return host.firstChild; }, configurable: true});\n"
+              "Object.defineProperty(Root.prototype, 'textContent', {get: function () { return 'logical'; }, set: function (v) { sets.push(v); host.textContent = v; }, configurable: true});\n"
+              "var frag = document.createDocumentFragment(); frag.appendChild(document.createElement('span'));\n"
+              "frag.__proto__ = Root.prototype; host.appendChild(document.createElement('em'));\n"
+              "frag.textContent = 'composed';\n"
+              "var native = Object.getOwnPropertyDescriptor(Node.prototype, 'firstChild').get.call(frag);\n"
+              "console.log('root ' + frag.firstChild.nodeName + ' ' + frag.textContent + ' ' + sets.join() + ' host=' + host.innerHTML + ' native=' + (native && native.nodeName));\n"
+              "var plain = document.createElement('div'); plain.textContent = 'x'; console.log('plain ' + plain.firstChild.nodeName + ' ' + plain.textContent);\n"
+              "class XTitle extends HTMLElement { get title() { return 'mine'; } } customElements.define('x-title', XTitle);\n"
+              "var t = document.createElement('x-title'); t.setAttribute('title', 'attr'); console.log('ce ' + t.title + ' ' + t.getAttribute('title'));\n"
+              "</script></body></html>");
+    const std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("root #text logical composed host=composed native=SPAN") != std::string::npos);
+    CHECK(log.find("plain #text x") != std::string::npos && log.find("ce mine attr") != std::string::npos);
+  }
   {   // a script that measures an element it just added gets the size the page lays out now, not the last picture's (YouTube's grid sizes itself that way)
     for (int with_fonts = 0; with_fonts < 2; ++with_fonts) {
       FakeEnvironment env(a);

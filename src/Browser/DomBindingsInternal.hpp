@@ -107,6 +107,9 @@ using namespace script;
 
 // The host class of node wrappers, and the object kinds the other files make.
 extern const HostClass kNodeHostClass;
+// What the interface's attribute does for a node, whatever the prototypes in front of the interfaces say (__host_get / __host_set: the interfaces' accessors).
+bool node_interface_get(Vm& vm, JsObject* o, JsString* key, Value* out);
+HostClass::Set node_interface_set(Vm& vm, JsObject* o, JsString* key, const Value& value);
 
 inline DomBindings::Impl& impl(Vm& vm) { return *static_cast<DomBindings::Impl*>(vm.user()); }
 
