@@ -29,7 +29,6 @@
 #include "Kernel/Delay.hpp"
 #include "Kernel/Firmware.hpp"
 #include "Allocators/Allocator.hpp"
-#include "Allocators/ThreadSafeAllocator.hpp"
 #include "Hardware/Bus/Pci/PciBar.hpp"
 #include "Hardware/MmioMapper.hpp"
 #include "Hardware/MidiDevice/X86MidiPortIo.hpp"
@@ -581,8 +580,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   if (high_bytes) Entry(Level::Ok, "RAM").size(high_bytes).text(" above 4 GiB for ordinary allocations (").size(allocator.free_bytes_low()).text(" below 4 GiB left for DMA)");
 
-  // The CPU comes next: the allocator's thread-safe front needs it, and from here on
-  // every subsystem allocates through that front, so any thread may use any of them.
   // The CPU, then the scheduler.
   hardware::SystemCpu system_cpu(st);
   hardware::ICentralProcessingUnit& cpu = system_cpu.cpu();
@@ -597,16 +594,18 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     e.text(cpu.name()).text(" ").text(cpu.model()).text(", ").dec(cpu.core_count()).text(" cores");
     if (efficiency) e.text(" (").dec(efficiency).text(" efficiency)");
   }
-  // Everything that may run on several cores shares ONE thread-safe front for the
-  // allocator: the scheduler's queues grow through it, and so do the concurrent
-  // containers. (Two separate wrappers would use two locks and not exclude each other.)
-  allocators::ThreadSafeAllocator shared_allocator(allocator, cpu);
+  // The allocator is lock-free (LLFree frames under per-core size-class caches), so every core, thread and interrupt handler uses it
+  // directly; it only needs to know which core calls, to pick that core's caches and frame reservations.
+  allocators::IAllocator& shared_allocator = allocator;
+  allocator.set_core_source(kernel::current_core);
 
   // Code memory for the JIT compilers (emulator, JavaScript and WebAssembly VMs): up to 16 MiB of code in 2 MiB windows taken on first use, W^X through
-  // the page tables, with the other cores' TLBs flushed by inter-processor interrupt. Nothing is allocated until something compiles.
+  // the page tables. Nothing is allocated until something compiles. From here on the page tables flush every core's TLB by inter-processor interrupt
+  // (the JIT's permission changes included, so the code memory needs no shootdown of its own), and free the tables that changes unlink.
   jit::CodePool jit_pool(shared_allocator, 8);
-  jit::CrossCoreTlbShootdown jit_shootdown(kernel::cpu_paging_host());
-  jit::KernelCodeMemory jit_code(paging, jit_pool, kernel::cpu_paging_host().nx_enabled(), &jit_shootdown);
+  jit::CrossCoreTlbShootdown tlb_shootdown(kernel::cpu_paging_host());
+  paging.set_shootdown(&tlb_shootdown);
+  jit::KernelCodeMemory jit_code(paging, jit_pool, kernel::cpu_paging_host().nx_enabled());
   if (paging_ok) jit::set_kernel_code_memory(&jit_code);
 
   // Then the display, so everything after it appears on screen. Falls back to the
@@ -1848,7 +1847,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     EjectContext eject_context{&explorer_files, {}};
     desktop.explorer().set_eject_handler(on_eject, &eject_context);
     if (!explorer_files.start_service()) Entry(Level::Warning, "Storage").text("could not start hot-plug polling; USB sticks plugged in later are not seen");
-    SystemMonitor monitor(allocator, shared_allocator);
+    SystemMonitor monitor(allocator);
     monitor.set_gpu(gpu);
     if (system_npu.hardware_present()) {   // (the software NPU is the CPU: it has no meter of its own)
       hardware::INeuralProcessingUnit& npu_now = system_npu.npu();   // (the Intel accelerator, when its firmware runs, replaced the one taken at the start)

@@ -20,23 +20,13 @@
 #include "Allocators/IAllocator.hpp"
 #include "Jit/CodeMemory.hpp"
 #include "Jit/CodePageSource.hpp"
-#include "Jit/SpinFlag.hpp"
 #include "Kernel/Paging.hpp"
 
 namespace jit {
 
-// Tells the other cores to drop their cached translations for a range whose permissions just changed (an IPI-driven TLB shootdown). PageTables only flushes
-// the calling core, and a core that still holds the old "writable, not executable" translation of a page that just became code would fault on entering
-// it. Optional: without one, only the calling core is flushed, which is right while the other cores are not running JIT code yet.
-class ITlbShootdown {
- public:
-  // False if some core did not answer (then the permission change must not be relied on).
-  virtual bool invalidate_range(uint64_t address, uint64_t bytes) = 0;
-
- protected:
-  constexpr ITlbShootdown() = default;
-  ~ITlbShootdown() = default;
-};
+// The TLB shootdown hook (see kernel::ITlbShootdown). Optional: without one, only the calling core is flushed, which is right while the other cores are not
+// running JIT code yet, or when the PageTables flush every core themselves (PageTables::set_shootdown()).
+using ITlbShootdown = kernel::ITlbShootdown;
 
 // ICodeMemory for the kernel: pages from an ICodePageSource (a CodePool of 2 MiB windows, or the allocator), whose permissions are switched in the page tables the kernel already owns (kernel::PageTables,
 // identity-mapped). allocate() hands out pages that are writable and not executable; make_executable() maps them executable and read-only; make_writable()
@@ -80,7 +70,6 @@ class KernelCodeMemory final : public ICodeMemory {
   bool nx_;
   ITlbShootdown* shootdown_;
   IInstructionCacheSync* icache_sync_ = nullptr;
-  SpinFlag tables_lock_;   // (PageTables is not thread safe; regions are made on whichever thread compiles)
 };
 
 }  // namespace jit

@@ -38,7 +38,7 @@ void report(const char* what, bool ok) {
 }  // namespace
 
 bool run_container_demo(allocators::Allocator& allocator) {
-  allocator.trim();   // (the size stacks back into the list, so the two readings compare)
+  allocator.trim();   // (empty spans back to the frame allocator, so the two readings compare)
   const uint64_t free_before = allocator.free_bytes();
   bool all_ok = true;
 

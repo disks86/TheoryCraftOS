@@ -20,226 +20,339 @@
 
 namespace allocators {
 
-// Occupies exactly one block at the start of every run.
-struct alignas(Allocator::kBlockSize) Allocator::Header {
-  static constexpr uint64_t kFree = 0x46524545'46524545;
-  static constexpr uint64_t kUsed = 0x55534544'55534544;
-  // Sits just before an over-aligned pointer and leads back to the real block.
-  static constexpr uint64_t kAligned = 0x414C4947'414C4947;
-  // A free block on a size stack (it counts as free for deallocate(): a second free is ignored).
-  static constexpr uint64_t kSmall = 0x534D414C'4C424C4B;
-
-  uint64_t magic;
-  uint64_t blocks;  // run length including this header block
-  Header* next;     // next free run (free runs only)
-};
 namespace {
-constexpr uint64_t kBlock = Allocator::kBlockSize;
+
+constexpr uint64_t kFrame = PageFrameAllocator::kFrameSize;
+constexpr uint32_t kDepotSlots = 16;
+constexpr uint64_t kSpanMagic = 0x5350414E'48454144;   // "SPANHEAD"
+constexpr uint64_t kFreeCookie = 0xF4EEB10C'4A11C0DE;  // (xored with the address) marks an object as sitting on a free list
+constexpr uint32_t kReleasing = ~0u;                   // Span::trim_free of a span reclaim() is giving back
+
+// Frame tags: what the allocation at a frame is.
+constexpr uint64_t kTagKind = 3;
+constexpr uint64_t kTagLarge = 1;   // (frames << 2) | 1, on the first frame of a frames allocation
+constexpr uint64_t kTagSpan = 2;    // span header address | 2, on every frame of a span
+
+constexpr uint32_t kClassSize[Allocator::kClassCount] = {
+    32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896,
+    1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 10240, 12288, 14336, 16384};
+
+// Sixteen-byte steps up to 128, then four classes per power of two.
+uint32_t class_of(uint64_t size) {
+  if (size <= 32) return 0;
+  if (size <= 128) return static_cast<uint32_t>((size + 15) / 16 - 2);
+  const uint32_t k = 63 - __builtin_clzll(size - 1);             // 2^k < size <= 2^(k + 1)
+  const uint64_t step = uint64_t{1} << (k - 2);
+  return 7 + 4 * (k - 7) + static_cast<uint32_t>((size - (uint64_t{1} << k) + step - 1) / step) - 1;
+}
+// The smallest class that holds `size` and whose objects are multiples of `alignment` (<= 4096; 16384 always qualifies).
+uint32_t class_for(uint64_t size, uint64_t alignment) {
+  uint32_t c = class_of(size);
+  while (kClassSize[c] & (alignment - 1)) ++c;
+  return c;
+}
+uint32_t span_frames(uint32_t size) { return size <= 256 ? 4 : size <= 1024 ? 16 : size <= 4096 ? 32 : 64; }
+// How many free objects a core's magazine collects before it goes to the depot (32 KiB worth, 8 to 256 objects).
+constexpr uint32_t magazine_limit(uint32_t size) { return 32768 / size < 8 ? 8 : 32768 / size > 256 ? 256 : 32768 / size; }
+// offset / size as (offset * reciprocal) >> 40, exact for offsets below 2^24 (spans are 256 KiB at most): the error is below
+// offset / 2^40, which is less than the 1 / size a quotient needs to change.
+constexpr uint64_t reciprocal_of(uint32_t size) { return (uint64_t{1} << 40) / size + 1; }
+
+// The allocator's own bookkeeping lives in memory it hands out: span headers at the end of each span, free-list links inside free
+// objects, the cache tables in the frame allocator's metadata. Each of those types is plain integers and pointers (implicit-lifetime),
+// the addresses are aligned for them (span ends and objects are multiples of 16, metadata of 64), and the memory is owned by the
+// allocator for as long as the object is used that way.
+template <class T> T* place(uint64_t address) { return reinterpret_cast<T*>(address); }
+uint64_t address_of(const void* p) { return reinterpret_cast<uint64_t>(p); }
+
+}  // namespace
+
+// The last 64 bytes of every span.
+struct alignas(64) Allocator::Span {
+  uint64_t magic;
+  uint64_t base;          // the first object, which is the span's first frame
+  uint32_t size;          // of each object
+  uint32_t capacity;      // objects in the span
+  uint32_t frames;
+  uint8_t cls;
+  uint8_t dma;
+  uint32_t trim_free;     // reclaim() only: free objects seen
+  Span* trim_next;        // reclaim() only: spans to give back
+  uint64_t reciprocal;    // reciprocal_of(size): finds an object's index without a division
+  uint32_t limit;         // magazine_limit(size)
+  uint32_t end;           // capacity * size: offsets past it are not objects
+};
+
+// A free object. A list of them is a magazine; its first object also knows the length and the last object, so that lists join in O(1).
+struct Allocator::FreeObject {
+  FreeObject* next;
+  uint64_t count;     // (head only)
+  FreeObject* tail;   // (head only)
+  uint64_t cookie;    // kFreeCookie ^ address while free
+};
+
+struct Allocator::Caches {
+  struct alignas(64) Core {
+    FreeObject* cell[2][kClassCount];   // [dma][class]: this core's magazine
+  };
+  Core cores[PageFrameAllocator::kCoreSlots];
+  FreeObject* depot[2][kClassCount][kDepotSlots];
+};
+
+namespace {
+
+template <class Object>
+uint64_t cookie_of(const Object* o) { return kFreeCookie ^ address_of(o); }
+
+template <class Object>
+void push(Object*& head, Object* o) {
+  o->next = head;
+  o->count = head ? head->count + 1 : 1;
+  o->tail = head ? head->tail : o;
+  o->cookie = cookie_of(o);
+  head = o;
+}
+template <class Object>
+Object* pop(Object*& head) {
+  Object* o = head;
+  Object* n = o->next;
+  if (n) {
+    n->count = o->count - 1;
+    n->tail = o->tail;
+  }
+  head = n;
+  o->cookie = 0;
+  return o;
+}
+template <class Object>
+Object* join(Object* a, Object* b) {
+  if (!a) return b;
+  if (!b) return a;
+  a->tail->next = b;
+  a->count += b->count;
+  a->tail = b->tail;
+  return a;
+}
+template <class Object>
+Object* take(Object** cell) { return __atomic_exchange_n(cell, static_cast<Object*>(nullptr), __ATOMIC_ACQUIRE); }
+template <class Object>
+bool put(Object** cell, Object* list) {
+  Object* expected = nullptr;
+  return __atomic_compare_exchange_n(cell, &expected, list, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
 
-// Puts [start, end) (block-aligned, at least two blocks) on the free list of its pool, merging with neighbours.
-void Allocator::add_run(uint64_t start, uint64_t end) {
-  auto* h = reinterpret_cast<Header*>(start);
-  h->magic = Header::kUsed;  // deallocate() does the insertion and merging for a used run
-  h->blocks = (end - start) / kBlock;
-  h->next = nullptr;
-  total_bytes_ += end - start;
-  deallocate(reinterpret_cast<uint8_t*>(h) + kBlock);
+}  // namespace
+
+void Allocator::set_core_source(uint32_t (*core)()) {
+  __atomic_store_n(&core_, core, __ATOMIC_RELEASE);
+  frames_.set_core_source(core);
+}
+
+bool Allocator::add_area(uint64_t base, uint64_t bytes) {
+  if (caches_) return frames_.add_region(base, bytes);
+  void* extra = nullptr;
+  if (!frames_.add_region(base, bytes, sizeof(Caches), &extra)) return false;
+  caches_ = place<Caches>(address_of(extra));   // (zeroed: every magazine and depot slot empty)
+  return true;
 }
 
 bool Allocator::initialize() {
-  static_assert(sizeof(Header) == kBlockSize, "header must fill exactly one block");
-  free_low_ = free_high_ = nullptr;
-  total_bytes_ = 0;
-  for (auto& pool : small_) for (Header*& top : pool) top = nullptr;
-  small_free_[0] = small_free_[1] = 0;
-  auto start = reinterpret_cast<uint64_t>(ram_.base());
-  uint64_t end = start + ram_.usable_bytes();
-  start = (start + kBlock - 1) & ~(kBlock - 1);
-  end &= ~(kBlock - 1);
-  if (end < start + 2 * kBlock) return false;
-  if (start < kLowLimit && end > kLowLimit) return add_region(reinterpret_cast<void*>(start), end - start);
-  add_run(start, end);
-  return true;
+  static_assert(sizeof(Span) == 64, "a span header is one cache line");
+  static_assert(sizeof(FreeObject) == 32, "a free object fits the smallest class");
+  frames_.reset();
+  caches_ = nullptr;
+  reclaiming_ = 0;
+  return add_region(ram_.base(), ram_.usable_bytes()) && caches_;
 }
 
 bool Allocator::add_region(void* base, uint64_t bytes) {
-  uint64_t start = (reinterpret_cast<uint64_t>(base) + kBlock - 1) & ~(kBlock - 1);
-  uint64_t end = (reinterpret_cast<uint64_t>(base) + bytes) & ~(kBlock - 1);
-  if (!base || bytes == 0 || end < start + 2 * kBlock) return false;
-  if (start < kLowLimit && end > kLowLimit) {  // one run per pool
-    if (kLowLimit - start >= 2 * kBlock) add_run(start, kLowLimit);
-    if (end - kLowLimit >= 2 * kBlock) add_run(kLowLimit, end);
-    return true;
+  const uint64_t start = address_of(base);
+  if (!base || bytes == 0 || bytes > UINT64_MAX - start) return false;
+  const uint64_t end = start + bytes;
+  if (start < kLowLimit && end > kLowLimit) {   // one area per pool
+    const bool low = add_area(start, kLowLimit - start);
+    const bool high = add_area(kLowLimit, end - kLowLimit);
+    return low || high;
   }
-  add_run(start, end);
-  return true;
+  return add_area(start, bytes);
 }
 
-void* Allocator::allocate_from(Header** list, uint64_t size) {
-  if (size == 0 || size > UINT64_MAX - 2 * kBlock) return nullptr;
-  const uint64_t need = 1 + (size + kBlock - 1) / kBlock;  // header + payload
+Allocator::FreeObject** Allocator::core_cell(bool dma, uint32_t cls) {
+  uint32_t (*core)() = __atomic_load_n(&core_, __ATOMIC_ACQUIRE);
+  const uint32_t slot = core ? core() % PageFrameAllocator::kCoreSlots : 0;
+  return &caches_->cores[slot].cell[dma][cls];
+}
 
-  Header** link = list;
-  for (Header* h = *list; h; link = &h->next, h = h->next) {
-    if (h->blocks < need) continue;
-    if (h->blocks - need >= 2) {  // split: keep the tail as a free run
-      auto* tail = reinterpret_cast<Header*>(reinterpret_cast<uint8_t*>(h) + need * kBlock);
-      tail->magic = Header::kFree;
-      tail->blocks = h->blocks - need;
-      tail->next = h->next;
-      *link = tail;
-      h->blocks = need;
-    } else {
-      *link = h->next;
-    }
-    h->magic = Header::kUsed;
-    h->next = nullptr;
-    return reinterpret_cast<uint8_t*>(h) + kBlock;
+Allocator::FreeObject* Allocator::depot_pop(bool dma, uint32_t cls) {
+  for (FreeObject*& cell : caches_->depot[dma][cls]) {
+    if (!__atomic_load_n(&cell, __ATOMIC_RELAXED)) continue;
+    if (FreeObject* list = take(&cell)) return list;
   }
   return nullptr;
 }
 
-void* Allocator::allocate_aligned_from(Header** list, uint64_t size, uint64_t alignment) {
-  if (alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;
-  if (alignment <= kBlock) return allocate_from(list, size);  // blocks are already aligned
-  if (size > UINT64_MAX - alignment) return nullptr;
-
-  // Over-allocate, then place a marker block in front of the aligned address.
-  auto* raw = static_cast<uint8_t*>(allocate_from(list, size + alignment));
-  if (!raw) return nullptr;
-  uint64_t aligned = (reinterpret_cast<uint64_t>(raw) + alignment - 1) & ~(alignment - 1);
-  if (aligned == reinterpret_cast<uint64_t>(raw)) return raw;
-
-  // aligned >= raw + kBlock, so the marker block lies inside our own payload.
-  auto* marker = reinterpret_cast<Header*>(aligned - kBlock);
-  marker->magic = Header::kAligned;
-  marker->blocks = 0;
-  marker->next = reinterpret_cast<Header*>(raw - kBlock);  // the real header
-  return reinterpret_cast<void*>(aligned);
-}
-
-void* Allocator::allocate_small(int pool, Header** list, uint64_t size) {
-  const uint64_t need = 1 + (size + kBlock - 1) / kBlock;
-  Header*& top = small_[pool][need];
-  if (!top) {   // refill: one run from the list, cut into blocks of this size
-    uint64_t count = kSlabBytes / (need * kBlock);
-    if (count < 4) count = 4;
-    auto* slab = static_cast<uint8_t*>(allocate_from(list, need * count * kBlock - kBlock));
-    if (!slab) return allocate_from(list, size);   // (too fragmented for a slab: this one block, as before)
-    auto* first = reinterpret_cast<Header*>(slab - kBlock);
-    const uint64_t blocks = first->blocks;   // need * count, or one more when the list could not split the last block off
-    for (uint64_t i = 0; i < count; ++i) {
-      auto* h = reinterpret_cast<Header*>(reinterpret_cast<uint8_t*>(first) + i * need * kBlock);
-      h->blocks = need + (i + 1 == count ? blocks - need * count : 0);
-      h->magic = Header::kSmall;
-      Header*& stack = small_[pool][h->blocks];
-      h->next = stack;
-      stack = h;
-      small_free_[pool] += h->blocks * kBlock;
+void Allocator::depot_push(bool dma, uint32_t cls, FreeObject* list) {
+  FreeObject* (&cells)[kDepotSlots] = caches_->depot[dma][cls];
+  for (;;) {
+    for (FreeObject*& cell : cells)
+      if (!__atomic_load_n(&cell, __ATOMIC_RELAXED) && put(&cell, list)) return;
+    // Every slot is taken: join one of the lists to ours and look for room again.
+    for (FreeObject*& cell : cells) {
+      if (FreeObject* other = take(&cell)) {
+        list = join(list, other);
+        if (put(&cell, list)) return;
+        break;
+      }
     }
   }
-  Header* h = top;
-  if (!h) return nullptr;
-  top = h->next;
-  small_free_[pool] -= h->blocks * kBlock;
-  h->magic = Header::kUsed;
-  h->next = nullptr;
-  return reinterpret_cast<uint8_t*>(h) + kBlock;
 }
 
-void* Allocator::allocate_general(int pool, Header** list, uint64_t size) {
-  if (size == 0 || size > UINT64_MAX - 2 * kBlock) return nullptr;
-  if (1 + (size + kBlock - 1) / kBlock <= kSmallBlocks) return allocate_small(pool, list, size);
-  return allocate_from(list, size);
+Allocator::FreeObject* Allocator::new_span(uint32_t cls, bool dma) {
+  const uint32_t size = kClassSize[cls], frames = span_frames(size);
+  const uint64_t base = frames_.allocate(frames, 1, dma);
+  if (!base) return nullptr;
+  Span* span = place<Span>(base + frames * kFrame - sizeof(Span));
+  span->magic = kSpanMagic;
+  span->base = base;
+  span->size = size;
+  span->capacity = static_cast<uint32_t>((frames * kFrame - sizeof(Span)) / size);
+  span->frames = frames;
+  span->cls = static_cast<uint8_t>(cls);
+  span->dma = dma;
+  span->trim_free = 0;
+  span->trim_next = nullptr;
+  span->reciprocal = reciprocal_of(size);
+  span->limit = magazine_limit(size);
+  span->end = span->capacity * size;
+  for (uint32_t f = 0; f < frames; ++f) __atomic_store_n(frames_.frame_tag(base + f * kFrame), address_of(span) | kTagSpan, __ATOMIC_RELEASE);
+  FreeObject* list = nullptr;
+  for (uint32_t i = span->capacity; i-- > 0;) push(list, place<FreeObject>(base + uint64_t{i} * size));
+  return list;
+}
+
+void* Allocator::allocate_small(uint32_t cls, bool dma) {
+  if (!caches_) return nullptr;
+  FreeObject** cell = core_cell(dma, cls);
+  FreeObject* list = take(cell);
+  if (!list) list = depot_pop(dma, cls);
+  if (!list) list = new_span(cls, dma);
+  if (!list) return nullptr;
+  FreeObject* o = pop(list);
+  if (list && !put(cell, list)) depot_push(dma, cls, list);   // (someone on this core filled the cell meanwhile)
+  return o;
+}
+
+void* Allocator::allocate_frames(uint64_t size, uint64_t alignment, bool dma) {
+  if (size > UINT64_MAX - kFrame) return nullptr;
+  const uint64_t frames = (size + kFrame - 1) / kFrame;
+  const uint64_t base = frames_.allocate(frames, alignment > kFrame ? alignment / kFrame : 1, dma);
+  if (!base) return nullptr;
+  __atomic_store_n(frames_.frame_tag(base), (frames << 2) | kTagLarge, __ATOMIC_RELEASE);
+  return place<void>(base);
+}
+
+void* Allocator::allocate_with_reclaim(uint64_t size, uint64_t alignment, bool dma) {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    void* p = size <= kMaxSmall && alignment <= kFrame ? allocate_small(class_for(size, alignment), dma) : allocate_frames(size, alignment, dma);
+    if (p) return p;
+    if (attempt == 0) reclaim();   // empty spans may hold the memory this needs
+  }
+  return nullptr;
 }
 
 void* Allocator::allocate(uint64_t size) {
-  if (size == 0 || size > UINT64_MAX - 2 * kBlock) return nullptr;
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    if (void* p = allocate_general(1, &free_high_, size)) return p;
-    if (void* p = allocate_general(0, &free_low_, size)) return p;
-    flush_small();   // the stacks may hold the memory this needs, in pieces
-  }
-  return nullptr;
+  if (size == 0) return nullptr;
+  return allocate_with_reclaim(size, 1, false);
 }
 
 void* Allocator::allocate_aligned(uint64_t size, uint64_t alignment) {
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    if (void* p = allocate_aligned_from(&free_high_, size, alignment)) return p;
-    if (void* p = allocate_aligned_from(&free_low_, size, alignment)) return p;
-    flush_small();
-  }
-  return nullptr;
+  if (size == 0 || alignment == 0 || (alignment & (alignment - 1))) return nullptr;
+  return allocate_with_reclaim(size, alignment, false);
 }
 
 void* Allocator::allocate_dma(uint64_t size, uint64_t alignment) {
-  if (void* p = allocate_aligned_from(&free_low_, size, alignment)) return p;
-  flush_small();
-  return allocate_aligned_from(&free_low_, size, alignment);
+  if (size == 0 || alignment == 0 || (alignment & (alignment - 1))) return nullptr;
+  return allocate_with_reclaim(size, alignment, true);
 }
 
-void Allocator::flush_small() {
-  for (int pool = 0; pool < 2; ++pool) {
-    for (Header*& top : small_[pool]) {
-      while (Header* h = top) {
-        top = h->next;
-        insert_free(h);
-      }
-    }
-    small_free_[pool] = 0;
-  }
+Allocator::Span* Allocator::span_of(const void* object) const {
+  const uint64_t* tag = frames_.frame_tag(address_of(object) & ~(kFrame - 1));
+  if (!tag) return nullptr;
+  const uint64_t t = __atomic_load_n(tag, __ATOMIC_ACQUIRE);
+  return (t & kTagKind) == kTagSpan ? place<Span>(t & ~kTagKind) : nullptr;
+}
+
+void Allocator::free_small(Span* span, void* ptr) {
+  const uint64_t offset = address_of(ptr) - span->base;
+  if (span->magic != kSpanMagic || offset >= span->end || ((offset * span->reciprocal) >> 40) * span->size != offset) return;   // not an object we handed out
+  FreeObject* o = place<FreeObject>(address_of(ptr));
+  if (o->cookie == cookie_of(o)) return;   // already free (a second free of the same pointer does nothing)
+  const bool dma = span->dma;
+  const uint32_t cls = span->cls;
+  FreeObject** cell = core_cell(dma, cls);
+  FreeObject* list = take(cell);
+  push(list, o);
+  if (list->count >= span->limit) depot_push(dma, cls, list);
+  else if (!put(cell, list)) depot_push(dma, cls, list);
 }
 
 void Allocator::deallocate(void* ptr) {
   if (!ptr) return;
-  auto* h = reinterpret_cast<Header*>(static_cast<uint8_t*>(ptr) - kBlock);
-  if (h->magic == Header::kAligned) h = h->next;  // over-aligned: free the real block
-  if (h->magic != Header::kUsed) return;  // not ours, or a double free
-  if (h->blocks >= 2 && h->blocks <= kSmallBlocks) {   // a size stack: no list walk
-    const int pool = pool_of(h);
-    h->magic = Header::kSmall;
-    h->next = small_[pool][h->blocks];
-    small_[pool][h->blocks] = h;
-    small_free_[pool] += h->blocks * kBlock;
-    return;
-  }
-  insert_free(h);
-}
-
-void Allocator::insert_free(Header* h) {
-  h->magic = Header::kFree;
-  Header** list = list_for(h);
-  Header* prev = nullptr;
-  Header* cur = *list;
-  while (cur && cur < h) { prev = cur; cur = cur->next; }
-
-  h->next = cur;
-  if (prev) prev->next = h; else *list = h;
-
-  auto end_of = [](Header* x) {
-    return reinterpret_cast<uint8_t*>(x) + x->blocks * kBlock;
-  };
-  if (cur && end_of(h) == reinterpret_cast<uint8_t*>(cur)) {  // merge forward
-    h->blocks += cur->blocks;
-    h->next = cur->next;
-    cur->magic = 0;
-  }
-  if (prev && end_of(prev) == reinterpret_cast<uint8_t*>(h)) {  // merge back
-    prev->blocks += h->blocks;
-    prev->next = h->next;
-    h->magic = 0;
+  const uint64_t address = address_of(ptr);
+  uint64_t* tag = frames_.frame_tag(address & ~(kFrame - 1));
+  if (!tag) return;   // not ours
+  uint64_t t = __atomic_load_n(tag, __ATOMIC_ACQUIRE);
+  if ((t & kTagKind) == kTagLarge) {
+    // Clearing the tag first makes a second free of the same pointer find nothing.
+    if ((address & (kFrame - 1)) == 0 && __atomic_compare_exchange_n(tag, &t, 0, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+      frames_.free(address, t >> 2);
+  } else if ((t & kTagKind) == kTagSpan) {
+    free_small(place<Span>(t & ~kTagKind), ptr);
   }
 }
 
-uint64_t Allocator::free_bytes_of(const Header* list) {
-  uint64_t total = 0;
-  for (const Header* h = list; h; h = h->next) total += (h->blocks - 1) * kBlock;
-  return total;
+// Takes every magazine and depot list (an exchange each, so no core is stopped), counts the free objects of each span, gives back the
+// spans that are entirely free and returns the other objects to the depot. Objects in a magazine that a caller holds at that moment
+// are not seen, which only keeps their spans for the next time.
+void Allocator::reclaim() {
+  if (!caches_ || __atomic_exchange_n(&reclaiming_, 1u, __ATOMIC_ACQUIRE)) return;
+  for (int dma = 0; dma < 2; ++dma) {
+    for (uint32_t cls = 0; cls < kClassCount; ++cls) {
+      FreeObject* all = nullptr;
+      for (Caches::Core& core : caches_->cores) all = join(all, take(&core.cell[dma][cls]));
+      for (FreeObject*& cell : caches_->depot[dma][cls]) all = join(all, take(&cell));
+      if (!all) continue;
+      for (FreeObject* o = all; o; o = o->next)
+        if (Span* s = span_of(o)) ++s->trim_free;
+      FreeObject* keep = nullptr;
+      Span* release = nullptr;
+      for (FreeObject* o = all; o;) {
+        FreeObject* next = o->next;
+        if (Span* s = span_of(o)) {
+          if (s->trim_free == s->capacity) {
+            s->trim_free = kReleasing;
+            s->trim_next = release;
+            release = s;
+          } else if (s->trim_free != kReleasing) {
+            push(keep, o);
+          }
+        }
+        o = next;
+      }
+      for (FreeObject* o = keep; o; o = o->next) span_of(o)->trim_free = 0;
+      if (keep) depot_push(dma, cls, keep);
+      while (release) {
+        Span* s = release;
+        release = s->trim_next;
+        const uint64_t base = s->base;
+        const uint32_t frames = s->frames;
+        s->magic = 0;
+        for (uint32_t f = 0; f < frames; ++f) __atomic_store_n(frames_.frame_tag(base + f * kFrame), uint64_t{0}, __ATOMIC_RELEASE);
+        frames_.free(base, frames);
+      }
+    }
+  }
+  __atomic_store_n(&reclaiming_, 0u, __ATOMIC_RELEASE);
 }
-
-uint64_t Allocator::free_bytes() const { return free_bytes_low() + free_bytes_high(); }   // (what sits on the size stacks is free too)
-uint64_t Allocator::free_bytes_low() const { return free_bytes_of(free_low_) + small_free_[0]; }
-uint64_t Allocator::free_bytes_high() const { return free_bytes_of(free_high_) + small_free_[1]; }
 
 }  // namespace allocators

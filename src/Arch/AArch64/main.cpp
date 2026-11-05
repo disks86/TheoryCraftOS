@@ -20,7 +20,6 @@
 // framebuffer, ACPI tables) come up here; the x86-only subsystems (PCI port access, interrupts, APIC,
 // threads, drivers) are not part of this image yet.
 #include "Allocators/Allocator.hpp"
-#include "Allocators/ThreadSafeAllocator.hpp"
 #include "Arch/AArch64/Cpu.hpp"
 #include "Arch/AArch64/Psci.hpp"
 #include "Arch/AArch64/Gic.hpp"
@@ -282,7 +281,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Interrupts: the GIC from the MADT, then exception vectors, the timer tick and the thread scheduler.
   hardware::AArch64Cpu cpu;
-  allocators::ThreadSafeAllocator shared_allocator(allocator, cpu);
+  // The allocator is lock-free and safe from every core as it is; it only needs to know which core calls (for its per-core caches).
+  allocators::IAllocator& shared_allocator = allocator;
+  allocator.set_core_source(kernel::current_core);
   if (acpi_ok) cpu.discover(acpi, shared_allocator);
   {
     const auto conduit = arch_aarch64::psci_conduit(acpi);

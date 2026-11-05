@@ -77,6 +77,7 @@ add_executable(BOOTX64
   src/console.cpp
   src/GraphicsConsole.cpp
   src/Allocators/Allocator.cpp
+  src/Allocators/PageFrameAllocator.cpp
   src/CPUScheduler/Scheduler.cpp
   src/runtime.cpp
   src/Hardware/CentralProcessingUnit/X86_64Cpu.cpp
