@@ -43,10 +43,6 @@ IMPORT HANDLE WINAPI CreateBitmap(int width, int height, UINT planes, UINT bits,
 IMPORT HANDLE WINAPI CreateDIBitmap(HANDLE hdc, const void *header, DWORD init, const void *bits, const void *info, UINT usage);
 IMPORT int WINAPI SetDIBits(HANDLE hdc, HANDLE bitmap, UINT start, UINT lines, const void *bits, const void *info, UINT usage);
 IMPORT BOOL WINAPI StretchBlt(HANDLE hdc, int x, int y, int cx, int cy, HANDLE source, int sx, int sy, int sw, int sh, DWORD rop);
-IMPORT HANDLE WINAPI FindResourceW(HANDLE module, LPCWSTR name, LPCWSTR type);
-IMPORT HANDLE WINAPI LoadResource(HANDLE module, HANDLE resource);
-IMPORT void *WINAPI LockResource(HANDLE resource);
-IMPORT DWORD WINAPI SizeofResource(HANDLE module, HANDLE resource);
 IMPORT HANDLE WINAPI CreateFileW(LPCWSTR name, DWORD access, DWORD share, void *security, DWORD disposition, DWORD flags, HANDLE template_file);
 IMPORT BOOL WINAPI ReadFile(HANDLE file, void *buffer, DWORD bytes, DWORD *read, void *overlapped);
 IMPORT DWORD WINAPI GetFileSize(HANDLE file, DWORD *high);

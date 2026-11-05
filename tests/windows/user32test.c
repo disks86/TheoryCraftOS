@@ -338,6 +338,87 @@ static void test_list_and_combo(HINSTANCE instance) {
   UnregisterClassA("TcosListParent", instance);
 }
 
+static int g_init_dialog, g_dlg_commands;
+static INT_PTR CALLBACK dialog_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  switch (message) {
+    case WM_INITDIALOG:
+      ++g_init_dialog;
+      SetDlgItemTextA(hwnd, 101, "from init");
+      SetDlgItemInt(hwnd, 102, 1234, FALSE);
+      CheckDlgButton(hwnd, 103, BST_CHECKED);
+      PostMessageA(hwnd, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+      return TRUE;
+    case WM_COMMAND:
+      ++g_dlg_commands;
+      if (LOWORD(wparam) == IDOK) { EndDialog(hwnd, 42); return TRUE; }
+      break;
+  }
+  return FALSE;
+}
+
+/* a dialog template in memory: a static, an edit, a check box and the OK button */
+static void put_word(WORD **p, WORD v) { *(*p)++ = v; }
+static void put_dword(WORD **p, DWORD v) { *(DWORD *)*p = v; *p += 2; }
+static void put_string(WORD **p, const wchar_t *s) { while (*s) *(*p)++ = (WORD)*s++; *(*p)++ = 0; }
+static void align4(WORD *base, WORD **p) { while (((char *)*p - (char *)base) & 3) *(*p)++ = 0; }
+static void put_item(WORD *base, WORD **p, DWORD style, short x, short y, short cx, short cy, WORD id, WORD cls, const wchar_t *text) {
+  align4(base, p);
+  put_dword(p, style | WS_CHILD | WS_VISIBLE); put_dword(p, 0);
+  put_word(p, (WORD)x); put_word(p, (WORD)y); put_word(p, (WORD)cx); put_word(p, (WORD)cy); put_word(p, id);
+  put_word(p, 0xFFFF); put_word(p, cls);
+  put_string(p, text);
+  put_word(p, 0);
+}
+
+static void test_dialogs(HINSTANCE instance) {
+  WORD buffer[512], *p = buffer;
+  memset(buffer, 0, sizeof buffer);
+  put_dword(&p, WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME); put_dword(&p, 0);
+  put_word(&p, 4);
+  put_word(&p, 10); put_word(&p, 10); put_word(&p, 120); put_word(&p, 70);
+  put_word(&p, 0); put_word(&p, 0);
+  put_string(&p, L"Test dialog");
+  put_item(buffer, &p, SS_LEFT, 5, 5, 50, 10, 100, 0x82, L"label");
+  put_item(buffer, &p, WS_TABSTOP | ES_AUTOHSCROLL, 5, 20, 50, 12, 101, 0x81, L"");
+  put_item(buffer, &p, WS_TABSTOP | BS_AUTOCHECKBOX, 5, 35, 50, 10, 103, 0x80, L"check");
+  put_item(buffer, &p, WS_TABSTOP | BS_DEFPUSHBUTTON, 60, 50, 40, 12, IDOK, 0x80, L"OK");
+  HWND owner = CreateWindowA("static", "owner", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 300, 200, NULL, NULL, instance, NULL);
+  g_init_dialog = 0; g_dlg_commands = 0;
+  INT_PTR r = DialogBoxIndirectParamA(instance, (LPCDLGTEMPLATEA)buffer, owner, dialog_proc, 0);
+  CHECK(r == 42 && g_init_dialog == 1 && g_dlg_commands >= 1);
+  CHECK(IsWindowEnabled(owner));
+
+  /* modeless: the items by id, text, numbers, check state, tab order */
+  HWND dlg = CreateDialogIndirectParamA(instance, (LPCDLGTEMPLATEA)buffer, owner, dialog_proc, 0);
+  CHECK(dlg != NULL && IsWindow(dlg));
+  if (dlg) {
+    char text[32];
+    HWND edit = GetDlgItem(dlg, 101);
+    CHECK(edit != NULL && GetDlgCtrlID(edit) == 101 && GetParent(edit) == dlg && GetDlgItem(dlg, 999) == NULL);
+    CHECK(GetDlgItemTextA(dlg, 101, text, sizeof text) == 9 && !strcmp(text, "from init"));
+    BOOL ok = FALSE;
+    SetDlgItemTextA(dlg, 101, "77");
+    CHECK(GetDlgItemInt(dlg, 101, &ok, FALSE) == 77 && ok);
+    SetDlgItemTextA(dlg, 101, "x");
+    GetDlgItemInt(dlg, 101, &ok, FALSE);
+    CHECK(!ok);
+    CHECK(IsDlgButtonChecked(dlg, 103) == BST_CHECKED);
+    CheckDlgButton(dlg, 103, BST_UNCHECKED);
+    CHECK(IsDlgButtonChecked(dlg, 103) == BST_UNCHECKED);
+    CHECK(GetNextDlgTabItem(dlg, edit, FALSE) == GetDlgItem(dlg, 103) && GetNextDlgTabItem(dlg, edit, TRUE) == GetDlgItem(dlg, IDOK));
+    CHECK(GetDlgItemTextA(dlg, 100, text, sizeof text) == 5 && !strcmp(text, "label"));
+    CHECK(SendDlgItemMessageA(dlg, 101, WM_GETTEXTLENGTH, 0, 0) == 1);
+    RECT r1 = {0, 0, 4, 8};
+    CHECK(MapDialogRect(dlg, &r1) && r1.right > 0 && r1.bottom > 0);
+    CHECK(GetWindowLongPtrA(dlg, DWLP_DLGPROC) == (LONG_PTR)dialog_proc);
+    SendMessageA(dlg, DM_SETDEFID, IDOK, 0);
+    CHECK(LOWORD(SendMessageA(dlg, DM_GETDEFID, 0, 0)) == IDOK);
+    CHECK(DestroyWindow(dlg) && !IsWindow(edit));
+  }
+  CHECK(DialogBoxIndirectParamA(instance, NULL, owner, dialog_proc, 0) == -1);
+  DestroyWindow(owner);
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -467,6 +548,7 @@ int main(void) {
   test_icons_and_carets(instance);
   test_scroll_bars(instance);
   test_list_and_combo(instance);
+  test_dialogs(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

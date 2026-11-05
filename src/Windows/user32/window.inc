@@ -85,6 +85,7 @@ SVC NtUserKillTimer(ULONG_PTR hwnd, ULONG_PTR id);
 SVC NtUserCallHwnd(ULONG_PTR hwnd, ULONG_PTR code);
 SVC NtUserCallHwndParam(ULONG_PTR hwnd, ULONG_PTR param, ULONG_PTR code);
 SVC NtUserCallOneParam(ULONG_PTR param, ULONG_PTR code);
+SVC NtUserCallNoParam(ULONG_PTR code);
 SVC NtUserCallTwoParam(ULONG_PTR a, ULONG_PTR b, ULONG_PTR code);
 SVC NtUserGetThreadState(ULONG_PTR what);
 SVC NtUserGetAncestor(ULONG_PTR hwnd, ULONG_PTR type);
@@ -106,6 +107,10 @@ SVC NtUserRemoveProp(ULONG_PTR hwnd, ULONG_PTR name);
 IMPORT int WINAPI MultiByteToWideChar(UINT code_page, DWORD flags, LPCSTR source, int source_length, LPWSTR destination, int destination_length);
 IMPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR source, int source_length, LPSTR destination, int destination_length, LPCSTR default_char, LPBOOL used_default);
 IMPORT HANDLE WINAPI GetModuleHandleW(LPCWSTR name);
+IMPORT HANDLE WINAPI FindResourceW(HANDLE module, LPCWSTR name, LPCWSTR type);
+IMPORT HANDLE WINAPI LoadResource(HANDLE module, HANDLE resource);
+IMPORT void *WINAPI LockResource(HANDLE resource);
+IMPORT DWORD WINAPI SizeofResource(HANDLE module, HANDLE resource);
 IMPORT void *WINAPI GetProcessHeap(void);
 IMPORT void *WINAPI HeapAlloc(void *heap, DWORD flags, SIZE_T bytes);
 IMPORT BOOL WINAPI HeapFree(void *heap, DWORD flags, void *memory);
@@ -348,6 +353,16 @@ static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags
 /* (the controls below use these before they are defined) */
 #define BOOL_OF(x) (((x) & 0xFFFFFFFFu) != 0)
 EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd);
+EXPORT LONG_PTR WINAPI DispatchMessageW(const MSG_ *msg);
+EXPORT int WINAPI GetMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last);
+EXPORT BOOL WINAPI TranslateMessage(const MSG_ *msg);
+EXPORT BOOL WINAPI PostMessageW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
+EXPORT void WINAPI PostQuitMessage(int code);
+EXPORT HANDLE WINAPI GetActiveWindow(void);
+EXPORT HANDLE WINAPI SetActiveWindow(HANDLE hwnd);
+EXPORT BOOL WINAPI IsWindow(HANDLE window);
+EXPORT int WINAPI GetWindowTextA(HANDLE hwnd, LPSTR buffer, int count);
+EXPORT int WINAPI GetSystemMetrics(int index);
 EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect);
 EXPORT BOOL WINAPI EnableWindow(HANDLE hwnd, BOOL enable);
 EXPORT BOOL WINAPI DestroyWindow(HANDLE hwnd);
@@ -376,11 +391,12 @@ EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
 #include "scroll.inc"
 #include "listbox.inc"
 #include "combo.inc"
+#include "dialog.inc"
 static void builtin_classes(void) {
   static volatile LONG done;
   static const struct { const WCHAR *name; UINT style; int wnd_extra; WNDPROC_ proc; } classes[] = {
       {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 8, combo_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 8, listbox_proc}, {L"MDIClient", 0, 0, builtin_proc},
-      {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 8, listbox_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, builtin_proc},
+      {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 8, listbox_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, DefDlgProcW},
       {L"#32771", 0x803, 0, builtin_proc}, {L"#32772", 0, 0, builtin_proc}, {L"IME", 0, 0, builtin_proc}, {L"SysLink", 0x8, 0, builtin_proc}, {L"tooltips_class32", 0x8, 0, builtin_proc}};
   if (__sync_lock_test_and_set(&done, 1)) return;
   for (size_t_ i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
@@ -572,7 +588,7 @@ EXPORT LONG WINAPI GetWindowLongA(HANDLE hwnd, int index) {
 EXPORT LONG_PTR WINAPI GetWindowLongPtrW(HANDLE hwnd, int index) { return (LONG_PTR)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_W); }
 EXPORT LONG_PTR WINAPI GetWindowLongPtrA(HANDLE hwnd, int index) {
   const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_A);
-  return (LONG_PTR)(index == -4 ? ansi_unwrap(v) : v);
+  return (LONG_PTR)((index == -4 || index == 8 /* DWLP_DLGPROC */) ? ansi_unwrap(v) : v);
 }
 EXPORT WORD WINAPI GetWindowWord(HANDLE hwnd, int index) { return (WORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_WORD); }
 EXPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value) { return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0); }
