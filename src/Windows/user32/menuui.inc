@@ -269,6 +269,14 @@ static void menu_draw_string(HANDLE hdc, const WCHAR *s, int n, int x, int y, in
 }
 static void menu_draw_bitmap(HANDLE hdc, HANDLE bitmap, int x, int y) {
   Bitmap_ bm;
+  if (((ULONG_PTR)bitmap >> 16) == 0 && (ULONG_PTR)bitmap >= 1 && (ULONG_PTR)bitmap <= 8) {      /* the magic bitmaps of the MDI buttons: drawn as a letter */
+    static const WCHAR glyph[9] = {0, L'-', L'o', L'_', L'_', L'x', L'x', L'o', L'x'};
+    SIZE_ unit;
+    GetTextExtentPoint32W(hdc, L"Ay", 2, &unit);
+    SetTextColor(hdc, GetSysColor(COLOR_MENUTEXT_));
+    ExtTextOutW(hdc, x + 4, y + 2, 0, NULL, &glyph[(ULONG_PTR)bitmap], 1, NULL);
+    return;
+  }
   if (((ULONG_PTR)bitmap >> 16) == 0 || (ULONG_PTR)bitmap == (ULONG_PTR)-1 || GetObjectW(bitmap, sizeof bm, &bm) == 0) return;
   HANDLE mem = CreateCompatibleDC(hdc);
   if (!mem) return;
@@ -629,10 +637,11 @@ static void mt_mouse(MTrack_ *t, UINT message, int px, int py) {
 /* The modal loop; the levels already open are the menu's. */
 static void mt_loop(MTrack_ *t) {
   HANDLE old_capture = GetCapture();
-  SetCapture(t->owner);
+  SetCapture(t->depth > 0 && t->lv[0].hwnd ? t->lv[0].hwnd : t->owner);      /* (a popup menu holds the capture itself, so the window that had it hears of it) */
   MSG_ msg;
   BOOL idle_sent = FALSE;
   while (!t->done) {
+    if (!IsWindow(t->owner)) break;      /* the owner is gone: the menu ends */
     if (!idle_sent && !PeekMessageW(&msg, NULL, 0, 0, 0 /* PM_NOREMOVE */)) {      /* no input: the owner is told once, as Windows does */
       idle_sent = TRUE;
       MLevel_ *top = &t->lv[t->depth > 0 ? t->depth - 1 : 0];
@@ -663,7 +672,7 @@ static void mt_loop(MTrack_ *t) {
     DispatchMessageW(&msg);
   }
   ReleaseCapture();
-  if (old_capture) SetCapture(old_capture);
+  if (old_capture && IsWindow(old_capture)) SetCapture(old_capture);
 }
 
 static void mt_finish(MTrack_ *t, BOOL popup_loop) {
@@ -794,7 +803,7 @@ static void menu_bar_track(HANDLE hwnd, int first, BOOL open, BOOL mouse) {
   SendMessageW(hwnd, WM_ENTERMENULOOP_, 0, 0);
   SendMessageW(hwnd, WM_INITMENU_, (ULONG_PTR)menu, 0);
   MLevel_ *lv = &t->lv[0];
-  if (menu_view_build(menu, TRUE, hwnd, &lv->view)) {
+  if (menu_view_build(menu, TRUE, hwnd, &lv->view) && lv->view.count > 0) {      /* (a bar without items is not entered) */
     menu_bar_justify(&lv->view, br.right - br.left);
     lv->menu = menu; lv->bar = TRUE; lv->sel = -1; lv->x = br.left; lv->y = br.top;
     t->depth = 1;

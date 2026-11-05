@@ -203,6 +203,7 @@ static int a_string_in_message(HANDLE hwnd, UINT message) {
   return 1;
 }
 
+static void *g_mdi_params;      /* WM_MDICREATE from an A caller: the structure the new child gets as its creation parameter */
 /* A caller, W callee. */
 static LONG_PTR a_to_w(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
   LONG_PTR result;
@@ -282,6 +283,18 @@ static LONG_PTR a_to_w(MsgFn fn, void *ctx, HANDLE hwnd, UINT message, ULONG_PTR
     w.name = a->name; w.cls = a->cls;
     *a = w;
     wide_free(name, a->name); wide_free(cls, a->cls);
+    return result;
+  }
+  if (message == 0x0220 /* WM_MDICREATE: the MDICREATESTRUCTA's strings; the child still gets the program's structure as its creation parameter */ && lparam) {
+    typedef struct { const void *cls, *title; HANDLE owner; int x, y, cx, cy; DWORD style; LONG_PTR lparam; } MdiCs_;
+    const MdiCs_ *a = (const MdiCs_ *)lparam;
+    MdiCs_ w = *a;
+    WCHAR *cls = wide_of((const char *)a->cls), *title = wide_of((const char *)a->title);
+    w.cls = cls; w.title = title;
+    g_mdi_params = (void *)lparam;
+    result = fn(ctx, hwnd, message, wparam, (LONG_PTR)&w);
+    g_mdi_params = NULL;
+    wide_free(cls, (const char *)a->cls); wide_free(title, (const char *)a->title);
     return result;
   }
   if (is_char_message(message)) wparam = char_to_wide(wparam);
@@ -400,15 +413,18 @@ EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
 #include "hooks.inc"
 #include "controls.inc"
 #include "scroll.inc"
+#include "scrollwin.inc"
 #include "listbox.inc"
 #include "combo.inc"
 #include "dialog.inc"
 #include "menu.inc"
 #include "menuui.inc"
+static LONG_PTR def_proc_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
+#include "mdi.inc"
 static void builtin_classes(void) {
   static volatile LONG done;
   static const struct { const WCHAR *name; UINT style; int wnd_extra; WNDPROC_ proc; } classes[] = {
-      {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 8, combo_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 8, listbox_proc}, {L"MDIClient", 0, 0, builtin_proc},
+      {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 8, combo_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 8, listbox_proc}, {L"MDIClient", 0, 0, mdiclient_proc},
       {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 8, listbox_proc}, {L"#32768", 0x20808, 0, menu_proc}, {L"#32770", 0x808, 30, DefDlgProcW},
       {L"#32771", 0x803, 0, builtin_proc}, {L"#32772", 0, 0, builtin_proc}, {L"IME", 0, 0, builtin_proc}, {L"SysLink", 0x8, 0, builtin_proc}, {L"tooltips_class32", 0x8, 0, builtin_proc}};
   if (__sync_lock_test_and_set(&done, 1)) return;
@@ -554,6 +570,7 @@ static HANDLE create_window(DWORD ex_style, const WCHAR *class_name, const WCHAR
   UNICODE_STRING class_us, title_us, version_us = {0, 0, NULL};
   builtin_classes();
   if (!class_name) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+  if ((ex_style & 0x40 /* WS_EX_MDICHILD */) && parent && !g_mdi_creating && is_mdi_client(parent)) return mdi_create_through_client(parent, class_name, title, style, x, y, cx, cy, instance, params, ansi);
   us_name(&class_us, class_name);
   if (title) us_name(&title_us, title);
   if (!instance) instance = GetModuleHandleW(NULL);

@@ -98,6 +98,15 @@ system metrics (NtUserCallOneParam). Calls follow Wine's `ntuser` interface (the
   WH_CALLWNDPROCRET for SendMessage and DispatchMessage (a hook that sends a message does not raise them again), WH_CBT for DestroyWindow, SetFocus, SetActiveWindow, ShowWindow (min/max/restore)
   with the veto of Windows. The start of a chain is `NtUserCallNextHookEx((1 << 32) | (id + 1), ...)`. Counters per hook id keep the no-hook case free of system calls. Not done: HCBT_CREATEWND,
   HCBT_MOVESIZE / SYSCOMMAND / CLICKSKIPPED, WH_SHELL / FOREGROUNDIDLE / DEBUG, hooks in other processes, WH_CALLWNDPROC for messages sent by another thread.
+* Scrolling (`scrollwin.inc`): ScrollDC, ScrollWindowEx and ScrollWindow copy the pixels in the window's device context and invalidate the uncovered strip (up to four rectangles, as the update
+  region or rectangle too); SW_SCROLLCHILDREN moves the child windows; the update region the window already had is not moved along. GetScrollBarInfo answers for OBJID_VSCROLL / HSCROLL (the strip
+  beside or below the client area; arrow size, thumb) and for a scroll bar control (OBJID_CLIENT).
+* MDI (`mdi.inc`): the "MDIClient" class (WM_MDICREATE / DESTROY / ACTIVATE / RESTORE / NEXT / MAXIMIZE / TILE / CASCADE / ICONARRANGE / GETACTIVE / SETMENU / REFRESHMENU), DefFrameProc,
+  DefMDIChildProc, CreateMDIWindow, CreateWindowEx with WS_EX_MDICHILD under a client (the child gets the MDICREATESTRUCT, the program's parameter is its lParam), TileWindows, CascadeWindows,
+  ArrangeIconicWindows. The client's state block is in its private data; children get ids from CLIENTCREATESTRUCT.idFirstChild; the window menu lists them ("&1 title", the active one
+  checked); a maximized child (or a WM_SIZE with SIZE_MAXIMIZED sent to it) puts the system icon and the minimize / restore / close buttons (magic bitmaps, drawn as letters) in the frame's
+  menu bar. Not done: MDIS_ALLCHILDSTYLES style rules of Windows, the "More windows" dialog, a maximized child's caption, TranslateMDISysAccel, WM_MDICREATE sent with the A structure from
+  another process.
 * Menus: `menu.inc` is the data half over win32k's HMENU objects: AppendMenu/InsertMenu/ModifyMenu/ChangeMenu (MF_ flags turned into MENUITEMINFO; MF_DEFAULT is not taken; an item without a
   string is a separator, which is grayed; a bad submenu handle is kept and the error set), the MENUITEMINFO calls, GetMenuString, CheckMenuItem/RadioItem, EnableMenuItem, defaults, bitmaps, MENUINFO,
   SetMenu/GetMenu (SetMenu changes the client area), GetSystemMenu, LoadMenu/LoadMenuIndirect from resources (old and extended templates). `menuui.inc` is the interface half: layout (a column or

@@ -790,6 +790,136 @@ static void test_menus(HINSTANCE instance) {
   DestroyMenu(menu);
 }
 
+/* ---- scrolling ---- */
+static void test_scrolling(HINSTANCE instance) {
+  HWND hwnd = CreateWindowExA(0, "Static", "x", WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_VSCROLL, 10, 10, 300, 200, NULL, NULL, instance, NULL);
+  CHECK(hwnd != NULL);
+  HWND child = CreateWindowExA(0, "Static", "c", WS_CHILD | WS_VISIBLE, 20, 30, 40, 20, hwnd, NULL, instance, NULL);
+  SCROLLINFO si = {sizeof si, SIF_ALL, 0, 99, 10, 30, 0};
+  SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+  SCROLLBARINFO sbi;
+  memset(&sbi, 0, sizeof sbi);
+  sbi.cbSize = sizeof sbi;
+  CHECK(GetScrollBarInfo(hwnd, OBJID_VSCROLL, &sbi));
+  CHECK(sbi.rcScrollBar.right - sbi.rcScrollBar.left == GetSystemMetrics(SM_CXVSCROLL) && sbi.rcScrollBar.bottom > sbi.rcScrollBar.top);
+  CHECK(!(sbi.rgstate[0] & STATE_SYSTEM_INVISIBLE) && sbi.dxyLineButton > 0 && sbi.xyThumbBottom > sbi.xyThumbTop && sbi.xyThumbTop >= sbi.dxyLineButton);
+  memset(&sbi, 0, sizeof sbi);
+  sbi.cbSize = sizeof sbi;
+  CHECK(GetScrollBarInfo(hwnd, OBJID_HSCROLL, &sbi) && (sbi.rgstate[0] & STATE_SYSTEM_INVISIBLE));
+  sbi.cbSize = 4;
+  CHECK(!GetScrollBarInfo(hwnd, OBJID_VSCROLL, &sbi) && GetLastError() == ERROR_INVALID_PARAMETER);
+
+  /* ScrollWindowEx: the uncovered strip is invalid, children move */
+  ValidateRect(hwnd, NULL);
+  HRGN rgn = CreateRectRgn(0, 0, 0, 0);
+  RECT update, rc;
+  int kind = ScrollWindowEx(hwnd, 0, 10, NULL, NULL, rgn, &update, SW_SCROLLCHILDREN | SW_INVALIDATE);
+  GetClientRect(hwnd, &rc);
+  CHECK(kind == SIMPLEREGION && update.top == 0 && update.bottom == 10 && update.left == 0 && update.right == rc.right);
+  RECT cr;
+  GetWindowRect(child, &cr);
+  POINT p = {cr.left, cr.top};
+  ScreenToClient(hwnd, &p);
+  CHECK(p.x == 20 && p.y == 40);
+  CHECK(GetUpdateRect(hwnd, &rc, FALSE) && rc.top == 0 && rc.bottom >= 10);
+  kind = ScrollWindowEx(hwnd, 5, 5, NULL, NULL, rgn, &update, 0);
+  CHECK(kind == COMPLEXREGION);
+  RECT area = {0, 0, 50, 50};
+  CHECK(ScrollWindow(hwnd, 100, 0, &area, NULL));      /* scrolled completely out */
+  HDC dc = GetDC(hwnd);
+  CHECK(ScrollDC(dc, 0, -5, &area, NULL, rgn, &update) && update.top == 45 && update.bottom == 50);
+  ReleaseDC(hwnd, dc);
+  CHECK(!ScrollWindowEx((HWND)0x1234, 0, 1, NULL, NULL, NULL, NULL, 0) && GetLastError() == ERROR_INVALID_WINDOW_HANDLE);
+  DeleteObject(rgn);
+  DestroyWindow(hwnd);
+}
+
+/* ---- MDI ---- */
+static int g_mdi_activations;
+static LRESULT CALLBACK mdi_frame_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+  extern HWND g_mdi_client;
+  return DefFrameProcA(hwnd, g_mdi_client, msg, wparam, lparam);
+}
+HWND g_mdi_client;
+static LRESULT CALLBACK mdi_child_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+  if (msg == WM_MDIACTIVATE && (HWND)lparam == hwnd) ++g_mdi_activations;
+  return DefMDIChildProcA(hwnd, msg, wparam, lparam);
+}
+static void test_mdi(HINSTANCE instance) {
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = mdi_frame_proc; wc.hInstance = instance; wc.lpszClassName = "TcosMdiFrame";
+  CHECK(RegisterClassA(&wc) != 0);
+  wc.lpfnWndProc = mdi_child_proc; wc.lpszClassName = "TcosMdiChild";
+  CHECK(RegisterClassA(&wc) != 0);
+  HMENU bar = CreateMenu(), windows = CreatePopupMenu();
+  AppendMenuA(bar, MF_POPUP, (UINT_PTR)windows, "&Window");
+  HWND frame = CreateWindowExA(0, "TcosMdiFrame", "frame", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 600, 400, NULL, bar, instance, NULL);
+  CHECK(frame != NULL);
+  CLIENTCREATESTRUCT ccs = {windows, 5000};
+  g_mdi_client = CreateWindowExA(0, "MDIClient", NULL, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 500, 300, frame, NULL, instance, &ccs);
+  CHECK(g_mdi_client != NULL);
+  CHECK(SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0) == 0);
+
+  HWND c1 = CreateMDIWindowA("TcosMdiChild", "One", 0, 0, 0, 200, 150, g_mdi_client, instance, 0);
+  CHECK(c1 != NULL && (GetWindowLongA(c1, GWL_EXSTYLE) & WS_EX_MDICHILD) && GetParent(c1) == g_mdi_client);
+  CHECK((HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0) == c1 && g_mdi_activations == 1);
+  MDICREATESTRUCTA mcs = {"TcosMdiChild", "Two", instance, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, 0, 0};
+  HWND c2 = (HWND)SendMessageW(g_mdi_client, WM_MDICREATE, 0, (LPARAM)&(MDICREATESTRUCTW){L"TcosMdiChild", L"Two", instance, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, 0, 0});
+  (void)mcs;
+  CHECK(c2 != NULL && (HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0) == c2);
+  HWND c3 = CreateMDIWindowA("TcosMdiChild", "Three", 0, 10, 10, 200, 150, g_mdi_client, instance, 0);
+  CHECK(c3 != NULL && GetTopWindow(g_mdi_client) == c3);
+
+  /* the window menu lists the children, the active one checked */
+  char text[64];
+  CHECK(GetMenuStringA(windows, 5000, text, sizeof text, MF_BYCOMMAND) > 0 && !strcmp(text, "1 One"));
+  CHECK(GetMenuStringA(windows, 5002, text, sizeof text, MF_BYCOMMAND) > 0 && !strcmp(text, "3 Three") && (GetMenuState(windows, 5002, MF_BYCOMMAND) & MF_CHECKED));
+
+  /* next / previous / activate */
+  CHECK(SendMessageA(g_mdi_client, WM_MDINEXT, (WPARAM)c3, 0) == 0 && (HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0) != c3);
+  SendMessageA(g_mdi_client, WM_MDIACTIVATE, (WPARAM)c1, 0);
+  CHECK((HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0) == c1 && GetTopWindow(g_mdi_client) == c1);
+  SendMessageA(frame, WM_COMMAND, 5001, 0);      /* the window menu entry of the second child */
+  CHECK((HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0) == c2);
+
+  /* maximize and restore */
+  RECT before, rc, client;
+  GetWindowRect(c2, &before);
+  BOOL maximized = FALSE;
+  SendMessageA(g_mdi_client, WM_MDIMAXIMIZE, (WPARAM)c2, 0);
+  CHECK((HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, (LPARAM)&maximized) == c2 && maximized && IsZoomed(c2));
+  GetClientRect(g_mdi_client, &client);
+  GetWindowRect(c2, &rc);
+  CHECK(rc.right - rc.left == client.right && rc.bottom - rc.top == client.bottom);
+  SendMessageA(g_mdi_client, WM_MDIRESTORE, (WPARAM)c2, 0);
+  GetWindowRect(c2, &rc);
+  CHECK(!IsZoomed(c2) && rc.left == before.left && rc.top == before.top && rc.right == before.right);
+
+  /* tile and cascade */
+  CHECK(SendMessageA(g_mdi_client, WM_MDITILE, 0, 0));
+  RECT r1, r2, r3;
+  GetWindowRect(c1, &r1); GetWindowRect(c2, &r2); GetWindowRect(c3, &r3);
+  CHECK(r1.right - r1.left > 0 && !(r1.left < r2.right && r2.left < r1.right && r1.top < r2.bottom && r2.top < r1.bottom));
+  CHECK(SendMessageA(g_mdi_client, WM_MDICASCADE, 0, 0));
+  GetWindowRect(c1, &r1); GetWindowRect(c2, &r2);
+  CHECK(r1.left != r2.left && r1.top != r2.top);
+  CHECK(TileWindows(g_mdi_client, MDITILE_VERTICAL, NULL, 0, NULL) == 3 && CascadeWindows(g_mdi_client, 0, NULL, 0, NULL) == 3);
+
+  /* destroying the active child activates another, the menu follows */
+  HWND active = (HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0);
+  SendMessageA(g_mdi_client, WM_MDIDESTROY, (WPARAM)active, 0);
+  CHECK(!IsWindow(active) && (HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, 0) != NULL && GetMenuState(windows, 5002, MF_BYCOMMAND) == (UINT)-1);
+  DestroyWindow(c1);      /* destroyed directly: DefMDIChildProc tells the client */
+  CHECK(GetMenuState(windows, 5001, MF_BYCOMMAND) == (UINT)-1);
+  HANDLE old = (HANDLE)SendMessageA(g_mdi_client, WM_MDISETMENU, 0, (LPARAM)windows);
+  CHECK(old == bar);
+  DestroyWindow(frame);
+  CHECK(!IsWindow(g_mdi_client));
+  UnregisterClassA("TcosMdiChild", instance);
+  UnregisterClassA("TcosMdiFrame", instance);
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -923,6 +1053,8 @@ int main(void) {
   test_clipboard(instance);
   test_hooks(instance);
   test_menus(instance);
+  test_scrolling(instance);
+  test_mdi(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);
