@@ -350,30 +350,23 @@ static void append_ms(String* out, uint64_t us) {
   out->append("ms");
 }
 
-// One line for the status bar and the console: "load 5200ms (downloads 3100ms/12 files 4MiB, slowest ...; scripts ...)".
+// One line for the status bar and the console, short numbers first (the status bar cuts it off):
+// "load 5200ms [downloads 3100ms/12 files, scripts 1900ms/43, events 1ms]; render 900ms [...]; slowest download ...; slowest script ...".
 void Page::timing_summary(String* out) const {
   if (phase_.load == 0 && phase_.render == 0) return;
   out->append("load ");
   append_ms(out, phase_.load);
   out->append(" [downloads ");
   append_ms(out, phase_.fetch);
-  out->append(" (");
+  out->append("/");
   out->append_uint(phase_.fetch_count);
-  out->append(" files, ");
+  out->append(" files ");
   out->append_uint(phase_.fetch_bytes >> 10);
-  out->append(" KiB; slowest ");
-  append_ms(out, phase_.slowest_fetch);
-  out->append(" ");
-  out->append(head(slowest_fetch_url_.view(), 80));
-  out->append("), scripts ");
+  out->append(" KiB, scripts ");
   append_ms(out, phase_.script);
-  out->append(" (");
+  out->append("/");
   out->append_uint(phase_.script_count);
-  out->append(" run; slowest ");
-  append_ms(out, phase_.slowest_script);
-  out->append(" ");
-  out->append(head(slowest_script_name_.view(), 80));
-  out->append("), load events and module scripts ");
+  out->append(", events ");
   append_ms(out, phase_.events);
   out->append("]; render ");
   append_ms(out, phase_.render);
@@ -393,7 +386,14 @@ void Page::timing_summary(String* out) const {
   append_ms(out, phase_.intersection);
   out->append(", rest ");
   append_ms(out, phase_.observers_end);
-  out->append("]");
+  out->append("]; slowest download ");
+  append_ms(out, phase_.slowest_fetch);
+  out->append(" ");
+  out->append(head(slowest_fetch_url_.view(), 80));
+  out->append("; slowest script ");
+  append_ms(out, phase_.slowest_script);
+  out->append(" ");
+  out->append(head(slowest_script_name_.view(), 80));
 }
 
 // What the service worker hub has to say to this document, as events of navigator.serviceWorker.
