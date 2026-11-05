@@ -85,7 +85,7 @@ class SystemVideoCodecs {
   MmioRegion amd_discovery_window(const PciDeviceInfo& d, uint64_t* bar_size) const;
   MmioRegion amd_registers(const PciDeviceInfo& d, uint64_t length) const;
   void add_amd(const PciDeviceInfo& d);
-  bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out);
+  bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out, uint64_t register_bytes = 0x200000);
   void add_intel(const PciDeviceInfo& d);
   void add_amd_uvd6(const PciDeviceInfo& d);
 
@@ -99,6 +99,7 @@ class SystemVideoCodecs {
   intel_gt::AllocatorGpuMemory gpu_memory_{allocator_};
   intel_gt::IGpuMemory* gpu_memory_override_ = nullptr;
   UniquePointer<intel_gt::MmioRegisterBank> intel_registers_bank_;  // lives as long as the device that uses it
+  UniquePointer<intel_gt::OffsetRegisterBank> intel_media_bank_;    // ... and, on Meteor Lake / Arrow Lake, the media tile's window onto it
   List<UniquePointer<IVideoCodecDevice>> devices_;
 };
 

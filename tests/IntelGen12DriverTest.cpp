@@ -136,7 +136,50 @@ static void test_hang() {
   CHECK(rig.mem.live() == live_before && live_before > 0 && rig.gpu.violations.empty());
 }
 
+// Xe-LPG (Meteor Lake, Arrow Lake): the Xe-LP engine with the Xe-LPG PAT and MOCS tables, PAT bits in the global GTT entries and the GMD_ID write after GTT writes.
+static void test_xe_lpg() {
+  Rig rig(Generation::Gen12);
+  VcsDriver::Config cfg = rig.config();
+  cfg.xe_lpg = true;
+  {
+    VcsDriver drv(rig.mem);
+    CHECK(drv.initialize(cfg) && drv.state() == VcsDriver::State::Ready);
+    // PAT: write-back, write-through, uncached, write-back one-way coherent, write-back two-way coherent.
+    const uint32_t pat[5] = {0, 4, 12, 2, 3};
+    for (uint32_t i = 0; i < 5; ++i) CHECK(rig.gpu.regs[0x4800 + 4 * i] == pat[i]);
+    // MOCS: entry 0 defers to the PAT, entry 1 ignores it and is cached, the uncached ones add the L4 policy.
+    CHECK(rig.gpu.regs[0x4000] == 0 && rig.gpu.regs[0x4004] == 0x100 && rig.gpu.regs[0x400C] == 0x10C && rig.gpu.regs[0x4038] == 0x104 && rig.gpu.regs[0x403C] == 0x100);
+    // The driver's global GTT entries (ring, status page, context) carry PAT index 3; the scratch entry too.
+    const uint64_t pat3 = (1ull << 52) | (1ull << 53);
+    for (uint64_t i = 100; i < 108; ++i) CHECK((rig.ggtt[i] & pat3) == pat3 && (rig.ggtt[i] & 1));
+    CHECK(rig.gpu.regs.count(0xD8C) == 1);   // Wa_22019338487
+    const std::vector<uint32_t> batch = simple_batch();
+    CHECK(drv.run_batch(ArrayView<const uint32_t>(batch.data(), batch.size())) == VcsDriver::Result::Done);
+    CHECK(rig.gpu.violations.empty());
+  }
+  CHECK(rig.mem.live() == 1);
+  // A plain Xe-LP driver writes none of that.
+  Rig plain(Generation::Gen12);
+  {
+    VcsDriver drv(plain.mem);
+    CHECK(drv.initialize(plain.config()));
+    CHECK(plain.gpu.regs.count(0xD8C) == 0 && (plain.ggtt[100] >> 52) == 0);
+  }
+  // Only the video engine of a Gen12 GPU can be an Xe-LPG one.
+  Rig gen9(Generation::Gen9);
+  VcsDriver::Config bad = gen9.config();
+  bad.xe_lpg = true;
+  VcsDriver d(gen9.mem);
+  CHECK(!d.initialize(bad));
+  // The media tile window adds its offset to every access.
+  Rig inner(Generation::Gen12);
+  OffsetRegisterBank window(inner.gpu, 0x380000);
+  window.write32(0x4800, 5);
+  CHECK(inner.gpu.regs[0x384800] == 5 && window.read32(0x4800) == 5);
+}
+
 int main() {
+  test_xe_lpg();
   test_init_and_jobs();
   test_failures();
   test_hang();

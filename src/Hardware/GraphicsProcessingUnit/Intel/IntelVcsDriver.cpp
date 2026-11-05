@@ -109,12 +109,20 @@ bool VcsDriver::allocate(uint64_t bytes, GpuBuffer* out) {
   return true;
 }
 
+// After global GTT writes. Xe-LPG's media tile has Wa_22019338487: the CPU's GTT writes are posted until a write to the (read-only) GMD_ID register makes the GPU's gunit wait
+// for them (xe does it at least every 63 writes; this driver writes 8 at a time).
+void VcsDriver::flush_ggtt(IRegisterBank& regs) const {
+  constexpr uint32_t kGmdId = 0xD8C;
+  if (config_.xe_lpg) regs.write32(kGmdId, 0);
+  ggtt_invalidate(regs);
+}
+
 void VcsDriver::fail_init() {
   // Nothing has been given to the engine yet (the port is enabled last), so everything can go back.
   if (ggtt_mapped_) {
-    const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_);
+    const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_, config_.xe_lpg ? kXelpgGgttPteCoherent : 0);
     for (uint64_t i = 0; i < ggtt_pages_; ++i) ggtt.write_raw(i, saved_entries_[i]);
-    ggtt_invalidate(*config_.registers);
+    flush_ggtt(*config_.registers);
     ggtt_mapped_ = false;
   }
   ppgtt_.shutdown();
@@ -131,7 +139,7 @@ bool VcsDriver::initialize(const Config& config) {
   config_ = config;
   ggtt_pages_ = ggtt_pages_for(config.engine);
   lrc_pages_ = config.engine == Engine::Render ? kLrcRenderPages : kLrcPages;
-  if (!config.registers || !config.ggtt_table.valid() || (config.engine == Engine::Render && config.generation != Generation::Gen9)) { state_ = State::Failed; return false; }
+  if (!config.registers || !config.ggtt_table.valid() || (config.engine == Engine::Render && config.generation != Generation::Gen9) || (config.xe_lpg && (config.generation != Generation::Gen12 || config.engine != Engine::Video))) { state_ = State::Failed; return false; }
   const uint64_t entries = config.ggtt_table.length() / 8;
   if (config.ggtt_first_page > entries || ggtt_pages_ > entries - config.ggtt_first_page ||
       (config.ggtt_first_page + ggtt_pages_) * kPageSize > kGgttReach) {
@@ -151,7 +159,10 @@ bool VcsDriver::initialize(const Config& config) {
     Forcewake::release(regs, ForcewakeDomain::Gt);
   };
 
-  if (config.generation == Generation::Gen12) program_gen12_pat(regs);
+  if (config.xe_lpg) {
+    program_xelpg_pat(regs);
+    program_xelpg_global_mocs(regs);
+  } else if (config.generation == Generation::Gen12) program_gen12_pat(regs);
   else if (config.generation == Generation::Gen11) program_icl_pat(regs);
   else program_private_pat(regs, gen9_private_pat());
   // The video engines' MOCS tables: the media commands select entry 1, "whatever the page table entry says". Gen9's video engines come out of reset with it; Gen11 programs
@@ -182,7 +193,7 @@ bool VcsDriver::initialize(const Config& config) {
   }
 
   // The global GTT: the driver's eight entries are remembered, point at the scratch page, then the ring, the status page and the context get theirs.
-  const Ggtt ggtt(config.ggtt_table, config.ggtt_first_page, ggtt_pages_);
+  const Ggtt ggtt(config.ggtt_table, config.ggtt_first_page, ggtt_pages_, config.xe_lpg ? kXelpgGgttPteCoherent : 0);
   if (!ggtt.valid()) { fail_init(); release_wells(); return false; }
   for (uint64_t i = 0; i < ggtt_pages_; ++i) ggtt.read(i, &saved_entries_[i]);
   if (!ggtt.clear(0, ggtt_pages_, scratch_.dma)) { fail_init(); release_wells(); return false; }
@@ -194,7 +205,7 @@ bool VcsDriver::initialize(const Config& config) {
   ring_ggtt_ = ggtt.address_of(0);
   status_ggtt_ = ggtt.address_of(4);
   context_ggtt_ = ggtt.address_of(5);
-  ggtt_invalidate(regs);
+  flush_ggtt(regs);
   if (!ok) { fail_init(); release_wells(); return false; }
 
   // The context's own address space, with the batch buffer in it.
@@ -245,9 +256,9 @@ void VcsDriver::shutdown() {
   }
   // Idle. The engine's status page address still names our page: point the whole range at the scratch page, which is never freed (the engine may still
   // write there when it wakes), and free the rest.
-  const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_);
+  const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_, config_.xe_lpg ? kXelpgGgttPteCoherent : 0);
   ggtt.clear(0, ggtt_pages_, scratch_.dma);
-  ggtt_invalidate(regs);
+  flush_ggtt(regs);
   ggtt_mapped_ = false;
   Forcewake::release(regs, engine_domain());
   ppgtt_.shutdown();

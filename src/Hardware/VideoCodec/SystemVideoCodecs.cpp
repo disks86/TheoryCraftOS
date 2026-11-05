@@ -148,10 +148,11 @@ struct IntelHardware {
   uint64_t first_page = 0;
 };
 
-bool SystemVideoCodecs::intel_hardware_setup(const PciDeviceInfo& d, IntelHardware* out) {
+bool SystemVideoCodecs::intel_hardware_setup(const PciDeviceInfo& d, IntelHardware* out, uint64_t register_bytes) {
   constexpr uint16_t kPciCommand = 0x04, kGmchControl = 0x50;
   constexpr uint32_t kMemorySpace = 1u << 1;
-  constexpr uint64_t kRegisters = 0x200000, kBarSize = 16u << 20, kGuardPages = 16;
+  constexpr uint64_t kBarSize = 16u << 20, kGuardPages = 16;
+  const uint64_t kRegisters = register_bytes;
   if (!mmio_ || !(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return false;
   const uint64_t base = pci_.memory_bar(d.address, 0);
   intel_gt::GgttGeometry geometry;
@@ -182,13 +183,18 @@ void SystemVideoCodecs::add_intel(const PciDeviceInfo& d) {
     if ((pci_.read32(d.address, kPciCommand) & kMemorySpace) && bar_sizer_->bar_size(d.address, 2, &local_memory)) device->set_local_memory_bar(local_memory);
   }
   IntelHardware hardware;
-  // The engine driver follows the Gen9.5, Gen11 and Xe-LP layouts only (its GTT geometry, its video box); no other generation gets its GTT looked at.
-  if (intel_hardware_ && (device->gpu().architecture == IntelGpuArchitecture::Gen9_5 || device->gpu().architecture == IntelGpuArchitecture::Gen11 ||
-                          (device->gpu().architecture == IntelGpuArchitecture::XeLp && !device->gpu().discrete)) && !intel_registers_bank_ && intel_hardware_setup(d, &hardware)) {
+  // The engine driver follows the Gen9.5, Gen11, Xe-LP and Xe-LPG layouts only (its GTT geometry, its video box); no other generation gets its GTT looked at. Xe-LPG's video
+  // boxes are on the media tile: 0x380000 into the BAR (IntelMediaEngineHw::kMediaTileBase), where the registers repeat; the driver gets a window onto that.
+  const IntelGpuArchitecture architecture = device->gpu().architecture;
+  const bool xe_lpg = architecture == IntelGpuArchitecture::XeLpg && !device->gpu().discrete;
+  if (intel_hardware_ && (architecture == IntelGpuArchitecture::Gen9_5 || architecture == IntelGpuArchitecture::Gen11 || xe_lpg ||
+                          (architecture == IntelGpuArchitecture::XeLp && !device->gpu().discrete)) && !intel_registers_bank_ &&
+      intel_hardware_setup(d, &hardware, xe_lpg ? IntelMediaEngineHw::kMediaTileBase + 0x200000 : 0x200000)) {
     intel_registers_bank_ = UniquePointer<intel_gt::MmioRegisterBank>::make(allocator_, hardware.registers);
-    if (intel_registers_bank_) {
+    if (intel_registers_bank_ && xe_lpg) intel_media_bank_ = UniquePointer<intel_gt::OffsetRegisterBank>::make(allocator_, *intel_registers_bank_, IntelMediaEngineHw::kMediaTileBase);
+    if (intel_registers_bank_ && (!xe_lpg || intel_media_bank_)) {
       IntelMediaVideoEngine::HardwareSetup setup;
-      setup.registers = intel_registers_bank_.get();
+      setup.registers = xe_lpg ? static_cast<intel_gt::IRegisterBank*>(intel_media_bank_.get()) : static_cast<intel_gt::IRegisterBank*>(intel_registers_bank_.get());
       setup.ggtt_table = hardware.ggtt_table;
       setup.ggtt_first_page = hardware.first_page;
       setup.memory = gpu_memory_override_ ? gpu_memory_override_ : &gpu_memory_;
