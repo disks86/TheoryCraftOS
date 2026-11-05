@@ -87,6 +87,7 @@ bool IntelVp9Decoder::run_frame(const vp9::OffloadFrame& frame, int current) {
   // The pictures the frame predicts from.
   Vp9Picture p;
   Vp9Buffers b;
+  b.gen11 = buffers_.gen11();
   uint32_t address = 0;
   if (!buffers_.surface(current, &address)) return false;
   b.current_picture = address;
@@ -173,10 +174,11 @@ bool IntelVp9Decoder::run_frame(const vp9::OffloadFrame& frame, int current) {
 
   DwordWriter w(buffers_.batch_words());
   emit_mi_flush(w);
-  emit_hcp_pipe_mode_select(w, kHcpCodecVp9);
-  for (uint32_t id = 0; id < 4; ++id) emit_hcp_surface_state(w, buffers_.layout(), id == 0 ? 0 : id + 1);
+  const bool gen11 = buffers_.gen11();
+  emit_hcp_pipe_mode_select(w, kHcpCodecVp9, gen11);
+  for (uint32_t id = 0; id < 4; ++id) emit_hcp_surface_state(w, buffers_.layout(), id == 0 ? 0 : id + 1, gen11);
   emit_vp9_pipe_buf_addr_state(w, b);
-  emit_hcp_ind_obj_base_addr_state(w, b.bitstream, b.bitstream_bytes, b.mocs);
+  emit_hcp_ind_obj_base_addr_state(w, b.bitstream, b.bitstream_bytes, b.mocs, gen11);
   const uint32_t segments = frame.seg.enabled ? vp9::MAX_SEGMENTS : 1;
   for (uint32_t s = 0; s < segments; ++s) {
     Vp9Segment seg;
@@ -190,7 +192,7 @@ bool IntelVp9Decoder::run_frame(const vp9::OffloadFrame& frame, int current) {
     seg.luma_ac = static_cast<uint32_t>(frame.dequant[s][1]);
     seg.chroma_dc = static_cast<uint32_t>(frame.dequant[s][2]);
     seg.chroma_ac = static_cast<uint32_t>(frame.dequant[s][3]);
-    emit_vp9_segment_state(w, seg, frame.filter_level != 0, intra);
+    emit_vp9_segment_state(w, seg, frame.filter_level != 0, intra, gen11);
   }
   emit_vp9_pic_state(w, p);
   emit_vp9_bsd_object(w, static_cast<uint32_t>(frame.data.size() - frame.uncompressed_header_bytes), frame.uncompressed_header_bytes);

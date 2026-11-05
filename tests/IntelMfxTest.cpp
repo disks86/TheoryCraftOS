@@ -24,6 +24,7 @@
 #include <string.h>
 #include <vector>
 #include "Hardware/VideoCodec/Intel/IntelAvcDecode.hpp"
+#include "Hardware/VideoCodec/Intel/IntelMfxCommands.hpp"
 #include "Hardware/VideoCodec/Intel/IntelTiling.hpp"
 #include "Hardware/VideoCodec/Software/H264Encoder.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -406,11 +407,78 @@ static void test_batch_robustness() {
   CHECK(a.live == 0);
 }
 
+// The Ice Lake (Gen11) HCP commands: the media driver's full lengths, MFX_WAITs around the pipe mode select, the surface state's fourth dword, the slice
+// quantisation parameter as magnitude and sign.
+static void test_gen11_hcp() {
+  using namespace hardware;
+  auto len = [](const std::vector<uint32_t>& v) { return (v[0] & 0xFF) + 2; };
+  HevcBuffers hb;
+  hb.gen11 = true;
+  std::vector<uint32_t> v = emit([&](DwordWriter& w) { emit_hevc_pipe_buf_addr_state(w, hb); });
+  CHECK(v.size() == 121 && len(v) == 121 && v[0] == (kHcpPipeBufAddrState | 119));
+  hb.gen11 = false;
+  v = emit([&](DwordWriter& w) { emit_hevc_pipe_buf_addr_state(w, hb); });
+  CHECK(v.size() == 95 && len(v) == 95);
+  hb.gen11 = true;
+  v = emit([&](DwordWriter& w) { emit_hevc_ind_obj_base_addr_state(w, hb); });
+  CHECK(v.size() == 29 && len(v) == 29);
+  HevcPicture pic;
+  pic.width = 64;
+  pic.height = 64;
+  v = emit([&](DwordWriter& w) { emit_hevc_pic_state(w, pic); });
+  CHECK(v.size() == 19 && len(v) == 19);
+  pic.gen11 = true;
+  v = emit([&](DwordWriter& w) { emit_hevc_pic_state(w, pic); });
+  CHECK(v.size() == 38 && len(v) == 38);
+  v = emit([&](DwordWriter& w) { emit_hevc_tile_state(w, pic); });
+  CHECK(v.size() == 17 && len(v) == 17);
+  HevcSlice sl;
+  sl.qp = -3;
+  v = emit([&](DwordWriter& w) { emit_hevc_slice_state(w, sl, true); });
+  CHECK(v.size() == 11 && len(v) == 11 && ((v[3] >> 6) & 0x3F) == 3 && ((v[3] >> 3) & 1) == 1);
+  sl.qp = 30;
+  v = emit([&](DwordWriter& w) { emit_hevc_slice_state(w, sl, true); });
+  CHECK(((v[3] >> 6) & 0x3F) == 30 && ((v[3] >> 3) & 1) == 0);
+  v = emit([&](DwordWriter& w) { emit_hevc_slice_state(w, sl, false); });
+  CHECK(v.size() == 9);
+  HevcWeights weights;
+  v = emit([&](DwordWriter& w) { emit_hevc_weightoffset_state(w, 0, 1, weights, true); });
+  CHECK(v.size() == 42 && len(v) == 42);
+  v = emit([&](DwordWriter& w) { emit_hevc_weightoffset_state(w, 0, 1, weights, false); });
+  CHECK(v.size() == 34);
+  // The pipe mode select is bracketed by MFX_WAIT on Gen11 (both for HCP and MFX), and the surface state grew a dword.
+  v = emit([&](DwordWriter& w) { emit_hcp_pipe_mode_select(w, kHcpCodecHevc, true); });
+  CHECK(v.size() == 8 && v[0] == kHcpMfxWaitSync && v[7] == kHcpMfxWaitSync && v[1] == (kHcpPipeModeSelect | 4));
+  v = emit([&](DwordWriter& w) { emit_hcp_pipe_mode_select(w, kHcpCodecHevc, false); });
+  CHECK(v.size() == 6);
+  v = emit([&](DwordWriter& w) { emit_pipe_mode_select_gen11(w, 0, true, false); });
+  CHECK(v.front() == kHcpMfxWaitSync && v.back() == kHcpMfxWaitSync);
+  Nv12TiledLayout layout;
+  CHECK(nv12_tiled_layout(64, 64, &layout));
+  v = emit([&](DwordWriter& w) { emit_hcp_surface_state(w, layout, 0, true); });
+  CHECK(v.size() == 4 && len(v) == 4 && v[3] == 0xFFFF && (v[2] >> 27) == 4 && (v[2] & 0xFFFF) == layout.chroma_offset_rows);
+  v = emit([&](DwordWriter& w) { emit_hcp_surface_state(w, layout, 0, false); });
+  CHECK(v.size() == 3);
+  Vp9Buffers vb;
+  vb.gen11 = true;
+  v = emit([&](DwordWriter& w) { emit_vp9_pipe_buf_addr_state(w, vb); });
+  CHECK(v.size() == 121);
+  Vp9Segment seg;
+  v = emit([&](DwordWriter& w) { emit_vp9_segment_state(w, seg, true, false, true); });
+  CHECK(v.size() == 8 && len(v) == 8);
+  v = emit([&](DwordWriter& w) { emit_vp9_segment_state(w, seg, true, false, false); });
+  CHECK(v.size() == 7);
+  // The buffers the engine needs are sized per 16 pixels on Gen11: never smaller than the Gen9 ones for the line stores.
+  const HevcBufferBytes g9 = hevc_buffer_bytes(1920, 1080, 6, false), g11 = hevc_buffer_bytes(1920, 1080, 6, true);
+  CHECK(g11.deblocking_line > 0 && g11.metadata_line > 0 && g11.sao_line > 0 && g11.motion_vector > 0 && g9.motion_vector > 0);
+}
+
 int main() {
   test_headers_and_fields();
   test_layout_and_tiling();
   test_picture_batches();
   test_batch_robustness();
+  test_gen11_hcp();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("intel mfx tests passed\n");
   return 0;

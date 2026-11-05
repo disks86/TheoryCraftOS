@@ -323,7 +323,8 @@ bool IntelVc1Decoder::decode_picture(const vc1::OffloadPicture& picture) {
 
   DwordWriter w(buffers_.batch_words());
   emit_mi_flush(w);
-  emit_pipe_mode_select(w, kFormatVc1, /*post=*/seq.loop_filter, /*pre=*/!seq.loop_filter);
+  if (b.gen11) emit_pipe_mode_select_gen11(w, kFormatVc1, /*post=*/seq.loop_filter, /*pre=*/!seq.loop_filter);
+  else emit_pipe_mode_select(w, kFormatVc1, /*post=*/seq.loop_filter, /*pre=*/!seq.loop_filter);
   emit_surface_state(w, width, height, buffers_.layout());
   emit_pipe_buf_addr_state(w, b);
   emit_bsp_buf_base_addr_state(w, b);
