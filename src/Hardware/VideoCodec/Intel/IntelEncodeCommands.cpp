@@ -29,6 +29,8 @@ struct EncodeField {
 };
 
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImages.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen11.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
 #include "Hardware/VideoCodec/Intel/IntelVdencTables.inc"
 
 // A command being filled in: the media driver's defaults, then fields by name.
@@ -126,6 +128,22 @@ void vdenc_surface(DwordWriter& w, const uint32_t (&defaults)[N], uint32_t width
   c.emit(w);
 }
 
+// VDENC_PIPE_BUF_ADDR_STATE. Dword layout: three dwords (low address, high address, attributes) per buffer. DS refs 1, 4, 7; original picture 10; stream-in 13; row store 16;
+// co-located MV 19; forward references 22, 25, 28; backward reference 31; statistics stream-out 34. Ice Lake and Xe-LP append more buffers (HEVC, VP9, AV1) that H.264 leaves
+// zero.
+template <uint32_t N>
+void vdenc_pipe_buf(DwordWriter& w, const uint32_t (&defaults)[N], const AvcEncodePicture& p, const AvcEncodeBuffers& b) {
+  Command<N> c(defaults);
+  if (p.p_picture) {
+    c.buffer(1, b.reference_ds4, 0);
+    c.buffer(22, b.reference, kMocs);
+  }
+  c.buffer(10, b.source, kMocs);
+  if (b.vdenc_row_store) c.buffer(16, b.vdenc_row_store, kMocs);
+  if (b.vdenc_statistics) c.buffer(34, b.vdenc_statistics, kMocs);
+  c.emit(w);
+}
+
 void flat_matrices(DwordWriter& w) {
   // MFX_QM_STATE: 16 dwords of matrix (flat: every weight 16); MFX_FQM_STATE: 32 dwords of 16-bit reciprocals (65536 / 16).
   for (uint32_t type = 0; type < 4; ++type) {
@@ -173,7 +191,15 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   const uint32_t mbs = p.width_mbs * p.height_mbs;
   const uint32_t qp = static_cast<uint32_t>(p.qp < 0 ? 0 : p.qp > static_cast<int32_t>(kMaxQp) ? kMaxQp : p.qp);
 
-  // --- MFX_PIPE_MODE_SELECT: encode, VDEnc, the picture leaves through the post-deblocking path when the filter runs.
+  const bool gen11_up = p.generation != EncodeGeneration::Gen9;
+  // --- Xe-LP starts a VDEnc picture by initialising the VDEnc pipe.
+  if (p.generation == EncodeGeneration::Gen12) {
+    Command<kGen12VdencControlStateDwords> c(kGen12VdencControlStateDefault);
+    c.set(kGen12VdencControlState_VdencInitialization, 1);
+    c.emit(w);
+  }
+  // --- MFX_PIPE_MODE_SELECT: encode, VDEnc, the picture leaves through the post-deblocking path when the filter runs. Ice Lake and later wait for the MFX pipe on both sides.
+  if (gen11_up) intel_mfx::emit_mfx_wait_sync(w);
   {
     Command<kMfxPipeModeSelectDwords> c(kMfxPipeModeSelectDefault);
     c.set(kMfxPipeModeSelect_StandardSelect, kMfxPipeModeSelect_STANDARD_SELECT_AVC);
@@ -187,6 +213,7 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
     c.set(kMfxPipeModeSelect_PostDeblockingOutputEnablePostdeblockoutenable, p.deblocking ? 1 : 0);
     c.emit(w);
   }
+  if (gen11_up) intel_mfx::emit_mfx_wait_sync(w);
   // --- The surfaces: reconstruction, source, 4x down-scaled reconstruction (the raw ones are aligned to 4 rows, the others to 8).
   mfx_surface(w, kMfxSurfaceRecon, layout.width, layout.height, layout.full, 8);
   mfx_surface(w, kMfxSurfaceSource, layout.width, layout.height, layout.full, 4);
@@ -235,7 +262,20 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   }
 
   // --- The VDEnc pipeline: mode, surfaces, buffers, the constant quantiser tables.
-  {
+  if (p.generation == EncodeGeneration::Gen12) {
+    // Xe-LP prefetches the TLB entries of the source picture ahead of the engine (the driver's settings for AVC).
+    Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
+    c.set(kGen12VdencPipeModeSelect_StandardSelect, kGen12VdencPipeModeSelect_STANDARD_SELECT_AVC);
+    c.set(kGen12VdencPipeModeSelect_FrameStatisticsStreamOutEnable, 1);
+    c.set(kGen12VdencPipeModeSelect_TlbPrefetchEnable, 1);
+    c.set(kGen12VdencPipeModeSelect_PakThresholdCheckEnable, 0);
+    c.set(kGen12VdencPipeModeSelect_VdencStreamInEnable, 0);
+    c.set(kGen12VdencPipeModeSelect_OutputRangeControlAfterColorSpaceConversion, 1);
+    c.set(kGen12VdencPipeModeSelect_HmeRegionPreFetchenable, 0);
+    c.set(kGen12VdencPipeModeSelect_PreFetchoffsetforsource, 7);
+    c.set(kGen12VdencPipeModeSelect_Numverticalreqminus1Src, 0);
+    c.emit(w);
+  } else {
     Command<kVdencPipeModeSelectDwords> c(kVdencPipeModeSelectDefault);
     c.set(kVdencPipeModeSelect_StandardSelect, kVdencPipeModeSelect_STANDARD_SELECT_AVC);
     c.set(kVdencPipeModeSelect_FrameStatisticsStreamOutEnable, 1);
@@ -246,19 +286,12 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   }
   vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full);
   vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full);
-  vdenc_surface(w, kVdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter);
-  {
-    Command<kVdencPipeBufAddrStateDwords> c(kVdencPipeBufAddrStateDefault);
-    // Dword layout: three dwords (low address, high address, attributes) per buffer. DS refs 1, 4, 7; original picture 10; stream-in 13; row store 16; co-located MV 19;
-    // forward references 22, 25, 28; backward reference 31; statistics stream-out 34.
-    if (p.p_picture) {
-      c.buffer(1, b.reference_ds4, 0);
-      c.buffer(22, b.reference, kMocs);
-    }
-    c.buffer(10, b.source, kMocs);
-    if (b.vdenc_row_store) c.buffer(16, b.vdenc_row_store, kMocs);
-    if (b.vdenc_statistics) c.buffer(34, b.vdenc_statistics, kMocs);
-    c.emit(w);
+  if (gen11_up) vdenc_surface(w, kGen11VdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter);   // (room for two surfaces; one is used)
+  else vdenc_surface(w, kVdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter);
+  switch (p.generation) {
+    case EncodeGeneration::Gen9: vdenc_pipe_buf(w, kVdencPipeBufAddrStateDefault, p, b); break;
+    case EncodeGeneration::Gen11: vdenc_pipe_buf(w, kGen11VdencPipeBufAddrStateDefault, p, b); break;
+    case EncodeGeneration::Gen12: vdenc_pipe_buf(w, kGen12VdencPipeBufAddrStateDefault, p, b); break;
   }
   {
     Command<kVdencConstQptStateDwords> c(kVdencConstQptStateDefault);
@@ -520,12 +553,34 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
   for (uint64_t i = 0; i < headers.size(); ++i) pak_insert(w, headers[i], i + 1 == headers.size(), headers[i].slice_header);
 
   // --- VDENC_WALKER_STATE: start at the top, the next slice starts below the picture; then wait for the VDEnc and MFX pipes.
-  {
-    Command<kVdencWalkerStateDwords> c(kVdencWalkerStateDefault);
-    c.set(kVdencWalkerState_MbLcuStartYPosition, 0);
-    c.set(kVdencWalkerState_MbLcuStartXPosition, 0);
-    c.set(kVdencWalkerState_NextsliceMbStartYPosition, p.height_mbs);
-    c.emit(w);
+  // (From Ice Lake the walker also carries the picture width in samples.)
+  switch (p.generation) {
+    case EncodeGeneration::Gen9: {
+      Command<kVdencWalkerStateDwords> c(kVdencWalkerStateDefault);
+      c.set(kVdencWalkerState_MbLcuStartYPosition, 0);
+      c.set(kVdencWalkerState_MbLcuStartXPosition, 0);
+      c.set(kVdencWalkerState_NextsliceMbStartYPosition, p.height_mbs);
+      c.emit(w);
+      break;
+    }
+    case EncodeGeneration::Gen11: {
+      Command<kGen11VdencWalkerStateDwords> c(kGen11VdencWalkerStateDefault);
+      c.set(kGen11VdencWalkerState_MbLcuStartYPosition, 0);
+      c.set(kGen11VdencWalkerState_MbLcuStartXPosition, 0);
+      c.set(kGen11VdencWalkerState_NextsliceMbStartYPosition, p.height_mbs);
+      c.set(kGen11VdencWalkerState_TileWidth, p.width_mbs * 16 - 1);
+      c.emit(w);
+      break;
+    }
+    case EncodeGeneration::Gen12: {
+      Command<kGen12VdencWalkerStateDwords> c(kGen12VdencWalkerStateDefault);
+      c.set(kGen12VdencWalkerState_MbLcuStartYPosition, 0);
+      c.set(kGen12VdencWalkerState_MbLcuStartXPosition, 0);
+      c.set(kGen12VdencWalkerState_NextsliceMbStartYPosition, p.height_mbs);
+      c.set(kGen12VdencWalkerState_TileWidth, p.width_mbs * 16 - 1);
+      c.emit(w);
+      break;
+    }
   }
   {
     Command<kVdPipelineFlushDwords> c(kVdPipelineFlushDefault);
@@ -538,12 +593,12 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
   return w.ok();
 }
 
-void emit_avc_vdenc_finish(DwordWriter& w, const AvcEncodeBuffers& b) {
+void emit_avc_vdenc_finish(DwordWriter& w, const AvcEncodeBuffers& b, EncodeGeneration generation) {
   intel_mfx::emit_mi_flush(w);
   if (b.status) {
     // MI_STORE_REGISTER_MEM (48-bit address): the number of bytes the PAK wrote for the frame.
     w.emit((0x24u << 23) | 2u);
-    w.emit(kBitstreamByteCountRegister);
+    w.emit(bitstream_byte_count_register(generation));
     w.emit(b.status);
     w.emit(0);
   }
