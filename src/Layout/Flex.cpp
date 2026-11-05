@@ -614,8 +614,10 @@ void LayoutContext::flex_intrinsic_widths(BoxId id, LayoutUnit* min_content, Lay
     LayoutUnit lo = cmin, hi = cmax;
     if (has_width) lo = hi = c.style.sizing == BoxSizing::BorderBox ? max(specified - bp, LayoutUnit()) : specified;
     if (row && c.style.flex_basis.is_px()) {   // (the flex basis stands for the width an item is laid out with)
-      hi = max(c.style.flex_basis.px100 > 0 ? LayoutUnit::from_px100(c.style.flex_basis.px100) : LayoutUnit(), LayoutUnit());
-      if (c.style.sizing == BoxSizing::BorderBox) hi = max(hi - bp, LayoutUnit());
+      LayoutUnit basis = max(c.style.flex_basis.px100 > 0 ? LayoutUnit::from_px100(c.style.flex_basis.px100) : LayoutUnit(), LayoutUnit());
+      if (c.style.sizing == BoxSizing::BorderBox) basis = max(basis - bp, LayoutUnit());
+      // an item that grows takes the room its content wants (flex: 1 1 0 around a label: YouTube's buttons); one that does not stays at its basis
+      hi = c.style.flex_grow_x100 > 0 ? max(hi, basis) : basis;
       if (!has_width) lo = min(lo, hi);
     }
     lo = clamp_content_width(c, lo);

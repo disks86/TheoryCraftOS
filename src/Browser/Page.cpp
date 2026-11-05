@@ -817,6 +817,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
     ok = paint::build_display_list(out->tree, paint_options, &out->list);
   }
   if (ok) resolve_scroll_target(out->tree);
+  if (ok) fetch_css_images(out->list);
   if (ok) record_geometry(out->tree);
   lap(&phase_.paint);
   out->document = &doc_;
@@ -1253,6 +1254,14 @@ void Page::set_scroll(int32_t y) {
 
 // The vertical place the page should be scrolled to: the fragment of the address (an element with that id, or an <a name>; "" and "top" are the top), or the
 // element scrollIntoView() was called on. Worked out from the layout just made.
+void Page::fetch_css_images(const paint::DisplayList& list) {
+  for (uint64_t i = 0; i < list.count(); ++i) {
+    const paint::Op& op = list.op(i);
+    if (op.kind == paint::OpKind::Image || op.kind == paint::OpKind::PushMask) objects_.want_css_image(list.text(op));
+  }
+  objects_.fetch_css_images(object_environment(), address_.view());
+}
+
 void Page::resolve_scroll_target(const layout::BoxTree& tree) {
   dom::Node* target = nullptr;
   bool top = false;

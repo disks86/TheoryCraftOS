@@ -161,6 +161,12 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   // --- IObjectSource, IObjectPainter
   bool object_info(const dom::Node* element, ObjectInfo* out) override;
   void paint_object(graphics::IRenderer2D& r, uint32_t node, ObjectKind kind, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) override;
+  bool background_image_size(StringView url, int32_t* width, int32_t* height) override;
+  void paint_background_image(graphics::IRenderer2D& r, StringView url, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) override;
+  // --- CSS pictures (the url() layers of background-image and mask-image): the page names those its display list uses (the address as the style wrote it),
+  // then has the ones not tried yet fetched (relative to `base`) before the list is painted. One that cannot be had is not drawn (a mask of it hides its box).
+  void want_css_image(StringView url);
+  void fetch_css_images(IObjectEnvironment& env, StringView base);
   // A click inside a video's rectangle w x h at (lx, ly): the control bar or the picture act on the player. True if something was done.
   bool object_clicked(uint32_t serial, int32_t lx, int32_t ly, uint32_t w, uint32_t h);
   void set_accelerated(bool accelerated) { accelerated_ = accelerated; }
@@ -312,6 +318,13 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     bool seen = false;
     UniquePointer<CanvasBitmap> bitmap;
   };
+  struct CssImage {
+    explicit CssImage(allocators::IAllocator& a) : url(a) {}
+    String url;                  // as the style wrote it
+    int32_t cache = -1;
+    uint8_t state = 0;           // 0 not fetched yet, 1 loaded, 2 failed
+    Scaled scaled;
+  };
   struct CanvasSlot {
     CanvasSlot() = default;
     uint32_t serial = 0;
@@ -326,6 +339,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   SvgSlot* find_svg(uint32_t serial);
   void sync_svg(dom::Document& doc, dom::Node* n);
   CanvasSlot* find_canvas_slot(uint32_t serial);
+  CssImage* find_css_image(StringView url);
   int32_t load_image_url(IObjectEnvironment& env, StringView url, bool* failed);
   void sync_image(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched);
   void sync_video(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched);
@@ -360,6 +374,8 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   List<UniquePointer<VideoSlot>> videos_;
   List<UniquePointer<CanvasSlot>> canvases_;
   List<UniquePointer<SvgSlot>> svgs_;
+  List<UniquePointer<CssImage>> css_images_;
+  static constexpr uint32_t kMaxCssImages = 256;
   List<Event> events_;
   media::MseHub mse_;
   media::EmeHub eme_;

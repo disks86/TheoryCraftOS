@@ -284,10 +284,11 @@ bool decode_data_url(allocators::IAllocator& allocator, StringView url, ByteBuff
 }
 
 PageObjects::PageObjects(allocators::IAllocator& allocator)
-    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator), mse_(allocator), eme_(allocator), blobs_(allocator) {}
+    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), css_images_(allocator), events_(allocator), mse_(allocator), eme_(allocator), blobs_(allocator) {}
 
 PageObjects::~PageObjects() {
   for (uint64_t i = 0; i < images_.count(); ++i) release_scaled(&images_[i]->scaled);
+  for (const auto& c : css_images_.view()) release_scaled(&c->scaled);
   for (uint64_t i = 0; i < videos_.count(); ++i) {
     release_scaled(&videos_[i]->scaled);
     release_scaled(&videos_[i]->poster_scaled);
@@ -979,6 +980,61 @@ void PageObjects::sync(dom::Document& doc, IObjectEnvironment& env, StringView b
     release_view(allocator_, videos_[i - 1]->picture);
     videos_.remove_at(i - 1);
   }
+}
+
+// --- CSS pictures ----------------------------------------------------------------------------------------------------------------
+
+PageObjects::CssImage* PageObjects::find_css_image(StringView url) {
+  for (const auto& c : css_images_.view())
+    if (c->url.view().equals(url)) return c.get();
+  return nullptr;
+}
+
+void PageObjects::want_css_image(StringView url) {
+  Lock lock(*this);
+  if (url.empty() || find_css_image(url) || css_images_.count() >= kMaxCssImages) return;
+  auto fresh = UniquePointer<CssImage>::make(allocator_, allocator_);
+  if (!fresh) return;
+  fresh->url.assign(url);
+  css_images_.push_back(util::move(fresh));
+}
+
+void PageObjects::fetch_css_images(IObjectEnvironment& env, StringView base) {
+  Lock lock(*this);
+  for (const auto& c : css_images_.view()) {
+    if (c->state != 0) continue;
+    String absolute(allocator_);
+    if (c->url.view().starts_with("data:") || c->url.view().starts_with("blob:")) absolute.assign(c->url.view());
+    else if (!resolve_reference(allocator_, base, c->url.view(), &absolute)) {
+      c->state = 2;
+      continue;
+    }
+    bool failed;
+    c->cache = load_image_url(env, absolute.view(), &failed);
+    c->state = c->cache >= 0 ? 1 : 2;
+    if (c->state == 1 && cache_[static_cast<uint64_t>(c->cache)]->started_ms == 0) cache_[static_cast<uint64_t>(c->cache)]->started_ms = now_ms_ ? now_ms_ : 1;
+    dirty_ = true;
+  }
+}
+
+bool PageObjects::background_image_size(StringView url, int32_t* width, int32_t* height) {
+  Lock lock(*this);
+  const CssImage* c = find_css_image(url);
+  if (!c || c->state != 1) return false;
+  const media::Image& image = cache_[static_cast<uint64_t>(c->cache)]->image;
+  *width = static_cast<int32_t>(image.width());
+  *height = static_cast<int32_t>(image.height());
+  return true;
+}
+
+void PageObjects::paint_background_image(graphics::IRenderer2D& r, StringView url, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {
+  Lock lock(*this);
+  CssImage* c = find_css_image(url);
+  if (!c || c->state != 1) return;
+  const CachedImage& cached = *cache_[static_cast<uint64_t>(c->cache)];
+  const uint32_t frame = image_frame(cached);
+  const ImageSource src = {cached.image.frame(frame), cached.image.width(), cached.image.height(), cached.image.width()};
+  draw_scaled(r, c->scaled, src, frame, x, y, w, h, clip, false);
 }
 
 uint32_t PageObjects::image_frame(const CachedImage& c) const {

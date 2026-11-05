@@ -47,6 +47,7 @@ class DisplayPainter {
   // A PushTransform / PushFilter at `begin` whose pop is at `close`: its content goes to an offscreen picture that is moved or filtered and drawn back.
   bool paint_group(graphics::IRenderer2D& renderer, const DisplayList& list, uint64_t begin, uint64_t close, int32_t dx, int32_t dy, const IRect& visible, uint32_t groups);
   bool push_clip_shape(graphics::IRenderer2D& renderer, const ClipShape& shape, int32_t dx, int32_t dy, const IRect& area);
+  bool push_mask(graphics::IRenderer2D& renderer, const DisplayList& list, const Op& op, int32_t dx, int32_t dy, const IRect& area);
   void draw_border(graphics::IRenderer2D& renderer, const Op& op, const IRect& rect, const IRect& visible);
   void draw_gradient(graphics::IRenderer2D& renderer, const DisplayList& list, const Op& op, const IRect& rect, int32_t dx, int32_t dy, const IRect& visible);
   void draw_shadow(graphics::IRenderer2D& renderer, const ShadowData& shadow, const IRect& bounds, int32_t dx, int32_t dy, const IRect& visible);

@@ -1481,6 +1481,7 @@ enum Prop : uint16_t {
   pAnimationName, pAnimationDuration, pAnimationTimingFunction, pAnimationDelay, pAnimationIterationCount, pAnimationDirection, pAnimationFillMode, pAnimationPlayState,
   pFilter, pBackdropFilter, pClipPath, pWritingMode, pDirection, pColorScheme, pScrollSnapType, pScrollSnapAlign, pScrollSnapStop, pOverscrollBehaviorX, pOverscrollBehaviorY,
   pScrollBehavior, pContainerType, pContainerName, pQuotes, pTabSize, pMixBlendMode, pContain, pAccentColor, pAppearance, pWillChange,
+  pMaskImage, pMaskSize, pMaskPosition, pMaskRepeat,
   // logical longhands: they mean a physical side given the direction and the writing mode (see physical_of)
   pMarginBlockStart, pMarginBlockEnd, pMarginInlineStart, pMarginInlineEnd, pPaddingBlockStart, pPaddingBlockEnd, pPaddingInlineStart, pPaddingInlineEnd,
   pInsetBlockStart, pInsetBlockEnd, pInsetInlineStart, pInsetInlineEnd, pInlineSize, pBlockSize, pMinInlineSize, pMinBlockSize, pMaxInlineSize, pMaxBlockSize,
@@ -1488,7 +1489,7 @@ enum Prop : uint16_t {
   // shorthands
   pBackground, pFont, pTextDecoration, pListStyle, pMargin, pPadding, pBorder, pBorderTop, pBorderRight, pBorderBottom, pBorderLeft, pBorderWidthAll, pBorderStyleAll,
   pBorderColorAll, pOverflow, pInset, pFlex, pFlexFlow, pGap, pGridColumn, pGridRow, pGridArea, pGridTemplate, pGrid, pPlaceContent, pPlaceItems, pPlaceSelf, pColumns,
-  pBorderRadius, pOutline, pColumnRule, pTransition, pAnimation, pOverscrollBehavior, pFontVariant, pContainer, pAll,
+  pBorderRadius, pOutline, pColumnRule, pTransition, pAnimation, pOverscrollBehavior, pFontVariant, pContainer, pAll, pMask,
 };
 
 struct PropertyName {
@@ -1549,6 +1550,8 @@ const PropertyName kProperties[] = {
     {"scroll-snap-align", pScrollSnapAlign}, {"scroll-snap-stop", pScrollSnapStop}, {"overscroll-behavior", pOverscrollBehavior}, {"overscroll-behavior-x", pOverscrollBehaviorX},
     {"overscroll-behavior-y", pOverscrollBehaviorY}, {"scroll-behavior", pScrollBehavior}, {"container", pContainer}, {"container-type", pContainerType}, {"container-name", pContainerName}, {"all", pAll}, {"quotes", pQuotes}, {"tab-size", pTabSize}, {"-moz-tab-size", pTabSize}, {"mix-blend-mode", pMixBlendMode},
     {"contain", pContain}, {"accent-color", pAccentColor}, {"appearance", pAppearance}, {"-webkit-appearance", pAppearance}, {"will-change", pWillChange},
+    {"mask", pMask}, {"-webkit-mask", pMask}, {"mask-image", pMaskImage}, {"-webkit-mask-image", pMaskImage}, {"mask-size", pMaskSize}, {"-webkit-mask-size", pMaskSize},
+    {"mask-position", pMaskPosition}, {"-webkit-mask-position", pMaskPosition}, {"mask-repeat", pMaskRepeat}, {"-webkit-mask-repeat", pMaskRepeat},
 };
 
 Prop property_from_name(StringView name) {
@@ -1568,6 +1571,7 @@ uint32_t longhands_of(Prop p, Prop* out) {
       add(pBackgroundColor); add(pBackgroundImage); add(pBackgroundPosition); add(pBackgroundSize); add(pBackgroundRepeat); add(pBackgroundOrigin); add(pBackgroundClip);
       add(pBackgroundAttachment);
       break;
+    case pMask: add(pMaskImage); add(pMaskPosition); add(pMaskSize); add(pMaskRepeat); break;
     case pFont:
       add(pFontStyle); add(pFontWeight); add(pFontSize); add(pLineHeight); add(pFontFamily); add(pFontStretch); add(pFontVariantCaps); add(pFontVariantNumeric);
       add(pFontVariantLigatures);
@@ -1708,6 +1712,10 @@ void copy_property(Prop p, const Style& from, Style* to) {
     case pBackgroundClip: to->background_clip = from.background_clip; break;
     case pBackgroundOrigin: to->background_origin = from.background_origin; break;
     case pBackgroundAttachment: to->background_attachment = from.background_attachment; break;
+    case pMaskImage: to->mask_image = from.mask_image; break;
+    case pMaskSize: to->mask_size = from.mask_size; break;
+    case pMaskPosition: to->mask_position = from.mask_position; break;
+    case pMaskRepeat: to->mask_repeat = from.mask_repeat; break;
     case pTransform: to->transform_value = from.transform_value; break;
     case pTranslate: to->translate = from.translate; break;
     case pRotate: to->rotate = from.rotate; break;
@@ -3448,7 +3456,7 @@ struct CssApply {
   bool parse_edge_color(StringView v, uint32_t* out) const;
   void set_outline_like(StringView value, int32_t* width, BorderStyle* border, bool* auto_style, uint32_t* color);
   void set_font_variant(StringView value, bool caps, bool numeric, bool ligatures);
-  void set_background_shorthand(StringView value);
+  void set_background_shorthand(StringView value, bool mask = false);
   void set_transition_shorthand(StringView value);
   void set_animation_shorthand(StringView value);
   void set_transform_origin(StringView value);
@@ -4049,28 +4057,30 @@ void CssApply::apply_value(Prop p, StringView value) {
       if (parse_shadow_list(value, eval, color_context(), p == pTextShadow, &shadows)) keep_text(value, p == pBoxShadow ? &style->box_shadow : &style->text_shadow);
       break;
     }
-    case pBackgroundImage: {
-      if (eq(value, "none")) { style->background_image = TextRef(); break; }
-      keep_list(value, &style->background_image, [&](StringView item) {
+    case pMask: set_background_shorthand(value, true); break;
+    case pMaskImage: case pBackgroundImage: {
+      TextRef* ref = p == pMaskImage ? &style->mask_image : &style->background_image;
+      if (eq(value, "none")) { *ref = TextRef(); break; }
+      keep_list(value, ref, [&](StringView item) {
         BackgroundLayer layer;
         return parse_image_item(item, eval, color_context(), &layer);
       });
       break;
     }
-    case pBackgroundSize:
-      keep_list(value, &style->background_size, [&](StringView item) {
+    case pBackgroundSize: case pMaskSize:
+      keep_list(value, p == pMaskSize ? &style->mask_size : &style->background_size, [&](StringView item) {
         BackgroundLayer layer;
         return parse_bg_size_item(item, eval, &layer);
       });
       break;
-    case pBackgroundPosition:
-      keep_list(value, &style->background_position, [&](StringView item) {
+    case pBackgroundPosition: case pMaskPosition:
+      keep_list(value, p == pMaskPosition ? &style->mask_position : &style->background_position, [&](StringView item) {
         AxisPos x, y;
         return parse_position(item, eval, &x, &y);
       });
       break;
-    case pBackgroundRepeat:
-      keep_list(value, &style->background_repeat, [&](StringView item) {
+    case pBackgroundRepeat: case pMaskRepeat:
+      keep_list(value, p == pMaskRepeat ? &style->mask_repeat : &style->background_repeat, [&](StringView item) {
         BackgroundLayer layer;
         return parse_bg_repeat_item(item, &layer);
       });
@@ -4518,7 +4528,8 @@ void CssApply::set_overscroll(StringView value, bool x, bool y) {
 }
 
 // background: the layers into the longhand lists (the colour is read separately).
-void CssApply::set_background_shorthand(StringView value) {
+// background, and mask / -webkit-mask (the same layers; a mask's mode and compositing keywords are not kept, and its boxes are always the border box).
+void CssApply::set_background_shorthand(StringView value, bool mask) {
   String images(sheet.allocator_), positions(sheet.allocator_), sizes(sheet.allocator_), repeats(sheet.allocator_), attachments(sheet.allocator_), origins(sheet.allocator_),
       clips(sheet.allocator_);
   uint64_t at = 0;
@@ -4558,6 +4569,9 @@ void CssApply::set_background_shorthand(StringView value) {
         uint32_t color;
         if (t.equals("/")) { after_slash = true; continue; }
         if (looks_like_image(t)) { image.assign(t); continue; }
+        if (mask && (eq(t, "alpha") || eq(t, "luminance") || eq(t, "match-source") || eq(t, "add") || eq(t, "subtract") || eq(t, "intersect") || eq(t, "exclude") ||
+                     eq(t, "no-clip")))
+          continue;
         if (eq(t, "repeat-x") || eq(t, "repeat-y") || repeat_keyword(t, &rm)) {
           if (!repeat.empty()) repeat.push_back(' ');
           repeat.append(t);
@@ -4599,6 +4613,14 @@ void CssApply::set_background_shorthand(StringView value) {
     add(&clips, clip);
   }
   if (layers == 0) return;
+  if (mask) {
+    if (eq(images.view(), "none")) style->mask_image = TextRef();
+    else keep_text(images.view(), &style->mask_image);
+    keep_text(positions.view(), &style->mask_position);
+    keep_text(sizes.view(), &style->mask_size);
+    keep_text(repeats.view(), &style->mask_repeat);
+    return;
+  }
   if (eq(images.view(), "none")) style->background_image = TextRef();
   else keep_text(images.view(), &style->background_image);
   keep_text(positions.view(), &style->background_position);
@@ -5378,6 +5400,18 @@ bool StyleSheet::shadows(TextRef list, const Style& style, List<Shadow>* out) co
   if (parse_shadow_list(t, eval_for(style, viewport_w_, viewport_h_), colors, false, out)) return true;
   out->clear();
   return false;
+}
+
+bool StyleSheet::mask_layers(const Style& style, List<BackgroundLayer>* out) const {
+  Style as_background = style;   // (the mask's lists read as background layers, positioned in and clipped to the border box)
+  as_background.background_clip = as_background.background_origin = as_background.background_attachment = TextRef();
+  as_background.background_image = style.mask_image;
+  as_background.background_size = style.mask_size;
+  as_background.background_position = style.mask_position;
+  as_background.background_repeat = style.mask_repeat;
+  if (!background_layers(as_background, out)) return false;
+  for (BackgroundLayer& layer : *out) layer.origin = layer.clip = BackgroundBox::BorderBox;
+  return true;
 }
 
 bool StyleSheet::background_layers(const Style& style, List<BackgroundLayer>* out) const {

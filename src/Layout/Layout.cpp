@@ -122,7 +122,8 @@ void LayoutContext::size_replaced(const Box& b, LayoutUnit* width, LayoutUnit* h
   const LayoutUnit v_edges = s.sizing == BoxSizing::BorderBox ? b.border.vertical() + b.padding.vertical() : LayoutUnit();
   LayoutUnit w, h;
   const bool has_w = resolve_in(s.width, b, false, &w), has_h = resolve_in(s.height, b, true, &h);
-  const bool ratio = b.has_natural_width && b.has_natural_height && b.natural_width > LayoutUnit() && b.natural_height > LayoutUnit();
+  // (a form control or an iframe has a size of its own but no aspect ratio: an input given only a width keeps its height)
+  const bool ratio = b.object_kind != 0 && b.has_natural_width && b.has_natural_height && b.natural_width > LayoutUnit() && b.natural_height > LayoutUnit();
   w = has_w ? max(w - h_edges, LayoutUnit()) : LayoutUnit();
   h = has_h ? max(h - v_edges, LayoutUnit()) : LayoutUnit();
   if (has_w && has_h) {

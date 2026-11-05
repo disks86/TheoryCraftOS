@@ -48,7 +48,7 @@ bool hit_test(const DisplayList& list, const dom::Document* doc, int32_t x, int3
   bool found = false;
   for (uint64_t i = 0; i < list.count(); ++i) {
     const Op& op = list.op(i);
-    if (op.kind == OpKind::PushClip || op.kind == OpKind::PushClipPath || op.kind == OpKind::PushTransform) {
+    if (op.kind == OpKind::PushClip || op.kind == OpKind::PushClipPath || op.kind == OpKind::PushMask || op.kind == OpKind::PushTransform) {
       Entry e;
       if (op.kind == OpKind::PushTransform) {
         e.is_transform = true;

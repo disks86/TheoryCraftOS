@@ -68,6 +68,8 @@ enum class OpKind : uint8_t {
   PushClipPath,   // like PushClip, but to the shape `data` (its PopClip is a PopClip)
   Shadow,         // a box-shadow: the shadow `data` (blurred, clipped out under the box or inside it for an inset shadow)
   Image,          // a picture from the object painter (a url() background layer, a list marker): see ImageLayerData `data`, the url is the text of the op
+  PushMask,       // like PushClip, but through the alpha of a url() picture laid out as the ImageLayerData `data` (mask-image; the url is the text of the op; its
+                  // PopClip is a PopClip). A picture the object painter does not have hides everything until the PopClip.
 };
 
 // Border line styles (browser::BorderStyle's order).
@@ -170,7 +172,7 @@ struct Op {
   uint32_t color = 0;                    // FillRect, Text: 0xAARRGGBB
   graphics::CornerRadii radii;           // FillRect, Border, Gradient, PushClip
   uint32_t node = 0;                     // Text and Object: the serial of the element it belongs to (0: none)
-  uint32_t data = 0;                     // PushTransform, PushFilter, PushClipPath, Shadow, Image: an index into the list's table of that kind
+  uint32_t data = 0;                     // PushTransform, PushFilter, PushClipPath, Shadow, Image, PushMask: an index into the list's table of that kind
 
   // Border
   uint32_t border_colors[4] = {0, 0, 0, 0};          // top, right, bottom, left
@@ -263,7 +265,7 @@ class DisplayList {
     uint64_t depth = 0;
     for (uint64_t i = begin; i < ops_.count(); ++i) {
       const OpKind k = ops_[i].kind;
-      if (k == OpKind::PushClip || k == OpKind::PushLayer || k == OpKind::PushTransform || k == OpKind::PushFilter || k == OpKind::PushClipPath) {
+      if (k == OpKind::PushClip || k == OpKind::PushLayer || k == OpKind::PushTransform || k == OpKind::PushFilter || k == OpKind::PushClipPath || k == OpKind::PushMask) {
         ++depth;
       } else if (k == OpKind::PopClip || k == OpKind::PopLayer || k == OpKind::PopTransform || k == OpKind::PopFilter) {
         if (depth <= 1) return i;

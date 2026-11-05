@@ -126,7 +126,7 @@ class Builder {
   static bool makes_context(const Box& b) {
     const Style& s = b.style;
     return (s.position != browser::Position::Static && !s.z_index_auto) || s.opacity_x1000 < 1000 || !s.transform_value.empty() || !s.translate.empty() || !s.rotate.empty() ||
-           !s.scale.empty() || !s.filter.empty() || !s.clip_path.empty();
+           !s.scale.empty() || !s.filter.empty() || !s.clip_path.empty() || !s.mask_image.empty();
   }
   // Is it painted in the positioned layer of its stacking context (as a unit)? Every positioned box is, and so is every context.
   static bool is_context(const Box& b) { return makes_context(b) || b.style.position != browser::Position::Static; }
@@ -237,7 +237,7 @@ class Builder {
   static constexpr uint64_t kNoOp = ~uint64_t{0};
   struct Effects {
     uint64_t transform_op = kNoOp, filter_op = kNoOp;
-    bool clip_path = false;
+    bool clip_path = false, mask = false;
     int32_t filter_grow = 0;
   };
 
@@ -324,6 +324,7 @@ class Builder {
         e.clip_path = true;
       }
     }
+    if (!s.mask_image.empty()) e.mask = open_mask(b, ax, ay);
     if (!s.filter.empty()) {
       List<browser::FilterFunction> fns(allocator());
       FilterData data;
@@ -359,6 +360,39 @@ class Builder {
     return e;
   }
 
+  // mask-image: the first url() layer (positioned in and clipped to the border box) masks the box and what is in it. Other kinds of mask layer (gradients)
+  // and the layers below the first are not drawn: the box is shown unmasked then.
+  bool open_mask(const Box& b, LayoutUnit ax, LayoutUnit ay) {
+    List<browser::BackgroundLayer> layers(allocator());
+    if (!options_.sheet->mask_layers(b.style, &layers)) return false;
+    for (const browser::BackgroundLayer& layer : layers) {
+      if (layer.image != browser::BackgroundLayer::Url || layer.url.empty()) continue;
+      const IRect border_rect = snap(ax, ay, b.width, b.height);
+      ImageLayerData d;
+      d.origin = d.clip = border_rect;
+      d.size_mode = static_cast<ImageLayerData::SizeMode>(layer.size_mode);
+      if (layer.size_mode == browser::BackgroundLayer::Explicit) {
+        d.size_w = layer.size_w.is_auto() ? -1.0f : dim_px(layer.size_w, static_cast<float>(border_rect.width));
+        d.size_h = layer.size_h.is_auto() ? -1.0f : dim_px(layer.size_h, static_cast<float>(border_rect.height));
+      }
+      d.pos_x_percent_x100 = layer.position_x.percent_x100;
+      d.pos_x_px100 = layer.position_x.px100;
+      d.pos_y_percent_x100 = layer.position_y.percent_x100;
+      d.pos_y_px100 = layer.position_y.px100;
+      d.repeat_x = static_cast<uint8_t>(layer.repeat_x);
+      d.repeat_y = static_cast<uint8_t>(layer.repeat_y);
+      Op op;
+      op.kind = OpKind::PushMask;
+      op.rect = border_rect;
+      failed_ |= !out_.add_image(d, &op.data);
+      failed_ |= !out_.add_text(layer.url, &op.text_offset);
+      op.text_length = static_cast<uint32_t>(layer.url.size());
+      add(op);
+      return true;
+    }
+    return false;
+  }
+
   void close_effects(const Effects& e) {
     if (e.filter_op != kNoOp) {
       out_.mutable_op(e.filter_op).rect = grow_rect(content_bounds(e.filter_op + 1), e.filter_grow);
@@ -366,6 +400,7 @@ class Builder {
       op.kind = OpKind::PopFilter;
       add(op);
     }
+    if (e.mask) pop_clip();
     if (e.clip_path) pop_clip();
     if (e.transform_op != kNoOp) {
       out_.mutable_op(e.transform_op).rect = content_bounds(e.transform_op + 1);
