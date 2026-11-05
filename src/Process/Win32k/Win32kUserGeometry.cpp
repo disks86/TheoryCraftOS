@@ -200,6 +200,7 @@ bool apply_show_cmd(Window* w, uint32_t cmd, uint32_t* flags, Rect* rect, bool* 
       break;
     case wn::SW_SHOWNORMAL: case wn::SW_RESTORE: case wn::SW_SHOWDEFAULT: case wn::SW_SHOW: case wn::SW_SHOWNA: case wn::SW_SHOWNOACTIVATE: {
       const bool restore = cmd == wn::SW_SHOWNORMAL || cmd == wn::SW_RESTORE || cmd == wn::SW_SHOWDEFAULT;
+      if (cmd == wn::SW_SHOW && was_visible) return false;      // (SW_SHOW on a visible window changes nothing: no message is sent)
       if (restore && (w->style & (wn::WS_MINIMIZE | wn::WS_MAXIMIZE))) {
         const bool was_min = (w->style & wn::WS_MINIMIZE) != 0;
         w->style &= ~(wn::WS_MINIMIZE | wn::WS_MAXIMIZE);

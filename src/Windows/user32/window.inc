@@ -854,3 +854,23 @@ EXPORT BOOL WINAPI SetKeyboardState(BYTE *state) { return BOOL_OF(NtUserSetKeybo
 EXPORT BOOL WINAPI GetCursorPos(POINT_ *p) { return p && BOOL_OF(NtUserGetCursorPos((ULONG_PTR)p)); }
 EXPORT BOOL WINAPI SetCursorPos(int x, int y) { return BOOL_OF(NtUserSetCursorPos((ULONG_PTR)(LONG_PTR)x, (ULONG_PTR)(LONG_PTR)y)); }
 EXPORT BOOL WINAPI AttachThreadInput(DWORD from, DWORD to, BOOL attach) { return BOOL_OF(NtUserAttachThreadInput(from, to, attach)); }
+
+/* ---- synthesized input ---------------------------------------------------------------------------------------------------------------------------------------------- */
+SVC NtUserSendInput(ULONG_PTR count, ULONG_PTR inputs, ULONG_PTR size);
+typedef struct { DWORD type; DWORD pad_; union { struct { LONG dx, dy; DWORD data, flags, time; ULONG_PTR extra; } mouse; struct { WORD vk, scan; DWORD flags, time; ULONG_PTR extra; } key; BYTE raw[32]; } u; } Input_;
+EXPORT UINT WINAPI SendInput(UINT count, Input_ *inputs, int size) {
+  if (!count || !inputs || size != (int)sizeof(Input_)) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+  return (UINT)NtUserSendInput(count, (ULONG_PTR)inputs, (ULONG_PTR)(LONG_PTR)size);
+}
+EXPORT void WINAPI mouse_event(DWORD flags, DWORD dx, DWORD dy, DWORD data, ULONG_PTR extra) {
+  Input_ in = {0};
+  in.type = 0;
+  in.u.mouse.dx = (LONG)dx; in.u.mouse.dy = (LONG)dy; in.u.mouse.data = data; in.u.mouse.flags = flags; in.u.mouse.extra = extra;
+  SendInput(1, &in, sizeof in);
+}
+EXPORT void WINAPI keybd_event(BYTE vk, BYTE scan, DWORD flags, ULONG_PTR extra) {
+  Input_ in = {0};
+  in.type = 1;
+  in.u.key.vk = vk; in.u.key.scan = scan; in.u.key.flags = flags; in.u.key.extra = extra;
+  SendInput(1, &in, sizeof in);
+}

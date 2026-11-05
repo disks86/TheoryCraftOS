@@ -89,8 +89,8 @@ system metrics (NtUserCallOneParam). Calls follow Wine's `ntuser` interface (the
 * Classes: the built-in classes (Button, Static, Edit, ListBox, ComboBox, ScrollBar, #32770, MDIClient, ...) are registered on first use with the styles Windows has. `controls.inc` has the
   procedures of **Static**, **Button** (push, check, 3-state, radio with groups, group box; BM_* messages, WM_COMMAND notifications, WM_CTLCOLORBTN) and **Edit** (single and multi line text model,
   selection, EM_* messages, WM_CHAR / key input, EN_* notifications, plain painting) over gdi32 (user32 imports gdi32; FillRect, FrameRect, DrawFocusRect are exports). A control's state block
-  is kept in the window's private data (NtUserCallHwndParam GetPrivateData/SetPrivateData) and the control reports to the parent it was created with. The other classes (ListBox, ComboBox,
-  ScrollBar, dialog, ...) still use the default window procedure.
+  is kept in the window's private data (NtUserCallHwndParam GetPrivateData/SetPrivateData) and the control reports to the parent it was created with. `scroll.inc` has the SetScrollInfo family and the **ScrollBar** control, `listbox.inc` the **ListBox** (and "ComboLBox"), `combo.inc` the **ComboBox** (an Edit child plus a list box child or popup), `dialog.inc` the **dialog** class (#32770 = DefDlgProc), templates, DialogBox / CreateDialog,
+  IsDialogMessage and the item functions, `icon.inc` carets, cursors, icons, LoadImage and DrawIconEx. Not done: menus (CreateMenu ... are stubs), the clipboard, hooks.
 * Painting: InvalidateRect on a window without WS_CLIPCHILDREN also invalidates the children it covers, and UpdateWindow paints the window and its children (win32k). New child windows go below
   their siblings (a maximized child on top), as in Windows.
 * ANSI: the window manager only knows Unicode; every window is a Unicode window. A functions convert what they send (`a_to_w`); a procedure given to RegisterClassA / SetWindowLongA is held behind
