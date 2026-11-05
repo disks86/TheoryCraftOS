@@ -295,6 +295,7 @@ struct Style {
   uint16_t width_px = 0, height_px = 0;        // width / height in pixels (0: auto), for pictures, videos and canvases
   uint8_t width_pct = 0;                        // width as a percentage of the line (0: not a percentage)
   bool own_background = false;                 // this element set the background
+  bool own_border = false;                     // this element set a border (even none): a form control then drops its default look
   uint32_t own_background_color = 0;           // what it set (for the page's background on <body>)
   uint32_t background_argb = 0;                // the same colour with its alpha kept (own_background_color shows a colour that is mostly transparent as none): what the pixel engine paints
   bool opaque_zero = false;                    // opacity: 0 (nothing is seen, the space is kept)
@@ -352,6 +353,7 @@ struct Style {
     s.width_px = s.height_px = 0;
     s.width_pct = 0;
     s.own_background = false;
+    s.own_border = false;
     s.own_background_color = 0;
     s.background_argb = 0;
     s.opaque_zero = false;

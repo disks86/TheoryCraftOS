@@ -214,6 +214,7 @@ class Builder {
     Box& b = tree_.box(id);
     b.out_of_flow = out_of_flow;
     b.floated = floated;
+    b.center_content = n->is_tag("button");
     b.establishes_bfc = out_of_flow || floated || kind == BoxKind::InlineBlock || s.overflow_x != Overflow::Visible || s.overflow_y != Overflow::Visible ||
                         s.layout == Layout::Flex || s.layout == Layout::Grid || s.layout == Layout::Table || s.column_count > 0 || s.flow_root;
     failed_ |= !tree_.append(parent, id);

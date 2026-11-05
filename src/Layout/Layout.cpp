@@ -268,6 +268,7 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   }
   // a box that starts a formatting context contains its floats: it is as high as the lowest of them
   if (b.establishes_bfc && !replaced && height_auto && !local_floats.empty()) content_height = max(content_height, local_floats.lowest_bottom() - b.content_top());
+  const LayoutUnit laid_out_height = content_height;
   floats_ = saved_floats;
   origin_x_ = saved_x;
   origin_y_ = saved_y;
@@ -286,6 +287,8 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
     }
     if (request.has_forced_height && height_auto) content_height = request.forced_height;
     content_height = clamp_content_height(b, content_height);
+    const bool flow = s.layout != browser::Layout::Flex && s.layout != browser::Layout::Grid && s.layout != browser::Layout::Table;
+    if (b.center_content && flow && content_height > laid_out_height) center_content(id, (content_height - laid_out_height) / 2);
   }
   b.height = content_height + bp_v;
 
@@ -299,6 +302,19 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   // the boxes positioned against this one can be placed now that its size is known
   if (b.style.position != browser::Position::Static || b.kind == BoxKind::Root) layout_absolutes(id);
   return outcome;
+}
+
+// Moves the laid-out content of a box down by `shift`: its lines and their fragments, and its in-flow children (atomic inlines sit where
+// their fragment is; block children where block layout put them).
+void LayoutContext::center_content(BoxId id, LayoutUnit shift) {
+  Box& b = tree_.box(id);
+  for (LineInfo& line : b.lines) line.y += shift;
+  for (Fragment& f : b.fragments) f.y += shift;
+  for (const BoxId child : b.children) {
+    Box& c = tree_.box(child);
+    if (!c.out_of_flow) c.y += shift;
+  }
+  if (b.has_baseline) b.baseline += shift;
 }
 
 MarginPair LayoutContext::estimate_top_margin(BoxId id, LayoutUnit cb_width) {

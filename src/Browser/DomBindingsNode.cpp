@@ -288,8 +288,10 @@ Value attributes_value(DomBindings::Impl& c, dom::Node* n) {
   for (uint64_t i = 0; i < n->attrs.count(); ++i) {
     JsObject* a = vm.new_plain();
     vm.define_named(a, "name", str_value(vm, n->attrs[i].name.view()));
-    vm.define_named(a, "value", str_value(vm, n->attrs[i].value.view()));
+    vm.define(a, vm.intern("__v"), str_value(vm, n->attrs[i].value.view()), kWritable);   // (Attr.prototype's value reads it; writing value sets the attribute)
     vm.define_named(a, "specified", bool_value(true));
+    vm.define_named(a, "nodeType", num_value(2));
+    vm.define_named(a, "nodeName", str_value(vm, n->attrs[i].name.view()));
     {   // namespaceURI, prefix, localName of the attribute
       const StringView full = n->attrs[i].name.view();
       const uint64_t colon = full.find(':');
@@ -298,6 +300,7 @@ Value attributes_value(DomBindings::Impl& c, dom::Node* n) {
       vm.define_named(a, "localName", str_value(vm, colon == StringView::npos ? full : full.substr(colon + 1)));
     }
     vm.define_named(a, "ownerElement", node_value(c, n));
+    set_interface(vm, a, "Attr");
     vm.array_push(list, Value::make_object(a));
   }
   Value item;

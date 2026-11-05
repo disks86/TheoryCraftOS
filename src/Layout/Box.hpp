@@ -95,6 +95,7 @@ struct Box {
   bool has_natural_width = false, has_natural_height = false;
   bool fill_width = false;           // Replaced: with no width of its own (an svg that only has a shape) it is as wide as its containing block
   uint8_t object_kind = 0;           // Replaced: a browser::ObjectKind (0: not a picture, video or canvas: an iframe or a form control)
+  bool center_content = false;       // a <button>: flow content shorter than the box is centred in it vertically (as browsers do)
 
   // --- tables (TableFixup.cpp sets them from the DOM; Table.cpp lays the table out)
   uint16_t colspan = 1, rowspan = 1;   // cells: the colspan and rowspan attributes (rowspan 0: down to the end of the row group)

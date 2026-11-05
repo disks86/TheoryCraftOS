@@ -1121,9 +1121,6 @@ class Builder {
     const dom::Node* n = options_.doc->by_serial(b.node);
     if (!n) return;
     const Style& s = b.style;
-    const bool styled = s.own_background || s.border_style[0] != browser::BorderStyle::None;
-    const IRect border_rect = snap(LayoutUnit(), LayoutUnit(), LayoutUnit(), LayoutUnit());
-    (void)border_rect;
     StringView type;
     dom::get_attribute(n, "type", &type);
     const bool is_input = n->is_tag("input");
@@ -1137,8 +1134,8 @@ class Builder {
       add(op);
       return;
     }
-    (void)styled;
-    // (the box of the control is the border box: the chrome is drawn over the content area grown by the padding and border the style gave it)
+    // A field or button keeps only the parts of its default look the page did not set: the box already drew the page's background and border.
+    const bool own_fill = !check && s.own_background, own_line = !check && s.own_border;
     Op fill;
     fill.kind = OpKind::FillRect;
     fill.rect = content;
@@ -1172,17 +1169,20 @@ class Builder {
     }
     fill.color = button ? 0xFFEFEFEFu : 0xFFFFFFFFu;
     fill.radii = graphics::CornerRadii::uniform(button ? 3.0f : 2.0f);
-    add(fill);
-    Op line;
-    line.kind = OpKind::Border;
-    line.rect = content;
-    line.radii = fill.radii;
-    for (int i = 0; i < 4; ++i) {
-      line.border_widths[i] = 1;
-      line.border_styles[i] = LineStyle::Solid;
-      line.border_colors[i] = 0xFF767676u;
+    if (!own_fill) add(fill);
+    if (!own_line) {
+      Op line;
+      line.kind = OpKind::Border;
+      line.rect = content;
+      line.radii = fill.radii;
+      for (int i = 0; i < 4; ++i) {
+        line.border_widths[i] = 1;
+        line.border_styles[i] = LineStyle::Solid;
+        line.border_colors[i] = 0xFF767676u;
+      }
+      add(line);
     }
-    add(line);
+    const int32_t inset = own_line ? 0 : 4;   // (the default border keeps the text off it; a field with the page's border has the page's padding instead)
     // the text in it: a field's value (or its hint, grey), a button's label
     String current(allocator());
     bool hint = false;
@@ -1196,7 +1196,7 @@ class Builder {
     if (!value.empty()) {
       const layout::TextMetrics m = measurer_.metrics(s);
       const LayoutUnit width = measurer_.width(s, value);
-      LayoutUnit x = LayoutUnit::from_px(content.x + 4);
+      LayoutUnit x = LayoutUnit::from_px(content.x + inset);
       if (button) x = LayoutUnit::from_px(content.x) + (LayoutUnit::from_px(content.width) - width) / 2;
       const LayoutUnit y = LayoutUnit::from_px(content.y) + (LayoutUnit::from_px(content.height) - m.height()) / 2;
       Op clip;
@@ -1206,11 +1206,11 @@ class Builder {
       emit_text(b, value, x, y, width, m.height(), b.node, hint ? 0xFF757575u : (s.color ? s.color : kDefaultInk));
       pop_clip();
     }
-    paint_caret(b, n, content, current.view(), hint || value.empty(), type);
+    paint_caret(b, n, content, current.view(), hint || value.empty(), type, inset);
   }
 
   // The caret of the focused text field: a one pixel bar between two characters (none while text is selected or in the hidden half of its blink).
-  void paint_caret(const Box& b, const dom::Node* n, const IRect& content, StringView text, bool nothing_drawn, StringView type) {
+  void paint_caret(const Box& b, const dom::Node* n, const IRect& content, StringView text, bool nothing_drawn, StringView type, int32_t inset) {
     const bool textarea = n->is_tag("textarea");
     if (b.node != options_.focus || options_.caret_hidden || (!n->is_tag("input") && !textarea)) return;
     if (n->is_tag("input") && !dom::is_text_field(dom::input_type(n))) return;
@@ -1225,7 +1225,7 @@ class Builder {
     if (!password && !nothing_drawn && caret <= text.size()) before = measurer_.width(s, text.first(caret));   // (a password is not drawn, so the caret stays at the start)
     Op bar;
     bar.kind = OpKind::FillRect;
-    bar.rect.x = content.x + 4 + before.round();
+    bar.rect.x = content.x + inset + before.round();
     bar.rect.y = content.y + (content.height - m.height().round()) / 2;
     bar.rect.width = 1;
     bar.rect.height = m.height().round();

@@ -367,6 +367,11 @@ static void test_positioning() {
                "<div style='margin-top:60px;height:10px'></div></div>").c_str());
   CHECK(px(c3.at("f").width) == px(c3.at("app").width) && px(c3.at("f").height) == 56 && c3.abs_y("f") == 3);
 
+  // a button taller than its content centres it (YouTube's search button: a 24px icon in a 40px button), across as well as down
+  Laid c4(page("<button id=b style='height:40px;width:64px;padding:0;border:0'><div id=i style='width:24px;height:24px'></div></button>"
+               "<button id=b2 style='height:40px;width:64px;padding:0;border:0'><span id=j style='display:inline-block;width:24px;height:10px'></span></button>").c_str());
+  CHECK(c4.abs_y("i") - c4.abs_y("b") == 8 && c4.abs_x("j") - c4.abs_x("b2") == 20 && c4.abs_y("j") > c4.abs_y("b2") + 8);
+
   // auto offsets keep the place the box would have had in the flow
   Laid d(page("<div style='height:10px'></div><div id=k style='position:absolute;width:20px;height:5px'></div>").c_str());
   CHECK(d.abs_x("k") == 0 && d.abs_y("k") == 10);

@@ -4164,10 +4164,21 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   function makeAttr(name, value, owner, ns) {
     var a = Object.create(Attr.prototype);
     a.name = name; a.localName = name.indexOf(':') >= 0 ? name.slice(name.indexOf(':') + 1) : name; a.prefix = name.indexOf(':') >= 0 ? name.slice(0, name.indexOf(':')) : null;
-    a.namespaceURI = ns || null; a.value = String(value); a.nodeValue = a.value; a.textContent = a.value; a.ownerElement = owner || null; a.specified = true; a.nodeType = 2; a.nodeName = name;
+    a.namespaceURI = ns || null; Object.defineProperty(a, '__v', { value: String(value), writable: true }); a.ownerElement = owner || null; a.specified = true; a.nodeType = 2; a.nodeName = name;
     return a;
   }
   method(Attr.prototype, 'toString', function () { return '[object Attr]'; });
+  // value, nodeValue and textContent of an attribute: writing one changes the attribute on its element (YouTube renames the ids in its icons this way)
+  (function () {
+    var get = function () { return this.__v === undefined ? '' : this.__v; };
+    var set = function (v) {
+      v = String(v);
+      if (Object.prototype.hasOwnProperty.call(this, '__v')) this.__v = v;
+      else Object.defineProperty(this, '__v', { value: v, writable: true });
+      if (this.ownerElement) this.ownerElement.setAttribute(this.name, v);
+    };
+    ['value', 'nodeValue', 'textContent'].forEach(function (k) { Object.defineProperty(Attr.prototype, k, { get: get, set: set, configurable: true }); });
+  }());
   method(EP, 'getAttributeNode', function (name) { return this.hasAttribute(name) ? makeAttr(String(name).toLowerCase(), this.getAttribute(name), this) : null; });
   method(EP, 'getAttributeNodeNS', function (ns, name) { return this.hasAttribute(name) ? makeAttr(name, this.getAttribute(name), this, ns) : null; });
   method(EP, 'setAttributeNode', function (attr) {
@@ -8401,19 +8412,25 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     });
   }());
 
-  // The classes whose objects the engine hands out as plain arrays: instanceof and their names are right for them.
+  // The classes whose objects the engine hands out as plain arrays: instanceof and their names are right for them. Their prototypes are not
+  // arrays (`list instanceof Array` is false, as in browsers: scripts test it to decide whether to copy a list): they only iterate.
   (function () {
+    var AP = Array.prototype;
     var Collection = function (name, extra) {
       var f = function () { throw new TypeError('Illegal constructor'); };
       Object.defineProperty(f, 'name', { value: name });
-      f.prototype = Object.create(Array.prototype);
+      f.prototype = {};
       Object.defineProperty(f.prototype, 'constructor', { value: f, writable: true, configurable: true });
+      Object.defineProperty(f.prototype, Symbol.iterator, { value: AP.values, writable: true, configurable: true });
       tag(f, name);
       if (extra) extra(f.prototype);
       hide(g, name, f);
       return f;
     };
-    Collection('NodeList', function (p) { method(p, 'item', function (i) { return this[i >>> 0] || null; }); });
+    Collection('NodeList', function (p) {
+      method(p, 'item', function (i) { return this[i >>> 0] || null; });
+      ['forEach', 'entries', 'keys', 'values'].forEach(function (k) { method(p, k, AP[k]); });
+    });
     Collection('HTMLCollection', function (p) {
       method(p, 'item', function (i) { return this[i >>> 0] || null; });
       method(p, 'namedItem', function (name) { name = String(name); for (var i = 0; i < this.length; i++) if (this[i].id === name || (this[i].getAttribute && this[i].getAttribute('name') === name)) return this[i]; return null; });
