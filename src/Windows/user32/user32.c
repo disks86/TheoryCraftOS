@@ -284,3 +284,4 @@ EXPORT BOOL WINAPI IsCharLowerA(CHAR c) { return char_is_alpha((BYTE)c) && char_
 EXPORT BOOL WINAPI IsCharLowerW(WCHAR c) { return char_is_alpha(c) && char_upper(c) != c; }
 
 #include "icon.inc"
+#include "clipboard.inc"

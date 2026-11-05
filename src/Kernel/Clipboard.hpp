@@ -37,6 +37,15 @@ class Clipboard {
  public:
   static constexpr uint64_t kMaxBytes = 64u << 20;  // the most it will hold
 
+  // An observer is called (outside the clipboard's own lock) before the clipboard is read and after it was changed: the system uses it to keep the Windows clipboard of the window
+  // manager (src/Process/Win32k/Win32kUserMiscClipboard.cpp) and this one the same. `changed` tells which of the two it is. It may call this clipboard's functions (it must stop that
+  // recursion itself).
+  using Observer = void (*)(void* context, bool changed);
+  void set_observer(Observer observer, void* context) {
+    __atomic_store_n(&observer_context_, context, __ATOMIC_RELEASE);
+    __atomic_store_n(&observer_, observer, __ATOMIC_RELEASE);
+  }
+
   explicit Clipboard(allocators::IAllocator& allocator) : allocator_(allocator) {}
   ~Clipboard() { clear(); }
   Clipboard(const Clipboard&) = delete;
@@ -61,6 +70,10 @@ class Clipboard {
   bool get_image(uint32_t* pixels, uint64_t capacity) const;
 
  private:
+  void observe(bool changed) const {
+    Observer observer = __atomic_load_n(&observer_, __ATOMIC_ACQUIRE);
+    if (observer) observer(__atomic_load_n(&observer_context_, __ATOMIC_ACQUIRE), changed);
+  }
   bool replace(ClipboardFormat format, ArrayView<uint8_t> data, uint32_t width, uint32_t height);
 
   allocators::IAllocator& allocator_;
@@ -69,6 +82,8 @@ class Clipboard {
   ArrayView<uint8_t> data_;
   uint32_t width_ = 0, height_ = 0;
   uint64_t sequence_ = 0;
+  Observer observer_ = nullptr;
+  void* observer_context_ = nullptr;
 };
 
 }  // namespace kernel

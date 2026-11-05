@@ -17,6 +17,7 @@
  */
 #include "Win32kTestSupport.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
+#include "Kernel/Clipboard.hpp"
 
 // Tests of the user-misc module of win32k (menus, cursors and icons, clipboard, accelerators, settings and metrics, monitors and display, keyboard layouts, input contexts, raw
 // input, shell services, the NtUserCall* multiplexers). The window manager and the GDI module are other modules: the functions of their contracts that this module calls are
@@ -664,6 +665,40 @@ void test_clipboard() {
   CHECK(p.call(N::NtUserCountClipboardFormats) == 1);
   drop_window(0x30001);
   CHECK(p.call(N::NtUserCountClipboardFormats) == 0 && p.call(N::NtUserGetClipboardOwner) == 0);
+
+  // the bridge: the clipboard of the desktop's programs and the Windows clipboard are one
+  {
+    kernel::Clipboard kc(*system_allocator());
+    user_misc::install_clipboard_bridge(&kc);
+    String got(*system_allocator());
+    // a Windows program copies text: it is on the desktop's clipboard when the program closes the clipboard
+    CHECK(p.call(N::NtUserOpenClipboard, 0, 0) == 1 && p.call(N::NtUserEmptyClipboard) == 1 && set_data(p, 13, 0, std::string("h\0i\0\0\0", 6)) == 0);
+    CHECK(!kc.has_text());      // (not before: the clipboard is still being filled)
+    CHECK(p.call(N::NtUserCloseClipboard) == 1 && kc.get_text(&got) && got.view().equals("hi"));
+    // the desktop copies: the Windows clipboard has it at the next look, and the format count and the sequence number change
+    const uint32_t seq = uint32_t(p.call(N::NtUserGetClipboardSequenceNumber));
+    CHECK(kc.set_text("from the desktop \xC3\xA9"));
+    CHECK(p.call(N::NtUserIsClipboardFormatAvailable, 13) == 1 && uint32_t(p.call(N::NtUserGetClipboardSequenceNumber)) > seq);
+    {
+      Locked lock;
+      List<char16_t> units(*system_allocator());
+      CHECK(user_misc::clipboard_unicode_text(&units) && units.count() == 18 && units[0] == u'f' && units[17] == 0xE9);
+    }
+    // a picture of the desktop is a CF_DIB; a CF_DIB of a program is a picture of the desktop
+    const uint32_t pixels[4] = {0xFF112233u, 0xFF445566u, 0xFF778899u, 0xFFAABBCCu};
+    CHECK(kc.set_image(pixels, 2, 2));
+    CHECK(p.call(N::NtUserIsClipboardFormatAvailable, 8) == 1 && p.call(N::NtUserIsClipboardFormatAvailable, 13) == 0);
+    std::string dib;
+    auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) dib.push_back(char(v >> (8 * i))); };
+    put32(40); put32(1); put32(1); dib.push_back(1); dib.push_back(0); dib.push_back(32); dib.push_back(0); put32(0); put32(4); put32(0); put32(0); put32(0); put32(0);
+    put32(0x00FF8040u);      // one pixel (no alpha: opaque)
+    CHECK(p.call(N::NtUserOpenClipboard, 0, 0) == 1 && p.call(N::NtUserEmptyClipboard) == 1 && set_data(p, 8, 0, dib) == 0 && p.call(N::NtUserCloseClipboard) == 1);
+    uint32_t w = 0, h = 0, one = 0;
+    CHECK(kc.image_size(&w, &h) && w == 1 && h == 1 && kc.get_image(&one, 1) && one == 0xFFFF8040u);
+    // emptying on the Windows side empties the other
+    CHECK(p.call(N::NtUserOpenClipboard, 0, 0) == 1 && p.call(N::NtUserEmptyClipboard) == 1 && p.call(N::NtUserCloseClipboard) == 1 && kc.format() == kernel::ClipboardFormat::Empty);
+    user_misc::install_clipboard_bridge(nullptr);
+  }
 
   // a process that ends while it has the clipboard open lets go of it
   new_window(0x30003, 131, 3);

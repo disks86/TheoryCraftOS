@@ -60,6 +60,7 @@ Checks that failed (Wine commit f343ca6), before the implementation of the libra
 | user32 listbox | not run | 250 (stops at a crash in the test): items, data, sorting, selection modes, notifications, keyboard/mouse selection; left: scroll bars on the control, multi-column, tab stops, owner draw drawing, LB_DIR |
 | user32 combo | not run | 167 (the test divides by zero in its own code after CB_GETCOMBOBOXINFO fails): simple / drop-down / list-only boxes made of Edit + ComboLBox; left: CB_GETCOMBOBOXINFO, exact heights, owner draw, extended UI |
 | user32 dialog | not run | 48 (crash late in the test): templates (DLGTEMPLATE and EX), DialogBox / CreateDialog, DefDlgProc, IsDialogMessage, item functions; left: exact tab/group order corner cases, DlgDirList, menus in templates, font based dialog units |
+| user32 clipboard | not run (stubs) | many failures: Wine's test drives several processes and window stations (wait failures, access violation in its child process); the clipboard itself is tested by tests/windows/user32test.c and Win32kMiscTest (the bridge to the desktop's clipboard) |
 | kernel32 atom | 9422 (hung) | 0 (needed user32 wsprintf, now in src/Windows/user32) |
 | kernel32 virtual | 10983 | 0 (passes; the child-process phase hung or lost the child once in four runs) |
 | kernel32 heap | 3463 (hung) | about 285 before test_heap_sizes (Global/Local memory done; HeapWalk regions, HeapQueryInformation, heap flags/debug heap and Windows' internal sub-heap sizes are not) |

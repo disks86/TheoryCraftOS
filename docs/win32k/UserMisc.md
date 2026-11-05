@@ -67,6 +67,15 @@ pointer is `ERROR_NOACCESS`, 998) and sizes with checked arithmetic.
 
 ## The clipboard
 
+**One clipboard for the whole system.** The desktop's own programs (kernel mode: text boxes, the editor, the spreadsheet, the browser, the paint program) use `kernel::Clipboard`
+(`src/Kernel/Clipboard.hpp`: text or a picture); Windows programs use this module. `install_clipboard_bridge` (called by `main.cpp` with the desktop's clipboard) keeps the two the
+same: each side has a sequence number and the bridge, run before every read and after every change of either side (`kernel::Clipboard::set_observer`, and at the start of every
+clipboard service here), copies a change across - text as CF_UNICODETEXT (UTF-8 <-> UTF-16), a picture as a 32-bit bottom-up CF_DIB (a 24-bit DIB works too; no alpha means opaque).
+A change on the desktop side wins unless a Windows program has just closed the clipboard (`CloseClipboard` pushes what it wrote); a Windows clipboard that is open is neither read
+nor written (it is half filled), the desktop's change is taken when it closes. A change that comes from the desktop wakes the Windows listeners (WM_CLIPBOARDUPDATE) and viewers.
+Other Windows formats stay on the Windows side. The bridge works before any Windows program ran: the first clipboard service call brings the Windows side up to date. Tests:
+`Win32kMiscTest` (bridge section), `tests/windows/user32test.c` (user32's clipboard functions and Edit copy/paste). user32 side: `src/Windows/user32/clipboard.inc`.
+
 Formats keep their bytes (the user-mode side keeps handles and passes them back). Availability follows Windows: the formats set, then the synthesized ones - CF_LOCALE and
 the missing members of the text family first, then the metafile pair, then the bitmap family. Text is converted between CF_TEXT, CF_OEMTEXT and CF_UNICODETEXT (cp1252; the
 OEM code page is treated as the ANSI one); the metafile and bitmap conversions are left to user mode (they are listed but `GetClipboardData` returns no data for them).

@@ -107,6 +107,11 @@ SVC NtUserRemoveProp(ULONG_PTR hwnd, ULONG_PTR name);
 IMPORT int WINAPI MultiByteToWideChar(UINT code_page, DWORD flags, LPCSTR source, int source_length, LPWSTR destination, int destination_length);
 IMPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR source, int source_length, LPSTR destination, int destination_length, LPCSTR default_char, LPBOOL used_default);
 IMPORT HANDLE WINAPI GetModuleHandleW(LPCWSTR name);
+IMPORT HANDLE WINAPI GlobalAlloc(UINT flags, SIZE_T bytes);
+IMPORT HANDLE WINAPI GlobalFree(HANDLE memory);
+IMPORT void *WINAPI GlobalLock(HANDLE memory);
+IMPORT BOOL WINAPI GlobalUnlock(HANDLE memory);
+IMPORT SIZE_T WINAPI GlobalSize(HANDLE memory);
 IMPORT HANDLE WINAPI FindResourceW(HANDLE module, LPCWSTR name, LPCWSTR type);
 IMPORT HANDLE WINAPI LoadResource(HANDLE module, HANDLE resource);
 IMPORT void *WINAPI LockResource(HANDLE resource);
@@ -353,6 +358,11 @@ static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags
 /* (the controls below use these before they are defined) */
 #define BOOL_OF(x) (((x) & 0xFFFFFFFFu) != 0)
 EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd);
+EXPORT BOOL WINAPI OpenClipboard(HANDLE hwnd);
+EXPORT BOOL WINAPI CloseClipboard(void);
+EXPORT BOOL WINAPI EmptyClipboard(void);
+EXPORT HANDLE WINAPI SetClipboardData(UINT format, HANDLE handle);
+EXPORT HANDLE WINAPI GetClipboardData(UINT format);
 EXPORT LONG_PTR WINAPI DispatchMessageW(const MSG_ *msg);
 EXPORT int WINAPI GetMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last);
 EXPORT BOOL WINAPI TranslateMessage(const MSG_ *msg);

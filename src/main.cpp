@@ -18,6 +18,7 @@
 
 #include "Process/WindowsSystem.hpp"
 #include "Process/Win32k/Win32k.hpp"
+#include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/WindowsFonts.hpp"
 #include "Font/SystemFontService.hpp"
 #include "Jit/CodePageSource.hpp"
@@ -1839,6 +1840,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_capture_hub(capture_hub.get());
     desktop.set_midi_output(&usb_midi);
     desktop.set_clipboard(&clipboard);
+    process::win32k::user_misc::install_clipboard_bridge(&clipboard);      // the desktop's clipboard and the Windows programs' clipboard are one
+    struct ClipboardBridgeGuard { ~ClipboardBridgeGuard() { process::win32k::user_misc::install_clipboard_bridge(nullptr); } } clipboard_bridge_guard;      // (gone before the clipboard is)
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);
     explorer_files.set_notifier(on_storage_change, &desktop);

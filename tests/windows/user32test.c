@@ -419,6 +419,107 @@ static void test_dialogs(HINSTANCE instance) {
   DestroyWindow(owner);
 }
 
+static int g_clip_updates;
+static LRESULT CALLBACK clip_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_CLIPBOARDUPDATE) ++g_clip_updates;
+  return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+static HGLOBAL global_text_a(const char *s) {
+  HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, strlen(s) + 1);
+  memcpy(GlobalLock(h), s, strlen(s) + 1);
+  GlobalUnlock(h);
+  return h;
+}
+
+static void test_clipboard(HINSTANCE instance) {
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = clip_proc; wc.hInstance = instance; wc.lpszClassName = "TcosClipClass";
+  RegisterClassA(&wc);
+  HWND hwnd = CreateWindowA("TcosClipClass", "clip", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, instance, NULL);
+  CHECK(AddClipboardFormatListener(hwnd));
+
+  /* nothing works without OpenClipboard */
+  CHECK(!EmptyClipboard() && GetLastError() == ERROR_CLIPBOARD_NOT_OPEN);
+  CHECK(OpenClipboard(hwnd) && GetOpenClipboardWindow() == hwnd);
+  CHECK(EmptyClipboard() && GetClipboardOwner() == hwnd);
+  DWORD sequence = GetClipboardSequenceNumber();
+  HGLOBAL text = global_text_a("hello clipboard");
+  CHECK(SetClipboardData(CF_TEXT, text) == text);
+  CHECK(CloseClipboard() && GetOpenClipboardWindow() == NULL);
+  CHECK(GetClipboardSequenceNumber() > sequence);
+
+  /* the text formats are made from each other */
+  CHECK(IsClipboardFormatAvailable(CF_TEXT) && IsClipboardFormatAvailable(CF_UNICODETEXT) && IsClipboardFormatAvailable(CF_OEMTEXT) && !IsClipboardFormatAvailable(CF_BITMAP));
+  CHECK(OpenClipboard(NULL));
+  HANDLE a = GetClipboardData(CF_TEXT), w = GetClipboardData(CF_UNICODETEXT);
+  CHECK(a == text && GetClipboardData(CF_TEXT) == a);      /* (the owner gets its own handle back, every time) */
+  const WCHAR *wide = w ? GlobalLock(w) : NULL;
+  CHECK(wide && !wcscmp(wide, L"hello clipboard") && GlobalSize(w) >= 32);
+  if (w) GlobalUnlock(w);
+  UINT f = 0, count = 0;
+  while ((f = EnumClipboardFormats(f)) != 0) ++count;
+  CHECK(count >= 3 && CountClipboardFormats() == (int)count);
+  CHECK(CloseClipboard());
+
+  /* a listener hears of the change when the clipboard closes */
+  MSG msg;
+  while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
+  CHECK(g_clip_updates >= 1);
+
+  /* formats of the program's own: registered names, binary data */
+  UINT own = RegisterClipboardFormatA("TcosOwnFormat");
+  CHECK(own >= 0xC000);
+  char name[32];
+  CHECK(GetClipboardFormatNameA(own, name, sizeof name) == 13 && !strcmp(name, "TcosOwnFormat"));
+  HGLOBAL blob = GlobalAlloc(GMEM_MOVEABLE, 5);
+  memcpy(GlobalLock(blob), "\x01\x02\x00\x03\x04", 5);
+  GlobalUnlock(blob);
+  CHECK(OpenClipboard(hwnd) && EmptyClipboard() && SetClipboardData(own, blob) == blob && CloseClipboard());
+  CHECK(IsClipboardFormatAvailable(own) && !IsClipboardFormatAvailable(CF_TEXT));
+  CHECK(OpenClipboard(NULL));
+  HANDLE got = GetClipboardData(own);
+  const BYTE *bytes = got ? GlobalLock(got) : NULL;
+  CHECK(bytes && GlobalSize(got) == 5 && bytes[2] == 0 && bytes[4] == 4);
+  if (got) GlobalUnlock(got);
+  CloseClipboard();
+
+  /* copy and paste between two edit controls */
+  HWND from = CreateWindowA("edit", "copy this text", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 200, 30, NULL, NULL, instance, NULL);
+  HWND to = CreateWindowA("edit", "", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 40, 200, 30, NULL, NULL, instance, NULL);
+  SendMessageA(from, EM_SETSEL, 5, 9);
+  SendMessageA(from, WM_COPY, 0, 0);
+  SendMessageA(to, WM_PASTE, 0, 0);
+  char text_a[64];
+  CHECK(GetWindowTextA(to, text_a, sizeof text_a) == 4 && !strcmp(text_a, "this"));
+  SendMessageA(from, EM_SETSEL, 0, 4);
+  SendMessageA(from, WM_CUT, 0, 0);
+  CHECK(GetWindowTextA(from, text_a, sizeof text_a) == 10 && !strcmp(text_a, " this text"));
+  SendMessageA(to, EM_SETSEL, 4, 4);
+  SendMessageA(to, WM_CHAR, 22, 0);      /* Ctrl+V */
+  CHECK(GetWindowTextA(to, text_a, sizeof text_a) == 8 && !strcmp(text_a, "thiscopy"));
+  CHECK(OpenClipboard(NULL) && IsClipboardFormatAvailable(CF_UNICODETEXT) && CloseClipboard());
+
+  /* a bitmap is kept as a DIB too, so a reader of either format finds it */
+  HBITMAP bmp = CreateBitmap(4, 3, 1, 32, NULL);
+  CHECK(bmp != NULL);
+  CHECK(OpenClipboard(hwnd) && EmptyClipboard() && SetClipboardData(CF_BITMAP, bmp) == bmp && CloseClipboard());
+  CHECK(IsClipboardFormatAvailable(CF_BITMAP) && IsClipboardFormatAvailable(CF_DIB));
+  CHECK(OpenClipboard(NULL));
+  HANDLE dib = GetClipboardData(CF_DIB);
+  const BITMAPINFOHEADER *header = dib ? GlobalLock(dib) : NULL;
+  CHECK(header && header->biWidth == 4 && header->biHeight == 3 && header->biBitCount == 32);
+  if (dib) GlobalUnlock(dib);
+  CHECK(GetClipboardData(CF_BITMAP) == bmp);
+  CloseClipboard();
+
+  CHECK(OpenClipboard(NULL) && EmptyClipboard() && CloseClipboard() && CountClipboardFormats() == 0);
+  CHECK(RemoveClipboardFormatListener(hwnd));
+  DestroyWindow(from); DestroyWindow(to); DestroyWindow(hwnd);
+  UnregisterClassA("TcosClipClass", instance);
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -549,6 +650,7 @@ int main(void) {
   test_scroll_bars(instance);
   test_list_and_combo(instance);
   test_dialogs(instance);
+  test_clipboard(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

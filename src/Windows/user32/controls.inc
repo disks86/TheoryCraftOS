@@ -715,6 +715,40 @@ static void edit_set_sel(HANDLE hwnd, EditState *st, LONG a, LONG b) {
   ctl_repaint(hwnd);
 }
 
+/* Copy and paste of the selection as CF_UNICODETEXT (the clipboard is shared with the desktop's own programs). */
+static BOOL edit_copy(HANDLE hwnd, EditState *st) {
+  const UINT a = st->sel_start < st->sel_end ? st->sel_start : st->sel_end, b = st->sel_start < st->sel_end ? st->sel_end : st->sel_start;
+  if (a == b || (ctl_style(hwnd) & ES_PASSWORD_)) return FALSE;
+  HANDLE memory = GlobalAlloc(2 /* GMEM_MOVEABLE */, ((SIZE_T)(b - a) + 1) * 2);
+  WCHAR *dst = memory ? GlobalLock(memory) : NULL;
+  if (!dst) { if (memory) GlobalFree(memory); return FALSE; }
+  for (UINT i = a; i < b; ++i) dst[i - a] = st->text[i];
+  dst[b - a] = 0;
+  GlobalUnlock(memory);
+  BOOL ok = FALSE;
+  if (OpenClipboard(hwnd)) {
+    EmptyClipboard();
+    ok = SetClipboardData(13 /* CF_UNICODETEXT */, memory) != NULL;
+    CloseClipboard();
+  }
+  if (!ok) GlobalFree(memory);
+  return ok;
+}
+static void edit_paste(HANDLE hwnd, EditState *st) {
+  if (st->readonly || (ctl_style(hwnd) & WS_DISABLED_) || !OpenClipboard(hwnd)) return;
+  HANDLE memory = GetClipboardData(13 /* CF_UNICODETEXT */);
+  const WCHAR *src = memory ? GlobalLock(memory) : NULL;
+  if (src) {
+    UINT n = 0;
+    const BOOL multiline = (ctl_style(hwnd) & ES_MULTILINE_) != 0;
+    while (src[n] && (multiline || (src[n] != L'\r' && src[n] != L'\n'))) ++n;
+    const UINT a = st->sel_start < st->sel_end ? st->sel_start : st->sel_end, b = st->sel_start < st->sel_end ? st->sel_end : st->sel_start;
+    edit_replace(hwnd, st, a, b, src, n, TRUE);
+    GlobalUnlock(memory);
+  }
+  CloseClipboard();
+}
+
 static LONG_PTR WINAPI edit_proc(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam) {
   EditState *st = message == 0x0081 ? NULL : ctl_state(hwnd);
   const LONG style = ctl_style(hwnd);
@@ -790,6 +824,8 @@ static LONG_PTR WINAPI edit_proc(HANDLE hwnd, UINT message, ULONG_PTR wparam, LO
     case 0x0202: if (GetCapture() == hwnd) ReleaseCapture(); return 0;
     case 0x0102: {      /* WM_CHAR */
       WCHAR c = (WCHAR)wparam;
+      if (c == 3) { edit_copy(hwnd, st); return 0; }      /* (copy and select all work in a read-only box) */
+      if (c == 1) { edit_set_sel(hwnd, st, 0, -1); return 0; }
       if (st->readonly || (style & WS_DISABLED_)) return 0;
       const UINT a = st->sel_start < st->sel_end ? st->sel_start : st->sel_end, b = st->sel_start < st->sel_end ? st->sel_end : st->sel_start;
       if (c == 8) {      /* backspace */
@@ -806,6 +842,10 @@ static LONG_PTR WINAPI edit_proc(HANDLE hwnd, UINT message, ULONG_PTR wparam, LO
         edit_replace(hwnd, st, a, b, L"\r\n", 2, TRUE);
         return 0;
       }
+      if (c == 3) { edit_copy(hwnd, st); return 0; }      /* Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+A */
+      if (c == 24) { SendMessageW(hwnd, 0x0300, 0, 0); return 0; }
+      if (c == 22) { edit_paste(hwnd, st); return 0; }
+      if (c == 1) { edit_set_sel(hwnd, st, 0, -1); return 0; }
       if (c == L'\t' && !(style & ES_MULTILINE_)) return 0;
       if (c < 0x20 && c != L'\t') return 0;
       if ((style & ES_NUMBER_) && (c < L'0' || c > L'9')) return 0;
@@ -845,7 +885,9 @@ static LONG_PTR WINAPI edit_proc(HANDLE hwnd, UINT message, ULONG_PTR wparam, LO
       if (moved) { st->sel_end = pos; if (!shift) st->sel_start = pos; ctl_repaint(hwnd); return 0; }
       return DefWindowProcW(hwnd, message, wparam, lparam);
     }
-    case 0x0301: case 0x0300: case 0x0302: return 0;      /* WM_COPY, WM_CUT, WM_PASTE: no clipboard here */
+    case 0x0301: edit_copy(hwnd, st); return 0;      /* WM_COPY */
+    case 0x0300: if (!st->readonly) { if (edit_copy(hwnd, st)) { const UINT a = st->sel_start < st->sel_end ? st->sel_start : st->sel_end, b = st->sel_start < st->sel_end ? st->sel_end : st->sel_start; edit_replace(hwnd, st, a, b, NULL, 0, TRUE); } } return 0;      /* WM_CUT */
+    case 0x0302: edit_paste(hwnd, st); return 0;      /* WM_PASTE */
     case 0x0303: if (st->readonly) return 0; { const UINT a = st->sel_start < st->sel_end ? st->sel_start : st->sel_end, b = st->sel_start < st->sel_end ? st->sel_end : st->sel_start; if (a != b) edit_replace(hwnd, st, a, b, NULL, 0, TRUE); } return 0;      /* WM_CLEAR */
     case 0x00B0: {      /* EM_GETSEL */
       const UINT a = st->sel_start < st->sel_end ? st->sel_start : st->sel_end, b = st->sel_start < st->sel_end ? st->sel_end : st->sel_start;

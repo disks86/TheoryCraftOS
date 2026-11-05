@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/Win32k/Win32kUserMisc.hpp"
+#include "Kernel/Clipboard.hpp"
+#include "Utility/Utf16.hpp"
 
 // The clipboard. The data of every format is kept as bytes (the user-mode side keeps the handles: it passes the handle it was given along, and gets it back). The text formats
 // are synthesized from each other (CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_LOCALE); the metafile and bitmap families are reported as available the way Windows does, but their
@@ -164,9 +166,127 @@ bool is_rendering(ClipboardState& s, Call& c, uint32_t format) {
   return user::window_process(s.owner_window) == c.pid() && user::window_thread(s.owner_window) == c.tid();
 }
 
+// --- the bridge to the kernel's clipboard
+kernel::Clipboard* g_bridge = nullptr;
+uint64_t g_last_kernel_sequence = 0;
+uint32_t g_last_windows_sequence = 0;
+bool g_bridge_busy = false;
+
+// A CF_DIB (24 or 32 bits per pixel, uncompressed) as pixels 0xAARRGGBB; a picture without alpha gets full alpha.
+bool dib_to_pixels(ConstByteView dib, List<uint32_t>* pixels, uint32_t* width, uint32_t* height) {
+  if (dib.size() < 40) return false;
+  auto u32 = [&](uint64_t o) { return uint32_t(dib[o]) | uint32_t(dib[o + 1]) << 8 | uint32_t(dib[o + 2]) << 16 | uint32_t(dib[o + 3]) << 24; };
+  const uint32_t header = u32(0), compression = u32(16), used = u32(32);
+  const int32_t w = int32_t(u32(4)), h = int32_t(u32(8));
+  const uint32_t bits = dib[14] | dib[15] << 8;
+  if (header < 40 || w <= 0 || h == 0 || (bits != 24 && bits != 32) || (compression != 0 && compression != 3)) return false;
+  const uint32_t rows = h < 0 ? uint32_t(-int64_t{h}) : uint32_t(h);
+  if (w > 16384 || rows > 16384) return false;
+  uint64_t offset = header + (compression == 3 && header == 40 ? 12 : 0) + uint64_t{used} * 4;
+  const uint64_t stride = ((uint64_t{uint32_t(w)} * bits + 31) / 32) * 4;
+  if (offset > dib.size() || stride * rows > dib.size() - offset) return false;
+  bool any_alpha = false;
+  for (uint32_t y = 0; y < rows; ++y) {
+    const uint32_t row = h < 0 ? y : rows - 1 - y;
+    const uint64_t at = offset + stride * row;
+    for (uint32_t x = 0; x < uint32_t(w); ++x) {
+      const uint8_t* p = &dib[at + uint64_t{x} * (bits / 8)];
+      const uint32_t a = bits == 32 ? p[3] : 0xFF;
+      any_alpha |= a != 0;
+      if (!pixels->push_back(a << 24 | uint32_t(p[2]) << 16 | uint32_t(p[1]) << 8 | p[0])) return false;
+    }
+  }
+  if (!any_alpha) for (uint32_t& px : pixels->view()) px |= 0xFF000000u;
+  *width = uint32_t(w);
+  *height = rows;
+  return true;
+}
+
+// Pixels as a bottom-up 32-bit CF_DIB.
+bool pixels_to_dib(const uint32_t* pixels, uint32_t width, uint32_t height, ByteBuffer* out) {
+  if (!out->put32(40) || !out->put32(width) || !out->put32(height) || !out->put16(1) || !out->put16(32) || !out->put32(0) || !out->put32(width * height * 4) || !out->put32(0) ||
+      !out->put32(0) || !out->put32(0) || !out->put32(0)) return false;
+  for (uint32_t y = height; y > 0; --y)
+    for (uint32_t x = 0; x < width; ++x) if (!out->put32(pixels[uint64_t{y - 1} * width + x])) return false;
+  return true;
+}
+
+void set_single_format(ClipboardState& s, uint32_t id, ConstByteView data) {
+  clear_formats(s);
+  Format* f = s.store.emplace(*system_allocator(), id);
+  if (f && f->data.append(data) && s.formats.push_back(f)) { f->has_data = true; f->handle = 0; }
+  else if (f) s.store.erase(f);
+  s.owner_window = 0;
+  ++s.sequence;
+  notify_change(s);
+}
+
+// Brings the two clipboards to the same contents (the system lock is held). A change on the desktop side wins when both changed; a Windows clipboard that a program has open is
+// not read (it is half written) and not written either.
+void bridge_sync(bool prefer_windows = false) {
+  ClipboardState* s = g_clipboard.get();
+  if (!g_bridge || !s || g_bridge_busy) return;
+  g_bridge_busy = true;
+  const uint64_t kernel_sequence = g_bridge->sequence();
+  const bool windows_changed = s->sequence != g_last_windows_sequence && s->open_thread == 0;
+  if (kernel_sequence != g_last_kernel_sequence && !(prefer_windows && windows_changed)) {
+    if (s->open_thread == 0) {
+      const kernel::ClipboardFormat format = g_bridge->format();
+      if (format == kernel::ClipboardFormat::Text) {
+        String text(*system_allocator());
+        ByteBuffer units(*system_allocator());
+        if (g_bridge->get_text(&text) && util::append_utf16le(&units, text.view()) && units.put16(0)) set_single_format(*s, kCfUnicodeText, units.view());
+      } else if (format == kernel::ClipboardFormat::Image) {
+        uint32_t w = 0, h = 0;
+        if (g_bridge->image_size(&w, &h)) {
+          List<uint32_t> pixels(*system_allocator());
+          ByteBuffer dib(*system_allocator());
+          bool ok = true;
+          for (uint64_t i = 0; i < uint64_t{w} * h && ok; ++i) ok = pixels.push_back(0);
+          if (ok && g_bridge->get_image(pixels.view().data(), pixels.count()) && pixels_to_dib(pixels.view().data(), w, h, &dib)) set_single_format(*s, kCfDib, dib.view());
+        }
+      } else {
+        clear_formats(*s);
+        s->owner_window = 0;
+        ++s->sequence;
+        notify_change(*s);
+      }
+      g_last_kernel_sequence = g_bridge->sequence();
+      g_last_windows_sequence = s->sequence;
+    }
+  } else if (windows_changed) {
+    ByteBuffer data(*system_allocator());
+    bool found = false;
+    uint64_t handle = 0;
+    if (format_data(*s, kCfUnicodeText, &data, &found, &handle) && found && data.size() >= 2) {
+      String text(*system_allocator());
+      if (data.size() > 2 && util::append_utf8_from_utf16le(&text, data.view().first(data.size() - 2)) && !text.empty()) g_bridge->set_text(text.view());
+      else g_bridge->clear();
+    } else {
+      ByteBuffer dib(*system_allocator());
+      List<uint32_t> pixels(*system_allocator());
+      uint32_t w = 0, h = 0;
+      found = false;
+      if (find_format(*s, kCfDib) && format_data(*s, kCfDib, &dib, &found, &handle) && found && dib_to_pixels(dib.view(), &pixels, &w, &h)) g_bridge->set_image(pixels.view().data(), w, h);
+      else g_bridge->clear();
+    }
+    g_last_kernel_sequence = g_bridge->sequence();
+    g_last_windows_sequence = s->sequence;
+  }
+  g_bridge_busy = false;
+}
+
+// The kernel clipboard's observer: takes the system lock itself.
+void bridge_observer(void*, bool) {
+  if (!g_bridge || g_bridge_busy) return;
+  SystemLock lock;
+  bridge_sync();
+}
+
 // --- services
 uint64_t svc_open(Call& c) {
   ClipboardState* s = st();
+  bridge_sync();
   const uint32_t hwnd = c.arg32(0);
   if (!s) return 0;
   if (hwnd != 0 && !user::is_window(hwnd)) return c.fail(kErrorInvalidWindowHandle);
@@ -182,6 +302,7 @@ uint64_t svc_close(Call& c) {
   ClipboardState* s = st();
   if (!s || !opened_by(*s, c)) return c.fail(kErrorClipboardNotOpen);
   close_open_state(*s, true);
+  bridge_sync(true);      // (what the program put there is now complete: the desktop gets it, even if the desktop changed its clipboard meanwhile)
   return 1;
 }
 
@@ -254,6 +375,7 @@ bool render_format(Call& c, ClipboardState& s, uint32_t format) {
 }
 
 uint64_t svc_get_data(Call& c) {
+  bridge_sync();
   ClipboardState* s = st();
   if (!s) return 0;
   const uint32_t format = c.arg32(0);
@@ -281,6 +403,7 @@ uint64_t svc_get_data(Call& c) {
 }
 
 uint64_t svc_enum_formats(Call& c) {
+  bridge_sync();
   ClipboardState* s = st();
   if (!s || !opened_by(*s, c)) return c.fail(kErrorClipboardNotOpen);
   List<uint32_t> list(*c.allocator());
@@ -293,11 +416,13 @@ uint64_t svc_enum_formats(Call& c) {
 }
 
 uint64_t svc_is_available(Call& c) {
+  bridge_sync();
   ClipboardState* s = st();
   return s && is_available(*s, c.arg32(0)) ? 1 : 0;
 }
 
 uint64_t svc_count(Call&) {
+  bridge_sync();
   ClipboardState* s = st();
   if (!s) return 0;
   List<uint32_t> list(*system_allocator());
@@ -308,7 +433,7 @@ uint64_t svc_count(Call&) {
 uint64_t svc_get_owner(Call&) { ClipboardState* s = st(); return s ? s->owner_window : 0; }
 uint64_t svc_get_open_window(Call&) { ClipboardState* s = st(); return s ? s->open_window : 0; }
 uint64_t svc_get_viewer(Call&) { ClipboardState* s = st(); return s ? s->viewer : 0; }
-uint64_t svc_get_sequence(Call&) { ClipboardState* s = st(); return s ? s->sequence : 0; }
+uint64_t svc_get_sequence(Call&) { bridge_sync(); ClipboardState* s = st(); return s ? s->sequence : 0; }
 
 uint64_t svc_set_viewer(Call& c) {
   ClipboardState* s = st();
@@ -351,6 +476,7 @@ uint64_t svc_remove_listener(Call& c) {
 }
 
 uint64_t svc_get_updated_formats(Call& c) {
+  bridge_sync();
   ClipboardState* s = st();
   if (!s) return 0;
   List<uint32_t> list(*c.allocator());
@@ -363,6 +489,7 @@ uint64_t svc_get_updated_formats(Call& c) {
 }
 
 uint64_t svc_get_priority_format(Call& c) {
+  bridge_sync();
   ClipboardState* s = st();
   const int32_t count = c.argi(1);
   if (!s) return 0;
@@ -379,6 +506,13 @@ uint64_t svc_get_priority_format(Call& c) {
 }
 
 }  // namespace
+
+void install_clipboard_bridge(kernel::Clipboard* clipboard) {
+  g_bridge = clipboard;
+  g_last_kernel_sequence = 0;
+  g_last_windows_sequence = 0;
+  if (clipboard) clipboard->set_observer(bridge_observer, nullptr);
+}
 
 void set_clipboard_render_timeout_ns(uint64_t ns) { if (ClipboardState* s = st()) s->render_timeout_ns = ns; }
 

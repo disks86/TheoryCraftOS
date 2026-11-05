@@ -28,6 +28,7 @@
 // The user-misc module of win32k: menus, cursors and icons, the clipboard, accelerator tables, monitors and display settings, SystemParametersInfo and the system metrics and
 // colours, keyboard layouts, input contexts, raw input, shell and process-level services, and the NtUserCallNoParam/OneParam/TwoParam multiplexers. The cross-module contract
 // (user_misc:: in Win32kUser.hpp) is implemented here; this header holds what the files of the module share and a few additions other modules may use. See docs/win32k/UserMisc.md.
+namespace kernel { class Clipboard; }
 namespace process::win32k::user_misc {
 
 using gdi::Rect;
@@ -227,6 +228,10 @@ uint32_t record_raw_input(uint64_t pid, uint32_t type, uint32_t device, uint64_t
 bool clipboard_unicode_text(List<char16_t>* out);
 bool clipboard_set_unicode_text(ArrayView<const char16_t> text);
 uint32_t clipboard_sequence();
+// The two clipboards of the system are one: the kernel's (src/Kernel/Clipboard.hpp: text and a picture, used by the desktop's programs) and this module's (Windows formats, used by
+// Windows programs). The bridge copies a change of either into the other (text as CF_UNICODETEXT, a picture as CF_DIB) whenever either is read or changed, and makes the Windows
+// listeners and viewers hear of a change that came from the desktop. It works without a Windows program running: the Windows side is brought up to date by the first service call.
+void install_clipboard_bridge(kernel::Clipboard* clipboard);
 // The system colour brushes and pens (NtUserCallOneParam GetSysColorBrush / GetSysColorPen) are GDI objects, which the gdi:: contract does not offer to make: the GDI module (or the
 // kernel) tells this module how, by giving a function that makes a solid brush / pen of a COLORREF owned by a process (0 on failure). Until then the two codes fail.
 using SolidObjectFactory = uint32_t (*)(uint64_t pid, uint32_t colorref);

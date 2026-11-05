@@ -33,6 +33,7 @@ bool Clipboard::replace(ClipboardFormat format, ArrayView<uint8_t> data, uint32_
     ++sequence_;
   }
   release_view(allocator_, old);
+  observe(true);
   return true;
 }
 
@@ -66,25 +67,30 @@ void Clipboard::clear() {
     ++sequence_;
   }
   release_view(allocator_, old);
+  observe(true);
 }
 
 ClipboardFormat Clipboard::format() const {
+  observe(false);
   ScopedMutex guard(mutex_);
   return format_;
 }
 
 uint64_t Clipboard::sequence() const {
+  observe(false);
   ScopedMutex guard(mutex_);
   return sequence_;
 }
 
 bool Clipboard::get_text(String* out) const {
+  observe(false);
   ScopedMutex guard(mutex_);
   if (format_ != ClipboardFormat::Text) return false;
   return out->assign(StringView(reinterpret_cast<const char*>(data_.data()), data_.size()));
 }
 
 bool Clipboard::image_size(uint32_t* width, uint32_t* height) const {
+  observe(false);
   ScopedMutex guard(mutex_);
   if (format_ != ClipboardFormat::Image) return false;
   *width = width_;
@@ -93,6 +99,7 @@ bool Clipboard::image_size(uint32_t* width, uint32_t* height) const {
 }
 
 bool Clipboard::get_image(uint32_t* pixels, uint64_t capacity) const {
+  observe(false);
   ScopedMutex guard(mutex_);
   if (format_ != ClipboardFormat::Image || capacity < uint64_t{width_} * height_) return false;
   __builtin_memcpy(pixels, data_.data(), data_.size());
