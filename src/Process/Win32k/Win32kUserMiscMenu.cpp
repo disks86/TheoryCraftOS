@@ -139,12 +139,14 @@ void destroy_menu_tree(MenuState& s, uint32_t handle, uint32_t depth) {
 }
 
 // Applies the fields of `mii` selected by its mask to `item`. `text`: the string for MIIM_STRING / MIIM_TYPE (null = none given).
-bool apply_mii(MenuState& s, Call& call, MenuItem& item, uint32_t menu_handle, const Mii& mii, const WideString* text) {
+bool apply_mii(MenuState& s, Call& call, MenuItem& item, uint32_t menu_handle, const Mii& mii, const WideString* text, bool classic = false) {
   if (mii.mask & kMiimSubmenu) {
     if (mii.submenu != 0) {
       const uint32_t sub = uint32_t(mii.submenu);
-      if (!s.menus.find(sub) || (mii.submenu >> 32) != 0) { call.set_last_error(kErrorInvalidMenuHandle); return false; }
-      if (menu_contains(s, sub, menu_handle, 0)) { call.set_last_error(kErrorInvalidParameter); return false; }
+      if (!s.menus.find(sub) || (mii.submenu >> 32) != 0) {
+        call.set_last_error(kErrorInvalidMenuHandle);
+        if (!classic) return false;      // (InsertMenu / AppendMenu / ModifyMenu keep a bad submenu handle and succeed with the error set)
+      } else if (menu_contains(s, sub, menu_handle, 0)) { call.set_last_error(kErrorInvalidParameter); return false; }
     }
   }
   if (mii.mask & (kMiimType | kMiimFtype)) {
@@ -338,12 +340,12 @@ uint64_t svc_set_menu_flag_rtol(Call& c) {
 // --- MENUINFO
 uint64_t svc_thunked_menu_info(Call& c) {
   MenuState* s = st();
-  Menu* menu = s && arg_handle_ok(c, c.arg(0)) ? s->menus.find(c.arg32(0)) : nullptr;
-  if (!menu) return c.fail(kErrorInvalidMenuHandle);
   uint8_t raw[kMenuInfoSize];
   if (!c.read(c.arg(1), ByteView(raw, kMenuInfoSize))) return c.fail(kErrorNoAccess);
   auto u32 = [&](uint32_t o) { return uint32_t(raw[o]) | uint32_t(raw[o + 1]) << 8 | uint32_t(raw[o + 2]) << 16 | uint32_t(raw[o + 3]) << 24; };
   if (u32(0) != kMenuInfoSize) return c.fail(kErrorInvalidParameter);
+  Menu* menu = s && arg_handle_ok(c, c.arg(0)) ? s->menus.find(c.arg32(0)) : nullptr;
+  if (!menu) return c.fail(kErrorInvalidMenuHandle);
   const uint32_t mask = u32(4), style = u32(8), max_height = u32(12), help = u32(24);
   const uint64_t brush = uint64_t(u32(16)) | uint64_t(u32(20)) << 32, data = uint64_t(u32(32)) | uint64_t(u32(36)) << 32;
   if ((mask & ~(kMimMaxHeight | kMimBackground | kMimHelpId | kMimMenuData | kMimStyle | kMimApplyToSubmenus)) != 0) return c.fail(kErrorInvalidParameter);
@@ -368,6 +370,7 @@ uint64_t svc_thunked_menu_info(Call& c) {
 enum Method : uint32_t { kSetMenuItemInfo, kInsertMenuItem, kCheckMenuRadioItem, kGetMenuDefaultItem, kGetMenuItemID, kGetMenuItemInfoA, kGetMenuItemInfoW, kGetMenuState, kGetSubMenu };
 
 uint64_t set_or_insert(Call& c, MenuState& s, uint32_t handle, uint32_t pos, uint32_t flags, bool insert, uint64_t info, uint64_t str) {
+  const bool classic = (flags & kClassicCall) != 0;
   Mii mii;
   if (!read_mii(c, info, &mii)) return 0;
   // MIIM_TYPE is the old way to give the type and string: it cannot be combined with the new ones, and a bitmap type is not set with MIIM_FTYPE or next to MIIM_BITMAP.
@@ -380,7 +383,7 @@ uint64_t set_or_insert(Call& c, MenuState& s, uint32_t handle, uint32_t pos, uin
   if (!insert) {
     MenuItem* item = find_item(s, &holder, pos, flags, &index);
     if (!item) return c.fail(kErrorMenuItemNotFound);
-    return apply_mii(s, c, *item, holder, mii, have_text ? &text : nullptr) ? 1 : 0;
+    return apply_mii(s, c, *item, holder, mii, have_text ? &text : nullptr, classic) ? 1 : 0;
   }
   Menu* menu = s.menus.find(handle);
   uint64_t where = menu->items.count();
@@ -394,7 +397,7 @@ uint64_t set_or_insert(Call& c, MenuState& s, uint32_t handle, uint32_t pos, uin
   MenuItem* item = nullptr;
   if (!insert_item(s, *menu, where, &item)) return c.fail(kErrorNotEnoughMemory);
   if (!(mii.mask & (kMiimType | kMiimFtype | kMiimString))) item->type = kMftString;
-  if (!apply_mii(s, c, *item, handle, mii, have_text ? &text : nullptr)) {
+  if (!apply_mii(s, c, *item, handle, mii, have_text ? &text : nullptr, classic)) {
     uint64_t at = 0;
     for (uint64_t i = 0; i < menu->items.count(); ++i) if (menu->items[i] == item) at = i;
     remove_item(*menu, at);
@@ -595,11 +598,11 @@ int32_t menu_item_count(uint32_t handle) {
 
 bool get_menu_info(Call& c, uint32_t handle, uint64_t info) {
   MenuState* s = st();
-  Menu* m = s ? s->menus.find(handle) : nullptr;
-  if (!m) { c.set_last_error(kErrorInvalidMenuHandle); return false; }
   uint32_t size = 0, mask = 0;
   if (!c.read_u32(info, &size) || !c.read_u32(info + 4, &mask)) { c.set_last_error(kErrorNoAccess); return false; }
   if (size != kMenuInfoSize) { c.set_last_error(kErrorInvalidParameter); return false; }
+  Menu* m = s ? s->menus.find(handle) : nullptr;
+  if (!m) { c.set_last_error(kErrorInvalidMenuHandle); return false; }
   bool ok = true;
   if (mask & kMimStyle) ok = ok && c.write_u32(info + 8, m->style);
   if (mask & kMimMaxHeight) ok = ok && c.write_u32(info + 12, m->max_height);

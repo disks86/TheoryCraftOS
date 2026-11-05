@@ -88,7 +88,7 @@ bridge to the kernel's text clipboard (`src/Kernel/Clipboard.hpp`), not wired ye
 
 ## Not implemented (they keep answering STATUS_NOT_IMPLEMENTED)
 
-* Needing text metrics or a modal loop: TrackPopupMenuEx, EndMenu, GetMenuBarInfo, GetMenuItemRect, MenuItemFromPoint, CalcMenuBar, PaintMenuBar, DrawMenuBarTemp.
+* Layout and the modal loop of menus (TrackPopupMenuEx, EndMenu, GetMenuBarInfo, GetMenuItemRect, MenuItemFromPoint, CalcMenuBar, DrawMenuBarTemp) are done in user mode (user32 `menuui.inc`, see User.md): they need the font metrics and a message loop that the kernel does not have. `NtUserTrackPopupMenuEx` and friends keep answering STATUS_NOT_IMPLEMENTED.
 * Needing GDI drawing that the gdi:: contract lacks: DrawIconEx, DrawCaption*, CreateEmptyCursorObject-style loaders (LoadCursorsAndIcons), GetClassIcoCur, GetOemBitmapSize.
 * Needing a user-mode callback: EnumDisplayMonitors (Wine's form calls back into the process for each monitor).
 * Needing registry/atom services that do not exist yet: GetClipboardFormatName (registered formats are atoms), RegisterClipboardFormat.

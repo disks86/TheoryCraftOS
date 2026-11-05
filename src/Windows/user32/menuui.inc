@@ -92,7 +92,7 @@
 #define VK_RIGHT_ 0x27
 #define VK_DOWN_ 0x28
 #define VK_F10_ 0x79
-#define ERROR_POPUP_ALREADY_ACTIVE_ 1444
+#define ERROR_POPUP_ALREADY_ACTIVE_ 1446
 #define MSGF_MENU_ 2
 #define MT_MAX_LEVELS 8
 #define MENU_PAD 2           /* between the border of a popup and its items */

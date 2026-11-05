@@ -77,7 +77,7 @@ static void hook_forget(int slot) {
 }
 
 static HANDLE set_hook(int id, ULONG_PTR proc, HANDLE module, DWORD thread, BOOL ansi) {
-  if (id < WH_MSGFILTER || id > 14) { SetLastError(1429 /* ERROR_INVALID_HOOK_FILTER */); return NULL; }
+  if (id < WH_MSGFILTER || id > 14) { SetLastError(1426 /* ERROR_INVALID_HOOK_FILTER */); return NULL; }
   const HANDLE h = (HANDLE)NtUserSetWindowsHookEx((ULONG_PTR)module, 0, thread, (ULONG_PTR)(LONG_PTR)id, proc, ansi);
   if (h) hook_remember(h, id, proc);
   return h;

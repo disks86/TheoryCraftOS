@@ -90,7 +90,24 @@ system metrics (NtUserCallOneParam). Calls follow Wine's `ntuser` interface (the
   procedures of **Static**, **Button** (push, check, 3-state, radio with groups, group box; BM_* messages, WM_COMMAND notifications, WM_CTLCOLORBTN) and **Edit** (single and multi line text model,
   selection, EM_* messages, WM_CHAR / key input, EN_* notifications, plain painting) over gdi32 (user32 imports gdi32; FillRect, FrameRect, DrawFocusRect are exports). A control's state block
   is kept in the window's private data (NtUserCallHwndParam GetPrivateData/SetPrivateData) and the control reports to the parent it was created with. `scroll.inc` has the SetScrollInfo family and the **ScrollBar** control, `listbox.inc` the **ListBox** (and "ComboLBox"), `combo.inc` the **ComboBox** (an Edit child plus a list box child or popup), `dialog.inc` the **dialog** class (#32770 = DefDlgProc), templates, DialogBox / CreateDialog,
-  IsDialogMessage and the item functions, `icon.inc` carets, cursors, icons, LoadImage and DrawIconEx. Not done: menus (CreateMenu ... are stubs), the clipboard, hooks.
+  IsDialogMessage and the item functions, `icon.inc` carets, cursors, icons, LoadImage and DrawIconEx, `clipboard.inc` the clipboard (see UserMisc.md), `hooks.inc` hooks and WinEvents, `menu.inc` and
+  `menuui.inc` menus.
+* Hooks (`hooks.inc`): SetWindowsHookEx/UnhookWindowsHookEx/CallNextHookEx (the handle is ignored, as in Windows: the hook procedure being run is the current one), SetWindowsHook, CallMsgFilter,
+  SetWinEventHook/NotifyWinEvent. win32k keeps the hooks and calls them for CallNextHookEx and CallMsgFilter only, so user32 raises the events that happen in user mode, for the hooks of its own
+  process: WH_GETMESSAGE / WH_KEYBOARD / WH_MOUSE for a message GetMessage or PeekMessage returns (a nonzero result of the keyboard and mouse hooks discards a removed message), WH_CALLWNDPROC and
+  WH_CALLWNDPROCRET for SendMessage and DispatchMessage (a hook that sends a message does not raise them again), WH_CBT for DestroyWindow, SetFocus, SetActiveWindow, ShowWindow (min/max/restore)
+  with the veto of Windows. The start of a chain is `NtUserCallNextHookEx((1 << 32) | (id + 1), ...)`. Counters per hook id keep the no-hook case free of system calls. Not done: HCBT_CREATEWND,
+  HCBT_MOVESIZE / SYSCOMMAND / CLICKSKIPPED, WH_SHELL / FOREGROUNDIDLE / DEBUG, hooks in other processes, WH_CALLWNDPROC for messages sent by another thread.
+* Menus: `menu.inc` is the data half over win32k's HMENU objects: AppendMenu/InsertMenu/ModifyMenu/ChangeMenu (MF_ flags turned into MENUITEMINFO; MF_DEFAULT is not taken; an item without a
+  string is a separator, which is grayed; a bad submenu handle is kept and the error set), the MENUITEMINFO calls, GetMenuString, CheckMenuItem/RadioItem, EnableMenuItem, defaults, bitmaps, MENUINFO,
+  SetMenu/GetMenu (SetMenu changes the client area), GetSystemMenu, LoadMenu/LoadMenuIndirect from resources (old and extended templates). `menuui.inc` is the interface half: layout (a column or
+  several for MFT_MENUBREAK, a bar), drawing (text with mnemonics, accelerators after the tab, check marks and bullets, bitmaps, submenu arrows, owner-draw through WM_MEASUREITEM/WM_DRAWITEM),
+  the popup window of class "#32768", TrackPopupMenu(Ex) and the modal loop of the menu bar with the keyboard (arrows, Return, Escape, mnemonics, WM_MENUCHAR) and the mouse, EndMenu,
+  GetMenuItemRect/MenuItemFromPoint/GetMenuBarInfo, and what DefWindowProc adds (WM_NCPAINT draws the bar, WM_NCHITTEST gives HTMENU, Alt / F10 / Alt+letter / Alt+Space send SC_KEYMENU, a click on
+  the bar, the right button on the caption opens the system menu, WM_CANCELMODE ends a menu). Order of messages: WM_ENTERMENULOOP, WM_INITMENU, WM_INITMENUPOPUP, WM_MENUSELECT, WM_ENTERIDLE (once
+  when no input is waiting), WM_UNINITMENUPOPUP, WM_EXITMENULOOP, then the command is posted (WM_COMMAND, WM_SYSCOMMAND, WM_MENUCOMMAND for MNS_NOTIFYBYPOS) or returned (TPM_RETURNCMD).
+  win32k keeps the menu of a window (SetMenu sets the window record, CreateWindowEx attaches it) and destroys it with the window. Not done: scroll arrows for menus taller than the screen, the delay
+  before a submenu opens, multi-row bars, MDI system buttons, the default item in bold, themes, WM_MENURBUTTONUP / WM_MENUDRAG, the exact pixel metrics of Windows.
 * Painting: InvalidateRect on a window without WS_CLIPCHILDREN also invalidates the children it covers, and UpdateWindow paints the window and its children (win32k). New child windows go below
   their siblings (a maximized child on top), as in Windows.
 * ANSI: the window manager only knows Unicode; every window is a Unicode window. A functions convert what they send (`a_to_w`); a procedure given to RegisterClassA / SetWindowLongA is held behind

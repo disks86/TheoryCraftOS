@@ -107,7 +107,7 @@ static void flags_to_mii(MII_ *mii, UINT flags, ULONG_PTR id, const void *item, 
   mii->cbSize = sizeof *mii;
   mii->fMask = MIIM_FTYPE_ | MIIM_STATE_ | MIIM_ID_ | MIIM_SUBMENU_;
   mii->fType = flags & (MFT_BITMAP_ | 0x20 | 0x40 | MFT_OWNERDRAW_ | MFT_SEPARATOR_ | 0x4000 | 0x2000);
-  mii->fState = flags & (0x3 | 0x8 | 0x80 | 0x1000);
+  mii->fState = flags & (0x3 | 0x8 | 0x80);      /* (MF_DEFAULT is not taken) */
   mii->wID = (UINT)id;
   if (flags & MF_POPUP_) mii->hSubMenu = (HANDLE)id;
   if ((flags & MFT_SEPARATOR_) || (!(flags & (MFT_BITMAP_ | MFT_OWNERDRAW_)) && !item)) mii->fState |= 0x3;      /* a separator is disabled and grayed */
