@@ -243,8 +243,8 @@ bool write_hevc_slice_header(const HevcStreamHeaders& s, const HevcSliceHeader& 
   b.put(1, 1);                              // first_slice_segment_in_pic_flag
   if (h.idr) b.put(0, 1);                   // no_output_of_prior_pics_flag
   b.ue(0);                                  // slice_pic_parameter_set_id
-  const bool p = h.p_slice && !h.idr;
-  b.ue(p ? 1 : 2);                          // slice_type: P or I
+  const bool bi = h.b_slice && !h.idr, p = (h.p_slice || h.b_slice) && !h.idr;
+  b.ue(bi ? 0 : p ? 1 : 2);                 // slice_type: B, P or I
   if (!h.idr) {
     b.put(h.poc_lsb, s.log2_max_poc_lsb);   // slice_pic_order_cnt_lsb
     b.put(0, 1);                            // short_term_ref_pic_set_sps_flag: the set follows (st_ref_pic_set(0))
@@ -255,6 +255,7 @@ bool write_hevc_slice_header(const HevcStreamHeaders& s, const HevcSliceHeader& 
   }
   if (p) {
     b.put(0, 1);                            // num_ref_idx_active_override_flag
+    if (bi) b.put(0, 1);                    // mvd_l1_zero_flag
     b.ue(0);                                // five_minus_max_num_merge_cand
   }
   b.se(h.qp - 26);                          // slice_qp_delta

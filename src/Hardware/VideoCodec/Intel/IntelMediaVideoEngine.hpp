@@ -23,6 +23,7 @@
 #include "Hardware/VideoCodec/Intel/IntelAv1Session.hpp"
 #include "Hardware/VideoCodec/Intel/IntelAvcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelAvcVdencEncoder.hpp"
+#include "Hardware/VideoCodec/Intel/IntelHevcVdencEncoder.hpp"
 #include "Hardware/VideoCodec/Intel/IntelHevcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMpeg2Session.hpp"
@@ -69,7 +70,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   // Stops the engine driver. Every session made by create_decoder() must be closed first.
   void shutdown() override { driver_.reset(); info_.accelerated_decode_codecs = 0; info_.accelerated_encode_codecs = 0; }
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override;
-  // H.264 on a Gen9.5, Gen11 or Xe-LP engine runs in VDEnc mode on the engine (IntelAvcVdencEncoder); every other encode stays on the CPU.
+  // H.264 on a Gen9.5, Gen11 or Xe-LP engine, and H.265 on an Xe-LP one, run in VDEnc mode on the engine (IntelAvcVdencEncoder, IntelHevcVdencEncoder); every other encode stays on the CPU.
   UniquePointer<IVideoEncoder> create_encoder(const EncoderConfig& config) override;
   const IntelMediaEngineStatus& engine_status() const { return status_; }
   const char* engine_summary() const override { return summary_.c_str(); }

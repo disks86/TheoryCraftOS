@@ -49,10 +49,12 @@ bool write_hevc_pps(const HevcStreamHeaders& s, ByteBuffer* out, uint32_t* bits)
 
 // The slice segment header of the picture's only slice, start code and NAL unit header included, ending with byte_alignment() because the CABAC slice data starts on a byte
 // boundary. No emulation prevention bytes (the engine inserts those while it writes the slice data behind the header). `bits` is the exact length (a multiple of 8).
-// IDR pictures are I slices of type IDR_W_RADL; the others are P slices of type TRAIL_R that reference the previous picture. Deblocking must be on (the PPS says so).
+// IDR pictures are I slices of type IDR_W_RADL; the others are P slices of type TRAIL_R that reference the previous picture, or, for the video engine (which codes a P picture as a
+// low-delay B one, the media driver converts P to B as well), B slices whose two lists both hold the previous picture. Deblocking must be on (the PPS says so).
 struct HevcSliceHeader {
   bool idr = false;
   bool p_slice = false;      // ignored for IDR pictures (always I)
+  bool b_slice = false;      // a generalised B slice (both lists the previous picture) instead of P; ignored for IDR pictures
   uint32_t poc_lsb = 0;      // not coded for IDR pictures
   int32_t qp = 26;           // 0 .. 51
   bool deblocking = true;

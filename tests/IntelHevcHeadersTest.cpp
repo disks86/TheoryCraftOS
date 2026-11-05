@@ -218,14 +218,16 @@ void check_slice(allocators::IAllocator& a, const HevcStreamHeaders& s, const He
   CHECK(r.u(1) == 1);                                   // first_slice_segment_in_pic_flag
   if (h.idr) CHECK(r.u(1) == 0);                        // no_output_of_prior_pics_flag
   CHECK(r.ue() == 0);                                   // slice_pic_parameter_set_id
-  const bool p = h.p_slice && !h.idr;
-  CHECK(r.ue() == (p ? 1u : 2u));
+  const bool bi = h.b_slice && !h.idr, p = (h.p_slice || h.b_slice) && !h.idr;
+  CHECK(r.ue() == (bi ? 0u : p ? 1u : 2u));
   if (!h.idr) {
     CHECK(r.u(s.log2_max_poc_lsb) == h.poc_lsb);
     CHECK(r.u(1) == 0);                                 // short_term_ref_pic_set_sps_flag
     CHECK(r.ue() == 1 && r.ue() == 0 && r.ue() == 0 && r.u(1) == 1);
   }
-  if (p) CHECK(r.u(1) == 0 && r.ue() == 0);
+  if (p) CHECK(r.u(1) == 0);                            // num_ref_idx_active_override_flag
+  if (bi) CHECK(r.u(1) == 0);                           // mvd_l1_zero_flag
+  if (p) CHECK(r.ue() == 0);                            // five_minus_max_num_merge_cand
   CHECK(r.se() == h.qp - 26);
   CHECK(r.u(1) == 1);                                   // slice_loop_filter_across_slices_enabled_flag
   // byte_alignment(): a one then zeros up to the byte boundary, and nothing after.
@@ -257,7 +259,9 @@ int main() {
       check_slice(a, s, h);
       h.poc_lsb = (1u << s.log2_max_poc_lsb) - 1;
       check_slice(a, s, h);
-      h.p_slice = false;   // a non-IDR I slice
+      h.p_slice = false; h.b_slice = true;   // the low-delay B form of a P picture
+      check_slice(a, s, h);
+      h.b_slice = false;   // a non-IDR I slice
       check_slice(a, s, h);
     }
   }

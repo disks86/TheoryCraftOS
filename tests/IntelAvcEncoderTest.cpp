@@ -496,7 +496,7 @@ void test_device(TestAllocator& a, Generation g = Generation::Gen9) {
     IntelMediaVideoEngine device(a, g == Generation::Gen12 ? 0x9A49 : g == Generation::Gen11 ? 0x8A52 : 0x3E92, region);   // Tiger Lake / Ice Lake / Coffee Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
-    CHECK(device.hardware_decode() && device.info().accelerated_encode_codecs == codec_mask(VideoCodec::H264));
+    CHECK(device.hardware_decode() && device.info().accelerated_encode_codecs == (g == Generation::Gen12 ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : codec_mask(VideoCodec::H264)));
     EncoderConfig cfg;
     cfg.codec = VideoCodec::H264;
     cfg.width = 48;
