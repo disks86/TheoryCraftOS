@@ -39,6 +39,7 @@ bool IntelMediaVideoEngine::initialize() {
   }
   driver_.reset();
   info_.accelerated_decode_codecs = 0;
+  info_.accelerated_encode_codecs = 0;
   generation_ = intel_gt::Generation::Gen9;
   // Three generations have a driver: Gen9.5 (its video box answers the look above) and Gen11, which run H.264, MPEG-2, VC-1, H.265 and VP9; and the integrated Xe-LP parts
   // (Tiger Lake, Rocket Lake, Alder Lake, Raptor Lake), whose first video box must have answered, which run H.264, MPEG-2, H.265, VP9 and AV1. VC-1 stays with the CPU
@@ -67,6 +68,7 @@ bool IntelMediaVideoEngine::initialize() {
       } else {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) |
                                           (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
+        info_.accelerated_encode_codecs = codec_mask(VideoCodec::H264);   // (VDEnc, constant quantiser)
       }
     }
   }
@@ -101,6 +103,14 @@ UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const Decoder
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
   }
   return SoftwareVideoCodec::create_decoder(config);
+}
+
+UniquePointer<IVideoEncoder> IntelMediaVideoEngine::create_encoder(const EncoderConfig& config) {
+  if (config.codec == VideoCodec::H264 && hardware_decode() && generation_ == intel_gt::Generation::Gen9 && (info_.accelerated_encode_codecs & codec_mask(VideoCodec::H264))) {
+    UniquePointer<IntelAvcVdencEncoder> session = UniquePointer<IntelAvcVdencEncoder>::make(allocator_, allocator_, *driver_, config);
+    if (session && session->prepare()) return UniquePointer<IVideoEncoder>(util::move(session));   // else the engine is busy with another session (or the size is not one it takes): the CPU does it
+  }
+  return SoftwareVideoCodec::create_encoder(config);
 }
 
 }  // namespace hardware

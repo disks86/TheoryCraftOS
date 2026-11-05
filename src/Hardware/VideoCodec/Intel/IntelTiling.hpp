@@ -39,5 +39,9 @@ bool detile_nv12_to_i420(ConstByteView tiled, const Nv12TiledLayout& layout, uin
 bool detile_nv12_to_planes(ConstByteView tiled, const Nv12TiledLayout& layout, uint32_t width, uint32_t height, ByteView y, uint32_t y_stride, ByteView u, uint32_t u_stride, ByteView v,
                            uint32_t v_stride, uint32_t first = 0, uint32_t step = 1);
 
+// The opposite direction, for an encoder's input: a full-range I420 picture (any size up to the coded one) becomes limited-range NV12 in the Y-tiled surface of `layout`,
+// which is `coded_width` x `coded_height` (even, whole macroblocks); the rows and columns beyond the picture repeat its last ones. False if the sizes do not fit.
+bool tile_i420_to_nv12(const VideoFrameBuffer& i420, uint32_t coded_width, uint32_t coded_height, const Nv12TiledLayout& layout, ByteView tiled);
+
 }  // namespace intel_mfx
 }  // namespace hardware

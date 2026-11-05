@@ -219,6 +219,7 @@ struct FakeGpu final : IRegisterBank {
       if ((d & ~0x100u) == 0x68000000u) continue;   // MFX_WAIT: one dword
       if ((d >> 29) == 3) { remaining = (d & 0xFF) + 1; continue; }
       if ((d >> 23) == 0x26) { remaining = 3; continue; }
+      if ((d >> 23) == 0x24) { remaining = 3; continue; }   // MI_STORE_REGISTER_MEM
       if ((d >> 23) == 0x0A) {
         batches.push_back(dump);
         if (on_batch) on_batch(*this, dump);

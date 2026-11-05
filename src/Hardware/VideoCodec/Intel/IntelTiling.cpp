@@ -92,5 +92,33 @@ bool detile_nv12_to_planes(ConstByteView tiled, const Nv12TiledLayout& layout, u
   return true;
 }
 
+bool tile_i420_to_nv12(const VideoFrameBuffer& i420, uint32_t coded_width, uint32_t coded_height, const Nv12TiledLayout& layout, ByteView tiled) {
+  const VideoFormat& f = i420.format();
+  if (!i420.valid() || f.pixel_format != PixelFormat::I420 || f.width == 0 || f.height == 0 || f.width > coded_width || f.height > coded_height) return false;
+  if ((coded_width & 1) || (coded_height & 1) || coded_width > layout.pitch || coded_height > layout.aligned_height || tiled.size() < layout.size) return false;
+  if (uint64_t{layout.chroma_offset_rows} + coded_height / 2 > layout.size / layout.pitch) return false;
+  const ConstByteView y_plane = i420.plane(0), u_plane = i420.plane(1), v_plane = i420.plane(2);
+  const uint32_t chroma_w = f.chroma_width(), chroma_h = f.chroma_height();
+  for (uint32_t row = 0; row < coded_height; ++row) {
+    const uint32_t src_row = row < f.height ? row : f.height - 1;
+    for (uint32_t col = 0; col < coded_width; ++col) {
+      const uint32_t src_col = col < f.width ? col : f.width - 1;
+      const uint32_t value = y_plane[uint64_t{src_row} * f.width + src_col];
+      tiled[y_tile_offset(layout.pitch, col, row)] = static_cast<uint8_t>(16 + (value * 219 + 127) / 255);
+    }
+  }
+  for (uint32_t row = 0; row < coded_height / 2; ++row) {
+    const uint32_t src_row = row < chroma_h ? row : chroma_h - 1;
+    for (uint32_t col = 0; col < coded_width / 2; ++col) {
+      const uint32_t src_col = col < chroma_w ? col : chroma_w - 1;
+      const int32_t cu = u_plane[uint64_t{src_row} * chroma_w + src_col], cv = v_plane[uint64_t{src_row} * chroma_w + src_col];
+      const uint64_t at = y_tile_offset(layout.pitch, col * 2, layout.chroma_offset_rows + row);
+      tiled[at] = static_cast<uint8_t>(128 + ((cu - 128) * 224 + (cu >= 128 ? 127 : -127)) / 255);
+      tiled[at + 1] = static_cast<uint8_t>(128 + ((cv - 128) * 224 + (cv >= 128 ? 127 : -127)) / 255);
+    }
+  }
+  return true;
+}
+
 }  // namespace intel_mfx
 }  // namespace hardware
