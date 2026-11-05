@@ -194,6 +194,7 @@ struct JsObject : Cell {
   bool htmldda = false;        // document.all: typeof says undefined, it is falsy and loosely equal to null
   bool uninit_this = false;    // a derived class's `this` before super() has returned (a ReferenceError to use it)
   bool constructs = false;     // a native that `new` accepts although it has no prototype property (Proxy); other natives are methods
+  bool interface_proto = false;   // the prototype of a built-in interface (Node.prototype ...): a host object's names are answered at it (see DomBindings::mark_interfaces)
   JsObject* proto = nullptr;
   Prop* props = nullptr;
   uint32_t prop_count = 0, prop_cap = 0;

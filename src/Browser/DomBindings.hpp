@@ -290,6 +290,10 @@ class DomBindings {
 
   // Defines everything on the global object. False if memory ran out.
   bool install();
+  // Marks the prototypes of the DOM interfaces the built-in scripts left on the global object (call it once they have run, before the page's scripts). What a node
+  // answers itself (firstChild, textContent ...) stands for an accessor on these; a prototype the page puts in front of them (a custom element's class, ShadyDOM's
+  // ShadyRoot that a fragment is given with __proto__ =) is looked at first, as in a browser.
+  void mark_interfaces();
 
   // Calls a global function that the page's built-in scripts define (a "hook") with these arguments: how the browser delivers the events that are made out of
   // script values (a message with its data, a storage change). False if there is no such function or it threw (counted like a listener that threw).

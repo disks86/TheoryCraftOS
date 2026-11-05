@@ -233,6 +233,7 @@ bool Page::start_engine() {
         prelude_error.insert(0, "The interface script failed: ");
         env_.console(3, prelude_error.view());
       }
+      bindings_->mark_interfaces();
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
       bindings_->set_hidden(hidden_);
       return true;

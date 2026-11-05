@@ -893,7 +893,7 @@ NATIVE(host_get) {
   JsObject* o = target.as_object();
   if (!o->host || !o->host->get) return true;
   Value found;
-  if (o->host->get(vm, o, vm.intern(name.view()), &found)) *result = found;
+  if ((o->host == &kNodeHostClass ? node_interface_get : o->host->get)(vm, o, vm.intern(name.view()), &found)) *result = found;
   return true;
 }
 // __host_set(object, name, value): what an assignment to the attribute does to the object, if the host handles it (the setters on the interfaces' prototypes call this, so
@@ -908,7 +908,7 @@ NATIVE(host_set) {
   if (!target.is_object()) return true;
   JsObject* o = target.as_object();
   if (!o->host || !o->host->set) return true;
-  switch (o->host->set(vm, o, vm.intern(name.view()), arg_at(args, argc, 2))) {
+  switch ((o->host == &kNodeHostClass ? node_interface_set : o->host->set)(vm, o, vm.intern(name.view()), arg_at(args, argc, 2))) {
     case HostClass::Set::Handled: *result = bool_value(true); return true;
     case HostClass::Set::Threw: return false;
     case HostClass::Set::NotHandled: return true;

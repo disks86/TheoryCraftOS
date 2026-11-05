@@ -205,6 +205,10 @@ static void test_clip_and_opacity() {
   // overflow:hidden clips children to the padding box
   Shot a(page("<div style='overflow:hidden;width:50px;height:50px;background:#ccc'><div style='width:100px;height:100px;background:#f00'></div></div>"));
   CHECK(a.rgb(40, 40) == 0xFF0000u && a.rgb(60, 40) == 0xFFFFFFu && a.rgb(40, 60) == 0xFFFFFFu);
+  // an absolute box escapes the clip of a static ancestor, and so do the positioned boxes inside it (YouTube: a body of height 0 with overflow: auto)
+  Shot a2(page("<div style='overflow:auto;height:0'><div style='position:absolute;left:0;top:0;width:80px'>"
+               "<div style='position:relative;width:50px;height:50px;background:#f00'></div></div></div>"));
+  CHECK(a2.rgb(20, 20) == 0xFF0000u);
   // with a radius the clip is round
   Shot b(page("<div style='overflow:hidden;width:60px;height:60px;border-radius:30px'><div style='width:100px;height:100px;background:#f00'></div></div>"));
   CHECK(b.rgb(1, 1) == 0xFFFFFFu && b.rgb(30, 30) == 0xFF0000u);
