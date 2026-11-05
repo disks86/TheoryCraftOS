@@ -270,6 +270,74 @@ static void test_scroll_bars(HINSTANCE instance) {
   UnregisterClassA("TcosScrollParent", instance);
 }
 
+static int g_list_notes[16], g_list_note_count;
+static LRESULT CALLBACK list_parent_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  if (message == WM_COMMAND && g_list_note_count < 16) g_list_notes[g_list_note_count++] = HIWORD(wparam);
+  return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+static void test_list_and_combo(HINSTANCE instance) {
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = list_parent_proc; wc.hInstance = instance; wc.lpszClassName = "TcosListParent";
+  RegisterClassA(&wc);
+  HWND parent = CreateWindowA("TcosListParent", "l", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 400, 300, NULL, NULL, instance, NULL);
+  char text[64];
+
+  /* list box: strings, data, sorting, selection and notifications */
+  HWND list = CreateWindowA("listbox", "", WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_SORT | LBS_NOINTEGRALHEIGHT, 5, 5, 100, 100, parent, (HMENU)1, instance, NULL);
+  CHECK(list != NULL);
+  CHECK(SendMessageA(list, LB_ADDSTRING, 0, (LPARAM)"pear") == 0);
+  CHECK(SendMessageA(list, LB_ADDSTRING, 0, (LPARAM)"apple") == 0);      /* (sorted: before pear) */
+  CHECK(SendMessageA(list, LB_ADDSTRING, 0, (LPARAM)"zebra") == 2);
+  CHECK(SendMessageA(list, LB_GETCOUNT, 0, 0) == 3);
+  CHECK(SendMessageA(list, LB_GETTEXTLEN, 1, 0) == 4 && SendMessageA(list, LB_GETTEXT, 1, (LPARAM)text) == 4 && !strcmp(text, "pear"));
+  CHECK(SendMessageA(list, LB_SETITEMDATA, 1, 77) && SendMessageA(list, LB_GETITEMDATA, 1, 0) == 77);
+  CHECK(SendMessageA(list, LB_FINDSTRING, (WPARAM)-1, (LPARAM)"ze") == 2 && SendMessageA(list, LB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)"APPLE") == 0);
+  CHECK(SendMessageA(list, LB_GETCURSEL, 0, 0) == LB_ERR);
+  CHECK(SendMessageA(list, LB_SETCURSEL, 2, 0) == 2 && SendMessageA(list, LB_GETCURSEL, 0, 0) == 2 && SendMessageA(list, LB_GETSEL, 2, 0) > 0);
+  CHECK(SendMessageA(list, LB_SETCURSEL, 9, 0) == LB_ERR);
+  g_list_note_count = 0;
+  SendMessageA(list, WM_KEYDOWN, VK_UP, 0);
+  CHECK(SendMessageA(list, LB_GETCURSEL, 0, 0) == 1 && g_list_note_count == 1 && g_list_notes[0] == LBN_SELCHANGE);
+  SendMessageA(list, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(10, 2));      /* the first item */
+  CHECK(SendMessageA(list, LB_GETCURSEL, 0, 0) == 0);
+  RECT r;
+  CHECK(SendMessageA(list, LB_GETITEMRECT, 1, (LPARAM)&r) != LB_ERR && r.top > 0 && r.bottom > r.top);
+  CHECK(SendMessageA(list, LB_DELETESTRING, 0, 0) == 2 && SendMessageA(list, LB_GETCOUNT, 0, 0) == 2);
+  SendMessageA(list, LB_RESETCONTENT, 0, 0);
+  CHECK(SendMessageA(list, LB_GETCOUNT, 0, 0) == 0);
+  HWND multi = CreateWindowA("listbox", "", WS_CHILD | WS_VISIBLE | LBS_MULTIPLESEL, 110, 5, 100, 100, parent, (HMENU)2, instance, NULL);
+  SendMessageA(multi, LB_ADDSTRING, 0, (LPARAM)"a"); SendMessageA(multi, LB_ADDSTRING, 0, (LPARAM)"b"); SendMessageA(multi, LB_ADDSTRING, 0, (LPARAM)"c");
+  CHECK(SendMessageA(multi, LB_SETSEL, TRUE, 0) == 0 && SendMessageA(multi, LB_SETSEL, TRUE, 2) == 0);
+  CHECK(SendMessageA(multi, LB_GETSELCOUNT, 0, 0) == 2 && SendMessageA(multi, LB_SETCURSEL, 1, 0) == LB_ERR);
+  int items[4];
+  CHECK(SendMessageA(multi, LB_GETSELITEMS, 4, (LPARAM)items) == 2 && items[0] == 0 && items[1] == 2);
+
+  /* combo box: the list and the edit control behind one window */
+  HWND combo = CreateWindowA("combobox", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_HASSTRINGS, 5, 120, 120, 150, parent, (HMENU)3, instance, NULL);
+  CHECK(combo != NULL);
+  CHECK(SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)"one") == 0 && SendMessageA(combo, CB_ADDSTRING, 0, (LPARAM)"two") == 1 && SendMessageA(combo, CB_GETCOUNT, 0, 0) == 2);
+  CHECK(SendMessageA(combo, CB_GETLBTEXT, 1, (LPARAM)text) == 3 && !strcmp(text, "two"));
+  CHECK(SendMessageA(combo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)"two") == 1);
+  g_list_note_count = 0;
+  CHECK(SendMessageA(combo, CB_SETCURSEL, 1, 0) == 1 && GetWindowTextA(combo, text, sizeof text) == 3 && !strcmp(text, "two"));
+  CHECK(SendMessageA(combo, CB_GETCURSEL, 0, 0) == 1);
+  SetWindowTextA(combo, "typed");
+  CHECK(GetWindowTextA(combo, text, sizeof text) == 5 && !strcmp(text, "typed"));
+  CHECK(!SendMessageA(combo, CB_GETDROPPEDSTATE, 0, 0));
+  SendMessageA(combo, CB_SHOWDROPDOWN, TRUE, 0);
+  CHECK(SendMessageA(combo, CB_GETDROPPEDSTATE, 0, 0));
+  SendMessageA(combo, CB_SHOWDROPDOWN, FALSE, 0);
+  CHECK(!SendMessageA(combo, CB_GETDROPPEDSTATE, 0, 0));
+  HWND fixed = CreateWindowA("combobox", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS, 130, 120, 120, 150, parent, (HMENU)4, instance, NULL);
+  SendMessageA(fixed, CB_ADDSTRING, 0, (LPARAM)"red");
+  SendMessageA(fixed, CB_SETCURSEL, 0, 0);
+  CHECK(GetWindowTextA(fixed, text, sizeof text) == 3 && !strcmp(text, "red"));
+  CHECK(DestroyWindow(parent));
+  UnregisterClassA("TcosListParent", instance);
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -398,6 +466,7 @@ int main(void) {
   test_controls(instance);
   test_icons_and_carets(instance);
   test_scroll_bars(instance);
+  test_list_and_combo(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

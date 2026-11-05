@@ -349,6 +349,9 @@ static ATOM register_class(const WNDCLASSEX_ *wc, const WCHAR *name, DWORD flags
 #define BOOL_OF(x) (((x) & 0xFFFFFFFFu) != 0)
 EXPORT BOOL WINAPI ShowWindow(HANDLE hwnd, int cmd);
 EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect);
+EXPORT BOOL WINAPI EnableWindow(HANDLE hwnd, BOOL enable);
+EXPORT BOOL WINAPI DestroyWindow(HANDLE hwnd);
+EXPORT HANDLE WINAPI CreateWindowExW(DWORD ex_style, const WCHAR *class_name, const WCHAR *title, DWORD style, int x, int y, int cx, int cy, HANDLE parent, HANDLE menu, HANDLE instance, void *params);
 EXPORT BOOL WINAPI SetWindowPos(HANDLE hwnd, HANDLE after, int x, int y, int cx, int cy, UINT flags);
 EXPORT LONG_PTR WINAPI DefWindowProcW(HANDLE hwnd, UINT message, ULONG_PTR wparam, LONG_PTR lparam);
 EXPORT SHORT WINAPI GetKeyState(int vk);
@@ -372,11 +375,12 @@ EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
 #include "controls.inc"
 #include "scroll.inc"
 #include "listbox.inc"
+#include "combo.inc"
 static void builtin_classes(void) {
   static volatile LONG done;
   static const struct { const WCHAR *name; UINT style; int wnd_extra; WNDPROC_ proc; } classes[] = {
-      {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 0, builtin_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 8, listbox_proc}, {L"MDIClient", 0, 0, builtin_proc},
-      {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 0, builtin_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, builtin_proc},
+      {L"Button", 0x8b, 8, button_proc}, {L"ComboBox", 0x8b, 8, combo_proc}, {L"Edit", 0x88, 8, edit_proc}, {L"ListBox", 0x88, 8, listbox_proc}, {L"MDIClient", 0, 0, builtin_proc},
+      {L"ScrollBar", 0x8b, 8, scrollbar_proc}, {L"Static", 0x88, 8, static_proc}, {L"ComboLBox", 0x808, 8, listbox_proc}, {L"#32768", 0x20808, 0, builtin_proc}, {L"#32770", 0x808, 30, builtin_proc},
       {L"#32771", 0x803, 0, builtin_proc}, {L"#32772", 0, 0, builtin_proc}, {L"IME", 0, 0, builtin_proc}, {L"SysLink", 0x8, 0, builtin_proc}, {L"tooltips_class32", 0x8, 0, builtin_proc}};
   if (__sync_lock_test_and_set(&done, 1)) return;
   for (size_t_ i = 0; i < sizeof classes / sizeof classes[0]; ++i) {
