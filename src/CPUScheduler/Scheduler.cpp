@@ -26,10 +26,10 @@ Scheduler::Scheduler(hardware::ICentralProcessingUnit& cpu, allocators::IAllocat
   efficiency_.reserve(kInitialCapacity);
 }
 
-bool Scheduler::submit(TaskFunction fn, void* context, TaskQueue queue) {
+bool Scheduler::submit(TaskFunction fn, void* context, TaskQueue queue, int32_t io_device) {
   if (!fn) return false;
   ScopedLock guard(lock_);
-  return (queue == TaskQueue::HighPerformance ? high_ : efficiency_).enqueue(Task{fn, context});
+  return (queue == TaskQueue::HighPerformance ? high_ : efficiency_).enqueue(Task{fn, context, io_device});
 }
 
 struct Scheduler::Job {
@@ -61,7 +61,7 @@ bool Scheduler::run_next() {
       *job = {this, task.fn, task.context};
       __atomic_add_fetch(&active_, 1, __ATOMIC_SEQ_CST);
       const hardware::CoreKind preferred = high ? hardware::CoreKind::Performance : hardware::CoreKind::Efficiency;
-      kernel::Thread* thread = kernel::spawn(job_main, job, "task", -1, static_cast<int8_t>(preferred));
+      kernel::Thread* thread = kernel::spawn(job_main, job, "task", -1, static_cast<int8_t>(preferred), kernel::kDefaultStackBytes, task.io_device);
       if (thread) {
         kernel::detach(thread);
         return true;

@@ -30,7 +30,7 @@ uint32_t current_core() { return 0; }
 uint32_t core_count() { return 1; }
 void yield() {}
 void sleep_us(uint64_t) {}
-Thread* spawn(ThreadFunction, void*, const char*, int32_t, int8_t, uint32_t) { return nullptr; }
+Thread* spawn(ThreadFunction, void*, const char*, int32_t, int8_t, uint32_t, int32_t) { return nullptr; }
 bool join(Thread*, uint64_t) { return true; }
 void detach(Thread*) {}
 namespace detail {

@@ -20,6 +20,7 @@
 #include "Kernel/Delay.hpp"
 #include "Kernel/Firmware.hpp"
 #if defined(__x86_64__)
+#include "Hardware/CentralProcessingUnit/Cpuid.hpp"
 #include "Kernel/Apic.hpp"
 #include "Kernel/Paging.hpp"
 #elif defined(__aarch64__)
@@ -42,7 +43,11 @@ namespace kernel {
 namespace {
 
 constexpr uint32_t kMaxCores = 128;
+static_assert(kMaxCores <= scheduling::kMaxPlacementCores);
 constexpr uint32_t kSliceTicks = 10;
+// What a thread gets on top of its placement_score on the core it was sent to when it became ready (more than any score), so that the core
+// that was woken for it takes it rather than something it suits slightly better.
+constexpr uint32_t kScoreSentHere = 32;
 
 struct alignas(4096) Core {
   Core* self = nullptr;  // first field: read through the GS base
@@ -60,6 +65,9 @@ struct alignas(4096) Core {
   Thread* leaving = nullptr;      // the thread this core switched away from, still running its interrupt return on that thread's stack (see finish_switch)
   uint64_t busy_ticks = 0, idle_ticks = 0;
   uint64_t kernel_entries = 0;      // interrupts of this core taken from ring 3 or the kernel that went through the scheduler (see wait_for_kernel_entry)
+  int32_t io_device = -1;           // the device whose interrupt handler this core is running (on_device_interrupt), or -1
+  bool resched = false;             // a thread was sent to this core while it was idle: switch to it on the way out of the interrupt
+  bool exit_reschedules = false;    // the interrupt this core is in (the tick, a device's) looks at `resched` on its way out
 #if defined(__x86_64__)
   // The stack an interrupt or SYSCALL from ring 3 lands on (TSS.rsp0); fills the rest of the page. Frames move to the thread's kernel stack at once.
   alignas(16) uint8_t entry_stack[3584];
@@ -82,6 +90,9 @@ struct Scheduler {
   uint32_t core_count = 1;
   uint32_t boot_core = 0;
   WaitList queues[kPriorityLevels];  // the ready queue, kept apart by Thread::priority; queues[0] is the lowest, queues[kPriorityLevels - 1] the highest
+  // What placement knows of each core (CPUScheduler/IoAffinity.hpp). `idle` is cleared as soon as a thread is sent to the core, so that the
+  // next thread made ready goes to another idle core; it is set again whenever the core switches to its idle thread.
+  scheduling::CorePlace places[kMaxCores];
   Thread* sleepers = nullptr;
   Thread* zombies = nullptr;
   Thread* all = nullptr;  // every thread that exists, through Thread::all_next
@@ -98,6 +109,7 @@ struct Scheduler {
 };
 
 Scheduler g;
+scheduling::IoDeviceTable g_devices;   // (outside g: drivers register before start())
 
 // ---- the few places where the two architectures differ ----
 #if defined(__x86_64__)
@@ -146,6 +158,24 @@ uint64_t swap_core_pointer(Core* c) {
 void restore_core_pointer(uint64_t old) { wrmsr(kMsrGsBase, old); }
 uint64_t this_hardware_id() { return apic::this_apic_id(); }
 uint64_t with_interrupts_enabled(uint64_t flags) { return flags | kRflagsInterrupts; }
+// The highest-level cache CPUID describes (leaf 4 on Intel, 0x8000001D on AMD and Hygon) and how many logical processors share it.
+uint32_t this_cache_domain() {
+  uint32_t level = 0, sharing = 0;
+  auto scan = [&](uint32_t leaf) {
+    for (uint32_t sub = 0; sub < 16; ++sub) {
+      const hardware::CpuidResult r = hardware::cpuid(leaf, sub);
+      if ((r.eax & 0x1F) == 0) break;   // no more caches
+      const uint32_t cache_level = (r.eax >> 5) & 7;
+      if (cache_level >= level) {
+        level = cache_level;
+        sharing = ((r.eax >> 14) & 0xFFF) + 1;
+      }
+    }
+  };
+  if (hardware::cpuid(0).eax >= 4) scan(4);
+  if (!level && hardware::cpuid(0x80000000).eax >= 0x8000001D) scan(0x8000001D);
+  return scheduling::cache_domain_from_apic_id(apic::this_apic_id(), sharing);
+}
 #elif defined(__aarch64__)
 // The core's own record hangs off TPIDR_ELx (EL2 when the firmware runs us there), the way x86 uses GS.
 uint64_t current_el() {
@@ -187,6 +217,8 @@ uint64_t swap_core_pointer(Core* c) {
 void restore_core_pointer(uint64_t old) { write_core_pointer(old); }
 uint64_t this_hardware_id() { return this_mpidr(); }
 uint64_t with_interrupts_enabled(uint64_t daif) { return daif & ~kDaifIrqMasked; }
+// Cores of one cluster (MPIDR Aff1, and Aff2 above it) share its cache.
+uint32_t this_cache_domain() { return static_cast<uint32_t>((this_mpidr() >> 8) & 0xFFFF); }
 #elif defined(__riscv) && __riscv_xlen == 64
 // The core's own record hangs off sscratch, the way x86 uses GS (the trap entry does not use sscratch).
 uint64_t read_core_pointer() {
@@ -213,6 +245,7 @@ uint64_t swap_core_pointer(Core* c) {
 void restore_core_pointer(uint64_t old) { write_core_pointer(old); }
 uint64_t this_hardware_id() { return arch_riscv64::boot_hart_id(); }   // the boot hart; the other harts read tp (see ap_main)
 uint64_t with_interrupts_enabled(uint64_t sstatus) { return sstatus | kSstatusSie; }
+uint32_t this_cache_domain() { return 0; }   // (nothing standard says which harts share a cache: treat them as one domain)
 #elif defined(__loongarch64)
 // The core's own record hangs off CSR.SAVE1, the way x86 uses GS (the trap entry saves registers on the stack and uses no SAVE register).
 uint64_t read_core_pointer() { return arch_loongarch64::csr_read<arch_loongarch64::kCsrSave1>(); }
@@ -236,6 +269,7 @@ uint64_t swap_core_pointer(Core* c) {
 void restore_core_pointer(uint64_t old) { write_core_pointer(old); }
 uint64_t this_hardware_id() { return arch_loongarch64::this_core_id(); }   // the id the IPI unit and the ACPI MADT use
 uint64_t with_interrupts_enabled(uint64_t crmd) { return crmd | kCrmdIe; }
+uint32_t this_cache_domain() { return 0; }
 #endif
 
 inline void pause_hint() { cpu_relax(); }
@@ -308,49 +342,116 @@ void sleepers_remove(Thread* t) {
   t->in_sleepers = false;
 }
 
-// A core running only its idle thread can be told that work arrived.
-void poke_idle_core(const Thread* t) {
-  const Core* self = g.running ? this_core() : nullptr;
-  for (uint32_t i = 0; i < g.core_count; ++i) {
-    const Core& c = g.cores[i];
-    if (!c.online || &c == self || !c.current || !c.current->is_idle) continue;
-    if (t->affinity >= 0 && static_cast<uint32_t>(t->affinity) != i) continue;
-    if (i < 64 && !((t->core_mask >> i) & 1)) continue;
-    send_wakeup(c.apic_id);
+// ---- device-aware placement (CPUScheduler/IoAffinity.hpp); lock held ----
+
+ArrayView<const scheduling::CorePlace> places() { return ArrayView<const scheduling::CorePlace>(g.places, g.core_count); }
+
+scheduling::CoreSet allowed_cores(const Thread* t) {
+  scheduling::CoreSet set;
+  if (t->affinity >= 0) {
+    set.add(static_cast<uint32_t>(t->affinity));
+    return set;
+  }
+  set.words[0] = t->core_mask;
+  set.words[1] = ~uint64_t{0};   // (cores past the 64th are always allowed)
+  return set;
+}
+
+// The core whose device interrupts the thread follows: its bound device's, else the one it learnt.
+int32_t io_core_of(const Thread* t) {
+  if (t->io_device >= 0) {
+    const int32_t core = g_devices.interrupt_core(t->io_device);
+    if (core >= 0) return core;
+  }
+  return t->learned_io.hint();
+}
+
+scheduling::PlacementHints hints_of(const Thread* t) {
+  scheduling::PlacementHints hints;
+  hints.io_core = io_core_of(t);
+  hints.last_core = t->last_core;
+  hints.preferred_kind = t->preferred_kind;
+  return hints;
+}
+
+// A thread that has just become ready goes to the idle core that suits it best, which is woken for it. When that is this core (idle, so in an
+// interrupt) and the interrupt reschedules on its way out (the tick, on_device_interrupt), it is only marked; otherwise it interrupts itself.
+// No idle core: the thread waits for a core to give up its current thread.
+void place_ready_locked(Thread* t) {
+  t->ready_tsc = hardware::read_tsc();
+  t->wake_core = -1;
+  const int32_t target = scheduling::choose_wake_core(hints_of(t), allowed_cores(t), places());
+  if (target < 0) return;
+  t->wake_core = target;
+  g.places[target].idle = false;   // (spoken for: the next thread made ready looks for another core)
+  Core& c = g.cores[target];
+  if (g.running && &c == this_core() && c.exit_reschedules) {
+    c.resched = true;
     return;
   }
+  send_wakeup(c.apic_id);
+}
+
+// With the lock held, in whatever context makes `t` ready: inside a device's interrupt handler the thread learns that core.
+void note_wake_source_locked(Thread* t) {
+  if (!g.running) return;
+  const Core* self = this_core();
+  if (self->io_device < 0) return;
+  t->learned_io.woken_by_interrupt_on(self->index);
+  g_devices.note_wake(self->io_device);
 }
 
 void enqueue_locked(Thread* t) {
   t->state = ThreadState::Ready;
   list_append(run_queue(t->priority), t);
-  poke_idle_core(t);
+  place_ready_locked(t);
 }
 
 void make_ready_locked(Thread* t) {
   if (t->state == ThreadState::Zombie || t->state == ThreadState::Ready) return;
   t->state = ThreadState::Ready;
+  note_wake_source_locked(t);
   if (!t->on_cpu) {  // otherwise its core queues it as soon as it has saved the registers
     list_append(run_queue(t->priority), t);
-    poke_idle_core(t);
+    place_ready_locked(t);
   }
 }
 
-bool eligible(const Thread* t, const Core* c, bool match_kind) {
+bool eligible(const Thread* t, const Core* c) {
   if (t->affinity >= 0 && static_cast<uint32_t>(t->affinity) != c->index) return false;
   if (c->index < 64 && !((t->core_mask >> c->index) & 1)) return false;
-  if (match_kind && t->preferred_kind >= 0 && t->preferred_kind != static_cast<int8_t>(c->kind)) return false;
   return true;
 }
 
-// The highest-priority eligible thread, FIFO within its level (a thread preferring this core's kind goes first at that same level, same as before priority levels
-// existed; the two full passes only differ in which threads they skip, not in this ordering, so splitting by level first keeps priority strict).
+// The thread was sent to another core that is still idle (that core has been woken and is about to take it).
+bool sent_elsewhere(const Thread* t, const Core* c) {
+  if (t->wake_core < 0 || static_cast<uint32_t>(t->wake_core) == c->index) return false;
+  const Core& target = g.cores[t->wake_core];
+  return target.online && target.current && target.current->is_idle;
+}
+
+// The thread this core runs next. Priorities stay strict: the highest level with an eligible thread wins. Within it, a thread that has waited
+// kPlacementPatienceUs or longer goes first (oldest first), so placement never starves anybody; otherwise the thread that suits this core best
+// (placement_score: its kind, its device's core, its warm cache, a shared cache; most of all being the thread this core was woken for), the
+// oldest among equals. A thread sent to another core that is still idle is left for that core.
 Thread* find_eligible(const Core* c) {
+  const uint64_t now = hardware::read_tsc();
+  const int64_t patience = static_cast<int64_t>(kPlacementPatienceUs * g.tsc_per_us);
   for (uint32_t level = kPriorityLevels; level-- > 0;) {
-    for (Thread* t = g.queues[level].head; t; t = t->next)
-      if (eligible(t, c, true)) return t;
-    for (Thread* t = g.queues[level].head; t; t = t->next)
-      if (eligible(t, c, false)) return t;
+    Thread* best = nullptr;
+    uint32_t best_score = 0;
+    for (Thread* t = g.queues[level].head; t; t = t->next) {
+      if (!eligible(t, c)) continue;
+      if (static_cast<int64_t>(now - t->ready_tsc) >= patience) return t;
+      if (sent_elsewhere(t, c)) continue;
+      uint32_t score = scheduling::placement_score(hints_of(t), c->index, places());
+      if (t->wake_core == static_cast<int32_t>(c->index)) score += kScoreSentHere;
+      if (!best || score > best_score) {
+        best = t;
+        best_score = score;
+      }
+    }
+    if (best) return best;
   }
   return nullptr;
 }
@@ -359,18 +460,25 @@ Thread* find_eligible(const Core* c) {
 // state of the interrupted context. Lock held. Returns the frame to resume.
 Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   Thread* prev = c->current;
+  c->resched = false;
+  c->exit_reschedules = false;
+  g.places[c->index].idle = prev->is_idle;   // (undoes place_ready_locked's claim if the thread it was woken for went elsewhere)
   if (!voluntary && prev->state == ThreadState::Running) {
     Thread* wanted = find_eligible(c);
-    if (!wanted && eligible(prev, c, false)) return frame;          // nobody else wants the core
+    if (!wanted && eligible(prev, c)) return frame;          // nobody else wants the core
     // Keeps running until its slice ends, unless its core was taken away or something of a strictly higher priority is now ready (which does not wait out the slice).
-    if (!prev->is_idle && c->slice > 0 && eligible(prev, c, false) && (!wanted || wanted->priority <= prev->priority)) return frame;
+    if (!prev->is_idle && c->slice > 0 && eligible(prev, c) && (!wanted || wanted->priority <= prev->priority)) return frame;
   }
   prev->saved = frame;
   // This core is still on prev's stack (below the saved frame: the return addresses of the handlers that called this) until the trap stub has loaded the next
   // frame. If prev were visible to another core before that, that core could resume it and its calls would overwrite those return addresses. So prev only becomes
   // runnable (and reapable: on_cpu) in finish_switch(), which the stub calls on the new thread's stack.
   if (prev->state == ThreadState::Running) prev->state = ThreadState::Ready;
-  if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(prev->priority), prev);      // (so that it competes for this core as before; taken out again below)
+  if (prev->state == ThreadState::Ready && !prev->is_idle) {      // (so that it competes for this core as before; taken out again below)
+    prev->ready_tsc = hardware::read_tsc();
+    prev->wake_core = -1;
+    list_append(run_queue(prev->priority), prev);
+  }
 
   Thread* next = find_eligible(c);
   if (next) list_remove(run_queue(next->priority), next);
@@ -381,7 +489,10 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   }
   next->state = ThreadState::Running;
   next->on_cpu = true;
+  next->last_core = static_cast<int32_t>(c->index);
+  next->wake_core = -1;
   c->current = next;
+  g.places[c->index].idle = next->is_idle;
 #if defined(__x86_64__)
   // A user-mode thread brings its page tables and its GS base along; the entry stubs find them in this core's page.
   if (prev->user_cr3) {
@@ -409,7 +520,10 @@ void finish_switch() {
   Thread* prev = c->leaving;
   c->leaving = nullptr;
   prev->on_cpu = false;
-  if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(prev->priority), prev);
+  if (prev->state == ThreadState::Ready && !prev->is_idle) {
+    list_append(run_queue(prev->priority), prev);
+    place_ready_locked(prev);   // (an idle core elsewhere may take it at once)
+  }
   unlock_irq(flags);
 }
 
@@ -432,6 +546,7 @@ Frame* on_timer(Frame* frame, void*) {
   Core* c = this_core();
   if (g.stopping && c->index != g.boot_core) park_core(c);
   const uint64_t flags = lock_irq();
+  c->exit_reschedules = true;   // (reschedule_locked below)
   const uint64_t now = hardware::read_tsc();
   while (g.sleepers && static_cast<int64_t>(g.sleepers->wake_tsc - now) <= 0) {
     Thread* t = g.sleepers;
@@ -494,6 +609,45 @@ Frame* on_wakeup(Frame* frame, void*) {
   return result;
 }
 
+// ---- device interrupts (set_device_interrupt_handler) ----
+
+struct DeviceVector {
+  Vector vector = 0;
+  bool used = false;
+  int32_t device = -1;
+  InterruptHandler handler = nullptr;   // read by the interrupt with an atomic load: cleared first when the slot is given up
+  void* context = nullptr;
+};
+constexpr uint32_t kDeviceVectors = 32;
+DeviceVector g_device_vectors[kDeviceVectors];
+uint32_t g_device_vectors_lock = 0;
+
+// Runs the driver's handler with this core marked as handling `device`, so that the threads it wakes learn the core (make_ready_locked). If one of them
+// was sent to this core, which was idle, it starts as the interrupt returns instead of at the next tick.
+Frame* on_device_interrupt(Frame* frame, void* argument) {
+  DeviceVector* slot = static_cast<DeviceVector*>(argument);
+  const InterruptHandler handler = __atomic_load_n(&slot->handler, __ATOMIC_ACQUIRE);
+  if (!handler) return frame;
+  if (!g.running) return handler(frame, slot->context);
+  Core* c = this_core();
+  const int32_t outer = c->io_device;
+  c->io_device = slot->device;
+  c->exit_reschedules = true;
+  g_devices.note_interrupt(slot->device);
+  Frame* result = handler(frame, slot->context);
+  c->io_device = outer;
+  if (result != frame || !c->resched) {
+    if (c->resched) send_wakeup(c->apic_id);   // (the handler switched frames itself: the woken thread waits for the wake-up instead)
+    c->exit_reschedules = false;
+    c->resched = false;
+    return result;
+  }
+  const uint64_t flags = lock_irq();
+  result = reschedule_locked(frame, c, false);
+  unlock_irq(flags);
+  return result;
+}
+
 // ---- thread creation ----
 
 void thread_main(Thread* t) {
@@ -542,7 +696,7 @@ void build_initial_frame(Thread* t, uint32_t stack_bytes) {
   t->saved = f;
 }
 
-Thread* make_thread(ThreadFunction fn, void* argument, const char* name, int32_t core, int8_t kind, uint32_t stack_bytes) {
+Thread* make_thread(ThreadFunction fn, void* argument, const char* name, int32_t core, int8_t kind, uint32_t stack_bytes, int32_t io_device) {
   void* memory = g.allocator->allocate(sizeof(Thread));
   if (!memory) return nullptr;
   Thread* t = new (memory) Thread();
@@ -557,6 +711,7 @@ Thread* make_thread(ThreadFunction fn, void* argument, const char* name, int32_t
   t->name = name;
   t->affinity = core;
   t->preferred_kind = kind;
+  t->io_device = io_device;
   build_initial_frame(t, stack_bytes);
   register_thread(t);
   return t;
@@ -611,6 +766,18 @@ void idle_loop(void*) {
   }
 }
 
+// Makes the core known to placement (its kind and its cache domain, measured on the core itself).
+void publish_place(Core* c, bool idle) {
+  scheduling::CorePlace place;
+  place.online = true;
+  place.idle = idle;
+  place.kind = static_cast<int8_t>(c->kind);
+  place.cache_domain = this_cache_domain();
+  const uint64_t flags = lock_irq();
+  g.places[c->index] = place;
+  unlock_irq(flags);
+}
+
 #if defined(__x86_64__)
 // What each application processor runs, forever, after the firmware hands it over.
 void ap_main(void* context) {
@@ -628,6 +795,7 @@ void ap_main(void* context) {
   Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
   if (!idle) for (;;) __asm__ volatile("cli; hlt");
   c->idle = c->current = idle;
+  publish_place(c, true);
   c->online = true;
   __atomic_add_fetch(&g.aps_ready, 1, __ATOMIC_SEQ_CST);
   apic::start_timer(g.tick_hz);
@@ -649,6 +817,7 @@ void ap_main(void* context) {
   Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
   if (!idle) halt_forever();
   c->idle = c->current = idle;
+  publish_place(c, true);
   c->online = true;
   __atomic_add_fetch(&g.aps_ready, 1, __ATOMIC_SEQ_CST);
   gic::enable_interrupt(kVectorWakeup);
@@ -670,6 +839,7 @@ void ap_main(void* context) {
   Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
   if (!idle) halt_forever();
   c->idle = c->current = idle;
+  publish_place(c, true);
   c->online = true;
   __atomic_add_fetch(&g.aps_ready, 1, __ATOMIC_SEQ_CST);
   start_tick(g.tick_hz);
@@ -690,6 +860,7 @@ void ap_main(void* context) {
   Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
   if (!idle) halt_forever();
   c->idle = c->current = idle;
+  publish_place(c, true);
   c->online = true;
   __atomic_add_fetch(&g.aps_ready, 1, __ATOMIC_SEQ_CST);
   start_tick(g.tick_hz);
@@ -741,6 +912,8 @@ uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity) {
     for (uint32_t c = 0; c < g.core_count; ++c)
       if (g.cores[c].current == t) info.core = static_cast<int32_t>(c);
     info.affinity = t->affinity;
+    info.io_core = io_core_of(t);
+    info.io_device = t->io_device;
     info.cpu_ticks = t->cpu_ticks;
   }
   unlock_irq(flags);
@@ -881,6 +1054,76 @@ void set_thread_priority(Thread* t, uint8_t priority) {
 
 Thread* current_thread() { return g.running ? this_core()->current : nullptr; }
 
+int32_t register_io_device(const char* name, int32_t interrupt_core) { return g_devices.add(StringView(name ? name : ""), interrupt_core); }
+
+void unregister_io_device(int32_t device) {
+  if (!g_devices.live(device)) return;
+  {
+    const uint64_t flags = lock_irq();   // (threads bound to it go back to learning: the slot may soon be another device's)
+    for (Thread* t = g.all; t; t = t->all_next)
+      if (t->io_device == device) t->io_device = -1;
+    unlock_irq(flags);
+  }
+  g_devices.remove(device);
+}
+
+bool set_io_device_core(int32_t device, int32_t core) { return g_devices.set_interrupt_core(device, core); }
+
+bool io_device_info(int32_t device, scheduling::IoDeviceInfo* out) { return out && g_devices.info(device, out); }
+
+uint32_t choose_io_interrupt_core(int8_t kind) {
+  if (!g.running) return 0;
+  uint32_t per_core[kMaxCores];
+  g_devices.devices_per_core(ArrayView<uint32_t>(per_core, g.core_count));
+  const uint64_t flags = lock_irq();
+  const int32_t core = scheduling::choose_interrupt_core(places(), ArrayView<const uint32_t>(per_core, g.core_count), scheduling::CoreSet::all(), kind,
+                                                         static_cast<int32_t>(g.boot_core));
+  unlock_irq(flags);
+  return core < 0 ? g.boot_core : static_cast<uint32_t>(core);
+}
+
+uint64_t core_hardware_id(uint32_t core) {
+  if (!g.running || core >= g.core_count || !g.cores[core].online) return ~uint64_t{0};
+  return g.cores[core].apic_id;
+}
+
+bool set_device_interrupt_handler(Vector vector, int32_t device, InterruptHandler handler, void* context) {
+  while (__atomic_exchange_n(&g_device_vectors_lock, 1u, __ATOMIC_ACQUIRE)) pause_hint();
+  DeviceVector* slot = nullptr;
+  DeviceVector* unused = nullptr;
+  for (DeviceVector& candidate : g_device_vectors) {
+    if (candidate.used && candidate.vector == vector) slot = &candidate;
+    else if (!candidate.used && !unused) unused = &candidate;
+  }
+  bool ok = true;
+  set_interrupt_handler(vector, nullptr, nullptr);
+  if (slot) __atomic_store_n(&slot->handler, static_cast<InterruptHandler>(nullptr), __ATOMIC_RELEASE);   // (an interrupt already in on another core sees no handler)
+  if (handler) {
+    if (!slot) slot = unused;
+    if (slot) {
+      slot->vector = vector;
+      slot->used = true;
+      slot->device = device;
+      slot->context = context;
+      __atomic_store_n(&slot->handler, handler, __ATOMIC_RELEASE);
+      set_interrupt_handler(vector, on_device_interrupt, slot);
+    } else {
+      ok = false;
+    }
+  } else if (slot) {
+    slot->used = false;
+  }
+  __atomic_store_n(&g_device_vectors_lock, 0u, __ATOMIC_RELEASE);
+  return ok;
+}
+
+void bind_thread_to_io_device(Thread* t, int32_t device) {
+  if (!t) return;
+  const uint64_t flags = lock_irq();
+  t->io_device = device;
+  unlock_irq(flags);
+}
+
 bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& allocator, uint32_t tick_hz) {
   if (g.running || !hardware::tsc_ticks_per_us()) return false;
   g.cpu = &cpu;
@@ -935,7 +1178,7 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
 
   // The caller becomes the main thread, pinned here so it may keep calling firmware.
   Thread* main_thread = adopt_context("main", false, static_cast<int32_t>(g.boot_core));
-  Thread* idle = make_thread(idle_loop, nullptr, "idle", static_cast<int32_t>(g.boot_core), -1, 16 * 1024);
+  Thread* idle = make_thread(idle_loop, nullptr, "idle", static_cast<int32_t>(g.boot_core), -1, 16 * 1024, -1);
   if (!main_thread || !idle) {
     restore_core_pointer(g.firmware_gs_base);
     interrupts_restore_firmware();
@@ -947,6 +1190,8 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
   main_thread->id = g.next_id++;
   boot->current = main_thread;
   boot->idle = idle;
+  main_thread->last_core = static_cast<int32_t>(g.boot_core);
+  publish_place(boot, false);
   boot->online = true;
   g.running = true;
 
@@ -982,10 +1227,10 @@ void stop() {
 }
 
 Thread* spawn(ThreadFunction fn, void* argument, const char* name, int32_t core, int8_t preferred_kind,
-              uint32_t stack_bytes) {
+              uint32_t stack_bytes, int32_t io_device) {
   if (!g.running || !fn) return nullptr;
   reap_zombies_impl();
-  Thread* t = make_thread(fn, argument, name, core, preferred_kind, stack_bytes);
+  Thread* t = make_thread(fn, argument, name, core, preferred_kind, stack_bytes, io_device);
   if (!t) return nullptr;
   const uint64_t flags = lock_irq();
   t->id = g.next_id++;

@@ -1480,6 +1480,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::PciMsix> thunderbolt_msix;              // its MSI-X, when the machine delivers it
     UniquePointer<hardware::PciMsi> thunderbolt_msi;                // else its MSI
     bool thunderbolt_msi_working = false;                           // an interrupt arrived in the start-up check: the loop reads the channel only when one comes
+    int32_t thunderbolt_io_device = -1;                             // its entry in the scheduler's device table (kernel::register_io_device)
     if (clock_ok && paging_ok) {
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
         hardware::PciDeviceInfo d;
@@ -1499,7 +1500,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           // arrives for a request of the controller.
           const uint32_t tb_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
           if (tb_apic_id <= 0xFF) {
-            kernel::set_interrupt_handler(kernel::kVectorThunderbolt, &on_thunderbolt_interrupt, thunderbolt.get());
+            thunderbolt_io_device = kernel::register_io_device("thunderbolt", static_cast<int32_t>(kernel::current_core()));
+            kernel::set_device_interrupt_handler(kernel::kVectorThunderbolt, thunderbolt_io_device, &on_thunderbolt_interrupt, thunderbolt.get());
             auto check_interrupt = [&]() {
               const uint32_t before = thunderbolt->interrupts();
               thunderbolt->probe_control();
@@ -1507,7 +1509,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
               return thunderbolt->interrupts() != before;
             };
             thunderbolt_msix = UniquePointer<hardware::PciMsix>::make(shared_allocator, pci, register_mapper);
-            kernel::set_interrupt_handler(kernel::kVectorThunderboltData, &on_thunderbolt_interrupt, thunderbolt.get());
+            kernel::set_device_interrupt_handler(kernel::kVectorThunderboltData, thunderbolt_io_device, &on_thunderbolt_interrupt, thunderbolt.get());
             const uint8_t tb_vectors[2] = {kernel::kVectorThunderbolt, kernel::kVectorThunderboltData};     // (entry 0: the control channel, entry 1: the data rings)
             if (thunderbolt_msix && thunderbolt_msix->enable(d.address, tb_vectors, 2, tb_apic_id) && thunderbolt->use_interrupts(true, 0, 1)) thunderbolt_msi_working = check_interrupt();
             if (!thunderbolt_msi_working) {
@@ -1519,7 +1521,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             if (!thunderbolt_msi_working) {
               thunderbolt->use_interrupts(false);
               thunderbolt_msi = UniquePointer<hardware::PciMsi>();
-              kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
+              kernel::set_device_interrupt_handler(kernel::kVectorThunderbolt, thunderbolt_io_device, nullptr, nullptr);
+              kernel::set_device_interrupt_handler(kernel::kVectorThunderboltData, thunderbolt_io_device, nullptr, nullptr);
+              kernel::unregister_io_device(thunderbolt_io_device);
+              thunderbolt_io_device = -1;
             }
           }
           // networking to another host: offered in our properties, an interface for the network stack that gets an address when the cable's other end answers
@@ -1884,6 +1889,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::MmioIoApicWindow> acpi_ioapic_window;
     UniquePointer<hardware::IoApic> acpi_ioapic;
     bool acpi_sci_working = false;
+    int32_t acpi_sci_device = -1;                                   // (kernel::register_io_device)
     if (acpi_tables.initialize()) {
       acpi_events = UniquePointer<hardware::AcpiEvents>::make(shared_allocator, acpi_host, acpi_ports, shared_allocator);
       if (acpi_events && acpi_events->initialize(acpi_tables) && acpi_events->enable_acpi_mode()) {
@@ -1909,9 +1915,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
             if (acpi_ioapic && acpi_ioapic->contains(route.gsi)) {
               acpi_sci.ioapic = acpi_ioapic.get();
               acpi_sci.gsi = route.gsi;
-              kernel::set_interrupt_handler(kernel::kVectorAcpiSci, &on_acpi_sci, &acpi_sci);
+              acpi_sci_device = kernel::register_io_device("acpi-sci", static_cast<int32_t>(kernel::current_core()));
+              kernel::set_device_interrupt_handler(kernel::kVectorAcpiSci, acpi_sci_device, &on_acpi_sci, &acpi_sci);
               acpi_sci_working = acpi_ioapic->route(route.gsi, kernel::kVectorAcpiSci, apic_id, route.level, route.active_low, false);
-              if (!acpi_sci_working) kernel::set_interrupt_handler(kernel::kVectorAcpiSci, nullptr, nullptr);
+              if (!acpi_sci_working) {
+                kernel::set_device_interrupt_handler(kernel::kVectorAcpiSci, acpi_sci_device, nullptr, nullptr);
+                kernel::unregister_io_device(acpi_sci_device);
+                acpi_sci_device = -1;
+              }
             }
             if (!acpi_sci_working) {
               acpi_ioapic = UniquePointer<hardware::IoApic>();
@@ -2277,7 +2288,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_ACPI_EVENTS
     if (acpi_sci_working && acpi_ioapic) {                           // (before the handler's state goes)
       acpi_ioapic->mask(acpi_sci.gsi, true);
-      kernel::set_interrupt_handler(kernel::kVectorAcpiSci, nullptr, nullptr);
+      kernel::set_device_interrupt_handler(kernel::kVectorAcpiSci, acpi_sci_device, nullptr, nullptr);
+      kernel::unregister_io_device(acpi_sci_device);
     }
 #endif
 #ifdef TCOS_THUNDERBOLT
@@ -2286,8 +2298,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (thunderbolt_msix || thunderbolt_msi) {                      // (before the driver goes: the handler holds a pointer to it)
       thunderbolt_msix = UniquePointer<hardware::PciMsix>();
       thunderbolt_msi = UniquePointer<hardware::PciMsi>();
-      kernel::set_interrupt_handler(kernel::kVectorThunderbolt, nullptr, nullptr);
-      kernel::set_interrupt_handler(kernel::kVectorThunderboltData, nullptr, nullptr);
+      kernel::set_device_interrupt_handler(kernel::kVectorThunderbolt, thunderbolt_io_device, nullptr, nullptr);
+      kernel::set_device_interrupt_handler(kernel::kVectorThunderboltData, thunderbolt_io_device, nullptr, nullptr);
+      kernel::unregister_io_device(thunderbolt_io_device);
     }
 #endif
     desktop.save_browser_data();

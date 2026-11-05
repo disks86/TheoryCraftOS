@@ -21,6 +21,9 @@
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Thread.hpp"
+#if defined(__x86_64__)
+#include "Kernel/Apic.hpp"
+#endif
 
 using namespace kernel;
 
@@ -250,6 +253,73 @@ bool test_blocking() {
   return ok;
 }
 
+#if defined(__x86_64__)
+// ---- device-aware placement: the thread a device's interrupts wake runs on the core they arrive on ----
+// The "device" is an inter-processor interrupt sent to one core with a vector whose handler was set with set_device_interrupt_handler: to the
+// scheduler it is the same as an MSI landing there.
+
+struct IoProbe {
+  Event arrived{true};
+  volatile bool stop = false;
+  int32_t device_core = -1;
+  uint32_t rounds = 0, on_device_core = 0;
+  int32_t first_core = -1;
+};
+
+Frame* on_io_probe_interrupt(Frame* frame, void* context) {
+  apic::eoi();
+  static_cast<IoProbe*>(context)->arrived.set();
+  return frame;
+}
+
+void io_consumer_main(void* argument) {
+  IoProbe* p = static_cast<IoProbe*>(argument);
+  while (p->arrived.wait(500000) && !p->stop) {
+    ++p->rounds;
+    if (static_cast<int32_t>(current_core()) == p->device_core) ++p->on_device_core;
+  }
+}
+
+void io_bound_main(void* argument) { static_cast<IoProbe*>(argument)->first_core = static_cast<int32_t>(current_core()); }
+
+bool test_io_affinity() {
+  if (core_count() < 2) return report("I/O affinity (one core: nothing to place)", true);
+  bool ok = true;
+  IoProbe probe;
+  const uint32_t core = choose_io_interrupt_core();
+  probe.device_core = static_cast<int32_t>(core);
+  const int32_t device = register_io_device("selftest", probe.device_core);
+  const uint64_t apic_id = core_hardware_id(core);
+  if (device < 0 || apic_id > 0xFF || !set_device_interrupt_handler(kVectorIoSelfTest, device, on_io_probe_interrupt, &probe)) {
+    unregister_io_device(device);
+    return report("I/O affinity: device set up", false);
+  }
+  ok &= report("I/O affinity: the device's interrupt goes to a core other than the boot core", core != current_core());
+
+  Thread* consumer = spawn(io_consumer_main, &probe, "io-consumer");
+  constexpr uint32_t kInterrupts = 40;
+  for (uint32_t i = 0; i < kInterrupts && consumer; ++i) {
+    apic::send_ipi(static_cast<uint32_t>(apic_id), kVectorIoSelfTest);
+    sleep_ms(3);
+  }
+  probe.stop = true;
+  probe.arrived.set();
+  if (consumer) join(consumer);
+  scheduling::IoDeviceInfo info;
+  const bool have_info = io_device_info(device, &info);
+  ok &= report("I/O affinity: every interrupt counted and woke the consumer", have_info && info.interrupts == kInterrupts && info.wakes >= probe.rounds && probe.rounds >= kInterrupts - 2);
+  ok &= report("I/O affinity: the woken thread runs on the interrupting core", probe.rounds && probe.on_device_core + 2 >= probe.rounds);
+
+  Thread* bound = spawn(io_bound_main, &probe, "io-bound", -1, -1, kDefaultStackBytes, device);
+  if (bound) join(bound);
+  ok &= report("I/O affinity: a thread spawned for the device starts on its core", probe.first_core == probe.device_core);
+
+  set_device_interrupt_handler(kVectorIoSelfTest, device, nullptr, nullptr);
+  unregister_io_device(device);
+  return ok;
+}
+#endif
+
 }  // namespace
 
 bool run_kernel_demo(allocators::IAllocator& allocator) {
@@ -258,5 +328,8 @@ bool run_kernel_demo(allocators::IAllocator& allocator) {
   ok &= test_mutex(allocator);
   ok &= test_pipe();
   ok &= test_blocking();
+#if defined(__x86_64__)
+  ok &= test_io_affinity();
+#endif
   return ok;
 }
