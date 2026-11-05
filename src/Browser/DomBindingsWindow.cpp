@@ -896,6 +896,25 @@ NATIVE(host_get) {
   if (o->host->get(vm, o, vm.intern(name.view()), &found)) *result = found;
   return true;
 }
+// __host_set(object, name, value): what an assignment to the attribute does to the object, if the host handles it (the setters on the interfaces' prototypes call this, so
+// that a script that takes `Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').set` and calls it on a node changes the node, as ShadyDOM does). False if the host
+// does not know the attribute (the setter then makes an own property, as an assignment to any other object does).
+NATIVE(host_set) {
+  (void)self;
+  const Value target = arg_at(args, argc, 0);
+  String name(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 1), &name)) return false;
+  *result = bool_value(false);
+  if (!target.is_object()) return true;
+  JsObject* o = target.as_object();
+  if (!o->host || !o->host->set) return true;
+  switch (o->host->set(vm, o, vm.intern(name.view()), arg_at(args, argc, 2))) {
+    case HostClass::Set::Handled: *result = bool_value(true); return true;
+    case HostClass::Set::Threw: return false;
+    case HostClass::Set::NotHandled: return true;
+  }
+  return true;
+}
 // __make_node(document, kind, nameOrTarget, data): kind 7 a processing instruction, 4 a CDATA section.
 NATIVE(make_node) {
   (void)self;
@@ -1211,6 +1230,7 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__fs_request", fs_request, 1);
   vm.define_native(g, "__fs_exit", fs_exit, 0);
   vm.define_native(g, "__host_get", host_get, 2);
+  vm.define_native(g, "__host_set", host_set, 3);
   vm.define_native(g, "__fs_element", fs_element, 0);
 
   // location and history
