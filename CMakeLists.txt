@@ -1363,8 +1363,21 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
   else()
     set(TCOS_QMP_SOCKET ${CMAKE_BINARY_DIR}/qmp.sock)
   endif()
+  # Without an accelerator QEMU emulates the CPU in software (TCG), which runs the OS 10-30 times slower than the
+  # hardware does. Use KVM with the host CPU when this user can open /dev/kvm (-cpu host needs KVM, so both or neither).
+  execute_process(COMMAND test -r /dev/kvm -a -w /dev/kvm RESULT_VARIABLE _kvm_unusable OUTPUT_QUIET ERROR_QUIET)
+  if(NOT QEMU MATCHES "qemu-system-x86_64$")
+    # (a wrapper such as the Wine test runner's: it enables KVM itself, and -enable-kvm and -accel cannot be combined)
+    set(QEMU_ACCEL "")
+  elseif(_kvm_unusable EQUAL 0)
+    set(QEMU_ACCEL -accel kvm -cpu host)
+    message(STATUS "QEMU: KVM available, the run and debug targets use -accel kvm -cpu host")
+  else()
+    set(QEMU_ACCEL "")
+    message(STATUS "QEMU: /dev/kvm not usable, the run and debug targets emulate the CPU in software (slow)")
+  endif()
   set(QEMU_COMMON
-    ${QEMU} -machine q35 -smp ${TCOS_SMP} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+    ${QEMU} ${QEMU_ACCEL} -machine q35 -smp ${TCOS_SMP} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
     -rtc base=localtime  # the taskbar clock shows local time
     # An absolute pointer for the desktop (no click-to-grab; relative PS/2 grabbing is unreliable under Wayland).
     -device virtio-tablet-pci

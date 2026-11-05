@@ -33,6 +33,7 @@
 #include "Audio/AudioPlayer.hpp"
 #include "Media/AudioStreaming.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "console.hpp"
 #include "Video/VideoPlayer.hpp"
 
 namespace desktop {
@@ -901,6 +902,11 @@ void WebBrowser::show(Fetched& page) {
         line.append("timing: ");
         line.append(timing.view());
         live_->console(1, line.view());   // (into the script log)
+        String report(allocator());   // (and the debug console, where the status bar's cut-off does not matter)
+        report.append("[info] Web: ");
+        report.append(line.view());
+        report.append("\n");
+        console::debug_puts(report.view());
       }
     }
     double seconds = 0;
