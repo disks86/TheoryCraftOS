@@ -286,6 +286,7 @@ struct HevcPicture {
   uint32_t num_tile_columns = 1, num_tile_rows = 1;
   uint32_t column_width[20] = {}, row_height[22] = {};     // in coding tree blocks (the last included)
   bool gen11 = false;                                      // Ice Lake's longer picture and tile state commands
+  bool gen12 = false;                                      // Xe-LP (with gen11 also set): the picture state grew by three more dwords
 };
 
 // Graphics addresses of what a picture uses (0: none). The line and column buffers the engine keeps state in are sized by hevc_buffer_bytes().
@@ -311,7 +312,7 @@ struct HevcBufferBytes {
   uint64_t motion_vector = 0;                              // per picture
 };
 // `gen11`: the sizes the Ice Lake engine needs (the media driver's GetHevcBufferSize for that generation: larger for 32 and 64 sample coding tree blocks).
-HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2_ctb, bool gen11 = false);
+HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2_ctb, bool gen11 = false, bool gen12 = false);   // (`gen12` with `gen11`: Xe-LP, whose tile line and column stores are larger)
 
 // Scaling lists in the engine's terms: 4x4 (6 x 16), 8x8, 16x16, 32x32 (two: intra, inter) as raster-order bytes, and the DC values of the big ones.
 struct HevcScaling {
@@ -333,6 +334,7 @@ struct HevcSlice {
   int32_t beta_offset_div2 = 0, tc_offset_div2 = 0;
   uint32_t header_bytes = 0;                               // from the start of the NAL unit (as stored, emulation prevention bytes included) to the slice segment data
   uint32_t data_offset = 0, data_size = 0;                 // the NAL unit in the bitstream buffer
+  uint32_t orig_hor_pos = 0, orig_ver_pos = 0;             // Xe-LP: where the slice this segment belongs to started (the segment's own position unless it is dependent)
 };
 
 // Prediction weights of one list, as the slice header codes them (the weight minus 1 << denominator, the offsets).
@@ -348,10 +350,10 @@ constexpr uint32_t hevc_ref_idx_entry(uint32_t frame_store, bool long_term, int3
 }
 
 // Gen11: bracketed by MFX_WAITs, and the VP9 mode switch ECO bit of Gen9.5 (dword 4, bit 6) is gone.
-void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec, bool gen11 = false);
+void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec, bool gen11 = false, bool gen12 = false);   // (Xe-LP, with gen11: seven dwords)
 // `id` 0 is the picture being decoded; VP9 describes its three reference pictures as 2 to 4.
 // Gen11: four dwords, and the surface format is a five-bit field one bit lower (NV12 is 4 << 27 there, 4 << 28 before).
-void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id = 0, bool gen11 = false);
+void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id = 0, bool gen11 = false, bool gen12 = false);   // (Xe-LP: five dwords, the last the compression control, off)
 void emit_hevc_pipe_buf_addr_state(DwordWriter& w, const HevcBuffers& b);
 void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b);
 void emit_hevc_qm_states(DwordWriter& w, const HevcScaling& s);
@@ -360,7 +362,7 @@ void emit_hevc_tile_state(DwordWriter& w, const HevcPicture& p);
 // `entries` are hevc_ref_idx_entry() values; only the first min(count, 15) are used.
 void emit_hevc_ref_idx_state(DwordWriter& w, uint32_t list, uint32_t count, const uint32_t entries[kMaxHevcRefIdx]);
 void emit_hevc_weightoffset_state(DwordWriter& w, uint32_t list, uint32_t count, const HevcWeights& weights, bool gen11 = false);   // (Gen11: 42 dwords)
-void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s, bool gen11 = false);   // (Gen11: 11 dwords, the quantisation parameter's sign in its own bit)
+void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s, bool gen11 = false, bool gen12 = false);   // (Gen11: 11 dwords, the quantisation parameter's sign in its own bit)
 void emit_hevc_bsd_object(DwordWriter& w, const HevcSlice& s);
 
 // --- VP9 (the HCP pipeline, Gen9.5 layouts of the reference driver's gen9_mfd.c). Profile 0 only: 8-bit 4:2:0.

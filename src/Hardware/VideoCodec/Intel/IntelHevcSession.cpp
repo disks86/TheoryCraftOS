@@ -24,7 +24,7 @@ namespace {
 constexpr uint64_t kBitstreamPadding = 64;   // zeros behind the last slice, for what the engine reads ahead
 constexpr uint32_t kMaxSlices = 4096;
 constexpr uint32_t kSliceDwords = 9 + 2 * 18 + 2 * 34 + 3;   // the most one slice segment's commands take
-constexpr uint32_t kSliceDwordsGen11 = 11 + 2 * 18 + 2 * 42 + 3;   // ... on Ice Lake, whose slice state and weight tables are longer
+constexpr uint32_t kSliceDwordsGen11 = 13 + 2 * 18 + 2 * 42 + 3;   // ... on Ice Lake and Xe-LP, whose slice state and weight tables are longer
 constexpr uint32_t kBatchTail = 4;                           // the end of the batch (a no-op and the end marker) and some room
 
 // Where byte `target` of a NAL unit without its emulation prevention bytes is in the NAL unit as stored.
@@ -146,6 +146,7 @@ bool IntelHevcDecoder::build_slices(const h265::OffloadPicture& picture, const F
     return static_cast<int>(store.of[r]);
   };
   bool first_inter_valid = false, first_from_l0 = false;
+  uint32_t orig_hor = 0, orig_ver = 0;   // where the independent slice segment before this one started
   uint32_t first_collocated = 0;
   for (uint64_t k = 0; k < n; ++k) {
     const ConstByteView nal = picture.slices[k];
@@ -164,6 +165,9 @@ bool IntelHevcDecoder::build_slices(const h265::OffloadPicture& picture, const F
     j.cr_qp_offset = sh.cr_qp_offset;
     j.temporal_mvp = sh.temporal_mvp;
     j.dependent = sh.dependent_slice_segment;
+    if (!j.dependent) { orig_hor = j.hor_pos; orig_ver = j.ver_pos; }
+    j.orig_hor_pos = orig_hor;
+    j.orig_ver_pos = orig_ver;
     j.cabac_init = sh.cabac_init_flag;
     j.mvd_l1_zero = sh.mvd_l1_zero;
     j.collocated_from_l0 = sh.collocated_from_l0;
@@ -251,7 +255,7 @@ bool IntelHevcDecoder::decode_picture(const h265::OffloadPicture& picture) {
 
   // The buffers: this picture, the pictures in the frame store with the motion vectors they left, and the engine's line and column buffers.
   HevcBuffers b;
-  const HevcBufferBytes sizes = hevc_buffer_bytes(width, height, static_cast<uint32_t>(sps.log2_ctb), buffers_.gen11());
+  const HevcBufferBytes sizes = hevc_buffer_bytes(width, height, static_cast<uint32_t>(sps.log2_ctb), buffers_.gen11(), buffers_.gen12());
   uint32_t address = 0;
   auto place = [&](uint32_t index, uint64_t bytes, uint64_t* out) {
     if (!buffers_.scratch(index, bytes ? bytes : 1, &address)) return false;
@@ -283,6 +287,7 @@ bool IntelHevcDecoder::decode_picture(const h265::OffloadPicture& picture) {
 
   HevcPicture p;
   p.gen11 = buffers_.gen11();
+  p.gen12 = buffers_.gen12();
   p.width = width;
   p.height = height;
   p.log2_min_cb = static_cast<uint32_t>(sps.log2_min_cb);
@@ -329,8 +334,8 @@ bool IntelHevcDecoder::decode_picture(const h265::OffloadPicture& picture) {
   while (next < jobs_.count()) {
     DwordWriter w(buffers_.batch_words());
     emit_mi_flush(w);
-    emit_hcp_pipe_mode_select(w, kHcpCodecHevc, p.gen11);
-    emit_hcp_surface_state(w, buffers_.layout(), 0, p.gen11);
+    emit_hcp_pipe_mode_select(w, kHcpCodecHevc, p.gen11, p.gen12);
+    emit_hcp_surface_state(w, buffers_.layout(), 0, p.gen11, p.gen12);
     emit_hevc_pipe_buf_addr_state(w, b);
     emit_hevc_qm_states(w, scaling);
     emit_hevc_pic_state(w, p);
@@ -341,7 +346,7 @@ bool IntelHevcDecoder::decode_picture(const h265::OffloadPicture& picture) {
       const HevcSlice& j = jobs_[next];
       const h265::OffloadSlice& info = picture.slice_info[next];
       const h265::SliceHeader& sh = *info.header;
-      emit_hevc_slice_state(w, j, p.gen11);
+      emit_hevc_slice_state(w, j, p.gen11, p.gen12);
       const int lists = sh.type == h265::kSliceB ? 2 : sh.type == h265::kSliceP ? 1 : 0;
       for (int l = 0; l < lists; ++l) {
         uint32_t entries[kMaxHevcRefIdx] = {};

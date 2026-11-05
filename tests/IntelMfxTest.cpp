@@ -473,12 +473,39 @@ static void test_gen11_hcp() {
   CHECK(g11.deblocking_line > 0 && g11.metadata_line > 0 && g11.sao_line > 0 && g11.motion_vector > 0 && g9.motion_vector > 0);
 }
 
+// Xe-LP (Gen12): the Ice Lake HCP commands with a few dwords more (pipe mode select 7, surface 5, picture state 41, slice state 13), larger tile stores.
+static void test_gen12_hcp() {
+  using namespace hardware;
+  auto len = [](const std::vector<uint32_t>& v) { return (v[0] & 0xFF) + 2; };
+  std::vector<uint32_t> v = emit([&](DwordWriter& w) { emit_hcp_pipe_mode_select(w, kHcpCodecHevc, true, true); });
+  CHECK(v.size() == 9 && v.front() == kHcpMfxWaitSync && v.back() == kHcpMfxWaitSync && len({v.begin() + 1, v.end()}) == 7);
+  Nv12TiledLayout layout;
+  CHECK(nv12_tiled_layout(64, 64, &layout));
+  v = emit([&](DwordWriter& w) { emit_hcp_surface_state(w, layout, 0, true, true); });
+  CHECK(v.size() == 5 && len(v) == 5 && (v[2] >> 27) == 4 && v[3] == 0xFFFF && v[4] == 0);
+  HevcPicture pic;
+  pic.width = 64;
+  pic.height = 64;
+  pic.gen11 = pic.gen12 = true;
+  v = emit([&](DwordWriter& w) { emit_hevc_pic_state(w, pic); });
+  CHECK(v.size() == 41 && len(v) == 41);
+  HevcSlice sl;
+  sl.orig_hor_pos = 5;
+  sl.orig_ver_pos = 3;
+  v = emit([&](DwordWriter& w) { emit_hevc_slice_state(w, sl, true, true); });
+  CHECK(v.size() == 13 && len(v) == 13 && v[11] == ((3u << 16) | 5u) && v[12] == 0);
+  const HevcBufferBytes l = hevc_buffer_bytes(1920, 1080, 6, true, false), x = hevc_buffer_bytes(1920, 1080, 6, true, true);
+  CHECK(x.deblocking_line == l.deblocking_line && x.deblocking_tile_line == 2 * l.deblocking_tile_line && x.deblocking_tile_column == 2 * l.deblocking_tile_column);
+  CHECK(x.metadata_tile_line == 2 * l.metadata_tile_line && x.sao_tile_line > l.sao_tile_line && x.sao_tile_column > l.sao_tile_column && x.motion_vector == l.motion_vector);
+}
+
 int main() {
   test_headers_and_fields();
   test_layout_and_tiling();
   test_picture_batches();
   test_batch_robustness();
   test_gen11_hcp();
+  test_gen12_hcp();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("intel mfx tests passed\n");
   return 0;

@@ -182,6 +182,7 @@ static uint8_t pattern(long k, uint32_t i) { return uint8_t(k * 131 + i * 7 + 1)
 struct FakeDecoder {
   const Reference* reference = nullptr;
   bool check_content = true;
+  bool gen12 = false;   // Xe-LP (with gen11): pipe mode select 7, surface state 5
   bool gen11 = false;   // Ice Lake: surface state 4 dwords, pipe buffer 121, indirect object 29, segment state 8
   std::map<uint64_t, long> painted;               // surface address -> the frame it last held
   std::map<long, uint64_t> address_of;            // frame -> the surface it was painted into
@@ -218,9 +219,9 @@ struct FakeDecoder {
       const size_t len = (h & 0xFF) + 2;
       if (i + len > d.size()) { problem("command runs past the batch"); return; }
       switch (h & 0xFFFF0000) {
-        case kHcpPipeModeSelect: codec = (d[i + 1] >> 5) & 3; if (len != 6) problem("pipe mode select length"); break;
+        case kHcpPipeModeSelect: codec = (d[i + 1] >> 5) & 3; if (len != (gen12 ? 7u : 6u)) problem("pipe mode select length"); break;
         case kHcpSurfaceState:
-          if (len != (gen11 ? 4u : 3u) || ((d[i + 2] >> (gen11 ? 27 : 28)) != 4)) problem("surface state");
+          if (len != (gen12 ? 5u : gen11 ? 4u : 3u) || ((d[i + 2] >> (gen11 ? 27 : 28)) != 4)) problem("surface state");
           surface_ids |= 1u << (d[i + 1] >> 28);
           pitch = (d[i + 1] & 0x1FFFF) + 1;
           break;
@@ -420,7 +421,8 @@ struct FakeDecoder {
 struct Rig2 : Rig {
   FakeDecoder engine;
   explicit Rig2(Generation g = Generation::Gen9) : Rig(g) {
-    engine.gen11 = g == Generation::Gen11;
+    engine.gen11 = g != Generation::Gen9;
+    engine.gen12 = g == Generation::Gen12;
     gpu.on_batch = [this](FakeGpu& gp, const std::vector<uint32_t>& d) { engine.run(gp, d); };
   }
 };
@@ -434,7 +436,7 @@ static DecoderConfig i420_config() {
 
 // A stream the engine takes (`taken`) or one the CPU keeps whole.
 static void compare_stream(const char* name, bool taken, Generation g = Generation::Gen9) {
-  printf("  %s%s\n", name, g == Generation::Gen11 ? " (Ice Lake)" : "");
+  printf("  %s%s\n", name, g == Generation::Gen12 ? " (Tiger Lake)" : g == Generation::Gen11 ? " (Ice Lake)" : "");
   TestAllocator a;
   {
     Reference ref;
@@ -568,8 +570,8 @@ static void test_damaged_streams() {
 
 // The device: VP9 sessions go to the engine, one at a time, everything else stays on the CPU.
 static void test_device(Generation g = Generation::Gen9) {
-  const bool icl = g == Generation::Gen11;
-  printf("  device (%s)\n", icl ? "Ice Lake" : "Coffee Lake");
+  const bool icl = g != Generation::Gen9;
+  printf("  device (%s)\n", g == Generation::Gen12 ? "Tiger Lake" : icl ? "Ice Lake" : "Coffee Lake");
   TestAllocator a;
   Reference ref;
   CHECK(make_reference_file(a, "inter", &ref));
@@ -584,7 +586,7 @@ static void test_device(Generation g = Generation::Gen9) {
   setup.ggtt_first_page = 100;
   setup.memory = &rig.mem;
   {
-    IntelMediaVideoEngine device(a, icl ? 0x8A52 : 0x3E92, region);   // Ice Lake / Coffee Lake
+    IntelMediaVideoEngine device(a, g == Generation::Gen12 ? 0x9A49 : icl ? 0x8A52 : 0x3E92, region);   // Tiger Lake / Ice Lake / Coffee Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
     CHECK(device.hardware_decode() && (device.info().accelerated_decode_codecs & codec_mask(VideoCodec::Vp9)));
@@ -618,7 +620,7 @@ int main() {
   // Streams the CPU keeps: 10- and 12-bit, 4:2:2, 4:4:0, 4:4:4.
   static const char* const kept[] = {"10bit", "12bit_444", "422", "440", "444"};
   for (const char* name : taken)
-    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) { compare_stream(name, true); compare_stream(name, true, Generation::Gen11); }
+    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) { compare_stream(name, true); compare_stream(name, true, Generation::Gen11); compare_stream(name, true, Generation::Gen12); }
   if (!getenv("ONLY")) {
     for (const char* name : kept) compare_stream(name, false);
     test_lease();
@@ -626,6 +628,7 @@ int main() {
     test_damaged_streams();
     test_device();
     test_device(Generation::Gen11);
+    test_device(Generation::Gen12);
   }
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
