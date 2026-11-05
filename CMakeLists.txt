@@ -915,6 +915,9 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Intel/IntelAvcDecode.cpp
   src/Hardware/VideoCodec/Intel/IntelTiling.cpp
   src/Hardware/VideoCodec/Intel/IntelAvcSession.cpp
+  src/Hardware/VideoCodec/Intel/IntelAvcHeaders.cpp
+  src/Hardware/VideoCodec/Intel/IntelEncodeCommands.cpp
+  src/Hardware/VideoCodec/Intel/IntelAvcVdencEncoder.cpp
   src/Hardware/VideoCodec/Intel/IntelEngineBuffers.cpp
   src/Hardware/VideoCodec/Intel/IntelMpeg2Session.cpp
   src/Hardware/VideoCodec/Intel/IntelVc1Session.cpp
