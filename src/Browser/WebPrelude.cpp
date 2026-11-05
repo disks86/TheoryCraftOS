@@ -11821,7 +11821,7 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
       if (n in proto) return;
       Object.defineProperty(proto, n, {
         get: function () { if (this === proto) throw new TypeError('Illegal invocation'); return g.__host_get(this, n); },
-        set: function (v) { if (this === proto) throw new TypeError('Illegal invocation'); Object.defineProperty(this, n, { value: v, writable: true, enumerable: true, configurable: true }); },
+        set: function (v) { if (this === proto) throw new TypeError('Illegal invocation'); if (g.__host_set(this, n, v)) return; Object.defineProperty(this, n, { value: v, writable: true, enumerable: true, configurable: true }); },
         enumerable: false, configurable: true });
     });
   });

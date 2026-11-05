@@ -6235,6 +6235,22 @@ static void test_webrtc() {
     CHECK(log.find("denied NotAllowedError") != std::string::npos && log.find("state denied") != std::string::npos && log.find("tx 1 recvonly audio") != std::string::npos);
     CHECK(log.find("video NotSupportedError") != std::string::npos && log.find("[\"audio/PCMU\",\"audio/PCMA\"] null") != std::string::npos);
   }
+  {   // the setters of the interface attributes change the node they are called on (ShadyDOM writes through Object.getOwnPropertyDescriptor(Node.prototype, ...).set.call)
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    page.load("<html><body><script>\n"
+              "var el = document.createElement('div'); el.innerHTML = '<b>x</b><i>y</i>';\n"
+              "Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').set.call(el, 'hello');\n"
+              "console.log('tc ' + el.innerHTML + ' ' + el.childNodes.length);\n"
+              "Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML').set.call(el, '<p>z</p>');\n"
+              "console.log('ih ' + el.innerHTML + ' ' + el.firstChild.nodeName);\n"
+              "el.id = 'viaAccessor'; Object.getOwnPropertyDescriptor(Element.prototype, 'className').set.call(el, 'k');\n"
+              "console.log('cls ' + el.getAttribute('class') + ' ' + el.className);\n"
+              "</script></body></html>");
+    const std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("tc hello 1") != std::string::npos && log.find("ih <p>z</p> P") != std::string::npos && log.find("cls k k") != std::string::npos);
+  }
   {   // a script that measures an element it just added gets the size the page lays out now, not the last picture's (YouTube's grid sizes itself that way)
     for (int with_fonts = 0; with_fonts < 2; ++with_fonts) {
       FakeEnvironment env(a);
