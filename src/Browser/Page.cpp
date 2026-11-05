@@ -374,6 +374,8 @@ void Page::timing_summary(String* out) const {
   append_ms(out, phase_.styles_fetch);
   out->append(", style rules ");
   append_ms(out, phase_.styles);
+  out->append("/");
+  out->append_uint(style_cache_.rule_count());
   out->append(", boxes ");
   append_ms(out, phase_.boxes);
   out->append(", layout ");
@@ -1158,6 +1160,7 @@ void Page::scroll_node_into_view(dom::Node* node) {
 void Page::record_geometry(const layout::BoxTree& tree) {
   geometry_.clear();
   geometry_ready_ = true;
+  geometry_version_ = doc_.version();
   if (tree.empty()) return;
   struct Pending {
     layout::BoxId id;
@@ -1190,8 +1193,37 @@ void Page::record_geometry(const layout::BoxTree& tree) {
   }
 }
 
+// A script asks for a size after the page changed: the boxes are made and laid out again (not painted), so that what it measures is what is there now. A page
+// that changes and measures in turn would lay out on every read, so the time spent here is held to a fifth: in between, the sizes are the last ones.
+void Page::refresh_geometry() {
+  if (!layout_fonts_ || geometry_busy_) return;
+  const uint64_t started = env_.monotonic_us();
+  if (started != 0 && geometry_done_us_ != 0 && started - geometry_done_us_ < geometry_cost_us_ * 4) return;
+  geometry_busy_ = true;
+  style_sheet();
+  style_cache_.set_viewport(media_.width, media_.height);
+  layout::BuildOptions build;
+  build.objects = &objects_;
+  layout::FontMeasurer measurer(*layout_fonts_, &style_cache_);
+  layout::BoxTree tree(allocator_);
+  bool ok = layout::build_box_tree(doc_, style_cache_, build, &tree);
+  if (ok) {
+    layout::LayoutOptions layout_options;
+    layout_options.viewport_width = layout::LayoutUnit::from_px(media_.width);
+    layout_options.viewport_height = layout::LayoutUnit::from_px(media_.height);
+    layout_options.measurer = &measurer;
+    layout_options.sheet = &style_cache_;
+    ok = layout::layout_tree(tree, layout_options);
+  }
+  if (ok) record_geometry(tree);
+  geometry_done_us_ = env_.monotonic_us();
+  geometry_cost_us_ = geometry_done_us_ - started;
+  geometry_busy_ = false;
+}
+
 bool Page::node_rect(dom::Node* node, double* rect8) {
   if (!node || !geometry_ready_ || !dom::is_connected(node)) return false;
+  if (geometry_version_ != doc_.version()) refresh_geometry();
   const BoxRect* r = geometry_.find(node->serial);
   if (!r) return false;
   rect8[0] = r->x;

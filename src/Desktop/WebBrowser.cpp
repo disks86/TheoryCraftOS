@@ -884,6 +884,7 @@ void WebBrowser::show(Fetched& page) {
   if (live_) live_->set_visible(__atomic_load_n(&page_shown_, __ATOMIC_ACQUIRE));
   if (!live_) ok = false;
   else {
+    live_->set_layout_fonts(&layout_fonts());   // (scripts that measure after the page changed get a fresh layout)
     if (history_.current() && history_.current()->has_state) live_->set_history_state(history_.current()->state.view(), true);
     String referrer(allocator());
     visible_referrer(allocator(), referrer_.view(), page.address.view(), &referrer);
