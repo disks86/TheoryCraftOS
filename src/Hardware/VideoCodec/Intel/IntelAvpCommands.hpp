@@ -29,6 +29,11 @@ namespace intel_avp {
 // run on an engine.
 using intel_mfx::DwordWriter;
 
+// The video engines that decode AV1: Xe-LP (Tiger Lake and its relatives) and Xe-LPG (Meteor Lake, Arrow Lake: the media driver's Xe_LPM_plus definitions). The command numbers and
+// every field this decoder sets are the same; five commands grew at the end (pipe mode select, pipe buffer addresses, indirect objects, picture state, tile coding) with fields a
+// decoder leaves at zero, and one reserved bit of the picture state (the full-range flag, which only film grain uses) went away.
+enum class AvpPlatform : uint8_t { XeLp, XeLpg };
+
 // AVP commands: pipeline 2, opcode 3, the command number in bits 16-22.
 constexpr uint32_t avp_header(uint32_t command) { return (3u << 29) | (2u << 27) | (3u << 23) | (command << 16); }
 constexpr uint32_t kAvpPipeModeSelect = avp_header(0);
@@ -48,6 +53,8 @@ constexpr uint32_t kVdPipelineFlush = (3u << 29) | (2u << 27) | (15u << 23);
 // The lengths of the commands in dwords.
 constexpr uint32_t kPipeModeSelectDwords = 6, kSurfaceStateDwords = 5, kPipeBufAddrDwords = 188, kIndObjDwords = 6, kPicStateDwords = 51, kSegmentStateDwords = 4;
 constexpr uint32_t kTileCodingDwords = 6, kBsdObjectDwords = 3, kInloopFilterDwords = 15, kInterPredDwords = 15;
+constexpr uint32_t kPipeModeSelectDwordsXeLpg = 7, kPipeBufAddrDwordsXeLpg = 212, kIndObjDwordsXeLpg = 9, kPicStateDwordsXeLpg = 76, kTileCodingDwordsXeLpg = 7;
+constexpr uint32_t kVdControlState = (3u << 29) | (2u << 27) | (3u << 23) | (10u << 16);   // AVP_VD_CONTROL_STATE (MI_VD_CONTROL_STATE for the AVP): three dwords
 
 // Surface ids of AVP_SURFACE_STATE.
 constexpr uint32_t kSurfaceRecon = 0, kSurfaceIntra = 6, kSurfaceLast = 7, kSurfaceIntrabc = 14;
@@ -164,15 +171,17 @@ struct AvpInterPred {
 
 void emit_mfx_wait(DwordWriter& w);
 void emit_vd_pipeline_flush(DwordWriter& w);
-void emit_avp_pipe_mode_select(DwordWriter& w);
+// The pipeline initialisation every picture starts with (before the first MFX_WAIT).
+void emit_avp_vd_control_state(DwordWriter& w);
+void emit_avp_pipe_mode_select(DwordWriter& w, AvpPlatform platform = AvpPlatform::XeLp);
 void emit_avp_surface_state(DwordWriter& w, const intel_mfx::Nv12TiledLayout& layout, uint32_t id);
-void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b);
-void emit_avp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs);
-void emit_avp_pic_state(DwordWriter& w, const AvpPicture& p);
+void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b, AvpPlatform platform = AvpPlatform::XeLp);
+void emit_avp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs, AvpPlatform platform = AvpPlatform::XeLp);
+void emit_avp_pic_state(DwordWriter& w, const AvpPicture& p, AvpPlatform platform = AvpPlatform::XeLp);
 void emit_avp_segment_state(DwordWriter& w, const AvpSegment& s);
 void emit_avp_inloop_filter_state(DwordWriter& w, const AvpInloop& f);
 void emit_avp_inter_pred_state(DwordWriter& w, const AvpInterPred& p);
-void emit_avp_tile_coding(DwordWriter& w, const AvpTile& t);
+void emit_avp_tile_coding(DwordWriter& w, const AvpTile& t, AvpPlatform platform = AvpPlatform::XeLp);
 void emit_avp_bsd_object(DwordWriter& w, uint32_t length, uint32_t offset);
 
 }  // namespace intel_avp

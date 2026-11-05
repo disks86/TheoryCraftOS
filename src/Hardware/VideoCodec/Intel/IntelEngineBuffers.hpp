@@ -46,6 +46,7 @@ class IntelEngineBuffers {
   // Gen11 (Ice Lake) engines take slightly longer MFX commands (see intel_mfx::AvcBuffers::gen11); Xe-LP (Gen12) takes those too, and longer HCP commands again.
   bool gen11() const { return driver_.generation() == intel_gt::Generation::Gen11 || driver_.generation() == intel_gt::Generation::Gen12; }
   bool gen12() const { return driver_.generation() == intel_gt::Generation::Gen12; }
+  bool xe_lpg() const { return driver_.xe_lpg(); }
   bool engine_ready() const { return driver_.state() == intel_gt::VcsDriver::State::Ready; }
   ArrayView<uint32_t> batch_words() const { return batch_words_; }
 

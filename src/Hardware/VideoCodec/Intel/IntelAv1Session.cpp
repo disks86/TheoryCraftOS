@@ -387,10 +387,14 @@ bool IntelAv1Decoder::run_frame(const av1::OffloadFrame& frame, int current) {
   }
 
   // The batch.
+  // The order of the media driver's AV1 decode packets: pipeline initialisation, mode, surfaces, buffers, bitstream, picture, inter prediction, segments; then for every tile
+  // the loop filter state, the tile and its data.
+  const AvpPlatform platform = buffers_.xe_lpg() ? AvpPlatform::XeLpg : AvpPlatform::XeLp;
   DwordWriter w(buffers_.batch_words());
   intel_mfx::emit_mi_flush(w);
+  emit_avp_vd_control_state(w);
   emit_mfx_wait(w);
-  emit_avp_pipe_mode_select(w);
+  emit_avp_pipe_mode_select(w, platform);
   emit_mfx_wait(w);
   emit_avp_surface_state(w, buffers_.layout(), kSurfaceRecon);
   if (!intra) {
@@ -398,8 +402,16 @@ bool IntelAv1Decoder::run_frame(const av1::OffloadFrame& frame, int current) {
     for (uint32_t i = 0; i < 7; ++i) emit_avp_surface_state(w, buffers_.layout(), kSurfaceLast + i);
   }
   if (hdr.allow_intrabc) emit_avp_surface_state(w, buffers_.layout(), kSurfaceIntrabc);
-  emit_avp_pipe_buf_addr_state(w, b);
-  emit_avp_ind_obj_base_addr_state(w, bitstream, bitstream_bytes, b.mocs);
+  emit_avp_pipe_buf_addr_state(w, b, platform);
+  emit_avp_ind_obj_base_addr_state(w, bitstream, bitstream_bytes, b.mocs, platform);
+  emit_avp_pic_state(w, p, platform);
+  if (!intra && order_hints) {
+    AvpInterPred ip;
+    for (uint32_t r = 0; r < 7; ++r)
+      for (uint32_t j = 0; j < 7; ++j) ip.saved_order_hint[r][j] = state_[surface[r]].ref_order_hint[j];
+    ip.motion_field_mask = motion_field_mask(seq, hdr, mi_cols, mi_rows);
+    emit_avp_inter_pred_state(w, ip);
+  }
   const uint32_t segments = seg ? 8 : 1;
   for (uint32_t s = 0; s < segments; ++s) {
     const av1::SegmentationData& d = hdr.segmentation.seg_data.d[s];
@@ -422,15 +434,6 @@ bool IntelAv1Decoder::run_frame(const av1::OffloadFrame& frame, int current) {
     sd.reference_frame = d.ref < 0 ? 0u : static_cast<uint32_t>(d.ref) & 7u;
     emit_avp_segment_state(w, sd);
   }
-  emit_avp_pic_state(w, p);
-  emit_avp_inloop_filter_state(w, loop);
-  if (!intra && order_hints) {
-    AvpInterPred ip;
-    for (uint32_t r = 0; r < 7; ++r)
-      for (uint32_t j = 0; j < 7; ++j) ip.saved_order_hint[r][j] = state_[surface[r]].ref_order_hint[j];
-    ip.motion_field_mask = motion_field_mask(seq, hdr, mi_cols, mi_rows);
-    emit_avp_inter_pred_state(w, ip);
-  }
   for (uint32_t t = 0; t < tiles; ++t) {
     const uint32_t col = t % cols, row = t / cols;
     AvpTile tile;
@@ -450,7 +453,8 @@ bool IntelAv1Decoder::run_frame(const av1::OffloadFrame& frame, int current) {
     tile.disable_frame_context_update = !hdr.refresh_context || t != hdr.tiling.update;
     tile.columns = cols;
     tile.rows = rows;
-    emit_avp_tile_coding(w, tile);
+    emit_avp_inloop_filter_state(w, loop);
+    emit_avp_tile_coding(w, tile, platform);
     emit_avp_bsd_object(w, tile_size[t], tile_offset[t]);
   }
   emit_vd_pipeline_flush(w);
