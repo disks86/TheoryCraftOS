@@ -31,6 +31,7 @@ class ByteBuffer {
   ByteBuffer& operator=(const ByteBuffer&) = delete;
 
   uint64_t size() const { return size_; }
+  allocators::IAllocator& allocator() const { return allocator_; }
   ConstByteView view() const { return ConstByteView(storage_).first(size_); }
   // The bytes written so far, for reading a packet or file straight into the buffer (after put_zeros, say).
   ByteView writable_view() { return storage_.first(size_); }

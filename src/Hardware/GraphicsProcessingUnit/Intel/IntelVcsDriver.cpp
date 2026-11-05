@@ -38,6 +38,9 @@ constexpr uint32_t kMfxWaitHeader = 0x68000000;       // MFX_WAIT: a single dwor
 constexpr uint32_t kMiBatchBufferStartGen8 = (0x31u << 23) | 1;
 constexpr uint32_t kBatchInPpgtt = 1u << 8;
 constexpr uint32_t kMiFlushDw = (0x26u << 23) | 1;
+// MI_STORE_REGISTER_MEM (48-bit address, per-process graphics address space, no predicate): an encode batch stores the video box's bitstream byte count for the host.
+constexpr uint32_t kMiStoreRegisterMem = (0x24u << 23) | 2;
+constexpr uint32_t kMfcBitstreamByteCountFrame = 0x128A0;   // MFC_BITSTREAM_BYTECOUNT_FRAME of the first video box (Gen9)
 constexpr uint32_t kFlushDwStoreIndex = 1u << 21, kFlushDwInvalidateTlb = 1u << 18, kFlushDwOpStoreDw = 1u << 14, kFlushDwInvalidateBsd = 1u << 7, kFlushDwUseGtt = 1u << 2;
 constexpr uint32_t kPphwspScratchAddress = 0x34 * 4;   // LRC_PPHWSP_SCRATCH_ADDR
 
@@ -298,6 +301,9 @@ bool VcsDriver::batch_is_acceptable(ArrayView<const uint32_t> commands) {
       length = (h & 0xFF) + 2;
     } else if ((h >> 23) == 0x26) {                               // MI_FLUSH_DW: a flush, no write
       if (((h >> 14) & 3) != 0 || (h & 0x3F) != 2) return false;
+      length = 4;
+    } else if (h == kMiStoreRegisterMem) {                        // the one register an encoder reads back; the address is in the context's own address space
+      if (n - i < 4 || commands[i + 1] != kMfcBitstreamByteCountFrame || commands[i + 3] != 0) return false;
       length = 4;
     } else {
       return false;
