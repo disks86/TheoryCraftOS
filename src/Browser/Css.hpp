@@ -260,6 +260,7 @@ struct Style {
   CornerRadius radius[4];                      // border-radius: top-left, top-right, bottom-right, bottom-left
   TextRef box_shadow;                          // the list as written (StyleSheet::shadows())
   TextRef background_image, background_size, background_position, background_repeat, background_clip, background_origin, background_attachment;   // lists as written
+  TextRef mask_image, mask_size, mask_position, mask_repeat;   // mask (and -webkit-mask) layers as written: the same grammar as the background's (StyleSheet::mask_layers())
   uint16_t opacity_x1000 = 1000;               // opacity 0..1 (opaque_zero is set when it is 0)
   TextRef transform_value, translate, rotate, scale;   // the transform property (`transform` is text-transform), translate, rotate and scale as written (StyleSheet::transform_ops())
   AxisPos transform_origin_x = {5000, 0}, transform_origin_y = {5000, 0};
@@ -397,6 +398,7 @@ struct Style {
     for (CornerRadius& r : s.radius) r = CornerRadius();
     s.box_shadow = TextRef();
     s.background_image = s.background_size = s.background_position = s.background_repeat = s.background_clip = s.background_origin = s.background_attachment = TextRef();
+    s.mask_image = s.mask_size = s.mask_position = s.mask_repeat = TextRef();
     s.opacity_x1000 = 1000;
     s.transform_value = s.translate = s.rotate = s.scale = TextRef();
     s.transform_origin_x = s.transform_origin_y = AxisPos{5000, 0};
@@ -674,6 +676,7 @@ class StyleSheet {
   bool font_families(const Style& style, List<FontFamily>* out) const;
   bool shadows(TextRef list, const Style& style, List<Shadow>* out) const;                  // style.box_shadow or style.text_shadow
   bool background_layers(const Style& style, List<BackgroundLayer>* out) const;
+  bool mask_layers(const Style& style, List<BackgroundLayer>* out) const;                   // the mask's layers (positioned and clipped by the border box)
   bool transform_ops(const Style& style, List<TransformOp>* out) const;                     // the translate, rotate, scale and transform properties in the order they apply
   // The matrix of the transform of a box of that size (column major like matrix3d()); with `around_origin` the transform-origin is taken into account (else it is the
   // matrix getComputedStyle() shows). False: no transform (the identity).

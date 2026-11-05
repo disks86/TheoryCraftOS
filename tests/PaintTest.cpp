@@ -987,6 +987,13 @@ static void test_background_images() {
   TestPictures p9;
   Shot i(page("<div style='width:58px;height:10px;background:url(tile.png) round no-repeat 0 0/10px 10px'></div>"), 100, 100, &p9);
   CHECK(p9.calls.size() == 6 && p9.has(0, 0, 10, 10) && p9.has(50, 0, 10, 10));
+  // mask-image: the box shows only where the picture is (YouTube's icons: a currentColor box through an SVG); a picture that is not there hides the box
+  TestPictures pm;
+  Shot mask_a(page("<div style='width:20px;height:20px;background:#00f;-webkit-mask:url(tile.png) no-repeat 0 0 / 8px 8px'><div style='height:20px;background:#0f0;width:6px'></div></div>"), 100, 100, &pm);
+  CHECK(mask_a.rgb(2, 2) == 0x00FF00u && mask_a.rgb(7, 7) == 0x0000FFu && is_white(mask_a.rgb(12, 12)) && is_white(mask_a.rgb(2, 12)));
+  TestPictures pn;
+  Shot mask_b(page("<div style='width:20px;height:20px;background:#00f;mask-image:url(missing.png)'></div><div style='width:20px;height:20px;background:#f00'></div>"), 100, 100, &pn);
+  CHECK(is_white(mask_b.rgb(5, 5)) && mask_b.rgb(5, 25) == 0xFF0000u);
   // origin and clip: the content box
   TestPictures p10;
   Shot j(page("<div style='width:30px;height:30px;padding:10px;background:url(tile.png);background-origin:content-box;background-clip:content-box'></div>"), 100, 100, &p10);

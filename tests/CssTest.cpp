@@ -450,6 +450,18 @@ static void test_backgrounds() {
   List<BackgroundLayer> kl(g_alloc);
   CHECK(p.sheet.background_layers(p.style("k"), &kl) && kl.count() == 1 && !kl[0].gradient.circle && kl[0].gradient.extent == Gradient::ClosestSide);
   CHECK(!p.style("m").background_image.empty() && p.sheet.text(p.style("m").background_position).equals("5px 6px"));   // (inherit copies it)
+  // mask and -webkit-mask: background's layer grammar, with the mode and compositing keywords left out; the boxes are always the border box
+  Page mk("<style>#a{-webkit-mask:url(m.svg) no-repeat center / cover;mask:url(m.svg) no-repeat center / cover;background-color:currentcolor}"
+          "#b{mask-image:url(b.png);mask-size:10px 20px;mask-position:right top;mask-repeat:repeat-x} #c{mask:url(c.png) luminance add 5px 6px} #d{mask:none}</style>"
+          "<div id=a>a</div><div id=b>b</div><div id=c>c</div><div id=d>d</div>");
+  List<BackgroundLayer> ma(g_alloc), mb(g_alloc), mc(g_alloc), md(g_alloc);
+  CHECK(mk.sheet.mask_layers(mk.style("a"), &ma) && ma.count() == 1 && ma[0].url.equals("m.svg") && ma[0].size_mode == BackgroundLayer::Cover && ma[0].repeat_x == RepeatMode::NoRepeat &&
+        ma[0].position_x.percent_x100 == 5000 && ma[0].origin == BackgroundBox::BorderBox && ma[0].clip == BackgroundBox::BorderBox);
+  CHECK(mk.style("a").background_image.empty());   // (the mask is not a background)
+  CHECK(mk.sheet.mask_layers(mk.style("b"), &mb) && mb.count() == 1 && mb[0].url.equals("b.png") && mb[0].size_w.x100 == 1000 && mb[0].size_h.x100 == 2000 &&
+        mb[0].position_x.percent_x100 == 10000 && mb[0].repeat_x == RepeatMode::Repeat && mb[0].repeat_y == RepeatMode::NoRepeat);
+  CHECK(mk.sheet.mask_layers(mk.style("c"), &mc) && mc.count() == 1 && mc[0].url.equals("c.png") && mc[0].position_x.px100 == 500 && mc[0].position_y.px100 == 600);
+  CHECK(mk.style("d").mask_image.empty() && mk.sheet.mask_layers(mk.style("d"), &md) && md.count() == 0);
 }
 
 static void test_opacity_visibility() {

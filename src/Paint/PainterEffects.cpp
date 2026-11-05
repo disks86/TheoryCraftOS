@@ -401,6 +401,18 @@ bool DisplayPainter::run(graphics::IRenderer2D& r, const DisplayList& list, uint
         }
         break;
       }
+      case OpKind::PushMask: {
+        const IRect narrowed = visible[depth].intersection(rect);
+        exact = push_mask(r, list, op, dx, dy, narrowed) && exact;
+        if (depth + 1 < sizeof(kinds)) {
+          ++depth;
+          visible[depth] = narrowed;
+          kinds[depth] = 0;
+        } else {
+          ++overflow_clips;
+        }
+        break;
+      }
       case OpKind::PopClip:
         r.pop_clip();
         if (overflow_clips > 0) --overflow_clips;
@@ -610,6 +622,25 @@ bool DisplayPainter::push_clip_shape(graphics::IRenderer2D& r, const ClipShape& 
   } else {
     fill_rrect(mask, area.x, area.y, RRect::make(shape.x + static_cast<float>(dx), shape.y + static_cast<float>(dy), shape.width, shape.height, shape.radii));
   }
+  return r.push_clip_mask(mask.view(), area.x, area.y);
+}
+
+// A mask-image layer: the picture's tiles are drawn over the visible part of the box, and their alpha is the clip.
+bool DisplayPainter::push_mask(graphics::IRenderer2D& r, const DisplayList& list, const Op& op, int32_t dx, int32_t dy, const IRect& area) {
+  Pixmap layer(allocator_);
+  AlphaMask mask(allocator_);
+  if (area.empty() || !layer.create(area.width, area.height) || !mask.create(area.width, area.height)) {
+    r.push_clip_rect(graphics::Rect2D{0, 0, 0, 0});   // (nothing of the box is on screen, or no memory: nothing shows)
+    return area.empty();
+  }
+  {
+    graphics::SoftwareRenderer2D inner(layer.surface(), nullptr, &allocator_);
+    inner.set_blend(graphics::BlendMode::Alpha);
+    draw_image_layer(inner, list, op, dx - area.x, dy - area.y, IRect{0, 0, area.width, area.height});
+  }
+  const ArrayView<const uint32_t> pixels = layer.pixels();
+  const ArrayView<uint8_t> coverage = mask.data();
+  for (uint64_t i = 0; i < coverage.size(); ++i) coverage[i] = static_cast<uint8_t>(pixels[i] >> 24);
   return r.push_clip_mask(mask.view(), area.x, area.y);
 }
 

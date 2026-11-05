@@ -421,6 +421,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
 
   bool start_engine();
   void resolve_scroll_target(const layout::BoxTree& tree);
+  // The url() pictures the display list draws (background and mask layers) are fetched before it is painted.
+  void fetch_css_images(const paint::DisplayList& list);
   // Fires `copy`, `cut` or `paste` (a ClipboardEvent with clipboardData) at `target`; true if a listener called preventDefault() (it did the work itself).
   bool fire_clipboard(dom::Node* target, StringView type);
   // Ctrl+A / C / X / V with no text field to work on: the page's own selection and the events.

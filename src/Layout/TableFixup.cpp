@@ -545,6 +545,7 @@ bool wrap_captions(BoxTree& tree, BoxId table_id) {
   ws.own_background_color = 0;
   ws.background_argb = 0;
   ws.background_image = ws.background_size = ws.background_position = ws.background_repeat = ws.background_clip = ws.background_origin = ws.background_attachment = browser::TextRef();
+  ws.mask_image = ws.mask_size = ws.mask_position = ws.mask_repeat = browser::TextRef();
   ws.box_shadow = browser::TextRef();
   ws.outline_style = BorderStyle::None;
   for (browser::CornerRadius& r : ws.radius) r = browser::CornerRadius();

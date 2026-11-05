@@ -162,6 +162,37 @@ static void probe_mirror(const std::string& rel, const std::string& path) {
   if (system(("curl -sf -m 60 -A 'Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)' -o '" + path + "' 'https://" + host + "/" + rel + "' || rm -f '" + path + "'").c_str()) != 0) return;
 }
 
+// PROBE: the bytes of a picture or other binary file. app.example is the probe directory (mirrored from PROBE_LIVE); a file of another host is kept under
+// _ext/<host>/ and fetched from that host the first time when PROBE_LIVE is set (YouTube's icons come from fonts.gstatic.com).
+static bool probe_file(const std::string& address, std::string* body) {
+  const char* root = getenv("PROBE_ROOT");
+  if (!root || address.compare(0, 8, "https://") != 0) return false;
+  std::string rest = address.substr(8);
+  const size_t cut = rest.find_first_of("?#");
+  if (cut != std::string::npos) rest.resize(cut);
+  const size_t slash = rest.find('/');
+  if (slash == std::string::npos) return false;
+  const std::string host = rest.substr(0, slash), rel = rest.substr(slash + 1);
+  for (char c : rest)
+    if (!isalnum(static_cast<unsigned char>(c)) && !strchr("/._=,~+%-", c)) return false;   // (the name goes to a shell: only plain characters)
+  std::string path;
+  if (host == "app.example") {
+    path = std::string(root) + "/" + rel;
+    probe_mirror(rel, path);
+  } else {
+    path = std::string(root) + "/_ext/" + rest;
+    if (getenv("PROBE_LIVE") && access(path.c_str(), F_OK) != 0 && system(("mkdir -p '" + path.substr(0, path.rfind('/')) + "'").c_str()) == 0 &&
+        system(("curl -sf -m 60 -o '" + path + "' 'https://" + rest + "' || rm -f '" + path + "'").c_str()) != 0)
+      return false;
+  }
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+  int c;
+  while ((c = fgetc(f)) != EOF) body->push_back(static_cast<char>(c));
+  fclose(f);
+  return true;
+}
+
 // A network that hands out canned answers keyed by "METHOD url" (404 for anything else) and remembers what was sent.
 struct FakeNet final : IPageLoader {
   struct Answer {
@@ -306,7 +337,10 @@ struct FakeEnvironment final : IPageEnvironment {
   bool fetch_bytes(StringView address, uint64_t, ByteBuffer* out) override {
     fetched.push_back(std::string(address.data(), address.size()));
     auto it = blobs.find(fetched.back());
-    if (it == blobs.end()) return false;
+    if (it == blobs.end()) {
+      std::string body;
+      return getenv("PROBE_HTML") && probe_file(fetched.back(), &body) && out->append(ConstByteView(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+    }
     return out->append(ConstByteView(reinterpret_cast<const uint8_t*>(it->second.data()), it->second.size()));
   }
   int opened_video = 0, opened_audio = 0;
@@ -6273,6 +6307,40 @@ static void test_webrtc() {
     const std::string log(page.log().data(), page.log().size());
     CHECK(log.find("root #text logical composed host=composed native=SPAN") != std::string::npos);
     CHECK(log.find("plain #text x") != std::string::npos && log.find("ce mine attr") != std::string::npos);
+  }
+  {   // YouTube's masthead: an input given only a width keeps its own height (no aspect ratio); a flex container is as wide as the content of an item that grows
+      // from a basis of 0; the url() of a mask is fetched with the picture and drawn through
+    FakeEnvironment env(a);
+    env.clock = 1700000000000ull;
+    env.blobs["https://app.example/icon.png"] = make_picture(a, 8, 8, 0xFF000000u);
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    font::FontSet fonts(a);
+    fonts.add_bundled_fonts();
+    page.set_layout_fonts(&fonts);
+    page.load("<html><body style='margin:0'><form style='display:flex;width:500px'><input id=i style='font-size:16px;line-height:22px;border:0;padding:0;width:100%'></form>"
+              "<div style='display:flex'><div id=f style='display:flex'><span style='flex:1 1 0px'>Sign in</span></div><div id=g style='display:flex'><span style='flex:0 1 0px'>x</span></div></div>"
+              "<div id=m style='width:8px;height:8px;background:red;-webkit-mask:url(icon.png) no-repeat center / cover'></div>"
+              "<script>setTimeout(function () { var i = document.getElementById('i');\n"
+              "  console.log('sizes ' + i.offsetWidth + 'x' + i.offsetHeight + ' ' + (document.getElementById('f').offsetWidth > 20) + ' ' + document.getElementById('g').offsetWidth);\n"
+              "}, 10);</script></body></html>");
+    PagePicture picture(a);
+    CHECK(page.render_picture(&picture, fonts));
+    for (int i = 0; i < 3; ++i) {
+      env.clock += 10;
+      page.run_due_timers(env.clock);
+    }
+    const std::string log(page.log().data(), page.log().size());
+    const size_t at = log.find("sizes 500x");
+    CHECK(at != std::string::npos && atoi(log.c_str() + at + 10) >= 18 && atoi(log.c_str() + at + 10) <= 24 && log.find(" true 0", at) != std::string::npos);   // (one line tall, not 500 x 21/147)
+    bool fetched_icon = false;
+    for (const std::string& f : env.fetched) fetched_icon |= f == "https://app.example/icon.png";
+    CHECK(fetched_icon);
+    bool mask = false;
+    for (uint64_t k = 0; k < picture.list.count(); ++k) mask |= picture.list.op(k).kind == paint::OpKind::PushMask && picture.list.text(picture.list.op(k)).equals("icon.png");
+    CHECK(mask);
+    int32_t w = 0, h = 0;
+    CHECK(page.objects().background_image_size("icon.png", &w, &h) && w == 8 && h == 8);
   }
   {   // a script that measures an element it just added gets the size the page lays out now, not the last picture's (YouTube's grid sizes itself that way)
     for (int with_fonts = 0; with_fonts < 2; ++with_fonts) {
