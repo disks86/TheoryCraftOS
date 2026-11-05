@@ -66,7 +66,8 @@ bool ggtt_geometry(uint16_t gmch_control, uint64_t register_bar_size, GgttGeomet
 // they are): pages [first_page, first_page + page_count) of the graphics address space.
 class Ggtt {
  public:
-  Ggtt(const MmioRegion& table, uint64_t first_page, uint64_t page_count) : table_(table), first_page_(first_page), page_count_(page_count) {}
+  // `pte_flags` are or-ed into every entry written (Xe-LPG: the page attribute index bits, kXelpgGgttPteCoherent).
+  Ggtt(const MmioRegion& table, uint64_t first_page, uint64_t page_count, uint64_t pte_flags = 0) : table_(table), first_page_(first_page), page_count_(page_count), pte_flags_(pte_flags) {}
 
   // True when the owned range lies inside the table the window covers.
   bool valid() const { return table_.valid() && page_count_ != 0 && first_page_ <= entries() && page_count_ <= entries() - first_page_; }
@@ -86,7 +87,7 @@ class Ggtt {
 
  private:
   MmioRegion table_;
-  uint64_t first_page_, page_count_;
+  uint64_t first_page_, page_count_, pte_flags_;
 };
 
 // The table that says what each of the 8 page attribute indices (PAT) means. The page tables above select index 0 for GGTT entries (the hardware always uses 0
@@ -108,6 +109,14 @@ void program_icl_pat(IRegisterBank& registers);
 // Values as the i915 driver sets them (tgl_setup_private_ppat): index 0 write-back, 1 write-combining, 2 write-through, 3 uncached, 4-7 write-back.
 constexpr uint64_t kGen12PatIndexBase = 0x4800;
 void program_gen12_pat(IRegisterBank& registers);
+// Xe-LPG (Meteor Lake, Arrow Lake): the PAT index of a global GTT entry is two bits of the entry (xe: XELPG_GGTT_PTE_PAT0/PAT1, bits 52 and 53), index 3 here: write-back,
+// coherent with the CPU's caches (one way) - what the ring, status page and context in system memory need.
+constexpr uint64_t kXelpgGgttPteCoherent = (1ull << 52) | (1ull << 53);
+// The Xe-LPG PAT table (xe_pat.c xelpg_pat_table: 0 write-back, 1 write-through, 2 uncached, 3 write-back one-way coherent, 4 write-back two-way coherent; PPGTT entries with
+// the PAT bit select index 4) and the 16-entry global MOCS table (xe_mocs.c mtl_mocs_desc, entries the table does not use read as entry 1: "ignore PAT, cached"). A media tile
+// has its own copy of both, and the register bank must be the media tile's.
+void program_xelpg_pat(IRegisterBank& registers);
+void program_xelpg_global_mocs(IRegisterBank& registers);
 
 // Asks the GPU to drop what it cached of the global GTT; needed after changing entries. `registers` is the register BAR (at least 0x102000 bytes).
 constexpr uint64_t kGttFlushRegister = 0x101008;

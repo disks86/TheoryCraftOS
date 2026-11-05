@@ -33,6 +33,7 @@ static int g_failed = 0;
 #include "FakeIntelGpu.hpp"
 #include "Hardware/VideoCodec/Intel/IntelHevcEncodeCommands.hpp"
 #include "Hardware/VideoCodec/Intel/IntelHevcVdencEncoder.hpp"
+#include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/Intel/IntelTiling.hpp"
 #include "Hardware/VideoCodec/Software/H265Cabac.hpp"
@@ -671,6 +672,46 @@ void test_device(TestAllocator& a) {
   }
   CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
   CHECK(rig.mem.live() == 1);
+
+  // Meteor Lake: the media tile. The engine and its registers are the tile's (the simulated GPU stands for the tile's window); the probe looks at the tile's own place in
+  // the BAR. H.264 and H.265 encode run on it, AV1 and MPEG-2 decode stay with the CPU.
+  {
+    Rig2 mtl;
+    mtl.engine.write_stream = true;
+    std::vector<uint32_t> r3(IntelMediaEngineHw::kMediaTileBase / 4 + 0x20000 / 4, 0);
+    r3[(IntelMediaEngineHw::kMediaTileBase + 0x0D50) / 4] = 1;
+    const MmioRegion region3(reinterpret_cast<uint64_t>(r3.data()), r3.size() * 4);
+    IntelMediaVideoEngine::HardwareSetup setup3;
+    setup3.registers = &mtl.gpu;
+    setup3.ggtt_table = mtl.config().ggtt_table;
+    setup3.ggtt_first_page = 100;
+    setup3.memory = &mtl.mem;
+    {
+      IntelMediaVideoEngine device(a, 0x7D55, region3);
+      device.set_hardware(setup3);
+      CHECK(device.initialize() && device.hardware_decode());
+      const uint32_t decode = device.info().accelerated_decode_codecs;
+      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && !(decode & codec_mask(VideoCodec::Av1)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
+      CHECK(device.info().accelerated_encode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)));
+      EncoderConfig cfg;
+      cfg.codec = VideoCodec::Hevc;
+      cfg.width = 64;
+      cfg.height = 64;
+      cfg.input = PixelFormat::I420;
+      VideoFrameBuffer f(a);
+      make_i420(f, 64, 64, 5);
+      UniquePointer<IVideoEncoder> hw = device.create_encoder(cfg);
+      CHECK(hw != nullptr);
+      if (hw) {
+        CHECK(hw->submit(f.frame()) == SubmitResult::Accepted);
+        VideoPacket p;
+        CHECK(hw->receive(&p) && p.keyframe && mtl.engine.pictures == 1);
+      }
+      // The driver programmed the Xe-LPG tables, with the Gen12 engine.
+      CHECK(mtl.gpu.regs[0x4800 + 12] == 2 && mtl.gpu.regs[0x4004] == 0x100);
+    }
+    CHECK(mtl.gpu.violations.empty() && mtl.engine.problems == 0);
+  }
 
   // Ice Lake and Coffee Lake offer H.264 only.
   for (Generation g : {Generation::Gen9, Generation::Gen11}) {
