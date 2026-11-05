@@ -325,7 +325,7 @@ struct FakeDecoder {
           surf_chroma = d[i + 4] & 0xFFFF;
           break;
         case kMfxPipeBufAddrState:
-          if (len != (g_generation == Generation::Gen11 ? 68u : 61u)) problem("pipe buffer address command length");
+          if (len != (g_generation != Generation::Gen9 ? 68u : 61u)) problem("pipe buffer address command length");
           out_pre = addr(d, i + 1);
           out_post = addr(d, i + 4);
           for (int k = 0; k < 16; ++k) refs[k] = addr(d, i + 19 + 2 * k);
@@ -720,7 +720,7 @@ static void test_device() {
 int main() {
   static const char* const streams[] = {"simple_intra", "sm_intra", "sm_intra_lf", "sm_intra_q", "sm_intra_nu", "adv_intra", "adv_intra_lf", "adv_intra_odd", "sp_ipp", "sm_ipp", "sm_ipp_q", "sm_ipp_nu",
                                         "sm_ipb", "sm_ipb_f", "adv_ipp", "adv_ipb", "adv_ipp_odd", "adv_skip"};
-  for (const Generation generation : {Generation::Gen9, Generation::Gen11}) {
+  for (const Generation generation : {Generation::Gen9, Generation::Gen11, Generation::Gen12}) {
     g_generation = generation;
     for (const char* name : streams)
       if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) compare_stream(name);

@@ -220,7 +220,7 @@ struct Rig2 : Rig {
   FakeDecoder engine;
   AllocatorGpuMemory* unused = nullptr;
   explicit Rig2(Generation g = Generation::Gen9) : Rig(g) {
-    engine.gen11 = g == Generation::Gen11;
+    engine.gen11 = g != Generation::Gen9;
     gpu.on_batch = [this](FakeGpu& gp, const std::vector<uint32_t>& d) { engine.run(gp, d); };
   }
 };
@@ -647,13 +647,15 @@ static void test_device() {
 
 // Ice Lake: the same stream through the hardware path of a Gen11 engine. The MFX commands are the Gen9 ones with two that grew (and the pipe mode select is
 // wrapped in MFX_WAITs); the HCP codecs (H.265, VP9) are offered too and tested in their own session tests.
-static void test_device_gen11() {
+static void test_device_gen11(Generation g = Generation::Gen11) {
+  const bool xe = g == Generation::Gen12;
+  printf("  device (%s)\n", xe ? "Tiger Lake" : "Ice Lake");
   File file("tests/data/h264_bframes.h264");
   CHECK(file.data != nullptr);
   if (!file.data) return;
   const std::vector<ConstByteView> aus = split(file.view());
   TestAllocator a;
-  Rig2 rig(Generation::Gen11);
+  Rig2 rig(g);
   std::vector<uint32_t> regs(0x20000 / 4, 0);
   regs[0x0D50 / 4] = 1;   // the first video box answers the power request
   const MmioRegion region(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4);
@@ -663,10 +665,10 @@ static void test_device_gen11() {
   setup.ggtt_first_page = 100;
   setup.memory = &rig.mem;
   {
-    IntelMediaVideoEngine device(a, 0x8A52, region);   // Ice Lake
+    IntelMediaVideoEngine device(a, xe ? 0x9A49 : 0x8A52, region);   // Ice Lake / Tiger Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
-    CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp9)));
+    CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | (xe ? codec_mask(VideoCodec::Av1) : codec_mask(VideoCodec::Vc1)) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp9)));
     std::vector<int64_t> hw_pts;
     {
       UniquePointer<IVideoDecoder> hw = device.create_decoder(i420_config());
@@ -678,7 +680,7 @@ static void test_device_gen11() {
     }
   }
   CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
-  CHECK(rig.gpu.regs[0x40E0] == 0x07 && rig.gpu.regs[0xC904] != 0);   // the Gen11 PAT and MOCS tables were programmed
+  if (!xe) CHECK(rig.gpu.regs[0x40E0] == 0x07 && rig.gpu.regs[0xC904] != 0);   // the Gen11 PAT and MOCS tables were programmed
   CHECK(rig.mem.live() == 1 && a.live == 0);
 }
 
@@ -761,6 +763,7 @@ int main() {
   test_damaged_streams();
   test_device();
   test_device_gen11();
+  test_device_gen11(Generation::Gen12);
   test_system();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("intel avc session tests passed\n");

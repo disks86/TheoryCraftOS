@@ -709,7 +709,7 @@ static void test_device() {
     IntelMediaVideoEngine device(a, 0x9A49, region);   // Tiger Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
-    CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == codec_mask(VideoCodec::Av1));
+    CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == (codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp9)));
     {
       UniquePointer<IVideoDecoder> hw = device.create_decoder(i420_config());
       CHECK(hw != nullptr);

@@ -244,6 +244,8 @@ struct FakeDecoder {
   size_t next = 0, slices_done = 0;
   long current = -1;
   bool weighted_p = false, weighted_b = false, saw_long_term = false, saw_tiles = false;
+  uint32_t independent_start = 0;   // the position of the last independent slice segment seen
+  bool gen12 = false;   // Xe-LP (with gen11): pipe mode select 7, surface state 5, picture state 41, slice state 13
   bool gen11 = false;   // Ice Lake: the HCP commands have the media driver's full lengths (pipe buffer 121, indirect object 29, picture 38, tile 17, slice 11, weights 42)
   // What the PPS NAL units seen so far say (dependent slice segments, extra slice header bits).
   bool pps_dependent = false;
@@ -308,11 +310,12 @@ struct FakeDecoder {
     ++batches;
     uint32_t codec = 99, surf_pitch = 0, surf_format = 0, surf_chroma = 0, qm_count = 0;
     uint64_t cur = 0, lines[9] = {}, mv_cur = 0, refs[8] = {}, mv_refs[8] = {}, bitstream = 0, bitstream_upper = 0;
-    uint32_t pic[38] = {}, tile[17] = {};
+    uint32_t pic[41] = {}, tile[17] = {};
     bool have_pic = false, have_tile = false, have_buf = false, have_ind = false;
     struct RefList { bool present = false; uint32_t count = 0; uint32_t entry[16] = {}; };
     struct Slice {
       uint32_t state[9] = {};
+      uint32_t orig = 0;   // Xe-LP: where the slice started (vertical position in the upper half)
       RefList list[2];
       bool weights[2] = {false, false};
       uint32_t size = 0, offset = 0;
@@ -329,8 +332,8 @@ struct FakeDecoder {
       const size_t len = (h & 0xFF) + 2;
       if (i + len > d.size()) { problem("command runs past the batch"); return; }
       switch (h & 0xFFFF0000) {
-        case kHcpPipeModeSelect: codec = (d[i + 1] >> 5) & 3; if (len != 6) problem("pipe mode select length"); break;
-        case kHcpSurfaceState: surf_pitch = (d[i + 1] & 0x1FFFF) + 1; surf_format = d[i + 2] >> (gen11 ? 27 : 28); surf_chroma = d[i + 2] & 0xFFFF; break;
+        case kHcpPipeModeSelect: codec = (d[i + 1] >> 5) & 3; if (len != (gen12 ? 7u : 6u)) problem("pipe mode select length"); break;
+        case kHcpSurfaceState: if (len != (gen12 ? 5u : gen11 ? 4u : 3u)) problem("surface state length"); surf_pitch = (d[i + 1] & 0x1FFFF) + 1; surf_format = d[i + 2] >> (gen11 ? 27 : 28); surf_chroma = d[i + 2] & 0xFFFF; break;
         case kHcpPipeBufAddrState:
           if (len != (gen11 ? 121u : 95u)) { problem("pipe buffer address length"); return; }
           cur = addr(d, i + 1);
@@ -341,12 +344,13 @@ struct FakeDecoder {
           break;
         case kHcpIndObjBaseAddrState: bitstream = addr(d, i + 1); bitstream_upper = addr(d, i + 4); have_ind = len == (gen11 ? 29u : 14u); break;
         case kHcpQmState: ++qm_count; break;
-        case kHcpPicState: if (len == (gen11 ? 38u : 19u)) { for (size_t k = 0; k < len; ++k) pic[k] = d[i + k]; have_pic = true; } break;
+        case kHcpPicState: if (len == (gen12 ? 41u : gen11 ? 38u : 19u)) { for (size_t k = 0; k < len; ++k) pic[k] = d[i + k]; have_pic = true; } break;
         case kHcpTileState: if (len == (gen11 ? 17u : 13u)) { for (size_t k = 0; k < len; ++k) tile[k] = d[i + k]; have_tile = true; } break;
         case kHcpSliceState: {
-          if (len != (gen11 ? 11u : 9u)) { problem("slice state length"); return; }
+          if (len != (gen12 ? 13u : gen11 ? 11u : 9u)) { problem("slice state length"); return; }
           Slice s;
           for (int k = 0; k < 9; ++k) s.state[k] = d[i + k];
+          s.orig = gen12 ? d[i + 11] : 0;
           slices.push_back(s);
           break;
         }
@@ -395,7 +399,7 @@ struct FakeDecoder {
     weighted_b |= (pic[4] >> 18) & 1;
 
     // Every buffer is mapped, none overlaps another.
-    const HevcBufferBytes sizes = hevc_buffer_bytes(width, height, log2_ctb, gen11);
+    const HevcBufferBytes sizes = hevc_buffer_bytes(width, height, log2_ctb, gen11, gen12);
     struct Range { uint64_t start, size; const char* name; };
     std::vector<Range> ranges;
     std::set<uint64_t> seen;
@@ -456,6 +460,8 @@ struct FakeDecoder {
         const uint32_t type = sl.state[3] & 3;
         const bool last = (sl.state[3] >> 2) & 1, dependent = (sl.state[3] >> 4) & 1, tmvp = (sl.state[3] >> 5) & 1;
         const uint32_t hor = sl.state[1] & 0xFFFF, ver = sl.state[1] >> 16, next_hor = sl.state[2] & 0xFFFF, next_ver = sl.state[2] >> 16;
+        if (!dependent) independent_start = sl.state[1];
+        if (gen12 && sl.orig != independent_start) problem("original slice start");
         // The slice NAL unit as stored, at the place the object names.
         std::vector<uint8_t> hw;
         for (uint32_t off = 0; off < sl.size; ++off) {
@@ -582,7 +588,8 @@ struct FakeDecoder {
 struct Rig2 : Rig {
   FakeDecoder engine;
   explicit Rig2(Generation g = Generation::Gen9) : Rig(g) {
-    engine.gen11 = g == Generation::Gen11;
+    engine.gen11 = g != Generation::Gen9;
+    engine.gen12 = g == Generation::Gen12;
     gpu.on_batch = [this](FakeGpu& gp, const std::vector<uint32_t>& d) { engine.run(gp, d); };
   }
 };
@@ -595,7 +602,7 @@ static DecoderConfig i420_config() {
 }
 
 static void compare_stream(const char* name, uint64_t batch_limit = 0, int min_batches_per_picture = 0, Generation g = Generation::Gen9) {
-  printf("  %s%s%s\n", name, batch_limit ? " (small batches)" : "", g == Generation::Gen11 ? " (Ice Lake)" : "");
+  printf("  %s%s%s\n", name, batch_limit ? " (small batches)" : "", g == Generation::Gen12 ? " (Tiger Lake)" : g == Generation::Gen11 ? " (Ice Lake)" : "");
   TestAllocator a;
   {
     Reference ref;
@@ -737,8 +744,8 @@ static void test_damaged_streams() {
 
 // The device: H.265 sessions go to the engine, one at a time, everything else stays on the CPU.
 static void test_device(Generation g = Generation::Gen9) {
-  const bool icl = g == Generation::Gen11;
-  printf("  device (%s)\n", icl ? "Ice Lake" : "Coffee Lake");
+  const bool icl = g != Generation::Gen9;
+  printf("  device (%s)\n", g == Generation::Gen12 ? "Tiger Lake" : icl ? "Ice Lake" : "Coffee Lake");
   TestAllocator a;
   Reference ref;
   CHECK(make_reference(a, "bframes", &ref));
@@ -753,7 +760,7 @@ static void test_device(Generation g = Generation::Gen9) {
   setup.ggtt_first_page = 100;
   setup.memory = &rig.mem;
   {
-    IntelMediaVideoEngine device(a, icl ? 0x8A52 : 0x3E92, region);   // Ice Lake / Coffee Lake
+    IntelMediaVideoEngine device(a, g == Generation::Gen12 ? 0x9A49 : icl ? 0x8A52 : 0x3E92, region);   // Tiger Lake / Ice Lake / Coffee Lake
     device.set_hardware(setup);
     CHECK(device.initialize());
     CHECK(device.hardware_decode() && (device.info().accelerated_decode_codecs & codec_mask(VideoCodec::Hevc)));
@@ -784,15 +791,17 @@ static void test_device(Generation g = Generation::Gen9) {
 int main() {
   static const char* const streams[] = {"intra", "ipp", "bframes", "ctu64", "scaling", "oddsize", "wpp", "weighted", "slices", "tools", "maxref", "qcif", "cutree_off", "highrate", "cra", "cip", "lossless"};
   for (const char* name : streams)
-    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) { compare_stream(name); compare_stream(name, 0, 0, Generation::Gen11); }
+    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) { compare_stream(name); compare_stream(name, 0, 0, Generation::Gen11); compare_stream(name, 0, 0, Generation::Gen12); }
   if (!getenv("ONLY")) {
     compare_stream("slices", 520, 2);   // (a batch holds the state and one slice)
     compare_stream("slices", 560, 2, Generation::Gen11);   // (the Ice Lake commands are longer)
+    compare_stream("slices", 580, 2, Generation::Gen12);
     test_lease_and_config();
     test_hang();
     test_damaged_streams();
     test_device();
     test_device(Generation::Gen11);
+    test_device(Generation::Gen12);
   }
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
