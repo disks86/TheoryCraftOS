@@ -1037,34 +1037,59 @@ static void test_desktop_bridge() {
   CHECK(windows_key_of_usage(0xE6, &k) && k.vk == 0xA5 && k.scan == 0x38 && k.extended);            // right Alt
   CHECK(!windows_key_of_usage(0x01, &k) && !windows_key_of_usage(0x80, &k) && !windows_key_of_usage(0xE8, &k));
 
-  Fixture f(34);
-  DesktopBridge bridge;
-  bridge.attach();
-  CHECK(!bridge.take_screen_changed());      // nothing drawn yet
-  CHECK(bridge.screen_width() == 1024 && bridge.screen_height() == 768);
-  CHECK(bridge.set_screen_size(800, 600) && bridge.screen_width() == 800 && bridge.set_screen_size(1024, 768));
-  const gdi::Rect clip[1] = {{10, 20, 30, 40}};
-  const uint32_t dc = gdi::create_screen_dc(34, 10, 20, ArrayView<const gdi::Rect>(clip, 1));
+}
+
+// A window surface: a screen DC aimed at it draws there (not on the screen), the sink hears of it in surface coordinates, a resize starts over blank, and a DC of a
+// surface that is gone draws nowhere.
+struct SurfaceSink : gdi::IWindowSurfaceSink {
+  uint32_t window = 0, calls = 0;
+  gdi::Rect dirty{};
+  void surface_changed(uint32_t w, const gdi::Rect& r) override { window = w; dirty = r; ++calls; }
+};
+
+static void test_window_surfaces() {
+  Fixture f(35);
+  SurfaceSink sink;
+  gdi::set_window_surface_sink(&sink);
+  const uint32_t id = gdi::create_window_surface(0x1234, 64, 48);
+  CHECK(id != 0);
+  uint32_t w = 0, h = 0;
+  CHECK(gdi::window_surface_size(id, &w, &h) && w == 64 && h == 48);
+  CHECK(gdi::create_window_surface(0x1234, 0, 10) == 0 && gdi::create_window_surface(0x1234, 20000, 10) == 0);      // (no empty or huge ones)
+  const gdi::Rect clip[1] = {{0, 0, 64, 48}};
+  const uint32_t dc = gdi::create_screen_dc(35, 5, 6, ArrayView<const gdi::Rect>(clip, 1), id);      // origin (5, 6) of the surface
   const uint32_t green = f.u(N(CreateSolidBrush), kGreen, 0);
   f.u(N(SelectBrush), dc, green);
-  CHECK(f.u(N(PatBlt), dc, 0, 0, 20, 20, kPatCopy) == 1);
-  CHECK(bridge.take_screen_changed());
-  std::vector<uint32_t> pixels(1024 * 768);
-  uint32_t w = 0, h = 0;
-  CHECK(!bridge.copy_screen(ArrayView<uint32_t>(pixels.data(), 1000), &w, &h) && w == 1024 && h == 768);      // too small
-  CHECK(bridge.copy_screen(ArrayView<uint32_t>(pixels.data(), pixels.size()), &w, &h));
-  const uint32_t want = 0xFF000000u | (kGreen & 0xFF) << 16 | (kGreen & 0xFF00) | (kGreen >> 16 & 0xFF);      // COLORREF 0x00BBGGRR as opaque 0xAARRGGBB
-  CHECK(pixels[20 * 1024 + 10] == want && pixels[39 * 1024 + 29] == want && pixels[0] != want && (pixels[0] >> 24) == 0xFF);
+  CHECK(f.u(N(PatBlt), dc, 0, 0, 10, 10, kPatCopy) == 1);
+  CHECK(sink.calls == 1 && sink.window == 0x1234 && sink.dirty.left == 5 && sink.dirty.top == 6 && sink.dirty.right == 15 && sink.dirty.bottom == 16);
+  ArrayView<uint32_t> px = gdi::window_surface_pixels(id, &w, &h);
+  const uint32_t want = (kGreen & 0xFF) << 16 | (kGreen & 0xFF00) | (kGreen >> 16 & 0xFF);      // COLORREF 0x00BBGGRR as 0x..RRGGBB
+  CHECK(px.size() == 64u * 48 && (px[6 * 64 + 5] & 0xFFFFFF) == want && (px[15 * 64 + 14] & 0xFFFFFF) == want && (px[0] & 0xFFFFFF) != want);
+  const ConstByteView screen = gdi::screen_pixels();      // (the screen is not where it went)
+  const uint64_t at = (6ull * gdi::screen_width() + 5) * 4;
+  CHECK(screen.size() > at + 3 && (uint32_t(screen[at + 2]) << 16 | uint32_t(screen[at + 1]) << 8 | screen[at]) != want);
+  // drawing that falls outside the surface is clipped and not reported
+  sink.calls = 0;
+  CHECK(f.u(N(PatBlt), dc, 200, 200, 10, 10, kPatCopy) == 1 && sink.calls == 0);
+  // a GPU present writes the bytes and says so
+  uint32_t bw = 0, bh = 0;
+  ByteView bytes = gdi::window_surface_bytes(id, &bw, &bh);
+  CHECK(bytes.size() == 64u * 48 * 4 && bw == 64 && bh == 48);
+  bytes[0] = 0x11;
+  gdi::window_surface_damaged(id, gdi::Rect{0, 0, 1, 1});
+  CHECK(sink.calls == 1 && sink.dirty.right == 1 && (gdi::window_surface_pixels(id, &w, &h)[0] & 0xFF) == 0x11);
+  // resized: blank (the window paints it again), the DC still draws on it
+  CHECK(gdi::resize_window_surface(id, 32, 32) && gdi::window_surface_size(id, &w, &h) && w == 32 && h == 32);
+  px = gdi::window_surface_pixels(id, &w, &h);
+  CHECK(px.size() == 32u * 32 && (px[6 * 32 + 5] & 0xFFFFFF) != want);
+  CHECK(f.u(N(PatBlt), dc, 0, 0, 2, 2, kPatCopy) == 1 && (gdi::window_surface_pixels(id, &w, &h)[6 * 32 + 5] & 0xFFFFFF) == want);
+  // gone: the DC draws nowhere, the views are empty
+  gdi::destroy_window_surface(id);
+  sink.calls = 0;
+  f.u(N(PatBlt), dc, 0, 0, 2, 2, kPatCopy);
+  CHECK(sink.calls == 0 && gdi::window_surface_pixels(id, &w, &h).empty() && !gdi::window_surface_size(id, &w, &h));
   gdi::delete_dc(dc);
-  // the pointer: a position, then a relative mouse's motion; nothing confines it
-  bridge.mouse_position(300, 200);
-  bridge.mouse_motion(5, -3);
-  int32_t x = 0, y = 0;
-  bridge.cursor(&x, &y);
-  CHECK(x == 305 && y == 197 && !bridge.cursor_confined());
-  bridge.detach();
-  CHECK(f.u(N(PatBlt), dc, 0, 0, 1, 1, kPatCopy) == 0 || !bridge.take_screen_changed());      // detached: no more changes noted
-  user::reset_state();      // (the window manager's state was made for the pointer: it goes with this test's system)
+  gdi::set_window_surface_sink(nullptr);
 }
 
 int main() {
@@ -1082,6 +1107,7 @@ int main() {
   test_font_provider();
   test_screen_dc();
   test_desktop_bridge();
+  test_window_surfaces();
   test_misc_and_errors();
   return finish("Win32kGdiTest");
 }

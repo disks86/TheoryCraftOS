@@ -23,7 +23,9 @@ namespace hardware {
 
 namespace {
 constexpr uint8_t kGoIdle = 0, kAllSendCid = 2, kSendRelativeAddress = 3, kSetBusWidth = 6, kSelectCard = 7, kSendIfCond = 8, kSendCsd = 9, kStopTransmission = 12, kSendStatus = 13,
-                  kSetBlockLength = 16, kReadSingle = 17, kReadMultiple = 18, kWriteSingle = 24, kWriteMultiple = 25, kSdSendOpCond = 41, kSendScr = 51, kAppCommand = 55;
+                  kSetBlockLength = 16, kReadSingle = 17, kReadMultiple = 18, kWriteSingle = 24, kWriteMultiple = 25, kSdSendOpCond = 41, kSendScr = 51, kAppCommand = 55,
+                  kEraseStart = 32, kEraseEnd = 33, kErase = 38;
+constexpr uint32_t kEraseReadyPolls = 1000;                          // up to ten seconds for an erase
 constexpr uint32_t kCardErrors = 0xFDF80008u;                       // the error bits of the card status
 constexpr uint32_t kReadyForData = 1u << 8;
 constexpr uint32_t kOcrVoltageWindow = 0x00FF8000, kOcrBusy = 0x80000000u, kOcrCcs = 0x40000000u;
@@ -55,6 +57,8 @@ bool sd_parse_csd(const uint32_t csd[4], uint64_t* block_count, bool* read_only)
   *read_only = field(csd, 13, 12) != 0;                              // permanent or temporary write protect
   return true;
 }
+
+uint32_t sd_csd_command_classes(const uint32_t csd[4]) { return field(csd, 95, 84); }
 
 void sd_parse_cid(const uint32_t cid[4], SdCardInfo* info) {
   info->manufacturer = static_cast<uint8_t>(field(cid, 127, 120));
@@ -123,6 +127,7 @@ bool SdCard::initialize() {
   c.argument = info_.relative_address << 16;
   c.response_type = SdResponse::R2;
   if (!host_.command(c) || !sd_parse_csd(c.response, &info_.block_count, &info_.read_only)) return false;
+  info_.can_erase = (sd_csd_command_classes(c.response) >> 5) & 1;
   c = SdCommand();
   c.index = kSelectCard;
   c.argument = info_.relative_address << 16;
@@ -137,7 +142,9 @@ bool SdCard::initialize() {
   prefix.index = kAppCommand;
   prefix.argument = info_.relative_address << 16;
   prefix.response_type = SdResponse::R1;
-  if (host_.command(prefix) && host_.read_blocks(c, 8, 1, ByteView(scr, 8)) && (scr[1] & 0x04)) {
+  const bool have_scr = host_.command(prefix) && host_.read_blocks(c, 8, 1, ByteView(scr, 8));
+  if (have_scr) info_.erased_reads_ones = scr[1] & 0x80;              // DATA_STAT_AFTER_ERASE (SCR bit 55)
+  if (have_scr && (scr[1] & 0x04)) {
     c = SdCommand();
     c.index = kSetBusWidth;
     c.argument = 2;
@@ -197,6 +204,29 @@ bool SdCard::write(uint64_t lba, uint32_t blocks, ConstByteView data) {
     if (!host_.command(stop) && ok) return false;
   }
   return ok && wait_ready();
+}
+
+bool SdCard::erase(uint64_t lba, uint32_t blocks) {
+  if (!info_.can_erase || info_.read_only || blocks == 0 || blocks > kMaxEraseBlocks || lba >= info_.block_count || blocks > info_.block_count - lba) return false;
+  SdCommand c;
+  c.index = kEraseStart;
+  c.argument = address_of(lba);
+  c.response_type = SdResponse::R1;
+  if (!host_.command(c) || (c.response[0] & kCardErrors)) return false;
+  c = SdCommand();
+  c.index = kEraseEnd;
+  c.argument = address_of(lba + blocks - 1);   // (the last block, inclusive)
+  c.response_type = SdResponse::R1;
+  if (!host_.command(c) || (c.response[0] & kCardErrors)) return false;
+  c = SdCommand();
+  c.index = kErase;
+  c.argument = 0;   // erase (not discard or FULE: every SD card with class 5 has it)
+  c.response_type = SdResponse::R1b;
+  if (!host_.command(c) || (c.response[0] & kCardErrors)) return false;
+  for (uint32_t i = 0; i < kEraseReadyPolls; ++i) {
+    if (wait_ready()) return true;
+  }
+  return false;
 }
 
 }  // namespace hardware

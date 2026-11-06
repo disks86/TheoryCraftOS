@@ -16,12 +16,16 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The desktop's view of the Windows programs (desktop::IWindowsSession) over win32k: the screen surface of GDI (told of every change through the screen sink) and the
-// window manager's input (user::inject_*). The desktop's keyboard speaks USB HID usages; here they become the virtual keys and set-1 scan codes of Windows (US layout)
-// and, for a press, the character it types. Every call takes the system lock itself; screen_changed only notes the change (the lock is held there).
+// The desktop's view of the Windows programs (desktop::IWindowsSession) over win32k. Attached, win32k redirects its top-level windows: each one draws on a window
+// surface of its own, which the desktop draws straight into its picture (draw_window, under the system lock, with no copy in between), and the desktop's frames are
+// the windows' frames (user::set_redirection). The window manager's observer and GDI's surface sink tell the bridge what changed; they run with the system lock held, so
+// they only note it, in a fixed table guarded by that same lock (no allocation there; a full table notes "everything changed" instead).
+// The desktop's keyboard speaks USB HID usages; here they become the virtual keys and set-1 scan codes of Windows (US layout) and, for a press, the character it types.
+// Every other call takes the system lock itself.
 #pragma once
 #include "Desktop/WindowsSession.hpp"
 #include "Process/Win32k/Win32kGdi.hpp"
+#include "Process/Win32k/Win32kUser.hpp"
 
 namespace process::win32k {
 
@@ -32,18 +36,20 @@ struct WindowsKey {
 };
 bool windows_key_of_usage(uint8_t usage, WindowsKey* out);      // false for a usage with no key of Windows
 
-class DesktopBridge final : public desktop::IWindowsSession, public gdi::IScreenSink {
+class DesktopBridge final : public desktop::IWindowsSession, public user::IWindowObserver, public gdi::IWindowSurfaceSink {
  public:
-  // Becomes win32k's screen sink (detach() or the destructor stops it).
-  void attach();
+  // Stops the redirection (if attach() started it); the destructor does too.
   void detach();
   ~DesktopBridge() { detach(); }
 
-  bool take_screen_changed() override { return __atomic_exchange_n(&changed_, false, __ATOMIC_ACQ_REL); }
-  uint32_t screen_width() override;
-  uint32_t screen_height() override;
-  bool set_screen_size(uint32_t width, uint32_t height) override;
-  bool copy_screen(ArrayView<uint32_t> out, uint32_t* width, uint32_t* height) override;
+  void attach(uint32_t width, uint32_t height, const desktop::WindowsRect& work_area, int32_t frame_border, int32_t frame_title) override;
+  void take_changes(List<uint32_t>* changed, List<Repaint>* repainted) override;
+  void windows(List<uint32_t>* out) override;
+  bool window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) override;
+  bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) override;
+  void move_window(uint32_t window, const desktop::WindowsRect& rect) override;
+  void activate_window(uint32_t window) override;
+  void window_command(uint32_t window, Command command) override;
   void key(uint8_t hid_usage, bool pressed, uint8_t modifiers) override;
   void mouse_motion(int32_t dx, int32_t dy) override;
   void mouse_position(int32_t x, int32_t y) override;
@@ -51,11 +57,25 @@ class DesktopBridge final : public desktop::IWindowsSession, public gdi::IScreen
   void mouse_wheel(int32_t notches) override;
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
+  uint32_t capture_window() override;
 
-  void screen_changed(const gdi::Rect& dirty) override;
+  // (with the system lock held)
+  void top_level_changed(uint32_t hwnd) override;
+  void surface_changed(uint32_t window, const gdi::Rect& dirty) override;
 
  private:
-  bool changed_ = false;
+  struct Pending {
+    uint32_t window = 0;
+    bool changed = false, repaint = false;
+    gdi::Rect dirty;
+  };
+  static constexpr uint32_t kMaxPending = 128;
+  Pending* pending_slot(uint32_t window);
+  static bool fill_info(const user::TopLevelInfo& info, desktop::WindowsWindowInfo* out);      // (lock held) the window's entry, a new one, or null when the table is full (overflow_ is then set)
+
+  Pending pending_[kMaxPending];
+  uint32_t pending_count_ = 0;
+  bool overflow_ = false;
   bool attached_ = false;
 };
 

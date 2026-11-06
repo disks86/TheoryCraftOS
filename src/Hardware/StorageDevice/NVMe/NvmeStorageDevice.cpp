@@ -117,6 +117,7 @@ bool NvmeStorageDevice::identify() {
   const uint8_t data_size_log2 = scratch_[128 + 4 * format + 2];  // LBAF[format].LBADS
   if (data_size_log2 < 9 || data_size_log2 > 12) return false;
   info_.block_size = 1u << data_size_log2;
+  info_.discard_zeroes = info_.discard && (scratch_[33] & 0x7) == 0x1;   // DLFEAT: deallocated blocks read as zeros
   return info_.block_count > 0 && chunk_bytes_ >= info_.block_size;
 }
 

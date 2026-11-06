@@ -29,6 +29,8 @@ struct SdCardInfo {
   bool high_capacity = false;         // SDHC / SDXC: addressed by block number
   bool read_only = false;             // the card's own write protection (the CSD bits; the slot's switch is the host's)
   bool bus_4bit = false;
+  bool can_erase = false;             // the CSD's command classes include class 5 (erase: CMD32, CMD33, CMD38)
+  bool erased_reads_ones = false;     // the SCR's DATA_STAT_AFTER_ERASE: erased blocks read as all ones (else zeros)
   uint32_t relative_address = 0;
   char name[8] = {};                  // the product name of the CID
   uint32_t serial = 0;
@@ -37,6 +39,7 @@ struct SdCardInfo {
 
 // The fields of the registers, for the host tests and for anyone who has the words.
 bool sd_parse_csd(const uint32_t csd[4], uint64_t* block_count, bool* read_only);
+uint32_t sd_csd_command_classes(const uint32_t csd[4]);   // CCC, bit n: class n is supported
 void sd_parse_cid(const uint32_t cid[4], SdCardInfo* info);
 
 class SdCard {
@@ -49,6 +52,10 @@ class SdCard {
   const SdCardInfo& info() const { return info_; }
   bool read(uint64_t lba, uint32_t blocks, ByteView data);
   bool write(uint64_t lba, uint32_t blocks, ConstByteView data);
+  // Erases `blocks` blocks from `lba` (CMD32 start, CMD33 end, CMD38), waiting while the card is busy. At most kMaxEraseBlocks at a time (an
+  // erase keeps the card busy for longer the more it covers). False if the card cannot erase or reports an error.
+  static constexpr uint32_t kMaxEraseBlocks = 8192;
+  bool erase(uint64_t lba, uint32_t blocks);
   uint32_t max_blocks() const { return host_.max_blocks(); }
 
  private:

@@ -159,6 +159,7 @@ struct Window {
   bool paint_pending = false;    // RDW_INTERNALPAINT: a WM_PAINT is due although the update region is empty
   bool erase_pending = false;    // the background must be erased on the next BeginPaint
   bool nc_paint_pending = false;
+  uint32_t surface = 0;                 // redirected top-level: its window surface (gdi), which the kernel's desktop composites
   bool redraw_disabled = false;  // WM_SETREDRAW(FALSE)
   bool destroying = false;
   List<Prop> props;
@@ -499,6 +500,21 @@ void invalidate_window(Window* w, const Rect* client_rect_or_null, bool erase);
 void validate_window(Window* w, const Rect* client_rect_or_null);
 void release_window_dcs(uint32_t hwnd);
 void refresh_window_dcs(Window* w);
+// Redirection (set_redirection): top-levels draw on window surfaces of their own and the desktop composites them; they do not clip or repaint one another, and a
+// top-level with a caption has the frame of the desktop's windows around it (frame_border on the sides and the bottom, frame_border + frame_title at the top), which the
+// desktop draws. The settings live outside State: the desktop makes them before the window manager's state exists.
+struct RedirectConfig {
+  bool on = false;
+  int32_t frame_border = 6, frame_title = 18;
+  IWindowObserver* observer = nullptr;
+};
+RedirectConfig& redirect_config();
+// The surface of a top-level and where it lies on the screen; a top-level's surface follows its size; the observer hears of it.
+bool redirected(const Window* w);                       // a top-level that draws on a window surface
+Rect surface_rect_screen(const Window* top);           // the part of the window the surface covers (inside the desktop's frame), screen coordinates
+void sync_surface(Window* top);                        // makes / resizes the surface of a visible redirected top-level (and repoints the DCs of its tree)
+void drop_surface(Window* top);
+void notify_top_level(const Window* w);                // tells the observer that the top-level of `w` changed
 Upcall* queue_erase(Call& call, Op* op, Window* w, uint32_t* dc_out);
 void paint_region_changed(Window* w);
 
@@ -538,6 +554,11 @@ void destroy_window_now(Window* w);
 
 // SetWindowPos core, shared with ShowWindow/CreateWindow/Move.
 struct SwpArgs { Window* w = nullptr; uint32_t after = 0; int32_t x = 0, y = 0, cx = 0, cy = 0; uint32_t flags = 0; };
+constexpr uint32_t kSwpNoShow = 0xFFFF;      // swp_op_begin's show command: none (a plain SetWindowPos)
+uint64_t swp_op_begin(Call& call, const SwpArgs& args, uint32_t show_cmd, bool want_visible_result, bool defer_hdwp);
+// WM_SYSCOMMAND of the kernel's desktop: the user moved or sized the window in the desktop's frame. lParam: x, y (signed) and width, height (unsigned), 16 bits each,
+// from the low end. DefWindowProc places the window with SetWindowPos in the program's own thread (WM_WINDOWPOSCHANGING / CHANGED, WM_MOVE, WM_SIZE as usual).
+constexpr uint32_t kScTcosPlace = 0xF1F0;
 uint64_t set_window_pos_op(Call& call, const SwpArgs& args, uint64_t final_result);
 void apply_zorder(Window* w, uint32_t after);
 Rect window_maximized_rect(Window* w);                   // where a maximized window goes
@@ -583,6 +604,7 @@ void set_cursor_pos_locked(int32_t x, int32_t y);
 Window* foreground_window_ptr();
 Queue* foreground_queue();
 bool set_foreground_internal(Window* w);
+void clear_foreground_internal();      // no window is the foreground one (the desktop's own window is active)
 
 // Hooks (Win32kUserHook.cpp).
 bool has_hooks(int32_t id, uint64_t thread);

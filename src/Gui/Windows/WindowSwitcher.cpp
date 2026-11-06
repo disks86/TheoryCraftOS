@@ -67,7 +67,7 @@ void WindowSwitcher::run_close(void* self, Control&) {
 
 uint32_t WindowSwitcher::button_count() const {
   uint32_t n = 0;
-  for (uint32_t i = 0; i < manager_.window_count(); ++i) n += !manager_.window_at(i)->modal();
+  for (uint32_t i = 0; i < manager_.window_count(); ++i) n += manager_.window_at(i)->in_taskbar();
   return n;
 }
 
@@ -75,7 +75,7 @@ Frame* WindowSwitcher::frame_at(uint32_t button) const {
   uint32_t n = 0;
   for (uint32_t i = 0; i < manager_.window_count(); ++i) {
     Frame* f = manager_.window_at(i);
-    if (f->modal()) continue;
+    if (!f->in_taskbar()) continue;
     if (n++ == button) return f;
   }
   return nullptr;

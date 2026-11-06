@@ -58,7 +58,7 @@
 #include "Desktop/ProgramLauncher.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/ComputerManager.hpp"
-#include "Desktop/WindowsScreen.hpp"
+#include "Desktop/Win32Windows.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -239,9 +239,10 @@ class Desktop {
   // The to-do items, kept in /AppStore/Todo once set_file_system() has been called (before that, in memory only).
   TodoStore& todo_store() { return *todo_store_; }
   ComputerManager& computer_manager() { return computer_manager_; }
-  // The Windows programs' screen and input (the kernel's win32k, src/Process/Win32k/Win32kDesktopBridge.cpp): shown in the "Windows" window. Null: none.
-  void set_windows_session(IWindowsSession* session) { windows_screen_.set_session(session); }
-  WindowsScreen& windows_screen() { return windows_screen_; }
+  // The Windows programs' windows and input (the kernel's win32k, src/Process/Win32k/Win32kDesktopBridge.cpp): each of their windows is one of the desktop's
+  // (Win32Windows.hpp). Null: none.
+  void set_windows_session(IWindowsSession* session) { win32_windows_.set_session(session, &windows_); }
+  Win32Windows& win32_windows() { return win32_windows_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
   // Opens the computer manager, or brings it forward (restoring it if minimized); it refreshes once a second meanwhile.
@@ -355,7 +356,6 @@ class Desktop {
   static void on_copy_finished(void* self, gui::Control&);
   static void on_extra_closed(void* self, gui::Control&);
   static void on_computer_manager(void* self, gui::Control&);
-  static void on_windows_screen(void* self, gui::Control&);
   static void tap_key(void* self, const hardware::KeyEvent& event, uint8_t modifiers);
   static void tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y);
   static void on_explorer(void* self, gui::Control&);
@@ -421,7 +421,7 @@ class Desktop {
   PrintDialog print_dialog_;
   FileExplorer explorer_;
   ComputerManager computer_manager_;
-  WindowsScreen windows_screen_;
+  Win32Windows win32_windows_;
   Notepad notepad_;
   FileProperties file_properties_;
   Paint paint_;

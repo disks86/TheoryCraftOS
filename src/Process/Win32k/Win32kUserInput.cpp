@@ -119,6 +119,8 @@ void activation_changes(Queue& q, Window* new_top, bool click, Notes& notes) {
   InputState& in = *q.input_state;
   Window* old = in.active;
   if (old == new_top) return;
+  notify_top_level(old);      // (the desktop's windows follow the activation)
+  notify_top_level(new_top);
   // the window comes to the top of its level
   if (new_top && new_top->parent && !(new_top->ex_style & wn::WS_EX_TOPMOST)) apply_zorder(new_top, kHwndTop);
   else if (new_top && new_top->parent) apply_zorder(new_top, kHwndTopmost);
@@ -154,6 +156,7 @@ static void foreground_changes(Queue* new_queue, Notes& notes) {
     InputState& in = *old->input_state;
     if (in.focus) { notes.add(in.focus->handle, wn::WM_KILLFOCUS, 0, 0); in.focus = nullptr; }
     if (in.active) {
+      notify_top_level(in.active);
       notes.add(in.active->handle, wn::WM_NCACTIVATE, 0, 0);
       notes.add(in.active->handle, wn::WM_ACTIVATE, WA_INACTIVE, 0);
       in.active = nullptr;
@@ -172,6 +175,12 @@ bool set_foreground_internal(Window* w) {
   activation_changes(*q, top, false, notes);
   flush_notes(notes, nullptr);
   return true;
+}
+
+void clear_foreground_internal() {
+  Notes notes(S().alloc);
+  foreground_changes(nullptr, notes);
+  flush_notes(notes, nullptr);
 }
 
 void activate_window_internal(Call& call, Window* w, bool notify) {
@@ -959,6 +968,12 @@ void inject_mouse_move(int32_t x, int32_t y) { LockGuard g; inject_move_locked(x
 void inject_mouse_motion(int32_t dx, int32_t dy) { LockGuard g; inject_motion_locked(dx, dy); }
 void set_cursor_position(int32_t x, int32_t y) { LockGuard g; set_cursor_pos_locked(x, y); }
 bool cursor_confined() { LockGuard g; return state_or_null() && S().clip_cursor_set; }
+uint32_t mouse_capture_window() {
+  LockGuard g;
+  if (!state_or_null()) return 0;
+  const Window* w = capture_window();
+  return w ? w->handle : 0;
+}
 void inject_mouse_button(uint32_t button, bool down) { LockGuard g; inject_button_locked(button, down); }
 void inject_mouse_wheel(int32_t delta, bool horizontal) { LockGuard g; inject_wheel_locked(delta, horizontal); }
 void cursor_position(int32_t* x, int32_t* y) {

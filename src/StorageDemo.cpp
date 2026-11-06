@@ -60,6 +60,7 @@ bool check_device(uint32_t index, IStorageDevice& dev, allocators::IAllocator& a
   if (info.kind == StorageKind::Optical) console::puts(", optical");
   if (info.read_only) console::puts(", read-only");
   if (info.removable) console::puts(", removable");
+  if (info.discard) console::puts(info.discard_zeroes ? ", discard (reads zeros)" : ", discard");
   console::puts(")\n");
 
   const uint32_t bs = info.block_size;

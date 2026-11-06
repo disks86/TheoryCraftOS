@@ -308,6 +308,7 @@ Window* get_window_relative(const Window* w, uint32_t rel) {
 void window_text_set(Window* w, ArrayView<const char16_t> text) {
   w->text.clear();
   w->text.append(text);
+  if (is_top_level(w)) notify_top_level(w);      // (the desktop's window shows the title)
 }
 
 // The default desktop: a window station "WinSta0" with the desktop "Default" and its window, made on first use.
@@ -463,6 +464,7 @@ void destroy_window_now(Window* w) {
   const uint32_t handle = w->handle;
   // children have gone already (destroy_window_tree); what refers to the window now goes
   w->destroying = true;
+  if (is_top_level(w)) { drop_surface(w); notify_top_level(w); }      // (the desktop's window goes)
   focus_window_gone(w);
   kill_timers_of_window(handle);
   drop_hotkeys_of_window(handle);

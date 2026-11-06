@@ -30,6 +30,9 @@ using namespace hardware;
 struct FakeSdCard {
   // what kind of card
   bool version2 = true, high_capacity = true, supports_4bit = true, is_sd = true, csd_write_protected = false;
+  bool erase_class = true, erased_ones = false;  // CSD command class 5; SCR DATA_STAT_AFTER_ERASE
+  uint64_t erase_first = ~0ull, erase_last = ~0ull;  // CMD32 / CMD33
+  uint32_t busy_after_erase = 3, erases = 0;
   uint64_t blocks = 4096;                      // of 512 bytes
   uint32_t rca = 0x1234;
   uint32_t power_up_polls = 3;                 // ACMD41 answers busy this many times
@@ -74,6 +77,7 @@ struct FakeSdCard {
       put_bits(w, 73, 62, static_cast<uint32_t>(blocks / 512 - 1));
     }
     put_bits(w, 13, 12, csd_write_protected ? 1 : 0);
+    put_bits(w, 95, 84, erase_class ? 0x5B5 : 0x595);   // the usual classes; bit 5 is erase
   }
   uint32_t status() const {
     uint32_t s = (static_cast<uint32_t>(state == State::Transfer ? 4 : state == State::Standby ? 3 : state == State::Identification ? 2 : state == State::Ready ? 1 : 0) << 9);
@@ -135,6 +139,25 @@ struct FakeSdCard {
         c.response[0] = status();
         return true;
       case 12: streaming = false; c.response[0] = status(); return true;
+      case 32: case 33: {
+        if (!erase_class || state != State::Transfer) { c.response[0] = 1u << 22; return true; }   // ILLEGAL_COMMAND
+        uint64_t block;
+        if (!address_ok(c.argument, &block) || block >= blocks) { c.response[0] = 1u << 31; return true; }   // OUT_OF_RANGE
+        (c.index == 32 ? erase_first : erase_last) = block;
+        c.response[0] = status();
+        return true;
+      }
+      case 38:
+        if (!erase_class || state != State::Transfer || c.argument != 0 || erase_first > erase_last || erase_last >= blocks) {
+          c.response[0] = 1u << 28;   // ERASE_SEQ_ERROR
+          return true;
+        }
+        memset(data.data() + erase_first * 512, erased_ones ? 0xFF : 0x00, (erase_last - erase_first + 1) * 512);
+        erase_first = erase_last = ~0ull;
+        busy_left = busy_after_erase;
+        ++erases;
+        c.response[0] = status();
+        return true;
       default: return false;
     }
   }
@@ -177,7 +200,7 @@ struct FakeSdHost final : ISdHost {
       const bool app = card->app_next;
       card->app_next = false;
       if (!app || block_size != 8 || card->state != FakeSdCard::State::Transfer) return false;
-      uint8_t scr[8] = {0x02, static_cast<uint8_t>(card->supports_4bit ? 0x05 : 0x01), 0, 0, 0, 0, 0, 0};
+      uint8_t scr[8] = {0x02, static_cast<uint8_t>((card->supports_4bit ? 0x05 : 0x01) | (card->erased_ones ? 0x80 : 0)), 0, 0, 0, 0, 0, 0};
       for (size_t i = 0; i < 8; ++i) data[i] = scr[i];
       c.response[0] = card->status();
       return true;

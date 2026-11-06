@@ -23,6 +23,7 @@
 #include "FileSystem/Ntfs/NtfsFileSystem.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #include "Hardware/StorageDevice/Partition/PartitionScanner.hpp"
+#include "Kernel/Delay.hpp"
 #include "Kernel/Thread.hpp"
 #include "Utility/String.hpp"
 
@@ -192,12 +193,47 @@ void SystemFileSystem::stop_service() {
 
 // Hot-plug every 250 ms, and every few seconds the blocks the volumes freed go to their devices as discards (a volume with none waiting
 // does nothing): they do not wait for a flush that may not come.
+void SystemFileSystem::scheduled_trim() {
+  const uint64_t per_us = hardware::tsc_ticks_per_us();
+  const uint64_t uptime_seconds = per_us ? hardware::read_tsc() / per_us / 1000000 : 0;
+  if (uptime_seconds < TrimSchedule::kFirstDelaySeconds) return;   // (before the state is even read)
+  if (!trim_schedule_loaded_) {
+    trim_schedule_loaded_ = true;
+    UniquePointer<IFile> file;
+    if (table_.open_file(layout::kFstrimState, OpenMode::Read, &file) == Status::Ok && file) {
+      char text[64];
+      uint64_t got = 0;
+      if (file->read(0, ByteView(reinterpret_cast<uint8_t*>(text), sizeof text), &got) == Status::Ok) trim_schedule_.load(StringView(text, got));
+    }
+  }
+  const uint64_t now = unix_time_now();
+  if (!trim_schedule_.due(now, uptime_seconds)) return;
+  uint64_t bytes = 0;
+  const Status status = table_.trim_all(&bytes);
+  trim_schedule_.done(now);
+  String state(allocator_);
+  UniquePointer<IFile> file;
+  table_.create_directory(layout::kFstrimFolder);   // (AlreadyExists after the first time)
+  uint64_t written = 0;
+  if (trim_schedule_.save(&state) && table_.open_file(layout::kFstrimState, OpenMode::CreateTruncate, &file) == Status::Ok && file) {
+    file->write(0, ConstByteView(reinterpret_cast<const uint8_t*>(state.view().data()), state.size()), &written);
+    file->flush();
+  }
+  if (status == Status::Ok) {
+    String text(allocator_);
+    if (text.assign("Trimmed the free space of the volumes: ") && text.append_uint(bytes >> 20) && text.append(" MiB")) notify(text.view());
+  }
+}
+
 void SystemFileSystem::service_main(void* self) {
   SystemFileSystem* files = static_cast<SystemFileSystem*>(self);
   constexpr uint32_t kDiscardEvery = 20;   // rounds: 5 s
   for (uint32_t round = 1; !__atomic_load_n(&files->stop_, __ATOMIC_ACQUIRE); ++round) {
     files->poll();
-    if (round % kDiscardEvery == 0) files->table_.send_discards();
+    if (round % kDiscardEvery == 0) {
+      files->table_.send_discards();
+      files->scheduled_trim();
+    }
     kernel::sleep_us(250000);
   }
 }

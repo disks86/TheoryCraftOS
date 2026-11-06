@@ -204,6 +204,34 @@ every volume. It is the shell command `fstrim [folder]`.
 - **Tests.** The host tests trim after the workload, with every live file read back through the poison disk. In the boot self-test, the
   scratch FAT32 volume's 62 MiB of free space is trimmed.
 
+**Scheduled fstrim.** `SystemFileSystem`'s service trims every volume (`MountTable::trim_all`) ten minutes after start-up, then once a
+week by the wall clock, as Linux's `fstrim.timer` does.
+
+- **Remembering.** The last run is kept in `/AppStore/FileSystem/fstrim.state` (`layout::kFstrimState`), so a machine started every day
+  still trims about weekly.
+- **No clock.** Without a working clock (unix time 0, or a clock that went backwards) it trims once per start.
+- **Policy.** It lives in `FileSystem/TrimSchedule` (`TrimScheduleTest`). The run is announced on the storage notifier ("Storage: Trimmed
+  the free space of the volumes: N MiB").
+
+**Discard on every SCSI transport.** `scsi::probe_unmap` and `scsi::unmap_range` (`ScsiCommands.hpp`) work over any transport's
+`run(cdb, data, data_in)`, and virtio-scsi, pvscsi and USB mass storage use them. A USB SSD that is thin provisioned gets discard; a
+stick that refuses the commands is left as it was.
+
+**SD erase.** A card whose CSD lists command class 5 gets `discard()` as an SD erase (CMD32 and CMD33 for the range, then CMD38), 8192
+blocks at a time, waiting while the card is busy. The SCR's DATA_STAT_AFTER_ERASE says whether erased blocks read as zeros or ones. It is
+tested against the fake card in `SdCardTest`: high and standard capacity, chunking, range checks and write protection.
+
+**What discarded blocks read back as.** `StorageInfo::discard_zeroes` comes from:
+
+- NVMe: DLFEAT = 001b.
+- ATA: IDENTIFY word 69, bits 14 and 5 (deterministic read after TRIM, and it reads zeros).
+- SCSI: READ CAPACITY(16) LBPRZ.
+- SD: the erased state.
+
+It appears in the storage demo and the properties. It is for information only: NVMe deallocate and ATA TRIM are advisory (a device may
+leave part of a range as it was), so nothing uses a discard to zero data. Zeroing would need Write Zeroes or WRITE SAME. In QEMU only the
+NVMe disk claims zeros.
+
 **virtio-scsi discard.**
 
 - **Detection.** UNMAP, when READ CAPACITY(16) reports a thin-provisioned unit (LBPME) and the Logical Block Provisioning VPD page says
@@ -239,13 +267,13 @@ The configurations: KVM with 4, 8 and 1 cores (8 with `num-queues=3` for virtio-
   - A big request takes extra slots only if they are free, so on a busy device it runs mostly in series. The I/O scheduler still counts it
     as one request.
 - **Discard gaps.**
-  - Nothing runs `fstrim` on a schedule.
-  - pvscsi, USB and SD have no discard (UAS and SD ERASE would be needed).
-  - NVMe and AHCI don't report what a discarded block reads back as (DLFEAT / RZAT).
+  - There is no Write Zeroes or WRITE SAME, so file systems still write zeros where they need them.
+  - SD uses ERASE, not the faster DISCARD (CMD38 argument 1, SD 3.0).
+  - UAS (USB Attached SCSI) is not supported, so USB disks stay one command at a time.
 - **Driver features still missing.**
   - NVMe: no interrupt coalescing (left off on purpose, for latency), only the first namespace.
   - AHCI: no port multipliers.
-  - virtio-scsi: still only the first LUN of each target, and one UNMAP descriptor a command.
+  - virtio-scsi, pvscsi and USB: only the first LUN of each target, and one UNMAP descriptor a command.
   - None of it has been tried on real hardware.
 - **Some callers don't pass priorities yet**. Windows `FileIoPriorityHintInformation` and process I/O priority are still ignored, and
   Linux `ioprio_set` is not wired to `set_thread_io_priority`. User processes do not yet put their threads into one `io_group`.

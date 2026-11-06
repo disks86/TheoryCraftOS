@@ -35,12 +35,20 @@ struct Slot {
 constexpr uint32_t kMaxHandles = 0x10000;
 constexpr ColorRef kDesktopColor = make_rgb(58, 110, 165);
 
+// The backing store of a top-level window the desktop composites (not in the handle table: a program cannot select it).
+struct WindowSurface {
+  uint32_t id = 0, window = 0;
+  UniquePointer<Bitmap> bitmap;
+};
+
 struct State {
-  explicit State(allocators::IAllocator& a) : allocator(a), slots(a), free_list(a) {}
+  explicit State(allocators::IAllocator& a) : allocator(a), slots(a), free_list(a), surfaces(a) {}
   allocators::IAllocator& allocator;
   List<Slot> slots;
   List<uint32_t> free_list;
   UniquePointer<Bitmap> screen;
+  List<WindowSurface> surfaces;
+  uint32_t next_surface = 1;
   uint32_t stock[21] = {};
   uint32_t screen_w = 1024, screen_h = 768;
   const DibMemory* dib_memory = nullptr;
@@ -408,19 +416,128 @@ ConstByteView screen_pixels() {
 
 void set_screen_sink(IScreenSink* sink) { g_screen_sink = sink; }
 
-uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip) {
+// ---- Window surfaces
+
+namespace {
+IWindowSurfaceSink* g_window_sink = nullptr;
+
+WindowSurface* find_surface(uint32_t id) {
+  State* st = state();
+  if (!st || id == 0) return nullptr;
+  for (WindowSurface& s : st->surfaces.view()) if (s.id == id) return &s;
+  return nullptr;
+}
+
+// A surface of width x height pixels, cleared to the desktop colour (the window paints it when told to).
+bool make_surface_bitmap(State& st, WindowSurface& s, uint32_t width, uint32_t height) {
+  if (width == 0 || height == 0 || width > 16384 || height > 16384) return false;
+  UniquePointer<Bitmap> b = UniquePointer<Bitmap>::make(st.allocator, st.allocator);
+  if (!b) return false;
+  b->width = int32_t(width);
+  b->height = int32_t(height);
+  b->bpp = 32;
+  b->stride = width * 4;
+  b->window_surface = s.window;
+  if (!b->data.put_zeros(uint64_t{b->stride} * height)) return false;
+  Surface v = surface_of(*b);
+  for (int32_t y = 0; y < b->height; ++y) for (int32_t x = 0; x < b->width; ++x) v.put(x, y, kDesktopColor);
+  s.bitmap = util::move(b);
+  return true;
+}
+}  // namespace
+
+uint32_t create_window_surface(uint32_t window, uint32_t width, uint32_t height) {
+  State* st = state();
+  if (!st) return 0;
+  WindowSurface s;
+  s.id = st->next_surface++;
+  s.window = window;
+  if (!make_surface_bitmap(*st, s, width, height)) return 0;
+  const uint32_t id = s.id;
+  if (!st->surfaces.push_back(util::move(s))) return 0;
+  return id;
+}
+
+bool resize_window_surface(uint32_t id, uint32_t width, uint32_t height) {
+  WindowSurface* s = find_surface(id);
+  if (!s) return false;
+  if (s->bitmap && uint32_t(s->bitmap->width) == width && uint32_t(s->bitmap->height) == height) return true;
+  return make_surface_bitmap(*state(), *s, width, height);
+}
+
+void destroy_window_surface(uint32_t id) {
+  State* st = state();
+  if (!st || id == 0) return;
+  for (uint64_t i = 0; i < st->surfaces.count(); ++i) {
+    if (st->surfaces[i].id != id) continue;
+    // DCs still aimed at it draw nowhere from now on (the window manager releases them with the window)
+    for (Slot& slot : st->slots.view()) if (slot.obj && slot.obj->type == kObjDc) { Dc* d = static_cast<Dc*>(slot.obj.get()); if (d->surface == id) d->surface_clip.clear(); }
+    st->surfaces.remove_at(i);
+    return;
+  }
+}
+
+bool window_surface_size(uint32_t id, uint32_t* width, uint32_t* height) {
+  WindowSurface* s = find_surface(id);
+  if (!s || !s->bitmap) return false;
+  *width = uint32_t(s->bitmap->width);
+  *height = uint32_t(s->bitmap->height);
+  return true;
+}
+
+// The pixels as 32-bit words (B, G, R, X bytes = 0xXXRRGGBB on this little-endian machine): the desktop draws them as they are. The surface's storage comes from the
+// allocator, which hands out blocks aligned for any type; a misaligned block (never expected) gives an empty view rather than stopping in cast().
+ArrayView<uint32_t> window_surface_pixels(uint32_t id, uint32_t* width, uint32_t* height) {
+  WindowSurface* s = find_surface(id);
+  if (!s || !s->bitmap) return ArrayView<uint32_t>();
+  ByteView bytes = s->bitmap->data.writable_view();
+  if ((reinterpret_cast<uintptr_t>(bytes.data()) & 3) != 0 || (bytes.size() & 3) != 0) return ArrayView<uint32_t>();
+  *width = uint32_t(s->bitmap->width);
+  *height = uint32_t(s->bitmap->height);
+  return bytes.cast<uint32_t>();
+}
+
+Bitmap* window_surface_bitmap(uint32_t id) {
+  WindowSurface* s = find_surface(id);
+  return s ? s->bitmap.get() : nullptr;
+}
+
+void set_window_surface_sink(IWindowSurfaceSink* sink) { g_window_sink = sink; }
+
+ByteView window_surface_bytes(uint32_t id, uint32_t* width, uint32_t* height) {
+  WindowSurface* s = find_surface(id);
+  if (!s || !s->bitmap) return ByteView();
+  *width = uint32_t(s->bitmap->width);
+  *height = uint32_t(s->bitmap->height);
+  return s->bitmap->data.writable_view();
+}
+
+void window_surface_damaged(uint32_t id, const Rect& dirty) {
+  const WindowSurface* s = find_surface(id);
+  if (s && s->bitmap) window_surface_changed(*s->bitmap, dirty);
+}
+
+void window_surface_changed(const Bitmap& b, const Rect& dirty) {
+  if (!g_window_sink || b.window_surface == 0) return;
+  const Rect r = rect_and(dirty, Rect{0, 0, b.width, b.height});
+  if (!rect_empty(r)) g_window_sink->surface_changed(b.window_surface, r);
+}
+
+uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface) {
   Dc* dc = new_dc(pid);
   if (!dc) return 0;
   dc->screen = true;
+  dc->surface = surface;
   dc->origin_x = origin_x;
   dc->origin_y = origin_y;
   for (const Rect& r : clip) if (!rect_empty(r)) dc->surface_clip.push_back(r);
   return dc->handle;
 }
 
-bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip) {
+bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface) {
   Dc* d = find_dc(dc);
   if (!d || !d->screen) return false;
+  d->surface = surface;
   d->origin_x = origin_x;
   d->origin_y = origin_y;
   d->surface_clip.clear();

@@ -111,6 +111,9 @@ void ScheduledStorageDevice::describe(IPropertySink& sink) const {
   sink.add_number("Peak in flight", s.peak_in_flight);
   sink.add_number("Read slots", s.depth.limit[0]);
   sink.add_number("Write slots", s.depth.limit[1]);
+  const StorageInfo info = inner_->info();
+  sink.add_flag("Discard", info.discard);
+  if (info.discard) sink.add_flag("Discarded blocks read as zeros", info.discard_zeroes);
 }
 
 bool ScheduledStorageDevice::read(uint64_t lba, ByteView buffer) {

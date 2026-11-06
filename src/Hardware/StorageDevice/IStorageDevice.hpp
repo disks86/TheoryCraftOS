@@ -43,6 +43,9 @@ struct StorageInfo {
   StorageMedia media = StorageMedia::Unknown;
   uint32_t queue_depth = 1;  // requests the driver takes at once (it serializes the rest itself)
   bool discard = false;      // discard() works: the medium can be told blocks are unused (TRIM, deallocate)
+  // Discarded blocks read back as zeros, the device says (NVMe DLFEAT, ATA RZAT, SCSI LBPRZ, SD's erased state). For information only: a
+  // discard is advisory (a device may leave part of a range as it was), so nothing relies on it to zero data.
+  bool discard_zeroes = false;
   char model[41] = {};   // NUL-terminated, trailing blanks trimmed
   char serial[21] = {};  // empty when the device reports none
 };

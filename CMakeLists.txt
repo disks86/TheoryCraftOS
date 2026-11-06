@@ -247,6 +247,7 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/ScheduledStorageDevice.cpp
   src/Hardware/StorageDevice/QueuedStorage.cpp
   src/FileSystem/DiscardBatch.cpp
+  src/FileSystem/TrimSchedule.cpp
   src/IoScheduler/IoCost.cpp
   src/IoScheduler/FairQueue.cpp
   src/IoScheduler/LatencyController.cpp
@@ -561,7 +562,7 @@ add_executable(BOOTX64
   src/Desktop/WebNotifications.cpp
   src/Desktop/WebAudio.cpp
   src/Desktop/PictureInPicture.cpp
-  src/Desktop/WindowsScreen.cpp
+  src/Desktop/Win32Windows.cpp
   src/Desktop/BrowserStore.cpp
   src/Desktop/SessionStore.cpp
   src/Desktop/DesktopSession.cpp

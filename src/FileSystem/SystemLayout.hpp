@@ -69,6 +69,10 @@ inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";
 // The Bluetooth bonds: the keys of the devices this machine has paired with, one file (the "Bluetooth" application's folder in the AppStore).
 inline constexpr const char* kBluetoothBonds = "/AppStore/Bluetooth/bonds.bin";
 
+// When the volumes were last trimmed by the schedule (FileSystem/TrimSchedule; the "FileSystem" application's folder in the AppStore).
+inline constexpr const char* kFstrimFolder = "/AppStore/FileSystem";
+inline constexpr const char* kFstrimState = "/AppStore/FileSystem/fstrim.state";
+
 // The name the EFI system partition is mounted under (the folder "/EFI").
 inline constexpr const char* kEfiMountName = "EFI";
 

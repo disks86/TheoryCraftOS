@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/StorageDevice/Scsi/ScsiCommands.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
@@ -76,6 +77,7 @@ class PvscsiDevice final : public StorageDeviceBase {
   const char* name() const override { return optical_ ? "PVSCSI optical drive" : "PVSCSI disk"; }
   bool initialize() override;
   void shutdown() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
 
  protected:
   bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
@@ -87,6 +89,7 @@ class PvscsiDevice final : public StorageDeviceBase {
   SharedPointer<PvscsiController> controller_;
   uint32_t target_;
   bool optical_ = false;
+  scsi::UnmapSupport unmap_;   // UNMAP when the unit is thin provisioned and says it takes it
 };
 
 }  // namespace hardware

@@ -369,47 +369,27 @@ bool VirtioScsiDevice::initialize() {
   info_.block_count = last + 1;
   if (info_.block_size < 512 || info_.block_size > 4096) return false;
   info_.queue_depth = controller_->depth();
-  if (!optical_) find_unmap();
+  if (!optical_) {
+    uint8_t scratch[64];
+    unmap_ = scsi::probe_unmap([this](ConstByteView cdb, ByteView data, bool in) { return run(cdb, data, in); }, ByteView(scratch));
+    info_.discard = unmap_.unmap && !info_.read_only;
+    info_.discard_zeroes = info_.discard && unmap_.reads_zeros;
+  }
   return true;
 }
 
-// READ CAPACITY(16) LBPME (thin provisioned), then the Logical Block Provisioning page's LBPU (UNMAP works) and the Block Limits page's
-// largest UNMAP (0 there: UNMAP is not supported after all; no Block Limits page: no limit said, so a conservative one).
-void VirtioScsiDevice::find_unmap() {
-  const uint8_t capacity16[16] = {scsi::kServiceActionIn16, scsi::kReadCapacity16Action, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0};
-  uint8_t data[64] = {};
-  if (!run(ConstByteView(capacity16), ByteView(data).first(32), true) || !scsi::capacity16_thin_provisioned(ConstByteView(data).first(32))) return;
-  uint8_t cdb[6];
-  scsi::build_vpd_inquiry(ByteView(cdb), scsi::kVpdLogicalBlockProvisioning, sizeof data);
-  ByteView(data).fill(0);
-  if (!run(ConstByteView(cdb), ByteView(data), true) || !scsi::parse_lbp_vpd_unmap(ConstByteView(data))) return;
-  uint32_t max_blocks = 0x400000, descriptors = 1;   // (2 GiB of 512-byte blocks when the unit says nothing)
-  scsi::build_vpd_inquiry(ByteView(cdb), scsi::kVpdBlockLimits, sizeof data);
-  ByteView(data).fill(0);
-  if (run(ConstByteView(cdb), ByteView(data), true) && scsi::parse_block_limits(ConstByteView(data), &max_blocks, &descriptors) && (max_blocks == 0 || descriptors == 0))
-    return;
-  unmap_max_blocks_ = max_blocks;
-  info_.discard = !info_.read_only;
-}
-
-// UNMAP, one block descriptor a command, at most unmap_max_blocks_ each.
+// UNMAP, through the SCSI helpers (scsi::unmap_range).
 bool VirtioScsiDevice::discard(uint64_t lba, uint64_t blocks) {
   if (!info_.discard || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
-  const uint64_t requested = blocks;
-  bool ok = true;
-  while (blocks > 0 && ok) {
-    const uint32_t n = blocks < unmap_max_blocks_ ? static_cast<uint32_t>(blocks) : unmap_max_blocks_;
-    uint8_t cdb[10], parameters[scsi::kUnmapParameterBytes];
-    ok = scsi::build_unmap(ByteView(cdb), ByteView(parameters), lba, n) && run(ConstByteView(cdb), ByteView(parameters), false);
-    lba += n;
-    blocks -= n;
-  }
+  uint8_t parameters[scsi::kUnmapParameterBytes];
+  const bool ok = scsi::unmap_range([this](ConstByteView cdb, ByteView data, bool in) { return run(cdb, data, in); }, unmap_, ByteView(parameters),
+                                    lba, blocks);
   if (ok) {
     __atomic_fetch_add(&stats_.discards, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&stats_.blocks_discarded, requested, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_.blocks_discarded, blocks, __ATOMIC_RELAXED);
   } else {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
   }

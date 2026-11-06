@@ -40,8 +40,8 @@ uint32_t g_width = 1024, g_height = 768;
 TCOS_WEAK uint32_t screen_width() { return g_width; }
 TCOS_WEAK uint32_t screen_height() { return g_height; }
 
-TCOS_WEAK uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip) {
-  (void)pid; (void)origin_x; (void)origin_y; (void)clip;
+TCOS_WEAK uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface) {
+  (void)pid; (void)origin_x; (void)origin_y; (void)clip; (void)surface;
   for (FallbackDc& d : g_dcs) {
     if (d.used) continue;
     d.used = true;
@@ -50,10 +50,17 @@ TCOS_WEAK uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t orig
   }
   return 0;
 }
-TCOS_WEAK bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip) {
-  (void)origin_x; (void)origin_y; (void)clip;
+TCOS_WEAK bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface) {
+  (void)origin_x; (void)origin_y; (void)clip; (void)surface;
   return is_dc(dc);
 }
+// (no window surfaces without GDI: a redirected window draws nowhere)
+TCOS_WEAK uint32_t create_window_surface(uint32_t window, uint32_t width, uint32_t height) { (void)window; (void)width; (void)height; return 0; }
+TCOS_WEAK bool resize_window_surface(uint32_t surface, uint32_t width, uint32_t height) { (void)surface; (void)width; (void)height; return false; }
+TCOS_WEAK void destroy_window_surface(uint32_t surface) { (void)surface; }
+TCOS_WEAK bool window_surface_size(uint32_t surface, uint32_t* width, uint32_t* height) { (void)surface; (void)width; (void)height; return false; }
+TCOS_WEAK ByteView window_surface_bytes(uint32_t surface, uint32_t* width, uint32_t* height) { (void)surface; (void)width; (void)height; return ByteView(); }
+TCOS_WEAK void window_surface_damaged(uint32_t surface, const Rect& dirty) { (void)surface; (void)dirty; }
 TCOS_WEAK bool is_dc(uint32_t handle) {
   for (const FallbackDc& d : g_dcs) if (d.used && d.handle == handle) return true;
   return false;

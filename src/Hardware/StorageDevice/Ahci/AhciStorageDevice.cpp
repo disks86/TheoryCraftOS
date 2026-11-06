@@ -288,6 +288,7 @@ bool AhciStorageDevice::identify_ata() {
   info_.removable = id[0] & (1u << 7);
   info_.media = media_from_ata_rotation(id[217]);
   info_.discard = lba48_ && (id[169] & 1u);   // DATA SET MANAGEMENT with TRIM
+  info_.discard_zeroes = info_.discard && (id[69] & (1u << 14)) && (id[69] & (1u << 5));   // deterministic read after TRIM, and it reads zeros (RZAT)
   general_purpose_logging_ = (id[84] & 0xC020) == 0x4020 || (id[87] & 0xC020) == 0x4020;   // (bits 15:14 = 01: the word is valid; bit 5 GPL)
   return info_.block_count > 0;
 }
