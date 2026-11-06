@@ -184,7 +184,9 @@ struct FakeEncoder {
   std::vector<uint32_t> sizes;
   std::vector<uint8_t> last_luma, last_chroma;    // the source surface as the engine read it (visible part)
   uint32_t last_width = 0, last_height = 0;
-  uint32_t previous_recon = 0, previous_ds4 = 0, previous_ds8 = 0, previous_mv = 0;
+  uint32_t previous_recon = 0, previous_ds4 = 0, previous_ds8 = 0, previous_mv = 0;   // the latest anchor
+  uint32_t older_recon = 0, older_ds4 = 0, older_ds8 = 0, older_mv = 0;                // the anchor before it
+  int b_pictures = 0;
   void problem(const char* what) { printf("    encoder model: %s\n", what); ++problems; }
 
   void run(FakeGpu& gpu, const std::vector<uint32_t>& d) {
@@ -245,9 +247,9 @@ struct FakeEncoder {
     if (!vmode || !vsrc || !vref || !vds || !vbuf || !cmd1 || !pic || !cmd2) return;
     if (xe_lpg) {
       // The driver's open code leaves the TLB prefetch bit alone and keeps the default prefetch geometry; the image has HEVC, 8-bit 4:2:0, low delay and the "Par0" bit set.
-      if (field(vmode[1], 0, 3) != 0 || field(vmode[1], 12, 14) != 0 || field(vmode[1], 15, 16) != 1 || field(vmode[1], 18, 18) != 0 || field(vmode[5], 17, 17) != 1)
+      if (field(vmode[1], 0, 3) != 0 || field(vmode[1], 12, 14) != 0 || field(vmode[1], 15, 16) != 1 || field(vmode[5], 17, 17) != 1)
         problem("VDEnc mode (Xe-LPG): HEVC, 8-bit 4:2:0, low delay");
-    } else if (field(vmode[1], 0, 3) != 0 || field(vmode[1], 7, 7) != 1 || field(vmode[1], 12, 14) != 0 || field(vmode[1], 15, 16) != 1 || field(vmode[1], 18, 18) != 0 ||
+    } else if (field(vmode[1], 0, 3) != 0 || field(vmode[1], 7, 7) != 1 || field(vmode[1], 12, 14) != 0 || field(vmode[1], 15, 16) != 1 ||
                field(vmode[3], 24, 27) != 4 || field(vmode[3], 16, 19) != 1)
       problem("VDEnc mode: HEVC, TLB prefetch, 8-bit 4:2:0, low delay");
     // The VDEnc surfaces: Y-major tiled, NV12 (4) in the five format bits from bit 27, and the Xe-LPG driver's chroma downsample filter on the source.
@@ -264,25 +266,41 @@ struct FakeEncoder {
     if (field(pic[4], 5, 5) != 1 || field(pic[4], 3, 3) != 0 || field(pic[4], 4, 4) != 0 || field(pic[4], 23, 23) != 0 || field(pic[4], 17, 17) != 0 || field(pic[4], 22, 22) != 0)
       problem("coding tools: cu_qp_delta on; SAO, PCM, AMP, tiles, transform skip off");
     if (field(pic[19], 16, 16) != 1 || field(pic[19], 25, 25) != 0 || field(pic[19], 31, 31) != 1) problem("HCP picture flags");
-    const bool b_picture = field(cmd2[2], 20, 21) == 3;
-    if (!b_picture && field(cmd2[2], 20, 21) != 0) problem("VDEnc picture type");
+    // Picture types: 0 I, 3 low-delay B (an anchor), 2 random-access B (between two anchors). The random access bit of the VDEnc mode is the last.
+    const uint32_t ptype = field(cmd2[2], 20, 21);
+    const bool rab = ptype == 2;
+    const bool b_picture = ptype == 3 || rab;   // (an inter picture)
+    if (ptype == 1) problem("VDEnc picture type");
+    if (field(vmode[1], 18, 18) != (rab ? 1u : 0u)) problem("VDEnc random access = B picture");
     const uint32_t qp = field(cmd2[27], 8, 15);
     if (qp < 10 || qp > 51 || field(cmd2[16], 0, 7) != 10 || field(cmd2[16], 8, 15) != 51) problem("VDEnc quantiser");
 
     // --- Slice level.
+    uint32_t ref_store = 0, back_store = 0;
     if (b_picture) {
       const uint32_t* l0 = expect(kHHcpRefIdx, 18, "HCP_REF_IDX_STATE list 0");
       const uint32_t* l1 = expect(kHHcpRefIdx, 18, "HCP_REF_IDX_STATE list 1");
       if (l0 && l1) {
         if (field(l0[1], 0, 0) != 0 || field(l1[1], 0, 0) != 1 || field(l0[1], 1, 4) != 0 || field(l1[1], 1, 4) != 0) problem("reference list numbers");
-        if (field(l0[2], 8, 10) != 0 || field(l0[2], 0, 7) != 1 || l0[2] != l1[2]) problem("reference list entries");
-        if (field(cmd2[3], 0, 7) != 1 || field(cmd2[3], 8, 15) != 1) problem("reference POC distances");
+        if (!rab) {
+          // (An anchor of a stream with B pictures is usually two pictures after the previous one.)
+          const uint32_t dist = field(l0[2], 0, 7);
+          if (dist < 1 || dist > 2 || l0[2] != l1[2] || (!xe_lpg && field(l0[2], 8, 10) != 0)) problem("reference list entries");
+          if (field(cmd2[3], 0, 7) != dist || field(cmd2[3], 8, 15) != dist) problem("reference POC distances");
+        } else {
+          // The earlier anchor is one picture back, the later one a picture ahead (a distance of minus one); they sit in different frame stores.
+          if (field(l0[2], 0, 7) != 1 || field(l1[2], 0, 7) != 0xFF || field(l0[2], 8, 10) == field(l1[2], 8, 10)) problem("random-access reference list entries");
+          if (field(cmd2[3], 0, 7) != 1 || field(cmd2[3], 8, 15) != 0xFF) problem("random-access reference POC distances");
+          if (field(cmd2[11], 0, 2) != field(l0[2], 8, 10) || field(cmd2[11], 24, 26) != field(l1[2], 8, 10)) problem("frame stores of the references in CMD2");
+        }
+        ref_store = field(l0[2], 8, 10);
+        back_store = rab ? field(l1[2], 8, 10) : ref_store;
       }
     }
     const uint32_t* slice = expect(kHHcpSliceState, 13, "HCP_SLICE_STATE");
     if (!slice) return;
     if (field(slice[3], 0, 1) != (b_picture ? 0u : 2u) || field(slice[3], 6, 11) != qp || field(slice[3], 2, 2) != 1 || field(slice[1], 0, 25) != 0 || field(slice[2], 0, 26) != 0) problem("slice state");
-    if (field(slice[4], 0, 0) != 0 || field(slice[4], 14, 14) != 1 || field(slice[7], 2, 2) != 1 || field(slice[7], 9, 10) != 3 || field(slice[7], 1, 1) != 0 || field(slice[7], 8, 8) != 0)
+    if (field(slice[4], 0, 0) != 0 || field(slice[4], 14, 14) != (rab ? 0u : 1u) || field(slice[7], 2, 2) != 1 || field(slice[7], 9, 10) != 3 || field(slice[7], 1, 1) != 0 || field(slice[7], 8, 8) != 0)
       problem("slice flags");
 
     struct Insert { std::vector<uint8_t> bytes; uint32_t bits; bool emulation; uint32_t skip; bool last; };
@@ -378,18 +396,29 @@ struct FakeEncoder {
     if (ind[12] <= bitstream || ind[12] - bitstream < 4096) problem("bitstream upper bound");
     mapped(status_address, 4, "status");
     if (b_picture) {
-      mapped(buf[37], layout.full.size, "reference");
-      mapped(buf[66], plan.mv_temporal_bytes, "reference motion vector buffer");
-      if (buf[37] != vbuf[22] || buf[37] == recon || buf[37] != previous_recon) problem("reference picture address");
-      if (vbuf[1] != previous_ds8 || vbuf[37] != previous_ds4 || buf[66] != previous_mv) problem("reference buffers are the previous picture's");
+      // The list 0 picture is the latest anchor, or for a random-access B picture the one before it; list 1 of a B picture is the latest anchor.
+      const uint32_t fwd_recon = rab ? older_recon : previous_recon, fwd_ds4 = rab ? older_ds4 : previous_ds4, fwd_ds8 = rab ? older_ds8 : previous_ds8, fwd_mv = rab ? older_mv : previous_mv;
+      mapped(buf[37 + 2 * ref_store], layout.full.size, "reference");
+      mapped(buf[66 + 2 * ref_store], plan.mv_temporal_bytes, "reference motion vector buffer");
+      if (buf[37 + 2 * ref_store] != vbuf[22] || buf[37 + 2 * ref_store] == recon || buf[37 + 2 * ref_store] != fwd_recon) problem("reference picture address");
+      if (vbuf[1] != fwd_ds8 || vbuf[37] != fwd_ds4 || buf[66 + 2 * ref_store] != fwd_mv) problem("reference buffers are the earlier anchor's");
       mapped(vbuf[1], layout.ds8.size, "8x downscaled reference");
       mapped(vbuf[37], layout.ds4.size, "4x downscaled reference");
+      if (xe_lpg && (rab || vbuf[31] != 0)) {
+        // The backward reference: the later anchor for a B picture, else (the hardware's request) the forward reference again.
+        const uint32_t bwd_recon = rab ? previous_recon : fwd_recon, bwd_ds4 = rab ? previous_ds4 : fwd_ds4, bwd_ds8 = rab ? previous_ds8 : fwd_ds8, bwd_mv = rab ? previous_mv : fwd_mv;
+        if (vbuf[31] != bwd_recon || vbuf[43] != bwd_ds4 || vbuf[7] != bwd_ds8 || buf[37 + 2 * back_store] != bwd_recon || buf[66 + 2 * back_store] != bwd_mv) problem("backward reference buffers");
+        if (rab && (vbuf[31] == vbuf[22] || vbuf[31] == recon)) problem("the two references and the picture are three pictures");
+      }
     }
     if (problems) return;
-    previous_recon = recon;
-    previous_ds8 = vbuf[49];
-    previous_ds4 = vbuf[52];
-    previous_mv = buf[31];
+    if (!rab) {   // (a B picture is nobody's reference)
+      older_recon = previous_recon; older_ds4 = previous_ds4; older_ds8 = previous_ds8; older_mv = previous_mv;
+      previous_recon = recon;
+      previous_ds8 = vbuf[49];
+      previous_ds4 = vbuf[52];
+      previous_mv = buf[31];
+    }
 
     // The source surface as the engine reads it.
     last_width = 0;
@@ -438,6 +467,7 @@ struct FakeEncoder {
     for (int k = 0; k < 4; ++k) st[k] = static_cast<uint8_t>(n >> (8 * k));
     ++pictures;
     if (!b_picture) ++keyframes;
+    if (rab) ++b_pictures;
     sizes.push_back(n);
   }
 };
@@ -563,6 +593,114 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
     VideoPacket in;
     in.data = ConstByteView(packets[k].data(), packets[k].size());
     in.pts_us = int64_t(k) * 1000;
+    CHECK(dec->submit(in) == SubmitResult::Accepted);
+    VideoFrame out;
+    while (dec->receive(&out)) check_frame(out);
+  }
+  dec->flush();
+  VideoFrame out;
+  while (dec->receive(&out)) check_frame(out);
+  CHECK(shown == count);
+}
+
+// Streams with B pictures (EncoderConfig::b_frames = 1): I B P B P in output order, coded I P B P B, one packet per submitted picture in decoding order (the B packets with the
+// earlier times) once flush() has been called; the CPU decodes the stream and shows the pictures (flat grey, which is all the engine model codes) in output order.
+void encode_and_check_ra(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, bool arc, int xe2) {
+  printf("  %ux%u, %u pictures with B pictures, keyframe interval %u%s\n", w, h, count, interval, arc ? " (Arc)" : xe2 == 2 ? " (Battlemage)" : xe2 == 1 ? " (Lunar Lake)" : " (Xe-LPG)");
+  Rig2 rig;
+  rig.engine.xe_lpg = true;
+  rig.engine.xe2 = xe2;
+  rig.gpu.xehp = true;
+  rig.engine.write_stream = (w % 64 == 0 && h % 64 == 0);
+  EncoderConfig cfg;
+  cfg.codec = VideoCodec::Hevc;
+  cfg.width = w;
+  cfg.height = h;
+  cfg.input = PixelFormat::I420;
+  cfg.keyframe_interval = interval;
+  cfg.quality = 70;
+  cfg.b_frames = 1;
+  std::vector<std::vector<uint8_t>> packets;
+  std::vector<int64_t> times;
+  std::vector<bool> keys;
+  VideoFrameBuffer frame_buffer(a);
+  auto drain = [&](IntelHevcVdencEncoder& enc) {
+    VideoPacket p;
+    while (enc.receive(&p)) {
+      keys.push_back(p.keyframe);
+      times.push_back(p.pts_us);
+      packets.emplace_back();
+      for (uint64_t b = 0; b < p.data.size(); ++b) packets.back().push_back(p.data[b]);
+    }
+  };
+  {
+    VcsDriver driver(rig.mem);
+    VcsDriver::Config driver_config = rig.config();
+    driver_config.xe_lpg = !arc && xe2 == 0;
+    driver_config.xe_hpg = arc;
+    driver_config.gmd_id_flush = !arc && xe2 == 0;
+    driver_config.xe2 = xe2 != 0;
+    driver_config.xe2_hpm = xe2 == 2;
+    CHECK(driver.initialize(driver_config));
+    {
+      IntelHevcVdencEncoder enc(a, driver, cfg);
+      CHECK(enc.prepare());
+      for (uint32_t k = 0; k < count; ++k) {
+        make_i420(frame_buffer, w, h, k);
+        CHECK(enc.submit(frame_buffer.frame(int64_t(k) * 1000, false)) == SubmitResult::Accepted);
+        drain(enc);
+      }
+      enc.flush();
+      drain(enc);
+      CHECK(enc.statistics().frames == count && enc.statistics().packets == count && enc.statistics().errors == 0);
+    }
+    CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
+  }
+  CHECK(rig.mem.live() == 1);
+  CHECK(packets.size() == count && rig.engine.pictures == int(count));
+  if (packets.size() != count) return;
+
+  // The pictures that became B pictures, by the encoder's rule (see the H.264 test).
+  uint32_t expected_b = 0, pos = 0;
+  bool held = false;
+  for (uint32_t k = 1; k < count; ++k) {
+    if (pos + 1 >= interval) { held = false; pos = 0; continue; }
+    ++pos;
+    if (!held) held = true;
+    else { ++expected_b; held = false; }
+  }
+  CHECK(rig.engine.b_pictures == int(expected_b));
+  CHECK(keys[0]);
+  uint32_t b_seen = 0;
+  for (uint32_t k = 1; k < count; ++k)
+    if (times[k] < times[k - 1]) { ++b_seen; CHECK(!keys[k]); }
+  CHECK(b_seen == expected_b);
+  if (!rig.engine.write_stream) return;
+
+  SoftwareVideoCodec soft(a);
+  DecoderConfig dc;
+  dc.codec = VideoCodec::Hevc;
+  dc.output = PixelFormat::I420;
+  UniquePointer<IVideoDecoder> dec = soft.create_decoder(dc);
+  CHECK(dec != nullptr);
+  if (!dec) return;
+  uint32_t shown = 0;
+  int64_t last_time = -1;
+  auto check_frame = [&](const VideoFrame& out) {
+    CHECK(out.format.width == w && out.format.height == h);
+    bool flat = true;
+    for (uint32_t row = 0; row < h; ++row)
+      for (uint32_t col = 0; col < w; ++col)
+        if (out.plane[0][uint64_t{row} * out.stride[0] + col] != 128) flat = false;
+    CHECK(flat);
+    CHECK(out.pts_us > last_time);   // output order is presentation order
+    last_time = out.pts_us;
+    ++shown;
+  };
+  for (uint32_t k = 0; k < count; ++k) {
+    VideoPacket in;
+    in.data = ConstByteView(packets[k].data(), packets[k].size());
+    in.pts_us = times[k];
     CHECK(dec->submit(in) == SubmitResult::Accepted);
     VideoFrame out;
     while (dec->receive(&out)) check_frame(out);
@@ -786,6 +924,13 @@ int main() {
     encode_and_check(a, 128, 128, 6, 6, 1, false, false, x2);
     encode_and_check(a, 1920, 1080, 2, 2, 75, false, false, x2);
   }
+  for (int x2 : {0, 1, 2}) {                                  // B pictures: Meteor Lake, Lunar Lake, Battlemage
+    encode_and_check_ra(a, 64, 64, 8, 8, false, x2);
+    encode_and_check_ra(a, 128, 64, 9, 5, false, x2);
+    encode_and_check_ra(a, 64, 64, 2, 8, false, x2);   // a picture that never gets a later anchor
+  }
+  encode_and_check_ra(a, 64, 64, 8, 8, true, 0);    // Arc Alchemist
+  encode_and_check_ra(a, 128, 128, 7, 4, true, 0);
   test_rejections(a);
   test_other_generations(a);
   test_hang(a);

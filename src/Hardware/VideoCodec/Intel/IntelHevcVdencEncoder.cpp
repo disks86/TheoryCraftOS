@@ -26,6 +26,9 @@ namespace hardware {
 namespace {
 // Scratch buffer indices of IntelEngineBuffers.
 constexpr uint32_t kScratchDs4 = 0 /* and 1 */, kScratchDs8 = 2 /* and 3 */, kScratchArena = 4, kScratchBitstream = 5, kScratchStatus = 6, kScratchPakObjects = 7;
+constexpr uint32_t kScratchDs4B = 8, kScratchDs8B = 9;   // the B picture's down-scaled reconstructions
+uint32_t ds4_index(uint32_t slot) { return slot < 2 ? slot : kScratchDs4B; }
+uint32_t ds8_index(uint32_t slot) { return slot < 2 ? 2 + slot : kScratchDs8B; }
 constexpr uint32_t kMinBitstreamBytes = 64 * 1024;
 constexpr uint32_t kLog2MaxPocLsb = 8;
 
@@ -37,7 +40,7 @@ uint32_t quantiser_for(uint32_t quality) {
 }  // namespace
 
 IntelHevcVdencEncoder::IntelHevcVdencEncoder(allocators::IAllocator& allocator, intel_gt::VcsDriver& driver, const EncoderConfig& config)
-    : allocator_(allocator), config_(config), buffers_(allocator, driver), yuv_(allocator), headers_(allocator), out_(allocator) {}
+    : allocator_(allocator), config_(config), buffers_(allocator, driver), yuv_{VideoFrameBuffer(allocator), VideoFrameBuffer(allocator)}, headers_(allocator), out_{ByteBuffer(allocator), ByteBuffer(allocator)} {}
 
 bool IntelHevcVdencEncoder::prepare() {
   if (prepared_) return true;
@@ -51,7 +54,10 @@ bool IntelHevcVdencEncoder::prepare() {
   stream_.width = config_.width;
   stream_.height = config_.height;
   stream_.log2_max_poc_lsb = kLog2MaxPocLsb;
-  if (!yuv_.allocate({config_.width, config_.height, PixelFormat::I420})) return false;
+  // B pictures: only where the commands are written (Xe-LPG, Arc and Xe2).
+  ra_mode_ = config_.b_frames > 0 && (buffers_.xe_lpg() || buffers_.xe_hpg() || buffers_.xe2());
+  stream_.b_pictures = ra_mode_;
+  if (!yuv_[0].allocate({config_.width, config_.height, PixelFormat::I420}) || !yuv_[1].allocate({config_.width, config_.height, PixelFormat::I420})) return false;
   if (!buffers_.lease()) return false;
   if (!buffers_.open(layout_.aligned_width, layout_.aligned_height)) {
     buffers_.release_lease();
@@ -60,7 +66,9 @@ bool IntelHevcVdencEncoder::prepare() {
   bitstream_bytes_ = layout_.aligned_width * layout_.aligned_height * 2 > kMinBitstreamBytes ? layout_.aligned_width * layout_.aligned_height * 2 : kMinBitstreamBytes;
   uint32_t source = 0, recon0 = 0, recon1 = 0, ignore = 0, arena = 0;
   bool ok = buffers_.surface(0, &source) && buffers_.surface(1, &recon0) && buffers_.surface(2, &recon1) && buffers_.picture_buffer(1, plan_.mv_temporal_bytes, &ignore) &&
-            buffers_.picture_buffer(2, plan_.mv_temporal_bytes, &ignore) && buffers_.scratch(kScratchDs4, layout_.ds4.size, &ignore) &&
+            buffers_.picture_buffer(2, plan_.mv_temporal_bytes, &ignore) &&
+            (!ra_mode_ || (buffers_.surface(3, &ignore) && buffers_.picture_buffer(3, plan_.mv_temporal_bytes, &ignore) && buffers_.scratch(kScratchDs4B, layout_.ds4.size, &ignore) &&
+                           buffers_.scratch(kScratchDs8B, layout_.ds8.size, &ignore))) && buffers_.scratch(kScratchDs4, layout_.ds4.size, &ignore) &&
             buffers_.scratch(kScratchDs4 + 1, layout_.ds4.size, &ignore) && buffers_.scratch(kScratchDs8, layout_.ds8.size, &ignore) &&
             buffers_.scratch(kScratchDs8 + 1, layout_.ds8.size, &ignore) && buffers_.scratch(kScratchArena, plan_.total, &arena) &&
             buffers_.scratch(kScratchBitstream, bitstream_bytes_, &addresses_.bitstream) && buffers_.scratch(kScratchStatus, 4096, &addresses_.status) &&
@@ -76,42 +84,62 @@ bool IntelHevcVdencEncoder::prepare() {
   return true;
 }
 
-bool IntelHevcVdencEncoder::build_batch(bool idr, uint32_t poc, uint32_t* words) {
+bool IntelHevcVdencEncoder::build_batch(const Picture& pic, uint32_t* words) {
   using namespace intel_enc;
-  const uint32_t current = recon_slot_, previous = 1 - recon_slot_;   // the reconstruction alternates between two surfaces
   HevcEncodeBuffers b = addresses_;
-  if (!buffers_.surface(1 + static_cast<int>(current), &b.recon) || !buffers_.surface(1 + static_cast<int>(previous), &b.reference) ||
-      !buffers_.picture_buffer(1 + static_cast<int>(current), plan_.mv_temporal_bytes, &b.mv_temporal) ||
-      !buffers_.picture_buffer(1 + static_cast<int>(previous), plan_.mv_temporal_bytes, &b.reference_mv_temporal) ||
-      !buffers_.scratch(kScratchDs4 + current, layout_.ds4.size, &b.recon_ds4) || !buffers_.scratch(kScratchDs4 + previous, layout_.ds4.size, &b.reference_ds4) ||
-      !buffers_.scratch(kScratchDs8 + current, layout_.ds8.size, &b.recon_ds8) || !buffers_.scratch(kScratchDs8 + previous, layout_.ds8.size, &b.reference_ds8))
+  // Anchors alternate between surfaces 1 and 2; a B picture, which nothing refers to, uses surface 3 (and its own down-scaled copies and motion vector buffer).
+  const uint32_t recon_slot = pic.b ? 2 : pic.recon_slot;
+  if (!buffers_.surface(1 + static_cast<int>(recon_slot), &b.recon) || !buffers_.picture_buffer(1 + static_cast<int>(recon_slot), plan_.mv_temporal_bytes, &b.mv_temporal) ||
+      !buffers_.scratch(ds4_index(recon_slot), layout_.ds4.size, &b.recon_ds4) || !buffers_.scratch(ds8_index(recon_slot), layout_.ds8.size, &b.recon_ds8))
     return false;
+  if (!pic.idr) {
+    const uint32_t forward = pic.b ? pic.forward_slot : 1 - pic.recon_slot;
+    if (!buffers_.surface(1 + static_cast<int>(forward), &b.reference) || !buffers_.picture_buffer(1 + static_cast<int>(forward), plan_.mv_temporal_bytes, &b.reference_mv_temporal) ||
+        !buffers_.scratch(ds4_index(forward), layout_.ds4.size, &b.reference_ds4) || !buffers_.scratch(ds8_index(forward), layout_.ds8.size, &b.reference_ds8))
+      return false;
+  }
+  if (pic.b) {
+    if (!buffers_.surface(1 + static_cast<int>(pic.backward_slot), &b.backward_reference) ||
+        !buffers_.picture_buffer(1 + static_cast<int>(pic.backward_slot), plan_.mv_temporal_bytes, &b.backward_mv_temporal) ||
+        !buffers_.scratch(ds4_index(pic.backward_slot), layout_.ds4.size, &b.backward_ds4) || !buffers_.scratch(ds8_index(pic.backward_slot), layout_.ds8.size, &b.backward_ds8))
+      return false;
+  }
 
   HevcEncodePicture p;
   p.platform = buffers_.xe_lpg() ? HevcVdencPlatform::XeLpg : buffers_.xe_hpg() ? HevcVdencPlatform::XeHpg : buffers_.xe2_hpm() ? HevcVdencPlatform::Xe2Hpm : buffers_.xe2() ? HevcVdencPlatform::Xe2Lpm : HevcVdencPlatform::XeLp;
-  p.p_picture = !idr;
+  p.p_picture = !pic.idr;
+  p.b_picture = pic.b;
+  p.ra_mode = ra_mode_;
+  p.reference_store = !ra_mode_ ? 0 : pic.b ? pic.forward_slot : 1 - pic.recon_slot;   // (frame store 0 for every reference of a stream without B pictures)
+  p.backward_store = pic.backward_slot;
   p.qp = static_cast<int32_t>(qp_);
   p.pps_qp = 26;
-  p.poc = poc;
-  p.reference_poc = poc ? poc - 1 : 0;
+  p.poc = pic.poc;
+  p.reference_poc = pic.reference_poc;
+  p.backward_poc = pic.backward_poc;
   p.deblocking = true;
 
   // The headers: the parameter sets in front of an IDR picture, then the slice header.
   headers_.clear();
   uint32_t vps_bits = 0, sps_bits = 0, pps_bits = 0, slice_bits = 0;
-  if (idr && (!write_hevc_vps(stream_, &headers_, &vps_bits) || !write_hevc_sps(stream_, &headers_, &sps_bits) || !write_hevc_pps(stream_, &headers_, &pps_bits))) return false;
+  if (pic.idr && (!write_hevc_vps(stream_, &headers_, &vps_bits) || !write_hevc_sps(stream_, &headers_, &sps_bits) || !write_hevc_pps(stream_, &headers_, &pps_bits))) return false;
   const uint64_t slice_at = headers_.size();
   HevcSliceHeader sh;
-  sh.idr = idr;
-  sh.b_slice = !idr;
-  sh.poc_lsb = poc & ((1u << kLog2MaxPocLsb) - 1);
+  sh.idr = pic.idr;
+  sh.b_slice = !pic.idr;
+  sh.poc_lsb = pic.poc & ((1u << kLog2MaxPocLsb) - 1);
   sh.qp = p.qp;
   sh.deblocking = p.deblocking;
+  if (!pic.idr) {
+    sh.negative_delta = pic.poc - pic.reference_poc;
+    sh.positive_delta = pic.b ? pic.backward_poc - pic.poc : 0;
+    sh.non_reference = pic.b;
+  }
   if (!write_hevc_slice_header(stream_, sh, &headers_, &slice_bits)) return false;
   const ConstByteView all = headers_.view();
   HevcHeaderInsert inserts[4];
   uint32_t count = 0;
-  if (idr) {
+  if (pic.idr) {
     const uint32_t set_bits[3] = {vps_bits, sps_bits, pps_bits};
     uint64_t at = 0;
     for (const uint32_t bits : set_bits) {
@@ -136,73 +164,123 @@ bool IntelHevcVdencEncoder::build_batch(bool idr, uint32_t poc, uint32_t* words)
   return true;
 }
 
+// Codes one picture from `source` and appends its access unit to the output queue.
+bool IntelHevcVdencEncoder::encode_picture(const VideoFrameBuffer& source, const Picture& pic, int64_t pts) {
+  uint32_t source_address = 0;
+  if (!buffers_.surface(0, &source_address) || !intel_mfx::tile_i420_to_nv12(source, layout_.aligned_width, layout_.aligned_height, layout_.full, buffers_.surface_buffer(0).cpu)) return false;
+  uint32_t words = 0;
+  if (!buffers_.clear_scratch(kScratchStatus) || !build_batch(pic, &words) || !buffers_.run(ArrayView<const uint32_t>(buffers_.batch_words().data(), words))) return false;
+
+  uint8_t size_bytes[4] = {};
+  if (!buffers_.read_scratch(kScratchStatus, ByteView(size_bytes, 4))) return false;
+  const uint32_t bytes = size_bytes[0] | (size_bytes[1] << 8) | (size_bytes[2] << 16) | (uint32_t{size_bytes[3]} << 24);
+  if (bytes == 0 || bytes > bitstream_bytes_) return false;
+  const uint32_t slot = (head_ + queued_) & 1u;
+  out_[slot].clear();
+  if (!out_[slot].put_zeros(bytes) || !buffers_.read_scratch(kScratchBitstream, out_[slot].writable_view())) return false;
+  pts_[slot] = pts;
+  key_[slot] = pic.idr;
+  ++queued_;
+  ++encoded_;
+  ++stats_.frames;
+  return true;
+}
+
+// An anchor (IDR or P) picture at output position `poc`: the reconstruction goes to the surface not holding the previous anchor.
+bool IntelHevcVdencEncoder::encode_anchor(const VideoFrameBuffer& source, bool idr, uint32_t poc, int64_t pts) {
+  Picture pic;
+  pic.idr = idr;
+  pic.poc = idr ? 0 : poc;
+  pic.recon_slot = idr ? 0 : 1 - anchor_slot_;
+  pic.reference_poc = anchor_poc_;
+  if (!encode_picture(source, pic, pts)) return false;
+  previous_anchor_slot_ = anchor_slot_;
+  previous_anchor_poc_ = anchor_poc_;
+  anchor_slot_ = pic.recon_slot;
+  anchor_poc_ = pic.poc;
+  return true;
+}
+
+// The B picture between the two latest anchors, at output position `poc`.
+bool IntelHevcVdencEncoder::encode_b(const VideoFrameBuffer& source, uint32_t poc, int64_t pts) {
+  Picture pic;
+  pic.b = true;
+  pic.poc = poc;
+  pic.recon_slot = 2;
+  pic.forward_slot = previous_anchor_slot_;
+  pic.backward_slot = anchor_slot_;
+  pic.reference_poc = previous_anchor_poc_;
+  pic.backward_poc = anchor_poc_;
+  return encode_picture(source, pic, pts);
+}
+
 SubmitResult IntelHevcVdencEncoder::submit(const VideoFrame& frame) {
   if (!prepared_) {
     ++stats_.errors;
     return SubmitResult::Invalid;
   }
-  if (pending_) return SubmitResult::Full;
+  if (queued_ != 0) return SubmitResult::Full;
   if (frame.format.width != config_.width || frame.format.height != config_.height || frame.format.pixel_format != config_.input) {
     ++stats_.errors;
     return SubmitResult::Invalid;
   }
-  if (!buffers_.engine_ready() || !convert_frame(frame, yuv_)) {
-    ++stats_.errors;
-    return SubmitResult::Invalid;
-  }
-  uint32_t source_address = 0;
-  if (!buffers_.surface(0, &source_address) || !intel_mfx::tile_i420_to_nv12(yuv_, layout_.aligned_width, layout_.aligned_height, layout_.full, buffers_.surface_buffer(0).cpu)) {
+  if (!buffers_.engine_ready() || !convert_frame(frame, yuv_[current_])) {
     ++stats_.errors;
     return SubmitResult::Invalid;
   }
 
   const uint32_t interval = config_.keyframe_interval < 1 ? 1 : config_.keyframe_interval;
   const bool idr = pictures_ == 0 || gop_position_ + 1 >= interval;
+  bool ok = true;
   if (idr) {
+    if (has_held_) ok = encode_anchor(yuv_[held_], false, gop_position_, held_pts_);   // the end of a group: the picture waiting for a later anchor becomes one itself
+    has_held_ = false;
     gop_position_ = 0;
-    poc_ = 0;
+    ok = ok && encode_anchor(yuv_[current_], true, 0, frame.pts_us);
   } else {
     ++gop_position_;
-    ++poc_;
+    if (ra_mode_ && !has_held_) {
+      // The first of two pictures: it waits for the next one, the anchor it will be predicted from.
+      held_ = current_;
+      current_ ^= 1u;
+      has_held_ = true;
+      held_pts_ = frame.pts_us;
+      ++pictures_;
+      return SubmitResult::Accepted;
+    }
+    ok = encode_anchor(yuv_[current_], false, gop_position_, frame.pts_us);
+    if (ok && has_held_) {
+      ok = encode_b(yuv_[held_], gop_position_ - 1, held_pts_);
+      has_held_ = false;
+    }
   }
-  uint32_t words = 0;
-  if (!buffers_.clear_scratch(kScratchStatus) || !build_batch(idr, poc_, &words) || !buffers_.run(ArrayView<const uint32_t>(buffers_.batch_words().data(), words))) {
+  if (!ok) {
+    queued_ = 0;
     ++stats_.errors;
     return SubmitResult::Invalid;
   }
-
-  uint8_t size_bytes[4] = {};
-  if (!buffers_.read_scratch(kScratchStatus, ByteView(size_bytes, 4))) {
-    ++stats_.errors;
-    return SubmitResult::Invalid;
-  }
-  const uint32_t bytes = size_bytes[0] | (size_bytes[1] << 8) | (size_bytes[2] << 16) | (uint32_t{size_bytes[3]} << 24);
-  if (bytes == 0 || bytes > bitstream_bytes_) {
-    ++stats_.errors;
-    return SubmitResult::Invalid;
-  }
-  out_.clear();
-  if (!out_.put_zeros(bytes) || !buffers_.read_scratch(kScratchBitstream, out_.writable_view())) {
-    ++stats_.errors;
-    return SubmitResult::Invalid;
-  }
-
-  recon_slot_ = 1 - recon_slot_;
   ++pictures_;
-  ++encoded_;
-  ++stats_.frames;
-  pts_ = frame.pts_us;
-  key_ = idr;
-  pending_ = true;
   return SubmitResult::Accepted;
 }
 
+void IntelHevcVdencEncoder::flush() {
+  if (!has_held_ || queued_ != 0) return;
+  // A last picture without a later anchor is coded as an anchor itself.
+  has_held_ = false;
+  if (!encode_anchor(yuv_[held_], false, gop_position_, held_pts_)) {
+    queued_ = 0;
+    ++stats_.errors;
+  }
+}
+
 bool IntelHevcVdencEncoder::receive(VideoPacket* packet) {
-  if (!pending_) return false;
-  pending_ = false;
-  packet->data = out_.view();
-  packet->pts_us = pts_;
-  packet->keyframe = key_;
+  if (queued_ == 0) return false;
+  const uint32_t slot = head_;
+  head_ = (head_ + 1) & 1u;
+  --queued_;
+  packet->data = out_[slot].view();
+  packet->pts_us = pts_[slot];
+  packet->keyframe = key_[slot];
   ++stats_.packets;
   stats_.bytes += packet->data.size();
   return true;

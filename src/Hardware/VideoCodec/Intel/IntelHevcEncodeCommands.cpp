@@ -76,6 +76,15 @@ void vdenc_pipe_buf(DwordWriter& w, const uint32_t (&image)[N], const HevcEncode
     c.buffer(1, b.reference_ds8, kMocs);
     c.buffer(37, b.reference_ds4, kMocs);
     c.buffer(22, b.reference, kMocs);
+    if (p.b_picture) {
+      c.buffer(31, b.backward_reference, kMocs);   // list 1: the later anchor and its down-scaled copies
+      c.buffer(7, b.backward_ds8, kMocs);
+      c.buffer(43, b.backward_ds4, kMocs);
+    } else if (p.ra_mode) {
+      c.buffer(31, b.reference, kMocs);            // an anchor of a stream with B pictures: the hardware wants the backward reference to be the forward one
+      c.buffer(7, b.reference_ds8, kMocs);
+      c.buffer(43, b.reference_ds4, kMocs);
+    }
   }
   c.buffer(10, b.source, kMocs);
   c.buffer(16, b.vdenc_row_store, kMocs);
@@ -115,10 +124,16 @@ void hcp_pipe_buf(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeBu
   c.buffer(28, b.sao_tile_column, kMocs);
   c.buffer(31, b.mv_temporal, kMocs);
   if (p.p_picture) {
-    c.raw(37, b.reference);   // frame store 0
-    c.raw(38, 0);
-    c.raw(66, b.reference_mv_temporal);
-    c.raw(67, 0);
+    c.raw(37 + 2 * p.reference_store, b.reference);   // the reference pictures are indexed by frame store (two dwords each); the co-located motion vector buffers likewise
+    c.raw(38 + 2 * p.reference_store, 0);
+    c.raw(66 + 2 * p.reference_store, b.reference_mv_temporal);
+    c.raw(67 + 2 * p.reference_store, 0);
+    if (p.b_picture) {
+      c.raw(37 + 2 * p.backward_store, b.backward_reference);
+      c.raw(38 + 2 * p.backward_store, 0);
+      c.raw(66 + 2 * p.backward_store, b.backward_mv_temporal);
+      c.raw(67 + 2 * p.backward_store, 0);
+    }
   }
   c.raw(53, (c.get(53) & ~0x7Fu) | kMocs);
   c.raw(82, (c.get(82) & ~0x7Fu) | kMocs);
@@ -220,41 +235,94 @@ void vdenc_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
 uint32_t xe_lpg_qp_index(const HevcEncodePicture& p) { return static_cast<uint32_t>(clip(10, 51, p.qp)) - 10; }
 
 template <uint32_t N>
-void xe_cmd1_image(DwordWriter& w, const HevcEncodePicture& p, const uint32_t (&image_i)[N], const uint32_t (&image_b)[N]) {
-  Command<N> c(p.p_picture ? image_b : image_i);
-  c.raw(kXeLpgVdencCmd1QpDword, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[xe_lpg_qp_index(p)]);   // (dword 22 on every platform)
+void xe_cmd1_image(DwordWriter& w, const uint32_t (&image)[N], uint32_t qp_dword) {
+  Command<N> c(image);
+  c.raw(kXeLpgVdencCmd1QpDword, qp_dword);   // (dword 22 on every platform)
   c.emit(w);
 }
 
+// The pictures of a stream with B pictures have their own images (the sequence's low-delay flag is off): I, anchor (P) and B; without them the I and low-delay B ones.
 void xe_lpg_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
+  const uint32_t q = xe_lpg_qp_index(p);
+  if (p.ra_mode) {
+    const uint32_t t = p.b_picture ? 2 : p.p_picture ? 1 : 0;
+    const uint32_t* const qp_tables[3] = {kXeLpgVdencCmd1RaQpTableI, kXeLpgVdencCmd1RaQpTableP, kXeLpgVdencCmd1RaQpTableB};
+    switch (p.platform) {
+      case HevcVdencPlatform::Xe2Lpm: {
+        const uint32_t* images[3] = {kXe2LpmVdencCmd1RaImageI, kXe2LpmVdencCmd1RaImageP, kXe2LpmVdencCmd1RaImageB};
+        uint32_t copy[kXe2LpmVdencCmd1Dwords];
+        for (uint32_t i = 0; i < kXe2LpmVdencCmd1Dwords; ++i) copy[i] = images[t][i];
+        xe_cmd1_image(w, copy, (t == 0 ? kXe2LpmVdencCmd1RaQpTableI : t == 1 ? kXe2LpmVdencCmd1RaQpTableP : kXe2LpmVdencCmd1RaQpTableB)[q]);
+        break;
+      }
+      case HevcVdencPlatform::Xe2Hpm: {
+        const uint32_t* images[3] = {kXe2HpmVdencCmd1RaImageI, kXe2HpmVdencCmd1RaImageP, kXe2HpmVdencCmd1RaImageB};
+        uint32_t copy[kXe2HpmVdencCmd1Dwords];
+        for (uint32_t i = 0; i < kXe2HpmVdencCmd1Dwords; ++i) copy[i] = images[t][i];
+        xe_cmd1_image(w, copy, (t == 0 ? kXe2HpmVdencCmd1RaQpTableI : t == 1 ? kXe2HpmVdencCmd1RaQpTableP : kXe2HpmVdencCmd1RaQpTableB)[q]);
+        break;
+      }
+      default: {
+        const bool arc = p.platform == HevcVdencPlatform::XeHpg;
+        const uint32_t* images[3] = {kXeLpgVdencCmd1RaImageI, kXeLpgVdencCmd1RaImageP, kXeLpgVdencCmd1RaImageB};
+        const uint32_t* arc_images[3] = {kXeHpgVdencCmd1RaImageI, kXeHpgVdencCmd1RaImageP, kXeHpgVdencCmd1RaImageB};
+        uint32_t copy[kXeLpgVdencCmd1Dwords];
+        for (uint32_t i = 0; i < kXeLpgVdencCmd1Dwords; ++i) copy[i] = (arc ? arc_images : images)[t][i];
+        xe_cmd1_image(w, copy, qp_tables[t][q]);
+        break;
+      }
+    }
+    return;
+  }
   switch (p.platform) {
-    case HevcVdencPlatform::Xe2Lpm: xe_cmd1_image(w, p, kXe2LpmVdencCmd1ImageI, kXe2LpmVdencCmd1ImageB); break;
-    case HevcVdencPlatform::Xe2Hpm: xe_cmd1_image(w, p, kXe2HpmVdencCmd1ImageI, kXe2HpmVdencCmd1ImageB); break;
-    default: xe_cmd1_image(w, p, kXeLpgVdencCmd1ImageI, kXeLpgVdencCmd1ImageB); break;   // (Arc's is Xe-LPG's)
+    case HevcVdencPlatform::Xe2Lpm: xe_cmd1_image(w, p.p_picture ? kXe2LpmVdencCmd1ImageB : kXe2LpmVdencCmd1ImageI, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[q]); break;
+    case HevcVdencPlatform::Xe2Hpm: xe_cmd1_image(w, p.p_picture ? kXe2HpmVdencCmd1ImageB : kXe2HpmVdencCmd1ImageI, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[q]); break;
+    default: xe_cmd1_image(w, p.p_picture ? kXeLpgVdencCmd1ImageB : kXeLpgVdencCmd1ImageI, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[q]); break;   // (Arc's is Xe-LPG's)
   }
 }
 
 void xe_lpg_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayout& l) {
   const uint32_t* image;
-  switch (p.platform) {
-    case HevcVdencPlatform::XeHpg: image = p.p_picture ? kXeHpgVdencCmd2ImageB : kXeHpgVdencCmd2ImageI; break;
-    case HevcVdencPlatform::Xe2Lpm: image = p.p_picture ? kXe2LpmVdencCmd2ImageB : kXe2LpmVdencCmd2ImageI; break;
-    case HevcVdencPlatform::Xe2Hpm: image = p.p_picture ? kXe2HpmVdencCmd2ImageB : kXe2HpmVdencCmd2ImageI; break;
-    default: image = p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI; break;
+  const uint32_t* qp_table;
+  if (p.ra_mode) {
+    const uint32_t t = p.b_picture ? 2 : p.p_picture ? 1 : 0;
+    const uint32_t* const images[5][3] = {{kXeLpgVdencCmd2RaImageI, kXeLpgVdencCmd2RaImageP, kXeLpgVdencCmd2RaImageB},   // (XeLp is not used here)
+                                           {kXeLpgVdencCmd2RaImageI, kXeLpgVdencCmd2RaImageP, kXeLpgVdencCmd2RaImageB},
+                                           {kXeHpgVdencCmd2RaImageI, kXeHpgVdencCmd2RaImageP, kXeHpgVdencCmd2RaImageB},
+                                           {kXe2LpmVdencCmd2RaImageI, kXe2LpmVdencCmd2RaImageP, kXe2LpmVdencCmd2RaImageB},
+                                           {kXe2HpmVdencCmd2RaImageI, kXe2HpmVdencCmd2RaImageP, kXe2HpmVdencCmd2RaImageB}};
+    const uint32_t* const tables[5][3] = {{kXeLpgVdencCmd2RaQpTableI, kXeLpgVdencCmd2RaQpTableP, kXeLpgVdencCmd2RaQpTableB},
+                                           {kXeLpgVdencCmd2RaQpTableI, kXeLpgVdencCmd2RaQpTableP, kXeLpgVdencCmd2RaQpTableB},
+                                           {kXeHpgVdencCmd2RaQpTableI, kXeHpgVdencCmd2RaQpTableP, kXeHpgVdencCmd2RaQpTableB},
+                                           {kXe2LpmVdencCmd2RaQpTableI, kXe2LpmVdencCmd2RaQpTableP, kXe2LpmVdencCmd2RaQpTableB},
+                                           {kXe2HpmVdencCmd2RaQpTableI, kXe2HpmVdencCmd2RaQpTableP, kXe2HpmVdencCmd2RaQpTableB}};
+    image = images[static_cast<uint32_t>(p.platform)][t];
+    qp_table = tables[static_cast<uint32_t>(p.platform)][t];
+  } else {
+    switch (p.platform) {
+      case HevcVdencPlatform::XeHpg: image = p.p_picture ? kXeHpgVdencCmd2ImageB : kXeHpgVdencCmd2ImageI; break;
+      case HevcVdencPlatform::Xe2Lpm: image = p.p_picture ? kXe2LpmVdencCmd2ImageB : kXe2LpmVdencCmd2ImageI; break;
+      case HevcVdencPlatform::Xe2Hpm: image = p.p_picture ? kXe2HpmVdencCmd2ImageB : kXe2HpmVdencCmd2ImageI; break;
+      default: image = p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI; break;
+    }
+    qp_table = p.p_picture ? kXeLpgVdencCmd2QpTableB : kXeLpgVdencCmd2QpTableI;
   }
   static_assert(kXeLpgVdencCmd2Dwords == kXe2LpmVdencCmd2Dwords && kXeLpgVdencCmd2Dwords == kXe2HpmVdencCmd2Dwords, "CMD2 is 62 dwords on every platform");
   uint32_t copy[kXeLpgVdencCmd2Dwords];
   for (uint32_t i = 0; i < kXeLpgVdencCmd2Dwords; ++i) copy[i] = image[i];
   Command<kXeLpgVdencCmd2Dwords> c(copy);
-  c.raw(kXeLpgVdencCmd2QpDword, (p.p_picture ? kXeLpgVdencCmd2QpTableB : kXeLpgVdencCmd2QpTableI)[xe_lpg_qp_index(p)]);
+  c.raw(kXeLpgVdencCmd2QpDword, qp_table[xe_lpg_qp_index(p)]);
   c.set(kXeLpgVdencCmd2_FrameWidthInPixelsMinusOne, l.width - 1);
   c.set(kXeLpgVdencCmd2_FrameHeightInPixelsMinusOne, l.height - 1);
   if (p.p_picture) {
     // As on Xe-LP: the distance to the picture the list entry names; the entries the lists do not have name "frame 0" of the POC list, so they get this picture's own count.
     const int32_t distance = clip(-16, 16, static_cast<int32_t>(p.poc) - static_cast<int32_t>(p.reference_poc));
     const int32_t unused = clip(-16, 16, static_cast<int32_t>(p.poc));
+    const int32_t back_distance = p.b_picture ? clip(-16, 16, static_cast<int32_t>(p.poc) - static_cast<int32_t>(p.backward_poc)) : distance;   // (negative: the later anchor)
     c.set(kXeLpgVdencCmd2_FwdPocNumberForRefid0InL0, static_cast<uint32_t>(distance) & 0xFF);
-    c.set(kXeLpgVdencCmd2_BwdPocNumberForRefid0InL1, static_cast<uint32_t>(distance) & 0xFF);
+    c.set(kXeLpgVdencCmd2_BwdPocNumberForRefid0InL1, static_cast<uint32_t>(back_distance) & 0xFF);
+    c.set(kXeLpgVdencCmd2_FwdRef0RefPic, p.reference_store);   // the frame store of each list's first picture (0 and 7 without B pictures)
+    if (p.b_picture) c.set(kXeLpgVdencCmd2_BwdRef0RefPic, p.backward_store);
     c.set(kXeLpgVdencCmd2_PocNumberForRefid1InL0, static_cast<uint32_t>(unused) & 0xFF);
     c.set(kXeLpgVdencCmd2_PocNumberForRefid1InL1, static_cast<uint32_t>(unused) & 0xFF);
     c.set(kXeLpgVdencCmd2_PocNumberForRefid2InL0, static_cast<uint32_t>(unused) & 0xFF);
@@ -387,12 +455,12 @@ void pak_insert(DwordWriter& w, const HevcHeaderInsert& h, bool last_header) {
 }
 
 // HCP_REF_IDX_STATE for one list: one entry, the previous picture (frame store 0).
-void hcp_ref_idx(DwordWriter& w, uint32_t list, int32_t poc_distance) {
+void hcp_ref_idx(DwordWriter& w, uint32_t list, int32_t poc_distance, uint32_t frame_store) {
   Command<kGen12HcpRefIdxStateDwords> c(kGen12HcpRefIdxStateDefault);
   c.set(kGen12HcpRefIdxState_Refpiclistnum, list);
   c.set(kGen12HcpRefIdxState_NumRefIdxLRefpiclistnumActiveMinus1, 0);
   // list entry: picture order count distance (8 bits), frame store (bits 8 .. 10), the long-term/field flags; the driver also sets the bottom-field flag of frame pictures.
-  c.raw(2, (static_cast<uint32_t>(clip(-128, 127, poc_distance)) & 0xFF) | (0u << 8) | (1u << 15));
+  c.raw(2, (static_cast<uint32_t>(clip(-128, 127, poc_distance)) & 0xFF) | ((frame_store & 7u) << 8) | (1u << 15));
   c.emit(w);
 }
 
@@ -513,8 +581,9 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
   // --- The VDEnc pipeline: mode (TLB prefetch, random-access off), surfaces, buffers.
   const bool xe_lpg = p.platform != HevcVdencPlatform::XeLp;   // (Xe-LPG's commands; Arc has them too)
   if (xe_lpg) {
-    if (p.platform == HevcVdencPlatform::Xe2Hpm) for (uint32_t i = 0; i < kXe2HpmVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmVdencPipeModeSelectImage[i]);
-    else for (uint32_t i = 0; i < kXeLpgVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgVdencPipeModeSelectImage[i]);
+    const uint32_t random_access = p.b_picture ? 1u << 18 : 0u;   // IsRandomAccess (dword 1, bit 18): the driver sets it when the picture is not low delay
+    if (p.platform == HevcVdencPlatform::Xe2Hpm) for (uint32_t i = 0; i < kXe2HpmVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
+    else for (uint32_t i = 0; i < kXeLpgVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
   } else {
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
     c.set(kGen12VdencPipeModeSelect_StandardSelect, 0);   // HEVC
@@ -585,8 +654,10 @@ bool emit_hevc_vdenc_slice(DwordWriter& w, const HevcEncodePicture& p, const Hev
   // --- The reference picture list of a low-delay B slice: both lists hold the previous picture.
   if (p.p_picture) {
     const int32_t distance = static_cast<int32_t>(p.poc) - static_cast<int32_t>(p.reference_poc);
-    hcp_ref_idx(w, 0, distance);
-    hcp_ref_idx(w, 1, distance);
+    hcp_ref_idx(w, 0, distance, p.reference_store);
+    // List 1 of a random-access B picture holds the later anchor (a negative distance); otherwise the same picture as list 0.
+    if (p.b_picture) hcp_ref_idx(w, 1, static_cast<int32_t>(p.poc) - static_cast<int32_t>(p.backward_poc), p.backward_store);
+    else hcp_ref_idx(w, 1, distance, p.reference_store);
   }
 
   // --- HCP_SLICE_STATE: the whole picture is the one slice.
@@ -608,7 +679,7 @@ bool emit_hevc_vdenc_slice(DwordWriter& w, const HevcEncodePicture& p, const Hev
     c.set(kGen12HcpSliceState_SliceLoopFilterAcrossSlicesEnabledFlag, 1);
     c.set(kGen12HcpSliceState_SliceSaoChromaFlag, 0);
     c.set(kGen12HcpSliceState_SliceSaoLumaFlag, 0);
-    c.set(kGen12HcpSliceState_Islowdelay, 1);
+    c.set(kGen12HcpSliceState_Islowdelay, p.b_picture ? 0 : 1);
     c.set(kGen12HcpSliceState_CollocatedFromL0Flag, 1);
     c.set(kGen12HcpSliceState_Maxmergeidx, 4);
     c.set(kGen12HcpSliceState_Collocatedrefidx, 0);

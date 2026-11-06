@@ -62,7 +62,7 @@ class Bits {
   bool ok_ = true;
 };
 
-constexpr uint32_t kNalTrailR = 1, kNalIdrWRadl = 19, kNalVps = 32, kNalSps = 33, kNalPps = 34;
+constexpr uint32_t kNalTrailN = 0, kNalTrailR = 1, kNalIdrWRadl = 19, kNalVps = 32, kNalSps = 33, kNalPps = 34;
 
 bool valid(const HevcStreamHeaders& s) {
   return s.width >= 16 && s.height >= 16 && s.width <= 8192 && s.height <= 8192 && (s.width & 1) == 0 && (s.height & 1) == 0 && s.level_idc <= 255 &&
@@ -112,9 +112,9 @@ void profile_tier_level(Bits& b, const HevcStreamHeaders& s) {
   b.put(s.level_idc, 8);  // general_level_idc (no sub-layers: max_sub_layers_minus1 is 0)
 }
 
-void sub_layer_ordering(Bits& b) {
-  b.ue(1);                // max_dec_pic_buffering_minus1: the current picture and one reference
-  b.ue(0);                // max_num_reorder_pics
+void sub_layer_ordering(Bits& b, bool b_pictures) {
+  b.ue(b_pictures ? 2 : 1);   // max_dec_pic_buffering_minus1: the current picture and one reference (two anchors with B pictures)
+  b.ue(b_pictures ? 1 : 0);   // max_num_reorder_pics
   b.ue(0);                // max_latency_increase_plus1
 }
 
@@ -135,7 +135,7 @@ bool write_hevc_vps(const HevcStreamHeaders& s, ByteBuffer* out, uint32_t* bits)
   b.put(0xFFFF, 16);      // vps_reserved_0xffff_16bits
   profile_tier_level(b, s);
   b.put(1, 1);            // vps_sub_layer_ordering_info_present_flag
-  sub_layer_ordering(b);
+  sub_layer_ordering(b, s.b_pictures);
   b.put(0, 6);            // vps_max_layer_id
   b.ue(0);                // vps_num_layer_sets_minus1
   b.put(0, 1);            // vps_timing_info_present_flag
@@ -170,7 +170,7 @@ bool write_hevc_sps(const HevcStreamHeaders& s, ByteBuffer* out, uint32_t* bits)
   b.ue(0);                // bit_depth_chroma_minus8
   b.ue(s.log2_max_poc_lsb - 4);
   b.put(1, 1);            // sps_sub_layer_ordering_info_present_flag
-  sub_layer_ordering(b);
+  sub_layer_ordering(b, s.b_pictures);
   b.ue(kHevcLog2MinCb - 3);                       // log2_min_luma_coding_block_size_minus3
   b.ue(kHevcLog2Ctb - kHevcLog2MinCb);            // log2_diff_max_min_luma_coding_block_size
   b.ue(kHevcLog2MinTb - 2);                       // log2_min_luma_transform_block_size_minus2
@@ -235,7 +235,7 @@ bool write_hevc_pps(const HevcStreamHeaders& s, ByteBuffer* out, uint32_t* bits)
 bool write_hevc_slice_header(const HevcStreamHeaders& s, const HevcSliceHeader& h, ByteBuffer* out, uint32_t* bits) {
   if (!valid(s) || h.qp < 0 || h.qp > 51 || !h.deblocking || h.poc_lsb >= (1u << s.log2_max_poc_lsb)) return false;
   const uint64_t before = out->size();
-  if (!append_nal_header(out, h.idr ? kNalIdrWRadl : kNalTrailR)) {
+  if (!append_nal_header(out, h.idr ? kNalIdrWRadl : h.non_reference ? kNalTrailN : kNalTrailR)) {
     out->truncate(before);
     return false;
   }
@@ -249,9 +249,13 @@ bool write_hevc_slice_header(const HevcStreamHeaders& s, const HevcSliceHeader& 
     b.put(h.poc_lsb, s.log2_max_poc_lsb);   // slice_pic_order_cnt_lsb
     b.put(0, 1);                            // short_term_ref_pic_set_sps_flag: the set follows (st_ref_pic_set(0))
     b.ue(1);                                // num_negative_pics (no inter_ref_pic_set_prediction_flag for set 0)
-    b.ue(0);                                // num_positive_pics
-    b.ue(0);                                // delta_poc_s0_minus1: the previous picture
+    b.ue(h.positive_delta ? 1 : 0);         // num_positive_pics
+    b.ue((h.negative_delta ? h.negative_delta : 1) - 1);   // delta_poc_s0_minus1: the earlier reference
     b.put(1, 1);                            // used_by_curr_pic_s0_flag
+    if (h.positive_delta) {
+      b.ue(h.positive_delta - 1);           // delta_poc_s1_minus1: the later reference
+      b.put(1, 1);                          // used_by_curr_pic_s1_flag
+    }
   }
   if (p) {
     b.put(0, 1);                            // num_ref_idx_active_override_flag
