@@ -50,6 +50,9 @@ struct SratMemory {
 uint32_t srat_cpus(ConstByteView srat, ArrayView<SratCpu> out);
 // The enabled memory ranges, the same way.
 uint32_t srat_memory(ConstByteView srat, ArrayView<SratMemory> out);
+// The MPIDR affinity (Aff3..Aff0, the other bits cleared) of the enabled GIC CPU interface whose ACPI processor UID is `uid`, from the MADT:
+// what an SRAT GICC entry names a core by. False if the MADT has no such entry.
+bool madt_gicc_mpidr(ConstByteView madt, uint32_t uid, uint64_t* mpidr);
 // The distance from `from` to `to` in the SLIT (10 is local; 255 unreachable), or 0 if the table is not a SLIT or does not cover both.
 uint8_t slit_distance(ConstByteView slit, uint32_t from, uint32_t to);
 

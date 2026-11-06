@@ -30,6 +30,8 @@ add_executable(BOOTAA64
   src/Arch/AArch64/Cpu.cpp
   src/Kernel/ThreadScheduler.cpp
   src/CPUScheduler/IoAffinity.cpp
+  src/Hardware/Acpi/Srat.cpp
+  src/Kernel/Numa.cpp
   src/Kernel/Sync.cpp
   src/Kernel/Firmware.cpp
   src/Kernel/Delay.cpp

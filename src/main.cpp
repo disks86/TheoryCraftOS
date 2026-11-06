@@ -142,7 +142,7 @@
 #include "Network/Tls/CaBundle.hpp"
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
-#include "Hardware/Acpi/Srat.hpp"
+#include "Kernel/Numa.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
@@ -717,26 +717,46 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // From here on the OS is preemptively multithreaded on every core.
   if (kernel::start(cpu, shared_allocator)) {
     Entry(Level::Ok, "Kernel").text("preemptive threads on ").dec(kernel::core_count()).text(" cores");
-    // NUMA: the SRAT's processor entries put each core in its node, so placement keeps a device's work on its node (kernel::set_core_numa_node).
+    // NUMA: the SRAT puts each core in its node and the SLIT says how far apart the nodes are, so placement keeps a device's work near it.
     if (paging_ok) {
       hardware::AcpiTables numa_tables(st);
-      const ConstByteView srat = numa_tables.initialize() ? numa_tables.find("SRAT") : ConstByteView();
-      hardware::SratCpu numa_cpus[256];
-      const uint32_t listed = hardware::srat_cpus(srat, ArrayView<hardware::SratCpu>(numa_cpus, 256));
-      uint32_t placed = 0, highest_node = 0;
-      for (const hardware::SratCpu& c : ArrayView<const hardware::SratCpu>(numa_cpus, listed < 256 ? listed : 256)) {
-        if (c.kind == hardware::SratCpuId::Gicc) continue;   // (an ACPI processor UID, not what addresses the core)
-        const int32_t core = kernel::core_from_hardware_id(c.id);
-        if (core < 0 || !kernel::set_core_numa_node(static_cast<uint32_t>(core), c.node)) continue;
-        ++placed;
-        if (c.node > highest_node) highest_node = c.node;
+      if (numa_tables.initialize()) {
+        const kernel::NumaSummary numa = kernel::apply_acpi_numa(numa_tables.find("SRAT"), numa_tables.find("SLIT"), numa_tables.find("APIC"));
+        if (numa.cores) Entry(Level::Info, "Kernel").text("NUMA: ").dec(numa.cores).text(" core(s) in ").dec(numa.nodes).text(" node(s) (SRAT), ").dec(numa.distances).text(" distance(s) (SLIT)");
       }
-      if (placed) Entry(Level::Info, "Kernel").text("NUMA: ").dec(placed).text(" core(s) in ").dec(highest_node + 1).text(" node(s) (SRAT)");
     }
     // The virtio-gpu's commands finish with an interrupt now (the host takes milliseconds for some; a thread waiting for one need not look again and again).
     if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) {
-      if (virtio->enable_interrupts()) Entry(Level::Ok, "GPU").text("virtio-gpu commands complete by interrupt (MSI-X)");
-      else Entry(Level::Info, "GPU").text("virtio-gpu has no usable interrupt; waiting for commands by polling");
+      if (virtio->enable_interrupts()) {
+        Entry(Level::Ok, "GPU").text("virtio-gpu commands complete by interrupt (MSI-X)");
+#ifdef TCOS_SELFTESTS
+        // Moving the interrupt by rewriting its MSI-X entry (what the scheduler's steering does): the next completion arrives on the other core,
+        // then back here.
+        if (kernel::core_count() > 1) {
+          const uint32_t home = kernel::current_core(), other = kernel::choose_io_interrupt_core();
+          uint32_t arrived[2] = {}, landed[2] = {};
+          auto completes_on = [&](uint32_t core, uint32_t step) {
+            const uint32_t before = virtio->interrupt_count();
+            virtio->refresh_connectors();
+            // Under KVM the command is often seen done (the driver looks before it sleeps) before the interrupt reaches the other core, which was
+            // halted: wait for it rather than call it lost.
+            for (uint32_t waited = 0; virtio->interrupt_count() == before && waited < 100; ++waited) kernel::sleep_ms(1);
+            arrived[step] = virtio->interrupt_count() - before;
+            landed[step] = virtio->last_interrupt_core();
+            return arrived[step] != 0 && landed[step] == core;
+          };
+          const bool moved_away = other != home && virtio->move_interrupt(other);
+          const bool away = moved_away && completes_on(other, 0);
+          const bool moved_back = virtio->move_interrupt(home);
+          const bool back = moved_back && completes_on(home, 1);
+          Entry e(away && back ? Level::Ok : Level::Fault, "GPU");
+          e.text("virtio-gpu interrupt moved to core ").dec(other).text(" and back by its MSI-X entry: ").text(away && back ? "ok" : "FAILED");
+          if (!(away && back)) e.text(" (moved ").dec(moved_away).dec(moved_back).text(", interrupts ").dec(arrived[0]).text("/").dec(arrived[1]).text(" on cores ").dec(landed[0]).text("/").dec(landed[1]).text(")");
+        }
+#endif
+      } else {
+        Entry(Level::Info, "GPU").text("virtio-gpu has no usable interrupt; waiting for commands by polling");
+      }
     }
     // The JIT's code memory, checked once the cores run: compile a small program, switch its pages to executable through the page tables, run it.
     if (paging_ok) {
@@ -1992,6 +2012,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     uint32_t thunderbolt_wakes_seen = 0;
     if (thunderbolt && acpi_events) {
       acpi::Node* controller = acpi_events->find_pci_device(pci, thunderbolt_address);
+      uint32_t thunderbolt_node = 0;
+      if (thunderbolt_io_device >= 0 && controller && acpi_events->proximity_domain(controller, &thunderbolt_node))   // (its node, for where its interrupt may go)
+        kernel::set_io_device_node(thunderbolt_io_device, thunderbolt_node);
       thunderbolt_wake.events = acpi_events.get();
       thunderbolt_wake.controller = controller;
       acpi_events->set_listener(&thunderbolt_wake);
