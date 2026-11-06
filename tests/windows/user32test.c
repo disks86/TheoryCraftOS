@@ -890,8 +890,8 @@ static void test_mdi(HINSTANCE instance) {
   SendMessageA(g_mdi_client, WM_MDIMAXIMIZE, (WPARAM)c2, 0);
   CHECK((HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, (LPARAM)&maximized) == c2 && maximized && IsZoomed(c2));
   GetClientRect(g_mdi_client, &client);
-  GetWindowRect(c2, &rc);
-  CHECK(rc.right - rc.left == client.right && rc.bottom - rc.top == client.bottom);
+  GetClientRect(c2, &rc);      /* the client area of the maximized child is the client area of the MDI client (its frame lies outside) */
+  CHECK(rc.right == client.right && rc.bottom == client.bottom);
   SendMessageA(g_mdi_client, WM_MDIRESTORE, (WPARAM)c2, 0);
   GetWindowRect(c2, &rc);
   CHECK(!IsZoomed(c2) && rc.left == before.left && rc.top == before.top && rc.right == before.right);

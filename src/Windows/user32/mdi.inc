@@ -58,6 +58,7 @@
 #define CW_USEDEFAULT_ ((int)0x80000000)
 
 typedef struct { HANDLE frame, active, window_menu, maximized, merged; UINT first_id; int count, cascade; HANDLE child[MDI_MAX]; RECT_ restore[MDI_MAX]; } MdiState;
+typedef struct { POINT_ reserved, max_size, max_pos, min_track, max_track; } MINMAXINFO_;
 typedef struct { const WCHAR *cls, *title; HANDLE owner; int x, y, cx, cy; DWORD style; LONG_PTR lparam; } MdiCreate_;
 typedef struct { HANDLE window_menu; UINT first_id; } MdiClientCreate_;
 
@@ -149,6 +150,12 @@ static HANDLE mdi_top_child(HANDLE client, MdiState *st, HANDLE skip) {
 }
 
 static void mdi_client_rect(HANDLE client, RECT_ *rc) { GetClientRect(client, rc); }
+/* where a maximized child goes: its client area is the client area of the MDI client, so its frame and caption lie outside */
+static void mdi_max_rect(HANDLE client, HANDLE child, RECT_ *rc) {
+  GetClientRect(client, rc);
+  AdjustWindowRectEx(rc, (DWORD)GetWindowLongW(child, -16), FALSE, (DWORD)GetWindowLongW(child, -20));
+}
+static void mdi_max_rect(HANDLE client, HANDLE child, RECT_ *rc);
 static void mdi_maximize(HANDLE client, MdiState *st, HANDLE child) {
   const int i = mdi_find(st, child);
   if (i < 0) return;
@@ -166,9 +173,9 @@ static void mdi_maximize(HANDLE client, MdiState *st, HANDLE child) {
     st->restore[i].left = p.x; st->restore[i].top = p.y; st->restore[i].right = p.x + (wr.right - wr.left); st->restore[i].bottom = p.y + (wr.bottom - wr.top);
   }
   RECT_ rc;
-  mdi_client_rect(client, &rc);
   SetWindowLongW(child, -16, GetWindowLongW(child, -16) | WS_MAXIMIZE_);
-  SetWindowPos(child, NULL, 0, 0, rc.right, rc.bottom, 0x4 | 0x10 /* NOZORDER | NOACTIVATE */);
+  mdi_max_rect(client, child, &rc);
+  SetWindowPos(child, NULL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, 0x4 | 0x10 /* NOZORDER | NOACTIVATE */);
   st->maximized = child;
   mdi_merge(client, st, child, TRUE);
 }
@@ -430,6 +437,13 @@ static LONG_PTR child_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, 
   (void)ctx;
   HANDLE client = mdi_client_of(hwnd);
   MdiState *st = (client && IsWindow(client)) ? mdi_state(client) : NULL;
+  if (message == 0x24 /* WM_GETMINMAXINFO */ && st && lparam) {      /* (asked while the child is being made, before it is in the list) */
+    RECT_ rc;
+    MINMAXINFO_ *mm = (MINMAXINFO_ *)lparam;
+    mdi_max_rect(client, hwnd, &rc);
+    mm->max_size.x = rc.right - rc.left; mm->max_size.y = rc.bottom - rc.top; mm->max_pos.x = rc.left; mm->max_pos.y = rc.top;
+    return 0;
+  }
   if (st && mdi_find(st, hwnd) >= 0) {
     switch (message) {
       case WM_CHILDACTIVATE_: case 0x21 /* WM_MOUSEACTIVATE */: case WM_SETFOCUS_:
