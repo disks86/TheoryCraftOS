@@ -188,6 +188,7 @@ bool AhciStorageDevice::identify_ata() {
     if (words >= 256 && words <= 2048) info_.block_size = words * 2;
   }
   info_.removable = id[0] & (1u << 7);
+  info_.media = media_from_ata_rotation(id[217]);
   return info_.block_count > 0;
 }
 

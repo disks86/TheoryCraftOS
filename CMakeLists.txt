@@ -244,6 +244,10 @@ add_executable(BOOTX64
   src/StorageDemo.cpp
   src/Hardware/StorageDevice/StorageDeviceBase.cpp
   src/Hardware/StorageDevice/SystemStorageDevices.cpp
+  src/Hardware/StorageDevice/ScheduledStorageDevice.cpp
+  src/IoScheduler/IoCost.cpp
+  src/IoScheduler/FairQueue.cpp
+  src/IoScheduler/LatencyController.cpp
   src/Hardware/StorageDevice/Virtio/VirtioBlockDevice.cpp
   src/Hardware/StorageDevice/Virtio/VirtioScsiDevice.cpp
   src/Hardware/StorageDevice/VMware/PvscsiDevice.cpp

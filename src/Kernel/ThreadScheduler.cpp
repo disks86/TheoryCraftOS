@@ -1283,6 +1283,13 @@ void set_thread_priority(Thread* t, uint8_t priority) {
   __atomic_store_n(&t->priority, priority, __ATOMIC_RELEASE);   // (a queued thread stays at the level it was queued at: Thread::queued_level)
 }
 
+void set_thread_io_priority(Thread* t, uint8_t io_class, uint16_t weight) {
+  __atomic_store_n(&t->io_weight, weight, __ATOMIC_RELAXED);
+  __atomic_store_n(&t->io_class, io_class, __ATOMIC_RELEASE);   // (read by the thread itself when it submits; the two need not change together)
+}
+
+void set_thread_io_group(Thread* t, uint64_t group) { __atomic_store_n(&t->io_group, group, __ATOMIC_RELEASE); }
+
 Thread* current_thread() {
   if (!g.running) return nullptr;
   const uint64_t flags = irq_save();   // (the core and its current thread read together: preempted in between, this could be another core's)

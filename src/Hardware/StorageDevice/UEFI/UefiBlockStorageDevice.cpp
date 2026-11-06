@@ -28,6 +28,7 @@ bool UefiBlockStorageDevice::initialize() {
   info_.block_count = m->last_block + 1;
   info_.read_only = m->read_only;
   info_.removable = m->removable_media;
+  if (info_.removable) info_.media = StorageMedia::Removable;
   __builtin_memcpy(info_.model, "firmware-driven block device", 29);  // fits: model has 41 bytes
   return prepare_bounce();
 }

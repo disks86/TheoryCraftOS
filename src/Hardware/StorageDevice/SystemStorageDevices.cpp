@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
+#include "Hardware/StorageDevice/ScheduledStorageDevice.hpp"
 #include "Hardware/StorageDevice/Ahci/AhciStorageDevice.hpp"
 #include "Hardware/StorageDevice/Ide/IdeStorageDevice.hpp"
 #include "Hardware/StorageDevice/NVMe/NvmeStorageDevice.hpp"
@@ -102,6 +103,9 @@ void SystemStorageDevices::find_firmware(List<UniquePointer<IStorageDevice>>& fo
 
 void SystemStorageDevices::adopt(List<UniquePointer<IStorageDevice>>& found, bool report) {
   for (uint64_t i = 0; i < found.count(); ++i) {
+    // Every device gets an I/O scheduler in front (without memory for one it is used as it is).
+    UniquePointer<ScheduledStorageDevice> scheduled = UniquePointer<ScheduledStorageDevice>::make(allocator_, allocator_);
+    if (scheduled && scheduled->attach(found[i])) found[i] = UniquePointer<IStorageDevice>(util::move(scheduled));
     Entry entry;
     entry.device = SharedPointer<IStorageDevice>::from(util::move(found[i]));
     if (!entry.device) continue;   // (out of memory: the device is dropped with the list)

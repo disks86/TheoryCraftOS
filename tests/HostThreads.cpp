@@ -78,6 +78,15 @@ void bounds_violation(const char* what, uint64_t index, uint64_t size) {
 namespace kernel {
 
 bool running() { return true; }
+
+namespace detail {
+// The wait-list lock as a plain spinlock (the Mutex, Event... here do not use wait lists; code that borrows the lock for itself does).
+uint64_t lock_list(WaitList* list) {
+  while (__atomic_exchange_n(&list->lock, 1u, __ATOMIC_ACQUIRE)) sched_yield();
+  return 0;
+}
+void unlock_list(WaitList* list, uint64_t) { __atomic_store_n(&list->lock, 0u, __ATOMIC_RELEASE); }
+}  // namespace detail
 Thread* current_thread() { return t_current ? t_current : &t_self; }
 uint32_t current_core() { return 0; }
 uint32_t core_count() { return 4; }
@@ -149,3 +158,8 @@ bool Event::wait(uint64_t timeout_us) {
 }
 
 }  // namespace kernel
+
+namespace hardware {
+uint64_t read_tsc() { return now_us(); }   // (a counter running at 1 MHz)
+uint64_t tsc_ticks_per_us() { return 1; }
+}  // namespace hardware

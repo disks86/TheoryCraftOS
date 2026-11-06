@@ -25,12 +25,23 @@ namespace hardware {
 
 enum class StorageKind : uint8_t { Disk, Optical };
 
+// What the medium is, for the I/O scheduler's cost model (IoScheduler/IoTypes.hpp): how much a request costs and how fast it should be.
+enum class StorageMedia : uint8_t { Unknown, Nvme, SolidState, Rotational, Virtual, Removable };
+
+// ATA IDENTIFY word 217, the nominal media rotation rate: 1 is a solid state drive, 0x0401-0xFFFE a disk spinning at that many rpm, anything
+// else is not reported.
+constexpr StorageMedia media_from_ata_rotation(uint16_t word217) {
+  return word217 == 1 ? StorageMedia::SolidState : word217 >= 0x0401 && word217 <= 0xFFFE ? StorageMedia::Rotational : StorageMedia::Unknown;
+}
+
 struct StorageInfo {
   StorageKind kind = StorageKind::Disk;
   uint64_t block_count = 0;
   uint32_t block_size = 512;  // bytes per logical block
   bool read_only = false;
   bool removable = false;
+  StorageMedia media = StorageMedia::Unknown;
+  uint32_t queue_depth = 1;  // requests the driver takes at once (it serializes the rest itself)
   char model[41] = {};   // NUL-terminated, trailing blanks trimmed
   char serial[21] = {};  // empty when the device reports none
 };

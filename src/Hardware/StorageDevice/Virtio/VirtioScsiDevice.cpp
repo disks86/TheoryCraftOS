@@ -137,6 +137,7 @@ bool VirtioScsiDevice::initialize() {
   info_.kind = optical_ ? StorageKind::Optical : StorageKind::Disk;
   info_.read_only = optical_;
   info_.removable = unit.removable;
+  info_.media = StorageMedia::Virtual;
   copy_device_string(ArrayView<char>(info_.model), unit.vendor_and_product, false);
 
   const uint8_t capacity10[10] = {scsi::kReadCapacity10};

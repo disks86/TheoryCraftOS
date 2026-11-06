@@ -157,6 +157,7 @@ bool NvmeStorageDevice::initialize() {
   if (!submit(admin_, cmd)) return false;
 
   if (!identify() || !prepare_bounce()) return false;
+  info_.media = StorageMedia::Nvme;
   return true;
 }
 

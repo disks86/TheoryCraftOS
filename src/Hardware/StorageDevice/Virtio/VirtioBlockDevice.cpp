@@ -43,6 +43,7 @@ bool VirtioBlockDevice::initialize() {
   }
   const uint32_t accepted = transport_.accepted_features();
   info_.read_only = accepted & kFeatureReadOnly;
+  info_.media = StorageMedia::Virtual;
   has_flush_ = accepted & kFeatureFlush;
   info_.block_size = kSectorBytes;
   if (accepted & kFeatureBlockSize) {
