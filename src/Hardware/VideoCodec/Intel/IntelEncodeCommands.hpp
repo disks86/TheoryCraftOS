@@ -83,6 +83,8 @@ struct AvcEncodePicture {
   uint32_t reference_frame_store = 0;           // the frame store id the reference list entry names
   uint32_t log2_max_frame_num = 8;
   uint32_t last_in_stream = 0;
+  bool xe_lpg = false;                          // Meteor Lake / Arrow Lake: the VDEnc commands of Xe_LPM_plus (Gen12 otherwise means Xe-LP)
+  uint32_t poc = 0, reference_poc = 0;          // picture order counts (low eight bits are what the VDEnc image state carries)
 };
 
 // Everything from the pipe mode select to the quantiser matrices: the state a picture's slices run in.

@@ -721,7 +721,7 @@ void test_device(TestAllocator& a) {
       CHECK(!!(decode & codec_mask(VideoCodec::Av1)) == pl.av1);
       const bool meteor = pl.id == 0x7D55;
       rig_pl.engine.xe_lpg = meteor;
-      CHECK(device.info().accelerated_encode_codecs == (meteor ? codec_mask(VideoCodec::Hevc) : 0));
+      CHECK(device.info().accelerated_encode_codecs == (meteor ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0));
       EncoderConfig cfg;
       cfg.codec = VideoCodec::Hevc;
       cfg.width = 64;
