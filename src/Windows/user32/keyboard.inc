@@ -140,3 +140,39 @@ EXPORT UINT WINAPI GetDoubleClickTime(void) { return (UINT)NtUserGetDoubleClickT
 EXPORT BOOL WINAPI SetDoubleClickTime(UINT ms) { return BOOL_OF(NtUserSetDoubleClickTime(ms)); }
 EXPORT BOOL WINAPI SwapMouseButton(BOOL swap) { return BOOL_OF(NtUserSwapMouseButton((ULONG_PTR)swap)); }
 EXPORT BOOL WINAPI MessageBeep(UINT type) { return BOOL_OF(NtUserMessageBeep(type)); }
+
+/* Raw input (WM_INPUT): the registrations, the records and the two devices are win32k's (src/Process/Win32k/Win32kUserMiscInput.cpp); the window manager makes a record for each
+ * mouse and keyboard event, of the machine or of SendInput, and posts WM_INPUT with it. The services answer (UINT)-1 for an error themselves. */
+SVC NtUserRegisterRawInputDevices(ULONG_PTR devices, ULONG_PTR count, ULONG_PTR size);
+SVC NtUserGetRegisteredRawInputDevices(ULONG_PTR devices, ULONG_PTR count, ULONG_PTR size);
+SVC NtUserGetRawInputDeviceList(ULONG_PTR list, ULONG_PTR count, ULONG_PTR size);
+SVC NtUserGetRawInputDeviceInfo(ULONG_PTR device, ULONG_PTR command, ULONG_PTR data, ULONG_PTR size);
+SVC NtUserGetRawInputData(ULONG_PTR input, ULONG_PTR command, ULONG_PTR data, ULONG_PTR size, ULONG_PTR header_size);
+SVC NtUserGetRawInputBuffer(ULONG_PTR data, ULONG_PTR size, ULONG_PTR header_size);
+#define RIDI_DEVICENAME_ 0x20000007u
+EXPORT BOOL WINAPI RegisterRawInputDevices(const void *devices, UINT count, UINT size) { return BOOL_OF(NtUserRegisterRawInputDevices((ULONG_PTR)devices, count, size)); }
+EXPORT UINT WINAPI GetRegisteredRawInputDevices(void *devices, UINT *count, UINT size) { return (UINT)NtUserGetRegisteredRawInputDevices((ULONG_PTR)devices, (ULONG_PTR)count, size); }
+EXPORT UINT WINAPI GetRawInputDeviceList(void *list, UINT *count, UINT size) { return (UINT)NtUserGetRawInputDeviceList((ULONG_PTR)list, (ULONG_PTR)count, size); }
+EXPORT UINT WINAPI GetRawInputDeviceInfoW(HANDLE device, UINT command, void *data, UINT *size) { return (UINT)NtUserGetRawInputDeviceInfo((ULONG_PTR)device, command, (ULONG_PTR)data, (ULONG_PTR)size); }
+/* The A form differs only in the device name, counted in characters of the ANSI code page. */
+EXPORT UINT WINAPI GetRawInputDeviceInfoA(HANDLE device, UINT command, void *data, UINT *size) {
+  if (command != RIDI_DEVICENAME_) return GetRawInputDeviceInfoW(device, command, data, size);
+  if (!size) { SetLastError(ERROR_INVALID_PARAMETER); return (UINT)-1; }
+  WCHAR wide[260];
+  UINT chars = 260;
+  const UINT n = GetRawInputDeviceInfoW(device, command, wide, &chars);
+  if (n == (UINT)-1) return n;
+  const int need = WideCharToMultiByte(65001, 0, wide, -1, NULL, 0, NULL, NULL);
+  if (!data) { *size = (UINT)need; return 0; }
+  if (*size < (UINT)need) { *size = (UINT)need; SetLastError(122 /* ERROR_INSUFFICIENT_BUFFER */); return (UINT)-1; }
+  return (UINT)WideCharToMultiByte(65001, 0, wide, -1, data, (int)*size, NULL, NULL);
+}
+EXPORT UINT WINAPI GetRawInputData(HANDLE input, UINT command, void *data, UINT *size, UINT header_size) {
+  return (UINT)NtUserGetRawInputData((ULONG_PTR)input, command, (ULONG_PTR)data, (ULONG_PTR)size, header_size);
+}
+EXPORT UINT WINAPI GetRawInputBuffer(void *data, UINT *size, UINT header_size) { return (UINT)NtUserGetRawInputBuffer((ULONG_PTR)data, (ULONG_PTR)size, header_size); }
+/* DefRawInputProc does nothing with the records (win32k drops the old ones itself); it only checks the header size, as Windows does. */
+EXPORT LONG_PTR WINAPI DefRawInputProc(void *inputs, INT count, UINT header_size) {
+  (void)inputs; (void)count;
+  return header_size == 24 /* sizeof(RAWINPUTHEADER) */ ? 0 : -1;
+}

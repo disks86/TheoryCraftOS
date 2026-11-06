@@ -107,15 +107,56 @@ Checked in QEMU (`build-selftest`, NVMe image with the `TCOS-SCRATCH` marker so 
 (4 queues, 16 requests in flight at once), 8 cores on 3 queue pairs (`max_ioqpairs=3`), 1 core, TCG, and polled (`msix_qsize=1`). The
 boot log's thread-safety section prints the properties.
 
+## virtio-blk: a request queue per core
+
+`VirtioBlockDevice` follows the same pattern as NVMe:
+
+- **Queues.** With `VIRTIO_BLK_F_MQ` it uses one request queue per online core (QEMU gives one per vCPU), up to 16.
+- **Slots.** A pool of up to 64 slots, each with a 64 KiB DMA buffer and its own header and status byte. Slot *s* always uses descriptors
+  3*s*..3*s*+2 of whichever queue it goes on, so any slot fits any queue, and the used ring's id names the slot.
+- **Interrupts.** On x86, an MSI-X entry per queue goes to that queue's core (`VirtioPciDevice::enable_msix_queues`). The transport now
+  handles up to 17 queues.
+- **Fallback.** Delivery is checked per queue; without it, waiters poll.
+
+## AHCI: Native Command Queuing
+
+`AhciStorageDevice` uses NCQ when both the HBA (`CAP.SNCQ`) and the drive (IDENTIFY word 76 bit 8) support it:
+
+- **Tags.** As many tags as both sides have, up to 32 (`CAP.NCS`, IDENTIFY word 75). Each tag has its own command table and 64 KiB
+  buffer. Commands are READ/WRITE FPDMA QUEUED (count in the features registers, tag in the count register). `PxSACT` is set before
+  `PxCI`, under the port's lock.
+- **Completions.** They arrive as Set Device Bits FISes; the tags whose `PxSACT` bit cleared are done.
+- **Interrupt.** The HBA has one MSI, sent to a core the thread scheduler picks (`choose_io_interrupt_core`). The handler goes through the
+  ports in `IS` and lets each drive reap. Without MSI, waiters poll.
+- **Non-queued commands.** A cache flush, IDENTIFY or ATAPI packet cannot be queued. Such a command takes an exclusive gate: new queued
+  commands wait, and the ones on the drive finish first. It then runs in slot 0, polled.
+- **Errors.** A task-file or host-bus error fails every outstanding tag. The next command restarts the port with the gate exclusive, and
+  each failed chunk is retried up to three times. A command that never completes restarts the port too, and its tag is retired.
+- **Without NCQ.** Optical drives and disks without NCQ keep the single-slot path (`queue_depth = 1`).
+
+`NvmeStorageDevice`, `VirtioBlockDevice` and `AhciStorageDevice` share `QueuedStorage.hpp`: the completion vectors (0xA0–0xBF), a lock-free
+`SlotPool`, `CommandCompletion` (sleep on the event, reap the queue yourself when the 2 ms wait times out, poll without interrupts, retire
+on timeout), and `describe_queues` for the properties.
+
+Checked in QEMU, all with concurrent readers on every disk and writers on a scratch disk:
+
+- KVM, 4 cores: virtio-blk with 4 queues, NVMe with 4, and both SATA disks with NCQ at depth 32.
+- 8 cores with virtio-blk limited to 3 queues (`num-queues=3`).
+- 1 core.
+- virtio and NVMe polled (`vectors=0`, `msix_qsize=1`).
+- TCG.
+- An injected read error on the SATA disk (`blkdebug`) to exercise NCQ error recovery.
+
 ## What is not done
 
-- **The other drivers are still synchronous**. AHCI, virtio-blk, virtio-scsi, pvscsi, USB, SD and UEFI poll their device and serialize
-  requests behind one bounce buffer (`queue_depth = 1`). There the depth controller has nothing to throttle, and only the order is the
-  scheduler's. virtio-blk (several virtqueues) and AHCI NCQ (32 tags) are the next candidates.
-- **NVMe still copies, and splits large requests in series**. Data goes through the slot's bounce buffer. A request larger than 64 KiB uses
-  one slot in series rather than several in parallel. There is no interrupt coalescing, no namespace other than the first, no
-  discard/TRIM, and the interrupt steering does not move NVMe interrupts (each is already on its own core). It has not been tried on real
-  hardware.
+- **USB, SD, IDE, virtio-scsi, pvscsi and UEFI are still synchronous**, one request at a time (`queue_depth = 1`).
+- **Data is still copied, and large requests run in series**. The three queued drivers copy through each slot's buffer, and a request
+  over 64 KiB runs its pieces one after another in one slot.
+- **Driver features still missing.**
+  - NVMe: no interrupt coalescing, only the first namespace, no TRIM.
+  - AHCI: no port multipliers, and no READ LOG EXT to find the failed tag (every tag is retried).
+  - None of it has been tried on real hardware.
+- **AHCI's polled fallback is untested**. QEMU's ich9-ahci always has MSI.
 - **Some callers don't pass priorities yet**. Windows `FileIoPriorityHintInformation` and process I/O priority are still ignored, and
   Linux `ioprio_set` is not wired to `set_thread_io_priority`. User processes do not yet put their threads into one `io_group`.
 - **Requests are not merged**. Callers are synchronous and own their buffers. On flash, merging matters little.

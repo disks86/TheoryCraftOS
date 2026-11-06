@@ -254,6 +254,67 @@ uint64_t svc_get_pointer_devices(Call& c) {
 
 }  // namespace
 
+namespace {
+
+constexpr uint32_t kWmInput = 0x00FF, kRimInput = 0, kRimInputSink = 1, kRidevExInputSink = 0x1000;
+
+// What a registration means for its usage: RIDEV_EXCLUDE and RIDEV_PAGEONLY share their bits with RIDEV_NOLEGACY (0x30), which only goes with a usage.
+bool excludes(const RawDevice& d) { return d.usage != 0 && (d.flags & 0x30) == kRidevExclude; }
+bool page_only(const RawDevice& d) { return d.usage == 0 && (d.flags & kRidevPageOnly) != 0; }
+bool no_legacy(const RawDevice& d) { return d.usage != 0 && (d.flags & 0x30) == 0x30; }
+
+// The registration of a process for a generic-desktop usage (2 mouse, 6 keyboard): its own entry for the usage (none if that excludes it), else a page-only one.
+const RawDevice* registration_for(const InputState& s, uint64_t pid, uint16_t usage) {
+  const RawDevice* page = nullptr;
+  for (const RawDevice& d : s.devices.view()) {
+    if (d.pid != pid || d.usage_page != 1) continue;
+    if (d.usage == usage) return excludes(d) ? nullptr : &d;
+    if (page_only(d)) page = &d;
+  }
+  return page;
+}
+
+}  // namespace
+
+// The foreground process gets WM_INPUT (RIM_INPUT) at its target window (the one it registered, else its focus window); another process only with RIDEV_INPUTSINK, or
+// with RIDEV_EXINPUTSINK when the foreground process does not take that input raw (RIM_INPUTSINK, at the registered window).
+void raw_input_event(uint32_t type, bool injected, ConstByteView data) {
+  InputState* s = g_input.get();
+  if (!s || s->devices.count() == 0) return;
+  const uint16_t usage = type == 0 ? 2 : 6;
+  const uint32_t foreground = user::foreground_window();
+  const uint64_t foreground_pid = foreground ? user::window_process(foreground) : 0;
+  const bool foreground_takes_it = foreground_pid && registration_for(*s, foreground_pid, usage);
+  List<uint64_t> done(*system_allocator());      // (a process with several entries gets one record)
+  for (uint64_t i = 0; i < s->devices.count(); ++i) {
+    const uint64_t pid = s->devices[i].pid;
+    bool seen = false;
+    for (uint64_t p : done.view()) if (p == pid) seen = true;
+    if (seen || !done.push_back(pid)) continue;
+    const RawDevice* d = registration_for(*s, pid, usage);
+    if (!d) continue;
+    uint32_t target = 0;
+    uint64_t wparam = kRimInput;
+    if (pid == foreground_pid) {
+      const uint32_t focus = user::focus_window();
+      target = d->hwnd ? d->hwnd : (focus && user::window_process(focus) == pid ? focus : foreground);
+    } else if (d->hwnd && ((d->flags & kRidevInputSink) || ((d->flags & kRidevExInputSink) && !foreground_takes_it))) {
+      target = d->hwnd;
+      wparam = kRimInputSink;
+    }
+    if (!target || !user::is_window(target)) continue;
+    const uint32_t handle = record_raw_input(pid, type, injected ? 0 : (type == 0 ? kMouseDevice : kKeyboardDevice), wparam, data, true);
+    if (handle) user::post_message(target, kWmInput, wparam, handle);
+  }
+}
+
+bool raw_input_no_legacy(uint64_t pid, uint32_t type) {
+  InputState* s = g_input.get();
+  if (!s) return false;
+  const RawDevice* d = registration_for(*s, pid, type == 0 ? 2 : 6);
+  return d && no_legacy(*d);
+}
+
 uint32_t record_raw_input(uint64_t pid, uint32_t type, uint32_t device, uint64_t wparam, ConstByteView data, bool buffered) {
   InputState* s = st();
   if (!s) return 0;

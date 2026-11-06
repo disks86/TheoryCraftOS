@@ -93,6 +93,7 @@ uint32_t core_count() { return 4; }
 // Device interrupts: none on the host (drivers that want them fall back to polling).
 uint64_t online_core_mask() { return 0xF; }
 uint64_t core_hardware_id(uint32_t) { return ~uint64_t{0}; }
+uint32_t choose_io_interrupt_core(int8_t, int64_t) { return 0; }
 int32_t register_io_device(const char*, int32_t) { return -1; }
 void unregister_io_device(int32_t) {}
 bool set_device_interrupt_handler(Vector, int32_t, InterruptHandler, void*) { return false; }

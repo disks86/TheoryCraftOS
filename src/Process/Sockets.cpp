@@ -78,6 +78,9 @@ network::INetworkStack* SocketManager::stack_for(Socket& s, Ipv4Address destinat
     if (!destination.is_unspecified() && destination.in_subnet(c.address, c.netmask)) { index = i; break; }
   }
   if (found) s.stack = stacks_.at(index);
+  // The loopback (127.0.0.0/8) needs no address of an interface: with none configured yet any stack carries it, as does a listener waiting for it.
+  if (!s.stack && (destination.is_loopback() || destination.is_unspecified()))
+    for (uint32_t i = 0; i < stacks_.count() && !s.stack; ++i) s.stack = stacks_.at(i);
   return s.stack;
 }
 
@@ -264,6 +267,9 @@ bool SocketManager::local_name(uint32_t id, uint32_t* address, uint16_t* port) {
   if (!s) return false;
   const network::IpConfiguration c = s->stack ? s->stack->configuration() : network::IpConfiguration();
   *address = c.address.value();
+  // a socket talking over the loopback is at the loopback address its packets come from
+  const bool has_peer = s->proto == SocketProto::Udp ? s->udp_connected : !!s->tcp;
+  if (has_peer && s->peer_address.is_loopback()) *address = s->peer_address.value();
   const uint16_t host_port = s->proto == SocketProto::Udp ? (s->udp ? s->udp->local_port() : s->bound_port) : (s->tcp ? s->tcp->local_port() : s->bound_port);
   *port = swap16(host_port);
   return true;

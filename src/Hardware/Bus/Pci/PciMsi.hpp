@@ -31,7 +31,7 @@ class PciMsi {
  public:
   static constexpr uint8_t kCapabilityId = 0x05;
 
-  explicit PciMsi(IPciBus& bus) : bus_(bus) {}
+  explicit PciMsi(const IPciBus& bus) : bus_(bus) {}
   ~PciMsi() { disable(); }
   PciMsi(const PciMsi&) = delete;
   PciMsi& operator=(const PciMsi&) = delete;
@@ -48,7 +48,7 @@ class PciMsi {
   bool enabled() const { return capability_ != 0; }
 
  private:
-  IPciBus& bus_;
+  const IPciBus& bus_;
   PciAddress function_{};
   uint16_t capability_ = 0;
 };

@@ -34,6 +34,8 @@ constexpr uint16_t kVirtioInputDevice = 0x1052;  // 0x1040 + device type 18
 // behaviour (what the queues carry) lives in the classes built on top.
 class VirtioPciDevice final : public IHardware {
  public:
+  static constexpr uint16_t kMaxQueues = 17;   // (virtio-blk: a request queue per core, up to 16; virtio-net: receive, transmit, control)
+
   VirtioPciDevice(const IPciBus& pci, const PciDeviceInfo& device, allocators::IAllocator& allocator,
                   efi::SystemTable* st)
       : pci_(pci), device_(device), allocator_(allocator), st_(st) {}
@@ -50,6 +52,8 @@ class VirtioPciDevice final : public IHardware {
   bool initialize() override;
   void shutdown() override;
 
+  // How many queues the device offers (common configuration num_queues).
+  uint16_t queue_count() const;
   // Allocates and registers queue `index` at the device's queue size.
   bool setup_queue(uint16_t index, Virtqueue* queue);
   // Sets DRIVER_OK: the device may now use its queues.
@@ -59,7 +63,11 @@ class VirtioPciDevice final : public IHardware {
   // Sends the completions of queue `queue_index` as an MSI-X interrupt: message `vector` to the core with local APIC id `apic_id`. Call after the queue is
   // set up. False if the device has no MSI-X, the table cannot be reached or the device does not take the vector (then nothing was changed; keep polling).
   bool enable_msix(uint8_t vector, uint32_t apic_id, uint16_t queue_index);
-  // Back to no interrupts (the queue's vector is dropped, MSI-X is switched off).
+  // A vector per queue: the completions of queue i (i < `count`) go as MSI-X table entry i, message `vectors[i]`, to the core with local
+  // APIC id `apic_ids[i]` (a device with a queue per core sends each queue's completions to the core that submits on it). False, with
+  // nothing changed, without MSI-X, with a table smaller than `count`, or if the device does not take a vector.
+  bool enable_msix_queues(const uint8_t* vectors, const uint32_t* apic_ids, uint16_t count);
+  // Back to no interrupts (the queues' vectors are dropped, MSI-X is switched off).
   void disable_msix();
   // The MSI-X entry enable_msix() set up now goes to the core with local APIC id `apic_id` (masked while it changes). False if MSI-X is off.
   bool retarget_msix(uint32_t apic_id);
@@ -92,12 +100,13 @@ class VirtioPciDevice final : public IHardware {
 
   Region common_, notify_, device_config_;
   uint32_t notify_multiplier_ = 0;
-  uint16_t queue_notify_offset_[8] = {};
+  uint16_t queue_notify_offset_[kMaxQueues] = {};
   uint32_t requested_features_ = 0;
   uint32_t accepted_features_ = 0;
   bool owns_device_ = false;
   uint16_t msix_capability_ = 0;   // config-space offset while MSI-X is on, else 0
-  uint16_t msix_queue_ = 0;
+  uint16_t msix_queue_ = 0;        // the first queue with a vector
+  uint16_t msix_queues_ = 0;       // how many have one
 };
 
 }  // namespace hardware

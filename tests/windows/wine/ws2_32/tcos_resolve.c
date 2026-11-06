@@ -173,6 +173,55 @@ static void test_socket_address(void)
     closesocket(s);
 }
 
+/* A server and a client in this process over 127.0.0.1, as Godot's game connects to its editor's debugger. */
+static void test_loopback(void)
+{
+    SOCKADDR_IN address, peer;
+    SOCKET listener, client, server, udp_a, udp_b;
+    int length;
+    char buffer[64];
+
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(6007);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ok(!bind(listener, (SOCKADDR *)&address, sizeof(address)), "bind %d\n", WSAGetLastError());
+    ok(!listen(listener, 4), "listen %d\n", WSAGetLastError());
+    client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ok(!connect(client, (SOCKADDR *)&address, sizeof(address)), "connect to 127.0.0.1: %d\n", WSAGetLastError());
+    length = sizeof(peer);
+    server = accept(listener, (SOCKADDR *)&peer, &length);
+    ok(server != INVALID_SOCKET, "accept %d\n", WSAGetLastError());
+    ok(peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK), "the client is at %s\n", inet_ntoa(peer.sin_addr));
+    ok(send(client, "hello editor", 13, 0) == 13, "send %d\n", WSAGetLastError());
+    memset(buffer, 0, sizeof(buffer));
+    ok(recv(server, buffer, sizeof(buffer), 0) == 13 && !strcmp(buffer, "hello editor"), "recv %s\n", buffer);
+    ok(send(server, "hello game", 11, 0) == 11, "send back %d\n", WSAGetLastError());
+    memset(buffer, 0, sizeof(buffer));
+    ok(recv(client, buffer, sizeof(buffer), 0) == 11 && !strcmp(buffer, "hello game"), "recv back %s\n", buffer);
+    length = sizeof(peer);
+    ok(!getsockname(client, (SOCKADDR *)&peer, &length) && peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK), "client end %s\n", inet_ntoa(peer.sin_addr));
+    length = sizeof(peer);
+    ok(!getpeername(client, (SOCKADDR *)&peer, &length) && peer.sin_port == htons(6007), "server end port %u\n", ntohs(peer.sin_port));
+    closesocket(client);
+    ok(recv(server, buffer, sizeof(buffer), 0) == 0, "the close reaches the server\n");
+    closesocket(server);
+    closesocket(listener);
+
+    udp_a = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    udp_b = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    address.sin_port = htons(6008);
+    ok(!bind(udp_a, (SOCKADDR *)&address, sizeof(address)), "udp bind %d\n", WSAGetLastError());
+    ok(sendto(udp_b, "datagram", 9, 0, (SOCKADDR *)&address, sizeof(address)) == 9, "sendto %d\n", WSAGetLastError());
+    length = sizeof(peer);
+    memset(buffer, 0, sizeof(buffer));
+    ok(recvfrom(udp_a, buffer, sizeof(buffer), 0, (SOCKADDR *)&peer, &length) == 9 && !strcmp(buffer, "datagram"), "recvfrom %s\n", buffer);
+    ok(peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK), "from %s\n", inet_ntoa(peer.sin_addr));
+    closesocket(udp_a);
+    closesocket(udp_b);
+}
+
 START_TEST(tcos_resolve)
 {
     WSADATA data;
@@ -182,5 +231,6 @@ START_TEST(tcos_resolve)
     test_getaddrinfo();
     test_own_name();
     test_socket_address();
+    test_loopback();
     WSACleanup();
 }
