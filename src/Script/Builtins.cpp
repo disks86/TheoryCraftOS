@@ -91,10 +91,8 @@ bool this_array(Vm& vm, const Value& self, JsObject** out) {
   const uint32_t count = static_cast<uint32_t>(length);
   JsObject* copy = vm.new_array(count);
   for (uint32_t i = 0; i < count; ++i) {
-    String key(vm.allocator());
-    key.append_uint(i);
     Value item;
-    if (!vm.get(self, vm.intern(key.view()), &item)) return false;
+    if (!vm.get(self, vm.index_key(i), &item)) return false;
     vm.array_push(copy, item);
   }
   *out = copy;

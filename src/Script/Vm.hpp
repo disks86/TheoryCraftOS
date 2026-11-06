@@ -77,6 +77,7 @@ class Vm {
     return true;
   }
   uint64_t heap_bytes() const { return heap_bytes_; }
+  uint64_t collections() const { return collections_; }   // (how many times the collector has run)
   uint64_t memory_limit() const { return memory_limit_; }
 
   // --- The JIT (VmJit.hpp): on by default when the kernel has executable code memory. A point is compiled after `hot_threshold` visits (1 compiles at once, which is what
@@ -123,6 +124,11 @@ class Vm {
   // A string of `length` zero bytes (the storage of an ArrayBuffer).
   JsString* new_bytes(uint32_t length);
   JsString* intern(StringView text);
+  // The interned decimal text of an array index ("0", "17" ...); the small ones are kept, so a loop over an array-like does not hash a new key each time.
+  JsString* index_key(uint32_t index);
+  // A one-character string of an ASCII character (s.charAt(i), s[i]): kept, so a script that walks a string or builds one a character at a time does not make a
+  // new string for each.
+  JsString* ascii_char(uint8_t c);
   JsString* concat(JsString* a, JsString* b);
   JsObject* new_object(JsObject* proto);
   JsObject* new_plain() { return new_object(object_proto_); }
@@ -396,6 +402,7 @@ class Vm {
   void trace();
   void sweep();
   void free_cell(Cell* cell);
+  void prune_intern_table();
   void rebuild_intern_table();
   void grow_props(JsObject* o);
   void index_rebuild(JsObject* o);
@@ -451,8 +458,14 @@ class Vm {
   // heap
   Cell* cells_ = nullptr;
   uint64_t heap_bytes_ = 0, gc_threshold_ = 4u << 20, memory_limit_ = 96u << 20;
+  uint64_t collections_ = 0;
+  uint64_t marked_bytes_ = 0;   // (collect: the bytes of the cells marked so far)
   JsString** interned_ = nullptr;
+  static constexpr uint32_t kIndexKeys = 4096;
+  JsString* index_keys_[kIndexKeys] = {};   // (index_key: roots, so they stay interned)
+  JsString* ascii_chars_[128] = {};        // (ascii_char: the same)
   uint32_t interned_cap_ = 0, interned_count_ = 0;
+  bool intern_rebuild_wanted_ = false;
   List<Cell*> gray_;
   List<FunctionCode*> codes_;
   PendingEval pending_eval_;

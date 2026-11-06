@@ -628,7 +628,7 @@ class StyleSheet {
   static constexpr uint32_t kMaxRules = 250000;   // (a big site's one style sheet has 30000 and more)
 
   explicit StyleSheet(allocators::IAllocator& allocator)
-      : allocator_(allocator), pool_(allocator), selectors_(allocator), key_table_(allocator), keyed_(allocator), unkeyed_(allocator), declarations_(allocator), rules_(allocator), scopes_(allocator), kept_(allocator),
+      : allocator_(allocator), pool_(allocator), selectors_(allocator), key_table_(allocator), keyed_(allocator), unkeyed_(allocator), ancestor_keys_(allocator), declarations_(allocator), rules_(allocator), scopes_(allocator), kept_(allocator),
         imports_(allocator), font_faces_(allocator), unicode_ranges_(allocator), keyframes_(allocator), stops_(allocator), registrations_(allocator), layers_(allocator),
         layer_rank_(allocator), containers_(allocator) {}
   StyleSheet(const StyleSheet&) = delete;
@@ -816,6 +816,10 @@ class StyleSheet {
   };
   mutable List<KeyRun> key_table_;
   mutable List<uint32_t> keyed_, unkeyed_;
+  // For each selector, kAncestorKeys hashes of what its element's ancestors must have (SelectorSet::ancestor_keys; 0 = nothing): for_candidates skips a
+  // selector whose hashes are not all in a filter made from the element's ancestors, without walking up the tree for each descendant combinator.
+  static constexpr uint32_t kAncestorKeys = 4;
+  mutable List<uint32_t> ancestor_keys_;
   mutable uint32_t indexed_count_ = 0;
   mutable uint64_t indexed_generation_ = ~uint64_t{0};
   uint64_t generation_ = 0;   // (clear() starts a new one: the index is made again)

@@ -934,10 +934,13 @@ void test_monitors() {
   CHECK(p.memory.get32(kB + 68) == 1 && p.memory.get32(kB + 16) == 1 && p.memory.get32(kC) == 1 && p.memory.get32(kC + 16) == 1024 && p.memory.get32(kC + 20) == 768);
   CHECK(p.memory.get32(kC + 64) == 2 && p.memory.get32(kC + 64 + 40) == 1024 && p.memory.get32(kC + 64 + 44) == 768);
   p.memory.put32(kA, 0); p.memory.put32(kA + 4, 2);
-  CHECK(p.call32(N::NtUserQueryDisplayConfig, 2, kA, kB, kA + 4, kC, 0) == 122 && p.memory.get32(kA) == 1);
+  CHECK(p.call32(N::NtUserQueryDisplayConfig, 2, kA, kB, kA + 4, kC, 0) == 87 && p.memory.get32(kA) == 0);      // a count of 0 is invalid
+  p.memory.put32(kA, 1); p.memory.put32(kA + 4, 1);
+  CHECK(p.call32(N::NtUserQueryDisplayConfig, 2, kA, kB, kA + 4, kC, 0) == 122 && p.memory.get32(kA) == 1 && p.memory.get32(kA + 4) == 1);      // too few: the counts stay
   p.memory.put32(kA, 1); p.memory.put32(kA + 4, 2);
   CHECK(p.call32(N::NtUserQueryDisplayConfig, 4, kA, kB, kA + 4, kC, kD) == 0 && p.memory.get32(kD) == 1);
   CHECK(p.call32(N::NtUserQueryDisplayConfig, 4, kA, kB, kA + 4, kC, 0) == 87 && p.call32(N::NtUserQueryDisplayConfig, 8, kA, kB, kA + 4, kC, 0) == 87);
+  CHECK(p.call32(N::NtUserQueryDisplayConfig, 1, kA, kB, kA + 4, kC, kD) == 87);      // a topology without QDC_DATABASE_CURRENT
   for (int i = 0; i < 20; ++i) p.memory.put8(kE + i, 0);
   p.memory.put32(kE, 1); p.memory.put32(kE + 4, 84); p.memory.put32(kE + 8, 1);
   CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, kE) == 0 && p.memory.get_wide_z(kE + 20) == "\\\\.\\DISPLAY1");
@@ -949,6 +952,15 @@ void test_monitors() {
   CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, kE) == 0xC000000Du);
   p.memory.put32(kE, 1); p.memory.put32(kE + 4, 84); p.memory.put32(kE + 8, 9);
   CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, kE) == 0xC0000001u);
+  p.memory.put32(kE + 4, 83);
+  CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, kE) == 0xC000000Du);      // the size is checked before the adapter
+  p.memory.put32(kE + 4, 0);
+  CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, kE) == 0xC0000001u);      // a header that does not hold itself
+  CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, 0) == 0xC0000001u);
+  p.memory.put32(kE, 3); p.memory.put32(kE + 4, 80); p.memory.put32(kE + 8, 1);      // the preferred mode of the target
+  CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, kE) == 0 && p.memory.get32(kE + 20) == 1024 && p.memory.get32(kE + 24) == 768 && p.memory.get32(kE + 48) == 60);      // (vSyncFreq: 16 bytes into the signal at 32)
+  p.memory.put32(kE, 9); p.memory.put32(kE + 4, 32);      // advanced colour: none, 8 bits per channel
+  CHECK(p.call32(N::NtUserDisplayConfigGetDeviceInfo, kE) == 0 && p.memory.get32(kE + 20) == 0 && p.memory.get32(kE + 28) == 8);
 
   // DPI: monitor, awareness of the process and the thread
   CHECK(p.call(N::NtUserGetDpiForMonitor, mon, 0, kA, kA + 4) == 1 && p.memory.get32(kA) == 96 && p.memory.get32(kA + 4) == 96);
@@ -967,6 +979,8 @@ void test_monitors() {
   CHECK(one(p, 12, 0x12) == (0x6011u | 0x80000000u) && one(p, 12, 0x22) == 0x12 && one(p, 12, 0) == 0x22 && one(p, 12, 0) == (0x6011u | 0x80000000u));
   clear_error(p);
   CHECK(one(p, 12, 0x77) == 0 && last_error(p) == kErrorInvalidParameter);
+  // handing back a context marked as the process's makes the thread follow the process again
+  CHECK(one(p, 12, 0x22) == (0x6011u | 0x80000000u) && one(p, 12, 0x6011u | 0x80000000u) == 0x22 && one(p, 12, 0) == (0x6011u | 0x80000000u));
   // a system DPI of 144: unaware threads keep seeing 96, aware ones see 144
   user_misc::set_system_dpi(144);
   CHECK(one(p, 9, 2) == 26 && p.call(N::NtUserGetDpiForCurrentProcess) == 144 && user_misc::dpi_for_monitor(mon) == 144);

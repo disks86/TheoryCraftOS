@@ -224,6 +224,17 @@ uint32_t nt_socket_control(Process& p, const SyscallRequest& r) {
       if (out_length < 4) return kInfoLengthMismatch;
       return p.write_user_u32(out_at, sockets->readable(uint32_t(id))) ? kSuccess : kAccessViolation;
     }
+    case 5: {    // InterfaceConfiguration (In: ULONG index; Out: address, netmask, gateway, DNS server, each as a sockaddr_in carries it)
+      uint8_t in[4] = {};
+      if (in_length != 4 || !p.read_user(r.args[2], ByteView(in, 4))) return in_length != 4 ? kInfoLengthMismatch : kAccessViolation;
+      if (out_length < 16) return kInfoLengthMismatch;
+      network::IpConfiguration c;
+      if (!sockets->interface_configuration(in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24), &c)) return 0x8000001Au;      // STATUS_NO_MORE_ENTRIES
+      const uint32_t values[4] = {c.address.value(), c.netmask.value(), c.gateway.value(), c.dns.value()};
+      uint8_t out[16];
+      for (uint32_t v = 0; v < 4; ++v) for (int i = 0; i < 4; ++i) out[4 * v + i] = uint8_t(values[v] >> (8 * (3 - i)));
+      return p.write_user(out_at, ConstByteView(out, 16)) ? kSuccess : kAccessViolation;
+    }
     default: return kInvalidInfoClass;
   }
 }

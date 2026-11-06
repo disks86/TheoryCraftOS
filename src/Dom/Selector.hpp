@@ -61,6 +61,10 @@ class SelectorSet {
   // What an element must have for the i-th selector to match it, if its rightmost compound says: an id (kind 1), a class (2) or a tag name (3), the most
   // telling one; 0 when nothing simple is required (*, [attr], :host, ::slotted ...). For indexing the selectors by what elements have.
   uint8_t key(uint32_t i, StringView* name) const;
+  // What the element's ancestors must have for the i-th selector to match: the ids (kind 1), classes (2) and tag names (3) of the compounds left of a child or
+  // descendant combinator (those match an ancestor of the element, also when sibling combinators come between). At most `max` of them go in kinds/names; returns
+  // how many. None for selectors that reach out of a shadow tree (:host, ::slotted). For skipping selectors early: see StyleSheet::for_candidates.
+  uint32_t ancestor_keys(uint32_t i, uint8_t* kinds, StringView* names, uint32_t max) const;
 
  private:
   enum class Combinator : uint8_t { None, Descendant, Child, Adjacent, Sibling };

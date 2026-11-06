@@ -639,6 +639,7 @@ void position_list_text(StringView value, String* out) {
 
 Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full = true);
 Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full, StringView only = StringView());
+bool computed_text_property(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, StringView name, Value* out);
 extern const HostClass kComputedClass;
 
 PseudoElement computed_pseudo(JsObject* o) { return static_cast<PseudoElement>(o->position); }   // (a computed style keeps its pseudo-element here)
@@ -660,6 +661,7 @@ NATIVE(computed_get_property_value) {
   else js_name_from_css(name.view(), &js);
   if (name.view().equals("float")) js.assign("cssFloat");
   JsObject* o = self.as_object();
+  if (!custom && computed_text_property(impl(vm), static_cast<dom::Node*>(o->host_data), computed_pseudo(o), js.view(), result)) return true;
   // (a custom property is only in the full snapshot; any other one is made alone)
   const Value snap = custom ? computed_snapshot(impl(vm), static_cast<dom::Node*>(o->host_data), computed_pseudo(o))
                             : build_computed_snapshot(impl(vm), static_cast<dom::Node*>(o->host_data), computed_pseudo(o), false, js.view());
@@ -898,6 +900,41 @@ bool pseudo_content_text(const dom::Node* n, StringView raw, String* out) {
 // `full`: with the custom properties, the indexes and cssText as well (the light one has the properties of the standard list, which is what nearly every read wants).
 // `only` (not with `full`): the one property a script reads; the others are not made (a page reads computedStyle.x of thousands of elements: each snapshot made a hundred
 // strings, gigabytes on YouTube's results page).
+// The computed properties that are the text the style sheet gave (or a default). Scripts read the transition and animation ones of every element they are
+// about to change (to wait for transitions), so these are answered without a snapshot: see computed_text_property.
+struct TextProperty {
+  const char* name;
+  TextRef Style::*field;
+  const char* fallback;
+};
+const TextProperty kTextProperties[] = {
+    {"transitionProperty", &Style::transition_property, "all"},     {"transitionDuration", &Style::transition_duration, "0s"},
+    {"transitionTimingFunction", &Style::transition_timing, "ease"}, {"transitionDelay", &Style::transition_delay, "0s"},
+    {"transitionBehavior", &Style::transition_behavior, "normal"},  {"animationName", &Style::animation_name, "none"},
+    {"animationDuration", &Style::animation_duration, "0s"},        {"animationTimingFunction", &Style::animation_timing, "ease"},
+    {"animationDelay", &Style::animation_delay, "0s"},              {"animationIterationCount", &Style::animation_iteration_count, "1"},
+    {"animationDirection", &Style::animation_direction, "normal"},  {"animationFillMode", &Style::animation_fill_mode, "none"},
+    {"animationPlayState", &Style::animation_play_state, "running"},
+};
+
+// One of kTextProperties of an element (its JS name): false when `name` is not one of them.
+bool computed_text_property(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, StringView name, Value* out) {
+  const TextProperty* found = nullptr;
+  for (const TextProperty& p : kTextProperties)
+    if (name.equals(p.name)) found = &p;
+  if (!found) return false;
+  Style s;
+  const bool known = element && element->is_element() && (pseudo == PseudoElement::None ? c.host.computed_style(element, &s) : c.host.computed_pseudo_style(element, pseudo, &s));
+  if (!known) {
+    *out = str_value(c.vm, "");
+    return true;
+  }
+  const StyleSheet* sheet = c.host.computed_style_sheet();
+  const StringView text = sheet ? sheet->text(s.*found->field) : StringView();
+  *out = str_value(c.vm, text.empty() ? StringView(found->fallback) : text);
+  return true;
+}
+
 Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full, StringView only) {
   Vm& vm = c.vm;
   JsObject* o = vm.new_plain();
@@ -1241,19 +1278,7 @@ Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoEl
   if (s.column_rule_color == kTransparentBorder) t.append("rgba(0, 0, 0, 0)");
   else rgb_text(s.column_rule_color ? s.column_rule_color : text_color, &t);
   set("columnRuleColor", t.view());
-  set("transitionProperty", text_of(s.transition_property, "all"));
-  set("transitionDuration", text_of(s.transition_duration, "0s"));
-  set("transitionTimingFunction", text_of(s.transition_timing, "ease"));
-  set("transitionDelay", text_of(s.transition_delay, "0s"));
-  set("transitionBehavior", text_of(s.transition_behavior, "normal"));
-  set("animationName", text_of(s.animation_name, "none"));
-  set("animationDuration", text_of(s.animation_duration, "0s"));
-  set("animationTimingFunction", text_of(s.animation_timing, "ease"));
-  set("animationDelay", text_of(s.animation_delay, "0s"));
-  set("animationIterationCount", text_of(s.animation_iteration_count, "1"));
-  set("animationDirection", text_of(s.animation_direction, "normal"));
-  set("animationFillMode", text_of(s.animation_fill_mode, "none"));
-  set("animationPlayState", text_of(s.animation_play_state, "running"));
+  for (const TextProperty& p : kTextProperties) set(p.name, text_of(s.*p.field, p.fallback));
   set("filter", text_of(s.filter, "none"));
   set("backdropFilter", text_of(s.backdrop_filter, "none"));
   set("clipPath", text_of(s.clip_path, "none"));
@@ -1398,6 +1423,7 @@ bool computed_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   Value ignored;
   if (vm.get_plain(impl(vm).computed_proto, key, &ignored)) return false;   // (a method: no snapshot is needed to find it)
   const bool listing = k[0] == '-' || (k[0] >= '0' && k[0] <= '9') || k.equals("length") || k.equals("cssText");   // (what only the full snapshot has)
+  if (!listing && computed_text_property(impl(vm), computed_node(o), computed_pseudo(o), k, out)) return true;
   if (!listing) {   // one property: only it is made
     const Value one = build_computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o), false, k);
     return one.is_object() && vm.get_plain(one.as_object(), key, out);

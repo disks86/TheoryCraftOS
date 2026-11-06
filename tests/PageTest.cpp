@@ -263,6 +263,23 @@ void report() {
   };
   top(self, "self");
   top(total, "total");
+  if (const char* want = getenv("PROBE_CALLERS")) {   // (who calls a function: the frames above it in the samples where it is running, at most 4 up)
+    for (int up = 1; up <= 4; ++up) {
+      std::map<std::string, int> callers;
+      for (int i = 0; i < g_count; ++i)
+        for (int k = 2; k + up < g_depths[i]; ++k)
+          if (name_of(g_frames[i][k]).find(want) != std::string::npos) {
+            const void* a = g_frames[i][k + up];
+            char text[32];
+            snprintf(text, sizeof text, " [%p]", a);
+            ++callers[name_of(g_frames[i][k + up]) + text];
+            break;
+          }
+      char what[64];
+      snprintf(what, sizeof what, "callers +%d", up);
+      top(callers, what);
+    }
+  }
 }
 }  // namespace probe_profile
 
@@ -777,6 +794,13 @@ static void test_style() {
   CHECK(js("<select id=s></select>", "var o = new Option('Label', 'v1', false, true); document.getElementById('s').appendChild(o); console.log(o.textContent, o.value, o instanceof HTMLOptionElement, o.selected, document.getElementById('s').value)", "Label v1 true true v1"));
   CHECK(js("<div id=d>x</div>", "var d = document.getElementById('d'); console.log(d.onclick, window.onerror, typeof new XMLSerializer().serializeToString(d), new XMLSerializer().serializeToString(d), document.implementation.createHTMLDocument('t').title, history instanceof History, new Map([[1, 2]]).get(1))", "null null string <div xmlns=\"http://www.w3.org/1999/xhtml\" id=\"d\">x</div> t true 2"));
   CHECK(js("<p id=p>x</p>", "var p = document.getElementById('p'); console.log(getComputedStyle(p).color, getComputedStyle(p).display, getComputedStyle(p).marginTop, getComputedStyle(p).textAlign)", "rgb(0, 0, 0) block 16px start"));
+  // the transition and animation properties (read without a snapshot), as properties, through getPropertyValue, defaults, after a class change
+  CHECK(js("<style>.t{transition:opacity 2s ease-in 1s;animation-name:spin} .u{transition-duration:3s}</style><p id=p class=t>x</p><p id=q>y</p>",
+           "var p = document.getElementById('p'), q = document.getElementById('q'), c = getComputedStyle(p), d = getComputedStyle(q);"
+           "console.log(c.transitionProperty, c.transitionDuration, c.transitionTimingFunction, c.transitionDelay, c.animationName, c.getPropertyValue('transition-delay'));"
+           "console.log(d.transitionProperty, d.transitionDuration, d.animationName, d.animationIterationCount, d.getPropertyValue('animation-play-state'));"
+           "q.className = 'u'; console.log(d.transitionDuration, d.getPropertyValue('transition-property'))",
+           "opacity 2s ease-in 1s spin 1s | all 0s none 1 running | 3s all"));
   // long strings built a piece at a time share a buffer: the branches of one prefix and the old values stay as they were, and the hash of an appended string is the one
   // of the same text made another way (a property key)
   CHECK(js("<p>x</p>",
@@ -6700,6 +6724,7 @@ int main(int argc, char** argv) {
         fflush(stdout);
       }
       settle_page(page, env, getenv("PROBE_SETTLE") ? atoi(getenv("PROBE_SETTLE")) : 20000);
+      { String t(a); page.timing_summary(&t); printf("timing after timers: %.*s\n", static_cast<int>(t.size()), t.view().data()); }
       if (getenv("PROBE_RENDER")) {
         struct rusage before;
         getrusage(RUSAGE_SELF, &before);

@@ -404,6 +404,18 @@ static void test_limits_and_collector() {
       CHECK(e.run("2 + 2", &error, &result) && std::string(result.c_str()) == "4");
       // Globals live on between scripts.
       CHECK(e.run("var shared = [1, 2, 3];", &error, &result) && e.run("shared.length", &error, &result) && std::string(result.c_str()) == "3");
+      // Interned names, the kept index keys and one-character strings stay right across many collections: the collector keeps the intern table to what is
+      // marked (prune_intern_table), and growing arrays and property lists counts only the growth (the heap after a collection is what is alive).
+      const uint64_t before = e.vm().collections();
+      CHECK(e.run("var keep = {}; for (var r = 0; r < 40; r++) { var junk = []; for (var i = 0; i < 20000; i++) junk.push({['n' + (i % 500)]: i, k: 'v' + i}); keep['name' + r] = r; }"
+                  "var al = {length: 5000}; for (var i = 0; i < 5000; i++) al[i] = i; var sum = 0; Array.prototype.forEach.call(al, function (v) { sum += v; });"
+                  "var abc = 'abcdefghijklmnopqrstuvwxyz0123456789', built = ''; for (var i = 0; i < 30000; i++) built += abc.charAt(i % 36);"
+                  "var o = {}; o[built.charAt(0)] = 1; o[built[1]] = 2; o[al[4500]] = 3;"
+                  "keep.name39 + ':' + sum + ':' + built.length + ':' + built.slice(0, 5) + ':' + (o.a + o['b'] + o['4500']) + ':' + ('x'.charAt(0) === 'x') + ':' + Object.keys(keep).length",
+                  &error, &result));
+      CHECK(std::string(result.c_str()) == "39:12497500:30000:abcde:6:true:40");
+      CHECK(e.vm().collections() > before + 3 && e.vm().heap_bytes() < (32u << 20));   // (under the limit: the count does not run away)
+      CHECK(e.run("var n = 0; for (var k in keep) n += keep[k]; n + ':' + keep['name' + 7] + ':' + 'é'.charAt(0) + 'abc'.charAt(1)", &error, &result) && std::string(result.c_str()) == "780:7:éb");
     }
     CHECK(a.live == 0);
   }

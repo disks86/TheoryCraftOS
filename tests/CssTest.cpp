@@ -1126,6 +1126,23 @@ static void test_percent_lengths() {
   CHECK(!r.style("b").width.has_percent());
 }
 
+// Selectors with combinators go through the index and the ancestor filter (StyleSheet::for_candidates): each one must still match exactly where it should.
+static void test_ancestor_filter() {
+  Page p("<style>"
+         ".x .y{width:11px} .x>.z{width:12px} #o .y.w{width:13px} section p.k{width:14px} .s + .t{width:15px} .u ~ .v{width:16px}"
+         ".a > .s ~ .q{width:17px} .no .y{height:9px} .x .missing .y{height:8px} div.x span#m{width:18px} .x *{min-width:3px} :not(.no) .y{max-width:7px}"
+         "</style>"
+         "<div class=x id=o><div class='y w' id=yw>a</div><div class=z id=z>b</div><span id=m>m</span>"
+         "<div><div class=z id=z2>c</div><div class=y id=y2>d</div></div></div>"
+         "<section><div><p class=k id=k>e</p></div></section><p class=k id=k2>f</p>"
+         "<div class=a><i class=s id=s>g</i><i class=t id=t>h</i><b class=u>i</b><b>j</b><b class=v id=v>k</b><b class=q id=q>l</b></div>"
+         "<div class=y id=y3>n</div>");
+  CHECK(px(p.style("yw").width) == 13 && px(p.style("z").width) == 12 && px(p.style("z2").width) != 12 && px(p.style("y2").width) == 11);
+  CHECK(px(p.style("k").width) == 14 && p.style("k2").width.is_auto() && px(p.style("t").width) == 15 && px(p.style("v").width) == 16 && px(p.style("q").width) == 17);
+  CHECK(px(p.style("m").width) == 18 && px(p.style("m").min_width) == 3 && p.style("y3").width.is_auto() && p.style("y3").min_width.is_auto());
+  CHECK(p.style("yw").height.is_auto() && p.style("y2").height.is_auto() && px(p.style("y2").max_width) == 7 && px(p.style("yw").max_width) == 7);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_units_and_math();
@@ -1155,6 +1172,7 @@ int main() {
   test_containers_and_scopes();
   test_percent_lengths();
   test_new_garbage();
+  test_ancestor_filter();
   CHECK(g_alloc.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

@@ -269,6 +269,13 @@ bool SocketManager::local_name(uint32_t id, uint32_t* address, uint16_t* port) {
   return true;
 }
 
+bool SocketManager::interface_configuration(uint32_t index, network::IpConfiguration* out) const {
+  if (index >= stacks_.count()) return false;
+  network::INetworkStack* stack = stacks_.at(index);
+  *out = stack ? stack->configuration() : network::IpConfiguration();
+  return true;
+}
+
 bool SocketManager::peer_name(uint32_t id, uint32_t* address, uint16_t* port) {
   const Socket* s = at(id);
   if (!s) return false;

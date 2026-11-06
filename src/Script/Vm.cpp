@@ -392,6 +392,7 @@ JsString* Vm::string_part(JsString* s, uint32_t from, uint32_t to) {
     return string_from_units(w + from, to - from);
   }
   if (from == 0 && to == s->length) return s;
+  if (to - from == 1 && kind != 3 && static_cast<uint8_t>(s->data()[from]) < 0x80) return ascii_char(static_cast<uint8_t>(s->data()[from]));
   JsString* part = new_string(StringView(s->data() + from, to - from));
   if (kind == 3 && part != empty_ && !part->interned) part->binary = true;
   return part;
@@ -522,6 +523,34 @@ JsString* Vm::concat_shared(JsString* a, JsString* b, uint32_t total) {
   return s;
 }
 
+JsString* Vm::ascii_char(uint8_t c) {
+  if (c >= 0x80) return empty_;
+  if (!ascii_chars_[c]) {
+    const char text = static_cast<char>(c);
+    JsString* s = intern(StringView(&text, 1));
+    if (!s->interned) return s;
+    ascii_chars_[c] = s;
+  }
+  return ascii_chars_[c];
+}
+
+JsString* Vm::index_key(uint32_t index) {
+  if (index < kIndexKeys && index_keys_[index]) return index_keys_[index];
+  char buffer[16];
+  uint32_t n = index;
+  int length = 0;
+  if (n == 0) buffer[length++] = '0';
+  while (n > 0) {
+    buffer[length++] = static_cast<char>('0' + n % 10);
+    n /= 10;
+  }
+  char text[16];
+  for (int i = 0; i < length; ++i) text[i] = buffer[length - 1 - i];
+  JsString* key = intern(StringView(text, static_cast<uint64_t>(length)));
+  if (index < kIndexKeys && key->interned) index_keys_[index] = key;
+  return key;
+}
+
 JsString* Vm::intern(StringView text) {
   const uint32_t h = hash_text(text);
   const uint32_t mask = interned_cap_ - 1;
@@ -561,7 +590,31 @@ JsString* Vm::intern(StringView text) {
   return s;
 }
 
+// After marking, before the sweep: the interned strings that are not marked are about to be freed, so the table keeps only the marked ones. The survivors go in a
+// fresh table (a gap left in the middle of a probe run would hide the entries after it); this reads the table only, not every cell on the heap.
+void Vm::prune_intern_table() {
+  JsString** fresh = static_cast<JsString**>(allocator_.allocate(sizeof(JsString*) * interned_cap_));
+  if (!fresh) {
+    intern_rebuild_wanted_ = true;   // (no memory: the table is made again from the cells after the sweep)
+    return;
+  }
+  for (uint32_t i = 0; i < interned_cap_; ++i) fresh[i] = nullptr;
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < interned_cap_; ++i) {
+    JsString* s = interned_[i];
+    if (!s || !s->marked) continue;
+    uint32_t k = s->hash & (interned_cap_ - 1);
+    while (fresh[k]) k = (k + 1) & (interned_cap_ - 1);
+    fresh[k] = s;
+    ++count;
+  }
+  allocator_.deallocate(interned_);
+  interned_ = fresh;
+  interned_count_ = count;
+}
+
 void Vm::rebuild_intern_table() {
+  intern_rebuild_wanted_ = false;
   for (uint32_t i = 0; i < interned_cap_; ++i) interned_[i] = nullptr;
   interned_count_ = 0;
   for (Cell* c = cells_; c; c = c->next) {
@@ -1274,10 +1327,16 @@ bool Vm::throw_value(const Value& value) {
 
 // --- Collector ---------------------------------------------------------------------------------------------------
 
+// (the bytes of what is alive are counted here and in trace(), while the cell is at hand: the sweep then only reads the links)
 void Vm::mark(Cell* cell) {
   if (!cell || cell->marked) return;
   cell->marked = true;
-  if (cell->kind != CellKind::String) gray_.push_back(cell);
+  if (cell->kind != CellKind::String) {
+    gray_.push_back(cell);
+    return;
+  }
+  const JsString* str = static_cast<JsString*>(cell);
+  marked_bytes_ += sizeof(JsString) + (str->shared ? uint64_t{str->shared->capacity} / str->shared->refs : uint64_t{str->length}) + 1;   // (a shared buffer is counted once between its strings)
 }
 
 void Vm::mark_value(const Value& v) {
@@ -1292,10 +1351,12 @@ void Vm::trace() {
     gray_.remove_at(gray_.count() - 1);
     if (c->kind == CellKind::Env) {
       Env* e = static_cast<Env*>(c);
+      marked_bytes_ += sizeof(Env) + sizeof(Value) * e->count;
       mark(e->parent);
       for (uint32_t i = 0; i < e->count; ++i) mark_value(e->slots()[i]);
     } else if (c->kind == CellKind::Object) {
       JsObject* o = static_cast<JsObject*>(c);
+      marked_bytes_ += sizeof(JsObject) + sizeof(Prop) * o->prop_cap + sizeof(Value) * o->capacity + sizeof(uint32_t) * o->index_cap;
       mark(o->proto);
       for (uint32_t i = 0; i < o->prop_count; ++i) {
         mark(o->props[i].key);
@@ -1320,36 +1381,23 @@ void Vm::trace() {
 
 void Vm::sweep() {
   Cell** link_to = &cells_;
-  uint64_t bytes = 0;
   while (*link_to) {
     Cell* c = *link_to;
     if (c->marked) {
       c->marked = false;
-      *link_to = c;
       link_to = &c->next;
-      switch (c->kind) {
-        case CellKind::String: {
-          const JsString* str = static_cast<JsString*>(c);
-          bytes += sizeof(JsString) + (str->shared ? uint64_t{str->shared->capacity} / str->shared->refs : uint64_t{str->length}) + 1;   // (a shared buffer is counted once between its strings)
-          break;
-        }
-        case CellKind::Env: bytes += sizeof(Env) + sizeof(Value) * static_cast<Env*>(c)->count; break;
-        case CellKind::Object: {
-          JsObject* o = static_cast<JsObject*>(c);
-          bytes += sizeof(JsObject) + sizeof(Prop) * o->prop_cap + sizeof(Value) * o->capacity + sizeof(uint32_t) * o->index_cap;
-          break;
-        }
-      }
     } else {
       *link_to = c->next;
       free_cell(c);
     }
   }
-  heap_bytes_ = bytes;
+  heap_bytes_ = marked_bytes_;
 }
 
 void Vm::collect() {
   gc_wanted_ = false;
+  ++collections_;
+  marked_bytes_ = 0;
   for (uint32_t i = 0; i < sp_; ++i) mark_value(stack_[i]);
   for (uint64_t i = 0; i < frames_.count(); ++i) {
     const Frame& f = frames_[i];
@@ -1361,6 +1409,8 @@ void Vm::collect() {
     mark(f.coroutine);
   }
   for (JsObject* p : function_kind_protos_) mark(p);
+  for (JsString* k : index_keys_) mark(k);
+  for (JsString* k : ascii_chars_) mark(k);
   mark_value(new_target_override_);
   mark_value(pending_frame_new_target_);
   for (uint64_t i = 0; i < handlers_.count(); ++i) mark(handlers_[i].env);
@@ -1384,8 +1434,9 @@ void Vm::collect() {
     mark(code->name);
   }
   trace();
+  prune_intern_table();
   sweep();
-  rebuild_intern_table();
+  if (intern_rebuild_wanted_) rebuild_intern_table();
   gc_threshold_ = heap_bytes_ * 2 > (4u << 20) ? heap_bytes_ * 2 : (4u << 20);
   if (gc_threshold_ > memory_limit_) gc_threshold_ = memory_limit_ - (memory_limit_ >> 3);
   // (but always a sixteenth of the limit above what is alive: with the heap close to the limit the next collection would otherwise come a few allocations
@@ -1409,7 +1460,9 @@ int64_t Vm::find_prop(JsObject* o, JsString* key) const {
   return -1;
 }
 
+// (the heap grows by the difference of the old and the new size of what is made again: the collector counts what is there, see trace())
 void Vm::index_rebuild(JsObject* o) {
+  const uint32_t old_cap = o->index_cap;
   allocator_.deallocate(o->index);
   o->index = nullptr;
   o->index_cap = 0;
@@ -1426,7 +1479,7 @@ void Vm::index_rebuild(JsObject* o) {
   }
   o->index = index;
   o->index_cap = cap;
-  heap_bytes_ += sizeof(uint32_t) * cap;
+  if (cap > old_cap) heap_bytes_ += sizeof(uint32_t) * (cap - old_cap);
 }
 
 void Vm::grow_props(JsObject* o) {
@@ -1438,9 +1491,9 @@ void Vm::grow_props(JsObject* o) {
   }
   for (uint32_t i = 0; i < o->prop_count; ++i) fresh[i] = o->props[i];
   allocator_.deallocate(o->props);
+  heap_bytes_ += sizeof(Prop) * (cap - o->prop_cap);
   o->props = fresh;
   o->prop_cap = cap;
-  heap_bytes_ += sizeof(Prop) * cap;
   if (heap_bytes_ > gc_threshold_) gc_wanted_ = true;
 }
 
@@ -1460,9 +1513,9 @@ bool Vm::ensure_items(JsObject* o, uint32_t capacity) {
   for (uint32_t i = 0; i < o->length; ++i) fresh[i] = o->items[i];
   for (uint32_t i = o->length; i < cap; ++i) new (&fresh[i]) Value();
   allocator_.deallocate(o->items);
+  heap_bytes_ += sizeof(Value) * (cap - o->capacity);
   o->items = fresh;
   o->capacity = cap;
-  heap_bytes_ += sizeof(Value) * cap;
   if (heap_bytes_ > gc_threshold_) gc_wanted_ = true;
   return true;
 }
@@ -1788,17 +1841,7 @@ bool Vm::to_property_key(const Value& v, JsString** out) {
     return true;
   }
   if (v.is_number() && v.u.number >= 0 && v.u.number < 1e9 && v.u.number == static_cast<double>(static_cast<uint32_t>(v.u.number))) {
-    char buffer[16];
-    uint32_t n = static_cast<uint32_t>(v.u.number);
-    int length = 0;
-    if (n == 0) buffer[length++] = '0';
-    while (n > 0) {
-      buffer[length++] = static_cast<char>('0' + n % 10);
-      n /= 10;
-    }
-    char text[16];
-    for (int i = 0; i < length; ++i) text[i] = buffer[length - 1 - i];
-    *out = intern(StringView(text, static_cast<uint64_t>(length)));
+    *out = index_key(static_cast<uint32_t>(v.u.number));
     return true;
   }
   JsString* s;

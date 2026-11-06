@@ -187,12 +187,9 @@ uint64_t svc_query_display_config(Call& c) {
   uint32_t paths = 0, modes = 0;
   if (c.arg(1) == 0 || c.arg(3) == 0 || !c.read_u32(c.arg(1), &paths) || !c.read_u32(c.arg(3), &modes)) return kErrorInvalidParameter;
   if (c.arg(2) == 0 || c.arg(4) == 0) return kErrorInvalidParameter;
-  if ((flags & kQdcDatabase) != 0 && c.arg(5) == 0) return kErrorInvalidParameter;
-  if (paths < 1 || modes < 2) {
-    c.write_u32(c.arg(1), 1);
-    c.write_u32(c.arg(3), 2);
-    return kErrorInsufficientBuffer;
-  }
+  if (((flags & kQdcDatabase) != 0) != (c.arg(5) != 0)) return kErrorInvalidParameter;      // the topology goes with QDC_DATABASE_CURRENT and only with it
+  if (paths == 0 || modes == 0) return kErrorInvalidParameter;
+  if (modes < 2) return kErrorInsufficientBuffer;      // (one path, two modes; the counts are left as they were: GetDisplayConfigBufferSizes tells them)
   const uint32_t w = gdi::screen_width(), h = gdi::screen_height();
   uint8_t path[72] = {};
   put32(path, 0, kAdapterLuidLow);        // source: adapterId.LowPart (HighPart 0), id 0, modeInfoIdx 0
@@ -230,35 +227,49 @@ uint64_t svc_query_display_config(Call& c) {
   return 0;
 }
 
+// The packet's header: type, size, adapter LUID, id. A header that cannot be read or that does not hold itself is STATUS_UNSUCCESSFUL (ERROR_GEN_FAILURE); an unknown type or
+// a size that is not the type's is STATUS_INVALID_PARAMETER; an adapter or source that is not the screen's is STATUS_UNSUCCESSFUL.
 uint64_t svc_display_config_get_device_info(Call& c) {
   uint8_t head[20];
-  if (!c.read(c.arg(0), ByteView(head, 20))) return kStatusInvalidParameter;
+  if (c.arg(0) == 0 || !c.read(c.arg(0), ByteView(head, 20))) return kStatusUnsuccessful;
   const uint32_t type = get32(head, 0), size = get32(head, 4), luid_low = get32(head, 8), id = get32(head, 16);
-  if (luid_low != kAdapterLuidLow || get32(head, 12) != 0) return kStatusUnsuccessful;
-  uint8_t out[512] = {};
-  for (uint32_t i = 0; i < 20; ++i) out[i] = head[i];
+  if (size < 20) return kStatusUnsuccessful;
   uint32_t need = 0;
   switch (type) {
-    case 1:      // DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME
-      need = 84;
-      if (size < need) return kStatusInvalidParameter;
-      if (id != 0) return kStatusUnsuccessful;
-      put_text(out, 20, 32, kAdapterName);
-      break;
-    case 2:      // GET_TARGET_NAME
-      need = 420;
-      if (size < need) return kStatusInvalidParameter;
-      if (id != 0) return kStatusUnsuccessful;
+    case 1: need = 84; break;       // DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME
+    case 2: need = 420; break;      // GET_TARGET_NAME
+    case 3: need = 80; break;       // GET_TARGET_PREFERRED_MODE
+    case 4: need = 276; break;      // GET_ADAPTER_NAME
+    case 9: need = 32; break;       // GET_ADVANCED_COLOR_INFO
+    default: return kStatusInvalidParameter;
+  }
+  if (size < need) return kStatusInvalidParameter;
+  if (luid_low != kAdapterLuidLow || get32(head, 12) != 0) return kStatusUnsuccessful;
+  if (type != 4 && id != 0) return kStatusUnsuccessful;
+  uint8_t out[512] = {};
+  for (uint32_t i = 0; i < 20; ++i) out[i] = head[i];
+  switch (type) {
+    case 1: put_text(out, 20, 32, kAdapterName); break;
+    case 2:
       put32(out, 24, 0xFFFFFFFFu);
       put_text(out, 36, 64, "Generic PnP Monitor");
       put_text(out, 164, 128, "\\\\?\\DISPLAY#Default_Monitor#0&0&0#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}");
       break;
-    case 4:      // GET_ADAPTER_NAME
-      need = 276;
-      if (size < need) return kStatusInvalidParameter;
-      put_text(out, 20, 128, "\\\\?\\TheoryCraft#Display#0");
+    case 3: {      // the mode the screen runs at is the preferred one: width, height and the signal of the target mode QueryDisplayConfig gives
+      const uint32_t w = gdi::screen_width(), h = gdi::screen_height();
+      const uint64_t pixel_rate = uint64_t{w} * h * 60;
+      put32(out, 20, w); put32(out, 24, h);
+      put32(out, 32, uint32_t(pixel_rate)); put32(out, 36, uint32_t(pixel_rate >> 32));
+      put32(out, 40, h * 60); put32(out, 44, 1);      // hSyncFreq
+      put32(out, 48, 60); put32(out, 52, 1);          // vSyncFreq
+      put32(out, 56, w); put32(out, 60, h);           // activeSize
+      put32(out, 64, w); put32(out, 68, h);           // totalSize
+      put32(out, 72, 255);                            // videoStandard: other
+      put32(out, 76, 1);                              // scanLineOrdering: progressive
       break;
-    default: return kStatusInvalidParameter;
+    }
+    case 4: put_text(out, 20, 128, "\\\\?\\TheoryCraft#Display#0"); break;
+    case 9: put32(out, 20, 0); put32(out, 24, 0); put32(out, 28, 8); break;      // no advanced colour (HDR) support; RGB, 8 bits per channel
   }
   return c.write(c.arg(0), ConstByteView(out, need)) ? 0 : kStatusInvalidParameter;
 }
@@ -384,7 +395,8 @@ uint32_t set_thread_dpi_context(Call& c, uint32_t context) {
   }
   if (context == 0) { t->dpi_context = 0; return previous; }
   if (!valid_context(context)) { c.set_last_error(kErrorInvalidParameter); return 0; }
-  t->dpi_context = normalize_context(context & ~0x80000000u);
+  // a context marked as the process's (what an earlier call answered for a thread with none) makes the thread follow the process again
+  t->dpi_context = (context & 0x80000000u) != 0 ? 0 : normalize_context(context);
   return previous;
 }
 
