@@ -627,6 +627,7 @@ void test_threads_stress() {
     CHECK(st.fair.enqueued == st.fair.completed && st.fair.dispatched == st.fair.completed);
     CHECK(st.fair.enqueued + st.bypassed == done);
     CHECK(peak <= 4);
+    CHECK(st.peak_in_flight >= 2 && st.peak_in_flight <= 4);
     printf("  stress: %llu requests, %llu bypassed, %llu queued, %llu expired, peak %d on device, write limit %u\n",
            (unsigned long long)done.load(), (unsigned long long)st.bypassed, (unsigned long long)st.fair.enqueued,
            (unsigned long long)st.fair.expired, peak.load(), st.depth.limit[1]);

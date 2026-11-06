@@ -90,6 +90,14 @@ void unlock_list(WaitList* list, uint64_t) { __atomic_store_n(&list->lock, 0u, _
 Thread* current_thread() { return t_current ? t_current : &t_self; }
 uint32_t current_core() { return 0; }
 uint32_t core_count() { return 4; }
+// Device interrupts: none on the host (drivers that want them fall back to polling).
+uint64_t online_core_mask() { return 0xF; }
+uint64_t core_hardware_id(uint32_t) { return ~uint64_t{0}; }
+int32_t register_io_device(const char*, int32_t) { return -1; }
+void unregister_io_device(int32_t) {}
+bool set_device_interrupt_handler(Vector, int32_t, InterruptHandler, void*) { return false; }
+void set_interrupt_handler(Vector, InterruptHandler, void*) {}
+namespace apic { void eoi() {} }
 void yield() { sched_yield(); }
 
 void sleep_us(uint64_t us) {

@@ -102,6 +102,17 @@ bool ScheduledStorageDevice::run(iosched::IoOp op, uint64_t bytes, Transfer&& tr
   return ok;
 }
 
+void ScheduledStorageDevice::describe(IPropertySink& sink) const {
+  inner_->describe(sink);
+  const iosched::IoSchedulerStatistics s = scheduler_.statistics();
+  sink.add_number("I/O scheduler depth", scheduler_.depth());
+  sink.add_number("Requests queued", s.fair.enqueued);
+  sink.add_number("Requests straight to the device", s.bypassed);
+  sink.add_number("Peak in flight", s.peak_in_flight);
+  sink.add_number("Read slots", s.depth.limit[0]);
+  sink.add_number("Write slots", s.depth.limit[1]);
+}
+
 bool ScheduledStorageDevice::read(uint64_t lba, ByteView buffer) {
   return run(iosched::IoOp::Read, buffer.size(), [&] { return inner_->read(lba, buffer); });
 }

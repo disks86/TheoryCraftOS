@@ -79,6 +79,7 @@ struct IoSchedulerStatistics {
   LatencyControllerStatistics depth;
   uint64_t bypassed = 0;
   uint32_t queued = 0, in_flight = 0;
+  uint32_t peak_in_flight = 0;   // the most requests that were on the device at once
 };
 
 template <class Lock>
@@ -104,6 +105,7 @@ class IoScheduler {
     __atomic_store_n(&slots_, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&queued_, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&bypassed_, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&peak_, 0, __ATOMIC_RELAXED);
     return true;
   }
 
@@ -167,6 +169,7 @@ class IoScheduler {
     s.depth = controller_.statistics();
     s.bypassed = __atomic_load_n(&bypassed_, __ATOMIC_RELAXED);
     s.in_flight = static_cast<uint32_t>(__atomic_load_n(&slots_, __ATOMIC_RELAXED) & 0xFFFF);
+    s.peak_in_flight = __atomic_load_n(&peak_, __ATOMIC_RELAXED);
     return s;
   }
 
@@ -198,7 +201,12 @@ class IoScheduler {
     uint64_t word = __atomic_load_n(&slots_, __ATOMIC_SEQ_CST);
     for (;;) {
       if (!(free_domains(word) & domain_bit(d))) return false;
-      if (__atomic_compare_exchange_n(&slots_, &word, word + one_slot(d), true, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return true;
+      if (__atomic_compare_exchange_n(&slots_, &word, word + one_slot(d), true, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        const uint32_t now_in = static_cast<uint32_t>((word + one_slot(d)) & 0xFFFF);
+        uint32_t peak = __atomic_load_n(&peak_, __ATOMIC_RELAXED);
+        while (now_in > peak && !__atomic_compare_exchange_n(&peak_, &peak, now_in, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        return true;
+      }
     }
   }
   void release(IoDomain d) { __atomic_fetch_sub(&slots_, one_slot(d), __ATOMIC_SEQ_CST); }
@@ -245,6 +253,7 @@ class IoScheduler {
   uint64_t slots_ = 0;              // atomic: bits 0-15 in flight in all, then 16 bits per domain
   uint32_t queued_ = 0;             // atomic: requests in the fair queue
   uint64_t bypassed_ = 0;           // atomic
+  uint32_t peak_ = 0;               // atomic
 };
 
 }  // namespace iosched

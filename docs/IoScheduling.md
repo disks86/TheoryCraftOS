@@ -81,13 +81,41 @@ this, and so does this controller:
   queued count. Both are sequentially consistent, so one of them always sees the other. As a safety net, and for the Idle grace time, a
   waiter whose wait times out (`wait_hint_us`) calls `kick()`.
 
+## NVMe: a queue pair per core
+
+`NvmeStorageDevice` is the first driver with real depth (`StorageInfo::queue_depth` > 1), and it is laid out the way NVMe is meant to be
+used on a machine with many cores:
+
+- **Queue pairs.** There is one I/O queue pair per online core, up to 16 and up to what the controller grants (Set Features, Number of
+  Queues). A thread submits on its own core's queue, under that queue's lock only. With fewer queues than cores, the cores share them in
+  order.
+- **Command slots.** There are 64 command slots, or fewer if `CAP.MQES` is small; that number is the queue depth reported to the scheduler.
+  Each slot has its own 64 KiB DMA buffer (capped by MDTS) and its own PRP list. A request holds one slot, and a big request moves 64 KiB
+  at a time through it. Every queue can hold every slot, so a queue can never overflow.
+- **Completions.** On x86 each queue's MSI-X entry is sent to its own core, with a vector of its own from `kVectorStorageFirst` (0xA0–0xBF,
+  shared by all controllers). The handler there takes the completions off the queue and wakes the waiting threads, and the thread
+  scheduler runs each one where its data arrived. Entry 0, the admin queue's, shares queue 1's vector; the admin queue itself is polled
+  and used only at start-up.
+- **Fallbacks.** Interrupt delivery is checked on every queue at start. Without MSI-X, before the scheduler runs, or when a check fails, the
+  waiting threads poll their own queue instead, still in parallel. A waiter whose 2 ms wait times out looks at the queue itself, so a lost
+  interrupt costs time, not the request. A command that outlives the controller's timeout fails, and its slot is retired for good: the
+  device may still write into it.
+- **Properties.** `describe()` shows the queues, the depth, the largest transfer and the interrupts taken per core. The scheduled device
+  adds the scheduler's numbers (requests queued and bypassed, peak in flight, read and write slots).
+
+Checked in QEMU (`build-selftest`, NVMe image with the `TCOS-SCRATCH` marker so the writers run on it) in several shapes: KVM with 4 cores
+(4 queues, 16 requests in flight at once), 8 cores on 3 queue pairs (`max_ioqpairs=3`), 1 core, TCG, and polled (`msix_qsize=1`). The
+boot log's thread-safety section prints the properties.
+
 ## What is not done
 
-- **The drivers are still synchronous**. They poll their device and serialize requests behind one bounce buffer, so every device reports
-  `queue_depth = 1` and the depth controller has nothing to throttle yet. The scheduler still decides the order, which is where the fairness
-  and latency gains come from on today's drivers. Making the NVMe driver multi-queue (one queue pair per core, real depth, interrupts) is
-  the next step. The scheduler is ready for it: set `StorageInfo::queue_depth`, and run one `IoScheduler` per hardware queue if per-queue
-  locking is wanted.
+- **The other drivers are still synchronous**. AHCI, virtio-blk, virtio-scsi, pvscsi, USB, SD and UEFI poll their device and serialize
+  requests behind one bounce buffer (`queue_depth = 1`). There the depth controller has nothing to throttle, and only the order is the
+  scheduler's. virtio-blk (several virtqueues) and AHCI NCQ (32 tags) are the next candidates.
+- **NVMe still copies, and splits large requests in series**. Data goes through the slot's bounce buffer. A request larger than 64 KiB uses
+  one slot in series rather than several in parallel. There is no interrupt coalescing, no namespace other than the first, no
+  discard/TRIM, and the interrupt steering does not move NVMe interrupts (each is already on its own core). It has not been tried on real
+  hardware.
 - **Some callers don't pass priorities yet**. Windows `FileIoPriorityHintInformation` and process I/O priority are still ignored, and
   Linux `ioprio_set` is not wired to `set_thread_io_priority`. User processes do not yet put their threads into one `io_group`.
 - **Requests are not merged**. Callers are synchronous and own their buffers. On flash, merging matters little.

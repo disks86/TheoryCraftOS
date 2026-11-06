@@ -41,7 +41,8 @@ class ScheduledStorageDevice final : public IStorageDevice {
   const char* name() const override { return inner_->name(); }
   bool initialize() override { return true; }   // (attach() takes a device that is up)
   void shutdown() override { inner_->shutdown(); }
-  void describe(IPropertySink& sink) const override { inner_->describe(sink); }
+  // The device's own facts, then the scheduler's.
+  void describe(IPropertySink& sink) const override;
   bool present() const override { return inner_->present(); }
   bool can_eject() const override { return inner_->can_eject(); }
   bool eject() override { return inner_->eject(); }
@@ -53,7 +54,7 @@ class ScheduledStorageDevice final : public IStorageDevice {
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
 
-  iosched::IoSchedulerStatistics scheduler_statistics() { return scheduler_.statistics(); }
+  iosched::IoSchedulerStatistics scheduler_statistics() const { return scheduler_.statistics(); }
   IStorageDevice& device() { return *inner_; }
 
  private:
@@ -74,7 +75,7 @@ class ScheduledStorageDevice final : public IStorageDevice {
   bool run(iosched::IoOp op, uint64_t bytes, Transfer&& transfer);
 
   UniquePointer<IStorageDevice> inner_;
-  iosched::IoScheduler<Lock> scheduler_;
+  mutable iosched::IoScheduler<Lock> scheduler_;   // (its statistics take its lock)
 };
 
 }  // namespace hardware

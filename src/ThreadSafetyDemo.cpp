@@ -198,9 +198,26 @@ void storage_write_main(void* argument) {
   job->ok = job->device->write(job->first_block, original) && job->ok;  // put it back
 }
 
+// Prints a device's properties (its driver's, then its I/O scheduler's) indented, and keeps the "Peak in flight" number.
+struct PropertyPrinter final : hardware::IPropertySink {
+  uint64_t peak = 0;
+  void add(StringView name, StringView value) override {
+    console::puts("      ");
+    console::puts(name);
+    console::puts(": ");
+    console::puts(value);
+    console::puts("\n");
+    if (name == StringView("Peak in flight")) {
+      peak = 0;
+      for (char c : value) peak = peak * 10 + static_cast<uint64_t>(c - '0');
+    }
+  }
+};
+
 bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocator& allocator) {
   if (storage.count() == 0) return true;
-  constexpr uint32_t kReadersPerDevice = 3, kWriters = 4, kMaxDevices = 16;
+  // A device that takes several requests at once (NVMe with a queue per core) gets enough readers to keep it busy.
+  constexpr uint32_t kReadersPerDevice = 3, kReadersPerDeepDevice = 12, kWriters = 4, kMaxDevices = 16;
   struct Reference {
     ByteView data;
     uint32_t blocks = 0;
@@ -208,8 +225,8 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
   };
   const uint32_t devices = storage.count() < kMaxDevices ? storage.count() : kMaxDevices;
   Reference references[kMaxDevices];
-  StorageJob jobs[kMaxDevices * kReadersPerDevice];
-  Thread* threads[kMaxDevices * kReadersPerDevice];
+  StorageJob jobs[kMaxDevices * kReadersPerDeepDevice];
+  Thread* threads[kMaxDevices * kReadersPerDeepDevice];
   StartGate gate;
 
   uint32_t job_count = 0;
@@ -222,7 +239,8 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     if (references[d].data.empty() || !dev->read(0, references[d].data)) continue;
     references[d].blocks = blocks;
     references[d].valid = true;
-    for (uint32_t r = 0; r < kReadersPerDevice; ++r) {
+    const uint32_t readers = info.queue_depth > 1 ? kReadersPerDeepDevice : kReadersPerDevice;
+    for (uint32_t r = 0; r < readers; ++r) {
       StorageJob& job = jobs[job_count];
       job = {dev, &gate, references[d].data, blocks, info.block_size, 31 * (d + 1) + r, 120, false,
              allocate_view<uint8_t>(allocator, uint64_t{17} * info.block_size)};
@@ -285,6 +303,21 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
   }
   ok &= report("storage: concurrent random reads match the reference", readers_ok);
   if (writer_count) ok &= report("storage: concurrent writes to disjoint regions verify and restore", writers_ok);
+  // Devices with a deep queue: what the driver and the scheduler saw. Several readers at once must have had several requests on the device.
+  bool deep = false, overlapped = true;
+  for (uint32_t d = 0; d < devices; ++d) {
+    hardware::IStorageDevice* dev = storage.at(d);
+    if (!references[d].valid || dev->info().queue_depth <= 1) continue;
+    deep = true;
+    console::Guard guard;
+    console::puts("    ");
+    console::puts(dev->name());
+    console::puts(":\n");
+    PropertyPrinter printer;
+    dev->describe(printer);
+    overlapped &= printer.peak > 1;
+  }
+  if (deep) ok &= report("storage: requests overlap on devices with a deep queue", overlapped);
   return ok;
 }
 

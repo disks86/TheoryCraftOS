@@ -33,7 +33,7 @@ class PciMsix {
   static constexpr uint8_t kCapabilityId = 0x11;
   static constexpr uint32_t kMaxEntries = 2048;
 
-  PciMsix(IPciBus& bus, IRegisterMapper& mapper) : bus_(bus), mapper_(mapper) {}
+  PciMsix(const IPciBus& bus, IRegisterMapper& mapper) : bus_(bus), mapper_(mapper) {}
   ~PciMsix() { disable(); }
   PciMsix(const PciMsix&) = delete;
   PciMsix& operator=(const PciMsix&) = delete;
@@ -44,6 +44,9 @@ class PciMsix {
   // `count` stay masked. False, with nothing changed, if there is no capability, the table is smaller than `count`, the table's BAR is not assigned or cannot be mapped, or the
   // core's id does not fit.
   bool enable(PciAddress function, const uint8_t* vectors, uint32_t count, uint32_t apic_id);
+  // The same with a core per entry: entry i goes to the core with local APIC id `apic_ids[i]` (a device with a queue per core, NVMe, sends each
+  // queue's completions to the core that submits on it).
+  bool enable(PciAddress function, const uint8_t* vectors, const uint32_t* apic_ids, uint32_t count);
   // Sends the entries enable() set up to the core with local APIC id `apic_id` instead: each is masked while its address changes (an interrupt
   // raised meanwhile stays pending and is delivered once it is unmasked). False if not enabled or the id does not fit.
   bool retarget(uint32_t apic_id);
@@ -52,7 +55,7 @@ class PciMsix {
   bool enabled() const { return capability_ != 0; }
 
  private:
-  IPciBus& bus_;
+  const IPciBus& bus_;
   IRegisterMapper& mapper_;
   PciAddress function_{};
   uint16_t capability_ = 0;
