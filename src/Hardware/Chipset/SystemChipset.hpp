@@ -21,7 +21,10 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/Chipset/AMD/AmdFchChipset.hpp"
+#include "Hardware/Chipset/AMD/AmdNodes.hpp"
 #include "Hardware/Chipset/Intel/IntelPchChipset.hpp"
+#include "Hardware/Chipset/Intel/IntelPchThermal.hpp"
+#include "Hardware/Chipset/Intel/IntelTcoWatchdog.hpp"
 #include "Hardware/Chipset/Smbus/SmbusHost.hpp"
 #include "Hardware/Chipset/Smbus/SmbusIoPorts.hpp"
 #include "Hardware/Chipset/Smbus/Spd.hpp"
@@ -48,6 +51,27 @@ class AmdPmMmio final : public IAmdPmRegisters {
   MmioRegion region_;
 };
 
+// The TCO watchdog's registers as x86 I/O ports from TCOBASE.
+class TcoIoPorts final : public ITcoPorts {
+ public:
+  explicit constexpr TcoIoPorts(uint16_t base) : base_(base) {}
+  uint16_t read16(uint8_t reg) override;
+  void write16(uint8_t reg, uint16_t value) override;
+
+ private:
+  uint16_t base_;
+};
+
+// What the TCO watchdog looked like at boot, and what the probe did about it.
+struct WatchdogReport {
+  bool present = false;
+  IntelTcoKind kind = IntelTcoKind::None;
+  bool caused_last_reset = false;   // the previous boot ended with this watchdog running out
+  bool was_running = false;         // the firmware left it counting
+  bool stopped = false;             // ...and the probe halted it (nothing here pings it yet)
+  uint32_t timeout_seconds = 0;
+};
+
 // One memory module found on the SMBus.
 struct MemoryModuleSlot {
   uint8_t slot = 0;   // SMBus address 0x50 + slot
@@ -56,7 +80,8 @@ struct MemoryModuleSlot {
 
 class SystemChipset {
  public:
-  explicit SystemChipset(const ICentralProcessingUnit& cpu) : smbus_(cpu) {}
+  explicit SystemChipset(const ICentralProcessingUnit& cpu) : smbus_(cpu), amd_nodes_(cpu), watchdog_(cpu) {}
+  ~SystemChipset();
   SystemChipset(const SystemChipset&) = delete;
   SystemChipset& operator=(const SystemChipset&) = delete;
 
@@ -76,6 +101,23 @@ class SystemChipset {
     return smbus_.with([&](SmbusHost& host) -> decltype(auto) { return operation(static_cast<ISmbusController&>(host)); });
   }
 
+  // AMD Zen: the nodes, SMN and Data Fabric, with their lock held. Also installed as the SMN reader of cpu_temperature_millicelsius.
+  template <class Operation>
+  decltype(auto) with_amd_nodes(Operation&& operation) {
+    return amd_nodes_.with([&](AmdNodes& nodes) -> decltype(auto) { return operation(static_cast<const AmdNodes&>(nodes)); });
+  }
+  uint32_t amd_node_count() { return with_amd_nodes([](const AmdNodes& n) { return n.node_count(); }); }
+
+  // The PCH thermal sensor (Intel, Haswell..Comet Lake); nullptr when there is none to read.
+  IntelPchThermal* pch_thermal() { return pch_thermal_.attached() ? &pch_thermal_ : nullptr; }
+
+  // The TCO watchdog, with its lock held (attached() is false when there is none).
+  template <class Operation>
+  decltype(auto) with_watchdog(Operation&& operation) {
+    return watchdog_.with([&](IntelTcoWatchdog& w) -> decltype(auto) { return operation(w); });
+  }
+  const WatchdogReport& watchdog_report() const { return watchdog_report_; }
+
   // Reads the SPD of every memory module on the SMBus (addresses 0x50..0x57) into `out`; returns how many answered and decoded. The lock is taken
   // per module, so other users are not held off for the whole scan. Why nothing was scanned goes to `reason` (null when the scan ran).
   uint32_t read_memory_modules(ArrayView<MemoryModuleSlot> out, const char** reason);
@@ -88,6 +130,11 @@ class SystemChipset {
   Optional<AmdPmMmio> pm_mmio_;
   Optional<SmbusIoPorts> ports_;
   Synchronized<SmbusHost> smbus_;
+  Synchronized<AmdNodes> amd_nodes_;
+  IntelPchThermal pch_thermal_;
+  Optional<TcoIoPorts> tco_ports_;
+  Synchronized<IntelTcoWatchdog> watchdog_;
+  WatchdogReport watchdog_report_;
 };
 
 }  // namespace hardware

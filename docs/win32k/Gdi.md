@@ -45,6 +45,11 @@ GDI shares DC attributes with user mode through a shared memory table on Windows
 * The screen is one 32-bit surface (B, G, R, X) made on first use at 1024 x 768 (`set_screen_size`). Window DCs (`create_screen_dc`) have an origin and a list of clip
   rectangles in screen coordinates; the clip of the DC (SelectClipRgn, meta region) is intersected with it. Every change calls `IScreenSink::screen_changed` with the
   bounding rectangle of what the call touched (once per call, when the `Painter` ends).
+* **Window surfaces** (redirection, see `docs/WindowsUserMode.md`, "One window system"): `create_window_surface(hwnd, w, h)` makes a 32-bit surface for a top-level
+  window, filled with the desktop colour; a screen DC made with its id (`create_screen_dc(..., surface)`) draws there, origin and clip in surface coordinates, and every
+  change calls `IWindowSurfaceSink::surface_changed(hwnd, dirty)` instead of the screen sink. `resize_window_surface` starts over blank, `destroy_window_surface` leaves the
+  DCs aimed at it drawing nowhere. The desktop reads the pixels in place (`window_surface_pixels`); a GPU present writes them (`window_surface_bytes`, then
+  `window_surface_damaged`).
 * A memory DC starts with the 1x1 monochrome stock bitmap. Bitmaps are device-dependent (zeroed, default colour table for <= 8 bpp) or DIB sections; DDBs made by
   CreateCompatibleBitmap take the depth of the DC (screen: 32 bpp).
 * **DIB sections** live in the memory of the calling process (so the program can write the pixels directly): the module maps a region in the process's address space

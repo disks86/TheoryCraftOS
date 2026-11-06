@@ -38,6 +38,21 @@ struct Margins { int32_t left = 0, top = 0, right = 0, bottom = 0; };
 // How far the window rectangle reaches past the client rectangle for a style (AdjustWindowRectEx; the algorithm of Windows NT with the metrics of Windows 10).
 Margins nc_margins(uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi, bool padded = true) {
   Margins m;
+  if (redirect_config().on && (style & wn::WS_CAPTION) == wn::WS_CAPTION && !(style & wn::WS_CHILD)) {
+    // the kernel's desktop draws the frame of a top-level with a caption: its sizes (a menu bar and a client edge are still the window's own)
+    const RedirectConfig& s = redirect_config();
+    m.left = m.right = m.bottom = s.frame_border;
+    m.top = s.frame_border + s.frame_title;
+    (void)padded;
+    if (has_menu) m.top += user_misc::system_metrics(SM_CYMENU, dpi);
+    if (ex_style & wn::WS_EX_CLIENTEDGE) {
+      m.left += user_misc::system_metrics(SM_CXEDGE, 96);
+      m.right += user_misc::system_metrics(SM_CXEDGE, 96);
+      m.top += user_misc::system_metrics(SM_CYEDGE, 96);
+      m.bottom += user_misc::system_metrics(SM_CYEDGE, 96);
+    }
+    return m;
+  }
   int32_t adjust = 0;
   if ((ex_style & (wn::WS_EX_STATICEDGE | wn::WS_EX_DLGMODALFRAME)) == wn::WS_EX_STATICEDGE) adjust = 1;
   else if ((ex_style & wn::WS_EX_DLGMODALFRAME) || (style & (wn::WS_THICKFRAME | wn::WS_DLGFRAME))) adjust = 2;
@@ -136,6 +151,40 @@ void apply_zorder(Window* w, uint32_t after) {
 void invalidate_screen_rect(const Rect& screen, const Window* except_tree) {
   Desktop* d = default_desktop();
   if (!d || !d->root) return;
+  if (except_tree && redirect_config().on) {
+    // the desktop composites the top-levels: what a window uncovers is only ever in its own top-level (a top-level uncovers nothing of another)
+    const Window* walk = except_tree;
+    while (walk->parent && walk->parent != d->root) walk = walk->parent;
+    if (walk == except_tree || walk->parent != d->root) return;
+    Window* top = find_window(walk->handle);      // (the same window, as the state holds it)
+    if (!top) return;
+    struct Within {
+      const Rect& area;
+      const Window* except;
+      void visit(Window* parent) {
+        for (Window* c = parent->first_child; c; c = c->next) {
+          if (c == except || !(c->style & wn::WS_VISIBLE)) continue;
+          const Rect hit = rect_intersect(area, client_rect_screen(c));
+          if (!rect_empty(hit)) {
+            int32_t ox, oy;
+            client_origin(c, &ox, &oy);
+            const Rect local = rect_offset(hit, -ox, -oy);
+            invalidate_window(c, &local, true);
+          }
+          visit(c);
+        }
+      }
+    } within{screen, except_tree};
+    const Rect hit = rect_intersect(screen, client_rect_screen(top));
+    if (!rect_empty(hit)) {
+      int32_t ox, oy;
+      client_origin(top, &ox, &oy);
+      const Rect local = rect_offset(hit, -ox, -oy);
+      invalidate_window(top, &local, true);
+    }
+    within.visit(top);
+    return;
+  }
   struct Walker {
     const Rect& area;
     const Window* except;
@@ -167,7 +216,7 @@ void invalidate_screen_rect(const Rect& screen, const Window* except_tree) {
 
 namespace {
 
-constexpr uint32_t kNoShow = 0xFFFF;
+constexpr uint32_t kNoShow = kSwpNoShow;
 
 Rect iconic_rect(Window* w) {
   const int32_t iw = 160, ih = 28;
@@ -181,6 +230,7 @@ Rect maximized_rect(Window* w) {
   const bool popup = (w->style & wn::WS_POPUP) != 0;
   Rect area = user_misc::monitor_rect(user_misc::monitor_from_point(0, 0, 1), !popup);
   if ((w->style & wn::WS_CHILD) && !popup && w->parent && w->parent->parent) area = Rect{0, 0, w->parent->client.right - w->parent->client.left, w->parent->client.bottom - w->parent->client.top};
+  if (redirected(w) && (w->style & wn::WS_CAPTION) == wn::WS_CAPTION) return area;      // (the desktop's maximized frame fills the work area, frame and all)
   gdi::Rect r{area.left, area.top, area.right, area.bottom};
   adjust_window_rect(&r, w->style & ~wn::WS_BORDER, w->ex_style, false, 0);
   return Rect{r.left, r.top, r.right, r.bottom};
@@ -414,9 +464,12 @@ uint64_t swp_step(Call& call, Op& op) {
         w->client = rect_offset(w->client, dx, dy);
       }
       refresh_window_dcs(w);      // (device contexts held by the program follow the window)
-      // paint bookkeeping: what the window covered or now covers must be redrawn
+      if (redirected(w)) sync_surface(w);      // (a redirected top-level's surface follows its size)
+      notify_top_level(w);
+      // paint bookkeeping: what the window covered or now covers must be redrawn (a redirected top-level that only moved needs nothing: the desktop composites it)
       const Rect new_screen = window_rect_screen(w);
-      if (!(flags & wn::SWP_NOREDRAW)) {
+      const bool composited_move = redirected(w) && !size_changed && !(flags & wn::SWP_FRAMECHANGED) && was_visible == ((w->style & wn::WS_VISIBLE) != 0);
+      if (!(flags & wn::SWP_NOREDRAW) && !composited_move) {
         if (was_visible && (!rect_equal(old_screen, new_screen) || (flags & wn::SWP_HIDEWINDOW))) invalidate_screen_rect(old_screen, w);
         if (flags & wn::SWP_HIDEWINDOW) { /* nothing more */ }
         else if ((w->style & wn::WS_VISIBLE) && (!was_visible || size_changed || (flags & wn::SWP_FRAMECHANGED))) {

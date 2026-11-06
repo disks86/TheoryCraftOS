@@ -38,6 +38,7 @@ Painter::~Painter() {
   if (rect_empty(dirty_) || !bitmap_) return;
   if (bitmap_->dib) dib_sync_out(*bitmap_);
   if (bitmap_->is_screen) sink_changed(dirty_);
+  else if (bitmap_->window_surface) window_surface_changed(*bitmap_, dirty_);
 }
 
 bool Painter::visible(int32_t x, int32_t y) const {

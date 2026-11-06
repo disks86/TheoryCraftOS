@@ -76,6 +76,14 @@ wrapper the window is ANSI). A window with procedure 0 (the desktop) is never ca
 * The window manager calls `user_misc::window_destroyed(hwnd)` for every window it destroys and `gdi::` for device contexts and regions. `Win32kUserFallback.cpp` has weak
   stand-ins for those functions so the module links alone; the real modules' definitions replace them. `GetWindowLong(GWL_ID)` of a top-level window answers the menu handle the
   window keeps (`SetMenu` of the user-misc module should call `NtUserSetWindowLong(GWL_ID)`'s equivalent; if it offers `window_menu(hwnd)` the answer can be taken from there).
+* **Redirection** (`Win32kUserRedirect.cpp`, on when the kernel's desktop attaches its bridge): each visible top-level window of the desktop draws, with its tree, on a
+  GDI window surface of its own covering the inside of the desktop's frame (`surface_rect_screen`; created at the first show, resized with the window, dropped on destroy).
+  `visible_region` stops at the top-level (top-levels do not clip one another), `invalidate_screen_rect` stays inside the changed window's tree, and a move that keeps
+  the size, frame and visibility (`composited_move`) invalidates nothing. A top-level with a caption has the desktop's frame sizes as its non-client margins and maximizes
+  to the work area exactly. The observer (`IWindowObserver::top_level_changed`) hears of creation, show/hide, move/size, title, style, activation and destruction.
+  The desktop's side: `top_level_info`, `top_levels`, `move_top_level` (posts `WM_SYSCOMMAND` 0xF1F0 with the rectangle packed in lParam: DefWindowProc runs SetWindowPos
+  in the program's thread, leaving out an unchanged size or position), `activate_top_level` (0: no foreground window), `command_top_level` (SC_*),
+  `present_to_window_locked` (a GPU flip into the client area). The settings live outside `State` (`redirect_config()`): the desktop sets them before the state exists.
 * Threads that end are noticed when their process ends (process-exit hook) or when a send to them finds the thread record finished; a per-thread exit hook is missing.
 * Not done: WM_ERASEBKGND painting (needs a fill in the GDI contract), the visible-region update of device contexts held across moves is done on SetWindowPos only for the
   window moved, WM_GETMINMAXINFO on maximize, tooltips/hover (WM_MOUSEHOVER), foreground lock, input contexts.

@@ -31,6 +31,7 @@ struct Row {
   F form;
   ArrayView<const uint16_t> smbus;
   bool spi_function;
+  IntelTcoKind tco;
 };
 
 // SMBus device IDs: Linux drivers/i2c/busses/i2c-i801.c (and include/linux/pci_ids.h).
@@ -70,6 +71,8 @@ constexpr uint16_t kArrowLakeH[] = {0x7722};
 constexpr uint16_t kPantherLakeH[] = {0xE322};
 constexpr uint16_t kPantherLakeP[] = {0xE422};
 constexpr uint16_t kWildcatLake[] = {0x4D22};
+constexpr uint16_t kNovaLakeS[] = {0x6E23};
+constexpr uint16_t kDiamondRapids[] = {0x5827};
 constexpr uint16_t kEmmitsburg[] = {0x1BC9};
 constexpr uint16_t kBirchStream[] = {0x5796};
 constexpr uint16_t kDenverton[] = {0x19DF};
@@ -81,51 +84,53 @@ constexpr uint16_t kJasperLake[] = {0x4DA3};
 constexpr ArrayView<const uint16_t> kNone;
 
 constexpr Row kRows[] = {
-    {P::Ich8, "ICH8", "965 series (P965, G965, Q965; GM965 laptops)", F::Discrete, kIch8, false},
-    {P::Ich9, "ICH9", "3 series (P35, G33, X38, Q35), 4 series laptops (GM45, PM45)", F::Discrete, kIch9, false},
-    {P::Ich10, "ICH10", "4 series (P45, G45, X48, Q45), X58, 5520", F::Discrete, kIch10, false},
-    {P::IbexPeak, "Ibex Peak", "5 series (P55, H55, H57, Q57; HM55/HM57), 3400 series", F::Discrete, kIbexPeak, false},
-    {P::CougarPoint, "Cougar Point", "6 series (Z68, P67, H67, H61, B65, Q67; HM65/HM67), C200", F::Discrete, kCougarPoint, false},
-    {P::Patsburg, "Patsburg", "X79, C600", F::Discrete, kPatsburg, false},
-    {P::PantherPoint, "Panther Point", "7 series (Z77, Z75, H77, B75, Q77; HM76/HM77), C216", F::Discrete, kPantherPoint, false},
-    {P::LynxPoint, "Lynx Point", "8 series (Z87, H87, H81, B85, Q87; HM86/HM87), C220", F::Discrete, kLynxPoint, false},
-    {P::LynxPointLp, "Lynx Point-LP", "the PCH in Haswell-U/Y packages", F::OnPackage, kLynxPointLp, false},
-    {P::Wellsburg, "Wellsburg", "X99, C610", F::Discrete, kWellsburg, false},
-    {P::WildcatPoint, "Wildcat Point", "9 series (Z97, H97)", F::Discrete, kWildcatPoint, false},
-    {P::WildcatPointLp, "Wildcat Point-LP", "the PCH in Broadwell-U/Y packages", F::OnPackage, kWildcatPointLp, false},
-    {P::SunrisePointH, "Sunrise Point-H", "100 series (Z170, H170, B150, H110, Q170, Q150; CM236, HM170), C230", F::Discrete, kSunrisePointH, true},
-    {P::SunrisePointLp, "Sunrise Point-LP", "the PCH in Skylake-U/Y and Kaby Lake-U/Y/R packages", F::OnPackage, kSunrisePointLp, true},
-    {P::UnionPoint, "Union Point", "200 series (Z270, H270, B250, Q270, Q250), Z370, B365, X299", F::Discrete, kUnionPoint, true},
-    {P::Lewisburg, "Lewisburg", "C620 series (C621..C628, C621A..C627A)", F::Discrete, kLewisburg, true},
-    {P::CannonPointH, "Cannon Point-H", "300 series (Z390, H370, B360, H310, Q370; HM370, QM370), C240", F::Discrete, kCannonPointH, true},
-    {P::CannonPointLp, "Cannon Point-LP", "the PCH in Whiskey Lake-U and Cannon Lake-U packages", F::OnPackage, kCannonPointLp, true},
-    {P::CometLakeH, "Comet Lake PCH-H", "400 series (Z490, H470, B460, H410, Q470, W480; HM470), C250", F::Discrete, kCometLakeH, true},
-    {P::CometLakeV, "Comet Lake PCH-V", "B460, H410 (the 22 nm parts)", F::Discrete, kCometLakeV, true},
-    {P::CometLakeLp, "Comet Lake PCH-LP", "the PCH in Comet Lake-U packages", F::OnPackage, kCometLakeLp, true},
-    {P::IceLakeLp, "Ice Lake PCH-LP", "the PCH in Ice Lake-U/Y packages", F::OnPackage, kIceLakeLp, true},
-    {P::IceLakeN, "Ice Lake PCH-N", "Ice Lake-N", F::OnPackage, kIceLakeN, true},
-    {P::TigerLakeLp, "Tiger Lake PCH-LP", "the PCH in Tiger Lake-UP3/UP4 packages", F::OnPackage, kTigerLakeLp, true},
-    {P::TigerLakeH, "Tiger Lake PCH-H", "500 series (Z590, H570, B560, H510, Q570, W580; HM570, WM590)", F::Discrete, kTigerLakeH, true},
-    {P::AlderLakeS, "Alder Lake PCH-S", "600 series (Z690, H670, B660, H610, Q670, W680)", F::Discrete, kAlderLakeS, true},
-    {P::AlderLakeP, "Alder Lake PCH-P", "the PCH in Alder Lake-P/H/U and Raptor Lake-P/H/U packages", F::OnPackage, kAlderLakeP, true},
-    {P::AlderLakeN, "Alder Lake PCH-N", "the PCH in Alder Lake-N (N100..N305, i3-N) and Alder Lake-M packages", F::OnPackage, kAlderLakeN, true},
-    {P::RaptorLakeS, "Raptor Lake PCH-S", "700 series (Z790, H770, B760)", F::Discrete, kRaptorLakeS, true},
-    {P::MeteorLakeP, "Meteor Lake SoC", "the SoC tile of Core Ultra 100 (Meteor Lake-U/H) and Core Ultra 200U (Arrow Lake-U)", F::Soc, kMeteorLakeP, true},
-    {P::MeteorLakeSocS, "Meteor Lake SoC-S", "the SoC tile of the Meteor Lake-S and Arrow Lake-S packages", F::Soc, kMeteorLakeSocS, true},
-    {P::ArrowLakeS, "Arrow Lake PCH-S", "800 series (Z890, B860, H810, Q870, W880)", F::Discrete, kArrowLakeS, true},
-    {P::ArrowLakeH, "Arrow Lake-H SoC", "the SoC tile of Core Ultra 200H (Arrow Lake-H)", F::Soc, kArrowLakeH, true},
-    {P::LunarLake, "Lunar Lake SoC", "the platform controller of Core Ultra 200V (Lunar Lake)", F::Soc, kNone, true},
-    {P::PantherLakeH, "Panther Lake-H SoC", "the platform controller of Core Ultra 300H (Panther Lake-H)", F::Soc, kPantherLakeH, true},
-    {P::PantherLakeP, "Panther Lake-P SoC", "the platform controller of Core Ultra 300U/P (Panther Lake-U/P)", F::Soc, kPantherLakeP, true},
-    {P::WildcatLake, "Wildcat Lake SoC", "the platform controller of Wildcat Lake", F::Soc, kWildcatLake, true},
-    {P::Emmitsburg, "Emmitsburg", "C740 series (C741)", F::Discrete, kEmmitsburg, true},
-    {P::BirchStream, "Birch Stream", "the Xeon 6 platform (Granite Rapids, Sierra Forest, Clearwater Forest)", F::Soc, kBirchStream, true},
-    {P::Denverton, "Denverton", "Atom C3000", F::Soc, kDenverton, true},
-    {P::CedarFork, "Cedar Fork", "the PCH of Snow Ridge (Atom P5900)", F::Soc, kCedarFork, true},
-    {P::ApolloLake, "Apollo Lake (Broxton)", "Pentium/Celeron N4200/J3455, Atom E3900", F::Soc, kApolloLake, true},
-    {P::GeminiLake, "Gemini Lake", "Pentium Silver/Celeron N4000/J4105", F::Soc, kGeminiLake, true},
-    {P::ElkhartLake, "Elkhart Lake", "Atom x6000E, Pentium/Celeron J6000/N6000 embedded", F::Soc, kElkhartLake, true},
-    {P::JasperLake, "Jasper Lake", "Pentium Silver/Celeron N5000/N6000", F::Soc, kJasperLake, true},
+    {P::Ich8, "ICH8", "965 series (P965, G965, Q965; GM965 laptops)", F::Discrete, kIch8, false, IntelTcoKind::None},
+    {P::Ich9, "ICH9", "3 series (P35, G33, X38, Q35), 4 series laptops (GM45, PM45)", F::Discrete, kIch9, false, IntelTcoKind::None},
+    {P::Ich10, "ICH10", "4 series (P45, G45, X48, Q45), X58, 5520", F::Discrete, kIch10, false, IntelTcoKind::None},
+    {P::IbexPeak, "Ibex Peak", "5 series (P55, H55, H57, Q57; HM55/HM57), 3400 series", F::Discrete, kIbexPeak, false, IntelTcoKind::None},
+    {P::CougarPoint, "Cougar Point", "6 series (Z68, P67, H67, H61, B65, Q67; HM65/HM67), C200", F::Discrete, kCougarPoint, false, IntelTcoKind::None},
+    {P::Patsburg, "Patsburg", "X79, C600", F::Discrete, kPatsburg, false, IntelTcoKind::None},
+    {P::PantherPoint, "Panther Point", "7 series (Z77, Z75, H77, B75, Q77; HM76/HM77), C216", F::Discrete, kPantherPoint, false, IntelTcoKind::None},
+    {P::LynxPoint, "Lynx Point", "8 series (Z87, H87, H81, B85, Q87; HM86/HM87), C220", F::Discrete, kLynxPoint, false, IntelTcoKind::None},
+    {P::LynxPointLp, "Lynx Point-LP", "the PCH in Haswell-U/Y packages", F::OnPackage, kLynxPointLp, false, IntelTcoKind::None},
+    {P::Wellsburg, "Wellsburg", "X99, C610", F::Discrete, kWellsburg, false, IntelTcoKind::None},
+    {P::WildcatPoint, "Wildcat Point", "9 series (Z97, H97)", F::Discrete, kWildcatPoint, false, IntelTcoKind::None},
+    {P::WildcatPointLp, "Wildcat Point-LP", "the PCH in Broadwell-U/Y packages", F::OnPackage, kWildcatPointLp, false, IntelTcoKind::None},
+    {P::SunrisePointH, "Sunrise Point-H", "100 series (Z170, H170, B150, H110, Q170, Q150; CM236, HM170), C230", F::Discrete, kSunrisePointH, true, IntelTcoKind::Version4},
+    {P::SunrisePointLp, "Sunrise Point-LP", "the PCH in Skylake-U/Y and Kaby Lake-U/Y/R packages", F::OnPackage, kSunrisePointLp, true, IntelTcoKind::Version4},
+    {P::UnionPoint, "Union Point", "200 series (Z270, H270, B250, Q270, Q250), Z370, B365, X299", F::Discrete, kUnionPoint, true, IntelTcoKind::Version4},
+    {P::Lewisburg, "Lewisburg", "C620 series (C621..C628, C621A..C627A)", F::Discrete, kLewisburg, true, IntelTcoKind::Version4},
+    {P::CannonPointH, "Cannon Point-H", "300 series (Z390, H370, B360, H310, Q370; HM370, QM370), C240", F::Discrete, kCannonPointH, true, IntelTcoKind::Version6},
+    {P::CannonPointLp, "Cannon Point-LP", "the PCH in Whiskey Lake-U and Cannon Lake-U packages", F::OnPackage, kCannonPointLp, true, IntelTcoKind::Version6},
+    {P::CometLakeH, "Comet Lake PCH-H", "400 series (Z490, H470, B460, H410, Q470, W480; HM470), C250", F::Discrete, kCometLakeH, true, IntelTcoKind::Version6},
+    {P::CometLakeV, "Comet Lake PCH-V", "B460, H410 (the 22 nm parts)", F::Discrete, kCometLakeV, true, IntelTcoKind::Version4},
+    {P::CometLakeLp, "Comet Lake PCH-LP", "the PCH in Comet Lake-U packages", F::OnPackage, kCometLakeLp, true, IntelTcoKind::Version6},
+    {P::IceLakeLp, "Ice Lake PCH-LP", "the PCH in Ice Lake-U/Y packages", F::OnPackage, kIceLakeLp, true, IntelTcoKind::Version6},
+    {P::IceLakeN, "Ice Lake PCH-N", "Ice Lake-N", F::OnPackage, kIceLakeN, true, IntelTcoKind::Version6},
+    {P::TigerLakeLp, "Tiger Lake PCH-LP", "the PCH in Tiger Lake-UP3/UP4 packages", F::OnPackage, kTigerLakeLp, true, IntelTcoKind::Version6},
+    {P::TigerLakeH, "Tiger Lake PCH-H", "500 series (Z590, H570, B560, H510, Q570, W580; HM570, WM590)", F::Discrete, kTigerLakeH, true, IntelTcoKind::Version6},
+    {P::AlderLakeS, "Alder Lake PCH-S", "600 series (Z690, H670, B660, H610, Q670, W680)", F::Discrete, kAlderLakeS, true, IntelTcoKind::Version6},
+    {P::AlderLakeP, "Alder Lake PCH-P", "the PCH in Alder Lake-P/H/U and Raptor Lake-P/H/U packages", F::OnPackage, kAlderLakeP, true, IntelTcoKind::Version6},
+    {P::AlderLakeN, "Alder Lake PCH-N", "the PCH in Alder Lake-N (N100..N305, i3-N) and Alder Lake-M packages", F::OnPackage, kAlderLakeN, true, IntelTcoKind::Version6},
+    {P::RaptorLakeS, "Raptor Lake PCH-S", "700 series (Z790, H770, B760)", F::Discrete, kRaptorLakeS, true, IntelTcoKind::Version6},
+    {P::MeteorLakeP, "Meteor Lake SoC", "the SoC tile of Core Ultra 100 (Meteor Lake-U/H) and Core Ultra 200U (Arrow Lake-U)", F::Soc, kMeteorLakeP, true, IntelTcoKind::Version6},
+    {P::MeteorLakeSocS, "Meteor Lake SoC-S", "the SoC tile of the Meteor Lake-S and Arrow Lake-S packages", F::Soc, kMeteorLakeSocS, true, IntelTcoKind::Version6},
+    {P::ArrowLakeS, "Arrow Lake PCH-S", "800 series (Z890, B860, H810, Q870, W880)", F::Discrete, kArrowLakeS, true, IntelTcoKind::Version6},
+    {P::ArrowLakeH, "Arrow Lake-H SoC", "the SoC tile of Core Ultra 200H (Arrow Lake-H)", F::Soc, kArrowLakeH, true, IntelTcoKind::Version6},
+    {P::LunarLake, "Lunar Lake SoC", "the platform controller of Core Ultra 200V (Lunar Lake)", F::Soc, kNone, true, IntelTcoKind::None},
+    {P::PantherLakeH, "Panther Lake-H SoC", "the platform controller of Core Ultra 300H (Panther Lake-H)", F::Soc, kPantherLakeH, true, IntelTcoKind::Version6},
+    {P::PantherLakeP, "Panther Lake-P SoC", "the platform controller of Core Ultra 300U/P (Panther Lake-U/P)", F::Soc, kPantherLakeP, true, IntelTcoKind::Version6},
+    {P::WildcatLake, "Wildcat Lake SoC", "the platform controller of Wildcat Lake", F::Soc, kWildcatLake, true, IntelTcoKind::Version6},
+    {P::NovaLakeS, "Nova Lake PCH-S", "the PCH of Nova Lake-S desktops", F::Discrete, kNovaLakeS, true, IntelTcoKind::Version6},
+    {P::Emmitsburg, "Emmitsburg", "C740 series (C741)", F::Discrete, kEmmitsburg, true, IntelTcoKind::Version6},
+    {P::DiamondRapids, "Diamond Rapids platform", "the Xeon platform of Diamond Rapids", F::Soc, kDiamondRapids, true, IntelTcoKind::None},
+    {P::BirchStream, "Birch Stream", "the Xeon 6 platform (Granite Rapids, Sierra Forest, Clearwater Forest)", F::Soc, kBirchStream, true, IntelTcoKind::None},
+    {P::Denverton, "Denverton", "Atom C3000", F::Soc, kDenverton, true, IntelTcoKind::Version4},
+    {P::CedarFork, "Cedar Fork", "the PCH of Snow Ridge (Atom P5900)", F::Soc, kCedarFork, true, IntelTcoKind::Version6},
+    {P::ApolloLake, "Apollo Lake (Broxton)", "Pentium/Celeron N4200/J3455, Atom E3900", F::Soc, kApolloLake, true, IntelTcoKind::None},
+    {P::GeminiLake, "Gemini Lake", "Pentium Silver/Celeron N4000/J4105", F::Soc, kGeminiLake, true, IntelTcoKind::None},
+    {P::ElkhartLake, "Elkhart Lake", "Atom x6000E, Pentium/Celeron J6000/N6000 embedded", F::Soc, kElkhartLake, true, IntelTcoKind::Version6},
+    {P::JasperLake, "Jasper Lake", "Pentium Silver/Celeron N5000/N6000", F::Soc, kJasperLake, true, IntelTcoKind::Version6},
 };
 
 IntelPchInfo info_of(const Row& row) {
@@ -136,6 +141,7 @@ IntelPchInfo info_of(const Row& row) {
   info.form = row.form;
   info.smbus_ids = row.smbus;
   info.spi_function = row.spi_function;
+  info.tco = row.tco;
   return info;
 }
 
@@ -212,6 +218,9 @@ constexpr CpuRow kCpus[] = {
     {6, 0x7A, 0x0, 0xF, {P::GeminiLake}},                         // Goldmont Plus
     {6, 0x96, 0x0, 0xF, {P::ElkhartLake}},                        // Elkhart Lake
     {6, 0x9C, 0x0, 0xF, {P::JasperLake}},                         // Jasper Lake
+    {18, 0x01, 0x0, 0xF, {P::NovaLakeS}},                         // Nova Lake-S
+    {18, 0x03, 0x0, 0xF, {P::NovaLakeS}},
+    {19, 0x01, 0x0, 0xF, {P::DiamondRapids}},                     // Diamond Rapids
 };
 }  // namespace
 

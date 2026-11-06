@@ -17,6 +17,8 @@
  */
 #pragma once
 #include <stdint.h>
+#include "ObjectContainer/List.hpp"
+#include "Process/Win32k/Win32k.hpp"
 #include "Process/Win32k/Win32kGdi.hpp"
 
 // What the other win32k modules (and the kernel, which feeds the machine's input in) use of the window manager (Win32kUser*.cpp). The window manager implements everything
@@ -51,13 +53,49 @@ void inject_mouse_button(uint32_t button, bool down);            // 1 left, 2 ri
 void inject_mouse_wheel(int32_t delta, bool horizontal);
 void cursor_position(int32_t* x, int32_t* y);                    // takes the lock itself
 void set_cursor_position(int32_t x, int32_t y);
-bool cursor_confined();                                          // a program keeps the cursor in a rectangle (ClipCursor); takes the lock                  // SetCursorPos / ClipCursor: the cursor moves (WM_MOUSEMOVE), but it is not input (no raw input); takes the lock
+bool cursor_confined();                                          // a program keeps the cursor in a rectangle (ClipCursor); takes the lock
+uint32_t mouse_capture_window();                                 // the window that has the mouse captured (SetCapture), 0: none; takes the lock                  // SetCursorPos / ClipCursor: the cursor moves (WM_MOUSEMOVE), but it is not input (no raw input); takes the lock
 // Times and timers: the window manager's timers (SetTimer) and the delayed things (tooltips, double-click time) are due by the monotonic clock of the process hosts. The kernel
 // calls this now and then (the desktop pump), and every message wait calls it; it posts WM_TIMER / WM_PAINT-like pending work. Takes the lock itself.
 void pump(uint64_t now_ns);
 
 // AdjustWindowRectEx: grows `rect` (a client rectangle) to the window rectangle for the style (the caption, frame and menu bar sizes come from user_misc::system_metrics).
 bool adjust_window_rect(gdi::Rect* rect, uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi);
+
+// --- Redirection: the kernel's desktop shows each top-level window as one of its own windows (Win32kDesktopBridge). Each function takes the system lock.
+// The observer is told (with the lock held: it must only record it) when a top-level window was made, destroyed, shown, hidden, moved, sized, retitled, activated or
+// changed its style.
+class IWindowObserver {
+ public:
+  virtual void top_level_changed(uint32_t hwnd) = 0;
+
+ protected:
+  IWindowObserver() = default;
+  ~IWindowObserver() = default;
+};
+void set_redirection(bool on, IWindowObserver* observer, int32_t frame_border, int32_t frame_title);
+struct TopLevelInfo {
+  bool exists = false, visible = false, minimized = false, maximized = false, active = false;
+  bool caption = false, sizable = false, minimize_box = false, maximize_box = false, tool = false, topmost = false;
+  bool popup = false, no_activate = false;      // WS_POPUP, WS_EX_NOACTIVATE
+  gdi::Rect window;          // screen coordinates (= the desktop's)
+  gdi::Rect surface;         // the part the window surface covers (inside the desktop's frame)
+  uint32_t surface_id = 0, owner = 0;
+  uint64_t pid = 0;
+};
+bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title);
+void top_levels(List<uint32_t>* out);                                      // the visible redirected top-levels, topmost first
+// What the desktop's window does to its top-level: the user moved or sized it (window rectangle, screen coordinates), activated it, asked to close / minimize /
+// maximize / restore it (WM_SYSCOMMAND to the program, as a click on its own caption would).
+bool move_top_level(uint32_t hwnd, const gdi::Rect& window);
+bool activate_top_level(uint32_t hwnd);                                     // 0: no Windows window is active (the desktop's own is)
+uint32_t top_level_surface_locked(uint32_t hwnd);                         // the window surface (gdi::window_surface_pixels) of a top-level; the caller holds the lock
+bool command_top_level(uint32_t hwnd, uint32_t sc);
+// A GPU present into a window (a flip of a swapchain made for it): the picture (32-bit pixels, rows `pitch` bytes apart, B, G, R, A bytes or R, G, B, A when `rgba`)
+// goes into the window surface with its top left at the client area's, clipped to the client area. False when the window is not a redirected one (the caller shows it
+// on the display then). The caller holds the lock.
+bool window_redirected_locked(uint32_t hwnd);
+bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t width, uint32_t height, uint32_t pitch, bool rgba);                       // SC_CLOSE, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // (the window manager's own declarations follow)

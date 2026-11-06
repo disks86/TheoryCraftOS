@@ -85,7 +85,7 @@ void Frame::restore() {
 void Frame::close() {
   UiGuard lock(this);
   if (host_) host_->close_tab(this);
-  else if (manager_) manager_->close_window(this);
+  else if (manager_ && close_requested()) manager_->close_window(this);
 }
 void Frame::dock(Dock edge) {
   UiGuard lock(this);
@@ -112,7 +112,7 @@ Rect2D Frame::client_rect() const {
     const int32_t pw = static_cast<int32_t>(bounds_.width) - padding().left - padding().right, ph = static_cast<int32_t>(bounds_.height) - padding().top - padding().bottom;
     return {padding().left, padding().top, static_cast<uint32_t>(pw > 0 ? pw : 0), static_cast<uint32_t>(ph > 0 ? ph : 0)};
   }
-  if (fullscreen_) {   // nothing but the surface
+  if (fullscreen_ || !decorated_) {   // nothing but the surface
     const int32_t fw = static_cast<int32_t>(bounds_.width) - padding().left - padding().right, fh = static_cast<int32_t>(bounds_.height) - padding().top - padding().bottom;
     return {padding().left, padding().top, static_cast<uint32_t>(fw > 0 ? fw : 0), static_cast<uint32_t>(fh > 0 ? fh : 0)};
   }
@@ -147,7 +147,7 @@ bool Frame::button_enabled(Part button) const {
 Frame::Part Frame::part_at(int32_t x, int32_t y) const {
   const int32_t w = static_cast<int32_t>(bounds_.width), h = static_cast<int32_t>(bounds_.height);
   if (x < 0 || y < 0 || x >= w || y >= h) return Part::None;
-  if (host_ || fullscreen_) return Part::Client;
+  if (host_ || fullscreen_ || !decorated_) return Part::Client;
   static const Part kButtons[8] = {Part::Close, Part::Maximize, Part::Minimize, Part::DockLeft, Part::DockRight, Part::DockTop, Part::DockBottom, Part::Tile};
   for (Part b : kButtons) {
     if ((is_dock_part(b) || b == Part::Tile) && !dock_enabled()) continue;
@@ -235,12 +235,21 @@ void Frame::draw_button(Painter& painter, Part button) {
 
 void Frame::paint(Painter& painter) {
   const Theme& t = painter.theme();
-  if (host_ || fullscreen_) {   // a tab (or a window in fullscreen) has only its surface
-    painter.fill({0, 0, bounds_.width, bounds_.height}, t.face);
+  if (host_ || fullscreen_ || !decorated_) {   // a tab (or a window in fullscreen, or an undecorated one) has only its surface
+    if (!opaque_client_) painter.fill({0, 0, bounds_.width, bounds_.height}, t.face);
     return;
   }
   const Rect2D all{0, 0, bounds_.width, bounds_.height};
-  painter.fill(all, t.face);
+  if (!opaque_client_) {
+    painter.fill(all, t.face);
+  } else {   // the frame around the client area only
+    const Rect2D c = client_rect();
+    const uint32_t right = static_cast<uint32_t>(c.x) + c.width, bottom = static_cast<uint32_t>(c.y) + c.height;
+    painter.fill({0, 0, bounds_.width, static_cast<uint32_t>(c.y)}, t.face);
+    painter.fill({0, c.y, static_cast<uint32_t>(c.x), c.height}, t.face);
+    if (bounds_.width > right) painter.fill({static_cast<int32_t>(right), c.y, bounds_.width - right, c.height}, t.face);
+    if (bounds_.height > bottom) painter.fill({0, static_cast<int32_t>(bottom), bounds_.width, bounds_.height - bottom}, t.face);
+  }
   painter.bevel(all, false);
   const Rect2D bar{kBorder, kBorder, bounds_.width - 2 * kBorder, static_cast<uint32_t>(kTitleHeight)};
   const bool lit = active_ && enabled();
