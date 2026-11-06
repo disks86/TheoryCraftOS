@@ -508,8 +508,7 @@ functions:
       if (image->dim == 0 || image->dim == 5 || image->dim == 4) return sp_fail(m, "1D, rect and buffer images");
       if (image->ms) return sp_fail(m, "multisampled images in shaders");
       r->kind = et->kind == T_SAMPLED ? SPV_RES_COMBINED : SPV_RES_IMAGE;
-      r->dim = image->dim == 2 ? SPV_DIM_3D : image->dim == 3 ? SPV_DIM_CUBE : image->arrayed ? SPV_DIM_2D_ARRAY : SPV_DIM_2D;
-      if (image->dim == 3 && image->arrayed) return sp_fail(m, "cube map arrays");
+      r->dim = image->dim == 2 ? SPV_DIM_3D : image->dim == 3 ? (image->arrayed ? SPV_DIM_CUBE_ARRAY : SPV_DIM_CUBE) : image->arrayed ? SPV_DIM_2D_ARRAY : SPV_DIM_2D;
       r->depth = image->depth == 1;
     } else {
       return sp_fail(m, "unsupported resource");

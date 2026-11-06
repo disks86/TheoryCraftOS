@@ -588,22 +588,54 @@ static int do_access_chain(Mod *m, uint32_t off) {
       }
       continue;
     }
-    /* a register-resident variable */
-    if (!is_const) return sp_fail(m, "dynamic indexing of an array or vector held in registers");
+    /* a register-resident variable (a dynamic index: an element or component picked when it is used, see reg_load / reg_store) */
+    if (!is_const && t->kind != T_ARRAY && t->kind != T_MAT && t->kind != T_VEC) return sp_fail(m, "dynamic struct index");
     switch (t->kind) {
       case T_STRUCT:
         if (index >= t->nmem) return sp_fail(m, "struct index");
         for (uint32_t i = 0; i < index; ++i) r->leaf0 += (uint32_t)type_nleaf(m, t->mem[i]);
         cur = t->mem[index];
         break;
-      case T_ARRAY: case T_MAT:
-        if (index >= t->count) return sp_fail(m, "index past the end of an array");
-        r->leaf0 += index * (uint32_t)type_nleaf(m, t->elem);
+      case T_ARRAY: case T_MAT: {
+        uint32_t n = (uint32_t)type_nleaf(m, t->elem);
+        if (is_const) {
+          if (index >= t->count) return sp_fail(m, "index past the end of an array");
+          r->leaf0 += index * n;
+        } else {
+          Val *iv = val_of(m, m->w[off + k]);
+          if (!iv) return 1;
+          if (r->cdyn_on) return sp_fail(m, "a dynamic index after a dynamic vector component");
+          Leaf ix = as_temp(m, &iv->leaf[0]);
+          if (r->dyn_on && r->rdims == 4) return sp_fail(m, "more than four dynamic indices into registers");
+          if (r->dyn_on) {   /* (the flat number: the earlier ones times this count, plus this index) */
+            Leaf prev;
+            sp_zero(&prev, sizeof prev);
+            prev.op = op_temp(r->dyn_reg);
+            prev.op.swz[0] = prev.op.swz[1] = prev.op.swz[2] = prev.op.swz[3] = (sp_u8)r->dyn_comp;
+            prev.n = 1, prev.cls = CLS_I;
+            Leaf count = imm_u(t->count, 1, CLS_I);
+            ix = alu(m, D_IMAD, 1, CLS_I, &prev, &count, &ix);
+          } else {
+            r->dyn_on = 1, r->rdims = 0, r->rcount = 1;
+          }
+          r->rcnt[r->rdims] = t->count, r->rstr[r->rdims] = n, ++r->rdims;
+          r->rcount *= t->count;
+          r->dyn_reg = ix.op.idx, r->dyn_comp = ix.op.swz[0];
+          if (r->rcount > 256) return sp_fail(m, "a dynamic index into more than 256 places held in registers");
+        }
         cur = t->elem;
         break;
+      }
       case T_VEC:
-        if (index >= t->count) return sp_fail(m, "vector component index");
-        r->comp = (sp_u8)index;
+        if (is_const) {
+          if (index >= t->count) return sp_fail(m, "vector component index");
+          r->comp = (sp_u8)index;
+        } else {
+          Val *iv = val_of(m, m->w[off + k]);
+          if (!iv) return 1;
+          Leaf ix = as_temp(m, &iv->leaf[0]);
+          r->cdyn_on = 1, r->cdyn_reg = ix.op.idx, r->cdyn_comp = ix.op.swz[0];
+        }
         cur = t->elem;
         break;
       default: return sp_fail(m, "bad access chain");
@@ -612,6 +644,49 @@ static int do_access_chain(Mod *m, uint32_t off) {
   r->type = cur;
   if (id < m->bound) set_val(m, id, r);
   return 0;
+}
+
+/* The integer leaf a dynamic index is kept in. */
+static Leaf index_leaf(uint32_t reg, uint32_t comp) {
+  Leaf l;
+  sp_zero(&l, sizeof l);
+  l.op = op_temp(reg);
+  l.op.swz[0] = l.op.swz[1] = l.op.swz[2] = l.op.swz[3] = (sp_u8)comp;
+  l.op.ncomp = 1;
+  l.n = 1, l.cls = CLS_I;
+  return l;
+}
+
+/* The first leaf of candidate f of a pointer with dynamic indices into registers (see Val::rdims). */
+static uint32_t candidate_leaf(const Val *p, uint32_t f) {
+  uint32_t at = p->leaf0;
+  for (int d = (int)p->rdims - 1; d >= 0; --d) {
+    at += (f % p->rcnt[d]) * p->rstr[d];
+    f /= p->rcnt[d];
+  }
+  return at;
+}
+
+/* One of `n` candidates by an integer index: a chain of comparisons and movc (an index out of range gives the first). */
+static Leaf select_leaf(Mod *m, const Leaf *cands, uint32_t n, const Leaf *index) {
+  Leaf acc = cands[0];
+  for (uint32_t e = 1; e < n; ++e) {
+    Leaf k = imm_u(e, 1, CLS_I);
+    Leaf c = alu(m, D_IEQ, 1, CLS_B, index, &k, 0);
+    acc = alu(m, D_MOVC, acc.n, cands[0].cls, &c, &cands[e], &acc);
+  }
+  return n == 1 ? copy_to_temp(m, &acc) : acc;
+}
+
+/* movc dst <- cond ? value : dst, under `mask` of the destination's components (value read component for component). */
+static void movc_into(Mod *m, const Leaf *dst, uint32_t mask, const Leaf *cond, const Leaf *value) {
+  SpIns *i = emit_ins(m, D_MOVC);
+  i->dst[0] = dst->op;
+  i->dst[0].mask = (sp_u8)mask;
+  i->ndst = 1;
+  add_src(i, cond, 4);
+  add_src(i, value, value->n);
+  add_src(i, dst, dst->n);
 }
 
 static const Leaf *var_leaf(Mod *m, const Val *ptr, uint32_t i) {
@@ -668,6 +743,23 @@ static int do_load(Mod *m, uint32_t off) {
     const Leaf *src = var_leaf(m, p, i);
     if (!src) return 1;
     Leaf s = *src;
+    if (p->dyn_on) {   /* the element picked by the dynamic index */
+      Leaf cands[256];
+      if (p->rcount > 256) return sp_fail(m, "access past the end of a variable");
+      for (uint32_t e = 0; e < p->rcount; ++e) {
+        const uint32_t at = candidate_leaf(p, e) + i;
+        if (at >= var->nleaf) return sp_fail(m, "access past the end of a variable");
+        cands[e] = var->leaf[at];
+      }
+      Leaf ix = index_leaf(p->dyn_reg, p->dyn_comp);
+      s = select_leaf(m, cands, p->rcount, &ix);
+    }
+    if (p->cdyn_on) {  /* the component picked by the dynamic index */
+      Leaf comps[4];
+      for (int c = 0; c < s.n; ++c) comps[c] = component_of(&s, c);
+      Leaf ix = index_leaf(p->cdyn_reg, p->cdyn_comp);
+      s = select_leaf(m, comps, s.n, &ix);
+    }
     if (p->comp < 4) s = component_of(&s, p->comp);
     s.cls = rt->kind == T_VEC || rt->kind == T_MAT ? get_type(m, rt->kind == T_MAT ? get_type(m, rt->elem)->elem : rt->elem)->cls : rt->cls;
     if (rt->kind != T_VEC && rt->kind != T_MAT && rt->kind != T_ARRAY && rt->kind != T_STRUCT) s.cls = rt->cls;
@@ -692,6 +784,37 @@ static int do_store(Mod *m, uint32_t ptr_id, uint32_t value_id) {
   }
   Val *var = m->vals[p->var];
   if (!var) return sp_fail(m, "store to an unknown variable");
+  if (p->dyn_on || p->cdyn_on) {   /* every element (component) it may be, each written under its comparison */
+    uint32_t elements = p->dyn_on ? p->rcount : 1;
+    Leaf eix = index_leaf(p->dyn_reg, p->dyn_comp), cix = index_leaf(p->cdyn_reg, p->cdyn_comp);
+    for (uint32_t e = 0; e < elements; ++e) {
+      Leaf ke = imm_u(e, 1, CLS_I);
+      Leaf ce = p->dyn_on ? alu(m, D_IEQ, 1, CLS_B, &eix, &ke, 0) : imm_u(0xFFFFFFFFu, 1, CLS_B);
+      for (uint32_t i = 0; i < v->nleaf; ++i) {
+        uint32_t at = (p->dyn_on ? candidate_leaf(p, e) : p->leaf0) + i;
+        if (at >= var->nleaf) return sp_fail(m, "access past the end of a variable");
+        const Leaf *dst = &var->leaf[at];
+        if (dst->op.file != OF_TEMP) return sp_fail(m, "a dynamic index into an input or output");
+        if (!p->cdyn_on) {
+          if (p->comp < 4) {
+            Leaf one = component_of(&v->leaf[i], 0);
+            movc_into(m, dst, 1u << dst->op.swz[p->comp], &ce, &one);
+          } else {
+            movc_into(m, dst, full_mask(dst->n), &ce, &v->leaf[i]);
+          }
+          continue;
+        }
+        for (int c = 0; c < dst->n; ++c) {
+          Leaf kc = imm_u((uint32_t)c, 1, CLS_I);
+          Leaf cc = alu(m, D_IEQ, 1, CLS_B, &cix, &kc, 0);
+          Leaf both = p->dyn_on ? alu(m, D_AND, 1, CLS_B, &ce, &cc, 0) : cc;
+          Leaf one = component_of(&v->leaf[i], 0);
+          movc_into(m, dst, 1u << dst->op.swz[c], &both, &one);
+        }
+      }
+    }
+    return 0;
+  }
   for (uint32_t i = 0; i < v->nleaf; ++i) {
     const Leaf *dst = var_leaf(m, p, i);
     if (!dst) return 1;
@@ -721,6 +844,45 @@ static SpOp res_op(uint32_t file, uint32_t unit) {
   return o;
 }
 
+/* A cube map lookup as one of a 2D array: the face the direction points at (Vulkan's table: the major axis and its sign), the coordinates on it, and the layer
+ * face + 6 * the cube's index (rounded first, as the array layer of a cube array is). Returns (s, t, layer). */
+static Leaf cube_coordinate(Mod *m, const Leaf *c, int arrayed) {
+  Leaf x = component_of(c, 0), y = component_of(c, 1), z = component_of(c, 2);
+  Leaf ax = x, ay = y, az = z;
+  ax.op.abs = 1, ax.op.neg = 0, ay.op.abs = 1, ay.op.neg = 0, az.op.abs = 1, az.op.neg = 0;
+  Leaf nx = x, ny = y, nz = z;
+  nx.op.neg ^= 1, ny.op.neg ^= 1, nz.op.neg ^= 1;
+  Leaf zero = imm_f(0.0f, 1);
+  Leaf x_over_y = alu(m, D_GE, 1, CLS_B, &ax, &ay, 0), x_over_z = alu(m, D_GE, 1, CLS_B, &ax, &az, 0);
+  Leaf x_major = alu(m, D_AND, 1, CLS_B, &x_over_y, &x_over_z, 0);
+  Leaf y_major = alu(m, D_GE, 1, CLS_B, &ay, &az, 0);
+  Leaf xp = alu(m, D_GE, 1, CLS_B, &x, &zero, 0), yp = alu(m, D_GE, 1, CLS_B, &y, &zero, 0), zp = alu(m, D_GE, 1, CLS_B, &z, &zero, 0);
+  Leaf f0 = imm_f(0.0f, 1), f1 = imm_f(1.0f, 1), f2 = imm_f(2.0f, 1), f3 = imm_f(3.0f, 1), f4 = imm_f(4.0f, 1), f5 = imm_f(5.0f, 1);
+  /* +x / -x: sc = -z / z, tc = -y; +y / -y: sc = x, tc = z / -z; +z / -z: sc = x / -x, tc = -y */
+  Leaf face_x = alu(m, D_MOVC, 1, CLS_F, &xp, &f0, &f1), sc_x = alu(m, D_MOVC, 1, CLS_F, &xp, &nz, &z);
+  Leaf face_y = alu(m, D_MOVC, 1, CLS_F, &yp, &f2, &f3), tc_y = alu(m, D_MOVC, 1, CLS_F, &yp, &z, &nz);
+  Leaf face_z = alu(m, D_MOVC, 1, CLS_F, &zp, &f4, &f5), sc_z = alu(m, D_MOVC, 1, CLS_F, &zp, &x, &nx);
+  Leaf face_yz = alu(m, D_MOVC, 1, CLS_F, &y_major, &face_y, &face_z), sc_yz = alu(m, D_MOVC, 1, CLS_F, &y_major, &x, &sc_z);
+  Leaf tc_yz = alu(m, D_MOVC, 1, CLS_F, &y_major, &tc_y, &ny), ma_yz = alu(m, D_MOVC, 1, CLS_F, &y_major, &ay, &az);
+  Leaf face = alu(m, D_MOVC, 1, CLS_F, &x_major, &face_x, &face_yz), sc = alu(m, D_MOVC, 1, CLS_F, &x_major, &sc_x, &sc_yz);
+  Leaf tc = alu(m, D_MOVC, 1, CLS_F, &x_major, &ny, &tc_yz), ma = alu(m, D_MOVC, 1, CLS_F, &x_major, &ax, &ma_yz);
+  /* s = sc / (2 ma) + 1/2, t = tc / (2 ma) + 1/2 */
+  Leaf two_ma = alu(m, D_ADD, 1, CLS_F, &ma, &ma, 0);
+  Leaf half = imm_f(0.5f, 1);
+  Leaf s = alu(m, D_DIV, 1, CLS_F, &sc, &two_ma, 0), t = alu(m, D_DIV, 1, CLS_F, &tc, &two_ma, 0);
+  s = alu(m, D_ADD, 1, CLS_F, &s, &half, 0), t = alu(m, D_ADD, 1, CLS_F, &t, &half, 0);
+  Leaf layer = face;
+  if (arrayed) {
+    Leaf a = component_of(c, 3);
+    Leaf six = imm_f(6.0f, 1);
+    Leaf cube = alu(m, D_ROUND_NE, 1, CLS_F, &a, 0, 0);
+    layer = alu(m, D_MAD, 1, CLS_F, &cube, &six, &face);
+  }
+  const Leaf *from[3] = {&s, &t, &layer};
+  sp_u8 comps[3] = {0, 0, 0};
+  return gather(m, from, comps, 3, CLS_F);
+}
+
 static int do_image_sample(Mod *m, uint32_t off) {
   uint32_t op = OPC(off), len = LEN(off), rtype = m->w[off + 1], id = m->w[off + 2];
   Val *si = val_of(m, m->w[off + 3]), *coord = val_of(m, m->w[off + 4]);
@@ -746,7 +908,11 @@ static int do_image_sample(Mod *m, uint32_t off) {
   if (!r) return 1;
   /* a cube map, 3D texture and array take their whole coordinate; a 2D one the first two components */
   Leaf coord_use = coord->leaf[0];
-  if (m->res[ri].dim == SPV_DIM_2D && coord_use.n > 2) {
+  if (m->res[ri].dim == SPV_DIM_CUBE || m->res[ri].dim == SPV_DIM_CUBE_ARRAY) {
+    if (dref) return sp_fail(m, "a depth comparison with a cube map");
+    if (gx) return sp_fail(m, "a cube map lookup with gradients");
+    coord_use = cube_coordinate(m, &coord->leaf[0], m->res[ri].dim == SPV_DIM_CUBE_ARRAY);
+  } else if (m->res[ri].dim == SPV_DIM_2D && coord_use.n > 2) {
     const Leaf *src2[2] = {&coord->leaf[0], &coord->leaf[0]};
     sp_u8 comps[2] = {0, 1};
     coord_use = gather(m, src2, comps, 2, CLS_F);
@@ -836,6 +1002,19 @@ static int do_image_size(Mod *m, uint32_t off) {
   Type *rt = get_type(m, rtype);
   uint32_t n = rt->kind == T_VEC ? rt->count : 1;
   Leaf out = info;
+  if (m->res[ri].dim == SPV_DIM_CUBE_ARRAY) {   /* (the cubes: the layers of the 2D array over six) */
+    Leaf six = imm_u(6, 1, CLS_U);
+    Leaf layers = component_of(&info, 2);
+    Leaf cubes = temp_leaf(m, 1, CLS_U, 0), rest = temp_leaf(m, 1, CLS_U, 0);
+    SpIns *d = emit_ins(m, D_UDIV);
+    d->dst[0] = dst_temp(&cubes), d->dst[1] = dst_temp(&rest), d->ndst = 2;
+    add_src(d, &layers, 1);
+    add_src(d, &six, 1);
+    out = copy_to_temp(m, &info);
+    SpIns *mv = emit_ins(m, D_MOV);
+    mv->dst[0] = out.op, mv->dst[0].mask = 4, mv->ndst = 1;
+    add_src(mv, &cubes, 1);
+  }
   out.n = (sp_u8)n, out.cls = CLS_I;
   r->leaf[0] = out;
   return 0;
@@ -1557,8 +1736,31 @@ static int gen_instruction(Mod *m, uint32_t off) {
     case OpCompositeExtract: return do_composite_extract(m, off);
     case OpCompositeInsert: return do_composite_insert(m, off);
     case OpVectorShuffle: return do_vector_shuffle(m, off);
-    case OpVectorExtractDynamic: return sp_fail(m, "dynamic vector indexing");
-    case OpVectorInsertDynamic: return sp_fail(m, "dynamic vector indexing");
+    case OpVectorExtractDynamic: {
+      Val *vec = val_of(m, m->w[off + 3]), *iv = val_of(m, m->w[off + 4]);
+      if (!vec || !iv) return 1;
+      Val *r = result_val(m, m->w[off + 1], m->w[off + 2]);
+      if (!r) return 1;
+      Leaf comps[4], ix = as_temp(m, &iv->leaf[0]);
+      for (int c = 0; c < vec->leaf[0].n; ++c) comps[c] = component_of(&vec->leaf[0], c);
+      r->leaf[0] = select_leaf(m, comps, vec->leaf[0].n, &ix);
+      r->leaf[0].cls = get_type(m, m->w[off + 1])->cls;
+      return 0;
+    }
+    case OpVectorInsertDynamic: {
+      Val *vec = val_of(m, m->w[off + 3]), *comp = val_of(m, m->w[off + 4]), *iv = val_of(m, m->w[off + 5]);
+      if (!vec || !comp || !iv) return 1;
+      Val *r = result_val(m, m->w[off + 1], m->w[off + 2]);
+      if (!r) return 1;
+      Leaf res = copy_to_temp(m, &vec->leaf[0]), ix = as_temp(m, &iv->leaf[0]);
+      for (int c = 0; c < res.n; ++c) {
+        Leaf kc = imm_u((uint32_t)c, 1, CLS_I);
+        Leaf cc = alu(m, D_IEQ, 1, CLS_B, &ix, &kc, 0);
+        movc_into(m, &res, 1u << c, &cc, &comp->leaf[0]);
+      }
+      r->leaf[0] = res;
+      return 0;
+    }
     case OpTranspose: case OpMatrixTimesVector: case OpVectorTimesMatrix: case OpMatrixTimesMatrix: case OpMatrixTimesScalar: case OpOuterProduct: return do_matrix(m, off);
     case OpVectorTimesScalar: {
       uint32_t rtype = m->w[off + 1], id = m->w[off + 2];

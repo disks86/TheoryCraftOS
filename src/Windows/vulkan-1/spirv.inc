@@ -32,8 +32,10 @@
  *    offsets of the module (Offset, ArrayStride, MatrixStride decorations); a column-major matrix is a register per column.
  *  - Memory (storage buffers and Workgroup variables) is addressed by bytes: an access chain into it is a constant offset plus, for dynamic indices, an integer in a temporary; a load is
  *    ld_raw, a store store_raw, an atomic imm_atomic_*. All the Workgroup variables of a compute shader share the group-shared memory g0, one after the other.
+ *  - A dynamic index into something held in registers (a local array, a vector's component) is a chain of comparisons and movc over the elements: a load picks, a store writes
+ *    each element under its comparison.
  * Not taken (spv_error says which): double precision, 64-bit integers, storage images and texel buffers, compare-exchange atomics, the length of a runtime array, tessellation /
- * geometry stages, dynamic indexing of anything held in registers, row-major matrices, subgroup operations, OpSpecConstantOp. */
+ * geometry stages, more than four dynamic indices into registers (or 256 places they may pick), row-major matrices, subgroup operations, OpSpecConstantOp. */
 #include "spirv.h"
 
 typedef unsigned long long sp_u64;
@@ -129,7 +131,11 @@ typedef struct Val {
   uint32_t leaf0;                         /* register-resident variables: the first leaf the pointer refers to */
   uint32_t byte_off;                      /* constant buffer: the offset in the block */
   uint32_t mstride;                       /* constant buffer: the MatrixStride in force */
-  uint32_t dyn_reg, dyn_on, dyn_comp;     /* constant buffer: a dynamic register offset (integer in a virtual temporary) */
+  uint32_t dyn_reg, dyn_on, dyn_comp;     /* constant buffer: a dynamic register offset (integer in a virtual temporary); memory: a dynamic byte offset; registers: a dynamic element */
+  /* registers with dynamic indices: up to four, each `rcnt` elements of `rstr` leaves; the indices make one flat number in dyn_reg (the first the most significant digit), and
+   * candidate f's leaves start at leaf0 + the sum of its digits times their strides. rcount: the candidates (the product of the counts). */
+  uint32_t rdims, rcnt[4], rstr[4], rcount;
+  uint32_t cdyn_on, cdyn_reg, cdyn_comp;  /* registers: a dynamic component of a vector leaf */
   uint32_t image_res, image_unit_off;     /* an image / sampler / sampled image: the resource and the element */
   uint32_t sampler_res;
   /* a pointer into memory (a storage buffer or Workgroup memory): byte_off and the dynamic offset dyn_* are in bytes */

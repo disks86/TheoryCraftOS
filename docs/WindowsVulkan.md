@@ -34,6 +34,11 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
 * **Size**: a shader may use up to 256 temporary registers at once and 60000 instructions (the kernel takes 65536 instructions and 256 temporaries of a program made from DXBC; a
   Direct3D 9 program keeps 32). The DXBC goes to the kernel in one escape of at most 4 MiB, and on virgl its TGSI text goes in pieces (the host's continuation packets). A big shader
   is slow to compile on the virgl host the first time (the host's GL driver compiles what virglrenderer makes of the TGSI; its shader cache keeps it after that).
+* **Cube maps** (also cube map arrays: `imageCubeArray`) are 2D arrays of six layers a cube to the kernel. A cube compatible image of 6·n layers is one `Texture2DArray`, and the
+  translated shader works out the face (Vulkan's table: the major axis and its sign), the point on it and the layer `face + 6 · round(cube)`, then samples the array. Filtering does not
+  cross faces. Not taken: depth comparisons and gradients with a cube map.
+* **Dynamic indices into registers** (a local array `a[i]`, a vector's `v[i]`, nested and struct-member arrays): a load is a chain of comparisons and `movc` over the places the
+  indices may pick (at most 256), a store writes each of them under its comparison.
 * **Memory in shaders** (storage buffers, `Workgroup` variables) is addressed by bytes: an access chain is a constant offset plus an integer for its dynamic indices, a load `ld_raw`, a
   store `store_raw`, atomics `imm_atomic_*` (add, sub, and, or, xor, min, max, exchange, increment, decrement; not compare-exchange, which the kernel has not). The layout is the module's
   (`Offset`, `ArrayStride`, `MatrixStride`: std430 or std140); `Workgroup` variables have none, so they are laid out one after the other in the group-shared memory `g0` (32 KiB).
@@ -57,10 +62,12 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
 
 ## Not done
 
-Geometry and tessellation shaders, storage images, texel buffers, queries and timestamps, indirect draws, sparse resources, input attachments, a second queue family, depth/stencil
+Geometry and tessellation shaders, storage images, texel buffers, occlusion and pipeline statistics queries (timestamps are done: the CPU's clock when the commands before them
+have run), indirect draws, sparse resources, input attachments, a second queue family, depth/stencil
 images that are also sampled (the kernel's depth images have no CPU view), blend constants, wireframe, depth clamp, anisotropy, specialization of `OpSpecConstantOp`, row-major
-matrices in shaders, dynamic indexing of anything held in registers (arrays in uniform blocks and anything in memory can be), `OpArrayLength` (the length of a runtime array),
+matrices in shaders, `OpArrayLength` (the length of a runtime array),
 `gl_NumWorkGroups`, compare-exchange atomics, more than 4 written and 4 read-only storage buffers a pipeline, arrays of storage buffers indexed dynamically, Vulkan 1.1 and later
 (`vkEnumerateInstanceVersion` says 1.0). A draw that writes a storage buffer another draw of the same pass reads from mapped memory may see the old contents (the copy back is when
-the pass's stream has run). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
+the pass's stream has run). Kernel limits Godot's renderers run into next: only pixel shaders sample textures (not vertex or compute shaders), arrays and cubes
+have one mip level, an 8-bit colour format and cannot be drawn into, and uniform data is the push constant block (`maxUniformBufferRange` 4096, below Vulkan's 16384). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
 that answer `VK_ERROR_FEATURE_NOT_PRESENT` (`src/Windows/stubs/vulkan-1.inc`). Not validated on real GPUs: only the CPU renderer and what QEMU gives (virgl, standard VGA) run it.

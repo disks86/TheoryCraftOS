@@ -270,7 +270,7 @@ static int write_container(Mod *m, const uint32_t *phys) {
     put(&w, (OF_SAMP << 12) | (1u << 20));
     put(&w, u);
     uint32_t dim = m->image_dim_by_unit[u];
-    uint32_t d = dim == SPV_DIM_3D ? 5 : dim == SPV_DIM_CUBE ? 6 : dim == SPV_DIM_2D_ARRAY ? 8 : 3;
+    uint32_t d = dim == SPV_DIM_3D ? 5 : dim == SPV_DIM_2D_ARRAY || dim == SPV_DIM_CUBE || dim == SPV_DIM_CUBE_ARRAY ? 8 : 3;   /* (cubes: texture2darray) */
     put(&w, D_DCL_RESOURCE | (d << 11) | (4u << 24));
     put(&w, (OF_RES << 12) | (1u << 20));
     put(&w, u);
