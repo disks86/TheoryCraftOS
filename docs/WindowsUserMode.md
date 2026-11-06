@@ -256,10 +256,20 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
   operation 5 (new): `GetAdaptersAddresses` (Windows' layout; the size does not depend on the flags), `GetAdaptersInfo`, `GetIfTable`, `GetIfEntry(2)`, `GetIpAddrTable`,
   `GetAdapterIndex`, `GetBestInterface`, `GetNumberOfInterfaces` and the LUID/GUID/index conversions; the routing, neighbour and connection tables answer
   `ERROR_NOT_SUPPORTED`. No MAC address (the kernel does not report it), no IPv6.
-- **Not done**: raw input (win32k keeps registrations and records, but nothing makes WM_INPUT records yet, so `RegisterRawInputDevices` stays a stub that fails: wiring it
-  would switch Godot's captured mouse to WM_INPUT and stop its motion), `TrackMouseEvent`/`WM_MOUSELEAVE` (no win32k service), WASAPI (`CoCreateInstance` of the device
-  enumerator fails: Godot falls back to its dummy audio driver), DirectSound.
-- **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`) and `scripts/winetest.sh winmm tcos_gameinput`
+- **Raw input** (`keyboard.inc` over `Win32kUserMiscInput.cpp`): `RegisterRawInputDevices`, `GetRegisteredRawInputDevices`, `GetRawInputData`, `GetRawInputBuffer`,
+  `GetRawInputDeviceList`, `GetRawInputDeviceInfoA/W`, `DefRawInputProc`. The window manager reports every mouse and keyboard event, of the machine (`user::inject_*`, and the
+  new `inject_mouse_motion` for a relative mouse: the raw motion is whole even where the cursor stops at a ClipCursor edge) and of `SendInput` (one record per INPUT, no device
+  handle, absolute moves as `MOUSE_MOVE_ABSOLUTE`), as RAWMOUSE / RAWKEYBOARD; the input module makes a record for each registered process and posts WM_INPUT: `RIM_INPUT` to the
+  foreground process at its registered window (else its focus window), `RIM_INPUTSINK` to another process registered with `RIDEV_INPUTSINK`, or with `RIDEV_EXINPUTSINK` when the
+  foreground process does not take that input raw. `RIDEV_PAGEONLY`, `RIDEV_EXCLUDE` and `RIDEV_NOLEGACY` (no WM_MOUSEMOVE / button / wheel, or WM_KEYDOWN / WM_CHAR, for that
+  process) are followed. Not done: `RIDEV_NOHOTKEYS`, `RIDEV_CAPTUREMOUSE`, `RIDEV_DEVNOTIFY` (WM_INPUT_DEVICE_CHANGE), HID devices other than the mouse and the keyboard, the
+  records' extra information. Wine's raw-input tests pass except the cross-desktop cases (no `CreateDesktop`); the multi-process part still hangs now and then in its own waits.
+- **Not done**: the machine's keyboard and mouse do not reach Windows programs yet. `user::inject_*` exist but nothing in the kernel or the desktop calls them, and nothing shows
+  win32k's screen (`gdi::set_screen_sink` has no caller), so in the running OS a Windows GUI program gets input only from `SendInput`. Also not done: `TrackMouseEvent` from
+  user32 (win32k tracks WM_MOUSELEAVE, but the service is not registered), WASAPI (`CoCreateInstance` of the device enumerator fails: Godot falls back to its dummy audio
+  driver), DirectSound.
+- **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`: also raw input from SendInput, NOLEGACY, removal), `Win32kMiscTest`
+  (`test_raw_input_dispatch`: foreground, sinks, page-only / exclude, injected records) and `scripts/winetest.sh winmm tcos_gameinput`
   (`tests/windows/wine/winmm/tcos_gameinput.c`: winmm, xinput by all three names, dinput8, avrt, iphlpapi), both 0 failures; Wine's winmm `timer` and `joystick` 0 failures
   (were 33 and 1), user32 `sysparams` about 550 (was 1595), `input` about 1700 (was 1967; the count varies with timing, and the raw-input part has hung once), `monitor`
   about 170 (it ran into a division by zero at 59 before and now reaches the display-configuration tests); host tests `WindowsSocketTest` (operation 5), `ModuleLoaderTest`

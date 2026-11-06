@@ -226,6 +226,138 @@ static void test_mouse_settings(void)
     ok(MessageBeep(MB_OK), "MessageBeep\n");
 }
 
+/* Raw input: SendInput's events come back as WM_INPUT records (with no device handle, as on Windows), and RIDEV_NOLEGACY keeps WM_MOUSEMOVE away. */
+static UINT raw_count, legacy_moves;
+static RAWINPUT raw_last_mouse, raw_last_key;
+static LRESULT CALLBACK raw_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    if (message == WM_INPUT)
+    {
+        RAWINPUT input;
+        UINT size = sizeof(input);
+        ok(wparam == RIM_INPUT, "WM_INPUT wparam %Iu\n", wparam);
+        if (GetRawInputData((HRAWINPUT)lparam, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1)
+        {
+            ++raw_count;
+            if (input.header.dwType == RIM_TYPEMOUSE) raw_last_mouse = input;
+            else if (input.header.dwType == RIM_TYPEKEYBOARD) raw_last_key = input;
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    if (message == WM_MOUSEMOVE) ++legacy_moves;
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+static void pump(void)
+{
+    MSG msg;
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < 100)
+    {
+        while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        Sleep(5);
+    }
+}
+static void send_mouse(LONG dx, LONG dy, DWORD flags)
+{
+    INPUT in;
+    memset(&in, 0, sizeof(in));
+    in.type = INPUT_MOUSE;
+    in.mi.dx = dx;
+    in.mi.dy = dy;
+    in.mi.dwFlags = flags;
+    ok(SendInput(1, &in, sizeof(in)) == 1, "SendInput mouse %lu\n", GetLastError());
+}
+static void send_key(WORD vk, DWORD flags)
+{
+    INPUT in;
+    memset(&in, 0, sizeof(in));
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk;
+    in.ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    in.ki.dwFlags = flags;
+    ok(SendInput(1, &in, sizeof(in)) == 1, "SendInput key %lu\n", GetLastError());
+}
+
+static void test_raw_input(void)
+{
+    WNDCLASSW cls = {0};
+    RAWINPUTDEVICE devices[2], registered[4];
+    RAWINPUTDEVICELIST list[4];
+    UINT count;
+    HWND hwnd;
+    char name[300];
+
+    cls.lpfnWndProc = raw_proc;
+    cls.lpszClassName = L"tcos_raw";
+    RegisterClassW(&cls);
+    hwnd = CreateWindowExW(0, L"tcos_raw", L"raw", WS_POPUP | WS_VISIBLE, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, NULL, NULL);
+    ok(hwnd != NULL, "CreateWindowEx %lu\n", GetLastError());
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+    pump();
+
+    count = ARRAY_SIZE(list);
+    ok(GetRawInputDeviceList(list, &count, sizeof(RAWINPUTDEVICELIST)) == 2, "a mouse and a keyboard\n");
+    count = sizeof(name);
+    ok(GetRawInputDeviceInfoA(list[0].hDevice, RIDI_DEVICENAME, name, &count) > 4 && !strncmp(name, "\\\\?\\", 4), "device name %s\n", name);
+
+    devices[0].usUsagePage = 1; devices[0].usUsage = 2; devices[0].dwFlags = 0; devices[0].hwndTarget = hwnd;      /* as Godot registers the mouse */
+    devices[1].usUsagePage = 1; devices[1].usUsage = 6; devices[1].dwFlags = 0; devices[1].hwndTarget = NULL;
+    ok(RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)), "RegisterRawInputDevices %lu\n", GetLastError());
+    count = ARRAY_SIZE(registered);
+    ok(GetRegisteredRawInputDevices(registered, &count, sizeof(RAWINPUTDEVICE)) == 2, "registered\n");
+
+    raw_count = legacy_moves = 0;
+    send_mouse(5, -3, MOUSEEVENTF_MOVE);
+    pump();
+    ok(raw_count == 1, "WM_INPUT for a relative move: %u\n", raw_count);
+    ok(raw_last_mouse.header.hDevice == NULL, "SendInput's records name no device\n");
+    ok(raw_last_mouse.data.mouse.usFlags == MOUSE_MOVE_RELATIVE && raw_last_mouse.data.mouse.lLastX == 5 && raw_last_mouse.data.mouse.lLastY == -3,
+       "motion %ld,%ld flags %#x\n", raw_last_mouse.data.mouse.lLastX, raw_last_mouse.data.mouse.lLastY, raw_last_mouse.data.mouse.usFlags);
+    ok(legacy_moves >= 1, "the legacy WM_MOUSEMOVE too\n");
+    raw_count = 0;
+    SetCursorPos(200, 210);
+    pump();
+    ok(raw_count == 0, "SetCursorPos is not input: %u WM_INPUT\n", raw_count);      /* (Godot warps the cursor while capturing the mouse) */
+
+    raw_count = 0;
+    send_mouse(0, 0, MOUSEEVENTF_LEFTDOWN);
+    send_mouse(0, 0, MOUSEEVENTF_WHEEL);
+    pump();
+    ok(raw_count == 2, "a button and a wheel: %u\n", raw_count);
+    ok(raw_last_mouse.data.mouse.usButtonFlags == RI_MOUSE_WHEEL, "wheel flags %#x\n", raw_last_mouse.data.mouse.usButtonFlags);
+    send_mouse(0, 0, MOUSEEVENTF_LEFTUP);
+    pump();
+
+    raw_count = 0;
+    send_key('A', 0);
+    send_key('A', KEYEVENTF_KEYUP);
+    pump();
+    ok(raw_count == 2, "two key records: %u\n", raw_count);
+    ok(raw_last_key.data.keyboard.VKey == 'A' && raw_last_key.data.keyboard.MakeCode == 0x1E && (raw_last_key.data.keyboard.Flags & RI_KEY_BREAK) &&
+       raw_last_key.data.keyboard.Message == WM_KEYUP, "key %#x make %#x flags %#x message %#x\n", raw_last_key.data.keyboard.VKey,
+       raw_last_key.data.keyboard.MakeCode, raw_last_key.data.keyboard.Flags, raw_last_key.data.keyboard.Message);
+
+    /* RIDEV_NOLEGACY: raw input only */
+    devices[0].dwFlags = RIDEV_NOLEGACY;
+    ok(RegisterRawInputDevices(devices, 1, sizeof(RAWINPUTDEVICE)), "NOLEGACY %lu\n", GetLastError());
+    raw_count = legacy_moves = 0;
+    send_mouse(4, 4, MOUSEEVENTF_MOVE);
+    pump();
+    ok(raw_count == 1 && legacy_moves == 0, "NOLEGACY: %u raw, %u WM_MOUSEMOVE\n", raw_count, legacy_moves);
+
+    /* removed: no more WM_INPUT */
+    devices[0].dwFlags = RIDEV_REMOVE; devices[0].hwndTarget = NULL;
+    devices[1].dwFlags = RIDEV_REMOVE;
+    ok(RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)), "remove %lu\n", GetLastError());
+    raw_count = legacy_moves = 0;
+    send_mouse(-4, -4, MOUSEEVENTF_MOVE);
+    pump();
+    ok(raw_count == 0 && legacy_moves >= 1, "after removing: %u raw, %u WM_MOUSEMOVE\n", raw_count, legacy_moves);
+    ok(DefRawInputProc(NULL, 0, sizeof(RAWINPUTHEADER)) == 0 && DefRawInputProc(NULL, 0, 4) == -1, "DefRawInputProc\n");
+    DestroyWindow(hwnd);
+}
+
 START_TEST(tcos_input)
 {
     test_keyboard_layout();
@@ -236,4 +368,5 @@ START_TEST(tcos_input)
     test_dpi_window();
     test_display_config();
     test_mouse_settings();
+    test_raw_input();
 }
