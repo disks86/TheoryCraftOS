@@ -76,7 +76,7 @@ constexpr uint32_t kNalSps = 7, kNalPps = 8, kNalSliceIdr = 5, kNalSlice = 1;
 
 bool valid(const AvcStreamHeaders& s) {
   return s.width >= 1 && s.height >= 1 && s.width <= 4096 && s.height <= 4096 && s.log2_max_frame_num >= 4 && s.log2_max_frame_num <= 16 && s.chroma_qp_offset >= -12 &&
-         s.chroma_qp_offset <= 12;
+         s.chroma_qp_offset <= 12 && s.log2_max_poc_lsb >= 4 && s.log2_max_poc_lsb <= 16;
 }
 
 // Start code, NAL unit header and the RBSP bytes with emulation prevention bytes put in.
@@ -103,13 +103,19 @@ bool write_avc_sps(const AvcStreamHeaders& s, ByteBuffer* out, uint32_t* bits) {
   const uint32_t mb_w = (s.width + 15) / 16, mb_h = (s.height + 15) / 16;
   ByteBuffer rbsp(out->allocator());
   Bits b(&rbsp);
-  b.put(66, 8);        // profile_idc: Baseline
-  b.put(0x40, 8);      // constraint_set1_flag (Constrained Baseline), the rest zero
+  b.put(s.b_pictures ? 77 : 66, 8);   // profile_idc: Main with B pictures (CAVLC, progressive), else Baseline
+  b.put(s.b_pictures ? 0x00 : 0x40, 8);   // constraint_set1_flag (Constrained Baseline) without B pictures
   b.put(s.level_idc, 8);
   b.ue(0);             // seq_parameter_set_id
   b.ue(s.log2_max_frame_num - 4);
-  b.ue(2);             // pic_order_cnt_type: output order is decoding order
-  b.ue(1);             // max_num_ref_frames
+  if (s.b_pictures) {
+    b.ue(0);           // pic_order_cnt_type 0
+    b.ue(s.log2_max_poc_lsb - 4);
+    b.ue(2);           // max_num_ref_frames: the previous anchor and the next one
+  } else {
+    b.ue(2);           // pic_order_cnt_type: output order is decoding order
+    b.ue(1);           // max_num_ref_frames
+  }
   b.put(0, 1);         // gaps_in_frame_num_value_allowed_flag
   b.ue(mb_w - 1);
   b.ue(mb_h - 1);
@@ -125,7 +131,28 @@ bool write_avc_sps(const AvcStreamHeaders& s, ByteBuffer* out, uint32_t* bits) {
   } else {
     b.put(0, 1);
   }
-  b.put(0, 1);         // vui_parameters_present_flag
+  if (s.b_pictures) {
+    // VUI with only the bitstream restriction: one picture of reordering, so a decoder outputs a B picture right after its anchor.
+    b.put(1, 1);       // vui_parameters_present_flag
+    b.put(0, 1);       // aspect_ratio_info_present_flag
+    b.put(0, 1);       // overscan_info_present_flag
+    b.put(0, 1);       // video_signal_type_present_flag
+    b.put(0, 1);       // chroma_loc_info_present_flag
+    b.put(0, 1);       // timing_info_present_flag
+    b.put(0, 1);       // nal_hrd_parameters_present_flag
+    b.put(0, 1);       // vcl_hrd_parameters_present_flag
+    b.put(0, 1);       // pic_struct_present_flag
+    b.put(1, 1);       // bitstream_restriction_flag
+    b.put(1, 1);       // motion_vectors_over_pic_boundaries_flag
+    b.ue(0);           // max_bytes_per_pic_denom
+    b.ue(0);           // max_bits_per_mb_denom
+    b.ue(16);          // log2_max_mv_length_horizontal
+    b.ue(16);          // log2_max_mv_length_vertical
+    b.ue(1);           // max_num_reorder_frames
+    b.ue(2);           // max_dec_frame_buffering
+  } else {
+    b.put(0, 1);       // vui_parameters_present_flag
+  }
   b.trailing();
   if (!b.ok()) return false;
   const uint64_t before = out->size();
@@ -165,18 +192,23 @@ bool write_avc_slice_header(const AvcStreamHeaders& s, const AvcSliceHeader& h, 
   if (!valid(s) || h.qp < 0 || h.qp > 51 || h.frame_num >= (1u << s.log2_max_frame_num)) return false;
   static const uint8_t kStart[4] = {0, 0, 0, 1};
   const uint64_t before = out->size();
-  if (!out->append(ConstByteView(kStart, 4)) || !out->put8(static_cast<uint8_t>((3u << 5) | (h.idr ? kNalSliceIdr : kNalSlice)))) return false;
+  if (!out->append(ConstByteView(kStart, 4)) || !out->put8(static_cast<uint8_t>(((h.b_slice ? 0u : 3u) << 5) | (h.idr ? kNalSliceIdr : kNalSlice)))) return false;
   Bits b(out);
   b.ue(0);                                  // first_mb_in_slice
-  b.ue(h.p_slice ? 5 : 7);                  // slice_type (all slices of the picture have this type)
+  b.ue(h.b_slice ? 6 : h.p_slice ? 5 : 7);  // slice_type (all slices of the picture have this type)
   b.ue(0);                                  // pic_parameter_set_id
   b.put(h.frame_num, s.log2_max_frame_num);
   if (h.idr) b.ue(h.idr_pic_id);
-  if (h.p_slice) {
+  if (s.b_pictures) b.put(h.poc_lsb & ((1u << s.log2_max_poc_lsb) - 1), s.log2_max_poc_lsb);   // pic_order_cnt_lsb
+  if (h.b_slice) b.put(1, 1);               // direct_spatial_mv_pred_flag
+  if (h.p_slice || h.b_slice) {
     b.put(0, 1);                            // num_ref_idx_active_override_flag
     b.put(0, 1);                            // ref_pic_list_modification_flag_l0
+    if (h.b_slice) b.put(0, 1);             // ref_pic_list_modification_flag_l1
   }
-  if (h.idr) {
+  if (h.b_slice) {
+    // nal_ref_idc 0: no dec_ref_pic_marking
+  } else if (h.idr) {
     b.put(0, 1);                            // no_output_of_prior_pics_flag
     b.put(0, 1);                            // long_term_reference_flag
   } else {
