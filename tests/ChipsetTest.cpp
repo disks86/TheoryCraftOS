@@ -538,6 +538,13 @@ static void test_intel_catalogue() {
   CHECK(intel_pch_for_cpu(6, 0x8E, 0xA).pch[0] == IntelPch::SunrisePointLp && intel_pch_for_cpu(6, 0x8E, 0xB).pch[0] == IntelPch::CannonPointLp);
   CHECK(intel_pch_for_cpu(6, 0x8E, 0xC).pch[0] == IntelPch::CometLakeLp && intel_pch_for_cpu(6, 0xB7, 1).contains(IntelPch::AlderLakeS));
   CHECK(intel_pch_for_cpu(6, 0xC6, 2).pch[0] == IntelPch::ArrowLakeS && intel_pch_for_cpu(6, 0x01, 0).count == 0);
+  CHECK(intel_pch_for_cpu(18, 0x01, 0).pch[0] == IntelPch::NovaLakeS && intel_pch_of_smbus(0x6E23).pch == IntelPch::NovaLakeS);
+  CHECK(intel_pch_for_cpu(19, 0x01, 0).pch[0] == IntelPch::DiamondRapids && intel_pch_of_smbus(0x5827).tco == IntelTcoKind::None);
+
+  // The TCO flavour follows i2c-i801's feature flags.
+  CHECK(intel_pch_of_smbus(0xA323).tco == IntelTcoKind::Version6 && intel_pch_of_smbus(0xA123).tco == IntelTcoKind::Version4);
+  CHECK(intel_pch_of_smbus(0xA3A3).tco == IntelTcoKind::Version4 && intel_pch_of_smbus(0x06A3).tco == IntelTcoKind::Version6);
+  CHECK(intel_pch_of_smbus(0x2930).tco == IntelTcoKind::None && intel_pch_of_smbus(0x5796).tco == IntelTcoKind::None);
 
   // Every Intel processor generation the CPU rules know pairs with a catalogued hub, apart from the parts that have none of their own.
   constexpr uint32_t kNoHub[] = {0x1D /* Dunnington: 7300 chipset */, 0x56 /* Broadwell-DE SoC */, 0x85 /* Knights Mill */, 0x8A /* Lakefield */};
@@ -546,8 +553,8 @@ static void test_intel_catalogue() {
       for (uint32_t stepping = 0; stepping < 16; ++stepping) {
         alignas(X86_64Cpu) unsigned char storage[sizeof(X86_64Cpu)];
         if (!create_intel_generation(storage, nullptr, {family, model, stepping})) continue;
-        bool exempt = family != 6;   // Nova Lake and Diamond Rapids: no hub IDs published yet
-        for (uint32_t m : kNoHub) exempt = exempt || m == model;
+        bool exempt = false;
+        for (uint32_t m : kNoHub) exempt = exempt || (family == 6 && m == model);
         const IntelPchCandidates c = intel_pch_for_cpu(family, model, stepping);
         if (exempt) continue;
         if (c.count == 0) {
@@ -650,6 +657,8 @@ static void test_intel_chipset() {
   FakePci::put32(smbus, 0x04, 0x00000001);                                // I/O decoding on
   FakePci::put32(smbus, 0x20, 0x0000EFA1);                                // SMBASE 0xEFA0
   FakePci::put32(smbus, 0x40, 0x00000001);                                // HST_EN
+  FakePci::put32(smbus, 0x50, 0x00000401);                                // TCOBASE 0x400
+  FakePci::put32(smbus, 0x54, 0x00000100);                                // TCO decode on
   FakePci::Function& spi = pci.add(0, 0x1F, 5, 0x8086, 0xA324, 0x0C, 0x80);
   FakePci::put32(spi, 0xDC, 0x0000002A);                                  // BLE, SMM_BWP, (bit 3) - not writable
   pci.add(0, 0x1F, 6, 0x8086, 0x15BC, 0x02, 0x00);                        // Ethernet
@@ -671,9 +680,18 @@ static void test_intel_chipset() {
   CHECK(chipset.bios_protection().known && chipset.bios_protection().locked() && chipset.bios_protection().smm_protect);
   CHECK(chipset.me().present && chipset.me().working_state() == 5 && chipset.me().init_complete() && chipset.me().operation_mode() == 0 && !chipset.me().manufacturing_mode());
   CHECK(strcmp(intel_me_working_state_name(chipset.me().working_state()), "normal") == 0);
+  CHECK(chipset.tco().usable && chipset.tco().io_base == 0x400 && chipset.tco().kind == IntelTcoKind::Version6);
+  PciAddress thermal{};
+  CHECK(chipset.thermal_function(&thermal) && thermal.device == 0x12);
   chipset.summarize(line);
   CHECK(strstr(line.c_str(), "Cannon Point-H (300 series") && !strstr(line.c_str(), "pairs"));
   CHECK(pci.writes == 0);   // reads only
+
+  // TCO decoding off.
+  FakePci::put32(smbus, 0x54, 0);
+  chipset.probe(pci, {ChipsetVendor::Intel, 6, 0x9E, 0xC});
+  CHECK(!chipset.tco().usable && strstr(chipset.tco().reason, "off"));
+  FakePci::put32(smbus, 0x54, 0x100);
 
   // The firmware left the host off; then without I/O decoding; then no I/O BAR.
   FakePci::put32(smbus, 0x40, 0);
@@ -706,6 +724,7 @@ static void test_intel_chipset() {
   chipset.probe(q35, {ChipsetVendor::Intel, 6, 0xB7, 1});
   CHECK(chipset.info().pch == IntelPch::Ich9 && chipset.unusual_pairing() && chipset.smbus().usable && chipset.smbus().io_base == 0x0700);
   CHECK(chipset.bios_protection().known && !chipset.bios_protection().locked() && !chipset.me().present);
+  CHECK(!chipset.tco().usable && !chipset.thermal_function(&thermal));   // ICH9: the TCO is in the LPC bridge's ACPI block
   chipset.summarize(line);
   CHECK(strstr(line.c_str(), "usually pairs with Raptor Lake PCH-S"));
 

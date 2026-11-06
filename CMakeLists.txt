@@ -473,6 +473,10 @@ add_executable(BOOTX64
   src/Hardware/Chipset/Smbus/SmbusIoPorts.cpp
   src/Hardware/Chipset/Smbus/Spd.cpp
   src/Hardware/Chipset/Intel/IntelPch.cpp
+  src/Hardware/Chipset/Intel/IntelGpioLayouts.cpp
+  src/Hardware/Chipset/Intel/IntelPchThermal.cpp
+  src/Hardware/Chipset/Intel/IntelTcoWatchdog.cpp
+  src/Hardware/Chipset/AMD/AmdNodes.cpp
   src/Hardware/Chipset/Intel/IntelPchChipset.cpp
   src/Hardware/Chipset/AMD/AmdChipsets.cpp
   src/Hardware/Chipset/AMD/AmdFchChipset.cpp
