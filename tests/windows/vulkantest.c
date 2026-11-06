@@ -54,7 +54,8 @@ FN(vkCmdDraw) FN(vkCmdSetViewport) FN(vkCmdSetScissor) FN(vkCmdCopyImageToBuffer
 FN(vkQueueWaitIdle) FN(vkCreateFence) FN(vkDestroyFence) FN(vkWaitForFences) FN(vkResetFences) FN(vkFlushMappedMemoryRanges) FN(vkCmdClearColorImage) FN(vkCmdFillBuffer)
 FN(vkCmdDrawIndexed) FN(vkCmdBindIndexBuffer) FN(vkCmdCopyBuffer) FN(vkDeviceWaitIdle) FN(vkCmdUpdateBuffer) FN(vkResetCommandBuffer) FN(vkCreateWin32SurfaceKHR) FN(vkDestroySurfaceKHR) FN(vkGetPhysicalDeviceSurfaceSupportKHR) FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
 FN(vkGetPhysicalDeviceSurfaceFormatsKHR) FN(vkGetPhysicalDeviceSurfacePresentModesKHR) FN(vkCreateSwapchainKHR) FN(vkDestroySwapchainKHR) FN(vkGetSwapchainImagesKHR) FN(vkAcquireNextImageKHR) FN(vkQueuePresentKHR)
-FN(vkCreateComputePipelines) FN(vkCmdDispatch) FN(vkCmdDispatchIndirect)
+FN(vkCreateComputePipelines) FN(vkCmdDispatch) FN(vkCmdDispatchIndirect) FN(vkCreateQueryPool) FN(vkDestroyQueryPool) FN(vkGetQueryPoolResults)
+FN(vkCmdResetQueryPool) FN(vkCmdWriteTimestamp)
 
 static void *load(VkInstance instance, const char *name) {
   void *p = (void *)pGetInstanceProcAddr(instance, name);
@@ -80,7 +81,8 @@ static void load_all(void) {
   L(vkCreateFence) L(vkDestroyFence) L(vkWaitForFences) L(vkResetFences) L(vkFlushMappedMemoryRanges) L(vkCmdClearColorImage) L(vkCmdFillBuffer) L(vkCmdDrawIndexed) L(vkCmdBindIndexBuffer)
   L(vkCmdCopyBuffer) L(vkDeviceWaitIdle) L(vkCmdUpdateBuffer) L(vkResetCommandBuffer) L(vkCreateWin32SurfaceKHR) L(vkDestroySurfaceKHR) L(vkGetPhysicalDeviceSurfaceSupportKHR)
   L(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) L(vkGetPhysicalDeviceSurfaceFormatsKHR) L(vkGetPhysicalDeviceSurfacePresentModesKHR) L(vkCreateSwapchainKHR) L(vkDestroySwapchainKHR)
-  L(vkGetSwapchainImagesKHR) L(vkAcquireNextImageKHR) L(vkQueuePresentKHR) L(vkCreateComputePipelines) L(vkCmdDispatch) L(vkCmdDispatchIndirect)
+  L(vkGetSwapchainImagesKHR) L(vkAcquireNextImageKHR) L(vkQueuePresentKHR) L(vkCreateComputePipelines) L(vkCmdDispatch) L(vkCmdDispatchIndirect) L(vkCreateQueryPool) L(vkDestroyQueryPool)
+  L(vkGetQueryPoolResults) L(vkCmdResetQueryPool) L(vkCmdWriteTimestamp)
 }
 
 static int memory_type(const VkPhysicalDeviceMemoryProperties *mp, unsigned bits, VkMemoryPropertyFlags want) {
@@ -191,7 +193,9 @@ static VkPipeline make_pipeline(Rig *r, Scene *s, VkShaderModule fs, VkCullModeF
 }
 
 /* Begins the pass, draws once with the pipeline, ends it and copies the picture to the readback buffer. */
-static void draw_frame(Rig *r, Scene *s, VkPipeline pipeline, float clear_r, float clear_g, float clear_b) {
+static void draw_frame_with(Rig *r, Scene *s, VkPipeline pipeline, VkDescriptorSet set, float clear_r, float clear_g, float clear_b);
+static void draw_frame(Rig *r, Scene *s, VkPipeline pipeline, float clear_r, float clear_g, float clear_b) { draw_frame_with(r, s, pipeline, s->set, clear_r, clear_g, clear_b); }
+static void draw_frame_with(Rig *r, Scene *s, VkPipeline pipeline, VkDescriptorSet set, float clear_r, float clear_g, float clear_b) {
   p_vkResetCommandBuffer(r->cb, 0);
   VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   check(p_vkBeginCommandBuffer(r->cb, &bi) == VK_SUCCESS, "vkBeginCommandBuffer");
@@ -204,7 +208,7 @@ static void draw_frame(Rig *r, Scene *s, VkPipeline pipeline, float clear_r, flo
   p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
   VkDeviceSize offset = 0;
   p_vkCmdBindVertexBuffers(r->cb, 0, 1, &s->vertex, &offset);
-  p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 1, &s->set, 0, NULL);
+  p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 1, &set, 0, NULL);
   p_vkCmdDraw(r->cb, 3, 1, 0, 0);
   p_vkCmdEndRenderPass(r->cb);
   VkBufferImageCopy copy;
@@ -634,6 +638,143 @@ static void test_compute_big(Rig *r) {
   p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
 }
 
+/* A cube map array (two cubes: twelve layers of 4 x 4, each a colour of its own) sampled in a pixel shader along directions from the pixel's place (vk_cubetex.frag): each pixel
+ * shows the layer Vulkan's table picks - face + 6 * cube. Only on an adapter with imageCubeArray. */
+static void test_cube_array(Rig *r, Scene *s) {
+  VkPhysicalDeviceFeatures features;
+  p_vkGetPhysicalDeviceFeatures(r->pd, &features);
+  if (!features.imageCubeArray) {
+    printf("    no cube map arrays on this adapter: skipped\n");
+    return;
+  }
+  VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, ici.imageType = VK_IMAGE_TYPE_2D, ici.format = VK_FORMAT_B8G8R8A8_UNORM, ici.extent.width = 4, ici.extent.height = 4, ici.extent.depth = 1;
+  ici.mipLevels = 1, ici.arrayLayers = 12, ici.samples = VK_SAMPLE_COUNT_1_BIT, ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkImage image = VK_NULL_HANDLE;
+  check(p_vkCreateImage(r->dev, &ici, NULL, &image) == VK_SUCCESS && image, "a cube compatible image of twelve layers");
+  if (!image) return;
+  VkMemoryRequirements req;
+  p_vkGetImageMemoryRequirements(r->dev, image, &req);
+  VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  ai.allocationSize = req.size, ai.memoryTypeIndex = (unsigned)memory_type(&r->mem, req.memoryTypeBits, 0);
+  VkDeviceMemory image_memory = VK_NULL_HANDLE;
+  p_vkAllocateMemory(r->dev, &ai, NULL, &image_memory);
+  p_vkBindImageMemory(r->dev, image, image_memory, 0);
+  VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = image, vci.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, vci.format = ici.format;
+  vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, vci.subresourceRange.levelCount = 1, vci.subresourceRange.layerCount = 12;
+  VkImageView view = VK_NULL_HANDLE;
+  check(p_vkCreateImageView(r->dev, &vci, NULL, &view) == VK_SUCCESS, "a cube array view");
+  /* the texels, one colour a layer (B, G, R, A in memory) */
+  VkDeviceMemory staging_memory;
+  void *staging_map;
+  VkBuffer staging = make_buffer(r, 12 * 16 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging_memory, &staging_map);
+  unsigned char *texels = staging_map;
+  for (unsigned layer = 0; layer < 12; ++layer)
+    for (unsigned t = 0; t < 16; ++t) {
+      unsigned char *px = texels + (layer * 16 + t) * 4;
+      px[0] = (unsigned char)(layer * 7), px[1] = (unsigned char)(200 - layer * 15), px[2] = (unsigned char)(layer * 20 + 10), px[3] = 255;
+    }
+  VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
+  VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 2, dpi.pPoolSizes = sizes;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  p_vkCreateDescriptorPool(r->dev, &dpi, NULL, &pool);
+  VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &s->set_layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  p_vkAllocateDescriptorSets(r->dev, &dai, &set);
+  VkDescriptorBufferInfo dbi = {s->uniform, 0, VK_WHOLE_SIZE};
+  VkDescriptorImageInfo dii = {s->sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkWriteDescriptorSet writes[2];
+  memset(writes, 0, sizeof writes);
+  writes[0].sType = writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[0].dstSet = writes[1].dstSet = set;
+  writes[0].dstBinding = 0, writes[0].descriptorCount = 1, writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, writes[0].pBufferInfo = &dbi;
+  writes[1].dstBinding = 1, writes[1].descriptorCount = 1, writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes[1].pImageInfo = &dii;
+  p_vkUpdateDescriptorSets(r->dev, 2, writes, 0, NULL);
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof cubetex_frag, smi.pCode = cubetex_frag;
+  VkShaderModule fs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &fs);
+  VkResult result;
+  VkPipeline pipeline = make_pipeline(r, s, fs, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, &result);
+  check(result == VK_SUCCESS && pipeline, "a pipeline that samples a cube map array");
+  if (pipeline) {
+    /* the texels in (one copy of all twelve layers), then the picture */
+    p_vkResetCommandBuffer(r->cb, 0);
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    p_vkBeginCommandBuffer(r->cb, &cbi);
+    VkBufferImageCopy copy;
+    memset(&copy, 0, sizeof copy);
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, copy.imageSubresource.layerCount = 12, copy.imageExtent.width = 4, copy.imageExtent.height = 4, copy.imageExtent.depth = 1;
+    p_vkCmdCopyBufferToImage(r->cb, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    p_vkEndCommandBuffer(r->cb);
+    submit_and_wait(r);
+    static const float white[15] = {-1, -1, 1, 1, 1, 3, -1, 1, 1, 1, -1, 3, 1, 1, 1};
+    memcpy(s->vertex_map, white, sizeof white);
+    const float tint[4] = {1, 1, 1, 1};
+    memcpy(s->uniform_map, tint, sizeof tint);
+    draw_frame_with(r, s, pipeline, set, 0, 0, 0);
+    const unsigned char *picture = (const unsigned char *)s->readback_map;
+    unsigned wrong = 0, compared = 0;
+    for (unsigned py = 2; py < H; py += 4)
+      for (unsigned px = 2; px < W; px += 4) {
+        const float u = (px + 0.5f) / W, v = (py + 0.5f) / H;
+        const float cube = u < 0.5f ? 0.0f : 1.0f;
+        float qx = u * 2.0f;
+        qx = (qx - (float)(int)qx) * 2.0f - 1.0f;
+        const float x = qx, y = v * 2.0f - 1.0f;   /* (z: -0.55) */
+        const float ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = 0.55f;
+        /* (not where two axes are nearly as long: the face there depends on rounding) */
+        const float m1 = ax > ay ? (ax > az ? ax : az) : (ay > az ? ay : az);
+        const float m2 = ax + ay + az - m1 - (ax < ay ? (ax < az ? ax : az) : (ay < az ? ay : az));
+        if (m1 - m2 < 0.06f) continue;
+        unsigned face = ax >= ay && ax >= az ? (x >= 0 ? 0 : 1) : ay >= az ? (y >= 0 ? 2 : 3) : 5;
+        const unsigned layer = face + 6 * (unsigned)cube;
+        ++compared;
+        if (!near_pixel(pixel(picture, W, px, py), layer * 7, 200 - layer * 15, layer * 20 + 10, 255)) {
+          if (!wrong) printf("    cube array: pixel %u,%u is %08x, want layer %u\n", px, py, pixel(picture, W, px, py), layer);
+          ++wrong;
+        }
+      }
+    check(compared > 100 && wrong == 0, "a cube map array: every pixel shows the face and the cube its direction picks");
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  if (fs) p_vkDestroyShaderModule(r->dev, fs, NULL);
+  p_vkDestroyDescriptorPool(r->dev, pool, NULL);
+  p_vkDestroyBuffer(r->dev, staging, NULL);
+  p_vkFreeMemory(r->dev, staging_memory, NULL);
+  p_vkDestroyImageView(r->dev, view, NULL);
+  p_vkDestroyImage(r->dev, image, NULL);
+  p_vkFreeMemory(r->dev, image_memory, NULL);
+}
+
+/* Timestamps: two around a dispatch-free submission's work, read back with and without availability; they go up. */
+static void test_timestamps(Rig *r) {
+  VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  qci.queryType = VK_QUERY_TYPE_TIMESTAMP, qci.queryCount = 4;
+  VkQueryPool pool = VK_NULL_HANDLE;
+  check(p_vkCreateQueryPool(r->dev, &qci, NULL, &pool) == VK_SUCCESS && pool, "a timestamp query pool");
+  if (!pool) return;
+  unsigned long long before[2] = {0, 0};
+  check(p_vkGetQueryPoolResults(r->dev, pool, 0, 1, sizeof before, before, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_NOT_READY && before[1] == 0,
+        "a timestamp that was not written is not available");
+  VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  p_vkResetCommandBuffer(r->cb, 0);
+  p_vkBeginCommandBuffer(r->cb, &cbi);
+  p_vkCmdResetQueryPool(r->cb, pool, 0, 4);
+  p_vkCmdWriteTimestamp(r->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
+  p_vkCmdWriteTimestamp(r->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, 1);
+  p_vkEndCommandBuffer(r->cb);
+  submit_and_wait(r);
+  unsigned long long t[2] = {0, 0};
+  check(p_vkGetQueryPoolResults(r->dev, pool, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS && t[0] != 0 && t[1] >= t[0],
+        "timestamps are written and go up");
+  p_vkDestroyQueryPool(r->dev, pool, NULL);
+}
+
 static void test_device(VkPhysicalDevice pd, unsigned index) {
   Rig r;
   memset(&r, 0, sizeof r);
@@ -856,6 +997,8 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   /* (after a present: the GPU work after it must still run - a present the host refused used to lose the context without a word) */
   test_compute(&r);
   test_compute_big(&r);
+  test_cube_array(&r, &s);
+  test_timestamps(&r);
 
   /* copies and clears that need no GPU */
   p_vkResetCommandBuffer(r.cb, 0);

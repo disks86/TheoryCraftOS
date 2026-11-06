@@ -43,7 +43,8 @@ typedef struct SpvAllocator {
 enum { SPV_STAGE_VERTEX = 0, SPV_STAGE_FRAGMENT = 4, SPV_STAGE_COMPUTE = 5 };   /* SPIR-V execution models 0, 4, 5 */
 
 enum { SPV_RES_UNIFORM = 1, SPV_RES_PUSH = 2, SPV_RES_IMAGE = 3, SPV_RES_SAMPLER = 4, SPV_RES_STORAGE = 5, SPV_RES_COMBINED = 6 };
-enum { SPV_DIM_2D = 0, SPV_DIM_3D = 1, SPV_DIM_CUBE = 2, SPV_DIM_2D_ARRAY = 3 };
+/* (a cube map and a cube map array are a 2D array of six layers a cube to the kernel: the translated shader works out the face and the layer, see spirv_gen.inc) */
+enum { SPV_DIM_2D = 0, SPV_DIM_3D = 1, SPV_DIM_CUBE = 2, SPV_DIM_2D_ARRAY = 3, SPV_DIM_CUBE_ARRAY = 4 };
 
 typedef struct SpvResource {
   uint32_t kind;          /* SPV_RES_* */

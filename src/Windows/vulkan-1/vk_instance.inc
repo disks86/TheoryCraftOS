@@ -294,7 +294,7 @@ VKAPI void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalDevice physical, V
   l->sampledImageIntegerSampleCounts = l->storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT;
   l->maxColorAttachments = l->maxFragmentOutputAttachments;
   l->maxSampleMaskWords = 1;
-  l->timestampComputeAndGraphics = VK_FALSE;
+  l->timestampComputeAndGraphics = VK_TRUE;   /* (timestamp queries: the CPU's clock in nanoseconds, vk_resources.inc) */
   l->timestampPeriod = 1.0f;
   l->maxClipDistances = 0, l->maxCullDistances = 0, l->maxCombinedClipAndCullDistances = 0;
   l->discreteQueuePriorities = 1;
@@ -311,6 +311,7 @@ VKAPI void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDevice physical, VkP
   const PhysDev *pd = (const PhysDev *)physical;
   memset(f, 0, sizeof *f);
   f->independentBlend = (pd->caps.features & FEAT_INDEPENDENT_BLEND) != 0;
+  f->imageCubeArray = (pd->caps.features & FEAT_TEXTURE_KINDS) != 0;   /* (cubes are 2D arrays: vkCreateImage) */
   f->fillModeNonSolid = VK_FALSE;
   f->depthClamp = VK_FALSE;
   f->samplerAnisotropy = VK_FALSE;
@@ -330,7 +331,7 @@ VKAPI void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice 
   memset(&p[0], 0, sizeof p[0]);
   p[0].queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT | ((pd->caps.features & FEAT_COMPUTE) ? VK_QUEUE_COMPUTE_BIT : 0);
   p[0].queueCount = 1;
-  p[0].timestampValidBits = 0;
+  p[0].timestampValidBits = 64;
   p[0].minImageTransferGranularity.width = p[0].minImageTransferGranularity.height = p[0].minImageTransferGranularity.depth = 1;
   *count = 1;
 }
@@ -386,7 +387,9 @@ VKAPI VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDev
   p->maxExtent.width = p->maxExtent.height = dim;
   p->maxExtent.depth = 1;
   p->maxMipLevels = 12;
-  p->maxArrayLayers = 1;
+  /* (arrays and cubes: sampled images of an 8-bit colour format, one level each - the kernel's Texture2DArray) */
+  const FormatInfo *afi = format_info(pd, format);
+  p->maxArrayLayers = (pd->caps.features & FEAT_TEXTURE_KINDS) && afi && (afi->dfmt == DF_A8R8G8B8 || afi->dfmt == DF_A8B8G8R8 || afi->dfmt == DF_A8R8G8B8_SRGB || afi->dfmt == DF_A8B8G8R8_SRGB) && !(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ? 256 : 1;
   p->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
   p->maxResourceSize = 1ull << 30;
   return VK_SUCCESS;

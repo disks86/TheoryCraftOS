@@ -191,9 +191,11 @@ VKAPI VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo
     kind = 1;
   } else if (ci->imageType != VK_IMAGE_TYPE_2D) {
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
-  } else if ((ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && layers == 6) {
+  } else if ((ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && layers >= 6 && layers % 6 == 0) {
+    /* A cube or an array of cubes is a 2D array of six layers a cube: the translated shaders work out the face and the layer (spirv_gen.inc cube_coordinate), so a cube and a
+     * cube array view of the image read the same allocation. */
     if (!(pd->caps.features & FEAT_TEXTURE_KINDS) || ci->mipLevels != 1 || ci->extent.width != ci->extent.height) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    kind = 3;
+    kind = 2;
   } else if (layers > 1) {
     if (!(pd->caps.features & FEAT_TEXTURE_KINDS) || ci->mipLevels != 1) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     kind = 2;
@@ -438,16 +440,72 @@ VKAPI VkResult VKAPI_CALL vkResetEvent(VkDevice device, VkEvent e) {
   *(UINT *)e = 0;
   return VK_SUCCESS;
 }
+/* Queries: timestamps. Every submission has run when vkQueueSubmit returns, so a timestamp is the time when the commands before it have run (the CPU's clock, in
+ * nanoseconds: timestampPeriod 1); the pool keeps the values and whether each is there. Occlusion and pipeline statistics queries are not done. */
+typedef struct QueryPool {
+  ULONGLONG *value;
+  BYTE *available;
+  UINT count;
+} QueryPool;
+
+static ULONGLONG now_ns(void) {
+  static LARGE_INTEGER frequency;
+  LARGE_INTEGER t;
+  if (!frequency.QuadPart && !QueryPerformanceFrequency(&frequency)) return 0;
+  QueryPerformanceCounter(&t);
+  return (ULONGLONG)(t.QuadPart / frequency.QuadPart) * 1000000000ull + (ULONGLONG)(t.QuadPart % frequency.QuadPart) * 1000000000ull / (ULONGLONG)frequency.QuadPart;
+}
+
 VKAPI VkResult VKAPI_CALL vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *ci, const VkAllocationCallbacks *alloc, VkQueryPool *out) {
-  (void)device, (void)ci, (void)alloc, (void)out;
-  return VK_ERROR_FEATURE_NOT_PRESENT;
+  (void)device, (void)alloc;
+  if (ci->queryType != VK_QUERY_TYPE_TIMESTAMP || ci->queryCount == 0 || ci->queryCount > (1u << 20)) return VK_ERROR_FEATURE_NOT_PRESENT;
+  QueryPool *p = vk_alloc(sizeof(QueryPool));
+  if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
+  p->count = ci->queryCount;
+  p->value = vk_alloc(sizeof(ULONGLONG) * p->count);
+  p->available = vk_alloc(p->count);
+  if (!p->value || !p->available) {
+    vk_free(p->value), vk_free(p->available), vk_free(p);
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  }
+  *out = (VkQueryPool)p;
+  return VK_SUCCESS;
 }
 VKAPI void VKAPI_CALL vkDestroyQueryPool(VkDevice device, VkQueryPool pool, const VkAllocationCallbacks *alloc) {
-  (void)device, (void)pool, (void)alloc;
+  QueryPool *p = (QueryPool *)pool;
+  (void)device, (void)alloc;
+  if (!p) return;
+  vk_free(p->value), vk_free(p->available), vk_free(p);
+}
+
+/* The results of queries first .. first + count - 1 into `data` (`stride` bytes apart) as vkGetQueryPoolResults and vkCmdCopyQueryPoolResults write them. FALSE: one is not there. */
+static BOOL query_results(const QueryPool *p, UINT first, UINT count, BYTE *data, ULONGLONG size, ULONGLONG stride, VkQueryResultFlags flags) {
+  BOOL all = TRUE;
+  const UINT word = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
+  const UINT need = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 2 * word : word;
+  for (UINT q = 0; q < count && first + q < p->count; ++q) {
+    if ((ULONGLONG)q * stride + need > size) break;
+    BYTE *at = data + (ULONGLONG)q * stride;
+    const BOOL there = p->available[first + q] != 0;
+    all &= there;
+    if (there || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
+      const ULONGLONG v = there ? p->value[first + q] : 0;
+      if (word == 8) memcpy(at, &v, 8);
+      else put32(at, 0, (UINT)v);
+    }
+    if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
+      if (word == 8) put64(at, 8, there ? 1 : 0);
+      else put32(at, 4, there ? 1 : 0);
+    }
+  }
+  return all;
 }
 VKAPI VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice device, VkQueryPool pool, uint32_t first, uint32_t count, size_t size, void *data, VkDeviceSize stride, VkQueryResultFlags flags) {
-  (void)device, (void)pool, (void)first, (void)count, (void)size, (void)data, (void)stride, (void)flags;
-  return VK_ERROR_FEATURE_NOT_PRESENT;
+  (void)device;
+  QueryPool *p = (QueryPool *)pool;
+  if (!p || !data || first > p->count || count > p->count - first) return VK_ERROR_DEVICE_LOST;
+  /* (a query that was written has its value already; one that was not will not get one by waiting: a wait gives NOT_READY too rather than hang) */
+  return query_results(p, first, count, data, size, stride, flags) ? VK_SUCCESS : VK_NOT_READY;
 }
 
 /* ---- render passes and framebuffers ---------------------------------------------------------------------------------------------------------------------------------- */

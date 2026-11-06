@@ -302,7 +302,7 @@ void test_fuzz() {
   uint32_t translated = 0, refused = 0;
   uint32_t seed = 12345;
   auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
-  for (const char* name : {"basic.vert.spv", "basic.frag.spv", "math.frag.spv", "cs_add.comp.spv", "cs_shared_opt.comp.spv", "vk_ssbo.vert.spv"}) {
+  for (const char* name : {"basic.vert.spv", "basic.frag.spv", "math.frag.spv", "cs_add.comp.spv", "cs_shared_opt.comp.spv", "vk_ssbo.vert.spv", "cs_dyn_opt.comp.spv", "vk_cube_opt.frag.spv"}) {
     const std::vector<uint32_t> words = read_spirv(name);
     const uint32_t stage = strstr(name, ".vert") ? SPV_STAGE_VERTEX : strstr(name, ".comp") ? SPV_STAGE_COMPUTE : SPV_STAGE_FRAGMENT;
     for (uint32_t cut = 5; cut < words.size(); cut += 7) {
@@ -535,6 +535,102 @@ void test_compute_big() {
   }
 }
 
+// Dynamic indices into registers (cs_dyn.comp): local arrays read and written in loops, a 2D local array, a constant array, a vector's component, a member array of a struct array.
+void test_compute_dynamic() {
+  HostAllocator allocator;
+  for (const char* name : {"cs_dyn.comp.spv", "cs_dyn_opt.comp.spv"}) {
+    Translated t;
+    UniquePointer<D3d9Program> p = compile_compute(allocator, name, &t);
+    if (!p) continue;
+    std::vector<uint8_t> values(4 * 16);
+    for (uint32_t i = 0; i < 16; ++i) {
+      const float x = 0.5f * i - 2.0f;
+      put_floats(values, 4 * i, &x, 1);
+    }
+    std::vector<uint8_t>* buffers[graphics::kMaxStorageBuffers] = {};
+    buffers[t.storage_slot[0]] = &values;
+    std::vector<uint8_t> constants(16);
+    dispatch(*p, 2, buffers, constants.data());
+    uint32_t wrong = 0;
+    for (int i = 0; i < 16; ++i) {
+      const float x = 0.5f * i - 2.0f;
+      float a[6];
+      for (int k = 0; k < 6; ++k) a[k] = x * static_cast<float>(k + 1);
+      a[i % 6] = a[i % 6] + 100.0f;
+      float g[2][3];
+      for (int r = 0; r < 2; ++r)
+        for (int c = 0; c < 3; ++c) g[r][c] = static_cast<float>(r * 10 + c) + x;
+      const float table[5] = {1.5f, 2.5f, 3.5f, 4.5f, 5.5f};
+      float q[4] = {x, x + 1.0f, x + 2.0f, x + 3.0f};
+      q[i & 3] = -1.0f;
+      float w[2][3];
+      for (int k = 0; k < 3; ++k) w[0][k] = static_cast<float>(k), w[1][k] = static_cast<float>(k) * 2.0f;
+      w[i & 1][i % 3] = 50.0f;
+      float sum = 0;
+      for (int k = 0; k < 6; ++k) sum += a[k] * static_cast<float>(k + 1);
+      sum += g[i & 1][i % 3] * 1000.0f;
+      sum += table[i % 5] * 7.0f;
+      sum += q[(i + 1) & 3] * 13.0f + q[i & 3];
+      sum += w[(i + 1) & 1][i % 3] * 3.0f + w[i & 1][i % 3];
+      const float got = get_float(values, 4 * static_cast<uint32_t>(i));
+      if (fabsf(got - sum) > 1e-3f * (1 + fabsf(sum))) {
+        if (!wrong) printf("  %s: v[%d] = %g, expected %g\n", name, i, got, sum);
+        ++wrong;
+      }
+    }
+    CHECK(wrong == 0);
+  }
+}
+
+// A texture set that says what was asked of it: (u, v, w, unit), w the layer of a 2D array.
+class EchoTextures final : public graphics::ITextureSet {
+ public:
+  graphics::Vec4 sample(uint32_t unit, float u, float v) const override { return {u, v, -1.0f, static_cast<float>(unit)}; }
+  graphics::Vec4 sample_volume(uint32_t unit, float u, float v, float w) const override { return {u, v, w, static_cast<float>(unit)}; }
+};
+
+// Cube maps and cube map arrays (vk_cube.frag) are 2D arrays of six layers a cube: the shader picks the face by Vulkan's table and the point on it, and the layer.
+void test_cube_arrays() {
+  HostAllocator allocator;
+  struct Case {
+    float x, y, z, cube;
+  };
+  const Case cases[] = {{1.0f, 0.25f, -0.5f, 0}, {-0.8f, 0.3f, 0.1f, 1}, {0.2f, 0.9f, -0.4f, 2}, {0.3f, -0.7f, 0.2f, 0}, {-0.1f, 0.2f, 0.95f, 3}, {0.4f, -0.3f, -0.6f, 1.4f}};
+  for (const char* name : {"vk_cube.frag.spv", "vk_cube_opt.frag.spv"}) {
+    Translated t = translate(read_spirv(name), SPV_STAGE_FRAGMENT);
+    if (!t.ok) printf("  %s: %s\n", name, t.error.c_str());
+    CHECK(t.ok);
+    if (!t.ok) continue;
+    NtStatus s = 0;
+    UniquePointer<D3d9Program> p = compile(allocator, t, &s);
+    CHECK(s == status::kSuccess && p);
+    if (!p) continue;
+    EchoTextures textures;
+    uint32_t wrong = 0;
+    for (const Case& c : cases) {
+      // Vulkan's table: the major axis and its sign give the face, sc and tc
+      const float ax = fabsf(c.x), ay = fabsf(c.y), az = fabsf(c.z);
+      float sc, tc, ma, face;
+      if (ax >= ay && ax >= az) face = c.x >= 0 ? 0 : 1, sc = c.x >= 0 ? -c.z : c.z, tc = -c.y, ma = ax;
+      else if (ay >= az) face = c.y >= 0 ? 2 : 3, sc = c.x, tc = c.y >= 0 ? c.z : -c.z, ma = ay;
+      else face = c.z >= 0 ? 4 : 5, sc = c.z >= 0 ? c.x : -c.x, tc = -c.y, ma = az;
+      const float u = 0.5f * (sc / ma) + 0.5f, v = 0.5f * (tc / ma) + 0.5f;
+      graphics::Vec4 varyings[4] = {{c.x, c.y, c.z, c.cube}, {}, {}, {}};
+      graphics::Vec4 color[graphics::kMaxColorTargets] = {};
+      const std::vector<uint8_t> constants(16);
+      p->run_fragment(varyings, constants.data(), &textures, color);
+      const float layer = face + 6.0f * rintf(c.cube);
+      const bool ok = fabsf(color[0].x - u) < 1e-5f && fabsf(color[0].y - v) < 1e-5f && fabsf(color[0].z - layer) < 1e-5f && color[0].w == 0.0f &&
+                      fabsf(color[1].x - u) < 1e-5f && fabsf(color[1].y - v) < 1e-5f && fabsf(color[1].z - face) < 1e-5f && color[1].w == 1.0f;
+      if (!ok && !wrong)
+        printf("  %s: (%g %g %g, cube %g): array %g %g %g unit %g, cube %g %g %g unit %g; want %g %g layer %g face %g\n", name, c.x, c.y, c.z, c.cube, color[0].x, color[0].y, color[0].z,
+               color[0].w, color[1].x, color[1].y, color[1].z, color[1].w, u, v, layer, face);
+      wrong += !ok;
+    }
+    CHECK(wrong == 0);
+  }
+}
+
 // A vertex shader reading a read-only storage buffer (the kernel's storage in draws).
 void test_vertex_storage() {
   HostAllocator allocator;
@@ -590,6 +686,8 @@ int main() {
   test_compute_shared();
   test_compute_spec();
   test_compute_big();
+  test_compute_dynamic();
+  test_cube_arrays();
   test_vertex_storage();
   printf("refusals\n");
   test_refusals();

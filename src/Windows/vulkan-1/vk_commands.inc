@@ -4,7 +4,8 @@
 
 enum {
   C_BEGIN_PASS = 1, C_NEXT_SUBPASS, C_END_PASS, C_BIND_PIPE, C_BIND_VB, C_BIND_IB, C_BIND_SETS, C_PUSH, C_VIEWPORT, C_SCISSOR, C_DRAW, C_DRAW_INDEXED, C_COPY_BUF, C_COPY_BUF2IMG,
-  C_COPY_IMG2BUF, C_COPY_IMG, C_BLIT, C_CLEAR_COLOR, C_CLEAR_DS, C_CLEAR_ATT, C_FILL, C_UPDATE, C_EXEC, C_RESOLVE, C_DISPATCH, C_DISPATCH_INDIRECT
+  C_COPY_IMG2BUF, C_COPY_IMG, C_BLIT, C_CLEAR_COLOR, C_CLEAR_DS, C_CLEAR_ATT, C_FILL, C_UPDATE, C_EXEC, C_RESOLVE, C_DISPATCH, C_DISPATCH_INDIRECT, C_TIMESTAMP, C_RESET_QUERIES,
+  C_COPY_QUERIES
 };
 /* The bind points: graphics and compute have pipelines and descriptor sets of their own. */
 enum { BP_GRAPHICS = 0, BP_COMPUTE = 1 };
@@ -296,10 +297,19 @@ VKAPI void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer b, uint32_t n, const VkEve
 }
 VKAPI void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer b, VkQueryPool p, uint32_t q, VkQueryControlFlags f) { (void)b, (void)p, (void)q, (void)f; }
 VKAPI void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer b, VkQueryPool p, uint32_t q) { (void)b, (void)p, (void)q; }
-VKAPI void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer b, VkQueryPool p, uint32_t f, uint32_t c) { (void)b, (void)p, (void)f, (void)c; }
-VKAPI void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer b, VkPipelineStageFlagBits s, VkQueryPool p, uint32_t q) { (void)b, (void)s, (void)p, (void)q; }
+VKAPI void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer b, VkQueryPool p, uint32_t f, uint32_t c) {
+  Cmd *cmd = record(b, C_RESET_QUERIES);
+  cmd->a = (ULONGLONG)(ULONG_PTR)p, cmd->b = f, cmd->c = c;
+}
+VKAPI void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer b, VkPipelineStageFlagBits s, VkQueryPool p, uint32_t q) {
+  (void)s;
+  Cmd *cmd = record(b, C_TIMESTAMP);
+  cmd->a = (ULONGLONG)(ULONG_PTR)p, cmd->b = q;
+}
 VKAPI void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer b, VkQueryPool p, uint32_t f, uint32_t c, VkBuffer d, VkDeviceSize o, VkDeviceSize s, VkQueryResultFlags fl) {
-  (void)b, (void)p, (void)f, (void)c, (void)d, (void)o, (void)s, (void)fl;
+  Cmd *cmd = record(b, C_COPY_QUERIES);
+  cmd->a = (ULONGLONG)(ULONG_PTR)p, cmd->b = f, cmd->c = c, cmd->d = o, cmd->e = s, cmd->n = fl;
+  cmd->p = keep(b, &d, sizeof d);
 }
 
 /* ---- running a command buffer ---------------------------------------------------------------------------------------------------------------------------------------- */
@@ -1157,6 +1167,27 @@ static void exec_one(Exec *x, const Cmd *c) {
     case C_EXEC:
       run_cmds(x, (CmdBuf *)(ULONG_PTR)c->a);
       break;
+    case C_RESET_QUERIES: {
+      QueryPool *p = (QueryPool *)(ULONG_PTR)c->a;
+      for (ULONGLONG q = c->b; p && q < c->b + c->c && q < p->count; ++q) p->available[q] = 0;
+      break;
+    }
+    case C_TIMESTAMP: {
+      /* (inside a pass the stream is still being written: the time is when the draws before it have been sent, not run) */
+      QueryPool *p = (QueryPool *)(ULONG_PTR)c->a;
+      if (!x->stream_open) flush(x);
+      if (p && c->b < p->count) p->value[c->b] = now_ns(), p->available[c->b] = 1;
+      break;
+    }
+    case C_COPY_QUERIES: {
+      QueryPool *p = (QueryPool *)(ULONG_PTR)c->a;
+      Buf *b = c->p ? *(Buf **)c->p : NULL;
+      flush(x);
+      if (!p || !b || !b->mem || c->d >= b->size || c->b > p->count || c->c > p->count - c->b) break;
+      query_results(p, (UINT)c->b, (UINT)c->c, b->mem->data + b->off + c->d, b->size - c->d, c->e, (VkQueryResultFlags)c->n);
+      ++b->mem->version;
+      break;
+    }
     default: break;
   }
   (void)d;
