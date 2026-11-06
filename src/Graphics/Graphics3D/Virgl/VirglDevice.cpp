@@ -363,17 +363,18 @@ class VirglShaderModule final : public IShaderModule {
     output_topology_ = desc.geometry_output;
     handle_ = device.new_handle();
     const uint32_t length = string_length(desc.tgsi) + 1;  // with the terminating NUL
-    const uint32_t text_dwords = (length + 3) / 4;
+    // A long text goes in pieces (the host's continuation packets: the first says the whole length, each one after it its offset with bit 31 set), each a command of its own with
+    // the same header: a virgl command counts its dwords in 16 bits, and the request buffer of the virtio queue is not unbounded either.
+    constexpr uint32_t kPieceBytes = 32 * 1024;
+    const uint32_t piece_dwords = ((length < kPieceBytes ? length : kPieceBytes) + 3) / 4;
     const uint32_t outputs = stream_output ? stream_output->stream_output_count : 0;
     const uint32_t so_dwords = outputs ? 4 + 2 * outputs : 0;   // (the four strides, and two words for each output)
-    const uint32_t total = 6 + so_dwords + text_dwords;
+    const uint32_t total = 6 + so_dwords + piece_dwords;
     hardware::VirtioGpu& gpu = device.gpu();
     uint32_t* cmd = static_cast<uint32_t*>(gpu.allocator().allocate(total * 4));
     if (!cmd) return;
-    cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + so_dwords + text_dwords);
     cmd[1] = handle_;
     cmd[2] = desc.stage == ShaderStage::Vertex ? virgl::kShaderVertex : desc.stage == ShaderStage::Compute ? virgl::kShaderCompute : desc.stage == ShaderStage::Geometry ? virgl::kShaderGeometry : desc.stage == ShaderStage::Hull ? virgl::kShaderTessControl : desc.stage == ShaderStage::Domain ? virgl::kShaderTessEval : virgl::kShaderFragment;
-    cmd[3] = length;                         // total text length (no continuation bit: it all fits)
     cmd[4] = length < 300 ? 300 : length;    // upper bound on the TGSI token count the host reserves
     cmd[5] = desc.stage == ShaderStage::Compute ? desc.shared_memory_bytes : outputs;   // stream output outputs; for a compute shader the group-shared memory it needs, in bytes
     if (outputs) {
@@ -388,9 +389,16 @@ class VirglShaderModule final : public IShaderModule {
         fill[entry.buffer] += entry.component_count;
       }
     }
-    cmd[6 + so_dwords + text_dwords - 1] = 0;
-    __builtin_memcpy(&cmd[6 + so_dwords], desc.tgsi, length - 1);
-    ok_ = device.send_commands(cmd, total);
+    ok_ = true;
+    for (uint32_t at = 0; at < length && ok_; at += kPieceBytes) {
+      const uint32_t bytes = length - at < kPieceBytes ? length - at : kPieceBytes;   // (with the NUL in the last piece)
+      const uint32_t dwords = (bytes + 3) / 4;
+      cmd[0] = virgl::header(virgl::kCreateObject, virgl::kObjectShader, 5 + so_dwords + dwords);
+      cmd[3] = at == 0 ? length : (at | 0x80000000u);   // (VIRGL_OBJ_SHADER_OFFSET_CONT)
+      cmd[6 + so_dwords + dwords - 1] = 0;
+      __builtin_memcpy(&cmd[6 + so_dwords], desc.tgsi + at, at + bytes == length ? bytes - 1 : bytes);
+      ok_ = device.send_commands(cmd, 6 + so_dwords + dwords);
+    }
     gpu.allocator().deallocate(cmd);
   }
   bool valid() const { return ok_; }

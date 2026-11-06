@@ -19,7 +19,7 @@
 // Direct3D 9 bytecode (as decoded by D3d9Program) to TGSI text, for the virgl device. The text follows graphics::ShaderModuleDesc::tgsi, and means what D3d9Program::run_vertex /
 // run_fragment compute:
 //
-//  - Direct3D's temporaries r0..r31 are TEMP[0..31]; the emitter's own temporaries follow them (scratch copies of source operands that have a modifier TGSI has no syntax for, a work
+//  - Direct3D's temporaries r0..r[n - 1] are TEMP[0..n - 1] (n: as many as the program uses, up to kMaxTemps); the emitter's own temporaries follow them (scratch copies of source operands that have a modifier TGSI has no syntax for, a work
 //    register for instructions that take several TGSI instructions, and a shadow register per output). Outputs are written to their shadow registers, which start at zero as in the
 //    interpreter, and copied to OUT[] at the end - which is also where the vertex shader's position gets the Y flip (and where partial writes of a register become whole ones).
 //  - The vertex shader always declares the four varyings, so that any pixel shader finds the ones it reads. A pixel shader declares the ones it reads.
@@ -53,21 +53,23 @@ class TgsiEmitter {
   using Instr = D3d9Program::Instruction;
 
   // `varyings`: the interpolants the host's shaders declare (the number the device takes: the vertex and pixel shaders of a pipeline must agree on them).
-  TgsiEmitter(const D3d9Program& program, allocators::IAllocator& allocator, uint32_t varyings) : p_(program), a_(allocator), body_(allocator), imms_(allocator), varyings_(varyings) {}
+  TgsiEmitter(const D3d9Program& program, allocators::IAllocator& allocator, uint32_t varyings)
+      : kScratch(program.temp_count_), p_(program), a_(allocator), body_(allocator), imms_(allocator), varyings_(varyings) {}
 
   NtStatus run(String* out);
 
  private:
-  static constexpr uint32_t kScratch = 32;   // 4 registers for source operands
-  static constexpr uint32_t kWork = 36, kWork2 = 37, kWork3 = 38;
-  static constexpr uint32_t kPosition = 39, kVarying = 40, kColor = 44;   // (kVarying: four)
-  static constexpr uint32_t kSys = 45;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
-  static constexpr uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
-  static constexpr uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, up to six vertices, turned back to Direct3D's +Y up
-  static constexpr uint32_t kPatchBase = kGsPosition + 6;   // a hull shader's patch constant registers (shadows of the tessellation factors)
-  static constexpr uint32_t kTempCount = kPatchBase + graphics::kMaxPatchRegisters;
-  static uint32_t color_register(uint32_t target) { return target == 0 ? kColor : kColorExtra + target - 1; }
-  static constexpr uint32_t kMaxOutput = 120000;   // (the virgl command carrying the text has a 16-bit dword count)
+  // (the emitter's registers come after the program's temporaries: the text declares no more registers than it uses)
+  const uint32_t kScratch;   // 4 registers for source operands
+  const uint32_t kWork = kScratch + 4, kWork2 = kScratch + 5, kWork3 = kScratch + 6;
+  const uint32_t kPosition = kScratch + 7, kVarying = kScratch + 8, kColor = kScratch + 12;   // (kVarying: four)
+  const uint32_t kSys = kScratch + 13;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
+  const uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
+  const uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, up to six vertices, turned back to Direct3D's +Y up
+  const uint32_t kPatchBase = kGsPosition + 6;   // a hull shader's patch constant registers (shadows of the tessellation factors)
+  const uint32_t kTempCount = kPatchBase + graphics::kMaxPatchRegisters;
+  uint32_t color_register(uint32_t target) const { return target == 0 ? kColor : kColorExtra + target - 1; }
+  static constexpr uint32_t kMaxOutput = 8u << 20;   // (virgl takes the text in pieces: VirglShaderModule)
 
   struct Imm {
     uint32_t bits[4];

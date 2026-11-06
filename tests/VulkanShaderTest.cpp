@@ -484,6 +484,57 @@ void test_compute_spec() {
   }
 }
 
+// The number of temporaries a DXBC container declares (dcl_temps), 0 if none.
+uint32_t declared_temps(const std::vector<uint8_t>& dxbc) {
+  for (size_t at = 0; at + 8 <= dxbc.size(); at += 4) {
+    uint32_t token, count;
+    memcpy(&token, dxbc.data() + at, 4);
+    memcpy(&count, dxbc.data() + at + 4, 4);
+    if (token == (104u | (2u << 24))) return count;
+  }
+  return 0;
+}
+
+// A shader far past the old limits of 32 temporaries and about 1100 instructions (cs_big.comp, generated: 80 values all live through 30 rounds of updates), against the same
+// arithmetic in C++; and its TGSI (what virgl gets) is made too.
+void test_compute_big() {
+  HostAllocator allocator;
+  constexpr int kValues = 80, kRounds = 30;
+  for (const char* name : {"cs_big.comp.spv", "cs_big_opt.comp.spv"}) {
+    Translated t;
+    UniquePointer<D3d9Program> p = compile_compute(allocator, name, &t);
+    if (!p) continue;
+    const uint32_t temps = declared_temps(t.dxbc);
+    printf("  %s: %u bytes of DXBC, %u temporaries\n", name, static_cast<uint32_t>(t.dxbc.size()), temps);
+    CHECK(temps > 32 && t.dxbc.size() > 1100 * 8);
+    std::vector<uint8_t> values(4 * 8);
+    for (uint32_t i = 0; i < 8; ++i) {
+      const float x = 0.25f * i - 1.0f;
+      put_floats(values, 4 * i, &x, 1);
+    }
+    std::vector<uint8_t>* buffers[graphics::kMaxStorageBuffers] = {};
+    buffers[t.storage_slot[0]] = &values;
+    std::vector<uint8_t> constants(16);
+    dispatch(*p, 2, buffers, constants.data());
+    uint32_t wrong = 0;
+    for (uint32_t i = 0; i < 8; ++i) {
+      const float x = 0.25f * i - 1.0f;
+      float a[kValues];
+      for (int k = 0; k < kValues; ++k) a[k] = x * static_cast<float>(k % 7 + 1) + static_cast<float>(k);
+      for (int r = 0; r < kRounds; ++r)
+        for (int k = 0; k < kValues; ++k) a[k] = a[k] * 0.5f + a[(k + 7) % kValues] * 0.25f + static_cast<float>(r % 5);
+      float sum = 0;
+      for (int k = 0; k < kValues; ++k) sum = sum + a[k] * static_cast<float>(k % 3 + 1);
+      const float got = get_float(values, 4 * i);
+      if (fabsf(got - sum) > 1e-4f * (1 + fabsf(sum))) {
+        if (!wrong) printf("  %s: v[%u] = %g, expected %g\n", name, i, got, sum);
+        ++wrong;
+      }
+    }
+    CHECK(wrong == 0);
+  }
+}
+
 // A vertex shader reading a read-only storage buffer (the kernel's storage in draws).
 void test_vertex_storage() {
   HostAllocator allocator;
@@ -538,6 +589,7 @@ int main() {
   test_compute_buffers();
   test_compute_shared();
   test_compute_spec();
+  test_compute_big();
   test_vertex_storage();
   printf("refusals\n");
   test_refusals();

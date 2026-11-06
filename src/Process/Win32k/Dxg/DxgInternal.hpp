@@ -41,6 +41,7 @@ constexpr uint32_t kNoSuchDevice = 0xC000000Eu;
 
 // --- Limits.
 constexpr uint32_t kMaxPrivateData = 64 * 1024;       // each blob of private driver / runtime data a process hands the kernel
+constexpr uint32_t kMaxEscapeData = 4u << 20;         // ... but the data of a driver's escape: a shader's code (dxgk::D3d9Program::kMaxDxbcBytes)
 constexpr uint32_t kMaxAllocationsPerCall = 256;      // NumAllocations of one CreateAllocation / list of one DestroyAllocation
 constexpr uint32_t kMaxObjectsPerSync = 32;           // D3DDDI_MAX_OBJECT_SIGNALED / _WAITED_ON
 constexpr uint32_t kMaxAdaptersPerCall = 16;          // MAX_ENUM_ADAPTERS
@@ -89,8 +90,8 @@ bool put64(Call& call, uint64_t address, uint64_t offset, uint64_t value);
 // `count` 32-bit / 64-bit values of an array of the caller's, copied in (count is checked by the caller against its limit). False if unreadable.
 bool read_u32_array(Call& call, uint64_t address, uint32_t count, List<uint32_t>* out);
 bool read_u64_array(Call& call, uint64_t address, uint32_t count, List<uint64_t>* out);
-// `size` bytes of the caller's memory (at most kMaxPrivateData) appended to the buffer.
-bool read_blob(Call& call, uint64_t address, uint32_t size, ByteBuffer* out);
+// `size` bytes of the caller's memory (at most `limit`) appended to the buffer.
+bool read_blob(Call& call, uint64_t address, uint32_t size, ByteBuffer* out, uint32_t limit = kMaxPrivateData);
 
 // --- What a process has made through this layer that dxgk::Kernel has no counterpart for.
 

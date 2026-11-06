@@ -51,11 +51,17 @@ ControlHeader header(uint32_t type) {
 uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
   if (!ready_ || request.size() < sizeof(ControlHeader) || request.size() > request_.size()) return 0;
   // A caller with interrupts masked (the console draws under its spinlock) must not block on the mutex while another thread has a command out: it looks
-  // for the mutex again instead. (Blocking there is a kernel panic.)
+  // for the mutex again instead (blocking there is a kernel panic), and not for ever: the thread that holds it may be waiting for the host's answer on this
+  // very core, which cannot switch to it while interrupts are masked - spinning on would hang the machine. It gives up, as for a host that does not answer
+  // (the console skips a frame).
   if (kernel::irq_enabled() || !kernel::running()) {
     lock_.lock();
   } else {
-    while (!lock_.try_lock()) delay_spin_us(20);
+    const uint64_t start = uptime_us();
+    while (!lock_.try_lock()) {
+      if (uptime_us() - start >= kMaskedLockWaitUs) return 0;
+      delay_spin_us(20);
+    }
   }
   struct Release {
     kernel::Mutex& mutex;

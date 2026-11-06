@@ -31,6 +31,9 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
   constant block (so every stage declares every slot); sampled images are texture units `t0..`/`s0..`; storage buffers are the kernel's storage slots: a buffer some stage of the
   pipeline writes is a raw unordered access view `u0..u3`, one that is only read (`NonWritable`) a raw read-only view `t0..t3` (the kernel's slots 4..7). That is 4 + 4 storage buffers a
   pipeline (`maxPerStageDescriptorStorageBuffers` 8; a pipeline that writes a fifth is refused when it is created).
+* **Size**: a shader may use up to 256 temporary registers at once and 60000 instructions (the kernel takes 65536 instructions and 256 temporaries of a program made from DXBC; a
+  Direct3D 9 program keeps 32). The DXBC goes to the kernel in one escape of at most 4 MiB, and on virgl its TGSI text goes in pieces (the host's continuation packets). A big shader
+  is slow to compile on the virgl host the first time (the host's GL driver compiles what virglrenderer makes of the TGSI; its shader cache keeps it after that).
 * **Memory in shaders** (storage buffers, `Workgroup` variables) is addressed by bytes: an access chain is a constant offset plus an integer for its dynamic indices, a load `ld_raw`, a
   store `store_raw`, atomics `imm_atomic_*` (add, sub, and, or, xor, min, max, exchange, increment, decrement; not compare-exchange, which the kernel has not). The layout is the module's
   (`Offset`, `ArrayStride`, `MatrixStride`: std430 or std140); `Workgroup` variables have none, so they are laid out one after the other in the group-shared memory `g0` (32 KiB).

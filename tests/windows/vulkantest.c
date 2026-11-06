@@ -557,6 +557,83 @@ static void test_compute(Rig *r) {
   p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
 }
 
+/* A shader far past the old limits (cs_big.comp: 80 values live through 30 rounds of updates, a few thousand instructions, more than 32 registers at once): the translator, the
+ * kernel and, on virgl, the shader text sent in pieces and the host's compiler all take it, and it computes what the same arithmetic in C does. */
+static void test_compute_big(Rig *r) {
+  VkQueueFamilyProperties fam;
+  unsigned nfam = 1;
+  p_vkGetPhysicalDeviceQueueFamilyProperties(r->pd, &nfam, &fam);
+  if (!(fam.queueFlags & VK_QUEUE_COMPUTE_BIT)) return;
+  VkDescriptorSetLayoutBinding binding = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+  VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dl.bindingCount = 1, dl.pBindings = &binding;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  p_vkCreateDescriptorSetLayout(r->dev, &dl, NULL, &set_layout);
+  VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pl.setLayoutCount = 1, pl.pSetLayouts = &set_layout;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  p_vkCreatePipelineLayout(r->dev, &pl, NULL, &layout);
+  VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+  VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  p_vkCreateDescriptorPool(r->dev, &dpi, NULL, &pool);
+  VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &set_layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  check(p_vkAllocateDescriptorSets(r->dev, &dai, &set) == VK_SUCCESS, "a descriptor set (large shader)");
+  VkDeviceMemory mem;
+  void *map;
+  VkBuffer buf = make_buffer(r, 8 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mem, &map);
+  float *v = map;
+  for (unsigned i = 0; i < 8; ++i) v[i] = 0.25f * i - 1.0f;
+  VkDescriptorBufferInfo info = {buf, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  w.dstSet = set, w.descriptorCount = 1, w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w.pBufferInfo = &info;
+  p_vkUpdateDescriptorSets(r->dev, 1, &w, 0, NULL);
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof big_comp, smi.pCode = big_comp;
+  VkShaderModule module = VK_NULL_HANDLE;
+  check(p_vkCreateShaderModule(r->dev, &smi, NULL, &module) == VK_SUCCESS, "a large compute shader module");
+  VkComputePipelineCreateInfo cpi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, cpi.stage.module = module, cpi.stage.pName = "main";
+  cpi.layout = layout;
+  VkPipeline pipe = VK_NULL_HANDLE;
+  check(p_vkCreateComputePipelines(r->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe) == VK_SUCCESS && pipe, "vkCreateComputePipelines (a shader of thousands of instructions, 80 live values)");
+  if (pipe) {
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    p_vkResetCommandBuffer(r->cb, 0);
+    p_vkBeginCommandBuffer(r->cb, &cbi);
+    p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    p_vkCmdDispatch(r->cb, 2, 1, 1);
+    p_vkEndCommandBuffer(r->cb);
+    submit_and_wait(r);
+    unsigned wrong = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+      const float x = 0.25f * i - 1.0f;
+      float a[80], sum = 0;
+      for (int k = 0; k < 80; ++k) a[k] = x * (float)(k % 7 + 1) + (float)k;
+      for (int round = 0; round < 30; ++round)
+        for (int k = 0; k < 80; ++k) a[k] = a[k] * 0.5f + a[(k + 7) % 80] * 0.25f + (float)(round % 5);
+      for (int k = 0; k < 80; ++k) sum = sum + a[k] * (float)(k % 3 + 1);
+      const float d = v[i] - sum, tol = 1e-4f * (1 + (sum < 0 ? -sum : sum));
+      if (d > tol || d < -tol) {
+        if (!wrong) printf("    large shader: v[%u] = %g, expected %g\n", i, v[i], sum);
+        ++wrong;
+      }
+    }
+    check(wrong == 0, "the large shader computes what C does");
+    p_vkDestroyPipeline(r->dev, pipe, NULL);
+  }
+  if (module) p_vkDestroyShaderModule(r->dev, module, NULL);
+  p_vkDestroyBuffer(r->dev, buf, NULL);
+  p_vkFreeMemory(r->dev, mem, NULL);
+  p_vkDestroyDescriptorPool(r->dev, pool, NULL);
+  p_vkDestroyPipelineLayout(r->dev, layout, NULL);
+  p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
+}
+
 static void test_device(VkPhysicalDevice pd, unsigned index) {
   Rig r;
   memset(&r, 0, sizeof r);
@@ -778,6 +855,7 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   test_swapchain(&r);
   /* (after a present: the GPU work after it must still run - a present the host refused used to lose the context without a word) */
   test_compute(&r);
+  test_compute_big(&r);
 
   /* copies and clears that need no GPU */
   p_vkResetCommandBuffer(r.cb, 0);
