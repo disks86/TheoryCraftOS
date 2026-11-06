@@ -90,6 +90,41 @@ int main() {
     if (!scsi::parse_lbp_vpd_unmap(ConstByteView(lbp)) || !scsi::parse_block_limits(ConstByteView(limits), &blocks, &descriptors) || blocks != 0x40 ||
         descriptors != 1 || scsi::parse_lbp_vpd_unmap(ConstByteView(lbp).first(5))) { puts("FAILED: provisioning pages"); return 1; }
   }
+  {  // probe_unmap / unmap_range against a scripted unit: thin provisioned, LBPRZ, UNMAP of at most 1000 blocks
+    std::vector<std::vector<uint8_t>> unmaps;
+    bool thin = true, lbpu = true, has_limits = true;
+    auto unit = [&](ConstByteView cdb, ByteView data, bool in) {
+      if (cdb[0] == scsi::kServiceActionIn16 && in) {
+        data.fill(0);
+        if (data.size() > 14) data[14] = thin ? 0xC0 : 0;
+        return true;
+      }
+      if (cdb[0] == scsi::kInquiry && (cdb[1] & 1) && in) {
+        data.fill(0);
+        if (cdb[2] == scsi::kVpdLogicalBlockProvisioning) { data[1] = 0xB2; data[5] = lbpu ? 0x80 : 0; return true; }
+        if (cdb[2] == scsi::kVpdBlockLimits && has_limits) { data[1] = 0xB0; data[22] = 0x03; data[23] = 0xE8; data[27] = 1; return true; }
+        return false;   // (no such page)
+      }
+      if (cdb[0] == scsi::kUnmap && !in) { unmaps.emplace_back(data.data(), data.data() + data.size()); return true; }
+      return false;
+    };
+    uint8_t scratch[64];
+    scsi::UnmapSupport u = scsi::probe_unmap(unit, ByteView(scratch));
+    if (!u.unmap || !u.reads_zeros || u.max_blocks != 1000) { puts("FAILED: probe_unmap"); return 1; }
+    if (!scsi::unmap_range(unit, u, ByteView(scratch), 5000, 2500) || unmaps.size() != 3 || unmaps[2][19] != (500 & 0xFF) || unmaps[1][15] != ((6000) & 0xFF)) {
+      puts("FAILED: unmap_range");
+      return 1;
+    }
+    has_limits = false;
+    u = scsi::probe_unmap(unit, ByteView(scratch));
+    if (!u.unmap || u.max_blocks != 0x400000) { puts("FAILED: probe_unmap without limits"); return 1; }
+    lbpu = false;
+    if (scsi::probe_unmap(unit, ByteView(scratch)).unmap) { puts("FAILED: probe_unmap without LBPU"); return 1; }
+    lbpu = true;
+    thin = false;
+    if (scsi::probe_unmap(unit, ByteView(scratch)).unmap || scsi::unmap_range(unit, scsi::UnmapSupport{}, ByteView(scratch), 0, 1)) { puts("FAILED: not thin"); return 1; }
+    if (scsi::probe_unmap(unit, ByteView(scratch).first(10)).unmap) { puts("FAILED: small scratch"); return 1; }
+  }
 
   for (int round = 0; round < 40000; ++round) {
     // truncations at every length, byte flips, junk, and lengths that lie

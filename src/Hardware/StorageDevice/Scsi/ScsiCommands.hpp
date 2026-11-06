@@ -67,8 +67,10 @@ inline bool parse_capacity16(ConstByteView data, uint64_t* last_block, uint32_t*
   return in.ok();
 }
 
-// READ CAPACITY(16) byte 14 bit 7, LBPME: the unit is thin provisioned (logical block provisioning management), the start of UNMAP support.
+// READ CAPACITY(16) byte 14 bit 7, LBPME: the unit is thin provisioned (logical block provisioning management), the start of UNMAP support;
+// bit 6, LBPRZ: unmapped blocks read back as zeros.
 inline bool capacity16_thin_provisioned(ConstByteView data) { return data.size() > 14 && (data[14] & 0x80); }
+inline bool capacity16_unmapped_reads_zeros(ConstByteView data) { return data.size() > 14 && (data[14] & 0x40); }
 
 // INQUIRY with EVPD for a vital product data page (in a 6-byte CDB): `length` bytes of page `page`.
 constexpr uint8_t kVpdBlockLimits = 0xB0, kVpdLogicalBlockProvisioning = 0xB2;
@@ -109,6 +111,55 @@ inline bool build_unmap(ByteView cdb, ByteView parameters, uint64_t lba, uint32_
   out.be32(static_cast<uint32_t>(lba));
   out.be32(blocks);
   out.be32(0);
+  return true;
+}
+
+// What a unit says about UNMAP, from READ CAPACITY(16) and the provisioning pages (probe_unmap).
+struct UnmapSupport {
+  bool unmap = false;          // UNMAP works
+  bool reads_zeros = false;    // unmapped blocks read as zeros (LBPRZ)
+  uint32_t max_blocks = 0;     // the most one UNMAP may name
+};
+
+// The drivers that speak SCSI share these. `run(cdb, data, data_in)` runs one command on the unit with `data` as its data stage (to the host
+// when data_in) and says whether it succeeded; `scratch` is at least 64 bytes the transport can move data through.
+// Thin provisioning (LBPME), then UNMAP support (the LBP page's LBPU) and its limit (the Block Limits page: 0 there means no UNMAP after all;
+// no page means no limit was given, so a conservative 2 GiB of 512-byte blocks).
+template <class Run>
+UnmapSupport probe_unmap(Run&& run, ByteView scratch) {
+  UnmapSupport support;
+  if (scratch.size() < 64) return support;
+  const ByteView data = scratch.first(64);
+  const uint8_t capacity16[16] = {kServiceActionIn16, kReadCapacity16Action, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0};
+  data.fill(0);
+  if (!run(ConstByteView(capacity16), data.first(32), true) || !capacity16_thin_provisioned(data.first(32))) return support;
+  const bool zeros = capacity16_unmapped_reads_zeros(data.first(32));
+  uint8_t cdb[6];
+  build_vpd_inquiry(ByteView(cdb), kVpdLogicalBlockProvisioning, 64);
+  data.fill(0);
+  if (!run(ConstByteView(cdb), data, true) || !parse_lbp_vpd_unmap(data)) return support;
+  uint32_t max_blocks = 0x400000, descriptors = 1;
+  build_vpd_inquiry(ByteView(cdb), kVpdBlockLimits, 64);
+  data.fill(0);
+  if (run(ConstByteView(cdb), data, true) && parse_block_limits(data, &max_blocks, &descriptors) && (max_blocks == 0 || descriptors == 0)) return support;
+  support.unmap = true;
+  support.reads_zeros = zeros;
+  support.max_blocks = max_blocks;
+  return support;
+}
+
+// UNMAP of [lba, lba + blocks), one block descriptor a command, `support.max_blocks` at most each; `scratch` (24 bytes or more) carries the
+// parameter list.
+template <class Run>
+bool unmap_range(Run&& run, const UnmapSupport& support, ByteView scratch, uint64_t lba, uint64_t blocks) {
+  if (!support.unmap || support.max_blocks == 0 || scratch.size() < kUnmapParameterBytes) return false;
+  while (blocks > 0) {
+    const uint32_t n = blocks < support.max_blocks ? static_cast<uint32_t>(blocks) : support.max_blocks;
+    uint8_t cdb[10];
+    if (!build_unmap(ByteView(cdb), scratch, lba, n) || !run(ConstByteView(cdb), scratch.first(kUnmapParameterBytes), false)) return false;
+    lba += n;
+    blocks -= n;
+  }
   return true;
 }
 

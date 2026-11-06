@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
 #include "Hardware/StorageDevice/QueuedStorage.hpp"
+#include "Hardware/StorageDevice/Scsi/ScsiCommands.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
 #include "ObjectContainer/List.hpp"
@@ -145,13 +146,10 @@ class VirtioScsiDevice final : public StorageDeviceBase {
   // Runs a command, retrying while the target reports a unit attention.
   bool run(ConstByteView cdb, ByteView data, bool device_writes);
 
-  // UNMAP when the unit is thin provisioned and says it takes it; the most blocks one may name.
-  void find_unmap();
-
   SharedPointer<VirtioScsiController> controller_;
   uint32_t target_;
   bool optical_ = false;
-  uint32_t unmap_max_blocks_ = 0;
+  scsi::UnmapSupport unmap_;   // UNMAP when the unit is thin provisioned and says it takes it
 };
 
 }  // namespace hardware

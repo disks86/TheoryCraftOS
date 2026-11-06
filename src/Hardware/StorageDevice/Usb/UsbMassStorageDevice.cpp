@@ -216,7 +216,27 @@ bool UsbMassStorageDevice::initialize() {
   }
   info_.block_count = last + 1;
   if (info_.block_size < 512 || info_.block_size > 4096) return false;
+  if (!optical_) {   // (a stick that does not know the commands answers CHECK CONDITION, and that is that)
+    unmap_ = scsi::probe_unmap([this](ConstByteView cdb, ByteView buffer, bool in) { return run(cdb, buffer, in); }, wire_.subview(kDataOffset, 64));
+    info_.discard = unmap_.unmap;
+    info_.discard_zeroes = unmap_.unmap && unmap_.reads_zeros;
+  }
   return prepare_bounce();
+}
+
+// UNMAP, under the device's lock like every other request (StorageDeviceBase); the parameter list goes through the wire buffer.
+bool UsbMassStorageDevice::discard(uint64_t lba, uint64_t blocks) {
+  kernel::ScopedMutex guard(mutex_);
+  const bool ok = present() && !wire_.empty() && info_.discard && blocks && lba < info_.block_count && blocks <= info_.block_count - lba &&
+                  scsi::unmap_range([this](ConstByteView cdb, ByteView data, bool in) { return run(cdb, data, in); }, unmap_,
+                                    wire_.subview(kDataOffset, scsi::kUnmapParameterBytes), lba, blocks);
+  if (ok) {
+    ++stats_.discards;
+    stats_.blocks_discarded += blocks;
+  } else {
+    ++stats_.errors;
+  }
+  return ok;
 }
 
 void UsbMassStorageDevice::shutdown() {

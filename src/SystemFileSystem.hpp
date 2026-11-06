@@ -31,6 +31,7 @@
 #include "FileSystem/IFileSystem.hpp"
 #include "FileSystem/Mount/MountTable.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/TrimSchedule.hpp"
 #include "Hardware/StorageDevice/Partition/PartitionStorageDevice.hpp"
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Kernel/Thread.hpp"
@@ -63,7 +64,8 @@ class SystemFileSystem {
   // service if that is busy.
   enum class EjectStatus : uint8_t { Ok, NotFound, NotEjectable, InUse, Failed };
   EjectStatus eject(StringView volume, bool force = false);
-  // Runs poll() every 250 ms on a thread of its own ("hotplug"), and every 5 s sends the volumes' freed blocks to their devices as discards.
+  // Runs poll() every 250 ms on a thread of its own ("hotplug"), every 5 s sends the volumes' freed blocks to their devices as discards, and
+  // trims every volume when the schedule says (FileSystem/TrimSchedule: ten minutes after start-up, then weekly).
   bool start_service();
   void stop_service();
 
@@ -73,6 +75,8 @@ class SystemFileSystem {
   void mount_fallback();
   void notify(StringView text);
   static void service_main(void* self);
+  // The scheduled fstrim, if it is due (the last run read from, and written to, layout::kFstrimState).
+  void scheduled_trim();
 
   allocators::IAllocator& allocator_;
   hardware::SystemStorageDevices& storage_;
@@ -82,5 +86,7 @@ class SystemFileSystem {
   Notifier notifier_ = nullptr;
   void* notifier_context_ = nullptr;
   kernel::Thread* service_ = nullptr;
+  filesystem::TrimSchedule trim_schedule_;
+  bool trim_schedule_loaded_ = false;
   bool stop_ = false;
 };

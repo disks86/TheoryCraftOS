@@ -89,6 +89,8 @@ class MountTable final : public IFileSystem {
   Status flush() override;
   Status send_discards() override;
   Status trim(StringView path, uint64_t* discarded_bytes) override;
+  // Every mounted volume (the root volume and the others), as trim() does for the table's own root.
+  Status trim_all(uint64_t* discarded_bytes);
 
  private:
   struct Entry;

@@ -20,6 +20,7 @@
 // the 4 bit bus, block transfers through the storage device (chunked, addressed by block or by byte), write protection, a card that is not an SD memory card, a card that goes away,
 // and the slot source that makes a device when a card is put in.
 #include <stdint.h>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <vector>
@@ -203,12 +204,52 @@ static void test_slot_source() {
   kept->shutdown();
 }
 
+// discard() as an SD erase (CMD32, CMD33, CMD38): the blocks read back in the erased state the SCR names, the neighbours are untouched, a range
+// past the end or a write-protected slot is refused, a card without the erase class does not offer discard, and big ranges go in pieces.
+static void test_erase() {
+  TestAllocator a;
+  for (int kind = 0; kind < 3; ++kind) {
+    FakeSdCard card(kind == 2 ? 4096 : 20480);
+    card.high_capacity = kind != 2;   // (standard capacity: byte addresses)
+    card.erased_ones = kind == 1;
+    FakeSdHost host;
+    host.insert(&card);
+    SdStorageDevice device(host, a);
+    CHECK(device.initialize());
+    const StorageInfo info = device.info();
+    CHECK(info.discard && info.discard_zeroes == !card.erased_ones);
+    std::fill(card.data.begin(), card.data.end(), 0x5A);
+    CHECK(device.discard(100, 50));
+    const uint8_t erased = card.erased_ones ? 0xFF : 0x00;
+    CHECK(card.data[100 * 512] == erased && card.data[150 * 512 - 1] == erased && card.data[100 * 512 - 1] == 0x5A && card.data[150 * 512] == 0x5A);
+    CHECK(card.erases == 1);
+    if (kind == 0) {
+      CHECK(device.discard(0, 20000) && card.erases == 1 + 3);   // 8192 + 8192 + 3616
+      CHECK(card.data[19999 * 512] == erased && card.data[20000 * 512] == 0x5A);
+    }
+    CHECK(!device.discard(info.block_count - 1, 2) && !device.discard(0, 0));
+    host.write_protect_switch = true;
+    CHECK(!device.discard(0, 1));
+    host.write_protect_switch = false;
+    CHECK(device.statistics().discards >= 1 && device.statistics().errors == 3);
+    device.shutdown();
+  }
+  FakeSdCard plain(4096);
+  plain.erase_class = false;
+  FakeSdHost host;
+  host.insert(&plain);
+  SdStorageDevice device(host, a);
+  CHECK(device.initialize() && !device.info().discard && !device.discard(0, 1));
+  device.shutdown();
+}
+
 int main() {
   test_registers();
   test_high_capacity();
   test_standard_capacity();
   test_not_a_card();
   test_slot_source();
+  test_erase();
   printf(g_failed ? "SdCardTest: %d FAILED\n" : "SdCardTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

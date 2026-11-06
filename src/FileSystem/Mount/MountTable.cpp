@@ -424,6 +424,11 @@ Status MountTable::trim(StringView path, uint64_t* discarded_bytes) {
     if (!entry->usable()) return Status::NoMedia;
     return entry->volume->file_system().trim("/", discarded_bytes);
   }
+  return trim_all(discarded_bytes);
+}
+
+Status MountTable::trim_all(uint64_t* discarded_bytes) {
+  *discarded_bytes = 0;
   List<SharedPointer<Entry>> snapshot(allocator_);
   {
     kernel::ScopedMutex guard(mutex_);

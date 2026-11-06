@@ -40,8 +40,30 @@ bool SdStorageDevice::initialize() {
     const uint32_t digit = (card.serial >> (28 - 4 * i)) & 0xF;
     info_.serial[i] = static_cast<char>(digit < 10 ? '0' + digit : 'A' + digit - 10);
   }
+  info_.discard = card.can_erase && !info_.read_only;   // (an erase, the card's own way of saying blocks are unused)
+  info_.discard_zeroes = info_.discard && !card.erased_reads_ones;
   if (!prepare_bounce()) return false;
   return true;
+}
+
+// Erase, kMaxEraseBlocks at a time, under the device's lock like every other request (StorageDeviceBase).
+bool SdStorageDevice::discard(uint64_t lba, uint64_t blocks) {
+  kernel::ScopedMutex guard(mutex_);
+  bool ok = info_.discard && !gone_ && present() && !host_.write_protected() && blocks && lba < info_.block_count && blocks <= info_.block_count - lba;
+  const uint64_t requested = blocks;
+  while (ok && blocks > 0) {
+    const uint32_t n = blocks < SdCard::kMaxEraseBlocks ? static_cast<uint32_t>(blocks) : SdCard::kMaxEraseBlocks;
+    ok = card_.erase(lba, n);
+    lba += n;
+    blocks -= n;
+  }
+  if (ok) {
+    ++stats_.discards;
+    stats_.blocks_discarded += requested;
+  } else {
+    ++stats_.errors;
+  }
+  return ok;
 }
 
 void SdStorageDevice::shutdown() {

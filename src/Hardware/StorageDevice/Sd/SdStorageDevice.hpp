@@ -32,6 +32,7 @@ class SdStorageDevice final : public StorageDeviceBase {
   const char* name() const override { return "SD card"; }
   // Identifies the card in the slot.
   bool initialize() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
   void shutdown() override;
   bool present() const override { return !gone_ && host_.card_present() && host_.generation() == generation_; }
 

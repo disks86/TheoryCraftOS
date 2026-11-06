@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
+#include "Hardware/StorageDevice/Scsi/ScsiCommands.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -58,6 +59,7 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
   const char* name() const override { return optical_ ? "USB optical drive" : "USB mass storage"; }
   bool initialize() override;
   void shutdown() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
 
  protected:
   bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
@@ -77,6 +79,7 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
   uint8_t interface_, in_, out_;
   uint16_t in_max_packet_, out_max_packet_;
   uint32_t generation_;     // the port's generation when the device was taken over
+  scsi::UnmapSupport unmap_;   // UNMAP (a USB SSD that is thin provisioned says so; sticks do not)
   bool shut_down_ = false;
   bool ejected_ = false;
   uint8_t last_sense_key_ = 0;   // of the last command that failed with CHECK CONDITION (0: none, or it has not failed since)
