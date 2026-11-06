@@ -4,7 +4,7 @@
 Same method as gen_intel_hevc_xelpg.py: the Intel media driver's (MIT licence) own lambdas, tables, field maps and command structures are compiled into a small program and run for
 the configuration the encoder here uses (constant QP, target usage 7, one slice, frame pictures, no 8x8 transform, I and P pictures, reference pictures), and the images are written.
 
-usage: gen_intel_avc_xelpg.py <media-driver-dir> <out.inc> [xelpg | xe2lpm | xe2hpm]
+usage: gen_intel_avc_xelpg.py <media-driver-dir> <out.inc> [xelpg | xe2lpm | xe2hpm | xe3lpm]
 
 xe2lpm (Lunar Lake) and xe2hpm (Arc Battlemage) read cs_avc_xe2_lpm.cpp / cs_avc_xe2_hpm.cpp and the matching *_open.h tables instead of cs_avc_lpm.cpp, and hwcmd_xe2_lpm.h / hwcmd_xe2_hpm.h, impl_xe2_hpm.h instead
 of hwcmd.h / impl_lpmplus_base.h; they write kXe2Lpm... / kXe2Hpm... names.
@@ -24,6 +24,7 @@ LEVELS = range(0, 53)
 PLATFORMS = {
     'xelpg': dict(ns='xe_lpm_plus_base::v0', hwcmd='hwcmd.h', hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h', cs='cs_avc_lpm.cpp', cs_class='EncodeAvcVdencConstSettingsXe_Lpm_Plus_Base', pms=['impl_lpmplus_base.h'], prefix='XeLpg'),
     'xe2lpm': dict(ns='xe2_lpm_base::xe2_lpm', hwcmd='hwcmd_xe2_lpm.h', hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe2_lpm.h', cs='cs_avc_xe2_lpm.cpp', cs_class='EncodeAvcVdencConstSettingsXe2_Lpm', pms=[], prefix='Xe2Lpm'),
+    'xe3lpm': dict(ns='xe3_lpm_base::xe3_lpm', hwcmd='hwcmd_xe3_lpm.h', hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe3_lpm.h', cs='cs_avc_xe3_lpm.cpp', cs_class='EncodeAvcVdencConstSettingsXe3_Lpm', pms=['impl_xe3_lpm.h'], prefix='Xe3Lpm'),
     'xe2hpm': dict(ns='xe_lpm_plus_base::v1', hwcmd='hwcmd_xe2_hpm.h', hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe2_hpm.h', cs='cs_avc_xe2_hpm.cpp', cs_class='EncodeAvcVdencConstSettingsXe2_Hpm', pms=['impl_lpmplus_base.h', 'impl_xe2_hpm.h'], prefix='Xe2Hpm'),
 }
 

@@ -7,7 +7,7 @@ VDENC_CMD2 (encode_hevc_vdenc_const_settings*.cpp), the DO_FIELD maps that put t
 prediction, one reference, low-delay B) and writes the resulting command images. CMD1 and CMD2 depend on the slice quantiser in one dword each (checked here), so they are
 written for the middle quantiser plus that dword for every quantiser.
 
-usage: gen_intel_hevc_xelpg.py <media-driver-dir> <out.inc> [xelpg | xehpg]
+usage: gen_intel_hevc_xelpg.py <media-driver-dir> <out.inc> [xelpg | xehpg | xe2lpm | xe2hpm | xe3lpm]
 
 The platform (default xelpg) picks the files and names below: xehpg is Arc Alchemist (Xe_HPM; its HEVC const settings are Xe_XPM_base's) and writes kXeHpg... names.
 
@@ -37,6 +37,9 @@ PLATFORMS = {
     # Battlemage: Xe2_HPM const settings, the Xe_LPM_plus_base implementation (v1 command set) plus Xe2_HPM's additions.
     'xe2hpm': dict(ns='xe_lpm_plus_base::v1', hwcmd='hwcmd_xe2_hpm.h', cs='cs_xe2_hpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe2_Hpm', prefix='Xe2Hpm',
                    hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe2_hpm.h', pms=['impl_lpmplus_base.h', 'impl_xe2_hpm.h'], cmd1=['impl_xe2_hpm.h'], tss=['impl_xe2_hpm.h']),
+    # Panther Lake / Wildcat Lake: Xe3_LPM_base const settings, the Xe3_LPM implementation (CMD1 grew to 49 dwords, CMD2 to 65, the pipe mode select to 7, the pipe buffer to 99).
+    'xe3lpm': dict(ns='xe3_lpm_base::xe3_lpm', hwcmd='hwcmd_xe3_lpm.h', cs='cs_xe3_lpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe3_Lpm_Base', prefix='Xe3Lpm',
+                   hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe3_lpm.h', pms=['impl_xe3_lpm.h'], cmd1=['impl_xe3_lpm.h'], tss=['impl_xe3_lpm.h']),
 }
 
 
@@ -116,6 +119,7 @@ struct WaTable {};
 struct OsItf { WaTable *pfnGetWaTable(OsItf *) { static WaTable t; return &t; } };
 static int Clip3(int x, int y, int z) { return z < x ? x : (z > y ? y : z); }
 enum { I_TYPE = 1, P_TYPE = 2, B_TYPE = 3 };
+enum { RATECONTROL_CQP = 1, ESCENARIO_VIDEOCONFERENCE = 4 };   // (only read by a target usage 6 tuning)
 PAR_STRUCTS
 struct Settings {
   std::vector<std::function<int(CMD1Par &, bool)>> vdencCmd1Settings;
@@ -126,7 +130,7 @@ struct Settings {
 #define HevcVdencFeatureSettings Settings
 struct Pic { int CodingType, HierarchLevelPlus1, QpY, pps_curr_pic_ref_enabled_flag, NumROI;
   struct { struct { int EnableCustomRoudingIntra, EnableCustomRoudingInter, RoundingOffsetIntra, RoundingOffsetInter; } fields; } CustomRoundingOffsetsParams; };
-struct Seq { int TargetUsage, HierarchicalFlag, palette_mode_enabled_flag, LowDelayMode, GopRefDist, bit_depth_luma_minus8, chroma_format_idc; };
+struct Seq { int TargetUsage, HierarchicalFlag, palette_mode_enabled_flag, LowDelayMode, GopRefDist, bit_depth_luma_minus8, chroma_format_idc, RateControlMethod, ScenarioInfo; };
 struct Slice { int slice_qp_delta, num_ref_idx_l0_active_minus1; };
 struct Ctx {
   Pic *m_hevcPicParams; Seq *m_hevcSeqParams; Slice *m_hevcSliceParams;

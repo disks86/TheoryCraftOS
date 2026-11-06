@@ -120,7 +120,7 @@ bool IntelAvcVdencEncoder::build_batch(const Picture& pic, uint32_t* words) {
   p.reference_frame_store = pic.b ? pic.forward_slot : 1 - pic.recon_slot;
   p.backward_reference_frame_store = pic.backward_slot;
   p.xe_lpg = buffers_.xe_lpg() || buffers_.xe2();   // (Xe2 has Xe-LPG's sequence)
-  p.xe2 = buffers_.xe2_hpm() ? 2 : buffers_.xe2() ? 1 : 0;
+  p.xe2 = buffers_.xe3() ? 3 : buffers_.xe2_hpm() ? 2 : buffers_.xe2() ? 1 : 0;
   p.xe_hpg = buffers_.xe_hpg();
   p.poc = pic.poc;
   p.reference_poc = pic.reference_poc;
