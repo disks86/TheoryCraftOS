@@ -753,6 +753,15 @@ Window* mouse_target(int32_t x, int32_t y, uint32_t* hit) {
   return w;
 }
 
+}  // namespace
+
+Window* window_under_cursor(uint32_t* hit) {
+  init_cursor();
+  return mouse_target(S().cursor_x, S().cursor_y, hit);
+}
+
+namespace {
+
 void deliver_mouse(Window* w, uint32_t hit, uint32_t client_message, uint64_t client_wparam) {
   if (!legacy_wanted(w, kRawTypeMouse)) return;
   if (hit == wn::HTCLIENT) {
@@ -792,7 +801,10 @@ void set_cursor_pos_locked(int32_t x, int32_t y) {
     }
   }
   if (w) {
-    if (Queue* q = find_queue(w->thread)) q->input_state->mouse_window = w;
+    if (Queue* q = find_queue(w->thread)) {
+      if (q->input_state->mouse_window != w) user_misc::cursor_entered_window(w->thread);      // (coming into a window shows its class cursor until the program sets one)
+      q->input_state->mouse_window = w;
+    }
     deliver_mouse(w, hit, wn::WM_MOUSEMOVE, key_flags());
   }
 }

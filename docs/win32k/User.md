@@ -83,7 +83,10 @@ wrapper the window is ANSI). A window with procedure 0 (the desktop) is never ca
   to the work area exactly. The observer (`IWindowObserver::top_level_changed`) hears of creation, show/hide, move/size, title, style, activation and destruction.
   The desktop's side: `top_level_info`, `top_levels`, `move_top_level` (posts `WM_SYSCOMMAND` 0xF1F0 with the rectangle packed in lParam: DefWindowProc runs SetWindowPos
   in the program's thread, leaving out an unchanged size or position), `activate_top_level` (0: no foreground window), `command_top_level` (SC_*),
-  `present_to_window_locked` (a GPU flip into the client area). The settings live outside `State` (`redirect_config()`): the desktop sets them before the state exists.
+  `present_to_window_locked` (a GPU flip into the client area, stretched when the sizes differ), `pointer_cursor` / `cursor_picture` (the cursor to draw), and
+  `drag_requested` (SC_MOVE / SC_SIZE, which DefWindowProc makes of `WM_NCLBUTTONDOWN` on a caption or border code). `apply_zorder` keeps owned windows above their owner
+  and tells the observer. `WM_SETICON` / `WM_GETICON` keep a window's icons. The settings live outside `State` (`redirect_config()`): the desktop sets them before the
+  state exists.
 * Threads that end are noticed when their process ends (process-exit hook) or when a send to them finds the thread record finished; a per-thread exit hook is missing.
 * Not done: WM_ERASEBKGND painting (needs a fill in the GDI contract), the visible-region update of device contexts held across moves is done on SetWindowPos only for the
   window moved, WM_GETMINMAXINFO on maximize, tooltips/hover (WM_MOUSEHOVER), foreground lock, input contexts.

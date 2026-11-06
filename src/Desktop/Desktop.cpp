@@ -1008,6 +1008,7 @@ void Desktop::monitors_changed() {
         if (layout.at(i).enabled) monitor_rects_[monitor_rect_count_++] = layout.at(i).rect;
     }
     if (!several) {
+      win32_windows_.set_monitors({}, {});
       toasts_.clear_area();
       display_settings_.refresh();
       return;
@@ -1038,6 +1039,7 @@ void Desktop::monitors_changed() {
     }
     surface_.set_regions(regions, count);
     windows_.set_areas(areas, count);
+    win32_windows_.set_monitors(ArrayView<const gui::Rect2D>(regions, count), ArrayView<const gui::Rect2D>(areas, count));
     if (count) toasts_.set_area(areas[0]);   // the primary monitor above its taskbar
     display_settings_.refresh();
   });

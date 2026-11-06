@@ -77,6 +77,23 @@ void Frame::maximize() {
   if (host_) host_->maximize();
   else if (manager_) manager_->maximize(this);
 }
+void Frame::set_icon(ArrayView<const uint32_t> argb, uint32_t width, uint32_t height) {
+  UiGuard lock(this);
+  icon_.clear();
+  invalidate();
+  if (width == 0 || height == 0 || argb.size() < uint64_t{width} * height) return;
+  for (uint32_t y = 0; y < kIconSize; ++y)      // (nearest pixel: icons come in 16, 32, 48 ... squares)
+    for (uint32_t x = 0; x < kIconSize; ++x)
+      if (!icon_.push_back(argb[uint64_t{y * height / kIconSize} * width + x * width / kIconSize])) { icon_.clear(); return; }
+}
+
+bool Frame::icon(graphics::Surface* out) const {
+  if (!has_icon()) return false;
+  out->pixels = icon_.view();
+  out->width = out->pitch = out->height = kIconSize;
+  return true;
+}
+
 void Frame::restore() {
   UiGuard lock(this);
   if (host_) host_->restore();
@@ -256,7 +273,13 @@ void Frame::paint(Painter& painter) {
   painter.fill(bar, lit ? t.title : t.inactive_title);
   const int32_t text_right = button_rect(dock_enabled() ? Part::Tile : Part::Minimize).x - 2;
   painter.push_frame({bar.x, bar.y, static_cast<uint32_t>(text_right > bar.x ? text_right - bar.x : 0), bar.height});
-  painter.text(4, (kTitleHeight - Painter::kGlyphHeight) / 2, title_.view(), lit ? t.title_text : t.inactive_title_text);
+  int32_t text_x = 4;
+  graphics::Surface picture;
+  if (icon(&picture)) {
+    painter.image(picture, {0, 0, kIconSize, kIconSize}, 2, (kTitleHeight - static_cast<int32_t>(kIconSize)) / 2);
+    text_x += static_cast<int32_t>(kIconSize);
+  }
+  painter.text(text_x, (kTitleHeight - Painter::kGlyphHeight) / 2, title_.view(), lit ? t.title_text : t.inactive_title_text);
   painter.pop_frame();
   if (dock_enabled()) {
     draw_button(painter, Part::Tile);

@@ -132,6 +132,7 @@ struct ThreadRecord {
   uint64_t tid = 0, pid = 0;
   uint32_t layout = 0;                // the active keyboard layout (HKL); 0 = the default one
   uint32_t cursor = 0;                // SetCursor
+  bool cursor_set = false;            // SetCursor was called since the pointer last came into one of the thread's windows (else the window's class cursor shows)
   uint32_t dpi_context = 0;           // SetThreadDpiAwarenessContext; 0 = follows the process
   bool mouse_in_pointer = false;
 };
@@ -188,6 +189,8 @@ bool is_monitor(uint32_t handle);
 Rect primary_monitor_rect();
 Rect virtual_screen_rect();
 bool set_monitor_work_area(const Rect& rect);
+// The monitors the kernel's desktop shows the programs on: their rectangles and work areas in screen coordinates, the primary first (at most 8). False for a bad list.
+bool set_monitors(ArrayView<const Rect> rects, ArrayView<const Rect> works);
 int32_t menu_item_count(uint32_t menu);                       // -1 for a handle that is not a menu
 bool get_menu_info(Call& call, uint32_t menu, uint64_t info);
 bool get_monitor_info(Call& call, uint32_t monitor, uint64_t info);

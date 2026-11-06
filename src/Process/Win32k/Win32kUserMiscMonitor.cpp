@@ -35,14 +35,33 @@ constexpr uint32_t kQdcAllPaths = 1, kQdcOnlyActive = 2, kQdcDatabase = 4;
 constexpr uint32_t kAdapterLuidLow = 1;
 constexpr uint32_t kMaxModes = 32;
 
+// The monitors the kernel's desktop has (set_monitors: their rectangles and work areas on the screen, the primary first); none set: one monitor, the screen.
+constexpr uint32_t kMaxMonitors = 8;
 struct MonitorState {
   Rect work;
   bool work_set = false;
   uint32_t registry_width = 0, registry_height = 0;
+  Rect rects[kMaxMonitors], works[kMaxMonitors];
+  uint32_t count = 0;
 };
 MonitorState g_monitor;
 
 Rect screen_rect() { return Rect{0, 0, int32_t(gdi::screen_width()), int32_t(gdi::screen_height())}; }
+
+uint32_t monitor_count() { return g_monitor.count ? g_monitor.count : 1; }
+Rect bounds_of(uint32_t index) { return g_monitor.count ? g_monitor.rects[index] : screen_rect(); }
+uint32_t index_of(uint32_t handle) { return handle - kMonitorHandle; }      // (is_monitor first)
+int64_t overlap(const Rect& a, const Rect& b) {
+  const int64_t w = int64_t(a.right < b.right ? a.right : b.right) - (a.left > b.left ? a.left : b.left);
+  const int64_t h = int64_t(a.bottom < b.bottom ? a.bottom : b.bottom) - (a.top > b.top ? a.top : b.top);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+// How far a point lies outside a rectangle (squared; 0 inside).
+int64_t distance2(const Rect& r, int32_t x, int32_t y) {
+  const int64_t dx = x < r.left ? int64_t(r.left) - x : x >= r.right ? int64_t(x) - r.right + 1 : 0;
+  const int64_t dy = y < r.top ? int64_t(r.top) - y : y >= r.bottom ? int64_t(y) - r.bottom + 1 : 0;
+  return dx * dx + dy * dy;
+}
 
 void put32(uint8_t* buf, uint32_t offset, uint32_t value) { for (uint32_t i = 0; i < 4; ++i) buf[offset + i] = uint8_t(value >> (8 * i)); }
 void put16(uint8_t* buf, uint32_t offset, uint32_t value) { buf[offset] = uint8_t(value); buf[offset + 1] = uint8_t(value >> 8); }
@@ -329,37 +348,76 @@ uint64_t svc_point_identity(Call& c) {
 }  // namespace
 
 uint32_t monitor_handle() { return kMonitorHandle; }
-bool is_monitor(uint32_t handle) { return handle == kMonitorHandle; }
-Rect primary_monitor_rect() { return screen_rect(); }
-Rect virtual_screen_rect() { return screen_rect(); }
+bool is_monitor(uint32_t handle) { return handle >= kMonitorHandle && handle - kMonitorHandle < monitor_count(); }
+Rect primary_monitor_rect() { return bounds_of(0); }
+Rect virtual_screen_rect() {
+  Rect u = bounds_of(0);
+  for (uint32_t i = 1; i < monitor_count(); ++i) {
+    const Rect r = bounds_of(i);
+    if (r.left < u.left) u.left = r.left;
+    if (r.top < u.top) u.top = r.top;
+    if (r.right > u.right) u.right = r.right;
+    if (r.bottom > u.bottom) u.bottom = r.bottom;
+  }
+  return u;
+}
+
+bool set_monitors(ArrayView<const Rect> rects, ArrayView<const Rect> works) {
+  if (rects.size() != works.size() || rects.size() > kMaxMonitors) return false;
+  for (uint64_t i = 0; i < rects.size(); ++i)
+    if (rects[i].left >= rects[i].right || rects[i].top >= rects[i].bottom || overlap(rects[i], works[i]) == 0) return false;
+  g_monitor.count = uint32_t(rects.size());
+  for (uint64_t i = 0; i < rects.size(); ++i) {
+    g_monitor.rects[i] = rects[i];
+    g_monitor.works[i] = works[i];
+  }
+  g_monitor.work_set = false;
+  return true;
+}
 
 bool set_monitor_work_area(const Rect& rect) {
-  const Rect screen = screen_rect();
+  const Rect screen = bounds_of(0);
   Rect r{rect.left < screen.left ? screen.left : rect.left, rect.top < screen.top ? screen.top : rect.top, rect.right > screen.right ? screen.right : rect.right,
          rect.bottom > screen.bottom ? screen.bottom : rect.bottom};
   if (r.left >= r.right || r.top >= r.bottom) return false;
+  if (g_monitor.count) {      // (the primary monitor's)
+    g_monitor.works[0] = r;
+    return true;
+  }
   g_monitor.work = r;
   g_monitor.work_set = true;
   return true;
 }
 
+// The monitor a rectangle overlaps most (a point: the one it is on); none: by `flags` nothing (MONITOR_DEFAULTTONULL 0), the primary (1) or the nearest (2).
 uint32_t monitor_from_rect(const Rect& rect, uint32_t flags) {
-  const Rect m = screen_rect();
-  const bool overlap = rect.left < m.right && rect.right > m.left && rect.top < m.bottom && rect.bottom > m.top;
-  if (overlap || (rect.left == rect.right && rect.top == rect.bottom && rect.left >= m.left && rect.left < m.right && rect.top >= m.top && rect.top < m.bottom)) return kMonitorHandle;
-  return flags == 1 || flags == 2 ? kMonitorHandle : 0;      // MONITOR_DEFAULTTOPRIMARY, MONITOR_DEFAULTTONEAREST
+  const bool point = rect.left >= rect.right || rect.top >= rect.bottom;
+  int64_t best = 0;
+  uint32_t found = 0;
+  for (uint32_t i = 0; i < monitor_count(); ++i) {
+    const Rect m = bounds_of(i);
+    const int64_t a = point ? (distance2(m, rect.left, rect.top) == 0 ? 1 : 0) : overlap(rect, m);
+    if (a > best) { best = a; found = kMonitorHandle + i; }
+  }
+  if (found) return found;
+  if (flags == 1) return kMonitorHandle;
+  if (flags != 2) return 0;
+  const int32_t cx = point ? rect.left : rect.left + (rect.right - rect.left) / 2, cy = point ? rect.top : rect.top + (rect.bottom - rect.top) / 2;
+  int64_t nearest = -1;
+  for (uint32_t i = 0; i < monitor_count(); ++i) {
+    const int64_t d = distance2(bounds_of(i), cx, cy);
+    if (nearest < 0 || d < nearest) { nearest = d; found = kMonitorHandle + i; }
+  }
+  return found;
 }
 
-uint32_t monitor_from_point(int32_t x, int32_t y, uint32_t flags) {
-  const Rect m = screen_rect();
-  if (x >= m.left && x < m.right && y >= m.top && y < m.bottom) return kMonitorHandle;
-  return flags == 1 || flags == 2 ? kMonitorHandle : 0;
-}
+uint32_t monitor_from_point(int32_t x, int32_t y, uint32_t flags) { return monitor_from_rect(Rect{x, y, x, y}, flags); }
 
 uint32_t dpi_for_monitor(uint32_t monitor) { return is_monitor(monitor) ? system_dpi() : 0; }
 
 Rect monitor_rect(uint32_t monitor, bool work_area) {
   if (!is_monitor(monitor)) return Rect{};
+  if (g_monitor.count) return work_area ? g_monitor.works[index_of(monitor)] : g_monitor.rects[index_of(monitor)];
   if (work_area && g_monitor.work_set) {
     // a screen that changed size since the work area was set: the work area is the whole screen again
     const Rect screen = screen_rect();
@@ -379,8 +437,12 @@ bool get_monitor_info(Call& c, uint32_t monitor, uint64_t info) {
   const Rect m = monitor_rect(monitor, false), w = monitor_rect(monitor, true);
   const int32_t v[8] = {m.left, m.top, m.right, m.bottom, w.left, w.top, w.right, w.bottom};
   for (uint32_t i = 0; i < 8; ++i) put32(out, 4 + 4 * i, uint32_t(v[i]));
-  put32(out, 36, 1);      // MONITORINFOF_PRIMARY
-  if (size == 104) put_text(out, 40, 32, kAdapterName);
+  put32(out, 36, index_of(monitor) == 0 ? 1 : 0);      // MONITORINFOF_PRIMARY
+  if (size == 104) {
+    char name[] = "\\\\.\\DISPLAY1";      // \\.\DISPLAY<n>
+    name[sizeof name - 2] = char('1' + index_of(monitor));
+    put_text(out, 40, 32, name);
+  }
   if (!c.write(info, ConstByteView(out, size))) { c.set_last_error(kErrorNoAccess); return false; }
   return true;
 }

@@ -101,6 +101,10 @@ void notify_top_level(const Window* w) {
   if (on_desktop(top)) g_redirect.observer->top_level_changed(top->handle);
 }
 
+void drag_requested(const Window* top, uint32_t edge) {
+  if (g_redirect.on && g_redirect.observer && on_desktop(top)) g_redirect.observer->drag_requested(top->handle, edge);
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // The desktop's side
 
@@ -137,6 +141,8 @@ bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title) {
   out->surface = surface_rect_screen(w);
   out->surface_id = w->surface;
   out->owner = w->owner ? w->owner->handle : 0;
+  const uint64_t icon = w->icon_small ? w->icon_small : w->icon_big ? w->icon_big : w->cls ? (w->cls->icon_small ? w->cls->icon_small : w->cls->icon) : 0;
+  out->icon = uint32_t(icon);
   out->pid = w->pid;
   if (title) {
     title->clear();
@@ -179,6 +185,32 @@ bool activate_top_level(uint32_t hwnd) {
   return set_foreground_internal(w);
 }
 
+void pointer_cursor(PointerCursor* out) {
+  LockGuard g;
+  *out = PointerCursor();
+  if (!state_or_null()) return;
+  if (user_misc::cursor_show_count() < 0) { out->hidden = true; return; }
+  uint32_t hit = 0;
+  const Window* w = window_under_cursor(&hit);
+  if (!w) return;
+  switch (hit) {      // the borders of a window that draws them itself: the sizing arrows (OCR_SIZEWE, OCR_SIZENS, OCR_SIZENWSE, OCR_SIZENESW)
+    case 10: case 11: out->system_id = 32644; return;
+    case 12: case 15: out->system_id = 32645; return;
+    case 13: case 17: out->system_id = 32642; return;
+    case 14: case 16: out->system_id = 32643; return;
+    default: break;
+  }
+  uint32_t cursor = 0;
+  if (!user_misc::thread_cursor(w->thread, &cursor)) cursor = w->cls ? uint32_t(w->cls->cursor) : 0;      // (the class cursor, as WM_SETCURSOR's default sets it)
+  else if (cursor == 0) { out->hidden = true; return; }      // SetCursor(NULL)
+  out->cursor = cursor;
+}
+
+bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) {
+  LockGuard g;
+  return user_misc::cursor_picture(cursor, system_id, argb, width, height, hot_x, hot_y);
+}
+
 uint32_t top_level_surface_locked(uint32_t hwnd) {
   if (!state_or_null()) return 0;
   const Window* w = find_window(hwnd);
@@ -204,33 +236,37 @@ bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t widt
   uint32_t sw = 0, sh = 0;
   const ByteView surface = gdi::window_surface_bytes(top->surface, &sw, &sh);
   if (surface.empty()) return true;
-  // the client area in surface coordinates, and the part of the picture that fits it
+  // the client area in surface coordinates (clipped to the surface); the picture is stretched over it (nearest pixel), or copied a row at a time when the sizes agree
   const Rect origin = surface_rect_screen(top);
   const Rect client = client_rect_screen(w);
-  const int32_t cx = client.left - origin.left, cy = client.top - origin.top;
-  const int64_t x0 = cx < 0 ? -int64_t{cx} : 0, y0 = cy < 0 ? -int64_t{cy} : 0;
-  int64_t cols = int64_t{width} < client.right - client.left ? int64_t{width} : client.right - client.left;
-  int64_t rows = int64_t{height} < client.bottom - client.top ? int64_t{height} : client.bottom - client.top;
-  if (int64_t{cx} + cols > int64_t{sw}) cols = int64_t{sw} - cx;
-  if (int64_t{cy} + rows > int64_t{sh}) rows = int64_t{sh} - cy;
-  if (cols <= x0 || rows <= y0 || pitch < uint64_t{width} * 4) return true;
-  const uint64_t n = uint64_t(cols - x0);
-  for (int64_t y = y0; y < rows; ++y) {
-    ConstByteView src;
+  const int64_t cw = int64_t{client.right} - client.left, ch = int64_t{client.bottom} - client.top;
+  const int64_t cx = int64_t{client.left} - origin.left, cy = int64_t{client.top} - origin.top;
+  if (cw <= 0 || ch <= 0 || width == 0 || height == 0 || pitch < uint64_t{width} * 4) return true;
+  const int64_t x0 = cx < 0 ? -cx : 0, y0 = cy < 0 ? -cy : 0;
+  const int64_t x1 = cx + cw > int64_t{sw} ? int64_t{sw} - cx : cw, y1 = cy + ch > int64_t{sh} ? int64_t{sh} - cy : ch;
+  if (x1 <= x0 || y1 <= y0) return true;
+  const bool same_size = cw == int64_t{width} && ch == int64_t{height};
+  const uint64_t n = uint64_t(x1 - x0);
+  for (int64_t y = y0; y < y1; ++y) {
     ByteView dst;
-    if (!pixels.try_subview(uint64_t(y) * pitch + uint64_t(x0) * 4, n * 4, &src) || !surface.try_subview((uint64_t(cy + y) * sw + uint64_t(cx + x0)) * 4, n * 4, &dst)) break;
-    if (!rgba) {      // (B, G, R, A: the surface's own order, one copy per row)
-      dst.copy_from(src);
+    if (!surface.try_subview((uint64_t(cy + y) * sw + uint64_t(cx + x0)) * 4, n * 4, &dst)) break;
+    const uint64_t sy = same_size ? uint64_t(y) : uint64_t(y) * height / uint64_t(ch);
+    ConstByteView row;
+    if (!pixels.try_subview(sy * pitch, uint64_t{width} * 4, &row)) break;
+    if (same_size && !rgba) {      // (B, G, R, A: the surface's own order, one copy per row)
+      dst.copy_from(row.subview(uint64_t(x0) * 4, n * 4));
       continue;
     }
-    for (uint64_t i = 0; i < n * 4; i += 4) {
-      dst[i] = src[i + 2];
-      dst[i + 1] = src[i + 1];
-      dst[i + 2] = src[i];
-      dst[i + 3] = src[i + 3];
+    for (uint64_t i = 0; i < n; ++i) {
+      const uint64_t sx = same_size ? uint64_t(x0) + i : (uint64_t(x0) + i) * width / uint64_t(cw);
+      const ConstByteView p = row.subview(sx * 4, 4);
+      dst[i * 4] = rgba ? p[2] : p[0];
+      dst[i * 4 + 1] = p[1];
+      dst[i * 4 + 2] = rgba ? p[0] : p[2];
+      dst[i * 4 + 3] = p[3];
     }
   }
-  gdi::window_surface_damaged(top->surface, gdi::Rect{int32_t(cx + x0), int32_t(cy + y0), int32_t(cx + cols), int32_t(cy + rows)});
+  gdi::window_surface_damaged(top->surface, gdi::Rect{int32_t(cx + x0), int32_t(cy + y0), int32_t(cx + x1), int32_t(cy + y1)});
   return true;
 }
 

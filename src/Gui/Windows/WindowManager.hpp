@@ -74,6 +74,8 @@ class WindowManager : public Control {
   uint32_t window_count() const { return static_cast<uint32_t>(order_.count()); }
   Frame* window_at(uint32_t creation_index) const { return creation_index < order_.count() ? order_[creation_index] : nullptr; }
   bool has_modal() const;
+  // Moves a window directly above or below another one in the stack (a program's own stacking order among its windows).
+  bool place_next_to(Frame* frame, Frame* anchor, bool above) { return move_child_next_to(frame, anchor, above); }
   // The stacking order: 0 = bottom.
   uint32_t stacking_index(const Frame* frame) const;
 

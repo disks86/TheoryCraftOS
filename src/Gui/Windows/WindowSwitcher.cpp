@@ -106,7 +106,13 @@ void WindowSwitcher::paint(Painter& painter) {
     painter.fill(r, shown ? t.light : t.face);
     painter.bevel(r, down);
     painter.push_frame({r.x + 3, r.y + 3, r.width > 6 ? r.width - 6 : 0, r.height > 6 ? r.height - 6 : 0});
-    painter.text(down ? 3 : 2, (static_cast<int32_t>(r.height) - 6 - Painter::kGlyphHeight) / 2 + (down ? 1 : 0), f->title(),
+    int32_t text_x = down ? 3 : 2;
+    graphics::Surface picture;
+    if (f->icon(&picture)) {
+      painter.image(picture, {0, 0, Frame::kIconSize, Frame::kIconSize}, text_x, (static_cast<int32_t>(r.height) - 6 - static_cast<int32_t>(Frame::kIconSize)) / 2 + (down ? 1 : 0));
+      text_x += static_cast<int32_t>(Frame::kIconSize) + 2;
+    }
+    painter.text(text_x, (static_cast<int32_t>(r.height) - 6 - Painter::kGlyphHeight) / 2 + (down ? 1 : 0), f->title(),
                  f->state() == Frame::State::Minimized ? t.shadow : t.text);
     painter.pop_frame();
   }

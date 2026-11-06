@@ -148,6 +148,8 @@ class Control {
 
   // The pointer to draw while the mouse is at (x, y) of this control (or is captured by it).
   virtual CursorShape cursor_shape(int32_t /*x*/, int32_t /*y*/) const { return CursorShape::Arrow; }
+  // For CursorShape::Image: the picture (0xAARRGGBB, straight alpha; valid while the UI lock is held) and its hot spot. False: the arrow is drawn.
+  virtual bool cursor_image(graphics::Surface* /*image*/, Point* /*hot*/) const { return false; }
 
   // --- Context menu. A control with one has it opened (at the pointer) by a right-button press on it or on a control inside it that has
   // none of its own, and from the keyboard by the Menu key or Shift+F10 while it or something inside it has the focus. See ContextMenu.
@@ -187,6 +189,8 @@ class Control {
   virtual Size default_size() const { return {0, 0}; }
   // Moves `child` to the end of the child list: painted last (on top) and hit first.
   bool move_child_to_front(Control* child);
+  // Moves `child` directly above (painted after) or below `anchor`, another child. False if either is not a child.
+  bool move_child_next_to(Control* child, Control* anchor, bool above);
   allocators::IAllocator& allocator() const { return allocator_; }
 
   // Places `child` the way layout() does: no repaint request. (Window::render() lays out every frame; a layout that called set_bounds() would ask for

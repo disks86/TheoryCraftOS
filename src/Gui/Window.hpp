@@ -164,6 +164,8 @@ class Window final : public Control {
   void control_destroyed(Control* control);
 
  private:
+  // The pointer at cursor_ (the frame's renderer, clip reset): the shape the control under it asks for.
+  void draw_pointer(Painter& painter, CursorShape shape, const Control* under);
   Control* target_at(int32_t x, int32_t y, Point* origin);
   void deliver_move(Control* target, const Point& origin, int32_t x, int32_t y);
   static bool is_inside(const Control* ancestor, const Control* c);

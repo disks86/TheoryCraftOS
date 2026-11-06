@@ -31,6 +31,7 @@
 // and restoring that brings back the size it had before it was docked.
 #pragma once
 #include "Gui/Control.hpp"
+#include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
 
 namespace gui {
@@ -48,7 +49,7 @@ class Frame : public Control {
   enum class Part : uint8_t { None, Minimize, Maximize, Close, TitleBar, Client, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight,
                               DockLeft, DockRight, DockTop, DockBottom, Tile };
 
-  explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator) {}
+  explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator), icon_(allocator) {}
 
   void set_title(StringView title) {
     UiGuard lock(this);
@@ -57,6 +58,13 @@ class Frame : public Control {
     if (host_) host_changed_title();
   }
   StringView title() const { return title_.view(); }
+
+  // A small picture left of the title (and on the taskbar button): 0xAARRGGBB pixels, straight alpha, top row first; scaled to kIconSize. Empty: none.
+  static constexpr uint32_t kIconSize = 16;
+  void set_icon(ArrayView<const uint32_t> argb, uint32_t width, uint32_t height);
+  bool has_icon() const { return icon_.count() == kIconSize * kIconSize; }
+  // The icon to draw (valid while the UI lock is held and the icon is not changed); false if there is none.
+  bool icon(graphics::Surface* out) const;
 
   // The three title bar buttons (all enabled by default), and whether the borders resize.
   void set_minimize_enabled(bool enabled) { UiGuard lock(this); can_minimize_ = enabled; invalidate(); }
@@ -158,6 +166,7 @@ class Frame : public Control {
   static Dock dock_of(Part part) { return static_cast<Dock>(static_cast<uint8_t>(part) - static_cast<uint8_t>(Part::DockLeft) + 1); }
 
   String title_;
+  mutable List<uint32_t> icon_;      // kIconSize x kIconSize, or empty (mutable: handed to the renderer as a Surface, which only reads it)
   Handler closed_;
   WindowManager* manager_ = nullptr;
   State state_ = State::Normal;

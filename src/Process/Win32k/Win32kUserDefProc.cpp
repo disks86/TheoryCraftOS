@@ -23,7 +23,7 @@ namespace process::win32k::user {
 namespace {
 
 State& S() { return state(); }
-constexpr uint32_t SC_CLOSE = 0xF060, SC_MINIMIZE = 0xF020, SC_MAXIMIZE = 0xF030, SC_RESTORE = 0xF120, WM_SYSCOMMAND = 0x112, SIZE_RESTORED = 0, SIZE_MINIMIZED = 1, SIZE_MAXIMIZED = 2;
+constexpr uint32_t SC_SIZE = 0xF000, SC_MOVE = 0xF010, SC_CLOSE = 0xF060, SC_MINIMIZE = 0xF020, SC_MAXIMIZE = 0xF030, SC_RESTORE = 0xF120, WM_SYSCOMMAND = 0x112, SIZE_RESTORED = 0, SIZE_MINIMIZED = 1, SIZE_MAXIMIZED = 2;
 constexpr uint32_t WA_INACTIVE = 0, WM_MOUSEACTIVATE_MA_ACTIVATE = 1;
 
 uint32_t get32(const uint8_t* raw, uint32_t o) { return uint32_t(raw[o]) | uint32_t(raw[o + 1]) << 8 | uint32_t(raw[o + 2]) << 16 | uint32_t(raw[o + 3]) << 24; }
@@ -210,7 +210,22 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       break;
     }
     case wn::WM_SETREDRAW: w->redraw_disabled = wparam == 0; break;
+    case 0x80: {      // WM_SETICON: ICON_SMALL 0, ICON_BIG 1 (ICON_SMALL2 2 is not settable); the previous icon
+      uint64_t& slot = wparam == 0 ? w->icon_small : w->icon_big;
+      if (wparam > 1) break;
+      op->result = slot;
+      slot = uint64_t(lparam);
+      notify_top_level(w);
+      break;
+    }
+    case 0x7F:        // WM_GETICON: ICON_SMALL2 falls back to the big icon (the class icons are the caller's to ask for)
+      op->result = wparam == 0 ? w->icon_small : wparam == 1 ? w->icon_big : (w->icon_small ? w->icon_small : w->icon_big);
+      break;
     case wn::WM_MOUSEACTIVATE: op->result = WM_MOUSEACTIVATE_MA_ACTIVATE; break;
+    case wn::WM_NCLBUTTONDOWN:      // a press on the caption moves the window, one on a border sizes it (HTLEFT 10 .. HTBOTTOMRIGHT 17 = WMSZ_LEFT 1 .. WMSZ_BOTTOMRIGHT 8)
+      if (wparam == wn::HTCAPTION) add_note(*op, hwnd, WM_SYSCOMMAND, SC_MOVE | 2, lparam);
+      else if (wparam >= 10 && wparam <= 17) add_note(*op, hwnd, WM_SYSCOMMAND, SC_SIZE | uint32_t(wparam - 9), lparam);
+      break;
     case WM_SYSCOMMAND: {
       const uint32_t cmd = uint32_t(wparam) & 0xFFF0;
       if (cmd == (SC_CLOSE & 0xFFF0)) {
@@ -221,6 +236,10 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
         SwpArgs args;
         args.w = w;
         return swp_op_begin(call, args, cmd == (SC_MINIMIZE & 0xFFF0) ? wn::SW_MINIMIZE : cmd == (SC_MAXIMIZE & 0xFFF0) ? wn::SW_SHOWMAXIMIZED : wn::SW_RESTORE, false, false);
+      } else if ((cmd == SC_MOVE || cmd == SC_SIZE) && redirected(top_level_of(w))) {
+        // the user moves or sizes the window with the mouse: the desktop drags its frame (the program hears of it as the frame moves)
+        const uint32_t edge = cmd == SC_MOVE ? kDragMove : uint32_t(wparam) & 0xF;
+        if (edge >= 1 && edge <= kDragMove) drag_requested(top_level_of(w), edge);
       } else if (cmd == kScTcosPlace && w->parent) {
         op_continue(call, *op);
         const uint64_t l = uint64_t(lparam);
