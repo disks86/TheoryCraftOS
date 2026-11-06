@@ -68,6 +68,7 @@ EXPORT BOOL WINAPI InsertMenuW(HANDLE menu, UINT pos, UINT flags, ULONG_PTR id, 
 EXPORT BOOL WINAPI RemoveMenu(HANDLE menu, UINT pos, UINT flags);
 EXPORT UINT WINAPI GetMenuState(HANDLE menu, UINT pos, UINT flags);
 EXPORT int WINAPI GetClassNameW(HANDLE hwnd, LPWSTR buffer, int count);
+EXPORT DWORD WINAPI GetClassInfoExW(HANDLE instance, const WCHAR *name, WNDCLASSEX_ *wc);
 EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value);
 
 static volatile LONG g_mdi_creating;
@@ -299,11 +300,23 @@ static HANDLE mdi_create_child(HANDLE client, MdiState *st, const MdiCreate_ *mc
   if (x == CW_USEDEFAULT_ || y == CW_USEDEFAULT_) { x = y = (st->cascade % 8) * step; ++st->cascade; }
   if (cx == CW_USEDEFAULT_) cx = (rc.right * 3) / 4;
   if (cy == CW_USEDEFAULT_) cy = (rc.bottom * 3) / 4;
-  HANDLE params = g_mdi_params ? g_mdi_params : (void *)mcs;
+  /* The child's creation parameter is the structure in the character set of its class: a program that gave the other one has its structure converted (WM_MDICREATE from an A caller to a
+   * W class is the W structure that was made for it; a W caller to an A class gets an A copy). */
+  WNDCLASSEX_ wc;
+  for (size_t_ i = 0; i < sizeof wc; ++i) ((BYTE *)&wc)[i] = 0;
+  wc.cbSize = sizeof wc;
+  const BOOL class_is_a = GetClassInfoExW(mcs->owner ? mcs->owner : GetModuleHandleW(NULL), mcs->cls, &wc) && thunk_slot(wc.lpfnWndProc) >= 0;
+  MdiCreate_ narrow = *mcs;
+  char *cls_a = NULL, *title_a = NULL;
+  void *params = (void *)mcs;
+  if (g_mdi_params && !class_is_a) params = (void *)mcs;      /* A caller, W class: the W structure */
+  else if (g_mdi_params) params = g_mdi_params;      /* A caller, A class: its own structure */
+  else if (class_is_a) { cls_a = narrow_of(mcs->cls); title_a = narrow_of(mcs->title); narrow.cls = (const WCHAR *)cls_a; narrow.title = (const WCHAR *)title_a; params = &narrow; }      /* W caller, A class */
   g_mdi_params = NULL;
   g_mdi_creating = 1;
   HANDLE child = CreateWindowExW(WS_EX_MDICHILD_, mcs->cls, mcs->title, style, x, y, cx, cy, client, NULL, mcs->owner, params);
   g_mdi_creating = 0;
+  narrow_free(cls_a, mcs->cls); narrow_free(title_a, mcs->title);
   if (!child) return NULL;
   SetWindowLongPtrW(child, -12 /* GWLP_ID */, (LONG_PTR)(st->first_id + (UINT)st->count));
   st->child[st->count] = child;
