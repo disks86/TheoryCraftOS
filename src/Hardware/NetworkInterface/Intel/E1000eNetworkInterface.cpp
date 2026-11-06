@@ -25,7 +25,20 @@ namespace hardware {
 using namespace intel_eth;
 
 namespace {
-constexpr uint32_t kRdbal = 0x2800, kRdbah = 0x2804, kRdlen = 0x2808, kRdh = 0x2810, kRdt = 0x2818;
+// Receive queue n: 0x2800 + 0x100 * n.
+constexpr uint32_t kRdbal = 0x2800, kRdbah = 0x2804, kRdlen = 0x2808, kRdh = 0x2810, kRdt = 0x2818, kRxQueueStride = 0x100;
+uint32_t rx_reg(uint32_t q, uint32_t reg) { return reg + kRxQueueStride * q; }
+// The 82574's extras: extended receive descriptors (RFCTL.EXSTEN), RSS (MRQC: two queues, IPv4 and TCP hashing; RETA: the queue in bit 7 of
+// each entry), MSI-X (IVAR: a vector for receive queue 0, 1 and the other causes; EIAC clears a queue's cause when its message goes out;
+// CTRL_EXT.EIAME and PBA_CLR), and a throttle per vector (EITR).
+constexpr uint32_t kRfctl = 0x5008, kRfctlExtended = 1u << 15;
+constexpr uint32_t kMrqc = 0x5818, kMrqcRss2Queues = 0x1, kMrqcIpv4Tcp = 1u << 16, kMrqcIpv4 = 1u << 17, kReta = 0x5C00, kRssKey = 0x5C80;
+constexpr uint32_t kRxcsumPcsd = 1u << 13;
+constexpr uint32_t kIvar82574 = 0x00E4, kIvarValid = 0x8, kEiac82574 = 0x00DC, kEitr82574 = 0x00E8;
+constexpr uint32_t kCtrlExtEiame = 1u << 24, kCtrlExtIame = 1u << 27, kCtrlExtPbaClear = 1u << 31;
+constexpr uint32_t kIntRxQueue0 = 1u << 20, kIntRxQueue1 = 1u << 21, kIntOther = 1u << 24;
+constexpr uint8_t kRssKeyBytes[40] = {0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0, 0xd0, 0xca, 0x2b, 0xcb,
+                                      0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa};
 constexpr uint32_t kTdbal = 0x3800, kTdbah = 0x3804, kTdlen = 0x3808, kTdh = 0x3810, kTdt = 0x3818, kTarc0 = 0x3840;
 
 constexpr uint32_t kExtcnfSwFlag = 1u << 5;   // MDIO software ownership (82573 and later, ICH and PCH)
@@ -175,6 +188,90 @@ bool E1000eNetworkInterface::reset() {
   return true;
 }
 
+bool E1000eNetworkInterface::start_receive_queue(uint32_t q) {
+  ReceiveQueue& queue = rx_[q];
+  queue.ring = allocate_dma_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
+  queue.buffers = allocate_dma_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors} * kBufferSize, 4096);
+  if (queue.ring.empty() || queue.buffers.empty()) return false;
+  for (uint32_t i = 0; i < kReceiveDescriptors; ++i) queue.ring[i] = ReceiveDescriptor{nic_dma_address(rx_buffer(queue, i)), 0};
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  const uint64_t rx = nic_dma_address(queue.ring);
+  regs().write32(rx_reg(q, kRdbal), static_cast<uint32_t>(rx));
+  regs().write32(rx_reg(q, kRdbah), static_cast<uint32_t>(rx >> 32));
+  regs().write32(rx_reg(q, kRdlen), kReceiveDescriptors * sizeof(ReceiveDescriptor));
+  regs().write32(rx_reg(q, kRdh), 0);
+  regs().write32(rx_reg(q, kRdt), kReceiveDescriptors - 1);  // all but one descriptor belong to the card
+  queue.next = 0;
+  return true;
+}
+
+// The 82574's MSI-X vectors: 0 and 1 are the receive queues (their cause is cleared by EIAC; the handler masks the queue until rearm), 2 the
+// other causes (the link), whose ICR the handler reads.
+void E1000eNetworkInterface::on_queue_interrupt(void* self, uint32_t vector) {
+  E1000eNetworkInterface* nic = static_cast<E1000eNetworkInterface*>(self);
+  if (vector < 2) nic->regs().write32(kImc, vector == 0 ? kIntRxQueue0 : kIntRxQueue1);
+  else nic->regs().read32(kIcr);
+  __atomic_fetch_add(&nic->msix_interrupts_, 1, __ATOMIC_ACQ_REL);
+  const NetworkWake wake = __atomic_load_n(&nic->wake_, __ATOMIC_ACQUIRE);
+  if (wake) wake(__atomic_load_n(&nic->wake_context_, __ATOMIC_ACQUIRE));
+}
+
+bool E1000eNetworkInterface::enable_msix(NetworkWake wake, void* context) {
+  if (queues_ < 2) return false;
+  __atomic_store_n(&wake_context_, context, __ATOMIC_RELEASE);
+  __atomic_store_n(&wake_, wake, __ATOMIC_RELEASE);
+  __atomic_store_n(&msix_vectors_, 3u, __ATOMIC_RELEASE);
+  if (device_->attach_interrupts(3, &E1000eNetworkInterface::on_queue_interrupt, this) != 3) {
+    __atomic_store_n(&msix_vectors_, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+    return false;
+  }
+  regs().write32(kImc, 0xFFFFFFFFu);
+  regs().read32(kIcr);
+  regs().write32(kIvar82574, (kIvarValid | 0) | ((kIvarValid | 1) << 4) | ((kIvarValid | 2) << 16));
+  regs().write32(kCtrlExt, (regs().read32(kCtrlExt) & ~kCtrlExtIame) | kCtrlExtEiame | kCtrlExtPbaClear);
+  regs().write32(kEiac82574, kIntRxQueue0 | kIntRxQueue1);
+  for (uint32_t i = 0; i < 10; ++i)
+    regs().write32(kRssKey + 4 * i, kRssKeyBytes[4 * i] | (uint32_t{kRssKeyBytes[4 * i + 1]} << 8) | (uint32_t{kRssKeyBytes[4 * i + 2]} << 16) |
+                                        (uint32_t{kRssKeyBytes[4 * i + 3]} << 24));
+  for (uint32_t i = 0; i < 128; i += 4) {  // the queues in turn: queue 1 is bit 7 of an entry
+    uint32_t value = 0;
+    for (uint32_t j = 0; j < 4; ++j) value |= (((i + j) & 1) ? 0x80u : 0u) << (8 * j);
+    regs().write32(kReta + i, value);
+  }
+  regs().set_bits32(kRxcsum, kRxcsumPcsd);
+  regs().write32(kMrqc, kMrqcRss2Queues | kMrqcIpv4 | kMrqcIpv4Tcp);
+  write_throttle();
+  const uint64_t before = __atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE);
+  regs().write32(kIms, kIntRxQueue0 | kIntRxQueue1 | kIntOther | kIntLinkChange);
+  // The route is tested on queue 0's vector and the other causes' one; both must come within 20 ms.
+  regs().write32(kIcs, kIntRxQueue0 | kIntLinkChange);
+  for (int i = 0; i < 200 && __atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE) < before + 2; ++i) delay_us(100);
+  if (__atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE) >= before + 2) {
+    regs().write32(kIms, kIntRxQueue0 | kIntRxQueue1 | kIntOther | kIntLinkChange);
+    return true;
+  }
+  disable_interrupts();
+  return false;
+}
+
+void E1000eNetworkInterface::disable_interrupts() {
+  if (!msix_vectors_) {
+    interrupts_.disable(*device_, claimed_);
+    return;
+  }
+  if (claimed_) {
+    regs().write32(kImc, 0xFFFFFFFFu);
+    regs().write32(kMrqc, 0);  // everything to queue 0 again (both are still taken from)
+    regs().write32(kIvar82574, 0);
+    regs().clear_bits32(kCtrlExt, kCtrlExtEiame | kCtrlExtPbaClear);
+    regs().write32(kEiac82574, 0);
+  }
+  device_->detach_interrupt();
+  __atomic_store_n(&msix_vectors_, 0u, __ATOMIC_RELEASE);
+  __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+}
+
 bool E1000eNetworkInterface::initialize() {
   if (started_ || !device_) return false;
   model_ = e1000e_find_model(device_->device_id());
@@ -205,23 +302,24 @@ bool E1000eNetworkInterface::initialize() {
   if (pch()) regs().clear_bits32(kCtrlExt, kCtrlExtForceSmbus);
   enable_autonegotiation();
 
-  rx_ring_ = allocate_dma_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
+  // The 82574 runs two receive queues with extended descriptors (RSS stays off until MSI-X: all of it to queue 0); the others one, legacy.
+  const bool is_82574 = model_->device_id == 0x10D3 || model_->device_id == 0x10F6;
+  queues_ = is_82574 ? 2 : 1;
+  extended_rx_ = is_82574;
+  if (extended_rx_) regs().set_bits32(kRfctl, kRfctlExtended);
+  regs().write32(kMrqc, 0);
+  for (uint32_t q = 0; q < queues_; ++q)
+    if (!start_receive_queue(q)) return false;
+  rx_turn_ = 0;
   tx_ring_ = allocate_dma_view<TransmitDescriptor>(allocator_, kTransmitDescriptors, 4096);
-  buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096);
-  if (rx_ring_.empty() || tx_ring_.empty() || buffers_.empty()) return false;
-  for (uint32_t i = 0; i < kReceiveDescriptors; ++i) rx_ring_[i] = ReceiveDescriptor{nic_dma_address(rx_buffer(i)), 0, 0, 0, 0, 0};
+  tx_buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kTransmitDescriptors} * kBufferSize, 4096);
+  if (tx_ring_.empty() || tx_buffers_.empty()) return false;
   for (uint32_t i = 0; i < kTransmitDescriptors; ++i)
     tx_ring_[i] = TransmitDescriptor{nic_dma_address(tx_buffer(i)), 0, 0, 0, 0, 0, 0};
   tx_clean_ = 0;
   __atomic_thread_fence(__ATOMIC_RELEASE);
 
-  const uint64_t rx = nic_dma_address(rx_ring_), tx = nic_dma_address(tx_ring_);
-  regs().write32(kRdbal, static_cast<uint32_t>(rx));
-  regs().write32(kRdbah, static_cast<uint32_t>(rx >> 32));
-  regs().write32(kRdlen, kReceiveDescriptors * sizeof(ReceiveDescriptor));
-  regs().write32(kRdh, 0);
-  regs().write32(kRdt, kReceiveDescriptors - 1);  // all but one descriptor belong to the card
-  rx_next_ = 0;
+  const uint64_t tx = nic_dma_address(tx_ring_);
   regs().write32(kTdbal, static_cast<uint32_t>(tx));
   regs().write32(kTdbah, static_cast<uint32_t>(tx >> 32));
   regs().write32(kTdlen, kTransmitDescriptors * sizeof(TransmitDescriptor));
@@ -255,9 +353,12 @@ void E1000eNetworkInterface::shutdown() {
     claimed_ = false;
   }
   started_ = false;
-  release_view(allocator_, rx_ring_);
+  for (ReceiveQueue& queue : rx_) {
+    release_view(allocator_, queue.ring);
+    release_view(allocator_, queue.buffers);
+  }
   release_view(allocator_, tx_ring_);
-  release_view(allocator_, buffers_);
+  release_view(allocator_, tx_buffers_);
 }
 
 // ---- running --------------------------------------------------------------------------------------------------------------------------------------------
@@ -278,19 +379,30 @@ bool E1000eNetworkInterface::accept_all_multicast(bool enable) {
 
 bool E1000eNetworkInterface::enable_interrupts(NetworkWake wake, void* context) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !interrupts_.enable(*device_, wake, context)) return false;
+  if (!started_ || !wake) return false;
+  if (interrupts_enabled()) return true;
+  if (enable_msix(wake, context)) return true;
+  if (!interrupts_.enable(*device_, wake, context)) return false;
   write_throttle();
   return true;
 }
 
 // ITR: the shortest time between two interrupts, in 256 ns units.
-void E1000eNetworkInterface::write_throttle() { regs().write32(kItr, InterruptModerator::intel_interval(moderator_.latency())); }
+void E1000eNetworkInterface::write_throttle() {
+  const uint32_t interval = InterruptModerator::intel_interval(moderator_.latency());
+  if (msix_vectors_) {
+    for (uint32_t v = 0; v < 2; ++v) regs().write32(kEitr82574 + 4 * v, interval);
+  } else {
+    regs().write32(kItr, interval);
+  }
+}
 
 void E1000eNetworkInterface::rearm_interrupts() {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !interrupts_.enabled()) return;
+  if (!started_ || !interrupts_enabled()) return;
   if (moderator_.update()) write_throttle();
-  interrupts_.rearm();
+  if (msix_vectors_) regs().write32(kIms, kIntRxQueue0 | kIntRxQueue1 | kIntOther | kIntLinkChange);
+  else interrupts_.rearm();
 }
 
 bool E1000eNetworkInterface::transmit(ConstByteView frame) { return transmit_frame(frame, TransmitChecksum{}); }
@@ -411,30 +523,47 @@ bool E1000eNetworkInterface::receive(ByteView buffer, uint32_t* length) {
 bool E1000eNetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* received) {
   kernel::ScopedMutex guard(mutex_);
   if (!started_ || !received) return false;
+  for (uint32_t k = 0; k < queues_; ++k) {  // the queues in turn
+    const uint32_t q = (rx_turn_ + k) % queues_;
+    if (receive_from(q, buffer, received)) {
+      rx_turn_ = (q + 1) % queues_;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool E1000eNetworkInterface::receive_from(uint32_t q, ByteView buffer, ReceivedFrame* received) {
+  ReceiveQueue& queue = rx_[q];
   for (uint32_t tries = 0; tries < kReceiveDescriptors; ++tries) {
-    volatile ReceiveDescriptor& d = rx_ring_[rx_next_];
-    const uint8_t status = d.status;
+    volatile ReceiveDescriptor& d = queue.ring[queue.next];
+    const uint64_t upper = d.upper;
+    // legacy: length 15:0, status 39:32, errors 47:40; extended: status 19:0 and errors 31:24, length 47:32 (the error bits are the same)
+    const uint8_t status = static_cast<uint8_t>(extended_rx_ ? upper : upper >> 32);
     if (!(status & kStatusDescriptorDone)) return false;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
     // With 2 KiB buffers and no long-packet mode a frame always fits one descriptor; one that does not end there is dropped.
-    const uint32_t frame = d.length;
-    const uint8_t errors = d.errors;
+    const uint32_t frame = static_cast<uint16_t>(extended_rx_ ? upper >> 32 : upper);
+    const uint8_t errors = static_cast<uint8_t>(extended_rx_ ? upper >> 24 : upper >> 40);
     const bool usable = (errors & ~(kErrorTcpUdpChecksum | kErrorIpChecksum)) == 0 && (status & kStatusEndOfPacket) && frame > 0 && frame <= kBufferSize;
     if (usable) {
-      buffer.copy_from(ConstByteView(rx_buffer(rx_next_)).first(frame).at_most(buffer.size()));  // as much as fits
+      buffer.copy_from(ConstByteView(rx_buffer(queue, queue.next)).first(frame).at_most(buffer.size()));  // as much as fits
       const bool checked = !(status & kStatusIgnoreChecksum);
       *received = ReceivedFrame{frame, checked && (status & kStatusIpChecksum) && !(errors & kErrorIpChecksum),
                                 checked && (status & (kStatusTcpChecksum | kStatusUdpChecksum)) && !(errors & kErrorTcpUdpChecksum)};
       ++stats_.frames_received;
+      ++queue.frames;
       moderator_.account(1, frame);
     } else {
       ++stats_.frames_dropped;
     }
-    d.status = 0;  // give the descriptor back to the card
+    // give the descriptor back to the card (an extended write-back overwrote the address)
+    d.address = nic_dma_address(rx_buffer(queue, queue.next));
+    d.upper = 0;
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    regs().write32(kRdt, rx_next_);
-    rx_next_ = (rx_next_ + 1) % kReceiveDescriptors;
+    regs().write32(rx_reg(q, kRdt), queue.next);
+    queue.next = (queue.next + 1) % kReceiveDescriptors;
     if (usable) return true;
   }
   return false;

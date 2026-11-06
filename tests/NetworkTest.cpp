@@ -383,6 +383,19 @@ int main() {
       assert(lan.nic_a.segmented > 0 && lan.nic_a.burst_frames > lan.nic_a.segmented);
       assert(lan.a.coalesced_segments() > 0 || lan.b.coalesced_segments() > 0);
     }
+    { // a run longer than one poll's 64 frames goes on in the next poll (which follows at once), and is handed on when a poll ends early
+      Lan lan; lan.configure_static();
+      TcpFrameSpec t; t.payload = 300;
+      for (int i = 0; i < 70; ++i) { t.seq = 1000 + 300 * i; lan.nic_a.inbox.push_back(tcp_frame(t)); }
+      lan.nic_a.on_idle = nullptr;
+      lan.a.poll();
+      assert(lan.a.saturated() && lan.a.coalesced_segments() == 63);
+      lan.a.poll();
+      assert(!lan.a.saturated() && lan.a.coalesced_segments() == 69);   // one run of 70, not 64 + 6
+      t.seq = 1000 + 300 * 70; lan.nic_a.inbox.push_back(tcp_frame(t));
+      lan.a.poll();
+      assert(lan.a.coalesced_segments() == 69);                         // (a new run of one, handed on at the end of its poll)
+    }
     // without segmentation offload nothing changes: segment by segment, still coalesced on receive
     Lan lan; lan.configure_static();
     assert(echo_transfer(lan, 100000, 9400));

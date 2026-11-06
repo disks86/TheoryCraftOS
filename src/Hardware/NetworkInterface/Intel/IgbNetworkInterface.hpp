@@ -37,8 +37,10 @@ namespace hardware {
 //
 // - Receive: up to four queues. With MSI-X each gets its own vector (on its own core) and RSS (Toeplitz hash of the IPv4 addresses and TCP/UDP
 //   ports, 128-entry redirection table) spreads flows over them; without it everything goes to queue 0. receive() takes from the queues in turn.
-// - Transmit: one queue of 256 descriptors (2 KiB buffers). The transport checksum is finished through a context descriptor in front of the
-//   frame; TCP segmentation offload takes segments of up to 32 KiB (context with MSS, TSE, a chain of data descriptors).
+// - Transmit: as many queues as receive queues, 256 descriptors (2 KiB buffers) each; a frame goes to the queue its flow hashes to (IPv4
+//   addresses and TCP/UDP ports), so a connection that fills its ring does not hold up the others and each one's frames stay in order. The
+//   transport checksum is finished through a context descriptor in front of the frame; TCP segmentation offload takes segments of up to
+//   32 KiB (context with MSS, TSE, a chain of data descriptors).
 // - Interrupts: MSI-X (a vector per receive queue and one for the link) or MSI. Either way an interrupt masks itself until rearm_interrupts()
 //   (MSI-X: EIAM auto-mask, MSI: IMC), and the throttle (EITR) follows the traffic (InterruptModerator). The 82575 (no IVAR) uses MSI only.
 enum class IgbKind : uint8_t { I82575, I82576, I82580, I350, I354, I210, I211, I225, I226 };
@@ -94,6 +96,10 @@ class IgbNetworkInterface final : public INetworkInterface {
   uint32_t queue_count() const { return queues_; }
   // Frames taken from each receive queue so far (RSS at work).
   uint64_t queue_frames(uint32_t queue) const { return queue < kMaxQueues ? rx_[queue].frames : 0; }
+  // Frames (and segments) sent on each transmit queue so far.
+  uint64_t queue_sent(uint32_t queue) const { return queue < kMaxQueues ? tx_[queue].sent : 0; }
+  // The transmit queue a frame goes to (of `queues`): its flow's hash; 0 for anything that is not IPv4.
+  static uint32_t transmit_queue_for(ConstByteView frame, uint32_t queues);
   // MSI-X vectors in use (receive queues + the link), 0 with MSI or polled.
   uint32_t msix_vectors() const { return msix_vectors_; }
 
@@ -111,6 +117,15 @@ class IgbNetworkInterface final : public INetworkInterface {
     uint32_t offload_status;
   };
   static_assert(sizeof(ReceiveDescriptor) == 16 && sizeof(TransmitDescriptor) == 16);
+  struct TransmitQueue {
+    ArrayView<TransmitDescriptor> ring;
+    ByteView buffers;
+    uint32_t next = 0;   // the next descriptor to fill
+    uint32_t clean = 0;  // the first descriptor the device may still be using
+    uint8_t frame_end[kTransmitDescriptors] = {};  // for the descriptor a frame starts at: the one it ends at
+    uint64_t sent = 0;
+  };
+  static_assert(kTransmitDescriptors <= 256);
   struct ReceiveQueue {
     ArrayView<ReceiveDescriptor> ring;
     ByteView buffers;
@@ -125,7 +140,8 @@ class IgbNetworkInterface final : public INetworkInterface {
   bool start_receive_queue(uint32_t q);
   void post_receive(ReceiveQueue& queue, uint32_t i);
   bool receive_from(uint32_t q, ByteView buffer, ReceivedFrame* received);
-  void reclaim_transmitted();
+  bool start_transmit_queue(uint32_t q);
+  void reclaim_transmitted(TransmitQueue& queue);
   bool send(ConstByteView frame, TransmitChecksum checksum, uint16_t mss);
   bool enable_msix(NetworkWake wake, void* context);
   void configure_rss();
@@ -133,7 +149,7 @@ class IgbNetworkInterface final : public INetworkInterface {
   void write_throttle();
   static void on_queue_interrupt(void* self, uint32_t vector);
   ByteView rx_buffer(const ReceiveQueue& queue, uint32_t i) const { return queue.buffers.subview(uint64_t{i} * kBufferSize, kBufferSize); }
-  ByteView tx_buffer(uint32_t i) const { return tx_buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
+  ByteView tx_buffer(const TransmitQueue& queue, uint32_t i) const { return queue.buffers.subview(uint64_t{i} * kBufferSize, kBufferSize); }
 
   UniquePointer<INicDevice> device_;
   allocators::IAllocator& allocator_;
@@ -144,12 +160,7 @@ class IgbNetworkInterface final : public INetworkInterface {
   uint32_t queues_ = 1;
   ReceiveQueue rx_[kMaxQueues];
   uint32_t rx_turn_ = 0;  // the queue receive() looks at first
-  ArrayView<TransmitDescriptor> tx_ring_;
-  ByteView tx_buffers_;
-  uint32_t tx_next_ = 0;   // the next descriptor to fill
-  uint32_t tx_clean_ = 0;  // the first descriptor the device may still be using
-  uint8_t tx_frame_end_[kTransmitDescriptors] = {};  // for the descriptor a frame starts at: the one it ends at
-  static_assert(kTransmitDescriptors <= 256);
+  TransmitQueue tx_[kMaxQueues];
   uint32_t receive_control_ = 0;
   MacAddress mac_{};
   kernel::Mutex mutex_;  // transmit and receive may come from different threads

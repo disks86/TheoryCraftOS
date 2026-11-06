@@ -32,7 +32,8 @@ namespace hardware {
 // interrupt and transmit-poll registers. Which chip it is comes from the version bits of TxConfig, not the PCI id (one id covers a dozen chips).
 //
 // Interrupts (MSI) when the caller enables them, each masking the chip until rearm_interrupts() (the chips' own moderation timers are not used), checked with a forced software interrupt (the RTL8125/8126 have none, so theirs are taken on
-// trust); transport checksums checked on receive and finished on transmit by the chip (the descriptor's protocol bits; frames shorter than the
+// trust); TCP segmentation offload on the chips that have it working (RtlChip::tso: segments up to 32000 bytes, as r8169's
+// RTL_GSO_MAX_SIZE_V2, chained over 2 KiB buffers); transport checksums checked on receive and finished on transmit by the chip (the descriptor's protocol bits; frames shorter than the
 // Ethernet minimum get theirs in software, as r8169 does for the chips that pad them wrongly). The chip's PHY is left as the firmware configured it (r8169 also loads PHY firmware and applies per-chip PHY
 // fixes; that is not done here).
 enum class RtlFamily : uint8_t { Rtl8169, Rtl8101, Rtl8168, Rtl8125, Rtl8126 };
@@ -43,6 +44,7 @@ struct RtlChip {
   uint32_t rx_config;     // the FIFO and DMA bits of RxConfig this chip wants
   bool auto_fifo;         // TxConfig's automatic FIFO bit (RTL8168E-VL and later)
   bool rxdv_gate;         // has the RXDV gate (RTL8168G and later), which blocks reception while it is set
+  bool tso;               // segmentation offload ("giant send"): the RTL8168D and later, not the RTL8168E-VL and one RTL8168CP that r8169 excludes
   const char* name;
 };
 
@@ -52,7 +54,8 @@ const RtlChip* rtl8169_identify(uint32_t tx_config);
 class Rtl8169NetworkInterface final : public INetworkInterface {
  public:
   static constexpr uint32_t kReceiveDescriptors = 256;
-  static constexpr uint32_t kTransmitDescriptors = 64;
+  static constexpr uint32_t kTransmitDescriptors = 256;
+  static constexpr uint32_t kMaxSegmentation = 32000;
   static constexpr uint32_t kBufferSize = 2048;
 
   Rtl8169NetworkInterface(UniquePointer<INicDevice> device, allocators::IAllocator& allocator)
@@ -72,7 +75,8 @@ class Rtl8169NetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
-  NetworkOffloads offloads() const override { return NetworkOffloads{true, true}; }
+  NetworkOffloads offloads() const override { return NetworkOffloads{true, true, chip_ && chip_->tso ? kMaxSegmentation : 0u, 1}; }
+  bool transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) override;
   bool receive_frame(ByteView buffer, ReceivedFrame* frame) override;
   bool transmit_frame(ConstByteView frame, TransmitChecksum checksum) override;
   bool enable_interrupts(NetworkWake wake, void* context) override;
@@ -102,10 +106,13 @@ class Rtl8169NetworkInterface final : public INetworkInterface {
   bool reset();
   void set_receive_mode();
   void write_interrupt_mask(uint32_t mask);
+  bool send(ConstByteView frame, TransmitChecksum checksum, uint16_t mss);
+  void reclaim_transmitted();
   static void on_interrupt(void* self);
   uint32_t rx_opts1(uint32_t i) const;
   ByteView rx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
   ByteView tx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{kReceiveDescriptors + i} * kBufferSize, kBufferSize); }
+  uint32_t ring_end(uint32_t i) const;
 
   UniquePointer<INicDevice> device_;
   allocators::IAllocator& allocator_;
@@ -121,7 +128,10 @@ class Rtl8169NetworkInterface final : public INetworkInterface {
   ArrayView<Descriptor> tx_ring_;
   ByteView buffers_;  // receive buffers, then transmit buffers
   uint32_t rx_next_ = 0;
-  uint32_t tx_next_ = 0;
+  uint32_t tx_next_ = 0;   // the next descriptor to fill
+  uint32_t tx_clean_ = 0;  // the first descriptor the chip may still be using
+  uint8_t tx_frame_end_[kTransmitDescriptors] = {};  // for the descriptor a frame starts at: the one it ends at
+  static_assert(kTransmitDescriptors <= 256);
   MacAddress mac_{};
   kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;
