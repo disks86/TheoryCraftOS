@@ -74,7 +74,7 @@ bool function_prototype_call(Vm& vm, const Value& self, const Value* args, uint3
 }  // namespace
 
 Vm::Vm(allocators::IAllocator& allocator, IHost* host)
-    : allocator_(allocator), host_(host), gray_(allocator), codes_(allocator), halt_reason_(allocator), frames_(allocator), handlers_(allocator) {
+    : allocator_(allocator), host_(host), remembered_(allocator), gray_(allocator), codes_(allocator), halt_reason_(allocator), frames_(allocator), handlers_(allocator) {
   frames_.reserve(kMaxFrames + 8);   // (the interpreter keeps pointers to frames: the list must never move them)
   stack_ = static_cast<Value*>(allocator_.allocate(sizeof(Value) * kStackValues));
   interned_cap_ = 1024;
@@ -129,11 +129,13 @@ uint64_t Vm::jit_regions() const { return jit_ ? jit_->compiled_regions() : 0; }
 uint64_t Vm::jit_entries() const { return jit_ ? jit_->entries() : 0; }
 
 Vm::~Vm() {
-  Cell* c = cells_;
-  while (c) {
-    Cell* next = c->next;
-    free_cell(c);
-    c = next;
+  for (Cell* list : {cells_, young_}) {
+    Cell* c = list;
+    while (c) {
+      Cell* next = c->next;
+      free_cell(c);
+      c = next;
+    }
   }
   for (uint64_t i = 0; i < codes_.count(); ++i) {
     codes_[i]->~FunctionCode();
@@ -173,6 +175,7 @@ void Vm::recover() {
     has_exception_ = false;
     exception_ = Value();
     gc_wanted_ = true;
+    major_wanted_ = true;
     if (native_depth_ == 0 && gc_hold_ == 0) collect();
   }
 }
@@ -185,20 +188,45 @@ void Vm::halt(StringView reason) {
 
 // --- The heap ----------------------------------------------------------------------------------------------------
 
+#if defined(__SANITIZE_ADDRESS__)
+// Host tests (built with the address sanitizer, never the kernel): every minor collection checks the barrier, and a missed one is printed before the test stops.
+bool Vm::verify_generations = true;
+static void print_generation_error(const char* what) {
+  __builtin_printf("%s\n", what);
+  __builtin_trap();
+}
+void (*Vm::generation_error)(const char* what) = print_generation_error;
+#else
+bool Vm::verify_generations = false;
+void (*Vm::generation_error)(const char* what) = nullptr;
+#endif
+
 void Vm::link(Cell* cell, uint64_t size) {
-  cell->next = cells_;
-  cells_ = cell;
+  cell->next = young_;
+  young_ = cell;
   account_bytes(size);
 }
 
+// A minor collection is wanted after a twelfth of the memory limit of new cells (4 to 64 MiB), a major one when the heap passes gc_threshold_.
 void Vm::account_bytes(uint64_t size) {
   heap_bytes_ += size;
-  if (heap_bytes_ > gc_threshold_) gc_wanted_ = true;
+  young_bytes_ += size;
+  uint64_t nursery = memory_limit_ / 12;
+  if (nursery < (4u << 20)) nursery = 4u << 20;
+  if (nursery > (64u << 20)) nursery = 64u << 20;
+  if (young_bytes_ > nursery) gc_wanted_ = true;
+  if (heap_bytes_ > gc_threshold_) gc_wanted_ = major_wanted_ = true;
   if (heap_bytes_ > memory_limit_ && !halted_) {
     // Try to free something first; only stop the script if that does not help.
-    gc_wanted_ = true;
+    gc_wanted_ = major_wanted_ = true;
     if (heap_bytes_ > memory_limit_ + (memory_limit_ >> 2)) halt("out of memory");
   }
+}
+
+// The storage of a cell (its properties, elements, index, wide text) grew by `bytes`: for an old cell that is old memory (a minor collection does not count it).
+void Vm::account_growth(Cell* cell, uint64_t bytes) {
+  if (cell->gen != kGenYoung) old_bytes_ += bytes;
+  account_bytes(bytes);
 }
 
 void Vm::free_cell(Cell* cell) {
@@ -325,7 +353,7 @@ const uint16_t* Vm::string_wide(JsString* s) {
     }
   }
   s->wide = w;
-  heap_bytes_ += sizeof(uint16_t) * (uint64_t{s->units} + 1);
+  account_growth(s, sizeof(uint16_t) * (uint64_t{s->units} + 1));
   return w;
 }
 
@@ -602,7 +630,7 @@ void Vm::prune_intern_table() {
   uint32_t count = 0;
   for (uint32_t i = 0; i < interned_cap_; ++i) {
     JsString* s = interned_[i];
-    if (!s || !s->marked) continue;
+    if (!s || (!s->marked && (!minor_ || s->gen == kGenYoung))) continue;   // (a minor collection frees only young strings)
     uint32_t k = s->hash & (interned_cap_ - 1);
     while (fresh[k]) k = (k + 1) & (interned_cap_ - 1);
     fresh[k] = s;
@@ -617,14 +645,16 @@ void Vm::rebuild_intern_table() {
   intern_rebuild_wanted_ = false;
   for (uint32_t i = 0; i < interned_cap_; ++i) interned_[i] = nullptr;
   interned_count_ = 0;
-  for (Cell* c = cells_; c; c = c->next) {
-    if (c->kind != CellKind::String) continue;
-    JsString* s = static_cast<JsString*>(c);
-    if (!s->interned) continue;
-    uint32_t k = s->hash & (interned_cap_ - 1);
-    while (interned_[k]) k = (k + 1) & (interned_cap_ - 1);
-    interned_[k] = s;
-    ++interned_count_;
+  for (Cell* list : {cells_, young_}) {
+    for (Cell* c = list; c; c = c->next) {
+      if (c->kind != CellKind::String) continue;
+      JsString* s = static_cast<JsString*>(c);
+      if (!s->interned) continue;
+      uint32_t k = s->hash & (interned_cap_ - 1);
+      while (interned_[k]) k = (k + 1) & (interned_cap_ - 1);
+      interned_[k] = s;
+      ++interned_count_;
+    }
   }
 }
 
@@ -1326,10 +1356,26 @@ bool Vm::throw_value(const Value& value) {
 }
 
 // --- Collector ---------------------------------------------------------------------------------------------------
+//
+// Two generations, no moving. New cells are young (young_). A minor collection marks what the roots reach without looking into old cells, except the
+// remembered ones (old cells a reference was stored into since: Vm::barrier), frees the young cells it did not mark and makes the others old. An old cell
+// can only point to a young one if it was written after the young one was made, so that it is remembered: nothing young that is still reachable is missed.
+// A major collection marks and sweeps everything, when the old generation has grown to gc_threshold_ (or the heap is near the limit). Most of what a page
+// makes dies young (event handlers, closures, iterator results, strings being built), and a minor collection only costs what survives and what is remembered,
+// not the hundreds of megabytes a big site keeps alive.
+
+void Vm::remember(Cell* cell) {
+  cell->gen = kGenRemembered;
+  if (!remembered_.push_back(cell)) {
+    remember_overflow_ = true;   // (a major collection does not need the list)
+    gc_wanted_ = major_wanted_ = true;
+  }
+}
 
 // (the bytes of what is alive are counted here and in trace(), while the cell is at hand: the sweep then only reads the links)
 void Vm::mark(Cell* cell) {
   if (!cell || cell->marked) return;
+  if (minor_ && cell->gen != kGenYoung) return;   // (old: alive until the next major collection; its references are looked at only if it is remembered)
   cell->marked = true;
   if (cell->kind != CellKind::String) {
     gray_.push_back(cell);
@@ -1345,59 +1391,56 @@ void Vm::mark_value(const Value& v) {
 
 void Vm::mark_object(JsObject* o) { mark(o); }
 
+// Calls each(Cell*) for every cell `cell` refers to (some may be null).
+template <class F>
+void Vm::for_each_reference(Cell* cell, F&& each) {
+  auto value = [&](const Value& v) {
+    if (v.tag == Tag::String || v.tag == Tag::Object) each(v.u.cell);
+  };
+  if (cell->kind == CellKind::Env) {
+    Env* e = static_cast<Env*>(cell);
+    each(e->parent);
+    for (uint32_t i = 0; i < e->count; ++i) value(e->slots()[i]);
+  } else if (cell->kind == CellKind::Object) {
+    JsObject* o = static_cast<JsObject*>(cell);
+    each(o->proto);
+    for (uint32_t i = 0; i < o->prop_count; ++i) {
+      each(o->props[i].key);
+      value(o->props[i].value);
+    }
+    for (uint32_t i = 0; i < o->length && o->items; ++i) value(o->items[i]);
+    each(o->env);
+    each(o->target);
+    value(o->bound_this);
+    if (o->okind == ObjKind::Coroutine && o->host_data) {
+      Coroutine* co = static_cast<Coroutine*>(o->host_data);
+      each(co->env);
+      value(co->this_value);
+      each(co->callee);
+      each(co->promise);
+      for (uint64_t i = 0; i < co->stack.count(); ++i) value(co->stack[i]);
+      for (uint64_t i = 0; i < co->handlers.count(); ++i) each(co->handlers[i].env);
+    }
+  }
+}
+
 void Vm::trace() {
   while (gray_.count() > 0) {
     Cell* c = gray_[gray_.count() - 1];
     gray_.remove_at(gray_.count() - 1);
-    if (c->kind == CellKind::Env) {
-      Env* e = static_cast<Env*>(c);
-      marked_bytes_ += sizeof(Env) + sizeof(Value) * e->count;
-      mark(e->parent);
-      for (uint32_t i = 0; i < e->count; ++i) mark_value(e->slots()[i]);
-    } else if (c->kind == CellKind::Object) {
-      JsObject* o = static_cast<JsObject*>(c);
-      marked_bytes_ += sizeof(JsObject) + sizeof(Prop) * o->prop_cap + sizeof(Value) * o->capacity + sizeof(uint32_t) * o->index_cap;
-      mark(o->proto);
-      for (uint32_t i = 0; i < o->prop_count; ++i) {
-        mark(o->props[i].key);
-        mark_value(o->props[i].value);
-      }
-      for (uint32_t i = 0; i < o->length && o->items; ++i) mark_value(o->items[i]);
-      mark(o->env);
-      mark(o->target);
-      mark_value(o->bound_this);
-      if (o->okind == ObjKind::Coroutine && o->host_data) {
-        Coroutine* co = static_cast<Coroutine*>(o->host_data);
-        mark(co->env);
-        mark_value(co->this_value);
-        mark(co->callee);
-        mark(co->promise);
-        for (uint64_t i = 0; i < co->stack.count(); ++i) mark_value(co->stack[i]);
-        for (uint64_t i = 0; i < co->handlers.count(); ++i) mark(co->handlers[i].env);
+    if (!minor_ || c->gen == kGenYoung) {   // (a remembered cell a minor collection looks into is not counted: it is old memory already)
+      if (c->kind == CellKind::Env) {
+        marked_bytes_ += sizeof(Env) + sizeof(Value) * static_cast<Env*>(c)->count;
+      } else if (c->kind == CellKind::Object) {
+        const JsObject* o = static_cast<JsObject*>(c);
+        marked_bytes_ += sizeof(JsObject) + sizeof(Prop) * o->prop_cap + sizeof(Value) * o->capacity + sizeof(uint32_t) * o->index_cap;
       }
     }
+    for_each_reference(c, [this](Cell* r) { mark(r); });
   }
 }
 
-void Vm::sweep() {
-  Cell** link_to = &cells_;
-  while (*link_to) {
-    Cell* c = *link_to;
-    if (c->marked) {
-      c->marked = false;
-      link_to = &c->next;
-    } else {
-      *link_to = c->next;
-      free_cell(c);
-    }
-  }
-  heap_bytes_ = marked_bytes_;
-}
-
-void Vm::collect() {
-  gc_wanted_ = false;
-  ++collections_;
-  marked_bytes_ = 0;
+void Vm::mark_roots() {
   for (uint32_t i = 0; i < sp_; ++i) mark_value(stack_[i]);
   for (uint64_t i = 0; i < frames_.count(); ++i) {
     const Frame& f = frames_[i];
@@ -1433,15 +1476,128 @@ void Vm::collect() {
     for (uint64_t k = 0; k < code->constants.count(); ++k) mark_value(code->constants[k]);
     mark(code->name);
   }
+}
+
+// The young cells: the unmarked ones are freed, the marked ones become old.
+void Vm::sweep_young() {
+  Cell* c = young_;
+  young_ = nullptr;
+  while (c) {
+    Cell* next = c->next;
+    if (c->marked) {
+      c->marked = false;
+      c->gen = kGenOld;
+      c->next = cells_;
+      cells_ = c;
+    } else {
+      free_cell(c);
+    }
+    c = next;
+  }
+}
+
+// (tests: see verify_generations) An old cell that is not remembered must not point to a young cell that is about to be freed.
+void Vm::verify_minor_marks() {
+  for (Cell* c = cells_; c; c = c->next) {
+    if (c->gen == kGenRemembered) continue;
+    for_each_reference(c, [&](Cell* r) {
+      if (!r || r->gen != kGenYoung || r->marked) return;
+      String what(allocator_);
+      what.append("generations: an old ");
+      if (c->kind == CellKind::Env) {
+        what.append("environment of ");
+        what.append_uint(static_cast<Env*>(c)->count);
+        what.append(" slots");
+      } else {
+        const JsObject* o = static_cast<JsObject*>(c);
+        what.append("object (kind ");
+        what.append_uint(static_cast<uint32_t>(o->okind));
+        what.append(", ");
+        what.append_uint(o->prop_count);
+        what.append(" properties");
+        for (uint32_t i = 0; i < o->prop_count && i < 6; ++i) {
+          what.append(i ? ", " : ": ");
+          what.append(o->props[i].key->view().substr(0, 40));
+        }
+        what.append("; ");
+        what.append_uint(o->length);
+        what.append(" items)");
+      }
+      what.append(" points to a young ");
+      what.append(r->kind == CellKind::String ? "string" : r->kind == CellKind::Env ? "environment" : "object");
+      if (r->kind == CellKind::String) {
+        what.append(" '");
+        what.append(static_cast<JsString*>(r)->view().substr(0, 40));
+        what.append("'");
+      }
+      what.append(" that was stored without Vm::barrier");
+      if (generation_error) generation_error(what.c_str());
+      else __builtin_trap();
+    });
+  }
+}
+
+void Vm::collect_minor() {
+  minor_ = true;
+  marked_bytes_ = 0;
+  mark_roots();
+  for (uint64_t i = 0; i < remembered_.count(); ++i) gray_.push_back(remembered_[i]);   // (looked into: they may point to young cells)
+  trace();
+  if (verify_generations) verify_minor_marks();
+  prune_intern_table();
+  sweep_young();
+  for (uint64_t i = 0; i < remembered_.count(); ++i) remembered_[i]->gen = kGenOld;
+  remembered_.clear();
+  minor_ = false;
+  old_bytes_ += marked_bytes_;
+  young_bytes_ = 0;
+  heap_bytes_ = old_bytes_;
+  if (intern_rebuild_wanted_) rebuild_intern_table();
+}
+
+void Vm::collect_major() {
+  ++major_collections_;
+  major_wanted_ = false;
+  remember_overflow_ = false;
+  for (uint64_t i = 0; i < remembered_.count(); ++i) remembered_[i]->gen = kGenOld;
+  remembered_.clear();
+  minor_ = false;
+  marked_bytes_ = 0;
+  mark_roots();
   trace();
   prune_intern_table();
-  sweep();
+  Cell** link_to = &cells_;
+  while (*link_to) {
+    Cell* c = *link_to;
+    if (c->marked) {
+      c->marked = false;
+      link_to = &c->next;
+    } else {
+      *link_to = c->next;
+      free_cell(c);
+    }
+  }
+  sweep_young();
+  old_bytes_ = marked_bytes_;
+  young_bytes_ = 0;
+  heap_bytes_ = old_bytes_;
   if (intern_rebuild_wanted_) rebuild_intern_table();
   gc_threshold_ = heap_bytes_ * 2 > (4u << 20) ? heap_bytes_ * 2 : (4u << 20);
   if (gc_threshold_ > memory_limit_) gc_threshold_ = memory_limit_ - (memory_limit_ >> 3);
   // (but always a sixteenth of the limit above what is alive: with the heap close to the limit the next collection would otherwise come a few allocations
   // later, again and again - YouTube's results page spent minutes collecting 230 MB that stayed alive)
   if (gc_threshold_ < heap_bytes_ + (memory_limit_ >> 4)) gc_threshold_ = heap_bytes_ + (memory_limit_ >> 4);
+}
+
+void Vm::collect() {
+  gc_wanted_ = false;
+  ++collections_;
+  if (major_wanted_ || remember_overflow_) {
+    collect_major();
+    return;
+  }
+  collect_minor();
+  if (heap_bytes_ > gc_threshold_) collect_major();   // (what survived made the old generation too big)
 }
 
 // --- Properties --------------------------------------------------------------------------------------------------
@@ -1479,7 +1635,7 @@ void Vm::index_rebuild(JsObject* o) {
   }
   o->index = index;
   o->index_cap = cap;
-  if (cap > old_cap) heap_bytes_ += sizeof(uint32_t) * (cap - old_cap);
+  if (cap > old_cap) account_growth(o, sizeof(uint32_t) * (cap - old_cap));
 }
 
 void Vm::grow_props(JsObject* o) {
@@ -1491,10 +1647,9 @@ void Vm::grow_props(JsObject* o) {
   }
   for (uint32_t i = 0; i < o->prop_count; ++i) fresh[i] = o->props[i];
   allocator_.deallocate(o->props);
-  heap_bytes_ += sizeof(Prop) * (cap - o->prop_cap);
+  account_growth(o, sizeof(Prop) * (cap - o->prop_cap));
   o->props = fresh;
   o->prop_cap = cap;
-  if (heap_bytes_ > gc_threshold_) gc_wanted_ = true;
 }
 
 bool Vm::ensure_items(JsObject* o, uint32_t capacity) {
@@ -1513,15 +1668,15 @@ bool Vm::ensure_items(JsObject* o, uint32_t capacity) {
   for (uint32_t i = 0; i < o->length; ++i) fresh[i] = o->items[i];
   for (uint32_t i = o->length; i < cap; ++i) new (&fresh[i]) Value();
   allocator_.deallocate(o->items);
-  heap_bytes_ += sizeof(Value) * (cap - o->capacity);
+  account_growth(o, sizeof(Value) * (cap - o->capacity));
   o->items = fresh;
   o->capacity = cap;
-  if (heap_bytes_ > gc_threshold_) gc_wanted_ = true;
   return true;
 }
 
 void Vm::define(JsObject* o, JsString* key, const Value& value, uint8_t flags) {
   if (o == sentinel_ || halted_) return;
+  barrier(o);
   if (o->okind == ObjKind::Array) {
     uint32_t i;
     if (key == length_) {
@@ -1535,7 +1690,10 @@ void Vm::define(JsObject* o, JsString* key, const Value& value, uint8_t flags) {
       for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value::make_hole();
       o->items[i] = value.unhole();
       if (i >= o->length) o->length = i + 1;
-      if (Env* e = mapped_env(o, i)) e->slots()[i] = o->items[i];
+      if (Env* e = mapped_env(o, i)) {
+        barrier(e);
+        e->slots()[i] = o->items[i];
+      }
       return;
     }
   }
@@ -1566,6 +1724,7 @@ void Vm::define_accessor(JsObject* o, JsString* key, const Value& getter, const 
     array_push(pair, Value());
     array_push(pair, Value());
   }
+  barrier(pair);
   if (!getter.is_undefined()) pair->items[0] = getter;
   if (!setter.is_undefined()) pair->items[1] = setter;
   define(o, key, Value::make_object(pair), static_cast<uint8_t>((flags & kEnumerable) | kAccessor));
@@ -1605,12 +1764,14 @@ bool Vm::array_index(const Value& key, uint32_t* index) const {
 bool Vm::array_push(JsObject* a, const Value& v) {
   if (a->okind != ObjKind::Array) return false;
   if (!ensure_items(a, a->length + 1)) return false;
+  barrier(a);
   a->items[a->length++] = v;
   return true;
 }
 
 bool Vm::array_push_bound(JsObject* b, const Value& v) {
   if (!ensure_items(b, b->length + 1)) return false;
+  barrier(b);
   b->items[b->length++] = v;
   return true;
 }
@@ -1632,7 +1793,10 @@ Env* Vm::mapped_env(JsObject* o, uint32_t index) const {
 
 void Vm::sync_arguments(JsObject* o) {
   for (uint32_t i = 0; i < o->length; ++i)
-    if (Env* e = mapped_env(o, i)) o->items[i] = e->slots()[i];
+    if (Env* e = mapped_env(o, i)) {
+      barrier(o);
+      o->items[i] = e->slots()[i];
+    }
 }
 
 bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
@@ -1657,7 +1821,10 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     uint32_t i;
     if (canonical_index(key->view(), &i)) {
       if (i < o->length && !o->items[i].is_hole()) {
-        if (Env* e = mapped_env(o, i)) o->items[i] = e->slots()[i];
+        if (Env* e = mapped_env(o, i)) {
+      barrier(o);
+      o->items[i] = e->slots()[i];
+    }
         *out = o->items[i];
         return true;
       }
@@ -1697,7 +1864,10 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
       JsObject* proto = new_plain();
       if (o->code->is_generator) {   // the objects a generator function makes inherit from the generator prototype
         Value generator_proto;
-        if (get_plain(global_, intern("__generator_proto"), &generator_proto) && generator_proto.is_object()) proto->proto = generator_proto.as_object();
+        if (get_plain(global_, intern("__generator_proto"), &generator_proto) && generator_proto.is_object()) {
+          barrier(proto);
+          proto->proto = generator_proto.as_object();
+        }
       } else {
         define(proto, constructor_, Value::make_object(o), kWritable);
       }
@@ -1855,7 +2025,10 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
   if (base.is_object() && array_index(key, &i)) {
     JsObject* o = base.as_object();
     if (o->okind == ObjKind::Array) {
-      if (Env* e = mapped_env(o, i)) o->items[i] = e->slots()[i];
+      if (Env* e = mapped_env(o, i)) {
+      barrier(o);
+      o->items[i] = e->slots()[i];
+    }
       *out = i < o->length ? o->items[i].unhole() : Value();
       return true;
     }
@@ -1927,8 +2100,12 @@ bool Vm::put_ex(const Value& base, JsString* key, const Value& value, bool stric
       if (strict && !(pair.is_object() && pair.as_object()->length >= 2 && is_callable(pair.as_object()->items[1]))) return refuse("Cannot set property ", " of #<Object> which has only a getter");
       return call_setter(pair, base, value);
     }
-    if (o->props[at].flags & kWritable) o->props[at].value = value;
-    else return refuse("Cannot assign to read only property '", "' of object");
+    if (o->props[at].flags & kWritable) {
+      barrier(o);
+      o->props[at].value = value;
+    } else {
+      return refuse("Cannot assign to read only property '", "' of object");
+    }
     return true;
   }
   if (key == prototype_ && o->okind == ObjKind::Function && !o->code->is_arrow) {   // (its own prototype, not made yet because nobody looked: written as it is, whatever
@@ -1958,8 +2135,12 @@ bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, 
     if (o->okind == ObjKind::TypedArray) return typed_array_put(*this, o, i, value);
     if (o->okind == ObjKind::Array && !o->frozen) {
       if (i < o->length) {
+        barrier(o);
         o->items[i] = value.unhole();
-        if (Env* e = mapped_env(o, i)) e->slots()[i] = o->items[i];
+        if (Env* e = mapped_env(o, i)) {
+          barrier(e);
+          e->slots()[i] = o->items[i];
+        }
         return true;
       }
       if (o->non_extensible || o->sealed) {
@@ -1969,6 +2150,7 @@ bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, 
       }
       if (i <= o->length + (1u << 20) && ensure_items(o, i + 1)) {
         for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value::make_hole();
+        barrier(o);
         o->items[i] = value.unhole();
         o->length = i + 1;
       }
@@ -2094,6 +2276,7 @@ bool Vm::become_wrapper(const Value& self, JsObject* proto, const Value& primiti
   for (JsObject* p = self.as_object()->proto; p && !derived; p = p->proto) derived = p == proto;
   if (!derived) return false;
   self.as_object()->okind = ObjKind::Primitive;
+  barrier(self.as_object());
   self.as_object()->bound_this = primitive;
   return true;
 }
@@ -3291,6 +3474,7 @@ reload:
           }
           if (e->slots()[in.a].is_uninitialized()) CHECK(throw_uninitialized(code, in.unused));
         }
+        barrier(e);
         e->slots()[in.a] = stack_[sp_ - 1];
         break;
       }
@@ -3636,6 +3820,7 @@ reload:
       }
       case Opc::SetLiteralProto: {   // [obj, value] -> [obj]   (an object or null; anything else is ignored)
         const Value& v = stack_[sp_ - 1];
+        barrier(stack_[sp_ - 2].as_object());
         if (v.is_object()) stack_[sp_ - 2].as_object()->proto = v.as_object();
         else if (v.is_null()) stack_[sp_ - 2].as_object()->proto = nullptr;
         --sp_;
@@ -3727,6 +3912,7 @@ reload:
         }
         const Value awaited = stack_[sp_ - 1];
         --sp_;
+        barrier(fp->coroutine);   // (its saved frame is about to change)
         saved->code = fp->code;
         saved->pc = pc;
         saved->env = fp->env;
@@ -3801,6 +3987,7 @@ JsObject* Vm::resolving_function(JsObject* promise, JsObject* shared, bool rejec
 void Vm::promise_settle(JsObject* promise, uint32_t state, const Value& value) {
   if (promise_state(promise) != kPromisePending) return;
   promise->position = (promise->position & ~kPromiseState) | state;
+  barrier(promise);
   promise->bound_this = value;
   // the reactions that were waiting
   const uint32_t count = promise->length;
@@ -3848,6 +4035,7 @@ void Vm::promise_then(JsObject* promise, const Value& on_fulfilled, const Value&
   promise->position |= kPromiseHandled;
   if (state == kPromisePending) {
     if (!ensure_items(promise, promise->length + 3)) return;
+    barrier(promise);
     promise->items[promise->length++] = on_fulfilled;
     promise->items[promise->length++] = on_rejected;
     promise->items[promise->length++] = derived_value;
@@ -3865,6 +4053,7 @@ JsObject* Vm::promise_resolved(const Value& value) {
 
 void Vm::enqueue_job(const Value& handler, const Value& argument, const Value& derived, uint32_t kind) {
   if (!micro_ || !ensure_items(micro_, micro_->length + 4)) return;
+  barrier(micro_);
   micro_->items[micro_->length++] = handler;
   micro_->items[micro_->length++] = argument;
   micro_->items[micro_->length++] = derived;

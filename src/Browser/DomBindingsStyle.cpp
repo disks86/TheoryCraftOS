@@ -1408,6 +1408,7 @@ Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement 
   const Value snap = build_computed_snapshot(c, element, pseudo, full);
   if (ring->length == kSnapshotPlaces * 3 && snap.is_object()) {
     slot = ring->items + 3 * (element->serial % kSnapshotPlaces);   // (the ring is not moved by building, but be sure)
+    vm.barrier(ring);
     slot[0] = Value::make_number(who);
     slot[1] = Value::make_number(version);
     slot[2] = snap;

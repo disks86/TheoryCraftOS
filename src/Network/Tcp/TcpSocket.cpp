@@ -51,7 +51,7 @@ TcpSocket::TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& 
 
 bool TcpSocket::connect(Ipv4Address address, uint16_t port) {
   StackLock guard(ip_);
-  if (state_ != TcpState::Closed || failed_ || port == 0 || !ip_.local_address().value()) return false;
+  if (state_ != TcpState::Closed || failed_ || port == 0 || !ip_.source_for(address).value()) return false;
   remote_address_ = address;
   remote_port_ = port;
   prepare_to_connect(manager_.allocate_port(), manager_.next_initial_sequence());
@@ -183,7 +183,7 @@ void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView dat
   if (!out.ok()) return;  // payload larger than a packet: cannot happen, the sender chunks to the MSS
 
   const uint16_t total = static_cast<uint16_t>(out.position());
-  uint32_t sum = pseudo_header_sum(ip_.local_address(), remote_address_, kProtocolTcp, total);
+  uint32_t sum = pseudo_header_sum(ip_.source_for(remote_address_), remote_address_, kProtocolTcp, total);
   sum = checksum_add(sum, out.written());
   out.patch_be16(16, checksum_finish(sum));
   ip_.send_ip(remote_address_, kProtocolTcp, out.written());  // a lost segment is retransmitted

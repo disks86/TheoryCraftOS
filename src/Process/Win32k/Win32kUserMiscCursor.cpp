@@ -368,7 +368,7 @@ uint64_t svc_set_cursor_pos(Call& c) {
   if (x > clip.right - 1) x = clip.right - 1;
   if (y < clip.top) y = clip.top;
   if (y > clip.bottom - 1) y = clip.bottom - 1;
-  user::inject_mouse_move(x, y);
+  user::set_cursor_position(x, y);      // (a program moving the cursor is not input: no raw motion)
   return 1;
 }
 
@@ -398,7 +398,7 @@ uint64_t svc_clip_cursor(Call& c) {
   const Rect limit = set ? clip : screen_rect();
   const int32_t nx = x < limit.left ? limit.left : x > limit.right - 1 ? limit.right - 1 : x;
   const int32_t ny = y < limit.top ? limit.top : y > limit.bottom - 1 ? limit.bottom - 1 : y;
-  if (nx != x || ny != y) user::inject_mouse_move(nx, ny);
+  if (nx != x || ny != y) user::set_cursor_position(nx, ny);
   return 1;
 }
 

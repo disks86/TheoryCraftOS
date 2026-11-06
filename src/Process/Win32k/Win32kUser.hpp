@@ -46,9 +46,11 @@ bool post_thread_message(uint64_t thread, uint32_t message, uint64_t wparam, uin
 void inject_key(uint32_t virtual_key, uint32_t scan_code, bool down, bool extended);
 void inject_char(char32_t character);                            // text typed (the layout is not this module's business): WM_CHAR to the focus window
 void inject_mouse_move(int32_t screen_x, int32_t screen_y);
+void inject_mouse_motion(int32_t dx, int32_t dy);                // a relative mouse's motion: raw input gets it whole, the cursor moves as far as the screen / ClipCursor lets it
 void inject_mouse_button(uint32_t button, bool down);            // 1 left, 2 right, 3 middle, 4 X1, 5 X2
 void inject_mouse_wheel(int32_t delta, bool horizontal);
 void cursor_position(int32_t* x, int32_t* y);                    // takes the lock itself
+void set_cursor_position(int32_t x, int32_t y);                  // SetCursorPos / ClipCursor: the cursor moves (WM_MOUSEMOVE), but it is not input (no raw input); takes the lock
 // Times and timers: the window manager's timers (SetTimer) and the delayed things (tooltips, double-click time) are due by the monotonic clock of the process hosts. The kernel
 // calls this now and then (the desktop pump), and every message wait calls it; it posts WM_TIMER / WM_PAINT-like pending work. Takes the lock itself.
 void pump(uint64_t now_ns);
@@ -96,6 +98,10 @@ uint32_t window_input_context_raw(uint32_t hwnd);
 // The menu bar of a window changed (SetMenu) or a window went: the menu module drops what depended on the window. The window manager calls this when it destroys a window.
 void window_destroyed(uint32_t hwnd);
 bool attach_window_menu(uint32_t hwnd, uint32_t menu);                  // CreateWindowEx with a menu: the window owns it from now on (false: no such menu)
+// Raw input: the window manager reports each mouse (type 0) and keyboard (type 1) event of the machine and of SendInput, with the RAWMOUSE / RAWKEYBOARD bytes; the input module
+// makes a record for each process registered for the device and posts WM_INPUT to its target window. `injected`: from SendInput (the record names no device, as on Windows).
+void raw_input_event(uint32_t type, bool injected, ConstByteView data);
+bool raw_input_no_legacy(uint64_t pid, uint32_t type);                  // RIDEV_NOLEGACY: the process wants no WM_MOUSEMOVE / WM_KEYDOWN ... of that device
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // (the user-misc module's own declarations follow)

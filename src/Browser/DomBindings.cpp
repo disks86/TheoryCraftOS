@@ -47,7 +47,10 @@ int dom_exception_code(StringView name) {
 bool throw_dom(Vm& vm, const char* name, StringView message) {
   DomBindings::Impl& c = impl(vm);
   JsObject* e = vm.new_error(ErrorKind::Error, message);
-  if (c.exception_proto) e->proto = c.exception_proto;
+  if (c.exception_proto) {
+    vm.barrier(e);
+    e->proto = c.exception_proto;
+  }
   vm.define_named(e, "name", str_value(vm, name), kWritable);
   const int code = dom_exception_code(name);
   vm.define_named(e, "code", num_value(code), kWritable);
@@ -84,7 +87,10 @@ dom::Node* arg_node(Vm& vm, const Value* args, uint32_t argc, uint32_t i) {
 
 void set_interface(Vm& vm, JsObject* array, const char* name) {
   Value ctor, proto;
-  if (vm.get_named(Value::make_object(vm.global()), name, &ctor) && ctor.is_object() && vm.get_named(ctor, "prototype", &proto) && proto.is_object()) array->proto = proto.as_object();
+  if (vm.get_named(Value::make_object(vm.global()), name, &ctor) && ctor.is_object() && vm.get_named(ctor, "prototype", &proto) && proto.is_object()) {
+    vm.barrier(array);
+    array->proto = proto.as_object();
+  }
 }
 
 JsObject* make_collection(DomBindings::Impl& c, const List<dom::Node*>& nodes, bool html_collection) {

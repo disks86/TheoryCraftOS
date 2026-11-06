@@ -35,7 +35,8 @@ namespace network {
 //
 // Not supported: IPv6, IP fragmentation (larger packets are dropped or refused),
 // IP options, TCP congestion control, selective acknowledgements, window scaling,
-// DNS over anything but A records.
+// DNS over anything but A records. Packets to 127.0.0.0/8 and to the stack's own
+// address are looped back inside the stack (delivered by poll()).
 class INetworkStack {
  public:
   // Processes received frames and timers. Cheap when nothing is happening.

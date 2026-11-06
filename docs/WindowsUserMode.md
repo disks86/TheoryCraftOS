@@ -219,8 +219,15 @@ and name resolution without DNS: `getaddrinfo`/`GetAddrInfoW`/`freeaddrinfo`/`Fr
 
 Not done: IPv6 sockets, DNS for Windows programs (the kernel's own network stack resolves names for itself), `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O,
 `SO_RCVTIMEO`/`SO_SNDTIMEO` and other `setsockopt` options (accepted, not applied), multicast, raw sockets, the legacy `inet_addr` forms (hex, octal, fewer than four parts),
-and a loopback interface (a program's own address is whichever one network interface it is bound to; nothing short-circuits traffic addressed back to that same address, so a
-connection to 127.0.0.1 does not reach a listener in the same machine: Godot's game-to-editor debugger link needs this).
+and binding to one particular local address (every socket uses the address of the interface it is on).
+
+The loopback: a packet to 127.0.0.0/8 or to the interface's own address never reaches the wire. `NetworkStack::send_ip_from` puts it in a queue of the same stack and
+`poll()` delivers it (with what it sends in answer, up to a bound per poll); a packet to 127/8 goes out from the address it is sent to (`IIpLayer::source_for`, which the
+TCP and UDP checksums use), so answers come back from where they were sent, and a frame from the wire addressed to 127/8 is dropped. It works before DHCP has given the
+interface an address (`SocketManager::stack_for` takes any stack for 127/8 then), but not on a machine with no network interface at all: the system's sockets exist only
+once one is found. A socket connected over the loopback reports 127.0.0.1 as its own address. This is what Godot's game uses to reach its editor's debugger.
+Tests: `NetworkTest` (TCP echo over 127.0.0.1, 127.1.2.3 and the own address with no frame on the wire, ICMP, UDP, a refused port, an unconfigured stack, a martian frame),
+`WindowsSocketTest` (the services: accept and receive over 127.0.0.1), and `tcos_resolve` in QEMU (connect/accept/send/recv and UDP in one Windows process).
 
 ## Game input, timers and the adapter list (user32, winmm, xinput, dinput8, avrt, iphlpapi)
 
@@ -249,10 +256,20 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
   operation 5 (new): `GetAdaptersAddresses` (Windows' layout; the size does not depend on the flags), `GetAdaptersInfo`, `GetIfTable`, `GetIfEntry(2)`, `GetIpAddrTable`,
   `GetAdapterIndex`, `GetBestInterface`, `GetNumberOfInterfaces` and the LUID/GUID/index conversions; the routing, neighbour and connection tables answer
   `ERROR_NOT_SUPPORTED`. No MAC address (the kernel does not report it), no IPv6.
-- **Not done**: raw input (win32k keeps registrations and records, but nothing makes WM_INPUT records yet, so `RegisterRawInputDevices` stays a stub that fails: wiring it
-  would switch Godot's captured mouse to WM_INPUT and stop its motion), `TrackMouseEvent`/`WM_MOUSELEAVE` (no win32k service), WASAPI (`CoCreateInstance` of the device
-  enumerator fails: Godot falls back to its dummy audio driver), DirectSound.
-- **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`) and `scripts/winetest.sh winmm tcos_gameinput`
+- **Raw input** (`keyboard.inc` over `Win32kUserMiscInput.cpp`): `RegisterRawInputDevices`, `GetRegisteredRawInputDevices`, `GetRawInputData`, `GetRawInputBuffer`,
+  `GetRawInputDeviceList`, `GetRawInputDeviceInfoA/W`, `DefRawInputProc`. The window manager reports every mouse and keyboard event, of the machine (`user::inject_*`, and the
+  new `inject_mouse_motion` for a relative mouse: the raw motion is whole even where the cursor stops at a ClipCursor edge) and of `SendInput` (one record per INPUT, no device
+  handle, absolute moves as `MOUSE_MOVE_ABSOLUTE`), as RAWMOUSE / RAWKEYBOARD; the input module makes a record for each registered process and posts WM_INPUT: `RIM_INPUT` to the
+  foreground process at its registered window (else its focus window), `RIM_INPUTSINK` to another process registered with `RIDEV_INPUTSINK`, or with `RIDEV_EXINPUTSINK` when the
+  foreground process does not take that input raw. `RIDEV_PAGEONLY`, `RIDEV_EXCLUDE` and `RIDEV_NOLEGACY` (no WM_MOUSEMOVE / button / wheel, or WM_KEYDOWN / WM_CHAR, for that
+  process) are followed. Not done: `RIDEV_NOHOTKEYS`, `RIDEV_CAPTUREMOUSE`, `RIDEV_DEVNOTIFY` (WM_INPUT_DEVICE_CHANGE), HID devices other than the mouse and the keyboard, the
+  records' extra information. Wine's raw-input tests pass except the cross-desktop cases (no `CreateDesktop`); the multi-process part still hangs now and then in its own waits.
+- **Not done**: the machine's keyboard and mouse do not reach Windows programs yet. `user::inject_*` exist but nothing in the kernel or the desktop calls them, and nothing shows
+  win32k's screen (`gdi::set_screen_sink` has no caller), so in the running OS a Windows GUI program gets input only from `SendInput`. Also not done: `TrackMouseEvent` from
+  user32 (win32k tracks WM_MOUSELEAVE, but the service is not registered), WASAPI (`CoCreateInstance` of the device enumerator fails: Godot falls back to its dummy audio
+  driver), DirectSound.
+- **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`: also raw input from SendInput, NOLEGACY, removal), `Win32kMiscTest`
+  (`test_raw_input_dispatch`: foreground, sinks, page-only / exclude, injected records) and `scripts/winetest.sh winmm tcos_gameinput`
   (`tests/windows/wine/winmm/tcos_gameinput.c`: winmm, xinput by all three names, dinput8, avrt, iphlpapi), both 0 failures; Wine's winmm `timer` and `joystick` 0 failures
   (were 33 and 1), user32 `sysparams` about 550 (was 1595), `input` about 1700 (was 1967; the count varies with timing, and the raw-input part has hung once), `monitor`
   about 170 (it ran into a division by zero at 59 before and now reaches the display-configuration tests); host tests `WindowsSocketTest` (operation 5), `ModuleLoaderTest`

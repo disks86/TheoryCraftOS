@@ -104,10 +104,15 @@ struct Value {
 
 enum class CellKind : uint8_t { String, Object, Env };
 
+// The generation of a cell (see Vm::collect): young until it survives a collection, then old. An old cell that had a reference stored into it since the last
+// collection is remembered (Vm::barrier), so that the next minor collection looks into it.
+enum CellGen : uint8_t { kGenYoung = 0, kGenOld = 1, kGenRemembered = 2 };
+
 struct Cell {
-  Cell* next = nullptr;   // the heap's list of every cell
+  Cell* next = nullptr;   // the list of its generation
   CellKind kind;
   bool marked = false;
+  uint8_t gen = kGenYoung;
   explicit Cell(CellKind k) : kind(k) {}
 };
 

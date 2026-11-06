@@ -576,6 +576,7 @@ void key_message_to(Queue& q, Window* w, uint32_t message, uint32_t vk, uint32_t
 void inject_key_locked(uint32_t vk, uint32_t scan, bool down, bool extended);
 void inject_char_locked(char32_t c);
 void inject_move_locked(int32_t x, int32_t y);
+void inject_motion_locked(int32_t dx, int32_t dy);
 void inject_button_locked(uint32_t button, bool down);
 void inject_wheel_locked(int32_t delta, bool horizontal);
 void set_cursor_pos_locked(int32_t x, int32_t y);

@@ -6694,6 +6694,14 @@ int main(int argc, char** argv) {
   if (const char* real = getenv("WPT_REAL_FILE")) return run_real_wpt(getenv("WPT_ROOT") ? getenv("WPT_ROOT") : ".", real);
   if (const char* html_file = getenv("PROBE_HTML")) {   // loads a saved page as the document at https://app.example/ (PROBE_ROOT serves its files) and prints the log
     if (getenv("PROBE_PROFILE")) probe_profile::start();
+    if (getenv("PROBE_VERIFY_GC")) {   // (every minor collection checks that no store missed Vm::barrier: slow)
+      script::Vm::verify_generations = true;
+      script::Vm::generation_error = [](const char* what) {
+        printf("%s\n", what);
+        fflush(stdout);
+        abort();
+      };
+    }
     std::string html;
     if (FILE* f = fopen(html_file, "rb")) { int c; while ((c = fgetc(f)) != EOF) html.push_back(static_cast<char>(c)); fclose(f); }
     TestAllocator a;

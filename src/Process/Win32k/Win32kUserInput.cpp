@@ -35,6 +35,28 @@ void init_cursor() {
   s.cursor_y = int32_t(gdi::screen_height() / 2);
 }
 
+// --- Raw input (WM_INPUT is the input module's: user_misc::raw_input_event). The records carry Windows' RAWMOUSE / RAWKEYBOARD.
+bool g_from_send_input = false;      // the events come from SendInput: their records name no device, as on Windows
+constexpr uint16_t kMouseMoveAbsolute = 1, kRawKeyBreak = 1, kRawKeyE0 = 2, kRawMouseWheel = 0x400, kRawMouseHWheel = 0x800;
+constexpr uint32_t kRawTypeMouse = 0, kRawTypeKeyboard = 1;
+void put_le(uint8_t* raw, uint32_t offset, uint32_t value, uint32_t bytes) { for (uint32_t i = 0; i < bytes; ++i) raw[offset + i] = uint8_t(value >> (8 * i)); }
+void raw_mouse(uint16_t flags, uint16_t button_flags, int16_t button_data, int32_t x, int32_t y) {
+  uint8_t m[24] = {};      // RAWMOUSE: usFlags, usButtonFlags (4), usButtonData (6), ulRawButtons (8), lLastX (12), lLastY (16), ulExtraInformation (20)
+  put_le(m, 0, flags, 2);
+  put_le(m, 4, button_flags, 2);
+  put_le(m, 6, uint16_t(button_data), 2);
+  put_le(m, 12, uint32_t(x), 4);
+  put_le(m, 16, uint32_t(y), 4);
+  user_misc::raw_input_event(kRawTypeMouse, g_from_send_input, ConstByteView(m, sizeof m));
+}
+// RI_MOUSE_LEFT_BUTTON_DOWN 1, _UP 2, then right, middle, X1, X2 by pairs
+uint16_t raw_button_flag(uint32_t button, bool down) { return button >= 1 && button <= 5 ? uint16_t((down ? 1u : 2u) << (2 * (button - 1))) : 0; }
+// RIDEV_NOLEGACY: the process of the window asked for raw input only
+bool legacy_wanted(Window* w, uint32_t type) { return !user_misc::raw_input_no_legacy(window_process(w->handle), type); }
+
+void button_legacy_locked(uint32_t button, bool down);      // (the legacy messages of a mouse event: below)
+void wheel_legacy_locked(int32_t delta, bool horizontal);
+
 }  // namespace
 
 Queue* foreground_queue() {
@@ -600,6 +622,7 @@ uint32_t vk_from_scan(uint32_t scan) {
 uint64_t nt_send_input(Call& call) {
   const uint32_t count = call.arg32(0);
   if (call.argi(2) != 40 || count == 0) return call.fail(kErrorInvalidParameter);
+  struct FromSendInput { FromSendInput() { g_from_send_input = true; } ~FromSendInput() { g_from_send_input = false; } } from_send_input;
   uint32_t done = 0;
   for (uint32_t i = 0; i < count; ++i) {
     uint8_t raw[40];
@@ -610,23 +633,25 @@ uint64_t nt_send_input(Call& call) {
       const int32_t dx = int32_t(u32(8)), dy = int32_t(u32(12));
       const uint32_t data = u32(16), flags = u32(20);
       init_cursor();
-      if (flags & MOUSEEVENTF_MOVE) {
-        if (flags & MOUSEEVENTF_ABSOLUTE) {
-          inject_move_locked(int32_t(int64_t{dx} * int64_t(gdi::screen_width()) / 65536), int32_t(int64_t{dy} * int64_t(gdi::screen_height()) / 65536));
-        } else {
-          inject_move_locked(S().cursor_x + dx, S().cursor_y + dy);
-        }
+      // one raw record for the whole INPUT (motion as given: relative, or absolute in 0..65535), then the legacy messages
+      struct Edge { uint32_t flag, button; bool down; };
+      const uint32_t x_button = data == 2 ? 5 : 4;
+      const Edge edges[] = {{MOUSEEVENTF_LEFTDOWN, 1, true}, {MOUSEEVENTF_LEFTUP, 1, false}, {MOUSEEVENTF_RIGHTDOWN, 2, true}, {MOUSEEVENTF_RIGHTUP, 2, false},
+                            {MOUSEEVENTF_MIDDLEDOWN, 3, true}, {MOUSEEVENTF_MIDDLEUP, 3, false}, {MOUSEEVENTF_XDOWN, x_button, true}, {MOUSEEVENTF_XUP, x_button, false}};
+      uint16_t raw_buttons = 0;
+      for (const Edge& e : edges) if (flags & e.flag) raw_buttons = uint16_t(raw_buttons | raw_button_flag(e.button, e.down));
+      int16_t raw_data = 0;
+      if (flags & MOUSEEVENTF_WHEEL) { raw_buttons |= kRawMouseWheel; raw_data = int16_t(data); }
+      else if (flags & MOUSEEVENTF_HWHEEL) { raw_buttons |= kRawMouseHWheel; raw_data = int16_t(data); }
+      const bool move = (flags & MOUSEEVENTF_MOVE) != 0, absolute = move && (flags & MOUSEEVENTF_ABSOLUTE);
+      if ((move && (absolute || dx != 0 || dy != 0)) || raw_buttons) raw_mouse(absolute ? kMouseMoveAbsolute : 0, raw_buttons, raw_data, move ? dx : 0, move ? dy : 0);
+      if (move) {
+        if (absolute) set_cursor_pos_locked(int32_t(int64_t{dx} * int64_t(gdi::screen_width()) / 65536), int32_t(int64_t{dy} * int64_t(gdi::screen_height()) / 65536));
+        else set_cursor_pos_locked(S().cursor_x + dx, S().cursor_y + dy);
       }
-      if (flags & MOUSEEVENTF_LEFTDOWN) inject_button_locked(1, true);
-      if (flags & MOUSEEVENTF_LEFTUP) inject_button_locked(1, false);
-      if (flags & MOUSEEVENTF_RIGHTDOWN) inject_button_locked(2, true);
-      if (flags & MOUSEEVENTF_RIGHTUP) inject_button_locked(2, false);
-      if (flags & MOUSEEVENTF_MIDDLEDOWN) inject_button_locked(3, true);
-      if (flags & MOUSEEVENTF_MIDDLEUP) inject_button_locked(3, false);
-      if (flags & MOUSEEVENTF_XDOWN) inject_button_locked(data == 2 ? 5 : 4, true);
-      if (flags & MOUSEEVENTF_XUP) inject_button_locked(data == 2 ? 5 : 4, false);
-      if (flags & MOUSEEVENTF_WHEEL) inject_wheel_locked(int32_t(data), false);
-      if (flags & MOUSEEVENTF_HWHEEL) inject_wheel_locked(int32_t(data), true);
+      for (const Edge& e : edges) if (flags & e.flag) button_legacy_locked(e.button, e.down);
+      if (flags & MOUSEEVENTF_WHEEL) wheel_legacy_locked(int32_t(data), false);
+      if (flags & MOUSEEVENTF_HWHEEL) wheel_legacy_locked(int32_t(data), true);
     } else if (type == 1) {      // INPUT_KEYBOARD: wVk 8, wScan 10, dwFlags 12, time 16, extraInfo 24
       uint32_t vk = raw[8] | uint32_t(raw[9]) << 8;
       const uint32_t scan = raw[10] | uint32_t(raw[11]) << 8, flags = u32(12);
@@ -720,6 +745,7 @@ Window* mouse_target(int32_t x, int32_t y, uint32_t* hit) {
 }
 
 void deliver_mouse(Window* w, uint32_t hit, uint32_t client_message, uint64_t client_wparam) {
+  if (!legacy_wanted(w, kRawTypeMouse)) return;
   if (hit == wn::HTCLIENT) {
     int32_t ox, oy;
     client_origin(w, &ox, &oy);
@@ -762,9 +788,32 @@ void set_cursor_pos_locked(int32_t x, int32_t y) {
   }
 }
 
-void inject_move_locked(int32_t x, int32_t y) { set_cursor_pos_locked(x, y); }
+// A pointing device that reports positions: raw input gets the motion from the last position.
+void inject_move_locked(int32_t x, int32_t y) {
+  init_cursor();
+  const int32_t dx = x - S().cursor_x, dy = y - S().cursor_y;
+  if (dx != 0 || dy != 0) raw_mouse(0, 0, 0, dx, dy);
+  set_cursor_pos_locked(x, y);
+}
+void inject_motion_locked(int32_t dx, int32_t dy) {
+  init_cursor();
+  if (dx == 0 && dy == 0) return;
+  raw_mouse(0, 0, 0, dx, dy);      // (whole: a clipped cursor does not stop the raw motion, which is what a game's mouse look reads)
+  set_cursor_pos_locked(S().cursor_x + dx, S().cursor_y + dy);
+}
 
 void inject_button_locked(uint32_t button, bool down) {
+  raw_mouse(0, raw_button_flag(button, down), 0, 0, 0);
+  button_legacy_locked(button, down);
+}
+void inject_wheel_locked(int32_t delta, bool horizontal) {
+  raw_mouse(0, horizontal ? kRawMouseHWheel : kRawMouseWheel, int16_t(delta), 0, 0);
+  wheel_legacy_locked(delta, horizontal);
+}
+
+namespace {
+
+void button_legacy_locked(uint32_t button, bool down) {
   State& s = S();
   init_cursor();
   static const uint32_t vks[6] = {0, wn::VK_LBUTTON, wn::VK_RBUTTON, wn::VK_MBUTTON, wn::VK_XBUTTON1, wn::VK_XBUTTON2};
@@ -812,15 +861,17 @@ void inject_button_locked(uint32_t button, bool down) {
   deliver_mouse(w, hit, message, wparam);
 }
 
-void inject_wheel_locked(int32_t delta, bool horizontal) {
+void wheel_legacy_locked(int32_t delta, bool horizontal) {
   State& s = S();
   init_cursor();
   Window* w = keyboard_target();
   if (!w) { uint32_t hit; w = mouse_target(s.cursor_x, s.cursor_y, &hit); }
-  if (!w) return;
+  if (!w || !legacy_wanted(w, kRawTypeMouse)) return;
   const uint64_t wparam = (uint64_t(uint16_t(delta)) << 16) | key_flags();
   post_input(w, horizontal ? wn::WM_MOUSEHWHEEL : wn::WM_MOUSEWHEEL, wparam, make_lparam(s.cursor_x, s.cursor_y));
 }
+
+}  // namespace
 
 void inject_key_locked(uint32_t vk, uint32_t scan, bool down, bool extended) {
   State& s = S();
@@ -835,6 +886,17 @@ void inject_key_locked(uint32_t vk, uint32_t scan, bool down, bool extended) {
     const uint32_t r = l + 1;
     const bool any = ((s.async_keys[l] | s.async_keys[r]) & 0x80) != 0;
     s.async_keys[g] = uint8_t((s.async_keys[g] & 1) | (any ? 0x80 : 0));
+  }
+  if (vk != wn::VK_PACKET) {      // RAWKEYBOARD: MakeCode, Flags (2), Reserved (4), VKey (6), Message (8), ExtraInformation (12); VKey is the generic modifier
+    const bool raw_alt = (s.async_keys[wn::VK_MENU] & 0x80) != 0 && !(s.async_keys[wn::VK_CONTROL] & 0x80);
+    const bool raw_sys = raw_alt || vk == 0x79 /* F10 */;      // (the message the legacy path posts)
+    uint8_t k[16] = {};
+    const uint32_t g = generic_modifier(vk);
+    put_le(k, 0, scan & 0xFF, 2);
+    put_le(k, 2, (down ? 0u : kRawKeyBreak) | (extended ? kRawKeyE0 : 0u), 2);
+    put_le(k, 6, g ? g : vk, 2);
+    put_le(k, 8, down ? (raw_sys ? wn::WM_SYSKEYDOWN : wn::WM_KEYDOWN) : (raw_sys ? wn::WM_SYSKEYUP : wn::WM_KEYUP), 4);
+    user_misc::raw_input_event(kRawTypeKeyboard, g_from_send_input, ConstByteView(k, sizeof k));
   }
   // hot keys
   if (down) {
@@ -855,7 +917,7 @@ void inject_key_locked(uint32_t vk, uint32_t scan, bool down, bool extended) {
     }
   }
   Window* target = keyboard_target();
-  if (!target) return;
+  if (!target || !legacy_wanted(target, kRawTypeKeyboard)) return;
   const bool alt = (s.async_keys[wn::VK_MENU] & 0x80) != 0 && !(s.async_keys[wn::VK_CONTROL] & 0x80);
   const bool sys = alt || vk == 0x79 /* F10 */;
   uint32_t message = down ? (sys ? wn::WM_SYSKEYDOWN : wn::WM_KEYDOWN) : (sys ? wn::WM_SYSKEYUP : wn::WM_KEYUP);
@@ -867,7 +929,7 @@ void inject_key_locked(uint32_t vk, uint32_t scan, bool down, bool extended) {
 void inject_char_locked(char32_t c) {
   State& s = S();
   Window* target = keyboard_target();
-  if (!target) return;
+  if (!target || !legacy_wanted(target, kRawTypeKeyboard)) return;
   const bool alt = (s.async_keys[wn::VK_MENU] & 0x80) != 0 && !(s.async_keys[wn::VK_CONTROL] & 0x80);
   const uint32_t message = alt ? 0x106 /* WM_SYSCHAR */ : wn::WM_CHAR;
   const uint32_t lparam = 1 | (alt ? 1u << 29 : 0);
@@ -893,6 +955,8 @@ struct LockGuard {
 void inject_key(uint32_t virtual_key, uint32_t scan_code, bool down, bool extended) { LockGuard g; if (state_or_null() || system_allocator()) inject_key_locked(virtual_key, scan_code, down, extended); }
 void inject_char(char32_t character) { LockGuard g; inject_char_locked(character); }
 void inject_mouse_move(int32_t x, int32_t y) { LockGuard g; inject_move_locked(x, y); }
+void inject_mouse_motion(int32_t dx, int32_t dy) { LockGuard g; inject_motion_locked(dx, dy); }
+void set_cursor_position(int32_t x, int32_t y) { LockGuard g; set_cursor_pos_locked(x, y); }
 void inject_mouse_button(uint32_t button, bool down) { LockGuard g; inject_button_locked(button, down); }
 void inject_mouse_wheel(int32_t delta, bool horizontal) { LockGuard g; inject_wheel_locked(delta, horizontal); }
 void cursor_position(int32_t* x, int32_t* y) {

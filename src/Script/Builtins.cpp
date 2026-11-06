@@ -499,6 +499,7 @@ NATIVE(object_set_prototype_of) {
     JsObject* wanted = proto.is_object() ? proto.as_object() : nullptr;
     JsObject* t = target.as_object();
     if (t->proto != wanted && (t->non_extensible || t->sealed || t->frozen)) return vm.throw_error(ErrorKind::TypeError, "#<Object> is not extensible");
+    vm.barrier(t);
     t->proto = wanted;
   }
   *result = target;
@@ -526,6 +527,8 @@ NATIVE(class_setup) {
     } else {
       Value parent_proto;
       if (!vm.get_named(parent, "prototype", &parent_proto)) return false;
+      vm.barrier(proto.as_object());
+      vm.barrier(ctor.as_object());
       proto.as_object()->proto = parent_proto.is_object() ? parent_proto.as_object() : nullptr;
       ctor.as_object()->proto = parent.as_object();
     }
@@ -927,6 +930,7 @@ NATIVE(array_unshift) {
   if (!this_array(vm, self, &a)) return false;
   const uint32_t old = a->length;
   if (!vm.array_set_length(a, old + argc)) return true;
+  vm.barrier(a);
   for (uint32_t i = old; i > 0; --i) a->items[i - 1 + argc] = a->items[i - 1];
   for (uint32_t i = 0; i < argc; ++i) a->items[i] = args[i];
   *result = num_value(a->length);
@@ -993,6 +997,7 @@ NATIVE(array_splice) {
   const uint32_t inserted = argc > 2 ? argc - 2 : 0;
   const uint32_t old = a->length;
   const uint32_t new_length = old - static_cast<uint32_t>(count) + inserted;
+  vm.barrier(a);
   if (new_length > old) {
     if (!vm.array_set_length(a, new_length)) return true;
     for (uint32_t i = old; i > static_cast<uint32_t>(start + count); --i) a->items[i - 1 + inserted - static_cast<uint32_t>(count)] = a->items[i - 1];
@@ -1114,6 +1119,7 @@ NATIVE(array_fill) {
   if (!arg_integer(vm, args, argc, 1, 0, &from) || !arg_integer(vm, args, argc, 2, a->length, &to)) return false;
   from = relative(from, a->length);
   to = relative(to, a->length);
+  vm.barrier(a);
   for (int64_t i = from; i < to; ++i) a->items[i] = arg_at(args, argc, 0);
   *result = self;
   return true;
@@ -1271,6 +1277,7 @@ NATIVE(array_sort) {
       if (!a->items[i].is_undefined()) copy[defined++] = a->items[i];
     const bool ok = merge_sort(vm, fn, copy, scratch, defined);
     if (ok) {
+      vm.barrier(a);   // (the comparator may have stored into the array: what is put back must be seen as stored now)
       for (uint32_t i = 0; i < defined; ++i) a->items[i] = copy[i];
       for (uint32_t i = defined; i < a->length; ++i) a->items[i] = Value();
     }
@@ -2752,6 +2759,7 @@ bool json_revive(Vm& vm, const Value& reviver, const Value& holder, JsString* ke
         Value revived;
         if (!json_revive(vm, reviver, value, k, &revived, depth + 1)) return false;
         if (i >= o->length) break;
+        vm.barrier(o);
         if (revived.is_undefined()) o->items[i] = Value();
         else o->items[i] = revived;
       }

@@ -416,6 +416,37 @@ static void test_limits_and_collector() {
       CHECK(std::string(result.c_str()) == "39:12497500:30000:abcde:6:true:40");
       CHECK(e.vm().collections() > before + 3 && e.vm().heap_bytes() < (32u << 20));   // (under the limit: the count does not run away)
       CHECK(e.run("var n = 0; for (var k in keep) n += keep[k]; n + ':' + keep['name' + 7] + ':' + 'é'.charAt(0) + 'abc'.charAt(1)", &error, &result) && std::string(result.c_str()) == "780:7:éb");
+      // Generations: an old array that a young object is stored into is looked into by the next minor collection only through Vm::barrier. With the barrier
+      // the object lives; a store without it is what the check of every minor collection (on in these tests) reports.
+      CHECK(e.run("var olds = [{}, {}]; olds.length", &error, &result) && std::string(result.c_str()) == "2");
+      Value olds_value;
+      CHECK(e.vm().get_named(Value::make_object(e.vm().global()), "olds", &olds_value) && olds_value.is_object());
+      JsObject* olds = olds_value.as_object();
+      e.vm().collect();
+      CHECK(olds->gen != kGenYoung);
+      {
+        JsObject* young = e.vm().new_plain();
+        e.vm().define(young, e.vm().intern("tag"), Value::make_number(41));
+        e.vm().barrier(olds);
+        olds->items[0] = Value::make_object(young);
+        e.vm().collect();
+        CHECK(e.run("olds[0].tag + 1", &error, &result) && std::string(result.c_str()) == "42");
+      }
+      {
+        static int reported = 0;
+        void (*const before)(const char*) = Vm::generation_error;
+        const bool verifying = Vm::verify_generations;
+        Vm::verify_generations = true;
+        Vm::generation_error = [](const char* what) { reported += std::string(what).find("without Vm::barrier") != std::string::npos; };
+        e.vm().collect();   // (now everything is old, olds unremembered)
+        JsObject* young = e.vm().new_plain();
+        olds->items[1] = Value::make_object(young);   // (no barrier)
+        e.vm().collect();
+        CHECK(reported >= 1);
+        olds->items[1] = Value();   // (the object was freed)
+        Vm::generation_error = before;
+        Vm::verify_generations = verifying;
+      }
     }
     CHECK(a.live == 0);
   }
