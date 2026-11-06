@@ -50,6 +50,7 @@ struct StorageInfo {
 struct StorageStatistics {
   uint64_t reads = 0, writes = 0;
   uint64_t blocks_read = 0, blocks_written = 0;
+  uint64_t discards = 0, blocks_discarded = 0;
   uint64_t errors = 0;
 };
 

@@ -143,6 +143,7 @@ Status NtfsFileSystem::init() {
   uint32_t volume_flags = 0;
   writable_ = false;
   if (!storage.read_only && check_writable(&volume_flags) == Status::Ok) writable_ = true;
+  discard_.attach(&device_, writable_);
   return Status::Ok;
 }
 

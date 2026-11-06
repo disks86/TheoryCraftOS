@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
+#include "FileSystem/DiscardBatch.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/ArrayView.hpp"
@@ -124,6 +125,7 @@ class FatFileSystem final : public IFileSystem {
   allocators::IAllocator& allocator_;
   hardware::IStorageDevice& device_;
   const uint64_t first_block_;
+  DiscardBatch discard_;   // freed clusters, discarded after the next flush
   mutable kernel::RecursiveMutex mutex_;
   File* open_files_ = nullptr;   // the open file handles, newest first (see File)
   uint64_t epoch_ = 0;           // changes whenever a cluster chain loses clusters, which makes ChainCursors start over

@@ -31,6 +31,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "DiscardWorkload.hpp"
 #include "FileSystem/Befs/BefsFileSystem.hpp"
 
 using namespace filesystem;
@@ -57,7 +58,9 @@ struct MemDisk : hardware::IStorageDevice {
   const char* name() const override { return "memdisk"; }
   bool initialize() override { return true; }
   void shutdown() override {}
-  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; return i; }
+  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; i.discard = dc.enabled; return i; }
+  bool discard(uint64_t lba, uint64_t count) override { return dc.discard(data, blocks, block_size, lba, count); }
+  discard_test::DiscardCounters dc;
   hardware::StorageStatistics statistics() const override { return {}; }
   bool read(uint64_t lba, ByteView buffer) override {
     if (buffer.size() % block_size || lba + buffer.size() / block_size > blocks) return false;
@@ -1876,6 +1879,30 @@ static int run_real(const char* in, const char* out, const char* expected) {
 }
 }  // namespace interop
 
+// Freed blocks are discarded after a flush, only once their transaction committed, and never while in use (the disk poisons what it
+// discards); the bitmap accounting stays right.
+static void test_discard(uint32_t bs, uint32_t ag_shift, uint32_t groups, uint32_t device_block) {
+  Built v(bs, ag_shift, groups, bs);
+  TestAllocator a;
+  {
+    MemDisk disk(v.image.img.data(), v.image.img.size(), device_block, 0, true);
+    disk.dc.enabled = true;
+    std::vector<discard_test::Model> files;
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (!fs) return;
+    CHECK(discard_test::run(*fs, 31 + bs + device_block, &files));
+    fs = UniquePointer<IFileSystem>();
+    CHECK(disk.dc.calls > 0 && disk.dc.blocks > 0 && disk.dc.refused == 0);
+    printf("  BeFS %u-byte blocks on %u-byte device blocks: %llu discards, %llu blocks\n", bs, device_block, (unsigned long long)disk.dc.calls,
+           (unsigned long long)disk.dc.blocks);
+    check_accounting(disk.data, v.image, "discard");
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (fs) CHECK(discard_test::check_all(*fs, files, "after a remount"));
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   if (argc == 4 && strcmp(argv[1], "dump") == 0) return interop::run_dump(argv[2], argv[3]);
   if (argc == 5 && strcmp(argv[1], "real") == 0) return interop::run_real(argv[2], argv[3], argv[4]);
@@ -1897,6 +1924,8 @@ int main(int argc, char** argv) {
   test_namespace();
   test_namespace_random(1024, 13, "1 KiB blocks");
   test_namespace_random(2048, 12, "2 KiB blocks");
+  test_discard(1024, 13, 3, 512);
+  test_discard(2048, 12, 3, 2048);
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("befs tests passed\n");
   return 0;

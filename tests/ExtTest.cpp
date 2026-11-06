@@ -33,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "DiscardWorkload.hpp"
 #include "FileSystem/Ext/ExtFileSystem.hpp"
 
 using namespace filesystem;
@@ -59,7 +60,9 @@ struct MemDisk : hardware::IStorageDevice {
   const char* name() const override { return "memdisk"; }
   bool initialize() override { return true; }
   void shutdown() override {}
-  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; return i; }
+  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; i.discard = dc.enabled; return i; }
+  bool discard(uint64_t lba, uint64_t count) override { return dc.discard(data, blocks, block_size, lba, count); }
+  discard_test::DiscardCounters dc;
   hardware::StorageStatistics statistics() const override { return {}; }
   bool read(uint64_t lba, ByteView buffer) override {
     if (buffer.size() % block_size || lba + buffer.size() / block_size > blocks) return false;
@@ -163,12 +166,13 @@ struct Mounted {
   uint64_t lead = 0;
   uint64_t length = 0;
   ~Mounted() { fs = UniquePointer<IFileSystem>(); delete disk; }
-  Status mount(const Bytes& image, uint32_t block, bool writable, uint64_t lead_blocks = 0) {
+  Status mount(const Bytes& image, uint32_t block, bool writable, uint64_t lead_blocks = 0, bool discard = false) {
     fs = UniquePointer<IFileSystem>();
     delete disk;
     lead = lead_blocks;
     length = image.size();
     disk = new MemDisk(image.data(), image.size(), block, lead_blocks, writable);
+    disk->dc.enabled = discard;
     return ExtFileSystem::mount(alloc, *disk, lead_blocks, &fs);
   }
   Bytes image() { return Bytes(disk->data + lead * disk->block_size, disk->data + lead * disk->block_size + length); }
@@ -1339,6 +1343,26 @@ static void test_damage(const Variant& v) {
   }
 }
 
+// Freed blocks are discarded after a flush and never while in use (the disk poisons what it discards); e2fsck finds nothing wrong after;
+// with 4096-byte device blocks under 1 KiB file system blocks only wholly freed device blocks go.
+static void test_discard(const Variant& v, uint32_t device_block, uint64_t lead) {
+  Bytes image = make_image(v);
+  Mounted mt;
+  CHECK_STATUS(mt.mount(image, device_block, true, lead, true), Status::Ok);
+  if (!mt.fs) return;
+  std::vector<discard_test::Model> files;
+  CHECK(discard_test::run(*mt.fs, 77 + v.block_size + device_block, &files, 160));
+  mt.fs = UniquePointer<IFileSystem>();
+  const MemDisk& disk = *mt.disk;
+  CHECK(disk.dc.calls > 0 && disk.dc.blocks > 0 && disk.dc.refused == 0);
+  printf("  %s on %u-byte blocks: %llu discards, %llu blocks\n", v.name, device_block, (unsigned long long)disk.dc.calls, (unsigned long long)disk.dc.blocks);
+  const Bytes after = mt.image();
+  CHECK_FSCK(after);
+  Mounted again;
+  CHECK_STATUS(again.mount(after, device_block, false), Status::Ok);
+  if (again.fs) CHECK(discard_test::check_all(*again.fs, files, "after a remount"));
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   g_verbose = getenv("EXT_VERBOSE") != nullptr;
@@ -1379,6 +1403,12 @@ int main(int argc, char** argv) {
   if (want("handles")) test_handles();
   if (want("times")) for (size_t i : {size_t{0}, size_t{2}, size_t{7}, size_t{8}, size_t{10}}) test_timestamps(variants[i]);
   if (want("mount")) { test_mount_rules(); test_mount_rules_ext4(); }
+  if (want("discard")) {
+    test_discard(variants[0], 512, 0);     // ext2 1k
+    test_discard(ext3[1], 512, 63);        // ext3 4k, at an offset
+    test_discard(ext4[0], 512, 0);         // ext4 4k (extents)
+    test_discard(ext4[1], 4096, 0);        // ext4 1k on 4 KiB device blocks
+  }
   if (want("damage")) { test_damage(variants[0]); test_damage(variants[2]); test_damage(ext3[0]); for (size_t i : {0, 2, 5, 6}) test_damage(ext4[i]); }
   sh("rm -rf '" + g_work + "'");
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }

@@ -169,6 +169,27 @@ in the "other" domain:
 - virtio-blk: `VIRTIO_BLK_F_DISCARD`, one segment of at most `max_discard_sectors` a request.
 - AHCI: TRIM, as above.
 
+**File systems discard what they free.** FAT, ext, NTFS and BeFS each keep a `DiscardBatch` (`src/FileSystem/DiscardBatch.hpp`):
+
+- **What goes in.** Every range they free is recorded in device blocks, and touching ranges merge. A range allocated again before it went
+  out is cut out of the batch.
+- **When it goes out.** Only in `flush()`, after the device flush has made the freeing durable, as Linux's ext4 does with its discard
+  option. After a crash, no file still points at a discarded block, and new data is never discarded.
+- **BeFS transactions.** Its frees join the batch uncommitted. `tx_commit` commits them, and a rolled-back or abandoned transaction drops
+  them.
+- **Partial device blocks.** Frees round inward to whole device blocks, so a device block partly in use (512-byte FAT clusters on a
+  4 KiB disk) is never discarded. Reuse rounds outward. FAT hands consecutive clusters over as one run.
+- **Bounds.** At most 64 ranges; when the batch is full, the smallest is dropped (discard is only a hint). Nothing is batched on a
+  read-only volume or a device without discard. `PartitionStorageDevice` passes discards through, and `StorageStatistics` counts them.
+- **Tests.**
+  - Each file system's host test runs a workload against a memory disk that overwrites discarded blocks with a poison byte. Every live
+    file must read back exactly after each flush and after a remount, and e2fsck (ext) and the NTFS and BeFS checkers must find the
+    volume clean. Removing FAT's reuse hook makes this test fail, as it should.
+  - `DiscardBatchTest` checks merging, splitting, commit and rollback, the full-batch rule and rounding, plus a random run against a
+    block-level model.
+  - In the boot self-test, deleting 1 MiB on a scratch FAT32 virtio-blk disk (marked by `TCOSSCR.TXT`) sends one merged 2048-block
+    discard.
+
 **Polled build.** `-DTCOS_STORAGE_POLLED=ON` builds a kernel whose storage drivers never turn on completion interrupts. It is for
 machines with broken MSI, and it is how the polled paths, AHCI's included, are tested.
 
@@ -194,8 +215,11 @@ The configurations: KVM with 4, 8 and 1 cores (8 with `num-queues=3` for virtio-
     buffers are and user-mode buffers may not be.
   - A big request takes extra slots only if they are free, so on a busy device it runs mostly in series. The I/O scheduler still counts it
     as one request.
-- **Discard reaches the devices, but nothing calls it yet.** The file systems (FAT, ext, NTFS, BeFS) don't issue discard when freeing
-  blocks. virtio-scsi UNMAP is not done, and NVMe and AHCI don't report what a discarded block reads back as (DLFEAT / RZAT).
+- **Discard gaps.**
+  - Discards go out only when a file system is flushed, so a volume that is never flushed never discards.
+  - There is no `fstrim` that discards a volume's existing free space.
+  - virtio-scsi UNMAP is not done.
+  - NVMe and AHCI don't report what a discarded block reads back as (DLFEAT / RZAT).
 - **Driver features still missing.**
   - NVMe: no interrupt coalescing (left off on purpose, for latency), only the first namespace.
   - AHCI: no port multipliers.

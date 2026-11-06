@@ -94,6 +94,7 @@ Status ExtFileSystem::alloc_blocks(uint32_t goal_group, uint64_t goal_block, uin
     uint64_t length = 1;
     while (length < want && index + length < count && !bit_test(bitmap.view(), index + length)) ++length;
     for (uint64_t k = 0; k < length; ++k) bit_set(bitmap.writable_view(), index + k);
+    discard_.reused_bytes(first_block_ * device_block_size_ + (first + index) * block_size_, length * block_size_, device_block_size_);
     s = store_block_bitmap(group, bitmap);
     if (s != Status::Ok) return s;
     gd_set(group, kGdFreeBlocks, kGdFreeBlocksHi, true, gd_free_blocks(group) - length);
@@ -134,6 +135,7 @@ Status ExtFileSystem::free_blocks(uint64_t start, uint64_t count) {
     s = store_group(group);
     if (s != Status::Ok) return s;
     free_blocks_ += here;
+    discard_.freed_bytes(first_block_ * device_block_size_ + start * block_size_, here * block_size_, device_block_size_);
     start += here;
     count -= here;
   }

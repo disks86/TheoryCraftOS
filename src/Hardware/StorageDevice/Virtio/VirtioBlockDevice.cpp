@@ -326,6 +326,7 @@ bool VirtioBlockDevice::discard(uint64_t lba, uint64_t blocks) {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
+  const uint64_t requested = blocks;
   const uint32_t scale = info_.block_size / kSectorBytes;
   uint64_t sector = lba * scale, sectors = blocks * scale;
   const uint32_t limit = max_discard_sectors_ / scale * scale;   // (whole blocks)
@@ -343,7 +344,12 @@ bool VirtioBlockDevice::discard(uint64_t lba, uint64_t blocks) {
     sectors -= n;
   }
   if (!slots_[slot].completion.lost) pool_.release(slot);
-  if (!ok) __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+  if (ok) {
+    __atomic_fetch_add(&stats_.discards, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_.blocks_discarded, requested, __ATOMIC_RELAXED);
+  } else {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+  }
   return ok;
 }
 
@@ -363,6 +369,8 @@ StorageStatistics VirtioBlockDevice::statistics() const {
   s.writes = __atomic_load_n(&stats_.writes, __ATOMIC_RELAXED);
   s.blocks_read = __atomic_load_n(&stats_.blocks_read, __ATOMIC_RELAXED);
   s.blocks_written = __atomic_load_n(&stats_.blocks_written, __ATOMIC_RELAXED);
+  s.discards = __atomic_load_n(&stats_.discards, __ATOMIC_RELAXED);
+  s.blocks_discarded = __atomic_load_n(&stats_.blocks_discarded, __ATOMIC_RELAXED);
   s.errors = __atomic_load_n(&stats_.errors, __ATOMIC_RELAXED);
   return s;
 }

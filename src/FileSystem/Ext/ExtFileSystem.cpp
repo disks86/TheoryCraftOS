@@ -372,6 +372,7 @@ Status ExtFileSystem::load_volume() {
   for (uint32_t i = 0; i < 16 && sb_.view()[kSbVolumeName + i] != 0; ++i) label_.push_back(static_cast<char>(sb_.view()[kSbVolumeName + i]));
 
   decide_writable();
+  discard_.attach(&device_, writable_);
   return Status::Ok;
 }
 
@@ -988,7 +989,9 @@ Status ExtFileSystem::flush() {
     const Status s = finish_write();
     if (s != Status::Ok) return s;
   }
-  return device_.flush() ? Status::Ok : Status::IoError;
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();   // (the bitmaps that freed them are on the medium now)
+  return Status::Ok;
 }
 
 }  // namespace filesystem

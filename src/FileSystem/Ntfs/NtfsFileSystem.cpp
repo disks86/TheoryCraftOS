@@ -1459,7 +1459,9 @@ Status NtfsFileSystem::flush() {
     const Status s = finish_write();
     if (s != Status::Ok) return s;
   }
-  return device_.flush() ? Status::Ok : Status::IoError;
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();   // (the $Bitmap that freed them is on the medium now)
+  return Status::Ok;
 }
 
 }  // namespace filesystem

@@ -136,6 +136,8 @@ Status NtfsFileSystem::bitmap_scan(uint64_t from, uint64_t to, bool want_set, ui
 Status NtfsFileSystem::bitmap_update(uint64_t first, uint64_t count, bool used) {
   if (count == 0) return Status::Ok;
   if (first >= cluster_count_ || count > cluster_count_ - first) return Status::Corrupt;
+  const uint64_t volume = first_block_ * block_size_ + first * cluster_bytes_;   // (where the clusters are on the device)
+  if (used) discard_.reused_bytes(volume, count * cluster_bytes_, block_size_);
   uint8_t storage[4096];
   ByteView buffer(storage);
   uint64_t pos = first;
@@ -159,6 +161,7 @@ Status NtfsFileSystem::bitmap_update(uint64_t first, uint64_t count, bool used) 
     pos = chunk_end;
   }
   if (free_known_) free_clusters_ = used ? free_clusters_ - count : free_clusters_ + count;
+  if (!used) discard_.freed_bytes(volume, count * cluster_bytes_, block_size_);
   return Status::Ok;
 }
 

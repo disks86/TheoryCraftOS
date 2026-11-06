@@ -21,6 +21,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/Ext/ExtFormat.hpp"
 #include "FileSystem/IFileSystem.hpp"
+#include "FileSystem/DiscardBatch.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
@@ -282,6 +283,7 @@ class ExtFileSystem final : public IFileSystem {
   allocators::IAllocator& allocator_;
   hardware::IStorageDevice& device_;
   const uint64_t first_block_;
+  DiscardBatch discard_;   // freed blocks, discarded after the next flush
   mutable kernel::RecursiveMutex mutex_;
   struct OpenHandle {
     uint32_t number = 0;

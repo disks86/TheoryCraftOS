@@ -499,6 +499,7 @@ Status BefsFileSystem::init() {
       writable_ = check_bitmap() == Status::Ok;
     }
   }
+  discard_.attach(&device_, writable_);
   return Status::Ok;
 }
 
@@ -1163,12 +1164,14 @@ Status BefsFileSystem::tx_commit() {
   for (uint32_t i = 0; i < tx_count_; ++i) release_view(allocator_, tx_[i].data);
   tx_count_ = 0;
   tx_used_blocks_ = used_blocks_;
+  discard_.commit();   // what this transaction freed is free on the medium
   return Status::Ok;
 }
 
 // After a failure once the log said the transaction was there: nothing more is written to this volume until it is mounted again (and
 // its log replayed).
 void BefsFileSystem::tx_abandon() {
+  discard_.rollback();
   for (uint32_t i = 0; i < tx_count_; ++i) release_view(allocator_, tx_[i].data);
   tx_count_ = 0;
   writable_ = false;
@@ -1279,6 +1282,7 @@ Status BefsFileSystem::replay_log(bool* super_touched) {
 
 // Drops everything the transaction changed.
 void BefsFileSystem::tx_rollback() {
+  discard_.rollback();   // (what it freed is still in use)
   if (tx_.empty()) return;
   for (uint32_t i = 0; i < tx_count_; ++i) release_view(allocator_, tx_[i].data);
   tx_count_ = 0;
@@ -1426,10 +1430,13 @@ Status BefsFileSystem::set_bits(uint64_t first, uint32_t count, bool used) {
     }
     done += n;
   }
+  const uint64_t volume = first_block_ * device_block_size_ + (first << block_shift_);
   if (used) {
     used_blocks_ += count;
+    discard_.reused_bytes(volume, uint64_t{count} << block_shift_, device_block_size_);
   } else {
     used_blocks_ = count > used_blocks_ ? 0 : used_blocks_ - count;
+    discard_.freed_bytes(volume, uint64_t{count} << block_shift_, device_block_size_, false);   // (only once the transaction commits)
   }
   return Status::Ok;
 }
@@ -2426,7 +2433,10 @@ Status BefsFileSystem::create_directory(StringView path) {
 
 Status BefsFileSystem::flush() {
   kernel::ScopedRecursiveMutex lock(mutex_);
-  return writable_ && !device_.flush() ? Status::IoError : Status::Ok;
+  if (!writable_) return Status::Ok;
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();   // (the committed transactions that freed them are on the medium)
+  return Status::Ok;
 }
 
 }  // namespace filesystem

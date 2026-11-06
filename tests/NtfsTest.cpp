@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 #include <sys/stat.h>
+#include "DiscardWorkload.hpp"
 #include "FileSystem/Ntfs/NtfsFileSystem.hpp"
 
 using namespace filesystem;
@@ -58,7 +59,9 @@ struct MemDisk : hardware::IStorageDevice {
   const char* name() const override { return "memdisk"; }
   bool initialize() override { return true; }
   void shutdown() override {}
-  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; return i; }
+  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; i.discard = dc.enabled; return i; }
+  bool discard(uint64_t lba, uint64_t count) override { return dc.discard(data, blocks, block_size, lba, count); }
+  discard_test::DiscardCounters dc;
   hardware::StorageStatistics statistics() const override { return {}; }
   bool read(uint64_t lba, ByteView buffer) override {
     if (buffer.size() % block_size || lba + buffer.size() / block_size > blocks) return false;
@@ -639,9 +642,11 @@ struct Mounted {
   MemDisk* disk = nullptr;
   UniquePointer<IFileSystem> fs;
   ~Mounted() { fs = UniquePointer<IFileSystem>(); delete disk; }
-  Status mount(const Bytes& image, uint32_t block, bool writable, uint64_t lead = 0) {
+  Status mount(const Bytes& image, uint32_t block, bool writable, uint64_t lead = 0, bool discard = false) {
+    fs = UniquePointer<IFileSystem>();
     delete disk;
     disk = new MemDisk(image.data(), image.size(), block, lead, writable);
+    disk->dc.enabled = discard;
     return NtfsFileSystem::mount(alloc, *disk, lead, &fs);
   }
 };
@@ -2022,6 +2027,30 @@ static int run_dump(const char* in, const char* out) {
   return g_failed ? 1 : 0;
 }
 
+// Freed clusters are discarded after a flush and never while in use (the disk poisons what it discards); the volume stays clean.
+static void test_discard(uint32_t bps, uint32_t spc, uint32_t device_block, uint64_t lead) {
+  Opts o;
+  o.bps = bps;
+  o.spc = spc;
+  o.clusters = 4096 * 4096 / (uint64_t{bps} * spc) < 4096 ? 4096 : 4096 * 4096 / (uint64_t{bps} * spc);
+  Standard s = make_standard(o, 5);
+  Mounted m;
+  CHECK_STATUS(m.mount(s.image, device_block, true, lead, true), Status::Ok);
+  if (!m.fs) return;
+  std::vector<discard_test::Model> files;
+  CHECK(discard_test::run(*m.fs, 4242 + bps * spc + device_block, &files));
+  m.fs = UniquePointer<IFileSystem>();
+  CHECK(m.disk->dc.calls > 0 && m.disk->dc.blocks > 0 && m.disk->dc.refused == 0);
+  printf("  %u-byte clusters on %u-byte blocks: %llu discards, %llu blocks\n", bps * spc, device_block, (unsigned long long)m.disk->dc.calls,
+         (unsigned long long)m.disk->dc.blocks);
+  {
+    const MemDisk volume(m.disk->data + lead * device_block, (m.disk->blocks - lead) * device_block, device_block);   // (the checker reads from block 0)
+    EXPECT_CLEAN(volume, o.clusters);
+  }
+  CHECK_STATUS(NtfsFileSystem::mount(m.alloc, *m.disk, lead, &m.fs), Status::Ok);
+  if (m.fs) CHECK(discard_test::check_all(*m.fs, files, "after a remount"));
+}
+
 int main(int argc, char** argv) {
   if (argc == 4 && strcmp(argv[1], "dump") == 0) return run_dump(argv[2], argv[3]);
   if (argc == 5 && strcmp(argv[1], "real") == 0) return run_real(argv[2], argv[3], argv[4]);
@@ -2047,6 +2076,11 @@ int main(int argc, char** argv) {
   if (want("dos")) test_dos_names();
   if (want("failures")) test_write_failures();
   if (want("damage")) test_damage();
+  if (want("discard")) {
+    test_discard(512, 8, 512, 0);    // 4 KiB clusters
+    test_discard(4096, 1, 4096, 3);  // 4 KiB sectors and blocks, at an offset
+    test_discard(512, 8, 2048, 5);   // 4 KiB clusters on 2 KiB device blocks, at an offset (the test volumes need clusters of 4 KiB)
+  }
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("NtfsTest: all passed\n");
   return 0;

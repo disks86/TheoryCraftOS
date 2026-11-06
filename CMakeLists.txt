@@ -246,6 +246,7 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/SystemStorageDevices.cpp
   src/Hardware/StorageDevice/ScheduledStorageDevice.cpp
   src/Hardware/StorageDevice/QueuedStorage.cpp
+  src/FileSystem/DiscardBatch.cpp
   src/IoScheduler/IoCost.cpp
   src/IoScheduler/FairQueue.cpp
   src/IoScheduler/LatencyController.cpp
@@ -1327,7 +1328,7 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   set(_primary_tool ${CMAKE_BINARY_DIR}/tools/primary_image)
   file(GLOB _primary_tool_sources ${CMAKE_SOURCE_DIR}/src/FileSystem/Fat/*.cpp ${CMAKE_SOURCE_DIR}/src/FileSystem/Fat/*.hpp)
   set(_primary_tool_inputs ${CMAKE_SOURCE_DIR}/tools/PrimaryImage.cpp ${CMAKE_SOURCE_DIR}/tests/KernelStubs.cpp ${CMAKE_SOURCE_DIR}/src/Kernel/Sync.cpp
-      ${CMAKE_SOURCE_DIR}/src/FileSystem/FileSystemTypes.cpp ${_primary_tool_sources})
+      ${CMAKE_SOURCE_DIR}/src/FileSystem/FileSystemTypes.cpp ${CMAKE_SOURCE_DIR}/src/FileSystem/DiscardBatch.cpp ${_primary_tool_sources})
   list(FILTER _primary_tool_inputs EXCLUDE REGEX "\\.hpp$")
   add_custom_command(OUTPUT ${_primary_tool}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools

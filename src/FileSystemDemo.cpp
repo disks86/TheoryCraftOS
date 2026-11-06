@@ -33,6 +33,36 @@ void put_mib(uint64_t bytes) {
   console::puts(" MiB");
 }
 
+// On a scratch volume (a TCOSSCR.TXT at its root) of a device that can discard: 1 MiB written, flushed, deleted and flushed again must
+// reach the device as discards (FileSystem/DiscardBatch). The file systems' own host tests check that nothing in use is discarded.
+bool check_discard(IFileSystem& fs, IStorageDevice& volume) {
+  UniquePointer<IFile> marker;
+  if (!volume.info().discard || fs.info().read_only || fs.open_file("/TCOSSCR.TXT", OpenMode::Read, &marker) != Status::Ok) return true;
+  marker = UniquePointer<IFile>();
+  constexpr uint64_t kBytes = 1 << 20;
+  bool ok = true;
+  {
+    UniquePointer<IFile> f;
+    ok = fs.open_file("/DISCARD.TMP", OpenMode::CreateTruncate, &f) == Status::Ok;
+    uint8_t chunk[4096];
+    for (uint32_t i = 0; i < sizeof chunk; ++i) chunk[i] = static_cast<uint8_t>(i * 7);
+    uint64_t done = 0;
+    for (uint64_t at = 0; ok && at < kBytes; at += sizeof chunk) ok = f->write(at, ConstByteView(chunk), &done) == Status::Ok && done == sizeof chunk;
+  }
+  ok = ok && fs.flush() == Status::Ok;
+  const StorageStatistics before = volume.statistics();
+  ok = ok && fs.remove("/DISCARD.TMP") == Status::Ok && fs.flush() == Status::Ok;
+  const StorageStatistics after = volume.statistics();
+  const uint64_t blocks = after.blocks_discarded - before.blocks_discarded;
+  ok = ok && blocks * volume.info().block_size >= kBytes / 2;   // (most of it: clusters at the edges of a run may share a device block)
+  console::puts("      discard after deleting 1 MiB: ");
+  console::put_dec(blocks);
+  console::puts(" blocks in ");
+  console::put_dec(after.discards - before.discards);
+  console::puts(ok ? " requests: ok\n" : " requests: FAILED\n");
+  return ok;
+}
+
 // Mounts `volume` as FAT and shows what is on it. False on a device/memory failure.
 bool show_volume(IStorageDevice& volume, uint64_t first_block, bool efi_system, allocators::IAllocator& allocator) {
   UniquePointer<IFileSystem> fs;
@@ -102,6 +132,7 @@ bool show_volume(IStorageDevice& volume, uint64_t first_block, bool efi_system, 
       release_view(allocator, bytes);
     }
   }
+  if (!efi_system) ok = check_discard(*fs, volume) && ok;
   return ok;
 }
 

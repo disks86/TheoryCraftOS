@@ -295,6 +295,7 @@ Status FatFileSystem::init() {
   fat_count_ = fats;
   fat_sectors_ = fat_sectors;
   read_only_ = storage.read_only;
+  discard_.attach(&device_, !read_only_);
   root_dir_start_ = reserved + fats * fat_sectors;
   const uint32_t root_sectors = (root_entries_ * 32 + bytes_per_sector_ - 1) / bytes_per_sector_;
   data_start_ = root_dir_start_ + root_sectors;
@@ -714,7 +715,9 @@ constexpr uint8_t kDotDot11[11] = {'.', '.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', 
 
 Status FatFileSystem::flush() {
   kernel::ScopedRecursiveMutex lock(mutex_);
-  return device_.flush() ? Status::Ok : Status::IoError;
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();   // (the FAT entries that freed them are on the medium now)
+  return Status::Ok;
 }
 
 Status FatFileSystem::write_bytes(uint64_t offset, ConstByteView data) {
@@ -787,6 +790,7 @@ Status FatFileSystem::allocate_cluster(uint32_t* result, uint32_t link_from) {
     s = get_fat(c, &value);
     if (s != Status::Ok) return s;
     if (value == 0) {
+      discard_.reused_bytes(first_block_ * block_size_ + cluster_offset(c), cluster_bytes_, block_size_);
       s = set_fat(c, end_mark());
       if (s != Status::Ok) return s;
       s = zero_cluster(c);
@@ -807,18 +811,36 @@ Status FatFileSystem::allocate_cluster(uint32_t* result, uint32_t link_from) {
 
 Status FatFileSystem::free_chain(uint32_t first) {
   ++epoch_;
+  // Runs of consecutive clusters go to the discard batch whole: a cluster can be smaller than a device block, and only device blocks
+  // that are freed entirely are discarded.
+  uint32_t run_first = 0, run_length = 0;
+  auto end_run = [&] {
+    if (run_length) discard_.freed_bytes(first_block_ * block_size_ + cluster_offset(run_first), uint64_t{run_length} * cluster_bytes_, block_size_);
+    run_length = 0;
+  };
   uint32_t c = first;
   for (uint32_t hops = 0; c >= 2 && hops <= cluster_count_; ++hops) {
     uint32_t next = 0;
     bool end = false;
     const Status link = next_cluster(c, &next, &end);
     const Status s = set_fat(c, 0);
-    if (s != Status::Ok) return s;
+    if (s != Status::Ok) {
+      end_run();
+      return s;
+    }
+    if (run_length && c == run_first + run_length) {
+      ++run_length;
+    } else {
+      end_run();
+      run_first = c;
+      run_length = 1;
+    }
     if (free_known_) ++free_clusters_;
     if (alloc_hint_ > c) alloc_hint_ = c;
     if (link != Status::Ok || end) break;
     c = next;
   }
+  end_run();
   return Status::Ok;
 }
 

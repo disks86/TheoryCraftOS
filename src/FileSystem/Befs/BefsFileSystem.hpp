@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
+#include "FileSystem/DiscardBatch.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/ArrayView.hpp"
@@ -246,6 +247,7 @@ class BefsFileSystem final : public IFileSystem {
   allocators::IAllocator& allocator_;
   hardware::IStorageDevice& device_;
   const uint64_t first_block_;
+  DiscardBatch discard_;   // freed blocks: committed with their transaction, discarded after the next flush
   mutable kernel::RecursiveMutex mutex_;
 
   ByteView block_;    // one device block, cached

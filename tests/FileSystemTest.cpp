@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "DiscardWorkload.hpp"
 #include "FileSystem/Fat/FatFileSystem.hpp"
 #include "FileSystem/Path.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
@@ -296,7 +297,7 @@ struct MemDisk final : hardware::IStorageDevice {
   const char* name() const override { return "memdisk"; }
   bool initialize() override { return true; }
   void shutdown() override {}
-  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; return i; }
+  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; i.discard = dc.enabled; return i; }
   hardware::StorageStatistics statistics() const override { return {}; }
   bool read(uint64_t lba, ByteView buffer) override {
     if (buffer.size() % block_size || lba + buffer.size() / block_size > blocks) return false;
@@ -309,7 +310,9 @@ struct MemDisk final : hardware::IStorageDevice {
     return true;
   }
   bool flush() override { return true; }
+  bool discard(uint64_t lba, uint64_t count) override { return dc.discard(data, blocks, block_size, lba, count); }
   uint8_t* data; uint64_t blocks; uint32_t block_size; bool can_write;
+  discard_test::DiscardCounters dc;
 };
 
 // Builds small FAT images the way mkfs and a driver would lay them out.
@@ -928,6 +931,38 @@ static void test_links() {
   CHECK(a.live == 0);
 }
 
+// Freed clusters are discarded after a flush, never one in use again (the disk poisons what it is told to discard). With 2048-byte device
+// blocks a 512-byte cluster shares its block with others, so only blocks wholly freed may go.
+static void test_fat_discard(FatImage::Kind kind, uint32_t block, const char* label) {
+  TestAllocator a;
+  {
+    FatImage im(kind);
+    MemDisk disk(im.img, im.total * 512ull, block, true);
+    disk.dc.enabled = true;
+    std::vector<discard_test::Model> files;
+    {
+      UniquePointer<IFileSystem> fsp;
+      CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &fsp), Status::Ok);
+      if (!fsp) return;
+      CHECK(discard_test::run(*fsp, 1234 + block + static_cast<uint32_t>(kind), &files, kind == FatImage::F12 ? 40 : 96));
+    }
+    CHECK(disk.dc.calls > 0 && disk.dc.blocks > 0 && disk.dc.refused == 0);
+    UniquePointer<IFileSystem> again;
+    CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &again), Status::Ok);
+    if (again) CHECK(discard_test::check_all(*again, files, "after a remount"));
+    printf("  %s: %llu discards, %llu blocks\n", label, (unsigned long long)disk.dc.calls, (unsigned long long)disk.dc.blocks);
+  }
+  CHECK(a.live == 0);
+  // A disk without discard is left alone.
+  FatImage im(FatImage::F16);
+  MemDisk plain(im.img, im.total * 512ull, 512, true);
+  UniquePointer<IFileSystem> fsp;
+  CHECK_STATUS(FatFileSystem::mount(a, plain, 0, &fsp), Status::Ok);
+  std::vector<discard_test::Model> files;
+  if (fsp) CHECK(discard_test::run(*fsp, 99, &files));
+  CHECK(plain.dc.calls == 0 && plain.dc.refused == 0);
+}
+
 static void test_set_metadata() {
   TestAllocator a;
   {
@@ -963,6 +998,10 @@ int main() {
   test_links();
   test_set_metadata();
   test_fat_offset();
+  test_fat_discard(FatImage::F12, 512, "FAT12 discard");
+  test_fat_discard(FatImage::F16, 512, "FAT16 discard");
+  test_fat_discard(FatImage::F32, 512, "FAT32 discard");
+  test_fat_discard(FatImage::F16, 2048, "FAT16/2048 discard");
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("filesystem tests passed\n");
   return 0;

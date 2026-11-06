@@ -62,6 +62,12 @@ class PartitionStorageDevice final : public IStorageDevice {
     return true;
   }
   bool flush() override { return parent_.flush(); }
+  bool discard(uint64_t lba, uint64_t blocks) override {
+    if (blocks == 0 || lba > count_ || blocks > count_ - lba || !parent_.discard(first_ + lba, blocks)) return fail();
+    ++stats_.discards;
+    stats_.blocks_discarded += blocks;
+    return true;
+  }
 
  private:
   bool in_range(uint64_t lba, uint64_t bytes) const {
