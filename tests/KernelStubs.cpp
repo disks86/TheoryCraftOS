@@ -40,6 +40,7 @@ void unregister_io_device(int32_t) {}
 bool set_device_interrupt_handler(Vector, int32_t, InterruptHandler, void*) { return false; }
 void set_interrupt_handler(Vector, InterruptHandler, void*) {}
 namespace apic { void eoi() {} }
+void set_thread_io_priority(Thread*, uint8_t, uint16_t) {}
 bool join(Thread*, uint64_t) { return true; }
 void detach(Thread*) {}
 namespace detail {

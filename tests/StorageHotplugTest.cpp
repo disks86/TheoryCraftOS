@@ -159,9 +159,10 @@ static void test_yank_in_the_middle() {
     CHECK(storage.poll(&e) && e.kind == StorageEvent::Kind::Added);
     Bytes big(512 * 100);
     int ok = 0, failed = 0;
-    for (int i = 0; i < 20; ++i) (e.device->read(0, ByteView(big.data(), big.size())) ? ok : failed)++;
+    // (A different region each time: the block cache would answer a repeat without asking the stick.)
+    for (int i = 0; i < 20; ++i) (e.device->read(static_cast<uint64_t>(i) * 100, ByteView(big.data(), big.size())) ? ok : failed)++;
     CHECK(failed > 0 && ok < 20);   // the stick vanished part way
-    CHECK(!e.device->present() || !e.device->read(0, ByteView(big.data(), 512)));
+    CHECK(!e.device->present() || !e.device->read(2500, ByteView(big.data(), 512)));
     CHECK(storage.poll(&e) && e.kind == StorageEvent::Kind::Removed);
     CHECK(!e.device->present() && storage.count() == 0);
     storage.shutdown();

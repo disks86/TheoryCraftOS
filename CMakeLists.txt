@@ -255,6 +255,8 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/StorageDeviceBase.cpp
   src/Hardware/StorageDevice/SystemStorageDevices.cpp
   src/Hardware/StorageDevice/ScheduledStorageDevice.cpp
+  src/Hardware/StorageDevice/CachedStorageDevice.cpp
+  src/BlockCache/ArcShard.cpp
   src/Hardware/StorageDevice/QueuedStorage.cpp
   src/FileSystem/DiscardBatch.cpp
   src/FileSystem/TrimSchedule.cpp

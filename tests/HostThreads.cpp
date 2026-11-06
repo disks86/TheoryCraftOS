@@ -166,6 +166,18 @@ bool Event::wait(uint64_t timeout_us) {
   }
 }
 
+// (Wakes after a nap whether notified or not: callers recheck their condition, as they must anyway.)
+bool ConditionVariable::wait(Mutex& mutex, uint64_t) {
+  mutex.unlock();
+  nap();
+  mutex.lock();
+  return true;
+}
+void ConditionVariable::notify_one() {}
+void ConditionVariable::notify_all() {}
+
+void set_thread_io_priority(Thread*, uint8_t, uint16_t) {}
+
 }  // namespace kernel
 
 namespace hardware {

@@ -30,8 +30,8 @@ namespace filesystem {
 
 // FAT12, FAT16 and FAT32 volumes - enough to read and write the EFI System Partition, removable media and data disks. Long file names
 // are understood (shown as UTF-8) and created when a name does not fit 8.3 (with a "~N" alias); a file can be opened by its long name,
-// not by its 8.3 alias. Names are case insensitive (ASCII). Writing goes straight to the device (no write-back cache here; flush() asks
-// the device to commit its own). A volume on a read-only device, a read-only file and anything else that cannot be written return
+// not by its 8.3 alias. Names are case insensitive (ASCII). Writing goes straight to the device (the block cache in front of it, docs/BlockCache.md,
+// keeps it; flush() asks it and the device to commit). A volume on a read-only device, a read-only file and anything else that cannot be written return
 // ReadOnly. Files are at most 4 GiB - 1. Time stamps are not kept up to date (no clock here): new entries get 1980-01-01.
 //
 // The volume starts at block `first_block` of the device (0 for a bare

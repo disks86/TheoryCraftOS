@@ -171,6 +171,25 @@ void storage_read_main(void* argument) {
   }
 }
 
+// Cold reads: 64 KiB at a time from places nobody read before, so each one misses the block cache and goes to the device (several at once
+// where it has a deep queue).
+struct ColdReadJob {
+  hardware::IStorageDevice* device;
+  StartGate* gate;
+  uint64_t first_block;   // this thread's first read; the next ones follow, `stride` blocks apart
+  uint64_t stride;
+  uint32_t rounds;
+  bool ok;
+  ByteView scratch;
+};
+
+void storage_cold_read_main(void* argument) {
+  ColdReadJob* job = static_cast<ColdReadJob*>(argument);
+  job->gate->go.wait();
+  job->ok = true;
+  for (uint32_t i = 0; i < job->rounds && job->ok; ++i) job->ok = job->device->read(job->first_block + i * job->stride, job->scratch);
+}
+
 // Writers each own a disjoint region at the end of the device.
 struct WriteJob {
   hardware::IStorageDevice* device;
@@ -201,12 +220,14 @@ void storage_write_main(void* argument) {
 // Prints a device's properties (its driver's, then its I/O scheduler's) indented, and keeps the "Peak in flight" number.
 struct PropertyPrinter final : hardware::IPropertySink {
   uint64_t peak = 0;
+  bool interrupts = false;   // "Completions" names an interrupt
   void add(StringView name, StringView value) override {
     console::puts("      ");
     console::puts(name);
     console::puts(": ");
     console::puts(value);
     console::puts("\n");
+    if (name == StringView("Completions")) interrupts = value.find(StringView("interrupt")) != StringView::npos;
     if (name == StringView("Peak in flight")) {
       peak = 0;
       for (char c : value) peak = peak * 10 + static_cast<uint64_t>(c - '0');
@@ -377,8 +398,53 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     console::puts(" scratch devices\n");
   }
   if (zeroed_devices) ok &= report("storage: blocks zeroed by the device read back as zeros", zero_ok);
+  // The block cache: the reference blocks were all read before, so reading them again must not reach the driver.
+  for (uint32_t d = 0; d < devices; ++d) {
+    hardware::IStorageDevice* dev = storage.at(d);
+    const hardware::StorageInfo info = dev->info();
+    if (info.kind != hardware::StorageKind::Disk || info.block_count < 64) continue;
+    ByteView memory = allocate_view<uint8_t>(allocator, uint64_t{32} * info.block_size);
+    if (memory.empty()) break;
+    bool good = dev->read(0, memory);
+    const uint64_t before = dev->statistics().reads;
+    good = good && dev->read(0, memory) && dev->read(16, memory.first(uint64_t{16} * info.block_size));
+    release_view(allocator, memory);
+    ok &= report("storage: repeated reads come from the block cache", good && dev->statistics().reads == before);
+    break;
+  }
+  // Cold reads on the devices with a deep queue (the earlier readers mostly hit the cache): 12 threads, each 16 reads of 64 KiB nobody read
+  // before, from the second quarter of the device.
+  {
+    constexpr uint32_t kColdThreads = 12, kColdRounds = 16;
+    ColdReadJob cold[kMaxDevices * kColdThreads];
+    Thread* cold_threads[kMaxDevices * kColdThreads] = {};
+    StartGate cold_gate;
+    uint32_t cold_count = 0;
+    for (uint32_t d = 0; d < devices; ++d) {
+      hardware::IStorageDevice* dev = storage.at(d);
+      const hardware::StorageInfo info = dev->info();
+      if (!references[d].valid || info.queue_depth <= 1) continue;
+      const uint64_t chunk = 65536 / info.block_size;
+      const uint64_t base = info.block_count / 4;
+      if (base + chunk * kColdThreads * kColdRounds > info.block_count / 2) continue;
+      for (uint32_t t = 0; t < kColdThreads; ++t) {
+        ColdReadJob& job = cold[cold_count];
+        job = {dev, &cold_gate, base + chunk * t, chunk * kColdThreads, kColdRounds, false, allocate_view<uint8_t>(allocator, 65536)};
+        cold_threads[cold_count] = !job.scratch.empty() ? spawn(storage_cold_read_main, &job, "cold reads") : nullptr;
+        ++cold_count;
+      }
+    }
+    cold_gate.go.set();
+    bool cold_ok = true;
+    for (uint32_t j = 0; j < cold_count; ++j) {
+      cold_ok &= cold_threads[j] && join(cold_threads[j], 60000000) && cold[j].ok;
+      release_view(allocator, cold[j].scratch);
+    }
+    if (cold_count) ok &= report("storage: cold reads on devices with a deep queue", cold_ok);
+  }
   // Devices with a deep queue: what the driver and the scheduler saw. Several readers at once must have had several requests on the device.
   bool deep = false, overlapped = true;
+  const bool single_core = __builtin_popcountll(kernel::online_core_mask()) == 1;
   for (uint32_t d = 0; d < devices; ++d) {
     hardware::IStorageDevice* dev = storage.at(d);
     if (!references[d].valid || dev->info().queue_depth <= 1) continue;
@@ -389,7 +455,8 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     console::puts(":\n");
     PropertyPrinter printer;
     dev->describe(printer);
-    overlapped &= printer.peak > 1;
+    // On one core a device that is polled (USB) finishes a request before its thread lets another one run: it cannot overlap there.
+    overlapped &= printer.peak > 1 || (single_core && !printer.interrupts);
   }
   if (deep) ok &= report("storage: requests overlap on devices with a deep queue", overlapped);
   return ok;

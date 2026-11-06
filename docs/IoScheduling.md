@@ -5,6 +5,9 @@ Every storage device the system finds gets an I/O scheduler in front of it (`har
 hold at once. Its model is BFQ's: per-issuer queues, B-WF2Q+ weighted fairness, and weight raising for interactive programs. It is reworked for
 NVMe and SATA flash, machines with many cores, and low latency.
 
+The block cache ([BlockCache.md](BlockCache.md)) sits in front of it, so reads it answers and writes it absorbs never get here; what
+does come is misses, coalesced writeback runs, flushes and discards.
+
 | File | What it holds |
 |---|---|
 | `src/IoScheduler/IoTypes.hpp`, `IoCost.cpp` | classes, weights, domains, media kinds, the cost model |

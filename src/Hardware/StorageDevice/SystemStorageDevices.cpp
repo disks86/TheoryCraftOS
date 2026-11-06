@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
+#include "Hardware/StorageDevice/CachedStorageDevice.hpp"
 #include "Hardware/StorageDevice/ScheduledStorageDevice.hpp"
 #include "Hardware/StorageDevice/Ahci/AhciStorageDevice.hpp"
 #include "Hardware/StorageDevice/Ide/IdeStorageDevice.hpp"
@@ -106,6 +107,9 @@ void SystemStorageDevices::adopt(List<UniquePointer<IStorageDevice>>& found, boo
     // Every device gets an I/O scheduler in front (without memory for one it is used as it is).
     UniquePointer<ScheduledStorageDevice> scheduled = UniquePointer<ScheduledStorageDevice>::make(allocator_, allocator_);
     if (scheduled && scheduled->attach(found[i])) found[i] = UniquePointer<IStorageDevice>(util::move(scheduled));
+    // ... and the block cache in front of that (docs/BlockCache.md), for disks: without memory for it, or for an optical drive, none.
+    UniquePointer<CachedStorageDevice> cached = UniquePointer<CachedStorageDevice>::make(allocator_, allocator_);
+    if (cached && cached->attach(found[i])) found[i] = UniquePointer<IStorageDevice>(util::move(cached));
     Entry entry;
     entry.device = SharedPointer<IStorageDevice>::from(util::move(found[i]));
     if (!entry.device) continue;   // (out of memory: the device is dropped with the list)
