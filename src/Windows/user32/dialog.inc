@@ -402,31 +402,42 @@ EXPORT BOOL WINAPI EndDialog(HANDLE hwnd, LONG_PTR result) {
   if (!info) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
   info->ended = TRUE;
   info->result = result;
+  /* the owner (or, for a child dialog, the parent: possibly a new one) is enabled again; the end of the modal loop does not do it */
+  HANDLE owner = (GetWindowLongW(hwnd, -16) & 0x40000000 /* WS_CHILD */) ? GetParent(hwnd) : GetWindow(hwnd, 4 /* GW_OWNER */);
+  if (owner && IsWindow(owner)) EnableWindow(owner, TRUE);
   ShowWindow(hwnd, 0);
   PostMessageW(hwnd, 0 /* WM_NULL: wakes the loop */, 0, 0);
   return TRUE;
 }
-/* The modal loop: the owner is disabled, messages go through IsDialogMessage until EndDialog; the answer is EndDialog's, -1 when the dialog could not be made. */
+/* The modal loop: the owner is disabled (a child window given as owner stands for its nearest ancestor that is not a child), messages go through IsDialogMessage until EndDialog, WM_QUIT or the
+ * destruction of the dialog; WM_ENTERIDLE tells the owner once whenever no input is waiting. The answer is EndDialog's (1 when the loop ended otherwise, WM_QUIT included), -1 when the dialog could not be made. */
 static LONG_PTR dialog_run(HANDLE instance, const void *tmpl, HANDLE owner, DlgProc_ proc, LONG_PTR param, BOOL ansi) {
   if (!tmpl) return -1;
-  const BOOL owner_was_enabled = owner && IsWindowEnabled(owner);
-  if (owner_was_enabled) EnableWindow(owner, FALSE);
+  while (owner && IsWindow(owner) && (GetWindowLongW(owner, -16) & 0x40000000)) owner = GetParent(owner);
+  if (owner && IsWindowEnabled(owner)) EnableWindow(owner, FALSE);
   const DWORD style = *(const WORD *)tmpl == 1 ? *(const DWORD *)((const WORD *)tmpl + 6) : *(const DWORD *)tmpl;
   HANDLE dlg = dialog_create(instance, tmpl, owner, proc, param, ansi);
-  if (!dlg) { if (owner_was_enabled) EnableWindow(owner, TRUE); return -1; }
+  if (!dlg) { if (owner && IsWindow(owner)) EnableWindow(owner, TRUE); return -1; }
   if (!(style & WS_VISIBLE_)) ShowWindow(dlg, 5);
-  LONG_PTR result = 0;
+  LONG_PTR result = 1;
   DialogInfo *info = dialog_info(dlg);
   MSG_ msg;
+  BOOL idle_sent = FALSE;
   while (info && !info->ended && IsWindow(dlg)) {
+    if (!idle_sent && !PeekMessageW(&msg, NULL, 0, 0, 0 /* PM_NOREMOVE */)) {
+      idle_sent = TRUE;
+      if (owner && IsWindow(owner)) SendMessageW(owner, 0x121 /* WM_ENTERIDLE */, 0 /* MSGF_DIALOGBOX */, (LONG_PTR)dlg);
+      info = IsWindow(dlg) ? dialog_info(dlg) : NULL;
+      continue;
+    }
+    idle_sent = FALSE;
     const int got = GetMessageW(&msg, NULL, 0, 0);
-    if (got == 0) { PostQuitMessage((int)msg.wparam); break; }      /* (the quit is for the loop that owns the thread) */
+    if (got == 0) { PostQuitMessage((int)msg.wparam); info = NULL; break; }      /* WM_QUIT ends the dialog (answer 1) and is posted again for the loop that owns the thread */
     if (got < 0) break;
     if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     info = IsWindow(dlg) ? dialog_info(dlg) : NULL;
   }
   if (info) result = info->result;
-  if (owner_was_enabled) EnableWindow(owner, TRUE);
   if (owner && IsWindow(owner) && GetActiveWindow() == dlg) SetActiveWindow(owner);
   if (IsWindow(dlg)) DestroyWindow(dlg);
   return result;

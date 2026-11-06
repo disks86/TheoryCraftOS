@@ -107,6 +107,7 @@ SVC NtUserRemoveProp(ULONG_PTR hwnd, ULONG_PTR name);
 IMPORT int WINAPI MultiByteToWideChar(UINT code_page, DWORD flags, LPCSTR source, int source_length, LPWSTR destination, int destination_length);
 IMPORT int WINAPI WideCharToMultiByte(UINT code_page, DWORD flags, LPCWSTR source, int source_length, LPSTR destination, int destination_length, LPCSTR default_char, LPBOOL used_default);
 IMPORT HANDLE WINAPI GetModuleHandleW(LPCWSTR name);
+IMPORT BOOL WINAPI IsBadWritePtr(void *p, SIZE_T length);
 IMPORT HANDLE WINAPI GlobalAlloc(UINT flags, SIZE_T bytes);
 IMPORT HANDLE WINAPI GlobalFree(HANDLE memory);
 IMPORT void *WINAPI GlobalLock(HANDLE memory);
@@ -388,6 +389,7 @@ EXPORT int WINAPI GetWindowTextA(HANDLE hwnd, LPSTR buffer, int count);
 EXPORT int WINAPI GetSystemMetrics(int index);
 EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect);
 EXPORT BOOL WINAPI EnableWindow(HANDLE hwnd, BOOL enable);
+EXPORT BOOL WINAPI PeekMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last, UINT flags);
 EXPORT BOOL WINAPI DestroyWindow(HANDLE hwnd);
 EXPORT HANDLE WINAPI CreateWindowExW(DWORD ex_style, const WCHAR *class_name, const WCHAR *title, DWORD style, int x, int y, int cx, int cy, HANDLE parent, HANDLE menu, HANDLE instance, void *params);
 EXPORT BOOL WINAPI SetWindowPos(HANDLE hwnd, HANDLE after, int x, int y, int cx, int cy, UINT flags);
@@ -615,8 +617,11 @@ EXPORT HANDLE WINAPI GetWindow(HANDLE hwnd, UINT relation) { return (HANDLE)NtUs
 EXPORT HANDLE WINAPI GetTopWindow(HANDLE hwnd) { return GetWindow(hwnd ? hwnd : GetDesktopWindow(), 5 /* GW_CHILD */); }
 EXPORT BOOL WINAPI IsChild(HANDLE parent, HANDLE hwnd) { return (NtUserCallHwndParam((ULONG_PTR)parent, (ULONG_PTR)hwnd, CHP_IS_CHILD) & 0xFFFFFFFFu) != 0; }
 EXPORT DWORD WINAPI GetWindowThreadProcessId(HANDLE hwnd, LPDWORD process) { return (DWORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)process, CHP_GET_WINDOW_THREAD); }
-EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index) { return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_W); }
+/* On 64 bits the 32-bit functions cannot hold a pointer: the window procedure, the instance and the parent are refused */
+static BOOL long_index_is_pointer(int index) { if (index == -4 || index == -6 || index == -8) { SetLastError(1413 /* ERROR_INVALID_INDEX */); return TRUE; } return FALSE; }
+EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index) { if (long_index_is_pointer(index)) return 0; return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_W); }
 EXPORT LONG WINAPI GetWindowLongA(HANDLE hwnd, int index) {
+  if (long_index_is_pointer(index)) return 0;
   const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_A);
   return (LONG)(index == -4 /* GWL_WNDPROC */ ? ansi_unwrap(v) : v);
 }
@@ -625,19 +630,35 @@ EXPORT LONG_PTR WINAPI GetWindowLongPtrA(HANDLE hwnd, int index) {
   const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_A);
   return (LONG_PTR)((index == -4 || index == 8 /* DWLP_DLGPROC */) ? ansi_unwrap(v) : v);
 }
-EXPORT WORD WINAPI GetWindowWord(HANDLE hwnd, int index) { return (WORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_WORD); }
-EXPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value) { return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0); }
-EXPORT LONG WINAPI SetWindowLongA(HANDLE hwnd, int index, LONG value) {
-  const ULONG_PTR in = index == -4 ? (ULONG_PTR)ansi_wrap((WNDPROC_)(ULONG_PTR)(DWORD)value) : (ULONG_PTR)(DWORD)value;
-  return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0);
+EXPORT WORD WINAPI GetWindowWord(HANDLE hwnd, int index) { if (long_index_is_pointer(index)) return 0; return (WORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_WORD); }
+/* A window that becomes or stops being layered is drawn again, children included */
+static void layered_redraw(HANDLE hwnd, int index, LONG old_style, LONG value) {
+  if (index != -20 /* GWL_EXSTYLE */ || !((old_style ^ value) & 0x80000)) return;
+  InvalidateRect(hwnd, NULL, TRUE);
+  for (HANDLE c = GetWindow(hwnd, 5); c; c = GetWindow(c, 2)) InvalidateRect(c, NULL, TRUE);
 }
-EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value) { return (LONG_PTR)NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 0); }
+EXPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value) {
+  if (long_index_is_pointer(index)) return 0;
+  const LONG old_style = index == -20 ? GetWindowLongW(hwnd, -20) : 0;
+  const LONG r = (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0);
+  layered_redraw(hwnd, index, old_style, (LONG)value);
+  return r;
+}
+EXPORT LONG WINAPI SetWindowLongA(HANDLE hwnd, int index, LONG value) {
+  if (long_index_is_pointer(index)) return 0;
+  const LONG old_style = index == -20 ? GetWindowLongW(hwnd, -20) : 0;
+  const LONG r = (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0);
+  layered_redraw(hwnd, index, old_style, (LONG)value);
+  return r;
+}
+EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value) { if (index == -4 && value == 0 && IsWindow(hwnd)) return GetWindowLongPtrW(hwnd, index); return (LONG_PTR)NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 0); }
 EXPORT LONG_PTR WINAPI SetWindowLongPtrA(HANDLE hwnd, int index, LONG_PTR value) {
+  if (index == -4 && value == 0 && IsWindow(hwnd)) return GetWindowLongPtrA(hwnd, index);
   const ULONG_PTR in = index == -4 ? (ULONG_PTR)ansi_wrap((WNDPROC_)value) : (ULONG_PTR)value;
   const ULONG_PTR old = NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0);
   return (LONG_PTR)(index == -4 ? ansi_unwrap(old) : old);
 }
-EXPORT WORD WINAPI SetWindowWord(HANDLE hwnd, int index, WORD value) { return (WORD)NtUserSetWindowWord((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, value); }
+EXPORT WORD WINAPI SetWindowWord(HANDLE hwnd, int index, WORD value) { if (long_index_is_pointer(index)) return 0; return (WORD)NtUserSetWindowWord((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, value); }
 EXPORT BOOL WINAPI ClientToScreen(HANDLE hwnd, POINT_ *p) { return p && (NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)p, CHP_CLIENT_TO_SCREEN) & 0xFFFFFFFFu) != 0; }
 EXPORT BOOL WINAPI ScreenToClient(HANDLE hwnd, POINT_ *p) { return p && (NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)p, CHP_SCREEN_TO_CLIENT) & 0xFFFFFFFFu) != 0; }
 EXPORT int WINAPI MapWindowPoints(HANDLE from, HANDLE to, POINT_ *points, UINT count) {
@@ -668,12 +689,12 @@ EXPORT HANDLE WINAPI FindWindowA(const char *class_name, const char *title) { re
 EXPORT int WINAPI GetWindowTextLengthW(HANDLE hwnd) { return (int)SendMessageW(hwnd, 0x000E /* WM_GETTEXTLENGTH */, 0, 0); }
 EXPORT int WINAPI GetWindowTextLengthA(HANDLE hwnd) { return (int)SendMessageA(hwnd, 0x000E, 0, 0); }
 EXPORT int WINAPI GetWindowTextW(HANDLE hwnd, LPWSTR buffer, int count) {
-  if (!buffer || count <= 0) return 0;
+  if (!buffer || count <= 0 || IsBadWritePtr(buffer, 2)) return 0;
   buffer[0] = 0;
   return (int)SendMessageW(hwnd, 0x000D /* WM_GETTEXT */, (ULONG_PTR)count, (LONG_PTR)buffer);
 }
 EXPORT int WINAPI GetWindowTextA(HANDLE hwnd, LPSTR buffer, int count) {
-  if (!buffer || count <= 0) return 0;
+  if (!buffer || count <= 0 || IsBadWritePtr(buffer, 1)) return 0;
   buffer[0] = 0;
   return (int)SendMessageA(hwnd, 0x000D, (ULONG_PTR)count, (LONG_PTR)buffer);
 }
