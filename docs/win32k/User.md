@@ -24,7 +24,8 @@ Files: `src/Process/Win32k/Win32kUser*.cpp` (state, classes, windows, geometry, 
 * DefWindowProc in the kernel: text messages, NCCREATE, NCCALCSIZE, NCHITTEST, WINDOWPOSCHANGED (-> WM_MOVE/WM_SIZE), NCACTIVATE, ACTIVATE (-> focus), SETREDRAW,
   MOUSEACTIVATE, PAINT, CLOSE (-> DestroyWindow), SYSCOMMAND (close/minimize/maximize/restore).
 * Input: focus, activation, foreground, capture, AttachThreadInput (shared input state), GetThreadState, GetGUIThreadInfo, key state (GetKeyState, GetAsyncKeyState,
-  Get/SetKeyboardState), cursor position and ClipCursor, hot keys, caret, TrackMouseEvent (WM_MOUSELEAVE), SendInput; `user::inject_*` for the machine's keyboard/mouse (hot keys,
+  Get/SetKeyboardState), cursor position and ClipCursor, hot keys, caret, TrackMouseEvent (WM_MOUSELEAVE), SendInput; raw input (each event, also SendInput's, goes to
+  `user_misc::raw_input_event` as RAWMOUSE / RAWKEYBOARD, which posts WM_INPUT; RIDEV_NOLEGACY drops the legacy messages); `user::inject_*` for the machine's keyboard/mouse (hot keys,
   system keys, auto repeat, double clicks, click activation, hit test -> WM_NCMOUSEMOVE, wheel), `user::pump`.
 * Hooks: SetWindowsHookEx, UnhookWindowsHookEx, UnhookWindowsHook, CallNextHookEx, CallMsgFilter (WH_MSGFILTER, WH_SYSMSGFILTER), WinEvent hooks (out of context).
 * Stations: Create/Open/Close window station, Get/SetProcessWindowStation, CreateDesktopEx, OpenDesktop, OpenInputDesktop, CloseDesktop, SwitchDesktop, Get/SetThreadDesktop,

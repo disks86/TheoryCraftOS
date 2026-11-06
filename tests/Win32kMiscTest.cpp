@@ -38,6 +38,7 @@ std::vector<FakeWindow> g_windows;
 std::vector<Posted> g_posted;
 int32_t g_cursor_x = 0, g_cursor_y = 0;
 uint32_t g_focus = 0;
+uint32_t g_foreground = 0;      // (the foreground window: raw input goes to its process)
 
 struct FakeBitmap { uint32_t id; int32_t w, h; std::vector<uint32_t> pixels; };
 std::vector<FakeBitmap> g_bitmaps;
@@ -82,12 +83,14 @@ __attribute__((weak)) bool window_screen_rect(uint32_t hwnd, gdi::Rect* rect) {
 }
 __attribute__((weak)) uint32_t desktop_window() { return 0x10010; }
 __attribute__((weak)) uint32_t focus_window() { return g_focus; }
+__attribute__((weak)) uint32_t foreground_window() { return g_foreground; }
 __attribute__((weak)) bool post_message(uint32_t hwnd, uint32_t message, uint64_t wparam, uint64_t lparam) {
   if (!find_window(hwnd)) return false;
   g_posted.push_back(Posted{hwnd, message, wparam, lparam});
   return true;
 }
 __attribute__((weak)) void inject_mouse_move(int32_t x, int32_t y) { g_cursor_x = x; g_cursor_y = y; }
+__attribute__((weak)) void set_cursor_position(int32_t x, int32_t y) { g_cursor_x = x; g_cursor_y = y; }
 __attribute__((weak)) void cursor_position(int32_t* x, int32_t* y) { *x = g_cursor_x; *y = g_cursor_y; }
 __attribute__((weak)) bool adjust_window_rect(gdi::Rect* rect, uint32_t style, uint32_t, bool has_menu, uint32_t) {
   rect->left -= 8;
@@ -1192,6 +1195,74 @@ void put_rid(FakeMemory& m, uint64_t a, uint16_t page, uint16_t usage, uint32_t 
   m.put16(a, page); m.put16(a + 2, usage); m.put32(a + 4, flags); m.put64(a + 8, hwnd);
 }
 
+// WM_INPUT: who gets a record and where the message goes (the window manager reports the events; here they are reported directly)
+const Posted* posted_input(uint32_t hwnd) {
+  for (const Posted& m : g_posted) if (m.hwnd == hwnd && m.message == 0xFF) return &m;
+  return nullptr;
+}
+
+void test_raw_input_dispatch() {
+  Program fg(180), sink(181), exsink(182), nolegacy(183);
+  setup(fg); setup(sink); setup(exsink); setup(nolegacy);
+  new_window(0x61001, 180); new_window(0x61002, 180); new_window(0x61101, 181); new_window(0x61201, 182); new_window(0x61301, 183);
+  g_foreground = 0x61001;
+  g_focus = 0x61002;
+  // the foreground process: the whole generic desktop page, but not the keyboard
+  put_rid(fg.memory, kA, 1, 0, 0x20, 0);           // RIDEV_PAGEONLY
+  put_rid(fg.memory, kA + 16, 1, 6, 0x10, 0);      // RIDEV_EXCLUDE
+  CHECK(fg.call(N::NtUserRegisterRawInputDevices, kA, 2, 16) == 1);
+  put_rid(sink.memory, kA, 1, 2, 0x100, 0x61101);  // RIDEV_INPUTSINK, mouse and keyboard
+  put_rid(sink.memory, kA + 16, 1, 6, 0x100, 0x61101);
+  CHECK(sink.call(N::NtUserRegisterRawInputDevices, kA, 2, 16) == 1);
+  put_rid(exsink.memory, kA, 1, 6, 0x1000, 0x61201);   // RIDEV_EXINPUTSINK, keyboard
+  CHECK(exsink.call(N::NtUserRegisterRawInputDevices, kA, 1, 16) == 1);
+  put_rid(nolegacy.memory, kA, 1, 2, 0x30, 0);     // RIDEV_NOLEGACY, mouse
+  CHECK(nolegacy.call(N::NtUserRegisterRawInputDevices, kA, 1, 16) == 1);
+  CHECK(user_misc::raw_input_no_legacy(183, 0) && !user_misc::raw_input_no_legacy(183, 1) && !user_misc::raw_input_no_legacy(180, 0));
+
+  // a mouse event of the machine: the foreground process at its focus window (RIM_INPUT), the sink at its window (RIM_INPUTSINK); not the others
+  uint8_t mouse[24] = {};
+  mouse[4] = 1;      // RI_MOUSE_LEFT_BUTTON_DOWN
+  mouse[12] = 7; mouse[16] = 0xFD;      // lLastX 7, lLastY -3
+  mouse[17] = mouse[18] = mouse[19] = 0xFF;
+  g_posted.clear();
+  { Locked lock; user_misc::raw_input_event(0, false, ConstByteView(mouse, 24)); }
+  const Posted* to_fg = posted_input(0x61002);
+  const Posted* to_sink = posted_input(0x61101);
+  CHECK(to_fg && to_fg->wparam == 0 && to_sink && to_sink->wparam == 1 && !posted_input(0x61201) && !posted_input(0x61301) && g_posted.size() == 2);
+  if (to_fg) {
+    fg.memory.put32(kC, 0x100);
+    CHECK(fg.call(N::NtUserGetRawInputData, to_fg->lparam, 0x10000003, kD, kC, 24) == 48);
+    CHECK(fg.memory.get32(kD) == 0 && fg.memory.get64(kD + 8) == 0x10001 && fg.memory.get64(kD + 16) == 0);      // RIM_TYPEMOUSE, the mouse, RIM_INPUT
+    CHECK(fg.memory.get16(kD + 24 + 4) == 1 && int32_t(fg.memory.get32(kD + 24 + 12)) == 7 && int32_t(fg.memory.get32(kD + 24 + 16)) == -3);
+    CHECK(sink.call32(N::NtUserGetRawInputData, to_fg->lparam, 0x10000003, kD, kC, 24) == 0xFFFFFFFFu);      // (each process reads its own record only)
+  }
+  // a keyboard event from SendInput: the foreground process excludes the keyboard, so the sink and the EXINPUTSINK window get it; the record names no device
+  uint8_t key[16] = {};
+  key[0] = 0x1E; key[6] = 'A'; key[8] = 0x00; key[9] = 0x01;      // MakeCode, VKey, WM_KEYDOWN
+  g_posted.clear();
+  { Locked lock; user_misc::raw_input_event(1, true, ConstByteView(key, 16)); }
+  const Posted* to_ex = posted_input(0x61201);
+  CHECK(posted_input(0x61101) && to_ex && to_ex->wparam == 1 && !posted_input(0x61002) && g_posted.size() == 2);
+  if (to_ex) {
+    exsink.memory.put32(kC, 0x100);
+    CHECK(exsink.call(N::NtUserGetRawInputData, to_ex->lparam, 0x10000003, kD, kC, 24) == 40 && exsink.memory.get32(kD) == 1 && exsink.memory.get64(kD + 8) == 0);
+    CHECK(exsink.memory.get16(kD + 24) == 0x1E && exsink.memory.get16(kD + 24 + 6) == 'A' && exsink.memory.get32(kD + 24 + 8) == 0x100);
+  }
+  // another foreground process with no focus window of its own: its window gets it
+  g_foreground = 0x61301;
+  g_posted.clear();
+  { Locked lock; user_misc::raw_input_event(0, false, ConstByteView(mouse, 24)); }
+  const Posted* to_nolegacy = posted_input(0x61301);
+  CHECK(to_nolegacy && to_nolegacy->wparam == 0 && posted_input(0x61101) && !posted_input(0x61002));
+  // nothing registered for the keyboard but the sinks: EXINPUTSINK takes it when the foreground process does not
+  g_posted.clear();
+  { Locked lock; user_misc::raw_input_event(1, false, ConstByteView(key, 16)); }
+  CHECK(posted_input(0x61201) && posted_input(0x61101) && !posted_input(0x61301));
+  g_foreground = 0;
+  g_focus = 0;
+}
+
 void test_input() {
   Program p(170);
   setup(p);
@@ -1518,6 +1589,7 @@ int main() {
   test_monitors();
   test_keyboard();
   test_input();
+  test_raw_input_dispatch();
   test_shell_and_calls();
   test_dwm();
   return finish("Win32kMiscTest");
