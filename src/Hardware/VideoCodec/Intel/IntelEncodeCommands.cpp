@@ -85,13 +85,14 @@ void mfx_surface(DwordWriter& w, uint32_t id, uint32_t width, uint32_t height, c
   c.emit(w);
 }
 
-// The three VDEnc surface state commands share their body (VDENC_Surface_State_Fields: dwords 2..5 of the command).
+// The three VDEnc surface state commands share their body (VDENC_Surface_State_Fields: dwords 2..5 of the command). Before Xe-LP the format is in bits 28 .. 31 behind an
+// "interleave chroma" bit 27; Xe-LP's definition (and every later one) has a five-bit format from bit 27, so NV12 (4) is bit 29.
 template <uint32_t N>
-void vdenc_surface(DwordWriter& w, const uint32_t (&defaults)[N], uint32_t width, uint32_t height, const Nv12TiledLayout& layout) {
+void vdenc_surface(DwordWriter& w, const uint32_t (&defaults)[N], uint32_t width, uint32_t height, const Nv12TiledLayout& layout, bool format_from_bit27) {
   Command<N> c(defaults);
   c.raw(2, ((height - 1) << 18) | ((width - 1) << 4));                 // width, height (dword 0 of the body)
-  c.raw(3, 1u | (1u << 1) | ((layout.pitch - 1) << 3) | (1u << 27) |   // Y-major tiled, pitch, interleaved chroma
-               (intel_mfx::kSurfacePlanar420 << 28));
+  const uint32_t format = format_from_bit27 ? intel_mfx::kSurfacePlanar420 << 27 : (1u << 27) | (intel_mfx::kSurfacePlanar420 << 28);
+  c.raw(3, 1u | (1u << 1) | ((layout.pitch - 1) << 3) | format);       // Y-major tiled, pitch, format (interleaved chroma)
   c.raw(4, layout.chroma_offset_rows);                                 // Y offset of the Cb plane
   c.raw(5, layout.chroma_offset_rows);                                 // ... of the Cr plane (the same: interleaved)
   c.emit(w);
@@ -253,10 +254,11 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
     c.set(kVdencPipeModeSelect_VdencStreamInEnable, 0);
     c.emit(w);
   }
-  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full);
-  vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full);
-  if (gen11_up) vdenc_surface(w, kGen11VdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter);   // (room for two surfaces; one is used)
-  else vdenc_surface(w, kVdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter);
+  const bool gen12_surfaces = p.generation == EncodeGeneration::Gen12;
+  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces);
+  vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces);
+  if (gen11_up) vdenc_surface(w, kGen11VdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, gen12_surfaces);   // (room for two surfaces; one is used)
+  else vdenc_surface(w, kVdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, false);
   switch (p.generation) {
     case EncodeGeneration::Gen9: vdenc_pipe_buf(w, kVdencPipeBufAddrStateDefault, p, b); break;
     case EncodeGeneration::Gen11: vdenc_pipe_buf(w, kGen11VdencPipeBufAddrStateDefault, p, b); break;
