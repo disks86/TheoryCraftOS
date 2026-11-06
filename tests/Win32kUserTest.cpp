@@ -275,15 +275,15 @@ void test_create_and_destroy() {
   t.proc = default_proc;
   prog.process.set_gs_base(kScratch + 0x7000);
   t.atom_class("Top", 0, 0x401000, 0, 8);
-  // an invisible overlapped window: NCCREATE, NCCALCSIZE, CREATE
+  // an invisible overlapped window: GETMINMAXINFO, NCCREATE, NCCALCSIZE, CREATE
   const uint32_t w = t.create("Top", WS_OVERLAPPEDWINDOW, 10, 20, 300, 200, 0, 0, "Title", 0x55AA);
   CHECK(w != 0 && t.is_window(w));
-  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE}));
+  CHECK((t.msgs() == std::vector<uint32_t>{0x24, WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE}));
   // the creation structure: lpCreateParams, geometry and styles
-  CHECK(rd(t.log[0].payload, 0) == 0x55AA && rd(t.log[0].payload, 32) == 200 && rd(t.log[0].payload, 36) == 300 && rd(t.log[0].payload, 40) == 20 && rd(t.log[0].payload, 44) == 10);
-  CHECK(rd(t.log[0].payload, 48) == WS_OVERLAPPEDWINDOW);
+  CHECK(rd(t.log[1].payload, 0) == 0x55AA && rd(t.log[1].payload, 32) == 200 && rd(t.log[1].payload, 36) == 300 && rd(t.log[1].payload, 40) == 20 && rd(t.log[1].payload, 44) == 10);
+  CHECK(rd(t.log[1].payload, 48) == WS_OVERLAPPEDWINDOW);
   // NCCALCSIZE came with the window rectangle in rgrc[0]
-  CHECK(rd(t.log[1].payload, 16) == 10 && rd(t.log[1].payload, 20) == 20 && rd(t.log[1].payload, 24) == 310 && rd(t.log[1].payload, 28) == 220 && t.log[1].wparam == 1);
+  CHECK(rd(t.log[2].payload, 16) == 10 && rd(t.log[2].payload, 20) == 20 && rd(t.log[2].payload, 24) == 310 && rd(t.log[2].payload, 28) == 220 && t.log[2].wparam == 1);
   // geometry: window rect and the client rectangle inside the frame (Windows 10 metrics: 8 px frame, 31 px of caption and frame on top)
   Rc wr = t.window_rect(w), cr = t.client_rect(w);
   CHECK(wr.l == 10 && wr.t == 20 && wr.r == 310 && wr.b == 220);
@@ -301,12 +301,12 @@ void test_create_and_destroy() {
   t.clear_log();
   t.proc = [](Th&, Call_& c) -> uint64_t { return c.msg == WM_NCCREATE ? 0 : 0; };
   CHECK(t.create("Top", 0, 0, 0, 10, 10) == 0);
-  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCDESTROY}));
+  CHECK((t.msgs() == std::vector<uint32_t>{0x24, WM_NCCREATE, WM_NCDESTROY}));
   // WM_CREATE answering -1: WM_DESTROY and WM_NCDESTROY
   t.clear_log();
   t.proc = [](Th&, Call_& c) -> uint64_t { return c.msg == WM_NCCREATE ? 1 : c.msg == WM_CREATE ? uint64_t(-1) : 0; };
   CHECK(t.create("Top", 0, 0, 0, 10, 10) == 0);
-  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE, WM_DESTROY, WM_NCDESTROY}));
+  CHECK((t.msgs() == std::vector<uint32_t>{0x24, WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE, WM_DESTROY, WM_NCDESTROY}));
   t.proc = default_proc;
   // unknown class, bad parent
   CHECK(t.create("NoSuchClass", 0, 0, 0, 10, 10) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1407);

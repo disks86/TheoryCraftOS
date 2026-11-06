@@ -76,6 +76,20 @@ uint64_t create_step(Call& call, Op& op) {
   if (!w) return 0;      // destroyed by one of its own messages
   const bool has_proc = w->wndproc != 0;
   switch (op.phase) {
+    case 20: {      // an overlapped or sizing window is asked for its limits before WM_NCCREATE
+      op.phase = 0;
+      if (!has_proc) return create_step(call, op);
+      const int32_t sw = int32_t(gdi::screen_width()), sh = int32_t(gdi::screen_height()), b = 8;
+      uint8_t raw[40] = {};
+      put32(raw, 8, uint32_t(sw + 2 * b)); put32(raw, 12, uint32_t(sh + 2 * b));      // ptMaxSize
+      put32(raw, 16, uint32_t(-b)); put32(raw, 20, uint32_t(-b));      // ptMaxPosition
+      put32(raw, 24, 136); put32(raw, 28, 39);      // ptMinTrackSize
+      put32(raw, 32, uint32_t(sw + 2 * b)); put32(raw, 36, uint32_t(sh + 2 * b));      // ptMaxTrackSize
+      List<uint8_t> payload(S().alloc);
+      for (uint8_t v : raw) payload.push_back(v);
+      if (!queue_payload_upcall(call, &op, w, wn::WM_GETMINMAXINFO, 0, payload, 0xFFFF, 0, 0)) return create_step(call, op);
+      return kUpcallDue;
+    }
     case 0: {
       op.phase = 1;
       if (!has_proc) return create_step(call, op);
@@ -265,6 +279,7 @@ uint64_t nt_create_window_ex(Call& call) {
   if (!op) { destroy_window_tree(w); return call.fail(kErrorNotEnoughMemory); }
   op->a[0] = w->handle;
   op->a[1] = call.arg(12);
+  if ((style & wn::WS_THICKFRAME) || !(style & (wn::WS_POPUP | wn::WS_CHILD))) op->phase = 20;
   return op_continue(call, *op);
 }
 
@@ -605,7 +620,7 @@ uint64_t set_long_step(Call& call, Op& op) {
     switch (offset) {
       case wn::GWL_STYLE:
         value = uint32_t(value);
-        if (!(w->style & wn::WS_CHILD) && w->parent == w->desktop->root) value |= wn::WS_CLIPSIBLINGS;
+        if ((uint32_t(value) & (wn::WS_CHILD | wn::WS_POPUP)) != wn::WS_CHILD) value |= wn::WS_CLIPSIBLINGS;      // (cannot be cleared on all but a pure child)
         w->style = uint32_t(value);
         w->ex_style = fix_ex_style(w->style, w->ex_style);
         break;
