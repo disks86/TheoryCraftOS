@@ -420,7 +420,11 @@ functions:
   sp_u8 *used = (sp_u8 *)sp_alloc(m, m->bound);
   sp_u8 *seen_func = (sp_u8 *)sp_alloc(m, m->nfuncs + 1);
   if (!used || !seen_func) return sp_fail(m, "out of memory");
-  uint32_t stack[32], sp_top = 0;
+  /* (a stack of the functions still to look at: each call pushes one, so it needs as many places as there are calls) */
+  uint32_t ncalls = 0;
+  for (uint32_t off = 5; off < m->nw; off += LEN(off)) ncalls += OPC(off) == OpFunctionCall;
+  uint32_t *stack = (uint32_t *)sp_alloc(m, ((sp_u64)ncalls + 1) * 4), sp_top = 0;
+  if (!stack) return sp_fail(m, "out of memory");
   stack[sp_top++] = m->entry_func;
   while (sp_top) {
     uint32_t fid = stack[--sp_top];
@@ -449,7 +453,7 @@ functions:
         case OpFunctionCall:
           for (uint32_t k = 4; k < len; ++k)
             if (m->w[off + k] < m->bound) used[m->w[off + k]] = 1;
-          if (sp_top < 32) stack[sp_top++] = m->w[off + 3];
+          if (sp_top <= ncalls) stack[sp_top++] = m->w[off + 3];
           break;
         default: break;
       }

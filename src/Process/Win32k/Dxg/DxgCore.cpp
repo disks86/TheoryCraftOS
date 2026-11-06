@@ -91,8 +91,8 @@ bool read_u64_array(Call& call, uint64_t address, uint32_t count, List<uint64_t>
   return true;
 }
 
-bool read_blob(Call& call, uint64_t address, uint32_t size, ByteBuffer* out) {
-  if (size > kMaxPrivateData) return false;
+bool read_blob(Call& call, uint64_t address, uint32_t size, ByteBuffer* out, uint32_t limit) {
+  if (size > limit) return false;
   out->clear();
   if (size == 0) return true;
   if (!out->put_zeros(size)) return false;

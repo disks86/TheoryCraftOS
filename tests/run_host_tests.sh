@@ -315,7 +315,7 @@ for t in "${WANTED[@]}"; do
     Win32kCompositionTest) build_and_run Win32kCompositionTest tests/Win32kCompositionTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Process/Win32k/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Hardware/Keyboard/KeyCodes.cpp ;;
     Win32kDxgTest) build_and_run Win32kDxgTest tests/Win32kDxgTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Process/Win32k/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Hardware/Keyboard/KeyCodes.cpp src/Process/Win32k/Dxg/*.cpp src/Kernel/Dxgkrnl/*.cpp src/Math/FloatMath.cpp \
                    src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp ;;
-    DxgkrnlTest) build_and_run DxgkrnlTest tests/DxgkrnlTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Dxgkrnl/*.cpp \
+    DxgkrnlTest) build_and_run DxgkrnlTest tests/DxgkrnlTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Kernel/Dxgkrnl/*.cpp \
                    src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp ;;
     VulkanShaderTest) mkdir -p "$out/vk"
                 # the translator is C (src/Windows/vulkan-1/spirv.inc, freestanding); the test links it as an object

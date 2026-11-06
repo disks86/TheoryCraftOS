@@ -1,6 +1,6 @@
 /* spirv.inc, part 5: giving out the registers and writing the DXBC container. */
 
-#define MAX_PHYS 32
+#define MAX_PHYS 256   /* the kernel's d3d9::kMaxTemps */
 
 typedef struct Interval {
   int32_t first, last;
@@ -51,25 +51,23 @@ static int allocate_registers(Mod *m, uint32_t *phys) {
   sp_u8 busy_read_only[MAX_PHYS];
   for (int i = 0; i < MAX_PHYS; ++i) busy_until[i] = -1, busy_read_only[i] = 0;
   uint32_t used_regs = 0;
-  /* a stable order: by first, then index */
+  /* a stable order: by first, then index (a counting sort: the firsts are instruction numbers) */
   uint32_t *order = (uint32_t *)sp_alloc(m, (sp_u64)(m->nvreg + 1) * 4);
-  if (!order) return sp_fail(m, "out of memory");
+  uint32_t *start = (uint32_t *)sp_alloc(m, ((sp_u64)m->ncode + 2) * 4);
+  if (!order || !start) return sp_fail(m, "out of memory");
   uint32_t n = 0;
   for (uint32_t v = 0; v < m->nvreg; ++v)
-    if (iv[v].used) order[n++] = v;
-  for (uint32_t i = 1; i < n; ++i) {   /* insertion sort: the lists are short and nearly sorted */
-    uint32_t v = order[i];
-    uint32_t j = i;
-    while (j > 0 && iv[order[j - 1]].first > iv[v].first) order[j] = order[j - 1], --j;
-    order[j] = v;
-  }
+    if (iv[v].used) ++start[iv[v].first + 1], ++n;
+  for (uint32_t i = 1; i <= m->ncode; ++i) start[i] += start[i - 1];
+  for (uint32_t v = 0; v < m->nvreg; ++v)
+    if (iv[v].used) order[start[iv[v].first]++] = v;
   for (uint32_t k = 0; k < n; ++k) {
     uint32_t v = order[k];
     int chosen = -1;
     for (int r = 0; r < MAX_PHYS && chosen < 0; ++r) {
       if (busy_until[r] < iv[v].first || (busy_until[r] == iv[v].first && busy_read_only[r] && iv[v].first_write)) chosen = r;
     }
-    if (chosen < 0) return sp_fail(m, "the shader needs more than 32 temporary registers");
+    if (chosen < 0) return sp_fail(m, "the shader needs more than 256 temporary registers");
     busy_until[chosen] = iv[v].last, busy_read_only[chosen] = iv[v].last_read_only;
     phys[v] = (uint32_t)chosen;
     if ((uint32_t)chosen + 1 > used_regs) used_regs = (uint32_t)chosen + 1;
@@ -242,7 +240,8 @@ void spv_declare_cb(SpvModule *m, uint32_t slot, uint32_t vec4) {
 }
 
 static int write_container(Mod *m, const uint32_t *phys) {
-  enum { kMaxWords = 8000 };
+  /* (an instruction is at most 1 + 2 destinations and 6 sources of up to 6 words each: 50 words; the declarations a few hundred) */
+  const uint32_t kMaxWords = 4096 + m->ncode * 50;
   uint32_t *tokens = (uint32_t *)sp_alloc(m, (sp_u64)(kMaxWords + 64) * 4);
   if (!tokens) return sp_fail(m, "out of memory");
   Writer w;

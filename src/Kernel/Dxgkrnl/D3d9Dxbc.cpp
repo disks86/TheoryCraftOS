@@ -76,7 +76,8 @@ struct Operand {
   uint8_t modifier = 0;   // 0 none, 1 negate, 2 abs, 3 negated abs
   float imm[4] = {0, 0, 0, 0};
   bool relative = false;   // the last index adds the integer in a temporary's component (cb0[r1.x + 3], icb[r2.y])
-  uint8_t relative_temp = 0, relative_component = 0;
+  uint16_t relative_temp = 0;
+  uint8_t relative_component = 0;
   bool vertex_from_id = false;   // a control point operand indexed by vOutputControlPointID
 };
 
@@ -162,7 +163,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       }
     }
   }
-  if (bytes.size() < 32 || bytes.size() > kMaxTokens * 4ull) return status::kInvalidParameter;
+  if (bytes.size() < 32 || bytes.size() > kMaxDxbcBytes) return status::kInvalidParameter;
   ByteReader head(bytes);
   if (head.le32() != kMagic) return status::kInvalidParameter;
   head.skip(16);
@@ -290,7 +291,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         o->relative_component = static_cast<uint8_t>(((sub >> 2) & 3) == 2 ? (sub >> 4) & 3 : (sub >> 4) & 3);   // (select_1, or the first of a swizzle)
         const uint32_t temp = p.le32();
         if (!p.ok() || temp >= kMaxTemps) return status::kNotSupported;
-        o->relative_temp = static_cast<uint8_t>(temp);
+        o->relative_temp = static_cast<uint16_t>(temp);
       } else if (representation == 2 && i == 0 && o->dims == 2 && patch_stage && (o->type == kOpInput || o->type == kOpInputControlPoint)) {
         // vicp[vOutputControlPointID][register]: the control point being made
         const uint32_t sub = p.le32();
@@ -399,7 +400,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         const uint32_t base = cb_base(slot);
         s->type = kConst, s->number = static_cast<uint16_t>(base + element);
         if (o.relative) {
-          s->relative = true, s->relative_temp = static_cast<int8_t>(o.relative_temp), s->relative_component = o.relative_component, s->relative_limit = static_cast<uint16_t>(base + size);
+          s->relative = true, s->relative_temp = static_cast<int16_t>(o.relative_temp), s->relative_component = o.relative_component, s->relative_limit = static_cast<uint16_t>(base + size);
         }
         return status::kSuccess;
       }
@@ -407,7 +408,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (o.dims != 1 || immediate_buffer_size == 0 || (!o.relative && o.index[0] >= immediate_buffer_size) || o.index[0] > immediate_buffer_size) return status::kNotSupported;
         s->type = kConst, s->number = static_cast<uint16_t>(kImmediateBufferBase + o.index[0]);
         if (o.relative) {
-          s->relative = true, s->relative_temp = static_cast<int8_t>(o.relative_temp), s->relative_component = o.relative_component;
+          s->relative = true, s->relative_temp = static_cast<int16_t>(o.relative_temp), s->relative_component = o.relative_component;
           s->relative_limit = static_cast<uint16_t>(kImmediateBufferBase + immediate_buffer_size);
         }
         return status::kSuccess;
@@ -1209,6 +1210,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (ins.dst.slot == kSlotPosition) writes_position = true;
     if (!writes_position) return status::kInvalidParameter;
   }
+  program->count_temps();
   *out = util::move(program);
   return status::kSuccess;
 }

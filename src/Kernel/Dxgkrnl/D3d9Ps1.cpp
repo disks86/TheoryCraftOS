@@ -294,6 +294,7 @@ NtStatus D3d9Program::compile_ps1(allocators::IAllocator& allocator, ConstByteVi
   result.src_count = 1;
   const NtStatus s = emit(result);
   if (s != status::kSuccess) return s;
+  program->count_temps();
   *out = util::move(program);
   return status::kSuccess;
 }

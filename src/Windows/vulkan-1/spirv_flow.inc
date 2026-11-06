@@ -269,7 +269,7 @@ static void note_range(Mod *m, uint32_t begin, uint32_t end) {
 
 /* Opens a DXBC loop that a branch to `exit_target` leaves. Returns the instruction index of the loop. */
 static int open_ctx(Mod *m, uint32_t exit_target, uint32_t *begin) {
-  if (m->ncstack >= 20) return sp_fail(m, "constructs nested too deep");
+  if (m->ncstack >= SP_MAX_NEST) return sp_fail(m, "constructs nested too deep");
   Ctx *c = &m->cstack[m->ncstack++];
   sp_zero(c, sizeof *c);
   c->exit_target = exit_target;
@@ -308,7 +308,12 @@ static void do_exit(Mod *m, int index) {
       uint32_t k = 0;
       for (; k < c->ncrossed; ++k)
         if (c->crossed[k] == flag) break;
-      if (k == c->ncrossed && c->ncrossed < 8) c->crossed[c->ncrossed++] = flag;
+      if (k < c->ncrossed) continue;
+      if (c->ncrossed == SP_MAX_NEST) {
+        sp_fail(m, "constructs nested too deep");
+        return;
+      }
+      c->crossed[c->ncrossed++] = flag;
     }
   }
   emit_simple(m, D_BREAK);
@@ -590,7 +595,7 @@ static int gen_function(Mod *m, uint32_t func_id, Val **args, uint32_t nargs, ui
   for (uint32_t i = 0; i < m->nfuncs; ++i)
     if (m->funcs[i].id == func_id) fn = &m->funcs[i];
   if (!fn) return sp_fail(m, "call of a missing function");
-  if (m->nfstack >= 15) return sp_fail(m, "functions nested too deep");
+  if (m->nfstack >= SP_MAX_CALLS) return sp_fail(m, "functions nested too deep");
   if (++m->steps > 20000) return sp_fail(m, "control flow too complex");
   Frame *f = &m->fstack[m->nfstack++];
   sp_zero(f, sizeof *f);

@@ -61,8 +61,16 @@ uint32_t float_to_uint(float x) {
 }  // namespace
 
 
+// The temporaries of a run. Not set by the constructor: a run clears as many as its program uses (execute from the first instruction).
+struct Temps {
+  Q q[kMaxTemps];
+  Temps() {}
+  Q& operator[](uint32_t i) { return q[i]; }
+  const Q& operator[](uint32_t i) const { return q[i]; }
+};
+
 struct D3d9Program::State {
-  Q r[kMaxTemps];
+  Temps r;
   Q a0;
   Q pos;
   Q var[graphics::kMaxVaryings] = {};          // (outputs the shader does not write are zero, not what the stack held)
@@ -191,7 +199,7 @@ NtStatus D3d9Program::compile(allocators::IAllocator& allocator, ConstByteView b
       }
     }
     switch (s->type) {
-      case kTemp: return s->number < kMaxTemps ? status::kSuccess : status::kInvalidParameter;
+      case kTemp: return s->number < kMaxD3d9Temps ? status::kSuccess : status::kInvalidParameter;
       case kConst: return status::kSuccess;   // (checked against the defs at the end)
       case kInput:
         if (s->number >= kMaxInputs) return status::kInvalidParameter;
@@ -230,7 +238,7 @@ NtStatus D3d9Program::compile(allocators::IAllocator& allocator, ConstByteView b
     if (shift >= 8) shift -= 16;
     d->shift = static_cast<int8_t>(shift);
     switch (d->type) {
-      case kTemp: return d->number < kMaxTemps ? status::kSuccess : status::kInvalidParameter;
+      case kTemp: return d->number < kMaxD3d9Temps ? status::kSuccess : status::kInvalidParameter;
       case kAddrTex:
         if (vertex && d->number == 0) return status::kSuccess;
         return status::kNotSupported;
@@ -322,7 +330,7 @@ NtStatus D3d9Program::compile(allocators::IAllocator& allocator, ConstByteView b
         if (!p.ok()) return status::kInvalidParameter;
         ins.src[0].type = reg_type(t);
         ins.src[0].number = static_cast<uint16_t>(t & 0x7FF);
-        if (vertex || (ins.src[0].type != kTemp && ins.src[0].type != kAddrTex) || ins.src[0].number >= kMaxTemps) return status::kNotSupported;
+        if (vertex || (ins.src[0].type != kTemp && ins.src[0].type != kAddrTex) || ins.src[0].number >= kMaxD3d9Temps) return status::kNotSupported;
         if (ins.src[0].type == kAddrTex) {
           if (major >= 3 || ins.src[0].number >= 2) return status::kNotSupported;
           ins.src[0].slot = static_cast<int8_t>(2 + ins.src[0].number);
@@ -411,6 +419,7 @@ NtStatus D3d9Program::compile(allocators::IAllocator& allocator, ConstByteView b
       if (ins.dst.slot == kSlotPosition) writes_position = true;
     if (!writes_position) return status::kInvalidParameter;
   }
+  program->count_temps();
   *out = util::move(program);
   return status::kSuccess;
 }
@@ -439,8 +448,22 @@ float apply_modifier(uint8_t m, float x) {
 
 }  // namespace
 
+void D3d9Program::count_temps() {
+  uint32_t n = 0;
+  for (const Instruction& ins : code_.view()) {
+    if (ins.dst.type == kTemp && ins.dst.number + 1u > n) n = ins.dst.number + 1u;
+    for (uint32_t k = 0; k < ins.src_count && k < 4; ++k) {
+      if (ins.src[k].type == kTemp && ins.src[k].number + 1u > n) n = ins.src[k].number + 1u;
+      if (ins.src[k].relative && ins.src[k].relative_temp >= 0 && static_cast<uint32_t>(ins.src[k].relative_temp) + 1u > n) n = static_cast<uint32_t>(ins.src[k].relative_temp) + 1u;
+    }
+  }
+  temp_count_ = n < kMaxTemps ? n : kMaxTemps;
+}
+
 void D3d9Program::execute(State& s, uint64_t begin, uint64_t end) const {
   using Instr = Instruction;
+  if (begin == 0)
+    for (uint32_t i = 0; i < temp_count_; ++i) s.r[i] = Q{{0, 0, 0, 0}};
   auto push_constant = [&](uint32_t index) {
     Q q = {{0, 0, 0, 0}};
     if (index < constant_registers_ && s.constants) __builtin_memcpy(q.f, s.constants + index * 16, 16);

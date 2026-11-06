@@ -164,13 +164,18 @@ typedef struct Func {
   uint32_t nreturns, last_label;
 } Func;
 
+/* (the kernel's DXBC front end takes 65536 instructions and 256 temporaries: D3d9Program::kMaxInstructions, d3d9::kMaxTemps) */
+#define SP_MAX_CODE 60000
+#define SP_MAX_NEST 64      /* constructs (loops, selections) one inside another */
+#define SP_MAX_CALLS 64     /* function calls one inside another (they are inlined) */
+
 /* A DXBC loop being written (a real loop, or a loop that runs once so that its `break` can leave a construct: a switch, the continue construct of a loop, a function with several
  * returns). Leaving it from inside is `break`; from inside other loops too, a flag per target loop that every loop in between tests after its endloop. */
 #define RET_TARGET 0xFFFFFFFEu
 typedef struct Ctx {
   uint32_t exit_target;     /* a branch to this block (RET_TARGET: a return) leaves the loop */
   uint32_t flag;            /* virtual temporary: set when the exit was taken from inside a loop within this one */
-  uint32_t crossed[8], ncrossed;   /* the flags of outer loops to test after this loop's endloop */
+  uint32_t crossed[SP_MAX_NEST], ncrossed;   /* the flags of outer loops to test after this loop's endloop */
 } Ctx;
 
 typedef struct Frame {
@@ -184,7 +189,6 @@ typedef struct Range {
 
 #define SP_MAX_ID_LEAVES 192
 #define SP_MAX_RES 32
-#define SP_MAX_CODE 1100
 #define SP_ERR_LEN 160
 
 struct SpvModule {
@@ -226,9 +230,9 @@ struct SpvModule {
   uint32_t cap_vreg;
   Range *loops;
   uint32_t nloops, cap_loops;
-  Ctx cstack[24];
+  Ctx cstack[SP_MAX_NEST];
   uint32_t ncstack;
-  Frame fstack[16];
+  Frame fstack[SP_MAX_CALLS];
   uint32_t nfstack;
   uint32_t used_samplers;
   uint32_t ncb;

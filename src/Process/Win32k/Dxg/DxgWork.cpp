@@ -271,9 +271,9 @@ uint32_t escape(Session& s, Call& call, uint64_t arg) {
   const uint32_t size = b.u32(24);
   if (device == 0) return kStatusInvalidParameter;
   if (type != kEscapeDriverPrivate) return kStatusNotSupported;      // VidMm, VidSch, DMM, TDR control ... are Windows' own escapes
-  if (data == 0 || size == 0 || size > kMaxPrivateData) return kStatusInvalidParameter;
+  if (data == 0 || size == 0 || size > kMaxEscapeData) return kStatusInvalidParameter;
   ByteBuffer request(s.allocator()), reply(s.allocator());
-  if (!read_blob(call, data, size, &request)) return kStatusAccessViolation;
+  if (!read_blob(call, data, size, &request, kMaxEscapeData)) return kStatusAccessViolation;
   if (!reply.put_zeros(size)) return status::kNoMemory;
   uint32_t reply_bytes = 0;
   const uint32_t st = s.kernel().escape(s.pid(), device, request.view(), reply.writable_view(), &reply_bytes);

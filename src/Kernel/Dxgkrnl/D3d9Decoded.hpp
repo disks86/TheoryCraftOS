@@ -69,7 +69,10 @@ enum AtomicKind : uint8_t { kAtomicAdd = 0, kAtomicAnd, kAtomicOr, kAtomicXor, k
 enum Usage : uint8_t { kUsagePosition = 0, kUsageTexCoord = 5, kUsageColor = 10 };
 enum Modifier : uint8_t { kModNone, kModNeg, kModBias, kModBiasNeg, kModSign, kModSignNeg, kModComp, kModX2, kModX2Neg, kModDz, kModDw, kModAbs, kModAbsNeg, kModNot };
 
-constexpr uint32_t kMaxTemps = 32, kMaxInputs = 16, kMaxOutputs = 16;
+// Temporaries: Direct3D 9 programs have 32 at most; a program made from DXBC (Direct3D 10 and later, the Vulkan driver's translated SPIR-V) up to kMaxTemps. A run sets to zero only
+// as many as its program uses (D3d9Program::temp_count_), so the size of the file costs nothing per vertex or pixel.
+constexpr uint32_t kMaxTemps = 256, kMaxInputs = 16, kMaxOutputs = 16;
+constexpr uint32_t kMaxD3d9Temps = 32;   // r0 .. r31 of a Direct3D 9 token stream
 constexpr int8_t kSlotNone = -1, kSlotPosition = -2;
 
 }  // namespace d3d9
@@ -93,7 +96,7 @@ struct D3d9Program::Instruction {
     uint8_t modifier = kModNone;
     bool relative = false;
     uint8_t relative_component = 0;
-    int8_t relative_temp = -1;     // the temporary whose component (an integer) is added to the register number; -1: a0 (Direct3D 9)
+    int16_t relative_temp = -1;    // the temporary whose component (an integer) is added to the register number; -1: a0 (Direct3D 9)
     uint16_t relative_limit = 0;   // with a relative address: the register number it must stay below (a constant buffer's end); 0: no such check
   };
   struct Dst {

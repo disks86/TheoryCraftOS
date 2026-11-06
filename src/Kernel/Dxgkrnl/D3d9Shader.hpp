@@ -51,8 +51,9 @@ enum class VertexKernel : uint8_t { None, MatrixColumns, MatrixRows };
 
 class D3d9Program {
  public:
-  static constexpr uint32_t kMaxTokens = 8192;
-  static constexpr uint32_t kMaxInstructions = 1024;
+  static constexpr uint32_t kMaxTokens = 8192;              // a Direct3D 9 token stream
+  static constexpr uint64_t kMaxDxbcBytes = 4u << 20;       // a DXBC container
+  static constexpr uint32_t kMaxInstructions = 65536;
   static constexpr uint32_t kMaxSteps = 1u << 20;   // instructions one run may execute
   static constexpr uint32_t kPushConstantRegisters = 8;
   static constexpr uint32_t kMaxConstantRegisters = 256;   // 4096 bytes: a program made from DXBC may declare constant buffers up to this much in all
@@ -165,6 +166,8 @@ class D3d9Program {
   uint32_t major_ = 0, minor_ = 0;
   bool uses_textures_ = false;
   uint32_t thread_group_[3] = {1, 1, 1};
+  uint32_t temp_count_ = 256;   // the temporaries the program names (r0 .. r[n - 1]): what a run sets to zero (count_temps; at most d3d9::kMaxTemps)
+  void count_temps();
   graphics::GeometryPrimitive geometry_input_ = graphics::GeometryPrimitive::Triangle;
   graphics::GeometryTopology geometry_output_ = graphics::GeometryTopology::TriangleStrip;
   uint32_t geometry_max_vertices_ = 0;
