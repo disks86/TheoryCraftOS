@@ -60,19 +60,19 @@ class NetworkStackSet final : public IStackProvider {
   // The stack of interface `index` (in the order added), or null.
   NetworkStack* at(uint32_t index) const override { return index < stacks_.count() ? stacks_[index].get() : nullptr; }
 
-  ~NetworkStackSet() { stop_service(); }
+  ~NetworkStackSet() { clear(); }
   NetworkStackSet(const NetworkStackSet&) = delete;
   NetworkStackSet& operator=(const NetworkStackSet&) = delete;
 
-  // Runs a thread that keeps every stack polled (about every 500 microseconds when
-  // idle, immediately again when there was traffic). Call after the last add().
+  // Runs a thread that keeps every stack polled: woken by the interfaces' interrupts
+  // where they have them (and every 5 ms for timers), else about every 500
+  // microseconds; immediately again while frames keep coming. Call after the last add().
   bool start_service();
   void stop_service();
   bool service_running() const { return service_ != nullptr; }
-  void clear() {  // drops every stack (before the NICs go away)
-    stop_service();
-    stacks_.clear();
-  }
+  void clear();  // drops every stack (before the NICs go away); their interfaces stop interrupting
+  // True when every interface wakes the service thread by interrupt.
+  bool interrupt_driven() const;
   void poll();
   // Starts DHCP on every interface.
   void start_dhcp();
@@ -89,6 +89,9 @@ class NetworkStackSet final : public IStackProvider {
   hardware::IClock& clock_;
   allocators::IAllocator& allocator_;
   static void service_main(void* self);
+  static void on_activity(void* self);  // from the interfaces' interrupt handlers
+  static constexpr uint64_t kPolledIdleUs = 500, kInterruptIdleUs = 5000;
+  kernel::Event activity_{true};
 
   List<UniquePointer<NetworkStack>> stacks_;
   kernel::Thread* service_ = nullptr;

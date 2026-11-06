@@ -33,7 +33,24 @@ bool NetworkStackSet::add(hardware::INetworkInterface& nic) {
   if (!stack || !stack->initialize()) return false;
   if (nic.wireless() || nic.link_comes_and_goes()) stack->set_dhcp_follows_link(true);       // the link of a Wi-Fi adapter is the connection: addresses come and go with it
   if (nic.direct_link()) stack->set_link_local_fallback(true);
-  return stacks_.push_back(util::move(stack));
+  if (!stacks_.push_back(util::move(stack))) return false;
+  nic.enable_interrupts(&NetworkStackSet::on_activity, this);  // (an interface that cannot stays polled)
+  return true;
+}
+
+void NetworkStackSet::on_activity(void* self) { static_cast<NetworkStackSet*>(self)->activity_.set(); }
+
+void NetworkStackSet::clear() {
+  stop_service();
+  for (UniquePointer<NetworkStack>& stack : stacks_) stack->interface().disable_interrupts();
+  stacks_.clear();
+}
+
+bool NetworkStackSet::interrupt_driven() const {
+  if (stacks_.count() == 0) return false;
+  for (const UniquePointer<NetworkStack>& stack : stacks_)
+    if (!stack->interface().interrupts_enabled()) return false;
+  return true;
 }
 
 bool NetworkStackSet::start_service() {
@@ -54,7 +71,12 @@ void NetworkStackSet::service_main(void* self) {
   NetworkStackSet* set = static_cast<NetworkStackSet*>(self);
   while (!__atomic_load_n(&set->stop_, __ATOMIC_ACQUIRE)) {
     set->poll();
-    kernel::sleep_us(500);
+    bool saturated = false;
+    for (UniquePointer<NetworkStack>& stack : set->stacks_) saturated = saturated || stack->saturated();
+    if (saturated) continue;  // frames are still waiting: no interrupt will say so again
+    // Interfaces that interrupt wake this thread when frames arrive; then it only has to wake up by itself for the stacks' timers. One that is
+    // polled keeps the short period.
+    set->activity_.wait(set->interrupt_driven() ? kInterruptIdleUs : kPolledIdleUs);
   }
 }
 

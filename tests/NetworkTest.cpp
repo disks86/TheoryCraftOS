@@ -165,6 +165,20 @@ static bool loopback_echo(Lan& lan, NetworkStack& stack, Ipv4Address to, uint32_
   return ok;
 }
 
+// True if every IPv4 TCP/UDP frame has a right transport checksum (UDP may say 0: none).
+static bool transport_checksum_ok(const std::vector<uint8_t>& f) {
+  if (f.size() < 34 || f[12] != 0x08 || f[13] != 0x00) return true;
+  const uint32_t ihl = (f[14] & 0x0F) * 4u, total = (f[16] << 8) | f[17], protocol = f[23];
+  if ((protocol != 6 && protocol != 17) || 14 + total > f.size() || total < ihl + 8) return true;
+  const uint32_t l4 = total - ihl;
+  if (protocol == 17 && f[14 + ihl + 6] == 0 && f[14 + ihl + 7] == 0) return true;
+  uint32_t sum = protocol + l4;
+  for (int i = 26; i < 34; i += 2) sum += (f[i] << 8) | f[i + 1];
+  for (uint32_t i = 0; i < l4; i += 2) sum += (f[14 + ihl + i] << 8) | (i + 1 < l4 ? f[14 + ihl + i + 1] : 0);
+  while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+  return sum == 0xFFFF;
+}
+
 int main() {
   { // ---- checksum sanity (RFC 1071 example) and byte helpers
     const uint8_t data[] = {0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7};
@@ -226,6 +240,44 @@ int main() {
     inject(10, 0, 0, 1); assert(victim->pending() == 1);           // the control: an unconfigured stack takes it
     uint8_t d[64]; uint32_t l; assert(victim->receive_from(ByteView(d, sizeof(d)), nullptr, nullptr, &l));
     inject(127, 0, 0, 1); assert(victim->pending() == 0);          // but not addressed to the loopback
+  }
+  { // ---- transport checksums: in software, or handed to an interface that offloads them; what goes on the wire is right either way
+    for (int mode = 0; mode < 3; ++mode) {   // 0: neither offloads, 1: both, 2: only A
+      Lan lan; lan.configure_static();
+      lan.nic_a.offload = mode >= 1; lan.nic_b.offload = mode == 1;
+      uint64_t bad = 0, checked = 0;
+      lan.wire.tap = [&](const std::vector<uint8_t>& f, int) { ++checked; if (!transport_checksum_ok(f)) ++bad; };
+      assert(loopback_echo(lan, lan.a, Ipv4Address::make(127, 0, 0, 1), 20000, 6600));   // the loopback still gets complete checksums
+      auto server = lan.b.udp_open(7100); auto client = lan.a.udp_open(0); assert(server && client);
+      for (int i = 0; i < 20; ++i) { uint8_t m[300]; memset(m, i, sizeof m); assert(client->send_to(Ipv4Address::make(10,0,0,2), 7100, ConstByteView(m, 1 + i * 13))); lan.step(2); }
+      assert(lan.run_until([&] { return server->pending() == 20; }, 2000));
+      // TCP both ways, through the same path
+      auto listener = lan.b.tcp_open(); assert(listener->listen(7200));
+      auto c = lan.a.tcp_open(); assert(c->connect(Ipv4Address::make(10,0,0,2), 7200));
+      SharedPointer<ITcpSocket> s;
+      assert(lan.run_until([&] { if (!s) s = listener->accept(); return s && c->state() == TcpState::Established; }, 3000));
+      std::vector<uint8_t> big(40000); for (size_t i = 0; i < big.size(); ++i) big[i] = (uint8_t)(i * 31);
+      size_t sent = 0, got = 0; uint8_t rb[4096];
+      assert(lan.run_until([&] { if (sent < big.size()) sent += c->send(ConstByteView(big.data() + sent, big.size() - sent));
+                                 for (uint32_t n; (n = s->receive(ByteView(rb))) > 0;) { assert(memcmp(rb, big.data() + got, n) == 0); got += n; }
+                                 return got == big.size(); }, 20000));
+      assert(checked > 40 && bad == 0);
+      assert((lan.nic_a.offloaded > 0) == (mode >= 1) && (lan.nic_b.offloaded > 0) == (mode == 1));
+    }
+    // receiving: a frame the interface vouches for is taken without looking; one it does not vouch for is checked and a broken one dropped
+    Lan lan; lan.configure_static(); lan.nic_a.offload = true;
+    auto server = lan.a.udp_open(7300); auto client = lan.b.udp_open(0); assert(server && client);
+    std::vector<uint8_t> captured;
+    lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) { if (from == 1 && f.size() > 42 && f[23] == 17 && f[36] == (7300 >> 8) && f[37] == (7300 & 0xFF)) captured = f; };
+    const uint8_t msg[] = "checked by the card";
+    assert(client->send_to(Ipv4Address::make(10,0,0,1), 7300, ConstByteView(msg, sizeof msg)) && lan.run_until([&] { return server->pending() == 1; }, 2000));
+    lan.wire.tap = nullptr;
+    uint8_t d[64]; uint32_t l; assert(server->receive_from(ByteView(d, sizeof d), nullptr, nullptr, &l));
+    std::vector<uint8_t> broken = captured; broken[40] ^= 0x5A;          // the UDP checksum is now wrong
+    lan.nic_a.inbox.push_back(broken); lan.step(2); assert(server->pending() == 1);           // vouched for: taken
+    assert(server->receive_from(ByteView(d, sizeof d), nullptr, nullptr, &l));
+    lan.nic_a.vouch = false; lan.nic_a.inbox.push_back(broken); lan.step(2); assert(server->pending() == 0);   // checked: dropped
+    lan.nic_a.inbox.push_back(captured); lan.step(2); assert(server->pending() == 1);         // (the good one still is)
   }
   { // ---- ARP + ICMP echo
     Lan lan; lan.configure_static(); uint32_t rtt = 99;

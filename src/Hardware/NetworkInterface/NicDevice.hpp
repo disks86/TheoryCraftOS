@@ -76,6 +76,16 @@ class INicDevice {
   virtual uint32_t config_read32(uint16_t offset) = 0;
   virtual void config_write32(uint16_t offset, uint32_t value) = 0;
 
+  // The controller's interrupt (MSI) delivered to `handler(context)`, in interrupt context, on some core. False if the controller or the
+  // machine cannot (no MSI capability, no vector left, the scheduler not running). detach_interrupt() undoes it; safe when not attached.
+  using InterruptHandler = void (*)(void* context);
+  virtual bool attach_interrupt(InterruptHandler handler, void* context) {
+    (void)handler;
+    (void)context;
+    return false;
+  }
+  virtual void detach_interrupt() {}
+
  protected:
   constexpr INicDevice() = default;
   ~INicDevice() = default;

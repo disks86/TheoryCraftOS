@@ -2,7 +2,8 @@
 # Boots the kernel in QEMU with the emulated network controllers that the consumer NIC drivers also run: `e1000e` (Intel 82574L, the e1000e
 # driver), `igb` (Intel 82576, the igb/igc driver) and `usb-net` on xHCI (CDC-ECM, after skipping its RNDIS configuration). Every netdev's
 # traffic is captured with filter-dump, and a NIC passes when its capture holds a whole DHCP exchange (Discover, Offer, Request, ACK): the
-# driver sent and received. Needs qemu-system-x86_64, OVMF, tcpdump and a configured build directory (default: build). Not part of
+# driver sent and received. The guest's UDP checksums must be right (the PCI drivers offload them), and the two PCI controllers must run on
+# MSI interrupts. Needs qemu-system-x86_64, OVMF, tcpdump and a configured build directory (default: build). Not part of
 # run_host_tests.sh because it boots a VM.
 # Usage: tests/nic_qemu.sh [build-dir] [seconds]
 set -uo pipefail
@@ -32,9 +33,17 @@ timeout "$seconds" qemu-system-x86_64 "${accel[@]}" -machine q35 -smp 4 -m 4G \
 
 grep -a "Network:" "$work/debugcon.log"
 failed=0
-for n in "n1 e1000e" "n2 igb" "n3 usb-net"; do
+for n in "n1 e1000e 52:54:00:00:00:e1 82574L" "n2 igb 52:54:00:00:00:1b 82576" "n3 usb-net 52:54:00:00:00:ec USB"; do
   set -- $n
   steps=$(tcpdump -nn -v -r "$work/$1.pcap" 2>/dev/null | grep -aoE 'DHCP-Message \(53\), length 1: [A-Za-z]+' | awk '{print $NF}' | tr '\n' ' ')
-  if [[ "$steps" == *"Discover Offer Request ACK"* ]]; then echo "$2: DHCP done"; else echo "$2: FAILED (saw: ${steps:-nothing})"; failed=1; fi
+  # the guest's own UDP datagrams (DHCP), with the checksum tcpdump recomputes: offloaded or not, it has to be right
+  sent=$(tcpdump -nn -vv -e -r "$work/$1.pcap" "ether src $3 and udp" 2>/dev/null)
+  good=$(grep -ac "udp sum ok" <<<"$sent"); bad=$(grep -acE "bad udp cksum" <<<"$sent")
+  if [[ "$steps" != *"Discover Offer Request ACK"* ]]; then echo "$2: FAILED (DHCP saw: ${steps:-nothing})"; failed=1; continue; fi
+  if [ "$bad" -ne 0 ] || [ "$good" -eq 0 ]; then echo "$2: FAILED ($good right and $bad wrong UDP checksums from the guest)"; failed=1; continue; fi
+  # the PCI controllers take MSI (QEMU's e1000e and igb have it); the USB adapter is polled
+  mode=$(grep -a "Network:   .*$4" "$work/debugcon.log" | head -1)
+  if [ "$4" != USB ] && [[ "$mode" != *"interrupts (MSI)"* ]]; then echo "$2: FAILED (not interrupt driven: ${mode:-no line})"; failed=1; continue; fi
+  echo "$2: DHCP done, $good UDP checksums right${mode:+, ${mode##*: }}"
 done
 exit $failed

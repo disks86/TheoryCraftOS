@@ -59,6 +59,59 @@ static Bytes frame_of(size_t size, uint8_t seed) {
   return f;
 }
 
+// What a checksum engine does: the ones'-complement sum from `start` to the end (the field holds the pseudo-header seed), complemented, into
+// `field`. (Written independently of the driver's software fallback.)
+static void hardware_checksum(uint8_t* frame, uint32_t length, uint32_t start, uint32_t field) {
+  if (start >= length || field + 2 > length) { printf("model: checksum request outside the frame\n"); ++g_failed; return; }
+  uint64_t sum = 0;
+  for (uint32_t i = start; i < length; i += 2) sum += (uint32_t{frame[i]} << 8) | (i + 1 < length ? frame[i + 1] : 0);
+  while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+  frame[field] = static_cast<uint8_t>(~sum >> 8);
+  frame[field + 1] = static_cast<uint8_t>(~sum);
+}
+
+// True if an IPv4 TCP/UDP frame's transport checksum is right (UDP may say 0: none).
+static bool transport_checksum_ok(const Bytes& f) {
+  if (f.size() < 34 || f[12] != 0x08 || f[13] != 0x00) return false;
+  const uint32_t ihl = (f[14] & 0x0F) * 4u, total = (f[16] << 8) | f[17], protocol = f[23];
+  if ((protocol != 6 && protocol != 17) || 14 + total > f.size()) return false;
+  const uint32_t l4 = total - ihl;
+  uint32_t sum = protocol + l4;
+  for (int i = 26; i < 34; i += 2) sum += (f[i] << 8) | f[i + 1];
+  for (uint32_t i = 0; i < l4; i += 2) sum += (f[14 + ihl + i] << 8) | (i + 1 < l4 ? f[14 + ihl + i + 1] : 0);
+  while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+  return sum == 0xFFFF;
+}
+
+// An IPv4 frame with a TCP (protocol 6) or UDP (17) payload of `payload` bytes after a header of `ip_header` bytes, the transport checksum
+// field seeded with the pseudo-header sum the way the stack does it; `request` says where the checksum goes.
+static Bytes transport_frame(uint8_t protocol, uint32_t payload, TransmitChecksum* request, uint32_t ip_header = 20) {
+  const uint32_t l4_header = protocol == 6 ? 20 : 8, l4 = l4_header + payload;
+  Bytes f(14 + ip_header + l4, 0);
+  for (int i = 0; i < 6; ++i) { f[i] = 0x02; f[6 + i] = 0x04; }
+  f[12] = 0x08;
+  f[14] = static_cast<uint8_t>(0x40 | (ip_header / 4));
+  f[16] = static_cast<uint8_t>((ip_header + l4) >> 8);
+  f[17] = static_cast<uint8_t>(ip_header + l4);
+  f[22] = 64;
+  f[23] = protocol;
+  const uint8_t addresses[8] = {10, 0, 2, 15, 93, 184, 216, 34};
+  memcpy(&f[26], addresses, 8);
+  uint8_t* t = &f[14 + ip_header];
+  t[0] = 0xC0; t[1] = 0x01; t[2] = 0x00; t[3] = 0x50;
+  if (protocol == 17) { t[4] = static_cast<uint8_t>(l4 >> 8); t[5] = static_cast<uint8_t>(l4); }
+  else { t[12] = 0x50; t[13] = 0x18; }
+  for (uint32_t i = 0; i < payload; ++i) t[l4_header + i] = static_cast<uint8_t>(i * 37 + 11);
+  const uint32_t field = 14 + ip_header + (protocol == 6 ? 16 : 6);
+  uint32_t seed = protocol + l4;
+  for (int i = 26; i < 34; i += 2) seed += (f[i] << 8) | f[i + 1];
+  while (seed >> 16) seed = (seed & 0xFFFF) + (seed >> 16);
+  f[field] = static_cast<uint8_t>(seed >> 8);
+  f[field + 1] = static_cast<uint8_t>(seed);
+  *request = TransmitChecksum{static_cast<uint16_t>(14 + ip_header), static_cast<uint16_t>(field)};
+  return f;
+}
+
 // A device: the register file (little-endian bytes) with a hook on every write, and the claim/release bookkeeping.
 struct ModelDevice : INicDevice, INicRegisters {
   std::vector<uint8_t> file;
@@ -66,6 +119,11 @@ struct ModelDevice : INicDevice, INicRegisters {
   int claims = 0, releases = 0;
   bool claim_fails = false;
   std::vector<Bytes> sent;
+  // The interrupt route: what attach_interrupt() was given. `msi_lost`: the route is set up but the messages never arrive.
+  InterruptHandler handler = nullptr;
+  void* handler_context = nullptr;
+  bool attach_refused = false, msi_lost = false;
+  int attaches = 0, detaches = 0, raised = 0;
   ModelDevice(size_t size, uint16_t v, uint16_t d) : file(size, 0), vendor(v), device(d) {}
 
   bool claim() override { ++claims; return !claim_fails; }
@@ -75,6 +133,22 @@ struct ModelDevice : INicDevice, INicRegisters {
   uint16_t device_id() const override { return device; }
   uint32_t config_read32(uint16_t) override { return 0xFFFFFFFFu; }
   void config_write32(uint16_t, uint32_t) override {}
+  bool attach_interrupt(InterruptHandler h, void* context) override {
+    if (attach_refused) return false;
+    ++attaches;
+    handler = h;
+    handler_context = context;
+    return true;
+  }
+  void detach_interrupt() override {
+    if (handler) ++detaches;
+    handler = nullptr;
+  }
+  void raise() {
+    if (!handler || msi_lost) return;
+    ++raised;
+    handler(handler_context);
+  }
 
   uint32_t raw(uint32_t off, int width) const {
     if (off + width > file.size()) { printf("model: access past the registers at %#x\n", off); abort(); }
@@ -116,7 +190,25 @@ struct RtlChipModel final : ModelDevice {
   }
   uint64_t tx_ring() const { return r32(0x20) | (uint64_t{r32(0x24)} << 32); }
   uint64_t rx_ring() const { return r32(0xE4) | (uint64_t{r32(0xE8)} << 32); }
+  uint32_t status_reg() const { return new_layout ? 0x3C : 0x3E; }
+  uint32_t mask_reg() const { return new_layout ? 0x38 : 0x3C; }
+  int status_width() const { return new_layout ? 4 : 2; }
+  // An event: its status bit is set, and an interrupt goes out if the mask lets it.
+  void signal(uint32_t bits) {
+    set_raw(status_reg(), status_width(), raw(status_reg(), status_width()) | bits);
+    if (raw(status_reg(), status_width()) & raw(mask_reg(), status_width())) raise();
+  }
+  int checksummed = 0;
   void on_write(uint32_t off, int width, uint32_t v) override {
+    if (off == status_reg() && width == status_width()) {  // write 1 to clear
+      set_raw(off, width, raw(off, width) & ~v);
+      return;
+    }
+    if (!new_layout && off == 0x38 && width == 1 && (v & 0x01)) {  // forced software interrupt
+      set_raw(off, width, v & ~1u);
+      signal(0x100);
+      if (!(v & 0x40)) return;
+    }
     if (off == 0x37 && width == 1 && (v & 0x10)) {  // reset: the configuration goes back to defaults, the identity stays
       ++resets;
       const uint32_t misc = r32(0xF0);
@@ -138,8 +230,18 @@ struct RtlChipModel final : ModelDevice {
       const uint32_t opts1 = get32(d);
       if (!(opts1 & (1u << 31))) return;
       if ((opts1 & (3u << 28)) == (3u << 28)) {
-        const uint32_t len = opts1 & 0x3FFF;
-        sent.emplace_back(at(get64(d + 8)), at(get64(d + 8)) + len);
+        const uint32_t len = opts1 & 0x3FFF, opts2 = get32(d + 4);
+        uint8_t* data = at(get64(d + 8));
+        // checksums: the RTL8169's TD0 bits (the chip finds the transport header itself), or TD1 with the header's offset
+        const bool tcp0 = opts1 & (1u << 16), udp0 = opts1 & (1u << 17), tcp1 = opts2 & (1u << 30), udp1 = opts2 & (1u << 31);
+        if (tcp0 || udp0 || tcp1 || udp1) {
+          const bool v2 = rtl8169_identify(version << 20)->family != RtlFamily::Rtl8169;
+          if ((tcp0 || udp0) == v2) { printf("model: checksum bits of the wrong descriptor format\n"); ++g_failed; }
+          const uint32_t start = (tcp1 || udp1) ? (opts2 >> 18) & 0x3FF : 14 + (data[14] & 0x0F) * 4u;
+          hardware_checksum(data, len, start, start + ((tcp0 || tcp1) ? 16 : 6));
+          ++checksummed;
+        }
+        sent.emplace_back(data, data + len);
       }
       put32(d, opts1 & ~(1u << 31));
       tx_index = (opts1 & (1u << 30)) ? 0 : tx_index + 1;
@@ -157,6 +259,7 @@ struct RtlChipModel final : ModelDevice {
     memset(at(get64(d + 8)) + frame.size(), 0xCC, 4);
     put32(d, (opts1 & (1u << 30)) | flags | len);
     rx_index = (opts1 & (1u << 30)) ? 0 : rx_index + 1;
+    signal(0x0001);  // RxOK
     return true;
   }
 };
@@ -344,8 +447,25 @@ struct IntelModel : ModelDevice {
     w32(kRah, nvm_mac[4] | (nvm_mac[5] << 8) | (1u << 31));
   }
   virtual void on_reset() {}
+  // ICR collects causes, IMS (set through IMS, cleared through IMC) says which interrupt; reading ICR clears it.
+  uint32_t ims = 0;
+  void signal(uint32_t causes) {
+    w32(0xC0, r32(0xC0) | causes);
+    if (r32(0xC0) & ims) raise();
+  }
+  uint32_t on_read(uint32_t off, int width) override {
+    if (off == 0xC0) {
+      const uint32_t v = r32(0xC0);
+      w32(0xC0, 0);
+      return v;
+    }
+    return raw(off, width);
+  }
   void on_write(uint32_t off, int width, uint32_t v) override {
     if (width != 4) { printf("model: %d-byte access to Intel register %#x\n", width, off); abort(); }
+    if (off == 0xD0) { ims |= v; w32(0xD0, ims); return; }
+    if (off == 0xD8) { ims &= ~v; w32(0xD0, ims); return; }
+    if (off == 0xC8) { signal(v); return; }
     if (off == kCtrl) {
       const uint32_t old = r32(kCtrl);
       if ((old & (1u << 16)) && !(v & (1u << 16)) && !(old & (1u << 17))) {  // LANPHYPC override released while the value was low: PHY power cycle
@@ -355,6 +475,8 @@ struct IntelModel : ModelDevice {
       }
       if (v & reset_bit) {
         ++resets;
+        ims = 0;
+        w32(0xD0, 0);
         w32(kCtrl, v & ~reset_bit & ~(1u << 2));
         w32(kRal, 0);
         w32(kRah, 0);
@@ -391,6 +513,9 @@ struct IntelModel : ModelDevice {
 struct E1000eChip final : IntelModel {
   uint32_t rx_head = 0, tx_head = 0;
   int dropped = 0;
+  int checksummed = 0;
+  bool have_context = false;
+  uint32_t context_start = 0, context_field = 0;
   E1000eChip(uint16_t device_id, bool is_chipset) : IntelModel(device_id) {
     chipset = is_chipset;
     phy_address = is_chipset && device_id != 0x10BD ? 2 : 1;
@@ -404,7 +529,20 @@ struct E1000eChip final : IntelModel {
       while (tx_head != v % n) {
         const uint64_t d = ring(0x3800) + 16ull * tx_head;
         const uint16_t len = get16(d + 8);
-        const uint8_t cmd = at(d + 11)[0];
+        const uint8_t cmd = at(d + 11)[0], type = at(d + 10)[0] >> 4;
+        if (cmd & 4) { printf("model: legacy checksum insertion (QEMU ignores it)\n"); ++g_failed; }
+        if ((cmd & 0x20) && type == 0) {  // a TCP/IP context descriptor: TUCSS, TUCSO; not written back
+          context_start = at(d + 4)[0];
+          context_field = at(d + 5)[0];
+          have_context = true;
+          tx_head = (tx_head + 1) % n;
+          continue;
+        }
+        if ((cmd & 0x20) && type == 1 && (at(d + 13)[0] & 2)) {  // an extended data descriptor with TXSM
+          if (!have_context) { printf("model: TXSM without a context\n"); ++g_failed; }
+          else hardware_checksum(at(get64(d)), len, context_start, context_field);
+          ++checksummed;
+        }
         if (cmd & 1) sent.emplace_back(at(get64(d)), at(get64(d)) + len);
         at(d + 12)[0] |= 1;  // DD
         tx_head = (tx_head + 1) % n;
@@ -423,6 +561,7 @@ struct E1000eChip final : IntelModel {
     at(d + 13)[0] = errors;
     rx_head = (rx_head + 1) % n;
     w32(0x2810, rx_head);
+    signal(1u << 7);  // RXT0
     return true;
   }
 };
@@ -431,6 +570,9 @@ struct IgbChip final : IntelModel {
   uint32_t rx_head = 0, tx_head = 0;
   int dropped = 0;
   bool bad_tx_descriptor = false;
+  bool have_context = false, context_tcp = false;
+  uint32_t context_start = 0;
+  int checksummed = 0;
   IgbChip(uint16_t device_id, bool igc) : IntelModel(device_id) {
     if (igc) reset_bit = 1u << 29;
   }
@@ -442,8 +584,21 @@ struct IgbChip final : IntelModel {
       while (tx_head != v % n) {
         const uint64_t d = ring(0xE000) + 16ull * tx_head;
         const uint32_t ctl = get32(d + 8), olinfo = get32(d + 12);
+        if (((ctl >> 20) & 0xF) == 2 && (ctl & (1u << 29))) {  // a context descriptor: remembered, not written back
+          const uint32_t lens = get32(d);
+          context_start = ((lens >> 9) & 0x7F) + (lens & 0x1FF);
+          context_tcp = ctl & (1u << 11);
+          have_context = true;
+          tx_head = (tx_head + 1) % n;
+          continue;
+        }
         // a data descriptor (DEXT, DTYP 3) with IFCS and EOP, PAYLEN matching the buffer length
         if (((ctl >> 20) & 0xF) != 3 || !(ctl & (1u << 29)) || !(ctl & (1u << 24)) || (olinfo >> 14) != (ctl & 0xFFFF)) bad_tx_descriptor = true;
+        if (olinfo & (1u << 9)) {  // TXSM: the transport checksum, as the context describes
+          if (!have_context) bad_tx_descriptor = true;
+          else hardware_checksum(at(get64(d)), ctl & 0xFFFF, context_start, context_start + (context_tcp ? 16 : 6));
+          ++checksummed;
+        }
         sent.emplace_back(at(get64(d)), at(get64(d)) + (ctl & 0xFFFF));
         put64(d, 0);       // write-back: the address is gone
         put32(d + 8, 0);
@@ -466,6 +621,7 @@ struct IgbChip final : IntelModel {
     put64(d + 8, (uint64_t{frame.size()} << 32) | status);
     rx_head = (rx_head + 1) % n;
     w32(0xC010, rx_head);
+    signal(1u << 7);  // RXT0
     return true;
   }
 };
@@ -643,6 +799,231 @@ static void test_igb_hostile() {
   }
 }
 
+// ---- interrupts and checksum offload ----------------------------------------------------------------------------------------------------------------------
+
+static int g_wakes = 0;
+static void count_wake(void*) { ++g_wakes; }
+
+// Sends TCP and UDP frames of several sizes with a checksum request through `nic`; the model finishes them like the hardware, and every one
+// must come out right. Short ones and requests the hardware cannot do are finished by the driver.
+template <class Nic, class Model>
+static void check_transmit_checksums(Nic& nic, Model* m, bool short_ones_in_software) {
+  CHECK(nic.offloads().transmit_checksums && nic.offloads().receive_checksums);
+  for (uint8_t protocol : {uint8_t{6}, uint8_t{17}}) {
+    for (uint32_t payload : {0u, 1u, 9u, 100u, 1001u, 1460u}) {
+      for (uint32_t ip_header : {20u, 24u}) {
+        TransmitChecksum request;
+        const Bytes f = transport_frame(protocol, payload, &request, ip_header);
+        if (f.size() > kEthernetMaxFrame) continue;
+        const size_t before = m->sent.size();
+        const int hardware_before = m->checksummed;
+        CHECK(nic.transmit_frame(ConstByteView(f.data(), f.size()), request));
+        CHECK(m->sent.size() == before + 1);
+        if (m->sent.size() != before + 1) continue;
+        Bytes out = m->sent.back();
+        out.resize(f.size());  // (the padding)
+        CHECK(transport_checksum_ok(out));
+        const bool by_hardware = m->checksummed == hardware_before + 1;
+        if (short_ones_in_software && f.size() < kEthernetMinFrame) CHECK(!by_hardware);
+        else CHECK(by_hardware);
+        // everything but the checksum field went out as given
+        Bytes expect = f;
+        expect[request.field] = out[request.field];
+        expect[request.field + 1] = out[request.field + 1];
+        CHECK(out == expect);
+      }
+    }
+  }
+  // a request outside the frame is refused, not sent
+  const Bytes small = frame_of(60, 5);
+  const size_t before = m->sent.size();
+  CHECK(!nic.transmit_frame(ConstByteView(small.data(), small.size()), TransmitChecksum{70, 76}) && m->sent.size() == before);
+  CHECK(!nic.transmit_frame(ConstByteView(small.data(), small.size()), TransmitChecksum{40, 59}) && m->sent.size() == before);
+}
+
+static void test_rtl_interrupts_and_checksums(uint16_t device_id, uint32_t xid, bool is_8125) {
+  TestAllocator alloc;
+  UniquePointer<RtlChipModel> owned = UniquePointer<RtlChipModel>::make(alloc, device_id, xid, is_8125);
+  RtlChipModel* m = owned.get();
+  {
+    Rtl8169NetworkInterface nic(util::move(owned), alloc);
+    CHECK(!nic.enable_interrupts(&count_wake, nullptr));  // not started
+    CHECK(nic.initialize());
+    CHECK((m->raw(0xE0, 2) & (1u << 5)) != 0);            // receive checksums on (C+ command RxChkSum)
+    g_wakes = 0;
+    CHECK(nic.enable_interrupts(&count_wake, nullptr) && nic.interrupts_enabled() && m->attaches == 1);
+    CHECK(m->raw(m->mask_reg(), m->status_width()) == (0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040 | 0x0100));
+    if (!is_8125) CHECK(m->raised == 1 && g_wakes == 1);      // the forced software interrupt went through
+    CHECK(m->raw(m->status_reg(), m->status_width()) == 0);  // and was acknowledged
+    const int wakes = g_wakes;
+    CHECK(m->deliver(frame_of(100, 1)));
+    CHECK(g_wakes == wakes + 1 && m->raw(m->status_reg(), m->status_width()) == 0);
+    uint8_t buffer[2048];
+    ReceivedFrame got;
+    CHECK(nic.receive_frame(ByteView(buffer, sizeof buffer), &got) && got.length == 100 && !got.ipv4_header_checksum_good && !got.transport_checksum_good);
+    // what the chip says about checksums
+    struct { uint32_t bits; bool ip, l4; } cases[] = {
+        {1u << 17, true, true},                // TCP, checked
+        {1u << 18, true, true},                // UDP, checked
+        {(1u << 17) | (1u << 18), true, false},  // other IP
+        {(1u << 17) | (1u << 14), true, false},  // TCP, failed
+        {(1u << 18) | (1u << 15), true, false},  // UDP, failed
+        {(1u << 17) | (1u << 16), false, false},  // the IP header failed
+    };
+    for (const auto& c : cases) {
+      CHECK(m->deliver(frame_of(80, 2), (3u << 28) | c.bits));
+      CHECK(nic.receive_frame(ByteView(buffer, sizeof buffer), &got) && got.length == 80 && got.ipv4_header_checksum_good == c.ip &&
+            got.transport_checksum_good == c.l4);
+    }
+    CHECK(nic.statistics().interrupts == static_cast<uint64_t>(m->raised));
+    check_transmit_checksums(nic, m, true);
+    nic.disable_interrupts();
+    CHECK(!nic.interrupts_enabled() && m->detaches == 1 && m->raw(m->mask_reg(), m->status_width()) == 0);
+    const int quiet = g_wakes;
+    m->deliver(frame_of(64, 3));
+    CHECK(g_wakes == quiet);
+    // on again, then shut down with them on: the route is taken down
+    CHECK(nic.enable_interrupts(&count_wake, nullptr));
+    nic.shutdown();
+    CHECK(m->detaches == 2);
+  }
+  CHECK(alloc.dma.empty());
+  // a route that delivers nothing: kept polled (the RTL8125/8126 cannot tell)
+  UniquePointer<RtlChipModel> lost = UniquePointer<RtlChipModel>::make(alloc, device_id, xid, is_8125);
+  lost->msi_lost = true;
+  RtlChipModel* l = lost.get();
+  {
+    Rtl8169NetworkInterface nic(util::move(lost), alloc);
+    CHECK(nic.initialize());
+    CHECK(nic.enable_interrupts(&count_wake, nullptr) == is_8125);
+    if (!is_8125) CHECK(l->detaches == 1 && !nic.interrupts_enabled() && l->raw(l->mask_reg(), l->status_width()) == 0);
+  }
+  UniquePointer<RtlChipModel> refused = UniquePointer<RtlChipModel>::make(alloc, device_id, xid, is_8125);
+  refused->attach_refused = true;
+  {
+    Rtl8169NetworkInterface nic(util::move(refused), alloc);
+    CHECK(nic.initialize() && !nic.enable_interrupts(&count_wake, nullptr) && !nic.interrupts_enabled());
+  }
+  CHECK(alloc.dma.empty());
+}
+
+template <class Nic, class Model>
+static void check_intel_interrupts(Nic& nic, Model* m) {
+  g_wakes = 0;
+  CHECK(nic.enable_interrupts(&count_wake, nullptr) && nic.interrupts_enabled() && m->attaches == 1);
+  CHECK(m->ims == ((1u << 2) | (1u << 4) | (1u << 6) | (1u << 7)));
+  CHECK(m->raised == 1 && g_wakes == 1 && m->r32(0xC0) == 0);  // the test interrupt (ICS), its cause read and cleared
+  m->deliver(frame_of(90, 1));
+  CHECK(g_wakes == 2 && m->r32(0xC0) == 0);
+  uint8_t buffer[2048];
+  ReceivedFrame got;
+  CHECK(nic.receive_frame(ByteView(buffer, sizeof buffer), &got) && got.length == 90);
+  m->signal(1u << 9);                // a cause that is not enabled: no interrupt
+  CHECK(g_wakes == 2);
+  CHECK(nic.statistics().interrupts == 2);
+  nic.disable_interrupts();
+  CHECK(!nic.interrupts_enabled() && m->detaches == 1 && m->ims == 0);
+}
+
+static void test_e1000e_interrupts_and_checksums(uint16_t device_id, bool chipset) {
+  TestAllocator alloc;
+  UniquePointer<E1000eChip> owned = UniquePointer<E1000eChip>::make(alloc, device_id, chipset);
+  E1000eChip* m = owned.get();
+  {
+    E1000eNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize());
+    CHECK((m->r32(0x5000) & 0x300) == 0x300);  // RXCSUM: IP and TCP/UDP
+    check_intel_interrupts(nic, m);
+    uint8_t buffer[2048];
+    ReceivedFrame got;
+    struct { uint8_t status, errors; bool ip, l4; } cases[] = {
+        {0x03 | 0x40 | 0x20, 0, true, true},     // IP and TCP checked
+        {0x03 | 0x40 | 0x10, 0, true, true},     // IP and UDP checked
+        {0x03 | 0x40, 0, true, false},           // IP only
+        {0x03 | 0x40 | 0x20, 0x20, true, false},  // TCP wrong: still handed on, unchecked
+        {0x03 | 0x40 | 0x20, 0x40, false, true},  // IP header wrong
+        {0x03 | 0x40 | 0x20 | 0x04, 0, false, false},  // "ignore checksum indication"
+    };
+    for (const auto& c : cases) {
+      CHECK(m->deliver(frame_of(70, 4), c.errors, c.status));
+      CHECK(nic.receive_frame(ByteView(buffer, sizeof buffer), &got) && got.length == 70 && got.ipv4_header_checksum_good == c.ip &&
+            got.transport_checksum_good == c.l4);
+    }
+    CHECK(m->deliver(frame_of(70, 4), 0x01));  // a CRC error: dropped
+    CHECK(!nic.receive_frame(ByteView(buffer, sizeof buffer), &got));
+    check_transmit_checksums(nic, m, false);
+    CHECK(nic.enable_interrupts(&count_wake, nullptr));
+    nic.shutdown();
+    CHECK(m->detaches == 2);
+  }
+  UniquePointer<E1000eChip> lost = UniquePointer<E1000eChip>::make(alloc, device_id, chipset);
+  lost->msi_lost = true;
+  E1000eChip* l = lost.get();
+  {
+    E1000eNetworkInterface nic(util::move(lost), alloc);
+    CHECK(nic.initialize() && !nic.enable_interrupts(&count_wake, nullptr) && !nic.interrupts_enabled() && l->detaches == 1 && l->ims == 0);
+  }
+  CHECK(alloc.dma.empty());
+}
+
+static void test_igb_interrupts_and_checksums(uint16_t device_id, bool igc) {
+  TestAllocator alloc;
+  UniquePointer<IgbChip> owned = UniquePointer<IgbChip>::make(alloc, device_id, igc);
+  IgbChip* m = owned.get();
+  {
+    IgbNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize());
+    CHECK((m->r32(0x5000) & 0x300) == 0x300);
+    check_intel_interrupts(nic, m);
+    CHECK(m->r32(0x1700) == (nic.model()->kind == IgbKind::I82575 ? 0u : 0x8080u));
+    uint8_t buffer[2048];
+    ReceivedFrame got;
+    struct { uint32_t status; bool ip, l4; } cases[] = {
+        {0x03 | 0x40 | 0x20, true, true},
+        {0x03 | 0x40 | 0x10, true, true},
+        {0x03 | 0x40, true, false},
+        {0x03 | 0x40 | 0x20 | 0x20000000, true, false},
+        {0x03 | 0x40 | 0x20 | 0x40000000, false, true},
+        {0x03 | 0x40 | 0x20 | 0x04, false, false},
+    };
+    for (const auto& c : cases) {
+      CHECK(m->deliver(frame_of(70, 4), c.status));
+      CHECK(nic.receive_frame(ByteView(buffer, sizeof buffer), &got) && got.length == 70 && got.ipv4_header_checksum_good == c.ip &&
+            got.transport_checksum_good == c.l4);
+    }
+    check_transmit_checksums(nic, m, false);
+    CHECK(!m->bad_tx_descriptor);
+    // a context descriptor takes a slot: frames with checksums fill the ring twice as fast, and it still never overruns the device
+    const size_t before = m->sent.size();
+    TransmitChecksum request;
+    const Bytes f = transport_frame(6, 500, &request);
+    for (int i = 0; i < 500; ++i) CHECK(nic.transmit_frame(ConstByteView(f.data(), f.size()), request) || i % 2);
+    for (int i = 0; i < 300; ++i) CHECK(nic.transmit(ConstByteView(f.data(), 100)));
+    CHECK(m->sent.size() >= before + 550 && !m->bad_tx_descriptor);
+    for (size_t i = before; i < m->sent.size(); ++i)
+      if (m->sent[i].size() == f.size()) CHECK(transport_checksum_ok(m->sent[i]));
+    nic.shutdown();
+  }
+  CHECK(alloc.dma.empty());
+}
+
+// An igb whose device sends nothing: the ring fills (two descriptors per checksummed frame) and is refused cleanly, never overwritten.
+static void test_igb_ring_full() {
+  TestAllocator alloc;
+  UniquePointer<IgbChip> owned = UniquePointer<IgbChip>::make(alloc, 0x1533, false);
+  IgbChip* m = owned.get();
+  IgbNetworkInterface nic(util::move(owned), alloc);
+  CHECK(nic.initialize());
+  m->w32(kTctl, m->r32(kTctl) & ~2u);  // (the model sends only while TCTL.EN is set)
+  TransmitChecksum request;
+  const Bytes f = transport_frame(17, 300, &request);
+  uint32_t accepted = 0;
+  while (nic.transmit_frame(ConstByteView(f.data(), f.size()), request)) ++accepted;
+  CHECK(accepted == (IgbNetworkInterface::kTransmitDescriptors - 1) / 2);
+  CHECK(!nic.transmit(ConstByteView(f.data(), f.size())) || accepted * 2 + 1 <= IgbNetworkInterface::kTransmitDescriptors - 1);
+  CHECK(m->sent.empty());
+}
+
 int main() {
   test_rtl_identify();
   test_rtl_chip(0x8168, 0x541, false);  // RTL8168H
@@ -663,6 +1044,16 @@ int main() {
   test_igb(0x15F3, true);   // I225-V
   test_igb(0x125C, true);   // I226-V
   test_igb_hostile();
+  test_rtl_interrupts_and_checksums(0x8168, 0x541, false);  // RTL8168H
+  test_rtl_interrupts_and_checksums(0x8169, 0x008, false);  // RTL8169 (the other descriptor format)
+  test_rtl_interrupts_and_checksums(0x8125, 0x641, true);   // RTL8125B
+  test_e1000e_interrupts_and_checksums(0x10D3, false);      // 82574L
+  test_e1000e_interrupts_and_checksums(0x15BC, true);       // I219-V
+  test_igb_interrupts_and_checksums(0x10C9, false);         // 82576
+  test_igb_interrupts_and_checksums(0x1533, false);         // I210
+  test_igb_interrupts_and_checksums(0x10A7, false);         // 82575 (no IVAR)
+  test_igb_interrupts_and_checksums(0x15F3, true);          // I225-V
+  test_igb_ring_full();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

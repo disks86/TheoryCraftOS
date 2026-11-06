@@ -172,7 +172,7 @@ void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView dat
   out.u8(static_cast<uint8_t>((header / 4) << 4));
   out.u8(flags);
   out.be16(static_cast<uint16_t>(last_advertised_window_));
-  out.be16(0);  // checksum, filled in below
+  out.be16(0);  // checksum: the IP layer fills it in
   out.be16(0);  // urgent pointer (unused)
   if (with_mss) {  // option: kind 2, length 4, our maximum segment size
     out.u8(2);
@@ -182,10 +182,6 @@ void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView dat
   out.bytes(data);
   if (!out.ok()) return;  // payload larger than a packet: cannot happen, the sender chunks to the MSS
 
-  const uint16_t total = static_cast<uint16_t>(out.position());
-  uint32_t sum = pseudo_header_sum(ip_.source_for(remote_address_), remote_address_, kProtocolTcp, total);
-  sum = checksum_add(sum, out.written());
-  out.patch_be16(16, checksum_finish(sum));
   ip_.send_ip(remote_address_, kProtocolTcp, out.written());  // a lost segment is retransmitted
 }
 

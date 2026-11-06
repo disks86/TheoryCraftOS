@@ -35,11 +35,17 @@ constexpr uint32_t kQueueThresholds = 8 | (1u << 8) | (1u << 16);  // prefetch 8
 constexpr uint32_t kSrrctl2k = 2, kSrrctlAdvancedOneBuffer = 1u << 25, kSrrctlDropEnable = 1u << 31;
 
 // Receive write-back: status in the low half of the second quadword, length in bits 47:32.
-constexpr uint32_t kRxDone = 1u << 0, kRxEndOfPacket = 1u << 1;
+constexpr uint32_t kRxDone = 1u << 0, kRxEndOfPacket = 1u << 1, kRxIgnoreChecksum = 1u << 2, kRxUdpChecksum = 1u << 4, kRxTcpChecksum = 1u << 5,
+                   kRxIpChecksum = 1u << 6;
 constexpr uint32_t kRxFrameErrors = 0x01000000 | 0x02000000 | 0x04000000 | 0x10000000 | 0x80000000u;  // CE, SE, SEQ, CXE, RXE
+constexpr uint32_t kRxTcpUdpError = 0x20000000, kRxIpError = 0x40000000;  // checksum errors: the frame is passed on, software looks again
 // Transmit data descriptor (E1000_ADVTXD_*).
 constexpr uint32_t kTxTypeData = 3u << 20, kTxExtended = 1u << 29, kTxReportStatus = 1u << 27, kTxInsertCrc = 1u << 25, kTxEndOfPacket = 1u << 24;
-constexpr uint32_t kTxPayloadShift = 14, kTxDone = 1u << 0;
+constexpr uint32_t kTxPayloadShift = 14, kTxDone = 1u << 0, kTxInsertTransportChecksum = 1u << 9;  // (POPTS.TXSM)
+// Transmit context descriptor: MACLEN and IPLEN, the context type, the transport protocol.
+constexpr uint32_t kTxTypeContext = 2u << 20, kTxContextTcp = 1u << 11, kTxMacLengthShift = 9;
+// IVAR0: queue 0's receive and transmit causes to vector 0 (igb_assign_vector in MSI mode); the 82575 has no IVAR.
+constexpr uint32_t kIvarQueue0ToVector0 = 0x8080;
 
 using K = IgbKind;
 constexpr IgbModel kModels[] = {
@@ -124,7 +130,8 @@ bool IgbNetworkInterface::initialize() {
   buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096);
   if (rx_ring_.empty() || tx_ring_.empty() || buffers_.empty()) return false;
   for (uint32_t i = 0; i < kReceiveDescriptors; ++i) post_receive(i);
-  for (uint32_t i = 0; i < kTransmitDescriptors; ++i) tx_ring_[i] = TransmitDescriptor{nic_dma_address(tx_buffer(i)), 0, kTxDone};  // free
+  for (uint32_t i = 0; i < kTransmitDescriptors; ++i) tx_ring_[i] = TransmitDescriptor{nic_dma_address(tx_buffer(i)), 0, 0};
+  tx_clean_ = 0;
   __atomic_thread_fence(__ATOMIC_RELEASE);
 
   // Receive queue: disabled while it is set up, enabled, and only then given its buffers (the tail).
@@ -153,6 +160,7 @@ bool IgbNetworkInterface::initialize() {
   if (!wait_for(regs(), kTxdctl, kQueueEnable, kQueueEnable, 100, 100)) return false;
   tx_next_ = 0;
 
+  regs().set_bits32(kRxcsum, kRxcsumIp | kRxcsumTcpUdp);
   receive_control_ = kRctlEnable | kRctlBroadcast | kRctlStripCrc;
   regs().write32(kRctl, receive_control_);
   regs().write32(kTctl, kTctlEnable | kTctlPadShortPackets | kTctlRetransmitLateCollision | kTctlCollisionThreshold | kTctlCollisionDistance);
@@ -161,6 +169,7 @@ bool IgbNetworkInterface::initialize() {
 }
 
 void IgbNetworkInterface::shutdown() {
+  disable_interrupts();
   if (claimed_) {
     started_ = false;
     if (model_ && regs().read32(kStatus) != 0xFFFFFFFFu) {
@@ -199,34 +208,82 @@ bool IgbNetworkInterface::accept_all_multicast(bool enable) {
   return enable;
 }
 
-bool IgbNetworkInterface::transmit(ConstByteView frame) {
+bool IgbNetworkInterface::enable_interrupts(NetworkWake wake, void* context) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
+  if (!started_) return false;
+  if (model_->kind != IgbKind::I82575) regs().write32(kIvar0, kIvarQueue0ToVector0);
+  return interrupts_.enable(*device_, wake, context);
+}
+
+// Frames the device has sent give their descriptors back: the data descriptor that ends each one has DD written back (a context descriptor
+// in front of it does not).
+void IgbNetworkInterface::reclaim_transmitted() {
+  while (tx_clean_ != tx_next_) {
+    const uint32_t end = tx_frame_end_[tx_clean_];
+    volatile TransmitDescriptor& d = tx_ring_[end];
+    if (!(d.offload_status & kTxDone)) return;
+    tx_clean_ = (end + 1) % kTransmitDescriptors;
+  }
+}
+
+bool IgbNetworkInterface::transmit(ConstByteView frame) { return transmit_frame(frame, TransmitChecksum{}); }
+
+bool IgbNetworkInterface::transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame || (checksum.requested() && !checksum.fits(frame.size()))) {
     ++stats_.send_failures;
     return false;
   }
-  volatile TransmitDescriptor& d = tx_ring_[tx_next_];
-  if (!(d.offload_status & kTxDone)) {
+  // The checksum needs a context descriptor (MACLEN 14, IPLEN up to 511) in front of the data; anything else is finished in software.
+  const bool hardware = checksum.requested() && (checksum.tcp() || checksum.udp()) && checksum.start >= kEthernetHeaderSize + 20 &&
+                        checksum.start - kEthernetHeaderSize <= 511;
+  const uint32_t needed = hardware ? 2 : 1;
+  reclaim_transmitted();
+  const uint32_t in_flight = (tx_next_ + kTransmitDescriptors - tx_clean_) % kTransmitDescriptors;
+  if (kTransmitDescriptors - 1 - in_flight < needed) {  // the device has not sent enough yet
     ++stats_.send_failures;
     return false;
   }
+  const uint32_t first = tx_next_;
+  if (hardware) {
+    volatile TransmitDescriptor& context = tx_ring_[first];
+    context.address = (uint64_t{kEthernetHeaderSize} << kTxMacLengthShift) | (checksum.start - kEthernetHeaderSize);  // (VLAN 0, no seed)
+    context.command_type_length = kTxTypeContext | kTxExtended | (checksum.tcp() ? kTxContextTcp : 0);
+    context.offload_status = 0;  // (no MSS, context index 0)
+    tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+  }
+  const uint32_t slot = tx_next_;
   const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
-  const ByteView buffer = tx_buffer(tx_next_).first(padded);
+  const ByteView buffer = tx_buffer(slot).first(padded);
   buffer.fill(0);
   buffer.copy_from(frame);
-  d.address = nic_dma_address(tx_buffer(tx_next_));
+  if (checksum.requested() && !hardware && !finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
+    tx_next_ = first;
+    ++stats_.send_failures;
+    return false;
+  }
+  volatile TransmitDescriptor& d = tx_ring_[slot];
+  d.address = nic_dma_address(tx_buffer(slot));
   d.command_type_length = kTxTypeData | kTxExtended | kTxReportStatus | kTxInsertCrc | kTxEndOfPacket | padded;
-  d.offload_status = padded << kTxPayloadShift;  // (and DD clear)
+  d.offload_status = (padded << kTxPayloadShift) | (hardware ? kTxInsertTransportChecksum : 0);  // (and DD clear)
+  tx_frame_end_[first] = static_cast<uint8_t>(slot);
   __atomic_thread_fence(__ATOMIC_RELEASE);
-  tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+  tx_next_ = (slot + 1) % kTransmitDescriptors;
   regs().write32(kTdt, tx_next_);
   ++stats_.frames_sent;
   return true;
 }
 
 bool IgbNetworkInterface::receive(ByteView buffer, uint32_t* length) {
+  ReceivedFrame frame;
+  if (!length || !receive_frame(buffer, &frame)) return false;
+  *length = frame.length;
+  return true;
+}
+
+bool IgbNetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* received) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !length) return false;
+  if (!started_ || !received) return false;
   for (uint32_t tries = 0; tries < kReceiveDescriptors; ++tries) {
     volatile ReceiveDescriptor& d = rx_ring_[rx_next_];
     const uint64_t upper = d.header_address;
@@ -238,7 +295,9 @@ bool IgbNetworkInterface::receive(ByteView buffer, uint32_t* length) {
     const bool usable = !(status & kRxFrameErrors) && (status & kRxEndOfPacket) && frame > 0 && frame <= kBufferSize;
     if (usable) {
       buffer.copy_from(ConstByteView(rx_buffer(rx_next_)).first(frame).at_most(buffer.size()));
-      *length = frame;
+      const bool checked = !(status & kRxIgnoreChecksum);
+      *received = ReceivedFrame{frame, checked && (status & kRxIpChecksum) && !(status & kRxIpError),
+                                checked && (status & (kRxTcpChecksum | kRxUdpChecksum)) && !(status & kRxTcpUdpError)};
       ++stats_.frames_received;
     } else {
       ++stats_.frames_dropped;
