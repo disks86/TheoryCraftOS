@@ -39,6 +39,7 @@ class Engine {
 
   bool ok() const { return vm_.ok(); }
   Vm& vm() { return vm_; }
+  const Vm& vm() const { return vm_; }
   void set_limits(uint64_t instructions, uint64_t memory_bytes);
 
   // Compiles and runs a script. False with *error ("TypeError: x is not a function", "SyntaxError: ... (line 3)") if it could not be compiled or

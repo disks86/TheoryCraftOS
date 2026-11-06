@@ -700,6 +700,29 @@ uint8_t SelectorSet::key(uint32_t i, StringView* name) const {
   return best;
 }
 
+uint32_t SelectorSet::ancestor_keys(uint32_t i, uint8_t* kinds, StringView* names, uint32_t max) const {
+  if (i >= tops_.count()) return 0;
+  const Selector& s = selectors_[tops_[i]];
+  if (s.host || s.slotted) return 0;
+  for (uint32_t k = 0; k < s.compound_count; ++k)
+    if (compound_is_host(compounds_[s.first_compound + k])) return 0;
+  uint32_t found = 0;
+  for (uint32_t k = s.compound_count; k > 1 && found < max; --k) {
+    const Combinator to_left = compounds_[s.first_compound + k - 1].combinator;
+    if (to_left != Combinator::Child && to_left != Combinator::Descendant) continue;   // (a sibling's: but its parent is the element's too, see the next compounds)
+    const Compound& c = compounds_[s.first_compound + k - 2];
+    for (uint32_t t = 0; t < c.test_count && found < max; ++t) {
+      const Test& test = tests_[c.first_test + t];
+      const uint8_t kind = test.kind == TestKind::Id ? 1 : test.kind == TestKind::Class ? 2 : test.kind == TestKind::Tag ? 3 : 0;
+      if (kind == 0) continue;
+      kinds[found] = kind;
+      names[found] = text(test.name_offset, test.name_length);
+      ++found;
+    }
+  }
+  return found;
+}
+
 bool SelectorSet::matches_any(const Node* element, const Node* scope) const {
   for (uint32_t i = 0; i < tops_.count(); ++i)
     if (matches(i, element, scope)) return true;

@@ -6465,6 +6465,29 @@ bool StyleSheet::property_registration(uint32_t index, PropertyRegistration* out
 }
 
 namespace {
+// The words of a class attribute (split at whitespace).
+template <class F>
+void for_each_word(StringView text, F&& each) {
+  auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; };
+  uint64_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() && blank(text[i])) ++i;
+    const uint64_t from = i;
+    while (i < text.size() && !blank(text[i])) ++i;
+    if (i > from) each(text.substr(from, i - from));
+  }
+}
+
+// A set of key hashes that can answer "maybe" for one that was never added, never "no" for one that was (two bits of 2048 per hash).
+struct AncestorFilter {
+  uint32_t bits[64] = {};
+  void add(uint32_t hash) {
+    bits[(hash >> 6) & 63] |= 1u << ((hash >> 1) & 31);
+    bits[(hash >> 21) & 63] |= 1u << ((hash >> 16) & 31);
+  }
+  bool has(uint32_t hash) const { return (bits[(hash >> 6) & 63] & (1u << ((hash >> 1) & 31))) && (bits[(hash >> 21) & 63] & (1u << ((hash >> 16) & 31))); }   // (bit 0 is always set: see build_index)
+};
+
 uint32_t key_hash(uint8_t kind, StringView name) {
   uint32_t h = 2166136261u ^ kind;
   h *= 16777619u;
@@ -6483,6 +6506,14 @@ void StyleSheet::build_index() const {
   key_table_.clear();
   keyed_.clear();
   unkeyed_.clear();
+  ancestor_keys_.clear();
+  for (uint32_t i = 0; i < n; ++i) {
+    uint8_t kinds[kAncestorKeys];
+    StringView names[kAncestorKeys];
+    const uint32_t found = selectors_.ancestor_keys(i, kinds, names, kAncestorKeys);
+    for (uint32_t k = 0; k < kAncestorKeys; ++k)
+      if (!ancestor_keys_.push_back(k < found ? key_hash(kinds[k], names[k]) | 1 : 0)) return;
+  }
   uint32_t capacity = 64;
   while (capacity < n * 2 && capacity < (1u << 24)) capacity <<= 1;   // (at most half full)
   for (uint32_t i = 0; i < capacity; ++i)
@@ -6560,20 +6591,34 @@ void StyleSheet::for_candidates(const dom::Node* element, bool (*visit)(void*, u
   StringView id;
   if (dom::get_attribute(element, "id", &id) && !id.empty()) add_run(1, id);
   StringView classes;
-  if (dom::get_attribute(element, "class", &classes)) {
-    auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; };
-    uint64_t i = 0;
-    while (i < classes.size()) {
-      while (i < classes.size() && blank(classes[i])) ++i;
-      const uint64_t from = i;
-      while (i < classes.size() && !blank(classes[i])) ++i;
-      if (i > from) add_run(2, classes.substr(from, i - from));
+  if (dom::get_attribute(element, "class", &classes)) for_each_word(classes, [&](StringView word) { add_run(2, word); });
+  add_run(3, element->name.view());
+  // A Bloom filter of the ids, classes and tags of the element's ancestors (the ones a child or descendant combinator can reach): a selector that needs one
+  // they do not have is skipped.
+  AncestorFilter ancestors;
+  const bool filtered = ancestor_keys_.count() == uint64_t{selectors_.count()} * kAncestorKeys;
+  if (filtered) {
+    for (const dom::Node* a = element->parent; a && a->is_element(); a = a->parent) {
+      ancestors.add(key_hash(3, a->name.view()) | 1);
+      StringView id;
+      if (dom::get_attribute(a, "id", &id) && !id.empty()) ancestors.add(key_hash(1, id) | 1);
+      StringView names;
+      if (!dom::get_attribute(a, "class", &names)) continue;
+      for_each_word(names, [&](StringView word) { ancestors.add(key_hash(2, word) | 1); });
     }
   }
-  add_run(3, element->name.view());
+  auto may_match = [&](uint32_t s) {
+    if (!filtered) return true;
+    for (uint32_t k = 0; k < kAncestorKeys; ++k) {
+      const uint32_t want = ancestor_keys_[uint64_t{s} * kAncestorKeys + k];
+      if (want == 0) return true;
+      if (!ancestors.has(want)) return false;
+    }
+    return true;
+  };
   if (all || keyed_.count() + unkeyed_.count() != selectors_.count()) {   // (or the index could not be made: no memory)
     for (uint32_t s = 0; s < selectors_.count(); ++s)
-      if (!visit(context, s)) return;
+      if (may_match(s) && !visit(context, s)) return;
     return;
   }
   for (;;) {
@@ -6581,7 +6626,8 @@ void StyleSheet::for_candidates(const dom::Node* element, bool (*visit)(void*, u
     for (uint32_t r = 0; r < run_count; ++r)
       if (runs[r].next < runs[r].run.size() && (best == kMaxRuns || runs[r].run[runs[r].next] < runs[best].run[runs[best].next])) best = r;
     if (best == kMaxRuns) return;
-    if (!visit(context, runs[best].run[runs[best].next++])) return;
+    const uint32_t s = runs[best].run[runs[best].next++];
+    if (may_match(s) && !visit(context, s)) return;
   }
 }
 
