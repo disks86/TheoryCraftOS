@@ -99,6 +99,7 @@ static void test_gpu() {
   CHECK(intel_gpu_identify(0x7D55).architecture == A::XeLpg && !intel_gpu_identify(0x7D55).discrete);
   CHECK(intel_gpu_identify(0x64A0).architecture == A::Xe2 && intel_gpu_identify(0xE20B).architecture == A::Xe2 && intel_gpu_identify(0xE20B).discrete);
   CHECK(intel_gpu_identify(0xB080).architecture == A::Xe3);
+  CHECK(intel_gpu_identify(0xD740).architecture == A::Xe3p && intel_gpu_identify(0xD75F).architecture == A::Xe3p && !intel_gpu_identify(0xD750).discrete && intel_gpu_identify(0xD760).architecture != A::Xe3p);
   CHECK(intel_gpu_identify(0x0BD5).architecture == A::XeHpc);
   CHECK(intel_gpu_identify(0x0000).architecture == A::Unknown && intel_gpu_identify(0xFFFF).architecture == A::Unknown);
   // Media engine: AV1 decode arrives with Xe-LP, AV1 encode with Arc.
@@ -122,10 +123,10 @@ static void test_media_engine() {
   using A = IntelGpuArchitecture;
   CHECK(IntelMediaEngineHw::supported(A::Gen9_5) && IntelMediaEngineHw::supported(A::XeLp));
   CHECK(IntelMediaEngineHw::supported(A::XeHpg) && IntelMediaEngineHw::supported(A::XeLpg) && IntelMediaEngineHw::supported(A::Xe2));
-  CHECK(IntelMediaEngineHw::supported(A::Xe3) && !IntelMediaEngineHw::supported(A::XeHpc) && !IntelMediaEngineHw::supported(A::Unknown));
+  CHECK(IntelMediaEngineHw::supported(A::Xe3) && IntelMediaEngineHw::supported(A::Xe3p) && !IntelMediaEngineHw::supported(A::XeHpc) && !IntelMediaEngineHw::supported(A::Unknown));
   // The register block starts at the BAR for most generations and 0x380000 into it on a standalone media tile; the window to map covers the block.
   CHECK(IntelMediaEngineHw::register_base(A::XeHpg) == 0 && IntelMediaEngineHw::register_base(A::Gen9_5) == 0);
-  CHECK(IntelMediaEngineHw::register_base(A::XeLpg) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe2) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe3) == 0x380000);
+  CHECK(IntelMediaEngineHw::register_base(A::XeLpg) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe2) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe3) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe3p) == 0x380000);
   CHECK(IntelMediaEngineHw::register_window(A::XeLp) == 0x20000 && IntelMediaEngineHw::register_window(A::Xe2) == 0x3A0000 && IntelMediaEngineHw::register_window(A::Xe3) == 0x3A0000 && IntelMediaEngineHw::register_window(A::XeHpc) == 0);
 
   // Gen9.5: one box; it acknowledges when the ack bit is set, and the request is withdrawn afterwards.
@@ -161,7 +162,7 @@ static void test_media_engine() {
   CHECK(s.probed && s.vdbox_present == 0x5 && s.vdbox_awake == 0x5);
   CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeLpg).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe2).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe3).probed);   // BAR too short for the tile
   CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeHpc).probed);
-  for (A tile : {A::XeLpg, A::Xe2, A::Xe3}) {
+  for (A tile : {A::XeLpg, A::Xe2, A::Xe3, A::Xe3p}) {
     std::vector<uint32_t> bar(IntelMediaEngineHw::register_window(tile) / 4, 0);
     const uint64_t base = IntelMediaEngineHw::kMediaTileBase;
     bar[(base + 0x0D50) / 4] = bar[(base + 0x0D58) / 4] = 1;   // both boxes acknowledge

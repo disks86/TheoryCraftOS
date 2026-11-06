@@ -186,7 +186,7 @@ void SystemVideoCodecs::add_intel(const PciDeviceInfo& d) {
   // The engine driver follows the Gen9.5, Gen11, Xe-LP, Xe-LPG and Xe-HPG layouts only (Xe-LPG and Xe-HPG have a fixed 8 MiB global GTT) (its GTT geometry, its video box); no other generation gets its GTT looked at. Xe-LPG's video
   // boxes are on the media tile: 0x380000 into the BAR (IntelMediaEngineHw::kMediaTileBase), where the registers repeat; the driver gets a window onto that.
   const IntelGpuArchitecture architecture = device->gpu().architecture;
-  const bool xe_lpg = (architecture == IntelGpuArchitecture::XeLpg && !device->gpu().discrete) || architecture == IntelGpuArchitecture::Xe2;   // (the media tile: Meteor/Arrow Lake, Lunar Lake, Battlemage)
+  const bool xe_lpg = (architecture == IntelGpuArchitecture::XeLpg && !device->gpu().discrete) || architecture == IntelGpuArchitecture::Xe2 || ((architecture == IntelGpuArchitecture::Xe3 || architecture == IntelGpuArchitecture::Xe3p) && !device->gpu().discrete);   // (the media tile: Meteor/Arrow Lake, Lunar Lake, Battlemage, Panther Lake)
   const bool xe_hpg = architecture == IntelGpuArchitecture::XeHpg && device->gpu().discrete;   // (Arc: registers at the start of the BAR, no media tile)
   if (intel_hardware_ && (architecture == IntelGpuArchitecture::Gen9_5 || architecture == IntelGpuArchitecture::Gen11 || xe_lpg || xe_hpg ||
                           (architecture == IntelGpuArchitecture::XeLp && !device->gpu().discrete)) && !intel_registers_bank_ &&
