@@ -32,36 +32,58 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen11.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12Hevc.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgHevc.inc"
 
 constexpr uint32_t kPage = 4096;
 constexpr uint32_t kCacheLine = 64;
 constexpr uint32_t kMaxPakInsertDwords = 250;   // (the validator reads a command's length from eight bits)
 
-// The VDEnc surface state commands share their body (dwords 2..5 of the command; the second surface of the DS reference command has its own at dwords 6..9).
-void vdenc_surface_body(uint32_t (&d)[10], uint32_t at, uint32_t width, uint32_t height, const Nv12TiledLayout& layout) {
+// The VDEnc surface state commands share their body (dwords 2..5 of the command; the second surface of the DS reference command has its own at dwords 6..9). Xe-LP and later
+// have a five-bit surface format from bit 27 of the second dword (NV12 is 4), tiled with the Y-major walk; `chroma_filter` is the chroma downsample filter control (bits 20 .. 22)
+// the Xe-LPG driver sets to 7 on the source surface.
+void vdenc_surface_body(uint32_t (&d)[10], uint32_t at, uint32_t width, uint32_t height, const Nv12TiledLayout& layout, uint32_t chroma_filter) {
   d[at] = ((height - 1) << 18) | ((width - 1) << 4);
-  d[at + 1] = 1u | (1u << 1) | ((layout.pitch - 1) << 3) | (1u << 27) | (intel_mfx::kSurfacePlanar420 << 28);   // Y-major tiled, pitch, interleaved chroma
+  d[at + 1] = 1u | (1u << 1) | ((layout.pitch - 1) << 3) | (chroma_filter << 20) | (intel_mfx::kSurfacePlanar420 << 27);
   d[at + 2] = layout.chroma_offset_rows;
   d[at + 3] = layout.chroma_offset_rows;
 }
 
 template <uint32_t N>
-void vdenc_surface(DwordWriter& w, const uint32_t (&defaults)[N], uint32_t width, uint32_t height, const Nv12TiledLayout& layout) {
-  Command<N> c(defaults);
-  c.raw(2, ((height - 1) << 18) | ((width - 1) << 4));
-  c.raw(3, 1u | (1u << 1) | ((layout.pitch - 1) << 3) | (1u << 27) | (intel_mfx::kSurfacePlanar420 << 28));
-  c.raw(4, layout.chroma_offset_rows);
-  c.raw(5, layout.chroma_offset_rows);
-  c.emit(w);
+void vdenc_surface(DwordWriter& w, const uint32_t (&defaults)[N], uint32_t width, uint32_t height, const Nv12TiledLayout& layout, uint32_t chroma_filter) {
+  uint32_t d[10] = {};
+  for (uint32_t i = 0; i < N; ++i) d[i] = defaults[i];
+  vdenc_surface_body(d, 2, width, height, layout, chroma_filter);
+  for (uint32_t i = 0; i < N; ++i) w.emit(d[i]);
 }
 
 // VDENC_DS_REF_SURFACE_STATE of Xe-LP: two surfaces, the 8x down-scaled picture and the 4x one.
 void vdenc_ds_surfaces(DwordWriter& w, const HevcEncodeLayout& l) {
   uint32_t d[10];
   for (uint32_t i = 0; i < 10; ++i) d[i] = kGen11VdencDsRefSurfaceStateDefault[i];
-  vdenc_surface_body(d, 2, l.ds8_width, l.ds8_height, l.ds8);
-  vdenc_surface_body(d, 6, l.ds4_width, l.ds4_height, l.ds4);
+  vdenc_surface_body(d, 2, l.ds8_width, l.ds8_height, l.ds8, 0);
+  vdenc_surface_body(d, 6, l.ds4_width, l.ds4_height, l.ds4, 0);
   for (uint32_t i = 0; i < 10; ++i) w.emit(d[i]);
+}
+
+// VDENC_PIPE_BUF_ADDR_STATE. The 89-dword command of Xe-LPG keeps the first 71 dwords where Xe-LP's has them (the rest is for AVC, VP9 and AV1 and stays as the image has it).
+template <uint32_t N>
+void vdenc_pipe_buf(DwordWriter& w, const uint32_t (&image)[N], const HevcEncodePicture& p, const HevcEncodeBuffers& b) {
+  Command<N> c(image);
+  if (p.p_picture) {
+    c.buffer(1, b.reference_ds8, kMocs);
+    c.buffer(37, b.reference_ds4, kMocs);
+    c.buffer(22, b.reference, kMocs);
+  }
+  c.buffer(10, b.source, kMocs);
+  c.buffer(16, b.vdenc_row_store, kMocs);
+  c.buffer(34, b.vdenc_statistics, kMocs);
+  c.buffer(46, b.pak_objects, kMocs);
+  c.buffer(49, b.recon_ds8, kMocs);
+  c.buffer(52, b.recon_ds4, kMocs);
+  c.raw(61, 3 * kCacheLine);   // the weights histogram follows the first three cache lines of the statistics
+  c.buffer(62, b.vdenc_tile_row_store, kMocs);
+  c.buffer(65, b.cu_count, kMocs);
+  c.emit(w);
 }
 
 void hcp_surface(DwordWriter& w, uint32_t id, const HevcEncodeLayout& l) {
@@ -186,6 +208,35 @@ void vdenc_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
     c.raw(18, (c.get(18) & 0xffffff00u) | 0x3f);
     c.raw(18, (c.get(18) & 0xffff00ffu) | 0x4400);
     c.raw(30, (c.get(30) & 0xff000000u) | 0x232323);
+  }
+  c.emit(w);
+}
+
+// VDENC_CMD1 and VDENC_CMD2 of Xe-LPG: the images the media driver's own parameter code produces for an I picture and a low-delay B picture (constant QP, target usage 7), with
+// the one dword each that depends on the quantiser (lambda and its square root; QpPrimeYAc) and the picture's size and picture order counts.
+uint32_t xe_lpg_qp_index(const HevcEncodePicture& p) { return static_cast<uint32_t>(clip(10, 51, p.qp)) - 10; }
+
+void xe_lpg_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
+  Command<kXeLpgVdencCmd1Dwords> c(p.p_picture ? kXeLpgVdencCmd1ImageB : kXeLpgVdencCmd1ImageI);
+  c.raw(kXeLpgVdencCmd1QpDword, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[xe_lpg_qp_index(p)]);
+  c.emit(w);
+}
+
+void xe_lpg_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayout& l) {
+  Command<kXeLpgVdencCmd2Dwords> c(p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI);
+  c.raw(kXeLpgVdencCmd2QpDword, (p.p_picture ? kXeLpgVdencCmd2QpTableB : kXeLpgVdencCmd2QpTableI)[xe_lpg_qp_index(p)]);
+  c.set(kXeLpgVdencCmd2_FrameWidthInPixelsMinusOne, l.width - 1);
+  c.set(kXeLpgVdencCmd2_FrameHeightInPixelsMinusOne, l.height - 1);
+  if (p.p_picture) {
+    // As on Xe-LP: the distance to the picture the list entry names; the entries the lists do not have name "frame 0" of the POC list, so they get this picture's own count.
+    const int32_t distance = clip(-16, 16, static_cast<int32_t>(p.poc) - static_cast<int32_t>(p.reference_poc));
+    const int32_t unused = clip(-16, 16, static_cast<int32_t>(p.poc));
+    c.set(kXeLpgVdencCmd2_FwdPocNumberForRefid0InL0, static_cast<uint32_t>(distance) & 0xFF);
+    c.set(kXeLpgVdencCmd2_BwdPocNumberForRefid0InL1, static_cast<uint32_t>(distance) & 0xFF);
+    c.set(kXeLpgVdencCmd2_PocNumberForRefid1InL0, static_cast<uint32_t>(unused) & 0xFF);
+    c.set(kXeLpgVdencCmd2_PocNumberForRefid1InL1, static_cast<uint32_t>(unused) & 0xFF);
+    c.set(kXeLpgVdencCmd2_PocNumberForRefid2InL0, static_cast<uint32_t>(unused) & 0xFF);
+    c.set(kXeLpgVdencCmd2_PocNumberForRefid2InL1, static_cast<uint32_t>(unused) & 0xFF);
   }
   c.emit(w);
 }
@@ -438,7 +489,10 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
   hcp_flat_matrices(w);
 
   // --- The VDEnc pipeline: mode (TLB prefetch, random-access off), surfaces, buffers.
-  {
+  const bool xe_lpg = p.platform == HevcVdencPlatform::XeLpg;
+  if (xe_lpg) {
+    for (uint32_t i = 0; i < kXeLpgVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgVdencPipeModeSelectImage[i]);
+  } else {
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
     c.set(kGen12VdencPipeModeSelect_StandardSelect, 0);   // HEVC
     c.set(kGen12VdencPipeModeSelect_FrameStatisticsStreamOutEnable, 0);
@@ -455,30 +509,15 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
     c.set(kGen12VdencPipeModeSelect_Numverticalreqminus1Src, 1);
     c.emit(w);
   }
-  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full);
-  vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full);
+  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, xe_lpg ? 7 : 0);
+  vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full, 0);
   vdenc_ds_surfaces(w, layout);
-  {
-    Command<kGen12VdencPipeBufAddrStateDwords> c(kGen12VdencPipeBufAddrStateDefault);
-    if (p.p_picture) {
-      c.buffer(1, b.reference_ds8, kMocs);
-      c.buffer(37, b.reference_ds4, kMocs);
-      c.buffer(22, b.reference, kMocs);
-    }
-    c.buffer(10, b.source, kMocs);
-    c.buffer(16, b.vdenc_row_store, kMocs);
-    c.buffer(34, b.vdenc_statistics, kMocs);
-    c.buffer(46, b.pak_objects, kMocs);
-    c.buffer(49, b.recon_ds8, kMocs);
-    c.buffer(52, b.recon_ds4, kMocs);
-    c.raw(61, 3 * kCacheLine);   // the weights histogram follows the first three cache lines of the statistics
-    c.buffer(62, b.vdenc_tile_row_store, kMocs);
-    c.buffer(65, b.cu_count, kMocs);
-    c.emit(w);
-  }
+  if (xe_lpg) vdenc_pipe_buf<kXeLpgVdencPipeBufAddrStateDwords>(w, kXeLpgVdencPipeBufAddrStateImage, p, b);
+  else vdenc_pipe_buf<kGen12VdencPipeBufAddrStateDwords>(w, kGen12VdencPipeBufAddrStateDefault, p, b);
 
   // --- CMD1, HCP_PIC_STATE, CMD2.
-  vdenc_cmd1(w, p);
+  if (xe_lpg) xe_lpg_cmd1(w, p);
+  else vdenc_cmd1(w, p);
   {
     Command<kGen12HcpPicStateDwords> c(kGen12HcpPicStateDefault);
     c.set(kGen12HcpPicState_Framewidthinmincbminus1, layout.width / 8 - 1);
@@ -511,7 +550,8 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
     c.set(kGen12HcpPicState_TemporalMvPredDisable, 1);
     c.emit(w);
   }
-  vdenc_cmd2(w, p, layout);
+  if (xe_lpg) xe_lpg_cmd2(w, p, layout);
+  else vdenc_cmd2(w, p, layout);
   (void)qp;
 }
 
@@ -565,53 +605,73 @@ bool emit_hevc_vdenc_slice(DwordWriter& w, const HevcEncodePicture& p, const Hev
     pak_insert(w, headers[i], i + 1 == headers.size());
   }
 
-  // --- VDENC_WEIGHTSOFFSETS_STATE: no weighted prediction.
-  {
-    Command<kGen12VdencWeightsOffsetsStateDwords> c(kGen12VdencWeightsOffsetsStateDefault);
-    c.set(kGen12VdencWeightsOffsetsState_WeightsForwardReference0, 1);
-    c.set(kGen12VdencWeightsOffsetsState_OffsetForwardReference0, 0);
-    c.set(kGen12VdencWeightsOffsetsState_WeightsForwardReference1, 1);
-    c.set(kGen12VdencWeightsOffsetsState_OffsetForwardReference1, 0);
-    c.set(kGen12VdencWeightsOffsetsState_WeightsForwardReference2, 1);
-    c.set(kGen12VdencWeightsOffsetsState_OffsetForwardReference2, 0);
-    c.set(kGen12VdencWeightsOffsetsState_HevcVp9WeightsBackwardReference0, 1);
-    c.set(kGen12VdencWeightsOffsetsState_HevcVp9OffsetBackwardReference0, 0);
-    c.emit(w);
-  }
+  if (p.platform == HevcVdencPlatform::XeLpg) {
+    // --- VDENC_WEIGHTSOFFSETS_STATE (7 dwords), the tile and slice state (the whole picture is one tile of the picture's size) and the 3-dword walker.
+    for (uint32_t i = 0; i < kXeLpgVdencWeightsOffsetsStateDwords; ++i) w.emit(kXeLpgVdencWeightsOffsetsStateImage[i]);
+    {
+      Command<kXeLpgVdencTileSliceStateDwords> c(kXeLpgVdencTileSliceStateImage);
+      c.set(kXeLpgVdencTileSliceState_TileWidth, (layout.width >= 256 ? align_up(layout.width, 8) : layout.width) - 1);
+      c.set(kXeLpgVdencTileSliceState_TileHeight, (layout.height >= 128 ? align_up(layout.height, 8) : layout.height) - 1);
+      c.emit(w);
+    }
+    {
+      Command<kXeLpgVdencWalkerStateDwords> c(kXeLpgVdencWalkerStateImage);
+      c.set(kXeLpgVdencWalkerState_FirstSuperSlice, 0);
+      c.set(kXeLpgVdencWalkerState_MbLcuStartXPosition, 0);
+      c.set(kXeLpgVdencWalkerState_MbLcuStartYPosition, 0);
+      c.set(kXeLpgVdencWalkerState_NextsliceMbLcuStartXPosition, layout.ctbs_x);
+      c.set(kXeLpgVdencWalkerState_NextsliceMbStartYPosition, layout.ctbs_y);
+      c.emit(w);
+    }
+  } else {
+    // --- VDENC_WEIGHTSOFFSETS_STATE: no weighted prediction.
+    {
+      Command<kGen12VdencWeightsOffsetsStateDwords> c(kGen12VdencWeightsOffsetsStateDefault);
+      c.set(kGen12VdencWeightsOffsetsState_WeightsForwardReference0, 1);
+      c.set(kGen12VdencWeightsOffsetsState_OffsetForwardReference0, 0);
+      c.set(kGen12VdencWeightsOffsetsState_WeightsForwardReference1, 1);
+      c.set(kGen12VdencWeightsOffsetsState_OffsetForwardReference1, 0);
+      c.set(kGen12VdencWeightsOffsetsState_WeightsForwardReference2, 1);
+      c.set(kGen12VdencWeightsOffsetsState_OffsetForwardReference2, 0);
+      c.set(kGen12VdencWeightsOffsetsState_HevcVp9WeightsBackwardReference0, 1);
+      c.set(kGen12VdencWeightsOffsetsState_HevcVp9OffsetBackwardReference0, 0);
+      c.emit(w);
+    }
 
-  // --- VDENC_WALKER_STATE: the one slice covers the picture. The rows from DW11 on are the driver's tables by slice quantiser (AddVdencWalkerStateCmd, HEVC branch, target usage 7).
-  {
-    Command<kGen12VdencWalkerStateDwords> c(kGen12VdencWalkerStateDefault);
-    c.set(kGen12VdencWalkerState_MbLcuStartYPosition, 0);
-    c.set(kGen12VdencWalkerState_MbLcuStartXPosition, 0);
-    c.set(kGen12VdencWalkerState_NextsliceMbLcuStartXPosition, layout.ctbs_x);
-    c.set(kGen12VdencWalkerState_NextsliceMbStartYPosition, layout.ctbs_y);
-    c.set(kGen12VdencWalkerState_Log2WeightDenomLuma, 0);
-    c.set(kGen12VdencWalkerState_HevcLog2WeightDemonLuma, 0);
-    c.set(kGen12VdencWalkerState_TileWidth, layout.width - 1);
-    c.set(kGen12VdencWalkerState_TileHeight, layout.height - 1);
-    c.raw(11, c.get(11) & 0xfffc00ffu);
-    c.raw(12, (c.get(12) & 0xfcffffffu) | 0x1000000);
-    c.set(kGen12VdencWalkerState_IbcControl, 0);
-    c.set(kGen12VdencWalkerState_PaletteModeEnable, 0);
-    uint32_t index;
-    if (qp <= 12) index = 0;
-    else if (qp <= 47) index = (qp - 8) / 5;
-    else if (qp <= 49) index = 8;
-    else index = 9;
-    static const uint32_t kTable1[10] = {0x50001, 0x50001, 0x50001, 0x50002, 0x90002, 0x90002, 0x90002, 0xd0002, 0x190002, 0x210003};
-    static const uint32_t kTable2[10] = {0x2000a, 0x2000a, 0x2000a, 0x4000a, 0x8000a, 0xc0010, 0xc0018, 0xc0018, 0x100020, 0x180030};
-    static const uint32_t kTable3[10] = {0x101004, 0x101004, 0x101004, 0xc1008, 0x42004, 0x42006, 0x13f06, 0x13f06, 0x13f0c, 0x13006};
-    static const uint32_t kTable4[10] = {0x100004, 0x100004, 0x100004, 0x100004, 0x200004, 0x300004, 0x400004, 0x600004, 0x800004, 0x1000004};
-    c.raw(12, (c.get(12) & 0xff80fff8u) | kTable1[index]);
-    c.raw(13, kTable2[index]);
-    c.raw(14, (c.get(14) & 0xffe0c0c0u) | kTable3[index]);
-    c.raw(15, (c.get(15) & 0xfc00u) | kTable4[index]);
-    c.raw(12, c.get(12) & 0xffff00ffu);
-    c.raw(14, (c.get(14) & 0x9fffffu) | 0xc8400000u);
-    c.raw(16, (c.get(16) & 0xffffffu) | 0xa6000000u);
-    c.raw(16, (c.get(16) & 0xffc0c0c0u) | 0x313131);   // target usage 7
-    c.emit(w);
+    // --- VDENC_WALKER_STATE: the one slice covers the picture. The rows from DW11 on are the driver's tables by slice quantiser (AddVdencWalkerStateCmd, HEVC branch, target usage 7).
+    {
+      Command<kGen12VdencWalkerStateDwords> c(kGen12VdencWalkerStateDefault);
+      c.set(kGen12VdencWalkerState_MbLcuStartYPosition, 0);
+      c.set(kGen12VdencWalkerState_MbLcuStartXPosition, 0);
+      c.set(kGen12VdencWalkerState_NextsliceMbLcuStartXPosition, layout.ctbs_x);
+      c.set(kGen12VdencWalkerState_NextsliceMbStartYPosition, layout.ctbs_y);
+      c.set(kGen12VdencWalkerState_Log2WeightDenomLuma, 0);
+      c.set(kGen12VdencWalkerState_HevcLog2WeightDemonLuma, 0);
+      c.set(kGen12VdencWalkerState_TileWidth, layout.width - 1);
+      c.set(kGen12VdencWalkerState_TileHeight, layout.height - 1);
+      c.raw(11, c.get(11) & 0xfffc00ffu);
+      c.raw(12, (c.get(12) & 0xfcffffffu) | 0x1000000);
+      c.set(kGen12VdencWalkerState_IbcControl, 0);
+      c.set(kGen12VdencWalkerState_PaletteModeEnable, 0);
+      uint32_t index;
+      if (qp <= 12) index = 0;
+      else if (qp <= 47) index = (qp - 8) / 5;
+      else if (qp <= 49) index = 8;
+      else index = 9;
+      static const uint32_t kTable1[10] = {0x50001, 0x50001, 0x50001, 0x50002, 0x90002, 0x90002, 0x90002, 0xd0002, 0x190002, 0x210003};
+      static const uint32_t kTable2[10] = {0x2000a, 0x2000a, 0x2000a, 0x4000a, 0x8000a, 0xc0010, 0xc0018, 0xc0018, 0x100020, 0x180030};
+      static const uint32_t kTable3[10] = {0x101004, 0x101004, 0x101004, 0xc1008, 0x42004, 0x42006, 0x13f06, 0x13f06, 0x13f0c, 0x13006};
+      static const uint32_t kTable4[10] = {0x100004, 0x100004, 0x100004, 0x100004, 0x200004, 0x300004, 0x400004, 0x600004, 0x800004, 0x1000004};
+      c.raw(12, (c.get(12) & 0xff80fff8u) | kTable1[index]);
+      c.raw(13, kTable2[index]);
+      c.raw(14, (c.get(14) & 0xffe0c0c0u) | kTable3[index]);
+      c.raw(15, (c.get(15) & 0xfc00u) | kTable4[index]);
+      c.raw(12, c.get(12) & 0xffff00ffu);
+      c.raw(14, (c.get(14) & 0x9fffffu) | 0xc8400000u);
+      c.raw(16, (c.get(16) & 0xffffffu) | 0xa6000000u);
+      c.raw(16, (c.get(16) & 0xffc0c0c0u) | 0x313131);   // target usage 7
+      c.emit(w);
+    }
   }
   (void)layout;
 
