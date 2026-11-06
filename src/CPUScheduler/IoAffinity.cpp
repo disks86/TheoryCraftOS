@@ -30,8 +30,10 @@ uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<c
   // A shared last-level cache still has what the interrupt handler (or the thread itself, before) read, so it is worth something too.
   const int32_t anchor = hints.io_core != kNoCore ? hints.io_core : hints.last_core;
   CorePlace anchor_place;
-  if (anchor >= 0 && cores.try_get(static_cast<uint64_t>(anchor), &anchor_place) && anchor_place.cache_domain == place.cache_domain)
-    score += kScoreCacheDomain;
+  if (anchor >= 0 && cores.try_get(static_cast<uint64_t>(anchor), &anchor_place)) {
+    if (anchor_place.cache_domain == place.cache_domain) score += kScoreCacheDomain;
+    if (anchor_place.numa_node == place.numa_node) score += kScoreNumaNode;
+  }
   return score;
 }
 
@@ -48,6 +50,27 @@ int32_t choose_wake_core(const PlacementHints& hints, const CoreSet& allowed, Ar
     }
   }
   return best;
+}
+
+int32_t choose_queue_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, ArrayView<const uint32_t> queued) {
+  int32_t best = kNoCore, shortest = kNoCore;
+  uint32_t best_score = 0, best_length = 0, shortest_length = 0;
+  for (uint32_t i = 0; i < cores.size() && i < kMaxPlacementCores; ++i) {
+    if (!cores[i].online || !allowed.has(i)) continue;
+    uint32_t length = 0;
+    queued.try_get(i, &length);
+    const uint32_t score = placement_score(hints, i, cores);
+    if (best == kNoCore || score > best_score || (score == best_score && length < best_length)) {
+      best = static_cast<int32_t>(i);
+      best_score = score;
+      best_length = length;
+    }
+    if (shortest == kNoCore || length < shortest_length) {
+      shortest = static_cast<int32_t>(i);
+      shortest_length = length;
+    }
+  }
+  return best != kNoCore && best_length > shortest_length + kQueueImbalance ? shortest : best;
 }
 
 int32_t choose_interrupt_core(ArrayView<const CorePlace> cores, ArrayView<const uint32_t> devices_per_core, const CoreSet& allowed, int8_t kind,

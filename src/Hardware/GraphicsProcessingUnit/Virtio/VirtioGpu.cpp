@@ -138,12 +138,19 @@ bool VirtioGpu::enable_interrupts() {
     return false;
   }
   interrupts_ = true;
+  kernel::set_io_device_retarget(io_device_, &VirtioGpu::retarget_interrupt, this);   // (the scheduler may move it to where its waiters run)
   return true;
+}
+
+bool VirtioGpu::retarget_interrupt(void* self, uint32_t, uint64_t hardware_id) {
+  VirtioGpu* gpu = static_cast<VirtioGpu*>(self);
+  return hardware_id <= 0xFF && gpu->transport_ && gpu->transport_->retarget_msix(static_cast<uint32_t>(hardware_id));
 }
 
 void VirtioGpu::disable_interrupts() {
   if (!interrupts_) return;
   interrupts_ = false;                 // commands are waited for by polling from here on
+  kernel::set_io_device_retarget(io_device_, nullptr, nullptr);   // (no move while MSI-X goes off)
   if (transport_) transport_->disable_msix();
   drop_interrupt_handler();
 }

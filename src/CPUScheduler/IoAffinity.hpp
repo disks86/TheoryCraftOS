@@ -51,6 +51,7 @@ struct CorePlace {
   bool idle = false;            // running only its idle thread
   int8_t kind = 0;              // hardware::CoreKind
   uint32_t cache_domain = 0;    // cores that share the last-level cache have the same number
+  uint32_t numa_node = 0;       // the ACPI proximity domain (SRAT) the core is in; 0 for every core of a machine without one
 };
 
 // What a thread brings to placement.
@@ -81,9 +82,42 @@ struct LearnedIoCore {
   int32_t hint() const { return confidence ? core : kNoCore; }
 };
 
+// Whether a device's interrupt should move to where the threads it wakes run. Each wake-up says where the woken thread will run if that is not
+// the interrupt's core (pinned elsewhere, or wanting another kind of core), else kNoCore. Once a window of wake-ups is in, decide() names a core
+// when most of them (three in four) had to run elsewhere and one core has a clear majority of those (a majority vote over the window).
+struct InterruptSteering {
+  static constexpr uint32_t kWindow = 32;
+  int32_t candidate = kNoCore;
+  uint32_t votes = 0;
+  uint32_t seen = 0;
+  uint32_t remote = 0;
+
+  void note(int32_t consumer_core) {
+    ++seen;
+    if (consumer_core < 0) return;
+    ++remote;
+    if (votes == 0) {
+      candidate = consumer_core;
+      votes = 1;
+    } else if (candidate == consumer_core) {
+      ++votes;
+    } else {
+      --votes;
+    }
+  }
+  bool window_full() const { return seen >= kWindow; }
+  // The core to move to, or kNoCore; starts a new window either way.
+  int32_t decide() {
+    const int32_t to = remote * 4 >= seen * 3 && remote && votes * 2 >= remote ? candidate : kNoCore;
+    *this = InterruptSteering();
+    return to;
+  }
+};
+
 // How much each match is worth when cores compete for a thread (or threads for a core). The kind the thread asked for outweighs everything
-// else (it is an explicit request; the rest are guesses), then the device's own core, then the cache it left behind, then a shared cache.
-constexpr uint32_t kScoreKind = 16, kScoreIoCore = 8, kScoreLastCore = 4, kScoreCacheDomain = 2;
+// else (it is an explicit request; the rest are guesses), then the device's own core, then the cache it left behind, then a shared cache, then
+// the same NUMA node (memory the device wrote by DMA, and the thread's own, are nearer there).
+constexpr uint32_t kScoreKind = 16, kScoreIoCore = 8, kScoreLastCore = 4, kScoreCacheDomain = 2, kScoreNumaNode = 1;
 
 // How well `core` suits a thread with these hints. 0 for a core out of range.
 uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<const CorePlace> cores);
@@ -91,6 +125,12 @@ uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<c
 // The idle core a thread that has just become ready should be started on: online, idle, in `allowed`, with the best placement_score (the lowest
 // index on a tie). kNoCore when no allowed core is idle (the thread then waits for a core to give up its current thread).
 int32_t choose_wake_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores);
+
+// The core whose run queue a ready thread joins when no allowed core is idle: the online allowed core with the best placement_score (the shorter
+// queue, `queued[i]`, among equals, then the lower index), unless that queue is more than kQueueImbalance longer than the shortest allowed one,
+// which then gets the thread instead (so one popular device does not pile every thread onto its core). kNoCore if no allowed core is online.
+constexpr uint32_t kQueueImbalance = 2;
+int32_t choose_queue_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, ArrayView<const uint32_t> queued);
 
 // The core a new device's interrupt should be sent to: an online core in `allowed`, of `kind` if one is online (-1: any kind), carrying the fewest
 // device interrupts already (`devices_per_core[i]`, missing entries count as 0), not `avoid` unless no other core qualifies, the lowest index on a

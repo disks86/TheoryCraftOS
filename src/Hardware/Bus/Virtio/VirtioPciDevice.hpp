@@ -61,6 +61,8 @@ class VirtioPciDevice final : public IHardware {
   bool enable_msix(uint8_t vector, uint32_t apic_id, uint16_t queue_index);
   // Back to no interrupts (the queue's vector is dropped, MSI-X is switched off).
   void disable_msix();
+  // The MSI-X entry enable_msix() set up now goes to the core with local APIC id `apic_id` (masked while it changes). False if MSI-X is off.
+  bool retarget_msix(uint32_t apic_id);
 
   // Device-specific configuration space.
   uint8_t read_config8(uint32_t offset) const;

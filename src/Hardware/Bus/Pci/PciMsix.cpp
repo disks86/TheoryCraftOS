@@ -59,6 +59,18 @@ bool PciMsix::enable(PciAddress function, const uint8_t* vectors, uint32_t count
   capability_ = cap;
   table_ = region;
   entries_ = size;
+  used_ = count;
+  return true;
+}
+
+bool PciMsix::retarget(uint32_t apic_id) {
+  if (capability_ == 0 || apic_id > 0xFF) return false;
+  for (uint32_t i = 0; i < used_; ++i) {
+    const uint64_t at = static_cast<uint64_t>(i) * kEntryBytes;
+    table_.write32(at + 12, 1);
+    table_.write32(at + 0, 0xFEE00000u | (apic_id << 12));
+    table_.write32(at + 12, 0);
+  }
   return true;
 }
 
@@ -70,6 +82,7 @@ void PciMsix::disable() {
   bus_.write32(function_, capability_, first & ~((kEnable | kFunctionMask) << 16));          // MSI-X off, function unmasked
   capability_ = 0;
   entries_ = 0;
+  used_ = 0;
 }
 
 }  // namespace hardware

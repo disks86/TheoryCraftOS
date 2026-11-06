@@ -44,6 +44,9 @@ class PciMsix {
   // `count` stay masked. False, with nothing changed, if there is no capability, the table is smaller than `count`, the table's BAR is not assigned or cannot be mapped, or the
   // core's id does not fit.
   bool enable(PciAddress function, const uint8_t* vectors, uint32_t count, uint32_t apic_id);
+  // Sends the entries enable() set up to the core with local APIC id `apic_id` instead: each is masked while its address changes (an interrupt
+  // raised meanwhile stays pending and is delivered once it is unmasked). False if not enabled or the id does not fit.
+  bool retarget(uint32_t apic_id);
   // MSI-X off (every entry masked first). Safe when not enabled.
   void disable();
   bool enabled() const { return capability_ != 0; }
@@ -55,6 +58,7 @@ class PciMsix {
   uint16_t capability_ = 0;
   MmioRegion table_;
   uint32_t entries_ = 0;
+  uint32_t used_ = 0;   // the entries enable() set up
 };
 
 }  // namespace hardware

@@ -41,7 +41,7 @@ namespace {
 
 constexpr int8_t kPerformance = 0, kEfficiency = 1;
 
-// Eight cores: 0-3 Performance sharing cache 0, 4-5 Performance sharing cache 1, 6-7 Efficiency sharing cache 2.
+// Eight cores: 0-3 Performance sharing cache 0, 4-5 Performance sharing cache 1, 6-7 Efficiency sharing cache 2. Two NUMA nodes: 0-3 and 4-7.
 struct Machine {
   CorePlace cores[8];
   Machine() {
@@ -50,6 +50,7 @@ struct Machine {
       cores[i].idle = true;
       cores[i].kind = i < 6 ? kPerformance : kEfficiency;
       cores[i].cache_domain = i < 4 ? 0 : i < 6 ? 1 : 2;
+      cores[i].numa_node = i < 4 ? 0 : 1;
     }
   }
   ArrayView<const CorePlace> view() const { return ArrayView<const CorePlace>(cores, 8); }
@@ -66,12 +67,13 @@ PlacementHints hints(int32_t io, int32_t last, int8_t kind = -1) {
 void test_scores() {
   Machine m;
   CHECK(placement_score(hints(-1, -1), 3, m.view()) == 0);
-  CHECK(placement_score(hints(2, -1), 2, m.view()) == kScoreIoCore + kScoreCacheDomain);
-  CHECK(placement_score(hints(2, -1), 1, m.view()) == kScoreCacheDomain);
+  CHECK(placement_score(hints(2, -1), 2, m.view()) == kScoreIoCore + kScoreCacheDomain + kScoreNumaNode);
+  CHECK(placement_score(hints(2, -1), 1, m.view()) == kScoreCacheDomain + kScoreNumaNode);
   CHECK(placement_score(hints(2, -1), 4, m.view()) == 0);
-  CHECK(placement_score(hints(-1, 5), 5, m.view()) == kScoreLastCore + kScoreCacheDomain);
-  CHECK(placement_score(hints(-1, 5), 4, m.view()) == kScoreCacheDomain);
-  CHECK(placement_score(hints(2, 5), 5, m.view()) == kScoreLastCore);   // (the domain counts from the device's core when there is one)
+  CHECK(placement_score(hints(-1, 5), 5, m.view()) == kScoreLastCore + kScoreCacheDomain + kScoreNumaNode);
+  CHECK(placement_score(hints(-1, 5), 4, m.view()) == kScoreCacheDomain + kScoreNumaNode);
+  CHECK(placement_score(hints(-1, 5), 6, m.view()) == kScoreNumaNode);   // another cache, the same node
+  CHECK(placement_score(hints(2, 5), 5, m.view()) == kScoreLastCore);   // (the domain and node count from the device's core when there is one)
   CHECK(placement_score(hints(-1, -1, kEfficiency), 7, m.view()) == kScoreKind);
   CHECK(placement_score(hints(-1, -1, kEfficiency), 0, m.view()) == 0);
   // Out of range: no score, no crash.
@@ -91,6 +93,8 @@ void test_wake_core() {
   m.cores[5].idle = false;
   CHECK(choose_wake_core(hints(5, -1), all, m.view()) == 4);
   m.cores[4].idle = false;
+  CHECK(choose_wake_core(hints(5, -1), all, m.view()) == 6);   // the device's node, ahead of lower-numbered cores on the other
+  m.cores[6].idle = m.cores[7].idle = false;
   CHECK(choose_wake_core(hints(5, -1), all, m.view()) == 0);
   m = Machine();
   // The warm cache with no device.
@@ -98,7 +102,7 @@ void test_wake_core() {
   // The device's core beats the warm cache.
   CHECK(choose_wake_core(hints(6, 3), all, m.view()) == 6);
   // The kind asked for beats the device.
-  CHECK(choose_wake_core(hints(6, -1, kPerformance), all, m.view()) == 0);
+  CHECK(choose_wake_core(hints(6, -1, kPerformance), all, m.view()) == 4);   // (a Performance core on the device's node)
   CHECK(choose_wake_core(hints(1, -1, kEfficiency), all, m.view()) == 6);
   CHECK(choose_wake_core(hints(7, -1, kEfficiency), all, m.view()) == 7);
   // Only allowed cores.
@@ -114,6 +118,33 @@ void test_wake_core() {
   for (CorePlace& c : m.cores) c.idle = false;
   CHECK(choose_wake_core(hints(5, -1), all, m.view()) == kNoCore);
   CHECK(choose_wake_core(hints(5, -1), all, ArrayView<const CorePlace>()) == kNoCore);
+}
+
+void test_queue_core() {
+  Machine m;
+  const CoreSet all = CoreSet::all();
+  uint32_t queued[8] = {};
+  // The device's core, then the shorter queue among equals.
+  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 5);
+  CHECK(choose_queue_core(hints(-1, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 0);
+  queued[0] = 2;
+  CHECK(choose_queue_core(hints(-1, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 1);
+  // A longer queue on the device's core is fine up to the imbalance limit...
+  queued[0] = 0;
+  queued[5] = kQueueImbalance;
+  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 5);
+  // ...past it the shortest queue takes the thread.
+  queued[5] = kQueueImbalance + 1;
+  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 0);
+  // Only allowed, online cores.
+  CoreSet three;
+  three.add(3);
+  CHECK(choose_queue_core(hints(5, -1), three, m.view(), ArrayView<const uint32_t>(queued, 8)) == 3);
+  m.cores[3].online = false;
+  CHECK(choose_queue_core(hints(5, -1), three, m.view(), ArrayView<const uint32_t>(queued, 8)) == kNoCore);
+  // Missing lengths count as empty queues.
+  Machine fresh;
+  CHECK(choose_queue_core(hints(6, -1), all, fresh.view(), ArrayView<const uint32_t>()) == 6);
 }
 
 void test_interrupt_core() {
@@ -167,6 +198,30 @@ void test_learned_core() {
   CHECK(learned.hint() == 5 && learned.confidence == 1);
   learned.forget();
   CHECK(learned.hint() == kNoCore);
+}
+
+void test_steering() {
+  InterruptSteering steering;
+  // Every wake-up for a thread pinned to core 5: move there.
+  for (uint32_t i = 0; i < InterruptSteering::kWindow; ++i) {
+    CHECK(!steering.window_full());
+    steering.note(5);
+  }
+  CHECK(steering.window_full() && steering.decide() == 5);
+  CHECK(!steering.window_full() && steering.seen == 0);   // a new window
+  // Mostly local: stay.
+  for (uint32_t i = 0; i < InterruptSteering::kWindow; ++i) steering.note(i % 2 ? 5 : kNoCore);
+  CHECK(steering.decide() == kNoCore);
+  // Remote but split between two cores: no clear place to go.
+  for (uint32_t i = 0; i < InterruptSteering::kWindow; ++i) steering.note(i % 2 ? 5 : 6);
+  CHECK(steering.decide() == kNoCore);
+  // Remote, one core well ahead, some local: 26 to core 2, 2 to core 3, 4 local.
+  for (uint32_t i = 0; i < 26; ++i) steering.note(2);
+  steering.note(3);
+  steering.note(3);
+  for (uint32_t i = 0; i < 4; ++i) steering.note(kNoCore);
+  CHECK(steering.decide() == 2);
+  CHECK(InterruptSteering().decide() == kNoCore);
 }
 
 void test_cache_domain() {
@@ -282,7 +337,9 @@ int main() {
   test_scores();
   test_wake_core();
   test_interrupt_core();
+  test_queue_core();
   test_learned_core();
+  test_steering();
   test_cache_domain();
   test_device_table();
   test_device_table_threads();

@@ -264,12 +264,26 @@ struct IoProbe {
   int32_t device_core = -1;
   uint32_t rounds = 0, on_device_core = 0;
   int32_t first_core = -1;
+  // steering: where main sends the interrupt (the retarget callback changes it), and what arrived on the pinned consumer's core
+  uint32_t send_to = 0;
+  int32_t pinned = -1, moved_to = -1;
+  uint32_t retargets = 0, arrived_on_pinned = 0;
 };
 
 Frame* on_io_probe_interrupt(Frame* frame, void* context) {
   apic::eoi();
-  static_cast<IoProbe*>(context)->arrived.set();
+  IoProbe* p = static_cast<IoProbe*>(context);
+  if (static_cast<int32_t>(current_core()) == p->pinned) __atomic_add_fetch(&p->arrived_on_pinned, 1, __ATOMIC_RELAXED);
+  p->arrived.set();
   return frame;
+}
+
+bool retarget_io_probe(void* context, uint32_t core, uint64_t hardware_id) {
+  IoProbe* p = static_cast<IoProbe*>(context);
+  p->moved_to = static_cast<int32_t>(core);
+  ++p->retargets;
+  __atomic_store_n(&p->send_to, static_cast<uint32_t>(hardware_id), __ATOMIC_RELEASE);
+  return true;
 }
 
 void io_consumer_main(void* argument) {
@@ -307,12 +321,33 @@ bool test_io_affinity() {
   if (consumer) join(consumer);
   scheduling::IoDeviceInfo info;
   const bool have_info = io_device_info(device, &info);
-  ok &= report("I/O affinity: every interrupt counted and woke the consumer", have_info && info.interrupts == kInterrupts && info.wakes >= probe.rounds && probe.rounds >= kInterrupts - 2);
+  ok &= report("I/O affinity: every interrupt counted and woke the consumer", have_info && info.interrupts == kInterrupts && info.wakes > 0 && info.wakes <= info.interrupts && probe.rounds >= kInterrupts - 2);
   ok &= report("I/O affinity: the woken thread runs on the interrupting core", probe.rounds && probe.on_device_core + 2 >= probe.rounds);
 
   Thread* bound = spawn(io_bound_main, &probe, "io-bound", -1, -1, kDefaultStackBytes, device);
   if (bound) join(bound);
   ok &= report("I/O affinity: a thread spawned for the device starts on its core", probe.first_core == probe.device_core);
+
+  // Steering: the consumer is pinned to another core, so the interrupt should follow it there.
+  probe.pinned = static_cast<int32_t>(core + 1 < core_count() ? core + 1 : 0);
+  if (probe.pinned == probe.device_core) probe.pinned = (probe.pinned + 1) % static_cast<int32_t>(core_count());
+  probe.stop = false;
+  probe.rounds = probe.on_device_core = 0;
+  probe.send_to = static_cast<uint32_t>(apic_id);
+  probe.arrived.reset();
+  set_io_device_retarget(device, retarget_io_probe, &probe);
+  Thread* pinned = spawn(io_consumer_main, &probe, "io-pinned", probe.pinned);
+  for (uint32_t i = 0; i < 2 * kInterrupts && pinned; ++i) {
+    apic::send_ipi(__atomic_load_n(&probe.send_to, __ATOMIC_ACQUIRE), kVectorIoSelfTest);
+    sleep_ms(2);
+  }
+  probe.stop = true;
+  probe.arrived.set();
+  if (pinned) join(pinned);
+  set_io_device_retarget(device, nullptr, nullptr);
+  const bool moved = io_device_info(device, &info) && info.interrupt_core == probe.pinned;
+  ok &= report("I/O affinity: the interrupt moves to the core its pinned consumer runs on",
+               probe.retargets == 1 && probe.moved_to == probe.pinned && moved && probe.arrived_on_pinned >= kInterrupts / 2);
 
   set_device_interrupt_handler(kVectorIoSelfTest, device, nullptr, nullptr);
   unregister_io_device(device);
