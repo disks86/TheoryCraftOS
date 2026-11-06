@@ -284,10 +284,10 @@ void test_create_and_destroy() {
   CHECK(rd(t.log[1].payload, 48) == WS_OVERLAPPEDWINDOW);
   // NCCALCSIZE came with the window rectangle in rgrc[0]
   CHECK(rd(t.log[2].payload, 16) == 10 && rd(t.log[2].payload, 20) == 20 && rd(t.log[2].payload, 24) == 310 && rd(t.log[2].payload, 28) == 220 && t.log[2].wparam == 1);
-  // geometry: window rect and the client rectangle inside the frame (Windows 10 metrics: 8 px frame, 31 px of caption and frame on top)
+  // geometry: window rect and the client rectangle inside the frame (Windows metrics for a program that is not DPI aware: a 4 px frame, 27 px of caption and frame on top)
   Rc wr = t.window_rect(w), cr = t.client_rect(w);
   CHECK(wr.l == 10 && wr.t == 20 && wr.r == 310 && wr.b == 220);
-  CHECK(cr.l == 0 && cr.t == 0 && cr.r == 300 - 16 && cr.b == 200 - 8 - 31);
+  CHECK(cr.l == 0 && cr.t == 0 && cr.r == 300 - 8 && cr.b == 200 - 4 - 27);
   CHECK(!(t.style(w) & WS_VISIBLE));
   CHECK(t.svc32(N::NtUserCallHwnd, {w, 13}) == 0);      // not visible
   // a visible one

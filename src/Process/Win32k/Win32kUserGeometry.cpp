@@ -85,7 +85,7 @@ void compute_nc(Window* w, Rect* client_out) {
   if (w->parent == nullptr) { *client_out = w->bounds; return; }
   const uint32_t dpi = window_dpi_of(w);
   const bool menu = w->menu != 0 && !(w->style & wn::WS_CHILD);
-  const Margins m = (w->style & wn::WS_MINIMIZE) ? Margins() : nc_margins(w->style, w->ex_style, menu, dpi);
+  const Margins m = (w->style & wn::WS_MINIMIZE) ? Margins() : nc_margins(w->style, w->ex_style, menu, dpi, false);      // (programs are not DPI aware here: no padded border)
   Rect c = w->bounds;
   c.left = int32_t(uint32_t(c.left) + uint32_t(m.left));
   c.top = int32_t(uint32_t(c.top) + uint32_t(m.top));

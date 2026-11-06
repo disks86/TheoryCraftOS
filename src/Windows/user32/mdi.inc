@@ -274,9 +274,13 @@ EXPORT UINT WINAPI ArrangeIconicWindows(HANDLE parent) {
 /* ---- the client -------------------------------------------------------------------------------------------------------------------------------------------------------- */
 static HANDLE mdi_create_child(HANDLE client, MdiState *st, const MdiCreate_ *mcs) {
   if (st->count >= MDI_MAX) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
-  DWORD style = mcs->style & (WS_MINIMIZE_ | WS_MAXIMIZE_ | 0x00200000 | 0x00100000 | 0x08000000);
-  if (GetWindowLongW(client, -16) & 1 /* MDIS_ALLCHILDSTYLES */) style = mcs->style;
-  style |= 0x40000000 | 0x04000000 | 0x02000000 | 0x00080000 | 0x00C00000 | 0x00040000 | 0x10000000 | 0x00020000 | 0x00010000;      /* child, clip siblings and children, sysmenu, caption, thickframe, visible, min/max boxes */
+  DWORD style;
+  if (GetWindowLongW(client, -16) & 1 /* MDIS_ALLCHILDSTYLES */) {      /* the program's styles, as a clipped child (a popup is refused) */
+    if (mcs->style & 0x80000000u) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    style = mcs->style | 0x40000000 | 0x04000000;
+  } else {      /* the program's styles without WS_POPUP, plus those of a document window */
+    style = (mcs->style & ~0x80000000u) | 0x40000000 | 0x10000000 | 0x04000000 | 0x00C00000 | 0x00080000 | 0x00040000 | 0x00020000 | 0x00010000;
+  }
   RECT_ rc;
   mdi_client_rect(client, &rc);
   int x = mcs->x, y = mcs->y, cx = mcs->cx, cy = mcs->cy;
