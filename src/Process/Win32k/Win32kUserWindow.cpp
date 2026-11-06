@@ -77,18 +77,40 @@ uint64_t create_step(Call& call, Op& op) {
   const bool has_proc = w->wndproc != 0;
   switch (op.phase) {
     case 20: {      // an overlapped or sizing window is asked for its limits before WM_NCCREATE
-      op.phase = 0;
+      op.phase = 21;
       if (!has_proc) return create_step(call, op);
-      const int32_t sw = int32_t(gdi::screen_width()), sh = int32_t(gdi::screen_height()), b = 8;
+      const Rect max = window_maximized_rect(w);
+      gdi::Rect none{0, 0, 0, 0};
+      adjust_window_rect(&none, w->style, w->ex_style, false, 0);      // (the frame, as negative left and top)
+      const bool plain = (w->style & (wn::WS_DLGFRAME | wn::WS_BORDER)) != 0;
       uint8_t raw[40] = {};
-      put32(raw, 8, uint32_t(sw + 2 * b)); put32(raw, 12, uint32_t(sh + 2 * b));      // ptMaxSize
-      put32(raw, 16, uint32_t(-b)); put32(raw, 20, uint32_t(-b));      // ptMaxPosition
-      put32(raw, 24, 136); put32(raw, 28, 39);      // ptMinTrackSize
-      put32(raw, 32, uint32_t(sw + 2 * b)); put32(raw, 36, uint32_t(sh + 2 * b));      // ptMaxTrackSize
+      put32(raw, 8, uint32_t(max.right - max.left)); put32(raw, 12, uint32_t(max.bottom - max.top));      // ptMaxSize
+      put32(raw, 16, uint32_t(max.left)); put32(raw, 20, uint32_t(max.top));      // ptMaxPosition
+      put32(raw, 24, plain ? uint32_t(user_misc::system_metrics(34, 96)) : uint32_t(-2 * none.left));      // ptMinTrackSize
+      put32(raw, 28, plain ? uint32_t(user_misc::system_metrics(35, 96)) : uint32_t(-2 * none.top));
+      put32(raw, 32, uint32_t(user_misc::system_metrics(59, 96))); put32(raw, 36, uint32_t(user_misc::system_metrics(60, 96)));      // ptMaxTrackSize
       List<uint8_t> payload(S().alloc);
       for (uint8_t v : raw) payload.push_back(v);
-      if (!queue_payload_upcall(call, &op, w, wn::WM_GETMINMAXINFO, 0, payload, 0xFFFF, 0, 0)) return create_step(call, op);
+      if (!queue_payload_upcall(call, &op, w, wn::WM_GETMINMAXINFO, 0, payload, 0xFFFF, 0, 0)) { op.payload.clear(); return create_step(call, op); }
       return kUpcallDue;
+    }
+    case 21: {      // the window is made no smaller and no larger than the limits it gave
+      op.phase = 0;
+      if (op.payload.count() >= 40) {
+        const uint8_t* p = op.payload.view().data();
+        int32_t cx = w->bounds.right - w->bounds.left, cy = w->bounds.bottom - w->bounds.top;
+        const int32_t min_x = int32_t(get32(p, 24)), min_y = int32_t(get32(p, 28)), max_x = int32_t(get32(p, 32)), max_y = int32_t(get32(p, 36));
+        if (max_x < cx) cx = max_x;
+        if (max_y < cy) cy = max_y;
+        if (cx < min_x) cx = min_x;
+        if (cy < min_y) cy = min_y;
+        w->bounds.right = w->bounds.left + cx;
+        w->bounds.bottom = w->bounds.top + cy;
+        Rect client;
+        compute_nc(w, &client);
+        w->client = client;
+      }
+      return create_step(call, op);
     }
     case 0: {
       op.phase = 1;
@@ -442,10 +464,16 @@ uint64_t nt_get_ancestor(Call& call) {
       Window* r = top_level_of(w);
       return r && r->parent ? r->handle : 0;
     }
-    case wn::GA_ROOTOWNER: {
-      Window* r = top_level_of(w);
-      while (r && r->owner) r = top_level_of(r->owner);
-      return r && r->parent ? r->handle : 0;
+    case wn::GA_ROOTOWNER: {      // up through GetParent (the owner of a popup, the parent of a child) as long as there is one
+      Window* r = w;
+      for (int guard = 0; guard < 64; ++guard) {
+        Window* up = nullptr;
+        if (r->style & wn::WS_POPUP) up = r->owner;
+        else if (r->style & wn::WS_CHILD) up = (r->parent && r->parent != r->desktop->root) ? r->parent : nullptr;
+        if (!up) break;
+        r = up;
+      }
+      return r->parent ? r->handle : 0;
     }
     default: return call.fail(kErrorInvalidParameter);
   }
@@ -583,8 +611,8 @@ uint64_t window_get_long(Call& call, Window* w, int32_t offset, uint32_t size) {
     case wn::GWL_HINSTANCE: v = w->instance; break;
     case wn::GWL_WNDPROC: v = w->wndproc; break;
     case wn::GWL_USERDATA: v = w->userdata; break;
-    case wn::GWL_HWNDPARENT:
-      v = ((w->style & wn::WS_CHILD) && !(w->style & wn::WS_POPUP)) ? (w->parent && w->parent->parent ? w->parent->handle : 0) : (w->owner ? w->owner->handle : 0);
+    case wn::GWL_HWNDPARENT:      // the owner of a window on the desktop, else its parent
+      v = (!w->parent || w->parent == w->desktop->root) ? (w->owner ? w->owner->handle : 0) : w->parent->handle;
       break;
     default: return call.fail(kErrorInvalidIndex);
   }

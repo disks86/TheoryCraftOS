@@ -416,6 +416,7 @@ EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
 #include "controls.inc"
 #include "scroll.inc"
 #include "scrollwin.inc"
+#include "display.inc"
 #include "listbox.inc"
 #include "combo.inc"
 #include "dialog.inc"

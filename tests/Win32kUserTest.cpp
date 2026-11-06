@@ -595,7 +595,7 @@ void test_geometry_and_zorder() {
   // maximize, minimize and restore
   const uint32_t f = t.create("G", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 50, 300, 200);
   CHECK(t.show(f, 3) == true);      // SW_SHOWMAXIMIZED: it was visible
-  CHECK((t.style(f) & WS_MAXIMIZE) && t.window_rect(f).l == -8 && t.window_rect(f).r == 1024 + 8);
+  CHECK((t.style(f) & WS_MAXIMIZE) && t.window_rect(f).l == -4 && t.window_rect(f).r == 1024 + 4);
   const uint64_t pl = t.tmp(0xD00);
   prog.memory.put32(pl, 44);
   CHECK(t.svc32(N::NtUserGetWindowPlacement, {f, pl}) == 1 && prog.memory.get32(pl + 8) == 3 && prog.memory.get32(pl + 28) == 40 && prog.memory.get32(pl + 36) == 340);

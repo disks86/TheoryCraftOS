@@ -176,13 +176,14 @@ Rect iconic_rect(Window* w) {
   return Rect{0, sh - ih, iw, sh};
 }
 
+// The rectangle of a maximized window: the work area (the whole monitor for a popup, the client area of the parent for a child) grown by what AdjustWindowRectEx adds for the style without WS_BORDER.
 Rect maximized_rect(Window* w) {
-  const uint32_t dpi = window_dpi_of(w);
-  const Margins m = nc_margins(w->style, w->ex_style, false, dpi);
-  Rect work = user_misc::monitor_rect(user_misc::monitor_from_point(0, 0, 1), true);
-  if (w->parent && w->parent->parent) work = Rect{0, 0, w->parent->client.right - w->parent->client.left, w->parent->client.bottom - w->parent->client.top};
-  const int32_t bx = (w->style & wn::WS_THICKFRAME) ? m.left : 0, by = (w->style & wn::WS_THICKFRAME) ? m.top - ((w->style & wn::WS_CAPTION) == wn::WS_CAPTION ? user_misc::system_metrics(SM_CYCAPTION, dpi) : 0) : 0;
-  return Rect{work.left - bx, work.top - by, work.right + bx, work.bottom + by};
+  const bool popup = (w->style & wn::WS_POPUP) != 0;
+  Rect area = user_misc::monitor_rect(user_misc::monitor_from_point(0, 0, 1), !popup);
+  if ((w->style & wn::WS_CHILD) && !popup && w->parent && w->parent->parent) area = Rect{0, 0, w->parent->client.right - w->parent->client.left, w->parent->client.bottom - w->parent->client.top};
+  gdi::Rect r{area.left, area.top, area.right, area.bottom};
+  adjust_window_rect(&r, w->style & ~wn::WS_BORDER, w->ex_style, false, 0);
+  return Rect{r.left, r.top, r.right, r.bottom};
 }
 
 // Translates a ShowWindow command into style bits, the new rectangle and SetWindowPos flags. False: nothing to do (the answer is just the old visibility).
@@ -723,5 +724,7 @@ void register_geometry_services() {
   register_handler(WindowsSyscallNumber::NtUserSetWindowRgn, nt_set_window_rgn);
   register_handler(WindowsSyscallNumber::NtUserGetWindowRgnEx, nt_get_window_rgn_ex);
 }
+
+Rect window_maximized_rect(Window* w) { return maximized_rect(w); }
 
 }  // namespace process::win32k::user

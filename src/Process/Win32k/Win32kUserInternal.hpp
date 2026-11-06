@@ -540,6 +540,7 @@ void destroy_window_now(Window* w);
 struct SwpArgs { Window* w = nullptr; uint32_t after = 0; int32_t x = 0, y = 0, cx = 0, cy = 0; uint32_t flags = 0; };
 uint64_t set_window_pos_op(Call& call, const SwpArgs& args, uint64_t final_result);
 void apply_zorder(Window* w, uint32_t after);
+Rect window_maximized_rect(Window* w);                   // where a maximized window goes
 void compute_nc(Window* w, Rect* client_out);       // the default client rectangle for the window rectangle `w->bounds` (AdjustWindowRect's inverse)
 uint64_t show_window_op(Call& call, Window* w, uint32_t cmd, bool async_ignored);
 void activate_window_internal(Call& call, Window* w, bool notify);
