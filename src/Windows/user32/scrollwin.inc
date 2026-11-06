@@ -36,6 +36,8 @@ EXPORT BOOL WINAPI ScreenToClient(HANDLE hwnd, POINT_ *p);
 EXPORT BOOL WINAPI ClientToScreen(HANDLE hwnd, POINT_ *p);
 EXPORT BOOL WINAPI GetWindowRect(HANDLE hwnd, RECT_ *rect);
 EXPORT BOOL WINAPI InvalidateRgn(HANDLE hwnd, HANDLE region, BOOL erase);
+EXPORT BOOL WINAPI SetPropW(HANDLE hwnd, LPCWSTR name, HANDLE data);
+EXPORT HANDLE WINAPI GetPropW(HANDLE hwnd, LPCWSTR name);
 
 static BOOL rect_meet(const RECT_ *a, const RECT_ *b, RECT_ *out) {
   out->left = a->left > b->left ? a->left : b->left; out->top = a->top > b->top ? a->top : b->top;
@@ -162,5 +164,31 @@ EXPORT BOOL WINAPI GetScrollBarInfo(HANDLE hwnd, LONG object, SCROLLBARINFO_ *in
   info->thumb_top = start;
   info->thumb_bottom = start + size;
   if (st.si.max <= st.si.min) info->state[0] |= STATE_SYSTEM_UNAVAILABLE_;
+  return TRUE;
+}
+
+/* ---- layered windows ------------------------------------------------------------------------------------------------------------------------------------------------ */
+/* The attributes are kept with the window (properties); the window manager does not blend anything, so a layered window is shown as an ordinary one. */
+#define WS_EX_LAYERED_ 0x80000
+EXPORT BOOL WINAPI SetLayeredWindowAttributes(HANDLE hwnd, DWORD key, BYTE alpha, DWORD flags) {
+  if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
+  if (!(GetWindowLongW(hwnd, -20 /* GWL_EXSTYLE */) & WS_EX_LAYERED_) || (flags & ~3u)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  SetPropW(hwnd, L"TcosLayeredKey", (HANDLE)(ULONG_PTR)key);
+  SetPropW(hwnd, L"TcosLayered", (HANDLE)(ULONG_PTR)(0x10000u | ((flags & 3u) << 8) | alpha));
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetLayeredWindowAttributes(HANDLE hwnd, DWORD *key, BYTE *alpha, DWORD *flags) {
+  if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
+  const ULONG_PTR v = (ULONG_PTR)GetPropW(hwnd, L"TcosLayered");
+  if (!(GetWindowLongW(hwnd, -20) & WS_EX_LAYERED_) || !(v & 0x10000)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (key) *key = (DWORD)(ULONG_PTR)GetPropW(hwnd, L"TcosLayeredKey");
+  if (alpha) *alpha = (BYTE)(v & 0xFF);
+  if (flags) *flags = (DWORD)((v >> 8) & 3);
+  return TRUE;
+}
+EXPORT BOOL WINAPI UpdateLayeredWindow(HANDLE hwnd, HANDLE hdc_dst, const POINT_ *dst, const SIZE_ *size, HANDLE hdc_src, const POINT_ *src, DWORD key, const void *blend, DWORD flags) {
+  (void)hdc_dst; (void)dst; (void)size; (void)hdc_src; (void)src; (void)key; (void)blend; (void)flags;
+  if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
+  if (!(GetWindowLongW(hwnd, -20) & WS_EX_LAYERED_)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   return TRUE;
 }

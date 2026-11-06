@@ -192,6 +192,9 @@ static uint8_t seg_pattern(long k, uint32_t i) { return uint8_t(k * 91 + i * 3 +
 
 // The decode engine of the simulated GPU.
 struct FakeDecoder {
+  bool xe_lpg = false;   // Meteor Lake / Arrow Lake: five commands are longer
+  bool xe_hpg = false;   // Arc Alchemist: four of them are (the tile coding command is not)
+  bool xe2 = false;      // Lunar Lake, Battlemage: as Xe-LPG, with a 215-dword buffer command
   const Reference* reference = nullptr;
   bool check_content = true;
   std::map<uint64_t, long> painted;                // surface address -> the frame it last held
@@ -235,6 +238,11 @@ struct FakeDecoder {
 
   void run(FakeGpu& gpu, const std::vector<uint32_t>& d) {
     enum { kModeSelect, kSurface, kBufAddr, kIndObj, kSegment, kPic, kInloop, kInter, kTile, kBsd, kOther };
+    const bool longer = xe_lpg || xe_hpg || xe2;
+    const uint32_t len_mode = longer ? kPipeModeSelectDwordsXeLpg : kPipeModeSelectDwords, len_buf = xe2 ? kPipeBufAddrDwordsXe2 : longer ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords, len_ind = longer ? kIndObjDwordsXeLpg : kIndObjDwords,
+                   len_pic = longer ? kPicStateDwordsXeLpg : kPicStateDwords, len_tile = xe_lpg || xe2 ? kTileCodingDwordsXeLpg : kTileCodingDwords;
+    size_t loops = 0;
+    bool have_vd_control = false;
     std::vector<int> order;
     std::vector<size_t> segment_at, tile_at, bsd_at;
     size_t pipe_mode = 0, buf_at = 0, ind_at = 0, pic_at = 0, loop_at = 0, inter_at = 0;
@@ -252,7 +260,8 @@ struct FakeDecoder {
       if (i + len > d.size()) { problem("command runs past the batch"); return; }
       if ((h & 0xFFFF0000) == kVdPipelineFlush) { have_flush = true; if (len != 2) problem("pipeline flush length"); i += len; continue; }
       switch (h & 0xFFFF0000) {
-        case kAvpPipeModeSelect: have_mode = true; pipe_mode = i; order.push_back(kModeSelect); if (len != kPipeModeSelectDwords) problem("pipe mode select length"); break;
+        case kVdControlState: have_vd_control = len == 3 && d[i + 1] == 1 && d[i + 2] == 0 && !have_mode; order.push_back(kOther); if (!have_vd_control) problem("pipeline initialisation"); break;
+        case kAvpPipeModeSelect: have_mode = true; pipe_mode = i; order.push_back(kModeSelect); if (len != len_mode) problem("pipe mode select length"); break;
         case kAvpSurfaceState:
           order.push_back(kSurface);
           if (len != kSurfaceStateDwords || bits(d, i, 2, 27, 31) != 4) problem("surface state");
@@ -260,13 +269,13 @@ struct FakeDecoder {
           pitch = bits(d, i, 1, 0, 16) + 1;
           chroma_rows = bits(d, i, 2, 0, 14);
           break;
-        case kAvpPipeBufAddrState: have_buf = true; buf_at = i; order.push_back(kBufAddr); if (len != kPipeBufAddrDwords) { problem("pipe buffer address length"); return; } break;
-        case kAvpIndObjBaseAddrState: have_ind = true; ind_at = i; order.push_back(kIndObj); if (len != kIndObjDwords) problem("indirect object length"); break;
+        case kAvpPipeBufAddrState: have_buf = true; buf_at = i; order.push_back(kBufAddr); if (len != len_buf) { problem("pipe buffer address length"); return; } break;
+        case kAvpIndObjBaseAddrState: have_ind = true; ind_at = i; order.push_back(kIndObj); if (len != len_ind) problem("indirect object length"); break;
         case kAvpSegmentState: segment_at.push_back(i); order.push_back(kSegment); if (len != kSegmentStateDwords) { problem("segment state length"); return; } break;
-        case kAvpPicState: have_pic = true; pic_at = i; order.push_back(kPic); if (len != kPicStateDwords) { problem("picture state length"); return; } break;
-        case kAvpInloopFilterState: have_loop = true; loop_at = i; order.push_back(kInloop); if (len != kInloopFilterDwords) problem("loop filter state length"); break;
+        case kAvpPicState: have_pic = true; pic_at = i; order.push_back(kPic); if (len != len_pic) { problem("picture state length"); return; } break;
+        case kAvpInloopFilterState: have_loop = true; ++loops; if (!loop_at) loop_at = i; order.push_back(kInloop); if (len != kInloopFilterDwords) problem("loop filter state length"); break;
         case kAvpInterPredState: have_inter = true; inter_at = i; order.push_back(kInter); if (len != kInterPredDwords) problem("inter prediction state length"); break;
-        case kAvpTileCoding: tile_at.push_back(i); order.push_back(kTile); if (len != kTileCodingDwords) { problem("tile coding length"); return; } break;
+        case kAvpTileCoding: tile_at.push_back(i); order.push_back(kTile); if (len != len_tile) { problem("tile coding length"); return; } break;
         case kAvpBsdObject: bsd_at.push_back(i); order.push_back(kBsd); if (len != kBsdObjectDwords) { problem("bsd object length"); return; } break;
         default: problem("an unknown command"); return;
       }
@@ -274,7 +283,8 @@ struct FakeDecoder {
     }
     if (!have_mode || !have_buf || !have_ind || !have_pic || !have_loop || tile_at.empty() || tile_at.size() != bsd_at.size() || segment_at.empty() || !have_flush) { problem("incomplete AV1 batch"); return; }
     if (bits(d, pipe_mode, 1, 5, 7) != 2 || bits(d, pipe_mode, 1, 0, 0) != 0) problem("pipe mode: not AV1 decoding");
-    // The order: modes, surfaces, buffers, bitstream, segments, picture, loop filter, (inter prediction), then the tiles in pairs.
+    if (!have_vd_control || loops != tile_at.size()) problem("pipeline initialisation / one loop filter state per tile");
+    // The order (the media driver's): initialisation, modes, surfaces, buffers, bitstream, picture, (inter prediction), segments, then for every tile the loop filter state, the tile and its data.
     {
       std::vector<int> expect;
       size_t pos = 0;
@@ -284,15 +294,14 @@ struct FakeDecoder {
       ++pos;
       if (pos >= order.size() || order[pos] != kIndObj) problem("order: indirect object");
       ++pos;
-      skip(kSegment);
       if (pos >= order.size() || order[pos] != kPic) problem("order: picture state");
       ++pos;
-      if (pos >= order.size() || order[pos] != kInloop) problem("order: loop filter state");
-      ++pos;
       skip(kInter);
+      skip(kSegment);
       for (size_t t = 0; t < tile_at.size(); ++t) {
-        if (pos + 1 >= order.size() || order[pos] != kTile || order[pos + 1] != kBsd) { problem("order: tiles"); break; }
-        pos += 2;
+        if (pos + 2 >= order.size() + 0 && pos + 2 > order.size() - 0) { problem("order: tiles"); break; }
+        if (order[pos] != kInloop || order[pos + 1] != kTile || order[pos + 2] != kBsd) { problem("order: tiles"); break; }
+        pos += 3;
       }
     }
 
@@ -547,7 +556,7 @@ struct FakeDecoder {
 
 struct Rig2 : Rig {
   FakeDecoder engine;
-  Rig2() : Rig(Generation::Gen12) { gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
+  explicit Rig2(bool lpg = false, bool hpg = false, bool x2 = false) : Rig(Generation::Gen12) { engine.xe_lpg = lpg; engine.xe_hpg = hpg; engine.xe2 = x2; gpu.xehp = lpg || hpg || x2; gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
 };
 
 static DecoderConfig i420_config() {
@@ -558,19 +567,23 @@ static DecoderConfig i420_config() {
 }
 
 // A stream the engine takes (`taken`) or one the CPU keeps whole.
-static void compare_stream(const char* name, bool taken) {
-  printf("  %s\n", name);
+static void compare_stream(const char* name, bool taken, bool xe_lpg = false, bool xe_hpg = false, bool xe2 = false) {
+  printf("  %s%s\n", name, xe_lpg ? " (Xe-LPG)" : xe_hpg ? " (Xe-HPG)" : xe2 ? " (Xe2)" : "");
   TestAllocator a;
   {
     Reference ref;
     CHECK(make_reference_file(a, name, &ref));
     if (ref.ends.empty()) return;
     printf("    %zu temporal units in, %zu frames decoded, %zu out\n", ref.ends.size(), ref.frames.size(), ref.out.pts.size());
-    Rig2 rig;
+    Rig2 rig(xe_lpg, xe_hpg, xe2);
     rig.engine.reference = &ref;
     {
       VcsDriver driver(rig.mem);
-      CHECK(driver.initialize(rig.config()));
+      VcsDriver::Config config = rig.config();
+      config.xe_lpg = xe_lpg;
+      config.xe_hpg = xe_hpg;
+      config.xe2 = xe2;
+      CHECK(driver.initialize(config));
       {
         IntelAv1Decoder session(a, driver, i420_config());
         CHECK(session.prepare());
@@ -745,7 +758,12 @@ int main() {
   // Streams the CPU keeps: 10- and 12-bit, 4:2:2, 4:4:4, monochrome, film grain, super-resolution.
   static const char* const kept[] = {"10bit", "12bit", "422", "444", "mono", "grain", "superres"};
   for (const char* name : taken)
-    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) compare_stream(name, true);
+    if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) {
+      compare_stream(name, true);
+      compare_stream(name, true, true);
+      compare_stream(name, true, false, true);
+      compare_stream(name, true, false, false, true);
+    }
   if (!getenv("ONLY")) {
     for (const char* name : kept) compare_stream(name, false);
     test_lease();

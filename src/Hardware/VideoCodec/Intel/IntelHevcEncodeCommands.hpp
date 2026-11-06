@@ -31,7 +31,9 @@ namespace intel_enc {
 // firmware (target usage 7, no RDOQ, no SAO, no tiles, no weighted prediction); their bit layouts are generated from the driver's hardware command definitions
 // (tools/gen_intel_encode_commands.py -> IntelEncodeCommandImagesGen12Hevc.inc). The stream structure is the one IntelHevcHeaders writes (64x64 coding tree blocks, 8x8 minimum
 // coding blocks, cu_qp_delta on, SAO/AMP/PCM/TMVP off, one reference). A "P" picture is coded as a low-delay B picture whose two lists hold the previous picture, as the driver does.
-// Ice Lake builds two of its VDEnc state commands with HuC firmware, which is not loaded here, so this class of encoder exists on Xe-LP only.
+// Ice Lake builds two of its VDEnc state commands with HuC firmware, which is not loaded here, so this class of encoder exists on Xe-LP only. Xe-LPG (Meteor Lake, Arrow Lake)
+// has the same sequence with new VDEnc commands (the 89-dword pipe buffer command, a 7-dword weights command, a 28-dword tile and slice state in front of a 3-dword walker, longer
+// CMD1 and CMD2); their images come from the media driver's own parameter code (tools/gen_intel_hevc_xelpg.py -> IntelEncodeCommandImagesXeLpgHevc.inc).
 
 constexpr uint32_t kHcpSurfaceIdRecon = 0, kHcpSurfaceIdSource = 1, kHcpSurfaceIdReference = 5;
 // HCP_ENC_BITSTREAM_BYTECOUNT_FRAME of the first video box: the size of the access unit the PAK has written.
@@ -80,7 +82,11 @@ struct HevcEncodeBuffers {
 // Fills the scratch addresses of `b` from the plan and the address of the scratch buffer.
 void hevc_resolve_scratch(const HevcScratchPlan& plan, uint32_t scratch_base, HevcEncodeBuffers* b);
 
+// XeLpg: Meteor Lake and Arrow Lake; XeHpg: Arc Alchemist, whose commands are Xe-LPG's apart from three dwords of CMD2.
+enum class HevcVdencPlatform { XeLp, XeLpg, XeHpg };
+
 struct HevcEncodePicture {
+  HevcVdencPlatform platform = HevcVdencPlatform::XeLp;
   bool p_picture = false;                         // a low-delay B picture predicting from the previous one, else I
   int32_t qp = 26;                                // the slice quantiser (10 .. 51; the driver's tables start at 10)
   int32_t pps_qp = 26;                            // init_qp of the picture parameter set (26 + init_qp_minus26)

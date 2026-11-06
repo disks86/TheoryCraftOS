@@ -68,6 +68,8 @@ add_executable(BOOTX64
   src/Hardware/MmioMapper.cpp
   src/Hardware/Bus/Pci/PciBar.cpp
   src/Kernel/ThreadScheduler.cpp
+  src/Hardware/Acpi/Srat.cpp
+  src/CPUScheduler/IoAffinity.cpp
   src/Kernel/Sync.cpp
   src/Kernel/Clipboard.cpp
   src/Kernel/Firmware.cpp

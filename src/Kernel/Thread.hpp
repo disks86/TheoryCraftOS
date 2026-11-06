@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <type_traits>
 #include "Allocators/IAllocator.hpp"
+#include "CPUScheduler/IoAffinity.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Interrupts.hpp"
 
@@ -58,6 +59,15 @@ struct Thread {
   uint64_t core_mask = ~uint64_t{0};      // the cores (bit n: core n, for the first 64) it may run on
   int8_t preferred_kind = -1;  // CoreKind it likes, or -1
   uint8_t priority = kDefaultPriority;    // 0 (least) .. 31 (most); the ready queue always runs the highest non-empty level first, round-robin within a level
+  // Device-aware placement (CPUScheduler/IoAffinity.hpp): the core it ran on last, the core whose device interrupts it follows (learnt from the
+  // interrupts that wake it, or the bound device's), the idle core it was sent to when it became ready, and when that was.
+  int32_t last_core = -1;
+  int32_t io_device = -1;                 // bound with bind_thread_to_io_device, or -1
+  scheduling::LearnedIoCore learned_io;
+  int32_t wake_core = -1;
+  uint64_t ready_tsc = 0;
+  int32_t queued_on = -1;                 // the core whose run queue it is in, or -1
+  uint8_t queued_level = 0;               // the priority level it was queued at (its priority may change while it waits)
   uint64_t wake_tsc = 0;
   Thread* prev = nullptr;   // run queue / wait list links
   Thread* next = nullptr;
@@ -106,8 +116,9 @@ bool run_on_every_core(void (*fn)(void*), void* argument, uint64_t timeout_us = 
 // to HLT. The caller checks that the processor has MWAIT with interrupts as break events (CPUID leaf 5) and, for a state where the local APIC timer stops, an always-running timer
 // (ARAT). Ignored on other architectures.
 void set_idle_mwait_hint(uint32_t hint);
+// `io_device` (from register_io_device, or -1) binds the new thread to that device from its first placement on (see bind_thread_to_io_device).
 Thread* spawn(ThreadFunction fn, void* argument, const char* name = "thread", int32_t core = -1,
-              int8_t preferred_kind = -1, uint32_t stack_bytes = kDefaultStackBytes);
+              int8_t preferred_kind = -1, uint32_t stack_bytes = kDefaultStackBytes, int32_t io_device = -1);
 // Gives up the core until the scheduler picks this thread again.
 void yield();
 void sleep_us(uint64_t us);
@@ -148,6 +159,8 @@ struct ThreadInfo {
   bool idle = false;       // a core's idle thread
   int32_t core = -1;       // the core it is running on right now, or -1
   int32_t affinity = -1;   // the only core allowed to run it, or -1
+  int32_t io_core = -1;    // the core whose device interrupts it follows, or -1
+  int32_t io_device = -1;  // the device it is bound to, or -1
   uint64_t cpu_ticks = 0;
 };
 struct CoreInfo {
@@ -163,6 +176,45 @@ uint32_t tick_rate();
 Thread* current_thread();
 uint32_t current_core();
 uint32_t core_count();
+
+// --- Device-aware scheduling (I/O affinity). A thread runs best on the core that takes the interrupts of the device it waits for: the handler
+// has just pulled the device's data (descriptors, completion entries, buffers) into that core's cache. The scheduler learns this by itself for
+// every interrupt handler set with set_device_interrupt_handler: a thread that the handler wakes (Event::set, Semaphore::release, ...) is sent to
+// the interrupting core, or an idle core sharing its last-level cache, if that is idle, and keeps preferring it while those interrupts keep coming.
+// If this core was idle the woken thread starts as soon as the handler returns, not at the next tick. Placement is a preference: priorities
+// stay strict, a thread is never kept off a core its affinity or core mask allows for long (kPlacementPatienceUs), and the core kind a thread
+// asked for outweighs the device.
+
+// Adds a device that raises interrupts on `interrupt_core` (-1: not routed yet). Returns its id, or -1 if the table is full. Safe before start().
+int32_t register_io_device(const char* name, int32_t interrupt_core);
+void unregister_io_device(int32_t device);
+// The device's interrupt now arrives on `core` (after its MSI was reprogrammed); threads bound to it follow.
+bool set_io_device_core(int32_t device, int32_t core);
+// The core a new device's interrupt should be routed to: spreads devices over the online cores, preferring `kind` (-1: any) and leaving the boot
+// core (which runs the desktop) alone while others are online. 0 before start().
+uint32_t choose_io_interrupt_core(int8_t kind = -1);
+// The core whose interrupt-message id (core_hardware_id) is `hardware_id`, or -1.
+int32_t core_from_hardware_id(uint64_t hardware_id);
+// Puts an online core in a NUMA node (the ACPI SRAT proximity domain): placement then prefers, after a shared cache, a core on the node of the
+// device's or the thread's last core. Every core is in node 0 until this is called. False for a core that is not online.
+bool set_core_numa_node(uint32_t core, uint32_t node);
+// What addresses the core in an interrupt message: the local APIC id on x86 (MPIDR affinity on ARM, the hart id on RISC-V). ~0 if out of range.
+uint64_t core_hardware_id(uint32_t core);
+// set_interrupt_handler for a device's interrupt: the handler runs as before, and what it wakes is placed as above. A null handler removes it.
+// False if every device vector slot is taken.
+bool set_device_interrupt_handler(Vector vector, int32_t device, InterruptHandler handler, void* context);
+// Makes the thread follow `device`'s interrupt core (whatever it learnt), -1 to go back to learning. Takes effect when it is next placed.
+void bind_thread_to_io_device(Thread* thread, int32_t device);
+bool io_device_info(int32_t device, scheduling::IoDeviceInfo* out);
+// Moves the device's interrupt to `core` (whose interrupt-message id is `hardware_id`); true if it was moved. Called from a kernel thread, never
+// from an interrupt or with a lock held.
+using IoRetarget = bool (*)(void* context, uint32_t core, uint64_t hardware_id);
+// Lets the scheduler move the device's interrupt to where its work runs: when most of the threads its interrupts wake cannot run on the
+// interrupt's core (pinned to another core, or wanting another kind) and one core takes most of them (scheduling::InterruptSteering),
+// `retarget` is called to send the interrupt there, and set_io_device_core follows if it succeeds. A null `retarget` stops this, after waiting for
+// a call in progress. False for a device that is not registered.
+bool set_io_device_retarget(int32_t device, IoRetarget retarget, void* context);
+constexpr uint64_t kPlacementPatienceUs = 2000;
 
 // For the synchronization primitives (Sync.hpp). The scheduler lock is a spinlock
 // that also masks interrupts; hold it only for a few instructions.

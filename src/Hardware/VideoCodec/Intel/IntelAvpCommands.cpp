@@ -152,10 +152,17 @@ void emit_vd_pipeline_flush(DwordWriter& w) {
   w.emit((1u << 5) | (1u << 4) | (1u << 20));
 }
 
-void emit_avp_pipe_mode_select(DwordWriter& w) {
-  uint32_t d[kPipeModeSelectDwords];
-  Fields f{ArrayView<uint32_t>(d)};
-  f.set(0, 0, 31, kAvpPipeModeSelect | (kPipeModeSelectDwords - 2));
+void emit_avp_vd_control_state(DwordWriter& w) {
+  w.emit(kVdControlState | (3 - 2));
+  w.emit(1);   // pipeline initialisation
+  w.emit(0);
+}
+
+void emit_avp_pipe_mode_select(DwordWriter& w, AvpPlatform platform) {
+  uint32_t d[kPipeModeSelectDwordsXeLpg];
+  const uint32_t n = platform != AvpPlatform::XeLp ? kPipeModeSelectDwordsXeLpg : kPipeModeSelectDwords;
+  Fields f{ArrayView<uint32_t>(d, n)};
+  f.set(0, 0, 31, kAvpPipeModeSelect | (n - 2));
   f.set(1, 0, 0, 0);          // decode
   f.set(1, 5, 7, 2);          // AV1
   f.set(1, 13, 14, 0);        // a single engine
@@ -174,11 +181,12 @@ void emit_avp_surface_state(DwordWriter& w, const intel_mfx::Nv12TiledLayout& la
   emit_words(w, f);
 }
 
-void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b) {
-  uint32_t d[kPipeBufAddrDwords];
-  Fields f{ArrayView<uint32_t>(d)};
+void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b, AvpPlatform platform) {
+  uint32_t d[kPipeBufAddrDwordsXe2];
+  const uint32_t n = platform == AvpPlatform::Xe2 ? kPipeBufAddrDwordsXe2 : platform != AvpPlatform::XeLp ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords;   // (the buffers this decoder uses sit at the same dwords on both)
+  Fields f{ArrayView<uint32_t>(d, n)};
   const uint32_t attr = attributes_of(b.mocs);
-  f.set(0, 0, 31, kAvpPipeBufAddrState | (kPipeBufAddrDwords - 2));
+  f.set(0, 0, 31, kAvpPipeBufAddrState | (n - 2));
   for (uint32_t i = 0; i < 8; ++i) f.buffer(1 + 2 * i, 17, b.reference[i], attr);
   f.buffer(18, 20, b.current, attr);
   f.buffer(24, 26, b.intrabc, attr);
@@ -192,10 +200,11 @@ void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b) {
   emit_words(w, f);
 }
 
-void emit_avp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs) {
-  uint32_t d[kIndObjDwords];
-  Fields f{ArrayView<uint32_t>(d)};
-  f.set(0, 0, 31, kAvpIndObjBaseAddrState | (kIndObjDwords - 2));
+void emit_avp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs, AvpPlatform platform) {
+  uint32_t d[kIndObjDwordsXeLpg];
+  const uint32_t n = platform != AvpPlatform::XeLp ? kIndObjDwordsXeLpg : kIndObjDwords;   // (Xe-LPG adds the coding unit objects an encoder reads: unused here)
+  Fields f{ArrayView<uint32_t>(d, n)};
+  f.set(0, 0, 31, kAvpIndObjBaseAddrState | (n - 2));
   f.buffer(1, 3, bitstream, attributes_of(mocs));
   const uint64_t upper = bitstream + ((bitstream_bytes + 4095) & ~uint64_t{4095});
   f.whole(4, static_cast<uint32_t>(upper));
@@ -230,15 +239,16 @@ AvpGlobalMotion av1_global_motion(uint32_t type, const int32_t matrix[6], bool a
   return g;
 }
 
-void emit_avp_pic_state(DwordWriter& w, const AvpPicture& p) {
-  uint32_t d[kPicStateDwords];
-  Fields f{ArrayView<uint32_t>(d)};
-  f.set(0, 0, 31, kAvpPicState | (kPicStateDwords - 2));
+void emit_avp_pic_state(DwordWriter& w, const AvpPicture& p, AvpPlatform platform) {
+  uint32_t d[kPicStateDwordsXeLpg];
+  const uint32_t n = platform != AvpPlatform::XeLp ? kPicStateDwordsXeLpg : kPicStateDwords;   // (Xe-LPG: the encoder's rate-control dwords at the end stay zero)
+  Fields f{ArrayView<uint32_t>(d, n)};
+  f.set(0, 0, 31, kAvpPicState | (n - 2));
   f.set(1, 0, 15, p.width - 1);
   f.set(1, 16, 31, p.height - 1);
   f.set(2, 0, 1, 1);                                   // 4:2:0
   f.set(2, 3, 4, 0);                                   // 8 bits
-  f.flag(2, 6, p.full_range);
+  if (platform == AvpPlatform::XeLp) f.flag(2, 6, p.full_range);   // (a reserved bit on Xe-LPG)
   f.set(2, 7, 8, p.sb128 ? 1 : 0);
   f.flag(2, 9, p.order_hint_enabled);
   f.set(2, 10, 12, p.order_hint_enabled && p.order_hint_bits > 0 ? p.order_hint_bits - 1 : 0);
@@ -377,10 +387,11 @@ void emit_avp_inter_pred_state(DwordWriter& w, const AvpInterPred& p) {
   emit_words(w, f);
 }
 
-void emit_avp_tile_coding(DwordWriter& w, const AvpTile& t) {
-  uint32_t d[kTileCodingDwords];
-  Fields f{ArrayView<uint32_t>(d)};
-  f.set(0, 0, 31, kAvpTileCoding | (kTileCodingDwords - 2));
+void emit_avp_tile_coding(DwordWriter& w, const AvpTile& t, AvpPlatform platform) {
+  uint32_t d[kTileCodingDwordsXeLpg];
+  const uint32_t n = platform == AvpPlatform::XeLpg || platform == AvpPlatform::Xe2 ? kTileCodingDwordsXeLpg : kTileCodingDwords;   // (Xe-LPG: the large-scale-tile output position at the end stays zero)
+  Fields f{ArrayView<uint32_t>(d, n)};
+  f.set(0, 0, 31, kAvpTileCoding | (n - 2));
   f.set(1, 0, 11, t.id);
   f.set(1, 12, 23, t.group_num);
   f.set(1, 24, 31, t.group_id);

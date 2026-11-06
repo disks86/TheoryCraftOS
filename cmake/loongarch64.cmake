@@ -28,6 +28,7 @@ add_executable(BOOTLOONGARCH64
   src/Arch/LoongArch64/Cpu.cpp
   src/Arch/LoongArch64/PageProtector.cpp
   src/Kernel/ThreadScheduler.cpp
+  src/CPUScheduler/IoAffinity.cpp
   src/Kernel/Sync.cpp
   src/Kernel/Firmware.cpp
   src/Kernel/Delay.cpp

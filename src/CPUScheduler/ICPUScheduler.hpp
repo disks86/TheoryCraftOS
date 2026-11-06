@@ -32,9 +32,10 @@ using TaskFunction = void (*)(void* context);
 // must not call firmware services; submit() is safe from any core.
 class ICPUScheduler {
  public:
-  // Queues a task. Returns false if fn is null or the allocator ran out of memory.
+  // Queues a task. Returns false if fn is null or the allocator ran out of memory. A task that waits for a device (kernel::register_io_device)
+  // names it in `io_device`: it is then run near the core that takes that device's interrupts (-1: no device).
   virtual bool submit(TaskFunction fn, void* context,
-                      TaskQueue queue = TaskQueue::HighPerformance) = 0;
+                      TaskQueue queue = TaskQueue::HighPerformance, int32_t io_device = -1) = 0;
   // Starts the next task, HighPerformance before Efficiency, on a free core of
   // the queue's kind (any free core if none; this core if all are busy). Returns
   // once the task is started - possibly still running on another core - or false

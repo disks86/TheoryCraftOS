@@ -96,6 +96,10 @@ class VcsDriver {
     uint64_t ggtt_first_page = 0;         // the first of the ggtt_pages_for(engine) pages of graphics address space this driver may use; it touches no others
     Generation generation = Generation::Gen9;   // (Gen11: Ice Lake; the video engine only)
     Engine engine = Engine::Video;        // the render engine is Gen9 only; it needs ggtt_pages_for(Engine::Render) pages
+    bool gmd_id_flush = false;            // Wa_22019338487: a write to GMD_ID after global GTT writes (the media tile of an integrated GPU: Meteor Lake, Lunar Lake)
+    bool xe2 = false;                     // Xe2 (Lunar Lake, Arc Battlemage) media tile: like Xe-LPG, with the Xe2 PAT/MOCS tables and register state image
+    bool xe_hpg = false;                  // Xe-HPG (Arc Alchemist, discrete): a Gen12 video engine whose PAT registers are multicast ones; system memory is used as it is on any Gen12
+    bool xe_lpg = false;                  // Xe-LPG (Meteor Lake, Arrow Lake) media tile: a Gen12 engine with its own PAT/MOCS layout; `registers` must be the media tile's window
     uint16_t device_id = 0;               // the GPU's PCI device ID and revision: which Gen9.5 workarounds the render engine gets (IntelGen9Setup.hpp)
     uint8_t revision = 0;
     uint32_t engine_base = 0;             // 0: the first video engine of the generation (VCS0 at 0x12000, VD0 at 0x1C0000)
@@ -124,6 +128,9 @@ class VcsDriver {
 
   uint32_t last_sequence() const { return seqno_; }
   Generation generation() const { return config_.generation; }
+  bool xe_lpg() const { return config_.xe_lpg; }
+  bool xe_hpg() const { return config_.xe_hpg; }
+  bool xe2() const { return config_.xe2; }
 
   // Only one user at a time can have buffers in the context's address space: whoever starts a decode session takes the lease and gives it back at the end.
   bool try_lease() {
@@ -158,6 +165,8 @@ class VcsDriver {
   }
   void write_job(uint64_t status_address, uint32_t sequence);
   void fail_init();
+  void flush_ggtt(IRegisterBank& regs) const;
+  uint64_t ggtt_flags() const;
   bool wedge();
   void write_ring(uint32_t dword);
 

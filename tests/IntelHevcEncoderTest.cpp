@@ -33,6 +33,7 @@ static int g_failed = 0;
 #include "FakeIntelGpu.hpp"
 #include "Hardware/VideoCodec/Intel/IntelHevcEncodeCommands.hpp"
 #include "Hardware/VideoCodec/Intel/IntelHevcVdencEncoder.hpp"
+#include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/Intel/IntelTiling.hpp"
 #include "Hardware/VideoCodec/Software/H265Cabac.hpp"
@@ -58,6 +59,7 @@ namespace {
 constexpr uint32_t kHMfxWait = 0x68000000, kHVdencControl = 0x708B0000;
 constexpr uint32_t kHHcpPipeMode = 0x73800000, kHHcpSurface = 0x73810000, kHHcpPipeBuf = 0x73820000, kHHcpIndObj = 0x73830000, kHHcpQm = 0x73840000, kHHcpFqm = 0x73850000,
                    kHHcpPicState = 0x73900000, kHHcpRefIdx = 0x73920000, kHHcpSliceState = 0x73940000, kHHcpPakInsert = 0x73A20000;
+constexpr uint32_t kHVdencTileSlice = 0x708D0000;
 constexpr uint32_t kHVdencPipeMode = 0x70800000, kHVdencSrc = 0x70810000, kHVdencRef = 0x70820000, kHVdencDs = 0x70830000, kHVdencPipeBuf = 0x70840000, kHVdencWalker = 0x70870000,
                    kHVdencWeights = 0x70880000, kHVdencCmd2 = 0x70890000, kHVdencCmd1 = 0x708A0000, kHVdFlush = 0x77800000;
 
@@ -177,6 +179,7 @@ void code_slice_data(Bits* out, bool b_slice, int slice_qp, uint32_t ctbs_x, uin
 struct FakeEncoder {
   int pictures = 0, problems = 0, keyframes = 0;
   bool write_stream = true;                       // the picture is whole 64x64 blocks: write real slice data
+  bool xe_lpg = false;                            // Meteor Lake / Arrow Lake VDEnc commands (else Xe-LP's)
   std::vector<uint32_t> sizes;
   std::vector<uint8_t> last_luma, last_chroma;    // the source surface as the engine read it (visible part)
   uint32_t last_width = 0, last_height = 0;
@@ -234,14 +237,23 @@ struct FakeEncoder {
     const uint32_t* vsrc = expect(kHVdencSrc, 6, "VDENC_SRC_SURFACE_STATE");
     const uint32_t* vref = expect(kHVdencRef, 6, "VDENC_REF_SURFACE_STATE");
     const uint32_t* vds = expect(kHVdencDs, 10, "VDENC_DS_REF_SURFACE_STATE");
-    const uint32_t* vbuf = expect(kHVdencPipeBuf, 71, "VDENC_PIPE_BUF_ADDR_STATE");
-    const uint32_t* cmd1 = expect(kHVdencCmd1, 31, "VDENC_CMD1");
+    const uint32_t* vbuf = expect(kHVdencPipeBuf, xe_lpg ? 89 : 71, "VDENC_PIPE_BUF_ADDR_STATE");
+    const uint32_t* cmd1 = expect(kHVdencCmd1, xe_lpg ? 33 : 31, "VDENC_CMD1");
     const uint32_t* pic = expect(kHHcpPicState, 41, "HCP_PIC_STATE");
-    const uint32_t* cmd2 = expect(kHVdencCmd2, 51, "VDENC_CMD2");
+    const uint32_t* cmd2 = expect(kHVdencCmd2, xe_lpg ? 62 : 51, "VDENC_CMD2");
     if (!vmode || !vsrc || !vref || !vds || !vbuf || !cmd1 || !pic || !cmd2) return;
-    if (field(vmode[1], 0, 3) != 0 || field(vmode[1], 7, 7) != 1 || field(vmode[1], 12, 14) != 0 || field(vmode[1], 15, 16) != 1 || field(vmode[1], 18, 18) != 0 || field(vmode[3], 24, 27) != 4 ||
-        field(vmode[3], 16, 19) != 1)
+    if (xe_lpg) {
+      // The driver's open code leaves the TLB prefetch bit alone and keeps the default prefetch geometry; the image has HEVC, 8-bit 4:2:0, low delay and the "Par0" bit set.
+      if (field(vmode[1], 0, 3) != 0 || field(vmode[1], 12, 14) != 0 || field(vmode[1], 15, 16) != 1 || field(vmode[1], 18, 18) != 0 || field(vmode[5], 17, 17) != 1)
+        problem("VDEnc mode (Xe-LPG): HEVC, 8-bit 4:2:0, low delay");
+    } else if (field(vmode[1], 0, 3) != 0 || field(vmode[1], 7, 7) != 1 || field(vmode[1], 12, 14) != 0 || field(vmode[1], 15, 16) != 1 || field(vmode[1], 18, 18) != 0 ||
+               field(vmode[3], 24, 27) != 4 || field(vmode[3], 16, 19) != 1)
       problem("VDEnc mode: HEVC, TLB prefetch, 8-bit 4:2:0, low delay");
+    // The VDEnc surfaces: Y-major tiled, NV12 (4) in the five format bits from bit 27, and the Xe-LPG driver's chroma downsample filter on the source.
+    for (const uint32_t* surface : {vsrc, vref})
+      if (field(surface[3], 0, 1) != 3 || field(surface[3], 27, 31) != 4 || field(surface[3], 3, 19) + 1 != field(s_src[1], 0, 16) + 1) problem("VDEnc surface format");
+    if (field(vds[3], 27, 31) != 4 || field(vds[7], 27, 31) != 4) problem("VDEnc down-scaled surface format");
+    if (field(vsrc[3], 20, 22) != 7 || field(vref[3], 20, 22) != 0) problem("VDEnc source chroma downsample filter");
 
     // --- Picture geometry and type, from the three places that carry them.
     const uint32_t width = field(cmd2[1], 0, 15) + 1, height = field(cmd2[1], 16, 31) + 1;
@@ -294,14 +306,18 @@ struct FakeEncoder {
       if (inserts[k].bytes.size() < 7 || inserts[k].bytes[4] != static_cast<uint8_t>((32 + k) << 1)) problem("parameter set NAL unit type");
     }
 
-    const uint32_t* weights = expect(kHVdencWeights, 3, "VDENC_WEIGHTSOFFSETS_STATE");
-    const uint32_t* walker = expect(kHVdencWalker, 27, "VDENC_WALKER_STATE");
+    const uint32_t* weights = expect(kHVdencWeights, xe_lpg ? 7 : 3, "VDENC_WEIGHTSOFFSETS_STATE");
+    const uint32_t* tile_slice = xe_lpg ? expect(kHVdencTileSlice, 28, "VDENC_HEVC_VP9_TILE_SLICE_STATE") : nullptr;
+    const uint32_t* walker = expect(kHVdencWalker, xe_lpg ? 3 : 27, "VDENC_WALKER_STATE");
     const uint32_t* flush = expect(kHVdFlush, 2, "VD_PIPELINE_FLUSH");
-    if (!weights || !walker || !flush) return;
+    if (!weights || !walker || !flush || (xe_lpg && !tile_slice)) return;
     const uint32_t ctbs_x = (width + 63) / 64, ctbs_y = (height + 63) / 64;
-    if (field(walker[2], 16, 25) != ctbs_x || field(walker[2], 0, 9) != ctbs_y || field(walker[5], 0, 15) + 1 != width || field(walker[5], 16, 31) + 1 != height || field(walker[1], 0, 8) != 0 ||
-        field(walker[1], 16, 24) != 0)
+    // The extent of the one slice: the next slice starts behind the last coding tree block; the tile is the whole picture (Xe-LP keeps its size in the walker).
+    const uint32_t* extent = xe_lpg ? tile_slice : walker;
+    if (field(walker[2], 16, 25) != ctbs_x || field(walker[2], 0, 9) != ctbs_y || field(extent[5], 0, 15) + 1 != width || field(extent[5], 16, 31) + 1 != height || field(walker[1], 0, 8) != 0 ||
+        field(walker[1], 16, 24) != 0 || field(walker[1], 28, 28) != 0)
       problem("walker extent");
+    if (xe_lpg && (field(weights[1], 0, 7) != 1 || field(weights[1], 8, 15) != 0 || field(tile_slice[3], 9, 10) != 0 || field(tile_slice[6], 0, 0) != 0)) problem("weights, single pipe, no tiles");
     if (field(flush[1], 1, 1) != 1 || field(flush[1], 17, 17) != 1 || field(flush[1], 3, 3) != 1) problem("pipeline flush");
     while (i < d.size() && d[i] == 0) ++i;
     if (i + 4 > d.size() || (d[i] >> 23) != 0x26) { problem("flush after the slice"); return; }
@@ -447,9 +463,11 @@ uint8_t limited_luma(uint32_t v) { return static_cast<uint8_t>(16 + (v * 219 + 1
 uint8_t limited_chroma(int32_t c) { return static_cast<uint8_t>(128 + ((c - 128) * 224 + (c >= 128 ? 127 : -127)) / 255); }
 
 // Encodes `count` pictures through the session, compares the source surface the engine saw with the input, decodes the packets on the CPU and checks the pictures.
-void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality) {
-  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u\n", w, h, count, interval, quality);
+void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, bool xe_lpg = false, bool arc = false) {
+  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : "");
   Rig2 rig;
+  rig.engine.xe_lpg = xe_lpg || arc;   // (Arc's commands have the same sizes and fields)
+  rig.gpu.xehp = xe_lpg || arc;
   rig.engine.write_stream = (w % 64 == 0 && h % 64 == 0);
   EncoderConfig cfg;
   cfg.codec = VideoCodec::Hevc;
@@ -463,7 +481,11 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
   VideoFrameBuffer sources[8] = {VideoFrameBuffer(a), VideoFrameBuffer(a), VideoFrameBuffer(a), VideoFrameBuffer(a), VideoFrameBuffer(a), VideoFrameBuffer(a), VideoFrameBuffer(a), VideoFrameBuffer(a)};
   {
     VcsDriver driver(rig.mem);
-    CHECK(driver.initialize(rig.config()));
+    VcsDriver::Config driver_config = rig.config();
+    driver_config.xe_lpg = xe_lpg;
+    driver_config.xe_hpg = arc;
+    driver_config.gmd_id_flush = xe_lpg;
+    CHECK(driver.initialize(driver_config));
     {
       IntelHevcVdencEncoder enc(a, driver, cfg);
       CHECK(enc.prepare());
@@ -672,6 +694,51 @@ void test_device(TestAllocator& a) {
   CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
   CHECK(rig.mem.live() == 1);
 
+  // The platforms after Xe-LP decode on the engine; of them only Meteor Lake encodes H.265 on it (Xe-LPG's VDEnc commands are written; Arc and Xe2's have a different CMD1/CMD2 and
+  // pipe mode, H.264 has two new state commands).
+  struct Platform { const char* name; uint16_t id; bool media_tile; bool av1; };
+  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}};
+  for (const Platform& pl : platforms) {
+    printf("  %s\n", pl.name);
+    Rig2 rig_pl;
+    rig_pl.gpu.xehp = true;
+    rig_pl.engine.write_stream = true;
+    const uint64_t base = pl.media_tile ? IntelMediaEngineHw::kMediaTileBase : 0;
+    std::vector<uint32_t> regs_pl((base + 0x20000) / 4, 0);
+    regs_pl[(base + 0x0D50) / 4] = 1;   // the first video box answers the power request
+    regs_pl[(base + 0x9140) / 4] = 0x5; // ... and the fuses say both boxes exist
+    const MmioRegion region_pl(reinterpret_cast<uint64_t>(regs_pl.data()), regs_pl.size() * 4);
+    IntelMediaVideoEngine::HardwareSetup setup_pl;
+    setup_pl.registers = &rig_pl.gpu;   // (the simulated GPU stands for the tile's own window)
+    setup_pl.ggtt_table = rig_pl.config().ggtt_table;
+    setup_pl.ggtt_first_page = 100;
+    setup_pl.memory = &rig_pl.mem;
+    {
+      IntelMediaVideoEngine device(a, pl.id, region_pl);
+      device.set_hardware(setup_pl);
+      CHECK(device.initialize() && device.hardware_decode());
+      const uint32_t decode = device.info().accelerated_decode_codecs;
+      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && (decode & codec_mask(VideoCodec::Vp9)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
+      CHECK(!!(decode & codec_mask(VideoCodec::Av1)) == pl.av1);
+      const bool meteor = pl.id == 0x7D55 || pl.id == 0x56A0;   // Meteor Lake and Arc Alchemist encode on the engine
+      rig_pl.engine.xe_lpg = meteor;
+      CHECK(device.info().accelerated_encode_codecs == (meteor ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0));
+      EncoderConfig cfg;
+      cfg.codec = VideoCodec::Hevc;
+      cfg.width = 64;
+      cfg.height = 64;
+      cfg.input = PixelFormat::I420;
+      UniquePointer<IVideoEncoder> enc = device.create_encoder(cfg);
+      if (enc) {
+        VideoFrameBuffer f(a);
+        make_i420(f, 64, 64, 5);
+        enc->submit(f.frame());
+      }
+      CHECK(rig_pl.engine.pictures == (meteor ? 1 : 0));   // (the CPU, if anything)
+    }
+    CHECK(rig_pl.gpu.violations.empty() && rig_pl.engine.problems == 0);
+  }
+
   // Ice Lake and Coffee Lake offer H.264 only.
   for (Generation g : {Generation::Gen9, Generation::Gen11}) {
     Rig2 other(g);
@@ -701,6 +768,13 @@ int main() {
   encode_and_check(a, 72, 40, 4, 2, 40);        // partial blocks: commands and source only
   encode_and_check(a, 1920, 1080, 2, 2, 75);    // a real size
   encode_and_check(a, 34, 18, 3, 3, 90);        // odd multiples of two: coded size 40x24
+  encode_and_check(a, 64, 64, 5, 3, 75, true);        // Meteor Lake and Arrow Lake: IPP IPP, one coding tree block
+  encode_and_check(a, 128, 128, 6, 6, 1, true);
+  encode_and_check(a, 72, 40, 4, 2, 40, true);        // partial blocks
+  encode_and_check(a, 1920, 1080, 2, 2, 75, true);
+  encode_and_check(a, 64, 64, 5, 3, 75, false, true);       // Arc Alchemist
+  encode_and_check(a, 72, 40, 4, 2, 40, false, true);
+  encode_and_check(a, 1920, 1080, 2, 2, 75, false, true);
   test_rejections(a);
   test_other_generations(a);
   test_hang(a);

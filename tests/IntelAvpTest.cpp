@@ -50,6 +50,80 @@ static void test_headers() {
   CHECK(emit([](DwordWriter& w) { emit_vd_pipeline_flush(w); }) == std::vector<uint32_t>({0x77800000, (1u << 4) | (1u << 5) | (1u << 20)}));
 }
 
+// Xe-LPG: five commands are longer, with the same fields (and the same dwords) in front; the full-range flag, reserved there, is not written.
+static void test_xe_lpg() {
+  const AvpPlatform lpg = AvpPlatform::XeLpg;
+  CHECK(emit([](DwordWriter& w) { emit_avp_vd_control_state(w); }) == std::vector<uint32_t>({0x718A0001u, 1, 0}));
+  const auto lp_mode = emit([](DwordWriter& w) { emit_avp_pipe_mode_select(w); }), lpg_mode = emit([&](DwordWriter& w) { emit_avp_pipe_mode_select(w, lpg); });
+  CHECK(lpg_mode.size() == kPipeModeSelectDwordsXeLpg && lpg_mode[0] == (kAvpPipeModeSelect | 5) && lpg_mode[1] == lp_mode[1] && lpg_mode[6] == 0);
+  AvpBuffers b;
+  b.current = 0x12345000;
+  b.line[kBsdLine] = 0x2000;
+  b.line[kBlockStreamout] = 0x9000;
+  const auto lp_buf = emit([&](DwordWriter& w) { emit_avp_pipe_buf_addr_state(w, b); }), lpg_buf = emit([&](DwordWriter& w) { emit_avp_pipe_buf_addr_state(w, b, lpg); });
+  CHECK(lpg_buf.size() == kPipeBufAddrDwordsXeLpg && lpg_buf[0] == (kAvpPipeBufAddrState | 210));
+  for (size_t i = 1; i < lp_buf.size(); ++i) CHECK(lpg_buf[i] == lp_buf[i]);
+  for (size_t i = lp_buf.size(); i < lpg_buf.size(); ++i) CHECK(lpg_buf[i] == 0);
+  const auto lpg_ind = emit([&](DwordWriter& w) { emit_avp_ind_obj_base_addr_state(w, 0x20000000, 0x1000, 3, lpg); });
+  CHECK(lpg_ind.size() == kIndObjDwordsXeLpg && lpg_ind[0] == (kAvpIndObjBaseAddrState | 7) && lpg_ind[6] == 0 && lpg_ind[7] == 0 && lpg_ind[8] == 0);
+  AvpPicture pic;
+  pic.width = 64;
+  pic.height = 48;
+  pic.full_range = true;
+  const auto lp_pic = emit([&](DwordWriter& w) { emit_avp_pic_state(w, pic); }), lpg_pic = emit([&](DwordWriter& w) { emit_avp_pic_state(w, pic, lpg); });
+  CHECK(lpg_pic.size() == kPicStateDwordsXeLpg && lpg_pic[0] == (kAvpPicState | 74) && (lp_pic[2] & 64) && !(lpg_pic[2] & 64) && lpg_pic[1] == lp_pic[1]);
+  for (size_t i = 3; i < lp_pic.size(); ++i) CHECK(lpg_pic[i] == lp_pic[i]);
+  for (size_t i = lp_pic.size(); i < lpg_pic.size(); ++i) CHECK(lpg_pic[i] == 0);
+  AvpTile tile;
+  tile.id = 5;
+  tile.columns = tile.rows = 2;
+  const auto lp_tile = emit([&](DwordWriter& w) { emit_avp_tile_coding(w, tile); }), lpg_tile = emit([&](DwordWriter& w) { emit_avp_tile_coding(w, tile, lpg); });
+  CHECK(lpg_tile.size() == kTileCodingDwordsXeLpg && lpg_tile[0] == (kAvpTileCoding | 5) && lpg_tile[6] == 0);
+  for (size_t i = 1; i < lp_tile.size(); ++i) CHECK(lpg_tile[i] == lp_tile[i]);
+}
+
+// Xe-HPG (Arc): the Xe-LPG commands but for the tile coding command, which stays six dwords.
+static void test_xe_hpg() {
+  const AvpPlatform hpg = AvpPlatform::XeHpg;
+  AvpTile tile;
+  tile.id = 5;
+  tile.columns = tile.rows = 2;
+  const auto lp = emit([&](DwordWriter& w) { emit_avp_tile_coding(w, tile); }), hp = emit([&](DwordWriter& w) { emit_avp_tile_coding(w, tile, hpg); });
+  CHECK(hp == lp);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_pipe_mode_select(w, hpg); }).size() == kPipeModeSelectDwordsXeLpg);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_pipe_buf_addr_state(w, AvpBuffers(), hpg); }).size() == kPipeBufAddrDwordsXeLpg);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_ind_obj_base_addr_state(w, 0x20000000, 0x1000, 3, hpg); }).size() == kIndObjDwordsXeLpg);
+  AvpPicture pic;
+  pic.width = 64;
+  pic.height = 48;
+  pic.full_range = true;
+  const auto hp_pic = emit([&](DwordWriter& w) { emit_avp_pic_state(w, pic, hpg); });
+  CHECK(hp_pic.size() == kPicStateDwordsXeLpg && !(hp_pic[2] & 64));
+}
+
+// Xe2 (Lunar Lake, Battlemage): the Xe-LPG lengths, with three more dwords of buffer addresses.
+static void test_xe2() {
+  const AvpPlatform x2 = AvpPlatform::Xe2;
+  AvpBuffers b;
+  b.current = 0x12345000;
+  b.line[kBlockStreamout] = 0x9000;
+  const auto lpg = emit([&](DwordWriter& w) { emit_avp_pipe_buf_addr_state(w, b, AvpPlatform::XeLpg); }), xe2 = emit([&](DwordWriter& w) { emit_avp_pipe_buf_addr_state(w, b, x2); });
+  CHECK(xe2.size() == kPipeBufAddrDwordsXe2 && xe2[0] == (kAvpPipeBufAddrState | 213));
+  for (size_t i = 1; i < lpg.size(); ++i) CHECK(xe2[i] == lpg[i]);
+  for (size_t i = lpg.size(); i < xe2.size(); ++i) CHECK(xe2[i] == 0);
+  AvpTile tile;
+  tile.id = 5;
+  CHECK(emit([&](DwordWriter& w) { emit_avp_tile_coding(w, tile, x2); }).size() == kTileCodingDwordsXeLpg);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_pipe_mode_select(w, x2); }).size() == kPipeModeSelectDwordsXeLpg);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_ind_obj_base_addr_state(w, 0x20000000, 0x1000, 3, x2); }).size() == kIndObjDwordsXeLpg);
+  AvpPicture pic;
+  pic.width = 64;
+  pic.height = 48;
+  pic.full_range = true;
+  const auto p = emit([&](DwordWriter& w) { emit_avp_pic_state(w, pic, x2); });
+  CHECK(p.size() == kPicStateDwordsXeLpg && !(p[2] & 64));
+}
+
 static void test_small_commands() {
   const std::vector<uint32_t> mode = emit([](DwordWriter& w) { emit_avp_pipe_mode_select(w); });
   CHECK(mode.size() == kPipeModeSelectDwords && mode[0] == (kAvpPipeModeSelect | 4) && mode[1] == (2u << 5) && mode[2] == 0 && mode[5] == 0);
@@ -265,6 +339,9 @@ static void test_default_contexts() {
 
 int main() {
   test_headers();
+  test_xe_lpg();
+  test_xe_hpg();
+  test_xe2();
   test_small_commands();
   test_pic_state();
   test_global_motion();

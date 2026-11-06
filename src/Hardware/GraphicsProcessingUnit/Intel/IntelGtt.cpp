@@ -21,6 +21,18 @@
 namespace hardware {
 namespace intel_gt {
 
+bool ggtt_geometry_xehp(uint64_t register_bar_size, GgttGeometry* out) {
+  constexpr uint64_t kTableBytes = uint64_t{8} << 20, kGuTop = 0xFEE00000ull;
+  if (register_bar_size < 2 * kTableBytes) return false;
+  GgttGeometry g;
+  g.table_offset = kTableBytes;
+  g.entries = kGuTop / kPageSize;
+  g.table_bytes = g.entries * 8;
+  g.address_space = kGuTop;
+  *out = g;
+  return true;
+}
+
 bool ggtt_geometry(uint16_t gmch_control, uint64_t register_bar_size, GgttGeometry* out) {
   const uint32_t size_code = (gmch_control >> 6) & 0x3;
   if (size_code == 0 || register_bar_size == 0 || (register_bar_size & 1)) return false;
@@ -36,13 +48,13 @@ bool ggtt_geometry(uint16_t gmch_control, uint64_t register_bar_size, GgttGeomet
 
 bool Ggtt::map(uint64_t index, uint64_t dma_address) const {
   if (!valid() || index >= page_count_ || (dma_address & (kPageSize - 1))) return false;
-  table_.write64((first_page_ + index) * 8, ggtt_pte(dma_address));
+  table_.write64((first_page_ + index) * 8, ggtt_pte(dma_address) | pte_flags_);
   return true;
 }
 
 bool Ggtt::clear(uint64_t index, uint64_t count, uint64_t scratch_dma) const {
   if (!valid() || index > page_count_ || count > page_count_ - index || (scratch_dma & (kPageSize - 1))) return false;
-  for (uint64_t i = 0; i < count; ++i) table_.write64((first_page_ + index + i) * 8, ggtt_pte(scratch_dma));
+  for (uint64_t i = 0; i < count; ++i) table_.write64((first_page_ + index + i) * 8, ggtt_pte(scratch_dma) | pte_flags_);
   return true;
 }
 
@@ -96,6 +108,39 @@ void program_gen12_pat(IRegisterBank& registers) {
   constexpr uint32_t kUncached = 0, kWriteCombining = 1, kWriteThrough = 2, kWriteBack = 3;
   const uint32_t values[8] = {kWriteBack, kWriteCombining, kWriteThrough, kUncached, kWriteBack, kWriteBack, kWriteBack, kWriteBack};
   for (uint32_t i = 0; i < 8; ++i) registers.write32(kGen12PatIndexBase + 4 * i, values[i]);
+}
+
+void program_xelpg_pat(IRegisterBank& registers) {
+  constexpr uint32_t kWriteBack = 0, kWriteThrough = 1u << 2, kUncached = 3u << 2, kOneWay = 2, kTwoWay = 3;   // L4 policy (bits 2..3), coherency (bits 0..1)
+  const uint32_t values[5] = {kWriteBack, kWriteThrough, kUncached, kWriteBack | kOneWay, kWriteBack | kTwoWay};
+  for (uint32_t i = 0; i < 5; ++i) registers.write32(kGen12PatIndexBase + 4 * i, values[i]);
+}
+
+void program_xe2_pat(IRegisterBank& registers) {
+  // XE2_PAT(no_promote, comp_en, l3clos, l3_policy, l4_policy, coh_mode): L4 policy bits 2..3, L3 policy bits 4..5, coherency bits 0..1.
+  const uint32_t values[5] = {3u << 2, (3u << 2) | 2, (3u << 2) | 3, (3u << 4) | (3u << 2), (3u << 2) | 3};
+  for (uint32_t i = 0; i < 5; ++i) registers.write32(kGen12PatIndexBase + 4 * i, values[i]);
+}
+
+void program_xe2_global_mocs(IRegisterBank& registers) {
+  constexpr uint32_t kIgnorePat = 1u << 8, kL4Uncached = 3u << 2, kL3Uncached = 3u << 4;
+  uint32_t table[16];
+  for (uint32_t& e : table) e = kIgnorePat;   // (the unused entries: entry 4, cached L3 and L4)
+  table[0] = kL4Uncached;
+  table[1] = kIgnorePat | kL4Uncached;
+  table[2] = kIgnorePat | kL3Uncached;
+  table[3] = kIgnorePat | kL3Uncached | kL4Uncached;
+  for (uint32_t i = 0; i < 16; ++i) registers.write32(0x4000 + 4 * i, table[i]);
+}
+
+void program_xelpg_global_mocs(IRegisterBank& registers) {
+  constexpr uint32_t kIgnorePat = 1u << 8, kL4Uncached = 3u << 2, kL4WriteThrough = 1u << 2;
+  uint32_t table[16];
+  for (uint32_t& e : table) e = kIgnorePat;   // (the unused entries: entry 1)
+  table[0] = 0;
+  table[3] = table[5] = table[7] = table[9] = kIgnorePat | kL4Uncached;
+  table[14] = kIgnorePat | kL4WriteThrough;
+  for (uint32_t i = 0; i < 16; ++i) registers.write32(0x4000 + 4 * i, table[i]);
 }
 
 void ggtt_invalidate(IRegisterBank& registers) {

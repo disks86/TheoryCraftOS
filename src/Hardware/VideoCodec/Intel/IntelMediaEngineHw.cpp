@@ -83,8 +83,11 @@ IntelMediaEngineStatus IntelMediaEngineHw::probe(const MmioRegion& bar, IntelGpu
     if (wake_and_sleep(registers, kForcewakeMediaGen9, kForcewakeAckMediaGen9)) status.vdbox_awake = 1;
     return status;
   }
-  const uint32_t disabled = registers.read32(kVeboxVdboxDisable) & kVdboxDisableMask;
-  status.vdbox_present = kVdboxBuilt & ~disabled;
+  // The fuse register's bits name the boxes that are disabled up to Xe-LP, and the boxes that are present from Xe-HPG on (xe_hw_engine.c read_media_fuses).
+  const uint32_t fuse = registers.read32(kVeboxVdboxDisable) & kVdboxDisableMask;
+  const bool bits_are_present = architecture == IntelGpuArchitecture::XeHpg || architecture == IntelGpuArchitecture::XeLpg || architecture == IntelGpuArchitecture::Xe2 ||
+                                architecture == IntelGpuArchitecture::Xe3;
+  status.vdbox_present = bits_are_present ? kVdboxBuilt & fuse : kVdboxBuilt & ~fuse;
   for (uint32_t box = 0; box < 4; ++box)
     if ((status.vdbox_present & (1u << box)) &&
         wake_and_sleep(registers, kForcewakeMediaVdbox + 4 * box, kForcewakeAckMediaVdbox + 4 * box))

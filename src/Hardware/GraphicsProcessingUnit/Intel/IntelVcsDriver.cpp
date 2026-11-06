@@ -109,12 +109,22 @@ bool VcsDriver::allocate(uint64_t bytes, GpuBuffer* out) {
   return true;
 }
 
+// After global GTT writes. Xe-LPG's media tile has Wa_22019338487: the CPU's GTT writes are posted until a write to the (read-only) GMD_ID register makes the GPU's gunit wait
+// for them (xe does it at least every 63 writes; this driver writes 8 at a time).
+uint64_t VcsDriver::ggtt_flags() const { return config_.xe2 ? kXe2GgttPteCoherent : config_.xe_lpg ? kXelpgGgttPteCoherent : 0; }
+
+void VcsDriver::flush_ggtt(IRegisterBank& regs) const {
+  constexpr uint32_t kGmdId = 0xD8C;
+  if (config_.gmd_id_flush) regs.write32(kGmdId, 0);
+  ggtt_invalidate(regs);
+}
+
 void VcsDriver::fail_init() {
   // Nothing has been given to the engine yet (the port is enabled last), so everything can go back.
   if (ggtt_mapped_) {
-    const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_);
+    const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_, ggtt_flags());
     for (uint64_t i = 0; i < ggtt_pages_; ++i) ggtt.write_raw(i, saved_entries_[i]);
-    ggtt_invalidate(*config_.registers);
+    flush_ggtt(*config_.registers);
     ggtt_mapped_ = false;
   }
   ppgtt_.shutdown();
@@ -131,7 +141,7 @@ bool VcsDriver::initialize(const Config& config) {
   config_ = config;
   ggtt_pages_ = ggtt_pages_for(config.engine);
   lrc_pages_ = config.engine == Engine::Render ? kLrcRenderPages : kLrcPages;
-  if (!config.registers || !config.ggtt_table.valid() || (config.engine == Engine::Render && config.generation != Generation::Gen9)) { state_ = State::Failed; return false; }
+  if (!config.registers || !config.ggtt_table.valid() || (config.engine == Engine::Render && config.generation != Generation::Gen9) || ((config.xe_lpg || config.xe_hpg || config.xe2) && (config.generation != Generation::Gen12 || config.engine != Engine::Video)) || (int{config.xe_lpg} + int{config.xe_hpg} + int{config.xe2} > 1)) { state_ = State::Failed; return false; }
   const uint64_t entries = config.ggtt_table.length() / 8;
   if (config.ggtt_first_page > entries || ggtt_pages_ > entries - config.ggtt_first_page ||
       (config.ggtt_first_page + ggtt_pages_) * kPageSize > kGgttReach) {
@@ -151,7 +161,22 @@ bool VcsDriver::initialize(const Config& config) {
     Forcewake::release(regs, ForcewakeDomain::Gt);
   };
 
-  if (config.generation == Generation::Gen12) program_gen12_pat(regs);
+  if (config.xe_lpg) {
+    // Meteor Lake's media tile has multicast PAT registers (xelpg_pat_ops.program_media); graphics IP 12.70 and later steer through the selector at 0xFD4.
+    regs.write32(0xFD4, 1u << 31);
+    program_xelpg_pat(regs);
+    program_xelpg_global_mocs(regs);
+  } else if (config.xe2) {
+    // Xe2's media PAT registers are plain, its media MOCS registers multicast ones.
+    program_xe2_pat(regs);
+    regs.write32(0xFD4, 1u << 31);
+    program_xe2_global_mocs(regs);
+  } else if (config.generation == Generation::Gen12) {
+    // Arc: the PAT registers (and the MOCS ones, whose video values are the reset ones) are multicast registers; the steering selector reads as multicast after a reset, and is
+    // made so here as the Linux driver does for graphics IP 12.50 and later.
+    if (config.xe_hpg) regs.write32(0xFDC, 1u << 31);
+    program_gen12_pat(regs);
+  }
   else if (config.generation == Generation::Gen11) program_icl_pat(regs);
   else program_private_pat(regs, gen9_private_pat());
   // The video engines' MOCS tables: the media commands select entry 1, "whatever the page table entry says". Gen9's video engines come out of reset with it; Gen11 programs
@@ -182,7 +207,7 @@ bool VcsDriver::initialize(const Config& config) {
   }
 
   // The global GTT: the driver's eight entries are remembered, point at the scratch page, then the ring, the status page and the context get theirs.
-  const Ggtt ggtt(config.ggtt_table, config.ggtt_first_page, ggtt_pages_);
+  const Ggtt ggtt(config.ggtt_table, config.ggtt_first_page, ggtt_pages_, (config.xe2 ? kXe2GgttPteCoherent : config.xe_lpg ? kXelpgGgttPteCoherent : 0));
   if (!ggtt.valid()) { fail_init(); release_wells(); return false; }
   for (uint64_t i = 0; i < ggtt_pages_; ++i) ggtt.read(i, &saved_entries_[i]);
   if (!ggtt.clear(0, ggtt_pages_, scratch_.dma)) { fail_init(); release_wells(); return false; }
@@ -194,7 +219,7 @@ bool VcsDriver::initialize(const Config& config) {
   ring_ggtt_ = ggtt.address_of(0);
   status_ggtt_ = ggtt.address_of(4);
   context_ggtt_ = ggtt.address_of(5);
-  ggtt_invalidate(regs);
+  flush_ggtt(regs);
   if (!ok) { fail_init(); release_wells(); return false; }
 
   // The context's own address space, with the batch buffer in it.
@@ -206,7 +231,7 @@ bool VcsDriver::initialize(const Config& config) {
   const uint64_t directories[4] = {ppgtt_.page_directory_dma(0), ppgtt_.page_directory_dma(1), ppgtt_.page_directory_dma(2), ppgtt_.page_directory_dma(3)};
   const bool gen12 = config.generation == Generation::Gen12;
   const bool gen11 = config.generation == Generation::Gen11;
-  const bool image = gen12 ? lrc_init_gen12_xcs(context_state_, engine_base(), true) && lrc_set_pml4(context_state_, ppgtt_.root_dma())
+  const bool image = gen12 ? (config.xe2 ? lrc_init_xe2_xcs(context_state_, engine_base(), true) : config.xe_lpg || config.xe_hpg ? lrc_init_dg2_xcs(context_state_, engine_base(), true) : lrc_init_gen12_xcs(context_state_, engine_base(), true)) && lrc_set_pml4(context_state_, ppgtt_.root_dma())
                            : (render() ? lrc_init_gen9_rcs(context_state_, engine_base(), true)
                                        : gen11 ? lrc_init_gen11_xcs(context_state_, engine_base(), true) : lrc_init_gen9_xcs(context_state_, engine_base(), true)) &&
                                  lrc_set_page_directories(context_state_, directories);
@@ -219,7 +244,7 @@ bool VcsDriver::initialize(const Config& config) {
   memory_fence();
 
   // From here the engine knows our status page.
-  port_.configure(regs, engine_base(), status_dwords_, static_cast<uint32_t>(status_ggtt_), gen12 ? ExeclistPort::Mode::Elsq : gen11 ? ExeclistPort::Mode::Elsq11 : ExeclistPort::Mode::Elsp);
+  port_.configure(regs, engine_base(), status_dwords_, static_cast<uint32_t>(status_ggtt_), gen12 ? (config.xe_lpg || config.xe_hpg || config.xe2 ? ExeclistPort::Mode::ElsqXehp : ExeclistPort::Mode::Elsq) : gen11 ? ExeclistPort::Mode::Elsq11 : ExeclistPort::Mode::Elsp);
   if (!port_.enable()) { fail_init(); release_wells(); return false; }
   release_wells();
   state_ = State::Ready;
@@ -245,9 +270,9 @@ void VcsDriver::shutdown() {
   }
   // Idle. The engine's status page address still names our page: point the whole range at the scratch page, which is never freed (the engine may still
   // write there when it wakes), and free the rest.
-  const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_);
+  const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_, ggtt_flags());
   ggtt.clear(0, ggtt_pages_, scratch_.dma);
-  ggtt_invalidate(regs);
+  flush_ggtt(regs);
   ggtt_mapped_ = false;
   Forcewake::release(regs, engine_domain());
   ppgtt_.shutdown();
@@ -397,7 +422,8 @@ VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
 
   lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), static_cast<uint32_t>(old_tail), static_cast<uint32_t>(new_tail));
   memory_fence();
-  const uint64_t descriptor = config_.generation == Generation::Gen12   ? lrc_descriptor_gen12(static_cast<uint32_t>(context_ggtt_), kContextId, 0, kVideoDecodeClass)
+  const uint64_t descriptor = config_.xe_lpg || config_.xe_hpg || config_.xe2 ? lrc_descriptor_xehp(static_cast<uint32_t>(context_ggtt_), kContextId)
+                              : config_.generation == Generation::Gen12   ? lrc_descriptor_gen12(static_cast<uint32_t>(context_ggtt_), kContextId, 0, kVideoDecodeClass)
                               : config_.generation == Generation::Gen11 ? lrc_descriptor_gen11(static_cast<uint32_t>(context_ggtt_), kContextId, 0, kVideoDecodeClass)
                                                                          : lrc_descriptor(static_cast<uint32_t>(context_ggtt_), kContextId);
   port_.submit(descriptor | kDescriptorForceRestore);

@@ -35,6 +35,7 @@ class FakeFunction final : public IPciBus {
   uint16_t msi_offset = 0x50;
   uint32_t writable_control_mask = 0x0071;   // enable and multiple message enable are the writable bits (the rest is read only)
   bool stuck_enable = false;                 // a function that will not switch MSI on
+  mutable int64_t mask_at_address_write = -1;   // the mask register (64-bit layout) when the address was last written
 
   explicit FakeFunction(bool is64, bool masking, bool with_msi = true) {
     config[1] = 0x00100000 | 0x0007;                         // status: capability list; command: io, memory, bus master
@@ -62,6 +63,7 @@ class FakeFunction final : public IPciBus {
       config[offset / 4] = (config[offset / 4] & 0xFFFF) | (control << 16);
       return;
     }
+    if (offset == msi_offset + 4) mask_at_address_write = config[(msi_offset + 16) / 4];
     config[offset / 4] = value;
   }
   uint64_t memory_bar(PciAddress, uint8_t) const override { return 0; }
@@ -142,11 +144,32 @@ static void test_refusals() {
   }
 }
 
+static void test_retarget() {
+  FakeFunction f(true, true);
+  PciMsi msi(f);
+  CHECK(!msi.retarget(0xFEE01000));   // not enabled
+  CHECK(msi.enable(kFunction, 0xFEE00000, 0x51));
+  CHECK(msi.retarget(0xFEE05000));
+  CHECK(f.config[0x54 / 4] == 0xFEE05000 && f.config[0x58 / 4] == 0 && f.config[0x5C / 4] == 0x51);   // data kept
+  CHECK(f.mask_at_address_write == 1 && f.config[0x60 / 4] == 0);   // masked while it changed, unmasked after
+  CHECK((f.control() & 1) == 1);                                    // still on
+  CHECK(!msi.retarget(0xFEE05002));                                 // misaligned
+  msi.disable();
+  CHECK(!msi.retarget(0xFEE05000));
+
+  FakeFunction g(false, false);   // 32-bit, no masking: one write of the address
+  PciMsi plain(g);
+  CHECK(plain.enable(kFunction, 0xFEE00000, 0x50));
+  CHECK(!plain.retarget(0x1'FEE0'0000ull));
+  CHECK(plain.retarget(0xFEE02000) && g.config[0x54 / 4] == 0xFEE02000 && g.config[0x58 / 4] == 0x50 && (g.control() & 1) == 1);
+}
+
 int main() {
   test_64_bit_with_masking();
   test_32_bit();
   test_32_bit_masking();
   test_refusals();
+  test_retarget();
   printf(g_failed ? "PciMsiTest: %d FAILED\n" : "PciMsiTest: all passed\n", g_failed);
   return g_failed ? 1 : 0;
 }

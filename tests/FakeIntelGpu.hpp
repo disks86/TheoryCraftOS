@@ -78,6 +78,7 @@ struct FakeGpu final : IRegisterBank {
   std::vector<std::string> violations;
   std::vector<std::vector<uint32_t>> batches;
   bool deny_gt = false, deny_media = false, deny_render = false, hang = false, never_idle = false;
+  bool xehp = false;                  // graphics IP 12.50 and later: the descriptor has a 16-bit context ID at bit 39 and no class, the status buffer holds it at bit 10
   bool render = false;                // the engine is the render engine: batches are 3D batches, the ring may hold PIPE_CONTROL
   uint32_t pipe_control_writes = 0;
   uint32_t elsp[4] = {};
@@ -232,7 +233,9 @@ struct FakeGpu final : IRegisterBank {
   void run(uint64_t desc) {
     const uint64_t ctx = desc & 0xFFFFF000u;
     const uint32_t id = static_cast<uint32_t>(desc >> 32);
-    if (gen == Generation::Gen12) {
+    if (gen == Generation::Gen12 && xehp) {
+      if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 3 || (desc >> 55) != 0 || ((desc >> 39) & 0xFFFF) == 0 || ((desc >> 39) & 0xFFFF) == 0xFFFF) violation("descriptor flags (Xe-HP form)");
+    } else if (gen == Generation::Gen12) {
       if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 3 || (desc >> 61) != 1 || ((desc >> 48) & 0x3F) != 0 || ((desc >> 37) & 0x7FF) == 0x7FF) violation("descriptor flags");
     } else if (gen == Generation::Gen11) {
       // Valid, privileged, the 32-bit legacy mode, no bits in the Gen9 context ID place, a context ID at bit 37, instance 0 and class 1 (video decode).
@@ -321,9 +324,9 @@ struct FakeGpu final : IRegisterBank {
     if (gen == Generation::Gen12) {
       uint32_t* wp12 = ggtt_dword(status_page + ExeclistPort::kCsb12WriteDword * 4, "csb pointer");
       if (!wp12) return;
-      const uint32_t ctx_id = static_cast<uint32_t>((desc >> 37) & 0x7FF), idle = 0x7FF;
+      const uint32_t ctx_id = static_cast<uint32_t>(xehp ? (desc >> 39) & 0xFFFF : (desc >> 37) & 0x7FF), idle = xehp ? 0xFFFF : 0x7FF, shift = xehp ? 10 : 15;
       // The context starts (the one switched away from is the idle one), then stops (the one switched to is the idle one).
-      const uint32_t entries[2][2] = {{ctx_id << 15 | 1u, idle << 15}, {idle << 15, ctx_id << 15}};
+      const uint32_t entries[2][2] = {{ctx_id << shift | 1u, idle << shift}, {idle << shift, ctx_id << shift}};
       for (const auto& entry : entries) {
         csb_wp = (csb_wp + 1) % ExeclistPort::kCsb12Entries;
         uint32_t* e = ggtt_dword(status_page + (ExeclistPort::kCsbFirstDword + csb_wp * 2) * 4, "csb entry");

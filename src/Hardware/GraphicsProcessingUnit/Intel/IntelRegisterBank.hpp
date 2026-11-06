@@ -74,5 +74,18 @@ class MmioRegisterBank final : public IRegisterBank {
   MmioRegion region_;
 };
 
+// A window onto a part of another bank, at a fixed offset: the media tile of Meteor Lake and Arrow Lake keeps a complete copy of the media registers (engines, power wells, PAT,
+// MOCS, GGTT flush) at 0x380000 of the BAR, and the engine driver addresses them as it would on any GPU. It has power wells of its own.
+class OffsetRegisterBank final : public IRegisterBank {
+ public:
+  OffsetRegisterBank(IRegisterBank& inner, uint64_t offset) : inner_(inner), offset_(offset) {}
+  uint32_t read32(uint64_t offset) override { return inner_.read32(offset_ + offset); }
+  void write32(uint64_t offset, uint32_t value) override { inner_.write32(offset_ + offset, value); }
+
+ private:
+  IRegisterBank& inner_;
+  uint64_t offset_;
+};
+
 }  // namespace intel_gt
 }  // namespace hardware

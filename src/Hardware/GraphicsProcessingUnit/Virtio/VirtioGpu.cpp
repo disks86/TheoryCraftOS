@@ -117,8 +117,15 @@ kernel::Frame* VirtioGpu::on_interrupt(kernel::Frame* frame, void* self) {
 bool VirtioGpu::enable_interrupts() {
   if (interrupts_) return true;
   if (!ready_ || !transport_ || !kernel::running()) return false;
-  kernel::set_interrupt_handler(kernel::kVectorVirtioGpu, &VirtioGpu::on_interrupt, this);
-  if (!transport_->enable_msix(kernel::kVectorVirtioGpu, kernel::apic::this_apic_id(), 0)) return false;
+  // The completions come to this core: the threads that wait for them (the desktop's) run here, and the scheduler sends any other waiter here too.
+  const uint32_t core = kernel::current_core();
+  io_device_ = kernel::register_io_device("virtio-gpu", static_cast<int32_t>(core));
+  if (!kernel::set_device_interrupt_handler(kernel::kVectorVirtioGpu, io_device_, &VirtioGpu::on_interrupt, this))
+    kernel::set_interrupt_handler(kernel::kVectorVirtioGpu, &VirtioGpu::on_interrupt, this);
+  if (!transport_->enable_msix(kernel::kVectorVirtioGpu, kernel::apic::this_apic_id(), 0)) {
+    drop_interrupt_handler();
+    return false;
+  }
   // Try it out: one command that needs an answer; the interrupt for it must arrive. Without it the device or the machine does not deliver (a message
   // address the interrupt controller ignores, ...) and polling stays.
   completion_.reset();
@@ -127,17 +134,31 @@ bool VirtioGpu::enable_interrupts() {
   for (int i = 0; i < 50 && interrupt_count() == before; ++i) delay_us(100);
   if (interrupt_count() == before) {
     transport_->disable_msix();
+    drop_interrupt_handler();
     return false;
   }
   interrupts_ = true;
+  kernel::set_io_device_retarget(io_device_, &VirtioGpu::retarget_interrupt, this);   // (the scheduler may move it to where its waiters run)
   return true;
+}
+
+bool VirtioGpu::retarget_interrupt(void* self, uint32_t, uint64_t hardware_id) {
+  VirtioGpu* gpu = static_cast<VirtioGpu*>(self);
+  return hardware_id <= 0xFF && gpu->transport_ && gpu->transport_->retarget_msix(static_cast<uint32_t>(hardware_id));
 }
 
 void VirtioGpu::disable_interrupts() {
   if (!interrupts_) return;
   interrupts_ = false;                 // commands are waited for by polling from here on
+  kernel::set_io_device_retarget(io_device_, nullptr, nullptr);   // (no move while MSI-X goes off)
   if (transport_) transport_->disable_msix();
-  kernel::set_interrupt_handler(kernel::kVectorVirtioGpu, nullptr, nullptr);
+  drop_interrupt_handler();
+}
+
+void VirtioGpu::drop_interrupt_handler() {
+  kernel::set_device_interrupt_handler(kernel::kVectorVirtioGpu, io_device_, nullptr, nullptr);
+  kernel::unregister_io_device(io_device_);
+  io_device_ = -1;
 }
 
 bool VirtioGpu::initialize() {
@@ -420,7 +441,7 @@ void VirtioGpu::present() {
 }
 
 void VirtioGpu::shutdown() {
-  if (interrupts_) kernel::set_interrupt_handler(kernel::kVectorVirtioGpu, nullptr, nullptr);
+  if (interrupts_) drop_interrupt_handler();
   interrupts_ = false;
   if (ready_) {
     ready_ = false;
