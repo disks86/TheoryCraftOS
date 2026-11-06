@@ -734,7 +734,7 @@ void test_device(TestAllocator& a, Generation g = Generation::Gen9) {
 // Meteor Lake: the media tile's engine encodes H.264 (and H.265) with the Xe-LPG commands; Arc and Lunar Lake leave it to the CPU.
 void test_device_xe_lpg(TestAllocator& a) {
   struct Platform { const char* name; uint16_t id; bool media_tile; bool hardware; };
-  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}, {"Panther Lake", 0xB080, true, true}};
+  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}, {"Panther Lake", 0xB080, true, true}, {"Nova Lake", 0xD750, true, false}};
   for (const Platform& pl : platforms) {
     printf("  through the media engine (%s)\n", pl.name);
     Rig2 rig(Generation::Gen12);

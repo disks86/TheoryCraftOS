@@ -843,7 +843,7 @@ void test_device(TestAllocator& a) {
   // The platforms after Xe-LP decode on the engine; of them only Meteor Lake encodes H.265 on it (Xe-LPG's VDEnc commands are written; Arc and Xe2's have a different CMD1/CMD2 and
   // pipe mode, H.264 has two new state commands).
   struct Platform { const char* name; uint16_t id; bool media_tile; bool av1; };
-  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}, {"Panther Lake", 0xB080, true, true}};
+  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}, {"Panther Lake", 0xB080, true, true}, {"Nova Lake", 0xD750, true, true}};
   for (const Platform& pl : platforms) {
     printf("  %s\n", pl.name);
     Rig2 rig_pl;
