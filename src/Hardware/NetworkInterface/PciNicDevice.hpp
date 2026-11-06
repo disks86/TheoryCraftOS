@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Pci/PciMsi.hpp"
+#include "Hardware/Bus/Pci/PciMsix.hpp"
 #include "Hardware/NetworkInterface/NicDevice.hpp"
 #include "Hardware/RegisterMapper.hpp"
 #include "uefi.hpp"
@@ -31,7 +32,7 @@ namespace hardware {
 class PciNicDevice final : public INicDevice {
  public:
   PciNicDevice(IPciBus& pci, const PciDeviceInfo& device, efi::SystemTable* st, IRegisterMapper* mapper)
-      : pci_(pci), device_(device), st_(st), mapper_(mapper), msi_(pci) {}
+      : pci_(pci), device_(device), st_(st), mapper_(mapper), msi_(pci), msix_(pci, mapper ? *mapper : no_mapper_) {}
   ~PciNicDevice() { detach_interrupt(); }
 
   bool claim() override;
@@ -43,9 +44,17 @@ class PciNicDevice final : public INicDevice {
   void config_write32(uint16_t offset, uint32_t value) override { pci_.write32(device_.address, offset, value); }
   // MSI to a vector of the network range on the core the scheduler picks for I/O interrupts (x86 only).
   bool attach_interrupt(InterruptHandler handler, void* context) override;
+  // MSI-X entries on consecutive cores, starting with the one the scheduler picks for I/O (needs the register mapper: the table is in a BAR).
+  uint32_t attach_interrupts(uint32_t count, QueueInterruptHandler handler, void* context) override;
   void detach_interrupt() override;
-  // For the interrupt entry: where the interrupt goes now.
+  // For the interrupt entries: where the interrupt goes now.
   void interrupt_target(InterruptHandler* handler, void** context) const;
+  static constexpr uint32_t kMaxVectors = 8;
+  struct VectorEntry {
+    PciNicDevice* device;
+    uint32_t index;
+  };
+  void queue_target(QueueInterruptHandler* handler, void** context) const;
 
  private:
   IPciBus& pci_;
@@ -54,11 +63,21 @@ class PciNicDevice final : public INicDevice {
   IRegisterMapper* mapper_;
   MmioNicRegisters registers_;
   bool detached_ = false;
+  struct NoMapper final : IRegisterMapper {
+    bool map_registers(uint64_t, uint64_t, MmioRegion*) override { return false; }
+  } no_mapper_;
   PciMsi msi_;
-  uint8_t vector_ = 0;
+  PciMsix msix_;
+  uint8_t vector_ = 0;                   // MSI
   int32_t io_device_ = -1;
   InterruptHandler handler_ = nullptr;   // read by the interrupt handler (atomic)
   void* handler_context_ = nullptr;
+  uint8_t vectors_[kMaxVectors] = {};    // MSI-X
+  int32_t io_devices_[kMaxVectors] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  VectorEntry entries_[kMaxVectors] = {};
+  uint32_t vector_count_ = 0;
+  QueueInterruptHandler queue_handler_ = nullptr;   // read by the interrupt handlers (atomic)
+  void* queue_context_ = nullptr;
 };
 
 }  // namespace hardware

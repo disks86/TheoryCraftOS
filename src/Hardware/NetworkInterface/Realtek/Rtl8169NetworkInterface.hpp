@@ -31,7 +31,7 @@ namespace hardware {
 // and RTL8126 (5 Gb/s). They share the descriptor rings (16-byte descriptors with an ownership bit) and most registers; the 2.5G and 5G parts moved the
 // interrupt and transmit-poll registers. Which chip it is comes from the version bits of TxConfig, not the PCI id (one id covers a dozen chips).
 //
-// Interrupts (MSI) when the caller enables them, checked with a forced software interrupt (the RTL8125/8126 have none, so theirs are taken on
+// Interrupts (MSI) when the caller enables them, each masking the chip until rearm_interrupts() (the chips' own moderation timers are not used), checked with a forced software interrupt (the RTL8125/8126 have none, so theirs are taken on
 // trust); transport checksums checked on receive and finished on transmit by the chip (the descriptor's protocol bits; frames shorter than the
 // Ethernet minimum get theirs in software, as r8169 does for the chips that pad them wrongly). The chip's PHY is left as the firmware configured it (r8169 also loads PHY firmware and applies per-chip PHY
 // fixes; that is not done here).
@@ -78,6 +78,7 @@ class Rtl8169NetworkInterface final : public INetworkInterface {
   bool enable_interrupts(NetworkWake wake, void* context) override;
   void disable_interrupts() override;
   bool interrupts_enabled() const override { return interrupts_; }
+  void rearm_interrupts() override;
   NetworkStatistics statistics() const override {
     NetworkStatistics s = stats_;
     s.interrupts = __atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE);

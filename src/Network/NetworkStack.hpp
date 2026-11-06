@@ -22,6 +22,7 @@
 #include "Network/Dns/DnsResolver.hpp"
 #include "Network/INetworkStack.hpp"
 #include "Network/Ip/IIpLayer.hpp"
+#include "Network/Tcp/TcpCoalescer.hpp"
 #include "Network/Tcp/TcpManager.hpp"
 #include "Network/Udp/UdpManager.hpp"
 #include "ObjectContainer/Dictionary.hpp"
@@ -88,6 +89,11 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) override;
   bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
                     bool link_broadcast) override;
+  uint32_t max_segmented_payload(Ipv4Address destination) const override;
+  bool send_tcp_segmented(Ipv4Address destination, ConstByteView segment, uint16_t mss) override;
+
+  // Receive offload: TCP segments put together before TCP saw them (0 without), see TcpCoalescer.
+  uint64_t coalesced_segments() const { return coalescer_.merged(); }
 
  private:
   struct ArpEntry {
@@ -111,6 +117,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void on_lease_lost() override;
 
   void handle_frame(ConstByteView frame, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
+  void flush_coalesced();
+  bool next_hop_for(Ipv4Address destination, hardware::MacAddress* mac) const;
   void handle_arp(ConstByteView arp);
   void handle_ipv4(ConstByteView packet, bool looped = false, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
   void deliver_looped();
@@ -154,6 +162,12 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   UniquePointer<DhcpClient> dhcp_;
   UniquePointer<DnsResolver> resolver_;
   uint16_t ip_id_ = 1;
+  // Receive offload: the run of TCP segments being put together during a poll(), and its memory.
+  static constexpr uint32_t kCoalesceBytes = 24 * 1024;
+  ByteView coalesce_storage_;
+  TcpCoalescer coalescer_;
+  // Segmentation offload: where a large TCP segment's frame is built (allocated with the first one).
+  ByteView segment_frame_;
   static constexpr uint32_t kMaxGroups = 8;
   Ipv4Address groups_[kMaxGroups];
   uint32_t group_count_ = 0;

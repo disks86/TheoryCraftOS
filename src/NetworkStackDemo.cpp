@@ -156,6 +156,47 @@ bool NetworkStackDemo::check_interface(uint32_t index) {
     if (tcp) tcp->close();
   }
 
+  // Bulk TCP through the same echo server: 256 KiB out and back, the way segmentation offload (large segments the interface cuts) and receive
+  // coalescing (runs of segments put together) are used for real; the counters say whether they were.
+  {
+    constexpr uint32_t kBulk = 256 * 1024;
+    const auto pattern = [](uint32_t i) { return static_cast<uint8_t>(i * 7 + (i >> 9)); };
+    SharedPointer<ITcpSocket> tcp = stack.tcp_open();
+    const bool tried = tcp && tcp->connect(c.gateway, kHostTcpEchoPort);
+    const uint64_t segmented_before = stack.interface().statistics().segmented_sends, coalesced_before = stack.coalesced_segments();
+    uint32_t sent = 0, got = 0;
+    bool same = true;
+    uint8_t chunk[2048];
+    const uint64_t deadline = stack.now_ms() + 20 * kHostTimeoutMs;
+    while (tried && got < kBulk && stack.now_ms() < deadline) {
+      stacks_.poll();
+      if (tcp->state() == TcpState::Closed) break;
+      while (tcp->is_connected() && sent < kBulk) {
+        const uint32_t n = kBulk - sent < sizeof(chunk) ? kBulk - sent : static_cast<uint32_t>(sizeof(chunk));
+        for (uint32_t i = 0; i < n; ++i) chunk[i] = pattern(sent + i);
+        const uint32_t k = tcp->send(ConstByteView(chunk).first(n));
+        sent += k;
+        if (k < n) break;
+      }
+      for (uint32_t n; (n = tcp->receive(ByteView(chunk))) > 0; got += n)
+        for (uint32_t i = 0; i < n; ++i) same = same && chunk[i] == pattern(got + i);
+    }
+    if (got == kBulk && same) {
+      line("      TCP bulk echo from host: ok, 256 KiB, ");
+      console::put_dec(stack.interface().statistics().segmented_sends - segmented_before);
+      line(" segments cut by the interface, ");
+      console::put_dec(stack.coalesced_segments() - coalesced_before);
+      line(" received segments coalesced\n");
+    } else if (tried && got > 0) {
+      line("      TCP bulk echo from host: FAILED after ");
+      console::put_dec(got);
+      line(same ? " bytes\n" : " bytes (wrong data)\n");
+    } else {
+      line("      TCP bulk echo from host: no answer (optional)\n");
+    }
+    if (tcp) tcp->close();
+  }
+
   // A web server on this interface.
   UniquePointer<Endpoint> endpoint = UniquePointer<Endpoint>::make(allocator_, allocator_);
   if (endpoint) {

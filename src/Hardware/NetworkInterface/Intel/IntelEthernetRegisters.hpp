@@ -53,13 +53,17 @@ constexpr uint32_t kInterruptMask = kIntLinkChange | kIntRxDescriptorsLow | kInt
 // RXCSUM: check IP and TCP/UDP checksums on receive
 constexpr uint32_t kRxcsumIp = 1u << 8, kRxcsumTcpUdp = 1u << 9;
 
-// Interrupts the way every one of these drivers does them in MSI mode: the cause register is read (which clears it), whoever polls is woken.
+// Interrupts the way every one of these drivers does them in MSI mode: the cause register is read (which clears it), the interrupt is masked
+// (IMC) and whoever polls is woken; rearm() unmasks it once everything was taken (a cause that came meanwhile interrupts at once).
 // Routed with INicDevice::attach_interrupt; enable() tests the route with a software-raised link-change interrupt (ICS) and keeps the
 // interrupt only if it arrives within 20 ms.
 class IntelInterrupts {
  public:
   bool enable(INicDevice& device, NetworkWake wake, void* context);
   void disable(INicDevice& device, bool registers_mapped);
+  void rearm() {
+    if (INicRegisters* regs = __atomic_load_n(&regs_, __ATOMIC_ACQUIRE)) regs->write32(kIms, kInterruptMask);
+  }
   bool enabled() const { return enabled_; }
   uint64_t count() const { return __atomic_load_n(&count_, __ATOMIC_ACQUIRE); }
 

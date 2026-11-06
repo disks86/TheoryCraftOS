@@ -33,21 +33,34 @@ constexpr uint32_t kCommandMemory = 1u << 1, kCommandBusMaster = 1u << 2;
 constexpr uint8_t kBarCount = 6;
 
 #if defined(__x86_64__)
-uint32_t g_network_vectors = 0;  // atomic: which of kVectorNetworkCount vectors are taken
+uint32_t g_network_vectors = 0;  // atomic: which of kVectorNetworkCount vectors are taken (bits 0-7 the first range, 8-15 the second)
+
+uint8_t vector_of(uint32_t bit) {
+  return static_cast<uint8_t>(bit < 8 ? kernel::kVectorNetworkFirst + bit : kernel::kVectorNetworkSecondFirst + (bit - 8));
+}
 
 uint8_t claim_network_vector() {
   uint32_t used = __atomic_load_n(&g_network_vectors, __ATOMIC_RELAXED);
   for (;;) {
     const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(~used));
     if (bit >= kernel::kVectorNetworkCount) return 0;
-    if (__atomic_compare_exchange_n(&g_network_vectors, &used, used | (1u << bit), false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-      return static_cast<uint8_t>(kernel::kVectorNetworkFirst + bit);
+    if (__atomic_compare_exchange_n(&g_network_vectors, &used, used | (1u << bit), false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return vector_of(bit);
   }
 }
 
 void release_network_vector(uint8_t vector) {
-  if (vector >= kernel::kVectorNetworkFirst && vector < kernel::kVectorNetworkFirst + kernel::kVectorNetworkCount)
-    __atomic_fetch_and(&g_network_vectors, ~(1u << (vector - kernel::kVectorNetworkFirst)), __ATOMIC_ACQ_REL);
+  for (uint32_t bit = 0; bit < kernel::kVectorNetworkCount; ++bit)
+    if (vector_of(bit) == vector) __atomic_fetch_and(&g_network_vectors, ~(1u << bit), __ATOMIC_ACQ_REL);
+}
+
+kernel::Frame* on_nic_queue_interrupt(kernel::Frame* frame, void* context) {
+  kernel::apic::eoi();
+  const PciNicDevice::VectorEntry* entry = static_cast<const PciNicDevice::VectorEntry*>(context);
+  PciNicDevice::QueueInterruptHandler handler;
+  void* handler_context;
+  entry->device->queue_target(&handler, &handler_context);
+  if (handler) handler(handler_context, entry->index);
+  return frame;
 }
 
 kernel::Frame* on_nic_interrupt(kernel::Frame* frame, void* context) {
@@ -66,9 +79,53 @@ void PciNicDevice::interrupt_target(InterruptHandler* handler, void** context) c
   *context = __atomic_load_n(&handler_context_, __ATOMIC_ACQUIRE);
 }
 
+void PciNicDevice::queue_target(QueueInterruptHandler* handler, void** context) const {
+  *handler = __atomic_load_n(&queue_handler_, __ATOMIC_ACQUIRE);
+  *context = __atomic_load_n(&queue_context_, __ATOMIC_ACQUIRE);
+}
+
+uint32_t PciNicDevice::attach_interrupts(uint32_t count, QueueInterruptHandler handler, void* context) {
+#if defined(__x86_64__)
+  if (vector_ || vector_count_ || !handler || count == 0 || count > kMaxVectors || !mapper_ || !kernel::running()) return 0;
+  if (msix_.table_size(device_.address) < count) return 0;
+  const uint32_t first = kernel::choose_io_interrupt_core();
+  const uint32_t cores = kernel::core_count() ? kernel::core_count() : 1;
+  uint32_t apic_ids[kMaxVectors];
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t core = (first + i) % cores;
+    const uint64_t apic = kernel::core_hardware_id(core);
+    vectors_[i] = claim_network_vector();
+    if (apic > 0xFF || !vectors_[i]) {
+      vector_count_ = i + (vectors_[i] ? 1 : 0);
+      detach_interrupt();
+      return 0;
+    }
+    apic_ids[i] = static_cast<uint32_t>(apic);
+    entries_[i] = VectorEntry{this, i};
+    vector_count_ = i + 1;
+    io_devices_[i] = kernel::register_io_device("ethernet-queue", static_cast<int32_t>(core));
+  }
+  __atomic_store_n(&queue_context_, context, __ATOMIC_RELEASE);
+  __atomic_store_n(&queue_handler_, handler, __ATOMIC_RELEASE);
+  for (uint32_t i = 0; i < count; ++i)
+    if (!kernel::set_device_interrupt_handler(vectors_[i], io_devices_[i], &on_nic_queue_interrupt, &entries_[i]))
+      kernel::set_interrupt_handler(vectors_[i], &on_nic_queue_interrupt, &entries_[i]);
+  if (!msix_.enable(device_.address, vectors_, apic_ids, count)) {
+    detach_interrupt();
+    return 0;
+  }
+  return count;
+#else
+  (void)count;
+  (void)handler;
+  (void)context;
+  return 0;
+#endif
+}
+
 bool PciNicDevice::attach_interrupt(InterruptHandler handler, void* context) {
 #if defined(__x86_64__)
-  if (vector_ || !handler || !kernel::running()) return false;
+  if (vector_ || vector_count_ || !handler || !kernel::running()) return false;
   const uint32_t core = kernel::choose_io_interrupt_core();
   const uint64_t apic = kernel::core_hardware_id(core);
   if (apic > 0xFF) return false;
@@ -92,6 +149,19 @@ bool PciNicDevice::attach_interrupt(InterruptHandler handler, void* context) {
 
 void PciNicDevice::detach_interrupt() {
 #if defined(__x86_64__)
+  msix_.disable();
+  for (uint32_t i = 0; i < vector_count_; ++i) {
+    if (vectors_[i]) {
+      kernel::set_device_interrupt_handler(vectors_[i], io_devices_[i], nullptr, nullptr);
+      kernel::set_interrupt_handler(vectors_[i], nullptr, nullptr);
+      release_network_vector(vectors_[i]);
+      vectors_[i] = 0;
+    }
+    if (io_devices_[i] >= 0) kernel::unregister_io_device(io_devices_[i]);
+    io_devices_[i] = -1;
+  }
+  vector_count_ = 0;
+  __atomic_store_n(&queue_handler_, static_cast<QueueInterruptHandler>(nullptr), __ATOMIC_RELEASE);
   msi_.disable();
   if (vector_) {
     kernel::set_device_interrupt_handler(vector_, io_device_, nullptr, nullptr);   // (clears the vector either way)

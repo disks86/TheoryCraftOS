@@ -25,9 +25,12 @@ namespace hardware {
 using namespace intel_eth;
 
 namespace {
-// Queue 0 (igb's E1000_RDBAL(0)... and igc's IGC_RDBAL(0)...: the same offsets).
-constexpr uint32_t kRdbal = 0xC000, kRdbah = 0xC004, kRdlen = 0xC008, kSrrctl = 0xC00C, kRdh = 0xC010, kRdt = 0xC018, kRxdctl = 0xC028;
-constexpr uint32_t kTdbal = 0xE000, kTdbah = 0xE004, kTdlen = 0xE008, kTdh = 0xE010, kTdt = 0xE018, kTxdctl = 0xE028;
+// Queue n's registers (igb's E1000_RDBAL(n)... and igc's IGC_RDBAL(n)...: the same offsets).
+constexpr uint32_t kRxQueueBase = 0xC000, kTxQueueBase = 0xE000, kQueueStride = 0x40;
+constexpr uint32_t kRdbal = 0x00, kRdbah = 0x04, kRdlen = 0x08, kSrrctl = 0x0C, kRdh = 0x10, kRdt = 0x18, kRxdctl = 0x28;
+constexpr uint32_t kTdbal = 0x00, kTdbah = 0x04, kTdlen = 0x08, kTdh = 0x10, kTdt = 0x18, kTxdctl = 0x28;
+uint32_t rx_reg(uint32_t q, uint32_t reg) { return kRxQueueBase + kQueueStride * q + reg; }
+uint32_t tx_reg(uint32_t reg) { return kTxQueueBase + reg; }
 constexpr uint32_t kEemngctl = 0x1010, kEemngctlConfigDone0 = 1u << 18;
 
 constexpr uint32_t kQueueEnable = 1u << 25;
@@ -40,12 +43,25 @@ constexpr uint32_t kRxDone = 1u << 0, kRxEndOfPacket = 1u << 1, kRxIgnoreChecksu
 constexpr uint32_t kRxFrameErrors = 0x01000000 | 0x02000000 | 0x04000000 | 0x10000000 | 0x80000000u;  // CE, SE, SEQ, CXE, RXE
 constexpr uint32_t kRxTcpUdpError = 0x20000000, kRxIpError = 0x40000000;  // checksum errors: the frame is passed on, software looks again
 // Transmit data descriptor (E1000_ADVTXD_*).
-constexpr uint32_t kTxTypeData = 3u << 20, kTxExtended = 1u << 29, kTxReportStatus = 1u << 27, kTxInsertCrc = 1u << 25, kTxEndOfPacket = 1u << 24;
-constexpr uint32_t kTxPayloadShift = 14, kTxDone = 1u << 0, kTxInsertTransportChecksum = 1u << 9;  // (POPTS.TXSM)
-// Transmit context descriptor: MACLEN and IPLEN, the context type, the transport protocol.
-constexpr uint32_t kTxTypeContext = 2u << 20, kTxContextTcp = 1u << 11, kTxMacLengthShift = 9;
+constexpr uint32_t kTxTypeData = 3u << 20, kTxExtended = 1u << 29, kTxReportStatus = 1u << 27, kTxInsertCrc = 1u << 25, kTxEndOfPacket = 1u << 24,
+                   kTxSegmentation = 1u << 31;
+constexpr uint32_t kTxPayloadShift = 14, kTxDone = 1u << 0, kTxInsertTransportChecksum = 1u << 9, kTxInsertIpChecksum = 1u << 8;  // (POPTS.TXSM, IXSM)
+// Transmit context descriptor: MACLEN and IPLEN, the context type, IPv4 and the transport protocol, MSS and the TCP header length.
+constexpr uint32_t kTxTypeContext = 2u << 20, kTxContextIpv4 = 1u << 10, kTxContextTcp = 1u << 11, kTxMacLengthShift = 9;
+constexpr uint32_t kTxMssShift = 16, kTxL4LengthShift = 8;
 // IVAR0: queue 0's receive and transmit causes to vector 0 (igb_assign_vector in MSI mode); the 82575 has no IVAR.
-constexpr uint32_t kIvarQueue0ToVector0 = 0x8080;
+constexpr uint32_t kIvarQueue0ToVector0 = 0x8080, kIvarValid = 0x80;
+
+// MSI-X (igb_configure_msix): GPIE, the extended interrupt registers, the vector of the "other" causes, the throttles.
+constexpr uint32_t kGpie = 0x1514, kGpieNsicr = 1u << 0, kGpieMsix = 1u << 4, kGpieEiame = 1u << 30, kGpiePba = 1u << 31;
+constexpr uint32_t kEics = 0x1520, kEims = 0x1524, kEiac = 0x152C, kEiam = 0x1530, kIvarMisc = 0x1740, kEitr0 = 0x1680;
+constexpr uint32_t kEitrCountIgnore = 1u << 31;
+// RSS (igb_setup_mrqc): MRQC, the redirection table, the hash key; RXCSUM.PCSD puts the hash in the descriptor.
+constexpr uint32_t kMrqc = 0x5818, kReta = 0x5C00, kRssKey = 0x5C80, kRxcsumPcsd = 1u << 13;
+constexpr uint32_t kMrqcRss = 0x2, kMrqcIpv4Tcp = 1u << 16, kMrqcIpv4 = 1u << 17, kMrqcIpv4Udp = 1u << 22;
+// The Toeplitz key of Microsoft's RSS verification suite (any key works; this one has published test vectors).
+constexpr uint8_t kRssKeyBytes[40] = {0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0, 0xd0, 0xca, 0x2b, 0xcb,
+                                      0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c, 0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa};
 
 using K = IgbKind;
 constexpr IgbModel kModels[] = {
@@ -71,6 +87,16 @@ const IgbModel* igb_find_model(uint16_t device_id) {
   for (const IgbModel& model : kModels)
     if (model.device_id == device_id) return &model;
   return nullptr;
+}
+
+uint32_t igb_receive_queues(IgbKind kind) {
+  switch (kind) {
+    case IgbKind::I82575:  // (MSI-X there needs MSIXBM, not done: one queue)
+    case IgbKind::I211:    // (igb leaves RSS off on the I211)
+      return 1;
+    default:
+      return IgbNetworkInterface::kMaxQueues;
+  }
 }
 
 bool IgbNetworkInterface::reset() {
@@ -100,6 +126,30 @@ void IgbNetworkInterface::restart_autonegotiation() {
       mdic_write(regs(), 1, kPhyControl, static_cast<uint16_t>((control & ~(kPhyPowerDown | kPhyIsolate)) | kPhyAutoNegEnable | kPhyRestartAutoNeg));
 }
 
+// A receive queue: disabled while it is set up, enabled, and only then given its buffers (the tail).
+bool IgbNetworkInterface::start_receive_queue(uint32_t q) {
+  ReceiveQueue& queue = rx_[q];
+  queue.ring = allocate_dma_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
+  queue.buffers = allocate_dma_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors} * kBufferSize, 4096);
+  if (queue.ring.empty() || queue.buffers.empty()) return false;
+  for (uint32_t i = 0; i < kReceiveDescriptors; ++i) post_receive(queue, i);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  regs().write32(rx_reg(q, kRxdctl), 0);
+  wait_for(regs(), rx_reg(q, kRxdctl), kQueueEnable, 0, 100, 100);
+  const uint64_t rx = nic_dma_address(queue.ring);
+  regs().write32(rx_reg(q, kRdbal), static_cast<uint32_t>(rx));
+  regs().write32(rx_reg(q, kRdbah), static_cast<uint32_t>(rx >> 32));
+  regs().write32(rx_reg(q, kRdlen), kReceiveDescriptors * sizeof(ReceiveDescriptor));
+  regs().write32(rx_reg(q, kRdh), 0);
+  regs().write32(rx_reg(q, kRdt), 0);
+  regs().write32(rx_reg(q, kSrrctl), kSrrctl2k | kSrrctlAdvancedOneBuffer | kSrrctlDropEnable);
+  regs().write32(rx_reg(q, kRxdctl), kQueueThresholds | kQueueEnable);
+  if (!wait_for(regs(), rx_reg(q, kRxdctl), kQueueEnable, kQueueEnable, 100, 100)) return false;
+  regs().write32(rx_reg(q, kRdt), kReceiveDescriptors - 1);
+  queue.next = 0;
+  return true;
+}
+
 bool IgbNetworkInterface::initialize() {
   if (started_ || !device_) return false;
   model_ = igb_find_model(device_->device_id());
@@ -125,39 +175,29 @@ bool IgbNetworkInterface::initialize() {
   regs().set_bits32(kCtrlExt, kCtrlExtDriverLoaded);
   restart_autonegotiation();
 
-  rx_ring_ = allocate_dma_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
+  // Every queue runs from the start; until RSS is switched on (with MSI-X) everything arrives on queue 0.
+  regs().write32(kMrqc, 0);
+  queues_ = igb_receive_queues(model_->kind);
+  for (uint32_t q = 0; q < queues_; ++q)
+    if (!start_receive_queue(q)) return false;
+  rx_turn_ = 0;
+
   tx_ring_ = allocate_dma_view<TransmitDescriptor>(allocator_, kTransmitDescriptors, 4096);
-  buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096);
-  if (rx_ring_.empty() || tx_ring_.empty() || buffers_.empty()) return false;
-  for (uint32_t i = 0; i < kReceiveDescriptors; ++i) post_receive(i);
+  tx_buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kTransmitDescriptors} * kBufferSize, 4096);
+  if (tx_ring_.empty() || tx_buffers_.empty()) return false;
   for (uint32_t i = 0; i < kTransmitDescriptors; ++i) tx_ring_[i] = TransmitDescriptor{nic_dma_address(tx_buffer(i)), 0, 0};
   tx_clean_ = 0;
   __atomic_thread_fence(__ATOMIC_RELEASE);
-
-  // Receive queue: disabled while it is set up, enabled, and only then given its buffers (the tail).
-  regs().write32(kRxdctl, 0);
-  wait_for(regs(), kRxdctl, kQueueEnable, 0, 100, 100);
-  const uint64_t rx = nic_dma_address(rx_ring_), tx = nic_dma_address(tx_ring_);
-  regs().write32(kRdbal, static_cast<uint32_t>(rx));
-  regs().write32(kRdbah, static_cast<uint32_t>(rx >> 32));
-  regs().write32(kRdlen, kReceiveDescriptors * sizeof(ReceiveDescriptor));
-  regs().write32(kRdh, 0);
-  regs().write32(kRdt, 0);
-  regs().write32(kSrrctl, kSrrctl2k | kSrrctlAdvancedOneBuffer | kSrrctlDropEnable);
-  regs().write32(kRxdctl, kQueueThresholds | kQueueEnable);
-  if (!wait_for(regs(), kRxdctl, kQueueEnable, kQueueEnable, 100, 100)) return false;
-  regs().write32(kRdt, kReceiveDescriptors - 1);
-  rx_next_ = 0;
-
-  regs().write32(kTxdctl, 0);
-  wait_for(regs(), kTxdctl, kQueueEnable, 0, 100, 100);
-  regs().write32(kTdbal, static_cast<uint32_t>(tx));
-  regs().write32(kTdbah, static_cast<uint32_t>(tx >> 32));
-  regs().write32(kTdlen, kTransmitDescriptors * sizeof(TransmitDescriptor));
-  regs().write32(kTdh, 0);
-  regs().write32(kTdt, 0);
-  regs().write32(kTxdctl, kQueueThresholds | kQueueEnable);
-  if (!wait_for(regs(), kTxdctl, kQueueEnable, kQueueEnable, 100, 100)) return false;
+  regs().write32(tx_reg(kTxdctl), 0);
+  wait_for(regs(), tx_reg(kTxdctl), kQueueEnable, 0, 100, 100);
+  const uint64_t tx = nic_dma_address(tx_ring_);
+  regs().write32(tx_reg(kTdbal), static_cast<uint32_t>(tx));
+  regs().write32(tx_reg(kTdbah), static_cast<uint32_t>(tx >> 32));
+  regs().write32(tx_reg(kTdlen), kTransmitDescriptors * sizeof(TransmitDescriptor));
+  regs().write32(tx_reg(kTdh), 0);
+  regs().write32(tx_reg(kTdt), 0);
+  regs().write32(tx_reg(kTxdctl), kQueueThresholds | kQueueEnable);
+  if (!wait_for(regs(), tx_reg(kTxdctl), kQueueEnable, kQueueEnable, 100, 100)) return false;
   tx_next_ = 0;
 
   regs().set_bits32(kRxcsum, kRxcsumIp | kRxcsumTcpUdp);
@@ -173,8 +213,8 @@ void IgbNetworkInterface::shutdown() {
   if (claimed_) {
     started_ = false;
     if (model_ && regs().read32(kStatus) != 0xFFFFFFFFu) {
-      regs().write32(kRxdctl, 0);
-      regs().write32(kTxdctl, 0);
+      for (uint32_t q = 0; q < queues_; ++q) regs().write32(rx_reg(q, kRxdctl), 0);
+      regs().write32(tx_reg(kTxdctl), 0);
       reset();
       regs().clear_bits32(kCtrlExt, kCtrlExtDriverLoaded);
     }
@@ -182,15 +222,18 @@ void IgbNetworkInterface::shutdown() {
     claimed_ = false;
   }
   started_ = false;
-  release_view(allocator_, rx_ring_);
+  for (ReceiveQueue& queue : rx_) {
+    release_view(allocator_, queue.ring);
+    release_view(allocator_, queue.buffers);
+  }
   release_view(allocator_, tx_ring_);
-  release_view(allocator_, buffers_);
+  release_view(allocator_, tx_buffers_);
 }
 
 // The write-back overwrote the addresses: a descriptor goes back to the read format before the device gets it again.
-void IgbNetworkInterface::post_receive(uint32_t i) {
-  volatile ReceiveDescriptor& d = rx_ring_[i];
-  d.packet_address = nic_dma_address(rx_buffer(i));
+void IgbNetworkInterface::post_receive(ReceiveQueue& queue, uint32_t i) {
+  volatile ReceiveDescriptor& d = queue.ring[i];
+  d.packet_address = nic_dma_address(rx_buffer(queue, i));
   d.header_address = 0;
 }
 
@@ -208,15 +251,127 @@ bool IgbNetworkInterface::accept_all_multicast(bool enable) {
   return enable;
 }
 
-bool IgbNetworkInterface::enable_interrupts(NetworkWake wake, void* context) {
-  kernel::ScopedMutex guard(mutex_);
-  if (!started_) return false;
-  if (model_->kind != IgbKind::I82575) regs().write32(kIvar0, kIvarQueue0ToVector0);
-  return interrupts_.enable(*device_, wake, context);
+NetworkStatistics IgbNetworkInterface::statistics() const {
+  NetworkStatistics s = stats_;
+  s.interrupts = interrupts_.count() + __atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE);
+  s.interrupt_rate = interrupts_enabled() ? moderator_.interrupts_per_second() : 0;
+  return s;
 }
 
+// ---- interrupts -------------------------------------------------------------------------------------------------------------------------------------
+
+// Vector v: v's receive queue's cause and its EIMS bit (EIAC cleared one, EIAM masked the other: the vector is quiet until rearmed).
+// The last vector has the "other" causes, the link: ICR says which (and is cleared by the read).
+void IgbNetworkInterface::on_queue_interrupt(void* self, uint32_t vector) {
+  IgbNetworkInterface* nic = static_cast<IgbNetworkInterface*>(self);
+  if (vector == __atomic_load_n(&nic->msix_vectors_, __ATOMIC_ACQUIRE) - 1) nic->regs().read32(kIcr);
+  __atomic_fetch_add(&nic->msix_interrupts_, 1, __ATOMIC_ACQ_REL);
+  const NetworkWake wake = __atomic_load_n(&nic->wake_, __ATOMIC_ACQUIRE);
+  if (wake) wake(__atomic_load_n(&nic->wake_context_, __ATOMIC_ACQUIRE));
+}
+
+// Queue q's receive cause to MSI-X entry `vector`: the 82576 has a byte per queue at IVAR(q & 7), the later parts two queues per register.
+void IgbNetworkInterface::write_ivar(uint32_t queue, uint32_t vector) {
+  const uint32_t index = model_->kind == IgbKind::I82576 ? (queue & 7) : (queue >> 1);
+  const uint32_t shift = model_->kind == IgbKind::I82576 ? ((queue & 8) << 1) : ((queue & 1) << 4);
+  const uint32_t reg = kIvar0 + 4 * index;
+  regs().write32(reg, (regs().read32(reg) & ~(0xFFu << shift)) | ((vector | kIvarValid) << shift));
+}
+
+void IgbNetworkInterface::configure_rss() {
+  for (uint32_t i = 0; i < 10; ++i)
+    regs().write32(kRssKey + 4 * i, kRssKeyBytes[4 * i] | (uint32_t{kRssKeyBytes[4 * i + 1]} << 8) | (uint32_t{kRssKeyBytes[4 * i + 2]} << 16) |
+                                        (uint32_t{kRssKeyBytes[4 * i + 3]} << 24));
+  for (uint32_t i = 0; i < 128; i += 4) {  // entry i in byte i % 4: the queues in turn
+    uint32_t value = 0;
+    for (uint32_t j = 0; j < 4; ++j) value |= ((i + j) % queues_) << (8 * j);
+    regs().write32(kReta + i, value);
+  }
+  regs().set_bits32(kRxcsum, kRxcsumPcsd);
+  regs().write32(kMrqc, kMrqcRss | kMrqcIpv4 | kMrqcIpv4Tcp | kMrqcIpv4Udp);
+}
+
+void IgbNetworkInterface::write_throttle() {
+  const uint32_t interval = InterruptModerator::intel_interval(moderator_.latency());
+  const uint32_t value = model_->kind == IgbKind::I82575 ? (interval | (interval << 16)) : (interval | kEitrCountIgnore);
+  const uint32_t vectors = msix_vectors_ ? msix_vectors_ - 1 : 1;
+  for (uint32_t v = 0; v < vectors; ++v) regs().write32(kEitr0 + 4 * v, value);
+}
+
+bool IgbNetworkInterface::enable_msix(NetworkWake wake, void* context) {
+  if (queues_ < 2) return false;  // (one queue: MSI does the same with less)
+  const uint32_t vectors = queues_ + 1;
+  __atomic_store_n(&wake_context_, context, __ATOMIC_RELEASE);
+  __atomic_store_n(&wake_, wake, __ATOMIC_RELEASE);
+  __atomic_store_n(&msix_vectors_, vectors, __ATOMIC_RELEASE);
+  if (device_->attach_interrupts(vectors, &IgbNetworkInterface::on_queue_interrupt, this) != vectors) {
+    __atomic_store_n(&msix_vectors_, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+    return false;
+  }
+  regs().write32(kImc, 0xFFFFFFFFu);
+  regs().write32(kEimc, 0xFFFFFFFFu);
+  regs().write32(kGpie, kGpieMsix | kGpiePba | kGpieEiame | kGpieNsicr);
+  for (uint32_t q = 0; q < queues_; ++q) write_ivar(q, q);
+  regs().write32(kIvarMisc, (queues_ | kIvarValid) << 8);
+  const uint32_t all = (1u << vectors) - 1;
+  regs().write32(kEiac, all);  // a vector's cause clears itself...
+  regs().write32(kEiam, all);  // ...and masks the vector until rearm_interrupts()
+  write_throttle();
+  configure_rss();
+  regs().write32(kIms, kIntLinkChange);
+  regs().write32(kEims, all);
+  // The route is tested on the link vector and on queue 0's; both must come through within 20 ms.
+  const uint64_t before = __atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE);
+  regs().write32(kEics, (1u << queues_) | 1u);
+  for (int i = 0; i < 200 && __atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE) < before + 2; ++i) delay_us(100);
+  if (__atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE) >= before + 2) {
+    regs().write32(kEims, all);
+    return true;
+  }
+  disable_interrupts();
+  return false;
+}
+
+bool IgbNetworkInterface::enable_interrupts(NetworkWake wake, void* context) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || !wake) return false;
+  if (interrupts_enabled()) return true;
+  if (model_->kind != IgbKind::I82575 && enable_msix(wake, context)) return true;
+  if (model_->kind != IgbKind::I82575) regs().write32(kIvar0, kIvarQueue0ToVector0);
+  if (!interrupts_.enable(*device_, wake, context)) return false;
+  write_throttle();
+  return true;
+}
+
+void IgbNetworkInterface::disable_interrupts() {
+  if (msix_vectors_) {
+    if (claimed_) {
+      regs().write32(kEimc, 0xFFFFFFFFu);
+      regs().write32(kImc, 0xFFFFFFFFu);
+      regs().write32(kGpie, 0);
+      regs().write32(kMrqc, 0);  // everything to queue 0 again (the other queues are still taken from)
+    }
+    device_->detach_interrupt();
+    __atomic_store_n(&msix_vectors_, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+    return;
+  }
+  interrupts_.disable(*device_, claimed_);
+}
+
+void IgbNetworkInterface::rearm_interrupts() {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || !interrupts_enabled()) return;
+  if (moderator_.update()) write_throttle();
+  if (msix_vectors_) regs().write32(kEims, (1u << msix_vectors_) - 1);
+  else interrupts_.rearm();
+}
+
+// ---- transmitting -----------------------------------------------------------------------------------------------------------------------------------
+
 // Frames the device has sent give their descriptors back: the data descriptor that ends each one has DD written back (a context descriptor
-// in front of it does not).
+// in front of it, and the descriptors of a chain before the last, do not).
 void IgbNetworkInterface::reclaim_transmitted() {
   while (tx_clean_ != tx_next_) {
     const uint32_t end = tx_frame_end_[tx_clean_];
@@ -230,49 +385,87 @@ bool IgbNetworkInterface::transmit(ConstByteView frame) { return transmit_frame(
 
 bool IgbNetworkInterface::transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame || (checksum.requested() && !checksum.fits(frame.size()))) {
+  return send(frame, checksum, 0);
+}
+
+bool IgbNetworkInterface::transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) {
+  kernel::ScopedMutex guard(mutex_);
+  if (mss == 0) {
+    ++stats_.send_failures;
+    return false;
+  }
+  return send(frame, checksum, mss);
+}
+
+// One frame, or (mss != 0) one TCP segment the device cuts into frames: a context descriptor when a checksum or segmentation is asked for,
+// then the data in as many 2 KiB buffers as it takes, the last descriptor with EOP and RS.
+bool IgbNetworkInterface::send(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) {
+  const bool segment = mss != 0;
+  TsoLayout layout;
+  bool fits = started_ && !frame.empty();
+  if (segment) fits = fits && frame.size() <= kMaxSegmentation && tso_layout(frame, checksum, &layout) && layout.tcp_start - kEthernetHeaderSize <= 511;
+  else fits = fits && frame.size() <= kEthernetMaxFrame && (!checksum.requested() || checksum.fits(frame.size()));
+  if (!fits) {
     ++stats_.send_failures;
     return false;
   }
   // The checksum needs a context descriptor (MACLEN 14, IPLEN up to 511) in front of the data; anything else is finished in software.
-  const bool hardware = checksum.requested() && (checksum.tcp() || checksum.udp()) && checksum.start >= kEthernetHeaderSize + 20 &&
-                        checksum.start - kEthernetHeaderSize <= 511;
-  const uint32_t needed = hardware ? 2 : 1;
+  const bool hardware = segment || (checksum.requested() && (checksum.tcp() || checksum.udp()) && checksum.start >= kEthernetHeaderSize + 20 &&
+                                    checksum.start - kEthernetHeaderSize <= 511);
+  // Short frames are padded by the controller (TCTL.PSP), after the checksum: padding them here would put the padding in the TCP/UDP length
+  // of a controller that works the checksum out from the frame's length (QEMU's does).
+  const uint32_t length = static_cast<uint32_t>(frame.size());
+  const uint32_t data_descriptors = (length + kBufferSize - 1) / kBufferSize;
+  const uint32_t needed = data_descriptors + (hardware ? 1 : 0);
   reclaim_transmitted();
   const uint32_t in_flight = (tx_next_ + kTransmitDescriptors - tx_clean_) % kTransmitDescriptors;
   if (kTransmitDescriptors - 1 - in_flight < needed) {  // the device has not sent enough yet
     ++stats_.send_failures;
     return false;
   }
+
   const uint32_t first = tx_next_;
+  uint32_t slot = first;
   if (hardware) {
-    volatile TransmitDescriptor& context = tx_ring_[first];
+    volatile TransmitDescriptor& context = tx_ring_[slot];
     context.address = (uint64_t{kEthernetHeaderSize} << kTxMacLengthShift) | (checksum.start - kEthernetHeaderSize);  // (VLAN 0, no seed)
-    context.command_type_length = kTxTypeContext | kTxExtended | (checksum.tcp() ? kTxContextTcp : 0);
-    context.offload_status = 0;  // (no MSS, context index 0)
-    tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+    context.command_type_length = kTxTypeContext | kTxExtended | (checksum.tcp() ? kTxContextTcp : 0) | (segment ? kTxContextIpv4 : 0);
+    context.offload_status = segment ? ((uint32_t{mss} << kTxMssShift) | (static_cast<uint32_t>(layout.header_length - layout.tcp_start) << kTxL4LengthShift)) : 0;
+    slot = (slot + 1) % kTransmitDescriptors;
   }
-  const uint32_t slot = tx_next_;
-  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
-  const ByteView buffer = tx_buffer(slot).first(padded);
-  buffer.fill(0);
-  buffer.copy_from(frame);
-  if (checksum.requested() && !hardware && !finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
-    tx_next_ = first;
-    ++stats_.send_failures;
-    return false;
+  const uint32_t first_data = slot;
+  for (uint32_t offset = 0, n = 0; n < data_descriptors; ++n) {
+    const uint32_t piece = length - offset < kBufferSize ? length - offset : kBufferSize;
+    const ByteView buffer = tx_buffer(slot).first(piece);
+    buffer.copy_from(frame.subview(offset, piece));
+    if (n == 0) {
+      if (segment && !prepare_tso_headers(buffer, layout)) return false;  // (cannot fail: the layout was checked)
+      if (!hardware && checksum.requested() && !finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
+        ++stats_.send_failures;
+        return false;
+      }
+    }
+    const bool last = n + 1 == data_descriptors;
+    volatile TransmitDescriptor& d = tx_ring_[slot];
+    d.address = nic_dma_address(tx_buffer(slot));
+    d.command_type_length = kTxTypeData | kTxExtended | kTxInsertCrc | (segment ? kTxSegmentation : 0) | (last ? kTxEndOfPacket | kTxReportStatus : 0) | piece;
+    d.offload_status = slot != first_data ? 0
+                       : ((segment ? layout.payload : length) << kTxPayloadShift) | (hardware ? kTxInsertTransportChecksum : 0) |
+                             (segment ? kTxInsertIpChecksum : 0);  // (and DD clear)
+    if (last) tx_frame_end_[first] = static_cast<uint8_t>(slot);
+    offset += piece;
+    slot = (slot + 1) % kTransmitDescriptors;
   }
-  volatile TransmitDescriptor& d = tx_ring_[slot];
-  d.address = nic_dma_address(tx_buffer(slot));
-  d.command_type_length = kTxTypeData | kTxExtended | kTxReportStatus | kTxInsertCrc | kTxEndOfPacket | padded;
-  d.offload_status = (padded << kTxPayloadShift) | (hardware ? kTxInsertTransportChecksum : 0);  // (and DD clear)
-  tx_frame_end_[first] = static_cast<uint8_t>(slot);
   __atomic_thread_fence(__ATOMIC_RELEASE);
-  tx_next_ = (slot + 1) % kTransmitDescriptors;
-  regs().write32(kTdt, tx_next_);
+  tx_next_ = slot;
+  regs().write32(tx_reg(kTdt), tx_next_);
   ++stats_.frames_sent;
+  if (segment) ++stats_.segmented_sends;
+  moderator_.account(1, length);
   return true;
 }
+
+// ---- receiving --------------------------------------------------------------------------------------------------------------------------------------
 
 bool IgbNetworkInterface::receive(ByteView buffer, uint32_t* length) {
   ReceivedFrame frame;
@@ -284,8 +477,20 @@ bool IgbNetworkInterface::receive(ByteView buffer, uint32_t* length) {
 bool IgbNetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* received) {
   kernel::ScopedMutex guard(mutex_);
   if (!started_ || !received) return false;
+  for (uint32_t k = 0; k < queues_; ++k) {  // the queues in turn, so a busy one does not starve the others
+    const uint32_t q = (rx_turn_ + k) % queues_;
+    if (receive_from(q, buffer, received)) {
+      rx_turn_ = (q + 1) % queues_;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IgbNetworkInterface::receive_from(uint32_t q, ByteView buffer, ReceivedFrame* received) {
+  ReceiveQueue& queue = rx_[q];
   for (uint32_t tries = 0; tries < kReceiveDescriptors; ++tries) {
-    volatile ReceiveDescriptor& d = rx_ring_[rx_next_];
+    volatile ReceiveDescriptor& d = queue.ring[queue.next];
     const uint64_t upper = d.header_address;
     const uint32_t status = static_cast<uint32_t>(upper);
     if (!(status & kRxDone)) return false;
@@ -294,18 +499,20 @@ bool IgbNetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* received
     const uint32_t frame = static_cast<uint16_t>(upper >> 32);
     const bool usable = !(status & kRxFrameErrors) && (status & kRxEndOfPacket) && frame > 0 && frame <= kBufferSize;
     if (usable) {
-      buffer.copy_from(ConstByteView(rx_buffer(rx_next_)).first(frame).at_most(buffer.size()));
+      buffer.copy_from(ConstByteView(rx_buffer(queue, queue.next)).first(frame).at_most(buffer.size()));
       const bool checked = !(status & kRxIgnoreChecksum);
       *received = ReceivedFrame{frame, checked && (status & kRxIpChecksum) && !(status & kRxIpError),
                                 checked && (status & (kRxTcpChecksum | kRxUdpChecksum)) && !(status & kRxTcpUdpError)};
       ++stats_.frames_received;
+      ++queue.frames;
+      moderator_.account(1, frame);
     } else {
       ++stats_.frames_dropped;
     }
-    post_receive(rx_next_);
+    post_receive(queue, queue.next);
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    regs().write32(kRdt, rx_next_);
-    rx_next_ = (rx_next_ + 1) % kReceiveDescriptors;
+    regs().write32(rx_reg(q, kRdt), queue.next);
+    queue.next = (queue.next + 1) % kReceiveDescriptors;
     if (usable) return true;
   }
   return false;
