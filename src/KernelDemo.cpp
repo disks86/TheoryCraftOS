@@ -17,6 +17,7 @@
  */
 
 #include "KernelDemo.hpp"
+#include <new>
 #include "console.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
@@ -355,7 +356,253 @@ bool test_io_affinity() {
 }
 #endif
 
-// ---- the tick takes the scheduler lock only when it has something to do ----
+// ---- stress: the wake-up protocol under contention on every core (docs/SchedulerLocking.md) ----
+// Each check counts something a lost or doubled wake-up would change, and every wait for the workers has a deadline, so a lost wake-up shows as a
+// failure instead of a hang.
+
+constexpr uint64_t kStressJoinUs = 20000000;   // (generous: TCG with 8 cores is slow)
+
+uint32_t next_random(uint32_t* state) {
+  uint32_t x = *state;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  return *state = x;
+}
+
+bool join_all(Thread** threads, uint32_t count) {
+  bool ok = true;
+  for (uint32_t i = 0; i < count; ++i) ok &= threads[i] && join(threads[i], kStressJoinUs);
+  return ok;
+}
+
+// Timeouts racing releases: a waiter whose timeout fired is passed over by a release, so nothing is lost: what was taken plus what is left is what
+// was given.
+struct SemaphoreRace {
+  Semaphore semaphore{0};
+  uint32_t released = 0, taken = 0;
+  volatile bool stop = false;
+  uint32_t seed = 0;
+};
+
+void semaphore_taker(void* argument) {
+  SemaphoreRace* r = static_cast<SemaphoreRace*>(argument);
+  uint32_t seed = __atomic_add_fetch(&r->seed, 7919, __ATOMIC_RELAXED) | 1;
+  while (!r->stop) {
+    if (r->semaphore.acquire_for(20 + next_random(&seed) % 200)) __atomic_add_fetch(&r->taken, 1, __ATOMIC_RELAXED);
+  }
+}
+
+void semaphore_giver(void* argument) {
+  SemaphoreRace* r = static_cast<SemaphoreRace*>(argument);
+  uint32_t seed = __atomic_add_fetch(&r->seed, 104729, __ATOMIC_RELAXED) | 1;
+  for (uint32_t i = 0; i < 3000; ++i) {
+    r->semaphore.release();
+    __atomic_add_fetch(&r->released, 1, __ATOMIC_RELAXED);
+    if (next_random(&seed) % 4 == 0) yield();
+    else if (next_random(&seed) % 16 == 0) sleep_us(50);
+  }
+}
+
+bool stress_semaphore_timeouts() {
+  SemaphoreRace race;
+  const uint32_t takers = core_count() + 1, givers = core_count();
+  Thread* threads[2 * 128 + 2] = {};
+  for (uint32_t i = 0; i < takers; ++i) threads[i] = spawn(semaphore_taker, &race, "taker");
+  for (uint32_t i = 0; i < givers; ++i) threads[takers + i] = spawn(semaphore_giver, &race, "giver");
+  bool ok = join_all(threads + takers, givers);
+  race.stop = true;
+  ok &= join_all(threads, takers);
+  uint32_t left = 0;
+  while (race.semaphore.try_acquire()) ++left;
+  return report("stress: semaphore releases racing timeouts, none lost", ok && race.taken + left == race.released && race.released == 3000 * givers);
+}
+
+// Ping-pong: each pair hands a turn back and forth through two semaphores; one lost wake-up stops the pair.
+struct PingPong {
+  Semaphore ping{0}, pong{0};
+  uint32_t rounds = 0;
+};
+
+constexpr uint32_t kPingPongRounds = 2000;
+
+void ping_main(void* argument) {
+  PingPong* p = static_cast<PingPong*>(argument);
+  for (uint32_t i = 0; i < kPingPongRounds; ++i) {
+    p->ping.release();
+    if (!p->pong.acquire_for(5000000)) return;
+  }
+}
+
+void pong_main(void* argument) {
+  PingPong* p = static_cast<PingPong*>(argument);
+  for (uint32_t i = 0; i < kPingPongRounds; ++i) {
+    if (!p->ping.acquire_for(5000000)) return;
+    ++p->rounds;
+    p->pong.release();
+  }
+}
+
+bool stress_ping_pong(allocators::IAllocator& allocator) {
+  const uint32_t pairs = core_count() * 2;
+  PingPong* games = static_cast<PingPong*>(allocator.allocate(sizeof(PingPong) * pairs));
+  Thread** threads = static_cast<Thread**>(allocator.allocate(sizeof(Thread*) * pairs * 2));
+  if (!games || !threads) return report("stress: semaphore ping-pong (memory)", false);
+  for (uint32_t i = 0; i < pairs; ++i) {
+    new (&games[i]) PingPong();
+    threads[2 * i] = spawn(ping_main, &games[i], "ping");
+    threads[2 * i + 1] = spawn(pong_main, &games[i], "pong");
+  }
+  bool ok = join_all(threads, pairs * 2);
+  for (uint32_t i = 0; i < pairs; ++i) ok &= games[i].rounds == kPingPongRounds;
+  allocator.deallocate(threads);
+  allocator.deallocate(games);
+  return report("stress: semaphore ping-pong pairs on every core finish every round", ok);
+}
+
+// A mutex handed between many threads that also yield and sleep while holding it.
+struct MutexStorm {
+  Mutex mutex;
+  uint64_t counter = 0;
+  uint32_t seed = 0;
+};
+
+constexpr uint32_t kMutexRounds = 3000;
+
+void mutex_storm_main(void* argument) {
+  MutexStorm* m = static_cast<MutexStorm*>(argument);
+  uint32_t seed = __atomic_add_fetch(&m->seed, 31337, __ATOMIC_RELAXED) | 1;
+  for (uint32_t i = 0; i < kMutexRounds; ++i) {
+    ScopedMutex hold(m->mutex);
+    const uint64_t before = m->counter;
+    const uint32_t r = next_random(&seed) % 64;
+    if (r == 0) sleep_us(30);
+    else if (r < 4) yield();
+    m->counter = before + 1;
+  }
+}
+
+bool stress_mutex() {
+  MutexStorm storm;
+  const uint32_t count = core_count() * 3;
+  Thread* threads[3 * 128] = {};
+  for (uint32_t i = 0; i < count; ++i) threads[i] = spawn(mutex_storm_main, &storm, "mutex");
+  const bool ok = join_all(threads, count);
+  return report("stress: mutex hand-offs keep a plain counter exact", ok && storm.counter == uint64_t{kMutexRounds} * count);
+}
+
+// A bounded queue through a condition variable; consumers wait with short timeouts so that notifications race timeouts.
+struct Channel {
+  Mutex mutex;
+  ConditionVariable not_empty, not_full;
+  uint32_t items[16] = {};
+  uint32_t head = 0, count = 0;
+  uint64_t produced_sum = 0, consumed_sum = 0;
+  uint32_t consumed = 0, total = 0;
+};
+
+void channel_producer(void* argument) {
+  Channel* c = static_cast<Channel*>(argument);
+  for (uint32_t i = 1; i <= 2000; ++i) {
+    ScopedMutex hold(c->mutex);
+    while (c->count == 16) c->not_full.wait(c->mutex, 1000);
+    c->items[(c->head + c->count) % 16] = i;
+    ++c->count;
+    c->produced_sum += i;
+    c->not_empty.notify_one();
+  }
+}
+
+void channel_consumer(void* argument) {
+  Channel* c = static_cast<Channel*>(argument);
+  ScopedMutex hold(c->mutex);
+  for (;;) {
+    while (c->count == 0 && c->consumed < c->total) c->not_empty.wait(c->mutex, 300);
+    if (c->consumed == c->total) break;
+    c->consumed_sum += c->items[c->head];
+    c->head = (c->head + 1) % 16;
+    --c->count;
+    ++c->consumed;
+    c->not_full.notify_one();
+    if (c->consumed == c->total) c->not_empty.notify_all();
+  }
+}
+
+bool stress_condition() {
+  Channel channel;
+  const uint32_t producers = core_count(), consumers = core_count();
+  channel.total = 2000 * producers;
+  Thread* threads[2 * 128] = {};
+  for (uint32_t i = 0; i < consumers; ++i) threads[i] = spawn(channel_consumer, &channel, "consumer");
+  for (uint32_t i = 0; i < producers; ++i) threads[consumers + i] = spawn(channel_producer, &channel, "producer");
+  const bool ok = join_all(threads, producers + consumers);
+  return report("stress: condition-variable queue delivers every item once", ok && channel.consumed == channel.total && channel.consumed_sum == channel.produced_sum);
+}
+
+// Threads that end at once: joined, or detached and reaped; and sleepers on every core that must all wake.
+uint32_t g_quick_runs = 0;
+void quick_main(void*) { __atomic_add_fetch(&g_quick_runs, 1, __ATOMIC_RELAXED); }
+
+void sleeper_main(void* argument) {
+  uint32_t seed = static_cast<uint32_t>(reinterpret_cast<uint64_t>(argument)) | 1;
+  for (uint32_t i = 0; i < 200; ++i) sleep_us(10 + next_random(&seed) % 300);
+}
+
+bool stress_join_and_sleep() {
+  bool ok = true;
+  __atomic_store_n(&g_quick_runs, 0u, __ATOMIC_RELAXED);
+  uint32_t spawned = 0;
+  for (uint32_t round = 0; round < 50; ++round) {
+    Thread* batch[16] = {};
+    for (Thread*& t : batch) {
+      t = spawn(quick_main, nullptr, "quick", -1, -1, 64 * 1024);
+      spawned += t ? 1 : 0;
+    }
+    for (uint32_t i = 0; i < 16; i += 2) ok &= batch[i] && join(batch[i], kStressJoinUs);
+    for (uint32_t i = 1; i < 16; i += 2) detach(batch[i]);
+  }
+  const bool joined = ok;
+  // The detached half may not all have run yet: wait for them, then for their cores to leave them (a zombie is reaped once off its core).
+  for (uint32_t i = 0; i < 5000 && __atomic_load_n(&g_quick_runs, __ATOMIC_RELAXED) != spawned; ++i) sleep_ms(1);
+  uint32_t unreaped = reap_zombies();
+  for (uint32_t i = 0; i < 1000 && unreaped != 0; ++i) {
+    sleep_ms(1);
+    unreaped = reap_zombies();
+  }
+  Thread* sleepers[2 * 128] = {};
+  const uint32_t count = core_count() * 2;
+  for (uint32_t i = 0; i < count; ++i) sleepers[i] = spawn(sleeper_main, reinterpret_cast<void*>(uint64_t{i} * 2654435761u), "sleeper");
+  const bool slept = join_all(sleepers, count);
+  const uint32_t runs = __atomic_load_n(&g_quick_runs, __ATOMIC_RELAXED);
+  const bool all = joined && unreaped == 0 && slept && runs == spawned && spawned == 800;
+  if (!all) {
+    auto dec = [](uint64_t v) { char b[24]; int n = 0; do { b[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v); while (n) { char c[2] = {b[--n], 0}; console::puts(c); } };
+    console::puts("  (joined ");
+    dec(joined);
+    console::puts(", unreaped ");
+    dec(unreaped);
+    console::puts(", sleepers ");
+    dec(slept);
+    console::puts(", ran ");
+    dec(runs);
+    console::puts(" of ");
+    dec(spawned);
+    console::puts(")\n");
+  }
+  return report("stress: threads that end at once are joined or reaped, sleepers on every core all wake", all);
+}
+
+bool test_stress(allocators::IAllocator& allocator) {
+  bool ok = true;
+  ok &= stress_semaphore_timeouts();
+  ok &= stress_ping_pong(allocator);
+  ok &= stress_mutex();
+  ok &= stress_condition();
+  ok &= stress_join_and_sleep();
+  return ok;
+}
+
+// ---- the tick takes a lock only when it has something to do ----
 
 bool test_quiet_ticks() {
   auto totals = [](uint64_t* ticks, uint64_t* lock_free) {
@@ -378,7 +625,7 @@ bool test_quiet_ticks() {
   percent[4] = static_cast<char>('0' + p / 10 % 10);
   percent[5] = static_cast<char>('0' + p % 10);
   console::puts(percent);
-  return report("quiet ticks mostly skip the scheduler lock", ticks > 0 && lock_free * 2 >= ticks);
+  return report("quiet ticks mostly take no lock", ticks > 0 && lock_free * 2 >= ticks);
 }
 
 }  // namespace
@@ -390,6 +637,7 @@ bool run_kernel_demo(allocators::IAllocator& allocator) {
   ok &= test_pipe();
   ok &= test_blocking();
   ok &= test_quiet_ticks();
+  ok &= test_stress(allocator);
 #if defined(__x86_64__)
   ok &= test_io_affinity();
 #endif

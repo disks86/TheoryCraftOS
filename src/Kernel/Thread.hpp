@@ -35,8 +35,10 @@ constexpr uint8_t kDefaultPriority = 8;
 
 struct Thread;
 
-// Threads waiting for something, oldest first. Only touched with the scheduler lock held.
+// Threads waiting for something, oldest first, with the lock that guards the list and the state of what they wait for (a semaphore's count, an
+// event's flag; see docs/SchedulerLocking.md). The run queues reuse the type (their lock word is unused: the core lock guards them).
 struct WaitList {
+  uint32_t lock = 0;
   Thread* head = nullptr;
   Thread* tail = nullptr;
 };
@@ -69,8 +71,18 @@ struct Thread {
   int32_t queued_on = -1;                 // the core whose run queue it is in, or -1
   uint8_t queued_level = 0;               // the priority level it was queued at (its priority may change while it waits)
   uint64_t wake_tsc = 0;
-  Thread* prev = nullptr;   // run queue / wait list links
+  Thread* prev = nullptr;   // run queue links (and `next` for the zombie list)
   Thread* next = nullptr;
+  Thread* wait_prev = nullptr;   // wait list links: a thread whose wait timed out stays on its wait list until it takes itself off (finish_wait),
+  Thread* wait_next = nullptr;   // and may be in a run queue meanwhile
+  // The wake-up protocol (docs/SchedulerLocking.md): the thread lock, which wait this is (a timeout armed for an earlier one must not end it), and
+  // the core whose sleeper list holds its timeout.
+  uint32_t wake_lock = 0;
+  uint32_t wait_seq = 0;
+  uint32_t sleep_seq = 0;
+  int32_t sleep_core = -1;
+  uint32_t timer_refs = 0;   // ticks that still point at it (it is not freed before 0)
+  bool zombie_listed = false;
   Thread* sleep_next = nullptr;
   Thread* all_next = nullptr;  // every live thread, newest first (see thread_snapshot)
   uint64_t cpu_ticks = 0;      // timer ticks that found it running
@@ -167,7 +179,7 @@ struct CoreInfo {
   bool online = false;
   hardware::CoreKind kind = hardware::CoreKind::Performance;
   uint64_t busy_ticks = 0, idle_ticks = 0;
-  uint64_t lock_free_ticks = 0;   // ticks that found nothing to do and did not take the scheduler lock
+  uint64_t lock_free_ticks = 0;   // ticks that found nothing to do and took no lock
 };
 // Copies up to `capacity` live threads (not finished ones); returns how many were written.
 uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity);
@@ -223,18 +235,19 @@ using IoRetarget = bool (*)(void* context, uint32_t core, uint64_t hardware_id);
 bool set_io_device_retarget(int32_t device, IoRetarget retarget, void* context);
 constexpr uint64_t kPlacementPatienceUs = 2000;
 
-// For the synchronization primitives (Sync.hpp). The scheduler lock is a spinlock
-// that also masks interrupts; hold it only for a few instructions.
+// For the synchronization primitives (Sync.hpp); the protocol is in docs/SchedulerLocking.md.
 namespace detail {
-uint64_t lock();
-void unlock(uint64_t flags);
-// With the lock held: the calling thread joins `list` (may be null for a pure sleep)
-// and becomes Blocked, with an optional timeout. The caller then unlocks and calls
-// yield(); when it returns the thread was woken (or timed out: current_thread()->timed_out).
-void block_current_locked(WaitList* list, uint64_t timeout_us);
-// With the lock held: makes the oldest waiter runnable. False if none.
-bool wake_one_locked(WaitList* list);
-uint32_t wake_all_locked(WaitList* list);
+// A wait list's lock: a spinlock that also masks interrupts on this core. Hold it only for a few instructions.
+uint64_t lock_list(WaitList* list);
+void unlock_list(WaitList* list, uint64_t flags);
+// With `list`'s lock held (`list` may be null for a pure sleep, then with nothing held): the calling thread becomes Blocked, joins `list` and, with
+// a timeout, its core's sleepers. The caller then unlocks, calls yield() and, when that returns, finish_wait().
+void prepare_wait(WaitList* list, uint64_t timeout_us);
+// Takes the calling thread off the sleepers and off `list` (whichever it is still on). True if the wait timed out.
+bool finish_wait(WaitList* list);
+// With `list`'s lock held: wakes the oldest waiter that is still waiting (one whose timeout already ended its wait is passed over). False if none.
+bool wake_one(WaitList* list);
+uint32_t wake_all(WaitList* list);
 }  // namespace detail
 
 }  // namespace kernel

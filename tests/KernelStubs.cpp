@@ -34,11 +34,12 @@ Thread* spawn(ThreadFunction, void*, const char*, int32_t, int8_t, uint32_t, int
 bool join(Thread*, uint64_t) { return true; }
 void detach(Thread*) {}
 namespace detail {
-uint64_t lock() { return 0; }
-void unlock(uint64_t) {}
-void block_current_locked(WaitList*, uint64_t) {}
-bool wake_one_locked(WaitList*) { return false; }
-uint32_t wake_all_locked(WaitList*) { return 0; }
+uint64_t lock_list(WaitList*) { return 0; }
+void unlock_list(WaitList*, uint64_t) {}
+void prepare_wait(WaitList*, uint64_t) {}
+bool finish_wait(WaitList*) { return false; }
+bool wake_one(WaitList*) { return false; }
+uint32_t wake_all(WaitList*) { return 0; }
 }
 }
 namespace kernel { [[noreturn]] void panic(const char* what, const Frame*) { fprintf(stderr, "PANIC: %s\n", what); abort(); } }
