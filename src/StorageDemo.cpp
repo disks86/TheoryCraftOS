@@ -63,8 +63,9 @@ bool check_device(uint32_t index, IStorageDevice& dev, allocators::IAllocator& a
   console::puts(")\n");
 
   const uint32_t bs = info.block_size;
-  // Room for the first 130 blocks (more than one bounce chunk of 64 KiB for 512-byte blocks) twice, plus one more.
-  const uint32_t span = info.block_count < 130 ? static_cast<uint32_t>(info.block_count) : 130;
+  // Room for the first 1100 blocks twice, plus one more: with 512-byte blocks that is nine 64 KiB chunks, which a driver with several command
+  // slots moves eight at a time and then one.
+  const uint32_t span = info.block_count < 1100 ? static_cast<uint32_t>(info.block_count) : 1100;
   ArrayView<uint8_t> memory = allocate_view<uint8_t>(allocator, uint64_t{span} * bs * 2 + bs);
   if (memory.empty()) {
     console::puts("      out of memory\n");
@@ -93,8 +94,18 @@ bool check_device(uint32_t index, IStorageDevice& dev, allocators::IAllocator& a
       b += take;
     }
     same = same && big.equals(piecewise);
-    console::puts(same ? "      read in pieces matches one big read: ok\n" : "      read in pieces: MISMATCH\n");
-    ok &= same;
+    if (same) {
+      console::puts("      read in pieces matches one big read: ok\n");
+    } else {
+      uint32_t at = 0;   // the first block that differs
+      while (at < span && big.subview(uint64_t{at} * bs, bs).equals(piecewise.subview(uint64_t{at} * bs, bs))) ++at;
+      // A disk in use (the ESP, which the system writes to as it boots) can change between the reads: a second big read tells.
+      const bool changed = dev.read(0, piecewise) && !big.subview(uint64_t{at} * bs, bs).equals(piecewise.subview(uint64_t{at} * bs, bs));
+      console::puts("      read in pieces: MISMATCH at block ");
+      console::put_dec(at);
+      console::puts(changed ? " (it changed between the reads: the disk is in use)\n" : "\n");
+      ok &= changed;
+    }
     uint32_t hash = 2166136261u;  // FNV-1a over the first 64 KiB, comparable with a host-side checksum
     for (uint8_t byte : big.at_most(65536)) hash = (hash ^ byte) * 16777619u;
     console::puts("      checksum of the first 64 KiB: ");

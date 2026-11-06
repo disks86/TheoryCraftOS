@@ -42,6 +42,7 @@ struct StorageInfo {
   bool removable = false;
   StorageMedia media = StorageMedia::Unknown;
   uint32_t queue_depth = 1;  // requests the driver takes at once (it serializes the rest itself)
+  bool discard = false;      // discard() works: the medium can be told blocks are unused (TRIM, deallocate)
   char model[41] = {};   // NUL-terminated, trailing blanks trimmed
   char serial[21] = {};  // empty when the device reports none
 };
@@ -83,6 +84,10 @@ class IStorageDevice : public IHardware {
   virtual bool write(uint64_t lba, ConstByteView buffer) = 0;
   // Forces the device's write cache to the medium.
   virtual bool flush() = 0;
+  // Tells the device that `blocks` blocks from `lba` hold nothing anyone needs (TRIM on SATA, Dataset Management deallocate on NVMe,
+  // DISCARD on virtio-blk), so flash can erase them ahead of time. What they read afterwards is up to the device. False when the device
+  // cannot (StorageInfo::discard), the range is outside it, or it reports an error.
+  virtual bool discard(uint64_t lba, uint64_t blocks) { (void)lba; (void)blocks; return false; }
 
  protected:
   constexpr IStorageDevice() = default;

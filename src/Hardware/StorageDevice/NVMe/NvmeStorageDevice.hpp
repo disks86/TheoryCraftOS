@@ -63,6 +63,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
   StorageStatistics statistics() const override;
 
   uint32_t queue_count() const { return queue_count_; }
@@ -135,6 +136,10 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   IoQueue& queue_for_this_core();
   // Runs one command through `slot` on `q` and waits for it. False on an error status or a timeout.
   bool execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint64_t lba, uint32_t blocks, uint64_t bytes);
+  // The two halves of execute(): send the command, then wait for it.
+  void submit(IoQueue& q, uint32_t slot, uint8_t opcode, uint64_t lba, uint32_t blocks, uint64_t bytes);
+  void submit_command(IoQueue& q, uint32_t slot, Command cmd);   // (the slot's id goes into the command)
+  bool finish(IoQueue& q, uint32_t slot);
   void reap(IoQueue& q);
   static kernel::Frame* on_queue_interrupt(kernel::Frame* frame, void* queue);
 

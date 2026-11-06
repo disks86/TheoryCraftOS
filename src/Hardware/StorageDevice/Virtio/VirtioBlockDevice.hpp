@@ -51,6 +51,7 @@ class VirtioBlockDevice final : public StorageDeviceBase {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
   StorageStatistics statistics() const override;
 
   uint32_t queue_count() const { return queue_count_; }
@@ -89,6 +90,9 @@ class VirtioBlockDevice final : public StorageDeviceBase {
   bool run(bool write, uint64_t lba, ByteView into, ConstByteView from);
   Queue& queue_for_this_core();
   bool execute(Queue& q, uint32_t slot, uint32_t type, uint64_t sector, uint64_t bytes);
+  // The two halves of execute(): post the request, then wait for it.
+  bool submit(Queue& q, uint32_t slot, uint32_t type, uint64_t sector, uint64_t bytes);
+  bool finish(Queue& q, uint32_t slot);
   void reap(Queue& q);
   static kernel::Frame* on_queue_interrupt(kernel::Frame* frame, void* queue);
   uint64_t read_config64(uint32_t offset) const;
@@ -104,6 +108,7 @@ class VirtioBlockDevice final : public StorageDeviceBase {
   ByteView slot_memory_;                  // every slot's buffer
   ByteView header_memory_;                // every slot's header (16 bytes) and status byte, 32 bytes apart
   bool has_flush_ = false;
+  uint32_t max_discard_sectors_ = 0;
   bool started_ = false;
   bool interrupts_ = false;
 };

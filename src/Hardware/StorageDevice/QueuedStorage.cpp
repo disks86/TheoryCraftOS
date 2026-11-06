@@ -26,8 +26,17 @@ namespace {
 uint32_t g_storage_vectors = 0;
 }  // namespace
 
+bool storage_interrupts_allowed() {
+#ifdef TCOS_STORAGE_POLLED
+  return false;
+#else
+  return true;
+#endif
+}
+
 uint8_t claim_storage_vector() {
 #if defined(__x86_64__)
+  if (!storage_interrupts_allowed()) return 0;
   uint32_t used = __atomic_load_n(&g_storage_vectors, __ATOMIC_RELAXED);
   for (;;) {
     if (used == ~0u) return 0;
@@ -101,6 +110,14 @@ uint32_t SlotPool::acquire() {
     else kernel::cpu_relax();
   }
   return slot;
+}
+
+uint32_t acquire_slots(SlotPool& pool, uint32_t* slots, uint32_t wanted) {
+  if (wanted > kMaxParallelChunks) wanted = kMaxParallelChunks;
+  slots[0] = pool.acquire();
+  uint32_t got = 1;
+  while (got < wanted && pool.try_acquire(&slots[got])) ++got;
+  return got;
 }
 
 void SlotPool::release(uint32_t slot) {

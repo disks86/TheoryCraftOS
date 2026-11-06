@@ -91,6 +91,7 @@ void test_cost_model() {
   CHECK(nvme.cost(IoOp::Read, 0) == 2000);
   CHECK(nvme.cost(IoOp::Write, 8192) == 4000 + 2 * 2000);
   CHECK(nvme.cost(IoOp::Flush, 0) == 100000);
+  CHECK(domain_of(IoOp::Discard) == IoDomain::Other && nvme.cost(IoOp::Discard, 0) == 100000);
   CHECK(nvme.cost(IoOp::Write, ~uint64_t{0}) == 4000 + 0xFFFFFFFFull * 2000);   // saturates, no wrap
   for (MediaKind k : {MediaKind::Nvme, MediaKind::SolidState, MediaKind::Rotational, MediaKind::Virtual, MediaKind::Removable}) {
     const IoCostModel m = IoCostModel::for_media(k);

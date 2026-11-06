@@ -134,29 +134,73 @@ boot log's thread-safety section prints the properties.
   each failed chunk is retried up to three times. A command that never completes restarts the port too, and its tag is retired.
 - **Without NCQ.** Optical drives and disks without NCQ keep the single-slot path (`queue_depth = 1`).
 
-`NvmeStorageDevice`, `VirtioBlockDevice` and `AhciStorageDevice` share `QueuedStorage.hpp`: the completion vectors (0xA0–0xBF), a lock-free
-`SlotPool`, `CommandCompletion` (sleep on the event, reap the queue yourself when the 2 ms wait times out, poll without interrupts, retire
-on timeout), and `describe_queues` for the properties.
+- **Error log.** After an NCQ error, the restart reads the NCQ Command Error log (READ LOG EXT, log 10h). A real drive aborts every command
+  until that log is read. The tag and LBA it reports appear in the properties.
+  - This only happens when the drive advertises General Purpose Logging (IDENTIFY word 84 or 87, bit 5).
+  - If the read is aborted, the port is restarted once more: an aborted READ LOG EXT leaves it in error.
+  - QEMU's ATA drive advertises no GPL, so this path is untested. QEMU did show that sending the read anyway breaks recovery.
+- **Discard.** TRIM is DATA SET MANAGEMENT, not queued, with up to 64 ranges a command, used when IDENTIFY word 169 bit 0 is set.
 
-Checked in QEMU, all with concurrent readers on every disk and writers on a scratch disk:
+## virtio-scsi
 
-- KVM, 4 cores: virtio-blk with 4 queues, NVMe with 4, and both SATA disks with NCQ at depth 32.
-- 8 cores with virtio-blk limited to 3 queues (`num-queues=3`).
-- 1 core.
-- virtio and NVMe polled (`vectors=0`, `msix_qsize=1`).
-- TCG.
-- An injected read error on the SATA disk (`blkdebug`) to exercise NCQ error recovery.
+`VirtioScsiController` keeps the queues and slots for every logical unit behind it:
+
+- **Queues.** One request queue per online core (`num_queues`; request queues start at virtqueue 2, after control and events), each with
+  its MSI-X entry on its core (`enable_msix_queues(..., first_queue = 2)`).
+- **Slots.** Up to 64 slots shared by the units, each with a 64 KiB buffer and its request and response headers.
+- **Commands.** Reads and writes go out in parallel chunks. A chunk interrupted by a unit attention is sent again, up to three times.
+
+## Shared pieces
+
+`NvmeStorageDevice`, `VirtioBlockDevice`, `VirtioScsiController` and `AhciStorageDevice` share `QueuedStorage.hpp`:
+
+- **Vectors.** The completion vectors (0xA0–0xBF), none when the build sets `TCOS_STORAGE_POLLED`.
+- **Slots.** A lock-free `SlotPool`.
+- **Completion wait.** `CommandCompletion`: sleep on the event, reap the queue yourself when the 2 ms wait times out, poll without
+  interrupts, retire the slot on timeout.
+- **Parallel chunks.** `acquire_slots` and `run_chunks`: a request over 64 KiB takes its first slot as usual, plus up to 7 more if they are
+  free right now, and keeps that many chunks on the device at once.
+- **Properties.** `describe_queues`.
+
+**Discard.** `IStorageDevice::discard(lba, blocks)` with `StorageInfo::discard` goes through the I/O scheduler as `IoOp::Discard`, counted
+in the "other" domain:
+
+- NVMe: Dataset Management with deallocate, when ONCS bit 2 is set; up to 256 ranges a command.
+- virtio-blk: `VIRTIO_BLK_F_DISCARD`, one segment of at most `max_discard_sectors` a request.
+- AHCI: TRIM, as above.
+
+**Polled build.** `-DTCOS_STORAGE_POLLED=ON` builds a kernel whose storage drivers never turn on completion interrupts. It is for
+machines with broken MSI, and it is how the polled paths, AHCI's included, are tested.
+
+**Checks.** In QEMU, every disk type was present at once: virtio-blk twice, NVMe, virtio-scsi, and SATA twice. The checks, all of which
+passed:
+
+- concurrent readers on every disk, and writers on a scratch disk;
+- 600 KiB writes read back on every scratch disk;
+- a 1100-block read compared with a piecewise read. On the ESP (QEMU's virtual FAT), which the system writes to as it boots, the check
+  sees the FAT change between the reads (block 653) and says so.
+- discard on the scratch disks that support it.
+
+The configurations: KVM with 4, 8 and 1 cores (8 with `num-queues=3` for virtio-blk and 2 for virtio-scsi), the polled build, TCG, and a
+`blkdebug` read error on a SATA disk.
 
 ## What is not done
 
-- **USB, SD, IDE, virtio-scsi, pvscsi and UEFI are still synchronous**, one request at a time (`queue_depth = 1`).
-- **Data is still copied, and large requests run in series**. The three queued drivers copy through each slot's buffer, and a request
-  over 64 KiB runs its pieces one after another in one slot.
+- **Some drivers are synchronous by nature**. USB mass storage uses Bulk-Only Transport, one command at a time; UAS would lift that. SD,
+  IDE, and the firmware fallback (`UefiBlockStorageDevice`) also keep `queue_depth = 1`. **pvscsi** has a ring and could be queued like
+  virtio-scsi, but is not yet.
+- **Copies and slot limits.**
+  - Every queued driver copies through slot buffers. Zero-copy needs to know that a caller's buffer is device-reachable, which kernel
+    buffers are and user-mode buffers may not be.
+  - A big request takes extra slots only if they are free, so on a busy device it runs mostly in series. The I/O scheduler still counts it
+    as one request.
+- **Discard reaches the devices, but nothing calls it yet.** The file systems (FAT, ext, NTFS, BeFS) don't issue discard when freeing
+  blocks. virtio-scsi UNMAP is not done, and NVMe and AHCI don't report what a discarded block reads back as (DLFEAT / RZAT).
 - **Driver features still missing.**
-  - NVMe: no interrupt coalescing, only the first namespace, no TRIM.
-  - AHCI: no port multipliers, and no READ LOG EXT to find the failed tag (every tag is retried).
+  - NVMe: no interrupt coalescing (left off on purpose, for latency), only the first namespace.
+  - AHCI: no port multipliers.
+  - virtio-scsi: still only the first LUN of each target.
   - None of it has been tried on real hardware.
-- **AHCI's polled fallback is untested**. QEMU's ich9-ahci always has MSI.
 - **Some callers don't pass priorities yet**. Windows `FileIoPriorityHintInformation` and process I/O priority are still ignored, and
   Linux `ioprio_set` is not wired to `set_thread_io_priority`. User processes do not yet put their threads into one `io_group`.
 - **Requests are not merged**. Callers are synchronous and own their buffers. On flash, merging matters little.

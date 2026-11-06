@@ -18,6 +18,7 @@
 
 #include "Hardware/StorageDevice/Virtio/VirtioBlockDevice.hpp"
 #include "Kernel/Thread.hpp"
+#include "Utility/ByteStream.hpp"
 #if defined(__x86_64__)
 #include "Kernel/Apic.hpp"
 #endif
@@ -25,9 +26,10 @@
 namespace hardware {
 
 namespace {
-constexpr uint32_t kFeatureReadOnly = 1u << 5, kFeatureBlockSize = 1u << 6, kFeatureFlush = 1u << 9, kFeatureMultiqueue = 1u << 12;
-constexpr uint32_t kConfigCapacity = 0, kConfigBlockSize = 20, kConfigNumQueues = 34;
-constexpr uint32_t kTypeRead = 0, kTypeWrite = 1, kTypeFlush = 4;
+constexpr uint32_t kFeatureReadOnly = 1u << 5, kFeatureBlockSize = 1u << 6, kFeatureFlush = 1u << 9, kFeatureMultiqueue = 1u << 12,
+                   kFeatureDiscard = 1u << 13;
+constexpr uint32_t kConfigCapacity = 0, kConfigBlockSize = 20, kConfigNumQueues = 34, kConfigMaxDiscardSectors = 36;
+constexpr uint32_t kTypeRead = 0, kTypeWrite = 1, kTypeFlush = 4, kTypeDiscard = 11;
 constexpr uint8_t kStatusOk = 0, kStatusPending = 0xFF;
 constexpr uint32_t kSectorBytes = 512;
 constexpr uint32_t kDescriptorsPerSlot = 3;       // header, data, status
@@ -47,7 +49,7 @@ uint16_t VirtioBlockDevice::read_config16(uint32_t offset) const {
 }
 
 bool VirtioBlockDevice::initialize() {
-  transport_.request_features(kFeatureReadOnly | kFeatureBlockSize | kFeatureFlush | kFeatureMultiqueue);
+  transport_.request_features(kFeatureReadOnly | kFeatureBlockSize | kFeatureFlush | kFeatureMultiqueue | kFeatureDiscard);
   if (!transport_.initialize()) {
     transport_.shutdown();
     return false;
@@ -63,6 +65,10 @@ bool VirtioBlockDevice::initialize() {
     if (size >= kSectorBytes && (size & (size - 1)) == 0 && size <= 4096) info_.block_size = size;
   }
   info_.block_count = read_config64(kConfigCapacity) / (info_.block_size / kSectorBytes);
+  if (accepted & kFeatureDiscard) {
+    for (uint32_t i = 0; i < 4; ++i) max_discard_sectors_ |= uint32_t{transport_.read_config8(kConfigMaxDiscardSectors + i)} << (8 * i);
+    info_.discard = max_discard_sectors_ != 0 && !info_.read_only;
+  }
 
   // A queue per online core, as many as the device has.
   uint32_t cores[kMaxQueues];
@@ -237,6 +243,10 @@ kernel::Frame* VirtioBlockDevice::on_queue_interrupt(kernel::Frame* frame, void*
 }
 
 bool VirtioBlockDevice::execute(Queue& q, uint32_t slot, uint32_t type, uint64_t sector, uint64_t bytes) {
+  return submit(q, slot, type, sector, bytes) && finish(q, slot);
+}
+
+bool VirtioBlockDevice::submit(Queue& q, uint32_t slot, uint32_t type, uint64_t sector, uint64_t bytes) {
   if (!started_) return false;
   Slot& s = slots_[slot];
   Request& header = s.header.cast<Request>()[0];
@@ -255,9 +265,13 @@ bool VirtioBlockDevice::execute(Queue& q, uint32_t slot, uint32_t type, uint64_t
   q.ring.post_chain(static_cast<uint16_t>(slot * kDescriptorsPerSlot), chain, n);
   transport_.notify(q.index);
   kernel::detail::unlock_list(&q.lock, flags);
+  return true;
+}
 
-  if (!s.completion.wait(may_sleep_for_interrupt(interrupts_), kTimeoutUs, [&] { reap(q); })) return false;
-  return s.completion.status == kStatusOk;
+bool VirtioBlockDevice::finish(Queue& q, uint32_t slot) {
+  CommandCompletion& c = slots_[slot].completion;
+  if (!c.wait(may_sleep_for_interrupt(interrupts_), kTimeoutUs, [&] { reap(q); })) return false;
+  return c.status == kStatusOk;
 }
 
 bool VirtioBlockDevice::run(bool write, uint64_t lba, ByteView into, ConstByteView from) {
@@ -271,28 +285,27 @@ bool VirtioBlockDevice::run(bool write, uint64_t lba, ByteView into, ConstByteVi
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
-  const uint32_t slot = pool_.acquire();
-  Queue& q = queue_for_this_core();
   const uint32_t scale = info_.block_size / kSectorBytes;
   const uint32_t max_blocks = kSlotBytes / info_.block_size;
-  uint64_t done = 0;
-  bool ok = true;
-  while (count > 0) {
-    const uint32_t n = count < max_blocks ? static_cast<uint32_t>(count) : max_blocks;
-    const uint64_t chunk = uint64_t{n} * info_.block_size;
-    const ByteView dma = slots_[slot].buffer.first(chunk);
-    if (write) dma.copy_from(from.subview(done, chunk));
-    if (!execute(q, slot, write ? kTypeWrite : kTypeRead, lba * scale, chunk)) {
-      ok = false;
-      break;
-    }
-    if (!write) into.subview(done, chunk).copy_from(dma);
-    __atomic_fetch_add(write ? &stats_.blocks_written : &stats_.blocks_read, n, __ATOMIC_RELAXED);
-    lba += n;
-    count -= n;
-    done += chunk;
-  }
-  if (!slots_[slot].completion.lost) pool_.release(slot);
+  const uint64_t chunks = (count + max_blocks - 1) / max_blocks;
+  uint32_t slots[kMaxParallelChunks];
+  const uint32_t got = acquire_slots(pool_, slots, chunks < kMaxParallelChunks ? static_cast<uint32_t>(chunks) : kMaxParallelChunks);
+  Queue& q = queue_for_this_core();
+  const uint32_t bs = info_.block_size;
+  const bool ok = run_chunks(
+      slots, got, count, max_blocks,
+      [&](uint32_t slot, uint64_t first, uint32_t n) {
+        if (write) slots_[slot].buffer.first(uint64_t{n} * bs).copy_from(from.subview(first * bs, uint64_t{n} * bs));
+        return submit(q, slot, write ? kTypeWrite : kTypeRead, (lba + first) * scale, uint64_t{n} * bs);
+      },
+      [&](uint32_t slot, uint64_t first, uint32_t n) {
+        if (!finish(q, slot)) return false;
+        if (!write) into.subview(first * bs, uint64_t{n} * bs).copy_from(slots_[slot].buffer.first(uint64_t{n} * bs));
+        __atomic_fetch_add(write ? &stats_.blocks_written : &stats_.blocks_read, n, __ATOMIC_RELAXED);
+        return true;
+      });
+  for (uint32_t i = 0; i < got; ++i)
+    if (!slots_[slots[i]].completion.lost) pool_.release(slots[i]);
   __atomic_fetch_add(ok ? (write ? &stats_.writes : &stats_.reads) : &stats_.errors, 1, __ATOMIC_RELAXED);
   return ok;
 }
@@ -305,6 +318,33 @@ bool VirtioBlockDevice::write(uint64_t lba, ConstByteView buffer) {
     return false;
   }
   return run(true, lba, ByteView(), buffer);
+}
+
+// One segment {sector, sectors, flags} a request, at most max_discard_sectors each.
+bool VirtioBlockDevice::discard(uint64_t lba, uint64_t blocks) {
+  if (!started_ || !info_.discard || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  const uint32_t scale = info_.block_size / kSectorBytes;
+  uint64_t sector = lba * scale, sectors = blocks * scale;
+  const uint32_t limit = max_discard_sectors_ / scale * scale;   // (whole blocks)
+  const uint32_t slot = pool_.acquire();
+  Queue& q = queue_for_this_core();
+  bool ok = limit != 0;
+  while (sectors > 0 && ok) {
+    const uint32_t n = sectors < limit ? static_cast<uint32_t>(sectors) : limit;
+    ByteWriter segment(slots_[slot].buffer.first(16));
+    segment.le64(sector);
+    segment.le32(n);
+    segment.le32(0);   // flags: no unmap guarantee asked for
+    ok = submit(q, slot, kTypeDiscard, 0, 16) && finish(q, slot);
+    sector += n;
+    sectors -= n;
+  }
+  if (!slots_[slot].completion.lost) pool_.release(slot);
+  if (!ok) __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+  return ok;
 }
 
 bool VirtioBlockDevice::flush() {

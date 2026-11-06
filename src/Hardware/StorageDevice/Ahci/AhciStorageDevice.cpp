@@ -45,7 +45,11 @@ constexpr uint32_t kSigAta = 0x00000101, kSigAtapi = 0xEB140101;
 // ATA commands.
 constexpr uint8_t kReadDmaExt = 0x25, kWriteDmaExt = 0x35, kReadDma = 0xC8, kWriteDma = 0xCA;
 constexpr uint8_t kFlushCache = 0xE7, kFlushCacheExt = 0xEA, kIdentify = 0xEC, kPacket = 0xA0;
-constexpr uint8_t kReadFpdmaQueued = 0x60, kWriteFpdmaQueued = 0x61;
+constexpr uint8_t kReadFpdmaQueued = 0x60, kWriteFpdmaQueued = 0x61, kReadLogExt = 0x2F;
+constexpr uint8_t kLogNcqCommandError = 0x10;
+constexpr uint8_t kDataSetManagement = 0x06, kDsmTrim = 0x01;
+constexpr uint32_t kTrimRanges = 64;           // 8-byte entries in one 512-byte block
+constexpr uint64_t kTrimRangeBlocks = 0xFFFF;
 constexpr uint32_t kPciCommand = 0x04;
 
 // Layout of the per-port memory: the command list (32 headers), the received FISes, the IDENTIFY data, then one command table per slot.
@@ -283,6 +287,8 @@ bool AhciStorageDevice::identify_ata() {
   }
   info_.removable = id[0] & (1u << 7);
   info_.media = media_from_ata_rotation(id[217]);
+  info_.discard = lba48_ && (id[169] & 1u);   // DATA SET MANAGEMENT with TRIM
+  general_purpose_logging_ = (id[84] & 0xC020) == 0x4020 || (id[87] & 0xC020) == 0x4020;   // (bits 15:14 = 01: the word is valid; bit 5 GPL)
   return info_.block_count > 0;
 }
 
@@ -503,6 +509,12 @@ bool AhciStorageDevice::restart_after_error() {
   if (__atomic_load_n(&needs_restart_, __ATOMIC_ACQUIRE)) {
     ok = start_port();   // (stops it first: PxCI and PxSACT clear)
     started_ = ok;
+    // After an NCQ error a drive aborts every command until its NCQ Command Error log has been read; the log also says what failed. A drive
+    // without General Purpose Logging has none, and one that aborts the read leaves the port in error: restart it once more.
+    if (ok && general_purpose_logging_ && !read_ncq_error_log()) {
+      ok = start_port();
+      started_ = ok;
+    }
     const uint64_t flags = kernel::detail::lock_list(&lock_);
     issued_ = 0;
     needs_restart_ = false;
@@ -513,9 +525,36 @@ bool AhciStorageDevice::restart_after_error() {
   return ok;
 }
 
+bool AhciStorageDevice::read_ncq_error_log() {
+  uint8_t fis[20] = {0x27, 0x80, kReadLogExt};
+  fis[4] = kLogNcqCommandError;   // LBA 7:0: the log, 15:8 and 39:32: page 0
+  fis[7] = 0x40;
+  fis[12] = 1;                    // one page
+  const ByteView page = memory_.subview(kIdentifyOffset, 512);
+  page.fill(0);
+  if (!issue(ConstByteView(fis), ConstByteView(), false, page)) return false;
+  // Byte 0: bit 7 set when a non-queued command failed, else bits 4:0 the tag; bytes 4-6 and 8-10 the LBA.
+  if (page[0] & 0x80) {
+    last_error_tag_ = kNoTag;
+  } else {
+    last_error_tag_ = page[0] & 0x1F;
+    last_error_lba_ = uint64_t{page[4]} | uint64_t{page[5]} << 8 | uint64_t{page[6]} << 16 | uint64_t{page[8]} << 24 |
+                      uint64_t{page[9]} << 32 | uint64_t{page[10]} << 40;
+  }
+  return true;
+}
+
 bool AhciStorageDevice::execute_ncq(uint32_t tag, bool write, uint64_t lba, uint32_t blocks, bool* retry) {
   *retry = false;
   if (!started_) return false;
+  if (!submit_ncq(tag, write, lba, blocks)) {
+    *retry = true;
+    return false;
+  }
+  return finish_ncq(tag);
+}
+
+bool AhciStorageDevice::submit_ncq(uint32_t tag, bool write, uint64_t lba, uint32_t blocks) {
   Tag& t = tags_[tag];
   const uint64_t bytes = uint64_t{blocks} * info_.block_size;
   const ByteView table = memory_.subview(kTableOffset + uint64_t{tag} * kTableStride, kTableStride);
@@ -551,16 +590,19 @@ bool AhciStorageDevice::execute_ncq(uint32_t tag, bool write, uint64_t lba, uint
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
   const uint64_t flags = kernel::detail::lock_list(&lock_);
-  if (needs_restart_) {
+  if (needs_restart_ || !started_) {
     kernel::detail::unlock_list(&lock_, flags);
-    *retry = true;
     return false;
   }
   issued_ |= 1u << tag;
   controller_->port_register(port_, kSact) = 1u << tag;   // (SACT before CI, as the specification asks)
   controller_->port_register(port_, kCi) = 1u << tag;
   kernel::detail::unlock_list(&lock_, flags);
+  return true;
+}
 
+bool AhciStorageDevice::finish_ncq(uint32_t tag) {
+  Tag& t = tags_[tag];
   if (!t.completion.wait(may_sleep_for_interrupt(interrupts_), kTimeoutUs, [&] { reap(); })) {
     const uint64_t f = kernel::detail::lock_list(&lock_);
     needs_restart_ = true;   // the drive still holds the tag: only a restart takes it back
@@ -570,47 +612,61 @@ bool AhciStorageDevice::execute_ncq(uint32_t tag, bool write, uint64_t lba, uint
   return t.completion.status == 0;
 }
 
+// A batch of chunks at once, one per tag. An error stops the drive's whole queue: the port is restarted and the batch sent again (three
+// times at most).
 bool AhciStorageDevice::run_ncq(bool write, uint64_t lba, ByteView into, ConstByteView from) {
   const uint64_t bytes = write ? from.size() : into.size();
   if (!started_ || bytes == 0 || bytes % info_.block_size != 0) {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
-  uint64_t count = bytes / info_.block_size;
+  const uint64_t count = bytes / info_.block_size;
   if (lba >= info_.block_count || count > info_.block_count - lba) {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
-  const uint32_t tag = pool_.acquire();
-  const uint32_t max_blocks = kSlotBytes / info_.block_size;
-  uint64_t done = 0;
-  bool ok = true;
+  const uint32_t bs = info_.block_size;
+  const uint32_t max_blocks = kSlotBytes / bs;
+  const uint64_t chunks = (count + max_blocks - 1) / max_blocks;
+  uint32_t tags[kMaxParallelChunks];
+  const uint32_t got = acquire_slots(pool_, tags, chunks < kMaxParallelChunks ? static_cast<uint32_t>(chunks) : kMaxParallelChunks);
+  uint64_t next = 0;
   uint32_t restarts = 0;
-  while (count > 0 && ok) {
-    const uint32_t n = count < max_blocks ? static_cast<uint32_t>(count) : max_blocks;
-    const uint64_t chunk = uint64_t{n} * info_.block_size;
-    const ByteView dma = tags_[tag].buffer.first(chunk);
-    if (write) dma.copy_from(from.subview(done, chunk));
-    bool retry = false;
+  bool ok = true;
+  while (ok && next < count) {
+    uint64_t first[kMaxParallelChunks];
+    uint32_t blocks[kMaxParallelChunks];
+    uint32_t started = 0;
+    bool stopped = false, failed = false;
     enter_queued();
-    const bool moved = !__atomic_load_n(&needs_restart_, __ATOMIC_ACQUIRE) && execute_ncq(tag, write, lba, n, &retry);
-    if (!moved && !retry && !__atomic_load_n(&needs_restart_, __ATOMIC_ACQUIRE)) ok = false;   // the drive refused it
-    leave_queued();
-    if (!moved) {
-      // The queue was stopped by an error (perhaps another command's): restart the port and try this chunk again, a few times.
-      if (!ok || tags_[tag].completion.lost || ++restarts > 3 || !restart_after_error()) {
-        ok = false;
+    for (uint64_t at = next; started < got && at < count && !stopped; ++started) {
+      const uint32_t n = count - at < max_blocks ? static_cast<uint32_t>(count - at) : max_blocks;
+      if (write) tags_[tags[started]].buffer.first(uint64_t{n} * bs).copy_from(from.subview(at * bs, uint64_t{n} * bs));
+      if (!submit_ncq(tags[started], write, lba + at, n)) {
+        stopped = true;
         break;
       }
-      continue;
+      first[started] = at;
+      blocks[started] = n;
+      at += n;
     }
-    if (!write) into.subview(done, chunk).copy_from(dma);
-    __atomic_fetch_add(write ? &stats_.blocks_written : &stats_.blocks_read, n, __ATOMIC_RELAXED);
-    lba += n;
-    count -= n;
-    done += chunk;
+    for (uint32_t i = 0; i < started; ++i) failed = !finish_ncq(tags[i]) || failed;
+    leave_queued();
+    if (stopped || failed) {
+      bool lost = false;
+      for (uint32_t i = 0; i < got; ++i) lost = lost || tags_[tags[i]].completion.lost;
+      const bool queue_stopped = __atomic_load_n(&needs_restart_, __ATOMIC_ACQUIRE);
+      if (lost || (!queue_stopped && !stopped) || ++restarts > 3 || !restart_after_error()) ok = false;
+      continue;   // (the same batch again)
+    }
+    for (uint32_t i = 0; i < started; ++i) {
+      if (!write) into.subview(first[i] * bs, uint64_t{blocks[i]} * bs).copy_from(tags_[tags[i]].buffer.first(uint64_t{blocks[i]} * bs));
+      __atomic_fetch_add(write ? &stats_.blocks_written : &stats_.blocks_read, blocks[i], __ATOMIC_RELAXED);
+      next = first[i] + blocks[i];
+    }
   }
-  if (!tags_[tag].completion.lost) pool_.release(tag);
+  for (uint32_t i = 0; i < got; ++i)
+    if (!tags_[tags[i]].completion.lost) pool_.release(tags[i]);
   __atomic_fetch_add(ok ? (write ? &stats_.writes : &stats_.reads) : &stats_.errors, 1, __ATOMIC_RELAXED);
   return ok;
 }
@@ -638,6 +694,37 @@ bool AhciStorageDevice::flush() {
   return ok;
 }
 
+// DATA SET MANAGEMENT / TRIM, not queued: up to 64 ranges of at most 65535 blocks a command, in the port's scratch block.
+bool AhciStorageDevice::discard(uint64_t lba, uint64_t blocks) {
+  if (!started_ || !info_.discard || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  if (ncq_) enter_exclusive();
+  bool ok = true;
+  {
+    kernel::ScopedMutex guard(mutex_);   // (the single-slot path and its scratch block)
+    const ByteView ranges = memory_.subview(kIdentifyOffset, 512);
+    while (blocks > 0 && ok) {
+      ranges.fill(0);
+      ByteWriter out(ranges);
+      for (uint32_t i = 0; i < kTrimRanges && blocks > 0; ++i) {
+        const uint64_t n = blocks < kTrimRangeBlocks ? blocks : kTrimRangeBlocks;
+        out.le64(lba | (n << 48));   // LBA in bits 47:0, the count in 63:48
+        lba += n;
+        blocks -= n;
+      }
+      uint8_t fis[20] = {0x27, 0x80, kDataSetManagement, kDsmTrim};
+      fis[7] = 0x40;
+      fis[12] = 1;   // one block of ranges
+      ok = issue(ConstByteView(fis), ConstByteView(), true, ranges);
+    }
+  }
+  if (ncq_) leave_exclusive();
+  if (!ok) __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+  return ok;
+}
+
 StorageStatistics AhciStorageDevice::statistics() const {
   StorageStatistics s;
   s.reads = __atomic_load_n(&stats_.reads, __ATOMIC_RELAXED);
@@ -653,6 +740,10 @@ void AhciStorageDevice::describe(IPropertySink& sink) const {
   const QueueReport report{controller_->interrupt_core(), controller_->interrupts()};
   describe_queues(sink, 1, ncq_ ? tag_count_ : 1, interrupts_, &report);
   if (errors_recovered_) sink.add_number("Queue restarts after errors", errors_recovered_);
+  if (last_error_tag_ != kNoTag) {
+    sink.add_number("Last NCQ error: tag", last_error_tag_);
+    sink.add_number("Last NCQ error: LBA", last_error_lba_);
+  }
 }
 
 }  // namespace hardware

@@ -222,6 +222,7 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     ByteView data;
     uint32_t blocks = 0;
     bool valid = false;
+    bool marked = false;   // block 0 starts with the scratch marker
   };
   const uint32_t devices = storage.count() < kMaxDevices ? storage.count() : kMaxDevices;
   Reference references[kMaxDevices];
@@ -239,6 +240,7 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     if (references[d].data.empty() || !dev->read(0, references[d].data)) continue;
     references[d].blocks = blocks;
     references[d].valid = true;
+    references[d].marked = references[d].data.first(12).equals(text_bytes("TCOS-SCRATCH"));
     const uint32_t readers = info.queue_depth > 1 ? kReadersPerDeepDevice : kReadersPerDevice;
     for (uint32_t r = 0; r < readers; ++r) {
       StorageJob& job = jobs[job_count];
@@ -303,6 +305,52 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
   }
   ok &= report("storage: concurrent random reads match the reference", readers_ok);
   if (writer_count) ok &= report("storage: concurrent writes to disjoint regions verify and restore", writers_ok);
+  // Big writes on every scratch device: 600 KiB at once (ten chunks, eight on the device at a time where there are slots), read back.
+  uint32_t big_writes = 0;
+  bool big_ok = true;
+  for (uint32_t d = 0; d < devices; ++d) {
+    hardware::IStorageDevice* dev = storage.at(d);
+    const hardware::StorageInfo info = dev->info();
+    if (info.read_only || !references[d].marked || info.block_count < 4096) continue;
+    const uint64_t bytes = 600 * 1024 / info.block_size * info.block_size;
+    const uint64_t first = info.block_count - uint64_t{kWriters} * 8 - 256 - bytes / info.block_size;
+    ByteView memory = allocate_view<uint8_t>(allocator, bytes * 3);
+    if (memory.empty()) continue;
+    const ByteView original = memory.first(bytes), pattern = memory.subview(bytes, bytes), back = memory.subview(2 * bytes, bytes);
+    for (uint64_t b = 0; b < bytes; ++b) pattern[b] = static_cast<uint8_t>(b * 7 + d + (b >> 9));
+    big_ok &= dev->read(first, original) && dev->write(first, pattern) && dev->read(first, back) && back.equals(pattern) &&
+              dev->write(first, original);
+    ++big_writes;
+    release_view(allocator, memory);
+  }
+  if (big_writes) ok &= report("storage: 600 KiB writes in parallel chunks read back", big_ok);
+  // Discard (TRIM) on every scratch device that can: 256 blocks in front of the writers' regions, then a block there written and read back.
+  uint32_t discarded = 0;
+  bool discard_ok = true;
+  for (uint32_t d = 0; d < devices; ++d) {
+    hardware::IStorageDevice* dev = storage.at(d);
+    const hardware::StorageInfo info = dev->info();
+    if (!info.discard || info.read_only || !references[d].valid || info.block_count < 1024) continue;
+    if (!references[d].marked) continue;
+    const uint64_t first = info.block_count - uint64_t{kWriters} * 8 - 256;
+    ByteView block = allocate_view<uint8_t>(allocator, uint64_t{info.block_size} * 3);
+    if (block.empty()) continue;
+    const ByteView original = block.first(info.block_size), pattern = block.subview(info.block_size, info.block_size),
+                   back = block.subview(2 * uint64_t{info.block_size}, info.block_size);
+    bool good = dev->read(first, original) && dev->discard(first, 256);
+    for (uint64_t b = 0; b < info.block_size; ++b) pattern[b] = static_cast<uint8_t>(0xA5 ^ b);
+    good = good && dev->write(first, pattern) && dev->read(first, back) && back.equals(pattern) && dev->write(first, original);
+    discard_ok &= good;
+    ++discarded;
+    release_view(allocator, block);
+  }
+  if (discarded) {
+    console::Guard guard;
+    console::puts("  storage: discard on ");
+    console::put_dec(discarded);
+    console::puts(" scratch devices\n");
+  }
+  if (discarded) ok &= report("storage: discarded blocks can be written and read again", discard_ok);
   // Devices with a deep queue: what the driver and the scheduler saw. Several readers at once must have had several requests on the device.
   bool deep = false, overlapped = true;
   for (uint32_t d = 0; d < devices; ++d) {

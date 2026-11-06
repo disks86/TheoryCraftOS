@@ -30,7 +30,7 @@ namespace iosched {
 enum class IoClass : uint8_t { Realtime = 0, BestEffort = 1, Idle = 2 };
 constexpr uint32_t kClassCount = 3;
 
-enum class IoOp : uint8_t { Read, Write, Flush };
+enum class IoOp : uint8_t { Read, Write, Flush, Discard };   // (discard: TRIM / deallocate, counted with flushes)
 
 // The depth controller hands out device slots per domain, so writes cannot fill the device's queue while reads wait behind them.
 enum class IoDomain : uint8_t { Read = 0, Write = 1, Other = 2 };

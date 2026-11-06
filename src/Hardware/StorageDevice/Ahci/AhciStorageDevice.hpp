@@ -113,6 +113,7 @@ class AhciStorageDevice final : public StorageDeviceBase {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
   StorageStatistics statistics() const override;
 
   // The HBA's interrupt for this port (AhciController::on_interrupt).
@@ -141,6 +142,9 @@ class AhciStorageDevice final : public StorageDeviceBase {
   bool run_ncq(bool write, uint64_t lba, ByteView into, ConstByteView from);
   // Queues one FPDMA command on `tag` and waits for it. False on an error; *retry when the port was being restarted (nothing was sent).
   bool execute_ncq(uint32_t tag, bool write, uint64_t lba, uint32_t blocks, bool* retry);
+  // Its halves: send (false, with nothing sent, while the port needs a restart), then wait (false on an error or a timeout).
+  bool submit_ncq(uint32_t tag, bool write, uint64_t lba, uint32_t blocks);
+  bool finish_ncq(uint32_t tag);
   void reap();
   bool restart_after_error();
   // The gate between queued commands (shared) and the others (exclusive: they wait until no queued command is on the drive).
@@ -166,6 +170,12 @@ class AhciStorageDevice final : public StorageDeviceBase {
   bool needs_restart_ = false;             // a task-file error stopped the queue
   uint32_t gate_ = 0;                      // atomic: bit 31 an exclusive command waits or runs, the rest queued commands in flight
   uint64_t errors_recovered_ = 0;
+  // From the NCQ Command Error log (log 10h) read after the last error: the tag and LBA the drive reports failed (kNoTag: none).
+  static constexpr uint32_t kNoTag = 0xFF;
+  uint32_t last_error_tag_ = kNoTag;
+  uint64_t last_error_lba_ = 0;
+  bool read_ncq_error_log();
+  bool general_purpose_logging_ = false;   // READ LOG EXT works (IDENTIFY word 84/87 bit 5)
 };
 
 }  // namespace hardware
