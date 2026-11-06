@@ -88,6 +88,7 @@
 #include "Hardware/SerialPort/SystemSerialPorts.hpp"
 #include "Hardware/SerialPort/X86SerialPortIo.hpp"
 #include "Hardware/Clock/TscClock.hpp"
+#include "Hardware/Platform/AMD/AmdRyzenPlatform.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #ifdef TCOS_AMD_VEGAM
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
@@ -886,6 +887,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   system_npu.probe_registers(pci, paging_ok ? &register_mapper : nullptr);  // Intel NPU: read the fuses (nothing is powered up)
   hardware::INeuralProcessingUnit& npu = system_npu.npu();
   Entry(Level::Ok, "NPU").text(npu.name()).text(", ").dec(npu.compute_units()).text(" compute units; ").text(system_npu.description());
+  // An AMD Zen machine: which Ryzen SoC it is and the graphics, display, video and NPU blocks that come with it (from the CPU model and the PCI bus).
+  if (system_cpu.amd() && hardware::amd_zen_core(system_cpu.family(), system_cpu.model()) != hardware::AmdZenCore::Unknown) {
+    FixedString<256> platform;
+    hardware::amd_ryzen_describe(hardware::amd_ryzen_identify_machine(system_cpu.family(), system_cpu.model(), pci), platform);
+    Entry(Level::Ok, "Platform").text(platform.c_str());
+  }
 #ifdef TCOS_SELFTESTS
   if (!run_npu_demo(npu, shared_allocator)) console::puts("NPU self-check failed\n");
 

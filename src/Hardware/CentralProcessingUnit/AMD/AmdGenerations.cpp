@@ -25,6 +25,7 @@
 #include "Hardware/CentralProcessingUnit/AMD/AmdZen3Cpu.hpp"
 #include "Hardware/CentralProcessingUnit/AMD/AmdZen4Cpu.hpp"
 #include "Hardware/CentralProcessingUnit/AMD/AmdZen5Cpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdZen6Cpu.hpp"
 #include "Hardware/CentralProcessingUnit/AMD/AmdZenCpu.hpp"
 #include "Hardware/CentralProcessingUnit/AMD/AmdZenPlusCpu.hpp"
 #include "Hardware/CentralProcessingUnit/GenerationTable.hpp"
@@ -43,11 +44,17 @@ constexpr GenerationRule kRules[] = {
     rule<AmdZenPlusCpu>(0x17, 0x08, 0x08),
     rule<AmdZenPlusCpu>(0x17, 0x18, 0x18),
     rule<AmdZenCpu>(0x17, 0x00, 0x2F),
+    rule<AmdZenCpu>(0x17, 0x50, 0x5F),   // Linux counts these as Zen 1 (arch/x86/kernel/cpu/amd.c)
     rule<AmdZen2Cpu>(0x17, 0x30, 0xFF),
     rule<AmdZen3Cpu>(0x19, 0x00, 0x0F),
     rule<AmdZen4Cpu>(0x19, 0x10, 0x1F),
     rule<AmdZen3Cpu>(0x19, 0x20, 0x5F),
     rule<AmdZen4Cpu>(0x19, 0x60, 0xAF),
+    // Family 1Ah: Zen 6 in the ranges Linux lists for it, Zen 5 elsewhere (Turin, Strix Point, Granite Ridge, Krackan Point, Strix Halo).
+    rule<AmdZen6Cpu>(0x1A, 0x50, 0x5F),
+    rule<AmdZen6Cpu>(0x1A, 0x80, 0xAF),
+    rule<AmdZen6Cpu>(0x1A, 0xC0, 0xCF),
+    rule<AmdZen6Cpu>(0x1A, 0xD8, 0xEF),
     rule<AmdZen5Cpu>(0x1A, 0x00, 0xFF),
 };
 }  // namespace

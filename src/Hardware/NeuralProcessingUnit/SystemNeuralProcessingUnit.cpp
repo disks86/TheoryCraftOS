@@ -42,9 +42,24 @@ SystemNeuralProcessingUnit::SystemNeuralProcessingUnit(const IPciBus& pci, ICent
       description_.append(IntelNpu::platform(d.device_id));
       description_.append(")");
     } else if (d.vendor_id == AmdXdnaNpu::kPciVendor && AmdXdnaNpu::matches(d.device_id)) {
+      constexpr uint16_t kPciRevision = 0x08;
       active_ = new (storage_) AmdXdnaNpu(cpu, scheduler);
+      amd_device_ = d;
+      amd_revision_ = static_cast<uint8_t>(pci.read32(d.address, kPciRevision) & 0xFF);
+      amd_found_ = true;
+      // The driver binds by (device id, revision); a revision it does not list still names the generation.
+      const AmdXdnaIdentity id = amd_xdna_identify(d.device_id, amd_revision_);
       description_.assign("AMD NPU (");
-      description_.append(AmdXdnaNpu::platform(d.device_id));
+      if (id.valid()) {
+        description_.append(id.npu);
+        description_.append(", ");
+        description_.append(id.platform);
+      } else {
+        description_.append(AmdXdnaNpu::platform(d.device_id));
+        description_.append(", revision ");
+        description_.append_uint(amd_revision_);
+        description_.append(" not in the driver's table");
+      }
       description_.append(")");
     }
   }
@@ -55,10 +70,51 @@ SystemNeuralProcessingUnit::SystemNeuralProcessingUnit(const IPciBus& pci, ICent
   active_->initialize();
 }
 
+namespace {
+// Maps the BARs the model's layout uses (its windows); a BAR that is missing or does not map stays empty, and the hardware layer then refuses its registers.
+void map_amd_bars(const IPciBus& pci, IRegisterMapper& mmio, PciAddress address, const AmdXdnaLayout& layout, MmioRegion (&regions)[6]) {
+  for (uint8_t i = 0; i < 6; ++i) {
+    regions[i] = MmioRegion();
+    if (layout.bar_window[i] == 0) continue;
+    const uint64_t base = pci.memory_bar(address, i);
+    MmioRegion r;
+    if (base != 0 && mmio.map_registers(base, layout.bar_window[i], &r)) regions[i] = r;
+  }
+}
+}  // namespace
+
+void SystemNeuralProcessingUnit::probe_amd_registers(const IPciBus& pci, IRegisterMapper* mmio) {
+  constexpr uint16_t kPciCommand = 0x04;
+  constexpr uint32_t kMemorySpace = 1u << 1;
+  if (!amd_found_ || !mmio || !(pci.read32(amd_device_.address, kPciCommand) & kMemorySpace)) return;
+  const AmdXdnaIdentity id = amd_identity();
+  if (!id.valid()) return;
+  const AmdXdnaLayout& layout = amd_xdna_layout(id.model);
+  MmioRegion regions[6];
+  map_amd_bars(pci, *mmio, amd_device_.address, layout, regions);
+  MmioNpuRegisters regs[6] = {MmioNpuRegisters(regions[0]), MmioNpuRegisters(regions[1]), MmioNpuRegisters(regions[2]),
+                              MmioNpuRegisters(regions[3]), MmioNpuRegisters(regions[4]), MmioNpuRegisters(regions[5])};
+  AmdXdnaBars bars;
+  for (uint8_t i = 0; i < 6; ++i)
+    if (regions[i].valid()) bars.bar[i] = {&regs[i], regions[i].length()};
+  AmdXdnaHw hw(layout, bars, nullptr);
+  amd_probe_ = hw.probe();  // reads only
+  if (!amd_probe_.valid) {
+    description_.append("; registers did not answer");
+    return;
+  }
+  description_.append(amd_probe_.firmware_alive ? "; firmware running" : "; firmware not running");
+  if (amd_probe_.psp_ready) description_.append(", PSP ready");
+}
+
 void SystemNeuralProcessingUnit::probe_registers(const IPciBus& pci, IRegisterMapper* mmio) {
   constexpr uint16_t kPciCommand = 0x04;
   constexpr uint32_t kMemorySpace = 1u << 1;
   constexpr uint8_t kIpBar = 0, kButtressBar = 4;  // ivpu's regv and regb
+  if (amd_found_) {
+    probe_amd_registers(pci, mmio);
+    return;
+  }
   if (!intel_found_ || !mmio || !(pci.read32(intel_device_.address, kPciCommand) & kMemorySpace)) return;
   const IntelNpuPlatform platform = intel_npu_platform(intel_device_.device_id);
   const uint64_t ip_base = pci.memory_bar(intel_device_.address, kIpBar);
@@ -123,6 +179,49 @@ IntelNpuDeviceError SystemNeuralProcessingUnit::start_intel_device(const IPciBus
   }
   description_.append("; firmware running");
   return IntelNpuDeviceError::None;
+}
+
+AmdXdnaError SystemNeuralProcessingUnit::start_amd_device(const IPciBus& pci, IRegisterMapper* mmio, allocators::IAllocator& allocator, ConstByteView firmware,
+                                                         ConstByteView cert_firmware, const IClock* clock) {
+  constexpr uint16_t kPciCommand = 0x04;
+  constexpr uint32_t kMemorySpace = 1u << 1, kBusMaster = 1u << 2;
+  const AmdXdnaIdentity id = amd_identity();
+  if (!amd_found_ || !id.valid()) return AmdXdnaError::NoDevice;
+  const uint32_t command = pci.read32(amd_device_.address, kPciCommand);
+  if (!mmio || amd_dev_ || !(command & kMemorySpace)) return AmdXdnaError::BadState;
+  const AmdXdnaLayout& layout = amd_xdna_layout(id.model);
+  MmioRegion regions[6];
+  map_amd_bars(pci, *mmio, amd_device_.address, layout, regions);
+  AmdXdnaBars bars;
+  for (uint8_t i = 0; i < 6; ++i) {
+    if (layout.bar_window[i] == 0) continue;
+    if (!regions[i].valid()) return AmdXdnaError::Registers;
+    amd_regs_[i] = UniquePointer<MmioNpuRegisters>::make(allocator, regions[i]);
+    if (!amd_regs_[i]) return AmdXdnaError::NoMemory;
+    bars.bar[i] = {amd_regs_[i].get(), regions[i].length()};
+  }
+  // The PSP reads the firmware from host memory (and the firmware later reaches host buffers): bus mastering on, as pci_set_master() in aie2_hw_start.
+  // Writing the command register's low half also writes the status half, whose bits are write-one-to-clear: write zeros there.
+  if (!(command & kBusMaster)) pci.write32(amd_device_.address, kPciCommand, (command & 0xFFFF) | kBusMaster);
+  UniquePointer<AmdXdnaDevice> device = UniquePointer<AmdXdnaDevice>::make(allocator, layout, bars, clock);
+  if (!device) return AmdXdnaError::NoMemory;
+  AmdXdnaError error = device->load_firmware(allocator, firmware, cert_firmware);
+  if (error == AmdXdnaError::None) error = device->start();
+  if (error != AmdXdnaError::None) {
+    description_.append("; firmware not started: ");
+    description_.append(amd_xdna_stage_name(device->failed_stage()));
+    description_.append(", ");
+    description_.append(amd_xdna_error_name(error));
+    return error;  // the device (powered off again) is destroyed here, before the register wrappers it reads through
+  }
+  amd_dev_ = util::move(device);
+  description_.append("; firmware running");
+  if (amd_dev_->total_columns()) {
+    description_.append(", ");
+    description_.append_uint(amd_dev_->total_columns());
+    description_.append(" AIE columns");
+  }
+  return AmdXdnaError::None;
 }
 
 }  // namespace hardware

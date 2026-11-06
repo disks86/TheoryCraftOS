@@ -19,6 +19,8 @@
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/Clock/IClock.hpp"
+#include "Hardware/NeuralProcessingUnit/AMD/AmdXdnaDevice.hpp"
 #include "Hardware/NeuralProcessingUnit/Intel/IntelNpuAccelerator.hpp"
 #include "Hardware/NeuralProcessingUnit/Intel/IntelNpuDevice.hpp"
 #include "Hardware/NeuralProcessingUnit/Intel/IntelNpuExecutor.hpp"
@@ -41,8 +43,9 @@ class SystemNeuralProcessingUnit {
   INeuralProcessingUnit& npu() { return *active_; }
   // One line for the boot log: which NPU hardware was found (vendor and platform) and that the computation still runs on the CPU, or that there is none.
   const char* description() const { return description_.c_str(); }
-  // Looks at an Intel NPU's fuse and status registers (read only; nothing is powered up or written) and adds what they say to description(). Needs the
-  // device's memory decoding to be on, as the firmware leaves it. Does nothing for other NPUs or without a mapper.
+  // Looks at an Intel NPU's fuse and status registers, or an AMD NPU's PSP, SMU and firmware-alive registers (read only; nothing is powered up or
+  // written), and adds what they say to description(). Needs the device's memory decoding to be on, as the firmware leaves it. Does nothing for other NPUs
+  // or without a mapper.
   void probe_registers(const IPciBus& pci, IRegisterMapper* mmio);
   // What probe_registers found; valid is false when it did not run or the registers did not answer.
   const IntelNpuInfo& intel_info() const { return intel_info_; }
@@ -59,14 +62,30 @@ class SystemNeuralProcessingUnit {
   // The running device, or null. Once there is an executor, use that: the device is not thread safe.
   IntelNpuDevice* intel_device() { return intel_dev_.get(); }
   IntelNpuExecutor* intel_executor() { return intel_exec_.get(); }
+  // The AMD NPU on the bus, if there is one: its PCI address, revision and the model the Linux amdxdna driver's table gives that (device id, revision).
+  bool amd_present() const { return amd_found_; }
+  PciAddress amd_address() const { return amd_device_.address; }
+  uint8_t amd_revision() const { return amd_revision_; }
+  AmdXdnaIdentity amd_identity() const { return amd_xdna_identify(amd_device_.device_id, amd_revision_); }
+  // What probe_registers found for the AMD NPU; valid is false when it did not run or the registers did not answer.
+  const AmdXdnaProbe& amd_probe() const { return amd_probe_; }
+  // Brings the AMD NPU up with its firmware (amdnpu/<id>_<rev>/npu.sbin or npu_7.sbin; AIE4 parts also cert.dev.sbin as `cert_firmware`; the kernel carries
+  // none): turns on bus mastering, powers it through the SMU, has the PSP validate and start the firmware, opens the management mailbox and runs the
+  // driver's bring-up messages. The images are copied; `clock` (may be null: polls are counted instead) times the waits. Returns None on success, and then
+  // amd_device() talks to the firmware; work still runs on the CPU (no graph compiler for the AI Engine array exists). Otherwise the device is powered
+  // off again and description() says where it stopped. Not called at boot.
+  AmdXdnaError start_amd_device(const IPciBus& pci, IRegisterMapper* mmio, allocators::IAllocator& allocator, ConstByteView firmware, ConstByteView cert_firmware,
+                                const IClock* clock);
+  AmdXdnaDevice* amd_device() { return amd_dev_.get(); }
   // True when a hardware NPU is on the bus (its work still runs on the CPU until a native driver exists).
   bool hardware_present() const { return hardware_present_; }
 
  private:
+  void probe_amd_registers(const IPciBus& pci, IRegisterMapper* mmio);
   // Vendor classes add no data, so the software NPU's size covers them all.
   alignas(16) unsigned char storage_[sizeof(SoftwareNeuralProcessingUnit)];
   INeuralProcessingUnit* active_ = nullptr;
-  FixedString<192> description_;
+  FixedString<256> description_;
   PciDeviceInfo intel_device_;
   IntelNpuInfo intel_info_;
   bool intel_found_ = false;
@@ -74,6 +93,12 @@ class SystemNeuralProcessingUnit {
   UniquePointer<IntelNpuDevice> intel_dev_;
   UniquePointer<IntelNpuExecutor> intel_exec_;      // after the device: they go first
   UniquePointer<IntelNpuAccelerator> intel_accel_;
+  PciDeviceInfo amd_device_{};
+  uint8_t amd_revision_ = 0;
+  bool amd_found_ = false;
+  AmdXdnaProbe amd_probe_;
+  UniquePointer<MmioNpuRegisters> amd_regs_[6];
+  UniquePointer<AmdXdnaDevice> amd_dev_;            // after the registers it reads through: it goes first
   ICentralProcessingUnit& cpu_;
   scheduling::ICPUScheduler& scheduler_;
   bool hardware_present_ = false;
