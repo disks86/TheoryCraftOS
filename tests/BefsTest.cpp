@@ -1892,6 +1892,8 @@ static void test_discard(uint32_t bs, uint32_t ag_shift, uint32_t groups, uint32
     CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
     if (!fs) return;
     CHECK(discard_test::run(*fs, 31 + bs + device_block, &files));
+    CHECK(discard_test::send_without_flush(*fs, disk.dc));
+    CHECK(discard_test::trim_and_check(*fs, files, disk.dc));
     fs = UniquePointer<IFileSystem>();
     CHECK(disk.dc.calls > 0 && disk.dc.blocks > 0 && disk.dc.refused == 0);
     printf("  BeFS %u-byte blocks on %u-byte device blocks: %llu discards, %llu blocks\n", bs, device_block, (unsigned long long)disk.dc.calls,

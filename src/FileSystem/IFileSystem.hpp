@@ -62,6 +62,18 @@ class IFileSystem {
 
   // Pushes everything to the medium.
   virtual Status flush() = 0;
+  // Tells the device about the blocks freed since the last time (FileSystem/DiscardBatch), once they are free on the medium: flushes the
+  // device first if anything is waiting. Cheap when nothing is. Called now and then (SystemFileSystem's service) so that discards do not
+  // wait for a flush() that may never come.
+  virtual Status send_discards() { return Status::Ok; }
+  // fstrim: discards all the free space of the volume that holds `path` (a plain file system has one; a mount table picks the volume, or
+  // takes every volume for its root). *discarded_bytes says how much went to the device. Unsupported where the device cannot discard or the
+  // file system cannot list its free space; ReadOnly on a read-only volume.
+  virtual Status trim(StringView path, uint64_t* discarded_bytes) {
+    (void)path;
+    *discarded_bytes = 0;
+    return Status::Unsupported;
+  }
   // Changes the read-only flag and the times of a file or folder. Unsupported by a file system that keeps none of that; ReadOnly if the volume is read-only.
   virtual Status set_metadata(StringView path, const MetadataChange& change) { (void)path; (void)change; return Status::Unsupported; }
 

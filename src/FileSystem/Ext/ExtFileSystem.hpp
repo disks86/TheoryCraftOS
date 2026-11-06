@@ -88,6 +88,8 @@ class ExtFileSystem final : public IFileSystem {
   Status remove(StringView path) override;
   Status rename(StringView from, StringView to) override;
   Status flush() override;
+  Status send_discards() override;
+  Status trim(StringView path, uint64_t* discarded_bytes) override;
 
  private:
   class File;
@@ -283,6 +285,7 @@ class ExtFileSystem final : public IFileSystem {
   allocators::IAllocator& allocator_;
   hardware::IStorageDevice& device_;
   const uint64_t first_block_;
+  void send_discards_if_due();   // after freeing: a big batch goes out now (the device flushed first)
   DiscardBatch discard_;   // freed blocks, discarded after the next flush
   mutable kernel::RecursiveMutex mutex_;
   struct OpenHandle {

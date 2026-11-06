@@ -23,6 +23,7 @@ namespace filesystem {
 void DiscardBatch::attach(hardware::IStorageDevice* device, bool writable) {
   device_ = device && writable && device->info().discard ? device : nullptr;
   count_ = 0;
+  block_size_ = device_ && device_->info().block_size ? device_->info().block_size : 512;
 }
 
 void DiscardBatch::remove_at(uint32_t index) {
@@ -119,6 +120,43 @@ void DiscardBatch::rollback() {
     if (!ranges_[i].committed) remove_at(i);
     else ++i;
   }
+}
+
+bool DiscardBatch::has_committed() const {
+  for (uint32_t i = 0; i < count_; ++i)
+    if (ranges_[i].committed) return true;
+  return false;
+}
+
+bool DiscardBatch::wants_issue() const {
+  uint64_t blocks = 0;
+  uint32_t committed = 0;
+  for (uint32_t i = 0; i < count_; ++i) {
+    if (!ranges_[i].committed) continue;
+    blocks += ranges_[i].count;
+    ++committed;
+  }
+  return committed == kMaxRanges || blocks >= kIssueBytes / block_size_;
+}
+
+bool DiscardBatch::discard_now(uint64_t lba, uint64_t count) {
+  if (!device_ || count == 0) return false;
+  ++stats_.requests;
+  if (!device_->discard(lba, count)) {
+    ++stats_.failed;
+    return false;
+  }
+  stats_.blocks += count;
+  return true;
+}
+
+bool DiscardBatch::discard_bytes_now(uint64_t offset, uint64_t bytes, uint32_t device_block_size, uint64_t* bytes_done) {
+  if (!device_ || device_block_size == 0 || bytes == 0 || offset > UINT64_MAX - bytes) return true;
+  const uint64_t first = (offset + device_block_size - 1) / device_block_size, end = (offset + bytes) / device_block_size;
+  if (end <= first) return true;
+  if (!discard_now(first, end - first)) return false;
+  *bytes_done += (end - first) * device_block_size;
+  return true;
 }
 
 uint32_t DiscardBatch::issue() {

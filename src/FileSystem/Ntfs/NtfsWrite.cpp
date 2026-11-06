@@ -161,7 +161,10 @@ Status NtfsFileSystem::bitmap_update(uint64_t first, uint64_t count, bool used) 
     pos = chunk_end;
   }
   if (free_known_) free_clusters_ = used ? free_clusters_ - count : free_clusters_ + count;
-  if (!used) discard_.freed_bytes(volume, count * cluster_bytes_, block_size_);
+  if (!used) {
+    discard_.freed_bytes(volume, count * cluster_bytes_, block_size_);
+    send_discards_if_due();
+  }
   return Status::Ok;
 }
 

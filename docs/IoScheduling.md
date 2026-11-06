@@ -190,6 +190,29 @@ in the "other" domain:
   - In the boot self-test, deleting 1 MiB on a scratch FAT32 virtio-blk disk (marked by `TCOSSCR.TXT`) sends one merged 2048-block
     discard.
 
+**Discards do not wait for a flush.** A file system sends its batch early, flushing the device first, once 32 MiB of committed ranges
+are waiting or the batch is full of them. `IFileSystem::send_discards()` sends whatever is committed, again after a device flush, and
+does nothing when nothing is waiting. `SystemFileSystem`'s service thread calls it for every volume every 5 s.
+
+**fstrim.** `IFileSystem::trim(path, &bytes)` discards all the free space of the volume that holds `path`; a mount table's root means
+every volume. It is the shell command `fstrim [folder]`.
+
+- **Order.** Under the file system's lock, it flushes the device (so every free so far is durable), sends the batch, then walks the
+  free-space map and discards each free run, rounded inward to whole device blocks.
+- **Maps.** FAT: the FAT entries. ext: the group block bitmaps. NTFS: `$Bitmap`. BeFS: the group bitmaps, only with no transaction
+  open.
+- **Tests.** The host tests trim after the workload, with every live file read back through the poison disk. In the boot self-test, the
+  scratch FAT32 volume's 62 MiB of free space is trimmed.
+
+**virtio-scsi discard.**
+
+- **Detection.** UNMAP, when READ CAPACITY(16) reports a thin-provisioned unit (LBPME) and the Logical Block Provisioning VPD page says
+  UNMAP works (LBPU). The Block Limits VPD page caps one UNMAP; a zero there means no UNMAP after all, and a missing page gives a
+  conservative 2 GiB.
+- **Command.** One block descriptor per command (`scsi::build_unmap`).
+- **Tests.** The parsers are in ParserFuzzTest, with exact-value checks. In QEMU, `scsi-hd` with `discard=unmap` reports it, and the
+  scratch-disk discard test now covers four devices.
+
 **Polled build.** `-DTCOS_STORAGE_POLLED=ON` builds a kernel whose storage drivers never turn on completion interrupts. It is for
 machines with broken MSI, and it is how the polled paths, AHCI's included, are tested.
 
@@ -216,14 +239,13 @@ The configurations: KVM with 4, 8 and 1 cores (8 with `num-queues=3` for virtio-
   - A big request takes extra slots only if they are free, so on a busy device it runs mostly in series. The I/O scheduler still counts it
     as one request.
 - **Discard gaps.**
-  - Discards go out only when a file system is flushed, so a volume that is never flushed never discards.
-  - There is no `fstrim` that discards a volume's existing free space.
-  - virtio-scsi UNMAP is not done.
+  - Nothing runs `fstrim` on a schedule.
+  - pvscsi, USB and SD have no discard (UAS and SD ERASE would be needed).
   - NVMe and AHCI don't report what a discarded block reads back as (DLFEAT / RZAT).
 - **Driver features still missing.**
   - NVMe: no interrupt coalescing (left off on purpose, for latency), only the first namespace.
   - AHCI: no port multipliers.
-  - virtio-scsi: still only the first LUN of each target.
+  - virtio-scsi: still only the first LUN of each target, and one UNMAP descriptor a command.
   - None of it has been tried on real hardware.
 - **Some callers don't pass priorities yet**. Windows `FileIoPriorityHintInformation` and process I/O priority are still ignored, and
   Linux `ioprio_set` is not wired to `set_thread_io_priority`. User processes do not yet put their threads into one `io_group`.

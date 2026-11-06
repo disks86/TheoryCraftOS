@@ -129,6 +129,22 @@ void test_basics() {
   b.issue();
   CHECK(d.calls.size() == 2 && d.sent(0, 1) && d.sent(2, 2));
   CHECK(b.statistics().failed == 0);
+
+  // Due: 32 MiB of committed blocks, or a batch full of committed ranges; uncommitted ones do not count.
+  CHECK(!b.wants_issue());
+  b.freed(0, filesystem::DiscardBatch::kIssueBytes / 512, false);
+  CHECK(!b.wants_issue() && !b.has_committed());
+  b.commit();
+  CHECK(b.wants_issue() && b.has_committed());
+  b.issue();
+  for (uint32_t i = 0; i < filesystem::DiscardBatch::kMaxRanges; ++i) b.freed(500000 + i * 10, 1);
+  CHECK(b.wants_issue());
+  b.issue();
+  // discard_now and its byte form go at once, rounded inward.
+  d.calls.clear();
+  uint64_t bytes = 0;
+  CHECK(b.discard_now(7, 3) && b.discard_bytes_now(4096 + 1, 3 * 4096, 4096, &bytes) && bytes == 2 * 4096);
+  CHECK(d.calls.size() == 2 && d.sent(7, 3) && d.sent(2, 2));
 }
 
 void test_off() {

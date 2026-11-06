@@ -190,10 +190,14 @@ void SystemFileSystem::stop_service() {
   service_ = nullptr;
 }
 
+// Hot-plug every 250 ms, and every few seconds the blocks the volumes freed go to their devices as discards (a volume with none waiting
+// does nothing): they do not wait for a flush that may not come.
 void SystemFileSystem::service_main(void* self) {
   SystemFileSystem* files = static_cast<SystemFileSystem*>(self);
-  while (!__atomic_load_n(&files->stop_, __ATOMIC_ACQUIRE)) {
+  constexpr uint32_t kDiscardEvery = 20;   // rounds: 5 s
+  for (uint32_t round = 1; !__atomic_load_n(&files->stop_, __ATOMIC_ACQUIRE); ++round) {
     files->poll();
+    if (round % kDiscardEvery == 0) files->table_.send_discards();
     kernel::sleep_us(250000);
   }
 }

@@ -24,7 +24,7 @@ namespace hardware::scsi {
 
 constexpr uint8_t kTestUnitReady = 0x00, kInquiry = 0x12, kReadCapacity10 = 0x25, kRead10 = 0x28,
                   kWrite10 = 0x2A, kSynchronizeCache10 = 0x35, kRead16 = 0x88, kWrite16 = 0x8A,
-                  kServiceActionIn16 = 0x9E;
+                  kServiceActionIn16 = 0x9E, kUnmap = 0x42;
 constexpr uint8_t kReadCapacity16Action = 0x10;
 constexpr uint8_t kDeviceTypeDisk = 0x00, kDeviceTypeOptical = 0x05;
 constexpr uint8_t kStatusGood = 0x00, kStatusCheckCondition = 0x02;
@@ -65,6 +65,51 @@ inline bool parse_capacity16(ConstByteView data, uint64_t* last_block, uint32_t*
   *last_block = (high << 32) | in.be32();
   *block_size = in.be32();
   return in.ok();
+}
+
+// READ CAPACITY(16) byte 14 bit 7, LBPME: the unit is thin provisioned (logical block provisioning management), the start of UNMAP support.
+inline bool capacity16_thin_provisioned(ConstByteView data) { return data.size() > 14 && (data[14] & 0x80); }
+
+// INQUIRY with EVPD for a vital product data page (in a 6-byte CDB): `length` bytes of page `page`.
+constexpr uint8_t kVpdBlockLimits = 0xB0, kVpdLogicalBlockProvisioning = 0xB2;
+inline void build_vpd_inquiry(ByteView cdb, uint8_t page, uint16_t length) {
+  cdb.fill(0);
+  cdb[0] = kInquiry;
+  cdb[1] = 1;   // EVPD
+  cdb[2] = page;
+  cdb[3] = static_cast<uint8_t>(length >> 8);
+  cdb[4] = static_cast<uint8_t>(length);
+}
+// The Logical Block Provisioning page (B2h): byte 5 bit 7, LBPU - UNMAP works. False if the page is short or another one.
+inline bool parse_lbp_vpd_unmap(ConstByteView data) { return data.size() > 5 && data[1] == kVpdLogicalBlockProvisioning && (data[5] & 0x80); }
+// The Block Limits page (B0h): the most blocks one UNMAP may name (bytes 20-23) and descriptors it may carry (24-27); 0 when not given.
+inline bool parse_block_limits(ConstByteView data, uint32_t* max_unmap_blocks, uint32_t* max_unmap_descriptors) {
+  ByteReader in(data);
+  in.skip(1);
+  const uint8_t page = in.u8();
+  in.skip(18);
+  *max_unmap_blocks = in.be32();
+  *max_unmap_descriptors = in.be32();
+  return in.ok() && page == kVpdBlockLimits;
+}
+
+// UNMAP of one range: the 10-byte CDB in `cdb` and the 24-byte parameter list (header and one block descriptor) in `parameters`.
+constexpr uint32_t kUnmapParameterBytes = 24;
+inline bool build_unmap(ByteView cdb, ByteView parameters, uint64_t lba, uint32_t blocks) {
+  if (cdb.size() < 10 || parameters.size() < kUnmapParameterBytes) return false;
+  cdb.first(10).fill(0);
+  cdb[0] = kUnmap;
+  cdb[7] = 0;
+  cdb[8] = kUnmapParameterBytes;   // parameter list length
+  ByteWriter out(parameters.first(kUnmapParameterBytes));
+  out.be16(kUnmapParameterBytes - 2);   // data length after this field
+  out.be16(16);                         // block descriptor data length
+  out.be32(0);
+  out.be32(static_cast<uint32_t>(lba >> 32));
+  out.be32(static_cast<uint32_t>(lba));
+  out.be32(blocks);
+  out.be32(0);
+  return true;
 }
 
 // The standard INQUIRY data: what kind of device, removable or not, and the

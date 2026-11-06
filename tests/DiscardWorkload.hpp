@@ -157,4 +157,31 @@ inline bool run(filesystem::IFileSystem& fs, uint32_t seed, std::vector<Model>* 
   return check_all(fs, *files, "at the end") && ok;
 }
 
+// fstrim on the mounted volume: it must discard something (the workload left free space) and every file must still read back - the disk
+// poisoned all that was discarded, so a block in use among them shows.
+inline bool trim_and_check(filesystem::IFileSystem& fs, const std::vector<Model>& files, const DiscardCounters& counters) {
+  const uint64_t before = counters.blocks;
+  uint64_t bytes = 0;
+  const filesystem::Status s = fs.trim("/", &bytes);
+  if (s != filesystem::Status::Ok || bytes == 0 || counters.blocks == before) {
+    printf("  trim: status %d, %llu bytes\n", static_cast<int>(s), (unsigned long long)bytes);
+    return false;
+  }
+  return check_all(fs, files, "after a trim");
+}
+
+// send_discards without a flush: a file removed is discarded by it (and nothing else in use).
+inline bool send_without_flush(filesystem::IFileSystem& fs, const DiscardCounters& counters) {
+  if (!write_file(fs, 99, 1, 200 * 1024) || fs.flush() != filesystem::Status::Ok) return false;
+  char name[32];
+  name_of(99, name);
+  if (fs.remove(name) != filesystem::Status::Ok) return false;
+  const uint64_t before = counters.blocks;
+  if (fs.send_discards() != filesystem::Status::Ok || counters.blocks == before) {
+    printf("  send_discards sent nothing\n");
+    return false;
+  }
+  return true;
+}
+
 }  // namespace discard_test

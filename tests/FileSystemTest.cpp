@@ -945,6 +945,8 @@ static void test_fat_discard(FatImage::Kind kind, uint32_t block, const char* la
       CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &fsp), Status::Ok);
       if (!fsp) return;
       CHECK(discard_test::run(*fsp, 1234 + block + static_cast<uint32_t>(kind), &files, kind == FatImage::F12 ? 40 : 96));
+      CHECK(discard_test::send_without_flush(*fsp, disk.dc));
+      CHECK(discard_test::trim_and_check(*fsp, files, disk.dc));
     }
     CHECK(disk.dc.calls > 0 && disk.dc.blocks > 0 && disk.dc.refused == 0);
     UniquePointer<IFileSystem> again;
@@ -960,6 +962,8 @@ static void test_fat_discard(FatImage::Kind kind, uint32_t block, const char* la
   CHECK_STATUS(FatFileSystem::mount(a, plain, 0, &fsp), Status::Ok);
   std::vector<discard_test::Model> files;
   if (fsp) CHECK(discard_test::run(*fsp, 99, &files));
+  uint64_t trimmed = 1;
+  if (fsp) CHECK(fsp->trim("/", &trimmed) == Status::Unsupported && trimmed == 0);
   CHECK(plain.dc.calls == 0 && plain.dc.refused == 0);
 }
 

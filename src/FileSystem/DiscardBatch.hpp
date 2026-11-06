@@ -63,6 +63,14 @@ class DiscardBatch {
   uint32_t issue();
 
   uint32_t pending() const { return count_; }
+  bool has_committed() const;
+  // Enough is waiting that it should go now rather than at the next flush: kIssueBytes of committed ranges, or a batch full of them.
+  static constexpr uint64_t kIssueBytes = 32ull << 20;
+  bool wants_issue() const;
+  // fstrim: discards [lba, lba + count) at once (free space the file system vouches for, under its lock), counted with the rest.
+  bool discard_now(uint64_t lba, uint64_t count);
+  // The same for a byte range (the device blocks wholly inside it); the device bytes discarded are added to *bytes_done.
+  bool discard_bytes_now(uint64_t offset, uint64_t bytes, uint32_t device_block_size, uint64_t* bytes_done);
   const DiscardStatistics& statistics() const { return stats_; }
 
  private:
@@ -74,6 +82,7 @@ class DiscardBatch {
   void remove_at(uint32_t index);
 
   hardware::IStorageDevice* device_ = nullptr;   // non-owning; null when off
+  uint32_t block_size_ = 512;
   Array<Range, kMaxRanges> ranges_;
   uint32_t count_ = 0;
   DiscardStatistics stats_;

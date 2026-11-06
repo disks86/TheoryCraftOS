@@ -397,6 +397,50 @@ Status MountTable::rename(StringView from, StringView to) {
   return a->volume->file_system().rename(rest_a, rest_b);
 }
 
+Status MountTable::send_discards() {
+  List<SharedPointer<Entry>> snapshot(allocator_);
+  {
+    kernel::ScopedMutex guard(mutex_);
+    for (const SharedPointer<Entry>& e : entries_.view()) snapshot.push_back(e);
+  }
+  Status result = Status::Ok;
+  for (const SharedPointer<Entry>& e : snapshot.view()) {
+    if (!e->usable()) continue;
+    const Status status = e->volume->file_system().send_discards();
+    if (status != Status::Ok && result == Status::Ok) result = status;
+  }
+  return result;
+}
+
+// The volume of `path`, or for the table's own root every volume that can (Unsupported only if none could).
+Status MountTable::trim(StringView path, uint64_t* discarded_bytes) {
+  *discarded_bytes = 0;
+  SharedPointer<Entry> entry;
+  StringView rest;
+  bool root;
+  const Status resolved = resolve(path, &entry, &rest, &root);
+  if (resolved != Status::Ok) return resolved;
+  if (!root) {
+    if (!entry->usable()) return Status::NoMedia;
+    return entry->volume->file_system().trim("/", discarded_bytes);
+  }
+  List<SharedPointer<Entry>> snapshot(allocator_);
+  {
+    kernel::ScopedMutex guard(mutex_);
+    for (const SharedPointer<Entry>& e : entries_.view()) snapshot.push_back(e);
+  }
+  Status result = Status::Unsupported;
+  for (const SharedPointer<Entry>& e : snapshot.view()) {
+    if (!e->usable()) continue;
+    uint64_t bytes = 0;
+    const Status status = e->volume->file_system().trim("/", &bytes);
+    *discarded_bytes += bytes;
+    if (status == Status::Ok && result == Status::Unsupported) result = Status::Ok;
+    else if (status != Status::Ok && status != Status::Unsupported && status != Status::ReadOnly) result = status;
+  }
+  return result;
+}
+
 Status MountTable::flush() {
   List<SharedPointer<Entry>> snapshot(allocator_);
   {

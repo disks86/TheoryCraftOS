@@ -2039,6 +2039,8 @@ static void test_discard(uint32_t bps, uint32_t spc, uint32_t device_block, uint
   if (!m.fs) return;
   std::vector<discard_test::Model> files;
   CHECK(discard_test::run(*m.fs, 4242 + bps * spc + device_block, &files));
+  CHECK(discard_test::send_without_flush(*m.fs, m.disk->dc));
+  CHECK(discard_test::trim_and_check(*m.fs, files, m.disk->dc));
   m.fs = UniquePointer<IFileSystem>();
   CHECK(m.disk->dc.calls > 0 && m.disk->dc.blocks > 0 && m.disk->dc.refused == 0);
   printf("  %u-byte clusters on %u-byte blocks: %llu discards, %llu blocks\n", bps * spc, device_block, (unsigned long long)m.disk->dc.calls,

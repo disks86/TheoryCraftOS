@@ -60,6 +60,8 @@ class FatFileSystem final : public IFileSystem {
   Status rename(StringView from, StringView to) override;
   Status set_metadata(StringView path, const MetadataChange& change) override;
   Status flush() override;
+  Status send_discards() override;
+  Status trim(StringView path, uint64_t* discarded_bytes) override;
 
  private:
   class File;
@@ -125,6 +127,7 @@ class FatFileSystem final : public IFileSystem {
   allocators::IAllocator& allocator_;
   hardware::IStorageDevice& device_;
   const uint64_t first_block_;
+  void send_discards_if_due();   // after freeing: a big batch goes out now (the device flushed first)
   DiscardBatch discard_;   // freed clusters, discarded after the next flush
   mutable kernel::RecursiveMutex mutex_;
   File* open_files_ = nullptr;   // the open file handles, newest first (see File)

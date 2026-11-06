@@ -203,6 +203,18 @@ void Shell::execute(StringView line) {
     if (count < 2) return say("usage: stat path");
     return stat(args[1]);
   }
+  if (command.equals("fstrim")) {   // the free space of the folder's volume (all volumes from the root) discarded on the device
+    String path(allocator_);
+    if (!path_of(command, count > 1 ? args[1] : StringView("."), &path)) return;
+    uint64_t bytes = 0;
+    const Status status = fs_->trim(path.view(), &bytes);
+    if (status != Status::Ok) return fail("fstrim", path.view(), status);
+    String text(allocator_);
+    if (text.append(path.view()) && text.append(": ") && text.append_uint(bytes >> 20) && text.append(" MiB (") && text.append_uint(bytes) &&
+        text.append(" bytes) trimmed"))
+      say(text.view());
+    return;
+  }
   if (run_program(command, args, count)) return;
   say(command, ": command not found (try help)");
 }
@@ -236,6 +248,7 @@ void Shell::help() const {
         "  cp source dest      copy a file or folder\n"
         "  mv source dest      move or rename\n"
         "  stat path           show what a path is\n"
+        "  fstrim [folder]     tell the disk the free space of the folder's volume is unused\n"
         "  clear, exit         clear the screen, close the terminal\n"
         "A word that names an ELF (Linux) or PE (Windows) program runs it: ./tool arg... (see the Linux and Windows folders).\n"
         "Drop a folder from the file explorer on the window to go there; a file puts its path on the line.\n");

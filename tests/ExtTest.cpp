@@ -1352,6 +1352,8 @@ static void test_discard(const Variant& v, uint32_t device_block, uint64_t lead)
   if (!mt.fs) return;
   std::vector<discard_test::Model> files;
   CHECK(discard_test::run(*mt.fs, 77 + v.block_size + device_block, &files, 160));
+  CHECK(discard_test::send_without_flush(*mt.fs, mt.disk->dc));
+  CHECK(discard_test::trim_and_check(*mt.fs, files, mt.disk->dc));
   mt.fs = UniquePointer<IFileSystem>();
   const MemDisk& disk = *mt.disk;
   CHECK(disk.dc.calls > 0 && disk.dc.blocks > 0 && disk.dc.refused == 0);

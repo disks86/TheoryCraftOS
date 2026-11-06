@@ -139,6 +139,7 @@ Status ExtFileSystem::free_blocks(uint64_t start, uint64_t count) {
     start += here;
     count -= here;
   }
+  send_discards_if_due();
   return Status::Ok;
 }
 

@@ -135,6 +135,7 @@ class VirtioScsiDevice final : public StorageDeviceBase {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
   void stop_interrupts() override { controller_->stop_interrupts(); }
 
  protected:
@@ -144,9 +145,13 @@ class VirtioScsiDevice final : public StorageDeviceBase {
   // Runs a command, retrying while the target reports a unit attention.
   bool run(ConstByteView cdb, ByteView data, bool device_writes);
 
+  // UNMAP when the unit is thin provisioned and says it takes it; the most blocks one may name.
+  void find_unmap();
+
   SharedPointer<VirtioScsiController> controller_;
   uint32_t target_;
   bool optical_ = false;
+  uint32_t unmap_max_blocks_ = 0;
 };
 
 }  // namespace hardware

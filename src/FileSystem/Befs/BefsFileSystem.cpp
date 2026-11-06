@@ -1165,6 +1165,7 @@ Status BefsFileSystem::tx_commit() {
   tx_count_ = 0;
   tx_used_blocks_ = used_blocks_;
   discard_.commit();   // what this transaction freed is free on the medium
+  send_discards_if_due();
   return Status::Ok;
 }
 
@@ -2429,6 +2430,53 @@ Status BefsFileSystem::rename(StringView from, StringView to) {
 Status BefsFileSystem::create_directory(StringView path) {
   uint64_t block = 0;
   return create_node(path, true, &block);
+}
+
+Status BefsFileSystem::send_discards() {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  if (!discard_.has_committed()) return Status::Ok;
+  if (!device_.flush()) return Status::IoError;   // (what freed them must be on the medium first)
+  discard_.issue();
+  return Status::Ok;
+}
+
+void BefsFileSystem::send_discards_if_due() {
+  if (discard_.wants_issue() && device_.flush()) discard_.issue();
+}
+
+// fstrim: the runs of clear bits in every group's bitmap, with no transaction open and after the device flush that makes every committed
+// free durable.
+Status BefsFileSystem::trim(StringView, uint64_t* discarded_bytes) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  *discarded_bytes = 0;
+  if (!writable_) return Status::ReadOnly;
+  if (!discard_.enabled()) return Status::Unsupported;
+  if (tx_count_ != 0) return Status::Busy;   // (cannot happen between operations)
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();
+  const uint32_t block_bits = block_size_ << 3;
+  bool ok = true;
+  for (uint32_t group = 0; group < group_count_; ++group) {
+    const uint32_t limit = group_bits(group);
+    for (uint32_t pos = 0; pos < limit;) {
+      Status s = load_bitmap(1 + uint64_t{group} * bitmap_per_group_ + pos / block_bits);
+      if (s != Status::Ok) return s;
+      const uint32_t in_block = pos % block_bits;
+      if (bitmap_[in_block >> 3] & (1u << (in_block & 7))) {
+        ++pos;
+        continue;
+      }
+      uint32_t n = 0;
+      s = clear_run(group, pos, limit, limit - pos, &n);
+      if (s != Status::Ok) return s;
+      if (n == 0) break;
+      const uint64_t block = (uint64_t{group} << group_shift_) + pos;
+      ok = discard_.discard_bytes_now(first_block_ * device_block_size_ + (block << block_shift_), uint64_t{n} << block_shift_, device_block_size_,
+                                      discarded_bytes) && ok;
+      pos += n;
+    }
+  }
+  return ok ? Status::Ok : Status::IoError;
 }
 
 Status BefsFileSystem::flush() {

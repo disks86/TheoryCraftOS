@@ -1453,6 +1453,40 @@ Status NtfsFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<I
   return Status::Ok;
 }
 
+Status NtfsFileSystem::send_discards() {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  if (!discard_.has_committed()) return Status::Ok;
+  if (!device_.flush()) return Status::IoError;   // (what freed them must be on the medium first)
+  discard_.issue();
+  return Status::Ok;
+}
+
+void NtfsFileSystem::send_discards_if_due() {
+  if (discard_.wants_issue() && device_.flush()) discard_.issue();
+}
+
+// fstrim: the runs of clear bits in $Bitmap, after the device flush that makes every free so far durable.
+Status NtfsFileSystem::trim(StringView, uint64_t* discarded_bytes) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  *discarded_bytes = 0;
+  if (!writable_) return Status::ReadOnly;
+  if (!discard_.enabled()) return Status::Unsupported;
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();
+  bool ok = true;
+  for (uint64_t pos = 0; pos < cluster_count_;) {
+    uint64_t free = 0, used = 0;
+    Status s = bitmap_scan(pos, cluster_count_, false, &free);
+    if (s != Status::Ok) return s;
+    if (free >= cluster_count_) break;
+    s = bitmap_scan(free, cluster_count_, true, &used);
+    if (s != Status::Ok) return s;
+    ok = discard_.discard_bytes_now(first_block_ * block_size_ + free * cluster_bytes_, (used - free) * cluster_bytes_, block_size_, discarded_bytes) && ok;
+    pos = used;
+  }
+  return ok ? Status::Ok : Status::IoError;
+}
+
 Status NtfsFileSystem::flush() {
   kernel::ScopedRecursiveMutex lock(mutex_);
   if (dirty_set_) {

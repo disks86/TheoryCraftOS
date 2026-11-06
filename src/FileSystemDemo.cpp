@@ -50,8 +50,9 @@ bool check_discard(IFileSystem& fs, IStorageDevice& volume) {
     for (uint64_t at = 0; ok && at < kBytes; at += sizeof chunk) ok = f->write(at, ConstByteView(chunk), &done) == Status::Ok && done == sizeof chunk;
   }
   ok = ok && fs.flush() == Status::Ok;
+  // Deleted, then sent without a flush (as the file system service does every few seconds).
   const StorageStatistics before = volume.statistics();
-  ok = ok && fs.remove("/DISCARD.TMP") == Status::Ok && fs.flush() == Status::Ok;
+  ok = ok && fs.remove("/DISCARD.TMP") == Status::Ok && fs.send_discards() == Status::Ok;
   const StorageStatistics after = volume.statistics();
   const uint64_t blocks = after.blocks_discarded - before.blocks_discarded;
   ok = ok && blocks * volume.info().block_size >= kBytes / 2;   // (most of it: clusters at the edges of a run may share a device block)
@@ -60,7 +61,15 @@ bool check_discard(IFileSystem& fs, IStorageDevice& volume) {
   console::puts(" blocks in ");
   console::put_dec(after.discards - before.discards);
   console::puts(ok ? " requests: ok\n" : " requests: FAILED\n");
-  return ok;
+  // fstrim: the whole free space, and the marker still reads.
+  uint64_t trimmed = 0;
+  const Status trim = fs.trim("/", &trimmed);
+  const bool marker_ok = fs.open_file("/TCOSSCR.TXT", OpenMode::Read, &marker) == Status::Ok && marker && marker->size() > 0;
+  const bool trim_ok = trim == Status::Ok && trimmed >= fs.info().free_bytes / 2 && marker_ok;
+  console::puts("      fstrim: ");
+  console::put_dec(trimmed >> 20);
+  console::puts(trim_ok ? " MiB of free space discarded: ok\n" : " MiB of free space discarded: FAILED\n");
+  return ok && trim_ok;
 }
 
 // Mounts `volume` as FAT and shows what is on it. False on a device/memory failure.

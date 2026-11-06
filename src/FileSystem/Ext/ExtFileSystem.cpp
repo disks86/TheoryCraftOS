@@ -983,6 +983,50 @@ Status ExtFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<IF
   return Status::Ok;
 }
 
+Status ExtFileSystem::send_discards() {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  if (!discard_.has_committed()) return Status::Ok;
+  if (!device_.flush()) return Status::IoError;   // (what freed them must be on the medium first)
+  discard_.issue();
+  return Status::Ok;
+}
+
+void ExtFileSystem::send_discards_if_due() {
+  if (discard_.wants_issue() && device_.flush()) discard_.issue();
+}
+
+// fstrim: the runs of clear bits in every group's block bitmap, after the device flush that makes every free so far durable.
+Status ExtFileSystem::trim(StringView, uint64_t* discarded_bytes) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  *discarded_bytes = 0;
+  if (!writable_) return Status::ReadOnly;
+  if (!discard_.enabled()) return Status::Unsupported;
+  Status s = flush_frees();
+  if (s != Status::Ok) return s;
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();
+  ByteBuffer bitmap(allocator_);
+  bool ok = true;
+  for (uint32_t group = 0; group < group_count_; ++group) {
+    if (gd_free_blocks(group) == 0) continue;
+    s = load_block_bitmap(group, &bitmap);
+    if (s != Status::Ok) return s;
+    const uint64_t count = group_block_count(group), first = group_first_block(group);
+    for (uint64_t index = 0; index < count;) {
+      if (bit_test(bitmap.view(), index)) {
+        ++index;
+        continue;
+      }
+      uint64_t length = 1;
+      while (index + length < count && !bit_test(bitmap.view(), index + length)) ++length;
+      ok = discard_.discard_bytes_now(first_block_ * device_block_size_ + (first + index) * block_size_, length * block_size_, device_block_size_,
+                                      discarded_bytes) && ok;
+      index += length;
+    }
+  }
+  return ok ? Status::Ok : Status::IoError;
+}
+
 Status ExtFileSystem::flush() {
   kernel::ScopedRecursiveMutex lock(mutex_);
   if (dirty_set_) {

@@ -63,7 +63,7 @@ class SystemFileSystem {
   // service if that is busy.
   enum class EjectStatus : uint8_t { Ok, NotFound, NotEjectable, InUse, Failed };
   EjectStatus eject(StringView volume, bool force = false);
-  // Runs poll() every 250 ms on a thread of its own ("hotplug").
+  // Runs poll() every 250 ms on a thread of its own ("hotplug"), and every 5 s sends the volumes' freed blocks to their devices as discards.
   bool start_service();
   void stop_service();
 

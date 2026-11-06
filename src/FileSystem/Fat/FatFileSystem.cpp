@@ -720,6 +720,53 @@ Status FatFileSystem::flush() {
   return Status::Ok;
 }
 
+
+Status FatFileSystem::send_discards() {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  if (!discard_.has_committed()) return Status::Ok;
+  if (!device_.flush()) return Status::IoError;   // (what freed them must be on the medium first)
+  discard_.issue();
+  return Status::Ok;
+}
+
+void FatFileSystem::send_discards_if_due() {
+  if (discard_.wants_issue() && device_.flush()) discard_.issue();
+}
+
+// fstrim: the runs of free clusters (FAT entry 0), after the device flush that makes every free so far durable.
+Status FatFileSystem::trim(StringView, uint64_t* discarded_bytes) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  *discarded_bytes = 0;
+  if (read_only_) return Status::ReadOnly;
+  if (!discard_.enabled()) return Status::Unsupported;
+  if (!device_.flush()) return Status::IoError;
+  discard_.issue();
+  uint32_t run_first = 0, run_length = 0;
+  bool ok = true;
+  auto end_run = [&] {
+    if (run_length)
+      ok = discard_.discard_bytes_now(first_block_ * block_size_ + cluster_offset(run_first), uint64_t{run_length} * cluster_bytes_, block_size_,
+                                      discarded_bytes) && ok;
+    run_length = 0;
+  };
+  for (uint32_t c = 2; c < cluster_count_ + 2; ++c) {
+    uint32_t value = 0;
+    const Status s = get_fat(c, &value);
+    if (s != Status::Ok) return s;
+    if (value != 0) {
+      end_run();
+    } else if (run_length && c == run_first + run_length) {
+      ++run_length;
+    } else {
+      end_run();
+      run_first = c;
+      run_length = 1;
+    }
+  }
+  end_run();
+  return ok ? Status::Ok : Status::IoError;
+}
+
 Status FatFileSystem::write_bytes(uint64_t offset, ConstByteView data) {
   if (read_only_) return Status::ReadOnly;
   uint64_t absolute = first_block_ * block_size_ + offset;
@@ -841,6 +888,7 @@ Status FatFileSystem::free_chain(uint32_t first) {
     c = next;
   }
   end_run();
+  send_discards_if_due();
   return Status::Ok;
 }
 

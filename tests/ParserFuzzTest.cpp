@@ -79,6 +79,17 @@ int main() {
     if (found != 1 || out[0].endpoint_address != 0x81 || out[0].report_descriptor_length != 63) { puts("FAILED: sample configuration not understood"); return 1; } }
   HidPointerLayout sample;
   if (!parse_hid_pointer(ConstByteView(hid.data(), hid.size()), &sample) || !sample.x.relative) { puts("FAILED: sample report descriptor not understood"); return 1; }
+  {  // UNMAP and the provisioning pages, exact values
+    uint8_t cdb[10], parameters[24];
+    if (!scsi::build_unmap(ByteView(cdb), ByteView(parameters), 0x123456789Aull, 77) || cdb[0] != 0x42 || cdb[8] != 24 || parameters[1] != 22 ||
+        parameters[3] != 16 || parameters[11] != 0x12 || parameters[15] != 0x9A || parameters[19] != 77) { puts("FAILED: UNMAP layout"); return 1; }
+    uint8_t lbp[8] = {0, 0xB2, 0, 4, 0, 0x80, 0, 0}, limits[64] = {0, 0xB0};
+    limits[23] = 0x40;
+    limits[27] = 1;
+    uint32_t blocks = 0, descriptors = 0;
+    if (!scsi::parse_lbp_vpd_unmap(ConstByteView(lbp)) || !scsi::parse_block_limits(ConstByteView(limits), &blocks, &descriptors) || blocks != 0x40 ||
+        descriptors != 1 || scsi::parse_lbp_vpd_unmap(ConstByteView(lbp).first(5))) { puts("FAILED: provisioning pages"); return 1; }
+  }
 
   for (int round = 0; round < 40000; ++round) {
     // truncations at every length, byte flips, junk, and lengths that lie
@@ -101,9 +112,14 @@ int main() {
     (void)scsi::parse_inquiry(ConstByteView(s.data(), s.size()), &inquiry);
     (void)scsi::parse_capacity10(ConstByteView(s.data(), s.size()), &last, &block);
     (void)scsi::parse_capacity16(ConstByteView(s.data(), s.size()), &last, &block);
+    uint32_t unmap_blocks, unmap_descriptors;
+    (void)scsi::capacity16_thin_provisioned(ConstByteView(s.data(), s.size()));
+    (void)scsi::parse_lbp_vpd_unmap(ConstByteView(s.data(), s.size()));
+    (void)scsi::parse_block_limits(ConstByteView(s.data(), s.size()), &unmap_blocks, &unmap_descriptors);
     char text[1 + rnd() % 45];
     copy_device_string(ArrayView<char>(text, sizeof(text)), ConstByteView(s.data(), s.size()), rnd() & 1);
     uint8_t cdb[16]; (void)scsi::build_read_write(ByteView(cdb), rnd() & 1, ((uint64_t)rnd() << 32) | rnd(), rnd() % 70000);
+    uint8_t parameters[24]; (void)scsi::build_unmap(ByteView(cdb), ByteView(parameters), ((uint64_t)rnd() << 32) | rnd(), rnd());
     ++cases;
   }
   printf("parser fuzz: %llu hostile inputs survived\n", (unsigned long long)cases);
