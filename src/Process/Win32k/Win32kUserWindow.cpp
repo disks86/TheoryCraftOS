@@ -247,6 +247,7 @@ uint64_t nt_create_window_ex(Call& call) {
     owner = parent;
     while (owner->parent && owner->parent->parent && (owner->style & wn::WS_CHILD)) owner = owner->parent;      // the owner is a top-level window
     if (owner->style & wn::WS_CHILD) owner = nullptr;
+    if (owner == desktop->root) owner = nullptr;      // (owned by the desktop: not owned)
     parent = desktop->root;
   }
   if (!parent) parent = desktop->root;
@@ -663,10 +664,10 @@ uint64_t set_long_step(Call& call, Op& op) {
       case wn::GWL_USERDATA: w->userdata = value; break;
       case wn::GWL_HWNDPARENT: {
         Window* np = value ? find_window(uint32_t(value)) : nullptr;
-        if (w->style & wn::WS_CHILD) {
-          if (np && np != w && !is_child_of(w, np)) { unlink_window(w); link_window(w, np, nullptr, false); }
-        } else {
-          w->owner = np && np != w && !is_child_of(w, np) ? top_level_of(np) : nullptr;
+        if (w->parent && w->parent != w->desktop->root) {      // a window inside another: the parent changes
+          if (np && np != w && !is_child_of(w, np)) { { unlink_window(w); link_window(w, np, nullptr, false); } }
+        } else if (!value || np) {      // a window on the desktop: the owner changes (to the window as given, even a child)
+          if (!np || (np != w && !is_child_of(w, np) && np != w->desktop->root)) w->owner = np;
         }
         break;
       }
