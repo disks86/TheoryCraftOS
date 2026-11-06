@@ -138,6 +138,24 @@ void Mutex::lock() {
 bool Mutex::try_lock() { return !__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE); }
 void Mutex::unlock() { __atomic_store_n(&state_, 0u, __ATOMIC_RELEASE); }
 
+// A condition variable that polls: the wait list's lock word counts notifications here (nothing else takes this list's lock on the host). A waiter reads the count
+// while it still holds the mutex, so a notification sent after it let go is not missed.
+bool ConditionVariable::wait(Mutex& mutex, uint64_t timeout_us) {
+  const uint32_t seen = __atomic_load_n(&list_.lock, __ATOMIC_ACQUIRE);
+  mutex.unlock();
+  const uint64_t start = now_us();
+  bool notified = false;
+  for (;;) {
+    if (__atomic_load_n(&list_.lock, __ATOMIC_ACQUIRE) != seen) { notified = true; break; }
+    if (timeout_us && now_us() - start >= timeout_us) break;
+    nap();
+  }
+  mutex.lock();
+  return notified;
+}
+void ConditionVariable::notify_one() { __atomic_fetch_add(&list_.lock, 1u, __ATOMIC_ACQ_REL); }      // (wakes every waiter: allowed, waits may end spuriously)
+void ConditionVariable::notify_all() { __atomic_fetch_add(&list_.lock, 1u, __ATOMIC_ACQ_REL); }
+
 void Semaphore::acquire() { acquire_for(0); }
 bool Semaphore::try_acquire() {
   uint32_t c = __atomic_load_n(&count_, __ATOMIC_ACQUIRE);

@@ -556,7 +556,7 @@ static void test_desktop_threads() {
     };
     press(42, 752);  // Start
     CHECK(wait_until(d, 3000000, [](desktop::Desktop& x) { return x.start_button().open(); }));
-    press(40, 724);  // Shut Down...
+    press(40, 696);  // Shut Down... (the last row, above the menu's search box: 736 - 28 - 2 - 20 / 2)
     CHECK(wait_until(d, 3000000, [](desktop::Desktop& x) { return x.shutdown_dialog().showing(); }));
     CHECK(!d.shutdown_requested());
     // The answer comes back from the handler thread.
