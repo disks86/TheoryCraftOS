@@ -31,10 +31,16 @@ class SystemCpu {
   explicit SystemCpu(efi::SystemTable* st);
 
   ICentralProcessingUnit& cpu() { return *active_; }
+  // What CPUID said: an AuthenticAMD part and its family/model (folded with the extended fields), for the platform catalogues.
+  bool amd() const { return amd_; }
+  uint32_t family() const { return family_; }
+  uint32_t model() const { return model_; }
 
  private:
   alignas(16) unsigned char storage_[sizeof(X86_64Cpu)];
   ICentralProcessingUnit* active_;
+  bool amd_ = false;
+  uint32_t family_ = 0, model_ = 0;
 };
 
 }  // namespace hardware
