@@ -233,12 +233,21 @@ static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, ui
 
 // VDENC_CMD3 and the 20-dword VDENC_AVC_IMG_STATE of Arc (tools/gen_intel_avc_xehpg.py: the tables of the media driver's Xe_HPM interface).
 static void xe_hpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, uint32_t qp) {
-  const uint32_t q = qp < 10 ? 0 : qp > 51 ? 41 : qp - 10;
-  const uint32_t* cmd3 = (p.p_picture ? kXeHpgAvcVdencCmd3TableP : kXeHpgAvcVdencCmd3TableI) + q * kXeHpgAvcVdencCmd3Dwords;
+  // The quantiser the driver looks up in CMD3: with B pictures below 1920x1080 it raises it above QP 31 (P by 1, B by 2); the table rows are those of the picture type (a stream
+  // with B pictures: P type 1, non-reference B type 3).
+  uint32_t looked_up = qp < 10 ? 10 : qp > 51 ? 51 : qp;
+  if (p.b_mode && looked_up >= 32 && p.width_mbs * 16 < 1920 && p.height_mbs * 16 < 1080) looked_up = looked_up + (p.b_picture ? 2 : p.p_picture ? 1 : 0) > 51 ? 51 : looked_up + (p.b_picture ? 2 : p.p_picture ? 1 : 0);
+  const uint32_t q = looked_up - 10;
+  const uint32_t* cmd3 = (p.b_mode ? (p.b_picture ? kXeHpgAvcVdencCmd3WithBB : p.p_picture ? kXeHpgAvcVdencCmd3WithBP : kXeHpgAvcVdencCmd3TableI) : (p.p_picture ? kXeHpgAvcVdencCmd3TableP : kXeHpgAvcVdencCmd3TableI)) + q * kXeHpgAvcVdencCmd3Dwords;
   for (uint32_t i = 0; i < kXeHpgAvcVdencCmd3Dwords; ++i) w.emit(cmd3[i]);
-  Command<kXeHpgAvcVdencImgStateDwords> c(p.p_picture ? kXeHpgAvcVdencImgStateP : kXeHpgAvcVdencImgStateI);
+  Command<kXeHpgAvcVdencImgStateDwords> c(p.b_picture ? kXeHpgAvcVdencImgStateB : p.p_picture ? kXeHpgAvcVdencImgStateP : kXeHpgAvcVdencImgStateI);
   c.raw(8, (c.get(8) & 0xffff) | kXeHpgAvcVdencImgStateLevelDword8[p.level_idc > 52 ? 52 : p.level_idc]);
-  c.set(kXeHpgAvcVdencImgState_PictureType, p.p_picture ? 1 : 0);
+  c.set(kXeHpgAvcVdencImgState_PictureType, p.b_picture ? 2 : p.p_picture ? 1 : 0);
+  if (p.b_picture) {
+    c.set(kXeHpgAvcVdencImgState_colloc_mv_rd_en, 1);
+    c.set(kXeHpgAvcVdencImgState_BidirectionalWeight, 0x20);
+  }
+  if (p.b_mode && p.p_picture && !p.b_picture) c.set(kXeHpgAvcVdencImgState_colloc_mv_wr_en, 1);
   c.set(kXeHpgAvcVdencImgState_Transform8X8Flag, 0);
   c.set(kXeHpgAvcVdencImgState_SubpelMode, 3);
   c.set(kXeHpgAvcVdencImgState_PictureWidth, p.width_mbs);
@@ -254,6 +263,10 @@ static void xe_hpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, ui
     c.set(kXeHpgAvcVdencImgState_FwdRefIdx1ReferencePicture, 0xf);
     c.set(kXeHpgAvcVdencImgState_FwdRefIdx2ReferencePicture, 0xf);
     c.set(kXeHpgAvcVdencImgState_PocNumberForFwdRef0, p.reference_poc & 0xFF);
+  }
+  if (p.b_picture) {
+    c.set(kXeHpgAvcVdencImgState_BwdRefIdx0ReferencePicture, p.backward_reference_frame_store);
+    c.set(kXeHpgAvcVdencImgState_PocNumberForBwdRef0, p.backward_poc & 0xFF);
   }
   c.emit(w);
 }

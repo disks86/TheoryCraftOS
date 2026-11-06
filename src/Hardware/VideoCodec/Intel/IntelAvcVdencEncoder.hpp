@@ -37,7 +37,7 @@ namespace hardware {
 // Baseline-profile I and P pictures, one slice, one reference picture, the quantiser fixed from the quality (CQP): quality 1 .. 100 maps to QP 51 .. 15 (75 is QP 24). A keyframe is
 // an IDR picture preceded by the parameter sets; `keyframe_interval` pictures make a group (0 or 1: every picture is a keyframe). Nothing is held back.
 //
-// With EncoderConfig::b_frames = 1 on Meteor Lake, Arrow Lake, Lunar Lake and Arc Battlemage (the other engines code I and P pictures only, as above) the stream is Main profile
+// With EncoderConfig::b_frames = 1 on Meteor Lake, Arrow Lake, Arc Alchemist, Lunar Lake and Arc Battlemage (the other engines code I and P pictures only, as above) the stream is Main profile
 // with a non-reference B picture between each two anchors: I B P B P ... in display order, I P B P B in decoding order. The first picture of a pair waits for the next
 // one (submit() produces no packet), which is coded first as a P picture, then the B picture between it and the previous anchor follows (two packets). A keyframe or flush() turns
 // a waiting picture into a P picture. The B pictures use spatial direct prediction.

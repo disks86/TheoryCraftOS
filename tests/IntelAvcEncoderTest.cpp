@@ -165,7 +165,7 @@ struct FakeEncoder {
     for (int k = 0; k < 4; ++k) expect(kHMfxQm, 18, "MFX_QM_STATE");
     for (int k = 0; k < 4; ++k) expect(kHMfxFqm, 34, "MFX_FQM_STATE");
     // B pictures (Xe-LPG and Xe2): the picture type of the image state is 2, and the direct mode state follows the matrices.
-    const bool b_picture = newer && !xe_hpg && field(vimg[1], 2, 3) == 2;
+    const bool b_picture = newer && field(vimg[1], 2, 3) == 2;
     const uint32_t* direct = nullptr;
     if (b_picture) {
       direct = expect(intel_mfx::kMfxAvcDirectmodeState & 0xFFFF0000u, 71, "MFX_AVC_DIRECTMODE_STATE");
@@ -181,7 +181,7 @@ struct FakeEncoder {
     if (newer) {
       // Xe-LPG's fields are narrower than Arc's (the same bits, one used as nine, the other as sixteen).
       if (field(vimg[3], 16, xe_hpg ? 31 : 24) != mbs_w || field(vimg[3], 0, xe_hpg ? 15 : 7) + 1 != mbs_h) problem("VDEnc image state size");
-      p_picture = field(vimg[1], 2, 3) == 1 || b_picture;
+      p_picture = field(vimg[1], 2, 3) == 1 || b_picture;   // (Arc's picture type field is in the same place)
       qp = field(vimg[14], 0, 7);
       if (field(vimg[14], 8, 15) != 0 || field(vimg[12], 0, 15) != 0x330A) problem("image state quantiser limits");
     } else {
@@ -307,8 +307,8 @@ struct FakeEncoder {
       // The direct mode state names the pictures' orders: this one between its references.
       const uint32_t cur_poc = direct[69], fwd_poc = direct[37 + 2 * ((ref_entry >> 1) & 0xF)], bwd_poc = direct[37 + 2 * back_store];
       if (direct[70] != cur_poc || !(fwd_poc < cur_poc && cur_poc < bwd_poc)) problem("direct mode picture order counts");
-      if (field(vimg[15], 8, 15) != (cur_poc & 0xFF) || field(vimg[16], 8, 15) != (fwd_poc & 0xFF) || field(vimg[19], 8, 15) != (bwd_poc & 0xFF)) problem("image state picture order counts");
-    } else if (newer && !xe_hpg && p_picture && field(vimg[1], 5, 5) == 1) {
+      if (field(vimg[xe_hpg ? 15 : 15], 8, 15) != (cur_poc & 0xFF) || field(vimg[16], 8, 15) != (fwd_poc & 0xFF) || field(vimg[19], 8, 15) != (bwd_poc & 0xFF)) problem("image state picture order counts");
+    } else if (newer && p_picture && field(vimg[1], 5, 5) == 1) {
       mapped(vbuf[83], (width_mbs_for_mv(width)) * mbs_h * 32, "colocated motion vectors written by a P picture");
     }
     const uint32_t bitstream = ind[21];
@@ -500,10 +500,11 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
 
 // Streams with B pictures (EncoderConfig::b_frames = 1): I B P B P in display order, coded I P B P B. Every submitted picture comes out as one packet, in decoding order, the B
 // packets with the earlier times; the CPU decodes the stream and shows the pictures in display order.
-void encode_and_check_b(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, int xe2) {
-  printf("  %ux%u, %u pictures with B pictures, keyframe interval %u%s\n", w, h, count, interval, xe2 == 2 ? " (Battlemage)" : xe2 == 1 ? " (Lunar Lake)" : " (Xe-LPG)");
+void encode_and_check_b(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, int xe2, bool arc = false) {
+  printf("  %ux%u, %u pictures with B pictures, keyframe interval %u%s\n", w, h, count, interval, arc ? " (Arc)" : xe2 == 2 ? " (Battlemage)" : xe2 == 1 ? " (Lunar Lake)" : " (Xe-LPG)");
   Rig2 rig(Generation::Gen12);
-  rig.engine.xe_lpg = true;
+  rig.engine.xe_lpg = !arc;
+  rig.engine.xe_hpg = arc;
   rig.engine.xe2 = xe2;
   rig.gpu.xehp = true;
   EncoderConfig cfg;
@@ -531,8 +532,9 @@ void encode_and_check_b(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count
   {
     VcsDriver driver(rig.mem);
     VcsDriver::Config driver_config = rig.config();
-    driver_config.xe_lpg = xe2 == 0;
-    driver_config.gmd_id_flush = xe2 == 0;
+    driver_config.xe_lpg = xe2 == 0 && !arc;
+    driver_config.xe_hpg = arc;
+    driver_config.gmd_id_flush = xe2 == 0 && !arc;
     driver_config.xe2 = xe2 != 0;
     driver_config.xe2_hpm = xe2 == 2;
     CHECK(driver.initialize(driver_config));
@@ -820,6 +822,9 @@ int main() {
     encode_and_check_b(a, 96, 64, 9, 5, x2);
     encode_and_check_b(a, 64, 48, 2, 8, x2);   // a picture that never gets a later anchor
   }
+  encode_and_check_b(a, 64, 48, 8, 8, 0, true);   // Arc Alchemist
+  encode_and_check_b(a, 96, 64, 9, 5, 0, true);
+  encode_and_check_b(a, 1920, 1088, 4, 4, 0, true);   // the size above which CMD3 is looked up unchanged
   test_rejections(a);
   test_hang(a);
   test_device(a);

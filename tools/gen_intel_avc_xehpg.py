@@ -97,6 +97,16 @@ def main():
             words += row
         o += ['', '// VDENC_CMD3, 23 dwords for each quantiser %d .. %d, %s pictures' % (QPS[0], QPS[-1], tn), emit_array('kXeHpgAvcVdencCmd3Table%s' % tn, words)]
     o += ['', 'constexpr uint32_t kXeHpgAvcVdencCmd3Dwords = 23;']
+    # With B pictures (a GOP without the I-P-only simplification): P pictures use CMD3 type 1 instead of 2 (the "IP GOP" row), non-reference B pictures type 3; the image state row of
+    # a non-reference B picture is type 2. The quantiser the driver looks up is raised for pictures under 1920x1080 above QP 31 (by 1 for P, 2 for B), so the rows up to 51 are needed.
+    for tn, t in (('P', 1), ('B', 3)):
+        words = []
+        for qp in QPS:
+            words += [ctor['CMD3'][0]] + cmd3_row(t, qp)
+        o += ['', '// VDENC_CMD3 with B pictures, %s pictures, 23 dwords per quantiser %d .. %d' % (tn, QPS[0], QPS[-1]), emit_array('kXeHpgAvcVdencCmd3WithB%s' % tn, words)]
+    row = [ctor['IMG'][0]] + img_row(6, 2)
+    row[8] = row[8] & 0xffff
+    o += ['', '// VDENC_AVC_IMG_STATE of a non-reference B picture at target usage 7 (dword 8 as above)', emit_array('kXeHpgAvcVdencImgStateB', row)]
     # VDENC_AVC_IMG_STATE: the table row is dwords 1 .. 19; the driver then sets named fields (the encoder does, with the same field map) and ORs dword 8 by level.
     for tn, t in (('I', 0), ('P', 1)):
         row = [ctor['IMG'][0]] + img_row(6, t)
