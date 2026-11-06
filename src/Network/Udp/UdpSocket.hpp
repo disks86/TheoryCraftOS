@@ -31,8 +31,8 @@ class UdpSocket final : public IUdpSocket {
   static constexpr uint32_t kMaxDatagram = kMaxIpPayload - 8;  // 1472: IP payload minus the UDP header
   static constexpr uint32_t kQueueLimit = 32;
 
-  UdpSocket(IIpLayer& ip, allocators::IAllocator& allocator, uint16_t port)
-      : ip_(ip), port_(port), queue_(allocator) {}
+  UdpSocket(IIpLayer& ip, allocators::IAllocator& allocator, uint16_t port, IpFamilies families = IpFamilies::Both)
+      : ip_(ip), port_(port), families_(families), queue_(allocator) {}
 
   uint16_t local_port() const override { return port_; }  // fixed at creation
   bool send_to(Ipv4Address address, uint16_t port, ConstByteView data) override;
@@ -49,6 +49,7 @@ class UdpSocket final : public IUdpSocket {
   // The UDP manager hands arriving datagrams in here.
   void deliver(const IpAddress& from_address, uint16_t from_port, ConstByteView data);
   bool closed() const { return closed_; }
+  IpFamilies families() const { return families_; }  // whose datagrams it takes
 
  private:
   struct Datagram {
@@ -60,6 +61,7 @@ class UdpSocket final : public IUdpSocket {
 
   IIpLayer& ip_;
   uint16_t port_;
+  IpFamilies families_;
   bool closed_ = false;
   Queue<Datagram> queue_;
 };

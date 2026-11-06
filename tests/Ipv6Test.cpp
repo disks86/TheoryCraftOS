@@ -25,65 +25,7 @@ static void store16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
-typedef std::vector<uint8_t> Bytes;
-
-static Ipv6Address v6(const char* text) {
-  Ipv6Address a{};
-  const bool ok = parse_ipv6(StringView(text), &a);
-  if (!ok) { printf("bad test address %s\n", text); abort(); }
-  return a;
-}
-static std::string text(const Ipv6Address& a) {
-  char buffer[48];
-  format_ipv6(a, ArrayView<char>(buffer));
-  return buffer;
-}
-
-// An Ethernet frame with an IPv6 packet: `payload` after the 40-byte header, ICMPv6 checksums filled in.
-static Bytes ipv6_frame(const uint8_t (&dst_mac)[6], const uint8_t (&src_mac)[6], const Ipv6Address& src, const Ipv6Address& dst, uint8_t next,
-                        uint8_t hop_limit, Bytes payload) {
-  if (next == 58 && payload.size() >= 4) {
-    payload[2] = payload[3] = 0;
-    const uint16_t sum = checksum_finish(checksum_add(pseudo_header_sum(src, dst, 58, (uint32_t)payload.size()), ConstByteView(payload.data(), payload.size())));
-    payload[2] = (uint8_t)(sum >> 8);
-    payload[3] = (uint8_t)sum;
-  }
-  Bytes f(14 + 40);
-  memcpy(&f[0], dst_mac, 6);
-  memcpy(&f[6], src_mac, 6);
-  f[12] = 0x86; f[13] = 0xDD;
-  f[14] = 0x60;
-  store16(&f[18], (uint16_t)payload.size());
-  f[20] = next; f[21] = hop_limit;
-  memcpy(&f[22], src.bytes, 16);
-  memcpy(&f[38], dst.bytes, 16);
-  f.insert(f.end(), payload.begin(), payload.end());
-  return f;
-}
-
-static const uint8_t kRouterMac[6] = {0x02, 0xAA, 0, 0, 0, 0x01};
-static const uint8_t kAllNodesMac[6] = {0x33, 0x33, 0, 0, 0, 1};
-
-// A router advertisement from fe80::1: lifetime, an autonomous on-link /64 `prefix`, an MTU, a DNS server.
-static Bytes router_advertisement(const Ipv6Address& prefix, uint16_t router_lifetime, uint32_t valid = 86400, uint8_t hop_limit = 255,
-                                  bool autonomous = true, uint8_t prefix_length = 64) {
-  Bytes m = {134, 0, 0, 0, 64, 0, (uint8_t)(router_lifetime >> 8), (uint8_t)router_lifetime, 0, 0, 0, 0, 0, 0, 0, 0};
-  const uint8_t slla[8] = {1, 1, kRouterMac[0], kRouterMac[1], kRouterMac[2], kRouterMac[3], kRouterMac[4], kRouterMac[5]};
-  m.insert(m.end(), slla, slla + 8);
-  Bytes pi = {3, 4, prefix_length, (uint8_t)(0x80 | (autonomous ? 0x40 : 0))};
-  for (int i = 3; i >= 0; --i) pi.push_back((uint8_t)(valid >> (8 * i)));
-  for (int i = 3; i >= 0; --i) pi.push_back((uint8_t)((valid / 2) >> (8 * i)));
-  pi.insert(pi.end(), 4, 0);
-  pi.insert(pi.end(), prefix.bytes, prefix.bytes + 16);
-  m.insert(m.end(), pi.begin(), pi.end());
-  const uint8_t mtu[8] = {5, 1, 0, 0, 0, 0, 0x05, 0xDC};
-  m.insert(m.end(), mtu, mtu + 8);
-  Bytes rdnss = {25, 3, 0, 0, 0, 0, 0x0E, 0x10};
-  const Ipv6Address dns = v6("2001:db8:1::53");
-  rdnss.insert(rdnss.end(), dns.bytes, dns.bytes + 16);
-  m.insert(m.end(), rdnss.begin(), rdnss.end());
-  return ipv6_frame(kAllNodesMac, kRouterMac, v6("fe80::1"), kIpv6AllNodes, 58, hop_limit, m);
-}
+#include "Ipv6Harness.hpp"
 
 static void step_until(Lan& lan, const std::function<bool()>& done, int max_ms) { lan.run_until(done, max_ms); }
 

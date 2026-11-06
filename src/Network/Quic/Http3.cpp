@@ -73,7 +73,7 @@ Http3Exchange::Http3Exchange(INetworkStack& stack, allocators::IAllocator& alloc
       scratch_(allocator),
       body_(allocator) {}
 
-bool Http3Exchange::start(Ipv4Address address, uint16_t port, StringView server_name, const h3::HeaderList& request, ConstByteView body) {
+bool Http3Exchange::start(const IpAddress& address, uint16_t port, StringView server_name, const h3::HeaderList& request, ConstByteView body) {
   request_head_.clear();
   ByteBuffer block(allocator_);
   if (!h3::qpack_encode(request, &block)) {

@@ -21,27 +21,27 @@
 
 namespace network {
 
-bool UdpManager::port_in_use(uint16_t port) const {
+bool UdpManager::port_in_use(uint16_t port, IpFamilies families) const {
   const uint64_t count = sockets_.count();
   for (uint64_t i = count; i > 0; --i) {
     const SharedPointer<UdpSocket>& s = sockets_[i - 1];
-    if (s->local_port() == port && !s->closed()) return true;
+    if (s->local_port() == port && !s->closed() && families_overlap(s->families(), families)) return true;
   }
   return false;
 }
 
-SharedPointer<UdpSocket> UdpManager::open(uint16_t port) {
+SharedPointer<UdpSocket> UdpManager::open(uint16_t port, IpFamilies families) {
   if (port == 0) {
     for (uint32_t tries = 0; tries < 16384 && port == 0; ++tries) {
       const uint16_t candidate = next_ephemeral_;
       next_ephemeral_ = next_ephemeral_ == 65535 ? 49152 : next_ephemeral_ + 1;
-      if (!port_in_use(candidate)) port = candidate;
+      if (!port_in_use(candidate, IpFamilies::Both)) port = candidate;  // (an ephemeral port is free for both versions)
     }
     if (port == 0) return SharedPointer<UdpSocket>();
-  } else if (port_in_use(port)) {
+  } else if (port_in_use(port, families)) {
     return SharedPointer<UdpSocket>();
   }
-  SharedPointer<UdpSocket> socket = SharedPointer<UdpSocket>::make(allocator_, ip_, allocator_, port);
+  SharedPointer<UdpSocket> socket = SharedPointer<UdpSocket>::make(allocator_, ip_, allocator_, port, families);
   if (!socket || !sockets_.push_back(socket)) return SharedPointer<UdpSocket>();
   return socket;
 }
@@ -60,7 +60,7 @@ bool UdpManager::handle(const IpAddress& source, const IpAddress& destination, C
     if (checksum_finish(sum) != 0) return false;
   }
   for (SharedPointer<UdpSocket>& s : sockets_) {
-    if (s->local_port() != port || s->closed()) continue;
+    if (s->local_port() != port || s->closed() || !families_take(s->families(), source.v6)) continue;
     s->deliver(source, source_port, datagram.dropped(8));
     return true;
   }

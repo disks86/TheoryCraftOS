@@ -37,11 +37,11 @@ SharedPointer<TcpSocket> TcpManager::spawn(TcpSocket* listener, const IpAddress&
   return child;
 }
 
-bool TcpManager::listening_on(uint16_t port) const {
+bool TcpManager::listening_on(uint16_t port, IpFamilies families) const {
   const uint64_t count = sockets_.count();
   for (uint64_t i = count; i > 0; --i) {
     const SharedPointer<TcpSocket>& s = sockets_[i - 1];
-    if (s->state() == TcpState::Listen && s->local_port() == port) return true;
+    if (s->state() == TcpState::Listen && s->local_port() == port && families_overlap(s->listen_families(), families)) return true;
   }
   return false;
 }
@@ -151,7 +151,7 @@ void TcpManager::handle(const IpAddress& source, const IpAddress& destination, C
     return;
   }
   for (SharedPointer<TcpSocket>& socket : sockets_) {
-    if (socket->state() != TcpState::Listen || socket->local_port() != destination_port) continue;
+    if (socket->state() != TcpState::Listen || socket->local_port() != destination_port || !families_take(socket->listen_families(), source.v6)) continue;
     if (s.flags & tcp_flags::kRst) return;
     if ((s.flags & tcp_flags::kSyn) && !(s.flags & tcp_flags::kAck)) {
       // A full backlog drops the SYN; the client's retransmission tries again later.

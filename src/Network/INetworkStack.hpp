@@ -68,6 +68,10 @@ class INetworkStack {
 
   // A UDP socket bound to `port` (0 picks a free one), or null if the port is taken.
   virtual SharedPointer<IUdpSocket> udp_open(uint16_t port) = 0;
+  // udp_open() for datagrams of the given IP versions only (udp_open() takes both).
+  virtual SharedPointer<IUdpSocket> udp_open_families(uint16_t port, IpFamilies families) {
+    return families == IpFamilies::Both ? udp_open(port) : SharedPointer<IUdpSocket>();
+  }
   // A new, unconnected TCP socket.
   virtual SharedPointer<ITcpSocket> tcp_open() = 0;
 

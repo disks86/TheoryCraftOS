@@ -373,7 +373,7 @@ bool QuicConnection::build_datagram(uint8_t* buffer, uint32_t capacity, uint32_t
 }
 
 bool QuicConnection::send_datagram(ConstByteView datagram) {
-  if (!socket_->send_to(peer_address_, peer_port_, datagram)) return false;
+  if (!socket_->send_to_ip(peer_address_, peer_port_, datagram)) return false;
   stats_.bytes_sent += datagram.size();
   return true;
 }

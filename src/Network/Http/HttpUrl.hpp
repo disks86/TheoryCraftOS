@@ -18,6 +18,7 @@
 
 // http:// and https:// URLs for the HTTP client: taking one apart, and working out where a redirect's Location leads.
 #pragma once
+#include "Network/NetworkTypes.hpp"
 #include "Utility/String.hpp"
 
 namespace network {
@@ -31,18 +32,20 @@ struct HttpUrl {
 
   allocators::IAllocator* allocator_;
   bool https = false;
-  String host;            // as written, without a port; a dotted-quad address is allowed (IPv6 literals are not)
+  String host;            // as written, without a port; a dotted-quad address, or an IPv6 one in brackets ("[2001:db8::1]")
   uint16_t port = 80;     // the default for the scheme if the URL has none
   String path;            // the path and the query, always starting with '/'; the fragment is dropped
 
   bool default_port() const { return port == (https ? 443 : 80); }
+  // The host is an address, not a name: which one.
+  bool literal_address(IpAddress* address) const;
   // "http://host[:port]/path" again.
   bool assign_text(String* out) const;
   bool same_origin(const HttpUrl& other) const { return https == other.https && port == other.port && host.view().equals_ignore_case(other.host.view()); }
 };
 
 // Parses an absolute http or https URL. False for any other scheme, an empty host, a port outside 1..65535, user information
-// ("user:pass@"), an IPv6 literal, a host over 253 characters, or characters that cannot be sent in a request line (controls, blanks,
+// ("user:pass@"), an IPv6 literal that is not a valid one in brackets (or has a zone), a host over 253 characters, or characters that cannot be sent in a request line (controls, blanks,
 // anything but printable ASCII). Memory shortage also fails.
 bool parse_http_url(StringView text, HttpUrl* out);
 

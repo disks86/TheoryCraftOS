@@ -98,9 +98,10 @@ bool verify_digest_signature(const Certificate& signer, bool ecdsa, RsaPadding p
 // Splits a DER ECDSA-Sig-Value into the integers' bytes (without the leading zero a positive INTEGER may carry).
 bool parse_ecdsa_signature(ConstByteView der, ConstByteView* r, ConstByteView* s);
 
-// Does the certificate's subject alternative name cover this DNS name (case-insensitive; "*.example.com" matches one label)? Or this IPv4 address?
+// Does the certificate's subject alternative name cover this DNS name (case-insensitive; "*.example.com" matches one label)? Or this IPv4 or IPv6 address?
 bool certificate_matches_host(const Certificate& cert, const char* name);
 bool certificate_matches_ipv4(const Certificate& cert, uint32_t address);
+bool certificate_matches_ipv6(const Certificate& cert, const uint8_t (&address)[16]);
 
 // Certificates the machine trusts. Entries are DER; add() copies, add_borrowed() keeps pointing at the caller's bytes (a certificate
 // bundle compiled into the program).
@@ -133,6 +134,8 @@ struct VerifyOptions {
   uint64_t now = 0;                 // seconds since 1970; 0 skips the validity check (the machine has no trusted clock)
   const char* hostname = nullptr;   // checked against the leaf's SAN if set
   uint32_t ipv4 = 0;                // or this address, if nonzero and no hostname
+  bool has_ipv6 = false;            // or this one, if set and there is neither of the others
+  uint8_t ipv6[16] = {};
   bool allow_sha1 = false;
   uint32_t min_rsa_bits = 2048;
   uint32_t max_depth = 8;

@@ -69,7 +69,8 @@ class TcpSocket final : public ITcpSocket {
   }
   bool connect(Ipv4Address address, uint16_t port) override { return connect_ip(IpAddress(address), port); }
   bool connect_ip(const IpAddress& address, uint16_t port) override;
-  bool listen(uint16_t port) override;
+  bool listen(uint16_t port) override { return listen_families(port, IpFamilies::Both); }
+  bool listen_families(uint16_t port, IpFamilies families) override;
   SharedPointer<ITcpSocket> accept() override;
   uint32_t send(ConstByteView data) override;
   uint32_t receive(ByteView buffer) override;
@@ -117,6 +118,7 @@ class TcpSocket final : public ITcpSocket {
     return state_ != TcpState::Listen && state_ != TcpState::Closed && local_port_ == local_port &&
            remote_port_ == remote_port && remote_ == remote_address;
   }
+  IpFamilies listen_families() const { return listen_families_; }  // a listener's: whose SYNs it takes
   void on_segment(const TcpSegment& segment);
   void on_timer(uint64_t now);
   // Becomes a connection in SynReceived for a SYN that arrived at `listener`.
@@ -163,6 +165,7 @@ class TcpSocket final : public ITcpSocket {
   ByteView burst_;  // where a large segment is built (allocated when the first one is sent)
   TcpState state_ = TcpState::Closed;
   uint16_t local_port_ = 0;
+  IpFamilies listen_families_ = IpFamilies::Both;
   IpAddress remote_;
   // The largest segment our side takes and sends: what fits a 1500-byte packet after the IP header of the connection's version.
   uint16_t our_mss() const { return static_cast<uint16_t>((remote_.v6 ? kMaxIpv6Payload : kMaxIpPayload) - 20); }

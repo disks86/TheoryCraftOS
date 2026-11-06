@@ -106,9 +106,9 @@ bool NetworkStack::wait_for_address(uint32_t timeout_ms) {
   return true;
 }
 
-SharedPointer<IUdpSocket> NetworkStack::udp_open(uint16_t port) {
+SharedPointer<IUdpSocket> NetworkStack::udp_open_families(uint16_t port, IpFamilies families) {
   kernel::ScopedRecursiveMutex guard(mutex_);
-  return SharedPointer<IUdpSocket>(udp_.open(port));
+  return SharedPointer<IUdpSocket>(udp_.open(port, families));
 }
 
 SharedPointer<ITcpSocket> NetworkStack::tcp_open() {

@@ -39,7 +39,8 @@ class TcpManager {
   // Runs timers, finishes accepted handshakes and forgets sockets that are done.
   void poll();
 
-  bool listening_on(uint16_t port) const;
+  // Some listener on `port` takes connections of one of `families` already.
+  bool listening_on(uint16_t port, IpFamilies families = IpFamilies::Both) const;
   uint16_t allocate_port();
   uint32_t next_initial_sequence();
   // Disowns (and resets) connections spawned by a listener that is going away.

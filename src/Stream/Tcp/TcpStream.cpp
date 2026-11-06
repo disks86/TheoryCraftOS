@@ -36,11 +36,11 @@ bool TcpStream::wait_step(uint64_t deadline_ms) {
   return false;
 }
 
-StreamStatus TcpStream::connect(network::INetworkStack& stack, allocators::IAllocator& allocator, network::Ipv4Address address,
+StreamStatus TcpStream::connect(network::INetworkStack& stack, allocators::IAllocator& allocator, const network::IpAddress& address,
                                 uint16_t port, uint32_t timeout_ms, UniquePointer<IAsyncStream>* result) {
   SharedPointer<network::ITcpSocket> socket = stack.tcp_open();
   if (!socket) return StreamStatus::OutOfMemory;
-  if (!socket->connect(address, port)) return StreamStatus::IoError;
+  if (!socket->connect_ip(address, port)) return StreamStatus::IoError;
   const uint64_t deadline = timeout_ms == kInfiniteTimeout ? ~uint64_t{0} : stack.now_ms() + timeout_ms;
   while (!socket->is_connected()) {
     if (socket->failed() || socket->state() == TcpState::Closed) return StreamStatus::ConnectionLost;
@@ -59,8 +59,8 @@ StreamStatus TcpStream::connect(network::INetworkStack& stack, allocators::IAllo
 
 StreamStatus TcpStream::connect(network::INetworkStack& stack, allocators::IAllocator& allocator, StringView host, uint16_t port,
                                 uint32_t timeout_ms, UniquePointer<IAsyncStream>* result) {
-  network::Ipv4Address address{};
-  if (!stack.resolve(host, timeout_ms == kInfiniteTimeout ? 0xFFFFFFFEu : timeout_ms, &address)) return StreamStatus::HostNotFound;
+  network::IpAddress address;
+  if (!stack.resolve_ip(host, timeout_ms == kInfiniteTimeout ? 0xFFFFFFFEu : timeout_ms, &address, true)) return StreamStatus::HostNotFound;  // (AAAA first where IPv6 reaches)
   return connect(stack, allocator, address, port, timeout_ms, result);
 }
 
@@ -70,11 +70,11 @@ static bool connect_settled(const SharedPointer<network::ITcpSocket>& socket) {
 }
 
 async::Task<StreamStatus> TcpStream::connect_async(network::INetworkStack& stack, allocators::IAllocator& allocator,
-                                                   network::Ipv4Address address, uint16_t port, uint32_t timeout_ms,
+                                                   network::IpAddress address, uint16_t port, uint32_t timeout_ms,
                                                    UniquePointer<IAsyncStream>* result, async::CancellationToken token) {
   SharedPointer<network::ITcpSocket> socket = stack.tcp_open();
   if (!socket) co_return StreamStatus::OutOfMemory;
-  if (!socket->connect(address, port)) co_return StreamStatus::IoError;
+  if (!socket->connect_ip(address, port)) co_return StreamStatus::IoError;
   const bool settled = co_await async::wait_until(
       [&stack, &socket, &token] {
         stack.poll();
@@ -98,18 +98,24 @@ async::Task<StreamStatus> TcpStream::connect_async(network::INetworkStack& stack
 async::Task<StreamStatus> TcpStream::connect_async(network::INetworkStack& stack, allocators::IAllocator& allocator, StringView host,
                                                    uint16_t port, uint32_t timeout_ms, UniquePointer<IAsyncStream>* result,
                                                    async::CancellationToken token) {
+  // Both lookups at once where IPv6 reaches beyond the link (an AAAA answer is preferred), else only the A one.
+  const network::Ipv6Configuration c6 = stack.configuration6();
+  SharedPointer<network::IDnsQuery> query6 = c6.global_ready && !c6.router.is_unspecified() ? stack.dns().query_aaaa(host) : SharedPointer<network::IDnsQuery>();
   SharedPointer<network::IDnsQuery> query = stack.dns().query(host);
-  if (!query) co_return StreamStatus::HostNotFound;
+  if (!query && !query6) co_return StreamStatus::HostNotFound;
+  const auto pending = [](const SharedPointer<network::IDnsQuery>& q) { return q && q->status() == network::DnsStatus::Pending; };
+  const auto resolved = [](const SharedPointer<network::IDnsQuery>& q) { return q && q->status() == network::DnsStatus::Resolved; };
   const bool answered = co_await async::wait_until(
-      [&stack, &query, &token] {
+      [&] {
         stack.poll();
-        return query->status() != network::DnsStatus::Pending || token.cancelled();
+        return resolved(query6) || (!pending(query6) && !pending(query)) || token.cancelled();
       },
       timeout_ms);
   if (!answered) co_return StreamStatus::TimedOut;
   if (token.cancelled()) co_return StreamStatus::Cancelled;
-  if (query->status() != network::DnsStatus::Resolved) co_return StreamStatus::HostNotFound;
-  co_return co_await connect_async(stack, allocator, query->address(), port, timeout_ms, result, token);
+  if (resolved(query6)) co_return co_await connect_async(stack, allocator, query6->ip_address(), port, timeout_ms, result, token);
+  if (!resolved(query)) co_return StreamStatus::HostNotFound;
+  co_return co_await connect_async(stack, allocator, query->ip_address(), port, timeout_ms, result, token);
 }
 
 async::Task<IoResult> TcpStream::on_read_async(ByteView buffer, async::CancellationToken token) {

@@ -195,13 +195,16 @@ void HttpClient::release_socket(bool graceful) {
   }
   socket_ = SharedPointer<ITcpSocket>();
   tls_socket_ = nullptr;
+  if (racer_) racer_->abort();
+  racer_ = SharedPointer<ITcpSocket>();
+  racer_tls_ = nullptr;
   h3_ = UniquePointer<Http3Exchange>();
 }
 
 void HttpClient::fail(HttpError error) {
   if (state_ == HttpState::Failed || state_ == HttpState::Done) return;
   release_socket(false);
-  dns_ = SharedPointer<IDnsQuery>();
+  dns_ = dns6_ = SharedPointer<IDnsQuery>();
   error_ = error;
   state_ = HttpState::Failed;
 }
@@ -326,6 +329,8 @@ bool HttpClient::begin_connection() {
   decoded_ = false;
   sent_ = 0;
   h3_failed_ = h3_used_ = address_ready_ = false;
+  has_fallback_ = fallback_started_ = false;
+  dns_answered_ms_ = 0;
   if (url_.https && !has_tls_) {
     error_ = HttpError::NoTlsConfiguration;
     state_ = HttpState::Failed;
@@ -339,14 +344,16 @@ bool HttpClient::begin_connection() {
   const uint64_t now = stack_.now_ms();
   deadline_ms_ = now + connect_timeout_ms_;
   last_progress_ms_ = now;
-  literal_address_ = parse_ipv4(url_.host.view(), &address_);
+  literal_address_ = url_.literal_address(&address_);
+  dns_ = dns6_ = SharedPointer<IDnsQuery>();
   if (literal_address_) {
     state_ = HttpState::Resolving;   // (poll() opens the connection at once)
-    dns_ = SharedPointer<IDnsQuery>();
     return true;
   }
+  const Ipv6Configuration c6 = stack_.configuration6();
+  if (c6.global_ready && !c6.router.is_unspecified()) dns6_ = stack_.dns().query_aaaa(url_.host.view());
   dns_ = stack_.dns().query(url_.host.view());
-  if (!dns_) {
+  if (!dns_ && !dns6_) {
     error_ = HttpError::Resolve;
     state_ = HttpState::Failed;
     return false;
@@ -392,29 +399,102 @@ bool HttpClient::build_request() {
   return ok;
 }
 
-// Opens the TCP connection (wrapped in TLS for https) to address_. False if the request failed.
-bool HttpClient::open_tcp() {
+// Opens a TCP connection (wrapped in TLS for https) to `address`. None, or why it could not even be started (OutOfMemory, Connect).
+HttpError HttpClient::open_attempt(const IpAddress& address, SharedPointer<ITcpSocket>* socket, TlsSocket** tls) {
+  *tls = nullptr;
   if (url_.https) {
     TlsConfig config = tls_;
     config.server_name = literal_address_ ? nullptr : url_.host.c_str();
     config.alpn = "http/1.1";
     if (session_cache_) config.sessions = session_cache_;
-    SharedPointer<ITcpSocket> socket = SharedPointer<ITcpSocket>::make_as<TlsSocket>(allocator_, stack_, allocator_, config);
-    tls_socket_ = static_cast<TlsSocket*>(socket.get());
-    socket_ = util::move(socket);
+    SharedPointer<ITcpSocket> made = SharedPointer<ITcpSocket>::make_as<TlsSocket>(allocator_, stack_, allocator_, config);
+    *tls = static_cast<TlsSocket*>(made.get());
+    *socket = util::move(made);
   } else {
-    socket_ = stack_.tcp_open();
+    *socket = stack_.tcp_open();
   }
-  if (!socket_) {
-    fail(HttpError::OutOfMemory);
+  if (!*socket) return HttpError::OutOfMemory;
+  if (!(*socket)->connect_ip(address, url_.port)) {
+    *socket = SharedPointer<ITcpSocket>();
+    *tls = nullptr;
+    return HttpError::Connect;
+  }
+  return HttpError::None;
+}
+
+// Opens the connection to address_ (and later, if it is slow, to fallback_address_ alongside it). False if the request failed.
+bool HttpClient::open_tcp() {
+  HttpError error = open_attempt(address_, &socket_, &tls_socket_);
+  if (error != HttpError::None && has_fallback_) {   // this version cannot even start a connection: go straight to the other one
+    address_ = fallback_address_;
+    has_fallback_ = false;
+    error = open_attempt(address_, &socket_, &tls_socket_);
+  }
+  if (error != HttpError::None) {
+    fail(error);
     return false;
   }
-  if (!socket_->connect(address_, url_.port)) {
-    fail(HttpError::Connect);
-    return false;
-  }
+  fallback_at_ms_ = stack_.now_ms() + kFallbackDelayMs;
   state_ = HttpState::Connecting;
   return true;
+}
+
+// The lookups are far enough along to pick the addresses: both answered, or the AAAA one resolved (it is preferred anyway), or the A one has waited
+// kResolutionDelayMs for the AAAA one. False while waiting (or after failing the request).
+bool HttpClient::resolution_done(uint64_t now) {
+  const DnsStatus four = dns_ ? dns_->status() : DnsStatus::NotFound, six = dns6_ ? dns6_->status() : DnsStatus::NotFound;
+  if (four == DnsStatus::Resolved && six == DnsStatus::Pending) {
+    if (dns_answered_ms_ == 0) dns_answered_ms_ = now;
+    if (now - dns_answered_ms_ < kResolutionDelayMs) return false;
+  } else if (six != DnsStatus::Resolved && (four == DnsStatus::Pending || six == DnsStatus::Pending)) {
+    if (now > deadline_ms_) fail(HttpError::Timeout);
+    return false;
+  }
+  if (six == DnsStatus::Resolved) {
+    address_ = dns6_->ip_address();
+    has_fallback_ = four == DnsStatus::Resolved;
+    if (has_fallback_) fallback_address_ = dns_->ip_address();
+    // (an A answer still on its way is not waited for: if IPv6 fails, the request fails, as with only an AAAA record)
+  } else if (four == DnsStatus::Resolved) {
+    address_ = dns_->ip_address();
+    has_fallback_ = false;
+  } else {
+    fail(HttpError::Resolve);
+    return false;
+  }
+  dns_ = dns6_ = SharedPointer<IDnsQuery>();
+  return true;
+}
+
+// Connecting over TCP: the first attempt, the fallback one once it is due, and whichever connects first wins.
+void HttpClient::poll_connecting(uint64_t now) {
+  if (has_fallback_ && !fallback_started_ && (now >= fallback_at_ms_ || socket_->failed())) {
+    fallback_started_ = true;
+    (void)open_attempt(fallback_address_, &racer_, &racer_tls_);   // (a fallback that cannot even start is simply not there)
+  }
+  if (racer_ && racer_->failed()) {
+    racer_ = SharedPointer<ITcpSocket>();
+    racer_tls_ = nullptr;
+  }
+  if (racer_ && (racer_->is_connected() || socket_->failed())) {
+    // the fallback connected first, or it is all that is left: it becomes the connection
+    socket_->abort();
+    socket_ = util::move(racer_);
+    tls_socket_ = racer_tls_;
+    address_ = fallback_address_;
+    racer_ = SharedPointer<ITcpSocket>();
+    racer_tls_ = nullptr;
+  }
+  if (socket_->failed()) return fail(tls_socket_ ? HttpError::Tls : HttpError::Connect);
+  if (now > deadline_ms_) return fail(HttpError::Timeout);
+  if (!socket_->is_connected()) return;
+  if (racer_) {
+    racer_->abort();
+    racer_ = SharedPointer<ITcpSocket>();
+    racer_tls_ = nullptr;
+  }
+  last_progress_ms_ = now;
+  state_ = HttpState::Sending;
 }
 
 // ---- HTTP/3
@@ -601,15 +681,8 @@ void HttpClient::poll() {
   const uint64_t now = stack_.now_ms();
   if (state_ == HttpState::Resolving) {
     if (!literal_address_ && !address_ready_) {
-      if (!dns_) return fail(HttpError::Resolve);
-      const DnsStatus status = dns_->status();
-      if (status == DnsStatus::Pending) {
-        if (now > deadline_ms_) fail(HttpError::Timeout);
-        return;
-      }
-      if (status != DnsStatus::Resolved) return fail(HttpError::Resolve);
-      address_ = dns_->address();
-      dns_ = SharedPointer<IDnsQuery>();
+      if (!dns_ && !dns6_) return fail(HttpError::Resolve);
+      if (!resolution_done(now)) return;
       address_ready_ = true;
     }
     if (!h3_failed_ && try_http3()) return;
@@ -617,11 +690,8 @@ void HttpClient::poll() {
   }
   if (h3_) return poll_http3(now);
   if (state_ == HttpState::Connecting) {
-    if (socket_->failed()) return fail(tls_socket_ ? HttpError::Tls : HttpError::Connect);
-    if (now > deadline_ms_) return fail(HttpError::Timeout);
-    if (!socket_->is_connected()) return;
-    last_progress_ms_ = now;
-    state_ = HttpState::Sending;
+    poll_connecting(now);
+    if (state_ != HttpState::Sending) return;
   }
   if (socket_->failed() && state_ != HttpState::ReceivingBody) return fail(tls_socket_ ? HttpError::Tls : HttpError::Connect);
   if (state_ == HttpState::Sending) {

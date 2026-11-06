@@ -33,6 +33,7 @@
 class NetworkStackDemo {
  public:
   static constexpr uint16_t kHostTcpEchoPort = 7777;  // optional echo servers on the host, reached at the gateway
+  static constexpr uint16_t kHostHttp6Port = 7780;    // an optional web server on the host's [::1], fetched as http://[fec0::2]:7780/
   static constexpr uint16_t kHostUdpEchoPort = 7778;
   static constexpr uint16_t kServerPort = 8080;
 

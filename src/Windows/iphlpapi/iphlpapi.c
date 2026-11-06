@@ -17,11 +17,12 @@
  */
 
 /* iphlpapi.dll for TheoryCraftOS: the adapter lists. The adapters are the software loopback (index 1, 127.0.0.1/8) and one Ethernet adapter per network interface of the
- * kernel (index 2, 3, ...), whose IPv4 address, netmask, gateway and DNS server come from the socket service NtSocketControl (operation 5, src/Process/WindowsSockets.cpp).
+ * kernel (index 2, 3, ...), whose IPv4 address, netmask, gateway and DNS server come from the socket service NtSocketControl (operation 5, src/Process/WindowsSockets.cpp)
+ * and whose IPv6 link-local and global addresses, router and DNS server from operation 8 (the loopback has ::1).
  * GetAdaptersAddresses lays them out as Windows does (adapters, unicast addresses, prefixes, gateways and DNS servers with their sockaddrs, then the strings) in one buffer
  * whose size does not depend on the flags that only leave parts out; GetAdaptersInfo lists the Ethernet adapters. The interface LUID / GUID / index conversions follow the
- * same numbering, and so do the MIB tables of the interfaces (GetIfTable, GetIfEntry(2), GetIpAddrTable, GetAdapterIndex, GetBestInterface). Not done: IPv6 (the kernel's
- * network stack has none), the MAC address (the kernel does not report it: PhysicalAddressLength is 0), the routing / neighbour / connection tables (they answer
+ * same numbering, and so do the MIB tables of the interfaces (GetIfTable, GetIfEntry(2), GetIpAddrTable, GetAdapterIndex, GetBestInterface). Not done: IPv6 in anything but
+ * GetAdaptersAddresses, the MAC address (the kernel does not report it: PhysicalAddressLength is 0), the routing / neighbour / connection tables (they answer
  * ERROR_NOT_SUPPORTED) and notifications (still stubs). Built freestanding over kernel32.dll and ntdll.dll. */
 #include <winsock2.h>
 #include <ws2ipdef.h>
@@ -44,9 +45,13 @@ __declspec(dllimport) LONG NTAPI NtClose(HANDLE handle);
 typedef struct {
   ULONG index, type;
   BYTE address[4], netmask[4], gateway[4], dns[4];      /* network order; address 0.0.0.0: not configured */
+  BYTE link_local6[16], global6[16], router6[16], dns6[16], prefix6[16];      /* (all zero: none) */
+  BYTE prefix_length6;
+  ULONG mtu;
 } Adapter;
 
 static BOOL zero4(const BYTE *a) { return !a[0] && !a[1] && !a[2] && !a[3]; }
+static BOOL zero16(const BYTE *a) { for (int i = 0; i < 16; ++i) if (a[i]) return FALSE; return TRUE; }
 static void put4(BYTE *out, BYTE a, BYTE b, BYTE c, BYTE d) { out[0] = a; out[1] = b; out[2] = c; out[3] = d; }
 static void zero(void *p, SIZE_T n) { for (SIZE_T i = 0; i < n; ++i) ((BYTE *)p)[i] = 0; }
 static void copy(void *to, const void *from, SIZE_T n) { for (SIZE_T i = 0; i < n; ++i) ((BYTE *)to)[i] = ((const BYTE *)from)[i]; }
@@ -60,6 +65,10 @@ static ULONG list_adapters(Adapter *out) {
   out[0].type = IF_TYPE_LOOPBACK_;
   put4(out[0].address, 127, 0, 0, 1);
   put4(out[0].netmask, 255, 0, 0, 0);
+  out[0].global6[15] = 1;      /* ::1 */
+  out[0].prefix6[15] = 1;
+  out[0].prefix_length6 = 128;
+  out[0].mtu = 0xFFFFFFFFu;
   n = 1;
   HANDLE socket = NULL;
   if (NtCreateSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &socket) < 0) return n;
@@ -73,6 +82,17 @@ static ULONG list_adapters(Adapter *out) {
     copy(a->netmask, config + 4, 4);
     copy(a->gateway, config + 8, 4);
     copy(a->dns, config + 12, 4);
+    a->mtu = 1500;
+    BYTE config6[72];
+    if (NtSocketControl(socket, 8 /* InterfaceConfiguration6 */, &i, sizeof i, config6, sizeof config6) == 0) {
+      const BYTE ready = config6[65];      /* 1: link-local ready, 2: global ready */
+      if (ready & 1) copy(a->link_local6, config6, 16);
+      if (ready & 2) { copy(a->global6, config6 + 16, 16); copy(a->prefix6, config6 + 16, 8); a->prefix_length6 = config6[64]; }
+      copy(a->router6, config6 + 32, 16);
+      copy(a->dns6, config6 + 48, 16);
+      const ULONG mtu = (ULONG)config6[68] | (ULONG)config6[69] << 8 | (ULONG)config6[70] << 16 | (ULONG)config6[71] << 24;
+      if (mtu >= 1280 && mtu < a->mtu) a->mtu = mtu;
+    }
   }
   NtClose(socket);
   return n;
@@ -117,15 +137,61 @@ static const WCHAR *description(const Adapter *a) { return a->type == IF_TYPE_LO
 
 static SIZE_T align8(SIZE_T n) { return (n + 7) & ~(SIZE_T)7; }
 
-/* The bytes one adapter takes; the same for every flag that only leaves a part out. */
-static SIZE_T adapter_size(const Adapter *a, BOOL ipv4) {
-  SIZE_T n = align8(sizeof(IP_ADAPTER_ADDRESSES_LH));
+/* The addresses one adapter lists, in each of GetAdaptersAddresses' lists: unicast addresses (IPv4, then IPv6 link-local and global), prefixes, gateways, DNS servers. */
+typedef struct { BYTE family_v6; BYTE bytes[16]; ULONG length; BYTE origin; } Entry;      /* length: a prefix's length or a unicast address's on-link prefix */
+typedef struct { Entry unicast[3], prefix[5], gateway[2], dns[2]; ULONG unicasts, prefixes, gateways, dnses; } Entries;
+static void add(Entry *list, ULONG *count, BOOL v6, const BYTE *bytes, ULONG length, BYTE origin) {
+  Entry *e = &list[(*count)++];
+  zero(e, sizeof *e);
+  e->family_v6 = (BYTE)v6;
+  copy(e->bytes, bytes, v6 ? 16 : 4);
+  e->length = length;
+  e->origin = origin;
+}
+#define ORIGIN_DHCP_ 0
+#define ORIGIN_WELL_KNOWN_ 1
+#define ORIGIN_LINK_LOCAL_ 2
+#define ORIGIN_ROUTER_ 3
+static void entries_of(const Adapter *a, BOOL ipv4, BOOL ipv6, Entries *e) {
+  zero(e, sizeof *e);
+  const BOOL loop = a->type == IF_TYPE_LOOPBACK_;
   if (ipv4 && !zero4(a->address)) {
-    n += align8(sizeof(IP_ADAPTER_UNICAST_ADDRESS_LH)) + align8(sizeof(SOCKADDR_IN));
-    n += 3 * (align8(sizeof(IP_ADAPTER_PREFIX_XP)) + align8(sizeof(SOCKADDR_IN)));
-    if (!zero4(a->gateway)) n += align8(sizeof(IP_ADAPTER_GATEWAY_ADDRESS_LH)) + align8(sizeof(SOCKADDR_IN));
-    if (!zero4(a->dns)) n += align8(sizeof(IP_ADAPTER_DNS_SERVER_ADDRESS_XP)) + align8(sizeof(SOCKADDR_IN));
+    const ULONG bits = (ULONG)prefix_length(a->netmask);
+    add(e->unicast, &e->unicasts, FALSE, a->address, bits, loop ? ORIGIN_WELL_KNOWN_ : ORIGIN_DHCP_);
+    /* the prefixes: the network, the address itself and the broadcast address of the network */
+    BYTE network[4], broadcast[4];
+    for (int i = 0; i < 4; ++i) { network[i] = a->address[i] & a->netmask[i]; broadcast[i] = network[i] | (BYTE)~a->netmask[i]; }
+    add(e->prefix, &e->prefixes, FALSE, network, bits, 0);
+    add(e->prefix, &e->prefixes, FALSE, a->address, 32, 0);
+    add(e->prefix, &e->prefixes, FALSE, broadcast, 32, 0);
+    if (!zero4(a->gateway)) add(e->gateway, &e->gateways, FALSE, a->gateway, 0, 0);
+    if (!zero4(a->dns)) add(e->dns, &e->dnses, FALSE, a->dns, 0, 0);
   }
+  if (ipv6) {
+    if (!zero16(a->link_local6)) {
+      static const BYTE kLinkLocal[16] = {0xFE, 0x80};
+      add(e->unicast, &e->unicasts, TRUE, a->link_local6, 64, ORIGIN_LINK_LOCAL_);
+      add(e->prefix, &e->prefixes, TRUE, kLinkLocal, 64, 0);
+    }
+    if (!zero16(a->global6)) {
+      add(e->unicast, &e->unicasts, TRUE, a->global6, a->prefix_length6, loop ? ORIGIN_WELL_KNOWN_ : ORIGIN_ROUTER_);
+      add(e->prefix, &e->prefixes, TRUE, a->prefix6, a->prefix_length6, 0);
+    }
+    if (!zero16(a->router6) && !loop) add(e->gateway, &e->gateways, TRUE, a->router6, 0, 0);
+    if (!zero16(a->dns6) && !loop) add(e->dns, &e->dnses, TRUE, a->dns6, 0, 0);
+  }
+}
+static SIZE_T sockaddr_size(const Entry *e) { return align8(e->family_v6 ? sizeof(SOCKADDR_IN6) : sizeof(SOCKADDR_IN)); }
+
+/* The bytes one adapter takes; the same for every flag that only leaves a part out. */
+static SIZE_T adapter_size(const Adapter *a, BOOL ipv4, BOOL ipv6) {
+  Entries e;
+  entries_of(a, ipv4, ipv6, &e);
+  SIZE_T n = align8(sizeof(IP_ADAPTER_ADDRESSES_LH));
+  for (ULONG i = 0; i < e.unicasts; ++i) n += align8(sizeof(IP_ADAPTER_UNICAST_ADDRESS_LH)) + sockaddr_size(&e.unicast[i]);
+  for (ULONG i = 0; i < e.prefixes; ++i) n += align8(sizeof(IP_ADAPTER_PREFIX_XP)) + sockaddr_size(&e.prefix[i]);
+  for (ULONG i = 0; i < e.gateways; ++i) n += align8(sizeof(IP_ADAPTER_GATEWAY_ADDRESS_LH)) + sockaddr_size(&e.gateway[i]);
+  for (ULONG i = 0; i < e.dnses; ++i) n += align8(sizeof(IP_ADAPTER_DNS_SERVER_ADDRESS_XP)) + sockaddr_size(&e.dns[i]);
   n += align8(39);                                         /* AdapterName */
   n += align8(sizeof(WCHAR));                              /* DnsSuffix */
   n += align8((wlen(description(a)) + 1) * sizeof(WCHAR));
@@ -141,11 +207,20 @@ static void *take(Cursor *c, SIZE_T bytes) {
   c->next += align8(bytes);
   return p;
 }
-static SOCKADDR *sockaddr4(Cursor *c, const BYTE *address) {
-  SOCKADDR_IN *in = take(c, sizeof *in);
-  in->sin_family = AF_INET;
-  copy(&in->sin_addr, address, 4);
-  return (SOCKADDR *)in;
+static void socket_address(Cursor *c, const Entry *e, SOCKET_ADDRESS *out) {
+  if (e->family_v6) {
+    SOCKADDR_IN6 *in6 = take(c, sizeof *in6);
+    in6->sin6_family = AF_INET6;
+    copy(&in6->sin6_addr, e->bytes, 16);
+    out->lpSockaddr = (SOCKADDR *)in6;
+    out->iSockaddrLength = sizeof *in6;
+  } else {
+    SOCKADDR_IN *in = take(c, sizeof *in);
+    in->sin_family = AF_INET;
+    copy(&in->sin_addr, e->bytes, 4);
+    out->lpSockaddr = (SOCKADDR *)in;
+    out->iSockaddrLength = sizeof *in;
+  }
 }
 static WCHAR *wide_copy(Cursor *c, const WCHAR *text) {
   const SIZE_T n = wlen(text) + 1;
@@ -153,73 +228,80 @@ static WCHAR *wide_copy(Cursor *c, const WCHAR *text) {
   copy(w, text, n * sizeof(WCHAR));
   return w;
 }
+/* Space the left-out entries of one list would have taken. */
+static void skip(Cursor *c, const Entry *list, ULONG count, SIZE_T node) {
+  for (ULONG i = 0; i < count; ++i) c->next += align8(node) + sockaddr_size(&list[i]);
+}
 
-static void fill_adapter(Cursor *c, const Adapter *a, ULONG flags, BOOL ipv4, IP_ADAPTER_ADDRESSES_LH *aa) {
+static void fill_adapter(Cursor *c, const Adapter *a, ULONG flags, BOOL ipv4, BOOL ipv6, IP_ADAPTER_ADDRESSES_LH *aa) {
+  const BOOL loop = a->type == IF_TYPE_LOOPBACK_;
+  Entries e;
+  entries_of(a, ipv4, ipv6, &e);
   aa->Length = sizeof *aa;
   aa->IfIndex = a->index;
   aa->IfType = a->type;
-  aa->Mtu = a->type == IF_TYPE_LOOPBACK_ ? 0xFFFFFFFFu : 1500;
-  aa->OperStatus = a->type == IF_TYPE_LOOPBACK_ || !zero4(a->address) ? IfOperStatusUp : IfOperStatusDown;
+  aa->Mtu = a->mtu;
+  aa->OperStatus = loop || !zero4(a->address) || !zero16(a->link_local6) ? IfOperStatusUp : IfOperStatusDown;
   aa->Ipv4Enabled = TRUE;
-  aa->Ipv4Metric = a->type == IF_TYPE_LOOPBACK_ ? 75 : 25;
+  aa->Ipv6Enabled = loop || !zero16(a->link_local6);
+  aa->Ipv4Metric = loop ? 75 : 25;
   aa->Ipv6Metric = aa->Ipv4Metric;
-  aa->Ipv6IfIndex = 0;
+  aa->Ipv6IfIndex = aa->Ipv6Enabled ? a->index : 0;
   aa->TransmitLinkSpeed = aa->ReceiveLinkSpeed = 1000000000ull;
   aa->ConnectionType = NET_IF_CONNECTION_DEDICATED;
   aa->TunnelType = TUNNEL_TYPE_NONE;
-  if (a->type != IF_TYPE_LOOPBACK_) aa->Dhcpv4Enabled = TRUE;
+  if (!loop) aa->Dhcpv4Enabled = TRUE;
   luid_of(a, &aa->Luid);
   for (int z = 0; z < 16; ++z) aa->ZoneIndices[z] = z == 0 ? 0 : z <= 2 ? a->index : 1;      /* (the interface and link scopes are the interface; the wider ones zone 1) */
-  if (ipv4 && !zero4(a->address)) {
-    if (!(flags & GAA_FLAG_SKIP_UNICAST)) {
+  if (!(flags & GAA_FLAG_SKIP_UNICAST)) {
+    IP_ADAPTER_UNICAST_ADDRESS_LH **link = (IP_ADAPTER_UNICAST_ADDRESS_LH **)&aa->FirstUnicastAddress;
+    for (ULONG i = 0; i < e.unicasts; ++i) {
+      const Entry *u = &e.unicast[i];
       IP_ADAPTER_UNICAST_ADDRESS_LH *ua = take(c, sizeof *ua);
       ua->Length = sizeof *ua;
-      ua->Flags = a->type == IF_TYPE_LOOPBACK_ ? 0 : IP_ADAPTER_ADDRESS_DNS_ELIGIBLE;
-      ua->Address.lpSockaddr = sockaddr4(c, a->address);
-      ua->Address.iSockaddrLength = sizeof(SOCKADDR_IN);
-      ua->PrefixOrigin = a->type == IF_TYPE_LOOPBACK_ ? IpPrefixOriginWellKnown : IpPrefixOriginDhcp;
-      ua->SuffixOrigin = a->type == IF_TYPE_LOOPBACK_ ? IpSuffixOriginWellKnown : IpSuffixOriginDhcp;
+      ua->Flags = loop || u->origin == ORIGIN_LINK_LOCAL_ ? 0 : IP_ADAPTER_ADDRESS_DNS_ELIGIBLE;
+      socket_address(c, u, &ua->Address);
+      ua->PrefixOrigin = u->origin == ORIGIN_WELL_KNOWN_ ? IpPrefixOriginWellKnown : u->origin == ORIGIN_DHCP_ ? IpPrefixOriginDhcp
+                         : u->origin == ORIGIN_ROUTER_ ? IpPrefixOriginRouterAdvertisement : IpPrefixOriginWellKnown;
+      ua->SuffixOrigin = u->origin == ORIGIN_WELL_KNOWN_ ? IpSuffixOriginWellKnown : u->origin == ORIGIN_DHCP_ ? IpSuffixOriginDhcp : IpSuffixOriginLinkLayerAddress;
       ua->DadState = IpDadStatePreferred;
       ua->ValidLifetime = ua->PreferredLifetime = ua->LeaseLifetime = 0xFFFFFFFFu;
-      ua->OnLinkPrefixLength = (UINT8)prefix_length(a->netmask);
-      aa->FirstUnicastAddress = ua;
-    } else c->next += align8(sizeof(IP_ADAPTER_UNICAST_ADDRESS_LH)) + align8(sizeof(SOCKADDR_IN));
-    /* the prefixes: the network, the address itself and the broadcast address of the network */
-    if (flags & GAA_FLAG_INCLUDE_PREFIX) {
-      BYTE network[4], broadcast[4];
-      for (int i = 0; i < 4; ++i) { network[i] = a->address[i] & a->netmask[i]; broadcast[i] = network[i] | (BYTE)~a->netmask[i]; }
-      const BYTE *addresses[3] = {network, a->address, broadcast};
-      const ULONG lengths[3] = {(ULONG)prefix_length(a->netmask), 32, 32};
-      IP_ADAPTER_PREFIX_XP **link = &aa->FirstPrefix;
-      for (int i = 0; i < 3; ++i) {
-        IP_ADAPTER_PREFIX_XP *p = take(c, sizeof *p);
-        p->Length = sizeof *p;
-        p->Address.lpSockaddr = sockaddr4(c, addresses[i]);
-        p->Address.iSockaddrLength = sizeof(SOCKADDR_IN);
-        p->PrefixLength = lengths[i];
-        *link = p;
-        link = &p->Next;
-      }
-    } else c->next += 3 * (align8(sizeof(IP_ADAPTER_PREFIX_XP)) + align8(sizeof(SOCKADDR_IN)));
-    if (!zero4(a->gateway)) {
-      if (flags & GAA_FLAG_INCLUDE_GATEWAYS) {
-        IP_ADAPTER_GATEWAY_ADDRESS_LH *g = take(c, sizeof *g);
-        g->Length = sizeof *g;
-        g->Address.lpSockaddr = sockaddr4(c, a->gateway);
-        g->Address.iSockaddrLength = sizeof(SOCKADDR_IN);
-        aa->FirstGatewayAddress = g;
-      } else c->next += align8(sizeof(IP_ADAPTER_GATEWAY_ADDRESS_LH)) + align8(sizeof(SOCKADDR_IN));
+      ua->OnLinkPrefixLength = (UINT8)u->length;
+      *link = ua;
+      link = &ua->Next;
     }
-    if (!zero4(a->dns)) {
-      if (!(flags & GAA_FLAG_SKIP_DNS_SERVER)) {
-        IP_ADAPTER_DNS_SERVER_ADDRESS_XP *d = take(c, sizeof *d);
-        d->Length = sizeof *d;
-        d->Address.lpSockaddr = sockaddr4(c, a->dns);
-        d->Address.iSockaddrLength = sizeof(SOCKADDR_IN);
-        aa->FirstDnsServerAddress = d;
-      } else c->next += align8(sizeof(IP_ADAPTER_DNS_SERVER_ADDRESS_XP)) + align8(sizeof(SOCKADDR_IN));
+  } else skip(c, e.unicast, e.unicasts, sizeof(IP_ADAPTER_UNICAST_ADDRESS_LH));
+  if (flags & GAA_FLAG_INCLUDE_PREFIX) {
+    IP_ADAPTER_PREFIX_XP **link = &aa->FirstPrefix;
+    for (ULONG i = 0; i < e.prefixes; ++i) {
+      IP_ADAPTER_PREFIX_XP *p = take(c, sizeof *p);
+      p->Length = sizeof *p;
+      socket_address(c, &e.prefix[i], &p->Address);
+      p->PrefixLength = e.prefix[i].length;
+      *link = p;
+      link = &p->Next;
     }
-  }
+  } else skip(c, e.prefix, e.prefixes, sizeof(IP_ADAPTER_PREFIX_XP));
+  if (flags & GAA_FLAG_INCLUDE_GATEWAYS) {
+    IP_ADAPTER_GATEWAY_ADDRESS_LH **link = &aa->FirstGatewayAddress;
+    for (ULONG i = 0; i < e.gateways; ++i) {
+      IP_ADAPTER_GATEWAY_ADDRESS_LH *g = take(c, sizeof *g);
+      g->Length = sizeof *g;
+      socket_address(c, &e.gateway[i], &g->Address);
+      *link = g;
+      link = &g->Next;
+    }
+  } else skip(c, e.gateway, e.gateways, sizeof(IP_ADAPTER_GATEWAY_ADDRESS_LH));
+  if (!(flags & GAA_FLAG_SKIP_DNS_SERVER)) {
+    IP_ADAPTER_DNS_SERVER_ADDRESS_XP **link = &aa->FirstDnsServerAddress;
+    for (ULONG i = 0; i < e.dnses; ++i) {
+      IP_ADAPTER_DNS_SERVER_ADDRESS_XP *d = take(c, sizeof *d);
+      d->Length = sizeof *d;
+      socket_address(c, &e.dns[i], &d->Address);
+      *link = d;
+      link = &d->Next;
+    }
+  } else skip(c, e.dns, e.dnses, sizeof(IP_ADAPTER_DNS_SERVER_ADDRESS_XP));
   GUID guid;
   adapter_guid(a->index, &guid);
   char *name = take(c, 39);
@@ -240,9 +322,9 @@ EXPORT ULONG WINAPI GetAdaptersAddresses(ULONG family, ULONG flags, PVOID reserv
   if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6) return ERROR_INVALID_PARAMETER;
   Adapter list[MAX_ADAPTERS];
   const ULONG count = list_adapters(list);
-  const BOOL ipv4 = family != AF_INET6;
+  const BOOL ipv4 = family != AF_INET6, ipv6 = family != AF_INET;
   SIZE_T need = 0;
-  for (ULONG i = 0; i < count; ++i) need += adapter_size(&list[i], ipv4);
+  for (ULONG i = 0; i < count; ++i) need += adapter_size(&list[i], ipv4, ipv6);
   if (!addresses || *size < need) { *size = (ULONG)need; return ERROR_BUFFER_OVERFLOW; }
   zero(addresses, need);
   Cursor c = {(BYTE *)addresses};
@@ -250,8 +332,8 @@ EXPORT ULONG WINAPI GetAdaptersAddresses(ULONG family, ULONG flags, PVOID reserv
   for (ULONG i = 0; i < count; ++i) {
     BYTE *start = c.next;
     IP_ADAPTER_ADDRESSES_LH *aa = take(&c, sizeof *aa);
-    fill_adapter(&c, &list[i], flags, ipv4, aa);
-    c.next = start + adapter_size(&list[i], ipv4);      /* (the parts left out keep their place) */
+    fill_adapter(&c, &list[i], flags, ipv4, ipv6, aa);
+    c.next = start + adapter_size(&list[i], ipv4, ipv6);      /* (the parts left out keep their place) */
     if (previous) previous->Next = aa;
     previous = aa;
   }

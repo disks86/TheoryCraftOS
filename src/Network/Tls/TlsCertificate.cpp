@@ -58,11 +58,16 @@ bool check_server_certificate(allocators::IAllocator& allocator, const TlsConfig
     o.now = config.clock ? config.clock(config.clock_context) : 0;
     o.hostname = config.server_name;
     if (!o.hostname) o.ipv4 = config.server_ipv4 ? config.server_ipv4 : peer_ipv4;
-    if (!o.hostname && o.ipv4 == 0 && !config.skip_hostname_check)   // nothing to check the certificate against: refuse rather than trust any host
+    if (!o.hostname && o.ipv4 == 0 && config.has_server_ipv6) {
+      o.has_ipv6 = true;
+      ByteView(o.ipv6).copy_from(ConstByteView(config.server_ipv6.bytes));
+    }
+    if (!o.hostname && o.ipv4 == 0 && !o.has_ipv6 && !config.skip_hostname_check)   // nothing to check the certificate against: refuse rather than trust any host
       return refuse(CertStatus::HostnameMismatch, kAlertBadCertificate, TlsError::Certificate);
     if (config.skip_hostname_check) {
       o.hostname = nullptr;
       o.ipv4 = 0;
+      o.has_ipv6 = false;
     }
     o.min_rsa_bits = config.min_rsa_bits;
     o.allow_sha1 = config.allow_sha1_certificates;
