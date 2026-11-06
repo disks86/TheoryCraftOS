@@ -32,6 +32,7 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgHevc.inc"   // (the pipe buffer command and the weights are the same for H.264)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgAvc.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeHpgAvc.inc"   // (Arc: its own CMD3 and image state; everything else is Xe-LPG's)
 #include "Hardware/VideoCodec/Intel/IntelVdencTables.inc"
 
 // log2(8) = 3 ... the media driver's 4.4 floating-point cost format: a 4-bit mantissa and a 4-bit exponent, saturating at `max`.
@@ -113,8 +114,8 @@ void vdenc_pipe_buf(DwordWriter& w, const uint32_t (&defaults)[N], const AvcEnco
   c.buffer(10, b.source, kMocs);
   if (b.vdenc_row_store) c.buffer(16, b.vdenc_row_store, kMocs);
   if (b.vdenc_statistics) c.buffer(34, b.vdenc_statistics, kMocs);
-  if (p.xe_lpg) {
-    // Xe-LPG: the VDEnc engine writes the 4x down-scaled reconstruction itself ("scaled reference surface stage 1"), the MFX engine's intra row store is also given to it, and
+  if (p.xe_lpg || p.xe_hpg) {
+    // Xe-LPG and Arc: the VDEnc engine writes the 4x down-scaled reconstruction itself ("scaled reference surface stage 1"), the MFX engine's intra row store is also given to it, and
     // with target usage 7 (performance mode, one reference) the second forward down-scaled reference is the first.
     if (b.recon_ds4) c.buffer(49, b.recon_ds4, kMocs);
     if (b.intra_row_store) c.buffer(77, b.intra_row_store, kMocs);
@@ -166,6 +167,11 @@ AvcEncodeScratchSizes avc_encode_scratch_sizes(uint32_t width_mbs, uint32_t heig
   return s;
 }
 
+// Rounding of P slices for a GOP without B pictures (the media driver's adaptive tables G0_P / adaptiveRoundingInter_P_G1 and adaptiveRoundingIntra_P_G1, equal on both platforms
+// that use them), by slice quantiser.
+constexpr uint8_t kRoundingInterG0P[52] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+constexpr uint8_t kRoundingIntraG0P[52] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0};
+
 // VDENC_CMD3 and VDENC_AVC_IMG_STATE of Xe-LPG (the images the media driver's own parameter code produces for I and P pictures; see tools/gen_intel_avc_xelpg.py).
 static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, uint32_t qp) {
   const uint32_t q = qp < 10 ? 0 : qp > 51 ? 41 : qp - 10;
@@ -180,6 +186,33 @@ static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, ui
   if (p.p_picture) {
     c.set(kXeLpgAvcVdencImgState_FwdRefIdx0ReferencePicture, p.reference_frame_store);
     c.set(kXeLpgAvcVdencImgState_PocNumberForFwdRef0, p.reference_poc & 0xFF);
+  }
+  c.emit(w);
+}
+
+// VDENC_CMD3 and the 20-dword VDENC_AVC_IMG_STATE of Arc (tools/gen_intel_avc_xehpg.py: the tables of the media driver's Xe_HPM interface).
+static void xe_hpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, uint32_t qp) {
+  const uint32_t q = qp < 10 ? 0 : qp > 51 ? 41 : qp - 10;
+  const uint32_t* cmd3 = (p.p_picture ? kXeHpgAvcVdencCmd3TableP : kXeHpgAvcVdencCmd3TableI) + q * kXeHpgAvcVdencCmd3Dwords;
+  for (uint32_t i = 0; i < kXeHpgAvcVdencCmd3Dwords; ++i) w.emit(cmd3[i]);
+  Command<kXeHpgAvcVdencImgStateDwords> c(p.p_picture ? kXeHpgAvcVdencImgStateP : kXeHpgAvcVdencImgStateI);
+  c.raw(8, (c.get(8) & 0xffff) | kXeHpgAvcVdencImgStateLevelDword8[p.level_idc > 52 ? 52 : p.level_idc]);
+  c.set(kXeHpgAvcVdencImgState_PictureType, p.p_picture ? 1 : 0);
+  c.set(kXeHpgAvcVdencImgState_Transform8X8Flag, 0);
+  c.set(kXeHpgAvcVdencImgState_SubpelMode, 3);
+  c.set(kXeHpgAvcVdencImgState_PictureWidth, p.width_mbs);
+  c.set(kXeHpgAvcVdencImgState_PictureHeightMinusOne, p.height_mbs - 1);
+  c.set(kXeHpgAvcVdencImgState_MinQp, 0xa);
+  c.set(kXeHpgAvcVdencImgState_MaxQp, 0x33);
+  c.set(kXeHpgAvcVdencImgState_QpPrimeY, qp);
+  c.set(kXeHpgAvcVdencImgState_PocNumberForCurrentPicture, p.poc & 0xFF);
+  if (p.p_picture) {
+    c.set(kXeHpgAvcVdencImgState_NumberOfL0ReferencesMinusOne, 0);
+    c.set(kXeHpgAvcVdencImgState_NumberOfL1ReferencesMinusOne, 0);
+    c.set(kXeHpgAvcVdencImgState_FwdRefIdx0ReferencePicture, p.reference_frame_store);
+    c.set(kXeHpgAvcVdencImgState_FwdRefIdx1ReferencePicture, 0xf);
+    c.set(kXeHpgAvcVdencImgState_FwdRefIdx2ReferencePicture, 0xf);
+    c.set(kXeHpgAvcVdencImgState_PocNumberForFwdRef0, p.reference_poc & 0xFF);
   }
   c.emit(w);
 }
@@ -259,8 +292,9 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   }
 
   // --- The VDEnc pipeline: mode, surfaces, buffers, the constant quantiser tables.
-  if (p.xe_lpg) {
-    for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i]);
+  if (p.xe_lpg || p.xe_hpg) {
+    // (Arc's older driver also turns the frame statistics stream-out on when it uses adaptive rounding: bit 5 of the first dword.)
+    for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i] | (i == 1 && p.xe_hpg ? 1u << 5 : 0u));
   } else if (p.generation == EncodeGeneration::Gen12) {
     // Xe-LP prefetches the TLB entries of the source picture ahead of the engine (the driver's settings for AVC).
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
@@ -284,18 +318,18 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
     c.emit(w);
   }
   const bool gen12_surfaces = p.generation == EncodeGeneration::Gen12;
-  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces, p.xe_lpg ? 7 : 0);   // (Xe-LPG: chroma downsample filter 7 on the source)
+  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces, gen12_surfaces ? 7 : 0);   // (Xe-LP and later: chroma downsample filter 7 on the source)
   vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces);
   if (gen11_up) vdenc_surface(w, kGen11VdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, gen12_surfaces);   // (room for two surfaces; one is used)
   else vdenc_surface(w, kVdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, false);
-  if (p.xe_lpg) {
-    vdenc_pipe_buf(w, kXeLpgVdencPipeBufAddrStateImage, p, b);
+  if (p.xe_lpg || p.xe_hpg) {
+    vdenc_pipe_buf(w, kXeLpgVdencPipeBufAddrStateImage, p, b);   // (Arc's is the same image)
   } else switch (p.generation) {
     case EncodeGeneration::Gen9: vdenc_pipe_buf(w, kVdencPipeBufAddrStateDefault, p, b); break;
     case EncodeGeneration::Gen11: vdenc_pipe_buf(w, kGen11VdencPipeBufAddrStateDefault, p, b); break;
     case EncodeGeneration::Gen12: vdenc_pipe_buf(w, kGen12VdencPipeBufAddrStateDefault, p, b); break;
   }
-  if (!p.xe_lpg)
+  if (!p.xe_lpg && !p.xe_hpg)
   {
     Command<kVdencConstQptStateDwords> c(kVdencConstQptStateDefault);
     uint32_t image[kVdencConstQptStateDwords];
@@ -363,8 +397,8 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
     c.emit(w);
   }
 
-  if (p.xe_lpg) {
-    xe_lpg_avc_image_state(w, p, qp);
+  if (p.xe_lpg || p.xe_hpg) {
+    if (p.xe_hpg) xe_hpg_avc_image_state(w, p, qp); else xe_lpg_avc_image_state(w, p, qp);
     flat_matrices(w);
     return;
   }
@@ -551,19 +585,20 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
     c.set(kMfxAvcSliceState_TailInsertionPresentInBitstream, p.last_in_stream ? 1 : 0);
     c.set(kMfxAvcSliceState_SlicedataInsertionPresentInBitstream, 1);
     c.set(kMfxAvcSliceState_HeaderInsertionPresentInBitstream, 1);
-    c.set(kMfxAvcSliceState_Roundinter, p.p_picture ? kAdaptiveInterRoundingPWithoutB[qp] : 2);
-    c.set(kMfxAvcSliceState_Roundinterenable, p.xe_lpg && p.p_picture ? 1 : 0);   // (the media driver's Xe-LPG code enables the inter rounding for P slices)
-    c.set(kMfxAvcSliceState_Roundintra, 5);
+    const bool newer = p.xe_lpg || p.xe_hpg;   // (the newer drivers use the G0 P tables)
+    c.set(kMfxAvcSliceState_Roundinter, p.p_picture ? (newer ? kRoundingInterG0P[qp] : kAdaptiveInterRoundingPWithoutB[qp]) : 2);
+    c.set(kMfxAvcSliceState_Roundinterenable, newer && p.p_picture ? 1 : 0);   // (the newer drivers enable the inter rounding for P slices)
+    c.set(kMfxAvcSliceState_Roundintra, newer && p.p_picture ? kRoundingIntraG0P[qp] : 5);
     c.set(kMfxAvcSliceState_Roundintraenable, 1);
     c.emit(w);
   }
 
   // --- Xe-LPG: VDENC_AVC_SLICE_STATE carries the same rounding values.
-  if (p.xe_lpg) {
+  if (p.xe_lpg || p.xe_hpg) {
     Command<kXeLpgAvcVdencSliceStateDwords> c(kXeLpgAvcVdencSliceStateImage);
-    c.set(kXeLpgAvcVdencSliceState_RoundIntra, 5);
+    c.set(kXeLpgAvcVdencSliceState_RoundIntra, p.p_picture ? kRoundingIntraG0P[qp] : 5);
     c.set(kXeLpgAvcVdencSliceState_RoundIntraEnable, 1);
-    c.set(kXeLpgAvcVdencSliceState_RoundInter, p.p_picture ? kAdaptiveInterRoundingPWithoutB[qp] : 2);
+    c.set(kXeLpgAvcVdencSliceState_RoundInter, p.p_picture ? kRoundingInterG0P[qp] : 2);
     c.set(kXeLpgAvcVdencSliceState_RoundInterEnable, p.p_picture ? 1 : 0);
     c.set(kXeLpgAvcVdencSliceState_Log2WeightDenomLuma, 0);
     c.emit(w);
@@ -573,7 +608,7 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
   for (uint64_t i = 0; i < headers.size(); ++i) pak_insert(w, headers[i], i + 1 == headers.size(), headers[i].slice_header);
 
   // --- Xe-LPG: the weights (none) and a 3-dword walker (the start is the top of the picture, the next slice starts below it).
-  if (p.xe_lpg) {
+  if (p.xe_lpg || p.xe_hpg) {
     for (uint32_t i = 0; i < kXeLpgVdencWeightsOffsetsStateDwords; ++i) w.emit(kXeLpgVdencWeightsOffsetsStateImage[i]);
     Command<kXeLpgAvcVdencWalkerStateDwords> c(kXeLpgAvcVdencWalkerStateImage);
     c.set(kXeLpgAvcVdencWalkerState_FirstSuperSlice, 1);
@@ -583,7 +618,7 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
 
   // --- VDENC_WALKER_STATE: start at the top, the next slice starts below the picture; then wait for the VDEnc and MFX pipes.
   // (From Ice Lake the walker also carries the picture width in samples.)
-  if (!p.xe_lpg) switch (p.generation) {
+  if (!p.xe_lpg && !p.xe_hpg) switch (p.generation) {
     case EncodeGeneration::Gen9: {
       Command<kVdencWalkerStateDwords> c(kVdencWalkerStateDefault);
       c.set(kVdencWalkerState_MbLcuStartYPosition, 0);

@@ -33,6 +33,7 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12Hevc.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgHevc.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeHpgHevc.inc"   // (only its CMD2 differs from Xe-LPG's; tools/gen_intel_hevc_xelpg.py xehpg)
 
 constexpr uint32_t kPage = 4096;
 constexpr uint32_t kCacheLine = 64;
@@ -223,7 +224,8 @@ void xe_lpg_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
 }
 
 void xe_lpg_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayout& l) {
-  Command<kXeLpgVdencCmd2Dwords> c(p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI);
+  const bool arc = p.platform == HevcVdencPlatform::XeHpg;
+  Command<kXeLpgVdencCmd2Dwords> c(arc ? (p.p_picture ? kXeHpgVdencCmd2ImageB : kXeHpgVdencCmd2ImageI) : (p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI));
   c.raw(kXeLpgVdencCmd2QpDword, (p.p_picture ? kXeLpgVdencCmd2QpTableB : kXeLpgVdencCmd2QpTableI)[xe_lpg_qp_index(p)]);
   c.set(kXeLpgVdencCmd2_FrameWidthInPixelsMinusOne, l.width - 1);
   c.set(kXeLpgVdencCmd2_FrameHeightInPixelsMinusOne, l.height - 1);
@@ -489,7 +491,7 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
   hcp_flat_matrices(w);
 
   // --- The VDEnc pipeline: mode (TLB prefetch, random-access off), surfaces, buffers.
-  const bool xe_lpg = p.platform == HevcVdencPlatform::XeLpg;
+  const bool xe_lpg = p.platform != HevcVdencPlatform::XeLp;   // (Xe-LPG's commands; Arc has them too)
   if (xe_lpg) {
     for (uint32_t i = 0; i < kXeLpgVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgVdencPipeModeSelectImage[i]);
   } else {
@@ -509,7 +511,7 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
     c.set(kGen12VdencPipeModeSelect_Numverticalreqminus1Src, 1);
     c.emit(w);
   }
-  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, xe_lpg ? 7 : 0);
+  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, 7);   // (chroma downsample filter 7 on the source from Xe-LP on)
   vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full, 0);
   vdenc_ds_surfaces(w, layout);
   if (xe_lpg) vdenc_pipe_buf<kXeLpgVdencPipeBufAddrStateDwords>(w, kXeLpgVdencPipeBufAddrStateImage, p, b);
@@ -605,7 +607,7 @@ bool emit_hevc_vdenc_slice(DwordWriter& w, const HevcEncodePicture& p, const Hev
     pak_insert(w, headers[i], i + 1 == headers.size());
   }
 
-  if (p.platform == HevcVdencPlatform::XeLpg) {
+  if (p.platform != HevcVdencPlatform::XeLp) {
     // --- VDENC_WEIGHTSOFFSETS_STATE (7 dwords), the tile and slice state (the whole picture is one tile of the picture's size) and the 3-dword walker.
     for (uint32_t i = 0; i < kXeLpgVdencWeightsOffsetsStateDwords; ++i) w.emit(kXeLpgVdencWeightsOffsetsStateImage[i]);
     {
