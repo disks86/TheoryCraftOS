@@ -206,6 +206,21 @@ static void demo_task(void* context) {
 using bootlog::Entry;
 using bootlog::Level;
 
+#if defined(TCOS_INTEL_WIFI) || defined(TCOS_INTEL_NPU) || defined(TCOS_AMD_VEGAM)
+// A device's interrupt handler through the scheduler's device table (kernel::set_device_interrupt_handler): the interrupt is counted against the
+// device and what the handler wakes is placed near this core. Returns the device's id (-1 if the table is full: the handler is set all the same).
+static int32_t attach_device_interrupt(kernel::Vector vector, const char* name, kernel::InterruptHandler handler, void* context) {
+  const int32_t device = kernel::register_io_device(name, static_cast<int32_t>(kernel::current_core()));
+  if (!kernel::set_device_interrupt_handler(vector, device, handler, context)) kernel::set_interrupt_handler(vector, handler, context);
+  return device;
+}
+static void detach_device_interrupt(kernel::Vector vector, int32_t* device) {
+  kernel::set_device_interrupt_handler(vector, *device, nullptr, nullptr);   // (clears the vector either way)
+  kernel::unregister_io_device(*device);
+  *device = -1;
+}
+#endif
+
 #ifdef TCOS_INTEL_WIFI
 // The Wi-Fi card's MSI: the transport masks the card and says an interrupt came; the interface looks at the card on its next call.
 static kernel::Frame* on_wifi_interrupt(kernel::Frame* frame, void* radio) {
@@ -226,6 +241,19 @@ static kernel::Frame* on_intel_npu_interrupt(kernel::Frame* frame, void*) {
 #endif
 
 #ifdef TCOS_THUNDERBOLT
+// Moves the Thunderbolt interrupt (MSI-X or MSI, whichever is on) to another core, when the scheduler finds its work runs there (kernel::set_io_device_retarget).
+struct ThunderboltInterruptRoute {
+  UniquePointer<hardware::PciMsix>* msix = nullptr;
+  UniquePointer<hardware::PciMsi>* msi = nullptr;
+};
+static bool retarget_thunderbolt_interrupt(void* context, uint32_t, uint64_t hardware_id) {
+  ThunderboltInterruptRoute* route = static_cast<ThunderboltInterruptRoute*>(context);
+  if (hardware_id > 0xFF) return false;
+  if (*route->msix) return (*route->msix)->retarget(static_cast<uint32_t>(hardware_id));
+  if (*route->msi) return (*route->msi)->retarget(0xFEE00000u | (hardware_id << 12));
+  return false;
+}
+
 // The Thunderbolt host interface's MSI: the driver reads the chip's notify registers (which lets it interrupt again) and counts; the desktop loop then reads the control channel.
 static kernel::Frame* on_thunderbolt_interrupt(kernel::Frame* frame, void* driver) {
   kernel::apic::eoi();
@@ -859,6 +887,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_AMD_VEGAM
   UniquePointer<hardware::AmdVegaM> vega_m;   // the Radeon RX Vega M's memory controller, engines and display (opt-in, below)
   UniquePointer<hardware::PciMsi> vega_msi;   // its MSI, when the machine delivers it
+  int32_t vega_io_device = -1;
   uint8_t vega_lit_crtc[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};   // the CRTC light_up() put each hot plug pin's output on (0xFF: none)
   bool vega_msi_working = false;              // the interrupt arrived in the self-test: the desktop loop looks at the ring only when one comes
 #endif
@@ -1340,6 +1369,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // on the executor runs jobs on it and the desktop loop services it. The tensor math of the NPU interface stays on the CPU (the NPU runs compiled graphs). Opt-in
     // (-DTCOS_INTEL_NPU=ON): none of it has run on a real NPU, and there is no firmware file unless the user puts the linux-firmware one there.
     UniquePointer<hardware::PciMsi> npu_msi;
+    int32_t npu_io_device = -1;
     bool npu_msi_working = false;
     ByteBuffer npu_firmware(shared_allocator);                      // the image: read again at every boot of the NPU, so it lives as long as the device
     if (clock_ok && paging_ok && system_npu.intel_present()) {
@@ -1350,12 +1380,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         const hardware::PciAddress npu_address = system_npu.intel_address();
         const uint32_t npu_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
         if (npu_apic_id <= 0xFF) {
-          kernel::set_interrupt_handler(kernel::kVectorIntelNpu, &on_intel_npu_interrupt, nullptr);
+          npu_io_device = attach_device_interrupt(kernel::kVectorIntelNpu, "intel-npu", &on_intel_npu_interrupt, nullptr);
           npu_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
           npu_msi_working = npu_msi && npu_msi->enable(npu_address, 0xFEE00000u | (npu_apic_id << 12), kernel::kVectorIntelNpu);
           if (!npu_msi_working) {
             npu_msi = UniquePointer<hardware::PciMsi>();
-            kernel::set_interrupt_handler(kernel::kVectorIntelNpu, nullptr, nullptr);
+            detach_device_interrupt(kernel::kVectorIntelNpu, &npu_io_device);
           }
         }
         hardware::IntelNpuExecutor::Config npu_config;
@@ -1369,7 +1399,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           Entry(Level::Warning, "NPU").text("could not start the firmware: ").text(hardware::intel_npu_device_error_name(npu_error));
           npu_msi = UniquePointer<hardware::PciMsi>();
           npu_msi_working = false;
-          kernel::set_interrupt_handler(kernel::kVectorIntelNpu, nullptr, nullptr);
+          detach_device_interrupt(kernel::kVectorIntelNpu, &npu_io_device);
         }
       }
     }
@@ -1378,6 +1408,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // The Intel Wireless-AC 9560 (and the rest of the 9000 series) as a network interface: the firmware from /firmware is started, and the card then scans and joins networks through the
     // Wi-Fi window; its network stack gets an address (DHCP) whenever it is joined. Opt-in (-DTCOS_INTEL_WIFI=ON): none of it has run on a real card.
     UniquePointer<hardware::PciMsi> wifi_msi;                       // the card's MSI, when the machine delivers it
+    int32_t wifi_io_device = -1;
     if (clock_ok && paging_ok) {
       hardware::FileSystemFirmwareSource wifi_firmware(explorer_files.file_system(), shared_allocator);
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
@@ -1400,13 +1431,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           // MSI: the handler, then the message to the core that runs this; kept only if the answer to a command of the card interrupts. Else the card is polled, as before.
           const uint32_t wifi_apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
           if (wifi_apic_id <= 0xFF) {
-            kernel::set_interrupt_handler(kernel::kVectorWifi, &on_wifi_interrupt, radio);
+            wifi_io_device = attach_device_interrupt(kernel::kVectorWifi, "intel-wifi", &on_wifi_interrupt, radio);
             wifi_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
             bool interrupts = wifi_msi && wifi_msi->enable(d.address, 0xFEE00000u | (wifi_apic_id << 12), kernel::kVectorWifi) && radio->use_interrupts(true) && radio->verify_interrupts();
             if (!interrupts) {
               radio->use_interrupts(false);
               wifi_msi = UniquePointer<hardware::PciMsi>();
-              kernel::set_interrupt_handler(kernel::kVectorWifi, nullptr, nullptr);
+              detach_device_interrupt(kernel::kVectorWifi, &wifi_io_device);
             }
             Entry(interrupts ? Level::Ok : Level::Info, "Wi-Fi").text(interrupts ? "interrupts: MSI" : "no interrupt from the card: polled");
           }
@@ -1481,6 +1512,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<hardware::PciMsi> thunderbolt_msi;                // else its MSI
     bool thunderbolt_msi_working = false;                           // an interrupt arrived in the start-up check: the loop reads the channel only when one comes
     int32_t thunderbolt_io_device = -1;                             // its entry in the scheduler's device table (kernel::register_io_device)
+    ThunderboltInterruptRoute thunderbolt_route{&thunderbolt_msix, &thunderbolt_msi};
     if (clock_ok && paging_ok) {
       for (uint32_t i = 0; i < pci.device_count(); ++i) {
         hardware::PciDeviceInfo d;
@@ -1525,6 +1557,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
               kernel::set_device_interrupt_handler(kernel::kVectorThunderboltData, thunderbolt_io_device, nullptr, nullptr);
               kernel::unregister_io_device(thunderbolt_io_device);
               thunderbolt_io_device = -1;
+            } else {
+              kernel::set_io_device_retarget(thunderbolt_io_device, &retarget_thunderbolt_interrupt, &thunderbolt_route);
             }
           }
           // networking to another host: offered in our properties, an interface for the network stack that gets an address when the cable's other end answers
@@ -1643,13 +1677,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         // MSI first, as the driver does (the interrupt ring is told it is on): the handler, then the message, to the core that runs this.
         const uint32_t apic_id = kernel::running() ? kernel::apic::this_apic_id() : 0xFFFF;
         if (apic_id <= 0xFF) {
-          kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, &on_vega_interrupt, nullptr);
+          vega_io_device = attach_device_interrupt(kernel::kVectorAmdVegaM, "amd-vega-m", &on_vega_interrupt, nullptr);
           vega_msi = UniquePointer<hardware::PciMsi>::make(shared_allocator, pci);
           if (vega_msi && vega_msi->enable(d.address, 0xFEE00000u | (apic_id << 12), kernel::kVectorAmdVegaM)) {
             inputs.msi = true;
           } else {
             vega_msi = UniquePointer<hardware::PciMsi>();
-            kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
+            detach_device_interrupt(kernel::kVectorAmdVegaM, &vega_io_device);
           }
         }
         const bool up = vega_m->bring_up(inputs);
@@ -1706,12 +1740,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           Entry(vega_msi_working ? Level::Ok : Level::Warning, "Vega M").text(vega_msi_working ? "interrupts: MSI wakes the CPU" : "interrupts: MSI did not arrive; the interrupt ring is polled");
           if (!vega_msi_working) {
             vega_msi = UniquePointer<hardware::PciMsi>();
-            kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
+            detach_device_interrupt(kernel::kVectorAmdVegaM, &vega_io_device);
           }
         }
         if (!up) {
           vega_msi = UniquePointer<hardware::PciMsi>();
-          kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
+          detach_device_interrupt(kernel::kVectorAmdVegaM, &vega_io_device);
           vega_m = UniquePointer<hardware::AmdVegaM>();
         } else if (drives_display) {
           display->set_native_display(vega_m.get());
@@ -2296,6 +2330,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (acpi_events && thunderbolt_wake.controller) acpi_events->disable_wake(thunderbolt_wake.controller);
     if (thunderbolt_link) thunderbolt_link->detach();                // (the network interface list keeps the entry; it stops using the connection before that goes)
     if (thunderbolt_msix || thunderbolt_msi) {                      // (before the driver goes: the handler holds a pointer to it)
+      kernel::set_io_device_retarget(thunderbolt_io_device, nullptr, nullptr);   // (waits for a move in progress: it uses the MSI objects)
       thunderbolt_msix = UniquePointer<hardware::PciMsix>();
       thunderbolt_msi = UniquePointer<hardware::PciMsi>();
       kernel::set_device_interrupt_handler(kernel::kVectorThunderbolt, thunderbolt_io_device, nullptr, nullptr);
@@ -2365,7 +2400,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   vega_m = UniquePointer<hardware::AmdVegaM>();
   if (vega_msi) {   // (after the card stopped posting)
     vega_msi = UniquePointer<hardware::PciMsi>();
-    kernel::set_interrupt_handler(kernel::kVectorAmdVegaM, nullptr, nullptr);
+    detach_device_interrupt(kernel::kVectorAmdVegaM, &vega_io_device);
   }
 #endif
   video_codecs.shutdown();

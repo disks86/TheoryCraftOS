@@ -199,6 +199,14 @@ bool set_device_interrupt_handler(Vector vector, int32_t device, InterruptHandle
 // Makes the thread follow `device`'s interrupt core (whatever it learnt), -1 to go back to learning. Takes effect when it is next placed.
 void bind_thread_to_io_device(Thread* thread, int32_t device);
 bool io_device_info(int32_t device, scheduling::IoDeviceInfo* out);
+// Moves the device's interrupt to `core` (whose interrupt-message id is `hardware_id`); true if it was moved. Called from a kernel thread, never
+// from an interrupt or with a lock held.
+using IoRetarget = bool (*)(void* context, uint32_t core, uint64_t hardware_id);
+// Lets the scheduler move the device's interrupt to where its work runs: when most of the threads its interrupts wake cannot run on the
+// interrupt's core (pinned to another core, or wanting another kind) and one core takes most of them (scheduling::InterruptSteering),
+// `retarget` is called to send the interrupt there, and set_io_device_core follows if it succeeds. A null `retarget` stops this, after waiting for
+// a call in progress. False for a device that is not registered.
+bool set_io_device_retarget(int32_t device, IoRetarget retarget, void* context);
 constexpr uint64_t kPlacementPatienceUs = 2000;
 
 // For the synchronization primitives (Sync.hpp). The scheduler lock is a spinlock

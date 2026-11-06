@@ -81,6 +81,38 @@ struct LearnedIoCore {
   int32_t hint() const { return confidence ? core : kNoCore; }
 };
 
+// Whether a device's interrupt should move to where the threads it wakes run. Each wake-up says where the woken thread will run if that is not
+// the interrupt's core (pinned elsewhere, or wanting another kind of core), else kNoCore. Once a window of wake-ups is in, decide() names a core
+// when most of them (three in four) had to run elsewhere and one core has a clear majority of those (a majority vote over the window).
+struct InterruptSteering {
+  static constexpr uint32_t kWindow = 32;
+  int32_t candidate = kNoCore;
+  uint32_t votes = 0;
+  uint32_t seen = 0;
+  uint32_t remote = 0;
+
+  void note(int32_t consumer_core) {
+    ++seen;
+    if (consumer_core < 0) return;
+    ++remote;
+    if (votes == 0) {
+      candidate = consumer_core;
+      votes = 1;
+    } else if (candidate == consumer_core) {
+      ++votes;
+    } else {
+      --votes;
+    }
+  }
+  bool window_full() const { return seen >= kWindow; }
+  // The core to move to, or kNoCore; starts a new window either way.
+  int32_t decide() {
+    const int32_t to = remote * 4 >= seen * 3 && remote && votes * 2 >= remote ? candidate : kNoCore;
+    *this = InterruptSteering();
+    return to;
+  }
+};
+
 // How much each match is worth when cores compete for a thread (or threads for a core). The kind the thread asked for outweighs everything
 // else (it is an explicit request; the rest are guesses), then the device's own core, then the cache it left behind, then a shared cache.
 constexpr uint32_t kScoreKind = 16, kScoreIoCore = 8, kScoreLastCore = 4, kScoreCacheDomain = 2;

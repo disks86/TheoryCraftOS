@@ -93,6 +93,18 @@ struct Scheduler {
   // What placement knows of each core (CPUScheduler/IoAffinity.hpp). `idle` is cleared as soon as a thread is sent to the core, so that the
   // next thread made ready goes to another idle core; it is set again whenever the core switches to its idle thread.
   scheduling::CorePlace places[kMaxCores];
+  // Interrupt steering (set_io_device_retarget), by device id: the driver's callback, the tally of where woken threads run, and a move the
+  // balancer thread is to make (-1: none). The balancer sleeps on balancer_wait until a decision is made.
+  struct Steering {
+    IoRetarget retarget = nullptr;
+    void* context = nullptr;
+    scheduling::InterruptSteering tally;
+    int32_t move_to = -1;
+  } steering[scheduling::IoDeviceTable::kCapacity];
+  WaitList balancer_wait;
+  Thread* balancer = nullptr;
+  bool balancer_started = false;
+  int32_t balancer_busy = -1;   // the device whose callback the balancer is in (atomic), or -1
   Thread* sleepers = nullptr;
   Thread* zombies = nullptr;
   Thread* all = nullptr;  // every thread that exists, through Thread::all_next
@@ -392,13 +404,35 @@ void place_ready_locked(Thread* t) {
   send_wakeup(c.apic_id);
 }
 
-// With the lock held, in whatever context makes `t` ready: inside a device's interrupt handler the thread learns that core.
+bool eligible(const Thread* t, const Core* c);
+bool wake_one_locked_impl(WaitList* list);
+
+// Where a thread woken by this core's device interrupt will run when it cannot run here (pinned elsewhere, or wanting another kind of core): the
+// core it is pinned to, else the core it ran on last. -1 when it can run here (or has never run).
+int32_t remote_consumer(const Thread* t, const Core* self) {
+  const bool kind_ok = t->preferred_kind < 0 || t->preferred_kind == static_cast<int8_t>(self->kind);
+  if (eligible(t, self) && kind_ok) return -1;
+  return t->affinity >= 0 ? t->affinity : t->last_core;
+}
+
+// With the lock held, in whatever context makes `t` ready: inside a device's interrupt handler the thread learns that core, and, for a device
+// whose interrupt may be moved, the wake-up counts toward moving it to where its threads run.
 void note_wake_source_locked(Thread* t) {
   if (!g.running) return;
   const Core* self = this_core();
-  if (self->io_device < 0) return;
+  const int32_t device = self->io_device;
+  if (device < 0 || t == g.balancer) return;
   t->learned_io.woken_by_interrupt_on(self->index);
-  g_devices.note_wake(self->io_device);
+  g_devices.note_wake(device);
+  if (static_cast<uint32_t>(device) >= scheduling::IoDeviceTable::kCapacity) return;
+  Scheduler::Steering& steering = g.steering[device];
+  if (!steering.retarget) return;
+  steering.tally.note(remote_consumer(t, self));
+  if (!steering.tally.window_full()) return;
+  const int32_t to = steering.tally.decide();
+  if (to < 0 || static_cast<uint32_t>(to) == self->index || static_cast<uint32_t>(to) >= g.core_count || !g.cores[to].online) return;
+  steering.move_to = to;
+  wake_one_locked_impl(&g.balancer_wait);
 }
 
 void enqueue_locked(Thread* t) {
@@ -415,6 +449,16 @@ void make_ready_locked(Thread* t) {
     list_append(run_queue(t->priority), t);
     place_ready_locked(t);
   }
+}
+
+bool wake_one_locked_impl(WaitList* list) {
+  Thread* t = list->head;
+  if (!t) return false;
+  list_remove(list, t);
+  t->waiting_on = nullptr;
+  if (t->in_sleepers) sleepers_remove(t);
+  make_ready_locked(t);
+  return true;
 }
 
 bool eligible(const Thread* t, const Core* c) {
@@ -1058,6 +1102,7 @@ int32_t register_io_device(const char* name, int32_t interrupt_core) { return g_
 
 void unregister_io_device(int32_t device) {
   if (!g_devices.live(device)) return;
+  set_io_device_retarget(device, nullptr, nullptr);
   {
     const uint64_t flags = lock_irq();   // (threads bound to it go back to learning: the slot may soon be another device's)
     for (Thread* t = g.all; t; t = t->all_next)
@@ -1117,6 +1162,61 @@ bool set_device_interrupt_handler(Vector vector, int32_t device, InterruptHandle
   return ok;
 }
 
+namespace {
+// Makes the interrupt moves note_wake_source_locked decided on, outside any lock (the drivers write PCI configuration space or MMIO).
+void io_balancer_main(void*) {
+  for (;;) {
+    uint64_t flags = lock_irq();
+    int32_t device = -1;
+    for (uint32_t i = 0; i < scheduling::IoDeviceTable::kCapacity && device < 0; ++i)
+      if (g.steering[i].move_to >= 0 && g.steering[i].retarget) device = static_cast<int32_t>(i);
+    if (device < 0) {
+      detail::block_current_locked(&g.balancer_wait, 0);
+      unlock_irq(flags);
+      yield();
+      continue;
+    }
+    Scheduler::Steering& steering = g.steering[device];
+    const uint32_t to = static_cast<uint32_t>(steering.move_to);
+    const IoRetarget retarget = steering.retarget;
+    void* context = steering.context;
+    const uint64_t hardware_id = g.cores[to].apic_id;
+    steering.move_to = -1;
+    __atomic_store_n(&g.balancer_busy, device, __ATOMIC_RELEASE);
+    unlock_irq(flags);
+    if (retarget(context, to, hardware_id)) g_devices.set_interrupt_core(device, static_cast<int32_t>(to));
+    __atomic_store_n(&g.balancer_busy, -1, __ATOMIC_RELEASE);
+  }
+}
+}  // namespace
+
+bool set_io_device_retarget(int32_t device, IoRetarget retarget, void* context) {
+  if (!g_devices.live(device) || static_cast<uint32_t>(device) >= scheduling::IoDeviceTable::kCapacity) return false;
+  uint64_t flags = lock_irq();
+  Scheduler::Steering& steering = g.steering[device];
+  steering.retarget = retarget;
+  steering.context = context;
+  steering.tally = scheduling::InterruptSteering();
+  steering.move_to = -1;
+  unlock_irq(flags);
+  if (!retarget) {   // (the driver may free the context once this returns)
+    while (__atomic_load_n(&g.balancer_busy, __ATOMIC_ACQUIRE) == device) yield();
+    return true;
+  }
+  if (g.running && !__atomic_exchange_n(&g.balancer_started, true, __ATOMIC_ACQ_REL)) {   // (the first driver to ask starts it)
+    Thread* balancer = spawn(io_balancer_main, nullptr, "io-balancer", -1, -1, 64 * 1024);
+    if (balancer) {
+      detach(balancer);
+      flags = lock_irq();
+      g.balancer = balancer;
+      unlock_irq(flags);
+    } else {
+      __atomic_store_n(&g.balancer_started, false, __ATOMIC_RELEASE);
+    }
+  }
+  return true;
+}
+
 void bind_thread_to_io_device(Thread* t, int32_t device) {
   if (!t) return;
   const uint64_t flags = lock_irq();
@@ -1132,6 +1232,14 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
   g.tick_hz = tick_hz;
   g.boot_core = cpu.current_core();
   g.core_count = cpu.core_count() < kMaxCores ? cpu.core_count() : kMaxCores;
+  // The kernel runs no static constructors, so the fields whose "none" is not zero are set here, before any core or interrupt reads them.
+  for (Core& c : g.cores) {
+    c.io_device = -1;
+    c.resched = false;
+    c.exit_reschedules = false;
+  }
+  for (Scheduler::Steering& steering : g.steering) steering.move_to = -1;
+  g.balancer_busy = -1;
 #if defined(__x86_64__)
   __asm__ volatile("fxsave %0" : "=m"(g_fpu_template));
 #endif
@@ -1349,15 +1457,7 @@ void block_current_locked(WaitList* list, uint64_t timeout_us) {
   }
 }
 
-bool wake_one_locked(WaitList* list) {
-  Thread* t = list->head;
-  if (!t) return false;
-  list_remove(list, t);
-  t->waiting_on = nullptr;
-  if (t->in_sleepers) sleepers_remove(t);
-  make_ready_locked(t);
-  return true;
-}
+bool wake_one_locked(WaitList* list) { return wake_one_locked_impl(list); }
 
 uint32_t wake_all_locked(WaitList* list) {
   uint32_t n = 0;

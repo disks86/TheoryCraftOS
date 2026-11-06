@@ -64,6 +64,21 @@ bool PciMsi::enable(PciAddress function, uint64_t message_address, uint16_t mess
   return true;
 }
 
+bool PciMsi::retarget(uint64_t message_address) {
+  if (!capability_ || (message_address & 3) != 0) return false;
+  const uint32_t control = bus_.read32(function_, capability_) >> 16;
+  const bool is64 = (control & kControl64Bit) != 0;
+  if (!is64 && (message_address >> 32) != 0) return false;
+  const uint16_t mask_register = static_cast<uint16_t>(capability_ + (is64 ? 16 : 12));
+  const bool masking = (control & kControlPerVectorMasking) != 0;
+  const uint32_t mask = masking ? bus_.read32(function_, mask_register) : 0;
+  if (masking) bus_.write32(function_, mask_register, mask | 1);
+  if (is64) bus_.write32(function_, capability_ + 8, static_cast<uint32_t>(message_address >> 32));
+  bus_.write32(function_, capability_ + 4, static_cast<uint32_t>(message_address));
+  if (masking) bus_.write32(function_, mask_register, mask & ~1u);
+  return true;
+}
+
 void PciMsi::disable() {
   if (!capability_) return;
   const uint32_t first = bus_.read32(function_, capability_);

@@ -142,6 +142,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   int32_t io_device_ = -1;           // kernel::register_io_device: what the threads waiting for completion_ follow
   uint32_t interrupt_count_ = 0;
   void drop_interrupt_handler();
+  static bool retarget_interrupt(void* self, uint32_t core, uint64_t hardware_id);
   static kernel::Frame* on_interrupt(kernel::Frame* frame, void* self);
   uint64_t fence_ = 0;
   bool in_flight_ = false;  // a command timed out and the device still holds its buffers

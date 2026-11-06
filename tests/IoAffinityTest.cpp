@@ -169,6 +169,30 @@ void test_learned_core() {
   CHECK(learned.hint() == kNoCore);
 }
 
+void test_steering() {
+  InterruptSteering steering;
+  // Every wake-up for a thread pinned to core 5: move there.
+  for (uint32_t i = 0; i < InterruptSteering::kWindow; ++i) {
+    CHECK(!steering.window_full());
+    steering.note(5);
+  }
+  CHECK(steering.window_full() && steering.decide() == 5);
+  CHECK(!steering.window_full() && steering.seen == 0);   // a new window
+  // Mostly local: stay.
+  for (uint32_t i = 0; i < InterruptSteering::kWindow; ++i) steering.note(i % 2 ? 5 : kNoCore);
+  CHECK(steering.decide() == kNoCore);
+  // Remote but split between two cores: no clear place to go.
+  for (uint32_t i = 0; i < InterruptSteering::kWindow; ++i) steering.note(i % 2 ? 5 : 6);
+  CHECK(steering.decide() == kNoCore);
+  // Remote, one core well ahead, some local: 26 to core 2, 2 to core 3, 4 local.
+  for (uint32_t i = 0; i < 26; ++i) steering.note(2);
+  steering.note(3);
+  steering.note(3);
+  for (uint32_t i = 0; i < 4; ++i) steering.note(kNoCore);
+  CHECK(steering.decide() == 2);
+  CHECK(InterruptSteering().decide() == kNoCore);
+}
+
 void test_cache_domain() {
   CHECK(cache_domain_from_apic_id(13, 0) == 13);
   CHECK(cache_domain_from_apic_id(13, 1) == 13);
@@ -283,6 +307,7 @@ int main() {
   test_wake_core();
   test_interrupt_core();
   test_learned_core();
+  test_steering();
   test_cache_domain();
   test_device_table();
   test_device_table_threads();

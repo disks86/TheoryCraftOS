@@ -39,6 +39,10 @@ class PciMsi {
   // Programs the message and enables MSI. False (nothing changed) if the function has no MSI capability, the address does not fit the function (above 4 GiB for one that is not
   // 64-bit capable, or not 4-byte aligned), or MSI would not switch on.
   bool enable(PciAddress function, uint64_t message_address, uint16_t message_data);
+  // Sends the message to another address (another core), the data unchanged. With per-vector masking the vector is masked while the address
+  // changes (an interrupt raised meanwhile stays pending and is delivered after); without it the low address dword is rewritten in one write,
+  // which is what changing the destination core of an x86 message needs. False if not enabled or the address does not fit the function.
+  bool retarget(uint64_t message_address);
   // MSI off and the legacy pin back. Safe when not enabled.
   void disable();
   bool enabled() const { return capability_ != 0; }

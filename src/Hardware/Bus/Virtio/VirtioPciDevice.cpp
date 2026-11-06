@@ -181,6 +181,18 @@ bool VirtioPciDevice::enable_msix(uint8_t vector, uint32_t apic_id, uint16_t que
   return true;
 }
 
+bool VirtioPciDevice::retarget_msix(uint32_t apic_id) {
+  if (!msix_capability_ || apic_id > 0xFF) return false;
+  const uint32_t table = pci_.read32(device_.address, msix_capability_ + 4);
+  const uint64_t bar = pci_.memory_bar(device_.address, static_cast<uint8_t>(table & 7));
+  if (!bar) return false;
+  volatile uint32_t* entry = reinterpret_cast<volatile uint32_t*>(bar + (table & ~7u));   // (as enable_msix: table entry 0)
+  entry[3] = 1;
+  entry[0] = 0xFEE00000u | (apic_id << 12);
+  entry[3] = 0;
+  return true;
+}
+
 void VirtioPciDevice::disable_msix() {
   if (!msix_capability_) return;
   if (common_.address) {
