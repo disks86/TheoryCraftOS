@@ -432,6 +432,26 @@ static void test_limits_and_collector() {
         e.vm().collect();
         CHECK(e.run("olds[0].tag + 1", &error, &result) && std::string(result.c_str()) == "42");
       }
+      {   // a minor collection takes the young interned strings nobody holds out of the table (backward shift): the others are still found as the same cell
+        std::vector<JsString*> kept;
+        for (int i = 0; i < 6000; ++i) {
+          const std::string name = "gen_name_" + std::to_string(i * 7919 % 100003);
+          JsString* s = e.vm().intern(StringView(name.data(), name.size()));
+          if (i % 5 == 0) {
+            kept.push_back(s);
+            e.vm().array_push(olds, Value::make_string(s));   // (held: through the old array, with the barrier)
+          }
+        }
+        e.vm().collect();
+        e.vm().collect();
+        bool same = true;
+        for (int i = 0; i < 6000; i += 5) {
+          const std::string name = "gen_name_" + std::to_string(i * 7919 % 100003);
+          same = same && e.vm().intern(StringView(name.data(), name.size())) == kept[static_cast<size_t>(i / 5)];
+        }
+        CHECK(same);
+        olds->length = 2;
+      }
       {
         static int reported = 0;
         void (*const before)(const char*) = Vm::generation_error;

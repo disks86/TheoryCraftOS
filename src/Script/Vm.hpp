@@ -423,7 +423,13 @@ class Vm {
   void sweep_young();
   void free_cell(Cell* cell);
   void prune_intern_table();
+  void prune_young_interned();
+  void intern_remove(JsString* s);
   void rebuild_intern_table();
+  uint64_t nursery_bytes() const;
+  void* pool_allocate(uint64_t size);
+  void pool_free(void* block, uint64_t size);
+  void pool_trim(uint64_t keep);
   void grow_props(JsObject* o);
   void index_rebuild(JsObject* o);
   int64_t find_prop(JsObject* o, JsString* key) const;
@@ -495,6 +501,17 @@ class Vm {
   JsString* ascii_chars_[128] = {};        // (ascii_char: the same)
   uint32_t interned_cap_ = 0, interned_count_ = 0;
   bool intern_rebuild_wanted_ = false;
+  List<JsString*> young_interned_;   // (interned since the last collection: the only ones a minor collection can free)
+  bool young_interned_lost_ = false;
+  // Small blocks the collector freed (cells, property lists, elements, indexes), kept by size class (16-byte steps up to kPoolLargest) for the next
+  // allocations: a big page makes and drops millions of objects, and giving each back to the system allocator and asking for it again cost as much as
+  // the collection itself. At most a nursery's worth is kept; a major collection gives most of it back.
+  static constexpr uint32_t kPoolLargest = 512, kPoolClasses = kPoolLargest / 16;
+  struct PoolBlock {
+    PoolBlock* next;
+  };
+  PoolBlock* pool_[kPoolClasses] = {};
+  uint64_t pool_bytes_ = 0;
   List<Cell*> gray_;
   List<FunctionCode*> codes_;
   PendingEval pending_eval_;
