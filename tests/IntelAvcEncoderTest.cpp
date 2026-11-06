@@ -86,6 +86,7 @@ struct FakeEncoder {
   Generation gen = Generation::Gen9;
   bool xe_lpg = false;                            // Meteor Lake / Arrow Lake VDEnc commands
   bool xe_hpg = false;                            // Arc Alchemist (Xe_HPM) VDEnc commands
+  int xe2 = 0;                                    // 1: Lunar Lake, 2: Arc Battlemage (Xe-LPG's sequence; a 7-dword pipe mode select on Battlemage)
   int pictures = 0, problems = 0, keyframes = 0;
   std::vector<uint32_t> sizes;
   void problem(const char* what) { printf("    encoder model: %s\n", what); ++problems; }
@@ -111,7 +112,7 @@ struct FakeEncoder {
     // The command sizes of the generation (Gen11 and Xe-LP grew four VDEnc commands; Xe-LP starts with the VDEnc control state, both wait for the MFX pipe around its mode).
     const bool gen9 = gen == Generation::Gen9, gen12 = gen == Generation::Gen12;
     const bool newer = xe_lpg || xe_hpg;   // the Xe_LPM_plus / Xe_HPM command set
-    const uint32_t vdenc_mode_dw = gen12 ? 6 : 2, vdenc_ds_dw = gen9 ? 6 : 10, vdenc_buf_dw = gen9 ? 37 : newer ? 89 : gen12 ? 71 : 62, walker_dw = gen9 ? 4 : newer ? 3 : gen12 ? 27 : 10;
+    const uint32_t vdenc_mode_dw = xe2 == 2 ? 7 : gen12 ? 6 : 2, vdenc_ds_dw = gen9 ? 6 : 10, vdenc_buf_dw = gen9 ? 37 : newer ? 89 : gen12 ? 71 : 62, walker_dw = gen9 ? 4 : newer ? 3 : gen12 ? 27 : 10;
     auto expect_wait = [&](const char* name) {
       if (i < d.size() && (d[i] & ~0x100u) == kHMfxWait && (d[i] & 0x100u)) ++i; else problem(name);
     };
@@ -366,12 +367,13 @@ uint8_t limited_luma(uint32_t v) { return static_cast<uint8_t>(16 + (v * 219 + 1
 uint8_t limited_chroma(int32_t c) { return static_cast<uint8_t>(128 + ((c - 128) * 224 + (c >= 128 ? 127 : -127)) / 255); }
 
 // Encodes `count` pictures through the session, decodes the packets on the CPU and compares.
-void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, Generation g = Generation::Gen9, bool xe_lpg = false, bool arc = false) {
-  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : g == Generation::Gen12 ? " (Xe-LP)" : g == Generation::Gen11 ? " (Ice Lake)" : "");
+void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, Generation g = Generation::Gen9, bool xe_lpg = false, bool arc = false, int xe2 = 0) {
+  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, xe2 == 2 ? " (Battlemage)" : xe2 ? " (Lunar Lake)" : arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : g == Generation::Gen12 ? " (Xe-LP)" : g == Generation::Gen11 ? " (Ice Lake)" : "");
   Rig2 rig(g);
-  rig.engine.xe_lpg = xe_lpg;
+  rig.engine.xe_lpg = xe_lpg || xe2;   // (Xe2 has Xe-LPG's sequence)
   rig.engine.xe_hpg = arc;
-  rig.gpu.xehp = xe_lpg || arc;
+  rig.engine.xe2 = xe2;
+  rig.gpu.xehp = xe_lpg || arc || xe2;
   EncoderConfig cfg;
   cfg.codec = VideoCodec::H264;
   cfg.width = w;
@@ -387,6 +389,8 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
     VcsDriver::Config driver_config = rig.config();
     driver_config.xe_lpg = xe_lpg;
     driver_config.xe_hpg = arc;
+    driver_config.xe2 = xe2 != 0;
+    driver_config.xe2_hpm = xe2 == 2;
     driver_config.gmd_id_flush = xe_lpg;
     CHECK(driver.initialize(driver_config));
     {
@@ -579,13 +583,14 @@ void test_device(TestAllocator& a, Generation g = Generation::Gen9) {
 // Meteor Lake: the media tile's engine encodes H.264 (and H.265) with the Xe-LPG commands; Arc and Lunar Lake leave it to the CPU.
 void test_device_xe_lpg(TestAllocator& a) {
   struct Platform { const char* name; uint16_t id; bool media_tile; bool hardware; };
-  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, false}};
+  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}};
   for (const Platform& pl : platforms) {
     printf("  through the media engine (%s)\n", pl.name);
     Rig2 rig(Generation::Gen12);
     rig.gpu.xehp = true;
-    rig.engine.xe_lpg = pl.hardware && pl.id == 0x7D55;
+    rig.engine.xe_lpg = pl.hardware && (pl.id == 0x7D55 || pl.id == 0x6420 || pl.id == 0xE20B);
     rig.engine.xe_hpg = pl.hardware && pl.id == 0x56A0;
+    rig.engine.xe2 = pl.id == 0xE20B ? 2 : pl.id == 0x6420 ? 1 : 0;
     const uint64_t base = pl.media_tile ? IntelMediaEngineHw::kMediaTileBase : 0;
     std::vector<uint32_t> regs((base + 0x20000) / 4, 0);
     regs[(base + 0x0D50) / 4] = 1;
@@ -658,6 +663,11 @@ int main() {
   encode_and_check(a, 64, 48, 5, 3, 75, Generation::Gen12, false, true);   // Arc Alchemist
   encode_and_check(a, 72, 40, 4, 2, 40, Generation::Gen12, false, true);
   encode_and_check(a, 96, 64, 6, 6, 1, Generation::Gen12, false, true);
+  for (int x2 : {1, 2}) {                                                   // Lunar Lake and Arc Battlemage
+    encode_and_check(a, 64, 48, 5, 3, 75, Generation::Gen12, false, false, x2);
+    encode_and_check(a, 96, 64, 6, 6, 1, Generation::Gen12, false, false, x2);
+    encode_and_check(a, 1920, 1080, 2, 2, 75, Generation::Gen12, false, false, x2);
+  }
   test_rejections(a);
   test_hang(a);
   test_device(a);

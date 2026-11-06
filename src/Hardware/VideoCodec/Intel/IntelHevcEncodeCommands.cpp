@@ -33,6 +33,8 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12Hevc.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgHevc.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2LpmHevc.inc"   // (Lunar Lake: CMD1 and CMD2 differ from Xe-LPG's)
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2HpmHevc.inc"   // (Battlemage: also the pipe mode select)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeHpgHevc.inc"   // (only its CMD2 differs from Xe-LPG's; tools/gen_intel_hevc_xelpg.py xehpg)
 
 constexpr uint32_t kPage = 4096;
@@ -217,15 +219,33 @@ void vdenc_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
 // the one dword each that depends on the quantiser (lambda and its square root; QpPrimeYAc) and the picture's size and picture order counts.
 uint32_t xe_lpg_qp_index(const HevcEncodePicture& p) { return static_cast<uint32_t>(clip(10, 51, p.qp)) - 10; }
 
-void xe_lpg_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
-  Command<kXeLpgVdencCmd1Dwords> c(p.p_picture ? kXeLpgVdencCmd1ImageB : kXeLpgVdencCmd1ImageI);
-  c.raw(kXeLpgVdencCmd1QpDword, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[xe_lpg_qp_index(p)]);
+template <uint32_t N>
+void xe_cmd1_image(DwordWriter& w, const HevcEncodePicture& p, const uint32_t (&image_i)[N], const uint32_t (&image_b)[N]) {
+  Command<N> c(p.p_picture ? image_b : image_i);
+  c.raw(kXeLpgVdencCmd1QpDword, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[xe_lpg_qp_index(p)]);   // (dword 22 on every platform)
   c.emit(w);
 }
 
+void xe_lpg_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
+  switch (p.platform) {
+    case HevcVdencPlatform::Xe2Lpm: xe_cmd1_image(w, p, kXe2LpmVdencCmd1ImageI, kXe2LpmVdencCmd1ImageB); break;
+    case HevcVdencPlatform::Xe2Hpm: xe_cmd1_image(w, p, kXe2HpmVdencCmd1ImageI, kXe2HpmVdencCmd1ImageB); break;
+    default: xe_cmd1_image(w, p, kXeLpgVdencCmd1ImageI, kXeLpgVdencCmd1ImageB); break;   // (Arc's is Xe-LPG's)
+  }
+}
+
 void xe_lpg_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayout& l) {
-  const bool arc = p.platform == HevcVdencPlatform::XeHpg;
-  Command<kXeLpgVdencCmd2Dwords> c(arc ? (p.p_picture ? kXeHpgVdencCmd2ImageB : kXeHpgVdencCmd2ImageI) : (p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI));
+  const uint32_t* image;
+  switch (p.platform) {
+    case HevcVdencPlatform::XeHpg: image = p.p_picture ? kXeHpgVdencCmd2ImageB : kXeHpgVdencCmd2ImageI; break;
+    case HevcVdencPlatform::Xe2Lpm: image = p.p_picture ? kXe2LpmVdencCmd2ImageB : kXe2LpmVdencCmd2ImageI; break;
+    case HevcVdencPlatform::Xe2Hpm: image = p.p_picture ? kXe2HpmVdencCmd2ImageB : kXe2HpmVdencCmd2ImageI; break;
+    default: image = p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI; break;
+  }
+  static_assert(kXeLpgVdencCmd2Dwords == kXe2LpmVdencCmd2Dwords && kXeLpgVdencCmd2Dwords == kXe2HpmVdencCmd2Dwords, "CMD2 is 62 dwords on every platform");
+  uint32_t copy[kXeLpgVdencCmd2Dwords];
+  for (uint32_t i = 0; i < kXeLpgVdencCmd2Dwords; ++i) copy[i] = image[i];
+  Command<kXeLpgVdencCmd2Dwords> c(copy);
   c.raw(kXeLpgVdencCmd2QpDword, (p.p_picture ? kXeLpgVdencCmd2QpTableB : kXeLpgVdencCmd2QpTableI)[xe_lpg_qp_index(p)]);
   c.set(kXeLpgVdencCmd2_FrameWidthInPixelsMinusOne, l.width - 1);
   c.set(kXeLpgVdencCmd2_FrameHeightInPixelsMinusOne, l.height - 1);
@@ -493,7 +513,8 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
   // --- The VDEnc pipeline: mode (TLB prefetch, random-access off), surfaces, buffers.
   const bool xe_lpg = p.platform != HevcVdencPlatform::XeLp;   // (Xe-LPG's commands; Arc has them too)
   if (xe_lpg) {
-    for (uint32_t i = 0; i < kXeLpgVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgVdencPipeModeSelectImage[i]);
+    if (p.platform == HevcVdencPlatform::Xe2Hpm) for (uint32_t i = 0; i < kXe2HpmVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmVdencPipeModeSelectImage[i]);
+    else for (uint32_t i = 0; i < kXeLpgVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgVdencPipeModeSelectImage[i]);
   } else {
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
     c.set(kGen12VdencPipeModeSelect_StandardSelect, 0);   // HEVC

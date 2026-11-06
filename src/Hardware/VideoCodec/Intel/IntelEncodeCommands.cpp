@@ -32,6 +32,8 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgHevc.inc"   // (the pipe buffer command and the weights are the same for H.264)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgAvc.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2LpmAvc.inc"   // (only the image state differs from Xe-LPG's)
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2HpmAvc.inc"   // (and the pipe mode select)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeHpgAvc.inc"   // (Arc: its own CMD3 and image state; everything else is Xe-LPG's)
 #include "Hardware/VideoCodec/Intel/IntelVdencTables.inc"
 
@@ -177,7 +179,13 @@ static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, ui
   const uint32_t q = qp < 10 ? 0 : qp > 51 ? 41 : qp - 10;
   const uint32_t* cmd3 = (p.p_picture ? kXeLpgAvcVdencCmd3TableP : kXeLpgAvcVdencCmd3TableI) + q * kXeLpgAvcVdencCmd3Dwords;
   for (uint32_t i = 0; i < kXeLpgAvcVdencCmd3Dwords; ++i) w.emit(cmd3[i]);
-  Command<kXeLpgAvcVdencImgStateDwords> c(p.p_picture ? kXeLpgAvcVdencImgStateP : kXeLpgAvcVdencImgStateI);
+  const uint32_t* image = p.xe2 == 1 ? (p.p_picture ? kXe2LpmAvcVdencImgStateP : kXe2LpmAvcVdencImgStateI)
+                        : p.xe2 == 2 ? (p.p_picture ? kXe2HpmAvcVdencImgStateP : kXe2HpmAvcVdencImgStateI)
+                                     : (p.p_picture ? kXeLpgAvcVdencImgStateP : kXeLpgAvcVdencImgStateI);
+  static_assert(kXeLpgAvcVdencImgStateDwords == kXe2LpmAvcVdencImgStateDwords && kXeLpgAvcVdencImgStateDwords == kXe2HpmAvcVdencImgStateDwords, "26 dwords on every platform");
+  uint32_t copy[kXeLpgAvcVdencImgStateDwords];
+  for (uint32_t i = 0; i < kXeLpgAvcVdencImgStateDwords; ++i) copy[i] = image[i];
+  Command<kXeLpgAvcVdencImgStateDwords> c(copy);
   c.raw(8, (p.p_picture ? kXeLpgAvcVdencImgStatePLevelDword8 : kXeLpgAvcVdencImgStateILevelDword8)[p.level_idc > 52 ? 52 : p.level_idc]);
   c.set(kXeLpgAvcVdencImgState_QpPrimeY, qp);
   c.set(kXeLpgAvcVdencImgState_PictureWidth, p.width_mbs);
@@ -294,7 +302,8 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   // --- The VDEnc pipeline: mode, surfaces, buffers, the constant quantiser tables.
   if (p.xe_lpg || p.xe_hpg) {
     // (Arc's older driver also turns the frame statistics stream-out on when it uses adaptive rounding: bit 5 of the first dword.)
-    for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i] | (i == 1 && p.xe_hpg ? 1u << 5 : 0u));
+    if (p.xe2 == 2) for (uint32_t i = 0; i < kXe2HpmAvcVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmAvcVdencPipeModeSelectImage[i]);
+    else for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i] | (i == 1 && p.xe_hpg ? 1u << 5 : 0u));
   } else if (p.generation == EncodeGeneration::Gen12) {
     // Xe-LP prefetches the TLB entries of the source picture ahead of the engine (the driver's settings for AVC).
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);

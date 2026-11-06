@@ -27,10 +27,16 @@ import os, re, subprocess, sys, tempfile
 QPS = range(10, 52)
 
 PLATFORMS = {
-    'xelpg': dict(ns='xe_lpm_plus_base::v0', hwcmd='hwcmd.h', cs='cs_lpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe_Lpm_Plus_Base', pms_impl='impl_lpmplus_base.h', prefix='XeLpg',
-                  hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h'),
-    'xehpg': dict(ns='xe_hpm', hwcmd='hwcmd_hpm.h', cs='cs_xpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe_Xpm_Base', pms_impl=None, prefix='XeHpg',
+    'xelpg': dict(ns='xe_lpm_plus_base::v0', hwcmd='hwcmd.h', cs='cs_lpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe_Lpm_Plus_Base', prefix='XeLpg',
+                  hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h', pms=['impl_lpmplus_base.h']),
+    'xehpg': dict(ns='xe_hpm', hwcmd='hwcmd_hpm.h', cs='cs_xpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe_Xpm_Base', prefix='XeHpg',
                   hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe_hpm.h'),
+    # Lunar Lake: Xe2_LPM_base const settings (CMD2 from the _open.h file), Xe2_LPM implementation adds fields to CMD1 and the tile and slice state.
+    'xe2lpm': dict(ns='xe2_lpm_base::xe2_lpm', hwcmd='hwcmd_xe2_lpm.h', cs='cs_xe2_lpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe2_Lpm_Base', prefix='Xe2Lpm',
+                   hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe2_lpm.h', cmd1=['impl_xe2_lpm.h'], tss=['impl_xe2_lpm.h']),
+    # Battlemage: Xe2_HPM const settings, the Xe_LPM_plus_base implementation (v1 command set) plus Xe2_HPM's additions.
+    'xe2hpm': dict(ns='xe_lpm_plus_base::v1', hwcmd='hwcmd_xe2_hpm.h', cs='cs_xe2_hpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe2_Hpm', prefix='Xe2Hpm',
+                   hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe2_hpm.h', pms=['impl_lpmplus_base.h', 'impl_xe2_hpm.h'], cmd1=['impl_xe2_hpm.h'], tss=['impl_xe2_hpm.h']),
 }
 
 
@@ -120,7 +126,7 @@ struct Settings {
 #define HevcVdencFeatureSettings Settings
 struct Pic { int CodingType, HierarchLevelPlus1, QpY, pps_curr_pic_ref_enabled_flag, NumROI;
   struct { struct { int EnableCustomRoudingIntra, EnableCustomRoudingInter, RoundingOffsetIntra, RoundingOffsetInter; } fields; } CustomRoundingOffsetsParams; };
-struct Seq { int TargetUsage, HierarchicalFlag, palette_mode_enabled_flag, LowDelayMode, GopRefDist, bit_depth_luma_minus8; };
+struct Seq { int TargetUsage, HierarchicalFlag, palette_mode_enabled_flag, LowDelayMode, GopRefDist, bit_depth_luma_minus8, chroma_format_idc; };
 struct Slice { int slice_qp_delta, num_ref_idx_l0_active_minus1; };
 struct Ctx {
   Pic *m_hevcPicParams; Seq *m_hevcSeqParams; Slice *m_hevcSliceParams;
@@ -137,7 +143,7 @@ static void dump(const char *tag, const uint32_t *d, size_t n) { printf("%s", ta
 int main(int argc, char **argv) {
   const int type = atoi(argv[1]), qp = atoi(argv[2]);
   Pic pic{}; pic.CodingType = type; pic.QpY = qp;
-  Seq seq{}; seq.TargetUsage = 7; seq.LowDelayMode = 1; seq.GopRefDist = 1;
+  Seq seq{}; seq.TargetUsage = 7; seq.LowDelayMode = 1; seq.GopRefDist = 1; seq.chroma_format_idc = 1;
   Slice sl{};
   Ctx ctx; ctx.m_hevcPicParams = &pic; ctx.m_hevcSeqParams = &seq; ctx.m_hevcSliceParams = &sl;
   Settings S; ctx.m_featureSetting = &S;
@@ -147,7 +153,8 @@ int main(int argc, char **argv) {
     CMD1Par par; for (auto &f : S.vdencCmd1Settings) f(par, lowDelay);
     _VDENC_CMD1_CMD cmd; auto &params = par;
     DO_FIELDS1();
-    dump("CMD1", (uint32_t *)&cmd, 33);
+    CMD1_EXTRA
+    dump("CMD1", (uint32_t *)&cmd, sizeof(cmd) / 4);
   }
   {
     // The picture-level parameters of HevcBasicFeature's VDENC_CMD2 SETPAR for a low-delay B (or I) picture whose one reference is the previous picture; the values that depend
@@ -166,7 +173,7 @@ int main(int argc, char **argv) {
     _VDENC_CMD2_CMD cmd; auto &params = par;
     DO_FIELDS2();
     for (auto &f : par.extSettings) f((uint32_t *)&cmd);
-    dump("CMD2", (uint32_t *)&cmd, 62);
+    dump("CMD2", (uint32_t *)&cmd, sizeof(cmd) / 4);
   }
   if (type == B_TYPE && qp == 26) {
     {
@@ -175,27 +182,28 @@ int main(int argc, char **argv) {
       Cmd::VDENC_PIPE_MODE_SELECT_CMD cmd; auto &params = par;
       DO_FIELDS_PMS();
       PMS_OVERRIDE
-      dump("PMS", (uint32_t *)&cmd, 6);
+      dump("PMS", (uint32_t *)&cmd, sizeof(cmd) / 4);
     }
     {
       WEIGHTS_PAR par; par.denomLuma = 1;
       Cmd::VDENC_WEIGHTSOFFSETS_STATE_CMD cmd; auto &params = par;
       DO_FIELDS_WO();
-      dump("WO", (uint32_t *)&cmd, 7);
+      dump("WO", (uint32_t *)&cmd, sizeof(cmd) / 4);
     }
     {
       TILE_PAR par; par.tileWidth = 64; par.tileHeight = 64; par.ctbSize = 64; par.numPipe = 0;
       Cmd::VDENC_HEVC_VP9_TILE_SLICE_STATE_CMD cmd; auto &params = par;
       DO_FIELDS_TSS();
-      dump("TSS", (uint32_t *)&cmd, 28);
+      TSS_EXTRA
+      dump("TSS", (uint32_t *)&cmd, sizeof(cmd) / 4);
     }
     {
       WALKER_PAR par; par.firstSuperSlice = false;
       Cmd::VDENC_WALKER_STATE_CMD cmd; auto &params = par;
       DO_FIELDS_WALK();
-      dump("WALK", (uint32_t *)&cmd, 3);
+      dump("WALK", (uint32_t *)&cmd, sizeof(cmd) / 4);
     }
-    { Cmd::VDENC_PIPE_BUF_ADDR_STATE_CMD cmd; dump("PBA", (uint32_t *)&cmd, 89); }
+    { Cmd::VDENC_PIPE_BUF_ADDR_STATE_CMD cmd; dump("PBA", (uint32_t *)&cmd, sizeof(cmd) / 4); }
   }
 }
 '''
@@ -217,22 +225,28 @@ def build_harness(d, tmp, plat):
     macros = ''.join([
         fields_macro(d + '/impl_common.h', 'VDENC_CMD1', 'DO_FIELDS1'), fields_macro(d + '/impl_common.h', 'VDENC_CMD2', 'DO_FIELDS2'),
         fields_macro(d + '/impl_common.h', 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS'),
-        fields_macro(d + '/' + plat['pms_impl'], 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS_LPM') if plat['pms_impl'] else '',
+        ''.join(fields_macro(d + '/' + f, 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS_%d' % i) for i, f in enumerate(plat.get('pms', []))),
+        ''.join(fields_macro(d + '/' + f, 'VDENC_CMD1', 'DO_FIELDS1_X%d' % i) for i, f in enumerate(plat.get('cmd1', []))),
+        ''.join(fields_macro(d + '/' + f, 'VDENC_HEVC_VP9_TILE_SLICE_STATE', 'DO_FIELDS_TSS_X%d' % i) for i, f in enumerate(plat.get('tss', []))),
         fields_macro(d + '/impl_common.h', 'VDENC_WEIGHTSOFFSETS_STATE', 'DO_FIELDS_WO'), fields_macro(d + '/impl_common.h', 'VDENC_HEVC_VP9_TILE_SLICE_STATE', 'DO_FIELDS_TSS'),
         fields_macro(d + '/impl_common.h', 'VDENC_WALKER_STATE', 'DO_FIELDS_WALK')])
-    src = HARNESS.replace('HWCMD_INCLUDE', plat['hwcmd_include']).replace('NAMESPACE', plat['ns']).replace('PMS_OVERRIDE', 'DO_FIELDS_PMS_LPM();' if plat['pms_impl'] else '').replace('PAR_STRUCTS', pars).replace('BODIES', bodies).replace('FIELD_MACROS', macros)
+    src = HARNESS.replace('HWCMD_INCLUDE', plat['hwcmd_include']).replace('NAMESPACE', plat['ns']).replace('PMS_OVERRIDE', ' '.join('DO_FIELDS_PMS_%d();' % i for i in range(len(plat.get('pms', []))))).replace('CMD1_EXTRA', ' '.join('DO_FIELDS1_X%d();' % i for i in range(len(plat.get('cmd1', []))))).replace('TSS_EXTRA', ' '.join('DO_FIELDS_TSS_X%d();' % i for i in range(len(plat.get('tss', []))))).replace('PAR_STRUCTS', pars).replace('BODIES', bodies).replace('FIELD_MACROS', macros)
     os.makedirs(tmp + '/stub', exist_ok=True)
     open(tmp + '/stub/mhw_hwcmd.h', 'w').write('''#pragma once
 #include <stdint.h>
 #include <string.h>
 #include <stddef.h>
 #define MOS_ZeroMemory(p, s) memset(p, 0, s)
+#define MEDIA_CLASS_DEFINE_END(x)
 #define __CODEGEN_MAX(_a, _b) (((_a) > (_b)) ? (_a) : (_b))
 #define __CODEGEN_BITFIELD(l, h) (h) - (l) + 1
 #define __CODEGEN_OP_LENGTH_BIAS 2
 #define __CODEGEN_OP_LENGTH(x) (uint32_t)((__CODEGEN_MAX(x, __CODEGEN_OP_LENGTH_BIAS)) - __CODEGEN_OP_LENGTH_BIAS)
 ''')
     open(tmp + '/stub/mos_utilities.h', 'w').write('#include "mhw_hwcmd.h"\n')   # (the Xe_HPM header includes this one)
+    open(tmp + '/stub/mhw_vdbox_vdenc_hwcmd_ext.h', 'w').write('')
+    for f in os.listdir(d):   # (the const settings include their CMD2 tables from *_open.h files)
+        if f.endswith('_open.h') or f.startswith('encode_'): open(tmp + '/stub/' + f, 'w').write(open(d + '/' + f).read())
     open(tmp + '/main.cpp', 'w').write(src)
     subprocess.check_call(['g++', '-std=c++17', '-w', '-I' + tmp + '/stub', '-I' + tmp + '/hdr', tmp + '/main.cpp', '-o', tmp + '/harness'])
     return tmp + '/harness'
@@ -272,6 +286,7 @@ def main():
             for n, (dw, lo, hi) in sorted(parse_fields(struct_text(header, struct, indent)).items(), key=lambda kv: kv[1]):
                 o.append('constexpr EncodeField k' + P + '%s_%s = {%d, %d, %d};' % (name, n, dw, lo, hi))
     for tag, name, struct, dwords in [('CMD1', 'VdencCmd1', '_VDENC_CMD1_CMD', 33), ('CMD2', 'VdencCmd2', '_VDENC_CMD2_CMD', 62)]:
+        dwords = len(runs[(3, 26)][tag])
         varying = sorted({i for t in (1, 3) for qp in QPS for i in range(dwords) if runs[(t, qp)][tag][i] != runs[(t, 26)][tag][i]})
         print('%s varies with the quantiser in dwords %s' % (tag, varying), file=sys.stderr)
         assert len(varying) == 1, 'unexpected quantiser dependence'

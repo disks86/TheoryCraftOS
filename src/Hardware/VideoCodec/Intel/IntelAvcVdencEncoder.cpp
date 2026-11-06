@@ -44,7 +44,6 @@ bool IntelAvcVdencEncoder::prepare() {
   if (config_.codec != VideoCodec::H264) return false;
   if (config_.input != PixelFormat::I420 && config_.input != PixelFormat::Nv12 && config_.input != PixelFormat::Bgra8888) return false;
   if (config_.width < 16 || config_.height < 16 || config_.width > 4096 || config_.height > 4096) return false;
-  if (buffers_.xe2()) return false;   // (its VDEnc commands are not written yet; Xe-LP, Xe-LPG and Arc's are)
   width_mbs_ = (config_.width + 15) / 16;
   height_mbs_ = (config_.height + 15) / 16;
   if (!intel_enc::avc_encode_layout(width_mbs_, height_mbs_, &layout_)) return false;
@@ -104,7 +103,8 @@ bool IntelAvcVdencEncoder::build_batch(bool idr, uint32_t frame_num, uint32_t* w
   p.deblocking = true;
   p.level_idc = stream_.level_idc;
   p.reference_frame_store = previous;
-  p.xe_lpg = buffers_.xe_lpg();
+  p.xe_lpg = buffers_.xe_lpg() || buffers_.xe2();   // (Xe2 has Xe-LPG's sequence)
+  p.xe2 = buffers_.xe2_hpm() ? 2 : buffers_.xe2() ? 1 : 0;
   p.xe_hpg = buffers_.xe_hpg();
   p.poc = 2 * frame_num;                        // pic_order_cnt_type 2: twice the frame number
   p.reference_poc = 2 * (frame_num - 1);

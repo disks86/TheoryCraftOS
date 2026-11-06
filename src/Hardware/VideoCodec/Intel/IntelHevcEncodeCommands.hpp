@@ -83,7 +83,8 @@ struct HevcEncodeBuffers {
 void hevc_resolve_scratch(const HevcScratchPlan& plan, uint32_t scratch_base, HevcEncodeBuffers* b);
 
 // XeLpg: Meteor Lake and Arrow Lake; XeHpg: Arc Alchemist, whose commands are Xe-LPG's apart from three dwords of CMD2.
-enum class HevcVdencPlatform { XeLp, XeLpg, XeHpg };
+// Xe2Lpm (Lunar Lake) and Xe2Hpm (Arc Battlemage) differ in CMD1 (39 dwords), CMD2 and, for Xe2Hpm, the 7-dword pipe mode select.
+enum class HevcVdencPlatform { XeLp, XeLpg, XeHpg, Xe2Lpm, Xe2Hpm };
 
 struct HevcEncodePicture {
   HevcVdencPlatform platform = HevcVdencPlatform::XeLp;

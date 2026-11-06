@@ -179,7 +179,8 @@ void code_slice_data(Bits* out, bool b_slice, int slice_qp, uint32_t ctbs_x, uin
 struct FakeEncoder {
   int pictures = 0, problems = 0, keyframes = 0;
   bool write_stream = true;                       // the picture is whole 64x64 blocks: write real slice data
-  bool xe_lpg = false;                            // Meteor Lake / Arrow Lake VDEnc commands (else Xe-LP's)
+  bool xe_lpg = false;                            // Meteor Lake / Arrow Lake VDEnc commands (else Xe-LP's); Arc and Xe2 have them too
+  int xe2 = 0;                                    // 1: Lunar Lake (39-dword CMD1), 2: Arc Battlemage (also a 7-dword pipe mode select)
   std::vector<uint32_t> sizes;
   std::vector<uint8_t> last_luma, last_chroma;    // the source surface as the engine read it (visible part)
   uint32_t last_width = 0, last_height = 0;
@@ -233,12 +234,12 @@ struct FakeEncoder {
     for (int k = 0; k < 20; ++k) expect(kHHcpQm, 18, "HCP_QM_STATE");
 
     // --- The VDEnc pipeline.
-    const uint32_t* vmode = expect(kHVdencPipeMode, 6, "VDENC_PIPE_MODE_SELECT");
+    const uint32_t* vmode = expect(kHVdencPipeMode, xe2 == 2 ? 7 : 6, "VDENC_PIPE_MODE_SELECT");
     const uint32_t* vsrc = expect(kHVdencSrc, 6, "VDENC_SRC_SURFACE_STATE");
     const uint32_t* vref = expect(kHVdencRef, 6, "VDENC_REF_SURFACE_STATE");
     const uint32_t* vds = expect(kHVdencDs, 10, "VDENC_DS_REF_SURFACE_STATE");
     const uint32_t* vbuf = expect(kHVdencPipeBuf, xe_lpg ? 89 : 71, "VDENC_PIPE_BUF_ADDR_STATE");
-    const uint32_t* cmd1 = expect(kHVdencCmd1, xe_lpg ? 33 : 31, "VDENC_CMD1");
+    const uint32_t* cmd1 = expect(kHVdencCmd1, xe2 ? 39 : xe_lpg ? 33 : 31, "VDENC_CMD1");
     const uint32_t* pic = expect(kHHcpPicState, 41, "HCP_PIC_STATE");
     const uint32_t* cmd2 = expect(kHVdencCmd2, xe_lpg ? 62 : 51, "VDENC_CMD2");
     if (!vmode || !vsrc || !vref || !vds || !vbuf || !cmd1 || !pic || !cmd2) return;
@@ -463,11 +464,12 @@ uint8_t limited_luma(uint32_t v) { return static_cast<uint8_t>(16 + (v * 219 + 1
 uint8_t limited_chroma(int32_t c) { return static_cast<uint8_t>(128 + ((c - 128) * 224 + (c >= 128 ? 127 : -127)) / 255); }
 
 // Encodes `count` pictures through the session, compares the source surface the engine saw with the input, decodes the packets on the CPU and checks the pictures.
-void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, bool xe_lpg = false, bool arc = false) {
-  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : "");
+void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, bool xe_lpg = false, bool arc = false, int xe2 = 0) {
+  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, xe2 == 2 ? " (Battlemage)" : xe2 ? " (Lunar Lake)" : arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : "");
   Rig2 rig;
-  rig.engine.xe_lpg = xe_lpg || arc;   // (Arc's commands have the same sizes and fields)
-  rig.gpu.xehp = xe_lpg || arc;
+  rig.engine.xe_lpg = xe_lpg || arc || xe2;   // (Arc's and Xe2's commands have the same fields)
+  rig.engine.xe2 = xe2;
+  rig.gpu.xehp = xe_lpg || arc || xe2;
   rig.engine.write_stream = (w % 64 == 0 && h % 64 == 0);
   EncoderConfig cfg;
   cfg.codec = VideoCodec::Hevc;
@@ -484,6 +486,8 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
     VcsDriver::Config driver_config = rig.config();
     driver_config.xe_lpg = xe_lpg;
     driver_config.xe_hpg = arc;
+    driver_config.xe2 = xe2 != 0;
+    driver_config.xe2_hpm = xe2 == 2;
     driver_config.gmd_id_flush = xe_lpg;
     CHECK(driver.initialize(driver_config));
     {
@@ -720,9 +724,11 @@ void test_device(TestAllocator& a) {
       const uint32_t decode = device.info().accelerated_decode_codecs;
       CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && (decode & codec_mask(VideoCodec::Vp9)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
       CHECK(!!(decode & codec_mask(VideoCodec::Av1)) == pl.av1);
-      const bool meteor = pl.id == 0x7D55 || pl.id == 0x56A0;   // Meteor Lake and Arc Alchemist encode on the engine
-      rig_pl.engine.xe_lpg = meteor;
-      CHECK(device.info().accelerated_encode_codecs == (meteor ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0));
+      const bool meteor = pl.id == 0x7D55 || pl.id == 0x56A0;   // Meteor Lake and Arc Alchemist encode H.264 and H.265 on the engine
+      const bool xe2 = pl.id == 0x6420 || pl.id == 0xE20B;      // Lunar Lake and Battlemage
+      rig_pl.engine.xe_lpg = meteor || xe2;
+      rig_pl.engine.xe2 = pl.id == 0xE20B ? 2 : xe2 ? 1 : 0;
+      CHECK(device.info().accelerated_encode_codecs == ((meteor || xe2) ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0));
       EncoderConfig cfg;
       cfg.codec = VideoCodec::Hevc;
       cfg.width = 64;
@@ -734,7 +740,7 @@ void test_device(TestAllocator& a) {
         make_i420(f, 64, 64, 5);
         enc->submit(f.frame());
       }
-      CHECK(rig_pl.engine.pictures == (meteor ? 1 : 0));   // (the CPU, if anything)
+      CHECK(rig_pl.engine.pictures == (meteor || xe2 ? 1 : 0));   // (the CPU, if anything)
     }
     CHECK(rig_pl.gpu.violations.empty() && rig_pl.engine.problems == 0);
   }
@@ -775,6 +781,11 @@ int main() {
   encode_and_check(a, 64, 64, 5, 3, 75, false, true);       // Arc Alchemist
   encode_and_check(a, 72, 40, 4, 2, 40, false, true);
   encode_and_check(a, 1920, 1080, 2, 2, 75, false, true);
+  for (int x2 : {1, 2}) {                                     // Lunar Lake and Arc Battlemage
+    encode_and_check(a, 64, 64, 5, 3, 75, false, false, x2);
+    encode_and_check(a, 128, 128, 6, 6, 1, false, false, x2);
+    encode_and_check(a, 1920, 1080, 2, 2, 75, false, false, x2);
+  }
   test_rejections(a);
   test_other_generations(a);
   test_hang(a);
