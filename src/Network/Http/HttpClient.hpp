@@ -25,9 +25,12 @@
 //   http.run(20000);                                 // or: while (http.busy()) { stack.poll(); http.poll(); }
 //   if (http.state() == HttpState::Done) use(http.status(), http.header("content-type"), http.body());
 //
-//   - The host name is looked up through the stack's DNS resolver (a dotted-quad address is used as it is), the connection is opened, wrapped
-//     in TLS for https (the certificate must be valid for the host name and chain to the trust store), and the request goes out with
-//     "Connection: close": every request has its own connection.
+//   - The host name is looked up through the stack's DNS resolver (an address - dotted-quad, or IPv6 in brackets - is used as it is), the
+//     connection is opened, wrapped in TLS for https (the certificate must be valid for the host name and chain to the trust store), and the
+//     request goes out with "Connection: close": every request has its own connection.
+//   - Where the stack has an IPv6 route, AAAA records are asked for along with A records, and an IPv6 address is tried first; the IPv4 one is
+//     tried as well if IPv6 has not connected within kFallbackDelayMs or fails (Happy Eyeballs, RFC 8305, in its simple form: one address of each
+//     version), and the first connection to complete is used.
 //   - Answers with Content-Length, "Transfer-Encoding: chunked" (extensions and trailers are skipped) and ones that simply end with the
 //     connection are all understood. 1xx interim answers are skipped. HEAD answers, 204 and 304 have no body.
 //   - Redirects (301, 302, 303, 307, 308) are followed, up to set_max_redirects() (default 5): a 303, and a 301 or 302 to a POST, becomes
@@ -97,6 +100,8 @@ struct WebSocketMessage {
 class HttpClient {
  public:
   static constexpr uint32_t kMaxHeadBytes = 64 * 1024;
+  static constexpr uint32_t kFallbackDelayMs = 250;     // how long IPv6 may take to connect before IPv4 is tried too (RFC 8305's suggestion)
+  static constexpr uint32_t kResolutionDelayMs = 50;    // how long to wait for the AAAA answer once the A answer is in
 
   HttpClient(INetworkStack& stack, allocators::IAllocator& allocator);
   ~HttpClient();
@@ -217,6 +222,9 @@ class HttpClient {
   bool decode_body();
   bool begin_websocket_connection();
   bool open_tcp();
+  HttpError open_attempt(const IpAddress& address, SharedPointer<ITcpSocket>* socket, TlsSocket** tls);
+  bool resolution_done(uint64_t now);
+  void poll_connecting(uint64_t now);
   bool try_http3();
   void poll_http3(uint64_t now);
   bool h3_head();
@@ -251,11 +259,17 @@ class HttpClient {
   // progress
   HttpState state_ = HttpState::Idle;
   HttpError error_ = HttpError::None;
-  SharedPointer<IDnsQuery> dns_;
-  Ipv4Address address_;
+  SharedPointer<IDnsQuery> dns_, dns6_;   // the A and AAAA lookups (dns6_ only where IPv6 reaches beyond the link)
+  uint64_t dns_answered_ms_ = 0;         // when the A answer came, while the AAAA one is still awaited
+  IpAddress address_;                    // the address in use (or tried first)
+  IpAddress fallback_address_;           // the other version's, tried as well after kFallbackDelayMs (has_fallback_)
+  bool has_fallback_ = false, fallback_started_ = false;
+  uint64_t fallback_at_ms_ = 0;
   bool literal_address_ = false;
   SharedPointer<ITcpSocket> socket_;
   TlsSocket* tls_socket_ = nullptr;   // socket_ when it is TLS
+  SharedPointer<ITcpSocket> racer_;   // the fallback attempt, while both are connecting
+  TlsSocket* racer_tls_ = nullptr;
   ByteBuffer request_head_;
   uint64_t sent_ = 0, request_total_ = 0;
   uint64_t deadline_ms_ = 0, last_progress_ms_ = 0;

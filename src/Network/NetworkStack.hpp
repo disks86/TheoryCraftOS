@@ -77,7 +77,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   bool resolve(StringView name, uint32_t timeout_ms, Ipv4Address* address) override;
   IDnsResolver& dns() override { return *resolver_; }
   bool ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_ms) override;
-  SharedPointer<IUdpSocket> udp_open(uint16_t port) override;
+  SharedPointer<IUdpSocket> udp_open(uint16_t port) override { return udp_open_families(port, IpFamilies::Both); }
+  SharedPointer<IUdpSocket> udp_open_families(uint16_t port, IpFamilies families) override;
   SharedPointer<ITcpSocket> tcp_open() override;
   bool join_multicast(Ipv4Address group) override;
   void leave_multicast(Ipv4Address group) override;

@@ -30,7 +30,7 @@ class UdpManager {
 
   // Opens a socket on `port` (0 = pick an unused one). Null if the port is in use
   // or memory ran out.
-  SharedPointer<UdpSocket> open(uint16_t port);
+  SharedPointer<UdpSocket> open(uint16_t port, IpFamilies families = IpFamilies::Both);
 
   // A UDP datagram arrived in an IP packet: `segment` is the UDP header and data.
   // True if a socket took it.
@@ -41,7 +41,7 @@ class UdpManager {
   void reap();
 
  private:
-  bool port_in_use(uint16_t port) const;
+  bool port_in_use(uint16_t port, IpFamilies families) const;
 
   IIpLayer& ip_;
   allocators::IAllocator& allocator_;

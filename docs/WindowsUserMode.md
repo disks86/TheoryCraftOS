@@ -198,28 +198,46 @@ Test: `tests/windows/advapitest.c` (also acts as its own service).
 ## Sockets
 
 `ws2_32.dll` (`src/Windows/ws2_32/ws2_32.c`) is Winsock over `src/Process/Sockets.{hpp,cpp}` and the NT services above - this OS's own, unlike real Windows, where Winsock
-talks to a device driver (`afd.sys`) through its own ioctl protocol rather than NT services. IPv4 only: `AF_INET`/`SOCK_STREAM`/`SOCK_DGRAM`, over whatever network
+talks to a device driver (`afd.sys`) through its own ioctl protocol rather than NT services. `AF_INET` and `AF_INET6`, `SOCK_STREAM`/`SOCK_DGRAM`, over whatever network
 interfaces `src/Network/NetworkStackSet` has (set as the system's sockets at boot once at least one interface exists, right after its service thread starts). A `SOCKET`
 is the same kernel `HANDLE` a program's other descriptors are (`DescriptorKind::Socket`), closed and duplicated/inherited exactly like a pipe handle. `WSAStartup`/
 `WSACleanup`, `socket`, `bind`, `connect` (blocking retries the handshake itself; non-blocking returns `WSAEWOULDBLOCK` until `select()`'s except/write sets or
 `getpeername` show how it resolved), `listen`, `accept`, `send`/`recv`, `sendto`/`recvfrom`, `shutdown`, `ioctlsocket` (`FIONBIO`, `FIONREAD`), `select` (up to 64 sockets
-per set), `getsockname`/`getpeername`, `closesocket`, `WSAGetLastError`/`WSASetLastError`, `htons`/`htonl`/`ntohs`/`ntohl`, `inet_addr`/`inet_ntoa` (a buffer per thread) all work. A failing NT
+per set), `getsockname`/`getpeername`, `closesocket`, `WSASocketA`/`WSASocketW`, `setsockopt`/`getsockopt`, `WSAGetLastError`/`WSASetLastError`, `htons`/`htonl`/`ntohs`/`ntohl`,
+`inet_addr`/`inet_ntoa` (a buffer per thread) all work. A failing NT
 status is mapped to its own WSA error (`WSAECONNREFUSED`, `WSAEWOULDBLOCK` and so on), not a plain Win32 one - `WSAGetLastError` still reads the same per-thread slot as
 `GetLastError`, matching the real one.
 
-Addresses: a program's `in_addr` has the first octet first in memory (as on Windows: `htonl(INADDR_LOOPBACK)`, `inet_pton` and a byte copy all give it); the socket services
-take and give an IPv4 address as one integer with the first octet in the top byte (`network::Ipv4Address::value()`), so ws2_32 swaps it at the boundary (`kernel_address` /
-`program_address`). Until November 2026 ws2_32 passed the integer through and its own `inet_addr` produced the reversed form, so only addresses made by `inet_addr` worked:
-`htonl(INADDR_LOOPBACK)` reached 1.0.0.127. `inet_pton`/`inet_ntop`/`InetPtonW`/`InetNtopW` (IPv4 with Windows' strict rules, IPv6 with `::` and a dotted tail), `gethostname`
-and name resolution without DNS: `getaddrinfo`/`GetAddrInfoW`/`freeaddrinfo`/`FreeAddrInfoW` answer numeric addresses (an IPv6 literal as an `AF_INET6` entry), a NULL node
-(the wildcard with `AI_PASSIVE`, else the loopback), `localhost` and the machine's own name (its interface address), with numeric or well-known services; any other name is
-`WSAHOST_NOT_FOUND`. `getnameinfo`/`GetNameInfoW` give numeric text (`localhost` for 127/8). The name-space lookups (`WSALookupService*`) find nothing. Tests:
-`scripts/winetest.sh ws2_32 tcos_resolve protocol` (`tests/windows/wine/ws2_32/tcos_resolve.c`, 63 checks, 0 failures; Wine's protocol test 1287 failures, most in
-`WSAEnumProtocols`, `WSAStringToAddress`/`WSAAddressToString`, the legacy `inet_addr` forms and `getservbyname`, then a crash at a table it reads without checking).
+Addresses: every service that takes or gives an address uses the program's own `SOCKADDR_IN` (16 bytes) or `SOCKADDR_IN6` (28 bytes) as it is in memory, with its
+length (`NtBindSocket(handle, address, length)`, `NtAcceptSocket(handle, &result, peer, &peer_length)` and so on; see `src/Process/WindowsSockets.hpp`), so ws2_32 passes
+them through and the kernel reads them with a bounds-checked codec (`src/Process/SocketAddress.hpp`). A buffer the kernel fills holds its capacity going in and the size
+written coming out; one too small is `STATUS_BUFFER_TOO_SMALL` (`WSAEFAULT`), found before a connection or datagram is taken. (Until November 2026 the services took an IPv4
+address as one integer, which ws2_32 byte-swapped at the boundary; before that it passed the integer through and only addresses made by its own `inet_addr` worked.)
 
-Not done: IPv6 sockets, DNS for Windows programs (the kernel's own network stack resolves names for itself), `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O,
-`SO_RCVTIMEO`/`SO_SNDTIMEO` and other `setsockopt` options (accepted, not applied), multicast, raw sockets, the legacy `inet_addr` forms (hex, octal, fewer than four parts),
-and binding to one particular local address (every socket uses the address of the interface it is on).
+IPv6: an `AF_INET6` socket is IPv6-only by default (`IPV6_V6ONLY` on, as on Windows); `setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)` before it is bound or used makes it
+dual-stack, so it also reaches IPv4 hosts through IPv4-mapped addresses (`::ffff:a.b.c.d`) and sees IPv4 peers as such. The network stack keeps listeners and UDP ports per
+IP version (`network::IpFamilies`): an `AF_INET` and an `AF_INET6` socket can listen on the same port, a dual-stack one takes the port for both. Global addresses (from SLAAC),
+link-local ones and `::1` all work; a link-local destination uses the first interface with a link-local address (the scope id is not used to pick one). The largest UDP
+datagram is 1452 bytes over IPv6 (1472 over IPv4). `setsockopt` applies `IPV6_V6ONLY`; `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_BROADCAST`, `SO_LINGER`, `SO_SNDBUF`/`SO_RCVBUF`,
+`SO_SNDTIMEO`/`SO_RCVTIMEO`, `SO_EXCLUSIVEADDRUSE`, `TCP_NODELAY`, `IP_TOS`/`IP_TTL` and `IPV6_UNICAST_HOPS` are accepted and change nothing (the stack has one fixed
+behaviour for each); `getsockopt` answers `SO_TYPE`, `SO_ERROR`, `IPV6_V6ONLY` and those; anything else is `WSAENOPROTOOPT`.
+
+Names and text: `inet_pton`/`inet_ntop`/`InetPtonW`/`InetNtopW` (IPv4 with Windows' strict rules, IPv6 with `::` and a dotted tail), `WSAStringToAddressA`/`W` and
+`WSAAddressToStringA`/`W` (`a.b.c.d:port`, `[v6%scope]:port`, the port left out when it is 0), `gethostname`, and `getaddrinfo`/`GetAddrInfoW`/`freeaddrinfo`/`FreeAddrInfoW`:
+numeric addresses (`AI_V4MAPPED` maps an IPv4 one for `AF_INET6`), a NULL node (the wildcard with `AI_PASSIVE`, else the loopback, of the family asked for), `localhost`
+(`::1` then `127.0.0.1`, as on Windows) and the machine's own name (its global IPv6 address, if it has one, and its IPv4 address) are answered in ws2_32; any other name goes to
+the kernel's DNS resolver (`NtSocketControl` `ResolveName`, which waits for the answer): AAAA and A records for `AF_UNSPEC` (AAAA only when some interface has a global IPv6
+address and a router, like Windows' default address-configuration check), IPv6 first. `getnameinfo`/`GetNameInfoW` give numeric text (`localhost` for 127/8); there is no
+reverse lookup. The name-space lookups (`WSALookupService*`) find nothing. `iphlpapi`'s `GetAdaptersAddresses` lists each interface's IPv6 link-local and global addresses,
+its router as a gateway and its RDNSS server, and `::1` on the loopback. Tests: `WindowsSocketTest` (the services over IPv4 and IPv6, dual stack, per-version listeners,
+DNS lookups, the address codec with truncations and bit flips), `tests/windows_ipv6_qemu.sh` (`tests/windows/sock6test.c` in the real kernel under QEMU: TCP and UDP over
+`::1`, dual stack, the text functions, the adapter list, and an echo to the host over the network at `[fec0::2]`), and `scripts/winetest.sh ws2_32 tcos_resolve protocol`
+(`tests/windows/wine/ws2_32/tcos_resolve.c`; Wine's protocol test had 1287 failures before this work, most in `WSAEnumProtocols`, `WSAStringToAddress`/`WSAAddressToString`, the legacy
+`inet_addr` forms and `getservbyname`).
+
+Not done: `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O, applying `SO_RCVTIMEO`/`SO_SNDTIMEO` and the other accepted options, multicast (IPv4 and IPv6), raw
+sockets, reverse DNS, `gethostbyname`/`gethostbyaddr` (still stubs), the legacy `inet_addr` forms (hex, octal, fewer than four parts), binding to one particular local address
+(every socket uses the addresses of the interface it is on), and the scope id of a link-local address.
 
 The loopback: a packet to 127.0.0.0/8 or to the interface's own address never reaches the wire. `NetworkStack::send_ip_from` puts it in a queue of the same stack and
 `poll()` delivers it (with what it sends in answer, up to a bound per poll); a packet to 127/8 goes out from the address it is sent to (`IIpLayer::source_for`, which the

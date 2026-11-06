@@ -84,6 +84,23 @@ int main() {
     CHECK(!certificate_matches_host(c, "a.b.lab.example.com") && !certificate_matches_host(c, "lab.example.com") && !certificate_matches_host(c, ".lab.example.com") && !certificate_matches_host(c, "example.com") && !certificate_matches_host(c, ""));
     CHECK(certificate_matches_host(c, "printer.example.com.") && !certificate_matches_host(c, "xprinter.example.com") && !certificate_matches_host(c, "printer.example.comx"));
     CHECK(certificate_matches_ipv4(c, 0x0a000002) && !certificate_matches_ipv4(c, 0x0a000003));
+    // IPv6 iPAddress entries are 16 bytes; a 4-byte one never matches an IPv6 address (nor a 16-byte one an IPv4 address), and a cut-short SAN ends the scan
+    {
+      const uint8_t v6_addr[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42};
+      const uint8_t other[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x43};
+      const uint8_t four[16] = {10, 0, 0, 2};
+      std::vector<uint8_t> san = {0x82, 3, 'a', '.', 'b', 0x87, 4, 10, 0, 0, 2, 0x87, 16};
+      san.insert(san.end(), v6_addr, v6_addr + 16);
+      Certificate fake;
+      fake.san = ConstByteView(san.data(), san.size());
+      CHECK(certificate_matches_ipv6(fake, v6_addr) && !certificate_matches_ipv6(fake, other) && !certificate_matches_ipv6(fake, four));
+      CHECK(certificate_matches_ipv4(fake, 0x0a000002) && !certificate_matches_ipv4(c, 0x20010db8));
+      CHECK(!certificate_matches_ipv6(c, v6_addr));      // (the chain-A leaf has only an IPv4 address)
+      for (size_t cut = 0; cut < san.size(); ++cut) {
+        fake.san = ConstByteView(san.data(), cut);
+        CHECK(!certificate_matches_ipv6(fake, v6_addr));
+      }
+    }
     CHECK(parse_certificate(ConstByteView(a[1].data(), a[1].size()), &c) == CertStatus::Ok && c.key_type == KeyType::EcP384 && c.is_ca && c.path_length == 0 && (c.key_usage & Certificate::kKeyCertSign) && c.sig_alg == SignatureAlgorithm::RsaSha256);
     CHECK(parse_certificate(ConstByteView(a[2].data(), a[2].size()), &c) == CertStatus::Ok && c.key_type == KeyType::Rsa && c.is_ca && c.self_issued() && c.path_length == -1);
     CHECK(parse_certificate(ConstByteView(b[0].data(), b[0].size()), &c) == CertStatus::Ok && c.key_type == KeyType::Rsa && c.sig_alg == SignatureAlgorithm::RsaPssSha384);

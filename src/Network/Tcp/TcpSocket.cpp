@@ -74,10 +74,11 @@ void TcpSocket::prepare_to_connect(uint16_t local_port, uint32_t initial_sequenc
   if (!send_buffer_.reserve(kBufferSize) || !receive_buffer_.reserve(kBufferSize)) failed_ = true;
 }
 
-bool TcpSocket::listen(uint16_t port) {
+bool TcpSocket::listen_families(uint16_t port, IpFamilies families) {
   StackLock guard(ip_);
-  if (state_ != TcpState::Closed || failed_ || port == 0 || manager_.listening_on(port)) return false;
+  if (state_ != TcpState::Closed || failed_ || port == 0 || manager_.listening_on(port, families)) return false;
   local_port_ = port;
+  listen_families_ = families;
   enter(TcpState::Listen);
   return true;
 }

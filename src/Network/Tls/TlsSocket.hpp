@@ -45,6 +45,8 @@ enum class TlsError : uint8_t {
 struct TlsConfig {
   const char* server_name = nullptr;           // sent as SNI and checked against the certificate; copied
   uint32_t server_ipv4 = 0;                    // checked against the certificate's IP addresses when there is no name (connect() fills it in)
+  bool has_server_ipv6 = false;                // the same for an IPv6 server (connect_ip() fills it in)
+  Ipv6Address server_ipv6 = kIpv6Any;
   // INSECURE: with neither a name nor an address to check (an inner socket without server_name), accept a certificate whatever host it names.
   // Without this the handshake fails then: a valid certificate for some other host proves nothing.
   bool skip_hostname_check = false;
@@ -83,7 +85,8 @@ class TlsSocket final : public ITcpSocket {
 
   // ITcpSocket
   TcpState state() const override;
-  bool connect(Ipv4Address address, uint16_t port) override;
+  bool connect(Ipv4Address address, uint16_t port) override { return connect_ip(IpAddress(address), port); }
+  bool connect_ip(const IpAddress& address, uint16_t port) override;
   bool listen(uint16_t) override { return false; }
   SharedPointer<ITcpSocket> accept() override { return SharedPointer<ITcpSocket>(); }
   uint32_t send(ConstByteView data) override;
@@ -97,6 +100,7 @@ class TlsSocket final : public ITcpSocket {
   void abort() override;
   uint16_t local_port() const override { return inner_ ? inner_->local_port() : 0; }
   Ipv4Address remote_address() const override { return inner_ ? inner_->remote_address() : Ipv4Address(); }
+  IpAddress remote_ip() const override { return inner_ ? inner_->remote_ip() : IpAddress(); }
   uint16_t remote_port() const override { return inner_ ? inner_->remote_port() : 0; }
 
   // TLS details

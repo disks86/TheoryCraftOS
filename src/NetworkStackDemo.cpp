@@ -17,6 +17,8 @@
  */
 
 #include "NetworkStackDemo.hpp"
+#include "Network/Http/HttpClient.hpp"
+#include "Utility/ByteText.hpp"
 #include "console.hpp"
 
 using namespace network;
@@ -263,6 +265,29 @@ bool NetworkStackDemo::check_interface(uint32_t index) {
       line("      TCP bulk echo over IPv6: no answer (optional)\n");
     }
     if (tcp) tcp->close();
+    // The HTTP client (what the browser loads pages with) to an IPv6 literal URL.
+    if (c6.global_ready) {
+      HttpClient http(stack, allocator_);
+      String url(allocator_);
+      url.append("http://[fec0::2]:");
+      url.append_uint(kHostHttp6Port);
+      url.append("/ipv6.txt");
+      const bool fetched = http.start(HttpMethod::Get, url.view()) && http.run(4 * kHostTimeoutMs);
+      const ConstByteView body = http.body();
+      if (fetched && http.status() == 200 && bytes_as_text(body) == StringView("hello over IPv6\n")) {
+        line("      HTTP over IPv6: ok, ");
+        console::put_dec(body.size());
+        line(" bytes from [fec0::2]\n");
+      } else if (fetched) {
+        line("      HTTP over IPv6: FAILED (status ");
+        console::put_dec(http.status());
+        line(")\n");
+      } else {
+        line("      HTTP over IPv6: no answer (optional), ");
+        line(http_error_name(http.error()));
+        line("\n");
+      }
+    }
   }
 
   // A web server on this interface.

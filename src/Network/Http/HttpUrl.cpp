@@ -17,6 +17,7 @@
  */
 
 #include "Network/Http/HttpUrl.hpp"
+#include "Network/Dns/IDnsResolver.hpp"
 #include "Utility/Move.hpp"
 
 namespace network {
@@ -80,6 +81,20 @@ bool normalize_path(StringView path_and_query, String* out) {
 
 }  // namespace
 
+bool HttpUrl::literal_address(IpAddress* address) const {
+  const StringView h = host.view();
+  if (!h.empty() && h[0] == '[') {
+    Ipv6Address v6;
+    if (h.size() < 2 || h[h.size() - 1] != ']' || !parse_ipv6(h.substr(1, h.size() - 2), &v6)) return false;
+    *address = IpAddress(v6);
+    return true;
+  }
+  Ipv4Address v4;
+  if (!parse_ipv4(h, &v4)) return false;
+  *address = IpAddress(v4);
+  return true;
+}
+
 bool HttpUrl::assign_text(String* out) const {
   out->clear();
   if (!out->append(https ? "https://" : "http://") || !out->append(host.view())) return false;
@@ -103,10 +118,25 @@ bool parse_http_url(StringView text, HttpUrl* out) {
   uint64_t end = at;
   while (end < text.size() && text[end] != '/' && text[end] != '?' && text[end] != '#') ++end;
   const StringView authority = text.substr(at, end - at);
-  if (authority.empty() || authority.contains('@') || authority.contains('[') || authority.contains(']')) return false;
+  if (authority.empty() || authority.contains('@')) return false;
   StringView host = authority;
   uint32_t port = https ? 443 : 80;
-  const uint64_t colon = authority.rfind(':');
+  // An IPv6 literal is in brackets ("[2001:db8::1]:8080", RFC 3986 3.2.2); it keeps them in `host`, as it is written in a Host header. No zone ("%eth0").
+  uint64_t colon = StringView::npos;
+  if (authority[0] == '[') {
+    const uint64_t close = authority.find(']');
+    if (close == StringView::npos) return false;
+    Ipv6Address literal;
+    if (!parse_ipv6(authority.substr(1, close - 1), &literal)) return false;
+    host = authority.first(close + 1);
+    if (close + 1 < authority.size()) {
+      if (authority[close + 1] != ':') return false;
+      colon = close + 1;
+    }
+  } else {
+    if (authority.contains('[') || authority.contains(']')) return false;
+    colon = authority.rfind(':');
+  }
   if (colon != StringView::npos) {
     host = authority.first(colon);
     const StringView digits = authority.substr(colon + 1);
@@ -118,7 +148,7 @@ bool parse_http_url(StringView text, HttpUrl* out) {
     }
     if (port == 0 || port > 65535) return false;
   }
-  if (host.empty() || host.size() > 253 || host.contains(':')) return false;
+  if (host.empty() || host.size() > 253 || (host[0] != '[' && host.contains(':'))) return false;
   // The rest: the path and the query, up to a '#'.
   StringView rest = text.substr(end);
   const uint64_t hash = rest.find('#');

@@ -17,8 +17,10 @@
  */
 
 #include "Process/WindowsSockets.hpp"
+#include "Process/SocketAddress.hpp"
 #include "Process/Sockets.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Utility/ByteText.hpp"
 
 namespace process::windowsabi {
 
@@ -27,7 +29,7 @@ namespace {
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du, kNotImplemented = 0xC0000002u,
                    kNoResources = 0xC000009Au, kInfoLengthMismatch = 0xC0000004u, kInvalidInfoClass = 0xC0000003u;
 constexpr uint32_t kStatusWouldBlock = 0xC0000103u;      // "not a directory" everywhere else; here, always on a Socket handle, it means WSAEWOULDBLOCK
-constexpr uint32_t kAfInet = 2, kSockStream = 1, kSockDgram = 2;
+constexpr uint32_t kSockStream = 1, kSockDgram = 2, kNotFound = 0xC0000225u, kBufferTooSmall = 0xC0000023u;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
   if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
@@ -56,12 +58,12 @@ uint32_t give_socket_handle(Process& p, uint32_t id, uint64_t* handle) {
 // Retries `attempt` (one of SocketManager's operations) until it is not "would block" any more, a blocking socket's handles stay busy here instead of returning to
 // the program; a non-blocking one's returns WSAEWOULDBLOCK at once, like it would from the real AFD driver.
 template <typename Attempt>
-uint32_t socket_wait(Process& p, uint64_t id, Attempt&& attempt) {
+uint32_t socket_wait(Process& p, uint64_t id, Attempt&& attempt, bool always_block = false) {
   SocketManager* sockets = system_sockets();
   bool would_block = false;
   uint32_t status = attempt(&would_block);
   if (status != kSuccess || !would_block) return status;
-  if (sockets->is_non_blocking(id)) return kStatusWouldBlock;
+  if (!always_block && sockets->is_non_blocking(id)) return kStatusWouldBlock;
   IProcessRuntime* runtime = p.runtime();
   for (;;) {
     if (p.exited() || (runtime && runtime->interrupted())) return 0xC0000120u;      // STATUS_CANCELLED
@@ -74,6 +76,39 @@ uint32_t socket_wait(Process& p, uint64_t id, Attempt&& attempt) {
   }
 }
 
+// Reads the program's socket address (`length` bytes at `at`, a SOCKADDR_IN or SOCKADDR_IN6). NTSTATUS.
+uint32_t read_address(Process& p, uint64_t at, uint64_t length, network::IpAddress* address, uint16_t* port) {
+  if (at == 0) return kAccessViolation;
+  if (length < kSockaddrInSize) return kInvalidParameter;
+  uint8_t bytes[kSockaddrIn6Size] = {};
+  const uint32_t n = length < kSockaddrIn6Size ? uint32_t(length) : kSockaddrIn6Size;
+  if (!p.read_user(at, ByteView(bytes, n))) return kAccessViolation;
+  return parse_socket_address(ConstByteView(bytes, n), address, port) ? kSuccess : kInvalidParameter;
+}
+
+// Writes a socket address for the program: into `capacity` bytes at `at`, its size to *length_at when that is given. NTSTATUS.
+uint32_t write_address(Process& p, uint64_t at, uint32_t capacity, uint64_t length_at, const network::IpAddress& address, uint16_t port) {
+  uint8_t bytes[kSockaddrIn6Size];
+  const uint32_t n = write_socket_address(ByteView(bytes), address, port);
+  if (n > capacity) return kBufferTooSmall;
+  if (!p.write_user(at, ConstByteView(bytes, n))) return kAccessViolation;
+  if (length_at != 0 && !p.write_user_u32(length_at, n)) return kAccessViolation;
+  return kSuccess;
+}
+
+// A little-endian ULONG of the program's.
+bool read_user_u32(Process& p, uint64_t at, uint32_t* out) {
+  uint8_t in[4] = {};
+  if (!p.read_user(at, ByteView(in, 4))) return false;
+  *out = in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24);
+  return true;
+}
+// An operation's ULONG input (InLength must be 4). NTSTATUS.
+uint32_t read_u32_in(Process& p, uint64_t at, uint32_t length, uint32_t* out) {
+  if (length != 4) return kInfoLengthMismatch;
+  return read_user_u32(p, at, out) ? kSuccess : kAccessViolation;
+}
+
 }  // namespace
 
 void socket_token_add(uint64_t token) { if (SocketManager* sockets = system_sockets()) sockets->add_ref(uint32_t(token)); }
@@ -82,11 +117,12 @@ void socket_token_release(uint64_t token) { if (SocketManager* sockets = system_
 uint32_t nt_create_socket(Process& p, const SyscallRequest& r) {
   SocketManager* sockets = system_sockets();
   if (!sockets) return kNotImplemented;
-  if (r.args[0] != 0 && uint32_t(r.args[0]) != kAfInet) return kInvalidParameter;
+  const uint32_t family = uint32_t(r.args[0]);
+  if (family != 0 && family != kWinAfInet && family != kWinAfInet6) return kInvalidParameter;
   const uint32_t type = uint32_t(r.args[1]);
   if (type != kSockStream && type != kSockDgram) return kInvalidParameter;
   if (r.args[3] == 0) return kAccessViolation;
-  const SocketManager::Created c = sockets->create(type == kSockStream ? SocketProto::Tcp : SocketProto::Udp);
+  const SocketManager::Created c = sockets->create(type == kSockStream ? SocketProto::Tcp : SocketProto::Udp, family == kWinAfInet6);
   if (c.id == 0) return c.status;
   uint64_t handle = 0;
   const uint32_t status = give_socket_handle(p, c.id, &handle);
@@ -99,15 +135,19 @@ uint32_t nt_bind_socket(Process& p, const SyscallRequest& r) {
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
-  return sockets->bind(uint32_t(id), uint32_t(r.args[1]), uint16_t(r.args[2]));
+  network::IpAddress address;
+  uint16_t port = 0;
+  if (const uint32_t status = read_address(p, r.args[1], r.args[2], &address, &port); status != kSuccess) return status;
+  return sockets->bind(uint32_t(id), address, port);
 }
 
 uint32_t nt_connect_socket(Process& p, const SyscallRequest& r) {
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
-  const uint32_t address = uint32_t(r.args[1]);
-  const uint16_t port = uint16_t(r.args[2]);
+  network::IpAddress address;
+  uint16_t port = 0;
+  if (const uint32_t status = read_address(p, r.args[1], r.args[2], &address, &port); status != kSuccess) return status;
   return socket_wait(p, uint32_t(id), [&](bool* would_block) { return sockets->connect(uint32_t(id), address, port, would_block); });
 }
 
@@ -123,7 +163,13 @@ uint32_t nt_accept_socket(Process& p, const SyscallRequest& r) {
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
   if (r.args[1] == 0) return kAccessViolation;
-  uint32_t out_id = 0, peer_address = 0;
+  // The peer's address goes to PeerAddress (capacity *PeerAddressLength, which becomes its size); checked before anything is accepted, so a too-small buffer
+  // loses no connection.
+  uint32_t peer_capacity = 0;
+  if (r.args[2] != 0 && (r.args[3] == 0 || !read_user_u32(p, r.args[3], &peer_capacity))) return kAccessViolation;
+  if (r.args[2] != 0 && peer_capacity < (sockets->is_ipv6(uint32_t(id)) ? kSockaddrIn6Size : kSockaddrInSize)) return kBufferTooSmall;
+  uint32_t out_id = 0;
+  network::IpAddress peer_address;
   uint16_t peer_port = 0;
   const uint32_t status = socket_wait(p, uint32_t(id), [&](bool* would_block) {
     return sockets->accept(uint32_t(id), &out_id, &peer_address, &peer_port, would_block);
@@ -133,14 +179,13 @@ uint32_t nt_accept_socket(Process& p, const SyscallRequest& r) {
   const uint32_t given = give_socket_handle(p, out_id, &handle);
   if (given != kSuccess) return given;
   if (!p.write_user_u64(r.args[1], handle)) { p.close_descriptor(handle / 4 - 1); return kAccessViolation; }
-  if (r.args[2] != 0 && !p.write_user_u32(r.args[2], peer_address)) return kAccessViolation;
-  if (r.args[3] != 0 && !p.write_user_u32(r.args[3], peer_port)) return kAccessViolation;
+  if (r.args[2] != 0) return write_address(p, r.args[2], peer_capacity, r.args[3], peer_address, peer_port);
   return kSuccess;
 }
 
 uint32_t nt_send_socket(Process& p, const SyscallRequest& r) {
-  uint64_t address_arg = 0, port_arg = 0, has_address_arg = 0;
-  if (!argument(p, r, 4, &address_arg) || !argument(p, r, 5, &port_arg) || !argument(p, r, 6, &has_address_arg)) return kAccessViolation;
+  uint64_t to_at = 0, to_length = 0;
+  if (!argument(p, r, 4, &to_at) || !argument(p, r, 5, &to_length)) return kAccessViolation;
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -148,9 +193,11 @@ uint32_t nt_send_socket(Process& p, const SyscallRequest& r) {
   if (length != 0 && r.args[1] == 0) return kAccessViolation;
   uint8_t stack_buffer[kMaxSocketIo_];
   if (length != 0 && !p.read_user(r.args[1], ByteView(stack_buffer, length))) return kAccessViolation;
-  const uint32_t address = uint32_t(address_arg);
-  const uint16_t port = uint16_t(port_arg);
-  const bool has_address = (has_address_arg & 0xFF) != 0;
+  network::IpAddress address;
+  uint16_t port = 0;
+  const bool has_address = to_at != 0;
+  if (has_address)
+    if (const uint32_t status = read_address(p, to_at, to_length, &address, &port); status != kSuccess) return status;
   uint32_t sent = 0;
   const uint32_t status = socket_wait(p, uint32_t(id), [&](bool* would_block) {
     return sockets->send(uint32_t(id), ConstByteView(stack_buffer, length), has_address ? &address : nullptr, has_address ? &port : nullptr, &sent, would_block);
@@ -161,15 +208,19 @@ uint32_t nt_send_socket(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_receive_socket(Process& p, const SyscallRequest& r) {
-  uint64_t from_address_at = 0, from_port_at = 0, peer_closed_at = 0;
-  if (!argument(p, r, 4, &from_address_at) || !argument(p, r, 5, &from_port_at) || !argument(p, r, 6, &peer_closed_at)) return kAccessViolation;
+  uint64_t from_at = 0, from_length_at = 0, peer_closed_at = 0;
+  if (!argument(p, r, 4, &from_at) || !argument(p, r, 5, &from_length_at) || !argument(p, r, 6, &peer_closed_at)) return kAccessViolation;
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
   const uint32_t capacity = uint32_t(r.args[2]) < kMaxSocketIo_ ? uint32_t(r.args[2]) : kMaxSocketIo_;
   if (capacity != 0 && r.args[1] == 0) return kAccessViolation;
+  uint32_t from_capacity = 0;
+  if (from_at != 0 && (from_length_at == 0 || !read_user_u32(p, from_length_at, &from_capacity))) return kAccessViolation;
+  if (from_at != 0 && from_capacity < (sockets->is_ipv6(uint32_t(id)) ? kSockaddrIn6Size : kSockaddrInSize)) return kBufferTooSmall;  // (before a datagram is taken)
   uint8_t stack_buffer[kMaxSocketIo_];
-  uint32_t got = 0, from_address = 0;
+  uint32_t got = 0;
+  network::IpAddress from_address;
   uint16_t from_port = 0;
   bool peer_closed = false;
   const uint32_t status = socket_wait(p, uint32_t(id), [&](bool* would_block) {
@@ -179,8 +230,8 @@ uint32_t nt_receive_socket(Process& p, const SyscallRequest& r) {
   if (status != kSuccess) return status;
   if (got != 0 && !p.write_user(r.args[1], ConstByteView(stack_buffer, got))) return kAccessViolation;
   if (r.args[3] != 0 && !p.write_user_u32(r.args[3], got)) return kAccessViolation;
-  if (from_address_at != 0 && !p.write_user_u32(from_address_at, from_address)) return kAccessViolation;
-  if (from_port_at != 0 && !p.write_user_u32(from_port_at, from_port)) return kAccessViolation;
+  if (from_at != 0 && !peer_closed)
+    if (const uint32_t written = write_address(p, from_at, from_capacity, from_length_at, from_address, from_port); written != kSuccess) return written;
   if (peer_closed_at != 0) {
     const uint8_t flag = peer_closed ? 1 : 0;
     if (!p.write_user(peer_closed_at, ConstByteView(&flag, 1))) return kAccessViolation;
@@ -197,43 +248,105 @@ uint32_t nt_socket_control(Process& p, const SyscallRequest& r) {
   const uint32_t operation = uint32_t(r.args[1]), in_length = uint32_t(r.args[3]), out_length = uint32_t(out_length_arg);
   switch (operation) {
     case 0: {      // Shutdown
-      uint8_t in[4] = {};
-      if (in_length != 4 || !p.read_user(r.args[2], ByteView(in, 4))) return in_length != 4 ? kInfoLengthMismatch : kAccessViolation;
-      return sockets->shutdown(uint32_t(id), in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24));
+      uint32_t how = 0;
+      if (const uint32_t status = read_u32_in(p, r.args[2], in_length, &how); status != kSuccess) return status;
+      return sockets->shutdown(uint32_t(id), how);
     }
-    case 1: {      // SetNonBlocking
+    case 1:        // SetNonBlocking
+    case 6: {      // SetV6Only
       uint8_t in = 0;
       if (in_length != 1 || !p.read_user(r.args[2], ByteView(&in, 1))) return in_length != 1 ? kInfoLengthMismatch : kAccessViolation;
+      if (operation == 6) return sockets->set_v6_only(uint32_t(id), in != 0);
       return sockets->set_non_blocking(uint32_t(id), in != 0) ? kSuccess : kInvalidHandle;
     }
     case 2:      // GetSockName
     case 3: {    // GetPeerName
-      if (out_length < 8) return kInfoLengthMismatch;
-      uint32_t address = 0;
+      network::IpAddress address;
       uint16_t port = 0;
       const bool ok = operation == 2 ? sockets->local_name(uint32_t(id), &address, &port) : sockets->peer_name(uint32_t(id), &address, &port);
       if (!ok) return 0xC0000238u;      // STATUS_NOT_CONNECTED (GetPeerName of an unconnected socket; GetSockName only fails on a bad handle, already ruled out)
-      // address and port are already network-byte-order values (Ipv4Address::value() and SocketManager's swap16()d port): dump them
-      // big-endian, matching a raw sockaddr_in's bytes, not the host's little-endian integer layout.
-      uint8_t out[8];
-      for (int i = 0; i < 4; ++i) out[i] = uint8_t(address >> (8 * (3 - i)));
-      out[4] = uint8_t(port >> 8); out[5] = uint8_t(port); out[6] = out[7] = 0;
-      return p.write_user(out_at, ConstByteView(out, 8)) ? kSuccess : kAccessViolation;
+      const uint32_t written = write_address(p, out_at, out_length, 0, address, port);
+      return written == kBufferTooSmall ? kInfoLengthMismatch : written;
     }
     case 4: {    // BytesReadable (FIONREAD)
       if (out_length < 4) return kInfoLengthMismatch;
       return p.write_user_u32(out_at, sockets->readable(uint32_t(id))) ? kSuccess : kAccessViolation;
     }
     case 5: {    // InterfaceConfiguration (In: ULONG index; Out: address, netmask, gateway, DNS server, each as a sockaddr_in carries it)
-      uint8_t in[4] = {};
-      if (in_length != 4 || !p.read_user(r.args[2], ByteView(in, 4))) return in_length != 4 ? kInfoLengthMismatch : kAccessViolation;
+      uint32_t index = 0;
+      if (const uint32_t status = read_u32_in(p, r.args[2], in_length, &index); status != kSuccess) return status;
       if (out_length < 16) return kInfoLengthMismatch;
       network::IpConfiguration c;
-      if (!sockets->interface_configuration(in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24), &c)) return 0x8000001Au;      // STATUS_NO_MORE_ENTRIES
+      if (!sockets->interface_configuration(index, &c)) return 0x8000001Au;      // STATUS_NO_MORE_ENTRIES
       const uint32_t values[4] = {c.address.value(), c.netmask.value(), c.gateway.value(), c.dns.value()};
       uint8_t out[16];
-      for (uint32_t v = 0; v < 4; ++v) for (int i = 0; i < 4; ++i) out[4 * v + i] = uint8_t(values[v] >> (8 * (3 - i)));
+      ByteWriter w{ByteView(out)};
+      for (uint32_t v : values) w.be32(v);
       return p.write_user(out_at, ConstByteView(out, 16)) ? kSuccess : kAccessViolation;
+    }
+    case 7: {    // GetSocketInfo (Out: ULONG family, ULONG type, BOOLEAN v6only, 3 bytes padding)
+      if (out_length < 12) return kInfoLengthMismatch;
+      uint8_t out[12] = {};
+      ByteWriter w{ByteView(out)};
+      w.le32(sockets->is_ipv6(uint32_t(id)) ? kWinAfInet6 : kWinAfInet);
+      w.le32(sockets->is_tcp(uint32_t(id)) ? kSockStream : kSockDgram);
+      w.u8(sockets->v6_only(uint32_t(id)) ? 1 : 0);
+      return p.write_user(out_at, ConstByteView(out, 12)) ? kSuccess : kAccessViolation;
+    }
+    case 8: {    // InterfaceConfiguration6 (In: ULONG index; Out: link-local, global, router, DNS server (16 bytes each), UCHAR prefix length, UCHAR flags, 2 pad, ULONG MTU)
+      uint32_t index = 0;
+      if (const uint32_t status = read_u32_in(p, r.args[2], in_length, &index); status != kSuccess) return status;
+      if (out_length < 72) return kInfoLengthMismatch;
+      network::Ipv6Configuration c;
+      if (!sockets->interface_configuration6(index, &c)) return 0x8000001Au;
+      uint8_t out[72] = {};
+      ByteWriter w{ByteView(out)};
+      w.bytes(ConstByteView(c.link_local.bytes));
+      w.bytes(ConstByteView(c.global.bytes));
+      w.bytes(ConstByteView(c.router.bytes));
+      w.bytes(ConstByteView(c.dns.bytes));
+      w.u8(c.prefix_length);
+      w.u8(uint8_t((c.link_local_ready ? 1 : 0) | (c.global_ready ? 2 : 0)));      // flags: 1 link-local ready, 2 global ready
+      w.zeros(2);
+      w.le32(c.mtu);
+      return p.write_user(out_at, ConstByteView(out, 72)) ? kSuccess : kAccessViolation;
+    }
+    case 9: {    // ResolveName (In: ULONG family (AF_INET for A, AF_INET6 for AAAA), then the name's bytes; Out: the 4- or 16-byte address). Always waits for the answer.
+      constexpr uint32_t kMaxName = 253;
+      if (in_length < 5 || in_length > 4 + kMaxName) return kInfoLengthMismatch;
+      uint8_t in[4 + kMaxName];
+      if (!p.read_user(r.args[2], ByteView(in, in_length))) return kAccessViolation;
+      ByteReader reader{ConstByteView(in, in_length)};
+      const uint32_t family = reader.le32();
+      if (family != kWinAfInet && family != kWinAfInet6) return kInvalidParameter;
+      const ConstByteView name_bytes = reader.rest();
+      const StringView name = bytes_as_text(name_bytes);      // (the resolver checks it is a valid name)
+      const bool ipv6 = family == kWinAfInet6;
+      if (out_length < (ipv6 ? 16u : 4u)) return kInfoLengthMismatch;
+      SocketManager::NameLookup lookup;
+      if (!sockets->start_lookup(name, ipv6, &lookup)) return kNotFound;
+      network::IpAddress found;
+      const uint64_t started = p.host().monotonic_ns();
+      constexpr uint64_t kLookupLimitNs = 15000000000ull;      // (the resolver gives up by itself sooner: this is only a backstop)
+      bool missing = false;
+      const uint32_t status = socket_wait(p, id, [&](bool* would_block) {
+        const SocketManager::LookupResult result = sockets->lookup_result(lookup, &found);
+        missing = result == SocketManager::LookupResult::NotFound || (result == SocketManager::LookupResult::Pending && p.host().monotonic_ns() - started > kLookupLimitNs);
+        *would_block = result == SocketManager::LookupResult::Pending && !missing;
+        return kSuccess;
+      }, true);
+      if (status != kSuccess) return status;
+      if (missing || found.v6 != ipv6) return kNotFound;
+      if (ipv6) return p.write_user(out_at, ConstByteView(found.ipv6.bytes)) ? kSuccess : kAccessViolation;
+      uint8_t v4[4];
+      ByteWriter w{ByteView(v4)};
+      w.be32(found.ipv4.value());
+      return p.write_user(out_at, ConstByteView(v4)) ? kSuccess : kAccessViolation;
+    }
+    case 10: {   // HasIpv6Route (Out: BOOLEAN: some interface has a global IPv6 address and a default router)
+      if (out_length < 1) return kInfoLengthMismatch;
+      const uint8_t routed = sockets->has_ipv6_route() ? 1 : 0;
+      return p.write_user(out_at, ConstByteView(&routed, 1)) ? kSuccess : kAccessViolation;
     }
     default: return kInvalidInfoClass;
   }

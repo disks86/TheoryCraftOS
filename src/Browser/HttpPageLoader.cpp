@@ -77,10 +77,19 @@ class HttpWebSocket final : public IWebSocket {
 
 }  // namespace
 
+// The first interface that can reach beyond itself: with an IPv4 address, or a global IPv6 one and a router (an IPv6-only network).
+network::INetworkStack* HttpPageLoader::connected_stack() const {
+  for (uint32_t i = 0; i < stacks_.count(); ++i) {
+    network::INetworkStack* stack = stacks_.at(i);
+    if (!stack) continue;
+    const network::Ipv6Configuration c6 = stack->configuration6();
+    if (!stack->configuration().address.is_unspecified() || (c6.global_ready && !c6.router.is_unspecified())) return stack;
+  }
+  return nullptr;
+}
+
 UniquePointer<IWebSocket> HttpPageLoader::open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
-  network::INetworkStack* stack = nullptr;
-  for (uint32_t i = 0; i < stacks_.count() && !stack; ++i)
-    if (!stacks_.at(i)->configuration().address.is_unspecified()) stack = stacks_.at(i);
+  network::INetworkStack* stack = connected_stack();
   if (!stack) {
     error->assign("There is no network connection.");
     return UniquePointer<IWebSocket>();
@@ -104,9 +113,7 @@ UniquePointer<IWebSocket> HttpPageLoader::open_websocket(StringView url, StringV
 }
 
 bool HttpPageLoader::send(network::HttpMethod method, StringView address, StringView content_type, StringView body, PageResult* result) {
-  network::INetworkStack* stack = nullptr;
-  for (uint32_t i = 0; i < stacks_.count() && !stack; ++i)
-    if (!stacks_.at(i)->configuration().address.is_unspecified()) stack = stacks_.at(i);
+  network::INetworkStack* stack = connected_stack();
   if (!stack) {
     result->error.assign("There is no network connection.");
     return false;
@@ -143,9 +150,7 @@ bool HttpPageLoader::exchange(const NetRequest& request, NetResponse* response) 
     response->error.assign("This browser cannot send that kind of request.");
     return false;
   }
-  network::INetworkStack* stack = nullptr;
-  for (uint32_t i = 0; i < stacks_.count() && !stack; ++i)
-    if (!stacks_.at(i)->configuration().address.is_unspecified()) stack = stacks_.at(i);
+  network::INetworkStack* stack = connected_stack();
   if (!stack) {
     response->error.assign("There is no network connection.");
     return false;

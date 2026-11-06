@@ -47,6 +47,7 @@ class HttpPageLoader final : public IPageLoader {
   bool post(StringView address, StringView content_type, StringView body, PageResult* result) override;
 
  private:
+  network::INetworkStack* connected_stack() const;
   bool send(network::HttpMethod method, StringView address, StringView content_type, StringView body, PageResult* result);
   network::NetworkStackSet& stacks_;
   allocators::IAllocator& allocator_;

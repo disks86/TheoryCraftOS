@@ -96,7 +96,7 @@ QuicConnection::Stats QuicConnection::stats() const {
 
 // ---- Starting
 
-bool QuicConnection::connect(Ipv4Address address, uint16_t port, StringView server_name) {
+bool QuicConnection::connect(const IpAddress& address, uint16_t port, StringView server_name) {
   if (state_ != QuicState::Idle) return false;
   crypto::IRandom* random = config_.tls.random;
   if (!random) {
@@ -119,6 +119,7 @@ bool QuicConnection::connect(Ipv4Address address, uint16_t port, StringView serv
   }
   peer_address_ = address;
   peer_port_ = port;
+  if (address.v6 && config_.max_datagram > 1452) config_.max_datagram = 1452;   // (an IPv6 header is 20 bytes longer)
   // the keys everyone can compute
   Space& initial = spaces_[0];
   if (!derive_initial_keys(original_dcid_.view(), &initial.send_keys, &initial.receive_keys)) {
@@ -159,7 +160,11 @@ bool QuicConnection::connect(Ipv4Address address, uint16_t port, StringView serv
   name[n] = 0;
   tls.server_name = n ? name : nullptr;
   tls.alpn = config_.tls.alpn ? config_.tls.alpn : "h3";
-  tls_ = UniquePointer<Tls13Client>::make(allocator_, allocator_, tls, address.value(), w.written());
+  if (address.v6 && tls.server_ipv4 == 0 && !tls.has_server_ipv6) {   // (what the certificate is checked against when there is no name)
+    tls.has_server_ipv6 = true;
+    tls.server_ipv6 = address.ipv6;
+  }
+  tls_ = UniquePointer<Tls13Client>::make(allocator_, allocator_, tls, address.v6 ? 0u : address.ipv4.value(), w.written());
   if (tls_) tls_->set_time_source([](void* stack) { return static_cast<INetworkStack*>(stack)->now_ms(); }, &stack_);
   if (!tls_ || !tls_->start()) {
     error_ = tls_ && tls_->failed() ? QuicError::Tls : QuicError::Internal;
@@ -341,10 +346,10 @@ void QuicConnection::drain_socket() {
   if (!socket_) return;
   uint8_t buffer[2048];
   for (uint32_t guard = 0; guard < 256 && socket_->pending() > 0 && state_ != QuicState::Failed && state_ != QuicState::Closed; ++guard) {
-    Ipv4Address from;
+    IpAddress from;
     uint16_t from_port = 0;
     uint32_t length = 0;
-    if (!socket_->receive_from(ByteView(buffer), &from, &from_port, &length)) break;
+    if (!socket_->receive_from_ip(ByteView(buffer), &from, &from_port, &length)) break;
     if (from != peer_address_ || from_port != peer_port_ || length == 0 || length > sizeof buffer) {
       ++stats_.datagrams_dropped;
       continue;

@@ -79,7 +79,14 @@ static void test_getaddrinfo(void)
         freeaddrinfo(ai);
     }
     ai = NULL;
-    ok(!getaddrinfo("localhost", NULL, NULL, &ai) && ai && address_of(ai)[0] == 127 && address_of(ai)[3] == 1, "localhost\n");
+    /* localhost is ::1 and then 127.0.0.1, as on Windows */
+    ok(!getaddrinfo("localhost", NULL, NULL, &ai) && ai && ai->ai_family == AF_INET6 && ai->ai_next && ai->ai_next->ai_family == AF_INET &&
+       address_of(ai->ai_next)[0] == 127 && address_of(ai->ai_next)[3] == 1, "localhost\n");
+    freeaddrinfo(ai);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    ai = NULL;
+    ok(!getaddrinfo("localhost", NULL, &hints, &ai) && ai && ai->ai_family == AF_INET && !ai->ai_next && address_of(ai)[0] == 127, "localhost for AF_INET\n");
     freeaddrinfo(ai);
     memset(&hints, 0, sizeof(hints));
     hints.ai_flags = AI_PASSIVE;
@@ -136,7 +143,14 @@ static void test_own_name(void)
 
     ok(!gethostname(name, sizeof(name)) && name[0], "gethostname %s\n", name);
     ok(gethostname(name, 1) == SOCKET_ERROR && WSAGetLastError() == WSAEFAULT, "a short buffer\n");
-    ok(!getaddrinfo(name, NULL, NULL, &ai) && ai && ai->ai_family == AF_INET, "this machine's name resolves\n");
+    /* its IPv6 address first when it has a global one (as on Windows), and its IPv4 address */
+    ok(!getaddrinfo(name, NULL, NULL, &ai) && ai, "this machine's name resolves\n");
+    {
+        const ADDRINFOA *p;
+        BOOL ipv4 = FALSE;
+        for (p = ai; p; p = p->ai_next) ipv4 |= p->ai_family == AF_INET;
+        ok(ipv4, "this machine's name has its IPv4 address\n");
+    }
     freeaddrinfo(ai);
 }
 

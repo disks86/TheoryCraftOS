@@ -18,7 +18,8 @@
 
 // Host-side tests for the HTTP client: URL parsing and redirect resolution, requests as they go out, every way an answer can be framed
 // (Content-Length, chunked in tiny pieces, until close), redirects, compression, limits and failures - against a scripted stack - and
-// a whole exchange over two real stacks joined by a fake wire. HTTPS is exercised against real servers by tests/http_live.sh.
+// a whole exchange over two real stacks joined by a fake wire, over IPv4 and IPv6 (AAAA preferred, with the IPv4 fallback when IPv6 is slow or
+// refused). HTTPS is exercised against real servers by tests/http_live.sh.
 #include <functional>
 #include <map>
 #include <stdio.h>
@@ -27,6 +28,7 @@
 #include "Media/Zlib.hpp"
 #include "Network/Http/HttpClient.hpp"
 #include "NetworkHarness.hpp"
+#include "Ipv6Harness.hpp"
 
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
@@ -51,10 +53,19 @@ static void test_urls() {
     CHECK(parse_http_url("http://h.example/", &u) && u.assign_text(&text) && text_of(text.view()) == "http://h.example/");
     // refused
     const char* bad[] = {"", "example.com", "ftp://example.com/", "http://", "http:///path", "http://user@example.com/", "http://example.com:0/", "http://example.com:65536/",
-                         "http://example.com:/", "http://example.com:abc/", "http://[::1]/", "http://exa mple.com/", "http://example.com/a b", "http://example.com/\x01"};
+                         "http://example.com:/", "http://example.com:abc/", "http://::1/", "http://[::1", "http://[::1]x/", "http://[::1]:/",
+                         "http://[fe80::1%25eth0]/", "http://[zz::1]/", "http://[]/", "http://a[::1]/", "http://exa mple.com/", "http://example.com/a b", "http://example.com/\x01"};
     for (const char* s : bad) CHECK(!parse_http_url(s, &u));
     std::string long_host = "http://" + std::string(254, 'a') + "/";
     CHECK(!parse_http_url(long_host.c_str(), &u));
+
+    // IPv6 literals: in brackets, which the host keeps (as a Host header has it)
+    IpAddress literal;
+    CHECK(parse_http_url("http://[::1]/", &u) && text_of(u.host.view()) == "[::1]" && u.port == 80 && u.literal_address(&literal) && literal == IpAddress(kIpv6Loopback));
+    CHECK(parse_http_url("https://[2001:DB8::1]:8443/x?y", &u) && u.port == 8443 && text_of(u.host.view()) == "[2001:DB8::1]" && text_of(u.path.view()) == "/x?y");
+    CHECK(u.literal_address(&literal) && literal == IpAddress(v6("2001:db8::1")) && u.assign_text(&text) && text_of(text.view()) == "https://[2001:DB8::1]:8443/x?y");
+    CHECK(parse_http_url("http://10.0.0.5/", &u) && u.literal_address(&literal) && literal == IpAddress(Ipv4Address::make(10, 0, 0, 5)));
+    CHECK(parse_http_url("http://example.com/", &u) && !u.literal_address(&literal));
 
     // references
     HttpUrl base(a);
@@ -72,6 +83,7 @@ static void test_urls() {
     CHECK(resolve_http_reference(base, "  /padded  ", &r) && text_of(r.path.view()) == "/padded");
     CHECK(!resolve_http_reference(base, "", &r) && !resolve_http_reference(base, "   ", &r));
     CHECK(!resolve_http_reference(base, "a b", &r) && !resolve_http_reference(base, "ftp://x/y", &r));
+    CHECK(resolve_http_reference(base, "//[fe80::2]:81/v6", &r) && text_of(r.host.view()) == "[fe80::2]" && r.port == 81 && text_of(r.path.view()) == "/v6");
   }
   CHECK(g_live == 0);
 }
@@ -535,6 +547,100 @@ static void test_over_the_network() {
   }
 }
 
+// The client on a dual-stack network: lan.b serves HTTP on port 80 (any version) and DNS; both machines have global IPv6 addresses from a router
+// advertisement. `ipv6_only_server` makes the HTTP listener IPv6-only or (false) IPv4-only.
+struct DualStack {
+  Lan lan;
+  DnsServer dns{lan.b, "www.example.com"};
+  SharedPointer<ITcpSocket> listener, conn;
+  std::string received;
+  IpAddress last_peer;
+  uint32_t served = 0;
+  explicit DualStack(IpFamilies families = IpFamilies::Both) {
+    lan.configure_static();
+    IpConfiguration c = lan.a.configuration();
+    c.dns = Ipv4Address::make(10, 0, 0, 2);
+    lan.a.configure(c);
+    lan.run_until([&] { return lan.a.configuration6().link_local_ready && lan.b.configuration6().link_local_ready; }, 3000);
+    lan.nic_a.inbox.push_back(router_advertisement(v6("2001:db8:1::"), 1800));
+    lan.nic_b.inbox.push_back(router_advertisement(v6("2001:db8:1::"), 1800));
+    lan.run_until([&] { return lan.a.configuration6().global_ready && lan.b.configuration6().global_ready; }, 3000);
+    dns.a = Ipv4Address::make(10, 0, 0, 2);
+    dns.aaaa = lan.b.configuration6().global;
+    listener = lan.b.tcp_open();
+    CHECK(listener->listen_families(80, families));
+  }
+  // What lan.b does each step: DNS, and one answer per connection.
+  void serve() {
+    dns.serve();
+    if (!conn && (conn = listener->accept())) { received.clear(); last_peer = conn->remote_ip(); }
+    if (!conn) return;
+    uint8_t b[512];
+    for (uint32_t n; (n = conn->receive(ByteView(b))) > 0;) received.append(reinterpret_cast<char*>(b), n);
+    if (received.find("\r\n\r\n") != std::string::npos) {
+      const char* answer = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+      conn->send(ConstByteView(reinterpret_cast<const uint8_t*>(answer), strlen(answer)));
+      conn->close();
+      conn = SharedPointer<ITcpSocket>();
+      ++served;
+    }
+  }
+  bool fetch(HttpClient& http, const char* url) {
+    if (!http.start(HttpMethod::Get, url)) return false;
+    lan.run_until([&] { serve(); http.poll(); return !http.busy(); }, 20000);
+    return http.state() == HttpState::Done && http.status() == 200 && text_of(http.body()) == "hello";
+  }
+};
+
+static void test_dual_stack() {
+  {
+    // AAAA and A: IPv6 is used
+    DualStack d;
+    HttpClient http(d.lan.a, d.lan.alloc);
+    CHECK(d.fetch(http, "http://www.example.com/"));
+    CHECK(d.last_peer == IpAddress(d.lan.a.configuration6().global) && d.dns.aaaa_queries >= 1);
+    CHECK(d.received.find("Host: www.example.com\r\n") != std::string::npos);
+    // an IPv6 literal: no lookup, and the Host header keeps the brackets
+    const uint32_t before = d.dns.queries;
+    std::string url = "http://[" + text(d.lan.b.configuration6().global) + "]/";
+    CHECK(d.fetch(http, url.c_str()) && d.dns.queries == before && d.last_peer.v6);
+    CHECK(d.received.find("Host: [" + text(d.lan.b.configuration6().global) + "]\r\n") != std::string::npos);
+    // no AAAA record: IPv4 (another name: the answers for the first are cached)
+    d.dns.aaaa = kIpv6Any;
+    d.dns.name = "v4.example.com";
+    CHECK(d.fetch(http, "http://v4.example.com/x") && !d.last_peer.v6 && d.last_peer == IpAddress(Ipv4Address::make(10, 0, 0, 1)));
+  }
+  {
+    // the AAAA record leads nowhere (no host answers neighbor discovery for it): after the fallback delay IPv4 is tried too, and wins
+    DualStack d;
+    d.dns.aaaa = v6("2001:db8:1::dead");
+    HttpClient http(d.lan.a, d.lan.alloc);
+    const uint64_t started = d.lan.clock.us;
+    CHECK(d.fetch(http, "http://www.example.com/"));
+    CHECK(!d.last_peer.v6 && d.served == 1);
+    CHECK(d.lan.clock.us - started >= HttpClient::kFallbackDelayMs * 1000ull && d.lan.clock.us - started < 5000000ull);   // (not the whole connect timeout)
+  }
+  {
+    // the server takes IPv4 only: the IPv6 attempt is refused (a reset), and IPv4 follows at once
+    DualStack d(IpFamilies::V4);
+    HttpClient http(d.lan.a, d.lan.alloc);
+    const uint64_t started = d.lan.clock.us;
+    CHECK(d.fetch(http, "http://www.example.com/"));
+    CHECK(!d.last_peer.v6 && d.lan.clock.us - started < HttpClient::kFallbackDelayMs * 1000ull);
+  }
+  {
+    // ... and IPv6 only: the IPv4 fallback, when it comes, loses; and a host with only an IPv6 address that refuses fails as Connect
+    DualStack d(IpFamilies::V6);
+    HttpClient http(d.lan.a, d.lan.alloc);
+    CHECK(d.fetch(http, "http://www.example.com/") && d.last_peer.v6);
+    d.dns.a = kAnyAddress;
+    HttpClient other(d.lan.a, d.lan.alloc);
+    CHECK(other.start(HttpMethod::Get, "http://[2001:db8:1::ff:fe00:2]:81/"));
+    d.lan.run_until([&] { d.serve(); other.poll(); return !other.busy(); }, 20000);
+    CHECK(other.state() == HttpState::Failed && other.error() == HttpError::Connect);
+  }
+}
+
 int main() {
   test_urls();
   test_requests_and_framing();
@@ -543,6 +649,7 @@ int main() {
   test_redirects();
   test_compression();
   test_over_the_network();
+  test_dual_stack();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("http tests passed\n");
   return 0;

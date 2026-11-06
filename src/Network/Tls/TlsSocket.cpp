@@ -100,15 +100,19 @@ TlsSocket::~TlsSocket() {
 
 // ------------------------------------------------------------------------------------------------ ITcpSocket
 
-bool TlsSocket::connect(Ipv4Address address, uint16_t port) {
+bool TlsSocket::connect_ip(const IpAddress& address, uint16_t port) {
   kernel::ScopedRecursiveMutex lock(stack_.mutex());
   if (state_ != St::Idle || inner_) return false;
   inner_ = stack_.tcp_open();
-  if (!inner_ || !inner_->connect(address, port)) {
+  if (!inner_ || !inner_->connect_ip(address, port)) {
     inner_ = SharedPointer<ITcpSocket>();
     return false;
   }
-  if (config_.server_ipv4 == 0) config_.server_ipv4 = address.value();
+  if (!address.v6 && config_.server_ipv4 == 0) config_.server_ipv4 = address.ipv4.value();
+  if (address.v6 && config_.server_ipv4 == 0 && !config_.has_server_ipv6) {
+    config_.has_server_ipv6 = true;
+    config_.server_ipv6 = address.ipv6;
+  }
   state_ = St::Connecting;
   started_ms_ = stack_.now_ms();
   return true;

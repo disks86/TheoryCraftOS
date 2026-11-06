@@ -164,6 +164,12 @@ struct IpAddress {
   bool is_multicast() const { return v6 ? ipv6.is_multicast() : ipv4.is_multicast(); }
 };
 
+// Which IP versions a listening TCP socket or a UDP port takes traffic from. An IPv4-only and an IPv6-only socket can share a port number; either one and a
+// Both socket cannot (a Winsock AF_INET6 socket is V6 unless IPV6_V6ONLY is turned off, which makes it Both).
+enum class IpFamilies : uint8_t { V4 = 1, V6 = 2, Both = 3 };
+constexpr bool families_overlap(IpFamilies a, IpFamilies b) { return (static_cast<uint8_t>(a) & static_cast<uint8_t>(b)) != 0; }
+constexpr bool families_take(IpFamilies families, bool v6) { return (static_cast<uint8_t>(families) & (v6 ? 2 : 1)) != 0; }
+
 // What SLAAC and the router advertisements gave an interface (RFC 4861, 4862).
 struct Ipv6Configuration {
   Ipv6Address link_local = kIpv6Any;  // fe80::/64 + the MAC's interface identifier, once duplicate address detection passed

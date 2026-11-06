@@ -53,14 +53,14 @@ class TcpStream final : public AsyncStreamBase {
   static constexpr uint32_t kDefaultTimeoutMs = 30000;
 
   // Connects to `address`:`port`, waiting up to `timeout_ms` for the handshake.
-  static StreamStatus connect(network::INetworkStack& stack, allocators::IAllocator& allocator, network::Ipv4Address address,
+  static StreamStatus connect(network::INetworkStack& stack, allocators::IAllocator& allocator, const network::IpAddress& address,
                               uint16_t port, uint32_t timeout_ms, UniquePointer<IAsyncStream>* result);
   // Resolves `host` (a name or dotted quad) first; the timeout covers each step.
   static StreamStatus connect(network::INetworkStack& stack, allocators::IAllocator& allocator, StringView host, uint16_t port,
                               uint32_t timeout_ms, UniquePointer<IAsyncStream>* result);
   // The same without blocking the thread. `result` must stay valid until the task completes.
   static async::Task<StreamStatus> connect_async(network::INetworkStack& stack, allocators::IAllocator& allocator,
-                                                 network::Ipv4Address address, uint16_t port, uint32_t timeout_ms,
+                                                 network::IpAddress address, uint16_t port, uint32_t timeout_ms,
                                                  UniquePointer<IAsyncStream>* result, async::CancellationToken token = {});
   static async::Task<StreamStatus> connect_async(network::INetworkStack& stack, allocators::IAllocator& allocator, StringView host,
                                                  uint16_t port, uint32_t timeout_ms, UniquePointer<IAsyncStream>* result,

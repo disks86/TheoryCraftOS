@@ -96,6 +96,8 @@ class ITcpSocket {
   // The same over either IP version (IPv6 where the stack has it). An IPv6 connection's remote_address() is 0.0.0.0.
   virtual bool connect_ip(const IpAddress& address, uint16_t port) { return !address.v6 && connect(address.ipv4, port); }
   virtual IpAddress remote_ip() const { return IpAddress(remote_address()); }
+  // listen() for connections of the given IP versions only (listen() itself takes both).
+  virtual bool listen_families(uint16_t port, IpFamilies families) { return families == IpFamilies::Both && listen(port); }
 
  protected:
   ITcpSocket() = default;

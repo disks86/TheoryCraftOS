@@ -74,7 +74,7 @@ class QuicConnection {
   QuicConnection& operator=(const QuicConnection&) = delete;
 
   // Opens the UDP socket and sends the first packets. `server_name` is the TLS server name (SNI, certificate check). False if that could not be done.
-  bool connect(Ipv4Address address, uint16_t port, StringView server_name);
+  bool connect(const IpAddress& address, uint16_t port, StringView server_name);   // (IPv4 or IPv6)
   // Receives datagrams, runs the timers, sends what is due.
   void poll();
 
@@ -242,7 +242,7 @@ class QuicConnection {
   bool peer_close_application_ = false;
   String peer_close_reason_;
   SharedPointer<IUdpSocket> socket_;
-  Ipv4Address peer_address_;
+  IpAddress peer_address_;
   uint16_t peer_port_ = 0;
   UniquePointer<Tls13Client> tls_;
   Space spaces_[kSpaceCount];

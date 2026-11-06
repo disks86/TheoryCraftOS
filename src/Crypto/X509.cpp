@@ -511,6 +511,16 @@ bool certificate_matches_ipv4(const Certificate& cert, uint32_t address) {
   return false;
 }
 
+bool certificate_matches_ipv6(const Certificate& cert, const uint8_t (&address)[16]) {
+  ConstByteView in = cert.san;
+  while (!in.empty()) {
+    Tlv g;
+    if (!read_tlv(&in, &g)) return false;
+    if (g.tag == 0x87 && g.content.size() == 16 && g.content.equals(ConstByteView(address))) return true;   // iPAddress, the 16-byte form (RFC 5280 4.2.1.6)
+  }
+  return false;
+}
+
 // ---- trust store
 
 TrustStore::~TrustStore() {
@@ -667,6 +677,8 @@ CertStatus verify_chain(const ConstByteView* certs, uint32_t count, const TrustS
     if (!certificate_matches_host(leaf, options.hostname)) return CertStatus::HostnameMismatch;
   } else if (options.ipv4 != 0) {
     if (!certificate_matches_ipv4(leaf, options.ipv4)) return CertStatus::HostnameMismatch;
+  } else if (options.has_ipv6) {
+    if (!certificate_matches_ipv6(leaf, options.ipv6)) return CertStatus::HostnameMismatch;
   }
 
   // walk up: at each step the current certificate is either a trust anchor itself, or is signed by an anchor, or by a supplied intermediate

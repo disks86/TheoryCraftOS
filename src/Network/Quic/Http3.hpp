@@ -58,7 +58,7 @@ class Http3Exchange {
 
   // Starts connecting to the server; the request (and `body`, which must stay valid until the end) is sent as soon as the connection is up. False if the
   // socket could not be opened or memory ran out.
-  bool start(Ipv4Address address, uint16_t port, StringView server_name, const h3::HeaderList& request, ConstByteView body);
+  bool start(const IpAddress& address, uint16_t port, StringView server_name, const h3::HeaderList& request, ConstByteView body);
   void poll();
   // Gives up: the connection is closed.
   void cancel();
