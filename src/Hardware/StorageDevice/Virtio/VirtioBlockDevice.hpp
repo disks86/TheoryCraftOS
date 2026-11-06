@@ -51,6 +51,7 @@ class VirtioBlockDevice final : public StorageDeviceBase {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  void stop_interrupts() override { disable_interrupts(); }
   bool discard(uint64_t lba, uint64_t blocks) override;
   StorageStatistics statistics() const override;
 

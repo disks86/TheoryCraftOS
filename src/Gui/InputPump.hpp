@@ -45,6 +45,15 @@ class InputPump {
     confine_ = confine;
     confine_context_ = context;
   }
+  // Taps: told every device event before it becomes window events - key releases too, and a relative mouse's motion as it was (the Windows programs' bridge needs both).
+  // The mouse tap gets the position the pointer is about to move to (window coordinates, kept inside the window and confined) and may change it.
+  using KeyTap = void (*)(void* context, const hardware::KeyEvent& event, uint8_t modifiers);
+  using MouseTap = void (*)(void* context, const hardware::MouseEvent& event, int32_t* x, int32_t* y);
+  void set_taps(KeyTap key, MouseTap mouse, void* context) {
+    key_tap_ = key;
+    mouse_tap_ = mouse;
+    tap_context_ = context;
+  }
   // Delivers everything the devices have right now; returns how many events there were.
   uint32_t pump();
   Point cursor() const { return {x_, y_}; }
@@ -58,6 +67,9 @@ class InputPump {
   int32_t x_ = 0, y_ = 0;
   Confine confine_ = nullptr;
   void* confine_context_ = nullptr;
+  KeyTap key_tap_ = nullptr;
+  MouseTap mouse_tap_ = nullptr;
+  void* tap_context_ = nullptr;
   uint8_t buttons_ = 0;
   uint8_t modifiers_ = 0;  // held after the last key event delivered
 };

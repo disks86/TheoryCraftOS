@@ -788,7 +788,7 @@ void test_input() {
   while (t.pk(&m)) {}
   user::inject_key(0xA4, 0x38, true, false);      // left Alt
   user::inject_key(0x43, 0x2E, true, false);
-  CHECK(t.pk(&m) && m.message == 0x104 && m.wparam == 0xA4);
+  CHECK(t.pk(&m) && m.message == 0x104 && m.wparam == 0x12);      // (the message names VK_MENU, as on Windows; the key state keeps VK_LMENU)
   CHECK(t.pk(&m) && m.message == WM_SYSKEYDOWN && m.wparam == 0x43 && (m.lparam & (1u << 29)) != 0);
   user::inject_key(0xA4, 0x38, false, false);
   user::inject_key(0x43, 0x2E, false, false);
@@ -868,7 +868,7 @@ void test_input() {
   user::inject_key('K', 0x25, true, false);
   user::inject_key('K', 0x25, false, false);
   user::inject_key(0xA2, 0x1D, false, false);
-  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.wparam == 0xA2);
+  CHECK(t.pk(&m) && m.message == WM_KEYDOWN && m.wparam == 0x11);      // (VK_CONTROL in the message)
   CHECK(t.pk(&m) && m.message == WM_HOTKEY && m.wparam == 7 && m.hwnd == 0 && (m.lparam & 0xFFFF) == 2 && (m.lparam >> 16) == 'K');
   CHECK(t.pk(&m) && m.message == WM_KEYUP && m.wparam == 'K' || true);
   while (t.pk(&m)) {}

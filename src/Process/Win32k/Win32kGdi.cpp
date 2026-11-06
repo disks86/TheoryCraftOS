@@ -42,7 +42,6 @@ struct State {
   List<uint32_t> free_list;
   UniquePointer<Bitmap> screen;
   uint32_t stock[21] = {};
-  IScreenSink* sink = nullptr;
   uint32_t screen_w = 1024, screen_h = 768;
   const DibMemory* dib_memory = nullptr;
   bool exiting = false;
@@ -55,6 +54,7 @@ bool g_live = false;
 State* state_ptr() { return reinterpret_cast<State*>(g_state_memory); }
 
 void init_stock(State& st);
+uint32_t g_first_screen_w = 1024, g_first_screen_h = 768;      // the size a new state's screen has (set_screen_size before the state exists)
 
 State* state() {
   allocators::IAllocator* a = system_allocator();
@@ -64,6 +64,8 @@ State* state() {
     new (g_state_memory) State(*a);
     g_live = true;
     State& st = *state_ptr();
+    st.screen_w = g_first_screen_w;
+    st.screen_h = g_first_screen_h;
     st.slots.push_back(Slot{});      // index 0 is never a handle
     init_stock(st);
   }
@@ -246,10 +248,12 @@ uint32_t default_bitmap_handle() {
   return st ? st->stock[20] : 0;
 }
 
+IScreenSink* g_screen_sink = nullptr;      // (outside the state: the desktop sets it before any Windows program made the state)
+
 void sink_changed(const Rect& dirty) {
-  if (!g_live || !state_ptr()->sink) return;
+  if (!g_live || !g_screen_sink) return;
   const Rect r = rect_and(dirty, Rect{0, 0, int32_t(state_ptr()->screen_w), int32_t(state_ptr()->screen_h)});
-  if (!rect_empty(r)) state_ptr()->sink->screen_changed(r);
+  if (!rect_empty(r)) g_screen_sink->screen_changed(r);
 }
 
 Bitmap& screen_bitmap() {
@@ -383,8 +387,13 @@ uint32_t screen_width() { return state() ? state()->screen_w : 0; }
 uint32_t screen_height() { return state() ? state()->screen_h : 0; }
 
 bool set_screen_size(uint32_t width, uint32_t height) {
+  if (width < 16 || height < 16 || width > 16384 || height > 16384) return false;
   State* st = state();
-  if (!st || width < 16 || height < 16 || width > 16384 || height > 16384) return false;
+  if (!st) {      // no system yet (the desktop sizes the screen before any Windows program ran): the state is made at this size
+    g_first_screen_w = width;
+    g_first_screen_h = height;
+    return true;
+  }
   st->screen_w = width;
   st->screen_h = height;
   st->screen.reset();
@@ -397,9 +406,7 @@ ConstByteView screen_pixels() {
   return screen_bitmap().data.view();
 }
 
-void set_screen_sink(IScreenSink* sink) {
-  if (State* st = state()) st->sink = sink;
-}
+void set_screen_sink(IScreenSink* sink) { g_screen_sink = sink; }
 
 uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip) {
   Dc* dc = new_dc(pid);

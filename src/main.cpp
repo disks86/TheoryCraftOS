@@ -19,6 +19,7 @@
 #include "Process/WindowsSystem.hpp"
 #include "Process/Win32k/Win32k.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
+#include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "Process/WindowsFonts.hpp"
 #include "Font/SystemFontService.hpp"
 #include "Jit/CodePageSource.hpp"
@@ -1917,6 +1918,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_clipboard(&clipboard);
     process::win32k::user_misc::install_clipboard_bridge(&clipboard);      // the desktop's clipboard and the Windows programs' clipboard are one
     struct ClipboardBridgeGuard { ~ClipboardBridgeGuard() { process::win32k::user_misc::install_clipboard_bridge(nullptr); } } clipboard_bridge_guard;      // (gone before the clipboard is)
+    // The Windows programs' screen and input: shown in the desktop's "Windows" window, which hands them the keyboard and the mouse (Win32kDesktopBridge.hpp).
+    process::win32k::DesktopBridge windows_bridge;
+    windows_bridge.attach();
+    desktop.set_windows_session(&windows_bridge);
+    struct WindowsBridgeGuard { desktop::Desktop& d; ~WindowsBridgeGuard() { d.set_windows_session(nullptr); } } windows_bridge_guard{desktop};      // (the desktop lets go first)
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);
     explorer_files.set_notifier(on_storage_change, &desktop);
@@ -2418,6 +2424,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   Entry(Level::Ok, "Shutdown").text("network stacks stopped");
   // The virtio-gpu's interrupts end before the kernel does: after that the firmware's interrupt table is back, and a message to our vector would hit it.
   if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) virtio->disable_interrupts();
+  for (uint32_t i = 0; i < storage.count(); ++i) storage.at(i)->stop_interrupts();   // (the same for the disks: their last flush is polled)
   kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   Entry(Level::Ok, "Shutdown").text("threads stopped");
   i2c_hid.stop(input.mice());

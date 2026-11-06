@@ -385,6 +385,16 @@ bool AhciStorageDevice::check_interrupts() {
   return true;
 }
 
+// The port stops interrupting and its waiters poll; then the HBA itself (shared by the ports: stopping it twice does nothing more).
+void AhciStorageDevice::stop_interrupts() {
+  if (interrupts_) {
+    controller_->port_register(port_, kIe) = 0;
+    controller_->detach_port(port_);
+    interrupts_ = false;
+  }
+  controller_->stop_interrupts();
+}
+
 void AhciStorageDevice::shutdown() {
   release_resources();
   controller_->shutdown();

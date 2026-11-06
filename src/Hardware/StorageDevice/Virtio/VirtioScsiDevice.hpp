@@ -46,6 +46,7 @@ class VirtioScsiController {
 
   bool initialize();
   void shutdown();  // safe to repeat
+  void stop_interrupts() { disable_interrupts(); }   // (shutdown, before the kernel stops: completions are polled from then on)
   efi::SystemTable* system_table() const { return st_; }
   uint32_t max_targets() const { return max_targets_; }
   uint32_t depth() const { return slot_count_; }
@@ -134,6 +135,7 @@ class VirtioScsiDevice final : public StorageDeviceBase {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  void stop_interrupts() override { controller_->stop_interrupts(); }
 
  protected:
   bool transfer(bool, uint64_t, uint32_t, ByteView) override { return false; }   // (read/write above do the work)

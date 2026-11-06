@@ -68,6 +68,7 @@ class PartitionStorageDevice final : public IStorageDevice {
     stats_.blocks_discarded += blocks;
     return true;
   }
+  void stop_interrupts() override { parent_.stop_interrupts(); }
 
  private:
   bool in_range(uint64_t lba, uint64_t bytes) const {

@@ -30,7 +30,7 @@ struct Rect { int32_t left = 0, top = 0, right = 0, bottom = 0; };      // RECT:
 // --- The screen: one surface of 32-bit pixels (B, G, R, X bytes; rows top to bottom, pitch = width * 4), made on first use at 1024 x 768.
 uint32_t screen_width();
 uint32_t screen_height();
-bool set_screen_size(uint32_t width, uint32_t height);      // contents are cleared to the desktop colour; false for a size over 16384 or under 16
+bool set_screen_size(uint32_t width, uint32_t height);      // contents are cleared to the desktop colour; false for a size over 16384 or under 16 (before the state exists: its size)
 ConstByteView screen_pixels();                              // the whole surface (valid until the screen is resized)
 // The kernel's desktop shows the surface: it is told what part changed (screen coordinates). Called with the system lock held, so it must only record the rectangle.
 class IScreenSink {

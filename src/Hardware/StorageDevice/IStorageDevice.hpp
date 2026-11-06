@@ -89,6 +89,9 @@ class IStorageDevice : public IHardware {
   // DISCARD on virtio-blk), so flash can erase them ahead of time. What they read afterwards is up to the device. False when the device
   // cannot (StorageInfo::discard), the range is outside it, or it reports an error.
   virtual bool discard(uint64_t lba, uint64_t blocks) { (void)lba; (void)blocks; return false; }
+  // Shutdown, before the kernel stops: the device raises no more interrupts and its requests (the last flush) are polled from here on. After
+  // kernel::stop the firmware's interrupt table is back, and a completion interrupt would land in a handler that never returns.
+  virtual void stop_interrupts() {}
 
  protected:
   constexpr IStorageDevice() = default;
