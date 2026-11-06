@@ -27,4 +27,9 @@ namespace hardware {
 // The temperature in thousandths of a degree Celsius, or -1 if this machine cannot tell. `pci` (may be nullptr) is needed on AMD.
 int32_t cpu_temperature_millicelsius(const IPciBus* pci);
 
+// On AMD the reading goes through the root complex's SMN index/data pair, which other drivers use too. Once the chipset layer owns that pair it
+// registers a reader that takes its lock (SystemChipset); until then (early boot, one core) the pair is used directly. nullptr unregisters.
+using AmdSmnReader = bool (*)(void* context, uint32_t address, uint32_t* value);
+void set_amd_smn_reader(AmdSmnReader reader, void* context);
+
 }  // namespace hardware

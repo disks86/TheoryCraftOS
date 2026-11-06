@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Chipset/Intel/IntelPchChipset.hpp"
+#include "Hardware/Chipset/Intel/IntelPchThermal.hpp"
 
 namespace hardware {
 
@@ -24,6 +25,8 @@ namespace {
 constexpr uint16_t kIntel = 0x8086;
 constexpr uint8_t kFirstChipsetDevice = 0x10;
 constexpr uint16_t kPciCommand = 0x04, kSmbusBar = 0x20, kSmbusHostConfig = 0x40, kBiosControl = 0xDC, kHeciFirmwareStatus = 0x40;
+constexpr uint16_t kTcoBase = 0x50, kTcoControl = 0x54;
+constexpr uint32_t kTcoControlEnable = 1u << 8;
 constexpr uint32_t kCommandIoSpace = 1u << 0;
 constexpr uint8_t kHostConfigEnable = 1u << 0;
 }  // namespace
@@ -73,6 +76,7 @@ void IntelPchChipset::probe(const IPciBus& pci, const ChipsetCpu& cpu) {
   smbus_ = ChipsetSmbus();
   bios_ = IntelBiosProtection();
   me_ = IntelMeStatus();
+  tco_ = IntelTcoLocation();
 
   PciDeviceInfo d;
   for (uint32_t i = 0; pci.pci_device(i, &d); ++i)
@@ -108,6 +112,22 @@ void IntelPchChipset::probe(const IPciBus& pci, const ChipsetCpu& cpu) {
     }
   }
 
+  // The TCO watchdog: its base is in the SMBus function on the hubs i801 hands it out for.
+  if (has_smbus && info_.tco != IntelTcoKind::None && !by_cpu_) {
+    const uint32_t base = pci.read32(smbus.address, kTcoBase);
+    const uint32_t control = pci.read32(smbus.address, kTcoControl);
+    if (base == 0xFFFFFFFFu || !(control & kTcoControlEnable)) {
+      tco_.reason = "TCO decoding left off by the firmware";
+    } else if ((base & 0xFFE0) == 0 || (base >> 16) != 0) {
+      tco_.reason = "TCO has no I/O base";
+    } else {
+      tco_.usable = true;
+      tco_.io_base = static_cast<uint16_t>(base & 0xFFE0);
+      tco_.kind = info_.tco;
+      tco_.reason = "";
+    }
+  }
+
   // BIOS flash protection: the SPI function (00:1F.5) where there is one, else the LPC bridge (00:1F.0).
   ChipsetFunctionInfo where;
   bool have_where = inventory_.find(ChipsetFunction::SpiFlash, &where);
@@ -128,6 +148,17 @@ void IntelPchChipset::probe(const IPciBus& pci, const ChipsetCpu& cpu) {
     me_.hfsts1 = status;
     break;
   }
+}
+
+bool IntelPchChipset::thermal_function(PciAddress* out) const {
+  for (uint32_t i = 0; i < inventory_.count(); ++i) {
+    ChipsetFunctionInfo f;
+    inventory_.at(i, &f);
+    if (f.function != ChipsetFunction::Thermal || !intel_pch_thermal_device(f.device_id)) continue;
+    *out = f.address;
+    return true;
+  }
+  return false;
 }
 
 void IntelPchChipset::summarize(FixedString<256>& out) const {

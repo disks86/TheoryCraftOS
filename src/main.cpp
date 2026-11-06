@@ -931,6 +931,64 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
               .text(me.manufacturing_mode() ? " (manufacturing mode)" : "");
         }
       }
+      // Temperatures, the watchdog and (AMD) the fabric.
+      auto temperature = [](Entry& e, int32_t mc) -> Entry& {
+        if (mc < 0) {
+          e.text("-");
+          mc = -mc;
+        }
+        return e.dec(static_cast<uint64_t>(mc / 1000)).text(".").dec(static_cast<uint64_t>(mc % 1000 / 100)).text(" C");
+      };
+      if (hardware::IntelPchThermal* sensor = system_chipset.pch_thermal()) {
+        int32_t mc = 0;
+        if (sensor->read(&mc)) {
+          Entry e(Level::Info, "Chipset");
+          temperature(e.text("PCH temperature "), mc);
+          const hardware::ThermalLimits limits = sensor->limits();
+          if (limits.critical_mc > 0) temperature(e.text(", critical "), limits.critical_mc);
+        } else {
+          Entry(Level::Info, "Chipset").text("PCH thermal sensor left off by the firmware");
+        }
+      }
+      const hardware::WatchdogReport& watchdog = system_chipset.watchdog_report();
+      if (watchdog.present) {
+        Entry e(watchdog.caused_last_reset ? Level::Warning : Level::Info, "Chipset");
+        e.text("TCO watchdog v").dec(watchdog.kind == hardware::IntelTcoKind::Version6 ? 6 : 4).text(", timeout ").dec(watchdog.timeout_seconds).text(" s");
+        if (watchdog.was_running) e.text(watchdog.stopped ? "; was running, halted" : "; running and could not be halted");
+        if (watchdog.caused_last_reset) e.text("; the last reset was this watchdog");
+      } else if (const hardware::IntelPchChipset* intel = system_chipset.intel()) {
+        Entry(Level::Info, "Chipset").text("TCO watchdog: ").text(intel->tco().reason);
+      }
+      // AMD: read the nodes under their lock, print after (the lock keeps interrupts off).
+      struct AmdNodeReport {
+        uint32_t nodes = 0, roots = 0;
+        hardware::AmdDataFabricInfo fabric;
+        hardware::AmdTemperatures temperatures[hardware::AmdNodes::kMaxNodes];
+      };
+      AmdNodeReport amd_report;
+      system_chipset.with_amd_nodes([&](const hardware::AmdNodes& nodes) {
+        amd_report.nodes = nodes.node_count();
+        amd_report.roots = nodes.root_count();
+        if (!amd_report.nodes) return;
+        amd_report.fabric = nodes.data_fabric();
+        for (uint32_t node = 0; node < amd_report.nodes && node < hardware::AmdNodes::kMaxNodes; ++node) amd_report.temperatures[node] = nodes.temperatures(node);
+      });
+      if (amd_report.nodes) {
+        {
+          Entry e(Level::Info, "Chipset");
+          e.text("AMD: ").dec(amd_report.nodes).text(amd_report.nodes == 1 ? " node, " : " nodes, ").dec(amd_report.roots).text(" root complexes, ");
+          e.text(hardware::amd_data_fabric_revision_name(amd_report.fabric.revision));
+          if (amd_report.fabric.block_instances) e.text(" with ").dec(amd_report.fabric.block_instances).text(" fabric blocks");
+          if (amd_report.fabric.dram_hole) e.text("; DRAM hole at ").hex(amd_report.fabric.dram_hole_base);
+        }
+        for (uint32_t node = 0; node < amd_report.nodes && node < hardware::AmdNodes::kMaxNodes; ++node) {
+          const hardware::AmdTemperatures& t = amd_report.temperatures[node];
+          if (!t.tctl_valid) continue;
+          Entry n(Level::Info, "Chipset");
+          temperature(n.text("node ").dec(node).text(": Tctl "), t.tctl_mc);
+          for (uint32_t c = 0; c < t.ccd_count; ++c) temperature(n.text(", CCD").dec(t.ccd_index[c]).text(" "), t.ccd_mc[c]);
+        }
+      }
       hardware::MemoryModuleSlot modules[8];
       const char* reason = nullptr;
       const uint32_t module_count = system_chipset.read_memory_modules(ArrayView<hardware::MemoryModuleSlot>(modules, 8), &reason);
@@ -2155,6 +2213,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     hardware::ThermalManager thermal(&cpu_ceiling);
     hardware::CpuThermalSource cpu_thermal(&pci);
     thermal.add(&cpu_thermal);
+    if (hardware::IntelPchThermal* pch_thermal = system_chipset.pch_thermal()) thermal.add(pch_thermal);
     UniquePointer<hardware::AcpiThermalZone> thermal_zones[4];
     const bool power_ok = cpu_power.initialize(power_caps);
     if (power_ok) {

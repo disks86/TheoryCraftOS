@@ -61,7 +61,9 @@ enum class IntelPch : uint8_t {
   PantherLakeH,
   PantherLakeP,
   WildcatLake,
+  NovaLakeS,        // the PCH of Nova Lake-S
   Emmitsburg,       // C740
+  DiamondRapids,    // the Xeon platform after Birch Stream
   BirchStream,      // the Xeon 6 platform (no separate PCH; the functions are in the I/O die)
   Denverton,        // Atom C3000 SoC
   CedarFork,        // Snow Ridge (Atom P5900) SoC
@@ -74,6 +76,11 @@ enum class IntelPch : uint8_t {
 // Where the hub lives.
 enum class IntelPchForm : uint8_t { Discrete, OnPackage, Soc };
 
+// The TCO watchdog of the hub as the OS can reach it (Linux i2c-i801's FEATURE_TCO_SPT/CNL): its I/O base is in the SMBus function (TCOBASE 0x50,
+// enabled by TCOCTL 0x54 bit 8). Version 4 (Sunrise Point era) keeps NO_REBOOT behind the hidden P2SB bridge, so it can be halted but not armed
+// here; version 6 (Cannon Lake on) has NO_REBOOT in TCO1_CNT. The ICHs and 5..9 series put it in the LPC bridge's ACPI block (not covered).
+enum class IntelTcoKind : uint8_t { None, Version4, Version6 };
+
 struct IntelPchInfo {
   IntelPch pch = IntelPch::Unknown;
   const char* codename = "unknown Intel chipset";
@@ -83,6 +90,7 @@ struct IntelPchInfo {
   // Since Sunrise Point the SPI flash controller is its own function (00:1F.5, where the BIOS protection bits are); before, they are in the LPC
   // bridge (00:1F.0). Both keep BIOS_CNTL at config offset 0xDC.
   bool spi_function = false;
+  IntelTcoKind tco = IntelTcoKind::None;
 };
 
 IntelPchInfo intel_pch_of_smbus(uint16_t smbus_device_id);

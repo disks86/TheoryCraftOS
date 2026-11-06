@@ -101,6 +101,7 @@ class PlatformI2cHid {
   IntelPchGpio* gpio_for(acpi::Node* node);
   acpi::Node* child(acpi::Node* parent, const char* name) const;
   bool integer_of(acpi::Node* node, const char* name, uint64_t* out);
+  bool uid_string(acpi::Node* node, char out[16]);
   bool hid_string(acpi::Node* node, char out[16]);
   void timing(acpi::Node* node, const char* method, uint32_t* hcnt, uint32_t* lcnt, uint32_t* sda);
 

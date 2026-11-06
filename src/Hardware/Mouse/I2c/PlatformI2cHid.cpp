@@ -120,7 +120,11 @@ PlatformI2cHid::Controller* PlatformI2cHid::controller_for(acpi::Node* node, con
 IntelPchGpio* PlatformI2cHid::gpio_for(acpi::Node* node) {
   for (uint64_t i = 0; i < gpios_.count(); ++i)
     if (gpios_[i]->node == node) return &gpios_[i]->pads;
-  if (!vm_.device_has_id(node, "INT344B")) return nullptr;
+  // Which controller this is: its _HID, and its _UID where one _HID covers several (Apollo Lake, Gemini Lake, Elkhart Lake).
+  char hid[16], uid[16];
+  if (!hid_string(node, hid)) return nullptr;
+  const IntelGpioLayout* layout = intel_gpio_layout(hid, uid_string(node, uid) ? uid : nullptr);
+  if (!layout) return nullptr;
   acpi::Node* crs = child(node, "_CRS");
   acpi::Value v;
   AcpiResources resources;
@@ -128,14 +132,40 @@ IntelPchGpio* PlatformI2cHid::gpio_for(acpi::Node* node) {
   UniquePointer<Gpio> g = UniquePointer<Gpio>::make(allocator_);
   if (!g) return nullptr;
   g->node = node;
-  for (uint32_t i = 0; i < resources.memory_count && i < IntelPchGpio::kSptLpCommunities; ++i) {
-    MmioRegion region;
-    if (resources.memory[i].length == 0 || !mapper_.map_registers(resources.memory[i].base, resources.memory[i].length, &region)) continue;
-    g->pads.add_community(region, IntelPchGpio::sunrise_point_lp_pin_base(i), IntelPchGpio::sunrise_point_lp_pins(i));
-  }
+  MmioRegion bars[AcpiResources::kMaxMemory];
+  for (uint32_t i = 0; i < resources.memory_count && i < AcpiResources::kMaxMemory; ++i)
+    if (resources.memory[i].length != 0) mapper_.map_registers(resources.memory[i].base, resources.memory[i].length, &bars[i]);
+  if (!g->pads.attach(*layout, ArrayView<const MmioRegion>(bars, resources.memory_count < AcpiResources::kMaxMemory ? resources.memory_count : AcpiResources::kMaxMemory))) return nullptr;
   IntelPchGpio* raw = &g->pads;
   if (!gpios_.push_back(util::move(g))) return nullptr;
   return raw;
+}
+
+bool PlatformI2cHid::uid_string(acpi::Node* node, char out[16]) {
+  out[0] = 0;
+  acpi::Node* n = child(node, "_UID");
+  acpi::Value v;
+  if (!n || !vm_.evaluate(n, nullptr, 0, &v)) return false;
+  if (v.kind == acpi::ValueKind::Integer) {
+    // decimal, as Linux compares it ("1", "2", ...)
+    char digits[20];
+    uint32_t count = 0;
+    uint64_t value = v.integer;
+    do {
+      digits[count++] = static_cast<char>('0' + value % 10);
+      value /= 10;
+    } while (value && count < 15);
+    for (uint32_t i = 0; i < count; ++i) out[i] = digits[count - 1 - i];
+    out[count] = 0;
+    return true;
+  }
+  if (v.kind == acpi::ValueKind::String) {
+    uint32_t i = 0;
+    for (; i < v.length && i < 15; ++i) out[i] = static_cast<char>(v.bytes[i]);
+    out[i] = 0;
+    return true;
+  }
+  return false;
 }
 
 bool PlatformI2cHid::setup_device(acpi::Node* device, CompositeMouse& mice, Report* report) {

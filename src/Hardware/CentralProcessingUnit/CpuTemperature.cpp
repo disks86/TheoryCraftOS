@@ -25,6 +25,10 @@ namespace {
 constexpr uint32_t kMsrThermStatus = 0x19C, kMsrTemperatureTarget = 0x1A2, kMsrPackageThermStatus = 0x1B1;
 constexpr uint32_t kSmnIndex = 0x60, kSmnData = 0x64, kSmnThermalTctl = 0x59800;
 
+// The registered reader: the context is published before the function (release), and read after it (acquire).
+AmdSmnReader g_smn_reader = nullptr;
+void* g_smn_context = nullptr;
+
 uint64_t rdmsr(uint32_t msr) {
   uint32_t low, high;
   __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
@@ -49,14 +53,27 @@ int32_t amd_temperature(const IPciBus* pci) {
   if (!pci) return -1;
   const PciAddress host_bridge{0, 0, 0};
   if ((pci->read32(host_bridge, 0) & 0xFFFF) != 0x1022 && (pci->read32(host_bridge, 0) & 0xFFFF) != 0x1D94) return -1;   // AMD / Hygon
-  pci->write32(host_bridge, kSmnIndex, kSmnThermalTctl);
-  const uint32_t value = pci->read32(host_bridge, kSmnData);
+  const AmdSmnReader reader = __atomic_load_n(&g_smn_reader, __ATOMIC_ACQUIRE);
+  uint32_t value = 0;
+  if (reader) {
+    if (!reader(__atomic_load_n(&g_smn_context, __ATOMIC_RELAXED), kSmnThermalTctl, &value)) return -1;
+  } else {
+    pci->write32(host_bridge, kSmnIndex, kSmnThermalTctl);
+    value = pci->read32(host_bridge, kSmnData);
+  }
   if (value == 0xFFFFFFFFu) return -1;
   int32_t millis = static_cast<int32_t>((value >> 21) & 0x7FF) * 125;   // eighths of a degree
   if (value & (1u << 19)) millis -= 49000;                              // the -49..206 range
   return millis;
 }
 }  // namespace
+
+void set_amd_smn_reader(AmdSmnReader reader, void* context) {
+  __atomic_store_n(&g_smn_reader, static_cast<AmdSmnReader>(nullptr), __ATOMIC_RELEASE);
+  if (!reader) return;
+  __atomic_store_n(&g_smn_context, context, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_smn_reader, reader, __ATOMIC_RELEASE);
+}
 
 int32_t cpu_temperature_millicelsius(const IPciBus* pci) {
   if (cpuid(1).ecx & (1u << 31)) return -1;   // a virtual machine: the sensor MSRs are not there to read

@@ -45,6 +45,14 @@ struct IntelMeStatus {
   uint8_t error_code() const { return (hfsts1 >> 12) & 0xF; }
   uint8_t operation_mode() const { return (hfsts1 >> 16) & 0xF; }
 };
+// Where the TCO watchdog's registers are: TCOBASE (0x50) of the SMBus function when TCOCTL (0x54) bit 8 says the firmware enabled the decode.
+struct IntelTcoLocation {
+  bool usable = false;
+  uint16_t io_base = 0;
+  IntelTcoKind kind = IntelTcoKind::None;
+  const char* reason = "no TCO watchdog the OS can reach on this hub";
+};
+
 const char* intel_me_working_state_name(uint8_t state);
 const char* intel_me_operation_mode_name(uint8_t mode);
 IntelBiosProtection intel_bios_protection_decode(uint8_t bios_control);
@@ -74,6 +82,9 @@ class IntelPchChipset final : public IChipset {
   const IntelPchCandidates& expected() const { return expected_; }
   const IntelBiosProtection& bios_protection() const { return bios_; }
   const IntelMeStatus& me() const { return me_; }
+  const IntelTcoLocation& tco() const { return tco_; }
+  // The PCH thermal sensor function (00:12.0 on the hubs that have one); false when there is none.
+  bool thermal_function(PciAddress* out) const;
 
  private:
   IntelPchInfo info_;
@@ -83,6 +94,7 @@ class IntelPchChipset final : public IChipset {
   ChipsetSmbus smbus_;
   IntelBiosProtection bios_;
   IntelMeStatus me_;
+  IntelTcoLocation tco_;
 };
 
 }  // namespace hardware

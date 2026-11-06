@@ -16,9 +16,15 @@ and reads the SPD of the memory modules on that bus. On Intel it also reports th
 | `Smbus/SmbusHost` | The i801/PIIX4 host protocol (quick, byte, byte data, word data, block) over `ISmbusHostPorts`, with Intel INUSE_STS and AMD host-semaphore arbitration, a 100 ms timeout and kill |
 | `Smbus/SmbusIoPorts` | The real I/O port backend (kernel only) |
 | `Smbus/Spd` | SPD decode for DDR3/DDR4/DDR5 (type, form, capacity, ranks, width, ECC, speed bin, JEP106 maker), and reading over SMBus with EE1004 page and SPD5118 hub page handling |
+| `Intel/IntelGpioLayouts` (+ `.inc`) | GPIO community layouts of 42 Intel GPIO controllers: Sunrise Point through Meteor Lake/Arrow Lake/800 series, the server PCHs and the Atom SoCs. Each has the memory resource index, the pin range and the pad groups with their ACPI GPIO numbers. Generated from the Linux pinctrl drivers by `scripts/gen_intel_gpio_layouts.py` |
+| `Bus/I2c/IntelGpio` | `IntelPchGpio`: attaches a layout's communities and maps an ACPI GPIO number to its pad. The pad stride comes from REVID (16 bytes from 0x94). Reads PADCFG0 (level, driven value, function). `PlatformI2cHid` picks the layout by `_HID`/`_UID` |
+| `Intel/IntelPchThermal` | The PCH thermal sensor (00:12.0, Haswell..Comet Lake, Wellsburg, Lewisburg): TEMP/TSEL/CTT through BAR 0. It is an `IThermalSource` named "chipset" and is added to the `ThermalManager` |
+| `Intel/IntelTcoWatchdog` | The TCO watchdog (iTCO v4/v6): timeout, start/stop/ping, NO_REBOOT (v6 in TCO1_CNT), and "the last reset was the watchdog". `IntelPchChipset` finds TCOBASE/TCOCTL in the SMBus function |
+| `AMD/AmdNodes` | Zen nodes: the root complexes (several per node on EPYC), SMN read/write through each node's 0x60/0x64 pair, Data Fabric config and FICAA/FICAD indirect reads (old and new offsets), DF revision (DF2..DF4.5), fabric block count, DRAM hole, and Tctl/CCD temperatures with k10temp's layouts |
 | `SystemChipset` | Kernel glue: picks the driver (AMD first on AMD CPUs, otherwise Intel first), maps the FCH PM MMIO block, owns the `SmbusHost` in a `Synchronized` |
 
-`main.cpp` probes after the `Platform` line and logs `Chipset` (identity, functions, SMBus, flash, ME) and one `Memory` line per module.
+`main.cpp` probes after the `Platform` line. It logs `Chipset` lines for identity, functions, SMBus, flash, ME, PCH temperature, TCO watchdog, and the
+AMD nodes/fabric with per-node Tctl and CCD temperatures, then one `Memory` line per module.
 
 ## Design rules
 
@@ -31,6 +37,13 @@ and reads the SPD of the memory modules on that bus. On Intel it also reports th
 - **AMD FCH revision ≥ 0x51 reads PM through MMIO** (0xFED80300), as Linux's piix4 does. Without a register mapper it falls back to
   0xCD6/0xCD7 and treats all-0xFF as unreachable.
 - **SPD is skipped when the FCH routes the SMBus to a port other than 0.** The port is not switched.
+- **One lock for SMN.** `AmdNodes` lives in a `Synchronized` in `SystemChipset`. Once nodes are found, `cpu_temperature_millicelsius` is pointed at it
+  (`set_amd_smn_reader`), so the CPU-temperature read and the chipset's own SMN and DF reads never split each other's index/data pairs.
+- **The watchdog is never armed by the probe.** Nothing in the OS pings it yet, so a TCO the firmware left counting is halted, and the boot log says
+  so. The probe also reports and clears SECOND_TO_STS ("the last reset was this watchdog"). Version 4 can be halted but not armed, because
+  NO_REBOOT is behind the P2SB bridge.
+- **The PCH sensor is read, not enabled.** If the firmware left TSEL off, the boot log says so.
+- **GPIO tables are generated, not typed.** Regenerate with `python3 -I scripts/gen_intel_gpio_layouts.py <linux tree> > src/Hardware/Chipset/Intel/IntelGpioLayouts.inc`.
 
 ## Sources
 
@@ -48,16 +61,30 @@ JEDEC SPD annexes for DDR3/DDR4/DDR5.
 - both catalogues, cross-checked against the Intel CPU generation rules (every model the CPU table knows pairs with a hub, apart from listed exceptions);
 - both drivers on fake PCI buses: Z390, q35 ICH9, a hidden SMBus, X670E/B650/X570, a Zen+ laptop, SB700.
 
+`tests/run_host_tests.sh ChipsetDevicesTest` covers:
+
+- the generated GPIO layouts: groups tile their communities, no GPIO number collides, `_UID` matching, and Cannon Point-LP's gapped numbering
+  reaching the right pad with 16-byte pads;
+- the PCH sensor: off, locked, critical point, a missing BAR;
+- the TCO watchdog against a register model that flags a write of NMI_NOW, a firmware-locked NO_REBOOT, and version 4 halting;
+- AMD nodes against a model with SMN per root and FICAA/FICAD:
+  - Zen 3 DF3 with legacy offsets, and Zen 4 DF4/DF4.5 with the new offsets;
+  - a two-socket EPYC with four roots per node;
+  - CCD validity, and six threads sharing the SMN pair without splitting it. A `std::mutex` stands in for the kernel `SpinLock`, which executes `cli`.
+
 In QEMU (q35, KVM) the boot log shows `Chipset: ICH9 ...`. OVMF leaves the ICH9 SMBus host disabled, so no SPD is read there.
 
 ## Not done
 
 - Not run on real hardware. The ID tables come from Linux and the PCI ID repository. The Promontory 300/400 SATA and bridge IDs, and B840 being
   Promontory 19, are the least certain entries.
-- Nova Lake, Diamond Rapids and Lunar Lake hubs have no published SMBus ID yet. Lunar Lake is named from the CPU only, and the other two are not
-  in the catalogue.
-- No GPIO community tables per PCH (`IntelPchGpio` still only knows Sunrise Point-LP), no P2SB/sideband access, no SPI flash
-  reads (only the protection bits), no PCH thermal sensor (the 00:12.0 MMIO register), no TCO watchdog.
-- AMD: no SMN or Data Fabric register access beyond counting nodes (CPU temperature still has its own SMN read), no FCH GPIO, no eSPI, no
-  SMBus port switching.
+- Lunar Lake has no published SMBus ID, so it is named from the CPU only. Lunar Lake and Panther Lake GPIO layouts come from ACPI `_DSD` in Linux
+  (`pinctrl-intel-platform.c`) and are not in the generated table. Lynx Point (Haswell) GPIO uses another register layout and is not covered.
+- GPIO is read-only: no interrupts (pins are polled), no pad changes. Nothing lists the GPIO state of a machine yet.
+- PCH temperature from Ice Lake on goes through the PMC/ACPI and is not read here; the ACPI thermal zones still cover it where the firmware has them.
+- TCO watchdog: there is no pinging service, so the OS cannot arm it on purpose yet. The ICH/5..9 series TCO (in the LPC ACPI block, NO_REBOOT
+  in RCBA) and AMD's FCH watchdog (sp5100_tco) are not covered.
+- AMD: no DRAM address map or address translation (atl), no HSMP mailbox, no SMU messages, no Data Fabric performance counters, no FCH GPIO,
+  no eSPI, no SMBus port switching. Promontory has no documented temperature sensor.
+- No P2SB/sideband access, and no SPI flash reads (only the protection bits).
 - The memory scan runs at boot only. Nothing exposes the modules in the inventory window yet.

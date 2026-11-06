@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Chipset/SystemChipset.hpp"
+#include "Hardware/CentralProcessingUnit/CpuTemperature.hpp"
 #include "Hardware/IoPort.hpp"
 
 namespace hardware {
@@ -26,7 +27,25 @@ uint8_t AmdPmIndexPorts::read8(uint8_t offset) {
   return IoPort(0xCD7).read8();
 }
 
+uint16_t TcoIoPorts::read16(uint8_t reg) { return IoPort(static_cast<uint16_t>(base_ + reg)).read16(); }
+
+void TcoIoPorts::write16(uint8_t reg, uint16_t value) { IoPort(static_cast<uint16_t>(base_ + reg)).write16(value); }
+
+namespace {
+// cpu_temperature_millicelsius's SMN reads, taken under the nodes' lock.
+bool read_smn_locked(void* context, uint32_t address, uint32_t* value) {
+  return static_cast<SystemChipset*>(context)->with_amd_nodes([&](const AmdNodes& nodes) { return nodes.smn_read(0, address, value); });
+}
+}  // namespace
+
+SystemChipset::~SystemChipset() { set_amd_smn_reader(nullptr, nullptr); }
+
 void SystemChipset::probe(const ChipsetCpu& cpu, const IPciBus& pci, IRegisterMapper* mapper) {
+  set_amd_smn_reader(nullptr, nullptr);
+  watchdog_.with([](IntelTcoWatchdog& w) { w.attach(nullptr, IntelTcoKind::None); });
+  tco_ports_.reset();
+  watchdog_report_ = WatchdogReport();
+  pch_thermal_ = IntelPchThermal();
   active_ = nullptr;
   smbus_.with([](SmbusHost& host) { host.attach(nullptr, SmbusHostFlavor::IntelI801); });   // before the ports it points at go
   ports_.reset();
@@ -46,7 +65,43 @@ void SystemChipset::probe(const ChipsetCpu& cpu, const IPciBus& pci, IRegisterMa
       if (intel_.found()) active_ = &intel_;
     }
   }
+  // AMD Zen: the nodes behind SMN and the Data Fabric.
+  if (cpu.vendor == ChipsetVendor::Amd || amd_.found()) {
+    const uint32_t nodes = amd_nodes_.with([&](AmdNodes& n) {
+      n.discover(pci, cpu.family, cpu.model);
+      return n.node_count();
+    });
+    if (nodes) set_amd_smn_reader(read_smn_locked, this);
+  }
   if (!active_) return;
+
+  if (active_ == &intel_) {
+    // The PCH thermal sensor (BAR 0 of its function).
+    PciAddress thermal;
+    if (mapper && intel_.thermal_function(&thermal)) {
+      MmioRegion region;
+      const uint64_t bar = pci.memory_bar(thermal, 0);
+      if (bar && mapper->map_registers(bar, IntelPchThermal::kRegisterBytes, &region)) pch_thermal_.attach(region);
+    }
+    // The TCO watchdog. Nothing in the OS pings it yet, so one the firmware left counting is halted rather than left to reset the machine.
+    const IntelTcoLocation& tco = intel_.tco();
+    if (tco.usable) {
+      tco_ports_.emplace(tco.io_base);
+      TcoIoPorts* ports = &*tco_ports_;
+      watchdog_report_ = watchdog_.with([&](IntelTcoWatchdog& w) {
+        WatchdogReport report;
+        if (!w.attach(ports, tco.kind)) return report;
+        report.present = true;
+        report.kind = tco.kind;
+        report.caused_last_reset = w.caused_last_reset();
+        report.timeout_seconds = w.timeout_seconds();
+        w.clear_status();
+        report.was_running = w.running();
+        if (report.was_running) report.stopped = w.stop();
+        return report;
+      });
+    }
+  }
 
   const ChipsetSmbus smbus = active_->smbus();
   if (!smbus.usable) return;
