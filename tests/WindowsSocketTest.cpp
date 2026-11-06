@@ -288,8 +288,43 @@ static void test_interface_configuration() {
   CHECK(s.call(WindowsSyscallNumber::NtSocketControl, sock, 5, kBase + 0x200, 4, kSize + kBase, 16) == 0xC0000005u);      // an output the process cannot write
 }
 
+// A server and a client in one process over 127.0.0.1 (what Godot's game and editor debugger do): the connection never touches the wire, and both ends report
+// the loopback address.
+static void test_loopback() {
+  Setup s;
+  const uint32_t frames = s.lan.wire.frames;
+  uint64_t server = 0, client = 0;
+  CHECK(s.create_socket(true, &server) == kSuccess && s.create_socket(true, &client) == kSuccess);
+  CHECK(s.call(WindowsSyscallNumber::NtBindSocket, server, 0, swap16(9300)) == kSuccess);
+  CHECK(s.call(WindowsSyscallNumber::NtListenSocket, server, 4) == kSuccess);
+  const uint8_t one = 1;
+  s.memory.write(kBase + 0x100, ConstByteView(&one, 1));
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, client, 1 /*SetNonBlocking*/, kBase + 0x100, 1, 0, 0) == kSuccess);
+  const uint32_t connect = s.call(WindowsSyscallNumber::NtConnectSocket, client, ip(127, 0, 0, 1), swap16(9300));
+  CHECK(connect == kSuccess || connect == kStatusWouldBlock);
+  // the accept waits (the fake host polls the stack while it does), and sees the client at the loopback address
+  CHECK(s.call(WindowsSyscallNumber::NtAcceptSocket, server, kBase + 0x200, kBase + 0x210, kBase + 0x218) == kSuccess);
+  const uint64_t accepted = s.memory.get64(kBase + 0x200);
+  CHECK(s.memory.get32(kBase + 0x210) == ip(127, 0, 0, 1));
+  for (int i = 0; i < 50; ++i) s.lan.step();
+  const char text[] = "over the loopback";
+  s.memory.write(kBase + 0x300, ConstByteView(reinterpret_cast<const uint8_t*>(text), sizeof(text)));
+  CHECK(s.call(WindowsSyscallNumber::NtSendSocket, client, kBase + 0x300, sizeof(text), kBase + 0x380, 0, 0, 0) == kSuccess);
+  s.memory.put32(kBase + 0x480, 0);
+  CHECK(s.call(WindowsSyscallNumber::NtReceiveSocket, accepted, kBase + 0x400, sizeof(text), kBase + 0x480, 0, 0, 0) == kSuccess);
+  uint8_t back[sizeof(text)] = {};
+  s.memory.read(kBase + 0x400, ByteView(back, sizeof(text)));
+  CHECK(s.memory.get32(kBase + 0x480) == sizeof(text) && !memcmp(back, text, sizeof(text)));
+  uint8_t info[8];
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, client, 2 /*GetSockName*/, 0, 0, kBase + 0x500, 8) == kSuccess);
+  s.memory.read(kBase + 0x500, ByteView(info, 8));
+  CHECK(info[0] == 127 && info[1] == 0 && info[2] == 0 && info[3] == 1);      // the client's own end is the loopback address too
+  CHECK(s.lan.wire.frames == frames);
+}
+
 int main() {
   test_interface_configuration();
+  test_loopback();
   test_tcp_client_server();
   test_tcp_non_blocking_and_errors();
   test_udp_round_trip();

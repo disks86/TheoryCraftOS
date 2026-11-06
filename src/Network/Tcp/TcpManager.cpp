@@ -98,7 +98,7 @@ void TcpManager::send_reset(Ipv4Address to, uint16_t to_port, uint16_t from_port
   out.be16(0);  // checksum, filled in below
   out.be16(0);  // urgent pointer
   if (!out.ok()) return;
-  uint32_t sum = pseudo_header_sum(ip_.local_address(), to, kProtocolTcp, 20);
+  uint32_t sum = pseudo_header_sum(ip_.source_for(to), to, kProtocolTcp, 20);
   sum = checksum_add(sum, out.written());
   out.patch_be16(16, checksum_finish(sum));
   ip_.send_ip(to, kProtocolTcp, out.written());

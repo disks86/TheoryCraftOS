@@ -99,6 +99,10 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
     uint16_t length;
     uint8_t ip_packet[kMtu];
   };
+  struct LoopedPacket {  // an IP packet this stack sent to itself (127.0.0.0/8 or its own address), delivered by poll()
+    uint16_t length;
+    uint8_t ip_packet[kMtu];
+  };
 
   // --- IDhcpListener
   void on_lease(const IpConfiguration& configuration) override;
@@ -106,7 +110,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
 
   void handle_frame(ConstByteView frame);
   void handle_arp(ConstByteView arp);
-  void handle_ipv4(ConstByteView packet);
+  void handle_ipv4(ConstByteView packet, bool looped = false);
+  void deliver_looped();
   void handle_icmp(Ipv4Address source, ConstByteView icmp);
   bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload);
   void send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
@@ -137,6 +142,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   IpConfiguration config_;
   Dictionary<uint32_t, ArpEntry> arp_;
   Queue<PendingPacket> pending_;
+  Queue<LoopedPacket> looped_;
   UdpManager udp_;
   TcpManager tcp_;
   SharedPointer<UdpSocket> dhcp_socket_;

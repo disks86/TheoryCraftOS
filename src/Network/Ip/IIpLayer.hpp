@@ -29,6 +29,10 @@ class IIpLayer {
  public:
   // The address packets are sent from (0.0.0.0 until the stack is configured).
   virtual Ipv4Address local_address() const = 0;
+  // The address a packet to `destination` is sent from: the loopback address it
+  // is sent to (so that the answer comes back from where it was sent), else the
+  // local address. Transport checksums are computed over this address.
+  virtual Ipv4Address source_for(Ipv4Address destination) const { return destination.is_loopback() ? destination : local_address(); }
   virtual uint32_t max_payload() const = 0;  // largest IP payload that fits one frame
   virtual uint64_t now_ms() const = 0;       // monotonic milliseconds
   // The stack's lock. The stack, its sockets and its resolver are used by many
@@ -36,7 +40,8 @@ class IIpLayer {
   virtual kernel::RecursiveMutex& mutex() = 0;
 
   // Wraps `payload` (UDP/TCP/ICMP bytes) in an IP header and sends it to
-  // `destination`, via the gateway when it is off-link. False if the packet
+  // `destination`, via the gateway when it is off-link; a packet to 127.0.0.0/8 or
+  // to the local address is delivered to this stack itself. False if the packet
   // cannot be sent now (not configured, too large, link-layer trouble); a packet
   // that is waiting for an ARP answer counts as sent.
   virtual bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) = 0;

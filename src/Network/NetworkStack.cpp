@@ -27,6 +27,8 @@ constexpr uint32_t kArpPacketSize = 28;
 constexpr uint64_t kArpLifetimeMs = 120000;
 constexpr uint32_t kArpRetryMs = 1000, kArpMaxRequests = 3;
 constexpr uint32_t kMaxPending = 8;
+constexpr uint32_t kMaxLooped = 256;         // packets to itself not yet delivered; more are dropped (TCP sends them again)
+constexpr uint32_t kLoopedPerPoll = 4096;    // a bound on the exchanges one poll() carries on over the loopback
 constexpr uint32_t kFramesPerPoll = 64;  // bound the work done in one poll()
 constexpr uint8_t kIcmpEchoReply = 0, kIcmpEchoRequest = 8;
 constexpr uint16_t kArpRequest = 1, kArpReply = 2;
@@ -41,6 +43,7 @@ NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& c
       allocator_(allocator),
       arp_(allocator),
       pending_(allocator),
+      looped_(allocator),
       udp_(*this, allocator),
       tcp_(*this, allocator) {}
 
@@ -127,12 +130,24 @@ void NetworkStack::poll() {
       }
     }
   }
+  deliver_looped();
   dhcp_->poll();
   service_link_local();
   resolver_->poll();
   service_pending();
   tcp_.poll();
+  deliver_looped();  // (what the timers and the received frames sent to this stack itself)
   udp_.reap();
+}
+
+// Packets to 127.0.0.0/8 or to our own address go no further than this queue. Delivering one may send
+// others (an ACK, an answer), which are delivered in the same call, up to a bound.
+void NetworkStack::deliver_looped() {
+  for (uint32_t i = 0; i < kLoopedPerPoll && !looped_.empty(); ++i) {
+    LoopedPacket p;
+    if (!looped_.dequeue(&p)) break;
+    handle_ipv4(ConstByteView(p.ip_packet).first(p.length), true);
+  }
 }
 
 void NetworkStack::handle_frame(ConstByteView frame) {
@@ -231,7 +246,7 @@ void NetworkStack::handle_igmp(ConstByteView igmp) {
     if (asked.is_unspecified() || asked == groups_[i]) send_igmp_report(groups_[i]);
 }
 
-void NetworkStack::handle_ipv4(ConstByteView packet) {
+void NetworkStack::handle_ipv4(ConstByteView packet, bool looped) {
   ByteReader in(packet);
   const uint8_t version_and_length = in.u8();
   in.skip(1);  // type of service
@@ -249,15 +264,15 @@ void NetworkStack::handle_ipv4(ConstByteView packet) {
   if (header < kIpv4HeaderSize || header > total || total > packet.size()) return;  // Ethernet padding makes the frame longer than total
   if (checksum_finish(checksum_add(0, packet.first(header))) != 0) return;
   if (flags_and_offset & 0x3FFF) return;  // a fragment (more-fragments flag or an offset): unsupported
-  if (!accepts_destination(destination)) return;
+  if (!looped && (!accepts_destination(destination) || destination.is_loopback())) return;  // (127/8 never arrives from a wire)
 
   ConstByteView payload = packet.subview(header, total - header);
   if (protocol == kProtocolUdp) {
     udp_.handle(source, destination, payload);
   } else if (protocol == kProtocolTcp) {
-    if (config_.configured() && destination == config_.address) tcp_.handle(source, destination, payload);
+    if (looped || (config_.configured() && destination == config_.address)) tcp_.handle(source, destination, payload);
   } else if (protocol == kProtocolIcmp) {
-    if (config_.configured() && destination == config_.address) handle_icmp(source, payload);
+    if (looped || (config_.configured() && destination == config_.address)) handle_icmp(source, payload);
   } else if (protocol == kProtocolIgmp) {
     handle_igmp(payload);
   }
@@ -327,8 +342,8 @@ void NetworkStack::send_arp_from(uint16_t operation, Ipv4Address sender_ip, cons
 
 bool NetworkStack::send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) {
   kernel::ScopedRecursiveMutex guard(mutex_);
-  if (!config_.configured()) return false;
-  return send_ip_from(config_.address, destination, protocol, payload, false);
+  if (!config_.configured() && !destination.is_loopback()) return false;  // (the loopback works before an address is configured)
+  return send_ip_from(source_for(destination), destination, protocol, payload, false);
 }
 
 bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
@@ -352,6 +367,14 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
   out.bytes(payload);
   if (!out.ok()) return false;
   const ConstByteView packet = out.written();
+
+  if (destination.is_loopback() || (config_.configured() && destination == config_.address)) {  // to this machine: not to the wire
+    if (looped_.count() >= kMaxLooped) return false;
+    LoopedPacket p;
+    p.length = static_cast<uint16_t>(packet.size());
+    if (!ByteView(p.ip_packet).copy_from(packet)) return false;
+    return looped_.enqueue(p);
+  }
 
   const bool broadcast = link_broadcast || destination.is_limited_broadcast() ||
                          (config_.configured() && destination == Ipv4Address::subnet_broadcast(config_.address, config_.netmask));
