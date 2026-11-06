@@ -106,7 +106,9 @@ ExeclistPort::Events ExeclistPort::poll() {
     csb_head_ = head;
     return e;
   }
-  if (mode_ == Mode::Elsq) {
+  if (mode_ == Mode::Elsq || mode_ == Mode::ElsqXehp) {
+    const bool xehp = mode_ == Mode::ElsqXehp;   // XEHP_CSB_SW_CTX_ID_MASK GENMASK(31, 10), XEHP_IDLE_CTX_ID; the Gen12 ones are GENMASK(25, 15), 0x7FF
+    const uint32_t shift = xehp ? 10 : 15, mask = xehp ? 0x3FFFFF : 0x7FF, idle_id = xehp ? kXehpIdleContextId : kIdleContextId;
     const uint32_t tail = load(status_[kCsb12WriteDword]) & 0xF;
     if (tail >= kCsb12Entries) return e;
     uint32_t head = csb_head_;
@@ -116,7 +118,7 @@ ExeclistPort::Events ExeclistPort::poll() {
       if (low == 0xFFFFFFFFu && high == 0xFFFFFFFFu) break;   // the pointer is ahead of the entry (the hardware does not always order the two): look again later
       head = next;
       e.status_or |= low | high;
-      const bool to_valid = ((low >> 15) & 0x7FF) != kIdleContextId, away_valid = ((high >> 15) & 0x7FF) != kIdleContextId, new_queue = (low & 1) != 0;
+      const bool to_valid = ((low >> shift) & mask) != idle_id, away_valid = ((high >> shift) & mask) != idle_id, new_queue = (low & 1) != 0;
       if (!away_valid || new_queue) ++e.started;
       else ++e.completed;
       if (!to_valid) ++e.idle;

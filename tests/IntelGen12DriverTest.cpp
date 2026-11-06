@@ -141,6 +141,8 @@ static void test_xe_lpg() {
   Rig rig(Generation::Gen12);
   VcsDriver::Config cfg = rig.config();
   cfg.xe_lpg = true;
+  rig.gpu.xehp = true;
+  cfg.gmd_id_flush = true;
   {
     VcsDriver drv(rig.mem);
     CHECK(drv.initialize(cfg) && drv.state() == VcsDriver::State::Ready);
@@ -152,7 +154,7 @@ static void test_xe_lpg() {
     // The driver's global GTT entries (ring, status page, context) carry PAT index 3; the scratch entry too.
     const uint64_t pat3 = (1ull << 52) | (1ull << 53);
     for (uint64_t i = 100; i < 108; ++i) CHECK((rig.ggtt[i] & pat3) == pat3 && (rig.ggtt[i] & 1));
-    CHECK(rig.gpu.regs.count(0xD8C) == 1);   // Wa_22019338487
+    CHECK(rig.gpu.regs.count(0xD8C) == 1 && rig.gpu.regs[0xFD4] == (1u << 31));   // Wa_22019338487; the media tile's multicast selector
     const std::vector<uint32_t> batch = simple_batch();
     CHECK(drv.run_batch(ArrayView<const uint32_t>(batch.data(), batch.size())) == VcsDriver::Result::Done);
     CHECK(rig.gpu.violations.empty());
@@ -178,11 +180,42 @@ static void test_xe_lpg() {
   CHECK(inner.gpu.regs[0x384800] == 5 && window.read32(0x4800) == 5);
 }
 
+// Xe2 (Lunar Lake, Arc Battlemage): its own PAT and MOCS tables, PAT index 2 in the global GTT entries, the Xe2 register state image, the context ID at bit 39.
+static void test_xe2() {
+  Rig rig(Generation::Gen12);
+  VcsDriver::Config cfg = rig.config();
+  cfg.xe2 = true;
+  rig.gpu.xehp = true;
+  cfg.gmd_id_flush = true;
+  {
+    VcsDriver drv(rig.mem);
+    CHECK(drv.initialize(cfg) && drv.state() == VcsDriver::State::Ready && drv.xe2() && !drv.xe_lpg());
+    const uint32_t pat[5] = {0xC, 0xE, 0xF, 0x3C, 0xF};
+    for (uint32_t i = 0; i < 5; ++i) CHECK(rig.gpu.regs[0x4800 + 4 * i] == pat[i]);
+    CHECK(rig.gpu.regs[0x4000] == 0xC && rig.gpu.regs[0x4004] == 0x10C && rig.gpu.regs[0x4008] == 0x130 && rig.gpu.regs[0x400C] == 0x13C && rig.gpu.regs[0x4010] == 0x100 && rig.gpu.regs[0x403C] == 0x100);
+    CHECK(rig.gpu.regs[0xFD4] == (1u << 31) && rig.gpu.regs.count(0xD8C) == 1);
+    for (uint64_t i = 100; i < 108; ++i) CHECK((rig.ggtt[i] >> 52) == 2 && (rig.ggtt[i] & 1));   // PAT1 only
+    const std::vector<uint32_t> batch = simple_batch();
+    CHECK(drv.run_batch(ArrayView<const uint32_t>(batch.data(), batch.size())) == VcsDriver::Result::Done);
+    CHECK(rig.gpu.violations.empty());
+  }
+  CHECK(rig.mem.live() == 1);
+  std::vector<uint32_t> a(kLrcStateDwords), b(kLrcStateDwords);
+  CHECK(lrc_init_dg2_xcs(ArrayView<uint32_t>(a.data(), a.size()), 0x1C0000, true) && lrc_init_xe2_xcs(ArrayView<uint32_t>(b.data(), b.size()), 0x1C0000, true));
+  for (uint32_t i = 0; i < 33; ++i) CHECK(a[i] == b[i]);
+  CHECK(b[33] == a[33] && b[36] == 0x1C03AC && b[38] == 0x1C0108 && a[36] == 0x1C028C && a[38] == 0x1C0288);
+  for (uint32_t i = 40; i < 52; ++i) CHECK(a[i] == b[i]);
+  // The descriptor of graphics IP 12.50 and later has the context ID at bit 39 and neither class nor instance.
+  CHECK(lrc_descriptor_xehp(0x12345000, 1) == (0x12345000ull | 0x19 | 0x100 | (1ull << 39)) && (lrc_descriptor_xehp(0x12345000, 1) >> 48) == 0);
+  CHECK(lrc_descriptor_gen12(0x12345000, 1, 0, 1) != lrc_descriptor_xehp(0x12345000, 1));
+}
+
 // Arc Alchemist (Xe-HPG): the Xe-LP PAT table written through the multicast selector, and the DG2 register state image.
 static void test_xe_hpg() {
   Rig rig(Generation::Gen12);
   VcsDriver::Config cfg = rig.config();
   cfg.xe_hpg = true;
+  rig.gpu.xehp = true;
   {
     VcsDriver drv(rig.mem);
     CHECK(drv.initialize(cfg) && drv.state() == VcsDriver::State::Ready && drv.xe_hpg() && !drv.xe_lpg());
@@ -211,6 +244,7 @@ static void test_xe_hpg() {
 }
 
 int main() {
+  test_xe2();
   test_xe_hpg();
   test_xe_lpg();
   test_init_and_jobs();

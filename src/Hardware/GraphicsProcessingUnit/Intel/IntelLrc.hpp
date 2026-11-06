@@ -71,6 +71,9 @@ bool lrc_init_gen12_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhi
 // The same for the video engines of graphics IP 12.55 and later (Arc Alchemist, Meteor Lake, Arrow Lake): two more registers (0x120, 0x124) in the first load, one skipped dword
 // instead of five before the second (xe_lrc.c dg2_xcs_offsets).
 bool lrc_init_dg2_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
+// Xe2 (xe_lrc.c XE2_CTX_COMMON): the first load of dg2_xcs_offsets, one skipped dword, and a second load that has the timestamp's upper half and the indirect ring state
+// pointer (left zero: the ring registers are in the context) where the others have 0x28c and 0x288.
+bool lrc_init_xe2_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
 // The top of a four-level address space (its page-map level 4 page) goes where Gen9 has the first page directory pointer.
 bool lrc_set_pml4(ArrayView<uint32_t> state, uint64_t pml4);
 
@@ -102,6 +105,12 @@ constexpr uint64_t lrc_descriptor_gen11(uint32_t context_ggtt_address, uint32_t 
   constexpr uint64_t kValid = 1u << 0, kPrivilege = 1u << 8, kAddressingShift = 3, kLegacy32 = 1;
   return (uint64_t{context_ggtt_address} & 0xFFFFF000u) | (kLegacy32 << kAddressingShift) | kValid | kPrivilege | (uint64_t{context_id & 0x7FF} << 37) |
          (uint64_t{engine_instance & 0x3F} << 48) | (uint64_t{engine_class & 7} << 61);
+}
+// Graphics IP 12.50 and later (Arc, Meteor Lake, Arrow Lake, Xe2): the 16-bit context ID sits at bit 39 and the engine class and instance are not in the descriptor (the engine
+// whose submit queue is written is the one that runs it); xe_execlist.c, xe_lrc.c.
+constexpr uint64_t lrc_descriptor_xehp(uint32_t context_ggtt_address, uint32_t context_id) {
+  constexpr uint64_t kValid = 1u << 0, kPrivilege = 1u << 8, kAddressingShift = 3, kLegacy64 = 3;
+  return (uint64_t{context_ggtt_address} & 0xFFFFF000u) | (kLegacy64 << kAddressingShift) | kValid | kPrivilege | (uint64_t{context_id & 0xFFFF} << 39);
 }
 constexpr uint32_t kVideoDecodeClass = 1;
 
