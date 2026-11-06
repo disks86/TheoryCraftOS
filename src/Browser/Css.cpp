@@ -5181,6 +5181,7 @@ bool css_declaration_valid(StringView name, StringView value) { return css_value
 bool css_supports(StringView text) { return supports_condition(text); }
 
 void StyleSheet::clear() {
+  ++generation_;
   pointer_state_ = false;
   scope_ = 0;
   pool_.clear();
@@ -5874,11 +5875,21 @@ bool StyleSheet::rule_applies(uint32_t selector, uint32_t element_scope, uint32_
 }
 
 bool StyleSheet::has_pseudo(const dom::Node* element, PseudoElement pseudo) const {
-  uint32_t element_scope, host_scope;
-  element_scopes(element, &element_scope, &host_scope);
-  for (uint32_t s = 0; s < selectors_.count(); ++s)
-    if (selectors_.pseudo(s) == static_cast<uint8_t>(pseudo) && rule_applies(s, element_scope, host_scope) && selectors_.matches(s, element, nullptr, true)) return true;
-  return false;
+  struct Visit {
+    const StyleSheet& sheet;
+    const dom::Node* element;
+    PseudoElement pseudo;
+    uint32_t element_scope, host_scope;
+    bool found;
+  } visit{*this, element, pseudo, 0, 0, false};
+  element_scopes(element, &visit.element_scope, &visit.host_scope);
+  for_candidates(element, [](void* p, uint32_t s) {
+    Visit& v = *static_cast<Visit*>(p);
+    const StyleSheet& sh = v.sheet;
+    v.found = sh.selectors_.pseudo(s) == static_cast<uint8_t>(v.pseudo) && sh.rule_applies(s, v.element_scope, v.host_scope) && sh.selectors_.matches(s, v.element, nullptr, true);
+    return !v.found;
+  }, &visit);
+  return visit.found;
 }
 
 namespace {
@@ -6453,17 +6464,149 @@ bool StyleSheet::property_registration(uint32_t index, PropertyRegistration* out
   return true;
 }
 
+namespace {
+uint32_t key_hash(uint8_t kind, StringView name) {
+  uint32_t h = 2166136261u ^ kind;
+  h *= 16777619u;
+  for (const char c : name) {
+    h ^= static_cast<uint8_t>(c);
+    h *= 16777619u;
+  }
+  return h;
+}
+}  // namespace
+
+void StyleSheet::build_index() const {
+  const uint32_t n = selectors_.count();
+  indexed_count_ = n;
+  indexed_generation_ = generation_;
+  key_table_.clear();
+  keyed_.clear();
+  unkeyed_.clear();
+  uint32_t capacity = 64;
+  while (capacity < n * 2 && capacity < (1u << 24)) capacity <<= 1;   // (at most half full)
+  for (uint32_t i = 0; i < capacity; ++i)
+    if (!key_table_.push_back(KeyRun())) return;
+  auto slot_of = [&](uint32_t hash) -> KeyRun& {
+    uint32_t at = hash & (capacity - 1);
+    while (key_table_[at].used && key_table_[at].hash != hash) at = (at + 1) & (capacity - 1);
+    return key_table_[at];
+  };
+  uint32_t keyed = 0;
+  for (uint32_t i = 0; i < n; ++i) {   // (how many selectors each key has)
+    StringView name;
+    const uint8_t kind = selectors_.key(i, &name);
+    if (kind == 0) {
+      if (!unkeyed_.push_back(i)) return;
+      continue;
+    }
+    KeyRun& run = slot_of(key_hash(kind, name));
+    run.used = true;
+    run.hash = key_hash(kind, name);
+    ++run.count;
+    ++keyed;
+  }
+  uint32_t start = 0;
+  for (KeyRun& run : key_table_) {   // (where each key's run begins; count goes back to 0 and is filled again below)
+    run.start = start;
+    start += run.count;
+    run.count = 0;
+  }
+  for (uint32_t i = 0; i < keyed; ++i)
+    if (!keyed_.push_back(0)) return;
+  for (uint32_t i = 0; i < n; ++i) {   // (in order, so every run lists its selectors in the order they were written)
+    StringView name;
+    const uint8_t kind = selectors_.key(i, &name);
+    if (kind == 0) continue;
+    KeyRun& run = slot_of(key_hash(kind, name));
+    keyed_[run.start + run.count++] = i;
+  }
+}
+
+const StyleSheet::KeyRun* StyleSheet::find_run(uint32_t hash) const {
+  const uint32_t capacity = static_cast<uint32_t>(key_table_.count());
+  if (capacity == 0) return nullptr;
+  for (uint32_t at = hash & (capacity - 1);; at = (at + 1) & (capacity - 1)) {
+    const KeyRun& run = key_table_[at];
+    if (!run.used) return nullptr;
+    if (run.hash == hash) return &run;
+  }
+}
+
+// The selectors the element could match, in the order they were written: the ones without a key and those of its id, classes and tag (see build_index), merged.
+// `visit` returns false to stop.
+void StyleSheet::for_candidates(const dom::Node* element, bool (*visit)(void*, uint32_t), void* context) const {
+  if (indexed_generation_ != generation_ || indexed_count_ != selectors_.count()) build_index();
+  constexpr uint32_t kMaxRuns = 40;
+  struct Cursor {
+    ArrayView<const uint32_t> run;
+    uint64_t next = 0;
+    const KeyRun* key = nullptr;
+  } runs[kMaxRuns];
+  uint32_t run_count = 0;
+  bool all = false;   // (too many classes to merge: every selector is tried)
+  auto add_run = [&](uint8_t kind, StringView name) {
+    const KeyRun* run = find_run(key_hash(kind, name));
+    if (!run || run->count == 0) return;
+    if (run_count == kMaxRuns) {
+      all = true;
+      return;
+    }
+    for (uint32_t r = 0; r < run_count; ++r)
+      if (runs[r].key == run) return;   // (a class written twice: its run once)
+    runs[run_count++] = {keyed_.view().subview(Slice{run->start, run->count}), 0, run};
+  };
+  if (unkeyed_.count() > 0) runs[run_count++] = {unkeyed_.view(), 0, nullptr};
+  StringView id;
+  if (dom::get_attribute(element, "id", &id) && !id.empty()) add_run(1, id);
+  StringView classes;
+  if (dom::get_attribute(element, "class", &classes)) {
+    auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; };
+    uint64_t i = 0;
+    while (i < classes.size()) {
+      while (i < classes.size() && blank(classes[i])) ++i;
+      const uint64_t from = i;
+      while (i < classes.size() && !blank(classes[i])) ++i;
+      if (i > from) add_run(2, classes.substr(from, i - from));
+    }
+  }
+  add_run(3, element->name.view());
+  if (all || keyed_.count() + unkeyed_.count() != selectors_.count()) {   // (or the index could not be made: no memory)
+    for (uint32_t s = 0; s < selectors_.count(); ++s)
+      if (!visit(context, s)) return;
+    return;
+  }
+  for (;;) {
+    uint32_t best = kMaxRuns;
+    for (uint32_t r = 0; r < run_count; ++r)
+      if (runs[r].next < runs[r].run.size() && (best == kMaxRuns || runs[r].run[runs[r].next] < runs[best].run[runs[best].next])) best = r;
+    if (best == kMaxRuns) return;
+    if (!visit(context, runs[best].run[runs[best].next++])) return;
+  }
+}
+
 void StyleSheet::apply(const dom::Node* element, StringView inline_style, const Style& parent, Style* style, PseudoElement pseudo) const {
   uint32_t matched[kMaxMatches];
   uint32_t count = 0;
   uint32_t element_scope, host_scope, slot_scope;
   element_scopes(element, &element_scope, &host_scope, &slot_scope);
-  for (uint32_t s = 0; s < selectors_.count() && count < kMaxMatches; ++s) {
-    if (selectors_.pseudo(s) != static_cast<uint8_t>(pseudo) || !rule_applies(s, element_scope, host_scope, slot_scope) || !selectors_.matches(s, element, nullptr, true)) continue;
-    const Rule& rule = rules_[selectors_.tag(s)];
-    if (rule.container != 0 && !container_applies(rule.container, element)) continue;
-    matched[count++] = s;
-  }
+  struct Visit {
+    const StyleSheet& sheet;
+    const dom::Node* element;
+    PseudoElement pseudo;
+    uint32_t element_scope, host_scope, slot_scope;
+    uint32_t* matched;
+    uint32_t* count;
+  } visit{*this, element, pseudo, element_scope, host_scope, slot_scope, matched, &count};
+  for_candidates(element, [](void* p, uint32_t s) {
+    Visit& v = *static_cast<Visit*>(p);
+    const StyleSheet& sh = v.sheet;
+    if (sh.selectors_.pseudo(s) != static_cast<uint8_t>(v.pseudo) || !sh.rule_applies(s, v.element_scope, v.host_scope, v.slot_scope) || !sh.selectors_.matches(s, v.element, nullptr, true)) return true;
+    const Rule& rule = sh.rules_[sh.selectors_.tag(s)];
+    if (rule.container != 0 && !sh.container_applies(rule.container, v.element)) return true;
+    v.matched[(*v.count)++] = s;
+    return *v.count < kMaxMatches;
+  }, &visit);
   // The order the declarations are applied in (the last one wins): by layer, then specificity, then where it came from. Normal declarations: later layers win and
   // unlayered rules win over layers; !important ones go the other way round.
   auto rank_of = [&](uint32_t selector) {

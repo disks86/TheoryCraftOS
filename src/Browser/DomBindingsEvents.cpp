@@ -145,9 +145,10 @@ NATIVE(dispatch_event_native) {
   const bool window = !node && (self.is_nullish() || (self.is_object() && self.as_object() == vm.global()));
   if (!node && !window && !self.is_object()) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
   bool prevented = false;
-  vm.hold_collector();
+  // (the event is an argument, on the VM stack; what the dispatch keeps across the listeners hangs off it: __path, __keep. So the collector may run in the
+  // listeners - YouTube builds its whole results page in one)
+  const Vm::PassThrough pass(vm);
   const bool ok = dispatch_event(c, node, window, event, &prevented, !node && !window ? self.as_object() : nullptr);
-  vm.release_collector();
   *result = bool_value(!prevented);
   return ok;
 }
@@ -398,19 +399,34 @@ bool invoke(DomBindings::Impl& c, dom::Node* node, JsObject* current, StringView
       if (event_flag(vm, e, "__stopi")) return false;
     }
   }
-  JsObject* l = listeners_of(vm, current, false);
-  Value list_value;
-  if (!l || !vm.get_plain(l, vm.intern(type), &list_value) || !list_value.is_object()) return true;
-  JsObject* list = list_value.as_object();
-  // (a copy: listeners may add and remove listeners while this runs)
-  List<Value> entries(vm.allocator());
-  for (uint32_t i = 0; i < list->length; ++i) entries.push_back(list->items[i]);
-  for (uint64_t i = 0; i < entries.count(); ++i) {
-    JsObject* entry = entries[i].as_object();
+  // The listeners as they are now (a copy: listeners may add and remove listeners while this runs). The collector may run in the listeners, so the copy is kept
+  // where it can see it - on the event, in __keep - and the list is looked up again after each one instead of kept in a variable.
+  auto current_list = [&]() -> JsObject* {
+    JsObject* l = listeners_of(vm, current, false);
+    Value list_value;
+    return l && vm.get_plain(l, vm.intern(type), &list_value) && list_value.is_object() ? list_value.as_object() : nullptr;
+  };
+  JsObject* list = current_list();
+  if (!list) return true;
+  JsObject* entries = vm.new_array(list->length);
+  if (!entries) return false;
+  for (uint32_t i = 0; i < list->length; ++i) vm.array_push(entries, list->items[i]);
+  JsObject* keep = nullptr;
+  {
+    Value keep_value;
+    if (vm.get_plain(e, vm.intern("__keep"), &keep_value) && keep_value.is_object()) keep = keep_value.as_object();
+    else if ((keep = vm.new_array()) != nullptr) vm.define(e, vm.intern("__keep"), Value::make_object(keep), kWritable);
+  }
+  if (!keep || !vm.array_push(keep, Value::make_object(entries))) return false;
+  const uint32_t kept_at = keep->length - 1;
+  bool go_on = true;
+  for (uint32_t i = 0; i < entries->length && go_on; ++i) {
+    JsObject* entry = entries->items[i].as_object();
     const bool capture = Vm::to_boolean(entry->items[1]);
     if ((phase == Phase::Capture || phase == Phase::TargetCapture) != capture) continue;
+    list = current_list();
     bool still = false;
-    for (uint32_t k = 0; k < list->length && !still; ++k) still = list->items[k].as_object() == entry;
+    for (uint32_t k = 0; list && k < list->length && !still; ++k) still = list->items[k].as_object() == entry;
     if (!still) continue;   // (removed meanwhile)
     if (Vm::to_boolean(entry->items[2])) {   // once: gone before it runs
       for (uint32_t k = 0; k < list->length; ++k) {
@@ -425,9 +441,10 @@ bool invoke(DomBindings::Impl& c, dom::Node* node, JsObject* current, StringView
     if (passive) vm.define(e, vm.intern("__passive"), bool_value(true), 0);
     call_listener(c, entry->items[0], current, event, type);
     if (passive) vm.define(e, vm.intern("__passive"), bool_value(false), 0);
-    if (event_flag(vm, e, "__stopi")) return false;
+    if (event_flag(vm, e, "__stopi")) go_on = false;
   }
-  return true;
+  if (keep->length > kept_at) keep->length = kept_at;   // (the copy is let go)
+  return go_on;
 }
 
 }  // namespace
@@ -466,6 +483,17 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
   const bool to_window = target_is_window || (nodes.count() && nodes[nodes.count() - 1]->type == dom::NodeType::Document);
   if (to_window) vm.array_push(path, Value::make_object(vm.global()));
   vm.define(e, vm.intern("__path"), Value::make_object(path), 0);
+  JsObject* keep = nullptr;   // (the path is used after the listeners ran: kept where the collector sees it, even if one dispatches this event again)
+  {
+    Value keep_value;
+    if (vm.get_plain(e, vm.intern("__keep"), &keep_value) && keep_value.is_object()) keep = keep_value.as_object();
+    else if ((keep = vm.new_array()) != nullptr) vm.define(e, vm.intern("__keep"), Value::make_object(keep), kWritable);
+  }
+  if (!keep || !vm.array_push(keep, Value::make_object(path))) {
+    report_error(c, "dispatchEvent");
+    return true;
+  }
+  const uint32_t kept_at = keep->length - 1;
   vm.define(e, vm.intern("__orig"), path->length ? path->items[0] : Value::make_null(), 0);
   vm.define(e, vm.intern("__stop"), bool_value(false), 0);
   vm.define(e, vm.intern("__stopi"), bool_value(false), 0);
@@ -499,6 +527,7 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
     vm.define_named(e, "target", path->items[0]);
     vm.define_named(e, "srcElement", path->items[0]);
   }
+  if (keep->length > kept_at) keep->length = kept_at;
   Value dp;
   vm.get_named(event, "defaultPrevented", &dp);
   *prevented = Vm::to_boolean(dp);

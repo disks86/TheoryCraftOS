@@ -59,6 +59,8 @@ LayoutUnit LayoutContext::layout_atomic(BoxId id, LayoutUnit available) {
   WidthRequest request;
   request.shrink = true;
   request.available = available;
+  request.cb_height_known = child_cb_height_known_;   // (the block whose lines it sits in is its containing block: height: 100% of an inline image is of that block)
+  request.cb_height = child_cb_height_;
   layout_block(id, available, request);
   const Box& b = tree_.box(id);
   return b.margin.left + b.width + b.margin.right;

@@ -544,7 +544,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   List<Message> messages_;
   Page* parent_ = nullptr;
   uint32_t frame_serial_ = 0, depth_ = 0;
-  uint64_t instruction_limit_ = 64000000, memory_limit_ = 256u << 20;   // (big sites boot in tens of millions of instructions and some 150 MB: YouTube's bundle alone is 10 MB of script)
+  uint64_t instruction_limit_ = 192000000, memory_limit_ = 512u << 20;   // (big sites boot in tens of millions of instructions and some 150 MB: YouTube's bundle alone is 10 MB of script; its search results take over 64 million in one event and keep 320 MB alive)
   uint32_t window_id_ = 1, next_window_id_ = 2;           // (the top page numbers the windows of its frames)
   List<PortHome> frame_windows_;                           // (the window number of each <iframe>, by the node's serial, made when first asked for)
   uint32_t next_port_ = 1;

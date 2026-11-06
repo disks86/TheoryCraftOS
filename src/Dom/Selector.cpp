@@ -682,6 +682,24 @@ bool SelectorSet::matches(uint32_t i, const Node* element, const Node* scope, bo
   return match_chain(s, s.compound_count - 1, element, scope);
 }
 
+uint8_t SelectorSet::key(uint32_t i, StringView* name) const {
+  if (i >= tops_.count()) return 0;
+  const Selector& s = selectors_[tops_[i]];
+  if (s.host || s.slotted || s.compound_count == 0) return 0;
+  const Compound& c = compounds_[s.first_compound + s.compound_count - 1];
+  if (compound_is_host(c)) return 0;
+  uint8_t best = 0;
+  for (uint32_t t = 0; t < c.test_count; ++t) {
+    const Test& test = tests_[c.first_test + t];
+    const uint8_t kind = test.kind == TestKind::Id ? 1 : test.kind == TestKind::Class ? 2 : test.kind == TestKind::Tag ? 3 : 0;
+    if (kind != 0 && (best == 0 || kind < best)) {
+      best = kind;
+      *name = text(test.name_offset, test.name_length);
+    }
+  }
+  return best;
+}
+
 bool SelectorSet::matches_any(const Node* element, const Node* scope) const {
   for (uint32_t i = 0; i < tops_.count(); ++i)
     if (matches(i, element, scope)) return true;

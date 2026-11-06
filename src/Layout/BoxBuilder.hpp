@@ -21,7 +21,7 @@
 // inline-level boxes, so inline content beside blocks is wrapped in anonymous blocks, white space between blocks makes no box, and an inline
 // element that has blocks inside becomes a block itself (the "a wraps a div" case; the real rule splits the inline around the blocks).
 //
-// Not done here yet: ::before and ::after content and counters, form controls drawn as controls (they come out as boxes of a typical
+// Not done here yet: counters and quotes in ::before / ::after content, form controls drawn as controls (they come out as boxes of a typical
 // size), and a shadow tree's slots beyond what dom::slot_assigned_nodes gives.
 #pragma once
 #include "Browser/Css.hpp"

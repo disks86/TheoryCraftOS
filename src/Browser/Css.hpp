@@ -628,7 +628,7 @@ class StyleSheet {
   static constexpr uint32_t kMaxRules = 250000;   // (a big site's one style sheet has 30000 and more)
 
   explicit StyleSheet(allocators::IAllocator& allocator)
-      : allocator_(allocator), pool_(allocator), selectors_(allocator), declarations_(allocator), rules_(allocator), scopes_(allocator), kept_(allocator),
+      : allocator_(allocator), pool_(allocator), selectors_(allocator), key_table_(allocator), keyed_(allocator), unkeyed_(allocator), declarations_(allocator), rules_(allocator), scopes_(allocator), kept_(allocator),
         imports_(allocator), font_faces_(allocator), unicode_ranges_(allocator), keyframes_(allocator), stops_(allocator), registrations_(allocator), layers_(allocator),
         layer_rank_(allocator), containers_(allocator) {}
   StyleSheet(const StyleSheet&) = delete;
@@ -807,6 +807,21 @@ class StyleSheet {
   bool rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope, uint32_t slot_scope = 0) const;
   String pool_;
   dom::SelectorSet selectors_;
+  // The selectors by what the element they match must have (SelectorSet::key: an id, a class or a tag): apply() looks only at those of the element's own id,
+  // classes and tag and at the ones that need none of these, instead of at every rule (YouTube has 20,000; scripts ask for computed styles constantly).
+  // Made when first needed after the selectors changed: a table from key hash to a run of `keyed_` (selector numbers in order).
+  struct KeyRun {
+    uint32_t hash = 0, start = 0, count = 0;
+    bool used = false;
+  };
+  mutable List<KeyRun> key_table_;
+  mutable List<uint32_t> keyed_, unkeyed_;
+  mutable uint32_t indexed_count_ = 0;
+  mutable uint64_t indexed_generation_ = ~uint64_t{0};
+  uint64_t generation_ = 0;   // (clear() starts a new one: the index is made again)
+  void build_index() const;
+  const KeyRun* find_run(uint32_t hash) const;
+  void for_candidates(const dom::Node* element, bool (*visit)(void*, uint32_t), void* context) const;
   const MediaEnvironment* env_ = nullptr;
   List<Declaration> declarations_;
   List<Rule> rules_;

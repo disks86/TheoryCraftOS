@@ -22,12 +22,18 @@
 #include <malloc.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <map>
+#include <algorithm>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <functional>
 #include <map>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include "Allocators/Allocator.hpp"
@@ -167,22 +173,34 @@ static void probe_mirror(const std::string& rel, const std::string& path) {
 static bool probe_file(const std::string& address, std::string* body) {
   const char* root = getenv("PROBE_ROOT");
   if (!root || address.compare(0, 8, "https://") != 0) return false;
-  std::string rest = address.substr(8);
-  const size_t cut = rest.find_first_of("?#");
-  if (cut != std::string::npos) rest.resize(cut);
+  std::string rest = address.substr(8), query;
+  const size_t hash_at = rest.find('#');
+  if (hash_at != std::string::npos) rest.resize(hash_at);
+  const size_t cut = rest.find('?');
+  if (cut != std::string::npos) {   // (a query is part of what is fetched - YouTube's thumbnails need theirs - and the file is named after it)
+    query = rest.substr(cut);
+    rest.resize(cut);
+  }
   const size_t slash = rest.find('/');
   if (slash == std::string::npos) return false;
   const std::string host = rest.substr(0, slash), rel = rest.substr(slash + 1);
-  for (char c : rest)
-    if (!isalnum(static_cast<unsigned char>(c)) && !strchr("/._=,~+%-", c)) return false;   // (the name goes to a shell: only plain characters)
+  for (char c : rest + query)
+    if (!isalnum(static_cast<unsigned char>(c)) && !strchr("/._=,~+%-?&", c)) return false;   // (the name goes to a shell, in single quotes: only plain characters)
   std::string path;
   if (host == "app.example") {
     path = std::string(root) + "/" + rel;
     probe_mirror(rel, path);
   } else {
     path = std::string(root) + "/_ext/" + rest;
+    if (!query.empty()) {
+      uint32_t h = 2166136261u;
+      for (char c : query) h = (h ^ static_cast<uint8_t>(c)) * 16777619u;
+      char tag[16];
+      snprintf(tag, sizeof tag, "_q%08x", h);
+      path += tag;
+    }
     if (getenv("PROBE_LIVE") && access(path.c_str(), F_OK) != 0 && system(("mkdir -p '" + path.substr(0, path.rfind('/')) + "'").c_str()) == 0 &&
-        system(("curl -sf -m 60 -o '" + path + "' 'https://" + rest + "' || rm -f '" + path + "'").c_str()) != 0)
+        system(("curl -sf -m 60 -o '" + path + "' 'https://" + rest + query + "' || rm -f '" + path + "'").c_str()) != 0)
       return false;
   }
   FILE* f = fopen(path.c_str(), "rb");
@@ -192,6 +210,61 @@ static bool probe_file(const std::string& address, std::string* body) {
   fclose(f);
   return true;
 }
+
+// PROBE_PROFILE=1: a sampling profiler for the probe (perf and ptrace are not always allowed): every millisecond of CPU the stack is recorded; at the end the
+// functions that were running most (self) and the ones most often on the stack (total) are printed.
+namespace probe_profile {
+constexpr int kDepth = 48, kMax = 400000;
+void* g_frames[kMax][kDepth];
+int g_depths[kMax];
+volatile int g_count = 0;
+void on_tick(int) {
+  const int at = g_count;
+  if (at >= kMax) return;
+  g_depths[at] = backtrace(g_frames[at], kDepth);
+  g_count = at + 1;
+}
+void start() {
+  void* warm[4];
+  backtrace(warm, 4);   // (loads the unwinder before the first signal)
+  signal(SIGPROF, on_tick);
+  itimerval t{{0, 1000}, {0, 1000}};
+  setitimer(ITIMER_PROF, &t, nullptr);
+}
+void report() {
+  itimerval off{};
+  setitimer(ITIMER_PROF, &off, nullptr);
+  std::map<void*, std::string> names;
+  auto name_of = [&](void* a) -> const std::string& {
+    auto it = names.find(a);
+    if (it != names.end()) return it->second;
+    char** sym = backtrace_symbols(&a, 1);
+    std::string n = sym ? sym[0] : "?";
+    free(sym);
+    const size_t open = n.find('('), plus = n.find('+', open == std::string::npos ? 0 : open);
+    if (open != std::string::npos && plus != std::string::npos && plus > open + 1) n = n.substr(open + 1, plus - open - 1);
+    return names[a] = n;
+  };
+  std::map<std::string, int> self, total;
+  for (int i = 0; i < g_count; ++i) {
+    std::map<std::string, bool> seen;
+    for (int k = 2; k < g_depths[i]; ++k) {   // (0 and 1 are the signal handler and the signal frame)
+      const std::string& n = name_of(g_frames[i][k]);
+      if (k == 2) ++self[n];
+      if (!seen[n]) { seen[n] = true; ++total[n]; }
+    }
+  }
+  auto top = [&](std::map<std::string, int>& m, const char* what) {
+    std::vector<std::pair<int, std::string>> v;
+    for (auto& e : m) v.push_back({e.second, e.first});
+    std::sort(v.rbegin(), v.rend());
+    printf("profile %s (%d samples of 1 ms):\n", what, g_count);
+    for (size_t i = 0; i < v.size() && i < 45; ++i) printf("  %6d %5.1f%%  %s\n", v[i].first, 100.0 * v[i].first / (g_count ? g_count : 1), v[i].second.c_str());
+  };
+  top(self, "self");
+  top(total, "total");
+}
+}  // namespace probe_profile
 
 // PROBE: the Content-Type header of a file of the probe directory, from its name.
 static std::string probe_content_type(const std::string& path) {
@@ -6444,6 +6517,23 @@ static void test_webrtc() {
       CHECK(with_fonts ? log.find("measured 123x45 200") != std::string::npos : log.find("measured 0x0 200") != std::string::npos);
     }
   }
+  {   // the collector runs in an event listener: a listener that makes much more garbage than the page may hold at once finishes (YouTube builds its whole results page
+      // in one); what the dispatch itself keeps - the path, the listeners left to call - survives
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    page.set_script_limits(200000000, 24u << 20);
+    page.load("<html><body><div id=d></div><script>\n"
+              "var d = document.getElementById('d'), calls = [];\n"
+              "d.addEventListener('work', function () { var keep = 0; for (var i = 0; i < 300000; i++) { var o = {a: [i, i + 1], s: 'x' + i}; keep += o.a.length; } calls.push('first ' + keep); });\n"
+              "d.addEventListener('work', function () { calls.push('second'); });\n"
+              "document.body.addEventListener('work', function (e) { calls.push('bubbled ' + (e.target === d)); });\n"
+              "d.dispatchEvent(new CustomEvent('work', {bubbles: true}));\n"
+              "console.log('gc ' + calls.join(','));\n"
+              "</script></body></html>");
+    const std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("gc first 600000,second,bubbled true") != std::string::npos && page.errors() == 0);
+  }
   {   // layouts for scripts are held to a fifth of the time, but an element made since the last one is laid out at once: one read as 0 x 0 kept YouTube's
       // feed empty (its grid waits for a resize that never comes)
     FakeEnvironment env(a);
@@ -6579,6 +6669,7 @@ static int run_real_wpt(const char* root, const char* file) {
 int main(int argc, char** argv) {
   if (const char* real = getenv("WPT_REAL_FILE")) return run_real_wpt(getenv("WPT_ROOT") ? getenv("WPT_ROOT") : ".", real);
   if (const char* html_file = getenv("PROBE_HTML")) {   // loads a saved page as the document at https://app.example/ (PROBE_ROOT serves its files) and prints the log
+    if (getenv("PROBE_PROFILE")) probe_profile::start();
     std::string html;
     if (FILE* f = fopen(html_file, "rb")) { int c; while ((c = fgetc(f)) != EOF) html.push_back(static_cast<char>(c)); fclose(f); }
     TestAllocator a;
@@ -6587,7 +6678,7 @@ int main(int argc, char** argv) {
       MediaEnvironment media;
       media.width = getenv("PROBE_WIDTH") ? atoi(getenv("PROBE_WIDTH")) : 1280;   // (the browser window's page area: PROBE_WIDTH / PROBE_HEIGHT)
       media.height = getenv("PROBE_HEIGHT") ? atoi(getenv("PROBE_HEIGHT")) : 800;
-      Page page(a, env, "https://app.example/", media, true);
+      Page page(a, env, getenv("PROBE_URL") ? getenv("PROBE_URL") : "https://app.example/", media, true);   // (PROBE_URL: the address it was saved from, on app.example)
       font::FontSet probe_fonts(a);   // (what scripts measure with once the page has changed; the probe's pictures use their own)
       probe_fonts.add_bundled_fonts();
       page.set_layout_fonts(&probe_fonts);
@@ -6615,6 +6706,10 @@ int main(int argc, char** argv) {
         printf("before render: peak rss %ld KiB\n", before.ru_maxrss);
         font::FontSet fonts(a);
         fonts.add_bundled_fonts();
+        {   // (pictures are fetched when the page is drawn and their load events then change the page: drawn once, the events run, then drawn for the result, as the browser does)
+          PagePicture first_pass(a);
+          if (page.render_picture(&first_pass, fonts)) settle_page(page, env, 2000);
+        }
         PagePicture picture(a);
         const bool ok = page.render_picture(&picture, fonts);
         struct rusage ru;
@@ -6648,6 +6743,7 @@ int main(int argc, char** argv) {
       for (const std::string& f : env.fetched) printf("fetched: %.120s\n", f.c_str());
       for (const std::string& l : env.console_lines) printf("console: %.300s\n", l.c_str());
       for (const std::string& r : env.net.sent) printf("sent: %.*s\n", static_cast<int>(r.find('\n')), r.c_str());
+      if (getenv("PROBE_PROFILE")) probe_profile::report();
       fflush(stdout);
       _Exit(0);
     }

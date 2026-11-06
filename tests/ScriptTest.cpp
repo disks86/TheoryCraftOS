@@ -225,6 +225,9 @@ static void test_objects() {
   CHECK(is("function A() {} var a = new A(); a instanceof A", "true"));
   CHECK(is("function A() {} function B() {} new A() instanceof B", "false"));
   CHECK(is("function A() {} new A().constructor === A", "true"));
+  // a function's own prototype is written even when its __proto__ is a constructor whose prototype is read-only (ShadyDOM wraps Event and CustomEvent so)
+  CHECK(is("function A() {} Object.defineProperty(A, 'prototype', {writable: false, value: {k: 1}}); function B() {} B.__proto__ = A; B.prototype = A.prototype; "
+           "var C = function () {}; C.__proto__ = Error; C.prototype = Error.prototype; (B.prototype === A.prototype) + ':' + (C.prototype === Error.prototype) + ':' + (new C() instanceof Error)", "true:true:true"));
   CHECK(is("function Animal(n) { this.n = n; } Animal.prototype.speak = function() { return this.n + ' makes a sound'; }; function Dog(n) { Animal.call(this, n); } Dog.prototype = Object.create(Animal.prototype); Dog.prototype.constructor = Dog; new Dog('rex').speak()", "rex makes a sound"));
   CHECK(is("var o = { toString() { return 'custom'; } }; '' + o", "custom"));
   CHECK(is("String({})", "[object Object]"));

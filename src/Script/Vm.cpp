@@ -1388,6 +1388,9 @@ void Vm::collect() {
   rebuild_intern_table();
   gc_threshold_ = heap_bytes_ * 2 > (4u << 20) ? heap_bytes_ * 2 : (4u << 20);
   if (gc_threshold_ > memory_limit_) gc_threshold_ = memory_limit_ - (memory_limit_ >> 3);
+  // (but always a sixteenth of the limit above what is alive: with the heap close to the limit the next collection would otherwise come a few allocations
+  // later, again and again - YouTube's results page spent minutes collecting 230 MB that stayed alive)
+  if (gc_threshold_ < heap_bytes_ + (memory_limit_ >> 4)) gc_threshold_ = heap_bytes_ + (memory_limit_ >> 4);
 }
 
 // --- Properties --------------------------------------------------------------------------------------------------
@@ -1883,6 +1886,10 @@ bool Vm::put_ex(const Value& base, JsString* key, const Value& value, bool stric
     }
     if (o->props[at].flags & kWritable) o->props[at].value = value;
     else return refuse("Cannot assign to read only property '", "' of object");
+    return true;
+  }
+  if (key == prototype_ && o->okind == ObjKind::Function && !o->code->is_arrow) {   // (its own prototype, not made yet because nobody looked: written as it is, whatever
+    define(o, prototype_, value, kWritable | kNonConfigurable);                     // the chain has - ShadyDOM sets F.__proto__ = Event, then F.prototype = Event.prototype)
     return true;
   }
   for (JsObject* p = o->proto; p; p = p->proto) {   // a setter further up the chain takes the write; a read-only property there stops it

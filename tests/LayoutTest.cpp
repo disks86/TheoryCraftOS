@@ -45,7 +45,7 @@ static font::FontSet* g_fonts = nullptr;   // the bundled fonts (made in main)
 // Every <img> is 100x50 and ready.
 struct FakeObjects final : browser::IObjectSource {
   bool object_info(const dom::Node* element, browser::ObjectInfo* out) override {
-    if (!element->is_tag("img")) return false;
+    if (!element->is_tag("img") || dom::has_attribute(element, "data-missing")) return false;   // (data-missing: a picture not there yet)
     out->kind = browser::ObjectKind::Image;
     out->width = 100;
     out->height = 50;
@@ -371,6 +371,32 @@ static void test_positioning() {
   Laid c4(page("<button id=b style='height:40px;width:64px;padding:0;border:0'><div id=i style='width:24px;height:24px'></div></button>"
                "<button id=b2 style='height:40px;width:64px;padding:0;border:0'><span id=j style='display:inline-block;width:24px;height:10px'></span></button>").c_str());
   CHECK(c4.abs_y("i") - c4.abs_y("b") == 8 && c4.abs_x("j") - c4.abs_x("b2") == 20 && c4.abs_y("j") > c4.abs_y("b2") + 8);
+
+  // ::before and ::after make boxes: one with only padding gives its element a height (YouTube's thumbnails are 16:9 so), one with text holds that text
+  // (strings, escapes, attr()); an inline one sits in the line
+  Laid g1(page("<style>.r:before{display:block;content:'';padding-top:50%} .t:before{display:block;content:'[' attr(data-x) '\\2022]'} .i:after{content:' tail'}</style>"
+               "<div style='width:200px'><div id=r class=r></div><div id=t class=t data-x=ab></div><span id=i class=i>x</span></div>").c_str());
+  CHECK(g1.ok && px(g1.at("r").height) == 100 && px(g1.at("t").height) > 0);
+  auto generated_text = [&](const Laid& l, const char* id) {
+    std::string out;
+    const BoxId owner = l.box(id);
+    for (uint64_t i = 0; i < l.tree.count(); ++i) {
+      const Box& b = l.tree.box(static_cast<BoxId>(i));
+      if (b.kind != BoxKind::Text || b.node != 0) continue;
+      for (BoxId up = b.parent; up != kNoBox; up = l.tree.box(up).parent)
+        if (up == owner) {
+          out.append(b.text.view().data(), b.text.size());
+          break;
+        }
+    }
+    return out;
+  };
+  CHECK(generated_text(g1, "t") == "[ab\xE2\x80\xA2]" && generated_text(g1, "i") == " tail");
+  // height: 100% of an inline image is of the block its line is in; a picture that is not there yet keeps the size the page gives it (not its alt text)
+  Laid g2(page("<div style='width:300px;height:100px'><img id=a style='display:inline-block;width:100%;height:100%'></div>"
+               "<div style='width:300px;height:100px'><span><img id=m data-missing alt=x style='display:inline-block;width:100%;height:100%'></span></div>").c_str());
+  CHECK(g2.ok && px(g2.at("a").width) == 300 && px(g2.at("a").height) == 100);
+  CHECK(g2.at("m").kind == BoxKind::Replaced && px(g2.at("m").width) == 300 && px(g2.at("m").height) == 100);
 
   // auto offsets keep the place the box would have had in the flow
   Laid d(page("<div style='height:10px'></div><div id=k style='position:absolute;width:20px;height:5px'></div>").c_str());

@@ -32,6 +32,7 @@ using browser::Float;
 using browser::Layout;
 using browser::Length;
 using browser::ObjectKind;
+using browser::PseudoElement;
 using browser::Overflow;
 using browser::Position;
 using browser::Style;
@@ -232,7 +233,9 @@ class Builder {
       return;
     }
     if (s.display == Display::ListItem && !s.list_none) add_marker(n, s, id);
+    add_pseudo(n, s, id, PseudoElement::Before);
     build_children(n, s, id, depth + 1);
+    add_pseudo(n, s, id, PseudoElement::After);
     finalize(id);
     failed_ |= !finish_table(tree_, id);
   }
@@ -251,9 +254,9 @@ class Builder {
         has_w = info.width != 0;
         has_h = info.height != 0;
         shape_only = info.shape_only;
-      } else if (n->is_tag("img")) {   // a picture that is not there: its alternative text, if it has some
-        StringView alt;
-        if (dom::get_attribute(n, "alt", &alt) && !alt.empty()) {
+      } else if (n->is_tag("img")) {   // a picture that is not there: its alternative text, if it has some and the page gives it no size (one it does keeps its box: YouTube
+        StringView alt;                 // measures its thumbnails' before it picks which picture to load)
+        if (s.width.is_auto() && s.height.is_auto() && dom::get_attribute(n, "alt", &alt) && !alt.empty()) {
           const BoxId id = tree_.create(BoxKind::Inline, n->serial, s);
           if (id == kNoBox) { failed_ = true; return true; }
           const BoxId text = tree_.create(BoxKind::Text, 0, s.inherit());
@@ -326,6 +329,103 @@ class Builder {
     if (id == kNoBox) { failed_ = true; return; }
     tree_.box(id).text.assign(text.view());
     failed_ |= !tree_.append(item, id);
+  }
+
+  // The text `content` gives a ::before or ::after: strings (CSS escapes become the characters, in UTF-8) and attr(name). Counters and quotes add nothing yet.
+  static void content_text(const dom::Node* n, StringView content, String* out) {
+    uint64_t i = 0;
+    for (uint32_t guard = 0; i < content.size() && guard < 200; ++guard) {
+      while (i < content.size() && is_space(content[i])) ++i;
+      if (i >= content.size()) break;
+      const char c = content[i];
+      if (c == '"' || c == '\'') {
+        ++i;
+        while (i < content.size() && content[i] != c) {
+          if (content[i] != '\\') {
+            out->push_back(content[i++]);
+            continue;
+          }
+          ++i;
+          if (i >= content.size()) break;
+          uint32_t cp = 0, digits = 0;
+          while (i < content.size() && digits < 6 && ((content[i] >= '0' && content[i] <= '9') || (content[i] >= 'a' && content[i] <= 'f') || (content[i] >= 'A' && content[i] <= 'F'))) {
+            const char h = content[i++];
+            cp = cp * 16 + static_cast<uint32_t>(h <= '9' ? h - '0' : (h | 32) - 'a' + 10);
+            ++digits;
+          }
+          if (digits == 0) {
+            if (content[i] != '\n') out->push_back(content[i]);
+            ++i;
+            continue;
+          }
+          if (i < content.size() && is_space(content[i])) ++i;
+          if (cp == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+          if (cp < 0x80) {
+            out->push_back(static_cast<char>(cp));
+          } else if (cp < 0x800) {
+            out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+          } else if (cp < 0x10000) {
+            out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+          } else {
+            out->push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+          }
+        }
+        if (i < content.size()) ++i;
+        continue;
+      }
+      if (c == '/') break;   // (alternative text for screen readers follows)
+      const uint64_t start = i;
+      while (i < content.size() && !is_space(content[i]) && content[i] != '(') ++i;
+      const StringView word = content.substr(start, i - start);
+      if (i < content.size() && content[i] == '(') {   // a function: attr() gives the attribute's value, the others nothing here
+        const uint64_t open = ++i;
+        int nesting = 1;
+        while (i < content.size() && nesting > 0) {
+          if (content[i] == '(') ++nesting;
+          else if (content[i] == ')') --nesting;
+          ++i;
+        }
+        const StringView argument = content.substr(open, (i > open ? i - 1 : open) - open).trimmed();
+        StringView value;
+        if (word.equals_ignore_case("attr") && dom::get_attribute(n, argument, &value)) out->append(value);
+      }
+    }
+  }
+
+  // ::before and ::after: a box in the style their rules give, holding the text of `content` (a box with only padding - YouTube's thumbnails get their height so).
+  void add_pseudo(const dom::Node* n, const Style& s, BoxId parent, PseudoElement which) {
+    if (failed_ || tree_.count() >= options_.max_boxes || !sheet_.has_pseudo(n, which)) return;
+    Style ps = s.inherit();
+    sheet_.apply(n, StringView(), s, &ps, which);
+    if (!ps.has_content || ps.display == Display::None || ps.contents) return;
+    String text(allocator());
+    content_text(n, sheet_.text(ps.content), &text);
+    const bool out_of_flow = ps.position == Position::Absolute || ps.position == Position::Fixed;
+    const bool floated = ps.float_side != Float::None && !out_of_flow;
+    BoxKind kind = BoxKind::Block;
+    if (!out_of_flow && !floated) kind = ps.inline_box ? BoxKind::InlineBlock : ps.display == Display::Inline ? BoxKind::Inline : BoxKind::Block;
+    if (kind == BoxKind::Inline && text.size() == 0) return;   // (an empty inline box takes no room)
+    const BoxId id = tree_.create(kind, 0, ps);
+    if (id == kNoBox) { failed_ = true; return; }
+    Box& b = tree_.box(id);
+    b.out_of_flow = out_of_flow;
+    b.floated = floated;
+    b.establishes_bfc = out_of_flow || floated || kind == BoxKind::InlineBlock || ps.overflow_x != Overflow::Visible || ps.overflow_y != Overflow::Visible ||
+                        ps.layout == Layout::Flex || ps.layout == Layout::Grid || ps.column_count > 0 || ps.flow_root;
+    failed_ |= !tree_.append(parent, id);
+    if (text.size() > 0) {
+      const BoxId t = tree_.create(BoxKind::Text, 0, ps.inherit());
+      if (t == kNoBox) { failed_ = true; return; }
+      tree_.box(t).text.assign(text.view());
+      failed_ |= !tree_.append(id, t);
+    }
+    finalize(id);
   }
 
   static bool only_collapsible_space(const Box& b) {

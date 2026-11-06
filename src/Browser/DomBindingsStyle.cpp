@@ -638,6 +638,7 @@ void position_list_text(StringView value, String* out) {
 }
 
 Value computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full = true);
+Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full, StringView only = StringView());
 extern const HostClass kComputedClass;
 
 PseudoElement computed_pseudo(JsObject* o) { return static_cast<PseudoElement>(o->position); }   // (a computed style keeps its pseudo-element here)
@@ -649,14 +650,21 @@ Value computed_view(Vm& vm, const Value& self) {   // the snapshot behind a live
 
 NATIVE(computed_get_property_value) {
   String name(vm.allocator());
-  const Value snap = computed_view(vm, self);
-  if (!snap.is_object() || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
+  if (!self.is_object() || self.as_object()->host != &kComputedClass || !arg_text(vm, arg_at(args, argc, 0), &name)) {
+    *result = str_value(vm, "");
+    return !vm.has_exception();
+  }
   String js(vm.allocator());
-  if (name.view().starts_with("--")) js.assign(name.view());   // (a custom property keeps its name)
+  const bool custom = name.view().starts_with("--");
+  if (custom) js.assign(name.view());   // (a custom property keeps its name)
   else js_name_from_css(name.view(), &js);
   if (name.view().equals("float")) js.assign("cssFloat");
+  JsObject* o = self.as_object();
+  // (a custom property is only in the full snapshot; any other one is made alone)
+  const Value snap = custom ? computed_snapshot(impl(vm), static_cast<dom::Node*>(o->host_data), computed_pseudo(o))
+                            : build_computed_snapshot(impl(vm), static_cast<dom::Node*>(o->host_data), computed_pseudo(o), false, js.view());
   Value v;
-  *result = vm.get_plain(snap.as_object(), vm.intern(js.view()), &v) ? v : str_value(vm, "");
+  *result = snap.is_object() && vm.get_plain(snap.as_object(), vm.intern(js.view()), &v) ? v : str_value(vm, "");
   return true;
 }
 
@@ -888,12 +896,17 @@ bool pseudo_content_text(const dom::Node* n, StringView raw, String* out) {
 }
 
 // `full`: with the custom properties, the indexes and cssText as well (the light one has the properties of the standard list, which is what nearly every read wants).
-Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full) {
+// `only` (not with `full`): the one property a script reads; the others are not made (a page reads computedStyle.x of thousands of elements: each snapshot made a hundred
+// strings, gigabytes on YouTube's results page).
+Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoElement pseudo, bool full, StringView only) {
   Vm& vm = c.vm;
   JsObject* o = vm.new_plain();
   Style s;
   const bool known = element && element->is_element() && (pseudo == PseudoElement::None ? c.host.computed_style(element, &s) : c.host.computed_pseudo_style(element, pseudo, &s));
-  auto set = [&](const char* name, StringView value) { vm.define_named(o, name, str_value(vm, value)); };
+  auto set = [&](const char* name, StringView value) {
+    if (!only.empty() && !only.equals(name)) return;
+    vm.define_named(o, name, str_value(vm, value));
+  };
   String t(vm.allocator());
   if (!known) {
     set("display", "");
@@ -1385,6 +1398,10 @@ bool computed_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   Value ignored;
   if (vm.get_plain(impl(vm).computed_proto, key, &ignored)) return false;   // (a method: no snapshot is needed to find it)
   const bool listing = k[0] == '-' || (k[0] >= '0' && k[0] <= '9') || k.equals("length") || k.equals("cssText");   // (what only the full snapshot has)
+  if (!listing) {   // one property: only it is made
+    const Value one = build_computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o), false, k);
+    return one.is_object() && vm.get_plain(one.as_object(), key, out);
+  }
   const Value snap = computed_snapshot(impl(vm), computed_node(o), computed_pseudo(o), listing);
   return snap.is_object() && vm.get_plain(snap.as_object(), key, out);
 }
