@@ -190,6 +190,8 @@ uint64_t create_step(Call& call, Op& op) {
         queue_payload_upcall(call, &op, w, wn::WM_WINDOWPOSCHANGED, 0, pos, 0xFFFF, 0, 0);
         invalidate_window(w, nullptr, true);
         w->nc_paint_pending = true;
+        if (redirected(w)) sync_surface(w);
+        notify_top_level(w);
         if (is_top_level(w) && !(w->ex_style & wn::WS_EX_NOACTIVATE)) activate_window_internal(call, w, true);
         return kUpcallDue;
       }
@@ -630,6 +632,7 @@ uint64_t set_long_step(Call& call, Op& op) {
   const int32_t offset = int32_t(op.a[1]);
   if (op.phase == 0) {
     op.phase = 1;
+    if (offset == wn::GWL_STYLE || offset == wn::GWL_EXSTYLE || offset == wn::GWL_HWNDPARENT) notify_top_level(w);      // (the desktop's window follows the frame, buttons and owner)
     if (offset == wn::GWL_STYLE || offset == wn::GWL_EXSTYLE) {
       List<uint8_t> payload(S().alloc);
       uint8_t raw[8];

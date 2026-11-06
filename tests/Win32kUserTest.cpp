@@ -22,6 +22,8 @@
 #include <functional>
 #include <thread>
 #include "Win32kTestSupport.hpp"
+#include "Process/Win32k/Win32kDesktopBridge.hpp"
+#include "Process/Win32k/Win32kGdi.hpp"
 #include "Process/Win32k/Win32kUser.hpp"
 #include "Process/Win32k/Win32kUserInternal.hpp"
 
@@ -1103,6 +1105,117 @@ void test_props_longs_text() {
   user::reset_state();
 }
 
+// Redirection (the desktop's windows are the programs' windows): the desktop's bridge sees each top-level, draws its surface, and moves, sizes, activates and closes it
+// through the program, as Win32kDesktopBridge does for the kernel's desktop.
+bool has(const List<uint32_t>& l, uint32_t v) { for (uint32_t x : l.view()) if (x == v) return true; return false; }
+bool has_repaint(const List<desktop::IWindowsSession::Repaint>& l, uint32_t w) { for (const auto& r : l.view()) if (r.window == w) return true; return false; }
+
+void test_redirection() {
+  Program prog(91);
+  Th t(prog, 91, kScratch);
+  t.proc = def_proc;
+  auto pump = [&]() {
+    Th::M m;
+    for (int i = 0; i < 64 && t.peek(&m); ++i) t.svc(N::NtUserDispatchMessage, {t.tmp(0xA00)});
+    for (int i = 0; i < 8; ++i) {      // (WM_PAINT is not in the queue: it comes while a window needs painting)
+      if (!t.peek(&m, 0, WM_PAINT, WM_PAINT)) break;
+      t.svc(N::NtUserDispatchMessage, {t.tmp(0xA00)});
+    }
+  };
+  // the program's red fill at client (x, y) w x h
+  auto fill = [&](uint32_t hwnd, int x, int y, int w, int h) {
+    const uint32_t dc = t.svc32(N::NtUserGetDC, {hwnd});
+    const uint64_t brush = t.svc(N::NtGdiCreateSolidBrush, {0x0000FF, 0});
+    t.svc(N::NtGdiSelectBrush, {dc, brush});
+    CHECK(t.svc32(N::NtGdiPatBlt, {dc, uint64_t(uint32_t(x)), uint64_t(uint32_t(y)), uint64_t(uint32_t(w)), uint64_t(uint32_t(h)), 0xF00021}) == 1);
+    t.svc(N::NtUserReleaseDC, {dc});
+  };
+  auto pixel = [&](uint32_t hwnd, int x, int y) -> uint32_t {      // the surface at (x, y)
+    user::TopLevelInfo info;
+    if (!user::top_level_info(hwnd, &info, nullptr) || info.surface_id == 0) return 0xDEAD;
+    uint32_t w = 0, h = 0;
+    const ArrayView<uint32_t> px = gdi::window_surface_pixels(info.surface_id, &w, &h);
+    return x >= 0 && y >= 0 && uint32_t(x) < w && uint32_t(y) < h ? px[uint64_t(y) * w + uint32_t(x)] & 0xFFFFFF : 0xDEAD;
+  };
+  List<uint32_t> changed(*system_allocator());
+  List<desktop::IWindowsSession::Repaint> repainted(*system_allocator());
+
+  DesktopBridge bridge;
+  bridge.attach(1024, 768, desktop::WindowsRect{0, 0, 1024, 740}, 6, 19);
+  CHECK(t.atom_class("Redir") >= 0xC000);
+  const uint32_t a = t.create("Redir", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 400, 300, 0, 0, "First");
+  CHECK(a != 0);
+  pump();
+  bridge.take_changes(&changed, &repainted);
+  CHECK(has(changed, a));
+  desktop::WindowsWindowInfo info;
+  String title(*system_allocator());
+  CHECK(bridge.window_info(a, &info, &title) && info.visible && info.caption && info.sizable && info.minimize_box && info.maximize_box && !info.popup);
+  CHECK(title.view() == StringView("First"));
+  CHECK(info.window.x == 100 && info.window.y == 100 && info.window.width == 400 && info.window.height == 300);
+  CHECK(info.surface.x == 106 && info.surface.y == 125 && info.surface.width == 388 && info.surface.height == 269);      // inside the desktop's frame
+  // the non-client sizes are the desktop's frame: the client area is the surface
+  const Rc wr = t.window_rect(a), cr = t.client_rect(a);
+  CHECK(wr.l == 100 && wr.t == 100 && wr.r == 500 && wr.b == 400 && cr.r == 388 && cr.b == 269);
+  List<uint32_t> all(*system_allocator());
+  bridge.windows(&all);
+  CHECK(all.count() == 1 && all[0] == a);
+
+  // drawing lands in the window's own surface, at client coordinates, and is noted for the desktop
+  fill(a, 0, 0, 10, 10);
+  bridge.take_changes(&changed, &repainted);
+  CHECK(has_repaint(repainted, a) && pixel(a, 0, 0) == 0xFF0000 && pixel(a, 9, 9) == 0xFF0000 && pixel(a, 10, 10) != 0xFF0000);
+
+  // a second window over the first: neither clips the other (the desktop composites them)
+  const uint32_t b = t.create("Redir", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 150, 150, 300, 200, 0, 0, "Second");
+  pump();
+  fill(a, 100, 100, 20, 20);      // (under b on the screen)
+  CHECK(pixel(a, 110, 110) == 0xFF0000);
+  bridge.windows(&all);
+  CHECK(all.count() == 2 && all[0] == a && all[1] == b);      // bottom first
+
+  // the user moves the first window: the program hears of it, nothing is repainted
+  bridge.take_changes(&changed, &repainted);
+  t.clear_log();
+  bridge.move_window(a, desktop::WindowsRect{200, 150, 400, 300});
+  pump();
+  bridge.take_changes(&changed, &repainted);
+  const Rc moved = t.window_rect(a);
+  CHECK(moved.l == 200 && moved.t == 150 && moved.r == 600 && moved.b == 450);
+  CHECK(t.saw(WM_WINDOWPOSCHANGED) && t.saw(WM_MOVE) && !t.saw(WM_PAINT) && !t.saw(WM_SIZE));
+  CHECK(has(changed, a) && !has_repaint(repainted, a) && pixel(a, 0, 0) == 0xFF0000);      // the picture went along as it was
+  // ... and sizes it: a new surface of the new size, painted again
+  t.clear_log();
+  bridge.move_window(a, desktop::WindowsRect{200, 150, 500, 350});
+  pump();
+  CHECK(t.saw(WM_SIZE) && t.saw(WM_PAINT));
+  user::TopLevelInfo ti;
+  uint32_t sw = 0, sh = 0;
+  CHECK(user::top_level_info(a, &ti, nullptr) && gdi::window_surface_size(ti.surface_id, &sw, &sh) && sw == 488 && sh == 319);
+
+  // activation both ways
+  bridge.activate_window(a);
+  CHECK(bridge.window_info(a, &info, nullptr) && info.active);
+  bridge.activate_window(0);
+  CHECK(bridge.window_info(a, &info, nullptr) && !info.active && user::foreground_window() == 0);
+  // maximize fills the work area exactly (the desktop's maximized frame)
+  bridge.window_command(a, desktop::IWindowsSession::Command::Maximize);
+  pump();
+  CHECK(bridge.window_info(a, &info, nullptr) && info.maximized && info.window.x == 0 && info.window.y == 0 && info.window.width == 1024 && info.window.height == 740);
+  bridge.window_command(a, desktop::IWindowsSession::Command::Restore);
+  pump();
+  CHECK(bridge.window_info(a, &info, nullptr) && !info.maximized && info.window.x == 200 && info.window.width == 500);
+  // close asks the program (DefWindowProc destroys it)
+  bridge.take_changes(&changed, &repainted);
+  bridge.window_command(b, desktop::IWindowsSession::Command::Close);
+  pump();
+  bridge.take_changes(&changed, &repainted);
+  CHECK(has(changed, b) && !bridge.window_info(b, &info, nullptr) && !user::is_window(b));
+  bridge.detach();
+  user::reset_state();
+  gdi::shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -1118,5 +1231,6 @@ int main() {
   test_hooks_and_stations();
   test_process_exit_and_bad_pointers();
   test_props_longs_text();
+  test_redirection();
   return finish("Win32kUserTest");
 }

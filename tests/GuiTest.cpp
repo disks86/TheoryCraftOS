@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <map>
 #include <vector>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -1384,29 +1385,92 @@ static void test_select_all_from_keyboard() {
   CHECK(a.live == 0);
 }
 
-// The Windows programs' window (WindowsScreen): opens when their screen first changes, shows it, and hands them the keys (presses and releases) and the pointer
-// (a relative mouse's motion whole; the pointer follows their cursor; it leaves the picture when nothing confines the cursor; Ctrl+Alt lets it go).
+// The Windows programs' windows as the desktop's (Win32Windows): a frame per window, drawn from the program's surface, following what the program does and telling it
+// what the user does; the keys go to the program whose window is active, the pointer while it is over one of their pictures (a relative mouse's motion whole; the
+// pointer follows their cursor; Ctrl+Alt lets a confined one go).
+struct FakeWindow {
+  desktop::WindowsWindowInfo info;
+  std::string title;
+  uint32_t color = 0xFF336699u;
+};
 struct FakeWindowsSession final : desktop::IWindowsSession {
-  bool changed = false, confined = false;
-  uint32_t width = 64, height = 48, color = 0xFF336699u;
+  explicit FakeWindowsSession(allocators::IAllocator& a) : changes(a) {}
+  bool attached = false, confined = false;
+  uint32_t width = 0, height = 0;
+  desktop::WindowsRect work;
+  int32_t border = 0, title_h = 0;
   int32_t cx = 0, cy = 0;
+  std::map<uint32_t, FakeWindow> wins;
+  std::vector<uint32_t> order;      // bottom first
+  List<uint32_t> changes;
+  std::vector<uint32_t> repaints;
   std::vector<std::string> log;
   void note(const char* what, int32_t a, int32_t b) { char t[64]; snprintf(t, sizeof t, "%s %d %d", what, a, b); log.push_back(t); }
-  void clamp() {
-    const int32_t lo = confined ? 10 : 0, hx = confined ? 30 : int32_t(width) - 1, hy = confined ? 30 : int32_t(height) - 1;
-    cx = cx < lo ? lo : cx > hx ? hx : cx;
-    cy = cy < lo ? lo : cy > hy ? hy : cy;
+  void changed(uint32_t w) { changes.push_back(w); }
+  void place(uint32_t w, const desktop::WindowsRect& r) {      // the window and its surface (inside the frame when it has a caption)
+    FakeWindow& f = wins[w];
+    f.info.window = r;
+    const int32_t b = f.info.caption ? border : 0, t = f.info.caption ? title_h : 0;
+    f.info.surface = {r.x + b, r.y + b + t, r.width - 2 * uint32_t(b), r.height - 2 * uint32_t(b) - uint32_t(t)};
   }
-  bool take_screen_changed() override { const bool c = changed; changed = false; return c; }
-  uint32_t screen_width() override { return width; }
-  uint32_t screen_height() override { return height; }
-  bool set_screen_size(uint32_t w, uint32_t h) override { sized_w = w; sized_h = h; return true; }      // (the fake keeps its 64 x 48 picture)
-  uint32_t sized_w = 0, sized_h = 0;
-  bool copy_screen(ArrayView<uint32_t> out, uint32_t* w, uint32_t* h) override {
-    *w = width; *h = height;
-    if (out.size() < uint64_t{width} * height) return false;
-    for (uint64_t i = 0; i < uint64_t{width} * height; ++i) out[i] = color;
+  uint32_t add(uint32_t w, bool caption, const desktop::WindowsRect& r, const char* title, bool active, bool popup = false) {
+    FakeWindow& f = wins[w];
+    f.info.exists = f.info.visible = true;
+    f.info.caption = caption;
+    f.info.sizable = f.info.minimize_box = f.info.maximize_box = caption;
+    f.info.popup = popup;
+    f.title = title;
+    place(w, r);
+    if (active) for (auto& [k, v] : wins) v.info.active = k == w;
+    order.push_back(w);
+    changed(w);
+    return w;
+  }
+  void attach(uint32_t w, uint32_t h, const desktop::WindowsRect& wa, int32_t b, int32_t t) override { attached = true; width = w; height = h; work = wa; border = b; title_h = t; }
+  void take_changes(List<uint32_t>* out, List<Repaint>* rep) override {
+    out->clear();
+    for (uint32_t w : changes.view()) out->push_back(w);
+    changes.clear();
+    rep->clear();
+    for (uint32_t w : repaints) rep->push_back(Repaint{w, {0, 0, 1, 1}});
+    repaints.clear();
+  }
+  void windows(List<uint32_t>* out) override { out->clear(); for (uint32_t w : order) if (wins.count(w)) out->push_back(w); }
+  bool window_info(uint32_t w, desktop::WindowsWindowInfo* out, String* title) override {
+    auto it = wins.find(w);
+    if (it == wins.end()) return false;
+    *out = it->second.info;
+    if (title) title->assign(StringView(it->second.title.c_str()));
     return true;
+  }
+  bool draw_window(uint32_t w, graphics::IRenderer2D& r, int32_t x, int32_t y, uint32_t* width_out, uint32_t* height_out) override {
+    auto it = wins.find(w);
+    if (it == wins.end()) return false;
+    const desktop::WindowsRect& sr = it->second.info.surface;
+    r.fill_rect({x, y, sr.width, sr.height}, it->second.color);
+    *width_out = sr.width;
+    *height_out = sr.height;
+    return true;
+  }
+  // the program agrees with whatever the user does
+  void move_window(uint32_t w, const desktop::WindowsRect& r) override {
+    note("move", r.x, r.y);
+    note("size", int32_t(r.width), int32_t(r.height));
+    place(w, r);
+    changed(w);
+  }
+  void activate_window(uint32_t w) override {
+    note("activate", int32_t(w), 0);
+    for (auto& [k, v] : wins) if (v.info.active != (k == w)) { v.info.active = k == w; changed(k); }
+  }
+  void window_command(uint32_t w, Command c) override {
+    note("command", int32_t(w), int32_t(c));
+    FakeWindow& f = wins[w];
+    if (c == Command::Close) { wins.erase(w); changed(w); return; }
+    f.info.minimized = c == Command::Minimize;
+    f.info.maximized = c == Command::Maximize;
+    if (c == Command::Maximize) place(w, work);
+    changed(w);
   }
   void key(uint8_t usage, bool pressed, uint8_t modifiers) override { (void)modifiers; note("key", usage, pressed); }
   void mouse_motion(int32_t dx, int32_t dy) override { note("motion", dx, dy); cx += dx; cy += dy; clamp(); }
@@ -1415,6 +1479,12 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   void mouse_wheel(int32_t notches) override { note("wheel", notches, 0); }
   void cursor(int32_t* x, int32_t* y) override { *x = cx; *y = cy; }
   bool cursor_confined() override { return confined; }
+  uint32_t capture_window() override { return 0; }
+  void clamp() {
+    if (!confined) return;
+    cx = cx < 120 ? 120 : cx > 140 ? 140 : cx;
+    cy = cy < 120 ? 120 : cy > 140 ? 140 : cy;
+  }
 };
 
 static void test_windows_screen() {
@@ -1423,80 +1493,143 @@ static void test_windows_screen() {
     Screen screen(a, 800, 600);
     FakeKeyboard kb;
     FakeMouse mouse;
-    FakeWindowsSession s;
+    FakeWindowsSession s(a);
     desktop::Desktop d(a, screen.renderer, &kb, &mouse);
     d.set_windows_session(&s);
-    desktop::WindowsScreen& ws = d.windows_screen();
+    desktop::Win32Windows& ww = d.win32_windows();
+    gui::WindowManager& wm = d.windows();
     d.step(0);
-    CHECK(!ws.showing());                       // nothing drawn yet: no window
-    CHECK(s.sized_w == 800 - 48 - uint32_t(desktop::WindowsScreen::kFrameWidth) && s.sized_h > 0 && s.sized_h < 600);      // the screen was fitted to the work area
-    s.changed = true;
-    d.step(1000);
-    CHECK(ws.showing() && ws.active() && ws.view().picture_width() == 64 && ws.view().picture_height() == 48);
-    CHECK(ws.bounds().width == 64 + uint32_t(desktop::WindowsScreen::kFrameWidth));
-    const Point o = ws.view().window_origin();
-    CHECK(screen.px(o.x + 5, o.y + 5) == 0xFF336699u);      // the picture is drawn
+    CHECK(s.attached && s.width == wm.bounds().width && s.height == wm.bounds().height && s.border == gui::Frame::kBorder && s.title_h == gui::Frame::kTitleHeight + 1);
+    CHECK(ww.count() == 0);
+    const Point mo = wm.window_origin();
 
-    // keys: the press and the release, while the window is the active one
-    kb.push(0x04, true); kb.push(0x04, false);
+    // a program shows a window: a frame of the desktop where the window is, its title, the program's picture inside, the active one
+    s.add(7, true, {100, 80, 200, 150}, "Notepad", true);
+    d.step(1000);
+    desktop::Win32Window* h = ww.host(7);
+    CHECK(h && h->manager() == &wm && wm.active() == h && h->title() == StringView("Notepad") && h->decorated() && h->in_taskbar());
+    CHECK(h->bounds().x == 100 && h->bounds().y == 80 && h->bounds().width == 200 && h->bounds().height == 150);
+    gui::Rect2D pic;
+    CHECK(h->picture_area(&pic) && pic.x == 106 && pic.y == 105 && pic.width == 188 && pic.height == 119);      // the program's surface, exactly
+    CHECK(screen.px(mo.x + 110, mo.y + 110) == 0xFF336699u && screen.px(mo.x + 150, mo.y + 90) != 0xFF336699u);      // the picture, and the desktop's title bar
+    CHECK(s.log.empty());      // (nothing echoed back to the program)
+
+    // the program moves its window: the frame follows, nothing goes back
+    s.place(7, {120, 90, 200, 150});
+    s.changed(7);
     d.step(2000);
+    CHECK(h->bounds().x == 120 && h->bounds().y == 90 && s.log.empty());
+    // the user moves the frame: the program is asked
+    {
+      gui::UiGuard lock(&wm);
+      h->set_bounds({140, 100, 220, 160});
+    }
+    d.step(3000);
+    CHECK(s.log.size() == 2 && s.log[0] == "move 140 100" && s.log[1] == "size 220 160");
+    d.step(4000);
+    CHECK(s.log.size() == 2 && h->bounds().x == 140 && h->bounds().width == 220);      // (the program agreed: no more)
+    s.log.clear();
+
+    // a popup (a menu) of the program: no frame, never active, no taskbar button
+    s.add(8, false, {150, 120, 60, 40}, "", false, true);
+    d.step(5000);
+    desktop::Win32Window* menu = ww.host(8);
+    CHECK(menu && !menu->decorated() && !menu->activatable() && !menu->in_taskbar() && wm.active() == h && menu->picture_area(&pic) && pic.x == 150 && pic.width == 60);
+    CHECK(s.log.empty());
+    s.window_command(8, desktop::IWindowsSession::Command::Close);      // (the program takes it down)
+    d.step(6000);
+    CHECK(ww.host(8) == nullptr && wm.active() == h);
+    s.log.clear();
+
+    // keys: the press and the release, while a program's window is the active one
+    kb.push(0x04, true); kb.push(0x04, false);
+    d.step(7000);
     CHECK(s.log.size() == 2 && s.log[0] == "key 4 1" && s.log[1] == "key 4 0");
     s.log.clear();
 
-    // the pointer comes into the picture: the cursor goes where it came in, then the motion is handed over whole and the pointer follows the cursor
+    // the pointer comes over the picture: the cursor goes there (screen = the window manager's area), then motion is handed over whole and the pointer follows the cursor
+    CHECK(h->picture_area(&pic));
     const Point p = d.pointer();
-    mouse.move(o.x + 10 - p.x, o.y + 10 - p.y, 0);
-    d.step(3000);
-    CHECK(s.log.size() == 1 && s.log[0] == "position 10 10" && ws.grabbed());
+    mouse.move(mo.x + pic.x + 10 - p.x, mo.y + pic.y + 10 - p.y, 0);
+    d.step(8000);
+    CHECK(s.log.size() == 1 && s.log[0] == "position 156 135" && ww.grabbed());
     mouse.move(5, -3, 0);
-    d.step(4000);
-    CHECK(s.log.size() == 2 && s.log[1] == "motion 5 -3" && d.pointer().x == o.x + 15 && d.pointer().y == o.y + 7);
+    d.step(9000);
+    CHECK(s.log.size() == 2 && s.log[1] == "motion 5 -3" && d.pointer().x == mo.x + 161 && d.pointer().y == mo.y + 132);
     mouse.move(0, 0, hardware::mouse_button::kLeft);
     mouse.move(0, 0, 0);
-    d.step(5000);
+    d.step(10000);
     CHECK(s.log.size() == 4 && s.log[2] == "button 1 1" && s.log[3] == "button 1 0");
     s.log.clear();
-
     // a program confines the cursor: the pointer stays with it however far the mouse goes
     s.confined = true;
-    mouse.move(-200, 0, 0);
-    d.step(6000);
-    CHECK(s.log.size() == 1 && s.log[0] == "motion -200 0" && d.pointer().x == o.x + 10 && ws.grabbed());
-    // not confined: leaving the picture gives the pointer back to the desktop, and nothing is handed over
-    s.confined = false;
-    s.log.clear();
-    mouse.move(-200, 0, 0);
-    d.step(7000);
-    CHECK(s.log.empty() && !ws.grabbed() && d.pointer().x < o.x);
-
-    // Ctrl+Alt lets the pointer go until the next click on the picture
-    mouse.move(o.x + 20 - d.pointer().x, 0, 0);
-    d.step(8000);
-    CHECK(ws.grabbed());
+    mouse.move(-300, 0, 0);
+    d.step(11000);
+    CHECK(s.log.size() == 1 && s.log[0] == "motion -300 0" && d.pointer().x == mo.x + 120 && ww.grabbed());
+    // Ctrl+Alt lets it go until the next click on a program's picture
     s.log.clear();
     kb.push(0xE0, true); kb.push(0xE2, true);
-    d.step(9000);
-    CHECK(!ws.grabbed() && s.log.size() == 2);      // (the keys went to the programs too)
+    d.step(12000);
+    CHECK(!ww.grabbed() && s.log.size() == 2);      // (the keys went to the program too)
     s.log.clear();
     mouse.move(2, 2, 0);
-    d.step(10000);
-    CHECK(s.log.empty() && !ws.grabbed());
-    mouse.move(0, 0, hardware::mouse_button::kLeft);
-    d.step(11000);
-    CHECK(ws.grabbed() && s.log.size() == 2 && s.log[1] == "button 1 1");
-    mouse.move(0, 0, 0);
+    d.step(13000);
+    CHECK(s.log.empty() && !ww.grabbed());
     kb.push(0xE2, false); kb.push(0xE0, false);
-    d.step(12000);
+    s.confined = false;
+    d.step(14000);
+    s.log.clear();
+    // not confined: leaving the picture gives the pointer back, nothing is handed over
+    mouse.move(mo.x + pic.x + 20 - d.pointer().x, mo.y + pic.y + 20 - d.pointer().y, hardware::mouse_button::kLeft);
+    mouse.move(0, 0, 0);
+    d.step(15000);
+    CHECK(ww.grabbed());
+    s.log.clear();
+    mouse.move(-400, 0, 0);
+    d.step(16000);
+    CHECK(s.log.empty() && !ww.grabbed());
+
+    // a desktop window becomes the active one: the program hears it lost the activation; keys stay with the desktop, a release goes where its press went
+    kb.push(0x05, true);
+    d.step(17000);
+    s.log.clear();
+    d.open_calculator();
+    d.step(18000);
+    CHECK(wm.active() != h && s.log.size() == 1 && s.log[0] == "activate 0 0");
+    kb.push(0x05, false); kb.push(0x06, true); kb.push(0x06, false);
+    d.step(19000);
+    CHECK(s.log.size() == 2 && s.log[1] == "key 5 0");
+    s.log.clear();
+    // ... and the user activates the program's window again
+    h->activate();
+    d.step(20000);
+    CHECK(s.log.size() == 1 && s.log[0] == "activate 7 0" && wm.active() == h);
     s.log.clear();
 
-    // a key pressed while the window was active is released there too, even after another window became the active one; new presses are not handed over
-    kb.push(0x05, true);
-    d.step(13000);
-    d.open_calculator();
-    CHECK(!ws.active());
-    kb.push(0x05, false); kb.push(0x06, true); kb.push(0x06, false);
-    d.step(14000);
-    CHECK(s.log.size() == 2 && s.log[0] == "key 5 1" && s.log[1] == "key 5 0");
+    // the frame's buttons ask the program: maximize (it fills the work area), minimize, close (the program decides; the frame stays until it destroys the window)
+    h->maximize();
+    d.step(21000);
+    CHECK(s.log.size() == 1 && s.log[0] == "command 7 2" && h->state() == gui::Frame::State::Maximized);
+    s.log.clear();
+    h->minimize();
+    d.step(22000);
+    CHECK(s.log.size() == 2 && s.log[0] == "activate 0 0" && s.log[1] == "command 7 1" && h->state() == gui::Frame::State::Minimized);      // (a minimized window is not the active one)
+    s.log.clear();
+    s.wins[7].info.minimized = false;      // the program restores itself (maximized again)
+    s.wins[7].info.maximized = true;
+    s.changed(7);
+    d.step(23000);
+    CHECK(h->state() == gui::Frame::State::Maximized && s.log.empty());
+    s.wins[7].color = 0xFF00FF00u;      // the program draws: the frame is drawn again
+    s.repaints.push_back(7);
+    d.step(24000);
+    CHECK(h->picture_area(&pic) && screen.px(mo.x + pic.x + 1, mo.y + pic.y + 1) == 0xFF00FF00u);
+    CHECK(wm.active() == h && s.log.size() == 1 && s.log[0] == "activate 7 0");      // (it came back as the active window: the program is told)
+    s.log.clear();
+    h->close();
+    CHECK(h->manager() == &wm && s.log.size() == 1 && s.log[0] == "command 7 0");
+    d.step(25000);
+    CHECK(ww.host(7) == nullptr && ww.count() == 0);
     d.set_windows_session(nullptr);
   }
   CHECK(a.live == 0);

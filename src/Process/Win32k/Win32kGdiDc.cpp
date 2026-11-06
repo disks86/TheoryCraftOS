@@ -161,6 +161,12 @@ void dc_release_selection(Dc& dc) {
 
 Surface dc_surface(Dc& dc, Bitmap** bitmap) {
   *bitmap = nullptr;
+  if (dc.screen && dc.surface) {      // a window with a window surface draws there (nowhere once the surface is gone)
+    Bitmap* b = window_surface_bitmap(dc.surface);
+    if (!b) return Surface();
+    *bitmap = b;
+    return surface_of(*b);
+  }
   if (dc.screen) {
     Bitmap& b = screen_bitmap();
     *bitmap = &b;

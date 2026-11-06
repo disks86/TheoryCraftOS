@@ -69,54 +69,156 @@ bool windows_key_of_usage(uint8_t usage, WindowsKey* out) {
   return true;
 }
 
-void DesktopBridge::attach() {
-  user_misc::SystemLock lock;
-  gdi::set_screen_sink(this);
-  attached_ = true;
+namespace {
+
+desktop::WindowsRect windows_rect(const gdi::Rect& r) {
+  return {r.left, r.top, uint32_t(r.right > r.left ? r.right - r.left : 0), uint32_t(r.bottom > r.top ? r.bottom - r.top : 0)};
+}
+
+gdi::Rect gdi_rect(const desktop::WindowsRect& r) { return {r.x, r.y, int32_t(uint32_t(r.x) + r.width), int32_t(uint32_t(r.y) + r.height)}; }
+
+}  // namespace
+
+void DesktopBridge::attach(uint32_t width, uint32_t height, const desktop::WindowsRect& work_area, int32_t frame_border, int32_t frame_title) {
+  {
+    user_misc::SystemLock lock;
+    if (width != gdi::screen_width() || height != gdi::screen_height()) gdi::set_screen_size(width, height);
+    user_misc::set_monitor_work_area(gdi_rect(work_area));
+    gdi::set_window_surface_sink(this);
+    attached_ = true;
+  }
+  user::set_redirection(true, this, frame_border, frame_title);      // (takes the lock itself)
 }
 
 void DesktopBridge::detach() {
   if (!attached_) return;
+  user::set_redirection(false, nullptr, 0, 0);
   user_misc::SystemLock lock;
-  gdi::set_screen_sink(nullptr);
+  gdi::set_window_surface_sink(nullptr);
   attached_ = false;
 }
 
-void DesktopBridge::screen_changed(const gdi::Rect& dirty) {
-  (void)dirty;      // (the desktop takes the whole screen: copying it is cheap next to drawing it)
-  __atomic_store_n(&changed_, true, __ATOMIC_RELEASE);
+DesktopBridge::Pending* DesktopBridge::pending_slot(uint32_t window) {
+  for (uint32_t i = 0; i < pending_count_; ++i) if (pending_[i].window == window) return &pending_[i];
+  if (pending_count_ == kMaxPending) {
+    overflow_ = true;
+    return nullptr;
+  }
+  Pending* p = &pending_[pending_count_++];
+  *p = Pending();
+  p->window = window;
+  return p;
 }
 
-uint32_t DesktopBridge::screen_width() {
-  user_misc::SystemLock lock;
-  return gdi::screen_width();
+void DesktopBridge::top_level_changed(uint32_t hwnd) {
+  if (Pending* p = pending_slot(hwnd)) p->changed = true;
 }
 
-uint32_t DesktopBridge::screen_height() {
-  user_misc::SystemLock lock;
-  return gdi::screen_height();
+void DesktopBridge::surface_changed(uint32_t window, const gdi::Rect& dirty) {
+  Pending* p = pending_slot(window);
+  if (!p) return;
+  if (!p->repaint) p->dirty = dirty;
+  else {
+    if (dirty.left < p->dirty.left) p->dirty.left = dirty.left;
+    if (dirty.top < p->dirty.top) p->dirty.top = dirty.top;
+    if (dirty.right > p->dirty.right) p->dirty.right = dirty.right;
+    if (dirty.bottom > p->dirty.bottom) p->dirty.bottom = dirty.bottom;
+  }
+  p->repaint = true;
 }
 
-bool DesktopBridge::set_screen_size(uint32_t width, uint32_t height) {
-  user_misc::SystemLock lock;
-  if (width == gdi::screen_width() && height == gdi::screen_height()) return true;
-  return gdi::set_screen_size(width, height);
+void DesktopBridge::take_changes(List<uint32_t>* changed, List<Repaint>* repainted) {
+  changed->clear();
+  repainted->clear();
+  bool overflow = false;
+  {
+    user_misc::SystemLock lock;
+    for (uint32_t i = 0; i < pending_count_; ++i) {
+      const Pending& p = pending_[i];
+      if (p.changed) changed->push_back(p.window);
+      if (p.repaint) repainted->push_back(Repaint{p.window, windows_rect(p.dirty)});
+    }
+    pending_count_ = 0;
+    overflow = overflow_;
+    overflow_ = false;
+  }
+  if (!overflow) return;
+  // the table was full: every window counts as changed and wholly repainted (a window that is gone was noted and is not visible: it is told apart by window_info)
+  user::top_levels(changed);
+  repainted->clear();
+  for (uint32_t w : changed->view()) repainted->push_back(Repaint{w, {0, 0, 0xFFFFu, 0xFFFFu}});
 }
 
-// GDI's surface is B, G, R, X bytes; the desktop wants opaque 0xAARRGGBB.
-bool DesktopBridge::copy_screen(ArrayView<uint32_t> out, uint32_t* width, uint32_t* height) {
-  user_misc::SystemLock lock;
-  const uint32_t w = gdi::screen_width(), h = gdi::screen_height();
-  *width = w;
-  *height = h;
-  const uint64_t count = uint64_t{w} * h;
-  const ConstByteView pixels = gdi::screen_pixels();
-  if (out.size() < count || pixels.size() < count * 4) return false;
-  for (uint64_t i = 0; i < count; ++i) {
-    const ConstByteView p = pixels.subview(i * 4, 4);
-    out[i] = 0xFF000000u | uint32_t(p[2]) << 16 | uint32_t(p[1]) << 8 | p[0];
+void DesktopBridge::windows(List<uint32_t>* out) {
+  user::top_levels(out);      // (topmost first: turned around)
+  for (uint64_t i = 0, j = out->count(); i + 1 < j; ++i, --j) {
+    const uint32_t t = (*out)[i];
+    (*out)[i] = (*out)[j - 1];
+    (*out)[j - 1] = t;
+  }
+}
+
+bool DesktopBridge::window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) {
+  *out = desktop::WindowsWindowInfo();
+  user::TopLevelInfo info;
+  if (!title) return user::top_level_info(window, &info, nullptr) && fill_info(info, out);
+  WideString wide(title->allocator());
+  if (!user::top_level_info(window, &info, &wide) || !fill_info(info, out)) return false;
+  title->clear();
+  for (char16_t c : wide.view()) {      // (the desktop's font has ASCII glyphs: anything else shows as '?')
+    const char a = c >= 0x20 && c < 0x7F ? static_cast<char>(c) : '?';
+    title->append(StringView(&a, 1));
   }
   return true;
+}
+
+bool DesktopBridge::fill_info(const user::TopLevelInfo& info, desktop::WindowsWindowInfo* out) {
+  out->exists = info.exists;
+  out->visible = info.visible;
+  out->minimized = info.minimized;
+  out->maximized = info.maximized;
+  out->active = info.active;
+  out->caption = info.caption;
+  out->sizable = info.sizable;
+  out->minimize_box = info.minimize_box;
+  out->maximize_box = info.maximize_box;
+  out->tool = info.tool;
+  out->topmost = info.topmost;
+  // A window without a caption that floats over another program's window (a menu, tooltip or drop-down list) is not activated from the desktop's side.
+  out->popup = !info.caption && (info.no_activate || info.tool || (info.popup && info.owner != 0 && info.topmost));
+  out->owned = info.owner != 0;
+  out->window = windows_rect(info.window);
+  out->surface = windows_rect(info.surface);
+  return true;
+}
+
+// The surface is drawn from where it lives, under the lock (no program draws on it meanwhile). Its pixels are B, G, R, X bytes, which is the desktop's own format
+// (0x..RRGGBB words): Replace copies each row as it is.
+bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) {
+  user_misc::SystemLock lock;
+  const uint32_t id = user::top_level_surface_locked(window);
+  if (id == 0) return false;
+  uint32_t w = 0, h = 0;
+  const ArrayView<uint32_t> pixels = gdi::window_surface_pixels(id, &w, &h);
+  if (pixels.empty() || pixels.size() < uint64_t{w} * h) return false;
+  graphics::Surface s;
+  s.pixels = pixels;
+  s.width = s.pitch = w;
+  s.height = h;
+  renderer.set_blend(graphics::BlendMode::Replace);
+  renderer.draw_image(s, {0, 0, w, h}, x, y);
+  renderer.set_blend(graphics::BlendMode::Alpha);
+  *width = w;
+  *height = h;
+  return true;
+}
+
+void DesktopBridge::move_window(uint32_t window, const desktop::WindowsRect& rect) { user::move_top_level(window, gdi_rect(rect)); }
+void DesktopBridge::activate_window(uint32_t window) { user::activate_top_level(window); }
+
+void DesktopBridge::window_command(uint32_t window, Command command) {
+  constexpr uint32_t kSc[] = {0xF060 /* SC_CLOSE */, 0xF020 /* SC_MINIMIZE */, 0xF030 /* SC_MAXIMIZE */, 0xF120 /* SC_RESTORE */};
+  user::command_top_level(window, kSc[static_cast<uint8_t>(command)]);
 }
 
 // A key press types a character too (win32k's TranslateMessage leaves that to the input path): the US layout's, Ctrl+letter its control character.
@@ -138,5 +240,6 @@ void DesktopBridge::mouse_button(uint32_t button, bool down) { user::inject_mous
 void DesktopBridge::mouse_wheel(int32_t notches) { user::inject_mouse_wheel(notches * 120, false); }      // (WHEEL_DELTA per notch)
 void DesktopBridge::cursor(int32_t* x, int32_t* y) { user::cursor_position(x, y); }
 bool DesktopBridge::cursor_confined() { return user::cursor_confined(); }
+uint32_t DesktopBridge::capture_window() { return user::mouse_capture_window(); }
 
 }  // namespace process::win32k

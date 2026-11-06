@@ -44,6 +44,10 @@ bool visible_region(const Window* w, bool client_area, bool clip_children, bool 
     const Window* par = cur->parent;
     if (par->parent) region_intersect(*out, client_rect_screen(par));
     const bool top_level = par->parent == nullptr;
+    if (top_level && redirected(cur)) {      // a redirected top-level draws on its own surface: other top-levels do not cover it (the desktop composites), its frame is the desktop's
+      region_intersect(*out, surface_rect_screen(cur));
+      break;
+    }
     const bool clip = top_level || (cur == w ? clip_siblings : (cur->style & wn::WS_CLIPSIBLINGS) != 0);
     if (clip) {
       for (const Window* sib = par->first_child; sib && sib != cur; sib = sib->next) {
@@ -79,10 +83,23 @@ bool visible_region(const Window* w, bool client_area, bool clip_children, bool 
 
 namespace {
 
-bool make_dc_geometry(const Window* w, const WinDc& d, int32_t* ox, int32_t* oy, List<Rect>* clip) {
+// The origin and clip of a window's DC: on the screen, or - for a window of a redirected top-level - on that top-level's surface (`surface` is then its id).
+bool make_dc_geometry(Window* w, const WinDc& d, int32_t* ox, int32_t* oy, List<Rect>* clip, uint32_t* surface) {
+  *surface = 0;
   if (d.window_dc) { const Rect r = window_rect_screen(w); *ox = r.left; *oy = r.top; }
   else client_origin(w, ox, oy);
-  return visible_region(w, !d.window_dc, d.clip_children, d.clip_siblings, clip);
+  if (!visible_region(w, !d.window_dc, d.clip_children, d.clip_siblings, clip)) return false;
+  Window* top = top_level_of(w);
+  if (top && redirected(top)) {
+    if (top->surface == 0) sync_surface(top);
+    if (top->surface == 0) { clip->clear(); return true; }      // (no surface yet - hidden or no memory: the DC draws nowhere)
+    const Rect s = surface_rect_screen(top);
+    *ox -= s.left;
+    *oy -= s.top;
+    for (Rect& r : *clip) r = rect_offset(r, -s.left, -s.top);
+    *surface = top->surface;
+  }
+  return true;
 }
 
 uint32_t create_window_dc(Call& call, Window* w, bool window_dc, bool clip_children, bool clip_siblings, const List<Rect>* extra_clip, bool exclude) {
@@ -94,8 +111,9 @@ uint32_t create_window_dc(Call& call, Window* w, bool window_dc, bool clip_child
   d.clip_children = clip_children;
   d.clip_siblings = clip_siblings;
   int32_t ox = 0, oy = 0;
+  uint32_t surface = 0;
   List<Rect> clip(s.alloc);
-  if (!make_dc_geometry(w, d, &ox, &oy, &clip)) return 0;
+  if (!make_dc_geometry(w, d, &ox, &oy, &clip, &surface)) return 0;
   if (extra_clip) {
     if (exclude) {
       for (const Rect& r : *extra_clip) region_subtract(clip, rect_offset(r, ox, oy));
@@ -112,7 +130,7 @@ uint32_t create_window_dc(Call& call, Window* w, bool window_dc, bool clip_child
     }
   }
   if (s.lock_update_window != 0 && s.lock_update_window == w->handle) clip.clear();
-  const uint32_t dc = gdi::create_screen_dc(call.pid(), ox, oy, clip.view());
+  const uint32_t dc = gdi::create_screen_dc(call.pid(), ox, oy, clip.view(), surface);
   if (dc == 0) return 0;
   d.dc = dc;
   if (!s.dcs.emplace(d)) { gdi::delete_dc(dc); return 0; }
@@ -137,8 +155,9 @@ void refresh_window_dcs(Window* w) {
   for (WinDc& d : s.dcs) {
     if (d.hwnd != w->handle) continue;
     int32_t ox = 0, oy = 0;
+    uint32_t surface = 0;
     List<Rect> clip(s.alloc);
-    if (make_dc_geometry(w, d, &ox, &oy, &clip)) gdi::update_screen_dc(d.dc, ox, oy, clip.view());
+    if (make_dc_geometry(w, d, &ox, &oy, &clip, &surface)) gdi::update_screen_dc(d.dc, ox, oy, clip.view(), surface);
   }
 }
 

@@ -558,7 +558,7 @@ add_executable(BOOTX64
   src/Desktop/WebNotifications.cpp
   src/Desktop/WebAudio.cpp
   src/Desktop/PictureInPicture.cpp
-  src/Desktop/WindowsScreen.cpp
+  src/Desktop/Win32Windows.cpp
   src/Desktop/BrowserStore.cpp
   src/Desktop/SessionStore.cpp
   src/Desktop/DesktopSession.cpp

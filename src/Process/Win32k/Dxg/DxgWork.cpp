@@ -17,6 +17,8 @@
  */
 #include "Process/Win32k/Dxg/DxgInternal.hpp"
 #include "Process/Win32k/Dxg/DxgLayouts.hpp"
+#include "Process/Win32k/Win32kUser.hpp"
+#include "Process/Win32k/Win32kUserMisc.hpp"
 
 // Contexts and the work that goes to them: NtGdiDdDDICreateContext(Virtual), DestroyContext, Get/SetContextSchedulingPriority, Render, Present, Escape.
 //
@@ -171,6 +173,27 @@ uint32_t render(Session& s, Call& call, uint64_t arg) {
 
 constexpr uint32_t kPresentBlt = 1u << 0, kPresentColorFill = 1u << 1, kPresentFlip = 1u << 2, kPresentDstRectValid = 1u << 6, kPresentSrcRectValid = 1u << 7;
 
+// A flip into a window that is one of the desktop's (win32k redirects it): the back buffer goes into the window's surface (one copy, at the client area) instead of onto
+// the display, and the desktop composites it like any window. Locks in the order the process exit hook takes them (the system lock, the session's, then the kernel's
+// inside lock()/unlock()), so that the view of the back buffer stays valid while it is copied. False in *handled: not such a window (the flip goes to the display).
+uint32_t present_to_window(Session& s, dxgk::Handle source, uint32_t window, bool* handled) {
+  *handled = false;
+  user_misc::SystemLock system;
+  if (!user::window_redirected_locked(window)) return status::kSuccess;
+  *handled = true;
+  Locked g(s);
+  dxgk::AllocationInfo info;
+  uint32_t st = s.kernel().query_allocation(s.pid(), source, &info);
+  if (st != status::kSuccess) return st;
+  const dxgk::Format f = info.desc.format;
+  if (!dxgk::is_plain_bgra(f) && !dxgk::is_rgba_order(f) && f != dxgk::Format::X8R8G8B8) return kStatusNotSupported;
+  dxgk::LockResult view;
+  st = s.kernel().lock(s.pid(), source, dxgk::kLockReadOnly, 0, &view);
+  if (st != status::kSuccess) return st;
+  user::present_to_window_locked(window, view.data, info.desc.width, info.desc.height, view.pitch, dxgk::is_rgba_order(f));
+  return s.kernel().unlock(s.pid(), source);
+}
+
 uint32_t present(Session& s, Call& call, uint64_t arg) {
   UserBlock b;
   if (!b.load(call, arg, sizeof_present_head)) return load_failure(arg);
@@ -182,6 +205,12 @@ uint32_t present(Session& s, Call& call, uint64_t arg) {
   if (flags & kPresentColorFill) return kStatusNotSupported;
   const bool blt = (flags & kPresentBlt) != 0, flip = (flags & kPresentFlip) != 0;
   if (blt == flip) return kStatusInvalidParameter;      // exactly one of the two
+  const uint64_t window = b.u64(8);
+  if (flip && window != 0 && window <= 0xFFFFFFFFu) {
+    bool handled = false;
+    const uint32_t st = present_to_window(s, source, static_cast<uint32_t>(window), &handled);
+    if (handled) return st;
+  }
   if (blt && destination == 0) return kStatusInvalidParameter;
   dxgk::PresentArgs args;
   args.source = source;

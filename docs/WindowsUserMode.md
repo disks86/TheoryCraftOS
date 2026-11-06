@@ -264,18 +264,41 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
   foreground process does not take that input raw. `RIDEV_PAGEONLY`, `RIDEV_EXCLUDE` and `RIDEV_NOLEGACY` (no WM_MOUSEMOVE / button / wheel, or WM_KEYDOWN / WM_CHAR, for that
   process) are followed. Not done: `RIDEV_NOHOTKEYS`, `RIDEV_CAPTUREMOUSE`, `RIDEV_DEVNOTIFY` (WM_INPUT_DEVICE_CHANGE), HID devices other than the mouse and the keyboard, the
   records' extra information. Wine's raw-input tests pass except the cross-desktop cases (no `CreateDesktop`); the multi-process part still hangs now and then in its own waits.
-- **The desktop bridge** (`src/Process/Win32k/Win32kDesktopBridge.cpp`, `src/Desktop/WindowsScreen.cpp`): win32k's screen is shown in the desktop's "Windows" window, and the
-  machine's keyboard and mouse reach the Windows programs. The window opens by itself when a Windows program first draws (and from Start > Windows Programs); at the first
-  pump the desktop sizes win32k's screen to its work area minus the window's frame (GDI keeps that size until its state exists). The screen is copied whole when the screen
-  sink reports a change. `gui::InputPump` has taps that see every device event before it becomes window events: key presses and releases (USB HID usages, turned into
-  virtual keys, set-1 scan codes, E0 and the character a press types: `windows_key_of_usage`), and a relative mouse's motion as it came (`user::inject_mouse_motion`,
-  whole for raw input). Keys go over while the window is the active one (a release always follows its press); the mouse while the pointer is over the picture or a button
-  pressed there is held, and the desktop pointer then follows the Windows cursor, so ClipCursor and SetCursorPos keep it in the picture (`user::cursor_confined`); with
-  nothing confining it, moving out gives the pointer back; Ctrl+Alt lets it go until the next click on the picture. Messages name the generic modifier keys (VK_SHIFT ...)
-  while the key state keeps left and right apart. Checked in QEMU with `tests/windows/bridgetest.c` (started from a Terminal: the window shows; a click, the G key and raw
-  mouse motion each recolour it). Not done: the Windows cursor's shape (the desktop draws its own pointer, also when a program hides the cursor), the caption and frame of
-  Windows windows (win32k does not paint non-client areas), resizing the screen with the window, several monitors, an absolute tablet's motion is computed from positions
-  (a program that warps the cursor sees jumps).
+- **One window system** (`src/Process/Win32k/Win32kUserRedirect.cpp`, `src/Process/Win32k/Win32kDesktopBridge.cpp`, `src/Desktop/Win32Windows.cpp`): every visible
+  top-level window of a Windows program is a window of the desktop, stacked, activated, moved, sized, minimized, maximized and closed like the native ones, with its own
+  taskbar button and Alt+Tab place. There is one coordinate space: win32k's screen is the desktop's window manager area (the bridge sets the screen size and the monitor
+  work area at the desktop's first pump), so a window's rectangle is its desktop frame's bounds.
+  - *Drawing, with no extra copy*: win32k redirects each top-level (`user::set_redirection`). A top-level and its children draw on a window surface of their own
+    (`gdi::create_window_surface`; the screen DCs of the tree are aimed at it, origins and clips in surface coordinates), top-levels do not clip or repaint one another, and
+    a pure move repaints nothing. The desktop's view of the window draws the surface straight from the kernel's memory (`draw_window`: `draw_image` with
+    `BlendMode::Replace`, a row copy, under the system lock), the same one copy a native window costs. GDI's surface sink and the window manager's observer only note what
+    changed (a fixed table in the bridge, guarded by the system lock).
+  - *Frames*: the desktop draws the title bar, frame and buttons of a window with a caption; win32k's non-client sizes are the desktop frame's (`nc_margins`, so
+    `AdjustWindowRectEx` agrees), and a maximized window fills the work area exactly. A window without a caption is an undecorated frame; a menu, tooltip or drop-down
+    (`WS_EX_NOACTIVATE`, a tool window, or an owned topmost popup, all without a caption) is never activated by the desktop and has no taskbar button.
+  - *Both ways*: what a program does to a window (show, hide, move, size, title, style, activation, destroy) reaches the desktop's frame at its next pump; what the user does
+    to the frame goes to the program as Windows would send it: a drag or resize is a private `WM_SYSCOMMAND` (`0xF1F0`, the rectangle packed in lParam) that DefWindowProc
+    turns into SetWindowPos in the program's own thread (so it gets WM_WINDOWPOSCHANGING/CHANGED, WM_MOVE, WM_SIZE), the buttons are SC_MINIMIZE / SC_MAXIMIZE /
+    SC_RESTORE / SC_CLOSE (the program decides whether to close), and activation follows the desktop's active window (a native window taking it leaves no Windows window
+    active). A change the user made is not undone by an older report of the program's while it catches up.
+  - *GPU presents*: a Vulkan swapchain made for a window flips through `D3DKMTPresent` with the window's handle; the kernel copies the back buffer into the window's surface
+    at the client area (`present_to_window` in `Dxg/DxgWork.cpp`, one row copy, taking the system lock, the process's dxg lock and the kernel's in the order the process exit
+    hook does) and the desktop composites it like any window; a flip without a window, or of a window that is not redirected, still goes to the display. DXGI already
+    presents through GDI (`SetDIBitsToDevice` into the window's DC), so it lands in the surface too.
+  - *Input*: `gui::InputPump` taps see every device event before it becomes window events: key presses and releases (USB HID usages, turned into virtual keys, set-1 scan
+    codes, E0 and the character a press types: `windows_key_of_usage`), and a relative mouse's motion as it came (`user::inject_mouse_motion`, whole for raw input). Keys go
+    to the programs while one of their windows is the desktop's active window (a release always follows its press); the mouse while the pointer is over the picture of one
+    of their windows (and no desktop window is on top there), a button pressed there is held, a program has captured the mouse, or a program confines the cursor while one
+    of its windows is active. The desktop pointer then follows the Windows cursor, so ClipCursor and SetCursorPos keep it where the program wants; Ctrl+Alt lets a confined
+    pointer go until the next click on a Windows window.
+  - Checked in QEMU with `tests/windows/bridgetest.c` (a frame of the desktop with the program's title and a taskbar button; G, a click and raw mouse motion recolour it;
+    dragging the title bar moves it without a repaint; maximize fills the work area and the program repaints at the new size; close ends the program) and
+    `tests/windows/vkwindowtest.c` (a swapchain presenting into its window every frame, behind and in front of other windows). Host tests: `Win32kUserTest`
+    (`test_redirection`), `Win32kGdiTest` (`test_window_surfaces`), `GuiTest` (`test_windows_screen`, with a fake session).
+  - Not done: the Windows cursor's shape (the desktop draws its own pointer), the program's z-order requests (`SetWindowPos` with `HWND_TOP` / `HWND_TOPMOST` does not
+    restack the desktop's frames; a window shown later is on top), owner/owned stacking (a dialog does not stay above its owner), window icons in the title bar and taskbar,
+    non-ASCII titles (shown as `?`), several monitors, `WM_NCHITTEST`-driven custom frames (a captionless window cannot be dragged by the user), a Vulkan swapchain whose
+    image is larger than the client area is cut, not scaled, and the desktop repaints its whole window when a program's picture changes (as for native windows).
 - **Not done**: `TrackMouseEvent` from user32 (win32k tracks WM_MOUSELEAVE, but the service is not registered), WASAPI (`CoCreateInstance` of the device enumerator fails:
   Godot falls back to its dummy audio driver), DirectSound.
 - **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`: also raw input from SendInput, NOLEGACY, removal), `Win32kMiscTest`
