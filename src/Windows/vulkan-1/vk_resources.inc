@@ -155,7 +155,9 @@ static VkResult image_create_allocation(Img *img) {
       flags = A_TEXTURE;
     }
     if (img->samples > 1) flags = A_TARGET;
-    if (img->swapchain) flags = A_TARGET | A_TEXTURE | A_PRESENT;
+    /* A swapchain image is drawn into and shown; it is a texture only when the program samples it (some adapters cannot show an image that is also sampled: virgl
+     * refuses to make one, and the present that needs it resident would lose the context). Copies and clears need no texture: the CPU does them on the image's memory. */
+    if (img->swapchain) flags = A_TARGET | A_PRESENT | ((img->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ? A_TEXTURE : 0);
   }
   UINT w[AW_WORDS];
   memset(w, 0, sizeof w);

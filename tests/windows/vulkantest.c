@@ -775,9 +775,9 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   }
 
   test_depth_and_push(&r, &s);
-  /* (before the swapchain: on virgl a present loses the context without a word - the GPU work after it fails) */
-  test_compute(&r);
   test_swapchain(&r);
+  /* (after a present: the GPU work after it must still run - a present the host refused used to lose the context without a word) */
+  test_compute(&r);
 
   /* copies and clears that need no GPU */
   p_vkResetCommandBuffer(r.cb, 0);
