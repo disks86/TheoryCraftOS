@@ -187,6 +187,8 @@ static void test_names() {
   CHECK(name("KERNEL32.dll") == "kernel32.dll" && name("Kernel32") == "kernel32.dll" && name("ntdll.DLL") == "ntdll.dll");
   CHECK(name("api-ms-win-core-file-l1-1-0.dll") == "kernel32.dll" && name("API-MS-WIN-CORE-HEAP-L1-2-0.dll") == "kernel32.dll" && name("KERNELBASE.dll") == "kernel32.dll");
   CHECK(name("api-ms-win-crt-stdio-l1-1-0.dll") == "msvcrt.dll" && name("UCRTBASE.DLL") == "msvcrt.dll" && name("msvcr120.dll") == "msvcrt.dll" && name("msvcrt") == "msvcrt.dll");      // every C runtime is the one msvcrt.dll
+  CHECK(name("XInput9_1_0.dll") == "xinput1_4.dll" && name("xinput1_3.dll") == "xinput1_4.dll" && name("XINPUT1_4.DLL") == "xinput1_4.dll" && name("xinputuap") == "xinput1_4.dll");      // every XInput is one library
+  CHECK(name("xinput.dll") == "xinput.dll" && name("wsock32.dll") == "ws2_32.dll");
   CHECK(name("vcruntime140.dll") == "msvcrt.dll" && name("user32.dll") == "user32.dll");
   CHECK(name("") == "<error>" && name(std::string(200, 'a').c_str()) == "<error>");
 }

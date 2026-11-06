@@ -46,7 +46,8 @@ uint32_t nt_send_socket(Process& p, const SyscallRequest& r);
 // not recvfrom); for TCP they are filled in from the one peer regardless. *PeerClosed true (status Success, *Got 0) is an orderly close, like a real recv() returning 0.
 uint32_t nt_receive_socket(Process& p, const SyscallRequest& r);
 // NtSocketControl(HANDLE, ULONG Operation, PVOID In, ULONG InLength, PVOID Out, ULONG OutLength). Operations: 0 Shutdown (In: ULONG How - 0 receive, 1 send, 2 both),
-// 1 SetNonBlocking (In: BOOLEAN), 2 GetSockName (Out: ULONG Address, ULONG Port), 3 GetPeerName (Out: the same), 4 BytesReadable (Out: ULONG, for FIONREAD).
+// 1 SetNonBlocking (In: BOOLEAN), 2 GetSockName (Out: ULONG Address, ULONG Port), 3 GetPeerName (Out: the same), 4 BytesReadable (Out: ULONG, for FIONREAD),
+// 5 InterfaceConfiguration (In: ULONG interface index; Out: address, netmask, gateway, DNS server, 4 bytes each in network order; STATUS_NO_MORE_ENTRIES past the last).
 uint32_t nt_socket_control(Process& p, const SyscallRequest& r);
 // NtSelectSockets(PULONG ReadCount, PULONG ReadHandles, PULONG WriteCount, PULONG WriteHandles, PULONG ExceptCount, PULONG ExceptHandles, PLARGE_INTEGER Timeout,
 // PULONG ReadyCount): each *Count is read/write, like a real fd_set's own fd_count field - in, how many handles its *Handles array holds; out, how many of them are
