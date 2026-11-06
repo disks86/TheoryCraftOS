@@ -744,6 +744,21 @@ static LONG_PTR def_proc_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wpara
   (void)ctx;
   LONG_PTR result;
   if (menu_def_before(hwnd, message, wparam, lparam, &result)) return result;
+  if (message == 0x0014 /* WM_ERASEBKGND */) {
+    /* the class background brush (a COLOR_ index plus one when small) fills the client area */
+    ULONG_PTR brush = GetClassLongPtrW(hwnd, -10 /* GCLP_HBRBACKGROUND */);
+    if (!brush || !wparam) return 0;
+    RECT_ rc;
+    GetClientRect(hwnd, &rc);
+    FillRect((HANDLE)wparam, &rc, (HANDLE)brush);
+    return 1;
+  }
+  if (message == 0x000F /* WM_PAINT */) {
+    /* painting nothing still erases the background and validates */
+    ULONG_PTR ps[9] = {0};
+    if (BeginPaint(hwnd, ps)) EndPaint(hwnd, ps);
+    return 0;
+  }
   result = (LONG_PTR)NtUserMessageCall((ULONG_PTR)hwnd, message, wparam, (ULONG_PTR)lparam, 0, MC_DEF_WINDOW_PROC, 0);
   menu_def_after(hwnd, message, wparam, lparam, &result);
   return result;
