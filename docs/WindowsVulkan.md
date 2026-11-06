@@ -28,19 +28,37 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
   `GLSL.std.450`) and given to the kernel as a `ShaderKind::Dxbc` shader through its private escape, which every adapter takes (interpreter, TGSI for virgl, D3D9 tokens for SVGA3D, ...).
   Vulkan's Y-down clip space is turned into the Y-up the kernel's Direct3D shaders have by negating the position's Y when it is written.
 * **Resource numbers** belong to a pipeline: uniform blocks (by set and binding) and the push constant block are constant buffers `cb0..` that the kernel lays end to end into its push
-  constant block (so every stage declares every slot); sampled images are texture units `t0..`/`s0..`.
+  constant block (so every stage declares every slot); sampled images are texture units `t0..`/`s0..`; storage buffers are the kernel's storage slots: a buffer some stage of the
+  pipeline writes is a raw unordered access view `u0..u3`, one that is only read (`NonWritable`) a raw read-only view `t0..t3` (the kernel's slots 4..7). That is 4 + 4 storage buffers a
+  pipeline (`maxPerStageDescriptorStorageBuffers` 8; a pipeline that writes a fifth is refused when it is created).
+* **Memory in shaders** (storage buffers, `Workgroup` variables) is addressed by bytes: an access chain is a constant offset plus an integer for its dynamic indices, a load `ld_raw`, a
+  store `store_raw`, atomics `imm_atomic_*` (add, sub, and, or, xor, min, max, exchange, increment, decrement; not compare-exchange, which the kernel has not). The layout is the module's
+  (`Offset`, `ArrayStride`, `MatrixStride`: std430 or std140); `Workgroup` variables have none, so they are laid out one after the other in the group-shared memory `g0` (32 KiB).
+  A boolean in memory is a 32-bit word. `barrier()` is `sync_g_t` (the kernel then runs the group a whole group at a time, at most 256 threads).
+* **Compute pipelines** (`vkCreateComputePipelines`, the adapter's `kFeatureCompute`): the shader is a `cs_5_0` DXBC compute shader with `dcl_thread_group` from `LocalSize`,
+  `LocalSizeId` or the specialised `WorkgroupSize`; `gl_GlobalInvocationID`, `gl_WorkGroupID`, `gl_LocalInvocationID` and `gl_LocalInvocationIndex` are the system values
+  `vThreadID`, `vThreadGroupID`, `vThreadIDInGroup`, `vThreadIDInGroupFlattened`. Queue family 0 has `VK_QUEUE_COMPUTE_BIT` on an adapter with compute. Graphics and compute have
+  their own bound pipeline and descriptor sets, as Vulkan's bind points do; push constants are shared.
 * **Memory** is host memory. A `VkBuffer` or `VkImage` bound to it gets a kernel allocation when the GPU needs it; the contents are copied to it when the program has written the
   memory since (a mapped memory counts as written every time). Uniform buffers never reach the GPU as buffers: their bytes are read at draw time into the constant block.
 * **Command buffers** are recorded as a list and run at `vkQueueSubmit`: a render pass is one command stream (`CommandStream.hpp`; a pass that does not fit the 64 KiB buffer of
   the context is run in parts), copies, fills, updates and clears that the CPU can do are done in order with it. A vertex buffer is used directly when it is one binding of 32-bit
   floats with the stride the pipeline expects; otherwise (normalised or integer formats, several bindings, instancing, other strides) the vertices are gathered into a temporary
   buffer of floats. Every submission has run when `vkQueueSubmit` returns, so fences, semaphores and events only keep a state.
+* **Dispatches** (`vkCmdDispatch`, `vkCmdDispatchIndirect`) are a stream of their own: the pipeline, the constants, the storage buffers (`BindUav`), `Dispatch`. When it has run, what
+  the GPU wrote into the written storage buffers (the bound ranges) is copied back into their host memory (`buf_readback`), so the copies the CPU does, the uniform data, an
+  indirect dispatch's group counts and a mapped memory all see it. Storage buffers in draws are bound the same way (read-only ones need the adapter's `kFeatureStorageInDraws`, written
+  ones `kFeatureVertexStores` / `kFeatureFragmentStores`, which are `vertexPipelineStoresAndAtomics` / `fragmentStoresAndAtomics`) and copied back when the pass's stream has run.
 * **Presentation**: `VK_KHR_win32_surface` + `VK_KHR_swapchain`; a swapchain image is a kernel allocation that `D3DKMTPresent` flips onto the display.
 
 ## Not done
 
-Compute pipelines and `vkCmdDispatch*`, geometry and tessellation shaders, storage buffers and images, texel buffers, queries and timestamps, indirect draws, sparse resources, input
-attachments, a second queue family, depth/stencil images that are also sampled (the kernel's depth images have no CPU view), blend constants, wireframe, depth clamp, anisotropy,
-specialization of `OpSpecConstantOp`, signed integer division and row-major matrices in shaders, dynamic indexing of anything but arrays in uniform blocks, Vulkan 1.1 and later
-(`vkEnumerateInstanceVersion` says 1.0). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
+Geometry and tessellation shaders, storage images, texel buffers, queries and timestamps, indirect draws, sparse resources, input attachments, a second queue family, depth/stencil
+images that are also sampled (the kernel's depth images have no CPU view), blend constants, wireframe, depth clamp, anisotropy, specialization of `OpSpecConstantOp`, row-major
+matrices in shaders, dynamic indexing of anything held in registers (arrays in uniform blocks and anything in memory can be), `OpArrayLength` (the length of a runtime array),
+`gl_NumWorkGroups`, compare-exchange atomics, more than 4 written and 4 read-only storage buffers a pipeline, arrays of storage buffers indexed dynamically, Vulkan 1.1 and later
+(`vkEnumerateInstanceVersion` says 1.0). A draw that writes a storage buffer another draw of the same pass reads from mapped memory may see the old contents (the copy back is when
+the pass's stream has run). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
 that answer `VK_ERROR_FEATURE_NOT_PRESENT` (`src/Windows/stubs/vulkan-1.inc`). Not validated on real GPUs: only the CPU renderer and what QEMU gives (virgl, standard VGA) run it.
+On virgl, the swapchain present loses the kernel context without an error: GPU work after a present fails (`D3DKMTRender` answers `STATUS_DEVICE_REMOVED`); `tests/windows/vulkantest.c`
+runs its compute test before the swapchain test for that reason.

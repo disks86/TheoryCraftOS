@@ -273,6 +273,15 @@ SpvResource *spv_resource(SpvModule *m, uint32_t index) { return index < m->nres
 uint32_t spv_input_mask(const SpvModule *m) { return m->input_mask; }
 uint32_t spv_output_mask(const SpvModule *m) { return m->output_mask; }
 uint32_t spv_uses_frag_coord(const SpvModule *m) { return m->frag_coord; }
+void spv_local_size(const SpvModule *m, uint32_t size[3]) {
+  for (int i = 0; i < 3; ++i) size[i] = m->local_size[i] ? m->local_size[i] : 1;
+}
+uint32_t spv_shared_bytes(const SpvModule *m) { return m->shared_bytes; }
+
+/* The value of a 32-bit scalar constant (0 when it is not one). */
+static uint32_t constant_u32(Mod *m, uint32_t id) {
+  return id < m->bound && m->vals[id] && m->vals[id]->nleaf && m->vals[id]->leaf[0].op.file == OF_IMM ? m->vals[id]->leaf[0].op.imm[0] : 0;
+}
 
 /* The pointee of a variable's pointer type, stripping the arrays of resources. */
 static uint32_t strip_arrays(Mod *m, uint32_t tid, uint32_t *array_size) {
@@ -371,6 +380,10 @@ int spv_reflect(SpvModule *m, uint32_t stage, const char *entry_name, const uint
         }
         if (m->w[off + 2] == 12) m->depth_replacing = 1;
         break;
+      case OpExecutionModeId:   /* LocalSizeId: the sizes are constants (defined further on) */
+        if (len >= 6 && m->w[off + 2] == 38 && m->w[off + 1] == m->entry_func)
+          for (int i = 0; i < 3; ++i) m->local_size_id[i] = m->w[off + 3 + i];
+        break;
       default:
         if ((op >= OpTypeVoid && op <= OpTypeSampledImage) || op == OpTypeArray || op == OpTypeRuntimeArray || op == OpTypeStruct || op == OpTypePointer || op == OpTypeFunction) {
           if (make_type(m, off)) return 1;
@@ -392,6 +405,16 @@ int spv_reflect(SpvModule *m, uint32_t stage, const char *entry_name, const uint
 functions:
   if (!entry_off) return sp_fail(m, "the entry point is not in the module");
   if (m->failed) return 1;
+  /* The size of a work group: LocalSizeId's constants, or the WorkgroupSize built-in (a constant composite, which specialization may have changed), over LocalSize. */
+  for (int i = 0; i < 3; ++i)
+    if (m->local_size_id[i]) m->local_size[i] = constant_u32(m, m->local_size_id[i]);
+  for (uint32_t i = 0; i < m->ndeco; ++i) {
+    Deco *d = &m->decos[i];
+    if (d->deco != DecoBuiltIn || d->arg != BuiltInWorkgroupSize || d->member != 0xFFFFFFFFu || d->id >= m->bound || !m->vals[d->id] || !m->vals[d->id]->nleaf) continue;
+    const Leaf *l = &m->vals[d->id]->leaf[0];
+    if (l->op.file != OF_IMM || l->n != 3) return sp_fail(m, "a WorkgroupSize that is not a constant vector of three");
+    for (int k = 0; k < 3; ++k) m->local_size[k] = l->op.imm[k];
+  }
   if (parse_functions(m)) return 1;
   /* The variables the entry point reaches. */
   sp_u8 *used = (sp_u8 *)sp_alloc(m, m->bound);
@@ -462,7 +485,13 @@ functions:
     if (storage == SCPushConstant) {
       r->kind = SPV_RES_PUSH, r->bytes = block_bytes(m, elem, 0, 0);
     } else if (storage == SCStorageBuffer || (storage == SCUniform && et->kind == T_STRUCT && deco_find(m, elem, 0xFFFFFFFFu, DecoBufferBlock, 0))) {
-      r->kind = SPV_RES_STORAGE, r->bytes = block_bytes(m, elem, 0, 0);
+      r->kind = SPV_RES_STORAGE, r->bytes = mem_size(m, elem, 0, 0);
+      /* read only: the variable is NonWritable, or every member of the block is */
+      r->readonly = deco_find(m, id, 0xFFFFFFFFu, DecoNonWritable, 0);
+      if (!r->readonly && et->kind == T_STRUCT && et->nmem) {
+        r->readonly = 1;
+        for (uint32_t k = 0; k < et->nmem; ++k) r->readonly &= deco_find(m, elem, k, DecoNonWritable, 0);
+      }
     } else if (storage == SCUniform) {
       r->kind = SPV_RES_UNIFORM, r->bytes = block_bytes(m, elem, 0, 0);
     } else if (et->kind == T_SAMPLER) {

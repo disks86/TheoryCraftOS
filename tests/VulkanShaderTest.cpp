@@ -73,16 +73,20 @@ std::vector<uint32_t> read_spirv(const char* name) {
   return words;
 }
 
-// One translated shader: the DXBC, and the layout of the constant buffers it was given (slot n at the sum of the sizes before it).
+// One translated shader: the DXBC, and the layout of the constant buffers it was given (slot n at the sum of the sizes before it). Storage buffers are numbered as vulkan-1.dll does:
+// the read-only ones t0.. (the kernel's slots after the unordered access ones), the others u0..; `storage_slot` is the kernel's slot of each binding.
 struct Translated {
   std::vector<uint8_t> dxbc;
   std::vector<uint32_t> cb_vec4;
   std::vector<uint32_t> binding_of_slot;
+  uint32_t storage_slot[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+  uint32_t local_size[3] = {1, 1, 1};
   std::string error;
   bool ok = false;
 };
 
-Translated translate(const std::vector<uint32_t>& words, uint32_t stage, const char* entry = nullptr) {
+Translated translate(const std::vector<uint32_t>& words, uint32_t stage, const char* entry = nullptr, const uint32_t* spec_ids = nullptr, const uint32_t* spec_values = nullptr,
+                     uint32_t spec_count = 0) {
   Translated t;
   SpvAllocator a = {sp_alloc_zero, sp_release, nullptr};
   SpvModule* m = spv_open(words.data(), static_cast<uint32_t>(words.size()), &a);
@@ -90,15 +94,19 @@ Translated translate(const std::vector<uint32_t>& words, uint32_t stage, const c
     t.error = "open";
     return t;
   }
-  if (spv_reflect(m, stage, entry, nullptr, nullptr, 0)) {
+  if (spv_reflect(m, stage, entry, spec_ids, spec_values, spec_count)) {
     t.error = spv_error(m);
     spv_close(m);
     return t;
   }
-  uint32_t slot = 0, unit = 0;
+  uint32_t slot = 0, unit = 0, uav = 0, srv = 0;
   for (uint32_t i = 0; i < spv_resource_count(m); ++i) {
     SpvResource* r = spv_resource(m, i);
-    if (r->kind == SPV_RES_UNIFORM || r->kind == SPV_RES_PUSH) {
+    if (r->kind == SPV_RES_STORAGE) {
+      r->uav = !r->readonly;
+      r->slot = r->uav ? uav++ : srv++;
+      if (r->binding < 8) t.storage_slot[r->binding] = r->uav ? r->slot : graphics::kMaxUavBuffers + r->slot;
+    } else if (r->kind == SPV_RES_UNIFORM || r->kind == SPV_RES_PUSH) {
       r->slot = slot++;
       r->cb_vec4 = (r->bytes + 15) / 16;
       spv_declare_cb(m, r->slot, r->cb_vec4);
@@ -108,6 +116,7 @@ Translated translate(const std::vector<uint32_t>& words, uint32_t stage, const c
       r->slot = unit++;
     }
   }
+  spv_local_size(m, t.local_size);
   const uint8_t* out = nullptr;
   uint32_t size = 0;
   if (spv_emit(m, &out, &size)) t.error = spv_error(m);
@@ -293,9 +302,9 @@ void test_fuzz() {
   uint32_t translated = 0, refused = 0;
   uint32_t seed = 12345;
   auto next = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
-  for (const char* name : {"basic.vert.spv", "basic.frag.spv", "math.frag.spv"}) {
+  for (const char* name : {"basic.vert.spv", "basic.frag.spv", "math.frag.spv", "cs_add.comp.spv", "cs_shared_opt.comp.spv", "vk_ssbo.vert.spv"}) {
     const std::vector<uint32_t> words = read_spirv(name);
-    const uint32_t stage = strstr(name, ".vert") ? SPV_STAGE_VERTEX : SPV_STAGE_FRAGMENT;
+    const uint32_t stage = strstr(name, ".vert") ? SPV_STAGE_VERTEX : strstr(name, ".comp") ? SPV_STAGE_COMPUTE : SPV_STAGE_FRAGMENT;
     for (uint32_t cut = 5; cut < words.size(); cut += 7) {
       std::vector<uint32_t> w(words.begin(), words.begin() + cut);
       Translated t = translate(w, stage);
@@ -317,6 +326,190 @@ void test_fuzz() {
   }
   printf("  fuzz: %u translated, %u refused\n", translated, refused);
   CHECK(translated + refused > 1000);
+}
+
+// ---- compute shaders -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// Runs groups_x x 1 x 1 work groups the way the kernel's software device does: a thread at a time, or a whole group at a time for a program with barriers or group-shared memory.
+void dispatch(const D3d9Program& p, uint32_t groups_x, std::vector<uint8_t>* const* buffers, const uint8_t* constants) {
+  graphics::ComputeContext c;
+  for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k)
+    if (buffers[k]) c.buffers[k] = ByteView(buffers[k]->data(), buffers[k]->size());
+  for (uint32_t g = 0; g < groups_x; ++g) {
+    c.group_id[0] = g, c.group_id[1] = c.group_id[2] = 0;
+    if (p.needs_group()) {
+      p.run_compute_group(c, constants);
+      continue;
+    }
+    uint32_t index = 0;
+    for (uint32_t z = 0; z < p.thread_group(2); ++z)
+      for (uint32_t y = 0; y < p.thread_group(1); ++y)
+        for (uint32_t x = 0; x < p.thread_group(0); ++x, ++index) {
+          c.thread_id[0] = x, c.thread_id[1] = y, c.thread_id[2] = z;
+          c.dispatch_id[0] = g * p.thread_group(0) + x, c.dispatch_id[1] = y, c.dispatch_id[2] = z;
+          c.group_index = index;
+          p.run_compute(c, constants);
+        }
+  }
+}
+
+float get_float(const std::vector<uint8_t>& b, uint32_t offset) {
+  float f;
+  memcpy(&f, b.data() + offset, 4);
+  return f;
+}
+uint32_t get_u32(const std::vector<uint8_t>& b, uint32_t offset) {
+  uint32_t v;
+  memcpy(&v, b.data() + offset, 4);
+  return v;
+}
+
+UniquePointer<D3d9Program> compile_compute(HostAllocator& allocator, const char* name, Translated* t, const uint32_t* spec_ids = nullptr, const uint32_t* spec_values = nullptr,
+                                           uint32_t spec_count = 0) {
+  *t = translate(read_spirv(name), SPV_STAGE_COMPUTE, nullptr, spec_ids, spec_values, spec_count);
+  if (!t->ok) printf("  %s: %s\n", name, t->error.c_str());
+  CHECK(t->ok);
+  if (!t->ok) return {};
+  NtStatus s = 0;
+  UniquePointer<D3d9Program> p = compile(allocator, *t, &s);
+  if (s != status::kSuccess) printf("  %s: the kernel refused the DXBC (0x%x)\n", name, s);
+  CHECK(s == status::kSuccess && p && p->stage() == graphics::ShaderStage::Compute);
+  // What virgl gets: the program as TGSI text (VULKAN_SHADER_TGSI=1 prints it).
+  if (p) {
+    String tgsi(allocator);
+    const NtStatus ts = p->emit_tgsi(&tgsi);
+    CHECK(ts == status::kSuccess);
+    if (getenv("VULKAN_SHADER_TGSI")) printf("--- %s TGSI ---\n%.*s\n", name, static_cast<int>(tgsi.size()), tgsi.data());
+  }
+  return p;
+}
+
+// Storage buffers read only and read-write with runtime arrays, push constants, a 4 x 2 work group, atomicAdd, signed division and modulo.
+void test_compute_buffers() {
+  HostAllocator allocator;
+  for (const char* name : {"cs_add.comp.spv", "cs_add_opt.comp.spv"}) {
+    Translated t;
+    UniquePointer<D3d9Program> p = compile_compute(allocator, name, &t);
+    if (!p) continue;
+    CHECK(t.local_size[0] == 4 && t.local_size[1] == 2 && t.local_size[2] == 1);
+    CHECK(t.storage_slot[0] == graphics::kMaxUavBuffers + 0 && t.storage_slot[1] == 0);   // (the input is NonWritable: a read-only view)
+    std::vector<uint8_t> src(8 + 16 * 4), dst(36 + 16 * 4);
+    const float offset[2] = {0.25f, 0.5f};
+    put_floats(src, 0, offset, 2);
+    for (uint32_t i = 0; i < 16; ++i) {
+      const float a = i * 1.5f - 3.0f, junk = -7.0f;
+      put_floats(src, 8 + 4 * i, &a, 1);
+      put_floats(dst, 36 + 4 * i, &junk, 1);
+    }
+    std::vector<uint8_t> constants(16);
+    const float scale = 2.0f;
+    put_floats(constants, 0, &scale, 1);
+    put_u32(constants, 4, 13);
+    std::vector<uint8_t>* buffers[graphics::kMaxStorageBuffers] = {};
+    buffers[t.storage_slot[0]] = &src, buffers[t.storage_slot[1]] = &dst;
+    dispatch(*p, 2, buffers, constants.data());
+    uint32_t wrong = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+      const float expected = i < 13 ? (i * 1.5f - 3.0f) * 2.0f + 0.5f : -7.0f;
+      if (fabsf(get_float(dst, 36 + 4 * i) - expected) > 1e-5f) {
+        if (!wrong) printf("  %s: b[%u] = %g, expected %g\n", name, i, get_float(dst, 36 + 4 * i), expected);
+        ++wrong;
+      }
+    }
+    for (uint32_t i = 0; i < 8; ++i) {
+      const int v = static_cast<int>(i) - 5;
+      const int expected = (v / 3) * 100 + ((v % 3) + 3) % 3;   // (OpSDiv rounds towards zero; GLSL's % is OpSMod: the sign of the divisor)
+      if (static_cast<int>(get_u32(dst, 4 + 4 * i)) != expected) {
+        if (!wrong) printf("  %s: q[%u] = %d, expected %d\n", name, i, static_cast<int>(get_u32(dst, 4 + 4 * i)), expected);
+        ++wrong;
+      }
+    }
+    CHECK(wrong == 0);
+    CHECK(get_u32(dst, 0) == 136);   // the sum of i + 1 over the 16 threads
+  }
+}
+
+// Group-shared memory with a barrier, a std430 struct (vec3, float, a mat2 of 8-byte columns), the local index; two groups of 16.
+void test_compute_shared() {
+  HostAllocator allocator;
+  for (const char* name : {"cs_shared.comp.spv", "cs_shared_opt.comp.spv"}) {
+    Translated t;
+    UniquePointer<D3d9Program> p = compile_compute(allocator, name, &t);
+    if (!p) continue;
+    CHECK(p->needs_group());
+    std::vector<uint8_t> items(32 * 32), sums(2 * 4);
+    float expected_sum[2] = {0, 0};
+    for (uint32_t i = 0; i < 32; ++i) {
+      const float f[8] = {0.5f * i, 1.0f + 0.25f * (i % 5), 0.1f * (i % 3), 0.01f * i, 1.0f, 2.0f + i, 3.0f, 0.5f * (i % 4)};   // pos, w, m columns (x, y), (x, y)
+      put_floats(items, 32 * i, f, 8);
+      expected_sum[i / 16] += f[0] + f[1] * f[2] + f[3] + (f[5] * 1.0f + f[7] * 2.0f);
+    }
+    std::vector<uint8_t>* buffers[graphics::kMaxStorageBuffers] = {};
+    buffers[t.storage_slot[0]] = &items, buffers[t.storage_slot[1]] = &sums;
+    std::vector<uint8_t> constants(16);
+    dispatch(*p, 2, buffers, constants.data());
+    for (uint32_t g = 0; g < 2; ++g) {
+      if (fabsf(get_float(sums, 4 * g) - expected_sum[g]) > 1e-3f) printf("  %s: sums[%u] = %g, expected %g\n", name, g, get_float(sums, 4 * g), expected_sum[g]);
+      CHECK(fabsf(get_float(sums, 4 * g) - expected_sum[g]) <= 1e-3f);
+    }
+    uint32_t wrong = 0;
+    for (uint32_t i = 0; i < 32; ++i) wrong += get_float(items, 32 * i + 12) != static_cast<float>(i % 16);
+    CHECK(wrong == 0);
+  }
+}
+
+// The work group size of a specialization constant (gl_WorkGroupSize), a uniform block, booleans in a buffer (any non-zero word is true).
+void test_compute_spec() {
+  HostAllocator allocator;
+  for (const char* name : {"cs_spec.comp.spv", "cs_spec_opt.comp.spv"}) {
+    const uint32_t ids[1] = {0}, values[1] = {8};
+    Translated t;
+    UniquePointer<D3d9Program> p = compile_compute(allocator, name, &t, ids, values, 1);
+    if (!p) continue;
+    CHECK(t.local_size[0] == 8 && p->thread_group(0) == 8);
+    std::vector<uint8_t> flags(16 * 4), words(4 + 16 * 4);
+    for (uint32_t i = 0; i < 16; ++i) {
+      put_u32(flags, 4 * i, i % 3 == 0 ? (i == 3 ? 5u : 1u) : 0u);
+      put_u32(words, 4 + 4 * i, 10 * i);
+    }
+    std::vector<uint8_t> constants(16);
+    put_u32(constants, 0, 7);
+    std::vector<uint8_t>* buffers[graphics::kMaxStorageBuffers] = {};
+    buffers[t.storage_slot[1]] = &flags, buffers[t.storage_slot[2]] = &words;
+    dispatch(*p, 2, buffers, constants.data());
+    uint32_t wrong = 0;
+    for (uint32_t i = 0; i < 16; ++i) wrong += get_u32(words, 4 + 4 * i) != 10 * i + 7 + (i % 3 == 0 ? 1000 : 0);
+    CHECK(wrong == 0);
+    CHECK(get_u32(words, 0) == 8);
+  }
+}
+
+// A vertex shader reading a read-only storage buffer (the kernel's storage in draws).
+void test_vertex_storage() {
+  HostAllocator allocator;
+  Translated t = translate(read_spirv("vk_ssbo.vert.spv"), SPV_STAGE_VERTEX);
+  if (!t.ok) printf("  vk_ssbo.vert: %s\n", t.error.c_str());
+  CHECK(t.ok && t.storage_slot[0] == graphics::kMaxUavBuffers);
+  if (!t.ok) return;
+  NtStatus s = 0;
+  UniquePointer<D3d9Program> p = compile(allocator, t, &s);
+  CHECK(s == status::kSuccess && p);
+  if (!p) return;
+  std::vector<uint8_t> positions(4 * 16);
+  for (uint32_t i = 0; i < 4; ++i) {
+    const float v[4] = {1.0f * i, 2.0f * i, 0.5f, 1.0f};
+    put_floats(positions, 16 * i, v, 4);
+  }
+  ByteView views[graphics::kMaxStorageBuffers] = {};
+  views[graphics::kMaxUavBuffers] = ByteView(positions.data(), positions.size());
+  graphics::VertexContext context;
+  context.storage = views;
+  context.vertex_id = 3;
+  graphics::Vec4 attributes[4] = {};
+  graphics::ShaderIo io = {};
+  std::vector<uint8_t> constants(16);
+  p->run_vertex_ex(attributes, constants.data(), context, &io);
+  CHECK(io.position.x == 3.0f && io.position.y == 6.0f && io.position.z == 0.5f && io.position.w == 1.0f);
 }
 
 // Things the translator names as not taken must say so.
@@ -341,6 +534,11 @@ int main() {
   test_basic();
   printf("math\n");
   test_math();
+  printf("compute\n");
+  test_compute_buffers();
+  test_compute_shared();
+  test_compute_spec();
+  test_vertex_storage();
   printf("refusals\n");
   test_refusals();
   printf("fuzz\n");

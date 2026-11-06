@@ -110,10 +110,13 @@ enum { CAP_ACCELERATED = 1, CAP_STENCIL = 2, CAP_MIPMAPS = 4, CAP_TEXTURES = 8, 
 /* graphics::DeviceFeature bits (src/Graphics/Graphics3D/IGraphicsDevice.hpp) */
 enum {
   FEAT_BLEND_STATE = 1u << 0, FEAT_TEXEL_ACCESS = 1u << 1, FEAT_SYSTEM_INPUTS = 1u << 2, FEAT_INSTANCING = 1u << 3, FEAT_LINES = 1u << 4, FEAT_MULTIPLE_TARGETS = 1u << 5, FEAT_FLOAT_FORMATS = 1u << 6,
-  FEAT_TEXTURE_KINDS = 1u << 8, FEAT_INDEPENDENT_BLEND = 1u << 9, FEAT_MULTISAMPLE = 1u << 11, FEAT_SRGB = 1u << 13, FEAT_UNORM16 = 1u << 14, FEAT_INTEGER = 1u << 15, FEAT_SNORM = 1u << 17
+  FEAT_TEXTURE_KINDS = 1u << 8, FEAT_INDEPENDENT_BLEND = 1u << 9, FEAT_COMPUTE = 1u << 10, FEAT_MULTISAMPLE = 1u << 11, FEAT_SRGB = 1u << 13, FEAT_UNORM16 = 1u << 14, FEAT_INTEGER = 1u << 15,
+  FEAT_SNORM = 1u << 17, FEAT_STORAGE_IN_DRAWS = 1u << 23, FEAT_FRAGMENT_STORES = 1u << 24, FEAT_VERTEX_STORES = 1u << 25
 };
+/* The kernel's storage buffer slots (graphics::kMaxUavBuffers, kMaxSrvBuffers): u0 .. u3 are read and written, the read-only views t0 .. t3 are the slots after them. */
+enum { UAV_SLOTS = 4, SRV_SLOTS = 4 };
 /* dxgk::AllocationFlags and dxgk::Format */
-enum { A_VERTEX = 1u << 0, A_INDEX = 1u << 1, A_TEXTURE = 1u << 2, A_TARGET = 1u << 3, A_DEPTH = 1u << 4, A_PRESENT = 1u << 5, A_STAGING = 1u << 6 };
+enum { A_VERTEX = 1u << 0, A_INDEX = 1u << 1, A_TEXTURE = 1u << 2, A_TARGET = 1u << 3, A_DEPTH = 1u << 4, A_PRESENT = 1u << 5, A_STAGING = 1u << 6, A_UAV = 1u << 9 };
 enum {
   DF_UNKNOWN = 0, DF_A8R8G8B8, DF_X8R8G8B8, DF_A8B8G8R8, DF_X8B8G8R8, DF_D32F, DF_D24S8, DF_RGBA16F, DF_RGBA32F, DF_A8R8G8B8_SRGB, DF_A8B8G8R8_SRGB, DF_RGBA16, DF_RGBA32UI, DF_RGBA32SI,
   DF_RGBA16UI, DF_RGBA16SI, DF_RGBA8UI, DF_RGBA16SN, DF_A2B10G10R10
@@ -299,6 +302,12 @@ typedef struct TexUnit {
   UINT sampler_set, sampler_binding;   /* a separate sampler (0xFFFFFFFF: the descriptor is a combined image sampler) */
 } TexUnit;
 
+/* A storage buffer of the pipeline: the descriptor (set, binding, array element) and the kernel's slot it is bound to (below UAV_SLOTS: read and written). */
+typedef struct StorageSlot {
+  UINT set, binding, element;
+  UINT slot;
+} StorageSlot;
+
 typedef struct VtxBinding {
   UINT binding, stride;
   BOOL per_instance;
@@ -327,6 +336,9 @@ typedef struct Pipe {
   UINT ncb;
   TexUnit unit[8];
   UINT nunit;
+  StorageSlot storage[UAV_SLOTS + SRV_SLOTS];
+  UINT nstorage;
+  BOOL compute;            /* a compute pipeline: `vs` is its shader */
   UINT color_targets;
   UINT subpass;
   UINT stencil_ref;

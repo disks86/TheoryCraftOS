@@ -37,6 +37,15 @@ static SpIns *emit_ins(Mod *m, uint16_t op) {
   return i;
 }
 
+static SpOp res_op_of(uint32_t file, uint32_t unit) {
+  SpOp o;
+  sp_zero(&o, sizeof o);
+  o.file = (sp_u8)file, o.idx = unit;
+  o.swz[0] = 0, o.swz[1] = 1, o.swz[2] = 2, o.swz[3] = 3;
+  o.ncomp = 4;
+  return o;
+}
+
 static SpOp op_none(void) {
   SpOp o;
   sp_zero(&o, sizeof o);
@@ -312,6 +321,144 @@ static int cb_leaves(Mod *m, const CbRead *rd, uint32_t tid, uint32_t offset, Le
   }
 }
 
+/* ---- memory: storage buffers and Workgroup variables ---------------------------------------------------------------------------------------------------------------- */
+/* The register a pointer into memory names, noted for the declarations. */
+static SpOp mem_op(Mod *m, const Val *p) {
+  SpOp o = res_op_of(p->mem_file, p->mem_idx);
+  if (p->mem_file == OF_UAV && p->mem_idx < 32) m->uav_used |= 1u << p->mem_idx;
+  if (p->mem_file == OF_RES && p->mem_idx < 32) m->srv_used |= 1u << p->mem_idx;
+  m->uses_memory = 1;
+  return o;
+}
+
+static Leaf dyn_leaf(const Val *p) {
+  Leaf d;
+  sp_zero(&d, sizeof d);
+  d.op = op_temp(p->dyn_reg);
+  d.op.swz[0] = d.op.swz[1] = d.op.swz[2] = d.op.swz[3] = (sp_u8)p->dyn_comp;
+  d.op.ncomp = 1;
+  d.n = 1, d.cls = CLS_U;
+  return d;
+}
+
+/* The byte address of `offset` bytes past where the pointer's dynamic part points. */
+static Leaf mem_address(Mod *m, const Val *p, uint32_t offset) {
+  Leaf c = imm_u(offset, 1, CLS_U);
+  if (!p->dyn_on) return c;
+  Leaf d = dyn_leaf(p);
+  if (offset == 0) return d;
+  return alu(m, D_IADD, 1, CLS_U, &d, &c, 0);
+}
+
+/* A scalar or vector of `n` components at `offset` (bytes): ld_raw. A boolean is kept in memory as a 32-bit integer. */
+static Leaf mem_load_leaf(Mod *m, const Val *p, uint32_t offset, sp_u8 n, sp_u8 cls) {
+  if (offset % 4) {
+    sp_fail(m, "memory that is not 4-byte aligned");
+    return imm_u(0, n, cls);
+  }
+  Leaf addr = mem_address(m, p, offset);
+  Leaf r = temp_leaf(m, n, cls == CLS_B ? CLS_U : cls, 0);
+  SpIns *i = emit_ins(m, D_LD_RAW);
+  i->dst[0] = dst_temp(&r);
+  i->ndst = 1;
+  add_src(i, &addr, 1);
+  i->src[i->nsrc++] = mem_op(m, p);
+  if (cls == CLS_B) {
+    Leaf zero = imm_u(0, 1, CLS_U);
+    r = alu(m, D_INE, n, CLS_B, &r, &zero, 0);
+  }
+  return r;
+}
+
+static void mem_store_leaf(Mod *m, const Val *p, uint32_t offset, const Leaf *v) {
+  if (p->mem_file == OF_RES) {
+    sp_fail(m, "a store to a storage buffer the pipeline reads only");
+    return;
+  }
+  if (offset % 4) {
+    sp_fail(m, "memory that is not 4-byte aligned");
+    return;
+  }
+  Leaf value = *v;
+  if (v->cls == CLS_B) {   /* (true is all ones in a register, 1 in memory) */
+    Leaf one = imm_u(1, 1, CLS_U);
+    value = alu(m, D_AND, v->n, CLS_U, v, &one, 0);
+  }
+  Leaf addr = mem_address(m, p, offset);
+  SpIns *i = emit_ins(m, D_STORE_RAW);
+  i->dst[0] = mem_op(m, p);
+  i->dst[0].mask = (sp_u8)full_mask(value.n);
+  i->ndst = 1;
+  add_src(i, &addr, 1);
+  add_src(i, &value, value.n);
+}
+
+/* Loads (store == 0) or stores the leaves of a value of type `tid` at `offset`; `mstride` the MatrixStride in force (0: none). */
+static int mem_walk(Mod *m, const Val *p, uint32_t tid, uint32_t offset, uint32_t mstride, Leaf *leaves, uint32_t *k, uint32_t cap, int store) {
+  Type *t = get_type(m, tid);
+  if (!t) return sp_fail(m, "memory of an unknown type");
+  switch (t->kind) {
+    case T_BOOL: case T_INT: case T_FLOAT: case T_VEC: {
+      if (*k >= cap) return sp_fail(m, "memory access shape");
+      sp_u8 n = (sp_u8)(t->kind == T_VEC ? t->count : 1);
+      sp_u8 cls = t->kind == T_VEC ? get_type(m, t->elem)->cls : t->cls;
+      if (store) mem_store_leaf(m, p, offset, &leaves[*k]);
+      else leaves[*k] = mem_load_leaf(m, p, offset, n, cls);
+      ++*k;
+      return 0;
+    }
+    case T_MAT: {
+      uint32_t stride = mem_column_stride(m, tid, mstride);
+      for (uint32_t c = 0; c < t->count; ++c)
+        if (mem_walk(m, p, t->elem, offset + c * stride, 0, leaves, k, cap, store)) return 1;
+      return 0;
+    }
+    case T_ARRAY: {
+      if (t->count == 0) return sp_fail(m, "a load or store of a whole runtime array");
+      uint32_t stride = mem_array_stride(m, tid);
+      for (uint32_t i = 0; i < t->count; ++i)
+        if (mem_walk(m, p, t->elem, offset + i * stride, mstride, leaves, k, cap, store)) return 1;
+      return 0;
+    }
+    case T_STRUCT:
+      for (uint32_t i = 0; i < t->nmem; ++i) {
+        uint32_t ms = 0;
+        if (deco_find(m, tid, i, DecoRowMajor, 0)) return sp_fail(m, "row-major matrices in storage buffers");
+        deco_find(m, tid, i, DecoMatrixStride, &ms);
+        if (mem_walk(m, p, t->mem[i], offset + mem_member_offset(m, tid, i), ms, leaves, k, cap, store)) return 1;
+      }
+      return 0;
+    default:
+      return sp_fail(m, "unsupported type in memory");
+  }
+}
+
+/* index * stride added to the pointer's dynamic offset (an integer in a temporary). */
+static void mem_add_dynamic(Mod *m, Val *r, const Leaf *index, uint32_t stride) {
+  Leaf ix = as_temp(m, index);
+  Leaf scaled = ix;
+  if (stride != 1) {
+    uint32_t shift = 0;
+    while (shift < 31 && (1u << shift) < stride) ++shift;
+    Leaf k = imm_u((1u << shift) == stride ? shift : stride, 1, CLS_U);
+    if ((1u << shift) == stride) {
+      scaled = alu(m, D_ISHL, 1, CLS_U, &ix, &k, 0);
+    } else {
+      scaled = alu(m, D_IMUL, 1, CLS_U, &ix, &k, 0);
+      SpIns *ins = &m->code[m->ncode - 1];   /* (imul writes the high word first) */
+      ins->dst[1] = ins->dst[0];
+      ins->dst[0] = op_none();
+      ins->dst[0].file = OF_NULL;
+      ins->ndst = 2;
+    }
+  }
+  if (r->dyn_on) {
+    Leaf prev = dyn_leaf(r);
+    scaled = alu(m, D_IADD, 1, CLS_U, &prev, &scaled, 0);
+  }
+  r->dyn_on = 1, r->dyn_reg = scaled.op.idx, r->dyn_comp = scaled.op.swz[0];
+}
+
 /* ---- access chains and loads and stores --------------------------------------------------------------------------------------------------------------------------- */
 static int const_index(Mod *m, uint32_t id, uint32_t *value) {
   Val *v = val_of(m, id);
@@ -345,6 +492,39 @@ static int do_access_chain(Mod *m, uint32_t off) {
     if (bv->is_image) {   /* an element of an array of images or samplers */
       if (t->kind != T_ARRAY || !is_const) return sp_fail(m, "dynamic indexing of an array of images");
       r->image_unit_off = r->image_unit_off * t->count + index;
+      cur = t->elem;
+      continue;
+    }
+    if (r->is_mem) {
+      if (r->res_array) {   /* the buffer of an array of storage buffers */
+        if (t->kind != T_ARRAY || !is_const || index >= t->count) return sp_fail(m, "an array of storage buffers indexed dynamically or past its end");
+        r->mem_idx += index, r->res_array = 0;
+        cur = t->elem;
+        continue;
+      }
+      uint32_t stride = 0;
+      switch (t->kind) {
+        case T_STRUCT: {
+          if (!is_const || index >= t->nmem) return sp_fail(m, "dynamic struct index");
+          if (deco_find(m, cur, index, DecoRowMajor, 0)) return sp_fail(m, "row-major matrices in storage buffers");
+          uint32_t ms = 0;
+          r->mstride = deco_find(m, cur, index, DecoMatrixStride, &ms) ? ms : 0;
+          r->byte_off += mem_member_offset(m, cur, index);
+          cur = t->mem[index];
+          continue;
+        }
+        case T_ARRAY: stride = mem_array_stride(m, cur); break;
+        case T_MAT: stride = mem_column_stride(m, cur, r->mstride); r->mstride = 0; break;
+        case T_VEC: stride = 4; break;
+        default: return sp_fail(m, "bad access chain");
+      }
+      if (is_const) {
+        r->byte_off += index * stride;
+      } else {
+        Val *iv = val_of(m, m->w[off + k]);
+        if (!iv) return 1;
+        mem_add_dynamic(m, r, &iv->leaf[0], stride);
+      }
       cur = t->elem;
       continue;
     }
@@ -463,6 +643,11 @@ static int do_load(Mod *m, uint32_t off) {
   }
   Val *r = result_val(m, rtype, id);
   if (!r) return 1;
+  if (p->is_mem) {
+    uint32_t k = 0;
+    if (mem_walk(m, p, rtype, p->byte_off, p->mstride, r->leaf, &k, r->nleaf, 0)) return 1;
+    return k == r->nleaf ? 0 : sp_fail(m, "memory load shape");
+  }
   if (p->is_cb) {
     CbRead rd;
     rd.res = p->var, rd.dyn_on = p->dyn_on, rd.dyn_reg = p->dyn_reg, rd.dyn_comp = p->dyn_comp, rd.mstride = p->mstride;
@@ -500,6 +685,11 @@ static int do_store(Mod *m, uint32_t ptr_id, uint32_t value_id) {
   Val *p = val_of(m, ptr_id), *v = val_of(m, value_id);
   if (!p || !v) return 1;
   if (p->is_cb) return sp_fail(m, "store to a uniform block");
+  if (p->is_mem) {
+    uint32_t k = 0;
+    if (mem_walk(m, p, p->type, p->byte_off, p->mstride, v->leaf, &k, v->nleaf, 1)) return 1;
+    return k == v->nleaf ? 0 : sp_fail(m, "memory store shape");
+  }
   Val *var = m->vals[p->var];
   if (!var) return sp_fail(m, "store to an unknown variable");
   for (uint32_t i = 0; i < v->nleaf; ++i) {
@@ -568,9 +758,9 @@ static int do_image_sample(Mod *m, uint32_t off) {
   else if (bias) dop = D_SAMPLE_B;
   else if (gx) dop = D_SAMPLE_D;
   if (!dop) return sp_fail(m, "a depth comparison with an explicit lod other than 0");
-  /* In a vertex shader there are no derivatives: an implicit lookup is a lookup at lod 0. */
+  /* Outside a fragment shader there are no derivatives: an implicit lookup is a lookup at lod 0. */
   Leaf zero_lod = imm_f(0.0f, 1);
-  if (m->stage == SPV_STAGE_VERTEX && dop == D_SAMPLE) dop = D_SAMPLE_L, lod = 0;
+  if (m->stage != SPV_STAGE_FRAGMENT && dop == D_SAMPLE) dop = D_SAMPLE_L, lod = 0;
   SpIns *i = emit_ins(m, dop);
   i->dst[0] = dst_temp(&result);
   i->ndst = 1;
@@ -1208,6 +1398,128 @@ static int do_derivative(Mod *m, uint32_t off, int mode) {
   return 0;
 }
 
+/* Signed division by the unsigned one: on the magnitudes, then the sign. `mode` 0 SDiv (rounds towards zero), 1 SRem (the sign of the dividend), 2 SMod (the sign of the divisor). */
+static int do_signed_div(Mod *m, uint32_t off, int mode) {
+  uint32_t rtype = m->w[off + 1], id = m->w[off + 2];
+  Val *a = val_of(m, m->w[off + 3]), *b = val_of(m, m->w[off + 4]);
+  if (!a || !b) return 1;
+  Val *r = result_val(m, rtype, id);
+  if (!r) return 1;
+  if (a->nleaf != r->nleaf || b->nleaf != r->nleaf) return sp_fail(m, "operand shape differs from the result's");
+  Leaf zero = imm_u(0, 1, CLS_I);
+  for (uint32_t i = 0; i < r->nleaf; ++i) {
+    int n = a->leaf[i].n;
+    const Leaf *x = &a->leaf[i], *y = &b->leaf[i];
+    Leaf nx = alu(m, D_INEG, n, CLS_I, x, 0, 0), ny = alu(m, D_INEG, n, CLS_I, y, 0, 0);
+    Leaf ax = alu(m, D_IMAX, n, CLS_U, x, &nx, 0), ay = alu(m, D_IMAX, n, CLS_U, y, &ny, 0);
+    Leaf q = temp_leaf(m, (sp_u8)n, CLS_U, 0), rem = temp_leaf(m, (sp_u8)n, CLS_U, 0);
+    SpIns *ins = emit_ins(m, D_UDIV);
+    ins->dst[0] = dst_temp(&q);
+    ins->dst[1] = dst_temp(&rem);
+    ins->ndst = 2;
+    add_src(ins, &ax, n);
+    add_src(ins, &ay, n);
+    if (mode == 0) {
+      Leaf sign = alu(m, D_XOR, n, CLS_I, x, y, 0);
+      Leaf negative = alu(m, D_ILT, n, CLS_B, &sign, &zero, 0);
+      Leaf nq = alu(m, D_INEG, n, CLS_I, &q, 0, 0);
+      r->leaf[i] = alu(m, D_MOVC, n, CLS_I, &negative, &nq, &q);
+      continue;
+    }
+    Leaf negative = alu(m, D_ILT, n, CLS_B, x, &zero, 0);
+    Leaf nr = alu(m, D_INEG, n, CLS_I, &rem, 0, 0);
+    Leaf t = alu(m, D_MOVC, n, CLS_I, &negative, &nr, &rem);
+    if (mode == 1) {
+      r->leaf[i] = t;
+      continue;
+    }
+    /* a remainder whose sign is not the divisor's: plus the divisor */
+    Leaf nonzero = alu(m, D_INE, n, CLS_B, &t, &zero, 0);
+    Leaf differ = alu(m, D_XOR, n, CLS_I, &t, y, 0);
+    Leaf opposite = alu(m, D_ILT, n, CLS_B, &differ, &zero, 0);
+    Leaf fix = alu(m, D_AND, n, CLS_B, &nonzero, &opposite, 0);
+    Leaf sum = alu(m, D_IADD, n, CLS_I, &t, y, 0);
+    r->leaf[i] = alu(m, D_MOVC, n, CLS_I, &fix, &sum, &t);
+  }
+  return 0;
+}
+
+/* The atomics on 32-bit integers in memory: imm_atomic_* (the old value is the result); a load and a store are ld_raw / store_raw. */
+static int do_atomic(Mod *m, uint32_t off) {
+  uint32_t op = OPC(off);
+  uint32_t ptr_id = op == OpAtomicStore ? m->w[off + 1] : m->w[off + 3];
+  Val *p = val_of(m, ptr_id);
+  if (!p) return 1;
+  if (!p->is_mem) return sp_fail(m, "an atomic on something that is not a storage buffer or Workgroup memory");
+  if (op == OpAtomicStore) {
+    Val *v = val_of(m, m->w[off + 4]);
+    if (!v) return 1;
+    mem_store_leaf(m, p, p->byte_off, &v->leaf[0]);
+    return 0;
+  }
+  uint32_t rtype = m->w[off + 1], id = m->w[off + 2];
+  Type *rt = get_type(m, rtype);
+  if (!rt || rt->kind != T_INT) return sp_fail(m, "an atomic on something other than a 32-bit integer");
+  Val *r = result_val(m, rtype, id);
+  if (!r) return 1;
+  if (op == OpAtomicLoad) {
+    r->leaf[0] = mem_load_leaf(m, p, p->byte_off, 1, rt->cls);
+    return 0;
+  }
+  if (p->mem_file == OF_RES) return sp_fail(m, "an atomic on a storage buffer the pipeline reads only");
+  if (p->byte_off % 4) return sp_fail(m, "memory that is not 4-byte aligned");
+  uint16_t dop;
+  Leaf value = imm_u(1, 1, rt->cls);
+  switch (op) {
+    case OpAtomicIIncrement: dop = D_IMM_ATOMIC_IADD; break;
+    case OpAtomicIDecrement: dop = D_IMM_ATOMIC_IADD, value = imm_u(0xFFFFFFFFu, 1, rt->cls); break;
+    case OpAtomicIAdd: case OpAtomicISub: dop = D_IMM_ATOMIC_IADD; break;
+    case OpAtomicAnd: dop = D_IMM_ATOMIC_AND; break;
+    case OpAtomicOr: dop = D_IMM_ATOMIC_OR; break;
+    case OpAtomicXor: dop = D_IMM_ATOMIC_XOR; break;
+    case OpAtomicExchange: dop = D_IMM_ATOMIC_EXCH; break;
+    case OpAtomicSMax: dop = D_IMM_ATOMIC_IMAX; break;
+    case OpAtomicSMin: dop = D_IMM_ATOMIC_IMIN; break;
+    case OpAtomicUMax: dop = D_IMM_ATOMIC_UMAX; break;
+    case OpAtomicUMin: dop = D_IMM_ATOMIC_UMIN; break;
+    default: return sp_fail(m, "compare-exchange atomics");
+  }
+  if (op != OpAtomicIIncrement && op != OpAtomicIDecrement) {
+    Val *v = val_of(m, m->w[off + 6]);
+    if (!v) return 1;
+    value = v->leaf[0];
+    if (op == OpAtomicISub) value = alu(m, D_INEG, 1, rt->cls, &value, 0, 0);
+  }
+  Leaf addr = mem_address(m, p, p->byte_off);
+  Leaf result = temp_leaf(m, 1, rt->cls, 0);
+  SpIns *i = emit_ins(m, dop);
+  i->dst[0] = dst_temp(&result);
+  i->dst[1] = mem_op(m, p);
+  i->dst[1].mask = 1;
+  i->ndst = 2;
+  add_src(i, &addr, 1);
+  add_src(i, &value, 1);
+  r->leaf[0] = result;
+  return 0;
+}
+
+/* OpControlBarrier: the threads of a work group wait for each other (sync_g_t; with the memory the semantics name). OpMemoryBarrier: memory only, which a thread here always sees in
+ * order (sync without the thread flag in a compute shader, nothing elsewhere). */
+static int do_barrier(Mod *m, uint32_t off) {
+  uint32_t op = OPC(off);
+  uint32_t semantics_id = op == OpControlBarrier ? m->w[off + 3] : m->w[off + 2];
+  uint32_t semantics = constant_u32(m, semantics_id);
+  if (m->stage != SPV_STAGE_COMPUTE) {
+    if (op == OpControlBarrier) return sp_fail(m, "a control barrier outside a compute shader");
+    return 0;
+  }
+  uint32_t flags = 2;                                   /* group-shared memory */
+  if (semantics & (0x40 | 0x800)) flags |= 4;            /* UniformMemory, ImageMemory: the group's view of the buffers */
+  if (op == OpControlBarrier) flags |= 1;                /* the threads */
+  emit_ins(m, D_SYNC)->extra = flags;
+  return 0;
+}
+
 /* One non-terminator instruction of a block. */
 static int gen_instruction(Mod *m, uint32_t off) {
   uint32_t op = OPC(off);
@@ -1327,7 +1639,14 @@ static int gen_instruction(Mod *m, uint32_t off) {
     case OpFDiv: return ew(m, m->w[off + 1], m->w[off + 2], D_DIV, 2, m->w[off + 3], m->w[off + 4], 0, 0, -1);
     case OpUDiv: return do_unsigned_div(m, off, 0);
     case OpUMod: return do_unsigned_div(m, off, 1);
-    case OpSDiv: case OpSRem: case OpSMod: return sp_fail(m, "signed integer division");
+    case OpSDiv: return do_signed_div(m, off, 0);
+    case OpSRem: return do_signed_div(m, off, 1);
+    case OpSMod: return do_signed_div(m, off, 2);
+    case OpAtomicLoad: case OpAtomicStore: case OpAtomicExchange: case OpAtomicCompareExchange: case OpAtomicCompareExchangeWeak: case OpAtomicIIncrement: case OpAtomicIDecrement:
+    case OpAtomicIAdd: case OpAtomicISub: case OpAtomicSMin: case OpAtomicUMin: case OpAtomicSMax: case OpAtomicUMax: case OpAtomicAnd: case OpAtomicOr: case OpAtomicXor:
+      return do_atomic(m, off);
+    case OpControlBarrier: case OpMemoryBarrier: return do_barrier(m, off);
+    case OpArrayLength: return sp_fail(m, "OpArrayLength (the length of a runtime array)");
     case OpFMod: return do_fmod(m, off, 0);
     case OpFRem: return do_fmod(m, off, 1);
     case OpAny: return do_any_all(m, off, 0);

@@ -1,5 +1,5 @@
-/* vulkan-1.c, part 4: graphics pipelines. The shaders are SPIR-V (spirv.inc turns them into DXBC, which the kernel takes on every GPU); the resources the shaders use are numbered for the
- * whole pipeline here: constant buffer slots (the kernel lays them end to end in its push constant block) and texture units. */
+/* vulkan-1.c, part 4: graphics and compute pipelines. The shaders are SPIR-V (spirv.inc turns them into DXBC, which the kernel takes on every GPU); the resources the shaders use are
+ * numbered for the whole pipeline here: constant buffer slots (the kernel lays them end to end in its push constant block), texture units and storage buffer slots. */
 
 static UINT put_words(UINT *w, UINT n, UINT v) {
   w[n] = v;
@@ -96,6 +96,56 @@ static BOOL assign_resources(Pipe *p, Stage *stages, UINT nstages, const Caps *c
     *why = "the pipeline samples more textures than the adapter has texture units";
     return FALSE;
   }
+  /* storage buffers: by (set, binding), each element a slot; a buffer that a stage writes is an unordered access view (u0 .. u3), one that is only read a read-only view (t0 .. t3) */
+  p->nstorage = 0;
+  UINT skeys[SP_MAX_RES_KEYS][4];   /* set, binding, elements, written */
+  UINT nskeys = 0;
+  for (UINT s = 0; s < nstages; ++s)
+    for (UINT i = 0; i < spv_resource_count(stages[s].m); ++i) {
+      SpvResource *r = spv_resource(stages[s].m, i);
+      if (r->kind != SPV_RES_STORAGE) continue;
+      UINT k = 0;
+      while (k < nskeys && !(skeys[k][0] == r->set && skeys[k][1] == r->binding)) ++k;
+      if (k == nskeys) {
+        if (nskeys == SP_MAX_RES_KEYS) continue;
+        skeys[k][0] = r->set, skeys[k][1] = r->binding, skeys[k][2] = r->array_size, skeys[k][3] = 0, ++nskeys;
+      }
+      skeys[k][3] |= !r->readonly;
+    }
+  for (UINT a = 1; a < nskeys; ++a) {
+    UINT c[4] = {skeys[a][0], skeys[a][1], skeys[a][2], skeys[a][3]};
+    UINT b = a;
+    while (b > 0 && (skeys[b - 1][0] > c[0] || (skeys[b - 1][0] == c[0] && skeys[b - 1][1] > c[1]))) memcpy(skeys[b], skeys[b - 1], sizeof c), --b;
+    memcpy(skeys[b], c, sizeof c);
+  }
+  UINT nuav = 0, nsrv = 0;
+  for (UINT k = 0; k < nskeys; ++k)
+    for (UINT e = 0; e < skeys[k][2]; ++e) {
+      if (skeys[k][3] ? nuav == UAV_SLOTS : nsrv == SRV_SLOTS) {
+        *why = skeys[k][3] ? "the pipeline writes more storage buffers than the adapter binds (4)" : "the pipeline reads more storage buffers than the adapter binds (4 written and 4 read only)";
+        return FALSE;
+      }
+      StorageSlot *ss = &p->storage[p->nstorage++];
+      ss->set = skeys[k][0], ss->binding = skeys[k][1], ss->element = e;
+      ss->slot = skeys[k][3] ? nuav++ : UAV_SLOTS + nsrv++;
+    }
+  for (UINT s = 0; s < nstages; ++s)
+    for (UINT i = 0; i < spv_resource_count(stages[s].m); ++i) {
+      SpvResource *r = spv_resource(stages[s].m, i);
+      if (r->kind != SPV_RES_STORAGE) continue;
+      for (UINT k = 0; k < p->nstorage; ++k)
+        if (p->storage[k].set == r->set && p->storage[k].binding == r->binding && p->storage[k].element == 0) {
+          r->uav = p->storage[k].slot < UAV_SLOTS;
+          r->slot = r->uav ? p->storage[k].slot : p->storage[k].slot - UAV_SLOTS;
+        }
+      /* (in a draw: read-only views need the adapter's storage in draws, written buffers its stores of that stage) */
+      if (stages[s].stage == SPV_STAGE_COMPUTE) continue;
+      UINT need = !r->uav ? FEAT_STORAGE_IN_DRAWS : stages[s].stage == SPV_STAGE_VERTEX ? FEAT_VERTEX_STORES : FEAT_FRAGMENT_STORES;
+      if (!(caps->features & need)) {
+        *why = !r->uav ? "the adapter has no storage buffers in draws" : "the adapter cannot write storage buffers from this shader stage (vertexPipelineStoresAndAtomics, fragmentStoresAndAtomics)";
+        return FALSE;
+      }
+    }
   /* the numbers into the shaders' resources */
   for (UINT s = 0; s < nstages; ++s)
     for (UINT i = 0; i < spv_resource_count(stages[s].m); ++i) {
@@ -151,6 +201,21 @@ static UINT blend_factor(VkBlendFactor f, BOOL *bad) {
   }
 }
 
+/* The values of a stage's specialization constants (4-byte and 1-byte ones, which is what 32-bit scalars and booleans are). */
+static UINT specialization(const VkSpecializationInfo *si, UINT *ids, UINT *values, UINT cap) {
+  UINT n = 0;
+  if (!si) return 0;
+  for (UINT k = 0; k < si->mapEntryCount && n < cap; ++k) {
+    if (si->pMapEntries[k].size != 4 && si->pMapEntries[k].size != 1) continue;
+    if (si->pMapEntries[k].offset > si->dataSize || si->pMapEntries[k].size > si->dataSize - si->pMapEntries[k].offset) continue;
+    ids[n] = si->pMapEntries[k].constantID;
+    values[n] = 0;
+    memcpy(&values[n], (const BYTE *)si->pData + si->pMapEntries[k].offset, si->pMapEntries[k].size);
+    ++n;
+  }
+  return n;
+}
+
 static VkResult create_one_pipeline(Device *d, const VkGraphicsPipelineCreateInfo *ci, Pipe **out) {
   const Caps *caps = &d->pd->caps;
   const VkPipelineShaderStageCreateInfo *vs_ci = NULL, *fs_ci = NULL;
@@ -179,17 +244,8 @@ static VkResult create_one_pipeline(Device *d, const VkGraphicsPipelineCreateInf
   SpvAllocator allocator = {spv_alloc, spv_release, NULL};
   for (UINT s = 0; s < 2; ++s) {
     const Shader *sh = (const Shader *)cis[s]->module;
-    UINT ids[16], values[16], nspec = 0;
-    if (cis[s]->pSpecializationInfo) {
-      const VkSpecializationInfo *si = cis[s]->pSpecializationInfo;
-      for (UINT k = 0; k < si->mapEntryCount && nspec < 16; ++k) {
-        if (si->pMapEntries[k].size != 4 && si->pMapEntries[k].size != 1) continue;
-        ids[nspec] = si->pMapEntries[k].constantID;
-        values[nspec] = 0;
-        memcpy(&values[nspec], (const BYTE *)si->pData + si->pMapEntries[k].offset, si->pMapEntries[k].size);
-        ++nspec;
-      }
-    }
+    UINT ids[16], values[16];
+    UINT nspec = specialization(cis[s]->pSpecializationInfo, ids, values, 16);
     stages[s].m = spv_open(sh->words, sh->nwords, &allocator);
     if (!stages[s].m || spv_reflect(stages[s].m, stages[s].stage, cis[s]->pName, ids, values, nspec)) {
       why = stages[s].m ? spv_error(stages[s].m) : "not a SPIR-V module";
@@ -372,10 +428,75 @@ VKAPI VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice device, VkPipelineC
   }
   return first_error;
 }
+/* A compute pipeline: the kernel's compute pipeline of the translated shader (the adapter's kFeatureCompute). */
+static VkResult create_one_compute_pipeline(Device *d, const VkComputePipelineCreateInfo *ci, Pipe **out) {
+  const Caps *caps = &d->pd->caps;
+  if (!(caps->features & FEAT_COMPUTE)) {
+    trace("the adapter has no compute shaders");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  if (ci->stage.stage != VK_SHADER_STAGE_COMPUTE_BIT || !ci->stage.module) return VK_ERROR_INITIALIZATION_FAILED;
+  Pipe *p = vk_alloc(sizeof(Pipe));
+  if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
+  p->dev = d, p->layout = (PipeLayout *)ci->layout, p->compute = TRUE;
+  VkResult result = VK_ERROR_INVALID_SHADER_NV;
+  const char *why = NULL;
+  SpvAllocator allocator = {spv_alloc, spv_release, NULL};
+  const Shader *sh = (const Shader *)ci->stage.module;
+  UINT ids[16], values[16];
+  UINT nspec = specialization(ci->stage.pSpecializationInfo, ids, values, 16);
+  Stage stage = {spv_open(sh->words, sh->nwords, &allocator), SPV_STAGE_COMPUTE};
+  const BYTE *dxbc = NULL;
+  UINT size = 0;
+  UINT words[2] = {5, 0};   /* CreateComputePipeline */
+  if (!stage.m || spv_reflect(stage.m, SPV_STAGE_COMPUTE, ci->stage.pName, ids, values, nspec)) {
+    why = stage.m ? spv_error(stage.m) : "not a SPIR-V module";
+    goto fail;
+  }
+  if (!assign_resources(p, &stage, 1, caps, &why)) {
+    result = VK_ERROR_FEATURE_NOT_PRESENT;
+    goto fail;
+  }
+  if (spv_emit(stage.m, &dxbc, &size)) {
+    why = spv_error(stage.m);
+    goto fail;
+  }
+  if (!create_kernel_shader(d, dxbc, size, 2, &p->vs)) {
+    why = "the adapter does not take the translated compute shader (barriers in a group of more than 256 threads, or something it lacks)";
+    result = VK_ERROR_FEATURE_NOT_PRESENT;
+    goto fail;
+  }
+  words[1] = p->vs;
+  if (!STATUS_OK(kmt_escape(d, words, sizeof words)) || !words[0]) {
+    why = "the adapter refused the compute pipeline";
+    result = VK_ERROR_FEATURE_NOT_PRESENT;
+    goto fail;
+  }
+  p->pipe = words[0];
+  spv_close(stage.m);
+  *out = p;
+  return VK_SUCCESS;
+fail:
+  if (why) trace(why);
+  if (stage.m) spv_close(stage.m);
+  if (p->vs) {
+    UINT req[2] = {3, p->vs};   /* DestroyShader */
+    kmt_escape(d, req, 8);
+  }
+  vk_free(p);
+  return result;
+}
+
 VKAPI VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t count, const VkComputePipelineCreateInfo *infos, const VkAllocationCallbacks *alloc, VkPipeline *out) {
-  (void)device, (void)cache, (void)infos, (void)alloc;
-  for (UINT i = 0; i < count; ++i) out[i] = VK_NULL_HANDLE;
-  return VK_ERROR_FEATURE_NOT_PRESENT;
+  (void)cache, (void)alloc;
+  VkResult first_error = VK_SUCCESS;
+  for (UINT i = 0; i < count; ++i) {
+    Pipe *p = NULL;
+    VkResult r = create_one_compute_pipeline((Device *)device, &infos[i], &p);
+    out[i] = r == VK_SUCCESS ? (VkPipeline)p : VK_NULL_HANDLE;
+    if (r != VK_SUCCESS && first_error == VK_SUCCESS) first_error = r;
+  }
+  return first_error;
 }
 VKAPI void VKAPI_CALL vkDestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks *alloc) {
   Pipe *p = (Pipe *)pipeline;

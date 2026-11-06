@@ -22,7 +22,7 @@
  * Two passes, because the numbers a shader's resources get (constant buffer slots, texture units) are those of the whole pipeline, not of one shader:
  *   spv_open     parse the module
  *   spv_reflect  find the entry point and the resources it uses (spv_resource_count / spv_resource), the vertex inputs and the outputs
- *   -- the caller numbers the resources of all the stages of a pipeline (SpvResource::slot, ::cb_vec4) --
+ *   -- the caller numbers the resources of all the stages of a pipeline (SpvResource::slot, ::cb_vec4, ::uav) --
  *   spv_emit     translate the entry point into a DXBC container
  *   spv_close
  * Self-contained C: no libc; the allocator is the caller's. */
@@ -56,6 +56,8 @@ typedef struct SpvResource {
   uint32_t cb_vec4;       /* set by the caller: size of the constant buffer in 16-byte registers (at least ceil(bytes / 16)); the same for every stage of a pipeline */
   uint32_t used;
   uint32_t sampler_slot;  /* set by the translator: for a SPV_RES_IMAGE sampled with a separate sampler, the resource index of that sampler (or ~0) */
+  uint32_t readonly;      /* set by the translator: a storage buffer that the shader only reads (NonWritable) */
+  uint32_t uav;           /* set by the caller: a storage buffer is unordered access view u<slot> (read and written) rather than the read-only view t<slot> */
 } SpvResource;
 
 typedef struct SpvModule SpvModule;
@@ -68,6 +70,10 @@ SpvResource *spv_resource(SpvModule *m, uint32_t index);
 uint32_t spv_input_mask(const SpvModule *m);     /* vertex stage: bit n set: location n is read; fragment: the varyings (locations) read */
 uint32_t spv_output_mask(const SpvModule *m);    /* vertex: varyings (locations) written; fragment: colour attachments written */
 uint32_t spv_uses_frag_coord(const SpvModule *m);
+/* Compute stage: the threads of a work group (LocalSize, LocalSizeId, or the WorkgroupSize constant with its specialization; after spv_reflect) and the bytes of Workgroup memory (after
+ * spv_emit). */
+void spv_local_size(const SpvModule *m, uint32_t size[3]);
+uint32_t spv_shared_bytes(const SpvModule *m);
 /* Every constant buffer slot of the pipeline must be declared in every stage, whether the stage uses it or not (the kernel lays the buffers end to end by slot): the size in 16-byte registers. */
 void spv_declare_cb(SpvModule *m, uint32_t slot, uint32_t vec4);
 /* The DXBC container; *out is owned by the module (valid until spv_close). */

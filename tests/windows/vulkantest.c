@@ -54,6 +54,7 @@ FN(vkCmdDraw) FN(vkCmdSetViewport) FN(vkCmdSetScissor) FN(vkCmdCopyImageToBuffer
 FN(vkQueueWaitIdle) FN(vkCreateFence) FN(vkDestroyFence) FN(vkWaitForFences) FN(vkResetFences) FN(vkFlushMappedMemoryRanges) FN(vkCmdClearColorImage) FN(vkCmdFillBuffer)
 FN(vkCmdDrawIndexed) FN(vkCmdBindIndexBuffer) FN(vkCmdCopyBuffer) FN(vkDeviceWaitIdle) FN(vkCmdUpdateBuffer) FN(vkResetCommandBuffer) FN(vkCreateWin32SurfaceKHR) FN(vkDestroySurfaceKHR) FN(vkGetPhysicalDeviceSurfaceSupportKHR) FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
 FN(vkGetPhysicalDeviceSurfaceFormatsKHR) FN(vkGetPhysicalDeviceSurfacePresentModesKHR) FN(vkCreateSwapchainKHR) FN(vkDestroySwapchainKHR) FN(vkGetSwapchainImagesKHR) FN(vkAcquireNextImageKHR) FN(vkQueuePresentKHR)
+FN(vkCreateComputePipelines) FN(vkCmdDispatch) FN(vkCmdDispatchIndirect)
 
 static void *load(VkInstance instance, const char *name) {
   void *p = (void *)pGetInstanceProcAddr(instance, name);
@@ -79,7 +80,7 @@ static void load_all(void) {
   L(vkCreateFence) L(vkDestroyFence) L(vkWaitForFences) L(vkResetFences) L(vkFlushMappedMemoryRanges) L(vkCmdClearColorImage) L(vkCmdFillBuffer) L(vkCmdDrawIndexed) L(vkCmdBindIndexBuffer)
   L(vkCmdCopyBuffer) L(vkDeviceWaitIdle) L(vkCmdUpdateBuffer) L(vkResetCommandBuffer) L(vkCreateWin32SurfaceKHR) L(vkDestroySurfaceKHR) L(vkGetPhysicalDeviceSurfaceSupportKHR)
   L(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) L(vkGetPhysicalDeviceSurfaceFormatsKHR) L(vkGetPhysicalDeviceSurfacePresentModesKHR) L(vkCreateSwapchainKHR) L(vkDestroySwapchainKHR)
-  L(vkGetSwapchainImagesKHR) L(vkAcquireNextImageKHR) L(vkQueuePresentKHR)
+  L(vkGetSwapchainImagesKHR) L(vkAcquireNextImageKHR) L(vkQueuePresentKHR) L(vkCreateComputePipelines) L(vkCmdDispatch) L(vkCmdDispatchIndirect)
 }
 
 static int memory_type(const VkPhysicalDeviceMemoryProperties *mp, unsigned bits, VkMemoryPropertyFlags want) {
@@ -421,6 +422,141 @@ static void test_swapchain(Rig *r) {
   p_vkDestroySurfaceKHR(g_instance, surface, NULL);
 }
 
+/* Compute: storage buffers (one read only), push constants, atomics and signed division (cs_add.comp), then group-shared memory and a barrier with a std430 struct (cs_shared.comp).
+ * In one submission: a dispatch, a copy of what it wrote (done by the CPU: it must see the GPU's results), an indirect dispatch whose group counts come from a buffer. Skipped on an
+ * adapter without compute (no VK_QUEUE_COMPUTE_BIT). */
+static void test_compute(Rig *r) {
+  VkQueueFamilyProperties fam;
+  unsigned nfam = 1;
+  p_vkGetPhysicalDeviceQueueFamilyProperties(r->pd, &nfam, &fam);
+  if (!(fam.queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+    printf("    no compute shaders on this adapter: skipped\n");
+    return;
+  }
+  const VkPhysicalDeviceLimits *l = &r->props.limits;
+  check(l->maxComputeWorkGroupInvocations >= 128 && l->maxComputeSharedMemorySize >= 16384 && l->maxPerStageDescriptorStorageBuffers >= 4 && l->maxComputeWorkGroupCount[0] >= 65535,
+        "compute limits (the minimums of Vulkan 1.0)");
+  VkDescriptorSetLayoutBinding bindings[2];
+  memset(bindings, 0, sizeof bindings);
+  for (unsigned i = 0; i < 2; ++i) bindings[i].binding = i, bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bindings[i].descriptorCount = 1, bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dl.bindingCount = 2, dl.pBindings = bindings;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  check(p_vkCreateDescriptorSetLayout(r->dev, &dl, NULL, &set_layout) == VK_SUCCESS, "a set layout of storage buffers");
+  VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+  VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pl.setLayoutCount = 1, pl.pSetLayouts = &set_layout, pl.pushConstantRangeCount = 1, pl.pPushConstantRanges = &push;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  check(p_vkCreatePipelineLayout(r->dev, &pl, NULL, &layout) == VK_SUCCESS, "a compute pipeline layout");
+  VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+  VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 2, dpi.poolSizeCount = 1, dpi.pPoolSizes = &ps;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  check(p_vkCreateDescriptorPool(r->dev, &dpi, NULL, &pool) == VK_SUCCESS, "a descriptor pool");
+  VkDescriptorSetLayout layouts[2] = {set_layout, set_layout};
+  VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 2, dai.pSetLayouts = layouts;
+  VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  check(p_vkAllocateDescriptorSets(r->dev, &dai, sets) == VK_SUCCESS, "descriptor sets");
+
+  /* the buffers: cs_add's input and output, a copy of the output, the indirect group counts; cs_shared's items and sums */
+  VkDeviceMemory mem[6];
+  void *map[6];
+  const VkDeviceSize sizes[6] = {8 + 16 * 4, 36 + 16 * 4, 36 + 16 * 4, 16, 32 * 32, 2 * 4};
+  const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+  VkBuffer buf[6];
+  for (unsigned i = 0; i < 6; ++i) buf[i] = make_buffer(r, sizes[i], usage, &mem[i], &map[i]);
+  float *src = map[0], *items = map[4];
+  unsigned *dst = map[1], *copy = map[2], *groups = map[3];
+  src[0] = 0.25f, src[1] = 0.5f;
+  for (unsigned i = 0; i < 16; ++i) {
+    src[2 + i] = i * 1.5f - 3.0f;
+    ((float *)dst)[9 + i] = -7.0f;
+  }
+  dst[0] = 0;
+  groups[0] = 1, groups[1] = 1, groups[2] = 1;
+  float expected_sum[2] = {0, 0};
+  for (unsigned i = 0; i < 32; ++i) {
+    const float f[8] = {0.5f * i, 1.0f + 0.25f * (i % 5), 0.1f * (i % 3), 0.01f * i, 1.0f, 2.0f + i, 3.0f, 0.5f * (i % 4)};
+    memcpy(items + 8 * i, f, sizeof f);
+    expected_sum[i / 16] += f[0] + f[1] * f[2] + f[3] + f[5] + f[7] * 2.0f;
+  }
+  VkDescriptorBufferInfo infos[4] = {{buf[0], 0, VK_WHOLE_SIZE}, {buf[1], 0, VK_WHOLE_SIZE}, {buf[4], 0, VK_WHOLE_SIZE}, {buf[5], 0, VK_WHOLE_SIZE}};
+  VkWriteDescriptorSet writes[2];
+  memset(writes, 0, sizeof writes);
+  for (unsigned s = 0; s < 2; ++s) {
+    writes[s].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, writes[s].dstSet = sets[s], writes[s].dstBinding = 0, writes[s].descriptorCount = 2;
+    writes[s].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, writes[s].pBufferInfo = &infos[2 * s];
+  }
+  p_vkUpdateDescriptorSets(r->dev, 2, writes, 0, NULL);
+
+  VkShaderModule modules[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  VkPipeline pipes[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  const unsigned *code[2] = {add_comp, shared_comp};
+  const size_t code_size[2] = {sizeof add_comp, sizeof shared_comp};
+  for (unsigned k = 0; k < 2; ++k) {
+    VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = code_size[k], smi.pCode = code[k];
+    check(p_vkCreateShaderModule(r->dev, &smi, NULL, &modules[k]) == VK_SUCCESS, "a compute shader module");
+    VkComputePipelineCreateInfo cpi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, cpi.stage.module = modules[k], cpi.stage.pName = "main";
+    cpi.layout = layout;
+    VkResult res = p_vkCreateComputePipelines(r->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipes[k]);
+    check(res == VK_SUCCESS && pipes[k], k == 0 ? "vkCreateComputePipelines (storage buffers, atomics)" : "vkCreateComputePipelines (group-shared memory, a barrier)");
+  }
+  if (pipes[0] && pipes[1]) {
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    p_vkResetCommandBuffer(r->cb, 0);
+    p_vkBeginCommandBuffer(r->cb, &cbi);
+    p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[0]);
+    p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &sets[0], 0, NULL);
+    const struct { float scale; unsigned count; } pc = {2.0f, 13};
+    p_vkCmdPushConstants(r->cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    p_vkCmdDispatch(r->cb, 2, 1, 1);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    p_vkCmdPipelineBarrier(r->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    VkBufferCopy region = {0, 0, sizes[1]};
+    p_vkCmdCopyBuffer(r->cb, buf[1], buf[2], 1, &region);
+    p_vkCmdDispatchIndirect(r->cb, buf[3], 0);   /* (one more group: threads 0 .. 7 add 1 .. 8 again) */
+    p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[1]);
+    p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &sets[1], 0, NULL);
+    p_vkCmdDispatch(r->cb, 2, 1, 1);
+    p_vkEndCommandBuffer(r->cb);
+    submit_and_wait(r);
+    unsigned wrong = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+      const float want = i < 13 ? (i * 1.5f - 3.0f) * 2.0f + 0.5f : -7.0f;
+      const float got = ((const float *)dst)[9 + i];
+      wrong += got < want - 1e-4f || got > want + 1e-4f;
+    }
+    for (unsigned i = 0; i < 8; ++i) {
+      const int v = (int)i - 5;
+      wrong += (int)dst[1 + i] != (v / 3) * 100 + ((v % 3) + 3) % 3;
+    }
+    check(wrong == 0, "a dispatch writes its storage buffer (cs_add: arithmetic, signed division and modulo)");
+    check(copy[0] == 136 && dst[0] == 136 + 36, "atomicAdd, a copy made after the dispatch sees what it wrote, an indirect dispatch");
+    const float *sums = map[5];
+    check(sums[0] > expected_sum[0] - 1e-2f && sums[0] < expected_sum[0] + 1e-2f && sums[1] > expected_sum[1] - 1e-2f && sums[1] < expected_sum[1] + 1e-2f,
+          "group-shared memory and a barrier (cs_shared: the sums of two groups)");
+    unsigned wrong_w = 0;
+    for (unsigned i = 0; i < 32; ++i) wrong_w += items[8 * i + 3] != (float)(i % 16);
+    check(wrong_w == 0, "a store into a member of a struct in a runtime array");
+    if (wrong || copy[0] != 136) printf("    cs_add: total %u (copy %u), b[0] %g, q[0] %d; cs_shared: sums %g %g (want %g %g)\n", dst[0], copy[0], ((const float *)dst)[9], (int)dst[1], sums[0], sums[1], expected_sum[0], expected_sum[1]);
+  }
+  for (unsigned k = 0; k < 2; ++k) {
+    if (pipes[k]) p_vkDestroyPipeline(r->dev, pipes[k], NULL);
+    if (modules[k]) p_vkDestroyShaderModule(r->dev, modules[k], NULL);
+  }
+  for (unsigned i = 0; i < 6; ++i) {
+    p_vkDestroyBuffer(r->dev, buf[i], NULL);
+    p_vkFreeMemory(r->dev, mem[i], NULL);
+  }
+  p_vkDestroyDescriptorPool(r->dev, pool, NULL);
+  p_vkDestroyPipelineLayout(r->dev, layout, NULL);
+  p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
+}
+
 static void test_device(VkPhysicalDevice pd, unsigned index) {
   Rig r;
   memset(&r, 0, sizeof r);
@@ -639,6 +775,8 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   }
 
   test_depth_and_push(&r, &s);
+  /* (before the swapchain: on virgl a present loses the context without a word - the GPU work after it fails) */
+  test_compute(&r);
   test_swapchain(&r);
 
   /* copies and clears that need no GPU */

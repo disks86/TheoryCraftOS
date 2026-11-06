@@ -27,11 +27,13 @@
  *    predecessors is wrapped in a second loop that runs once, so that `continue` still reaches the continue construct. A function with more than one return runs inside a
  *    loop that runs once too. Phi nodes are variables written on the edges.
  *  - Vulkan's clip space has Y down, the kernel's Direct3D shaders Y up (it flips them): the position's Y is negated when it is written.
- *  - Resource numbering comes from the caller (SpvResource::slot, ::cb_vec4): a uniform or push constant block is a constant buffer cb<slot> of cb_vec4 registers; a sampled image is
- *    texture t<slot> with sampler s<slot>. Constant buffers are std140 / std430 laid out with the offsets of the module (Offset, ArrayStride, MatrixStride decorations); a column-major
- *    matrix is a register per column.
- * Not taken (spv_error says which): double precision, 64-bit integers, atomics and storage images / buffers, signed division, tessellation / geometry stages, a runtime array,
- * dynamic indexing of anything but arrays in uniform blocks, row-major matrices, subgroup operations, OpSpecConstantOp. */
+ *  - Resource numbering comes from the caller (SpvResource::slot, ::cb_vec4, ::uav): a uniform or push constant block is a constant buffer cb<slot> of cb_vec4 registers; a sampled image
+ *    is texture t<slot> with sampler s<slot>; a storage buffer is the raw buffer u<slot> (read and written) or t<slot> (read only). Constant buffers are std140 / std430 laid out with the
+ *    offsets of the module (Offset, ArrayStride, MatrixStride decorations); a column-major matrix is a register per column.
+ *  - Memory (storage buffers and Workgroup variables) is addressed by bytes: an access chain into it is a constant offset plus, for dynamic indices, an integer in a temporary; a load is
+ *    ld_raw, a store store_raw, an atomic imm_atomic_*. All the Workgroup variables of a compute shader share the group-shared memory g0, one after the other.
+ * Not taken (spv_error says which): double precision, 64-bit integers, storage images and texel buffers, compare-exchange atomics, the length of a runtime array, tessellation /
+ * geometry stages, dynamic indexing of anything held in registers, row-major matrices, subgroup operations, OpSpecConstantOp. */
 #include "spirv.h"
 
 typedef unsigned long long sp_u64;
@@ -64,12 +66,15 @@ enum {
   OpShiftRightArithmetic, OpShiftLeftLogical, OpBitwiseOr, OpBitwiseXor, OpBitwiseAnd, OpNot, OpDPdx = 207, OpDPdy, OpFwidth, OpDPdxFine, OpDPdyFine, OpFwidthFine, OpDPdxCoarse, OpDPdyCoarse,
   OpFwidthCoarse, OpPhi = 245, OpLoopMerge, OpSelectionMerge, OpLabel, OpBranch, OpBranchConditional, OpSwitch, OpKill, OpReturn, OpReturnValue, OpUnreachable,
   OpSourceContinued = 2, OpSource = 3, OpSourceExtension = 4, OpString = 7, OpLine = 8, OpNoLine = 317, OpCapability = 17, OpMemoryModel = 14, OpUndef = 1, OpNop = 0, OpMemberName = 6,
-  OpDecorationGroup = 73, OpExtension = 10, OpTerminateInvocation = 4416, OpDemoteToHelperInvocation = 5380, OpModuleProcessed = 330
+  OpDecorationGroup = 73, OpExtension = 10, OpTerminateInvocation = 4416, OpDemoteToHelperInvocation = 5380, OpModuleProcessed = 330, OpExecutionModeId = 331, OpArrayLength = 68,
+  OpControlBarrier = 224, OpMemoryBarrier, OpAtomicLoad = 227, OpAtomicStore, OpAtomicExchange, OpAtomicCompareExchange, OpAtomicCompareExchangeWeak, OpAtomicIIncrement, OpAtomicIDecrement,
+  OpAtomicIAdd, OpAtomicISub, OpAtomicSMin, OpAtomicUMin, OpAtomicSMax, OpAtomicUMax, OpAtomicAnd, OpAtomicOr, OpAtomicXor
 };
 enum { DecoBlock = 2, DecoBufferBlock = 3, DecoRowMajor = 4, DecoColMajor = 5, DecoArrayStride = 6, DecoMatrixStride = 7, DecoBuiltIn = 11, DecoFlat = 14, DecoLocation = 30, DecoComponent = 31,
-       DecoBinding = 33, DecoDescriptorSet = 34, DecoOffset = 35, DecoSpecId = 1 };
+       DecoBinding = 33, DecoDescriptorSet = 34, DecoOffset = 35, DecoSpecId = 1, DecoNonWritable = 24 };
 enum { BuiltInPosition = 0, BuiltInPointSize = 1, BuiltInClipDistance = 3, BuiltInCullDistance = 4, BuiltInVertexId = 5, BuiltInInstanceId = 6, BuiltInFragCoord = 15, BuiltInPointCoord = 16,
-       BuiltInFrontFacing = 17, BuiltInFragDepth = 22, BuiltInVertexIndex = 42, BuiltInInstanceIndex = 43 };
+       BuiltInFrontFacing = 17, BuiltInFragDepth = 22, BuiltInVertexIndex = 42, BuiltInInstanceIndex = 43, BuiltInNumWorkgroups = 24, BuiltInWorkgroupSize = 25, BuiltInWorkgroupId = 26,
+       BuiltInLocalInvocationId = 27, BuiltInGlobalInvocationId = 28, BuiltInLocalInvocationIndex = 29 };
 enum { SCUniformConstant = 0, SCInput = 1, SCUniform = 2, SCOutput = 3, SCWorkgroup = 4, SCPrivate = 6, SCFunction = 7, SCPushConstant = 9, SCStorageBuffer = 12 };
 
 /* ---- DXBC numbers ------------------------------------------------------------------------------------------------------------------------------------------------------ */
@@ -80,11 +85,16 @@ enum {
   D_RESINFO = 61, D_RET = 62, D_ROUND_NE = 64, D_ROUND_NI = 65, D_ROUND_PI = 66, D_ROUND_Z = 67, D_RSQ = 68, D_SAMPLE = 69, D_SAMPLE_C = 70, D_SAMPLE_C_LZ = 71, D_SAMPLE_L = 72, D_SAMPLE_D = 73,
   D_SAMPLE_B = 74, D_SQRT = 75, D_SINCOS = 77, D_UDIV = 78, D_ULT = 79, D_UGE = 80, D_UMUL = 81, D_UMAX = 83, D_UMIN = 84, D_USHR = 85, D_UTOF = 86, D_XOR = 87, D_DDX = 11, D_DDY = 12,
   D_DCL_RESOURCE = 88, D_DCL_CB = 89, D_DCL_SAMPLER = 90, D_DCL_INPUT = 95, D_DCL_INPUT_SGV = 96, D_DCL_INPUT_PS = 98, D_DCL_INPUT_PS_SIV = 100, D_DCL_OUTPUT = 101, D_DCL_OUTPUT_SIV = 103,
-  D_DCL_TEMPS = 104, D_DCL_GLOBAL_FLAGS = 106
+  D_DCL_TEMPS = 104, D_DCL_GLOBAL_FLAGS = 106, D_DCL_THREAD_GROUP = 155, D_DCL_UAV_RAW = 157, D_DCL_TGSM_RAW = 159, D_DCL_RESOURCE_RAW = 161, D_LD_RAW = 165, D_STORE_RAW = 166,
+  D_IMM_ATOMIC_IADD = 180, D_IMM_ATOMIC_AND, D_IMM_ATOMIC_OR, D_IMM_ATOMIC_XOR, D_IMM_ATOMIC_EXCH, D_IMM_ATOMIC_CMP_EXCH, D_IMM_ATOMIC_IMAX, D_IMM_ATOMIC_IMIN, D_IMM_ATOMIC_UMAX,
+  D_IMM_ATOMIC_UMIN, D_SYNC = 190
 };
 
 /* ---- the operand and instruction lists ------------------------------------------------------------------------------------------------------------------------------- */
-enum { OF_TEMP = 0, OF_IN = 1, OF_OUT = 2, OF_IMM = 4, OF_CB = 8, OF_SAMP = 6, OF_RES = 7, OF_NULL = 13, OF_NONE = 255 };
+enum { OF_TEMP = 0, OF_IN = 1, OF_OUT = 2, OF_IMM = 4, OF_CB = 8, OF_SAMP = 6, OF_RES = 7, OF_NULL = 13, OF_UAV = 30, OF_TGSM = 31, OF_THREAD_ID = 32, OF_GROUP_ID = 33, OF_THREAD_IN_GROUP = 34,
+       OF_THREAD_INDEX = 36, OF_NONE = 255 };
+/* (the compute shader's system values are operands of their own, with no register number) */
+#define IS_SYSTEM_FILE(f) ((f) >= OF_THREAD_ID && (f) <= OF_THREAD_INDEX)
 enum { CLS_F = 0, CLS_I = 1, CLS_U = 2, CLS_B = 3 };
 
 typedef struct SpOp {
@@ -122,6 +132,9 @@ typedef struct Val {
   uint32_t dyn_reg, dyn_on, dyn_comp;     /* constant buffer: a dynamic register offset (integer in a virtual temporary) */
   uint32_t image_res, image_unit_off;     /* an image / sampler / sampled image: the resource and the element */
   uint32_t sampler_res;
+  /* a pointer into memory (a storage buffer or Workgroup memory): byte_off and the dynamic offset dyn_* are in bytes */
+  sp_u8 is_mem, mem_file, res_array, pad2;   /* mem_file: OF_UAV, OF_RES (read only) or OF_TGSM; res_array: the next index picks the buffer of an array of storage buffers */
+  uint32_t mem_idx;                       /* the register: u# / t# / g# */
 } Val;
 
 enum { T_VOID = 1, T_BOOL, T_INT, T_FLOAT, T_VEC, T_MAT, T_ARRAY, T_STRUCT, T_PTR, T_IMAGE, T_SAMPLER, T_SAMPLED, T_FUNC };
@@ -197,7 +210,10 @@ struct SpvModule {
   uint32_t res_var[SP_MAX_RES];
   uint32_t nres;
   uint32_t input_mask, output_mask, frag_coord, uses_vertex_id, uses_instance_id, depth_replacing;
-  uint32_t local_size[3];
+  uint32_t local_size[3], local_size_id[3];
+  uint32_t shared_bytes;    /* Workgroup variables, all in g0 */
+  uint32_t uav_used, srv_used, system_used;   /* registers u# / t# of storage buffers used, compute system values (bit OF_* - OF_THREAD_ID) */
+  uint32_t uses_memory;     /* raw buffers: Shader Model 5 */
   /* functions */
   Func *funcs;
   uint32_t nfuncs;
@@ -397,6 +413,56 @@ static uint32_t block_bytes(Mod *m, uint32_t tid, uint32_t owner, uint32_t membe
         deco_find(m, tid, i, DecoOffset, &off);
         uint32_t size = block_bytes(m, t->mem[i], tid, i);
         if (off + size > end) end = off + size;
+      }
+      return end;
+    }
+    default: return 0;
+  }
+}
+
+/* The layout of memory: what the decorations say (storage buffers), or, where there are none (Workgroup variables), the members one after the other, 4-byte scalars, arrays and
+ * matrix columns as long as their elements. */
+static uint32_t mem_size(Mod *m, uint32_t tid, uint32_t owner, uint32_t member);
+static uint32_t mem_array_stride(Mod *m, uint32_t tid) {
+  Type *t = get_type(m, tid);
+  uint32_t stride = 0;
+  if (!t || deco_find(m, tid, 0xFFFFFFFFu, DecoArrayStride, &stride)) return stride;
+  return mem_size(m, t->elem, 0, 0);
+}
+/* The stride of the columns of a matrix of type `tid` (0 from the caller: none was decorated). */
+static uint32_t mem_column_stride(Mod *m, uint32_t tid, uint32_t mstride) {
+  Type *t = get_type(m, tid);
+  Type *col = t ? get_type(m, t->elem) : 0;
+  return mstride ? mstride : col ? 4 * col->count : 16;
+}
+static uint32_t mem_member_offset(Mod *m, uint32_t tid, uint32_t index) {
+  Type *t = get_type(m, tid);
+  uint32_t off = 0, end = 0;
+  if (deco_find(m, tid, index, DecoOffset, &off)) return off;
+  for (uint32_t i = 0; t && i < index && i < t->nmem; ++i) {
+    uint32_t at = end;
+    deco_find(m, tid, i, DecoOffset, &at);
+    end = at + mem_size(m, t->mem[i], tid, i);
+  }
+  return end;
+}
+static uint32_t mem_size(Mod *m, uint32_t tid, uint32_t owner, uint32_t member) {
+  Type *t = get_type(m, tid);
+  if (!t) return 0;
+  switch (t->kind) {
+    case T_BOOL: case T_INT: case T_FLOAT: return 4;
+    case T_VEC: return 4 * t->count;
+    case T_MAT: {
+      uint32_t stride = 0;
+      if (owner) deco_find(m, owner, member, DecoMatrixStride, &stride);
+      return mem_column_stride(m, tid, stride) * t->count;
+    }
+    case T_ARRAY: return mem_array_stride(m, tid) * t->count;   /* (a runtime array: 0) */
+    case T_STRUCT: {
+      uint32_t end = 0;
+      for (uint32_t i = 0; i < t->nmem; ++i) {
+        uint32_t e = mem_member_offset(m, tid, i) + mem_size(m, t->mem[i], tid, i);
+        if (e > end) end = e;
       }
       return end;
     }
