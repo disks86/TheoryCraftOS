@@ -133,8 +133,10 @@ void NetworkStack::poll() {
     if (ours && coalescer_.offer(f, received)) continue;
     handle_frame(f, received);
   }
-  flush_coalesced();
   saturated_ = i == kFramesPerPoll;
+  // A poll that stopped at its limit is followed by another at once (NetworkStackSet): the run may go on in it. Otherwise it is handed on now,
+  // so coalescing never holds a segment back for longer than the frames already waiting take.
+  if (!saturated_) flush_coalesced();
 
   if (follow_link_) {
     const bool up = nic_.link_up();
@@ -169,6 +171,7 @@ void NetworkStack::deliver_looped() {
   }
 }
 
+// (also called before anything that must see the frames received so far in order: a send, a timer, another poll that is not straight after)
 void NetworkStack::flush_coalesced() {
   if (!coalescer_.holding()) return;
   hardware::ReceivedFrame checked;  // (every piece was checked before it joined)

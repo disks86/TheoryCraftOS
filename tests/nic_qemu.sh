@@ -3,7 +3,7 @@
 # driver), `igb` (Intel 82576, the igb/igc driver) and `usb-net` on xHCI (CDC-ECM, after skipping its RNDIS configuration). Every netdev's
 # traffic is captured with filter-dump, and a NIC passes when its capture holds a whole DHCP exchange (Discover, Offer, Request, ACK): the
 # driver sent and received. The guest's UDP checksums must be right (the PCI drivers offload them), and the two PCI controllers must run on
-# MSI interrupts. Needs qemu-system-x86_64, OVMF, tcpdump and a configured build directory (default: build). Not part of
+# MSI-X interrupts with several RSS receive queues. Needs qemu-system-x86_64, OVMF, tcpdump and a configured build directory (default: build). Not part of
 # run_host_tests.sh because it boots a VM.
 # Usage: tests/nic_qemu.sh [build-dir] [seconds]
 set -uo pipefail
@@ -44,7 +44,7 @@ for n in "n1 e1000e 52:54:00:00:00:e1 82574L" "n2 igb 52:54:00:00:00:1b 82576" "
   # the PCI controllers take MSI (QEMU's e1000e and igb have it); the USB adapter is polled
   mode=$(grep -a "Network:   .*$4" "$work/debugcon.log" | head -1)
   if [ "$4" != USB ] && [[ "$mode" != *"interrupts (MSI"* ]]; then echo "$2: FAILED (not interrupt driven: ${mode:-no line})"; failed=1; continue; fi
-  if [ "$4" = 82576 ] && [[ "$mode" != *"MSI-X"* ]]; then echo "$2: FAILED (no MSI-X receive queues: $mode)"; failed=1; continue; fi
+  if [ "$4" != USB ] && [[ "$mode" != *"MSI-X"* ]]; then echo "$2: FAILED (no MSI-X receive queues: $mode)"; failed=1; continue; fi
   echo "$2: DHCP done, $good UDP checksums right${mode:+, ${mode##*: }}"
 done
 exit $failed

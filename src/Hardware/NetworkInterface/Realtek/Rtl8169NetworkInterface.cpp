@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/NetworkInterface/Realtek/Rtl8169NetworkInterface.hpp"
+#include "Hardware/NetworkInterface/TcpSegmentation.hpp"
 #include "Kernel/Delay.hpp"
 
 namespace hardware {
@@ -52,6 +53,8 @@ constexpr uint32_t kRxProtoUdp = 1u << 18, kRxProtoTcp = 1u << 17, kRxProtoMask 
 // Transmit checksums: the RTL8169 family in opts1 (TD0), every later chip in opts2 (TD1) with the transport header's offset.
 constexpr uint32_t kTd0Tcp = 1u << 16, kTd0Udp = 1u << 17, kTd0Ip = 1u << 18;
 constexpr uint32_t kTd1Ipv4 = 1u << 29, kTd1Tcp = 1u << 30, kTd1Udp = 1u << 31, kTd1TransportShift = 18, kTd1TransportMax = 0x3FF;
+// Segmentation ("giant send", r8169's rtl8169_tso_csum_v2): opts1 says IPv4 and where the TCP header starts (7 bits), opts2 the MSS (11 bits).
+constexpr uint32_t kTd1GiantSendIpv4 = 1u << 26, kTd1GiantTcpShift = 18, kTd1GiantTcpMax = 0x7F, kTd1MssShift = 18, kTd1MssMax = 0x7FF;
 constexpr uint32_t kCrcLength = 4;
 
 constexpr uint32_t kRxFifoThreshold = 7u << 13, kRxDmaBurst = 7u << 8, kRx128Int = 1u << 15, kRxMulti = 1u << 14, kRxEarlyOff = 1u << 11, kRxFetch8125 = 8u << 27;
@@ -60,56 +63,56 @@ constexpr uint32_t kRxOld = kRxFifoThreshold | kRxDmaBurst, kRxDefault = kRx128I
 
 // r8169's rtl_chip_infos, most specific first. (The mac versions it gives them are in the comments.)
 constexpr RtlChip kChips[] = {
-    {0x7CF, 0x64A, RtlFamily::Rtl8126, kRx8125, true, true, "Realtek RTL8126A"},    // 70
-    {0x7CF, 0x649, RtlFamily::Rtl8126, kRx8125, true, true, "Realtek RTL8126A"},    // 69
-    {0x7CF, 0x688, RtlFamily::Rtl8125, kRx8125, true, true, "Realtek RTL8125D"},    // 64
-    {0x7CF, 0x641, RtlFamily::Rtl8125, kRx8125, true, true, "Realtek RTL8125B"},    // 63
-    {0x7CF, 0x609, RtlFamily::Rtl8125, kRx8125, true, true, "Realtek RTL8125A"},    // 61
-    {0x7C8, 0x608, RtlFamily::Rtl8125, kRx8125, true, true, "Realtek RTL8125A"},    // 60
-    {0x7CF, 0x54B, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8117"},    // 52
-    {0x7CF, 0x54A, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8117"},    // 52
-    {0x7C8, 0x500, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8168EP"},  // 49-51
-    {0x7C8, 0x540, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8168H"},   // 45, 46
-    {0x7CF, 0x5C8, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8411B"},   // 44
-    {0x7CF, 0x509, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8168GU"},  // 42
-    {0x7CF, 0x4C1, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8168G"},   // 41
-    {0x7CF, 0x4C0, RtlFamily::Rtl8168, kRx8168g, true, true, "Realtek RTL8168G"},   // 40
-    {0x7C8, 0x488, RtlFamily::Rtl8168, kRx8168c, true, false, "Realtek RTL8411"},   // 38
-    {0x7CF, 0x481, RtlFamily::Rtl8168, kRx8168c, true, false, "Realtek RTL8168F"},  // 36
-    {0x7CF, 0x480, RtlFamily::Rtl8168, kRx8168c, true, false, "Realtek RTL8168F"},  // 35
-    {0x7C8, 0x2C8, RtlFamily::Rtl8168, kRx8168c, true, false, "Realtek RTL8168E-VL"},  // 34
-    {0x7CF, 0x2C1, RtlFamily::Rtl8168, kRxDefault, false, false, "Realtek RTL8168E"},  // 32
-    {0x7C8, 0x2C0, RtlFamily::Rtl8168, kRxDefault, false, false, "Realtek RTL8168E"},  // 33
-    {0x7CF, 0x281, RtlFamily::Rtl8168, kRxDefault, false, false, "Realtek RTL8168D"},  // 25
-    {0x7C8, 0x280, RtlFamily::Rtl8168, kRxDefault, false, false, "Realtek RTL8168D"},  // 26
-    {0x7CF, 0x28A, RtlFamily::Rtl8168, kRxDefault, false, false, "Realtek RTL8168DP"},  // 28
-    {0x7CF, 0x28B, RtlFamily::Rtl8168, kRxDefault, false, false, "Realtek RTL8168DP"},  // 31
-    {0x7CF, 0x3C9, RtlFamily::Rtl8168, kRx8168c, false, false, "Realtek RTL8168C"},    // 23
-    {0x7CF, 0x3C8, RtlFamily::Rtl8168, kRx8168c, false, false, "Realtek RTL8168C"},    // 18
-    {0x7C8, 0x3C8, RtlFamily::Rtl8168, kRx8168c, false, false, "Realtek RTL8168CP"},   // 24
-    {0x7CF, 0x3C0, RtlFamily::Rtl8168, kRx8168c, false, false, "Realtek RTL8168C"},    // 19
-    {0x7CF, 0x3C2, RtlFamily::Rtl8168, kRx8168c, false, false, "Realtek RTL8168C"},    // 20
-    {0x7CF, 0x3C3, RtlFamily::Rtl8168, kRx8168c, false, false, "Realtek RTL8168C"},    // 21
-    {0x7C8, 0x3C0, RtlFamily::Rtl8168, kRx8168c, false, false, "Realtek RTL8168CP"},   // 22
-    {0x7C8, 0x380, RtlFamily::Rtl8168, kRxOld, false, false, "Realtek RTL8168B"},      // 17
-    {0x7C8, 0x300, RtlFamily::Rtl8168, kRxOld, false, false, "Realtek RTL8168B"},      // 11
-    {0x7C8, 0x448, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8106E"},  // 39
-    {0x7C8, 0x440, RtlFamily::Rtl8101, kRxDefault, true, false, "Realtek RTL8402"},    // 37
-    {0x7CF, 0x409, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8105E"},  // 29
-    {0x7C8, 0x408, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8105E"},  // 30
-    {0x7CF, 0x349, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8102E"},  // 08
-    {0x7CF, 0x249, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8102E"},  // 08
-    {0x7CF, 0x348, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8102E"},  // 07
-    {0x7CF, 0x248, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8102E"},  // 07
-    {0x7CF, 0x240, RtlFamily::Rtl8101, kRxOld, false, false, "Realtek RTL8101E"},      // 14
-    {0x7C8, 0x348, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8102E"},  // 09
-    {0x7C8, 0x248, RtlFamily::Rtl8101, kRxDefault, false, false, "Realtek RTL8102E"},  // 09
-    {0x7C8, 0x340, RtlFamily::Rtl8101, kRxOld, false, false, "Realtek RTL8101E"},      // 10
-    {0xFC8, 0x980, RtlFamily::Rtl8169, kRxOld, false, false, "Realtek RTL8169sc/8110sc"},  // 06
-    {0xFC8, 0x180, RtlFamily::Rtl8169, kRxOld, false, false, "Realtek RTL8169sb/8110sb"},  // 05
-    {0xFC8, 0x100, RtlFamily::Rtl8169, kRxOld, false, false, "Realtek RTL8169s"},          // 04
-    {0xFC8, 0x040, RtlFamily::Rtl8169, kRxOld, false, false, "Realtek RTL8169s"},          // 03
-    {0xFC8, 0x008, RtlFamily::Rtl8169, kRxOld, false, false, "Realtek RTL8169"},           // 02
+    {0x7CF, 0x64A, RtlFamily::Rtl8126, kRx8125, true, true, true, "Realtek RTL8126A"},    // 70
+    {0x7CF, 0x649, RtlFamily::Rtl8126, kRx8125, true, true, true, "Realtek RTL8126A"},    // 69
+    {0x7CF, 0x688, RtlFamily::Rtl8125, kRx8125, true, true, true, "Realtek RTL8125D"},    // 64
+    {0x7CF, 0x641, RtlFamily::Rtl8125, kRx8125, true, true, true, "Realtek RTL8125B"},    // 63
+    {0x7CF, 0x609, RtlFamily::Rtl8125, kRx8125, true, true, true, "Realtek RTL8125A"},    // 61
+    {0x7C8, 0x608, RtlFamily::Rtl8125, kRx8125, true, true, true, "Realtek RTL8125A"},    // 60
+    {0x7CF, 0x54B, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8117"},    // 52
+    {0x7CF, 0x54A, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8117"},    // 52
+    {0x7C8, 0x500, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8168EP"},  // 49-51
+    {0x7C8, 0x540, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8168H"},   // 45, 46
+    {0x7CF, 0x5C8, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8411B"},   // 44
+    {0x7CF, 0x509, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8168GU"},  // 42
+    {0x7CF, 0x4C1, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8168G"},   // 41
+    {0x7CF, 0x4C0, RtlFamily::Rtl8168, kRx8168g, true, true, true, "Realtek RTL8168G"},   // 40
+    {0x7C8, 0x488, RtlFamily::Rtl8168, kRx8168c, true, false, true, "Realtek RTL8411"},   // 38
+    {0x7CF, 0x481, RtlFamily::Rtl8168, kRx8168c, true, false, true, "Realtek RTL8168F"},  // 36
+    {0x7CF, 0x480, RtlFamily::Rtl8168, kRx8168c, true, false, true, "Realtek RTL8168F"},  // 35
+    {0x7C8, 0x2C8, RtlFamily::Rtl8168, kRx8168c, true, false, false, "Realtek RTL8168E-VL"},  // 34
+    {0x7CF, 0x2C1, RtlFamily::Rtl8168, kRxDefault, false, false, true, "Realtek RTL8168E"},  // 32
+    {0x7C8, 0x2C0, RtlFamily::Rtl8168, kRxDefault, false, false, true, "Realtek RTL8168E"},  // 33
+    {0x7CF, 0x281, RtlFamily::Rtl8168, kRxDefault, false, false, true, "Realtek RTL8168D"},  // 25
+    {0x7C8, 0x280, RtlFamily::Rtl8168, kRxDefault, false, false, true, "Realtek RTL8168D"},  // 26
+    {0x7CF, 0x28A, RtlFamily::Rtl8168, kRxDefault, false, false, true, "Realtek RTL8168DP"},  // 28
+    {0x7CF, 0x28B, RtlFamily::Rtl8168, kRxDefault, false, false, true, "Realtek RTL8168DP"},  // 31
+    {0x7CF, 0x3C9, RtlFamily::Rtl8168, kRx8168c, false, false, false, "Realtek RTL8168C"},    // 23
+    {0x7CF, 0x3C8, RtlFamily::Rtl8168, kRx8168c, false, false, false, "Realtek RTL8168C"},    // 18
+    {0x7C8, 0x3C8, RtlFamily::Rtl8168, kRx8168c, false, false, false, "Realtek RTL8168CP"},   // 24
+    {0x7CF, 0x3C0, RtlFamily::Rtl8168, kRx8168c, false, false, false, "Realtek RTL8168C"},    // 19
+    {0x7CF, 0x3C2, RtlFamily::Rtl8168, kRx8168c, false, false, false, "Realtek RTL8168C"},    // 20
+    {0x7CF, 0x3C3, RtlFamily::Rtl8168, kRx8168c, false, false, false, "Realtek RTL8168C"},    // 21
+    {0x7C8, 0x3C0, RtlFamily::Rtl8168, kRx8168c, false, false, false, "Realtek RTL8168CP"},   // 22
+    {0x7C8, 0x380, RtlFamily::Rtl8168, kRxOld, false, false, false, "Realtek RTL8168B"},      // 17
+    {0x7C8, 0x300, RtlFamily::Rtl8168, kRxOld, false, false, false, "Realtek RTL8168B"},      // 11
+    {0x7C8, 0x448, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8106E"},  // 39
+    {0x7C8, 0x440, RtlFamily::Rtl8101, kRxDefault, true, false, false, "Realtek RTL8402"},    // 37
+    {0x7CF, 0x409, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8105E"},  // 29
+    {0x7C8, 0x408, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8105E"},  // 30
+    {0x7CF, 0x349, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8102E"},  // 08
+    {0x7CF, 0x249, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8102E"},  // 08
+    {0x7CF, 0x348, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8102E"},  // 07
+    {0x7CF, 0x248, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8102E"},  // 07
+    {0x7CF, 0x240, RtlFamily::Rtl8101, kRxOld, false, false, false, "Realtek RTL8101E"},      // 14
+    {0x7C8, 0x348, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8102E"},  // 09
+    {0x7C8, 0x248, RtlFamily::Rtl8101, kRxDefault, false, false, false, "Realtek RTL8102E"},  // 09
+    {0x7C8, 0x340, RtlFamily::Rtl8101, kRxOld, false, false, false, "Realtek RTL8101E"},      // 10
+    {0xFC8, 0x980, RtlFamily::Rtl8169, kRxOld, false, false, false, "Realtek RTL8169sc/8110sc"},  // 06
+    {0xFC8, 0x180, RtlFamily::Rtl8169, kRxOld, false, false, false, "Realtek RTL8169sb/8110sb"},  // 05
+    {0xFC8, 0x100, RtlFamily::Rtl8169, kRxOld, false, false, false, "Realtek RTL8169s"},          // 04
+    {0xFC8, 0x040, RtlFamily::Rtl8169, kRxOld, false, false, false, "Realtek RTL8169s"},          // 03
+    {0xFC8, 0x008, RtlFamily::Rtl8169, kRxOld, false, false, false, "Realtek RTL8169"},           // 02
 };
 
 struct PciId {
@@ -214,7 +217,7 @@ bool Rtl8169NetworkInterface::initialize() {
   regs().write32(kRxConfig, chip_->rx_config);
   regs().write32(kTxConfig, kTxDmaBurst | kTxInterFrameGap | (chip_->auto_fifo ? kTxAutoFifo : 0));
   rx_next_ = 0;
-  tx_next_ = 0;
+  tx_next_ = tx_clean_ = 0;
   set_receive_mode();
   mask_interrupts();
   started_ = true;
@@ -287,45 +290,101 @@ bool Rtl8169NetworkInterface::transmit(ConstByteView frame) { return transmit_fr
 
 bool Rtl8169NetworkInterface::transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame || (checksum.requested() && !checksum.fits(frame.size()))) {
+  return send(frame, checksum, 0);
+}
+
+bool Rtl8169NetworkInterface::transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) {
+  kernel::ScopedMutex guard(mutex_);
+  if (mss == 0 || !chip_ || !chip_->tso) {
     ++stats_.send_failures;
     return false;
   }
-  volatile Descriptor& d = tx_ring_[tx_next_];
-  if (d.opts1 & kDescOwn) {  // the chip has not sent this one yet
+  return send(frame, checksum, mss);
+}
+
+uint32_t Rtl8169NetworkInterface::ring_end(uint32_t i) const { return i == kTransmitDescriptors - 1 ? kRingEnd : 0; }
+
+// A frame (or segment) is done when the chip has handed back the last descriptor of its chain.
+void Rtl8169NetworkInterface::reclaim_transmitted() {
+  while (tx_clean_ != tx_next_) {
+    const uint32_t end = tx_frame_end_[tx_clean_];
+    volatile Descriptor& d = tx_ring_[end];
+    if (d.opts1 & kDescOwn) return;
+    tx_clean_ = (end + 1) % kTransmitDescriptors;
+  }
+}
+
+// One frame in one descriptor, or (mss != 0) a TCP segment in a chain of them the chip cuts into frames. Every descriptor of a chain carries
+// the same offload bits; the first one is handed to the chip last, so it never sees half a chain.
+bool Rtl8169NetworkInterface::send(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) {
+  const bool segment = mss != 0;
+  TsoLayout layout;
+  bool fits = started_ && !frame.empty();
+  if (segment)
+    fits = fits && frame.size() <= kMaxSegmentation && mss <= kTd1MssMax && tso_layout(frame, checksum, &layout) && layout.tcp_start <= kTd1GiantTcpMax;
+  else
+    fits = fits && frame.size() <= kEthernetMaxFrame && (!checksum.requested() || checksum.fits(frame.size()));
+  if (!fits) {
     ++stats_.send_failures;
     return false;
   }
-  // Short frames are padded here: several of these chips send them unpadded or with garbage (r8169's rtl_test_hw_pad_bug).
-  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
-  const ByteView buffer = tx_buffer(tx_next_).first(padded);
-  buffer.fill(0);
-  buffer.copy_from(frame);
+  // Short frames are padded here: several of these chips send them unpadded or with garbage (r8169's rtl_test_hw_pad_bug); their checksum is
+  // then finished in software too, as r8169 does.
+  const uint32_t length = segment || frame.size() >= kEthernetMinFrame ? static_cast<uint32_t>(frame.size()) : kEthernetMinFrame;
+  const uint32_t descriptors = (length + kBufferSize - 1) / kBufferSize;
+  reclaim_transmitted();
+  const uint32_t in_flight = (tx_next_ + kTransmitDescriptors - tx_clean_) % kTransmitDescriptors;
+  if (kTransmitDescriptors - 1 - in_flight < descriptors) {  // the chip has not sent enough yet
+    ++stats_.send_failures;
+    return false;
+  }
+
   uint32_t opts1 = 0, opts2 = 0;
-  if (checksum.requested()) {
+  if (segment) {
+    opts1 = kTd1GiantSendIpv4 | (uint32_t{layout.tcp_start} << kTd1GiantTcpShift);
+    opts2 = uint32_t{mss} << kTd1MssShift;
+  } else if (checksum.requested()) {
     const bool hardware = (checksum.tcp() || checksum.udp()) && frame.size() >= kEthernetMinFrame && checksum.start <= kTd1TransportMax;
-    if (!hardware) {
-      if (!finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
-        ++stats_.send_failures;
-        return false;
-      }
-    } else if (chip_->family == RtlFamily::Rtl8169) {
-      opts1 = kTd0Ip | (checksum.tcp() ? kTd0Tcp : kTd0Udp);
-    } else {
-      opts2 = kTd1Ipv4 | (checksum.tcp() ? kTd1Tcp : kTd1Udp) | (uint32_t{checksum.start} << kTd1TransportShift);
+    if (hardware && chip_->family == RtlFamily::Rtl8169) opts1 = kTd0Ip | (checksum.tcp() ? kTd0Tcp : kTd0Udp);
+    else if (hardware) opts2 = kTd1Ipv4 | (checksum.tcp() ? kTd1Tcp : kTd1Udp) | (uint32_t{checksum.start} << kTd1TransportShift);
+  }  // (otherwise it is finished in the buffer below)
+  const bool software_checksum = !segment && checksum.requested() && opts1 == 0 && opts2 == 0;
+
+  const uint32_t first = tx_next_;
+  uint32_t slot = first;
+  for (uint32_t offset = 0, n = 0; n < descriptors; ++n) {
+    const uint32_t piece = length - offset < kBufferSize ? length - offset : kBufferSize;
+    const ByteView buffer = tx_buffer(slot).first(piece);
+    buffer.fill(0);  // (the padding of a short frame)
+    if (offset < frame.size()) buffer.copy_from(frame.subview(offset, frame.size() - offset < piece ? frame.size() - offset : piece));
+    if (n == 0 && software_checksum && !finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
+      ++stats_.send_failures;
+      return false;
     }
+    volatile Descriptor& d = tx_ring_[slot];
+    d.opts2 = opts2;
+    d.address = nic_dma_address(tx_buffer(slot));
+    const uint32_t flags = opts1 | piece | ring_end(slot) | (n + 1 == descriptors ? kLastFrag : 0);
+    if (n == 0) {
+      d.opts1 = flags | kFirstFrag;  // (owned by the chip below, once the rest of the chain is)
+    } else {
+      __atomic_thread_fence(__ATOMIC_RELEASE);
+      d.opts1 = flags | kDescOwn;
+    }
+    if (n + 1 == descriptors) tx_frame_end_[first] = static_cast<uint8_t>(slot);
+    offset += piece;
+    slot = (slot + 1) % kTransmitDescriptors;
   }
-  d.opts2 = opts2;
-  d.address = nic_dma_address(tx_buffer(tx_next_));
-  __atomic_thread_fence(__ATOMIC_RELEASE);  // the frame and the address before the ownership bit
-  d.opts1 = kDescOwn | kFirstFrag | kLastFrag | opts1 | padded | (tx_next_ == kTransmitDescriptors - 1 ? kRingEnd : 0);
+  __atomic_thread_fence(__ATOMIC_RELEASE);  // the frame, the addresses and the rest of the chain before the first descriptor's ownership bit
+  tx_ring_[first].opts1 = tx_ring_[first].opts1 | kDescOwn;
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+  tx_next_ = slot;
   if (new_layout())
     regs().write16(kTxPoll8125, 1);
   else
     regs().write8(kTxPoll, kTxPollNormal);
   ++stats_.frames_sent;
+  if (segment) ++stats_.segmented_sends;
   return true;
 }
 

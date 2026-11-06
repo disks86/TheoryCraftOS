@@ -35,8 +35,9 @@ namespace hardware {
 // share both. Legacy descriptor rings as on the 8254x. Interrupts (MSI) when the caller enables them; IP and TCP/UDP checksums checked on
 // receive (RXCSUM) and the transport checksum inserted on transmit through a TCP/IP context descriptor in front of an extended data
 // descriptor; TCP segmentation offload (TSE) for segments of up to 32 KiB, chained over 2 KiB buffers. An interrupt masks itself until
-// rearm_interrupts(), and the throttle (ITR) follows the traffic. One queue (the 82574's second queue and MSI-X are not used). QEMU's
-// `e1000e` device is an 82574L.
+// rearm_interrupts(), and the throttle (ITR) follows the traffic. The 82574 (QEMU's `e1000e`) also runs its second receive queue: with
+// MSI-X (a vector per receive queue and one for the other causes, each throttled by its EITR) RSS spreads flows over both; it uses extended
+// receive descriptors, which RSS needs. The chipset parts have one queue and MSI.
 //
 // Kept from e1000e: the MAC-only reset (the PHY keeps the link the firmware negotiated), the station address taken back from before the reset when the
 // NVM does not reload it, waking a PHY left powered down (LANPHYPC toggle) when the management engine allows it, and the I219 transmit hang workaround.
@@ -57,6 +58,7 @@ class E1000eNetworkInterface final : public INetworkInterface {
   static constexpr uint32_t kTransmitDescriptors = 256;
   static constexpr uint32_t kBufferSize = 2048;
   static constexpr uint32_t kMaxSegmentation = 32768;
+  static constexpr uint32_t kMaxQueues = 2;
 
   E1000eNetworkInterface(UniquePointer<INicDevice> device, allocators::IAllocator& allocator)
       : device_(util::move(device)), allocator_(allocator) {}
@@ -75,33 +77,40 @@ class E1000eNetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
-  NetworkOffloads offloads() const override { return NetworkOffloads{true, true, kMaxSegmentation, 1}; }
+  NetworkOffloads offloads() const override { return NetworkOffloads{true, true, kMaxSegmentation, static_cast<uint16_t>(msix_vectors_ ? queues_ : 1)}; }
   bool receive_frame(ByteView buffer, ReceivedFrame* frame) override;
   bool transmit_frame(ConstByteView frame, TransmitChecksum checksum) override;
   bool transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) override;
   bool enable_interrupts(NetworkWake wake, void* context) override;
-  void disable_interrupts() override { interrupts_.disable(*device_, claimed_); }
-  bool interrupts_enabled() const override { return interrupts_.enabled(); }
+  void disable_interrupts() override;
+  bool interrupts_enabled() const override { return msix_vectors_ != 0 || interrupts_.enabled(); }
   void rearm_interrupts() override;
   NetworkStatistics statistics() const override {
     NetworkStatistics s = stats_;
-    s.interrupts = interrupts_.count();
-    s.interrupt_rate = interrupts_.enabled() ? moderator_.interrupts_per_second() : 0;
+    s.interrupts = interrupts_.count() + __atomic_load_n(&msix_interrupts_, __ATOMIC_ACQUIRE);
+    s.interrupt_rate = interrupts_enabled() ? moderator_.interrupts_per_second() : 0;
     return s;
   }
 
   const E1000eModel* model() const { return model_; }
   // Whether the PHY had to be powered up with the LANPHYPC toggle during initialize().
   bool phy_was_woken() const { return phy_woken_; }
+  uint32_t queue_count() const { return queues_; }
+  uint64_t queue_frames(uint32_t queue) const { return queue < kMaxQueues ? rx_[queue].frames : 0; }
+  uint32_t msix_vectors() const { return msix_vectors_; }
 
  private:
+  // Legacy (length, checksum, status, errors, special in the second quadword) or, on the 82574, extended (write-back: RSS info in the first,
+  // status and errors, length and VLAN in the second): the same 16 bytes, read as two quadwords and taken apart by format.
   struct ReceiveDescriptor {
     uint64_t address;
-    uint16_t length;
-    uint16_t checksum;
-    uint8_t status;
-    uint8_t errors;
-    uint16_t special;
+    uint64_t upper;
+  };
+  struct ReceiveQueue {
+    ArrayView<ReceiveDescriptor> ring;
+    ByteView buffers;
+    uint32_t next = 0;
+    uint64_t frames = 0;
   };
   struct TransmitDescriptor {
     uint64_t address;
@@ -128,8 +137,12 @@ class E1000eNetworkInterface final : public INetworkInterface {
   void reclaim_transmitted();
   bool send(ConstByteView frame, TransmitChecksum checksum, uint16_t mss);
   void write_throttle();
-  ByteView rx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
-  ByteView tx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{kReceiveDescriptors + i} * kBufferSize, kBufferSize); }
+  bool start_receive_queue(uint32_t q);
+  bool receive_from(uint32_t q, ByteView buffer, ReceivedFrame* received);
+  bool enable_msix(NetworkWake wake, void* context);
+  static void on_queue_interrupt(void* self, uint32_t vector);
+  ByteView rx_buffer(const ReceiveQueue& queue, uint32_t i) const { return queue.buffers.subview(uint64_t{i} * kBufferSize, kBufferSize); }
+  ByteView tx_buffer(uint32_t i) const { return tx_buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
 
   UniquePointer<INicDevice> device_;
   allocators::IAllocator& allocator_;
@@ -137,10 +150,12 @@ class E1000eNetworkInterface final : public INetworkInterface {
   bool claimed_ = false;
   bool started_ = false;
   bool phy_woken_ = false;
-  ArrayView<ReceiveDescriptor> rx_ring_;
+  uint32_t queues_ = 1;
+  bool extended_rx_ = false;  // the 82574: extended receive descriptors
+  ReceiveQueue rx_[kMaxQueues];
+  uint32_t rx_turn_ = 0;
   ArrayView<TransmitDescriptor> tx_ring_;
-  ByteView buffers_;  // receive buffers, then transmit buffers
-  uint32_t rx_next_ = 0;
+  ByteView tx_buffers_;
   uint32_t tx_next_ = 0;   // the next descriptor to fill
   uint32_t tx_clean_ = 0;  // the first descriptor the card may still be using
   uint8_t tx_frame_end_[kTransmitDescriptors] = {};  // for the descriptor a frame starts at: the one it ends at
@@ -148,6 +163,10 @@ class E1000eNetworkInterface final : public INetworkInterface {
   uint32_t receive_control_ = 0;
   intel_eth::IntelInterrupts interrupts_;
   InterruptModerator moderator_;
+  uint32_t msix_vectors_ = 0;    // the 82574's MSI-X: receive queue 0, 1, the other causes
+  NetworkWake wake_ = nullptr;   // read by the interrupt handlers (atomic)
+  void* wake_context_ = nullptr;
+  uint64_t msix_interrupts_ = 0; // atomic
   MacAddress mac_{};
   kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;
