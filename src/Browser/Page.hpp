@@ -522,10 +522,11 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool geometry_ready_ = false;
   font::FontSet* layout_fonts_ = nullptr;   // (set_layout_fonts)
   uint64_t geometry_version_ = 0;           // the document version geometry_ was recorded for
+  uint32_t geometry_serials_ = 0;           // the nodes made before that layout: serials up to this (a newer node has no box in geometry_ yet)
   uint64_t geometry_cost_us_ = 0;           // what the last layout for a script took, and when it ended: layouts for scripts are held to a fifth of the time
   uint64_t geometry_done_us_ = 0;
   bool geometry_busy_ = false;
-  void refresh_geometry();
+  void refresh_geometry(bool force = false);
   int32_t scroll_y_ = 0;
   void record_geometry(const layout::BoxTree& tree);
   uint32_t scroll_node_ = 0;   // an element scrollIntoView() was called on: its place is worked out when the page is drawn

@@ -20,6 +20,9 @@
 // semaphores) on top of pthreads, so code written against Kernel/Thread.hpp and Kernel/Sync.hpp can be run
 // - and checked with ThreadSanitizer - on the development machine. Waits poll with short sleeps: simple, and
 // correct if not fast.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // (pthread_getattr_np)
+#endif
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -51,6 +54,16 @@ struct HostThread {
 void* trampoline(void* argument) {
   auto* t = static_cast<HostThread*>(argument);
   t_current = &t->base;
+  pthread_attr_t attr;   // (where its stack is, as the kernel's threads know theirs: code that asks how much stack is left gets an answer)
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    void* low = nullptr;
+    size_t size = 0;
+    if (pthread_attr_getstack(&attr, &low, &size) == 0) {
+      t->base.stack = static_cast<uint8_t*>(low);
+      t->base.stack_top = static_cast<uint8_t*>(low) + size;
+    }
+    pthread_attr_destroy(&attr);
+  }
   t->base.entry(t->base.argument);
   return nullptr;
 }
@@ -75,12 +88,17 @@ void sleep_us(uint64_t us) {
   nanosleep(&ts, nullptr);
 }
 
-Thread* spawn(ThreadFunction fn, void* argument, const char* name, int32_t, int8_t, uint32_t) {
+Thread* spawn(ThreadFunction fn, void* argument, const char* name, int32_t, int8_t, uint32_t stack_bytes) {
   auto* t = new HostThread{};
   t->base.entry = fn;
   t->base.argument = argument;
   t->base.name = name;
-  if (pthread_create(&t->handle, nullptr, trampoline, t) != 0) {
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  if (stack_bytes) pthread_attr_setstacksize(&attr, stack_bytes < 65536 ? 65536 : stack_bytes);   // (the size the caller asked for, as the kernel gives it)
+  const int created = pthread_create(&t->handle, &attr, trampoline, t);
+  pthread_attr_destroy(&attr);
+  if (created != 0) {
     delete t;
     return nullptr;
   }

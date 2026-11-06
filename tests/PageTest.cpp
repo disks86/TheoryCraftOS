@@ -249,6 +249,42 @@ struct FakeNet final : IPageLoader {
         a.headers = probe_content_type(path) + "Access-Control-Allow-Origin: *\r\n";   // (gstatic's icons are fetched by script: the real servers allow it)
       }
     }
+    if (it == answers.end() && getenv("PROBE_LIVE") && getenv("PROBE_ROOT") && key.find("POST https://app.example/youtubei/") == 0 && key.find("/log_event") == std::string::npos) {
+      // (PROBE: YouTube's API calls - the guide, the browse continuations - go to the live site, as the browser would send them)
+      const std::string rest = key.substr(strlen("POST https://app.example/"));
+      bool plain = true;
+      for (char ch : rest) plain &= isalnum(static_cast<unsigned char>(ch)) || strchr("/._=?&-", ch);
+      const std::string dir = getenv("PROBE_ROOT"), body_file = dir + "/_post_body", out_file = dir + "/_post_answer";
+      if (plain) {
+        if (FILE* f = fopen(body_file.c_str(), "wb")) { fwrite(request.body.data(), 1, request.body.size(), f); fclose(f); }
+        remove(out_file.c_str());
+        std::string headers;   // (the page's own headers: the body is often gzip, with Content-Encoding saying so)
+        const std::string block(request.headers.data(), request.headers.size());
+        for (size_t at = 0; at < block.size();) {
+          size_t end = block.find('\n', at);
+          if (end == std::string::npos) end = block.size();
+          std::string line = block.substr(at, end - at);
+          at = end + 1;
+          if (!line.empty() && line.back() == '\r') line.pop_back();
+          if (line.empty() || line.find('\'') != std::string::npos || strncasecmp(line.c_str(), "host:", 5) == 0 || strncasecmp(line.c_str(), "content-length:", 15) == 0) continue;
+          for (size_t p = line.find("app.example"); p != std::string::npos; p = line.find("app.example")) line.replace(p, 11, getenv("PROBE_LIVE"));   // (Origin, Referer)
+          headers += " -H '" + line + "'";
+        }
+        if (headers.find("ontent-Type") == std::string::npos && headers.find("ontent-type") == std::string::npos) headers += " -H 'Content-Type: application/json'";
+        const std::string cmd = "curl -sf -m 60 -A 'Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)'" + headers + " --data-binary @'" + body_file + "' -o '" + out_file + "' 'https://" + getenv("PROBE_LIVE") + "/" + rest + "'";
+        const int status = system(cmd.c_str());
+        printf("probe live POST %s: %s\n", rest.c_str(), status == 0 ? "answered" : "failed");
+        if (status == 0)
+          if (FILE* f = fopen(out_file.c_str(), "rb")) {
+            a.status = 200;
+            a.headers = "Content-Type: application/json\r\n";
+            a.body.clear();
+            int c;
+            while ((c = fgetc(f)) != EOF) a.body.push_back(static_cast<char>(c));
+            fclose(f);
+          }
+      }
+    }
     if (request.headers.contains("If-None-Match")) {   // a revalidation: the answer "<key>#304" if the test has one
       auto not_modified = answers.find(key + "#304");
       if (not_modified != answers.end()) a = not_modified->second;
@@ -547,7 +583,13 @@ struct FakeEnvironment final : IPageEnvironment {
     return true;
   }
   uint64_t now_ms() override { return clock; }
-  uint64_t monotonic_us() override { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return static_cast<uint64_t>(ts.tv_sec) * 1000000u + static_cast<uint64_t>(ts.tv_nsec) / 1000u; }
+  uint64_t monotonic_step = 0, monotonic_now = 1000000;   // (a test that sets the step gets a clock that moves that much per reading)
+  uint64_t monotonic_us() override {
+    if (monotonic_step) return monotonic_now += monotonic_step;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000u + static_cast<uint64_t>(ts.tv_nsec) / 1000u;
+  }
   void console(int, StringView t) override { console_lines.push_back(std::string(t.data(), t.size())); }
   StorageHub* shared_local = nullptr;   // (another window's: windows share localStorage and tell each other about changes)
   PageHub* shared_hub = nullptr;
@@ -6402,6 +6444,31 @@ static void test_webrtc() {
       CHECK(with_fonts ? log.find("measured 123x45 200") != std::string::npos : log.find("measured 0x0 200") != std::string::npos);
     }
   }
+  {   // layouts for scripts are held to a fifth of the time, but an element made since the last one is laid out at once: one read as 0 x 0 kept YouTube's
+      // feed empty (its grid waits for a resize that never comes)
+    FakeEnvironment env(a);
+    env.clock = 1700000000000ull;
+    env.monotonic_step = 1000;   // (every layout seems to take a millisecond, and the next one comes a millisecond after it: within the budget)
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    font::FontSet fonts(a);
+    fonts.add_bundled_fonts();
+    page.set_layout_fonts(&fonts);
+    page.load("<html><body><div id=first style='width:200px;height:30px'></div>"
+              "<script>setTimeout(function () {\n"
+              "  var a = document.createElement('div'); a.style.width = '123px'; document.body.appendChild(a); var aw = a.offsetWidth;\n"
+              "  var b = document.createElement('div'); b.style.width = '77px'; document.body.appendChild(b);\n"
+              "  console.log('fresh ' + aw + ' ' + b.offsetWidth + ' ' + b.clientWidth);\n"
+              "}, 10);</script></body></html>");
+    PagePicture picture(a);
+    CHECK(page.render_picture(&picture, fonts));
+    for (int i = 0; i < 5; ++i) {
+      env.clock += 10;
+      page.run_due_timers(env.clock);
+    }
+    const std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("fresh 123 77 77") != std::string::npos);
+  }
   {   // the timing line of a page that fetched and ran nothing (the slowest file and script names are empty)
     FakeEnvironment env(a);
     MediaEnvironment media;
@@ -6518,8 +6585,8 @@ int main(int argc, char** argv) {
     {
       FakeEnvironment env(a);
       MediaEnvironment media;
-      media.width = 1280;
-      media.height = 800;
+      media.width = getenv("PROBE_WIDTH") ? atoi(getenv("PROBE_WIDTH")) : 1280;   // (the browser window's page area: PROBE_WIDTH / PROBE_HEIGHT)
+      media.height = getenv("PROBE_HEIGHT") ? atoi(getenv("PROBE_HEIGHT")) : 800;
       Page page(a, env, "https://app.example/", media, true);
       font::FontSet probe_fonts(a);   // (what scripts measure with once the page has changed; the probe's pictures use their own)
       probe_fonts.add_bundled_fonts();
@@ -6554,8 +6621,8 @@ int main(int argc, char** argv) {
         getrusage(RUSAGE_SELF, &ru);
         { String t(a); page.timing_summary(&t); printf("timing: %.*s\n", static_cast<int>(t.size()), t.view().data()); }
         printf("render_picture %d, peak rss %ld KiB, heap now %llu KiB peak %llu KiB\n", ok ? 1 : 0, ru.ru_maxrss, (unsigned long long)(a.bytes >> 10), (unsigned long long)(a.peak >> 10));
-        if (ok && getenv("PROBE_PNG")) {   // the page as a picture (the top 1280 x 800), written to the file
-          const int32_t w = 1280, h = 800;
+        if (ok && getenv("PROBE_PNG")) {   // the page as a picture (the top of the viewport), written to the file
+          const int32_t w = static_cast<int32_t>(media.width), h = static_cast<int32_t>(media.height);
           media::Image image(a);
           image.create(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
           graphics::Surface surface = image.surface(0);

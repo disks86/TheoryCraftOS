@@ -26,16 +26,27 @@ namespace script {
 
 namespace {
 
-// The parser, the compiler and the interpreter recurse, and threads of this system have small stacks (64 KiB): the work is done on a thread with a
-// stack of its own where the system runs threads (and right here where it does not, as in the tests).
-constexpr uint32_t kScriptStackBytes = 1u << 20;
+// The parser, the compiler and the interpreter recurse deeply: the work is done on a thread with a big stack of its own unless the calling thread
+// already has that much left (and right here where the system runs no threads, as in the tests). Staying on the calling thread matters beyond
+// speed: a script that runs another engine's script (a page registering a service worker) holds recursive locks, such as the service worker hub's,
+// that the nested script takes again; on another thread it would wait for itself.
+constexpr uint32_t kScriptStackBytes = 8u << 20, kInlineStackBytes = 2u << 20;
+
+// The bytes of stack the calling thread has left (0 if it is not known).
+uint64_t stack_left() {
+  const kernel::Thread* me = kernel::current_thread();
+  if (!me || !me->stack) return 0;
+  // (the frame address, not a local's: a sanitizer may keep locals elsewhere; compared as numbers, the stack grows down to `stack`)
+  const uintptr_t at = reinterpret_cast<uintptr_t>(__builtin_frame_address(0)), base = reinterpret_cast<uintptr_t>(me->stack), top = reinterpret_cast<uintptr_t>(me->stack_top);
+  return at > base && at <= top ? at - base : 0;
+}
 
 template <class F>
 void on_big_stack(F&& job) {
   struct Context {
     F* job;
   } context{&job};
-  if (kernel::running()) {
+  if (kernel::running() && stack_left() < kInlineStackBytes) {
     kernel::Thread* thread = kernel::spawn([](void* p) { (*static_cast<Context*>(p)->job)(); }, &context, "script", -1, -1, kScriptStackBytes);
     if (thread) {
       kernel::join(thread);
