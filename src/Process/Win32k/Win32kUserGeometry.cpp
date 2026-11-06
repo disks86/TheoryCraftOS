@@ -36,27 +36,29 @@ uint64_t get64(const uint8_t* raw, uint32_t o) { return uint64_t(get32(raw, o)) 
 struct Margins { int32_t left = 0, top = 0, right = 0, bottom = 0; };
 
 // How far the window rectangle reaches past the client rectangle for a style (AdjustWindowRectEx; the algorithm of Windows NT with the metrics of Windows 10).
-Margins nc_margins(uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi) {
+Margins nc_margins(uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi, bool padded = true) {
   Margins m;
-  if (style & wn::WS_MINIMIZE) return m;
   int32_t adjust = 0;
   if ((ex_style & (wn::WS_EX_STATICEDGE | wn::WS_EX_DLGMODALFRAME)) == wn::WS_EX_STATICEDGE) adjust = 1;
   else if ((ex_style & wn::WS_EX_DLGMODALFRAME) || (style & (wn::WS_THICKFRAME | wn::WS_DLGFRAME))) adjust = 2;
   int32_t xpad = 0, ypad = 0;
   if (style & wn::WS_THICKFRAME) {
     adjust += user_misc::system_metrics(SM_CXFRAME, dpi) - user_misc::system_metrics(SM_CXDLGFRAME, dpi);
-    xpad = ypad = user_misc::system_metrics(SM_CXPADDEDBORDER, dpi);
+    if (padded) xpad = ypad = user_misc::system_metrics(SM_CXPADDEDBORDER, dpi);
   }
   if ((style & (wn::WS_BORDER | wn::WS_DLGFRAME)) || (ex_style & wn::WS_EX_DLGMODALFRAME)) ++adjust;
   m.left = m.right = adjust + xpad;
   m.top = m.bottom = adjust + ypad;
-  if ((style & wn::WS_CAPTION) == wn::WS_CAPTION) m.top += user_misc::system_metrics((ex_style & wn::WS_EX_TOOLWINDOW) ? SM_CYSMCAPTION : SM_CYCAPTION, dpi);
+  if ((style & wn::WS_CAPTION) == wn::WS_CAPTION) {      // (the caption height scaled, plus one pixel that is not)
+    const int32_t extra = int32_t(dpi / 96) > 1 ? int32_t(dpi / 96) - 1 : 0;
+    m.top += user_misc::system_metrics((ex_style & wn::WS_EX_TOOLWINDOW) ? SM_CYSMCAPTION : SM_CYCAPTION, dpi) - extra;
+  }
   if (has_menu) m.top += user_misc::system_metrics(SM_CYMENU, dpi);
   if (ex_style & wn::WS_EX_CLIENTEDGE) {
-    m.left += user_misc::system_metrics(SM_CXEDGE, dpi);
-    m.right += user_misc::system_metrics(SM_CXEDGE, dpi);
-    m.top += user_misc::system_metrics(SM_CYEDGE, dpi);
-    m.bottom += user_misc::system_metrics(SM_CYEDGE, dpi);
+    m.left += user_misc::system_metrics(SM_CXEDGE, 96);      // (the client edge is not scaled)
+    m.right += user_misc::system_metrics(SM_CXEDGE, 96);
+    m.top += user_misc::system_metrics(SM_CYEDGE, 96);
+    m.bottom += user_misc::system_metrics(SM_CYEDGE, 96);
   }
   return m;
 }
@@ -69,7 +71,8 @@ uint32_t window_dpi_of(const Window* w) {
 }  // namespace
 
 bool adjust_window_rect(gdi::Rect* rect, uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi) {
-  const Margins m = nc_margins(style, ex_style, has_menu && !(style & wn::WS_CHILD), dpi);
+  // AdjustWindowRectEx (dpi 0) leaves out the padded border of a sizing frame; the ForDpi form has it
+  const Margins m = nc_margins(style, ex_style, has_menu && !(style & wn::WS_CHILD), dpi == 0 ? 96 : dpi, dpi != 0);
   rect->left = int32_t(uint32_t(rect->left) - uint32_t(m.left));
   rect->top = int32_t(uint32_t(rect->top) - uint32_t(m.top));
   rect->right = int32_t(uint32_t(rect->right) + uint32_t(m.right));
@@ -82,7 +85,7 @@ void compute_nc(Window* w, Rect* client_out) {
   if (w->parent == nullptr) { *client_out = w->bounds; return; }
   const uint32_t dpi = window_dpi_of(w);
   const bool menu = w->menu != 0 && !(w->style & wn::WS_CHILD);
-  const Margins m = nc_margins(w->style, w->ex_style, menu, dpi);
+  const Margins m = (w->style & wn::WS_MINIMIZE) ? Margins() : nc_margins(w->style, w->ex_style, menu, dpi);
   Rect c = w->bounds;
   c.left = int32_t(uint32_t(c.left) + uint32_t(m.left));
   c.top = int32_t(uint32_t(c.top) + uint32_t(m.top));
@@ -479,6 +482,7 @@ uint64_t nt_set_window_pos(Call& call) {
   Window* w = window_arg(call, 0);
   if (!w) return 0;
   if (!w->parent) return call.fail(kErrorAccessDenied);
+  if (w->destroy_stage == 2) return call.fail(kErrorInvalidParameter);
   const uint32_t flags = call.arg32(6);
   if (flags & ~0x7FFFu & ~0u) {
     if (flags & 0xFFFF8000u) return call.fail(kErrorInvalidParameter);

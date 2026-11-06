@@ -173,6 +173,7 @@ struct Window {
   uint32_t dc_cache_count = 0;
   Window* last_active_popup = nullptr;
   uint32_t creating_stage = 0;   // nonzero while WM_NCCREATE/WM_CREATE run
+  uint32_t cs_style = 0, cs_ex_style = 0;    // what CreateWindowEx was given (the CREATESTRUCT of WM_NCCREATE and WM_CREATE), the extended style with WS_EX_WINDOWEDGE decided
   uint32_t destroy_stage = 0;    // 1: WM_DESTROY sent, 2: WM_NCDESTROY sent
 };
 

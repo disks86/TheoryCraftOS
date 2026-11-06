@@ -258,9 +258,10 @@ void validate_window(Window* w, const Rect* r) {
 
 namespace {
 
+constexpr uint32_t kNoArg = 99;      // (no region argument: the call takes a rectangle only)
 bool rects_from_args(Call& call, uint32_t rect_index, uint32_t rgn_index, List<Rect>* out, bool* whole) {
   *whole = false;
-  if (call.arg(rgn_index) != 0) {
+  if (rgn_index != kNoArg && call.arg(rgn_index) != 0) {
     if (!gdi::region_rects(call.arg32(rgn_index), out)) { call.set_last_error(kErrorInvalidHandle); return false; }
     return true;
   }
@@ -283,7 +284,7 @@ uint64_t invalidate_impl(Call& call, bool is_rgn, bool validate) {
     if (call.arg(1) != 0) {
       if (!gdi::region_rects(call.arg32(1), &rects)) return call.fail(kErrorInvalidHandle);
     } else whole = true;
-  } else if (!rects_from_args(call, 1, 99, &rects, &whole)) return 0;
+  } else if (!rects_from_args(call, 1, kNoArg, &rects, &whole)) return 0;
   const bool erase = !validate && call.arg_bool(2);
   auto apply = [&](Window* w) {
     if (validate) {

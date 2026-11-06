@@ -78,7 +78,10 @@ void system_send(uint32_t hwnd, uint32_t message, uint64_t wparam, uint64_t lpar
 void flush_notes(Notes& notes, Op* op) {
   for (uint64_t i = 0; i + 2 < notes.list.count(); i += 3) {
     const uint64_t head = notes.list[i];
-    if (op) {
+    Window* target = op ? find_window(uint32_t(head)) : nullptr;
+    if (op && target && target->thread != op->thread) {      // a window of another thread hears of it as a notification: the caller never waits for that thread
+      system_send(uint32_t(head), uint32_t(head >> 32), notes.list[i + 1], notes.list[i + 2]);
+    } else if (op) {
       op->notes.push_back(head);
       op->notes.push_back(notes.list[i + 1]);
       op->notes.push_back(notes.list[i + 2]);

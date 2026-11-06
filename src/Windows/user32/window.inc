@@ -829,11 +829,12 @@ EXPORT ULONG_PTR WINAPI SetTimer(HANDLE hwnd, ULONG_PTR id, UINT elapse, void *p
 EXPORT BOOL WINAPI KillTimer(HANDLE hwnd, ULONG_PTR id) { return (NtUserKillTimer((ULONG_PTR)hwnd, id) & 0xFFFFFFFFu) != 0; }
 
 /* The window rectangle for a client rectangle (AdjustWindowRectEx): the metrics are the window manager's. */
-EXPORT BOOL WINAPI AdjustWindowRectEx(RECT_ *rect, DWORD style, BOOL menu, DWORD ex_style) {
-  struct { DWORD style, ex_style, menu, dpi; } params = {style, ex_style, menu, 0};
+EXPORT BOOL WINAPI AdjustWindowRectExForDpi(RECT_ *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi) {
+  struct { DWORD style, ex_style, menu, dpi; } params = {style, ex_style, menu, dpi};
   if (!rect) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   return (NtUserCallTwoParam((ULONG_PTR)rect, (ULONG_PTR)&params, 7 /* AdjustWindowRect */) & 0xFFFFFFFFu) != 0;
 }
+EXPORT BOOL WINAPI AdjustWindowRectEx(RECT_ *rect, DWORD style, BOOL menu, DWORD ex_style) { return AdjustWindowRectExForDpi(rect, style, menu, ex_style, 0); }
 EXPORT BOOL WINAPI AdjustWindowRect(RECT_ *rect, DWORD style, BOOL menu) { return AdjustWindowRectEx(rect, style, menu, 0); }
 
 /* Clipboard format names are atoms of the window manager's table (the same table the class names use). */

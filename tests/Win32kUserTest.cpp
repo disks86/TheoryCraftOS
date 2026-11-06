@@ -314,7 +314,7 @@ void test_create_and_destroy() {
   CHECK(t.create("Top", WS_CHILD, 0, 0, 10, 10, 0x99999) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1400);
 
   // children, siblings and the tree
-  const uint32_t p = t.create("Top", WS_OVERLAPPED, 0, 0, 200, 200);
+  const uint32_t p = t.create("Top", WS_POPUP, 0, 0, 200, 200);      // (a popup: no caption or frame moves the children)
   const uint32_t c1 = t.create("Top", WS_CHILD | WS_VISIBLE, 5, 5, 50, 50, p);
   const uint32_t c2 = t.create("Top", WS_CHILD | WS_VISIBLE, 60, 5, 50, 50, p);
   const uint32_t g = t.create("Top", WS_CHILD | WS_VISIBLE, 1, 1, 10, 10, c1);
@@ -645,7 +645,7 @@ void test_geometry_and_zorder() {
   // GetWindowInfo
   const uint64_t wi = t.tmp(0xF00);
   prog.memory.put32(wi, 60);
-  CHECK(t.svc32(N::NtUserCallHwndParam, {p, wi, 8}) == 1 && prog.memory.get32(wi + 4) == 400 && prog.memory.get32(wi + 36) == (WS_POPUP | WS_VISIBLE));
+  CHECK(t.svc32(N::NtUserCallHwndParam, {p, wi, 8}) == 1 && prog.memory.get32(wi + 4) == 400 && prog.memory.get32(wi + 36) == (WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS));
   // AdjustWindowRect (Windows 10 metrics)
   gdi::Rect ar{0, 0, 100, 100};
   user::adjust_window_rect(&ar, WS_OVERLAPPEDWINDOW, 0, false, 96);
@@ -1071,8 +1071,8 @@ void test_props_longs_text() {
   CHECK(t.svc(N::NtUserSetWindowLongPtr, {w, uint64_t(-21), 0x77, 0}) == 0 && t.svc(N::NtUserCallHwndParam, {w, uint64_t(-21), 12}) == 0x77);
   t.clear_log();
   const uint32_t old = t.svc32(N::NtUserSetWindowLong, {w, uint64_t(-16), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0});
-  CHECK(old == 0 && (t.style(w) & WS_VISIBLE) && t.saw(0x7C) && t.saw(WM_STYLECHANGED));
-  CHECK(rd(t.log.back().payload, 0) == 0 && rd(t.log.back().payload, 4) == (WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPSIBLINGS));
+  CHECK(old == (WS_CAPTION | WS_CLIPSIBLINGS) && (t.style(w) & WS_VISIBLE) && t.saw(0x7C) && t.saw(WM_STYLECHANGED));
+  CHECK(rd(t.log.back().payload, 0) == (WS_CAPTION | WS_CLIPSIBLINGS) && rd(t.log.back().payload, 4) == (WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPSIBLINGS));
   CHECK(t.svc32(N::NtUserSetWindowLong, {w, uint64_t(-20), 8, 0}) == (t.svc32(N::NtUserCallHwndParam, {w, uint64_t(-20), 10}) & ~8u) || true);
   CHECK((t.svc32(N::NtUserCallHwndParam, {w, uint64_t(-20), 10}) & 8) == 0);      // WS_EX_TOPMOST cannot be set this way
   // window procedure replacement

@@ -331,10 +331,11 @@ uint64_t spi(Call& c, uint32_t action, uint32_t ui, uint64_t pv, uint32_t dpi, b
     case 0x2A: {    // SPI_SETNONCLIENTMETRICS
       uint32_t size = 0;
       if (pv == 0 || !c.read_u32(pv, &size)) return c.fail(kErrorNoAccess);
-      if (size != kNcmSize || (ui != 0 && ui != kNcmSize)) return c.fail(kErrorInvalidParameter);
-      uint8_t buf[kNcmSize];
-      if (action == 0x29) { write_ncm(buf, s->metrics, dpi); return put_out(c, pv, buf, kNcmSize) ? 1 : 0; }
-      if (!c.read(pv, ByteView(buf, kNcmSize))) return c.fail(kErrorNoAccess);
+      const uint32_t old_size = kNcmSize - 4;      // (before Windows Vista: no iPaddedBorderWidth)
+      if ((size != kNcmSize && size != old_size) || (ui != 0 && ui != size)) return c.fail(kErrorInvalidParameter);
+      uint8_t buf[kNcmSize] = {};
+      if (action == 0x29) { write_ncm(buf, s->metrics, dpi); put32(buf, 0, size); return put_out(c, pv, buf, size) ? 1 : 0; }
+      if (!c.read(pv, ByteView(buf, size))) return c.fail(kErrorNoAccess);
       read_ncm(buf, &s->metrics);
       return 1;
     }

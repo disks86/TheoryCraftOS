@@ -32,7 +32,7 @@ uint32_t get32(const uint8_t* raw, uint32_t o) { return uint32_t(raw[o]) | uint3
 
 // The extended style the frame flags imply (WS_EX_WINDOWEDGE).
 uint32_t fix_ex_style(uint32_t style, uint32_t ex) {
-  if ((ex & wn::WS_EX_DLGMODALFRAME) || (style & wn::WS_THICKFRAME) || ((style & (wn::WS_DLGFRAME | wn::WS_CHILD)) == wn::WS_DLGFRAME)) return ex | wn::WS_EX_WINDOWEDGE;
+  if ((ex & wn::WS_EX_DLGMODALFRAME) || (!(ex & wn::WS_EX_STATICEDGE) && (style & (wn::WS_DLGFRAME | wn::WS_THICKFRAME)))) return ex | wn::WS_EX_WINDOWEDGE;
   return ex & ~wn::WS_EX_WINDOWEDGE;
 }
 
@@ -46,8 +46,8 @@ void fill_create_struct(Window* w, const Op& op, List<uint8_t>& out) {
   put32(raw, 36, uint32_t(w->bounds.right - w->bounds.left));
   put32(raw, 40, uint32_t(w->bounds.top));
   put32(raw, 44, uint32_t(w->bounds.left));
-  put32(raw, 48, w->style);
-  put32(raw, 72, w->ex_style);
+  put32(raw, 48, w->cs_style);
+  put32(raw, 72, w->cs_ex_style);
   out.clear();
   for (uint8_t b : raw) out.push_back(b);
 }
@@ -203,6 +203,7 @@ uint64_t nt_create_window_ex(Call& call) {
   else if (parent_arg != 0) {
     parent = find_window(uint32_t(parent_arg));
     if (!parent) return call.fail(kErrorInvalidWindowHandle);
+    if (parent->destroy_stage == 2) return call.fail(kErrorInvalidParameter);      // (a window past WM_NCDESTROY takes no new children)
   }
   if ((style & wn::WS_CHILD) && !parent) return call.fail(uint32_t(kErrorTlwWithWsChild));
   if (!(style & wn::WS_CHILD) && parent && parent != desktop->message_root) {
@@ -219,9 +220,15 @@ uint64_t nt_create_window_ex(Call& call) {
   w->desktop = desktop;
   w->thread = q->thread;
   w->pid = q->pid;
+  w->cs_style = style;
+  w->cs_ex_style = fix_ex_style(style, ex_style);
+  // the styles the window gets: an overlapped window has a caption and the raised edge; all but a pure child clip their siblings
+  const bool overlapped = !(style & (wn::WS_CHILD | wn::WS_POPUP));
+  if (overlapped) style |= wn::WS_CAPTION;
+  if ((style & (wn::WS_CHILD | wn::WS_POPUP)) != wn::WS_CHILD) style |= wn::WS_CLIPSIBLINGS;
   w->style = style;
   w->ex_style = fix_ex_style(style, ex_style);
-  if (!(style & wn::WS_CHILD)) w->ex_style |= wn::WS_EX_WINDOWEDGE;      // (every window that is not a child has the raised edge, whatever its frame style)
+  if (overlapped) w->ex_style |= wn::WS_EX_WINDOWEDGE;
   w->wndproc = cls->wndproc;
   w->unicode = !call.arg_bool(16);
   w->instance = call.arg(11);
@@ -384,6 +391,7 @@ uint64_t nt_set_parent(Call& call) {
   if (!w) return 0;
   Desktop* desktop = w->desktop;
   if (w == desktop->root || w == desktop->message_root || !w->parent) return call.fail(kErrorAccessDenied);
+  if (w->destroy_stage == 2) return call.fail(kErrorInvalidParameter);      // (past WM_NCDESTROY the window is not put back into a tree)
   Window* parent = nullptr;
   const uint64_t p = call.arg(1);
   if (p == 0) parent = desktop->root;
