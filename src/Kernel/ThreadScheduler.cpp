@@ -89,7 +89,16 @@ struct Scheduler {
   ApStart ap_start[kMaxCores];
   uint32_t core_count = 1;
   uint32_t boot_core = 0;
-  WaitList queues[kPriorityLevels];  // the ready queue, kept apart by Thread::priority; queues[0] is the lowest, queues[kPriorityLevels - 1] the highest
+  // The ready threads: a run queue per core, each kept apart by priority level (levels[0] the lowest). A thread waits in the queue of the core it
+  // was sent to, or of the core that suits it best when no allowed core was idle (choose_queue_core). Any core may take from any queue (see
+  // find_eligible): the queues say where a thread is expected to run, not where it must. level_counts / ready_levels count the ready threads of
+  // each level over all queues, so a core finds the highest level with work without looking at every queue.
+  struct RunQueue {
+    WaitList levels[kPriorityLevels];
+  } run_queues[kMaxCores];
+  uint32_t queue_lengths[kMaxCores];
+  uint32_t level_counts[kPriorityLevels];
+  uint32_t ready_levels = 0;   // bit L: level_counts[L] != 0
   // What placement knows of each core (CPUScheduler/IoAffinity.hpp). `idle` is cleared as soon as a thread is sent to the core, so that the
   // next thread made ready goes to another idle core; it is set again whenever the core switches to its idle thread.
   scheduling::CorePlace places[kMaxCores];
@@ -336,7 +345,25 @@ void list_remove(WaitList* list, Thread* t) {
   t->prev = t->next = nullptr;
 }
 
-WaitList* run_queue(uint8_t priority) { return &g.queues[priority]; }
+static_assert(kPriorityLevels <= 32, "ready_levels has a bit per level");
+
+void queue_on_locked(Thread* t, uint32_t core) {
+  const uint8_t level = t->priority;
+  list_append(&g.run_queues[core].levels[level], t);
+  ++g.queue_lengths[core];
+  if (g.level_counts[level]++ == 0) g.ready_levels |= 1u << level;
+  t->queued_on = static_cast<int32_t>(core);
+  t->queued_level = level;
+}
+
+void unqueue_locked(Thread* t) {
+  if (t->queued_on < 0) return;
+  const uint32_t core = static_cast<uint32_t>(t->queued_on);
+  list_remove(&g.run_queues[core].levels[t->queued_level], t);
+  --g.queue_lengths[core];
+  if (--g.level_counts[t->queued_level] == 0) g.ready_levels &= ~(1u << t->queued_level);
+  t->queued_on = -1;
+}
 
 void sleepers_insert(Thread* t) {
   Thread** link = &g.sleepers;
@@ -386,14 +413,23 @@ scheduling::PlacementHints hints_of(const Thread* t) {
   return hints;
 }
 
-// A thread that has just become ready goes to the idle core that suits it best, which is woken for it. When that is this core (idle, so in an
-// interrupt) and the interrupt reschedules on its way out (the tick, on_device_interrupt), it is only marked; otherwise it interrupts itself.
-// No idle core: the thread waits for a core to give up its current thread.
-void place_ready_locked(Thread* t) {
+// A thread that has just become ready joins the run queue of the idle core that suits it best, which is woken for it. When that is this core
+// (idle, so in an interrupt) and the interrupt reschedules on its way out (the tick, on_device_interrupt), it is only marked; otherwise it
+// interrupts itself. No idle core: it joins the queue of the busy core that suits it best (choose_queue_core) and waits for a core to give up
+// its current thread.
+void ready_locked(Thread* t) {
   t->ready_tsc = hardware::read_tsc();
   t->wake_core = -1;
-  const int32_t target = scheduling::choose_wake_core(hints_of(t), allowed_cores(t), places());
-  if (target < 0) return;
+  const scheduling::PlacementHints hints = hints_of(t);
+  const scheduling::CoreSet allowed = allowed_cores(t);
+  const int32_t target = scheduling::choose_wake_core(hints, allowed, places());
+  if (target < 0) {
+    int32_t core = scheduling::choose_queue_core(hints, allowed, places(), ArrayView<const uint32_t>(g.queue_lengths, g.core_count));
+    if (core < 0) core = static_cast<int32_t>(g.running ? this_core()->index : g.boot_core);   // (no allowed core online: any core may still take it)
+    queue_on_locked(t, static_cast<uint32_t>(core));
+    return;
+  }
+  queue_on_locked(t, static_cast<uint32_t>(target));
   t->wake_core = target;
   g.places[target].idle = false;   // (spoken for: the next thread made ready looks for another core)
   Core& c = g.cores[target];
@@ -437,18 +473,14 @@ void note_wake_source_locked(Thread* t) {
 
 void enqueue_locked(Thread* t) {
   t->state = ThreadState::Ready;
-  list_append(run_queue(t->priority), t);
-  place_ready_locked(t);
+  ready_locked(t);
 }
 
 void make_ready_locked(Thread* t) {
   if (t->state == ThreadState::Zombie || t->state == ThreadState::Ready) return;
   t->state = ThreadState::Ready;
   note_wake_source_locked(t);
-  if (!t->on_cpu) {  // otherwise its core queues it as soon as it has saved the registers
-    list_append(run_queue(t->priority), t);
-    place_ready_locked(t);
-  }
+  if (!t->on_cpu) ready_locked(t);  // (else its core queues it as soon as it has saved the registers)
 }
 
 bool wake_one_locked_impl(WaitList* list) {
@@ -474,28 +506,54 @@ bool sent_elsewhere(const Thread* t, const Core* c) {
   return target.online && target.current && target.current->is_idle;
 }
 
-// The thread this core runs next. Priorities stay strict: the highest level with an eligible thread wins. Within it, a thread that has waited
-// kPlacementPatienceUs or longer goes first (oldest first), so placement never starves anybody; otherwise the thread that suits this core best
-// (placement_score: its kind, its device's core, its warm cache, a shared cache; most of all being the thread this core was woken for), the
-// oldest among equals. A thread sent to another core that is still idle is left for that core.
+// The best thread of one list for core `c` so far: one that has waited kPlacementPatienceUs or longer beats any other (the oldest of those);
+// otherwise the best placement_score, plus kScoreSentHere for the thread this core was woken for, the earlier one among equals. A thread sent to
+// another core that is still idle is left for that core.
+struct Pick {
+  Thread* thread = nullptr;
+  uint32_t score = 0;
+  bool aged = false;
+};
+
+void consider(Pick& pick, Thread* t, const Core* c, uint64_t now, int64_t patience) {
+  if (!eligible(t, c)) return;
+  if (static_cast<int64_t>(now - t->ready_tsc) >= patience) {
+    if (!pick.aged || static_cast<int64_t>(t->ready_tsc - pick.thread->ready_tsc) < 0) pick = Pick{t, 0, true};
+    return;
+  }
+  if (pick.aged || sent_elsewhere(t, c)) return;
+  uint32_t score = scheduling::placement_score(hints_of(t), c->index, places());
+  if (t->wake_core == static_cast<int32_t>(c->index)) score += kScoreSentHere;
+  if (!pick.thread || score > pick.score) pick = Pick{t, score, false};
+}
+
+// The thread this core runs next. Priorities stay strict: the highest level with an eligible thread in any queue wins. At that level this core
+// takes from its own queue first (Pick), and from the other queues (work stealing) when its own has nothing it may run - or when a thread
+// there has waited past its patience, so that a core busy with higher-priority work cannot strand the threads queued on it. A list is in the
+// order its threads became ready, so the first eligible thread of another queue is the only one that can be the oldest.
 Thread* find_eligible(const Core* c) {
   const uint64_t now = hardware::read_tsc();
   const int64_t patience = static_cast<int64_t>(kPlacementPatienceUs * g.tsc_per_us);
-  for (uint32_t level = kPriorityLevels; level-- > 0;) {
-    Thread* best = nullptr;
-    uint32_t best_score = 0;
-    for (Thread* t = g.queues[level].head; t; t = t->next) {
-      if (!eligible(t, c)) continue;
-      if (static_cast<int64_t>(now - t->ready_tsc) >= patience) return t;
-      if (sent_elsewhere(t, c)) continue;
-      uint32_t score = scheduling::placement_score(hints_of(t), c->index, places());
-      if (t->wake_core == static_cast<int32_t>(c->index)) score += kScoreSentHere;
-      if (!best || score > best_score) {
-        best = t;
-        best_score = score;
+  for (uint32_t levels = g.ready_levels; levels;) {
+    const uint32_t level = 31 - static_cast<uint32_t>(__builtin_clz(levels));
+    levels &= ~(1u << level);
+    Pick own;
+    for (Thread* t = g.run_queues[c->index].levels[level].head; t; t = t->next) consider(own, t, c, now, patience);
+    if (own.aged) return own.thread;
+    Pick stolen;
+    for (uint32_t i = 0; i < g.core_count; ++i) {
+      if (i == c->index || !g.queue_lengths[i]) continue;
+      for (Thread* t = g.run_queues[i].levels[level].head; t; t = t->next) {
+        if (own.thread) {   // (only an aged thread could beat it: the first eligible one is the oldest here)
+          if (!eligible(t, c)) continue;
+          if (static_cast<int64_t>(now - t->ready_tsc) >= patience) consider(stolen, t, c, now, patience);
+          break;
+        }
+        consider(stolen, t, c, now, patience);
       }
     }
-    if (best) return best;
+    if (stolen.aged || (stolen.thread && !own.thread)) return stolen.thread;
+    if (own.thread) return own.thread;
   }
   return nullptr;
 }
@@ -506,7 +564,7 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   Thread* prev = c->current;
   c->resched = false;
   c->exit_reschedules = false;
-  g.places[c->index].idle = prev->is_idle;   // (undoes place_ready_locked's claim if the thread it was woken for went elsewhere)
+  g.places[c->index].idle = prev->is_idle;   // (undoes ready_locked's claim if the thread it was woken for went elsewhere)
   if (!voluntary && prev->state == ThreadState::Running) {
     Thread* wanted = find_eligible(c);
     if (!wanted && eligible(prev, c)) return frame;          // nobody else wants the core
@@ -521,14 +579,14 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   if (prev->state == ThreadState::Ready && !prev->is_idle) {      // (so that it competes for this core as before; taken out again below)
     prev->ready_tsc = hardware::read_tsc();
     prev->wake_core = -1;
-    list_append(run_queue(prev->priority), prev);
+    queue_on_locked(prev, c->index);
   }
 
   Thread* next = find_eligible(c);
-  if (next) list_remove(run_queue(next->priority), next);
+  if (next) unqueue_locked(next);
   else next = c->idle;
   if (next != prev) {
-    if (prev->state == ThreadState::Ready && !prev->is_idle) list_remove(run_queue(prev->priority), prev);      // (finish_switch queues it)
+    if (prev->state == ThreadState::Ready && !prev->is_idle) unqueue_locked(prev);      // (finish_switch queues it)
     c->leaving = prev;
   }
   next->state = ThreadState::Running;
@@ -564,10 +622,7 @@ void finish_switch() {
   Thread* prev = c->leaving;
   c->leaving = nullptr;
   prev->on_cpu = false;
-  if (prev->state == ThreadState::Ready && !prev->is_idle) {
-    list_append(run_queue(prev->priority), prev);
-    place_ready_locked(prev);   // (an idle core elsewhere may take it at once)
-  }
+  if (prev->state == ThreadState::Ready && !prev->is_idle) ready_locked(prev);   // (an idle core elsewhere may take it at once)
   unlock_irq(flags);
 }
 

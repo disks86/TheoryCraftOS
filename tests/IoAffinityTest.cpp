@@ -120,6 +120,33 @@ void test_wake_core() {
   CHECK(choose_wake_core(hints(5, -1), all, ArrayView<const CorePlace>()) == kNoCore);
 }
 
+void test_queue_core() {
+  Machine m;
+  const CoreSet all = CoreSet::all();
+  uint32_t queued[8] = {};
+  // The device's core, then the shorter queue among equals.
+  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 5);
+  CHECK(choose_queue_core(hints(-1, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 0);
+  queued[0] = 2;
+  CHECK(choose_queue_core(hints(-1, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 1);
+  // A longer queue on the device's core is fine up to the imbalance limit...
+  queued[0] = 0;
+  queued[5] = kQueueImbalance;
+  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 5);
+  // ...past it the shortest queue takes the thread.
+  queued[5] = kQueueImbalance + 1;
+  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 0);
+  // Only allowed, online cores.
+  CoreSet three;
+  three.add(3);
+  CHECK(choose_queue_core(hints(5, -1), three, m.view(), ArrayView<const uint32_t>(queued, 8)) == 3);
+  m.cores[3].online = false;
+  CHECK(choose_queue_core(hints(5, -1), three, m.view(), ArrayView<const uint32_t>(queued, 8)) == kNoCore);
+  // Missing lengths count as empty queues.
+  Machine fresh;
+  CHECK(choose_queue_core(hints(6, -1), all, fresh.view(), ArrayView<const uint32_t>()) == 6);
+}
+
 void test_interrupt_core() {
   Machine m;
   const CoreSet all = CoreSet::all();
@@ -310,6 +337,7 @@ int main() {
   test_scores();
   test_wake_core();
   test_interrupt_core();
+  test_queue_core();
   test_learned_core();
   test_steering();
   test_cache_domain();

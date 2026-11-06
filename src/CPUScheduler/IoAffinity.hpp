@@ -126,6 +126,12 @@ uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<c
 // index on a tie). kNoCore when no allowed core is idle (the thread then waits for a core to give up its current thread).
 int32_t choose_wake_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores);
 
+// The core whose run queue a ready thread joins when no allowed core is idle: the online allowed core with the best placement_score (the shorter
+// queue, `queued[i]`, among equals, then the lower index), unless that queue is more than kQueueImbalance longer than the shortest allowed one,
+// which then gets the thread instead (so one popular device does not pile every thread onto its core). kNoCore if no allowed core is online.
+constexpr uint32_t kQueueImbalance = 2;
+int32_t choose_queue_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, ArrayView<const uint32_t> queued);
+
 // The core a new device's interrupt should be sent to: an online core in `allowed`, of `kind` if one is online (-1: any kind), carrying the fewest
 // device interrupts already (`devices_per_core[i]`, missing entries count as 0), not `avoid` unless no other core qualifies, the lowest index on a
 // tie. kNoCore if no core is online.

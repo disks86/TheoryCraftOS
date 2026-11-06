@@ -66,6 +66,8 @@ struct Thread {
   scheduling::LearnedIoCore learned_io;
   int32_t wake_core = -1;
   uint64_t ready_tsc = 0;
+  int32_t queued_on = -1;                 // the core whose run queue it is in, or -1
+  uint8_t queued_level = 0;               // the priority level it was queued at (its priority may change while it waits)
   uint64_t wake_tsc = 0;
   Thread* prev = nullptr;   // run queue / wait list links
   Thread* next = nullptr;
