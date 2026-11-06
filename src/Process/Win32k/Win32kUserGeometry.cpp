@@ -464,6 +464,7 @@ uint64_t swp_step(Call& call, Op& op) {
 }  // namespace
 
 uint64_t swp_op_begin(Call& call, const SwpArgs& args, uint32_t show_cmd, bool want_visible_result, bool defer_hdwp) {
+  if (args.w && args.w->parent && args.w->parent == args.w->desktop->message_root && !defer_hdwp) return 1;      // (a message-only window is not moved, restacked or told: the call succeeds)
   Op* op = op_begin(call, swp_step);
   if (!op) return call.fail(kErrorNotEnoughMemory);
   op->a[0] = args.w ? args.w->handle : 0;

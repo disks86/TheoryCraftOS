@@ -105,7 +105,9 @@ static HANDLE dialog_create(HANDLE instance, const void *template_data, HANDLE o
   if (point_size > 0) { xbase = 6 * point_size / 8; ybase = 13 * point_size / 8; if (xbase < 1) xbase = 1; if (ybase < 1) ybase = 1; }
 
   RECT_ rect = {dlg_x(x, xbase), dlg_y(y, ybase), dlg_x(x + cx, xbase), dlg_y(y + cy, ybase)};
-  const DWORD window_style = (style & ~(DWORD)WS_VISIBLE_) | 0x4 /* DS_3DLOOK: every dialog has it */;
+  DWORD window_style = (style & ~(DWORD)WS_VISIBLE_) | 0x4 /* DS_3DLOOK: every dialog has it */;
+  if (style & 0x400 /* DS_CONTROL */) { window_style &= ~(DWORD)(0x00C00000 | 0x00080000); ex_style |= 0x10000 /* WS_EX_CONTROLPARENT */; }      /* (a control-like dialog has no caption or system menu) */
+  else if (!(style & WS_CHILD_)) ex_style |= 0x10000;
   /* the size is the client size: the window is as much bigger as the frame needs */
   RECT_ frame = {0, 0, rect.right - rect.left, rect.bottom - rect.top};
   AdjustWindowRectEx(&frame, window_style, FALSE, ex_style);
