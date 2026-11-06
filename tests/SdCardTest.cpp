@@ -80,7 +80,7 @@ static void test_high_capacity() {
     CHECK(info.block_count == 4096 && info.block_size == 512 && info.removable && !info.read_only && strcmp(info.model, "SD SD16G") == 0 && strcmp(info.serial, "CAFE0123") == 0);
     CHECK(host.width == 4 && host.clock == 25000000 && host.clocks.size() >= 2 && host.clocks[0] == 400000);
     // the sequence of commands of an identification
-    const uint8_t expected[] = {0, 8, 55, 41, 55, 41, 55, 41, 2, 3, 9, 7, 55, 51, 55, 6};
+    const uint8_t expected[] = {0, 8, 55, 41, 55, 41, 55, 41, 2, 3, 9, 7, 55, 51, 55, 6, 55, 13};
     CHECK(host.commands_seen.size() == sizeof expected && memcmp(host.commands_seen.data(), expected, sizeof expected) == 0);
     // a write and a read back: odd sizes and positions, through chunks of the bounce buffer and of the host's limit
     std::vector<uint8_t> out(300 * 512), in(300 * 512);
@@ -232,6 +232,16 @@ static void test_erase() {
     CHECK(!device.discard(0, 1));
     host.write_protect_switch = false;
     CHECK(device.statistics().discards >= 1 && device.statistics().errors == 3);
+    device.shutdown();
+  }
+  {  // a card with DISCARD: used instead of ERASE, and then nothing is promised about what the blocks read
+    FakeSdCard card(4096);
+    card.discard_support = true;
+    FakeSdHost host;
+    host.insert(&card);
+    SdStorageDevice device(host, a);
+    CHECK(device.initialize() && device.info().discard && !device.info().discard_zeroes);
+    CHECK(device.discard(10, 20) && card.discards == 1 && card.erases == 0);
     device.shutdown();
   }
   FakeSdCard plain(4096);

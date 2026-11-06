@@ -41,6 +41,7 @@ bool check_discard(IFileSystem& fs, IStorageDevice& volume) {
   marker = UniquePointer<IFile>();
   constexpr uint64_t kBytes = 1 << 20;
   bool ok = true;
+  const uint64_t zeroed_before = volume.statistics().blocks_zeroed;
   {
     UniquePointer<IFile> f;
     ok = fs.open_file("/DISCARD.TMP", OpenMode::CreateTruncate, &f) == Status::Ok;
@@ -50,6 +51,14 @@ bool check_discard(IFileSystem& fs, IStorageDevice& volume) {
     for (uint64_t at = 0; ok && at < kBytes; at += sizeof chunk) ok = f->write(at, ConstByteView(chunk), &done) == Status::Ok && done == sizeof chunk;
   }
   ok = ok && fs.flush() == Status::Ok;
+  if (volume.info().write_zeroes) {   // the new clusters were zeroed by the device (FAT zero_cluster), not by writes
+    const uint64_t zeroed = volume.statistics().blocks_zeroed - zeroed_before;
+    const bool zero_ok = zeroed * volume.info().block_size >= kBytes / 2;
+    console::puts("      new clusters zeroed by the device: ");
+    console::put_dec(zeroed);
+    console::puts(zero_ok ? " blocks: ok\n" : " blocks: FAILED\n");
+    ok = ok && zero_ok;
+  }
   // Deleted, then sent without a flush (as the file system service does every few seconds).
   const StorageStatistics before = volume.statistics();
   ok = ok && fs.remove("/DISCARD.TMP") == Status::Ok && fs.send_discards() == Status::Ok;

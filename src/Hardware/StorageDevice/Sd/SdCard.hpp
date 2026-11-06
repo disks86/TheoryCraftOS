@@ -31,6 +31,7 @@ struct SdCardInfo {
   bool bus_4bit = false;
   bool can_erase = false;             // the CSD's command classes include class 5 (erase: CMD32, CMD33, CMD38)
   bool erased_reads_ones = false;     // the SCR's DATA_STAT_AFTER_ERASE: erased blocks read as all ones (else zeros)
+  bool can_discard = false;           // the SD Status's DISCARD_SUPPORT (bit 313): CMD38 with argument 1, faster than an erase
   uint32_t relative_address = 0;
   char name[8] = {};                  // the product name of the CID
   uint32_t serial = 0;
@@ -55,7 +56,8 @@ class SdCard {
   // Erases `blocks` blocks from `lba` (CMD32 start, CMD33 end, CMD38), waiting while the card is busy. At most kMaxEraseBlocks at a time (an
   // erase keeps the card busy for longer the more it covers). False if the card cannot erase or reports an error.
   static constexpr uint32_t kMaxEraseBlocks = 8192;
-  bool erase(uint64_t lba, uint32_t blocks);
+  // `discard`: CMD38 DISCARD (the card may keep the old data or erase it, as it likes; can_discard) instead of ERASE.
+  bool erase(uint64_t lba, uint32_t blocks, bool discard = false);
   uint32_t max_blocks() const { return host_.max_blocks(); }
 
  private:

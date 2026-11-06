@@ -297,7 +297,7 @@ struct MemDisk final : hardware::IStorageDevice {
   const char* name() const override { return "memdisk"; }
   bool initialize() override { return true; }
   void shutdown() override {}
-  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; i.discard = dc.enabled; return i; }
+  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; i.discard = dc.enabled; i.write_zeroes = dc.zeroes; return i; }
   hardware::StorageStatistics statistics() const override { return {}; }
   bool read(uint64_t lba, ByteView buffer) override {
     if (buffer.size() % block_size || lba + buffer.size() / block_size > blocks) return false;
@@ -311,6 +311,7 @@ struct MemDisk final : hardware::IStorageDevice {
   }
   bool flush() override { return true; }
   bool discard(uint64_t lba, uint64_t count) override { return dc.discard(data, blocks, block_size, lba, count); }
+  bool write_zeroes(uint64_t lba, uint64_t count) override { return can_write && dc.write_zeroes(data, blocks, block_size, lba, count); }
   uint8_t* data; uint64_t blocks; uint32_t block_size; bool can_write;
   discard_test::DiscardCounters dc;
 };
@@ -967,6 +968,41 @@ static void test_fat_discard(FatImage::Kind kind, uint32_t block, const char* la
   CHECK(plain.dc.calls == 0 && plain.dc.refused == 0);
 }
 
+// New clusters are zeroed by the device when it can (write_zeroes) - and still zeroed, by writing, when it refuses. The free space is
+// poisoned first (a trim on the poisoning disk), so a new directory that was not zeroed would list garbage.
+static void test_fat_write_zeroes(bool refuse, uint32_t block) {
+  TestAllocator a;
+  {
+    FatImage im(FatImage::F16);
+    MemDisk disk(im.img, im.total * 512ull, block, true);
+    disk.dc.enabled = true;
+    disk.dc.zeroes = true;
+    disk.dc.refuse_zeroes = refuse;
+    UniquePointer<IFileSystem> fsp;
+    CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &fsp), Status::Ok);
+    if (!fsp) return;
+    uint64_t trimmed = 0;
+    CHECK(fsp->trim("/", &trimmed) == Status::Ok && trimmed > 0);   // every free cluster is poison now
+    for (int i = 0; i < 12; ++i) {
+      char name[16];
+      snprintf(name, sizeof name, "/dir%02d", i);
+      CHECK_STATUS(fsp->create_directory(name), Status::Ok);
+      UniquePointer<IDirectory> dir;
+      CHECK_STATUS(fsp->open_directory(name, &dir), Status::Ok);
+      DirectoryEntry e;
+      int listed = 0;
+      while (dir && dir->next(&e) == Status::Ok) ++listed;
+      CHECK(listed == 0);   // (no garbage entries from the poison)
+    }
+    std::vector<discard_test::Model> files;
+    CHECK(discard_test::run(*fsp, 555 + block, &files));
+    CHECK(refuse || block > 512 ? disk.dc.zero_calls == 0 : disk.dc.zero_calls > 0);   // (512-byte clusters: whole blocks only on a 512-byte device)
+    printf("  FAT16 write zeroes%s on %u-byte blocks: %llu calls, %llu blocks\n", refuse ? " (refused)" : "", block, (unsigned long long)disk.dc.zero_calls,
+           (unsigned long long)disk.dc.zeroed_blocks);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_set_metadata() {
   TestAllocator a;
   {
@@ -1006,6 +1042,9 @@ int main() {
   test_fat_discard(FatImage::F16, 512, "FAT16 discard");
   test_fat_discard(FatImage::F32, 512, "FAT32 discard");
   test_fat_discard(FatImage::F16, 2048, "FAT16/2048 discard");
+  test_fat_write_zeroes(false, 512);
+  test_fat_write_zeroes(true, 512);
+  test_fat_write_zeroes(false, 2048);   // (512-byte clusters on 2048-byte blocks: not whole blocks, written)
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("filesystem tests passed\n");
   return 0;

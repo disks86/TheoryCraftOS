@@ -220,6 +220,10 @@ bool UsbMassStorageDevice::initialize() {
     unmap_ = scsi::probe_unmap([this](ConstByteView cdb, ByteView buffer, bool in) { return run(cdb, buffer, in); }, wire_.subview(kDataOffset, 64));
     info_.discard = unmap_.unmap;
     info_.discard_zeroes = unmap_.unmap && unmap_.reads_zeros;
+    // (the block of zeros goes through the wire buffer: blocks that fit what is left of it)
+    if (info_.block_size <= wire_.size() - kDataOffset)
+      write_same_max_ = scsi::probe_write_same([this](ConstByteView cdb, ByteView buffer, bool in) { return run(cdb, buffer, in); }, wire_.subview(kDataOffset, 64));
+    info_.write_zeroes = write_same_max_ != 0;
   }
   return prepare_bounce();
 }
@@ -235,6 +239,25 @@ bool UsbMassStorageDevice::discard(uint64_t lba, uint64_t blocks) {
     stats_.blocks_discarded += blocks;
   } else {
     ++stats_.errors;
+  }
+  return ok;
+}
+
+// WRITE SAME(16) with a block of zeros (scsi::write_same_zeroes). A unit that turns it down once is not asked again.
+bool UsbMassStorageDevice::write_zeroes(uint64_t lba, uint64_t blocks) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!info_.write_zeroes || __atomic_load_n(&write_same_refused_, __ATOMIC_ACQUIRE) || blocks == 0 || lba >= info_.block_count ||
+      blocks > info_.block_count - lba || !present() || wire_.empty()) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  const ByteView zero_block = wire_.subview(kDataOffset, info_.block_size);
+  const bool ok = scsi::write_same_zeroes([this](ConstByteView cdb, ByteView data, bool in) { return run(cdb, data, in); }, zero_block, write_same_max_, lba, blocks);
+  if (ok) {
+    __atomic_fetch_add(&stats_.blocks_zeroed, blocks, __ATOMIC_RELAXED);
+  } else {
+    __atomic_store_n(&write_same_refused_, true, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
   }
   return ok;
 }

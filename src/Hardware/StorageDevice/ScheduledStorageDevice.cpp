@@ -114,6 +114,7 @@ void ScheduledStorageDevice::describe(IPropertySink& sink) const {
   const StorageInfo info = inner_->info();
   sink.add_flag("Discard", info.discard);
   if (info.discard) sink.add_flag("Discarded blocks read as zeros", info.discard_zeroes);
+  sink.add_flag("Write zeroes", info.write_zeroes);
 }
 
 bool ScheduledStorageDevice::read(uint64_t lba, ByteView buffer) {
@@ -126,6 +127,10 @@ bool ScheduledStorageDevice::write(uint64_t lba, ConstByteView buffer) {
 
 bool ScheduledStorageDevice::discard(uint64_t lba, uint64_t blocks) {
   return run(iosched::IoOp::Discard, 0, [&] { return inner_->discard(lba, blocks); });
+}
+
+bool ScheduledStorageDevice::write_zeroes(uint64_t lba, uint64_t blocks) {
+  return run(iosched::IoOp::WriteZeroes, 0, [&] { return inner_->write_zeroes(lba, blocks); });
 }
 
 bool ScheduledStorageDevice::flush() {

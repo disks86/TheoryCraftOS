@@ -46,6 +46,7 @@ struct StorageInfo {
   // Discarded blocks read back as zeros, the device says (NVMe DLFEAT, ATA RZAT, SCSI LBPRZ, SD's erased state). For information only: a
   // discard is advisory (a device may leave part of a range as it was), so nothing relies on it to zero data.
   bool discard_zeroes = false;
+  bool write_zeroes = false;   // write_zeroes() works: the device zeroes blocks itself (NVMe Write Zeroes, virtio-blk WRITE_ZEROES, SCSI WRITE SAME)
   char model[41] = {};   // NUL-terminated, trailing blanks trimmed
   char serial[21] = {};  // empty when the device reports none
 };
@@ -54,6 +55,7 @@ struct StorageStatistics {
   uint64_t reads = 0, writes = 0;
   uint64_t blocks_read = 0, blocks_written = 0;
   uint64_t discards = 0, blocks_discarded = 0;
+  uint64_t blocks_zeroed = 0;   // by write_zeroes
   uint64_t errors = 0;
 };
 
@@ -92,6 +94,10 @@ class IStorageDevice : public IHardware {
   // DISCARD on virtio-blk), so flash can erase them ahead of time. What they read afterwards is up to the device. False when the device
   // cannot (StorageInfo::discard), the range is outside it, or it reports an error.
   virtual bool discard(uint64_t lba, uint64_t blocks) { (void)lba; (void)blocks; return false; }
+  // Makes `blocks` blocks from `lba` read as zeros, the device doing it without the zeros crossing the bus (unlike discard, this is a
+  // guarantee). False when the device cannot (StorageInfo::write_zeroes) - then write zeros instead - the range is outside it, or it
+  // reports an error.
+  virtual bool write_zeroes(uint64_t lba, uint64_t blocks) { (void)lba; (void)blocks; return false; }
   // Shutdown, before the kernel stops: the device raises no more interrupts and its requests (the last flush) are polled from here on. After
   // kernel::stop the firmware's interrupt table is back, and a completion interrupt would land in a handler that never returns.
   virtual void stop_interrupts() {}

@@ -129,6 +129,7 @@ class FatFileSystem final : public IFileSystem {
   const uint64_t first_block_;
   void send_discards_if_due();   // after freeing: a big batch goes out now (the device flushed first)
   DiscardBatch discard_;   // freed clusters, discarded after the next flush
+  bool device_zeroes_ = false;   // the device can zero blocks itself (IStorageDevice::write_zeroes): new clusters are zeroed that way
   mutable kernel::RecursiveMutex mutex_;
   File* open_files_ = nullptr;   // the open file handles, newest first (see File)
   uint64_t epoch_ = 0;           // changes whenever a cluster chain loses clusters, which makes ChainCursors start over

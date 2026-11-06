@@ -125,6 +125,39 @@ int main() {
     if (scsi::probe_unmap(unit, ByteView(scratch)).unmap || scsi::unmap_range(unit, scsi::UnmapSupport{}, ByteView(scratch), 0, 1)) { puts("FAILED: not thin"); return 1; }
     if (scsi::probe_unmap(unit, ByteView(scratch).first(10)).unmap) { puts("FAILED: small scratch"); return 1; }
   }
+  {  // WRITE SAME as write zeroes: the limit from the Block Limits page, commands split at it, the block sent is zeros
+    std::vector<std::vector<uint8_t>> commands;
+    uint64_t limit = 3000;
+    bool page = true, refuse = false;
+    auto unit = [&](ConstByteView cdb, ByteView data, bool in) {
+      if (cdb[0] == scsi::kInquiry && (cdb[1] & 1) && in && cdb[2] == scsi::kVpdBlockLimits && page) {
+        data.fill(0);
+        data[1] = 0xB0;
+        for (int i = 0; i < 8; ++i) data[36 + i] = static_cast<uint8_t>(limit >> (56 - 8 * i));
+        return true;
+      }
+      if (cdb[0] == scsi::kWriteSame16 && !in && !refuse) {
+        for (uint8_t b : data) if (b != 0) return false;
+        commands.emplace_back(cdb.data(), cdb.data() + 16);
+        return true;
+      }
+      return false;
+    };
+    uint8_t scratch[64], block[512];
+    for (uint8_t& b : block) b = 0xEE;
+    const uint64_t max = scsi::probe_write_same(unit, ByteView(scratch));
+    auto lba = [&](size_t i) { uint64_t v = 0; for (int k = 2; k < 10; ++k) v = (v << 8) | commands[i][k]; return v; };
+    auto count = [&](size_t i) { uint32_t v = 0; for (int k = 10; k < 14; ++k) v = (v << 8) | commands[i][k]; return v; };
+    if (max != 3000 || !scsi::write_same_zeroes(unit, ByteView(block), max, 0x100000000ull, 7000) || commands.size() != 3 || commands[0][0] != 0x93 ||
+        commands[0][1] != 0 || lba(0) != 0x100000000ull || count(0) != 3000 || lba(1) != 0x100000000ull + 3000 || count(1) != 3000 ||
+        lba(2) != 0x100000000ull + 6000 || count(2) != 1000) { puts("FAILED: write same"); return 1; }
+    limit = 0;
+    if (scsi::probe_write_same(unit, ByteView(scratch)) != 0xFFFF) { puts("FAILED: write same without a limit"); return 1; }
+    page = false;
+    if (scsi::probe_write_same(unit, ByteView(scratch)) != 0) { puts("FAILED: write same without the page"); return 1; }
+    refuse = true;
+    if (scsi::write_same_zeroes(unit, ByteView(block), 100, 0, 10)) { puts("FAILED: write same refused"); return 1; }
+  }
 
   for (int round = 0; round < 40000; ++round) {
     // truncations at every length, byte flips, junk, and lengths that lie

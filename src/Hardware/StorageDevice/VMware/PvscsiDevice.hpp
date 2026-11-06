@@ -78,6 +78,7 @@ class PvscsiDevice final : public StorageDeviceBase {
   bool initialize() override;
   void shutdown() override;
   bool discard(uint64_t lba, uint64_t blocks) override;
+  bool write_zeroes(uint64_t lba, uint64_t blocks) override;
 
  protected:
   bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
@@ -90,6 +91,8 @@ class PvscsiDevice final : public StorageDeviceBase {
   uint32_t target_;
   bool optical_ = false;
   scsi::UnmapSupport unmap_;   // UNMAP when the unit is thin provisioned and says it takes it
+  uint64_t write_same_max_ = 0;   // WRITE SAME as write zeroes: the most blocks a command (0: none)
+  bool write_same_refused_ = false;   // atomic: the unit turned WRITE SAME down once; write_zeroes fails at once from then on
 };
 
 }  // namespace hardware

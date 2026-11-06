@@ -232,6 +232,28 @@ It appears in the storage demo and the properties. It is for information only: N
 leave part of a range as it was), so nothing uses a discard to zero data. Zeroing would need Write Zeroes or WRITE SAME. In QEMU only the
 NVMe disk claims zeros.
 
+**Write zeroes.** `IStorageDevice::write_zeroes(lba, blocks)` with `StorageInfo::write_zeroes` makes blocks read as zeros without the
+zeros crossing the bus, and unlike discard it is a guarantee. It goes through the I/O scheduler as `IoOp::WriteZeroes`, counted with
+writes at the cost of the command alone. `StorageStatistics::blocks_zeroed` counts it.
+
+- **The commands.**
+  - NVMe: Write Zeroes, when ONCS bit 3 is set; 65536 blocks a command.
+  - virtio-blk: `VIRTIO_BLK_F_WRITE_ZEROES`, at most `max_write_zeroes_sectors` a request.
+  - SCSI (virtio-scsi, pvscsi, USB): WRITE SAME(16) with one block of zeros (`scsi::write_same_zeroes`). A unit with a Block Limits page
+    is taken to support it; one that refuses it once is not asked again, and the caller writes zeros.
+  - ATA has none here; it would need SCT Write Same.
+- **FAT** zeroes the clusters it allocates this way when a cluster is whole device blocks, and writes zeros otherwise or when the device
+  refuses.
+- **Tests.**
+  - FileSystemTest poisons the free space first, then new directories must still list empty; this also passes on a disk that refuses
+    write zeroes.
+  - ParserFuzzTest covers WRITE SAME against a scripted unit.
+  - In the boot self-test, the 1 MiB file's clusters are zeroed by the disk (2048 blocks). Write zeroes is verified (pattern, zero, read
+    back) on five scratch disk types: virtio-blk, NVMe, virtio-scsi, pvscsi and USB.
+
+**SD DISCARD.** A card whose SD Status (ACMD13) has DISCARD_SUPPORT gets CMD38 with argument 1, which is faster, instead of an ERASE.
+Its contents afterwards are the card's choice, so `discard_zeroes` is off then.
+
 **virtio-scsi discard.**
 
 - **Detection.** UNMAP, when READ CAPACITY(16) reports a thin-provisioned unit (LBPME) and the Logical Block Provisioning VPD page says
@@ -266,10 +288,8 @@ The configurations: KVM with 4, 8 and 1 cores (8 with `num-queues=3` for virtio-
     buffers are and user-mode buffers may not be.
   - A big request takes extra slots only if they are free, so on a busy device it runs mostly in series. The I/O scheduler still counts it
     as one request.
-- **Discard gaps.**
-  - There is no Write Zeroes or WRITE SAME, so file systems still write zeros where they need them.
-  - SD uses ERASE, not the faster DISCARD (CMD38 argument 1, SD 3.0).
-  - UAS (USB Attached SCSI) is not supported, so USB disks stay one command at a time.
+- **USB disks stay one command at a time.** UAS needs bulk streams in the xHCI driver, an asynchronous bulk interface, and the UAS
+  protocol itself; that is a project of its own. ATA has no write zeroes (SCT Write Same is not done).
 - **Driver features still missing.**
   - NVMe: no interrupt coalescing (left off on purpose, for latency), only the first namespace.
   - AHCI: no port multipliers.

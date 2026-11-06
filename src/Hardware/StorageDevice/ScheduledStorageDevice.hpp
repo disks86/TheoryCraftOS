@@ -55,6 +55,7 @@ class ScheduledStorageDevice final : public IStorageDevice {
   bool flush() override;
   void stop_interrupts() override { inner_->stop_interrupts(); }
   bool discard(uint64_t lba, uint64_t blocks) override;
+  bool write_zeroes(uint64_t lba, uint64_t blocks) override;
 
   iosched::IoSchedulerStatistics scheduler_statistics() const { return scheduler_.statistics(); }
   IStorageDevice& device() { return *inner_; }

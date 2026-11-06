@@ -296,6 +296,7 @@ Status FatFileSystem::init() {
   fat_sectors_ = fat_sectors;
   read_only_ = storage.read_only;
   discard_.attach(&device_, !read_only_);
+  device_zeroes_ = storage.write_zeroes && !read_only_;
   root_dir_start_ = reserved + fats * fat_sectors;
   const uint32_t root_sectors = (root_entries_ * 32 + bytes_per_sector_ - 1) / bytes_per_sector_;
   data_start_ = root_dir_start_ + root_sectors;
@@ -816,8 +817,15 @@ uint32_t FatFileSystem::free_cluster_count() {
 }
 
 Status FatFileSystem::zero_cluster(uint32_t cluster) {
-  uint8_t zeros[4096] = {};
   const uint64_t base = cluster_offset(cluster);
+  // The device zeroes it without the zeros crossing the bus, when the cluster is whole device blocks (else, or if it refuses, written).
+  const uint64_t absolute = first_block_ * block_size_ + base;
+  if (device_zeroes_ && absolute % block_size_ == 0 && cluster_bytes_ % block_size_ == 0) {
+    const uint64_t block = absolute / block_size_, blocks = cluster_bytes_ / block_size_;
+    if (block_number_ != ~uint64_t{0} && block_number_ >= block && block_number_ < block + blocks) block_number_ = ~uint64_t{0};   // (the cached block is stale)
+    if (device_.write_zeroes(block, blocks)) return Status::Ok;
+  }
+  uint8_t zeros[4096] = {};
   for (uint32_t done = 0; done < cluster_bytes_;) {
     const uint32_t n = cluster_bytes_ - done < sizeof zeros ? cluster_bytes_ - done : static_cast<uint32_t>(sizeof zeros);
     const Status s = write_bytes(base + done, ConstByteView(zeros, n));

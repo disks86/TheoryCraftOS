@@ -35,6 +35,16 @@ constexpr uint8_t kPoison = 0xDD;
 struct DiscardCounters {
   bool enabled = false;
   uint64_t calls = 0, blocks = 0, refused = 0;
+  // write_zeroes: offered when `zeroes`; `refuse_zeroes` turns every call down (the caller must write zeros itself then).
+  bool zeroes = false, refuse_zeroes = false;
+  uint64_t zero_calls = 0, zeroed_blocks = 0;
+  bool write_zeroes(uint8_t* data, uint64_t total, uint32_t block_size, uint64_t lba, uint64_t count) {
+    if (!zeroes || refuse_zeroes || count == 0 || lba >= total || count > total - lba) return false;
+    memset(data + lba * block_size, 0, count * block_size);
+    ++zero_calls;
+    zeroed_blocks += count;
+    return true;
+  }
   // Poisons blocks [lba, lba + count) of `data` (a disk of `total` blocks of `block_size`); false when out of range.
   bool discard(uint8_t* data, uint64_t total, uint32_t block_size, uint64_t lba, uint64_t count) {
     if (!enabled || count == 0 || lba >= total || count > total - lba) {

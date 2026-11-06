@@ -60,6 +60,7 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
   bool initialize() override;
   void shutdown() override;
   bool discard(uint64_t lba, uint64_t blocks) override;
+  bool write_zeroes(uint64_t lba, uint64_t blocks) override;
 
  protected:
   bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
@@ -80,6 +81,8 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
   uint16_t in_max_packet_, out_max_packet_;
   uint32_t generation_;     // the port's generation when the device was taken over
   scsi::UnmapSupport unmap_;   // UNMAP (a USB SSD that is thin provisioned says so; sticks do not)
+  uint64_t write_same_max_ = 0;   // WRITE SAME as write zeroes: the most blocks a command (0: none)
+  bool write_same_refused_ = false;   // atomic: the unit turned WRITE SAME down once; write_zeroes fails at once from then on
   bool shut_down_ = false;
   bool ejected_ = false;
   uint8_t last_sense_key_ = 0;   // of the last command that failed with CHECK CONDITION (0: none, or it has not failed since)

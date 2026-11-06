@@ -24,7 +24,7 @@ namespace hardware::scsi {
 
 constexpr uint8_t kTestUnitReady = 0x00, kInquiry = 0x12, kReadCapacity10 = 0x25, kRead10 = 0x28,
                   kWrite10 = 0x2A, kSynchronizeCache10 = 0x35, kRead16 = 0x88, kWrite16 = 0x8A,
-                  kServiceActionIn16 = 0x9E, kUnmap = 0x42;
+                  kServiceActionIn16 = 0x9E, kUnmap = 0x42, kWriteSame16 = 0x93;
 constexpr uint8_t kReadCapacity16Action = 0x10;
 constexpr uint8_t kDeviceTypeDisk = 0x00, kDeviceTypeOptical = 0x05;
 constexpr uint8_t kStatusGood = 0x00, kStatusCheckCondition = 0x02;
@@ -95,6 +95,28 @@ inline bool parse_block_limits(ConstByteView data, uint32_t* max_unmap_blocks, u
   return in.ok() && page == kVpdBlockLimits;
 }
 
+// The Block Limits page's MAXIMUM WRITE SAME LENGTH (bytes 36-43; 0: none given). False if the page is short or another one.
+inline bool parse_write_same_limit(ConstByteView data, uint64_t* max_blocks) {
+  ByteReader in(data);
+  in.skip(1);
+  const uint8_t page = in.u8();
+  in.skip(34);
+  const uint64_t high = in.be32();
+  *max_blocks = (high << 32) | in.be32();
+  return in.ok() && page == kVpdBlockLimits;
+}
+
+// WRITE SAME(16) without UNMAP: the one block of data the command carries is written to `blocks` blocks from `lba`.
+inline void build_write_same16(ByteView cdb, uint64_t lba, uint32_t blocks) {
+  cdb.first(16).fill(0);
+  ByteWriter out(cdb.first(16));
+  out.u8(kWriteSame16);
+  out.u8(0);
+  out.be32(static_cast<uint32_t>(lba >> 32));
+  out.be32(static_cast<uint32_t>(lba));
+  out.be32(blocks);
+}
+
 // UNMAP of one range: the 10-byte CDB in `cdb` and the 24-byte parameter list (header and one block descriptor) in `parameters`.
 constexpr uint32_t kUnmapParameterBytes = 24;
 inline bool build_unmap(ByteView cdb, ByteView parameters, uint64_t lba, uint32_t blocks) {
@@ -157,6 +179,38 @@ bool unmap_range(Run&& run, const UnmapSupport& support, ByteView scratch, uint6
     const uint32_t n = blocks < support.max_blocks ? static_cast<uint32_t>(blocks) : support.max_blocks;
     uint8_t cdb[10];
     if (!build_unmap(ByteView(cdb), scratch, lba, n) || !run(ConstByteView(cdb), scratch.first(kUnmapParameterBytes), false)) return false;
+    lba += n;
+    blocks -= n;
+  }
+  return true;
+}
+
+// WRITE SAME as write zeroes: a unit with a Block Limits page is taken to have it (the limit there, or 65535 blocks a command when it
+// gives none); whether it really does shows on the first use (write_same_zeroes fails, and the caller stops trying).
+template <class Run>
+uint64_t probe_write_same(Run&& run, ByteView scratch) {
+  if (scratch.size() < 64) return 0;
+  const ByteView data = scratch.first(64);
+  uint8_t cdb[6];
+  build_vpd_inquiry(ByteView(cdb), kVpdBlockLimits, 64);
+  data.fill(0);
+  uint64_t max_blocks = 0;
+  if (!run(ConstByteView(cdb), data, true) || !parse_write_same_limit(data, &max_blocks)) return 0;
+  return max_blocks ? max_blocks : 0xFFFF;
+}
+
+// Zeroes [lba, lba + blocks) with WRITE SAME(16) commands of at most `max_blocks` (and 2^32 - 1); `zero_block` is one block of the unit's
+// size, filled with zeros here, that each command sends.
+template <class Run>
+bool write_same_zeroes(Run&& run, ByteView zero_block, uint64_t max_blocks, uint64_t lba, uint64_t blocks) {
+  if (max_blocks == 0 || zero_block.empty()) return false;
+  if (max_blocks > 0xFFFFFFFFull) max_blocks = 0xFFFFFFFFull;
+  zero_block.fill(0);
+  while (blocks > 0) {
+    const uint32_t n = static_cast<uint32_t>(blocks < max_blocks ? blocks : max_blocks);
+    uint8_t cdb[16];
+    build_write_same16(ByteView(cdb), lba, n);
+    if (!run(ConstByteView(cdb), zero_block, false)) return false;
     lba += n;
     blocks -= n;
   }

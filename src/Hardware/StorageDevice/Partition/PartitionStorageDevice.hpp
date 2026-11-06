@@ -69,6 +69,11 @@ class PartitionStorageDevice final : public IStorageDevice {
     return true;
   }
   void stop_interrupts() override { parent_.stop_interrupts(); }
+  bool write_zeroes(uint64_t lba, uint64_t blocks) override {
+    if (blocks == 0 || lba > count_ || blocks > count_ - lba || !parent_.write_zeroes(first_ + lba, blocks)) return fail();
+    stats_.blocks_zeroed += blocks;
+    return true;
+  }
 
  private:
   bool in_range(uint64_t lba, uint64_t bytes) const {

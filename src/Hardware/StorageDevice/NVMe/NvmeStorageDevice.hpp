@@ -65,6 +65,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   bool flush() override;
   void stop_interrupts() override { disable_interrupts(); }
   bool discard(uint64_t lba, uint64_t blocks) override;
+  bool write_zeroes(uint64_t lba, uint64_t blocks) override;
   StorageStatistics statistics() const override;
 
   uint32_t queue_count() const { return queue_count_; }

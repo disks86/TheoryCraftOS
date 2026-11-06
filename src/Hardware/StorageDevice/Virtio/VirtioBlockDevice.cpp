@@ -27,9 +27,9 @@ namespace hardware {
 
 namespace {
 constexpr uint32_t kFeatureReadOnly = 1u << 5, kFeatureBlockSize = 1u << 6, kFeatureFlush = 1u << 9, kFeatureMultiqueue = 1u << 12,
-                   kFeatureDiscard = 1u << 13;
-constexpr uint32_t kConfigCapacity = 0, kConfigBlockSize = 20, kConfigNumQueues = 34, kConfigMaxDiscardSectors = 36;
-constexpr uint32_t kTypeRead = 0, kTypeWrite = 1, kTypeFlush = 4, kTypeDiscard = 11;
+                   kFeatureDiscard = 1u << 13, kFeatureWriteZeroes = 1u << 14;
+constexpr uint32_t kConfigCapacity = 0, kConfigBlockSize = 20, kConfigNumQueues = 34, kConfigMaxDiscardSectors = 36, kConfigMaxWriteZeroesSectors = 48;
+constexpr uint32_t kTypeRead = 0, kTypeWrite = 1, kTypeFlush = 4, kTypeDiscard = 11, kTypeWriteZeroes = 13;
 constexpr uint8_t kStatusOk = 0, kStatusPending = 0xFF;
 constexpr uint32_t kSectorBytes = 512;
 constexpr uint32_t kDescriptorsPerSlot = 3;       // header, data, status
@@ -49,7 +49,7 @@ uint16_t VirtioBlockDevice::read_config16(uint32_t offset) const {
 }
 
 bool VirtioBlockDevice::initialize() {
-  transport_.request_features(kFeatureReadOnly | kFeatureBlockSize | kFeatureFlush | kFeatureMultiqueue | kFeatureDiscard);
+  transport_.request_features(kFeatureReadOnly | kFeatureBlockSize | kFeatureFlush | kFeatureMultiqueue | kFeatureDiscard | kFeatureWriteZeroes);
   if (!transport_.initialize()) {
     transport_.shutdown();
     return false;
@@ -68,6 +68,10 @@ bool VirtioBlockDevice::initialize() {
   if (accepted & kFeatureDiscard) {
     for (uint32_t i = 0; i < 4; ++i) max_discard_sectors_ |= uint32_t{transport_.read_config8(kConfigMaxDiscardSectors + i)} << (8 * i);
     info_.discard = max_discard_sectors_ != 0 && !info_.read_only;
+  }
+  if (accepted & kFeatureWriteZeroes) {
+    for (uint32_t i = 0; i < 4; ++i) max_write_zeroes_sectors_ |= uint32_t{transport_.read_config8(kConfigMaxWriteZeroesSectors + i)} << (8 * i);
+    info_.write_zeroes = max_write_zeroes_sectors_ != 0 && !info_.read_only;
   }
 
   // A queue per online core, as many as the device has.
@@ -320,16 +324,10 @@ bool VirtioBlockDevice::write(uint64_t lba, ConstByteView buffer) {
   return run(true, lba, ByteView(), buffer);
 }
 
-// One segment {sector, sectors, flags} a request, at most max_discard_sectors each.
-bool VirtioBlockDevice::discard(uint64_t lba, uint64_t blocks) {
-  if (!started_ || !info_.discard || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
-    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
-    return false;
-  }
-  const uint64_t requested = blocks;
+bool VirtioBlockDevice::segment_requests(uint32_t type, uint32_t max_sectors, uint64_t lba, uint64_t blocks) {
   const uint32_t scale = info_.block_size / kSectorBytes;
   uint64_t sector = lba * scale, sectors = blocks * scale;
-  const uint32_t limit = max_discard_sectors_ / scale * scale;   // (whole blocks)
+  const uint32_t limit = max_sectors / scale * scale;   // (whole blocks)
   const uint32_t slot = pool_.acquire();
   Queue& q = queue_for_this_core();
   bool ok = limit != 0;
@@ -338,18 +336,37 @@ bool VirtioBlockDevice::discard(uint64_t lba, uint64_t blocks) {
     ByteWriter segment(slots_[slot].buffer.first(16));
     segment.le64(sector);
     segment.le32(n);
-    segment.le32(0);   // flags: no unmap guarantee asked for
-    ok = submit(q, slot, kTypeDiscard, 0, 16) && finish(q, slot);
+    segment.le32(0);   // flags: no unmap asked for (discard: no guarantee wanted; write zeroes: the blocks are written)
+    ok = submit(q, slot, type, 0, 16) && finish(q, slot);
     sector += n;
     sectors -= n;
   }
   if (!slots_[slot].completion.lost) pool_.release(slot);
+  return ok;
+}
+
+bool VirtioBlockDevice::discard(uint64_t lba, uint64_t blocks) {
+  if (!started_ || !info_.discard || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  const bool ok = segment_requests(kTypeDiscard, max_discard_sectors_, lba, blocks);
   if (ok) {
     __atomic_fetch_add(&stats_.discards, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&stats_.blocks_discarded, requested, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats_.blocks_discarded, blocks, __ATOMIC_RELAXED);
   } else {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
   }
+  return ok;
+}
+
+bool VirtioBlockDevice::write_zeroes(uint64_t lba, uint64_t blocks) {
+  if (!started_ || !info_.write_zeroes || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  const bool ok = segment_requests(kTypeWriteZeroes, max_write_zeroes_sectors_, lba, blocks);
+  __atomic_fetch_add(ok ? &stats_.blocks_zeroed : &stats_.errors, ok ? blocks : 1, __ATOMIC_RELAXED);
   return ok;
 }
 
@@ -371,6 +388,7 @@ StorageStatistics VirtioBlockDevice::statistics() const {
   s.blocks_written = __atomic_load_n(&stats_.blocks_written, __ATOMIC_RELAXED);
   s.discards = __atomic_load_n(&stats_.discards, __ATOMIC_RELAXED);
   s.blocks_discarded = __atomic_load_n(&stats_.blocks_discarded, __ATOMIC_RELAXED);
+  s.blocks_zeroed = __atomic_load_n(&stats_.blocks_zeroed, __ATOMIC_RELAXED);
   s.errors = __atomic_load_n(&stats_.errors, __ATOMIC_RELAXED);
   return s;
 }

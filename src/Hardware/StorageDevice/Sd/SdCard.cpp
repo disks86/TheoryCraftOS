@@ -151,6 +151,19 @@ bool SdCard::initialize() {
     c.response_type = SdResponse::R1;
     if (app_command(c) && !(c.response[0] & kCardErrors) && host_.set_bus_width(4)) info_.bus_4bit = true;
   }
+  // The SD Status (ACMD13, 64 bytes): byte 24 bit 1 is DISCARD_SUPPORT. A card that does not answer just has no discard.
+  if (info_.can_erase) {
+    uint8_t status[64] = {};
+    SdCommand status_prefix;
+    status_prefix.index = kAppCommand;
+    status_prefix.argument = info_.relative_address << 16;
+    status_prefix.response_type = SdResponse::R1;
+    c = SdCommand();
+    c.index = kSendStatus;
+    c.response_type = SdResponse::R1;
+    if (host_.command(status_prefix) && host_.read_blocks(c, 64, 1, ByteView(status)) && !(c.response[0] & kCardErrors))
+      info_.can_discard = status[24] & 0x02;
+  }
   if (!info_.high_capacity) {
     c = SdCommand();
     c.index = kSetBlockLength;
@@ -206,8 +219,8 @@ bool SdCard::write(uint64_t lba, uint32_t blocks, ConstByteView data) {
   return ok && wait_ready();
 }
 
-bool SdCard::erase(uint64_t lba, uint32_t blocks) {
-  if (!info_.can_erase || info_.read_only || blocks == 0 || blocks > kMaxEraseBlocks || lba >= info_.block_count || blocks > info_.block_count - lba) return false;
+bool SdCard::erase(uint64_t lba, uint32_t blocks, bool discard) {
+  if ((discard && !info_.can_discard) || !info_.can_erase || info_.read_only || blocks == 0 || blocks > kMaxEraseBlocks || lba >= info_.block_count || blocks > info_.block_count - lba) return false;
   SdCommand c;
   c.index = kEraseStart;
   c.argument = address_of(lba);
@@ -220,7 +233,7 @@ bool SdCard::erase(uint64_t lba, uint32_t blocks) {
   if (!host_.command(c) || (c.response[0] & kCardErrors)) return false;
   c = SdCommand();
   c.index = kErase;
-  c.argument = 0;   // erase (not discard or FULE: every SD card with class 5 has it)
+  c.argument = discard ? 1u : 0u;   // DISCARD (SD 3.0 cards that say so), else ERASE (every card with class 5)
   c.response_type = SdResponse::R1b;
   if (!host_.command(c) || (c.response[0] & kCardErrors)) return false;
   for (uint32_t i = 0; i < kEraseReadyPolls; ++i) {

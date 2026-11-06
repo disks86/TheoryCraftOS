@@ -41,7 +41,7 @@ bool SdStorageDevice::initialize() {
     info_.serial[i] = static_cast<char>(digit < 10 ? '0' + digit : 'A' + digit - 10);
   }
   info_.discard = card.can_erase && !info_.read_only;   // (an erase, the card's own way of saying blocks are unused)
-  info_.discard_zeroes = info_.discard && !card.erased_reads_ones;
+  info_.discard_zeroes = info_.discard && !card.can_discard && !card.erased_reads_ones;   // (DISCARD leaves the contents up to the card)
   if (!prepare_bounce()) return false;
   return true;
 }
@@ -53,7 +53,7 @@ bool SdStorageDevice::discard(uint64_t lba, uint64_t blocks) {
   const uint64_t requested = blocks;
   while (ok && blocks > 0) {
     const uint32_t n = blocks < SdCard::kMaxEraseBlocks ? static_cast<uint32_t>(blocks) : SdCard::kMaxEraseBlocks;
-    ok = card_.erase(lba, n);
+    ok = card_.erase(lba, n, card_.info().can_discard);
     lba += n;
     blocks -= n;
   }

@@ -374,6 +374,8 @@ bool VirtioScsiDevice::initialize() {
     unmap_ = scsi::probe_unmap([this](ConstByteView cdb, ByteView data, bool in) { return run(cdb, data, in); }, ByteView(scratch));
     info_.discard = unmap_.unmap && !info_.read_only;
     info_.discard_zeroes = info_.discard && unmap_.reads_zeros;
+    write_same_max_ = scsi::probe_write_same([this](ConstByteView cdb, ByteView data, bool in) { return run(cdb, data, in); }, ByteView(scratch));
+    info_.write_zeroes = write_same_max_ != 0 && !info_.read_only;
   }
   return true;
 }
@@ -391,6 +393,25 @@ bool VirtioScsiDevice::discard(uint64_t lba, uint64_t blocks) {
     __atomic_fetch_add(&stats_.discards, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&stats_.blocks_discarded, blocks, __ATOMIC_RELAXED);
   } else {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+  }
+  return ok;
+}
+
+// WRITE SAME(16) with a block of zeros (scsi::write_same_zeroes). A unit that turns it down once is not asked again.
+bool VirtioScsiDevice::write_zeroes(uint64_t lba, uint64_t blocks) {
+  if (!info_.write_zeroes || __atomic_load_n(&write_same_refused_, __ATOMIC_ACQUIRE) || blocks == 0 || lba >= info_.block_count ||
+      blocks > info_.block_count - lba) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  uint8_t zeros[4096];
+  const ByteView zero_block = ByteView(zeros).first(info_.block_size);   // (copied into a slot by the controller)
+  const bool ok = scsi::write_same_zeroes([this](ConstByteView cdb, ByteView data, bool in) { return run(cdb, data, in); }, zero_block, write_same_max_, lba, blocks);
+  if (ok) {
+    __atomic_fetch_add(&stats_.blocks_zeroed, blocks, __ATOMIC_RELAXED);
+  } else {
+    __atomic_store_n(&write_same_refused_, true, __ATOMIC_RELEASE);
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
   }
   return ok;

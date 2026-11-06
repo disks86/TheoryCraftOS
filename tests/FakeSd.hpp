@@ -31,6 +31,8 @@ struct FakeSdCard {
   // what kind of card
   bool version2 = true, high_capacity = true, supports_4bit = true, is_sd = true, csd_write_protected = false;
   bool erase_class = true, erased_ones = false;  // CSD command class 5; SCR DATA_STAT_AFTER_ERASE
+  bool discard_support = false;                  // SD Status DISCARD_SUPPORT
+  uint32_t discards = 0;
   uint64_t erase_first = ~0ull, erase_last = ~0ull;  // CMD32 / CMD33
   uint32_t busy_after_erase = 3, erases = 0;
   uint64_t blocks = 4096;                      // of 512 bytes
@@ -148,8 +150,15 @@ struct FakeSdCard {
         return true;
       }
       case 38:
-        if (!erase_class || state != State::Transfer || c.argument != 0 || erase_first > erase_last || erase_last >= blocks) {
+        if (!erase_class || state != State::Transfer || c.argument > 1 || (c.argument == 1 && !discard_support) || erase_first > erase_last || erase_last >= blocks) {
           c.response[0] = 1u << 28;   // ERASE_SEQ_ERROR
+          return true;
+        }
+        if (c.argument == 1) {   // DISCARD: this card keeps the data, as it may (only the counter says it happened)
+          ++discards;
+          erase_first = erase_last = ~0ull;
+          busy_left = busy_after_erase;
+          c.response[0] = status();
           return true;
         }
         memset(data.data() + erase_first * 512, erased_ones ? 0xFF : 0x00, (erase_last - erase_first + 1) * 512);
@@ -202,6 +211,15 @@ struct FakeSdHost final : ISdHost {
       if (!app || block_size != 8 || card->state != FakeSdCard::State::Transfer) return false;
       uint8_t scr[8] = {0x02, static_cast<uint8_t>((card->supports_4bit ? 0x05 : 0x01) | (card->erased_ones ? 0x80 : 0)), 0, 0, 0, 0, 0, 0};
       for (size_t i = 0; i < 8; ++i) data[i] = scr[i];
+      c.response[0] = card->status();
+      return true;
+    }
+    if (c.index == 13) {                                       // ACMD13: the SD Status
+      const bool app = card->app_next;
+      card->app_next = false;
+      if (!app || block_size != 64 || card->state != FakeSdCard::State::Transfer) return false;
+      for (size_t i = 0; i < 64; ++i) data[i] = 0;
+      if (card->discard_support) data[24] = 0x02;
       c.response[0] = card->status();
       return true;
     }

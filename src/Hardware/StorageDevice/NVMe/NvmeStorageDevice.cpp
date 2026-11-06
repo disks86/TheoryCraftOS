@@ -34,7 +34,8 @@ constexpr uint32_t kCcIoSqEntrySize = 6u << 16, kCcIoCqEntrySize = 4u << 20;  //
 constexpr uint32_t kCstsReady = 1u, kCstsFatal = 1u << 1;
 constexpr uint8_t kAdminCreateIoSq = 0x01, kAdminCreateIoCq = 0x05, kAdminIdentify = 0x06, kAdminSetFeatures = 0x09;
 constexpr uint32_t kFeatureNumberOfQueues = 0x07;
-constexpr uint8_t kIoFlush = 0x00, kIoWrite = 0x01, kIoRead = 0x02, kIoDatasetManagement = 0x09;
+constexpr uint8_t kIoFlush = 0x00, kIoWrite = 0x01, kIoRead = 0x02, kIoWriteZeroes = 0x08, kIoDatasetManagement = 0x09;
+constexpr uint64_t kWriteZeroesMaxBlocks = 65536;   // (the count is a 16-bit, zero-based field)
 constexpr uint32_t kDsmDeallocate = 1u << 2;
 constexpr uint32_t kDsmRangeBytes = 16, kDsmMaxRanges = 256;
 constexpr uint32_t kPciCommand = 0x04;
@@ -90,6 +91,7 @@ bool NvmeStorageDevice::identify() {
   copy_device_string(ArrayView<char>(info_.serial), ConstByteView(scratch_).subview(4, 20), false);
   copy_device_string(ArrayView<char>(info_.model), ConstByteView(scratch_).subview(24, 40), false);
   info_.discard = (scratch_[520] & (1u << 2)) != 0;   // ONCS bit 2: Dataset Management
+  info_.write_zeroes = (scratch_[520] & (1u << 3)) != 0;   // ONCS bit 3: Write Zeroes
   const uint8_t mdts = scratch_[77];   // the largest transfer, as a power of two of the minimum page size (4 KiB here); 0: no limit
   if (mdts != 0 && mdts < 32 && (uint64_t{kPage} << mdts) < chunk_bytes_) chunk_bytes_ = kPage << mdts;
 
@@ -544,6 +546,34 @@ bool NvmeStorageDevice::discard(uint64_t lba, uint64_t blocks) {
   return ok;
 }
 
+// Write Zeroes, kWriteZeroesMaxBlocks a command (no data, so no slot buffer: only its command id).
+bool NvmeStorageDevice::write_zeroes(uint64_t lba, uint64_t blocks) {
+  if (!enabled_ || !info_.write_zeroes || info_.read_only || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  const uint64_t requested = blocks;
+  const uint32_t slot = pool_.acquire();
+  IoQueue& q = queue_for_this_core();
+  bool ok = true;
+  while (blocks > 0 && ok) {
+    const uint64_t n = blocks < kWriteZeroesMaxBlocks ? blocks : kWriteZeroesMaxBlocks;
+    Command cmd = {};
+    cmd.cdw0 = kIoWriteZeroes;
+    cmd.cdw10 = static_cast<uint32_t>(lba);
+    cmd.cdw11 = static_cast<uint32_t>(lba >> 32);
+    cmd.cdw12 = static_cast<uint32_t>(n - 1);
+    submit_command(q, slot, cmd);
+    ok = finish(q, slot);
+    lba += n;
+    blocks -= n;
+  }
+  if (!slots_[slot].completion.lost) pool_.release(slot);
+  if (ok) __atomic_fetch_add(&stats_.blocks_zeroed, requested, __ATOMIC_RELAXED);
+  else __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+  return ok;
+}
+
 bool NvmeStorageDevice::flush() {
   if (!enabled_ || slot_count_ == 0) return false;
   const uint32_t slot = pool_.acquire();
@@ -561,6 +591,7 @@ StorageStatistics NvmeStorageDevice::statistics() const {
   s.blocks_written = __atomic_load_n(&stats_.blocks_written, __ATOMIC_RELAXED);
   s.discards = __atomic_load_n(&stats_.discards, __ATOMIC_RELAXED);
   s.blocks_discarded = __atomic_load_n(&stats_.blocks_discarded, __ATOMIC_RELAXED);
+  s.blocks_zeroed = __atomic_load_n(&stats_.blocks_zeroed, __ATOMIC_RELAXED);
   s.errors = __atomic_load_n(&stats_.errors, __ATOMIC_RELAXED);
   return s;
 }

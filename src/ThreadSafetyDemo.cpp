@@ -351,6 +351,32 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     console::puts(" scratch devices\n");
   }
   if (discarded) ok &= report("storage: discarded blocks can be written and read again", discard_ok);
+  // Write zeroes on every scratch device that can: 64 blocks of a pattern, zeroed by the device, read back as zeros (unlike discard, a promise).
+  uint32_t zeroed_devices = 0;
+  bool zero_ok = true;
+  for (uint32_t d = 0; d < devices; ++d) {
+    hardware::IStorageDevice* dev = storage.at(d);
+    const hardware::StorageInfo info = dev->info();
+    if (!info.write_zeroes || info.read_only || !references[d].marked || info.block_count < 1024) continue;
+    const uint64_t first = info.block_count - uint64_t{kWriters} * 8 - 256 - 64;
+    const uint64_t bytes = uint64_t{64} * info.block_size;
+    ByteView memory = allocate_view<uint8_t>(allocator, bytes * 2);
+    if (memory.empty()) continue;
+    const ByteView pattern = memory.first(bytes), back = memory.subview(bytes, bytes);
+    for (uint64_t b = 0; b < bytes; ++b) pattern[b] = static_cast<uint8_t>(0x5A ^ b);
+    bool good = dev->write(first, pattern) && dev->write_zeroes(first, 64) && dev->read(first, back);
+    for (uint64_t b = 0; good && b < bytes; ++b) good = back[b] == 0;
+    zero_ok &= good;
+    ++zeroed_devices;
+    release_view(allocator, memory);
+  }
+  if (zeroed_devices) {
+    console::Guard guard;
+    console::puts("  storage: write zeroes on ");
+    console::put_dec(zeroed_devices);
+    console::puts(" scratch devices\n");
+  }
+  if (zeroed_devices) ok &= report("storage: blocks zeroed by the device read back as zeros", zero_ok);
   // Devices with a deep queue: what the driver and the scheduler saw. Several readers at once must have had several requests on the device.
   bool deep = false, overlapped = true;
   for (uint32_t d = 0; d < devices; ++d) {

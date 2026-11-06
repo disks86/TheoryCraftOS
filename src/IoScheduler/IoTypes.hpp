@@ -30,7 +30,8 @@ namespace iosched {
 enum class IoClass : uint8_t { Realtime = 0, BestEffort = 1, Idle = 2 };
 constexpr uint32_t kClassCount = 3;
 
-enum class IoOp : uint8_t { Read, Write, Flush, Discard };   // (discard: TRIM / deallocate, counted with flushes)
+// (discard: TRIM / deallocate, counted with flushes; write zeroes: the device zeroes blocks itself, counted with writes, no data moved)
+enum class IoOp : uint8_t { Read, Write, Flush, Discard, WriteZeroes };
 
 // The depth controller hands out device slots per domain, so writes cannot fill the device's queue while reads wait behind them.
 enum class IoDomain : uint8_t { Read = 0, Write = 1, Other = 2 };
@@ -39,7 +40,7 @@ constexpr uint32_t kAllDomains = (1u << kDomainCount) - 1;
 constexpr uint32_t domain_index(IoDomain d) { return static_cast<uint32_t>(d); }
 constexpr uint32_t domain_bit(IoDomain d) { return 1u << domain_index(d); }
 constexpr IoDomain domain_of(IoOp op) {
-  return op == IoOp::Read ? IoDomain::Read : op == IoOp::Write ? IoDomain::Write : IoDomain::Other;
+  return op == IoOp::Read ? IoDomain::Read : op == IoOp::Write || op == IoOp::WriteZeroes ? IoDomain::Write : IoDomain::Other;
 }
 
 constexpr uint16_t kMinWeight = 1, kMaxWeight = 1000, kDefaultWeight = 100;

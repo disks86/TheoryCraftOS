@@ -53,6 +53,7 @@ class VirtioBlockDevice final : public StorageDeviceBase {
   bool flush() override;
   void stop_interrupts() override { disable_interrupts(); }
   bool discard(uint64_t lba, uint64_t blocks) override;
+  bool write_zeroes(uint64_t lba, uint64_t blocks) override;
   StorageStatistics statistics() const override;
 
   uint32_t queue_count() const { return queue_count_; }
@@ -110,6 +111,9 @@ class VirtioBlockDevice final : public StorageDeviceBase {
   ByteView header_memory_;                // every slot's header (16 bytes) and status byte, 32 bytes apart
   bool has_flush_ = false;
   uint32_t max_discard_sectors_ = 0;
+  uint32_t max_write_zeroes_sectors_ = 0;
+  // Discard and write zeroes: one segment {sector, sectors, flags} a request, at most `max_sectors` each.
+  bool segment_requests(uint32_t type, uint32_t max_sectors, uint64_t lba, uint64_t blocks);
   bool started_ = false;
   bool interrupts_ = false;
 };
