@@ -121,6 +121,10 @@ bool ScheduledStorageDevice::write(uint64_t lba, ConstByteView buffer) {
   return run(iosched::IoOp::Write, buffer.size(), [&] { return inner_->write(lba, buffer); });
 }
 
+bool ScheduledStorageDevice::discard(uint64_t lba, uint64_t blocks) {
+  return run(iosched::IoOp::Discard, 0, [&] { return inner_->discard(lba, blocks); });
+}
+
 bool ScheduledStorageDevice::flush() {
   return run(iosched::IoOp::Flush, 0, [&] { return inner_->flush(); });
 }

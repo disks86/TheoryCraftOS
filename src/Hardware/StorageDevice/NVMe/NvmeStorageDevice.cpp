@@ -34,7 +34,9 @@ constexpr uint32_t kCcIoSqEntrySize = 6u << 16, kCcIoCqEntrySize = 4u << 20;  //
 constexpr uint32_t kCstsReady = 1u, kCstsFatal = 1u << 1;
 constexpr uint8_t kAdminCreateIoSq = 0x01, kAdminCreateIoCq = 0x05, kAdminIdentify = 0x06, kAdminSetFeatures = 0x09;
 constexpr uint32_t kFeatureNumberOfQueues = 0x07;
-constexpr uint8_t kIoFlush = 0x00, kIoWrite = 0x01, kIoRead = 0x02;
+constexpr uint8_t kIoFlush = 0x00, kIoWrite = 0x01, kIoRead = 0x02, kIoDatasetManagement = 0x09;
+constexpr uint32_t kDsmDeallocate = 1u << 2;
+constexpr uint32_t kDsmRangeBytes = 16, kDsmMaxRanges = 256;
 constexpr uint32_t kPciCommand = 0x04;
 constexpr uint32_t kPage = 4096;
 constexpr uint32_t kPrpListBytes = 128;          // per slot: 16 entries, enough for 64 KiB (and 128-byte aligned, so a list never crosses a page)
@@ -87,6 +89,7 @@ bool NvmeStorageDevice::identify() {
   if (!admin(cmd)) return false;
   copy_device_string(ArrayView<char>(info_.serial), ConstByteView(scratch_).subview(4, 20), false);
   copy_device_string(ArrayView<char>(info_.model), ConstByteView(scratch_).subview(24, 40), false);
+  info_.discard = (scratch_[520] & (1u << 2)) != 0;   // ONCS bit 2: Dataset Management
   const uint8_t mdts = scratch_[77];   // the largest transfer, as a power of two of the minimum page size (4 KiB here); 0: no limit
   if (mdts != 0 && mdts < 32 && (uint64_t{kPage} << mdts) < chunk_bytes_) chunk_bytes_ = kPage << mdts;
 
@@ -406,6 +409,11 @@ kernel::Frame* NvmeStorageDevice::on_queue_interrupt(kernel::Frame* frame, void*
 }
 
 bool NvmeStorageDevice::execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint64_t lba, uint32_t blocks, uint64_t bytes) {
+  submit(q, slot, opcode, lba, blocks, bytes);
+  return finish(q, slot);
+}
+
+void NvmeStorageDevice::submit(IoQueue& q, uint32_t slot, uint8_t opcode, uint64_t lba, uint32_t blocks, uint64_t bytes) {
   Slot& s = slots_[slot];
   Command cmd = {};
   cmd.cdw0 = opcode | (slot << 16);   // the command id is the slot
@@ -426,6 +434,13 @@ bool NvmeStorageDevice::execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint6
     cmd.cdw11 = static_cast<uint32_t>(lba >> 32);
     cmd.cdw12 = blocks - 1;  // zero-based count
   }
+  submit_command(q, slot, cmd);
+}
+
+void NvmeStorageDevice::submit_command(IoQueue& q, uint32_t slot, Command cmd) {
+  Slot& s = slots_[slot];
+  cmd.cdw0 = (cmd.cdw0 & 0xFFFF) | (slot << 16);
+  cmd.nsid = namespace_id_;
   s.completion.arm();
 
   const uint64_t flags = kernel::detail::lock_list(&q.lock);
@@ -434,44 +449,47 @@ bool NvmeStorageDevice::execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint6
   __atomic_thread_fence(__ATOMIC_RELEASE);
   write32(kDoorbells + (2 * q.id) * doorbell_stride_, q.tail);
   kernel::detail::unlock_list(&q.lock, flags);
-
-  if (!s.completion.wait(may_sleep_for_interrupt(interrupts_), uint64_t{timeout_ms_} * 1000, [&] { reap(q); })) return false;
-  return s.completion.status == 0;
 }
 
-// Moves a whole request through one slot, chunk_bytes_ at a time.
+bool NvmeStorageDevice::finish(IoQueue& q, uint32_t slot) {
+  CommandCompletion& c = slots_[slot].completion;
+  if (!c.wait(may_sleep_for_interrupt(interrupts_), uint64_t{timeout_ms_} * 1000, [&] { reap(q); })) return false;
+  return c.status == 0;
+}
+
+// Moves a whole request, chunk_bytes_ at a time, several chunks at once when slots are free.
 bool NvmeStorageDevice::run(bool write, uint64_t lba, ByteView into, ConstByteView from) {
   const uint64_t bytes = write ? from.size() : into.size();
   if (!enabled_ || slot_count_ == 0 || bytes == 0 || bytes % info_.block_size != 0) {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
-  uint64_t count = bytes / info_.block_size;
+  const uint64_t count = bytes / info_.block_size;
   if (lba >= info_.block_count || count > info_.block_count - lba) {
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
-  const uint32_t slot = pool_.acquire();
-  IoQueue& q = queue_for_this_core();
   const uint32_t max_blocks = chunk_bytes_ / info_.block_size;
-  uint64_t done = 0;
-  bool ok = true;
-  while (count > 0) {
-    const uint32_t n = count < max_blocks ? static_cast<uint32_t>(count) : max_blocks;
-    const uint64_t chunk = uint64_t{n} * info_.block_size;
-    const ByteView dma = slots_[slot].buffer.first(chunk);
-    if (write) dma.copy_from(from.subview(done, chunk));
-    if (!execute(q, slot, write ? kIoWrite : kIoRead, lba, n, chunk)) {
-      ok = false;
-      break;
-    }
-    if (!write) into.subview(done, chunk).copy_from(dma);
-    __atomic_fetch_add(write ? &stats_.blocks_written : &stats_.blocks_read, n, __ATOMIC_RELAXED);
-    lba += n;
-    count -= n;
-    done += chunk;
-  }
-  if (!slots_[slot].completion.lost) pool_.release(slot);
+  const uint64_t chunks = (count + max_blocks - 1) / max_blocks;
+  uint32_t slots[kMaxParallelChunks];
+  const uint32_t got = acquire_slots(pool_, slots, chunks < kMaxParallelChunks ? static_cast<uint32_t>(chunks) : kMaxParallelChunks);
+  IoQueue& q = queue_for_this_core();
+  const uint32_t bs = info_.block_size;
+  const bool ok = run_chunks(
+      slots, got, count, max_blocks,
+      [&](uint32_t slot, uint64_t first, uint32_t n) {
+        if (write) slots_[slot].buffer.first(uint64_t{n} * bs).copy_from(from.subview(first * bs, uint64_t{n} * bs));
+        submit(q, slot, write ? kIoWrite : kIoRead, lba + first, n, uint64_t{n} * bs);
+        return true;
+      },
+      [&](uint32_t slot, uint64_t first, uint32_t n) {
+        if (!finish(q, slot)) return false;
+        if (!write) into.subview(first * bs, uint64_t{n} * bs).copy_from(slots_[slot].buffer.first(uint64_t{n} * bs));
+        __atomic_fetch_add(write ? &stats_.blocks_written : &stats_.blocks_read, n, __ATOMIC_RELAXED);
+        return true;
+      });
+  for (uint32_t i = 0; i < got; ++i)
+    if (!slots_[slots[i]].completion.lost) pool_.release(slots[i]);
   __atomic_fetch_add(ok ? (write ? &stats_.writes : &stats_.reads) : &stats_.errors, 1, __ATOMIC_RELAXED);
   return ok;
 }
@@ -484,6 +502,39 @@ bool NvmeStorageDevice::write(uint64_t lba, ConstByteView buffer) {
     return false;
   }
   return run(true, lba, ByteView(), buffer);
+}
+
+// Dataset Management with the deallocate attribute: up to 256 ranges a command, each at most 2^32 - 1 blocks.
+bool NvmeStorageDevice::discard(uint64_t lba, uint64_t blocks) {
+  if (!enabled_ || !info_.discard || blocks == 0 || lba >= info_.block_count || blocks > info_.block_count - lba) {
+    __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  const uint32_t slot = pool_.acquire();
+  IoQueue& q = queue_for_this_core();
+  bool ok = true;
+  while (blocks > 0 && ok) {
+    ByteWriter ranges(slots_[slot].buffer.first(uint64_t{kDsmMaxRanges} * kDsmRangeBytes));
+    uint32_t count = 0;
+    for (; count < kDsmMaxRanges && blocks > 0; ++count) {
+      const uint32_t n = blocks < 0xFFFFFFFFull ? static_cast<uint32_t>(blocks) : 0xFFFFFFFFu;
+      ranges.le32(0);       // context attributes
+      ranges.le32(n);       // length in blocks
+      ranges.le64(lba);     // starting LBA
+      lba += n;
+      blocks -= n;
+    }
+    Command cmd = {};
+    cmd.cdw0 = kIoDatasetManagement;
+    cmd.prp1 = physical(slots_[slot].buffer.data());
+    cmd.cdw10 = count - 1;   // zero-based number of ranges
+    cmd.cdw11 = kDsmDeallocate;
+    submit_command(q, slot, cmd);
+    ok = finish(q, slot);
+  }
+  if (!slots_[slot].completion.lost) pool_.release(slot);
+  if (!ok) __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
+  return ok;
 }
 
 bool NvmeStorageDevice::flush() {

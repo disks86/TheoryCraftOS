@@ -28,6 +28,10 @@
 
 namespace hardware {
 
+// False when the build asked for polled storage (TCOS_STORAGE_POLLED: a machine whose MSI does not work, or to test the polled paths):
+// then no driver turns on completion interrupts.
+bool storage_interrupts_allowed();
+
 // x86: a vector of kVectorStorageFirst.. for a completion interrupt, or 0 when all are taken (and on other architectures).
 uint8_t claim_storage_vector();
 void release_storage_vector(uint8_t vector);
@@ -101,6 +105,39 @@ struct CommandCompletion {
     return true;
   }
 };
+
+// A big request goes to the device as several chunks at once, each through a slot of its own: the first slot is waited for as usual, more
+// are taken only if they are free right now (so one big request does not keep others out), up to kMaxParallelChunks. Fills `slots` and
+// returns how many it got (at least 1).
+constexpr uint32_t kMaxParallelChunks = 8;
+uint32_t acquire_slots(SlotPool& pool, uint32_t* slots, uint32_t wanted);
+
+// Runs a request of `count` blocks as chunks of at most `max_blocks`, a batch at a time with one chunk per slot: `start(slot, first, n)`
+// sends the chunk of blocks first..first+n-1 (false: it could not be sent), `finish(slot, first, n)` waits for it and takes its data. Every
+// chunk that was sent is finished, even after a failure. False if any chunk failed.
+template <class Start, class Finish>
+bool run_chunks(const uint32_t* slots, uint32_t slot_count, uint64_t count, uint32_t max_blocks, Start&& start, Finish&& finish) {
+  uint64_t next = 0;
+  bool ok = true;
+  while (next < count && ok) {
+    uint64_t first[kMaxParallelChunks];
+    uint32_t blocks[kMaxParallelChunks];
+    uint32_t started = 0;
+    for (uint32_t i = 0; i < slot_count && i < kMaxParallelChunks && next < count; ++i) {
+      const uint32_t n = count - next < max_blocks ? static_cast<uint32_t>(count - next) : max_blocks;
+      if (!start(slots[i], next, n)) {
+        ok = false;
+        break;
+      }
+      first[started] = next;
+      blocks[started] = n;
+      ++started;
+      next += n;
+    }
+    for (uint32_t i = 0; i < started; ++i) ok = finish(slots[i], first[i], blocks[i]) && ok;
+  }
+  return ok;
+}
 
 // The properties every such driver shows: its queues and depth, how completions arrive, and the interrupts each queue's core took.
 struct QueueReport {

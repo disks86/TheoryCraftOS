@@ -151,8 +151,8 @@ bool VirtioPciDevice::start() {
   return !(common8(kStatus) & 0xC0);  // neither NEEDS_RESET nor FAILED
 }
 
-bool VirtioPciDevice::enable_msix_queues(const uint8_t* vectors, const uint32_t* apic_ids, uint16_t count) {
-  if (msix_capability_ || count == 0 || count > kMaxQueues || !common_.address) return false;
+bool VirtioPciDevice::enable_msix_queues(const uint8_t* vectors, const uint32_t* apic_ids, uint16_t count, uint16_t first_queue) {
+  if (msix_capability_ || count == 0 || first_queue >= kMaxQueues || count > kMaxQueues - first_queue || !common_.address) return false;
   for (uint16_t i = 0; i < count; ++i)
     if (apic_ids[i] > 0xFF) return false;
   const uint16_t cap = pci_.find_capability(device_.address, kPciCapabilityMsix);
@@ -179,20 +179,20 @@ bool VirtioPciDevice::enable_msix_queues(const uint8_t* vectors, const uint32_t*
   set_common16(kMsixConfigVector, kNoVector);
   bool ok = true;
   for (uint16_t i = 0; i < count && ok; ++i) {
-    set_common16(kQueueSelect, i);
+    set_common16(kQueueSelect, static_cast<uint16_t>(first_queue + i));
     set_common16(kQueueMsixVector, i);
     ok = common16(kQueueMsixVector) == i;
   }
   if (!ok) {   // the device did not take them all: back to none
     for (uint16_t i = 0; i < count; ++i) {
-      set_common16(kQueueSelect, i);
+      set_common16(kQueueSelect, static_cast<uint16_t>(first_queue + i));
       set_common16(kQueueMsixVector, kNoVector);
     }
     pci_.write32(device_.address, cap, first);
     return false;
   }
   msix_capability_ = cap;
-  msix_queue_ = 0;
+  msix_queue_ = first_queue;
   msix_queues_ = count;
   return true;
 }

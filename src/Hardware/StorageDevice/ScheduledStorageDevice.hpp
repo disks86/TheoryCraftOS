@@ -53,6 +53,7 @@ class ScheduledStorageDevice final : public IStorageDevice {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  bool discard(uint64_t lba, uint64_t blocks) override;
 
   iosched::IoSchedulerStatistics scheduler_statistics() const { return scheduler_.statistics(); }
   IStorageDevice& device() { return *inner_; }
