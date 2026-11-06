@@ -55,7 +55,7 @@ bool IntelAvcVdencEncoder::prepare() {
   stream_.log2_max_frame_num = 8;
   stream_.chroma_qp_offset = 0;
   // B pictures: only where the commands are written (the engines that take the Xe_LPM_plus / Xe2 command set).
-  b_mode_ = config_.b_frames > 0 && (buffers_.xe_lpg() || buffers_.xe2());
+  b_mode_ = config_.b_frames > 0 && (buffers_.xe_lpg() || buffers_.xe_hpg() || buffers_.xe2());
   stream_.b_pictures = b_mode_;
   if (!yuv_[0].allocate({config_.width, config_.height, PixelFormat::I420}) || !yuv_[1].allocate({config_.width, config_.height, PixelFormat::I420})) return false;
   mv_bytes_ = uint64_t{((config_.width + 31) >> 4)} * height_mbs_ * 32;   // the colocated motion vectors: a cache line per two macroblocks
