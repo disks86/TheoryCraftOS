@@ -466,6 +466,15 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
   src/Hardware/Platform/AMD/AmdRyzenPlatform.cpp
+  src/Hardware/Chipset/IChipset.cpp
+  src/Hardware/Chipset/SystemChipset.cpp
+  src/Hardware/Chipset/Smbus/SmbusHost.cpp
+  src/Hardware/Chipset/Smbus/SmbusIoPorts.cpp
+  src/Hardware/Chipset/Smbus/Spd.cpp
+  src/Hardware/Chipset/Intel/IntelPch.cpp
+  src/Hardware/Chipset/Intel/IntelPchChipset.cpp
+  src/Hardware/Chipset/AMD/AmdChipsets.cpp
+  src/Hardware/Chipset/AMD/AmdFchChipset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
