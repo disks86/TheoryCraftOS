@@ -51,7 +51,10 @@ enum class DockStyle : uint8_t {
 enum class Orientation : uint8_t { Horizontal, Vertical };
 
 // The pointer drawn over a control (when the window draws its own): see Control::cursor_shape().
-enum class CursorShape : uint8_t { Arrow, ResizeHorizontal, ResizeVertical, ResizeDiagonalDown, ResizeDiagonalUp, Crosshair };
+enum class CursorShape : uint8_t { Arrow, ResizeHorizontal, ResizeVertical, ResizeDiagonalDown, ResizeDiagonalUp, Crosshair,
+                                   IBeam, Hand, Wait, Move, No,
+                                   Hidden,      // no pointer at all (a game that draws its own)
+                                   Image };     // a picture the control has (Control::cursor_image)
 
 enum class MouseButton : uint8_t { None, Left, Right, Middle };
 

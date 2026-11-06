@@ -284,8 +284,9 @@ void SoftwareRenderer2D::draw_image(const Surface& source, const Rect2D& rect, i
 }
 
 void SoftwareRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_t color) {
-  for (; *text; ++text, x += static_cast<int32_t>(hardware::Font8x16::kWidth)) {
-    const ConstByteView glyph = hardware::Font8x16::glyph(*text);
+  for (char32_t c = hardware::utf8_next(text); c != 0; c = hardware::utf8_next(text), x += static_cast<int32_t>(hardware::Font8x16::kWidth)) {      // (UTF-8)
+    uint8_t glyph[hardware::Font8x16::kHeight];
+    hardware::Font8x16::glyph_of(c, glyph);
     for (uint32_t j = 0; j < hardware::Font8x16::kHeight; ++j)
       for (uint32_t i = 0; i < hardware::Font8x16::kWidth; ++i)
         if (glyph[j] & (0x80 >> i)) plot(x + static_cast<int32_t>(i), y + static_cast<int32_t>(j), color);

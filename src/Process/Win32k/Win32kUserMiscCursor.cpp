@@ -275,6 +275,7 @@ uint64_t svc_set_cursor(Call& c) {
   if (!t) return 0;
   const uint32_t previous = t->cursor;
   t->cursor = uint32_t(handle);
+  t->cursor_set = true;
   return previous;
 }
 
@@ -454,6 +455,63 @@ uint32_t stock_object(uint64_t pid, uint32_t id, bool icon) {
 
 uint32_t system_cursor(uint64_t pid, uint32_t ocr_id) { return stock_object(pid, ocr_id, false); }
 uint32_t system_icon(uint64_t pid, uint32_t oic_id) { return stock_object(pid, oic_id, true); }
+
+int32_t cursor_show_count() {
+  const CursorState* s = g_cursors.get();
+  return s ? s->show_count : 0;
+}
+
+bool thread_cursor(uint64_t tid, uint32_t* cursor) {
+  const ThreadRecord* t = find_thread_record(tid);
+  if (!t || !t->cursor_set) return false;
+  *cursor = t->cursor;
+  return true;
+}
+
+void cursor_entered_window(uint64_t tid) {
+  if (ThreadRecord* t = find_thread_record(tid)) t->cursor_set = false;
+}
+
+bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) {
+  *system_id = 0;
+  argb->clear();
+  CursorState* s = g_cursors.get();
+  const CursorIcon* icon = s ? s->icons.find(cursor) : nullptr;
+  if (!icon) return false;
+  if (icon->frames.count() == 0) {      // a system cursor (or one without images yet): the desktop draws its own of that kind
+    *system_id = icon->resource_is_id && icon->resource_id >= 32512 && icon->resource_id <= 32651 ? uint32_t(icon->resource_id) : 32512;
+    return true;
+  }
+  const Frame& f = icon->frames[0];
+  const uint64_t count = uint64_t{f.width} * f.height;
+  if (count == 0 || count > 256u * 256) return false;
+  List<uint32_t> color(*system_allocator()), mask(*system_allocator());
+  const bool has_color = f.color != 0 && gdi::bitmap_pixels(f.color, &color) && color.count() >= count;
+  const bool has_mask = f.mask != 0 && gdi::bitmap_pixels(f.mask, &mask);
+  // a monochrome cursor's mask is twice as tall: AND on top, XOR below
+  const bool mono = !has_color && has_mask && mask.count() >= 2 * count;
+  if (!has_color && !mono) return false;
+  bool alpha = false;
+  if (has_color) for (uint64_t i = 0; i < count && !alpha; ++i) alpha = (color[i] >> 24) != 0xFF;
+  for (uint64_t i = 0; i < count; ++i) {
+    uint32_t px;
+    if (mono) {
+      const bool and_bit = (mask[i] & 0xFFFFFF) != 0, xor_bit = (mask[count + i] & 0xFFFFFF) != 0;
+      px = and_bit ? (xor_bit ? 0xFF000000u : 0) : (xor_bit ? 0xFFFFFFFFu : 0xFF000000u);      // (an inverting pixel shows black)
+    } else if (alpha) {
+      px = color[i];
+    } else {
+      const bool transparent = has_mask && i < mask.count() && (mask[i] & 0xFFFFFF) != 0;
+      px = transparent ? 0 : (color[i] | 0xFF000000u);
+    }
+    if (!argb->push_back(px)) return false;
+  }
+  *width = f.width;
+  *height = f.height;
+  *hot_x = f.hot_x;
+  *hot_y = f.hot_y;
+  return true;
+}
 
 Rect cursor_clip_rect() {
   SystemLock lock;

@@ -61,7 +61,12 @@ class Painter {
   // A dotted-looking focus frame.
   void focus_frame(const Rect2D& r);
 
-  static int32_t text_width(StringView text) { return static_cast<int32_t>(text.size()) * kGlyphWidth; }
+  // (UTF-8: a character, not a byte, is a glyph wide)
+  static int32_t text_width(StringView text) {
+    int32_t n = 0;
+    for (uint64_t i = 0; i < text.size(); ++i) n += (static_cast<uint8_t>(text[i]) & 0xC0) != 0x80;
+    return n * kGlyphWidth;
+  }
 
  private:
   struct Frame {

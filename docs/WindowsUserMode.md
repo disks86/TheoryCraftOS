@@ -295,10 +295,31 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
     dragging the title bar moves it without a repaint; maximize fills the work area and the program repaints at the new size; close ends the program) and
     `tests/windows/vkwindowtest.c` (a swapchain presenting into its window every frame, behind and in front of other windows). Host tests: `Win32kUserTest`
     (`test_redirection`), `Win32kGdiTest` (`test_window_surfaces`), `GuiTest` (`test_windows_screen`, with a fake session).
-  - Not done: the Windows cursor's shape (the desktop draws its own pointer), the program's z-order requests (`SetWindowPos` with `HWND_TOP` / `HWND_TOPMOST` does not
-    restack the desktop's frames; a window shown later is on top), owner/owned stacking (a dialog does not stay above its owner), window icons in the title bar and taskbar,
-    non-ASCII titles (shown as `?`), several monitors, `WM_NCHITTEST`-driven custom frames (a captionless window cannot be dragged by the user), a Vulkan swapchain whose
-    image is larger than the client area is cut, not scaled, and the desktop repaints its whole window when a program's picture changes (as for native windows).
+  - *Stacking*: the program's stacking order (SetWindowPos, activation) reaches the frames: the program's top window goes directly above its frame that is highest on the
+    desktop, the others directly below it in the program's order, so the desktop's own windows keep their places. win32k keeps a window's owned windows directly above
+    it (`apply_zorder`), so raising a main window, from the program or by a click, brings its dialogs along.
+  - *Custom title bars and borders*: DefWindowProc turns `WM_NCLBUTTONDOWN` with HTCAPTION or a border code (HTLEFT .. HTBOTTOMRIGHT) into `SC_MOVE` / `SC_SIZE`, and those
+    ask the desktop (`drag_requested` / `take_drag`) to drag the frame with the pointer until the left button is let go, the program hearing of it as for any move. A
+    program that sends `WM_NCLBUTTONDOWN` itself (the usual custom title bar) or `SC_MOVE` works so.
+  - *Cursor*: the desktop draws the cursor the program shows over its windows: the class cursor of the window under the pointer, or what the program's thread set with
+    SetCursor since the pointer came into that window, hidden by `SetCursor(NULL)` or a negative `ShowCursor` count; the sizing arrows over a border of a window that
+    draws its own. System cursors map to the desktop's shapes (arrow, I-beam, hand, wait, cross, the four sizing arrows, move, no); a program's own cursor is drawn from
+    its frame 0 (colour bitmap with alpha or mask, or a monochrome AND/XOR mask) with its hot spot.
+  - *Icons and titles*: `WM_SETICON` / `WM_GETICON` are kept per window; the frame and its taskbar button show the window's small icon (else its big one, else the
+    class's), scaled to 16 x 16. Titles reach the desktop in UTF-8; the desktop's 8x16 font now reads UTF-8 and has the letters of Latin-1 Supplement and Latin Extended-A
+    (a base letter with its accent) and look-alikes for common punctuation (dashes, quotes, the euro sign); other characters still show as `?`.
+  - *Monitors*: the desktop gives win32k its monitors (rectangles and work areas, primary first; again when they change): `MonitorFromRect` / `FromPoint` / `FromWindow`
+    pick by overlap or nearness, `GetMonitorInfo` answers each (`\\.\DISPLAY<n>`, the primary flagged), `EnumDisplayMonitors` calls back for each, and a window
+    maximizes to the work area of the monitor it is mostly on.
+  - *Vulkan sizes*: a swapchain image of another size than the client area is stretched over it (nearest pixel), as DWM does.
+  - Checked in QEMU with `tests/windows/windowstest.c` (accented title and icon in the title bar and taskbar, I-beam and hand cursors, the owned window coming along when
+    its owner is raised over the Terminal, a captionless window dragged by its own bar) and `vkwindowtest.c` maximized (the stretched picture fills the window).
+    Host tests: `Win32kUserTest` (`test_redirection`: stacking, owner, drag requests, icon, UTF-8 title, cursors, custom cursor picture, stretched present, two
+    monitors), `GuiTest` (`test_windows_more`, `test_font_unicode`).
+  - Not done: `WM_SETCURSOR` and `WM_NCHITTEST` are not sent (a program that sets its cursor only in WM_SETCURSOR shows its class cursor; win32k's own hit test decides
+    the non-client parts), animated cursors show frame 0, topmost windows are topmost only among the programs' windows, non-Latin scripts in titles, per-monitor DPI,
+    the display configuration queries (`QueryDisplayConfig`, `EnumDisplayDevices`) still describe one display, and the desktop repaints its whole window when a program's
+    picture changes (as for native windows).
 - **Not done**: `TrackMouseEvent` from user32 (win32k tracks WM_MOUSELEAVE, but the service is not registered), WASAPI (`CoCreateInstance` of the device enumerator fails:
   Godot falls back to its dummy audio driver), DirectSound.
 - **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`: also raw input from SendInput, NOLEGACY, removal), `Win32kMiscTest`

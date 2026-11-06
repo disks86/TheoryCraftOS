@@ -22,7 +22,7 @@ pointer is `ERROR_NOACCESS`, 998) and sizes with checked arithmetic.
 | `...Accel.cpp` | accelerator tables |
 | `...Clipboard.cpp` | the clipboard |
 | `...Settings.cpp` | `SystemParametersInfo`, metrics, colours, double-click time |
-| `...Monitor.cpp` | the monitor, display modes, display configuration, DPI awareness |
+| `...Monitor.cpp` | the monitors, display modes, display configuration, DPI awareness |
 | `...Keyboard.cpp` | keyboard layouts, US layout tables, input contexts (IME) |
 | `...Input.cpp` | raw input, pointer services |
 | `...Shell.cpp` | shell windows, shell hooks, shutdown block reasons, display affinity, beep |
@@ -52,7 +52,8 @@ pointer is `ERROR_NOACCESS`, 998) and sizes with checked arithmetic.
   ScaleSystemMetricForDPIWithoutCache. Some 80 simple settings (BOOL/UINT) with Windows 10 defaults, the accessibility structures, NONCLIENTMETRICS / ICONMETRICS /
   MINIMIZEDMETRICS / LOGFONT / work area / wallpaper / mouse thresholds. `system_metrics()` has the Windows 10 values at 96 dpi and scales the size metrics for other DPIs;
   `system_color()` the default scheme. Nothing is read from or written to a registry.
-* **Monitor and display**: one monitor, `0x10001`, sized from `gdi::screen_width()/height()`; MonitorFrom*, GetMonitorInfo (MONITORINFO/EX), EnumDisplaySettings (a list of
+* **Monitor and display**: the monitors the kernel's desktop sets (`set_monitors`: rectangles and work areas, primary first, handles `0x10001` up), or one monitor,
+  `0x10001`, sized from `gdi::screen_width()/height()`; MonitorFrom* by overlap or nearness, MonitorFrom*, GetMonitorInfo (MONITORINFO/EX), EnumDisplaySettings (a list of
   standard modes up to 4K plus the current one), ChangeDisplaySettings (resizes the screen surface; CDS_TEST, registry mode), EnumDisplayDevices, GetDisplayConfigBufferSizes,
   QueryDisplayConfig, DisplayConfigGetDeviceInfo, GetDpiForMonitor, GetDpiForCurrentProcess, GetSystemDpiForProcess, Get/SetProcessDpiAwarenessContext (once), the thread
   context, the two point conversions (identity: one monitor).
@@ -90,7 +91,7 @@ bridge to the kernel's text clipboard (`src/Kernel/Clipboard.hpp`), not wired ye
 
 * Layout and the modal loop of menus (TrackPopupMenuEx, EndMenu, GetMenuBarInfo, GetMenuItemRect, MenuItemFromPoint, CalcMenuBar, DrawMenuBarTemp) are done in user mode (user32 `menuui.inc`, see User.md): they need the font metrics and a message loop that the kernel does not have. `NtUserTrackPopupMenuEx` and friends keep answering STATUS_NOT_IMPLEMENTED.
 * Needing GDI drawing that the gdi:: contract lacks: DrawIconEx, DrawCaption*, CreateEmptyCursorObject-style loaders (LoadCursorsAndIcons), GetClassIcoCur, GetOemBitmapSize.
-* Needing a user-mode callback: EnumDisplayMonitors (Wine's form calls back into the process for each monitor).
+* Needing a user-mode callback: EnumDisplayMonitors (Wine's form calls back into the process for each monitor; our user32 walks the monitor handles itself).
 * Needing registry/atom services that do not exist yet: GetClipboardFormatName (registered formats are atoms), RegisterClipboardFormat.
 * Needing queue/input state of the window manager: GetKeyboardState/SetKeyboardState/GetKeyState/GetAsyncKeyState, GetMouseMovePointsEx, touch/gesture/pointer message
   services (GetTouchInputInfo, GetGestureInfo, GetPointerInfoList, Inject*), WaitForInputIdle, BlockInput.

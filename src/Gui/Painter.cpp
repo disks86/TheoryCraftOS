@@ -88,16 +88,21 @@ bool Painter::device_image(graphics::IGraphicsDevice& owner, graphics::IImage& i
 }
 
 void Painter::text(int32_t x, int32_t y, StringView s, uint32_t color) {
-  // draw_text wants a C string: copy in pieces so any length works.
+  // draw_text wants a C string: copy in pieces so any length works, each ending on a whole UTF-8 character.
   char buffer[65];
   uint64_t done = 0;
+  int32_t advance = 0;      // characters drawn so far
   while (done < s.size()) {
     uint64_t n = s.size() - done;
-    if (n > 64) n = 64;
+    if (n > 64) {
+      n = 64;
+      while (n > 1 && (static_cast<uint8_t>(s[done + n]) & 0xC0) == 0x80) --n;      // (not inside a character)
+    }
     for (uint64_t i = 0; i < n; ++i) buffer[i] = s[done + i];
     buffer[n] = 0;
     const Frame& f = frames_[depth_];
-    renderer_.draw_text(x + f.origin_x + static_cast<int32_t>(done) * kGlyphWidth, y + f.origin_y, buffer, color);
+    renderer_.draw_text(x + f.origin_x + advance * kGlyphWidth, y + f.origin_y, buffer, color);
+    for (uint64_t i = 0; i < n; ++i) advance += (static_cast<uint8_t>(buffer[i]) & 0xC0) != 0x80;
     done += n;
   }
 }

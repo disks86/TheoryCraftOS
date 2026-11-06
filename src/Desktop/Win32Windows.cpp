@@ -42,8 +42,11 @@ void Win32WindowView::paint(gui::Painter& painter) {
   if (bounds_.height > h) painter.fill({0, static_cast<int32_t>(h), w < bounds_.width ? w : bounds_.width, bounds_.height - h}, 0xFF000000u);
 }
 
-Win32Window::Win32Window(allocators::IAllocator& allocator, IWindowsSession& session, uint32_t window)
-    : Frame(allocator), session_(session), window_(window), view_(allocator, session, window) {
+gui::CursorShape Win32WindowView::cursor_shape(int32_t, int32_t) const { return owner_.pointer_shape(); }
+bool Win32WindowView::cursor_image(graphics::Surface* image, gui::Point* hot) const { return owner_.pointer_image(image, hot); }
+
+Win32Window::Win32Window(allocators::IAllocator& allocator, IWindowsSession& session, uint32_t window, const Win32Windows& owner)
+    : Frame(allocator), session_(session), window_(window), view_(allocator, session, window, owner) {
   set_padding(gui::Insets::all(0));
   set_escape_closes(false);      // (Escape is the program's key)
   set_opaque_client(true);       // (the program's picture covers the client area)
@@ -74,12 +77,85 @@ void Win32Windows::set_session(IWindowsSession* session, gui::WindowManager* man
     for (UniquePointer<Win32Window>& h : hosts_.view()) manager_->remove_window(h.get());
     hosts_.clear();
     last_active_ = nullptr;
+    drag_ = nullptr;
   }
   session_ = session;
   manager_ = manager;
-  attached_ = false;
+  attached_ = display_sent_ = false;
   grabbed_ = released_ = false;
   buttons_ = 0;
+}
+
+namespace {
+
+// The desktop's pointer for a system cursor (OCR_ id).
+gui::CursorShape shape_of(uint32_t system_id) {
+  switch (system_id) {
+    case 32513: return gui::CursorShape::IBeam;
+    case 32514: case 32650: return gui::CursorShape::Wait;      // (OCR_WAIT, OCR_APPSTARTING)
+    case 32515: return gui::CursorShape::Crosshair;
+    case 32642: return gui::CursorShape::ResizeDiagonalDown;     // OCR_SIZENWSE
+    case 32643: return gui::CursorShape::ResizeDiagonalUp;       // OCR_SIZENESW
+    case 32644: return gui::CursorShape::ResizeHorizontal;
+    case 32645: return gui::CursorShape::ResizeVertical;
+    case 32646: return gui::CursorShape::Move;
+    case 32648: return gui::CursorShape::No;
+    case 32649: return gui::CursorShape::Hand;
+    default: return gui::CursorShape::Arrow;
+  }
+}
+
+}  // namespace
+
+bool Win32Windows::pointer_image(graphics::Surface* image, gui::Point* hot) const {
+  if (pointer_shape_ != gui::CursorShape::Image || pointer_pixels_.count() < uint64_t{pointer_w_} * pointer_h_) return false;
+  image->pixels = pointer_pixels_.view();
+  image->width = image->pitch = pointer_w_;
+  image->height = pointer_h_;
+  *hot = pointer_hot_;
+  return true;
+}
+
+void Win32Windows::follow_pointer(gui::WindowManager& manager) {
+  IWindowsSession::Pointer p;
+  session_->pointer(&p);
+  gui::CursorShape shape = p.hidden ? gui::CursorShape::Hidden : shape_of(p.system_id);
+  List<uint32_t> pixels(allocator_);
+  uint32_t w = 0, h = 0;
+  int32_t hx = 0, hy = 0;
+  bool fresh_picture = false;
+  if (!p.hidden && p.cursor != 0) {
+    gui::UiGuard lock(&manager);
+    if (p.cursor == pointer_cursor_ && pointer_shape_ != gui::CursorShape::Hidden) shape = pointer_shape_;      // (the picture is kept while the handle stays)
+    else fresh_picture = true;
+  }
+  if (fresh_picture) {
+    uint32_t system_id = 32512;
+    if (session_->cursor_picture(p.cursor, &system_id, &pixels, &w, &h, &hx, &hy) && pixels.count() >= uint64_t{w} * h && w != 0) shape = gui::CursorShape::Image;
+    else shape = shape_of(system_id);
+  }
+  gui::UiGuard lock(&manager);
+  const bool changed = shape != pointer_shape_ || fresh_picture;
+  if (fresh_picture) {
+    pointer_cursor_ = p.cursor;
+    pointer_pixels_.clear();
+    for (uint32_t px : pixels.view()) pointer_pixels_.push_back(px);
+    pointer_w_ = w;
+    pointer_h_ = h;
+    pointer_hot_ = {hx, hy};
+  }
+  pointer_shape_ = shape;
+  if (changed) manager.invalidate();      // (the pointer is drawn with the frame)
+}
+
+void Win32Windows::set_monitors(ArrayView<const gui::Rect2D> regions, ArrayView<const gui::Rect2D> areas) {
+  monitor_count_ = 0;
+  for (uint64_t i = 0; i < regions.size() && i < areas.size() && monitor_count_ < 8; ++i) {
+    regions_[monitor_count_] = regions[i];
+    areas_[monitor_count_] = areas[i];
+    ++monitor_count_;
+  }
+  display_sent_ = false;
 }
 
 Win32Window* Win32Windows::host(uint32_t window) const {
@@ -90,19 +166,46 @@ Win32Window* Win32Windows::host(uint32_t window) const {
 void Win32Windows::pump(gui::WindowManager& manager) {
   if (!session_) return;
   const bool first = !attached_;
-  if (first) {      // win32k's screen becomes the window manager's area, before a program shows a window
-    gui::Rect2D b, work;
-    {
-      gui::UiGuard lock(&manager);
-      b = manager.bounds();
-      work = manager.area(0);
+  // the display: win32k's screen is the window manager's area, its monitors the desktop's (again whenever they change)
+  IWindowsSession::Monitor monitors[8];
+  uint32_t monitor_count = 0;
+  gui::Rect2D bounds;
+  bool send = false;
+  {
+    gui::UiGuard lock(&manager);
+    bounds = manager.bounds();
+    if (bounds.width == 0 || bounds.height == 0) return;
+    send = !display_sent_ || !same(bounds, sent_bounds_);
+    if (send) {
+      const gui::Point o = manager.window_origin();
+      if (monitor_count_ == 0) monitors[monitor_count++] = {{0, 0, bounds.width, bounds.height}, windows_rect(manager.area(0))};
+      for (uint32_t i = 0; i < monitor_count_; ++i) {
+        const gui::Rect2D r = regions_[i], a = areas_[i];      // (desktop window coordinates; the window manager's area are a shift of them)
+        monitors[monitor_count++] = {{r.x - o.x, r.y - o.y, r.width, r.height}, {a.x - o.x, a.y - o.y, a.width, a.height}};
+      }
+      display_sent_ = true;
+      sent_bounds_ = bounds;
     }
-    if (b.width == 0 || b.height == 0) return;
-    session_->attach(b.width, b.height, windows_rect(work), gui::Frame::kBorder, gui::Frame::kTitleHeight + 1);
+  }
+  if (first) {
+    session_->attach(gui::Frame::kBorder, gui::Frame::kTitleHeight + 1);
     attached_ = true;
   }
+  if (send) session_->set_display(bounds.width, bounds.height, ArrayView<const IWindowsSession::Monitor>(monitors, monitor_count));
   session_->take_changes(&changed_, &repainted_);
-  if (first) session_->windows(&changed_);      // (the windows shown before: all of them)
+  if (first) session_->windows(&changed_);
+  uint32_t edge = 0;
+  if (const uint32_t window = session_->take_drag(&edge)) {
+    gui::UiGuard lock(&manager);
+    Win32Window* h = host(window);
+    if (h && h->manager() == &manager && h->state() == gui::Frame::State::Normal) {
+      drag_ = h;
+      drag_edge_ = edge;
+      drag_x_ = pointer_x_;
+      drag_y_ = pointer_y_;
+      drag_from_ = h->bounds();
+    }
+  }      // (the windows shown before: all of them)
   {
     gui::UiGuard lock(&manager);
     follow_frames(manager);      // (first: what the user did since the last pump is asked of the programs before their older reports are applied)
@@ -111,13 +214,64 @@ void Win32Windows::pump(gui::WindowManager& manager) {
   for (uint32_t window : changed_.view()) {
     WindowsWindowInfo info;
     const bool exists = session_->window_info(window, &info, &title);
+    // the icon's picture, when it is not the one the frame has (taken outside the UI lock: the session takes the kernel's)
+    bool new_icon = false;
+    List<uint32_t> icon(allocator_);
+    uint32_t iw = 0, ih = 0;
+    if (exists && info.visible) {
+      uint32_t current = 0;
+      {
+        gui::UiGuard lock(&manager);
+        const Win32Window* h = host(window);
+        current = h ? h->icon_ : 0;
+        new_icon = !h || current != info.icon;
+      }
+      int32_t hx = 0, hy = 0;
+      uint32_t system_id = 0;
+      if (new_icon && info.icon != 0 && !session_->cursor_picture(info.icon, &system_id, &icon, &iw, &ih, &hx, &hy)) icon.clear();
+    }
     gui::UiGuard lock(&manager);
     if (!exists || !info.visible) remove(manager, window);
     else apply(manager, window, info, title);
+    if (new_icon) {
+      if (Win32Window* h = host(window)) {
+        h->icon_ = info.icon;
+        h->set_icon(icon.view(), iw, ih);      // (a system icon has no picture: none is shown)
+      }
+    }
+  }
+  if (hosts_.count() > 0) follow_pointer(manager);
+  if (changed_.count() > 0) {
+    session_->windows(&order_);
+    gui::UiGuard lock(&manager);
+    restack(manager);
   }
   gui::UiGuard lock(&manager);
   for (const IWindowsSession::Repaint& r : repainted_.view())
     if (Win32Window* h = host(r.window)) h->view_.invalidate();
+}
+
+// The programs' order among their frames: their top window goes directly above the frame of theirs that is highest on the desktop (where the user or the program
+// last raised one), each next one directly below the one before it; the desktop's own windows keep their places relative to that frame.
+void Win32Windows::restack(gui::WindowManager& manager) {
+  List<Win32Window*> frames(allocator_);      // bottom first
+  for (uint32_t window : order_.view()) {
+    Win32Window* h = host(window);
+    if (h && h->manager() == &manager) frames.push_back(h);
+  }
+  if (frames.count() < 2) return;
+  Win32Window* highest = frames[0];
+  for (Win32Window* f : frames.view()) if (manager.stacking_index(f) > manager.stacking_index(highest)) highest = f;
+  Win32Window* previous = nullptr;
+  for (uint64_t i = frames.count(); i > 0; --i) {
+    Win32Window* f = frames[i - 1];
+    if (!previous) {
+      if (f != highest) manager.place_next_to(f, highest, true);
+    } else if (manager.stacking_index(f) > manager.stacking_index(previous)) {
+      manager.place_next_to(f, previous, false);
+    }
+    previous = f;
+  }
 }
 
 void Win32Windows::remove(gui::WindowManager& manager, uint32_t window) {
@@ -125,6 +279,7 @@ void Win32Windows::remove(gui::WindowManager& manager, uint32_t window) {
     if (hosts_[i]->window_ != window) continue;
     manager.remove_window(hosts_[i].get());
     if (last_active_ == hosts_[i].get()) last_active_ = manager.active();
+    if (drag_ == hosts_[i].get()) drag_ = nullptr;
     hosts_.remove_at(i);
     return;
   }
@@ -135,7 +290,7 @@ void Win32Windows::apply(gui::WindowManager& manager, uint32_t window, const Win
   Win32Window* h = host(window);
   const bool fresh = h == nullptr;
   if (fresh) {
-    UniquePointer<Win32Window> made = UniquePointer<Win32Window>::make(allocator_, allocator_, *session_, window);
+    UniquePointer<Win32Window> made = UniquePointer<Win32Window>::make(allocator_, allocator_, *session_, window, *this);
     if (!made || !hosts_.push_back(util::move(made))) return;
     h = hosts_[hosts_.count() - 1].get();
   }
@@ -232,6 +387,22 @@ void Win32Windows::release_buttons() {
   buttons_ = 0;
 }
 
+void Win32Windows::drag_to(int32_t x, int32_t y) {
+  constexpr int32_t kMin = 32;
+  const int32_t dx = x - drag_x_, dy = y - drag_y_;
+  int32_t left = drag_from_.x, top = drag_from_.y, right = left + static_cast<int32_t>(drag_from_.width), bottom = top + static_cast<int32_t>(drag_from_.height);
+  if (drag_edge_ == 9) {
+    left += dx, right += dx, top += dy, bottom += dy;
+  } else {
+    const uint32_t e = drag_edge_;
+    if (e == 1 || e == 4 || e == 7) left = left + dx < right - kMin ? left + dx : right - kMin;
+    if (e == 2 || e == 5 || e == 8) right = right + dx > left + kMin ? right + dx : left + kMin;
+    if (e == 3 || e == 4 || e == 5) top = top + dy < bottom - kMin ? top + dy : bottom - kMin;
+    if (e == 6 || e == 7 || e == 8) bottom = bottom + dy > top + kMin ? bottom + dy : top + kMin;
+  }
+  drag_->set_bounds({left, top, static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top)});
+}
+
 void Win32Windows::tap_key(const hardware::KeyEvent& event, uint8_t modifiers) {
   if (!session_ || !manager_ || !attached_) return;
   const uint8_t bit = static_cast<uint8_t>(1u << (event.usage & 7));
@@ -264,13 +435,31 @@ void Win32Windows::tap_mouse(const hardware::MouseEvent& event, int32_t* x, int3
   gui::Point origin;
   Win32Window* over = nullptr;
   bool program_active = false;
+  bool dragging = false, drag_done = false;
   {
     gui::UiGuard lock(manager_);
+    pointer_x_ = *x;
+    pointer_y_ = *y;
+    if (drag_) {      // the frame follows the pointer; the program hears of it as the frame moves, not as mouse input
+      dragging = true;
+      drag_to(*x, *y);
+      if (!(event.buttons & hardware::mouse_button::kLeft)) {
+        drag_ = nullptr;
+        drag_done = true;
+      }
+    }
     origin = manager_->window_origin();
     gui::Rect2D area;
     over = host_under(*manager_, *x - origin.x, *y - origin.y, &area);
     const gui::Frame* active = manager_->active();
     for (const UniquePointer<Win32Window>& h : hosts_.view()) if (h.get() == active) program_active = true;
+  }
+  if (dragging) {
+    if (drag_done && (buttons_ & hardware::mouse_button::kLeft)) {      // (the press that began it is let go in the program too)
+      session_->mouse_button(1, false);
+      buttons_ = static_cast<uint8_t>(buttons_ & ~hardware::mouse_button::kLeft);
+    }
+    return;
   }
   const int32_t sx = *x - origin.x, sy = *y - origin.y;      // win32k's screen = the window manager's area
   const uint8_t pressed_now = static_cast<uint8_t>(event.buttons & ~buttons_ & 7);

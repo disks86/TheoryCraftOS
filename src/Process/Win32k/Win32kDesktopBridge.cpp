@@ -79,15 +79,27 @@ gdi::Rect gdi_rect(const desktop::WindowsRect& r) { return {r.x, r.y, int32_t(ui
 
 }  // namespace
 
-void DesktopBridge::attach(uint32_t width, uint32_t height, const desktop::WindowsRect& work_area, int32_t frame_border, int32_t frame_title) {
+void DesktopBridge::attach(int32_t frame_border, int32_t frame_title) {
   {
     user_misc::SystemLock lock;
-    if (width != gdi::screen_width() || height != gdi::screen_height()) gdi::set_screen_size(width, height);
-    user_misc::set_monitor_work_area(gdi_rect(work_area));
     gdi::set_window_surface_sink(this);
     attached_ = true;
   }
   user::set_redirection(true, this, frame_border, frame_title);      // (takes the lock itself)
+}
+
+void DesktopBridge::set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) {
+  gdi::Rect rects[8], works[8];
+  uint32_t n = 0;
+  for (const Monitor& m : monitors) {
+    if (n == 8) break;
+    rects[n] = gdi_rect(m.rect);
+    works[n] = gdi_rect(m.work);
+    ++n;
+  }
+  user_misc::SystemLock lock;
+  if (width != gdi::screen_width() || height != gdi::screen_height()) gdi::set_screen_size(width, height);
+  user_misc::set_monitors(ArrayView<const gdi::Rect>(rects, n), ArrayView<const gdi::Rect>(works, n));
 }
 
 void DesktopBridge::detach() {
@@ -149,6 +161,19 @@ void DesktopBridge::take_changes(List<uint32_t>* changed, List<Repaint>* repaint
   for (uint32_t w : changed->view()) repainted->push_back(Repaint{w, {0, 0, 0xFFFFu, 0xFFFFu}});
 }
 
+void DesktopBridge::drag_requested(uint32_t hwnd, uint32_t edge) {
+  drag_window_ = hwnd;
+  drag_edge_ = edge;
+}
+
+uint32_t DesktopBridge::take_drag(uint32_t* edge) {
+  user_misc::SystemLock lock;
+  const uint32_t w = drag_window_;
+  *edge = drag_edge_;
+  drag_window_ = drag_edge_ = 0;
+  return w;
+}
+
 void DesktopBridge::windows(List<uint32_t>* out) {
   user::top_levels(out);      // (topmost first: turned around)
   for (uint64_t i = 0, j = out->count(); i + 1 < j; ++i, --j) {
@@ -165,9 +190,18 @@ bool DesktopBridge::window_info(uint32_t window, desktop::WindowsWindowInfo* out
   WideString wide(title->allocator());
   if (!user::top_level_info(window, &info, &wide) || !fill_info(info, out)) return false;
   title->clear();
-  for (char16_t c : wide.view()) {      // (the desktop's font has ASCII glyphs: anything else shows as '?')
-    const char a = c >= 0x20 && c < 0x7F ? static_cast<char>(c) : '?';
-    title->append(StringView(&a, 1));
+  const ArrayView<const char16_t> text = wide.view();
+  for (uint64_t i = 0; i < text.size(); ++i) {      // UTF-16 to UTF-8 (a lone surrogate is U+FFFD)
+    char32_t c = text[i];
+    if (c >= 0xD800 && c < 0xDC00 && i + 1 < text.size() && text[i + 1] >= 0xDC00 && text[i + 1] < 0xE000) c = 0x10000 + ((c - 0xD800) << 10) + (text[++i] - 0xDC00);
+    else if (c >= 0xD800 && c < 0xE000) c = 0xFFFD;
+    char bytes[4];
+    uint32_t n = 0;
+    if (c < 0x80) bytes[n++] = static_cast<char>(c);
+    else if (c < 0x800) { bytes[n++] = static_cast<char>(0xC0 | c >> 6); bytes[n++] = static_cast<char>(0x80 | (c & 0x3F)); }
+    else if (c < 0x10000) { bytes[n++] = static_cast<char>(0xE0 | c >> 12); bytes[n++] = static_cast<char>(0x80 | (c >> 6 & 0x3F)); bytes[n++] = static_cast<char>(0x80 | (c & 0x3F)); }
+    else { bytes[n++] = static_cast<char>(0xF0 | c >> 18); bytes[n++] = static_cast<char>(0x80 | (c >> 12 & 0x3F)); bytes[n++] = static_cast<char>(0x80 | (c >> 6 & 0x3F)); bytes[n++] = static_cast<char>(0x80 | (c & 0x3F)); }
+    if (!title->append(StringView(bytes, n))) return false;
   }
   return true;
 }
@@ -187,6 +221,7 @@ bool DesktopBridge::fill_info(const user::TopLevelInfo& info, desktop::WindowsWi
   // A window without a caption that floats over another program's window (a menu, tooltip or drop-down list) is not activated from the desktop's side.
   out->popup = !info.caption && (info.no_activate || info.tool || (info.popup && info.owner != 0 && info.topmost));
   out->owned = info.owner != 0;
+  out->icon = info.icon;
   out->window = windows_rect(info.window);
   out->surface = windows_rect(info.surface);
   return true;
@@ -241,5 +276,17 @@ void DesktopBridge::mouse_wheel(int32_t notches) { user::inject_mouse_wheel(notc
 void DesktopBridge::cursor(int32_t* x, int32_t* y) { user::cursor_position(x, y); }
 bool DesktopBridge::cursor_confined() { return user::cursor_confined(); }
 uint32_t DesktopBridge::capture_window() { return user::mouse_capture_window(); }
+
+void DesktopBridge::pointer(Pointer* out) {
+  user::PointerCursor c;
+  user::pointer_cursor(&c);
+  out->hidden = c.hidden;
+  out->cursor = c.cursor;
+  out->system_id = c.system_id;
+}
+
+bool DesktopBridge::cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) {
+  return user::cursor_picture(cursor, system_id, argb, width, height, hot_x, hot_y);
+}
 
 }  // namespace process::win32k

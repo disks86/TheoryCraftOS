@@ -16,9 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* Monitors and display settings of user32.dll (included by window.inc after the scrolling): win32k knows one monitor, the screen. GetMonitorInfo and the MonitorFrom functions answer for it
- * (a point or window outside it is handled by the flags: nothing, the primary monitor or the nearest, which is the same), EnumDisplayMonitors calls back once, and the display settings
- * come from the window manager (the W forms only; the DEVMODEA forms stay unimplemented). */
+/* Monitors and display settings of user32.dll (included by window.inc after the scrolling): win32k knows the desktop's monitors (one, the screen, unless the kernel's desktop
+ * set more). GetMonitorInfo and the MonitorFrom functions answer for them (a point or window off every monitor is handled by the flags: nothing, the primary monitor or the
+ * nearest), EnumDisplayMonitors calls back for each (for a device context: the primary only), and the display settings come from the window manager (the W forms only; the
+ * DEVMODEA forms stay unimplemented). */
 
 #define MONITOR_DEFAULTTONULL_ 0
 #define ERROR_INVALID_MONITOR_HANDLE_ 1461
@@ -62,19 +63,27 @@ typedef BOOL (WINAPI *MONITORENUMPROC_)(HANDLE, HANDLE, RECT_ *, LONG_PTR);
 EXPORT BOOL WINAPI EnumDisplayMonitors(HANDLE hdc, const RECT_ *clip, MONITORENUMPROC_ proc, LONG_PTR data) {
   if (!proc) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   RECT_ zero = {0, 0, 0, 0};
-  HANDLE monitor = MonitorFromRect(&zero, 1 /* MONITOR_DEFAULTTOPRIMARY */);
-  MonitorInfoW_ info;
-  for (size_t_ i = 0; i < sizeof info; ++i) ((BYTE *)&info)[i] = 0;
-  info.size = 40;
-  if (!monitor || !GetMonitorInfoW(monitor, &info)) return FALSE;
-  RECT_ area = info.monitor;
-  if (hdc) {      /* in device coordinates: the rectangle of the monitor within the clip of the context, from the origin of its window */
-    RECT_ box;
-    if (GetClipBox(hdc, &box) == 0 /* ERROR */) return FALSE;
-    area.left = 0; area.top = 0; area.right = info.monitor.right - info.monitor.left; area.bottom = info.monitor.bottom - info.monitor.top;
+  HANDLE primary = MonitorFromRect(&zero, 1 /* MONITOR_DEFAULTTOPRIMARY */);
+  if (!primary) return FALSE;
+  /* win32k numbers the monitors from the primary's handle up (Win32kUserMiscMonitor.cpp); the first handle it does not know ends the list */
+  const DWORD saved_error = GetLastError();
+  for (ULONG_PTR i = 0; i < 8; ++i) {
+    HANDLE monitor = (HANDLE)((ULONG_PTR)primary + i);
+    MonitorInfoW_ info;
+    for (size_t_ k = 0; k < sizeof info; ++k) ((BYTE *)&info)[k] = 0;
+    info.size = 40;
+    if (!GetMonitorInfoW(monitor, &info)) { if (i == 0) return FALSE; break; }
+    RECT_ area = info.monitor;
+    if (hdc) {      /* in device coordinates: the rectangle of the monitor within the clip of the context, from the origin of its window (the primary only) */
+      RECT_ box;
+      if (i > 0) break;
+      if (GetClipBox(hdc, &box) == 0 /* ERROR */) return FALSE;
+      area.left = 0; area.top = 0; area.right = info.monitor.right - info.monitor.left; area.bottom = info.monitor.bottom - info.monitor.top;
+    }
+    if (clip) { RECT_ meet; if (!rect_meet(&area, clip, &meet)) continue; area = meet; }
+    if (!proc(monitor, hdc, &area, data)) break;
   }
-  if (clip) { RECT_ meet; if (!rect_meet(&area, clip, &meet)) return TRUE; area = meet; }
-  proc(monitor, hdc, &area, data);
+  SetLastError(saved_error);
   return TRUE;
 }
 EXPORT BOOL WINAPI EnumDisplaySettingsExW(LPCWSTR device, DWORD mode, void *devmode, DWORD flags) {
