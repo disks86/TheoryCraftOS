@@ -45,7 +45,6 @@ bool IntelHevcVdencEncoder::prepare() {
   if (config_.input != PixelFormat::I420 && config_.input != PixelFormat::Nv12 && config_.input != PixelFormat::Bgra8888) return false;
   if (config_.width < 16 || config_.height < 16 || config_.width > 4096 || config_.height > 4096 || (config_.width & 1) || (config_.height & 1)) return false;
   if (!buffers_.gen12()) return false;   // (Ice Lake builds two of the VDEnc commands with HuC firmware)
-  if (buffers_.xe2()) return false;   // (its VDEnc commands are not written yet; Xe-LP, Xe-LPG and Arc's are)
   if (!intel_enc::hevc_encode_layout((config_.width + 7) & ~7u, (config_.height + 7) & ~7u, &layout_)) return false;
   plan_ = intel_enc::hevc_scratch_plan(layout_);
   qp_ = quantiser_for(config_.quality);
@@ -89,7 +88,7 @@ bool IntelHevcVdencEncoder::build_batch(bool idr, uint32_t poc, uint32_t* words)
     return false;
 
   HevcEncodePicture p;
-  p.platform = buffers_.xe_lpg() ? HevcVdencPlatform::XeLpg : buffers_.xe_hpg() ? HevcVdencPlatform::XeHpg : HevcVdencPlatform::XeLp;
+  p.platform = buffers_.xe_lpg() ? HevcVdencPlatform::XeLpg : buffers_.xe_hpg() ? HevcVdencPlatform::XeHpg : buffers_.xe2_hpm() ? HevcVdencPlatform::Xe2Hpm : buffers_.xe2() ? HevcVdencPlatform::Xe2Lpm : HevcVdencPlatform::XeLp;
   p.p_picture = !idr;
   p.qp = static_cast<int32_t>(qp_);
   p.pps_qp = 26;

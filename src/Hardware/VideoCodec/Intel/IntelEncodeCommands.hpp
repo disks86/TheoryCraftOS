@@ -85,6 +85,7 @@ struct AvcEncodePicture {
   uint32_t last_in_stream = 0;
   bool xe_lpg = false;                          // Meteor Lake / Arrow Lake: the VDEnc commands of Xe_LPM_plus (Gen12 otherwise means Xe-LP)
   bool xe_hpg = false;                          // Arc Alchemist: the VDEnc commands of Xe_HPM
+  uint32_t xe2 = 0;                             // 1: Lunar Lake, 2: Arc Battlemage (set with xe_lpg: Xe-LPG's command sequence with Xe2's image state, and a 7-dword pipe mode select on Battlemage)
   uint32_t poc = 0, reference_poc = 0;          // picture order counts (low eight bits are what the VDEnc image state carries)
 };
 
