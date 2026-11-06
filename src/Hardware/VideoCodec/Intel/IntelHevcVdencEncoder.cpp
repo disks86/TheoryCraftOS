@@ -54,8 +54,8 @@ bool IntelHevcVdencEncoder::prepare() {
   stream_.width = config_.width;
   stream_.height = config_.height;
   stream_.log2_max_poc_lsb = kLog2MaxPocLsb;
-  // B pictures: only where the commands are written (Xe-LPG, Arc and Xe2).
-  ra_mode_ = config_.b_frames > 0 && (buffers_.xe_lpg() || buffers_.xe_hpg() || buffers_.xe2());
+  // B pictures: opt-in; Xe-LP and newer.
+  ra_mode_ = config_.b_frames > 0;   // (every Gen12 platform from Xe-LP on)
   stream_.b_pictures = ra_mode_;
   if (!yuv_[0].allocate({config_.width, config_.height, PixelFormat::I420}) || !yuv_[1].allocate({config_.width, config_.height, PixelFormat::I420})) return false;
   if (!buffers_.lease()) return false;

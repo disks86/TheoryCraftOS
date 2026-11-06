@@ -187,6 +187,7 @@ struct FakeEncoder {
   uint32_t previous_recon = 0, previous_ds4 = 0, previous_ds8 = 0, previous_mv = 0;   // the latest anchor
   uint32_t older_recon = 0, older_ds4 = 0, older_ds8 = 0, older_mv = 0;                // the anchor before it
   int b_pictures = 0;
+  bool ra_stream = false;                         // the stream has B pictures: frame stores alternate on every platform
   void problem(const char* what) { printf("    encoder model: %s\n", what); ++problems; }
 
   void run(FakeGpu& gpu, const std::vector<uint32_t>& d) {
@@ -285,7 +286,7 @@ struct FakeEncoder {
         if (!rab) {
           // (An anchor of a stream with B pictures is usually two pictures after the previous one.)
           const uint32_t dist = field(l0[2], 0, 7);
-          if (dist < 1 || dist > 2 || l0[2] != l1[2] || (!xe_lpg && field(l0[2], 8, 10) != 0)) problem("reference list entries");
+          if (dist < 1 || dist > 2 || l0[2] != l1[2] || (!xe_lpg && !ra_stream && field(l0[2], 8, 10) != 0)) problem("reference list entries");
           if (field(cmd2[3], 0, 7) != dist || field(cmd2[3], 8, 15) != dist) problem("reference POC distances");
         } else {
           // The earlier anchor is one picture back, the later one a picture ahead (a distance of minus one); they sit in different frame stores.
@@ -404,7 +405,7 @@ struct FakeEncoder {
       if (vbuf[1] != fwd_ds8 || vbuf[37] != fwd_ds4 || buf[66 + 2 * ref_store] != fwd_mv) problem("reference buffers are the earlier anchor's");
       mapped(vbuf[1], layout.ds8.size, "8x downscaled reference");
       mapped(vbuf[37], layout.ds4.size, "4x downscaled reference");
-      if (xe_lpg && (rab || vbuf[31] != 0)) {
+      if (rab || vbuf[31] != 0) {
         // The backward reference: the later anchor for a B picture, else (the hardware's request) the forward reference again.
         const uint32_t bwd_recon = rab ? previous_recon : fwd_recon, bwd_ds4 = rab ? previous_ds4 : fwd_ds4, bwd_ds8 = rab ? previous_ds8 : fwd_ds8, bwd_mv = rab ? previous_mv : fwd_mv;
         if (vbuf[31] != bwd_recon || vbuf[43] != bwd_ds4 || vbuf[7] != bwd_ds8 || buf[37 + 2 * back_store] != bwd_recon || buf[66 + 2 * back_store] != bwd_mv) problem("backward reference buffers");
@@ -605,12 +606,13 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
 
 // Streams with B pictures (EncoderConfig::b_frames = 1): I B P B P in output order, coded I P B P B, one packet per submitted picture in decoding order (the B packets with the
 // earlier times) once flush() has been called; the CPU decodes the stream and shows the pictures (flat grey, which is all the engine model codes) in output order.
-void encode_and_check_ra(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, bool arc, int xe2) {
-  printf("  %ux%u, %u pictures with B pictures, keyframe interval %u%s\n", w, h, count, interval, arc ? " (Arc)" : xe2 == 2 ? " (Battlemage)" : xe2 == 1 ? " (Lunar Lake)" : " (Xe-LPG)");
+void encode_and_check_ra(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, bool arc, int xe2, bool xe_lp = false) {
+  printf("  %ux%u, %u pictures with B pictures, keyframe interval %u%s\n", w, h, count, interval, xe_lp ? " (Xe-LP)" : arc ? " (Arc)" : xe2 == 2 ? " (Battlemage)" : xe2 == 1 ? " (Lunar Lake)" : " (Xe-LPG)");
   Rig2 rig;
-  rig.engine.xe_lpg = true;
+  rig.engine.xe_lpg = !xe_lp;
   rig.engine.xe2 = xe2;
-  rig.gpu.xehp = true;
+  rig.engine.ra_stream = true;
+  rig.gpu.xehp = !xe_lp;
   rig.engine.write_stream = (w % 64 == 0 && h % 64 == 0);
   EncoderConfig cfg;
   cfg.codec = VideoCodec::Hevc;
@@ -636,9 +638,9 @@ void encode_and_check_ra(TestAllocator& a, uint32_t w, uint32_t h, uint32_t coun
   {
     VcsDriver driver(rig.mem);
     VcsDriver::Config driver_config = rig.config();
-    driver_config.xe_lpg = !arc && xe2 == 0;
+    driver_config.xe_lpg = !xe_lp && !arc && xe2 == 0;
     driver_config.xe_hpg = arc;
-    driver_config.gmd_id_flush = !arc && xe2 == 0;
+    driver_config.gmd_id_flush = !xe_lp && !arc && xe2 == 0;
     driver_config.xe2 = xe2 != 0;
     driver_config.xe2_hpm = xe2 == 2;
     CHECK(driver.initialize(driver_config));
@@ -929,6 +931,8 @@ int main() {
     encode_and_check_ra(a, 128, 64, 9, 5, false, x2);
     encode_and_check_ra(a, 64, 64, 2, 8, false, x2);   // a picture that never gets a later anchor
   }
+  encode_and_check_ra(a, 64, 64, 8, 8, false, 0, true);    // Xe-LP (Tiger Lake and later)
+  encode_and_check_ra(a, 128, 64, 9, 5, false, 0, true);
   encode_and_check_ra(a, 64, 64, 8, 8, true, 0);    // Arc Alchemist
   encode_and_check_ra(a, 128, 128, 7, 4, true, 0);
   test_rejections(a);
