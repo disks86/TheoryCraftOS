@@ -35,6 +35,7 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgHevc.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2LpmHevc.inc"   // (Lunar Lake: CMD1 and CMD2 differ from Xe-LPG's)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2HpmHevc.inc"   // (Battlemage: also the pipe mode select)
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe3LpmHevc.inc"   // (Panther Lake: CMD1 49 dwords, CMD2 65, pipe buffer 99)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeHpgHevc.inc"   // (only its CMD2 differs from Xe-LPG's; tools/gen_intel_hevc_xelpg.py xehpg)
 
 constexpr uint32_t kPage = 4096;
@@ -262,6 +263,13 @@ void xe_lpg_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
         xe_cmd1_image(w, copy, (t == 0 ? kXe2HpmVdencCmd1RaQpTableI : t == 1 ? kXe2HpmVdencCmd1RaQpTableP : kXe2HpmVdencCmd1RaQpTableB)[q]);
         break;
       }
+      case HevcVdencPlatform::Xe3Lpm: {
+        const uint32_t* images[3] = {kXe3LpmVdencCmd1RaImageI, kXe3LpmVdencCmd1RaImageP, kXe3LpmVdencCmd1RaImageB};
+        uint32_t copy[kXe3LpmVdencCmd1Dwords];
+        for (uint32_t i = 0; i < kXe3LpmVdencCmd1Dwords; ++i) copy[i] = images[t][i];
+        xe_cmd1_image(w, copy, (t == 0 ? kXe3LpmVdencCmd1RaQpTableI : t == 1 ? kXe3LpmVdencCmd1RaQpTableP : kXe3LpmVdencCmd1RaQpTableB)[q]);
+        break;
+      }
       default: {
         const bool arc = p.platform == HevcVdencPlatform::XeHpg;
         const uint32_t* images[3] = {kXeLpgVdencCmd1RaImageI, kXeLpgVdencCmd1RaImageP, kXeLpgVdencCmd1RaImageB};
@@ -276,42 +284,19 @@ void xe_lpg_cmd1(DwordWriter& w, const HevcEncodePicture& p) {
   }
   switch (p.platform) {
     case HevcVdencPlatform::Xe2Lpm: xe_cmd1_image(w, p.p_picture ? kXe2LpmVdencCmd1ImageB : kXe2LpmVdencCmd1ImageI, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[q]); break;
+    case HevcVdencPlatform::Xe3Lpm: xe_cmd1_image(w, p.p_picture ? kXe3LpmVdencCmd1ImageB : kXe3LpmVdencCmd1ImageI, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[q]); break;
     case HevcVdencPlatform::Xe2Hpm: xe_cmd1_image(w, p.p_picture ? kXe2HpmVdencCmd1ImageB : kXe2HpmVdencCmd1ImageI, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[q]); break;
     default: xe_cmd1_image(w, p.p_picture ? kXeLpgVdencCmd1ImageB : kXeLpgVdencCmd1ImageI, (p.p_picture ? kXeLpgVdencCmd1QpTableB : kXeLpgVdencCmd1QpTableI)[q]); break;   // (Arc's is Xe-LPG's)
   }
 }
 
-void xe_lpg_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayout& l) {
-  const uint32_t* image;
-  const uint32_t* qp_table;
-  if (p.ra_mode) {
-    const uint32_t t = p.b_picture ? 2 : p.p_picture ? 1 : 0;
-    const uint32_t* const images[5][3] = {{kXeLpgVdencCmd2RaImageI, kXeLpgVdencCmd2RaImageP, kXeLpgVdencCmd2RaImageB},   // (XeLp is not used here)
-                                           {kXeLpgVdencCmd2RaImageI, kXeLpgVdencCmd2RaImageP, kXeLpgVdencCmd2RaImageB},
-                                           {kXeHpgVdencCmd2RaImageI, kXeHpgVdencCmd2RaImageP, kXeHpgVdencCmd2RaImageB},
-                                           {kXe2LpmVdencCmd2RaImageI, kXe2LpmVdencCmd2RaImageP, kXe2LpmVdencCmd2RaImageB},
-                                           {kXe2HpmVdencCmd2RaImageI, kXe2HpmVdencCmd2RaImageP, kXe2HpmVdencCmd2RaImageB}};
-    const uint32_t* const tables[5][3] = {{kXeLpgVdencCmd2RaQpTableI, kXeLpgVdencCmd2RaQpTableP, kXeLpgVdencCmd2RaQpTableB},
-                                           {kXeLpgVdencCmd2RaQpTableI, kXeLpgVdencCmd2RaQpTableP, kXeLpgVdencCmd2RaQpTableB},
-                                           {kXeHpgVdencCmd2RaQpTableI, kXeHpgVdencCmd2RaQpTableP, kXeHpgVdencCmd2RaQpTableB},
-                                           {kXe2LpmVdencCmd2RaQpTableI, kXe2LpmVdencCmd2RaQpTableP, kXe2LpmVdencCmd2RaQpTableB},
-                                           {kXe2HpmVdencCmd2RaQpTableI, kXe2HpmVdencCmd2RaQpTableP, kXe2HpmVdencCmd2RaQpTableB}};
-    image = images[static_cast<uint32_t>(p.platform)][t];
-    qp_table = tables[static_cast<uint32_t>(p.platform)][t];
-  } else {
-    switch (p.platform) {
-      case HevcVdencPlatform::XeHpg: image = p.p_picture ? kXeHpgVdencCmd2ImageB : kXeHpgVdencCmd2ImageI; break;
-      case HevcVdencPlatform::Xe2Lpm: image = p.p_picture ? kXe2LpmVdencCmd2ImageB : kXe2LpmVdencCmd2ImageI; break;
-      case HevcVdencPlatform::Xe2Hpm: image = p.p_picture ? kXe2HpmVdencCmd2ImageB : kXe2HpmVdencCmd2ImageI; break;
-      default: image = p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI; break;
-    }
-    qp_table = p.p_picture ? kXeLpgVdencCmd2QpTableB : kXeLpgVdencCmd2QpTableI;
-  }
-  static_assert(kXeLpgVdencCmd2Dwords == kXe2LpmVdencCmd2Dwords && kXeLpgVdencCmd2Dwords == kXe2HpmVdencCmd2Dwords, "CMD2 is 62 dwords on every platform");
-  uint32_t copy[kXeLpgVdencCmd2Dwords];
-  for (uint32_t i = 0; i < kXeLpgVdencCmd2Dwords; ++i) copy[i] = image[i];
-  Command<kXeLpgVdencCmd2Dwords> c(copy);
-  c.raw(kXeLpgVdencCmd2QpDword, qp_table[xe_lpg_qp_index(p)]);
+// The picture-dependent fields of CMD2 on top of the platform's image (62 dwords, 65 on Xe3).
+template <uint32_t N>
+void xe_cmd2_fill(DwordWriter& w, const uint32_t* image, uint32_t qp_dword, const HevcEncodePicture& p, const HevcEncodeLayout& l) {
+  uint32_t copy[N];
+  for (uint32_t i = 0; i < N; ++i) copy[i] = image[i];
+  Command<N> c(copy);
+  c.raw(kXeLpgVdencCmd2QpDword, qp_dword);
   c.set(kXeLpgVdencCmd2_FrameWidthInPixelsMinusOne, l.width - 1);
   c.set(kXeLpgVdencCmd2_FrameHeightInPixelsMinusOne, l.height - 1);
   if (p.p_picture) {
@@ -329,6 +314,41 @@ void xe_lpg_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLay
     c.set(kXeLpgVdencCmd2_PocNumberForRefid2InL1, static_cast<uint32_t>(unused) & 0xFF);
   }
   c.emit(w);
+}
+
+void xe_lpg_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayout& l) {
+  const uint32_t* image;
+  const uint32_t* qp_table;
+  if (p.ra_mode) {
+    const uint32_t t = p.b_picture ? 2 : p.p_picture ? 1 : 0;
+    const uint32_t* const images[6][3] = {{kXeLpgVdencCmd2RaImageI, kXeLpgVdencCmd2RaImageP, kXeLpgVdencCmd2RaImageB},   // (XeLp is not used here)
+                                           {kXeLpgVdencCmd2RaImageI, kXeLpgVdencCmd2RaImageP, kXeLpgVdencCmd2RaImageB},
+                                           {kXeHpgVdencCmd2RaImageI, kXeHpgVdencCmd2RaImageP, kXeHpgVdencCmd2RaImageB},
+                                           {kXe2LpmVdencCmd2RaImageI, kXe2LpmVdencCmd2RaImageP, kXe2LpmVdencCmd2RaImageB},
+                                           {kXe2HpmVdencCmd2RaImageI, kXe2HpmVdencCmd2RaImageP, kXe2HpmVdencCmd2RaImageB},
+                                           {kXe3LpmVdencCmd2RaImageI, kXe3LpmVdencCmd2RaImageP, kXe3LpmVdencCmd2RaImageB}};
+    const uint32_t* const tables[6][3] = {{kXeLpgVdencCmd2RaQpTableI, kXeLpgVdencCmd2RaQpTableP, kXeLpgVdencCmd2RaQpTableB},
+                                           {kXeLpgVdencCmd2RaQpTableI, kXeLpgVdencCmd2RaQpTableP, kXeLpgVdencCmd2RaQpTableB},
+                                           {kXeHpgVdencCmd2RaQpTableI, kXeHpgVdencCmd2RaQpTableP, kXeHpgVdencCmd2RaQpTableB},
+                                           {kXe2LpmVdencCmd2RaQpTableI, kXe2LpmVdencCmd2RaQpTableP, kXe2LpmVdencCmd2RaQpTableB},
+                                           {kXe2HpmVdencCmd2RaQpTableI, kXe2HpmVdencCmd2RaQpTableP, kXe2HpmVdencCmd2RaQpTableB},
+                                           {kXe3LpmVdencCmd2RaQpTableI, kXe3LpmVdencCmd2RaQpTableP, kXe3LpmVdencCmd2RaQpTableB}};
+    image = images[static_cast<uint32_t>(p.platform)][t];
+    qp_table = tables[static_cast<uint32_t>(p.platform)][t];
+  } else {
+    switch (p.platform) {
+      case HevcVdencPlatform::XeHpg: image = p.p_picture ? kXeHpgVdencCmd2ImageB : kXeHpgVdencCmd2ImageI; break;
+      case HevcVdencPlatform::Xe2Lpm: image = p.p_picture ? kXe2LpmVdencCmd2ImageB : kXe2LpmVdencCmd2ImageI; break;
+      case HevcVdencPlatform::Xe2Hpm: image = p.p_picture ? kXe2HpmVdencCmd2ImageB : kXe2HpmVdencCmd2ImageI; break;
+      case HevcVdencPlatform::Xe3Lpm: image = p.p_picture ? kXe3LpmVdencCmd2ImageB : kXe3LpmVdencCmd2ImageI; break;
+      default: image = p.p_picture ? kXeLpgVdencCmd2ImageB : kXeLpgVdencCmd2ImageI; break;
+    }
+    qp_table = p.p_picture ? kXeLpgVdencCmd2QpTableB : kXeLpgVdencCmd2QpTableI;
+  }
+  static_assert(kXeLpgVdencCmd2Dwords == kXe2LpmVdencCmd2Dwords && kXeLpgVdencCmd2Dwords == kXe2HpmVdencCmd2Dwords, "CMD2 is 62 dwords from Xe-LPG to Xe2");
+  static_assert(kXe3LpmVdencCmd2QpDword == kXeLpgVdencCmd2QpDword, "the quantiser dword stays where it is");
+  if (p.platform == HevcVdencPlatform::Xe3Lpm) xe_cmd2_fill<kXe3LpmVdencCmd2Dwords>(w, image, qp_table[xe_lpg_qp_index(p)], p, l);
+  else xe_cmd2_fill<kXeLpgVdencCmd2Dwords>(w, image, qp_table[xe_lpg_qp_index(p)], p, l);
 }
 
 // The lambda table of CMD2 DW26 by picture type (I, P, B) and quantiser 10 .. 51: the driver's table, from which only the I and B rows are used here (its P and B rows are equal).
@@ -592,6 +612,7 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
   if (xe_lpg) {
     const uint32_t random_access = p.b_picture ? 1u << 18 : 0u;   // IsRandomAccess (dword 1, bit 18): the driver sets it when the picture is not low delay
     if (p.platform == HevcVdencPlatform::Xe2Hpm) for (uint32_t i = 0; i < kXe2HpmVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
+    else if (p.platform == HevcVdencPlatform::Xe3Lpm) for (uint32_t i = 0; i < kXe3LpmVdencPipeModeSelectDwords; ++i) w.emit(kXe3LpmVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
     else for (uint32_t i = 0; i < kXeLpgVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
   } else {
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
@@ -613,7 +634,8 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
   vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, 7);   // (chroma downsample filter 7 on the source from Xe-LP on)
   vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full, 0);
   vdenc_ds_surfaces(w, layout);
-  if (xe_lpg) vdenc_pipe_buf<kXeLpgVdencPipeBufAddrStateDwords>(w, kXeLpgVdencPipeBufAddrStateImage, p, b);
+  if (p.platform == HevcVdencPlatform::Xe3Lpm) vdenc_pipe_buf<kXe3LpmVdencPipeBufAddrStateDwords>(w, kXe3LpmVdencPipeBufAddrStateImage, p, b);   // (the first 89 dwords are Xe-LPG's)
+  else if (xe_lpg) vdenc_pipe_buf<kXeLpgVdencPipeBufAddrStateDwords>(w, kXeLpgVdencPipeBufAddrStateImage, p, b);
   else vdenc_pipe_buf<kGen12VdencPipeBufAddrStateDwords>(w, kGen12VdencPipeBufAddrStateDefault, p, b);
 
   // --- CMD1, HCP_PIC_STATE, CMD2.

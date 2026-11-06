@@ -180,7 +180,7 @@ struct FakeEncoder {
   int pictures = 0, problems = 0, keyframes = 0;
   bool write_stream = true;                       // the picture is whole 64x64 blocks: write real slice data
   bool xe_lpg = false;                            // Meteor Lake / Arrow Lake VDEnc commands (else Xe-LP's); Arc and Xe2 have them too
-  int xe2 = 0;                                    // 1: Lunar Lake (39-dword CMD1), 2: Arc Battlemage (also a 7-dword pipe mode select)
+  int xe2 = 0;                                    // 1: Lunar Lake (39-dword CMD1), 2: Arc Battlemage (also a 7-dword pipe mode select), 3: Panther Lake (49-dword CMD1, 65-dword CMD2, 99-dword pipe buffer)
   std::vector<uint32_t> sizes;
   std::vector<uint8_t> last_luma, last_chroma;    // the source surface as the engine read it (visible part)
   uint32_t last_width = 0, last_height = 0;
@@ -237,14 +237,14 @@ struct FakeEncoder {
     for (int k = 0; k < 20; ++k) expect(kHHcpQm, 18, "HCP_QM_STATE");
 
     // --- The VDEnc pipeline.
-    const uint32_t* vmode = expect(kHVdencPipeMode, xe2 == 2 ? 7 : 6, "VDENC_PIPE_MODE_SELECT");
+    const uint32_t* vmode = expect(kHVdencPipeMode, xe2 >= 2 ? 7 : 6, "VDENC_PIPE_MODE_SELECT");
     const uint32_t* vsrc = expect(kHVdencSrc, 6, "VDENC_SRC_SURFACE_STATE");
     const uint32_t* vref = expect(kHVdencRef, 6, "VDENC_REF_SURFACE_STATE");
     const uint32_t* vds = expect(kHVdencDs, 10, "VDENC_DS_REF_SURFACE_STATE");
-    const uint32_t* vbuf = expect(kHVdencPipeBuf, xe_lpg ? 89 : 71, "VDENC_PIPE_BUF_ADDR_STATE");
-    const uint32_t* cmd1 = expect(kHVdencCmd1, xe2 ? 39 : xe_lpg ? 33 : 31, "VDENC_CMD1");
+    const uint32_t* vbuf = expect(kHVdencPipeBuf, xe2 == 3 ? 99 : xe_lpg ? 89 : 71, "VDENC_PIPE_BUF_ADDR_STATE");
+    const uint32_t* cmd1 = expect(kHVdencCmd1, xe2 == 3 ? 49 : xe2 ? 39 : xe_lpg ? 33 : 31, "VDENC_CMD1");
     const uint32_t* pic = expect(kHHcpPicState, 41, "HCP_PIC_STATE");
-    const uint32_t* cmd2 = expect(kHVdencCmd2, xe_lpg ? 62 : 51, "VDENC_CMD2");
+    const uint32_t* cmd2 = expect(kHVdencCmd2, xe2 == 3 ? 65 : xe_lpg ? 62 : 51, "VDENC_CMD2");
     if (!vmode || !vsrc || !vref || !vds || !vbuf || !cmd1 || !pic || !cmd2) return;
     if (xe_lpg) {
       // The driver's open code leaves the TLB prefetch bit alone and keeps the default prefetch geometry; the image has HEVC, 8-bit 4:2:0, low delay and the "Par0" bit set.
@@ -496,7 +496,7 @@ uint8_t limited_chroma(int32_t c) { return static_cast<uint8_t>(128 + ((c - 128)
 
 // Encodes `count` pictures through the session, compares the source surface the engine saw with the input, decodes the packets on the CPU and checks the pictures.
 void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, bool xe_lpg = false, bool arc = false, int xe2 = 0) {
-  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, xe2 == 2 ? " (Battlemage)" : xe2 ? " (Lunar Lake)" : arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : "");
+  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, xe2 == 3 ? " (Panther Lake)" : xe2 == 2 ? " (Battlemage)" : xe2 ? " (Lunar Lake)" : arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : "");
   Rig2 rig;
   rig.engine.xe_lpg = xe_lpg || arc || xe2;   // (Arc's and Xe2's commands have the same fields)
   rig.engine.xe2 = xe2;
@@ -519,6 +519,7 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
     driver_config.xe_hpg = arc;
     driver_config.xe2 = xe2 != 0;
     driver_config.xe2_hpm = xe2 == 2;
+    driver_config.xe3 = xe2 == 3;
     driver_config.gmd_id_flush = xe_lpg;
     CHECK(driver.initialize(driver_config));
     {
@@ -607,7 +608,7 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
 // Streams with B pictures (EncoderConfig::b_frames = 1): I B P B P in output order, coded I P B P B, one packet per submitted picture in decoding order (the B packets with the
 // earlier times) once flush() has been called; the CPU decodes the stream and shows the pictures (flat grey, which is all the engine model codes) in output order.
 void encode_and_check_ra(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, bool arc, int xe2, bool xe_lp = false) {
-  printf("  %ux%u, %u pictures with B pictures, keyframe interval %u%s\n", w, h, count, interval, xe_lp ? " (Xe-LP)" : arc ? " (Arc)" : xe2 == 2 ? " (Battlemage)" : xe2 == 1 ? " (Lunar Lake)" : " (Xe-LPG)");
+  printf("  %ux%u, %u pictures with B pictures, keyframe interval %u%s\n", w, h, count, interval, xe_lp ? " (Xe-LP)" : arc ? " (Arc)" : xe2 == 3 ? " (Panther Lake)" : xe2 == 2 ? " (Battlemage)" : xe2 == 1 ? " (Lunar Lake)" : " (Xe-LPG)");
   Rig2 rig;
   rig.engine.xe_lpg = !xe_lp;
   rig.engine.xe2 = xe2;
@@ -643,6 +644,7 @@ void encode_and_check_ra(TestAllocator& a, uint32_t w, uint32_t h, uint32_t coun
     driver_config.gmd_id_flush = !xe_lp && !arc && xe2 == 0;
     driver_config.xe2 = xe2 != 0;
     driver_config.xe2_hpm = xe2 == 2;
+    driver_config.xe3 = xe2 == 3;
     CHECK(driver.initialize(driver_config));
     {
       IntelHevcVdencEncoder enc(a, driver, cfg);
@@ -841,7 +843,7 @@ void test_device(TestAllocator& a) {
   // The platforms after Xe-LP decode on the engine; of them only Meteor Lake encodes H.265 on it (Xe-LPG's VDEnc commands are written; Arc and Xe2's have a different CMD1/CMD2 and
   // pipe mode, H.264 has two new state commands).
   struct Platform { const char* name; uint16_t id; bool media_tile; bool av1; };
-  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}};
+  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}, {"Panther Lake", 0xB080, true, true}};
   for (const Platform& pl : platforms) {
     printf("  %s\n", pl.name);
     Rig2 rig_pl;
@@ -865,9 +867,9 @@ void test_device(TestAllocator& a) {
       CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && (decode & codec_mask(VideoCodec::Vp9)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
       CHECK(!!(decode & codec_mask(VideoCodec::Av1)) == pl.av1);
       const bool meteor = pl.id == 0x7D55 || pl.id == 0x56A0;   // Meteor Lake and Arc Alchemist encode H.264 and H.265 on the engine
-      const bool xe2 = pl.id == 0x6420 || pl.id == 0xE20B;      // Lunar Lake and Battlemage
+      const bool xe2 = pl.id == 0x6420 || pl.id == 0xE20B || pl.id == 0xB080;      // Lunar Lake, Battlemage and Panther Lake
       rig_pl.engine.xe_lpg = meteor || xe2;
-      rig_pl.engine.xe2 = pl.id == 0xE20B ? 2 : xe2 ? 1 : 0;
+      rig_pl.engine.xe2 = pl.id == 0xB080 ? 3 : pl.id == 0xE20B ? 2 : xe2 ? 1 : 0;
       CHECK(device.info().accelerated_encode_codecs == ((meteor || xe2) ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0));
       EncoderConfig cfg;
       cfg.codec = VideoCodec::Hevc;
@@ -921,12 +923,12 @@ int main() {
   encode_and_check(a, 64, 64, 5, 3, 75, false, true);       // Arc Alchemist
   encode_and_check(a, 72, 40, 4, 2, 40, false, true);
   encode_and_check(a, 1920, 1080, 2, 2, 75, false, true);
-  for (int x2 : {1, 2}) {                                     // Lunar Lake and Arc Battlemage
+  for (int x2 : {1, 2, 3}) {                                  // Lunar Lake, Arc Battlemage and Panther Lake
     encode_and_check(a, 64, 64, 5, 3, 75, false, false, x2);
     encode_and_check(a, 128, 128, 6, 6, 1, false, false, x2);
     encode_and_check(a, 1920, 1080, 2, 2, 75, false, false, x2);
   }
-  for (int x2 : {0, 1, 2}) {                                  // B pictures: Meteor Lake, Lunar Lake, Battlemage
+  for (int x2 : {0, 1, 2, 3}) {                               // B pictures: Meteor Lake, Lunar Lake, Battlemage, Panther Lake
     encode_and_check_ra(a, 64, 64, 8, 8, false, x2);
     encode_and_check_ra(a, 128, 64, 9, 5, false, x2);
     encode_and_check_ra(a, 64, 64, 2, 8, false, x2);   // a picture that never gets a later anchor

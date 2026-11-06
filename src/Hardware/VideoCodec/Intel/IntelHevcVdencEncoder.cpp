@@ -106,7 +106,7 @@ bool IntelHevcVdencEncoder::build_batch(const Picture& pic, uint32_t* words) {
   }
 
   HevcEncodePicture p;
-  p.platform = buffers_.xe_lpg() ? HevcVdencPlatform::XeLpg : buffers_.xe_hpg() ? HevcVdencPlatform::XeHpg : buffers_.xe2_hpm() ? HevcVdencPlatform::Xe2Hpm : buffers_.xe2() ? HevcVdencPlatform::Xe2Lpm : HevcVdencPlatform::XeLp;
+  p.platform = buffers_.xe3() ? HevcVdencPlatform::Xe3Lpm : buffers_.xe_lpg() ? HevcVdencPlatform::XeLpg : buffers_.xe_hpg() ? HevcVdencPlatform::XeHpg : buffers_.xe2_hpm() ? HevcVdencPlatform::Xe2Hpm : buffers_.xe2() ? HevcVdencPlatform::Xe2Lpm : HevcVdencPlatform::XeLp;
   p.p_picture = !pic.idr;
   p.b_picture = pic.b;
   p.ra_mode = ra_mode_;
