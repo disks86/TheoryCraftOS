@@ -291,7 +291,7 @@ class VirglImage final : public IImage {
 
   bool write_pixels_float(ArrayView<const Vec4> pixels) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (!is_wide_format(desc_.format) || !(desc_.usage & kImageSampled) || pixels.size() != count || !ensure_backing(count)) return false;
+    if (!is_wide_format(desc_.format) || desc_.samples > 1 || pixels.size() != count || !ensure_backing(count)) return false;
     ByteWriter out{backing_};
     for (const Vec4& c : pixels) encode_wide_pixel(desc_.format, c, out);
     if (!out.ok()) return false;
@@ -299,10 +299,11 @@ class VirglImage final : public IImage {
     return device_.gpu().command(as_bytes(transfer));
   }
 
-  // Only a texture takes pixels: the host copies them from guest memory (the backing) into the resource.
+  // The host copies the pixels from guest memory (the backing) into the resource: a texture, or an image that is only drawn into and shown (its Y_0_TOP rows go
+  // top row first as read_pixels() gives them back, so a swapchain image the CPU cleared or copied into is shown as written). Not a depth or multisampled image.
   bool write_pixels(ArrayView<const uint32_t> pixels) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || is_wide_format(desc_.format) || pixels.size() != count) return false;
+    if (desc_.samples > 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || pixels.size() != count) return false;
     if (!ensure_backing(count)) return false;
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
@@ -313,7 +314,7 @@ class VirglImage final : public IImage {
   // A rectangle: its rows go to the same place in the backing (the backing is the whole image), and the host copies just that box.
   bool write_rect(const Rect2D& area, ArrayView<const uint32_t> pixels, uint32_t pitch) override {
     const Extent2D e = desc_.extent;
-    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || is_wide_format(desc_.format) || !area.width || !area.height || pitch < area.width) return false;
+    if (desc_.samples > 1 || desc_.format == Format::D32Float || is_wide_format(desc_.format) || !area.width || !area.height || pitch < area.width) return false;
     if (area.x < 0 || area.y < 0 || uint64_t{static_cast<uint32_t>(area.x)} + area.width > e.width || uint64_t{static_cast<uint32_t>(area.y)} + area.height > e.height) return false;
     if (pixels.size() < uint64_t{area.height - 1} * pitch + area.width) return false;
     if (!ensure_backing(uint64_t{e.width} * e.height)) return false;

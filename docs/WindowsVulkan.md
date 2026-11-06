@@ -49,7 +49,8 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
   the GPU wrote into the written storage buffers (the bound ranges) is copied back into their host memory (`buf_readback`), so the copies the CPU does, the uniform data, an
   indirect dispatch's group counts and a mapped memory all see it. Storage buffers in draws are bound the same way (read-only ones need the adapter's `kFeatureStorageInDraws`, written
   ones `kFeatureVertexStores` / `kFeatureFragmentStores`, which are `vertexPipelineStoresAndAtomics` / `fragmentStoresAndAtomics`) and copied back when the pass's stream has run.
-* **Presentation**: `VK_KHR_win32_surface` + `VK_KHR_swapchain`; a swapchain image is a kernel allocation that `D3DKMTPresent` flips onto the display.
+* **Presentation**: `VK_KHR_win32_surface` + `VK_KHR_swapchain`; a swapchain image is a kernel allocation that `D3DKMTPresent` flips onto the display. A swapchain image is a render target and a present image, and a texture only when the program asks to sample it: virgl cannot show an image that is also
+  sampled (making it resident for the present fails, and a present that fails loses the context).
 
 ## Not done
 
@@ -60,5 +61,3 @@ matrices in shaders, dynamic indexing of anything held in registers (arrays in u
 (`vkEnumerateInstanceVersion` says 1.0). A draw that writes a storage buffer another draw of the same pass reads from mapped memory may see the old contents (the copy back is when
 the pass's stream has run). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
 that answer `VK_ERROR_FEATURE_NOT_PRESENT` (`src/Windows/stubs/vulkan-1.inc`). Not validated on real GPUs: only the CPU renderer and what QEMU gives (virgl, standard VGA) run it.
-On virgl, the swapchain present loses the kernel context without an error: GPU work after a present fails (`D3DKMTRender` answers `STATUS_DEVICE_REMOVED`); `tests/windows/vulkantest.c`
-runs its compute test before the swapchain test for that reason.
