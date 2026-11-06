@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <vector>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DropDown.hpp"
@@ -1295,17 +1297,9 @@ static void test_desktop() {
     CHECK(start.open());
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // File Explorer
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Computer Manager
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Text Editor
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Spreadsheet
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Database
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Web Browser
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Terminal
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Paint
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Media Player
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // 3D Test
     d.step(5500000);
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...
+    kb.push(key::kUp, true); kb.push(key::kUp, false);       // back to File Explorer
+    kb.push(key::kUp, true); kb.push(key::kUp, false);       // the selection wraps past the top to the last item, Shut Down... (whatever programs are listed between)
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);
     d.step(6000000);
     // A modal confirmation opens first; nothing is shut down yet.
@@ -1390,6 +1384,124 @@ static void test_select_all_from_keyboard() {
   CHECK(a.live == 0);
 }
 
+// The Windows programs' window (WindowsScreen): opens when their screen first changes, shows it, and hands them the keys (presses and releases) and the pointer
+// (a relative mouse's motion whole; the pointer follows their cursor; it leaves the picture when nothing confines the cursor; Ctrl+Alt lets it go).
+struct FakeWindowsSession final : desktop::IWindowsSession {
+  bool changed = false, confined = false;
+  uint32_t width = 64, height = 48, color = 0xFF336699u;
+  int32_t cx = 0, cy = 0;
+  std::vector<std::string> log;
+  void note(const char* what, int32_t a, int32_t b) { char t[64]; snprintf(t, sizeof t, "%s %d %d", what, a, b); log.push_back(t); }
+  void clamp() {
+    const int32_t lo = confined ? 10 : 0, hx = confined ? 30 : int32_t(width) - 1, hy = confined ? 30 : int32_t(height) - 1;
+    cx = cx < lo ? lo : cx > hx ? hx : cx;
+    cy = cy < lo ? lo : cy > hy ? hy : cy;
+  }
+  bool take_screen_changed() override { const bool c = changed; changed = false; return c; }
+  uint32_t screen_width() override { return width; }
+  uint32_t screen_height() override { return height; }
+  bool set_screen_size(uint32_t w, uint32_t h) override { sized_w = w; sized_h = h; return true; }      // (the fake keeps its 64 x 48 picture)
+  uint32_t sized_w = 0, sized_h = 0;
+  bool copy_screen(ArrayView<uint32_t> out, uint32_t* w, uint32_t* h) override {
+    *w = width; *h = height;
+    if (out.size() < uint64_t{width} * height) return false;
+    for (uint64_t i = 0; i < uint64_t{width} * height; ++i) out[i] = color;
+    return true;
+  }
+  void key(uint8_t usage, bool pressed, uint8_t modifiers) override { (void)modifiers; note("key", usage, pressed); }
+  void mouse_motion(int32_t dx, int32_t dy) override { note("motion", dx, dy); cx += dx; cy += dy; clamp(); }
+  void mouse_position(int32_t x, int32_t y) override { note("position", x, y); cx = x; cy = y; clamp(); }
+  void mouse_button(uint32_t button, bool down) override { note("button", int32_t(button), down); }
+  void mouse_wheel(int32_t notches) override { note("wheel", notches, 0); }
+  void cursor(int32_t* x, int32_t* y) override { *x = cx; *y = cy; }
+  bool cursor_confined() override { return confined; }
+};
+
+static void test_windows_screen() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    FakeWindowsSession s;
+    desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+    d.set_windows_session(&s);
+    desktop::WindowsScreen& ws = d.windows_screen();
+    d.step(0);
+    CHECK(!ws.showing());                       // nothing drawn yet: no window
+    CHECK(s.sized_w == 800 - 48 - uint32_t(desktop::WindowsScreen::kFrameWidth) && s.sized_h > 0 && s.sized_h < 600);      // the screen was fitted to the work area
+    s.changed = true;
+    d.step(1000);
+    CHECK(ws.showing() && ws.active() && ws.view().picture_width() == 64 && ws.view().picture_height() == 48);
+    CHECK(ws.bounds().width == 64 + uint32_t(desktop::WindowsScreen::kFrameWidth));
+    const Point o = ws.view().window_origin();
+    CHECK(screen.px(o.x + 5, o.y + 5) == 0xFF336699u);      // the picture is drawn
+
+    // keys: the press and the release, while the window is the active one
+    kb.push(0x04, true); kb.push(0x04, false);
+    d.step(2000);
+    CHECK(s.log.size() == 2 && s.log[0] == "key 4 1" && s.log[1] == "key 4 0");
+    s.log.clear();
+
+    // the pointer comes into the picture: the cursor goes where it came in, then the motion is handed over whole and the pointer follows the cursor
+    const Point p = d.pointer();
+    mouse.move(o.x + 10 - p.x, o.y + 10 - p.y, 0);
+    d.step(3000);
+    CHECK(s.log.size() == 1 && s.log[0] == "position 10 10" && ws.grabbed());
+    mouse.move(5, -3, 0);
+    d.step(4000);
+    CHECK(s.log.size() == 2 && s.log[1] == "motion 5 -3" && d.pointer().x == o.x + 15 && d.pointer().y == o.y + 7);
+    mouse.move(0, 0, hardware::mouse_button::kLeft);
+    mouse.move(0, 0, 0);
+    d.step(5000);
+    CHECK(s.log.size() == 4 && s.log[2] == "button 1 1" && s.log[3] == "button 1 0");
+    s.log.clear();
+
+    // a program confines the cursor: the pointer stays with it however far the mouse goes
+    s.confined = true;
+    mouse.move(-200, 0, 0);
+    d.step(6000);
+    CHECK(s.log.size() == 1 && s.log[0] == "motion -200 0" && d.pointer().x == o.x + 10 && ws.grabbed());
+    // not confined: leaving the picture gives the pointer back to the desktop, and nothing is handed over
+    s.confined = false;
+    s.log.clear();
+    mouse.move(-200, 0, 0);
+    d.step(7000);
+    CHECK(s.log.empty() && !ws.grabbed() && d.pointer().x < o.x);
+
+    // Ctrl+Alt lets the pointer go until the next click on the picture
+    mouse.move(o.x + 20 - d.pointer().x, 0, 0);
+    d.step(8000);
+    CHECK(ws.grabbed());
+    s.log.clear();
+    kb.push(0xE0, true); kb.push(0xE2, true);
+    d.step(9000);
+    CHECK(!ws.grabbed() && s.log.size() == 2);      // (the keys went to the programs too)
+    s.log.clear();
+    mouse.move(2, 2, 0);
+    d.step(10000);
+    CHECK(s.log.empty() && !ws.grabbed());
+    mouse.move(0, 0, hardware::mouse_button::kLeft);
+    d.step(11000);
+    CHECK(ws.grabbed() && s.log.size() == 2 && s.log[1] == "button 1 1");
+    mouse.move(0, 0, 0);
+    kb.push(0xE2, false); kb.push(0xE0, false);
+    d.step(12000);
+    s.log.clear();
+
+    // a key pressed while the window was active is released there too, even after another window became the active one; new presses are not handed over
+    kb.push(0x05, true);
+    d.step(13000);
+    d.open_calculator();
+    CHECK(!ws.active());
+    kb.push(0x05, false); kb.push(0x06, true); kb.push(0x06, false);
+    d.step(14000);
+    CHECK(s.log.size() == 2 && s.log[0] == "key 5 1" && s.log[1] == "key 5 0");
+    d.set_windows_session(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_dock_layout();
   test_uniform_panel();
@@ -1408,6 +1520,7 @@ int main() {
   test_notice_dialog();
   test_switcher();
   test_desktop_toasts();
+  test_windows_screen();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui: all checks passed\n");
   return 0;

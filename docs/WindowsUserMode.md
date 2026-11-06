@@ -264,10 +264,20 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
   foreground process does not take that input raw. `RIDEV_PAGEONLY`, `RIDEV_EXCLUDE` and `RIDEV_NOLEGACY` (no WM_MOUSEMOVE / button / wheel, or WM_KEYDOWN / WM_CHAR, for that
   process) are followed. Not done: `RIDEV_NOHOTKEYS`, `RIDEV_CAPTUREMOUSE`, `RIDEV_DEVNOTIFY` (WM_INPUT_DEVICE_CHANGE), HID devices other than the mouse and the keyboard, the
   records' extra information. Wine's raw-input tests pass except the cross-desktop cases (no `CreateDesktop`); the multi-process part still hangs now and then in its own waits.
-- **Not done**: the machine's keyboard and mouse do not reach Windows programs yet. `user::inject_*` exist but nothing in the kernel or the desktop calls them, and nothing shows
-  win32k's screen (`gdi::set_screen_sink` has no caller), so in the running OS a Windows GUI program gets input only from `SendInput`. Also not done: `TrackMouseEvent` from
-  user32 (win32k tracks WM_MOUSELEAVE, but the service is not registered), WASAPI (`CoCreateInstance` of the device enumerator fails: Godot falls back to its dummy audio
-  driver), DirectSound.
+- **The desktop bridge** (`src/Process/Win32k/Win32kDesktopBridge.cpp`, `src/Desktop/WindowsScreen.cpp`): win32k's screen is shown in the desktop's "Windows" window, and the
+  machine's keyboard and mouse reach the Windows programs. The window opens by itself when a Windows program first draws (and from Start > Windows Programs); at the first
+  pump the desktop sizes win32k's screen to its work area minus the window's frame (GDI keeps that size until its state exists). The screen is copied whole when the screen
+  sink reports a change. `gui::InputPump` has taps that see every device event before it becomes window events: key presses and releases (USB HID usages, turned into
+  virtual keys, set-1 scan codes, E0 and the character a press types: `windows_key_of_usage`), and a relative mouse's motion as it came (`user::inject_mouse_motion`,
+  whole for raw input). Keys go over while the window is the active one (a release always follows its press); the mouse while the pointer is over the picture or a button
+  pressed there is held, and the desktop pointer then follows the Windows cursor, so ClipCursor and SetCursorPos keep it in the picture (`user::cursor_confined`); with
+  nothing confining it, moving out gives the pointer back; Ctrl+Alt lets it go until the next click on the picture. Messages name the generic modifier keys (VK_SHIFT ...)
+  while the key state keeps left and right apart. Checked in QEMU with `tests/windows/bridgetest.c` (started from a Terminal: the window shows; a click, the G key and raw
+  mouse motion each recolour it). Not done: the Windows cursor's shape (the desktop draws its own pointer, also when a program hides the cursor), the caption and frame of
+  Windows windows (win32k does not paint non-client areas), resizing the screen with the window, several monitors, an absolute tablet's motion is computed from positions
+  (a program that warps the cursor sees jumps).
+- **Not done**: `TrackMouseEvent` from user32 (win32k tracks WM_MOUSELEAVE, but the service is not registered), WASAPI (`CoCreateInstance` of the device enumerator fails:
+  Godot falls back to its dummy audio driver), DirectSound.
 - **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`: also raw input from SendInput, NOLEGACY, removal), `Win32kMiscTest`
   (`test_raw_input_dispatch`: foreground, sinks, page-only / exclude, injected records) and `scripts/winetest.sh winmm tcos_gameinput`
   (`tests/windows/wine/winmm/tcos_gameinput.c`: winmm, xinput by all three names, dinput8, avrt, iphlpapi), both 0 failures; Wine's winmm `timer` and `joystick` 0 failures
