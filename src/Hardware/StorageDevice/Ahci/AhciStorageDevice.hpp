@@ -46,6 +46,7 @@ class AhciController {
   bool initialize();
   // Stops the ports and gives the controller back to the firmware. Safe to repeat.
   void shutdown();
+  void stop_interrupts() { disable_interrupts(); }   // (shutdown, before the kernel stops: the HBA raises no more interrupts)
 
   uint32_t ports_implemented() const { return ports_; }
   bool addresses_64_bit() const { return addresses_64_; }
@@ -113,6 +114,7 @@ class AhciStorageDevice final : public StorageDeviceBase {
   bool read(uint64_t lba, ByteView buffer) override;
   bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
+  void stop_interrupts() override;
   bool discard(uint64_t lba, uint64_t blocks) override;
   StorageStatistics statistics() const override;
 

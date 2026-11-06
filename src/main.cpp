@@ -2418,6 +2418,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   Entry(Level::Ok, "Shutdown").text("network stacks stopped");
   // The virtio-gpu's interrupts end before the kernel does: after that the firmware's interrupt table is back, and a message to our vector would hit it.
   if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) virtio->disable_interrupts();
+  for (uint32_t i = 0; i < storage.count(); ++i) storage.at(i)->stop_interrupts();   // (the same for the disks: their last flush is polled)
   kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   Entry(Level::Ok, "Shutdown").text("threads stopped");
   i2c_hid.stop(input.mice());

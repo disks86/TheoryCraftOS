@@ -62,6 +62,7 @@ class PartitionStorageDevice final : public IStorageDevice {
     return true;
   }
   bool flush() override { return parent_.flush(); }
+  void stop_interrupts() override { parent_.stop_interrupts(); }
 
  private:
   bool in_range(uint64_t lba, uint64_t bytes) const {
