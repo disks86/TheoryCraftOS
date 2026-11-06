@@ -358,7 +358,7 @@ void test_create_and_destroy() {
   CHECK(t.svc32(N::NtUserSetParent, {d, b}) == 0);      // d is b's parent: a cycle
   CHECK(t.svc32(N::NtUserSetParent, {b, b}) == 0);
   const uint32_t old = t.svc32(N::NtUserSetParent, {b, 0});      // to the desktop
-  CHECK(old == d && t.parent_of(b) == 0);
+  CHECK(old == d && t.parent_of(b) == user::desktop_window());      // (a child of the desktop has the desktop as its parent)
   CHECK(t.svc32(N::NtUserSetParent, {a, 0}) == (uint32_t)user::desktop_window());      // a was a top-level window: its parent was the desktop
   user::reset_state();
 }

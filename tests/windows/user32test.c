@@ -1015,7 +1015,7 @@ int main(void) {
   CHECK(ScreenToClient(child1, &p) && p.x == 0 && p.y == 0);
   CHECK(FindWindowExA(hwnd, NULL, "TcosTestClass", "c2") == child2);
   CHECK(FindWindowA("TcosTestClass", "Other") == hwnd);
-  CHECK(SetParent(child1, NULL) == hwnd && GetParent(child1) == NULL);
+  CHECK(SetParent(child1, NULL) == hwnd && GetParent(child1) == GetDesktopWindow());
   CHECK(!SetParent(hwnd, child2) && IsWindow(hwnd));      /* (a window cannot become the child of its own child) */
   CHECK(EnableWindow(child2, FALSE) == FALSE && !IsWindowEnabled(child2));
   EnableWindow(child2, TRUE);

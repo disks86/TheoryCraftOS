@@ -241,8 +241,9 @@ uint64_t nt_create_window_ex(Call& call) {
     if (!parent) return call.fail(kErrorInvalidWindowHandle);
     if (parent->destroy_stage == 2) return call.fail(kErrorInvalidParameter);      // (a window past WM_NCDESTROY takes no new children)
   }
-  if ((style & wn::WS_CHILD) && !parent) return call.fail(uint32_t(kErrorTlwWithWsChild));
-  if (!(style & wn::WS_CHILD) && parent && parent != desktop->message_root) {
+  const bool as_child = (style & wn::WS_CHILD) && !(style & wn::WS_POPUP);      // (WS_POPUP wins over WS_CHILD: it is owned, not a child)
+  if (as_child && !parent) return call.fail(uint32_t(kErrorTlwWithWsChild));
+  if (!as_child && parent && parent != desktop->message_root) {
     owner = parent;
     while (owner->parent && owner->parent->parent && (owner->style & wn::WS_CHILD)) owner = owner->parent;      // the owner is a top-level window
     if (owner->style & wn::WS_CHILD) owner = nullptr;
@@ -287,9 +288,9 @@ uint64_t nt_create_window_ex(Call& call) {
   // z-order: the top of its level (below the topmost windows unless it is one)
   if (parent->parent == nullptr || (w->ex_style & wn::WS_EX_TOPMOST) || true) {
     Window* after = nullptr;
-    if (!(w->ex_style & wn::WS_EX_TOPMOST) && !(style & wn::WS_CHILD)) {
+    if (!(w->ex_style & wn::WS_EX_TOPMOST) && !as_child) {
       for (Window* c = parent->first_child; c && (c->ex_style & wn::WS_EX_TOPMOST); c = c->next) after = c;
-    } else if ((style & wn::WS_CHILD) && !(style & wn::WS_MAXIMIZE)) {      // a new child goes below its siblings (the dialog order is the creation order); a maximized one goes on top
+    } else if (as_child && !(style & wn::WS_MAXIMIZE)) {      // a new child goes below its siblings (the dialog order is the creation order); a maximized one goes on top
       for (Window* c = parent->first_child; c; c = c->next) after = c;
     }
     link_window(w, parent, after, false);
@@ -469,11 +470,11 @@ uint64_t nt_get_ancestor(Call& call) {
       for (int guard = 0; guard < 64; ++guard) {
         Window* up = nullptr;
         if (r->style & wn::WS_POPUP) up = r->owner;
-        else if (r->style & wn::WS_CHILD) up = (r->parent && r->parent != r->desktop->root) ? r->parent : nullptr;
+        else if (r->style & wn::WS_CHILD) up = r->parent;
         if (!up) break;
         r = up;
       }
-      return r->parent ? r->handle : 0;
+      return r->handle;
     }
     default: return call.fail(kErrorInvalidParameter);
   }
@@ -915,7 +916,7 @@ uint64_t nt_call_hwnd(Call& call) {
     case kGetParent:
       if (w == w->desktop->root) return 0;
       if (w->style & wn::WS_POPUP) return w->owner ? w->owner->handle : 0;      // (a popup is owned even when it also has WS_CHILD, as in Windows)
-      if (w->style & wn::WS_CHILD) return w->parent && w->parent != w->desktop->root ? w->parent->handle : 0;
+      if (w->style & wn::WS_CHILD) return w->parent ? w->parent->handle : 0;      // (a child of the desktop has the desktop as its parent)
       return 0;
     case kGetWindowDpiAwarenessContext: return w->dpi_context ? w->dpi_context : 0x6010u;
     case kGetWindowInputContext: return user_misc::window_input_context_raw(w->handle);
