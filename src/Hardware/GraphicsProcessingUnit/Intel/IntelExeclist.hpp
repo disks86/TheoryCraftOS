@@ -47,7 +47,7 @@ class ExeclistPort {
   // twelve entries, its write pointer is at dword 0x2f of the status page, and an entry is in the Gen12 format (the context IDs of the contexts switched to and from).
   // Elsq11: Gen11 (Ice Lake) takes the same submit queue and has the same twelve-entry CSB, but its entries are still in the Gen8 format (one status dword whose
   // bits say what happened, then the context ID).
-  enum class Mode : uint8_t { Elsp, Elsq, Elsq11 };
+  enum class Mode : uint8_t { Elsp, Elsq, Elsq11, ElsqXehp };   // (ElsqXehp: graphics IP 12.50 and later, whose status buffer holds 16-bit context IDs at bit 10)
   static constexpr uint32_t kCsb12Entries = 12;
   static constexpr uint32_t kCsb12WriteDword = 0x2f;     // ICL_HWS_CSB_WRITE_INDEX
   static constexpr uint32_t kRingExeclistSqContents = 0x510;
@@ -55,6 +55,7 @@ class ExeclistPort {
   static constexpr uint32_t kControlLoad = 1u << 0;      // EL_CTRL_LOAD
   static constexpr uint32_t kGen11DisableLegacyMode = 1u << 3;
   static constexpr uint32_t kIdleContextId = 0x7FF;
+  static constexpr uint32_t kXehpIdleContextId = 0xFFFF;
 
   // Bits of the status dword of a CSB entry.
   static constexpr uint32_t kStatusIdleToActive = 1u << 0;

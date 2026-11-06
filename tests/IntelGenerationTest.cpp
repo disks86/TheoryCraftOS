@@ -152,10 +152,11 @@ static void test_media_engine() {
   CHECK(s.vdbox_present == 0 && s.vdbox_count() == 0);
 
   // Unsupported generations and short windows read nothing.
-  // Arc Alchemist (Xe-HPG) reads like Xe-LP. The standalone media tile (Meteor Lake and Arrow Lake graphics, Lunar Lake, Arc Battlemage, Panther Lake) is the same
+  // Arc Alchemist (Xe-HPG) reads like Xe-LP, but for the polarity of the fuse register. The standalone media tile (Meteor Lake and Arrow Lake graphics, Lunar Lake, Arc Battlemage, Panther Lake) is the same
   // block 0x380000 into the BAR: a BAR that ends before it is refused, and nothing outside the tile is touched.
   FakeRegisters hpg;
   hpg.at(0x0D50) = hpg.at(0x0D58) = 1;
+  hpg.at(0x9140) = 0x5;   // from Xe-HPG on the fuse register's bits name the boxes that are present
   s = IntelMediaEngineHw::probe(hpg.region(), A::XeHpg);
   CHECK(s.probed && s.vdbox_present == 0x5 && s.vdbox_awake == 0x5);
   CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeLpg).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe2).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe3).probed);   // BAR too short for the tile
@@ -164,11 +165,12 @@ static void test_media_engine() {
     std::vector<uint32_t> bar(IntelMediaEngineHw::register_window(tile) / 4, 0);
     const uint64_t base = IntelMediaEngineHw::kMediaTileBase;
     bar[(base + 0x0D50) / 4] = bar[(base + 0x0D58) / 4] = 1;   // both boxes acknowledge
+    bar[(base + 0x9140) / 4] = 0x5;                              // ... and are present
     const MmioRegion region(reinterpret_cast<uint64_t>(bar.data()), bar.size() * 4);
     s = IntelMediaEngineHw::probe(region, tile);
     CHECK(s.probed && s.vdbox_present == 0x5 && s.vdbox_awake == 0x5 && s.vdbox_count() == 2);
     CHECK(bar[(base + 0xA540) / 4] == 0x00010000 && bar[(base + 0xA548) / 4] == 0x00010000 && bar[0xA540 / 4] == 0);   // requests withdrawn; the GT half untouched
-    bar[(base + 0x9140) / 4] = 0x4;   // VCS2 fused off
+    bar[(base + 0x9140) / 4] = 0x1;   // VCS2 fused off
     s = IntelMediaEngineHw::probe(region, tile);
     CHECK(s.vdbox_present == 0x1 && s.vdbox_awake == 0x1);
     bar[(base + 0x0D50) / 4] = 0;     // the remaining box never wakes

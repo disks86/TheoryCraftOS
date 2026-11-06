@@ -389,7 +389,7 @@ bool IntelAv1Decoder::run_frame(const av1::OffloadFrame& frame, int current) {
   // The batch.
   // The order of the media driver's AV1 decode packets: pipeline initialisation, mode, surfaces, buffers, bitstream, picture, inter prediction, segments; then for every tile
   // the loop filter state, the tile and its data.
-  const AvpPlatform platform = buffers_.xe_lpg() ? AvpPlatform::XeLpg : buffers_.xe_hpg() ? AvpPlatform::XeHpg : AvpPlatform::XeLp;
+  const AvpPlatform platform = buffers_.xe2() ? AvpPlatform::Xe2 : buffers_.xe_lpg() ? AvpPlatform::XeLpg : buffers_.xe_hpg() ? AvpPlatform::XeHpg : AvpPlatform::XeLp;
   DwordWriter w(buffers_.batch_words());
   intel_mfx::emit_mi_flush(w);
   emit_avp_vd_control_state(w);

@@ -194,6 +194,7 @@ static uint8_t seg_pattern(long k, uint32_t i) { return uint8_t(k * 91 + i * 3 +
 struct FakeDecoder {
   bool xe_lpg = false;   // Meteor Lake / Arrow Lake: five commands are longer
   bool xe_hpg = false;   // Arc Alchemist: four of them are (the tile coding command is not)
+  bool xe2 = false;      // Lunar Lake, Battlemage: as Xe-LPG, with a 215-dword buffer command
   const Reference* reference = nullptr;
   bool check_content = true;
   std::map<uint64_t, long> painted;                // surface address -> the frame it last held
@@ -237,9 +238,9 @@ struct FakeDecoder {
 
   void run(FakeGpu& gpu, const std::vector<uint32_t>& d) {
     enum { kModeSelect, kSurface, kBufAddr, kIndObj, kSegment, kPic, kInloop, kInter, kTile, kBsd, kOther };
-    const bool longer = xe_lpg || xe_hpg;
-    const uint32_t len_mode = longer ? kPipeModeSelectDwordsXeLpg : kPipeModeSelectDwords, len_buf = longer ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords, len_ind = longer ? kIndObjDwordsXeLpg : kIndObjDwords,
-                   len_pic = longer ? kPicStateDwordsXeLpg : kPicStateDwords, len_tile = xe_lpg ? kTileCodingDwordsXeLpg : kTileCodingDwords;
+    const bool longer = xe_lpg || xe_hpg || xe2;
+    const uint32_t len_mode = longer ? kPipeModeSelectDwordsXeLpg : kPipeModeSelectDwords, len_buf = xe2 ? kPipeBufAddrDwordsXe2 : longer ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords, len_ind = longer ? kIndObjDwordsXeLpg : kIndObjDwords,
+                   len_pic = longer ? kPicStateDwordsXeLpg : kPicStateDwords, len_tile = xe_lpg || xe2 ? kTileCodingDwordsXeLpg : kTileCodingDwords;
     size_t loops = 0;
     bool have_vd_control = false;
     std::vector<int> order;
@@ -555,7 +556,7 @@ struct FakeDecoder {
 
 struct Rig2 : Rig {
   FakeDecoder engine;
-  explicit Rig2(bool lpg = false, bool hpg = false) : Rig(Generation::Gen12) { engine.xe_lpg = lpg; engine.xe_hpg = hpg; gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
+  explicit Rig2(bool lpg = false, bool hpg = false, bool x2 = false) : Rig(Generation::Gen12) { engine.xe_lpg = lpg; engine.xe_hpg = hpg; engine.xe2 = x2; gpu.xehp = lpg || hpg || x2; gpu.on_batch = [this](FakeGpu& g, const std::vector<uint32_t>& d) { engine.run(g, d); }; }
 };
 
 static DecoderConfig i420_config() {
@@ -566,21 +567,22 @@ static DecoderConfig i420_config() {
 }
 
 // A stream the engine takes (`taken`) or one the CPU keeps whole.
-static void compare_stream(const char* name, bool taken, bool xe_lpg = false, bool xe_hpg = false) {
-  printf("  %s%s\n", name, xe_lpg ? " (Xe-LPG)" : xe_hpg ? " (Xe-HPG)" : "");
+static void compare_stream(const char* name, bool taken, bool xe_lpg = false, bool xe_hpg = false, bool xe2 = false) {
+  printf("  %s%s\n", name, xe_lpg ? " (Xe-LPG)" : xe_hpg ? " (Xe-HPG)" : xe2 ? " (Xe2)" : "");
   TestAllocator a;
   {
     Reference ref;
     CHECK(make_reference_file(a, name, &ref));
     if (ref.ends.empty()) return;
     printf("    %zu temporal units in, %zu frames decoded, %zu out\n", ref.ends.size(), ref.frames.size(), ref.out.pts.size());
-    Rig2 rig(xe_lpg, xe_hpg);
+    Rig2 rig(xe_lpg, xe_hpg, xe2);
     rig.engine.reference = &ref;
     {
       VcsDriver driver(rig.mem);
       VcsDriver::Config config = rig.config();
       config.xe_lpg = xe_lpg;
       config.xe_hpg = xe_hpg;
+      config.xe2 = xe2;
       CHECK(driver.initialize(config));
       {
         IntelAv1Decoder session(a, driver, i420_config());
@@ -760,6 +762,7 @@ int main() {
       compare_stream(name, true);
       compare_stream(name, true, true);
       compare_stream(name, true, false, true);
+      compare_stream(name, true, false, false, true);
     }
   if (!getenv("ONLY")) {
     for (const char* name : kept) compare_stream(name, false);

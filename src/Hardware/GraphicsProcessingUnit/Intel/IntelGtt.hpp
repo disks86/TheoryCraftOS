@@ -115,11 +115,17 @@ void program_gen12_pat(IRegisterBank& registers);
 // Xe-LPG (Meteor Lake, Arrow Lake): the PAT index of a global GTT entry is two bits of the entry (xe: XELPG_GGTT_PTE_PAT0/PAT1, bits 52 and 53), index 3 here: write-back,
 // coherent with the CPU's caches (one way) - what the ring, status page and context in system memory need.
 constexpr uint64_t kXelpgGgttPteCoherent = (1ull << 52) | (1ull << 53);
+// Xe2: PAT index 2 (write-back, two-way coherent): PAT1 only.
+constexpr uint64_t kXe2GgttPteCoherent = 1ull << 53;
 // The Xe-LPG PAT table (xe_pat.c xelpg_pat_table: 0 write-back, 1 write-through, 2 uncached, 3 write-back one-way coherent, 4 write-back two-way coherent; PPGTT entries with
 // the PAT bit select index 4) and the 16-entry global MOCS table (xe_mocs.c mtl_mocs_desc, entries the table does not use read as entry 1: "ignore PAT, cached"). A media tile
 // has its own copy of both, and the register bank must be the media tile's.
 void program_xelpg_pat(IRegisterBank& registers);
 void program_xelpg_global_mocs(IRegisterBank& registers);
+// Xe2 (xe_pat.c xe2_pat_table, xe_mocs.c xe2_mocs_table): PAT entries 0 .. 3 as the table has them and entry 4, which PPGTT entries with the PAT bit select, as entry 2: write-back,
+// two-way coherent. Global MOCS 0 .. 15; the media tile's MOCS registers are multicast ones.
+void program_xe2_pat(IRegisterBank& registers);
+void program_xe2_global_mocs(IRegisterBank& registers);
 
 // Asks the GPU to drop what it cached of the global GTT; needed after changing entries. `registers` is the register BAR (at least 0x102000 bytes).
 constexpr uint64_t kGttFlushRegister = 0x101008;

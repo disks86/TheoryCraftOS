@@ -33,7 +33,7 @@ using intel_mfx::DwordWriter;
 // Alchemist: Xe_HPM). The command numbers and
 // every field this decoder sets are the same; five commands grew at the end (pipe mode select, pipe buffer addresses, indirect objects, picture state, tile coding) with fields a
 // decoder leaves at zero, and one reserved bit of the picture state (the full-range flag, which only film grain uses) went away.
-enum class AvpPlatform : uint8_t { XeLp, XeLpg, XeHpg };   // (Xe-HPG, Arc Alchemist: the Xe-LPG commands, but the tile coding command stays six dwords)
+enum class AvpPlatform : uint8_t { XeLp, XeLpg, XeHpg, Xe2 };   // (Xe-HPG, Arc Alchemist: the Xe-LPG commands, but the tile coding command stays six dwords)
 
 // AVP commands: pipeline 2, opcode 3, the command number in bits 16-22.
 constexpr uint32_t avp_header(uint32_t command) { return (3u << 29) | (2u << 27) | (3u << 23) | (command << 16); }
@@ -54,7 +54,7 @@ constexpr uint32_t kVdPipelineFlush = (3u << 29) | (2u << 27) | (15u << 23);
 // The lengths of the commands in dwords.
 constexpr uint32_t kPipeModeSelectDwords = 6, kSurfaceStateDwords = 5, kPipeBufAddrDwords = 188, kIndObjDwords = 6, kPicStateDwords = 51, kSegmentStateDwords = 4;
 constexpr uint32_t kTileCodingDwords = 6, kBsdObjectDwords = 3, kInloopFilterDwords = 15, kInterPredDwords = 15;
-constexpr uint32_t kPipeModeSelectDwordsXeLpg = 7, kPipeBufAddrDwordsXeLpg = 212, kIndObjDwordsXeLpg = 9, kPicStateDwordsXeLpg = 76, kTileCodingDwordsXeLpg = 7;
+constexpr uint32_t kPipeModeSelectDwordsXeLpg = 7, kPipeBufAddrDwordsXeLpg = 212, kPipeBufAddrDwordsXe2 = 215, kIndObjDwordsXeLpg = 9, kPicStateDwordsXeLpg = 76, kTileCodingDwordsXeLpg = 7;
 constexpr uint32_t kVdControlState = (3u << 29) | (2u << 27) | (3u << 23) | (10u << 16);   // AVP_VD_CONTROL_STATE (MI_VD_CONTROL_STATE for the AVP): three dwords
 
 // Surface ids of AVP_SURFACE_STATE.

@@ -673,82 +673,47 @@ void test_device(TestAllocator& a) {
   CHECK(rig.gpu.violations.empty() && rig.engine.problems == 0);
   CHECK(rig.mem.live() == 1);
 
-  // Meteor Lake: the media tile. The engine and its registers are the tile's (the simulated GPU stands for the tile's window); the probe looks at the tile's own place in
-  // the BAR. H.264 and H.265 encode run on it, MPEG-2 decode stays with the CPU.
-  {
-    Rig2 mtl;
-    mtl.engine.write_stream = true;
-    std::vector<uint32_t> r3(IntelMediaEngineHw::kMediaTileBase / 4 + 0x20000 / 4, 0);
-    r3[(IntelMediaEngineHw::kMediaTileBase + 0x0D50) / 4] = 1;
-    const MmioRegion region3(reinterpret_cast<uint64_t>(r3.data()), r3.size() * 4);
-    IntelMediaVideoEngine::HardwareSetup setup3;
-    setup3.registers = &mtl.gpu;
-    setup3.ggtt_table = mtl.config().ggtt_table;
-    setup3.ggtt_first_page = 100;
-    setup3.memory = &mtl.mem;
+  // The platforms after Xe-LP decode on the engine but do not encode on it: their VDEnc commands are not the ones written here (the media driver's definitions have an 89-dword
+  // pipe buffer command, a 7-dword weights command, a 3-dword walker plus a separate HEVC/VP9 tile and slice state).
+  struct Platform { const char* name; uint16_t id; bool media_tile; bool av1; };
+  const Platform platforms[] = {{"Meteor Lake", 0x7D55, true, true}, {"Arc Alchemist", 0x56A0, false, true}, {"Lunar Lake", 0x6420, true, true}, {"Arc Battlemage", 0xE20B, true, true}};
+  for (const Platform& pl : platforms) {
+    printf("  %s\n", pl.name);
+    Rig2 rig_pl;
+    rig_pl.gpu.xehp = true;
+    rig_pl.engine.write_stream = true;
+    const uint64_t base = pl.media_tile ? IntelMediaEngineHw::kMediaTileBase : 0;
+    std::vector<uint32_t> regs_pl((base + 0x20000) / 4, 0);
+    regs_pl[(base + 0x0D50) / 4] = 1;   // the first video box answers the power request
+    regs_pl[(base + 0x9140) / 4] = 0x5; // ... and the fuses say both boxes exist
+    const MmioRegion region_pl(reinterpret_cast<uint64_t>(regs_pl.data()), regs_pl.size() * 4);
+    IntelMediaVideoEngine::HardwareSetup setup_pl;
+    setup_pl.registers = &rig_pl.gpu;   // (the simulated GPU stands for the tile's own window)
+    setup_pl.ggtt_table = rig_pl.config().ggtt_table;
+    setup_pl.ggtt_first_page = 100;
+    setup_pl.memory = &rig_pl.mem;
     {
-      IntelMediaVideoEngine device(a, 0x7D55, region3);
-      device.set_hardware(setup3);
+      IntelMediaVideoEngine device(a, pl.id, region_pl);
+      device.set_hardware(setup_pl);
       CHECK(device.initialize() && device.hardware_decode());
       const uint32_t decode = device.info().accelerated_decode_codecs;
-      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
-      CHECK(device.info().accelerated_encode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)));
+      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && (decode & codec_mask(VideoCodec::Vp9)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
+      CHECK(!!(decode & codec_mask(VideoCodec::Av1)) == pl.av1);
+      CHECK(device.info().accelerated_encode_codecs == 0);
       EncoderConfig cfg;
       cfg.codec = VideoCodec::Hevc;
       cfg.width = 64;
       cfg.height = 64;
       cfg.input = PixelFormat::I420;
-      VideoFrameBuffer f(a);
-      make_i420(f, 64, 64, 5);
-      UniquePointer<IVideoEncoder> hw = device.create_encoder(cfg);
-      CHECK(hw != nullptr);
-      if (hw) {
-        CHECK(hw->submit(f.frame()) == SubmitResult::Accepted);
-        VideoPacket p;
-        CHECK(hw->receive(&p) && p.keyframe && mtl.engine.pictures == 1);
+      UniquePointer<IVideoEncoder> enc = device.create_encoder(cfg);
+      if (enc) {
+        VideoFrameBuffer f(a);
+        make_i420(f, 64, 64, 5);
+        enc->submit(f.frame());
       }
-      // The driver programmed the Xe-LPG tables, with the Gen12 engine.
-      CHECK(mtl.gpu.regs[0x4800 + 12] == 2 && mtl.gpu.regs[0x4004] == 0x100);
+      CHECK(rig_pl.engine.pictures == 0);   // (the CPU, if anything)
     }
-    CHECK(mtl.gpu.violations.empty() && mtl.engine.problems == 0);
-  }
-
-  // Arc Alchemist: a discrete card, the main GT. H.264, H.265, VP9 and AV1 decode (not MPEG-2), H.264 and H.265 encode.
-  {
-    Rig2 arc;
-    arc.engine.write_stream = true;
-    std::vector<uint32_t> r4(0x20000 / 4, 0);
-    r4[0x0D50 / 4] = 1;
-    const MmioRegion region4(reinterpret_cast<uint64_t>(r4.data()), r4.size() * 4);
-    IntelMediaVideoEngine::HardwareSetup setup4;
-    setup4.registers = &arc.gpu;
-    setup4.ggtt_table = arc.config().ggtt_table;
-    setup4.ggtt_first_page = 100;
-    setup4.memory = &arc.mem;
-    {
-      IntelMediaVideoEngine device(a, 0x56A0, region4);   // A770
-      device.set_hardware(setup4);
-      CHECK(device.initialize() && device.hardware_decode());
-      const uint32_t decode = device.info().accelerated_decode_codecs;
-      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
-      CHECK(device.info().accelerated_encode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)));
-      EncoderConfig cfg;
-      cfg.codec = VideoCodec::Hevc;
-      cfg.width = 64;
-      cfg.height = 64;
-      cfg.input = PixelFormat::I420;
-      VideoFrameBuffer f(a);
-      make_i420(f, 64, 64, 6);
-      UniquePointer<IVideoEncoder> hw = device.create_encoder(cfg);
-      CHECK(hw != nullptr);
-      if (hw) {
-        CHECK(hw->submit(f.frame()) == SubmitResult::Accepted);
-        VideoPacket p;
-        CHECK(hw->receive(&p) && p.keyframe && arc.engine.pictures == 1);
-      }
-      CHECK(arc.gpu.regs[0xFDC] == (1u << 31) && arc.gpu.regs.count(0xD8C) == 0);
-    }
-    CHECK(arc.gpu.violations.empty() && arc.engine.problems == 0);
+    CHECK(rig_pl.gpu.violations.empty() && rig_pl.engine.problems == 0);
   }
 
   // Ice Lake and Coffee Lake offer H.264 only.

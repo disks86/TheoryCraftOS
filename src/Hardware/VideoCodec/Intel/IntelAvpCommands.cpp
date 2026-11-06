@@ -182,8 +182,8 @@ void emit_avp_surface_state(DwordWriter& w, const intel_mfx::Nv12TiledLayout& la
 }
 
 void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b, AvpPlatform platform) {
-  uint32_t d[kPipeBufAddrDwordsXeLpg];
-  const uint32_t n = platform != AvpPlatform::XeLp ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords;   // (the buffers this decoder uses sit at the same dwords on both)
+  uint32_t d[kPipeBufAddrDwordsXe2];
+  const uint32_t n = platform == AvpPlatform::Xe2 ? kPipeBufAddrDwordsXe2 : platform != AvpPlatform::XeLp ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords;   // (the buffers this decoder uses sit at the same dwords on both)
   Fields f{ArrayView<uint32_t>(d, n)};
   const uint32_t attr = attributes_of(b.mocs);
   f.set(0, 0, 31, kAvpPipeBufAddrState | (n - 2));
@@ -389,7 +389,7 @@ void emit_avp_inter_pred_state(DwordWriter& w, const AvpInterPred& p) {
 
 void emit_avp_tile_coding(DwordWriter& w, const AvpTile& t, AvpPlatform platform) {
   uint32_t d[kTileCodingDwordsXeLpg];
-  const uint32_t n = platform == AvpPlatform::XeLpg ? kTileCodingDwordsXeLpg : kTileCodingDwords;   // (Xe-LPG: the large-scale-tile output position at the end stays zero)
+  const uint32_t n = platform == AvpPlatform::XeLpg || platform == AvpPlatform::Xe2 ? kTileCodingDwordsXeLpg : kTileCodingDwords;   // (Xe-LPG: the large-scale-tile output position at the end stays zero)
   Fields f{ArrayView<uint32_t>(d, n)};
   f.set(0, 0, 31, kAvpTileCoding | (n - 2));
   f.set(1, 0, 11, t.id);

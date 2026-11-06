@@ -43,6 +43,7 @@ bool IntelMediaVideoEngine::initialize() {
   generation_ = intel_gt::Generation::Gen9;
   xe_lpg_ = false;
   xe_hpg_ = false;
+  xe2_ = false;
   // Three generations have a driver: Gen9.5 (its video box answers the look above) and Gen11, which run H.264, MPEG-2, VC-1, H.265 and VP9; and the integrated Xe-LP parts
   // (Tiger Lake, Rocket Lake, Alder Lake, Raptor Lake), whose first video box must have answered, which run H.264, MPEG-2, H.265, VP9 and AV1. VC-1 stays with the CPU
   // there: the media driver has a Xe-LP path for it, but nothing says every Xe-LP part still has the hardware.
@@ -59,7 +60,10 @@ bool IntelMediaVideoEngine::initialize() {
   // Arc Alchemist (Xe-HPG, discrete): the same engine on the main GT, driven out of system memory over PCIe (the card's own memory is not used). Its AVC, HEVC, VP9 and VDEnc
   // commands are Xe-LP's too (Xe_HPM compared field by field); AV1's are Xe-LPG's apart from the tile coding command.
   const bool xe_hpg = gpu_.architecture == IntelGpuArchitecture::XeHpg && gpu_.discrete && (status_.vdbox_awake & 1);
-  if (setup_.registers && setup_.memory && setup_.ggtt_table.valid() && (gen9 || gen11 || gen12 || xe_lpg || xe_hpg) && status_.vdbox_count() > 0) {
+  // Lunar Lake and Arc Battlemage (Xe2): the media tile again, with Xe2's PAT and MOCS tables and context image. The decode commands (AVC, HEVC, VP9) are Xe-LP's with optional
+  // new fields; AV1's have the Xe-LPG lengths but a 215-dword buffer command. The VDEnc ones are not (below).
+  const bool xe2 = gpu_.architecture == IntelGpuArchitecture::Xe2 && (status_.vdbox_awake & 1);
+  if (setup_.registers && setup_.memory && setup_.ggtt_table.valid() && (gen9 || gen11 || gen12 || xe_lpg || xe_hpg || xe2) && status_.vdbox_count() > 0) {
     UniquePointer<intel_gt::VcsDriver> driver = UniquePointer<intel_gt::VcsDriver>::make(allocator_, *setup_.memory);
     intel_gt::VcsDriver::Config config;
     config.registers = setup_.registers;
@@ -67,16 +71,21 @@ bool IntelMediaVideoEngine::initialize() {
     config.ggtt_first_page = setup_.ggtt_first_page;
     config.xe_lpg = xe_lpg;
     config.xe_hpg = xe_hpg;
-    config.generation = (gen12 || xe_lpg || xe_hpg) ? intel_gt::Generation::Gen12 : gen11 ? intel_gt::Generation::Gen11 : intel_gt::Generation::Gen9;
+    config.xe2 = xe2;
+    config.gmd_id_flush = (xe_lpg || xe2) && !gpu_.discrete;
+    config.generation = (gen12 || xe_lpg || xe_hpg || xe2) ? intel_gt::Generation::Gen12 : gen11 ? intel_gt::Generation::Gen11 : intel_gt::Generation::Gen9;
     if (driver && driver->initialize(config)) {
       driver_ = util::move(driver);
       generation_ = config.generation;
       xe_lpg_ = xe_lpg;
       xe_hpg_ = xe_hpg;
-      if (xe_lpg || xe_hpg) {
+      xe2_ = xe2;
+      if (xe_lpg || xe_hpg || xe2) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) |
                                           (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
-        info_.accelerated_encode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc);   // (VDEnc, constant quantiser)
+        // No encode: the VDEnc commands changed after Xe-LP (the pipe buffer command is 89 dwords, the weights 7, the walker 3 plus a separate HEVC/VP9 tile and slice state, and
+        // CMD1/CMD2 are not in the definitions at all), and only the Xe-LP ones are written.
+        info_.accelerated_encode_codecs = 0;
       } else if (gen12) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) |
                                           (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
@@ -110,7 +119,7 @@ UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const Decoder
     UniquePointer<IntelVc1Decoder> session = UniquePointer<IntelVc1Decoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
   }
-  if (config.codec == VideoCodec::Mpeg2 && hardware_decode() && !xe_lpg_ && !xe_hpg_) {
+  if (config.codec == VideoCodec::Mpeg2 && hardware_decode() && !xe_lpg_ && !xe_hpg_ && !xe2_) {
     UniquePointer<IntelMpeg2Decoder> session = UniquePointer<IntelMpeg2Decoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
   }
