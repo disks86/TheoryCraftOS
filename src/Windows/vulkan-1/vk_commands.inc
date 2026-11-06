@@ -1,10 +1,13 @@
-/* vulkan-1.c, part 5: command buffers. vkCmd* record into a list; vkQueueSubmit runs the list: the draws become the kernel's command stream (CommandStream.hpp), the copies and clears
- * that the CPU can do are done in order with it. */
+/* vulkan-1.c, part 5: command buffers. vkCmd* record into a list; vkQueueSubmit runs the list: the draws and dispatches become the kernel's command stream (CommandStream.hpp), the
+ * copies and clears that the CPU can do are done in order with it. What the GPU writes into storage buffers is copied back into their memory when the stream has run (buf_readback), so
+ * the memory always holds what the commands before have left there: a dispatch is run on its own for that. */
 
 enum {
   C_BEGIN_PASS = 1, C_NEXT_SUBPASS, C_END_PASS, C_BIND_PIPE, C_BIND_VB, C_BIND_IB, C_BIND_SETS, C_PUSH, C_VIEWPORT, C_SCISSOR, C_DRAW, C_DRAW_INDEXED, C_COPY_BUF, C_COPY_BUF2IMG,
-  C_COPY_IMG2BUF, C_COPY_IMG, C_BLIT, C_CLEAR_COLOR, C_CLEAR_DS, C_CLEAR_ATT, C_FILL, C_UPDATE, C_EXEC, C_RESOLVE
+  C_COPY_IMG2BUF, C_COPY_IMG, C_BLIT, C_CLEAR_COLOR, C_CLEAR_DS, C_CLEAR_ATT, C_FILL, C_UPDATE, C_EXEC, C_RESOLVE, C_DISPATCH, C_DISPATCH_INDIRECT
 };
+/* The bind points: graphics and compute have pipelines and descriptor sets of their own. */
+enum { BP_GRAPHICS = 0, BP_COMPUTE = 1 };
 
 typedef struct Cmd {
   UINT op, n;
@@ -141,8 +144,9 @@ VKAPI void VKAPI_CALL vkCmdNextSubpass(VkCommandBuffer b, VkSubpassContents cont
 }
 VKAPI void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer b) { record(b, C_END_PASS); }
 VKAPI void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer b, VkPipelineBindPoint point, VkPipeline pipeline) {
-  if (point != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
-  record(b, C_BIND_PIPE)->a = (ULONGLONG)(ULONG_PTR)pipeline;
+  if (point != VK_PIPELINE_BIND_POINT_GRAPHICS && point != VK_PIPELINE_BIND_POINT_COMPUTE) return;
+  Cmd *c = record(b, C_BIND_PIPE);
+  c->a = (ULONGLONG)(ULONG_PTR)pipeline, c->d = point == VK_PIPELINE_BIND_POINT_COMPUTE ? BP_COMPUTE : BP_GRAPHICS;
 }
 VKAPI void VKAPI_CALL vkCmdBindVertexBuffers(VkCommandBuffer b, uint32_t first, uint32_t count, const VkBuffer *bufs, const VkDeviceSize *offsets) {
   for (UINT i = 0; i < count; ++i) {
@@ -157,9 +161,9 @@ VKAPI void VKAPI_CALL vkCmdBindIndexBuffer(VkCommandBuffer b, VkBuffer buffer, V
 VKAPI void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer b, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet *sets, uint32_t ndyn,
                                               const uint32_t *dyn) {
   (void)layout;
-  if (point != VK_PIPELINE_BIND_POINT_GRAPHICS) return;
+  if (point != VK_PIPELINE_BIND_POINT_GRAPHICS && point != VK_PIPELINE_BIND_POINT_COMPUTE) return;
   Cmd *c = record(b, C_BIND_SETS);
-  c->a = first, c->n = count, c->b = ndyn;
+  c->a = first, c->n = count, c->b = ndyn, c->d = point == VK_PIPELINE_BIND_POINT_COMPUTE ? BP_COMPUTE : BP_GRAPHICS;
   c->p = keep(b, NULL, sizeof(void *) * count + sizeof(UINT) * ndyn);
   if (!c->p) return;
   memcpy(c->p, sets, sizeof(void *) * count);
@@ -204,8 +208,14 @@ VKAPI void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer b, VkBuffer buffe
   (void)buffer, (void)offset, (void)count, (void)stride;
   ((CmdBuf *)b)->failed = TRUE;
 }
-VKAPI void VKAPI_CALL vkCmdDispatch(VkCommandBuffer b, uint32_t x, uint32_t y, uint32_t z) { (void)x, (void)y, (void)z, ((CmdBuf *)b)->failed = TRUE; }
-VKAPI void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer b, VkBuffer buffer, VkDeviceSize offset) { (void)buffer, (void)offset, ((CmdBuf *)b)->failed = TRUE; }
+VKAPI void VKAPI_CALL vkCmdDispatch(VkCommandBuffer b, uint32_t x, uint32_t y, uint32_t z) {
+  Cmd *c = record(b, C_DISPATCH);
+  c->a = x, c->b = y, c->c = z;
+}
+VKAPI void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer b, VkBuffer buffer, VkDeviceSize offset) {
+  Cmd *c = record(b, C_DISPATCH_INDIRECT);
+  c->a = (ULONGLONG)(ULONG_PTR)buffer, c->b = offset;
+}
 
 VKAPI void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer b, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions) {
   Cmd *c = record(b, C_COPY_BUF);
@@ -311,6 +321,14 @@ typedef struct Exec {
   DescSet *sets[8];
   UINT dyn[8][8];
   BYTE push[256];
+  Pipe *cpipe;                 /* the compute pipeline (the graphics one is `pipe`) */
+  DescSet *csets[8];
+  UINT cdyn[8][8];
+  struct {                     /* storage buffers the stream writes: copied back into their memory once it has run */
+    Buf *b;
+    ULONGLONG off, size;
+  } written[UAV_SLOTS * 4];
+  UINT nwritten;
   struct {
     Buf *b;
     ULONGLONG off;
@@ -373,6 +391,7 @@ static void flush(Exec *x) {
     x->failed = TRUE;
     trace_status("D3DKMTRender", (UINT)st);
   } else {
+    for (UINT i = 0; i < x->nwritten; ++i) buf_readback(x->written[i].b, x->written[i].off, x->written[i].size);
     /* The stream has run (or been refused) when Render returns; a context that lost a submission says so in the device state (a lost device). */
     BYTE state[16];
     memset(state, 0, sizeof state);
@@ -385,6 +404,7 @@ static void flush(Exec *x) {
   }
   x->bytes = 0;
   x->nalloc = 0;
+  x->nwritten = 0;
   x->stream_open = FALSE;
   x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = TRUE;
   x->topology_sent = 0xFFFFFFFFu;
@@ -467,9 +487,16 @@ static void resolve_subpass(Exec *x) {
   }
 }
 
+/* The descriptor sets and dynamic offsets of the bind point a pipeline is used at. */
+static DescSet **bound_sets(Exec *x, const Pipe *p) { return p->compute ? x->csets : x->sets; }
+static UINT dynamic_offset(Exec *x, const Pipe *p, UINT set, const DescSet *s, UINT binding, UINT element) {
+  UINT di = dynamic_index(s->layout, binding, element);
+  return di < 8 ? (p->compute ? x->cdyn : x->dyn)[set][di] : 0;
+}
+
 /* The constant data of the pipeline's constant buffer slots, in the order the shaders declared them. Returns the number of bytes. */
-static UINT gather_constants(Exec *x, BYTE *out, UINT cap) {
-  Pipe *p = x->pipe;
+static UINT gather_constants(Exec *x, Pipe *p, BYTE *out, UINT cap) {
+  DescSet **sets = bound_sets(x, p);
   UINT total = 0;
   for (UINT i = 0; i < p->ncb; ++i) {
     UINT bytes = p->cb[i].vec4 * 16;
@@ -478,18 +505,13 @@ static UINT gather_constants(Exec *x, BYTE *out, UINT cap) {
     memset(dst, 0, bytes);
     if (p->cb[i].kind == SPV_RES_PUSH) {
       memcpy(dst, x->push, MIN(bytes, (UINT)sizeof x->push));
-    } else if (p->cb[i].set < 8 && x->sets[p->cb[i].set]) {
-      DescSet *s = x->sets[p->cb[i].set];
+    } else if (p->cb[i].set < 8 && sets[p->cb[i].set]) {
+      DescSet *s = sets[p->cb[i].set];
       int bi = layout_binding_index(s->layout, p->cb[i].binding);
       if (bi >= 0 && s->layout->b[bi].count > 0 && s->d[s->first[bi]].buf) {
         Descr *d = &s->d[s->first[bi]];
         ULONGLONG off = d->off;
-        if (s->layout->b[bi].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
-          UINT di = 0;
-          for (UINT k = 0; k < s->layout->nb; ++k)
-            if (s->layout->b[k].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC && s->layout->b[k].binding < p->cb[i].binding) di += s->layout->b[k].count;
-          off += x->dyn[p->cb[i].set][di & 7];
-        }
+        if (is_dynamic(s->layout->b[bi].type)) off += dynamic_offset(x, p, p->cb[i].set, s, p->cb[i].binding, 0);
         Buf *buf = d->buf;
         if (buf->mem && off < buf->size) {
           ULONGLONG n = MIN((ULONGLONG)bytes, MIN(d->range, buf->size - off));
@@ -502,20 +524,20 @@ static UINT gather_constants(Exec *x, BYTE *out, UINT cap) {
   return total;
 }
 
-static void bind_textures(Exec *x) {
-  Pipe *p = x->pipe;
+static void bind_textures(Exec *x, Pipe *p) {
+  DescSet **sets = bound_sets(x, p);
   for (UINT u = 0; u < p->nunit; ++u) {
     TexUnit *tu = &p->unit[u];
-    if (tu->set >= 8 || !x->sets[tu->set]) continue;
-    DescSet *s = x->sets[tu->set];
+    if (tu->set >= 8 || !sets[tu->set]) continue;
+    DescSet *s = sets[tu->set];
     int bi = layout_binding_index(s->layout, tu->binding);
     if (bi < 0) continue;
     UINT index = s->first[bi] + tu->element;
     if (index >= s->nd) continue;
     Descr *d = &s->d[index];
     Sampler *smp = d->sampler;
-    if (tu->sampler_set < 8 && x->sets[tu->sampler_set]) {
-      DescSet *ss = x->sets[tu->sampler_set];
+    if (tu->sampler_set < 8 && sets[tu->sampler_set]) {
+      DescSet *ss = sets[tu->sampler_set];
       int sb = layout_binding_index(ss->layout, tu->sampler_binding);
       if (sb >= 0 && ss->first[sb] < ss->nd) smp = ss->d[ss->first[sb]].sampler;
     }
@@ -527,6 +549,75 @@ static void bind_textures(Exec *x) {
     UINT payload[9] = {u, (UINT)idx, smp->filter, smp->addr_u, smp->addr_v, smp->mip_filter, fbits(smp->lod_bias), fbits(smp->min_lod), fbits(smp->max_lod)};
     packet(x, OP_BIND_TEXTURE, payload, 9);
   }
+}
+
+/* The pipeline's storage buffers into the kernel's slots (BindUav). The written ones are noted for the copy back. FALSE when one is not there: the kernel refuses a dispatch or a
+ * draw without every slot its shader uses. */
+static BOOL bind_storage(Exec *x, Pipe *p) {
+  DescSet **sets = bound_sets(x, p);
+  for (UINT k = 0; k < p->nstorage; ++k) {
+    const StorageSlot *ss = &p->storage[k];
+    DescSet *s = ss->set < 8 ? sets[ss->set] : NULL;
+    int bi = s ? layout_binding_index(s->layout, ss->binding) : -1;
+    if (bi < 0 || ss->element >= s->layout->b[bi].count) return FALSE;
+    Descr *d = &s->d[s->first[bi] + ss->element];
+    Buf *buf = d->buf;
+    UINT alloc;
+    if (!buf || !buf_sync(buf, &alloc)) return FALSE;
+    ULONGLONG off = d->off;
+    if (is_dynamic(s->layout->b[bi].type)) off += dynamic_offset(x, p, ss->set, s, ss->binding, ss->element);
+    if (off >= buf->size) return FALSE;
+    ULONGLONG range = MIN(d->range, buf->size - off);
+    range = (range + 3) & ~3ull;   /* (the kernel binds whole words; the allocation is rounded up to 16 bytes) */
+    int idx = alloc_index(x, alloc);
+    if (idx < 0 || off % 4 || range == 0 || range > 0xFFFFFFFFull) return FALSE;
+    UINT payload[4] = {ss->slot, (UINT)idx, (UINT)off, (UINT)range};
+    if (!packet(x, OP_BIND_UAV, payload, 4)) return FALSE;
+    if (ss->slot < UAV_SLOTS) {
+      BOOL noted = FALSE;
+      for (UINT i = 0; i < x->nwritten; ++i) noted |= x->written[i].b == buf && x->written[i].off == off && x->written[i].size == range;
+      if (noted) continue;
+      if (x->nwritten == sizeof x->written / sizeof x->written[0]) return FALSE;
+      x->written[x->nwritten].b = buf, x->written[x->nwritten].off = off, x->written[x->nwritten].size = range;
+      ++x->nwritten;
+    }
+  }
+  return TRUE;
+}
+
+/* A dispatch: the compute pipeline, its constants, textures and storage buffers, run on its own so that what it writes is back in memory for the commands after it. */
+static void do_dispatch(Exec *x, UINT gx, UINT gy, UINT gz) {
+  Pipe *p = x->cpipe;
+  if (!p || x->stream_open || gx == 0 || gy == 0 || gz == 0) return;
+  if (gx > 65535 || gy > 65535 || gz > 65535) {
+    trace("a dispatch of more work groups than maxComputeWorkGroupCount");
+    x->failed = TRUE;
+    return;
+  }
+  flush(x);
+  packet(x, OP_BIND_PIPELINE, &p->pipe, 1);
+  BYTE constants[4096];
+  UINT bytes = gather_constants(x, p, constants, MIN((UINT)sizeof constants, x->caps->max_push_constant_bytes));
+  if (bytes) {
+    UINT words = bytes / 4;
+    UINT *w = stream_words(x, 2 + words);
+    if (w) {
+      w[0] = OP_PUSH | ((2 + words) << 16);
+      w[1] = bytes;
+      memcpy(w + 2, constants, bytes);
+    }
+  }
+  bind_textures(x, p);
+  if (!bind_storage(x, p)) {
+    trace("a dispatch without a storage buffer its pipeline uses");
+    x->bytes = 0, x->nalloc = 0, x->nwritten = 0;
+    return;
+  }
+  UINT payload[3] = {gx, gy, gz};
+  packet(x, OP_DISPATCH, payload, 3);
+  flush(x);
+  /* (the graphics state is sent again for the next draw) */
+  x->dirty_pipe = x->dirty_state = TRUE;
 }
 
 static BOOL vertex_direct(Pipe *p) {
@@ -651,7 +742,7 @@ static void do_draw(Exec *x, UINT count, UINT instances, UINT first, int vertex_
   }
   if (x->dirty_state) {
     BYTE constants[4096];
-    UINT bytes = gather_constants(x, constants, MIN((UINT)sizeof constants, x->caps->max_push_constant_bytes));
+    UINT bytes = gather_constants(x, p, constants, MIN((UINT)sizeof constants, x->caps->max_push_constant_bytes));
     if (bytes) {
       UINT words = bytes / 4;
       UINT *w = stream_words(x, 2 + words);
@@ -661,7 +752,11 @@ static void do_draw(Exec *x, UINT count, UINT instances, UINT first, int vertex_
         memcpy(w + 2, constants, bytes);
       }
     }
-    bind_textures(x);
+    bind_textures(x, p);
+    if (!bind_storage(x, p)) {
+      trace("a draw without a storage buffer its pipeline uses");
+      return;
+    }
     x->dirty_state = FALSE;
   }
   {
@@ -892,6 +987,10 @@ static void exec_one(Exec *x, const Cmd *c) {
       x->fb = NULL;
       break;
     case C_BIND_PIPE:
+      if (c->d == BP_COMPUTE) {
+        x->cpipe = (Pipe *)(ULONG_PTR)c->a;
+        break;
+      }
       x->pipe = (Pipe *)(ULONG_PTR)c->a;
       x->dirty_pipe = TRUE;
       break;
@@ -907,14 +1006,30 @@ static void exec_one(Exec *x, const Cmd *c) {
       DescSet **sets = c->p;
       const UINT *dyn = (const UINT *)((BYTE *)c->p + sizeof(void *) * c->n);
       UINT used = 0;
+      DescSet **bound = c->d == BP_COMPUTE ? x->csets : x->sets;
+      UINT (*offsets)[8] = c->d == BP_COMPUTE ? x->cdyn : x->dyn;
       for (UINT i = 0; i < c->n && c->a + i < 8; ++i) {
-        x->sets[c->a + i] = sets[i];
+        bound[c->a + i] = sets[i];
         UINT count = 0;
         for (UINT k = 0; sets[i] && k < sets[i]->layout->nb; ++k)
-          if (sets[i]->layout->b[k].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) count += sets[i]->layout->b[k].count;
-        for (UINT k = 0; k < count && k < 8 && used < c->b; ++k) x->dyn[c->a + i][k] = dyn[used++];
+          if (is_dynamic(sets[i]->layout->b[k].type)) count += sets[i]->layout->b[k].count;
+        for (UINT k = 0; k < count && used < c->b; ++k, ++used)
+          if (k < 8) offsets[c->a + i][k] = dyn[used];
       }
-      x->dirty_state = TRUE;
+      if (c->d == BP_GRAPHICS) x->dirty_state = TRUE;
+      break;
+    }
+    case C_DISPATCH:
+      do_dispatch(x, (UINT)c->a, (UINT)c->b, (UINT)c->c);
+      break;
+    case C_DISPATCH_INDIRECT: {
+      /* (the group counts are read from the buffer's memory: what the commands before have left there) */
+      Buf *b = (Buf *)(ULONG_PTR)c->a;
+      if (!b || !b->mem || c->b > b->size || b->size - c->b < 12) break;
+      flush(x);
+      UINT g[3];
+      memcpy(g, b->mem->data + b->off + c->b, 12);
+      do_dispatch(x, g[0], g[1], g[2]);
       break;
     }
     case C_PUSH:

@@ -57,6 +57,15 @@ static int io_leaf(Mod *m, IoCtx *c, Type *t, Leaf *out) {
         m->in_decl[FACE_REG] = DECL_FRONT_FACING;
         return 0;
       case BuiltInFragDepth: return sp_fail(m, "gl_FragDepth");
+      case BuiltInGlobalInvocationId: case BuiltInWorkgroupId: case BuiltInLocalInvocationId: case BuiltInLocalInvocationIndex: {
+        if (!is_input || m->stage != SPV_STAGE_COMPUTE) return sp_fail(m, "a compute built-in outside a compute shader");
+        uint32_t file = c->builtin == BuiltInGlobalInvocationId ? OF_THREAD_ID : c->builtin == BuiltInWorkgroupId ? OF_GROUP_ID : c->builtin == BuiltInLocalInvocationId ? OF_THREAD_IN_GROUP : OF_THREAD_INDEX;
+        out->op.file = (sp_u8)file;
+        identity_swz(&out->op, 0, n);
+        m->system_used |= 1u << (file - OF_THREAD_ID);
+        return 0;
+      }
+      case BuiltInNumWorkgroups: return sp_fail(m, "gl_NumWorkGroups");
       default: return sp_fail2(m, "unsupported built-in", c->builtin);
     }
   }
@@ -149,13 +158,27 @@ static int setup_variables(Mod *m) {
       if (r == m->nres) continue;
       v = new_val(m, pointee, 0);
       if (!v) return sp_fail(m, "out of memory");
-      if (m->res[r].kind == SPV_RES_STORAGE) return sp_fail(m, "storage buffers");
-      if (m->res[r].kind == SPV_RES_UNIFORM || m->res[r].kind == SPV_RES_PUSH) {
+      if (m->res[r].kind == SPV_RES_STORAGE) {
+        v->is_mem = 1, v->is_ptr = 1, v->comp = 4, v->var = r;
+        v->mem_file = m->res[r].uav ? OF_UAV : OF_RES;
+        v->mem_idx = m->res[r].slot;
+        v->res_array = m->res[r].array_size > 1;
+      } else if (m->res[r].kind == SPV_RES_UNIFORM || m->res[r].kind == SPV_RES_PUSH) {
         if (m->res[r].array_size > 1) return sp_fail(m, "arrays of uniform blocks");
         v->is_cb = 1, v->var = r, v->mstride = 16, v->is_ptr = 1, v->comp = 4;
       } else {
         v->is_image = 1, v->image_res = r, v->sampler_res = 0xFFFFFFFFu, v->is_ptr = 1;
       }
+    } else if (storage == SCWorkgroup) {
+      /* one after the other in the group-shared memory g0 */
+      if (m->stage != SPV_STAGE_COMPUTE) return sp_fail(m, "Workgroup memory outside a compute shader");
+      uint32_t bytes = (mem_size(m, pointee, 0, 0) + 3) & ~3u;
+      if (bytes == 0 || bytes > 32768 || m->shared_bytes > 32768 - bytes) return sp_fail(m, "more Workgroup memory than the adapter has (32 KiB)");
+      v = new_val(m, pointee, 0);
+      if (!v) return sp_fail(m, "out of memory");
+      v->is_mem = 1, v->is_ptr = 1, v->comp = 4, v->var = id;
+      v->mem_file = OF_TGSM, v->mem_idx = 0, v->byte_off = m->shared_bytes;
+      m->shared_bytes += bytes;
     } else {
       continue;
     }

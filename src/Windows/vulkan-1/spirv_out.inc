@@ -22,9 +22,11 @@ static int allocate_registers(Mod *m, uint32_t *phys) {
   if (!iv) return sp_fail(m, "out of memory");
   for (uint32_t i = 0; i < m->ncode; ++i) {
     SpIns *c = &m->code[i];
+    /* (an instruction with two results may write the first before it has read its sources for the second: none of them shares a register with a source) */
+    const int no_sharing = c->ndst > 1;
     for (uint32_t s = 0; s < c->nsrc; ++s) {
-      if (c->src[s].file == OF_TEMP) touch(iv, c->src[s].idx, (int32_t)i, 0);
-      if (c->src[s].rel) touch(iv, c->src[s].rel_reg, (int32_t)i, 0);
+      if (c->src[s].file == OF_TEMP) touch(iv, c->src[s].idx, (int32_t)i, no_sharing);
+      if (c->src[s].rel) touch(iv, c->src[s].rel_reg, (int32_t)i, no_sharing);
     }
     for (uint32_t d = 0; d < c->ndst; ++d)
       if (c->dst[d].file == OF_TEMP) touch(iv, c->dst[d].idx, (int32_t)i, 1);
@@ -99,7 +101,7 @@ static void put_operand(Writer *w, const SpOp *o, int mode) {
   uint32_t type = o->file;
   uint32_t dims = 1;
   if (o->file == OF_IMM) dims = 0;
-  else if (o->file == OF_NULL) dims = 0;
+  else if (o->file == OF_NULL || IS_SYSTEM_FILE(o->file)) dims = 0;
   else if (o->file == OF_CB) dims = 2;
   uint32_t token = (type << 12) | (dims << 20);
   uint32_t ext = 0;
@@ -122,6 +124,11 @@ static void put_operand(Writer *w, const SpOp *o, int mode) {
   }
   if (o->file == OF_NULL) {
     put(w, token);
+    return;
+  }
+  if (IS_SYSTEM_FILE(o->file)) {   /* (vThreadID and the others: no register number) */
+    put(w, token | 2u | (1u << 2) | (swz_bits(o->swz) << 4));
+    if (ext) put(w, ext);
     return;
   }
   if (mode == 3) {
@@ -154,7 +161,7 @@ static void put_instruction(Writer *w, const SpIns *c) {
   uint32_t token = c->op;
   if (c->sat) token |= 1u << 13;
   if (c->test) token |= 1u << 18;
-  if (c->op == D_RESINFO) token |= c->extra << 11;
+  if (c->op == D_RESINFO || c->op == D_SYNC) token |= c->extra << 11;
   put(w, token);
   switch (c->op) {
     case D_IF: case D_BREAKC: case D_DISCARD:
@@ -241,7 +248,7 @@ static int write_container(Mod *m, const uint32_t *phys) {
   Writer w;
   w.m = m, w.t = tokens, w.n = 0, w.cap = kMaxWords, w.phys = phys;
   uint32_t type = m->stage == SPV_STAGE_VERTEX ? 1u : m->stage == SPV_STAGE_FRAGMENT ? 0u : 5u;
-  put(&w, (type << 16) | (m->stage == SPV_STAGE_COMPUTE ? 0x50u : 0x40u));
+  put(&w, (type << 16) | (m->stage == SPV_STAGE_COMPUTE || m->uses_memory ? 0x50u : 0x40u));
   put(&w, 0);   /* the length, filled in below */
   put(&w, D_DCL_GLOBAL_FLAGS | (1u << 11) | (1u << 24));
   /* constant buffers: every slot of the pipeline, in order (the kernel puts them end to end by slot) */
@@ -269,6 +276,36 @@ static int write_container(Mod *m, const uint32_t *phys) {
     put(&w, (OF_RES << 12) | (1u << 20));
     put(&w, u);
     put(&w, 0x5555u);
+  }
+  /* storage buffers (raw), the group-shared memory, the work group and the compute system values */
+  for (uint32_t u = 0; u < 32; ++u)
+    if ((m->uav_used >> u) & 1) {
+      put(&w, D_DCL_UAV_RAW | (3u << 24));
+      put(&w, (OF_UAV << 12) | (1u << 20));
+      put(&w, u);
+    }
+  for (uint32_t t = 0; t < 32; ++t)
+    if ((m->srv_used >> t) & 1) {
+      put(&w, D_DCL_RESOURCE_RAW | (3u << 24));
+      put(&w, (OF_RES << 12) | (1u << 20));
+      put(&w, t);
+    }
+  if (m->shared_bytes) {
+    put(&w, D_DCL_TGSM_RAW | (4u << 24));
+    put(&w, (OF_TGSM << 12) | (1u << 20));
+    put(&w, 0);
+    put(&w, m->shared_bytes);
+  }
+  if (m->stage == SPV_STAGE_COMPUTE) {
+    uint32_t size[3];
+    spv_local_size(m, size);
+    put(&w, D_DCL_THREAD_GROUP | (4u << 24));
+    for (int i = 0; i < 3; ++i) put(&w, size[i]);
+    for (uint32_t file = OF_THREAD_ID; file <= OF_THREAD_INDEX; ++file)
+      if ((m->system_used >> (file - OF_THREAD_ID)) & 1) {
+        put(&w, D_DCL_INPUT | (2u << 24));
+        put(&w, (file << 12) | 2u | ((file == OF_THREAD_INDEX ? 1u : 7u) << 4));
+      }
   }
   for (uint32_t r = 0; r < 16; ++r) {
     uint32_t k = m->in_decl[r];
@@ -357,7 +394,6 @@ static int write_container(Mod *m, const uint32_t *phys) {
 
 int spv_emit(SpvModule *m, const uint8_t **out, uint32_t *size) {
   if (m->failed) return 1;
-  if (m->stage == SPV_STAGE_COMPUTE) return sp_fail(m, "compute shaders");
   m->ncode = 0, m->nvreg = 0, m->nloops = 0;
   if (setup_variables(m)) return 1;
   if (gen_function(m, m->entry_func, 0, 0, 0, 0)) return 1;

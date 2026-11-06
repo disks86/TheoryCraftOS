@@ -98,6 +98,7 @@ static BOOL buf_sync(Buf *b, UINT *alloc_out) {
     UINT flags = 0;
     if (b->usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) flags |= A_VERTEX;
     if (b->usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) flags |= A_INDEX;
+    if (b->usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) flags |= A_UAV;
     if (!flags) flags = A_VERTEX;
     ULONGLONG size = (b->size + 15) & ~15ull;
     if (size < 16) size = 16;
@@ -114,6 +115,18 @@ static BOOL buf_sync(Buf *b, UINT *alloc_out) {
   }
   *alloc_out = b->alloc;
   return TRUE;
+}
+
+/* What the GPU wrote into bytes off .. off + size of a buffer (a storage buffer of a dispatch or a draw) back into its memory, so that the program, the copies the CPU does and the
+ * uniform data read from the memory see it. The buffer stays in step: nothing is copied up again for it. */
+static void buf_readback(Buf *b, ULONGLONG off, ULONGLONG size) {
+  if (!b->mem || !b->alloc || off >= b->size) return;
+  if (size > b->size - off) size = b->size - off;
+  BYTE *p = kmt_lock(b->dev, b->alloc, 0, LOCK_READ_ONLY);
+  if (!p) return;
+  memcpy(b->mem->data + b->off + off, p + off, (size_t)size);
+  kmt_unlock(b->dev, b->alloc);
+  b->synced = b->mem->version;
 }
 
 /* ---- images ---------------------------------------------------------------------------------------------------------------------------------------------------------------- */
@@ -503,8 +516,7 @@ VKAPI VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice device, const VkD
   }
   for (UINT i = 0; i < l->nb; ++i) {
     const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i];
-    if (b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
-        b->descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT || b->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+    if (b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || b->descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT || b->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
       vk_free(l->b);
       vk_free(l);
       return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -526,6 +538,23 @@ static int layout_binding_index(const DSetLayout *l, UINT binding) {
   for (UINT i = 0; i < l->nb; ++i)
     if (l->b[i].binding == binding) return (int)i;
   return -1;
+}
+
+/* The binding with the next higher number after `binding` (-1: none). */
+static int next_binding_index(const DSetLayout *l, UINT binding) {
+  int best = -1;
+  for (UINT i = 0; i < l->nb; ++i)
+    if (l->b[i].binding > binding && (best < 0 || l->b[i].binding < l->b[best].binding)) best = (int)i;
+  return best;
+}
+
+static BOOL is_dynamic(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; }
+/* The number of a dynamic descriptor among those of its set: the dynamic offsets come in the order of the bindings, then of the array elements. */
+static UINT dynamic_index(const DSetLayout *l, UINT binding, UINT element) {
+  UINT n = element;
+  for (UINT k = 0; k < l->nb; ++k)
+    if (is_dynamic(l->b[k].type) && l->b[k].binding < binding) n += l->b[k].count;
+  return n;
 }
 
 VKAPI VkResult VKAPI_CALL vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipelineLayout *out) {
@@ -621,11 +650,19 @@ VKAPI void VKAPI_CALL vkUpdateDescriptorSets(VkDevice device, uint32_t nwrites, 
     DescSet *s = (DescSet *)w->dstSet;
     int bi = layout_binding_index(s->layout, w->dstBinding);
     if (bi < 0) continue;
-    for (UINT k = 0; k < w->descriptorCount; ++k) {
-      UINT index = s->first[bi] + w->dstArrayElement + k;
-      if (index >= s->nd || w->dstArrayElement + k >= s->layout->b[bi].count) break;
+    UINT element = w->dstArrayElement;
+    for (UINT k = 0; k < w->descriptorCount; ++k, ++element) {
+      /* (descriptors past the end of a binding go on into the next binding: Vulkan's consecutive binding updates) */
+      while (bi >= 0 && element >= s->layout->b[bi].count) {
+        element -= s->layout->b[bi].count;
+        bi = next_binding_index(s->layout, s->layout->b[bi].binding);
+      }
+      if (bi < 0) break;
+      UINT index = s->first[bi] + element;
+      if (index >= s->nd) break;
       Descr *d = &s->d[index];
-      if (w->pBufferInfo && (w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)) {
+      if (w->pBufferInfo && (w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                             w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)) {
         const VkDescriptorBufferInfo *bi2 = &w->pBufferInfo[k];
         d->buf = (Buf *)bi2->buffer, d->off = bi2->offset;
         d->range = bi2->range == VK_WHOLE_SIZE ? (d->buf ? d->buf->size - bi2->offset : 0) : bi2->range;

@@ -265,7 +265,17 @@ VKAPI void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalDevice physical, V
   l->maxFragmentOutputAttachments = (c->features & FEAT_MULTIPLE_TARGETS) ? 4 : 1;
   l->maxFragmentDualSrcAttachments = 0;
   l->maxFragmentCombinedOutputResources = 4;
-  l->maxComputeSharedMemorySize = 0;
+  /* compute (the kernel's: 32 KiB of group-shared memory, 65535 groups a dimension; 256 threads a group, which is what a group with barriers may have) */
+  BOOL compute = (c->features & FEAT_COMPUTE) != 0;
+  l->maxComputeSharedMemorySize = compute ? 32768 : 0;
+  for (int i = 0; i < 3; ++i) l->maxComputeWorkGroupCount[i] = compute ? 65535 : 0;
+  l->maxComputeWorkGroupInvocations = compute ? 256 : 0;
+  l->maxComputeWorkGroupSize[0] = l->maxComputeWorkGroupSize[1] = compute ? 256 : 0, l->maxComputeWorkGroupSize[2] = compute ? 64 : 0;
+  /* storage buffers: four written and four read only at a time, in any stage that has them */
+  BOOL storage = compute || (c->features & FEAT_STORAGE_IN_DRAWS);
+  l->maxPerStageDescriptorStorageBuffers = storage ? UAV_SLOTS + SRV_SLOTS : 0;
+  l->maxDescriptorSetStorageBuffers = storage ? UAV_SLOTS + SRV_SLOTS : 0;
+  l->maxDescriptorSetStorageBuffersDynamic = storage ? 4 : 0;
   l->maxDrawIndexedIndexValue = 0xFFFFFFFFu;
   l->maxDrawIndirectCount = 1;
   l->maxSamplerLodBias = 2.0f, l->maxSamplerAnisotropy = 1.0f;
@@ -304,20 +314,21 @@ VKAPI void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDevice physical, VkP
   f->fillModeNonSolid = VK_FALSE;
   f->depthClamp = VK_FALSE;
   f->samplerAnisotropy = VK_FALSE;
-  f->fragmentStoresAndAtomics = VK_FALSE;
+  f->fragmentStoresAndAtomics = (pd->caps.features & FEAT_FRAGMENT_STORES) != 0;
+  f->vertexPipelineStoresAndAtomics = (pd->caps.features & FEAT_VERTEX_STORES) != 0;
   f->largePoints = VK_FALSE;
   f->robustBufferAccess = VK_FALSE;
 }
 
 VKAPI void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physical, uint32_t *count, VkQueueFamilyProperties *p) {
-  (void)physical;
+  const PhysDev *pd = (const PhysDev *)physical;
   if (!p) {
     *count = 1;
     return;
   }
   if (*count < 1) return;
   memset(&p[0], 0, sizeof p[0]);
-  p[0].queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT;
+  p[0].queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT | ((pd->caps.features & FEAT_COMPUTE) ? VK_QUEUE_COMPUTE_BIT : 0);
   p[0].queueCount = 1;
   p[0].timestampValidBits = 0;
   p[0].minImageTransferGranularity.width = p[0].minImageTransferGranularity.height = p[0].minImageTransferGranularity.depth = 1;
