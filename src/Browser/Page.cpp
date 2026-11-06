@@ -374,7 +374,9 @@ void Page::timing_summary(String* out) const {
     out->append_uint(engine_->vm().heap_bytes() >> 20);
     out->append(" MiB/");
     out->append_uint(engine_->vm().collections());
-    out->append(" collections");
+    out->append(" collections (");
+    out->append_uint(engine_->vm().major_collections());
+    out->append(" major)");
   }
   out->append("]; render ");
   append_ms(out, phase_.render);

@@ -42,6 +42,7 @@ struct Layout {
   uint32_t value_payload;
   uint32_t env_parent, env_slots;
   uint32_t obj_kind, obj_host, obj_env, obj_length, obj_items, obj_frozen;
+  uint32_t env_gen, obj_gen;   // (Cell::gen: compiled code does not store into an old cell that is not remembered, the interpreter does that with Vm::barrier)
   uint64_t uninitialized_bits;
   Layout() {
     Value v;
@@ -49,6 +50,7 @@ struct Layout {
     Env e;
     env_parent = static_cast<uint32_t>(reinterpret_cast<const char*>(&e.parent) - reinterpret_cast<const char*>(&e));
     env_slots = sizeof(Env);   // (Env::slots() is the memory right after the header)
+    env_gen = static_cast<uint32_t>(reinterpret_cast<const char*>(&e.gen) - reinterpret_cast<const char*>(&e));
     JsObject o;
     auto at = [&](const void* field) { return static_cast<uint32_t>(reinterpret_cast<const char*>(field) - reinterpret_cast<const char*>(&o)); };
     obj_kind = at(&o.okind);
@@ -57,6 +59,7 @@ struct Layout {
     obj_length = at(&o.length);
     obj_items = at(&o.items);
     obj_frozen = at(&o.frozen);
+    obj_gen = at(&o.gen);
     Value u = Value::make_uninitialized();
     __builtin_memcpy(&uninitialized_bits, reinterpret_cast<const char*>(&u) + value_payload, 8);
   }
@@ -323,6 +326,7 @@ void Translator::set_elem(uint32_t pc, uint32_t& h) {
   b_.branch_if(IrCond::Ne, b_.load_ptr(IrMem::U64, o, l.obj_host), c(0), slow);
   b_.branch_if(IrCond::Ne, b_.load_ptr(IrMem::U64, o, l.obj_env), c(0), slow);
   b_.branch_if(IrCond::Ne, b_.load_ptr(IrMem::U8, o, l.obj_frozen), c(0), slow);
+  b_.branch_if(IrCond::Eq, b_.load_ptr(IrMem::U8, o, l.obj_gen), c(kGenOld), slow);   // (old and not remembered: the helper stores with the barrier)
   const uint32_t x = load_payload(key);
   const uint32_t idx = b_.unary(IrOp::F2I, x);
   b_.branch_if(IrCond::Eq, b_.fsetcond(IrCond::Eq, b_.unary(IrOp::I2F, idx), x), c(0), slow);
@@ -423,6 +427,7 @@ Translator::Flow Translator::translate_one(const Instr& in, uint32_t pc, uint32_
         b_.branch_if(IrCond::Eq, p0, c(l_.uninitialized_bits), stub(pc, h, 0));
         b_.place_label(ok);
       }
+      b_.branch_if(IrCond::Eq, b_.load_ptr(IrMem::U8, e, l_.env_gen), c(kGenOld), stub(pc, h, 0));   // (an old environment that is not remembered: the interpreter stores with the barrier)
       b_.store_ptr(IrMem::U64, e, static_cast<int64_t>(slot), b_.load_state(off(h - 1)));
       b_.store_ptr(IrMem::U64, e, static_cast<int64_t>(slot + l_.value_payload), b_.load_state(off(h - 1) + l_.value_payload));
       return Flow::Next;

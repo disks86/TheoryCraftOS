@@ -16,7 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The virtual machine: the heap (strings, objects, environments, with a mark-and-sweep collector), the interpreter loop and the operations the
+// The virtual machine: the heap (strings, objects, environments, with a generational mark-and-sweep collector: code that stores a reference into a cell
+// calls barrier(), see collect() in Vm.cpp), the interpreter loop and the operations the
 // built-in functions are written with. Errors are thrown as script values: functions that can throw return false and leave the exception in
 // the VM (take_exception()); there are no C++ exceptions. A script is limited in the instructions it may run and the memory it may use, and stops
 // with an error when it passes them (a page cannot hang or exhaust the browser).
@@ -77,7 +78,18 @@ class Vm {
     return true;
   }
   uint64_t heap_bytes() const { return heap_bytes_; }
-  uint64_t collections() const { return collections_; }   // (how many times the collector has run)
+  uint64_t collections() const { return collections_; }   // (how many times the collector has run, minor and major)
+  uint64_t major_collections() const { return major_collections_; }
+  // Before a reference is stored into a cell (a property, an element, a variable, a prototype ...) that is not new: an old cell is remembered, so that the next
+  // minor collection finds the young cells it now points to. Every store into a cell that may be old must come after this (the stores the VM makes itself
+  // do; natives and hosts that write JsObject fields or items directly call it). Stores into a cell made since the last collection need none.
+  void barrier(Cell* cell) {
+    if (cell && cell->gen == kGenOld) remember(cell);
+  }
+  // Tests: every minor collection checks that no old cell points to a young cell it did not mark (a store that missed barrier()) and stops the program with
+  // the details if one does.
+  static bool verify_generations;
+  static void (*generation_error)(const char* what);   // (called with the details; null: the program stops)
   uint64_t memory_limit() const { return memory_limit_; }
 
   // --- The JIT (VmJit.hpp): on by default when the kernel has executable code memory. A point is compiled after `hot_threshold` visits (1 compiles at once, which is what
@@ -395,12 +407,20 @@ class Vm {
   void* alloc_cell(uint64_t size);
   void link(Cell* cell, uint64_t size);
   void account_bytes(uint64_t size);   // `size` more bytes are held (a collection is wanted when there are many)
+  void account_growth(Cell* cell, uint64_t bytes);
   JsString* concat_shared(JsString* a, JsString* b, uint32_t total);
+  void remember(Cell* cell);
   void mark(Cell* cell);
   void mark_value(const Value& v);
   void mark_object(JsObject* o);
+  template <class F>
+  void for_each_reference(Cell* cell, F&& each);
+  void mark_roots();
   void trace();
-  void sweep();
+  void collect_minor();
+  void collect_major();
+  void verify_minor_marks();
+  void sweep_young();
   void free_cell(Cell* cell);
   void prune_intern_table();
   void rebuild_intern_table();
@@ -456,9 +476,18 @@ class Vm {
   IHost* host_;
   bool ok_ = false;
   // heap
+  // Two generations: cells_ (old: survived a collection) and young_ (made since the last one). A minor collection marks from the roots and the remembered
+  // cells, frees the young cells it did not reach and makes the rest old; a major one marks and sweeps everything. gc_threshold_ is the heap size that asks
+  // for a major collection, nursery_bytes_ the young bytes that ask for a minor one.
   Cell* cells_ = nullptr;
+  Cell* young_ = nullptr;
+  List<Cell*> remembered_;
   uint64_t heap_bytes_ = 0, gc_threshold_ = 4u << 20, memory_limit_ = 96u << 20;
-  uint64_t collections_ = 0;
+  uint64_t old_bytes_ = 0, young_bytes_ = 0;
+  bool minor_ = false;          // (a minor collection is marking: old cells are not looked into)
+  bool major_wanted_ = false;
+  bool remember_overflow_ = false;   // (the remembered list could not grow: the next collection is a major one)
+  uint64_t collections_ = 0, major_collections_ = 0;
   uint64_t marked_bytes_ = 0;   // (collect: the bytes of the cells marked so far)
   JsString** interned_ = nullptr;
   static constexpr uint32_t kIndexKeys = 4096;

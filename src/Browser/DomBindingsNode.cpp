@@ -1862,6 +1862,7 @@ JsObject* construct_element(void* user, JsObject* proto) {
       if (!e) return nullptr;
       JsObject* w = c.owner.wrap(e);
       if (w) {
+        c.vm.barrier(w);
         w->proto = proto;
         c.vm.define_named(w, "__ce", Value::make_number(1), 0);   // (the constructor that is about to run is the upgrade)
       }
@@ -1998,6 +1999,7 @@ bool install_nodes(DomBindings::Impl& c) {
   {   // `window` is a Window, which is an EventTarget: addEventListener and the rest are inherited, as pages that patch Window.prototype expect
     JsObject* window_proto = vm.new_object(event_target);
     make_class(c, "Window", illegal_constructor, window_proto);
+    vm.barrier(g);
     g->proto = window_proto;
   }
   make_class(c, "HTMLElement", html_element_constructor, c.html_proto);

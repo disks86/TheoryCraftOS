@@ -838,6 +838,7 @@ bool install_typed_arrays(Vm& vm) {
     JsObject* ctor = vm.new_native(kConstructors[k], kNames[k], 3);
     vm.define(ctor, vm.prototype_name(), Value::make_object(proto), 0);
     vm.define(proto, vm.intern("constructor"), Value::make_object(ctor), kWritable);
+    vm.barrier(ctor);
     ctor->proto = abstract_ctor;
     vm.define_named(ctor, "BYTES_PER_ELEMENT", num_value(kSizes[k]), 0);
     vm.define_named(proto, "BYTES_PER_ELEMENT", num_value(kSizes[k]), 0);
