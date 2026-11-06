@@ -245,8 +245,9 @@ uint64_t nt_create_window_ex(Call& call) {
   if (as_child && !parent) return call.fail(uint32_t(kErrorTlwWithWsChild));
   if (!as_child && parent && parent != desktop->message_root) {
     owner = parent;
-    while (owner->parent && owner->parent->parent && (owner->style & wn::WS_CHILD)) owner = owner->parent;      // the owner is a top-level window
-    if (owner->style & wn::WS_CHILD) owner = nullptr;
+    auto pure_child = [](const Window* x) { return (x->style & (wn::WS_CHILD | wn::WS_POPUP)) == wn::WS_CHILD; };      // (WS_POPUP makes a window an owner even with WS_CHILD)
+    while (owner->parent && owner->parent->parent && pure_child(owner)) owner = owner->parent;      // the owner is a top-level window
+    if (pure_child(owner)) owner = nullptr;
     if (owner == desktop->root) owner = nullptr;      // (owned by the desktop: not owned)
     parent = desktop->root;
   }

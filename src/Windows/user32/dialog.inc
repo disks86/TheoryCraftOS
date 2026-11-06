@@ -415,7 +415,7 @@ EXPORT BOOL WINAPI EndDialog(HANDLE hwnd, LONG_PTR result) {
  * destruction of the dialog; WM_ENTERIDLE tells the owner once whenever no input is waiting. The answer is EndDialog's (1 when the loop ended otherwise, WM_QUIT included), -1 when the dialog could not be made. */
 static LONG_PTR dialog_run(HANDLE instance, const void *tmpl, HANDLE owner, DlgProc_ proc, LONG_PTR param, BOOL ansi) {
   if (!tmpl) return -1;
-  while (owner && IsWindow(owner) && (GetWindowLongW(owner, -16) & 0x40000000)) owner = GetParent(owner);
+  while (owner && IsWindow(owner) && (GetWindowLongW(owner, -16) & 0xC0000000u) == 0x40000000u) owner = GetParent(owner);      /* (a pure child: WS_POPUP makes a window an owner even with WS_CHILD) */
   if (owner && IsWindowEnabled(owner)) EnableWindow(owner, FALSE);
   const DWORD style = *(const WORD *)tmpl == 1 ? *(const DWORD *)((const WORD *)tmpl + 6) : *(const DWORD *)tmpl;
   HANDLE dlg = dialog_create(instance, tmpl, owner, proc, param, ansi);
