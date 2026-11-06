@@ -111,6 +111,31 @@ uint32_t srat_memory(ConstByteView srat, ArrayView<SratMemory> out) {
   return count;
 }
 
+bool madt_gicc_mpidr(ConstByteView madt, uint32_t uid, uint64_t* mpidr) {
+  constexpr uint64_t kMadtEntries = 44;
+  constexpr uint8_t kTypeGicc = 0x0B;
+  constexpr uint64_t kAffinityMask = 0xFF00FFFFFFull;
+  if (!has_signature(madt, 'A', 'P', 'I', 'C')) return false;
+  const ConstByteView table = body(madt);
+  for (uint64_t at = kMadtEntries; at + 2 <= table.size();) {
+    const uint8_t type = table[at], length = table[at + 1];
+    if (length < 2 || length > table.size() - at) break;
+    if (type == kTypeGicc && length >= 76) {
+      ByteReader r(table.subview(at + 8, length - 8));
+      const uint32_t entry_uid = r.le32();
+      const uint32_t flags = r.le32();
+      r.skip(68 - 16);   // up to the MPIDR field
+      const uint64_t affinity = r.le64() & kAffinityMask;
+      if (r.ok() && entry_uid == uid && (flags & kFlagEnabled)) {
+        *mpidr = affinity;
+        return true;
+      }
+    }
+    at += length;
+  }
+  return false;
+}
+
 uint8_t slit_distance(ConstByteView slit, uint32_t from, uint32_t to) {
   if (!has_signature(slit, 'S', 'L', 'I', 'T')) return 0;
   const ConstByteView table = body(slit);

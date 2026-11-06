@@ -69,7 +69,8 @@ HevcScratchPlan hevc_scratch_plan(const HevcEncodeLayout& layout);
 struct HevcEncodeBuffers {
   uint32_t source = 0;
   uint32_t recon = 0, recon_ds4 = 0, recon_ds8 = 0, mv_temporal = 0;                  // what the engine writes for this picture
-  uint32_t reference = 0, reference_ds4 = 0, reference_ds8 = 0, reference_mv_temporal = 0;   // what a P picture predicts from
+  uint32_t reference = 0, reference_ds4 = 0, reference_ds8 = 0, reference_mv_temporal = 0;   // what a P picture predicts from (a B picture's list 0: the earlier anchor)
+  uint32_t backward_reference = 0, backward_ds4 = 0, backward_ds8 = 0, backward_mv_temporal = 0;   // a B picture's list 1: the later anchor
   uint32_t bitstream = 0, bitstream_bytes = 0;
   uint32_t pak_objects = 0;
   uint32_t status = 0;                            // 4 bytes the bitstream size is stored to
@@ -83,11 +84,16 @@ struct HevcEncodeBuffers {
 void hevc_resolve_scratch(const HevcScratchPlan& plan, uint32_t scratch_base, HevcEncodeBuffers* b);
 
 // XeLpg: Meteor Lake and Arrow Lake; XeHpg: Arc Alchemist, whose commands are Xe-LPG's apart from three dwords of CMD2.
-enum class HevcVdencPlatform { XeLp, XeLpg, XeHpg };
+// Xe2Lpm (Lunar Lake) and Xe2Hpm (Arc Battlemage) differ in CMD1 (39 dwords), CMD2 and, for Xe2Hpm, the 7-dword pipe mode select.
+enum class HevcVdencPlatform { XeLp, XeLpg, XeHpg, Xe2Lpm, Xe2Hpm };
 
 struct HevcEncodePicture {
   HevcVdencPlatform platform = HevcVdencPlatform::XeLp;
-  bool p_picture = false;                         // a low-delay B picture predicting from the previous one, else I
+  bool p_picture = false;                         // a low-delay B picture predicting from the previous one (an inter picture), else I
+  bool b_picture = false;                         // with p_picture: a random-access B picture between two anchors, which no picture refers to (list 0: earlier, list 1: later)
+  bool ra_mode = false;                           // the stream has B pictures: the anchors' images are the random-access set
+  uint32_t reference_store = 0, backward_store = 1;   // the frame stores of the references (the reconstruction slot they were written to)
+  uint32_t backward_poc = 0;
   int32_t qp = 26;                                // the slice quantiser (10 .. 51; the driver's tables start at 10)
   int32_t pps_qp = 26;                            // init_qp of the picture parameter set (26 + init_qp_minus26)
   int32_t cb_qp_offset = 0, cr_qp_offset = 0;     // pps_cb_qp_offset, pps_cr_qp_offset

@@ -133,9 +133,9 @@ void test_queue_core() {
   queued[0] = 0;
   queued[5] = kQueueImbalance;
   CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 5);
-  // ...past it the shortest queue takes the thread.
+  // ...past it the shortest queue takes the thread, on the device's node among equally short ones.
   queued[5] = kQueueImbalance + 1;
-  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 0);
+  CHECK(choose_queue_core(hints(5, -1), all, m.view(), ArrayView<const uint32_t>(queued, 8)) == 4);
   // Only allowed, online cores.
   CoreSet three;
   three.add(3);
@@ -145,6 +145,38 @@ void test_queue_core() {
   // Missing lengths count as empty queues.
   Machine fresh;
   CHECK(choose_queue_core(hints(6, -1), all, fresh.view(), ArrayView<const uint32_t>()) == 6);
+}
+
+// Three nodes of two cores: 0-1 node 0, 2-3 node 1, 4-5 node 2, each core its own cache. Node 0 is near node 2 (12) and far from node 1 (30).
+void test_numa_distances() {
+  CorePlace cores[6];
+  for (uint32_t i = 0; i < 6; ++i) {
+    cores[i].online = true;
+    cores[i].idle = true;
+    cores[i].cache_domain = i;
+    cores[i].numa_node = i / 2;
+  }
+  const ArrayView<const CorePlace> view(cores, 6);
+  NumaDistances slit;
+  for (uint32_t a = 0; a < 3; ++a) slit.distance[a][a] = 10;
+  slit.distance[0][1] = slit.distance[1][0] = 30;
+  slit.distance[0][2] = slit.distance[2][0] = 12;
+  slit.distance[1][2] = slit.distance[2][1] = 20;
+  CHECK(slit.between(0, 2) == 12 && slit.between(1, 1) == 10);
+  CHECK(NumaDistances().between(3, 3) == 10 && NumaDistances().between(3, 4) == 20 && slit.between(99, 0) == 20);
+  // The device's core and its node-mate busy: the nearer node (2), not the lower-numbered far one (1).
+  cores[0].idle = cores[1].idle = false;
+  CHECK(choose_wake_core(hints(0, -1), CoreSet::all(), view, &slit) == 4);
+  CHECK(choose_wake_core(hints(0, -1), CoreSet::all(), view) == 2);   // (no SLIT: every other node is 20, so the lowest index)
+  // The same for queues when every core is busy and the queues are even.
+  for (CorePlace& c : cores) c.idle = false;
+  // Core 0's queue is past the imbalance limit: the shortest queue takes the thread, the nearest node among equally short ones.
+  uint32_t queued[6] = {3, 3, 0, 0, 0, 0};
+  CHECK(choose_queue_core(hints(0, -1), CoreSet::all(), view, ArrayView<const uint32_t>(queued, 6), &slit) == 4);
+  CHECK(choose_queue_core(hints(0, -1), CoreSet::all(), view, ArrayView<const uint32_t>(queued, 6)) == 2);
+  // Within the limit the device's core keeps it.
+  uint32_t even[6] = {5, 5, 4, 4, 4, 4};
+  CHECK(choose_queue_core(hints(1, -1), CoreSet::all(), view, ArrayView<const uint32_t>(even, 6), &slit) == 1);
 }
 
 void test_interrupt_core() {
@@ -174,6 +206,13 @@ void test_interrupt_core() {
   CHECK(choose_interrupt_core(one.view(), ArrayView<const uint32_t>(), all, -1, 0) == 0);
   for (CorePlace& c : one.cores) c.online = false;
   CHECK(choose_interrupt_core(one.view(), ArrayView<const uint32_t>(), all, -1, 0) == kNoCore);
+  // The device's node first, whatever the load elsewhere; a node with no core online falls back to any.
+  Machine two;
+  uint32_t heavy[8] = {0, 0, 0, 0, 3, 3, 3, 3};
+  CHECK(choose_interrupt_core(two.view(), ArrayView<const uint32_t>(heavy, 8), all, -1, 0, 1) == 4);
+  CHECK(choose_interrupt_core(two.view(), ArrayView<const uint32_t>(heavy, 8), all, kEfficiency, 0, 0) == 1);   // (no Efficiency core on node 0: the node wins over the kind)
+  CHECK(choose_interrupt_core(two.view(), ArrayView<const uint32_t>(heavy, 8), all, -1, 0, 7) == 1);
+  CHECK(choose_interrupt_core(two.view(), ArrayView<const uint32_t>(heavy, 8), all, -1, 0, -1) == 1);
   // A short load array counts the rest as unloaded.
   Machine full;
   uint32_t short_load[2] = {5, 5};
@@ -253,6 +292,9 @@ void test_device_table() {
   table.note_wake(gpu);
   CHECK(table.info(gpu, &info) && strcmp(info.name, "virtio-gpu") == 0 && info.interrupt_core == 2 && info.interrupts == 2 && info.wakes == 1);
   CHECK(table.set_interrupt_core(gpu, 5) && table.interrupt_core(gpu) == 5);
+  CHECK(table.numa_node(gpu) == -1 && table.set_numa_node(gpu, 2) && table.numa_node(gpu) == 2);
+  CHECK(table.info(gpu, &info) && info.numa_node == 2);
+  CHECK(!table.set_numa_node(40, 1) && table.numa_node(40) == -1);
 
   uint32_t per_core[4] = {9, 9, 9, 9};
   table.devices_per_core(ArrayView<uint32_t>(per_core, 4));
@@ -338,6 +380,7 @@ int main() {
   test_wake_core();
   test_interrupt_core();
   test_queue_core();
+  test_numa_distances();
   test_learned_core();
   test_steering();
   test_cache_domain();

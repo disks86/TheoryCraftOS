@@ -43,11 +43,12 @@ using namespace hardware;
 static Bytes make_dsdt() {
   const Bytes nhi = device("NHI0", cat({name_def("_ADR", num(0)), name_def("_PRW", package(2, cat({num(0x6D), num(3)}))),
                                         method("_PSW", 1, store(b({0x68}), path("\\_SB.PSWV")))}));
-  const Bytes second = device("NHI1", cat({name_def("_ADR", num(1)), name_def("_PRW", package(2, cat({package(2, cat({path("\\_SB"), num(0x10)})), num(4)})))}));
+  const Bytes second = device("NHI1", cat({name_def("_ADR", num(1)), name_def("_PRW", package(2, cat({package(2, cat({path("\\_SB"), num(0x10)})), num(4)}))),
+                                           method("_PXM", 0, cat({b({0xA4}), num(3)}))}));   // its own node (Return (3))
   const Bytes plain = device("DEV2", name_def("_ADR", num(2)));
   const Bytes far = device("NHI2", cat({name_def("_ADR", num(3)), name_def("_PRW", package(2, cat({num(0x1FF), num(3)})))}));   // an event outside the register block
   const Bytes port = device("RP05", cat({name_def("_ADR", num(0x1C0004)), nhi, second, plain, far}));
-  const Bytes pci = device("PCI0", cat({name_def("_HID", num(0x080AD041)), name_def("_BBN", num(0)), port}));
+  const Bytes pci = device("PCI0", cat({name_def("_HID", num(0x080AD041)), name_def("_BBN", num(0)), name_def("_PXM", num(1)), port}));
   const Bytes ec = device("EC0", cat({name_def("_HID", num(0x090CD041)), name_def("_GPE", num(0x23)),
                                       method("_Q50", 0, notify("\\_SB.LID0", 0x80)),
                                       method("_Q51", 0, notify("\\_SB.PWRB", 0x80)),
@@ -117,6 +118,14 @@ static void test_events() {
   Node* nhi = events.find_pci_device(pci, {5, 0, 0});
   Node* second = events.find_pci_device(pci, {5, 0, 1});
   CHECK(port_node && nhi && second && port_node != nhi && events.find_pci_device(pci, {5, 0, 2}) && !events.find_pci_device(pci, {5, 1, 0}) && !events.find_pci_device(pci, {6, 0, 0}));
+  // NUMA nodes: the root bridge's _PXM for what is below it, a device's own _PXM method first, none outside the bridge
+  uint32_t domain = 99;
+  CHECK(events.proximity_domain(nhi, &domain) && domain == 1);
+  CHECK(events.proximity_domain(second, &domain) && domain == 3);
+  CHECK(events.proximity_domain(port_node, &domain) && domain == 1);
+  domain = 99;
+  CHECK(!events.proximity_domain(events.interpreter().find("\\_SB.EC0"), &domain) && domain == 99);
+  CHECK(!events.proximity_domain(nullptr, &domain));
   CHECK(events.is_within(port_node, nhi) && events.is_within(nhi, nhi) && !events.is_within(nhi, port_node));
   // _PRW in both forms
   AcpiEvents::WakeSource source;

@@ -32,7 +32,7 @@ uint32_t get32(const uint8_t* raw, uint32_t o) { return uint32_t(raw[o]) | uint3
 
 // The extended style the frame flags imply (WS_EX_WINDOWEDGE).
 uint32_t fix_ex_style(uint32_t style, uint32_t ex) {
-  if ((ex & wn::WS_EX_DLGMODALFRAME) || (style & wn::WS_THICKFRAME) || ((style & (wn::WS_DLGFRAME | wn::WS_CHILD)) == wn::WS_DLGFRAME)) return ex | wn::WS_EX_WINDOWEDGE;
+  if ((ex & wn::WS_EX_DLGMODALFRAME) || (!(ex & wn::WS_EX_STATICEDGE) && (style & (wn::WS_DLGFRAME | wn::WS_THICKFRAME)))) return ex | wn::WS_EX_WINDOWEDGE;
   return ex & ~wn::WS_EX_WINDOWEDGE;
 }
 
@@ -46,8 +46,8 @@ void fill_create_struct(Window* w, const Op& op, List<uint8_t>& out) {
   put32(raw, 36, uint32_t(w->bounds.right - w->bounds.left));
   put32(raw, 40, uint32_t(w->bounds.top));
   put32(raw, 44, uint32_t(w->bounds.left));
-  put32(raw, 48, w->style);
-  put32(raw, 72, w->ex_style);
+  put32(raw, 48, w->cs_style);
+  put32(raw, 72, w->cs_ex_style);
   out.clear();
   for (uint8_t b : raw) out.push_back(b);
 }
@@ -76,6 +76,42 @@ uint64_t create_step(Call& call, Op& op) {
   if (!w) return 0;      // destroyed by one of its own messages
   const bool has_proc = w->wndproc != 0;
   switch (op.phase) {
+    case 20: {      // an overlapped or sizing window is asked for its limits before WM_NCCREATE
+      op.phase = 21;
+      if (!has_proc) return create_step(call, op);
+      const Rect max = window_maximized_rect(w);
+      gdi::Rect none{0, 0, 0, 0};
+      adjust_window_rect(&none, w->style, w->ex_style, false, 0);      // (the frame, as negative left and top)
+      const bool plain = (w->style & (wn::WS_DLGFRAME | wn::WS_BORDER)) != 0;
+      uint8_t raw[40] = {};
+      put32(raw, 8, uint32_t(max.right - max.left)); put32(raw, 12, uint32_t(max.bottom - max.top));      // ptMaxSize
+      put32(raw, 16, uint32_t(max.left)); put32(raw, 20, uint32_t(max.top));      // ptMaxPosition
+      put32(raw, 24, plain ? uint32_t(user_misc::system_metrics(34, 96)) : uint32_t(-2 * none.left));      // ptMinTrackSize
+      put32(raw, 28, plain ? uint32_t(user_misc::system_metrics(35, 96)) : uint32_t(-2 * none.top));
+      put32(raw, 32, uint32_t(user_misc::system_metrics(59, 96))); put32(raw, 36, uint32_t(user_misc::system_metrics(60, 96)));      // ptMaxTrackSize
+      List<uint8_t> payload(S().alloc);
+      for (uint8_t v : raw) payload.push_back(v);
+      if (!queue_payload_upcall(call, &op, w, wn::WM_GETMINMAXINFO, 0, payload, 0xFFFF, 0, 0)) { op.payload.clear(); return create_step(call, op); }
+      return kUpcallDue;
+    }
+    case 21: {      // the window is made no smaller and no larger than the limits it gave
+      op.phase = 0;
+      if (op.payload.count() >= 40) {
+        const uint8_t* p = op.payload.view().data();
+        int32_t cx = w->bounds.right - w->bounds.left, cy = w->bounds.bottom - w->bounds.top;
+        const int32_t min_x = int32_t(get32(p, 24)), min_y = int32_t(get32(p, 28)), max_x = int32_t(get32(p, 32)), max_y = int32_t(get32(p, 36));
+        if (max_x < cx) cx = max_x;
+        if (max_y < cy) cy = max_y;
+        if (cx < min_x) cx = min_x;
+        if (cy < min_y) cy = min_y;
+        w->bounds.right = w->bounds.left + cx;
+        w->bounds.bottom = w->bounds.top + cy;
+        Rect client;
+        compute_nc(w, &client);
+        w->client = client;
+      }
+      return create_step(call, op);
+    }
     case 0: {
       op.phase = 1;
       if (!has_proc) return create_step(call, op);
@@ -203,12 +239,16 @@ uint64_t nt_create_window_ex(Call& call) {
   else if (parent_arg != 0) {
     parent = find_window(uint32_t(parent_arg));
     if (!parent) return call.fail(kErrorInvalidWindowHandle);
+    if (parent->destroy_stage == 2) return call.fail(kErrorInvalidParameter);      // (a window past WM_NCDESTROY takes no new children)
   }
-  if ((style & wn::WS_CHILD) && !parent) return call.fail(uint32_t(kErrorTlwWithWsChild));
-  if (!(style & wn::WS_CHILD) && parent && parent != desktop->message_root) {
+  const bool as_child = (style & wn::WS_CHILD) && !(style & wn::WS_POPUP);      // (WS_POPUP wins over WS_CHILD: it is owned, not a child)
+  if (as_child && !parent) return call.fail(uint32_t(kErrorTlwWithWsChild));
+  if (!as_child && parent && parent != desktop->message_root) {
     owner = parent;
-    while (owner->parent && owner->parent->parent && (owner->style & wn::WS_CHILD)) owner = owner->parent;      // the owner is a top-level window
-    if (owner->style & wn::WS_CHILD) owner = nullptr;
+    auto pure_child = [](const Window* x) { return (x->style & (wn::WS_CHILD | wn::WS_POPUP)) == wn::WS_CHILD; };      // (WS_POPUP makes a window an owner even with WS_CHILD)
+    while (owner->parent && owner->parent->parent && pure_child(owner)) owner = owner->parent;      // the owner is a top-level window
+    if (pure_child(owner)) owner = nullptr;
+    if (owner == desktop->root) owner = nullptr;      // (owned by the desktop: not owned)
     parent = desktop->root;
   }
   if (!parent) parent = desktop->root;
@@ -219,9 +259,15 @@ uint64_t nt_create_window_ex(Call& call) {
   w->desktop = desktop;
   w->thread = q->thread;
   w->pid = q->pid;
+  w->cs_style = style;
+  w->cs_ex_style = fix_ex_style(style, ex_style);
+  // the styles the window gets: an overlapped window has a caption and the raised edge; all but a pure child clip their siblings
+  const bool overlapped = !(style & (wn::WS_CHILD | wn::WS_POPUP));
+  if (overlapped) style |= wn::WS_CAPTION;
+  if ((style & (wn::WS_CHILD | wn::WS_POPUP)) != wn::WS_CHILD) style |= wn::WS_CLIPSIBLINGS;
   w->style = style;
   w->ex_style = fix_ex_style(style, ex_style);
-  if (!(style & wn::WS_CHILD)) w->ex_style |= wn::WS_EX_WINDOWEDGE;      // (every window that is not a child has the raised edge, whatever its frame style)
+  if (overlapped) w->ex_style |= wn::WS_EX_WINDOWEDGE;
   w->wndproc = cls->wndproc;
   w->unicode = !call.arg_bool(16);
   w->instance = call.arg(11);
@@ -244,9 +290,9 @@ uint64_t nt_create_window_ex(Call& call) {
   // z-order: the top of its level (below the topmost windows unless it is one)
   if (parent->parent == nullptr || (w->ex_style & wn::WS_EX_TOPMOST) || true) {
     Window* after = nullptr;
-    if (!(w->ex_style & wn::WS_EX_TOPMOST) && !(style & wn::WS_CHILD)) {
+    if (!(w->ex_style & wn::WS_EX_TOPMOST) && !as_child) {
       for (Window* c = parent->first_child; c && (c->ex_style & wn::WS_EX_TOPMOST); c = c->next) after = c;
-    } else if ((style & wn::WS_CHILD) && !(style & wn::WS_MAXIMIZE)) {      // a new child goes below its siblings (the dialog order is the creation order); a maximized one goes on top
+    } else if (as_child && !(style & wn::WS_MAXIMIZE)) {      // a new child goes below its siblings (the dialog order is the creation order); a maximized one goes on top
       for (Window* c = parent->first_child; c; c = c->next) after = c;
     }
     link_window(w, parent, after, false);
@@ -258,6 +304,7 @@ uint64_t nt_create_window_ex(Call& call) {
   if (!op) { destroy_window_tree(w); return call.fail(kErrorNotEnoughMemory); }
   op->a[0] = w->handle;
   op->a[1] = call.arg(12);
+  if ((style & wn::WS_THICKFRAME) || !(style & (wn::WS_POPUP | wn::WS_CHILD))) op->phase = 20;
   return op_continue(call, *op);
 }
 
@@ -384,6 +431,7 @@ uint64_t nt_set_parent(Call& call) {
   if (!w) return 0;
   Desktop* desktop = w->desktop;
   if (w == desktop->root || w == desktop->message_root || !w->parent) return call.fail(kErrorAccessDenied);
+  if (w->destroy_stage == 2) return call.fail(kErrorInvalidParameter);      // (past WM_NCDESTROY the window is not put back into a tree)
   Window* parent = nullptr;
   const uint64_t p = call.arg(1);
   if (p == 0) parent = desktop->root;
@@ -419,10 +467,16 @@ uint64_t nt_get_ancestor(Call& call) {
       Window* r = top_level_of(w);
       return r && r->parent ? r->handle : 0;
     }
-    case wn::GA_ROOTOWNER: {
-      Window* r = top_level_of(w);
-      while (r && r->owner) r = top_level_of(r->owner);
-      return r && r->parent ? r->handle : 0;
+    case wn::GA_ROOTOWNER: {      // up through GetParent (the owner of a popup, the parent of a child) as long as there is one
+      Window* r = w;
+      for (int guard = 0; guard < 64; ++guard) {
+        Window* up = nullptr;
+        if (r->style & wn::WS_POPUP) up = r->owner;
+        else if (r->style & wn::WS_CHILD) up = r->parent;
+        if (!up) break;
+        r = up;
+      }
+      return r->handle;
     }
     default: return call.fail(kErrorInvalidParameter);
   }
@@ -560,8 +614,8 @@ uint64_t window_get_long(Call& call, Window* w, int32_t offset, uint32_t size) {
     case wn::GWL_HINSTANCE: v = w->instance; break;
     case wn::GWL_WNDPROC: v = w->wndproc; break;
     case wn::GWL_USERDATA: v = w->userdata; break;
-    case wn::GWL_HWNDPARENT:
-      v = ((w->style & wn::WS_CHILD) && !(w->style & wn::WS_POPUP)) ? (w->parent && w->parent->parent ? w->parent->handle : 0) : (w->owner ? w->owner->handle : 0);
+    case wn::GWL_HWNDPARENT:      // the owner of a window on the desktop, else its parent
+      v = (!w->parent || w->parent == w->desktop->root) ? (w->owner ? w->owner->handle : 0) : w->parent->handle;
       break;
     default: return call.fail(kErrorInvalidIndex);
   }
@@ -597,7 +651,7 @@ uint64_t set_long_step(Call& call, Op& op) {
     switch (offset) {
       case wn::GWL_STYLE:
         value = uint32_t(value);
-        if (!(w->style & wn::WS_CHILD) && w->parent == w->desktop->root) value |= wn::WS_CLIPSIBLINGS;
+        if ((uint32_t(value) & (wn::WS_CHILD | wn::WS_POPUP)) != wn::WS_CHILD) value |= wn::WS_CLIPSIBLINGS;      // (cannot be cleared on all but a pure child)
         w->style = uint32_t(value);
         w->ex_style = fix_ex_style(w->style, w->ex_style);
         break;
@@ -611,10 +665,10 @@ uint64_t set_long_step(Call& call, Op& op) {
       case wn::GWL_USERDATA: w->userdata = value; break;
       case wn::GWL_HWNDPARENT: {
         Window* np = value ? find_window(uint32_t(value)) : nullptr;
-        if (w->style & wn::WS_CHILD) {
-          if (np && np != w && !is_child_of(w, np)) { unlink_window(w); link_window(w, np, nullptr, false); }
-        } else {
-          w->owner = np && np != w && !is_child_of(w, np) ? top_level_of(np) : nullptr;
+        if (w->parent && w->parent != w->desktop->root) {      // a window inside another: the parent changes
+          if (np && np != w && !is_child_of(w, np)) { { unlink_window(w); link_window(w, np, nullptr, false); } }
+        } else if (!value || np) {      // a window on the desktop: the owner changes (to the window as given, even a child)
+          if (!np || (np != w && !is_child_of(w, np) && np != w->desktop->root)) w->owner = np;
         }
         break;
       }
@@ -864,7 +918,7 @@ uint64_t nt_call_hwnd(Call& call) {
     case kGetParent:
       if (w == w->desktop->root) return 0;
       if (w->style & wn::WS_POPUP) return w->owner ? w->owner->handle : 0;      // (a popup is owned even when it also has WS_CHILD, as in Windows)
-      if (w->style & wn::WS_CHILD) return w->parent && w->parent != w->desktop->root ? w->parent->handle : 0;
+      if (w->style & wn::WS_CHILD) return w->parent ? w->parent->handle : 0;      // (a child of the desktop has the desktop as its parent)
       return 0;
     case kGetWindowDpiAwarenessContext: return w->dpi_context ? w->dpi_context : 0x6010u;
     case kGetWindowInputContext: return user_misc::window_input_context_raw(w->handle);

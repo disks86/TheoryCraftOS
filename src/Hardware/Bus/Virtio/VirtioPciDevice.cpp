@@ -188,9 +188,12 @@ bool VirtioPciDevice::retarget_msix(uint32_t apic_id) {
   if (!bar) return false;
   volatile uint32_t* entry = reinterpret_cast<volatile uint32_t*>(bar + (table & ~7u));   // (as enable_msix: table entry 0)
   entry[3] = 1;
+  (void)entry[3];                                         // (reads push each write out before the next)
   entry[0] = 0xFEE00000u | (apic_id << 12);
+  (void)entry[0];
   entry[3] = 0;
-  return true;
+  (void)entry[3];
+  return entry[0] == (0xFEE00000u | (apic_id << 12));
 }
 
 void VirtioPciDevice::disable_msix() {

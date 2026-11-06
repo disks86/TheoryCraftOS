@@ -275,19 +275,19 @@ void test_create_and_destroy() {
   t.proc = default_proc;
   prog.process.set_gs_base(kScratch + 0x7000);
   t.atom_class("Top", 0, 0x401000, 0, 8);
-  // an invisible overlapped window: NCCREATE, NCCALCSIZE, CREATE
+  // an invisible overlapped window: GETMINMAXINFO, NCCREATE, NCCALCSIZE, CREATE
   const uint32_t w = t.create("Top", WS_OVERLAPPEDWINDOW, 10, 20, 300, 200, 0, 0, "Title", 0x55AA);
   CHECK(w != 0 && t.is_window(w));
-  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE}));
+  CHECK((t.msgs() == std::vector<uint32_t>{0x24, WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE}));
   // the creation structure: lpCreateParams, geometry and styles
-  CHECK(rd(t.log[0].payload, 0) == 0x55AA && rd(t.log[0].payload, 32) == 200 && rd(t.log[0].payload, 36) == 300 && rd(t.log[0].payload, 40) == 20 && rd(t.log[0].payload, 44) == 10);
-  CHECK(rd(t.log[0].payload, 48) == WS_OVERLAPPEDWINDOW);
+  CHECK(rd(t.log[1].payload, 0) == 0x55AA && rd(t.log[1].payload, 32) == 200 && rd(t.log[1].payload, 36) == 300 && rd(t.log[1].payload, 40) == 20 && rd(t.log[1].payload, 44) == 10);
+  CHECK(rd(t.log[1].payload, 48) == WS_OVERLAPPEDWINDOW);
   // NCCALCSIZE came with the window rectangle in rgrc[0]
-  CHECK(rd(t.log[1].payload, 16) == 10 && rd(t.log[1].payload, 20) == 20 && rd(t.log[1].payload, 24) == 310 && rd(t.log[1].payload, 28) == 220 && t.log[1].wparam == 1);
-  // geometry: window rect and the client rectangle inside the frame (Windows 10 metrics: 8 px frame, 31 px of caption and frame on top)
+  CHECK(rd(t.log[2].payload, 16) == 10 && rd(t.log[2].payload, 20) == 20 && rd(t.log[2].payload, 24) == 310 && rd(t.log[2].payload, 28) == 220 && t.log[2].wparam == 1);
+  // geometry: window rect and the client rectangle inside the frame (Windows metrics for a program that is not DPI aware: a 4 px frame, 27 px of caption and frame on top)
   Rc wr = t.window_rect(w), cr = t.client_rect(w);
   CHECK(wr.l == 10 && wr.t == 20 && wr.r == 310 && wr.b == 220);
-  CHECK(cr.l == 0 && cr.t == 0 && cr.r == 300 - 16 && cr.b == 200 - 8 - 31);
+  CHECK(cr.l == 0 && cr.t == 0 && cr.r == 300 - 8 && cr.b == 200 - 4 - 27);
   CHECK(!(t.style(w) & WS_VISIBLE));
   CHECK(t.svc32(N::NtUserCallHwnd, {w, 13}) == 0);      // not visible
   // a visible one
@@ -301,12 +301,12 @@ void test_create_and_destroy() {
   t.clear_log();
   t.proc = [](Th&, Call_& c) -> uint64_t { return c.msg == WM_NCCREATE ? 0 : 0; };
   CHECK(t.create("Top", 0, 0, 0, 10, 10) == 0);
-  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCDESTROY}));
+  CHECK((t.msgs() == std::vector<uint32_t>{0x24, WM_NCCREATE, WM_NCDESTROY}));
   // WM_CREATE answering -1: WM_DESTROY and WM_NCDESTROY
   t.clear_log();
   t.proc = [](Th&, Call_& c) -> uint64_t { return c.msg == WM_NCCREATE ? 1 : c.msg == WM_CREATE ? uint64_t(-1) : 0; };
   CHECK(t.create("Top", 0, 0, 0, 10, 10) == 0);
-  CHECK((t.msgs() == std::vector<uint32_t>{WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE, WM_DESTROY, WM_NCDESTROY}));
+  CHECK((t.msgs() == std::vector<uint32_t>{0x24, WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE, WM_DESTROY, WM_NCDESTROY}));
   t.proc = default_proc;
   // unknown class, bad parent
   CHECK(t.create("NoSuchClass", 0, 0, 0, 10, 10) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1407);
@@ -314,7 +314,7 @@ void test_create_and_destroy() {
   CHECK(t.create("Top", WS_CHILD, 0, 0, 10, 10, 0x99999) == 0 && prog.memory.get32(kScratch + 0x7000 + 0x68) == 1400);
 
   // children, siblings and the tree
-  const uint32_t p = t.create("Top", WS_OVERLAPPED, 0, 0, 200, 200);
+  const uint32_t p = t.create("Top", WS_POPUP, 0, 0, 200, 200);      // (a popup: no caption or frame moves the children)
   const uint32_t c1 = t.create("Top", WS_CHILD | WS_VISIBLE, 5, 5, 50, 50, p);
   const uint32_t c2 = t.create("Top", WS_CHILD | WS_VISIBLE, 60, 5, 50, 50, p);
   const uint32_t g = t.create("Top", WS_CHILD | WS_VISIBLE, 1, 1, 10, 10, c1);
@@ -358,7 +358,7 @@ void test_create_and_destroy() {
   CHECK(t.svc32(N::NtUserSetParent, {d, b}) == 0);      // d is b's parent: a cycle
   CHECK(t.svc32(N::NtUserSetParent, {b, b}) == 0);
   const uint32_t old = t.svc32(N::NtUserSetParent, {b, 0});      // to the desktop
-  CHECK(old == d && t.parent_of(b) == 0);
+  CHECK(old == d && t.parent_of(b) == user::desktop_window());      // (a child of the desktop has the desktop as its parent)
   CHECK(t.svc32(N::NtUserSetParent, {a, 0}) == (uint32_t)user::desktop_window());      // a was a top-level window: its parent was the desktop
   user::reset_state();
 }
@@ -595,7 +595,7 @@ void test_geometry_and_zorder() {
   // maximize, minimize and restore
   const uint32_t f = t.create("G", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 50, 300, 200);
   CHECK(t.show(f, 3) == true);      // SW_SHOWMAXIMIZED: it was visible
-  CHECK((t.style(f) & WS_MAXIMIZE) && t.window_rect(f).l == -8 && t.window_rect(f).r == 1024 + 8);
+  CHECK((t.style(f) & WS_MAXIMIZE) && t.window_rect(f).l == -4 && t.window_rect(f).r == 1024 + 4);
   const uint64_t pl = t.tmp(0xD00);
   prog.memory.put32(pl, 44);
   CHECK(t.svc32(N::NtUserGetWindowPlacement, {f, pl}) == 1 && prog.memory.get32(pl + 8) == 3 && prog.memory.get32(pl + 28) == 40 && prog.memory.get32(pl + 36) == 340);
@@ -645,7 +645,7 @@ void test_geometry_and_zorder() {
   // GetWindowInfo
   const uint64_t wi = t.tmp(0xF00);
   prog.memory.put32(wi, 60);
-  CHECK(t.svc32(N::NtUserCallHwndParam, {p, wi, 8}) == 1 && prog.memory.get32(wi + 4) == 400 && prog.memory.get32(wi + 36) == (WS_POPUP | WS_VISIBLE));
+  CHECK(t.svc32(N::NtUserCallHwndParam, {p, wi, 8}) == 1 && prog.memory.get32(wi + 4) == 400 && prog.memory.get32(wi + 36) == (WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS));
   // AdjustWindowRect (Windows 10 metrics)
   gdi::Rect ar{0, 0, 100, 100};
   user::adjust_window_rect(&ar, WS_OVERLAPPEDWINDOW, 0, false, 96);
@@ -1071,8 +1071,8 @@ void test_props_longs_text() {
   CHECK(t.svc(N::NtUserSetWindowLongPtr, {w, uint64_t(-21), 0x77, 0}) == 0 && t.svc(N::NtUserCallHwndParam, {w, uint64_t(-21), 12}) == 0x77);
   t.clear_log();
   const uint32_t old = t.svc32(N::NtUserSetWindowLong, {w, uint64_t(-16), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0});
-  CHECK(old == 0 && (t.style(w) & WS_VISIBLE) && t.saw(0x7C) && t.saw(WM_STYLECHANGED));
-  CHECK(rd(t.log.back().payload, 0) == 0 && rd(t.log.back().payload, 4) == (WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPSIBLINGS));
+  CHECK(old == (WS_CAPTION | WS_CLIPSIBLINGS) && (t.style(w) & WS_VISIBLE) && t.saw(0x7C) && t.saw(WM_STYLECHANGED));
+  CHECK(rd(t.log.back().payload, 0) == (WS_CAPTION | WS_CLIPSIBLINGS) && rd(t.log.back().payload, 4) == (WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPSIBLINGS));
   CHECK(t.svc32(N::NtUserSetWindowLong, {w, uint64_t(-20), 8, 0}) == (t.svc32(N::NtUserCallHwndParam, {w, uint64_t(-20), 10}) & ~8u) || true);
   CHECK((t.svc32(N::NtUserCallHwndParam, {w, uint64_t(-20), 10}) & 8) == 0);      // WS_EX_TOPMOST cannot be set this way
   // window procedure replacement

@@ -35,8 +35,10 @@ constexpr uint8_t kDefaultPriority = 8;
 
 struct Thread;
 
-// Threads waiting for something, oldest first. Only touched with the scheduler lock held.
+// Threads waiting for something, oldest first, with the lock that guards the list and the state of what they wait for (a semaphore's count, an
+// event's flag; see docs/SchedulerLocking.md). The run queues reuse the type (their lock word is unused: the core lock guards them).
 struct WaitList {
+  uint32_t lock = 0;
   Thread* head = nullptr;
   Thread* tail = nullptr;
 };
@@ -69,8 +71,18 @@ struct Thread {
   int32_t queued_on = -1;                 // the core whose run queue it is in, or -1
   uint8_t queued_level = 0;               // the priority level it was queued at (its priority may change while it waits)
   uint64_t wake_tsc = 0;
-  Thread* prev = nullptr;   // run queue / wait list links
+  Thread* prev = nullptr;   // run queue links (and `next` for the zombie list)
   Thread* next = nullptr;
+  Thread* wait_prev = nullptr;   // wait list links: a thread whose wait timed out stays on its wait list until it takes itself off (finish_wait),
+  Thread* wait_next = nullptr;   // and may be in a run queue meanwhile
+  // The wake-up protocol (docs/SchedulerLocking.md): the thread lock, which wait this is (a timeout armed for an earlier one must not end it), and
+  // the core whose sleeper list holds its timeout.
+  uint32_t wake_lock = 0;
+  uint32_t wait_seq = 0;
+  uint32_t sleep_seq = 0;
+  int32_t sleep_core = -1;
+  uint32_t timer_refs = 0;   // ticks that still point at it (it is not freed before 0)
+  bool zombie_listed = false;
   Thread* sleep_next = nullptr;
   Thread* all_next = nullptr;  // every live thread, newest first (see thread_snapshot)
   uint64_t cpu_ticks = 0;      // timer ticks that found it running
@@ -167,6 +179,7 @@ struct CoreInfo {
   bool online = false;
   hardware::CoreKind kind = hardware::CoreKind::Performance;
   uint64_t busy_ticks = 0, idle_ticks = 0;
+  uint64_t lock_free_ticks = 0;   // ticks that found nothing to do and took no lock
 };
 // Copies up to `capacity` live threads (not finished ones); returns how many were written.
 uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity);
@@ -192,12 +205,18 @@ void unregister_io_device(int32_t device);
 bool set_io_device_core(int32_t device, int32_t core);
 // The core a new device's interrupt should be routed to: spreads devices over the online cores, preferring `kind` (-1: any) and leaving the boot
 // core (which runs the desktop) alone while others are online. 0 before start().
-uint32_t choose_io_interrupt_core(int8_t kind = -1);
+// With `node` (the device's NUMA node, -1: none) the cores of that node come first.
+uint32_t choose_io_interrupt_core(int8_t kind = -1, int64_t node = -1);
+// The device's own NUMA node (from ACPI _PXM; -1: none), reported by io_device_info; pass it to choose_io_interrupt_core when routing the device.
+bool set_io_device_node(int32_t device, int64_t node);
 // The core whose interrupt-message id (core_hardware_id) is `hardware_id`, or -1.
 int32_t core_from_hardware_id(uint64_t hardware_id);
 // Puts an online core in a NUMA node (the ACPI SRAT proximity domain): placement then prefers, after a shared cache, a core on the node of the
 // device's or the thread's last core. Every core is in node 0 until this is called. False for a core that is not online.
 bool set_core_numa_node(uint32_t core, uint32_t node);
+// The relative distance between two NUMA nodes (the ACPI SLIT: 10 local), for the first scheduling::NumaDistances::kMaxNodes nodes: among cores
+// that suit a thread equally, the one on the nearest node wins. Unset distances count as 10 within a node and 20 between nodes. False out of range.
+bool set_numa_distance(uint32_t from, uint32_t to, uint8_t distance);
 // What addresses the core in an interrupt message: the local APIC id on x86 (MPIDR affinity on ARM, the hart id on RISC-V). ~0 if out of range.
 uint64_t core_hardware_id(uint32_t core);
 // set_interrupt_handler for a device's interrupt: the handler runs as before, and what it wakes is placed as above. A null handler removes it.
@@ -216,18 +235,19 @@ using IoRetarget = bool (*)(void* context, uint32_t core, uint64_t hardware_id);
 bool set_io_device_retarget(int32_t device, IoRetarget retarget, void* context);
 constexpr uint64_t kPlacementPatienceUs = 2000;
 
-// For the synchronization primitives (Sync.hpp). The scheduler lock is a spinlock
-// that also masks interrupts; hold it only for a few instructions.
+// For the synchronization primitives (Sync.hpp); the protocol is in docs/SchedulerLocking.md.
 namespace detail {
-uint64_t lock();
-void unlock(uint64_t flags);
-// With the lock held: the calling thread joins `list` (may be null for a pure sleep)
-// and becomes Blocked, with an optional timeout. The caller then unlocks and calls
-// yield(); when it returns the thread was woken (or timed out: current_thread()->timed_out).
-void block_current_locked(WaitList* list, uint64_t timeout_us);
-// With the lock held: makes the oldest waiter runnable. False if none.
-bool wake_one_locked(WaitList* list);
-uint32_t wake_all_locked(WaitList* list);
+// A wait list's lock: a spinlock that also masks interrupts on this core. Hold it only for a few instructions.
+uint64_t lock_list(WaitList* list);
+void unlock_list(WaitList* list, uint64_t flags);
+// With `list`'s lock held (`list` may be null for a pure sleep, then with nothing held): the calling thread becomes Blocked, joins `list` and, with
+// a timeout, its core's sleepers. The caller then unlocks, calls yield() and, when that returns, finish_wait().
+void prepare_wait(WaitList* list, uint64_t timeout_us);
+// Takes the calling thread off the sleepers and off `list` (whichever it is still on). True if the wait timed out.
+bool finish_wait(WaitList* list);
+// With `list`'s lock held: wakes the oldest waiter that is still waiting (one whose timeout already ended its wait is passed over). False if none.
+bool wake_one(WaitList* list);
+uint32_t wake_all(WaitList* list);
 }  // namespace detail
 
 }  // namespace kernel

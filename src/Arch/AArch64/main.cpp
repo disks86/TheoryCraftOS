@@ -26,6 +26,7 @@
 #include "Arch/AArch64/Spcr.hpp"
 #include "BootLog.hpp"
 #include "Hardware/Acpi/AcpiTables.hpp"
+#include "Kernel/Numa.hpp"
 #include "Hardware/DebugConsole.hpp"
 #include "Hardware/GraphicsProcessingUnit/Broadcom/V3dGpuMemory.hpp"
 #include "Hardware/GraphicsProcessingUnit/Broadcom/V3dSelfTest.hpp"
@@ -155,12 +156,14 @@ void jit_check(JitHandles& jit_handles, allocators::IAllocator& allocator) {
   if (result == jit::SelfTestResult::Passed) e.text(": ").dec(bytes).text(" bytes of code run, memory protections ").text(jit_handles.memory.protections_enforced() ? "enforced (W^X)" : "not available");
 }
 
-void scheduler_check(allocators::IAllocator& allocator, hardware::AArch64Cpu& cpu) {
+void scheduler_check(allocators::IAllocator& allocator, hardware::AArch64Cpu& cpu, const hardware::AcpiTables& acpi) {
   if (!kernel::start(cpu, allocator, 1000)) {
     Entry(Level::Fault, "Kernel").text("could not start threads");
     return;
   }
   Entry(Level::Ok, "Kernel").text("threads running, tick ").dec(kernel::tick_rate()).text(" Hz, GICv").dec(kernel::gic::version());
+  const kernel::NumaSummary numa = kernel::apply_acpi_numa(acpi.find("SRAT"), acpi.find("SLIT"), acpi.find("APIC"));
+  if (numa.cores) Entry(Level::Info, "Kernel").text("NUMA: ").dec(numa.cores).text(" core(s) in ").dec(numa.nodes).text(" node(s) (SRAT), ").dec(numa.distances).text(" distance(s) (SLIT)");
   Worker a, b;
   kernel::Thread* ta = kernel::spawn(spin_worker, &a, "spin-a");
   kernel::Thread* tb = kernel::spawn(spin_worker, &b, "spin-b");
@@ -293,7 +296,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   JitHandles jit_handles(shared_allocator, st);   // (lives as long as main, which registers it)
   if (acpi_ok && kernel::gic::init_boot_core(acpi)) {
     Entry(Level::Ok, "GIC").text("version ").dec(kernel::gic::version());
-    scheduler_check(shared_allocator, cpu);
+    scheduler_check(shared_allocator, cpu, acpi);
     jit_check(jit_handles, shared_allocator);
   } else {
     Entry(Level::Warning, "GIC").text("not found; running without interrupts");

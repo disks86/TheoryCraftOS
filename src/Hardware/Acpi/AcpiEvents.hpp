@@ -119,6 +119,9 @@ class AcpiEvents {
   acpi::Node* find_pci_device(const IPciBus& pci, PciAddress address);
   // Is `device` the node `ancestor` or below it? (A root port's notification is news for the devices behind it.)
   bool is_within(const acpi::Node* ancestor, const acpi::Node* device) const;
+  // The proximity domain (NUMA node, as the SRAT numbers them) of a device: its own _PXM, else the nearest ancestor's (usually the PCI root
+  // bridge's). False when none of them has one (the device then belongs to no particular node).
+  bool proximity_domain(acpi::Node* device, uint32_t* node);
 
   // _PRW of the device: the event it raises to wake the machine and the deepest sleep state it works in.
   bool wake_source(acpi::Node* device, WakeSource* out);

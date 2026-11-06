@@ -214,12 +214,12 @@ EXPORT BOOL WINAPI GetWindowRect(HANDLE window, RECT_ *rect) {
 }
 /* The metrics are the window manager's (Windows 10 values at 96 dpi). */
 EXPORT int WINAPI GetSystemMetrics(int index) { return (int)(NtUserCallOneParam((ULONG_PTR)(LONG_PTR)index, 9 /* GetSystemMetrics */) & 0xFFFFFFFFu); }
-EXPORT BOOL WINAPI SystemParametersInfoW(UINT action, UINT param, PVOID data, UINT flags) {
-  (void)param; (void)flags;
-  if (action == 0x30 /* SPI_GETWORKAREA */ && data) { RECT_ *r = data; r->left = 0; r->top = 0; r->right = SCREEN_W; r->bottom = WORK_H; return TRUE; }
-  SetLastError(ERROR_INVALID_PARAMETER);
-  return FALSE;
-}
+SVC NtUserSystemParametersInfo(ULONG_PTR action, ULONG_PTR param, ULONG_PTR data, ULONG_PTR flags);
+SVC NtUserSystemParametersInfoForDpi(ULONG_PTR action, ULONG_PTR param, ULONG_PTR data, ULONG_PTR flags, ULONG_PTR dpi);
+/* The settings are the window manager's. The A function passes the data on as it is: the structures with fonts and strings are those of the W function. */
+EXPORT BOOL WINAPI SystemParametersInfoW(UINT action, UINT param, PVOID data, UINT flags) { return (NtUserSystemParametersInfo(action, param, (ULONG_PTR)data, flags) & 0xFFFFFFFFu) != 0; }
+EXPORT BOOL WINAPI SystemParametersInfoA(UINT action, UINT param, PVOID data, UINT flags) { return SystemParametersInfoW(action, param, data, flags); }
+EXPORT BOOL WINAPI SystemParametersInfoForDpi(UINT action, UINT param, PVOID data, UINT flags, UINT dpi) { return (NtUserSystemParametersInfoForDpi(action, param, (ULONG_PTR)data, flags, dpi) & 0xFFFFFFFFu) != 0; }
 
 /* ---- characters ------------------------------------------------------------------------------------------------------------------------------------------- */
 

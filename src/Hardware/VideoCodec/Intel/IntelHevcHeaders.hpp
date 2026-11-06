@@ -39,6 +39,7 @@ struct HevcStreamHeaders {
   uint32_t level_idc = 120;         // general_level_idc (30 x the level number)
   uint32_t log2_max_poc_lsb = 8;    // 4 .. 16
   int32_t cb_qp_offset = 0, cr_qp_offset = 0;   // pps_cb_qp_offset, pps_cr_qp_offset: -12 .. 12
+  bool b_pictures = false;          // B pictures between the anchors: one picture of reordering and room for the two anchors and the picture being coded
 };
 
 // The video, sequence and picture parameter sets, with emulation prevention bytes, appended to `out`. Each returns in `bits` what it added, start code included (a whole number
@@ -58,6 +59,10 @@ struct HevcSliceHeader {
   uint32_t poc_lsb = 0;      // not coded for IDR pictures
   int32_t qp = 26;           // 0 .. 51
   bool deblocking = true;
+  // The reference picture set the header carries: the picture `negative_delta` earlier in output order and, for a B slice with a later reference, `positive_delta` later (0: none).
+  // A B slice with a positive delta is a random-access B picture: list 0 holds the earlier picture, list 1 the later one. `non_reference` makes it a TRAIL_N picture.
+  uint32_t negative_delta = 1, positive_delta = 0;
+  bool non_reference = false;
 };
 bool write_hevc_slice_header(const HevcStreamHeaders& s, const HevcSliceHeader& h, ByteBuffer* out, uint32_t* bits);
 

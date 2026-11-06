@@ -416,6 +416,7 @@ EXPORT BOOL WINAPI GetClientRect(HANDLE window, RECT_ *rect);
 #include "controls.inc"
 #include "scroll.inc"
 #include "scrollwin.inc"
+#include "display.inc"
 #include "listbox.inc"
 #include "combo.inc"
 #include "dialog.inc"
@@ -575,9 +576,10 @@ static HANDLE create_window(DWORD ex_style, const WCHAR *class_name, const WCHAR
   if ((ex_style & 0x40 /* WS_EX_MDICHILD */) && parent && !g_mdi_creating && is_mdi_client(parent)) return mdi_create_through_client(parent, class_name, title, style, x, y, cx, cy, instance, params, ansi);
   us_name(&class_us, class_name);
   if (title) us_name(&title_us, title);
+  const HANDLE given_instance = instance;      /* (an MDI child keeps the owner it was given in its CREATESTRUCT, even none) */
   if (!instance) instance = GetModuleHandleW(NULL);
   return (HANDLE)NtUserCreateWindowEx(ex_style, (ULONG_PTR)&class_us, (ULONG_PTR)&version_us, title ? (ULONG_PTR)&title_us : 0, style, (ULONG_PTR)(LONG_PTR)x, (ULONG_PTR)(LONG_PTR)y,
-                                       (ULONG_PTR)(LONG_PTR)cx, (ULONG_PTR)(LONG_PTR)cy, (ULONG_PTR)parent, (ULONG_PTR)menu, (ULONG_PTR)instance, (ULONG_PTR)params, 0, (ULONG_PTR)instance,
+                                       (ULONG_PTR)(LONG_PTR)cx, (ULONG_PTR)(LONG_PTR)cy, (ULONG_PTR)parent, (ULONG_PTR)menu, (ULONG_PTR)(g_mdi_creating ? given_instance : instance), (ULONG_PTR)params, 0, (ULONG_PTR)instance,
                                        (ULONG_PTR)class_name, 0);
 }
 EXPORT HANDLE WINAPI CreateWindowExW(DWORD ex_style, const WCHAR *class_name, const WCHAR *title, DWORD style, int x, int y, int cx, int cy, HANDLE parent, HANDLE menu, HANDLE instance, void *params) {
@@ -829,11 +831,12 @@ EXPORT ULONG_PTR WINAPI SetTimer(HANDLE hwnd, ULONG_PTR id, UINT elapse, void *p
 EXPORT BOOL WINAPI KillTimer(HANDLE hwnd, ULONG_PTR id) { return (NtUserKillTimer((ULONG_PTR)hwnd, id) & 0xFFFFFFFFu) != 0; }
 
 /* The window rectangle for a client rectangle (AdjustWindowRectEx): the metrics are the window manager's. */
-EXPORT BOOL WINAPI AdjustWindowRectEx(RECT_ *rect, DWORD style, BOOL menu, DWORD ex_style) {
-  struct { DWORD style, ex_style, menu, dpi; } params = {style, ex_style, menu, 0};
+EXPORT BOOL WINAPI AdjustWindowRectExForDpi(RECT_ *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi) {
+  struct { DWORD style, ex_style, menu, dpi; } params = {style, ex_style, menu, dpi};
   if (!rect) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   return (NtUserCallTwoParam((ULONG_PTR)rect, (ULONG_PTR)&params, 7 /* AdjustWindowRect */) & 0xFFFFFFFFu) != 0;
 }
+EXPORT BOOL WINAPI AdjustWindowRectEx(RECT_ *rect, DWORD style, BOOL menu, DWORD ex_style) { return AdjustWindowRectExForDpi(rect, style, menu, ex_style, 0); }
 EXPORT BOOL WINAPI AdjustWindowRect(RECT_ *rect, DWORD style, BOOL menu) { return AdjustWindowRectEx(rect, style, menu, 0); }
 
 /* Clipboard format names are atoms of the window manager's table (the same table the class names use). */

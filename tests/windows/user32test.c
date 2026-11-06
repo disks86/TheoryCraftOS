@@ -890,8 +890,8 @@ static void test_mdi(HINSTANCE instance) {
   SendMessageA(g_mdi_client, WM_MDIMAXIMIZE, (WPARAM)c2, 0);
   CHECK((HWND)SendMessageA(g_mdi_client, WM_MDIGETACTIVE, 0, (LPARAM)&maximized) == c2 && maximized && IsZoomed(c2));
   GetClientRect(g_mdi_client, &client);
-  GetWindowRect(c2, &rc);
-  CHECK(rc.right - rc.left == client.right && rc.bottom - rc.top == client.bottom);
+  GetClientRect(c2, &rc);      /* the client area of the maximized child is the client area of the MDI client (its frame lies outside) */
+  CHECK(rc.right == client.right && rc.bottom == client.bottom);
   SendMessageA(g_mdi_client, WM_MDIRESTORE, (WPARAM)c2, 0);
   GetWindowRect(c2, &rc);
   CHECK(!IsZoomed(c2) && rc.left == before.left && rc.top == before.top && rc.right == before.right);
@@ -1015,7 +1015,7 @@ int main(void) {
   CHECK(ScreenToClient(child1, &p) && p.x == 0 && p.y == 0);
   CHECK(FindWindowExA(hwnd, NULL, "TcosTestClass", "c2") == child2);
   CHECK(FindWindowA("TcosTestClass", "Other") == hwnd);
-  CHECK(SetParent(child1, NULL) == hwnd && GetParent(child1) == NULL);
+  CHECK(SetParent(child1, NULL) == hwnd && GetParent(child1) == GetDesktopWindow());
   CHECK(!SetParent(hwnd, child2) && IsWindow(hwnd));      /* (a window cannot become the child of its own child) */
   CHECK(EnableWindow(child2, FALSE) == FALSE && !IsWindowEnabled(child2));
   EnableWindow(child2, TRUE);

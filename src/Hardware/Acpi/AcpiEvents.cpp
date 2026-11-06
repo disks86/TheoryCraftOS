@@ -165,6 +165,20 @@ acpi::Node* AcpiEvents::find_pci_device(const IPciBus& pci, PciAddress address) 
   return walker.found;
 }
 
+bool AcpiEvents::proximity_domain(acpi::Node* device, uint32_t* node) {
+  kernel::ScopedRecursiveMutex vm_guard(vm_.mutex());
+  if (!ready_ || !device || !node) return false;
+  for (acpi::Node* at = device; at; at = vm_.parent(at)) {
+    acpi::Node* pxm = vm_.find("_PXM", at);
+    uint64_t value = 0;
+    if (pxm && vm_.parent(pxm) == at && vm_.evaluate_integer(pxm, &value) && value <= 0xFFFFFFFFu) {
+      *node = static_cast<uint32_t>(value);
+      return true;
+    }
+  }
+  return false;
+}
+
 // --- wake events
 
 bool AcpiEvents::wake_source(acpi::Node* device, WakeSource* out) {

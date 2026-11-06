@@ -58,7 +58,9 @@ bool avc_encode_layout(uint32_t width_mbs, uint32_t height_mbs, AvcEncodeLayout*
 struct AvcEncodeBuffers {
   uint32_t source = 0;                          // the input picture
   uint32_t recon = 0, recon_ds4 = 0;            // what the engine writes: the reconstruction and its 4x down-scaled copy
-  uint32_t reference = 0, reference_ds4 = 0;    // what a P picture predicts from
+  uint32_t reference = 0, reference_ds4 = 0;    // what a P picture predicts from (a B picture: its list 0, the earlier anchor)
+  uint32_t backward_reference = 0, backward_ds4 = 0;   // a B picture's list 1: the later anchor
+  uint32_t colocated_mv_read = 0, colocated_mv_write = 0;   // the later anchor's motion vectors (read by a B picture); where a P picture writes its own
   uint32_t bitstream = 0, bitstream_bytes = 0;  // the access unit goes here
   uint32_t vdenc_row_store = 0, vdenc_statistics = 0, pak_statistics = 0;
   uint32_t intra_row_store = 0, deblocking_row_store = 0, bsd_mpc_row_store = 0, mpr_row_store = 0;
@@ -74,7 +76,9 @@ AvcEncodeScratchSizes avc_encode_scratch_sizes(uint32_t width_mbs, uint32_t heig
 struct AvcEncodePicture {
   EncodeGeneration generation = EncodeGeneration::Gen9;
   uint32_t width_mbs = 0, height_mbs = 0;
-  bool p_picture = false;                       // P (one reference), else I
+  bool p_picture = false;                       // an inter picture (one reference; a B picture has one in each list), else I
+  bool b_picture = false;                       // with p_picture: a B picture, which no picture refers to (list 0: the earlier anchor, list 1: the later one)
+  bool b_mode = false;                          // the stream has B pictures: I and P pictures use the tables of a GOP with B pictures, and P pictures write the motion vectors a B picture reads
   int32_t qp = 26;                              // the slice quantiser (0 .. 51)
   int32_t chroma_qp_offset = 0;
   bool deblocking = true;                       // the in-loop filter runs (disable_deblocking_filter_idc 0)
@@ -85,7 +89,9 @@ struct AvcEncodePicture {
   uint32_t last_in_stream = 0;
   bool xe_lpg = false;                          // Meteor Lake / Arrow Lake: the VDEnc commands of Xe_LPM_plus (Gen12 otherwise means Xe-LP)
   bool xe_hpg = false;                          // Arc Alchemist: the VDEnc commands of Xe_HPM
-  uint32_t poc = 0, reference_poc = 0;          // picture order counts (low eight bits are what the VDEnc image state carries)
+  uint32_t xe2 = 0;                             // 1: Lunar Lake, 2: Arc Battlemage (set with xe_lpg: Xe-LPG's command sequence with Xe2's image state, and a 7-dword pipe mode select on Battlemage)
+  uint32_t backward_reference_frame_store = 0;  // a B picture's list 1 entry
+  uint32_t poc = 0, reference_poc = 0, backward_poc = 0;          // picture order counts (low eight bits are what the VDEnc image state carries)
 };
 
 // Everything from the pipe mode select to the quantiser matrices: the state a picture's slices run in.

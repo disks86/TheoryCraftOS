@@ -70,8 +70,12 @@ class Scheduler final : public ICPUScheduler {
   mutable SpinLock lock_;  // guards both queues
   Queue<Task> high_;
   Queue<Task> efficiency_;
+  // The task threads started and not joined yet (lock_): run() joins them all before it returns, so their stacks are back in the allocator. (A
+  // thread counts itself done in active_ before it exits, so active_ alone would let run() return while the last one is still on its way out.)
+  Queue<kernel::Thread*> started_;
   allocators::IAllocator& allocator_;
   uint32_t active_ = 0;  // task threads started and not yet finished
+  void join_started(bool finished_only);
 };
 
 }  // namespace scheduling

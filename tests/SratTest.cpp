@@ -137,6 +137,37 @@ void test_srat() {
   CHECK(srat_cpus(stuck.view(), ArrayView<SratCpu>(cpus, 8)) == 0);
 }
 
+Table make_madt() {
+  Table t("APIC", 8);
+  auto gicc = [&](uint32_t uid, uint32_t flags, uint64_t mpidr) {
+    const uint64_t at = t.bytes.size();
+    t.append(0x0B, 80);
+    t.put(at + 8, uid, 4); t.put(at + 12, flags, 4); t.put(at + 68, mpidr, 8);
+  };
+  t.append(0x00, 8);                       // (a local APIC entry: not a GICC)
+  gicc(0, 1, 0x80000000ull);               // the MT/U bits above Aff2 are dropped
+  gicc(1, 1, 0x0000000101ull);
+  gicc(2, 0, 0x0000000102ull);             // disabled
+  gicc(7, 1, 0xFF00000000ull | 0x10203);   // Aff3
+  t.finish();
+  return t;
+}
+
+void test_madt_gicc() {
+  const Table t = make_madt();
+  uint64_t mpidr = 0;
+  CHECK(madt_gicc_mpidr(t.view(), 0, &mpidr) && mpidr == 0);
+  CHECK(madt_gicc_mpidr(t.view(), 1, &mpidr) && mpidr == 0x101);
+  CHECK(!madt_gicc_mpidr(t.view(), 2, &mpidr));
+  CHECK(madt_gicc_mpidr(t.view(), 7, &mpidr) && mpidr == (0xFF00000000ull | 0x10203));
+  CHECK(!madt_gicc_mpidr(t.view(), 9, &mpidr));
+  CHECK(!madt_gicc_mpidr(make_srat().view(), 0, &mpidr));
+  Table short_entry = make_madt();
+  short_entry.bytes[44 + 8 + 1] = 70;      // the first GICC claims 70 bytes: too short for the MPIDR, and the walk is off from there on
+  short_entry.finish();
+  CHECK(!madt_gicc_mpidr(short_entry.view(), 0, &mpidr));
+}
+
 void test_slit() {
   const Table t = make_slit();
   CHECK(slit_distance(t.view(), 0, 0) == 10);
@@ -159,7 +190,7 @@ void test_slit() {
 // Every prefix of the bytes (with the table's length left as it was, and set to the prefix) and every single-bit flip: no read out of bounds
 // (ASan, the checked views), no more entries than the intact table has room for.
 void test_damage() {
-  const Table tables[2] = {make_srat(), make_slit()};
+  const Table tables[3] = {make_srat(), make_slit(), make_madt()};
   SratCpu cpus[16];
   SratMemory memory[16];
   for (const Table& original : tables) {
@@ -172,6 +203,8 @@ void test_damage() {
         CHECK(srat_memory(t.view(), ArrayView<SratMemory>(memory, 16)) <= 16);
         for (uint32_t a = 0; a < 4; ++a)
           for (uint32_t b = 0; b < 4; ++b) (void)slit_distance(t.view(), a, b);
+        uint64_t mpidr;
+        for (uint32_t uid = 0; uid < 8; ++uid) (void)madt_gicc_mpidr(t.view(), uid, &mpidr);
       }
     }
     for (uint64_t byte = 0; byte < original.bytes.size(); ++byte) {
@@ -182,6 +215,8 @@ void test_damage() {
         CHECK(srat_memory(t.view(), ArrayView<SratMemory>(memory, 16)) <= 16);
         for (uint32_t a = 0; a < 4; ++a)
           for (uint32_t b = 0; b < 4; ++b) (void)slit_distance(t.view(), a, b);
+        uint64_t mpidr;
+        for (uint32_t uid = 0; uid < 8; ++uid) (void)madt_gicc_mpidr(t.view(), uid, &mpidr);
       }
     }
   }
@@ -192,6 +227,7 @@ void test_damage() {
 int main() {
   test_srat();
   test_slit();
+  test_madt_gicc();
   test_damage();
   if (g_failed) {
     printf("SratTest: %d FAILED\n", g_failed);

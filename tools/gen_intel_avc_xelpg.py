@@ -4,7 +4,10 @@
 Same method as gen_intel_hevc_xelpg.py: the Intel media driver's (MIT licence) own lambdas, tables, field maps and command structures are compiled into a small program and run for
 the configuration the encoder here uses (constant QP, target usage 7, one slice, frame pictures, no 8x8 transform, I and P pictures, reference pictures), and the images are written.
 
-usage: gen_intel_avc_xelpg.py <media-driver-dir> <out.inc>
+usage: gen_intel_avc_xelpg.py <media-driver-dir> <out.inc> [xelpg | xe2lpm | xe2hpm]
+
+xe2lpm (Lunar Lake) and xe2hpm (Arc Battlemage) read cs_avc_xe2_lpm.cpp / cs_avc_xe2_hpm.cpp and the matching *_open.h tables instead of cs_avc_lpm.cpp, and hwcmd_xe2_lpm.h / hwcmd_xe2_hpm.h, impl_xe2_hpm.h instead
+of hwcmd.h / impl_lpmplus_base.h; they write kXe2Lpm... / kXe2Hpm... names.
 
 <media-driver-dir> holds, besides the files gen_intel_hevc_xelpg.py reads (cmdpar.h, impl_common.h, impl_lpmplus_base.h, hwcmd.h):
   cs_avc.cpp      [media_softlet/agnostic/common/codec/hal/enc/avc/features/encode_avc_vdenc_const_settings.cpp]
@@ -18,14 +21,20 @@ from gen_intel_hevc_xelpg import brace_block, function_body, par_struct, fields_
 QPS = range(10, 52)
 LEVELS = range(0, 53)
 
+PLATFORMS = {
+    'xelpg': dict(ns='xe_lpm_plus_base::v0', hwcmd='hwcmd.h', hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h', cs='cs_avc_lpm.cpp', cs_class='EncodeAvcVdencConstSettingsXe_Lpm_Plus_Base', pms=['impl_lpmplus_base.h'], prefix='XeLpg'),
+    'xe2lpm': dict(ns='xe2_lpm_base::xe2_lpm', hwcmd='hwcmd_xe2_lpm.h', hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe2_lpm.h', cs='cs_avc_xe2_lpm.cpp', cs_class='EncodeAvcVdencConstSettingsXe2_Lpm', pms=[], prefix='Xe2Lpm'),
+    'xe2hpm': dict(ns='xe_lpm_plus_base::v1', hwcmd='hwcmd_xe2_hpm.h', hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe2_hpm.h', cs='cs_avc_xe2_hpm.cpp', cs_class='EncodeAvcVdencConstSettingsXe2_Hpm', pms=['impl_lpmplus_base.h', 'impl_xe2_hpm.h'], prefix='Xe2Hpm'),
+}
+
 HARNESS = r'''
 #include <vector>
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <array>
-#include "mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h"
-using namespace mhw::vdbox::vdenc::xe_lpm_plus_base::v0;
+#include "HWCMD_INCLUDE"
+using namespace mhw::vdbox::vdenc::NAMESPACE;
 typedef int MOS_STATUS;
 #define MOS_STATUS_SUCCESS 0
 #define ENCODE_FUNC_CALL()
@@ -57,7 +66,7 @@ struct Settings {
 struct WaTable {};
 struct OsItf { WaTable *pfnGetWaTable(OsItf *) { static WaTable t; return &t; } };
 struct Pic { int CodingType, pic_init_qp_minus26, RefPicFlag, EnableRollingIntraRefresh; };
-struct Seq { int GopRefDist, GopPicSize, FrameWidth, FrameHeight, TargetUsage, Level; };
+struct Seq { int GopRefDist, GopPicSize, FrameWidth, FrameHeight, TargetUsage, Level, LowDelayMode, EnableSliceLevelRateCtrl; };
 struct Slice { int slice_qp_delta, num_ref_idx_l0_active_minus1; };
 struct Ctx {
   Pic *m_avcPicParams; Seq *m_avcSeqParams; Slice *m_avcSliceParams;
@@ -73,8 +82,9 @@ FIELD_MACROS
 static void dump(const char *tag, const uint32_t *d, size_t n) { printf("%s", tag); for (size_t i = 0; i < n; i++) printf(" 0x%x", d[i]); printf("\n"); }
 int main(int argc, char **argv) {
   const int type = atoi(argv[1]), qp = atoi(argv[2]), level = atoi(argv[3]);
-  Pic pic{}; pic.CodingType = type; pic.pic_init_qp_minus26 = qp - 26; pic.RefPicFlag = 1;
-  Seq seq{}; seq.TargetUsage = 7; seq.GopRefDist = 1; seq.GopPicSize = 30; seq.FrameWidth = 64; seq.FrameHeight = 64; seq.Level = level;
+  const int gop = argc > 4 ? atoi(argv[4]) : 1, large = argc > 5 ? atoi(argv[5]) : 0;   // gop 2: one non-reference B picture between anchors
+  Pic pic{}; pic.CodingType = type; pic.pic_init_qp_minus26 = qp - 26; pic.RefPicFlag = type != B_TYPE;
+  Seq seq{}; seq.TargetUsage = 7; seq.GopRefDist = gop; seq.LowDelayMode = gop == 1; seq.GopPicSize = 30; seq.FrameWidth = large ? 1920 : 64; seq.FrameHeight = large ? 1088 : 64; seq.Level = level;
   Slice sl{};
   Ctx ctx; ctx.m_avcPicParams = &pic; ctx.m_avcSeqParams = &seq; ctx.m_avcSliceParams = &sl; ctx.m_osItf = &ctx.m_osItfStorage;
   Settings S; ctx.m_featureSetting = &S;
@@ -82,7 +92,7 @@ int main(int argc, char **argv) {
   {
     CMD3Par par; for (auto &f : S.vdencCmd3Settings) f(par);
     _VDENC_CMD3_CMD cmd; impl_cmd3(par, cmd);
-    dump("CMD3", (uint32_t *)&cmd, 23);
+    dump("CMD3", (uint32_t *)&cmd, sizeof(cmd) / 4);
   }
   {
     // VDENC_AVC_IMG_STATE: SETPAR of AvcBasicFeature and AvcReferenceFrames for a progressive frame: one reference (frame store 0) for P; colocated MV writing is left off (only
@@ -91,11 +101,13 @@ int main(int argc, char **argv) {
     par.pictureType = type - 1; par.transform8X8Flag = 0; par.pictureHeightMinusOne = 3; par.pictureWidth = 4;
     if (type != I_TYPE) { par.fwdRefIdx0ReferencePicture = 0; par.fwdRefIdx1ReferencePicture = 0xf; par.fwdRefIdx2ReferencePicture = 0xf; par.numberOfL0ReferencesMinusOne = 0; par.numberOfL1ReferencesMinusOne = 0; }
     par.qpPrimeY = qp;
+    if (type == B_TYPE) { par.colMVReadEnable = true; par.bidirectionalWeight = 0x20; }
+    if (type == P_TYPE && gop == 2) par.colMVWriteEnable = true;   // (a P picture is the colocated picture of the B picture before it)
     for (auto &f : S.vdencAvcImgStateSettings) f(par);
     Cmd::VDENC_AVC_IMG_STATE_CMD cmd; auto &params = par;
     DO_FIELDS_IMG();
     for (auto &f : par.extSettings) f((uint32_t *)&cmd);
-    dump("IMG", (uint32_t *)&cmd, 26);
+    dump("IMG", (uint32_t *)&cmd, sizeof(cmd) / 4);
   }
   if (type == P_TYPE && qp == 26 && level == 40) {
     {
@@ -106,8 +118,8 @@ int main(int argc, char **argv) {
       par.VdencPipeModeSelectPar1 = par1table[7 - 1]; par.VdencPipeModeSelectPar0 = 1;
       Cmd::VDENC_PIPE_MODE_SELECT_CMD cmd; auto &params = par;
       DO_FIELDS_PMS();
-      DO_FIELDS_PMS_LPM();
-      dump("PMS", (uint32_t *)&cmd, 6);
+      PMS_LAYERS
+      dump("PMS", (uint32_t *)&cmd, sizeof(cmd) / 4);
     }
     { Cmd::VDENC_AVC_SLICE_STATE_CMD cmd; dump("SLICE", (uint32_t *)&cmd, 4); }
     { Cmd::VDENC_WALKER_STATE_CMD cmd; dump("WALK", (uint32_t *)&cmd, 3); }
@@ -141,16 +153,16 @@ def cmd3_impl(impl):
     return 'static void impl_cmd3(CMD3Par &params, _VDENC_CMD3_CMD &cmd) {\n' + pre + macro + '\nDO_FIELDS3();\n}\n'
 
 
-def build(d, tmp):
+def build(d, tmp, plat):
     bodies = '\n'.join([
         'int SetCmd3() {%s}' % function_body(d + '/cs_avc.cpp', 'MOS_STATUS EncodeAvcVdencConstSettings::SetVdencCmd3Settings()'),
-        'int SetImg() {%s}' % function_body(d + '/cs_avc_lpm.cpp', 'MOS_STATUS EncodeAvcVdencConstSettingsXe_Lpm_Plus_Base::SetVdencAvcImgStateSettings()'),
+        'int SetImg() {%s}' % function_body(d + '/' + plat['cs'], 'MOS_STATUS %s::SetVdencAvcImgStateSettings()' % plat['cs_class']),
     ])
     pars = ''.join([par_struct(d + '/cmdpar.h', 'VDENC_CMD3', 'CMD3Par'), par_struct(d + '/cmdpar.h', 'VDENC_AVC_IMG_STATE', 'IMGPar'),
                     par_struct(d + '/cmdpar.h', 'VDENC_PIPE_MODE_SELECT', 'PMS_PAR')])
-    macros = ''.join([fields_macro(d + '/impl_common.h', 'VDENC_AVC_IMG_STATE', 'DO_FIELDS_IMG'), fields_macro(d + '/impl_common.h', 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS'),
-                      fields_macro(d + '/impl_lpmplus_base.h', 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS_LPM')])
-    src = (HARNESS.replace('STRUCT_DECL', struct_decl(d + '/cs_avc.h')).replace('TABLES', tables_text(d + '/cs_avc.cpp')).replace('PAR_STRUCTS', pars)
+    macros = ''.join([fields_macro(d + '/impl_common.h', 'VDENC_AVC_IMG_STATE', 'DO_FIELDS_IMG'), fields_macro(d + '/impl_common.h', 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS')] +
+                     [fields_macro(d + '/' + f, 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS_%d' % i) for i, f in enumerate(plat['pms'])])
+    src = (HARNESS.replace('HWCMD_INCLUDE', plat['hwcmd_include']).replace('NAMESPACE', plat['ns']).replace('PMS_LAYERS', ' '.join('DO_FIELDS_PMS_%d();' % i for i in range(len(plat['pms'])))).replace('STRUCT_DECL', struct_decl(d + '/cs_avc.h')).replace('TABLES', tables_text(d + '/cs_avc.cpp')).replace('PAR_STRUCTS', pars)
            .replace('BODIES', bodies).replace('CMD3_FUNC', cmd3_impl(d + '/impl_common.h')).replace('FIELD_MACROS', macros))
     os.makedirs(tmp + '/stub', exist_ok=True)
     os.makedirs(tmp + '/hdr', exist_ok=True)
@@ -159,20 +171,24 @@ def build(d, tmp):
 #include <string.h>
 #include <stddef.h>
 #define MOS_ZeroMemory(p, s) memset(p, 0, s)
+#define MEDIA_CLASS_DEFINE_END(x)
 #define __CODEGEN_MAX(_a, _b) (((_a) > (_b)) ? (_a) : (_b))
 #define __CODEGEN_BITFIELD(l, h) (h) - (l) + 1
 #define __CODEGEN_OP_LENGTH_BIAS 2
 #define __CODEGEN_OP_LENGTH(x) (uint32_t)((__CODEGEN_MAX(x, __CODEGEN_OP_LENGTH_BIAS)) - __CODEGEN_OP_LENGTH_BIAS)
 ''')
-    open(tmp + '/hdr/mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h', 'w').write(open(d + '/hwcmd.h').read())
+    open(tmp + '/hdr/' + plat['hwcmd_include'], 'w').write(open(d + '/' + plat['hwcmd']).read())
+    open(tmp + '/stub/mhw_vdbox_vdenc_hwcmd_ext.h', 'w').write('')
+    for f in os.listdir(d):   # (the const settings include their image state tables from *_open.h files)
+        if f.endswith('_open.h') or f.startswith('encode_'): open(tmp + '/stub/' + f, 'w').write(open(d + '/' + f).read())
     open(tmp + '/main.cpp', 'w').write(src)
     subprocess.check_call(['g++', '-std=c++17', '-w', '-I' + tmp + '/stub', '-I' + tmp + '/hdr', tmp + '/main.cpp', '-o', tmp + '/harness'])
     return tmp + '/harness'
 
 
-def run(h, t, qp, level):
+def run(h, t, qp, level, gop=1, large=0):
     out = {}
-    for line in subprocess.check_output([h, str(t), str(qp), str(level)], text=True).split('\n'):
+    for line in subprocess.check_output([h, str(t), str(qp), str(level), str(gop), str(large)], text=True).split('\n'):
         if line:
             k, *v = line.split()
             out[k] = [int(x, 16) for x in v]
@@ -181,27 +197,32 @@ def run(h, t, qp, level):
 
 def main():
     d, out_path = sys.argv[1], sys.argv[2]
+    plat = PLATFORMS[sys.argv[3] if len(sys.argv) > 3 else 'xelpg']
     with tempfile.TemporaryDirectory() as tmp:
-        h = build(d, tmp)
+        h = build(d, tmp, plat)
         runs = {(t, qp): run(h, t, qp, 40) for t in (1, 2) for qp in QPS}
         level_runs = {lv: run(h, 2, 26, lv) for lv in LEVELS}
         level_runs_i = {lv: run(h, 1, 26, lv) for lv in LEVELS}
-    header = open(d + '/hwcmd.h').read()
+        # With B pictures (GopRefDist 2): all three picture types; CMD3 also depends on the picture size (a lambda offset below 1920x1080 above QP 31).
+        bruns = {(t, qp, big): run(h, t, qp, 40, 2, big) for t in (1, 2, 3) for qp in QPS for big in (0, 1)}
+        blevel = {lv: run(h, 3, 26, lv, 2, 0) for lv in LEVELS}
+    header = open(d + '/' + plat['hwcmd']).read()
+    P = plat['prefix']
     o = ['// Generated by tools/gen_intel_avc_xelpg.py from the Intel media driver (MIT licence): the VDEnc commands of H.264 encode on Xe-LPG (constant QP, target usage 7, one slice).',
          '// Do not edit by hand.']
     base = runs[(2, 26)]
     for tag, name, struct, indent in [('PMS', 'AvcVdencPipeModeSelect', 'VDENC_PIPE_MODE_SELECT_CMD', '    '), ('SLICE', 'AvcVdencSliceState', 'VDENC_AVC_SLICE_STATE_CMD', '    '),
                                       ('WALK', 'AvcVdencWalkerState', 'VDENC_WALKER_STATE_CMD', '    ')]:
         img = base[tag]
-        o += ['', '// %s, %d dwords' % (struct, len(img)), 'constexpr uint32_t kXeLpg%sDwords = %d;' % (name, len(img)), emit_array('kXeLpg%sImage' % name, img)]
+        o += ['', '// %s, %d dwords' % (struct, len(img)), 'constexpr uint32_t k' + P + '%sDwords = %d;' % (name, len(img)), emit_array('k' + P + '%sImage' % name, img)]
         if tag in ('SLICE', 'WALK'):
             for n, (dw, lo, hi) in sorted(parse_fields(struct_text(header, struct, indent)).items(), key=lambda kv: kv[1]):
-                o.append('constexpr EncodeField kXeLpg%s_%s = {%d, %d, %d};' % (name, n, dw, lo, hi))
+                o.append('constexpr EncodeField k' + P + '%s_%s = {%d, %d, %d};' % (name, n, dw, lo, hi))
     # CMD3 depends on the quantiser all over; keep the whole command for every quantiser.
     for t, tn in ((1, 'I'), (2, 'P')):
         words = [w for qp in QPS for w in runs[(t, qp)]['CMD3']]
-        o += ['', '// VDENC_CMD3, 23 dwords for each quantiser %d .. %d, %s pictures' % (QPS[0], QPS[-1], tn), emit_array('kXeLpgAvcVdencCmd3Table%s' % tn, words)]
-    o += ['', 'constexpr uint32_t kXeLpgAvcVdencCmd3Dwords = 23;']
+        o += ['', '// VDENC_CMD3, 23 dwords for each quantiser %d .. %d, %s pictures' % (QPS[0], QPS[-1], tn), emit_array('k' + P + 'AvcVdencCmd3Table%s' % tn, words)]
+    o += ['', 'constexpr uint32_t k' + P + 'AvcVdencCmd3Dwords = 23;']
     # VDENC_AVC_IMG_STATE: the image at quantiser 26 and level 40, plus the dwords that vary.
     for t, tn in ((1, 'I'), (2, 'P')):
         img = runs[(t, 26)]['IMG']
@@ -212,10 +233,19 @@ def main():
         print('IMG %s varies with qp in %s, with level in %s' % (tn, varying_qp, varying_lv), file=sys.stderr)
         assert varying_qp == [14] and varying_lv == [8], 'unexpected dependence'
         o += ['', '// VDENC_AVC_IMG_STATE, 26 dwords, %s pictures at level 40 / quantiser 26; dword 8 by level_idc 0 .. 52 (the media driver indexes its table by the level).' % tn,
-              emit_array('kXeLpgAvcVdencImgState%s' % tn, runs[(t, 26)]['IMG']), emit_array('kXeLpgAvcVdencImgState%sLevelDword8' % tn, [lrs[l]['IMG'][8] for l in LEVELS])]
-    o += ['', 'constexpr uint32_t kXeLpgAvcVdencImgStateDwords = 26;']
+              emit_array('k' + P + 'AvcVdencImgState%s' % tn, runs[(t, 26)]['IMG']), emit_array('k' + P + 'AvcVdencImgState%sLevelDword8' % tn, [lrs[l]['IMG'][8] for l in LEVELS])]
+    o += ['', 'constexpr uint32_t k' + P + 'AvcVdencImgStateDwords = 26;']
     for n, (dw, lo, hi) in sorted(parse_fields(struct_text(header, 'VDENC_AVC_IMG_STATE_CMD' if False else '_VDENC_AVC_IMG_STATE_CMD', '')).items(), key=lambda kv: kv[1]):
-        o.append('constexpr EncodeField kXeLpgAvcVdencImgState_%s = {%d, %d, %d};' % (n, dw, lo, hi))
+        o.append('constexpr EncodeField k' + P + 'AvcVdencImgState_%s = {%d, %d, %d};' % (n, dw, lo, hi))
+    # --- With B pictures.
+    for t, tn in ((1, 'I'), (2, 'P'), (3, 'B')):
+        for big, sn in ((0, 'Small'), (1, 'Large')):
+            words = [w for qp in QPS for w in bruns[(t, qp, big)]['CMD3']]
+            o += ['', '// VDENC_CMD3 with B pictures, %s pictures, pictures %s (under 1920x1080 or not), 23 dwords per quantiser %d .. %d' % (tn, sn.lower(), QPS[0], QPS[-1]), emit_array('k' + P + 'AvcVdencCmd3WithB%s%s' % (tn, sn), words)]
+        img = bruns[(t, 26, 0)]['IMG']
+        assert all(bruns[(t, qp, big)]['IMG'][i] == img[i] for qp in QPS for big in (0, 1) for i in range(26) if i != 14), 'image state depends on more than the quantiser'
+        assert [blevel[l]['IMG'][8] for l in LEVELS] == [level_runs[l]['IMG'][8] for l in LEVELS]
+        o += ['', '// VDENC_AVC_IMG_STATE with B pictures, %s pictures (level 40, quantiser 26; dword 8 by level and dword 14 by quantiser are set by the encoder)' % tn, emit_array('k' + P + 'AvcVdencImgStateWithB%s' % tn, img)]
     open(out_path, 'w').write('\n'.join(o) + '\n')
 
 

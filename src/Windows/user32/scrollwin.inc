@@ -32,6 +32,7 @@ IMPORT int WINAPI CombineRgn(HANDLE dest, HANDLE a, HANDLE b, int mode);
 IMPORT int WINAPI GetRgnBox(HANDLE region, RECT_ *box);
 IMPORT BOOL WINAPI SetRectRgn(HANDLE region, int l, int t, int r, int b);
 EXPORT HANDLE WINAPI GetWindow(HANDLE hwnd, UINT relation);
+EXPORT HANDLE WINAPI GetAncestor(HANDLE hwnd, UINT type);
 EXPORT BOOL WINAPI ScreenToClient(HANDLE hwnd, POINT_ *p);
 EXPORT BOOL WINAPI ClientToScreen(HANDLE hwnd, POINT_ *p);
 EXPORT BOOL WINAPI GetWindowRect(HANDLE hwnd, RECT_ *rect);

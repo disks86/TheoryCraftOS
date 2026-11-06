@@ -58,6 +58,7 @@
 #define CW_USEDEFAULT_ ((int)0x80000000)
 
 typedef struct { HANDLE frame, active, window_menu, maximized, merged; UINT first_id; int count, cascade; HANDLE child[MDI_MAX]; RECT_ restore[MDI_MAX]; } MdiState;
+typedef struct { POINT_ reserved, max_size, max_pos, min_track, max_track; } MINMAXINFO_;
 typedef struct { const WCHAR *cls, *title; HANDLE owner; int x, y, cx, cy; DWORD style; LONG_PTR lparam; } MdiCreate_;
 typedef struct { HANDLE window_menu; UINT first_id; } MdiClientCreate_;
 
@@ -68,6 +69,7 @@ EXPORT BOOL WINAPI InsertMenuW(HANDLE menu, UINT pos, UINT flags, ULONG_PTR id, 
 EXPORT BOOL WINAPI RemoveMenu(HANDLE menu, UINT pos, UINT flags);
 EXPORT UINT WINAPI GetMenuState(HANDLE menu, UINT pos, UINT flags);
 EXPORT int WINAPI GetClassNameW(HANDLE hwnd, LPWSTR buffer, int count);
+EXPORT DWORD WINAPI GetClassInfoExW(HANDLE instance, const WCHAR *name, WNDCLASSEX_ *wc);
 EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value);
 
 static volatile LONG g_mdi_creating;
@@ -148,6 +150,12 @@ static HANDLE mdi_top_child(HANDLE client, MdiState *st, HANDLE skip) {
 }
 
 static void mdi_client_rect(HANDLE client, RECT_ *rc) { GetClientRect(client, rc); }
+/* where a maximized child goes: its client area is the client area of the MDI client, so its frame and caption lie outside */
+static void mdi_max_rect(HANDLE client, HANDLE child, RECT_ *rc) {
+  GetClientRect(client, rc);
+  AdjustWindowRectEx(rc, (DWORD)GetWindowLongW(child, -16), FALSE, (DWORD)GetWindowLongW(child, -20));
+}
+static void mdi_max_rect(HANDLE client, HANDLE child, RECT_ *rc);
 static void mdi_maximize(HANDLE client, MdiState *st, HANDLE child) {
   const int i = mdi_find(st, child);
   if (i < 0) return;
@@ -165,9 +173,9 @@ static void mdi_maximize(HANDLE client, MdiState *st, HANDLE child) {
     st->restore[i].left = p.x; st->restore[i].top = p.y; st->restore[i].right = p.x + (wr.right - wr.left); st->restore[i].bottom = p.y + (wr.bottom - wr.top);
   }
   RECT_ rc;
-  mdi_client_rect(client, &rc);
   SetWindowLongW(child, -16, GetWindowLongW(child, -16) | WS_MAXIMIZE_);
-  SetWindowPos(child, NULL, 0, 0, rc.right, rc.bottom, 0x4 | 0x10 /* NOZORDER | NOACTIVATE */);
+  mdi_max_rect(client, child, &rc);
+  SetWindowPos(child, NULL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, 0x4 | 0x10 /* NOZORDER | NOACTIVATE */);
   st->maximized = child;
   mdi_merge(client, st, child, TRUE);
 }
@@ -198,42 +206,53 @@ static void mdi_forget(HANDLE client, MdiState *st, HANDLE child) {
 }
 
 /* ---- arranging --------------------------------------------------------------------------------------------------------------------------------------------------------- */
+/* The windows TileWindows and CascadeWindows arrange, top of the z-order first: the given list or the children of `parent`; a window must be a visible child of the parent with a
+ * caption and frame (WS_CAPTION), not minimized, and not disabled when asked to skip those. */
 static int arrange_collect(HANDLE parent, HANDLE *out, int max, const HANDLE *given, int given_count, BOOL skip_disabled) {
   int n = 0;
-  if (given) { for (int i = 0; i < given_count && n < max; ++i) out[n++] = given[i]; return n; }
-  /* bottom of the z-order first */
-  HANDLE w = GetWindow(parent, 5);
-  if (w) w = GetWindow(w, 1 /* GW_HWNDLAST */);
-  for (; w && n < max; w = GetWindow(w, 3 /* GW_HWNDPREV */)) {
+  HANDLE w = given ? (given_count > 0 ? given[0] : NULL) : GetWindow(parent, 5 /* GW_CHILD */);
+  for (int k = 0; w && n < max;) {
     const DWORD style = (DWORD)GetWindowLongW(w, -16);
-    if (!(style & 0x10000000) || (style & WS_MINIMIZE_) || (skip_disabled && (style & 0x08000000))) continue;
-    out[n++] = w;
+    const BOOL eligible = IsWindow(w) && GetAncestor(w, 1 /* GA_PARENT */) == parent && (style & 0x10000000) && !(style & WS_MINIMIZE_) &&
+                          (style & 0x00C00000) == 0x00C00000 && !(skip_disabled && (style & 0x08000000));
+    if (eligible) out[n++] = w;
+    if (given) { ++k; w = k < given_count ? given[k] : NULL; } else w = GetWindow(w, 2 /* GW_HWNDNEXT */);
   }
   return n;
+}
+/* Puts the windows in the area: a cascade starts with the last (the bottom one) at the corner and steps by the caption and frame, going back to the edge where the next would stick out;
+ * a tile fills columns top to bottom, the first (topmost) window first. A window without a sizing frame is moved, not resized. */
+static void arrange_place(HANDLE w, int x, int y, int cx, int cy) {
+  const DWORD style = (DWORD)GetWindowLongW(w, -16);
+  if (style & WS_MAXIMIZE_) ShowWindow(w, 9 /* SW_RESTORE */);
+  if (style & 0x00040000 /* WS_THICKFRAME */) SetWindowPos(w, NULL, x, y, cx, cy, 0x4 | 0x10);
+  else SetWindowPos(w, NULL, x, y, 0, 0, 0x1 | 0x4 | 0x10);
 }
 static void arrange_windows(const RECT_ *area, HANDLE *list, int n, BOOL cascade, BOOL horizontal) {
   const int width = area->right - area->left, height = area->bottom - area->top;
   if (n <= 0) return;
   if (cascade) {
-    const int step = GetSystemMetrics(4 /* SM_CYCAPTION */) + GetSystemMetrics(33 /* SM_CYFRAME */);
-    int pos = 0;
-    for (int i = 0; i < n; ++i) {
-      int cw = width * 3 / 4, ch = height * 3 / 4;
-      if (pos + cw > width || pos + ch > height) pos = 0;
-      SetWindowPos(list[i], NULL, area->left + pos, area->top + pos, cw, ch, 0x4 | 0x10);
-      pos += step;
+    const int spacing = GetSystemMetrics(4 /* SM_CYCAPTION */) + GetSystemMetrics(8 /* SM_CYDLGFRAME */);
+    const int cw = width * 3 / 4, ch = height * 3 / 4;
+    int x = area->left, y = area->top;
+    for (int i = n - 1; i >= 0; --i) {
+      arrange_place(list[i], x, y, cw, ch);
+      x += spacing; y += spacing;
+      if (x + cw > area->right) x = area->left;
+      if (y + ch > area->bottom) y = area->top;
     }
     return;
   }
-  int cols = 1;
-  while (cols * cols < n) ++cols;
-  int rows = (n + cols - 1) / cols;
-  if (horizontal) { const int t = cols; cols = rows; rows = t; }      /* MDITILE_HORIZONTAL: one row of windows per line, more rows than columns */
-  if (cols * rows < n) rows = (n + cols - 1) / cols;
-  for (int i = 0; i < n; ++i) {
-    const int col = horizontal ? i / rows : i % cols, row = horizontal ? i % rows : i / cols;
-    const int x0 = width * col / cols, x1 = width * (col + 1) / cols, y0 = height * row / rows, y1 = height * (row + 1) / rows;
-    SetWindowPos(list[i], NULL, area->left + x0, area->top + y0, x1 - x0, y1 - y0, 0x4 | 0x10);
+  int a = 1;
+  while ((a + 1) * (a + 1) <= n) ++a;
+  const int b = n / a;
+  const int columns = horizontal ? a : b, base = horizontal ? b : a, extra = n - base * columns;
+  int next = 0;
+  for (int c = 0; c < columns && next < n; ++c) {
+    const int rows = base + (c >= columns - extra ? 1 : 0);
+    int w = width / columns;
+    if (w < GetSystemMetrics(28 /* SM_CXMIN */)) w = GetSystemMetrics(28);
+    for (int r = 0; r < rows && next < n; ++r) arrange_place(list[next++], area->left + c * (width / columns), area->top + r * (height / rows), w, height / rows);
   }
 }
 EXPORT WORD WINAPI TileWindows(HANDLE parent, UINT how, const RECT_ *rect, UINT count, const HANDLE *kids) {
@@ -274,9 +293,13 @@ EXPORT UINT WINAPI ArrangeIconicWindows(HANDLE parent) {
 /* ---- the client -------------------------------------------------------------------------------------------------------------------------------------------------------- */
 static HANDLE mdi_create_child(HANDLE client, MdiState *st, const MdiCreate_ *mcs) {
   if (st->count >= MDI_MAX) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
-  DWORD style = mcs->style & (WS_MINIMIZE_ | WS_MAXIMIZE_ | 0x00200000 | 0x00100000 | 0x08000000);
-  if (GetWindowLongW(client, -16) & 1 /* MDIS_ALLCHILDSTYLES */) style = mcs->style;
-  style |= 0x40000000 | 0x04000000 | 0x02000000 | 0x00080000 | 0x00C00000 | 0x00040000 | 0x10000000 | 0x00020000 | 0x00010000;      /* child, clip siblings and children, sysmenu, caption, thickframe, visible, min/max boxes */
+  DWORD style;
+  if (GetWindowLongW(client, -16) & 1 /* MDIS_ALLCHILDSTYLES */) {      /* the program's styles, as a clipped child (a popup is refused) */
+    if (mcs->style & 0x80000000u) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    style = mcs->style | 0x40000000 | 0x04000000;
+  } else {      /* the program's styles without WS_POPUP, plus those of a document window */
+    style = (mcs->style & ~0x80000000u) | 0x40000000 | 0x10000000 | 0x04000000 | 0x00C00000 | 0x00080000 | 0x00040000 | 0x00020000 | 0x00010000;
+  }
   RECT_ rc;
   mdi_client_rect(client, &rc);
   int x = mcs->x, y = mcs->y, cx = mcs->cx, cy = mcs->cy;
@@ -284,11 +307,23 @@ static HANDLE mdi_create_child(HANDLE client, MdiState *st, const MdiCreate_ *mc
   if (x == CW_USEDEFAULT_ || y == CW_USEDEFAULT_) { x = y = (st->cascade % 8) * step; ++st->cascade; }
   if (cx == CW_USEDEFAULT_) cx = (rc.right * 3) / 4;
   if (cy == CW_USEDEFAULT_) cy = (rc.bottom * 3) / 4;
-  HANDLE params = g_mdi_params ? g_mdi_params : (void *)mcs;
+  /* The child's creation parameter is the structure in the character set of its class: a program that gave the other one has its structure converted (WM_MDICREATE from an A caller to a
+   * W class is the W structure that was made for it; a W caller to an A class gets an A copy). */
+  WNDCLASSEX_ wc;
+  for (size_t_ i = 0; i < sizeof wc; ++i) ((BYTE *)&wc)[i] = 0;
+  wc.cbSize = sizeof wc;
+  const BOOL class_is_a = GetClassInfoExW(mcs->owner ? mcs->owner : GetModuleHandleW(NULL), mcs->cls, &wc) && thunk_slot(wc.lpfnWndProc) >= 0;
+  MdiCreate_ narrow = *mcs;
+  char *cls_a = NULL, *title_a = NULL;
+  void *params = (void *)mcs;
+  if (g_mdi_params && !class_is_a) params = (void *)mcs;      /* A caller, W class: the W structure */
+  else if (g_mdi_params) params = g_mdi_params;      /* A caller, A class: its own structure */
+  else if (class_is_a) { cls_a = narrow_of(mcs->cls); title_a = narrow_of(mcs->title); narrow.cls = (const WCHAR *)cls_a; narrow.title = (const WCHAR *)title_a; params = &narrow; }      /* W caller, A class */
   g_mdi_params = NULL;
   g_mdi_creating = 1;
   HANDLE child = CreateWindowExW(WS_EX_MDICHILD_, mcs->cls, mcs->title, style, x, y, cx, cy, client, NULL, mcs->owner, params);
   g_mdi_creating = 0;
+  narrow_free(cls_a, mcs->cls); narrow_free(title_a, mcs->title);
   if (!child) return NULL;
   SetWindowLongPtrW(child, -12 /* GWLP_ID */, (LONG_PTR)(st->first_id + (UINT)st->count));
   st->child[st->count] = child;
@@ -402,6 +437,13 @@ static LONG_PTR child_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wparam, 
   (void)ctx;
   HANDLE client = mdi_client_of(hwnd);
   MdiState *st = (client && IsWindow(client)) ? mdi_state(client) : NULL;
+  if (message == 0x24 /* WM_GETMINMAXINFO */ && st && lparam) {      /* (asked while the child is being made, before it is in the list) */
+    RECT_ rc;
+    MINMAXINFO_ *mm = (MINMAXINFO_ *)lparam;
+    mdi_max_rect(client, hwnd, &rc);
+    mm->max_size.x = rc.right - rc.left; mm->max_size.y = rc.bottom - rc.top; mm->max_pos.x = rc.left; mm->max_pos.y = rc.top;
+    return 0;
+  }
   if (st && mdi_find(st, hwnd) >= 0) {
     switch (message) {
       case WM_CHILDACTIVATE_: case 0x21 /* WM_MOUSEACTIVATE */: case WM_SETFOCUS_:

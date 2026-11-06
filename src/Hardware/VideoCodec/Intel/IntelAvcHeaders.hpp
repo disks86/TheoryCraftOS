@@ -31,6 +31,9 @@ struct AvcStreamHeaders {
   uint32_t level_idc = 40;
   uint32_t log2_max_frame_num = 8;            // 4 .. 16
   int32_t chroma_qp_offset = 0;
+  // B pictures: Main profile, pic_order_cnt_type 0 (so pictures can be coded out of display order), two reference frames and a reorder depth of one picture.
+  bool b_pictures = false;
+  uint32_t log2_max_poc_lsb = 8;              // 4 .. 16 (with B pictures)
 };
 
 // The sequence parameter set and the picture parameter set, with emulation prevention bytes, appended to `out`. Each returns the bits it added, start code included
@@ -43,6 +46,8 @@ bool write_avc_pps(const AvcStreamHeaders& s, ByteBuffer* out, uint32_t* bits);
 struct AvcSliceHeader {
   bool idr = false;
   bool p_slice = false;
+  bool b_slice = false;                       // a B slice (not a reference picture: nal_ref_idc 0, no reference marking)
+  uint32_t poc_lsb = 0;                       // pic_order_cnt_lsb (with AvcStreamHeaders::b_pictures)
   uint32_t frame_num = 0;
   uint32_t idr_pic_id = 0;
   int32_t qp = 26;

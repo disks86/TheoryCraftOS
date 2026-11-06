@@ -173,6 +173,7 @@ struct Window {
   uint32_t dc_cache_count = 0;
   Window* last_active_popup = nullptr;
   uint32_t creating_stage = 0;   // nonzero while WM_NCCREATE/WM_CREATE run
+  uint32_t cs_style = 0, cs_ex_style = 0;    // what CreateWindowEx was given (the CREATESTRUCT of WM_NCCREATE and WM_CREATE), the extended style with WS_EX_WINDOWEDGE decided
   uint32_t destroy_stage = 0;    // 1: WM_DESTROY sent, 2: WM_NCDESTROY sent
 };
 
@@ -539,6 +540,7 @@ void destroy_window_now(Window* w);
 struct SwpArgs { Window* w = nullptr; uint32_t after = 0; int32_t x = 0, y = 0, cx = 0, cy = 0; uint32_t flags = 0; };
 uint64_t set_window_pos_op(Call& call, const SwpArgs& args, uint64_t final_result);
 void apply_zorder(Window* w, uint32_t after);
+Rect window_maximized_rect(Window* w);                   // where a maximized window goes
 void compute_nc(Window* w, Rect* client_out);       // the default client rectangle for the window rectangle `w->bounds` (AdjustWindowRect's inverse)
 uint64_t show_window_op(Call& call, Window* w, uint32_t cmd, bool async_ignored);
 void activate_window_internal(Call& call, Window* w, bool notify);
