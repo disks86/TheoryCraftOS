@@ -203,11 +203,60 @@ interfaces `src/Network/NetworkStackSet` has (set as the system's sockets at boo
 is the same kernel `HANDLE` a program's other descriptors are (`DescriptorKind::Socket`), closed and duplicated/inherited exactly like a pipe handle. `WSAStartup`/
 `WSACleanup`, `socket`, `bind`, `connect` (blocking retries the handshake itself; non-blocking returns `WSAEWOULDBLOCK` until `select()`'s except/write sets or
 `getpeername` show how it resolved), `listen`, `accept`, `send`/`recv`, `sendto`/`recvfrom`, `shutdown`, `ioctlsocket` (`FIONBIO`, `FIONREAD`), `select` (up to 64 sockets
-per set), `getsockname`/`getpeername`, `closesocket`, `WSAGetLastError`/`WSASetLastError`, `htons`/`htonl`/`ntohs`/`ntohl`, `inet_addr`/`inet_ntoa` all work. A failing NT
+per set), `getsockname`/`getpeername`, `closesocket`, `WSAGetLastError`/`WSASetLastError`, `htons`/`htonl`/`ntohs`/`ntohl`, `inet_addr`/`inet_ntoa` (a buffer per thread) all work. A failing NT
 status is mapped to its own WSA error (`WSAECONNREFUSED`, `WSAEWOULDBLOCK` and so on), not a plain Win32 one - `WSAGetLastError` still reads the same per-thread slot as
-`GetLastError`, matching the real one. Not done: IPv6, `getaddrinfo`/`gethostbyname` (no DNS from a Windows program yet, though the kernel's own network stack resolves
-names for itself), `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O, `SO_RCVTIMEO`/`SO_SNDTIMEO` and other `setsockopt` options, multicast, raw sockets, and a
-loopback interface (a program's own address is whichever one network interface it is bound to; nothing short-circuits traffic addressed back to that same address).
+`GetLastError`, matching the real one.
+
+Addresses: a program's `in_addr` has the first octet first in memory (as on Windows: `htonl(INADDR_LOOPBACK)`, `inet_pton` and a byte copy all give it); the socket services
+take and give an IPv4 address as one integer with the first octet in the top byte (`network::Ipv4Address::value()`), so ws2_32 swaps it at the boundary (`kernel_address` /
+`program_address`). Until November 2026 ws2_32 passed the integer through and its own `inet_addr` produced the reversed form, so only addresses made by `inet_addr` worked:
+`htonl(INADDR_LOOPBACK)` reached 1.0.0.127. `inet_pton`/`inet_ntop`/`InetPtonW`/`InetNtopW` (IPv4 with Windows' strict rules, IPv6 with `::` and a dotted tail), `gethostname`
+and name resolution without DNS: `getaddrinfo`/`GetAddrInfoW`/`freeaddrinfo`/`FreeAddrInfoW` answer numeric addresses (an IPv6 literal as an `AF_INET6` entry), a NULL node
+(the wildcard with `AI_PASSIVE`, else the loopback), `localhost` and the machine's own name (its interface address), with numeric or well-known services; any other name is
+`WSAHOST_NOT_FOUND`. `getnameinfo`/`GetNameInfoW` give numeric text (`localhost` for 127/8). The name-space lookups (`WSALookupService*`) find nothing. Tests:
+`scripts/winetest.sh ws2_32 tcos_resolve protocol` (`tests/windows/wine/ws2_32/tcos_resolve.c`, 63 checks, 0 failures; Wine's protocol test 1287 failures, most in
+`WSAEnumProtocols`, `WSAStringToAddress`/`WSAAddressToString`, the legacy `inet_addr` forms and `getservbyname`, then a crash at a table it reads without checking).
+
+Not done: IPv6 sockets, DNS for Windows programs (the kernel's own network stack resolves names for itself), `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O,
+`SO_RCVTIMEO`/`SO_SNDTIMEO` and other `setsockopt` options (accepted, not applied), multicast, raw sockets, the legacy `inet_addr` forms (hex, octal, fewer than four parts),
+and a loopback interface (a program's own address is whichever one network interface it is bound to; nothing short-circuits traffic addressed back to that same address, so a
+connection to 127.0.0.1 does not reach a listener in the same machine: Godot's game-to-editor debugger link needs this).
+
+## Game input, timers and the adapter list (user32, winmm, xinput, dinput8, avrt, iphlpapi)
+
+What a game engine (Godot, SDL) touches at start-up. Before November 2026 these were stubs answering 0, which for most of them means success with nothing written: Godot's
+joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "succeeded" with, every program saw four XInput gamepads, `timeGetDevCaps` left the caps unset,
+`GetAdaptersAddresses` left the list unset (the Godot editor walks it at start-up), `MapVirtualKey` gave 0 for every key (Godot's key codes come from it), and
+`WSALookupServiceNext` "succeeded" forever.
+
+- **user32 keyboard** (`src/Windows/user32/keyboard.inc`): `GetKeyboardLayout(List|Name)`, `Load`/`Unload`/`ActivateKeyboardLayout`, `MapVirtualKey(Ex)A/W`, `VkKeyScan(Ex)A/W`,
+  `OemKeyScan`, `ToUnicode(Ex)`, `ToAscii(Ex)`, `GetKeyNameTextA/W`, `GetKeyboardType`, over win32k's US layout (`Win32kUserMiscKeyboard.cpp`); also `Get`/`SetDoubleClickTime`,
+  `SwapMouseButton`, `MessageBeep`.
+- **user32 DPI and display configuration** (`display.inc`): the awareness contexts with Windows' rules (`IsValid`, `GetAwarenessFrom`, `GetDpiFrom`, `AreDpiAwarenessContextsEqual`,
+  `Set`/`GetThreadDpiAwarenessContext` with the "process's" mark that makes a thread follow the process again, `SetProcessDpiAwarenessContext`, `SetProcessDPIAware`,
+  `IsProcessDPIAware`, `Get`/`SetProcessDpiAwarenessInternal`), `GetDpiForWindow`/`GetDpiForSystem`/`GetSystemDpiForProcess`, `GetSystemMetricsForDpi`, the
+  logical/physical point functions (one monitor: the same point, refused outside the window), `GetDisplayConfigBufferSizes`, `QueryDisplayConfig`,
+  `DisplayConfigGetDeviceInfo` (source, target, preferred mode, adapter name, advanced colour: none), `ChangeDisplaySettings(Ex)W`.
+- **winmm** (`src/Windows/winmm/winmm.c`): `timeGetTime`, `timeGetSystemTime`, `timeGetDevCaps` (1 .. 65535 ms), `timeBegin`/`EndPeriod`, `timeSetEvent`/`timeKillEvent` over kernel32's
+  timer queues (16 events, ids not reused at once, one-shot events gone once fired, one callback of an event at a time, time-critical priority, `TIME_KILL_SYNCHRONOUS`); 16 empty joystick slots
+  (`JOYERR_PARMS`/`JOYERR_UNPLUGGED`); no wave, MIDI or mixer device (the open functions clear the handle and answer `MMSYSERR_BADDEVICEID`/`MMSYSERR_NODRIVER`).
+- **xinput1_4** (`src/Windows/xinput1_4`): no controller (`ERROR_DEVICE_NOT_CONNECTED` for slots 0-3, `ERROR_BAD_ARGUMENTS` otherwise), with the ordinal-only exports @100-104
+  and @108; every other name of the library (`xinput1_3`, `xinput9_1_0`, `xinputuap`) loads this one (`canonical_library_name`).
+- **dinput8** (`src/Windows/dinput8`): `DirectInput8Create` hands out a real `IDirectInput8A/W` with no devices (`EnumDevices` calls nothing back, `CreateDevice` is
+  `DIERR_DEVICENOTREG`); `CoCreateInstance(CLSID_DirectInput8)` reaches its class factory (ole32 knows the class). Not done: the system keyboard and mouse devices, action mapping.
+- **avrt** (`src/Windows/avrt`): MMCSS registration for the standard task names (a time-critical thread priority until reverted; handles checked against a table).
+- **iphlpapi** (`src/Windows/iphlpapi`): the loopback adapter (index 1) and one Ethernet adapter per kernel interface, whose IPv4 configuration comes from `NtSocketControl`
+  operation 5 (new): `GetAdaptersAddresses` (Windows' layout; the size does not depend on the flags), `GetAdaptersInfo`, `GetIfTable`, `GetIfEntry(2)`, `GetIpAddrTable`,
+  `GetAdapterIndex`, `GetBestInterface`, `GetNumberOfInterfaces` and the LUID/GUID/index conversions; the routing, neighbour and connection tables answer
+  `ERROR_NOT_SUPPORTED`. No MAC address (the kernel does not report it), no IPv6.
+- **Not done**: raw input (win32k keeps registrations and records, but nothing makes WM_INPUT records yet, so `RegisterRawInputDevices` stays a stub that fails: wiring it
+  would switch Godot's captured mouse to WM_INPUT and stop its motion), `TrackMouseEvent`/`WM_MOUSELEAVE` (no win32k service), WASAPI (`CoCreateInstance` of the device
+  enumerator fails: Godot falls back to its dummy audio driver), DirectSound.
+- **Tests**: `scripts/winetest.sh user32 tcos_input` (`tests/windows/wine/user32/tcos_input.c`) and `scripts/winetest.sh winmm tcos_gameinput`
+  (`tests/windows/wine/winmm/tcos_gameinput.c`: winmm, xinput by all three names, dinput8, avrt, iphlpapi), both 0 failures; Wine's winmm `timer` and `joystick` 0 failures
+  (were 33 and 1), user32 `sysparams` about 550 (was 1595), `input` about 1700 (was 1967; the count varies with timing, and the raw-input part has hung once), `monitor`
+  about 170 (it ran into a division by zero at 59 before and now reaches the display-configuration tests); host tests `WindowsSocketTest` (operation 5), `ModuleLoaderTest`
+  (XInput names), `Win32kMiscTest` (display configuration and thread DPI contexts).
 
 ## Directory change notifications
 
