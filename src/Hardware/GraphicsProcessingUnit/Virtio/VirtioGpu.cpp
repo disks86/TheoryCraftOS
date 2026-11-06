@@ -109,6 +109,7 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
 kernel::Frame* VirtioGpu::on_interrupt(kernel::Frame* frame, void* self) {
   VirtioGpu* gpu = static_cast<VirtioGpu*>(self);
   kernel::apic::eoi();
+  __atomic_store_n(&gpu->last_interrupt_core_, kernel::current_core(), __ATOMIC_RELEASE);
   __atomic_fetch_add(&gpu->interrupt_count_, 1, __ATOMIC_ACQ_REL);
   gpu->completion_.set();
   return frame;
@@ -139,6 +140,13 @@ bool VirtioGpu::enable_interrupts() {
   }
   interrupts_ = true;
   kernel::set_io_device_retarget(io_device_, &VirtioGpu::retarget_interrupt, this);   // (the scheduler may move it to where its waiters run)
+  return true;
+}
+
+bool VirtioGpu::move_interrupt(uint32_t core) {
+  if (!interrupts_) return false;
+  if (!retarget_interrupt(this, core, kernel::core_hardware_id(core))) return false;
+  kernel::set_io_device_core(io_device_, static_cast<int32_t>(core));
   return true;
 }
 

@@ -59,6 +59,11 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   bool interrupts_enabled() const { return interrupts_; }
   // Interrupts taken so far (for tests and the boot log).
   uint32_t interrupt_count() const { return __atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE); }
+  // The core the last command completion interrupted.
+  uint32_t last_interrupt_core() const { return __atomic_load_n(&last_interrupt_core_, __ATOMIC_ACQUIRE); }
+  // Sends the completion interrupt to `core` from now on (its MSI-X entry rewritten, as the scheduler's steering does) and tells the
+  // scheduler. False without interrupts or for a core that is not online.
+  bool move_interrupt(uint32_t core);
 
   uint32_t mode_count() const override;
   bool mode_info(uint32_t index, DisplayMode* out) const override;
@@ -141,6 +146,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   bool interrupts_ = false;
   int32_t io_device_ = -1;           // kernel::register_io_device: what the threads waiting for completion_ follow
   uint32_t interrupt_count_ = 0;
+  uint32_t last_interrupt_core_ = 0;
   void drop_interrupt_handler();
   static bool retarget_interrupt(void* self, uint32_t core, uint64_t hardware_id);
   static kernel::Frame* on_interrupt(kernel::Frame* frame, void* self);

@@ -727,8 +727,36 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
     // The virtio-gpu's commands finish with an interrupt now (the host takes milliseconds for some; a thread waiting for one need not look again and again).
     if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) {
-      if (virtio->enable_interrupts()) Entry(Level::Ok, "GPU").text("virtio-gpu commands complete by interrupt (MSI-X)");
-      else Entry(Level::Info, "GPU").text("virtio-gpu has no usable interrupt; waiting for commands by polling");
+      if (virtio->enable_interrupts()) {
+        Entry(Level::Ok, "GPU").text("virtio-gpu commands complete by interrupt (MSI-X)");
+#ifdef TCOS_SELFTESTS
+        // Moving the interrupt by rewriting its MSI-X entry (what the scheduler's steering does): the next completion arrives on the other core,
+        // then back here.
+        if (kernel::core_count() > 1) {
+          const uint32_t home = kernel::current_core(), other = kernel::choose_io_interrupt_core();
+          uint32_t arrived[2] = {}, landed[2] = {};
+          auto completes_on = [&](uint32_t core, uint32_t step) {
+            const uint32_t before = virtio->interrupt_count();
+            virtio->refresh_connectors();
+            // Under KVM the command is often seen done (the driver looks before it sleeps) before the interrupt reaches the other core, which was
+            // halted: wait for it rather than call it lost.
+            for (uint32_t waited = 0; virtio->interrupt_count() == before && waited < 100; ++waited) kernel::sleep_ms(1);
+            arrived[step] = virtio->interrupt_count() - before;
+            landed[step] = virtio->last_interrupt_core();
+            return arrived[step] != 0 && landed[step] == core;
+          };
+          const bool moved_away = other != home && virtio->move_interrupt(other);
+          const bool away = moved_away && completes_on(other, 0);
+          const bool moved_back = virtio->move_interrupt(home);
+          const bool back = moved_back && completes_on(home, 1);
+          Entry e(away && back ? Level::Ok : Level::Fault, "GPU");
+          e.text("virtio-gpu interrupt moved to core ").dec(other).text(" and back by its MSI-X entry: ").text(away && back ? "ok" : "FAILED");
+          if (!(away && back)) e.text(" (moved ").dec(moved_away).dec(moved_back).text(", interrupts ").dec(arrived[0]).text("/").dec(arrived[1]).text(" on cores ").dec(landed[0]).text("/").dec(landed[1]).text(")");
+        }
+#endif
+      } else {
+        Entry(Level::Info, "GPU").text("virtio-gpu has no usable interrupt; waiting for commands by polling");
+      }
     }
     // The JIT's code memory, checked once the cores run: compile a small program, switch its pages to executable through the page tables, run it.
     if (paging_ok) {
