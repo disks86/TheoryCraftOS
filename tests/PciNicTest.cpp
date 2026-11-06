@@ -12,6 +12,8 @@
 #include "Hardware/NetworkInterface/Intel/E1000eNetworkInterface.hpp"
 #include "Hardware/NetworkInterface/Intel/IgbNetworkInterface.hpp"
 #include "Hardware/NetworkInterface/Realtek/Rtl8169NetworkInterface.hpp"
+#include "Hardware/NetworkInterface/InterruptModeration.hpp"
+#include "TsoReference.hpp"
 
 namespace hardware {
 void delay_us(uint64_t) {}
@@ -124,6 +126,11 @@ struct ModelDevice : INicDevice, INicRegisters {
   void* handler_context = nullptr;
   bool attach_refused = false, msi_lost = false;
   int attaches = 0, detaches = 0, raised = 0;
+  // MSI-X: the handler of every entry, and how many entries the "table" has (0: no MSI-X capability).
+  QueueInterruptHandler queue_handler = nullptr;
+  void* queue_context = nullptr;
+  uint32_t msix_entries = 0, msix_attached = 0;
+  std::vector<int> vector_raised = std::vector<int>(8, 0);
   ModelDevice(size_t size, uint16_t v, uint16_t d) : file(size, 0), vendor(v), device(d) {}
 
   bool claim() override { ++claims; return !claim_fails; }
@@ -140,9 +147,25 @@ struct ModelDevice : INicDevice, INicRegisters {
     handler_context = context;
     return true;
   }
+  uint32_t attach_interrupts(uint32_t count, QueueInterruptHandler h, void* context) override {
+    if (attach_refused || count > msix_entries || handler || queue_handler) return 0;
+    ++attaches;
+    queue_handler = h;
+    queue_context = context;
+    msix_attached = count;
+    return count;
+  }
   void detach_interrupt() override {
-    if (handler) ++detaches;
+    if (handler || queue_handler) ++detaches;
     handler = nullptr;
+    queue_handler = nullptr;
+    msix_attached = 0;
+  }
+  void raise_vector(uint32_t v) {
+    if (!queue_handler || msi_lost || v >= msix_attached) return;
+    ++raised;
+    ++vector_raised[v];
+    queue_handler(queue_context, v);
   }
   void raise() {
     if (!handler || msi_lost) return;
@@ -202,6 +225,12 @@ struct RtlChipModel final : ModelDevice {
   void on_write(uint32_t off, int width, uint32_t v) override {
     if (off == status_reg() && width == status_width()) {  // write 1 to clear
       set_raw(off, width, raw(off, width) & ~v);
+      return;
+    }
+    if (off == mask_reg() && width == status_width()) {  // opening the mask over pending status interrupts at once
+      const uint32_t was = raw(off, width);
+      set_raw(off, width, v);
+      if ((raw(status_reg(), status_width()) & v & ~was)) raise();
       return;
     }
     if (!new_layout && off == 0x38 && width == 1 && (v & 0x01)) {  // forced software interrupt
@@ -447,11 +476,51 @@ struct IntelModel : ModelDevice {
     w32(kRah, nvm_mac[4] | (nvm_mac[5] << 8) | (1u << 31));
   }
   virtual void on_reset() {}
+  // What leaves the controller: short frames padded (TCTL.PSP) - after any checksum. A checksummed frame must come unpadded: a controller
+  // that works the TCP/UDP length out from the frame (QEMU's) would count the padding.
+  void emit(Bytes frame, bool checksummed) {
+    if (checksummed && frame.size() >= 34 && frame[12] == 0x08 && frame.size() != 14u + ((frame[16] << 8) | frame[17])) {
+      printf("model: a checksummed frame padded before the controller\n");
+      ++g_failed;
+    }
+    if (frame.size() < 60 && (r32(kTctl) & (1u << 3))) frame.resize(60, 0);
+    sent.push_back(frame);
+  }
   // ICR collects causes, IMS (set through IMS, cleared through IMC) says which interrupt; reading ICR clears it.
   uint32_t ims = 0;
+  // MSI-X mode (GPIE.MSIX_MODE): causes go to EICR bits (a queue's through IVAR, the others through IVAR_MISC), EIMS enables them, EIAC
+  // clears and EIAM masks a bit when its interrupt goes out.
+  uint32_t eims = 0, eicr = 0;
+  bool msix_mode() const { return r32(0x1514) & (1u << 4); }
+  bool ivar_82576 = true;  // the IVAR layout: a byte per queue (82576) or two queues per register (82580 and later)
+  int rx_vector(uint32_t q) const {
+    const uint32_t index = ivar_82576 ? (q & 7) : (q >> 1), shift = ivar_82576 ? ((q & 8) << 1) : ((q & 1) << 4);
+    const uint32_t entry = (r32(0x1700 + 4 * index) >> shift) & 0xFF;
+    return (entry & 0x80) ? static_cast<int>(entry & 0x1F) : -1;
+  }
+  void fire_vector(uint32_t v) {
+    eicr |= 1u << v;
+    if (!(eims & (1u << v))) return;
+    if (r32(0x152C) & (1u << v)) eicr &= ~(1u << v);
+    if ((r32(0x1530) & (1u << v)) && (r32(0x1514) & (1u << 30))) eims &= ~(1u << v);
+    raise_vector(v);
+  }
   void signal(uint32_t causes) {
     w32(0xC0, r32(0xC0) | causes);
+    if (msix_mode()) {
+      const uint32_t misc = (r32(0x1740) >> 8) & 0xFF;
+      if ((causes & ims & ~(1u << 7)) && (misc & 0x80)) fire_vector(misc & 0x1F);
+      return;
+    }
     if (r32(0xC0) & ims) raise();
+  }
+  void signal_queue(uint32_t q) {
+    if (msix_mode()) {
+      const int v = rx_vector(q);
+      if (v >= 0) fire_vector(static_cast<uint32_t>(v));
+      return;
+    }
+    signal(1u << 7);  // RXT0
   }
   uint32_t on_read(uint32_t off, int width) override {
     if (off == 0xC0) {
@@ -463,9 +532,27 @@ struct IntelModel : ModelDevice {
   }
   void on_write(uint32_t off, int width, uint32_t v) override {
     if (width != 4) { printf("model: %d-byte access to Intel register %#x\n", width, off); abort(); }
-    if (off == 0xD0) { ims |= v; w32(0xD0, ims); return; }
+    if (off == 0xD0) {  // IMS: unmasking a pending cause interrupts at once
+      const uint32_t was = ims;
+      ims |= v;
+      w32(0xD0, ims);
+      if (!msix_mode() && (r32(0xC0) & ims & ~was)) raise();
+      return;
+    }
     if (off == 0xD8) { ims &= ~v; w32(0xD0, ims); return; }
     if (off == 0xC8) { signal(v); return; }
+    if (off == 0x1524) {  // EIMS: the same for the extended causes
+      const uint32_t was = eims;
+      eims |= v;
+      for (uint32_t b = 0; b < 32; ++b)
+        if ((eicr & eims & ~was) & (1u << b)) { eicr &= ~(1u << b); fire_vector(b); }
+      return;
+    }
+    if (off == 0x1528) { eims &= ~v; return; }
+    if (off == 0x1520) {  // EICS
+      for (uint32_t b = 0; b < 32; ++b) if (v & (1u << b)) fire_vector(b);
+      return;
+    }
     if (off == kCtrl) {
       const uint32_t old = r32(kCtrl);
       if ((old & (1u << 16)) && !(v & (1u << 16)) && !(old & (1u << 17))) {  // LANPHYPC override released while the value was low: PHY power cycle
@@ -475,8 +562,9 @@ struct IntelModel : ModelDevice {
       }
       if (v & reset_bit) {
         ++resets;
-        ims = 0;
+        ims = eims = eicr = 0;
         w32(0xD0, 0);
+        w32(0x1514, 0);
         w32(kCtrl, v & ~reset_bit & ~(1u << 2));
         w32(kRal, 0);
         w32(kRah, 0);
@@ -513,9 +601,17 @@ struct IntelModel : ModelDevice {
 struct E1000eChip final : IntelModel {
   uint32_t rx_head = 0, tx_head = 0;
   int dropped = 0;
-  int checksummed = 0;
-  bool have_context = false;
-  uint32_t context_start = 0, context_field = 0;
+  int checksummed = 0, segmentations = 0;
+  bool have_context = false, context_tse = false;
+  uint32_t context_start = 0, context_field = 0, context_mss = 0, context_header = 0, context_payload = 0;
+  Bytes chain;  // the pieces of the frame being sent
+  // TSE as the 82574 does it (headers prepared by the driver: IP length and checksum zero, the seed without the length)
+  void segment_chain(uint32_t mss, uint32_t header, uint32_t payload) {
+    ++segmentations;
+    if (chain.size() < 54 || chain[16] != 0 || chain[17] != 0 || chain[24] != 0 || chain[25] != 0) { printf("model: TSO headers not prepared\n"); ++g_failed; }
+    if (header + payload != chain.size()) { printf("model: TSO lengths disagree (%u + %u != %zu)\n", header, payload, chain.size()); ++g_failed; }
+    for (auto& f : reference_segment(chain.data(), chain.size(), static_cast<uint16_t>(mss), true)) emit(f, false);
+  }
   E1000eChip(uint16_t device_id, bool is_chipset) : IntelModel(device_id) {
     chipset = is_chipset;
     phy_address = is_chipset && device_id != 0x10BD ? 2 : 1;
@@ -530,20 +626,35 @@ struct E1000eChip final : IntelModel {
         const uint64_t d = ring(0x3800) + 16ull * tx_head;
         const uint16_t len = get16(d + 8);
         const uint8_t cmd = at(d + 11)[0], type = at(d + 10)[0] >> 4;
-        if (cmd & 4) { printf("model: legacy checksum insertion (QEMU ignores it)\n"); ++g_failed; }
-        if ((cmd & 0x20) && type == 0) {  // a TCP/IP context descriptor: TUCSS, TUCSO; not written back
+        if (!(cmd & 0x20) && (cmd & 4)) { printf("model: legacy checksum insertion (QEMU ignores it)\n"); ++g_failed; }
+        if ((cmd & 0x20) && type == 0) {  // a TCP/IP context descriptor: TUCSS, TUCSO (and for TSE PAYLEN, HDRLEN, MSS); not written back
           context_start = at(d + 4)[0];
           context_field = at(d + 5)[0];
+          context_tse = cmd & 0x04;
+          context_mss = get16(d + 14);
+          context_header = at(d + 13)[0];
+          context_payload = get16(d + 8) | (static_cast<uint32_t>(at(d + 10)[0] & 0x0F) << 16);
           have_context = true;
           tx_head = (tx_head + 1) % n;
           continue;
         }
-        if ((cmd & 0x20) && type == 1 && (at(d + 13)[0] & 2)) {  // an extended data descriptor with TXSM
-          if (!have_context) { printf("model: TXSM without a context\n"); ++g_failed; }
-          else hardware_checksum(at(get64(d)), len, context_start, context_field);
-          ++checksummed;
+        chain.insert(chain.end(), at(get64(d)), at(get64(d)) + len);
+        const bool extended = (cmd & 0x20) && type == 1;
+        if (cmd & 1) {  // EOP: the frame (or segment) is complete
+          if (extended && (cmd & 0x04)) {  // TSE: cut it up
+            if (!have_context || !context_tse) { printf("model: TSE without a segmentation context\n"); ++g_failed; }
+            else segment_chain(context_mss, context_header, context_payload);
+          } else {
+            const bool txsm = extended && (at(d + 13)[0] & 2);
+            if (txsm) {
+              if (!have_context) { printf("model: TXSM without a context\n"); ++g_failed; }
+              else hardware_checksum(chain.data(), static_cast<uint32_t>(chain.size()), context_start, context_field);
+              ++checksummed;
+            }
+            emit(chain, txsm);
+          }
+          chain.clear();
         }
-        if (cmd & 1) sent.emplace_back(at(get64(d)), at(get64(d)) + len);
         at(d + 12)[0] |= 1;  // DD
         tx_head = (tx_head + 1) % n;
       }
@@ -561,23 +672,45 @@ struct E1000eChip final : IntelModel {
     at(d + 13)[0] = errors;
     rx_head = (rx_head + 1) % n;
     w32(0x2810, rx_head);
-    signal(1u << 7);  // RXT0
+    signal_queue(0);
     return true;
   }
 };
 
+// The Toeplitz hash of RSS over `input`, with a 40-byte key (Microsoft's RSS specification).
+static uint32_t toeplitz(const uint8_t* key, const uint8_t* input, size_t length) {
+  uint32_t result = 0, window = (uint32_t(key[0]) << 24) | (key[1] << 16) | (key[2] << 8) | key[3];
+  for (size_t i = 0; i < length; ++i)
+    for (int bit = 7; bit >= 0; --bit) {
+      if (input[i] & (1u << bit)) result ^= window;
+      const size_t next = i * 8 + (7 - bit) + 32;  // the key bit that comes into the window
+      window = (window << 1) | ((next / 8 < 40) ? ((key[next / 8] >> (7 - next % 8)) & 1) : 0);
+    }
+  return result;
+}
+
 struct IgbChip final : IntelModel {
-  uint32_t rx_head = 0, tx_head = 0;
+  uint32_t rx_head[4] = {}, tx_head = 0;
   int dropped = 0;
   bool bad_tx_descriptor = false;
   bool have_context = false, context_tcp = false;
-  uint32_t context_start = 0;
-  int checksummed = 0;
+  uint32_t context_start = 0, context_mss = 0, context_l4 = 0;
+  int checksummed = 0, segmentations = 0;
+  uint32_t last_hash = 0;
+  Bytes chain;
   IgbChip(uint16_t device_id, bool igc) : IntelModel(device_id) {
     if (igc) reset_bit = 1u << 29;
+    ivar_82576 = device_id == 0x10C9 || device_id == 0x10E6 || device_id == 0x10E7 || device_id == 0x10E8 || device_id == 0x1526 ||
+                 device_id == 0x150A || device_id == 0x1518 || device_id == 0x150D;
+    msix_entries = device_id == 0x10A7 ? 0 : 10;
   }
+  uint32_t rq(uint32_t q, uint32_t reg) const { return 0xC000 + 0x40 * q + reg; }
   uint64_t ring(uint32_t base) const { return r32(base) | (uint64_t{r32(base + 4)} << 32); }
-  void on_reset() override { rx_head = tx_head = 0; w32(0xC028, 0); w32(0xE028, 0); w32(0xC010, 0); w32(0xE010, 0); }
+  void on_reset() override {
+    tx_head = 0;
+    for (uint32_t q = 0; q < 4; ++q) { rx_head[q] = 0; w32(rq(q, 0x28), 0); w32(rq(q, 0x10), 0); }
+    w32(0xE028, 0); w32(0xE010, 0);
+  }
   void after_write(uint32_t off, uint32_t v) override {
     if (off == 0xE018 && (r32(kTctl) & 2) && (r32(0xE028) & (1u << 25))) {
       const uint32_t n = r32(0xE008) / 16;
@@ -588,42 +721,89 @@ struct IgbChip final : IntelModel {
           const uint32_t lens = get32(d);
           context_start = ((lens >> 9) & 0x7F) + (lens & 0x1FF);
           context_tcp = ctl & (1u << 11);
+          context_mss = olinfo >> 16;
+          context_l4 = (olinfo >> 8) & 0xFF;
           have_context = true;
           tx_head = (tx_head + 1) % n;
           continue;
         }
-        // a data descriptor (DEXT, DTYP 3) with IFCS and EOP, PAYLEN matching the buffer length
-        if (((ctl >> 20) & 0xF) != 3 || !(ctl & (1u << 29)) || !(ctl & (1u << 24)) || (olinfo >> 14) != (ctl & 0xFFFF)) bad_tx_descriptor = true;
-        if (olinfo & (1u << 9)) {  // TXSM: the transport checksum, as the context describes
-          if (!have_context) bad_tx_descriptor = true;
-          else hardware_checksum(at(get64(d)), ctl & 0xFFFF, context_start, context_start + (context_tcp ? 16 : 6));
-          ++checksummed;
-        }
-        sent.emplace_back(at(get64(d)), at(get64(d)) + (ctl & 0xFFFF));
-        put64(d, 0);       // write-back: the address is gone
+        // a data descriptor (DEXT, DTYP 3) with IFCS; PAYLEN on the first of a chain
+        if (((ctl >> 20) & 0xF) != 3 || !(ctl & (1u << 29)) || !(ctl & (1u << 25))) bad_tx_descriptor = true;
+        if (chain.empty()) { chain_olinfo = olinfo; chain_tse = ctl & (1u << 31); }
+        else if (olinfo != 0 || bool(ctl & (1u << 31)) != chain_tse) bad_tx_descriptor = true;
+        chain.insert(chain.end(), at(get64(d)), at(get64(d)) + (ctl & 0xFFFF));
+        put64(d, 0);  // write-back: the address is gone
         put32(d + 8, 0);
-        put32(d + 12, 1);  // DD
+        if (ctl & (1u << 24)) {  // EOP
+          if (!(ctl & (1u << 27))) bad_tx_descriptor = true;  // (RS on the last)
+          put32(d + 12, 1);  // DD
+          finish_chain();
+        } else {
+          put32(d + 12, 0);
+        }
         tx_head = (tx_head + 1) % n;
       }
       w32(0xE010, tx_head);
     }
   }
-  bool deliver(const Bytes& frame, uint32_t status = 3) {
-    if (!(r32(kRctl) & 2) || !(r32(0xC028) & (1u << 25))) { ++dropped; return false; }
-    if ((r32(0xC00C) & 0x7F) != 2 || ((r32(0xC00C) >> 25) & 7) != 1) { ++dropped; return false; }  // 2 KiB, advanced one buffer
-    const uint32_t n = r32(0xC008) / 16;
-    if (rx_head == r32(0xC018) % n) { ++dropped; return false; }
-    const uint64_t d = ring(0xC000) + 16ull * rx_head;
+  uint32_t chain_olinfo = 0;
+  bool chain_tse = false;
+  void finish_chain() {
+    if (chain_tse) {  // TSE: PAYLEN is the payload, the context has MSS and the TCP header length
+      ++segmentations;
+      const uint32_t header = context_start + context_l4;
+      if (!have_context || !context_tcp || (chain_olinfo >> 14) != chain.size() - header || !(chain_olinfo & (3u << 8))) bad_tx_descriptor = true;
+      if (chain.size() < 54 || chain[16] != 0 || chain[17] != 0 || chain[24] != 0 || chain[25] != 0) { printf("model: TSO headers not prepared\n"); ++g_failed; }
+      for (auto& f : reference_segment(chain.data(), chain.size(), static_cast<uint16_t>(context_mss), true)) emit(f, false);
+    } else {
+      if ((chain_olinfo >> 14) != chain.size()) bad_tx_descriptor = true;
+      if (chain_olinfo & (1u << 9)) {  // TXSM: the transport checksum, as the context describes
+        if (!have_context) bad_tx_descriptor = true;
+        else hardware_checksum(chain.data(), static_cast<uint32_t>(chain.size()), context_start, context_start + (context_tcp ? 16 : 6));
+        ++checksummed;
+      }
+      emit(chain, chain_olinfo & (1u << 9));
+    }
+    chain.clear();
+  }
+  // The queue RSS picks for a frame: the hash of the IPv4 addresses (and the ports of TCP/UDP) with the key in RSSRK, through RETA.
+  int rss_queue(const Bytes& frame) {
+    const uint32_t mrqc = r32(0x5818);
+    if (!(mrqc & 2) || frame.size() < 34 || frame[12] != 0x08 || frame[13] != 0) return 0;
+    uint8_t key[40], input[12];
+    for (int i = 0; i < 40; ++i) key[i] = static_cast<uint8_t>(r32(0x5C80 + 4 * (i / 4)) >> (8 * (i % 4)));
+    memcpy(input, &frame[26], 8);
+    size_t length = 8;
+    const uint8_t protocol = frame[23];
+    if (((protocol == 6 && (mrqc & (1u << 16))) || (protocol == 17 && (mrqc & (1u << 22)))) && frame.size() >= 38) {
+      memcpy(input + 8, &frame[34], 4);
+      length = 12;
+    } else if (!(mrqc & (1u << 17))) {
+      return 0;
+    }
+    last_hash = toeplitz(key, input, length);
+    const uint32_t entry = last_hash & 127;
+    return static_cast<int>((r32(0x5C00 + 4 * (entry / 4)) >> (8 * (entry % 4))) & 0x0F);
+  }
+  bool deliver(const Bytes& frame, uint32_t status = 3, int queue = -1) {
+    const uint32_t q = queue >= 0 ? static_cast<uint32_t>(queue) : static_cast<uint32_t>(rss_queue(frame));
+    if (q >= 4 || !(r32(kRctl) & 2) || !(r32(rq(q, 0x28)) & (1u << 25))) { ++dropped; return false; }
+    if ((r32(rq(q, 0x0C)) & 0x7F) != 2 || ((r32(rq(q, 0x0C)) >> 25) & 7) != 1) { ++dropped; return false; }  // 2 KiB, advanced one buffer
+    const uint32_t n = r32(rq(q, 0x08)) / 16;
+    if (n == 0 || rx_head[q] == r32(rq(q, 0x18)) % n) { ++dropped; return false; }
+    const uint64_t d = ring(rq(q, 0)) + 16ull * rx_head[q];
     const uint64_t buffer = get64(d);
     if (buffer == 0 || get64(d + 8) != 0) { printf("model: receive descriptor not in read format\n"); ++g_failed; ++dropped; return false; }
     memcpy(at(buffer), frame.data(), frame.size());
     put64(d, 0x1234567800000000ull);  // write-back: RSS/packet info
     put64(d + 8, (uint64_t{frame.size()} << 32) | status);
-    rx_head = (rx_head + 1) % n;
-    w32(0xC010, rx_head);
-    signal(1u << 7);  // RXT0
+    rx_head[q] = (rx_head[q] + 1) % n;
+    w32(rq(q, 0x10), rx_head[q]);
+    signal_queue(q);
     return true;
   }
+  // (the queue-0 view the older tests use)
+  uint32_t& rx_head0() { return rx_head[0]; }
 };
 
 template <class Nic, class Model>
@@ -788,11 +968,11 @@ static void test_igb_hostile() {
   uint8_t buffer[100];
   for (int i = 0; i < 3000; ++i) {
     const uint32_t n = m->r32(0xC008) / 16;
-    if (m->rx_head != m->r32(0xC018) % n) {
-      const uint64_t d = m->ring(0xC000) + 16ull * m->rx_head;
+    if (m->rx_head[0] != m->r32(0xC018) % n) {
+      const uint64_t d = m->ring(0xC000) + 16ull * m->rx_head[0];
       put64(d, rng());
       put64(d + 8, rng() | 1);  // done, with anything else
-      m->rx_head = (m->rx_head + 1) % n;
+      m->rx_head[0] = (m->rx_head[0] + 1) % n;
     }
     uint32_t length = 0;
     if (nic.receive(ByteView(buffer, sizeof buffer), &length)) CHECK(length <= IgbNetworkInterface::kBufferSize);
@@ -970,6 +1150,7 @@ static void test_igb_interrupts_and_checksums(uint16_t device_id, bool igc) {
   TestAllocator alloc;
   UniquePointer<IgbChip> owned = UniquePointer<IgbChip>::make(alloc, device_id, igc);
   IgbChip* m = owned.get();
+  m->msix_entries = 0;  // (the MSI path; MSI-X has its own test)
   {
     IgbNetworkInterface nic(util::move(owned), alloc);
     CHECK(nic.initialize());
@@ -1024,6 +1205,319 @@ static void test_igb_ring_full() {
   CHECK(m->sent.empty());
 }
 
+// ---- interrupt moderation, MSI-X with RSS, segmentation offload -------------------------------------------------------------------------------
+
+static void test_moderation_classes() {
+  using L = InterruptLatency;
+  CHECK(InterruptModerator::classify(L::Low, 0, 0) == L::Low);               // nothing seen: no change
+  CHECK(InterruptModerator::classify(L::Low, 2, 200) == L::Lowest);          // a ping, a keystroke
+  CHECK(InterruptModerator::classify(L::Low, 20, 30000) == L::Bulk);         // full frames
+  CHECK(InterruptModerator::classify(L::Low, 50, 15000) == L::Lowest);       // many small ones
+  CHECK(InterruptModerator::classify(L::Low, 3, 9000) == L::Bulk);           // big ones, few
+  CHECK(InterruptModerator::classify(L::Lowest, 1, 30000) == L::Bulk);       // segmentation offload
+  CHECK(InterruptModerator::classify(L::Lowest, 3, 3000) == L::Low);
+  CHECK(InterruptModerator::classify(L::Bulk, 40, 60000) == L::Low);
+  CHECK(InterruptModerator::classify(L::Bulk, 10, 60000) == L::Bulk);
+  CHECK(InterruptModerator::classify(L::Bulk, 1, 100) == L::Low);
+  CHECK(InterruptModerator::rate(L::Lowest) == 70000 && InterruptModerator::rate(L::Low) == 20000 && InterruptModerator::rate(L::Bulk) == 4000);
+  CHECK(InterruptModerator::intel_interval(L::Lowest) == 56 && InterruptModerator::intel_interval(L::Low) == 196 &&
+        InterruptModerator::intel_interval(L::Bulk) == 980);
+  InterruptModerator m;
+  CHECK(m.latency() == L::Low && !m.update());     // starts at 20000 a second
+  m.account(1, 64);
+  CHECK(!m.update() && m.latency() == L::Low);       // (a ping would be "lowest": conservative keeps it low)
+  m.account(30, 45000);
+  CHECK(m.update() && m.latency() == L::Bulk && m.interrupts_per_second() == 4000);
+  m.account(0xFFFFFFFFu, 0xFFFFFFF0u);
+  m.account(1, 100);                                // (sums saturate)
+  m.update();
+}
+
+// An interrupt shuts the device's interrupt until rearm_interrupts(): more frames meanwhile raise none; rearming with frames waiting
+// interrupts at once.
+template <class Nic, class Model>
+static void check_masking(Nic& nic, Model* m, bool msix) {
+  g_wakes = 0;
+  const int before = m->raised;
+  CHECK(m->deliver(frame_of(100, 1)));
+  CHECK(m->raised == before + 1 && g_wakes == 1);
+  CHECK(m->deliver(frame_of(100, 2)) && m->deliver(frame_of(100, 3)));
+  CHECK(m->raised == before + 1);                  // masked
+  uint8_t buffer[2048];
+  ReceivedFrame got;
+  int taken = 0;
+  while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) ++taken;
+  CHECK(taken == 3);
+  nic.rearm_interrupts();
+  CHECK(m->raised == before + 2);                  // the causes of frames 2 and 3 were still set: one more interrupt (as with NAPI)
+  CHECK(!nic.receive_frame(ByteView(buffer, sizeof buffer), &got));
+  nic.rearm_interrupts();
+  CHECK(m->raised == before + 2);                  // nothing pending now: quiet, and open
+  CHECK(m->deliver(frame_of(100, 4)));
+  CHECK(m->raised == before + 3);                  // open again
+  CHECK(nic.receive_frame(ByteView(buffer, sizeof buffer), &got));
+  CHECK(m->deliver(frame_of(100, 5)));             // (masked, pending)
+  nic.rearm_interrupts();
+  CHECK(m->raised == before + 4);                  // pending when rearmed: at once
+  while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
+  nic.rearm_interrupts();
+  (void)msix;
+}
+
+static void test_masking_and_throttle() {
+  TestAllocator alloc;
+  {
+    UniquePointer<RtlChipModel> owned = UniquePointer<RtlChipModel>::make(alloc, 0x8168, 0x541, false);
+    RtlChipModel* m = owned.get();
+    Rtl8169NetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize() && nic.enable_interrupts(&count_wake, nullptr));
+    CHECK(m->raw(m->mask_reg(), 2) != 0);          // open after the self-test
+    check_masking(nic, m, false);
+  }
+  {
+    UniquePointer<E1000eChip> owned = UniquePointer<E1000eChip>::make(alloc, 0x10D3, false);
+    E1000eChip* m = owned.get();
+    E1000eNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize() && nic.enable_interrupts(&count_wake, nullptr));
+    CHECK(m->r32(0xC4) == 196);                    // ITR: 20000 a second to begin with
+    check_masking(nic, m, false);
+    // a stream of full frames: bulk (4000 a second); then a ping: low latency, and lowest after another
+    for (int i = 0; i < 40; ++i) m->deliver(frame_of(1514, 6));
+    uint8_t buffer[2048];
+    ReceivedFrame got;
+    while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
+    nic.rearm_interrupts();
+    CHECK(m->r32(0xC4) == 980 && nic.statistics().interrupt_rate == 4000);
+    m->deliver(frame_of(64, 7));
+    while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
+    nic.rearm_interrupts();
+    CHECK(m->r32(0xC4) == 196);
+    m->deliver(frame_of(64, 8));
+    while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
+    nic.rearm_interrupts();
+    CHECK(m->r32(0xC4) == 196 && nic.statistics().interrupt_rate == 20000);  // (conservative: never the lowest-latency class)
+  }
+  {
+    UniquePointer<IgbChip> owned = UniquePointer<IgbChip>::make(alloc, 0x1533, false);
+    owned->msix_entries = 0;  // MSI
+    IgbChip* m = owned.get();
+    IgbNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize() && nic.enable_interrupts(&count_wake, nullptr) && nic.msix_vectors() == 0);
+    CHECK(m->r32(0x1680) == (196u | (1u << 31)));  // EITR(0)
+    check_masking(nic, m, false);
+    for (int i = 0; i < 40; ++i) m->deliver(frame_of(1514, 6));
+    uint8_t buffer[2048];
+    ReceivedFrame got;
+    while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
+    nic.rearm_interrupts();
+    CHECK(m->r32(0x1680) == (980u | (1u << 31)));
+  }
+  CHECK(alloc.dma.empty());
+}
+
+// Frames of `flows` TCP connections (different source ports), `per_flow` each.
+static std::vector<Bytes> flow_frames(uint32_t flows, uint32_t per_flow) {
+  std::vector<Bytes> out;
+  for (uint32_t i = 0; i < per_flow; ++i)
+    for (uint32_t f = 0; f < flows; ++f) {
+      TransmitChecksum request;
+      Bytes frame = transport_frame(6, 100, &request);
+      frame[34] = static_cast<uint8_t>(0x80 + f);  // the source port
+      frame[35] = static_cast<uint8_t>(f * 7);
+      frame[60] = static_cast<uint8_t>(i);
+      out.push_back(frame);
+    }
+  return out;
+}
+
+static void test_igb_msix(uint16_t device_id, bool igc, uint32_t queues) {
+  TestAllocator alloc;
+  UniquePointer<IgbChip> owned = UniquePointer<IgbChip>::make(alloc, device_id, igc);
+  IgbChip* m = owned.get();
+  {
+    IgbNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize() && nic.queue_count() == queues);
+    for (uint32_t q = 0; q < queues; ++q) CHECK((m->r32(m->rq(q, 0x28)) & (1u << 25)) && m->r32(m->rq(q, 0x18)) == 255);  // every queue runs
+    CHECK(m->r32(0x5818) == 0);  // RSS off until MSI-X: all of it to queue 0
+    CHECK(m->deliver(frame_of(80, 1)) && m->rx_head[0] == 1);
+    g_wakes = 0;
+    CHECK(nic.enable_interrupts(&count_wake, nullptr));
+    if (queues == 1) {  // (one queue: MSI)
+      CHECK(nic.msix_vectors() == 0 && m->handler && nic.offloads().receive_queues == 1);
+      return;
+    }
+    CHECK(nic.msix_vectors() == queues + 1 && m->msix_attached == queues + 1 && nic.offloads().receive_queues == queues);
+    CHECK((m->r32(0x1514) & ((1u << 4) | (1u << 30) | (1u << 31) | 1u)) == ((1u << 4) | (1u << 30) | (1u << 31) | 1u));  // GPIE
+    for (uint32_t q = 0; q < queues; ++q) CHECK(m->rx_vector(q) == static_cast<int>(q));
+    CHECK(((m->r32(0x1740) >> 8) & 0xFF) == (0x80 | queues));      // the link: the last vector
+    const uint32_t all = (1u << (queues + 1)) - 1;
+    CHECK(m->r32(0x152C) == all && m->r32(0x1530) == all && m->eims == all);
+    CHECK(m->vector_raised[queues] == 1 && m->vector_raised[0] == 1 && g_wakes == 2);  // the self-test, link vector and queue 0
+    CHECK((m->r32(0x5818) & 0x2) && (m->r32(0x5000) & (1u << 13)));                    // RSS on, the hash in the descriptor
+    for (uint32_t e = 0; e < 128; ++e) CHECK(((m->r32(0x5C00 + 4 * (e / 4)) >> (8 * (e % 4))) & 0xFF) == e % queues);
+    // the key: Microsoft's verification suite gives 0x51ccc178 for 66.9.149.187:2794 -> 161.142.100.80:1766 over TCP
+    TransmitChecksum request;
+    Bytes probe = transport_frame(6, 10, &request);
+    const uint8_t addresses[8] = {66, 9, 149, 187, 161, 142, 100, 80};
+    memcpy(&probe[26], addresses, 8);
+    probe[34] = 2794 >> 8; probe[35] = 2794 & 0xFF; probe[36] = 1766 >> 8; probe[37] = 1766 & 0xFF;
+    m->rss_queue(probe);
+    CHECK(m->last_hash == 0x51ccc178u);
+    for (uint32_t v = 0; v <= queues; ++v) CHECK(m->r32(0x1680 + 4 * v) == (v < queues ? (196u | (1u << 31)) : 0u));  // EITR per queue vector
+
+    // RSS spreads 16 flows over the queues; every queue's vector interrupts once (then masks itself) and the driver takes all of them
+    uint8_t buffer[2048];
+    ReceivedFrame got;
+    while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
+    nic.rearm_interrupts();
+    std::vector<int> before(m->vector_raised);
+    const std::vector<Bytes> frames = flow_frames(16, 4);
+    for (const Bytes& f : frames) CHECK(m->deliver(f));
+    uint32_t used = 0;
+    for (uint32_t q = 0; q < queues; ++q) {
+      const int raised = m->vector_raised[q] - before[q];
+      if (raised) ++used;
+      CHECK(raised <= 1);  // auto-masked after the first
+    }
+    CHECK(used >= 2);
+    uint32_t taken = 0;
+    while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) ++taken;
+    CHECK(taken == frames.size());
+    uint32_t busy = 0;
+    for (uint32_t q = 0; q < queues; ++q) if (nic.queue_frames(q) > 0) ++busy;
+    CHECK(busy >= 2);
+    // a flow stays on its queue: the frames of one flow come out in order
+    // (checked through the queue the model chose for each frame of flow 0)
+    const int q0 = m->rss_queue(frames[0]);
+    for (size_t i = 0; i < frames.size(); i += 16) CHECK(m->rss_queue(frames[i]) == q0);
+    nic.rearm_interrupts();  // (the causes of the frames that came while masked interrupt once more)
+    while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
+    nic.rearm_interrupts();
+    CHECK(m->eims == all);
+    // the link vector
+    const int link_before = m->vector_raised[queues];
+    m->signal(1u << 2);
+    CHECK(m->vector_raised[queues] == link_before + 1);
+    nic.rearm_interrupts();
+    nic.disable_interrupts();
+    CHECK(nic.msix_vectors() == 0 && m->r32(0x5818) == 0 && m->r32(0x1514) == 0 && !m->queue_handler && m->eims == 0);
+    // frames still arrive (polled, queue 0)
+    CHECK(m->deliver(frame_of(70, 9)) && nic.receive_frame(ByteView(buffer, sizeof buffer), &got) && got.length == 70);
+  }
+  CHECK(alloc.dma.empty());
+  // MSI-X refused (no table, or a route that loses the messages): MSI on one queue instead
+  UniquePointer<IgbChip> lost = UniquePointer<IgbChip>::make(alloc, device_id, igc);
+  lost->msi_lost = true;
+  {
+    IgbNetworkInterface nic(util::move(lost), alloc);
+    CHECK(nic.initialize() && !nic.enable_interrupts(&count_wake, nullptr) && !nic.interrupts_enabled() && nic.msix_vectors() == 0);
+  }
+  UniquePointer<IgbChip> small = UniquePointer<IgbChip>::make(alloc, device_id, igc);
+  small->msix_entries = 2;  // fewer entries than queues + 1
+  IgbChip* sm = small.get();
+  {
+    IgbNetworkInterface nic(util::move(small), alloc);
+    CHECK(nic.initialize() && nic.enable_interrupts(&count_wake, nullptr) && nic.msix_vectors() == 0 && sm->handler != nullptr);
+  }
+  CHECK(alloc.dma.empty());
+}
+
+// Segmentation offload: segments of several sizes and MSS values come out as frames the way a controller makes them (TsoReference); each
+// frame is right-sized and right-checksummed, the payload is whole and in order, and PSH/FIN are only on the last.
+template <class Nic, class Model>
+static void check_segmentation(Nic& nic, Model* m) {
+  CHECK(nic.offloads().max_segmentation_bytes == 32768);
+  for (uint32_t payload : {1u, 536u, 1460u, 1461u, 8000u, 16384u, 32000u}) {
+    for (uint16_t mss : {uint16_t{536}, uint16_t{1460}}) {
+      TransmitChecksum request;
+      Bytes f = transport_frame(6, payload, &request);
+      if (f.size() > 32768) continue;
+      f[47] = 0x19;  // FIN, PSH, ACK
+      const size_t before = m->sent.size();
+      const int segmentations = m->segmentations;
+      CHECK(nic.transmit_segmented(ConstByteView(f.data(), f.size()), request, mss));
+      CHECK(m->segmentations == segmentations + 1);
+      const uint32_t expect = (payload + mss - 1) / mss;
+      CHECK(m->sent.size() == before + expect);
+      if (m->sent.size() != before + expect) continue;
+      Bytes joined;
+      uint32_t sequence = 0;
+      for (uint32_t k = 0; k < expect; ++k) {
+        Bytes out = m->sent[before + k];
+        const size_t ip_length = 14u + ((out[16] << 8) | out[17]);  // (a short last frame is padded on the wire)
+        CHECK(ip_length <= out.size() && (out.size() == ip_length || out.size() == 60));
+        out.resize(ip_length < out.size() ? ip_length : out.size());
+        CHECK(out.size() <= kEthernetMaxFrame && transport_checksum_ok(out));
+        uint32_t ip_sum = 0;
+        for (int i = 14; i < 34; i += 2) ip_sum += (out[i] << 8) | out[i + 1];
+        while (ip_sum >> 16) ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
+        CHECK(ip_sum == 0xFFFF);
+        const uint32_t seq = (uint32_t(out[38]) << 24) | (out[39] << 16) | (out[40] << 8) | out[41];
+        if (k > 0) CHECK(seq == sequence);
+        sequence = seq + static_cast<uint32_t>(out.size() - 54);
+        CHECK((out[47] & 0x09) == (k + 1 == expect ? 0x09 : 0));
+        joined.insert(joined.end(), out.begin() + 54, out.end());
+      }
+      CHECK(joined == Bytes(f.begin() + 54, f.end()));
+    }
+  }
+  // what is refused: no MSS, too large, not TCP, nothing to cut
+  TransmitChecksum request;
+  Bytes f = transport_frame(6, 1000, &request);
+  CHECK(!nic.transmit_segmented(ConstByteView(f.data(), f.size()), request, 0));
+  TransmitChecksum big_request;
+  Bytes big = transport_frame(6, 33000, &big_request);
+  CHECK(!nic.transmit_segmented(ConstByteView(big.data(), big.size()), big_request, 1460));
+  TransmitChecksum udp_request;
+  Bytes udp = transport_frame(17, 3000, &udp_request);
+  CHECK(!nic.transmit_segmented(ConstByteView(udp.data(), udp.size()), udp_request, 1460));
+  TransmitChecksum empty_request;
+  Bytes empty = transport_frame(6, 0, &empty_request);
+  CHECK(!nic.transmit_segmented(ConstByteView(empty.data(), empty.size()), empty_request, 1460));
+  // the ring fills and empties with segments (17 descriptors each) and frames mixed
+  for (int i = 0; i < 200; ++i) {
+    TransmitChecksum r;
+    Bytes s = transport_frame(6, 30000, &r);
+    CHECK(nic.transmit_segmented(ConstByteView(s.data(), s.size()), r, 1460));
+    CHECK(nic.transmit(ConstByteView(f.data(), 100)));
+  }
+  CHECK(nic.statistics().segmented_sends >= 200);
+}
+
+static void test_segmentation() {
+  TestAllocator alloc;
+  {
+    UniquePointer<E1000eChip> owned = UniquePointer<E1000eChip>::make(alloc, 0x10D3, false);
+    E1000eChip* m = owned.get();
+    E1000eNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize());
+    check_segmentation(nic, m);
+  }
+  for (uint16_t id : {uint16_t{0x10C9}, uint16_t{0x1533}, uint16_t{0x15F3}}) {
+    UniquePointer<IgbChip> owned = UniquePointer<IgbChip>::make(alloc, id, id == 0x15F3);
+    IgbChip* m = owned.get();
+    IgbNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize());
+    check_segmentation(nic, m);
+    CHECK(!m->bad_tx_descriptor);
+  }
+  // a device that sends nothing: segments are refused when the ring is full, never overwritten
+  UniquePointer<IgbChip> owned = UniquePointer<IgbChip>::make(alloc, 0x1533, false);
+  IgbChip* m = owned.get();
+  {
+    IgbNetworkInterface nic(util::move(owned), alloc);
+    CHECK(nic.initialize());
+    m->w32(kTctl, m->r32(kTctl) & ~2u);
+    TransmitChecksum r;
+    Bytes s = transport_frame(6, 30000, &r);
+    uint32_t accepted = 0;
+    while (nic.transmit_segmented(ConstByteView(s.data(), s.size()), r, 1460)) ++accepted;
+    CHECK(accepted == (IgbNetworkInterface::kTransmitDescriptors - 1) / 16);  // (15 data descriptors and a context each)
+    CHECK(m->sent.empty());
+  }
+  CHECK(alloc.dma.empty());
+}
+
 int main() {
   test_rtl_identify();
   test_rtl_chip(0x8168, 0x541, false);  // RTL8168H
@@ -1054,6 +1548,13 @@ int main() {
   test_igb_interrupts_and_checksums(0x10A7, false);         // 82575 (no IVAR)
   test_igb_interrupts_and_checksums(0x15F3, true);          // I225-V
   test_igb_ring_full();
+  test_moderation_classes();
+  test_masking_and_throttle();
+  test_igb_msix(0x10C9, false, 4);  // 82576 (the IVAR byte per queue)
+  test_igb_msix(0x1533, false, 4);  // I210 (two queues per IVAR)
+  test_igb_msix(0x15F3, true, 4);   // I225-V
+  test_igb_msix(0x1539, false, 1);  // I211: one queue, MSI
+  test_segmentation();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

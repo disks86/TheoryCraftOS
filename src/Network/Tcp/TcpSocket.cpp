@@ -17,6 +17,7 @@
  */
 
 #include "Network/Tcp/TcpSocket.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Network/Checksum.hpp"
 #include "Network/Tcp/TcpManager.hpp"
 
@@ -45,7 +46,9 @@ constexpr uint16_t kOurMss = kMaxIpPayload - 20;  // 1460
 }  // namespace
 
 TcpSocket::TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& allocator)
-    : ip_(ip), manager_(manager), send_buffer_(allocator), receive_buffer_(allocator), accept_queue_(allocator) {}
+    : ip_(ip), manager_(manager), allocator_(allocator), send_buffer_(allocator), receive_buffer_(allocator), accept_queue_(allocator) {}
+
+TcpSocket::~TcpSocket() { release_view(allocator_, burst_); }
 
 // ------------------------------------------------------------------ user API
 
@@ -185,28 +188,55 @@ void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView dat
   ip_.send_ip(remote_address_, kProtocolTcp, out.written());  // a lost segment is retransmitted
 }
 
+bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, uint32_t length, uint16_t mss) {
+  if (burst_.empty()) burst_ = allocate_view<uint8_t>(allocator_, uint64_t{kBufferSize} + 20);
+  if (burst_.size() < uint64_t{length} + 20) return false;
+  last_advertised_window_ = advertised_window();
+  ByteWriter out{burst_};
+  out.be16(local_port_);
+  out.be16(remote_port_);
+  out.be32(sequence);
+  out.be32(rcv_nxt_);
+  out.u8(5 << 4);
+  out.u8(flags);
+  out.be16(static_cast<uint16_t>(last_advertised_window_));
+  out.be16(0);  // checksum: the IP layer fills it in
+  out.be16(0);
+  if (!out.ok()) return false;
+  send_buffer_.peek(offset, burst_.subview(20, length));
+  return ip_.send_tcp_segmented(remote_address_, burst_.first(20 + length), mss);
+}
+
 // Sends whatever the peer's window and our send buffer allow, then the FIN if
-// the application has closed and everything is out.
+// the application has closed and everything is out. Where the interface cuts segments into frames (segmentation offload), what fits goes
+// in one large segment instead of one per MSS.
 void TcpSocket::output() {
   const bool may_send_data = state_ == TcpState::Established || state_ == TcpState::CloseWait ||
                              state_ == TcpState::FinWait1 || state_ == TcpState::LastAck;
   if (!may_send_data) return;
 
   const uint16_t mss = peer_mss_ < kOurMss ? peer_mss_ : kOurMss;
+  const uint32_t burst = ip_.max_segmented_payload(remote_address_);
   for (;;) {
     const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);  // data only
     if (fin_sent_) break;  // nothing follows a FIN
     const uint32_t unsent = send_buffer_.size() > in_flight ? send_buffer_.size() - in_flight : 0;
     const uint32_t window_room = snd_wnd_ > in_flight ? snd_wnd_ - in_flight : 0;
     uint32_t n = unsent < window_room ? unsent : window_room;
-    if (n > mss) n = mss;
     if (n == 0) break;
-
-    uint8_t chunk[kMaxIpPayload];
-    const ByteView payload = ByteView(chunk).first(n);  // n <= mss <= kMaxIpPayload by construction; checked here
-    send_buffer_.peek(in_flight, payload);
-    const bool last = n == unsent;
-    send_segment(tcp_flags::kAck | (last ? tcp_flags::kPsh : 0), snd_nxt_, payload, false);
+    if (n > mss && burst > 20u + mss) {  // several segments' worth, cut by the interface
+      if (n > burst - 20) n = burst - 20;
+      if (n > kBufferSize) n = kBufferSize;
+      const bool last = n == unsent;
+      send_burst(tcp_flags::kAck | (last ? tcp_flags::kPsh : 0), snd_nxt_, in_flight, n, mss);  // (a lost one is retransmitted)
+    } else {
+      if (n > mss) n = mss;
+      uint8_t chunk[kMaxIpPayload];
+      const ByteView payload = ByteView(chunk).first(n);  // n <= mss <= kMaxIpPayload by construction; checked here
+      send_buffer_.peek(in_flight, payload);
+      const bool last = n == unsent;
+      send_segment(tcp_flags::kAck | (last ? tcp_flags::kPsh : 0), snd_nxt_, payload, false);
+    }
     if (!timing_) {  // time this segment (Karn: never a retransmission, see rollback)
       timing_ = true;
       timed_sequence_ = snd_nxt_ + n;
@@ -316,6 +346,9 @@ void TcpSocket::on_segment(const TcpSegment& s) {
 
   // From here on the connection is synchronized.
   if (s.flags & kRst) {
+    // In TIME-WAIT the connection is over (both FINs exchanged and acknowledged): a reset there is the answer of a peer that already forgot
+    // it - say to a duplicated last ACK - and is ignored (RFC 1337), not reported as a failure.
+    if (state_ == TcpState::TimeWait) return;
     // Only a reset whose sequence number falls in our receive window counts.
     if (seq_ge(s.sequence, rcv_nxt_) && seq_lt(s.sequence, rcv_nxt_ + advertised_window() + 1)) fail();
     return;

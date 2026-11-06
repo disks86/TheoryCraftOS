@@ -17,6 +17,7 @@
  */
 
 #include "Network/NetworkStack.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Network/Checksum.hpp"
 #include "Kernel/Thread.hpp"
 
@@ -47,7 +48,10 @@ NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& c
       udp_(*this, allocator),
       tcp_(*this, allocator) {}
 
-NetworkStack::~NetworkStack() = default;
+NetworkStack::~NetworkStack() {
+  release_view(allocator_, coalesce_storage_);
+  release_view(allocator_, segment_frame_);
+}
 
 bool NetworkStack::initialize() {
   dhcp_socket_ = udp_.open(DhcpClient::kClientPort);
@@ -57,6 +61,9 @@ bool NetworkStack::initialize() {
   dhcp_ = UniquePointer<DhcpClient>::make(allocator_, ip, dhcp_socket_, nic_.mac_address(), listener);
   INetworkStack& stack = *this;
   resolver_ = UniquePointer<DnsResolver>::make(allocator_, stack, allocator_);
+  // (without the memory, frames are just handled one by one and segments sent packet by packet)
+  coalesce_storage_ = allocate_view<uint8_t>(allocator_, kCoalesceBytes);
+  coalescer_ = TcpCoalescer(coalesce_storage_);
   return dhcp_ && resolver_;
 }
 
@@ -116,8 +123,17 @@ void NetworkStack::poll() {
   hardware::ReceivedFrame received;
   saturated_ = false;
   uint32_t i = 0;
-  for (; i < kFramesPerPoll && nic_.receive_frame(ByteView(frame), &received); ++i)
-    if (received.length <= sizeof(frame)) handle_frame(ConstByteView(frame).first(received.length), received);
+  for (; i < kFramesPerPoll && nic_.receive_frame(ByteView(frame), &received); ++i) {
+    if (received.length > sizeof(frame)) continue;
+    const ConstByteView f = ConstByteView(frame).first(received.length);
+    // Receive offload: a TCP segment for this machine may join the run being put together; anything else hands the run on first (order is kept).
+    const bool ours = received.length >= hardware::kEthernetHeaderSize && hardware::MacAddress{{f[0], f[1], f[2], f[3], f[4], f[5]}} == nic_.mac_address();
+    if (ours && coalescer_.offer(f, received)) continue;
+    flush_coalesced();
+    if (ours && coalescer_.offer(f, received)) continue;
+    handle_frame(f, received);
+  }
+  flush_coalesced();
   saturated_ = i == kFramesPerPoll;
 
   if (follow_link_) {
@@ -151,6 +167,15 @@ void NetworkStack::deliver_looped() {
     if (!looped_.dequeue(&p)) break;
     handle_ipv4(ConstByteView(p.ip_packet).first(p.length), true);
   }
+}
+
+void NetworkStack::flush_coalesced() {
+  if (!coalescer_.holding()) return;
+  hardware::ReceivedFrame checked;  // (every piece was checked before it joined)
+  checked.ipv4_header_checksum_good = true;
+  checked.transport_checksum_good = true;
+  handle_ipv4(coalescer_.held(), false, checked);
+  coalescer_.clear();
 }
 
 void NetworkStack::handle_frame(ConstByteView frame, const hardware::ReceivedFrame& checks) {
@@ -323,6 +348,77 @@ bool NetworkStack::send_frame(const hardware::MacAddress& destination, uint16_t 
   if (nic_.offloads().transmit_checksums) return nic_.transmit_frame(out.written(), checksum);
   const ByteView written = ByteView(frame).first(out.position());
   return hardware::finish_transmit_checksum(written, checksum) && nic_.transmit(written);
+}
+
+// The MAC address a packet to `destination` goes to, when it is known now (an ARP entry that has not expired): for unicast to the wire only.
+bool NetworkStack::next_hop_for(Ipv4Address destination, hardware::MacAddress* mac) const {
+  if (!config_.configured() || destination.is_loopback() || destination == config_.address || destination.is_multicast() ||
+      destination.is_limited_broadcast() || destination == Ipv4Address::subnet_broadcast(config_.address, config_.netmask))
+    return false;
+  Ipv4Address next_hop = destination;
+  if (!destination.in_subnet(config_.address, config_.netmask)) {
+    if (config_.gateway.is_unspecified()) return false;
+    next_hop = config_.gateway;
+  }
+  const ArpEntry* entry = const_cast<Dictionary<uint32_t, ArpEntry>&>(arp_).find(next_hop.value());
+  if (!entry || entry->expires_ms <= now_ms()) return false;
+  *mac = entry->mac;
+  return true;
+}
+
+// How large a frame the interface takes for segmentation (0: none), capped at what one IP packet can say.
+static uint32_t segmentation_bytes(const hardware::INetworkInterface& nic) {
+  const uint32_t bytes = nic.offloads().max_segmentation_bytes;
+  if (bytes <= hardware::kEthernetMaxFrame) return 0;
+  return bytes < 65535 + hardware::kEthernetHeaderSize ? bytes : 65535 + hardware::kEthernetHeaderSize;
+}
+
+uint32_t NetworkStack::max_segmented_payload(Ipv4Address destination) const {
+  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  hardware::MacAddress mac;
+  const uint32_t bytes = segmentation_bytes(nic_);
+  if (bytes == 0 || !next_hop_for(destination, &mac)) return 0;
+  return bytes - hardware::kEthernetHeaderSize - kIpv4HeaderSize;
+}
+
+// The frame of a large TCP segment, built like any other (IP header, the pseudo-header seed in the checksum field) and given to the interface
+// to cut up: TCP over IPv4 to a next hop whose address is known.
+bool NetworkStack::send_tcp_segmented(Ipv4Address destination, ConstByteView segment, uint16_t mss) {
+  kernel::ScopedRecursiveMutex guard(mutex_);
+  hardware::MacAddress mac;
+  const uint32_t bytes = segmentation_bytes(nic_);
+  if (bytes == 0 || mss == 0 || segment.size() < 20 || !next_hop_for(destination, &mac)) return false;
+  if (segment_frame_.size() != bytes) {  // (made when the first large segment goes out)
+    release_view(allocator_, segment_frame_);
+    segment_frame_ = allocate_view<uint8_t>(allocator_, bytes);
+    if (segment_frame_.empty()) return false;
+  }
+  if (segment.size() > segment_frame_.size() - hardware::kEthernetHeaderSize - kIpv4HeaderSize) return false;
+  const Ipv4Address source = source_for(destination);
+  ByteWriter out{segment_frame_};
+  mac.write(out);
+  nic_.mac_address().write(out);
+  out.be16(kEtherTypeIpv4);
+  out.u8(0x45);
+  out.u8(0);
+  out.be16(static_cast<uint16_t>(kIpv4HeaderSize + segment.size()));
+  out.be16(ip_id_);
+  ip_id_ = static_cast<uint16_t>(ip_id_ + (segment.size() - 20 + mss - 1) / mss);  // (each frame takes the next identification)
+  out.be16(0x4000);
+  out.u8(64);
+  out.u8(kProtocolTcp);
+  out.be16(0);
+  source.write(out);
+  destination.write(out);
+  out.patch_be16(hardware::kEthernetHeaderSize + 10, checksum_finish(checksum_add(0, out.written().dropped(hardware::kEthernetHeaderSize))));
+  out.bytes(segment);
+  if (!out.ok()) return false;
+  const ByteView frame = segment_frame_.first(out.position());
+  const uint32_t tcp = hardware::kEthernetHeaderSize + kIpv4HeaderSize;
+  const uint16_t seed = static_cast<uint16_t>(~checksum_finish(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint16_t>(segment.size()))));
+  frame[tcp + 16] = static_cast<uint8_t>(seed >> 8);
+  frame[tcp + 17] = static_cast<uint8_t>(seed);
+  return nic_.transmit_segmented(frame, hardware::TransmitChecksum{static_cast<uint16_t>(tcp), static_cast<uint16_t>(tcp + 16)}, mss);
 }
 
 void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip) {

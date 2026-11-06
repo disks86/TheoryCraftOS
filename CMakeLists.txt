@@ -205,6 +205,7 @@ add_executable(BOOTX64
   src/Network/Udp/UdpManager.cpp
   src/Network/Tcp/TcpSocket.cpp
   src/Network/Tcp/TcpManager.cpp
+  src/Network/Tcp/TcpCoalescer.cpp
   src/Network/Dhcp/DhcpClient.cpp
   src/Network/Dns/DnsMessage.cpp
   src/Network/Dns/DnsResolver.cpp

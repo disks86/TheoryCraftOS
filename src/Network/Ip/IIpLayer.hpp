@@ -51,6 +51,22 @@ class IIpLayer {
   virtual bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
                             bool link_broadcast) = 0;
 
+  // TCP segmentation offload. The largest TCP segment (header and data) that may go to `destination` in one send_tcp_segmented(): more
+  // than one packet's worth when the interface cuts segments into frames itself and the way there is known; 0 otherwise (send packet by
+  // packet, with send_ip()).
+  virtual uint32_t max_segmented_payload(Ipv4Address destination) const {
+    (void)destination;
+    return 0;
+  }
+  // Sends a TCP segment (checksum field zero, as for send_ip()) that the interface cuts into frames of at most `mss` bytes of data. False if
+  // it cannot now (the segment is then as good as lost: TCP retransmits).
+  virtual bool send_tcp_segmented(Ipv4Address destination, ConstByteView segment, uint16_t mss) {
+    (void)destination;
+    (void)segment;
+    (void)mss;
+    return false;
+  }
+
  protected:
   IIpLayer() = default;
   ~IIpLayer() = default;

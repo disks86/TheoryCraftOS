@@ -85,6 +85,17 @@ class INetworkInterface : public IHardware {
     return transmit(writable);
   }
 
+  // TCP segmentation offload: `frame` is one IPv4 TCP segment of up to offloads().max_segmentation_bytes bytes, its checksum requested as for
+  // transmit_frame() (the seed covers the whole segment's length). The interface sends it as frames of at most `mss` bytes of payload, each
+  // with its own IP length, identification and checksum, sequence number and TCP checksum; FIN and PSH only on the last. False (nothing
+  // sent) if it cannot now; only called on an interface whose offloads() say it can.
+  virtual bool transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) {
+    (void)frame;
+    (void)checksum;
+    (void)mss;
+    return false;
+  }
+
   // Interrupts: an interface that can interrupt calls `wake(context)` from its interrupt handler whenever it has something new, so whoever polls
   // it may sleep in between. True once an interrupt has been seen to arrive (the interface tests it); false leaves the interface polled.
   // disable_interrupts() is called before `context` goes away.
@@ -95,6 +106,9 @@ class INetworkInterface : public IHardware {
   }
   virtual void disable_interrupts() {}
   virtual bool interrupts_enabled() const { return false; }
+  // Interrupt mitigation (as Linux's NAPI): an interrupt masks the interface's interrupt until whoever polls it has taken everything there
+  // was and calls this, so a burst of frames costs one interrupt. The interface also picks its interrupt rate from the traffic it saw.
+  virtual void rearm_interrupts() {}
 
   virtual NetworkStatistics statistics() const = 0;
 

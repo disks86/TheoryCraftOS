@@ -1195,8 +1195,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       // (stacks.add() asked for interrupts: an interface that has them wakes the network thread instead of being polled)
       const hardware::NetworkOffloads offloads = nic.offloads();
-      Entry(Level::Info, "Network").text("  ").text(nic.name()).text(nic.interrupts_enabled() ? ": interrupts (MSI)" : ": polled")
-          .text(offloads.receive_checksums || offloads.transmit_checksums ? ", checksum offload" : "");
+      Entry e(Level::Info, "Network");
+      e.text("  ").text(nic.name());
+      if (!nic.interrupts_enabled()) e.text(": polled");
+      else if (offloads.receive_queues > 1) e.text(": interrupts (MSI-X, ").dec(offloads.receive_queues).text(" receive queues with RSS)");
+      else e.text(": interrupts (MSI)");
+      e.text(offloads.receive_checksums || offloads.transmit_checksums ? ", checksum offload" : "").text(offloads.max_segmentation_bytes ? ", TSO" : "");
     }
     if (stacks.count() > 0) {
       stacks.start_service();  // one thread keeps every stack polled

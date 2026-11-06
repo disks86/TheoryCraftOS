@@ -60,6 +60,7 @@ class TcpSocket final : public ITcpSocket {
   static constexpr uint32_t kTimeWaitMs = 2000;
 
   TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& allocator);
+  ~TcpSocket();
 
   // --- ITcpSocket
   TcpState state() const override {
@@ -139,6 +140,8 @@ class TcpSocket final : public ITcpSocket {
 
   uint32_t advertised_window() const;
   void send_segment(uint8_t flags, uint32_t sequence, ConstByteView data, bool with_mss);
+  // Data from the send buffer (`offset` bytes past snd_una_) as one large segment the interface cuts into frames of `mss` bytes.
+  bool send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, uint32_t length, uint16_t mss);
   void send_ack() { send_segment(tcp_flags::kAck, snd_nxt_, ConstByteView(), false); }
   void output();
   void process_ack(const TcpSegment& segment);
@@ -151,6 +154,8 @@ class TcpSocket final : public ITcpSocket {
 
   IIpLayer& ip_;
   TcpManager& manager_;
+  allocators::IAllocator& allocator_;
+  ByteView burst_;  // where a large segment is built (allocated when the first one is sent)
   TcpState state_ = TcpState::Closed;
   uint16_t local_port_ = 0;
   Ipv4Address remote_address_ = kAnyAddress;
