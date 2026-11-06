@@ -20,6 +20,7 @@
 #include "Kernel/Sync.hpp"
 #include "Hardware/Bus/Usb/Xhci/XhciController.hpp"
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace hardware {
 
@@ -107,6 +108,8 @@ bool XhciController::initialize() {
   scratchpad_count_ = (((params2 >> 21) & 0x1F) << 5) | ((params2 >> 27) & 0x1F);
 
   ac64_ = hcc & kHccAc64;
+  const uint32_t psa = (hcc >> 12) & 0xF;   // MaxPSASize: 2^(MaxPSASize + 1) stream contexts at most, 0 when streams are not supported
+  max_stream_array_ = psa ? 1u << (psa + 1) : 0;
 
   if (!take_ownership() || !reset() || !setup_memory() || !start()) {
     shutdown();
@@ -340,10 +343,9 @@ void XhciController::release_device(Device& d) {
     release_view(allocator_, e.buffer);
     e = InterruptEndpoint{};
   }
-  for (BulkEndpoint& e : d.bulk) {
-    e.ring.release(allocator_);
-    e = BulkEndpoint{};
-  }
+  for (BulkEndpoint& e : d.bulk) release_bulk(e);
+  for (PendingBulk& p : pending_)   // what was in flight to it ends, failed
+    if (p.used && !p.done && p.slot == d.slot) p.done = true, p.ok = false;
   for (UniquePointer<IsoEndpoint>& e : d.iso)
     if (e) release_iso(d, *e);
   release_view(allocator_, d.output_context);
@@ -601,6 +603,15 @@ void XhciController::handle_event(const Trb& event) {
   if (trb_type(event.control) != kTrbTransferEvent) return;  // port changes etc.: ports are polled
   const uint32_t slot = event.control >> 24;
   const uint32_t endpoint_id = (event.control >> 16) & 0x1F;
+  for (PendingBulk& p : pending_) {   // an asynchronous bulk transfer (submit_bulk)
+    if (!p.used || p.done || p.slot != slot || p.context_id != endpoint_id || p.trb != event.parameter) continue;
+    const uint32_t code = completion_code(event.status);
+    const uint32_t residual = event.status & 0xFFFFFF;
+    p.ok = code == kCompletionSuccess || code == kCompletionShortPacket;
+    p.transferred = residual <= p.length ? p.length - residual : 0;
+    p.done = true;
+    return;
+  }
   for (Device& d : devices_) {
     if (!d.slot || d.slot != slot) continue;
     for (UniquePointer<IsoEndpoint>& iso : d.iso)
@@ -651,22 +662,71 @@ bool XhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, 
 // ------------------------------------------------------------ bulk endpoints
 
 bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+  return start_bulk(port, endpoint_address, max_packet, 0);
+}
+
+uint32_t XhciController::max_bulk_streams(uint32_t port) const {
   kernel::ScopedMutex lock_guard(lock_);
-  if (port >= ports_ || !devices_[port].present || !max_packet) return false;
+  if (port >= ports_ || !devices_[port].present || devices_[port].speed_id < 4 || max_stream_array_ < 2) return 0;   // (SuperSpeed and above only)
+  const uint32_t controller = max_stream_array_ - 1;
+  return controller < BulkEndpoint::kMaxStreams ? controller : BulkEndpoint::kMaxStreams;
+}
+
+bool XhciController::start_bulk_endpoint_streams(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams) {
+  if (streams == 0 || streams > max_bulk_streams(port)) return false;
+  return start_bulk(port, endpoint_address, max_packet, streams);
+}
+
+void XhciController::release_bulk(BulkEndpoint& e) {
+  e.ring.release(allocator_);
+  for (xhci::ProducerRing& r : e.stream_rings) r.release(allocator_);
+  release_view(allocator_, e.stream_contexts);
+  e = BulkEndpoint{};
+}
+
+// Configure Endpoint for a bulk endpoint; with streams its dequeue pointer is a linear primary stream array (2^(MaxPStreams + 1) entries)
+// whose entries 1..streams point at a transfer ring each (SCT 1: a primary transfer ring).
+bool XhciController::start_bulk(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams) {
+  kernel::ScopedMutex lock_guard(lock_);
+  if (port >= ports_ || !devices_[port].present || !max_packet || streams > BulkEndpoint::kMaxStreams) return false;
   Device& d = devices_[port];
   BulkEndpoint* e = nullptr;
   for (BulkEndpoint& candidate : d.bulk) {
-    if (candidate.active && candidate.address == endpoint_address) return true;  // already running
+    if (candidate.active && candidate.address == endpoint_address) return candidate.streams == streams;  // already running (as asked?)
     if (!candidate.active && !e) e = &candidate;
   }
-  if (!e || !e->ring.init(allocator_)) return false;
+  if (!e) return false;
+  uint32_t max_pstreams = 0, entries = 0;
+  if (streams) {
+    while ((2u << max_pstreams) < streams + 1) ++max_pstreams;   // entries = 2^(MaxPStreams + 1) > the highest stream id
+    entries = 2u << max_pstreams;
+    if (entries > max_stream_array_) return false;
+    e->stream_contexts = allocate_dma_view<uint8_t>(allocator_, uint64_t{entries} * 16, 64);
+    if (e->stream_contexts.empty() || !dma_reachable(e->stream_contexts.data())) {
+      release_bulk(*e);
+      return false;
+    }
+    e->stream_contexts.fill(0);
+    for (uint32_t s = 1; s <= streams; ++s) {
+      xhci::ProducerRing& ring = e->stream_rings[s - 1];
+      if (!ring.init(allocator_)) {
+        release_bulk(*e);
+        return false;
+      }
+      ByteWriter context(e->stream_contexts.subview(uint64_t{s} * 16, 16));
+      context.le64(ring.address() | ring.cycle() | (1u << 1));   // DCS, SCT = 1
+      context.le64(0);
+    }
+    e->streams = streams;
+  } else if (!e->ring.init(allocator_)) {
+    return false;
+  }
 
   const bool in = endpoint_address & 0x80;
   const uint8_t dci = (endpoint_address & 0x0F) * 2 + (in ? 1 : 0);
   e->address = endpoint_address;
   e->context_id = dci;
 
-  const uint32_t context_bytes = 33 * context_size_;
   d.input_context.fill(0);
   if (dci > d.context_entries) d.context_entries = dci;
   const ArrayView<uint32_t> control = context_at(d.input_context, 0);
@@ -677,20 +737,112 @@ bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
 
   constexpr uint32_t kEndpointTypeBulkOut = 2, kEndpointTypeBulkIn = 6;
   const ArrayView<uint32_t> ep = context_at(d.input_context, dci + 1);
-  ep[0] = 0;
+  ep[0] = streams ? (max_pstreams << 10) | (1u << 15) : 0;   // MaxPStreams, LSA (a linear array: no secondary ones)
   ep[1] = (3u << 1) | ((in ? kEndpointTypeBulkIn : kEndpointTypeBulkOut) << 3) | (uint32_t{max_packet} << 16);
-  const uint64_t ring = e->ring.address() | e->ring.cycle();
-  ep[2] = static_cast<uint32_t>(ring);
-  ep[3] = static_cast<uint32_t>(ring >> 32);
+  const uint64_t dequeue = streams ? reinterpret_cast<uint64_t>(e->stream_contexts.data()) : e->ring.address() | e->ring.cycle();
+  ep[2] = static_cast<uint32_t>(dequeue);
+  ep[3] = static_cast<uint32_t>(dequeue >> 32);
   ep[4] = 4096;  // average TRB length
 
   Trb completion;
   if (!run_command(reinterpret_cast<uint64_t>(d.input_context.data()),
                    (kTrbConfigureEndpoint << 10) | (uint32_t{d.slot} << 24), &completion)) {
-    e->ring.release(allocator_);
+    release_bulk(*e);
     return false;
   }
   e->active = true;
+  return true;
+}
+
+bool XhciController::submit_bulk(uint32_t port, uint8_t endpoint_address, uint16_t stream, ByteView data, uint32_t* token) {
+  kernel::ScopedMutex lock_guard(lock_);
+  const uint32_t length = static_cast<uint32_t>(data.size());
+  if (port >= ports_ || !devices_[port].present || data.size() > 0x10000) return false;
+  const uint64_t address = reinterpret_cast<uint64_t>(data.data());
+  if (length && ((address & ~0xFFFFull) != ((address + length - 1) & ~0xFFFFull) || !dma_reachable(data.data()))) return false;
+  Device& d = devices_[port];
+  for (BulkEndpoint& e : d.bulk) {
+    if (!e.active || e.address != endpoint_address) continue;
+    if (e.streams ? stream == 0 || stream > e.streams : stream != 0) return false;
+    uint32_t free = kMaxPendingBulk;
+    for (uint32_t i = 0; i < kMaxPendingBulk && free == kMaxPendingBulk; ++i)
+      if (!pending_[i].used) free = i;
+    if (free == kMaxPendingBulk) return false;
+    xhci::ProducerRing& ring = e.streams ? e.stream_rings[stream - 1] : e.ring;
+    PendingBulk& p = pending_[free];
+    p = PendingBulk{};
+    p.used = true;
+    p.slot = d.slot;
+    p.context_id = e.context_id;
+    p.port = port;
+    p.length = length;
+    p.stream = stream;
+    p.trb = ring.push(address, length & 0x1FFFF, (kTrbNormal << 10) | kTrbIoc | kTrbInterruptOnShortPacket);
+    ring_doorbell(d.slot, e.context_id | (uint32_t{stream} << 16));   // (DB target: the endpoint; DB stream id in bits 31:16)
+    *token = free;
+    return true;
+  }
+  return false;
+}
+
+// Stop Endpoint (every stream of it stops where it is), Set TR Dequeue Pointer for the transfer's stream (or ring) to the next free TRB,
+// so the controller never looks at the abandoned one, and a doorbell for each stream that still has transfers queued, which restarts it.
+bool XhciController::cancel_bulk(uint32_t port, uint32_t token) {
+  kernel::ScopedMutex lock_guard(lock_);
+  if (token >= kMaxPendingBulk || !pending_[token].used || pending_[token].port != port || port >= ports_ || !devices_[port].present) return false;
+  pump_events();
+  PendingBulk& p = pending_[token];
+  if (p.done) {   // it ended after all
+    p = PendingBulk{};
+    return true;
+  }
+  Device& d = devices_[port];
+  for (BulkEndpoint& e : d.bulk) {
+    if (!e.active || e.context_id != p.context_id) continue;
+    Trb completion;
+    const uint32_t target = (uint32_t{e.context_id} << 16) | (uint32_t{d.slot} << 24);
+    run_command(0, (kTrbStopEndpoint << 10) | target, &completion);   // (fails harmlessly if it already stopped)
+    pump_events();   // a transfer that finished meanwhile
+    if (p.done) {
+      p = PendingBulk{};
+    } else {
+      xhci::ProducerRing& ring = e.streams ? e.stream_rings[p.stream - 1] : e.ring;
+      const uint64_t next = ring.next_address() | ring.cycle() | (e.streams ? (1u << 1) : 0u);   // DCS, and SCT 1 for a stream
+      // The stream id is in the status dword (bits 31:16) of the Set TR Dequeue Pointer TRB; the command ring takes no status, so it goes
+      // through push's status argument.
+      const uint64_t trb = command_ring_.push(next, uint32_t{p.stream} << 16, (kTrbSetTrDequeuePointer << 10) | target);
+      ring_doorbell(0, 0);
+      if (!wait_event(kTrbCommandCompletion, trb, &completion, kRingTimeoutMs) || completion_code(completion.status) != kCompletionSuccess) return false;
+      p = PendingBulk{};
+    }
+    // Restart the streams (or the ring) that still have work.
+    if (e.streams) {
+      for (uint32_t s = 1; s <= e.streams; ++s)
+        for (const PendingBulk& q : pending_)
+          if (q.used && !q.done && q.slot == d.slot && q.context_id == e.context_id && q.stream == s) {
+            ring_doorbell(d.slot, e.context_id | (s << 16));
+            break;
+          }
+    } else {
+      ring_doorbell(d.slot, e.context_id);
+    }
+    return true;
+  }
+  return false;
+}
+
+bool XhciController::poll_bulk(uint32_t port, uint32_t token, bool* ok, uint32_t* transferred) {
+  kernel::ScopedMutex lock_guard(lock_);
+  *ok = false;
+  *transferred = 0;
+  if (token >= kMaxPendingBulk || !pending_[token].used || pending_[token].port != port) return true;   // (not a transfer: nothing to wait for)
+  pump_events();
+  PendingBulk& p = pending_[token];
+  if (!p.done && port < ports_ && !(read32(port_register(port)) & kPortConnected)) p.done = true;   // unplugged: it will not end by itself
+  if (!p.done) return false;
+  *ok = p.ok;
+  *transferred = p.transferred;
+  p = PendingBulk{};
   return true;
 }
 

@@ -97,6 +97,39 @@ class IUsbHostController : public IHardware {
   // CLEAR_FEATURE(ENDPOINT_HALT), which the caller still sends).
   virtual bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) = 0;
 
+  // --- Bulk streams (USB 3.x SuperSpeed): one endpoint, many independent queues, named by a stream id (1..), so a device can serve
+  // several transfers out of order (UAS gives every command a stream). How many streams an endpoint of the device on `port` may have
+  // here: 0 when the device is not SuperSpeed or the controller has none.
+  virtual uint32_t max_bulk_streams(uint32_t port) const { (void)port; return 0; }
+  // Configures a bulk endpoint with `streams` streams (1..max_bulk_streams); like start_bulk_endpoint otherwise. Transfers on it go
+  // through submit_bulk with a stream id.
+  virtual bool start_bulk_endpoint_streams(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams) {
+    (void)port; (void)endpoint_address; (void)max_packet; (void)streams;
+    return false;
+  }
+
+  // --- Asynchronous bulk transfers: queued without waiting, finished later, so that several are in flight at once (on different
+  // endpoints, or streams of one). `data` follows bulk_transfer's rules and must stay put until the transfer finished. `stream` is 0 on
+  // an endpoint without streams. *token names the transfer for poll_bulk. False (nothing queued) if the controller cannot, the endpoint is
+  // not running, or too many transfers are pending.
+  virtual bool supports_async_bulk() const { return false; }
+  virtual bool submit_bulk(uint32_t port, uint8_t endpoint_address, uint16_t stream, ByteView data, uint32_t* token) {
+    (void)port; (void)endpoint_address; (void)stream; (void)data; (void)token;
+    return false;
+  }
+  // True once the transfer is over (the token is free again): *ok says whether it succeeded (a short IN transfer does), *transferred
+  // how much moved. False while it is still running. Never blocks; a transfer to a device that was unplugged ends, failed.
+  virtual bool poll_bulk(uint32_t port, uint32_t token, bool* ok, uint32_t* transferred) {
+    (void)port; (void)token;
+    *ok = false;
+    *transferred = 0;
+    return true;
+  }
+  // Takes back a transfer that will not end by itself (a UAS command the device ended without its data stage): the endpoint stops, the
+  // transfer is skipped on its ring (or stream) and the token is free; the endpoint's other transfers carry on. False if it could not be
+  // done (the endpoint is then best reset).
+  virtual bool cancel_bulk(uint32_t port, uint32_t token) { (void)port; (void)token; return false; }
+
   // --- Isochronous endpoints (audio): a steady stream of packets, one per service interval, delivered on time or lost, never retried.
   // Controllers that cannot do them say so here and refuse the calls below (the defaults).
   virtual bool supports_isochronous() const { return false; }

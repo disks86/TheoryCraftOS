@@ -68,6 +68,12 @@ class XhciController final : public IXhciController {
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
   bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
   bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
+  uint32_t max_bulk_streams(uint32_t port) const override;
+  bool start_bulk_endpoint_streams(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams) override;
+  bool supports_async_bulk() const override { return true; }
+  bool submit_bulk(uint32_t port, uint8_t endpoint_address, uint16_t stream, ByteView data, uint32_t* token) override;
+  bool poll_bulk(uint32_t port, uint32_t token, bool* ok, uint32_t* transferred) override;
+  bool cancel_bulk(uint32_t port, uint32_t token) override;
   bool supports_hotplug() const override { return true; }
   bool poll_hotplug(UsbHotplugEvent* event) override;
   uint32_t port_generation(uint32_t port) const override;
@@ -94,11 +100,25 @@ class XhciController final : public IXhciController {
   };
 
   struct BulkEndpoint {
+    static constexpr uint32_t kMaxStreams = 16;
     bool active = false;
     uint8_t address = 0;
     uint8_t context_id = 0;
-    xhci::ProducerRing ring;
+    xhci::ProducerRing ring;                    // without streams
+    uint32_t streams = 0;                       // with: stream ids 1..streams, each its own ring
+    ByteView stream_contexts;                   // the stream context array (16 bytes an entry, entry 0 reserved)
+    xhci::ProducerRing stream_rings[kMaxStreams];   // stream i on stream_rings[i - 1]
   };
+
+  // An asynchronous bulk transfer (submit_bulk) until poll_bulk collects it; completed by the event pump.
+  struct PendingBulk {
+    bool used = false, done = false, ok = false;
+    uint8_t slot = 0, context_id = 0;
+    uint32_t port = 0, length = 0, transferred = 0;
+    uint16_t stream = 0;
+    uint64_t trb = 0;
+  };
+  static constexpr uint32_t kMaxPendingBulk = 128;
 
   // One isochronous endpoint: a ring of transfer descriptors of one packet each, and a buffer with one slot per descriptor. OUT: slots from head to
   // tail are queued and not yet sent. IN: every slot is armed or holds a packet nobody has taken; head is the oldest.
@@ -165,6 +185,8 @@ class XhciController final : public IXhciController {
   void pump_events();
   void arm_endpoint(Device& d, InterruptEndpoint& e);
   bool start_in_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval, bool bulk);
+  bool start_bulk(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint32_t streams);
+  void release_bulk(BulkEndpoint& e);
   void release_device(Device& d);
 
   bool dma_reachable(const void* p) const;
@@ -184,6 +206,8 @@ class XhciController final : public IXhciController {
   uint64_t cap_ = 0, op_ = 0, runtime_ = 0, doorbells_ = 0;
   uint16_t version_ = 0;
   uint32_t max_slots_ = 0, ports_ = 0, context_size_ = 32;
+  uint32_t max_stream_array_ = 0;   // entries of a primary stream array the controller takes (HCCPARAMS1 MaxPSASize; 0: no streams)
+  PendingBulk pending_[kMaxPendingBulk];
 
   uint64_t* dcbaa_ = nullptr;
   uint64_t* scratchpad_table_ = nullptr;

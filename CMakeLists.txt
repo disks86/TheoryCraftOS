@@ -259,6 +259,8 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/Ide/IdeStorageDevice.cpp
   src/Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
   src/Hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
+  src/Hardware/StorageDevice/Usb/UasProtocol.cpp
+  src/Hardware/StorageDevice/Usb/UasStorageDevice.cpp
   src/Hardware/StorageDevice/Sd/SdCard.cpp
   src/Hardware/StorageDevice/Sd/SdStorageDevice.cpp
   src/Hardware/Bus/Rtsx/RtsxHost.cpp

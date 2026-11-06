@@ -19,6 +19,7 @@
 #include "Hardware/StorageDevice/Usb/UsbMassStorageDevice.hpp"
 #include "Hardware/Bus/Usb/UsbDescriptors.hpp"
 #include "Hardware/StorageDevice/Scsi/ScsiCommands.hpp"
+#include "Hardware/StorageDevice/Usb/UasStorageDevice.hpp"
 #include "Hardware/StorageDevice/WaitFor.hpp"
 
 namespace hardware {
@@ -57,6 +58,8 @@ void UsbMassStorageDevice::discover_port(IUsbHostController& host_controller, ui
       ConstByteView descriptor;
       UsbConfigurationInfo configuration;
       if (!walker.next(&descriptor) || !parse_usb_configuration(descriptor, &configuration)) return;
+      // USB Attached SCSI first (many commands at once); a device without it, or where it does not come up, gets Bulk-Only below.
+      if (UasStorageDevice::attach(*host, port, configuration.value, config, allocator, st, out)) return;
 
       bool in_interface = false;
       uint8_t number = 0, in_ep = 0, out_ep = 0;

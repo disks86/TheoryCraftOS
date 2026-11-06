@@ -150,9 +150,36 @@ boot log's thread-safety section prints the properties.
 - **Slots.** Up to 64 slots shared by the units, each with a 64 KiB buffer and its request and response headers.
 - **Commands.** Reads and writes go out in parallel chunks. A chunk interrupted by a unit attention is sent again, up to three times.
 
+## USB Attached SCSI (UAS)
+
+`UasStorageDevice` (`src/Hardware/StorageDevice/Usb/`) takes a USB disk before Bulk-Only Transport does, when its configuration has an
+interface with protocol 0x62:
+
+- **Setup.** The interface is switched to its UAS alternate setting (SET_INTERFACE), and its four pipes (command, status, data in, data
+  out) are found by their Pipe Usage descriptors. If anything fails, the interface goes back to alternate 0 and BOT takes the disk.
+- **Information units.** A Command IU carries the CDB with a tag, and the device answers on the status pipe with a Sense IU (status and
+  sense data) or a Response IU (a task management answer or an error). `UasProtocol.cpp` builds and parses them; parsing refuses short,
+  overlong and inconsistent units.
+- **USB 3: a bulk stream per tag.** The xHCI driver gives the status and data endpoints a primary stream context array with a ring per
+  stream (`start_bulk_endpoint_streams`); a transfer rings the doorbell with the stream id. Tag *n* uses stream *n* on both pipes. Up to
+  16 tags, fewer if the device's SuperSpeed companion descriptors or the controller's MaxPSASize allow fewer. Each tag has its own 64 KiB
+  buffer; requests go through `run_chunks` like the other queued drivers, and `queue_depth` is the tag count.
+- **Asynchronous bulk.** `IUsbHostController::submit_bulk` queues a transfer and returns a token, `poll_bulk` reports when the event pump
+  has completed it, and `cancel_bulk` takes back one still queued (Stop Endpoint, then Set TR Dequeue Pointer for that stream). A tag
+  queues its status and data transfers before the command, so the device can answer in any order.
+- **USB 2: one command at a time.** Without streams the device announces each data phase with Read Ready or Write Ready, which only works
+  with one command outstanding; `queue_depth` is then 1.
+- **Errors.** CHECK CONDITION gives the sense key from the Sense IU; UNIT ATTENTION is retried and NOT READY waited out, as with BOT. If
+  the status arrives while the data transfer is still queued (a short or failed command), the data transfer is cancelled. A transfer that
+  fails or does not finish in 10 seconds gives the device up: every later request fails until it is plugged in again.
+- **Tests.** `tests/run_host_tests.sh UasTest` (ASan and TSan) covers the IU and descriptor parsers with truncation and bit flips, and a
+  fake UAS device (`tests/FakeUas.hpp`) that completes commands out of order: eight threads, a medium error that cancels queued data,
+  unit attention, unplugging, the USB 2 path, and the fall back to BOT. In QEMU a `usb-uas` disk on `qemu-xhci` comes up with 16 tags
+  and reaches 12 in flight; on a USB 2 port (`qemu-xhci,p3=0`) it runs one command at a time. Both pass the storage checks.
+
 ## Shared pieces
 
-`NvmeStorageDevice`, `VirtioBlockDevice`, `VirtioScsiController` and `AhciStorageDevice` share `QueuedStorage.hpp`:
+`NvmeStorageDevice`, `VirtioBlockDevice`, `VirtioScsiController`, `AhciStorageDevice` and `UasStorageDevice` share `QueuedStorage.hpp`:
 
 - **Vectors.** The completion vectors (0xA0–0xBF), none when the build sets `TCOS_STORAGE_POLLED`.
 - **Slots.** A lock-free `SlotPool`.
@@ -266,7 +293,8 @@ Its contents afterwards are the card's choice, so `discard_zeroes` is off then.
 **Polled build.** `-DTCOS_STORAGE_POLLED=ON` builds a kernel whose storage drivers never turn on completion interrupts. It is for
 machines with broken MSI, and it is how the polled paths, AHCI's included, are tested.
 
-**Checks.** In QEMU, every disk type was present at once: virtio-blk twice, NVMe, virtio-scsi, and SATA twice. The checks, all of which
+**Checks.** In QEMU, every disk type was present at once: virtio-blk twice, NVMe, virtio-scsi, SATA twice, pvscsi, a USB stick and a
+UAS disk. The checks, all of which
 passed:
 
 - concurrent readers on every disk, and writers on a scratch disk;
@@ -280,20 +308,21 @@ The configurations: KVM with 4, 8 and 1 cores (8 with `num-queues=3` for virtio-
 
 ## What is not done
 
-- **Some drivers are synchronous by nature**. USB mass storage uses Bulk-Only Transport, one command at a time; UAS would lift that. SD,
-  IDE, and the firmware fallback (`UefiBlockStorageDevice`) also keep `queue_depth = 1`. **pvscsi** has a ring and could be queued like
+- **Some drivers are synchronous by nature**. USB disks that only speak Bulk-Only Transport, and UAS disks on USB 2, run one command at a
+  time. SD, IDE, and the firmware fallback (`UefiBlockStorageDevice`) also keep `queue_depth = 1`. **pvscsi** has a ring and could be queued like
   virtio-scsi, but is not yet.
 - **Copies and slot limits.**
   - Every queued driver copies through slot buffers. Zero-copy needs to know that a caller's buffer is device-reachable, which kernel
     buffers are and user-mode buffers may not be.
   - A big request takes extra slots only if they are free, so on a busy device it runs mostly in series. The I/O scheduler still counts it
     as one request.
-- **USB disks stay one command at a time.** UAS needs bulk streams in the xHCI driver, an asynchronous bulk interface, and the UAS
-  protocol itself; that is a project of its own. ATA has no write zeroes (SCT Write Same is not done).
+- **UAS limits.** At most 16 tags. No task management (ABORT TASK, LOGICAL UNIT RESET) and no endpoint reset: a transfer error gives
+  the device up instead of recovering it. Streams only on xHCI. If UAS setup fails after the pipes were started, BOT reuses endpoints
+  that were configured for UAS. ATA has no write zeroes (SCT Write Same is not done).
 - **Driver features still missing.**
   - NVMe: no interrupt coalescing (left off on purpose, for latency), only the first namespace.
   - AHCI: no port multipliers.
-  - virtio-scsi, pvscsi and USB: only the first LUN of each target, and one UNMAP descriptor a command.
+  - virtio-scsi, pvscsi, USB and UAS: only the first LUN of each target, and one UNMAP descriptor a command.
   - None of it has been tried on real hardware.
 - **Some callers don't pass priorities yet**. Windows `FileIoPriorityHintInformation` and process I/O priority are still ignored, and
   Linux `ioprio_set` is not wired to `set_thread_io_priority`. User processes do not yet put their threads into one `io_group`.
