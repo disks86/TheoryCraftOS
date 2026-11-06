@@ -65,6 +65,8 @@ constexpr Range kRanges[] = {
     // Xe3 (Panther Lake, Wildcat Lake)
     {0xB080, 0xB0BF, make(A::Xe3, "Intel Arc Graphics (Xe3, Panther Lake)", false, true, true)},
     {0xFD80, 0xFD8F, make(A::Xe3, "Intel Graphics (Xe3, Wildcat Lake)", false, true, true)},
+    // Xe3p (Nova Lake-S 0xD740 .. 0xD74B, Nova Lake-P 0xD750 .. 0xD75F; the xe driver's INTEL_NVLS_IDS / INTEL_NVLP_IDS)
+    {0xD740, 0xD75F, make(A::Xe3p, "Intel Graphics (Xe3p, Nova Lake)", false, true, true)},
 };
 }  // namespace
 

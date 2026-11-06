@@ -33,6 +33,7 @@ enum class IntelGpuArchitecture : uint8_t {
   XeLpg,   // Xe-LPG: Meteor Lake and Arrow Lake
   Xe2,     // Xe2: Lunar Lake and Arc Battlemage (B-series)
   Xe3,     // Xe3: Panther Lake and Wildcat Lake
+  Xe3p,    // Xe3p: Nova Lake (integrated Xe3p_LPG graphics, Xe3p_LPM media)
 };
 
 struct IntelGpuInfo {
