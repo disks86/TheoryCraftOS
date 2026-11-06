@@ -38,37 +38,9 @@ constexpr uint8_t kIoFlush = 0x00, kIoWrite = 0x01, kIoRead = 0x02;
 constexpr uint32_t kPciCommand = 0x04;
 constexpr uint32_t kPage = 4096;
 constexpr uint32_t kPrpListBytes = 128;          // per slot: 16 entries, enough for 64 KiB (and 128-byte aligned, so a list never crosses a page)
-constexpr uint64_t kInterruptWaitUs = 2000;      // how long a waiter sleeps before it looks at its queue itself
 constexpr uint64_t kInterruptCheckUs = 20000;    // how long start-up waits for a queue's first interrupt
 
-// The microseconds of the time stamp counter (0 until it is calibrated).
-uint64_t now_us() {
-  const uint64_t per_us = tsc_ticks_per_us();
-  return per_us ? read_tsc() / per_us : 0;
-}
-
 uint64_t physical(const void* p) { return reinterpret_cast<uint64_t>(p); }   // (the kernel's memory is identity mapped)
-
-#if defined(__x86_64__)
-// The storage vectors (kVectorStorageFirst...) in use, one bit each, shared by every controller.
-uint32_t g_storage_vectors = 0;
-
-uint8_t claim_storage_vector() {
-  uint32_t used = __atomic_load_n(&g_storage_vectors, __ATOMIC_RELAXED);
-  for (;;) {
-    if (used == ~0u) return 0;
-    const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(~used));
-    if (bit >= kernel::kVectorStorageCount) return 0;
-    if (__atomic_compare_exchange_n(&g_storage_vectors, &used, used | (1u << bit), false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-      return static_cast<uint8_t>(kernel::kVectorStorageFirst + bit);
-  }
-}
-
-void release_storage_vector(uint8_t vector) {
-  if (vector >= kernel::kVectorStorageFirst && vector < kernel::kVectorStorageFirst + kernel::kVectorStorageCount)
-    __atomic_fetch_and(&g_storage_vectors, ~(1u << (vector - kernel::kVectorStorageFirst)), __ATOMIC_ACQ_REL);
-}
-#endif
 }  // namespace
 
 uint32_t NvmeStorageDevice::read32(uint32_t reg) const { return *reinterpret_cast<volatile uint32_t*>(registers_ + reg); }
@@ -199,12 +171,10 @@ bool NvmeStorageDevice::set_up_slots() {
     Slot& s = slots_[i];
     s.buffer = slot_memory_.subview(uint64_t{i} * chunk_bytes_, chunk_bytes_);
     s.prp = prp_memory_.subview(uint64_t{i} * kPrpListBytes, kPrpListBytes).cast<uint64_t>();
-    s.completed = 0;
-    s.status = 0;
-    s.lost = false;
-    s.done.reset();
+    s.completion.lost = false;
+    s.completion.arm();
   }
-  __atomic_store_n(&free_slots_, slot_count_ == 64 ? ~uint64_t{0} : (uint64_t{1} << slot_count_) - 1, __ATOMIC_RELEASE);
+  pool_.reset(slot_count_);
   return true;
 }
 
@@ -338,13 +308,13 @@ bool NvmeStorageDevice::check_interrupts() {
   for (uint32_t i = 0; i < queue_count_; ++i) {
     IoQueue& q = queues_[i];
     const uint64_t before = __atomic_load_n(&q.interrupts, __ATOMIC_ACQUIRE);
-    const uint32_t slot = acquire_slot();
+    const uint32_t slot = pool_.acquire();
     const bool read = execute(q, slot, kIoRead, 0, 1, info_.block_size);
-    if (!slots_[slot].lost) release_slot(slot);
+    if (!slots_[slot].completion.lost) pool_.release(slot);
     if (!read) return false;
-    const uint64_t start = now_us();
+    const uint64_t start = storage_now_us();
     while (__atomic_load_n(&q.interrupts, __ATOMIC_ACQUIRE) == before) {
-      if (now_us() - start > kInterruptCheckUs) return false;
+      if (storage_now_us() - start > kInterruptCheckUs) return false;
       kernel::cpu_relax();
     }
   }
@@ -383,7 +353,7 @@ void NvmeStorageDevice::shutdown() {
     q.entries = 0;
   }
   queue_count_ = 0;
-  __atomic_store_n(&free_slots_, 0, __ATOMIC_RELEASE);
+  pool_.close();
   for (Slot& s : slots_) s.buffer = ByteView(), s.prp = ArrayView<uint64_t>();
   slot_count_ = 0;
   release_view(allocator_, slot_memory_);
@@ -395,21 +365,6 @@ void NvmeStorageDevice::shutdown() {
 }
 
 // ---- requests ----
-
-uint32_t NvmeStorageDevice::acquire_slot() {
-  for (;;) {
-    uint64_t free = __atomic_load_n(&free_slots_, __ATOMIC_ACQUIRE);
-    while (free) {
-      const uint32_t slot = static_cast<uint32_t>(__builtin_ctzll(free));
-      if (__atomic_compare_exchange_n(&free_slots_, &free, free & ~(uint64_t{1} << slot), true, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return slot;
-    }
-    // Every slot busy (the I/O scheduler keeps to queue_depth, so only callers that bypass it get here): wait for one.
-    if (kernel::running()) kernel::yield();
-    else kernel::cpu_relax();
-  }
-}
-
-void NvmeStorageDevice::release_slot(uint32_t slot) { __atomic_fetch_or(&free_slots_, uint64_t{1} << slot, __ATOMIC_RELEASE); }
 
 NvmeStorageDevice::IoQueue& NvmeStorageDevice::queue_for_this_core() {
   const uint32_t core = kernel::current_core();
@@ -431,14 +386,13 @@ void NvmeStorageDevice::reap(IoQueue& q) {
     q.head = (q.head + 1) % q.entries;
     if (q.head == 0) q.phase ^= 1;
     if (id < slot_count_) {
-      slots_[id].status = status;
-      __atomic_store_n(&slots_[id].completed, 1, __ATOMIC_RELEASE);
+      slots_[id].completion.record(status);
       woken[n++] = id;
     }
   }
   if (n) write32(kDoorbells + (2 * q.id + 1) * doorbell_stride_, q.head);
   kernel::detail::unlock_list(&q.lock, flags);
-  for (uint32_t i = 0; i < n; ++i) slots_[woken[i]].done.set();
+  for (uint32_t i = 0; i < n; ++i) slots_[woken[i]].completion.wake();
 }
 
 kernel::Frame* NvmeStorageDevice::on_queue_interrupt(kernel::Frame* frame, void* queue) {
@@ -472,8 +426,7 @@ bool NvmeStorageDevice::execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint6
     cmd.cdw11 = static_cast<uint32_t>(lba >> 32);
     cmd.cdw12 = blocks - 1;  // zero-based count
   }
-  __atomic_store_n(&s.completed, 0, __ATOMIC_RELAXED);
-  s.done.reset();
+  s.completion.arm();
 
   const uint64_t flags = kernel::detail::lock_list(&q.lock);
   q.submission[q.tail] = cmd;
@@ -482,28 +435,8 @@ bool NvmeStorageDevice::execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint6
   write32(kDoorbells + (2 * q.id) * doorbell_stride_, q.tail);
   kernel::detail::unlock_list(&q.lock, flags);
 
-  // Sleep until the completion interrupt (looking ourselves when it is late), or poll the queue when there are no interrupts.
-  const bool sleep = interrupts_ && kernel::running() && kernel::irq_enabled();
-  const uint64_t start = now_us();
-  const uint64_t limit_us = uint64_t{timeout_ms_} * 1000;
-  while (!__atomic_load_n(&s.completed, __ATOMIC_ACQUIRE)) {
-    if (sleep) {
-      if (!s.done.wait(kInterruptWaitUs)) reap(q);
-      else if (!__atomic_load_n(&s.completed, __ATOMIC_ACQUIRE)) s.done.reset();   // (a stale set from the slot's last use)
-    } else {
-      reap(q);
-      if (__atomic_load_n(&s.completed, __ATOMIC_ACQUIRE)) break;
-      if (kernel::running()) kernel::yield();
-      else kernel::cpu_relax();
-    }
-    if (now_us() - start > limit_us) {
-      reap(q);
-      if (__atomic_load_n(&s.completed, __ATOMIC_ACQUIRE)) break;
-      s.lost = true;   // the device may still write into it later
-      return false;
-    }
-  }
-  return s.status == 0;
+  if (!s.completion.wait(may_sleep_for_interrupt(interrupts_), uint64_t{timeout_ms_} * 1000, [&] { reap(q); })) return false;
+  return s.completion.status == 0;
 }
 
 // Moves a whole request through one slot, chunk_bytes_ at a time.
@@ -518,7 +451,7 @@ bool NvmeStorageDevice::run(bool write, uint64_t lba, ByteView into, ConstByteVi
     __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
     return false;
   }
-  const uint32_t slot = acquire_slot();
+  const uint32_t slot = pool_.acquire();
   IoQueue& q = queue_for_this_core();
   const uint32_t max_blocks = chunk_bytes_ / info_.block_size;
   uint64_t done = 0;
@@ -538,7 +471,7 @@ bool NvmeStorageDevice::run(bool write, uint64_t lba, ByteView into, ConstByteVi
     count -= n;
     done += chunk;
   }
-  if (!slots_[slot].lost) release_slot(slot);
+  if (!slots_[slot].completion.lost) pool_.release(slot);
   __atomic_fetch_add(ok ? (write ? &stats_.writes : &stats_.reads) : &stats_.errors, 1, __ATOMIC_RELAXED);
   return ok;
 }
@@ -555,9 +488,9 @@ bool NvmeStorageDevice::write(uint64_t lba, ConstByteView buffer) {
 
 bool NvmeStorageDevice::flush() {
   if (!enabled_ || slot_count_ == 0) return false;
-  const uint32_t slot = acquire_slot();
+  const uint32_t slot = pool_.acquire();
   const bool ok = execute(queue_for_this_core(), slot, kIoFlush, 0, 0, 0);
-  if (!slots_[slot].lost) release_slot(slot);
+  if (!slots_[slot].completion.lost) pool_.release(slot);
   if (!ok) __atomic_fetch_add(&stats_.errors, 1, __ATOMIC_RELAXED);
   return ok;
 }
@@ -577,26 +510,10 @@ uint64_t NvmeStorageDevice::queue_interrupts(uint32_t queue) const {
 }
 
 void NvmeStorageDevice::describe(IPropertySink& sink) const {
-  sink.add_number("I/O queues", queue_count_);
-  sink.add_number("Queue depth", slot_count_);
+  QueueReport report[kMaxQueues];
+  for (uint32_t i = 0; i < queue_count_; ++i) report[i] = {queues_[i].core, __atomic_load_n(&queues_[i].interrupts, __ATOMIC_RELAXED)};
+  describe_queues(sink, queue_count_, slot_count_, interrupts_, report);
   sink.add_number("Largest transfer", chunk_bytes_ / 1024, "KiB");
-  sink.add_text("Completions", interrupts_ ? "MSI-X interrupt per queue, on its core" : "polled");
-  if (!interrupts_) return;
-  char text[kMaxQueues * 21];   // "core:count " per queue
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < queue_count_; ++i) {
-    auto put = [&](uint64_t v) {
-      char digits[20];
-      uint32_t d = 0;
-      do digits[d++] = static_cast<char>('0' + v % 10); while ((v /= 10) && d < sizeof digits);
-      while (d && n < sizeof text) text[n++] = digits[--d];
-    };
-    put(queues_[i].core);
-    if (n < sizeof text) text[n++] = ':';
-    put(__atomic_load_n(&queues_[i].interrupts, __ATOMIC_RELAXED));
-    if (n < sizeof text && i + 1 < queue_count_) text[n++] = ' ';
-  }
-  sink.add("Interrupts (core:count)", StringView(text, n));
 }
 
 }  // namespace hardware

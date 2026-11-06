@@ -245,6 +245,7 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/StorageDeviceBase.cpp
   src/Hardware/StorageDevice/SystemStorageDevices.cpp
   src/Hardware/StorageDevice/ScheduledStorageDevice.cpp
+  src/Hardware/StorageDevice/QueuedStorage.cpp
   src/IoScheduler/IoCost.cpp
   src/IoScheduler/FairQueue.cpp
   src/IoScheduler/LatencyController.cpp

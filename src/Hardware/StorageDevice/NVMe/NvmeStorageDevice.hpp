@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Pci/PciMsix.hpp"
+#include "Hardware/StorageDevice/QueuedStorage.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
 #include "Kernel/Interrupts.hpp"
 #include "Kernel/Sync.hpp"
@@ -44,7 +45,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   static constexpr uint32_t kAdminEntries = 16;
   static constexpr uint32_t kMaxQueues = 16;
   static constexpr uint32_t kMaxQueueEntries = 128;
-  static constexpr uint32_t kMaxSlots = 64;
+  static constexpr uint32_t kMaxSlots = SlotPool::kMaxSlots;
   static constexpr uint32_t kSlotBytes = 64 * 1024;
 
   NvmeStorageDevice(const IPciBus& pci, const PciDeviceInfo& device, allocators::IAllocator& allocator,
@@ -112,10 +113,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   struct Slot {
     ByteView buffer;                      // kSlotBytes of DMA memory
     ArrayView<uint64_t> prp;              // the PRP list for the pages after the first
-    kernel::Event done;                   // set when its completion is reaped (a waiter re-checks `completed`: a set can be stale)
-    uint32_t completed = 0;               // atomic
-    uint16_t status = 0;
-    bool lost = false;                    // timed out: the device may still use its memory, so it is never handed out again
+    CommandCompletion completion;
   };
 
   uint32_t read32(uint32_t reg) const;
@@ -134,8 +132,6 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   void disable_interrupts();
 
   bool run(bool write, uint64_t lba, ByteView into, ConstByteView from);
-  uint32_t acquire_slot();
-  void release_slot(uint32_t slot);
   IoQueue& queue_for_this_core();
   // Runs one command through `slot` on `q` and waits for it. False on an error status or a timeout.
   bool execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint64_t lba, uint32_t blocks, uint64_t bytes);
@@ -159,7 +155,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   uint8_t core_queue_[64] = {};           // the queue each of the first 64 cores submits on (others: core % queue_count_)
   Slot slots_[kMaxSlots];
   uint32_t slot_count_ = 0;
-  uint64_t free_slots_ = 0;               // atomic: bit n set while slot n is free
+  SlotPool pool_;
   ByteView slot_memory_;                  // every slot's buffer, then
   ByteView prp_memory_;                   // every slot's PRP list
   // The MSI-X table lies in one of the function's BARs, which (like the registers) are reachable at their physical address.
