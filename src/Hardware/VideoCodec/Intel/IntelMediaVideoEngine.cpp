@@ -83,12 +83,12 @@ bool IntelMediaVideoEngine::initialize() {
       if (xe_lpg || xe_hpg || xe2) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) |
                                           (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);
-        // Encode: the VDEnc commands changed after Xe-LP, and only the Xe-LP ones and, for both codecs, the Xe-LPG ones are written (IntelHevcEncodeCommands.hpp, IntelEncodeCommands.cpp). Compared with the media
+        // Encode: the VDEnc commands changed after Xe-LP, and only the Xe-LP, Xe-LPG and Arc ones are written (IntelHevcEncodeCommands.hpp, IntelEncodeCommands.cpp). Compared with the media
         // driver's definitions (Xe_LPM_plus, Xe_HPM, Xe2): the pipe buffer command is 89 dwords (71), the weights 7 (3), the walker 3 (27) with a separate 28-dword HEVC/VP9 tile
         // and slice state, CMD1 is 33 (Xe_LPM_plus) or 39 (Xe_HPM, Xe2) dwords (31), CMD2 62 (51), and H.264 gets VDENC_AVC_IMG_STATE (26) and VDENC_AVC_SLICE_STATE (4); Xe_HPM
         // and Xe2 also grow the pipe mode select and the frame statistics streamout. The CMD1/CMD2 values come from per-platform constant tables, so each platform family needs
-        // its own images (tools/gen_intel_hevc_xelpg.py and gen_intel_avc_xelpg.py do Xe_LPM_plus); the rest stays with the CPU encoder until it is done.
-        info_.accelerated_encode_codecs = xe_lpg ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0;
+        // its own images (tools/gen_intel_{hevc,avc}_xelpg.py do Xe_LPM_plus, gen_intel_hevc_xelpg.py xehpg and gen_intel_avc_xehpg.py do Arc); the rest stays with the CPU encoder until it is done.
+        info_.accelerated_encode_codecs = (xe_lpg || xe_hpg) ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0;
       } else if (gen12) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) |
                                           (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);

@@ -7,7 +7,9 @@ VDENC_CMD2 (encode_hevc_vdenc_const_settings*.cpp), the DO_FIELD maps that put t
 prediction, one reference, low-delay B) and writes the resulting command images. CMD1 and CMD2 depend on the slice quantiser in one dword each (checked here), so they are
 written for the middle quantiser plus that dword for every quantiser.
 
-usage: gen_intel_hevc_xelpg.py <media-driver-dir> <out.inc>
+usage: gen_intel_hevc_xelpg.py <media-driver-dir> <out.inc> [xelpg | xehpg]
+
+The platform (default xelpg) picks the files and names below: xehpg is Arc Alchemist (Xe_HPM; its HEVC const settings are Xe_XPM_base's) and writes kXeHpg... names.
 
 <media-driver-dir> holds copies of these files from github.com/intel/media-driver (paths in the repository in brackets):
   cmdpar.h            [media_softlet/agnostic/common/hw/vdbox/mhw_vdbox_vdenc_cmdpar.h]
@@ -16,11 +18,20 @@ usage: gen_intel_hevc_xelpg.py <media-driver-dir> <out.inc>
   cs_common.cpp       [media_softlet/agnostic/common/codec/hal/enc/hevc/features/encode_hevc_vdenc_const_settings.cpp]
   cs_lpm.cpp          [media_softlet/agnostic/Xe_M_plus/Xe_LPM_plus_base/codec/hal/enc/hevc/features/encode_hevc_vdenc_const_settings_xe_lpm_plus_base.cpp]
   hwcmd.h             [media_softlet/agnostic/Xe_M_plus/Xe_LPM_plus/hw/vdbox/mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h; the Xe_LPM_plus_base copy]
+  For xehpg instead of cs_lpm.cpp / impl_lpmplus_base.h / hwcmd.h: cs_xpm.cpp [media_driver/media_softlet/agnostic/Xe_M/Xe_XPM_base/codec/hal/enc/hevc/features/
+  encode_hevc_vdenc_const_settings_xe_xpm_base.cpp] and hwcmd_hpm.h [... Xe_HPM/.../mhw_vdbox_vdenc_hwcmd_xe_hpm.h]; the Xe_HPM implementation adds nothing to the common one.
 Needs g++.
 """
 import os, re, subprocess, sys, tempfile
 
 QPS = range(10, 52)
+
+PLATFORMS = {
+    'xelpg': dict(ns='xe_lpm_plus_base::v0', hwcmd='hwcmd.h', cs='cs_lpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe_Lpm_Plus_Base', pms_impl='impl_lpmplus_base.h', prefix='XeLpg',
+                  hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h'),
+    'xehpg': dict(ns='xe_hpm', hwcmd='hwcmd_hpm.h', cs='cs_xpm.cpp', cs_class='EncodeHevcVdencConstSettingsXe_Xpm_Base', pms_impl=None, prefix='XeHpg',
+                  hwcmd_include='mhw_vdbox_vdenc_hwcmd_xe_hpm.h'),
+}
 
 
 def brace_block(s, start):
@@ -84,8 +95,8 @@ HARNESS = r'''
 #include <cstdlib>
 #include <cmath>
 #include <array>
-#include "mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h"
-using namespace mhw::vdbox::vdenc::xe_lpm_plus_base::v0;
+#include "HWCMD_INCLUDE"
+using namespace mhw::vdbox::vdenc::NAMESPACE;
 typedef int MOS_STATUS;
 #define MOS_STATUS_SUCCESS 0
 #define ENCODE_FUNC_CALL()
@@ -94,6 +105,9 @@ typedef int MOS_STATUS;
 #define MOS_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CLIP3(lo, hi, v) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
 #define MOS_ALIGN_CEIL(v, a) (((v) + (a) - 1) / (a) * (a))
+#define MEDIA_IS_WA(t, w) (0)   // (no workaround: current production steppings)
+struct WaTable {};
+struct OsItf { WaTable *pfnGetWaTable(OsItf *) { static WaTable t; return &t; } };
 static int Clip3(int x, int y, int z) { return z < x ? x : (z > y ? y : z); }
 enum { I_TYPE = 1, P_TYPE = 2, B_TYPE = 3 };
 PAR_STRUCTS
@@ -113,6 +127,8 @@ struct Ctx {
   bool m_hevcVdencRoundingPrecisionEnabled = true;   // (the driver's default for "HEVC VDEnc Rounding Enable")
   bool m_hevcRdoqEnabled = false;                    // (target usage 7)
   void *m_featureSetting;
+  OsItf *m_osItf = &m_osItfStorage;
+  OsItf m_osItfStorage;
   BODIES
 };
 #define DOF(dw, field, value) cmd.dw.field = (value)
@@ -158,7 +174,7 @@ int main(int argc, char **argv) {
       par.bitDepthMinus8 = 0; par.chromaType = 1; par.randomAccess = false; par.VdencPipeModeSelectPar0 = 1;
       Cmd::VDENC_PIPE_MODE_SELECT_CMD cmd; auto &params = par;
       DO_FIELDS_PMS();
-      DO_FIELDS_PMS_LPM();
+      PMS_OVERRIDE
       dump("PMS", (uint32_t *)&cmd, 6);
     }
     {
@@ -185,12 +201,12 @@ int main(int argc, char **argv) {
 '''
 
 
-def build_harness(d, tmp):
+def build_harness(d, tmp, plat):
     bodies = '\n'.join([
         'int SetCmd1Common() {%s}' % function_body(d + '/cs_common.cpp', 'MOS_STATUS EncodeHevcVdencConstSettings::SetVdencCmd1Settings()'),
-        'int SetCmd1Lpm() {%s}' % function_body(d + '/cs_lpm.cpp', 'MOS_STATUS EncodeHevcVdencConstSettingsXe_Lpm_Plus_Base::SetVdencCmd1Settings()').replace(
+        'int SetCmd1Lpm() {%s}' % function_body(d + '/' + plat['cs'], 'MOS_STATUS %s::SetVdencCmd1Settings()' % plat['cs_class']).replace(
             'EncodeHevcVdencConstSettings::SetVdencCmd1Settings();', 'SetCmd1Common();'),
-        'int SetCmd2Lpm() {%s}' % function_body(d + '/cs_lpm.cpp', 'MOS_STATUS EncodeHevcVdencConstSettingsXe_Lpm_Plus_Base::SetVdencCmd2Settings()'),
+        'int SetCmd2Lpm() {%s}' % function_body(d + '/' + plat['cs'], 'MOS_STATUS %s::SetVdencCmd2Settings()' % plat['cs_class']),
     ])
     pars = ''.join([par_struct(d + '/cmdpar.h', 'VDENC_CMD1', 'CMD1Par'), par_struct(d + '/cmdpar.h', 'VDENC_CMD2', 'CMD2Par'),
                     par_struct(d + '/cmdpar.h', 'VDENC_PIPE_MODE_SELECT', 'VDENC_PIPE_MODE_SELECT_PAR'),
@@ -200,10 +216,11 @@ def build_harness(d, tmp):
     pars = pars.replace('MAX_REF_LIST_NUM', '2').replace('MAX_REF_NUM', '3')
     macros = ''.join([
         fields_macro(d + '/impl_common.h', 'VDENC_CMD1', 'DO_FIELDS1'), fields_macro(d + '/impl_common.h', 'VDENC_CMD2', 'DO_FIELDS2'),
-        fields_macro(d + '/impl_common.h', 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS'), fields_macro(d + '/impl_lpmplus_base.h', 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS_LPM'),
+        fields_macro(d + '/impl_common.h', 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS'),
+        fields_macro(d + '/' + plat['pms_impl'], 'VDENC_PIPE_MODE_SELECT', 'DO_FIELDS_PMS_LPM') if plat['pms_impl'] else '',
         fields_macro(d + '/impl_common.h', 'VDENC_WEIGHTSOFFSETS_STATE', 'DO_FIELDS_WO'), fields_macro(d + '/impl_common.h', 'VDENC_HEVC_VP9_TILE_SLICE_STATE', 'DO_FIELDS_TSS'),
         fields_macro(d + '/impl_common.h', 'VDENC_WALKER_STATE', 'DO_FIELDS_WALK')])
-    src = HARNESS.replace('PAR_STRUCTS', pars).replace('BODIES', bodies).replace('FIELD_MACROS', macros)
+    src = HARNESS.replace('HWCMD_INCLUDE', plat['hwcmd_include']).replace('NAMESPACE', plat['ns']).replace('PMS_OVERRIDE', 'DO_FIELDS_PMS_LPM();' if plat['pms_impl'] else '').replace('PAR_STRUCTS', pars).replace('BODIES', bodies).replace('FIELD_MACROS', macros)
     os.makedirs(tmp + '/stub', exist_ok=True)
     open(tmp + '/stub/mhw_hwcmd.h', 'w').write('''#pragma once
 #include <stdint.h>
@@ -215,6 +232,7 @@ def build_harness(d, tmp):
 #define __CODEGEN_OP_LENGTH_BIAS 2
 #define __CODEGEN_OP_LENGTH(x) (uint32_t)((__CODEGEN_MAX(x, __CODEGEN_OP_LENGTH_BIAS)) - __CODEGEN_OP_LENGTH_BIAS)
 ''')
+    open(tmp + '/stub/mos_utilities.h', 'w').write('#include "mhw_hwcmd.h"\n')   # (the Xe_HPM header includes this one)
     open(tmp + '/main.cpp', 'w').write(src)
     subprocess.check_call(['g++', '-std=c++17', '-w', '-I' + tmp + '/stub', '-I' + tmp + '/hdr', tmp + '/main.cpp', '-o', tmp + '/harness'])
     return tmp + '/harness'
@@ -235,34 +253,36 @@ def emit_array(name, words):
 
 def main():
     d, out_path = sys.argv[1], sys.argv[2]
+    plat = PLATFORMS[sys.argv[3] if len(sys.argv) > 3 else 'xelpg']
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(tmp + '/hdr')
-        open(tmp + '/hdr/mhw_vdbox_vdenc_hwcmd_xe_lpm_plus.h', 'w').write(open(d + '/hwcmd.h').read())
-        harness = build_harness(d, tmp)
+        open(tmp + '/hdr/' + plat['hwcmd_include'], 'w').write(open(d + '/' + plat['hwcmd']).read())
+        harness = build_harness(d, tmp, plat)
         runs = {(t, qp): run(harness, t, qp) for t in (1, 3) for qp in QPS}
-    header = open(d + '/hwcmd.h').read()
+    header = open(d + '/' + plat['hwcmd']).read()
+    P = plat['prefix']
     o = ['// Generated by tools/gen_intel_hevc_xelpg.py from the Intel media driver (MIT licence): the VDEnc commands of HEVC encode on Xe-LPG (constant QP, target usage 7, no tiles,',
          '// low-delay B). Do not edit by hand.']
     for tag, name, struct, indent in [('PMS', 'VdencPipeModeSelect', 'VDENC_PIPE_MODE_SELECT_CMD', '    '), ('WO', 'VdencWeightsOffsetsState', 'VDENC_WEIGHTSOFFSETS_STATE_CMD', '    '),
                                       ('TSS', 'VdencTileSliceState', 'VDENC_HEVC_VP9_TILE_SLICE_STATE_CMD', '    '), ('WALK', 'VdencWalkerState', 'VDENC_WALKER_STATE_CMD', '    '),
                                       ('PBA', 'VdencPipeBufAddrState', 'VDENC_PIPE_BUF_ADDR_STATE_CMD', '    ')]:
         img = runs[(3, 26)][tag]
-        o += ['', '// %s, %d dwords' % (struct, len(img)), 'constexpr uint32_t kXeLpg%sDwords = %d;' % (name, len(img)), emit_array('kXeLpg%sImage' % name, img)]
+        o += ['', '// %s, %d dwords' % (struct, len(img)), 'constexpr uint32_t k' + P + '%sDwords = %d;' % (name, len(img)), emit_array('k' + P + '%sImage' % name, img)]
         if tag in ('TSS', 'WALK'):
             for n, (dw, lo, hi) in sorted(parse_fields(struct_text(header, struct, indent)).items(), key=lambda kv: kv[1]):
-                o.append('constexpr EncodeField kXeLpg%s_%s = {%d, %d, %d};' % (name, n, dw, lo, hi))
+                o.append('constexpr EncodeField k' + P + '%s_%s = {%d, %d, %d};' % (name, n, dw, lo, hi))
     for tag, name, struct, dwords in [('CMD1', 'VdencCmd1', '_VDENC_CMD1_CMD', 33), ('CMD2', 'VdencCmd2', '_VDENC_CMD2_CMD', 62)]:
         varying = sorted({i for t in (1, 3) for qp in QPS for i in range(dwords) if runs[(t, qp)][tag][i] != runs[(t, 26)][tag][i]})
         print('%s varies with the quantiser in dwords %s' % (tag, varying), file=sys.stderr)
         assert len(varying) == 1, 'unexpected quantiser dependence'
         v = varying[0]
         o += ['', '// %s, %d dwords: image of an I picture and of a low-delay B picture at quantiser 26, and dword %d for the quantisers %d .. %d' % (struct, dwords, v, QPS[0], QPS[-1]),
-              'constexpr uint32_t kXeLpg%sDwords = %d;' % (name, dwords), 'constexpr uint32_t kXeLpg%sQpDword = %d;' % (name, v),
-              emit_array('kXeLpg%sImageI' % name, runs[(1, 26)][tag]), emit_array('kXeLpg%sImageB' % name, runs[(3, 26)][tag]),
-              emit_array('kXeLpg%sQpTableI' % name, [runs[(1, qp)][tag][v] for qp in QPS]), emit_array('kXeLpg%sQpTableB' % name, [runs[(3, qp)][tag][v] for qp in QPS])]
+              'constexpr uint32_t k' + P + '%sDwords = %d;' % (name, dwords), 'constexpr uint32_t k' + P + '%sQpDword = %d;' % (name, v),
+              emit_array('k' + P + '%sImageI' % name, runs[(1, 26)][tag]), emit_array('k' + P + '%sImageB' % name, runs[(3, 26)][tag]),
+              emit_array('k' + P + '%sQpTableI' % name, [runs[(1, qp)][tag][v] for qp in QPS]), emit_array('k' + P + '%sQpTableB' % name, [runs[(3, qp)][tag][v] for qp in QPS])]
         if tag == 'CMD2':
             for n, (dw, lo, hi) in sorted(parse_fields(struct_text(header, struct, '')).items(), key=lambda kv: kv[1]):
-                o.append('constexpr EncodeField kXeLpg%s_%s = {%d, %d, %d};' % (name, n, dw, lo, hi))
+                o.append('constexpr EncodeField k' + P + '%s_%s = {%d, %d, %d};' % (name, n, dw, lo, hi))
     open(out_path, 'w').write('\n'.join(o) + '\n')
 
 

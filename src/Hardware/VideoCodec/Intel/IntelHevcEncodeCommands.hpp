@@ -82,7 +82,8 @@ struct HevcEncodeBuffers {
 // Fills the scratch addresses of `b` from the plan and the address of the scratch buffer.
 void hevc_resolve_scratch(const HevcScratchPlan& plan, uint32_t scratch_base, HevcEncodeBuffers* b);
 
-enum class HevcVdencPlatform { XeLp, XeLpg };
+// XeLpg: Meteor Lake and Arrow Lake; XeHpg: Arc Alchemist, whose commands are Xe-LPG's apart from three dwords of CMD2.
+enum class HevcVdencPlatform { XeLp, XeLpg, XeHpg };
 
 struct HevcEncodePicture {
   HevcVdencPlatform platform = HevcVdencPlatform::XeLp;

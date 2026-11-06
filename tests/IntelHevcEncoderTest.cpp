@@ -253,7 +253,7 @@ struct FakeEncoder {
     for (const uint32_t* surface : {vsrc, vref})
       if (field(surface[3], 0, 1) != 3 || field(surface[3], 27, 31) != 4 || field(surface[3], 3, 19) + 1 != field(s_src[1], 0, 16) + 1) problem("VDEnc surface format");
     if (field(vds[3], 27, 31) != 4 || field(vds[7], 27, 31) != 4) problem("VDEnc down-scaled surface format");
-    if (xe_lpg && (field(vsrc[3], 20, 22) != 7 || field(vref[3], 20, 22) != 0)) problem("VDEnc source chroma downsample filter");
+    if (field(vsrc[3], 20, 22) != 7 || field(vref[3], 20, 22) != 0) problem("VDEnc source chroma downsample filter");
 
     // --- Picture geometry and type, from the three places that carry them.
     const uint32_t width = field(cmd2[1], 0, 15) + 1, height = field(cmd2[1], 16, 31) + 1;
@@ -463,11 +463,11 @@ uint8_t limited_luma(uint32_t v) { return static_cast<uint8_t>(16 + (v * 219 + 1
 uint8_t limited_chroma(int32_t c) { return static_cast<uint8_t>(128 + ((c - 128) * 224 + (c >= 128 ? 127 : -127)) / 255); }
 
 // Encodes `count` pictures through the session, compares the source surface the engine saw with the input, decodes the packets on the CPU and checks the pictures.
-void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, bool xe_lpg = false) {
-  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, xe_lpg ? " (Xe-LPG)" : "");
+void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, uint32_t interval, uint32_t quality, bool xe_lpg = false, bool arc = false) {
+  printf("  %ux%u, %u pictures, keyframe interval %u, quality %u%s\n", w, h, count, interval, quality, arc ? " (Arc)" : xe_lpg ? " (Xe-LPG)" : "");
   Rig2 rig;
-  rig.engine.xe_lpg = xe_lpg;
-  rig.gpu.xehp = xe_lpg;
+  rig.engine.xe_lpg = xe_lpg || arc;   // (Arc's commands have the same sizes and fields)
+  rig.gpu.xehp = xe_lpg || arc;
   rig.engine.write_stream = (w % 64 == 0 && h % 64 == 0);
   EncoderConfig cfg;
   cfg.codec = VideoCodec::Hevc;
@@ -483,6 +483,7 @@ void encode_and_check(TestAllocator& a, uint32_t w, uint32_t h, uint32_t count, 
     VcsDriver driver(rig.mem);
     VcsDriver::Config driver_config = rig.config();
     driver_config.xe_lpg = xe_lpg;
+    driver_config.xe_hpg = arc;
     driver_config.gmd_id_flush = xe_lpg;
     CHECK(driver.initialize(driver_config));
     {
@@ -719,7 +720,7 @@ void test_device(TestAllocator& a) {
       const uint32_t decode = device.info().accelerated_decode_codecs;
       CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && (decode & codec_mask(VideoCodec::Vp9)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
       CHECK(!!(decode & codec_mask(VideoCodec::Av1)) == pl.av1);
-      const bool meteor = pl.id == 0x7D55;
+      const bool meteor = pl.id == 0x7D55 || pl.id == 0x56A0;   // Meteor Lake and Arc Alchemist encode on the engine
       rig_pl.engine.xe_lpg = meteor;
       CHECK(device.info().accelerated_encode_codecs == (meteor ? (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)) : 0));
       EncoderConfig cfg;
@@ -771,6 +772,9 @@ int main() {
   encode_and_check(a, 128, 128, 6, 6, 1, true);
   encode_and_check(a, 72, 40, 4, 2, 40, true);        // partial blocks
   encode_and_check(a, 1920, 1080, 2, 2, 75, true);
+  encode_and_check(a, 64, 64, 5, 3, 75, false, true);       // Arc Alchemist
+  encode_and_check(a, 72, 40, 4, 2, 40, false, true);
+  encode_and_check(a, 1920, 1080, 2, 2, 75, false, true);
   test_rejections(a);
   test_other_generations(a);
   test_hang(a);
