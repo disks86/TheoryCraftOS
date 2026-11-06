@@ -116,6 +116,12 @@ void vdenc_pipe_buf(DwordWriter& w, const uint32_t (&defaults)[N], const AvcEnco
   c.buffer(10, b.source, kMocs);
   if (b.vdenc_row_store) c.buffer(16, b.vdenc_row_store, kMocs);
   if (b.vdenc_statistics) c.buffer(34, b.vdenc_statistics, kMocs);
+  if (p.b_picture) {
+    c.buffer(31, b.backward_reference, kMocs);   // list 1: the later anchor, its down-scaled copy (DsBwdRef0) and its motion vectors (the colocated picture)
+    c.buffer(7, b.backward_ds4, 0);
+    c.buffer(19, b.colocated_mv_read, kMocs);
+  }
+  if (p.b_mode && p.p_picture && !p.b_picture && b.colocated_mv_write) c.buffer(83, b.colocated_mv_write, kMocs);   // a P picture leaves its motion vectors for the B picture before it
   if (p.xe_lpg || p.xe_hpg) {
     // Xe-LPG and Arc: the VDEnc engine writes the 4x down-scaled reconstruction itself ("scaled reference surface stage 1"), the MFX engine's intra row store is also given to it, and
     // with target usage 7 (performance mode, one reference) the second forward down-scaled reference is the first.
@@ -174,14 +180,37 @@ AvcEncodeScratchSizes avc_encode_scratch_sizes(uint32_t width_mbs, uint32_t heig
 constexpr uint8_t kRoundingInterG0P[52] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 constexpr uint8_t kRoundingIntraG0P[52] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0};
 
+constexpr uint8_t kRoundingInterP[52] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2};
+constexpr uint8_t kRoundingIntraP[52] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3};
+constexpr uint8_t kRoundingInterB[52] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+constexpr uint8_t kRoundingIntraB[52] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2};
+
+// The adaptive rounding of P and (non-reference) B slices by quantiser: the G0 tables for a stream without B pictures, the P and B tables for one with.
+static uint32_t rounding_inter(const AvcEncodePicture& p, uint32_t qp) { return !p.b_mode ? kRoundingInterG0P[qp] : p.b_picture ? kRoundingInterB[qp] : kRoundingInterP[qp]; }
+static uint32_t rounding_intra(const AvcEncodePicture& p, uint32_t qp) { return !p.b_mode ? kRoundingIntraG0P[qp] : p.b_picture ? kRoundingIntraB[qp] : kRoundingIntraP[qp]; }
+
 // VDENC_CMD3 and VDENC_AVC_IMG_STATE of Xe-LPG (the images the media driver's own parameter code produces for I and P pictures; see tools/gen_intel_avc_xelpg.py).
 static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, uint32_t qp) {
   const uint32_t q = qp < 10 ? 0 : qp > 51 ? 41 : qp - 10;
-  const uint32_t* cmd3 = (p.p_picture ? kXeLpgAvcVdencCmd3TableP : kXeLpgAvcVdencCmd3TableI) + q * kXeLpgAvcVdencCmd3Dwords;
+  const bool large = p.width_mbs * 16 >= 1920 || p.height_mbs * 16 >= 1080;   // (below that size the driver offsets the lambda of a GOP with B pictures above QP 31)
+  const uint32_t* cmd3;
+  const uint32_t* image;
+  if (p.b_mode) {
+    const uint32_t t = p.b_picture ? 2 : p.p_picture ? 1 : 0;
+    static const uint32_t* const kCmd3[3][2] = {{kXeLpgAvcVdencCmd3WithBISmall, kXeLpgAvcVdencCmd3WithBILarge}, {kXeLpgAvcVdencCmd3WithBPSmall, kXeLpgAvcVdencCmd3WithBPLarge},
+                                                 {kXeLpgAvcVdencCmd3WithBBSmall, kXeLpgAvcVdencCmd3WithBBLarge}};
+    cmd3 = kCmd3[t][large ? 1 : 0] + q * kXeLpgAvcVdencCmd3Dwords;   // (the other platforms of this family have the same CMD3)
+    static const uint32_t* const kImg[3][3] = {{kXeLpgAvcVdencImgStateWithBI, kXeLpgAvcVdencImgStateWithBP, kXeLpgAvcVdencImgStateWithBB},
+                                                {kXe2LpmAvcVdencImgStateWithBI, kXe2LpmAvcVdencImgStateWithBP, kXe2LpmAvcVdencImgStateWithBB},
+                                                {kXe2HpmAvcVdencImgStateWithBI, kXe2HpmAvcVdencImgStateWithBP, kXe2HpmAvcVdencImgStateWithBB}};
+    image = kImg[p.xe2][t];
+  } else {
+    cmd3 = (p.p_picture ? kXeLpgAvcVdencCmd3TableP : kXeLpgAvcVdencCmd3TableI) + q * kXeLpgAvcVdencCmd3Dwords;
+    image = p.xe2 == 1 ? (p.p_picture ? kXe2LpmAvcVdencImgStateP : kXe2LpmAvcVdencImgStateI)
+          : p.xe2 == 2 ? (p.p_picture ? kXe2HpmAvcVdencImgStateP : kXe2HpmAvcVdencImgStateI)
+                       : (p.p_picture ? kXeLpgAvcVdencImgStateP : kXeLpgAvcVdencImgStateI);
+  }
   for (uint32_t i = 0; i < kXeLpgAvcVdencCmd3Dwords; ++i) w.emit(cmd3[i]);
-  const uint32_t* image = p.xe2 == 1 ? (p.p_picture ? kXe2LpmAvcVdencImgStateP : kXe2LpmAvcVdencImgStateI)
-                        : p.xe2 == 2 ? (p.p_picture ? kXe2HpmAvcVdencImgStateP : kXe2HpmAvcVdencImgStateI)
-                                     : (p.p_picture ? kXeLpgAvcVdencImgStateP : kXeLpgAvcVdencImgStateI);
   static_assert(kXeLpgAvcVdencImgStateDwords == kXe2LpmAvcVdencImgStateDwords && kXeLpgAvcVdencImgStateDwords == kXe2HpmAvcVdencImgStateDwords, "26 dwords on every platform");
   uint32_t copy[kXeLpgAvcVdencImgStateDwords];
   for (uint32_t i = 0; i < kXeLpgAvcVdencImgStateDwords; ++i) copy[i] = image[i];
@@ -194,6 +223,10 @@ static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, ui
   if (p.p_picture) {
     c.set(kXeLpgAvcVdencImgState_FwdRefIdx0ReferencePicture, p.reference_frame_store);
     c.set(kXeLpgAvcVdencImgState_PocNumberForFwdRef0, p.reference_poc & 0xFF);
+  }
+  if (p.b_picture) {
+    c.set(kXeLpgAvcVdencImgState_BwdRefIdx0ReferencePicture, p.backward_reference_frame_store);
+    c.set(kXeLpgAvcVdencImgState_PocNumberForBwdRef0, p.backward_poc & 0xFF);
   }
   c.emit(w);
 }
@@ -275,6 +308,10 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
       c.raw(19 + 2 * p.reference_frame_store, b.reference);
       c.raw(20 + 2 * p.reference_frame_store, 0);
     }
+    if (p.p_picture && p.b_picture && b.backward_reference) {
+      c.raw(19 + 2 * p.backward_reference_frame_store, b.backward_reference);
+      c.raw(20 + 2 * p.backward_reference_frame_store, 0);
+    }
     c.raw(51, (c.get(51) & ~0x7Fu) | kMocs);
     if (b.recon_ds4 && !p.xe_lpg) {
       c.raw(62, b.recon_ds4);
@@ -302,8 +339,9 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   // --- The VDEnc pipeline: mode, surfaces, buffers, the constant quantiser tables.
   if (p.xe_lpg || p.xe_hpg) {
     // (Arc's older driver also turns the frame statistics stream-out on when it uses adaptive rounding: bit 5 of the first dword.)
-    if (p.xe2 == 2) for (uint32_t i = 0; i < kXe2HpmAvcVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmAvcVdencPipeModeSelectImage[i]);
-    else for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i] | (i == 1 && p.xe_hpg ? 1u << 5 : 0u));
+    const uint32_t random_access = p.b_picture ? 1u << 18 : 0u;   // IsRandomAccess (dword 1, bit 18) for a B picture
+    if (p.xe2 == 2) for (uint32_t i = 0; i < kXe2HpmAvcVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmAvcVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
+    else for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i] | (i == 1 && p.xe_hpg ? 1u << 5 : 0u) | (i == 1 ? random_access : 0u));
   } else if (p.generation == EncodeGeneration::Gen12) {
     // Xe-LP prefetches the TLB entries of the source picture ahead of the engine (the driver's settings for AVC).
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
@@ -409,6 +447,18 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   if (p.xe_lpg || p.xe_hpg) {
     if (p.xe_hpg) xe_hpg_avc_image_state(w, p, qp); else xe_lpg_avc_image_state(w, p, qp);
     flat_matrices(w);
+    if (p.b_picture) {
+      // MFX_AVC_DIRECTMODE_STATE for the encoder: no direct motion vector buffers (the VDEnc engine keeps the colocated motion vectors), only the picture order counts of the
+      // reference frame stores (top and bottom field of a frame are equal) and of this picture, in dwords 37 .. 68 and 69, 70.
+      w.emit(intel_mfx::kMfxAvcDirectmodeState | (71 - 2));
+      for (uint32_t i = 0; i < 36; ++i) w.emit(0);
+      uint32_t pocs[32] = {};
+      pocs[2 * p.reference_frame_store] = pocs[2 * p.reference_frame_store + 1] = p.reference_poc;
+      pocs[2 * p.backward_reference_frame_store] = pocs[2 * p.backward_reference_frame_store + 1] = p.backward_poc;
+      for (uint32_t i = 0; i < 32; ++i) w.emit(pocs[i]);
+      w.emit(p.poc);
+      w.emit(p.poc);
+    }
     return;
   }
 
@@ -567,13 +617,13 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
   if (headers.size() == 0) return false;
   const uint32_t qp = static_cast<uint32_t>(p.qp < 0 ? 0 : p.qp > static_cast<int32_t>(kMaxQp) ? kMaxQp : p.qp);
 
-  // --- The reference picture list of a P slice (one entry: the previous picture, a short-term frame).
-  if (p.p_picture) {
+  // --- The reference picture lists of a P slice (one entry: the previous picture, a short-term frame) or a B slice (list 0: the earlier anchor, list 1: the later one).
+  for (uint32_t list = 0; list < (p.b_picture ? 2u : p.p_picture ? 1u : 0u); ++list) {
     Command<kMfxAvcRefIdxStateDwords> c(kMfxAvcRefIdxStateDefault);
-    c.set(kMfxAvcRefIdxState_RefpiclistSelect, 0);
+    c.set(kMfxAvcRefIdxState_RefpiclistSelect, list);
     // 32 one-byte entries from dword 2: frame store id in bits 1..4, bit 5 = frame (not a field), bit 6 = long term, bit 7 = not present.
     uint32_t entries[8] = {0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u};
-    entries[0] = (entries[0] & ~0xFFu) | intel_mfx::avc_ref_idx_entry(p.reference_frame_store, false);
+    entries[0] = (entries[0] & ~0xFFu) | intel_mfx::avc_ref_idx_entry(list == 0 ? p.reference_frame_store : p.backward_reference_frame_store, false);
     for (uint32_t i = 0; i < 8; ++i) c.raw(2 + i, entries[i]);
     c.emit(w);
   }
@@ -581,8 +631,10 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
   // --- MFX_AVC_SLICE_STATE: the whole picture is one slice.
   {
     Command<kMfxAvcSliceStateDwords> c(kMfxAvcSliceStateDefault);
-    c.set(kMfxAvcSliceState_SliceType, p.p_picture ? kMfxAvcSliceState_SLICE_TYPE_PSLICE : kMfxAvcSliceState_SLICE_TYPE_ISLICE);
+    c.set(kMfxAvcSliceState_SliceType, p.b_picture ? kMfxAvcSliceState_SLICE_TYPE_BSLICE : p.p_picture ? kMfxAvcSliceState_SLICE_TYPE_PSLICE : kMfxAvcSliceState_SLICE_TYPE_ISLICE);
     c.set(kMfxAvcSliceState_NumberOfReferencePicturesInInterPredictionList0, p.p_picture ? 1 : 0);
+    c.set(kMfxAvcSliceState_NumberOfReferencePicturesInInterPredictionList1, p.b_picture ? 1 : 0);
+    c.set(kMfxAvcSliceState_DirectPredictionType, p.b_picture ? kMfxAvcSliceState_DIRECT_PREDICTION_TYPE_SPATIAL : 0);
     c.set(kMfxAvcSliceState_SliceAlphaC0OffsetDiv2, static_cast<uint32_t>(p.alpha_c0_offset_div2) & 0xF);
     c.set(kMfxAvcSliceState_SliceBetaOffsetDiv2, static_cast<uint32_t>(p.beta_offset_div2) & 0xF);
     c.set(kMfxAvcSliceState_SliceQuantizationParameter, qp);
@@ -595,9 +647,9 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
     c.set(kMfxAvcSliceState_SlicedataInsertionPresentInBitstream, 1);
     c.set(kMfxAvcSliceState_HeaderInsertionPresentInBitstream, 1);
     const bool newer = p.xe_lpg || p.xe_hpg;   // (the newer drivers use the G0 P tables)
-    c.set(kMfxAvcSliceState_Roundinter, p.p_picture ? (newer ? kRoundingInterG0P[qp] : kAdaptiveInterRoundingPWithoutB[qp]) : 2);
+    c.set(kMfxAvcSliceState_Roundinter, p.p_picture ? (newer ? rounding_inter(p, qp) : kAdaptiveInterRoundingPWithoutB[qp]) : 2);
     c.set(kMfxAvcSliceState_Roundinterenable, newer && p.p_picture ? 1 : 0);   // (the newer drivers enable the inter rounding for P slices)
-    c.set(kMfxAvcSliceState_Roundintra, newer && p.p_picture ? kRoundingIntraG0P[qp] : 5);
+    c.set(kMfxAvcSliceState_Roundintra, newer && p.p_picture ? rounding_intra(p, qp) : 5);
     c.set(kMfxAvcSliceState_Roundintraenable, 1);
     c.emit(w);
   }
@@ -605,9 +657,9 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
   // --- Xe-LPG: VDENC_AVC_SLICE_STATE carries the same rounding values.
   if (p.xe_lpg || p.xe_hpg) {
     Command<kXeLpgAvcVdencSliceStateDwords> c(kXeLpgAvcVdencSliceStateImage);
-    c.set(kXeLpgAvcVdencSliceState_RoundIntra, p.p_picture ? kRoundingIntraG0P[qp] : 5);
+    c.set(kXeLpgAvcVdencSliceState_RoundIntra, p.p_picture ? rounding_intra(p, qp) : 5);
     c.set(kXeLpgAvcVdencSliceState_RoundIntraEnable, 1);
-    c.set(kXeLpgAvcVdencSliceState_RoundInter, p.p_picture ? kRoundingInterG0P[qp] : 2);
+    c.set(kXeLpgAvcVdencSliceState_RoundInter, p.p_picture ? rounding_inter(p, qp) : 2);
     c.set(kXeLpgAvcVdencSliceState_RoundInterEnable, p.p_picture ? 1 : 0);
     c.set(kXeLpgAvcVdencSliceState_Log2WeightDenomLuma, 0);
     c.emit(w);

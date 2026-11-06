@@ -95,6 +95,8 @@ struct EncoderConfig {
   uint32_t fps_numerator = 30, fps_denominator = 1;
   uint32_t quality = 75;           // 1 .. 100; higher is better and bigger
   uint32_t keyframe_interval = 1;  // a keyframe every this many frames (codecs that only have keyframes ignore it)
+  uint32_t b_frames = 0;           // 1: a bidirectional picture between each two anchors (H.264 on the Intel engines that can; the packets then come out in decoding order, with the presentation
+                                   // times of their pictures, and one picture is held back until the next arrives or flush()); everything else ignores it
 };
 
 enum class SubmitResult : uint8_t {
