@@ -41,7 +41,7 @@ namespace {
 
 constexpr int8_t kPerformance = 0, kEfficiency = 1;
 
-// Eight cores: 0-3 Performance sharing cache 0, 4-5 Performance sharing cache 1, 6-7 Efficiency sharing cache 2.
+// Eight cores: 0-3 Performance sharing cache 0, 4-5 Performance sharing cache 1, 6-7 Efficiency sharing cache 2. Two NUMA nodes: 0-3 and 4-7.
 struct Machine {
   CorePlace cores[8];
   Machine() {
@@ -50,6 +50,7 @@ struct Machine {
       cores[i].idle = true;
       cores[i].kind = i < 6 ? kPerformance : kEfficiency;
       cores[i].cache_domain = i < 4 ? 0 : i < 6 ? 1 : 2;
+      cores[i].numa_node = i < 4 ? 0 : 1;
     }
   }
   ArrayView<const CorePlace> view() const { return ArrayView<const CorePlace>(cores, 8); }
@@ -66,12 +67,13 @@ PlacementHints hints(int32_t io, int32_t last, int8_t kind = -1) {
 void test_scores() {
   Machine m;
   CHECK(placement_score(hints(-1, -1), 3, m.view()) == 0);
-  CHECK(placement_score(hints(2, -1), 2, m.view()) == kScoreIoCore + kScoreCacheDomain);
-  CHECK(placement_score(hints(2, -1), 1, m.view()) == kScoreCacheDomain);
+  CHECK(placement_score(hints(2, -1), 2, m.view()) == kScoreIoCore + kScoreCacheDomain + kScoreNumaNode);
+  CHECK(placement_score(hints(2, -1), 1, m.view()) == kScoreCacheDomain + kScoreNumaNode);
   CHECK(placement_score(hints(2, -1), 4, m.view()) == 0);
-  CHECK(placement_score(hints(-1, 5), 5, m.view()) == kScoreLastCore + kScoreCacheDomain);
-  CHECK(placement_score(hints(-1, 5), 4, m.view()) == kScoreCacheDomain);
-  CHECK(placement_score(hints(2, 5), 5, m.view()) == kScoreLastCore);   // (the domain counts from the device's core when there is one)
+  CHECK(placement_score(hints(-1, 5), 5, m.view()) == kScoreLastCore + kScoreCacheDomain + kScoreNumaNode);
+  CHECK(placement_score(hints(-1, 5), 4, m.view()) == kScoreCacheDomain + kScoreNumaNode);
+  CHECK(placement_score(hints(-1, 5), 6, m.view()) == kScoreNumaNode);   // another cache, the same node
+  CHECK(placement_score(hints(2, 5), 5, m.view()) == kScoreLastCore);   // (the domain and node count from the device's core when there is one)
   CHECK(placement_score(hints(-1, -1, kEfficiency), 7, m.view()) == kScoreKind);
   CHECK(placement_score(hints(-1, -1, kEfficiency), 0, m.view()) == 0);
   // Out of range: no score, no crash.
@@ -91,6 +93,8 @@ void test_wake_core() {
   m.cores[5].idle = false;
   CHECK(choose_wake_core(hints(5, -1), all, m.view()) == 4);
   m.cores[4].idle = false;
+  CHECK(choose_wake_core(hints(5, -1), all, m.view()) == 6);   // the device's node, ahead of lower-numbered cores on the other
+  m.cores[6].idle = m.cores[7].idle = false;
   CHECK(choose_wake_core(hints(5, -1), all, m.view()) == 0);
   m = Machine();
   // The warm cache with no device.
@@ -98,7 +102,7 @@ void test_wake_core() {
   // The device's core beats the warm cache.
   CHECK(choose_wake_core(hints(6, 3), all, m.view()) == 6);
   // The kind asked for beats the device.
-  CHECK(choose_wake_core(hints(6, -1, kPerformance), all, m.view()) == 0);
+  CHECK(choose_wake_core(hints(6, -1, kPerformance), all, m.view()) == 4);   // (a Performance core on the device's node)
   CHECK(choose_wake_core(hints(1, -1, kEfficiency), all, m.view()) == 6);
   CHECK(choose_wake_core(hints(7, -1, kEfficiency), all, m.view()) == 7);
   // Only allowed cores.

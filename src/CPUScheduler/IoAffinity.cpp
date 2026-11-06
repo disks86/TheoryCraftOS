@@ -30,8 +30,10 @@ uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<c
   // A shared last-level cache still has what the interrupt handler (or the thread itself, before) read, so it is worth something too.
   const int32_t anchor = hints.io_core != kNoCore ? hints.io_core : hints.last_core;
   CorePlace anchor_place;
-  if (anchor >= 0 && cores.try_get(static_cast<uint64_t>(anchor), &anchor_place) && anchor_place.cache_domain == place.cache_domain)
-    score += kScoreCacheDomain;
+  if (anchor >= 0 && cores.try_get(static_cast<uint64_t>(anchor), &anchor_place)) {
+    if (anchor_place.cache_domain == place.cache_domain) score += kScoreCacheDomain;
+    if (anchor_place.numa_node == place.numa_node) score += kScoreNumaNode;
+  }
   return score;
 }
 

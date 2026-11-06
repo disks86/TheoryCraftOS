@@ -142,6 +142,7 @@
 #include "Network/Tls/CaBundle.hpp"
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
+#include "Hardware/Acpi/Srat.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
@@ -716,6 +717,22 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // From here on the OS is preemptively multithreaded on every core.
   if (kernel::start(cpu, shared_allocator)) {
     Entry(Level::Ok, "Kernel").text("preemptive threads on ").dec(kernel::core_count()).text(" cores");
+    // NUMA: the SRAT's processor entries put each core in its node, so placement keeps a device's work on its node (kernel::set_core_numa_node).
+    if (paging_ok) {
+      hardware::AcpiTables numa_tables(st);
+      const ConstByteView srat = numa_tables.initialize() ? numa_tables.find("SRAT") : ConstByteView();
+      hardware::SratCpu numa_cpus[256];
+      const uint32_t listed = hardware::srat_cpus(srat, ArrayView<hardware::SratCpu>(numa_cpus, 256));
+      uint32_t placed = 0, highest_node = 0;
+      for (const hardware::SratCpu& c : ArrayView<const hardware::SratCpu>(numa_cpus, listed < 256 ? listed : 256)) {
+        if (c.kind == hardware::SratCpuId::Gicc) continue;   // (an ACPI processor UID, not what addresses the core)
+        const int32_t core = kernel::core_from_hardware_id(c.id);
+        if (core < 0 || !kernel::set_core_numa_node(static_cast<uint32_t>(core), c.node)) continue;
+        ++placed;
+        if (c.node > highest_node) highest_node = c.node;
+      }
+      if (placed) Entry(Level::Info, "Kernel").text("NUMA: ").dec(placed).text(" core(s) in ").dec(highest_node + 1).text(" node(s) (SRAT)");
+    }
     // The virtio-gpu's commands finish with an interrupt now (the host takes milliseconds for some; a thread waiting for one need not look again and again).
     if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) {
       if (virtio->enable_interrupts()) Entry(Level::Ok, "GPU").text("virtio-gpu commands complete by interrupt (MSI-X)");

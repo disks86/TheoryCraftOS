@@ -1127,6 +1127,21 @@ uint32_t choose_io_interrupt_core(int8_t kind) {
   return core < 0 ? g.boot_core : static_cast<uint32_t>(core);
 }
 
+int32_t core_from_hardware_id(uint64_t hardware_id) {
+  if (!g.running) return -1;
+  for (uint32_t i = 0; i < g.core_count; ++i)
+    if (g.cores[i].online && g.cores[i].apic_id == hardware_id) return static_cast<int32_t>(i);
+  return -1;
+}
+
+bool set_core_numa_node(uint32_t core, uint32_t node) {
+  if (!g.running || core >= g.core_count || !g.cores[core].online) return false;
+  const uint64_t flags = lock_irq();
+  g.places[core].numa_node = node;
+  unlock_irq(flags);
+  return true;
+}
+
 uint64_t core_hardware_id(uint32_t core) {
   if (!g.running || core >= g.core_count || !g.cores[core].online) return ~uint64_t{0};
   return g.cores[core].apic_id;

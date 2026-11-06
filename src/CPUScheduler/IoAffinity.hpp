@@ -51,6 +51,7 @@ struct CorePlace {
   bool idle = false;            // running only its idle thread
   int8_t kind = 0;              // hardware::CoreKind
   uint32_t cache_domain = 0;    // cores that share the last-level cache have the same number
+  uint32_t numa_node = 0;       // the ACPI proximity domain (SRAT) the core is in; 0 for every core of a machine without one
 };
 
 // What a thread brings to placement.
@@ -114,8 +115,9 @@ struct InterruptSteering {
 };
 
 // How much each match is worth when cores compete for a thread (or threads for a core). The kind the thread asked for outweighs everything
-// else (it is an explicit request; the rest are guesses), then the device's own core, then the cache it left behind, then a shared cache.
-constexpr uint32_t kScoreKind = 16, kScoreIoCore = 8, kScoreLastCore = 4, kScoreCacheDomain = 2;
+// else (it is an explicit request; the rest are guesses), then the device's own core, then the cache it left behind, then a shared cache, then
+// the same NUMA node (memory the device wrote by DMA, and the thread's own, are nearer there).
+constexpr uint32_t kScoreKind = 16, kScoreIoCore = 8, kScoreLastCore = 4, kScoreCacheDomain = 2, kScoreNumaNode = 1;
 
 // How well `core` suits a thread with these hints. 0 for a core out of range.
 uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<const CorePlace> cores);

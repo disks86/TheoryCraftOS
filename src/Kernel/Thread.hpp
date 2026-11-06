@@ -191,6 +191,11 @@ bool set_io_device_core(int32_t device, int32_t core);
 // The core a new device's interrupt should be routed to: spreads devices over the online cores, preferring `kind` (-1: any) and leaving the boot
 // core (which runs the desktop) alone while others are online. 0 before start().
 uint32_t choose_io_interrupt_core(int8_t kind = -1);
+// The core whose interrupt-message id (core_hardware_id) is `hardware_id`, or -1.
+int32_t core_from_hardware_id(uint64_t hardware_id);
+// Puts an online core in a NUMA node (the ACPI SRAT proximity domain): placement then prefers, after a shared cache, a core on the node of the
+// device's or the thread's last core. Every core is in node 0 until this is called. False for a core that is not online.
+bool set_core_numa_node(uint32_t core, uint32_t node);
 // What addresses the core in an interrupt message: the local APIC id on x86 (MPIDR affinity on ARM, the hart id on RISC-V). ~0 if out of range.
 uint64_t core_hardware_id(uint32_t core);
 // set_interrupt_handler for a device's interrupt: the handler runs as before, and what it wakes is placed as above. A null handler removes it.
