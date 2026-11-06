@@ -73,7 +73,7 @@ encoder.
 `AmdVcnVideoEngine` uses it: the codecs it reports are the version's lists (from the IP discovery table when read, else from the catalogue), and
 `load_firmware` now reads and checks the file of every VCN generation, not only VCN 1 (`renoir_vcn.bin`, `green_sardine_vcn.bin`, `vangogh_vcn.bin`,
 `yellow_carp_vcn.bin`, `vcn_3_1_2.bin`, `vcn_4_0_2.bin`, `vcn_4_0_5.bin`, `vcn_4_0_6.bin`). Only VCN 1.0 has a start sequence and decode sessions; the
-others say "no start sequence for this VCN generation yet" and their sessions run on the CPU. The firmware files for VCN 2+ are not in `firmware/`.
+others say "no start sequence for this VCN generation yet" and their sessions run on the CPU. The VCN 2-4 firmware files are in `firmware/` (see `firmware/README.md`), and `VideoCodecTest` checks that every Ryzen APU finds and validates its own.
 
 ## What is driven, and what is only identified
 
@@ -87,7 +87,8 @@ others say "no start sequence for this VCN generation yet" and their sessions ru
 ## NPU
 
 Written from the Linux `drivers/accel/amdxdna` driver (register offsets, message layouts, sequences); tested only against a simulated NPU
-(`tests/AmdXdnaHwTest.cpp`), never on hardware, and no NPU firmware is in the repo.
+(`tests/AmdXdnaHwTest.cpp`), never on hardware. The linux-firmware NPU images are in `firmware/amdnpu/<id>_<rev>/` (`npu.sbin`, `npu_7.sbin`) and
+pass the PSP load path in the test; nothing loads them at boot yet. linux-firmware has none for the AIE4 parts.
 
 | File | What it does |
 | --- | --- |

@@ -1578,14 +1578,22 @@ static void test_amd_vcn_firmware() {
     CHECK(strstr(picasso.firmware_status(), "picasso_vcn.bin") && strstr(raven2.firmware_status(), "raven2_vcn.bin"));
     CHECK(strstr(raven.engine_summary(), "firmware raven_vcn.bin") && !strstr(raven.engine_summary(), "not read"));   // the boot-log line carries it
     CHECK(raven.firmware().ucode().size() == raven.firmware().header().ucode_size_bytes && raven.firmware().ucode().size() > 300000);
-    // A VCN 2+ APU looks for its own file (the catalogue knows Renoir's engine: renoir_vcn.bin), which this volume does not have. A card whose table was not
-    // read has no known VCN version and is not asked to load anything.
+    // A VCN 2+ APU loads its own file (the catalogue knows each engine: renoir_vcn.bin, green_sardine_vcn.bin, ...), checked like VCN 1's; nothing starts
+    // those engines yet. A card whose table was not read has no known VCN version and is not asked to load anything.
     const int before = fs.opened;
     CHECK(!navi.load_firmware(fs) && navi.firmware_status()[0] == 0 && fs.opened == before && navi.firmware_state() == AmdFirmwareStatus::NotApplicable);
-    CHECK(!renoir.load_firmware(fs) && renoir.firmware_state() == AmdFirmwareStatus::NotFound && strstr(renoir.firmware_status(), "/firmware/renoir_vcn.bin"));
-    AmdVcnVideoEngine cezanne(a, 0x1638), strix(a, 0x150E);
-    CHECK(cezanne.initialize() && !cezanne.load_firmware(fs) && strstr(cezanne.firmware_status(), "green_sardine_vcn.bin"));
-    CHECK(strix.initialize() && !strix.load_firmware(fs) && strstr(strix.firmware_status(), "vcn_4_0_5.bin") && !strix.firmware().loaded());
+    CHECK(renoir.load_firmware(fs) && renoir.firmware().header().ip_version_major == 2 && strstr(renoir.firmware_status(), "renoir_vcn.bin"));
+    CHECK(strstr(renoir.firmware_status(), "no start sequence for this VCN generation yet"));
+    // Every Ryzen APU with a VCN 2+ engine finds its file in firmware/, and the file is for that engine's VCN major version.
+    const uint16_t apus[] = {0x1636, 0x164C, 0x1638, 0x15E7, 0x163F, 0x1435, 0x1506, 0x1681, 0x164E, 0x13C0, 0x15BF, 0x15C8, 0x1900, 0x1901, 0x150E, 0x1114, 0x1902, 0x1586};
+    for (uint16_t id : apus) {
+      AmdVcnVideoEngine apu(a, id);
+      const bool loaded = apu.initialize() && apu.load_firmware(fs);
+      if (!loaded || apu.firmware().header().ip_version_major != apu.vcn_info().version.major) {
+        printf("FAILED: APU %04X firmware: %s\n", id, apu.firmware_status());
+        ++g_failed;
+      }
+    }
     // The software codecs and their reported hardware do not change.
     CHECK(raven.info().hardware_engine && !raven.info().accelerated);
   }

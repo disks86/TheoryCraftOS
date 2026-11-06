@@ -25,6 +25,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <string>
 #include <vector>
 #include "Hardware/NeuralProcessingUnit/AMD/AmdXdnaDevice.hpp"
 #include "Hardware/NeuralProcessingUnit/AMD/AmdXdnaNpu.hpp"
@@ -924,7 +925,43 @@ static void test_malformed() {
   }
 }
 
+// The images the repository ships (firmware/amdnpu, from linux-firmware): found where the layout says (firmware_dir + firmware_names), and accepted by the
+// PSP load path, which hands the fake PSP exactly their bytes.
+static std::vector<uint8_t> read_repo_file(const std::string& path) {
+  std::vector<uint8_t> bytes;
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return bytes;
+  uint8_t chunk[65536];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) bytes.insert(bytes.end(), chunk, chunk + n);
+  fclose(f);
+  return bytes;
+}
+
+static void test_shipped_firmware() {
+  TestAllocator alloc;
+  for (const auto& d : kAie2Devices) {
+    SimNpu sim(d[0], static_cast<uint8_t>(d[1]));
+    for (const char* name : sim.layout.firmware_names) {
+      if (!name) continue;
+      const std::string path = std::string("firmware/") + sim.id.firmware_dir + name;
+      const std::vector<uint8_t> fw = read_repo_file(path);
+      if (fw.empty()) {
+        printf("FAILED: %s missing\n", path.c_str());
+        ++g_failed;
+        continue;
+      }
+      AmdXdnaHw hw(sim.layout, sim.bars, &sim.clock);
+      CHECK(hw.load_firmware(alloc, ConstByteView(fw.data(), fw.size()), ConstByteView()) == AmdXdnaError::None);
+      CHECK(hw.firmware_buffer_size() >= fw.size() && hw.firmware_buffer_size() % AmdXdnaHw::kFirmwareAlign == 0);
+      CHECK(hw.psp_start() == AmdXdnaError::None && memcmp(sim.firmware_seen.data(), fw.data(), fw.size()) == 0);
+    }
+  }
+  CHECK(alloc.live == 0);
+}
+
 int main() {
+  test_shipped_firmware();
   test_identify();
   test_protocol();
   test_probe();
