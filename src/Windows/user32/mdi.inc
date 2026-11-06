@@ -198,42 +198,53 @@ static void mdi_forget(HANDLE client, MdiState *st, HANDLE child) {
 }
 
 /* ---- arranging --------------------------------------------------------------------------------------------------------------------------------------------------------- */
+/* The windows TileWindows and CascadeWindows arrange, top of the z-order first: the given list or the children of `parent`; a window must be a visible child of the parent with a
+ * caption and frame (WS_CAPTION), not minimized, and not disabled when asked to skip those. */
 static int arrange_collect(HANDLE parent, HANDLE *out, int max, const HANDLE *given, int given_count, BOOL skip_disabled) {
   int n = 0;
-  if (given) { for (int i = 0; i < given_count && n < max; ++i) out[n++] = given[i]; return n; }
-  /* bottom of the z-order first */
-  HANDLE w = GetWindow(parent, 5);
-  if (w) w = GetWindow(w, 1 /* GW_HWNDLAST */);
-  for (; w && n < max; w = GetWindow(w, 3 /* GW_HWNDPREV */)) {
+  HANDLE w = given ? (given_count > 0 ? given[0] : NULL) : GetWindow(parent, 5 /* GW_CHILD */);
+  for (int k = 0; w && n < max;) {
     const DWORD style = (DWORD)GetWindowLongW(w, -16);
-    if (!(style & 0x10000000) || (style & WS_MINIMIZE_) || (skip_disabled && (style & 0x08000000))) continue;
-    out[n++] = w;
+    const BOOL eligible = IsWindow(w) && GetAncestor(w, 1 /* GA_PARENT */) == parent && (style & 0x10000000) && !(style & WS_MINIMIZE_) &&
+                          (style & 0x00C00000) == 0x00C00000 && !(skip_disabled && (style & 0x08000000));
+    if (eligible) out[n++] = w;
+    if (given) { ++k; w = k < given_count ? given[k] : NULL; } else w = GetWindow(w, 2 /* GW_HWNDNEXT */);
   }
   return n;
+}
+/* Puts the windows in the area: a cascade starts with the last (the bottom one) at the corner and steps by the caption and frame, going back to the edge where the next would stick out;
+ * a tile fills columns top to bottom, the first (topmost) window first. A window without a sizing frame is moved, not resized. */
+static void arrange_place(HANDLE w, int x, int y, int cx, int cy) {
+  const DWORD style = (DWORD)GetWindowLongW(w, -16);
+  if (style & WS_MAXIMIZE_) ShowWindow(w, 9 /* SW_RESTORE */);
+  if (style & 0x00040000 /* WS_THICKFRAME */) SetWindowPos(w, NULL, x, y, cx, cy, 0x4 | 0x10);
+  else SetWindowPos(w, NULL, x, y, 0, 0, 0x1 | 0x4 | 0x10);
 }
 static void arrange_windows(const RECT_ *area, HANDLE *list, int n, BOOL cascade, BOOL horizontal) {
   const int width = area->right - area->left, height = area->bottom - area->top;
   if (n <= 0) return;
   if (cascade) {
-    const int step = GetSystemMetrics(4 /* SM_CYCAPTION */) + GetSystemMetrics(33 /* SM_CYFRAME */);
-    int pos = 0;
-    for (int i = 0; i < n; ++i) {
-      int cw = width * 3 / 4, ch = height * 3 / 4;
-      if (pos + cw > width || pos + ch > height) pos = 0;
-      SetWindowPos(list[i], NULL, area->left + pos, area->top + pos, cw, ch, 0x4 | 0x10);
-      pos += step;
+    const int spacing = GetSystemMetrics(4 /* SM_CYCAPTION */) + GetSystemMetrics(8 /* SM_CYDLGFRAME */);
+    const int cw = width * 3 / 4, ch = height * 3 / 4;
+    int x = area->left, y = area->top;
+    for (int i = n - 1; i >= 0; --i) {
+      arrange_place(list[i], x, y, cw, ch);
+      x += spacing; y += spacing;
+      if (x + cw > area->right) x = area->left;
+      if (y + ch > area->bottom) y = area->top;
     }
     return;
   }
-  int cols = 1;
-  while (cols * cols < n) ++cols;
-  int rows = (n + cols - 1) / cols;
-  if (horizontal) { const int t = cols; cols = rows; rows = t; }      /* MDITILE_HORIZONTAL: one row of windows per line, more rows than columns */
-  if (cols * rows < n) rows = (n + cols - 1) / cols;
-  for (int i = 0; i < n; ++i) {
-    const int col = horizontal ? i / rows : i % cols, row = horizontal ? i % rows : i / cols;
-    const int x0 = width * col / cols, x1 = width * (col + 1) / cols, y0 = height * row / rows, y1 = height * (row + 1) / rows;
-    SetWindowPos(list[i], NULL, area->left + x0, area->top + y0, x1 - x0, y1 - y0, 0x4 | 0x10);
+  int a = 1;
+  while ((a + 1) * (a + 1) <= n) ++a;
+  const int b = n / a;
+  const int columns = horizontal ? a : b, base = horizontal ? b : a, extra = n - base * columns;
+  int next = 0;
+  for (int c = 0; c < columns && next < n; ++c) {
+    const int rows = base + (c >= columns - extra ? 1 : 0);
+    int w = width / columns;
+    if (w < GetSystemMetrics(28 /* SM_CXMIN */)) w = GetSystemMetrics(28);
+    for (int r = 0; r < rows && next < n; ++r) arrange_place(list[next++], area->left + c * (width / columns), area->top + r * (height / rows), w, height / rows);
   }
 }
 EXPORT WORD WINAPI TileWindows(HANDLE parent, UINT how, const RECT_ *rect, UINT count, const HANDLE *kids) {
