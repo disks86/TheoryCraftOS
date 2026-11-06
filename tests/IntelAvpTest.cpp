@@ -82,6 +82,25 @@ static void test_xe_lpg() {
   for (size_t i = 1; i < lp_tile.size(); ++i) CHECK(lpg_tile[i] == lp_tile[i]);
 }
 
+// Xe-HPG (Arc): the Xe-LPG commands but for the tile coding command, which stays six dwords.
+static void test_xe_hpg() {
+  const AvpPlatform hpg = AvpPlatform::XeHpg;
+  AvpTile tile;
+  tile.id = 5;
+  tile.columns = tile.rows = 2;
+  const auto lp = emit([&](DwordWriter& w) { emit_avp_tile_coding(w, tile); }), hp = emit([&](DwordWriter& w) { emit_avp_tile_coding(w, tile, hpg); });
+  CHECK(hp == lp);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_pipe_mode_select(w, hpg); }).size() == kPipeModeSelectDwordsXeLpg);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_pipe_buf_addr_state(w, AvpBuffers(), hpg); }).size() == kPipeBufAddrDwordsXeLpg);
+  CHECK(emit([&](DwordWriter& w) { emit_avp_ind_obj_base_addr_state(w, 0x20000000, 0x1000, 3, hpg); }).size() == kIndObjDwordsXeLpg);
+  AvpPicture pic;
+  pic.width = 64;
+  pic.height = 48;
+  pic.full_range = true;
+  const auto hp_pic = emit([&](DwordWriter& w) { emit_avp_pic_state(w, pic, hpg); });
+  CHECK(hp_pic.size() == kPicStateDwordsXeLpg && !(hp_pic[2] & 64));
+}
+
 static void test_small_commands() {
   const std::vector<uint32_t> mode = emit([](DwordWriter& w) { emit_avp_pipe_mode_select(w); });
   CHECK(mode.size() == kPipeModeSelectDwords && mode[0] == (kAvpPipeModeSelect | 4) && mode[1] == (2u << 5) && mode[2] == 0 && mode[5] == 0);
@@ -298,6 +317,7 @@ static void test_default_contexts() {
 int main() {
   test_headers();
   test_xe_lpg();
+  test_xe_hpg();
   test_small_commands();
   test_pic_state();
   test_global_motion();

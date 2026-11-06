@@ -47,6 +47,7 @@ class IntelEngineBuffers {
   bool gen11() const { return driver_.generation() == intel_gt::Generation::Gen11 || driver_.generation() == intel_gt::Generation::Gen12; }
   bool gen12() const { return driver_.generation() == intel_gt::Generation::Gen12; }
   bool xe_lpg() const { return driver_.xe_lpg(); }
+  bool xe_hpg() const { return driver_.xe_hpg(); }
   bool engine_ready() const { return driver_.state() == intel_gt::VcsDriver::State::Ready; }
   ArrayView<uint32_t> batch_words() const { return batch_words_; }
 

@@ -139,7 +139,7 @@ bool VcsDriver::initialize(const Config& config) {
   config_ = config;
   ggtt_pages_ = ggtt_pages_for(config.engine);
   lrc_pages_ = config.engine == Engine::Render ? kLrcRenderPages : kLrcPages;
-  if (!config.registers || !config.ggtt_table.valid() || (config.engine == Engine::Render && config.generation != Generation::Gen9) || (config.xe_lpg && (config.generation != Generation::Gen12 || config.engine != Engine::Video))) { state_ = State::Failed; return false; }
+  if (!config.registers || !config.ggtt_table.valid() || (config.engine == Engine::Render && config.generation != Generation::Gen9) || ((config.xe_lpg || config.xe_hpg) && (config.generation != Generation::Gen12 || config.engine != Engine::Video)) || (config.xe_lpg && config.xe_hpg)) { state_ = State::Failed; return false; }
   const uint64_t entries = config.ggtt_table.length() / 8;
   if (config.ggtt_first_page > entries || ggtt_pages_ > entries - config.ggtt_first_page ||
       (config.ggtt_first_page + ggtt_pages_) * kPageSize > kGgttReach) {
@@ -162,7 +162,12 @@ bool VcsDriver::initialize(const Config& config) {
   if (config.xe_lpg) {
     program_xelpg_pat(regs);
     program_xelpg_global_mocs(regs);
-  } else if (config.generation == Generation::Gen12) program_gen12_pat(regs);
+  } else if (config.generation == Generation::Gen12) {
+    // Arc: the PAT registers (and the MOCS ones, whose video values are the reset ones) are multicast registers; the steering selector reads as multicast after a reset, and is
+    // made so here as the Linux driver does for graphics IP 12.50 and later.
+    if (config.xe_hpg) regs.write32(0xFDC, 1u << 31);
+    program_gen12_pat(regs);
+  }
   else if (config.generation == Generation::Gen11) program_icl_pat(regs);
   else program_private_pat(regs, gen9_private_pat());
   // The video engines' MOCS tables: the media commands select entry 1, "whatever the page table entry says". Gen9's video engines come out of reset with it; Gen11 programs
@@ -217,7 +222,7 @@ bool VcsDriver::initialize(const Config& config) {
   const uint64_t directories[4] = {ppgtt_.page_directory_dma(0), ppgtt_.page_directory_dma(1), ppgtt_.page_directory_dma(2), ppgtt_.page_directory_dma(3)};
   const bool gen12 = config.generation == Generation::Gen12;
   const bool gen11 = config.generation == Generation::Gen11;
-  const bool image = gen12 ? lrc_init_gen12_xcs(context_state_, engine_base(), true) && lrc_set_pml4(context_state_, ppgtt_.root_dma())
+  const bool image = gen12 ? (config.xe_lpg || config.xe_hpg ? lrc_init_dg2_xcs(context_state_, engine_base(), true) : lrc_init_gen12_xcs(context_state_, engine_base(), true)) && lrc_set_pml4(context_state_, ppgtt_.root_dma())
                            : (render() ? lrc_init_gen9_rcs(context_state_, engine_base(), true)
                                        : gen11 ? lrc_init_gen11_xcs(context_state_, engine_base(), true) : lrc_init_gen9_xcs(context_state_, engine_base(), true)) &&
                                  lrc_set_page_directories(context_state_, directories);

@@ -103,6 +103,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   UniquePointer<intel_gt::VcsDriver> driver_;
   intel_gt::Generation generation_ = intel_gt::Generation::Gen9;
   bool xe_lpg_ = false;   // Meteor Lake / Arrow Lake: a Gen12 engine on the media tile
+  bool xe_hpg_ = false;   // Arc Alchemist: a Gen12 engine of a discrete card
 };
 
 }  // namespace hardware

@@ -68,6 +68,9 @@ bool lrc_init_gen11_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhi
 // The same for a Gen12 (Xe-LP) video engine: the shorter register list of gen12_xcs_offsets (the load commands also set the "from the command streamer's MMIO"
 // bit), the ring MI mode and batch buffer offset at the places Gen12 has them. As the i915 driver does (gt/intel_lrc.c).
 bool lrc_init_gen12_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
+// The same for the video engines of graphics IP 12.55 and later (Arc Alchemist, Meteor Lake, Arrow Lake): two more registers (0x120, 0x124) in the first load, one skipped dword
+// instead of five before the second (xe_lrc.c dg2_xcs_offsets).
+bool lrc_init_dg2_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
 // The top of a four-level address space (its page-map level 4 page) goes where Gen9 has the first page directory pointer.
 bool lrc_set_pml4(ArrayView<uint32_t> state, uint64_t pml4);
 

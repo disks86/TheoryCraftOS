@@ -178,7 +178,40 @@ static void test_xe_lpg() {
   CHECK(inner.gpu.regs[0x384800] == 5 && window.read32(0x4800) == 5);
 }
 
+// Arc Alchemist (Xe-HPG): the Xe-LP PAT table written through the multicast selector, and the DG2 register state image.
+static void test_xe_hpg() {
+  Rig rig(Generation::Gen12);
+  VcsDriver::Config cfg = rig.config();
+  cfg.xe_hpg = true;
+  {
+    VcsDriver drv(rig.mem);
+    CHECK(drv.initialize(cfg) && drv.state() == VcsDriver::State::Ready && drv.xe_hpg() && !drv.xe_lpg());
+    CHECK(rig.gpu.regs[0xFDC] == (1u << 31));
+    const uint32_t pat[8] = {3, 1, 2, 0, 3, 3, 3, 3};
+    for (uint32_t i = 0; i < 8; ++i) CHECK(rig.gpu.regs[0x4800 + 4 * i] == pat[i]);
+    CHECK(rig.gpu.regs.count(0xD8C) == 0 && rig.gpu.regs.count(0x4000) == 0 && (rig.ggtt[100] >> 52) == 0);
+    const std::vector<uint32_t> batch = simple_batch();
+    CHECK(drv.run_batch(ArrayView<const uint32_t>(batch.data(), batch.size())) == VcsDriver::Result::Done);
+    CHECK(rig.gpu.violations.empty());
+  }
+  CHECK(rig.mem.live() == 1);
+  // The register state image: two more registers in the first load, and the second load at the same place.
+  std::vector<uint32_t> a(kLrcStateDwords), b(kLrcStateDwords);
+  CHECK(lrc_init_gen12_xcs(ArrayView<uint32_t>(a.data(), a.size()), 0x1C0000, true) && lrc_init_dg2_xcs(ArrayView<uint32_t>(b.data(), b.size()), 0x1C0000, true));
+  CHECK((a[1] & 0xFF) == 25 && (b[1] & 0xFF) == 29 && a[33] == b[33] && a[2] == b[2]);
+  CHECK(b[28] == 0x1C0120 && b[30] == 0x1C0124 && a[28] == 0 && a[30] == 0);
+  for (uint32_t i = 33; i < 52; ++i) CHECK(a[i] == b[i]);
+  CHECK(a[kCtxContextControl] == b[kCtxContextControl]);
+  // Both are exclusive with Xe-LPG.
+  Rig both(Generation::Gen12);
+  VcsDriver::Config bad = both.config();
+  bad.xe_hpg = bad.xe_lpg = true;
+  VcsDriver d(both.mem);
+  CHECK(!d.initialize(bad));
+}
+
 int main() {
+  test_xe_hpg();
   test_xe_lpg();
   test_init_and_jobs();
   test_failures();
