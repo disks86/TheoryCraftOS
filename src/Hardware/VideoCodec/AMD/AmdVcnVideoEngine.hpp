@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
 #include "Hardware/Mmio.hpp"
+#include "Hardware/Platform/AMD/AmdRyzenPlatform.hpp"
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/AMD/AmdRavenMemory.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
@@ -27,6 +28,7 @@
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnWorkMemory.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnGenerations.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Utility/FixedString.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -45,7 +47,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown).
   // `discovery` is, for a card, the last 64 KiB of its video memory; for an APU, its memory BAR (see AmdMediaEngineHw); or an empty window to skip looking at the hardware.
   explicit AmdVcnVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& discovery = MmioRegion())
-      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), device_id_(gpu_device_id), gpu_(amd_gpu_identify(gpu_device_id)), discovery_(discovery), firmware_(allocator) {}
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), device_id_(gpu_device_id), gpu_(amd_gpu_identify(gpu_device_id)), apu_(amd_ryzen_soc_of_gpu(gpu_device_id)), discovery_(discovery), firmware_(allocator) {}
 
   // A Radeon card's register BAR (BAR 5; at least AmdMmIndexVramReader::kRegisterWindow bytes), for reaching video memory the CPU-visible aperture does not cover,
   // and the size of that aperture (BAR 0). Call before initialize(); both are optional.
@@ -67,13 +69,16 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
 
   // VCN 1.0 (Ryzen 2000/3000 "Raven" APUs) runs on microcode the OS has to put into the engine's memory: this reads the right file from /firmware and checks it.
   // It does not start the engine - that needs the GPU's memory controller set up and a way to hand the microcode to the card, which this OS does not have.
-  // Other generations have no firmware file here yet (firmware_status() stays empty).
+  // VCN 2 and newer (the Ryzen 4000 and later APUs, and the cards whose table was read) have their file read and checked the same way, but nothing here
+  // starts those engines yet (each generation has its own start sequence, and VCN 4 a unified queue). A part whose VCN version is not known loads nothing.
   bool load_firmware(filesystem::IFileSystem& file_system) override {
     const char* name = amd_vcn1_firmware_name(device_id_, revision_);
+    const AmdVcnInfo vcn = vcn_info();
+    if (!name && vcn.generation != AmdVcnGeneration::Vcn1) name = vcn.firmware;
     if (!name) return false;
     firmware_name_ = name;
     firmware_state_ = firmware_.load(file_system, name);
-    engine_note_ = "engine not started";
+    engine_note_ = vcn.generation == AmdVcnGeneration::Vcn1 || vcn.generation == AmdVcnGeneration::Unknown ? "engine not started" : "no start sequence for this VCN generation yet";
     rebuild_firmware_text();
     refresh_summary();
     return firmware_state_ == AmdFirmwareStatus::Ok;
@@ -502,12 +507,27 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
 
   const char* name() const override { return "AMD video engine (VCN) (software path)"; }
   const AmdGpuInfo& gpu() const { return gpu_; }
-  // Codecs the engine would serve once it is driven: today's sessions all run in software (info().accelerated is false).
+  // The Ryzen SoC this GPU is the integrated graphics of (soc == Unknown for a card).
+  const AmdRyzenSocInfo& apu() const { return apu_; }
+  // The video engine: the version the IP discovery table lists when it was read, else the one the Ryzen catalogue expects for this APU; generation Unknown
+  // when neither says.
+  AmdVcnInfo vcn_info() const {
+    const AmdVcnFirmwareHint hint = apu_.soc == AmdRyzenSoc::Cezanne ? AmdVcnFirmwareHint::GreenSardine :
+                                    apu_.soc == AmdRyzenSoc::Renoir || apu_.soc == AmdRyzenSoc::Lucienne ? AmdVcnFirmwareHint::Renoir : AmdVcnFirmwareHint::None;
+    if (status_.probed && status_.discovery.vcn_instances) return amd_vcn_info(status_.discovery.vcn, hint);
+    return apu_.video_engine();
+  }
+  // Codecs the engine would serve once it is driven: today's sessions all run in software (info().accelerated is false). The codec lists of the engine's VCN
+  // version when it is known (amdgpu's), else what the GPU generation implies.
   uint32_t engine_decode_codecs() const {
+    const AmdVcnInfo vcn = vcn_info();
+    if (vcn.known() && vcn.decode_count) return vcn.decode_mask();
     return base_codecs() | (amd_gpu_has_video_engine(gpu_.architecture) ? codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) : 0) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) |
            (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0) | (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0);
   }
   uint32_t engine_encode_codecs() const {
+    const AmdVcnInfo vcn = vcn_info();
+    if (vcn.known()) return vcn.encode_mask();
     return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_av1_encode ? codec_mask(VideoCodec::Av1) : 0);
   }
 
@@ -551,6 +571,14 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
 
   void refresh_summary() {
     summary_.assign(gpu_.name);
+    if (apu_.soc != AmdRyzenSoc::Unknown && !status_.probed && apu_.has_video_engine()) {
+      summary_.append(", expected VCN ");   // what the catalogue says this APU carries, until the table is read
+      summary_.append_uint(apu_.vcn.major);
+      summary_.append(".");
+      summary_.append_uint(apu_.vcn.minor);
+      summary_.append(".");
+      summary_.append_uint(apu_.vcn.revision);
+    }
     if (status_.probed) {
       const AmdIpDiscoveryInfo& d = status_.discovery;
       summary_.append(", VCN ");
@@ -605,6 +633,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   uint16_t device_id_ = 0;
   uint8_t revision_ = 0;
   AmdGpuInfo gpu_;
+  AmdRyzenSocInfo apu_;
   MmioRegion discovery_;
   AmdVcnFirmware firmware_;
   AmdFirmwareStatus firmware_state_ = AmdFirmwareStatus::NotApplicable;

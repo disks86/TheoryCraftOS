@@ -88,6 +88,8 @@
 #include "Hardware/SerialPort/SystemSerialPorts.hpp"
 #include "Hardware/SerialPort/X86SerialPortIo.hpp"
 #include "Hardware/Clock/TscClock.hpp"
+#include "Hardware/Platform/AMD/AmdRyzenPlatform.hpp"
+#include "Hardware/Chipset/SystemChipset.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #ifdef TCOS_AMD_VEGAM
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdVegaM.hpp"
@@ -886,6 +888,62 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   system_npu.probe_registers(pci, paging_ok ? &register_mapper : nullptr);  // Intel NPU: read the fuses (nothing is powered up)
   hardware::INeuralProcessingUnit& npu = system_npu.npu();
   Entry(Level::Ok, "NPU").text(npu.name()).text(", ").dec(npu.compute_units()).text(" compute units; ").text(system_npu.description());
+  // An AMD Zen machine: which Ryzen SoC it is and the graphics, display, video and NPU blocks that come with it (from the CPU model and the PCI bus).
+  if (system_cpu.amd() && hardware::amd_zen_core(system_cpu.family(), system_cpu.model()) != hardware::AmdZenCore::Unknown) {
+    FixedString<256> platform;
+    hardware::amd_ryzen_describe(hardware::amd_ryzen_identify_machine(system_cpu.family(), system_cpu.model(), pci), platform);
+    Entry(Level::Ok, "Platform").text(platform.c_str());
+  }
+  // The chipset (Intel PCH or AMD FCH and Promontory): what it is, what it carries, how the firmware left its flash and management engine, and the
+  // memory modules its SMBus can see.
+  hardware::SystemChipset system_chipset(cpu);
+  {
+    hardware::ChipsetCpu chipset_cpu;
+    chipset_cpu.vendor = system_cpu.intel() ? hardware::ChipsetVendor::Intel : system_cpu.amd() ? hardware::ChipsetVendor::Amd : hardware::ChipsetVendor::Unknown;
+    chipset_cpu.family = system_cpu.family();
+    chipset_cpu.model = system_cpu.model();
+    chipset_cpu.stepping = system_cpu.stepping();
+    system_chipset.probe(chipset_cpu, pci, paging_ok ? &register_mapper : nullptr);
+    if (const hardware::IChipset* chipset = system_chipset.chipset()) {
+      FixedString<256> line;
+      chipset->summarize(line);
+      Entry(Level::Ok, "Chipset").text(line.c_str());
+      chipset->inventory().summarize(line);
+      Entry(Level::Info, "Chipset").text("functions: ").text(line.c_str());
+      const hardware::ChipsetSmbus smbus = chipset->smbus();
+      if (smbus.usable) Entry(Level::Info, "Chipset").text("SMBus host at I/O ").hex(smbus.io_base);
+      else Entry(Level::Info, "Chipset").text("SMBus: ").text(smbus.reason);
+      if (const hardware::IntelPchChipset* intel = system_chipset.intel()) {
+        const hardware::IntelBiosProtection& bios = intel->bios_protection();
+        if (bios.known) {
+          Entry(bios.locked() ? Level::Info : Level::Warning, "Chipset")
+              .text("BIOS flash ")
+              .text(bios.write_enable ? "writable" : bios.lock_enable ? "locked" : "write-protected but not locked")
+              .text(bios.smm_protect ? ", SMM-only writes" : "");
+        }
+        const hardware::IntelMeStatus& me = intel->me();
+        if (me.present) {
+          Entry(Level::Info, "Chipset")
+              .text("management engine ")
+              .text(hardware::intel_me_working_state_name(me.working_state()))
+              .text(", ")
+              .text(hardware::intel_me_operation_mode_name(me.operation_mode()))
+              .text(me.manufacturing_mode() ? " (manufacturing mode)" : "");
+        }
+      }
+      hardware::MemoryModuleSlot modules[8];
+      const char* reason = nullptr;
+      const uint32_t module_count = system_chipset.read_memory_modules(ArrayView<hardware::MemoryModuleSlot>(modules, 8), &reason);
+      for (uint32_t m = 0; m < module_count; ++m) {
+        FixedString<128> description;
+        hardware::spd_describe(modules[m].module, description);
+        Entry(Level::Ok, "Memory").text("module at SMBus 0x").hex2(static_cast<uint8_t>(0x50 + modules[m].slot)).text(": ").text(description.c_str());
+      }
+      if (module_count == 0) Entry(Level::Info, "Memory").text("no module SPD read over the SMBus").text(reason ? ": " : "").text(reason ? reason : "");
+    } else {
+      Entry(Level::Info, "Chipset").text("no Intel or AMD chipset on the PCI bus");
+    }
+  }
 #ifdef TCOS_SELFTESTS
   if (!run_npu_demo(npu, shared_allocator)) console::puts("NPU self-check failed\n");
 

@@ -10,6 +10,15 @@ boot volume (`<build>/esp/firmware`); on an installed machine copy the files to 
 | `raven_vcn.bin` | AMD Video Core Next 1.0 (VCN 1) - Ryzen 2000 "Raven Ridge" APUs (PCI 1002:15DD, revision < 8) | |
 | `picasso_vcn.bin` | VCN 1.0 - Ryzen 3000 mobile "Picasso" (PCI 1002:15D8, revision < 8) | |
 | `raven2_vcn.bin` | VCN 1.0 - "Raven2" / "Dali" (PCI 1002:15DD or 15D8, revision >= 8) | |
+| `renoir_vcn.bin`, `green_sardine_vcn.bin` | VCN 2.2 - Ryzen 4000 "Renoir" and Ryzen 5000U "Lucienne"; Ryzen 5000 "Cezanne" and 7030 "Barcelo" (byte-identical today) | Read and checked; the engine is not started yet |
+| `vangogh_vcn.bin` | VCN 3.0.2 - Steam Deck "Van Gogh" | Read and checked only |
+| `yellow_carp_vcn.bin`, `vcn_3_1_2.bin` | VCN 3.1.1 - Ryzen 6000 "Rembrandt"; VCN 3.1.2 - Mendocino, Raphael, Granite Ridge (byte-identical today) | Read and checked only |
+| `vcn_4_0_2.bin` | VCN 4.0.2 - Ryzen 7040/8040 "Phoenix", "Hawk Point" | Read and checked only |
+| `vcn_4_0_5.bin` | VCN 4.0.5 - Ryzen AI 300 "Strix Point", "Krackan Point" | Read and checked only |
+| `vcn_4_0_6.bin`, `vcn_4_0_6_1.bin` | VCN 4.0.6 - Ryzen AI Max "Strix Halo": first and second engine | Read and checked only (`_1` is not loaded yet) |
+| `amdnpu/1502_00/npu.sbin`, `npu_7.sbin` | AMD XDNA NPU (npu1) - Phoenix / Hawk Point (PCI 1022:1502 rev 0): firmware 1.5.2.380 and 1.5.5.391 | The driver tries `npu_7.sbin` first; `start_amd_device` takes the bytes, nothing loads them at boot yet |
+| `amdnpu/17f0_10/npu.sbin`, `npu_7.sbin` | XDNA 2 (npu4) - Strix Point (1022:17F0 rev 0x10), and Strix Halo (npu6, rev 0x20), which the driver points at the same directory: 1.0.0.63 and 1.1.2.64 | As above |
+| `amdnpu/17f0_11/npu.sbin`, `npu_7.sbin` | XDNA 2 (npu5) - Krackan Point (1022:17F0 rev 0x11): 1.0.0.166 and 1.1.2.65 | As above |
 | `vegam_uvd.bin` | Unified Video Decoder 6.3 - Radeon RX Vega M (PCI 1002:694C, 694E, 694F; amdgpu's VEGAM), firmware 1.130 | |
 | `vegam_vce.bin` | Video Coding Engine 3.4 (H.264 encode) - Radeon RX Vega M (PCI 1002:694C, 694E, 694F; amdgpu's VEGAM), firmware 53.21 (binary id 3) | |
 | `vegam_pfp.bin`, `vegam_me.bin`, `vegam_ce.bin` | Command processor (graphics) microcode: PFP, ME, CE - Radeon RX Vega M (amdgpu's VEGAM), versions 243, 164, 137 | Loaded by the SMC |
@@ -19,6 +28,7 @@ boot volume (`<build>/esp/firmware`); on an installed machine copy the files to 
 | `iwlwifi-9000-pu-b0-jf-b0-46.ucode` | Intel Wireless-AC 9560 (iwlwifi 9000 family, PU MAC with the JF radio; Dell XPS 15 9575), firmware core43, API 46 | The driver tries newer API numbers first and takes the first file it finds |
 | `ibt-17-16-1.sfi`, `ibt-17-0-1.sfi` | Intel Bluetooth firmware (USB 8087:0aaa and relatives) for the Wireless-AC 9560 (JfP, hardware variant 0x11): the bootloader names the file `ibt-<variant>-<hardware revision>-<firmware revision>.sfi`; revision 16 is the common one, 0 the older | The Bluetooth service reads `/firmware/<name>` without the `intel/` of Linux's path; the controller's log line says which one it asks for |
 | `LICENSE.amdgpu` | The license these files are distributed under | Must stay with them |
+| `LICENSE.amdnpu` | The license the AMD NPU files (`amdnpu/`) are distributed under | Must stay with them |
 | `LICENCE.iwlwifi_firmware` | The license the Intel Wi-Fi file is distributed under | Must stay with it |
 | `LICENCE.ibt_firmware` | The license the Intel Bluetooth files are distributed under | Must stay with them |
 
@@ -32,7 +42,27 @@ Copied unmodified from the linux-firmware repository (`amdgpu/raven_vcn.bin`, `a
 `LICENSES/LICENSE.amdgpu`), https://gitlab.com/kernel-firmware/linux-firmware, which lists them in its WHENCE file as
 "Redistributable. See LICENSE.amdgpu for details." SHA-256:
 
+The VCN 2-4 files (`amdgpu/<name>`) and the NPU files were copied unmodified from the same repository on 2026-11-06; the NPU files are
+`amdnpu/<dir>/npu.sbin.<version>` stored under the names the repository's WHENCE links give them (`npu.sbin`, `npu_7.sbin`), as copies rather than
+links so they survive a FAT volume. WHENCE lists them as "Redistributable. See LICENSE.amdnpu for details." (`LICENSES/LICENSE.amdnpu`). There is no
+firmware for the AIE4 NPUs (1022:17F2, 1B0B) in linux-firmware yet.
+
 ```
+5b32a9f1ee1176babe56910fa1fa52df938b60665febbeab1ce0ee38cb4d5c98  renoir_vcn.bin
+5b32a9f1ee1176babe56910fa1fa52df938b60665febbeab1ce0ee38cb4d5c98  green_sardine_vcn.bin
+3d282b29bff2ea1833e00cfb08bb6dd9b379f7e58090e0e87aaccb4c2a35d732  vangogh_vcn.bin
+31176d1a359aad08d462895eb02184b5d36c8d7570afc380ec889a9c7ffe8cb4  yellow_carp_vcn.bin
+31176d1a359aad08d462895eb02184b5d36c8d7570afc380ec889a9c7ffe8cb4  vcn_3_1_2.bin
+5633a5212d41e1f3932c1e7e630b1f2c8c4d27bc53ce8149c3be75d1d832053c  vcn_4_0_2.bin
+4481b9b377bc7c06727032b826456f3e8b9f896792c696de77f9bf8018b164c9  vcn_4_0_5.bin
+4481b9b377bc7c06727032b826456f3e8b9f896792c696de77f9bf8018b164c9  vcn_4_0_6.bin
+c5e9a4ef05d3c4afa77c5a8fabe5987bf8272907823ae5463f97e93a818a1566  vcn_4_0_6_1.bin
+718142a5778b003e5cc2719c9785772b67e5b4e6fa64cba0632a3c0466030bcc  amdnpu/1502_00/npu.sbin
+d13ff9fb95c6cea40213fa69e5a3465529f00bb67c0984d62343c6e31808fb9e  amdnpu/1502_00/npu_7.sbin
+81831072efc3db9e0a1038cded24afd2e67a29434de550e51a19544de05ba91a  amdnpu/17f0_10/npu.sbin
+7ed0f242f253b581eb75c8c8b34638d92fba598063b635a541beb94869245469  amdnpu/17f0_10/npu_7.sbin
+7f1cc47f1b462d9267486818ede34e7936c312d48e14cfa0a7e357e4600e9a17  amdnpu/17f0_11/npu.sbin
+3e3c996ef1e562e96ee4c4d90faa9faf1132c72da3af1bcf35d592cc34903fed  amdnpu/17f0_11/npu_7.sbin
 d376048d547b418effa4f357a4d1cddd418d101874f6a679144ab4df069f3aeb  picasso_vcn.bin
 d376048d547b418effa4f357a4d1cddd418d101874f6a679144ab4df069f3aeb  raven2_vcn.bin
 d376048d547b418effa4f357a4d1cddd418d101874f6a679144ab4df069f3aeb  raven_vcn.bin

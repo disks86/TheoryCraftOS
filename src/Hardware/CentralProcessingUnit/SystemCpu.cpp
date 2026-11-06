@@ -71,6 +71,11 @@ bool is_qemu_tcg() {
 SystemCpu::SystemCpu(efi::SystemTable* st) {
   const Vendor vendor = detect_vendor();
   const CpuSignature sig = cpu_signature();
+  amd_ = vendor == Vendor::Amd;
+  intel_ = vendor == Vendor::Intel;
+  family_ = sig.family;
+  model_ = sig.model;
+  stepping_ = sig.stepping;
 
   // 1. A known microarchitecture.
   active_ = nullptr;

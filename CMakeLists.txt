@@ -298,6 +298,10 @@ add_executable(BOOTX64
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuDevice.cpp
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuFirmwareFile.cpp
   src/Hardware/NeuralProcessingUnit/Intel/IntelNpuExecutor.cpp
+  src/Hardware/NeuralProcessingUnit/AMD/AmdXdnaHw.cpp
+  src/Hardware/NeuralProcessingUnit/AMD/AmdXdnaMailbox.cpp
+  src/Hardware/NeuralProcessingUnit/AMD/AmdXdnaMessages.cpp
+  src/Hardware/NeuralProcessingUnit/AMD/AmdXdnaDevice.cpp
   src/Math/FloatMath.cpp
   src/Spreadsheet/Sheet.cpp
   src/Database/DatabaseTypes.cpp
@@ -462,6 +466,16 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Multi/GpuNativeDrivers.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
+  src/Hardware/Platform/AMD/AmdRyzenPlatform.cpp
+  src/Hardware/Chipset/IChipset.cpp
+  src/Hardware/Chipset/SystemChipset.cpp
+  src/Hardware/Chipset/Smbus/SmbusHost.cpp
+  src/Hardware/Chipset/Smbus/SmbusIoPorts.cpp
+  src/Hardware/Chipset/Smbus/Spd.cpp
+  src/Hardware/Chipset/Intel/IntelPch.cpp
+  src/Hardware/Chipset/Intel/IntelPchChipset.cpp
+  src/Hardware/Chipset/AMD/AmdChipsets.cpp
+  src/Hardware/Chipset/AMD/AmdFchChipset.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
@@ -790,6 +804,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcnGenerations.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6.cpp
   src/Hardware/VideoCodec/AMD/AmdVce3.cpp
