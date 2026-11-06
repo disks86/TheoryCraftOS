@@ -361,7 +361,7 @@ void vdenc_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayo
 
   c.set(kGen12VdencCmd2_FrameWidthInPixelsMinusOne, l.width - 1);
   c.set(kGen12VdencCmd2_FrameHeightInPixelsMinusOne, l.height - 1);
-  c.set(kGen12VdencCmd2_PictureType, p.p_picture ? 3 : 0);   // low-delay B or I
+  c.set(kGen12VdencCmd2_PictureType, !p.p_picture ? 0 : p.b_picture ? 2 : 3);   // I, random-access B (2) or low-delay B (3); an anchor's references are all earlier, which makes it low delay to the driver
   c.set(kGen12VdencCmd2_TemporalMvpEnableFlag, 0);
   c.set(kGen12VdencCmd2_TransformSkip, 0);
   c.set(kGen12VdencCmd2_NumRefIdxL0Minus1, 0);
@@ -384,7 +384,9 @@ void vdenc_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayo
     c.set(kGen12VdencCmd2_PocNumberForRefid0InL0, static_cast<uint32_t>(distance) & 0xFF);
     c.set(kGen12VdencCmd2_PocNumberForRefid1InL0, static_cast<uint32_t>(unused) & 0xFF);
     c.set(kGen12VdencCmd2_PocNumberForRefid2InL0, static_cast<uint32_t>(unused) & 0xFF);
-    c.set(kGen12VdencCmd2_PocNumberForRefid0InL1, static_cast<uint32_t>(distance) & 0xFF);
+    // List 1 of a B picture names the later anchor (a negative distance); of every other picture the same one as list 0. Its other entries copy list 0's (the driver does).
+    const int32_t distance_l1 = p.b_picture ? clip(-16, 16, static_cast<int32_t>(p.poc) - static_cast<int32_t>(p.backward_poc)) : distance;
+    c.set(kGen12VdencCmd2_PocNumberForRefid0InL1, static_cast<uint32_t>(distance_l1) & 0xFF);
     c.set(kGen12VdencCmd2_PocNumberForRefid1InL1, static_cast<uint32_t>(unused) & 0xFF);
     c.set(kGen12VdencCmd2_PocNumberForRefid2InL1, static_cast<uint32_t>(unused) & 0xFF);
     c.set(kGen12VdencCmd2_SubPelMode, 3);
@@ -402,8 +404,14 @@ void vdenc_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayo
   c.raw(7, (c.get(7) & 0xfff7ffffu) | 0x80000);   // one reference
   c.set(kGen12VdencCmd2_VdencStreamInEnable, 0);
   c.set(kGen12VdencCmd2_PakOnlyMultiPassEnable, 0);
-  c.raw(8, 0);                                    // low delay: no backward-reference parameters
-  c.raw(9, c.get(9) & 0xffff0000u);
+  if (p.b_picture) {
+    c.raw(7, c.get(7) & 0xfff7feffu);             // not low delay
+    c.raw(8, 0x54555555);
+    c.raw(9, (c.get(9) & 0xffff0000u) | 0x5555);
+  } else {
+    c.raw(8, 0);                                  // low delay: no backward-reference parameters
+    c.raw(9, c.get(9) & 0xffff0000u);
+  }
   c.set(kGen12VdencCmd2_MinQp, 10);
   c.set(kGen12VdencCmd2_MaxQp, 51);
   c.set(kGen12VdencCmd2_TemporalMVEnableForIntegerSearch, 0);
@@ -423,7 +431,8 @@ void vdenc_cmd2(DwordWriter& w, const HevcEncodePicture& p, const HevcEncodeLayo
   c.raw(34, (c.get(34) & 0xff000000u) | 0x44aa44);
 
   // Reference frame store of list entry 0 (store 0), the unused entries (7), and the flag in the top bit.
-  c.raw(11, 0x00070700u);
+  // List entry 0 (and for a B picture the backward reference, in the top byte) are frame stores of the stream's three.
+  c.raw(11, 0x00070700u | (p.p_picture ? p.reference_store : 0u) | (p.b_picture ? p.backward_store << 24 : 0u));
   c.raw(11, (c.get(11) & 0x7fffffffu) | 0x80000000u);
   c.emit(w);
 }
@@ -595,7 +604,7 @@ void emit_hevc_vdenc_picture(DwordWriter& w, const HevcEncodePicture& p, const H
     c.set(kGen12VdencPipeModeSelect_BitDepth, kGen12VdencPipeModeSelect_BIT_DEPTH_8BIT);
     c.set(kGen12VdencPipeModeSelect_PakChromaSubSamplingType, kGen12VdencPipeModeSelect_PAK_CHROMA_SUB_SAMPLING_TYPE_420);
     c.set(kGen12VdencPipeModeSelect_OutputRangeControlAfterColorSpaceConversion, 1);
-    c.set(kGen12VdencPipeModeSelect_IsRandomAccess, 0);   // low delay
+    c.set(kGen12VdencPipeModeSelect_IsRandomAccess, p.b_picture ? 1 : 0);   // (as on the newer platforms: set for the B pictures)
     c.set(kGen12VdencPipeModeSelect_HmeRegionPreFetchenable, 0);
     c.set(kGen12VdencPipeModeSelect_PreFetchoffsetforsource, 4);
     c.set(kGen12VdencPipeModeSelect_Numverticalreqminus1Src, 1);
