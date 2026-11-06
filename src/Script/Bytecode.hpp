@@ -110,6 +110,7 @@ struct FunctionCode {
   List<Instr> code;
   List<uint32_t> lines;                 // the source line of each instruction
   List<Value> constants;                // numbers and (interned) strings
+  uint32_t constants_seen = 0;          // (the collector: constants before this were marked by an earlier collection and are old)
   List<FunctionCode*> children;         // the functions made inside this one
   List<EvalScope*> eval_scopes;         // the calls of eval(...) in it (see Opc::EvalScope)
   uint32_t slot_count = 0;              // variables (parameters first)

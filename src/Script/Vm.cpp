@@ -74,7 +74,7 @@ bool function_prototype_call(Vm& vm, const Value& self, const Value* args, uint3
 }  // namespace
 
 Vm::Vm(allocators::IAllocator& allocator, IHost* host)
-    : allocator_(allocator), host_(host), remembered_(allocator), gray_(allocator), codes_(allocator), halt_reason_(allocator), frames_(allocator), handlers_(allocator) {
+    : allocator_(allocator), host_(host), remembered_(allocator), young_interned_(allocator), gray_(allocator), codes_(allocator), halt_reason_(allocator), frames_(allocator), handlers_(allocator) {
   frames_.reserve(kMaxFrames + 8);   // (the interpreter keeps pointers to frames: the list must never move them)
   stack_ = static_cast<Value*>(allocator_.allocate(sizeof(Value) * kStackValues));
   interned_cap_ = 1024;
@@ -143,6 +143,7 @@ Vm::~Vm() {
   }
   allocator_.deallocate(interned_);
   allocator_.deallocate(stack_);
+  pool_trim(0);
 }
 
 FunctionCode* Vm::new_code() {
@@ -211,15 +212,75 @@ void Vm::link(Cell* cell, uint64_t size) {
 void Vm::account_bytes(uint64_t size) {
   heap_bytes_ += size;
   young_bytes_ += size;
-  uint64_t nursery = memory_limit_ / 12;
-  if (nursery < (4u << 20)) nursery = 4u << 20;
-  if (nursery > (64u << 20)) nursery = 64u << 20;
-  if (young_bytes_ > nursery) gc_wanted_ = true;
+  if (young_bytes_ > nursery_bytes()) gc_wanted_ = true;
   if (heap_bytes_ > gc_threshold_) gc_wanted_ = major_wanted_ = true;
   if (heap_bytes_ > memory_limit_ && !halted_) {
     // Try to free something first; only stop the script if that does not help.
     gc_wanted_ = major_wanted_ = true;
     if (heap_bytes_ > memory_limit_ + (memory_limit_ >> 2)) halt("out of memory");
+  }
+}
+
+uint64_t Vm::nursery_bytes() const {
+  const uint64_t nursery = memory_limit_ / 12;
+  return nursery < (4u << 20) ? 4u << 20 : nursery > (64u << 20) ? 64u << 20 : nursery;
+}
+
+// The pool of small blocks (see pool_). A block is always allocated at the full size of its class, so any request of that class fits in it; a block goes
+// back to the class of the size it was asked for with (never more than it has). Under the address sanitizer the pool marks a kept block, and the part of a
+// handed-out block past the size asked for, as unusable, so that a use after free or a write past the end is still caught.
+#if defined(__SANITIZE_ADDRESS__)
+extern "C" void __asan_poison_memory_region(void const volatile* addr, size_t size);
+extern "C" void __asan_unpoison_memory_region(void const volatile* addr, size_t size);
+#define TCOS_POOL_POISON(p, n) __asan_poison_memory_region((p), (n))
+#define TCOS_POOL_UNPOISON(p, n) __asan_unpoison_memory_region((p), (n))
+#else
+#define TCOS_POOL_POISON(p, n) ((void)(p), (void)(n))
+#define TCOS_POOL_UNPOISON(p, n) ((void)(p), (void)(n))
+#endif
+
+void* Vm::pool_allocate(uint64_t size) {
+  if (size == 0 || size > kPoolLargest) return allocator_.allocate(size);
+  const uint32_t c = static_cast<uint32_t>((size + 15) / 16 - 1);
+  const uint64_t block_size = uint64_t{c + 1} * 16;
+  void* block = pool_[c];
+  if (block) {
+    TCOS_POOL_UNPOISON(block, block_size);
+    pool_[c] = pool_[c]->next;
+    pool_bytes_ -= block_size;
+    if (pool_[c]) __builtin_prefetch(pool_[c], 1);   // (the next one of this size: its first touch overlaps with filling this one)
+  } else {
+    block = allocator_.allocate(block_size);
+    if (!block) return nullptr;
+  }
+  TCOS_POOL_POISON(static_cast<char*>(block) + size, block_size - size);
+  return block;
+}
+
+void Vm::pool_free(void* block, uint64_t size) {
+  if (!block) return;
+  const uint32_t c = static_cast<uint32_t>((size + 15) / 16 - 1);
+  const uint64_t block_size = uint64_t{c + 1} * 16;
+  if (size == 0 || size > kPoolLargest || pool_bytes_ >= nursery_bytes()) {
+    if (size != 0 && size <= kPoolLargest) TCOS_POOL_UNPOISON(block, block_size);
+    allocator_.deallocate(block);
+    return;
+  }
+  TCOS_POOL_UNPOISON(block, block_size);
+  pool_[c] = new (block) PoolBlock{pool_[c]};   // (the block is at least 16 bytes and suitably aligned: it came from the allocator)
+  pool_bytes_ += block_size;
+  TCOS_POOL_POISON(block, block_size);
+}
+
+void Vm::pool_trim(uint64_t keep) {
+  for (uint32_t c = 0; c < kPoolClasses; ++c) {
+    while (pool_[c] && pool_bytes_ > keep) {
+      PoolBlock* b = pool_[c];
+      TCOS_POOL_UNPOISON(b, uint64_t{c + 1} * 16);
+      pool_[c] = b->next;
+      pool_bytes_ -= uint64_t{c + 1} * 16;
+      allocator_.deallocate(b);
+    }
   }
 }
 
@@ -234,11 +295,12 @@ void Vm::free_cell(Cell* cell) {
     case CellKind::String: {
       JsString* str = static_cast<JsString*>(cell);
       allocator_.deallocate(str->wide);
+      const uint64_t size = sizeof(JsString) + (str->shared ? 1 : uint64_t{str->length} + 1);   // (as it was made: see new_string, concat_shared; a buffer's length only shrinks)
       if (str->shared && --str->shared->refs == 0) allocator_.deallocate(str->shared);
-      allocator_.deallocate(cell);
+      pool_free(cell, size);
       break;
     }
-    case CellKind::Env: allocator_.deallocate(cell); break;
+    case CellKind::Env: pool_free(cell, sizeof(Env) + sizeof(Value) * static_cast<Env*>(cell)->count); break;
     case CellKind::Object: {
       JsObject* o = static_cast<JsObject*>(cell);
       if (o->okind == ObjKind::Coroutine && o->host_data) {
@@ -247,10 +309,10 @@ void Vm::free_cell(Cell* cell) {
         allocator_.deallocate(co);
       }
       if (o->okind == ObjKind::RegExp && o->host_data) regexp_release(allocator_, o->host_data);
-      allocator_.deallocate(o->props);
-      allocator_.deallocate(o->index);
-      allocator_.deallocate(o->items);
-      allocator_.deallocate(o);
+      pool_free(o->props, sizeof(Prop) * o->prop_cap);
+      pool_free(o->index, sizeof(uint32_t) * o->index_cap);
+      pool_free(o->items, sizeof(Value) * o->capacity);   // (typed arrays use capacity as a mark and have no items)
+      pool_free(o, sizeof(JsObject));
       break;
     }
   }
@@ -436,7 +498,7 @@ uint32_t Vm::string_unit_at(JsString* s, uint32_t index) {
 
 JsString* Vm::new_string(StringView text) {
   if (text.empty() && empty_) return empty_;
-  void* mem = allocator_.allocate(sizeof(JsString) + text.size() + 1);
+  void* mem = pool_allocate(sizeof(JsString) + text.size() + 1);
   if (!mem) {
     halt("out of memory");
     return empty_;
@@ -453,7 +515,7 @@ JsString* Vm::new_string(StringView text) {
 
 JsString* Vm::new_bytes(uint32_t length) {
   if (length == 0) return empty_;
-  void* mem = allocator_.allocate(sizeof(JsString) + uint64_t{length} + 1);
+  void* mem = pool_allocate(sizeof(JsString) + uint64_t{length} + 1);
   if (!mem) {
     halt("out of memory");
     return empty_;
@@ -489,7 +551,7 @@ JsString* Vm::concat(JsString* a, JsString* b) {
     return empty_;
   }
   if (total >= kAppendBufferMin) return concat_shared(a, b, static_cast<uint32_t>(total));
-  void* mem = allocator_.allocate(sizeof(JsString) + total + 1);
+  void* mem = pool_allocate(sizeof(JsString) + total + 1);
   if (!mem) {
     halt("out of memory");
     return empty_;
@@ -535,7 +597,7 @@ JsString* Vm::concat_shared(JsString* a, JsString* b, uint32_t total) {
     hash = hash_text(StringView(d, total));
     account_bytes(uint64_t{capacity} + 1);
   }
-  void* mem = allocator_.allocate(sizeof(JsString) + 1);
+  void* mem = pool_allocate(sizeof(JsString) + 1);
   if (!mem) {
     if (buffer->refs == 0) allocator_.deallocate(buffer);
     halt("out of memory");
@@ -591,6 +653,7 @@ JsString* Vm::intern(StringView text) {
   if (s == empty_ && !text.empty()) return s;
   if (s->interned) return s;   // (the empty string)
   s->interned = true;
+  if (!young_interned_.push_back(s)) young_interned_lost_ = true;
   if ((interned_count_ + 1) * 2 > interned_cap_) {
     // grow the table
     const uint32_t cap = interned_cap_ * 2;
@@ -641,6 +704,37 @@ void Vm::prune_intern_table() {
   interned_count_ = count;
 }
 
+// A minor collection: only the strings interned since the last collection can be freed, so only the unmarked ones of those leave the table.
+void Vm::prune_young_interned() {
+  if (young_interned_lost_) {
+    prune_intern_table();
+  } else {
+    for (uint64_t i = 0; i < young_interned_.count(); ++i)
+      if (!young_interned_[i]->marked) intern_remove(young_interned_[i]);
+  }
+  young_interned_.clear();
+  young_interned_lost_ = false;
+}
+
+// Takes s out of the table. The entries after it in its probe run move back into the gap when their own place is not between the gap and where they are
+// (linear probing with backward shift: no tombstones, so lookups stay as they were).
+void Vm::intern_remove(JsString* s) {
+  const uint32_t mask = interned_cap_ - 1;
+  uint32_t gap = s->hash & mask;
+  while (interned_[gap] && interned_[gap] != s) gap = (gap + 1) & mask;
+  if (!interned_[gap]) return;
+  interned_[gap] = nullptr;
+  --interned_count_;
+  for (uint32_t j = (gap + 1) & mask; interned_[j]; j = (j + 1) & mask) {
+    const uint32_t home = interned_[j]->hash & mask;
+    const bool stays = gap <= j ? (gap < home && home <= j) : (gap < home || home <= j);   // (its home is after the gap, cyclically: moving it would hide it)
+    if (stays) continue;
+    interned_[gap] = interned_[j];
+    interned_[j] = nullptr;
+    gap = j;
+  }
+}
+
 void Vm::rebuild_intern_table() {
   intern_rebuild_wanted_ = false;
   for (uint32_t i = 0; i < interned_cap_; ++i) interned_[i] = nullptr;
@@ -659,7 +753,7 @@ void Vm::rebuild_intern_table() {
 }
 
 JsObject* Vm::new_object(JsObject* proto) {
-  void* mem = allocator_.allocate(sizeof(JsObject));
+  void* mem = pool_allocate(sizeof(JsObject));
   if (!mem) {
     halt("out of memory");
     return sentinel_;
@@ -1275,7 +1369,7 @@ JsObject* Vm::new_function(FunctionCode* code, Env* env, const Value& this_value
 
 Env* Vm::new_env(uint32_t slots, Env* parent) {
   const uint64_t size = sizeof(Env) + sizeof(Value) * slots;
-  void* mem = allocator_.allocate(size);
+  void* mem = pool_allocate(size);
   if (!mem) {
     halt("out of memory");
     return nullptr;
@@ -1471,9 +1565,10 @@ void Vm::mark_roots() {
   mark(pending_eval_.env);
   mark_value(pending_eval_.this_value);
   for (JsString* s : {empty_, length_, prototype_, name_, message_, constructor_, to_string_, value_of_, undefined_text_, null_text_, true_text_, false_text_}) mark(s);
-  for (uint64_t i = 0; i < codes_.count(); ++i) {
+  for (uint64_t i = 0; i < codes_.count(); ++i) {   // (constants never change once compiled: a minor collection marks only those since the last collection)
     FunctionCode* code = codes_[i];
-    for (uint64_t k = 0; k < code->constants.count(); ++k) mark_value(code->constants[k]);
+    for (uint64_t k = minor_ ? code->constants_seen : 0; k < code->constants.count(); ++k) mark_value(code->constants[k]);
+    code->constants_seen = static_cast<uint32_t>(code->constants.count());
     mark(code->name);
   }
 }
@@ -1484,6 +1579,7 @@ void Vm::sweep_young() {
   young_ = nullptr;
   while (c) {
     Cell* next = c->next;
+    if (next) __builtin_prefetch(next, 1);   // (the list is scattered in memory: start the next load while this cell is dealt with)
     if (c->marked) {
       c->marked = false;
       c->gen = kGenOld;
@@ -1544,7 +1640,7 @@ void Vm::collect_minor() {
   for (uint64_t i = 0; i < remembered_.count(); ++i) gray_.push_back(remembered_[i]);   // (looked into: they may point to young cells)
   trace();
   if (verify_generations) verify_minor_marks();
-  prune_intern_table();
+  prune_young_interned();
   sweep_young();
   for (uint64_t i = 0; i < remembered_.count(); ++i) remembered_[i]->gen = kGenOld;
   remembered_.clear();
@@ -1566,6 +1662,8 @@ void Vm::collect_major() {
   mark_roots();
   trace();
   prune_intern_table();
+  young_interned_.clear();
+  young_interned_lost_ = false;
   Cell** link_to = &cells_;
   while (*link_to) {
     Cell* c = *link_to;
@@ -1582,6 +1680,7 @@ void Vm::collect_major() {
   young_bytes_ = 0;
   heap_bytes_ = old_bytes_;
   if (intern_rebuild_wanted_) rebuild_intern_table();
+  pool_trim(nursery_bytes() / 4);
   gc_threshold_ = heap_bytes_ * 2 > (4u << 20) ? heap_bytes_ * 2 : (4u << 20);
   if (gc_threshold_ > memory_limit_) gc_threshold_ = memory_limit_ - (memory_limit_ >> 3);
   // (but always a sixteenth of the limit above what is alive: with the heap close to the limit the next collection would otherwise come a few allocations
@@ -1619,13 +1718,13 @@ int64_t Vm::find_prop(JsObject* o, JsString* key) const {
 // (the heap grows by the difference of the old and the new size of what is made again: the collector counts what is there, see trace())
 void Vm::index_rebuild(JsObject* o) {
   const uint32_t old_cap = o->index_cap;
-  allocator_.deallocate(o->index);
+  pool_free(o->index, sizeof(uint32_t) * old_cap);
   o->index = nullptr;
   o->index_cap = 0;
   if (o->prop_count <= 8) return;
   uint32_t cap = 16;
   while (cap < o->prop_count * 2 + 2) cap *= 2;
-  uint32_t* index = static_cast<uint32_t*>(allocator_.allocate(sizeof(uint32_t) * cap));
+  uint32_t* index = static_cast<uint32_t*>(pool_allocate(sizeof(uint32_t) * cap));
   if (!index) return;   // (lookups just stay linear)
   for (uint32_t i = 0; i < cap; ++i) index[i] = 0;
   for (uint32_t p = 0; p < o->prop_count; ++p) {
@@ -1640,13 +1739,13 @@ void Vm::index_rebuild(JsObject* o) {
 
 void Vm::grow_props(JsObject* o) {
   const uint32_t cap = o->prop_cap ? o->prop_cap * 2 : 4;
-  Prop* fresh = static_cast<Prop*>(allocator_.allocate(sizeof(Prop) * cap));
+  Prop* fresh = static_cast<Prop*>(pool_allocate(sizeof(Prop) * cap));
   if (!fresh) {
     halt("out of memory");
     return;
   }
   for (uint32_t i = 0; i < o->prop_count; ++i) fresh[i] = o->props[i];
-  allocator_.deallocate(o->props);
+  pool_free(o->props, sizeof(Prop) * o->prop_cap);
   account_growth(o, sizeof(Prop) * (cap - o->prop_cap));
   o->props = fresh;
   o->prop_cap = cap;
@@ -1660,14 +1759,14 @@ bool Vm::ensure_items(JsObject* o, uint32_t capacity) {
     halt("array too large");
     return false;
   }
-  Value* fresh = static_cast<Value*>(allocator_.allocate(sizeof(Value) * cap));
+  Value* fresh = static_cast<Value*>(pool_allocate(sizeof(Value) * cap));
   if (!fresh) {
     halt("out of memory");
     return false;
   }
   for (uint32_t i = 0; i < o->length; ++i) fresh[i] = o->items[i];
   for (uint32_t i = o->length; i < cap; ++i) new (&fresh[i]) Value();
-  allocator_.deallocate(o->items);
+  pool_free(o->items, sizeof(Value) * o->capacity);
   account_growth(o, sizeof(Value) * (cap - o->capacity));
   o->items = fresh;
   o->capacity = cap;

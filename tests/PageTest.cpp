@@ -263,6 +263,19 @@ void report() {
   };
   top(self, "self");
   top(total, "total");
+  if (const char* within = getenv("PROBE_WITHIN")) {   // (where the time under a function goes: the self time of the samples that have it on the stack)
+    std::map<std::string, int> inside;
+    int under = 0;
+    for (int i = 0; i < g_count; ++i) {
+      bool found = false;
+      for (int k = 2; k < g_depths[i] && !found; ++k) found = name_of(g_frames[i][k]).find(within) != std::string::npos;
+      if (!found || g_depths[i] <= 2) continue;
+      ++under;
+      ++inside[name_of(g_frames[i][2])];
+    }
+    printf("within %s: %d samples\n", within, under);
+    top(inside, "self within");
+  }
   if (const char* want = getenv("PROBE_CALLERS")) {   // (who calls a function: the frames above it in the samples where it is running, at most 4 up)
     for (int up = 1; up <= 4; ++up) {
       std::map<std::string, int> callers;
