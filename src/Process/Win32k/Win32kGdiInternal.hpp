@@ -145,6 +145,7 @@ struct Bitmap : Object {
   int32_t dim_cx = 0, dim_cy = 0;
   uint32_t attributes = 0;
   bool is_screen = false;      // the screen surface (not in the handle table)
+  uint32_t window_surface = 0; // the surface of this top-level window (not in the handle table; changes go to the window surface sink)
   uint32_t dib_usage = 0;
   uint32_t clr_important = 0;
   uint32_t x_ppm = 0, y_ppm = 0;
@@ -212,6 +213,7 @@ struct Dc : Object {
   bool screen = false, memory = false, info = false, printer = false, enhmeta = false;
   int32_t origin_x = 0, origin_y = 0;  // screen DC: where device (0,0) lies on the screen
   List<Rect> surface_clip;             // screen DC: where drawing is allowed (screen coordinates)
+  uint32_t surface = 0;                // screen DC of a window with a window surface: that surface (origin and clip are then the surface's coordinates)
   Point cur_pos;
   Path path;
   Rect bounds;
@@ -252,6 +254,8 @@ bool destroy_object(uint32_t handle);      // removes it from the table (no chec
 uint32_t stock_handle(int index);          // GetStockObject(index), 0 if out of range
 uint32_t default_bitmap_handle();          // the 1x1 monochrome bitmap every memory DC starts with
 void sink_changed(const Rect& dirty);      // tells the screen sink
+Bitmap* window_surface_bitmap(uint32_t surface);
+void window_surface_changed(const Bitmap& bitmap, const Rect& dirty);      // tells the window surface sink
 Bitmap& screen_bitmap();
 void dib_sync_in(Bitmap& b);               // a DIB section: reads the process's memory into the mirror
 void dib_sync_out(Bitmap& b);              // ... and writes the mirror back

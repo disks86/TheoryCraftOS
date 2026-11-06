@@ -120,7 +120,11 @@ bool WindowManager::add_window(Frame* frame, bool modal) {
   frame->state_ = Frame::State::Normal;
   frame->set_visible(true);
   keep_inside(frame);
-  activate(frame);
+  if (frame->activatable()) activate(frame);
+  else {
+    move_child_to_front(frame);
+    refresh();
+  }
   return true;
 }
 
@@ -163,7 +167,7 @@ void WindowManager::close_window(Frame* frame) {
 Frame* WindowManager::top_usable() const {
   for (uint32_t i = child_count(); i > 0; --i) {
     Frame* f = as_frame(child(i - 1));
-    if (f->visible() && f->enabled() && f->state() != Frame::State::Minimized) return f;
+    if (f->visible() && f->enabled() && f->activatable() && f->state() != Frame::State::Minimized) return f;
   }
   return nullptr;
 }
@@ -180,7 +184,7 @@ void WindowManager::refresh() {
     if (f->enabled() != usable) f->set_enabled(usable);
   }
   if (modal) active_ = modal;
-  else if (!active_ || !active_->visible() || !active_->enabled()) active_ = top_usable();
+  else if (!active_ || !active_->visible() || !active_->enabled() || !active_->activatable()) active_ = top_usable();
   for (uint32_t i = 0; i < child_count(); ++i) as_frame(child(i))->active_ = as_frame(child(i)) == active_;
   if (Window* w = window()) w->set_focus_scope(active_);
   invalidate();
@@ -194,7 +198,7 @@ void WindowManager::activate(Frame* frame) {
     frame->set_visible(true);
   }
   move_child_to_front(frame);
-  active_ = frame;
+  if (frame->activatable()) active_ = frame;
   refresh();
 }
 
@@ -339,7 +343,7 @@ void WindowManager::layout() {
 
 void WindowManager::on_descendant_pressed(Control* child) {
   Frame* f = as_frame(child);
-  if (f->enabled() && (f != active_ || stacking_index(f) + 1 != child_count())) activate(f);
+  if (f->enabled() && (f != active_ || stacking_index(f) + 1 != child_count())) activate(f);      // (a window that is not activatable is only raised)
 }
 
 }  // namespace gui

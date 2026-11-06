@@ -21,7 +21,8 @@ statuses as Windows has them, from Wine's d3dkmt test), Evict.
 
 Contexts and work: CreateContext (maps a 96 KiB region: 64 KiB DMA buffer = the command stream of CommandStream.hpp, 1024 allocation-list entries, an unused patch list),
 CreateContextVirtual (no buffers, cannot Render), DestroyContext, Get/SetContextSchedulingPriority and the InProcess pair (**recorded only**: dxgk cannot change a context's
-priority), Render (copies from the mapped buffer), Present (flip, or blt without stretching), Escape (DRIVERPRIVATE = the dxgk escape ABI, reply in the same buffer).
+priority), Render (copies from the mapped buffer), Present (flip, or blt without stretching; a flip with `hWindow` naming a window the desktop composites goes into that window's
+surface at its client area instead of onto the display: `present_to_window`), Escape (DRIVERPRIVATE = the dxgk escape ABI, reply in the same buffer).
 
 Allocations: CreateAllocation(2), DestroyAllocation(2), Lock(2), Unlock(2), QueryAllocationResidency, QueryResourceInfo, OpenResource(2).
 

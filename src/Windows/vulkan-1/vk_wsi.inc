@@ -1,4 +1,5 @@
-/* vulkan-1.c, part 6: VK_KHR_surface, VK_KHR_win32_surface and VK_KHR_swapchain. A swapchain image is an allocation the kernel can show (flip) on the display. */
+/* vulkan-1.c, part 6: VK_KHR_surface, VK_KHR_win32_surface and VK_KHR_swapchain. A swapchain image is an allocation the kernel can show (flip): into its window's client
+ * area when the window is one of the desktop's (the kernel copies it into the window's surface), else on the display. */
 
 typedef struct Surface {
   HINSTANCE instance;
@@ -12,6 +13,7 @@ typedef struct Swapchain {
   UINT next;
   UINT w, h;
   VkFormat format;
+  HWND window;
 } Swapchain;
 
 VKAPI VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR *ci, const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
@@ -86,6 +88,8 @@ VKAPI VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchai
   Swapchain *sc = vk_alloc(sizeof(Swapchain));
   if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
   sc->dev = d, sc->n = MAX(ci->minImageCount, 2u), sc->w = ci->imageExtent.width, sc->h = ci->imageExtent.height, sc->format = ci->imageFormat;
+  sc->next = 0;
+  sc->window = ci->surface ? ((Surface *)ci->surface)->window : NULL;
   sc->img = vk_alloc(sizeof(Img *) * sc->n);
   if (!sc->img) {
     vk_free(sc);
@@ -157,6 +161,7 @@ VKAPI VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKH
     BYTE args[128];
     memset(args, 0, sizeof args);
     put32(args, 0, q->dev->ctx);
+    put64(args, 8, (ULONGLONG)(ULONG_PTR)sc->window);
     put32(args, 20, img->alloc);
     put32(args, 88, 4);   /* flip */
     NTSTATUS st = D3DKMTPresent(args);

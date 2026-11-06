@@ -46,8 +46,31 @@ void set_screen_sink(IScreenSink* sink);
 // --- Device contexts of windows and of the screen (what GetDC/BeginPaint make). The DC draws on the screen surface; its origin is the window's (client or window) top-left in
 // screen coordinates, and `clip` (screen coordinates) is where drawing is allowed - the visible part of the window, minus its children and what covers it. An empty `clip`
 // array means "nowhere" (everything is clipped). Returns the HDC (0 on failure). The DC belongs to process `pid` (gone when it ends).
-uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip);
-bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip);
+// `surface`: a window surface (below) the DC draws on instead of the screen; origin and clip are then in the surface's coordinates.
+uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface = 0);
+bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface = 0);
+
+// --- Window surfaces: the backing store of a top-level window that the kernel's desktop composites (the window and its children draw there through their DCs; the desktop
+// copies it into its picture as it is, so a window that moves needs no drawing). Same pixel format as the screen. Called with the system lock held.
+uint32_t create_window_surface(uint32_t window, uint32_t width, uint32_t height);      // 0: no memory or a bad size
+bool resize_window_surface(uint32_t surface, uint32_t width, uint32_t height);           // the contents are cleared (the window repaints)
+void destroy_window_surface(uint32_t surface);
+bool window_surface_size(uint32_t surface, uint32_t* width, uint32_t* height);
+ArrayView<uint32_t> window_surface_pixels(uint32_t surface, uint32_t* width, uint32_t* height);      // rows top to bottom, pitch = width; valid until resized or destroyed
+// Told what part of which window's surface changed. Called with the system lock held: it must only record it.
+// Something other than GDI wrote the surface's pixels (a GPU present): the sink is told, as after a drawing.
+void window_surface_damaged(uint32_t surface, const Rect& dirty);
+// The surface's bytes (B, G, R, X; rows width * 4 bytes apart), for writing them.
+ByteView window_surface_bytes(uint32_t surface, uint32_t* width, uint32_t* height);
+class IWindowSurfaceSink {
+ public:
+  virtual void surface_changed(uint32_t window, const Rect& dirty) = 0;
+
+ protected:
+  IWindowSurfaceSink() = default;
+  ~IWindowSurfaceSink() = default;
+};
+void set_window_surface_sink(IWindowSurfaceSink* sink);
 bool is_dc(uint32_t handle);
 bool delete_dc(uint32_t dc);      // ReleaseDC / EndPaint: the DC goes (any objects selected into it stay)
 

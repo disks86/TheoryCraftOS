@@ -68,6 +68,17 @@ class Frame : public Control {
   void set_resizable(bool resizable) { UiGuard lock(this); resizable_ = resizable; }
   // Escape closes the window (dialogs).
   void set_escape_closes(bool closes) { UiGuard lock(this); escape_closes_ = closes; }
+  // Undecorated: no title bar, border or buttons, only the client area (a window whose program draws all of itself, such as a Windows program's popup).
+  void set_decorated(bool decorated) { UiGuard lock(this); decorated_ = decorated; invalidate(); }
+  bool decorated() const { return decorated_; }
+  // Not activatable: the manager raises the window but never makes it the active one (a menu or tooltip of a Windows program keeps its owner active).
+  void set_activatable(bool activatable) { UiGuard lock(this); activatable_ = activatable; }
+  bool activatable() const { return activatable_; }
+  // The client area is wholly painted by its controls (a picture that covers it): the frame does not fill it first.
+  void set_opaque_client(bool opaque) { UiGuard lock(this); opaque_client_ = opaque; invalidate(); }
+  // Whether the taskbar (and Alt+Tab) list the window.
+  void set_in_taskbar(bool in_taskbar) { UiGuard lock(this); in_taskbar_ = in_taskbar; }
+  bool in_taskbar() const { return in_taskbar_ && !modal_; }
   // Fired (see Handler: on the window's handler thread, if it has one) after the window was closed and
   // removed from its manager.
   void on_closed(Handler handler) { UiGuard lock(this); closed_ = handler; }
@@ -126,6 +137,8 @@ class Frame : public Control {
  protected:
   // Told when the manager the frame is in changes (a window manager added or removed it): a tabbed window passes that on to its tabs.
   virtual void manager_changed() {}
+  // Asked before close() closes the window: false keeps it open (a Windows program's window asks the program, which destroys it if it agrees).
+  virtual bool close_requested() { return true; }
   // Told when the window manager closes the frame (after it was taken out): a tabbed window closes its tabs.
   virtual void window_closed(Window* /*window*/) {}
   // A tab changed its title / the host is asked to...
@@ -152,6 +165,7 @@ class Frame : public Control {
   Rect2D restore_bounds_;
   bool can_minimize_ = true, can_maximize_ = true, can_close_ = true, resizable_ = true;
   bool escape_closes_ = false;
+  bool decorated_ = true, activatable_ = true, in_taskbar_ = true, opaque_client_ = false;
   Dock docked_ = Dock::None;
   uint8_t tile_slot_ = 0, tile_count_ = 0;   // the place in the grid while docked_ is Tile
   TabFrame* host_ = nullptr;

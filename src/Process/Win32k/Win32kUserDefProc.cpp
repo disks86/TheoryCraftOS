@@ -221,6 +221,20 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
         SwpArgs args;
         args.w = w;
         return swp_op_begin(call, args, cmd == (SC_MINIMIZE & 0xFFF0) ? wn::SW_MINIMIZE : cmd == (SC_MAXIMIZE & 0xFFF0) ? wn::SW_SHOWMAXIMIZED : wn::SW_RESTORE, false, false);
+      } else if (cmd == kScTcosPlace && w->parent) {
+        op_continue(call, *op);
+        const uint64_t l = uint64_t(lparam);
+        SwpArgs args;
+        args.w = w;
+        args.x = int16_t(uint16_t(l));
+        args.y = int16_t(uint16_t(l >> 16));
+        args.cx = int32_t(uint16_t(l >> 32));
+        args.cy = int32_t(uint16_t(l >> 48));
+        args.flags = wn::SWP_NOZORDER | wn::SWP_NOACTIVATE;
+        const Rect now = window_rect_screen(w);      // (what does not change is left out, as SetWindowPos's own fix-up does: no WM_SIZE for a move)
+        if (now.right - now.left == args.cx && now.bottom - now.top == args.cy) args.flags |= wn::SWP_NOSIZE;
+        if (now.left == args.x && now.top == args.y) args.flags |= wn::SWP_NOMOVE;
+        return swp_op_begin(call, args, kSwpNoShow, false, false);
       }
       break;
     }

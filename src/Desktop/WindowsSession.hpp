@@ -16,24 +16,62 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// What the desktop's "Windows" window (WindowsScreen.hpp) needs of the Windows programs: their screen and their input. The kernel implements it over win32k
+// What the desktop needs of the Windows programs to show their windows as its own (Win32Windows.hpp) and hand them its input. The kernel implements it over win32k
 // (src/Process/Win32k/Win32kDesktopBridge.cpp); the desktop's tests with a fake.
+//
+// One coordinate space: win32k's screen is the desktop's window manager area (attach() makes it so), so a window's rectangle is where the desktop's frame for it is,
+// and the program's picture of the inside of that frame (its surface) is drawn by the desktop straight from the kernel's memory, with no copy in between.
 #pragma once
 #include <stdint.h>
-#include "Utility/ArrayView.hpp"
+#include "Graphics/Graphics2D/IRenderer2D.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Utility/String.hpp"
 
 namespace desktop {
 
+struct WindowsRect {
+  int32_t x = 0, y = 0;
+  uint32_t width = 0, height = 0;
+};
+
+// A top-level window of a Windows program as the desktop shows it.
+struct WindowsWindowInfo {
+  bool exists = false, visible = false, minimized = false, maximized = false, active = false;
+  bool caption = false;                  // the desktop draws its title bar and frame (else the program draws all of it)
+  bool sizable = false, minimize_box = false, maximize_box = false;
+  bool tool = false, topmost = false;    // a tool window (no taskbar button), above the others
+  bool popup = false;                    // no caption and not activatable from the desktop's side (menus, tooltips, drop-downs)
+  bool owned = false;                    // it has an owner window (a dialog): no taskbar button of its own
+  WindowsRect window;                    // the whole window = the desktop's frame
+  WindowsRect surface;                   // the program's picture inside it
+};
+
 class IWindowsSession {
  public:
-  // True when the screen changed since the last call (and forgets it).
-  virtual bool take_screen_changed() = 0;
-  virtual uint32_t screen_width() = 0;
-  virtual uint32_t screen_height() = 0;
-  // Makes the screen this size (what was drawn is lost: the desktop does it once, before the programs start, to fit the screen in its window).
-  virtual bool set_screen_size(uint32_t width, uint32_t height) = 0;
-  // Copies the screen (0xAARRGGBB, opaque, rows top to bottom, pitch = width) into `out`; false when `out` holds fewer than width * height pixels.
-  virtual bool copy_screen(ArrayView<uint32_t> out, uint32_t* width, uint32_t* height) = 0;
+  enum class Command : uint8_t { Close, Minimize, Maximize, Restore };
+
+  // Makes win32k's screen the desktop's window manager area (width x height) with the given work area, and the desktop's frame the one windows with a caption get
+  // (border and title bar heights: the surface of such a window starts that far in). Done once, before the programs start.
+  virtual void attach(uint32_t width, uint32_t height, const WindowsRect& work_area, int32_t frame_border, int32_t frame_title) = 0;
+  // What changed since the last call (and forgets it): the windows whose state or place changed (shown, hidden, moved, sized, retitled, restyled, activated,
+  // destroyed), and those whose picture changed (with the part, in surface coordinates).
+  struct Repaint {
+    uint32_t window = 0;
+    WindowsRect dirty;
+  };
+  virtual void take_changes(List<uint32_t>* changed, List<Repaint>* repainted) = 0;
+  // The visible top-level windows, bottom of the stack first.
+  virtual void windows(List<uint32_t>* out) = 0;
+  // False when the window is gone.
+  virtual bool window_info(uint32_t window, WindowsWindowInfo* out, String* title) = 0;
+  // Draws the window's surface with its top left at (x, y) of `renderer` (the renderer's clip applies), from the kernel's memory as it is, and says its size.
+  // False when there is none.
+  virtual bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) = 0;
+  // What the user did to the desktop's frame: the program is asked (it hears of it as it would on Windows) and the result comes back as a change.
+  virtual void move_window(uint32_t window, const WindowsRect& rect) = 0;
+  virtual void activate_window(uint32_t window) = 0;      // 0: none of the Windows programs' windows is active (a desktop window is)
+  virtual void window_command(uint32_t window, Command command) = 0;
+
   // Input, in the screen's coordinates.
   virtual void key(uint8_t hid_usage, bool pressed, uint8_t modifiers) = 0;   // modifiers: hardware::modifier bits held (for the character a press types)
   virtual void mouse_motion(int32_t dx, int32_t dy) = 0;
@@ -42,6 +80,7 @@ class IWindowsSession {
   virtual void mouse_wheel(int32_t notches) = 0;                              // + away from the user
   virtual void cursor(int32_t* x, int32_t* y) = 0;                            // where the Windows cursor is
   virtual bool cursor_confined() = 0;                                         // a program keeps the cursor in a rectangle (ClipCursor): the pointer stays with it
+  virtual uint32_t capture_window() = 0;                                      // the window that captured the mouse (SetCapture), 0: none
 
  protected:
   IWindowsSession() = default;
