@@ -1,0 +1,321 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "Hardware/NetworkInterface/Intel/E1000eNetworkInterface.hpp"
+#include "Hardware/NetworkInterface/Intel/IntelEthernetRegisters.hpp"
+#include "Kernel/Delay.hpp"
+
+namespace hardware {
+
+using namespace intel_eth;
+
+namespace {
+constexpr uint32_t kRdbal = 0x2800, kRdbah = 0x2804, kRdlen = 0x2808, kRdh = 0x2810, kRdt = 0x2818;
+constexpr uint32_t kTdbal = 0x3800, kTdbah = 0x3804, kTdlen = 0x3808, kTdh = 0x3810, kTdt = 0x3818, kTarc0 = 0x3840;
+
+constexpr uint32_t kExtcnfSwFlag = 1u << 5;   // MDIO software ownership (82573 and later, ICH and PCH)
+constexpr uint32_t kFwsmResetAllowed = 1u << 6;  // RSPCIPHY: the ME lets the host reset (and power-cycle) the PHY
+constexpr uint32_t kFextnvm3PhyCfgMask = 0x0C000000, kFextnvm3PhyCfg50ms = 0x08000000;
+constexpr uint32_t kIosfpcRdmtsHex = 0x00010000, kTarc0MultiQ3 = 3u << 28, kTarc0MultiQ2 = 1u << 29;
+
+constexpr uint8_t kStatusDescriptorDone = 1u << 0, kStatusEndOfPacket = 1u << 1;
+constexpr uint8_t kCommandEndOfPacket = 1u << 0, kCommandInsertCrc = 1u << 1, kCommandReportStatus = 1u << 3;
+
+using K = E1000eKind;
+// e1000e's PCI table (hw.h). One line per device id; the names are what Intel sells them as.
+constexpr E1000eModel kModels[] = {
+    {0x105E, K::Mac8257x, "Intel 82571EB"}, {0x105F, K::Mac8257x, "Intel 82571EB"}, {0x1060, K::Mac8257x, "Intel 82571EB"},
+    {0x10A4, K::Mac8257x, "Intel 82571EB"}, {0x10A5, K::Mac8257x, "Intel 82571EB"}, {0x10BC, K::Mac8257x, "Intel 82571EB"},
+    {0x10D5, K::Mac8257x, "Intel 82571PT"}, {0x10D9, K::Mac8257x, "Intel 82571EB"}, {0x10DA, K::Mac8257x, "Intel 82571EB"},
+    {0x107D, K::Mac8257x, "Intel 82572EI"}, {0x107E, K::Mac8257x, "Intel 82572EI"}, {0x107F, K::Mac8257x, "Intel 82572EI"},
+    {0x10B9, K::Mac8257x, "Intel 82572EI"}, {0x108B, K::Mac8257x, "Intel 82573E"},  {0x108C, K::Mac8257x, "Intel 82573E"},
+    {0x109A, K::Mac8257x, "Intel 82573L"},  {0x10D3, K::Mac8257x, "Intel 82574L"},  {0x10F6, K::Mac8257x, "Intel 82574LA"},
+    {0x150C, K::Mac8257x, "Intel 82583V"},  {0x1096, K::Mac8257x, "Intel 80003ES2LAN"}, {0x1098, K::Mac8257x, "Intel 80003ES2LAN"},
+    {0x10BA, K::Mac8257x, "Intel 80003ES2LAN"}, {0x10BB, K::Mac8257x, "Intel 80003ES2LAN"},
+    // ICH8, ICH9, ICH10 (82566, 82567, 82562 PHYs)
+    {0x1049, K::Ich, "Intel 82566MM"}, {0x104A, K::Ich, "Intel 82566DM"}, {0x104B, K::Ich, "Intel 82566DC"}, {0x104C, K::Ich, "Intel 82562V"},
+    {0x104D, K::Ich, "Intel 82566MC"}, {0x10C4, K::Ich, "Intel 82562GT"}, {0x10C5, K::Ich, "Intel 82562G"},  {0x1501, K::Ich, "Intel 82567V-3"},
+    {0x10BD, K::Ich, "Intel 82566DM-2"}, {0x10BF, K::Ich, "Intel 82567LF"}, {0x10C0, K::Ich, "Intel 82562V-2"}, {0x10C2, K::Ich, "Intel 82562G-2"},
+    {0x10C3, K::Ich, "Intel 82562GT-2"}, {0x10CB, K::Ich, "Intel 82567V"},  {0x10E5, K::Ich, "Intel 82567LM-4"}, {0x10F5, K::Ich, "Intel 82567LM"},
+    {0x294C, K::Ich, "Intel 82566DC-2"}, {0x10CC, K::Ich, "Intel 82567LM-2"}, {0x10CD, K::Ich, "Intel 82567LF-2"}, {0x10CE, K::Ich, "Intel 82567V-2"},
+    {0x10DE, K::Ich, "Intel 82567LM-3"}, {0x10DF, K::Ich, "Intel 82567LF-3"}, {0x1525, K::Ich, "Intel 82567V-4"},
+    // 5 Series / 3400 (82577, 82578), 6 and 7 Series (82579)
+    {0x10EA, K::Pch, "Intel 82577LM"}, {0x10EB, K::Pch, "Intel 82577LC"}, {0x10EF, K::Pch, "Intel 82578DM"}, {0x10F0, K::Pch, "Intel 82578DC"},
+    {0x1502, K::Pch2, "Intel 82579LM"}, {0x1503, K::Pch2, "Intel 82579V"},
+    // 8 and 9 Series (I217, I218)
+    {0x153A, K::PchLpt, "Intel I217-LM"}, {0x153B, K::PchLpt, "Intel I217-V"}, {0x155A, K::PchLpt, "Intel I218-LM"}, {0x1559, K::PchLpt, "Intel I218-V"},
+    {0x15A0, K::PchLpt, "Intel I218-LM"}, {0x15A1, K::PchLpt, "Intel I218-V"}, {0x15A2, K::PchLpt, "Intel I218-LM"}, {0x15A3, K::PchLpt, "Intel I218-V"},
+    // 100 Series and later (I219)
+    {0x156F, K::PchSpt, "Intel I219-LM"}, {0x1570, K::PchSpt, "Intel I219-V"}, {0x15B7, K::PchSpt, "Intel I219-LM"}, {0x15B8, K::PchSpt, "Intel I219-V"},
+    {0x15B9, K::PchSpt, "Intel I219-LM"}, {0x15D7, K::PchSpt, "Intel I219-LM"}, {0x15D8, K::PchSpt, "Intel I219-V"}, {0x15E3, K::PchSpt, "Intel I219-LM"},
+    {0x15D6, K::PchSpt, "Intel I219-V"},  {0x15BD, K::PchSpt, "Intel I219-LM"}, {0x15BE, K::PchSpt, "Intel I219-V"}, {0x15BB, K::PchSpt, "Intel I219-LM"},
+    {0x15BC, K::PchSpt, "Intel I219-V"},  {0x15DF, K::PchSpt, "Intel I219-LM"}, {0x15E0, K::PchSpt, "Intel I219-V"}, {0x15E1, K::PchSpt, "Intel I219-LM"},
+    {0x15E2, K::PchSpt, "Intel I219-V"},  {0x0D4E, K::PchSpt, "Intel I219-LM"}, {0x0D4F, K::PchSpt, "Intel I219-V"}, {0x0D4C, K::PchSpt, "Intel I219-LM"},
+    {0x0D4D, K::PchSpt, "Intel I219-V"},  {0x0D53, K::PchSpt, "Intel I219-LM"}, {0x0D55, K::PchSpt, "Intel I219-V"}, {0x15FB, K::PchSpt, "Intel I219-LM"},
+    {0x15FC, K::PchSpt, "Intel I219-V"},  {0x15F9, K::PchSpt, "Intel I219-LM"}, {0x15FA, K::PchSpt, "Intel I219-V"}, {0x15F4, K::PchSpt, "Intel I219-LM"},
+    {0x15F5, K::PchSpt, "Intel I219-V"},  {0x1A1E, K::PchSpt, "Intel I219-LM"}, {0x1A1F, K::PchSpt, "Intel I219-V"}, {0x1A1C, K::PchSpt, "Intel I219-LM"},
+    {0x1A1D, K::PchSpt, "Intel I219-V"},  {0x0DC5, K::PchSpt, "Intel I219-LM"}, {0x0DC6, K::PchSpt, "Intel I219-V"}, {0x0DC7, K::PchSpt, "Intel I219-LM"},
+    {0x0DC8, K::PchSpt, "Intel I219-V"},  {0x550A, K::PchSpt, "Intel I219-LM"}, {0x550B, K::PchSpt, "Intel I219-V"}, {0x550C, K::PchSpt, "Intel I219-LM"},
+    {0x550D, K::PchSpt, "Intel I219-V"},  {0x550E, K::PchSpt, "Intel I219-LM"}, {0x550F, K::PchSpt, "Intel I219-V"}, {0x5510, K::PchSpt, "Intel I219-LM"},
+    {0x5511, K::PchSpt, "Intel I219-V"},  {0x57A0, K::PchSpt, "Intel I219-LM"}, {0x57A1, K::PchSpt, "Intel I219-V"}, {0x57B3, K::PchSpt, "Intel I219-LM"},
+    {0x57B4, K::PchSpt, "Intel I219-V"},  {0x57B5, K::PchSpt, "Intel I219-LM"}, {0x57B6, K::PchSpt, "Intel I219-V"}, {0x57B7, K::PchSpt, "Intel I219-LM"},
+    {0x57B8, K::PchSpt, "Intel I219-V"},  {0x57B9, K::PchSpt, "Intel I219-LM"}, {0x57BA, K::PchSpt, "Intel I219-V"},
+};
+// The 82573, 82574 and 82583 take the PHY with the MDIO software ownership flag, like the chipset parts.
+constexpr uint16_t kMdioFlagDevices[] = {0x108B, 0x108C, 0x109A, 0x10D3, 0x10F6, 0x150C};
+bool uses_mdio_flag(uint16_t device_id) {
+  for (uint16_t id : kMdioFlagDevices)
+    if (id == device_id) return true;
+  return false;
+}
+}  // namespace
+
+const E1000eModel* e1000e_find_model(uint16_t device_id) {
+  for (const E1000eModel& model : kModels)
+    if (model.device_id == device_id) return &model;
+  return nullptr;
+}
+
+// ---- the PHY, through the MDIO interface of the MAC -----------------------------------------------------------------------------------------------------
+
+bool E1000eNetworkInterface::acquire_phy() {
+  // The 82571/82572 and 80003ES2LAN arbitrate through SWSM instead; their PHY is not touched here.
+  if (!chipset_mac() && !uses_mdio_flag(model_->device_id)) return false;
+  regs().set_bits32(kExtcnfCtrl, kExtcnfSwFlag);
+  if (wait_for(regs(), kExtcnfCtrl, kExtcnfSwFlag, kExtcnfSwFlag, 100, 1000)) return true;
+  regs().clear_bits32(kExtcnfCtrl, kExtcnfSwFlag);  // the firmware holds it
+  return false;
+}
+
+void E1000eNetworkInterface::release_phy() { regs().clear_bits32(kExtcnfCtrl, kExtcnfSwFlag); }
+
+bool E1000eNetworkInterface::phy_read(uint32_t reg, uint16_t* value) { return mdic_read(regs(), pch() ? 2 : 1, reg, value); }
+
+bool E1000eNetworkInterface::phy_write(uint32_t reg, uint16_t value) { return mdic_write(regs(), pch() ? 2 : 1, reg, value); }
+
+bool E1000eNetworkInterface::phy_accessible() {
+  if (!acquire_phy()) return false;
+  uint16_t id = 0;
+  const bool ok = phy_read(kPhyId1, &id) && id != 0 && id != 0xFFFF;
+  release_phy();
+  return ok;
+}
+
+// A PHY the firmware left in a low-power state does not answer on MDIO. Pulling the LANPHYPC line power-cycles it (e1000_toggle_lanphypc_pch_lpt); only
+// allowed when the management engine does not block PHY resets.
+void E1000eNetworkInterface::wake_phy() {
+  if (!pch() || phy_accessible() || !(regs().read32(kFwsm) & kFwsmResetAllowed)) return;
+  regs().write32(kFextnvm3, (regs().read32(kFextnvm3) & ~kFextnvm3PhyCfgMask) | kFextnvm3PhyCfg50ms);
+  uint32_t ctrl = regs().read32(kCtrl);
+  ctrl = (ctrl | kCtrlLanPhyPcOverride) & ~kCtrlLanPhyPcValue;
+  regs().write32(kCtrl, ctrl);
+  regs().read32(kStatus);
+  delay_us(20);
+  regs().write32(kCtrl, ctrl & ~kCtrlLanPhyPcOverride);
+  regs().read32(kStatus);
+  if (model_->kind < E1000eKind::PchLpt) {
+    delay_us(50000);
+  } else {
+    wait_for(regs(), kCtrlExt, kCtrlExtLanPhyPcDone, kCtrlExtLanPhyPcDone, 20, 5000);
+    delay_us(30000);
+  }
+  regs().clear_bits32(kCtrlExt, kCtrlExtForceSmbus);  // the MAC talks to the PHY over PCIe-style K1 again, not SMBus
+  phy_woken_ = true;
+}
+
+// The PHY negotiates on its own once autonegotiation is on; a PHY the firmware powered down or left forced is put back to that.
+void E1000eNetworkInterface::enable_autonegotiation() {
+  if (!acquire_phy()) return;
+  uint16_t control = 0;
+  if (phy_read(kPhyControl, &control) && (!(control & kPhyAutoNegEnable) || (control & kPhyPowerDown)))
+    phy_write(kPhyControl, static_cast<uint16_t>((control & ~kPhyPowerDown) | kPhyAutoNegEnable | kPhyRestartAutoNeg));
+  release_phy();
+}
+
+// ---- bring-up -------------------------------------------------------------------------------------------------------------------------------------------
+
+bool E1000eNetworkInterface::reset() {
+  regs().write32(kImc, 0xFFFFFFFFu);
+  stop_dma(regs());
+  regs().set_bits32(kCtrl, kCtrlReset);  // the MAC only: the PHY keeps its link
+  delay_us(20000);
+  if (!wait_for(regs(), kCtrl, kCtrlReset, 0, 100, 1000)) return false;
+  if (chipset_mac()) {
+    // The chipset parts load their configuration from the flash after a reset and say when they are done.
+    if (wait_for(regs(), kStatus, kStatusLanInitDone, kStatusLanInitDone, 1500, 100)) regs().clear_bits32(kStatus, kStatusLanInitDone);
+  } else {
+    wait_for(regs(), kEecd, kEecdAutoReadDone, kEecdAutoReadDone, 100, 100);
+  }
+  regs().write32(kImc, 0xFFFFFFFFu);
+  regs().read32(kIcr);
+  return true;
+}
+
+bool E1000eNetworkInterface::initialize() {
+  if (started_ || !device_) return false;
+  model_ = e1000e_find_model(device_->device_id());
+  if (!model_ || device_->vendor_id() != 0x8086) return false;
+  if (!device_->claim()) return false;
+  claimed_ = true;
+  if (regs().read32(kStatus) == 0xFFFFFFFFu) return false;  // nothing answers
+
+  MacAddress before{};
+  const bool had_mac = read_mac(regs(), &before);
+  wake_phy();
+  if (!reset()) return false;
+
+  // The station address: reloaded from the NVM by the reset; if it was not, the one the firmware had programmed.
+  if (!read_mac(regs(), &mac_)) {
+    if (!had_mac) return false;
+    mac_ = before;
+    write_mac(regs(), mac_);
+  }
+  const uint32_t multicast_registers = chipset_mac() ? 32 : 128;
+  for (uint32_t i = 0; i < multicast_registers; ++i) regs().write32(kMta + 4 * i, 0);
+
+  uint32_t ctrl = regs().read32(kCtrl);
+  ctrl |= kCtrlSetLinkUp | kCtrlAutoSpeed;
+  ctrl &= ~(kCtrlLinkReset | kCtrlForceSpeed | kCtrlForceDuplex | kCtrlPhyReset | kCtrlGioMasterDisable);
+  regs().write32(kCtrl, ctrl);
+  regs().set_bits32(kCtrlExt, kCtrlExtDriverLoaded);  // tells the management engine a driver runs the port
+  if (pch()) regs().clear_bits32(kCtrlExt, kCtrlExtForceSmbus);
+  enable_autonegotiation();
+
+  rx_ring_ = allocate_dma_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
+  tx_ring_ = allocate_dma_view<TransmitDescriptor>(allocator_, kTransmitDescriptors, 4096);
+  buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096);
+  if (rx_ring_.empty() || tx_ring_.empty() || buffers_.empty()) return false;
+  for (uint32_t i = 0; i < kReceiveDescriptors; ++i) rx_ring_[i] = ReceiveDescriptor{nic_dma_address(rx_buffer(i)), 0, 0, 0, 0, 0};
+  for (uint32_t i = 0; i < kTransmitDescriptors; ++i)
+    tx_ring_[i] = TransmitDescriptor{nic_dma_address(tx_buffer(i)), 0, 0, 0, kStatusDescriptorDone, 0, 0};  // free: "the device is done with it"
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+
+  const uint64_t rx = nic_dma_address(rx_ring_), tx = nic_dma_address(tx_ring_);
+  regs().write32(kRdbal, static_cast<uint32_t>(rx));
+  regs().write32(kRdbah, static_cast<uint32_t>(rx >> 32));
+  regs().write32(kRdlen, kReceiveDescriptors * sizeof(ReceiveDescriptor));
+  regs().write32(kRdh, 0);
+  regs().write32(kRdt, kReceiveDescriptors - 1);  // all but one descriptor belong to the card
+  rx_next_ = 0;
+  regs().write32(kTdbal, static_cast<uint32_t>(tx));
+  regs().write32(kTdbah, static_cast<uint32_t>(tx >> 32));
+  regs().write32(kTdlen, kTransmitDescriptors * sizeof(TransmitDescriptor));
+  regs().write32(kTdh, 0);
+  regs().write32(kTdt, 0);
+  tx_next_ = 0;
+  if (model_->kind == E1000eKind::PchSpt) {
+    // I219 erratum: the transmit DMA can hang with three outstanding requests; e1000e drops it to two.
+    regs().set_bits32(kIosfpc, kIosfpcRdmtsHex);
+    regs().write32(kTarc0, (regs().read32(kTarc0) & ~kTarc0MultiQ3) | kTarc0MultiQ2);
+  }
+  regs().write32(kTipg, kTipgDefault);
+
+  receive_control_ = kRctlEnable | kRctlBroadcast | kRctlStripCrc;  // 2 KiB buffers: BSIZE = 0
+  regs().write32(kRctl, receive_control_);
+  regs().write32(kTctl, kTctlEnable | kTctlPadShortPackets | kTctlRetransmitLateCollision | kTctlCollisionThreshold | kTctlCollisionDistance);
+  started_ = true;
+  return true;
+}
+
+void E1000eNetworkInterface::shutdown() {
+  if (claimed_) {
+    started_ = false;
+    if (model_ && regs().read32(kStatus) != 0xFFFFFFFFu) {
+      reset();  // the card stops using our memory
+      regs().clear_bits32(kCtrlExt, kCtrlExtDriverLoaded);
+    }
+    device_->release();
+    claimed_ = false;
+  }
+  started_ = false;
+  release_view(allocator_, rx_ring_);
+  release_view(allocator_, tx_ring_);
+  release_view(allocator_, buffers_);
+}
+
+// ---- running --------------------------------------------------------------------------------------------------------------------------------------------
+
+bool E1000eNetworkInterface::link_up() const { return started_ && (regs().read32(kStatus) & kStatusLinkUp); }
+
+uint32_t E1000eNetworkInterface::link_speed_mbps() const { return started_ ? status_speed_mbps(regs().read32(kStatus), false) : 0; }
+
+LinkDuplex E1000eNetworkInterface::link_duplex() const { return started_ ? status_duplex(regs().read32(kStatus)) : LinkDuplex::Unknown; }
+
+bool E1000eNetworkInterface::accept_all_multicast(bool enable) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_) return false;
+  receive_control_ = enable ? (receive_control_ | kRctlMulticastPromiscuous) : (receive_control_ & ~kRctlMulticastPromiscuous);
+  regs().write32(kRctl, receive_control_);
+  return enable;
+}
+
+bool E1000eNetworkInterface::transmit(ConstByteView frame) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
+    ++stats_.send_failures;
+    return false;
+  }
+  volatile TransmitDescriptor& d = tx_ring_[tx_next_];
+  if (!(d.status & kStatusDescriptorDone)) {  // the card has not finished with this one yet
+    ++stats_.send_failures;
+    return false;
+  }
+  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
+  const ByteView buffer = tx_buffer(tx_next_).first(padded);
+  buffer.fill(0);
+  buffer.copy_from(frame);
+  d.address = nic_dma_address(tx_buffer(tx_next_));
+  d.length = static_cast<uint16_t>(padded);
+  d.status = 0;
+  d.command = kCommandEndOfPacket | kCommandInsertCrc | kCommandReportStatus;
+  __atomic_thread_fence(__ATOMIC_RELEASE);  // descriptor contents before the tail moves
+  tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+  regs().write32(kTdt, tx_next_);
+  ++stats_.frames_sent;
+  return true;
+}
+
+bool E1000eNetworkInterface::receive(ByteView buffer, uint32_t* length) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || !length) return false;
+  for (uint32_t tries = 0; tries < kReceiveDescriptors; ++tries) {
+    volatile ReceiveDescriptor& d = rx_ring_[rx_next_];
+    const uint8_t status = d.status;
+    if (!(status & kStatusDescriptorDone)) return false;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+
+    // With 2 KiB buffers and no long-packet mode a frame always fits one descriptor; one that does not end there is dropped.
+    const uint32_t frame = d.length;
+    const bool usable = d.errors == 0 && (status & kStatusEndOfPacket) && frame > 0 && frame <= kBufferSize;
+    if (usable) {
+      buffer.copy_from(ConstByteView(rx_buffer(rx_next_)).first(frame).at_most(buffer.size()));  // as much as fits
+      *length = frame;
+      ++stats_.frames_received;
+    } else {
+      ++stats_.frames_dropped;
+    }
+    d.status = 0;  // give the descriptor back to the card
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    regs().write32(kRdt, rx_next_);
+    rx_next_ = (rx_next_ + 1) % kReceiveDescriptors;
+    if (usable) return true;
+  }
+  return false;
+}
+
+}  // namespace hardware
