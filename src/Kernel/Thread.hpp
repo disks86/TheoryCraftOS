@@ -167,6 +167,7 @@ struct CoreInfo {
   bool online = false;
   hardware::CoreKind kind = hardware::CoreKind::Performance;
   uint64_t busy_ticks = 0, idle_ticks = 0;
+  uint64_t lock_free_ticks = 0;   // ticks that found nothing to do and did not take the scheduler lock
 };
 // Copies up to `capacity` live threads (not finished ones); returns how many were written.
 uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity);

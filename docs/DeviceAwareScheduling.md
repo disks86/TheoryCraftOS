@@ -35,8 +35,14 @@ The policy is in `src/CPUScheduler/IoAffinity.{hpp,cpp}`. It takes no locks and 
   left for that core.
 - **Cache domains:** on x86, CPUID leaf 4 or 0x8000001D gives the number of logical processors sharing the last-level cache, and APIC ids are
   grouped by it. On AArch64 the MPIDR cluster sets the domain. RISC-V and LoongArch treat all cores as one domain.
-- **NUMA nodes:** at boot `main.cpp` reads the ACPI SRAT (`src/Hardware/Acpi/Srat`) and puts each core in its proximity domain with
-  `kernel::set_core_numa_node`. Without an SRAT every core is in node 0.
+- **NUMA nodes:** at boot, `kernel::apply_acpi_numa` (`src/Kernel/Numa`, used by the x86-64 and AArch64 boots) reads the ACPI SRAT
+  (`src/Hardware/Acpi/Srat`) and puts each core in its proximity domain. On ARM, an SRAT GICC entry names the core by ACPI processor UID,
+  which the MADT's GICC entries turn into an MPIDR. The SLIT's distances (`kernel::set_numa_distance`) break ties between equally suitable
+  cores in favour of the nearest node. Without an SRAT every core is in node 0. Without a SLIT, distances are 10 within a node and 20 between
+  nodes.
+- **Device nodes:** `AcpiEvents::proximity_domain` finds a device's `_PXM` on the device or its nearest ancestor (usually the PCI root
+  bridge). `kernel::set_io_device_node` records it (Thunderbolt does), and `choose_io_interrupt_core(kind, node)` puts the device's
+  interrupt on its own node first.
 
 ## Interrupt routing
 
@@ -49,12 +55,22 @@ The policy is in `src/CPUScheduler/IoAffinity.{hpp,cpp}`. It takes no locks and 
   - `PciMsix::retarget`, `PciMsi::retarget` and `VirtioPciDevice::retarget_msix` rewrite the message address with the vector masked, so an
     interrupt raised during the change stays pending instead of being lost.
   - virtio-gpu and Thunderbolt offer this. Their interrupts start on the core that sets them up.
+  - With `TCOS_SELFTESTS`, the boot moves the virtio-gpu completion interrupt to another core and back (`VirtioGpu::move_interrupt`) and
+    checks where it lands. This passes under QEMU TCG and KVM. Under KVM the interrupt can arrive after the driver has already seen the
+    command finish by polling; the driver's wait loop re-checks the ring, so this costs nothing.
 - **Drivers registered** in the device table: virtio-gpu, Thunderbolt, ACPI SCI, Intel Wi-Fi, Intel NPU and Vega M.
 
 ## Monitoring
 
 `kernel::io_device_info` returns each device's interrupt core, its interrupt count and how many threads those interrupts woke.
 `kernel::thread_snapshot` reports each thread's `io_core` and `io_device`.
+
+## The timer tick
+
+Every core takes a tick 1000 times a second. A tick takes the global scheduler lock only when it has work: a sleeper is due, a thread was
+sent to the core, the running thread may no longer run there, or a ready thread outranks it (or matches its level once its slice is over).
+The tick checks this without the lock, from the first sleeper's wake time and a bit mask of non-empty priority levels. The boot self test
+measured 99% of ticks lock-free on a quiet 4-core machine (`CoreInfo::lock_free_ticks`).
 
 ## Note: no static constructors
 
@@ -63,8 +79,12 @@ The kernel runs no static constructors. Any scheduler field whose "none" value i
 
 ## Not done
 
-- One global scheduler lock still guards all run queues. Per-core locks would need the wait lists and `Sync.hpp` reworked.
-- The SLIT is parsed (`slit_distance`) but not used: a thread is either on its node or not.
-- Devices have no NUMA node of their own (ACPI `_PXM`), so a device's node is the node of its interrupt core.
-- The GICC entries of an ARM SRAT are not yet mapped to cores, because that needs the MADT's processor UID to MPIDR table.
-- Steering is tested on the boot self test's stand-in device; no real driver has moved an interrupt on hardware.
+- **Per-core locks.** One global lock still guards the run queues, the sleepers and the wait lists of `Sync.hpp`. The tick no longer takes it
+  when idle, but every wake-up, block and switch still does. Replacing it means:
+  - a lock per run queue, plus one per wait list or per synchronization object;
+  - a wake-up protocol that cannot lose a wake-up between "decide to block" and "switch away". Linux uses `on_cpu` and a per-task lock for
+    this.
+
+  This is a rewrite of `Sync.cpp` and the switch path, and needs its own design and multi-core stress tests.
+- Devices other than Thunderbolt don't look up their `_PXM` yet: they are set up before the ACPI interpreter is up.
+- No real driver has moved an interrupt on physical hardware. QEMU's virtio-gpu is the device tested.

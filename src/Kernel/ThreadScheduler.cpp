@@ -64,6 +64,7 @@ struct alignas(4096) Core {
   Thread* idle = nullptr;
   Thread* leaving = nullptr;      // the thread this core switched away from, still running its interrupt return on that thread's stack (see finish_switch)
   uint64_t busy_ticks = 0, idle_ticks = 0;
+  uint64_t lock_free_ticks = 0;     // ticks that needed no scheduler lock (on_timer's fast path)
   uint64_t kernel_entries = 0;      // interrupts of this core taken from ring 3 or the kernel that went through the scheduler (see wait_for_kernel_entry)
   int32_t io_device = -1;           // the device whose interrupt handler this core is running (on_device_interrupt), or -1
   bool resched = false;             // a thread was sent to this core while it was idle: switch to it on the way out of the interrupt
@@ -98,7 +99,7 @@ struct Scheduler {
   } run_queues[kMaxCores];
   uint32_t queue_lengths[kMaxCores];
   uint32_t level_counts[kPriorityLevels];
-  uint32_t ready_levels = 0;   // bit L: level_counts[L] != 0
+  uint32_t ready_levels = 0;   // bit L: level_counts[L] != 0 (written under the lock, read without it by on_timer: atomic)
   // What placement knows of each core (CPUScheduler/IoAffinity.hpp). `idle` is cleared as soon as a thread is sent to the core, so that the
   // next thread made ready goes to another idle core; it is set again whenever the core switches to its idle thread.
   scheduling::CorePlace places[kMaxCores];
@@ -116,6 +117,7 @@ struct Scheduler {
   bool balancer_started = false;
   int32_t balancer_busy = -1;   // the device whose callback the balancer is in (atomic), or -1
   Thread* sleepers = nullptr;
+  uint64_t next_wake_tsc = 0;   // the first sleeper's wake_tsc, ~0 without one (atomic: on_timer reads it without the lock)
   Thread* zombies = nullptr;
   Thread* all = nullptr;  // every thread that exists, through Thread::all_next
   allocators::IAllocator* allocator = nullptr;
@@ -352,7 +354,7 @@ void queue_on_locked(Thread* t, uint32_t core) {
   const uint8_t level = t->priority;
   list_append(&g.run_queues[core].levels[level], t);
   ++g.queue_lengths[core];
-  if (g.level_counts[level]++ == 0) g.ready_levels |= 1u << level;
+  if (g.level_counts[level]++ == 0) __atomic_store_n(&g.ready_levels, g.ready_levels | (1u << level), __ATOMIC_RELEASE);
   t->queued_on = static_cast<int32_t>(core);
   t->queued_level = level;
 }
@@ -362,9 +364,11 @@ void unqueue_locked(Thread* t) {
   const uint32_t core = static_cast<uint32_t>(t->queued_on);
   list_remove(&g.run_queues[core].levels[t->queued_level], t);
   --g.queue_lengths[core];
-  if (--g.level_counts[t->queued_level] == 0) g.ready_levels &= ~(1u << t->queued_level);
+  if (--g.level_counts[t->queued_level] == 0) __atomic_store_n(&g.ready_levels, g.ready_levels & ~(1u << t->queued_level), __ATOMIC_RELEASE);
   t->queued_on = -1;
 }
+
+void refresh_next_wake_locked() { __atomic_store_n(&g.next_wake_tsc, g.sleepers ? g.sleepers->wake_tsc : ~uint64_t{0}, __ATOMIC_RELEASE); }
 
 void sleepers_insert(Thread* t) {
   Thread** link = &g.sleepers;
@@ -372,6 +376,7 @@ void sleepers_insert(Thread* t) {
   t->sleep_next = *link;
   *link = t;
   t->in_sleepers = true;
+  refresh_next_wake_locked();
 }
 
 void sleepers_remove(Thread* t) {
@@ -380,6 +385,7 @@ void sleepers_remove(Thread* t) {
   if (*link) *link = t->sleep_next;
   t->sleep_next = nullptr;
   t->in_sleepers = false;
+  refresh_next_wake_locked();
 }
 
 // ---- device-aware placement (CPUScheduler/IoAffinity.hpp); lock held ----
@@ -637,6 +643,21 @@ void finish_switch() {
 UserTickHook g_user_tick = nullptr;
 #endif
 
+// Whether this tick has anything to do under the scheduler lock: a sleeper is due, a thread was sent here, the running thread may no longer run
+// here, or a ready thread outranks it (or matches its level once its slice is over; anything at all for an idle core). Read without the lock:
+// a change that races with it is seen by the next tick, and whoever makes a thread ready wakes an idle core for it anyway.
+bool tick_needs_lock(const Core* c, uint64_t now) {
+  if (c->resched) return true;
+  if (static_cast<int64_t>(now - __atomic_load_n(&g.next_wake_tsc, __ATOMIC_ACQUIRE)) >= 0) return true;
+  const Thread* current = c->current;
+  if (!current->is_idle && !eligible(current, c)) return true;
+  const uint32_t levels = __atomic_load_n(&g.ready_levels, __ATOMIC_ACQUIRE);
+  if (!levels) return false;
+  if (current->is_idle) return true;
+  const uint32_t top = 31 - static_cast<uint32_t>(__builtin_clz(levels));
+  return top > current->priority || (c->slice == 0 && top == current->priority);
+}
+
 Frame* on_timer(Frame* frame, void*) {
   ack_tick();
   __atomic_fetch_add(&this_core()->kernel_entries, 1, __ATOMIC_SEQ_CST);
@@ -645,9 +666,21 @@ Frame* on_timer(Frame* frame, void*) {
 #endif
   Core* c = this_core();
   if (g.stopping && c->index != g.boot_core) park_core(c);
+  // The accounting is this core's own (interrupts are masked here); monitoring reads it with relaxed loads.
+  if (c->current->is_idle) {
+    __atomic_store_n(&c->idle_ticks, c->idle_ticks + 1, __ATOMIC_RELAXED);
+  } else {
+    __atomic_store_n(&c->busy_ticks, c->busy_ticks + 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&c->current->cpu_ticks, 1, __ATOMIC_RELAXED);
+  }
+  if (c->slice > 0) --c->slice;
+  const uint64_t now = hardware::read_tsc();
+  if (!tick_needs_lock(c, now)) {   // most ticks: nothing changes, so no core waits for the lock on this one's account
+    __atomic_store_n(&c->lock_free_ticks, c->lock_free_ticks + 1, __ATOMIC_RELAXED);
+    return frame;
+  }
   const uint64_t flags = lock_irq();
   c->exit_reschedules = true;   // (reschedule_locked below)
-  const uint64_t now = hardware::read_tsc();
   while (g.sleepers && static_cast<int64_t>(g.sleepers->wake_tsc - now) <= 0) {
     Thread* t = g.sleepers;
     g.sleepers = t->sleep_next;
@@ -660,13 +693,7 @@ Frame* on_timer(Frame* frame, void*) {
     }
     make_ready_locked(t);
   }
-  if (c->current->is_idle) {
-    ++c->idle_ticks;
-  } else {
-    ++c->busy_ticks;
-    ++c->current->cpu_ticks;
-  }
-  if (c->slice > 0) --c->slice;
+  refresh_next_wake_locked();
   Frame* result = reschedule_locked(frame, c, false);
   unlock_irq(flags);
   return result;
@@ -991,6 +1018,7 @@ bool core_info(uint32_t core, CoreInfo* out) {
   out->kind = c.kind;
   out->busy_ticks = c.busy_ticks;
   out->idle_ticks = c.idle_ticks;
+  out->lock_free_ticks = __atomic_load_n(&c.lock_free_ticks, __ATOMIC_RELAXED);
   unlock_irq(flags);
   return true;
 }
@@ -1320,6 +1348,7 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
     c.exit_reschedules = false;
   }
   for (Scheduler::Steering& steering : g.steering) steering.move_to = -1;
+  g.next_wake_tsc = ~uint64_t{0};
   g.balancer_busy = -1;
 #if defined(__x86_64__)
   __asm__ volatile("fxsave %0" : "=m"(g_fpu_template));

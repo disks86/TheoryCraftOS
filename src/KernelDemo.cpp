@@ -355,6 +355,32 @@ bool test_io_affinity() {
 }
 #endif
 
+// ---- the tick takes the scheduler lock only when it has something to do ----
+
+bool test_quiet_ticks() {
+  auto totals = [](uint64_t* ticks, uint64_t* lock_free) {
+    *ticks = *lock_free = 0;
+    for (uint32_t i = 0; i < core_count(); ++i) {
+      CoreInfo info;
+      if (!core_info(i, &info) || !info.online) continue;
+      *ticks += info.busy_ticks + info.idle_ticks;
+      *lock_free += info.lock_free_ticks;
+    }
+  };
+  uint64_t ticks0, free0, ticks1, free1;
+  totals(&ticks0, &free0);
+  sleep_ms(200);
+  totals(&ticks1, &free1);
+  const uint64_t ticks = ticks1 - ticks0, lock_free = free1 - free0;
+  char percent[] = "  (000% of the ticks)\n";
+  const uint64_t p = ticks ? lock_free * 100 / ticks : 0;
+  percent[3] = static_cast<char>('0' + p / 100 % 10);
+  percent[4] = static_cast<char>('0' + p / 10 % 10);
+  percent[5] = static_cast<char>('0' + p % 10);
+  console::puts(percent);
+  return report("quiet ticks mostly skip the scheduler lock", ticks > 0 && lock_free * 2 >= ticks);
+}
+
 }  // namespace
 
 bool run_kernel_demo(allocators::IAllocator& allocator) {
@@ -363,6 +389,7 @@ bool run_kernel_demo(allocators::IAllocator& allocator) {
   ok &= test_mutex(allocator);
   ok &= test_pipe();
   ok &= test_blocking();
+  ok &= test_quiet_ticks();
 #if defined(__x86_64__)
   ok &= test_io_affinity();
 #endif
