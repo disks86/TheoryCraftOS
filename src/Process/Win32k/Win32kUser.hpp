@@ -68,6 +68,9 @@ bool adjust_window_rect(gdi::Rect* rect, uint32_t style, uint32_t ex_style, bool
 class IWindowObserver {
  public:
   virtual void top_level_changed(uint32_t hwnd) = 0;
+  // The program asked for the user to move (edge 9) or size (edge 1 .. 8: WMSZ_LEFT .. WMSZ_BOTTOMRIGHT) the window with the mouse (SC_MOVE / SC_SIZE, a press on a
+  // caption or border hit code): the desktop drags the window's frame until the button is let go.
+  virtual void drag_requested(uint32_t hwnd, uint32_t edge) = 0;
 
  protected:
   IWindowObserver() = default;
@@ -81,6 +84,7 @@ struct TopLevelInfo {
   gdi::Rect window;          // screen coordinates (= the desktop's)
   gdi::Rect surface;         // the part the window surface covers (inside the desktop's frame)
   uint32_t surface_id = 0, owner = 0;
+  uint32_t icon = 0;         // the small icon to show: WM_SETICON's small or big one, else the class's
   uint64_t pid = 0;
 };
 bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title);
@@ -91,8 +95,17 @@ bool move_top_level(uint32_t hwnd, const gdi::Rect& window);
 bool activate_top_level(uint32_t hwnd);                                     // 0: no Windows window is active (the desktop's own is)
 uint32_t top_level_surface_locked(uint32_t hwnd);                         // the window surface (gdi::window_surface_pixels) of a top-level; the caller holds the lock
 bool command_top_level(uint32_t hwnd, uint32_t sc);
+// The cursor the desktop shows over the Windows programs' windows (takes the lock): hidden (ShowCursor's counter below 0, or a program set no cursor), else `cursor`
+// (a cursor handle for cursor_picture; 0 with `system_id` for one of the system's shapes: OCR_NORMAL 32512, OCR_IBEAM 32513 ...).
+struct PointerCursor {
+  bool hidden = false;
+  uint32_t cursor = 0, system_id = 32512;
+};
+void pointer_cursor(PointerCursor* out);
+// The picture of a cursor (takes the lock): see user_misc::cursor_picture.
+bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y);
 // A GPU present into a window (a flip of a swapchain made for it): the picture (32-bit pixels, rows `pitch` bytes apart, B, G, R, A bytes or R, G, B, A when `rgba`)
-// goes into the window surface with its top left at the client area's, clipped to the client area. False when the window is not a redirected one (the caller shows it
+// goes into the window surface over the client area, stretched to it (nearest pixel) when the sizes differ. False when the window is not a redirected one (the caller shows it
 // on the display then). The caller holds the lock.
 bool window_redirected_locked(uint32_t hwnd);
 bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t width, uint32_t height, uint32_t pitch, bool rgba);                       // SC_CLOSE, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE
@@ -141,6 +154,13 @@ bool attach_window_menu(uint32_t hwnd, uint32_t menu);                  // Creat
 // makes a record for each process registered for the device and posts WM_INPUT to its target window. `injected`: from SendInput (the record names no device, as on Windows).
 void raw_input_event(uint32_t type, bool injected, ConstByteView data);
 bool raw_input_no_legacy(uint64_t pid, uint32_t type);                  // RIDEV_NOLEGACY: the process wants no WM_MOUSEMOVE / WM_KEYDOWN ... of that device
+// The cursor the desktop shows (the caller holds the lock): the ShowCursor counter, the cursor a thread set since the pointer came into its window (false: none, the
+// class cursor shows), the pointer coming into a window of the thread, and the picture of a cursor: a system cursor's OCR_ id (32512 ...; nothing to draw), or else
+// frame 0 as 0xAARRGGBB pixels (top row first) with its hot spot.
+int32_t cursor_show_count();
+bool thread_cursor(uint64_t tid, uint32_t* cursor);
+void cursor_entered_window(uint64_t tid);
+bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y);
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // (the user-misc module's own declarations follow)

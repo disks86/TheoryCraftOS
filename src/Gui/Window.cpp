@@ -114,57 +114,112 @@ void Window::render() {
     }
     if (cursor_visible_) {
       painter.renderer().reset_clip();
-      const float x = static_cast<float>(cursor_.x), y = static_cast<float>(cursor_.y);
       Control* under = captured_;
       Point origin;
       if (under) origin = under->window_origin();
       else under = target_at(cursor_.x, cursor_.y, &origin);
       const CursorShape shape = under ? under->cursor_shape(cursor_.x - origin.x, cursor_.y - origin.y) : CursorShape::Arrow;
-      if (shape == CursorShape::Arrow) {
-        // A classic arrow: black triangle with a white edge.
-        renderer_->fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
-        renderer_->fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
-      } else if (shape == CursorShape::Crosshair) {
-        for (int pass = 0; pass < 2; ++pass) {  // a white outline, then the black cross
-          const int32_t reach = pass == 0 ? 8 : 7;
-          const int32_t cx = cursor_.x, cy = cursor_.y;
-          const uint32_t color = pass == 0 ? theme_.highlight : theme_.dark;
-          const int32_t w = pass == 0 ? 3 : 1;
-          painter.fill({cx - reach, cy - w / 2, static_cast<uint32_t>(2 * reach + 1), static_cast<uint32_t>(w)}, color);
-          painter.fill({cx - w / 2, cy - reach, static_cast<uint32_t>(w), static_cast<uint32_t>(2 * reach + 1)}, color);
-        }
-      } else {
-        // A double arrow along the resize direction, centered on the pointer.
-        const int32_t dx = shape == CursorShape::ResizeVertical ? 0 : 1;
-        const int32_t dy = shape == CursorShape::ResizeHorizontal ? 0 : shape == CursorShape::ResizeDiagonalUp ? -1 : 1;
-        const int32_t px = -dy, py = dx;  // perpendicular
-        const float step = dx && dy ? 0.75f : 1.0f;
-        for (int pass = 0; pass < 2; ++pass) {  // white outline, then the black arrow on top
-          const float grow = pass == 0 ? 1.5f : 0.0f;
-          const uint32_t color = pass == 0 ? theme_.highlight : theme_.dark;
-          for (int sign = -1; sign <= 1; sign += 2) {
-            const float s = static_cast<float>(sign) * step;
-            const float tx = x + s * (9 + grow) * dx, ty = y + s * (9 + grow) * dy;
-            const float bx = x + s * 3 * dx, by = y + s * 3 * dy;
-            const float w = 4.5f + grow;
-            renderer_->fill_triangle({tx, ty}, {bx + w * px, by + w * py}, {bx - w * px, by - w * py}, color);
-          }
-          const float half = 1.0f + grow;
-          for (float t = -4; t <= 4; t += 1) {
-            const float cx = x + t * dx * step, cy = y + t * dy * step;
-            renderer_->fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py - half},
-                                    {cx + half * px + half, cy + half * py + half}, color);
-            renderer_->fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py + half},
-                                    {cx - half * px - half, cy - half * py + half}, color);
-          }
-        }
-      }
+      draw_pointer(painter, shape, under);
     }
   }
   // Presenting needs no access to the controls: the UI may change while the frame goes out.
   // Present on the same renderer we painted (captured under the lock above).
   r->reset_clip();
   r->present();
+}
+
+void Window::draw_pointer(Painter& painter, CursorShape shape, const Control* under) {
+  graphics::IRenderer2D& r = painter.renderer();
+  const float x = static_cast<float>(cursor_.x), y = static_cast<float>(cursor_.y);
+  const int32_t cx = cursor_.x, cy = cursor_.y;
+  const uint32_t light = theme_.highlight, dark = theme_.dark;
+  // A double arrow along (dx, dy), centered on the pointer: a white outline, then the black arrow on top.
+  auto double_arrow = [&](int32_t dx, int32_t dy) {
+    const int32_t px = -dy, py = dx;  // perpendicular
+    const float step = dx && dy ? 0.75f : 1.0f;
+    for (int pass = 0; pass < 2; ++pass) {
+      const float grow = pass == 0 ? 1.5f : 0.0f;
+      const uint32_t color = pass == 0 ? light : dark;
+      for (int sign = -1; sign <= 1; sign += 2) {
+        const float s = static_cast<float>(sign) * step;
+        const float tx = x + s * (9 + grow) * dx, ty = y + s * (9 + grow) * dy;
+        const float bx = x + s * 3 * dx, by = y + s * 3 * dy;
+        const float w = 4.5f + grow;
+        r.fill_triangle({tx, ty}, {bx + w * px, by + w * py}, {bx - w * px, by - w * py}, color);
+      }
+      const float half = 1.0f + grow;
+      for (float t = -4; t <= 4; t += 1) {
+        const float ax = x + t * dx * step, ay = y + t * dy * step;
+        r.fill_triangle({ax - half * px - half, ay - half * py - half}, {ax + half * px + half, ay + half * py - half}, {ax + half * px + half, ay + half * py + half}, color);
+        r.fill_triangle({ax - half * px - half, ay - half * py - half}, {ax + half * px + half, ay + half * py + half}, {ax - half * px - half, ay + half * py + half}, color);
+      }
+    }
+  };
+  auto arrow = [&]() {      // a classic arrow: black triangle with a white edge
+    r.fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, light);
+    r.fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, dark);
+  };
+  switch (shape) {
+    case CursorShape::Hidden: return;
+    case CursorShape::Image: {
+      graphics::Surface image;
+      Point hot;
+      if (!under || !under->cursor_image(&image, &hot) || !image.valid()) { arrow(); return; }
+      r.set_blend(graphics::BlendMode::Alpha);
+      r.draw_image(image, {0, 0, image.width, image.height}, cx - hot.x, cy - hot.y);
+      return;
+    }
+    case CursorShape::Crosshair:
+      for (int pass = 0; pass < 2; ++pass) {  // a white outline, then the black cross
+        const int32_t reach = pass == 0 ? 8 : 7, w = pass == 0 ? 3 : 1;
+        const uint32_t color = pass == 0 ? light : dark;
+        painter.fill({cx - reach, cy - w / 2, static_cast<uint32_t>(2 * reach + 1), static_cast<uint32_t>(w)}, color);
+        painter.fill({cx - w / 2, cy - reach, static_cast<uint32_t>(w), static_cast<uint32_t>(2 * reach + 1)}, color);
+      }
+      return;
+    case CursorShape::IBeam:
+      for (int pass = 0; pass < 2; ++pass) {  // a text bar with serifs
+        const int32_t g = pass == 0 ? 1 : 0;
+        const uint32_t color = pass == 0 ? light : dark;
+        painter.fill({cx - g, cy - 8 - g, static_cast<uint32_t>(1 + 2 * g), static_cast<uint32_t>(17 + 2 * g)}, color);
+        painter.fill({cx - 3 - g, cy - 8 - g, static_cast<uint32_t>(7 + 2 * g), static_cast<uint32_t>(1 + 2 * g)}, color);
+        painter.fill({cx - 3 - g, cy + 8 - g, static_cast<uint32_t>(7 + 2 * g), static_cast<uint32_t>(1 + 2 * g)}, color);
+      }
+      return;
+    case CursorShape::Wait:
+      for (int pass = 0; pass < 2; ++pass) {  // an hourglass
+        const float g = pass == 0 ? 1.5f : 0.0f;
+        const uint32_t color = pass == 0 ? light : dark;
+        r.fill_triangle({x - 6 - g, y - 9 - g}, {x + 6 + g, y - 9 - g}, {x, y + g}, color);
+        r.fill_triangle({x, y - g}, {x - 6 - g, y + 9 + g}, {x + 6 + g, y + 9 + g}, color);
+      }
+      return;
+    case CursorShape::Move:
+      double_arrow(1, 0);
+      double_arrow(0, 1);
+      return;
+    case CursorShape::No:
+      r.fill_rounded_rect({cx - 9, cy - 9, 19, 19}, graphics::CornerRadii::uniform(9.5f), light);
+      r.fill_rounded_rect({cx - 8, cy - 8, 17, 17}, graphics::CornerRadii::uniform(8.5f), dark);
+      r.fill_rounded_rect({cx - 6, cy - 6, 13, 13}, graphics::CornerRadii::uniform(6.5f), light);
+      r.fill_triangle({x - 6, y - 4}, {x - 4, y - 6}, {x + 6, y + 4}, dark);
+      r.fill_triangle({x - 4, y - 6}, {x + 6, y + 4}, {x + 4, y + 6}, dark);
+      return;
+    case CursorShape::Hand:
+      for (int pass = 0; pass < 2; ++pass) {  // a pointing finger over a palm, its tip at the hot spot
+        const int32_t g = pass == 0 ? 1 : 0;
+        const uint32_t color = pass == 0 ? dark : light;
+        r.fill_rounded_rect({cx - 2 - g, cy - g, static_cast<uint32_t>(5 + 2 * g), static_cast<uint32_t>(10 + 2 * g)}, graphics::CornerRadii::uniform(2.5f), color);
+        r.fill_rounded_rect({cx - 5 - g, cy + 7 - g, static_cast<uint32_t>(13 + 2 * g), static_cast<uint32_t>(9 + 2 * g)}, graphics::CornerRadii::uniform(3.0f), color);
+      }
+      return;
+    case CursorShape::ResizeHorizontal: double_arrow(1, 0); return;
+    case CursorShape::ResizeVertical: double_arrow(0, 1); return;
+    case CursorShape::ResizeDiagonalDown: double_arrow(1, 1); return;
+    case CursorShape::ResizeDiagonalUp: double_arrow(1, -1); return;
+    case CursorShape::Arrow: break;
+  }
+  arrow();
 }
 
 // --- Input -------------------------------------------------------------------

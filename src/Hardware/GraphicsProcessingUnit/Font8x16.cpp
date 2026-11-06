@@ -126,6 +126,114 @@ constexpr uint8_t kGlyphs[95][16] = {
 };
 }  // namespace
 
+namespace {
+
+// U+00C0..U+00FF and U+0100..U+017F: the base character and the accent of each, two bytes a character. Accents: g grave, a acute, c circumflex, t tilde,
+// d diaeresis, r ring, C cedilla, v caron, m macron, b breve, o dot above, O ogonek, D double acute, s stroke, - none (a dotless i), ' ' none.
+constexpr char kLatin1[] = "AgAaAcAtAdArE CCEgEaEcEdIgIaIcIdDsNtOgOaOcOtOdx OsUgUaUcUdYaP B agaaacatadare cCegeaecedigiaiciddsntogoaocotod/ osuguaucudyap yd";
+constexpr char kLatinExtendedA[] = "AmamAbabAOaOCacaCcccCocoCvcvDvdvDsdsEmemEbebEoeoEOeOEvevGcgcGbgbGogoGCgCHchcHshsItitImimIbibIOiOIoi-I j JcjcKCkCk LalaLClCLvlvLoloLslsNanaNCnCNvnvn N n OmomObobODoDO o RaraRCrCRvrvSasaScscSCsCSvsvTCtCTvtvTstsUtutUmumUbubUrurUDuDUOuOWcwcYcycYdZazaZozoZvzvf ";
+
+// The accents above a letter (two rows) and below it.
+struct Accent { char code; uint8_t rows[2]; };
+constexpr Accent kAbove[] = {{'g', {0x20, 0x10}}, {'a', {0x08, 0x10}}, {'c', {0x18, 0x24}}, {'t', {0x32, 0x4C}}, {'d', {0x00, 0x24}}, {'r', {0x18, 0x18}},
+                             {'v', {0x24, 0x18}}, {'m', {0x00, 0x3C}}, {'b', {0x42, 0x3C}}, {'o', {0x00, 0x10}}, {'D', {0x12, 0x24}}};
+constexpr Accent kBelow[] = {{'C', {0x08, 0x30}}, {'O', {0x08, 0x06}}};
+
+bool has_ascender(char c) { return c == 'b' || c == 'd' || c == 'f' || c == 'h' || c == 'k' || c == 'l' || c == 't'; }
+
+// Symbols and punctuation outside the letter ranges, as an ASCII look-alike.
+char look_alike(char32_t c) {
+  switch (c) {
+    case 0xA0: return ' ';
+    case 0xA1: return '!';
+    case 0xA2: return 'c';
+    case 0xA3: return 'L';
+    case 0xA5: return 'Y';
+    case 0xA7: return 'S';
+    case 0xA9: return 'C';
+    case 0xAB: return '<';
+    case 0xAD: return '-';
+    case 0xAE: return 'R';
+    case 0xB0: return 'o';
+    case 0xB1: return '+';
+    case 0xB2: return '2';
+    case 0xB3: return '3';
+    case 0xB4: return '\'';
+    case 0xB5: return 'u';
+    case 0xB7: return '.';
+    case 0xB9: return '1';
+    case 0xBB: return '>';
+    case 0xBF: return '?';
+    case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014: case 0x2212: return '-';
+    case 0x2018: case 0x2019: case 0x201A: case 0x2032: return '\'';
+    case 0x201C: case 0x201D: case 0x201E: case 0x2033: return '"';
+    case 0x2022: case 0x2023: case 0x25CF: return '*';
+    case 0x2026: return '.';
+    case 0x2039: return '<';
+    case 0x203A: return '>';
+    case 0x20AC: return 'E';
+    case 0x2122: return 'T';
+    default: return 0;
+  }
+}
+
+}  // namespace
+
+void Font8x16::glyph_of(char32_t c, uint8_t (&out)[kHeight]) {
+  char base = '?', accent = ' ';
+  if (c >= 32 && c <= 126) base = static_cast<char>(c);
+  else if (c >= 0xC0 && c <= 0xFF) base = kLatin1[(c - 0xC0) * 2], accent = kLatin1[(c - 0xC0) * 2 + 1];
+  else if (c >= 0x100 && c <= 0x17F) base = kLatinExtendedA[(c - 0x100) * 2], accent = kLatinExtendedA[(c - 0x100) * 2 + 1];
+  else if (const char a = look_alike(c)) base = a;
+  const ConstByteView g = glyph(base);
+  for (uint32_t i = 0; i < kHeight; ++i) out[i] = g[i];
+  if (accent == ' ') return;
+  const bool lower = base >= 'a' && base <= 'z';
+  if ((base == 'i' || base == 'j') && accent != 'O' && accent != 'C') for (uint32_t i = 0; i < 5; ++i) out[i] = 0;      // (the dot gives way to the accent)
+  if (accent == '-') return;
+  if (accent == 's') {      // a stroke: through the middle of a round letter, across the stem of the others
+    if (base == 'O' || base == 'o') for (uint32_t i = 0; i < 8; ++i) out[4 + i] |= static_cast<uint8_t>(0x02 << (i * 6 / 8));
+    else out[lower ? 4 : 6] |= lower ? 0x1C : 0xF8;
+    return;
+  }
+  for (const Accent& a : kBelow)
+    if (a.code == accent) {
+      out[12] |= a.rows[0];
+      out[13] |= a.rows[1];
+      return;
+    }
+  const uint32_t row = lower && !has_ascender(base) ? 2 : 0;      // (over a capital or an ascender the accent takes the top rows)
+  for (const Accent& a : kAbove)
+    if (a.code == accent) {
+      out[row] |= a.rows[0];
+      out[row + 1] |= a.rows[1];
+    }
+}
+
+char32_t utf8_next(const char*& at) {
+  const uint8_t b0 = static_cast<uint8_t>(*at);
+  if (b0 == 0) return 0;
+  ++at;
+  if (b0 < 0x80) return b0;
+  const uint32_t extra = b0 >= 0xF0 && b0 < 0xF5 ? 3 : b0 >= 0xE0 ? 2 : b0 >= 0xC2 && b0 < 0xE0 ? 1 : 0;
+  if (extra == 0 || b0 >= 0xF5) return 0xFFFD;
+  char32_t c = b0 & (0x3F >> extra);
+  const char* p = at;
+  for (uint32_t i = 0; i < extra; ++i, ++p) {
+    const uint8_t b = static_cast<uint8_t>(*p);
+    if ((b & 0xC0) != 0x80) return 0xFFFD;      // (cut off: only the lead byte is used up)
+    c = c << 6 | (b & 0x3F);
+  }
+  at = p;
+  return c;
+}
+
+uint64_t utf8_length(ConstByteView text) {
+  uint64_t n = 0;
+  for (uint8_t b : text) n += (b & 0xC0) != 0x80;
+  return n;
+}
+
 ConstByteView Font8x16::glyph(char c) {
   unsigned char u = static_cast<unsigned char>(c);
   if (u < 32 || u > 126) u = '?';

@@ -19,7 +19,9 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
+#include "Hardware/RegisterMapper.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "uefi.hpp"
@@ -28,12 +30,19 @@ namespace hardware {
 
 // Finds every network interface the machine has and brings them up. Each PCI
 // network controller gets a native driver where this OS has one (virtio-net,
-// Intel e1000, Realtek RTL8139); any other NIC the firmware can drive is used
-// through the firmware's driver instead.
+// Intel e1000/e1000e/igb/igc, Realtek RTL8139 and RTL8111/8168/8125, VMware
+// vmxnet3, AMD PCnet); USB adapters plugged in at boot (CDC-ECM, CDC-NCM, Realtek
+// RTL815x through their CDC configuration, ASIX AX88179) come next; any other NIC
+// the firmware can drive is used through the firmware's driver instead.
 class SystemNetworkInterfaces {
  public:
   SystemNetworkInterfaces(IPciBus& pci, allocators::IAllocator& allocator, efi::SystemTable* st)
       : pci_(pci), allocator_(allocator), st_(st), interfaces_(allocator) {}
+
+  // The drivers of the newer controllers map their registers through this (uncached, above 4 GiB too); without one they use the firmware's mapping.
+  void set_register_mapper(IRegisterMapper* mapper) { mapper_ = mapper; }
+  // The USB adapters are looked for on these controllers' root ports (none without it).
+  void set_usb(IUsbBus* usb) { usb_ = usb; }
 
   void initialize();
   // Stops every interface and frees them.
@@ -49,11 +58,14 @@ class SystemNetworkInterfaces {
 
  private:
   void find_native();
+  void find_usb();
   void find_firmware();
 
   IPciBus& pci_;
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;
+  IRegisterMapper* mapper_ = nullptr;
+  IUsbBus* usb_ = nullptr;
   List<UniquePointer<INetworkInterface>> interfaces_;
 };
 

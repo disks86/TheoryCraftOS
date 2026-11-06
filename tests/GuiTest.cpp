@@ -30,6 +30,7 @@
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Desktop/Desktop.hpp"
+#include "Hardware/GraphicsProcessingUnit/Font8x16.hpp"
 #include "Gui/Controls/ToastCenter.hpp"
 #include "FakeMonitors.hpp"
 #include "Gui/Controls/Menu.hpp"
@@ -1426,7 +1427,27 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     changed(w);
     return w;
   }
-  void attach(uint32_t w, uint32_t h, const desktop::WindowsRect& wa, int32_t b, int32_t t) override { attached = true; width = w; height = h; work = wa; border = b; title_h = t; }
+  void attach(int32_t b, int32_t t) override { attached = true; border = b; title_h = t; }
+  void set_display(uint32_t w, uint32_t h, ArrayView<const Monitor> monitors) override {
+    width = w;
+    height = h;
+    monitor_count = uint32_t(monitors.size());
+    if (monitors.size() > 0) work = monitors[0].work;
+  }
+  uint32_t monitor_count = 0;
+  uint32_t drag_window = 0, drag_edge = 0;
+  uint32_t take_drag(uint32_t* edge) override { const uint32_t w = drag_window; *edge = drag_edge; drag_window = drag_edge = 0; return w; }
+  Pointer ptr;
+  void pointer(Pointer* out) override { *out = ptr; }
+  // cursor 50: a 2 x 2 picture; icon 60: a 16 x 16 red one; anything else a system shape
+  bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* w, uint32_t* h, int32_t* hx, int32_t* hy) override {
+    argb->clear();
+    *system_id = 0;
+    if (cursor == 50) { for (uint32_t i = 0; i < 4; ++i) argb->push_back(0xFF112233u); *w = *h = 2; *hx = 1; *hy = 1; return true; }
+    if (cursor == 60) { for (uint32_t i = 0; i < 256; ++i) argb->push_back(0xFFFF0000u); *w = *h = 16; *hx = *hy = 0; return true; }
+    *system_id = 32512;
+    return true;
+  }
   void take_changes(List<uint32_t>* out, List<Repaint>* rep) override {
     out->clear();
     for (uint32_t w : changes.view()) out->push_back(w);
@@ -1500,6 +1521,7 @@ static void test_windows_screen() {
     gui::WindowManager& wm = d.windows();
     d.step(0);
     CHECK(s.attached && s.width == wm.bounds().width && s.height == wm.bounds().height && s.border == gui::Frame::kBorder && s.title_h == gui::Frame::kTitleHeight + 1);
+    CHECK(s.monitor_count == 1 && s.work.width == wm.area(0).width && s.work.height == wm.area(0).height);
     CHECK(ww.count() == 0);
     const Point mo = wm.window_origin();
 
@@ -1635,6 +1657,143 @@ static void test_windows_screen() {
   CHECK(a.live == 0);
 }
 
+// More of the programs' windows as the desktop's: their stacking order (among the desktop's own windows), a drag a program asks for, the cursor it shows, icons and
+// titles outside ASCII.
+static void test_windows_more() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    FakeWindowsSession s(a);
+    desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+    d.set_windows_session(&s);
+    desktop::Win32Windows& ww = d.win32_windows();
+    gui::WindowManager& wm = d.windows();
+    d.step(0);
+    const Point mo = wm.window_origin();
+    s.add(7, true, {40, 40, 200, 150}, "Seven", false);
+    s.add(8, true, {300, 60, 200, 150}, "Eight", true);
+    d.step(1000);
+    desktop::Win32Window* h7 = ww.host(7);
+    desktop::Win32Window* h8 = ww.host(8);
+    CHECK(h7 && h8 && wm.stacking_index(h8) > wm.stacking_index(h7));
+
+    // the program restacks its windows: the frames follow, a desktop window between them keeps its place on top
+    d.open_calculator();
+    d.step(2000);
+    gui::Frame* calc = wm.active();
+    s.log.clear();
+    s.order = {8, 7};
+    s.changed(7);
+    d.step(3000);
+    CHECK(wm.stacking_index(h7) > wm.stacking_index(h8) && wm.stacking_index(calc) > wm.stacking_index(h7));
+
+    // the user raises the program's window over the desktop's: a window the program keeps above it (an owned one) comes along, above both
+    h8->activate();
+    d.step(3500);
+    CHECK(wm.stacking_index(h8) > wm.stacking_index(calc));
+    s.order = {8, 7};
+    s.changed(8);
+    d.step(3600);
+    CHECK(wm.stacking_index(h7) > wm.stacking_index(h8) && wm.stacking_index(h8) > wm.stacking_index(calc));
+
+    // a drag the program asks for (its own title bar): the frame follows the pointer while the left button is held; the program hears of it as a move
+    h8->activate();
+    d.step(4000);
+    gui::Rect2D pic;
+    CHECK(h8->picture_area(&pic));
+    const Point p0 = d.pointer();
+    mouse.move(mo.x + pic.x + 20 - p0.x, mo.y + pic.y + 20 - p0.y, hardware::mouse_button::kLeft);
+    d.step(5000);
+    s.drag_window = 8;
+    s.drag_edge = 9;
+    d.step(6000);
+    s.log.clear();
+    mouse.move(30, 20, hardware::mouse_button::kLeft);
+    d.step(7000);
+    CHECK(h8->bounds().x == 330 && h8->bounds().y == 80);
+    bool moved = false;
+    for (const std::string& e : s.log) moved |= e == "move 330 80";
+    CHECK(moved);
+    mouse.move(0, 0, 0);
+    d.step(8000);
+    CHECK(s.log.back() == "button 1 0");      // (the press that began it is let go)
+    mouse.move(5, 5, 0);
+    d.step(9000);
+    CHECK(h8->bounds().x == 330);      // (over)
+    // ... and a border: the bottom right corner sizes it
+    CHECK(h8->picture_area(&pic));
+    mouse.move(mo.x + pic.x + 20 - d.pointer().x, mo.y + pic.y + 20 - d.pointer().y, hardware::mouse_button::kLeft);
+    d.step(10000);
+    s.drag_window = 8;
+    s.drag_edge = 8;
+    d.step(11000);
+    mouse.move(40, 10, hardware::mouse_button::kLeft);
+    d.step(12000);
+    CHECK(h8->bounds().x == 330 && h8->bounds().width == 240 && h8->bounds().height == 160);
+    mouse.move(0, 0, 0);
+    d.step(13000);
+
+    // the cursor the program shows over its windows
+    CHECK(h8->picture_area(&pic));
+    const desktop::Win32WindowView& view = h8->view();
+    s.ptr.hidden = true;
+    d.step(14000);
+    CHECK(view.cursor_shape(0, 0) == gui::CursorShape::Hidden);
+    s.ptr.hidden = false;
+    s.ptr.system_id = 32513;
+    d.step(15000);
+    CHECK(view.cursor_shape(0, 0) == gui::CursorShape::IBeam);
+    s.ptr.system_id = 32649;
+    d.step(16000);
+    CHECK(view.cursor_shape(0, 0) == gui::CursorShape::Hand);
+    s.ptr.cursor = 50;
+    d.step(17000);
+    graphics::Surface image;
+    Point hot;
+    CHECK(view.cursor_shape(0, 0) == gui::CursorShape::Image && view.cursor_image(&image, &hot) && image.width == 2 && hot.x == 1 && image.pixels[3] == 0xFF112233u);
+    mouse.move(mo.x + pic.x + 40 - d.pointer().x, mo.y + pic.y + 40 - d.pointer().y, 0);
+    d.step(18000);
+    const Point at = d.pointer();
+    CHECK(screen.px(at.x, at.y) == 0xFF112233u && screen.px(at.x - 1, at.y - 1) == 0xFF112233u);      // (drawn with its hot spot on the pointer)
+
+    // an icon and a title outside ASCII
+    s.wins[7].info.icon = 60;
+    s.wins[7].title = "Z\xC3\xBC";      // Z, u with diaeresis
+    s.changed(7);
+    d.step(19000);
+    CHECK(h7->has_icon() && h7->title() == StringView("Z\xC3\xBC") && Painter::text_width(h7->title()) == 2 * Painter::kGlyphWidth);
+    h7->activate();
+    d.step(20000);
+    const gui::Rect2D b7 = h7->bounds();
+    CHECK(screen.px(mo.x + b7.x + gui::Frame::kBorder + 4, mo.y + b7.y + gui::Frame::kBorder + 4) == 0xFFFF0000u);      // the icon, left in the title bar
+    d.set_windows_session(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
+// The fixed font's characters beyond ASCII: an accented letter is its base letter with the accent; UTF-8 is read a character at a time.
+static void test_font_unicode() {
+  using hardware::Font8x16;
+  uint8_t u[16], ue[16], q[16];
+  Font8x16::glyph_of(U'u', u);
+  Font8x16::glyph_of(0xFC, ue);      // u with diaeresis
+  Font8x16::glyph_of(0x4E00, q);     // (a CJK character: not there)
+  const ConstByteView question = Font8x16::glyph('?');
+  bool same_below = true, same_q = true;
+  for (uint32_t i = 4; i < 16; ++i) same_below &= u[i] == ue[i];
+  for (uint32_t i = 0; i < 16; ++i) same_q &= q[i] == question[i];
+  CHECK(same_below && ue[3] != 0 && u[3] == 0 && same_q);
+  uint8_t i_acute[16];
+  Font8x16::glyph_of(0xED, i_acute);      // i acute: the dot gives way to the accent
+  CHECK(i_acute[2] != 0 && i_acute[4] == 0);
+  const char* text = "a\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80\xC3";
+  CHECK(hardware::utf8_next(text) == U'a' && hardware::utf8_next(text) == 0xE9 && hardware::utf8_next(text) == 0x20AC && hardware::utf8_next(text) == 0x1F600);
+  CHECK(hardware::utf8_next(text) == 0xFFFD && hardware::utf8_next(text) == 0);      // (cut off)
+  CHECK(Painter::text_width("\xC3\xA9t\xC3\xA9") == 3 * Painter::kGlyphWidth);
+}
+
 int main() {
   test_dock_layout();
   test_uniform_panel();
@@ -1654,6 +1813,8 @@ int main() {
   test_switcher();
   test_desktop_toasts();
   test_windows_screen();
+  test_windows_more();
+  test_font_unicode();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui: all checks passed\n");
   return 0;

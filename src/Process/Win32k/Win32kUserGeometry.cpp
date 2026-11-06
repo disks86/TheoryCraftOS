@@ -119,6 +119,24 @@ void compute_nc(Window* w, Rect* client_out) {
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // Z-order
 
+namespace {
+// The windows `w` owns go directly above it, recursively (apply_zorder has placed `w`).
+void apply_owned_zorder(Window* w, uint32_t depth = 0) {
+  Window* parent = w->parent;
+  if (!parent || depth > 16) return;
+  Window* owned[64];
+  uint32_t n = 0;
+  for (Window* c = parent->first_child; c && n < 64; c = c->next) if (c->owner == w && c != w) owned[n++] = c;
+  for (uint32_t i = n; i > 0; --i) {
+    Window* o = owned[i - 1];
+    if (!(o->ex_style & wn::WS_EX_TOPMOST) && (w->ex_style & wn::WS_EX_TOPMOST)) continue;
+    unlink_window(o);
+    link_window(o, parent, w->prev, false);
+  }
+  for (uint32_t i = 0; i < n; ++i) apply_owned_zorder(owned[i], depth + 1);
+}
+}  // namespace
+
 void apply_zorder(Window* w, uint32_t after) {
   Window* parent = w->parent;
   if (!parent) return;
@@ -146,6 +164,9 @@ void apply_zorder(Window* w, uint32_t after) {
     } else if (sibling == w) { insert_after = w->prev; }
   }
   link_window(w, parent, insert_after, at_end);
+  if (!top_level) return;
+  if (!at_end) apply_owned_zorder(w);      // the windows it owns stay above it (a dialog above its main window), theirs above them in turn
+  notify_top_level(w);
 }
 
 void invalidate_screen_rect(const Rect& screen, const Window* except_tree) {
@@ -228,7 +249,8 @@ Rect iconic_rect(Window* w) {
 // The rectangle of a maximized window: the work area (the whole monitor for a popup, the client area of the parent for a child) grown by what AdjustWindowRectEx adds for the style without WS_BORDER.
 Rect maximized_rect(Window* w) {
   const bool popup = (w->style & wn::WS_POPUP) != 0;
-  Rect area = user_misc::monitor_rect(user_misc::monitor_from_point(0, 0, 1), !popup);
+  const Rect at = w->parent ? window_rect_screen(w) : Rect{};
+  Rect area = user_misc::monitor_rect(user_misc::monitor_from_rect(gdi::Rect{at.left, at.top, at.right, at.bottom}, 2), !popup);      // (the monitor the window is mostly on)
   if ((w->style & wn::WS_CHILD) && !popup && w->parent && w->parent->parent) area = Rect{0, 0, w->parent->client.right - w->parent->client.left, w->parent->client.bottom - w->parent->client.top};
   if (redirected(w) && (w->style & wn::WS_CAPTION) == wn::WS_CAPTION) return area;      // (the desktop's maximized frame fills the work area, frame and all)
   gdi::Rect r{area.left, area.top, area.right, area.bottom};

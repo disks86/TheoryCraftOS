@@ -42,6 +42,7 @@ struct WindowsWindowInfo {
   bool tool = false, topmost = false;    // a tool window (no taskbar button), above the others
   bool popup = false;                    // no caption and not activatable from the desktop's side (menus, tooltips, drop-downs)
   bool owned = false;                    // it has an owner window (a dialog): no taskbar button of its own
+  uint32_t icon = 0;                     // the icon to show (a handle cursor_picture takes), 0: none
   WindowsRect window;                    // the whole window = the desktop's frame
   WindowsRect surface;                   // the program's picture inside it
 };
@@ -50,9 +51,15 @@ class IWindowsSession {
  public:
   enum class Command : uint8_t { Close, Minimize, Maximize, Restore };
 
-  // Makes win32k's screen the desktop's window manager area (width x height) with the given work area, and the desktop's frame the one windows with a caption get
-  // (border and title bar heights: the surface of such a window starts that far in). Done once, before the programs start.
-  virtual void attach(uint32_t width, uint32_t height, const WindowsRect& work_area, int32_t frame_border, int32_t frame_title) = 0;
+  // Starts showing the programs' windows as the desktop's: windows with a caption get the desktop's frame (border and title bar heights: the surface of such a window
+  // starts that far in). Done once, before set_display.
+  virtual void attach(int32_t frame_border, int32_t frame_title) = 0;
+  // Makes win32k's screen the desktop's window manager area (width x height) and its monitors these (rectangles and work areas in that area, the primary first;
+  // at most 8). Done at the start and whenever the desktop's monitors change.
+  struct Monitor {
+    WindowsRect rect, work;
+  };
+  virtual void set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) = 0;
   // What changed since the last call (and forgets it): the windows whose state or place changed (shown, hidden, moved, sized, retitled, restyled, activated,
   // destroyed), and those whose picture changed (with the part, in surface coordinates).
   struct Repaint {
@@ -60,10 +67,13 @@ class IWindowsSession {
     WindowsRect dirty;
   };
   virtual void take_changes(List<uint32_t>* changed, List<Repaint>* repainted) = 0;
+  // A program asked for its window to be moved (edge 9) or sized (edge 1 .. 8: left, right, top, top left, top right, bottom, bottom left, bottom right) by the
+  // user with the mouse (a custom title bar or border): the window, and forgets it; 0 when none.
+  virtual uint32_t take_drag(uint32_t* edge) = 0;
   // The visible top-level windows, bottom of the stack first.
   virtual void windows(List<uint32_t>* out) = 0;
   // False when the window is gone.
-  virtual bool window_info(uint32_t window, WindowsWindowInfo* out, String* title) = 0;
+  virtual bool window_info(uint32_t window, WindowsWindowInfo* out, String* title) = 0;      // (the title in UTF-8)
   // Draws the window's surface with its top left at (x, y) of `renderer` (the renderer's clip applies), from the kernel's memory as it is, and says its size.
   // False when there is none.
   virtual bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) = 0;
@@ -71,6 +81,16 @@ class IWindowsSession {
   virtual void move_window(uint32_t window, const WindowsRect& rect) = 0;
   virtual void activate_window(uint32_t window) = 0;      // 0: none of the Windows programs' windows is active (a desktop window is)
   virtual void window_command(uint32_t window, Command command) = 0;
+
+  // The cursor the programs show where the Windows cursor is: hidden, a shape of the system's (`system_id`: OCR_NORMAL 32512, OCR_IBEAM 32513, ...), or `cursor`, a
+  // handle whose picture cursor_picture gives (the desktop keeps it while the handle stays the same).
+  struct Pointer {
+    bool hidden = false;
+    uint32_t cursor = 0, system_id = 32512;
+  };
+  virtual void pointer(Pointer* out) = 0;
+  // The picture of a cursor: a system shape (`system_id` set, `argb` empty) or 0xAARRGGBB pixels (straight alpha, top row first) with the hot spot.
+  virtual bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) = 0;
 
   // Input, in the screen's coordinates.
   virtual void key(uint8_t hid_usage, bool pressed, uint8_t modifiers) = 0;   // modifiers: hardware::modifier bits held (for the character a press types)

@@ -69,6 +69,33 @@ class INetworkInterface : public IHardware {
   // The Wi-Fi side of this interface (scanning, joining a network), or nullptr when it is not a wireless adapter.
   virtual IWirelessInterface* wireless() { return nullptr; }
 
+  // --- Hardware help. Interfaces without it keep these defaults, which do everything in software.
+  virtual NetworkOffloads offloads() const { return NetworkOffloads{}; }
+  // receive() with what the hardware found about the frame's checksums.
+  virtual bool receive_frame(ByteView buffer, ReceivedFrame* frame) {
+    *frame = ReceivedFrame{};
+    return receive(buffer, &frame->length);
+  }
+  // transmit() with a transport checksum to finish (done in software here: the frame is copied first).
+  virtual bool transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
+    if (!checksum.requested()) return transmit(frame);
+    uint8_t copy[kEthernetMaxFrame];
+    const ByteView writable = ByteView(copy).first(frame.size() < sizeof copy ? frame.size() : sizeof copy);
+    if (frame.size() > sizeof copy || !writable.copy_from(frame) || !finish_transmit_checksum(writable, checksum)) return false;
+    return transmit(writable);
+  }
+
+  // Interrupts: an interface that can interrupt calls `wake(context)` from its interrupt handler whenever it has something new, so whoever polls
+  // it may sleep in between. True once an interrupt has been seen to arrive (the interface tests it); false leaves the interface polled.
+  // disable_interrupts() is called before `context` goes away.
+  virtual bool enable_interrupts(NetworkWake wake, void* context) {
+    (void)wake;
+    (void)context;
+    return false;
+  }
+  virtual void disable_interrupts() {}
+  virtual bool interrupts_enabled() const { return false; }
+
   virtual NetworkStatistics statistics() const = 0;
 
  protected:

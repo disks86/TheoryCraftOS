@@ -142,6 +142,7 @@ EXPORT int WINAPI wsprintfA(LPSTR buffer, LPCSTR format, ...) { va_list_ a; __bu
 typedef struct { LONG left, top, right, bottom; } RECT_;
 IMPORT HANDLE WINAPI GetConsoleWindow(void);
 IMPORT void WINAPI SetLastError(DWORD error);
+IMPORT DWORD WINAPI GetLastError(void);
 #define SCREEN_W 1024
 #define SCREEN_H 768
 #define WORK_H 728

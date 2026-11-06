@@ -1014,6 +1014,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Network interfaces: native drivers where we have them, the firmware's driver otherwise.
   hardware::SystemNetworkInterfaces network(pci, shared_allocator, st);
+  network.set_register_mapper(paging_ok ? &register_mapper : nullptr);
+  network.set_usb(&usb);
   network.initialize();
   if (network.count() == 0) Entry(Level::Info, "Network").text("no interfaces");
   for (uint32_t i = 0; i < network.count(); ++i) {
@@ -1023,6 +1025,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     e.text(nic.name()).text(" ");
     for (int b = 0; b < 6; ++b) e.hex2(mac.bytes[b]).text(b < 5 ? ":" : "");
     e.text(nic.link_up() ? ", link up" : ", link DOWN (no cable?)");
+    if (nic.link_speed_mbps()) e.text(", ").dec(nic.link_speed_mbps()).text(" Mb/s");
 #ifdef TCOS_SELFTESTS
     run_network_probe(nic, st);
 #endif
@@ -1184,8 +1187,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
 #endif
   if (network.count() > 0 && clock_ok) {
-    for (uint32_t i = 0; i < network.count(); ++i)
-      if (!stacks.add(*network.at(i))) Entry(Level::Warning, "Network").text("could not start a network stack on interface ").dec(i);
+    for (uint32_t i = 0; i < network.count(); ++i) {
+      hardware::INetworkInterface& nic = *network.at(i);
+      if (!stacks.add(nic)) {
+        Entry(Level::Warning, "Network").text("could not start a network stack on interface ").dec(i);
+        continue;
+      }
+      // (stacks.add() asked for interrupts: an interface that has them wakes the network thread instead of being polled)
+      const hardware::NetworkOffloads offloads = nic.offloads();
+      Entry(Level::Info, "Network").text("  ").text(nic.name()).text(nic.interrupts_enabled() ? ": interrupts (MSI)" : ": polled")
+          .text(offloads.receive_checksums || offloads.transmit_checksums ? ", checksum offload" : "");
+    }
     if (stacks.count() > 0) {
       stacks.start_service();  // one thread keeps every stack polled
       network::set_system_network_stacks(&stacks);

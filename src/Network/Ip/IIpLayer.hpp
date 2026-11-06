@@ -43,7 +43,8 @@ class IIpLayer {
   // `destination`, via the gateway when it is off-link; a packet to 127.0.0.0/8 or
   // to the local address is delivered to this stack itself. False if the packet
   // cannot be sent now (not configured, too large, link-layer trouble); a packet
-  // that is waiting for an ARP answer counts as sent.
+  // that is waiting for an ARP answer counts as sent. A TCP or UDP payload is passed with its checksum field zero: the
+  // IP layer fills it in, in software or through the network interface's checksum offload.
   virtual bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) = 0;
   // The same with an explicit source address (0.0.0.0 is allowed), optionally as
   // a link-layer broadcast. DHCP needs this before it has an address.

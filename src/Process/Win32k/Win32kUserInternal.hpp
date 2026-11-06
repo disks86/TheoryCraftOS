@@ -145,6 +145,7 @@ struct Window {
   Window* prev = nullptr;
   Window* owner = nullptr;       // owner window (popups); the owner pointer is cleared when the owner goes
   Class* cls = nullptr;
+  uint64_t icon_big = 0, icon_small = 0;      // WM_SETICON (ICON_BIG / ICON_SMALL)
   Desktop* desktop = nullptr;
   uint64_t thread = 0, pid = 0;
   uint32_t style = 0, ex_style = 0;
@@ -509,6 +510,8 @@ struct RedirectConfig {
   IWindowObserver* observer = nullptr;
 };
 RedirectConfig& redirect_config();
+constexpr uint32_t kDragMove = 9;      // drag_requested: a move (1 .. 8 are the WMSZ_ edges of a size)
+void drag_requested(const Window* top, uint32_t edge);
 // The surface of a top-level and where it lies on the screen; a top-level's surface follows its size; the observer hears of it.
 bool redirected(const Window* w);                       // a top-level that draws on a window surface
 Rect surface_rect_screen(const Window* top);           // the part of the window the surface covers (inside the desktop's frame), screen coordinates
@@ -604,7 +607,8 @@ void set_cursor_pos_locked(int32_t x, int32_t y);
 Window* foreground_window_ptr();
 Queue* foreground_queue();
 bool set_foreground_internal(Window* w);
-void clear_foreground_internal();      // no window is the foreground one (the desktop's own window is active)
+void clear_foreground_internal();
+Window* window_under_cursor(uint32_t* hit);      // the window the cursor is over (or the capture window) and the hit test code      // no window is the foreground one (the desktop's own window is active)
 
 // Hooks (Win32kUserHook.cpp).
 bool has_hooks(int32_t id, uint64_t thread);

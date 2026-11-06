@@ -42,8 +42,10 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   void detach();
   ~DesktopBridge() { detach(); }
 
-  void attach(uint32_t width, uint32_t height, const desktop::WindowsRect& work_area, int32_t frame_border, int32_t frame_title) override;
+  void attach(int32_t frame_border, int32_t frame_title) override;
+  void set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) override;
   void take_changes(List<uint32_t>* changed, List<Repaint>* repainted) override;
+  uint32_t take_drag(uint32_t* edge) override;
   void windows(List<uint32_t>* out) override;
   bool window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) override;
   bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) override;
@@ -58,10 +60,13 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
+  void pointer(Pointer* out) override;
+  bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) override;
 
   // (with the system lock held)
   void top_level_changed(uint32_t hwnd) override;
   void surface_changed(uint32_t window, const gdi::Rect& dirty) override;
+  void drag_requested(uint32_t hwnd, uint32_t edge) override;
 
  private:
   struct Pending {
@@ -76,6 +81,7 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   Pending pending_[kMaxPending];
   uint32_t pending_count_ = 0;
   bool overflow_ = false;
+  uint32_t drag_window_ = 0, drag_edge_ = 0;      // (guarded by the system lock too)
   bool attached_ = false;
 };
 

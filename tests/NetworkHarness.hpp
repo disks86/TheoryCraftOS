@@ -63,6 +63,21 @@ struct FakeNic final : hardware::INetworkInterface {
   Wire* wire; FakeNic* peer = nullptr; int index; hardware::MacAddress mac;
   std::deque<std::vector<uint8_t>> inbox; hardware::NetworkStatistics stats; bool cable = true;
   std::function<void()> on_idle;   // called when receive() finds nothing: lets the peer machine run
+  // Checksum offload, as a card that has it: transmit_frame() finishes the checksum "in hardware" (the software helper), receive_frame() vouches
+  // for every TCP/UDP frame (`vouch`: the tests break checksums to see the stack trusts it).
+  bool offload = false, vouch = true; uint64_t offloaded = 0;
+  hardware::NetworkOffloads offloads() const override { return hardware::NetworkOffloads{offload, offload}; }
+  bool transmit_frame(ConstByteView frame, hardware::TransmitChecksum checksum) override {
+    if (!checksum.requested()) return transmit(frame);
+    assert(offload);  // the stack asks only interfaces that offload
+    std::vector<uint8_t> f(frame.data(), frame.data() + frame.size());
+    if (!hardware::finish_transmit_checksum(ByteView(f.data(), f.size()), checksum)) return false;
+    ++offloaded; return transmit(ConstByteView(f.data(), f.size())); }
+  bool receive_frame(ByteView buffer, hardware::ReceivedFrame* frame) override {
+    *frame = hardware::ReceivedFrame{};
+    if (!receive(buffer, &frame->length)) return false;
+    if (offload && vouch) { frame->ipv4_header_checksum_good = true; frame->transport_checksum_good = true; }
+    return true; }
   FakeNic(Wire* w, int i, uint8_t last) : wire(w), index(i) { mac = {{0x02, 0, 0, 0, 0, last}}; }
   const char* name() const override { return "fake nic"; } bool initialize() override { return true; } void shutdown() override {}
   hardware::MacAddress mac_address() const override { return mac; } bool link_up() const override { return cable; }

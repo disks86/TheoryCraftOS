@@ -34,7 +34,8 @@ class UdpManager {
 
   // A UDP datagram arrived in an IP packet: `segment` is the UDP header and data.
   // True if a socket took it.
-  bool handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment);
+  // `checksum_verified`: the network interface checked the checksum already (and found it right).
+  bool handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment, bool checksum_verified = false);
 
   // Forgets sockets that were closed or that nobody holds any more.
   void reap();

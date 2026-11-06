@@ -237,8 +237,18 @@ add_executable(BOOTX64
   src/Hardware/NetworkInterface/AMD/PcnetNetworkInterface.cpp
   src/Hardware/NetworkInterface/VMware/Vmxnet3NetworkInterface.cpp
   src/Hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
+  src/Hardware/NetworkInterface/Intel/E1000eNetworkInterface.cpp
+  src/Hardware/NetworkInterface/Intel/IgbNetworkInterface.cpp
+  src/Hardware/NetworkInterface/Intel/IntelEthernetRegisters.cpp
+  src/Hardware/NetworkInterface/PciNicDevice.cpp
   src/Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
+  src/Hardware/NetworkInterface/Realtek/Rtl8169NetworkInterface.cpp
   src/Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp
+  src/Hardware/NetworkInterface/Usb/Ax88179NetworkInterface.cpp
+  src/Hardware/NetworkInterface/Usb/CdcEthernetInterface.cpp
+  src/Hardware/NetworkInterface/Usb/CdcNcm.cpp
+  src/Hardware/NetworkInterface/Usb/UsbNetworkCommon.cpp
+  src/Hardware/NetworkInterface/Usb/UsbNetworkInterfaces.cpp
   src/Hardware/WirelessInterface/WirelessTypes.cpp
   src/Hardware/WirelessInterface/Software/SoftwareWirelessInterface.cpp
   src/StorageDemo.cpp

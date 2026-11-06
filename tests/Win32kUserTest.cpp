@@ -26,6 +26,7 @@
 #include "Process/Win32k/Win32kGdi.hpp"
 #include "Process/Win32k/Win32kUser.hpp"
 #include "Process/Win32k/Win32kUserInternal.hpp"
+#include "Process/Win32k/Win32kUserMisc.hpp"
 
 using namespace w32test;
 using namespace process;
@@ -1141,7 +1142,9 @@ void test_redirection() {
   List<desktop::IWindowsSession::Repaint> repainted(*system_allocator());
 
   DesktopBridge bridge;
-  bridge.attach(1024, 768, desktop::WindowsRect{0, 0, 1024, 740}, 6, 19);
+  bridge.attach(6, 19);
+  const desktop::IWindowsSession::Monitor one[1] = {{{0, 0, 1024, 768}, {0, 0, 1024, 740}}};
+  bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
   CHECK(t.atom_class("Redir") >= 0xC000);
   const uint32_t a = t.create("Redir", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 400, 300, 0, 0, "First");
   CHECK(a != 0);
@@ -1205,6 +1208,133 @@ void test_redirection() {
   bridge.window_command(a, desktop::IWindowsSession::Command::Restore);
   pump();
   CHECK(bridge.window_info(a, &info, nullptr) && !info.maximized && info.window.x == 200 && info.window.width == 500);
+  // stacking: the program's SetWindowPos reaches the desktop, and a window it owns stays above it
+  auto index_in = [&](const List<uint32_t>& l, uint32_t v) { for (uint64_t i = 0; i < l.count(); ++i) if (l[i] == v) return int64_t(i); return int64_t(-1); };
+  const uint32_t dlg = t.create("Redir", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 260, 200, 200, 120, a, 0, "Dialog");      // (owned by a)
+  pump();
+  CHECK(t.svc32(N::NtUserSetWindowPos, {b, 0, 0, 0, 0, 0, 0x13}) == 1);      // HWND_TOP, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+  bridge.windows(&all);
+  CHECK(index_in(all, b) == int64_t(all.count()) - 1);
+  bridge.take_changes(&changed, &repainted);
+  CHECK(t.svc32(N::NtUserSetWindowPos, {a, 0, 0, 0, 0, 0, 0x13}) == 1);
+  bridge.take_changes(&changed, &repainted);
+  bridge.windows(&all);
+  CHECK(has(changed, a) && index_in(all, dlg) == int64_t(all.count()) - 1 && index_in(all, a) == int64_t(all.count()) - 2 && index_in(all, b) < index_in(all, a));
+  bridge.take_changes(&changed, &repainted);
+  bridge.window_command(dlg, desktop::IWindowsSession::Command::Close);
+  pump();
+
+  // a press the program reports as on its caption or a border: the desktop is asked to drag the window
+  uint32_t edge = 0;
+  CHECK(bridge.take_drag(&edge) == 0);
+  t.post(a, 0xA1, 2, 0);      // WM_NCLBUTTONDOWN, HTCAPTION
+  pump();
+  CHECK(bridge.take_drag(&edge) == a && edge == 9 && bridge.take_drag(&edge) == 0);
+  t.post(a, 0xA1, 17, 0);     // HTBOTTOMRIGHT
+  pump();
+  CHECK(bridge.take_drag(&edge) == a && edge == 8);
+
+  // the icon: WM_SETICON's, shown by the desktop
+  const uint32_t icon = user_misc::create_cursor_icon(91, true);
+  CHECK(icon != 0 && t.svc(N::NtUserMessageCall, {a, 0x80, 0, icon, 0, 0x2b1, 0}) == 0);      // WM_SETICON ICON_SMALL
+  CHECK(t.svc(N::NtUserMessageCall, {a, 0x7F, 0, 0, 0, 0x2b1, 0}) == icon && bridge.window_info(a, &info, nullptr) && info.icon == icon);
+
+  // a title outside ASCII comes to the desktop in UTF-8
+  {
+    user::Window* wa = user::find_window(a);
+    wa->text.clear();
+    wa->text.append(u'Z');
+    wa->text.append(char16_t(0x00FC));      // u with diaeresis
+    wa->text.append(char16_t(0xD83D));      // U+1F600, a surrogate pair
+    wa->text.append(char16_t(0xDE00));
+    wa->text.append(char16_t(0xD800));      // a lone surrogate
+  }
+  CHECK(bridge.window_info(a, &info, &title) && title.view() == StringView("Z\xC3\xBC\xF0\x9F\x98\x80\xEF\xBF\xBD"));
+
+  // the cursor: the class cursor of the window it is over, SetCursor's until it comes into a window again, hidden by SetCursor(NULL) or ShowCursor
+  const uint32_t ibeam = user_misc::system_cursor(91, 32513);
+  {
+    const uint64_t wc = t.tmp(0x100), us = t.tmp(0x200), chars = t.tmp(0x240);
+    for (uint64_t i = 0; i < 80; ++i) t.mem().put8(wc + i, 0);
+    t.mem().put32(wc, 80);
+    t.mem().put64(wc + 8, 0x401000);
+    t.mem().put64(wc + 24, 0x400000);
+    t.mem().put64(wc + 40, ibeam);      // hCursor
+    t.mem().put_unicode_string(us, chars, "RedirText");
+    CHECK(t.svc32(N::NtUserRegisterClassExWOW, {wc, us, 0, 0, 0, 0, 0}) >= 0xC000);
+  }
+  const uint32_t text = t.create("RedirText", WS_POPUP | WS_VISIBLE, 700, 500, 100, 100, 0, 0, "Text");
+  pump();
+  user::inject_mouse_move(750, 550);
+  desktop::IWindowsSession::Pointer ptr;
+  bridge.pointer(&ptr);
+  uint32_t system_id = 0, pw = 0, ph = 0;
+  int32_t hx = 0, hy = 0;
+  List<uint32_t> argb(*system_allocator());
+  CHECK(!ptr.hidden && ptr.cursor == ibeam && bridge.cursor_picture(ptr.cursor, &system_id, &argb, &pw, &ph, &hx, &hy) && system_id == 32513 && argb.count() == 0);
+  t.svc(N::NtUserSetCursor, {0});
+  bridge.pointer(&ptr);
+  CHECK(ptr.hidden);
+  user::inject_mouse_move(10, 760);      // (over nothing of the program's)
+  user::inject_mouse_move(760, 560);     // back in: the class cursor again
+  bridge.pointer(&ptr);
+  CHECK(!ptr.hidden && ptr.cursor == ibeam);
+  CHECK(t.svc(N::NtUserShowCursor, {0}) == uint64_t(uint32_t(-1)));
+  bridge.pointer(&ptr);
+  CHECK(ptr.hidden);
+  t.svc(N::NtUserShowCursor, {1});
+  // a cursor of the program's own: its picture with straight alpha and the hot spot
+  {
+    const uint32_t px[4] = {0x80FF0000u, 0xFF00FF00u, 0x000000FFu, 0xFFFFFFFFu};
+    const uint32_t color = gdi::create_bitmap(91, 2, 2, ArrayView<const uint32_t>(px, 4));
+    const uint32_t mine = user_misc::create_cursor_icon(91, false);
+    const uint64_t data = t.tmp(0x1000), frame = t.tmp(0x1100);
+    for (uint64_t i = 0; i < 48; ++i) t.mem().put8(data + i, 0);
+    for (uint64_t i = 0; i < 40; ++i) t.mem().put8(frame + i, 0);
+    t.mem().put32(data + 8, 1);         // one frame
+    t.mem().put64(data + 16, frame);
+    t.mem().put32(frame, 2);
+    t.mem().put32(frame + 4, 2);
+    t.mem().put64(frame + 8, color);
+    t.mem().put32(frame + 32, 1);       // hot spot (1, 0)
+    CHECK(color != 0 && mine != 0 && t.svc32(N::NtUserSetCursorIconData, {mine, 0, 0, data}) != 0);
+    t.svc(N::NtUserSetCursor, {mine});
+    bridge.pointer(&ptr);
+    CHECK(ptr.cursor == mine && bridge.cursor_picture(mine, &system_id, &argb, &pw, &ph, &hx, &hy) && system_id == 0 && pw == 2 && ph == 2 && hx == 1 && hy == 0);
+    CHECK(argb.count() == 4 && argb[0] == px[0] && argb[1] == px[1] && argb[2] == px[2] && argb[3] == px[3]);
+  }
+
+  // a GPU picture of another size is stretched over the client area
+  {
+    const uint8_t picture[16] = {0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255};      // B, G, R, A: red, green / blue, white
+    const Rc c = t.client_rect(a);
+    CHECK(user::present_to_window_locked(a, ConstByteView(picture, 16), 2, 2, 8, false));
+    CHECK(pixel(a, 0, 0) == 0xFF0000 && pixel(a, c.r - 1, 0) == 0x00FF00 && pixel(a, 0, c.b - 1) == 0x0000FF && pixel(a, c.r - 1, c.b - 1) == 0xFFFFFF);
+    CHECK(pixel(a, c.r / 2 - 1, c.b / 2 - 1) == 0xFF0000 && pixel(a, (c.r + 1) / 2, (c.b + 1) / 2) == 0xFFFFFF);
+    CHECK(!user::present_to_window_locked(0x7777, ConstByteView(picture, 16), 2, 2, 8, false));      // (not a window: the caller shows it on the display)
+  }
+
+  // two monitors: the programs see both; a window maximizes on the one it is on
+  {
+    const desktop::IWindowsSession::Monitor two[2] = {{{0, 0, 512, 768}, {0, 0, 512, 740}}, {{512, 0, 512, 768}, {512, 0, 512, 768}}};
+    bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(two, 2));
+    const uint32_t second = user_misc::monitor_from_point(600, 10, 0);
+    CHECK(second != 0 && second != user_misc::monitor_from_point(10, 10, 0) && user_misc::monitor_from_point(5000, 10, 0) == 0);
+    CHECK(user_misc::monitor_from_point(5000, 10, 2) == second);      // (the nearest)
+    const gdi::Rect r2 = user_misc::monitor_rect(second, false);
+    CHECK(r2.left == 512 && r2.right == 1024 && user_misc::monitor_from_rect(gdi::Rect{400, 0, 700, 100}, 0) == second);      // (most of it)
+    bridge.move_window(a, desktop::WindowsRect{600, 100, 300, 200});
+    pump();
+    bridge.window_command(a, desktop::IWindowsSession::Command::Maximize);
+    pump();
+    CHECK(bridge.window_info(a, &info, nullptr) && info.maximized && info.window.x == 512 && info.window.width == 512 && info.window.height == 768);
+    bridge.window_command(a, desktop::IWindowsSession::Command::Restore);
+    pump();
+    bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+    CHECK(user_misc::monitor_from_point(600, 10, 0) == user_misc::monitor_from_point(10, 10, 0));
+  }
+  (void)text;
+
   // close asks the program (DefWindowProc destroys it)
   bridge.take_changes(&changed, &repainted);
   bridge.window_command(b, desktop::IWindowsSession::Command::Close);

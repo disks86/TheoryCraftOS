@@ -142,6 +142,26 @@ bool Control::move_child_to_front(Control* child) {
   return false;
 }
 
+bool Control::move_child_next_to(Control* child, Control* anchor, bool above) {
+  UiGuard lock(this);
+  const uint64_t n = children_.count();
+  uint64_t from = n, at = n;
+  for (uint64_t i = 0; i < n; ++i) {
+    if (children_[i] == child) from = i;
+    if (children_[i] == anchor) at = i;
+  }
+  if (from == n || at == n || child == anchor) return false;
+  // where it goes, counted in the list without it
+  uint64_t to = above ? at + 1 : at;
+  if (from < to) --to;
+  if (to == from) return true;
+  if (from < to) for (uint64_t j = from; j < to; ++j) children_[j] = children_[j + 1];
+  else for (uint64_t j = from; j > to; --j) children_[j] = children_[j - 1];
+  children_[to] = child;
+  invalidate();
+  return true;
+}
+
 Point Control::window_origin() const {
   // Everything up to, but not including, the root (the window itself or a popup, whose bounds are
   // already window coordinates).

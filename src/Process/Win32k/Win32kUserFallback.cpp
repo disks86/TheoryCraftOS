@@ -138,6 +138,14 @@ TCOS_WEAK void window_destroyed(uint32_t hwnd) { (void)hwnd; }
 TCOS_WEAK bool attach_window_menu(uint32_t hwnd, uint32_t menu) { (void)hwnd; (void)menu; return false; }
 TCOS_WEAK void raw_input_event(uint32_t type, bool injected, ConstByteView data) { (void)type; (void)injected; (void)data; }
 TCOS_WEAK bool raw_input_no_legacy(uint64_t pid, uint32_t type) { (void)pid; (void)type; return false; }
+TCOS_WEAK int32_t cursor_show_count() { return 0; }
+TCOS_WEAK bool thread_cursor(uint64_t tid, uint32_t* cursor) { (void)tid; (void)cursor; return false; }
+TCOS_WEAK void cursor_entered_window(uint64_t tid) { (void)tid; }
+TCOS_WEAK bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) {
+  (void)cursor; (void)argb; (void)width; (void)height; (void)hot_x; (void)hot_y;
+  *system_id = 32512;
+  return true;
+}
 
 }  // namespace user_misc
 

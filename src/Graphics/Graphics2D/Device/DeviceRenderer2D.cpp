@@ -720,11 +720,10 @@ void DeviceRenderer2D::draw_image(const Surface& s, const Rect2D& rect, int32_t 
 }
 
 void DeviceRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_t color) {
-  for (; *text; ++text, x += static_cast<int32_t>(hardware::Font8x16::kWidth)) {
-    const ConstByteView glyph = hardware::Font8x16::glyph(*text);
+  for (char32_t c = hardware::utf8_next(text); c != 0; c = hardware::utf8_next(text), x += static_cast<int32_t>(hardware::Font8x16::kWidth)) {      // (UTF-8)
     // The set pixels as rectangles: a run of a row, taller while the rows below have the same pixels set (a stem is one rectangle, not one a row). The pixels covered are the glyph's.
     uint8_t rows[hardware::Font8x16::kHeight];
-    for (uint32_t j = 0; j < hardware::Font8x16::kHeight; ++j) rows[j] = glyph[j];
+    hardware::Font8x16::glyph_of(c, rows);
     for (uint32_t j = 0; j < hardware::Font8x16::kHeight; ++j) {
       uint32_t i = 0;
       while (i < hardware::Font8x16::kWidth) {

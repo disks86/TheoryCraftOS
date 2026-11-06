@@ -112,7 +112,7 @@ class IRenderer2D {
   virtual void fill_triangle(Vec2 a, Vec2 b, Vec2 c, uint32_t color) = 0;
   // Copies `source_rect` of `source` (0xAARRGGBB through source.decode) with its top left at (x, y).
   virtual void draw_image(const Surface& source, const Rect2D& source_rect, int32_t x, int32_t y) = 0;
-  // Fixed 8x16 font, no wrapping; '\n' is not interpreted. Background pixels are left alone.
+  // Fixed 8x16 font, UTF-8 text (the characters Font8x16::glyph_of has; others show as '?'), no wrapping; '\n' is not interpreted. Background pixels are left alone.
   virtual void draw_text(int32_t x, int32_t y, const char* text, uint32_t color) = 0;
 
   // ---- Pixel-engine primitives -------------------------------------------------------------------------
