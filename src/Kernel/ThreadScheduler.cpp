@@ -102,6 +102,7 @@ struct Scheduler {
   // What placement knows of each core (CPUScheduler/IoAffinity.hpp). `idle` is cleared as soon as a thread is sent to the core, so that the
   // next thread made ready goes to another idle core; it is set again whenever the core switches to its idle thread.
   scheduling::CorePlace places[kMaxCores];
+  scheduling::NumaDistances numa;   // (all 0, "not known", until set_numa_distance)
   // Interrupt steering (set_io_device_retarget), by device id: the driver's callback, the tally of where woken threads run, and a move the
   // balancer thread is to make (-1: none). The balancer sleeps on balancer_wait until a decision is made.
   struct Steering {
@@ -422,9 +423,9 @@ void ready_locked(Thread* t) {
   t->wake_core = -1;
   const scheduling::PlacementHints hints = hints_of(t);
   const scheduling::CoreSet allowed = allowed_cores(t);
-  const int32_t target = scheduling::choose_wake_core(hints, allowed, places());
+  const int32_t target = scheduling::choose_wake_core(hints, allowed, places(), &g.numa);
   if (target < 0) {
-    int32_t core = scheduling::choose_queue_core(hints, allowed, places(), ArrayView<const uint32_t>(g.queue_lengths, g.core_count));
+    int32_t core = scheduling::choose_queue_core(hints, allowed, places(), ArrayView<const uint32_t>(g.queue_lengths, g.core_count), &g.numa);
     if (core < 0) core = static_cast<int32_t>(g.running ? this_core()->index : g.boot_core);   // (no allowed core online: any core may still take it)
     queue_on_locked(t, static_cast<uint32_t>(core));
     return;
@@ -1171,13 +1172,15 @@ bool set_io_device_core(int32_t device, int32_t core) { return g_devices.set_int
 
 bool io_device_info(int32_t device, scheduling::IoDeviceInfo* out) { return out && g_devices.info(device, out); }
 
-uint32_t choose_io_interrupt_core(int8_t kind) {
+bool set_io_device_node(int32_t device, int64_t node) { return g_devices.set_numa_node(device, node); }
+
+uint32_t choose_io_interrupt_core(int8_t kind, int64_t node) {
   if (!g.running) return 0;
   uint32_t per_core[kMaxCores];
   g_devices.devices_per_core(ArrayView<uint32_t>(per_core, g.core_count));
   const uint64_t flags = lock_irq();
   const int32_t core = scheduling::choose_interrupt_core(places(), ArrayView<const uint32_t>(per_core, g.core_count), scheduling::CoreSet::all(), kind,
-                                                         static_cast<int32_t>(g.boot_core));
+                                                         static_cast<int32_t>(g.boot_core), node);
   unlock_irq(flags);
   return core < 0 ? g.boot_core : static_cast<uint32_t>(core);
 }
@@ -1193,6 +1196,14 @@ bool set_core_numa_node(uint32_t core, uint32_t node) {
   if (!g.running || core >= g.core_count || !g.cores[core].online) return false;
   const uint64_t flags = lock_irq();
   g.places[core].numa_node = node;
+  unlock_irq(flags);
+  return true;
+}
+
+bool set_numa_distance(uint32_t from, uint32_t to, uint8_t distance) {
+  if (from >= scheduling::NumaDistances::kMaxNodes || to >= scheduling::NumaDistances::kMaxNodes) return false;
+  const uint64_t flags = lock_irq();
+  g.numa.distance[from][to] = distance;
   unlock_irq(flags);
   return true;
 }

@@ -37,47 +37,66 @@ uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<c
   return score;
 }
 
-int32_t choose_wake_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores) {
+namespace {
+// How far `core` is from the node the hints point at (their device's core, else their last core); 0 when they point nowhere.
+uint32_t node_distance(const PlacementHints& hints, uint32_t core, ArrayView<const CorePlace> cores, const NumaDistances* distances) {
+  const int32_t anchor = hints.io_core != kNoCore ? hints.io_core : hints.last_core;
+  CorePlace from, to;
+  if (anchor < 0 || !cores.try_get(static_cast<uint64_t>(anchor), &from) || !cores.try_get(core, &to)) return 0;
+  return distances ? distances->between(from.numa_node, to.numa_node) : NumaDistances().between(from.numa_node, to.numa_node);
+}
+}  // namespace
+
+int32_t choose_wake_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, const NumaDistances* distances) {
   int32_t best = kNoCore;
-  uint32_t best_score = 0;
+  uint32_t best_score = 0, best_distance = 0;
   for (uint32_t i = 0; i < cores.size() && i < kMaxPlacementCores; ++i) {
     const CorePlace& place = cores[i];
     if (!place.online || !place.idle || !allowed.has(i)) continue;
     const uint32_t score = placement_score(hints, i, cores);
-    if (best == kNoCore || score > best_score) {
+    const uint32_t distance = node_distance(hints, i, cores, distances);
+    if (best == kNoCore || score > best_score || (score == best_score && distance < best_distance)) {
       best = static_cast<int32_t>(i);
       best_score = score;
+      best_distance = distance;
     }
   }
   return best;
 }
 
-int32_t choose_queue_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, ArrayView<const uint32_t> queued) {
+int32_t choose_queue_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, ArrayView<const uint32_t> queued,
+                          const NumaDistances* distances) {
   int32_t best = kNoCore, shortest = kNoCore;
-  uint32_t best_score = 0, best_length = 0, shortest_length = 0;
+  uint32_t best_score = 0, best_length = 0, best_distance = 0, shortest_length = 0, shortest_distance = 0;
   for (uint32_t i = 0; i < cores.size() && i < kMaxPlacementCores; ++i) {
     if (!cores[i].online || !allowed.has(i)) continue;
     uint32_t length = 0;
     queued.try_get(i, &length);
     const uint32_t score = placement_score(hints, i, cores);
-    if (best == kNoCore || score > best_score || (score == best_score && length < best_length)) {
+    const uint32_t distance = node_distance(hints, i, cores, distances);
+    if (best == kNoCore || score > best_score || (score == best_score && (length < best_length || (length == best_length && distance < best_distance)))) {
       best = static_cast<int32_t>(i);
       best_score = score;
       best_length = length;
+      best_distance = distance;
     }
-    if (shortest == kNoCore || length < shortest_length) {
+    if (shortest == kNoCore || length < shortest_length || (length == shortest_length && distance < shortest_distance)) {
       shortest = static_cast<int32_t>(i);
       shortest_length = length;
+      shortest_distance = distance;
     }
   }
   return best != kNoCore && best_length > shortest_length + kQueueImbalance ? shortest : best;
 }
 
 int32_t choose_interrupt_core(ArrayView<const CorePlace> cores, ArrayView<const uint32_t> devices_per_core, const CoreSet& allowed, int8_t kind,
-                              int32_t avoid) {
-  // Passes, most wanted first: the kind and not `avoid`, the kind, any kind and not `avoid`, anything online.
-  for (uint32_t pass = 0; pass < 4; ++pass) {
-    const bool match_kind = pass < 2 && kind >= 0;
+                              int32_t avoid, int64_t node) {
+  // Passes, most wanted first: the kind and not `avoid`, the kind, any kind and not `avoid`, anything online; all of them on the device's node
+  // first when it has one.
+  for (uint32_t pass = 0; pass < 8; ++pass) {
+    const bool match_node = pass < 4;
+    if (match_node && node < 0) continue;
+    const bool match_kind = pass % 4 < 2 && kind >= 0;
     const bool skip_avoid = pass % 2 == 0;
     int32_t best = kNoCore;
     uint32_t best_load = 0;
@@ -85,6 +104,7 @@ int32_t choose_interrupt_core(ArrayView<const CorePlace> cores, ArrayView<const 
       const CorePlace& place = cores[i];
       if (!place.online || !allowed.has(i)) continue;
       if (match_kind && place.kind != kind) continue;
+      if (match_node && place.numa_node != node) continue;
       if (skip_avoid && static_cast<int32_t>(i) == avoid) continue;
       uint32_t load = 0;
       devices_per_core.try_get(i, &load);
@@ -134,6 +154,7 @@ int32_t IoDeviceTable::add(StringView name, int32_t interrupt_core) {
     for (uint64_t c = 0; c < length; ++c) words[c / 8] |= uint64_t{static_cast<uint8_t>(name[c])} << (c % 8 * 8);
     for (uint32_t w = 0; w < kNameWords; ++w) __atomic_store_n(&slot.name[w], words[w], __ATOMIC_RELEASE);
     __atomic_store_n(&slot.core, interrupt_core, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot.node, int64_t{-1}, __ATOMIC_RELEASE);
     __atomic_store_n(&slot.interrupts, uint64_t{0}, __ATOMIC_RELEASE);
     __atomic_store_n(&slot.wakes, uint64_t{0}, __ATOMIC_RELEASE);
     __atomic_store_n(&slot.sequence, sequence + 2, __ATOMIC_RELEASE);
@@ -164,6 +185,18 @@ bool IoDeviceTable::set_interrupt_core(int32_t id, int32_t core) {
   return true;
 }
 
+bool IoDeviceTable::set_numa_node(int32_t id, int64_t node) {
+  Slot* slot = live_slot(id);
+  if (!slot) return false;
+  __atomic_store_n(&slot->node, node, __ATOMIC_RELEASE);
+  return true;
+}
+
+int64_t IoDeviceTable::numa_node(int32_t id) const {
+  const Slot* slot = live_slot(id);
+  return slot ? __atomic_load_n(&slot->node, __ATOMIC_ACQUIRE) : -1;
+}
+
 int32_t IoDeviceTable::interrupt_core(int32_t id) const {
   const Slot* slot = live_slot(id);
   return slot ? __atomic_load_n(&slot->core, __ATOMIC_ACQUIRE) : kNoCore;
@@ -190,12 +223,14 @@ bool IoDeviceTable::info(int32_t id, IoDeviceInfo* out) const {
     // (acquire: the second read of the count cannot move above these)
     for (uint32_t w = 0; w < kNameWords; ++w) words[w] = __atomic_load_n(&slot.name[w], __ATOMIC_ACQUIRE);
     const int32_t core = __atomic_load_n(&slot.core, __ATOMIC_ACQUIRE);
+    const int64_t node = __atomic_load_n(&slot.node, __ATOMIC_ACQUIRE);
     const uint64_t interrupts = __atomic_load_n(&slot.interrupts, __ATOMIC_ACQUIRE);
     const uint64_t wakes = __atomic_load_n(&slot.wakes, __ATOMIC_ACQUIRE);
     if (__atomic_load_n(&slot.sequence, __ATOMIC_RELAXED) != before) continue;
     for (uint32_t c = 0; c < sizeof out->name; ++c) out->name[c] = c / 8 < kNameWords ? static_cast<char>(words[c / 8] >> (c % 8 * 8)) : 0;
     out->name[sizeof out->name - 1] = 0;
     out->interrupt_core = core;
+    out->numa_node = node;
     out->interrupts = interrupts;
     out->wakes = wakes;
     return true;

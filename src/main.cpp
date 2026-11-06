@@ -142,7 +142,7 @@
 #include "Network/Tls/CaBundle.hpp"
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
-#include "Hardware/Acpi/Srat.hpp"
+#include "Kernel/Numa.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Acpi/SystemAcpiPorts.hpp"
 #include "Hardware/Acpi/AcpiEvents.hpp"
@@ -717,21 +717,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // From here on the OS is preemptively multithreaded on every core.
   if (kernel::start(cpu, shared_allocator)) {
     Entry(Level::Ok, "Kernel").text("preemptive threads on ").dec(kernel::core_count()).text(" cores");
-    // NUMA: the SRAT's processor entries put each core in its node, so placement keeps a device's work on its node (kernel::set_core_numa_node).
+    // NUMA: the SRAT puts each core in its node and the SLIT says how far apart the nodes are, so placement keeps a device's work near it.
     if (paging_ok) {
       hardware::AcpiTables numa_tables(st);
-      const ConstByteView srat = numa_tables.initialize() ? numa_tables.find("SRAT") : ConstByteView();
-      hardware::SratCpu numa_cpus[256];
-      const uint32_t listed = hardware::srat_cpus(srat, ArrayView<hardware::SratCpu>(numa_cpus, 256));
-      uint32_t placed = 0, highest_node = 0;
-      for (const hardware::SratCpu& c : ArrayView<const hardware::SratCpu>(numa_cpus, listed < 256 ? listed : 256)) {
-        if (c.kind == hardware::SratCpuId::Gicc) continue;   // (an ACPI processor UID, not what addresses the core)
-        const int32_t core = kernel::core_from_hardware_id(c.id);
-        if (core < 0 || !kernel::set_core_numa_node(static_cast<uint32_t>(core), c.node)) continue;
-        ++placed;
-        if (c.node > highest_node) highest_node = c.node;
+      if (numa_tables.initialize()) {
+        const kernel::NumaSummary numa = kernel::apply_acpi_numa(numa_tables.find("SRAT"), numa_tables.find("SLIT"), numa_tables.find("APIC"));
+        if (numa.cores) Entry(Level::Info, "Kernel").text("NUMA: ").dec(numa.cores).text(" core(s) in ").dec(numa.nodes).text(" node(s) (SRAT), ").dec(numa.distances).text(" distance(s) (SLIT)");
       }
-      if (placed) Entry(Level::Info, "Kernel").text("NUMA: ").dec(placed).text(" core(s) in ").dec(highest_node + 1).text(" node(s) (SRAT)");
     }
     // The virtio-gpu's commands finish with an interrupt now (the host takes milliseconds for some; a thread waiting for one need not look again and again).
     if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) {
@@ -1992,6 +1984,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     uint32_t thunderbolt_wakes_seen = 0;
     if (thunderbolt && acpi_events) {
       acpi::Node* controller = acpi_events->find_pci_device(pci, thunderbolt_address);
+      uint32_t thunderbolt_node = 0;
+      if (thunderbolt_io_device >= 0 && controller && acpi_events->proximity_domain(controller, &thunderbolt_node))   // (its node, for where its interrupt may go)
+        kernel::set_io_device_node(thunderbolt_io_device, thunderbolt_node);
       thunderbolt_wake.events = acpi_events.get();
       thunderbolt_wake.controller = controller;
       acpi_events->set_listener(&thunderbolt_wake);

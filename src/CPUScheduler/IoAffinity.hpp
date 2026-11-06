@@ -119,24 +119,38 @@ struct InterruptSteering {
 // the same NUMA node (memory the device wrote by DMA, and the thread's own, are nearer there).
 constexpr uint32_t kScoreKind = 16, kScoreIoCore = 8, kScoreLastCore = 4, kScoreCacheDomain = 2, kScoreNumaNode = 1;
 
+// Relative distances between NUMA nodes (the ACPI SLIT: 10 local, larger farther), for the first kMaxNodes nodes. 0 means not known: then a
+// node is 10 from itself and 20 from any other, as ACPI says to assume without a SLIT.
+struct NumaDistances {
+  static constexpr uint32_t kMaxNodes = 16;
+  uint8_t distance[kMaxNodes][kMaxNodes] = {};
+  uint8_t between(uint32_t from, uint32_t to) const {
+    const uint8_t known = from < kMaxNodes && to < kMaxNodes ? distance[from][to] : 0;
+    return known ? known : (from == to ? 10 : 20);
+  }
+};
+
 // How well `core` suits a thread with these hints. 0 for a core out of range.
 uint32_t placement_score(const PlacementHints& hints, uint32_t core, ArrayView<const CorePlace> cores);
 
-// The idle core a thread that has just become ready should be started on: online, idle, in `allowed`, with the best placement_score (the lowest
-// index on a tie). kNoCore when no allowed core is idle (the thread then waits for a core to give up its current thread).
-int32_t choose_wake_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores);
+// The idle core a thread that has just become ready should be started on: online, idle, in `allowed`, with the best placement_score; on a tie
+// the core whose node is nearest the node of the thread's device (or last) core, by `distances` when given, then the lowest index. kNoCore
+// when no allowed core is idle (the thread then waits for a core to give up its current thread).
+int32_t choose_wake_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores,
+                         const NumaDistances* distances = nullptr);
 
 // The core whose run queue a ready thread joins when no allowed core is idle: the online allowed core with the best placement_score (the shorter
-// queue, `queued[i]`, among equals, then the lower index), unless that queue is more than kQueueImbalance longer than the shortest allowed one,
-// which then gets the thread instead (so one popular device does not pile every thread onto its core). kNoCore if no allowed core is online.
+// queue, `queued[i]`, among equals, then the nearer node as for choose_wake_core, then the lower index), unless that queue is more than kQueueImbalance longer than the shortest allowed one,
+// which then gets the thread instead (the nearest node among equally short ones), so one popular device does not pile every thread onto its core. kNoCore if no allowed core is online.
 constexpr uint32_t kQueueImbalance = 2;
-int32_t choose_queue_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, ArrayView<const uint32_t> queued);
+int32_t choose_queue_core(const PlacementHints& hints, const CoreSet& allowed, ArrayView<const CorePlace> cores, ArrayView<const uint32_t> queued,
+                          const NumaDistances* distances = nullptr);
 
 // The core a new device's interrupt should be sent to: an online core in `allowed`, of `kind` if one is online (-1: any kind), carrying the fewest
 // device interrupts already (`devices_per_core[i]`, missing entries count as 0), not `avoid` unless no other core qualifies, the lowest index on a
-// tie. kNoCore if no core is online.
+// tie; on the device's NUMA `node` (-1: none) before any other node. kNoCore if no core is online.
 int32_t choose_interrupt_core(ArrayView<const CorePlace> cores, ArrayView<const uint32_t> devices_per_core, const CoreSet& allowed, int8_t kind,
-                              int32_t avoid);
+                              int32_t avoid, int64_t node = -1);
 
 // The last-level cache domain of an x86 core: CPUID leaf 4 (or 0x8000001D on AMD) says how many logical processors share a cache (`sharing`, the
 // field plus one); they have the same APIC id once the bits that number them are dropped.
@@ -145,6 +159,7 @@ uint32_t cache_domain_from_apic_id(uint32_t apic_id, uint32_t sharing);
 struct IoDeviceInfo {
   char name[24] = {};
   int32_t interrupt_core = kNoCore;
+  int64_t numa_node = -1;    // the device's own node (ACPI _PXM), or -1
   uint64_t interrupts = 0;   // interrupts the device raised (that went through a handler set with set_device_interrupt_handler)
   uint64_t wakes = 0;        // threads those interrupts made ready
 };
@@ -165,6 +180,9 @@ class IoDeviceTable {
   // Frees the slot. False if `id` is not a live device.
   bool remove(int32_t id);
   bool set_interrupt_core(int32_t id, int32_t core);
+  // The device's NUMA node (-1: none, as after add()).
+  bool set_numa_node(int32_t id, int64_t node);
+  int64_t numa_node(int32_t id) const;
   // kNoCore for an id that is not a live device.
   int32_t interrupt_core(int32_t id) const;
   void note_interrupt(int32_t id);
@@ -182,6 +200,7 @@ class IoDeviceTable {
     uint32_t sequence = 0;            // odd while the slot is being set up or torn down
     uint64_t name[kNameWords] = {};   // the name, 8 characters a word, little end first
     int32_t core = kNoCore;
+    int64_t node = -1;
     uint64_t interrupts = 0;
     uint64_t wakes = 0;
   };
