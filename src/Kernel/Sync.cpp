@@ -19,6 +19,8 @@
 #include "Kernel/Sync.hpp"
 #include "Kernel/Delay.hpp"
 
+// Each object's wait list carries its own lock, which also guards the object's state; blocking and waking follow docs/SchedulerLocking.md:
+// check under the list lock, prepare_wait, unlock, yield, finish_wait.
 namespace kernel {
 
 namespace {
@@ -47,18 +49,19 @@ void Mutex::lock() {
     return;
   }
   for (;;) {
-    const uint64_t flags = detail::lock();
+    const uint64_t flags = detail::lock_list(&list_);
     // Announce the wait before the last attempt: an unlock that follows a failed
     // attempt then always sees us and wakes someone (no lost wakeup).
     __atomic_add_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);
     if (try_lock()) {
       __atomic_sub_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);
-      detail::unlock(flags);
+      detail::unlock_list(&list_, flags);
       return;
     }
-    detail::block_current_locked(&list_, 0);
-    detail::unlock(flags);
+    detail::prepare_wait(&list_, 0);
+    detail::unlock_list(&list_, flags);
     yield();
+    detail::finish_wait(&list_);
     __atomic_sub_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);
   }
 }
@@ -66,18 +69,18 @@ void Mutex::lock() {
 void Mutex::unlock() {
   __atomic_exchange_n(&state_, 0, __ATOMIC_SEQ_CST);
   if (__atomic_load_n(&waiters_, __ATOMIC_SEQ_CST) == 0) return;
-  const uint64_t flags = detail::lock();
-  detail::wake_one_locked(&list_);
-  detail::unlock(flags);
+  const uint64_t flags = detail::lock_list(&list_);
+  detail::wake_one(&list_);
+  detail::unlock_list(&list_, flags);
 }
 
 // ---------------------------------------------------------------- Semaphore
 
 bool Semaphore::try_acquire() {
-  const uint64_t flags = detail::lock();
+  const uint64_t flags = detail::lock_list(&list_);
   const bool ok = count_ > 0;
   if (ok) --count_;
-  detail::unlock(flags);
+  detail::unlock_list(&list_, flags);
   return ok;
 }
 
@@ -88,10 +91,10 @@ bool Semaphore::acquire_for(uint64_t timeout_us) {
   }
   const uint64_t deadline = timeout_us ? deadline_tsc(timeout_us) : 0;
   for (;;) {
-    const uint64_t flags = detail::lock();
+    const uint64_t flags = detail::lock_list(&list_);
     if (count_ > 0) {
       --count_;
-      detail::unlock(flags);
+      detail::unlock_list(&list_, flags);
       return true;
     }
     uint64_t remaining = 0;
@@ -99,37 +102,38 @@ bool Semaphore::acquire_for(uint64_t timeout_us) {
       bool expired;
       remaining = microseconds_until(deadline, &expired);
       if (expired) {
-        detail::unlock(flags);
+        detail::unlock_list(&list_, flags);
         return false;
       }
     }
-    detail::block_current_locked(&list_, remaining);
-    detail::unlock(flags);
+    detail::prepare_wait(&list_, remaining);
+    detail::unlock_list(&list_, flags);
     yield();
+    detail::finish_wait(&list_);
   }
 }
 
 void Semaphore::acquire() { acquire_for(0); }
 
 void Semaphore::release(uint32_t count) {
-  const uint64_t flags = detail::lock();
+  const uint64_t flags = detail::lock_list(&list_);
   count_ += count;
   for (uint32_t i = 0; i < count; ++i)
-    if (!detail::wake_one_locked(&list_)) break;
-  detail::unlock(flags);
+    if (!detail::wake_one(&list_)) break;
+  detail::unlock_list(&list_, flags);
 }
 
 // ---------------------------------------------------------------- Event
 
 void Event::set() {
-  const uint64_t flags = detail::lock();
+  const uint64_t flags = detail::lock_list(&list_);
   if (auto_reset_) {
-    if (!detail::wake_one_locked(&list_)) __atomic_store_n(&signaled_, true, __ATOMIC_RELEASE);
+    if (!detail::wake_one(&list_)) __atomic_store_n(&signaled_, true, __ATOMIC_RELEASE);
   } else {
     __atomic_store_n(&signaled_, true, __ATOMIC_RELEASE);
-    detail::wake_all_locked(&list_);
+    detail::wake_all(&list_);
   }
-  detail::unlock(flags);
+  detail::unlock_list(&list_, flags);
 }
 
 void Event::reset() { __atomic_store_n(&signaled_, false, __ATOMIC_RELEASE); }
@@ -142,10 +146,10 @@ bool Event::wait(uint64_t timeout_us) {
   }
   const uint64_t deadline = timeout_us ? deadline_tsc(timeout_us) : 0;
   for (;;) {
-    const uint64_t flags = detail::lock();
+    const uint64_t flags = detail::lock_list(&list_);
     if (signaled_) {
       if (auto_reset_) signaled_ = false;
-      detail::unlock(flags);
+      detail::unlock_list(&list_, flags);
       return true;
     }
     uint64_t remaining = 0;
@@ -153,44 +157,49 @@ bool Event::wait(uint64_t timeout_us) {
       bool expired;
       remaining = microseconds_until(deadline, &expired);
       if (expired) {
-        detail::unlock(flags);
+        detail::unlock_list(&list_, flags);
         return false;
       }
     }
-    detail::block_current_locked(&list_, remaining);
-    detail::unlock(flags);
+    detail::prepare_wait(&list_, remaining);
+    detail::unlock_list(&list_, flags);
     yield();
-    // An auto-reset set() that found us waiting consumed itself on our behalf.
-    if (auto_reset_ && !current_thread()->timed_out) return true;
+    // An auto-reset set() that found us waiting consumed itself on our behalf (a set() that came after our timeout passed us over).
+    if (!detail::finish_wait(&list_) && auto_reset_) return true;
   }
 }
 
 // ---------------------------------------------------------------- ConditionVariable
 
 bool ConditionVariable::wait(Mutex& mutex, uint64_t timeout_us) {
-  const uint64_t flags = detail::lock();
-  detail::block_current_locked(&list_, timeout_us);  // enqueued before the mutex is released: no missed notify
-  // The mutex is let go while the scheduler's lock is still held (interrupts are off): a thread that is marked blocked but has not given up the mutex yet must not be
-  // switched away from, or the mutex would stay held until somebody wakes it - and the ones that would wake it may be waiting for that mutex.
+  const uint64_t flags = detail::lock_list(&list_);
+  detail::prepare_wait(&list_, timeout_us);  // enqueued before the mutex is released: no missed notify
+  // The mutex is let go while this list's lock is still held (interrupts are off): a thread that is marked blocked but has not given up the mutex
+  // yet must not be switched away from, or the mutex would stay held until somebody wakes it - and the ones that would wake it may be waiting for
+  // that mutex. (The mutex's list lock after this one's: the one place two wait-list locks are held, always in this order.)
   __atomic_exchange_n(&mutex.state_, 0, __ATOMIC_SEQ_CST);
-  if (__atomic_load_n(&mutex.waiters_, __ATOMIC_SEQ_CST) != 0) detail::wake_one_locked(&mutex.list_);
-  detail::unlock(flags);
+  if (__atomic_load_n(&mutex.waiters_, __ATOMIC_SEQ_CST) != 0) {
+    const uint64_t inner = detail::lock_list(&mutex.list_);
+    detail::wake_one(&mutex.list_);
+    detail::unlock_list(&mutex.list_, inner);
+  }
+  detail::unlock_list(&list_, flags);
   yield();
-  const bool timed_out = current_thread()->timed_out;
+  const bool timed_out = detail::finish_wait(&list_);
   mutex.lock();
   return !timed_out;
 }
 
 void ConditionVariable::notify_one() {
-  const uint64_t flags = detail::lock();
-  detail::wake_one_locked(&list_);
-  detail::unlock(flags);
+  const uint64_t flags = detail::lock_list(&list_);
+  detail::wake_one(&list_);
+  detail::unlock_list(&list_, flags);
 }
 
 void ConditionVariable::notify_all() {
-  const uint64_t flags = detail::lock();
-  detail::wake_all_locked(&list_);
-  detail::unlock(flags);
+  const uint64_t flags = detail::lock_list(&list_);
+  detail::wake_all(&list_);
+  detail::unlock_list(&list_, flags);
 }
 
 }  // namespace kernel

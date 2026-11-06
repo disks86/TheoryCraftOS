@@ -21,9 +21,10 @@
 namespace scheduling {
 
 Scheduler::Scheduler(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& allocator)
-    : cpu_(cpu), lock_(cpu), high_(allocator), efficiency_(allocator), allocator_(allocator) {
+    : cpu_(cpu), lock_(cpu), high_(allocator), efficiency_(allocator), started_(allocator), allocator_(allocator) {
   high_.reserve(kInitialCapacity);  // best effort: the queues also grow on demand
   efficiency_.reserve(kInitialCapacity);
+  started_.reserve(kInitialCapacity);   // (so that starting tasks does not allocate either)
 }
 
 bool Scheduler::submit(TaskFunction fn, void* context, TaskQueue queue, int32_t io_device) {
@@ -63,7 +64,12 @@ bool Scheduler::run_next() {
       const hardware::CoreKind preferred = high ? hardware::CoreKind::Performance : hardware::CoreKind::Efficiency;
       kernel::Thread* thread = kernel::spawn(job_main, job, "task", -1, static_cast<int8_t>(preferred), kernel::kDefaultStackBytes, task.io_device);
       if (thread) {
-        kernel::detach(thread);
+        bool kept;
+        {
+          ScopedLock guard(lock_);
+          kept = started_.enqueue(thread);
+        }
+        if (!kept) kernel::detach(thread);   // (no memory to keep it: it frees itself, and run() may then return before it is gone)
         return true;
       }
       __atomic_sub_fetch(&active_, 1, __ATOMIC_SEQ_CST);
@@ -79,6 +85,25 @@ uint64_t Scheduler::pending() const {
   return high_.count() + efficiency_.count();
 }
 
+// Joins the task threads started so far: all of them (each is finishing or finished, waited for), or only those already finished.
+void Scheduler::join_started(bool finished_only) {
+  uint64_t left;
+  {
+    ScopedLock guard(lock_);
+    left = started_.count();
+  }
+  for (; left > 0; --left) {
+    kernel::Thread* thread = nullptr;
+    {
+      ScopedLock guard(lock_);
+      if (!started_.dequeue(&thread)) return;
+    }
+    if (kernel::join(thread, finished_only ? 1 : 0)) continue;
+    ScopedLock guard(lock_);
+    if (!started_.enqueue(thread)) kernel::detach(thread);   // (still running: kept for later)
+  }
+}
+
 void Scheduler::run() {
   // Running tasks may submit more work, so only stop once nothing is queued
   // and no task thread is still executing.
@@ -86,7 +111,10 @@ void Scheduler::run() {
     if (run_next()) continue;
     if (__atomic_load_n(&active_, __ATOMIC_SEQ_CST) == 0) {
       // Everything has run; give the finished threads' stacks back before returning.
-      if (kernel::running()) while (kernel::reap_zombies() != 0) kernel::yield();
+      if (kernel::running()) {
+        join_started(false);
+        while (kernel::reap_zombies() != 0) kernel::yield();
+      }
       break;
     }
     kernel::yield();
@@ -96,7 +124,10 @@ void Scheduler::run() {
 
 void Scheduler::run_forever() {
   for (;;) {
-    if (!run_next()) kernel::sleep_us(1000);
+    if (!run_next()) {
+      join_started(true);
+      kernel::sleep_us(1000);
+    }
   }
 }
 

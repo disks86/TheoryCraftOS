@@ -67,24 +67,22 @@ The policy is in `src/CPUScheduler/IoAffinity.{hpp,cpp}`. It takes no locks and 
 
 ## The timer tick
 
-Every core takes a tick 1000 times a second. A tick takes the global scheduler lock only when it has work: a sleeper is due, a thread was
-sent to the core, the running thread may no longer run there, or a ready thread outranks it (or matches its level once its slice is over).
-The tick checks this without the lock, from the first sleeper's wake time and a bit mask of non-empty priority levels. The boot self test
-measured 99% of ticks lock-free on a quiet 4-core machine (`CoreInfo::lock_free_ticks`).
+Every core takes a tick 1000 times a second. A tick takes a lock only when it has work: one of its own sleepers is due, a thread was sent to
+the core, the running thread may no longer run there, or a ready thread outranks it (or matches its level once its slice is over). The tick
+checks this without a lock, from its sleepers' first wake time and the per-level ready counts. The boot self test measures it
+(`CoreInfo::lock_free_ticks`): 99% lock-free on a quiet 4-core machine.
 
 ## Note: no static constructors
 
 The kernel runs no static constructors. Any scheduler field whose "none" value is not zero (for example `Core::io_device`) must be set in
 `kernel::start()`.
 
+## Locking
+
+The run queues, sleepers, wait lists and thread states have their own locks (per core, per wait list, per thread). The protocol is in
+[SchedulerLocking.md](SchedulerLocking.md).
+
 ## Not done
 
-- **Per-core locks.** One global lock still guards the run queues, the sleepers and the wait lists of `Sync.hpp`. The tick no longer takes it
-  when idle, but every wake-up, block and switch still does. Replacing it means:
-  - a lock per run queue, plus one per wait list or per synchronization object;
-  - a wake-up protocol that cannot lose a wake-up between "decide to block" and "switch away". Linux uses `on_cpu` and a per-task lock for
-    this.
-
-  This is a rewrite of `Sync.cpp` and the switch path, and needs its own design and multi-core stress tests.
 - Devices other than Thunderbolt don't look up their `_PXM` yet: they are set up before the ACPI interpreter is up.
 - No real driver has moved an interrupt on physical hardware. QEMU's virtio-gpu is the device tested.
