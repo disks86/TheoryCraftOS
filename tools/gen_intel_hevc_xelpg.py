@@ -266,4 +266,5 @@ def main():
     open(out_path, 'w').write('\n'.join(o) + '\n')
 
 
-main()
+if __name__ == '__main__':
+    main()

@@ -30,6 +30,8 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImages.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen11.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesGen12.inc"
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgHevc.inc"   // (the pipe buffer command and the weights are the same for H.264)
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgAvc.inc"
 #include "Hardware/VideoCodec/Intel/IntelVdencTables.inc"
 
 // log2(8) = 3 ... the media driver's 4.4 floating-point cost format: a 4-bit mantissa and a 4-bit exponent, saturating at `max`.
@@ -88,11 +90,11 @@ void mfx_surface(DwordWriter& w, uint32_t id, uint32_t width, uint32_t height, c
 // The three VDEnc surface state commands share their body (VDENC_Surface_State_Fields: dwords 2..5 of the command). Before Xe-LP the format is in bits 28 .. 31 behind an
 // "interleave chroma" bit 27; Xe-LP's definition (and every later one) has a five-bit format from bit 27, so NV12 (4) is bit 29.
 template <uint32_t N>
-void vdenc_surface(DwordWriter& w, const uint32_t (&defaults)[N], uint32_t width, uint32_t height, const Nv12TiledLayout& layout, bool format_from_bit27) {
+void vdenc_surface(DwordWriter& w, const uint32_t (&defaults)[N], uint32_t width, uint32_t height, const Nv12TiledLayout& layout, bool format_from_bit27, uint32_t chroma_filter = 0) {
   Command<N> c(defaults);
   c.raw(2, ((height - 1) << 18) | ((width - 1) << 4));                 // width, height (dword 0 of the body)
   const uint32_t format = format_from_bit27 ? intel_mfx::kSurfacePlanar420 << 27 : (1u << 27) | (intel_mfx::kSurfacePlanar420 << 28);
-  c.raw(3, 1u | (1u << 1) | ((layout.pitch - 1) << 3) | format);       // Y-major tiled, pitch, format (interleaved chroma)
+  c.raw(3, 1u | (1u << 1) | ((layout.pitch - 1) << 3) | (chroma_filter << 20) | format);       // Y-major tiled, pitch, format (interleaved chroma)
   c.raw(4, layout.chroma_offset_rows);                                 // Y offset of the Cb plane
   c.raw(5, layout.chroma_offset_rows);                                 // ... of the Cr plane (the same: interleaved)
   c.emit(w);
@@ -111,6 +113,13 @@ void vdenc_pipe_buf(DwordWriter& w, const uint32_t (&defaults)[N], const AvcEnco
   c.buffer(10, b.source, kMocs);
   if (b.vdenc_row_store) c.buffer(16, b.vdenc_row_store, kMocs);
   if (b.vdenc_statistics) c.buffer(34, b.vdenc_statistics, kMocs);
+  if (p.xe_lpg) {
+    // Xe-LPG: the VDEnc engine writes the 4x down-scaled reconstruction itself ("scaled reference surface stage 1"), the MFX engine's intra row store is also given to it, and
+    // with target usage 7 (performance mode, one reference) the second forward down-scaled reference is the first.
+    if (b.recon_ds4) c.buffer(49, b.recon_ds4, kMocs);
+    if (b.intra_row_store) c.buffer(77, b.intra_row_store, kMocs);
+    if (p.p_picture) c.buffer(4, b.reference_ds4, 0);
+  }
   c.emit(w);
 }
 
@@ -157,6 +166,24 @@ AvcEncodeScratchSizes avc_encode_scratch_sizes(uint32_t width_mbs, uint32_t heig
   return s;
 }
 
+// VDENC_CMD3 and VDENC_AVC_IMG_STATE of Xe-LPG (the images the media driver's own parameter code produces for I and P pictures; see tools/gen_intel_avc_xelpg.py).
+static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, uint32_t qp) {
+  const uint32_t q = qp < 10 ? 0 : qp > 51 ? 41 : qp - 10;
+  const uint32_t* cmd3 = (p.p_picture ? kXeLpgAvcVdencCmd3TableP : kXeLpgAvcVdencCmd3TableI) + q * kXeLpgAvcVdencCmd3Dwords;
+  for (uint32_t i = 0; i < kXeLpgAvcVdencCmd3Dwords; ++i) w.emit(cmd3[i]);
+  Command<kXeLpgAvcVdencImgStateDwords> c(p.p_picture ? kXeLpgAvcVdencImgStateP : kXeLpgAvcVdencImgStateI);
+  c.raw(8, (p.p_picture ? kXeLpgAvcVdencImgStatePLevelDword8 : kXeLpgAvcVdencImgStateILevelDword8)[p.level_idc > 52 ? 52 : p.level_idc]);
+  c.set(kXeLpgAvcVdencImgState_QpPrimeY, qp);
+  c.set(kXeLpgAvcVdencImgState_PictureWidth, p.width_mbs);
+  c.set(kXeLpgAvcVdencImgState_PictureHeightMinusOne, p.height_mbs - 1);
+  c.set(kXeLpgAvcVdencImgState_PocNumberForCurrentPicture, p.poc & 0xFF);
+  if (p.p_picture) {
+    c.set(kXeLpgAvcVdencImgState_FwdRefIdx0ReferencePicture, p.reference_frame_store);
+    c.set(kXeLpgAvcVdencImgState_PocNumberForFwdRef0, p.reference_poc & 0xFF);
+  }
+  c.emit(w);
+}
+
 void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const AvcEncodeBuffers& b, const AvcEncodeLayout& layout) {
   const uint32_t mbs = p.width_mbs * p.height_mbs;
   const uint32_t qp = static_cast<uint32_t>(p.qp < 0 ? 0 : p.qp > static_cast<int32_t>(kMaxQp) ? kMaxQp : p.qp);
@@ -176,7 +203,7 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
     c.set(kMfxPipeModeSelect_CodecSelect, kMfxPipeModeSelect_CODEC_SELECT_ENCODE);
     c.set(kMfxPipeModeSelect_DecoderShortFormatMode, 1);   // (the encoder's "long format": the engine does not move the next slice's position)
     c.set(kMfxPipeModeSelect_VdencMode, 1);
-    c.set(kMfxPipeModeSelect_ScaledSurfaceEnable, 1);
+    c.set(kMfxPipeModeSelect_ScaledSurfaceEnable, p.xe_lpg ? 0 : 1);   // (Xe-LPG: the VDEnc engine writes the down-scaled reconstruction itself)
     c.set(kMfxPipeModeSelect_StreamOutEnable, 0);
     c.set(kMfxPipeModeSelect_FrameStatisticsStreamoutEnable, 1);
     c.set(kMfxPipeModeSelect_PreDeblockingOutputEnablePredeblockoutenable, p.deblocking ? 0 : 1);
@@ -208,7 +235,7 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
       c.raw(20 + 2 * p.reference_frame_store, 0);
     }
     c.raw(51, (c.get(51) & ~0x7Fu) | kMocs);
-    if (b.recon_ds4) {
+    if (b.recon_ds4 && !p.xe_lpg) {
       c.raw(62, b.recon_ds4);
       c.raw(63, 0);
       c.raw(64, (c.get(64) & ~0x7Fu) | kMocs);
@@ -232,7 +259,9 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   }
 
   // --- The VDEnc pipeline: mode, surfaces, buffers, the constant quantiser tables.
-  if (p.generation == EncodeGeneration::Gen12) {
+  if (p.xe_lpg) {
+    for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i]);
+  } else if (p.generation == EncodeGeneration::Gen12) {
     // Xe-LP prefetches the TLB entries of the source picture ahead of the engine (the driver's settings for AVC).
     Command<kGen12VdencPipeModeSelectDwords> c(kGen12VdencPipeModeSelectDefault);
     c.set(kGen12VdencPipeModeSelect_StandardSelect, kGen12VdencPipeModeSelect_STANDARD_SELECT_AVC);
@@ -255,15 +284,18 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
     c.emit(w);
   }
   const bool gen12_surfaces = p.generation == EncodeGeneration::Gen12;
-  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces);
+  vdenc_surface(w, kVdencSrcSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces, p.xe_lpg ? 7 : 0);   // (Xe-LPG: chroma downsample filter 7 on the source)
   vdenc_surface(w, kVdencRefSurfaceStateDefault, layout.width, layout.height, layout.full, gen12_surfaces);
   if (gen11_up) vdenc_surface(w, kGen11VdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, gen12_surfaces);   // (room for two surfaces; one is used)
   else vdenc_surface(w, kVdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, false);
-  switch (p.generation) {
+  if (p.xe_lpg) {
+    vdenc_pipe_buf(w, kXeLpgVdencPipeBufAddrStateImage, p, b);
+  } else switch (p.generation) {
     case EncodeGeneration::Gen9: vdenc_pipe_buf(w, kVdencPipeBufAddrStateDefault, p, b); break;
     case EncodeGeneration::Gen11: vdenc_pipe_buf(w, kGen11VdencPipeBufAddrStateDefault, p, b); break;
     case EncodeGeneration::Gen12: vdenc_pipe_buf(w, kGen12VdencPipeBufAddrStateDefault, p, b); break;
   }
+  if (!p.xe_lpg)
   {
     Command<kVdencConstQptStateDwords> c(kVdencConstQptStateDefault);
     uint32_t image[kVdencConstQptStateDwords];
@@ -329,6 +361,12 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
     c.set(kMfxAvcImgState_Framebitratemaxunit, 1);
     c.set(kMfxAvcImgState_Framebitratemaxunitmode, 1);
     c.emit(w);
+  }
+
+  if (p.xe_lpg) {
+    xe_lpg_avc_image_state(w, p, qp);
+    flat_matrices(w);
+    return;
   }
 
   // --- VDENC_IMG_STATE.
@@ -514,18 +552,38 @@ bool emit_avc_vdenc_slice(DwordWriter& w, const AvcEncodePicture& p, ArrayView<c
     c.set(kMfxAvcSliceState_SlicedataInsertionPresentInBitstream, 1);
     c.set(kMfxAvcSliceState_HeaderInsertionPresentInBitstream, 1);
     c.set(kMfxAvcSliceState_Roundinter, p.p_picture ? kAdaptiveInterRoundingPWithoutB[qp] : 2);
-    c.set(kMfxAvcSliceState_Roundinterenable, 0);
+    c.set(kMfxAvcSliceState_Roundinterenable, p.xe_lpg && p.p_picture ? 1 : 0);   // (the media driver's Xe-LPG code enables the inter rounding for P slices)
     c.set(kMfxAvcSliceState_Roundintra, 5);
     c.set(kMfxAvcSliceState_Roundintraenable, 1);
+    c.emit(w);
+  }
+
+  // --- Xe-LPG: VDENC_AVC_SLICE_STATE carries the same rounding values.
+  if (p.xe_lpg) {
+    Command<kXeLpgAvcVdencSliceStateDwords> c(kXeLpgAvcVdencSliceStateImage);
+    c.set(kXeLpgAvcVdencSliceState_RoundIntra, 5);
+    c.set(kXeLpgAvcVdencSliceState_RoundIntraEnable, 1);
+    c.set(kXeLpgAvcVdencSliceState_RoundInter, p.p_picture ? kAdaptiveInterRoundingPWithoutB[qp] : 2);
+    c.set(kXeLpgAvcVdencSliceState_RoundInterEnable, p.p_picture ? 1 : 0);
+    c.set(kXeLpgAvcVdencSliceState_Log2WeightDenomLuma, 0);
     c.emit(w);
   }
 
   // --- The headers go in front of the slice data the engine writes.
   for (uint64_t i = 0; i < headers.size(); ++i) pak_insert(w, headers[i], i + 1 == headers.size(), headers[i].slice_header);
 
+  // --- Xe-LPG: the weights (none) and a 3-dword walker (the start is the top of the picture, the next slice starts below it).
+  if (p.xe_lpg) {
+    for (uint32_t i = 0; i < kXeLpgVdencWeightsOffsetsStateDwords; ++i) w.emit(kXeLpgVdencWeightsOffsetsStateImage[i]);
+    Command<kXeLpgAvcVdencWalkerStateDwords> c(kXeLpgAvcVdencWalkerStateImage);
+    c.set(kXeLpgAvcVdencWalkerState_FirstSuperSlice, 1);
+    c.set(kXeLpgAvcVdencWalkerState_NextsliceMbStartYPosition, p.height_mbs);
+    c.emit(w);
+  }
+
   // --- VDENC_WALKER_STATE: start at the top, the next slice starts below the picture; then wait for the VDEnc and MFX pipes.
   // (From Ice Lake the walker also carries the picture width in samples.)
-  switch (p.generation) {
+  if (!p.xe_lpg) switch (p.generation) {
     case EncodeGeneration::Gen9: {
       Command<kVdencWalkerStateDwords> c(kVdencWalkerStateDefault);
       c.set(kVdencWalkerState_MbLcuStartYPosition, 0);
