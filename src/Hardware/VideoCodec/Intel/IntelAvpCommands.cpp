@@ -160,7 +160,7 @@ void emit_avp_vd_control_state(DwordWriter& w) {
 
 void emit_avp_pipe_mode_select(DwordWriter& w, AvpPlatform platform) {
   uint32_t d[kPipeModeSelectDwordsXeLpg];
-  const uint32_t n = platform == AvpPlatform::XeLpg ? kPipeModeSelectDwordsXeLpg : kPipeModeSelectDwords;
+  const uint32_t n = platform != AvpPlatform::XeLp ? kPipeModeSelectDwordsXeLpg : kPipeModeSelectDwords;
   Fields f{ArrayView<uint32_t>(d, n)};
   f.set(0, 0, 31, kAvpPipeModeSelect | (n - 2));
   f.set(1, 0, 0, 0);          // decode
@@ -183,7 +183,7 @@ void emit_avp_surface_state(DwordWriter& w, const intel_mfx::Nv12TiledLayout& la
 
 void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b, AvpPlatform platform) {
   uint32_t d[kPipeBufAddrDwordsXeLpg];
-  const uint32_t n = platform == AvpPlatform::XeLpg ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords;   // (the buffers this decoder uses sit at the same dwords on both)
+  const uint32_t n = platform != AvpPlatform::XeLp ? kPipeBufAddrDwordsXeLpg : kPipeBufAddrDwords;   // (the buffers this decoder uses sit at the same dwords on both)
   Fields f{ArrayView<uint32_t>(d, n)};
   const uint32_t attr = attributes_of(b.mocs);
   f.set(0, 0, 31, kAvpPipeBufAddrState | (n - 2));
@@ -202,7 +202,7 @@ void emit_avp_pipe_buf_addr_state(DwordWriter& w, const AvpBuffers& b, AvpPlatfo
 
 void emit_avp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs, AvpPlatform platform) {
   uint32_t d[kIndObjDwordsXeLpg];
-  const uint32_t n = platform == AvpPlatform::XeLpg ? kIndObjDwordsXeLpg : kIndObjDwords;   // (Xe-LPG adds the coding unit objects an encoder reads: unused here)
+  const uint32_t n = platform != AvpPlatform::XeLp ? kIndObjDwordsXeLpg : kIndObjDwords;   // (Xe-LPG adds the coding unit objects an encoder reads: unused here)
   Fields f{ArrayView<uint32_t>(d, n)};
   f.set(0, 0, 31, kAvpIndObjBaseAddrState | (n - 2));
   f.buffer(1, 3, bitstream, attributes_of(mocs));
@@ -241,7 +241,7 @@ AvpGlobalMotion av1_global_motion(uint32_t type, const int32_t matrix[6], bool a
 
 void emit_avp_pic_state(DwordWriter& w, const AvpPicture& p, AvpPlatform platform) {
   uint32_t d[kPicStateDwordsXeLpg];
-  const uint32_t n = platform == AvpPlatform::XeLpg ? kPicStateDwordsXeLpg : kPicStateDwords;   // (Xe-LPG: the encoder's rate-control dwords at the end stay zero)
+  const uint32_t n = platform != AvpPlatform::XeLp ? kPicStateDwordsXeLpg : kPicStateDwords;   // (Xe-LPG: the encoder's rate-control dwords at the end stay zero)
   Fields f{ArrayView<uint32_t>(d, n)};
   f.set(0, 0, 31, kAvpPicState | (n - 2));
   f.set(1, 0, 15, p.width - 1);

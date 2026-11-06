@@ -29,10 +29,11 @@ namespace intel_avp {
 // run on an engine.
 using intel_mfx::DwordWriter;
 
-// The video engines that decode AV1: Xe-LP (Tiger Lake and its relatives) and Xe-LPG (Meteor Lake, Arrow Lake: the media driver's Xe_LPM_plus definitions). The command numbers and
+// The video engines that decode AV1: Xe-LP (Tiger Lake and its relatives), Xe-LPG (Meteor Lake, Arrow Lake: the media driver's Xe_LPM_plus definitions) and Xe-HPG (Arc
+// Alchemist: Xe_HPM). The command numbers and
 // every field this decoder sets are the same; five commands grew at the end (pipe mode select, pipe buffer addresses, indirect objects, picture state, tile coding) with fields a
 // decoder leaves at zero, and one reserved bit of the picture state (the full-range flag, which only film grain uses) went away.
-enum class AvpPlatform : uint8_t { XeLp, XeLpg };
+enum class AvpPlatform : uint8_t { XeLp, XeLpg, XeHpg };   // (Xe-HPG, Arc Alchemist: the Xe-LPG commands, but the tile coding command stays six dwords)
 
 // AVP commands: pipeline 2, opcode 3, the command number in bits 16-22.
 constexpr uint32_t avp_header(uint32_t command) { return (3u << 29) | (2u << 27) | (3u << 23) | (command << 16); }

@@ -60,6 +60,9 @@ struct GgttGeometry {
   uint64_t entries = 0;       // 8 bytes each
   uint64_t address_space = 0; // bytes of graphics address space the table maps
 };
+// Graphics IP 12.50 and later (Arc, Meteor Lake, Arrow Lake): the table is always 8 MiB at the middle of the 16 MiB register BAR (a 4 GiB address space), whatever the GMCH
+// control says. The part from 0xFEE00000 up belongs to the GuC and the WOPCM: `out` stops below it.
+bool ggtt_geometry_xehp(uint64_t register_bar_size, GgttGeometry* out);
 bool ggtt_geometry(uint16_t gmch_control, uint64_t register_bar_size, GgttGeometry* out);
 
 // The global GTT table, seen through its window. The driver may only change the part it owns (so the entries the firmware set up for the display stay as

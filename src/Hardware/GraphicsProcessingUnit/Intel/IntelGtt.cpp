@@ -21,6 +21,18 @@
 namespace hardware {
 namespace intel_gt {
 
+bool ggtt_geometry_xehp(uint64_t register_bar_size, GgttGeometry* out) {
+  constexpr uint64_t kTableBytes = uint64_t{8} << 20, kGuTop = 0xFEE00000ull;
+  if (register_bar_size < 2 * kTableBytes) return false;
+  GgttGeometry g;
+  g.table_offset = kTableBytes;
+  g.entries = kGuTop / kPageSize;
+  g.table_bytes = g.entries * 8;
+  g.address_space = kGuTop;
+  *out = g;
+  return true;
+}
+
 bool ggtt_geometry(uint16_t gmch_control, uint64_t register_bar_size, GgttGeometry* out) {
   const uint32_t size_code = (gmch_control >> 6) & 0x3;
   if (size_code == 0 || register_bar_size == 0 || (register_bar_size & 1)) return false;

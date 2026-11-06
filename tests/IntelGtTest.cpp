@@ -73,6 +73,7 @@ static void test_entries_and_geometry() {
   GgttGeometry g;
   CHECK(ggtt_geometry(0x0080, 16u << 20, &g) && g.table_offset == (8u << 20) && g.table_bytes == (4u << 20) && g.entries == 524288 && g.address_space == (2ull << 30));
   CHECK(ggtt_geometry(0x00C0, 16u << 20, &g) && g.table_bytes == (8u << 20) && g.address_space == (4ull << 30));
+  CHECK(ggtt_geometry_xehp(16u << 20, &g) && g.table_offset == (8u << 20) && g.entries == 0xFEE00 && g.table_bytes == 0xFEE00u * 8 && g.address_space == 0xFEE00000ull && !ggtt_geometry_xehp(8u << 20, &g));
   CHECK(ggtt_geometry(0x0040, 16u << 20, &g) && g.table_bytes == (2u << 20) && g.address_space == (1ull << 30));
   CHECK(ggtt_geometry(0xFF40, 16u << 20, &g) && g.table_bytes == (2u << 20));  // other fields of the word are ignored
   CHECK(!ggtt_geometry(0x0000, 16u << 20, &g) && !ggtt_geometry(0x0080, 0, &g) && !ggtt_geometry(0x0080, (16u << 20) + 1, &g));

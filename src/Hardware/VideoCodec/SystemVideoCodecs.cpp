@@ -148,7 +148,7 @@ struct IntelHardware {
   uint64_t first_page = 0;
 };
 
-bool SystemVideoCodecs::intel_hardware_setup(const PciDeviceInfo& d, IntelHardware* out, uint64_t register_bytes) {
+bool SystemVideoCodecs::intel_hardware_setup(const PciDeviceInfo& d, IntelHardware* out, uint64_t register_bytes, bool fixed_ggtt) {
   constexpr uint16_t kPciCommand = 0x04, kGmchControl = 0x50;
   constexpr uint32_t kMemorySpace = 1u << 1;
   constexpr uint64_t kBarSize = 16u << 20, kGuardPages = 16;
@@ -156,7 +156,7 @@ bool SystemVideoCodecs::intel_hardware_setup(const PciDeviceInfo& d, IntelHardwa
   if (!mmio_ || !(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return false;
   const uint64_t base = pci_.memory_bar(d.address, 0);
   intel_gt::GgttGeometry geometry;
-  if (base == 0 || !intel_gt::ggtt_geometry(static_cast<uint16_t>(pci_.read32(d.address, kGmchControl)), kBarSize, &geometry)) return false;
+  if (base == 0 || !(fixed_ggtt ? intel_gt::ggtt_geometry_xehp(kBarSize, &geometry) : intel_gt::ggtt_geometry(static_cast<uint16_t>(pci_.read32(d.address, kGmchControl)), kBarSize, &geometry))) return false;
   if (!mmio_->map_registers(base, kRegisters, &out->registers) || !mmio_->map_registers(base + geometry.table_offset, geometry.table_bytes, &out->ggtt_table)) return false;
   return intel_gt::find_unused_ggtt_range(out->ggtt_table, intel_gt::VcsDriver::kGgttPagesNeeded, kGuardPages, &out->first_page);
 }
@@ -183,13 +183,14 @@ void SystemVideoCodecs::add_intel(const PciDeviceInfo& d) {
     if ((pci_.read32(d.address, kPciCommand) & kMemorySpace) && bar_sizer_->bar_size(d.address, 2, &local_memory)) device->set_local_memory_bar(local_memory);
   }
   IntelHardware hardware;
-  // The engine driver follows the Gen9.5, Gen11, Xe-LP and Xe-LPG layouts only (its GTT geometry, its video box); no other generation gets its GTT looked at. Xe-LPG's video
+  // The engine driver follows the Gen9.5, Gen11, Xe-LP, Xe-LPG and Xe-HPG layouts only (Xe-LPG and Xe-HPG have a fixed 8 MiB global GTT) (its GTT geometry, its video box); no other generation gets its GTT looked at. Xe-LPG's video
   // boxes are on the media tile: 0x380000 into the BAR (IntelMediaEngineHw::kMediaTileBase), where the registers repeat; the driver gets a window onto that.
   const IntelGpuArchitecture architecture = device->gpu().architecture;
   const bool xe_lpg = architecture == IntelGpuArchitecture::XeLpg && !device->gpu().discrete;
-  if (intel_hardware_ && (architecture == IntelGpuArchitecture::Gen9_5 || architecture == IntelGpuArchitecture::Gen11 || xe_lpg ||
+  const bool xe_hpg = architecture == IntelGpuArchitecture::XeHpg && device->gpu().discrete;   // (Arc: registers at the start of the BAR, no media tile)
+  if (intel_hardware_ && (architecture == IntelGpuArchitecture::Gen9_5 || architecture == IntelGpuArchitecture::Gen11 || xe_lpg || xe_hpg ||
                           (architecture == IntelGpuArchitecture::XeLp && !device->gpu().discrete)) && !intel_registers_bank_ &&
-      intel_hardware_setup(d, &hardware, xe_lpg ? IntelMediaEngineHw::kMediaTileBase + 0x200000 : 0x200000)) {
+      intel_hardware_setup(d, &hardware, xe_lpg ? IntelMediaEngineHw::kMediaTileBase + 0x200000 : 0x200000, xe_lpg || xe_hpg)) {
     intel_registers_bank_ = UniquePointer<intel_gt::MmioRegisterBank>::make(allocator_, hardware.registers);
     if (intel_registers_bank_ && xe_lpg) intel_media_bank_ = UniquePointer<intel_gt::OffsetRegisterBank>::make(allocator_, *intel_registers_bank_, IntelMediaEngineHw::kMediaTileBase);
     if (intel_registers_bank_ && (!xe_lpg || intel_media_bank_)) {

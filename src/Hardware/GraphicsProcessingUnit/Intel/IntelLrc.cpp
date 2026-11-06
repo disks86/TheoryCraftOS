@@ -107,6 +107,7 @@ bool lrc_init_gen9_rcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhib
 namespace {
 // gen12_xcs_offsets: a skip, a load of 13 registers, a skip, a load of 9.
 constexpr uint16_t kGen12Run0[] = {0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4};
+constexpr uint16_t kDg2Run0[] = {0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4, 0x120, 0x124};
 constexpr uint16_t kGen12Run1[] = {0x3a8, 0x28c, 0x288, 0x284, 0x280, 0x27c, 0x278, 0x274, 0x270};
 constexpr uint32_t kGen12RingMiMode = 0x60 + 1, kGen12BbOffset = 0x70 + 1;   // (lrc_ring_mi_mode, lrc_ring_bb_offset: the value follows the register)
 
@@ -129,6 +130,17 @@ bool lrc_init_gen12_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhi
   if (!gen12_load(state, &at, 1, ArrayView<const uint16_t>(kGen12Run0), mmio_base) || !gen12_load(state, &at, 5, ArrayView<const uint16_t>(kGen12Run1), mmio_base)) return false;
   // Context control as Gen11 and later set it: the synchronous switch inhibit on, the restore inhibited for a context that has never run, and the save and render-state
   // bits left to the hardware.
+  state[kCtxContextControl] = masked_enable(kCtxCtrlInhibitSynCtxSwitch) | masked_disable(kCtxCtrlRestoreInhibit) | (inhibit_restore ? kCtxCtrlRestoreInhibit : 0u);
+  state[kGen12RingMiMode] = masked_disable(kStopRing);
+  state[kGen12BbOffset] = 0;
+  return true;
+}
+
+bool lrc_init_dg2_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) {
+  if (state.size() != kLrcStateDwords) return false;
+  for (uint32_t& d : state) d = 0;
+  uint64_t at = 0;
+  if (!gen12_load(state, &at, 1, ArrayView<const uint16_t>(kDg2Run0), mmio_base) || !gen12_load(state, &at, 1, ArrayView<const uint16_t>(kGen12Run1), mmio_base)) return false;
   state[kCtxContextControl] = masked_enable(kCtxCtrlInhibitSynCtxSwitch) | masked_disable(kCtxCtrlRestoreInhibit) | (inhibit_restore ? kCtxCtrlRestoreInhibit : 0u);
   state[kGen12RingMiMode] = masked_disable(kStopRing);
   state[kGen12BbOffset] = 0;

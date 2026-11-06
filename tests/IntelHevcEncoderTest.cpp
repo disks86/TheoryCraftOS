@@ -713,6 +713,44 @@ void test_device(TestAllocator& a) {
     CHECK(mtl.gpu.violations.empty() && mtl.engine.problems == 0);
   }
 
+  // Arc Alchemist: a discrete card, the main GT. H.264, H.265, VP9 and AV1 decode (not MPEG-2), H.264 and H.265 encode.
+  {
+    Rig2 arc;
+    arc.engine.write_stream = true;
+    std::vector<uint32_t> r4(0x20000 / 4, 0);
+    r4[0x0D50 / 4] = 1;
+    const MmioRegion region4(reinterpret_cast<uint64_t>(r4.data()), r4.size() * 4);
+    IntelMediaVideoEngine::HardwareSetup setup4;
+    setup4.registers = &arc.gpu;
+    setup4.ggtt_table = arc.config().ggtt_table;
+    setup4.ggtt_first_page = 100;
+    setup4.memory = &arc.mem;
+    {
+      IntelMediaVideoEngine device(a, 0x56A0, region4);   // A770
+      device.set_hardware(setup4);
+      CHECK(device.initialize() && device.hardware_decode());
+      const uint32_t decode = device.info().accelerated_decode_codecs;
+      CHECK((decode & codec_mask(VideoCodec::H264)) && (decode & codec_mask(VideoCodec::Hevc)) && !(decode & codec_mask(VideoCodec::Mpeg2)));
+      CHECK(device.info().accelerated_encode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc)));
+      EncoderConfig cfg;
+      cfg.codec = VideoCodec::Hevc;
+      cfg.width = 64;
+      cfg.height = 64;
+      cfg.input = PixelFormat::I420;
+      VideoFrameBuffer f(a);
+      make_i420(f, 64, 64, 6);
+      UniquePointer<IVideoEncoder> hw = device.create_encoder(cfg);
+      CHECK(hw != nullptr);
+      if (hw) {
+        CHECK(hw->submit(f.frame()) == SubmitResult::Accepted);
+        VideoPacket p;
+        CHECK(hw->receive(&p) && p.keyframe && arc.engine.pictures == 1);
+      }
+      CHECK(arc.gpu.regs[0xFDC] == (1u << 31) && arc.gpu.regs.count(0xD8C) == 0);
+    }
+    CHECK(arc.gpu.violations.empty() && arc.engine.problems == 0);
+  }
+
   // Ice Lake and Coffee Lake offer H.264 only.
   for (Generation g : {Generation::Gen9, Generation::Gen11}) {
     Rig2 other(g);
