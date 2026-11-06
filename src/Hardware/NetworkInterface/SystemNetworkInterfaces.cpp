@@ -19,8 +19,13 @@
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
 #include "Hardware/NetworkInterface/AMD/PcnetNetworkInterface.hpp"
 #include "Hardware/NetworkInterface/Intel/E1000NetworkInterface.hpp"
+#include "Hardware/NetworkInterface/Intel/E1000eNetworkInterface.hpp"
+#include "Hardware/NetworkInterface/Intel/IgbNetworkInterface.hpp"
+#include "Hardware/NetworkInterface/PciNicDevice.hpp"
 #include "Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.hpp"
+#include "Hardware/NetworkInterface/Realtek/Rtl8169NetworkInterface.hpp"
 #include "Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.hpp"
+#include "Hardware/NetworkInterface/Usb/UsbNetworkInterfaces.hpp"
 #include "Hardware/NetworkInterface/Virtio/VirtioNetworkInterface.hpp"
 #include "Hardware/NetworkInterface/VMware/Vmxnet3NetworkInterface.hpp"
 
@@ -46,7 +51,15 @@ void SystemNetworkInterfaces::find_native() {
   PciDeviceInfo d;
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassNetwork) continue;
-    if (d.vendor_id == kVirtioPciVendor &&
+    // The controllers on consumer boards and cards (their drivers take the device through INicDevice, so tests can hand them a model).
+    const auto device = [&] { return UniquePointer<INicDevice>(UniquePointer<PciNicDevice>::make(allocator_, pci_, d, st_, mapper_)); };
+    if (E1000eNetworkInterface::supports(d.vendor_id, d.device_id))
+      try_add<E1000eNetworkInterface>(interfaces_, allocator_, device(), allocator_);
+    else if (IgbNetworkInterface::supports(d.vendor_id, d.device_id))
+      try_add<IgbNetworkInterface>(interfaces_, allocator_, device(), allocator_);
+    else if (Rtl8169NetworkInterface::supports(d.vendor_id, d.device_id))
+      try_add<Rtl8169NetworkInterface>(interfaces_, allocator_, device(), allocator_);
+    else if (d.vendor_id == kVirtioPciVendor &&
         (d.device_id == kVirtioNetDevice || d.device_id == kVirtioNetTransitionalDevice))
       try_add<VirtioNetworkInterface>(interfaces_, allocator_, pci_, d, allocator_, st_);
     else if (E1000NetworkInterface::supports(d.vendor_id, d.device_id))
@@ -57,6 +70,21 @@ void SystemNetworkInterfaces::find_native() {
       try_add<PcnetNetworkInterface>(interfaces_, allocator_, pci_, d, allocator_, st_);
     else if (Rtl8139NetworkInterface::supports(d.vendor_id, d.device_id))
       try_add<Rtl8139NetworkInterface>(interfaces_, allocator_, pci_, d, allocator_, st_);
+  }
+}
+
+// USB network adapters on the root ports (open_usb_network_interface brings each one up, or leaves the device alone).
+void SystemNetworkInterfaces::find_usb() {
+  if (!usb_) return;
+  for (uint32_t c = 0; c < usb_->controller_count(); ++c) {
+    IUsbHostController* host = usb_->host_controller(c);
+    if (!host) continue;
+    for (uint32_t port = 0; port < usb_->port_count(c); ++port) {
+      UsbDeviceDescriptor descriptor;
+      if (!usb_->device_descriptor(c, port, &descriptor)) continue;
+      UniquePointer<INetworkInterface> nic = open_usb_network_interface(*host, port, allocator_);
+      if (nic) interfaces_.push_back(util::move(nic));
+    }
   }
 }
 
@@ -81,6 +109,7 @@ void SystemNetworkInterfaces::find_firmware() {
 
 void SystemNetworkInterfaces::initialize() {
   find_native();
+  find_usb();
   find_firmware();
 }
 
