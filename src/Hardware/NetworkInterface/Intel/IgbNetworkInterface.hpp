@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/NetworkInterface/Intel/IntelEthernetRegisters.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
 #include "Hardware/NetworkInterface/NicDevice.hpp"
 #include "Kernel/Sync.hpp"
@@ -30,7 +31,8 @@ namespace hardware {
 // I210/I211 is the second port of many desktop boards and the usual add-in card) and the 2.5 Gb/s I225 and I226 (Linux's igc; the on-board port of most
 // Intel desktop boards since 2020). Both use queue 0's registers at 0xC000 (receive) and 0xE000 (transmit) and the same 16-byte advanced descriptors, which
 // the device overwrites with its write-back format. The I225/I226 reset with DEV_RST instead of RST and report 2.5 Gb/s in a STATUS bit of its own.
-// One queue, polled, interrupts off, no offloads. QEMU's `igb` device is an 82576.
+// One queue. Interrupts (MSI, queue 0 mapped to vector 0) when the caller enables them; IP and TCP/UDP checksums checked on receive, the
+// transport checksum finished on transmit through a context descriptor in front of the frame. QEMU's `igb` device is an 82576.
 enum class IgbKind : uint8_t { I82575, I82576, I82580, I350, I354, I210, I211, I225, I226 };
 
 struct IgbModel {
@@ -62,7 +64,17 @@ class IgbNetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
-  NetworkStatistics statistics() const override { return stats_; }
+  NetworkOffloads offloads() const override { return NetworkOffloads{true, true}; }
+  bool receive_frame(ByteView buffer, ReceivedFrame* frame) override;
+  bool transmit_frame(ConstByteView frame, TransmitChecksum checksum) override;
+  bool enable_interrupts(NetworkWake wake, void* context) override;
+  void disable_interrupts() override { interrupts_.disable(*device_, claimed_); }
+  bool interrupts_enabled() const override { return interrupts_.enabled(); }
+  NetworkStatistics statistics() const override {
+    NetworkStatistics s = stats_;
+    s.interrupts = interrupts_.count();
+    return s;
+  }
 
   const IgbModel* model() const { return model_; }
   // Whether initialize() could restart the PHY's autonegotiation.
@@ -75,6 +87,7 @@ class IgbNetworkInterface final : public INetworkInterface {
     uint64_t header_address;
   };
   // Read format: address, command/type/length, payload length and options. Write-back: the status (DD) lands in bit 0 of the last dword.
+  // A context descriptor has the same size: MACLEN/IPLEN, the context type and protocol, MSS/index.
   struct TransmitDescriptor {
     uint64_t address;
     uint32_t command_type_length;
@@ -87,6 +100,7 @@ class IgbNetworkInterface final : public INetworkInterface {
   bool reset();
   void restart_autonegotiation();
   void post_receive(uint32_t i);
+  void reclaim_transmitted();
   ByteView rx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
   ByteView tx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{kReceiveDescriptors + i} * kBufferSize, kBufferSize); }
 
@@ -100,8 +114,12 @@ class IgbNetworkInterface final : public INetworkInterface {
   ArrayView<TransmitDescriptor> tx_ring_;
   ByteView buffers_;  // receive buffers, then transmit buffers
   uint32_t rx_next_ = 0;
-  uint32_t tx_next_ = 0;
+  uint32_t tx_next_ = 0;   // the next descriptor to fill
+  uint32_t tx_clean_ = 0;  // the first descriptor the device may still be using
+  uint8_t tx_frame_end_[kTransmitDescriptors] = {};  // for the descriptor a frame starts at: the one it ends at
+  static_assert(kTransmitDescriptors <= 256);
   uint32_t receive_control_ = 0;
+  intel_eth::IntelInterrupts interrupts_;
   MacAddress mac_{};
   kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;

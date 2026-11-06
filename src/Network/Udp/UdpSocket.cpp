@@ -45,15 +45,9 @@ bool UdpSocket::send_from(Ipv4Address source, Ipv4Address address, uint16_t port
   out.be16(port_);
   out.be16(port);
   out.be16(static_cast<uint16_t>(8 + data.size()));
-  out.be16(0);  // checksum, filled in below
+  out.be16(0);  // checksum: the IP layer fills it in
   out.bytes(data);
   if (!out.ok()) return false;
-
-  uint32_t sum = pseudo_header_sum(source, address, kProtocolUdp, static_cast<uint16_t>(out.position()));
-  sum = checksum_add(sum, out.written());
-  uint16_t checksum = checksum_finish(sum);
-  if (checksum == 0) checksum = 0xFFFF;  // 0 means "no checksum" on the wire
-  out.patch_be16(6, checksum);
   return ip_.send_ip_from(source, address, kProtocolUdp, out.written(), link_broadcast);
 }
 

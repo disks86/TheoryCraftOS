@@ -94,5 +94,47 @@ uint32_t status_speed_mbps(uint32_t status, bool has_2500) {
   return speed == 1 ? 100 : 10;
 }
 
+void IntelInterrupts::on_interrupt(void* self) {
+  IntelInterrupts* interrupts = static_cast<IntelInterrupts*>(self);
+  INicRegisters* regs = __atomic_load_n(&interrupts->regs_, __ATOMIC_ACQUIRE);
+  if (!regs) return;
+  const uint32_t causes = regs->read32(kIcr);  // (reading clears them)
+  if (causes == 0 || causes == 0xFFFFFFFFu) return;
+  __atomic_fetch_add(&interrupts->count_, 1, __ATOMIC_ACQ_REL);
+  const NetworkWake wake = __atomic_load_n(&interrupts->wake_, __ATOMIC_ACQUIRE);
+  if (wake) wake(__atomic_load_n(&interrupts->context_, __ATOMIC_ACQUIRE));
+}
+
+bool IntelInterrupts::enable(INicDevice& device, NetworkWake wake, void* context) {
+  if (enabled_ || !wake) return enabled_;
+  INicRegisters& regs = device.registers();
+  regs.write32(kImc, 0xFFFFFFFFu);
+  regs.read32(kIcr);
+  __atomic_store_n(&context_, context, __ATOMIC_RELEASE);
+  __atomic_store_n(&wake_, wake, __ATOMIC_RELEASE);
+  __atomic_store_n(&regs_, &regs, __ATOMIC_RELEASE);
+  if (!device.attach_interrupt(&IntelInterrupts::on_interrupt, this)) {
+    __atomic_store_n(&regs_, static_cast<INicRegisters*>(nullptr), __ATOMIC_RELEASE);
+    return false;
+  }
+  regs.write32(kIms, kInterruptMask);
+  enabled_ = true;
+  const uint64_t before = count();
+  regs.write32(kIcs, kIntLinkChange);
+  for (int i = 0; i < 200 && count() == before; ++i) delay_us(100);
+  if (count() != before) return true;
+  disable(device, true);
+  return false;
+}
+
+void IntelInterrupts::disable(INicDevice& device, bool registers_mapped) {
+  if (!enabled_) return;
+  if (registers_mapped) device.registers().write32(kImc, 0xFFFFFFFFu);
+  device.detach_interrupt();
+  __atomic_store_n(&regs_, static_cast<INicRegisters*>(nullptr), __ATOMIC_RELEASE);
+  __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+  enabled_ = false;
+}
+
 }  // namespace intel_eth
 }  // namespace hardware

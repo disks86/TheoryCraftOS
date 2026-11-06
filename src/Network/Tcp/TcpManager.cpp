@@ -95,16 +95,13 @@ void TcpManager::send_reset(Ipv4Address to, uint16_t to_port, uint16_t from_port
   out.u8(5 << 4);
   out.u8(flags);
   out.be16(0);  // window
-  out.be16(0);  // checksum, filled in below
+  out.be16(0);  // checksum: the IP layer fills it in
   out.be16(0);  // urgent pointer
   if (!out.ok()) return;
-  uint32_t sum = pseudo_header_sum(ip_.source_for(to), to, kProtocolTcp, 20);
-  sum = checksum_add(sum, out.written());
-  out.patch_be16(16, checksum_finish(sum));
   ip_.send_ip(to, kProtocolTcp, out.written());
 }
 
-void TcpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment) {
+void TcpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment, bool checksum_verified) {
   ByteReader in(segment);
   const uint16_t source_port = in.be16();
   const uint16_t destination_port = in.be16();
@@ -118,9 +115,8 @@ void TcpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteVi
   if (!in.ok()) return;  // shorter than a TCP header
   const uint32_t header = (offset_and_reserved >> 4) * 4u;
   if (header < 20 || header > segment.size()) return;
-  const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint16_t>(segment.size())),
-                                    segment);
-  if (checksum_finish(sum) != 0) return;  // corrupted in transit
+  const uint32_t sum = checksum_verified ? 0 : checksum_add(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint16_t>(segment.size())), segment);
+  if (!checksum_verified && checksum_finish(sum) != 0) return;  // corrupted in transit
 
   // Options: only the maximum segment size matters. Each one is bounds-checked
   // against the option area; a malformed list just ends the scan.

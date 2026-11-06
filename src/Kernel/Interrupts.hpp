@@ -48,6 +48,8 @@ constexpr uint8_t kVectorAcpiSci = 0x53;   // I/O APIC: the ACPI system control 
 constexpr uint8_t kVectorWifi = 0x55;      // MSI: the Intel Wi-Fi card (receive, firmware errors)
 constexpr uint8_t kVectorIntelNpu = 0x56;  // MSI: the Intel NPU (message channel, MMU faults, watchdogs)
 constexpr uint8_t kVectorIoSelfTest = 0x57; // inter-processor interrupt standing in for a device's (KernelDemo's I/O affinity check)
+constexpr uint8_t kVectorNetworkFirst = 0x58; // MSI: Ethernet controllers (Realtek RTL8111/8168/8125, Intel e1000e/igb/igc), one each, handed out by PciNicDevice
+constexpr uint8_t kVectorNetworkCount = 8;
 // MSI-X: storage queues with a vector each (NVMe: one per core), handed out by the drivers that use them (NvmeStorageDevice). (0x60-0x7F is the firmware's legacy PIC, 0x80
 // the system call entry.)
 constexpr uint8_t kVectorStorageFirst = 0xA0;

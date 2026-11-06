@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/NetworkInterface/Intel/IntelEthernetRegisters.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
 #include "Hardware/NetworkInterface/NicDevice.hpp"
 #include "Kernel/Sync.hpp"
@@ -29,7 +30,9 @@ namespace hardware {
 // The Intel PCI Express gigabit controllers Linux drives with e1000e: the 82571/82572/82573/82574/82583 cards and, above all, the controllers built into
 // Intel's chipsets that nearly every Intel desktop and laptop board of the last fifteen years has (ICH8/9/10 with the 82566/82567 PHY, the 82577/82578,
 // 82579, I217, I218 and the I219 of Skylake to Panther Lake). The MAC lives in the chipset and talks to a separate PHY chip; the management engine may
-// share both. Legacy descriptor rings as on the 8254x, polled, interrupts off. QEMU's `e1000e` device is an 82574L.
+// share both. Legacy descriptor rings as on the 8254x. Interrupts (MSI) when the caller enables them; IP and TCP/UDP checksums checked on
+// receive (RXCSUM) and the transport checksum inserted on transmit through a TCP/IP context descriptor in front of an extended data
+// descriptor. QEMU's `e1000e` device is an 82574L.
 //
 // Kept from e1000e: the MAC-only reset (the PHY keeps the link the firmware negotiated), the station address taken back from before the reset when the
 // NVM does not reload it, waking a PHY left powered down (LANPHYPC toggle) when the management engine allows it, and the I219 transmit hang workaround.
@@ -67,7 +70,17 @@ class E1000eNetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
-  NetworkStatistics statistics() const override { return stats_; }
+  NetworkOffloads offloads() const override { return NetworkOffloads{true, true}; }
+  bool receive_frame(ByteView buffer, ReceivedFrame* frame) override;
+  bool transmit_frame(ConstByteView frame, TransmitChecksum checksum) override;
+  bool enable_interrupts(NetworkWake wake, void* context) override;
+  void disable_interrupts() override { interrupts_.disable(*device_, claimed_); }
+  bool interrupts_enabled() const override { return interrupts_.enabled(); }
+  NetworkStatistics statistics() const override {
+    NetworkStatistics s = stats_;
+    s.interrupts = interrupts_.count();
+    return s;
+  }
 
   const E1000eModel* model() const { return model_; }
   // Whether the PHY had to be powered up with the LANPHYPC toggle during initialize().
@@ -104,6 +117,7 @@ class E1000eNetworkInterface final : public INetworkInterface {
   void wake_phy();
   void enable_autonegotiation();
   bool reset();
+  void reclaim_transmitted();
   ByteView rx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
   ByteView tx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{kReceiveDescriptors + i} * kBufferSize, kBufferSize); }
 
@@ -117,8 +131,12 @@ class E1000eNetworkInterface final : public INetworkInterface {
   ArrayView<TransmitDescriptor> tx_ring_;
   ByteView buffers_;  // receive buffers, then transmit buffers
   uint32_t rx_next_ = 0;
-  uint32_t tx_next_ = 0;
+  uint32_t tx_next_ = 0;   // the next descriptor to fill
+  uint32_t tx_clean_ = 0;  // the first descriptor the card may still be using
+  uint8_t tx_frame_end_[kTransmitDescriptors] = {};  // for the descriptor a frame starts at: the one it ends at
+  static_assert(kTransmitDescriptors <= 256);
   uint32_t receive_control_ = 0;
+  intel_eth::IntelInterrupts interrupts_;
   MacAddress mac_{};
   kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;

@@ -29,7 +29,11 @@ constexpr uint32_t kTxConfig = 0x40, kRxConfig = 0x44, kCfg9346 = 0x50, kPhyStat
 constexpr uint32_t kRxDescLow = 0xE4, kRxDescHigh = 0xE8, kMaxTxPacketSize = 0xEC, kMisc = 0xF0;
 
 constexpr uint8_t kCmdReset = 0x10, kCmdRxEnable = 0x08, kCmdTxEnable = 0x04;
-constexpr uint8_t kTxPollNormal = 0x40;
+constexpr uint8_t kTxPollNormal = 0x40, kTxPollSoftwareInterrupt = 0x01;
+// IntrStatus / IntrMask
+constexpr uint32_t kIntRxOk = 0x0001, kIntRxError = 0x0002, kIntRxOverflow = 0x0010, kIntLinkChange = 0x0020, kIntRxFifoOverflow = 0x0040,
+                   kIntSoftware = 0x0100;
+constexpr uint32_t kInterruptMask = kIntRxOk | kIntRxError | kIntRxOverflow | kIntLinkChange | kIntRxFifoOverflow | kIntSoftware;
 constexpr uint8_t kCfg9346Unlock = 0xC0, kCfg9346Lock = 0x00;
 constexpr uint32_t kAcceptBroadcast = 0x08, kAcceptMulticast = 0x04, kAcceptMyPhys = 0x02, kAcceptAllPhys = 0x01, kAcceptMask = 0x3F;
 constexpr uint32_t kTxDmaBurst = 7u << 8, kTxInterFrameGap = 3u << 24, kTxAutoFifo = 1u << 7;
@@ -42,6 +46,12 @@ constexpr uint16_t kPhyFullDuplex = 0x01, kPhyLink = 0x02, kPhy10 = 0x04, kPhy10
 
 // Descriptor opts1
 constexpr uint32_t kDescOwn = 1u << 31, kRingEnd = 1u << 30, kFirstFrag = 1u << 29, kLastFrag = 1u << 28, kRxError = 1u << 21, kLengthMask = 0x3FFF;
+// Receive checksums (opts1): the protocol the chip found (PID1:PID0 = UDP 10, TCP 01, other IP 11) and what failed.
+constexpr uint32_t kRxProtoUdp = 1u << 18, kRxProtoTcp = 1u << 17, kRxProtoMask = kRxProtoUdp | kRxProtoTcp, kRxIpFail = 1u << 16,
+                   kRxUdpFail = 1u << 15, kRxTcpFail = 1u << 14;
+// Transmit checksums: the RTL8169 family in opts1 (TD0), every later chip in opts2 (TD1) with the transport header's offset.
+constexpr uint32_t kTd0Tcp = 1u << 16, kTd0Udp = 1u << 17, kTd0Ip = 1u << 18;
+constexpr uint32_t kTd1Ipv4 = 1u << 29, kTd1Tcp = 1u << 30, kTd1Udp = 1u << 31, kTd1TransportShift = 18, kTd1TransportMax = 0x3FF;
 constexpr uint32_t kCrcLength = 4;
 
 constexpr uint32_t kRxFifoThreshold = 7u << 13, kRxDmaBurst = 7u << 8, kRx128Int = 1u << 15, kRxMulti = 1u << 14, kRxEarlyOff = 1u << 11, kRxFetch8125 = 8u << 27;
@@ -126,6 +136,11 @@ bool Rtl8169NetworkInterface::supports(uint16_t vendor_id, uint16_t device_id) {
   return false;
 }
 
+void Rtl8169NetworkInterface::write_interrupt_mask(uint32_t mask) {
+  if (new_layout()) regs().write32(kIntrMask8125, mask);
+  else regs().write16(kIntrMask, static_cast<uint16_t>(mask));
+}
+
 void Rtl8169NetworkInterface::mask_interrupts() {
   if (new_layout()) {
     regs().write32(kIntrMask8125, 0);
@@ -185,7 +200,7 @@ bool Rtl8169NetworkInterface::initialize() {
     regs().write8(kMaxTxPacketSize, kNoEarlyTx);
     regs().write16(kIntrMitigate, 0);
   }
-  regs().write16(kCPlusCmd, regs().read16(kCPlusCmd) & ~(kCPlusRxChecksum | kCPlusRxVlan));
+  regs().write16(kCPlusCmd, static_cast<uint16_t>((regs().read16(kCPlusCmd) & ~kCPlusRxVlan) | kCPlusRxChecksum));
   regs().write16(kRxMaxSize, kBufferSize);
   const uint64_t tx = nic_dma_address(tx_ring_), rx = nic_dma_address(rx_ring_);
   regs().write32(kTxDescHigh, static_cast<uint32_t>(tx >> 32));
@@ -207,6 +222,7 @@ bool Rtl8169NetworkInterface::initialize() {
 }
 
 void Rtl8169NetworkInterface::shutdown() {
+  disable_interrupts();
   if (claimed_) {
     if (chip_) {
       started_ = false;
@@ -267,9 +283,11 @@ LinkDuplex Rtl8169NetworkInterface::link_duplex() const {
   return (status & kPhyFullDuplex) ? LinkDuplex::Full : LinkDuplex::Half;
 }
 
-bool Rtl8169NetworkInterface::transmit(ConstByteView frame) {
+bool Rtl8169NetworkInterface::transmit(ConstByteView frame) { return transmit_frame(frame, TransmitChecksum{}); }
+
+bool Rtl8169NetworkInterface::transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame || (checksum.requested() && !checksum.fits(frame.size()))) {
     ++stats_.send_failures;
     return false;
   }
@@ -283,10 +301,24 @@ bool Rtl8169NetworkInterface::transmit(ConstByteView frame) {
   const ByteView buffer = tx_buffer(tx_next_).first(padded);
   buffer.fill(0);
   buffer.copy_from(frame);
-  d.opts2 = 0;
+  uint32_t opts1 = 0, opts2 = 0;
+  if (checksum.requested()) {
+    const bool hardware = (checksum.tcp() || checksum.udp()) && frame.size() >= kEthernetMinFrame && checksum.start <= kTd1TransportMax;
+    if (!hardware) {
+      if (!finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
+        ++stats_.send_failures;
+        return false;
+      }
+    } else if (chip_->family == RtlFamily::Rtl8169) {
+      opts1 = kTd0Ip | (checksum.tcp() ? kTd0Tcp : kTd0Udp);
+    } else {
+      opts2 = kTd1Ipv4 | (checksum.tcp() ? kTd1Tcp : kTd1Udp) | (uint32_t{checksum.start} << kTd1TransportShift);
+    }
+  }
+  d.opts2 = opts2;
   d.address = nic_dma_address(tx_buffer(tx_next_));
   __atomic_thread_fence(__ATOMIC_RELEASE);  // the frame and the address before the ownership bit
-  d.opts1 = kDescOwn | kFirstFrag | kLastFrag | padded | (tx_next_ == kTransmitDescriptors - 1 ? kRingEnd : 0);
+  d.opts1 = kDescOwn | kFirstFrag | kLastFrag | opts1 | padded | (tx_next_ == kTransmitDescriptors - 1 ? kRingEnd : 0);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
   if (new_layout())
@@ -298,8 +330,15 @@ bool Rtl8169NetworkInterface::transmit(ConstByteView frame) {
 }
 
 bool Rtl8169NetworkInterface::receive(ByteView buffer, uint32_t* length) {
+  ReceivedFrame frame;
+  if (!length || !receive_frame(buffer, &frame)) return false;
+  *length = frame.length;
+  return true;
+}
+
+bool Rtl8169NetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* received) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !length) return false;
+  if (!started_ || !received) return false;
   for (uint32_t tries = 0; tries < kReceiveDescriptors; ++tries) {
     volatile Descriptor& d = rx_ring_[rx_next_];
     const uint32_t status = d.opts1;
@@ -312,7 +351,8 @@ bool Rtl8169NetworkInterface::receive(ByteView buffer, uint32_t* length) {
     if (usable) {
       const uint32_t frame = size - kCrcLength;
       buffer.copy_from(ConstByteView(rx_buffer(rx_next_)).first(frame).at_most(buffer.size()));  // as much as fits
-      *length = frame;
+      const uint32_t checked = status & (kRxProtoMask | kRxIpFail | kRxUdpFail | kRxTcpFail);
+      *received = ReceivedFrame{frame, (status & kRxProtoMask) != 0 && !(status & kRxIpFail), checked == kRxProtoTcp || checked == kRxProtoUdp};
       ++stats_.frames_received;
     } else {
       ++stats_.frames_dropped;
@@ -325,6 +365,54 @@ bool Rtl8169NetworkInterface::receive(ByteView buffer, uint32_t* length) {
     if (usable) return true;
   }
   return false;
+}
+
+// ---- interrupts -----------------------------------------------------------------------------------------------------------------------------------
+
+// Takes no lock: the status bits are acknowledged (write 1 to clear) and whoever polls is woken; the rings are looked at by receive().
+void Rtl8169NetworkInterface::on_interrupt(void* self) {
+  Rtl8169NetworkInterface* nic = static_cast<Rtl8169NetworkInterface*>(self);
+  INicRegisters& regs = nic->regs();
+  const uint32_t status = nic->new_layout() ? regs.read32(kIntrStatus8125) : regs.read16(kIntrStatus);
+  if (status == 0 || status == 0xFFFFu || status == 0xFFFFFFFFu) return;  // not ours, or the chip is gone
+  if (nic->new_layout()) regs.write32(kIntrStatus8125, status);
+  else regs.write16(kIntrStatus, static_cast<uint16_t>(status));
+  __atomic_fetch_add(&nic->interrupt_count_, 1, __ATOMIC_ACQ_REL);
+  const NetworkWake wake = __atomic_load_n(&nic->wake_, __ATOMIC_ACQUIRE);
+  if (wake) wake(__atomic_load_n(&nic->wake_context_, __ATOMIC_ACQUIRE));
+}
+
+bool Rtl8169NetworkInterface::enable_interrupts(NetworkWake wake, void* context) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || interrupts_ || !wake) return interrupts_;
+  __atomic_store_n(&wake_context_, context, __ATOMIC_RELEASE);
+  __atomic_store_n(&wake_, wake, __ATOMIC_RELEASE);
+  if (!device_->attach_interrupt(&Rtl8169NetworkInterface::on_interrupt, this)) {
+    __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+    return false;
+  }
+  mask_interrupts();
+  write_interrupt_mask(kInterruptMask);
+  interrupts_ = true;
+  if (new_layout()) return true;  // (no software interrupt to test with)
+  // Forced software interrupt: if it does not come within 20 ms the message is lost somewhere, and the chip stays polled.
+  const uint64_t before = __atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE);
+  regs().write8(kTxPoll, kTxPollSoftwareInterrupt);
+  for (int i = 0; i < 200 && __atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE) == before; ++i) delay_us(100);
+  if (__atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE) != before) return true;
+  write_interrupt_mask(0);
+  device_->detach_interrupt();
+  __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+  interrupts_ = false;
+  return false;
+}
+
+void Rtl8169NetworkInterface::disable_interrupts() {
+  if (!interrupts_) return;
+  if (claimed_) write_interrupt_mask(0);
+  device_->detach_interrupt();
+  __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
+  interrupts_ = false;
 }
 
 }  // namespace hardware

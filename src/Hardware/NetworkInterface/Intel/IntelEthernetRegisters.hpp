@@ -27,7 +27,7 @@ namespace hardware {
 namespace intel_eth {
 
 constexpr uint32_t kCtrl = 0x0000, kStatus = 0x0008, kEecd = 0x0010, kCtrlExt = 0x0018, kMdic = 0x0020, kFextnvm3 = 0x003C;
-constexpr uint32_t kIcr = 0x00C0, kIms = 0x00D0, kImc = 0x00D8, kRctl = 0x0100, kTctl = 0x0400, kTipg = 0x0410;
+constexpr uint32_t kIcr = 0x00C0, kIcs = 0x00C8, kIms = 0x00D0, kImc = 0x00D8, kRxcsum = 0x5000, kIvar0 = 0x1700, kRctl = 0x0100, kTctl = 0x0400, kTipg = 0x0410;
 constexpr uint32_t kExtcnfCtrl = 0x0F00, kIosfpc = 0x0F28, kEimc = 0x1528;
 constexpr uint32_t kMta = 0x5200, kRal0 = 0x5400, kRah0 = 0x5404, kFwsm = 0x5B54;
 
@@ -47,6 +47,30 @@ constexpr uint32_t kTctlEnable = 1u << 1, kTctlPadShortPackets = 1u << 3, kTctlC
 constexpr uint32_t kTctlRetransmitLateCollision = 1u << 24;
 constexpr uint32_t kTipgDefault = 0x0060200A;  // IPGT 10, IPGR1 8, IPGR2 6 (IEEE 802.3)
 constexpr uint32_t kRahAddressValid = 1u << 31;
+// ICR / IMS / ICS: the causes a polled-with-interrupts driver wants (link change, receive descriptors low, receive overrun, receive timer)
+constexpr uint32_t kIntLinkChange = 1u << 2, kIntRxDescriptorsLow = 1u << 4, kIntRxOverrun = 1u << 6, kIntRxTimer = 1u << 7;
+constexpr uint32_t kInterruptMask = kIntLinkChange | kIntRxDescriptorsLow | kIntRxOverrun | kIntRxTimer;
+// RXCSUM: check IP and TCP/UDP checksums on receive
+constexpr uint32_t kRxcsumIp = 1u << 8, kRxcsumTcpUdp = 1u << 9;
+
+// Interrupts the way every one of these drivers does them in MSI mode: the cause register is read (which clears it), whoever polls is woken.
+// Routed with INicDevice::attach_interrupt; enable() tests the route with a software-raised link-change interrupt (ICS) and keeps the
+// interrupt only if it arrives within 20 ms.
+class IntelInterrupts {
+ public:
+  bool enable(INicDevice& device, NetworkWake wake, void* context);
+  void disable(INicDevice& device, bool registers_mapped);
+  bool enabled() const { return enabled_; }
+  uint64_t count() const { return __atomic_load_n(&count_, __ATOMIC_ACQUIRE); }
+
+ private:
+  static void on_interrupt(void* self);
+  INicRegisters* regs_ = nullptr;   // read by the interrupt handler (atomic)
+  NetworkWake wake_ = nullptr;
+  void* context_ = nullptr;
+  bool enabled_ = false;
+  uint64_t count_ = 0;              // atomic
+};
 
 // Turns DMA off and waits until the device has finished the transfers it had started (the step before every reset).
 void stop_dma(INicRegisters& regs);

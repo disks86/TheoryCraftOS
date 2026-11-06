@@ -33,8 +33,13 @@ constexpr uint32_t kFwsmResetAllowed = 1u << 6;  // RSPCIPHY: the ME lets the ho
 constexpr uint32_t kFextnvm3PhyCfgMask = 0x0C000000, kFextnvm3PhyCfg50ms = 0x08000000;
 constexpr uint32_t kIosfpcRdmtsHex = 0x00010000, kTarc0MultiQ3 = 3u << 28, kTarc0MultiQ2 = 1u << 29;
 
-constexpr uint8_t kStatusDescriptorDone = 1u << 0, kStatusEndOfPacket = 1u << 1;
-constexpr uint8_t kCommandEndOfPacket = 1u << 0, kCommandInsertCrc = 1u << 1, kCommandReportStatus = 1u << 3;
+constexpr uint8_t kStatusDescriptorDone = 1u << 0, kStatusEndOfPacket = 1u << 1, kStatusIgnoreChecksum = 1u << 2, kStatusUdpChecksum = 1u << 4,
+                  kStatusTcpChecksum = 1u << 5, kStatusIpChecksum = 1u << 6;
+constexpr uint8_t kErrorTcpUdpChecksum = 1u << 5, kErrorIpChecksum = 1u << 6;  // (checksum errors: the frame is passed on, software looks again)
+constexpr uint8_t kCommandEndOfPacket = 1u << 0, kCommandInsertCrc = 1u << 1, kCommandReportStatus = 1u << 3, kCommandExtended = 1u << 5;
+// Checksums go through a TCP/IP context descriptor (TUCSS/TUCSO; TUCMD: extended, TCP) and an extended data descriptor (DTYP 1, POPTS.TXSM),
+// as e1000e does: the legacy descriptor's CSO/CSS insertion is not implemented everywhere (QEMU's 82574 ignores it).
+constexpr uint8_t kContextTcp = 1u << 0, kDataDescriptorType = 1u << 4, kPoptsTransportChecksum = 1u << 1;
 
 using K = E1000eKind;
 // e1000e's PCI table (hw.h). One line per device id; the names are what Intel sells them as.
@@ -202,7 +207,8 @@ bool E1000eNetworkInterface::initialize() {
   if (rx_ring_.empty() || tx_ring_.empty() || buffers_.empty()) return false;
   for (uint32_t i = 0; i < kReceiveDescriptors; ++i) rx_ring_[i] = ReceiveDescriptor{nic_dma_address(rx_buffer(i)), 0, 0, 0, 0, 0};
   for (uint32_t i = 0; i < kTransmitDescriptors; ++i)
-    tx_ring_[i] = TransmitDescriptor{nic_dma_address(tx_buffer(i)), 0, 0, 0, kStatusDescriptorDone, 0, 0};  // free: "the device is done with it"
+    tx_ring_[i] = TransmitDescriptor{nic_dma_address(tx_buffer(i)), 0, 0, 0, 0, 0, 0};
+  tx_clean_ = 0;
   __atomic_thread_fence(__ATOMIC_RELEASE);
 
   const uint64_t rx = nic_dma_address(rx_ring_), tx = nic_dma_address(tx_ring_);
@@ -225,6 +231,7 @@ bool E1000eNetworkInterface::initialize() {
   }
   regs().write32(kTipg, kTipgDefault);
 
+  regs().set_bits32(kRxcsum, kRxcsumIp | kRxcsumTcpUdp);
   receive_control_ = kRctlEnable | kRctlBroadcast | kRctlStripCrc;  // 2 KiB buffers: BSIZE = 0
   regs().write32(kRctl, receive_control_);
   regs().write32(kTctl, kTctlEnable | kTctlPadShortPackets | kTctlRetransmitLateCollision | kTctlCollisionThreshold | kTctlCollisionDistance);
@@ -233,6 +240,7 @@ bool E1000eNetworkInterface::initialize() {
 }
 
 void E1000eNetworkInterface::shutdown() {
+  disable_interrupts();
   if (claimed_) {
     started_ = false;
     if (model_ && regs().read32(kStatus) != 0xFFFFFFFFu) {
@@ -264,35 +272,92 @@ bool E1000eNetworkInterface::accept_all_multicast(bool enable) {
   return enable;
 }
 
-bool E1000eNetworkInterface::transmit(ConstByteView frame) {
+bool E1000eNetworkInterface::enable_interrupts(NetworkWake wake, void* context) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
+  return started_ && interrupts_.enable(*device_, wake, context);
+}
+
+bool E1000eNetworkInterface::transmit(ConstByteView frame) { return transmit_frame(frame, TransmitChecksum{}); }
+
+// Frames the card has sent give their descriptors back: DD is written back to the data descriptor that ends each (not to a context descriptor).
+void E1000eNetworkInterface::reclaim_transmitted() {
+  while (tx_clean_ != tx_next_) {
+    const uint32_t end = tx_frame_end_[tx_clean_];
+    volatile TransmitDescriptor& d = tx_ring_[end];
+    if (!(d.status & kStatusDescriptorDone)) return;
+    tx_clean_ = (end + 1) % kTransmitDescriptors;
+  }
+}
+
+bool E1000eNetworkInterface::transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame || (checksum.requested() && !checksum.fits(frame.size()))) {
     ++stats_.send_failures;
     return false;
   }
-  volatile TransmitDescriptor& d = tx_ring_[tx_next_];
-  if (!(d.status & kStatusDescriptorDone)) {  // the card has not finished with this one yet
+  const bool hardware = checksum.requested() && (checksum.tcp() || checksum.udp()) && checksum.field < 256;
+  const uint32_t needed = hardware ? 2 : 1;
+  reclaim_transmitted();
+  const uint32_t in_flight = (tx_next_ + kTransmitDescriptors - tx_clean_) % kTransmitDescriptors;
+  if (kTransmitDescriptors - 1 - in_flight < needed) {  // the card has not sent enough yet
     ++stats_.send_failures;
     return false;
   }
+  const uint32_t first = tx_next_;
+  if (hardware) {
+    // The context: the transport checksum covers TUCSS to the end of the frame (TUCSE 0) and goes to TUCSO. No IP header checksum (the stack's).
+    volatile TransmitDescriptor& context = tx_ring_[first];
+    context.address = (uint64_t{checksum.start} << 32) | (uint64_t{checksum.field} << 40);
+    context.length = 0;
+    context.checksum_offset = 0;  // (PAYLEN 19:16, DTYP 0: context)
+    context.command = static_cast<uint8_t>(kCommandExtended | (checksum.tcp() ? kContextTcp : 0));
+    context.status = 0;
+    context.checksum_start = 0;
+    context.special = 0;
+    tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+  }
+  const uint32_t slot = tx_next_;
   const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
-  const ByteView buffer = tx_buffer(tx_next_).first(padded);
+  const ByteView buffer = tx_buffer(slot).first(padded);
   buffer.fill(0);
   buffer.copy_from(frame);
-  d.address = nic_dma_address(tx_buffer(tx_next_));
+  if (checksum.requested() && !hardware && !finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
+    tx_next_ = first;
+    ++stats_.send_failures;
+    return false;
+  }
+  volatile TransmitDescriptor& d = tx_ring_[slot];
+  d.address = nic_dma_address(tx_buffer(slot));
   d.length = static_cast<uint16_t>(padded);
   d.status = 0;
-  d.command = kCommandEndOfPacket | kCommandInsertCrc | kCommandReportStatus;
+  d.special = 0;
+  if (hardware) {  // an extended data descriptor: DTYP 1, POPTS where the legacy one has CSS
+    d.checksum_offset = kDataDescriptorType;
+    d.checksum_start = kPoptsTransportChecksum;
+    d.command = kCommandEndOfPacket | kCommandInsertCrc | kCommandReportStatus | kCommandExtended;
+  } else {
+    d.checksum_offset = 0;
+    d.checksum_start = 0;
+    d.command = kCommandEndOfPacket | kCommandInsertCrc | kCommandReportStatus;
+  }
+  tx_frame_end_[first] = static_cast<uint8_t>(slot);
   __atomic_thread_fence(__ATOMIC_RELEASE);  // descriptor contents before the tail moves
-  tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+  tx_next_ = (slot + 1) % kTransmitDescriptors;
   regs().write32(kTdt, tx_next_);
   ++stats_.frames_sent;
   return true;
 }
 
 bool E1000eNetworkInterface::receive(ByteView buffer, uint32_t* length) {
+  ReceivedFrame frame;
+  if (!length || !receive_frame(buffer, &frame)) return false;
+  *length = frame.length;
+  return true;
+}
+
+bool E1000eNetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* received) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !length) return false;
+  if (!started_ || !received) return false;
   for (uint32_t tries = 0; tries < kReceiveDescriptors; ++tries) {
     volatile ReceiveDescriptor& d = rx_ring_[rx_next_];
     const uint8_t status = d.status;
@@ -301,10 +366,13 @@ bool E1000eNetworkInterface::receive(ByteView buffer, uint32_t* length) {
 
     // With 2 KiB buffers and no long-packet mode a frame always fits one descriptor; one that does not end there is dropped.
     const uint32_t frame = d.length;
-    const bool usable = d.errors == 0 && (status & kStatusEndOfPacket) && frame > 0 && frame <= kBufferSize;
+    const uint8_t errors = d.errors;
+    const bool usable = (errors & ~(kErrorTcpUdpChecksum | kErrorIpChecksum)) == 0 && (status & kStatusEndOfPacket) && frame > 0 && frame <= kBufferSize;
     if (usable) {
       buffer.copy_from(ConstByteView(rx_buffer(rx_next_)).first(frame).at_most(buffer.size()));  // as much as fits
-      *length = frame;
+      const bool checked = !(status & kStatusIgnoreChecksum);
+      *received = ReceivedFrame{frame, checked && (status & kStatusIpChecksum) && !(errors & kErrorIpChecksum),
+                                checked && (status & (kStatusTcpChecksum | kStatusUdpChecksum)) && !(errors & kErrorTcpUdpChecksum)};
       ++stats_.frames_received;
     } else {
       ++stats_.frames_dropped;

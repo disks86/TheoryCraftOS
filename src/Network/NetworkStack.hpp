@@ -66,6 +66,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   // --- INetworkStack
   kernel::RecursiveMutex& mutex() override { return mutex_; }
   void poll() override;
+  // The last poll() stopped at its limit of frames: more are probably waiting (an interrupt will not announce those again).
+  bool saturated() const { return saturated_; }
   IpConfiguration configuration() const override;
   void configure(const IpConfiguration& configuration) override;
   void start_dhcp() override;
@@ -108,12 +110,14 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void on_lease(const IpConfiguration& configuration) override;
   void on_lease_lost() override;
 
-  void handle_frame(ConstByteView frame);
+  void handle_frame(ConstByteView frame, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
   void handle_arp(ConstByteView arp);
-  void handle_ipv4(ConstByteView packet, bool looped = false);
+  void handle_ipv4(ConstByteView packet, bool looped = false, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
   void deliver_looped();
   void handle_icmp(Ipv4Address source, ConstByteView icmp);
-  bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload);
+  // `checksum` (offsets into the payload: an IP packet) is a transport checksum still to finish: by the interface when it offloads them.
+  bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload,
+                  hardware::TransmitChecksum checksum = hardware::TransmitChecksum{});
   void send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
   void send_arp_from(uint16_t operation, Ipv4Address sender_ip, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
   void service_link_local();
@@ -133,6 +137,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   hardware::IClock& clock_;
   allocators::IAllocator& allocator_;
   bool follow_link_ = false, link_was_up_ = false;
+  bool saturated_ = false;
   enum class LinkLocalState : uint8_t { Off, Probing, Announcing, Bound };
   bool link_local_enabled_ = false;
   LinkLocalState link_local_state_ = LinkLocalState::Off;
