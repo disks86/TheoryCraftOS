@@ -17,9 +17,10 @@
  */
 
 // What a driver needs to hand a TCP segment to a controller that cuts it into frames itself (TCP segmentation offload): where the headers
-// are, checked against the frame, and the header changes Intel's controllers expect (as igb_tso / e1000_tso make them): the IP total length
-// and header checksum zero (the controller writes each frame's), and the pseudo-header sum in the TCP checksum field without the length
-// (each frame's length is added by the controller).
+// are, checked against the frame (IPv4, or IPv6 with TCP straight after the fixed header), and the header changes the controllers expect
+// (as igb_tso / e1000_tso and, for IPv6, tcp_v6_gso_csum_prep make them): the IPv4 total length and header checksum zero, or the IPv6
+// payload length zero (the controller writes each frame's), and the pseudo-header sum in the TCP checksum field without the length (each
+// frame's length is added by the controller).
 #pragma once
 #include <stdint.h>
 #include "Hardware/NetworkInterface/NetworkTypes.hpp"
@@ -31,11 +32,33 @@ struct TsoLayout {
   uint16_t tcp_start = 0;      // where the TCP header begins
   uint16_t header_length = 0;  // Ethernet, IP and TCP headers together
   uint32_t payload = 0;        // TCP payload bytes (what is cut into segments)
+  bool ipv6 = false;
 };
+
+// Which IP version a frame carries (by its EtherType): 4, 6, or 0 for anything else.
+inline uint32_t frame_ip_version(ConstByteView frame) {
+  if (frame.size() < kEthernetHeaderSize) return 0;
+  if (frame[12] == 0x08 && frame[13] == 0x00) return 4;
+  if (frame[12] == 0x86 && frame[13] == 0xDD) return 6;
+  return 0;
+}
 
 // Reads the layout of an IPv4 TCP frame whose checksum request (as transmit_segmented() gets it) points at its TCP checksum field. False
 // for anything else: not IPv4, not TCP, a fragment, lengths that do not agree with the frame, or no payload.
 inline bool tso_layout(ConstByteView frame, TransmitChecksum checksum, TsoLayout* out) {
+  if (frame_ip_version(frame) == 6) {
+    ByteReader in(frame.dropped(kEthernetHeaderSize));
+    const uint32_t first = in.be32();
+    const uint16_t payload_length = in.be16();
+    const uint8_t next = in.u8();
+    const uint32_t tcp_start = kEthernetHeaderSize + 40;
+    if (!in.ok() || (first >> 28) != 6 || next != 6 || payload_length != frame.size() - tcp_start || tcp_start + 20 > frame.size()) return false;
+    const uint32_t tcp_header = (frame[tcp_start + 12] >> 4) * 4u;
+    if (tcp_header < 20 || tcp_start + tcp_header >= frame.size() || checksum.start != tcp_start || !checksum.tcp()) return false;
+    *out = TsoLayout{static_cast<uint16_t>(kEthernetHeaderSize), static_cast<uint16_t>(tcp_start), static_cast<uint16_t>(tcp_start + tcp_header),
+                     static_cast<uint32_t>(frame.size() - tcp_start - tcp_header), true};
+    return true;
+  }
   ByteReader in(frame);
   in.skip(12);
   const uint16_t ether_type = in.be16();
@@ -62,10 +85,15 @@ inline bool tso_layout(ConstByteView frame, TransmitChecksum checksum, TsoLayout
 // elsewhere, in the next transmit buffers).
 inline bool prepare_tso_headers(ByteView frame, const TsoLayout& layout) {
   if (frame.size() < layout.header_length || layout.header_length < layout.tcp_start + 20u) return false;
-  frame[layout.ip_start + 2] = 0;  // total length
-  frame[layout.ip_start + 3] = 0;
-  frame[layout.ip_start + 10] = 0;  // header checksum
-  frame[layout.ip_start + 11] = 0;
+  if (layout.ipv6) {
+    frame[layout.ip_start + 4] = 0;  // payload length
+    frame[layout.ip_start + 5] = 0;
+  } else {
+    frame[layout.ip_start + 2] = 0;  // total length
+    frame[layout.ip_start + 3] = 0;
+    frame[layout.ip_start + 10] = 0;  // header checksum
+    frame[layout.ip_start + 11] = 0;
+  }
   // The seed covers the TCP length of the whole segment: subtract it (ones'-complement arithmetic: add its complement).
   const uint32_t tcp_length = layout.header_length - layout.tcp_start + layout.payload;
   const uint32_t field = layout.tcp_start + 16u;

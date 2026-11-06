@@ -45,6 +45,101 @@ bool parse_ipv4(StringView text, Ipv4Address* address) {
   return true;
 }
 
+bool parse_ipv6(StringView text, Ipv6Address* address) {
+  if (text.size() < 2 || text.size() > 45) return false;  // ("::" to the longest form with an IPv4 tail)
+  uint16_t groups[8] = {};
+  uint32_t count = 0;
+  int gap = -1;  // where "::" stands (the number of groups before it)
+  uint64_t i = 0;
+  if (text[0] == ':') {
+    if (text[1] != ':') return false;
+    gap = 0;
+    i = 2;
+  }
+  while (i < text.size()) {
+    // An IPv4 address in the last 32 bits: the rest of the text has a dot.
+    bool dotted = false;
+    for (uint64_t j = i; j < text.size() && text[j] != ':'; ++j) dotted = dotted || text[j] == '.';
+    if (dotted) {
+      Ipv4Address v4;
+      if (count > 6 || !parse_ipv4(text.substr(i, text.size() - i), &v4)) return false;
+      groups[count++] = static_cast<uint16_t>((v4.octets[0] << 8) | v4.octets[1]);
+      groups[count++] = static_cast<uint16_t>((v4.octets[2] << 8) | v4.octets[3]);
+      i = text.size();
+      break;
+    }
+    uint32_t value = 0, digits = 0;
+    for (; i < text.size() && text[i] != ':'; ++i, ++digits) {
+      const char c = text[i];
+      const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+      if (d < 0 || digits >= 4) return false;
+      value = (value << 4) | static_cast<uint32_t>(d);
+    }
+    if (digits == 0 || count >= 8) return false;
+    groups[count++] = static_cast<uint16_t>(value);
+    if (i == text.size()) break;
+    ++i;  // the ':'
+    if (i < text.size() && text[i] == ':') {
+      if (gap >= 0) return false;  // only one "::"
+      gap = static_cast<int>(count);
+      ++i;
+    } else if (i == text.size()) {
+      return false;  // a trailing single ':'
+    }
+  }
+  if (gap < 0 ? count != 8 : count > 7) return false;
+  Ipv6Address a{};
+  const uint32_t zeros = 8 - count;
+  for (uint32_t g = 0, out = 0; g < count; ++g, ++out) {
+    if (gap >= 0 && g == static_cast<uint32_t>(gap)) out += zeros;
+    a.bytes[2 * out] = static_cast<uint8_t>(groups[g] >> 8);
+    a.bytes[2 * out + 1] = static_cast<uint8_t>(groups[g]);
+  }
+  if (address) *address = a;
+  return true;
+}
+
+uint32_t format_ipv6(const Ipv6Address& address, ArrayView<char> out) {
+  if (out.size() < 40) return 0;
+  // The longest run of zero groups (at least two; the first of equal ones).
+  int best = -1, best_length = 1;
+  for (int g = 0; g < 8;) {
+    if (address.group(g) != 0) {
+      ++g;
+      continue;
+    }
+    int end = g;
+    while (end < 8 && address.group(end) == 0) ++end;
+    if (end - g > best_length) {
+      best = g;
+      best_length = end - g;
+    }
+    g = end;
+  }
+  uint32_t n = 0;
+  const char* hex = "0123456789abcdef";
+  for (int g = 0; g < 8; ++g) {
+    if (g == best) {
+      out[n++] = ':';
+      if (g == 0) out[n++] = ':';
+      g += best_length - 1;
+      continue;
+    }
+    const uint16_t v = address.group(g);
+    bool started = false;
+    for (int shift = 12; shift >= 0; shift -= 4) {
+      const uint32_t digit = (v >> shift) & 0xF;
+      if (digit || started || shift == 0) {
+        out[n++] = hex[digit];
+        started = true;
+      }
+    }
+    if (g < 7) out[n++] = ':';
+  }
+  out[n] = 0;
+  return n;
+}
+
 // One lookup. Its fields are the resolver's working state; the application sees
 // only the IDnsQuery part.
 struct DnsResolver::Query final : IDnsQuery {
@@ -57,6 +152,10 @@ struct DnsResolver::Query final : IDnsQuery {
   }
   Ipv4Address address() const override {
     kernel::ScopedRecursiveMutex guard(*mutex);
+    return address_.v6 ? kAnyAddress : address_.ipv4;
+  }
+  IpAddress ip_address() const override {
+    kernel::ScopedRecursiveMutex guard(*mutex);
     return address_;
   }
   uint32_t ttl_seconds() const override {
@@ -67,8 +166,9 @@ struct DnsResolver::Query final : IDnsQuery {
   kernel::RecursiveMutex* mutex = nullptr;
 
   DnsStatus status_ = DnsStatus::Pending;
-  Ipv4Address address_ = kAnyAddress;
+  IpAddress address_;
   uint32_t ttl_ = 0;
+  uint16_t type = dns::kTypeA;
 
   char name[dns::kMaxTextName + 2] = {};
   uint16_t id = 0;
@@ -109,31 +209,32 @@ SharedPointer<IUdpSocket> DnsResolver::open_random_socket() {
   return stack_.udp_open(0);
 }
 
-const DnsResolver::CacheEntry* DnsResolver::lookup(StringView name) {
+const DnsResolver::CacheEntry* DnsResolver::lookup(StringView name, uint16_t type) {
   const uint64_t now = stack_.now_ms();
   for (uint64_t i = cache_.count(); i > 0; --i) {
     CacheEntry& e = cache_[i - 1];
     if (e.expires_ms <= now) {
       cache_.remove_at(i - 1);
-    } else if (dns::names_equal(StringView(e.name), name)) {
+    } else if (e.type == type && dns::names_equal(StringView(e.name), name)) {
       return &cache_[i - 1];
     }
   }
   return nullptr;
 }
 
-void DnsResolver::remember(StringView name, bool found, Ipv4Address address, uint32_t ttl_seconds) {
+void DnsResolver::remember(StringView name, uint16_t type, bool found, const IpAddress& address, uint32_t ttl_seconds) {
   if (ttl_seconds == 0) return;  // "do not cache"
   if (ttl_seconds > kMaxTtlSeconds) ttl_seconds = kMaxTtlSeconds;
   CacheEntry entry{};
   if (name.ends_with('.')) name = name.without_suffix(1);
   if (name.empty() || !name.copy_to(ArrayView<char>(entry.name))) return;  // names too long for the cache are simply not cached
+  entry.type = type;
   entry.found = found;
   entry.address = address;
   entry.expires_ms = stack_.now_ms() + uint64_t{ttl_seconds} * 1000;
 
   for (CacheEntry& e : cache_) {
-    if (dns::names_equal(StringView(e.name), StringView(entry.name))) {
+    if (e.type == type && dns::names_equal(StringView(e.name), StringView(entry.name))) {
       e = entry;
       return;
     }
@@ -147,22 +248,43 @@ void DnsResolver::remember(StringView name, bool found, Ipv4Address address, uin
   cache_.push_back(entry);
 }
 
-SharedPointer<IDnsQuery> DnsResolver::query(StringView name) {
+SharedPointer<IDnsQuery> DnsResolver::query(StringView name) { return start(name, dns::kTypeA); }
+SharedPointer<IDnsQuery> DnsResolver::query_aaaa(StringView name) { return start(name, dns::kTypeAaaa); }
+
+// The server: the IPv4 one the configuration names, else the IPv6 one from the router advertisements.
+bool DnsResolver::server(IpAddress* address) const {
+  const IpConfiguration config = stack_.configuration();
+  if (config.configured() && !config.dns.is_unspecified()) {
+    *address = IpAddress(config.dns);
+    return true;
+  }
+  const Ipv6Configuration config6 = stack_.configuration6();
+  if (config6.configured() && !config6.dns.is_unspecified()) {
+    *address = IpAddress(config6.dns);
+    return true;
+  }
+  return false;
+}
+
+SharedPointer<IDnsQuery> DnsResolver::start(StringView name, uint16_t type) {
   kernel::ScopedRecursiveMutex guard(stack_.mutex());
   uint8_t scratch[dns::kMaxName + 1];
-  Ipv4Address literal;
-  const bool is_address = parse_ipv4(name, &literal);
-  if (!is_address && !dns::encode_name(name, ByteView(scratch))) return SharedPointer<IDnsQuery>();  // not a valid host name
+  Ipv4Address literal4;
+  Ipv6Address literal6;
+  const bool is_v4 = parse_ipv4(name, &literal4), is_v6 = !is_v4 && parse_ipv6(name, &literal6);
+  if (!is_v4 && !is_v6 && !dns::encode_name(name, ByteView(scratch))) return SharedPointer<IDnsQuery>();  // not a valid host name
 
   SharedPointer<Query> q = SharedPointer<Query>::make(allocator_);
   if (!q) return SharedPointer<IDnsQuery>();
   q->mutex = &stack_.mutex();
-  if (is_address) {  // an address needs no lookup
-    q->status_ = DnsStatus::Resolved;
-    q->address_ = literal;
+  q->type = type;
+  if (is_v4 || is_v6) {  // an address needs no lookup (one of the other version has no address of this one)
+    const bool matches = (type == dns::kTypeA) == is_v4;
+    q->status_ = matches ? DnsStatus::Resolved : DnsStatus::NotFound;
+    if (matches) q->address_ = is_v4 ? IpAddress(literal4) : IpAddress(literal6);
     return SharedPointer<IDnsQuery>(q);
   }
-  if (const CacheEntry* cached = lookup(name)) {
+  if (const CacheEntry* cached = lookup(name, type)) {
     q->status_ = cached->found ? DnsStatus::Resolved : DnsStatus::NotFound;
     q->address_ = cached->address;
     q->ttl_ = static_cast<uint32_t>((cached->expires_ms - stack_.now_ms() + 999) / 1000);  // what is left of it, rounded up
@@ -185,14 +307,14 @@ void DnsResolver::finish(Query& q, DnsStatus status) {
 
 void DnsResolver::step(Query& q) {
   if (q.status_ != DnsStatus::Pending) return;
-  const IpConfiguration config = stack_.configuration();
-  if (!config.configured() || config.dns.is_unspecified()) {
+  IpAddress dns_server;
+  if (!server(&dns_server)) {
     finish(q, DnsStatus::Failed);
     return;
   }
   const uint64_t now = stack_.now_ms();
   uint8_t request[dns::kHeaderSize + dns::kMaxName + 4];
-  const uint32_t request_length = dns::build_query(q.id, StringView(q.name), ByteView(request));
+  const uint32_t request_length = dns::build_query(q.id, StringView(q.name), ByteView(request), q.type);
   if (!request_length) {
     finish(q, DnsStatus::Failed);
     return;
@@ -206,22 +328,22 @@ void DnsResolver::step(Query& q) {
     }
     // Answers that arrived since the last look.
     uint8_t reply[1500];
-    Ipv4Address from;
+    IpAddress from;
     uint16_t from_port = 0;
     uint32_t length = 0;
-    while (q.udp->receive_from(ByteView(reply), &from, &from_port, &length)) {
-      if (!(from == config.dns) || from_port != 53 || length > sizeof(reply)) continue;  // not from our server
+    while (q.udp->receive_from_ip(ByteView(reply), &from, &from_port, &length)) {
+      if (from != dns_server || from_port != 53 || length > sizeof(reply)) continue;  // not from our server
       dns::Answer answer;
-      switch (dns::parse_response(ConstByteView(reply).first(length), q.id, StringView(q.name), &answer)) {
+      switch (dns::parse_response(ConstByteView(reply).first(length), q.id, StringView(q.name), &answer, q.type)) {
         case dns::ParseResult::Answer:
           q.address_ = answer.address;
           q.ttl_ = answer.ttl;
-          remember(StringView(q.name), true, answer.address, answer.ttl);
+          remember(StringView(q.name), q.type, true, answer.address, answer.ttl);
           finish(q, DnsStatus::Resolved);
           return;
         case dns::ParseResult::NoSuchName:
         case dns::ParseResult::NoAddress:
-          remember(StringView(q.name), false, kAnyAddress, kNegativeTtlSeconds);
+          remember(StringView(q.name), q.type, false, IpAddress(), kNegativeTtlSeconds);
           finish(q, DnsStatus::NotFound);
           return;
         case dns::ParseResult::ServerError:
@@ -232,7 +354,7 @@ void DnsResolver::step(Query& q) {
           q.phase = Query::Phase::Tcp;
           q.next_ms = now + kTcpTimeoutMs;
           q.tcp = stack_.tcp_open();
-          if (!q.tcp || !q.tcp->connect(config.dns, 53)) finish(q, DnsStatus::Failed);
+          if (!q.tcp || !q.tcp->connect_ip(dns_server, 53)) finish(q, DnsStatus::Failed);
           return;
         case dns::ParseResult::Invalid:
           break;  // a stray or forged packet: keep waiting for the real one
@@ -243,7 +365,7 @@ void DnsResolver::step(Query& q) {
         finish(q, DnsStatus::Failed);
         return;
       }
-      q.udp->send_to(config.dns, 53, ConstByteView(request).first(request_length));
+      q.udp->send_to_ip(dns_server, 53, ConstByteView(request).first(request_length));
       q.next_ms = now + (1000u << q.attempts);  // 1 s, 2 s, 4 s
       ++q.attempts;
     }
@@ -274,16 +396,16 @@ void DnsResolver::step(Query& q) {
         finish(q, DnsStatus::Failed);
       } else if (q.tcp_received >= expected + 2) {
         dns::Answer answer;
-        switch (dns::parse_response(ConstByteView(q.tcp_buffer).subview(2, expected), q.id, StringView(q.name), &answer)) {
+        switch (dns::parse_response(ConstByteView(q.tcp_buffer).subview(2, expected), q.id, StringView(q.name), &answer, q.type)) {
           case dns::ParseResult::Answer:
             q.address_ = answer.address;
             q.ttl_ = answer.ttl;
-            remember(StringView(q.name), true, answer.address, answer.ttl);
+            remember(StringView(q.name), q.type, true, answer.address, answer.ttl);
             finish(q, DnsStatus::Resolved);
             break;
           case dns::ParseResult::NoSuchName:
           case dns::ParseResult::NoAddress:
-            remember(StringView(q.name), false, kAnyAddress, kNegativeTtlSeconds);
+            remember(StringView(q.name), q.type, false, IpAddress(), kNegativeTtlSeconds);
             finish(q, DnsStatus::NotFound);
             break;
           default:

@@ -31,5 +31,9 @@ uint16_t checksum_finish(uint32_t sum);
 // Sum over the pseudo-header that TCP and UDP checksums cover in addition to
 // their own segment: source, destination, protocol and segment length.
 uint32_t pseudo_header_sum(Ipv4Address source, Ipv4Address destination, uint8_t protocol, uint16_t length);
+// The IPv6 pseudo-header (RFC 8200 8.1): addresses, the upper-layer length (32 bits) and the next header. With an IpAddress pair: the one of
+// their family (both are of the same one).
+uint32_t pseudo_header_sum(const Ipv6Address& source, const Ipv6Address& destination, uint8_t next_header, uint32_t length);
+uint32_t pseudo_header_sum(const IpAddress& source, const IpAddress& destination, uint8_t protocol, uint32_t length);
 
 }  // namespace network

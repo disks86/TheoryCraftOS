@@ -18,7 +18,8 @@
 
 // Generic receive offload for TCP (Linux's GRO, in software): segments of one connection that arrive back to back in one poll are put
 // together into one larger segment before TCP sees them, so TCP takes (and acknowledges) one segment instead of many. The rules are Linux's
-// tcp_gro_receive: same addresses and ports, IPv4 without options or fragments, the next sequence number, the same acknowledgement, the same
+// tcp_gro_receive: same addresses and ports, IPv4 without options or fragments (or IPv6 with TCP straight after its header, the same
+// traffic class, flow label and hop limit), the next sequence number, the same acknowledgement, the same
 // TCP options, only ACK (PSH may end a run), no larger than the first one (a shorter one ends the run), and checksums that are right (the
 // interface checked them, or this does). The window of the last piece is kept.
 #pragma once
@@ -38,7 +39,7 @@ class TcpCoalescer {
   // a new run.
   bool offer(ConstByteView frame, const hardware::ReceivedFrame& checks);
   bool holding() const { return length_ != 0; }
-  // The run: one IPv4 packet with the total length of all of it (its header checksum and TCP checksum are not recomputed: it is handed on as
+  // The run: one IP packet with the (total or payload) length of all of it (its header checksum and TCP checksum are not recomputed: it is handed on as
   // checked).
   ConstByteView held() const { return ConstByteView(storage_).first(length_); }
   uint32_t pieces() const { return pieces_; }
@@ -51,6 +52,7 @@ class TcpCoalescer {
  private:
   struct Segment {
     ConstByteView ip;       // the IP packet (without Ethernet padding)
+    bool ipv6;
     uint32_t tcp_offset;    // from the start of the IP packet
     uint32_t tcp_header;
     uint32_t sequence, acknowledgement;
@@ -66,6 +68,8 @@ class TcpCoalescer {
   uint32_t next_sequence_ = 0;
   uint32_t piece_size_ = 0;  // the payload of the first piece: later ones may not be larger
   uint32_t tcp_header_ = 0;
+  uint32_t ip_header_ = 0;   // 20 (IPv4) or 40 (IPv6): where the run's TCP header is
+  bool ipv6_ = false;
   bool closed_ = false;      // the run ended (PSH, or a short piece): the next segment starts another
   uint64_t merged_ = 0;
 };

@@ -52,6 +52,13 @@ bool UdpSocket::send_from(Ipv4Address source, Ipv4Address address, uint16_t port
 }
 
 bool UdpSocket::receive_from(ByteView buffer, Ipv4Address* from_address, uint16_t* from_port, uint32_t* length) {
+  IpAddress from;
+  if (!receive_from_ip(buffer, &from, from_port, length)) return false;
+  if (from_address) *from_address = from.v6 ? kAnyAddress : from.ipv4;
+  return true;
+}
+
+bool UdpSocket::receive_from_ip(ByteView buffer, IpAddress* from_address, uint16_t* from_port, uint32_t* length) {
   StackLock guard(ip_);
   Datagram d;
   if (!queue_.dequeue(&d)) return false;
@@ -62,7 +69,23 @@ bool UdpSocket::receive_from(ByteView buffer, Ipv4Address* from_address, uint16_
   return true;
 }
 
-void UdpSocket::deliver(Ipv4Address from_address, uint16_t from_port, ConstByteView data) {
+// Over IPv6 the same datagram, sent with send_ip_to() (the IP layer fills in the checksum, which IPv6 requires) and 20 bytes shorter at most.
+bool UdpSocket::send_to_ip(const IpAddress& address, uint16_t port, ConstByteView data) {
+  if (!address.v6) return send_to(address.ipv4, port, data);
+  StackLock guard(ip_);
+  if (closed_ || data.size() > kMaxIpv6Payload - 8) return false;
+  uint8_t storage[8 + kMaxDatagram];
+  ByteWriter out{ByteView(storage)};
+  out.be16(port_);
+  out.be16(port);
+  out.be16(static_cast<uint16_t>(8 + data.size()));
+  out.be16(0);
+  out.bytes(data);
+  if (!out.ok()) return false;
+  return ip_.send_ip_to(address, kProtocolUdp, out.written());
+}
+
+void UdpSocket::deliver(const IpAddress& from_address, uint16_t from_port, ConstByteView data) {
   StackLock guard(ip_);
   if (closed_ || data.size() > kMaxDatagram || queue_.count() >= kQueueLimit) return;
   Datagram d;

@@ -85,7 +85,17 @@ static uint32_t toeplitz(const uint8_t* key, const uint8_t* input, size_t length
 }
 
 // True if an IPv4 TCP/UDP frame's transport checksum is right (UDP may say 0: none).
+static bool is_v6(const Bytes& f) { return f.size() >= 54 && f[12] == 0x86 && f[13] == 0xDD; }
 static bool transport_checksum_ok(const Bytes& f) {
+  if (is_v6(f)) {
+    const uint32_t l4 = (f[18] << 8) | f[19], protocol = f[20];
+    if ((protocol != 6 && protocol != 17) || 54 + l4 > f.size()) return false;
+    uint32_t sum = protocol + l4;
+    for (int i = 22; i < 54; i += 2) sum += (f[i] << 8) | f[i + 1];
+    for (uint32_t i = 0; i < l4; i += 2) sum += (f[54 + i] << 8) | (i + 1 < l4 ? f[54 + i + 1] : 0);
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return sum == 0xFFFF;
+  }
   if (f.size() < 34 || f[12] != 0x08 || f[13] != 0x00) return false;
   const uint32_t ihl = (f[14] & 0x0F) * 4u, total = (f[16] << 8) | f[17], protocol = f[23];
   if ((protocol != 6 && protocol != 17) || 14 + total > f.size()) return false;
@@ -124,6 +134,41 @@ static Bytes transport_frame(uint8_t protocol, uint32_t payload, TransmitChecksu
   f[field + 1] = static_cast<uint8_t>(seed);
   *request = TransmitChecksum{static_cast<uint16_t>(14 + ip_header), static_cast<uint16_t>(field)};
   return f;
+}
+
+// The same over IPv6 (2001:db8::1 -> 2001:db8::2): TCP or UDP straight after the 40-byte header.
+static Bytes transport_frame6(uint8_t protocol, uint32_t payload, TransmitChecksum* request) {
+  const uint32_t l4_header = protocol == 6 ? 20 : 8, l4 = l4_header + payload;
+  Bytes f(54 + l4, 0);
+  for (int i = 0; i < 6; ++i) { f[i] = 0x02; f[6 + i] = 0x04; }
+  f[12] = 0x86;
+  f[13] = 0xDD;
+  f[14] = 0x60;
+  f[18] = static_cast<uint8_t>(l4 >> 8);
+  f[19] = static_cast<uint8_t>(l4);
+  f[20] = protocol;
+  f[21] = 64;
+  f[22] = 0x20; f[23] = 0x01; f[24] = 0x0D; f[25] = 0xB8; f[37] = 1;
+  f[38] = 0x20; f[39] = 0x01; f[40] = 0x0D; f[41] = 0xB8; f[53] = 2;
+  uint8_t* t = &f[54];
+  t[0] = 0xC0; t[1] = 0x02; t[2] = 0x00; t[3] = 0x50;
+  if (protocol == 17) { t[4] = static_cast<uint8_t>(l4 >> 8); t[5] = static_cast<uint8_t>(l4); }
+  else { t[12] = 0x50; t[13] = 0x18; }
+  for (uint32_t i = 0; i < payload; ++i) t[l4_header + i] = static_cast<uint8_t>(i * 29 + 3);
+  const uint32_t field = 54 + (protocol == 6 ? 16 : 6);
+  uint32_t seed = protocol + l4;
+  for (int i = 22; i < 54; i += 2) seed += (f[i] << 8) | f[i + 1];
+  while (seed >> 16) seed = (seed & 0xFFFF) + (seed >> 16);
+  f[field] = static_cast<uint8_t>(seed >> 8);
+  f[field + 1] = static_cast<uint8_t>(seed);
+  *request = TransmitChecksum{54, static_cast<uint16_t>(field)};
+  return f;
+}
+
+// TSO headers as the driver must leave them: IPv4 total length and checksum zero, or IPv6 payload length zero.
+static bool tso_headers_prepared(const Bytes& chain) {
+  if (is_v6(chain)) return chain[18] == 0 && chain[19] == 0;
+  return chain.size() >= 54 && chain[16] == 0 && chain[17] == 0 && chain[24] == 0 && chain[25] == 0;
 }
 
 // A device: the register file (little-endian bytes) with a hook on every write, and the claim/release bookkeeping.
@@ -291,7 +336,12 @@ struct RtlChipModel final : ModelDevice {
   }
   void finish_chain() {
     const uint32_t opts1 = chain_opts1, opts2 = chain_opts2;
-    if (opts1 & (1u << 26)) {  // giant send: the TCP header at opts1 24:18, the MSS at opts2 28:18
+    if (is_v6(chain) && (opts1 & (1u << 26))) { printf("model: IPv4 giant send for an IPv6 segment\n"); ++g_failed; }
+    if (opts1 & (1u << 25)) {  // IPv6 giant send: headers prepared as tcp_v6_gso_csum_prep leaves them
+      ++segmentations;
+      if (!is_v6(chain) || !tso_headers_prepared(chain) || ((opts1 >> 18) & 0x7F) != 54) { printf("model: IPv6 giant send set up wrong\n"); ++g_failed; }
+      for (auto& f : reference_segment(chain.data(), chain.size(), static_cast<uint16_t>((opts2 >> 18) & 0x7FF), true)) sent.push_back(f);
+    } else if (opts1 & (1u << 26)) {  // giant send: the TCP header at opts1 24:18, the MSS at opts2 28:18
       ++segmentations;
       if (rtl8169_identify(version << 20)->family == RtlFamily::Rtl8169 || !rtl8169_identify(version << 20)->tso) { printf("model: giant send on a chip without it\n"); ++g_failed; }
       if (((opts1 >> 18) & 0x7F) != 14u + (chain[14] & 0x0F) * 4u) { printf("model: the TCP header offset is wrong\n"); ++g_failed; }
@@ -302,6 +352,9 @@ struct RtlChipModel final : ModelDevice {
       if (tcp0 || udp0 || tcp1 || udp1) {
         const bool v2 = rtl8169_identify(version << 20)->family != RtlFamily::Rtl8169;
         if ((tcp0 || udp0) == v2) { printf("model: checksum bits of the wrong descriptor format\n"); ++g_failed; }
+        if ((tcp1 || udp1) && bool(opts2 & (1u << 28)) != is_v6(chain)) { printf("model: the IPv6 checksum bit does not match the frame\n"); ++g_failed; }
+        if ((tcp1 || udp1) && bool(opts2 & (1u << 29)) == is_v6(chain)) { printf("model: the IPv4 checksum bit does not match the frame\n"); ++g_failed; }
+        if ((tcp0 || udp0) && is_v6(chain)) { printf("model: an RTL8169 has no IPv6 checksum\n"); ++g_failed; }
         const uint32_t start = (tcp1 || udp1) ? (opts2 >> 18) & 0x3FF : 14 + (chain[14] & 0x0F) * 4u;
         hardware_checksum(chain.data(), static_cast<uint32_t>(chain.size()), start, start + ((tcp0 || tcp1) ? 16 : 6));
         ++checksummed;
@@ -513,7 +566,8 @@ struct IntelModel : ModelDevice {
   // What leaves the controller: short frames padded (TCTL.PSP) - after any checksum. A checksummed frame must come unpadded: a controller
   // that works the TCP/UDP length out from the frame (QEMU's) would count the padding.
   void emit(Bytes frame, bool checksummed) {
-    if (checksummed && frame.size() >= 34 && frame[12] == 0x08 && frame.size() != 14u + ((frame[16] << 8) | frame[17])) {
+    const size_t ip_length = is_v6(frame) ? 54u + ((frame[18] << 8) | frame[19]) : frame.size() >= 34 ? 14u + ((frame[16] << 8) | frame[17]) : frame.size();
+    if (checksummed && (frame[12] == 0x08 || is_v6(frame)) && frame.size() != ip_length) {
       printf("model: a checksummed frame padded before the controller\n");
       ++g_failed;
     }
@@ -637,13 +691,14 @@ struct E1000eChip final : IntelModel {
   uint32_t last_hash = 0;
   int dropped = 0;
   int checksummed = 0, segmentations = 0;
-  bool have_context = false, context_tse = false;
+  bool have_context = false, context_tse = false, context_ip = false, chain_popts_ixsm = false;
   uint32_t context_start = 0, context_field = 0, context_mss = 0, context_header = 0, context_payload = 0;
   Bytes chain;  // the pieces of the frame being sent
   // TSE as the 82574 does it (headers prepared by the driver: IP length and checksum zero, the seed without the length)
   void segment_chain(uint32_t mss, uint32_t header, uint32_t payload) {
     ++segmentations;
-    if (chain.size() < 54 || chain[16] != 0 || chain[17] != 0 || chain[24] != 0 || chain[25] != 0) { printf("model: TSO headers not prepared\n"); ++g_failed; }
+    if (!tso_headers_prepared(chain)) { printf("model: TSO headers not prepared\n"); ++g_failed; }
+    if (is_v6(chain) && (context_ip || chain_popts_ixsm)) { printf("model: IPv4 header checksum asked for an IPv6 segment\n"); ++g_failed; }
     if (header + payload != chain.size()) { printf("model: TSO lengths disagree (%u + %u != %zu)\n", header, payload, chain.size()); ++g_failed; }
     for (auto& f : reference_segment(chain.data(), chain.size(), static_cast<uint16_t>(mss), true)) emit(f, false);
   }
@@ -722,6 +777,7 @@ struct E1000eChip final : IntelModel {
           context_start = at(d + 4)[0];
           context_field = at(d + 5)[0];
           context_tse = cmd & 0x04;
+          context_ip = cmd & 0x02;
           context_mss = get16(d + 14);
           context_header = at(d + 13)[0];
           context_payload = get16(d + 8) | (static_cast<uint32_t>(at(d + 10)[0] & 0x0F) << 16);
@@ -731,6 +787,7 @@ struct E1000eChip final : IntelModel {
         }
         chain.insert(chain.end(), at(get64(d)), at(get64(d)) + len);
         const bool extended = (cmd & 0x20) && type == 1;
+        if (extended && (at(d + 13)[0] & 1)) chain_popts_ixsm = true;
         if (cmd & 1) {  // EOP: the frame (or segment) is complete
           if (extended && (cmd & 0x04)) {  // TSE: cut it up
             if (!have_context || !context_tse) { printf("model: TSE without a segmentation context\n"); ++g_failed; }
@@ -745,6 +802,7 @@ struct E1000eChip final : IntelModel {
             emit(chain, txsm);
           }
           chain.clear();
+          chain_popts_ixsm = false;
         }
         at(d + 12)[0] |= 1;  // DD
         tx_head = (tx_head + 1) % n;
@@ -782,7 +840,7 @@ struct IgbChip final : IntelModel {
   int dropped = 0;
   bool bad_tx_descriptor = false;
   struct Context {
-    bool valid = false, tcp = false;
+    bool valid = false, tcp = false, ipv4 = false;
     uint32_t start = 0, mss = 0, l4 = 0;
   } context, contexts[4];
   struct Chain {
@@ -827,6 +885,7 @@ struct IgbChip final : IntelModel {
         context.tcp = ctl & (1u << 11);
         context.mss = olinfo >> 16;
         context.l4 = (olinfo >> 8) & 0xFF;
+        context.ipv4 = ctl & (1u << 10);
         context.valid = true;
         tx_head[q] = (tx_head[q] + 1) % n;
         continue;
@@ -857,8 +916,12 @@ struct IgbChip final : IntelModel {
       ++segmentations;
       const uint32_t header = context.start + context.l4;
       if (!context.valid || !context.tcp || (chain.olinfo >> 14) != chain.bytes.size() - header || !(chain.olinfo & (3u << 8))) bad_tx_descriptor = true;
-      if (chain.bytes.size() < 54 || chain.bytes[16] != 0 || chain.bytes[17] != 0 || chain.bytes[24] != 0 || chain.bytes[25] != 0) {
+      if (!tso_headers_prepared(chain.bytes)) {
         printf("model: TSO headers not prepared\n");
+        ++g_failed;
+      }
+      if (is_v6(chain.bytes) && (context.ipv4 || (chain.olinfo & (1u << 8)))) {
+        printf("model: IPv4 header checksum asked for an IPv6 segment\n");
         ++g_failed;
       }
       for (auto& f : reference_segment(chain.bytes.data(), chain.bytes.size(), static_cast<uint16_t>(context.mss), true)) emit(f, false);
@@ -1121,6 +1184,22 @@ static void check_transmit_checksums(Nic& nic, Model* m, bool short_ones_in_soft
         expect[request.field + 1] = out[request.field + 1];
         CHECK(out == expect);
       }
+    }
+  }
+  // IPv6: the same, TCP and UDP
+  for (uint8_t protocol : {uint8_t{6}, uint8_t{17}}) {
+    for (uint32_t payload : {0u, 7u, 600u, 1440u}) {
+      TransmitChecksum request;
+      const Bytes f = transport_frame6(protocol, payload, &request);
+      const size_t before = m->sent.size();
+      const int hardware_before = m->checksummed;
+      CHECK(nic.transmit_frame(ConstByteView(f.data(), f.size()), request));
+      CHECK(m->sent.size() == before + 1);
+      if (m->sent.size() != before + 1) continue;
+      Bytes out = m->sent.back();
+      out.resize(f.size());
+      CHECK(transport_checksum_ok(out));
+      (void)hardware_before;
     }
   }
   // a request outside the frame is refused, not sent
@@ -1573,6 +1652,25 @@ static void check_segmentation(Nic& nic, Model* m) {
       CHECK(joined == Bytes(f.begin() + 54, f.end()));
     }
   }
+  // IPv6 segments
+  for (uint32_t payload : {1u, 1440u, 1441u, 9000u, 30000u}) {
+    TransmitChecksum r6;
+    Bytes f6 = transport_frame6(6, payload, &r6);
+    f6[67] = 0x19;
+    const size_t before = m->sent.size();
+    CHECK(nic.transmit_segmented(ConstByteView(f6.data(), f6.size()), r6, 1440));
+    const uint32_t expect = (payload + 1439) / 1440;
+    CHECK(m->sent.size() == before + expect);
+    Bytes joined;
+    for (size_t k = before; k < m->sent.size(); ++k) {
+      Bytes out = m->sent[k];
+      out.resize(54u + ((out[18] << 8) | out[19]) < out.size() ? 54u + ((out[18] << 8) | out[19]) : out.size());
+      CHECK(is_v6(out) && out.size() <= kEthernetMaxFrame && transport_checksum_ok(out));
+      CHECK((out[67] & 0x09) == (k + 1 == m->sent.size() ? 0x09 : 0));
+      joined.insert(joined.end(), out.begin() + 74, out.end());
+    }
+    CHECK(joined == Bytes(f6.begin() + 74, f6.end()));
+  }
   // what is refused: no MSS, too large, not TCP, nothing to cut
   TransmitChecksum request;
   Bytes f = transport_frame(6, 1000, &request);
@@ -1787,6 +1885,14 @@ static void test_rtl_segmentation() {
           joined.insert(joined.end(), m->sent[k].begin() + 54, m->sent[k].end());
         }
         CHECK(joined == Bytes(f.begin() + 54, f.end()));
+      }
+      for (uint32_t payload : {1u, 1441u, 20000u}) {  // IPv6 giant send
+        TransmitChecksum r6;
+        Bytes f6 = transport_frame6(6, payload, &r6);
+        const size_t before = m->sent.size();
+        CHECK(nic.transmit_segmented(ConstByteView(f6.data(), f6.size()), r6, 1440));
+        CHECK(m->sent.size() == before + (payload + 1439) / 1440);
+        for (size_t k = before; k < m->sent.size(); ++k) CHECK(transport_checksum_ok(m->sent[k]));
       }
       // what is refused: too large, an MSS that does not fit the descriptor, not TCP
       TransmitChecksum r;

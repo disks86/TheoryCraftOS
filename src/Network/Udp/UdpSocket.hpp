@@ -37,6 +37,8 @@ class UdpSocket final : public IUdpSocket {
   uint16_t local_port() const override { return port_; }  // fixed at creation
   bool send_to(Ipv4Address address, uint16_t port, ConstByteView data) override;
   bool receive_from(ByteView buffer, Ipv4Address* from_address, uint16_t* from_port, uint32_t* length) override;
+  bool send_to_ip(const IpAddress& address, uint16_t port, ConstByteView data) override;
+  bool receive_from_ip(ByteView buffer, IpAddress* from_address, uint16_t* from_port, uint32_t* length) override;
   uint32_t pending() const override;
   void close() override;
 
@@ -45,12 +47,12 @@ class UdpSocket final : public IUdpSocket {
   bool send_from(Ipv4Address source, Ipv4Address address, uint16_t port, ConstByteView data, bool link_broadcast);
 
   // The UDP manager hands arriving datagrams in here.
-  void deliver(Ipv4Address from_address, uint16_t from_port, ConstByteView data);
+  void deliver(const IpAddress& from_address, uint16_t from_port, ConstByteView data);
   bool closed() const { return closed_; }
 
  private:
   struct Datagram {
-    Ipv4Address from_address;
+    IpAddress from_address;
     uint16_t from_port;
     uint16_t length;
     uint8_t data[kMaxDatagram];

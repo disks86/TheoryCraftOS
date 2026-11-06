@@ -67,7 +67,8 @@ class TcpSocket final : public ITcpSocket {
     StackLock guard(ip_);
     return state_;
   }
-  bool connect(Ipv4Address address, uint16_t port) override;
+  bool connect(Ipv4Address address, uint16_t port) override { return connect_ip(IpAddress(address), port); }
+  bool connect_ip(const IpAddress& address, uint16_t port) override;
   bool listen(uint16_t port) override;
   SharedPointer<ITcpSocket> accept() override;
   uint32_t send(ConstByteView data) override;
@@ -100,7 +101,11 @@ class TcpSocket final : public ITcpSocket {
   }
   Ipv4Address remote_address() const override {
     StackLock guard(ip_);
-    return remote_address_;
+    return remote_.v6 ? kAnyAddress : remote_.ipv4;
+  }
+  IpAddress remote_ip() const override {
+    StackLock guard(ip_);
+    return remote_;
   }
   uint16_t remote_port() const override {
     StackLock guard(ip_);
@@ -108,14 +113,14 @@ class TcpSocket final : public ITcpSocket {
   }
 
   // --- used by TcpManager
-  bool matches(Ipv4Address remote_address, uint16_t remote_port, uint16_t local_port) const {
+  bool matches(const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port) const {
     return state_ != TcpState::Listen && state_ != TcpState::Closed && local_port_ == local_port &&
-           remote_port_ == remote_port && remote_address_ == remote_address;
+           remote_port_ == remote_port && remote_ == remote_address;
   }
   void on_segment(const TcpSegment& segment);
   void on_timer(uint64_t now);
   // Becomes a connection in SynReceived for a SYN that arrived at `listener`.
-  void accept_syn(TcpSocket* listener, Ipv4Address remote_address, uint16_t remote_port, uint16_t local_port,
+  void accept_syn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port,
                   const TcpSegment& syn, uint32_t initial_sequence);
   void prepare_to_connect(uint16_t local_port, uint32_t initial_sequence);
   bool take_established_event() {  // true once, when a child connection completes its handshake
@@ -158,7 +163,9 @@ class TcpSocket final : public ITcpSocket {
   ByteView burst_;  // where a large segment is built (allocated when the first one is sent)
   TcpState state_ = TcpState::Closed;
   uint16_t local_port_ = 0;
-  Ipv4Address remote_address_ = kAnyAddress;
+  IpAddress remote_;
+  // The largest segment our side takes and sends: what fits a 1500-byte packet after the IP header of the connection's version.
+  uint16_t our_mss() const { return static_cast<uint16_t>((remote_.v6 ? kMaxIpv6Payload : kMaxIpPayload) - 20); }
   uint16_t remote_port_ = 0;
 
   // Send side.

@@ -27,7 +27,7 @@ SharedPointer<TcpSocket> TcpManager::create() {
   return socket;
 }
 
-SharedPointer<TcpSocket> TcpManager::spawn(TcpSocket* listener, Ipv4Address remote_address, uint16_t remote_port,
+SharedPointer<TcpSocket> TcpManager::spawn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port,
                                            uint16_t local_port, const TcpSegment& syn) {
   SharedPointer<TcpSocket> child = create();
   if (!child) return SharedPointer<TcpSocket>();
@@ -76,7 +76,7 @@ void TcpManager::detach_children(TcpSocket* listener) {
   }
 }
 
-void TcpManager::send_reset(Ipv4Address to, uint16_t to_port, uint16_t from_port, const TcpSegment& cause) {
+void TcpManager::send_reset(const IpAddress& to, uint16_t to_port, uint16_t from_port, const TcpSegment& cause) {
   uint8_t storage[20];
   ByteWriter out{ByteView(storage)};
   uint32_t sequence = 0, acknowledgement = 0;
@@ -98,10 +98,10 @@ void TcpManager::send_reset(Ipv4Address to, uint16_t to_port, uint16_t from_port
   out.be16(0);  // checksum: the IP layer fills it in
   out.be16(0);  // urgent pointer
   if (!out.ok()) return;
-  ip_.send_ip(to, kProtocolTcp, out.written());
+  ip_.send_ip_to(to, kProtocolTcp, out.written());
 }
 
-void TcpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment, bool checksum_verified) {
+void TcpManager::handle(const IpAddress& source, const IpAddress& destination, ConstByteView segment, bool checksum_verified) {
   ByteReader in(segment);
   const uint16_t source_port = in.be16();
   const uint16_t destination_port = in.be16();
@@ -115,7 +115,7 @@ void TcpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteVi
   if (!in.ok()) return;  // shorter than a TCP header
   const uint32_t header = (offset_and_reserved >> 4) * 4u;
   if (header < 20 || header > segment.size()) return;
-  const uint32_t sum = checksum_verified ? 0 : checksum_add(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint16_t>(segment.size())), segment);
+  const uint32_t sum = checksum_verified ? 0 : checksum_add(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint32_t>(segment.size())), segment);
   if (!checksum_verified && checksum_finish(sum) != 0) return;  // corrupted in transit
 
   // Options: only the maximum segment size matters. Each one is bounds-checked

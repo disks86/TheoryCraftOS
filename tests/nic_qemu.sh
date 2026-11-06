@@ -41,10 +41,16 @@ for n in "n1 e1000e 52:54:00:00:00:e1 82574L" "n2 igb 52:54:00:00:00:1b 82576" "
   good=$(grep -ac "udp sum ok" <<<"$sent"); bad=$(grep -acE "bad udp cksum" <<<"$sent")
   if [[ "$steps" != *"Discover Offer Request ACK"* ]]; then echo "$2: FAILED (DHCP saw: ${steps:-nothing})"; failed=1; continue; fi
   if [ "$bad" -ne 0 ] || [ "$good" -eq 0 ]; then echo "$2: FAILED ($good right and $bad wrong UDP checksums from the guest)"; failed=1; continue; fi
+  # IPv6: the guest's neighbor and router discovery and MLD reports, with right checksums
+  sent6=$(tcpdump -nn -vv -e -r "$work/$1.pcap" "ether src $3 and icmp6" 2>/dev/null)
+  good6=$(grep -ac "icmp6 sum ok" <<<"$sent6"); bad6=$(grep -acE "bad icmp6 cksum" <<<"$sent6")
+  if [ "$bad6" -ne 0 ] || [ "$good6" -eq 0 ] || ! grep -aq "neighbor solicitation" <<<"$sent6" || ! grep -aq "router solicitation" <<<"$sent6"; then
+    echo "$2: FAILED (IPv6: $good6 right and $bad6 wrong ICMPv6 checksums, solicitations missing?)"; failed=1; continue
+  fi
   # the PCI controllers take MSI (QEMU's e1000e and igb have it); the USB adapter is polled
   mode=$(grep -a "Network:   .*$4" "$work/debugcon.log" | head -1)
   if [ "$4" != USB ] && [[ "$mode" != *"interrupts (MSI"* ]]; then echo "$2: FAILED (not interrupt driven: ${mode:-no line})"; failed=1; continue; fi
   if [ "$4" != USB ] && [[ "$mode" != *"MSI-X"* ]]; then echo "$2: FAILED (no MSI-X receive queues: $mode)"; failed=1; continue; fi
-  echo "$2: DHCP done, $good UDP checksums right${mode:+, ${mode##*: }}"
+  echo "$2: DHCP done, $good UDP checksums right, $good6 ICMPv6 right${mode:+, ${mode##*: }}"
 done
 exit $failed

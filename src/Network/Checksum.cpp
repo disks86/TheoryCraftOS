@@ -49,4 +49,15 @@ uint32_t pseudo_header_sum(Ipv4Address source, Ipv4Address destination, uint8_t 
   return checksum_add(0, out.written());
 }
 
+uint32_t pseudo_header_sum(const Ipv6Address& source, const Ipv6Address& destination, uint8_t next_header, uint32_t length) {
+  uint32_t sum = checksum_add(0, ConstByteView(source.bytes));
+  sum = checksum_add(sum, ConstByteView(destination.bytes));
+  return sum + (length >> 16) + (length & 0xFFFF) + next_header;
+}
+
+uint32_t pseudo_header_sum(const IpAddress& source, const IpAddress& destination, uint8_t protocol, uint32_t length) {
+  if (source.v6) return pseudo_header_sum(source.ipv6, destination.ipv6, protocol, length);
+  return pseudo_header_sum(source.ipv4, destination.ipv4, protocol, static_cast<uint16_t>(length));
+}
+
 }  // namespace network

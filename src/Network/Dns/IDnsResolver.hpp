@@ -36,8 +36,10 @@ const char* dns_status_name(DnsStatus status);
 class IDnsQuery {
  public:
   virtual DnsStatus status() const = 0;
-  // The first IPv4 address of the name; valid when status() is Resolved.
+  // The first IPv4 address of the name; valid when status() is Resolved (0.0.0.0 for an AAAA query).
   virtual Ipv4Address address() const = 0;
+  // The address of either version (an AAAA query's IPv6 address).
+  virtual IpAddress ip_address() const { return IpAddress(address()); }
   // How many seconds the answer may be cached (as the server stated it).
   virtual uint32_t ttl_seconds() const = 0;
 
@@ -59,7 +61,8 @@ class IDnsQuery {
 //   - Results, including "no such name", are cached for as long as their TTL.
 //   - Dotted-quad text ("10.0.2.2") is accepted and resolves to itself.
 //
-// Driven by the network stack's poll(). IPv6 (AAAA) records are not requested.
+// Driven by the network stack's poll(). AAAA records are asked for by query_aaaa(); the server is the IPv4 one the configuration names,
+// else the IPv6 one a router advertisement named (RDNSS).
 class IDnsResolver {
  public:
   // Starts looking up `name`, or returns a finished query at once if the answer
@@ -67,6 +70,11 @@ class IDnsResolver {
   // not a valid host name (longer than 253 characters, a label over 63, empty
   // labels, ...).
   virtual SharedPointer<IDnsQuery> query(StringView name) = 0;
+  // The same for the name's IPv6 address (AAAA records; IPv6 text resolves to itself). Null where there is no IPv6.
+  virtual SharedPointer<IDnsQuery> query_aaaa(StringView name) {
+    (void)name;
+    return SharedPointer<IDnsQuery>();
+  }
 
   // Throws away every cached result.
   virtual void clear_cache() = 0;
@@ -80,5 +88,11 @@ class IDnsResolver {
 
 // Parses "a.b.c.d" into an address. False for anything else.
 bool parse_ipv4(StringView text, Ipv4Address* address);
+// Parses IPv6 text (RFC 4291 2.2: eight groups of up to four hex digits, one "::" for a run of zero groups, an IPv4 address in the last
+// 32 bits). No zone index, no brackets. False for anything else.
+bool parse_ipv6(StringView text, Ipv6Address* address);
+// Writes the RFC 5952 form (lowercase, the longest run of two or more zero groups as "::") with a terminating zero; needs 40 bytes.
+// Returns the length, 0 if `out` is too small.
+uint32_t format_ipv6(const Ipv6Address& address, ArrayView<char> out);
 
 }  // namespace network

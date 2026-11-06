@@ -463,11 +463,12 @@ bool E1000eNetworkInterface::send(ConstByteView frame, TransmitChecksum checksum
     // header checksum (IPCSS to IPCSE, at IPCSO), the payload length, the header length and the MSS.
     volatile TransmitDescriptor& context = tx_ring_[slot];
     uint64_t setup = (uint64_t{checksum.start} << 32) | (uint64_t{checksum.field} << 40);
-    if (segment) setup |= kEthernetHeaderSize | (uint64_t{kEthernetHeaderSize + 10} << 8) | (uint64_t{layout.tcp_start - 1u} << 16);
+    if (segment && !layout.ipv6) setup |= kEthernetHeaderSize | (uint64_t{kEthernetHeaderSize + 10} << 8) | (uint64_t{layout.tcp_start - 1u} << 16);
     context.address = setup;
     context.length = segment ? static_cast<uint16_t>(layout.payload) : 0;
     context.checksum_offset = segment ? static_cast<uint8_t>((layout.payload >> 16) & 0x0F) : 0;  // (PAYLEN 19:16, DTYP 0: context)
-    context.command = static_cast<uint8_t>(kCommandExtended | (checksum.tcp() ? kContextTcp : 0) | (segment ? kContextIp | kCommandSegmentation : 0));
+    context.command = static_cast<uint8_t>(kCommandExtended | (checksum.tcp() ? kContextTcp : 0) | (segment ? kCommandSegmentation : 0) |
+                                           (segment && !layout.ipv6 ? kContextIp : 0));  // (IP: an IPv4 header, whose checksum is inserted)
     context.status = 0;
     context.checksum_start = segment ? static_cast<uint8_t>(layout.header_length) : 0;  // (HDRLEN)
     context.special = segment ? mss : 0;                                                  // (MSS)
@@ -493,7 +494,7 @@ bool E1000eNetworkInterface::send(ConstByteView frame, TransmitChecksum checksum
     const uint8_t end = last ? kCommandEndOfPacket | kCommandReportStatus : 0;
     if (hardware) {  // an extended data descriptor: DTYP 1, POPTS where the legacy one has CSS
       d.checksum_offset = kDataDescriptorType;
-      d.checksum_start = static_cast<uint8_t>(kPoptsTransportChecksum | (segment ? kPoptsIpChecksum : 0));
+      d.checksum_start = static_cast<uint8_t>(kPoptsTransportChecksum | (segment && !layout.ipv6 ? kPoptsIpChecksum : 0));
       d.command = static_cast<uint8_t>(end | kCommandInsertCrc | kCommandExtended | (segment ? kCommandSegmentation : 0));
     } else {
       d.checksum_offset = 0;

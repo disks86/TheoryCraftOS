@@ -75,7 +75,8 @@ struct FakeNic final : hardware::INetworkInterface {
     // the stack's seed: the pseudo-header sum with the whole TCP length
     const uint32_t tcp = checksum.start, tcp_length = static_cast<uint32_t>(frame.size() - tcp);
     const uint8_t* f = frame.data();
-    const uint16_t seed = tso_fold(tso_sum16(f + 26, 8, 6 + tcp_length));
+    const bool v6 = f[12] == 0x86 && f[13] == 0xDD;
+    const uint16_t seed = v6 ? tso_fold(tso_sum16(f + 22, 32, 6 + tcp_length)) : tso_fold(tso_sum16(f + 26, 8, 6 + tcp_length));
     if (((f[checksum.field] << 8) | f[checksum.field + 1]) != seed) { ++refused_segments; return false; }
     for (auto& piece : reference_segment(f, frame.size(), mss, false)) {
       assert(piece.size() <= hardware::kEthernetMaxFrame);

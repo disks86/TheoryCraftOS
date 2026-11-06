@@ -28,12 +28,13 @@
 
 namespace network {
 
-// IPv4 networking over one network interface: Ethernet framing, ARP, IPv4, ICMP
-// echo, UDP, TCP, a DHCP client and a DNS resolver. Single-threaded and polled: call poll()
+// IPv4 and IPv6 networking over one network interface: Ethernet framing, ARP, IPv4, ICMP echo, IPv6 with neighbor discovery and stateless
+// address autoconfiguration (ICMPv6, MLDv2 for its own groups), UDP and TCP over both, a DHCP client and a DNS resolver (A and AAAA). Single-threaded and polled: call poll()
 // regularly (from one core) - frames are received, timers run and sockets make
 // progress only then. All the blocking helpers below simply call poll() in a loop.
 //
-// Not supported: IPv6, IP fragmentation (larger packets are dropped or refused),
+// Not supported: DHCPv6, IPv6 extension headers other than hop-by-hop and destination options (skipped), IPv6 multicast groups for
+// applications, IP fragmentation (larger packets are dropped or refused),
 // IP options, TCP congestion control, selective acknowledgements, window scaling,
 // DNS over anything but A records. Packets to 127.0.0.0/8 and to the stack's own
 // address are looped back inside the stack (delivered by poll()).
@@ -78,6 +79,25 @@ class INetworkStack {
     return false;
   }
   virtual void leave_multicast(Ipv4Address group) { (void)group; }
+
+  // --- IPv6 (stacks without it keep these defaults). What stateless autoconfiguration has given the interface so far.
+  virtual Ipv6Configuration configuration6() const { return Ipv6Configuration{}; }
+  // An ICMPv6 echo request, as ping().
+  virtual bool ping6(const Ipv6Address& address, uint32_t timeout_ms, uint32_t* rtt_ms) {
+    (void)address;
+    (void)timeout_ms;
+    (void)rtt_ms;
+    return false;
+  }
+  // Looks up a name for either version: an IPv6 address (AAAA) when `prefer_ipv6` and the interface has an IPv6 address that can reach it,
+  // else IPv4 (A); a literal address of either kind resolves to itself.
+  virtual bool resolve_ip(StringView name, uint32_t timeout_ms, IpAddress* address, bool prefer_ipv6 = false) {
+    (void)prefer_ipv6;
+    Ipv4Address v4;
+    if (!resolve(name, timeout_ms, &v4)) return false;
+    if (address) *address = IpAddress(v4);
+    return true;
+  }
 
  protected:
   INetworkStack() = default;

@@ -1,4 +1,4 @@
-// What a controller with TCP segmentation offload does with one large IPv4 TCP segment, written for the tests independently of the drivers:
+// What a controller with TCP segmentation offload does with one large IPv4 or IPv6 TCP segment, written for the tests independently of the drivers:
 // the payload in pieces of `mss`, each frame with the headers copied, its own IP total length, identification (+1 each) and header checksum,
 // sequence number, PSH and FIN only on the last, and the TCP checksum. `seed_without_length`: the TCP checksum field holds the pseudo-header
 // sum without the length (as Intel's controllers want it prepared, igb_tso); else the field holds the stack's seed with the whole length
@@ -19,7 +19,8 @@ inline uint16_t tso_fold(uint32_t sum) {
 
 inline std::vector<std::vector<uint8_t>> reference_segment(const uint8_t* frame, size_t length, uint16_t mss, bool seed_without_length) {
   std::vector<std::vector<uint8_t>> out;
-  const uint32_t ip = 14, ihl = (frame[14] & 0x0F) * 4u, tcp = ip + ihl, header = tcp + (frame[tcp + 12] >> 4) * 4u;
+  const bool v6 = frame[12] == 0x86 && frame[13] == 0xDD;
+  const uint32_t ip = 14, ihl = v6 ? 40u : (frame[14] & 0x0F) * 4u, tcp = ip + ihl, header = tcp + (frame[tcp + 12] >> 4) * 4u;
   if (length <= header || mss == 0) return out;
   const uint32_t payload = static_cast<uint32_t>(length - header);
   const uint16_t id = static_cast<uint16_t>((frame[ip + 4] << 8) | frame[ip + 5]);
@@ -33,12 +34,17 @@ inline std::vector<std::vector<uint8_t>> reference_segment(const uint8_t* frame,
     const bool last = offset + piece == payload;
     std::vector<uint8_t> f(frame, frame + header);
     f.insert(f.end(), frame + header + offset, frame + header + offset + piece);
-    const uint32_t total = header - ip + piece;
-    f[ip + 2] = static_cast<uint8_t>(total >> 8); f[ip + 3] = static_cast<uint8_t>(total);
-    f[ip + 4] = static_cast<uint8_t>((id + k) >> 8); f[ip + 5] = static_cast<uint8_t>(id + k);
-    f[ip + 10] = f[ip + 11] = 0;
-    const uint16_t ip_sum = static_cast<uint16_t>(~tso_fold(tso_sum16(&f[ip], ihl)));
-    f[ip + 10] = static_cast<uint8_t>(ip_sum >> 8); f[ip + 11] = static_cast<uint8_t>(ip_sum);
+    if (v6) {  // the payload length; no identification, no header checksum
+      const uint32_t payload_length = header - tcp + piece;
+      f[ip + 4] = static_cast<uint8_t>(payload_length >> 8); f[ip + 5] = static_cast<uint8_t>(payload_length);
+    } else {
+      const uint32_t total = header - ip + piece;
+      f[ip + 2] = static_cast<uint8_t>(total >> 8); f[ip + 3] = static_cast<uint8_t>(total);
+      f[ip + 4] = static_cast<uint8_t>((id + k) >> 8); f[ip + 5] = static_cast<uint8_t>(id + k);
+      f[ip + 10] = f[ip + 11] = 0;
+      const uint16_t ip_sum = static_cast<uint16_t>(~tso_fold(tso_sum16(&f[ip], ihl)));
+      f[ip + 10] = static_cast<uint8_t>(ip_sum >> 8); f[ip + 11] = static_cast<uint8_t>(ip_sum);
+    }
     const uint32_t s = sequence + offset;
     f[tcp + 4] = static_cast<uint8_t>(s >> 24); f[tcp + 5] = static_cast<uint8_t>(s >> 16); f[tcp + 6] = static_cast<uint8_t>(s >> 8); f[tcp + 7] = static_cast<uint8_t>(s);
     if (!last) f[tcp + 13] &= static_cast<uint8_t>(~0x09);  // PSH, FIN

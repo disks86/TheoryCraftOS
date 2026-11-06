@@ -42,7 +42,7 @@ const char* tcp_state_name(TcpState state) {
 
 namespace {
 constexpr uint32_t kMinRtoMs = 200, kMaxRtoMs = 8000, kInitialRtoMs = 1000;
-constexpr uint16_t kOurMss = kMaxIpPayload - 20;  // 1460
+
 }  // namespace
 
 TcpSocket::TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& allocator)
@@ -52,10 +52,10 @@ TcpSocket::~TcpSocket() { release_view(allocator_, burst_); }
 
 // ------------------------------------------------------------------ user API
 
-bool TcpSocket::connect(Ipv4Address address, uint16_t port) {
+bool TcpSocket::connect_ip(const IpAddress& address, uint16_t port) {
   StackLock guard(ip_);
-  if (state_ != TcpState::Closed || failed_ || port == 0 || !ip_.source_for(address).value()) return false;
-  remote_address_ = address;
+  if (state_ != TcpState::Closed || failed_ || port == 0 || ip_.source_for_ip(address).is_unspecified()) return false;
+  remote_ = address;
   remote_port_ = port;
   prepare_to_connect(manager_.allocate_port(), manager_.next_initial_sequence());
   if (failed_) return false;
@@ -104,7 +104,7 @@ uint32_t TcpSocket::receive(ByteView buffer) {
   StackLock guard(ip_);
   const uint32_t n = receive_buffer_.read(buffer);
   // The sender may be waiting on a closed window: tell it once there is room again.
-  if (n && last_advertised_window_ < kOurMss && advertised_window() >= kOurMss &&
+  if (n && last_advertised_window_ < our_mss() && advertised_window() >= our_mss() &&
       (state_ == TcpState::Established || state_ == TcpState::FinWait1 || state_ == TcpState::FinWait2))
     send_ack();
   return n;
@@ -180,12 +180,12 @@ void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView dat
   if (with_mss) {  // option: kind 2, length 4, our maximum segment size
     out.u8(2);
     out.u8(4);
-    out.be16(kOurMss);
+    out.be16(our_mss());
   }
   out.bytes(data);
   if (!out.ok()) return;  // payload larger than a packet: cannot happen, the sender chunks to the MSS
 
-  ip_.send_ip(remote_address_, kProtocolTcp, out.written());  // a lost segment is retransmitted
+  ip_.send_ip_to(remote_, kProtocolTcp, out.written());  // a lost segment is retransmitted
 }
 
 bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, uint32_t length, uint16_t mss) {
@@ -204,7 +204,7 @@ bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, ui
   out.be16(0);
   if (!out.ok()) return false;
   send_buffer_.peek(offset, burst_.subview(20, length));
-  return ip_.send_tcp_segmented(remote_address_, burst_.first(20 + length), mss);
+  return ip_.send_tcp_segmented(remote_, burst_.first(20 + length), mss);
 }
 
 // Sends whatever the peer's window and our send buffer allow, then the FIN if
@@ -215,8 +215,8 @@ void TcpSocket::output() {
                              state_ == TcpState::FinWait1 || state_ == TcpState::LastAck;
   if (!may_send_data) return;
 
-  const uint16_t mss = peer_mss_ < kOurMss ? peer_mss_ : kOurMss;
-  const uint32_t burst = ip_.max_segmented_payload(remote_address_);
+  const uint16_t mss = peer_mss_ < our_mss() ? peer_mss_ : our_mss();
+  const uint32_t burst = ip_.max_segmented_payload(remote_);
   for (;;) {
     const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);  // data only
     if (fin_sent_) break;  // nothing follows a FIN
@@ -287,10 +287,10 @@ void TcpSocket::fail() {
   enter(TcpState::Closed);
 }
 
-void TcpSocket::accept_syn(TcpSocket* listener, Ipv4Address remote_address, uint16_t remote_port, uint16_t local_port,
+void TcpSocket::accept_syn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port,
                            const TcpSegment& syn, uint32_t initial_sequence) {
   listener_ = listener;
-  remote_address_ = remote_address;
+  remote_ = remote_address;
   remote_port_ = remote_port;
   prepare_to_connect(local_port, initial_sequence);
   if (failed_) {

@@ -16,7 +16,7 @@ if [ ! -x "$venv/bin/python" ] || ! "$venv/bin/python" -c "import paramiko" 2>/d
 fi
 tool=$work/SftpLive
 g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -I tests -Wall -Wextra -Wno-unused-parameter tests/SftpLive.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-  src/FileSystem/FileSystemTypes.cpp src/Network/Sftp/*.cpp src/Network/Ssh/*.cpp src/Network/ServerNetwork.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
+  src/FileSystem/FileSystemTypes.cpp src/Network/Sftp/*.cpp src/Network/Ssh/*.cpp src/Network/ServerNetwork.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackIpv6.cpp src/Network/NetworkStackSet.cpp \
   src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Checksum.cpp src/Crypto/*.cpp -o "$tool" 2>&1 | grep -E "error" -A3
 [ -x "$tool" ] || exit 1
 

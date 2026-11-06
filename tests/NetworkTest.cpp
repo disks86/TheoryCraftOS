@@ -281,11 +281,13 @@ int main() {
   { // ---- the loopback: 127.0.0.0/8 and the stack's own address never reach the wire
     Lan lan; lan.configure_static();
     const Ipv4Address loopback = Ipv4Address::make(127, 0, 0, 1);
-    const uint32_t frames = lan.wire.frames;
+    uint64_t ipv4_out = 0;  // (IPv6 neighbor discovery has its own business on the wire meanwhile)
+    lan.wire.tap = [&](const std::vector<uint8_t>& f, int) { if (f.size() > 14 && f[12] == 0x08 && (f[13] == 0x00 || f[13] == 0x06)) ++ipv4_out; };
+    const uint64_t frames = 0;
     assert(loopback_echo(lan, lan.a, loopback, 200000, 6100));                        // TCP over 127.0.0.1, both ends in A
     assert(loopback_echo(lan, lan.a, Ipv4Address::make(127, 1, 2, 3), 3000, 6101));    // any 127/8 address
     assert(loopback_echo(lan, lan.a, Ipv4Address::make(10, 0, 0, 1), 50000, 6102));    // A's own address
-    assert(lan.wire.frames == frames);                                                 // none of it went out
+    assert(ipv4_out == frames);                                                        // none of it went out
     uint32_t rtt = 99; assert(lan.a.ping(loopback, 1000, &rtt));                       // ICMP echo over the loopback
     // UDP: the datagram comes from the loopback address, and the answer finds its way back
     auto server = lan.a.udp_open(6200); auto client = lan.a.udp_open(0); assert(server && client);
@@ -294,7 +296,8 @@ int main() {
     uint8_t buf[16]; Ipv4Address from; uint16_t port; uint32_t len;
     assert(server->receive_from(ByteView(buf, sizeof(buf)), &from, &port, &len) && len == sizeof(msg) && from == loopback && port == client->local_port());
     assert(server->send_to(from, port, ConstByteView(buf, len)) && lan.run_until([&] { return client->pending() > 0; }, 100));
-    assert(lan.wire.frames == frames);
+    assert(ipv4_out == frames);
+    lan.wire.tap = nullptr;
     // a closed port answers with a reset at once
     auto refused = lan.a.tcp_open(); assert(refused->connect(loopback, 6300));
     assert(lan.run_until([&] { return refused->state() == TcpState::Closed; }, 100) && refused->failed());

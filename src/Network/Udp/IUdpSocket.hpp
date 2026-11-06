@@ -36,6 +36,16 @@ class IUdpSocket {
   // a longer datagram is discarded) and reports the sender and the datagram's
   // full length. False if none is waiting.
   virtual bool receive_from(ByteView buffer, Ipv4Address* from_address, uint16_t* from_port, uint32_t* length) = 0;
+  // The same over either IP version (an IPv6 datagram carries at most 1452 bytes). An IPv6 sender comes out of receive_from() as 0.0.0.0.
+  virtual bool send_to_ip(const IpAddress& address, uint16_t port, ConstByteView data) {
+    return !address.v6 && send_to(address.ipv4, port, data);
+  }
+  virtual bool receive_from_ip(ByteView buffer, IpAddress* from_address, uint16_t* from_port, uint32_t* length) {
+    Ipv4Address from = kAnyAddress;
+    if (!receive_from(buffer, &from, from_port, length)) return false;
+    if (from_address) *from_address = IpAddress(from);
+    return true;
+  }
   // Datagrams waiting to be received.
   virtual uint32_t pending() const = 0;
 
