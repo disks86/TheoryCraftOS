@@ -17,6 +17,8 @@
  */
 #include "Win32kTestSupport.hpp"
 #include "Process/Win32k/Win32kGdi.hpp"
+#include "Process/Win32k/Win32kDesktopBridge.hpp"
+#include "Process/Win32k/Win32kUser.hpp"
 
 using namespace w32test;
 using namespace process;
@@ -1017,6 +1019,54 @@ static void test_registration() {
   gdi::shutdown();
 }
 
+// The desktop's view of the Windows programs (Win32kDesktopBridge): the keys of the USB keyboard as Windows names them, the screen as the desktop draws it, and the
+// pointer handed over.
+static void test_desktop_bridge() {
+  WindowsKey k;
+  CHECK(windows_key_of_usage(0x04, &k) && k.vk == 'A' && k.scan == 0x1E && !k.extended);           // A
+  CHECK(windows_key_of_usage(0x27, &k) && k.vk == '0' && k.scan == 0x0B);                           // 0
+  CHECK(windows_key_of_usage(0x28, &k) && k.vk == 0x0D && k.scan == 0x1C && !k.extended);           // Enter
+  CHECK(windows_key_of_usage(0x58, &k) && k.vk == 0x0D && k.scan == 0x1C && k.extended);            // keypad Enter
+  CHECK(windows_key_of_usage(0x52, &k) && k.vk == 0x26 && k.scan == 0x48 && k.extended);            // Up
+  CHECK(windows_key_of_usage(0x38, &k) && k.vk == 0xBF && k.scan == 0x35);                          // /
+  CHECK(windows_key_of_usage(0x45, &k) && k.vk == 0x7B && k.scan == 0x58);                          // F12
+  CHECK(windows_key_of_usage(0x68, &k) && k.vk == 0x7C && k.scan == 0x64);                          // F13
+  CHECK(windows_key_of_usage(0x62, &k) && k.vk == 0x60 && k.scan == 0x52);                          // keypad 0
+  CHECK(windows_key_of_usage(0x65, &k) && k.vk == 0x5D && k.extended);                              // Application
+  CHECK(windows_key_of_usage(0xE1, &k) && k.vk == 0xA0 && k.scan == 0x2A && !k.extended);           // left Shift
+  CHECK(windows_key_of_usage(0xE6, &k) && k.vk == 0xA5 && k.scan == 0x38 && k.extended);            // right Alt
+  CHECK(!windows_key_of_usage(0x01, &k) && !windows_key_of_usage(0x80, &k) && !windows_key_of_usage(0xE8, &k));
+
+  Fixture f(34);
+  DesktopBridge bridge;
+  bridge.attach();
+  CHECK(!bridge.take_screen_changed());      // nothing drawn yet
+  CHECK(bridge.screen_width() == 1024 && bridge.screen_height() == 768);
+  CHECK(bridge.set_screen_size(800, 600) && bridge.screen_width() == 800 && bridge.set_screen_size(1024, 768));
+  const gdi::Rect clip[1] = {{10, 20, 30, 40}};
+  const uint32_t dc = gdi::create_screen_dc(34, 10, 20, ArrayView<const gdi::Rect>(clip, 1));
+  const uint32_t green = f.u(N(CreateSolidBrush), kGreen, 0);
+  f.u(N(SelectBrush), dc, green);
+  CHECK(f.u(N(PatBlt), dc, 0, 0, 20, 20, kPatCopy) == 1);
+  CHECK(bridge.take_screen_changed());
+  std::vector<uint32_t> pixels(1024 * 768);
+  uint32_t w = 0, h = 0;
+  CHECK(!bridge.copy_screen(ArrayView<uint32_t>(pixels.data(), 1000), &w, &h) && w == 1024 && h == 768);      // too small
+  CHECK(bridge.copy_screen(ArrayView<uint32_t>(pixels.data(), pixels.size()), &w, &h));
+  const uint32_t want = 0xFF000000u | (kGreen & 0xFF) << 16 | (kGreen & 0xFF00) | (kGreen >> 16 & 0xFF);      // COLORREF 0x00BBGGRR as opaque 0xAARRGGBB
+  CHECK(pixels[20 * 1024 + 10] == want && pixels[39 * 1024 + 29] == want && pixels[0] != want && (pixels[0] >> 24) == 0xFF);
+  gdi::delete_dc(dc);
+  // the pointer: a position, then a relative mouse's motion; nothing confines it
+  bridge.mouse_position(300, 200);
+  bridge.mouse_motion(5, -3);
+  int32_t x = 0, y = 0;
+  bridge.cursor(&x, &y);
+  CHECK(x == 305 && y == 197 && !bridge.cursor_confined());
+  bridge.detach();
+  CHECK(f.u(N(PatBlt), dc, 0, 0, 1, 1, kPatCopy) == 0 || !bridge.take_screen_changed());      // detached: no more changes noted
+  user::reset_state();      // (the window manager's state was made for the pointer: it goes with this test's system)
+}
+
 int main() {
   test_registration();
   test_objects();
@@ -1031,6 +1081,7 @@ int main() {
   test_text();
   test_font_provider();
   test_screen_dc();
+  test_desktop_bridge();
   test_misc_and_errors();
   return finish("Win32kGdiTest");
 }

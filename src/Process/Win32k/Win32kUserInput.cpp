@@ -923,7 +923,8 @@ void inject_key_locked(uint32_t vk, uint32_t scan, bool down, bool extended) {
   uint32_t message = down ? (sys ? wn::WM_SYSKEYDOWN : wn::WM_KEYDOWN) : (sys ? wn::WM_SYSKEYUP : wn::WM_KEYUP);
   uint32_t lparam = 1 | ((scan & 0xFF) << 16) | (extended ? 1u << 24 : 0) | ((alt && vk != wn::VK_MENU && vk != wn::VK_LMENU && vk != wn::VK_RMENU) ? 1u << 29 : 0) | ((was_down || !down) ? 1u << 30 : 0) | (down ? 0 : 1u << 31);
   if (!down) lparam = (lparam & ~1u) | 1;
-  post_input(target, message, vk, lparam);
+  const uint32_t g = generic_modifier(vk);
+  post_input(target, message, g ? g : vk, lparam);      // (a left / right modifier is VK_SHIFT, VK_CONTROL or VK_MENU in the message, as on Windows)
 }
 
 void inject_char_locked(char32_t c) {
@@ -957,6 +958,7 @@ void inject_char(char32_t character) { LockGuard g; inject_char_locked(character
 void inject_mouse_move(int32_t x, int32_t y) { LockGuard g; inject_move_locked(x, y); }
 void inject_mouse_motion(int32_t dx, int32_t dy) { LockGuard g; inject_motion_locked(dx, dy); }
 void set_cursor_position(int32_t x, int32_t y) { LockGuard g; set_cursor_pos_locked(x, y); }
+bool cursor_confined() { LockGuard g; return state_or_null() && S().clip_cursor_set; }
 void inject_mouse_button(uint32_t button, bool down) { LockGuard g; inject_button_locked(button, down); }
 void inject_mouse_wheel(int32_t delta, bool horizontal) { LockGuard g; inject_wheel_locked(delta, horizontal); }
 void cursor_position(int32_t* x, int32_t* y) {

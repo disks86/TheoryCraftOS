@@ -50,7 +50,8 @@ void inject_mouse_motion(int32_t dx, int32_t dy);                // a relative m
 void inject_mouse_button(uint32_t button, bool down);            // 1 left, 2 right, 3 middle, 4 X1, 5 X2
 void inject_mouse_wheel(int32_t delta, bool horizontal);
 void cursor_position(int32_t* x, int32_t* y);                    // takes the lock itself
-void set_cursor_position(int32_t x, int32_t y);                  // SetCursorPos / ClipCursor: the cursor moves (WM_MOUSEMOVE), but it is not input (no raw input); takes the lock
+void set_cursor_position(int32_t x, int32_t y);
+bool cursor_confined();                                          // a program keeps the cursor in a rectangle (ClipCursor); takes the lock                  // SetCursorPos / ClipCursor: the cursor moves (WM_MOUSEMOVE), but it is not input (no raw input); takes the lock
 // Times and timers: the window manager's timers (SetTimer) and the delayed things (tooltips, double-click time) are due by the monotonic clock of the process hosts. The kernel
 // calls this now and then (the desktop pump), and every message wait calls it; it posts WM_TIMER / WM_PAINT-like pending work. Takes the lock itself.
 void pump(uint64_t now_ns);

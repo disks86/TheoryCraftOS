@@ -40,6 +40,7 @@ uint32_t InputPump::pump() {
       const uint8_t bit = static_cast<uint8_t>(1u << (key.usage - hardware::key::kLeftControl));
       modifiers_ = key.pressed ? (modifiers_ | bit) : (modifiers_ & ~bit);
     }
+    if (key_tap_) key_tap_(tap_context_, key, modifiers_);
     if (!key.pressed) continue;
     KeyArgs args;
     args.usage = key.usage;
@@ -65,6 +66,11 @@ uint32_t InputPump::pump() {
     x = x < 0 ? 0 : x > max_x ? max_x : x;
     y = y < 0 ? 0 : y > max_y ? max_y : y;
     if (confine_) confine_(confine_context_, &x, &y);
+    if (mouse_tap_) {
+      mouse_tap_(tap_context_, m, &x, &y);
+      x = x < 0 ? 0 : x > max_x ? max_x : x;      // (what the tap asks for stays inside the window too)
+      y = y < 0 ? 0 : y > max_y ? max_y : y;
+    }
     // Press and release at the position the pointer had when the button changed, after moving there.
     if (x != x_ || y != y_) {
       x_ = x;

@@ -48,6 +48,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       print_dialog_(allocator),
       explorer_(allocator),
       computer_manager_(allocator),
+      windows_screen_(allocator),
       notepad_(allocator),
       paint_(allocator),
       spreadsheet_(allocator),
@@ -115,6 +116,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
+  start_.menu().add_item("Windows Programs", {&Desktop::on_windows_screen, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -194,6 +196,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   computer_manager_.on_open_device_properties({&Desktop::on_device_properties, this});
   computer_manager_.on_open_bluetooth_properties({&Desktop::on_bluetooth_properties, this});
   input_.set_confine(&Desktop::confine_pointer, this);
+  input_.set_taps(&Desktop::tap_key, &Desktop::tap_mouse, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
 }
@@ -678,6 +681,15 @@ uint32_t Desktop::calculator_count() const {
 }
 
 void Desktop::on_calculator(void* self, Control&) { static_cast<Desktop*>(self)->open_calculator(); }
+
+// The Windows programs' screen: from the Start menu, and by itself when a Windows program first draws (WindowsScreen::pump).
+void Desktop::on_windows_screen(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->windows_screen_.open(d->windows_);
+}
+// The raw device events go to the Windows programs' window first (it hands them over when they are theirs), then on as usual. (The input pump's thread.)
+void Desktop::tap_key(void* self, const hardware::KeyEvent& event, uint8_t modifiers) { static_cast<Desktop*>(self)->windows_screen_.tap_key(event, modifiers); }
+void Desktop::tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y) { static_cast<Desktop*>(self)->windows_screen_.tap_mouse(event, x, y); }
 
 Calendar* Desktop::open_calendar(TabFrame* into) {
   Calendar* calendar = open_instance(calendar_, extra_calendars_, &Desktop::setup_calendar, into);
@@ -1205,6 +1217,7 @@ void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   window_.tick(uptime_us);
   input_.pump();
+  windows_screen_.pump(windows_);
   web_browser_.tick(uptime_us);
   toasts_.tick(uptime_us);
   if (media_player_.manager()) window_.locked([&] { media_player_.pump(); });
