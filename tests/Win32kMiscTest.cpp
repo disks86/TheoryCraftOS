@@ -759,7 +759,10 @@ void test_settings() {
   CHECK(p.memory.get_wide_z(kA + 24 + 28) == "Segoe UI" && p.memory.get32(kA + 24 + 16) == 400 && p.memory.get32(kA + 216) == 19);
   clear_error(p);
   p.memory.put32(kB, 500);
-  CHECK(spi(p, 0x29, 500, kB) == 0 && last_error(p) == kErrorInvalidParameter);
+  CHECK(spi(p, 0x29, 500, kB) == 1 && p.memory.get32(kB) == 500);      // (the size before Windows Vista: no iPaddedBorderWidth)
+  p.memory.put32(kB, 496);
+  CHECK(spi(p, 0x29, 496, kB) == 0 && last_error(p) == kErrorInvalidParameter);
+  p.memory.put32(kB, 500);
   CHECK(spi(p, 0x29, 504, kB) == 0);      // cbSize in the block and the size argument must agree with the real size
   p.memory.put32(kA + 8, 20);
   CHECK(spi(p, 0x2A, 504, kA) == 1 && one(p, 9, 2) == 20 && user_misc::system_metrics(2, 96) == 20);      // SM_CXVSCROLL follows
