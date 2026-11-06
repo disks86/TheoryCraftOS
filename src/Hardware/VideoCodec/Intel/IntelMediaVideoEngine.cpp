@@ -62,7 +62,15 @@ bool IntelMediaVideoEngine::initialize() {
   const bool xe_hpg = gpu_.architecture == IntelGpuArchitecture::XeHpg && gpu_.discrete && (status_.vdbox_awake & 1);
   // Lunar Lake and Arc Battlemage (Xe2): the media tile again, with Xe2's PAT and MOCS tables and context image. The decode commands (AVC, HEVC, VP9) are Xe-LP's with optional
   // new fields; AV1's have the Xe-LPG lengths but a 215-dword buffer command. The VDEnc ones are not (below).
-  const bool xe2 = gpu_.architecture == IntelGpuArchitecture::Xe2 && (status_.vdbox_awake & 1);
+  const bool xe3 = gpu_.architecture == IntelGpuArchitecture::Xe3 && !gpu_.discrete && (status_.vdbox_awake & 1);
+  // Panther Lake and Wildcat Lake (Xe3): the kernel's xe driver gives the media tile Xe2's description, and the decode commands (AVC, HEVC, VP9, AV1) are Xe2's field for field
+  // (checked against the media driver's Xe3_LPM definitions: only the VDEnc commands grew, to a 99-dword pipe buffer command, a 7-dword pipe mode select, 49-dword CMD1 and
+  // 65-dword CMD2), so the Xe2 setup runs with the Xe3 flag for the encoders.
+  // Nova Lake (Xe3p_LPM): the kernel's xe driver again gives the media tile Xe2's description (PAT entries 0 .. 4 and the video context image are Xe2's too), and the decode
+  // commands equal Xe3's (the media driver's Xe3P_LPM definitions only split two header fields). Its VDEnc constant tables are closed (the open files are empty), so there is no
+  // encode here: the CPU encodes.
+  const bool xe3p = gpu_.architecture == IntelGpuArchitecture::Xe3p && !gpu_.discrete && (status_.vdbox_awake & 1);
+  const bool xe2 = (gpu_.architecture == IntelGpuArchitecture::Xe2 && (status_.vdbox_awake & 1)) || xe3 || xe3p;
   if (setup_.registers && setup_.memory && setup_.ggtt_table.valid() && (gen9 || gen11 || gen12 || xe_lpg || xe_hpg || xe2) && status_.vdbox_count() > 0) {
     UniquePointer<intel_gt::VcsDriver> driver = UniquePointer<intel_gt::VcsDriver>::make(allocator_, *setup_.memory);
     intel_gt::VcsDriver::Config config;
@@ -72,7 +80,8 @@ bool IntelMediaVideoEngine::initialize() {
     config.xe_lpg = xe_lpg;
     config.xe_hpg = xe_hpg;
     config.xe2 = xe2;
-    config.xe2_hpm = xe2 && gpu_.discrete;
+    config.xe2_hpm = xe2 && !xe3 && !xe3p && gpu_.discrete;
+    config.xe3 = xe3;
     config.gmd_id_flush = (xe_lpg || xe2) && !gpu_.discrete;
     config.generation = (gen12 || xe_lpg || xe_hpg || xe2) ? intel_gt::Generation::Gen12 : gen11 ? intel_gt::Generation::Gen11 : intel_gt::Generation::Gen9;
     if (driver && driver->initialize(config)) {
@@ -88,7 +97,7 @@ bool IntelMediaVideoEngine::initialize() {
         // HEVC/VP9 tile and slice state, longer CMD1 and CMD2, VDENC_AVC_IMG_STATE and VDENC_AVC_SLICE_STATE for H.264), and each family has its own constant tables. The images come
         // from the media driver's own code, compiled by tools/gen_intel_{hevc,avc}_xelpg.py (Xe-LPG, Lunar Lake and Battlemage; the HEVC one also does Arc) and
         // tools/gen_intel_avc_xehpg.py (Arc's older H.264 path). None of it has run on hardware.
-        info_.accelerated_encode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc);
+        info_.accelerated_encode_codecs = xe3p ? 0 : codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc);
       } else if (gen12) {
         info_.accelerated_decode_codecs = codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) |
                                           (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0);

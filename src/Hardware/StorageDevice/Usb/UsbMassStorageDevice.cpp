@@ -199,6 +199,7 @@ bool UsbMassStorageDevice::initialize() {
   info_.kind = optical_ ? StorageKind::Optical : StorageKind::Disk;
   info_.read_only = optical_;
   info_.removable = unit.removable;
+  info_.media = StorageMedia::Removable;
   copy_device_string(ArrayView<char>(info_.model), unit.vendor_and_product, false);
 
   const uint8_t ready[6] = {scsi::kTestUnitReady};

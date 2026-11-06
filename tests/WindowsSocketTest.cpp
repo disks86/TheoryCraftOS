@@ -265,7 +265,31 @@ static void test_select() {
   CHECK(s.memory.get32(kBase + 0x190) == 1 && s.memory.get32(kBase + 0x120) == 1 && s.memory.get64(kBase + 0x100) == client);
 }
 
+// Operation 5 lists the interfaces' IPv4 configuration (iphlpapi's adapter list): one interface here, then STATUS_NO_MORE_ENTRIES; a short buffer or index is refused.
+static void test_interface_configuration() {
+  Setup s;
+  uint64_t sock = 0;
+  CHECK(s.create_socket(false, &sock) == kSuccess);
+  s.memory.put32(kBase + 0x200, 0);
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, sock, 5 /*InterfaceConfiguration*/, kBase + 0x200, 4, kBase + 0x500, 16) == kSuccess);
+  uint8_t c[16];
+  s.memory.read(kBase + 0x500, ByteView(c, 16));
+  CHECK(c[0] == 10 && c[1] == 0 && c[2] == 0 && c[3] == 1);            // address
+  CHECK(c[4] == 255 && c[5] == 255 && c[6] == 255 && c[7] == 0);       // netmask
+  CHECK(c[8] == 10 && c[9] == 0 && c[10] == 0 && c[11] == 254);        // gateway
+  CHECK(c[12] == 0 && c[13] == 0 && c[14] == 0 && c[15] == 0);         // no DNS server
+  s.memory.put32(kBase + 0x200, 1);
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, sock, 5, kBase + 0x200, 4, kBase + 0x500, 16) == 0x8000001Au);
+  s.memory.put32(kBase + 0x200, 0xFFFFFFFFu);
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, sock, 5, kBase + 0x200, 4, kBase + 0x500, 16) == 0x8000001Au);
+  s.memory.put32(kBase + 0x200, 0);
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, sock, 5, kBase + 0x200, 4, kBase + 0x500, 15) == 0xC0000004u);      // STATUS_INFO_LENGTH_MISMATCH
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, sock, 5, kBase + 0x200, 2, kBase + 0x500, 16) == 0xC0000004u);
+  CHECK(s.call(WindowsSyscallNumber::NtSocketControl, sock, 5, kBase + 0x200, 4, kSize + kBase, 16) == 0xC0000005u);      // an output the process cannot write
+}
+
 int main() {
+  test_interface_configuration();
   test_tcp_client_server();
   test_tcp_non_blocking_and_errors();
   test_udp_round_trip();

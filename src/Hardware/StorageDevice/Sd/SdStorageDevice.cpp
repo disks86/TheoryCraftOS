@@ -30,6 +30,7 @@ bool SdStorageDevice::initialize() {
   info_.block_count = card.block_count;
   info_.read_only = card.read_only || host_.write_protected();
   info_.removable = true;
+  info_.media = StorageMedia::Removable;
   const char prefix[] = "SD ";
   uint32_t n = 0;
   for (const char* p = prefix; *p; ++p) info_.model[n++] = *p;

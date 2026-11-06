@@ -1,0 +1,8 @@
+LIBRARY xinput1_4.dll
+EXPORTS
+XInputGetStateEx @100 NONAME
+XInputWaitForGuideButton @101 NONAME
+XInputCancelGuideButtonWait @102 NONAME
+XInputPowerOffController @103 NONAME
+XInputGetBaseBusInformation @104 NONAME
+XInputGetCapabilitiesEx @108 NONAME

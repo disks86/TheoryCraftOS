@@ -19,9 +19,11 @@
 #include "KernelDemo.hpp"
 #include <new>
 #include "console.hpp"
+#include "Hardware/StorageDevice/ScheduledStorageDevice.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Thread.hpp"
+#include "Utility/AllocatedView.hpp"
 #if defined(__x86_64__)
 #include "Kernel/Apic.hpp"
 #endif
@@ -628,6 +630,134 @@ bool test_quiet_ticks() {
   return report("quiet ticks mostly take no lock", ticks > 0 && lock_free * 2 >= ticks);
 }
 
+// ---- the I/O scheduler (docs/IoScheduling.md) in front of a RAM disk that takes 40 us a request ----
+// Writers at BestEffort, a reader at Realtime and one at Idle share it from threads on every core: every block reads back what its thread
+// wrote, the realtime reads wait less than the writes, the idle reads finish (their deadline), and the scheduler's counts add up.
+
+class SlowRamDisk final : public hardware::IStorageDevice {
+ public:
+  static constexpr uint32_t kBlocks = 1024;
+  explicit SlowRamDisk(ByteView memory) : memory_(memory) {}
+  const char* name() const override { return "slow RAM disk"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  hardware::StorageInfo info() const override {
+    hardware::StorageInfo i;
+    i.block_count = kBlocks;
+    i.block_size = 512;
+    i.media = hardware::StorageMedia::SolidState;
+    return i;
+  }
+  hardware::StorageStatistics statistics() const override { return {}; }
+  bool read(uint64_t lba, ByteView buffer) override { return move(lba, buffer.size(), [&](ByteView disk) { buffer.copy_from(disk); }); }
+  bool write(uint64_t lba, ConstByteView buffer) override { return move(lba, buffer.size(), [&](ByteView disk) { disk.copy_from(buffer); }); }
+  bool flush() override { return true; }
+  uint32_t overlaps() const { return __atomic_load_n(&overlaps_, __ATOMIC_RELAXED); }
+
+ private:
+  template <class Copy>
+  bool move(uint64_t lba, uint64_t bytes, Copy&& copy) {
+    if (lba >= kBlocks || bytes > (kBlocks - lba) * 512) return false;
+    if (__atomic_add_fetch(&busy_, 1, __ATOMIC_ACQ_REL) > 1) __atomic_add_fetch(&overlaps_, 1, __ATOMIC_RELAXED);   // (depth 1: never two at once)
+    copy(memory_.subview(lba * 512, bytes));
+    hardware::delay_spin_us(40);
+    __atomic_sub_fetch(&busy_, 1, __ATOMIC_ACQ_REL);
+    return true;
+  }
+  ByteView memory_;
+  uint32_t busy_ = 0, overlaps_ = 0;
+};
+
+struct IoSchedulerRun {
+  hardware::IStorageDevice* disk = nullptr;
+  uint32_t next_writer = 0;
+  uint32_t bad = 0;
+  uint64_t write_us = 0, writes = 0;
+  uint64_t realtime_us = 0, realtime_reads = 0;
+  uint64_t idle_reads = 0;
+};
+
+void io_writer_main(void* argument) {
+  IoSchedulerRun* r = static_cast<IoSchedulerRun*>(argument);
+  const uint32_t me = __atomic_fetch_add(&r->next_writer, 1, __ATOMIC_RELAXED);
+  uint8_t block[4096], back[4096];
+  for (uint32_t round = 0; round < 60; ++round) {
+    const uint64_t lba = me * 64 + (round % 8) * 8;   // its own 32 KiB, 4 KiB at a time
+    for (uint32_t i = 0; i < sizeof(block); ++i) block[i] = static_cast<uint8_t>(me * 31 + round * 7 + i);
+    const uint64_t start = hardware::uptime_us();
+    const bool wrote = r->disk->write(lba, ConstByteView(block));
+    __atomic_add_fetch(&r->write_us, hardware::uptime_us() - start, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&r->writes, 1, __ATOMIC_RELAXED);
+    if (!wrote || !r->disk->read(lba, ByteView(back)) || !ConstByteView(back).equals(ConstByteView(block))) __atomic_add_fetch(&r->bad, 1, __ATOMIC_RELAXED);
+  }
+}
+
+void io_realtime_main(void* argument) {
+  IoSchedulerRun* r = static_cast<IoSchedulerRun*>(argument);
+  set_thread_io_priority(current_thread(), 0, 100);
+  uint8_t block[512];
+  for (uint32_t i = 0; i < 40; ++i) {
+    const uint64_t start = hardware::uptime_us();
+    if (!r->disk->read(1000, ByteView(block))) __atomic_add_fetch(&r->bad, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&r->realtime_us, hardware::uptime_us() - start, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&r->realtime_reads, 1, __ATOMIC_RELAXED);
+    sleep_us(500);
+  }
+}
+
+void io_idle_main(void* argument) {
+  IoSchedulerRun* r = static_cast<IoSchedulerRun*>(argument);
+  set_thread_io_priority(current_thread(), 2, 100);
+  uint8_t block[512];
+  for (uint32_t i = 0; i < 10; ++i) {
+    if (!r->disk->read(1001, ByteView(block))) __atomic_add_fetch(&r->bad, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&r->idle_reads, 1, __ATOMIC_RELAXED);
+  }
+}
+
+bool test_io_scheduler(allocators::IAllocator& allocator) {
+  ByteView memory = allocate_view<uint8_t>(allocator, SlowRamDisk::kBlocks * 512);
+  if (memory.empty()) return report("I/O scheduler: writers, a realtime and an idle reader share a disk", false);
+  memory.fill(0);
+  SlowRamDisk* ram = nullptr;
+  bool ok = false;
+  {
+    UniquePointer<hardware::IStorageDevice> device = UniquePointer<hardware::IStorageDevice>::make_as<SlowRamDisk>(allocator, memory);
+    ram = static_cast<SlowRamDisk*>(device.get());
+    hardware::ScheduledStorageDevice scheduled(allocator);
+    if (device && scheduled.attach(device)) {
+      IoSchedulerRun run;
+      run.disk = &scheduled;
+      const uint32_t writers = core_count() < 8 ? core_count() + 2 : 10;
+      Thread* threads[12] = {};
+      for (uint32_t i = 0; i < writers; ++i) threads[i] = spawn(io_writer_main, &run, "io writer");
+      threads[writers] = spawn(io_realtime_main, &run, "io realtime");
+      threads[writers + 1] = spawn(io_idle_main, &run, "io idle");
+      ok = join_all(threads, writers + 2);
+      const iosched::IoSchedulerStatistics st = scheduled.scheduler_statistics();
+      const uint64_t requests = uint64_t{writers} * 60 * 2 + 40 + 10;
+      const uint64_t write_avg = run.writes ? run.write_us / run.writes : 0;
+      const uint64_t realtime_avg = run.realtime_reads ? run.realtime_us / run.realtime_reads : 0;
+      auto number = [](const char* before, uint64_t value) {
+        console::puts(before);
+        console::put_dec(static_cast<int64_t>(value));
+      };
+      number("  (", writers);
+      number(" writers: writes took ", write_avg);
+      number(" us on average, realtime reads ", realtime_avg);
+      number(" us; ", st.fair.enqueued);
+      number(" of ", requests);
+      number(" requests queued, ", st.bypassed);
+      console::puts(" bypassed)\n");
+      ok &= run.bad == 0 && ram->overlaps() == 0 && run.idle_reads == 10 && run.realtime_reads == 40;
+      ok &= st.queued == 0 && st.in_flight == 0 && st.fair.enqueued == st.fair.completed && st.fair.enqueued + st.bypassed == requests;
+      ok &= realtime_avg < write_avg;
+    }
+  }
+  release_view(allocator, memory);
+  return report("I/O scheduler: writers, a realtime and an idle reader share a disk", ok);
+}
+
 }  // namespace
 
 bool run_kernel_demo(allocators::IAllocator& allocator) {
@@ -638,6 +768,7 @@ bool run_kernel_demo(allocators::IAllocator& allocator) {
   ok &= test_blocking();
   ok &= test_quiet_ticks();
   ok &= test_stress(allocator);
+  ok &= test_io_scheduler(allocator);
 #if defined(__x86_64__)
   ok &= test_io_affinity();
 #endif

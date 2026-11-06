@@ -34,6 +34,7 @@ using namespace build;
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeLpgAvc.inc"
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2LpmAvc.inc"   // (only the image state differs from Xe-LPG's)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe2HpmAvc.inc"   // (and the pipe mode select)
+#include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXe3LpmHevc.inc"   // (Panther Lake: the 99-dword pipe buffer command)
 #include "Hardware/VideoCodec/Intel/IntelEncodeCommandImagesXeHpgAvc.inc"   // (Arc: its own CMD3 and image state; everything else is Xe-LPG's)
 #include "Hardware/VideoCodec/Intel/IntelVdencTables.inc"
 
@@ -203,10 +204,10 @@ static void xe_lpg_avc_image_state(DwordWriter& w, const AvcEncodePicture& p, ui
     static const uint32_t* const kImg[3][3] = {{kXeLpgAvcVdencImgStateWithBI, kXeLpgAvcVdencImgStateWithBP, kXeLpgAvcVdencImgStateWithBB},
                                                 {kXe2LpmAvcVdencImgStateWithBI, kXe2LpmAvcVdencImgStateWithBP, kXe2LpmAvcVdencImgStateWithBB},
                                                 {kXe2HpmAvcVdencImgStateWithBI, kXe2HpmAvcVdencImgStateWithBP, kXe2HpmAvcVdencImgStateWithBB}};
-    image = kImg[p.xe2][t];
+    image = kImg[p.xe2 == 3 ? 1 : p.xe2][t];   // (Panther Lake: Lunar Lake's)
   } else {
     cmd3 = (p.p_picture ? kXeLpgAvcVdencCmd3TableP : kXeLpgAvcVdencCmd3TableI) + q * kXeLpgAvcVdencCmd3Dwords;
-    image = p.xe2 == 1 ? (p.p_picture ? kXe2LpmAvcVdencImgStateP : kXe2LpmAvcVdencImgStateI)
+    image = p.xe2 == 1 || p.xe2 == 3 ? (p.p_picture ? kXe2LpmAvcVdencImgStateP : kXe2LpmAvcVdencImgStateI)
           : p.xe2 == 2 ? (p.p_picture ? kXe2HpmAvcVdencImgStateP : kXe2HpmAvcVdencImgStateI)
                        : (p.p_picture ? kXeLpgAvcVdencImgStateP : kXeLpgAvcVdencImgStateI);
   }
@@ -353,7 +354,7 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   if (p.xe_lpg || p.xe_hpg) {
     // (Arc's older driver also turns the frame statistics stream-out on when it uses adaptive rounding: bit 5 of the first dword.)
     const uint32_t random_access = p.b_picture ? 1u << 18 : 0u;   // IsRandomAccess (dword 1, bit 18) for a B picture
-    if (p.xe2 == 2) for (uint32_t i = 0; i < kXe2HpmAvcVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmAvcVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
+    if (p.xe2 == 2 || p.xe2 == 3) for (uint32_t i = 0; i < kXe2HpmAvcVdencPipeModeSelectDwords; ++i) w.emit(kXe2HpmAvcVdencPipeModeSelectImage[i] | (i == 1 ? random_access : 0u));
     else for (uint32_t i = 0; i < kXeLpgAvcVdencPipeModeSelectDwords; ++i) w.emit(kXeLpgAvcVdencPipeModeSelectImage[i] | (i == 1 && p.xe_hpg ? 1u << 5 : 0u) | (i == 1 ? random_access : 0u));
   } else if (p.generation == EncodeGeneration::Gen12) {
     // Xe-LP prefetches the TLB entries of the source picture ahead of the engine (the driver's settings for AVC).
@@ -383,7 +384,8 @@ void emit_avc_vdenc_picture(DwordWriter& w, const AvcEncodePicture& p, const Avc
   if (gen11_up) vdenc_surface(w, kGen11VdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, gen12_surfaces);   // (room for two surfaces; one is used)
   else vdenc_surface(w, kVdencDsRefSurfaceStateDefault, layout.quarter_width, layout.quarter_height, layout.quarter, false);
   if (p.xe_lpg || p.xe_hpg) {
-    vdenc_pipe_buf(w, kXeLpgVdencPipeBufAddrStateImage, p, b);   // (Arc's is the same image)
+    if (p.xe2 == 3) vdenc_pipe_buf(w, kXe3LpmVdencPipeBufAddrStateImage, p, b);
+    else vdenc_pipe_buf(w, kXeLpgVdencPipeBufAddrStateImage, p, b);   // (Arc's is the same image)
   } else switch (p.generation) {
     case EncodeGeneration::Gen9: vdenc_pipe_buf(w, kVdencPipeBufAddrStateDefault, p, b); break;
     case EncodeGeneration::Gen11: vdenc_pipe_buf(w, kGen11VdencPipeBufAddrStateDefault, p, b); break;

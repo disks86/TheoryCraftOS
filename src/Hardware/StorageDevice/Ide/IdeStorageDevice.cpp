@@ -134,6 +134,7 @@ bool IdeStorageDevice::initialize() {
   copy_device_string(ArrayView<char>(info_.serial), id_bytes.subview(20, 20), true);  // words 10-19
   copy_device_string(ArrayView<char>(info_.model), id_bytes.subview(54, 40), true);   // words 27-46
   info_.removable = id[0] & (1u << 7);
+  if (!atapi_) info_.media = media_from_ata_rotation(id[217]);
 
   if (atapi_) {
     info_.kind = StorageKind::Optical;

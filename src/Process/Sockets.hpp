@@ -65,6 +65,8 @@ class SocketManager {
   bool is_non_blocking(uint32_t id) const;
   bool local_name(uint32_t id, uint32_t* address, uint16_t* port);
   bool peer_name(uint32_t id, uint32_t* address, uint16_t* port);
+  // The IPv4 configuration of the `index`th network interface (for iphlpapi's adapter list); false past the last one.
+  bool interface_configuration(uint32_t index, network::IpConfiguration* out) const;
   // How many bytes (TCP) or whole datagrams (UDP) are waiting; for select()'s read set and FIONREAD.
   uint32_t readable(uint32_t id) const;
   bool is_tcp(uint32_t id) const;

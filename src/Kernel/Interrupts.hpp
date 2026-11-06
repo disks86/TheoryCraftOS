@@ -48,6 +48,10 @@ constexpr uint8_t kVectorAcpiSci = 0x53;   // I/O APIC: the ACPI system control 
 constexpr uint8_t kVectorWifi = 0x55;      // MSI: the Intel Wi-Fi card (receive, firmware errors)
 constexpr uint8_t kVectorIntelNpu = 0x56;  // MSI: the Intel NPU (message channel, MMU faults, watchdogs)
 constexpr uint8_t kVectorIoSelfTest = 0x57; // inter-processor interrupt standing in for a device's (KernelDemo's I/O affinity check)
+// MSI-X: storage queues with a vector each (NVMe: one per core), handed out by the drivers that use them (NvmeStorageDevice). (0x60-0x7F is the firmware's legacy PIC, 0x80
+// the system call entry.)
+constexpr uint8_t kVectorStorageFirst = 0xA0;
+constexpr uint8_t kVectorStorageCount = 32;
 constexpr uint8_t kVectorSpurious = 0xFF;
 constexpr uint64_t kRflagsInterrupts = 1u << 9;
 #elif defined(__aarch64__)

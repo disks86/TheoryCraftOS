@@ -32,7 +32,16 @@ uint32_t PciMsix::table_size(PciAddress function) {
 }
 
 bool PciMsix::enable(PciAddress function, const uint8_t* vectors, uint32_t count, uint32_t apic_id) {
-  if (capability_ != 0 || count == 0 || count > kMaxEntries || apic_id > 0xFF) return false;
+  if (count == 0 || count > kMaxEntries || apic_id > 0xFF) return false;
+  uint32_t ids[kMaxEntries];
+  for (uint32_t i = 0; i < count; ++i) ids[i] = apic_id;
+  return enable(function, vectors, ids, count);
+}
+
+bool PciMsix::enable(PciAddress function, const uint8_t* vectors, const uint32_t* apic_ids, uint32_t count) {
+  if (capability_ != 0 || count == 0 || count > kMaxEntries) return false;
+  for (uint32_t i = 0; i < count; ++i)
+    if (apic_ids[i] > 0xFF) return false;
   const uint16_t cap = bus_.find_capability(function, kCapabilityId);
   if (cap == 0) return false;
   const uint32_t first = bus_.read32(function, cap);                   // id, next, message control in the high half
@@ -49,7 +58,7 @@ bool PciMsix::enable(PciAddress function, const uint8_t* vectors, uint32_t count
   for (uint32_t i = 0; i < size; ++i) region.write32(i * kEntryBytes + 12, 1);                  // every entry masked
   for (uint32_t i = 0; i < count; ++i) {
     const uint64_t at = static_cast<uint64_t>(i) * kEntryBytes;
-    region.write32(at + 0, 0xFEE00000u | (apic_id << 12));            // fixed delivery to that core
+    region.write32(at + 0, 0xFEE00000u | (apic_ids[i] << 12));        // fixed delivery to that core
     region.write32(at + 4, 0);
     region.write32(at + 8, vectors[i]);                                // edge triggered
     region.write32(at + 12, 0);

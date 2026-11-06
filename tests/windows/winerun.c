@@ -45,7 +45,8 @@ int main(void) {
     /* Wine's tests start themselves again to get a second process, and for that they need their own name as the first argument (<dll>_<test>.exe: the test is <test>). */
     char test_name[100] = "";
     {
-      const char *underscore = strchr(line, '_'), *dot = strrchr(line, '.');
+      /* (the DLL name ends at the first underscore, except for ws2_32, the one tested DLL with an underscore of its own; test names may have them too) */
+      const char *underscore = strncmp(line, "ws2_32_", 7) == 0 ? line + 6 : strchr(line, '_'), *dot = strrchr(line, '.');
       if (underscore && dot && dot > underscore + 1 && (size_t)(dot - underscore) < sizeof(test_name)) { memcpy(test_name, underscore + 1, (size_t)(dot - underscore - 1)); test_name[dot - underscore - 1] = 0; }
     }
     snprintf(command, sizeof(command), "C:\\Windows\\Tests\\%s%s%s", line, test_name[0] ? " " : "", test_name);

@@ -61,6 +61,11 @@ struct Thread {
   uint64_t core_mask = ~uint64_t{0};      // the cores (bit n: core n, for the first 64) it may run on
   int8_t preferred_kind = -1;  // CoreKind it likes, or -1
   uint8_t priority = kDefaultPriority;    // 0 (least) .. 31 (most); the ready queue always runs the highest non-empty level first, round-robin within a level
+  // I/O priority (set_thread_io_priority): the I/O scheduler's class (0 Realtime, 1 BestEffort, 2 Idle; kIoClassFromPriority: derived from
+  // `priority`), the weight within the class, and the group whose threads share one I/O queue (0: the thread's own).
+  uint8_t io_class = 0xFF;
+  uint16_t io_weight = 0;
+  uint64_t io_group = 0;
   // Device-aware placement (CPUScheduler/IoAffinity.hpp): the core it ran on last, the core whose device interrupts it follows (learnt from the
   // interrupts that wake it, or the bound device's), the idle core it was sent to when it became ready, and when that was.
   int32_t last_core = -1;
@@ -116,6 +121,12 @@ void set_thread_affinity(Thread* thread, int32_t core);
 // Changes which of the kPriorityLevels queues the thread runs from (clamped to 0..kPriorityLevels-1). Takes effect the next time it is scheduled: a thread already
 // sitting in the ready queue runs once more at its old level, then moves.
 void set_thread_priority(Thread* thread, uint8_t priority);
+// The thread's I/O priority (iosched::IoClass and weight, docs/IoScheduling.md), like Linux's ioprio_set: its storage requests compete in
+// that class with that weight. kIoClassFromPriority (the default) derives both from its CPU priority. Takes effect with its next request.
+constexpr uint8_t kIoClassFromPriority = 0xFF;
+void set_thread_io_priority(Thread* thread, uint8_t io_class, uint16_t weight);
+// Puts the thread's storage requests into the I/O queue of `group` (the threads of one process share their fair share); 0: its own queue.
+void set_thread_io_group(Thread* thread, uint64_t group);
 // Restricts the thread to the cores whose bit is set (cores past the 64th are always allowed). False for a mask that allows no online core. Takes effect when the thread is next
 // scheduled (within a time slice if it runs on a core that is now excluded).
 bool set_thread_core_mask(Thread* thread, uint64_t mask);

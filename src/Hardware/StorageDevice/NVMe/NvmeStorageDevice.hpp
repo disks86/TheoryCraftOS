@@ -18,18 +18,34 @@
 
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Bus/Pci/PciMsix.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
+#include "Kernel/Interrupts.hpp"
+#include "Kernel/Sync.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace hardware {
 
-// An NVM Express SSD (QEMU's `nvme` device): the first active namespace of the
-// controller, through one admin and one I/O queue pair that are used one command
-// at a time, polled, interrupts masked. Data moves by PRP, so the bounce buffer
-// plus one PRP list page is all the memory it needs.
+// An NVM Express SSD: the first active namespace of the controller, used the way NVMe is meant to be on a machine with many cores.
+//
+// - One I/O queue pair per core (up to kMaxQueues and what the controller grants): a thread submits on its own core's queue, under that queue's
+//   lock only, so cores never contend for a doorbell.
+// - Real depth: a pool of kMaxSlots command slots, each with its own DMA buffer and PRP list, so that many requests are on the device at once
+//   (StorageInfo::queue_depth tells the I/O scheduler how many). A request holds one slot; a big one goes through it 64 KiB at a time.
+// - Interrupts: on x86 each queue's MSI-X entry goes to the core that submits on it, with a vector of its own (kVectorStorageFirst...); the
+//   completion handler there wakes the waiting thread, which the scheduler then runs where the data just arrived. Interrupt delivery is
+//   checked on every queue at start; without MSI-X, before the scheduler runs, or if a check fails, the waiting threads poll their queue
+//   instead (still in parallel). A waiter also looks at its queue itself whenever its wait times out, so a lost interrupt costs time, not the
+//   request.
+// - The admin queue is used one command at a time, polled, during start-up only.
 class NvmeStorageDevice final : public StorageDeviceBase {
  public:
-  static constexpr uint32_t kQueueEntries = 16;
+  static constexpr uint32_t kAdminEntries = 16;
+  static constexpr uint32_t kMaxQueues = 16;
+  static constexpr uint32_t kMaxQueueEntries = 128;
+  static constexpr uint32_t kMaxSlots = 64;
+  static constexpr uint32_t kSlotBytes = 64 * 1024;
 
   NvmeStorageDevice(const IPciBus& pci, const PciDeviceInfo& device, allocators::IAllocator& allocator,
                     efi::SystemTable* st)
@@ -41,10 +57,21 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   const char* name() const override { return "NVMe"; }
   bool initialize() override;
   void shutdown() override;
+  void describe(IPropertySink& sink) const override;
+
+  bool read(uint64_t lba, ByteView buffer) override;
+  bool write(uint64_t lba, ConstByteView buffer) override;
+  bool flush() override;
+  StorageStatistics statistics() const override;
+
+  uint32_t queue_count() const { return queue_count_; }
+  uint32_t slot_count() const { return slot_count_; }
+  bool uses_interrupts() const { return interrupts_; }
+  // Completion interrupts taken on the queue (0 when polled).
+  uint64_t queue_interrupts(uint32_t queue) const;
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
-  bool flush_cache() override;
+  bool transfer(bool, uint64_t, uint32_t, ByteView) override { return false; }   // (read/write above do the work)
 
  private:
   struct Command {  // submission queue entry, 64 bytes
@@ -62,12 +89,33 @@ class NvmeStorageDevice final : public StorageDeviceBase {
     uint16_t command_id;
     uint16_t status;  // bit 0 phase tag, bits 15:1 status
   };
-  struct Queue {
-    ArrayView<Command> submission;    // kQueueEntries entries (the rest of the page is unused)
+  struct AdminQueue {
+    ArrayView<Command> submission;    // kAdminEntries entries (the rest of the page is unused)
     ArrayView<Completion> completion;
     uint32_t tail = 0, head = 0;
     uint16_t phase = 1;
-    uint16_t id = 0;
+  };
+  struct IoQueue {
+    NvmeStorageDevice* owner = nullptr;   // (for the interrupt handler)
+    ArrayView<Command> submission;
+    ArrayView<Completion> completion;
+    uint32_t entries = 0;
+    uint32_t tail = 0, head = 0;          // guarded by `lock`
+    uint16_t phase = 1;
+    uint16_t id = 0;                      // the queue id (1..), also its MSI-X entry
+    uint32_t core = 0;                    // the core its interrupt goes to
+    kernel::WaitList lock;                // only the lock word: an IRQ-masking spinlock (kernel::detail::lock_list)
+    int32_t io_device = -1;
+    uint8_t vector = 0;                   // 0: none
+    uint64_t interrupts = 0;              // atomic
+  };
+  struct Slot {
+    ByteView buffer;                      // kSlotBytes of DMA memory
+    ArrayView<uint64_t> prp;              // the PRP list for the pages after the first
+    kernel::Event done;                   // set when its completion is reaped (a waiter re-checks `completed`: a set can be stale)
+    uint32_t completed = 0;               // atomic
+    uint16_t status = 0;
+    bool lost = false;                    // timed out: the device may still use its memory, so it is never handed out again
   };
 
   uint32_t read32(uint32_t reg) const;
@@ -76,20 +124,54 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   void write64(uint32_t reg, uint64_t value) const;
   bool wait_ready(bool ready);
   bool disable_controller();
-  bool setup_queue(Queue* q, uint16_t id);
-  bool submit(Queue& q, Command& command, uint32_t* result = nullptr);
-  bool io(uint8_t opcode, uint64_t lba, uint32_t blocks, ByteView dma);
+  bool admin(Command& command, uint32_t* result = nullptr);
   bool identify();
+  bool set_up_slots();
+  bool set_up_queues();
+  bool create_queue(IoQueue& q, bool interrupt);
+  bool enable_interrupts();
+  bool check_interrupts();
+  void disable_interrupts();
+
+  bool run(bool write, uint64_t lba, ByteView into, ConstByteView from);
+  uint32_t acquire_slot();
+  void release_slot(uint32_t slot);
+  IoQueue& queue_for_this_core();
+  // Runs one command through `slot` on `q` and waits for it. False on an error status or a timeout.
+  bool execute(IoQueue& q, uint32_t slot, uint8_t opcode, uint64_t lba, uint32_t blocks, uint64_t bytes);
+  void reap(IoQueue& q);
+  static kernel::Frame* on_queue_interrupt(kernel::Frame* frame, void* queue);
 
   const IPciBus& pci_;
   PciDeviceInfo device_;
   uint64_t registers_ = 0;
   uint32_t doorbell_stride_ = 4;
   uint32_t timeout_ms_ = 5000;
-  Queue admin_, io_;
-  ByteView scratch_;  // identify data (4 KiB) followed by the PRP list (4 KiB)
+  uint32_t max_queue_entries_ = 2;        // CAP.MQES + 1
+  uint32_t chunk_bytes_ = kSlotBytes;     // what one command moves at most (MDTS)
+  AdminQueue admin_;
+  ByteView scratch_;                      // identify data (4 KiB) followed by an admin PRP list (4 KiB)
+  kernel::Mutex admin_mutex_;
   uint32_t namespace_id_ = 1;
-  uint16_t next_command_id_ = 1;
+  uint16_t next_admin_id_ = 1;
+  IoQueue queues_[kMaxQueues];
+  uint32_t queue_count_ = 0;
+  uint8_t core_queue_[64] = {};           // the queue each of the first 64 cores submits on (others: core % queue_count_)
+  Slot slots_[kMaxSlots];
+  uint32_t slot_count_ = 0;
+  uint64_t free_slots_ = 0;               // atomic: bit n set while slot n is free
+  ByteView slot_memory_;                  // every slot's buffer, then
+  ByteView prp_memory_;                   // every slot's PRP list
+  // The MSI-X table lies in one of the function's BARs, which (like the registers) are reachable at their physical address.
+  struct BarMapper final : IRegisterMapper {
+    bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) override {
+      if (physical == 0 || length == 0 || length > UINT64_MAX - physical) return false;
+      *region = MmioRegion(physical, length);
+      return true;
+    }
+  } bar_mapper_;
+  UniquePointer<PciMsix> msix_;
+  bool interrupts_ = false;
   bool owns_device_ = false;
   bool enabled_ = false;
 };
