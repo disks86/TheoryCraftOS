@@ -84,6 +84,15 @@ class INicDevice {
     (void)context;
     return false;
   }
+  // MSI-X: `count` vectors (entry i calls handler(context, i)), spread over the cores. Returns how many it set up: `count`, or 0 (no MSI-X,
+  // too few vectors left), and then the caller uses attach_interrupt(). detach_interrupt() undoes either.
+  using QueueInterruptHandler = void (*)(void* context, uint32_t index);
+  virtual uint32_t attach_interrupts(uint32_t count, QueueInterruptHandler handler, void* context) {
+    (void)count;
+    (void)handler;
+    (void)context;
+    return 0;
+  }
   virtual void detach_interrupt() {}
 
  protected:

@@ -74,6 +74,8 @@ void NetworkStackSet::service_main(void* self) {
     bool saturated = false;
     for (UniquePointer<NetworkStack>& stack : set->stacks_) saturated = saturated || stack->saturated();
     if (saturated) continue;  // frames are still waiting: no interrupt will say so again
+    // Everything was taken: the interfaces may interrupt again (an interrupt masks itself until then, so a burst costs one).
+    for (UniquePointer<NetworkStack>& stack : set->stacks_) stack->interface().rearm_interrupts();
     // Interfaces that interrupt wake this thread when frames arrive; then it only has to wake up by itself for the stacks' timers. One that is
     // polled keeps the short period.
     set->activity_.wait(set->interrupt_driven() ? kInterruptIdleUs : kPolledIdleUs);

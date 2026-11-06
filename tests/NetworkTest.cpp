@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Network/Tcp/TcpCoalescer.hpp"
+#include <random>
 #include "Network/Checksum.hpp"
 #include "Network/Dns/DnsMessage.hpp"
 #include "Network/NetworkStack.hpp"
@@ -179,7 +181,95 @@ static bool transport_checksum_ok(const std::vector<uint8_t>& f) {
   return sum == 0xFFFF;
 }
 
+// A TCP/IPv4 frame to MAC 02:00:00:00:00:01, 10.0.0.2:4000 -> 10.0.0.1:80 unless changed, with right checksums.
+struct TcpFrameSpec { uint32_t seq = 1000, ack = 5000; uint8_t flags = 0x10; uint16_t window = 8192, payload = 100, source_port = 4000; uint8_t ttl = 64;
+                      std::vector<uint8_t> options; uint8_t fill = 0; };
+static std::vector<uint8_t> tcp_frame(const TcpFrameSpec& t) {
+  const uint32_t tcp_header = 20 + (uint32_t)t.options.size(), total = 20 + tcp_header + t.payload;
+  std::vector<uint8_t> f(14 + total, 0);
+  const uint8_t dst[6] = {0x02, 0, 0, 0, 0, 1}; memcpy(&f[0], dst, 6); f[6] = 0x02; f[11] = 2; f[12] = 0x08;
+  f[14] = 0x45; store16(&f[16], (uint16_t)total); f[22] = t.ttl; f[23] = 6;
+  const uint8_t addresses[8] = {10, 0, 0, 2, 10, 0, 0, 1}; memcpy(&f[26], addresses, 8);
+  uint32_t sum = 0; for (int i = 14; i < 34; i += 2) sum += (f[i] << 8) | f[i + 1]; while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16); store16(&f[24], (uint16_t)~sum);
+  uint8_t* tcp = &f[34]; store16(tcp, t.source_port); store16(tcp + 2, 80); ::store32(tcp + 4, t.seq); ::store32(tcp + 8, t.ack);
+  tcp[12] = (uint8_t)((tcp_header / 4) << 4); tcp[13] = t.flags; store16(tcp + 14, t.window);
+  for (size_t i = 0; i < t.options.size(); ++i) tcp[20 + i] = t.options[i];
+  for (uint32_t i = 0; i < t.payload; ++i) tcp[tcp_header + i] = (uint8_t)(t.fill + t.seq + i);
+  uint32_t ps = 6 + tcp_header + t.payload; for (int i = 26; i < 34; i += 2) ps += (f[i] << 8) | f[i + 1];
+  for (uint32_t i = 0; i < tcp_header + t.payload; i += 2) ps += (tcp[i] << 8) | (i + 1 < tcp_header + t.payload ? tcp[i + 1] : 0);
+  while (ps >> 16) ps = (ps & 0xFFFF) + (ps >> 16); store16(tcp + 16, (uint16_t)~ps);
+  return f;
+}
+static bool offer(TcpCoalescer& c, const std::vector<uint8_t>& f, bool vouched = false) {
+  hardware::ReceivedFrame r; r.length = (uint32_t)f.size(); r.ipv4_header_checksum_good = vouched; r.transport_checksum_good = vouched;
+  return c.offer(ConstByteView(f.data(), f.size()), r);
+}
+
+static void test_coalescer() {
+  std::vector<uint8_t> storage(24 * 1024);
+  TcpCoalescer c(ByteView(storage.data(), storage.size()));
+  // a run of full segments and a short last one: one segment, the payloads in order, the IP length of all of it
+  TcpFrameSpec t; t.payload = 1460;
+  std::vector<uint8_t> expect;
+  for (int i = 0; i < 6; ++i) {
+    t.seq = 1000 + 1460 * i; if (i == 5) t.payload = 300;
+    if (i == 4) t.window = 9000;
+    const auto f = tcp_frame(t); expect.insert(expect.end(), f.begin() + 54, f.end());
+    assert(offer(c, f));
+  }
+  assert(c.holding() && c.pieces() == 6 && c.merged() == 5);
+  ConstByteView run = c.held();
+  assert(run.size() == 40 + expect.size() && load16(run.data() + 2) == run.size() && memcmp(run.data() + 40, expect.data(), expect.size()) == 0);
+  assert(load16(run.data() + 20 + 14) == 9000);                         // the latest window
+  t.seq = 1000 + 1460 * 5 + 300; t.payload = 100;
+  assert(!offer(c, tcp_frame(t)));                                       // the short piece ended the run
+  c.clear();
+  // what does not join: another sequence number, acknowledgement, port, TTL, option bytes, a larger piece, flags; nothing without payload
+  t = TcpFrameSpec{}; t.payload = 500; assert(offer(c, tcp_frame(t)));
+  auto next = [&](TcpFrameSpec x) { x.seq = 1500; return x; };
+  { TcpFrameSpec x = next(t); x.seq = 1501; assert(!offer(c, tcp_frame(x))); }
+  { TcpFrameSpec x = next(t); x.ack = 5001; assert(!offer(c, tcp_frame(x))); }
+  { TcpFrameSpec x = next(t); x.source_port = 4001; assert(!offer(c, tcp_frame(x))); }
+  { TcpFrameSpec x = next(t); x.ttl = 63; assert(!offer(c, tcp_frame(x))); }
+  { TcpFrameSpec x = next(t); x.payload = 501; assert(!offer(c, tcp_frame(x))); }
+  { TcpFrameSpec x = next(t); x.flags = 0x11; assert(!offer(c, tcp_frame(x))); }   // FIN
+  { TcpFrameSpec x = next(t); x.flags = 0x14; assert(!offer(c, tcp_frame(x))); }   // RST
+  { TcpFrameSpec x = next(t); x.options = {1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2}; assert(!offer(c, tcp_frame(x))); }
+  { TcpFrameSpec x = next(t); x.payload = 0; assert(!offer(c, tcp_frame(x))); }
+  { TcpFrameSpec x = next(t); auto f = tcp_frame(x); f[60] ^= 1; assert(!offer(c, f)); }   // a broken checksum, not vouched for
+  { TcpFrameSpec x = next(t); auto f = tcp_frame(x); f[60] ^= 1; assert(offer(c, f, true)); }  // vouched for by the interface: taken
+  assert(c.pieces() == 2);
+  { TcpFrameSpec x = t; x.seq = 2000; x.flags = 0x18; assert(offer(c, tcp_frame(x))); }  // PSH joins and ends the run
+  { TcpFrameSpec x = t; x.seq = 2500; assert(!offer(c, tcp_frame(x))); }
+  c.clear();
+  { TcpFrameSpec x = t; x.flags = 0x18; assert(!offer(c, tcp_frame(x)) && !c.holding()); }  // a PSH segment alone is just itself
+  // identical options join (timestamps in the same tick, as Linux requires)
+  t.options = {1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2};
+  assert(offer(c, tcp_frame(t))); { TcpFrameSpec x = next(t); assert(offer(c, tcp_frame(x))); }
+  c.clear();
+  // the storage limits a run
+  t = TcpFrameSpec{}; t.payload = 1460;
+  uint32_t taken = 0; for (int i = 0; i < 40; ++i) { t.seq = 1000 + 1460 * i; if (offer(c, tcp_frame(t))) ++taken; else break; }
+  assert(taken == (24 * 1024 - 40) / 1460 && c.held().size() <= storage.size());
+  c.clear();
+  // truncated and bit-flipped frames: never past the storage or the frame, a held run stays well formed
+  std::mt19937 rng(5);
+  t = TcpFrameSpec{}; t.payload = 700;
+  for (int round = 0; round < 4000; ++round) {
+    if (rng() % 8 == 0) c.clear();
+    t.seq = 1000 + 700 * (c.pieces());
+    auto f = tcp_frame(t);
+    if (round & 1) f.resize(rng() % (f.size() + 1));
+    else for (int k = 0; k < 1 + (int)(rng() % 3); ++k) f[rng() % f.size()] ^= (uint8_t)(1u << (rng() % 8));
+    offer(c, f, rng() % 2);
+    if (c.holding()) { ConstByteView h = c.held(); assert(h.size() <= storage.size() && load16(h.data() + 2) == h.size() && h[0] == 0x45); }
+  }
+  // and a coalescer without storage takes nothing
+  TcpCoalescer none; assert(!offer(none, tcp_frame(TcpFrameSpec{})));
+}
+
 int main() {
+  test_coalescer();
   { // ---- checksum sanity (RFC 1071 example) and byte helpers
     const uint8_t data[] = {0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7};
     assert(checksum_finish(checksum_add(0, ConstByteView(data, 8))) == 0x220d);
@@ -278,6 +368,25 @@ int main() {
     assert(server->receive_from(ByteView(d, sizeof d), nullptr, nullptr, &l));
     lan.nic_a.vouch = false; lan.nic_a.inbox.push_back(broken); lan.step(2); assert(server->pending() == 0);   // checked: dropped
     lan.nic_a.inbox.push_back(captured); lan.step(2); assert(server->pending() == 1);         // (the good one still is)
+  }
+  { // ---- segmentation and receive offload: TCP sends large segments the interface cuts, the receiver puts runs back together; under loss,
+    //      duplication and reordering the data still arrives whole, every frame on the wire is a right-sized, right-checksummed one
+    for (int mode = 0; mode < 4; ++mode) {
+      Lan lan; lan.configure_static();
+      lan.nic_a.offload = lan.nic_b.offload = mode != 1; lan.nic_a.tso = lan.nic_b.tso = true;
+      if (mode == 2) { lan.wire.loss_percent = 5; }
+      if (mode == 3) { lan.wire.duplicate_percent = 10; lan.wire.reorder_percent = 10; }
+      uint64_t bad = 0, big = 0;
+      lan.wire.tap = [&](const std::vector<uint8_t>& f, int) { if (!transport_checksum_ok(f)) ++bad; if (f.size() > hardware::kEthernetMaxFrame) ++big; };
+      assert(echo_transfer(lan, 200000, 9300));
+      assert(bad == 0 && big == 0 && lan.nic_a.refused_segments == 0 && lan.nic_b.refused_segments == 0);
+      assert(lan.nic_a.segmented > 0 && lan.nic_a.burst_frames > lan.nic_a.segmented);
+      assert(lan.a.coalesced_segments() > 0 || lan.b.coalesced_segments() > 0);
+    }
+    // without segmentation offload nothing changes: segment by segment, still coalesced on receive
+    Lan lan; lan.configure_static();
+    assert(echo_transfer(lan, 100000, 9400));
+    assert(lan.nic_a.segmented == 0 && lan.b.coalesced_segments() > 0);
   }
   { // ---- ARP + ICMP echo
     Lan lan; lan.configure_static(); uint32_t rtt = 99;

@@ -100,6 +100,7 @@ void IntelInterrupts::on_interrupt(void* self) {
   if (!regs) return;
   const uint32_t causes = regs->read32(kIcr);  // (reading clears them)
   if (causes == 0 || causes == 0xFFFFFFFFu) return;
+  regs->write32(kImc, 0xFFFFFFFFu);  // quiet until rearm()
   __atomic_fetch_add(&interrupts->count_, 1, __ATOMIC_ACQ_REL);
   const NetworkWake wake = __atomic_load_n(&interrupts->wake_, __ATOMIC_ACQUIRE);
   if (wake) wake(__atomic_load_n(&interrupts->context_, __ATOMIC_ACQUIRE));
@@ -122,7 +123,10 @@ bool IntelInterrupts::enable(INicDevice& device, NetworkWake wake, void* context
   const uint64_t before = count();
   regs.write32(kIcs, kIntLinkChange);
   for (int i = 0; i < 200 && count() == before; ++i) delay_us(100);
-  if (count() != before) return true;
+  if (count() != before) {
+    rearm();
+    return true;
+  }
   disable(device, true);
   return false;
 }

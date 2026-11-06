@@ -21,6 +21,7 @@
 // Whenever one stack's NIC has nothing to receive it lets the other machine run, so
 // a blocking call on one side makes progress without threads.
 #pragma once
+#include "TsoReference.hpp"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -66,7 +67,21 @@ struct FakeNic final : hardware::INetworkInterface {
   // Checksum offload, as a card that has it: transmit_frame() finishes the checksum "in hardware" (the software helper), receive_frame() vouches
   // for every TCP/UDP frame (`vouch`: the tests break checksums to see the stack trusts it).
   bool offload = false, vouch = true; uint64_t offloaded = 0;
-  hardware::NetworkOffloads offloads() const override { return hardware::NetworkOffloads{offload, offload}; }
+  // Segmentation offload (`tso`, segments up to 32 KiB): the reference segmenter cuts them; `segmented` counts them, `bursts` the frames made.
+  bool tso = false; uint64_t segmented = 0, burst_frames = 0, refused_segments = 0;
+  hardware::NetworkOffloads offloads() const override { return hardware::NetworkOffloads{offload, offload, tso ? 32768u : 0u, 1}; }
+  bool transmit_segmented(ConstByteView frame, hardware::TransmitChecksum checksum, uint16_t mss) override {
+    assert(tso && checksum.tcp() && frame.size() <= 32768 && mss > 0);
+    // the stack's seed: the pseudo-header sum with the whole TCP length
+    const uint32_t tcp = checksum.start, tcp_length = static_cast<uint32_t>(frame.size() - tcp);
+    const uint8_t* f = frame.data();
+    const uint16_t seed = tso_fold(tso_sum16(f + 26, 8, 6 + tcp_length));
+    if (((f[checksum.field] << 8) | f[checksum.field + 1]) != seed) { ++refused_segments; return false; }
+    for (auto& piece : reference_segment(f, frame.size(), mss, false)) {
+      assert(piece.size() <= hardware::kEthernetMaxFrame);
+      ++burst_frames; transmit(ConstByteView(piece.data(), piece.size()));
+    }
+    ++segmented; return true; }
   bool transmit_frame(ConstByteView frame, hardware::TransmitChecksum checksum) override {
     if (!checksum.requested()) return transmit(frame);
     assert(offload);  // the stack asks only interfaces that offload

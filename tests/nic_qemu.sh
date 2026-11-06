@@ -43,7 +43,8 @@ for n in "n1 e1000e 52:54:00:00:00:e1 82574L" "n2 igb 52:54:00:00:00:1b 82576" "
   if [ "$bad" -ne 0 ] || [ "$good" -eq 0 ]; then echo "$2: FAILED ($good right and $bad wrong UDP checksums from the guest)"; failed=1; continue; fi
   # the PCI controllers take MSI (QEMU's e1000e and igb have it); the USB adapter is polled
   mode=$(grep -a "Network:   .*$4" "$work/debugcon.log" | head -1)
-  if [ "$4" != USB ] && [[ "$mode" != *"interrupts (MSI)"* ]]; then echo "$2: FAILED (not interrupt driven: ${mode:-no line})"; failed=1; continue; fi
+  if [ "$4" != USB ] && [[ "$mode" != *"interrupts (MSI"* ]]; then echo "$2: FAILED (not interrupt driven: ${mode:-no line})"; failed=1; continue; fi
+  if [ "$4" = 82576 ] && [[ "$mode" != *"MSI-X"* ]]; then echo "$2: FAILED (no MSI-X receive queues: $mode)"; failed=1; continue; fi
   echo "$2: DHCP done, $good UDP checksums right${mode:+, ${mode##*: }}"
 done
 exit $failed

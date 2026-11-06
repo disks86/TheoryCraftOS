@@ -40,6 +40,10 @@ constexpr uint8_t kCommandEndOfPacket = 1u << 0, kCommandInsertCrc = 1u << 1, kC
 // Checksums go through a TCP/IP context descriptor (TUCSS/TUCSO; TUCMD: extended, TCP) and an extended data descriptor (DTYP 1, POPTS.TXSM),
 // as e1000e does: the legacy descriptor's CSO/CSS insertion is not implemented everywhere (QEMU's 82574 ignores it).
 constexpr uint8_t kContextTcp = 1u << 0, kDataDescriptorType = 1u << 4, kPoptsTransportChecksum = 1u << 1;
+// Segmentation (e1000_tso): the context's TUCMD says IPv4, TCP and TSE and carries PAYLEN, HDRLEN and MSS; every data descriptor has TSE too
+// and asks for both checksums (POPTS IXSM, TXSM).
+constexpr uint8_t kContextIp = 1u << 1, kCommandSegmentation = 1u << 2, kPoptsIpChecksum = 1u << 0;
+constexpr uint32_t kItr = 0x00C4;
 
 using K = E1000eKind;
 // e1000e's PCI table (hw.h). One line per device id; the names are what Intel sells them as.
@@ -274,7 +278,19 @@ bool E1000eNetworkInterface::accept_all_multicast(bool enable) {
 
 bool E1000eNetworkInterface::enable_interrupts(NetworkWake wake, void* context) {
   kernel::ScopedMutex guard(mutex_);
-  return started_ && interrupts_.enable(*device_, wake, context);
+  if (!started_ || !interrupts_.enable(*device_, wake, context)) return false;
+  write_throttle();
+  return true;
+}
+
+// ITR: the shortest time between two interrupts, in 256 ns units.
+void E1000eNetworkInterface::write_throttle() { regs().write32(kItr, InterruptModerator::intel_interval(moderator_.latency())); }
+
+void E1000eNetworkInterface::rearm_interrupts() {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || !interrupts_.enabled()) return;
+  if (moderator_.update()) write_throttle();
+  interrupts_.rearm();
 }
 
 bool E1000eNetworkInterface::transmit(ConstByteView frame) { return transmit_frame(frame, TransmitChecksum{}); }
@@ -291,60 +307,97 @@ void E1000eNetworkInterface::reclaim_transmitted() {
 
 bool E1000eNetworkInterface::transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame || (checksum.requested() && !checksum.fits(frame.size()))) {
+  return send(frame, checksum, 0);
+}
+
+bool E1000eNetworkInterface::transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) {
+  kernel::ScopedMutex guard(mutex_);
+  if (mss == 0) {
     ++stats_.send_failures;
     return false;
   }
-  const bool hardware = checksum.requested() && (checksum.tcp() || checksum.udp()) && checksum.field < 256;
-  const uint32_t needed = hardware ? 2 : 1;
+  return send(frame, checksum, mss);
+}
+
+// One frame, or (mss != 0) one TCP segment the card cuts into frames: a context descriptor when a checksum or segmentation is asked for, then
+// the data in as many 2 KiB buffers as it takes (extended data descriptors; a plain frame takes one legacy descriptor), EOP and RS on the last.
+bool E1000eNetworkInterface::send(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) {
+  const bool segment = mss != 0;
+  TsoLayout layout;
+  bool fits = started_ && !frame.empty();
+  if (segment) fits = fits && frame.size() <= kMaxSegmentation && tso_layout(frame, checksum, &layout) && layout.header_length < 256;
+  else fits = fits && frame.size() <= kEthernetMaxFrame && (!checksum.requested() || checksum.fits(frame.size()));
+  if (!fits) {
+    ++stats_.send_failures;
+    return false;
+  }
+  const bool hardware = segment || (checksum.requested() && (checksum.tcp() || checksum.udp()) && checksum.field < 256);
+  // Short frames are padded by the controller (TCTL.PSP), after the checksum: padding them here would put the padding in the TCP/UDP length
+  // of a controller that works the checksum out from the frame's length (QEMU's does).
+  const uint32_t length = static_cast<uint32_t>(frame.size());
+  const uint32_t data_descriptors = (length + kBufferSize - 1) / kBufferSize;
+  const uint32_t needed = data_descriptors + (hardware ? 1 : 0);
   reclaim_transmitted();
   const uint32_t in_flight = (tx_next_ + kTransmitDescriptors - tx_clean_) % kTransmitDescriptors;
   if (kTransmitDescriptors - 1 - in_flight < needed) {  // the card has not sent enough yet
     ++stats_.send_failures;
     return false;
   }
+
   const uint32_t first = tx_next_;
+  uint32_t slot = first;
   if (hardware) {
-    // The context: the transport checksum covers TUCSS to the end of the frame (TUCSE 0) and goes to TUCSO. No IP header checksum (the stack's).
-    volatile TransmitDescriptor& context = tx_ring_[first];
-    context.address = (uint64_t{checksum.start} << 32) | (uint64_t{checksum.field} << 40);
-    context.length = 0;
-    context.checksum_offset = 0;  // (PAYLEN 19:16, DTYP 0: context)
-    context.command = static_cast<uint8_t>(kCommandExtended | (checksum.tcp() ? kContextTcp : 0));
+    // The context: the transport checksum covers TUCSS to the end of the frame (TUCSE 0) and goes to TUCSO; with segmentation also the IP
+    // header checksum (IPCSS to IPCSE, at IPCSO), the payload length, the header length and the MSS.
+    volatile TransmitDescriptor& context = tx_ring_[slot];
+    uint64_t setup = (uint64_t{checksum.start} << 32) | (uint64_t{checksum.field} << 40);
+    if (segment) setup |= kEthernetHeaderSize | (uint64_t{kEthernetHeaderSize + 10} << 8) | (uint64_t{layout.tcp_start - 1u} << 16);
+    context.address = setup;
+    context.length = segment ? static_cast<uint16_t>(layout.payload) : 0;
+    context.checksum_offset = segment ? static_cast<uint8_t>((layout.payload >> 16) & 0x0F) : 0;  // (PAYLEN 19:16, DTYP 0: context)
+    context.command = static_cast<uint8_t>(kCommandExtended | (checksum.tcp() ? kContextTcp : 0) | (segment ? kContextIp | kCommandSegmentation : 0));
     context.status = 0;
-    context.checksum_start = 0;
-    context.special = 0;
-    tx_next_ = (tx_next_ + 1) % kTransmitDescriptors;
+    context.checksum_start = segment ? static_cast<uint8_t>(layout.header_length) : 0;  // (HDRLEN)
+    context.special = segment ? mss : 0;                                                  // (MSS)
+    slot = (slot + 1) % kTransmitDescriptors;
   }
-  const uint32_t slot = tx_next_;
-  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
-  const ByteView buffer = tx_buffer(slot).first(padded);
-  buffer.fill(0);
-  buffer.copy_from(frame);
-  if (checksum.requested() && !hardware && !finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
-    tx_next_ = first;
-    ++stats_.send_failures;
-    return false;
+  for (uint32_t offset = 0, n = 0; n < data_descriptors; ++n) {
+    const uint32_t piece = length - offset < kBufferSize ? length - offset : kBufferSize;
+    const ByteView buffer = tx_buffer(slot).first(piece);
+    buffer.copy_from(frame.subview(offset, piece));
+    if (n == 0) {
+      if (segment && !prepare_tso_headers(buffer, layout)) return false;  // (cannot fail: the layout was checked)
+      if (!hardware && checksum.requested() && !finish_transmit_checksum(buffer.first(frame.size()), checksum)) {
+        ++stats_.send_failures;
+        return false;
+      }
+    }
+    const bool last = n + 1 == data_descriptors;
+    volatile TransmitDescriptor& d = tx_ring_[slot];
+    d.address = nic_dma_address(tx_buffer(slot));
+    d.length = static_cast<uint16_t>(piece);
+    d.status = 0;
+    d.special = 0;
+    const uint8_t end = last ? kCommandEndOfPacket | kCommandReportStatus : 0;
+    if (hardware) {  // an extended data descriptor: DTYP 1, POPTS where the legacy one has CSS
+      d.checksum_offset = kDataDescriptorType;
+      d.checksum_start = static_cast<uint8_t>(kPoptsTransportChecksum | (segment ? kPoptsIpChecksum : 0));
+      d.command = static_cast<uint8_t>(end | kCommandInsertCrc | kCommandExtended | (segment ? kCommandSegmentation : 0));
+    } else {
+      d.checksum_offset = 0;
+      d.checksum_start = 0;
+      d.command = static_cast<uint8_t>(end | kCommandInsertCrc);
+    }
+    if (last) tx_frame_end_[first] = static_cast<uint8_t>(slot);
+    offset += piece;
+    slot = (slot + 1) % kTransmitDescriptors;
   }
-  volatile TransmitDescriptor& d = tx_ring_[slot];
-  d.address = nic_dma_address(tx_buffer(slot));
-  d.length = static_cast<uint16_t>(padded);
-  d.status = 0;
-  d.special = 0;
-  if (hardware) {  // an extended data descriptor: DTYP 1, POPTS where the legacy one has CSS
-    d.checksum_offset = kDataDescriptorType;
-    d.checksum_start = kPoptsTransportChecksum;
-    d.command = kCommandEndOfPacket | kCommandInsertCrc | kCommandReportStatus | kCommandExtended;
-  } else {
-    d.checksum_offset = 0;
-    d.checksum_start = 0;
-    d.command = kCommandEndOfPacket | kCommandInsertCrc | kCommandReportStatus;
-  }
-  tx_frame_end_[first] = static_cast<uint8_t>(slot);
   __atomic_thread_fence(__ATOMIC_RELEASE);  // descriptor contents before the tail moves
-  tx_next_ = (slot + 1) % kTransmitDescriptors;
+  tx_next_ = slot;
   regs().write32(kTdt, tx_next_);
   ++stats_.frames_sent;
+  if (segment) ++stats_.segmented_sends;
+  moderator_.account(1, length);
   return true;
 }
 
@@ -374,6 +427,7 @@ bool E1000eNetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* recei
       *received = ReceivedFrame{frame, checked && (status & kStatusIpChecksum) && !(errors & kErrorIpChecksum),
                                 checked && (status & (kStatusTcpChecksum | kStatusUdpChecksum)) && !(errors & kErrorTcpUdpChecksum)};
       ++stats_.frames_received;
+      moderator_.account(1, frame);
     } else {
       ++stats_.frames_dropped;
     }

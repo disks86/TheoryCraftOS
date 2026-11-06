@@ -377,6 +377,7 @@ void Rtl8169NetworkInterface::on_interrupt(void* self) {
   if (status == 0 || status == 0xFFFFu || status == 0xFFFFFFFFu) return;  // not ours, or the chip is gone
   if (nic->new_layout()) regs.write32(kIntrStatus8125, status);
   else regs.write16(kIntrStatus, static_cast<uint16_t>(status));
+  nic->write_interrupt_mask(0);  // quiet until rearm_interrupts()
   __atomic_fetch_add(&nic->interrupt_count_, 1, __ATOMIC_ACQ_REL);
   const NetworkWake wake = __atomic_load_n(&nic->wake_, __ATOMIC_ACQUIRE);
   if (wake) wake(__atomic_load_n(&nic->wake_context_, __ATOMIC_ACQUIRE));
@@ -394,17 +395,25 @@ bool Rtl8169NetworkInterface::enable_interrupts(NetworkWake wake, void* context)
   mask_interrupts();
   write_interrupt_mask(kInterruptMask);
   interrupts_ = true;
-  if (new_layout()) return true;  // (no software interrupt to test with)
+  if (new_layout()) return true;  // (no software interrupt to test with: the mask stays open)
   // Forced software interrupt: if it does not come within 20 ms the message is lost somewhere, and the chip stays polled.
   const uint64_t before = __atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE);
   regs().write8(kTxPoll, kTxPollSoftwareInterrupt);
   for (int i = 0; i < 200 && __atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE) == before; ++i) delay_us(100);
-  if (__atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE) != before) return true;
+  if (__atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE) != before) {
+    write_interrupt_mask(kInterruptMask);  // (the test interrupt masked it)
+    return true;
+  }
   write_interrupt_mask(0);
   device_->detach_interrupt();
   __atomic_store_n(&wake_, static_cast<NetworkWake>(nullptr), __ATOMIC_RELEASE);
   interrupts_ = false;
   return false;
+}
+
+// Status bits that came while the mask was shut are still set: opening it interrupts at once.
+void Rtl8169NetworkInterface::rearm_interrupts() {
+  if (interrupts_ && started_) write_interrupt_mask(kInterruptMask);
 }
 
 void Rtl8169NetworkInterface::disable_interrupts() {

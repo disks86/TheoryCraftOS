@@ -88,6 +88,8 @@ inline bool finish_transmit_checksum(ByteView frame, TransmitChecksum checksum) 
 struct NetworkOffloads {
   bool receive_checksums = false;   // receive_frame() reports checksums the hardware verified
   bool transmit_checksums = false;  // transmit_frame() finishes TCP/UDP checksums in hardware
+  uint32_t max_segmentation_bytes = 0;  // transmit_segmented() takes TCP segments up to this size (headers included); 0: no segmentation offload
+  uint16_t receive_queues = 1;           // hardware receive queues in use (RSS spreads flows over them, each with its own interrupt)
 };
 
 // Called from an interrupt handler when an interface has something new (frames arrived, the link changed). It must not block.
@@ -99,6 +101,8 @@ struct NetworkStatistics {
   uint64_t send_failures = 0;    // frames refused (no room, too big, link down ...)
   uint64_t frames_dropped = 0;   // received frames that were lost or unusable
   uint64_t interrupts = 0;       // interrupts taken (0 for a polled interface)
+  uint64_t segmented_sends = 0;  // TCP segments the hardware cut into frames (segmentation offload)
+  uint32_t interrupt_rate = 0;   // the interrupt rate the moderation allows now, per second (0: not limited, or polled)
 };
 
 }  // namespace hardware
