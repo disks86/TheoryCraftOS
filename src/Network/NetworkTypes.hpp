@@ -57,6 +57,7 @@ struct Ipv4Address {
   bool operator!=(const Ipv4Address& o) const { return !(*this == o); }
   bool is_unspecified() const { return value() == 0; }
   bool is_limited_broadcast() const { return value() == 0xFFFFFFFF; }
+  bool is_loopback() const { return octets[0] == 127; }  // 127.0.0.0/8: this machine, never on a wire
   bool is_multicast() const { return (octets[0] & 0xF0) == 0xE0; }
   bool is_link_local() const { return octets[0] == 169 && octets[1] == 254; }  // 169.254.0.0/16 (RFC 3927)
   bool in_subnet(const Ipv4Address& network_address, const Ipv4Address& mask) const {

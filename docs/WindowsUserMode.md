@@ -219,8 +219,15 @@ and name resolution without DNS: `getaddrinfo`/`GetAddrInfoW`/`freeaddrinfo`/`Fr
 
 Not done: IPv6 sockets, DNS for Windows programs (the kernel's own network stack resolves names for itself), `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O,
 `SO_RCVTIMEO`/`SO_SNDTIMEO` and other `setsockopt` options (accepted, not applied), multicast, raw sockets, the legacy `inet_addr` forms (hex, octal, fewer than four parts),
-and a loopback interface (a program's own address is whichever one network interface it is bound to; nothing short-circuits traffic addressed back to that same address, so a
-connection to 127.0.0.1 does not reach a listener in the same machine: Godot's game-to-editor debugger link needs this).
+and binding to one particular local address (every socket uses the address of the interface it is on).
+
+The loopback: a packet to 127.0.0.0/8 or to the interface's own address never reaches the wire. `NetworkStack::send_ip_from` puts it in a queue of the same stack and
+`poll()` delivers it (with what it sends in answer, up to a bound per poll); a packet to 127/8 goes out from the address it is sent to (`IIpLayer::source_for`, which the
+TCP and UDP checksums use), so answers come back from where they were sent, and a frame from the wire addressed to 127/8 is dropped. It works before DHCP has given the
+interface an address (`SocketManager::stack_for` takes any stack for 127/8 then), but not on a machine with no network interface at all: the system's sockets exist only
+once one is found. A socket connected over the loopback reports 127.0.0.1 as its own address. This is what Godot's game uses to reach its editor's debugger.
+Tests: `NetworkTest` (TCP echo over 127.0.0.1, 127.1.2.3 and the own address with no frame on the wire, ICMP, UDP, a refused port, an unconfigured stack, a martian frame),
+`WindowsSocketTest` (the services: accept and receive over 127.0.0.1), and `tcos_resolve` in QEMU (connect/accept/send/recv and UDP in one Windows process).
 
 ## Game input, timers and the adapter list (user32, winmm, xinput, dinput8, avrt, iphlpapi)
 

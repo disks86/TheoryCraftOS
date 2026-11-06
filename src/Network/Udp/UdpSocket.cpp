@@ -33,7 +33,7 @@ void UdpSocket::close() {
 
 bool UdpSocket::send_to(Ipv4Address address, uint16_t port, ConstByteView data) {
   StackLock guard(ip_);
-  return send_from(ip_.local_address(), address, port, data, false);
+  return send_from(ip_.source_for(address), address, port, data, false);
 }
 
 bool UdpSocket::send_from(Ipv4Address source, Ipv4Address address, uint16_t port, ConstByteView data,

@@ -143,6 +143,28 @@ struct MiniDhcpServer {
   }
 };
 
+
+// ---------------------------------------------------------------- the loopback
+// A TCP echo inside one stack: client and server both on `stack`, the client connecting to `to`.
+static bool loopback_echo(Lan& lan, NetworkStack& stack, Ipv4Address to, uint32_t total, uint16_t port) {
+  auto server = stack.tcp_open(); if (!server->listen(port)) return false;
+  auto client = stack.tcp_open(); if (!client->connect(to, port)) return false;
+  SharedPointer<ITcpSocket> accepted;
+  std::vector<uint8_t> sent(total), got; for (uint32_t i = 0; i < total; ++i) sent[i] = (uint8_t)(i * 7 + (i >> 9));
+  uint32_t offset = 0;
+  for (int i = 0; i < 200000 && got.size() < total; ++i) {
+    lan.step();
+    if (!accepted) accepted = server->accept();
+    if (client->is_connected() && offset < total) offset += client->send(ConstByteView(sent.data() + offset, total - offset));
+    uint8_t buf[2048];
+    if (accepted) { uint32_t n = accepted->receive(ByteView(buf, sizeof(buf))); for (uint32_t w = 0; w < n;) { uint32_t k = accepted->send(ConstByteView(buf + w, n - w)); w += k; if (!k) lan.step(); } }
+    uint32_t n = client->receive(ByteView(buf, sizeof(buf))); got.insert(got.end(), buf, buf + n);
+  }
+  const bool ok = got == sent && accepted && accepted->remote_address() == client->remote_address() && accepted->remote_port() == client->local_port();
+  client->close(); server->close(); lan.step(10);
+  return ok;
+}
+
 int main() {
   { // ---- checksum sanity (RFC 1071 example) and byte helpers
     const uint8_t data[] = {0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7};
@@ -151,6 +173,59 @@ int main() {
     uint8_t b[4]; ::store32(b, 0xA1B2C3D4); assert(::load32(b) == 0xA1B2C3D4 && b[0] == 0xA1 && load16(b + 1) == 0xB2C3);
     assert(Ipv4Address::make(10,0,2,15).in_subnet(Ipv4Address::make(10,0,2,0), Ipv4Address::make(255,255,255,0)));
     assert(Ipv4Address::subnet_broadcast(Ipv4Address::make(10,0,2,15), Ipv4Address::make(255,255,255,0)) == Ipv4Address::make(10,0,2,255));
+  }
+  { // ---- the loopback: 127.0.0.0/8 and the stack's own address never reach the wire
+    Lan lan; lan.configure_static();
+    const Ipv4Address loopback = Ipv4Address::make(127, 0, 0, 1);
+    const uint32_t frames = lan.wire.frames;
+    assert(loopback_echo(lan, lan.a, loopback, 200000, 6100));                        // TCP over 127.0.0.1, both ends in A
+    assert(loopback_echo(lan, lan.a, Ipv4Address::make(127, 1, 2, 3), 3000, 6101));    // any 127/8 address
+    assert(loopback_echo(lan, lan.a, Ipv4Address::make(10, 0, 0, 1), 50000, 6102));    // A's own address
+    assert(lan.wire.frames == frames);                                                 // none of it went out
+    uint32_t rtt = 99; assert(lan.a.ping(loopback, 1000, &rtt));                       // ICMP echo over the loopback
+    // UDP: the datagram comes from the loopback address, and the answer finds its way back
+    auto server = lan.a.udp_open(6200); auto client = lan.a.udp_open(0); assert(server && client);
+    const uint8_t msg[] = "loop"; assert(client->send_to(loopback, 6200, ConstByteView(msg, sizeof(msg))));
+    assert(lan.run_until([&] { return server->pending() > 0; }, 100));
+    uint8_t buf[16]; Ipv4Address from; uint16_t port; uint32_t len;
+    assert(server->receive_from(ByteView(buf, sizeof(buf)), &from, &port, &len) && len == sizeof(msg) && from == loopback && port == client->local_port());
+    assert(server->send_to(from, port, ConstByteView(buf, len)) && lan.run_until([&] { return client->pending() > 0; }, 100));
+    assert(lan.wire.frames == frames);
+    // a closed port answers with a reset at once
+    auto refused = lan.a.tcp_open(); assert(refused->connect(loopback, 6300));
+    assert(lan.run_until([&] { return refused->state() == TcpState::Closed; }, 100) && refused->failed());
+  }
+  { // ---- the loopback works before the interface has an address (no DHCP answer yet)
+    Lan lan;
+    assert(!lan.a.configuration().configured());
+    assert(loopback_echo(lan, lan.a, Ipv4Address::make(127, 0, 0, 1), 10000, 6400));
+    auto c = lan.a.tcp_open(); assert(!c->connect(Ipv4Address::make(10, 0, 0, 2), 80));   // anything else still needs an address
+  }
+  { // ---- a frame from the wire addressed to 127.0.0.1 is not taken (martian), even by a stack that takes anything before it has an address
+    Lan lan;
+    IpConfiguration cb; cb.address = Ipv4Address::make(10,0,0,2); cb.netmask = Ipv4Address::make(255,255,255,0); lan.b.configure(cb);
+    auto victim = lan.a.udp_open(6500); auto sender = lan.b.udp_open(0); assert(victim && sender);
+    std::vector<uint8_t> captured;
+    lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) { if (from == 1 && f.size() > 42 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17) captured = f; };
+    const uint8_t msg[] = "spoof";
+    assert(sender->send_to(Ipv4Address::make(10, 0, 0, 255), 6500, ConstByteView(msg, sizeof(msg))));      // (the subnet broadcast: no ARP, which A could not answer)
+    lan.run_until([&] { return !captured.empty(); }, 5000);
+    assert(!captured.empty());
+    lan.wire.tap = nullptr;
+    auto inject = [&](uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+      std::vector<uint8_t> f = captured;
+      memcpy(&f[0], lan.nic_a.mac.bytes, 6);                       // to A's MAC (B never learned it: A has no address to answer ARP with)
+      f[30] = a; f[31] = b; f[32] = c; f[33] = d;
+      f[24] = f[25] = 0; uint32_t sum = 0; for (int i = 14; i < 34; i += 2) sum += (f[i] << 8) | f[i + 1];
+      while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16); store16(&f[24], (uint16_t)~sum);
+      f[40] = f[41] = 0;                                           // no UDP checksum (it covers the destination)
+      lan.nic_a.inbox.push_back(f); lan.step(5);
+    };
+    assert(lan.run_until([&] { return victim->pending() > 0; }, 1000));      // (the broadcast itself reaches A too)
+    while (victim->pending()) { uint8_t d[64]; uint32_t l; victim->receive_from(ByteView(d, sizeof(d)), nullptr, nullptr, &l); }
+    inject(10, 0, 0, 1); assert(victim->pending() == 1);           // the control: an unconfigured stack takes it
+    uint8_t d[64]; uint32_t l; assert(victim->receive_from(ByteView(d, sizeof(d)), nullptr, nullptr, &l));
+    inject(127, 0, 0, 1); assert(victim->pending() == 0);          // but not addressed to the loopback
   }
   { // ---- ARP + ICMP echo
     Lan lan; lan.configure_static(); uint32_t rtt = 99;
