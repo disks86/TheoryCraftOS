@@ -51,16 +51,27 @@ class IIpLayer {
   virtual bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
                             bool link_broadcast) = 0;
 
+  // IPv6 (and either version through one call). The defaults: no IPv6.
+  virtual IpAddress source_for_ip(const IpAddress& destination) const {
+    return destination.v6 ? IpAddress(kIpv6Any) : IpAddress(source_for(destination.ipv4));
+  }
+  virtual uint32_t max_payload_for(const IpAddress& destination) const { return destination.v6 ? kMaxIpv6Payload : max_payload(); }
+  // send_ip() for either version: an IPv6 packet to a loopback, own or link-local address, a neighbor or via the default router. TCP and UDP
+  // come with their checksum field zero, as for send_ip().
+  virtual bool send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload) {
+    return !destination.v6 && send_ip(destination.ipv4, protocol, payload);
+  }
+
   // TCP segmentation offload. The largest TCP segment (header and data) that may go to `destination` in one send_tcp_segmented(): more
   // than one packet's worth when the interface cuts segments into frames itself and the way there is known; 0 otherwise (send packet by
-  // packet, with send_ip()).
-  virtual uint32_t max_segmented_payload(Ipv4Address destination) const {
+  // packet, with send_ip_to()).
+  virtual uint32_t max_segmented_payload(const IpAddress& destination) const {
     (void)destination;
     return 0;
   }
   // Sends a TCP segment (checksum field zero, as for send_ip()) that the interface cuts into frames of at most `mss` bytes of data. False if
   // it cannot now (the segment is then as good as lost: TCP retransmits).
-  virtual bool send_tcp_segmented(Ipv4Address destination, ConstByteView segment, uint16_t mss) {
+  virtual bool send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss) {
     (void)destination;
     (void)segment;
     (void)mss;

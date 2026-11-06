@@ -292,7 +292,9 @@ static void test_interface_configuration() {
 // the loopback address.
 static void test_loopback() {
   Setup s;
-  const uint32_t frames = s.lan.wire.frames;
+  uint64_t ipv4_out = 0;  // (IPv6 neighbor discovery has its own business on the wire meanwhile)
+  s.lan.wire.tap = [&](const std::vector<uint8_t>& f, int) { if (f.size() > 14 && f[12] == 0x08 && (f[13] == 0x00 || f[13] == 0x06)) ++ipv4_out; };
+  const uint64_t frames = 0;
   uint64_t server = 0, client = 0;
   CHECK(s.create_socket(true, &server) == kSuccess && s.create_socket(true, &client) == kSuccess);
   CHECK(s.call(WindowsSyscallNumber::NtBindSocket, server, 0, swap16(9300)) == kSuccess);
@@ -319,7 +321,8 @@ static void test_loopback() {
   CHECK(s.call(WindowsSyscallNumber::NtSocketControl, client, 2 /*GetSockName*/, 0, 0, kBase + 0x500, 8) == kSuccess);
   s.memory.read(kBase + 0x500, ByteView(info, 8));
   CHECK(info[0] == 127 && info[1] == 0 && info[2] == 0 && info[3] == 1);      // the client's own end is the loopback address too
-  CHECK(s.lan.wire.frames == frames);
+  CHECK(ipv4_out == frames);
+  s.lan.wire.tap = nullptr;
 }
 
 int main() {

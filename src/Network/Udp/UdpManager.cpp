@@ -46,7 +46,7 @@ SharedPointer<UdpSocket> UdpManager::open(uint16_t port) {
   return socket;
 }
 
-bool UdpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment, bool checksum_verified) {
+bool UdpManager::handle(const IpAddress& source, const IpAddress& destination, ConstByteView segment, bool checksum_verified) {
   ByteReader in(segment);
   const uint16_t source_port = in.be16();
   const uint16_t port = in.be16();
@@ -54,6 +54,7 @@ bool UdpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteVi
   const uint16_t wire_checksum = in.be16();
   if (!in.ok() || udp_length < 8 || udp_length > segment.size()) return false;
   const ConstByteView datagram = segment.first(udp_length);  // anything after it is padding
+  if (wire_checksum == 0 && source.v6) return false;  // (over IPv6 the checksum is not optional, RFC 8200 8.1)
   if (wire_checksum != 0 && !checksum_verified) {  // a zero checksum means the sender did not compute one
     const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolUdp, udp_length), datagram);
     if (checksum_finish(sum) != 0) return false;

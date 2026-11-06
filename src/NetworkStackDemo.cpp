@@ -197,6 +197,74 @@ bool NetworkStackDemo::check_interface(uint32_t index) {
     if (tcp) tcp->close();
   }
 
+  // IPv6: stateless autoconfiguration (a router advertisement from QEMU's user network gives fec0::/64), ping6 to the host, and the same bulk
+  // TCP echo over IPv6 (QEMU takes [fec0::2] to the host's loopback).
+  {
+    const uint64_t deadline = stack.now_ms() + 6000;
+    while (!stack.configuration6().global_ready && stack.now_ms() < deadline) stacks_.poll();
+    const Ipv6Configuration c6 = stack.configuration6();
+    char text[48];
+    line("      IPv6: link-local ");
+    if (c6.link_local_ready && format_ipv6(c6.link_local, ArrayView<char>(text))) line(text);
+    else line("none");
+    line(", global ");
+    if (c6.global_ready && format_ipv6(c6.global, ArrayView<char>(text))) line(text);
+    else line("none");
+    line(", router ");
+    if (!c6.router.is_unspecified() && format_ipv6(c6.router, ArrayView<char>(text))) line(text);
+    else line("none");
+    line(", dns ");
+    if (!c6.dns.is_unspecified() && format_ipv6(c6.dns, ArrayView<char>(text))) line(text);
+    else line("none");
+    line("\n");
+    Ipv6Address host;
+    parse_ipv6(StringView("fec0::2"), &host);
+    uint32_t rtt = 0;
+    if (c6.global_ready && stack.ping6(host, 2000, &rtt)) {
+      line("      ping6 fec0::2: reply in ");
+      console::put_dec(rtt);
+      line(" ms\n");
+    } else {
+      line("      ping6 fec0::2: no reply\n");
+    }
+    constexpr uint32_t kBulk = 256 * 1024;
+    const auto pattern = [](uint32_t i) { return static_cast<uint8_t>(i * 11 + (i >> 9)); };
+    SharedPointer<ITcpSocket> tcp = stack.tcp_open();
+    const bool tried = c6.global_ready && tcp && tcp->connect_ip(IpAddress(host), kHostTcpEchoPort);
+    const uint64_t segmented_before = stack.interface().statistics().segmented_sends, coalesced_before = stack.coalesced_segments();
+    uint32_t sent = 0, got = 0;
+    bool same = true;
+    uint8_t chunk[2048];
+    const uint64_t end = stack.now_ms() + 20 * kHostTimeoutMs;
+    while (tried && got < kBulk && stack.now_ms() < end) {
+      stacks_.poll();
+      if (tcp->state() == TcpState::Closed) break;
+      while (tcp->is_connected() && sent < kBulk) {
+        const uint32_t n = kBulk - sent < sizeof(chunk) ? kBulk - sent : static_cast<uint32_t>(sizeof(chunk));
+        for (uint32_t i = 0; i < n; ++i) chunk[i] = pattern(sent + i);
+        const uint32_t k = tcp->send(ConstByteView(chunk).first(n));
+        sent += k;
+        if (k < n) break;
+      }
+      for (uint32_t n; (n = tcp->receive(ByteView(chunk))) > 0; got += n)
+        for (uint32_t i = 0; i < n; ++i) same = same && chunk[i] == pattern(got + i);
+    }
+    if (got == kBulk && same) {
+      line("      TCP bulk echo over IPv6: ok, 256 KiB, ");
+      console::put_dec(stack.interface().statistics().segmented_sends - segmented_before);
+      line(" segments cut by the interface, ");
+      console::put_dec(stack.coalesced_segments() - coalesced_before);
+      line(" received segments coalesced\n");
+    } else if (tried && got > 0) {
+      line("      TCP bulk echo over IPv6: FAILED after ");
+      console::put_dec(got);
+      line(same ? " bytes\n" : " bytes (wrong data)\n");
+    } else {
+      line("      TCP bulk echo over IPv6: no answer (optional)\n");
+    }
+    if (tcp) tcp->close();
+  }
+
   // A web server on this interface.
   UniquePointer<Endpoint> endpoint = UniquePointer<Endpoint>::make(allocator_, allocator_);
   if (endpoint) {

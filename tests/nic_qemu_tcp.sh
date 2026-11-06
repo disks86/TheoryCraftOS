@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # TCP through QEMU's e1000e (82574L) and igb (82576) with a self-test kernel (-DTCOS_SELFTESTS=ON): the network self-test sends 256 KiB to an
 # echo server on the host (started here, reached at the gateway) and checks what comes back. Passes when both interfaces get the bulk echo
-# right with segments cut by the interface (TSO) and received segments coalesced (GRO), and every TCP checksum on both wires is right and no
-# frame is longer than 1514 bytes. Needs qemu-system-x86_64, OVMF, python3 and tcpdump.
+# right with segments cut by the interface (TSO) and received segments coalesced (GRO), over IPv4 and over IPv6 (SLAAC from QEMU's router
+# advertisement, the host at [fec0::2] reached on its loopback [::1]), and every TCP checksum on both wires is right and no frame is longer
+# than 1514 bytes. Needs qemu-system-x86_64, OVMF, python3 and tcpdump.
 # Usage: tests/nic_qemu_tcp.sh <self-test build dir> [seconds]   (the ESP is taken from build/ and the kernel from the self-test build)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -32,7 +33,11 @@ def udp():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 7778))
     while True:
         d, a = s.recvfrom(65536); s.sendto(d, a)
+class Tcp6(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    address_family = socket.AF_INET6
 threading.Thread(target=udp, daemon=True).start()
+threading.Thread(target=lambda: Tcp6(("::1", 7777), Echo).serve_forever(), daemon=True).start()
 Tcp(("127.0.0.1", 7777), Echo).serve_forever()
 PY
 python3 -I "$work/echo.py" & echo_pid=$!
@@ -47,10 +52,12 @@ timeout "$seconds" qemu-system-x86_64 "${accel[@]}" -machine q35 -smp 4 -m 4G \
   -drive format=raw,file=fat:rw:"$work/esp" \
   -chardev file,id=dbg,path="$work/debugcon.log" -device isa-debugcon,iobase=0x402,chardev=dbg -serial null >/dev/null 2>"$work/qemu.err"
 
-grep -aE "Network:   |bulk echo" "$work/debugcon.log"
+grep -aE "Network:   |bulk echo|IPv6: |ping6" "$work/debugcon.log"
 failed=0
 [ "$(grep -acE 'TCP bulk echo from host: ok, 256 KiB, [1-9][0-9]* segments cut by the interface, [1-9][0-9]* received segments coalesced' "$work/debugcon.log")" -eq 2 ] ||
   { echo "FAILED: not both interfaces did the bulk echo with segmentation and coalescing"; failed=1; }
+[ "$(grep -acE 'TCP bulk echo over IPv6: ok, 256 KiB, [1-9][0-9]* segments cut by the interface, [1-9][0-9]* received segments coalesced' "$work/debugcon.log")" -eq 2 ] ||
+  { echo "FAILED: not both interfaces did the IPv6 bulk echo with segmentation and coalescing"; failed=1; }
 for n in "n1 e1000e" "n2 igb"; do
   set -- $n
   dump=$(tcpdump -nn -vv -e -r "$work/$1.pcap" tcp 2>/dev/null)

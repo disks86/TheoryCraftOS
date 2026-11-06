@@ -18,14 +18,14 @@
 
 // DNS wire format helpers (RFC 1035): host-name encoding with compression
 // pointers, and building / parsing the one kind of message the resolver uses -
-// a recursive A-record question and its answer. Private to Network/Dns/.
+// a recursive A (or AAAA) question and its answer. Private to Network/Dns/.
 #pragma once
 #include "Network/NetworkTypes.hpp"
 #include "Utility/StringView.hpp"
 
 namespace network::dns {
 
-constexpr uint16_t kTypeA = 1, kTypeCname = 5, kClassIn = 1;
+constexpr uint16_t kTypeA = 1, kTypeCname = 5, kTypeAaaa = 28, kClassIn = 1;
 constexpr uint32_t kHeaderSize = 12;
 constexpr uint32_t kMaxName = 255;       // longest encoded name, including the length bytes
 constexpr uint32_t kMaxTextName = 253;   // longest name as dotted text
@@ -36,7 +36,7 @@ uint32_t encode_name(StringView name, ByteView out);
 
 // A question: 12-byte header (recursion desired) and one A/IN question for
 // `name`. Returns the message length, 0 on error.
-uint32_t build_query(uint16_t id, StringView name, ByteView out);
+uint32_t build_query(uint16_t id, StringView name, ByteView out, uint16_t type = kTypeA);
 
 enum class ParseResult : uint8_t {
   Answer,       // an A record was found: fields below are set
@@ -48,13 +48,13 @@ enum class ParseResult : uint8_t {
 };
 
 struct Answer {
-  Ipv4Address address;
+  IpAddress address;  // IPv4 for an A question, IPv6 for AAAA
   uint32_t ttl;  // seconds, the smallest TTL along the CNAME chain
 };
 
 // Checks that `message` answers the question (id, `name`) and extracts the
 // address. CNAME chains and name compression are handled.
-ParseResult parse_response(ConstByteView message, uint16_t id, StringView name, Answer* answer);
+ParseResult parse_response(ConstByteView message, uint16_t id, StringView name, Answer* answer, uint16_t type = kTypeA);
 
 // Case-insensitive comparison of two host names given as text (a trailing dot is ignored).
 bool names_equal(StringView a, StringView b);

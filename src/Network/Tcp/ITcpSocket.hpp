@@ -93,6 +93,10 @@ class ITcpSocket {
   virtual Ipv4Address remote_address() const = 0;
   virtual uint16_t remote_port() const = 0;
 
+  // The same over either IP version (IPv6 where the stack has it). An IPv6 connection's remote_address() is 0.0.0.0.
+  virtual bool connect_ip(const IpAddress& address, uint16_t port) { return !address.v6 && connect(address.ipv4, port); }
+  virtual IpAddress remote_ip() const { return IpAddress(remote_address()); }
+
  protected:
   ITcpSocket() = default;
   ~ITcpSocket() = default;

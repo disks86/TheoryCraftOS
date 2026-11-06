@@ -46,7 +46,8 @@ NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& c
       pending_(allocator),
       looped_(allocator),
       udp_(*this, allocator),
-      tcp_(*this, allocator) {}
+      tcp_(*this, allocator),
+      pending6_(allocator) {}
 
 NetworkStack::~NetworkStack() {
   release_view(allocator_, coalesce_storage_);
@@ -148,11 +149,13 @@ void NetworkStack::poll() {
         dhcp_->stop();
         link_local_state_ = LinkLocalState::Off;
         config_ = IpConfiguration{};
+        stop_ipv6();  // (autoconfiguration starts over when the link is back)
       }
     }
   }
   deliver_looped();
   dhcp_->poll();
+  service_ipv6();
   service_link_local();
   resolver_->poll();
   service_pending();
@@ -167,7 +170,9 @@ void NetworkStack::deliver_looped() {
   for (uint32_t i = 0; i < kLoopedPerPoll && !looped_.empty(); ++i) {
     LoopedPacket p;
     if (!looped_.dequeue(&p)) break;
-    handle_ipv4(ConstByteView(p.ip_packet).first(p.length), true);
+    const ConstByteView packet = ConstByteView(p.ip_packet).first(p.length);
+    if (p.length && (p.ip_packet[0] >> 4) == 6) handle_ipv6(packet, true);
+    else handle_ipv4(packet, true);
   }
 }
 
@@ -177,7 +182,9 @@ void NetworkStack::flush_coalesced() {
   hardware::ReceivedFrame checked;  // (every piece was checked before it joined)
   checked.ipv4_header_checksum_good = true;
   checked.transport_checksum_good = true;
-  handle_ipv4(coalescer_.held(), false, checked);
+  const ConstByteView run = coalescer_.held();
+  if ((run[0] >> 4) == 6) handle_ipv6(run, false, checked);
+  else handle_ipv4(run, false, checked);
   coalescer_.clear();
 }
 
@@ -188,10 +195,13 @@ void NetworkStack::handle_frame(ConstByteView frame, const hardware::ReceivedFra
   const uint16_t type = in.be16();
   if (!in.ok()) return;  // shorter than an Ethernet header
   const bool multicast_mac = (destination.bytes[0] & 1) && !destination.is_broadcast();
-  if (!destination.is_broadcast() && !(destination == nic_.mac_address()) && !(multicast_mac && group_count_ > 0)) return;  // not for us
+  const bool ipv6_multicast = destination.bytes[0] == 0x33 && destination.bytes[1] == 0x33;
+  if (!destination.is_broadcast() && !(destination == nic_.mac_address()) && !(multicast_mac && (group_count_ > 0 || (ipv6_multicast && ipv6_started_))))
+    return;  // not for us
 
   if (type == kEtherTypeArp) handle_arp(in.rest());
   else if (type == kEtherTypeIpv4) handle_ipv4(in.rest(), false, checks);
+  else if (type == kEtherTypeIpv6) handle_ipv6(in.rest(), false, checks);
 }
 
 void NetworkStack::learn(Ipv4Address address, const hardware::MacAddress& mac) {
@@ -376,52 +386,81 @@ static uint32_t segmentation_bytes(const hardware::INetworkInterface& nic) {
   return bytes < 65535 + hardware::kEthernetHeaderSize ? bytes : 65535 + hardware::kEthernetHeaderSize;
 }
 
-uint32_t NetworkStack::max_segmented_payload(Ipv4Address destination) const {
+uint32_t NetworkStack::max_segmented_payload(const IpAddress& destination) const {
   kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
   hardware::MacAddress mac;
   const uint32_t bytes = segmentation_bytes(nic_);
-  if (bytes == 0 || !next_hop_for(destination, &mac)) return 0;
+  if (bytes == 0) return 0;
+  if (destination.v6) return link_address6_for(destination.ipv6, &mac) ? bytes - hardware::kEthernetHeaderSize - kIpv6HeaderSize : 0;
+  if (!next_hop_for(destination.ipv4, &mac)) return 0;
   return bytes - hardware::kEthernetHeaderSize - kIpv4HeaderSize;
 }
 
 // The frame of a large TCP segment, built like any other (IP header, the pseudo-header seed in the checksum field) and given to the interface
-// to cut up: TCP over IPv4 to a next hop whose address is known.
-bool NetworkStack::send_tcp_segmented(Ipv4Address destination, ConstByteView segment, uint16_t mss) {
+// to cut up: TCP to a next hop whose address is known.
+bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss) {
   kernel::ScopedRecursiveMutex guard(mutex_);
   hardware::MacAddress mac;
   const uint32_t bytes = segmentation_bytes(nic_);
-  if (bytes == 0 || mss == 0 || segment.size() < 20 || !next_hop_for(destination, &mac)) return false;
+  const uint32_t ip_header = destination.v6 ? kIpv6HeaderSize : kIpv4HeaderSize;
+  if (bytes == 0 || mss == 0 || segment.size() < 20) return false;
+  if (destination.v6 ? !link_address6_for(destination.ipv6, &mac) : !next_hop_for(destination.ipv4, &mac)) return false;
+  if (segment.size() > bytes - hardware::kEthernetHeaderSize - ip_header) return false;
   if (segment_frame_.size() != bytes) {  // (made when the first large segment goes out)
     release_view(allocator_, segment_frame_);
     segment_frame_ = allocate_view<uint8_t>(allocator_, bytes);
     if (segment_frame_.empty()) return false;
   }
-  if (segment.size() > segment_frame_.size() - hardware::kEthernetHeaderSize - kIpv4HeaderSize) return false;
-  const Ipv4Address source = source_for(destination);
+  const IpAddress source = source_for_ip(destination);
+  if (source.is_unspecified() || source.v6 != destination.v6) return false;
   ByteWriter out{segment_frame_};
   mac.write(out);
   nic_.mac_address().write(out);
-  out.be16(kEtherTypeIpv4);
-  out.u8(0x45);
-  out.u8(0);
-  out.be16(static_cast<uint16_t>(kIpv4HeaderSize + segment.size()));
-  out.be16(ip_id_);
-  ip_id_ = static_cast<uint16_t>(ip_id_ + (segment.size() - 20 + mss - 1) / mss);  // (each frame takes the next identification)
-  out.be16(0x4000);
-  out.u8(64);
-  out.u8(kProtocolTcp);
-  out.be16(0);
-  source.write(out);
-  destination.write(out);
-  out.patch_be16(hardware::kEthernetHeaderSize + 10, checksum_finish(checksum_add(0, out.written().dropped(hardware::kEthernetHeaderSize))));
+  if (destination.v6) {
+    out.be16(kEtherTypeIpv6);
+    out.be32(0x60000000u);
+    out.be16(static_cast<uint16_t>(segment.size()));
+    out.u8(kProtocolTcp);
+    out.u8(64);
+    source.ipv6.write(out);
+    destination.ipv6.write(out);
+  } else {
+    out.be16(kEtherTypeIpv4);
+    out.u8(0x45);
+    out.u8(0);
+    out.be16(static_cast<uint16_t>(kIpv4HeaderSize + segment.size()));
+    out.be16(ip_id_);
+    ip_id_ = static_cast<uint16_t>(ip_id_ + (segment.size() - 20 + mss - 1) / mss);  // (each frame takes the next identification)
+    out.be16(0x4000);
+    out.u8(64);
+    out.u8(kProtocolTcp);
+    out.be16(0);
+    source.ipv4.write(out);
+    destination.ipv4.write(out);
+    out.patch_be16(hardware::kEthernetHeaderSize + 10, checksum_finish(checksum_add(0, out.written().dropped(hardware::kEthernetHeaderSize))));
+  }
   out.bytes(segment);
   if (!out.ok()) return false;
   const ByteView frame = segment_frame_.first(out.position());
-  const uint32_t tcp = hardware::kEthernetHeaderSize + kIpv4HeaderSize;
-  const uint16_t seed = static_cast<uint16_t>(~checksum_finish(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint16_t>(segment.size()))));
+  const uint32_t tcp = hardware::kEthernetHeaderSize + ip_header;
+  const uint16_t seed = static_cast<uint16_t>(~checksum_finish(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint32_t>(segment.size()))));
   frame[tcp + 16] = static_cast<uint8_t>(seed >> 8);
   frame[tcp + 17] = static_cast<uint8_t>(seed);
   return nic_.transmit_segmented(frame, hardware::TransmitChecksum{static_cast<uint16_t>(tcp), static_cast<uint16_t>(tcp + 16)}, mss);
+}
+
+IpAddress NetworkStack::source_for_ip(const IpAddress& destination) const {
+  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  if (destination.v6) return IpAddress(source_for6(destination.ipv6));
+  return IpAddress(source_for(destination.ipv4));
+}
+
+bool NetworkStack::send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload) {
+  if (!destination.v6) return send_ip(destination.ipv4, protocol, payload);
+  kernel::ScopedRecursiveMutex guard(mutex_);
+  const Ipv6Address source = source_for6(destination.ipv6);
+  if (source.is_unspecified()) return false;
+  return send_ip6(source, destination.ipv6, protocol, payload, 64);
 }
 
 void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip) {

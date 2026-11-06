@@ -55,6 +55,8 @@ constexpr uint32_t kTd0Tcp = 1u << 16, kTd0Udp = 1u << 17, kTd0Ip = 1u << 18;
 constexpr uint32_t kTd1Ipv4 = 1u << 29, kTd1Tcp = 1u << 30, kTd1Udp = 1u << 31, kTd1TransportShift = 18, kTd1TransportMax = 0x3FF;
 // Segmentation ("giant send", r8169's rtl8169_tso_csum_v2): opts1 says IPv4 and where the TCP header starts (7 bits), opts2 the MSS (11 bits).
 constexpr uint32_t kTd1GiantSendIpv4 = 1u << 26, kTd1GiantTcpShift = 18, kTd1GiantTcpMax = 0x7F, kTd1MssShift = 18, kTd1MssMax = 0x7FF;
+// IPv6 (r8169: TD1_IPv6_CS, TD1_GTSENV6; the chips without the v2 descriptor have no IPv6 offload).
+constexpr uint32_t kTd1Ipv6 = 1u << 28, kTd1GiantSendIpv6 = 1u << 25;
 constexpr uint32_t kCrcLength = 4;
 
 constexpr uint32_t kRxFifoThreshold = 7u << 13, kRxDmaBurst = 7u << 8, kRx128Int = 1u << 15, kRxMulti = 1u << 14, kRxEarlyOff = 1u << 11, kRxFetch8125 = 8u << 27;
@@ -340,13 +342,18 @@ bool Rtl8169NetworkInterface::send(ConstByteView frame, TransmitChecksum checksu
   }
 
   uint32_t opts1 = 0, opts2 = 0;
+  const bool ipv6 = frame_ip_version(frame) == 6;
   if (segment) {
-    opts1 = kTd1GiantSendIpv4 | (uint32_t{layout.tcp_start} << kTd1GiantTcpShift);
+    opts1 = (layout.ipv6 ? kTd1GiantSendIpv6 : kTd1GiantSendIpv4) | (uint32_t{layout.tcp_start} << kTd1GiantTcpShift);
     opts2 = uint32_t{mss} << kTd1MssShift;
   } else if (checksum.requested()) {
-    const bool hardware = (checksum.tcp() || checksum.udp()) && frame.size() >= kEthernetMinFrame && checksum.start <= kTd1TransportMax;
-    if (hardware && chip_->family == RtlFamily::Rtl8169) opts1 = kTd0Ip | (checksum.tcp() ? kTd0Tcp : kTd0Udp);
-    else if (hardware) opts2 = kTd1Ipv4 | (checksum.tcp() ? kTd1Tcp : kTd1Udp) | (uint32_t{checksum.start} << kTd1TransportShift);
+    bool hardware = (checksum.tcp() || checksum.udp()) && frame.size() >= kEthernetMinFrame && checksum.start <= kTd1TransportMax;
+    if (hardware && chip_->family == RtlFamily::Rtl8169) {
+      if (ipv6) hardware = false;
+      else opts1 = kTd0Ip | (checksum.tcp() ? kTd0Tcp : kTd0Udp);
+    } else if (hardware) {
+      opts2 = (ipv6 ? kTd1Ipv6 : kTd1Ipv4) | (checksum.tcp() ? kTd1Tcp : kTd1Udp) | (uint32_t{checksum.start} << kTd1TransportShift);
+    }
   }  // (otherwise it is finished in the buffer below)
   const bool software_checksum = !segment && checksum.requested() && opts1 == 0 && opts2 == 0;
 
@@ -361,6 +368,7 @@ bool Rtl8169NetworkInterface::send(ConstByteView frame, TransmitChecksum checksu
       ++stats_.send_failures;
       return false;
     }
+    if (n == 0 && segment && layout.ipv6 && !prepare_tso_headers(buffer, layout)) return false;  // (IPv6 giant send: tcp_v6_gso_csum_prep)
     volatile Descriptor& d = tx_ring_[slot];
     d.opts2 = opts2;
     d.address = nic_dma_address(tx_buffer(slot));

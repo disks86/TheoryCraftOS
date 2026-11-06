@@ -453,7 +453,7 @@ bool IgbNetworkInterface::send(ConstByteView frame, TransmitChecksum checksum, u
   if (hardware) {
     volatile TransmitDescriptor& context = queue.ring[slot];
     context.address = (uint64_t{kEthernetHeaderSize} << kTxMacLengthShift) | (checksum.start - kEthernetHeaderSize);  // (VLAN 0, no seed)
-    context.command_type_length = kTxTypeContext | kTxExtended | (checksum.tcp() ? kTxContextTcp : 0) | (segment ? kTxContextIpv4 : 0);
+    context.command_type_length = kTxTypeContext | kTxExtended | (checksum.tcp() ? kTxContextTcp : 0) | (segment && !layout.ipv6 ? kTxContextIpv4 : 0);
     context.offload_status = segment ? ((uint32_t{mss} << kTxMssShift) | (static_cast<uint32_t>(layout.header_length - layout.tcp_start) << kTxL4LengthShift)) : 0;
     slot = (slot + 1) % kTransmitDescriptors;
   }
@@ -475,7 +475,7 @@ bool IgbNetworkInterface::send(ConstByteView frame, TransmitChecksum checksum, u
     d.command_type_length = kTxTypeData | kTxExtended | kTxInsertCrc | (segment ? kTxSegmentation : 0) | (last ? kTxEndOfPacket | kTxReportStatus : 0) | piece;
     d.offload_status = slot != first_data ? 0
                        : ((segment ? layout.payload : length) << kTxPayloadShift) | (hardware ? kTxInsertTransportChecksum : 0) |
-                             (segment ? kTxInsertIpChecksum : 0);  // (and DD clear)
+                             (segment && !layout.ipv6 ? kTxInsertIpChecksum : 0);  // (and DD clear; IPv6 has no header checksum)
     if (last) queue.frame_end[first] = static_cast<uint8_t>(slot);
     offset += piece;
     slot = (slot + 1) % kTransmitDescriptors;

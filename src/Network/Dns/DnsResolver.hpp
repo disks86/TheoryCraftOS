@@ -38,6 +38,7 @@ class DnsResolver final : public IDnsResolver {
       : stack_(stack), allocator_(allocator), queries_(allocator), cache_(allocator) {}
 
   SharedPointer<IDnsQuery> query(StringView name) override;
+  SharedPointer<IDnsQuery> query_aaaa(StringView name) override;
   void clear_cache() override;
   uint32_t cache_size() const override;
 
@@ -48,15 +49,18 @@ class DnsResolver final : public IDnsResolver {
   struct Query;
   struct CacheEntry {
     char name[64];  // names longer than this are simply not cached
+    uint16_t type;  // A or AAAA
     bool found;     // false: a cached "no such name"
-    Ipv4Address address;
+    IpAddress address;
     uint64_t expires_ms;
   };
 
   void step(Query& query);
   void finish(Query& query, DnsStatus status);
-  void remember(StringView name, bool found, Ipv4Address address, uint32_t ttl_seconds);
-  const CacheEntry* lookup(StringView name);
+  SharedPointer<IDnsQuery> start(StringView name, uint16_t type);
+  void remember(StringView name, uint16_t type, bool found, const IpAddress& address, uint32_t ttl_seconds);
+  const CacheEntry* lookup(StringView name, uint16_t type);
+  bool server(IpAddress* address) const;
   uint32_t random();
   SharedPointer<IUdpSocket> open_random_socket();
 

@@ -86,7 +86,7 @@ uint32_t encode_name(StringView name, ByteView out) {
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-uint32_t build_query(uint16_t id, StringView name, ByteView out) {
+uint32_t build_query(uint16_t id, StringView name, ByteView out, uint16_t type) {
   ByteWriter w(out);
   w.be16(id);
   w.be16(0x0100);  // standard query, recursion desired
@@ -100,12 +100,12 @@ uint32_t build_query(uint16_t id, StringView name, ByteView out) {
   const uint32_t n = encode_name(name, out.subview(kHeaderSize, room));
   if (!n) return 0;
   w.reserve(n);  // the name is already in place
-  w.be16(kTypeA);
+  w.be16(type);
   w.be16(kClassIn);
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-ParseResult parse_response(ConstByteView m, uint16_t id, StringView name, Answer* answer) {
+ParseResult parse_response(ConstByteView m, uint16_t id, StringView name, Answer* answer, uint16_t type_asked) {
   ByteReader in(m);
   const uint16_t wire_id = in.be16();
   const uint16_t flags = in.be16();
@@ -124,7 +124,7 @@ ParseResult parse_response(ConstByteView m, uint16_t id, StringView name, Answer
   in.seek(o);
   const uint16_t qtype = in.be16(), qclass = in.be16();
   if (!in.ok()) return ParseResult::Invalid;
-  if (!names_equal(StringView(qname.data()), name) || qtype != kTypeA || qclass != kClassIn) return ParseResult::Invalid;
+  if (!names_equal(StringView(qname.data()), name) || qtype != type_asked || qclass != kClassIn) return ParseResult::Invalid;
   o = in.position();
 
   if (flags & 0x0200) return ParseResult::Truncated;
@@ -147,9 +147,10 @@ ParseResult parse_response(ConstByteView m, uint16_t id, StringView name, Answer
     ConstByteView rdata = in.take(rdlength);  // the record data must lie inside the message
     if (!in.ok()) return ParseResult::Invalid;
     if (klass == kClassIn && names_equal(StringView(owner_storage), StringView(target.data()))) {
-      if (type == kTypeA && rdlength == 4) {
+      if (type == type_asked && ((type == kTypeA && rdlength == 4) || (type == kTypeAaaa && rdlength == 16))) {
         ByteReader address(rdata);
-        answer->address = Ipv4Address::read(address);
+        if (type == kTypeA) answer->address = IpAddress(Ipv4Address::read(address));
+        else answer->address = IpAddress(Ipv6Address::read(address));
         answer->ttl = ttl < min_ttl ? ttl : min_ttl;
         return ParseResult::Answer;
       }

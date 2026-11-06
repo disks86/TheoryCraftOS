@@ -89,8 +89,18 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) override;
   bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
                     bool link_broadcast) override;
-  uint32_t max_segmented_payload(Ipv4Address destination) const override;
-  bool send_tcp_segmented(Ipv4Address destination, ConstByteView segment, uint16_t mss) override;
+  uint32_t max_segmented_payload(const IpAddress& destination) const override;
+  bool send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss) override;
+  IpAddress source_for_ip(const IpAddress& destination) const override;
+  bool send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload) override;
+
+  // --- IPv6 (NetworkStackIpv6.cpp)
+  Ipv6Configuration configuration6() const override;
+  bool ping6(const Ipv6Address& address, uint32_t timeout_ms, uint32_t* rtt_ms) override;
+  bool resolve_ip(StringView name, uint32_t timeout_ms, IpAddress* address, bool prefer_ipv6 = false) override;
+  // The address an IPv6 packet to `destination` goes out from: ::1 to itself, the link-local one on the link, else the global one (:: when
+  // there is none that fits yet).
+  Ipv6Address source_for6(const Ipv6Address& destination) const;
 
   // Receive offload: TCP segments put together before TCP saw them (0 without), see TcpCoalescer.
   uint64_t coalesced_segments() const { return coalescer_.merged(); }
@@ -107,7 +117,21 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
     uint16_t length;
     uint8_t ip_packet[kMtu];
   };
-  struct LoopedPacket {  // an IP packet this stack sent to itself (127.0.0.0/8 or its own address), delivered by poll()
+  struct PendingPacket6 {  // an IPv6 packet (complete) waiting for its next hop's MAC address
+    Ipv6Address next_hop;
+    uint64_t next_request_ms;
+    uint32_t requests;
+    uint16_t length;
+    uint8_t ip_packet[kMtu];
+  };
+  struct NeighborEntry {  // the neighbor cache (RFC 4861 7.3, simplified: reachable for a fixed time, then asked again)
+    Ipv6Address address;
+    hardware::MacAddress mac;
+    uint64_t expires_ms;
+    bool valid;
+  };
+  enum class AddressState : uint8_t { None, Tentative, Preferred, Duplicate };
+  struct LoopedPacket {  // an IP packet (either version) this stack sent to itself, delivered by poll()
     uint16_t length;
     uint8_t ip_packet[kMtu];
   };
@@ -123,6 +147,33 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void handle_ipv4(ConstByteView packet, bool looped = false, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
   void deliver_looped();
   void handle_icmp(Ipv4Address source, ConstByteView icmp);
+  // --- IPv6 (NetworkStackIpv6.cpp)
+  void start_ipv6();
+  void stop_ipv6();
+  void service_ipv6();
+  void handle_ipv6(ConstByteView packet, bool looped = false, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
+  void handle_icmpv6(const Ipv6Address& source, const Ipv6Address& destination, uint8_t hop_limit, ConstByteView icmp, bool looped);
+  void handle_router_advertisement(const Ipv6Address& source, ConstByteView message);
+  void handle_neighbor_solicitation(const Ipv6Address& source, const Ipv6Address& destination, ConstByteView message);
+  void handle_neighbor_advertisement(ConstByteView message);
+  bool accepts_destination6(const Ipv6Address& destination) const;
+  bool is_my_ipv6(const Ipv6Address& address) const;
+  // Builds and sends an IPv6 packet (TCP/UDP: checksum as for IPv4; ICMPv6: computed here). `router_alert`: a hop-by-hop header with the
+  // router alert option in front (MLD).
+  bool send_ip6(const Ipv6Address& source, const Ipv6Address& destination, uint8_t next_header, ConstByteView payload, uint8_t hop_limit,
+                bool router_alert = false);
+  bool send_icmpv6(const Ipv6Address& source, const Ipv6Address& destination, ConstByteView message, uint8_t hop_limit, bool router_alert = false);
+  void send_neighbor_solicitation(const Ipv6Address& target, bool duplicate_detection);
+  void send_neighbor_advertisement(const Ipv6Address& to, const Ipv6Address& target, bool solicited);
+  void send_router_solicitation();
+  void send_mld_report();
+  void learn6(const Ipv6Address& address, const hardware::MacAddress& mac, bool create);
+  const NeighborEntry* neighbor(const Ipv6Address& address) const;
+  bool next_hop6_for(const Ipv6Address& destination, Ipv6Address* next_hop) const;
+  bool link_address6_for(const Ipv6Address& destination, hardware::MacAddress* mac) const;
+  void flush_pending6(const Ipv6Address& resolved);
+  void service_pending6();
+  void begin_duplicate_detection(bool global);
   // `checksum` (offsets into the payload: an IP packet) is a transport checksum still to finish: by the interface when it offloads them.
   bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload,
                   hardware::TransmitChecksum checksum = hardware::TransmitChecksum{});
@@ -177,6 +228,24 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   uint16_t ping_id_ = 0x7C05, ping_sequence_ = 0;
   uint64_t ping_sent_ms_ = 0, ping_rtt_ms_ = 0;
   Ipv4Address ping_target_ = kAnyAddress;
+  bool ping_v6_ = false;
+  Ipv6Address ping_target6_ = kIpv6Any;
+
+  // --- IPv6 state
+  bool ipv6_started_ = false;
+  Ipv6Configuration config6_;
+  AddressState link_local_state_6_ = AddressState::None, global_state_ = AddressState::None;
+  Ipv6Address tentative_link_local_ = kIpv6Any, tentative_global_ = kIpv6Any;
+  uint64_t link_local_dad_ms_ = 0, global_dad_ms_ = 0;   // when duplicate detection of each finishes
+  uint32_t router_solicitations_ = 0;
+  uint64_t next_router_solicitation_ms_ = 0;
+  uint64_t router_expires_ms_ = 0, prefix_expires_ms_ = 0, dns6_expires_ms_ = 0;
+  bool prefix_on_link_ = false;
+  static constexpr uint32_t kNeighbors = 32;
+  NeighborEntry neighbors_[kNeighbors] = {};
+  uint32_t next_neighbor_slot_ = 0;
+  Queue<PendingPacket6> pending6_;
+  uint32_t ipv6_flow_ = 0;
 };
 
 }  // namespace network
