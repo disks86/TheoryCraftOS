@@ -46,7 +46,8 @@ constexpr uint32_t kMinRtoMs = 200, kMaxRtoMs = 8000, kInitialRtoMs = 1000;
 }  // namespace
 
 TcpSocket::TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& allocator)
-    : ip_(ip), manager_(manager), allocator_(allocator), send_buffer_(allocator), receive_buffer_(allocator), accept_queue_(allocator) {}
+    : ip_(ip), manager_(manager), allocator_(allocator), send_buffer_(allocator), receive_buffer_(allocator), accept_queue_(allocator),
+      backlog_{Backlog(allocator), Backlog(allocator)} {}
 
 TcpSocket::~TcpSocket() {
   release_view(allocator_, burst_);
@@ -56,10 +57,9 @@ TcpSocket::~TcpSocket() {
 // ------------------------------------------------------------------ user API
 
 bool TcpSocket::connect_ip(const IpAddress& address, uint16_t port) {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   if (state_ != TcpState::Closed || failed_ || port == 0 || ip_.source_for_ip(address).is_unspecified()) return false;
-  remote_ = address;
-  remote_port_ = port;
+  set_remote(address, port);
   const uint16_t local = manager_.claim_connection(this, address, port);   // (from now on its segments find it)
   if (local == 0) return false;
   prepare_to_connect(local, manager_.next_initial_sequence());
@@ -74,26 +74,40 @@ bool TcpSocket::connect_ip(const IpAddress& address, uint16_t port) {
 }
 
 void TcpSocket::prepare_to_connect(uint16_t local_port, uint32_t initial_sequence) {
-  local_port_ = local_port;
+  __atomic_store_n(&local_port_, local_port, __ATOMIC_RELEASE);
   iss_ = initial_sequence;
   snd_una_ = iss_;
   snd_nxt_ = iss_ + 1;  // the SYN occupies one sequence number
   snd_max_ = snd_nxt_;
   rto_ms_ = kInitialRtoMs;
-  if (!send_buffer_.reserve(kBufferSize) || !receive_buffer_.reserve(kBufferSize)) failed_ = true;
+  bool reserved;
+  {
+    kernel::ScopedMutex sending(send_lock_);
+    kernel::ScopedMutex receiving(receive_lock_);
+    reserved = send_buffer_.reserve(kBufferSize) && receive_buffer_.reserve(kBufferSize);
+  }
+  if (!reserved) __atomic_store_n(&failed_, true, __ATOMIC_RELEASE);
+}
+
+void TcpSocket::set_remote(const IpAddress& address, uint16_t port) {
+  {
+    kernel::ScopedMutex guard(remote_lock_);
+    remote_ = address;
+  }
+  __atomic_store_n(&remote_port_, port, __ATOMIC_RELEASE);
 }
 
 bool TcpSocket::listen_families(uint16_t port, IpFamilies families) {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   if (state_ != TcpState::Closed || failed_ || port == 0 || !manager_.claim_listener(this, port, families)) return false;
-  local_port_ = port;
+  __atomic_store_n(&local_port_, port, __ATOMIC_RELEASE);
   listen_families_ = families;
   enter(TcpState::Listen);
   return true;
 }
 
 SharedPointer<ITcpSocket> TcpSocket::accept() {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   if (state_ != TcpState::Listen) return SharedPointer<ITcpSocket>();
   kernel::ScopedMutex queue(accept_lock_);
   if (accept_queue_.empty()) return SharedPointer<ITcpSocket>();
@@ -102,28 +116,35 @@ SharedPointer<ITcpSocket> TcpSocket::accept() {
   return SharedPointer<ITcpSocket>(child);
 }
 
+// The application's side takes only the buffer's lock; the segments the bytes go out in are the holder's business (output(), deferred).
 uint32_t TcpSocket::send(ConstByteView data) {
-  kernel::ScopedRecursiveMutex guard(lock_);
-  const bool can_send = state_ == TcpState::Established || state_ == TcpState::CloseWait ||
-                        state_ == TcpState::SynSent || state_ == TcpState::SynReceived;
-  if (!can_send || close_requested_) return 0;
-  const uint32_t queued = send_buffer_.write(data);
-  output();
+  const TcpState now = state();
+  const bool can_send = now == TcpState::Established || now == TcpState::CloseWait || now == TcpState::SynSent || now == TcpState::SynReceived;
+  if (!can_send) return 0;
+  uint32_t queued;
+  {
+    kernel::ScopedMutex guard(send_lock_);
+    if (close_requested_) return 0;
+    queued = send_buffer_.write(data);
+  }
+  if (queued) request(kWorkOutput);
   return queued;
 }
 
 uint32_t TcpSocket::receive(ByteView buffer) {
-  kernel::ScopedRecursiveMutex guard(lock_);
-  const uint32_t n = receive_buffer_.read(buffer);
-  // The sender may be waiting on a closed window: tell it once there is room again.
-  if (n && last_advertised_window_ < our_mss() && advertised_window() >= our_mss() &&
-      (state_ == TcpState::Established || state_ == TcpState::FinWait1 || state_ == TcpState::FinWait2))
-    send_ack();
+  uint32_t n;
+  {
+    kernel::ScopedMutex guard(receive_lock_);
+    n = receive_buffer_.read(buffer);
+  }
+  // The sender may be waiting on a closed window: tell it once there is room again. (our_mss() reads remote_: written before any byte
+  // arrived, which this thread has seen through receive_lock_.)
+  if (n && __atomic_load_n(&last_advertised_window_, __ATOMIC_RELAXED) < our_mss()) request(kWorkWindow);
   return n;
 }
 
 void TcpSocket::close() {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   switch (state_) {
     case TcpState::Listen:
       enter(TcpState::Closed);
@@ -136,7 +157,10 @@ void TcpSocket::close() {
     case TcpState::SynReceived:
     case TcpState::Established:
     case TcpState::CloseWait:
-      close_requested_ = true;
+      {
+        kernel::ScopedMutex guard(send_lock_);
+        close_requested_ = true;
+      }
       output();  // sends the FIN once the queued data is out
       break;
     default:
@@ -145,7 +169,7 @@ void TcpSocket::close() {
 }
 
 void TcpSocket::abort() {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   if (state_ == TcpState::Listen) {
     close();
     return;
@@ -199,14 +223,14 @@ uint32_t TcpSocket::accepted_waiting() const {
 }
 
 void TcpSocket::leave_listener(TcpSocket* listener) {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   if (listener_ != listener) return;
   listener_ = nullptr;
   abort();
 }
 
 void TcpSocket::close_if_abandoned() {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   if (listener_) return;   // (a connection its listener has not handed over yet: nobody but the table holds it, and that is fine)
   if (state_ == TcpState::Listen || state_ == TcpState::SynSent || state_ == TcpState::Established || state_ == TcpState::CloseWait) close();
 }
@@ -214,7 +238,7 @@ void TcpSocket::close_if_abandoned() {
 // ------------------------------------------------------------------ sending
 
 uint32_t TcpSocket::advertised_window() const {
-  const uint32_t w = receive_buffer_.free_space();
+  const uint32_t w = receive_room();
   return w > 65535 ? 65535 : w;
 }
 
@@ -273,14 +297,15 @@ void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView dat
 
   uint8_t storage[kMaxIpPayload];
   ByteWriter out{ByteView(storage)};
-  last_advertised_window_ = advertised_window();
+  const uint32_t window = advertised_window();
+  __atomic_store_n(&last_advertised_window_, window, __ATOMIC_RELAXED);
   out.be16(local_port_);
   out.be16(remote_port_);
   out.be32(sequence);
   out.be32((flags & kAck) ? rcv_nxt_ : 0);
   out.u8(static_cast<uint8_t>((header / 4) << 4));
   out.u8(flags);
-  out.be16(static_cast<uint16_t>(last_advertised_window_));
+  out.be16(static_cast<uint16_t>(window));
   out.be16(0);  // checksum: the IP layer fills it in
   out.be16(0);  // urgent pointer (unused)
   out.bytes(option_bytes);
@@ -293,7 +318,8 @@ void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView dat
 bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, uint32_t length, uint16_t mss) {
   if (burst_.empty()) burst_ = allocate_view<uint8_t>(allocator_, uint64_t{kBufferSize} + 20);
   if (burst_.size() < uint64_t{length} + 20) return false;
-  last_advertised_window_ = advertised_window();
+  const uint32_t window = advertised_window();
+  __atomic_store_n(&last_advertised_window_, window, __ATOMIC_RELAXED);
   ByteWriter out{burst_};
   out.be16(local_port_);
   out.be16(remote_port_);
@@ -307,11 +333,11 @@ bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, ui
   }
   out.u8(5 << 4);
   out.u8(flags);
-  out.be16(static_cast<uint16_t>(last_advertised_window_));
+  out.be16(static_cast<uint16_t>(window));
   out.be16(0);  // checksum: the IP layer fills it in
   out.be16(0);
   if (!out.ok()) return false;
-  send_buffer_.peek(offset, burst_.subview(20, length));
+  send_peek(offset, burst_.subview(20, length));
   return ip_.send_tcp_segmented(remote_, burst_.first(20 + length), mss, ecn_ok_ && fresh_data ? kEcnEct0 : 0);
 }
 
@@ -383,7 +409,7 @@ bool TcpSocket::retransmit_holes(uint32_t mss) {
     if (n > mss) n = mss;
     uint8_t chunk[kMaxIpPayload];
     const ByteView payload = ByteView(chunk).first(n);
-    send_buffer_.peek(gap_start - snd_una_, payload);
+    send_peek(gap_start - snd_una_, payload);
     send_segment(tcp_flags::kAck, gap_start, payload, false);
     retransmit_next_ = gap_start + n;
     retransmitted_ += n;
@@ -429,7 +455,8 @@ void TcpSocket::output() {
   for (;;) {
     const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);  // data only
     if (fin_sent_) break;  // nothing follows a FIN
-    const uint32_t unsent = send_buffer_.size() > in_flight ? send_buffer_.size() - in_flight : 0;
+    const uint32_t queued = send_size();
+    const uint32_t unsent = queued > in_flight ? queued - in_flight : 0;
     // The receiver's window counts from snd_una_; the network's from what is really in flight (in SACK recovery: less what arrived or was lost).
     const uint32_t pipe_now = pipe();
     const uint32_t receiver_room = snd_wnd_ > in_flight ? snd_wnd_ - in_flight : 0;
@@ -456,7 +483,7 @@ void TcpSocket::output() {
       if (n > mss) n = mss;
       uint8_t chunk[kMaxIpPayload];
       const ByteView payload = ByteView(chunk).first(n);  // n <= mss <= kMaxIpPayload by construction; checked here
-      send_buffer_.peek(in_flight, payload);
+      send_peek(in_flight, payload);
       const bool last = n == unsent;
       send_segment(tcp_flags::kAck | (last ? tcp_flags::kPsh : 0), snd_nxt_, payload, false);
     }
@@ -476,7 +503,7 @@ void TcpSocket::output() {
 
   // The FIN goes out once every queued byte has been sent.
   const uint32_t in_flight = snd_nxt_ - snd_una_;
-  if (close_requested_ && !fin_sent_ && send_buffer_.size() == in_flight) {
+  if (close_requested_ && !fin_sent_ && send_size() == in_flight) {   // (no byte is queued once close_requested_ is set)
     send_segment(tcp_flags::kFin | tcp_flags::kAck, snd_nxt_, ConstByteView(), false);
     fin_sent_ = fin_ever_sent_ = true;
     advance_next(1);
@@ -497,7 +524,7 @@ void TcpSocket::rollback_for_retransmission() {
 // ------------------------------------------------------------------ receiving
 
 void TcpSocket::enter(TcpState state) {
-  state_ = state;
+  __atomic_store_n(&state_, state, __ATOMIC_RELEASE);
   if (state == TcpState::TimeWait) {
     time_wait_deadline_ = ip_.now_ms() + kTimeWaitMs;
     timer_deadline_ = 0;
@@ -508,7 +535,7 @@ void TcpSocket::enter(TcpState state) {
 }
 
 void TcpSocket::fail() {
-  failed_ = true;
+  __atomic_store_n(&failed_, true, __ATOMIC_RELEASE);
   if (listener_ && state_ == TcpState::SynReceived) {
     listener_->child_finished_handshake();
     listener_ = nullptr;
@@ -518,10 +545,9 @@ void TcpSocket::fail() {
 
 bool TcpSocket::accept_syn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port,
                            const TcpSegment& syn, uint32_t initial_sequence) {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  Owner owner(*this);
   listener_ = listener;
-  remote_ = remote_address;
-  remote_port_ = remote_port;
+  set_remote(remote_address, remote_port);
   prepare_to_connect(local_port, initial_sequence);
   if (failed_) {
     listener_ = nullptr;
@@ -543,17 +569,101 @@ bool TcpSocket::accept_syn(TcpSocket* listener, const IpAddress& remote_address,
 }
 
 void TcpSocket::on_segment(const TcpSegment& s, const SharedPointer<TcpSocket>& self) {
-  using namespace tcp_flags;
-  kernel::ScopedRecursiveMutex guard(lock_);
-  handle_segment(s);
-  // A connection its listener spawned has completed its handshake: it goes to the listener's accept queue (under its accept lock - a leaf,
-  // allowed with this lock held; the listener's own lock is not taken).
-  if (established_event_) {
-    established_event_ = false;
-    if (listener_) {
-      listener_->child_established(self);
-      listener_ = nullptr;
+  if (!lock_.held_by_me() && lock_.try_lock()) {
+    // (what waits in the backlog arrived first: it goes first)
+    if (lock_.depth() == 1 && (__atomic_load_n(&pending_, __ATOMIC_ACQUIRE) & kWorkBacklog)) run_deferred();
+    handle_segment(s);
+    hand_over_if_established(&self);
+    release();
+    return;
+  }
+  // Busy (or this thread is inside the connection already, as when a segment loops back): the holder takes it from the backlog.
+  if (keep_in_backlog(s)) request(kWorkBacklog);
+}
+
+// A connection its listener spawned has completed its handshake: it goes to the listener's accept queue (under its accept lock - a leaf,
+// allowed with this lock held; the listener's own lock is not taken).
+void TcpSocket::hand_over_if_established(const SharedPointer<TcpSocket>* self) {
+  if (!established_event_) return;
+  established_event_ = false;
+  if (!listener_) return;
+  const SharedPointer<TcpSocket> reference = self ? *self : manager_.reference(this);
+  if (reference) listener_->child_established(reference);
+  listener_ = nullptr;
+}
+
+bool TcpSocket::keep_in_backlog(const TcpSegment& s) {
+  kernel::ScopedMutex guard(backlog_lock_);
+  Backlog& half = backlog_[filling_];
+  const uint64_t used = half.data.size();
+  if (!half.entries.empty() && (used >= kBacklogBytes || s.data.size() > kBacklogBytes - used)) {   // full: dropped, the peer sends it again
+    __atomic_fetch_add(&backlog_drops_, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  BacklogEntry entry;
+  entry.segment = s;
+  entry.segment.data = ConstByteView();
+  entry.offset = used;
+  entry.length = static_cast<uint32_t>(s.data.size());
+  if (!half.data.append(s.data) || !half.entries.push_back(entry)) {
+    half.data.truncate(used);
+    __atomic_fetch_add(&backlog_drops_, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  __atomic_fetch_add(&backlogged_, 1, __ATOMIC_RELAXED);
+  return true;
+}
+
+void TcpSocket::request(uint32_t work) {
+  // (seq_cst: either the holder sees the flag after letting go - see release() - or this thread's try_lock finds lock_ free)
+  __atomic_fetch_or(&pending_, work, __ATOMIC_SEQ_CST);
+  if (lock_.held_by_me() || !lock_.try_lock()) return;   // the holder (this thread further out, or another) runs it before it lets go
+  release();
+}
+
+// (lock_ held, outermost) Runs the flagged work until none is left.
+void TcpSocket::run_deferred() {
+  for (;;) {
+    const uint32_t work = __atomic_exchange_n(&pending_, 0, __ATOMIC_ACQ_REL);
+    if (!work) return;
+    if (work & kWorkBacklog) {
+      uint32_t taken;
+      {
+        kernel::ScopedMutex guard(backlog_lock_);
+        taken = filling_;
+        filling_ ^= 1;   // (the other half was emptied the last time: arrivals go there now)
+      }
+      Backlog& half = backlog_[taken];
+      for (const BacklogEntry& entry : half.entries) {
+        TcpSegment s = entry.segment;
+        s.data = half.data.view().subview(entry.offset, entry.length);
+        handle_segment(s);
+        hand_over_if_established(nullptr);
+      }
+      half.entries.clear();
+      half.data.clear();
     }
+    // The application read from a window it had closed: tell the sender once there is room again.
+    if ((work & kWorkWindow) && last_advertised_window_ < our_mss() && advertised_window() >= our_mss() &&
+        (state_ == TcpState::Established || state_ == TcpState::FinWait1 || state_ == TcpState::FinWait2))
+      send_ack();
+    if (work & kWorkOutput) output();
+    if (work & kWorkTimers) run_timers(ip_.now_ms());
+  }
+}
+
+void TcpSocket::release() {
+  if (lock_.depth() > 1) {   // an inner hold: the outermost one runs the work
+    lock_.unlock();
+    return;
+  }
+  for (;;) {
+    run_deferred();
+    lock_.unlock();
+    // Work flagged after the last look, by a thread whose try_lock failed because this one still held lock_: take it back and run it. (The
+    // fence pairs with the seq_cst flagging in request(): one of the two sees the other.)
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&pending_, __ATOMIC_RELAXED) == 0 || !lock_.try_lock()) return;
   }
 }
 
@@ -659,7 +769,10 @@ void TcpSocket::process_ack(const TcpSegment& s) {
       fin_acked_ = fin_sent_ = true;
       --acked;
     }
-    send_buffer_.discard(acked);
+    {
+      kernel::ScopedMutex guard(send_lock_);
+      send_buffer_.discard(acked);
+    }
     snd_una_ = s.acknowledgement;
     if (seq_gt(snd_una_, snd_nxt_)) snd_nxt_ = snd_una_;   // (data sent before a go-back-N had arrived after all)
     note_sack(s);
@@ -742,12 +855,19 @@ void TcpSocket::accept_data(const TcpSegment& s) {
   if (skip > s.data.size()) skip = static_cast<uint32_t>(s.data.size());
   const ConstByteView fresh = s.data.dropped(skip);  // the part we do not have yet
   const uint32_t length = static_cast<uint32_t>(fresh.size());
-  const uint32_t stored = receive_buffer_.write(fresh);
+  uint32_t stored;
+  {
+    kernel::ScopedMutex guard(receive_lock_);
+    stored = receive_buffer_.write(fresh);
+  }
   rcv_nxt_ += stored;
 
   if (fin && stored == length && end_sequence == rcv_nxt_) {
     ++rcv_nxt_;
-    fin_received_ = true;
+    {
+      kernel::ScopedMutex guard(receive_lock_);
+      fin_received_ = true;
+    }
     held_.clear();   // (nothing comes after a FIN)
     if (state_ == TcpState::Established) enter(TcpState::CloseWait);
     else if (state_ == TcpState::FinWait1) enter(fin_acked_ ? TcpState::TimeWait : TcpState::Closing);
@@ -761,7 +881,7 @@ void TcpSocket::accept_data(const TcpSegment& s) {
 // Data past a gap: kept (within the receive window, while there are ranges to spare) in ooo_storage_, at its sequence number modulo the
 // buffer size.
 void TcpSocket::accept_out_of_order(uint32_t sequence, ConstByteView data) {
-  const uint32_t window_end = rcv_nxt_ + receive_buffer_.free_space();
+  const uint32_t window_end = rcv_nxt_ + receive_room();   // (room only grows meanwhile: the application reads, only this side writes)
   uint32_t end = sequence + static_cast<uint32_t>(data.size());
   if (!seq_lt(sequence, window_end)) return;
   if (seq_gt(end, window_end)) end = window_end;
@@ -775,12 +895,15 @@ void TcpSocket::accept_out_of_order(uint32_t sequence, ConstByteView data) {
 // After rcv_nxt_ moved: what was held from there on goes into the receive buffer (as much as fits) and is acknowledged with it.
 void TcpSocket::take_reassembled() {
   held_.remove_below(rcv_nxt_);
-  while (!held_.empty() && held_.at(0).start == rcv_nxt_ && receive_buffer_.free_space() > 0) {
+  while (!held_.empty() && held_.at(0).start == rcv_nxt_ && receive_room() > 0) {
     const uint32_t available = held_.at(0).end - rcv_nxt_;
     uint8_t chunk[512];
     uint32_t n = available < sizeof chunk ? available : static_cast<uint32_t>(sizeof chunk);
     for (uint32_t i = 0; i < n; ++i) chunk[i] = ooo_storage_[(rcv_nxt_ + i) % kBufferSize];
-    n = receive_buffer_.write(ConstByteView(chunk).first(n));
+    {
+      kernel::ScopedMutex guard(receive_lock_);
+      n = receive_buffer_.write(ConstByteView(chunk).first(n));
+    }
     if (n == 0) break;
     rcv_nxt_ += n;
     held_.remove_below(rcv_nxt_);
@@ -832,7 +955,15 @@ void TcpSocket::sample_rtt(uint32_t acknowledged_up_to) {
 }
 
 void TcpSocket::on_timer(uint64_t now) {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  if (!lock_.held_by_me() && lock_.try_lock()) {
+    run_timers(now);
+    release();
+    return;
+  }
+  request(kWorkTimers);   // (busy: the holder runs them)
+}
+
+void TcpSocket::run_timers(uint64_t now) {
   if (state_ == TcpState::TimeWait) {
     if (now >= time_wait_deadline_) enter(TcpState::Closed);
     return;
@@ -862,14 +993,14 @@ void TcpSocket::on_timer(uint64_t now) {
   // Zero window: the peer's ACK that reopens it could be lost, so ask now and then
   // by sending one byte (which also gets an ACK carrying the current window).
   const bool stalled = (state_ == TcpState::Established || state_ == TcpState::CloseWait) && snd_wnd_ == 0 &&
-                       snd_una_ == snd_nxt_ && send_buffer_.size() > 0;
+                       snd_una_ == snd_nxt_ && send_size() > 0;
   if (!stalled) {
     persist_deadline_ = 0;
   } else if (persist_deadline_ == 0) {
     persist_deadline_ = now + rto_ms_;
   } else if (now >= persist_deadline_) {
     uint8_t probe;
-    send_buffer_.peek(0, ByteView(&probe, 1));
+    send_peek(0, ByteView(&probe, 1));
     send_segment(tcp_flags::kAck, snd_nxt_, ConstByteView(&probe, 1), false);
     advance_next(1);
     arm_timer();
@@ -878,7 +1009,7 @@ void TcpSocket::on_timer(uint64_t now) {
 
   // Data that held back while its frames waited in the stack's transmit queue (see output()) goes once they have gone out.
   const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);
-  if (!fin_sent_ && send_buffer_.size() > in_flight && snd_wnd_ > 0) output();
+  if (!fin_sent_ && send_size() > in_flight && snd_wnd_ > 0) output();
 }
 
 }  // namespace network

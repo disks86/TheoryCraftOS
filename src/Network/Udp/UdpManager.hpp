@@ -17,17 +17,18 @@
  */
 
 #pragma once
+#include "Network/RcuSocketTable.hpp"
 #include "Network/Udp/UdpSocket.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/SharedPointer.hpp"
 
 namespace network {
 
-// Owns the UDP sockets and routes arriving datagrams to them by destination port. Thread-safe: the table has its own lock, each socket its
-// own (see UdpSocket), and a datagram is handed to its socket with the table's let go.
+// Owns the UDP sockets and routes arriving datagrams to them by destination port. Thread-safe: a datagram finds its socket in a hash table read
+// with RCU (RcuSocketTable: no lock), and is handed to it under the socket's own lock; opening and forgetting sockets take table_mutex_.
 class UdpManager {
  public:
-  UdpManager(IIpLayer& ip, allocators::IAllocator& allocator) : ip_(ip), allocator_(allocator), sockets_(allocator) {}
+  UdpManager(IIpLayer& ip, allocators::IAllocator& allocator) : ip_(ip), allocator_(allocator), table_(allocator), sockets_(allocator) {}
 
   // Opens a socket on `port` (0 = pick an unused one). Null if the port is in use
   // or memory ran out.
@@ -46,8 +47,9 @@ class UdpManager {
 
   IIpLayer& ip_;
   allocators::IAllocator& allocator_;
-  mutable kernel::Mutex table_mutex_;   // guards the list (never held while calling into a socket)
-  List<SharedPointer<UdpSocket>> sockets_;
+  RcuSocketTable<UdpSocket, 128> table_;   // by local port
+  mutable kernel::Mutex table_mutex_;      // guards the table's changes and the list (never held while calling into a socket)
+  List<SharedPointer<UdpSocket>> sockets_;   // every open socket (to forget the closed ones)
   uint16_t next_ephemeral_ = 49152;
 };
 

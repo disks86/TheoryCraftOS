@@ -22,12 +22,9 @@
 namespace network {
 
 bool UdpManager::port_in_use(uint16_t port, IpFamilies families) const {
-  const uint64_t count = sockets_.count();
-  for (uint64_t i = count; i > 0; --i) {
-    const SharedPointer<UdpSocket>& s = sockets_[i - 1];
-    if (s->local_port() == port && !s->closed() && families_overlap(s->families(), families)) return true;
-  }
-  return false;
+  return table_.any(hash_port(port), [&](const SocketKey& k, const UdpSocket& s) {
+    return k.local_port == port && !s.closed() && families_overlap(k.families, families);
+  });
 }
 
 SharedPointer<UdpSocket> UdpManager::open(uint16_t port, IpFamilies families) {
@@ -44,6 +41,13 @@ SharedPointer<UdpSocket> UdpManager::open(uint16_t port, IpFamilies families) {
   }
   SharedPointer<UdpSocket> socket = SharedPointer<UdpSocket>::make(allocator_, ip_, allocator_, port, families);
   if (!socket || !sockets_.push_back(socket)) return SharedPointer<UdpSocket>();
+  SocketKey key;
+  key.local_port = port;
+  key.families = families;
+  if (!table_.insert(hash_port(port), key, socket)) {
+    sockets_.remove_at(sockets_.count() - 1);
+    return SharedPointer<UdpSocket>();
+  }
   return socket;
 }
 
@@ -60,15 +64,10 @@ bool UdpManager::handle(const IpAddress& source, const IpAddress& destination, C
     const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolUdp, udp_length), datagram);
     if (checksum_finish(sum) != 0) return false;
   }
-  SharedPointer<UdpSocket> to;
-  {
-    kernel::ScopedMutex guard(table_mutex_);
-    for (SharedPointer<UdpSocket>& s : sockets_) {
-      if (s->local_port() != port || s->closed() || !families_take(s->families(), source.v6)) continue;
-      to = s;
-      break;
-    }
-  }
+  // (a closed socket may linger in the table until reap(); one opened on its port since then comes after it in the bucket)
+  const SharedPointer<UdpSocket> to = table_.find(hash_port(port), [&](const SocketKey& k, const UdpSocket& s) {
+    return k.local_port == port && !s.closed() && families_take(k.families, source.v6);
+  });
   if (!to) return false;
   to->deliver(source, source_port, datagram.dropped(8));
   return true;
@@ -78,7 +77,10 @@ void UdpManager::reap() {
   kernel::ScopedMutex guard(table_mutex_);
   for (uint64_t i = sockets_.count(); i > 0; --i) {
     SharedPointer<UdpSocket>& s = sockets_[i - 1];
-    if (s->closed() || s.use_count() == 1) sockets_.remove_at(i - 1);
+    // closed, or held by nobody but this list and the table (2 references)
+    if (!s->closed() && s.use_count() > 2) continue;
+    table_.remove(hash_port(s->local_port()), s.get());
+    sockets_.remove_at(i - 1);
   }
 }
 

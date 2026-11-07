@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Network/Tcp/TcpSocket.hpp"
+#include "ObjectContainer/Dictionary.hpp"
 
 namespace network {
 
@@ -26,17 +27,19 @@ namespace network {
 //
 // Threads. Several threads hand segments in at once (one per receive queue of the
 // interface, plus the stack's control poll for the loopback), and applications use
-// their sockets meanwhile. The table of sockets has its own lock (table_mutex_), taken
-// only for short lookups and changes and never while calling into a socket; each
-// socket has its own lock (TcpSocket::lock_). A socket's identity - its ports, its
-// peer, whether it listens - is published into its table entry (the "key") whenever it
-// changes, so a lookup reads only the table, never a socket's fields. Lock order:
-// a socket's lock may be held when the table's is taken (a listen() checks the port),
+// their sockets meanwhile. A segment finds its socket in one of two hash tables read
+// with RCU (RcuSocketTable: no lock, no write) - connections by their four-tuple,
+// listeners by their port - and is handed to it with nothing of the manager held.
+// A socket's identity is published there when it changes (claim_connection,
+// claim_listener, release), so a lookup never reads a socket's own fields. Changes,
+// and the list of every socket the timers walk, take table_mutex_. Lock order: a
+// socket's lock may be held when the table's is taken (a listen() claims its port),
 // never the other way round; a listener's lock may be held when one of its new
 // connections' is taken, never the other way round.
 class TcpManager {
  public:
-  TcpManager(IIpLayer& ip, allocators::IAllocator& allocator) : ip_(ip), allocator_(allocator), sockets_(allocator) {}
+  TcpManager(IIpLayer& ip, allocators::IAllocator& allocator)
+      : ip_(ip), allocator_(allocator), connections_(allocator), listeners_(allocator), sockets_(allocator), port_uses_(allocator) {}
 
   // A new, unconnected socket.
   SharedPointer<TcpSocket> create();
@@ -53,37 +56,45 @@ class TcpManager {
   // Disowns (and resets) connections spawned by a listener that is going away.
   void detach_children(TcpSocket* listener);
 
-  // --- used by TcpSocket (with its own lock held): what it is, published in its entry
+  // --- used by TcpSocket (with its own lock held): what it is, published in the tables
   // A free local port for a connection to `remote`:`remote_port`, taken for `socket` at once (0: none free).
   uint16_t claim_connection(TcpSocket* socket, const IpAddress& remote, uint16_t remote_port);
   // `socket` listens on `port` for `families`; false if another listener has the port for one of them.
   bool claim_listener(TcpSocket* socket, uint16_t port, IpFamilies families);
   // `socket` is closed: no segment finds it any more, and its port is free.
   void release(TcpSocket* socket);
+  // The manager's reference to `socket` (null once it was forgotten).
+  SharedPointer<TcpSocket> reference(TcpSocket* socket) const;
 
   // Answers a segment for which there is no connection with a reset.
   void send_reset(const IpAddress& to, uint16_t to_port, uint16_t from_port, const TcpSegment& cause);
 
+  uint32_t connection_count() const { return connections_.count(); }   // (for tests)
+
  private:
-  enum class Kind : uint8_t { None, Listener, Connection };
-  struct Entry {
+  static constexpr uint32_t kConnectionBuckets = 1024, kListenerBuckets = 64;
+  struct Snapshot {   // a socket the timers look at, and how many references the manager itself holds to it
     SharedPointer<TcpSocket> socket;
-    Kind kind = Kind::None;
-    uint16_t local_port = 0, remote_port = 0;
-    IpAddress remote;
-    IpFamilies families = IpFamilies::Both;
+    uint32_t held = 0;
   };
-  Entry* entry_of(TcpSocket* socket);
+  static uint32_t hash_of(TcpSocket::Table table, const SocketKey& key);   // (the bucket hash of an entry of `table`)
   bool port_in_use(uint16_t port) const;
   uint16_t allocate_port();
-  // Copies of every socket (for work done without the table's lock).
-  bool snapshot(List<SharedPointer<TcpSocket>>* out) const;
+  void use_port(uint16_t port);
+  void unuse_port(uint16_t port);
+  bool publish(const SharedPointer<TcpSocket>& socket, TcpSocket::Table table, const SocketKey& key);
+  void unpublish(TcpSocket* socket);
+  SharedPointer<TcpSocket> shared(TcpSocket* socket) const;
+  bool snapshot(List<Snapshot>* out) const;
   void spawn(TcpSocket& listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port, const TcpSegment& syn);
 
   IIpLayer& ip_;
   allocators::IAllocator& allocator_;
-  mutable kernel::Mutex table_mutex_;   // guards everything below
-  List<Entry> sockets_;
+  RcuSocketTable<TcpSocket, kConnectionBuckets> connections_;
+  RcuSocketTable<TcpSocket, kListenerBuckets> listeners_;
+  mutable kernel::Mutex table_mutex_;   // guards the tables' changes and everything below
+  Dictionary<uint64_t, SharedPointer<TcpSocket>> sockets_;   // every socket, by its address (for the timers and to forget the finished ones)
+  Dictionary<uint32_t, uint32_t> port_uses_;   // local port -> listeners and connections on it
   uint16_t next_port_ = 49152;
   uint32_t iss_counter_ = 0;
 };

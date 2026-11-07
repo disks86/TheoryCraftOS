@@ -24,8 +24,10 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
   3. **A TLS connection's own lock**. TLS work (handshake arithmetic, record encryption) no longer runs under the stack's lock, so
      connections do it at the same time.
   4. **A TCP or UDP socket's own lock**. A listener's lock may be held when one of its new connections' is taken, never the other way round.
-  5. **The socket tables'** (`TcpManager`, `UdpManager`) **and a listener's accept queue's.** These are only ever taken for a short lookup
-     or change, never while calling into a socket.
+     A TCP connection's is never waited for on the receive path (see "Within one connection" below).
+  5. **The socket tables' writers' lock** (`TcpManager`, `UdpManager`), **a listener's accept queue's, and a TCP connection's leaf locks**
+     (its send buffer, its receive buffer, its peer address, its backlog). These are only ever taken for a short change or copy, never
+     while calling into a socket. Lookups take no lock at all (below).
   6. **The IP lock** (`ip_lock_`, fair, recursive). It covers everything of the IP layer:
      - addresses (IPv4 and IPv6, with their autoconfiguration)
      - the ARP and neighbor caches, and the packets waiting for them or for the loopback
@@ -35,10 +37,32 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
      It is held only while a packet is built and sent or the state looked at, and nothing under it calls into a socket.
 - **Receiving takes no stack-wide lock.** A TCP segment is looked up in the table by keys the sockets publish there (their ports, their
   peer, whether they listen; `TcpManager::claim_connection`, `claim_listener`, `release`), so a lookup never reads a socket's own fields.
-  It is then handled under its socket's lock. ARP, ICMP and neighbor discovery take the IP lock; the loopback is delivered by the control
-  poll. Timers run over a snapshot of the table, each socket under its own lock.
-- **Application threads** call socket operations (`send()`, `receive()`, `accept()`…) directly, under that socket's lock. `send()` puts
-  data on the wire from the caller's thread, so a send never waits for a service thread.
+  It is then handled by its socket (below). ARP, ICMP and neighbor discovery take the IP lock; the loopback is delivered by the control
+  poll. Timers run over a snapshot of the table.
+- **The socket tables are hash tables read with RCU** (`RcuSocketTable.hpp`, after the CLAUDE.md rule for read-mostly lookup tables):
+  connections hashed by both ports and the peer's address (1024 buckets), listeners and UDP ports by port. A lookup walks one bucket in
+  an RCU read-side section and copies out the socket's `SharedPointer`, with no lock and no write to shared memory, so receive queues do
+  not contend on the table however many connections there are. Opening and closing take the table's writer lock, unlink the node with
+  `rcu_assign_pointer`, and retire it to the table's own RCU domain, which frees it after a grace period. A registry (a `Dictionary` by
+  socket, under the same lock) holds every socket for the timers and for reaping.
+- **Within one connection** (after Linux's socket ownership, `TcpSocket.hpp`), nobody waits for another's protocol work:
+  - The protocol state is under the connection's lock, but every hold of it goes through `TcpSocket::Owner`, whose release first runs the
+    work that others left for the holder.
+  - A segment that arrives while the connection is held (by an application call, a timer, or another receive queue's thread) is copied
+    to the connection's **backlog** and processed by the holder before it lets go. The receive thread goes on to its next frame. The
+    backlog has two halves: arrivals fill one under a leaf lock while the holder works through the other. It keeps up to 64 KiB (always
+    at least one segment, since a coalesced one may be large); beyond that a segment is dropped and the peer resends it.
+  - `send()` and `receive()` take only their buffer's leaf lock and copy. The protocol work they cause (sending the new data, a window
+    update) is done at once if the connection is free, and otherwise flagged for the holder. A busy connection's timers are flagged the
+    same way.
+  - Flagging and the holder's release pair up through a sequentially consistent flag word and fence, so no flagged work is left behind:
+    either the holder sees the flag after letting go and takes the lock back, or the flagger's `try_lock` succeeds.
+  - Status reads (`state()`, `failed()`, the ports, buffer levels, `peer_closed()`) are atomics or leaf-locked, so they never wait for
+    protocol work either.
+  - So one connection's application sender, application receiver, timers and receive queues all run at the same time. What is still
+    serialized is the protocol processing itself: one thread at a time runs the state machine, as in every TCP.
+- **Application threads** call socket operations directly. `send()` puts data on the wire from the caller's thread when the connection
+  is free, so a send never waits for a service thread.
 - **Fair locks.** The control and IP locks use `kernel::Mutex(true)`: an unlock with threads waiting hands the mutex to the one that has
   waited longest (`wake_one` wakes the oldest), which holds it without trying again. The ordinary mutex lets the releasing thread barge.
   With a flood of frames arriving:
@@ -126,20 +150,28 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
 - `NetworkThreadTest`, with real threads (`HostThreads.cpp`) under ThreadSanitizer, runs two `NetworkStackSet`s with service threads, joined by a
   wire whose interfaces interrupt. It checks:
   - Six connections echoing 96 KiB at once, a thread on each side.
+  - 256 connections from four threads to one listener, all answered, with the receive path looking up every segment while connects and
+    closes change the table; both tables are empty again at the end.
+  - One connection with four threads (a sender and a receiver on each side), 1 MiB each way, intact, with segments going through the
+    backlog.
+  - The backlog, deterministically: a thread holds a connection while its peer sends. The segments go to the backlog (none is visible),
+    another connection on the same machine is served meanwhile, and a `send()` on the held connection returns at once. When the holder
+    lets go, the data is there and the reply goes out. With the old blocking receive and send paths put back, this check fails.
   - The loopback ping-pong latency.
   - Datagrams sent while a thread floods the interface.
 
 ## Not done
 
-- **One socket, one thread at a time.** A connection's segments, its timers and its application calls are serialized by its lock. This is
-  the unit of parallelism; there is no finer split within a connection.
+- **One connection's protocol processing** runs on one thread at a time (application calls, timers and receive threads do not wait for
+  it, see above). Splitting the sender's and the receiver's halves of the state machine, as some research stacks do, is not done.
 - **RSS steering in the drivers** comes from the hardware's indirection table, set up once. Nothing moves a flow to the core its
   application runs on (no aRFS), and the queues' threads are not pinned to cores.
 - **Shared per-frame work.** The IP lock is taken for a moment per received frame (to look at the addresses) and per sent packet.
   Transmitting is serialized, since one transmit ring is shared. Both are short, but a read-mostly copy of the addresses (RCU) would take
   that lock off the receive path.
-- **The socket tables are lists**, searched linearly under their lock. That is fine for the connection counts this OS sees; a hash table
-  would be needed for many thousands.
+- **The socket tables have a fixed bucket count** (1024 connections, 64 listeners, 128 UDP ports). Chains grow past a few thousand
+  connections, and there is no resizing (it would need a second table published with RCU).
+- **The UDP socket's own lock** is still taken by the receive path (a datagram is handed over under it); UDP sockets have no backlog.
 - **CoDel's precision:** it works at the clock's millisecond, so its 5 ms target is coarse.
 - **TCP:** no timestamps (RFC 7323), no window scaling (the window stays within 16 KiB), and no RACK.
 - **Pacing** only applies on paths whose round trip is at least a millisecond.

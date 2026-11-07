@@ -1159,7 +1159,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_STUB_LIBRARIES user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
       vulkan-1 avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
-      activeds normaliz sensapi authz rasapi32)
+      activeds normaliz sensapi authz rasapi32
+      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
   add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1178,6 +1179,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_imm32 win32u)      # (the services of win32k: input contexts, hot keys)
   set(WINDOWS_IMPORTS_user32 win32u gdi32)      # (the window manager of win32k: classes, windows, messages)
   set(WINDOWS_IMPORTS_vulkan-1 gdi32 user32)      # (the D3DKMT services of the kernel-mode Direct3D layer, the window size)
+  set(WINDOWS_IMPORTS_crypt32 advapi32 bcrypt)      # (DPAPI: the per-user key in the registry, AES and HMAC of bcrypt)
+  set(WINDOWS_IMPORTS_secur32 advapi32)      # (GetUserNameExW: the user name of the token)
   set(WINDOWS_STUB_RESULT_vulkan-1 0xFFFFFFF8u)   # (VK_ERROR_FEATURE_NOT_PRESENT for the exports that are not implemented)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     if(DEFINED WINDOWS_STUB_RESULT_${_library})
