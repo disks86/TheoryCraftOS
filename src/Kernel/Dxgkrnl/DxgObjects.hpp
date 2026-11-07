@@ -82,7 +82,8 @@ class ShaderObject {
   graphics::ShaderStage stage_ = graphics::ShaderStage::Vertex;
   ByteView text_;                 // the TGSI text the device may keep pointing at (NUL terminated)
   ArrayView<uint32_t> tokens_;    // the Direct3D 9 tokens
-  graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};   // what a DXBC pixel shader declared for its units
+  graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};   // what a DXBC shader declared for its units
+  uint32_t texture_mask_ = 0;               // ... the units it reads (bit n: unit n)
   uint32_t thread_group_[3] = {1, 1, 1};     // a compute shader's thread group
   uint32_t storage_mask_ = 0;                // ... and the storage buffer slots it uses (bit n: u<n>)
   bool fragment_stores_ = false;             // a pixel shader that writes them
@@ -124,12 +125,13 @@ class PipelineObject {
   graphics::GeometryPrimitive geometry_input() const { return geometry_input_; }
   uint32_t thread_group(uint32_t axis) const { return axis < 3 ? thread_group_[axis] : 1; }
   uint32_t storage_mask() const { return storage_mask_; }
+  uint32_t texture_mask() const { return texture_mask_; }   // a compute pipeline: the texture units its shader reads
   bool writes_storage() const { return fragment_stores_ || vertex_stores_ || geometry_stores_ || tessellation_stores_; }   // a shader of the pipeline writes buffers
   bool has_per_instance() const { return per_instance_; }
   // Stream output: which buffers (bit n: buffer n) the pipeline's declaration writes to, and whether it has one.
   uint32_t stream_output_buffers() const { return stream_output_buffers_; }
   bool has_stream_output() const { return stream_output_buffers_ != 0; }
-  // The kind of texture the pixel shader declared for a unit (2D when it does not say: only a DXBC program does).
+  // The kind of texture the shaders declared for a unit (2D when they do not say: only a DXBC program does).
   graphics::TextureKind texture_kind(uint32_t unit) const { return unit < graphics::kMaxTextureUnits ? texture_kinds_[unit] : graphics::TextureKind::Texture2D; }
 
  private:
@@ -148,6 +150,7 @@ class PipelineObject {
   bool fragment_stores_ = false, vertex_stores_ = false, geometry_stores_ = false, tessellation_stores_ = false;
   SharedPointer<ShaderObject> vertex_, fragment_;   // (kept alive for as long as the pipeline is)
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};
+  uint32_t texture_mask_ = 0;   // a compute pipeline: the units its shader reads, which a dispatch needs bound
   uint32_t vertex_slot_mask_ = 0, instance_slot_mask_ = 0, slot_strides_[graphics::kMaxVertexBuffers] = {};
   uint32_t stride_ = 0, attribute_count_ = 0, texture_count_ = 0, color_target_count_ = 1;
 };

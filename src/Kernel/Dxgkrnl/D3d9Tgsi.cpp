@@ -1530,16 +1530,17 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
-    for (uint32_t i = 0; i < graphics::kMaxTextureUnits; ++i) {
-      if (!sampler_used_[i]) continue;
-      add(*out, "DCL SAMP[");
-      add_uint(*out, i);
-      add(*out, "]\nDCL SVIEW[");
-      add_uint(*out, i);
-      add(*out, "], ");
-      add(*out, dimension_name(p_.texture_kind(i)));
-      add(*out, ", FLOAT\n");
-    }
+  }
+  // The samplers and views the program reads, in whichever stage it is (a vertex or compute shader reads textures too)
+  for (uint32_t i = 0; i < graphics::kMaxTextureUnits; ++i) {
+    if (!sampler_used_[i]) continue;
+    add(*out, "DCL SAMP[");
+    add_uint(*out, i);
+    add(*out, "]\nDCL SVIEW[");
+    add_uint(*out, i);
+    add(*out, "], ");
+    add(*out, dimension_name(p_.texture_kind(i)));
+    add(*out, ", FLOAT\n");
   }
   if (!compute_) {   // (the buffers a vertex, geometry, tessellation or pixel shader reads and writes: all the numbers up to the last, so that the host's binding points are the numbers)
     uint32_t last = 0;

@@ -331,8 +331,9 @@ void test_fuzz() {
 // ---- compute shaders -------------------------------------------------------------------------------------------------------------------------------------------------------
 
 // Runs groups_x x 1 x 1 work groups the way the kernel's software device does: a thread at a time, or a whole group at a time for a program with barriers or group-shared memory.
-void dispatch(const D3d9Program& p, uint32_t groups_x, std::vector<uint8_t>* const* buffers, const uint8_t* constants) {
+void dispatch(const D3d9Program& p, uint32_t groups_x, std::vector<uint8_t>* const* buffers, const uint8_t* constants, const graphics::ITextureSet* textures = nullptr) {
   graphics::ComputeContext c;
+  c.textures = textures;
   for (uint32_t k = 0; k < graphics::kMaxStorageBuffers; ++k)
     if (buffers[k]) c.buffers[k] = ByteView(buffers[k]->data(), buffers[k]->size());
   for (uint32_t g = 0; g < groups_x; ++g) {
@@ -631,6 +632,76 @@ void test_cube_arrays() {
   }
 }
 
+// A texture set that says what it was asked: a lookup at a level (u, v, lod, 10 + unit), in a volume or array (u, v, w, 20 + unit), a fetch (x, y, level, 30 + unit); 16 x 8.
+class EchoTexels final : public graphics::ITextureSet {
+ public:
+  graphics::Vec4 sample(uint32_t unit, float u, float v) const override { return {u, v, -1.0f, static_cast<float>(unit)}; }
+  graphics::Vec4 sample_lod(uint32_t unit, float u, float v, float lod) const override { return {u, v, lod, 10.0f + unit}; }
+  graphics::Vec4 sample_lod_volume(uint32_t unit, float u, float v, float w, float) const override { return {u, v, w, 20.0f + unit}; }
+  graphics::Vec4 fetch(uint32_t unit, int32_t x, int32_t y, uint32_t level) const override { return {static_cast<float>(x), static_cast<float>(y), static_cast<float>(level), 30.0f + unit}; }
+  bool size(uint32_t, uint32_t level, uint32_t* width, uint32_t* height, uint32_t* levels) const override {
+    *width = 16 >> level, *height = 8 >> level, *levels = 1;
+    return true;
+  }
+};
+
+// Textures in a compute shader (cs_tex.comp) and a vertex shader (vk_vtex.vert): lookups at a level, texel fetches, sizes; the kernel used to refuse them outside pixel shaders.
+void test_textures_outside_pixels() {
+  HostAllocator allocator;
+  EchoTexels textures;
+  for (const char* name : {"cs_tex.comp.spv", "cs_tex_opt.comp.spv"}) {
+    Translated t;
+    UniquePointer<D3d9Program> p = compile_compute(allocator, name, &t);
+    if (!p) continue;
+    std::vector<uint8_t> out(4 * 16 * 4);
+    std::vector<uint8_t>* buffers[graphics::kMaxStorageBuffers] = {};
+    buffers[t.storage_slot[2]] = &out;
+    std::vector<uint8_t> constants(16);
+    dispatch(*p, 1, buffers, constants.data(), &textures);
+    uint32_t wrong = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+      const float* o = reinterpret_cast<const float*>(out.data()) + i * 16;
+      const float u = static_cast<float>(i) * 0.125f;
+      wrong += !(o[0] == u && o[1] == 0.5f && o[2] == 0.0f && o[3] >= 10.0f && o[3] < 12.0f);                                     // textureLod: unit 0 or 1
+      wrong += !(o[4] == static_cast<float>(i) && o[5] == 1.0f && o[6] == 0.0f && o[7] == o[3] + 20.0f);                         // texelFetch, the same unit
+      wrong += !(o[8] == u && o[9] == 0.5f && o[10] == 2.0f && o[11] >= 20.0f && o[11] < 22.0f && o[11] - 20.0f != o[3] - 10.0f);   // the array: the other unit
+      wrong += !(o[12] == 16.0f && o[13] == 8.0f);                                                                                // textureSize
+      if (wrong && i == 0) printf("  %s: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g\n", name, o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8], o[9], o[10], o[11], o[12], o[13]);
+    }
+    CHECK(wrong == 0);
+  }
+  Translated v = translate(read_spirv("vk_vtex.vert.spv"), SPV_STAGE_VERTEX);
+  if (!v.ok) printf("  vk_vtex.vert: %s\n", v.error.c_str());
+  CHECK(v.ok);
+  if (!v.ok) return;
+  NtStatus s = 0;
+  UniquePointer<D3d9Program> p = compile(allocator, v, &s);
+  if (s != status::kSuccess) printf("  vk_vtex.vert: the kernel refused the DXBC (0x%x)\n", s);
+  CHECK(s == status::kSuccess && p);
+  if (!p) return;
+  graphics::VertexContext context;
+  context.textures = &textures;
+  graphics::Vec4 attributes[4] = {};
+  graphics::ShaderIo io = {};
+  std::vector<uint8_t> constants(16);
+  p->run_vertex_ex(attributes, constants.data(), context, &io);
+  CHECK(io.position.x == 0.25f && io.position.y == 0.75f && io.position.z == 3.0f && io.position.w == 2.0f);   // (texture(): u, v at level 0; texelFetch: x, y)
+  graphics::VertexContext none;   // (without a texture set: zeros, not a crash)
+  p->run_vertex_ex(attributes, constants.data(), none, &io);
+  // The shaders of the QEMU test (tests/windows/vulkantest.c): taken, and their TGSI made (VULKAN_SHADER_TGSI=1 prints it)
+  Translated c;
+  CHECK(compile_compute(allocator, "cs_ctex_opt.comp.spv", &c));
+  Translated d = translate(read_spirv("vk_vtexdraw.vert.spv"), SPV_STAGE_VERTEX);
+  CHECK(d.ok);
+  UniquePointer<D3d9Program> q = d.ok ? compile(allocator, d) : UniquePointer<D3d9Program>();
+  CHECK(q);
+  if (q) {
+    String tgsi(allocator);
+    CHECK(q->emit_tgsi(&tgsi) == status::kSuccess);
+    if (getenv("VULKAN_SHADER_TGSI")) printf("--- vk_vtexdraw.vert TGSI ---\n%.*s\n", static_cast<int>(tgsi.size()), tgsi.data());
+  }
+}
+
 // A vertex shader reading a read-only storage buffer (the kernel's storage in draws).
 void test_vertex_storage() {
   HostAllocator allocator;
@@ -688,6 +759,7 @@ int main() {
   test_compute_big();
   test_compute_dynamic();
   test_cube_arrays();
+  test_textures_outside_pixels();
   test_vertex_storage();
   printf("refusals\n");
   test_refusals();

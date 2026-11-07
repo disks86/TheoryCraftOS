@@ -841,7 +841,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   uint64_t vertex_offset = 0;
   const VirglImage* textures[kBaseTextureUnits] = {};
   SamplerDesc samplers[kBaseTextureUnits];
-  bool textures_dirty = false;
+  bool textures_dirty = false, compute_textures_dirty = false;
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
@@ -1126,6 +1126,26 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           }
           storage_dirty = false;
         }
+        if (compute_textures_dirty) {
+          // The textures bound (a prefix of the units, up to the last one bound: the kernel has checked that those the shader reads are there), for the compute stage.
+          uint32_t unit_count = 0;
+          for (uint32_t unit = 0; unit < kBaseTextureUnits; ++unit)
+            if (textures[unit]) unit_count = unit + 1;
+          if (unit_count) {
+            uint32_t states[kBaseTextureUnits] = {};
+            for (uint32_t unit = 0; unit < unit_count; ++unit)
+              if (textures[unit] && !(states[unit] = sampler_state(samplers[unit]))) return false;
+            stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
+            stream.put(virgl::kShaderCompute);
+            stream.put(0);
+            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit] ? textures[unit]->view() : 0);
+            stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
+            stream.put(virgl::kShaderCompute);
+            stream.put(0);
+            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(states[unit]);
+          }
+          compute_textures_dirty = false;
+        }
         if (compute_constants_dirty) {
           stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
           stream.put(virgl::kShaderCompute);
@@ -1238,6 +1258,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         textures[cmd.unit] = image;
         samplers[cmd.unit] = cmd.sampler;
         textures_dirty = true;
+        compute_textures_dirty = true;
         break;
       }
       case RecordedCommand::Type::PushConstants: {
@@ -1304,19 +1325,22 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             for (const VirglImage* extra : extra_colors)
               if (textures[unit] == extra) return false;
           if (textures_dirty) {
-            stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
-            stream.put(virgl::kShaderFragment);
-            stream.put(0);
-            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit]->view());
+            // (to the vertex and the pixel stage alike: a vertex shader may read the units too, numbered as the pipeline's)
             uint32_t states[kBaseTextureUnits];
             for (uint32_t unit = 0; unit < unit_count; ++unit) {
               states[unit] = sampler_state(samplers[unit]);   // (created straight away, so it exists before the stream that uses it)
               if (!states[unit]) return false;
             }
-            stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
-            stream.put(virgl::kShaderFragment);
-            stream.put(0);
-            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(states[unit]);
+            for (const uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment}) {
+              stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
+              stream.put(stage);
+              stream.put(0);
+              for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit]->view());
+              stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
+              stream.put(stage);
+              stream.put(0);
+              for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(states[unit]);
+            }
             textures_dirty = false;
           }
         }

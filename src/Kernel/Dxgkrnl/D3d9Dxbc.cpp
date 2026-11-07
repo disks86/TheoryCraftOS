@@ -939,7 +939,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       continue;
     } else if (opcode == 45 || opcode == 46 || opcode == 72 || opcode == 61 || opcode == 111) {
       // ld (dst, integer address, resource), sample_l (dst, coordinate, resource, sampler, level), resinfo (dst, level, resource): Shader Model 4 texture access beyond sample.
-      if (vertex || compute) return status::kNotSupported;
+      // (in any stage: none of them takes a derivative)
       Operand d, address, resource, sampler, lod;
       if ((s = read_operand(p, &d)) != status::kSuccess) return s;
       if (opcode != 111 && (s = read_operand(p, &address)) != status::kSuccess) return s;   // (sampleinfo has no address)
@@ -1054,7 +1054,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         ins.src_count = 2;
       }
     } else if (opcode == kSample4 || opcode == 109 || opcode == 73 || opcode == 74 || opcode == 108 || opcode == 70 || opcode == 71 || opcode == 126 || opcode == 127 || opcode == 128) {   // (sample, gather4 and its variants, sample_d, sample_b, lod, sample_c, sample_c_lz)
-      if (vertex || compute) return status::kNotSupported;   // (no textures in the vertex stage)
+      // (a vertex or compute shader has no derivatives: the lookups that take the level from them are refused there; gather4, sample_d and sample_c_lz are fine)
+      if ((vertex || compute) && (opcode == kSample4 || opcode == 74 || opcode == 108 || opcode == 70)) return status::kNotSupported;
       Operand d, coordinate, resource, sampler, gather_offset;
       const bool gather_op = opcode == 109 || opcode == 126 || opcode == 127 || opcode == 128;
       if ((s = read_operand(p, &d)) != status::kSuccess || (s = read_operand(p, &coordinate)) != status::kSuccess) return s;
@@ -1210,6 +1211,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       if (ins.dst.slot == kSlotPosition) writes_position = true;
     if (!writes_position) return status::kInvalidParameter;
   }
+  // (a vertex shader that reads textures is given them through its context: the function with system values)
+  if (vertex && program->uses_textures_) program->uses_system_values_ = true;
   program->count_temps();
   *out = util::move(program);
   return status::kSuccess;

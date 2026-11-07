@@ -459,6 +459,9 @@ class Adapter::StreamRunner {
     if (uint64_t{x} * y * z * per_group > graphics::kMaxDispatchThreads) return kBad;
     for (uint32_t slot = 0; slot < graphics::kMaxStorageBuffers; ++slot)
       if ((compute_->storage_mask() >> slot & 1) && !uav_bound_[slot]) return kBad;
+    for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u)   // (the textures the shader reads: bound, and of the kind it declared)
+      if ((compute_->texture_mask() >> u & 1) && (!texture_bound_[u] || (texture_alloc_[u]->desc().samples > 1 ? graphics::TextureKind::Texture2DMS : texture_alloc_[u]->texture_kind()) != compute_->texture_kind(u)))
+        return kBad;
     if (x == 0 || y == 0 || z == 0 || !exec_) return status::kSuccess;
     const NtStatus s = ensure_cb();
     if (s != status::kSuccess) return s;
@@ -1427,6 +1430,7 @@ NtStatus Adapter::create_shader(const ShaderDesc& desc, SharedPointer<ShaderObje
         }
       }
       for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) shader->texture_kinds_[u] = program->texture_kind(u);
+      shader->texture_mask_ = program->texture_unit_mask();
       for (uint32_t k = 0; k < 3; ++k) shader->thread_group_[k] = program->thread_group(k);
       shader->geometry_input_ = program->geometry_input();
       shader->geometry_streams_ = program->geometry_streams();
@@ -1463,6 +1467,8 @@ NtStatus Adapter::create_compute_pipeline(const SharedPointer<ShaderObject>& sha
   pipeline->compute_ = true;
   for (uint32_t k = 0; k < 3; ++k) pipeline->thread_group_[k] = shader->thread_group_[k];
   pipeline->storage_mask_ = shader->storage_mask_;
+  pipeline->texture_mask_ = shader->texture_mask_;
+  for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) pipeline->texture_kinds_[u] = shader->texture_kind(u);
   pipeline->vertex_ = shader;   // (kept alive for as long as the pipeline is)
   *out = pipeline;
   return status::kSuccess;
@@ -1585,7 +1591,12 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   for (uint32_t i = 0; i < d.attribute_count; ++i) pipeline->per_instance_ = pipeline->per_instance_ || d.attributes[i].per_instance;
   pipeline->attribute_count_ = d.attribute_count;
   pipeline->texture_count_ = d.texture_count;
-  for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) pipeline->texture_kinds_[u] = fragment->texture_kind(u);
+  // (a unit has the kind the stage that reads it declared; a vertex and a pixel shader that read one unit as two kinds do not go together)
+  for (uint32_t u = 0; u < graphics::kMaxTextureUnits; ++u) {
+    const bool in_vertex = (vertex->texture_mask_ >> u) & 1, in_fragment = (fragment->texture_mask_ >> u) & 1;
+    if (in_vertex && in_fragment && vertex->texture_kind(u) != fragment->texture_kind(u)) return status::kNotSupported;
+    pipeline->texture_kinds_[u] = in_vertex ? vertex->texture_kind(u) : fragment->texture_kind(u);
+  }
   pipeline->color_target_count_ = d.color_target_count;
   pipeline->fragment_stores_ = fragment->fragment_stores_;
   pipeline->vertex_stores_ = vertex->vertex_stores_;

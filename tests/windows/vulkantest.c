@@ -751,6 +751,96 @@ static void test_cube_array(Rig *r, Scene *s) {
   p_vkFreeMemory(r->dev, image_memory, NULL);
 }
 
+/* Textures outside pixel shaders: a vertex shader whose colour is a texel it fetches (green), and a compute shader that fetches, looks up at level 0 and asks the size of the
+ * scene's 2 x 2 texture (red, green / blue, white). */
+static void test_textures_in_vertex_and_compute(Rig *r, Scene *s) {
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof vtexdraw_vert, smi.pCode = vtexdraw_vert;
+  VkShaderModule vs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &vs);
+  VkShaderModule scene_vs = s->vs;
+  s->vs = vs;
+  VkResult result;
+  VkPipeline pipeline = make_pipeline(r, s, s->fs_color, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, &result);
+  s->vs = scene_vs;
+  check(result == VK_SUCCESS && pipeline, "a pipeline whose vertex shader reads a texture");
+  if (pipeline) {
+    static const float white[15] = {-1, -1, 1, 1, 1, 3, -1, 1, 1, 1, -1, 3, 1, 1, 1};
+    memcpy(s->vertex_map, white, sizeof white);
+    draw_frame(r, s, pipeline, 0, 0, 0);
+    const unsigned char *picture = (const unsigned char *)s->readback_map;
+    check(near_pixel(pixel(picture, W, 10, 10), 0, 255, 0, 255) && near_pixel(pixel(picture, W, 50, 40), 0, 255, 0, 255), "a vertex shader's texel fetch colours the draw");
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  if (vs) p_vkDestroyShaderModule(r->dev, vs, NULL);
+
+  VkQueueFamilyProperties fam;
+  unsigned nfam = 1;
+  p_vkGetPhysicalDeviceQueueFamilyProperties(r->pd, &nfam, &fam);
+  if (!(fam.queueFlags & VK_QUEUE_COMPUTE_BIT)) return;
+  VkDescriptorSetLayoutBinding bindings[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+  VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dl.bindingCount = 2, dl.pBindings = bindings;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  p_vkCreateDescriptorSetLayout(r->dev, &dl, NULL, &set_layout);
+  VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pl.setLayoutCount = 1, pl.pSetLayouts = &set_layout;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  p_vkCreatePipelineLayout(r->dev, &pl, NULL, &layout);
+  VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+  VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 2, dpi.pPoolSizes = sizes;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  p_vkCreateDescriptorPool(r->dev, &dpi, NULL, &pool);
+  VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &set_layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  p_vkAllocateDescriptorSets(r->dev, &dai, &set);
+  VkDeviceMemory mem;
+  void *map;
+  VkBuffer buf = make_buffer(r, 3 * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mem, &map);
+  memset(map, 0, 3 * 16);
+  VkDescriptorImageInfo dii = {s->sampler, s->texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkDescriptorBufferInfo dbi = {buf, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet writes[2];
+  memset(writes, 0, sizeof writes);
+  writes[0].sType = writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[0].dstSet = writes[1].dstSet = set;
+  writes[0].dstBinding = 0, writes[0].descriptorCount = 1, writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes[0].pImageInfo = &dii;
+  writes[1].dstBinding = 1, writes[1].descriptorCount = 1, writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, writes[1].pBufferInfo = &dbi;
+  p_vkUpdateDescriptorSets(r->dev, 2, writes, 0, NULL);
+  smi.codeSize = sizeof ctex_comp, smi.pCode = ctex_comp;
+  VkShaderModule cs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &cs);
+  VkComputePipelineCreateInfo cpi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, cpi.stage.module = cs, cpi.stage.pName = "main";
+  cpi.layout = layout;
+  VkPipeline cpipe = VK_NULL_HANDLE;
+  check(p_vkCreateComputePipelines(r->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &cpipe) == VK_SUCCESS && cpipe, "a compute pipeline that reads a texture");
+  if (cpipe) {
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    p_vkResetCommandBuffer(r->cb, 0);
+    p_vkBeginCommandBuffer(r->cb, &cbi);
+    p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, cpipe);
+    p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    p_vkCmdDispatch(r->cb, 1, 1, 1);
+    p_vkEndCommandBuffer(r->cb);
+    submit_and_wait(r);
+    const float *o = map;
+    const int fetched = o[0] > 0.99f && o[1] > 0.99f && o[2] > 0.99f && o[3] > 0.99f;                 /* (1, 1): white */
+    const int looked = o[4] < 0.01f && o[5] < 0.01f && o[6] > 0.99f && o[7] > 0.99f;                  /* (0.25, 0.75): blue */
+    check(fetched && looked && o[8] == 2.0f && o[9] == 2.0f, "a compute shader reads a texture: a fetch, a lookup at level 0, its size");
+    if (!(fetched && looked && o[8] == 2.0f)) printf("    compute texture: %g %g %g %g | %g %g %g %g | %g %g\n", o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8], o[9]);
+    p_vkDestroyPipeline(r->dev, cpipe, NULL);
+  }
+  if (cs) p_vkDestroyShaderModule(r->dev, cs, NULL);
+  p_vkDestroyBuffer(r->dev, buf, NULL);
+  p_vkFreeMemory(r->dev, mem, NULL);
+  p_vkDestroyDescriptorPool(r->dev, pool, NULL);
+  p_vkDestroyPipelineLayout(r->dev, layout, NULL);
+  p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
+}
+
 /* Timestamps: two around a dispatch-free submission's work, read back with and without availability; they go up. */
 static void test_timestamps(Rig *r) {
   VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -998,6 +1088,7 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   test_compute(&r);
   test_compute_big(&r);
   test_cube_array(&r, &s);
+  test_textures_in_vertex_and_compute(&r, &s);
   test_timestamps(&r);
 
   /* copies and clears that need no GPU */

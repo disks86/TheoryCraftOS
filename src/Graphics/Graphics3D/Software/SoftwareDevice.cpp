@@ -1437,7 +1437,9 @@ IPipeline* SoftwareDevice::create_graphics_pipeline(const GraphicsPipelineDesc& 
   // A shader that samples textures needs the pipeline to say how many, and the other way round.
   // (one with system values reads whatever it likes)
   const bool textured = fs->desc().textured_fragment_function != nullptr;
-  if (desc.texture_count > kMaxTextureUnits || (!fs->desc().fragment_function_ex && (desc.texture_count != 0) != textured)) return nullptr;
+  // (textures without a fragment shader that samples them: those of a vertex shader that reads them, through its context)
+  const bool vertex_reads = vs->desc().vertex_function_ex != nullptr;
+  if (desc.texture_count > kMaxTextureUnits || (!fs->desc().fragment_function_ex && (textured ? desc.texture_count == 0 : desc.texture_count != 0 && !vertex_reads))) return nullptr;
   return make<SoftwarePipeline>(allocator_, desc, vs->desc().vertex_function, fs->desc().fragment_function, fs->desc().textured_fragment_function, vs->desc().vertex_function_ex,
                                 fs->desc().fragment_function_ex);
 }
@@ -1624,6 +1626,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         if (uint64_t{gx} * gy * gz * threads_per_group > kMaxDispatchThreads) return false;
         ComputeContext context;
         for (uint32_t k = 0; k < kMaxStorageBuffers; ++k) context.buffers[k] = storage[k];
+        context.textures = &s.textures;   // (bound outside the passes as well)
         for (uint32_t z = 0; z < gz; ++z)
           for (uint32_t y = 0; y < gy; ++y)
             for (uint32_t x = 0; x < gx; ++x) {
@@ -1783,6 +1786,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
           context.vertex_id = static_cast<uint32_t>(v);
           context.instance_id = cmd.first_instance + instance;
           context.storage = s.storage;
+          context.textures = &s.textures;
           ++stat_vs;
           *out = run_vertex_shader(*s.pipeline, streams, static_cast<uint64_t>(v), instance_number, s.constants, context);
           return true;

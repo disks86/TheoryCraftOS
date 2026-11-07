@@ -283,6 +283,7 @@ using TexturedFragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* c
 // primitive of the draw it belongs to.
 struct VertexContext {
   const ByteView* storage = nullptr;   // the storage buffers bound (kFeatureStorageInDraws): kMaxStorageBuffers views, the shader resource views of buffers in the slots after the unordered access ones
+  const ITextureSet* textures = nullptr;   // the textures bound for the draw (kFeatureTexelAccess): a vertex shader reads them at a level it names (no derivatives)
   uint32_t vertex_id = 0;     // the index of the vertex (or its number in a draw without indices), before the base vertex offset is added in
   uint32_t instance_id = 0;
 };
@@ -377,6 +378,7 @@ struct ComputeContext {
   uint32_t group_index = 0;       // SV_GroupIndex: the thread's number in its group
   ByteView buffers[kMaxStorageBuffers];
   ByteView shared[kMaxSharedMemories];   // (made by a group function for the group it runs)
+  const ITextureSet* textures = nullptr;   // the textures bound for the dispatch (kFeatureTexelAccess): read at a level the shader names, texel fetches and sizes (no derivatives)
 };
 using ComputeShaderFn = void (*)(const ComputeContext& context, const uint8_t* constants);
 // A compute shader that uses group-shared memory or barriers is run a whole group at a time: the function runs all the threads of the group named by group_id (thread_id, dispatch_id and

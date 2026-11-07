@@ -927,6 +927,8 @@ static int do_image_sample(Mod *m, uint32_t off) {
   /* Outside a fragment shader there are no derivatives: an implicit lookup is a lookup at lod 0. */
   Leaf zero_lod = imm_f(0.0f, 1);
   if (m->stage != SPV_STAGE_FRAGMENT && dop == D_SAMPLE) dop = D_SAMPLE_L, lod = 0;
+  if (m->stage != SPV_STAGE_FRAGMENT && dop == D_SAMPLE_C) dop = D_SAMPLE_C_LZ;
+  if (m->stage != SPV_STAGE_FRAGMENT && dop == D_SAMPLE_B) return sp_fail(m, "a lookup with a bias outside a fragment shader");
   SpIns *i = emit_ins(m, dop);
   i->dst[0] = dst_temp(&result);
   i->ndst = 1;
@@ -961,14 +963,19 @@ static int do_image_fetch(Mod *m, uint32_t off) {
   if (mask & ~2u) return sp_fail(m, "texel fetch with offsets or a sample");
   Val *r = result_val(m, rtype, id);
   if (!r) return 1;
-  /* address: the coordinates, then the mip level */
+  /* address: the coordinates (the components after them zero), and the mip level in w - where ld takes it for every kind of texture */
   Leaf addr = temp_leaf(m, 4, CLS_I, 0);
   uint32_t nc = coord->leaf[0].n;
+  if (nc > 3) return sp_fail(m, "a texel fetch of more than three coordinates");
+  Leaf zero4 = imm_u(0, 4, CLS_I);
+  SpIns *z = emit_ins(m, D_MOV);
+  z->dst[0] = addr.op, z->dst[0].mask = 0xF, z->ndst = 1;
+  add_src(z, &zero4, 4);
   SpIns *a = emit_ins(m, D_MOV);
   a->dst[0] = addr.op, a->dst[0].mask = (sp_u8)full_mask(nc), a->ndst = 1;
   add_src(a, &coord->leaf[0], nc);
   SpIns *b = emit_ins(m, D_MOV);
-  b->dst[0] = addr.op, b->dst[0].mask = (sp_u8)(1u << nc), b->ndst = 1;
+  b->dst[0] = addr.op, b->dst[0].mask = 8, b->ndst = 1;
   Leaf zero = imm_u(0, 1, CLS_I);
   add_src(b, lod ? &lod->leaf[0] : &zero, 1);
   Leaf result = temp_leaf(m, 4, CLS_F, 0);
