@@ -18,7 +18,8 @@
 
 // Fills the primary disk image of the OS with the files that belong on it (the Windows libraries in /Windows/Windows/System32, say), using the OS's own FAT driver on
 // the image file. The image must already be a FAT volume (mkfs.fat); files that exist are replaced, folders that exist are kept.
-// Usage: primary_image <image> [dir:/folder]... [file:/path/on/image=host/file]...   (folders are made on the way, so dir: is only needed for empty ones)
+// Usage: primary_image <image> [dir:/folder]... [file:/path/on/image=host/file]... [get:/path/on/image=host/file]...   (folders are made on the way, so dir: is only
+// needed for empty ones; get: copies a file out of the image)
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,8 +103,26 @@ static bool put_file(IFileSystem& fs, const std::string& path, const std::string
   return file->flush() == Status::Ok;
 }
 
+// Copies the image's file at `path` to `host`.
+bool get_file(IFileSystem& fs, const std::string& path, const std::string& host) {
+  UniquePointer<IFile> file;
+  if (fs.open_file(path.c_str(), OpenMode::Read, &file) != Status::Ok || !file) { fprintf(stderr, "primary_image: no file %s\n", path.c_str()); return false; }
+  FILE* out = fopen(host.c_str(), "wb");
+  if (!out) { fprintf(stderr, "primary_image: cannot write %s\n", host.c_str()); return false; }
+  static uint8_t buffer[1 << 20];
+  bool ok = true;
+  for (uint64_t done = 0; done < file->size() && ok;) {
+    uint64_t got = 0;
+    const uint64_t want = file->size() - done < sizeof buffer ? file->size() - done : sizeof buffer;
+    ok = file->read(done, ByteView(buffer, want), &got) == Status::Ok && got > 0 && fwrite(buffer, 1, got, out) == got;
+    done += got;
+  }
+  fclose(out);
+  return ok;
+}
+
 int main(int argc, char** argv) {
-  if (argc < 2) { fprintf(stderr, "usage: primary_image <image> [dir:/folder] [file:/path=host-file]...\n"); return 2; }
+  if (argc < 2) { fprintf(stderr, "usage: primary_image <image> [dir:/folder] [file:/path=host-file] [get:/path=host-file]...\n"); return 2; }
   const int fd = open(argv[1], O_RDWR);
   struct stat st;
   if (fd < 0 || fstat(fd, &st) != 0) { fprintf(stderr, "primary_image: cannot open %s\n", argv[1]); return 1; }
@@ -120,6 +139,10 @@ int main(int argc, char** argv) {
       const size_t eq = arg.find('=');
       if (eq == std::string::npos) { fprintf(stderr, "primary_image: %s needs =host-file\n", arg.c_str()); ok = false; continue; }
       ok = put_file(*fs, arg.substr(5, eq - 5), arg.substr(eq + 1)) && ok;
+    } else if (arg.rfind("get:", 0) == 0) {
+      const size_t eq = arg.find('=');
+      if (eq == std::string::npos) { fprintf(stderr, "primary_image: %s needs =host-file\n", arg.c_str()); ok = false; continue; }
+      ok = get_file(*fs, arg.substr(4, eq - 4), arg.substr(eq + 1)) && ok;
     } else {
       fprintf(stderr, "primary_image: unknown argument %s\n", arg.c_str());
       ok = false;

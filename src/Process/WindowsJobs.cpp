@@ -72,8 +72,8 @@ uint32_t nt_is_process_in_job(Process& p, const SyscallRequest& r) {
   if (!pid_of_handle(p, r.args[0], &pid)) return kInvalidHandle;
   uint32_t asked = 0;
   if (r.args[1] != 0 && (asked = job_of_handle(p, r.args[1])) == 0) return kInvalidHandle;
-  const uint32_t actual = objects->job_of_process(pid);
-  return actual != 0 && (asked == 0 || asked == actual) ? kProcessInJob : kProcessNotInJob;
+  if (asked != 0) return objects->job_contains(asked, pid) ? kProcessInJob : kProcessNotInJob;      // (in that job, at any depth of the nesting)
+  return objects->job_of_process(pid) != 0 ? kProcessInJob : kProcessNotInJob;
 }
 
 uint32_t nt_query_information_job_object(Process& p, const SyscallRequest& r) {

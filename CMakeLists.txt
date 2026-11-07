@@ -1112,7 +1112,9 @@ endif()
 # library, as a real one would be.
 if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_DIR ${CMAKE_BINARY_DIR}/windows)
-  set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector
+  # (-fno-strict-aliasing: the Windows interfaces pass one structure as another all the time, an OSVERSIONINFOEXW as an OSVERSIONINFOW say, which is what their compiler
+  # allows; with strict aliasing GCC took a read of such a field for an uninitialised one and compiled RtlVerifyVersionInfo down to a constant failure.)
+  set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector -fno-strict-aliasing
       -fasynchronous-unwind-tables -nostdlib -shared -Wl,--entry=DllMain)
   file(GLOB WINDOWS_HEADERS ${CMAKE_SOURCE_DIR}/src/Windows/*.h)
   set(WINDOWS_STUBS_C ${CMAKE_SOURCE_DIR}/src/Windows/stubs/stubs.c)

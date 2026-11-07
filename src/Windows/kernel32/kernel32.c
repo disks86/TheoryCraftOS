@@ -2529,6 +2529,14 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     return FALSE;
   }
   con_note_child(process_id, block.console, block.words[11] == 0xFFFFFFFFu ? process_id : block.words[11], block.words[10] & 1);
+  if ((flags & 0x80000 /* EXTENDED_STARTUPINFO_PRESENT */) && startup && startup->cb >= sizeof(STARTUPINFOW) + sizeof(PVOID)) {      /* PROC_THREAD_ATTRIBUTE_JOB_LIST: into those jobs */
+    const ProcThreadAttributeList *attributes = *(ProcThreadAttributeList *const *)((const BYTE *)startup + sizeof(STARTUPINFOW));
+    const ProcThreadAttributeEntry *jobs = attributes ? attribute_of(attributes, 0x0002000D) : NULL;
+    for (SIZE_T i = 0; jobs && i < jobs->size / sizeof(HANDLE); ++i) {
+      const NTSTATUS joined = NtAssignProcessToJobObject(((HANDLE *)jobs->value)[i], process);
+      if (!NT_SUCCESS(joined)) { NtTerminateProcess(process, (DWORD)joined); NtClose(process); NtClose(thread); fail_nt(joined); return FALSE; }
+    }
+  }
   if (process_attributes && process_attributes->lpSecurityDescriptor) {      /* the descriptors the process and its first thread are made with */
     OBJECT_ATTRIBUTES made = { sizeof(made), NULL, NULL, 0, process_attributes->lpSecurityDescriptor, NULL };
     RtlTcosNewObjectSecurity(process, &made, FALSE, 10 /* a process */);

@@ -21,7 +21,7 @@
 # to C:\Program Files\Chromium on a primary disk of its own (build/chromium.img, 2 GiB, made once and refreshed with the system DLLs on every run). The VM runs headless
 # with the standard VGA card for CHROMIUM_SECONDS (default 300) seconds or until the program ends; the debug console goes to build/chromium.log and a screenshot of the
 # end to build/chromium.ppm. Environment: CHROMIUM_SMP (cores, 4), CHROMIUM_MEMORY (8G), CHROMIUM_QMP (socket path, short: QEMU limits it to 107 bytes), CHROMIUM_EXTRA
-# (more files for System32, space-separated).
+# (more files for System32, space-separated), CHROMIUM_GDB (a port for QEMU's gdb stub).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 src=$(cd "$1" && pwd); shift
@@ -56,7 +56,7 @@ qemu-system-x86_64 -accel kvm -cpu host -machine q35 -smp "${CHROMIUM_SMP:-4}" -
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd -drive if=pflash,format=raw,file="$build/OVMF_VARS.fd" \
   -drive format=raw,file=fat:rw:"$build/esp" -drive if=none,id=data,format=raw,file="$image" -device virtio-blk-pci,drive=data \
   -chardev file,id=dbg,path="$log" -device isa-debugcon,iobase=0x402,chardev=dbg -serial null \
-  -vga none -device VGA,vgamem_mb=64 -display none -qmp unix:"$qmp",server=on,wait=off &
+  -vga none -device VGA,vgamem_mb=64 -display none -qmp unix:"$qmp",server=on,wait=off ${CHROMIUM_GDB:+-gdb tcp:127.0.0.1:$CHROMIUM_GDB} &
 pid=$!
 for _ in $(seq 1 "${CHROMIUM_SECONDS:-300}"); do
   kill -0 $pid 2>/dev/null || break

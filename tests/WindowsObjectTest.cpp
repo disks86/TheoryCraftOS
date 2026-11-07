@@ -389,7 +389,12 @@ static void test_jobs() {
     const uint64_t job = p.out();
     CHECK(p.call(WindowsSyscallNumber::NtIsProcessInJob, self, 0) == 0x123);      // in no job yet
     CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, job, self) == 0);
-    CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, job, self) == 0xC0000022u);      // a process is in one job only
+    CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, job, self) == 0xC0000022u);      // not twice into one job
+    CHECK(p.call(WindowsSyscallNumber::NtCreateJobObject, kBase + 0x108, 0x1F001F, 0) == 0);
+    const uint64_t inner = p.memory.get64(kBase + 0x108);
+    CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, inner, self) == 0);      // another job nests inside the first (Windows 8 and later)
+    CHECK(p.call(WindowsSyscallNumber::NtIsProcessInJob, self, inner) == 0x124 && p.call(WindowsSyscallNumber::NtIsProcessInJob, self, job) == 0x124);
+    CHECK(p.call(WindowsSyscallNumber::NtClose, inner) == 0);
     CHECK(p.call(WindowsSyscallNumber::NtIsProcessInJob, self, 0) == 0x124 && p.call(WindowsSyscallNumber::NtIsProcessInJob, self, job) == 0x124);
     CHECK(p.call(WindowsSyscallNumber::NtAssignProcessToJobObject, 0x7777, self) == 0xC0000008u);
     // accounting and the list of processes
