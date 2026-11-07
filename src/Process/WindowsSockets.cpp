@@ -57,20 +57,33 @@ uint32_t give_socket_handle(Process& p, uint32_t id, uint64_t* handle) {
 
 // Retries `attempt` (one of SocketManager's operations) until it is not "would block" any more, a blocking socket's handles stay busy here instead of returning to
 // the program; a non-blocking one's returns WSAEWOULDBLOCK at once, like it would from the real AFD driver.
+// Waits (the process's lock let go) until a network stack has done something that may let a blocked operation go on: woken by the stacks
+// themselves where they can (SocketManager::wait_for_progress), else after a 2 ms sleep. `kSliceUs` bounds each wait so that a process that
+// exits or is interrupted is noticed.
+constexpr uint64_t kSliceUs = 2000;
+void wait_for_network(Process& p, SocketManager& sockets, uint64_t seen) {
+  IProcessRuntime* runtime = p.runtime();
+  if (runtime) runtime->unlock();
+  if (!sockets.wait_for_progress(seen, kSliceUs)) p.host().sleep_ns(kSliceUs * 1000);
+  if (runtime) runtime->lock();
+}
+
+// Retries `attempt` (one of SocketManager's operations) until it is not "would block" any more, a blocking socket's handles stay busy here instead of returning to
+// the program; a non-blocking one's returns WSAEWOULDBLOCK at once, like it would from the real AFD driver.
 template <typename Attempt>
 uint32_t socket_wait(Process& p, uint64_t id, Attempt&& attempt, bool always_block = false) {
   SocketManager* sockets = system_sockets();
   bool would_block = false;
+  uint64_t seen = sockets->progress();   // (read before the attempt: what happens after it wakes the wait below)
   uint32_t status = attempt(&would_block);
   if (status != kSuccess || !would_block) return status;
   if (!always_block && sockets->is_non_blocking(id)) return kStatusWouldBlock;
   IProcessRuntime* runtime = p.runtime();
   for (;;) {
     if (p.exited() || (runtime && runtime->interrupted())) return 0xC0000120u;      // STATUS_CANCELLED
-    if (runtime) runtime->unlock();
-    p.host().sleep_ns(2000000);      // 2 ms: a short, steady poll - the network stack's own service thread, not this wait, is what makes progress
-    if (runtime) runtime->lock();
+    wait_for_network(p, *sockets, seen);
     would_block = false;
+    seen = sockets->progress();
     status = attempt(&would_block);
     if (status != kSuccess || !would_block) return status;
   }
@@ -386,6 +399,7 @@ uint32_t nt_select_sockets(Process& p, const SyscallRequest& r) {
   const uint64_t started = p.host().monotonic_ns();
   IProcessRuntime* runtime = p.runtime();
   for (;;) {
+    const uint64_t seen = sockets->progress();
     uint32_t ready = 0, kept_read = 0, kept_write = 0, kept_except = 0;
     for (uint32_t i = 0; i < read_count; ++i) { uint64_t sid; if (id_of(read_handles[i], &sid) && sockets->ready_to_read(uint32_t(sid))) { read_handles[kept_read++] = read_handles[i]; ++ready; } }
     for (uint32_t i = 0; i < write_count; ++i) { uint64_t sid; if (id_of(write_handles[i], &sid) && sockets->ready_to_write(uint32_t(sid))) { write_handles[kept_write++] = write_handles[i]; ++ready; } }
@@ -406,9 +420,7 @@ uint32_t nt_select_sockets(Process& p, const SyscallRequest& r) {
       if (except_count_at != 0 && !p.write_user_u32(except_count_at, 0)) return kAccessViolation;
       return p.write_user_u32(ready_count_at, 0) ? kSuccess : kAccessViolation;
     }
-    if (runtime) runtime->unlock();
-    p.host().sleep_ns(2000000);
-    if (runtime) runtime->lock();
+    wait_for_network(p, *sockets, seen);
   }
 }
 

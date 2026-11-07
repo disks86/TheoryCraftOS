@@ -30,20 +30,49 @@ void set_system_network_stacks(NetworkStackSet* stacks) { g_system_stacks = stac
 
 bool NetworkStackSet::add(hardware::INetworkInterface& nic) {
   UniquePointer<NetworkStack> stack = UniquePointer<NetworkStack>::make(allocator_, nic, clock_, allocator_);
-  if (!stack || !stack->initialize()) return false;
+  UniquePointer<Worker> worker = UniquePointer<Worker>::make(allocator_);
+  if (!stack || !worker || !stack->initialize()) return false;
   if (nic.wireless() || nic.link_comes_and_goes()) stack->set_dhcp_follows_link(true);       // the link of a Wi-Fi adapter is the connection: addresses come and go with it
   if (nic.direct_link()) stack->set_link_local_fallback(true);
+  worker->set = this;
+  worker->stack = stack.get();
+  NetworkStack::ServiceHooks hooks;
+  hooks.wake = &NetworkStackSet::on_activity;
+  hooks.progress = &NetworkStackSet::on_progress;
+  hooks.context = worker.get();
+  stack->set_service_hooks(hooks);
   if (!stacks_.push_back(util::move(stack))) return false;
-  nic.enable_interrupts(&NetworkStackSet::on_activity, this);  // (an interface that cannot stays polled)
+  if (!workers_.push_back(util::move(worker))) {
+    stacks_.remove_at(stacks_.count() - 1);
+    return false;
+  }
+  nic.enable_interrupts(&NetworkStackSet::on_activity, workers_[workers_.count() - 1].get());  // (an interface that cannot stays polled)
   return true;
 }
 
-void NetworkStackSet::on_activity(void* self) { static_cast<NetworkStackSet*>(self)->activity_.set(); }
+void NetworkStackSet::on_activity(void* worker) { static_cast<Worker*>(worker)->activity.set(); }
+
+void NetworkStackSet::on_progress(void* worker) {
+  NetworkStackSet* set = static_cast<Worker*>(worker)->set;
+  __atomic_add_fetch(&set->progress_, 1, __ATOMIC_ACQ_REL);
+  kernel::ScopedMutex guard(set->progress_mutex_);   // (taken so that a waiter between its check and its wait still gets the notification)
+  set->progress_cv_.notify_all();
+}
+
+bool NetworkStackSet::wait_for_progress(uint64_t seen, uint64_t timeout_us) {
+  kernel::ScopedMutex guard(progress_mutex_);
+  if (progress() == seen) progress_cv_.wait(progress_mutex_, timeout_us);
+  return true;
+}
 
 void NetworkStackSet::clear() {
   stop_service();
-  for (UniquePointer<NetworkStack>& stack : stacks_) stack->interface().disable_interrupts();
+  for (UniquePointer<NetworkStack>& stack : stacks_) {
+    stack->interface().disable_interrupts();
+    stack->set_service_hooks(NetworkStack::ServiceHooks{});
+  }
   stacks_.clear();
+  workers_.clear();
 }
 
 bool NetworkStackSet::interrupt_driven() const {
@@ -56,29 +85,43 @@ bool NetworkStackSet::interrupt_driven() const {
 bool NetworkStackSet::start_service() {
   if (service_) return true;
   stop_ = false;
-  service_ = kernel::spawn(service_main, this, "network");
-  return service_ != nullptr;
+  for (UniquePointer<Worker>& worker : workers_) {
+    worker->thread = kernel::spawn(service_main, worker.get(), "network");
+    if (!worker->thread) {   // (all or none)
+      service_ = true;
+      stop_service();
+      return false;
+    }
+  }
+  service_ = true;
+  return true;
 }
 
 void NetworkStackSet::stop_service() {
   if (!service_) return;
   __atomic_store_n(&stop_, true, __ATOMIC_RELEASE);
-  kernel::join(service_);
-  service_ = nullptr;
+  for (UniquePointer<Worker>& worker : workers_) {
+    if (!worker->thread) continue;
+    worker->activity.set();
+    kernel::join(worker->thread);
+    worker->thread = nullptr;
+  }
+  service_ = false;
 }
 
 void NetworkStackSet::service_main(void* self) {
-  NetworkStackSet* set = static_cast<NetworkStackSet*>(self);
-  while (!__atomic_load_n(&set->stop_, __ATOMIC_ACQUIRE)) {
-    set->poll();
-    bool saturated = false;
-    for (UniquePointer<NetworkStack>& stack : set->stacks_) saturated = saturated || stack->saturated();
-    if (saturated) continue;  // frames are still waiting: no interrupt will say so again
-    // Everything was taken: the interfaces may interrupt again (an interrupt masks itself until then, so a burst costs one).
-    for (UniquePointer<NetworkStack>& stack : set->stacks_) stack->interface().rearm_interrupts();
-    // Interfaces that interrupt wake this thread when frames arrive; then it only has to wake up by itself for the stacks' timers. One that is
-    // polled keeps the short period.
-    set->activity_.wait(set->interrupt_driven() ? kInterruptIdleUs : kPolledIdleUs);
+  Worker* worker = static_cast<Worker*>(self);
+  NetworkStack& stack = *worker->stack;
+  while (!__atomic_load_n(&worker->set->stop_, __ATOMIC_ACQUIRE)) {
+    stack.poll();
+    if (stack.saturated()) continue;  // frames are still waiting: no interrupt will say so again
+    // Everything was taken: the interface may interrupt again (an interrupt masks itself until then, so a burst costs one).
+    stack.interface().rearm_interrupts();
+    // An interface that interrupts wakes this thread when frames arrive; then it only has to wake up by itself for the stack's timers. One
+    // that is polled keeps the short period, and so does a stack whose frames wait for room in the interface (it may not interrupt when it
+    // has sent some).
+    const bool soon = !stack.interface().interrupts_enabled() || stack.backlogged();
+    worker->activity.wait(soon ? kPolledIdleUs : kInterruptIdleUs);
   }
 }
 

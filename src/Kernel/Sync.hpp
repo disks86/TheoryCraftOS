@@ -35,6 +35,8 @@ class Mutex {
   void lock();
   bool try_lock();
   void unlock();
+  // Some thread is waiting for it (a hint, true or false a moment later): a holder doing a long job in steps can let it go between them.
+  bool contended() const { return __atomic_load_n(&waiters_, __ATOMIC_RELAXED) != 0; }
 
  private:
   uint32_t state_ = 0;    // 1 while held
@@ -91,6 +93,8 @@ class RecursiveMutex {
       mutex_.unlock();
     }
   }
+  // Another thread is waiting for it (see Mutex::contended).
+  bool contended() const { return mutex_.contended(); }
   // True if the calling thread holds it.
   bool held_by_me() const { return __atomic_load_n(&owner_, __ATOMIC_RELAXED) == current_thread(); }
 

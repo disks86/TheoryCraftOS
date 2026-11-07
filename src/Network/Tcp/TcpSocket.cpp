@@ -70,6 +70,7 @@ void TcpSocket::prepare_to_connect(uint16_t local_port, uint32_t initial_sequenc
   iss_ = initial_sequence;
   snd_una_ = iss_;
   snd_nxt_ = iss_ + 1;  // the SYN occupies one sequence number
+  snd_max_ = snd_nxt_;
   rto_ms_ = kInitialRtoMs;
   if (!send_buffer_.reserve(kBufferSize) || !receive_buffer_.reserve(kBufferSize)) failed_ = true;
 }
@@ -211,20 +212,69 @@ bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, ui
 // Sends whatever the peer's window and our send buffer allow, then the FIN if
 // the application has closed and everything is out. Where the interface cuts segments into frames (segmentation offload), what fits goes
 // in one large segment instead of one per MSS.
+uint32_t TcpSocket::initial_window() const {
+  const uint32_t mss = send_mss();
+  const uint32_t ten = 10 * mss, floor = 2 * mss > 14600 ? 2 * mss : 14600;   // RFC 6928: min(10*MSS, max(2*MSS, 14600))
+  return ten < floor ? ten : floor;
+}
+
+// Loss: a fast retransmit (three duplicate ACKs) halves the window; a retransmission timeout starts again from one segment.
+void TcpSocket::on_congestion(bool timeout) {
+  const uint32_t mss = send_mss();
+  const uint32_t flight = snd_nxt_ - snd_una_;
+  ssthresh_ = flight / 2 > 2 * mss ? flight / 2 : 2 * mss;   // RFC 5681 (4)
+  cwnd_ = timeout ? mss : ssthresh_;
+  bytes_acked_ = 0;
+  in_recovery_ = !timeout;
+  recover_ = snd_nxt_;
+}
+
+// New data acknowledged: slow start below ssthresh_ (at most two segments per ACK, RFC 3465), one segment per window's worth above it.
+void TcpSocket::grow_window(uint32_t acked) {
+  const uint32_t mss = send_mss();
+  if (cwnd_ == 0) return;
+  if (in_recovery_) {
+    if (!seq_ge(snd_una_, recover_)) return;   // a partial ACK: still recovering (go-back-N already resends the rest)
+    in_recovery_ = false;
+    cwnd_ = ssthresh_;                          // RFC 6582: the window after recovery
+    return;
+  }
+  if (cwnd_ < ssthresh_) {
+    cwnd_ += acked < 2u * mss ? acked : 2u * mss;
+  } else {
+    bytes_acked_ += acked;
+    if (bytes_acked_ >= cwnd_) {
+      bytes_acked_ -= cwnd_;
+      cwnd_ += mss;
+    }
+  }
+  if (cwnd_ > kMaxCongestionWindow) cwnd_ = kMaxCongestionWindow;
+}
+
 void TcpSocket::output() {
   const bool may_send_data = state_ == TcpState::Established || state_ == TcpState::CloseWait ||
                              state_ == TcpState::FinWait1 || state_ == TcpState::LastAck;
   if (!may_send_data) return;
 
-  const uint16_t mss = peer_mss_ < our_mss() ? peer_mss_ : our_mss();
+  const uint16_t mss = send_mss();
   const uint32_t burst = ip_.max_segmented_payload(remote_);
+  const uint64_t now = ip_.now_ms();
+  if (cwnd_ == 0) {
+    cwnd_ = initial_window();
+  } else if (snd_nxt_ == snd_una_ && last_send_ms_ && now - last_send_ms_ > rto_ms_) {   // idle for longer than an RTO: RFC 5681 4.1
+    const uint32_t restart = initial_window();
+    if (cwnd_ > restart) cwnd_ = restart;
+  }
   for (;;) {
     const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);  // data only
     if (fin_sent_) break;  // nothing follows a FIN
     const uint32_t unsent = send_buffer_.size() > in_flight ? send_buffer_.size() - in_flight : 0;
-    const uint32_t window_room = snd_wnd_ > in_flight ? snd_wnd_ - in_flight : 0;
+    const uint32_t limit = snd_wnd_ < cwnd_ ? snd_wnd_ : cwnd_;   // the receiver's window and the network's
+    // (a zero receive window is probed by on_timer; a congestion window smaller than a segment still lets one segment out)
+    const uint32_t window_room = limit > in_flight ? limit - in_flight : (in_flight == 0 && snd_wnd_ > 0 ? mss : 0);
     uint32_t n = unsent < window_room ? unsent : window_room;
     if (n == 0) break;
+    if (ip_.queued_for(remote_, local_port_, remote_port_) >= kMaxQueuedFrames) break;   // its frames wait for the interface: hold back
     if (n > mss && burst > 20u + mss) {  // several segments' worth, cut by the interface
       if (n > burst - 20) n = burst - 20;
       if (n > kBufferSize) n = kBufferSize;
@@ -243,7 +293,8 @@ void TcpSocket::output() {
       timed_sequence_ = snd_nxt_ + n;
       timed_at_ = ip_.now_ms();
     }
-    snd_nxt_ += n;
+    advance_next(n);
+    last_send_ms_ = now;
     if (!timer_deadline_) arm_timer();
   }
 
@@ -251,8 +302,8 @@ void TcpSocket::output() {
   const uint32_t in_flight = snd_nxt_ - snd_una_;
   if (close_requested_ && !fin_sent_ && send_buffer_.size() == in_flight) {
     send_segment(tcp_flags::kFin | tcp_flags::kAck, snd_nxt_, ConstByteView(), false);
-    fin_sent_ = true;
-    ++snd_nxt_;
+    fin_sent_ = fin_ever_sent_ = true;
+    advance_next(1);
     if (state_ == TcpState::Established) enter(TcpState::FinWait1);
     else if (state_ == TcpState::CloseWait) enter(TcpState::LastAck);
     if (!timer_deadline_) arm_timer();
@@ -383,7 +434,7 @@ void TcpSocket::on_segment(const TcpSegment& s) {
 
 void TcpSocket::process_ack(const TcpSegment& s) {
   using namespace tcp_flags;
-  if (seq_gt(s.acknowledgement, snd_nxt_)) {  // acknowledges something we have not sent
+  if (seq_gt(s.acknowledgement, snd_max_)) {  // acknowledges something we have not sent
     send_ack();
     return;
   }
@@ -400,12 +451,14 @@ void TcpSocket::process_ack(const TcpSegment& s) {
 
   if (seq_gt(s.acknowledgement, snd_una_)) {
     uint32_t acked = s.acknowledgement - snd_una_;
-    if (fin_sent_ && s.acknowledgement == snd_nxt_) {  // the FIN is acknowledged too
-      fin_acked_ = true;
+    if (fin_ever_sent_ && s.acknowledgement == snd_max_) {  // the FIN is acknowledged too
+      fin_acked_ = fin_sent_ = true;
       --acked;
     }
     send_buffer_.discard(acked);
     snd_una_ = s.acknowledgement;
+    if (seq_gt(snd_una_, snd_nxt_)) snd_nxt_ = snd_una_;   // (data sent before a go-back-N had arrived after all)
+    grow_window(acked);
     sample_rtt(s.acknowledgement);
     retries_ = 0;
     duplicate_acks_ = 0;
@@ -420,6 +473,7 @@ void TcpSocket::process_ack(const TcpSegment& s) {
   } else if (s.acknowledgement == snd_una_ && s.data.empty() && snd_una_ != snd_nxt_ && s.window == old_window &&
              !(s.flags & kFin)) {
     if (++duplicate_acks_ == 3) {  // fast retransmit: the receiver keeps asking for the same byte
+      if (!in_recovery_) on_congestion(false);
       rollback_for_retransmission();
       output();
     }
@@ -503,6 +557,7 @@ void TcpSocket::on_timer(uint64_t now) {
     } else if (state_ == TcpState::SynReceived) {
       send_segment(tcp_flags::kSyn | tcp_flags::kAck, iss_, ConstByteView(), true);
     } else {
+      if (cwnd_) on_congestion(true);
       rollback_for_retransmission();
       output();
     }
@@ -521,10 +576,14 @@ void TcpSocket::on_timer(uint64_t now) {
     uint8_t probe;
     send_buffer_.peek(0, ByteView(&probe, 1));
     send_segment(tcp_flags::kAck, snd_nxt_, ConstByteView(&probe, 1), false);
-    ++snd_nxt_;
+    advance_next(1);
     arm_timer();
     persist_deadline_ = 0;
   }
+
+  // Data that held back while its frames waited in the stack's transmit queue (see output()) goes once they have gone out.
+  const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);
+  if (!fin_sent_ && send_buffer_.size() > in_flight && snd_wnd_ > 0) output();
 }
 
 }  // namespace network

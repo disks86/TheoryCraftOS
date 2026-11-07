@@ -158,6 +158,7 @@ add_executable(BOOTX64
   src/Network/Checksum.cpp
   src/Network/NetworkStack.cpp
   src/Network/NetworkStackIpv6.cpp
+  src/Network/EgressQueue.cpp
   src/Network/Snmp/SnmpMessage.cpp
   src/Network/Snmp/SnmpUsm.cpp
   src/Network/Snmp/SnmpTrap.cpp

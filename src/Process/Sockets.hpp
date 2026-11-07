@@ -97,6 +97,10 @@ class SocketManager {
   // True if send() would not block (always, in this polled model, once connected: the 16 KiB send buffer rarely fills against a wait()); for select()'s write set.
   bool ready_to_write(uint32_t id) const;
   bool has_error(uint32_t id) const;  // for select()'s exception set
+  // See IStackProvider: read progress() before an attempt that may block; wait_for_progress() returns when some stack did something (or the
+  // timeout passed), false if the stacks cannot be waited on that way (then the caller sleeps).
+  uint64_t progress() const { return stacks_.progress(); }
+  bool wait_for_progress(uint64_t seen, uint64_t timeout_us) { return stacks_.wait_for_progress(seen, timeout_us); }
 
  private:
   struct Socket {

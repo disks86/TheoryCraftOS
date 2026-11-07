@@ -49,15 +49,24 @@ inline bool seq_ge(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) 
 // The default ITcpSocket: the RFC 793 state machine with the retransmission
 // timer of RFC 6298 (smoothed RTT, exponential back-off, Karn's rule), fast
 // retransmit after three duplicate ACKs, receive-window flow control and zero
-// window probing. Loss recovery is go-back-N, out-of-order segments are dropped
-// (the sender retransmits them), and there is no congestion control: it is meant
-// for local networks and modest transfers.
+// window probing, and congestion control (RFC 5681 slow start and congestion
+// avoidance with appropriate byte counting, RFC 6582's recovery after a fast
+// retransmit, RFC 6928's initial window of ten segments, the restart window after
+// an idle period), so that connections sharing a bottleneck share it. Loss recovery
+// is go-back-N and out-of-order segments are dropped (the sender retransmits them).
+// A connection also holds back while kMaxQueuedFrames of its frames wait in the
+// stack's transmit queue (IIpLayer::queued_for), so a bulk sender cannot fill that
+// queue ahead of the others.
 class TcpSocket final : public ITcpSocket {
  public:
   static constexpr uint32_t kBufferSize = 16384;  // each of the send and receive buffers
   static constexpr uint32_t kBacklog = 8;
   static constexpr uint32_t kMaxRetries = 8;
   static constexpr uint32_t kTimeWaitMs = 2000;
+  // (enough for the queue to hold each busy connection through a burst of room the interface makes at once: with 2, the connection whose ACKs
+  // came first took what the queue left, and two bulk connections through a bottleneck split it 3:1; 4 splits it evenly)
+  static constexpr uint32_t kMaxQueuedFrames = 4;
+  static constexpr uint32_t kMaxCongestionWindow = 1u << 20;
 
   TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& allocator);
   ~TcpSocket();
@@ -113,6 +122,16 @@ class TcpSocket final : public ITcpSocket {
     return remote_port_;
   }
 
+  // Congestion control state, for tests and statistics.
+  uint32_t congestion_window() const {
+    StackLock guard(ip_);
+    return cwnd_;
+  }
+  uint32_t slow_start_threshold() const {
+    StackLock guard(ip_);
+    return ssthresh_;
+  }
+
   // --- used by TcpManager
   bool matches(const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port) const {
     return state_ != TcpState::Listen && state_ != TcpState::Closed && local_port_ == local_port &&
@@ -157,6 +176,10 @@ class TcpSocket final : public ITcpSocket {
   void rollback_for_retransmission();
   void arm_timer();
   void sample_rtt(uint32_t acknowledged_up_to);
+  uint16_t send_mss() const { return peer_mss_ < our_mss() ? peer_mss_ : our_mss(); }
+  uint32_t initial_window() const;
+  void on_congestion(bool timeout);
+  void grow_window(uint32_t acked);
   void fail();
 
   IIpLayer& ip_;
@@ -173,10 +196,18 @@ class TcpSocket final : public ITcpSocket {
 
   // Send side.
   uint32_t iss_ = 0, snd_una_ = 0, snd_nxt_ = 0, snd_wnd_ = 0, snd_wl1_ = 0, snd_wl2_ = 0;
+  // The highest sequence number sent so far: go-back-N moves snd_nxt_ back, and the peer may then acknowledge what it had already received,
+  // past snd_nxt_ but not past this.
+  uint32_t snd_max_ = 0;
+  void advance_next(uint32_t n) {
+    snd_nxt_ += n;
+    if (seq_gt(snd_nxt_, snd_max_)) snd_max_ = snd_nxt_;
+  }
   ByteRing send_buffer_;      // bytes from snd_una_ on: unacknowledged first, then unsent
   bool close_requested_ = false;
   bool fin_sent_ = false;
   bool fin_acked_ = false;
+  bool fin_ever_sent_ = false;   // (fin_sent_ is cleared by go-back-N; this is not: the FIN's sequence number is snd_max_ - 1)
   uint16_t peer_mss_ = 536;
   // Receive side.
   uint32_t irs_ = 0, rcv_nxt_ = 0;
@@ -194,6 +225,11 @@ class TcpSocket final : public ITcpSocket {
   bool timing_ = false;           // an RTT measurement is in progress
   uint32_t timed_sequence_ = 0;
   uint64_t timed_at_ = 0;
+  // Congestion control (bytes). cwnd_ 0: not started (the initial window is set when the first data goes out, once the peer's MSS is known).
+  uint32_t cwnd_ = 0, ssthresh_ = kMaxCongestionWindow, bytes_acked_ = 0;
+  bool in_recovery_ = false;
+  uint32_t recover_ = 0;          // snd_nxt_ when loss was detected: recovery ends when everything up to it is acknowledged
+  uint64_t last_send_ms_ = 0;
 
   bool failed_ = false;
   bool established_event_ = false;
