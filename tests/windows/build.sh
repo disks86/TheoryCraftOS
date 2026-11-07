@@ -89,6 +89,8 @@ $cc -O1 -Wall -o "$out/ws2eventtest.exe" tests/windows/ws2eventtest.c -lws2_32
 echo "built $out/ws2eventtest.exe (ws2_32: WSA events, WSAEventSelect, overlapped WSARecv/WSASend, WSAIoctl, protocol catalogue, GetAddrInfoExW)"
 $cc -O1 -Wall -o "$out/crypt32test.exe" tests/windows/crypt32test.c -lcrypt32 -lsecur32
 echo "built $out/crypt32test.exe (crypt32: DPAPI round trip, CryptProtectMemory, certificate stores; secur32 GetUserNameExW)"
+$cc -O1 -Wall -o "$out/shmregiontest.exe" tests/windows/shmregiontest.c
+echo "built $out/shmregiontest.exe (sections as Chromium hands them on: NtQuerySection, DuplicateHandle through a process handle, read-only handles, 64 KiB-aligned views)"
 x86_64-w64-mingw32-windres tests/windows/user32misctest.rc -O coff -o "$out/user32misctest_rc.o"
 $cc -O1 -Wall -o "$out/user32misctest.exe" tests/windows/user32misctest.c "$out/user32misctest_rc.o" -luser32 -lgdi32
 echo "built $out/user32misctest.exe (user32: rectangles, LoadString, window stations and desktops, notifications)"

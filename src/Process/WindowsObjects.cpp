@@ -1552,8 +1552,14 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
   if (view == 0 || view > info.size - offset) view = info.size - offset;
   uint64_t bytes = 0;
   if (!AddressSpace::round_up(view, &bytes)) return kInvalidParameter;
-  if (base == 0) {
-    if (!space->find_free(bytes, 0x00007FF500000000ull, &base)) return kNoResources;
+  if (base == 0) {      // views begin on the allocation granularity (64 KiB), as on Windows: programs round a view's address down to it to unmap the view
+    uint64_t hint = 0x00007FF500000000ull;
+    for (uint32_t attempt = 0;; ++attempt) {
+      if (attempt >= 256 || !space->find_free(bytes, hint, &base)) return kNoResources;
+      const uint64_t aligned = (base + 0xFFFF) & ~uint64_t{0xFFFF};
+      if (aligned == base) break;
+      hint = aligned;
+    }
   } else if (base % 4096 != 0) {
     return kInvalidParameter;
   }

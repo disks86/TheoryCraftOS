@@ -354,6 +354,22 @@ void log_exception(Task* task, uint32_t code, uint64_t rip, uint64_t address, ui
   put_code_address(modules, rip);
   console::puts(" address ");
   console::put_hex(address);
+  process::AddressSpace& space = task->program.address_space();      // what is mapped there: the region and its neighbour below
+  const uint64_t index = space.region_index(address);
+  process::AddressSpace::RegionInfo region;
+  for (uint64_t i = index > 0 ? index - 1 : 0; i <= index && space.region_at(i, &region); ++i) {
+    console::puts(i < index || region.base > address ? "\n    region below/after " : "\n    region ");
+    console::put_hex(region.base);
+    console::puts("+");
+    console::put_hex(region.size);
+    console::puts(" prot ");
+    console::put_dec(region.protection);
+    console::puts(" protect ");
+    console::put_hex(region.attributes.protect);
+    console::puts(region.attributes.reserved ? " reserved" : "");
+    console::puts(region.storage ? " shared" : " private");
+    console::puts(region.attributes.type == process::PageAttributes::Mapped ? " view" : region.attributes.type == process::PageAttributes::Image ? " image" : "");
+  }
   console::puts("\n");
   uint8_t raw[1024] = {};      // what may be return addresses: the words on its stack that point into a module
   if (!task->program.address_space().read_privileged(rsp, ByteView(raw, sizeof raw)) && !task->program.address_space().read_privileged(rsp, ByteView(raw, 128))) return;

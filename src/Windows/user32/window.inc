@@ -576,10 +576,12 @@ static HANDLE create_window(DWORD ex_style, const WCHAR *class_name, const WCHAR
   if ((ex_style & 0x40 /* WS_EX_MDICHILD */) && parent && !g_mdi_creating && is_mdi_client(parent)) return mdi_create_through_client(parent, class_name, title, style, x, y, cx, cy, instance, params, ansi);
   us_name(&class_us, class_name);
   if (title) us_name(&title_us, title);
-  const HANDLE given_instance = instance;      /* (an MDI child keeps the owner it was given in its CREATESTRUCT, even none) */
+  /* (an MDI child keeps the owner it was given in its CREATESTRUCT, even none; and no instance finds the process's class of that name whatever module registered it,
+     as on Windows: a browser registers its classes from its DLL and creates the windows with no instance) */
+  const HANDLE given_instance = instance;
   if (!instance) instance = GetModuleHandleW(NULL);
   return (HANDLE)NtUserCreateWindowEx(ex_style, (ULONG_PTR)&class_us, (ULONG_PTR)&version_us, title ? (ULONG_PTR)&title_us : 0, style, (ULONG_PTR)(LONG_PTR)x, (ULONG_PTR)(LONG_PTR)y,
-                                       (ULONG_PTR)(LONG_PTR)cx, (ULONG_PTR)(LONG_PTR)cy, (ULONG_PTR)parent, (ULONG_PTR)menu, (ULONG_PTR)(g_mdi_creating ? given_instance : instance), (ULONG_PTR)params, 0, (ULONG_PTR)instance,
+                                       (ULONG_PTR)(LONG_PTR)cx, (ULONG_PTR)(LONG_PTR)cy, (ULONG_PTR)parent, (ULONG_PTR)menu, (ULONG_PTR)(g_mdi_creating || !given_instance ? given_instance : instance), (ULONG_PTR)params, 0, (ULONG_PTR)instance,
                                        (ULONG_PTR)class_name, 0);
 }
 EXPORT HANDLE WINAPI CreateWindowExW(DWORD ex_style, const WCHAR *class_name, const WCHAR *title, DWORD style, int x, int y, int cx, int cy, HANDLE parent, HANDLE menu, HANDLE instance, void *params) {

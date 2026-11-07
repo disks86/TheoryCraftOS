@@ -174,8 +174,12 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
   } else {
     uint64_t at = 0;
     const uint64_t hint = (target.mmap_cursor() + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
-    if (!space->find_free(rounded, hint, &at)) return kStatusNoMemory;
-    at = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);      // reservations begin on the allocation granularity
+    for (uint64_t probe = hint, attempt = 0;; ++attempt) {      // reservations begin on the allocation granularity: a free place that starts on it
+      if (attempt >= 256 || !space->find_free(rounded, probe, &at)) return kStatusNoMemory;
+      const uint64_t aligned = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
+      if (aligned == at) break;
+      probe = aligned;
+    }
     if (!space->map(at, rounded, prot)) return kStatusNoMemory;
     set_private_attributes(*space, at, rounded, protect, type);
     target.set_mmap_cursor(at + rounded);
