@@ -22,6 +22,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Kernel/Rcu.hpp"
 #include "Network/NetworkTypes.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Utility/SharedPointer.hpp"
 
 namespace network {
@@ -55,20 +56,27 @@ inline uint32_t hash_connection(uint16_t local_port, uint16_t remote_port, const
 // serialised by the caller's lock; a removed node is unlinked at once and freed after a grace period in the table's own RCU domain, so the
 // deleters - which may drop the last reference to a socket - run on the network's threads, not wherever some other domain polls.
 //
-// kBuckets is fixed (a power of two): with this OS's connection counts the chains stay short; a table that must hold many thousands of sockets
-// would want more of them.
-template <class Socket, uint32_t kBuckets = 256>
+// The bucket array grows (doubling past two entries a bucket) and shrinks (halving below one in four, never under kMinBuckets) with what the
+// table holds. A resize builds a new array with copies of every node, publishes it with one rcu_assign_pointer, and retires the old array and
+// nodes: a reader already in the old one finishes its walk there (it is intact until the grace period ends), later readers see only the new
+// one. A resize that runs out of memory leaves the table as it was (only its chains are longer). Nothing exists until the first insert.
+template <class Socket, uint32_t kMinBuckets = 64>
 class RcuSocketTable {
-  static_assert((kBuckets & (kBuckets - 1)) == 0, "a power of two");
+  static_assert(kMinBuckets && (kMinBuckets & (kMinBuckets - 1)) == 0, "a power of two");
 
  public:
+  static constexpr uint32_t kMaxBuckets = 1u << 20;
+
   explicit RcuSocketTable(allocators::IAllocator& allocator) : allocator_(allocator) {}
   ~RcuSocketTable() {
-    for (uint32_t b = 0; b < kBuckets; ++b)
-      while (Node* n = heads_[b]) {
-        heads_[b] = n->next;
-        n->retire(Free{}, domain_);
-      }
+    if (Buckets* b = buckets_) {
+      for (Node*& head : b->heads)
+        while (Node* n = head) {
+          head = n->next;
+          n->retire(FreeNode{}, domain_);
+        }
+      b->retire(FreeBuckets{}, domain_);
+    }
     domain_.barrier();   // (every retired node is freed before the domain and the allocator its deleters use go away)
   }
   RcuSocketTable(const RcuSocketTable&) = delete;
@@ -76,13 +84,16 @@ class RcuSocketTable {
 
   // Writer (the caller's lock held): adds `socket` under `key` in the bucket of `hash`. False if out of memory.
   bool insert(uint32_t hash, const SocketKey& key, const SharedPointer<Socket>& socket) {
-    void* memory = allocator_.allocate(sizeof(Node));
-    if (!memory) return false;
-    Node* node = new (memory) Node();   // (placement new into allocator memory: RCU ends the node's life, not an owner - see Free)
-    node->key = key;
-    node->socket = socket;
-    node->allocator = &allocator_;
-    Node** head = &heads_[hash & (kBuckets - 1)];
+    if (!buckets_) {
+      Buckets* first = make_buckets(kMinBuckets);
+      if (!first) return false;
+      kernel::rcu_assign_pointer(&buckets_, first);
+    }
+    const uint32_t held = count();
+    if (held >= 2 * bucket_count() && bucket_count() < kMaxBuckets) resize(2 * bucket_count());   // (failing is fine: longer chains)
+    Node* node = make_node(hash, key, socket);
+    if (!node) return false;
+    Node** head = &buckets_->heads[hash & buckets_->mask];
     node->next = *head;
     kernel::rcu_assign_pointer(head, node);   // (published whole: a reader sees the node with its key and socket, or not at all)
     __atomic_fetch_add(&count_, 1, __ATOMIC_RELAXED);
@@ -91,12 +102,14 @@ class RcuSocketTable {
 
   // Writer: removes `socket`'s node from the bucket of `hash` (readers already in it may still see it until they leave). False if not there.
   bool remove(uint32_t hash, const Socket* socket) {
-    Node** link = &heads_[hash & (kBuckets - 1)];
+    if (!buckets_) return false;
+    Node** link = &buckets_->heads[hash & buckets_->mask];
     for (Node* n = *link; n; link = &n->next, n = *link) {
       if (n->socket.get() != socket) continue;
       kernel::rcu_assign_pointer(link, n->next);
-      n->retire(Free{}, domain_);
-      __atomic_fetch_sub(&count_, 1, __ATOMIC_RELAXED);
+      n->retire(FreeNode{}, domain_);
+      const uint32_t held = __atomic_sub_fetch(&count_, 1, __ATOMIC_RELAXED);
+      if (bucket_count() > kMinBuckets && held < bucket_count() / 4) resize(bucket_count() / 2);
       return true;
     }
     return false;
@@ -106,7 +119,9 @@ class RcuSocketTable {
   template <typename Match>
   SharedPointer<Socket> find(uint32_t hash, Match&& match) const {
     kernel::RcuReader reader(domain_);
-    for (const Node* n = kernel::rcu_dereference(&heads_[hash & (kBuckets - 1)]); n; n = kernel::rcu_dereference(&n->next))
+    const Buckets* b = kernel::rcu_dereference(&buckets_);
+    if (!b) return SharedPointer<Socket>();
+    for (const Node* n = kernel::rcu_dereference(&b->heads[hash & b->mask]); n; n = kernel::rcu_dereference(&n->next))
       if (match(n->key, *n->socket)) return n->socket;
     return SharedPointer<Socket>();
   }
@@ -116,32 +131,117 @@ class RcuSocketTable {
   template <typename Visit>
   bool any(uint32_t hash, Visit&& visit) const {
     kernel::RcuReader reader(domain_);
-    for (const Node* n = kernel::rcu_dereference(&heads_[hash & (kBuckets - 1)]); n; n = kernel::rcu_dereference(&n->next))
+    const Buckets* b = kernel::rcu_dereference(&buckets_);
+    if (!b) return false;
+    for (const Node* n = kernel::rcu_dereference(&b->heads[hash & b->mask]); n; n = kernel::rcu_dereference(&n->next))
       if (visit(n->key, *n->socket)) return true;
     return false;
   }
 
   uint32_t count() const { return __atomic_load_n(&count_, __ATOMIC_RELAXED); }   // (changed by writers, read by anyone)
+  // The current number of buckets (0 before the first insert; writers' view, for tests).
+  uint32_t bucket_count() const { return buckets_ ? buckets_->mask + 1 : 0; }
 
  private:
   struct Node;
-  struct Free {
+  struct Buckets;
+  struct FreeNode {
     void operator()(Node* node) const {
       allocators::IAllocator* allocator = node->allocator;
       node->~Node();
       allocator->deallocate(node);
     }
   };
-  struct Node : kernel::RcuObjectBase<Node, Free> {
+  struct FreeBuckets {
+    void operator()(Buckets* buckets) const {
+      allocators::IAllocator* allocator = buckets->allocator;
+      release_view(*allocator, buckets->heads);
+      buckets->~Buckets();
+      allocator->deallocate(buckets);
+    }
+  };
+  struct Node : kernel::RcuObjectBase<Node, FreeNode> {
+    uint32_t hash = 0;
     SocketKey key;
     SharedPointer<Socket> socket;
     Node* next = nullptr;
     allocators::IAllocator* allocator = nullptr;
   };
+  struct Buckets : kernel::RcuObjectBase<Buckets, FreeBuckets> {
+    ArrayView<Node*> heads;
+    uint32_t mask = 0;
+    allocators::IAllocator* allocator = nullptr;
+  };
+
+  // (placement new into allocator memory: RCU ends these objects' lives, not an owner - see FreeNode and FreeBuckets)
+  Node* make_node(uint32_t hash, const SocketKey& key, const SharedPointer<Socket>& socket) {
+    void* memory = allocator_.allocate(sizeof(Node));
+    if (!memory) return nullptr;
+    Node* node = new (memory) Node();
+    node->hash = hash;
+    node->key = key;
+    node->socket = socket;
+    node->allocator = &allocator_;
+    return node;
+  }
+  Buckets* make_buckets(uint32_t count) {
+    ArrayView<Node*> heads = allocate_view<Node*>(allocator_, count);
+    if (heads.empty()) return nullptr;
+    for (Node*& head : heads) head = nullptr;
+    void* memory = allocator_.allocate(sizeof(Buckets));
+    if (!memory) {
+      release_view(allocator_, heads);
+      return nullptr;
+    }
+    Buckets* buckets = new (memory) Buckets();
+    buckets->heads = heads;
+    buckets->mask = count - 1;
+    buckets->allocator = &allocator_;
+    return buckets;
+  }
+
+  // (writer) Moves every entry into a new array of `count` buckets; nothing changes if memory runs out.
+  void resize(uint32_t count) {
+    Buckets* old = buckets_;
+    Buckets* fresh = make_buckets(count);
+    if (!fresh) return;
+    bool complete = true;
+    for (Node* head : old->heads) {
+      for (Node* n = head; n && complete; n = n->next) {
+        Node* copy = make_node(n->hash, n->key, n->socket);
+        if (!copy) {
+          complete = false;
+          break;
+        }
+        Node*& to = fresh->heads[n->hash & fresh->mask];
+        copy->next = to;
+        to = copy;   // (not published yet: the array goes out whole below)
+      }
+      if (!complete) break;
+    }
+    if (!complete) {   // never published, so nobody can be reading it: freed at once
+      for (Node* head : fresh->heads)
+        while (Node* n = head) {
+          head = n->next;
+          FreeNode{}(n);
+        }
+      FreeBuckets{}(fresh);
+      return;
+    }
+    kernel::rcu_assign_pointer(&buckets_, fresh);
+    // (the old array is left as it is - readers may be walking it - and freed with its nodes after the grace period)
+    for (Node* head : old->heads)
+      for (Node* n = head; n;) {
+        Node* next = n->next;
+        n->retire(FreeNode{}, domain_);
+        n = next;
+      }
+    old->retire(FreeBuckets{}, domain_);
+  }
 
   allocators::IAllocator& allocator_;
   mutable kernel::RcuDomain domain_;
-  Node* heads_[kBuckets] = {};
+  Buckets* buckets_ = nullptr;
   uint32_t count_ = 0;
 };
 

@@ -23,11 +23,11 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
      the stack itself (`configure`, `start_dhcp`).
   3. **A TLS connection's own lock**. TLS work (handshake arithmetic, record encryption) no longer runs under the stack's lock, so
      connections do it at the same time.
-  4. **A TCP or UDP socket's own lock**. A listener's lock may be held when one of its new connections' is taken, never the other way round.
-     A TCP connection's is never waited for on the receive path (see "Within one connection" below).
+  4. **A TCP socket's own lock**. A listener's lock may be held when one of its new connections' is taken, never the other way round.
+     It is never waited for on the receive path (see "Within one connection" below). UDP sockets have no such lock any more.
   5. **The socket tables' writers' lock** (`TcpManager`, `UdpManager`), **a listener's accept queue's, and a TCP connection's leaf locks**
-     (its send buffer, its receive buffer, its peer address, its backlog). These are only ever taken for a short change or copy, never
-     while calling into a socket. Lookups take no lock at all (below).
+     (its send buffer, its receive buffer, its peer address, its backlog), **and a UDP socket's queue lock**. These are only ever taken for
+     a short change or copy, never while calling into a socket. Lookups take no lock at all (below).
   6. **The IP lock** (`ip_lock_`, fair, recursive). It covers everything of the IP layer:
      - addresses (IPv4 and IPv6, with their autoconfiguration)
      - the ARP and neighbor caches, and the packets waiting for them or for the loopback
@@ -40,11 +40,22 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
   It is then handled by its socket (below). ARP, ICMP and neighbor discovery take the IP lock; the loopback is delivered by the control
   poll. Timers run over a snapshot of the table.
 - **The socket tables are hash tables read with RCU** (`RcuSocketTable.hpp`, after the CLAUDE.md rule for read-mostly lookup tables):
-  connections hashed by both ports and the peer's address (1024 buckets), listeners and UDP ports by port. A lookup walks one bucket in
-  an RCU read-side section and copies out the socket's `SharedPointer`, with no lock and no write to shared memory, so receive queues do
-  not contend on the table however many connections there are. Opening and closing take the table's writer lock, unlink the node with
+  connections hashed by both ports and the peer's address, listeners and UDP ports by port. A lookup walks one bucket in an RCU read-side
+  section and copies out the socket's `SharedPointer`, with no lock and no write to shared memory, so receive queues do not contend on
+  the table however many connections there are. Opening and closing take the table's writer lock, unlink the node with
   `rcu_assign_pointer`, and retire it to the table's own RCU domain, which frees it after a grace period. A registry (a `Dictionary` by
   socket, under the same lock) holds every socket for the timers and for reaping.
+- **The tables resize themselves.** The bucket array doubles when the table holds two entries a bucket, and halves below one in four,
+  never under its least size (256 for connections, 16 for listeners, 32 for UDP ports) and never over 2^20. A resize:
+  - builds a new array holding copies of every node;
+  - publishes it with one `rcu_assign_pointer`;
+  - retires the old array and its nodes without touching them. A reader already walking the old array finishes there, and later readers
+    see only the new one.
+
+  If memory runs out partway, the half-built array is freed at once (nobody could have seen it) and the table stays as it was.
+- **UDP delivery waits for nobody.** A UDP socket's only lock is its datagram queue's, held while one datagram is copied in or out.
+  Sending takes no lock (the port and IP versions never change, and `closed` is atomic), so the receive threads never wait for an
+  application's send, and several threads send from one socket at once.
 - **Within one connection** (after Linux's socket ownership, `TcpSocket.hpp`), nobody waits for another's protocol work:
   - The protocol state is under the connection's lock, but every hold of it goes through `TcpSocket::Owner`, whose release first runs the
     work that others left for the holder.
@@ -157,6 +168,16 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
   - The backlog, deterministically: a thread holds a connection while its peer sends. The segments go to the backlog (none is visible),
     another connection on the same machine is served meanwhile, and a `send()` on the held connection returns at once. When the holder
     lets go, the data is there and the reply goes out. With the old blocking receive and send paths put back, this check fails.
+  - One UDP socket with four sender threads and a reader thread, echoed by a thread on the other machine across two receive queues:
+    every echo is intact.
+- `RcuSocketTableTest` (built with ASan and with ThreadSanitizer) checks the table on its own:
+  - it grows to 4096 buckets for 5000 entries, keeps every entry findable, and shrinks back to its least size;
+  - a resize that runs out of memory partway leaves the table whole and frees its half-built copy;
+  - four readers look up 1000 fixed sockets while a writer churns 120 000 others through the table (38 resizes, up to 16384 buckets), and
+    no lookup misses.
+
+  A reader can be stranded only in the instant between loading the bucket array and reading a bucket's head. The stress test cannot
+  catch a resize that unlinks the old array in place (tried: it passes), so that rule rests on the code comment.
   - The loopback ping-pong latency.
   - Datagrams sent while a thread floods the interface.
 
@@ -169,9 +190,9 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
 - **Shared per-frame work.** The IP lock is taken for a moment per received frame (to look at the addresses) and per sent packet.
   Transmitting is serialized, since one transmit ring is shared. Both are short, but a read-mostly copy of the addresses (RCU) would take
   that lock off the receive path.
-- **The socket tables have a fixed bucket count** (1024 connections, 64 listeners, 128 UDP ports). Chains grow past a few thousand
-  connections, and there is no resizing (it would need a second table published with RCU).
-- **The UDP socket's own lock** is still taken by the receive path (a datagram is handed over under it); UDP sockets have no backlog.
+- **A resize is done by the writer that triggers it**, under the table's lock: growing a table of n entries copies n nodes while the
+  connect or close that triggered it waits. That is amortized over the n inserts before it, but one connect pays it all. An incremental
+  resize, which moves a few buckets on each change, is not done.
 - **CoDel's precision:** it works at the clock's millisecond, so its 5 ms target is coarse.
 - **TCP:** no timestamps (RFC 7323), no window scaling (the window stays within 16 KiB), and no RACK.
 - **Pacing** only applies on paths whose round trip is at least a millisecond.
