@@ -122,6 +122,16 @@ def canonical(name):
     n = name.lower().replace("/", "\\").split("\\")[-1]
     if "." not in n:
         n += ".dll"
+    if n.startswith("api-ms-win-core-winrt-"):
+        return "combase.dll"
+    if n.startswith("api-ms-win-power-"):
+        return "powrprof.dll"
+    if n.startswith("api-ms-win-shcore-"):
+        return "shcore.dll"
+    if n == "winspool.drv":
+        return "winspool.dll"
+    if n == "bthprops.cpl":
+        return "bthprops.dll"
     if n.startswith("api-ms-win-core-") or n.startswith("api-ms-win-eventing-") or n == "kernelbase.dll":
         return "kernel32.dll"
     if n.startswith("api-ms-win-security-"):

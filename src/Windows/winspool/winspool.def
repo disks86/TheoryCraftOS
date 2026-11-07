@@ -1,5 +1,7 @@
 LIBRARY winspool.dll
 EXPORTS
+; Programs linked with the Windows SDK import GetDefaultPrinterW from winspool.drv by its ordinal (chrome.dll does).
+GetDefaultPrinterW @203
 ; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
 ADVANCEDSETUPDIALOG @101
 AdvancedSetupDialog @102
@@ -102,7 +104,6 @@ EnumMonitorsA @199
 EnumMonitorsW @200
 GetDefaultPrinterA @201
 SetDefaultPrinterA @202
-GetDefaultPrinterW @203
 SetDefaultPrinterW @204
 EnumPortsA @225
 EnumPortsW @232
