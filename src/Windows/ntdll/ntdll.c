@@ -404,15 +404,21 @@ EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULO
  * something may take again). The libraries are told in load order when something starts and in the opposite order when it ends; the program's callbacks come first and last. */
 typedef void (NTAPI *TlsCallback)(PVOID, DWORD, PVOID);
 #define LDRP_DONT_CALL_FOR_THREADS 0x00040000u
-static volatile ULONG_PTR g_loader_owner;
-static volatile LONG g_loader_depth;
-static void loader_lock(void) {
-  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
-  if (g_loader_owner == me) { ++g_loader_depth; return; }
-  while (!__sync_bool_compare_and_swap(&g_loader_owner, 0, me)) NtYieldExecution();
-  g_loader_depth = 1;
+/* The loader lock is a critical section that PEB.LoaderLock (offset 0x110) points at, as on Windows: programs look at its OwningThread to tell whether they run under it. */
+EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs);
+static RTL_CRITICAL_SECTION g_loader_section = {NULL, -1, 0, NULL, NULL, 0};
+static void loader_publish(void) {
+  PRTL_CRITICAL_SECTION *slot = (PRTL_CRITICAL_SECTION *)((BYTE *)NtCurrentPeb() + 0x110);
+  if (*slot != &g_loader_section) *slot = &g_loader_section;
 }
-static void loader_unlock(void) { if (--g_loader_depth == 0) __sync_lock_release(&g_loader_owner); }
+static void loader_lock(void) {
+  loader_publish();
+  RtlEnterCriticalSection(&g_loader_section);
+}
+static void loader_unlock(void) { RtlLeaveCriticalSection(&g_loader_section); }
+#define g_loader_owner ((ULONG_PTR)g_loader_section.OwningThread)
+#define g_loader_depth (g_loader_section.RecursionCount)
 
 /* LdrLockLoaderLock(flags, &disposition, &cookie): flag 1 raises on error, flag 2 only tries. Disposition 1: taken, 2: someone else holds it (try only). The cookie is
  * what LdrUnlockLoaderLock wants back (it is the owner: a different thread may not release the lock). */

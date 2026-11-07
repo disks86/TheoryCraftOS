@@ -1,0 +1,4 @@
+LIBRARY dwrite.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+DWriteCreateFactory @1

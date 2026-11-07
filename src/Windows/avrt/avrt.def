@@ -1,0 +1,17 @@
+LIBRARY avrt.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+AvQuerySystemResponsiveness @2
+AvRevertMmThreadCharacteristics @4
+AvRtCreateThreadOrderingGroup @5
+AvRtCreateThreadOrderingGroupExA @6
+AvRtCreateThreadOrderingGroupExW @7
+AvRtDeleteThreadOrderingGroup @8
+AvRtJoinThreadOrderingGroup @9
+AvRtLeaveThreadOrderingGroup @10
+AvRtWaitOnThreadOrderingGroup @11
+AvSetMmMaxThreadCharacteristicsA @12
+AvSetMmMaxThreadCharacteristicsW @13
+AvSetMmThreadCharacteristicsA @14
+AvSetMmThreadCharacteristicsW @15
+AvSetMmThreadPriority @16

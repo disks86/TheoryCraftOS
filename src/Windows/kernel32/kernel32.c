@@ -955,6 +955,7 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
   }
   if (index >= d->NumberOfFunctions) return NULL;
   const ULONG rva = functions[index];
+  if (rva == 0) return NULL;      /* (a gap in the numbers: no function has that ordinal) */
   if (rva >= dir_rva && rva < dir_rva + dir_size) {      /* a forwarder: "DLL.Function" or "DLL.#ordinal" */
     const char *forward = (const char *)(base + rva);
     WCHAR library[64];

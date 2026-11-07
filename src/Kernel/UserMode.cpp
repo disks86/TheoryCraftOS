@@ -324,6 +324,51 @@ Frame* on_syscall(Frame* frame, void*) {
   return frame;
 }
 
+// Each exception a processor fault raises in a Windows program goes to the debug console (the first 64 of each program): a program that handles them quietly
+// but goes wrong afterwards can then be followed.
+// (with the module and offset when the address is inside one; false if it is not)
+bool put_code_address(const process::ModuleSet* modules, uint64_t address) {
+  console::put_hex(address);
+  for (uint64_t i = 0; modules && i < modules->count(); ++i) {
+    const process::Module& m = modules->at(i);
+    if (address < m.base || address - m.base >= m.size) continue;
+    console::puts(" (");
+    console::puts(m.name.view());
+    console::puts("+");
+    console::put_hex(address - m.base);
+    console::puts(")");
+    return true;
+  }
+  return false;
+}
+
+void log_exception(Task* task, uint32_t code, uint64_t rip, uint64_t address, uint64_t rsp) {
+  if (task->exceptions_logged >= 64) return;
+  ++task->exceptions_logged;
+  const process::ModuleSet* modules = task->program.modules();
+  console::puts("user program: exception ");
+  console::put_hex(code);
+  console::puts(" at ");
+  put_code_address(modules, rip);
+  console::puts(" address ");
+  console::put_hex(address);
+  console::puts("\n");
+  uint8_t raw[1024] = {};      // what may be return addresses: the words on its stack that point into a module
+  if (!task->program.address_space().read_privileged(rsp, ByteView(raw, sizeof raw)) && !task->program.address_space().read_privileged(rsp, ByteView(raw, 128))) return;
+  uint32_t shown = 0;
+  for (uint32_t at = 0; at + 8 <= sizeof raw && shown < 10; at += 8) {
+    uint64_t w = 0;
+    for (uint32_t k = 0; k < 8; ++k) w |= uint64_t{raw[at + k]} << (8 * k);
+    bool inside = false;
+    for (uint64_t i = 0; modules && i < modules->count() && !inside; ++i) inside = w > modules->at(i).base && w - modules->at(i).base < modules->at(i).size;
+    if (!inside) continue;
+    console::puts("    ");
+    put_code_address(modules, w);
+    console::puts("\n");
+    ++shown;
+  }
+}
+
 // An exception in user mode ends that program only.
 Frame* on_user_fault(Frame* frame) {
   // CR2 is read first, with interrupts still off: once they are on, a thread switch can bring another fault to this core, which changes CR2.
@@ -416,6 +461,7 @@ Frame* on_user_fault(Frame* frame) {
       irq_disable();
     }
     if (delivered) {
+      log_exception(task, info.code, frame->rip, address, frame->rsp);
       context_to_frame(entry, frame);
       return frame;
     }
@@ -1192,20 +1238,7 @@ void report() {
     console::put_dec(int64_t(task->program.address_space().resident_bytes() >> 20));
     console::puts(" MiB resident\n");
     const process::ModuleSet* modules = task->program.modules();
-    auto where = [&](uint64_t address) {
-      console::put_hex(address);
-      for (uint64_t i = 0; modules && i < modules->count(); ++i) {
-        const process::Module& m = modules->at(i);
-        if (address < m.base || address - m.base >= m.size) continue;
-        console::puts(" (");
-        console::puts(m.name.view());
-        console::puts("+");
-        console::put_hex(address - m.base);
-        console::puts(")");
-        return true;
-      }
-      return false;
-    };
+    auto where = [&](uint64_t address) { return put_code_address(modules, address); };
     for (UserThread* t = task->threads; t; t = t->next) {
       console::puts("  thread ");
       console::put_dec(int64_t(t->id >> 20));

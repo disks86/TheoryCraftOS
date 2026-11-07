@@ -1,0 +1,8 @@
+LIBRARY msimg32.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+vSetDdrawflag @1
+AlphaBlend @2
+DllInitialize @3
+GradientFill @4
+TransparentBlt @5

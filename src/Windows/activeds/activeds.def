@@ -1,0 +1,32 @@
+LIBRARY activeds.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+ADsGetObject @3
+ADsBuildEnumerator @4
+ADsFreeEnumerator @5
+ADsEnumerateNext @6
+ADsBuildVarArrayStr @7
+ADsBuildVarArrayInt @8
+ADsOpenObject @9
+DllCanUnloadNow @10
+DllGetClassObject @11
+ADsSetLastError @12
+ADsGetLastError @13
+AllocADsMem @14
+FreeADsMem @15
+ReallocADsMem @16
+AllocADsStr @17
+FreeADsStr @18
+ReallocADsStr @19
+ADsEncodeBinaryData @20
+PropVariantToAdsType @21
+AdsTypeToPropVariant @22
+AdsFreeAdsValues @23
+ADsDecodeBinaryData @24
+AdsTypeToPropVariant2 @25
+PropVariantToAdsType2 @26
+ConvertSecDescriptorToVariant @27
+ConvertSecurityDescriptorToSecDes @28
+BinarySDToSecurityDescriptor @29
+SecurityDescriptorToBinarySD @30
+ConvertTrusteeToSid @31

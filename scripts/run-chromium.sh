@@ -20,7 +20,8 @@
 # The folder is the unpacked chrome-win.zip of a Chromium snapshot (commondatastorage.googleapis.com/chromium-browser-snapshots/Win_x64/<rev>/chrome-win.zip). It goes
 # to C:\Program Files\Chromium on a primary disk of its own (build/chromium.img, 2 GiB, made once and refreshed with the system DLLs on every run). The VM runs headless
 # with the standard VGA card for CHROMIUM_SECONDS (default 300) seconds or until the program ends; the debug console goes to build/chromium.log and a screenshot of the
-# end to build/chromium.ppm. Environment: CHROMIUM_SMP (cores, 4), CHROMIUM_MEMORY (8G), CHROMIUM_QMP (socket path, short: QEMU limits it to 107 bytes).
+# end to build/chromium.ppm. Environment: CHROMIUM_SMP (cores, 4), CHROMIUM_MEMORY (8G), CHROMIUM_QMP (socket path, short: QEMU limits it to 107 bytes), CHROMIUM_EXTRA
+# (more files for System32, space-separated).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 src=$(cd "$1" && pwd); shift
@@ -37,7 +38,7 @@ if [ ! -f "$image" ]; then
   mkfs.fat -F 32 -n TCOS "$image" >/dev/null
 fi
 files=()
-for dll in "$build"/windows/*.dll; do files+=("file:/Windows/Windows/System32/$(basename "$dll")=$dll"); done
+for dll in "$build"/windows/*.dll ${CHROMIUM_EXTRA:-}; do files+=("file:/Windows/Windows/System32/$(basename "$dll")=$dll"); done
 stamp="$build/chromium.stamp"
 if [ ! -f "$stamp" ] || [ "$src" != "$(cat "$stamp")" ]; then
   while IFS= read -r -d '' f; do

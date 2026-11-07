@@ -1,0 +1,24 @@
+LIBRARY oleacc.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+AccGetRunningUtilityState @3
+AccNotifyTouchInteraction @4
+AccSetRunningUtilityState @5
+AccessibleChildren @6
+AccessibleObjectFromEvent @7
+AccessibleObjectFromPoint @8
+AccessibleObjectFromWindow @9
+AccessibleObjectFromWindowTimeout @10
+CreateStdAccessibleObject @11
+CreateStdAccessibleProxyA @12
+CreateStdAccessibleProxyW @13
+GetOleaccVersionInfo @16
+GetProcessHandleFromHwnd @17
+GetRoleTextA @18
+GetRoleTextW @19
+GetStateTextA @20
+GetStateTextW @21
+LresultFromObject @25
+ObjectFromLresult @26
+PropMgrClient_LookupProp @27
+WindowFromAccessibleObject @28

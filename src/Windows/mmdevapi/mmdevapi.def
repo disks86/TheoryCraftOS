@@ -1,0 +1,4 @@
+LIBRARY mmdevapi.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+ActivateAudioInterfaceAsync @17

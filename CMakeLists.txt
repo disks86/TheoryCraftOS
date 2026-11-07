@@ -1201,17 +1201,18 @@ if(TCOS_ARCH STREQUAL "x86_64")
         list(APPEND _own_sources ${WINDOWS_DIR}/advapi32.dll)
         list(APPEND _own_depends ${WINDOWS_DIR}/advapi32.dll)
       endif()
-      # <dll>.def: forwarders to other libraries (and exports that the C code cannot spell).
-      set(_own_def ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.def)
-      if(EXISTS ${_own_def})
-        list(APPEND _own_sources ${_own_def})
-        list(APPEND _own_depends ${_own_def})
-      endif()
       # Libraries this one imports besides kernel32.dll (a list in WINDOWS_IMPORTS_<dll>).
       foreach(_import ${WINDOWS_IMPORTS_${_library}})
         list(APPEND _own_sources ${WINDOWS_DIR}/${_import}.dll)
         list(APPEND _own_depends ${WINDOWS_DIR}/${_import}.dll)
       endforeach()
+    endif()
+    # <dll>.def: forwarders to other libraries, exports that the C code cannot spell, and the ordinals Windows gives the exports (scripts/sync-ordinals.py: a program may
+    # import by number). A library that is only stubs may have one too.
+    set(_own_def ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.def)
+    if(EXISTS ${_own_def})
+      list(APPEND _own_sources ${_own_def})
+      list(APPEND _own_depends ${_own_def})
     endif()
     add_custom_command(OUTPUT ${WINDOWS_DIR}/${_library}.dll
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}

@@ -1,0 +1,17 @@
+LIBRARY lz32.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+CopyLZFile @1
+GetExpandedNameA @2
+GetExpandedNameW @3
+LZClose @4
+LZCloseFile @5
+LZCopy @6
+LZCreateFileW @7
+LZDone @8
+LZInit @9
+LZOpenFileA @10
+LZOpenFileW @11
+LZRead @12
+LZSeek @13
+LZStart @14

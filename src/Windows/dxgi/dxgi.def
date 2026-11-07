@@ -36,3 +36,23 @@ D3DKMTWaitForSynchronizationObject = gdi32.D3DKMTWaitForSynchronizationObject
 D3DKMTWaitForVerticalBlankEvent = gdi32.D3DKMTWaitForVerticalBlankEvent
 D3DKMTCheckVidPnExclusiveOwnership = gdi32.D3DKMTCheckVidPnExclusiveOwnership
 D3DKMTOpenAdapterFromGdiDisplayName = gdi32.D3DKMTOpenAdapterFromGdiDisplayName
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+ApplyCompatResolutionQuirking @1
+CompatString @2
+CompatValue @3
+DXGIDumpJournal @4
+PIXBeginCapture @5
+PIXEndCapture @6
+PIXGetCaptureState @7
+SetAppCompatStringPointer @8
+UpdateHMDEmulationStatus @9
+CreateDXGIFactory @10
+CreateDXGIFactory1 @11
+CreateDXGIFactory2 @12
+DXGID3D10CreateDevice @13
+DXGID3D10CreateLayeredDevice @14
+DXGID3D10GetLayeredDeviceSize @15
+DXGID3D10RegisterLayers @16
+DXGIDeclareAdapterRemovalSupport @17
+DXGIGetDebugInterface1 @19
+DXGIReportAdapterConfiguration @20

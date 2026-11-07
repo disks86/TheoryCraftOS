@@ -97,6 +97,7 @@ struct Task final : process::IProcessRuntime {
   Mutex mutex;
   ConditionVariable changed;
   char name[24] = {};             // what the process manager calls the program (see set_name())
+  uint32_t exceptions_logged = 0;      // (see log_exception in UserMode.cpp)
   uint64_t retired_ticks = 0;     // CPU ticks of the threads that have ended (under `mutex`)
   Task* all_next = nullptr;       // every running program (see process_snapshot()); under the registry's lock
   bool registered = false;
