@@ -128,7 +128,7 @@ class D3d9Program {
 
   // Runs the program. `attributes` are the vertex attributes by location, `constants` the 128-byte push-constant block.
   void run_vertex(const graphics::Vec4* attributes, const uint8_t* constants, graphics::ShaderIo* out) const;
-  // `textures` may be null when uses_textures() is false. `color` has room for color_output_count() Vec4s (kMaxColorTargets is always enough). False: the pixel was killed.
+  // `varyings` has graphics::kMaxVaryings Vec4s (a program reads any of them). `textures` may be null when uses_textures() is false. `color` has room for color_output_count() Vec4s (kMaxColorTargets is always enough). False: the pixel was killed.
   bool run_fragment(const graphics::Vec4* varyings, const uint8_t* constants, const graphics::ITextureSet* textures, graphics::Vec4* color) const;
 
   // The same program as TGSI text for a device that runs shaders on a GPU (virgl), following ShaderModuleDesc::tgsi: vertex inputs IN[n] are attribute locations, varyings

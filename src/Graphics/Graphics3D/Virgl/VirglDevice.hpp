@@ -37,10 +37,14 @@ class VirglDevice final : public IGraphicsDevice {
     return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureTimestampQueries | kFeatureDepthResolve | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureIndependentBlend | (gpu_.virgl_has_compute() ? kFeatureCompute | kFeatureStorageInDraws | kFeatureFragmentStores | kFeatureVertexStores | kFeatureGeometryStores | (gpu_.virgl_has_tessellation() ? kFeatureTessellationStores : 0u) : 0u) | (gpu_.virgl_has_geometry() ? kFeatureGeometryShaders : 0u) | (gpu_.virgl_has_tessellation() ? kFeatureTessellation : 0u) | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | (gpu_.virgl_max_samples() >= 2 ? kFeatureMultisample : 0u),
             (gpu_.virgl_max_samples() >= 2 ? 1u << 2 : 0u) | (gpu_.virgl_max_samples() >= 4 ? 1u << 4 : 0u), limits()};
   }
-  // (texture units: a host's GL 3.3, which the TGSI it is given needs, has 16 in each stage - GL_MAX_TEXTURE_IMAGE_UNITS and GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS - and so does the kernel)
-  static DeviceLimits limits() {
+  // What the host's GL has (GL 3.3, which the TGSI it is given needs, at least): 16 texture units in each stage (GL_MAX_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS), 16
+  // vertex attributes (GL_MAX_VERTEX_ATTRIBS); varyings: the vertex shader's outputs are 16 vectors in GL 4 (GL_MAX_VERTEX_OUTPUT_COMPONENTS 64), 15 in GL 3.3 (GL_MAX_VARYING_COMPONENTS
+  // 60), and the translated shaders spend one on a copy of the position (for stream output: D3d9Tgsi.cpp extra()).
+  DeviceLimits limits() const {
     DeviceLimits l;
     l.texture_units = kMaxTextureUnits;
+    l.vertex_attributes = kMaxVertexAttributes;
+    l.varyings = gpu_.virgl_has_tessellation() ? 15 : 14;   // (GLSL 4.00 and later: a GL 4 host)
     return l;
   }
 

@@ -702,6 +702,50 @@ void test_textures_outside_pixels() {
   }
 }
 
+// Sixteen vertex attributes and fifteen varyings (vk_many.vert / .frag), with the system values above them (gl_VertexIndex, gl_FrontFacing): the kernel took four of each.
+void test_many_inputs() {
+  HostAllocator allocator;
+  Translated vt = translate(read_spirv("vk_many.vert.spv"), SPV_STAGE_VERTEX), ft = translate(read_spirv("vk_many.frag.spv"), SPV_STAGE_FRAGMENT);
+  if (!vt.ok) printf("  vk_many.vert: %s\n", vt.error.c_str());
+  if (!ft.ok) printf("  vk_many.frag: %s\n", ft.error.c_str());
+  CHECK(vt.ok && ft.ok);
+  if (!vt.ok || !ft.ok) return;
+  NtStatus s = 0;
+  UniquePointer<D3d9Program> vs = compile(allocator, vt, &s);
+  if (s != status::kSuccess) printf("  vk_many.vert: the kernel refused the DXBC (0x%x)\n", s);
+  UniquePointer<D3d9Program> fs = compile(allocator, ft, &s);
+  if (s != status::kSuccess) printf("  vk_many.frag: the kernel refused the DXBC (0x%x)\n", s);
+  CHECK(vs && fs);
+  if (!vs || !fs) return;
+  graphics::Vec4 attributes[graphics::kMaxVertexAttributes];
+  for (uint32_t k = 0; k < 16; ++k) attributes[k] = {1.0f * k, 2.0f * k, 0.5f * k, 1.0f};
+  graphics::VertexContext context;
+  context.vertex_id = 7;
+  graphics::ShaderIo io = {};
+  std::vector<uint8_t> constants(16);
+  vs->run_vertex_ex(attributes, constants.data(), context, &io);
+  uint32_t wrong = 0;
+  for (uint32_t k = 0; k < 15; ++k) {
+    const graphics::Vec4 want = {attributes[k].x + attributes[k + 1].x * 0.5f, attributes[k].y + attributes[k + 1].y * 0.5f, attributes[k].z + attributes[k + 1].z * 0.5f, 1.5f};
+    if (io.varying[k].x != want.x || io.varying[k].y != want.y || io.varying[k].z != want.z || io.varying[k].w != want.w) {
+      if (!wrong) printf("  vk_many.vert: varying %u is %g %g %g %g\n", k, io.varying[k].x, io.varying[k].y, io.varying[k].z, io.varying[k].w);
+      ++wrong;
+    }
+  }
+  CHECK(wrong == 0);
+  CHECK(io.position.x == 15.0f + 7.0f && io.position.y == 30.0f + 7.0f && io.position.z == 7.5f + 7.0f && io.position.w == 8.0f);
+  graphics::FragmentContext fc;
+  fc.front_facing = true;
+  graphics::Vec4 color[graphics::kMaxColorTargets] = {};
+  CHECK(fs->run_fragment_ex(io.varying, fc, constants.data(), nullptr, color));
+  float want[4] = {1000, 1000, 1000, 1000};
+  for (uint32_t k = 0; k < 15; ++k) want[0] += io.varying[k].x * (k + 1), want[1] += io.varying[k].y * (k + 1), want[2] += io.varying[k].z * (k + 1), want[3] += io.varying[k].w * (k + 1);
+  if (fabsf(color[0].x - want[0]) > 1e-2f || fabsf(color[0].w - want[3]) > 1e-2f) printf("  vk_many.frag: %g %g %g %g, want %g %g %g %g\n", color[0].x, color[0].y, color[0].z, color[0].w, want[0], want[1], want[2], want[3]);
+  CHECK(fabsf(color[0].x - want[0]) <= 1e-2f && fabsf(color[0].y - want[1]) <= 1e-2f && fabsf(color[0].z - want[2]) <= 1e-2f && fabsf(color[0].w - want[3]) <= 1e-2f);
+  String tgsi(allocator);
+  CHECK(vs->emit_tgsi(&tgsi, 15) == status::kSuccess && fs->emit_tgsi(&tgsi, 15) == status::kSuccess);   // (what virgl gets, with its fifteen varyings)
+}
+
 // A vertex shader reading a read-only storage buffer (the kernel's storage in draws).
 void test_vertex_storage() {
   HostAllocator allocator;
@@ -760,6 +804,7 @@ int main() {
   test_compute_dynamic();
   test_cube_arrays();
   test_textures_outside_pixels();
+  test_many_inputs();
   test_vertex_storage();
   printf("refusals\n");
   test_refusals();

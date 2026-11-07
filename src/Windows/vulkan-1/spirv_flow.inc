@@ -1,10 +1,10 @@
 /* spirv.inc, part 4: variables, control flow, functions. */
 
 /* ---- inputs and outputs ------------------------------------------------------------------------------------------------------------------------------------------- */
-#define POS_REG 15          /* the register of the position (vertex output, pixel input) */
-#define FACE_REG 12
-#define INSTANCE_REG 13
-#define VERTEX_REG 14
+#define POS_REG 31          /* the register of the position (vertex output, pixel input); the system values below it, above the 16 locations */
+#define FACE_REG 28
+#define INSTANCE_REG 29
+#define VERTEX_REG 30
 enum { DECL_NONE = 0, DECL_PLAIN = 1, DECL_POSITION = 2, DECL_VERTEX_ID = 3, DECL_INSTANCE_ID = 4, DECL_FRONT_FACING = 5, DECL_FLAT = 6 };
 
 static void identity_swz(SpOp *o, uint32_t base, uint32_t n) {

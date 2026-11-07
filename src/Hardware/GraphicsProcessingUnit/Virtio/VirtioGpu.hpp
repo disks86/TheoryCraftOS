@@ -118,6 +118,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // How many commands timed out so far (the host was not answering).
   uint32_t timeouts() const { return __atomic_load_n(&timeouts_, __ATOMIC_ACQUIRE); }
   static constexpr uint64_t kCommandTimeoutUs = 250000;
+  // ... but a 3D command (a submission of virgl commands) waits longer: the host may be compiling a big shader for it, which takes seconds when its shader cache does not have it.
+  static constexpr uint64_t k3dCommandTimeoutUs = 20000000;
   static constexpr uint64_t kMaskedLockWaitUs = 2000;   // how long a caller with interrupts masked looks for the mutex before it gives up
   static constexpr uint64_t kInterruptWaitUs = 2000;   // one sleep for the interrupt; short, so a lost one costs little before the next look
   static constexpr uint64_t kSpinWaitUs = 50;   // how long a command's answer is waited for by spinning before the thread sleeps between looks

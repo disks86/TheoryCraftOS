@@ -273,7 +273,7 @@ static VkResult create_one_pipeline(Device *d, const VkGraphicsPipelineCreateInf
       result = VK_ERROR_FORMAT_NOT_SUPPORTED;
       goto fail;
     }
-    if (p->nattrs >= caps->max_vertex_attributes || p->nattrs >= 4) {
+    if (p->nattrs >= caps->max_vertex_attributes || p->nattrs >= MAX_ATTRIBUTES) {
       why = "more vertex attributes than the adapter has";
       result = VK_ERROR_FEATURE_NOT_PRESENT;
       goto fail;
@@ -331,7 +331,7 @@ static VkResult create_one_pipeline(Device *d, const VkGraphicsPipelineCreateInf
     goto fail;
   }
   p->topology = ci->pInputAssemblyState->topology;
-  UINT words[96];
+  UINT words[192];
   UINT n = 0;
   n = put_words(words, n, 2);   /* CreatePipeline */
   n = put_words(words, n, p->vs);
@@ -369,7 +369,9 @@ static VkResult create_one_pipeline(Device *d, const VkGraphicsPipelineCreateInf
   n = put_words(words, n, stencil ? ds->front.writeMask & 0xFF : 0xFF);
   n = put_words(words, n, stencil ? ds->front.reference & 0xFF : 0);
   p->stencil_ref = stencil ? ds->front.reference & 0xFF : 0;
-  if (has_blend_state || p->color_targets > 1 || attr_flags || (depth_test && ds->depthCompareOp != VK_COMPARE_OP_LESS_OR_EQUAL && ds->depthCompareOp != VK_COMPARE_OP_LESS)) {
+  /* (attributes past the fourth go in the escape's last optional part, so every part before it is written then too) */
+  const BOOL more_attributes = p->nattrs > 4;
+  if (more_attributes || has_blend_state || p->color_targets > 1 || attr_flags || (depth_test && ds->depthCompareOp != VK_COMPARE_OP_LESS_OR_EQUAL && ds->depthCompareOp != VK_COMPARE_OP_LESS)) {
     UINT compare = depth_test ? ds->depthCompareOp : VK_COMPARE_OP_LESS_OR_EQUAL;
     if (!has_blend_state && compare == VK_COMPARE_OP_LESS) compare = VK_COMPARE_OP_LESS_OR_EQUAL;   /* (the device only has "less or equal"; the difference is the pixels of equal depth) */
     BOOL bad = FALSE;
@@ -383,16 +385,33 @@ static VkResult create_one_pipeline(Device *d, const VkGraphicsPipelineCreateInf
     n = put_words(words, n, ba ? MIN(ba->colorBlendOp, 4u) : 0);
     n = put_words(words, n, ba ? MIN(ba->alphaBlendOp, 4u) : 0);
     n = put_words(words, n, ba ? ba->colorWriteMask & 15 : 15);
-    n = put_words(words, n, attr_flags);
+    n = put_words(words, n, attr_flags & 15);   /* (per instance: the first four attributes) */
     if (bad && blend_on) {
       why = "blend constants";
       result = VK_ERROR_FEATURE_NOT_PRESENT;
       goto fail;
     }
-    if (p->color_targets > 1) {
+    if (p->color_targets > 1 || more_attributes) {
       n = put_words(words, n, p->color_targets);
       n = put_words(words, n, 0);   /* independent blending: no */
       for (UINT t = 0; t < 27; ++t) n = put_words(words, n, 0);
+    }
+    if (more_attributes) {
+      n = put_words(words, n, 0);   /* multisample */
+      n = put_words(words, n, 0);   /* geometry shader */
+      n = put_words(words, n, 0);   /* hull and domain shader */
+      n = put_words(words, n, 0);
+      n = put_words(words, n, 0);   /* stream output entries */
+      n = put_words(words, n, p->nattrs - 4);
+      for (UINT a = 4; a < p->nattrs; ++a) {
+        n = put_words(words, n, p->attrs[a].location);
+        n = put_words(words, n, p->out_format[a]);   /* (format | slot << 8: all from the one vertex buffer) */
+        n = put_words(words, n, p->out_offset[a]);
+      }
+      n = put_words(words, n, attr_flags >> 4);   /* per instance: the others */
+      n = put_words(words, n, 0);                 /* the slots of the first four */
+      n = put_words(words, n, 0);                 /* strides of more slots */
+      n = put_words(words, n, 0);                 /* blend states of targets 4 .. 7 */
     }
   }
   if (!STATUS_OK(kmt_escape(d, words, n * 4))) {

@@ -175,6 +175,7 @@ typedef struct Func {
 #define SP_MAX_NEST 64      /* constructs (loops, selections) one inside another */
 #define SP_MAX_CALLS 64     /* function calls one inside another (they are inlined) */
 #define SP_MAX_UNITS 16     /* texture units t0 .. (graphics::kMaxTextureUnits) */
+#define SP_REGISTERS 32     /* input and output registers v0 .. v31, o0 .. o31: locations 0 .. 15 are the attributes and varyings, the system values and the position above them */
 
 /* A DXBC loop being written (a real loop, or a loop that runs once so that its `break` can leave a construct: a switch, the continue construct of a loop, a function with several
  * returns). Leaving it from inside is `break`; from inside other loops too, a flag per target loop that every loop in between tests after its endloop. */
@@ -253,7 +254,7 @@ struct SpvModule {
   /* unit state for the writer */
   uint32_t image_dim_by_unit[SP_MAX_UNITS], image_depth_by_unit[SP_MAX_UNITS], unit_used[SP_MAX_UNITS], nunits;
   uint32_t steps;
-  sp_u8 in_decl[16], out_decl[16];
+  sp_u8 in_decl[SP_REGISTERS], out_decl[SP_REGISTERS];
   uint32_t cb_decl[16];
 };
 typedef struct SpvModule Mod;

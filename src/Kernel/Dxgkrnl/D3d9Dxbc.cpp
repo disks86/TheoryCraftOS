@@ -21,7 +21,7 @@
 //
 // The container is checked (magic, size, every chunk inside it); the checksum is not (a driver trusts the runtime to have made it). The SHDR / SHEX chunk is the program, the ISGN /
 // OSGN chunks (ISG1 / OSG1 too) say what the input and output registers mean. Mapping, as for Direct3D 9: a vertex shader's input register vN is vertex attribute location N; its
-// outputs go to the varyings by semantic (COLOR0 / COLOR1 to 0 / 1, TEXCOORD0 / TEXCOORD1 to 2 / 3), SV_Position is the position; a pixel shader reads the same by its input
+// outputs go to the varyings by semantic (COLOR0 / COLOR1 to 0 / 1, TEXCOORDn to 2 + n, up to graphics::kMaxVaryings), SV_Position is the position; a pixel shader reads the same by its input
 // semantics and writes o0 (SV_Target0). cb0[0..7] are the push constants. Literals become constants of the program. Resource t0 / t1 with a 2D texture are texture units 0 / 1.
 //
 // Taken: the float arithmetic, dot products, comparisons (as 1.0 / 0.0), movc, rounding, sin / cos / sqrt / rsq / exp / log / div, sample, if_z / if_nz / else / endif,
@@ -36,6 +36,7 @@ namespace dxgk {
 
 namespace {
 
+constexpr uint32_t kRegisters = 32;   // input and output registers v0 .. v31, o0 .. o31 (what Shader Model 4 and 5 have)
 constexpr uint32_t kMagic = 0x43425844, kShdr = 0x52444853, kShex = 0x58454853, kIsgn = 0x4E475349, kIsg1 = 0x31475349, kOsgn = 0x4E47534F, kOsg1 = 0x3147534F, kOsg5 = 0x3547534F;
 
 enum DxbcOp : uint32_t {
@@ -98,12 +99,12 @@ bool names_equal(const char* a, const char* b) {
   }
 }
 
-// Reads a signature chunk into `out` (at most 16 elements); false when it is malformed.
+// Reads a signature chunk into `out` (at most kRegisters elements); false when it is malformed.
 bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out, uint32_t* count, bool has_stream = false) {
   ByteReader in(chunk);
   const uint32_t n = in.le32();
   in.le32();   // (the key)
-  if (!in.ok() || n > 16) return false;
+  if (!in.ok() || n > kRegisters) return false;
   for (uint32_t i = 0; i < n; ++i) {
     ConstByteView entry = in.take(element_size);
     if (!in.ok()) return false;
@@ -134,7 +135,7 @@ bool read_signature(ConstByteView chunk, uint32_t element_size, SigElement* out,
 // Where a signature element goes between the stages (see the top of this file); kSlotNone when it goes nowhere this device has.
 int8_t signature_slot(const SigElement& s, bool output_of_vertex) {
   if (names_equal(s.name, "COLOR") && s.index < 2) return static_cast<int8_t>(s.index);
-  if (names_equal(s.name, "TEXCOORD") && s.index < 2) return static_cast<int8_t>(2 + s.index);
+  if (names_equal(s.name, "TEXCOORD") && s.index < graphics::kMaxVaryings - 2) return static_cast<int8_t>(2 + s.index);
   if (output_of_vertex && (names_equal(s.name, "SV_POSITION") || names_equal(s.name, "POSITION")) && s.index == 0) return kSlotPosition;
   return kSlotNone;
 }
@@ -223,28 +224,28 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   program->minor_ = minor;
 
   // What the input and output registers are.
-  int8_t in_slot[16], out_slot[16];
-  int8_t in_sys[16];   // an input register that is a system value (SysValue), or -1
+  int8_t in_slot[kRegisters], out_slot[kRegisters];
+  int8_t in_sys[kRegisters];   // an input register that is a system value (SysValue), or -1
   for (int8_t& s : in_sys) s = -1;
   for (int8_t& s : in_slot) s = kSlotNone;
   for (int8_t& s : out_slot) s = kSlotNone;
-  int8_t stream_slot[graphics::kMaxGeometryStreams][16];   // (a geometry shader's output registers by the stream they belong to: the registers are shared, the meanings are not)
+  int8_t stream_slot[graphics::kMaxGeometryStreams][kRegisters];   // (a geometry shader's output registers by the stream they belong to: the registers are shared, the meanings are not)
   for (auto& row : stream_slot)
     for (int8_t& s : row) s = kSlotNone;
   uint32_t streams_declared = 0;
-  SigElement elements[16];
+  SigElement elements[kRegisters];
   uint32_t count = 0;
   if (!isgn.empty()) {
     if (!read_signature(isgn, isgn_size, elements, &count)) return status::kInvalidParameter;
     for (uint32_t i = 0; i < count; ++i)
-      if (elements[i].reg < 16) in_slot[elements[i].reg] = signature_slot(elements[i], geometry || patch_stage);   // (a geometry, hull or domain shader's inputs include the position)
+      if (elements[i].reg < kRegisters) in_slot[elements[i].reg] = signature_slot(elements[i], geometry || patch_stage);   // (a geometry, hull or domain shader's inputs include the position)
   }
   if (vertex || geometry || patch_stage) {
     if (vertex)
       for (uint32_t i = 0; i < graphics::kMaxVertexAttributes; ++i) in_slot[i] = static_cast<int8_t>(i);   // (vN is attribute location N)
     if (osgn.empty() || !read_signature(osgn, osgn_size, elements, &count, osgn_streams)) return status::kInvalidParameter;
     for (uint32_t i = 0; i < count; ++i) {
-      if (elements[i].reg >= 16 || elements[i].stream >= graphics::kMaxGeometryStreams) continue;
+      if (elements[i].reg >= kRegisters || elements[i].stream >= graphics::kMaxGeometryStreams) continue;
       const int8_t slot = signature_slot(elements[i], true);
       stream_slot[elements[i].stream][elements[i].reg] = slot;
       if (out_slot[elements[i].reg] == kSlotNone) out_slot[elements[i].reg] = slot;   // (a register of several streams: the first until the instructions say which)
@@ -346,18 +347,18 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (geometry || patch_stage) {
           // v[vertex][register]: the vertex immediate, or for a hull shader's control point phase the control point being made
           const uint32_t limit = geometry ? geometry_vertices : input_points;
-          if (o.dims != 2 || (!o.vertex_from_id && o.index[0] >= limit) || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          if (o.dims != 2 || (!o.vertex_from_id && o.index[0] >= limit) || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
           if (o.vertex_from_id && !(hull && phase == 1)) return status::kNotSupported;
           s->type = kInput, s->number = static_cast<uint16_t>(o.index[1]), s->slot = in_slot[o.index[1]], s->vertex = static_cast<uint8_t>(o.index[0]);
           s->vertex_from_id = o.vertex_from_id;
           return status::kSuccess;
         }
-        if (o.dims == 1 && o.index[0] < 16 && in_sys[o.index[0]] >= 0) {
+        if (o.dims == 1 && o.index[0] < kRegisters && in_sys[o.index[0]] >= 0) {
           s->type = kSysValue, s->number = static_cast<uint16_t>(in_sys[o.index[0]]);
           program->uses_system_values_ = true;
           return status::kSuccess;
         }
-        if (o.dims != 1 || o.index[0] >= 16 || in_slot[o.index[0]] < 0) return status::kNotSupported;
+        if (o.dims != 1 || o.index[0] >= kRegisters || in_slot[o.index[0]] < 0) return status::kNotSupported;
         s->type = kInput, s->number = static_cast<uint16_t>(o.index[0]), s->slot = in_slot[o.index[0]];
         return status::kSuccess;
       }
@@ -432,7 +433,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         d->type = kTemp, d->number = static_cast<uint16_t>(o.index[0]);
         return status::kSuccess;
       case kOpOutput: {
-        if (o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;
+        if (o.dims != 1 || o.index[0] >= kRegisters) return status::kNotSupported;
         if (hull && (phase == 2 || phase == 3)) {   // (a patch constant register)
           if (o.index[0] >= graphics::kMaxPatchRegisters) return status::kNotSupported;
           d->type = kPatchOut, d->number = static_cast<uint16_t>(o.index[0]);
@@ -633,13 +634,13 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         if (geometry && opcode == kDclInput4 && o.type == kOpGsInstanceId) continue;   // (vGSInstanceID)
         if (geometry && (opcode == kDclInput4 || opcode == kDclInputSiv4) && o.type == kOpInput) {
           // v[N][register] (and for the _siv form the system value after it): the signature says what the register is
-          if (o.dims != 2 || o.index[0] != geometry_vertices || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+          if (o.dims != 2 || o.index[0] != geometry_vertices || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
           continue;
         }
         if (patch_stage && (opcode == kDclInput4 || opcode == kDclInputSiv4)) {
           // control points (v[N][register] of a hull shader, vicp[N][register] of a domain shader), the control point being made, the domain location, the patch constants
           if (o.type == kOpInput || o.type == kOpInputControlPoint) {
-            if (o.dims != 2 || o.index[0] != input_points || o.index[1] >= 16 || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
+            if (o.dims != 2 || o.index[0] != input_points || o.index[1] >= kRegisters || in_slot[o.index[1]] == kSlotNone) return status::kNotSupported;
             continue;
           }
           if (o.type == kOpOutputControlPointId || o.type == kOpDomainPoint || o.type == kOpInputPatchConstant || o.type == kOpForkInstanceId || o.type == kOpJoinInstanceId) continue;
@@ -665,7 +666,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
         }
         if (hull && opcode == kDclOutput4 && o.type == kOpOutput && (phase == 2 || phase == 3)) continue;   // (a patch constant register)
         if (compute && opcode == kDclInput4 && (o.type == kOpThreadId || o.type == kOpThreadGroupId || o.type == kOpThreadIdInGroup || o.type == kOpThreadIdFlat)) continue;
-        if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= 16) return status::kNotSupported;   // (depth and the like)
+        if ((o.type != kOpInput && o.type != kOpOutput) || o.dims != 1 || o.index[0] >= kRegisters) return status::kNotSupported;   // (depth and the like)
         // An input that is a system value says which in its declaration (a name after the operand); the rest take their meaning from the signature.
         if (o.type == kOpInput && (opcode == kDclInputSgv4 || opcode == kDclInputSiv4 || opcode == kDclInputPsSgv4 || opcode == kDclInputPsSiv4)) {
           const uint32_t name = p.le32() & 0xFFFF;
@@ -1181,7 +1182,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
       for (uint64_t i = program->code_.count(); i > 0; --i) {
         Instr& ins = program->code_[i - 1];
         if (ins.op == kGsEmit) stream_after = ins.control;
-        if ((ins.dst.type == kRastOut || ins.dst.type == kAttrOut) && ins.dst.number < 16) {
+        if ((ins.dst.type == kRastOut || ins.dst.type == kAttrOut) && ins.dst.number < kRegisters) {
           const int8_t slot = stream_slot[stream_after][ins.dst.number];
           if (slot == kSlotNone) continue;   // (a register the stream has no element for: left as the first meaning had it)
           ins.dst.slot = slot;

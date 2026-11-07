@@ -56,6 +56,7 @@ static void *vk_realloc_array(void *old, size_t old_count, size_t new_count, siz
 #define EXPORT __declspec(dllexport)
 #define VKAPI EXPORT VKAPI_ATTR
 #define SP_MAX_RES_KEYS 32
+#define MAX_ATTRIBUTES 16   /* vertex attributes of a pipeline (graphics::kMaxVertexAttributes) */
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -323,11 +324,11 @@ typedef struct Pipe {
   KMT_HANDLE vs, fs, pipe;
   VtxBinding bindings[8];
   UINT nbindings;
-  VtxAttr attrs[8];
+  VtxAttr attrs[MAX_ATTRIBUTES];
   UINT nattrs;
   UINT out_stride;         /* of the gathered vertex buffer: the sum of the attributes' float components */
-  UINT out_offset[8];
-  UINT out_format[8];      /* graphics::VertexFormat: Float1 .. Float4 */
+  UINT out_offset[MAX_ATTRIBUTES];
+  UINT out_format[MAX_ATTRIBUTES];      /* graphics::VertexFormat: Float1 .. Float4 */
   UINT topology;
   BOOL dyn_viewport, dyn_scissor;
   VkViewport viewport;

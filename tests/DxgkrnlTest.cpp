@@ -2562,7 +2562,7 @@ void test_dxbc() {
           ++compiled;
           String text(allocator);
           p->emit_tgsi(&text);
-          graphics::Vec4 varyings[4] = {}, color[graphics::kMaxColorTargets];
+          graphics::Vec4 varyings[graphics::kMaxVaryings] = {}, color[graphics::kMaxColorTargets];   // (the varyings a program may read: any of them)
           uint8_t constants[128] = {};
           p->run_fragment(varyings, constants, &textures, color);
         } else {

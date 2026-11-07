@@ -162,14 +162,19 @@ typedef struct Scene {
   VkShaderModule vs, fs_color, fs_tex;
 } Scene;
 
+static VkPipeline make_pipeline_with(Rig *r, Scene *s, VkShaderModule vs, VkShaderModule fs, const VkPipelineVertexInputStateCreateInfo *input, VkCullModeFlags cull, VkFrontFace front, VkResult *result);
 static VkPipeline make_pipeline(Rig *r, Scene *s, VkShaderModule fs, VkCullModeFlags cull, VkFrontFace front, VkResult *result) {
-  VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
-  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = s->vs, stages[0].pName = "main";
-  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs, stages[1].pName = "main";
   VkVertexInputBindingDescription binding = {0, 20, VK_VERTEX_INPUT_RATE_VERTEX};
   VkVertexInputAttributeDescription attrs[2] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 8}};
   VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &binding, vi.vertexAttributeDescriptionCount = 2, vi.pVertexAttributeDescriptions = attrs;
+  return make_pipeline_with(r, s, s->vs, fs, &vi, cull, front, result);
+}
+static VkPipeline make_pipeline_with(Rig *r, Scene *s, VkShaderModule vs, VkShaderModule fs, const VkPipelineVertexInputStateCreateInfo *input, VkCullModeFlags cull, VkFrontFace front, VkResult *result) {
+  VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = vs, stages[0].pName = "main";
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs, stages[1].pName = "main";
+  const VkPipelineVertexInputStateCreateInfo vi = *input;
   VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
   ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   VkViewport viewport = {0, 0, W, H, 0, 1};
@@ -944,6 +949,57 @@ static void test_many_units(Rig *r, Scene *s) {
   p_vkFreeMemory(r->dev, staging_memory, NULL);
 }
 
+/* Sixteen vertex attributes and fifteen varyings (vk_manydraw.vert / .frag): the colour is x of attribute 1, y of attribute 8, z of attribute 15, through varyings 0, 7 and 14.
+ * Skipped on an adapter with fewer. */
+static void test_many_inputs(Rig *r, Scene *s) {
+  if (r->props.limits.maxVertexInputAttributes < 16 || r->props.limits.maxVertexOutputComponents < 64) {
+    printf("    %u vertex attributes, %u output components on this adapter: skipped\n", r->props.limits.maxVertexInputAttributes, r->props.limits.maxVertexOutputComponents);
+    return;
+  }
+  /* three vertices of sixteen vec4s: attribute 0 the position, 1 .. 15 values that the varyings carry */
+  VkDeviceMemory memory;
+  void *map;
+  VkBuffer vertices = make_buffer(r, 3 * 16 * 16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &memory, &map);
+  float *v = map;
+  static const float corners[3][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+  for (unsigned i = 0; i < 3; ++i)
+    for (unsigned k = 0; k < 16; ++k) {
+      float *a = v + (i * 16 + k) * 4;
+      a[0] = k == 0 ? corners[i][0] : 0.9f, a[1] = k == 0 ? corners[i][1] : 0.9f, a[2] = 0.9f, a[3] = 1.0f;
+    }
+  v[(0 * 16 + 1) * 4 + 0] = v[(1 * 16 + 1) * 4 + 0] = v[(2 * 16 + 1) * 4 + 0] = 0.25f;   /* attribute 1, x */
+  v[(0 * 16 + 8) * 4 + 1] = v[(1 * 16 + 8) * 4 + 1] = v[(2 * 16 + 8) * 4 + 1] = 0.5f;    /* attribute 8, y */
+  v[(0 * 16 + 15) * 4 + 2] = v[(1 * 16 + 15) * 4 + 2] = v[(2 * 16 + 15) * 4 + 2] = 0.75f;   /* attribute 15, z */
+  VkVertexInputBindingDescription binding = {0, 16 * 16, VK_VERTEX_INPUT_RATE_VERTEX};
+  VkVertexInputAttributeDescription attrs[16];
+  for (unsigned k = 0; k < 16; ++k) attrs[k].location = k, attrs[k].binding = 0, attrs[k].format = VK_FORMAT_R32G32B32A32_SFLOAT, attrs[k].offset = 16 * k;
+  VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &binding, vi.vertexAttributeDescriptionCount = 16, vi.pVertexAttributeDescriptions = attrs;
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof manydraw_vert, smi.pCode = manydraw_vert;
+  VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &vs);
+  smi.codeSize = sizeof manydraw_frag, smi.pCode = manydraw_frag;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &fs);
+  VkResult result;
+  VkPipeline pipeline = make_pipeline_with(r, s, vs, fs, &vi, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, &result);
+  check(result == VK_SUCCESS && pipeline, "a pipeline of sixteen vertex attributes and fifteen varyings");
+  if (pipeline) {
+    VkBuffer scene_vertex = s->vertex;
+    s->vertex = vertices;
+    draw_frame(r, s, pipeline, 0, 0, 0);
+    s->vertex = scene_vertex;
+    const unsigned char *picture = (const unsigned char *)s->readback_map;
+    check(near_pixel(pixel(picture, W, 16, 16), 191, 128, 64, 255) && near_pixel(pixel(picture, W, 40, 50), 191, 128, 64, 255), "sixteen attributes and fifteen varyings reach the pixel shader");
+    if (!near_pixel(pixel(picture, W, 16, 16), 191, 128, 64, 255)) printf("    many inputs: pixel %08x\n", pixel(picture, W, 16, 16));
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  if (vs) p_vkDestroyShaderModule(r->dev, vs, NULL);
+  if (fs) p_vkDestroyShaderModule(r->dev, fs, NULL);
+  p_vkDestroyBuffer(r->dev, vertices, NULL);
+  p_vkFreeMemory(r->dev, memory, NULL);
+}
+
 /* Timestamps: two around a dispatch-free submission's work, read back with and without availability; they go up. */
 static void test_timestamps(Rig *r) {
   VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -1193,6 +1249,7 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   test_cube_array(&r, &s);
   test_textures_in_vertex_and_compute(&r, &s);
   test_many_units(&r, &s);
+  test_many_inputs(&r, &s);
   test_timestamps(&r);
 
   /* copies and clears that need no GPU */

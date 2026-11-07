@@ -256,7 +256,7 @@ VKAPI void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalDevice physical, V
   l->maxPerStageDescriptorSamplers = c->max_texture_units, l->maxPerStageDescriptorUniformBuffers = 12, l->maxPerStageDescriptorSampledImages = c->max_texture_units;
   l->maxPerStageResources = 128;
   l->maxDescriptorSetSamplers = c->max_texture_units, l->maxDescriptorSetUniformBuffers = 12, l->maxDescriptorSetUniformBuffersDynamic = 8, l->maxDescriptorSetSampledImages = c->max_texture_units;
-  l->maxVertexInputAttributes = MIN(c->max_vertex_attributes, 8);
+  l->maxVertexInputAttributes = MIN(c->max_vertex_attributes, MAX_ATTRIBUTES);
   l->maxVertexInputBindings = 8;
   l->maxVertexInputAttributeOffset = 2047;
   l->maxVertexInputBindingStride = 2048;

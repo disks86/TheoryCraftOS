@@ -383,7 +383,7 @@ class VirglShaderModule final : public IShaderModule {
       for (uint32_t e = 0; e < outputs; ++e) {
         const StreamOutputEntry& entry = stream_output->stream_output[e];
         // (the shader keeps the position as the shader wrote it, +Y up, in an output of its own for each stream as well as in the host's output 0)
-        const uint32_t reg = entry.output == 0 ? 5u + entry.stream : entry.output;
+        const uint32_t reg = entry.output == 0 ? device.limits().varyings + 1 + entry.stream : entry.output;   // (the register after the varyings: D3d9Tgsi.cpp extra())
         cmd[10 + 2 * e] = reg | (entry.start_component << 8) | (entry.component_count << 10) | (entry.buffer << 13) | (fill[entry.buffer] << 16);
         cmd[11 + 2 * e] = entry.stream == swap_stream ? 0u : entry.stream == 0 ? swap_stream : entry.stream;
         fill[entry.buffer] += entry.component_count;
@@ -482,7 +482,7 @@ class VirglPipeline final : public VirglPipelineBase {
       const auto* geometry = static_cast<const VirglShaderModule*>(desc.geometry_shader);
       if (!geometry->tgsi()) return;
       // The host gives a register one stream: a shader output that two streams capture cannot be had.
-      uint8_t streams_of_output[kBaseVaryings + 1] = {};
+      uint8_t streams_of_output[kMaxVaryings + 1] = {};
       for (uint32_t e = 0; e < desc.stream_output_count; ++e) {
         const StreamOutputEntry& entry = desc.stream_output[e];
         if (entry.output == 0) continue;
@@ -562,7 +562,7 @@ class VirglPipeline final : public VirglPipelineBase {
     dsa_ = device.new_handle();
     rasterizer_ = device.new_handle();
     elements_ = device.new_handle();
-    uint32_t cmd[64];
+    uint32_t cmd[160];   // (the blend, depth and rasterizer objects, and up to kMaxVertexAttributes vertex elements of four words)
     uint32_t n = 0;
 
     // Blend state: source-over blending (alpha_blend) or the pipeline's own state (kFeatureBlendState); with independent blending each target has a state of its own, else target 0's
@@ -636,7 +636,7 @@ class VirglPipeline final : public VirglPipelineBase {
       cmd[n++] = desc.attributes[i].per_instance ? 1 : 0;   // vertex buffer index (the divisor belongs to a buffer binding on the host: per-instance attributes get a binding of their own, of the same buffer)
       cmd[n++] = kFormats[static_cast<uint32_t>(desc.attributes[i].format)];
     }
-    ok_ = n <= 64 && device.send_commands(cmd, n);
+    ok_ = n <= sizeof cmd / sizeof cmd[0] && device.send_commands(cmd, n);
   }
   ~VirglPipeline() {
     device_.destroy_object(blend_);
@@ -777,8 +777,8 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
   if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
-  if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kBaseVertexAttributes ||
-      desc.varying_count > kBaseVaryings)
+  if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > limits().vertex_attributes ||
+      desc.varying_count > limits().varyings)
     return nullptr;
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment)
     return nullptr;

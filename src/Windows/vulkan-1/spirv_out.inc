@@ -184,15 +184,15 @@ static int write_signature(Mod *m, sp_u8 *out, uint32_t *size, int outputs) {
   struct Elem {
     const char *name;
     uint32_t index, sys, reg, mask;
-  } elems[17];
+  } elems[SP_REGISTERS + 1];
   uint32_t n = 0;
   const sp_u8 *decl = outputs ? m->out_decl : m->in_decl;
-  for (uint32_t r = 0; r < 16; ++r) {
+  for (uint32_t r = 0; r < SP_REGISTERS; ++r) {
     if (!decl[r]) continue;
     if (r == POS_REG && decl[r] == DECL_POSITION) {
       if (!outputs) continue;   /* a pixel shader's position is declared as a system value, not in the signature */
       elems[n].name = "SV_Position", elems[n].index = 0, elems[n].sys = 1;
-    } else if (r >= 12 && !outputs && (decl[r] == DECL_VERTEX_ID || decl[r] == DECL_INSTANCE_ID || decl[r] == DECL_FRONT_FACING)) {
+    } else if (r >= FACE_REG && !outputs && (decl[r] == DECL_VERTEX_ID || decl[r] == DECL_INSTANCE_ID || decl[r] == DECL_FRONT_FACING)) {
       continue;
     } else if (m->stage == SPV_STAGE_VERTEX && !outputs) {
       elems[n].name = "ATTR", elems[n].index = r, elems[n].sys = 0;
@@ -306,7 +306,7 @@ static int write_container(Mod *m, const uint32_t *phys) {
         put(&w, (file << 12) | 2u | ((file == OF_THREAD_INDEX ? 1u : 7u) << 4));
       }
   }
-  for (uint32_t r = 0; r < 16; ++r) {
+  for (uint32_t r = 0; r < SP_REGISTERS; ++r) {
     uint32_t k = m->in_decl[r];
     if (!k) continue;
     if (k == DECL_POSITION) {
@@ -334,7 +334,7 @@ static int write_container(Mod *m, const uint32_t *phys) {
       put(&w, r);
     }
   }
-  for (uint32_t r = 0; r < 16; ++r) {
+  for (uint32_t r = 0; r < SP_REGISTERS; ++r) {
     uint32_t k = m->out_decl[r];
     if (!k) continue;
     if (k == DECL_POSITION) {
@@ -357,7 +357,8 @@ static int write_container(Mod *m, const uint32_t *phys) {
   if (m->failed) return 1;
   tokens[1] = w.n;
   /* the container */
-  sp_u8 *isgn = (sp_u8 *)sp_alloc(m, 512), *osgn = (sp_u8 *)sp_alloc(m, 512);
+  /* (a signature: 8 bytes, 24 an element, and the names: SP_REGISTERS elements of at most 12 bytes of name) */
+  sp_u8 *isgn = (sp_u8 *)sp_alloc(m, 8 + SP_REGISTERS * 36), *osgn = (sp_u8 *)sp_alloc(m, 8 + SP_REGISTERS * 36);
   if (!isgn || !osgn) return sp_fail(m, "out of memory");
   uint32_t isize = 0, osize = 0;
   write_signature(m, isgn, &isize, 0);
