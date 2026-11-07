@@ -1,0 +1,4 @@
+LIBRARY winspool.dll
+EXPORTS
+; Programs linked with the Windows SDK import GetDefaultPrinterW from winspool.drv by its ordinal (chrome.dll does).
+GetDefaultPrinterW @203

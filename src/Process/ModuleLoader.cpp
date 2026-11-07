@@ -49,6 +49,13 @@ bool canonical_library_name(StringView name, String* out) {
   for (char c : name) if (!out->push_back(lower(c))) return false;
   if (out->view().rfind('.') == StringView::npos && !out->append(".dll")) return false;
   const StringView text = out->view();
+  // The API sets of other libraries than kernel32 (checked first: the WinRT ones start with api-ms-win-core- too).
+  if (starts_with(text, "api-ms-win-core-winrt-")) return out->assign("combase.dll");
+  if (starts_with(text, "api-ms-win-power-")) return out->assign("powrprof.dll");
+  if (starts_with(text, "api-ms-win-shcore-")) return out->assign("shcore.dll");
+  // Libraries with other extensions than .dll: here they are DLLs like the others (the print spooler's winspool.drv is winspool.dll).
+  if (text.equals("winspool.drv")) return out->assign("winspool.dll");
+  if (text.equals("bthprops.cpl")) return out->assign("bthprops.dll");
   if (starts_with(text, "api-ms-win-core-") || starts_with(text, "api-ms-win-eventing-") || text.equals("kernelbase.dll")) return out->assign("kernel32.dll");
   if (starts_with(text, "api-ms-win-security-")) return out->assign("advapi32.dll");
   if (text.equals("wsock32.dll") || text.equals("winsock.dll")) return out->assign("ws2_32.dll");

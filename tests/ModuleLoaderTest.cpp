@@ -186,6 +186,10 @@ static void test_names() {
   auto name = [&](const char* n) { return canonical_library_name(n, &out) ? str(out.view()) : std::string("<error>"); };
   CHECK(name("KERNEL32.dll") == "kernel32.dll" && name("Kernel32") == "kernel32.dll" && name("ntdll.DLL") == "ntdll.dll");
   CHECK(name("api-ms-win-core-file-l1-1-0.dll") == "kernel32.dll" && name("API-MS-WIN-CORE-HEAP-L1-2-0.dll") == "kernel32.dll" && name("KERNELBASE.dll") == "kernel32.dll");
+  CHECK(name("api-ms-win-core-winrt-l1-1-0.dll") == "combase.dll" && name("api-ms-win-core-winrt-string-l1-1-0.dll") == "combase.dll" &&
+        name("api-ms-win-core-realtime-l1-1-1.dll") == "kernel32.dll");      // the WinRT API sets are combase's, the other core ones kernel32's
+  CHECK(name("api-ms-win-power-base-l1-1-0.dll") == "powrprof.dll" && name("api-ms-win-shcore-scaling-l1-1-1.dll") == "shcore.dll");
+  CHECK(name("WINSPOOL.DRV") == "winspool.dll" && name("bthprops.cpl") == "bthprops.dll" && name("other.cpl") == "other.cpl");
   CHECK(name("api-ms-win-crt-stdio-l1-1-0.dll") == "msvcrt.dll" && name("UCRTBASE.DLL") == "msvcrt.dll" && name("msvcr120.dll") == "msvcrt.dll" && name("msvcrt") == "msvcrt.dll");      // every C runtime is the one msvcrt.dll
   CHECK(name("XInput9_1_0.dll") == "xinput1_4.dll" && name("xinput1_3.dll") == "xinput1_4.dll" && name("XINPUT1_4.DLL") == "xinput1_4.dll" && name("xinputuap") == "xinput1_4.dll");      // every XInput is one library
   CHECK(name("xinput.dll") == "xinput.dll" && name("wsock32.dll") == "ws2_32.dll");
