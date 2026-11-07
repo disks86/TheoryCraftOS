@@ -461,6 +461,9 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
       for (uint32_t i = 0; i < 64; ++i) op.image[i] = target.image_information()[i];
       op.protect = target.priority_class;      // (the Win32 priority class)
       if (const Process::ThreadRecord* main_thread = target.find_thread(target.id())) op.argument = main_thread->teb;      // (the TEB of its main thread)
+      if (target.runtime()) target.runtime()->cpu_time(0, &op.cpu_time);
+      op.create_time = target.create_time;
+      if (const AddressSpace* space = target.address_space()) { op.mapped_bytes = space->mapped_bytes(); op.resident_bytes = space->resident_bytes(); }
       return kStatusSuccess;
     }
   }

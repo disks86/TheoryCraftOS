@@ -173,6 +173,7 @@ class IProcessRuntime {
     uint32_t type = 0, protect = 0, old_protect = 0;
     uint8_t info[48] = {};                // Query: MEMORY_BASIC_INFORMATION
     uint8_t image[64] = {};               // ProcessInfo: the SECTION_IMAGE_INFORMATION of the program; its PEB address comes back in `address`
+    uint64_t cpu_time = 0, create_time = 0, mapped_bytes = 0, resident_bytes = 0;      // ProcessInfo: its CPU time (100 ns), when it started, what its memory spans and uses
     uint64_t argument = 0, stack_size = 0, thread_id = 0;      // CreateThread (thread_id comes back); ThreadStatus: exit code (STILL_ACTIVE if it runs) comes back in `size`
     bool suspended = false;
     X86Context* context = nullptr;        // GetContext/SetContext: the registers of thread_id (a single object of the caller, only used during the call)

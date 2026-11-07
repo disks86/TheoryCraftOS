@@ -530,13 +530,15 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   uint64_t remote_peb = 0;
   uint32_t remote_priority = 0x20;      // NORMAL_PRIORITY_CLASS
   uint8_t remote_image[64] = {};
-  if (!self && p.runtime() && (info_class == 0 || info_class == 37 || info_class == 18)) {      // (another program's PEB and image are not ours to look into: it tells)
-    IProcessRuntime::RemoteOp op;
-    op.kind = IProcessRuntime::RemoteOp::ProcessInfo;
-    if (p.runtime()->remote_operation(child_pid, op) == kSuccess) {
-      remote_peb = op.address;
-      remote_priority = op.protect;
-      for (uint32_t i = 0; i < 64; ++i) remote_image[i] = op.image[i];
+  IProcessRuntime::RemoteOp remote;
+  remote.kind = IProcessRuntime::RemoteOp::ProcessInfo;
+  bool remote_known = false;
+  if (!self && p.runtime() && (info_class == 0 || info_class == 37 || info_class == 18 || info_class == 2 || info_class == 3 || info_class == 4)) {      // (another program's PEB and image are not ours to look into: it tells)
+    if (p.runtime()->remote_operation(child_pid, remote) == kSuccess) {
+      remote_known = true;
+      remote_peb = remote.address;
+      remote_priority = remote.protect;
+      for (uint32_t i = 0; i < 64; ++i) remote_image[i] = remote.image[i];
     }
   }
   Buffer b;
@@ -562,6 +564,21 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   } else if (info_class == 26 || info_class == 24) {      // ProcessWow64Information: not a 32-bit process; ProcessSessionInformation: session 1 (the one in the PEB)
     if (info_class == 24) b.put(0, 1, 4);
     size = info_class == 24 ? 4 : 8;
+  } else if (!self && (info_class == 2 || info_class == 3 || info_class == 4)) {      // another program's I/O counters (none counted), memory and times
+    if (info_class == 3) {
+      b.put(0, remote.mapped_bytes, 8);
+      b.put(8, remote.mapped_bytes, 8);
+      const uint32_t used_at[5] = {24, 32, 72, 80, 88};      // the working set and page file figures: what it uses
+      for (uint32_t at : used_at) b.put(at, remote.resident_bytes, 8);
+      size = length >= 96 ? 96 : 88;
+    } else if (info_class == 4) {
+      b.put(0, remote_known ? remote.create_time : 0, 8);
+      if (child_exited) b.put(8, remote_known ? remote.create_time : 0, 8);      // ExitTime (an ended program's is not kept: its start)
+      b.put(24, remote.cpu_time, 8);
+      size = 32;
+    } else {
+      size = 48;
+    }
   } else if (!self) {
     return kInvalidInfoClass;
   } else {
