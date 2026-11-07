@@ -963,6 +963,23 @@ static void exec_clear_color(const Img *img_c, const void *payload, UINT nranges
   }
 }
 
+/* A clear of a whole image that can be drawn into (one level, one layer, one sample) done by the GPU: a pass that only clears it, in the stream with the other commands, instead of
+ * the CPU filling the image's memory (which waits for the GPU first and then has the whole image uploaded again). FALSE: not such an image or range, the CPU does it. */
+static BOOL gpu_clear_color(Exec *x, Img *img, const VkClearColorValue *color, const VkImageSubresourceRange *ranges, UINT nranges) {
+  if (img->is_depth || !(img->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || img->mips != 1 || img->samples != 1 || img->kind != 0 || img->layers > 1) return FALSE;
+  if (img->tiling == VK_IMAGE_TILING_LINEAR && img->mem) return FALSE;   /* (a linear image's memory is what the program sees: the CPU keeps it) */
+  BOOL covered = FALSE;
+  for (UINT r = 0; r < nranges; ++r) covered |= ranges[r].baseMipLevel == 0 && ranges[r].levelCount != 0 && ranges[r].baseArrayLayer == 0 && ranges[r].layerCount != 0;
+  if (!covered) return TRUE;   /* (nothing of the one level and layer: nothing to do) */
+  int idx = alloc_index(x, img->alloc);
+  if (idx < 0) return FALSE;
+  UINT payload[9] = {(UINT)idx, NO_ALLOC, 1, color->uint32[0], color->uint32[1], color->uint32[2], color->uint32[3], fbits(1.0f), 0};   /* (the colour's words as they are: floats, or the integers of an integer image) */
+  if (!packet(x, OP_BEGIN_PASS, payload, 9) || !packet(x, OP_END_PASS, NULL, 0)) return FALSE;
+  img->gpu_written = TRUE;
+  x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = TRUE;
+  return TRUE;
+}
+
 static void run_cmds(Exec *x, CmdBuf *cb);
 
 static void exec_one(Exec *x, const Cmd *c) {
@@ -1097,10 +1114,14 @@ static void exec_one(Exec *x, const Cmd *c) {
       }
       break;
     }
-    case C_CLEAR_COLOR:
+    case C_CLEAR_COLOR: {
+      Img *img = (Img *)(ULONG_PTR)c->a;
+      const VkImageSubresourceRange *ranges = (const VkImageSubresourceRange *)((const BYTE *)c->p + sizeof(VkClearColorValue));
+      if (gpu_clear_color(x, img, c->p, ranges, c->n)) break;
       flush(x);
-      exec_clear_color((Img *)(ULONG_PTR)c->a, c->p, c->n);
+      exec_clear_color(img, c->p, c->n);
       break;
+    }
     case C_CLEAR_DS: {
       /* A depth image has no CPU view: a pass that only clears it. */
       Img *img = (Img *)(ULONG_PTR)c->a;
@@ -1215,6 +1236,7 @@ static VkResult submit_cmdbuf(Device *d, CmdBuf *cb) {
 VKAPI VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
   Queue *q = (Queue *)queue;
   VkResult result = VK_SUCCESS;
+  ++g_submission;   /* (what the program wrote into mapped memory up to now is seen by these commands) */
   for (UINT i = 0; i < count && result == VK_SUCCESS; ++i)
     for (UINT k = 0; k < submits[i].commandBufferCount && result == VK_SUCCESS; ++k) result = submit_cmdbuf(q->dev, (CmdBuf *)submits[i].pCommandBuffers[k]);
   if (fence) ((Fence *)fence)->signaled = TRUE;

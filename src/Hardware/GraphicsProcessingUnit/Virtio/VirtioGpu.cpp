@@ -48,7 +48,7 @@ ControlHeader header(uint32_t type) {
 }
 }  // namespace
 
-uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
+uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence) {
   if (!ready_ || request.size() < sizeof(ControlHeader) || request.size() > request_.size()) return 0;
   // A caller with interrupts masked (the console draws under its spinlock) must not block on the mutex while another thread has a command out: it looks
   // for the mutex again instead (blocking there is a kernel panic), and not for ever: the thread that holds it may be waiting for the host's answer on this
@@ -77,10 +77,11 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
   auto* head = reinterpret_cast<ControlHeader*>(request_.data());
   if (head->type >= kCmdCtxCreate) {
     head->context_id = kContextId;
-    // Wait for the host to finish the work before answering: a later readback or flush
-    // then sees its results, and our buffers are free to reuse.
-    head->flags |= kFlagFence;
-    head->fence_id = ++fence_;
+    // With a fence the host answers when the work is finished (see execute() in the header). Either way our buffers are free to reuse once it answers: it has read the request.
+    if (fence) {
+      head->flags |= kFlagFence;
+      head->fence_id = ++fence_;
+    }
   }
   auto* reply = reinterpret_cast<ControlHeader*>(response_.data());
   reply->type = 0;

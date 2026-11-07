@@ -147,7 +147,7 @@ class VirglBuffer final : public IBuffer {
   void unmap() override {
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, static_cast<uint32_t>(memory_.size()), 1, 1}, 0,
                             id_, 0, 0, 0};
-    device_.gpu().command(as_bytes(transfer));
+    device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
   // What a compute shader wrote lives on the host: pull it into the guest memory.
   bool read_back() override {
@@ -250,7 +250,7 @@ class VirglImage final : public IImage {
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, layer, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
-    return device_.gpu().command(as_bytes(transfer));
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
   bool read_layer_pixels(uint32_t layer, ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
@@ -296,7 +296,7 @@ class VirglImage final : public IImage {
     for (const Vec4& c : pixels) encode_wide_pixel(desc_.format, c, out);
     if (!out.ok()) return false;
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * bytes_per_pixel(desc_.format), 0};
-    return device_.gpu().command(as_bytes(transfer));
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
 
   // The host copies the pixels from guest memory (the backing) into the resource: a texture, or an image that is only drawn into and shown (its Y_0_TOP rows go
@@ -308,7 +308,7 @@ class VirglImage final : public IImage {
     const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
     for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
-    return device_.gpu().command(as_bytes(transfer));
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
 
   // A rectangle: its rows go to the same place in the backing (the backing is the whole image), and the host copies just that box.
@@ -323,7 +323,7 @@ class VirglImage final : public IImage {
       for (uint32_t i = 0; i < area.width; ++i) staged[uint64_t{static_cast<uint32_t>(area.y) + j} * e.width + static_cast<uint32_t>(area.x) + i] = pixels[uint64_t{j} * pitch + i];
     const uint64_t offset = (uint64_t{static_cast<uint32_t>(area.y)} * e.width + static_cast<uint32_t>(area.x)) * 4;
     TransferHost3d transfer{header(kCmdTransferToHost3d), {static_cast<uint32_t>(area.x), static_cast<uint32_t>(area.y), 0, area.width, area.height, 1}, offset, id_, 0, e.width * 4, 0};
-    return device_.gpu().command(as_bytes(transfer));
+    return device_.gpu().command(as_bytes(transfer), /*fence=*/false);
   }
 
  private:
@@ -681,7 +681,7 @@ class VirglPipeline final : public VirglPipelineBase {
 
 // --- Device --------------------------------------------------------------------
 
-bool VirglDevice::send_commands(const uint32_t* dwords, uint32_t count) {
+bool VirglDevice::send_commands(const uint32_t* dwords, uint32_t count, bool fence) {
   const uint64_t bytes = uint64_t{count} * 4;
   hardware::VirtioGpu& g = gpu_;
   uint8_t* request = static_cast<uint8_t*>(g.allocator().allocate(sizeof(CmdSubmit) + bytes));
@@ -689,7 +689,7 @@ bool VirglDevice::send_commands(const uint32_t* dwords, uint32_t count) {
   CmdSubmit submit{header(kCmdSubmit3d), static_cast<uint32_t>(bytes), 0};
   __builtin_memcpy(request, &submit, sizeof(submit));
   __builtin_memcpy(request + sizeof(submit), dwords, bytes);
-  const bool ok = g.command(ConstByteView(request, sizeof(submit) + bytes));
+  const bool ok = g.command(ConstByteView(request, sizeof(submit) + bytes), fence);
   g.allocator().deallocate(request);
   return ok;
 }
@@ -1419,7 +1419,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     }
     if (!pending) break;
     const uint32_t nop = 0;
-    if (attempt > kQueryPolls || !send_commands(&nop, 1)) return false;
+    if (attempt > kQueryPolls || !send_commands(&nop, 1, /*fence=*/true)) return false;   // (a fenced one: the host looks at its queries while it waits for fences)
   }
   if (disjoint_asked) clock_interrupted_ = false;
   uint64_t counts[kMaxOcclusionQueries + kFillQueries] = {};

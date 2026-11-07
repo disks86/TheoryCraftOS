@@ -176,6 +176,7 @@ typedef struct Mem {
   UINT type;
   UINT version;            /* counts the writes the CPU may have made: a buffer or image synchronised with an older one is stale */
   BOOL mapped;
+  UINT seen_submission;    /* the submission in which a mapped memory was last counted as written (g_submission) */
 } Mem;
 
 typedef struct Buf {
@@ -186,6 +187,7 @@ typedef struct Buf {
   ULONGLONG off;
   KMT_HANDLE alloc;        /* made when the GPU first needs the buffer */
   UINT synced;
+  BYTE *sent;              /* a buffer in mapped memory: what was last copied to the GPU (size bytes), so that a submission that finds it unchanged copies nothing */
 } Buf;
 
 typedef struct Img {

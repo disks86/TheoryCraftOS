@@ -66,7 +66,8 @@ class VirglDevice final : public IGraphicsDevice {
 
   // Used by the resource classes (not part of IGraphicsDevice).
   hardware::VirtioGpu& gpu() { return gpu_; }
-  bool send_commands(const uint32_t* dwords, uint32_t count);  // SUBMIT_3D
+  // SUBMIT_3D. Without a fence (the default) the host takes the commands and the GPU runs them while we go on; `fence`: the answer waits for the GPU (and has the host poll).
+  bool send_commands(const uint32_t* dwords, uint32_t count, bool fence = false);
   uint32_t new_handle() { return next_handle_++; }
   bool destroy_object(uint32_t handle);
   // The host-side sampler state object for `sampler`, made on first use (0 if the host refuses it).
