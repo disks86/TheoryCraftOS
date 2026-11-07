@@ -26,8 +26,8 @@
 
 namespace process {
 
-// The images of DLLs laid out as they are in memory at their preferred base (headers and sections where their RVAs put them, nothing relocated), shared by every
-// process that maps the same file there: a 300 MB browser DLL is in memory once however many of its processes run. The pages are mapped as an image (copy-on-write):
+// The images of DLLs laid out as they are in memory at a base (headers and sections where their RVAs put them, relocated for that base), shared by every process that maps
+// the same file there: a 300 MB browser DLL is in memory once however many of its processes run. The pages are mapped as an image (copy-on-write):
 // a page that the loader (relocations, the import table, the security cookie) or the program writes gets a copy of its own in that process (AddressSpace::privatize).
 //
 // An image is known by its file: the size, the first page (the headers, with their time stamp and checksum) and a hash of all of it; an image nobody maps any more
@@ -40,14 +40,16 @@ class ImageCache {
   ImageCache& operator=(const ImageCache&) = delete;
 
   class Image;
-  // The laid-out image of `file` (whose parsed headers are `pe`), made now if it is not there yet; the caller holds one reference (Image::release when done; each
-  // mapping holds its own). nullptr if the layout is not one that can be shared (old 512-byte sections, a damaged file) or memory ran out.
-  Image* acquire(const exe::PeFile& pe, ConstByteView file);
+  // The laid-out image of `file` (whose parsed headers are `pe`) for loading at `base`, made now if it is not there yet: at another base than its preferred one the
+  // relocations are applied (and the headers' ImageBase changed) once, in the shared copy, so a library that every process has to move to the same place is shared too.
+  // The caller holds one reference (Image::release when done; each mapping holds its own). nullptr if the layout is not one that can be shared (old 512-byte sections,
+  // a damaged file or relocations) or memory ran out.
+  Image* acquire(const exe::PeFile& pe, ConstByteView file, uint64_t base);
   uint32_t count();
 
-  // Maps the image at `base` (its preferred base: nothing is relocated) into `space`: the headers read-only, each section with the permissions of its characteristics
+  // Maps the image at the base it was made for into `space`: the headers read-only, each section with the permissions of its characteristics
   // (the Windows layer marks them copy-on-write). False if a piece does not fit; nothing stays mapped then.
-  static bool map(Image& image, AddressSpace& space, uint64_t base);
+  static bool map(Image& image, AddressSpace& space);
 
  private:
   friend class Image;
@@ -71,7 +73,7 @@ class ImageCache::Image final : public SharedMemory {
   ImageCache& cache_;
   uint8_t* storage_ = nullptr;
   uint64_t size_ = 0, header_bytes_ = 0;
-  uint64_t file_size_ = 0, sample_ = 0;
+  uint64_t file_size_ = 0, sample_ = 0, base_ = 0;
   uint8_t headers_[4096] = {};
   PeSectionPlacement sections_[kMaxSections];
   uint32_t section_count_ = 0;

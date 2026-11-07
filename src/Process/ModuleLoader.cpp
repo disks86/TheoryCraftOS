@@ -329,12 +329,13 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     say(c, canonical, " cannot be moved (it has no relocations)");
     return LoadStatus::Malformed;
   }
-  // At its preferred base an image is the same in every process: its pages are shared (ImageCache), and only the ones written get copies of their own.
+  // At a given base an image is the same in every process (the processes of one program load their libraries alike, moved ones included): its pages are shared
+  // (ImageCache, with the relocations for that base applied once), and only the ones written get copies of their own.
   bool shared = false;
-  if (!relocate && pe.entry_rva() < size) {
+  if (pe.entry_rva() < size) {
     if (ImageCache* cache = image_cache()) {
-      if (ImageCache::Image* cached = cache->acquire(pe, file)) {
-        shared = ImageCache::map(*cached, c.space, base);
+      if (ImageCache::Image* cached = cache->acquire(pe, file, base)) {
+        shared = ImageCache::map(*cached, c.space);
         cached->release();      // (the mappings hold it now)
       }
     }
@@ -348,12 +349,12 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     return status;
   }
   LoadStatus status = LoadStatus::Ok;
-  if (!apply_relocations(c.space, pe, base, base - pe.image_base())) {
+  if (!shared && !apply_relocations(c.space, pe, base, base - pe.image_base())) {      // (a shared image was relocated when it was made)
     say(c, canonical, " has damaged relocations");
     return LoadStatus::Malformed;
   }
   initialise_security_cookie(c.space, pe, base);
-  if (relocate && (pe.dll_characteristics() & 0x40)) record_image_base(c.space, base);
+  if (!shared && relocate && (pe.dll_characteristics() & 0x40)) record_image_base(c.space, base);
   describe_image_pages(c.space, pe, base);
   module->base = base;
   module->size = size;

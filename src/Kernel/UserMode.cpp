@@ -1257,6 +1257,13 @@ void report() {
     console::puts(" MiB resident\n");
     const process::ModuleSet* modules = task->program.modules();
     auto where = [&](uint64_t address) { return put_code_address(modules, address); };
+    for (uint64_t i = 0; modules && i < modules->count(); ++i) {      // where its modules are (a library that had to move is not where the others have it)
+      console::puts("  module ");
+      console::puts(modules->at(i).name.view());
+      console::puts(" at ");
+      console::put_hex(modules->at(i).base);
+      console::puts("\n");
+    }
     for (UserThread* t = task->threads; t; t = t->next) {
       console::puts("  thread ");
       console::put_dec(int64_t(t->id >> 20));

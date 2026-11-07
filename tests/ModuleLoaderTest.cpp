@@ -374,7 +374,10 @@ static void test_shared_images() {
     CHECK(load_windows_modules(two, A, pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), "app.exe", provider, &set_two, &detail) == LoadStatus::Ok);
     const Module* kept = set_one.find("ntdll.dll")->base == 0x180000000ull ? set_one.find("ntdll.dll") : set_one.find("kernel32.dll");
     const uint64_t page = kept->base + 0x2000;      // (the second page of its section: nothing the loader writes)
-    CHECK(cache.count() == 1 && one.is_shared(page) && two.is_shared(page) && one.storage_at(page) == two.storage_at(page));
+    CHECK(cache.count() == 2 && one.is_shared(page) && two.is_shared(page) && one.storage_at(page) == two.storage_at(page));      // (the moved library is shared too, relocated once)
+    const Module* moved = set_one.find("ntdll.dll") == kept ? set_one.find("kernel32.dll") : set_one.find("ntdll.dll");
+    CHECK(one.is_shared(moved->base + 0x2000) && two.is_shared(moved->base + 0x2000) && one.storage_at(moved->base + 0x2000) == two.storage_at(moved->base + 0x2000));
+    CHECK(u64_at(one, moved->base + 0x2F00) == moved->base + 0x1234 && u64_at(two, moved->base + 0x2F00) == moved->base + 0x1234);
     CHECK(u64_at(one, kept->base + 0x2F00) == kept->base + 0x1234 && u64_at(two, kept->base + 0x2F00) == kept->base + 0x1234);
     const uint8_t mark = 0x77;
     CHECK(one.write_privileged(page, ConstByteView(&mark, 1)) && !one.is_shared(page) && two.is_shared(page));
