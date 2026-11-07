@@ -142,6 +142,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   uint64_t coalesced_segments() const;
   // The most receive queues seen being handled at the same moment (for tests: two flows on two queues were handled concurrently).
   uint32_t concurrent_receives_seen() const { return __atomic_load_n(&concurrent_peak_, __ATOMIC_RELAXED); }
+  uint32_t tcp_connection_count() const { return tcp_.connection_count(); }   // (connections in the lookup table, for tests)
 
  private:
   struct ArpEntry {
@@ -241,8 +242,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   //   1. a receive queue's lock (RxQueue::lock: the thread handling that queue)
   //   2. mutex_, the control lock: DHCP, the resolver, the orchestration of poll_control(), and what applications ask of the stack itself
   //      (configure, start_dhcp). Fair (handed to waiters in turn).
-  //   3. a TLS connection's lock, 4. a TCP or UDP socket's (a listener's before one of its new connections'), 5. the socket tables' and a
-  //      listener's accept queue (TcpManager, UdpManager)
+  //   3. a TLS connection's lock, 4. a TCP or UDP socket's (a listener's before one of its new connections'; TCP's never waited for on the
+  //      receive path: see TcpSocket), 5. the socket tables' writers' lock and a listener's accept queue (TcpManager, UdpManager: lookups take
+  //      none, RCU), and a TCP socket's leaf locks (its buffers, its backlog)
   //   6. ip_lock_: everything of the IP layer below - addresses (IPv4 and IPv6, and their autoconfiguration), ARP and neighbor caches,
   //      the packets waiting for them and for the loopback, the transmit queue and the interface's transmit path, the ping, multicast groups.
   //      Held only while a packet is built and sent or the state looked at; nothing under it calls into a socket. Fair too: receive threads

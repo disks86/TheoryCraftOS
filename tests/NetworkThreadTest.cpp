@@ -20,16 +20,19 @@
 // service thread, joined by a wire whose interfaces "interrupt" when a frame arrives. Application threads use their sockets the way programs
 // do, waiting with wait_for_progress() instead of polling: several connections echo at once from several threads; a ping-pong over the
 // loopback is woken by the stack itself (not the service thread's 5 ms idle timer); and an application's send() gets in while frames pour in.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 #include "Kernel/Interrupts.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "Network/Tcp/TcpSocket.hpp"
 #include "Stream/Tcp/TcpStream.hpp"
 
 using namespace network;
@@ -472,6 +475,205 @@ static void test_parallel_queues() {
   CHECK(m.b.at(0)->concurrent_receives_seen() == 2);
 }
 
+// Many connections at once (the lookup tables are hashed and read with RCU): four client threads open 64 connections each to one listener,
+// whose server thread accepts and answers them all, while the receive path looks every segment's connection up without a lock and the
+// threads that connect and close change the table under it. Every answer is right, and the table empties again once they are all closed.
+static void test_many_connections() {
+  Machines m(2);
+  constexpr int kThreads = 4, kPerThread = 64, kTotal = kThreads * kPerThread;
+  SharedPointer<ITcpSocket> listener = m.b.at(0)->tcp_open();
+  CHECK(listener->listen(9200));
+  std::atomic<int> answered{0}, clients_done{0};
+  std::thread server([&] {   // accepts everything, answers each 4-byte question with the bytes reversed, closes after its client does
+    std::vector<SharedPointer<ITcpSocket>> conns;
+    std::vector<std::vector<uint8_t>> got;
+    wait_until(m.b, [&] {
+      while (SharedPointer<ITcpSocket> c = listener->accept()) {
+        conns.push_back(c);
+        got.emplace_back();
+      }
+      for (size_t i = 0; i < conns.size(); ++i) {
+        if (!conns[i]) continue;
+        uint8_t buffer[16];
+        for (uint32_t n; (n = conns[i]->receive(ByteView(buffer))) > 0;) got[i].insert(got[i].end(), buffer, buffer + n);
+        if (got[i].size() == 4) {
+          const uint8_t answer[4] = {got[i][3], got[i][2], got[i][1], got[i][0]};
+          if (conns[i]->send(ConstByteView(answer, 4)) == 4) got[i].push_back(0);   // (answered)
+        }
+        if (conns[i]->peer_closed()) {
+          conns[i]->close();
+          conns[i] = SharedPointer<ITcpSocket>();
+        }
+      }
+      return clients_done == kThreads && std::all_of(conns.begin(), conns.end(), [](const SharedPointer<ITcpSocket>& c) { return !c; }) &&
+             conns.size() == size_t(kTotal);
+    }, 120);
+  });
+  std::vector<std::thread> clients;
+  for (int t = 0; t < kThreads; ++t)
+    clients.emplace_back([&, t] {
+      std::vector<SharedPointer<ITcpSocket>> socks;
+      for (int i = 0; i < kPerThread; ++i) {
+        SharedPointer<ITcpSocket> s = m.a.at(0)->tcp_open();
+        CHECK(s->connect(Ipv4Address::make(10, 0, 0, 2), 9200));
+        socks.push_back(s);
+      }
+      std::vector<bool> asked(kPerThread, false), done(kPerThread, false);
+      std::vector<std::vector<uint8_t>> in(kPerThread);
+      wait_until(m.a, [&] {
+        bool all = true;
+        for (int i = 0; i < kPerThread; ++i) {
+          if (done[i]) continue;
+          all = false;
+          const uint8_t question[4] = {uint8_t(t), uint8_t(i), uint8_t(i * 3), 0x5A};
+          if (!asked[i] && socks[i]->is_connected()) asked[i] = socks[i]->send(ConstByteView(question, 4)) == 4;
+          uint8_t buffer[16];
+          for (uint32_t n; (n = socks[i]->receive(ByteView(buffer))) > 0;) in[i].insert(in[i].end(), buffer, buffer + n);
+          if (in[i].size() >= 4 || socks[i]->failed()) {
+            if (in[i].size() == 4 && in[i][0] == 0x5A && in[i][1] == uint8_t(i * 3) && in[i][2] == uint8_t(i) && in[i][3] == uint8_t(t)) ++answered;
+            socks[i]->close();
+            done[i] = true;
+          }
+        }
+        return all;
+      }, 120);
+      ++clients_done;
+    });
+  for (std::thread& c : clients) c.join();
+  server.join();
+  const bool emptied = wait_until(m.a, [&] { return m.a.at(0)->tcp_connection_count() == 0 && m.b.at(0)->tcp_connection_count() == 0; }, 30);
+  printf("many connections: %d of %d answered, tables emptied: %s\n", answered.load(), kTotal, emptied ? "yes" : "no");
+  CHECK(answered == kTotal);
+  CHECK(emptied);
+}
+
+// One connection, several threads: on each machine one thread sends while another receives on the same socket, both directions at once, while
+// the service threads process its segments. Nobody waits for the protocol work of another (send() and receive() take only their buffer's
+// lock; segments that find the connection busy go to its backlog), and every byte arrives intact and in order.
+static void test_one_connection_threads() {
+  Machines m(2);
+  constexpr uint32_t kBytes = 1024 * 1024;
+  SharedPointer<ITcpSocket> listener = m.b.at(0)->tcp_open();
+  CHECK(listener->listen(9300));
+  SharedPointer<ITcpSocket> client = m.a.at(0)->tcp_open();
+  CHECK(client->connect(Ipv4Address::make(10, 0, 0, 2), 9300));
+  SharedPointer<ITcpSocket> server;
+  CHECK(wait_until(m.b, [&] { return bool(server = listener->accept()); }));
+  CHECK(wait_until(m.a, [&] { return client->is_connected(); }));
+  if (!server || !client->is_connected()) return;
+  std::atomic<int> intact{0};
+  const auto sender = [&](NetworkStackSet& set, SharedPointer<ITcpSocket> s, uint8_t seed) {
+    std::vector<uint8_t> out(kBytes);
+    for (uint32_t i = 0; i < kBytes; ++i) out[i] = uint8_t(i * 11 + seed);
+    uint32_t offset = 0;
+    wait_until(set, [&] {
+      while (offset < kBytes) {
+        const uint32_t k = s->send(ConstByteView(out.data() + offset, kBytes - offset));
+        if (!k) break;
+        offset += k;
+      }
+      return (offset == kBytes && s->unsent_or_unacknowledged() == 0) || s->failed();
+    }, 120);
+  };
+  const auto receiver = [&](NetworkStackSet& set, SharedPointer<ITcpSocket> s, uint8_t seed) {
+    uint32_t got = 0;
+    bool same = true;
+    uint8_t buffer[3000];
+    wait_until(set, [&] {
+      for (uint32_t n; (n = s->receive(ByteView(buffer))) > 0; got += n)
+        for (uint32_t i = 0; i < n; ++i) same = same && buffer[i] == uint8_t((got + i) * 11 + seed);
+      return got >= kBytes || s->failed();
+    }, 120);
+    if (same && got == kBytes) ++intact;
+  };
+  std::thread a_send(sender, std::ref(m.a), client, 1), a_receive(receiver, std::ref(m.a), client, 2);
+  std::thread b_send(sender, std::ref(m.b), server, 2), b_receive(receiver, std::ref(m.b), server, 1);
+  a_send.join();
+  a_receive.join();
+  b_send.join();
+  b_receive.join();
+  auto* a = static_cast<TcpSocket*>(client.get());
+  auto* b = static_cast<TcpSocket*>(server.get());
+  printf("one connection, four threads: %d of 2 directions intact, %llu + %llu segments through the backlog, %llu dropped\n", intact.load(),
+         (unsigned long long)(a->backlogged_segments()), (unsigned long long)(b->backlogged_segments()),
+         (unsigned long long)(a->backlog_drops() + b->backlog_drops()));
+  CHECK(intact == 2);
+  client->close();
+  server->close();
+}
+
+// The backlog, deterministically: a thread holds the server's connection (as an application's call or a timer would) while the client sends.
+// The service thread does not wait for it - the segments go to the backlog and another connection on the same machine is served meanwhile -
+// and a send() on the held connection returns at once; when the holder lets go it processes the backlog itself, and the data is there.
+static void test_backlog() {
+  Machines m;
+  SharedPointer<ITcpSocket> listener = m.b.at(0)->tcp_open();
+  CHECK(listener->listen(9400));
+  SharedPointer<ITcpSocket> c1 = m.a.at(0)->tcp_open(), c2 = m.a.at(0)->tcp_open();
+  CHECK(c1->connect(Ipv4Address::make(10, 0, 0, 2), 9400) && c2->connect(Ipv4Address::make(10, 0, 0, 2), 9400));
+  SharedPointer<ITcpSocket> s1, s2;
+  CHECK(wait_until(m.b, [&] {
+    if (!s1) s1 = listener->accept();
+    else if (!s2) s2 = listener->accept();
+    return bool(s2);
+  }));
+  CHECK(wait_until(m.a, [&] { return c1->is_connected() && c2->is_connected(); }));
+  if (!s1 || !s2) return;
+  // (which accepted connection is c1's: the one whose peer port is c1's)
+  if (s1->remote_port() != c1->local_port()) {
+    SharedPointer<ITcpSocket> t = s1;
+    s1 = s2;
+    s2 = t;
+  }
+  auto* held = static_cast<TcpSocket*>(s1.get());
+  constexpr uint32_t kBytes = 8000;
+  std::vector<uint8_t> out(kBytes);
+  for (uint32_t i = 0; i < kBytes; ++i) out[i] = uint8_t(i * 5 + 3);
+  bool other_served = false, send_returned = false;
+  uint64_t backlogged = 0;
+  uint32_t visible_while_held = 0;
+  {
+    std::optional<TcpSocket::Owner> hold;
+    hold.emplace(*held);
+    const uint64_t before = held->backlogged_segments();
+    CHECK(c1->send(ConstByteView(out.data(), kBytes)) == kBytes);
+    wait_until(m.b, [&] { return held->backlogged_segments() - before >= 3; }, 10);
+    backlogged = held->backlogged_segments() - before;
+    visible_while_held = s1->available();   // (nothing processed: it waits in the backlog)
+    // the service thread is not stuck behind the held connection: the other one is served
+    const uint8_t ping[3] = {1, 2, 3};
+    CHECK(c2->send(ConstByteView(ping, 3)) == 3);
+    other_served = wait_until(m.b, [&] { return s2->available() == 3; }, 10);
+    // nor is an application's send() on the held connection (its segments go out when the holder lets go)
+    std::atomic<bool> returned{false};
+    std::thread t([&] {
+      const uint8_t reply[2] = {9, 8};
+      CHECK(s1->send(ConstByteView(reply, 2)) == 2);
+      returned = true;
+    });
+    for (int i = 0; i < 2000 && !returned; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    send_returned = returned;
+    hold.reset();   // (letting go processes the backlog on this thread, and sends the reply; before the join, so a send() that waits fails, not hangs)
+    t.join();
+  }
+  const uint32_t visible_after = s1->available();
+  std::vector<uint8_t> in(kBytes + 16);
+  uint32_t got = 0;
+  wait_until(m.b, [&] {
+    for (uint32_t n; (n = s1->receive(ByteView(in.data() + got, in.size() - got))) > 0;) got += n;
+    return got >= kBytes;
+  }, 10);
+  uint8_t reply[4];
+  uint32_t replied = 0;
+  wait_until(m.a, [&] { return (replied += c1->receive(ByteView(reply + replied, sizeof reply - replied))) >= 2; }, 10);
+  printf("backlog: %llu segments kept while held (%u bytes visible then, %u right after), other connection served: %s, send returned: %s\n",
+         (unsigned long long)backlogged, visible_while_held, visible_after, other_served ? "yes" : "no", send_returned ? "yes" : "no");
+  CHECK(backlogged >= 3 && visible_while_held == 0 && visible_after > 0);
+  CHECK(other_served && send_returned);
+  CHECK(got == kBytes && std::equal(out.begin(), out.end(), in.begin()));
+  CHECK(replied == 2 && reply[0] == 9 && reply[1] == 8);
+}
+
 int main() {
   test_concurrent_connections();
   test_loopback_latency();
@@ -479,6 +681,9 @@ int main() {
   test_fair_lock();
   test_executor_wake();
   test_parallel_queues();
+  test_many_connections();
+  test_one_connection_threads();
+  test_backlog();
   if (g_failed) { printf("NetworkThreadTest: %d failed\n", g_failed.load()); return 1; }
   printf("NetworkThreadTest: all passed\n");
   return 0;

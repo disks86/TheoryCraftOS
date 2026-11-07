@@ -103,8 +103,13 @@ class RecursiveMutex {
   }
   // Another thread is waiting for it (see Mutex::contended).
   bool contended() const { return mutex_.contended(); }
-  // True if the calling thread holds it.
-  bool held_by_me() const { return __atomic_load_n(&owner_, __ATOMIC_RELAXED) == current_thread(); }
+  // True if the calling thread holds it. (Never before there are threads - current_thread() is null then, as is owner_ when nobody holds it.)
+  bool held_by_me() const {
+    Thread* owner = __atomic_load_n(&owner_, __ATOMIC_RELAXED);
+    return owner && owner == current_thread();
+  }
+  // How many times the calling thread has taken it (only meaningful to the owner: 1 = the outermost hold).
+  uint32_t depth() const { return depth_; }
 
  private:
   Mutex mutex_;
