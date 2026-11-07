@@ -7,6 +7,10 @@
 //
 //   dxgk_suite::render(allocator, device, display, &pixels, &report)   -> 32 x 32 words (B8G8R8A8), false (and a report) where a step failed
 //   dxgk_suite::compare(...)                                           -> renders on `device` and on a software device and compares
+//   dxgk_suite::conformance(allocator, device, display, name, &counts) -> every scene of dxgk::run_conformance on `device` against a software device; the
+//                                                                        number of scenes it drew differently or broke (each printed), 0 when it draws or refuses each
+//                                                                        (CONFORMANCE_PICTURES=1 prints both pictures of a scene that differs, CONFORMANCE_REFUSALS=1
+//                                                                        the step each refused scene stopped at)
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +18,7 @@
 #include <vector>
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
+#include "Kernel/Dxgkrnl/Conformance.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Kernel/Dxgkrnl/SelfTest.hpp"
 #include "Utility/ByteStream.hpp"
@@ -86,6 +91,61 @@ inline int compare(allocators::IAllocator& allocator, graphics::IGraphicsDevice&
     ++failures;
   }
   return failures;
+}
+
+struct ConformanceCounts {
+  uint32_t same = 0, refused = 0, differs = 0, broken = 0;
+};
+
+// The scenes the system runs at boot on each accelerated GPU (Conformance.hpp), on `device` against a software device. A device may refuse a scene (it says so, a program
+// falls back) but never draw something else or break: the number of scenes that did is returned, each printed with `name`.
+inline uint32_t conformance(allocators::IAllocator& allocator, graphics::IGraphicsDevice& device, hardware::IGraphicsProcessingUnit* display, const char* name,
+                            ConformanceCounts* counts) {
+  struct Context {
+    const char* name;
+    ConformanceCounts* counts;
+  } context{name, counts};
+  graphics::SoftwareDevice reference(allocator, nullptr);
+  Kernel kernel(allocator);
+  AdapterConfig config;
+  config.display = display;
+  if (kernel.add_adapter(device, config) != 0 || kernel.add_adapter(reference, AdapterConfig()) != 1) {
+    printf("  conformance: %s: add_adapter failed\n", name);
+    return 1;
+  }
+  return run_conformance(allocator, kernel, 0, 1, [](void* raw, const SceneResult& r) {
+    Context& c = *static_cast<Context*>(raw);
+    switch (r.verdict) {
+      case SceneVerdict::Same: ++c.counts->same; break;
+      case SceneVerdict::Refused:
+        ++c.counts->refused;
+        if (getenv("CONFORMANCE_REFUSALS")) printf("  conformance: %s: %s refused at %s: %08x\n", c.name, r.name, r.step, static_cast<unsigned>(r.status));
+        break;
+      case SceneVerdict::Differs:
+        ++c.counts->differs;
+        printf("  conformance: %s: %s differs in %u pixels (first %u,%u: %08x, reference %08x)\n", c.name, r.name, r.bad_pixels, r.first_bad % 32, r.first_bad / 32,
+               r.device_value, r.reference_value);
+        if (getenv("CONFORMANCE_PICTURES") && r.device_picture && r.reference_picture) {   // (each pixel as its strongest channel: r g b, w white, . black)
+          for (uint32_t y = 0; y < 32; ++y) {
+            char line[2][33];
+            for (int side = 0; side < 2; ++side) {
+              for (uint32_t x = 0; x < 32; ++x) {
+                const uint32_t px = (side ? r.reference_picture : r.device_picture)[y * 32 + x];
+                const uint32_t red = (px >> 16) & 0xFF, green = (px >> 8) & 0xFF, blue = px & 0xFF;
+                line[side][x] = red > 160 && green > 160 && blue > 160 ? 'w' : red > green && red > blue && red > 40 ? 'r' : green > blue && green > 40 ? 'g' : blue > 40 ? 'b' : '.';
+              }
+              line[side][32] = 0;
+            }
+            printf("    %s   %s\n", line[0], line[1]);
+          }
+        }
+        break;
+      case SceneVerdict::Broken:
+        ++c.counts->broken;
+        printf("  conformance: %s: %s broken at %s: %08x\n", c.name, r.name, r.step, static_cast<unsigned>(r.status));
+        break;
+    }
+  }, &context);
 }
 
 }  // namespace dxgk_suite

@@ -49,7 +49,8 @@ class Compiler {
     if (!error_) error_ = why;
     return false;
   }
-  uint32_t temp_reg(uint32_t index, uint32_t comp) const { return temp_base_ + 4 * index + comp; }
+  // A temporary has registers only when the shader uses it (temp_slot_): a producer may declare a range far larger than one shader touches.
+  uint32_t temp_reg(uint32_t index, uint32_t comp) const { return temp_base_ + 4 * temp_slot_[index] + comp; }
   uint32_t in_reg(uint32_t index, uint32_t comp) const { return in_base_ + 4 * index + comp; }
   uint32_t out_reg(uint32_t index, uint32_t comp) const { return out_base_ + 4 * index + comp; }
   uint32_t new_scratch() {
@@ -110,6 +111,9 @@ class Compiler {
   uint32_t const_sgpr_[TgsiShader::kMaxConsts] = {};
   bool const_used_[TgsiShader::kMaxConsts] = {};
   bool in_used_[TgsiShader::kMaxInputs] = {};
+  bool temp_used_[TgsiShader::kMaxTemps] = {};
+  uint32_t temp_slot_[TgsiShader::kMaxTemps] = {};
+  uint32_t temps_used_ = 0;
   bool sampler_used_[TgsiShader::kMaxSamplers] = {};
   uint32_t image_sgpr_[TgsiShader::kMaxSamplers] = {}, sampler_sgpr_[TgsiShader::kMaxSamplers] = {}, vbuf_sgpr_[TgsiShader::kMaxInputs] = {};
   bool uses_kill_ = false;
@@ -298,13 +302,15 @@ bool Compiler::analyze() {
         if (src.index >= TgsiShader::kMaxConsts) return fail("constant row out of range");
         const_used_[src.index] = true;
         if (static_cast<uint32_t>(src.index) + 1u > info_->const_rows) info_->const_rows = static_cast<uint32_t>(src.index) + 1u;
-      } else if (src.file == TgsiFile::Temp && src.index >= s_.temps) {
-        return fail("a temporary that is not declared");
+      } else if (src.file == TgsiFile::Temp) {
+        if (src.index >= s_.temps) return fail("a temporary that is not declared");
+        temp_used_[src.index] = true;
       } else if (src.file == TgsiFile::Imm && src.index >= s_.immediates.count()) {
         return fail("an immediate that is not declared");
       }
     }
     if (i.dst.file == TgsiFile::Temp && i.dst.index >= s_.temps) return fail("a temporary that is not declared");
+    if (i.dst.file == TgsiFile::Temp) temp_used_[i.dst.index] = true;
     if (i.dst.file == TgsiFile::Out && i.dst.index >= s_.outputs) return fail("an output that is not declared");
     if (i.op == TgsiOp::Tex || i.op == TgsiOp::Txb || i.op == TgsiOp::Txl) {
       if (!s_.fragment) return fail("texture sampling in a vertex shader");
@@ -369,7 +375,9 @@ bool Compiler::prologue() {
   in_base_ = at;
   at += 4 * s_.inputs;
   temp_base_ = at;
-  at += 4 * s_.temps;
+  for (uint32_t t = 0; t < s_.temps; ++t)
+    if (temp_used_[t]) temp_slot_[t] = temps_used_++;
+  at += 4 * temps_used_;
   out_base_ = at;
   at += 4 * s_.outputs;
   scratch_base_ = at;

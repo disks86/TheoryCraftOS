@@ -21,7 +21,8 @@
 // device says it has them) blend state, texel access, system values, instancing and lines. Each scene says one of: it draws what the reference draws, it draws something else, the
 // device refuses it (kNotSupported: the adapter says so honestly, a program can fall back), or it breaks (a step of the services failed, or the context was lost).
 //
-// The system runs this at boot on each accelerated GPU and logs the verdicts (main.cpp); the host tests run it on every device they can simulate.
+// The system runs this at boot on each accelerated GPU and logs the verdicts (main.cpp). The host tests run it on every device with a simulator that draws: the CPU renderer
+// (DxgkrnlTest), Intel Gen9 (Gen9GraphicsDeviceTest) and the Radeon RX Vega M (AmdVegaMTest); virgl runs it in QEMU. The V3D and SVGA3D devices have no such simulator.
 #pragma once
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 

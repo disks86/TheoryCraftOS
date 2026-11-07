@@ -389,7 +389,8 @@ CommandProcessorModel::Result CommandProcessorModel::draw(bool indexed, const Pm
   call.scissor.top = 0;
   call.scissor.right = width;
   call.scissor.bottom = height;
-  for (int k = 0; k < 4; ++k) {
+  const bool viewport_scissor = (context_reg(mmPA_SC_MODE_CNTL_0) & PA_SC_MODE_CNTL_0__VPORT_SCISSOR_ENABLE_MASK) != 0;   // (the viewport's scissor applies only when enabled)
+  for (int k = 0; k < (viewport_scissor ? 4 : 3); ++k) {
     const uint32_t tl = context_reg(tl_regs[k]), br = context_reg(br_regs[k]);
     const uint32_t l = tl & 0x7FFF, t = (tl >> 16) & 0x7FFF, rr = br & 0x7FFF, b = (br >> 16) & 0x7FFF;
     if (l > call.scissor.left) call.scissor.left = l;
