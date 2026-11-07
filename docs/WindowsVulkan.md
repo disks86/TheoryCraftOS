@@ -18,7 +18,8 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
   appended to the blob after the name; a caller that asks for the old 96 bytes still gets them).
 * Limits (`maxPushConstantsSize`, `maxPerStageDescriptorSamplers`, `maxVertexInputAttributes`, `maxFragmentOutputAttachments`, ...), the sample counts, the features
   (`independentBlend` only with `kFeatureIndependentBlend`) and the formats (sRGB, float, integer, 16 bit unorm / snorm and 10-10-10-2 only with their feature bits) follow the adapter.
-  A small GPU (128 byte push constant block, 2 texture units, 4 attributes, 4 varyings) is a small Vulkan device; the CPU renderer is a big one.
+  virgl gives 16 texture units, 16 vertex attributes (`maxVertexInputAttributes`, the most vulkan-1 takes) and 15 varyings (14 on a GL 3.3 host); a GPU with less is a smaller
+  Vulkan device, and the CPU renderer is a big one. virgl 3D commands wait up to 20 s for the host (a cold shader compile can be slow), display commands 250 ms.
 * A pipeline the adapter cannot run is refused when it is created (`VK_ERROR_FEATURE_NOT_PRESENT`, with the reason written to the debugger when `VULKAN_1_DEBUG` is set), never
   when it is drawn with.
 
