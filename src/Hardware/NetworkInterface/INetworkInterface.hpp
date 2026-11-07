@@ -76,6 +76,12 @@ class INetworkInterface : public IHardware {
     *frame = ReceivedFrame{};
     return receive(buffer, &frame->length);
   }
+  // Receive queues one at a time, for a stack that empties them on several threads at once (RSS spreads flows over them, so a flow's frames
+  // stay in one queue, in order). An interface with one queue (the default) has only queue 0, which receive_frame() reads; one with more
+  // must make receive_frame_from() on different queues safe to call at the same time (and with transmit), each queue from one thread at a time.
+  virtual uint32_t receive_queue_count() const { return 1; }
+  virtual bool receive_frame_from(uint32_t queue, ByteView buffer, ReceivedFrame* frame) { return queue == 0 && receive_frame(buffer, frame); }
+
   // transmit() with a transport checksum to finish (done in software here: the frame is copied first).
   virtual bool transmit_frame(ConstByteView frame, TransmitChecksum checksum) {
     if (!checksum.requested()) return transmit(frame);

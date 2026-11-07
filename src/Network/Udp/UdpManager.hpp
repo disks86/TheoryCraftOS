@@ -23,7 +23,8 @@
 
 namespace network {
 
-// Owns the UDP sockets and routes arriving datagrams to them by destination port.
+// Owns the UDP sockets and routes arriving datagrams to them by destination port. Thread-safe: the table has its own lock, each socket its
+// own (see UdpSocket), and a datagram is handed to its socket with the table's let go.
 class UdpManager {
  public:
   UdpManager(IIpLayer& ip, allocators::IAllocator& allocator) : ip_(ip), allocator_(allocator), sockets_(allocator) {}
@@ -45,6 +46,7 @@ class UdpManager {
 
   IIpLayer& ip_;
   allocators::IAllocator& allocator_;
+  mutable kernel::Mutex table_mutex_;   // guards the list (never held while calling into a socket)
   List<SharedPointer<UdpSocket>> sockets_;
   uint16_t next_ephemeral_ = 49152;
 };

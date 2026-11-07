@@ -30,27 +30,40 @@ void set_system_network_stacks(NetworkStackSet* stacks) { g_system_stacks = stac
 
 bool NetworkStackSet::add(hardware::INetworkInterface& nic) {
   UniquePointer<NetworkStack> stack = UniquePointer<NetworkStack>::make(allocator_, nic, clock_, allocator_);
-  UniquePointer<Worker> worker = UniquePointer<Worker>::make(allocator_);
-  if (!stack || !worker || !stack->initialize()) return false;
+  if (!stack || !stack->initialize()) return false;
   if (nic.wireless() || nic.link_comes_and_goes()) stack->set_dhcp_follows_link(true);       // the link of a Wi-Fi adapter is the connection: addresses come and go with it
   if (nic.direct_link()) stack->set_link_local_fallback(true);
-  worker->set = this;
-  worker->stack = stack.get();
+  // A worker per receive queue, chained so that the interface's interrupt wakes them all.
+  const uint32_t queues = stack->receive_queues();
+  const uint64_t first_index = workers_.count();
+  Worker* previous = nullptr;
+  for (uint32_t q = 0; q < queues; ++q) {
+    UniquePointer<Worker> worker = UniquePointer<Worker>::make(allocator_);
+    if (!worker) return false;
+    worker->set = this;
+    worker->stack = stack.get();
+    worker->queue = q;
+    Worker* raw = worker.get();
+    if (!workers_.push_back(util::move(worker))) return false;
+    if (previous) previous->next = raw;
+    previous = raw;
+  }
+  Worker* control = workers_[first_index].get();
   NetworkStack::ServiceHooks hooks;
   hooks.wake = &NetworkStackSet::on_activity;
   hooks.progress = &NetworkStackSet::on_progress;
-  hooks.context = worker.get();
+  hooks.context = control;
   stack->set_service_hooks(hooks);
   if (!stacks_.push_back(util::move(stack))) return false;
-  if (!workers_.push_back(util::move(worker))) {
-    stacks_.remove_at(stacks_.count() - 1);
-    return false;
-  }
-  nic.enable_interrupts(&NetworkStackSet::on_activity, workers_[workers_.count() - 1].get());  // (an interface that cannot stays polled)
+  nic.enable_interrupts(&NetworkStackSet::on_interrupt, control);  // (an interface that cannot stays polled)
   return true;
 }
 
 void NetworkStackSet::on_activity(void* worker) { static_cast<Worker*>(worker)->activity.set(); }
+
+void NetworkStackSet::on_interrupt(void* first_worker) {
+  for (Worker* w = static_cast<Worker*>(first_worker); w; w = w->next) w->activity.set();
+}
 
 void NetworkStackSet::on_progress(void* worker) {
   NetworkStackSet* set = static_cast<Worker*>(worker)->set;
@@ -113,15 +126,20 @@ void NetworkStackSet::stop_service() {
 void NetworkStackSet::service_main(void* self) {
   Worker* worker = static_cast<Worker*>(self);
   NetworkStack& stack = *worker->stack;
+  const bool control = worker->queue == 0;
   while (!__atomic_load_n(&worker->set->stop_, __ATOMIC_ACQUIRE)) {
-    stack.poll();
-    if (stack.saturated()) continue;  // frames are still waiting: no interrupt will say so again
+    bool saturated = stack.poll_receive(worker->queue);
+    if (control) {
+      stack.poll_control();
+      saturated = saturated || stack.saturated();
+    }
+    if (saturated) continue;  // frames are still waiting: no interrupt will say so again
     // Everything was taken: the interface may interrupt again (an interrupt masks itself until then, so a burst costs one).
     stack.interface().rearm_interrupts();
     // An interface that interrupts wakes this thread when frames arrive; then it only has to wake up by itself for the stack's timers. One
-    // that is polled keeps the short period, and so does a stack whose frames wait for room in the interface (it may not interrupt when it
-    // has sent some).
-    const bool soon = !stack.interface().interrupts_enabled() || stack.backlogged();
+    // that is polled keeps the short period, and so does the control worker of a stack whose frames wait for room in the interface (it may
+    // not interrupt when it has sent some), or whose connections pace their data.
+    const bool soon = !stack.interface().interrupts_enabled() || (control && stack.backlogged());
     worker->activity.wait(soon ? kPolledIdleUs : kInterruptIdleUs);
   }
 }

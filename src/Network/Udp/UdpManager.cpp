@@ -31,6 +31,7 @@ bool UdpManager::port_in_use(uint16_t port, IpFamilies families) const {
 }
 
 SharedPointer<UdpSocket> UdpManager::open(uint16_t port, IpFamilies families) {
+  kernel::ScopedMutex guard(table_mutex_);
   if (port == 0) {
     for (uint32_t tries = 0; tries < 16384 && port == 0; ++tries) {
       const uint16_t candidate = next_ephemeral_;
@@ -59,15 +60,22 @@ bool UdpManager::handle(const IpAddress& source, const IpAddress& destination, C
     const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolUdp, udp_length), datagram);
     if (checksum_finish(sum) != 0) return false;
   }
-  for (SharedPointer<UdpSocket>& s : sockets_) {
-    if (s->local_port() != port || s->closed() || !families_take(s->families(), source.v6)) continue;
-    s->deliver(source, source_port, datagram.dropped(8));
-    return true;
+  SharedPointer<UdpSocket> to;
+  {
+    kernel::ScopedMutex guard(table_mutex_);
+    for (SharedPointer<UdpSocket>& s : sockets_) {
+      if (s->local_port() != port || s->closed() || !families_take(s->families(), source.v6)) continue;
+      to = s;
+      break;
+    }
   }
-  return false;
+  if (!to) return false;
+  to->deliver(source, source_port, datagram.dropped(8));
+  return true;
 }
 
 void UdpManager::reap() {
+  kernel::ScopedMutex guard(table_mutex_);
   for (uint64_t i = sockets_.count(); i > 0; --i) {
     SharedPointer<UdpSocket>& s = sockets_[i - 1];
     if (s->closed() || s.use_count() == 1) sockets_.remove_at(i - 1);

@@ -26,6 +26,7 @@
 #include "Network/Tcp/TcpCoalescer.hpp"
 #include "Network/Tcp/TcpManager.hpp"
 #include "Network/Udp/UdpManager.hpp"
+#include "ObjectContainer/Array.hpp"
 #include "ObjectContainer/Dictionary.hpp"
 #include "ObjectContainer/Queue.hpp"
 #include "Hardware/Clock/IClock.hpp"
@@ -78,7 +79,17 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
 
   // --- INetworkStack
   kernel::RecursiveMutex& mutex() override { return mutex_; }
+  // Receives and runs everything (every receive queue, then poll_control()). A thread per receive queue can instead call poll_receive() for
+  // its queue while one calls poll_control() (NetworkStackSet does).
   void poll() override;
+  // The interface's receive queues (each with its own receive offload run and lock; see INetworkInterface::receive_frame_from).
+  uint32_t receive_queues() const { return queue_count_; }
+  // Takes and handles what queue `queue` has received (up to a batch). True if it stopped at the limit (more are probably waiting). Takes no
+  // stack-wide lock: TCP and UDP go to their sockets under the sockets' own locks, so several queues are handled at once.
+  bool poll_receive(uint32_t queue);
+  // Everything that is not receiving: the loopback, DHCP, IPv6 autoconfiguration, link-local addresses, DNS, ARP retries, TCP timers and what
+  // waits in the transmit queue.
+  void poll_control();
   // The last poll() stopped at its limit of frames: more are probably waiting (an interrupt will not announce those again).
   // (read by the service thread while another thread's poll may be setting it: a hint, accessed atomically)
   bool saturated() const { return __atomic_load_n(&saturated_, __ATOMIC_RELAXED); }
@@ -104,7 +115,10 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void leave_multicast(Ipv4Address group) override;
 
   // --- IIpLayer
-  Ipv4Address local_address() const override { return config_.address; }
+  Ipv4Address local_address() const override {
+    kernel::ScopedRecursiveMutex guard(ip_lock_);
+    return config_.address;
+  }
   uint32_t max_payload() const override { return kMaxIpPayload; }
   uint64_t now_ms() const override { return clock_.now_ms(); }
   bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) override;
@@ -125,7 +139,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   Ipv6Address source_for6(const Ipv6Address& destination) const;
 
   // Receive offload: TCP segments put together before TCP saw them (0 without), see TcpCoalescer.
-  uint64_t coalesced_segments() const { return coalescer_.merged(); }
+  uint64_t coalesced_segments() const;
+  // The most receive queues seen being handled at the same moment (for tests: two flows on two queues were handled concurrently).
+  uint32_t concurrent_receives_seen() const { return __atomic_load_n(&concurrent_peak_, __ATOMIC_RELAXED); }
 
  private:
   struct ArpEntry {
@@ -162,8 +178,14 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void on_lease(const IpConfiguration& configuration) override;
   void on_lease_lost() override;
 
+  struct RxQueue {   // one receive queue's state: taken only by the thread handling the queue (under `lock`)
+    kernel::Mutex lock;
+    ByteView storage;
+    TcpCoalescer coalescer;
+  };
+  static constexpr uint32_t kMaxQueues = 8;
   void handle_frame(ConstByteView frame, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
-  void flush_coalesced();
+  void flush_coalesced(RxQueue& rx);
   bool next_hop_for(Ipv4Address destination, hardware::MacAddress* mac) const;
   void handle_arp(ConstByteView arp);
   void handle_ipv4(ConstByteView packet, bool looped = false, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
@@ -204,7 +226,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
                   hardware::TransmitChecksum checksum = hardware::TransmitChecksum{});
   void send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
   void send_arp_from(uint16_t operation, Ipv4Address sender_ip, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
-  void service_link_local();
+  bool service_link_local();   // true: DHCP should be tried again (the caller does it, with the IP lock let go)
   void link_local_conflict();
   void check_link_local_claim(uint16_t operation, const hardware::MacAddress& sender_mac, Ipv4Address sender_ip, Ipv4Address target_ip);
   void learn(Ipv4Address address, const hardware::MacAddress& mac);
@@ -215,9 +237,20 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void handle_igmp(ConstByteView igmp);
   void send_igmp_report(Ipv4Address group);
 
-  // Guards everything below, and the sockets and resolver. Fair (handed to waiters in turn): the service thread holds it in long stretches,
-  // and application threads must get it in between - an unfair one let the polling thread take it straight back (see poll()).
+  // The locks, outermost first (a thread holding one may take only those after it):
+  //   1. a receive queue's lock (RxQueue::lock: the thread handling that queue)
+  //   2. mutex_, the control lock: DHCP, the resolver, the orchestration of poll_control(), and what applications ask of the stack itself
+  //      (configure, start_dhcp). Fair (handed to waiters in turn).
+  //   3. a TLS connection's lock, 4. a TCP or UDP socket's (a listener's before one of its new connections'), 5. the socket tables' and a
+  //      listener's accept queue (TcpManager, UdpManager)
+  //   6. ip_lock_: everything of the IP layer below - addresses (IPv4 and IPv6, and their autoconfiguration), ARP and neighbor caches,
+  //      the packets waiting for them and for the loopback, the transmit queue and the interface's transmit path, the ping, multicast groups.
+  //      Held only while a packet is built and sent or the state looked at; nothing under it calls into a socket. Fair too: receive threads
+  //      take it for a moment per frame, and under a flood an application's send would otherwise keep losing the race for it (10 ms a datagram).
+  // So receiving takes no stack-wide lock (TCP and UDP go straight to their sockets, ARP, ICMP and neighbor discovery take the IP lock), and
+  // sockets on different queues are handled at the same time.
   kernel::RecursiveMutex mutex_;
+  mutable kernel::RecursiveMutex ip_lock_;
   kernel::Mutex ping_mutex_;      // one ping at a time (they share the ping_* state)
   hardware::INetworkInterface& nic_;
   hardware::IClock& clock_;
@@ -240,17 +273,18 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   kernel::Mutex progress_mutex_;
   kernel::ConditionVariable progress_cv_;
   void note_progress();
-  uint8_t outgoing_ecn_ = kEcnNotEct;   // the ECN field of the IP packet being built (set by send_ip_to for its call)
+  uint8_t outgoing_ecn_ = kEcnNotEct;   // the ECN field of the IP packet being built (set by send_ip_to for its call, under ip_lock_)
   UdpManager udp_;
   TcpManager tcp_;
   SharedPointer<UdpSocket> dhcp_socket_;
   UniquePointer<DhcpClient> dhcp_;
   UniquePointer<DnsResolver> resolver_;
   uint16_t ip_id_ = 1;
-  // Receive offload: the run of TCP segments being put together during a poll(), and its memory.
+  // Receive offload and the receive queues: each queue's run of TCP segments being put together, and its memory.
   static constexpr uint32_t kCoalesceBytes = 24 * 1024;
-  ByteView coalesce_storage_;
-  TcpCoalescer coalescer_;
+  Array<UniquePointer<RxQueue>, kMaxQueues> rx_;
+  uint32_t queue_count_ = 1;
+  uint32_t receiving_now_ = 0, concurrent_peak_ = 0;   // (queues being handled at this moment, and the most seen)
   // Segmentation offload: where a large TCP segment's frame is built (allocated with the first one).
   ByteView segment_frame_;
   static constexpr uint32_t kMaxGroups = 8;

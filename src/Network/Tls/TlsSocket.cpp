@@ -101,7 +101,7 @@ TlsSocket::~TlsSocket() {
 // ------------------------------------------------------------------------------------------------ ITcpSocket
 
 bool TlsSocket::connect_ip(const IpAddress& address, uint16_t port) {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   if (state_ != St::Idle || inner_) return false;
   inner_ = stack_.tcp_open();
   if (!inner_ || !inner_->connect_ip(address, port)) {
@@ -119,7 +119,7 @@ bool TlsSocket::connect_ip(const IpAddress& address, uint16_t port) {
 }
 
 TcpState TlsSocket::state() const {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   const_cast<TlsSocket*>(this)->pump();
   if (!inner_) return TcpState::Closed;
   if (state_ == St::Failed) return TcpState::Closed;
@@ -129,37 +129,37 @@ TcpState TlsSocket::state() const {
 }
 
 bool TlsSocket::is_connected() const {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   const_cast<TlsSocket*>(this)->pump();
   return state_ == St::Open;
 }
 
 bool TlsSocket::failed() const {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   const_cast<TlsSocket*>(this)->pump();
   return state_ == St::Failed || (inner_ && inner_->failed());
 }
 
 bool TlsSocket::peer_closed() const {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   const_cast<TlsSocket*>(this)->pump();
   return peer_closed_ && in_.size() == 0;
 }
 
 uint32_t TlsSocket::available() const {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   const_cast<TlsSocket*>(this)->pump();
   return in_.size();
 }
 
 uint32_t TlsSocket::unsent_or_unacknowledged() const {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   const_cast<TlsSocket*>(this)->pump();
   return out_.size() + (inner_ ? inner_->unsent_or_unacknowledged() : 0);
 }
 
 uint32_t TlsSocket::receive(ByteView buffer) {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   pump();
   const uint32_t n = in_.read(buffer);
   if (n) pump();   // room for more
@@ -167,7 +167,7 @@ uint32_t TlsSocket::receive(ByteView buffer) {
 }
 
 uint32_t TlsSocket::send(ConstByteView data) {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   pump();
   if (state_ != St::Open || sent_close_) return 0;
   uint32_t done = 0;
@@ -186,7 +186,7 @@ uint32_t TlsSocket::send(ConstByteView data) {
 }
 
 void TlsSocket::close() {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   if (!inner_) return;
   pump();
   if (state_ == St::Open && !sent_close_) {
@@ -199,7 +199,7 @@ void TlsSocket::close() {
 }
 
 void TlsSocket::abort() {
-  kernel::ScopedRecursiveMutex lock(stack_.mutex());
+  kernel::ScopedRecursiveMutex lock(lock_);
   if (inner_) inner_->abort();
   if (state_ != St::Failed) state_ = St::Closed;
 }

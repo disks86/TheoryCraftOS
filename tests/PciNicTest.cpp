@@ -1814,9 +1814,20 @@ static void test_e1000e_msix() {
     const std::vector<Bytes> frames = flow_frames(16, 4);
     for (const Bytes& f : frames) CHECK(m->deliver(f));
     CHECK(m->vector_raised[0] - before[0] == 1 && m->vector_raised[1] - before[1] == 1);
+    // read a queue at a time (what a stack with a thread per queue does): each frame comes out of the queue RSS put it on, none from the other
+    CHECK(nic.receive_queue_count() == 2 && !nic.receive_frame_from(2, ByteView(buffer, sizeof buffer), &got));
+    uint32_t on[2] = {0, 0}, expected[2] = {0, 0};
+    const uint64_t counted[2] = {nic.queue_frames(0), nic.queue_frames(1)};
+    for (const Bytes& f : frames) ++expected[m->rss_queue(f)];
+    for (uint32_t q = 0; q < 2; ++q)
+      while (nic.receive_frame_from(q, ByteView(buffer, sizeof buffer), &got)) ++on[q];
+    CHECK(on[0] == expected[0] && on[1] == expected[1] && on[0] + on[1] == frames.size() && on[0] > 0 && on[1] > 0);
+    CHECK(nic.queue_frames(0) - counted[0] == on[0] && nic.queue_frames(1) - counted[1] == on[1]);
+    // and all at once, the old way: the queues in turn
+    for (const Bytes& f : frames) CHECK(m->deliver(f));
     uint32_t taken = 0;
     while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) ++taken;
-    CHECK(taken == frames.size() && nic.queue_frames(0) > 0 && nic.queue_frames(1) > 0);
+    CHECK(taken == frames.size() && nic.queue_frames(0) - counted[0] == 2 * on[0] && nic.queue_frames(1) - counted[1] == 2 * on[1]);
     nic.rearm_interrupts();
     while (nic.receive_frame(ByteView(buffer, sizeof buffer), &got)) {}
     nic.rearm_interrupts();

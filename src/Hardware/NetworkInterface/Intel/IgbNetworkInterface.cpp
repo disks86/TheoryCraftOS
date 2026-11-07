@@ -499,17 +499,26 @@ bool IgbNetworkInterface::receive(ByteView buffer, uint32_t* length) {
   return true;
 }
 
+// The queues in turn, so a busy one does not starve the others (one thread reading every queue); a stack with a thread per queue uses
+// receive_frame_from() instead.
 bool IgbNetworkInterface::receive_frame(ByteView buffer, ReceivedFrame* received) {
-  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !received) return false;
-  for (uint32_t k = 0; k < queues_; ++k) {  // the queues in turn, so a busy one does not starve the others
-    const uint32_t q = (rx_turn_ + k) % queues_;
-    if (receive_from(q, buffer, received)) {
-      rx_turn_ = (q + 1) % queues_;
+  const uint32_t turn = __atomic_load_n(&rx_turn_, __ATOMIC_RELAXED);
+  for (uint32_t k = 0; k < queues_; ++k) {
+    const uint32_t q = (turn + k) % queues_;
+    if (receive_frame_from(q, buffer, received)) {
+      __atomic_store_n(&rx_turn_, (q + 1) % queues_, __ATOMIC_RELAXED);
       return true;
     }
   }
   return false;
+}
+
+// One queue, under its own lock: several queues are read at once (and transmitted on meanwhile, under mutex_), each by one thread.
+bool IgbNetworkInterface::receive_frame_from(uint32_t q, ByteView buffer, ReceivedFrame* received) {
+  if (!started_ || !received || q >= queues_) return false;
+  kernel::ScopedMutex guard(rx_[q].lock);
+  return receive_from(q, buffer, received);
 }
 
 bool IgbNetworkInterface::receive_from(uint32_t q, ByteView buffer, ReceivedFrame* received) {
@@ -528,11 +537,14 @@ bool IgbNetworkInterface::receive_from(uint32_t q, ByteView buffer, ReceivedFram
       const bool checked = !(status & kRxIgnoreChecksum);
       *received = ReceivedFrame{frame, checked && (status & kRxIpChecksum) && !(status & kRxIpError),
                                 checked && (status & (kRxTcpChecksum | kRxUdpChecksum)) && !(status & kRxTcpUdpError)};
-      ++stats_.frames_received;
+      __atomic_add_fetch(&stats_.frames_received, 1, __ATOMIC_RELAXED);   // (shared by the queues: counted atomically)
       ++queue.frames;
-      moderator_.account(1, frame);
+      {
+        kernel::ScopedMutex shared(mutex_);   // (the moderator is the interface's, not the queue's)
+        moderator_.account(1, frame);
+      }
     } else {
-      ++stats_.frames_dropped;
+      __atomic_add_fetch(&stats_.frames_dropped, 1, __ATOMIC_RELAXED);
     }
     post_receive(queue, queue.next);
     __atomic_thread_fence(__ATOMIC_RELEASE);
