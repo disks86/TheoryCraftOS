@@ -133,7 +133,10 @@ bool join(Thread* thread, uint64_t) {
 void detach(Thread* thread) { pthread_detach(reinterpret_cast<HostThread*>(thread)->handle); }  // (leaked: tests only)
 
 void Mutex::lock() {
+  if (!__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE)) return;
+  __atomic_add_fetch(&waiters_, 1, __ATOMIC_RELAXED);   // (what contended() reads)
   while (__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE)) nap();
+  __atomic_sub_fetch(&waiters_, 1, __ATOMIC_RELAXED);
 }
 bool Mutex::try_lock() { return !__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE); }
 void Mutex::unlock() { __atomic_store_n(&state_, 0u, __ATOMIC_RELEASE); }

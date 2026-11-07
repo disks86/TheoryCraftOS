@@ -31,6 +31,8 @@ constexpr uint32_t kMaxPending = 8;
 constexpr uint32_t kMaxLooped = 256;         // packets to itself not yet delivered; more are dropped (TCP sends them again)
 constexpr uint32_t kLoopedPerPoll = 4096;    // a bound on the exchanges one poll() carries on over the loopback
 constexpr uint32_t kFramesPerPoll = 64;  // bound the work done in one poll()
+constexpr uint32_t kFramesPerBatch = 16;  // received frames handled per hold of the lock (see poll())
+constexpr uint64_t kHandoffUs = 200;      // how long poll() waits for a thread it let the lock go to
 constexpr uint8_t kIcmpEchoReply = 0, kIcmpEchoRequest = 8;
 constexpr uint16_t kArpRequest = 1, kArpReply = 2;
 // RFC 3927: three probes about a second apart, two seconds of quiet, two announcements two seconds apart, ten conflicts before slowing down, defend an address once in ten seconds.
@@ -45,6 +47,7 @@ NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& c
       arp_(allocator),
       pending_(allocator),
       looped_(allocator),
+      egress_(allocator),
       udp_(*this, allocator),
       tcp_(*this, allocator),
       pending6_(allocator) {}
@@ -119,24 +122,42 @@ SharedPointer<ITcpSocket> NetworkStack::tcp_open() {
 // ------------------------------------------------------------------ receiving
 
 void NetworkStack::poll() {
-  kernel::ScopedRecursiveMutex guard(mutex_);
   uint8_t frame[hardware::kEthernetMaxFrame + 64];
   hardware::ReceivedFrame received;
-  saturated_ = false;
-  uint32_t i = 0;
-  for (; i < kFramesPerPoll && nic_.receive_frame(ByteView(frame), &received); ++i) {
-    if (received.length > sizeof(frame)) continue;
-    const ConstByteView f = ConstByteView(frame).first(received.length);
-    // Receive offload: a TCP segment for this machine may join the run being put together; anything else hands the run on first (order is kept).
-    const bool ours = received.length >= hardware::kEthernetHeaderSize && hardware::MacAddress{{f[0], f[1], f[2], f[3], f[4], f[5]}} == nic_.mac_address();
-    if (ours && coalescer_.offer(f, received)) continue;
-    flush_coalesced();
-    if (ours && coalescer_.offer(f, received)) continue;
-    handle_frame(f, received);
+  uint32_t taken = 0;
+  bool more = true;
+  // Received frames go through in batches. Between two, the lock is let go when another thread waits for it (an application's send() or
+  // receive()), so a stream of arriving frames cannot keep an application out for the whole poll: it gets in after at most one batch.
+  while (more && taken < kFramesPerPoll) {
+    {
+      kernel::ScopedRecursiveMutex guard(mutex_);
+      if (taken == 0 && !egress_.empty()) egress_.drain(nic_, now_ms());   // (what waited for room goes first: ACKs among it)
+      uint32_t n = 0;
+      for (; n < kFramesPerBatch && nic_.receive_frame(ByteView(frame), &received); ++n) {
+        if (received.length > sizeof(frame)) continue;
+        const ConstByteView f = ConstByteView(frame).first(received.length);
+        // Receive offload: a TCP segment for this machine may join the run being put together; anything else hands the run on first (order is kept).
+        const bool ours = received.length >= hardware::kEthernetHeaderSize && hardware::MacAddress{{f[0], f[1], f[2], f[3], f[4], f[5]}} == nic_.mac_address();
+        if (ours && coalescer_.offer(f, received)) continue;
+        flush_coalesced();
+        if (ours && coalescer_.offer(f, received)) continue;
+        handle_frame(f, received);
+      }
+      taken += n;
+      more = n == kFramesPerBatch;
+      if (!more || !mutex_.contended()) continue;
+    }
+    // Hand it over: the lock does not queue (whoever tries first gets it), so this thread, trying again at once, would usually win. It
+    // waits - yielding - until the waiter has it, for at most kHandoffUs.
+    const uint64_t until = clock_.now_us() + kHandoffUs;
+    do kernel::yield();
+    while (mutex_.contended() && clock_.now_us() < until);
   }
-  saturated_ = i == kFramesPerPoll;
+
+  kernel::ScopedRecursiveMutex guard(mutex_);
   // A poll that stopped at its limit is followed by another at once (NetworkStackSet): the run may go on in it. Otherwise it is handed on now,
   // so coalescing never holds a segment back for longer than the frames already waiting take.
+  saturated_ = taken >= kFramesPerPoll;
   if (!saturated_) flush_coalesced();
 
   if (follow_link_) {
@@ -150,30 +171,36 @@ void NetworkStack::poll() {
         link_local_state_ = LinkLocalState::Off;
         config_ = IpConfiguration{};
         stop_ipv6();  // (autoconfiguration starts over when the link is back)
+        egress_.clear();
       }
     }
   }
-  deliver_looped();
+  uint32_t looped = deliver_looped();
   dhcp_->poll();
   service_ipv6();
   service_link_local();
   resolver_->poll();
   service_pending();
   tcp_.poll();
-  deliver_looped();  // (what the timers and the received frames sent to this stack itself)
+  looped += deliver_looped();  // (what the timers and the received frames sent to this stack itself)
   udp_.reap();
+  const uint32_t drained = egress_.empty() ? 0 : egress_.drain(nic_, now_ms());
+  if (!looped_.empty()) saturated_ = true;   // (the loopback's bound per poll was reached: go on at once)
+  if ((taken || looped || drained) && hooks_.progress) hooks_.progress(hooks_.context);
 }
 
 // Packets to 127.0.0.0/8 or to our own address go no further than this queue. Delivering one may send
 // others (an ACK, an answer), which are delivered in the same call, up to a bound.
-void NetworkStack::deliver_looped() {
-  for (uint32_t i = 0; i < kLoopedPerPoll && !looped_.empty(); ++i) {
+uint32_t NetworkStack::deliver_looped() {
+  uint32_t i = 0;
+  for (; i < kLoopedPerPoll && !looped_.empty(); ++i) {
     LoopedPacket p;
     if (!looped_.dequeue(&p)) break;
     const ConstByteView packet = ConstByteView(p.ip_packet).first(p.length);
     if (p.length && (p.ip_packet[0] >> 4) == 6) handle_ipv6(packet, true);
     else handle_ipv4(packet, true);
   }
+  return i;
 }
 
 // (also called before anything that must see the frames received so far in order: a send, a timer, another poll that is not straight after)
@@ -355,12 +382,43 @@ bool NetworkStack::send_frame(const hardware::MacAddress& destination, uint16_t 
   out.be16(ether_type);
   out.bytes(payload);
   if (!out.ok()) return false;
-  if (!checksum.requested()) return nic_.transmit(out.written());
+  if (!checksum.requested()) return transmit(EgressQueue::Kind::Plain, out.written());
   checksum.start = static_cast<uint16_t>(checksum.start + hardware::kEthernetHeaderSize);
   checksum.field = static_cast<uint16_t>(checksum.field + hardware::kEthernetHeaderSize);
-  if (nic_.offloads().transmit_checksums) return nic_.transmit_frame(out.written(), checksum);
+  if (nic_.offloads().transmit_checksums) return transmit(EgressQueue::Kind::Checksum, out.written(), checksum);
   const ByteView written = ByteView(frame).first(out.position());
-  return hardware::finish_transmit_checksum(written, checksum) && nic_.transmit(written);
+  return hardware::finish_transmit_checksum(written, checksum) && transmit(EgressQueue::Kind::Plain, written);
+}
+
+bool NetworkStack::transmit(EgressQueue::Kind kind, ConstByteView frame, hardware::TransmitChecksum checksum, uint16_t mss) {
+  const uint64_t now = now_ms();
+  if (!egress_.empty()) egress_.drain(nic_, now);
+  if (egress_.empty()) {   // (with frames waiting, this one waits its turn too: a flow's frames stay in order)
+    bool sent = false;
+    switch (kind) {
+      case EgressQueue::Kind::Plain: sent = nic_.transmit(frame); break;
+      case EgressQueue::Kind::Checksum: sent = nic_.transmit_frame(frame, checksum); break;
+      case EgressQueue::Kind::Segmented: sent = nic_.transmit_segmented(frame, checksum, mss); break;
+    }
+    if (sent) return true;
+  }
+  const bool queued = egress_.enqueue(EgressQueue::flow_of_frame(frame), kind, frame, checksum, mss, now);
+  if (queued) wake_service();
+  return queued;
+}
+
+bool NetworkStack::backlogged() const {
+  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  return !egress_.empty() || !looped_.empty();
+}
+
+EgressQueue::Stats NetworkStack::egress_stats() const {
+  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  return egress_.stats();
+}
+
+uint32_t NetworkStack::queued_for(const IpAddress& remote, uint16_t local_port, uint16_t remote_port) const {
+  return egress_.queued_in_flow(EgressQueue::flow_of(remote, kProtocolTcp, local_port, remote_port));   // (called by TCP, under the stack's lock)
 }
 
 // The MAC address a packet to `destination` goes to, when it is known now (an ARP entry that has not expired): for unicast to the wire only.
@@ -446,7 +504,7 @@ bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteVie
   const uint16_t seed = static_cast<uint16_t>(~checksum_finish(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint32_t>(segment.size()))));
   frame[tcp + 16] = static_cast<uint8_t>(seed >> 8);
   frame[tcp + 17] = static_cast<uint8_t>(seed);
-  return nic_.transmit_segmented(frame, hardware::TransmitChecksum{static_cast<uint16_t>(tcp), static_cast<uint16_t>(tcp + 16)}, mss);
+  return transmit(EgressQueue::Kind::Segmented, frame, hardware::TransmitChecksum{static_cast<uint16_t>(tcp), static_cast<uint16_t>(tcp + 16)}, mss);
 }
 
 IpAddress NetworkStack::source_for_ip(const IpAddress& destination) const {
@@ -537,8 +595,9 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
     if (looped_.count() >= kMaxLooped || !finish_here()) return false;
     LoopedPacket p;
     p.length = static_cast<uint16_t>(packet.size());
-    if (!ByteView(p.ip_packet).copy_from(packet)) return false;
-    return looped_.enqueue(p);
+    if (!ByteView(p.ip_packet).copy_from(packet) || !looped_.enqueue(p)) return false;
+    wake_service();   // (delivered by the next poll: right away, not at the service thread's next timer)
+    return true;
   }
 
   const bool broadcast = link_broadcast || destination.is_limited_broadcast() ||

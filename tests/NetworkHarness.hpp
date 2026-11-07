@@ -64,6 +64,10 @@ struct FakeNic final : hardware::INetworkInterface {
   Wire* wire; FakeNic* peer = nullptr; int index; hardware::MacAddress mac;
   std::deque<std::vector<uint8_t>> inbox; hardware::NetworkStatistics stats; bool cable = true;
   std::function<void()> on_idle;   // called when receive() finds nothing: lets the peer machine run
+  // A bottleneck: at most this many frames (0: no limit) are taken per millisecond of the fake clock (Lan::step refills it); past that the
+  // transmit queue is "full" and transmit() refuses, as a real interface's ring does. `refused` counts the refusals.
+  uint32_t frames_per_ms = 0, budget = 0;
+  uint64_t refused = 0;
   // Checksum offload, as a card that has it: transmit_frame() finishes the checksum "in hardware" (the software helper), receive_frame() vouches
   // for every TCP/UDP frame (`vouch`: the tests break checksums to see the stack trusts it).
   bool offload = false, vouch = true; uint64_t offloaded = 0;
@@ -98,6 +102,7 @@ struct FakeNic final : hardware::INetworkInterface {
   const char* name() const override { return "fake nic"; } bool initialize() override { return true; } void shutdown() override {}
   hardware::MacAddress mac_address() const override { return mac; } bool link_up() const override { return cable; }
   bool transmit(ConstByteView frame_view) override {
+    if (frames_per_ms) { if (budget == 0) { ++refused; return false; } --budget; }
     const uint8_t* frame = frame_view.data(); const uint32_t length = (uint32_t)frame_view.size();
     std::vector<uint8_t> f(frame, frame + length); if (f.size() < 60) f.resize(60);
     ++wire->frames; if (wire->tap) wire->tap(f, index);
@@ -123,7 +128,7 @@ struct Lan {
   Lan() { nic_a.peer = &nic_b; nic_b.peer = &nic_a; assert(a.initialize() && b.initialize());
     nic_a.on_idle = [this] { if (in_idle) return; in_idle = true; b.poll(); in_idle = false; };
     nic_b.on_idle = [this] { if (in_idle) return; in_idle = true; a.poll(); in_idle = false; }; }
-  void step(int ms = 1) { for (int i = 0; i < ms; ++i) { clock.us += 1000; a.poll(); b.poll(); } }
+  void step(int ms = 1) { for (int i = 0; i < ms; ++i) { clock.us += 1000; nic_a.budget = nic_a.frames_per_ms; nic_b.budget = nic_b.frames_per_ms; a.poll(); b.poll(); } }
   bool run_until(const std::function<bool()>& done, int max_ms = 60000) { for (int i = 0; i < max_ms; ++i) { if (done()) return true; step(); } return done(); }
   void configure_static() {
     IpConfiguration ca, cb;

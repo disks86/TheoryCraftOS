@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Network/Dhcp/DhcpClient.hpp"
 #include "Network/Dns/DnsResolver.hpp"
+#include "Network/EgressQueue.hpp"
 #include "Network/INetworkStack.hpp"
 #include "Network/Ip/IIpLayer.hpp"
 #include "Network/Tcp/TcpCoalescer.hpp"
@@ -61,6 +62,17 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   // The address the stack tries on its `attempt`-th try (0 first): from the MAC address and the attempt, in 169.254.1.0 - 169.254.254.255 as the RFC reserves the first and last 256.
   static Ipv4Address link_local_candidate(const hardware::MacAddress& mac, uint32_t attempt);
 
+  // Who runs this stack (NetworkStackSet's service thread for it): `wake` is called when the stack has work that its next poll() should do
+  // now - a packet to itself, frames waiting for room in the interface - from whatever thread made it (an application's send(), say);
+  // `progress` after a poll() that changed something sockets may be waiting for (frames received or delivered, frames sent from the
+  // transmit queue). Either may be null. Both run with the stack's lock held: they must only signal.
+  struct ServiceHooks {
+    void (*wake)(void* context) = nullptr;
+    void (*progress)(void* context) = nullptr;
+    void* context = nullptr;
+  };
+  void set_service_hooks(const ServiceHooks& hooks) { hooks_ = hooks; }
+
   // The interface this stack drives.
   hardware::INetworkInterface& interface() const { return nic_; }
 
@@ -69,6 +81,10 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void poll() override;
   // The last poll() stopped at its limit of frames: more are probably waiting (an interrupt will not announce those again).
   bool saturated() const { return saturated_; }
+  // Frames are waiting for room in the interface's transmit queue (EgressQueue): the stack should be polled again soon, whether or not the
+  // interface interrupts when it has sent some.
+  bool backlogged() const;
+  EgressQueue::Stats egress_stats() const;
   IpConfiguration configuration() const override;
   void configure(const IpConfiguration& configuration) override;
   void start_dhcp() override;
@@ -91,6 +107,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
                     bool link_broadcast) override;
   uint32_t max_segmented_payload(const IpAddress& destination) const override;
+  uint32_t queued_for(const IpAddress& remote, uint16_t local_port, uint16_t remote_port) const override;
   bool send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss) override;
   IpAddress source_for_ip(const IpAddress& destination) const override;
   bool send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload) override;
@@ -146,7 +163,6 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   bool next_hop_for(Ipv4Address destination, hardware::MacAddress* mac) const;
   void handle_arp(ConstByteView arp);
   void handle_ipv4(ConstByteView packet, bool looped = false, const hardware::ReceivedFrame& checks = hardware::ReceivedFrame{});
-  void deliver_looped();
   void handle_icmp(Ipv4Address source, ConstByteView icmp);
   // --- IPv6 (NetworkStackIpv6.cpp)
   void start_ipv6();
@@ -176,6 +192,10 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void service_pending6();
   void begin_duplicate_detection(bool global);
   // `checksum` (offsets into the payload: an IP packet) is a transport checksum still to finish: by the interface when it offloads them.
+  // Hands a frame to the interface, or, when it has no room (or frames are waiting already), to the transmit queue. False if neither took it.
+  void wake_service() { if (hooks_.wake) hooks_.wake(hooks_.context); }
+  uint32_t deliver_looped();
+  bool transmit(EgressQueue::Kind kind, ConstByteView frame, hardware::TransmitChecksum checksum = hardware::TransmitChecksum{}, uint16_t mss = 0);
   bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload,
                   hardware::TransmitChecksum checksum = hardware::TransmitChecksum{});
   void send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
@@ -208,6 +228,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   Dictionary<uint32_t, ArpEntry> arp_;
   Queue<PendingPacket> pending_;
   Queue<LoopedPacket> looped_;
+  EgressQueue egress_;   // frames the interface had no room for, sent fairly as it makes room
+  ServiceHooks hooks_;
   UdpManager udp_;
   TcpManager tcp_;
   SharedPointer<UdpSocket> dhcp_socket_;

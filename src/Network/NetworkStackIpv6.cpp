@@ -477,8 +477,9 @@ bool NetworkStack::send_ip6(const Ipv6Address& source, const Ipv6Address& destin
     if (looped_.count() >= 256 || !finish_here()) return false;
     LoopedPacket p;
     p.length = static_cast<uint16_t>(packet.size());
-    if (!ByteView(p.ip_packet).copy_from(packet)) return false;
-    return looped_.enqueue(p);
+    if (!ByteView(p.ip_packet).copy_from(packet) || !looped_.enqueue(p)) return false;
+    wake_service();   // (delivered by the next poll: right away, not at the service thread's next timer)
+    return true;
   }
   if (destination.is_multicast()) return send_frame(multicast_mac(destination), kEtherTypeIpv6, packet, checksum);
 

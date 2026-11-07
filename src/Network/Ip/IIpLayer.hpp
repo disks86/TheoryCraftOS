@@ -78,6 +78,15 @@ class IIpLayer {
     return false;
   }
 
+  // Frames of the TCP connection (remote address and ports) still waiting in the stack's transmit queue because the interface had no room
+  // (see EgressQueue): a sender holds back while some are, so that it fills the queue with no more than its share. 0 when there is none.
+  virtual uint32_t queued_for(const IpAddress& remote, uint16_t local_port, uint16_t remote_port) const {
+    (void)remote;
+    (void)local_port;
+    (void)remote_port;
+    return 0;
+  }
+
  protected:
   IIpLayer() = default;
   ~IIpLayer() = default;
