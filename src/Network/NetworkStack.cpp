@@ -32,7 +32,6 @@ constexpr uint32_t kMaxLooped = 256;         // packets to itself not yet delive
 constexpr uint32_t kLoopedPerPoll = 4096;    // a bound on the exchanges one poll() carries on over the loopback
 constexpr uint32_t kFramesPerPoll = 64;  // bound the work done in one poll()
 constexpr uint32_t kFramesPerBatch = 16;  // received frames handled per hold of the lock (see poll())
-constexpr uint64_t kHandoffUs = 200;      // how long poll() waits for a thread it let the lock go to
 constexpr uint8_t kIcmpEchoReply = 0, kIcmpEchoRequest = 8;
 constexpr uint16_t kArpRequest = 1, kArpReply = 2;
 // RFC 3927: three probes about a second apart, two seconds of quiet, two announcements two seconds apart, ten conflicts before slowing down, defend an address once in ten seconds.
@@ -41,7 +40,8 @@ constexpr uint64_t kLinkLocalProbeMs = 1000, kLinkLocalQuietMs = 2000, kLinkLoca
 }  // namespace
 
 NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& clock, allocators::IAllocator& allocator)
-    : nic_(nic),
+    : mutex_(true),
+      nic_(nic),
       clock_(clock),
       allocator_(allocator),
       arp_(allocator),
@@ -147,18 +147,16 @@ void NetworkStack::poll() {
       more = n == kFramesPerBatch;
       if (!more || !mutex_.contended()) continue;
     }
-    // Hand it over: the lock does not queue (whoever tries first gets it), so this thread, trying again at once, would usually win. It
-    // waits - yielding - until the waiter has it, for at most kHandoffUs.
-    const uint64_t until = clock_.now_us() + kHandoffUs;
-    do kernel::yield();
-    while (mutex_.contended() && clock_.now_us() < until);
+    // The lock is a fair one: letting it go here gave it to the waiting thread, and this one queues behind it when it locks again. (The yield
+    // lets that thread run now if it shares this core.)
+    kernel::yield();
   }
 
   kernel::ScopedRecursiveMutex guard(mutex_);
   // A poll that stopped at its limit is followed by another at once (NetworkStackSet): the run may go on in it. Otherwise it is handed on now,
   // so coalescing never holds a segment back for longer than the frames already waiting take.
-  saturated_ = taken >= kFramesPerPoll;
-  if (!saturated_) flush_coalesced();
+  const bool saturated = taken >= kFramesPerPoll;
+  if (!saturated) flush_coalesced();
 
   if (follow_link_) {
     const bool up = nic_.link_up();
@@ -185,8 +183,25 @@ void NetworkStack::poll() {
   looped += deliver_looped();  // (what the timers and the received frames sent to this stack itself)
   udp_.reap();
   const uint32_t drained = egress_.empty() ? 0 : egress_.drain(nic_, now_ms());
-  if (!looped_.empty()) saturated_ = true;   // (the loopback's bound per poll was reached: go on at once)
-  if ((taken || looped || drained) && hooks_.progress) hooks_.progress(hooks_.context);
+  // (the loopback's bound per poll was reached: go on at once)
+  __atomic_store_n(&saturated_, saturated || !looped_.empty(), __ATOMIC_RELAXED);
+  if (taken || looped || drained) note_progress();
+}
+
+void NetworkStack::note_progress() {
+  __atomic_add_fetch(&progress_, 1, __ATOMIC_ACQ_REL);
+  {
+    kernel::ScopedMutex guard(progress_mutex_);   // (so that a waiter between its check and its wait is not missed)
+    progress_cv_.notify_all();
+  }
+  if (hooks_.progress) hooks_.progress(hooks_.context);
+}
+
+bool NetworkStack::wait_for_progress(uint64_t seen, uint64_t timeout_us) {
+  if (timeout_us == 0) return true;   // (0 is "forever" to the condition variable: never that here)
+  kernel::ScopedMutex guard(progress_mutex_);
+  if (progress() == seen) progress_cv_.wait(progress_mutex_, timeout_us);
+  return true;
 }
 
 // Packets to 127.0.0.0/8 or to our own address go no further than this queue. Delivering one may send
@@ -317,7 +332,7 @@ void NetworkStack::handle_igmp(ConstByteView igmp) {
 void NetworkStack::handle_ipv4(ConstByteView packet, bool looped, const hardware::ReceivedFrame& checks) {
   ByteReader in(packet);
   const uint8_t version_and_length = in.u8();
-  in.skip(1);  // type of service
+  const uint8_t ecn = in.u8() & 3;  // type of service: the ECN field
   const uint16_t total = in.be16();
   in.skip(2);  // identification
   const uint16_t flags_and_offset = in.be16();
@@ -338,7 +353,7 @@ void NetworkStack::handle_ipv4(ConstByteView packet, bool looped, const hardware
   if (protocol == kProtocolUdp) {
     udp_.handle(source, destination, payload, checks.transport_checksum_good);
   } else if (protocol == kProtocolTcp) {
-    if (looped || (config_.configured() && destination == config_.address)) tcp_.handle(source, destination, payload, checks.transport_checksum_good);
+    if (looped || (config_.configured() && destination == config_.address)) tcp_.handle(source, destination, payload, checks.transport_checksum_good, ecn);
   } else if (protocol == kProtocolIcmp) {
     if (looped || (config_.configured() && destination == config_.address)) handle_icmp(source, payload);
   } else if (protocol == kProtocolIgmp) {
@@ -409,7 +424,7 @@ bool NetworkStack::transmit(EgressQueue::Kind kind, ConstByteView frame, hardwar
 
 bool NetworkStack::backlogged() const {
   kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
-  return !egress_.empty() || !looped_.empty();
+  return !egress_.empty() || !looped_.empty() || tcp_.pacing();
 }
 
 EgressQueue::Stats NetworkStack::egress_stats() const {
@@ -456,7 +471,7 @@ uint32_t NetworkStack::max_segmented_payload(const IpAddress& destination) const
 
 // The frame of a large TCP segment, built like any other (IP header, the pseudo-header seed in the checksum field) and given to the interface
 // to cut up: TCP to a next hop whose address is known.
-bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss) {
+bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss, uint8_t ecn) {
   kernel::ScopedRecursiveMutex guard(mutex_);
   hardware::MacAddress mac;
   const uint32_t bytes = segmentation_bytes(nic_);
@@ -476,7 +491,7 @@ bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteVie
   nic_.mac_address().write(out);
   if (destination.v6) {
     out.be16(kEtherTypeIpv6);
-    out.be32(0x60000000u);
+    out.be32(0x60000000u | (uint32_t{ecn & 3u} << 20));   // (the ECN field: the low bits of the traffic class)
     out.be16(static_cast<uint16_t>(segment.size()));
     out.u8(kProtocolTcp);
     out.u8(64);
@@ -485,7 +500,7 @@ bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteVie
   } else {
     out.be16(kEtherTypeIpv4);
     out.u8(0x45);
-    out.u8(0);
+    out.u8(ecn & 3);
     out.be16(static_cast<uint16_t>(kIpv4HeaderSize + segment.size()));
     out.be16(ip_id_);
     ip_id_ = static_cast<uint16_t>(ip_id_ + (segment.size() - 20 + mss - 1) / mss);  // (each frame takes the next identification)
@@ -513,12 +528,18 @@ IpAddress NetworkStack::source_for_ip(const IpAddress& destination) const {
   return IpAddress(source_for(destination.ipv4));
 }
 
-bool NetworkStack::send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload) {
-  if (!destination.v6) return send_ip(destination.ipv4, protocol, payload);
+bool NetworkStack::send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload, uint8_t ecn) {
   kernel::ScopedRecursiveMutex guard(mutex_);
-  const Ipv6Address source = source_for6(destination.ipv6);
-  if (source.is_unspecified()) return false;
-  return send_ip6(source, destination.ipv6, protocol, payload, 64);
+  outgoing_ecn_ = ecn & 3;
+  bool sent;
+  if (!destination.v6) {
+    sent = send_ip(destination.ipv4, protocol, payload);
+  } else {
+    const Ipv6Address source = source_for6(destination.ipv6);
+    sent = !source.is_unspecified() && send_ip6(source, destination.ipv6, protocol, payload, 64);
+  }
+  outgoing_ecn_ = kEcnNotEct;
+  return sent;
 }
 
 void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip) {
@@ -558,7 +579,7 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
   uint8_t packet_storage[kMtu];
   ByteWriter out{ByteView(packet_storage)};
   out.u8(0x45);  // IPv4, 5 words of header
-  out.u8(0);
+  out.u8(outgoing_ecn_);   // type of service: only the ECN field is used
   out.be16(static_cast<uint16_t>(kIpv4HeaderSize + payload.size()));
   out.be16(ip_id_++);
   out.be16(0x4000);  // don't fragment

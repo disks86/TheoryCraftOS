@@ -125,17 +125,22 @@ bool Executor::run_once() {
   return progressed;
 }
 
-void Executor::idle() { kernel::sleep_us(200); }
+void Executor::idle(uint64_t seen) {
+  if (wake_.wait && wake_.wait(wake_.context, seen, wake_.max_wait_us)) return;
+  kernel::sleep_us(200);
+}
 
 void Executor::run_until(bool (*done)(void*), void* context) {
   while (!done(context)) {
-    if (!run_once()) idle();
+    const uint64_t before = seen();   // (read before the pass: what happens during it ends the wait at once)
+    if (!run_once()) idle(before);
   }
 }
 
 void Executor::run() {
   while (active_ != 0 || head_ != nullptr) {
-    if (!run_once()) idle();
+    const uint64_t before = seen();
+    if (!run_once()) idle(before);
   }
 }
 

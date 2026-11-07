@@ -29,8 +29,23 @@ uint64_t TcpStream::deadline_after(uint32_t timeout_ms) const {
   return timeout_ms == kInfiniteTimeout ? ~uint64_t{0} : stack_.now_ms() + timeout_ms;
 }
 
+async::Executor::IdleWake TcpStream::idle_wake(network::INetworkStack& stack) {
+  async::Executor::IdleWake wake;
+  wake.context = &stack;
+  wake.progress = [](void* context) { return static_cast<network::INetworkStack*>(context)->progress(); };
+  wake.wait = [](void* context, uint64_t seen, uint64_t timeout_us) {
+    network::INetworkStack* s = static_cast<network::INetworkStack*>(context);
+    return s->serviced() && s->wait_for_progress(seen, timeout_us);
+  };
+  return wake;
+}
+
 bool TcpStream::wait_step(uint64_t deadline_ms) {
   if (deadline_ms != ~uint64_t{0} && stack_.now_ms() >= deadline_ms) return true;
+  if (stack_.serviced()) {   // a service thread polls it: wait for it to have done something (at most 1 ms: the caller checks again then)
+    stack_.wait_for_progress(stack_.progress(), 1000);
+    return false;
+  }
   stack_.poll();
   kernel::sleep_us(200);
   return false;
@@ -48,7 +63,7 @@ StreamStatus TcpStream::connect(network::INetworkStack& stack, allocators::IAllo
       socket->abort();
       return StreamStatus::TimedOut;
     }
-    stack.poll();
+    if (!stack.serviced()) stack.poll();
     kernel::sleep_us(200);
   }
   UniquePointer<IAsyncStream> stream = UniquePointer<IAsyncStream>::make_as<TcpStream>(allocator, stack, util::move(socket));
@@ -77,7 +92,7 @@ async::Task<StreamStatus> TcpStream::connect_async(network::INetworkStack& stack
   if (!socket->connect_ip(address, port)) co_return StreamStatus::IoError;
   const bool settled = co_await async::wait_until(
       [&stack, &socket, &token] {
-        stack.poll();
+        if (!stack.serviced()) stack.poll();
         return connect_settled(socket) || token.cancelled();
       },
       timeout_ms);
@@ -107,7 +122,7 @@ async::Task<StreamStatus> TcpStream::connect_async(network::INetworkStack& stack
   const auto resolved = [](const SharedPointer<network::IDnsQuery>& q) { return q && q->status() == network::DnsStatus::Resolved; };
   const bool answered = co_await async::wait_until(
       [&] {
-        stack.poll();
+        if (!stack.serviced()) stack.poll();
         return resolved(query6) || (!pending(query6) && !pending(query)) || token.cancelled();
       },
       timeout_ms);
@@ -146,7 +161,7 @@ async::Task<IoResult> TcpStream::on_read_async(ByteView buffer, async::Cancellat
     const bool woke = co_await async::wait_until(
         [this, &token] {
           if (closed_) return true;
-          stack_.poll();
+          if (!stack_.serviced()) stack_.poll();   // (a service thread polls it otherwise)
           return socket_->available() > 0 || socket_->peer_closed() || socket_->failed() || socket_->state() == TcpState::Closed ||
                  token.cancelled();
         },
@@ -167,7 +182,7 @@ async::Task<StreamStatus> TcpStream::on_write_async(ConstByteView data, async::C
     const bool progressed = co_await async::wait_until(  // the condition itself tries to send: it holds once there was room
         [this, &data, &token, &sent] {
           if (closed_ || token.cancelled()) return true;
-          stack_.poll();
+          if (!stack_.serviced()) stack_.poll();   // (a service thread polls it otherwise)
           if (socket_->failed() || !socket_->is_connected()) return true;
           sent = socket_->send(data);
           return sent > 0;
@@ -184,7 +199,7 @@ async::Task<StreamStatus> TcpStream::on_flush_async(async::CancellationToken tok
   const bool drained = co_await async::wait_until(
       [this, &token] {
         if (closed_ || token.cancelled()) return true;
-        stack_.poll();
+        if (!stack_.serviced()) stack_.poll();   // (a service thread polls it otherwise)
         return socket_->unsent_or_unacknowledged() == 0 || socket_->failed() || socket_->state() == TcpState::Closed;
       },
       write_timeout_ms_);
@@ -305,7 +320,7 @@ StreamStatus TcpListener::accept(uint32_t timeout_ms, UniquePointer<IAsyncStream
     SharedPointer<network::ITcpSocket> accepted = socket_->accept();
     if (accepted) return wrap(util::move(accepted), result);
     if (deadline != ~uint64_t{0} && stack_.now_ms() >= deadline) return StreamStatus::TimedOut;
-    stack_.poll();
+    if (!stack_.serviced()) stack_.poll();   // (a service thread polls it otherwise)
     kernel::sleep_us(200);
   }
 }
@@ -317,7 +332,7 @@ async::Task<StreamStatus> TcpListener::accept_async(UniquePointer<IAsyncStream>*
   const bool got = co_await async::wait_until(
       [this, &accepted, &token] {
         if (!socket_ || token.cancelled()) return true;
-        stack_.poll();
+        if (!stack_.serviced()) stack_.poll();   // (a service thread polls it otherwise)
         accepted = socket_->accept();
         return static_cast<bool>(accepted);
       },

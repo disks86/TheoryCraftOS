@@ -196,6 +196,9 @@ struct IpConfiguration {
   bool configured() const { return !address.is_unspecified(); }
 };
 
+// The ECN field of an IP header (RFC 3168 5): the low two bits of IPv4's type of service and IPv6's traffic class.
+constexpr uint8_t kEcnNotEct = 0, kEcnEct1 = 1, kEcnEct0 = 2, kEcnCe = 3;
+
 constexpr uint16_t kEtherTypeIpv4 = 0x0800;
 constexpr uint16_t kEtherTypeArp = 0x0806;
 constexpr uint16_t kEtherTypeIpv6 = 0x86DD;

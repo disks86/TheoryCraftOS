@@ -17,9 +17,10 @@
  */
 
 // Fair sharing and latency in the network stack: the transmit queue's scheduler (EgressQueue: deficit round robin with new flows first,
-// drops from the fattest flow, the sojourn limit), its flow classifier against truncated and bit-flipped frames, TCP congestion control
-// (initial window, growth, the cut after loss), and two machines on a fake wire whose sending interface is a bottleneck: two bulk TCP
-// connections share it evenly, and a request/answer connection keeps a short round trip while they run.
+// drops from the fattest flow, the sojourn limit, CoDel's drops and ECN marks), its flow classifier against truncated and bit-flipped
+// frames, TCP congestion control (initial window, growth, the cut after loss), SACK (the range set against a model, a lost segment that is
+// the only one sent again), ECN end to end, pacing on a long path, and two machines on a fake wire whose sending interface is a bottleneck:
+// two bulk TCP connections share it evenly, and a request/answer connection keeps a short round trip while they run.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,8 @@
 #include "NetworkHarness.hpp"
 #include "Network/EgressQueue.hpp"
 #include "Network/Tcp/TcpSocket.hpp"
+#include "Network/Tcp/SequenceRanges.hpp"
+#include <set>
 
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
@@ -267,10 +270,197 @@ static void test_shared_bottleneck() {
   CHECK(lan.nic_a.refused > 0);   // (the bottleneck was really there)
 }
 
+// SequenceRanges against a plain set of byte numbers: random adds and cuts, near the 2^32 wrap; every range stays sorted, disjoint and apart.
+static void test_sequence_ranges() {
+  uint32_t seed = 7;
+  auto rnd = [&] { seed = seed * 1664525 + 1013904223; return seed >> 8; };
+  for (int round = 0; round < 200; ++round) {
+    SequenceRanges r;
+    std::set<uint32_t> model;   // offsets from base
+    const uint32_t base = 0xFFFFF000u + rnd() % 0x2000;   // across the wrap
+    uint32_t low = 0;           // everything below this offset was cut
+    for (int op = 0; op < 60; ++op) {
+      if (rnd() % 5 == 0) {
+        low += rnd() % 300;
+        r.remove_below(base + low);
+        for (auto it = model.begin(); it != model.end();) it = *it < low ? model.erase(it) : std::next(it);
+      } else {
+        const uint32_t start = low + rnd() % 4000, length = 1 + rnd() % 400;
+        std::vector<std::pair<uint32_t, uint32_t>> before;
+        for (uint32_t i = 0; i < r.count(); ++i) before.emplace_back(r.at(i).start, r.at(i).end);
+        if (r.add(base + start, base + start + length)) {
+          for (uint32_t i = start; i < start + length; ++i) model.insert(i);
+        } else {
+          CHECK(r.count() == SequenceRanges::kMax);   // (refused only when full, and then unchanged)
+          bool same = before.size() == r.count();
+          for (uint32_t i = 0; same && i < r.count(); ++i) same = before[i].first == r.at(i).start && before[i].second == r.at(i).end;
+          CHECK(same);
+        }
+      }
+      uint32_t bytes = 0;
+      for (uint32_t i = 0; i < r.count(); ++i) {
+        CHECK(SequenceRanges::before(r.at(i).start, r.at(i).end));
+        if (i) CHECK(SequenceRanges::before(r.at(i - 1).end, r.at(i).start));   // (apart: touching ones merge)
+        bytes += r.at(i).end - r.at(i).start;
+      }
+      CHECK(bytes == model.size() && r.bytes() == bytes);
+      for (int probe = 0; probe < 20; ++probe) {
+        const uint32_t o = low + rnd() % 4500;
+        CHECK(r.covers(base + o) == (model.count(o) == 1));
+      }
+      uint32_t gs, ge;
+      if (r.next_gap(base + low, base + low + 5000, &gs, &ge)) CHECK(!r.covers(gs) && SequenceRanges::before(gs, ge) && (ge == base + low + 5000 || r.covers(ge)));
+    }
+  }
+}
+
+// A transfer in which exactly one data segment is lost: with SACK the sender sends that one again, at once and alone (none of the segments
+// after it, which the receiver already holds); the receiver puts the held data in order.
+static void test_sack_recovery() {
+  Lan lan;
+  lan.configure_static();
+  int data_frames = 0, dropped = 0;
+  std::set<uint32_t> sequences;
+  uint32_t retransmitted = 0;
+  int step = 0, dropped_at = -1, resent_at = -1;
+  lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) {
+    if (from != 0 || f.size() < 54 || f[23] != 6) return;
+    const uint32_t header = (f[46] >> 4) * 4u, total = uint32_t(f[16] << 8 | f[17]);
+    if (total <= 20 + header) return;   // (no data)
+    const uint32_t seq = uint32_t(f[38]) << 24 | uint32_t(f[39]) << 16 | uint32_t(f[40]) << 8 | f[41];
+    if (!sequences.insert(seq).second && ++retransmitted == 1) resent_at = step;
+    if (++data_frames == 5 && !dropped) {   // the fifth data segment is lost
+      ++dropped;
+      dropped_at = step;
+      lan.wire.loss_percent = 100;   // (just this one: put back on the next frame)
+    } else {
+      lan.wire.loss_percent = 0;
+    }
+  };
+  Bulk bulk(lan, 7400);
+  auto* client = static_cast<TcpSocket*>(bulk.client.get());
+  for (; step < 400 && bulk.received < 60000; ++step) { lan.step(); bulk.step(); }
+  printf("sack: the lost segment was sent again %d steps after it was lost; %u retransmitted\n", resent_at - dropped_at, retransmitted);
+  CHECK(client->sack_permitted() && client->ecn_capable());
+  CHECK(dropped == 1 && bulk.received >= 60000);
+  CHECK(retransmitted == 1);   // (go-back-N would have sent the four after it again as well)
+  // (and at once: the segments after it arrived coalesced into one - one duplicate ACK - but what the receiver holds says it is lost; without
+  // SACK only the retransmission timer finds it, 165 steps later)
+  CHECK(resent_at >= dropped_at && resent_at - dropped_at <= 5);
+  lan.wire.tap = nullptr;
+}
+
+// CoDel in the transmit queue: a flow whose frames keep waiting more than the target for an interval loses one, then more; frames of an
+// ECN-capable packet are marked instead (and still sent).
+static void test_codel() {
+  TestAllocator alloc;
+  for (int ect = 0; ect < 2; ++ect) {
+    EgressQueue q(alloc);
+    RecordingNic nic;
+    uint64_t now = 0;
+    for (int ms = 0; ms < 400; ++ms, ++now) {   // two frames in, one out per millisecond: a standing queue
+      for (int k = 0; k < 2; ++k) {
+        auto f = tcp_frame(2, 80, 1000, uint8_t(k));
+        if (ect) f[15] = kEcnEct0;
+        q.enqueue(EgressQueue::flow_of_frame(ConstByteView(f.data(), f.size())), EgressQueue::Kind::Plain, ConstByteView(f.data(), f.size()), {}, 0, now);
+      }
+      nic.room = 1;
+      q.drain(nic, now);
+    }
+    const EgressQueue::Stats st = q.stats();
+    if (ect) {
+      int marked = 0;
+      bool checksums = true;
+      for (const auto& f : nic.sent) {
+        if ((f[15] & 3) != kEcnCe) continue;
+        ++marked;
+        uint32_t sum = 0;   // (a marked frame's IPv4 header checksum is redone)
+        for (int i = 14; i < 34; i += 2) sum += uint32_t(f[i] << 8 | f[i + 1]);
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+        checksums = checksums && sum == 0xFFFF;
+      }
+      CHECK(st.marked > 0 && st.dropped_codel == 0 && marked == int(st.marked) && checksums);
+    } else {
+      CHECK(st.dropped_codel > 0 && st.marked == 0);
+    }
+    printf("codel (%s): %llu dropped by CoDel, %llu marked, %llu over the sojourn limit, %llu dropped full\n", ect ? "ECN" : "no ECN",
+           (unsigned long long)st.dropped_codel, (unsigned long long)st.marked, (unsigned long long)st.dropped_stale, (unsigned long long)st.dropped_full);
+  }
+}
+
+// ECN end to end: the receiver echoes a CE mark (ECE until the sender's CWR), and the sender cuts its window without retransmitting.
+static void test_ecn() {
+  Lan lan;
+  lan.configure_static();
+  bool mark_next = false;
+  int ect = 0, ece = 0, cwr = 0, not_ect_data = 0;
+  lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) {
+    if (f.size() < 54 || f[23] != 6) return;
+    const uint32_t header = (f[46] >> 4) * 4u, total = uint32_t(f[16] << 8 | f[17]);
+    if (from == 0 && total > 20 + header) {
+      if ((f[15] & 3) == kEcnEct0) ++ect;
+      else ++not_ect_data;
+      if (f[47] & tcp_flags::kCwr) ++cwr;
+      if (mark_next) {   // a congested router on the way marks CE (and redoes the IPv4 header checksum, which the receiver checks)
+        auto& g = const_cast<std::vector<uint8_t>&>(f);
+        g[15] |= kEcnCe;
+        g[24] = g[25] = 0;
+        uint32_t sum = 0;
+        for (int i = 14; i < 34; i += 2) sum += uint32_t(g[i] << 8 | g[i + 1]);
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+        g[24] = uint8_t(~sum >> 8);
+        g[25] = uint8_t(~sum);
+        mark_next = false;
+      }
+    }
+    if (from == 1 && (f[47] & tcp_flags::kEce) && !(f[47] & tcp_flags::kSyn)) ++ece;
+  };
+  Bulk bulk(lan, 7500);
+  auto* client = static_cast<TcpSocket*>(bulk.client.get());
+  for (int i = 0; i < 300; ++i) { lan.step(); bulk.step(); }
+  CHECK(client->ecn_capable() && ect > 20 && not_ect_data == 0);
+  const uint32_t before = client->congestion_window();
+  const uint64_t had = bulk.received;
+  mark_next = true;
+  for (int i = 0; i < 50; ++i) { lan.step(); bulk.step(); }
+  printf("ecn: %d ACKs with ECE, %d CWR, window %u -> %u (ssthresh %u)\n", ece, cwr, before, client->congestion_window(), client->slow_start_threshold());
+  CHECK(ece >= 1 && cwr == 1 && client->congestion_window() < before && client->slow_start_threshold() < before);
+  for (int i = 0; i < 300; ++i) { lan.step(); bulk.step(); }
+  CHECK(bulk.received > had + 100000);
+  lan.wire.tap = nullptr;
+}
+
+// Pacing on a path with a 40 ms round trip: the window goes out spread over the round trip, not as one burst in a millisecond.
+static void test_pacing() {
+  Lan lan;
+  lan.configure_static();
+  lan.clock.auto_advance = false;   // (the clock is the wire's here: it moves by the step only)
+  lan.wire.delay_us = 20000;
+  std::vector<int> per_ms(20000, 0);
+  lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) {
+    if (from != 0 || f.size() < 54 || f[23] != 6) return;
+    const uint32_t header = (f[46] >> 4) * 4u, total = uint32_t(f[16] << 8 | f[17]);
+    if (total > 20 + header && lan.clock.us / 1000 < per_ms.size()) ++per_ms[lan.clock.us / 1000];
+  };
+  Bulk bulk(lan, 7600);
+  for (int i = 0; i < 6000; ++i) { lan.step(); bulk.step(); }
+  int busiest_late = 0;   // (after the first round trips: the first window has no RTT to pace by)
+  for (size_t ms = 1000; ms < 6000; ++ms) busiest_late = per_ms[ms] > busiest_late ? per_ms[ms] : busiest_late;
+  printf("pacing: %llu bytes in 6 s over a 40 ms round trip, at most %d data segments in one millisecond\n", (unsigned long long)bulk.received, busiest_late);
+  CHECK(bulk.received > 1000000);   // (a 16 KiB window per 40 ms: about 2.4 MB in 6 s)
+  CHECK(busiest_late <= 5);   // (unpaced, the whole window - 11 segments - leaves in the millisecond its ACK arrives)
+  lan.wire.tap = nullptr;
+}
+
 int main() {
   test_scheduler();
   test_classifier();
   test_congestion_window();
+  test_sequence_ranges();
+  test_sack_recovery();
+  test_codel();
+  test_ecn();
+  test_pacing();
   test_shared_bottleneck();
   if (g_failed) { printf("NetworkFairnessTest: %d failed\n", g_failed); return 1; }
   printf("NetworkFairnessTest: all passed\n");

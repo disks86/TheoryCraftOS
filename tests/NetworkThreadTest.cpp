@@ -28,9 +28,20 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "Kernel/Interrupts.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "Stream/Tcp/TcpStream.hpp"
 
 using namespace network;
+using namespace stream;
+
+// (the executor's fatal errors: HostThreads.cpp has no kernel panic)
+namespace kernel {
+[[noreturn]] void panic(const char* what, const Frame*) {
+  fprintf(stderr, "PANIC: %s\n", what);
+  abort();
+}
+}  // namespace kernel
 
 static std::atomic<int> g_failed{0};
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
@@ -285,10 +296,97 @@ static void test_send_during_flood() {
   CHECK(got >= 190 && ms / 200 < 5);   // (without the hand-over between batches: 17 ms)
 }
 
+// The stack's lock is a fair one (kernel::Mutex(true)). A thread that holds it in long stretches and takes it again the moment it lets go (as
+// the polling thread does) and one that needs it only briefly: with the fair lock they take strict turns. (In the kernel an ordinary one lets
+// the first take it straight back: the second is woken only to find it held again.)
+static void test_fair_lock() {
+  double ratios[2] = {0, 0};
+  for (int fair = 0; fair < 2; ++fair) {
+    kernel::RecursiveMutex lock(fair != 0);
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> hog{0}, brief{0};
+    std::thread holder([&] {
+      while (!stop) {
+        kernel::ScopedRecursiveMutex guard(lock);
+        kernel::ScopedRecursiveMutex again(lock);   // (recursive)
+        ++hog;
+        for (volatile int spin = 0; spin < 20000; ++spin) {}
+      }
+    });
+    std::thread other([&] {
+      while (!stop) {
+        kernel::ScopedRecursiveMutex guard(lock);
+        ++brief;
+      }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    stop = true;
+    holder.join();
+    other.join();
+    ratios[fair] = double(brief) / double(hog ? hog.load() : 1);
+    printf("%s lock: the long holder %llu times, the brief one %llu (%.2f per turn of the other)\n", fair ? "fair" : "plain", (unsigned long long)hog.load(),
+           (unsigned long long)brief.load(), ratios[fair]);
+  }
+  CHECK(ratios[1] > 0.95 && ratios[1] < 1.05);   // (strictly in turn: the host's plain lock, which naps between tries, is merely random)
+}
+
+// An async task (an Executor running TcpStream) in ping-pong with a server thread over the loopback, its executor woken by the stack's progress
+// (TcpStream::idle_wake): every round trip completes, and quickly.
+static async::Task<void> ping(network::INetworkStack& stack, allocators::IAllocator& allocator, int rounds, int* done) {
+  UniquePointer<IAsyncStream> stream;
+  if (co_await TcpStream::connect_async(stack, allocator, IpAddress(Ipv4Address::make(127, 0, 0, 1)), 9600, 5000, &stream) != StreamStatus::Ok) co_return;
+  for (int i = 0; i < rounds; ++i) {
+    uint8_t q[8] = {uint8_t(i)};
+    if (co_await stream->write_async(ConstByteView(q)) != StreamStatus::Ok) co_return;
+    uint32_t got = 0;
+    while (got < 8) {
+      const IoResult r = co_await stream->read_async(ByteView(q).subview(got));
+      if (r.status != StreamStatus::Ok || r.count == 0) co_return;
+      got += r.count;
+    }
+    ++*done;
+  }
+}
+
+static void test_executor_wake() {
+  Machines m;
+  async::set_frame_allocator(m.alloc);
+  NetworkStack& stack = *m.a.at(0);
+  SharedPointer<ITcpSocket> listener = stack.tcp_open();
+  CHECK(listener->listen(9600));
+  constexpr int kRounds = 200;
+  std::thread server([&] {
+    SharedPointer<ITcpSocket> conn;
+    CHECK(wait_until(m.a, [&] { return bool(conn = listener->accept()); }));
+    if (!conn) return;
+    uint8_t b[8];
+    int rounds = 0;
+    wait_until(m.a, [&] {
+      while (conn->available() >= 8 && rounds < kRounds) {
+        conn->receive(ByteView(b));
+        conn->send(ConstByteView(b));
+        ++rounds;
+      }
+      return rounds == kRounds;
+    }, 60);
+  });
+  async::Executor executor(m.clock);
+  executor.set_idle_wake(TcpStream::idle_wake(stack));
+  int done = 0;
+  const auto start = std::chrono::steady_clock::now();
+  executor.block_on(ping(stack, m.alloc, kRounds, &done));
+  const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+  server.join();
+  printf("executor: %d async round trips, %.0f us each on average\n", done, done ? us / done : 0.0);
+  CHECK(done == kRounds && us / kRounds < 2500);
+}
+
 int main() {
   test_concurrent_connections();
   test_loopback_latency();
   test_send_during_flood();
+  test_fair_lock();
+  test_executor_wake();
   if (g_failed) { printf("NetworkThreadTest: %d failed\n", g_failed.load()); return 1; }
   printf("NetworkThreadTest: all passed\n");
   return 0;

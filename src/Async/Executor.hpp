@@ -30,7 +30,10 @@ constexpr uint32_t kNoTimeout = 0xFFFFFFFFu;
 // stream read with no data yet, ...); then the executor runs the others, and polls
 // the waiting ones until their condition holds. Waiting costs a poll of the
 // condition per pass, which suits this OS's polled network stack and storage.
-// When nothing is ready the executor sleeps briefly instead of spinning.
+// When nothing is ready the executor sleeps briefly instead of spinning - or, with
+// set_idle_wake(), waits on something that says when there may be (a network stack's
+// progress: frames arrived or went), so a task waiting on a socket runs as soon as it
+// can instead of at the next 200 microsecond tick.
 //
 //   async::Executor executor(clock);
 //   executor.spawn(serve(stack));         // runs in the background
@@ -70,6 +73,17 @@ class Executor {
   // Spawned tasks that have not finished.
   uint32_t active_tasks() const { return active_; }
 
+  // What to wait on when a pass made no progress: progress(context) is read before each pass, and wait(context, seen, max_wait_us) returns
+  // once it is no longer `seen` (or the time is up). max_wait_us bounds the wait so that delays and timeouts still end on time to about
+  // that much. Null functions: the 200 microsecond sleep.
+  struct IdleWake {
+    uint64_t (*progress)(void* context) = nullptr;
+    bool (*wait)(void* context, uint64_t seen, uint64_t timeout_us) = nullptr;
+    void* context = nullptr;
+    uint64_t max_wait_us = 1000;
+  };
+  void set_idle_wake(const IdleWake& wake) { wake_ = wake; }
+
   // --- for the awaiters
   void add_waiter(detail::Waiter* waiter);
 
@@ -78,7 +92,9 @@ class Executor {
   static constexpr uint32_t kMaxPollers = 8;
 
   void run_until(bool (*done)(void*), void* context);
-  void idle();
+  void idle(uint64_t seen);
+  uint64_t seen() const { return wake_.progress ? wake_.progress(wake_.context) : 0; }
+  IdleWake wake_;
   void unlink_root(detail::PromiseBase* root);
 
   hardware::IClock& clock_;

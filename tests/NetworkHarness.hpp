@@ -56,6 +56,8 @@ struct FakeClock final : hardware::IClock {
 struct Wire {
   uint32_t seed = 1;
   int loss_percent = 0, duplicate_percent = 0, reorder_percent = 0;
+  uint64_t delay_us = 0;   // one way: a frame is received this long (of the fake clock) after it is sent
+  hardware::IClock* clock = nullptr;   // (needed for the delay)
   uint64_t frames = 0, dropped = 0;
   std::function<void(const std::vector<uint8_t>&, int)> tap;   // sees every frame offered to the wire, with sender index
   uint32_t rnd() { seed = seed * 1664525 + 1013904223; return seed >> 8; }
@@ -63,6 +65,7 @@ struct Wire {
 struct FakeNic final : hardware::INetworkInterface {
   Wire* wire; FakeNic* peer = nullptr; int index; hardware::MacAddress mac;
   std::deque<std::vector<uint8_t>> inbox; hardware::NetworkStatistics stats; bool cable = true;
+  std::deque<uint64_t> due;   // (parallel to inbox while the wire has a delay: when each frame may be received)
   std::function<void()> on_idle;   // called when receive() finds nothing: lets the peer machine run
   // A bottleneck: at most this many frames (0: no limit) are taken per millisecond of the fake clock (Lan::step refills it); past that the
   // transmit queue is "full" and transmit() refuses, as a real interface's ring does. `refused` counts the refusals.
@@ -108,6 +111,11 @@ struct FakeNic final : hardware::INetworkInterface {
     ++wire->frames; if (wire->tap) wire->tap(f, index);
     if (wire->loss_percent && wire->rnd() % 100 < (uint32_t)wire->loss_percent) { ++wire->dropped; return true; }
     auto deliver = [&](std::vector<uint8_t> x) {
+      if (wire->delay_us) {   // (a delayed wire keeps order: no reordering)
+        peer->inbox.push_back(x);
+        peer->due.push_back(wire->clock->now_us() + wire->delay_us);
+        return;
+      }
       if (wire->reorder_percent && !peer->inbox.empty() && wire->rnd() % 100 < (uint32_t)wire->reorder_percent) peer->inbox.insert(peer->inbox.end() - 1, x);
       else peer->inbox.push_back(x); };
     deliver(f);
@@ -115,9 +123,10 @@ struct FakeNic final : hardware::INetworkInterface {
     ++stats.frames_sent; return true; }
   bool receive(ByteView buffer_view, uint32_t* length) override {
     uint8_t* buffer = buffer_view.data(); const uint32_t capacity = (uint32_t)buffer_view.size();
-    if (inbox.empty() && on_idle) on_idle();
-    if (inbox.empty()) return false; auto& f = inbox.front(); uint32_t n = f.size() < capacity ? f.size() : capacity;
-    if (n) memcpy(buffer, f.data(), n); *length = f.size(); inbox.pop_front(); ++stats.frames_received; return true; }
+    const auto ready = [&] { return !inbox.empty() && (due.empty() || due.front() <= wire->clock->now_us()); };
+    if (!ready() && on_idle) on_idle();
+    if (!ready()) return false; auto& f = inbox.front(); uint32_t n = f.size() < capacity ? f.size() : capacity;
+    if (n) memcpy(buffer, f.data(), n); *length = f.size(); inbox.pop_front(); if (!due.empty()) due.pop_front(); ++stats.frames_received; return true; }
   hardware::NetworkStatistics statistics() const override { return stats; }
 };
 
@@ -125,7 +134,7 @@ struct Lan {
   TestAllocator alloc; FakeClock clock; Wire wire; FakeNic nic_a{&wire, 0, 1}, nic_b{&wire, 1, 2};
   NetworkStack a{nic_a, clock, alloc}, b{nic_b, clock, alloc};
   bool in_idle = false;
-  Lan() { nic_a.peer = &nic_b; nic_b.peer = &nic_a; assert(a.initialize() && b.initialize());
+  Lan() { wire.clock = &clock; nic_a.peer = &nic_b; nic_b.peer = &nic_a; assert(a.initialize() && b.initialize());
     nic_a.on_idle = [this] { if (in_idle) return; in_idle = true; b.poll(); in_idle = false; };
     nic_b.on_idle = [this] { if (in_idle) return; in_idle = true; a.poll(); in_idle = false; }; }
   void step(int ms = 1) { for (int i = 0; i < ms; ++i) { clock.us += 1000; nic_a.budget = nic_a.frames_per_ms; nic_b.budget = nic_b.frames_per_ms; a.poll(); b.poll(); } }

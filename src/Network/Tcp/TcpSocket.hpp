@@ -19,6 +19,7 @@
 #pragma once
 #include "Network/ByteRing.hpp"
 #include "Network/Ip/IIpLayer.hpp"
+#include "Network/Tcp/SequenceRanges.hpp"
 #include "Network/Tcp/ITcpSocket.hpp"
 #include "ObjectContainer/List.hpp"
 
@@ -27,7 +28,7 @@ namespace network {
 class TcpManager;
 
 namespace tcp_flags {
-constexpr uint8_t kFin = 0x01, kSyn = 0x02, kRst = 0x04, kPsh = 0x08, kAck = 0x10;
+constexpr uint8_t kFin = 0x01, kSyn = 0x02, kRst = 0x04, kPsh = 0x08, kAck = 0x10, kEce = 0x40, kCwr = 0x80;
 }
 
 // A received TCP segment, parsed.
@@ -38,6 +39,10 @@ struct TcpSegment {
   uint16_t window;
   ConstByteView data;  // the payload, a view into the received packet
   uint16_t mss;  // from the MSS option, 0 if absent
+  bool sack_permitted;   // the SACK-permitted option (RFC 2018), on a SYN
+  uint8_t sack_blocks;   // SACK blocks carried (at most 4)
+  uint32_t sack[4][2];   // their [left edge, right edge)
+  bool congestion_experienced;   // the IP header said CE (RFC 3168): a router (or this machine's queue) was congested
 };
 
 // Sequence numbers wrap at 2^32; comparisons are done on the signed difference.
@@ -52,8 +57,19 @@ inline bool seq_ge(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) 
 // window probing, and congestion control (RFC 5681 slow start and congestion
 // avoidance with appropriate byte counting, RFC 6582's recovery after a fast
 // retransmit, RFC 6928's initial window of ten segments, the restart window after
-// an idle period), so that connections sharing a bottleneck share it. Loss recovery
-// is go-back-N and out-of-order segments are dropped (the sender retransmits them).
+// an idle period), so that connections sharing a bottleneck share it.
+//
+// Segments that arrive out of order are kept (up to SequenceRanges::kMax pieces
+// within the receive window) and the receiver says what it holds with SACK blocks
+// (RFC 2018); a sender whose peer does too retransmits only the holes during loss
+// recovery (in the spirit of RFC 6675: the bytes in flight counted without what was
+// SACKed or lost), and falls back to go-back-N after a timeout or without SACK.
+// ECN (RFC 3168) is negotiated on the SYN: new data then goes out ECN-capable, a
+// congestion mark on the way (or in this machine's own transmit queue, which marks
+// instead of dropping) is echoed back, and the sender cuts its window as for a loss,
+// once per window, without a retransmission. Data is paced at twice the congestion
+// window per round trip in slow start and 1.2 times it after (as Linux does), so a
+// window does not leave as one burst on a long path.
 // A connection also holds back while kMaxQueuedFrames of its frames wait in the
 // stack's transmit queue (IIpLayer::queued_for), so a bulk sender cannot fill that
 // queue ahead of the others.
@@ -123,6 +139,16 @@ class TcpSocket final : public ITcpSocket {
   }
 
   // Congestion control state, for tests and statistics.
+  // Data waits only for the pacing rate (the stack polls again soon then, whether or not frames come).
+  bool pacing_paused() const { return paced_out_; }
+  bool sack_permitted() const {
+    StackLock guard(ip_);
+    return sack_ok_;
+  }
+  bool ecn_capable() const {
+    StackLock guard(ip_);
+    return ecn_ok_;
+  }
   uint32_t congestion_window() const {
     StackLock guard(ip_);
     return cwnd_;
@@ -176,6 +202,14 @@ class TcpSocket final : public ITcpSocket {
   void rollback_for_retransmission();
   void arm_timer();
   void sample_rtt(uint32_t acknowledged_up_to);
+  void accept_out_of_order(uint32_t sequence, ConstByteView data);
+  void take_reassembled();
+  void note_sack(const TcpSegment& segment);
+  bool adds_sack(const TcpSegment& segment) const;
+  uint32_t pipe() const;
+  bool sack_recovery() const { return in_recovery_ && sack_ok_; }
+  bool retransmit_holes(uint32_t mss);
+  uint32_t pacing_allowance(uint64_t now);
   uint16_t send_mss() const { return peer_mss_ < our_mss() ? peer_mss_ : our_mss(); }
   uint32_t initial_window() const;
   void on_congestion(bool timeout);
@@ -230,6 +264,24 @@ class TcpSocket final : public ITcpSocket {
   bool in_recovery_ = false;
   uint32_t recover_ = 0;          // snd_nxt_ when loss was detected: recovery ends when everything up to it is acknowledged
   uint64_t last_send_ms_ = 0;
+  // SACK (RFC 2018). What this side holds beyond rcv_nxt_ (its bytes in ooo_storage_, indexed by sequence modulo kBufferSize: the window
+  // is at most kBufferSize, so no two held bytes share a place), and which range the latest segment went to (reported first).
+  bool sack_ok_ = false;
+  SequenceRanges held_;
+  uint32_t latest_held_ = 0;
+  ByteView ooo_storage_;
+  // What the peer said it holds beyond snd_una_ (the scoreboard), and where hole retransmission has got to in recovery.
+  SequenceRanges sacked_;
+  uint32_t retransmit_next_ = 0, retransmitted_ = 0;
+  // ECN (RFC 3168).
+  bool ecn_ok_ = false;
+  bool ece_pending_ = false;      // a CE mark arrived: ACKs say ECE until the peer sends CWR
+  bool cwr_pending_ = false;      // the window was cut for an ECE: the next new data says CWR
+  uint32_t ecn_recover_ = 0;      // no second cut for an ECE until snd_una_ passes this
+  bool ecn_cut_ = false;          // (whether ecn_recover_ is set yet)
+  // Pacing: bytes that may go now (refilled at the pacing rate, at most a burst's worth), and when it was last refilled.
+  uint64_t pacing_credit_ = 0, paced_at_ms_ = 0;
+  bool paced_out_ = false;
 
   bool failed_ = false;
   bool established_event_ = false;

@@ -1059,14 +1059,17 @@ void HttpClient::finish() {
 bool HttpClient::run(uint32_t timeout_ms) {
   const uint64_t start = stack_.now_ms();
   while (busy()) {
-    stack_.poll();
+    const uint64_t seen = stack_.progress();   // (before this pass: what arrives during it ends the wait below at once)
+    if (!stack_.serviced()) stack_.poll();      // (a service thread polls it otherwise: this one would only contend for the lock)
     poll();
     if (!busy()) break;
     if (stack_.now_ms() - start > timeout_ms) {
       fail(HttpError::Timeout);
       break;
     }
-    kernel::sleep_us(100);
+    // With a service thread polling the stack, wait for it to have done something (woken at once); without one this thread is the only
+    // one polling, so it keeps the short sleep. (1 ms bounds the wait: the client's own timers - TLS, HTTP/3 - run in poll().)
+    if (!stack_.serviced() || !stack_.wait_for_progress(seen, 1000)) kernel::sleep_us(100);
   }
   return state_ == HttpState::Done || state_ == HttpState::Upgraded;
 }

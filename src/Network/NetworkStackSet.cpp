@@ -60,6 +60,7 @@ void NetworkStackSet::on_progress(void* worker) {
 }
 
 bool NetworkStackSet::wait_for_progress(uint64_t seen, uint64_t timeout_us) {
+  if (timeout_us == 0) return true;   // (0 is "forever" to the condition variable: never that here)
   kernel::ScopedMutex guard(progress_mutex_);
   if (progress() == seen) progress_cv_.wait(progress_mutex_, timeout_us);
   return true;

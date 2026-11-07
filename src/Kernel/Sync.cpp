@@ -63,10 +63,27 @@ void Mutex::lock() {
     yield();
     detail::finish_wait(&list_);
     __atomic_sub_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);
+    if (fair_ && __atomic_exchange_n(&handoff_, 0u, __ATOMIC_ACQUIRE)) return;   // handed over: state_ stayed 1, for this thread
   }
 }
 
 void Mutex::unlock() {
+  if (fair_ && running()) {
+    // With someone waiting, the mutex stays held and goes to the oldest waiter (wake_one wakes the oldest): nobody can take it in between.
+    // The list's lock orders this against a thread about to wait (it announces itself and queues under the same lock).
+    const uint64_t flags = detail::lock_list(&list_);
+    if (__atomic_load_n(&waiters_, __ATOMIC_SEQ_CST) != 0) {
+      __atomic_store_n(&handoff_, 1u, __ATOMIC_RELEASE);
+      if (detail::wake_one(&list_)) {
+        detail::unlock_list(&list_, flags);
+        return;
+      }
+      __atomic_store_n(&handoff_, 0u, __ATOMIC_RELEASE);
+    }
+    __atomic_exchange_n(&state_, 0, __ATOMIC_SEQ_CST);
+    detail::unlock_list(&list_, flags);
+    return;
+  }
   __atomic_exchange_n(&state_, 0, __ATOMIC_SEQ_CST);
   if (__atomic_load_n(&waiters_, __ATOMIC_SEQ_CST) == 0) return;
   const uint64_t flags = detail::lock_list(&list_);

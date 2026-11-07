@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Async/Executor.hpp"
 #include "Network/INetworkStack.hpp"
 #include "Stream/IAsyncStream.hpp"
 #include "Utility/SharedPointer.hpp"
@@ -51,6 +52,12 @@ namespace stream {
 class TcpStream final : public AsyncStreamBase {
  public:
   static constexpr uint32_t kDefaultTimeoutMs = 30000;
+
+  // For the executor that runs tasks using streams on `stack` (which must outlive it): when no task can go on, it waits for the stack to
+  // have done something - woken as soon as frames arrive - instead of sleeping by the clock. (Only with a service thread polling the stack;
+  // without one the executor sleeps as before, since its tasks are what polls the stack.)
+  //   executor.set_idle_wake(TcpStream::idle_wake(stack));
+  static async::Executor::IdleWake idle_wake(network::INetworkStack& stack);
 
   // Connects to `address`:`port`, waiting up to `timeout_ms` for the handshake.
   static StreamStatus connect(network::INetworkStack& stack, allocators::IAllocator& allocator, const network::IpAddress& address,

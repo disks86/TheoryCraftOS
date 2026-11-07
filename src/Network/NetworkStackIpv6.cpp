@@ -208,7 +208,7 @@ void NetworkStack::handle_ipv6(ConstByteView packet, bool looped, const hardware
   } else if (next == kProtocolUdp) {
     udp_.handle(from, to, payload, checks.transport_checksum_good);
   } else if (next == kProtocolTcp) {
-    if (looped || (!destination.is_multicast() && is_my_ipv6(destination))) tcp_.handle(from, to, payload, checks.transport_checksum_good);
+    if (looped || (!destination.is_multicast() && is_my_ipv6(destination))) tcp_.handle(from, to, payload, checks.transport_checksum_good, static_cast<uint8_t>((first >> 20) & 3));
   }
 }
 
@@ -436,7 +436,7 @@ bool NetworkStack::send_ip6(const Ipv6Address& source, const Ipv6Address& destin
   if (payload.size() > kMaxIpv6Payload - extension) return false;
   uint8_t storage[kMtu];
   ByteWriter out{ByteView(storage)};
-  out.be32(0x60000000u);  // version 6, traffic class 0, no flow label
+  out.be32(0x60000000u | (uint32_t{outgoing_ecn_} << 20));  // version 6, traffic class 0 but for the ECN field, no flow label
   out.be16(static_cast<uint16_t>(extension + payload.size()));
   out.u8(router_alert ? kHeaderHopByHop : next_header);
   out.u8(hop_limit);
