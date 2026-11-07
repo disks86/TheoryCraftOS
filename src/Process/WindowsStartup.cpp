@@ -298,15 +298,15 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
       w.u64(previous, head);                           // last.Flink = head
       w.u64(head + 8, previous);                       // head.Blink = last
     };
-    uint64_t all[64], init[64], init_count = 0;
-    for (uint64_t i = 0; i < count; ++i) all[i] = i;
+    List<uint64_t> all(allocator), init(allocator);
+    for (uint64_t i = 0; i < count; ++i) if (!all.push_back(i)) return LoadStatus::OutOfMemory;
     for (uint32_t index : input.init_order) {
-      if (index >= count || init_count >= 64) return LoadStatus::Malformed;
-      init[init_count++] = index;
+      if (index >= count) return LoadStatus::Malformed;
+      if (!init.push_back(index)) return LoadStatus::OutOfMemory;
     }
-    chain(ldr + 0x10, 0x00, all, count);
-    chain(ldr + 0x20, 0x10, all, count);
-    chain(ldr + 0x30, 0x20, init, init_count);
+    chain(ldr + 0x10, 0x00, all.view().data(), all.count());
+    chain(ldr + 0x20, 0x10, all.view().data(), all.count());
+    chain(ldr + 0x30, 0x20, init.view().data(), init.count());
     for (uint64_t i = 0; i < count; ++i) {
       const WindowsModule& m = input.modules[i];
       if (m.name.size() > 100) return LoadStatus::Malformed;
@@ -315,7 +315,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
       if (!utf16(m.name, &base_name)) return LoadStatus::Malformed;
       if (m.main) {
         if (!utf16(input.image_path, &full_name)) return LoadStatus::Malformed;
-      } else if (!utf16("C:\\Windows\\System32\\", &full_name) || !utf16(m.name, &full_name)) {
+      } else if (!utf16(m.directory.empty() ? StringView("C:\\Windows\\System32\\") : m.directory, &full_name) || !utf16(m.name, &full_name)) {
         return LoadStatus::Malformed;
       }
       if (base_name.size() + full_name.size() + 8 > kPerModule - kEntrySize) return LoadStatus::Malformed;

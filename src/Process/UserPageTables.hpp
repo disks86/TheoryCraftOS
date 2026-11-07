@@ -49,9 +49,17 @@ class UserPageTables {
   // out) leaves the old ones as they were, still usable by anything that runs on them.
   // With `keep_previous` the old set is not freed but kept until release_previous() (or the next rebuild): other CPUs may still be running on it.
   bool rebuild(const AddressSpace& space, bool keep_previous = false);
-  // Rebuilds only if the address space changed since the last build.
-  bool sync(const AddressSpace& space, bool keep_previous = false) { return (built_ && generation_ == space.generation()) || rebuild(space, keep_previous); }
+  // Brings the tables up to date: built the first time, after that only the ranges the space says changed (AddressSpace::take_change) are redone, in place, while
+  // other CPUs may be running on the tables (each entry is one store). `*flush` (if given) is set when an entry a CPU may have cached went away, lost a permission or
+  // points elsewhere now: those CPUs must drop their TLB before the memory the space let go of is reused. False if memory for a table ran out (the tables are then
+  // only partly up to date: entries that went away are gone, new ones may be missing).
+  bool sync(AddressSpace& space, bool keep_previous = false, bool* flush = nullptr);
+  // Redoes the entries of [start, end) from the space. Pages the program may use and that have memory get entries; a page without memory (a private page never
+  // touched) has none until the program's first touch asks for one (the page fault, which gives it memory and calls this for the page).
+  bool update(const AddressSpace& space, uint64_t start, uint64_t end, bool* flush);
   void release_previous();
+  // The entry of the page at `address` in the current tables (0 if there is none).
+  uint64_t entry_of(uint64_t address);
 
   uint64_t root() const { return root_; }
   bool built() const { return built_; }
@@ -60,9 +68,16 @@ class UserPageTables {
   static constexpr uint64_t kPresent = 1, kWritable = 2, kUser = 4, kNoExecute = 1ull << 63;
 
  private:
+  // The entry for `address` in the tables whose root is `root` (made on the way when `make`, the tables going into set `into`): nullptr if a level is missing.
+  uint64_t* leaf(uint64_t root, uint64_t address, bool make, uint32_t into);
   bool map_page(uint64_t address, uint64_t physical, uint64_t leaf_flags);
-  uint64_t* new_table();
+  uint64_t* new_table(uint32_t into);
   void release();
+  // The entry `address` should have now (0: none).
+  uint64_t wanted(const AddressSpace& space, uint64_t address) const;
+  uint64_t leaf_flags(uint8_t protection) const;
+  // The first pass of update(): every present user entry of [start, end) below `table` (a table of `level`, covering from `base`) set to what it should be.
+  void refresh(const AddressSpace& space, uint64_t table, uint32_t level, uint64_t base, uint64_t start, uint64_t end, bool* flush);
 
   allocators::IAllocator& allocator_;
   List<Identity> identity_ = List<Identity>(allocator_);
@@ -72,7 +87,6 @@ class UserPageTables {
   bool nx_;
   bool built_ = false;
   uint64_t root_ = 0;
-  uint64_t generation_ = 0;
 };
 
 }  // namespace process

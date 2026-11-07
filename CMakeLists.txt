@@ -704,6 +704,8 @@ add_executable(BOOTX64
   src/Process/Syscall.cpp
   src/Process/Process.cpp
   src/Process/AddressSpace.cpp
+  src/Process/PageMap.cpp
+  src/Process/ImageCache.cpp
   src/Process/ImageLoader.cpp
   src/Process/UserProgram.cpp
   src/Process/UserPageTables.cpp
@@ -1274,6 +1276,14 @@ endif()
 option(TCOS_AMD_VEGAM "Bring up the Radeon RX Vega M (Kaby Lake-G): memory controller and GART, interrupt ring, microcode through the SMC, graphics engine with compute queues, SDMA, and the display surface (not yet run on a real card)" OFF)
 if(TCOS_AMD_VEGAM)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_VEGAM)
+endif()
+# A program on the primary disk to start once the desktop is up (an OS path such as "/Windows/Program Files/Chromium/chrome.exe"), with its arguments (a ;-separated list):
+# what it prints goes to the debug console. For trying a big program in QEMU without driving the desktop (see scripts/run-program.sh).
+set(TCOS_AUTORUN "" CACHE STRING "A program on the primary disk to start when the desktop is up")
+set(TCOS_AUTORUN_ARGUMENTS "" CACHE STRING "Its arguments (;-separated)")
+if(TCOS_AUTORUN)
+  string(REPLACE ";" "\\x1f" _autorun_arguments "${TCOS_AUTORUN_ARGUMENTS}")
+  target_compile_definitions(BOOTX64 PRIVATE "TCOS_AUTORUN=\"${TCOS_AUTORUN}\"" "TCOS_AUTORUN_ARGUMENTS=\"${_autorun_arguments}\"")
 endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)

@@ -49,6 +49,7 @@ struct WindowsModule {
   bool main = false;                // the program itself (first in the list; left out of the initialization order)
   bool in_init_order = true;
   uint32_t tls_rva = 0, tls_size = 0;      // its TLS directory (0: none)
+  StringView directory;             // the Windows folder of its file ("C:\\Program Files\\App\\"); empty: C:\\Windows\\System32
 };
 
 struct WindowsStartupInput {

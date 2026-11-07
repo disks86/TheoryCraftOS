@@ -22,6 +22,7 @@
 #include <vector>
 #include "Process/AddressSpace.hpp"
 #include "Process/ModuleLoader.hpp"
+#include "Process/ImageCache.hpp"
 
 using namespace process;
 
@@ -345,10 +346,48 @@ static void test_failures() {
   }
 }
 
+// Libraries at their preferred base share their pages between address spaces (the image cache); what one writes is its own.
+static void test_shared_images() {
+  ImageCache cache(A);
+  set_image_cache(&cache);
+  Provider provider;
+  provider.libraries["ntdll.dll"] = build(ntdll_spec()).bytes;
+  provider.libraries["kernel32.dll"] = build(kernel_spec()).bytes;
+  Spec program;
+  program.dll = false;
+  program.base = 0x140000000ull;
+  program.imports = {{"KERNEL32.dll", "KFunc"}, {"ntdll.dll", "RtlAlpha"}};
+  const Built exe = build(program);
+  exe::PeFile pe(A);
+  CHECK(pe.parse(ConstByteView(exe.bytes.data(), exe.bytes.size())));
+  {
+    AddressSpace one(A), two(A);
+    ModuleSet set_one(A), set_two(A);
+    String detail(A);
+    LoadedImage image;
+    CHECK(load_pe(pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), one, &image) == LoadStatus::Ok && load_pe(pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), two, &image) == LoadStatus::Ok);
+    CHECK(load_windows_modules(one, A, pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), "app.exe", provider, &set_one, &detail) == LoadStatus::Ok);
+    CHECK(load_windows_modules(two, A, pe, ConstByteView(exe.bytes.data(), exe.bytes.size()), "app.exe", provider, &set_two, &detail) == LoadStatus::Ok);
+    const Module* kept = set_one.find("ntdll.dll")->base == 0x180000000ull ? set_one.find("ntdll.dll") : set_one.find("kernel32.dll");
+    const uint64_t page = kept->base + 0x2000;      // (the second page of its section: nothing the loader writes)
+    CHECK(cache.count() == 1 && one.is_shared(page) && two.is_shared(page) && one.storage_at(page) == two.storage_at(page));
+    CHECK(u64_at(one, kept->base + 0x2F00) == kept->base + 0x1234 && u64_at(two, kept->base + 0x2F00) == kept->base + 0x1234);
+    const uint8_t mark = 0x77;
+    CHECK(one.write_privileged(page, ConstByteView(&mark, 1)) && !one.is_shared(page) && two.is_shared(page));
+    uint8_t seen[2] = {};
+    CHECK(one.read_privileged(page, ByteView(seen, 1)) && two.read_privileged(page, ByteView(seen + 1, 1)) && seen[0] == 0x77 && seen[1] != 0x77);
+    // The program's imports reach the shared library's code alike in both.
+    CHECK(set_one.export_address("ntdll.dll", "RtlAlpha") == set_two.export_address("ntdll.dll", "RtlAlpha"));
+  }
+  CHECK(cache.count() == 0);      // nobody maps it any more: it is gone
+  set_image_cache(nullptr);
+}
+
 int main() {
   test_names();
   test_load();
   test_failures();
+  test_shared_images();
   CHECK(A.live == 0);
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("ModuleLoaderTest: all passed\n");

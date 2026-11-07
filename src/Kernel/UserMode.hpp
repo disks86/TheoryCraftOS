@@ -148,6 +148,8 @@ struct Task final : process::IProcessRuntime {
   bool launch(UserThread* thread, uint32_t stack_bytes);
   // Rebuilds the page tables if the address space changed and gives them to all the threads. False if memory ran out.
   bool sync_tables();
+  // Makes the entry of one page the program may use and that has memory (the page fault calls it after giving the page its memory).
+  bool fault_in(uint64_t page);
 
  private:
   allocators::IAllocator& allocator_;

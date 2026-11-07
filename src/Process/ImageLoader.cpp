@@ -145,6 +145,38 @@ void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)
   put(60, pe.checksum(), 4);
 }
 
+bool place_pe_sections(const exe::PeFile& pe, ConstByteView file, uint64_t image_pages, PeSectionPlacement* out, uint32_t capacity, uint32_t* count) {
+  *count = 0;
+  for (const exe::PeSection& section : pe.sections().view()) {
+    const uint64_t span = section.virtual_size ? section.virtual_size : section.raw_size;
+    if (span == 0) continue;
+    if (*count >= capacity) return false;
+    if (section.virtual_address % AddressSpace::kPageSize != 0 || section.virtual_address > image_pages || span > image_pages - section.virtual_address) return false;
+    PeSectionPlacement& p = out[(*count)++];
+    p.rva = section.virtual_address;
+    p.span = span;
+    p.protection = uint8_t(((section.characteristics & exe::kPeSectionRead) ? kProtRead : 0) | ((section.characteristics & exe::kPeSectionWrite) ? kProtWrite : 0) |
+                           ((section.characteristics & exe::kPeSectionExecute) ? kProtExecute : 0));
+    // The file is mapped from the 512-byte boundary below the raw data, so a raw pointer that is not aligned shows the bytes in front of it too, and (then) the rest of the
+    // page is what the file has there rather than zeros.
+    const uint64_t delta = section.raw_offset & 511u;
+    const uint64_t from = section.raw_offset - delta;
+    uint64_t copy = section.raw_size < span ? section.raw_size : span;
+    uint64_t source = section.raw_offset;
+    if (delta != 0 && copy != 0 && from < file.size()) {
+      uint64_t page_end = 0, mapped = 0;
+      if (!AddressSpace::round_up(delta + section.raw_size, &page_end) || !AddressSpace::round_up(span, &mapped)) return false;
+      copy = page_end < mapped ? page_end : mapped;
+      if (copy > file.size() - from) copy = file.size() - from;
+      source = from;
+    }
+    if (copy && !in_file(file, source, copy)) return false;
+    p.source = source;
+    p.copy = copy;
+  }
+  return true;
+}
+
 namespace {
 // The pieces of an image that were mapped so far, to give back if the rest fails.
 struct MappedPieces {
@@ -172,34 +204,14 @@ LoadStatus map_pe_image_pieces(const exe::PeFile& pe, ConstByteView file, Addres
   pieces.add(base, header_bytes);
   if (!space.write_privileged(base, file.first(header_bytes))) return LoadStatus::Malformed;
 
-  for (const exe::PeSection& section : pe.sections().view()) {
-    const uint64_t span = section.virtual_size ? section.virtual_size : section.raw_size;
-    if (span == 0) continue;
-    if (section.virtual_address % AddressSpace::kPageSize != 0 || section.virtual_address > image_pages || span > image_pages - section.virtual_address) return LoadStatus::Malformed;
-    const uint8_t protection = uint8_t(((section.characteristics & exe::kPeSectionRead) ? kProtRead : 0) | ((section.characteristics & exe::kPeSectionWrite) ? kProtWrite : 0) |
-                                       ((section.characteristics & exe::kPeSectionExecute) ? kProtExecute : 0));
-    if (!space.map(base + section.virtual_address, span, protection)) return LoadStatus::Malformed;      // overlaps the headers or another section
-    pieces.add(base + section.virtual_address, span);
-    // The file is mapped from the 512-byte boundary below the raw data, so a raw pointer that is not aligned shows the bytes in front of it too, and (then) the rest of the
-    // page is what the file has there rather than zeros.
-    const uint64_t delta = section.raw_offset & 511u;
-    const uint64_t from = section.raw_offset - delta;
-    uint64_t copy = section.raw_size < span ? section.raw_size : span;
-    uint64_t at = base + section.virtual_address;
-    uint64_t source = section.raw_offset;
-    if (delta != 0 && copy != 0 && from < file.size()) {
-      uint64_t page_end = 0;
-      if (!AddressSpace::round_up(delta + section.raw_size, &page_end)) return LoadStatus::Malformed;
-      uint64_t mapped = 0;
-      if (!AddressSpace::round_up(span, &mapped)) return LoadStatus::Malformed;
-      copy = page_end < mapped ? page_end : mapped;
-      if (copy > file.size() - from) copy = file.size() - from;
-      source = from;
-    }
-    if (copy) {
-      if (!in_file(file, source, copy)) return LoadStatus::Malformed;
-      if (!space.write_privileged(at, file.subview(source, copy))) return LoadStatus::Malformed;
-    }
+  PeSectionPlacement placed[MappedPieces::kMax - 1];
+  uint32_t placed_count = 0;
+  if (!place_pe_sections(pe, file, image_pages, placed, MappedPieces::kMax - 1, &placed_count)) return LoadStatus::Malformed;
+  for (uint32_t i = 0; i < placed_count; ++i) {
+    const PeSectionPlacement& section = placed[i];
+    if (!space.map(base + section.rva, section.span, section.protection)) return LoadStatus::Malformed;      // overlaps the headers or another section
+    pieces.add(base + section.rva, section.span);
+    if (section.copy && !space.write_privileged(base + section.rva, file.subview(section.source, section.copy))) return LoadStatus::Malformed;
   }
   if (pe.entry_rva() >= image_pages || (require_entry && pe.entry_rva() == 0)) return LoadStatus::Malformed;
   LoadedImage image;

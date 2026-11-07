@@ -17,6 +17,7 @@
  */
 #include "Process/Win32k/Win32k.hpp"
 #include "Kernel/UserMode.hpp"
+#include "Process/ImageCache.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Delay.hpp"
 #include "Executable/ExecutableKind.hpp"
@@ -360,36 +361,32 @@ Frame* on_user_fault(Frame* frame) {
     if (result == process::windowsabi::GuardResult::Retry) return frame;
     if (result == process::windowsabi::GuardResult::Exception) guard = 1;
   }
-  // A page the program may use but the CPU does not have in the tables it runs with (another thread, or a parent changing this program's memory, rebuilt them since): the
-  // tables are rebuilt and the instruction runs again. A fault at the same place a few times in a row is real.
-  if ((frame->vector & 0xFF) == 14 && !(frame->error & 1) && task->program.process()->abi() == process::SyscallAbi::Windows) {
-    const uint64_t stale_address = page_fault_address;
+  // A page the program may use but has no entry for yet: a private page touched for the first time (it gets its memory now), an entry the tables do not have yet
+  // because another thread or process is changing this program's memory, or a write to a copy-on-write page of a Windows program (the page gets a copy of its own
+  // first). The entry is made and the instruction runs again; a fault at the same place a few times in a row is real.
+  if ((frame->vector & 0xFF) == 14 && !(frame->error & 8) && page_fault_address < process::AddressSpace::kUserTop) {
     process::AddressSpace* space = task->program.process()->address_space();
     UserThread* self = current_user_thread();
-    if (space && self && stale_address < 0x0000800000000000ull) {
-      const uint8_t need = (frame->error & 0x10) ? process::kProtExecute : (frame->error & 2) ? process::kProtWrite : process::kProtRead;
+    if (space && self) {
+      const bool write = (frame->error & 2) != 0;
+      const uint8_t need = (frame->error & 0x10) ? process::kProtExecute : write ? process::kProtWrite : process::kProtRead;
+      const uint64_t page = process::AddressSpace::round_down(page_fault_address);
       bool again = false;
       irq_enable();
       task->mutex.lock();
-      if (space->check(stale_address, 1, need)) {
-        if (self->stale_rip == frame->rip && self->stale_address == stale_address) ++self->stale_count; else { self->stale_rip = frame->rip; self->stale_address = stale_address; self->stale_count = 1; }
-        again = self->stale_count <= 3 && task->sync_tables();
+      if (write && task->program.process()->abi() == process::SyscallAbi::Windows && !space->check(page, 1, process::kProtWrite)) space->break_copy_on_write(page, 1);      // (nothing unless the page is copy-on-write)
+      if (space->check(page, 1, need) && space->materialize(page)) {
+        const uint64_t had = task->tables.entry_of(page);
+        again = task->sync_tables() && task->fault_in(page);
+        // (an entry that was already what it is now did not help: the same fault coming back a few times means the program really cannot do this)
+        const bool progress = task->tables.entry_of(page) != had;
+        if (progress || self->stale_rip != frame->rip || self->stale_address != page_fault_address) { self->stale_rip = frame->rip; self->stale_address = page_fault_address; self->stale_count = 0; }
+        if (!progress && ++self->stale_count > 3) again = false;
       }
       task->mutex.unlock();
       irq_disable();
       if (again) return frame;
     }
-  }
-  // A write to a copy-on-write page (PAGE_WRITECOPY) is not a fault: the page gets its own copy and the instruction runs again.
-  if ((frame->vector & 0xFF) == 14 && (frame->error & 3) == 3 && task->program.process()->abi() == process::SyscallAbi::Windows) {
-    const uint64_t cow_address = page_fault_address;
-    irq_enable();
-    task->mutex.lock();
-    process::AddressSpace* space = task->program.process()->address_space();
-    const bool copied = space && ((space->break_copy_on_write(cow_address, 1) && task->sync_tables()) || space->check(cow_address, 1, process::kProtWrite));      // (or another thread got there first)
-    task->mutex.unlock();
-    irq_disable();
-    if (copied) return frame;
   }
   // A Windows program gets its exception delivered, to be handled by SEH or C++ code (or to end up in ntdll's last resort); only when that cannot be done is the program stopped.
   process::Process* process = task->program.process();
@@ -487,6 +484,9 @@ bool init(allocators::IAllocator& allocator) {
     g.objects->set_allocator(&allocator);
     process::set_system_objects(g.objects);
     process::win32k::install();
+  }
+  if (!process::image_cache()) {      // the pages of DLLs at their preferred base, shared by every program that maps them
+    if (void* cache_memory = allocator.allocate(sizeof(process::ImageCache))) process::set_image_cache(new (cache_memory) process::ImageCache(allocator));
   }
   g.nx = (rdmsr(kMsrEfer) & kEferNxe) != 0;
 
@@ -813,25 +813,43 @@ uint32_t Task::list_modules(uint64_t pid, ModuleEntry* out, uint32_t capacity) {
 }
 
 bool Task::sync_tables() {
-  // The program's threads run side by side on every core, each on the page tables it was given. New tables are built beside the old ones; every thread is then given the new
-  // ones (a thread running on another core takes them when that core's interrupt brings it into the kernel and back), and only after all those cores have answered are the old
-  // tables and the memory of what was unmapped given back: until then another core may still be running on them.
-  if (!tables.sync(program.address_space(), true)) return false;
+  // The program's threads run side by side on every core, each on the page tables it was given. The tables are changed in place, only where the memory layout
+  // changed; when an entry a core may have cached went away or lost a permission (or the tables were made anew), every core running a thread of the program is
+  // interrupted, and only after all of them went through the kernel (which reloads CR3: the TLB goes with it) is the memory that was let go of given back.
+  process::AddressSpace& space = program.address_space();
+  const uint64_t before = tables.root();
+  bool flush = false;
+  if (!tables.sync(space, true, &flush)) return false;
   const uint64_t root = tables.root();
+  if (root == before && !flush && !space.has_retired()) return true;
   CoreMask others;
   for (UserThread* t = threads; t; t = t->next) {
-    if (!t->spawned || !t->thread || t->joined || t->finished || t->thread->user_cr3 == root) continue;
-    const int32_t core = set_thread_user_cr3(t->thread, root);
+    if (!t->spawned || !t->thread || t->joined || t->finished) continue;
+    const int32_t core = set_thread_user_cr3(t->thread, root);      // (also says where the thread runs right now)
     if (core >= 0) others.add(static_cast<uint32_t>(core));
   }
   bool answered = true;
   if (!others.empty()) answered = wait_for_kernel_entry(others);
   if (answered) {
     tables.release_previous();
-    program.address_space().reclaim();
+    space.reclaim();
   } else {
     console::puts("user program: a core did not give up the old page tables\n");      // (the old tables and memory are kept until the next change)
   }
+  return true;
+}
+
+bool Task::fault_in(uint64_t page) {
+  bool flush = false;
+  if (!tables.update(program.address_space(), page, page + process::AddressSpace::kPageSize, &flush)) return false;
+  if (!flush) return true;
+  CoreMask others;      // (an entry was there and allowed less: the cores that may have it cached forget it)
+  for (UserThread* t = threads; t; t = t->next) {
+    if (!t->spawned || !t->thread || t->joined || t->finished) continue;
+    const int32_t core = set_thread_user_cr3(t->thread, tables.root());
+    if (core >= 0) others.add(static_cast<uint32_t>(core));
+  }
+  if (!others.empty()) wait_for_kernel_entry(others);
   return true;
 }
 
@@ -1205,7 +1223,7 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
     info.create_time = task->program.process()->create_time;
     __builtin_memcpy(info.name, task->name, sizeof info.name);
     info.windows = task->program.process()->abi() == process::SyscallAbi::Windows;
-    info.memory_bytes = task->program.address_space().mapped_bytes();
+    info.memory_bytes = task->program.address_space().resident_bytes();
     ScopedMutex hold(task->mutex);
     info.cpu_ticks = task->retired_ticks;
     bool ready = false;

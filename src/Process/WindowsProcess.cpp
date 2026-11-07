@@ -32,7 +32,7 @@ namespace {
 constexpr uint32_t kSuccess = 0, kNotImplemented = 0xC0000002u, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du,
                    kNoMemory = 0xC0000017u, kObjectNameNotFound = 0xC0000034u, kInvalidImageFormat = 0xC000007Bu, kNoResources = 0xC000009Au,
                    kNameTooLong = 0xC0000106u;
-constexpr uint64_t kMaxImageBytes = 64ull << 20, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
+constexpr uint64_t kMaxImageBytes = 1ull << 30, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
 constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8, kExplicitStdHandles = 0x10, kPseudoConsole = 0x20, kHasParent = 0x40, kHasHandleList = 0x80, kFreshConsole = 0x100, kDetachedProcess = 0x200;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
@@ -533,13 +533,14 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
       case 2: size = 48; break;      // IO_COUNTERS (nothing is counted)
       case 3: {      // VM_COUNTERS_EX
         const uint64_t mapped = p.address_space() ? p.address_space()->mapped_bytes() : 0;
+        const uint64_t used = p.address_space() ? p.address_space()->resident_bytes() : 0;      // (pages that were never touched take no memory)
         b.put(0, mapped, 8);         // PeakVirtualSize
         b.put(8, mapped, 8);         // VirtualSize
-        b.put(24, mapped, 8);        // PeakWorkingSetSize
-        b.put(32, mapped, 8);        // WorkingSetSize
-        b.put(72, mapped, 8);        // PagefileUsage
-        b.put(80, mapped, 8);        // PeakPagefileUsage
-        b.put(88, mapped, 8);        // PrivateUsage
+        b.put(24, used, 8);          // PeakWorkingSetSize
+        b.put(32, used, 8);          // WorkingSetSize
+        b.put(72, used, 8);          // PagefileUsage
+        b.put(80, used, 8);          // PeakPagefileUsage
+        b.put(88, used, 8);          // PrivateUsage
         size = length >= 96 ? 96 : 88;
         break;
       }

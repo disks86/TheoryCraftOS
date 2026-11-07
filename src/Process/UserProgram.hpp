@@ -47,7 +47,7 @@ struct ProgramStart {
 // arguments joined by spaces). The first argument is also the program's path.
 class UserProgram final : public IModuleHost {
  public:
-  UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = 256ull << 20)
+  UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = AddressSpace::kNoLimit)
       : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator), startup_title_(allocator), startup_desktop_(allocator) {}
   UserProgram(const UserProgram&) = delete;
   UserProgram& operator=(const UserProgram&) = delete;

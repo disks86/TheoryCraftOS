@@ -21,12 +21,14 @@
 #include "Process/WindowsFiles.hpp"
 #include "Process/WindowsProcess.hpp"
 #include "Process/WindowsDebug.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 namespace process::windowsabi {
 
 namespace {
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidParameter = 0xC000000Du, kNotImplemented = 0xC0000002u, kDllNotFound = 0xC0000135u;
-constexpr uint32_t kRecordBytes = 64, kMaxRecords = 32;
+constexpr uint32_t kRecordBytes = 64, kMaxRecords = 256;      // (the records are on the heap: kernel stacks are small)
 }  // namespace
 
 uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
@@ -60,12 +62,16 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
     exe::PeFile checked(p.files().allocator());
     if (const uint32_t header = image_section_status(file.view(), checked)) return header;
   }
-  LoadedModule loaded[kMaxRecords];
+  List<LoadedModule> loaded_list(p.files().allocator());
+  ByteBuffer record_buffer(p.files().allocator());
+  if (!loaded_list.reserve(capacity) || !record_buffer.put_zeros(uint64_t{capacity} * kRecordBytes)) return 0xC0000017u;
+  for (uint32_t i = 0; i < capacity; ++i) loaded_list.push_back(LoadedModule());
+  LoadedModule* loaded = &loaded_list[0];
   uint32_t count = 0;
   status = host->load_module(file.view(), canonical.view(), loaded, capacity, &count, (flags & 1) == 0);
   if (status == 0xC000007Bu) status = 0xC00000BBu;      // a good image that this process cannot run (a 32-bit library): the caller may try the next file of its path
   if (status != kSuccess) return status;
-  uint8_t records[kMaxRecords * kRecordBytes] = {};
+  uint8_t* records = record_buffer.writable_view().data();
   uint64_t base = 0;
   for (uint32_t i = 0; i < count; ++i) {
     uint8_t* out = records + i * kRecordBytes;
@@ -89,11 +95,15 @@ uint32_t nt_release_module(Process& p, const SyscallRequest& r) {
   if (!host) return kNotImplemented;
   const uint32_t capacity = uint32_t(r.args[2]);
   if (capacity == 0 || capacity > kMaxRecords || r.args[1] == 0) return kInvalidParameter;
-  LoadedModule doomed[kMaxRecords];
+  List<LoadedModule> doomed_list(p.files().allocator());
+  ByteBuffer record_buffer(p.files().allocator());
+  if (!doomed_list.reserve(capacity) || !record_buffer.put_zeros(uint64_t{capacity} * kRecordBytes)) return 0xC0000017u;
+  for (uint32_t i = 0; i < capacity; ++i) doomed_list.push_back(LoadedModule());
+  LoadedModule* doomed = &doomed_list[0];
   uint32_t count = 0;
   const uint32_t status = host->release_module(r.args[0], doomed, capacity, &count);
   if (status != kSuccess) return status;
-  uint8_t records[kMaxRecords * kRecordBytes] = {};
+  uint8_t* records = record_buffer.writable_view().data();
   for (uint32_t i = 0; i < count; ++i) {
     uint8_t* out = records + i * kRecordBytes;
     const uint64_t values[3] = {doomed[i].base, doomed[i].size, doomed[i].entry};
