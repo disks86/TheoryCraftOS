@@ -22,24 +22,21 @@
 namespace network {
 
 uint32_t UdpSocket::pending() const {
-  kernel::ScopedRecursiveMutex guard(lock_);
+  kernel::ScopedMutex guard(queue_lock_);
   return static_cast<uint32_t>(queue_.count());
 }
 
 void UdpSocket::close() {
-  kernel::ScopedRecursiveMutex guard(lock_);
   __atomic_store_n(&closed_, true, __ATOMIC_RELEASE);
 }
 
 bool UdpSocket::send_to(Ipv4Address address, uint16_t port, ConstByteView data) {
-  kernel::ScopedRecursiveMutex guard(lock_);
   return send_from(ip_.source_for(address), address, port, data, false);
 }
 
 bool UdpSocket::send_from(Ipv4Address source, Ipv4Address address, uint16_t port, ConstByteView data,
                           bool link_broadcast) {
-  kernel::ScopedRecursiveMutex guard(lock_);
-  if (closed_ || data.size() > kMaxDatagram) return false;
+  if (closed() || data.size() > kMaxDatagram) return false;
   uint8_t storage[8 + kMaxDatagram];
   ByteWriter out{ByteView(storage)};
   out.be16(port_);
@@ -59,9 +56,11 @@ bool UdpSocket::receive_from(ByteView buffer, Ipv4Address* from_address, uint16_
 }
 
 bool UdpSocket::receive_from_ip(ByteView buffer, IpAddress* from_address, uint16_t* from_port, uint32_t* length) {
-  kernel::ScopedRecursiveMutex guard(lock_);
   Datagram d;
-  if (!queue_.dequeue(&d)) return false;
+  {
+    kernel::ScopedMutex guard(queue_lock_);
+    if (!queue_.dequeue(&d)) return false;
+  }
   buffer.copy_from(ConstByteView(d.data).first(d.length).at_most(buffer.size()));  // as much as fits
   if (from_address) *from_address = d.from_address;
   if (from_port) *from_port = d.from_port;
@@ -72,8 +71,7 @@ bool UdpSocket::receive_from_ip(ByteView buffer, IpAddress* from_address, uint16
 // Over IPv6 the same datagram, sent with send_ip_to() (the IP layer fills in the checksum, which IPv6 requires) and 20 bytes shorter at most.
 bool UdpSocket::send_to_ip(const IpAddress& address, uint16_t port, ConstByteView data) {
   if (!address.v6) return send_to(address.ipv4, port, data);
-  kernel::ScopedRecursiveMutex guard(lock_);
-  if (closed_ || data.size() > kMaxIpv6Payload - 8) return false;
+  if (closed() || data.size() > kMaxIpv6Payload - 8) return false;
   uint8_t storage[8 + kMaxDatagram];
   ByteWriter out{ByteView(storage)};
   out.be16(port_);
@@ -86,13 +84,14 @@ bool UdpSocket::send_to_ip(const IpAddress& address, uint16_t port, ConstByteVie
 }
 
 void UdpSocket::deliver(const IpAddress& from_address, uint16_t from_port, ConstByteView data) {
-  kernel::ScopedRecursiveMutex guard(lock_);
-  if (closed_ || data.size() > kMaxDatagram || queue_.count() >= kQueueLimit) return;
-  Datagram d;
+  if (closed() || data.size() > kMaxDatagram) return;
+  Datagram d;   // (filled before the lock: only the enqueue's copy happens under it)
   d.from_address = from_address;
   d.from_port = from_port;
   d.length = static_cast<uint16_t>(data.size());
-  ByteView(d.data).copy_from(data);
+  ByteView(d.data).first(data.size()).copy_from(data);
+  kernel::ScopedMutex guard(queue_lock_);
+  if (queue_.count() >= kQueueLimit) return;
   queue_.enqueue(d);
 }
 

@@ -674,6 +674,76 @@ static void test_backlog() {
   CHECK(replied == 2 && reply[0] == 9 && reply[1] == 8);
 }
 
+// One UDP socket, several threads: on machine A four threads send datagrams from the same socket while a fifth reads the echoes from it; on B
+// one thread echoes everything back on its socket while the service threads (two receive queues) deliver into both. The socket's only lock is
+// its queue's, held for a copy, so a delivery never waits for a send. Every echo that comes back is intact (UDP may drop: the senders keep
+// at most 16 datagrams outstanding, below the queue's 32, and nearly all must return).
+static void test_udp_threads() {
+  Machines m(2);
+  constexpr int kSenders = 4;
+  constexpr uint32_t kPerSender = 400, kSize = 600;
+  SharedPointer<IUdpSocket> echo = m.b.at(0)->udp_open(9500);
+  SharedPointer<IUdpSocket> shared = m.a.at(0)->udp_open(0);
+  CHECK(echo && shared);
+  if (!echo || !shared) return;
+  std::atomic<bool> stop{false};
+  std::atomic<uint32_t> sent{0}, echoed{0}, corrupt{0};
+  std::thread echoer([&] {
+    uint8_t buffer[2000];
+    while (!stop) {
+      IpAddress from;
+      uint16_t port;
+      uint32_t length;
+      const uint64_t seen = m.b.progress();
+      bool any = false;
+      while (echo->receive_from_ip(ByteView(buffer), &from, &port, &length)) {
+        echo->send_to_ip(from, port, ConstByteView(buffer, length));
+        any = true;
+      }
+      if (!any) m.b.wait_for_progress(seen, 5);
+    }
+  });
+  std::thread reader([&] {
+    uint8_t buffer[2000];
+    while (!stop) {
+      uint32_t length;
+      const uint64_t seen = m.a.progress();
+      bool any = false;
+      while (shared->receive_from_ip(ByteView(buffer), nullptr, nullptr, &length)) {
+        any = true;
+        bool good = length == kSize;
+        for (uint32_t i = 4; good && i < kSize; ++i) good = buffer[i] == uint8_t(buffer[0] * 31 + buffer[1] + buffer[2] * 7 + i);
+        if (good) ++echoed;
+        else ++corrupt;
+      }
+      if (!any) m.a.wait_for_progress(seen, 5);
+    }
+  });
+  std::vector<std::thread> senders;
+  for (int t = 0; t < kSenders; ++t)
+    senders.emplace_back([&, t] {
+      uint8_t d[kSize];
+      for (uint32_t n = 0; n < kPerSender; ++n) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (sent - echoed - corrupt >= 16 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        d[0] = uint8_t(t);
+        d[1] = uint8_t(n);
+        d[2] = uint8_t(n >> 8);
+        d[3] = 0;
+        for (uint32_t i = 4; i < kSize; ++i) d[i] = uint8_t(d[0] * 31 + d[1] + d[2] * 7 + i);
+        if (shared->send_to(Ipv4Address::make(10, 0, 0, 2), 9500, ConstByteView(d, kSize))) ++sent;
+      }
+    });
+  for (std::thread& t : senders) t.join();
+  wait_until(m.a, [&] { return echoed + corrupt >= sent; }, 10);
+  stop = true;
+  echoer.join();
+  reader.join();
+  printf("udp threads: %u sent from %d threads on one socket, %u echoed intact, %u corrupt\n", sent.load(), kSenders, echoed.load(), corrupt.load());
+  CHECK(sent == kSenders * kPerSender);
+  CHECK(corrupt == 0 && echoed >= sent * 9 / 10);
+}
+
 int main() {
   test_concurrent_connections();
   test_loopback_latency();
@@ -684,6 +754,7 @@ int main() {
   test_many_connections();
   test_one_connection_threads();
   test_backlog();
+  test_udp_threads();
   if (g_failed) { printf("NetworkThreadTest: %d failed\n", g_failed.load()); return 1; }
   printf("NetworkThreadTest: all passed\n");
   return 0;

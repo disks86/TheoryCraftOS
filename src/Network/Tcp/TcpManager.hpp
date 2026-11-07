@@ -72,7 +72,7 @@ class TcpManager {
   uint32_t connection_count() const { return connections_.count(); }   // (for tests)
 
  private:
-  static constexpr uint32_t kConnectionBuckets = 1024, kListenerBuckets = 64;
+  static constexpr uint32_t kConnectionBuckets = 256, kListenerBuckets = 16;   // (the least each table has: they grow with what they hold)
   struct Snapshot {   // a socket the timers look at, and how many references the manager itself holds to it
     SharedPointer<TcpSocket> socket;
     uint32_t held = 0;

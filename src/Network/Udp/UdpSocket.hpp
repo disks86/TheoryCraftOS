@@ -26,6 +26,11 @@ namespace network {
 
 // The default IUdpSocket. Received datagrams wait in a queue (up to kQueueLimit;
 // later ones are dropped, as UDP allows).
+//
+// Thread-safe with one leaf lock: the queue's, held only while a datagram is copied
+// in or out. Sending takes no lock (the port and families never change and closed_
+// is atomic), so the receive threads never wait for an application's send - which
+// builds and transmits the packet - and senders on several threads go at once.
 class UdpSocket final : public IUdpSocket {
  public:
   static constexpr uint32_t kMaxDatagram = kMaxIpPayload - 8;  // 1472: IP payload minus the UDP header
@@ -48,7 +53,7 @@ class UdpSocket final : public IUdpSocket {
 
   // The UDP manager hands arriving datagrams in here.
   void deliver(const IpAddress& from_address, uint16_t from_port, ConstByteView data);
-  bool closed() const { return __atomic_load_n(&closed_, __ATOMIC_ACQUIRE); }   // (read by the manager without this socket's lock)
+  bool closed() const { return __atomic_load_n(&closed_, __ATOMIC_ACQUIRE); }
   IpFamilies families() const { return families_; }  // whose datagrams it takes
 
  private:
@@ -64,9 +69,9 @@ class UdpSocket final : public IUdpSocket {
   IpFamilies families_;
   bool closed_ = false;
   Queue<Datagram> queue_;
-  // Guards the queue (the port and families never change; closed_ is read atomically). Datagrams arrive from the stack's receive threads while
-  // the application reads: this lock, not the stack's, is what they share.
-  mutable kernel::RecursiveMutex lock_;
+  // Guards the queue (a leaf: nothing is taken while it is held). Datagrams arrive from the stack's receive threads while the application
+  // reads: this lock, not the stack's, is what they share.
+  mutable kernel::Mutex queue_lock_;
 };
 
 }  // namespace network

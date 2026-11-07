@@ -47,7 +47,7 @@ class UdpManager {
 
   IIpLayer& ip_;
   allocators::IAllocator& allocator_;
-  RcuSocketTable<UdpSocket, 128> table_;   // by local port
+  RcuSocketTable<UdpSocket, 32> table_;   // by local port (grows with what it holds)
   mutable kernel::Mutex table_mutex_;      // guards the table's changes and the list (never held while calling into a socket)
   List<SharedPointer<UdpSocket>> sockets_;   // every open socket (to forget the closed ones)
   uint16_t next_ephemeral_ = 49152;
