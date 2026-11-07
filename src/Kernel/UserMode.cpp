@@ -153,10 +153,12 @@ void load_core(void* argument) {
   uint64_t cr4;
   __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
   if (cr4 & (1u << 7)) __asm__ volatile("movq %0, %%cr4" ::"r"(cr4 & ~uint64_t{1u << 7}) : "memory");
-  // Interrupts save the x87/SSE state only. With XSAVE on, a program could use AVX, whose upper halves would leak between programs, so user mode is told
-  // there is none (CPUID then reports OSXSAVE clear).
-  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
-  if (cr4 & (1u << 18)) __asm__ volatile("movq %0, %%cr4" ::"r"(cr4 & ~uint64_t{1u << 18}) : "memory");
+  // Interrupts save the x87/SSE state only; the AVX and AVX-512 registers (which the kernel never uses) go with their thread at each switch (see enable_extended_state),
+  // so programs may use them. Without XSAVE support user mode is told there is none (CPUID reports OSXSAVE clear).
+  if (!enable_extended_state()) {
+    __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+    if (cr4 & (1u << 18)) __asm__ volatile("movq %0, %%cr4" ::"r"(cr4 & ~uint64_t{1u << 18}) : "memory");
+  }
   wrmsr(kMsrEfer, rdmsr(kMsrEfer) | kEferSce);
   wrmsr(kMsrStar, (uint64_t{0x10} << 48) | (uint64_t{kSelectorCode} << 32));      // SYSCALL loads CS 0x08 / SS 0x10 (the SYSRET half is unused: we return with IRET)
   wrmsr(kMsrLstar, copy_of(tcos_tramp_syscall));

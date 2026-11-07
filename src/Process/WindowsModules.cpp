@@ -56,8 +56,18 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
     const uint8_t none[4] = {};
     return p.write_user_u64(r.args[1], existing) && (count_at == 0 || p.write_user(count_at, ConstByteView(none, 4))) ? kSuccess : kAccessViolation;
   }
+  // A name that stands for another library (an API set such as api-ms-win-core-winrt-l1-1-0.dll, kernelbase.dll, a C runtime) is that library, from System32, wherever
+  // the caller looked for it: no file of the alias's name exists.
+  String alias_path(p.files().allocator());
+  {
+    String plain(p.files().allocator());
+    const StringView file_name = slash == StringView::npos ? path.view() : path.view().without_prefix(slash + 1);
+    for (char ch : file_name) if (!plain.push_back(ch >= 'A' && ch <= 'Z' ? char(ch + 32) : ch)) return kInvalidParameter;
+    if (plain.view().rfind('.') == StringView::npos && !plain.append(".dll")) return kInvalidParameter;
+    if (!(flags & 4) && !plain.view().equals(canonical.view()) && (!alias_path.assign("C:\\Windows\\System32\\") || !alias_path.append(canonical.view()))) return kInvalidParameter;
+  }
   ByteBuffer file(p.files().allocator());
-  if (!read_program_file(p, path.view(), &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
+  if (!read_program_file(p, alias_path.empty() ? path.view() : alias_path.view(), &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
   {
     exe::PeFile checked(p.files().allocator());
     if (const uint32_t header = image_section_status(file.view(), checked)) return header;

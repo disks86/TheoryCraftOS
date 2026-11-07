@@ -1081,8 +1081,9 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     ULONG ldr_flags = ((flags & 1) ? 2 : 0) | 0x40000000;
     unicode_string(&us, path);
     const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
-    if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
-    return (HMODULE)handle;
+    if (NT_SUCCESS(status)) return (HMODULE)handle;
+    /* An assembly the manifest names whose file is not there (Common Controls 6 is the comctl32.dll of System32 here): the usual search finds the library. */
+    if (status != (NTSTATUS)0xC0000135 && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A) { set_error(dos_error_of_load(status)); return NULL; }
   }
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
