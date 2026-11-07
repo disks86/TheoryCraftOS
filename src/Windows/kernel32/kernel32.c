@@ -4687,7 +4687,7 @@ static const char *error_text(DWORD error) {
 }
 /* ---- start ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
+BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
   (void)module; (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) RtlTcosSetUnhandledExceptionHook(UnhandledExceptionFilter);      /* (what runs when nothing handled an exception) */
   return TRUE;

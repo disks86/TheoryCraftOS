@@ -24,7 +24,7 @@
  * is not stripped); the unwind tables (.pdata) are kept for SymFunctionTableAccess64 and StackWalk64. There is no PDB, DWARF or CodeView reader, so there are no line
  * numbers, types, locals or source files: those calls fail the way they do for a module without debug information (ERROR_MOD_NOT_FOUND / ERROR_NOT_SUPPORTED).
  * The 32-bit variants of the functions are the same calls with 32-bit addresses; only the ones that need no new structure layout are here. Not here either: symbol servers
- * (SymSrv*), the Windows debugger extension exports, MiniDumpWriteDump's callbacks and the full C++ name decoder of UnDecorateSymbolName (the common signatures only).
+ * (SymSrv*, except SymSrvGetFileIndexInfo), the Windows debugger extension exports, MiniDumpWriteDump's callbacks and the full C++ name decoder of UnDecorateSymbolName (the common signatures only).
  * Built freestanding over kernel32.dll and ntdll.dll with the OS's mingw compiler. */
 #define WIN32_LEAN_AND_MEAN
 #define _IMAGEHLP_SOURCE_

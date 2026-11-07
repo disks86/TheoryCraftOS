@@ -1,0 +1,10 @@
+#include <windows.h>
+/* Resources for user32misctest.c: strings in two bundles (ids 0..15 and 16..31), one of them empty. */
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+STRINGTABLE
+{
+  1, "Hello"
+  2, ""
+  15, "last of the first bundle"
+  17, "Second bundle"
+}

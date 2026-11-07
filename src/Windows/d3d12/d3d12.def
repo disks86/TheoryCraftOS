@@ -1,0 +1,4 @@
+LIBRARY d3d12.dll
+EXPORTS
+; Programs linked with the Windows SDK import D3D12CreateDevice by its ordinal (chrome.dll does).
+D3D12CreateDevice @101

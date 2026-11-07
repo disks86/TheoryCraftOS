@@ -33,6 +33,8 @@ MonitorFromWindow = user32.MonitorFromWindow
 GetSystemWow64DirectoryA = kernel32.GetSystemWow64DirectoryA
 IsWow64Process = kernel32.IsWow64Process
 ; ordinals that programs import by number
+SHChangeNotifyRegister @2
+SHChangeNotifyDeregister @4
 SHAllocShared @7
 SHLockShared @8
 SHUnlockShared @9
@@ -70,5 +72,6 @@ SHFree @195
 SHAlloc @196
 ReadCabinetState @651
 WriteCabinetState @652
+IsUserAnAdmin @680
 SetCurrentProcessExplicitAppUserModelID = shcore.SetCurrentProcessExplicitAppUserModelID
 GetCurrentProcessExplicitAppUserModelID = shcore.GetCurrentProcessExplicitAppUserModelID

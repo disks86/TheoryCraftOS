@@ -172,3 +172,109 @@ EXPORT BOOL WINAPI GetAllUsersProfileDirectoryA(LPSTR buffer, LPDWORD size) {
   *size = n;
   return TRUE;
 }
+
+/* ---- app containers ---------------------------------------------------------------------------------------------------------------------------------------- *
+ * The SID of an app container is derived from its name as on Windows: S-1-15-2-r1-...-r7, the seven sub-authorities being the first 28 bytes of the SHA-256 of the
+ * lower-cased name (UTF-16, little-endian), read as little-endian DWORDs. The SID is allocated like RtlAllocateAndInitializeSid's, so FreeSid frees it. */
+
+IMPORT NTSTATUS NTAPI RtlAllocateAndInitializeSid(const void *authority, BYTE count, DWORD s0, DWORD s1, DWORD s2, DWORD s3, DWORD s4, DWORD s5, DWORD s6, DWORD s7,
+                                                  void **sid);
+
+static const DWORD kSha256K[64] = {
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+  0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+  0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+  0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+static DWORD ror32(DWORD x, int n) { return (x >> n) | (x << (32 - n)); }
+static void sha256_block(DWORD state[8], const BYTE block[64]) {
+  DWORD w[64];
+  for (int i = 0; i < 16; i++) w[i] = (DWORD)block[4 * i] << 24 | (DWORD)block[4 * i + 1] << 16 | (DWORD)block[4 * i + 2] << 8 | block[4 * i + 3];
+  for (int i = 16; i < 64; i++) {
+    const DWORD s0 = ror32(w[i - 15], 7) ^ ror32(w[i - 15], 18) ^ (w[i - 15] >> 3), s1 = ror32(w[i - 2], 17) ^ ror32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+  }
+  DWORD a = state[0], b = state[1], c = state[2], d = state[3], e = state[4], f = state[5], g = state[6], h = state[7];
+  for (int i = 0; i < 64; i++) {
+    const DWORD t1 = h + (ror32(e, 6) ^ ror32(e, 11) ^ ror32(e, 25)) + ((e & f) ^ (~e & g)) + kSha256K[i] + w[i];
+    const DWORD t2 = (ror32(a, 2) ^ ror32(a, 13) ^ ror32(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+    h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+  }
+  state[0] += a; state[1] += b; state[2] += c; state[3] += d; state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+/* SHA-256 of `size` bytes (at most a few hundred here: the name is limited). */
+static void sha256(const BYTE *data, DWORD size, BYTE out[32]) {
+  DWORD state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  BYTE block[64];
+  DWORD done = 0;
+  for (; size - done >= 64; done += 64) sha256_block(state, data + done);
+  DWORD n = size - done;
+  for (DWORD i = 0; i < n; i++) block[i] = data[done + i];
+  block[n++] = 0x80;
+  if (n > 56) { while (n < 64) block[n++] = 0; sha256_block(state, block); n = 0; }
+  while (n < 56) block[n++] = 0;
+  const unsigned long long bits = (unsigned long long)size * 8;
+  for (int i = 0; i < 8; i++) block[56 + i] = (BYTE)(bits >> (56 - 8 * i));
+  sha256_block(state, block);
+  for (int i = 0; i < 8; i++) { out[4 * i] = (BYTE)(state[i] >> 24); out[4 * i + 1] = (BYTE)(state[i] >> 16); out[4 * i + 2] = (BYTE)(state[i] >> 8); out[4 * i + 3] = (BYTE)state[i]; }
+}
+
+#define APP_CONTAINER_NAME_MAX 64      /* (the longest name Windows accepts) */
+EXPORT LONG WINAPI DeriveAppContainerSidFromAppContainerName(LPCWSTR name, void **sid) {
+  if (sid) *sid = NULL;
+  if (!name || !sid) return (LONG)0x80070057;      /* E_INVALIDARG */
+  BYTE text[APP_CONTAINER_NAME_MAX * 2];
+  DWORD n = 0;
+  for (; name[n]; n++) {
+    if (n >= APP_CONTAINER_NAME_MAX) return (LONG)0x80070057;
+    WCHAR c = name[n];
+    if (c >= 'A' && c <= 'Z') c = (WCHAR)(c + 32);
+    text[2 * n] = (BYTE)c;
+    text[2 * n + 1] = (BYTE)(c >> 8);
+  }
+  if (n < 2) return (LONG)0x80070057;
+  BYTE hash[32];
+  sha256(text, 2 * n, hash);
+  DWORD rid[7];
+  for (int i = 0; i < 7; i++) rid[i] = (DWORD)hash[4 * i] | (DWORD)hash[4 * i + 1] << 8 | (DWORD)hash[4 * i + 2] << 16 | (DWORD)hash[4 * i + 3] << 24;
+  static const BYTE kAppPackageAuthority[6] = {0, 0, 0, 0, 0, 15};      /* SECURITY_APP_PACKAGE_AUTHORITY */
+  if (RtlAllocateAndInitializeSid(kAppPackageAuthority, 8, 2 /* SECURITY_APP_PACKAGE_BASE_RID */, rid[0], rid[1], rid[2], rid[3], rid[4], rid[5], rid[6], sid) < 0) {
+    *sid = NULL;
+    return (LONG)0x8007000E;      /* E_OUTOFMEMORY */
+  }
+  return 0;
+}
+
+/* ---- group policy -------------------------------------------------------------------------------------------------------------------------------------------- *
+ * There is no group policy: the critical section is a token that only says so, notifications are accepted and never sent, and the profile is a local one. */
+#define POLICY_SECTION_USER ((HANDLE)(ULONG_PTR)0x47500001u)
+#define POLICY_SECTION_MACHINE ((HANDLE)(ULONG_PTR)0x47500002u)
+EXPORT HANDLE WINAPI EnterCriticalPolicySection(BOOL machine) { return machine ? POLICY_SECTION_MACHINE : POLICY_SECTION_USER; }
+EXPORT BOOL WINAPI LeaveCriticalPolicySection(HANDLE section) {
+  if (section != POLICY_SECTION_USER && section != POLICY_SECTION_MACHINE) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+  return TRUE;
+}
+EXPORT BOOL WINAPI RegisterGPNotification(HANDLE event, BOOL machine) {
+  (void)machine;
+  if (!event) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  return TRUE;
+}
+EXPORT BOOL WINAPI UnregisterGPNotification(HANDLE event) {
+  if (!event) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  return TRUE;
+}
+/* GetProfileType: 0 is a local profile (not PT_TEMPORARY, PT_ROAMING or PT_MANDATORY). */
+EXPORT BOOL WINAPI GetProfileType(DWORD *flags) {
+  if (!flags) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  *flags = 0;
+  return TRUE;
+}
+
+/* The entry point (without one of its own, the default of stubs.c would lose to the DllMain kernel32.dll exports, which would then run as this library's entry). */
+BOOL WINAPI DllMain(HANDLE instance, DWORD reason, LPVOID reserved) {
+  (void)instance;
+  (void)reason;
+  (void)reserved;
+  return TRUE;
+}

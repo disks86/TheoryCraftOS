@@ -1,0 +1,4 @@
+LIBRARY mmdevapi.dll
+EXPORTS
+; Programs import ActivateAudioInterfaceAsync by its ordinal (chrome.dll does).
+ActivateAudioInterfaceAsync @17

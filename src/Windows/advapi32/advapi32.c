@@ -123,7 +123,7 @@ EXPORT BOOL WINAPI CryptGenRandom(HANDLE provider, DWORD length, BYTE *buffer) {
   return TRUE;
 }
 
-EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
+BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
   (void)module; (void)reserved; (void)reason;
   return TRUE;
 }

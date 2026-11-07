@@ -120,6 +120,20 @@ static int wsa_error_for(NTSTATUS status) {
 /* Fails the call (returning `result`) with a WSA error made from an NTSTATUS; result is -1 for int-returning calls, INVALID_SOCKET for socket()/accept(). */
 static SOCKET fail_nt(NTSTATUS status, SOCKET result) { set_wsa_error(wsa_error_for(status)); return result; }
 
+/* Event select (below, with the overlapped calls): the plain calls tell it what they did, so that a network event it already recorded can be recorded again (FD_READ after a
+ * recv, FD_ACCEPT after an accept, FD_WRITE after a send that would have blocked), a connect is watched for FD_CONNECT, and a closed socket is forgotten. */
+#define FD_READ_ 0x01
+#define FD_WRITE_ 0x02
+#define FD_OOB_ 0x04
+#define FD_ACCEPT_ 0x08
+#define FD_CONNECT_ 0x10
+#define FD_CLOSE_ 0x20
+static volatile LONG g_watched = 0;      /* how many sockets event select knows (the plain calls skip the table while there are none) */
+static void select_rearm(SOCKET s, LONG events);
+static void select_connecting(SOCKET s);
+static void select_forget(SOCKET s);
+static void select_inherit(SOCKET listener, SOCKET accepted);
+
 EXPORT int WSAAPI WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData) {
   (void)wVersionRequested;
   ++g_started;
@@ -173,6 +187,7 @@ EXPORT SOCKET WSAAPI socket(int af, int type, int protocol) {
   return (SOCKET)(UINT_PTR)h;
 }
 EXPORT int WSAAPI closesocket(SOCKET s) {
+  if (g_watched) select_forget(s);
   const NTSTATUS status = NtClose((HANDLE)(UINT_PTR)s);
   if (!NT_SUCCESS(status)) return (int)fail_nt(status, SOCKET_ERROR);
   return 0;
@@ -186,6 +201,7 @@ EXPORT int WSAAPI bind(SOCKET s, const SOCKADDR *name, int namelen) {
 EXPORT int WSAAPI connect(SOCKET s, const SOCKADDR *name, int namelen) {
   if (!check_address(name, namelen)) return SOCKET_ERROR;
   const NTSTATUS status = NtConnectSocket((HANDLE)(UINT_PTR)s, name, (ULONG)address_size(name, namelen));
+  if (NT_SUCCESS(status) || wsa_error_for(status) == WSAEWOULDBLOCK_) select_connecting(s);      /* (FD_CONNECT follows either way, as on Windows) */
   return NT_SUCCESS(status) ? 0 : (int)fail_nt(status, SOCKET_ERROR);
 }
 EXPORT int WSAAPI listen(SOCKET s, int backlog) {
@@ -198,8 +214,10 @@ EXPORT SOCKET WSAAPI accept(SOCKET s, SOCKADDR *addr, int *addrlen) {
   ULONG peer_length = sizeof peer;
   if (addr && !addrlen) { set_wsa_error(WSAEFAULT_); return INVALID_SOCKET; }
   const NTSTATUS status = NtAcceptSocket((HANDLE)(UINT_PTR)s, &out, &peer, &peer_length);
+  if (g_watched) select_rearm(s, FD_ACCEPT_);
   if (!NT_SUCCESS(status)) return fail_nt(status, INVALID_SOCKET);
   if (!give_address(&peer, peer_length, addr, addrlen)) { NtClose(out); return INVALID_SOCKET; }
+  if (g_watched) select_inherit(s, (SOCKET)(UINT_PTR)out);
   return (SOCKET)(UINT_PTR)out;
 }
 
@@ -207,6 +225,7 @@ EXPORT int WSAAPI send(SOCKET s, const char *buf, int len, int flags) {
   (void)flags;
   ULONG sent = 0;
   const NTSTATUS status = NtSendSocket((HANDLE)(UINT_PTR)s, (PVOID)(UINT_PTR)buf, (ULONG)len, &sent, NULL, 0);
+  if (g_watched && !NT_SUCCESS(status) && wsa_error_for(status) == WSAEWOULDBLOCK_) select_rearm(s, FD_WRITE_);
   return NT_SUCCESS(status) ? (int)sent : (int)fail_nt(status, SOCKET_ERROR);
 }
 EXPORT int WSAAPI sendto(SOCKET s, const char *buf, int len, int flags, const SOCKADDR *to, int tolen) {
@@ -215,12 +234,14 @@ EXPORT int WSAAPI sendto(SOCKET s, const char *buf, int len, int flags, const SO
   if (!check_address(to, tolen)) return SOCKET_ERROR;
   ULONG sent = 0;
   const NTSTATUS status = NtSendSocket((HANDLE)(UINT_PTR)s, (PVOID)(UINT_PTR)buf, (ULONG)len, &sent, to, (ULONG)address_size(to, tolen));
+  if (g_watched && !NT_SUCCESS(status) && wsa_error_for(status) == WSAEWOULDBLOCK_) select_rearm(s, FD_WRITE_);
   return NT_SUCCESS(status) ? (int)sent : (int)fail_nt(status, SOCKET_ERROR);
 }
 EXPORT int WSAAPI recv(SOCKET s, char *buf, int len, int flags) {
   (void)flags;
   ULONG got = 0;
   const NTSTATUS status = NtReceiveSocket((HANDLE)(UINT_PTR)s, buf, (ULONG)len, &got, NULL, NULL, NULL);
+  if (g_watched) select_rearm(s, FD_READ_);
   return NT_SUCCESS(status) ? (int)got : (int)fail_nt(status, SOCKET_ERROR);
 }
 EXPORT int WSAAPI recvfrom(SOCKET s, char *buf, int len, int flags, SOCKADDR *from, int *fromlen) {
@@ -231,6 +252,7 @@ EXPORT int WSAAPI recvfrom(SOCKET s, char *buf, int len, int flags, SOCKADDR *fr
   BOOLEAN closed = FALSE;
   if (from && !fromlen) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
   const NTSTATUS status = NtReceiveSocket((HANDLE)(UINT_PTR)s, buf, (ULONG)len, &got, from ? &sender : NULL, from ? &sender_length : NULL, &closed);
+  if (g_watched) select_rearm(s, FD_READ_);
   if (!NT_SUCCESS(status)) return (int)fail_nt(status, SOCKET_ERROR);
   if (!closed && !give_address(&sender, sender_length, from, fromlen)) return SOCKET_ERROR;
   return (int)got;
@@ -269,20 +291,36 @@ static int get_name(SOCKET s, ULONG operation, SOCKADDR *out, int *outlen) {
 EXPORT int WSAAPI getsockname(SOCKET s, SOCKADDR *name, int *namelen) { return get_name(s, 2, name, namelen); }
 EXPORT int WSAAPI getpeername(SOCKET s, SOCKADDR *name, int *namelen) { return get_name(s, 3, name, namelen); }
 
+/* The services take the handles as 32-bit values (a handle fits) and compact each array to the ready ones in place, while an fd_set holds 64-bit SOCKETs: each set goes
+ * through an array of ULONGs of its own and comes back as the ready SOCKETs. */
+static void pack_set(const fd_set_ *set, ULONG *count, ULONG *handles) {
+  *count = 0;
+  if (!set) return;
+  const UINT n = set->fd_count > 64 ? 64 : set->fd_count;
+  for (UINT i = 0; i < n; ++i) handles[(*count)++] = (ULONG)set->fd_array[i];
+}
+static void unpack_set(fd_set_ *set, ULONG count, const ULONG *handles) {
+  if (!set) return;
+  for (ULONG i = 0; i < count && i < 64; ++i) set->fd_array[i] = (SOCKET)handles[i];
+  set->fd_count = count;
+}
 EXPORT int WSAAPI select(int nfds, fd_set_ *readfds, fd_set_ *writefds, fd_set_ *exceptfds, const TIMEVAL_ *timeout) {
   (void)nfds;
   LARGE_INTEGER time_limit;
   const PLARGE_INTEGER time_arg = timeout ? &time_limit : NULL;
   if (timeout) time_limit.QuadPart = (LONGLONG)timeout->tv_sec * 10000000LL + (LONGLONG)timeout->tv_usec * 10LL;
+  ULONG read_count, write_count, except_count, read_handles[64], write_handles[64], except_handles[64];
+  pack_set(readfds, &read_count, read_handles);
+  pack_set(writefds, &write_count, write_handles);
+  pack_set(exceptfds, &except_count, except_handles);
   ULONG ready = 0;
-  const NTSTATUS status = NtSelectSockets(
-      readfds ? &readfds->fd_count : NULL, readfds ? (PULONG)readfds->fd_array : NULL,
-      writefds ? &writefds->fd_count : NULL, writefds ? (PULONG)writefds->fd_array : NULL,
-      exceptfds ? &exceptfds->fd_count : NULL, exceptfds ? (PULONG)exceptfds->fd_array : NULL,
-      time_arg, &ready);
-  /* Each fd_set's own fd_count is read/write, like the real one: NtSelectSockets already turned it from "how many handles I gave you" into "how many of them are
-     ready" and compacted fd_array to match, so there is nothing left to do here. */
+  const NTSTATUS status = NtSelectSockets(readfds ? &read_count : NULL, readfds ? read_handles : NULL, writefds ? &write_count : NULL, writefds ? write_handles : NULL,
+                                          exceptfds ? &except_count : NULL, exceptfds ? except_handles : NULL, time_arg, &ready);
   if (!NT_SUCCESS(status)) return (int)fail_nt(status, SOCKET_ERROR);
+  /* Each count came back as how many of its handles are ready, the array compacted to them. */
+  unpack_set(readfds, read_count, read_handles);
+  unpack_set(writefds, write_count, write_handles);
+  unpack_set(exceptfds, except_count, except_handles);
   return (int)ready;
 }
 
@@ -1066,4 +1104,800 @@ EXPORT int WSAAPI WSAStringToAddressW(WCHAR *text, int family, void *protocol_in
   if (text[n]) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
   narrow[n] = 0;
   return WSAStringToAddressA(narrow, family, protocol_info, out, out_length);
+}
+
+/* ---- events, event select and the overlapped calls ----------------------------------------------------------------------------------------------------------------------
+ * WSA events are kernel32 manual-reset events. WSAEventSelect keeps a record per socket (the event, the FD_* bits asked for, which of them may be recorded again, what is
+ * recorded and not yet enumerated, and the error of each) and makes the socket non-blocking, as on Windows. A poller thread of this DLL (started by the first WSAEventSelect)
+ * asks NtSelectSockets about every socket that has something left to record - readable, writable, failed - and records and signals what it finds; the conditions are
+ * re-armed the way Windows re-enables them (FD_READ by a receive, FD_ACCEPT by an accept, FD_WRITE by a send that would block). The services have no wake-up for anything but
+ * the network, so the poller waits at most POLL_100NS in each select and re-reads the table; with nothing to watch it sleeps on an event of its own.
+ * Overlapped WSARecv/WSARecvFrom complete at once when data is waiting; otherwise they are left with the poller, which receives into the caller's buffers when the socket
+ * becomes readable and completes the OVERLAPPED (Internal: the NTSTATUS, InternalHigh: the bytes), its event and its completion routine (an APC of the thread that asked).
+ * Sends never wait (the stack takes the data or fails), so the send calls always complete inline. Not done: completion ports for sockets, WSAAsyncSelect, FD_OOB/QOS. */
+IMPORT HANDLE WINAPI CreateEventW(SECURITY_ATTRIBUTES *attributes, BOOL manual, BOOL initial, const WCHAR *name);
+IMPORT BOOL WINAPI SetEvent(HANDLE event);
+IMPORT BOOL WINAPI ResetEvent(HANDLE event);
+IMPORT BOOL WINAPI CloseHandle(HANDLE handle);
+IMPORT DWORD WINAPI WaitForSingleObject(HANDLE handle, DWORD milliseconds);
+IMPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL all, DWORD milliseconds, BOOL alertable);
+IMPORT HANDLE WINAPI CreateThread(SECURITY_ATTRIBUTES *attributes, size_t_ stack, LPTHREAD_START_ROUTINE start, PVOID parameter, DWORD flags, DWORD *id);
+IMPORT void WINAPI AcquireSRWLockExclusive(SRWLOCK *lock);
+IMPORT void WINAPI ReleaseSRWLockExclusive(SRWLOCK *lock);
+IMPORT DWORD WINAPI QueueUserAPC(void (WINAPI *function)(ULONG_PTR), HANDLE thread, ULONG_PTR parameter);
+IMPORT BOOL WINAPI DuplicateHandle(HANDLE source_process, HANDLE source, HANDLE target_process, HANDLE *target, DWORD access, BOOL inherit, DWORD options);
+IMPORT HANDLE WINAPI GetCurrentProcess(void);
+IMPORT HANDLE WINAPI GetCurrentThread(void);
+IMPORT void WINAPI Sleep(DWORD milliseconds);
+
+#define WSA_IO_PENDING_ 997
+#define WSA_IO_INCOMPLETE_ 996
+#define WSA_INVALID_HANDLE_ 6
+#define WSA_INVALID_PARAMETER_ 87
+#define WSA_OPERATION_ABORTED_ 995
+#define WSA_WAIT_FAILED_ 0xFFFFFFFFu
+#define WSA_MAXIMUM_WAIT_EVENTS_ 64
+#define STATUS_PENDING_ 0x00000103
+#define STATUS_CANCELLED_ ((NTSTATUS)0xC0000120u)
+#define STATUS_BUFFER_TOO_SMALL_ ((NTSTATUS)0xC0000023u)
+#define STATUS_INVALID_PARAMETER_ ((NTSTATUS)0xC000000Du)
+#define STATUS_NO_MEMORY_ ((NTSTATUS)0xC000009Au)
+#define FD_MAX_EVENTS_ 10
+#define POLL_100NS 100000      /* 10 ms: how long a change of the table (a new socket, a re-armed event) can wait to be seen */
+
+typedef struct { ULONG len; char *buf; } WSABUF_;
+typedef struct { LONG lNetworkEvents; int iErrorCode[FD_MAX_EVENTS_]; } WSANETWORKEVENTS_;
+typedef void (WINAPI *COMPLETION_ROUTINE_)(DWORD error, DWORD bytes, OVERLAPPED *overlapped, DWORD flags);
+
+static int bit_index(LONG event) { int i = 0; while (i < FD_MAX_EVENTS_ - 1 && !(event & (1 << i))) ++i; return i; }
+
+typedef struct {
+  SOCKET socket;              /* 0: a free record */
+  HANDLE event;
+  LONG mask, armed, recorded;
+  int errors[FD_MAX_EVENTS_];
+  BOOL tcp, connecting, closed;      /* closed: FD_CLOSE (or a failed connect) was found; the socket is not read again for it until it is selected again */
+} SelectRecord;
+/* An overlapped receive that had nothing to receive yet. */
+#define MAX_BUFFERS 16
+typedef struct {
+  SOCKET socket;              /* 0: free */
+  OVERLAPPED *overlapped;
+  WSABUF_ buffers[MAX_BUFFERS];
+  DWORD buffer_count;
+  SOCKADDR *from;
+  int *from_length;
+  COMPLETION_ROUTINE_ routine;
+  HANDLE thread;              /* the thread to run the routine in (a handle of our own), or NULL */
+} PendingReceive;
+#define MAX_RECORDS 512
+#define MAX_PENDING 256
+static SelectRecord g_records[MAX_RECORDS];
+static PendingReceive g_pending[MAX_PENDING];
+static SRWLOCK g_select_lock = {0};
+static HANDLE g_wake = NULL;                  /* set when the table changed: the poller looks again */
+static volatile LONG g_poller_state = 0;      /* 0 not started, 1 starting, 2 running */
+static UINT g_rotate = 0;                     /* where the next pass starts (more than 64 sockets are polled in turns) */
+
+static SelectRecord *find_record(SOCKET s) {
+  for (UINT i = 0; i < MAX_RECORDS; ++i) if (g_records[i].socket == s) return &g_records[i];
+  return NULL;
+}
+static SelectRecord *new_record(SOCKET s, BOOL tcp) {
+  for (UINT i = 0; i < MAX_RECORDS; ++i) {
+    if (g_records[i].socket) continue;
+    memset(&g_records[i], 0, sizeof g_records[i]);
+    g_records[i].socket = s;
+    g_records[i].tcp = tcp;
+    __atomic_add_fetch(&g_watched, 1, __ATOMIC_RELAXED);
+    return &g_records[i];
+  }
+  return NULL;
+}
+static void wake_poller(void) { if (g_wake) SetEvent(g_wake); }
+
+static void select_rearm(SOCKET s, LONG events) {
+  AcquireSRWLockExclusive(&g_select_lock);
+  SelectRecord *r = find_record(s);
+  BOOL changed = FALSE;
+  if (r && (r->mask & events & ~r->armed)) { r->armed |= r->mask & events; changed = TRUE; }
+  ReleaseSRWLockExclusive(&g_select_lock);
+  if (changed) wake_poller();
+}
+static void select_connecting(SOCKET s) {
+  SOCKET_INFO_ info;
+  if (!socket_info(s, &info) || info.type != SOCK_STREAM_) return;
+  AcquireSRWLockExclusive(&g_select_lock);
+  SelectRecord *r = find_record(s);
+  if (!r) r = new_record(s, TRUE);
+  if (r) { r->connecting = TRUE; r->closed = FALSE; }
+  ReleaseSRWLockExclusive(&g_select_lock);
+  wake_poller();
+}
+
+/* An accepted socket has the event selection of its listener (and is non-blocking with it), as on Windows. */
+static void select_inherit(SOCKET listener, SOCKET accepted) {
+  AcquireSRWLockExclusive(&g_select_lock);
+  const SelectRecord *l = find_record(listener);
+  const HANDLE event = l ? l->event : NULL;
+  const LONG mask = l ? l->mask : 0;
+  SelectRecord *r = mask ? new_record(accepted, l->tcp) : NULL;
+  if (r) { r->event = event; r->mask = r->armed = mask & ~FD_ACCEPT_; }      /* (FD_ACCEPT means nothing for a connected socket: its readability is data) */
+  ReleaseSRWLockExclusive(&g_select_lock);
+  if (!mask) return;
+  const UCHAR on = 1;
+  NtSocketControl((HANDLE)(UINT_PTR)accepted, 1 /*SetNonBlocking*/, (PVOID)&on, 1, NULL, 0);
+  wake_poller();
+}
+
+static void WINAPI completion_apc(ULONG_PTR parameter);
+typedef struct { COMPLETION_ROUTINE_ routine; DWORD error, bytes; OVERLAPPED *overlapped; } CompletionCall;
+static DWORD wsa_error_of_status(NTSTATUS status) {
+  if (NT_SUCCESS(status)) return 0;
+  if (status == STATUS_CANCELLED_) return WSA_OPERATION_ABORTED_;
+  if (status == STATUS_BUFFER_TOO_SMALL_) return WSAEFAULT_;
+  return (DWORD)wsa_error_for(status);
+}
+/* Completes an overlapped call: the status block, the event, and the routine (queued to `thread`, which is closed here). */
+static void complete_overlapped(OVERLAPPED *ov, NTSTATUS status, DWORD bytes, COMPLETION_ROUTINE_ routine, HANDLE thread) {
+  ov->InternalHigh = bytes;
+  __atomic_store_n(&ov->Internal, (ULONG_PTR)(ULONG)status, __ATOMIC_RELEASE);
+  HANDLE event = (HANDLE)((ULONG_PTR)ov->hEvent & ~(ULONG_PTR)1);      /* (the low bit only says "no completion port") */
+  if (event) SetEvent(event);
+  if (routine && thread) {
+    CompletionCall *call = HeapAlloc(GetProcessHeap(), 0, sizeof *call);
+    if (call) {
+      call->routine = routine; call->bytes = bytes; call->overlapped = ov; call->error = wsa_error_of_status(status);
+      if (!QueueUserAPC(completion_apc, thread, (ULONG_PTR)call)) HeapFree(GetProcessHeap(), 0, call);
+    }
+  }
+  if (thread) CloseHandle(thread);
+}
+static void WINAPI completion_apc(ULONG_PTR parameter) {
+  CompletionCall call = *(CompletionCall *)parameter;
+  HeapFree(GetProcessHeap(), 0, (void *)parameter);
+  call.routine(call.error, call.bytes, call.overlapped, 0);
+}
+static HANDLE own_thread_handle(void) {
+  HANDLE h = NULL;
+  if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, 0, FALSE, 2 /* DUPLICATE_SAME_ACCESS */)) return NULL;
+  return h;
+}
+
+/* Receives into a list of buffers in one receive (a datagram is not split between calls; more than one buffer goes through a block of the heap). */
+static NTSTATUS receive_into(SOCKET s, const WSABUF_ *buffers, DWORD count, DWORD *bytes, SOCKADDR *from, int *from_length) {
+  ANY_SOCKADDR_ sender;
+  ULONG sender_length = sizeof sender, got = 0;
+  BOOLEAN closed = FALSE;
+  size_t_ total = 0;
+  for (DWORD i = 0; i < count; ++i) { if (buffers[i].len > 0x7FFFFFFFu - total) return STATUS_INVALID_PARAMETER_; total += buffers[i].len; }
+  char *block = count == 1 ? buffers[0].buf : total ? HeapAlloc(GetProcessHeap(), 0, total) : NULL;
+  if (count != 1 && total && !block) return STATUS_NO_MEMORY_;
+  const NTSTATUS status = NtReceiveSocket((HANDLE)(UINT_PTR)s, block, (ULONG)total, &got, from ? &sender : NULL, from ? &sender_length : NULL, &closed);
+  if (NT_SUCCESS(status) && count != 1) {
+    size_t_ done = 0;
+    for (DWORD i = 0; i < count && done < got; ++i) {
+      const size_t_ n = got - done < buffers[i].len ? got - done : buffers[i].len;
+      memcpy(buffers[i].buf, block + done, n);
+      done += n;
+    }
+  }
+  if (count != 1 && block) HeapFree(GetProcessHeap(), 0, block);
+  if (g_watched) select_rearm(s, FD_READ_);
+  if (!NT_SUCCESS(status)) return status;
+  if (from && from_length && !closed) {
+    if (*from_length < (int)sender_length) return STATUS_BUFFER_TOO_SMALL_;
+    memcpy(from, &sender, sender_length);
+    *from_length = (int)sender_length;
+  }
+  *bytes = got;
+  return 0;
+}
+
+/* Whether a receive would not block now (a zero-timeout select of the one socket). */
+static BOOL readable_now(SOCKET s) {
+  ULONG count = 1, handle = (ULONG)s, ready = 0;
+  LARGE_INTEGER zero; zero.QuadPart = 0;
+  return NT_SUCCESS(NtSelectSockets(&count, &handle, NULL, NULL, NULL, NULL, &zero, &ready)) && ready > 0;
+}
+
+static void record_event(SelectRecord *r, LONG event, int error, BOOL *signal) {
+  if (!(r->mask & r->armed & event)) return;
+  r->armed &= ~event;
+  r->recorded |= event;
+  r->errors[bit_index(event)] = error;
+  *signal = TRUE;
+}
+static BOOL is_connected(SOCKET s) {
+  ANY_SOCKADDR_ peer;
+  return NT_SUCCESS(NtSocketControl((HANDLE)(UINT_PTR)s, 3 /*GetPeerName*/, NULL, 0, &peer, sizeof peer));
+}
+/* What a socket the services found readable / writable / failed means for its record; TRUE if the record changed. */
+static BOOL evaluate(SelectRecord *r, BOOL readable, BOOL writable, BOOL failed) {
+  BOOL signal = FALSE;
+  const LONG before_armed = r->armed;
+  const BOOL before_closed = r->closed, before_connecting = r->connecting;
+  if (r->connecting && (writable || failed)) {
+    const BOOL connected = !failed && is_connected(r->socket);
+    if (connected || failed) {
+      r->connecting = FALSE;
+      record_event(r, FD_CONNECT_, failed ? WSAECONNREFUSED_ : 0, &signal);
+      if (failed) r->closed = TRUE;      /* (a connection that never was is not also "closed") */
+    }
+  }
+  if (!r->connecting && !r->closed) {
+    if (readable || failed) {
+      if (r->mask & FD_ACCEPT_) record_event(r, FD_ACCEPT_, 0, &signal);
+      else if (!r->tcp) record_event(r, FD_READ_, 0, &signal);
+      else {
+        ULONG available = 0;
+        NtSocketControl((HANDLE)(UINT_PTR)r->socket, 4 /*BytesReadable*/, NULL, 0, &available, sizeof available);
+        if (available > 0) record_event(r, FD_READ_, 0, &signal);
+        else {      /* readable with nothing to read: the peer closed (or the connection failed). FD_CLOSE is recorded once, whatever was enumerated before. */
+          r->closed = TRUE;
+          r->armed |= r->mask & FD_CLOSE_;
+          record_event(r, FD_CLOSE_, failed ? WSAECONNRESET_ : 0, &signal);
+        }
+      }
+    }
+    if (writable && (r->armed & FD_WRITE_) && (!r->tcp || is_connected(r->socket))) record_event(r, FD_WRITE_, 0, &signal);
+  }
+  if (signal && r->event) SetEvent(r->event);
+  return signal || r->armed != before_armed || r->closed != before_closed || r->connecting != before_connecting;
+}
+
+static BOOL in_list(ULONG handle, const ULONG *list, ULONG count) { for (ULONG i = 0; i < count; ++i) if (list[i] == handle) return TRUE; return FALSE; }
+static void add_handle(ULONG handle, ULONG *list, ULONG *count) {
+  if (*count < 64 && !in_list(handle, list, *count)) list[(*count)++] = handle;
+}
+
+/* One pass: which sockets have something to record or a receive waiting, a select of them (at most `timeout` long), and what it found. `only`: just that socket (0: all).
+ * Returns -1 if there was nothing to ask about, 0 if sockets were ready but nothing changed, 1 otherwise. */
+static int poll_pass(SOCKET only, LONGLONG timeout) {
+  ULONG reads[64], writes[64], excepts[64], read_count = 0, write_count = 0, except_count = 0;
+  AcquireSRWLockExclusive(&g_select_lock);
+  const UINT start = only ? 0 : g_rotate++ % MAX_RECORDS;
+  for (UINT k = 0; k < MAX_RECORDS; ++k) {
+    const SelectRecord *r = &g_records[(start + k) % MAX_RECORDS];
+    if (!r->socket || (only && r->socket != only)) continue;
+    const ULONG h = (ULONG)r->socket;
+    const BOOL open = !r->connecting && !r->closed;
+    /* (a listener is read for FD_ACCEPT only: its readability is the waiting connection, which stays until it is accepted) */
+    const BOOL want_read = open && (r->armed & ((r->mask & FD_ACCEPT_) ? FD_ACCEPT_ : (FD_READ_ | FD_CLOSE_)));
+    /* (a connect still under way is followed for any selection, so that the record knows when the socket can be read) */
+    const BOOL want_write = (r->connecting && r->mask) || (open && (r->armed & FD_WRITE_));
+    if (want_read) add_handle(h, reads, &read_count);
+    if (want_write) add_handle(h, writes, &write_count);
+    if (r->tcp && (want_read || want_write)) add_handle(h, excepts, &except_count);      /* (a failure is only news for a socket watched for something) */
+  }
+  for (UINT i = 0; i < MAX_PENDING; ++i) if (g_pending[i].socket && (!only || g_pending[i].socket == only)) add_handle((ULONG)g_pending[i].socket, reads, &read_count);
+  ReleaseSRWLockExclusive(&g_select_lock);
+  if (!read_count && !write_count && !except_count) return -1;
+  ULONG ready = 0;
+  LARGE_INTEGER limit; limit.QuadPart = timeout;
+  const NTSTATUS status = NtSelectSockets(&read_count, reads, &write_count, writes, &except_count, excepts, &limit, &ready);
+  if (!NT_SUCCESS(status)) return 0;
+  if (ready == 0) return 1;      /* (the time is up: nothing to wait for before the next pass) */
+  int changed = 0;
+  PendingReceive done[32];      /* (at most this many receives a pass: the rest go in the next one) */
+  UINT done_count = 0;
+  AcquireSRWLockExclusive(&g_select_lock);
+  for (UINT i = 0; i < MAX_RECORDS; ++i) {
+    SelectRecord *r = &g_records[i];
+    if (!r->socket || (only && r->socket != only)) continue;
+    const ULONG h = (ULONG)r->socket;
+    const BOOL readable = in_list(h, reads, read_count), writable = in_list(h, writes, write_count), failed = in_list(h, excepts, except_count);
+    if ((readable || writable || failed) && evaluate(r, readable, writable, failed)) changed = 1;
+  }
+  /* The receives that can go now leave the table (receive_into takes the lock itself); one that finds nothing after all goes back. */
+  for (UINT i = 0; i < MAX_PENDING; ++i) {
+    PendingReceive *p = &g_pending[i];
+    if (!p->socket || (only && p->socket != only) || !in_list((ULONG)p->socket, reads, read_count) || done_count == 32) continue;
+    done[done_count++] = *p;
+    p->socket = 0;
+  }
+  ReleaseSRWLockExclusive(&g_select_lock);
+  for (UINT i = 0; i < done_count; ++i) {
+    PendingReceive *p = &done[i];
+    DWORD bytes = 0;
+    const NTSTATUS result = receive_into(p->socket, p->buffers, p->buffer_count, &bytes, p->from, p->from_length);
+    if (!NT_SUCCESS(result) && wsa_error_for(result) == WSAEWOULDBLOCK_) {      /* (another receive took the data first) */
+      AcquireSRWLockExclusive(&g_select_lock);
+      UINT slot = 0;
+      while (slot < MAX_PENDING && g_pending[slot].socket) ++slot;
+      if (slot < MAX_PENDING) g_pending[slot] = *p;
+      ReleaseSRWLockExclusive(&g_select_lock);
+      if (slot < MAX_PENDING) continue;
+    }
+    complete_overlapped(p->overlapped, result, bytes, p->routine, p->thread);
+    changed = 1;
+  }
+  return changed;
+}
+
+static DWORD WINAPI poller_thread(PVOID unused) {
+  (void)unused;
+  for (;;) {
+    const int result = poll_pass(0, POLL_100NS);
+    /* (a socket that is ready without news - a fresh TCP socket reads as writable - must not spin the pass: then wait a little, or for a change of the table) */
+    if (result < 0) WaitForSingleObject(g_wake, INFINITE);
+    else if (result == 0) WaitForSingleObject(g_wake, 5);
+    ResetEvent(g_wake);
+  }
+  return 0;
+}
+static BOOL start_poller(void) {
+  for (;;) {
+    LONG expected = 0;
+    if (__atomic_compare_exchange_n(&g_poller_state, &expected, 1, FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+    if (expected == 2) return TRUE;
+    Sleep(1);      /* (another thread is starting it) */
+  }
+  g_wake = CreateEventW(NULL, TRUE, FALSE, NULL);
+  HANDLE thread = g_wake ? CreateThread(NULL, 0, poller_thread, NULL, 0, NULL) : NULL;
+  if (!thread) {
+    if (g_wake) { CloseHandle(g_wake); g_wake = NULL; }
+    __atomic_store_n(&g_poller_state, 0, __ATOMIC_RELEASE);
+    return FALSE;
+  }
+  CloseHandle(thread);
+  __atomic_store_n(&g_poller_state, 2, __ATOMIC_RELEASE);
+  return TRUE;
+}
+
+/* A socket being closed: its record goes, and its waiting receives complete as cancelled (WSA_OPERATION_ABORTED). */
+static void select_forget(SOCKET s) {
+  AcquireSRWLockExclusive(&g_select_lock);
+  SelectRecord *r = find_record(s);
+  if (r) { r->socket = 0; __atomic_sub_fetch(&g_watched, 1, __ATOMIC_RELAXED); }
+  ReleaseSRWLockExclusive(&g_select_lock);
+  for (;;) {
+    PendingReceive cancelled[16];
+    UINT n = 0;
+    AcquireSRWLockExclusive(&g_select_lock);
+    for (UINT i = 0; i < MAX_PENDING && n < 16; ++i) if (g_pending[i].socket == s) { cancelled[n++] = g_pending[i]; g_pending[i].socket = 0; }
+    ReleaseSRWLockExclusive(&g_select_lock);
+    if (!n) return;
+    for (UINT i = 0; i < n; ++i) complete_overlapped(cancelled[i].overlapped, STATUS_CANCELLED_, 0, cancelled[i].routine, cancelled[i].thread);
+  }
+}
+
+EXPORT HANDLE WSAAPI WSACreateEvent(void) {
+  HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
+  if (!event) set_wsa_error(WSA_NOT_ENOUGH_MEMORY_);
+  return event;
+}
+EXPORT BOOL WSAAPI WSACloseEvent(HANDLE event) { if (!CloseHandle(event)) { set_wsa_error(WSA_INVALID_HANDLE_); return FALSE; } return TRUE; }
+EXPORT BOOL WSAAPI WSASetEvent(HANDLE event) { if (!SetEvent(event)) { set_wsa_error(WSA_INVALID_HANDLE_); return FALSE; } return TRUE; }
+EXPORT BOOL WSAAPI WSAResetEvent(HANDLE event) { if (!ResetEvent(event)) { set_wsa_error(WSA_INVALID_HANDLE_); return FALSE; } return TRUE; }
+/* The WSA_WAIT_* values are the WAIT_* ones (WSA_WAIT_EVENT_0 = WAIT_OBJECT_0, WSA_WAIT_TIMEOUT = WAIT_TIMEOUT, WSA_WAIT_IO_COMPLETION = WAIT_IO_COMPLETION). */
+EXPORT DWORD WSAAPI WSAWaitForMultipleEvents(DWORD count, const HANDLE *events, BOOL wait_all, DWORD timeout, BOOL alertable) {
+  if (!count || count > WSA_MAXIMUM_WAIT_EVENTS_ || !events) { set_wsa_error(WSA_INVALID_PARAMETER_); return WSA_WAIT_FAILED_; }
+  const DWORD result = WaitForMultipleObjectsEx(count, events, wait_all, timeout, alertable);
+  if (result == WSA_WAIT_FAILED_) set_wsa_error(WSA_INVALID_HANDLE_);
+  return result;
+}
+
+EXPORT int WSAAPI WSAEventSelect(SOCKET s, HANDLE event, LONG events) {
+  SOCKET_INFO_ info;
+  if (!require_started() || !socket_info(s, &info)) return SOCKET_ERROR;
+  if (events && !event) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
+  const UCHAR on = 1;      /* (WSAEventSelect makes the socket non-blocking, and it stays so) */
+  const NTSTATUS status = NtSocketControl((HANDLE)(UINT_PTR)s, 1 /*SetNonBlocking*/, (PVOID)&on, 1, NULL, 0);
+  if (!NT_SUCCESS(status)) return (int)fail_nt(status, SOCKET_ERROR);
+  if (events && !start_poller()) { set_wsa_error(WSAENOBUFS_); return SOCKET_ERROR; }
+  AcquireSRWLockExclusive(&g_select_lock);
+  SelectRecord *r = find_record(s);
+  if (!r && events) r = new_record(s, info.type == SOCK_STREAM_);
+  if (!r && events) { ReleaseSRWLockExclusive(&g_select_lock); set_wsa_error(WSAENOBUFS_); return SOCKET_ERROR; }
+  if (r) {
+    /* A new selection clears what was recorded, and every condition is looked at afresh (an FD_CLOSE that was found before is found again). */
+    r->event = events ? event : NULL;
+    r->mask = events & (FD_READ_ | FD_WRITE_ | FD_ACCEPT_ | FD_CONNECT_ | FD_CLOSE_);
+    r->armed = r->mask;
+    r->recorded = 0;
+    memset(r->errors, 0, sizeof r->errors);
+    if (!r->connecting) r->closed = FALSE;
+  }
+  ReleaseSRWLockExclusive(&g_select_lock);
+  wake_poller();
+  return 0;
+}
+
+EXPORT int WSAAPI WSAEnumNetworkEvents(SOCKET s, HANDLE event, WSANETWORKEVENTS_ *out) {
+  SOCKET_INFO_ info;
+  if (!socket_info(s, &info)) return SOCKET_ERROR;
+  if (!out) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  if (g_watched) poll_pass(s, 0);      /* (what is true right now, without waiting for the poller) */
+  memset(out, 0, sizeof *out);
+  AcquireSRWLockExclusive(&g_select_lock);
+  SelectRecord *r = g_watched ? find_record(s) : NULL;
+  if (r) {
+    out->lNetworkEvents = r->recorded;
+    for (int i = 0; i < FD_MAX_EVENTS_; ++i) if (r->recorded & (1 << i)) out->iErrorCode[i] = r->errors[i];
+    r->recorded = 0;
+    memset(r->errors, 0, sizeof r->errors);
+  }
+  if (event) ResetEvent(event);
+  ReleaseSRWLockExclusive(&g_select_lock);
+  return 0;
+}
+
+/* Sends a list of buffers: a stream socket sends them in turn, a datagram one as one datagram (gathered in a block of the heap). */
+static NTSTATUS send_from(SOCKET s, const WSABUF_ *buffers, DWORD count, DWORD *bytes, const SOCKADDR *to, int to_length) {
+  SOCKET_INFO_ info;
+  *bytes = 0;
+  const ULONG to_size = to ? (ULONG)address_size(to, to_length) : 0;
+  if (count == 1 || (socket_info(s, &info) && info.type == SOCK_STREAM_)) {
+    for (DWORD i = 0; i < count; ++i) {
+      ULONG sent = 0;
+      const NTSTATUS status = NtSendSocket((HANDLE)(UINT_PTR)s, buffers[i].buf, buffers[i].len, &sent, to, to_size);
+      if (!NT_SUCCESS(status)) {
+        if (g_watched && wsa_error_for(status) == WSAEWOULDBLOCK_) select_rearm(s, FD_WRITE_);
+        return *bytes ? 0 : status;      /* (what went is reported; the error comes with the next call) */
+      }
+      *bytes += sent;
+      if (sent < buffers[i].len) break;
+    }
+    return 0;
+  }
+  size_t_ total = 0;
+  for (DWORD i = 0; i < count; ++i) { if (buffers[i].len > 0x7FFFFFFFu - total) return STATUS_INVALID_PARAMETER_; total += buffers[i].len; }
+  char *block = HeapAlloc(GetProcessHeap(), 0, total ? total : 1);
+  if (!block) return STATUS_NO_MEMORY_;
+  size_t_ at = 0;
+  for (DWORD i = 0; i < count; ++i) { memcpy(block + at, buffers[i].buf, buffers[i].len); at += buffers[i].len; }
+  ULONG sent = 0;
+  const NTSTATUS status = NtSendSocket((HANDLE)(UINT_PTR)s, block, (ULONG)total, &sent, to, to_size);
+  HeapFree(GetProcessHeap(), 0, block);
+  if (!NT_SUCCESS(status)) return status;
+  *bytes = sent;
+  return 0;
+}
+
+/* The end of a call that is done, overlapped or not: the OVERLAPPED (and the routine) of an overlapped one, the result for both. */
+static int finish_call(NTSTATUS status, DWORD bytes, DWORD *bytes_out, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
+  if (ov) complete_overlapped(ov, status, bytes, routine, routine ? own_thread_handle() : NULL);
+  if (!NT_SUCCESS(status)) { set_wsa_error((int)wsa_error_of_status(status)); return SOCKET_ERROR; }
+  if (bytes_out) *bytes_out = bytes;
+  return 0;
+}
+
+static int receive_call(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes_out, DWORD *flags, SOCKADDR *from, int *from_length, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
+  if (!buffers || !count) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
+  if ((from && !from_length) || (!ov && !bytes_out)) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  if (flags) *flags = 0;
+  for (int attempt = 0; ov && attempt < 4; ++attempt) {
+    if (!readable_now(s)) {
+      /* Nothing to receive yet: the poller receives it when it comes. */
+      SOCKET_INFO_ info;
+      if (!socket_info(s, &info)) return SOCKET_ERROR;
+      if (count > MAX_BUFFERS || !start_poller()) { set_wsa_error(WSAENOBUFS_); return SOCKET_ERROR; }
+      HANDLE thread = routine ? own_thread_handle() : NULL;
+      ov->Internal = STATUS_PENDING_;
+      ov->InternalHigh = 0;
+      AcquireSRWLockExclusive(&g_select_lock);
+      PendingReceive *p = NULL;
+      for (UINT i = 0; i < MAX_PENDING && !p; ++i) if (!g_pending[i].socket) p = &g_pending[i];
+      if (p) {
+        p->socket = s; p->overlapped = ov; p->buffer_count = count; p->from = from; p->from_length = from_length; p->routine = routine; p->thread = thread;
+        for (DWORD i = 0; i < count; ++i) p->buffers[i] = buffers[i];
+      }
+      ReleaseSRWLockExclusive(&g_select_lock);
+      if (!p) { if (thread) CloseHandle(thread); ov->Internal = 0; set_wsa_error(WSAENOBUFS_); return SOCKET_ERROR; }
+      wake_poller();
+      set_wsa_error(WSA_IO_PENDING_);
+      return SOCKET_ERROR;
+    }
+    DWORD bytes = 0;
+    const NTSTATUS status = receive_into(s, buffers, count, &bytes, from, from_length);
+    if (!NT_SUCCESS(status) && wsa_error_for(status) == WSAEWOULDBLOCK_) continue;      /* (the data went to another receive in the meantime: wait for more) */
+    return finish_call(status, bytes, bytes_out, ov, routine);
+  }
+  DWORD bytes = 0;
+  const NTSTATUS status = receive_into(s, buffers, count, &bytes, from, from_length);
+  return finish_call(status, bytes, bytes_out, ov, routine);
+}
+EXPORT int WSAAPI WSARecv(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes, DWORD *flags, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
+  return receive_call(s, buffers, count, bytes, flags, NULL, NULL, ov, routine);
+}
+EXPORT int WSAAPI WSARecvFrom(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes, DWORD *flags, SOCKADDR *from, int *from_length, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
+  return receive_call(s, buffers, count, bytes, flags, from, from_length, ov, routine);
+}
+EXPORT int WSAAPI WSASend(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes_out, DWORD flags, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
+  (void)flags;
+  if (!buffers || !count) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
+  DWORD bytes = 0;
+  const NTSTATUS status = send_from(s, buffers, count, &bytes, NULL, 0);
+  return finish_call(status, bytes, bytes_out, ov, routine);
+}
+EXPORT int WSAAPI WSASendTo(SOCKET s, WSABUF_ *buffers, DWORD count, DWORD *bytes_out, DWORD flags, const SOCKADDR *to, int to_length, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
+  (void)flags;
+  if (!buffers || !count) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
+  if (to && !check_address(to, to_length)) return SOCKET_ERROR;
+  DWORD bytes = 0;
+  const NTSTATUS status = send_from(s, buffers, count, &bytes, to, to_length);
+  return finish_call(status, bytes, bytes_out, ov, routine);
+}
+
+EXPORT BOOL WSAAPI WSAGetOverlappedResult(SOCKET s, OVERLAPPED *ov, DWORD *bytes, BOOL wait, DWORD *flags) {
+  (void)s;
+  if (!ov || !bytes || !flags) { set_wsa_error(WSAEFAULT_); return FALSE; }
+  if (__atomic_load_n(&ov->Internal, __ATOMIC_ACQUIRE) == STATUS_PENDING_) {
+    HANDLE event = (HANDLE)((ULONG_PTR)ov->hEvent & ~(ULONG_PTR)1);
+    if (!wait || !event) { set_wsa_error(WSA_IO_INCOMPLETE_); return FALSE; }
+    while (__atomic_load_n(&ov->Internal, __ATOMIC_ACQUIRE) == STATUS_PENDING_) WaitForSingleObject(event, INFINITE);      /* (the event may be another call's too) */
+  }
+  *bytes = (DWORD)ov->InternalHigh;
+  *flags = 0;
+  const NTSTATUS status = (NTSTATUS)(ULONG)ov->Internal;
+  if (NT_SUCCESS(status)) return TRUE;
+  set_wsa_error((int)wsa_error_of_status(status));
+  return FALSE;
+}
+
+/* ---- WSAIoctl ---------------------------------------------------------------------------------------------------------------------------------------------------------
+ * FIONBIO / FIONREAD as ioctlsocket; the keep-alive and UDP reset settings are accepted (there are no keep-alives, and an ICMP port-unreachable never fails a UDP receive here);
+ * the base handle of a socket is itself (there are no layered providers). No extension functions (AcceptEx, ConnectEx, ...: mswsock.dll has only stubs of them): WSAEINVAL,
+ * which callers take for "use the plain calls". Anything else is WSAEOPNOTSUPP. */
+#define SIO_GET_EXTENSION_FUNCTION_POINTER_ 0xC8000006u
+#define SIO_KEEPALIVE_VALS_ 0x98000004u
+#define SIO_UDP_CONNRESET_ 0x9800000Cu
+#define SIO_UDP_NETRESET_ 0x9800000Fu
+#define SIO_BASE_HANDLE_ 0x48000022u
+#define SIO_BSP_HANDLE_ 0x4800001Bu
+#define SIO_BSP_HANDLE_SELECT_ 0x4800001Cu
+#define SIO_BSP_HANDLE_POLL_ 0x4800001Du
+EXPORT int WSAAPI WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_size, void *out, DWORD out_size, DWORD *returned, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
+  SOCKET_INFO_ info;
+  if (!socket_info(s, &info)) return SOCKET_ERROR;
+  DWORD bytes = 0;
+  switch (code) {
+    case FIONBIO_: {
+      if (!in || in_size < sizeof(ULONG)) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+      u_long_ value; memcpy(&value, in, sizeof value);
+      if (ioctlsocket(s, (LONG)FIONBIO_, &value) != 0) return SOCKET_ERROR;
+      break;
+    }
+    case FIONREAD_: {
+      if (!out || out_size < sizeof(ULONG)) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+      u_long_ value = 0;
+      if (ioctlsocket(s, (LONG)FIONREAD_, &value) != 0) return SOCKET_ERROR;
+      memcpy(out, &value, sizeof value);
+      bytes = sizeof value;
+      break;
+    }
+    case SIO_KEEPALIVE_VALS_:
+      if (!in || in_size < 12) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }      /* (struct tcp_keepalive: onoff, time, interval) */
+      break;
+    case SIO_UDP_CONNRESET_: case SIO_UDP_NETRESET_:
+      if (!in || in_size < sizeof(BOOL)) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+      break;
+    case SIO_BASE_HANDLE_: case SIO_BSP_HANDLE_: case SIO_BSP_HANDLE_SELECT_: case SIO_BSP_HANDLE_POLL_:
+      if (!out || out_size < sizeof(SOCKET)) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+      memcpy(out, &s, sizeof s);
+      bytes = sizeof s;
+      break;
+    case SIO_GET_EXTENSION_FUNCTION_POINTER_:
+      if (out && out_size >= sizeof(void *)) memset(out, 0, sizeof(void *));
+      set_wsa_error(WSAEINVAL_);
+      return SOCKET_ERROR;
+    default:
+      set_wsa_error(WSAEOPNOTSUPP_);
+      return SOCKET_ERROR;
+  }
+  if (returned) *returned = bytes;
+  if (ov) complete_overlapped(ov, 0, bytes, routine, routine ? own_thread_handle() : NULL);
+  return 0;
+}
+
+/* ---- the protocol catalogue -------------------------------------------------------------------------------------------------------------------------------------------
+ * Four entries, like the base MSAFD providers of a fresh Windows: TCP and UDP over IPv4 and IPv6 (no layered providers). */
+typedef struct { ULONG Data1; USHORT Data2, Data3; UCHAR Data4[8]; } GUID_;
+typedef struct {
+  DWORD dwServiceFlags1, dwServiceFlags2, dwServiceFlags3, dwServiceFlags4, dwProviderFlags;
+  GUID_ ProviderId;
+  DWORD dwCatalogEntryId;
+  struct { int ChainLen; DWORD ChainEntries[7]; } ProtocolChain;
+  int iVersion, iAddressFamily, iMaxSockAddr, iMinSockAddr, iSocketType, iProtocol, iProtocolMaxOffset, iNetworkByteOrder, iSecurityScheme;
+  DWORD dwMessageSize, dwProviderReserved;
+  WCHAR szProtocol[256];
+} WSAPROTOCOL_INFOW_;
+_Static_assert(sizeof(WSAPROTOCOL_INFOW_) == 628, "WSAPROTOCOL_INFOW is 628 bytes");
+static const GUID_ kTcpipProvider = {0xE70F1AA0, 0xAB8B, 0x11CF, {0x8C, 0xA3, 0x00, 0x80, 0x5F, 0x48, 0xA1, 0x92}};
+static const GUID_ kTcpip6Provider = {0xF9EAB0C0, 0x26D4, 0x11D0, {0xBB, 0xBF, 0x00, 0xAA, 0x00, 0x6C, 0x34, 0xE4}};
+static const struct { int family, type, protocol; const char *name; } kProtocols[] = {
+  {AF_INET_, SOCK_STREAM_, IPPROTO_TCP_, "MSAFD Tcpip [TCP/IP]"},
+  {AF_INET_, SOCK_DGRAM_, IPPROTO_UDP_, "MSAFD Tcpip [UDP/IP]"},
+  {AF_INET6_, SOCK_STREAM_, IPPROTO_TCP_, "MSAFD Tcpip [TCP/IPv6]"},
+  {AF_INET6_, SOCK_DGRAM_, IPPROTO_UDP_, "MSAFD Tcpip [UDP/IPv6]"},
+};
+#define PROTOCOL_COUNT (sizeof kProtocols / sizeof kProtocols[0])
+static BOOL same_guid(const GUID_ *a, const GUID_ *b) {
+  if (a->Data1 != b->Data1 || a->Data2 != b->Data2 || a->Data3 != b->Data3) return FALSE;
+  for (int i = 0; i < 8; ++i) if (a->Data4[i] != b->Data4[i]) return FALSE;
+  return TRUE;
+}
+static void fill_protocol(WSAPROTOCOL_INFOW_ *p, UINT index) {
+  memset(p, 0, sizeof *p);
+  const BOOL stream = kProtocols[index].type == SOCK_STREAM_, v6 = kProtocols[index].family == AF_INET6_;
+  p->dwServiceFlags1 = stream ? 0x00020066u /* GUARANTEED_DELIVERY|GUARANTEED_ORDER|GRACEFUL_CLOSE|EXPEDITED_DATA|IFS_HANDLES */
+                              : 0x00020609u /* CONNECTIONLESS|MESSAGE_ORIENTED|SUPPORT_BROADCAST|SUPPORT_MULTIPOINT|IFS_HANDLES */;
+  p->dwProviderFlags = 0x8;      /* PFL_MATCHES_PROTOCOL_ZERO */
+  p->ProviderId = v6 ? kTcpip6Provider : kTcpipProvider;
+  p->dwCatalogEntryId = 1001 + index;
+  p->ProtocolChain.ChainLen = 1;      /* BASE_PROTOCOL */
+  p->iVersion = 2;
+  p->iAddressFamily = kProtocols[index].family;
+  p->iMaxSockAddr = p->iMinSockAddr = v6 ? (int)sizeof(SOCKADDR_IN6_) : (int)sizeof(SOCKADDR_IN);
+  p->iSocketType = kProtocols[index].type;
+  p->iProtocol = kProtocols[index].protocol;
+  p->dwMessageSize = stream ? 0 : 65467;
+  for (int i = 0; kProtocols[index].name[i] && i < 255; ++i) p->szProtocol[i] = (WCHAR)kProtocols[index].name[i];
+}
+/* The entries for the protocol numbers in `wanted` (0-terminated; NULL: all): the count, or SOCKET_ERROR with the error (WSAENOBUFS and the size needed for a short buffer). */
+static int enum_protocols(const int *wanted, WSAPROTOCOL_INFOW_ *buffer, DWORD *length, int *error) {
+  if (!length) { *error = WSAEFAULT_; return SOCKET_ERROR; }
+  UINT chosen[PROTOCOL_COUNT], n = 0;
+  for (UINT i = 0; i < PROTOCOL_COUNT; ++i) {
+    BOOL take = !wanted;
+    for (const int *w = wanted; w && *w && !take; ++w) take = *w == kProtocols[i].protocol;
+    if (take) chosen[n++] = i;
+  }
+  const DWORD need = n * (DWORD)sizeof(WSAPROTOCOL_INFOW_);
+  if (!buffer || *length < need) { *length = need; *error = WSAENOBUFS_; return SOCKET_ERROR; }
+  for (UINT i = 0; i < n; ++i) fill_protocol(&buffer[i], chosen[i]);
+  return (int)n;
+}
+EXPORT int WSAAPI WSAEnumProtocolsW(int *protocols, WSAPROTOCOL_INFOW_ *buffer, DWORD *length) {
+  int error = 0;
+  const int n = enum_protocols(protocols, buffer, length, &error);
+  if (n < 0) set_wsa_error(error);
+  return n;
+}
+EXPORT int WSAAPI WSCEnumProtocols(int *protocols, WSAPROTOCOL_INFOW_ *buffer, DWORD *length, int *error) {
+  int e = 0;
+  const int n = enum_protocols(protocols, buffer, length, &e);
+  if (n < 0 && error) *error = e;
+  return n;
+}
+EXPORT int WSAAPI WSCGetProviderPath(GUID_ *provider, WCHAR *path, int *length, int *error) {
+  static const char kPath[] = "%SystemRoot%\\system32\\mswsock.dll";
+  int e = 0;
+  if (!provider || !path || !length) e = WSAEFAULT_;
+  else if (!same_guid(provider, &kTcpipProvider) && !same_guid(provider, &kTcpip6Provider)) e = WSAEINVAL_;
+  else if (*length < (int)sizeof kPath) { *length = (int)sizeof kPath; e = WSAEFAULT_; }
+  if (e) { if (error) *error = e; return SOCKET_ERROR; }
+  for (int i = 0; i < (int)sizeof kPath; ++i) path[i] = (WCHAR)kPath[i];
+  *length = (int)sizeof kPath - 1;
+  return 0;
+}
+/* No name space providers are installed (names go to the kernel's resolver directly): an empty list. */
+EXPORT int WSAAPI WSAEnumNameSpaceProvidersW(DWORD *length, void *buffer) {
+  (void)buffer;
+  if (!length) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+  return 0;
+}
+EXPORT int WSAAPI WSASetServiceW(void *registration, int operation, DWORD flags) {
+  (void)registration; (void)operation; (void)flags;
+  set_wsa_error(WSAEOPNOTSUPP_);
+  return SOCKET_ERROR;
+}
+/* A socket is a handle of this process's table; there is no way to hand it to another process. */
+EXPORT int WSAAPI WSADuplicateSocketW(SOCKET s, DWORD process, WSAPROTOCOL_INFOW_ *info) {
+  (void)s; (void)process;
+  if (info) memset(info, 0, sizeof *info);
+  set_wsa_error(WSAEOPNOTSUPP_);
+  return SOCKET_ERROR;
+}
+
+/* ---- GetAddrInfoExW ---------------------------------------------------------------------------------------------------------------------------------------------------
+ * GetAddrInfoW's answer in ADDRINFOEXW entries (one heap block each, like the others). Asked with an OVERLAPPED, the lookup runs in a thread of its own: the call returns
+ * WSA_IO_PENDING, and the result, the OVERLAPPED's Internal (the error), its event and the completion routine (called in that thread, as Windows calls it outside the caller)
+ * follow when it is done. The timeout is not used (the resolver has its own); a lookup cannot be cancelled. */
+typedef struct addrinfoexW_ {
+  int ai_flags, ai_family, ai_socktype, ai_protocol;
+  size_t_ ai_addrlen;
+  WCHAR *ai_canonname;
+  SOCKADDR *ai_addr;
+  void *ai_blob;
+  size_t_ ai_bloblen;
+  GUID_ *ai_provider;
+  struct addrinfoexW_ *ai_next;
+} ADDRINFOEXW_;
+typedef void (WINAPI *LOOKUP_ROUTINE_)(DWORD error, DWORD bytes, OVERLAPPED *overlapped);
+
+EXPORT void WSAAPI FreeAddrInfoExW(ADDRINFOEXW_ *ai) {
+  while (ai) { ADDRINFOEXW_ *next = ai->ai_next; HeapFree(GetProcessHeap(), 0, ai); ai = next; }
+}
+static size_t_ wide_length(const WCHAR *s) { size_t_ n = 0; while (s[n]) ++n; return n; }
+static int lookup_ex(const WCHAR *name, const WCHAR *service, const ADDRINFOEXW_ *hints, ADDRINFOEXW_ **result) {
+  ADDRINFOW_ plain_hints, *found = NULL;
+  memset(&plain_hints, 0, sizeof plain_hints);
+  if (hints) { plain_hints.ai_flags = hints->ai_flags; plain_hints.ai_family = hints->ai_family; plain_hints.ai_socktype = hints->ai_socktype; plain_hints.ai_protocol = hints->ai_protocol; }
+  const int error = GetAddrInfoW(name, service, hints ? &plain_hints : NULL, &found);
+  if (error) return error;
+  ADDRINFOEXW_ *head = NULL, **tail = &head;
+  for (const ADDRINFOW_ *ai = found; ai; ai = ai->ai_next) {
+    const size_t_ name_bytes = ai->ai_canonname ? (wide_length(ai->ai_canonname) + 1) * sizeof(WCHAR) : 0;
+    BYTE *block = HeapAlloc(GetProcessHeap(), 0, sizeof(ADDRINFOEXW_) + ai->ai_addrlen + name_bytes);
+    if (!block) { FreeAddrInfoExW(head); FreeAddrInfoW(found); return WSA_NOT_ENOUGH_MEMORY_; }
+    ADDRINFOEXW_ *e = (ADDRINFOEXW_ *)block;
+    memset(e, 0, sizeof *e);
+    e->ai_flags = ai->ai_flags; e->ai_family = ai->ai_family; e->ai_socktype = ai->ai_socktype; e->ai_protocol = ai->ai_protocol;
+    e->ai_addrlen = ai->ai_addrlen;
+    e->ai_addr = (SOCKADDR *)(block + sizeof(ADDRINFOEXW_));
+    memcpy(e->ai_addr, ai->ai_addr, ai->ai_addrlen);
+    if (name_bytes) { e->ai_canonname = (WCHAR *)(block + sizeof(ADDRINFOEXW_) + ai->ai_addrlen); memcpy(e->ai_canonname, ai->ai_canonname, name_bytes); }
+    *tail = e;
+    tail = &e->ai_next;
+  }
+  FreeAddrInfoW(found);
+  *result = head;
+  return 0;
+}
+static WCHAR *wide_copy(const WCHAR *s) {
+  if (!s) return NULL;
+  const size_t_ bytes = (wide_length(s) + 1) * sizeof(WCHAR);
+  WCHAR *out = HeapAlloc(GetProcessHeap(), 0, bytes);
+  if (out) memcpy(out, s, bytes);
+  return out;
+}
+typedef struct { WCHAR *name, *service; ADDRINFOEXW_ hints; BOOL has_hints; ADDRINFOEXW_ **result; OVERLAPPED *overlapped; LOOKUP_ROUTINE_ routine; } Lookup;
+static void free_lookup(Lookup *l) {
+  if (l->name) HeapFree(GetProcessHeap(), 0, l->name);
+  if (l->service) HeapFree(GetProcessHeap(), 0, l->service);
+  HeapFree(GetProcessHeap(), 0, l);
+}
+static DWORD WINAPI lookup_thread(PVOID parameter) {
+  Lookup *l = parameter;
+  const int error = lookup_ex(l->name, l->service, l->has_hints ? &l->hints : NULL, l->result);
+  OVERLAPPED *ov = l->overlapped;
+  const LOOKUP_ROUTINE_ routine = l->routine;
+  free_lookup(l);
+  ov->InternalHigh = 0;
+  __atomic_store_n(&ov->Internal, (ULONG_PTR)(DWORD)error, __ATOMIC_RELEASE);
+  if (ov->hEvent) SetEvent(ov->hEvent);
+  if (routine) routine((DWORD)error, 0, ov);
+  return 0;
+}
+EXPORT int WSAAPI GetAddrInfoExW(const WCHAR *name, const WCHAR *service, DWORD name_space, GUID_ *provider, const ADDRINFOEXW_ *hints, ADDRINFOEXW_ **result,
+                                 void *timeout, OVERLAPPED *ov, LOOKUP_ROUTINE_ routine, HANDLE *handle) {
+  (void)provider; (void)timeout;
+  if (!result) { set_wsa_error(WSA_INVALID_PARAMETER_); return WSA_INVALID_PARAMETER_; }
+  *result = NULL;
+  if (handle) *handle = NULL;
+  /* NS_ALL, NS_DNS, NS_NETBT, NS_WINS, NS_NLA: all answered by the one resolver */
+  if (name_space != 0 && (name_space < 12 || name_space > 15)) { set_wsa_error(WSAEINVAL_); return WSAEINVAL_; }
+  if (routine && !ov) { set_wsa_error(WSA_INVALID_PARAMETER_); return WSA_INVALID_PARAMETER_; }
+  if (!ov) {
+    const int error = lookup_ex(name, service, hints, result);
+    set_wsa_error(error);
+    return error;
+  }
+  Lookup *l = HeapAlloc(GetProcessHeap(), 0, sizeof *l);
+  if (!l) { set_wsa_error(WSA_NOT_ENOUGH_MEMORY_); return WSA_NOT_ENOUGH_MEMORY_; }
+  memset(l, 0, sizeof *l);
+  l->name = wide_copy(name); l->service = wide_copy(service);
+  if (hints) { l->hints = *hints; l->has_hints = TRUE; }
+  l->result = result; l->overlapped = ov; l->routine = routine;
+  if ((name && !l->name) || (service && !l->service)) { free_lookup(l); set_wsa_error(WSA_NOT_ENOUGH_MEMORY_); return WSA_NOT_ENOUGH_MEMORY_; }
+  ov->Internal = WSA_IO_PENDING_;
+  ov->InternalHigh = 0;
+  HANDLE thread = CreateThread(NULL, 0, lookup_thread, l, 0, NULL);
+  if (!thread) { free_lookup(l); ov->Internal = 0; set_wsa_error(WSA_NOT_ENOUGH_MEMORY_); return WSA_NOT_ENOUGH_MEMORY_; }
+  CloseHandle(thread);
+  if (handle) *handle = (HANDLE)ov;      /* (a value for GetAddrInfoExCancel, which cannot cancel anything) */
+  set_wsa_error(WSA_IO_PENDING_);
+  return WSA_IO_PENDING_;
+}
+/* The error of an overlapped GetAddrInfoExW: WSA_IO_PENDING (997) while it runs. */
+EXPORT int WSAAPI GetAddrInfoExOverlappedResult(OVERLAPPED *ov) {
+  if (!ov) return WSAEINVAL_;
+  return (int)(DWORD)__atomic_load_n(&ov->Internal, __ATOMIC_ACQUIRE);
+}
+EXPORT int WSAAPI GetAddrInfoExCancel(HANDLE *handle) {
+  (void)handle;
+  set_wsa_error(WSA_INVALID_HANDLE_);
+  return WSA_INVALID_HANDLE_;
 }

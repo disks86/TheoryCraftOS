@@ -90,12 +90,21 @@ static BOOL directory_entry(const BYTE *section, DWORD size, DWORD dir, DWORD id
 }
 
 /* The RT_VERSION resource of an open PE file, copied into a new heap block (*out, *out_size). The error is set on failure. */
+#define HEADER_BYTES 0x1000u      /* the headers and the section table are in the first page (a mingw program with debug sections has more than 1 KiB of them) */
+static BOOL parse_version_resource(HANDLE file, const BYTE *header, DWORD header_size, LONGLONG file_size_bytes, BYTE **out, DWORD *out_size);
 static BOOL read_version_resource(HANDLE file, BYTE **out, DWORD *out_size) {
-  BYTE header[0x400];
   LARGE_INTEGER file_size;
   if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart < 0x40) { SetLastError(ERROR_BAD_FORMAT); return FALSE; }
-  const DWORD header_size = file_size.QuadPart < (LONGLONG)sizeof header ? (DWORD)file_size.QuadPart : (DWORD)sizeof header;
-  if (!read_at(file, 0, header, header_size)) return FALSE;
+  const DWORD header_size = file_size.QuadPart < (LONGLONG)HEADER_BYTES ? (DWORD)file_size.QuadPart : HEADER_BYTES;
+  BYTE *header = HeapAlloc(GetProcessHeap(), 0, HEADER_BYTES);
+  if (!header) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  const BOOL ok = read_at(file, 0, header, header_size) && parse_version_resource(file, header, header_size, file_size.QuadPart, out, out_size);
+  HeapFree(GetProcessHeap(), 0, header);
+  return ok;
+}
+static BOOL parse_version_resource(HANDLE file, const BYTE *header, DWORD header_size, LONGLONG file_size_bytes, BYTE **out, DWORD *out_size) {
+  LARGE_INTEGER file_size;
+  file_size.QuadPart = file_size_bytes;
   if (header[0] != 'M' || header[1] != 'Z') { SetLastError(ERROR_BAD_FORMAT); return FALSE; }
   const DWORD pe = rd32(header + 0x3C);
   if (pe > header_size - 24 || rd32(header + pe) != 0x00004550u) { SetLastError(ERROR_BAD_FORMAT); return FALSE; }
