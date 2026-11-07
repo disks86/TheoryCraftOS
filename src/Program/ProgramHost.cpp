@@ -22,11 +22,30 @@
 
 namespace desktop {
 
+namespace {
+crypto::IEntropySource* g_system_entropy = nullptr;
+kernel::Mutex g_system_entropy_mutex;
+}  // namespace
+
+void set_system_entropy(crypto::IEntropySource* source) {
+  kernel::ScopedMutex lock(g_system_entropy_mutex);
+  g_system_entropy = source;
+}
+
+bool ProgramHost::Entropy::read(ByteView out) {
+  if (crypto::CpuEntropySource::available()) {
+    crypto::CpuEntropySource cpu;
+    if (cpu.read(out)) return true;
+  }
+  kernel::ScopedMutex lock(g_system_entropy_mutex);
+  return g_system_entropy && g_system_entropy->read(out);
+}
+
 ProgramHost::ProgramHost(allocators::IAllocator& allocator)
     : allocator_(allocator), buffer_(allocator), random_(entropy_), unhandled_(allocator), input_(allocator) {
   start_real_ns_ = filesystem::unix_time_now() * 1000000000ull;
   start_tsc_ = hardware::read_tsc();
-  random_.initialize();      // (stays not ready on a processor without RDSEED and RDRAND)
+  random_.initialize();      // (stays not ready when there is no source at all)
 }
 
 bool ProgramHost::take_output(String* out) {

@@ -200,7 +200,6 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   if (!AddressSpace::round_up(tls_total, &tls_bytes)) return LoadStatus::Malformed;
   // The loader lists: PEB_LDR_DATA, and per module a LDR_DATA_TABLE_ENTRY with its two names.
   constexpr uint64_t kLdrHeader = 0x60, kEntrySize = 0x140, kPerModule = 1024;
-  if (input.modules.size() > 64) return LoadStatus::Malformed;
   uint64_t ldr_bytes = 0;
   if (!input.modules.empty() && !AddressSpace::round_up(kLdrHeader + input.modules.size() * kPerModule, &ldr_bytes)) return LoadStatus::Malformed;
   total = kPebSize + kTebSize + parameters_bytes + tls_bytes + ldr_bytes;

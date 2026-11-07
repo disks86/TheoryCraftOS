@@ -1281,6 +1281,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SystemGuestServices guest(pci, shared_allocator, st);
   guest.initialize();
   if (guest.entropy()) Entry(Level::Ok, "Guest").text("virtio-rng: host entropy available");
+  desktop::set_system_entropy(guest.entropy());      // (what programs' random bytes come from on a CPU without RDRAND)
   if (guest.balloon()) Entry(Level::Ok, "Guest").text("virtio-balloon: ").dec(guest.balloon()->target_pages() / 256).text(" MiB requested by the host");
   if (guest.virtualbox()) Entry(Level::Ok, "Guest").text("VirtualBox guest device: pointer integration, display requests, balloon, heartbeat");
   if (hardware::PvPanic::present()) Entry(Level::Ok, "Guest").text("pvpanic: crashes are reported to the host");
@@ -2608,6 +2609,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   i2c_hid.stop(input.mice());
   input.mice().remove(&pen_mouse);
   input.shutdown();
+  desktop::set_system_entropy(nullptr);
   guest.shutdown();
   hyperv.shutdown();
   for (uint32_t i = 0; i < storage.count(); ++i) {

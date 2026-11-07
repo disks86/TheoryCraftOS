@@ -29,6 +29,9 @@ namespace desktop {
 // reads its standard input from a queue that the terminal fills line by line (push_input), and sees end of file once close_input() is called; a read waits
 // until a line, the end of the input, or interrupt() arrives. Time comes from the wall clock and the processor's time stamp counter; random bytes
 // from a seeded generator (RDSEED/RDRAND), so getrandom() works only on processors that have them.
+// The entropy source programs fall back to when the CPU has no generator instructions (nullptr: none). Reads are serialised; the source must outlive its use.
+void set_system_entropy(crypto::IEntropySource* source);
+
 class ProgramHost final : public process::IProcessHost {
  public:
   explicit ProgramHost(allocators::IAllocator& allocator);
@@ -74,7 +77,13 @@ class ProgramHost final : public process::IProcessHost {
   String buffer_;
   uint64_t dropped_ = 0;
   uint64_t start_real_ns_ = 0, start_tsc_ = 0;
-  crypto::CpuEntropySource entropy_;
+  // The CPU's generator (RDSEED / RDRAND), else the system's source (set_system_entropy: the hypervisor's virtio-rng, a TPM), so that a program gets random bytes on a
+  // processor without the instructions too.
+  class Entropy final : public crypto::IEntropySource {
+   public:
+    bool read(ByteView out) override;
+  };
+  Entropy entropy_;
   crypto::DrbgRandom random_;
   String unhandled_;
   uint32_t unhandled_count_ = 0;
