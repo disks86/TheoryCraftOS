@@ -776,7 +776,7 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 }
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
-  if (desc.texture_count > kBaseTextureUnits || desc.fragment_shader == nullptr) return nullptr;
+  if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kBaseVertexAttributes ||
       desc.varying_count > kBaseVaryings)
     return nullptr;
@@ -839,8 +839,8 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   VirglImage* depth = nullptr;
   VirglBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
-  const VirglImage* textures[kBaseTextureUnits] = {};
-  SamplerDesc samplers[kBaseTextureUnits];
+  const VirglImage* textures[kMaxTextureUnits] = {};
+  SamplerDesc samplers[kMaxTextureUnits];
   bool textures_dirty = false, compute_textures_dirty = false;
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
@@ -1129,10 +1129,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (compute_textures_dirty) {
           // The textures bound (a prefix of the units, up to the last one bound: the kernel has checked that those the shader reads are there), for the compute stage.
           uint32_t unit_count = 0;
-          for (uint32_t unit = 0; unit < kBaseTextureUnits; ++unit)
+          for (uint32_t unit = 0; unit < kMaxTextureUnits; ++unit)
             if (textures[unit]) unit_count = unit + 1;
           if (unit_count) {
-            uint32_t states[kBaseTextureUnits] = {};
+            uint32_t states[kMaxTextureUnits] = {};
             for (uint32_t unit = 0; unit < unit_count; ++unit)
               if (textures[unit] && !(states[unit] = sampler_state(samplers[unit]))) return false;
             stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
@@ -1254,7 +1254,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       case RecordedCommand::Type::BindTexture: {
         const VirglImage* image = static_cast<const VirglImage*>(cmd.image);
-        if (cmd.unit >= kBaseTextureUnits || !image || !image->view()) return false;   // (only an image created with kImageSampled has a view)
+        if (cmd.unit >= kMaxTextureUnits || !image || !image->view()) return false;   // (only an image created with kImageSampled has a view)
         textures[cmd.unit] = image;
         samplers[cmd.unit] = cmd.sampler;
         textures_dirty = true;
@@ -1326,7 +1326,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
               if (textures[unit] == extra) return false;
           if (textures_dirty) {
             // (to the vertex and the pixel stage alike: a vertex shader may read the units too, numbered as the pipeline's)
-            uint32_t states[kBaseTextureUnits];
+            uint32_t states[kMaxTextureUnits];
             for (uint32_t unit = 0; unit < unit_count; ++unit) {
               states[unit] = sampler_state(samplers[unit]);   // (created straight away, so it exists before the stream that uses it)
               if (!states[unit]) return false;

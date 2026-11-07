@@ -841,6 +841,109 @@ static void test_textures_in_vertex_and_compute(Rig *r, Scene *s) {
   p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
 }
 
+/* Twelve texture units (vk_units.frag: an array of twelve samplers) bound in turn to three 1 x 1 images, red, green and blue: the picture mixes units 1, 6 and 11 (green, red,
+ * blue). Skipped on an adapter with fewer units. */
+static void test_many_units(Rig *r, Scene *s) {
+  if (r->props.limits.maxPerStageDescriptorSamplers < 12) {
+    printf("    %u texture units on this adapter: skipped\n", r->props.limits.maxPerStageDescriptorSamplers);
+    return;
+  }
+  VkImage images[3];
+  VkDeviceMemory memories[3];
+  VkImageView views[3];
+  VkDeviceMemory staging_memory;
+  void *staging_map;
+  VkBuffer staging = make_buffer(r, 3 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging_memory, &staging_map);
+  static const unsigned char colours[12] = {0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255};   /* B, G, R, A: red, green, blue */
+  memcpy(staging_map, colours, sizeof colours);
+  p_vkResetCommandBuffer(r->cb, 0);
+  VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  p_vkBeginCommandBuffer(r->cb, &cbi);
+  for (unsigned k = 0; k < 3; ++k) {
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D, ici.format = VK_FORMAT_B8G8R8A8_UNORM, ici.extent.width = ici.extent.height = ici.extent.depth = 1, ici.mipLevels = ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT, ici.tiling = VK_IMAGE_TILING_OPTIMAL, ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    p_vkCreateImage(r->dev, &ici, NULL, &images[k]);
+    VkMemoryRequirements req;
+    p_vkGetImageMemoryRequirements(r->dev, images[k], &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size, ai.memoryTypeIndex = (unsigned)memory_type(&r->mem, req.memoryTypeBits, 0);
+    p_vkAllocateMemory(r->dev, &ai, NULL, &memories[k]);
+    p_vkBindImageMemory(r->dev, images[k], memories[k], 0);
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = images[k], vci.viewType = VK_IMAGE_VIEW_TYPE_2D, vci.format = ici.format;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, vci.subresourceRange.levelCount = 1, vci.subresourceRange.layerCount = 1;
+    p_vkCreateImageView(r->dev, &vci, NULL, &views[k]);
+    VkBufferImageCopy copy;
+    memset(&copy, 0, sizeof copy);
+    copy.bufferOffset = 4 * k, copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, copy.imageSubresource.layerCount = 1, copy.imageExtent.width = copy.imageExtent.height = copy.imageExtent.depth = 1;
+    p_vkCmdCopyBufferToImage(r->cb, staging, images[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  }
+  p_vkEndCommandBuffer(r->cb);
+  submit_and_wait(r);
+  VkDescriptorSetLayoutBinding bindings[2] = {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
+  VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dl.bindingCount = 2, dl.pBindings = bindings;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  p_vkCreateDescriptorSetLayout(r->dev, &dl, NULL, &set_layout);
+  VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &set_layout;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  p_vkCreatePipelineLayout(r->dev, &plci, NULL, &layout);
+  VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12}};
+  VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 2, dpi.pPoolSizes = sizes;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  p_vkCreateDescriptorPool(r->dev, &dpi, NULL, &pool);
+  VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &set_layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  p_vkAllocateDescriptorSets(r->dev, &dai, &set);
+  VkDescriptorBufferInfo dbi = {s->uniform, 0, VK_WHOLE_SIZE};
+  VkDescriptorImageInfo dii[12];
+  for (unsigned k = 0; k < 12; ++k) dii[k].sampler = s->sampler, dii[k].imageView = views[k % 3], dii[k].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet writes[2];
+  memset(writes, 0, sizeof writes);
+  writes[0].sType = writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[0].dstSet = writes[1].dstSet = set;
+  writes[0].dstBinding = 0, writes[0].descriptorCount = 1, writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, writes[0].pBufferInfo = &dbi;
+  writes[1].dstBinding = 1, writes[1].descriptorCount = 12, writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes[1].pImageInfo = dii;
+  p_vkUpdateDescriptorSets(r->dev, 2, writes, 0, NULL);
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof units_frag, smi.pCode = units_frag;
+  VkShaderModule fs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &fs);
+  VkPipelineLayout scene_layout = s->layout;
+  s->layout = layout;
+  VkResult result;
+  VkPipeline pipeline = make_pipeline(r, s, fs, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, &result);
+  s->layout = scene_layout;
+  check(result == VK_SUCCESS && pipeline, "a pipeline of twelve texture units");
+  if (pipeline) {
+    static const float white[15] = {-1, -1, 1, 1, 1, 3, -1, 1, 1, 1, -1, 3, 1, 1, 1};
+    memcpy(s->vertex_map, white, sizeof white);
+    s->layout = layout;
+    draw_frame_with(r, s, pipeline, set, 0, 0, 0);
+    s->layout = scene_layout;
+    const unsigned char *picture = (const unsigned char *)s->readback_map;
+    /* unit 1 green, unit 6 red, unit 11 blue: 0.25 red, 0.25 green, 0.5 blue */
+    check(near_pixel(pixel(picture, W, 20, 20), 128, 64, 64, 255) && near_pixel(pixel(picture, W, 45, 50), 128, 64, 64, 255), "twelve texture units: each reads the image bound to it");
+    if (!near_pixel(pixel(picture, W, 20, 20), 128, 64, 64, 255)) printf("    twelve units: pixel %08x\n", pixel(picture, W, 20, 20));
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  if (fs) p_vkDestroyShaderModule(r->dev, fs, NULL);
+  p_vkDestroyDescriptorPool(r->dev, pool, NULL);
+  p_vkDestroyPipelineLayout(r->dev, layout, NULL);
+  p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
+  for (unsigned k = 0; k < 3; ++k) {
+    p_vkDestroyImageView(r->dev, views[k], NULL);
+    p_vkDestroyImage(r->dev, images[k], NULL);
+    p_vkFreeMemory(r->dev, memories[k], NULL);
+  }
+  p_vkDestroyBuffer(r->dev, staging, NULL);
+  p_vkFreeMemory(r->dev, staging_memory, NULL);
+}
+
 /* Timestamps: two around a dispatch-free submission's work, read back with and without availability; they go up. */
 static void test_timestamps(Rig *r) {
   VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -1089,6 +1192,7 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   test_compute_big(&r);
   test_cube_array(&r, &s);
   test_textures_in_vertex_and_compute(&r, &s);
+  test_many_units(&r, &s);
   test_timestamps(&r);
 
   /* copies and clears that need no GPU */

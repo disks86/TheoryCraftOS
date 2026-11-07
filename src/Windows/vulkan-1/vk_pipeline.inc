@@ -87,7 +87,10 @@ static BOOL assign_resources(Pipe *p, Stage *stages, UINT nstages, const Caps *c
   }
   for (UINT k = 0; k < nkeys; ++k)
     for (UINT e = 0; e < keys[k][2]; ++e) {
-      if (p->nunit >= 8) break;
+      if (p->nunit >= SP_MAX_UNITS) {
+        *why = "the pipeline samples more textures than there are texture units (16)";
+        return FALSE;
+      }
       TexUnit *u = &p->unit[p->nunit++];
       u->set = keys[k][0], u->binding = keys[k][1], u->element = e;
       u->sampler_set = u->sampler_binding = 0xFFFFFFFFu;

@@ -829,7 +829,7 @@ static int image_unit(Mod *m, const Val *image, uint32_t *unit, uint32_t *res_in
   *res_index = image->image_res;
   if (*res_index >= m->nres) return sp_fail(m, "image without a resource");
   *unit = m->res[*res_index].slot + image->image_unit_off;
-  if (*unit >= 8) return sp_fail(m, "texture unit out of range");
+  if (*unit >= SP_MAX_UNITS) return sp_fail(m, "texture unit out of range");
   m->unit_used[*unit] = 1;
   m->image_dim_by_unit[*unit] = m->res[*res_index].dim;
   if (*unit + 1 > m->nunits) m->nunits = *unit + 1;

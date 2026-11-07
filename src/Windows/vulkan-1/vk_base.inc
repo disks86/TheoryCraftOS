@@ -334,7 +334,7 @@ typedef struct Pipe {
   VkRect2D scissor;
   CbSlot cb[16];
   UINT ncb;
-  TexUnit unit[8];
+  TexUnit unit[SP_MAX_UNITS];
   UINT nunit;
   StorageSlot storage[UAV_SLOTS + SRV_SLOTS];
   UINT nstorage;

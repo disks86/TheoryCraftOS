@@ -71,6 +71,6 @@ images that are also sampled (the kernel's depth images have no CPU view), blend
 matrices in shaders, `OpArrayLength` (the length of a runtime array),
 `gl_NumWorkGroups`, compare-exchange atomics, more than 4 written and 4 read-only storage buffers a pipeline, arrays of storage buffers indexed dynamically, Vulkan 1.1 and later
 (`vkEnumerateInstanceVersion` says 1.0). A draw that writes a storage buffer another draw of the same pass reads from mapped memory may see the old contents (the copy back is when
-the pass's stream has run). Kernel limits Godot's renderers run into next: virgl has 2 texture units, arrays and cubes
+the pass's stream has run). Kernel limits Godot's renderers run into next: arrays and cubes
 have one mip level, an 8-bit colour format and cannot be drawn into, and uniform data is the push constant block (`maxUniformBufferRange` 4096, below Vulkan's 16384). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
 that answer `VK_ERROR_FEATURE_NOT_PRESENT` (`src/Windows/stubs/vulkan-1.inc`). Not validated on real GPUs: only the CPU renderer and what QEMU gives (virgl, standard VGA) run it.
