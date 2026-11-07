@@ -41,6 +41,7 @@ constexpr uint64_t kLinkLocalProbeMs = 1000, kLinkLocalQuietMs = 2000, kLinkLoca
 
 NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& clock, allocators::IAllocator& allocator)
     : mutex_(true),
+      ip_lock_(true),
       nic_(nic),
       clock_(clock),
       allocator_(allocator),
@@ -53,7 +54,8 @@ NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& c
       pending6_(allocator) {}
 
 NetworkStack::~NetworkStack() {
-  release_view(allocator_, coalesce_storage_);
+  for (UniquePointer<RxQueue>& rx : rx_)
+    if (rx) release_view(allocator_, rx->storage);
   release_view(allocator_, segment_frame_);
 }
 
@@ -65,22 +67,29 @@ bool NetworkStack::initialize() {
   dhcp_ = UniquePointer<DhcpClient>::make(allocator_, ip, dhcp_socket_, nic_.mac_address(), listener);
   INetworkStack& stack = *this;
   resolver_ = UniquePointer<DnsResolver>::make(allocator_, stack, allocator_);
-  // (without the memory, frames are just handled one by one and segments sent packet by packet)
-  coalesce_storage_ = allocate_view<uint8_t>(allocator_, kCoalesceBytes);
-  coalescer_ = TcpCoalescer(coalesce_storage_);
+  // A receive queue's state each (without the coalescing memory, its frames are just handled one by one).
+  const uint32_t queues = nic_.receive_queue_count();
+  queue_count_ = queues == 0 ? 1 : queues < kMaxQueues ? queues : kMaxQueues;
+  for (uint32_t q = 0; q < queue_count_; ++q) {
+    rx_[q] = UniquePointer<RxQueue>::make(allocator_);
+    if (!rx_[q]) return false;
+    rx_[q]->storage = allocate_view<uint8_t>(allocator_, kCoalesceBytes);
+    rx_[q]->coalescer = TcpCoalescer(rx_[q]->storage);
+  }
   return dhcp_ && resolver_;
 }
 
 // ------------------------------------------------------------------ configuration
 
 IpConfiguration NetworkStack::configuration() const {
-  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   return config_;
 }
 
 void NetworkStack::configure(const IpConfiguration& configuration) {
   kernel::ScopedRecursiveMutex guard(mutex_);
   dhcp_->stop();
+  kernel::ScopedRecursiveMutex ip(ip_lock_);
   link_local_state_ = LinkLocalState::Off;
   config_ = configuration;
 }
@@ -91,11 +100,13 @@ void NetworkStack::start_dhcp() {
 }
 
 void NetworkStack::on_lease(const IpConfiguration& configuration) {
+  kernel::ScopedRecursiveMutex ip(ip_lock_);
   link_local_state_ = LinkLocalState::Off;  // a real lease replaces a made-up address
   config_ = configuration;
 }
 
 void NetworkStack::on_lease_lost() {
+  kernel::ScopedRecursiveMutex ip(ip_lock_);
   if (link_local_state_ != LinkLocalState::Bound && link_local_state_ != LinkLocalState::Announcing) config_ = IpConfiguration{};
 }
 
@@ -110,54 +121,58 @@ bool NetworkStack::wait_for_address(uint32_t timeout_ms) {
 }
 
 SharedPointer<IUdpSocket> NetworkStack::udp_open_families(uint16_t port, IpFamilies families) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
   return SharedPointer<IUdpSocket>(udp_.open(port, families));
 }
 
 SharedPointer<ITcpSocket> NetworkStack::tcp_open() {
-  kernel::ScopedRecursiveMutex guard(mutex_);
   return SharedPointer<ITcpSocket>(tcp_.create());
 }
 
 // ------------------------------------------------------------------ receiving
 
 void NetworkStack::poll() {
+  bool saturated = false;
+  for (uint32_t q = 0; q < queue_count_; ++q) saturated = poll_receive(q) || saturated;
+  poll_control();
+  if (saturated) __atomic_store_n(&saturated_, true, __ATOMIC_RELAXED);
+}
+
+bool NetworkStack::poll_receive(uint32_t queue) {
+  if (queue >= queue_count_) return false;
+  RxQueue& rx = *rx_[queue];
+  kernel::ScopedMutex guard(rx.lock);
   uint8_t frame[hardware::kEthernetMaxFrame + 64];
   hardware::ReceivedFrame received;
   uint32_t taken = 0;
-  bool more = true;
-  // Received frames go through in batches. Between two, the lock is let go when another thread waits for it (an application's send() or
-  // receive()), so a stream of arriving frames cannot keep an application out for the whole poll: it gets in after at most one batch.
-  while (more && taken < kFramesPerPoll) {
-    {
-      kernel::ScopedRecursiveMutex guard(mutex_);
-      if (taken == 0 && !egress_.empty()) egress_.drain(nic_, now_ms());   // (what waited for room goes first: ACKs among it)
-      uint32_t n = 0;
-      for (; n < kFramesPerBatch && nic_.receive_frame(ByteView(frame), &received); ++n) {
-        if (received.length > sizeof(frame)) continue;
-        const ConstByteView f = ConstByteView(frame).first(received.length);
-        // Receive offload: a TCP segment for this machine may join the run being put together; anything else hands the run on first (order is kept).
-        const bool ours = received.length >= hardware::kEthernetHeaderSize && hardware::MacAddress{{f[0], f[1], f[2], f[3], f[4], f[5]}} == nic_.mac_address();
-        if (ours && coalescer_.offer(f, received)) continue;
-        flush_coalesced();
-        if (ours && coalescer_.offer(f, received)) continue;
-        handle_frame(f, received);
-      }
-      taken += n;
-      more = n == kFramesPerBatch;
-      if (!more || !mutex_.contended()) continue;
+  for (; taken < kFramesPerPoll && nic_.receive_frame_from(queue, ByteView(frame), &received); ++taken) {
+    if (taken == 0) {   // (counted while it handles frames: how many queues do that at once)
+      const uint32_t now_receiving = __atomic_add_fetch(&receiving_now_, 1u, __ATOMIC_ACQ_REL);
+      for (uint32_t peak = __atomic_load_n(&concurrent_peak_, __ATOMIC_RELAXED); now_receiving > peak;)
+        if (__atomic_compare_exchange_n(&concurrent_peak_, &peak, now_receiving, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
     }
-    // The lock is a fair one: letting it go here gave it to the waiting thread, and this one queues behind it when it locks again. (The yield
-    // lets that thread run now if it shares this core.)
-    kernel::yield();
+    if (received.length > sizeof(frame)) continue;
+    const ConstByteView f = ConstByteView(frame).first(received.length);
+    // Receive offload: a TCP segment for this machine may join the run being put together; anything else hands the run on first (order is kept).
+    const bool ours = received.length >= hardware::kEthernetHeaderSize && hardware::MacAddress{{f[0], f[1], f[2], f[3], f[4], f[5]}} == nic_.mac_address();
+    if (ours && rx.coalescer.offer(f, received)) continue;
+    flush_coalesced(rx);
+    if (ours && rx.coalescer.offer(f, received)) continue;
+    handle_frame(f, received);
   }
-
-  kernel::ScopedRecursiveMutex guard(mutex_);
-  // A poll that stopped at its limit is followed by another at once (NetworkStackSet): the run may go on in it. Otherwise it is handed on now,
-  // so coalescing never holds a segment back for longer than the frames already waiting take.
+  // A poll that stopped at its limit is followed by another at once: the run may go on in it. Otherwise it is handed on now, so coalescing
+  // never holds a segment back for longer than the frames already waiting take.
   const bool saturated = taken >= kFramesPerPoll;
-  if (!saturated) flush_coalesced();
+  if (!saturated) flush_coalesced(rx);
+  if (taken) {
+    __atomic_sub_fetch(&receiving_now_, 1u, __ATOMIC_ACQ_REL);
+    note_progress();
+  }
+  return saturated;
+}
 
+void NetworkStack::poll_control() {
+  kernel::ScopedRecursiveMutex guard(mutex_);
+  bool restart_dhcp = false;
   if (follow_link_) {
     const bool up = nic_.link_up();
     if (up != link_was_up_) {
@@ -166,6 +181,7 @@ void NetworkStack::poll() {
         dhcp_->start();
       } else {
         dhcp_->stop();
+        kernel::ScopedRecursiveMutex ip(ip_lock_);
         link_local_state_ = LinkLocalState::Off;
         config_ = IpConfiguration{};
         stop_ipv6();  // (autoconfiguration starts over when the link is back)
@@ -175,17 +191,33 @@ void NetworkStack::poll() {
   }
   uint32_t looped = deliver_looped();
   dhcp_->poll();
-  service_ipv6();
-  service_link_local();
+  {
+    kernel::ScopedRecursiveMutex ip(ip_lock_);
+    service_ipv6();
+    restart_dhcp = service_link_local();
+    service_pending();
+  }
+  if (restart_dhcp) dhcp_->start();
   resolver_->poll();
-  service_pending();
   tcp_.poll();
   looped += deliver_looped();  // (what the timers and the received frames sent to this stack itself)
   udp_.reap();
-  const uint32_t drained = egress_.empty() ? 0 : egress_.drain(nic_, now_ms());
+  uint32_t drained = 0;
+  bool looped_left;
+  {
+    kernel::ScopedRecursiveMutex ip(ip_lock_);
+    if (!egress_.empty()) drained = egress_.drain(nic_, now_ms());
+    looped_left = !looped_.empty();
+  }
   // (the loopback's bound per poll was reached: go on at once)
-  __atomic_store_n(&saturated_, saturated || !looped_.empty(), __ATOMIC_RELAXED);
-  if (taken || looped || drained) note_progress();
+  __atomic_store_n(&saturated_, looped_left, __ATOMIC_RELAXED);
+  if (looped || drained) note_progress();
+}
+
+uint64_t NetworkStack::coalesced_segments() const {
+  uint64_t n = 0;
+  for (uint32_t q = 0; q < queue_count_; ++q) n += rx_[q]->coalescer.merged();
+  return n;
 }
 
 void NetworkStack::note_progress() {
@@ -208,9 +240,12 @@ bool NetworkStack::wait_for_progress(uint64_t seen, uint64_t timeout_us) {
 // others (an ACK, an answer), which are delivered in the same call, up to a bound.
 uint32_t NetworkStack::deliver_looped() {
   uint32_t i = 0;
-  for (; i < kLoopedPerPoll && !looped_.empty(); ++i) {
+  for (; i < kLoopedPerPoll; ++i) {
     LoopedPacket p;
-    if (!looped_.dequeue(&p)) break;
+    {
+      kernel::ScopedRecursiveMutex ip(ip_lock_);   // (taken off the queue under the IP lock, handled with it let go: it goes to sockets)
+      if (!looped_.dequeue(&p)) break;
+    }
     const ConstByteView packet = ConstByteView(p.ip_packet).first(p.length);
     if (p.length && (p.ip_packet[0] >> 4) == 6) handle_ipv6(packet, true);
     else handle_ipv4(packet, true);
@@ -219,15 +254,15 @@ uint32_t NetworkStack::deliver_looped() {
 }
 
 // (also called before anything that must see the frames received so far in order: a send, a timer, another poll that is not straight after)
-void NetworkStack::flush_coalesced() {
-  if (!coalescer_.holding()) return;
+void NetworkStack::flush_coalesced(RxQueue& rx) {
+  if (!rx.coalescer.holding()) return;
   hardware::ReceivedFrame checked;  // (every piece was checked before it joined)
   checked.ipv4_header_checksum_good = true;
   checked.transport_checksum_good = true;
-  const ConstByteView run = coalescer_.held();
+  const ConstByteView run = rx.coalescer.held();
   if ((run[0] >> 4) == 6) handle_ipv6(run, false, checked);
   else handle_ipv4(run, false, checked);
-  coalescer_.clear();
+  rx.coalescer.clear();
 }
 
 void NetworkStack::handle_frame(ConstByteView frame, const hardware::ReceivedFrame& checks) {
@@ -238,8 +273,12 @@ void NetworkStack::handle_frame(ConstByteView frame, const hardware::ReceivedFra
   if (!in.ok()) return;  // shorter than an Ethernet header
   const bool multicast_mac = (destination.bytes[0] & 1) && !destination.is_broadcast();
   const bool ipv6_multicast = destination.bytes[0] == 0x33 && destination.bytes[1] == 0x33;
-  if (!destination.is_broadcast() && !(destination == nic_.mac_address()) && !(multicast_mac && (group_count_ > 0 || (ipv6_multicast && ipv6_started_))))
+  if (multicast_mac) {
+    kernel::ScopedRecursiveMutex ip(ip_lock_);
+    if (!(group_count_ > 0 || (ipv6_multicast && ipv6_started_))) return;  // not a group we are in
+  } else if (!destination.is_broadcast() && !(destination == nic_.mac_address())) {
     return;  // not for us
+  }
 
   if (type == kEtherTypeArp) handle_arp(in.rest());
   else if (type == kEtherTypeIpv4) handle_ipv4(in.rest(), false, checks);
@@ -252,6 +291,7 @@ void NetworkStack::learn(Ipv4Address address, const hardware::MacAddress& mac) {
 }
 
 void NetworkStack::handle_arp(ConstByteView arp) {
+  kernel::ScopedRecursiveMutex ip(ip_lock_);
   // Ethernet / IPv4 ARP only: hardware type 1, protocol 0x0800, sizes 6 and 4.
   ByteReader in(arp);
   if (in.be16() != 1 || in.be16() != kEtherTypeIpv4 || in.u8() != 6 || in.u8() != 4) return;
@@ -290,7 +330,7 @@ bool NetworkStack::is_member(Ipv4Address group) const {
 // ------------------------------------------------------------------ multicast
 
 bool NetworkStack::join_multicast(Ipv4Address group) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   if (!group.is_multicast()) return false;
   if (is_member(group)) return true;
   if (group_count_ >= kMaxGroups) return false;
@@ -301,7 +341,7 @@ bool NetworkStack::join_multicast(Ipv4Address group) {
 }
 
 void NetworkStack::leave_multicast(Ipv4Address group) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   for (uint32_t i = 0; i < group_count_; ++i) {
     if (!(groups_[i] == group)) continue;
     groups_[i] = groups_[--group_count_];
@@ -322,6 +362,7 @@ void NetworkStack::send_igmp_report(Ipv4Address group) {
 }
 
 void NetworkStack::handle_igmp(ConstByteView igmp) {
+  kernel::ScopedRecursiveMutex ip(ip_lock_);
   if (igmp.size() < 8 || checksum_finish(checksum_add(0, igmp.first(8))) != 0) return;
   if (igmp[0] != 0x11) return;  // only queries matter: a general query (group 0) or one for a group we are in
   const Ipv4Address asked = Ipv4Address::make(igmp[4], igmp[5], igmp[6], igmp[7]);
@@ -347,21 +388,28 @@ void NetworkStack::handle_ipv4(ConstByteView packet, bool looped, const hardware
   if (header < kIpv4HeaderSize || header > total || total > packet.size()) return;  // Ethernet padding makes the frame longer than total
   if (!checks.ipv4_header_checksum_good && checksum_finish(checksum_add(0, packet.first(header))) != 0) return;
   if (flags_and_offset & 0x3FFF) return;  // a fragment (more-fragments flag or an offset): unsupported
-  if (!looped && (!accepts_destination(destination) || destination.is_loopback())) return;  // (127/8 never arrives from a wire)
+  bool accepted, to_me;
+  {
+    kernel::ScopedRecursiveMutex ip(ip_lock_);   // (the addresses looked at; let go before the packet goes to a socket)
+    accepted = accepts_destination(destination);
+    to_me = config_.configured() && destination == config_.address;
+  }
+  if (!looped && (!accepted || destination.is_loopback())) return;  // (127/8 never arrives from a wire)
 
   ConstByteView payload = packet.subview(header, total - header);
   if (protocol == kProtocolUdp) {
     udp_.handle(source, destination, payload, checks.transport_checksum_good);
   } else if (protocol == kProtocolTcp) {
-    if (looped || (config_.configured() && destination == config_.address)) tcp_.handle(source, destination, payload, checks.transport_checksum_good, ecn);
+    if (looped || to_me) tcp_.handle(source, destination, payload, checks.transport_checksum_good, ecn);
   } else if (protocol == kProtocolIcmp) {
-    if (looped || (config_.configured() && destination == config_.address)) handle_icmp(source, payload);
+    if (looped || to_me) handle_icmp(source, payload);
   } else if (protocol == kProtocolIgmp) {
     handle_igmp(payload);
   }
 }
 
 void NetworkStack::handle_icmp(Ipv4Address source, ConstByteView icmp) {
+  kernel::ScopedRecursiveMutex ip(ip_lock_);
   if (icmp.size() < 8 || checksum_finish(checksum_add(0, icmp)) != 0) return;
   ByteReader in(icmp);
   const uint8_t type = in.u8();
@@ -423,17 +471,21 @@ bool NetworkStack::transmit(EgressQueue::Kind kind, ConstByteView frame, hardwar
 }
 
 bool NetworkStack::backlogged() const {
-  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
-  return !egress_.empty() || !looped_.empty() || tcp_.pacing();
+  {
+    kernel::ScopedRecursiveMutex guard(ip_lock_);
+    if (!egress_.empty() || !looped_.empty()) return true;
+  }
+  return tcp_.pacing();
 }
 
 EgressQueue::Stats NetworkStack::egress_stats() const {
-  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   return egress_.stats();
 }
 
 uint32_t NetworkStack::queued_for(const IpAddress& remote, uint16_t local_port, uint16_t remote_port) const {
-  return egress_.queued_in_flow(EgressQueue::flow_of(remote, kProtocolTcp, local_port, remote_port));   // (called by TCP, under the stack's lock)
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
+  return egress_.queued_in_flow(EgressQueue::flow_of(remote, kProtocolTcp, local_port, remote_port));
 }
 
 // The MAC address a packet to `destination` goes to, when it is known now (an ARP entry that has not expired): for unicast to the wire only.
@@ -460,7 +512,7 @@ static uint32_t segmentation_bytes(const hardware::INetworkInterface& nic) {
 }
 
 uint32_t NetworkStack::max_segmented_payload(const IpAddress& destination) const {
-  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   hardware::MacAddress mac;
   const uint32_t bytes = segmentation_bytes(nic_);
   if (bytes == 0) return 0;
@@ -472,7 +524,7 @@ uint32_t NetworkStack::max_segmented_payload(const IpAddress& destination) const
 // The frame of a large TCP segment, built like any other (IP header, the pseudo-header seed in the checksum field) and given to the interface
 // to cut up: TCP to a next hop whose address is known.
 bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss, uint8_t ecn) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   hardware::MacAddress mac;
   const uint32_t bytes = segmentation_bytes(nic_);
   const uint32_t ip_header = destination.v6 ? kIpv6HeaderSize : kIpv4HeaderSize;
@@ -523,13 +575,13 @@ bool NetworkStack::send_tcp_segmented(const IpAddress& destination, ConstByteVie
 }
 
 IpAddress NetworkStack::source_for_ip(const IpAddress& destination) const {
-  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   if (destination.v6) return IpAddress(source_for6(destination.ipv6));
   return IpAddress(source_for(destination.ipv4));
 }
 
 bool NetworkStack::send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload, uint8_t ecn) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   outgoing_ecn_ = ecn & 3;
   bool sent;
   if (!destination.v6) {
@@ -566,14 +618,14 @@ void NetworkStack::send_arp_from(uint16_t operation, Ipv4Address sender_ip, cons
 }
 
 bool NetworkStack::send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   if (!config_.configured() && !destination.is_loopback()) return false;  // (the loopback works before an address is configured)
   return send_ip_from(source_for(destination), destination, protocol, payload, false);
 }
 
 bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
                                 bool link_broadcast) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   if (payload.size() > kMaxIpPayload) return false;
 
   uint8_t packet_storage[kMtu];
@@ -718,7 +770,7 @@ bool NetworkStack::ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_
   bool ok;
   uint64_t deadline;
   {
-    kernel::ScopedRecursiveMutex guard(mutex_);
+    kernel::ScopedRecursiveMutex guard(ip_lock_);
     ping_active_ = true;
     ping_answered_ = false;
     ping_target_ = address;
@@ -728,13 +780,13 @@ bool NetworkStack::ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_
   }
   for (;;) {
     {
-      kernel::ScopedRecursiveMutex guard(mutex_);
+      kernel::ScopedRecursiveMutex guard(ip_lock_);
       if (!ok || ping_answered_ || now_ms() >= deadline) break;
     }
     poll();
     kernel::sleep_us(200);
   }
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   ok = ok && ping_answered_;
   ping_active_ = false;
   if (ok && rtt_ms) *rtt_ms = static_cast<uint32_t>(ping_rtt_ms_);
@@ -754,22 +806,23 @@ Ipv4Address NetworkStack::link_local_candidate(const hardware::MacAddress& mac, 
   return Ipv4Address::make(169, 254, static_cast<uint8_t>(1 + (hash >> 8) % 254), static_cast<uint8_t>(hash >> 20));
 }
 
-void NetworkStack::service_link_local() {
-  if (!link_local_enabled_) return;
+bool NetworkStack::service_link_local() {
+  if (!link_local_enabled_) return false;
+  bool restart_dhcp = false;
   const uint64_t now = now_ms();
   if (link_local_state_ == LinkLocalState::Off) {
-    if (config_.configured() || dhcp_->state() != DhcpState::Failed || (follow_link_ && !link_was_up_)) return;
+    if (config_.configured() || dhcp_->state() != DhcpState::Failed || (follow_link_ && !link_was_up_)) return false;
     link_local_address_ = link_local_candidate(nic_.mac_address(), link_local_attempt_);
     link_local_state_ = LinkLocalState::Probing;
     link_local_step_ = 0;
     link_local_next_ms_ = now;
-    return;
+    return false;
   }
   if (link_local_state_ == LinkLocalState::Bound && dhcp_->state() == DhcpState::Failed && now >= link_local_dhcp_retry_ms_) {
     link_local_dhcp_retry_ms_ = now + kLinkLocalDhcpRetryMs;  // a server may have appeared
-    dhcp_->start();
+    restart_dhcp = true;
   }
-  if (now < link_local_next_ms_) return;
+  if (now < link_local_next_ms_) return restart_dhcp;
   const uint32_t jitter = (nic_.mac_address().bytes[5] + link_local_step_ * 37u) % 1000;  // spreads two hosts that start together
   switch (link_local_state_) {
     case LinkLocalState::Probing:
@@ -797,6 +850,7 @@ void NetworkStack::service_link_local() {
     default:
       break;
   }
+  return restart_dhcp;
 }
 
 // Picks another address after a conflict; after ten of them waits a minute between tries.

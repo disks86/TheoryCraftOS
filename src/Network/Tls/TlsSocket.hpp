@@ -161,6 +161,9 @@ class TlsSocket final : public ITcpSocket {
   void finish_handshake();
 
   INetworkStack& stack_;
+  // Guards this connection's state (its own: TLS work - the handshake's arithmetic, record encryption - is not done under the stack's lock, so
+  // connections do it at the same time). Taken before the inner TCP socket's.
+  mutable kernel::RecursiveMutex lock_;
   allocators::IAllocator& allocator_;
   TlsConfig config_;
   char server_name_[256] = {};

@@ -89,7 +89,7 @@ class TcpSocket final : public ITcpSocket {
 
   // --- ITcpSocket
   TcpState state() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return state_;
   }
   bool connect(Ipv4Address address, uint16_t port) override { return connect_ip(IpAddress(address), port); }
@@ -100,92 +100,81 @@ class TcpSocket final : public ITcpSocket {
   uint32_t send(ConstByteView data) override;
   uint32_t receive(ByteView buffer) override;
   uint32_t available() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return receive_buffer_.size();
   }
   uint32_t unsent_or_unacknowledged() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return send_buffer_.size();
   }
   bool is_connected() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return state_ == TcpState::Established || state_ == TcpState::CloseWait;
   }
   bool peer_closed() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return fin_received_ && receive_buffer_.size() == 0;
   }
   bool failed() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return failed_;
   }
   void close() override;
   void abort() override;
   uint16_t local_port() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return local_port_;
   }
   Ipv4Address remote_address() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return remote_.v6 ? kAnyAddress : remote_.ipv4;
   }
   IpAddress remote_ip() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return remote_;
   }
   uint16_t remote_port() const override {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return remote_port_;
   }
 
   // Congestion control state, for tests and statistics.
   // Data waits only for the pacing rate (the stack polls again soon then, whether or not frames come).
-  bool pacing_paused() const { return paced_out_; }
+  bool pacing_paused() const { return __atomic_load_n(&paced_out_, __ATOMIC_RELAXED); }   // (read by the manager without this socket's lock)
   bool sack_permitted() const {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return sack_ok_;
   }
   bool ecn_capable() const {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return ecn_ok_;
   }
   uint32_t congestion_window() const {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return cwnd_;
   }
   uint32_t slow_start_threshold() const {
-    StackLock guard(ip_);
+    kernel::ScopedRecursiveMutex guard(lock_);
     return ssthresh_;
   }
 
-  // --- used by TcpManager
-  bool matches(const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port) const {
-    return state_ != TcpState::Listen && state_ != TcpState::Closed && local_port_ == local_port &&
-           remote_port_ == remote_port && remote_ == remote_address;
-  }
-  IpFamilies listen_families() const { return listen_families_; }  // a listener's: whose SYNs it takes
-  void on_segment(const TcpSegment& segment);
+  // --- used by TcpManager (which takes no socket's lock while it holds its table's)
+  kernel::RecursiveMutex& lock() const { return lock_; }
+  // A segment for this connection. `self` is the table's reference to this socket (handed to the listener when a connection it spawned is
+  // established).
+  void on_segment(const TcpSegment& segment, const SharedPointer<TcpSocket>& self);
   void on_timer(uint64_t now);
-  // Becomes a connection in SynReceived for a SYN that arrived at `listener`.
-  void accept_syn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port,
+  // Becomes a connection in SynReceived for a SYN that arrived at `listener` (whose lock the caller holds). False if out of memory.
+  bool accept_syn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port,
                   const TcpSegment& syn, uint32_t initial_sequence);
-  void prepare_to_connect(uint16_t local_port, uint32_t initial_sequence);
-  bool take_established_event() {  // true once, when a child connection completes its handshake
-    const bool e = established_event_;
-    established_event_ = false;
-    return e;
-  }
-  TcpSocket* listener() const { return listener_; }
-  void detach_from_listener() { listener_ = nullptr; }
-  void enqueue_accepted(SharedPointer<TcpSocket> child) { accept_queue_.push_back(child); }
-  uint32_t embryo_count() const { return embryos_; }
-  uint32_t accepted_waiting() const { return static_cast<uint32_t>(accept_queue_.count()); }
-  void child_finished_handshake() {
-    if (embryos_) --embryos_;
-  }
-  void add_embryo() { ++embryos_; }
-  void drop_pending_connections();
-  bool is_dead() const { return state_ == TcpState::Closed; }
+  // `listener` is closing: a connection it spawned and has not handed over yet is reset.
+  void leave_listener(TcpSocket* listener);
+  // The application let go of it while it was still open (or listening): close it as close() would.
+  void close_if_abandoned();
+  // A listener's count of connections still in their handshake and of those waiting to be accepted (its accept lock: taken by its connections
+  // with their own locks held).
+  uint32_t embryo_count() const;
+  uint32_t accepted_waiting() const;
 
  private:
   enum class Mode : uint8_t { Open, Closing };
@@ -196,6 +185,7 @@ class TcpSocket final : public ITcpSocket {
   bool send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, uint32_t length, uint16_t mss);
   void send_ack() { send_segment(tcp_flags::kAck, snd_nxt_, ConstByteView(), false); }
   void output();
+  void handle_segment(const TcpSegment& segment);
   void process_ack(const TcpSegment& segment);
   void accept_data(const TcpSegment& segment);
   void enter(TcpState state);
@@ -215,6 +205,12 @@ class TcpSocket final : public ITcpSocket {
   void on_congestion(bool timeout);
   void grow_window(uint32_t acked);
   void fail();
+  void prepare_to_connect(uint16_t local_port, uint32_t initial_sequence);
+  // The listener's side of its connections (under accept_lock_).
+  void add_embryo();
+  void child_finished_handshake();
+  void child_established(const SharedPointer<TcpSocket>& child);
+  void drop_pending_connections();
 
   IIpLayer& ip_;
   TcpManager& manager_;
@@ -286,9 +282,13 @@ class TcpSocket final : public ITcpSocket {
   bool failed_ = false;
   bool established_event_ = false;
   // Listening sockets.
-  TcpSocket* listener_ = nullptr;  // for a connection spawned by a listener, until accepted
+  TcpSocket* listener_ = nullptr;  // for a connection spawned by a listener, until accepted (it outlives this pointer: see leave_listener)
+  mutable kernel::Mutex accept_lock_;   // guards the two below (a leaf: nothing else is taken while it is held)
   List<SharedPointer<TcpSocket>> accept_queue_;
   uint32_t embryos_ = 0;           // children still in SynReceived
+
+  // Guards everything in this socket but the two above (see TcpManager for the order it is taken in).
+  mutable kernel::RecursiveMutex lock_;
 };
 
 }  // namespace network

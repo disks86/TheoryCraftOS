@@ -66,40 +66,53 @@ struct RealClock final : hardware::IClock {
   }
 };
 
-// One end of the wire: frames another thread sends arrive here; an arrival "interrupts" (wakes the service thread of this end's stack).
+// One end of the wire: frames another thread sends arrive here; an arrival "interrupts" (wakes the service threads of this end's stack). With
+// `queues` 2 it is an interface with RSS: a TCP frame goes to the queue its ports pick (so a flow stays in one), anything else to queue 0.
 struct WireNic final : hardware::INetworkInterface {
+  static constexpr uint32_t kMaxQueues = 2;
   WireNic* peer = nullptr;
   hardware::MacAddress mac;
-  std::mutex mutex;
-  std::deque<std::vector<uint8_t>> inbox;
+  uint32_t queues = 1;
+  std::mutex mutex[kMaxQueues];
+  std::deque<std::vector<uint8_t>> inbox[kMaxQueues];
+  std::mutex wake_mutex;
   hardware::NetworkWake wake = nullptr;
   void* wake_context = nullptr;
-  std::atomic<uint64_t> sent{0};
-  explicit WireNic(uint8_t last) { mac = {{0x02, 0, 0, 0, 0, last}}; }
+  std::atomic<uint64_t> sent{0}, received_on[kMaxQueues] = {{0}, {0}};
+  explicit WireNic(uint8_t last, uint32_t queue_count = 1) : queues(queue_count) { mac = {{0x02, 0, 0, 0, 0, last}}; }
   const char* name() const override { return "wire nic"; }
   bool initialize() override { return true; }
   void shutdown() override {}
   hardware::MacAddress mac_address() const override { return mac; }
   bool link_up() const override { return true; }
   bool enable_interrupts(hardware::NetworkWake w, void* context) override {
-    std::lock_guard<std::mutex> guard(mutex);
+    std::lock_guard<std::mutex> guard(wake_mutex);
     wake = w;
     wake_context = context;
     return true;
   }
   void disable_interrupts() override {
-    std::lock_guard<std::mutex> guard(mutex);
+    std::lock_guard<std::mutex> guard(wake_mutex);
     wake = nullptr;
   }
   bool interrupts_enabled() const override { return true; }
+  uint32_t queue_of(ConstByteView frame) const {
+    if (queues == 1 || frame.size() < 38 || frame[12] != 0x08 || frame[13] != 0x00 || frame[23] != 6) return 0;
+    const uint32_t ports = uint32_t(frame[34] << 8 | frame[35]) + uint32_t(frame[36] << 8 | frame[37]);
+    return ports % queues;
+  }
   void arrive(ConstByteView frame) {
+    const uint32_t q = queue_of(frame);
+    {
+      std::lock_guard<std::mutex> guard(mutex[q]);
+      if (inbox[q].size() > 1024) return;   // (a full ring drops)
+      inbox[q].emplace_back(frame.data(), frame.data() + frame.size());
+      if (inbox[q].back().size() < 60) inbox[q].back().resize(60);
+    }
     hardware::NetworkWake w;
     void* c;
     {
-      std::lock_guard<std::mutex> guard(mutex);
-      if (inbox.size() > 1024) return;   // (a full ring drops)
-      inbox.emplace_back(frame.data(), frame.data() + frame.size());
-      if (inbox.back().size() < 60) inbox.back().resize(60);
+      std::lock_guard<std::mutex> guard(wake_mutex);
       w = wake;
       c = wake_context;
     }
@@ -110,15 +123,32 @@ struct WireNic final : hardware::INetworkInterface {
     peer->arrive(frame);
     return true;
   }
-  bool receive(ByteView buffer, uint32_t* length) override {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (inbox.empty()) return false;
-    const std::vector<uint8_t>& f = inbox.front();
+  uint32_t receive_queue_count() const override { return queues; }
+  size_t waiting(uint32_t q) {
+    std::lock_guard<std::mutex> guard(mutex[q]);
+    return inbox[q].size();
+  }
+  bool receive_frame_from(uint32_t q, ByteView buffer, hardware::ReceivedFrame* frame) override {
+    *frame = hardware::ReceivedFrame{};
+    if (q >= queues) return false;
+    std::lock_guard<std::mutex> guard(mutex[q]);
+    if (inbox[q].empty()) return false;
+    const std::vector<uint8_t>& f = inbox[q].front();
     const uint32_t n = f.size() < buffer.size() ? uint32_t(f.size()) : uint32_t(buffer.size());
     for (uint32_t i = 0; i < n; ++i) buffer[i] = f[i];
-    *length = uint32_t(f.size());
-    inbox.pop_front();
+    frame->length = uint32_t(f.size());
+    inbox[q].pop_front();
+    ++received_on[q];
     return true;
+  }
+  bool receive(ByteView buffer, uint32_t* length) override {
+    hardware::ReceivedFrame frame;
+    for (uint32_t q = 0; q < queues; ++q)
+      if (receive_frame_from(q, buffer, &frame)) {
+        *length = frame.length;
+        return true;
+      }
+    return false;
   }
   hardware::NetworkStatistics statistics() const override { return hardware::NetworkStatistics{}; }
 };
@@ -126,9 +156,9 @@ struct WireNic final : hardware::INetworkInterface {
 struct Machines {
   SafeAllocator alloc;
   RealClock clock;
-  WireNic nic_a{1}, nic_b{2};
+  WireNic nic_a, nic_b;
   NetworkStackSet a{clock, alloc}, b{clock, alloc};
-  Machines() {
+  explicit Machines(uint32_t queues = 1) : nic_a(1, queues), nic_b(2, queues) {
     nic_a.peer = &nic_b;
     nic_b.peer = &nic_a;
     CHECK(a.add(nic_a) && b.add(nic_b));
@@ -252,9 +282,10 @@ static void test_loopback_latency() {
   CHECK(us / kRounds < 2500);   // (without the wake hook a round trip waits for the 5 ms idle timer twice: 10 ms; even ThreadSanitizer's slowdown stays well under)
 }
 
-// A flood of frames into machine A (raw UDP datagrams put on its wire as fast as a thread can) keeps its service thread busy; an application
-// thread's send() still gets the stack's lock between batches, so its datagrams go out while the flood lasts (it would wait for whole polls,
-// back to back, otherwise).
+// A flood of frames into machine A (raw UDP datagrams put on its wire as fast as its ring takes them) keeps its service thread busy; an
+// application thread's send() still gets the locks it needs (the IP lock, a fair one, for a moment), so its datagrams go out at once while the
+// flood lasts - and all of them arrive. (Before receiving took no stack-wide lock and the locks were fair, a send waited for whole polls:
+// 17 ms.)
 static void test_send_during_flood() {
   Machines m;
   SharedPointer<IUdpSocket> heard = m.b.at(0)->udp_open(9800);
@@ -273,16 +304,25 @@ static void test_send_during_flood() {
   std::atomic<uint64_t> flooded{0};
   std::thread flooder([&] {
     while (!stop) {
+      if (m.nic_a.waiting(0) >= 1024) {   // (the ring is full: a real wire's frames would be dropped; this thread need not spin on it)
+        std::this_thread::yield();
+        continue;
+      }
       m.nic_a.arrive(ConstByteView(frame.data(), frame.size()));
       ++flooded;
     }
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   int got = 0;
+  double send_us = 0, slowest_send_us = 0;
   const auto start = std::chrono::steady_clock::now();
   for (int i = 0; i < 200; ++i) {
     const uint8_t msg[4] = {uint8_t(i)};
+    const auto before = std::chrono::steady_clock::now();
     talker->send_to(Ipv4Address::make(10, 0, 0, 2), 9800, ConstByteView(msg));
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - before).count();
+    send_us += us;
+    if (us > slowest_send_us) slowest_send_us = us;
     uint8_t d[16];
     Ipv4Address from;
     uint16_t port;
@@ -292,8 +332,9 @@ static void test_send_during_flood() {
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   stop = true;
   flooder.join();
-  printf("during a flood of %llu frames: %d of 200 datagrams sent and heard, %.3f ms each\n", (unsigned long long)flooded.load(), got, ms / 200);
-  CHECK(got >= 190 && ms / 200 < 5);   // (without the hand-over between batches: 17 ms)
+  printf("during a flood of %llu frames: %d of 200 datagrams sent and heard, send() %.0f us on average (slowest %.0f), %.3f ms each end to end\n",
+         (unsigned long long)flooded.load(), got, send_us / 200, slowest_send_us, ms / 200);
+  CHECK(got >= 190 && send_us / 200 < 500);
 }
 
 // The stack's lock is a fair one (kernel::Mutex(true)). A thread that holds it in long stretches and takes it again the moment it lets go (as
@@ -381,12 +422,63 @@ static void test_executor_wake() {
   CHECK(done == kRounds && us / kRounds < 2500);
 }
 
+// Two bulk connections into machine B, whose interface has two receive queues (one flow on each): B runs a service thread per queue, and the
+// two flows' segments are handled at the same moment - each under its own socket's lock, neither queue holding a stack-wide lock - while
+// every byte arrives intact and in order.
+static void test_parallel_queues() {
+  Machines m(2);
+  CHECK(m.b.at(0)->receive_queues() == 2);
+  constexpr int kFlows = 2;
+  constexpr uint32_t kBytes = 512 * 1024;
+  std::atomic<int> intact{0};
+  std::vector<std::thread> threads;
+  for (int f = 0; f < kFlows; ++f) {
+    const uint16_t port = uint16_t(9100 + 2 * f);   // (client ports 49152 and 49153, in either order: the port sums differ by an odd number, one per queue)
+    SharedPointer<ITcpSocket> listener = m.b.at(0)->tcp_open();
+    CHECK(listener->listen(port));
+    threads.emplace_back([&m, listener, f, &intact] {   // the receiver: checks the pattern as it reads
+      SharedPointer<ITcpSocket> conn;
+      CHECK(wait_until(m.b, [&] { return bool(conn = listener->accept()); }));
+      if (!conn) return;
+      uint32_t got = 0;
+      bool same = true;
+      uint8_t buffer[4096];
+      wait_until(m.b, [&] {
+        for (uint32_t n; (n = conn->receive(ByteView(buffer))) > 0; got += n)
+          for (uint32_t i = 0; i < n; ++i) same = same && buffer[i] == uint8_t((got + i) * 13 + f);
+        return got >= kBytes || conn->failed();
+      }, 120);
+      if (same && got == kBytes) ++intact;
+    });
+    threads.emplace_back([&m, port, f] {   // the sender
+      SharedPointer<ITcpSocket> s = m.a.at(0)->tcp_open();
+      CHECK(s->connect(Ipv4Address::make(10, 0, 0, 2), port));
+      CHECK(wait_until(m.a, [&] { return s->is_connected() || s->failed(); }));
+      std::vector<uint8_t> out(kBytes);
+      for (uint32_t i = 0; i < kBytes; ++i) out[i] = uint8_t(i * 13 + f);
+      uint32_t offset = 0;
+      wait_until(m.a, [&] {
+        if (offset < kBytes) offset += s->send(ConstByteView(out.data() + offset, kBytes - offset));
+        return (offset == kBytes && s->unsent_or_unacknowledged() == 0) || s->failed();
+      }, 120);
+      s->close();
+    });
+  }
+  for (std::thread& t : threads) t.join();
+  printf("parallel queues: %d of %d flows intact, %llu and %llu frames on B's two queues, at most %u queues handled at once\n", intact.load(), kFlows,
+         (unsigned long long)m.nic_b.received_on[0].load(), (unsigned long long)m.nic_b.received_on[1].load(), m.b.at(0)->concurrent_receives_seen());
+  CHECK(intact == kFlows);
+  CHECK(m.nic_b.received_on[0] > 100 && m.nic_b.received_on[1] > 100);   // (the flows really went to different queues)
+  CHECK(m.b.at(0)->concurrent_receives_seen() == 2);
+}
+
 int main() {
   test_concurrent_connections();
   test_loopback_latency();
   test_send_during_flood();
   test_fair_lock();
   test_executor_wake();
+  test_parallel_queues();
   if (g_failed) { printf("NetworkThreadTest: %d failed\n", g_failed.load()); return 1; }
   printf("NetworkThreadTest: all passed\n");
   return 0;

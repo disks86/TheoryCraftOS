@@ -5,23 +5,49 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
 
 ## Threads and locks
 
-- **One stack per interface.** `NetworkStackSet` builds a `NetworkStack` for each network interface. Each stack has its own lock (a
-  `kernel::RecursiveMutex`, `INetworkStack::mutex()`) that guards it, its sockets and its resolver. Stacks share nothing, so interfaces
+- **One stack per interface.** `NetworkStackSet` builds a `NetworkStack` for each network interface. Stacks share nothing, so interfaces
   never contend with each other.
-- **One service thread per stack.** `NetworkStackSet::start_service()` starts a "network" thread for each stack. The thread polls its stack.
-  Its interface's interrupt wakes it (the interrupt masks itself until `rearm_interrupts()`, so a burst costs one interrupt), it polls again
-  at once while frames keep coming (`saturated()`), and otherwise it sleeps 5 ms (500 µs for a polled interface, or while frames wait for
-  room in the interface). Two network cards are serviced on two cores, and a busy one does not delay the other. (Until November 2026 one
-  thread polled every stack in turn.)
-- **Application threads** call socket operations (`send()`, `receive()`, `accept()`…) directly. Each one takes the stack's lock for the time
-  of the call. `send()` puts data on the wire from the caller's thread, so a send never waits for the service thread.
-- **Polls let applications in.** `NetworkStack::poll()` handles received frames in batches of 16 (at most 64 per poll), and between batches
-  it lets go of the lock if another thread is waiting for it (`Mutex::contended()`).
-- **The stack's lock is fair** (`kernel::Mutex(true)`, through `RecursiveMutex(true)`). An unlock with threads waiting hands the mutex to the
-  one that has waited longest (`wake_one` wakes the oldest), and that thread holds it without trying again. Nobody can take it in between,
-  and the thread that let go queues behind. The ordinary mutex lets the releasing thread barge: with a flood of frames arriving, an
-  application's datagram took 17 ms to go out; with the fair lock it takes 0.3 ms (`NetworkThreadTest`). On the host, the fair mode is a
-  ticket lock, and a thread that holds the lock in long stretches and one that needs it briefly take strict turns.
+- **A service thread per receive queue.** `NetworkStackSet::start_service()` starts a "network" thread for every receive queue of every
+  stack (`NetworkStack::receive_queues()`, from `INetworkInterface::receive_queue_count()`: 2 for the 82574 and 4 for the 82576 with RSS,
+  else 1).
+  - Each thread empties its own queue (`poll_receive(queue)`), and queue 0's thread also runs the stack's control poll (`poll_control()`).
+  - The interface's interrupt wakes all of its threads (the interrupt masks itself until `rearm_interrupts()`, so a burst costs one). A
+    thread polls again at once while its queue is still full, and otherwise sleeps 5 ms (500 µs for a polled interface, or while the stack
+    has frames waiting for room or paced data).
+  - RSS keeps each flow in one queue, so its frames stay in order. Several flows of one interface are handled on several cores at the same
+    moment. (Before November 2026 one thread polled every stack in turn; then one thread per stack.)
+- **The locks**, outermost first (a thread holding one takes only those after it; `NetworkStack.hpp` has the list too):
+  1. **A receive queue's lock** (`RxQueue::lock`): the thread handling the queue, with its own receive-offload run. Drivers lock each
+     receive ring separately (`receive_frame_from`), so their queues are read at once and transmitted on meanwhile.
+  2. **The control lock** (`mutex()`, fair). It covers DHCP, the resolver, the order of `poll_control()`, and what applications ask of
+     the stack itself (`configure`, `start_dhcp`).
+  3. **A TLS connection's own lock**. TLS work (handshake arithmetic, record encryption) no longer runs under the stack's lock, so
+     connections do it at the same time.
+  4. **A TCP or UDP socket's own lock**. A listener's lock may be held when one of its new connections' is taken, never the other way round.
+  5. **The socket tables'** (`TcpManager`, `UdpManager`) **and a listener's accept queue's.** These are only ever taken for a short lookup
+     or change, never while calling into a socket.
+  6. **The IP lock** (`ip_lock_`, fair, recursive). It covers everything of the IP layer:
+     - addresses (IPv4 and IPv6, with their autoconfiguration)
+     - the ARP and neighbor caches, and the packets waiting for them or for the loopback
+     - the transmit queue and the interface's transmit path
+     - the ping and the multicast groups
+
+     It is held only while a packet is built and sent or the state looked at, and nothing under it calls into a socket.
+- **Receiving takes no stack-wide lock.** A TCP segment is looked up in the table by keys the sockets publish there (their ports, their
+  peer, whether they listen; `TcpManager::claim_connection`, `claim_listener`, `release`), so a lookup never reads a socket's own fields.
+  It is then handled under its socket's lock. ARP, ICMP and neighbor discovery take the IP lock; the loopback is delivered by the control
+  poll. Timers run over a snapshot of the table, each socket under its own lock.
+- **Application threads** call socket operations (`send()`, `receive()`, `accept()`…) directly, under that socket's lock. `send()` puts
+  data on the wire from the caller's thread, so a send never waits for a service thread.
+- **Fair locks.** The control and IP locks use `kernel::Mutex(true)`: an unlock with threads waiting hands the mutex to the one that has
+  waited longest (`wake_one` wakes the oldest), which holds it without trying again. The ordinary mutex lets the releasing thread barge.
+  With a flood of frames arriving:
+  - an application's datagram first took 17 ms to go out, while receiving held the stack lock
+  - 0.3 ms with a fair stack lock
+  - with receiving off the stack lock and the IP lock fair, `send()` takes about 10 µs, and a datagram crosses to the other machine in
+    about 0.2 ms (`NetworkThreadTest`)
+
+  On the host, the fair mode is a ticket lock.
 
 ## Waking waiters instead of polling them
 
@@ -93,7 +119,10 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
   - The flow classifier, against every truncation and bit flip of IPv4 and IPv6 frames.
   - The congestion window: initial value, growth, the cut after loss, and recovery.
   - The shared bottleneck above (`FakeNic::frames_per_ms` in `NetworkHarness.hpp` makes one).
-- `NetworkThreadTest` also checks the fair lock's turn-taking and the executor's wake-up (async `TcpStream` round trips).
+- `NetworkThreadTest` also checks the fair lock's turn-taking and the executor's wake-up (async `TcpStream` round trips). It also has two
+  512 KiB TCP flows into a machine whose interface has two receive queues: each flow lands on its own queue, both arrive intact, and both
+  queues are handled at the same moment. That check fails if receiving takes a stack-wide lock. `PciNicTest` checks that the 82574's
+  `receive_frame_from()` gives each frame from the queue RSS put it on.
 - `NetworkThreadTest`, with real threads (`HostThreads.cpp`) under ThreadSanitizer, runs two `NetworkStackSet`s with service threads, joined by a
   wire whose interfaces interrupt. It checks:
   - Six connections echoing 96 KiB at once, a thread on each side.
@@ -102,8 +131,15 @@ The protocol details (IPv4/IPv6, TCP, UDP, DNS, offloads) are in the headers; th
 
 ## Not done
 
-- **One lock per stack**, not per socket or per receive queue, and a multi-queue interface's receive queues (RSS) are handled by that stack's
-  one thread. Changing either means making socket lookup, ARP/neighbour state, the TCP manager and every socket safe on their own.
+- **One socket, one thread at a time.** A connection's segments, its timers and its application calls are serialized by its lock. This is
+  the unit of parallelism; there is no finer split within a connection.
+- **RSS steering in the drivers** comes from the hardware's indirection table, set up once. Nothing moves a flow to the core its
+  application runs on (no aRFS), and the queues' threads are not pinned to cores.
+- **Shared per-frame work.** The IP lock is taken for a moment per received frame (to look at the addresses) and per sent packet.
+  Transmitting is serialized, since one transmit ring is shared. Both are short, but a read-mostly copy of the addresses (RCU) would take
+  that lock off the receive path.
+- **The socket tables are lists**, searched linearly under their lock. That is fine for the connection counts this OS sees; a hash table
+  would be needed for many thousands.
 - **CoDel's precision:** it works at the clock's millisecond, so its 5 ms target is coarse.
 - **TCP:** no timestamps (RFC 7323), no window scaling (the window stays within 16 KiB), and no RACK.
 - **Pacing** only applies on paths whose round trip is at least a millisecond.

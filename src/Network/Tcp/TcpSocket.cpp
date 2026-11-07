@@ -56,12 +56,17 @@ TcpSocket::~TcpSocket() {
 // ------------------------------------------------------------------ user API
 
 bool TcpSocket::connect_ip(const IpAddress& address, uint16_t port) {
-  StackLock guard(ip_);
+  kernel::ScopedRecursiveMutex guard(lock_);
   if (state_ != TcpState::Closed || failed_ || port == 0 || ip_.source_for_ip(address).is_unspecified()) return false;
   remote_ = address;
   remote_port_ = port;
-  prepare_to_connect(manager_.allocate_port(), manager_.next_initial_sequence());
-  if (failed_) return false;
+  const uint16_t local = manager_.claim_connection(this, address, port);   // (from now on its segments find it)
+  if (local == 0) return false;
+  prepare_to_connect(local, manager_.next_initial_sequence());
+  if (failed_) {
+    manager_.release(this);
+    return false;
+  }
   enter(TcpState::SynSent);
   send_segment(tcp_flags::kSyn | tcp_flags::kEce | tcp_flags::kCwr, iss_, ConstByteView(), true);   // (offers ECN, RFC 3168 6.1.1, and SACK)
   arm_timer();
@@ -79,8 +84,8 @@ void TcpSocket::prepare_to_connect(uint16_t local_port, uint32_t initial_sequenc
 }
 
 bool TcpSocket::listen_families(uint16_t port, IpFamilies families) {
-  StackLock guard(ip_);
-  if (state_ != TcpState::Closed || failed_ || port == 0 || manager_.listening_on(port, families)) return false;
+  kernel::ScopedRecursiveMutex guard(lock_);
+  if (state_ != TcpState::Closed || failed_ || port == 0 || !manager_.claim_listener(this, port, families)) return false;
   local_port_ = port;
   listen_families_ = families;
   enter(TcpState::Listen);
@@ -88,15 +93,17 @@ bool TcpSocket::listen_families(uint16_t port, IpFamilies families) {
 }
 
 SharedPointer<ITcpSocket> TcpSocket::accept() {
-  StackLock guard(ip_);
-  if (state_ != TcpState::Listen || accept_queue_.empty()) return SharedPointer<ITcpSocket>();
+  kernel::ScopedRecursiveMutex guard(lock_);
+  if (state_ != TcpState::Listen) return SharedPointer<ITcpSocket>();
+  kernel::ScopedMutex queue(accept_lock_);
+  if (accept_queue_.empty()) return SharedPointer<ITcpSocket>();
   SharedPointer<TcpSocket> child = accept_queue_[0];
   accept_queue_.remove_at(0);
   return SharedPointer<ITcpSocket>(child);
 }
 
 uint32_t TcpSocket::send(ConstByteView data) {
-  StackLock guard(ip_);
+  kernel::ScopedRecursiveMutex guard(lock_);
   const bool can_send = state_ == TcpState::Established || state_ == TcpState::CloseWait ||
                         state_ == TcpState::SynSent || state_ == TcpState::SynReceived;
   if (!can_send || close_requested_) return 0;
@@ -106,7 +113,7 @@ uint32_t TcpSocket::send(ConstByteView data) {
 }
 
 uint32_t TcpSocket::receive(ByteView buffer) {
-  StackLock guard(ip_);
+  kernel::ScopedRecursiveMutex guard(lock_);
   const uint32_t n = receive_buffer_.read(buffer);
   // The sender may be waiting on a closed window: tell it once there is room again.
   if (n && last_advertised_window_ < our_mss() && advertised_window() >= our_mss() &&
@@ -116,7 +123,7 @@ uint32_t TcpSocket::receive(ByteView buffer) {
 }
 
 void TcpSocket::close() {
-  StackLock guard(ip_);
+  kernel::ScopedRecursiveMutex guard(lock_);
   switch (state_) {
     case TcpState::Listen:
       enter(TcpState::Closed);
@@ -138,7 +145,7 @@ void TcpSocket::close() {
 }
 
 void TcpSocket::abort() {
-  StackLock guard(ip_);
+  kernel::ScopedRecursiveMutex guard(lock_);
   if (state_ == TcpState::Listen) {
     close();
     return;
@@ -152,13 +159,56 @@ void TcpSocket::abort() {
   enter(TcpState::Closed);
 }
 
+// The connections that were established but never accepted are reset. (Taken out of the queue under its lock, reset with it let go: each
+// takes its own lock, which may not be taken while the accept lock is held.)
 void TcpSocket::drop_pending_connections() {
-  while (!accept_queue_.empty()) {
-    accept_queue_[0]->listener_ = nullptr;
-    accept_queue_[0]->abort();
-    accept_queue_.remove_at(0);
+  List<SharedPointer<TcpSocket>> pending(allocator_);
+  {
+    kernel::ScopedMutex queue(accept_lock_);
+    for (SharedPointer<TcpSocket>& child : accept_queue_) pending.push_back(child);
+    accept_queue_.clear();
+    embryos_ = 0;
   }
-  embryos_ = 0;
+  for (SharedPointer<TcpSocket>& child : pending) child->abort();
+}
+
+void TcpSocket::add_embryo() {
+  kernel::ScopedMutex queue(accept_lock_);
+  ++embryos_;
+}
+
+void TcpSocket::child_finished_handshake() {
+  kernel::ScopedMutex queue(accept_lock_);
+  if (embryos_) --embryos_;
+}
+
+void TcpSocket::child_established(const SharedPointer<TcpSocket>& child) {
+  kernel::ScopedMutex queue(accept_lock_);
+  if (embryos_) --embryos_;
+  accept_queue_.push_back(child);
+}
+
+uint32_t TcpSocket::embryo_count() const {
+  kernel::ScopedMutex queue(accept_lock_);
+  return embryos_;
+}
+
+uint32_t TcpSocket::accepted_waiting() const {
+  kernel::ScopedMutex queue(accept_lock_);
+  return static_cast<uint32_t>(accept_queue_.count());
+}
+
+void TcpSocket::leave_listener(TcpSocket* listener) {
+  kernel::ScopedRecursiveMutex guard(lock_);
+  if (listener_ != listener) return;
+  listener_ = nullptr;
+  abort();
+}
+
+void TcpSocket::close_if_abandoned() {
+  kernel::ScopedRecursiveMutex guard(lock_);
+  if (listener_) return;   // (a connection its listener has not handed over yet: nobody but the table holds it, and that is fine)
+  if (state_ == TcpState::Listen || state_ == TcpState::SynSent || state_ == TcpState::Established || state_ == TcpState::CloseWait) close();
 }
 
 // ------------------------------------------------------------------ sending
@@ -372,7 +422,7 @@ void TcpSocket::output() {
     const uint32_t restart = initial_window();
     if (cwnd_ > restart) cwnd_ = restart;
   }
-  paced_out_ = false;
+  __atomic_store_n(&paced_out_, false, __ATOMIC_RELAXED);
   // In loss recovery with SACK the holes go first (only they: what the peer holds is not sent again).
   if (sack_recovery()) retransmit_holes(mss);
   uint32_t allowance = pacing_allowance(now);
@@ -392,7 +442,7 @@ void TcpSocket::output() {
     if (ip_.queued_for(remote_, local_port_, remote_port_) >= kMaxQueuedFrames) break;   // its frames wait for the interface: hold back
     if (n > allowance) {   // the pacing rate allows less now: whole segments of it, or wait (on_timer goes on)
       if (allowance < mss && allowance < unsent) {
-        paced_out_ = true;
+        __atomic_store_n(&paced_out_, true, __ATOMIC_RELAXED);
         break;
       }
       n = allowance > mss ? allowance - allowance % mss : allowance;
@@ -453,6 +503,7 @@ void TcpSocket::enter(TcpState state) {
     timer_deadline_ = 0;
   } else if (state == TcpState::Closed) {
     timer_deadline_ = 0;
+    manager_.release(this);   // (no segment finds it any more; its port is free)
   }
 }
 
@@ -465,15 +516,16 @@ void TcpSocket::fail() {
   enter(TcpState::Closed);
 }
 
-void TcpSocket::accept_syn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port,
+bool TcpSocket::accept_syn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port,
                            const TcpSegment& syn, uint32_t initial_sequence) {
+  kernel::ScopedRecursiveMutex guard(lock_);
   listener_ = listener;
   remote_ = remote_address;
   remote_port_ = remote_port;
   prepare_to_connect(local_port, initial_sequence);
   if (failed_) {
     listener_ = nullptr;
-    return;
+    return false;
   }
   irs_ = syn.sequence;
   rcv_nxt_ = irs_ + 1;
@@ -486,9 +538,26 @@ void TcpSocket::accept_syn(TcpSocket* listener, const IpAddress& remote_address,
   enter(TcpState::SynReceived);
   send_segment(tcp_flags::kSyn | tcp_flags::kAck | (ecn_ok_ ? tcp_flags::kEce : 0), iss_, ConstByteView(), true);
   arm_timer();
+  listener->add_embryo();
+  return true;
 }
 
-void TcpSocket::on_segment(const TcpSegment& s) {
+void TcpSocket::on_segment(const TcpSegment& s, const SharedPointer<TcpSocket>& self) {
+  using namespace tcp_flags;
+  kernel::ScopedRecursiveMutex guard(lock_);
+  handle_segment(s);
+  // A connection its listener spawned has completed its handshake: it goes to the listener's accept queue (under its accept lock - a leaf,
+  // allowed with this lock held; the listener's own lock is not taken).
+  if (established_event_) {
+    established_event_ = false;
+    if (listener_) {
+      listener_->child_established(self);
+      listener_ = nullptr;
+    }
+  }
+}
+
+void TcpSocket::handle_segment(const TcpSegment& s) {
   using namespace tcp_flags;
   if (state_ == TcpState::Closed || state_ == TcpState::Listen) return;
 
@@ -763,6 +832,7 @@ void TcpSocket::sample_rtt(uint32_t acknowledged_up_to) {
 }
 
 void TcpSocket::on_timer(uint64_t now) {
+  kernel::ScopedRecursiveMutex guard(lock_);
   if (state_ == TcpState::TimeWait) {
     if (now >= time_wait_deadline_) enter(TcpState::Closed);
     return;

@@ -23,32 +23,23 @@ namespace network {
 
 SharedPointer<TcpSocket> TcpManager::create() {
   SharedPointer<TcpSocket> socket = SharedPointer<TcpSocket>::make(allocator_, ip_, *this, allocator_);
-  if (!socket || !sockets_.push_back(socket)) return SharedPointer<TcpSocket>();
+  if (!socket) return SharedPointer<TcpSocket>();
+  Entry entry;
+  entry.socket = socket;
+  kernel::ScopedMutex guard(table_mutex_);
+  if (!sockets_.push_back(entry)) return SharedPointer<TcpSocket>();
   return socket;
 }
 
-SharedPointer<TcpSocket> TcpManager::spawn(TcpSocket* listener, const IpAddress& remote_address, uint16_t remote_port,
-                                           uint16_t local_port, const TcpSegment& syn) {
-  SharedPointer<TcpSocket> child = create();
-  if (!child) return SharedPointer<TcpSocket>();
-  child->accept_syn(listener, remote_address, remote_port, local_port, syn, next_initial_sequence());
-  if (child->is_dead()) return SharedPointer<TcpSocket>();  // out of memory: reaped later
-  listener->add_embryo();
-  return child;
-}
-
-bool TcpManager::listening_on(uint16_t port, IpFamilies families) const {
-  const uint64_t count = sockets_.count();
-  for (uint64_t i = count; i > 0; --i) {
-    const SharedPointer<TcpSocket>& s = sockets_[i - 1];
-    if (s->state() == TcpState::Listen && s->local_port() == port && families_overlap(s->listen_families(), families)) return true;
-  }
-  return false;
+TcpManager::Entry* TcpManager::entry_of(TcpSocket* socket) {
+  for (Entry& e : sockets_)
+    if (e.socket.get() == socket) return &e;
+  return nullptr;
 }
 
 bool TcpManager::port_in_use(uint16_t port) const {
-  for (const SharedPointer<TcpSocket>& s : sockets_)
-    if (s->state() != TcpState::Closed && s->local_port() == port) return true;
+  for (const Entry& e : sockets_)
+    if (e.kind != Kind::None && e.local_port == port) return true;
   return false;
 }
 
@@ -58,22 +49,81 @@ uint16_t TcpManager::allocate_port() {
     next_port_ = next_port_ == 65535 ? 49152 : next_port_ + 1;
     if (!port_in_use(candidate)) return candidate;
   }
-  return next_port_;
+  return 0;
+}
+
+uint16_t TcpManager::claim_connection(TcpSocket* socket, const IpAddress& remote, uint16_t remote_port) {
+  kernel::ScopedMutex guard(table_mutex_);
+  Entry* e = entry_of(socket);
+  const uint16_t port = e ? allocate_port() : 0;
+  if (port == 0) return 0;
+  e->kind = Kind::Connection;
+  e->local_port = port;
+  e->remote = remote;
+  e->remote_port = remote_port;
+  return port;
+}
+
+bool TcpManager::claim_listener(TcpSocket* socket, uint16_t port, IpFamilies families) {
+  kernel::ScopedMutex guard(table_mutex_);
+  Entry* mine = entry_of(socket);
+  if (!mine) return false;
+  for (const Entry& e : sockets_)
+    if (e.kind == Kind::Listener && e.local_port == port && families_overlap(e.families, families)) return false;
+  mine->kind = Kind::Listener;
+  mine->local_port = port;
+  mine->families = families;
+  return true;
+}
+
+void TcpManager::release(TcpSocket* socket) {
+  kernel::ScopedMutex guard(table_mutex_);
+  if (Entry* e = entry_of(socket)) e->kind = Kind::None;
+}
+
+bool TcpManager::snapshot(List<SharedPointer<TcpSocket>>* out) const {
+  kernel::ScopedMutex guard(table_mutex_);
+  if (!out->reserve(sockets_.count())) return false;
+  for (const Entry& e : sockets_) out->push_back(e.socket);
+  return true;
+}
+
+bool TcpManager::pacing() const {
+  kernel::ScopedMutex guard(table_mutex_);
+  for (const Entry& e : sockets_)
+    if (e.socket->pacing_paused()) return true;   // (an atomic flag: read without the socket's lock)
+  return false;
 }
 
 uint32_t TcpManager::next_initial_sequence() {
   // RFC 793 suggests a counter ticking every 4 microseconds; milliseconds times
   // 250 is the same thing, plus a bump so two connections in one tick differ.
-  iss_counter_ += 64000;
-  return static_cast<uint32_t>(ip_.now_ms() * 250) + iss_counter_;
+  const uint32_t bump = __atomic_add_fetch(&iss_counter_, 64000u, __ATOMIC_RELAXED);
+  return static_cast<uint32_t>(ip_.now_ms() * 250) + bump;
 }
 
 void TcpManager::detach_children(TcpSocket* listener) {
-  for (SharedPointer<TcpSocket>& s : sockets_) {
-    if (s->listener() != listener) continue;
-    s->detach_from_listener();
-    s->abort();
+  List<SharedPointer<TcpSocket>> all(allocator_);
+  snapshot(&all);
+  for (SharedPointer<TcpSocket>& s : all) s->leave_listener(listener);   // (each takes its own lock: this listener's is held, the order allows it)
+}
+
+// A connection for a SYN that arrived at `listener` (whose lock the caller holds): set up under its own lock, then put in the table where its
+// next segment finds it.
+void TcpManager::spawn(TcpSocket& listener, const IpAddress& remote_address, uint16_t remote_port, uint16_t local_port, const TcpSegment& syn) {
+  SharedPointer<TcpSocket> child = SharedPointer<TcpSocket>::make(allocator_, ip_, *this, allocator_);
+  if (!child) return;
+  Entry entry;
+  entry.socket = child;
+  entry.kind = Kind::Connection;
+  entry.local_port = local_port;
+  entry.remote = remote_address;
+  entry.remote_port = remote_port;
+  {
+    kernel::ScopedMutex guard(table_mutex_);
+    if (!sockets_.push_back(entry)) return;
   }
+  if (!child->accept_syn(&listener, remote_address, remote_port, local_port, syn, next_initial_sequence())) release(child.get());  // (out of memory)
 }
 
 void TcpManager::send_reset(const IpAddress& to, uint16_t to_port, uint16_t from_port, const TcpSegment& cause) {
@@ -147,27 +197,30 @@ void TcpManager::handle(const IpAddress& source, const IpAddress& destination, C
   s.data = segment.dropped(header);
   s.congestion_experienced = ecn == kEcnCe;
 
-  // An existing connection first, then a listener.
-  for (SharedPointer<TcpSocket>& socket : sockets_) {
-    if (!socket->matches(source, source_port, destination_port)) continue;
-    socket->on_segment(s);
-    if (socket->take_established_event()) {
-      TcpSocket* listener = socket->listener();
-      if (listener) {
-        listener->child_finished_handshake();
-        listener->enqueue_accepted(socket);
-        socket->detach_from_listener();
+  // An existing connection first, then a listener: found in the table (by the published keys), handled with the table let go.
+  SharedPointer<TcpSocket> connection, listener;
+  {
+    kernel::ScopedMutex guard(table_mutex_);
+    for (const Entry& e : sockets_) {
+      if (e.kind == Kind::Connection && e.local_port == destination_port && e.remote_port == source_port && e.remote == source) {
+        connection = e.socket;
+        break;
       }
+      if (!listener && e.kind == Kind::Listener && e.local_port == destination_port && families_take(e.families, source.v6)) listener = e.socket;
     }
+  }
+  if (connection) {
+    connection->on_segment(s, connection);
     return;
   }
-  for (SharedPointer<TcpSocket>& socket : sockets_) {
-    if (socket->state() != TcpState::Listen || socket->local_port() != destination_port || !families_take(socket->listen_families(), source.v6)) continue;
+  if (listener) {
     if (s.flags & tcp_flags::kRst) return;
     if ((s.flags & tcp_flags::kSyn) && !(s.flags & tcp_flags::kAck)) {
-      // A full backlog drops the SYN; the client's retransmission tries again later.
-      if (socket->embryo_count() + socket->accepted_waiting() < TcpSocket::kBacklog)
-        spawn(socket.get(), source, source_port, destination_port, s);
+      // Under the listener's lock: it cannot close meanwhile and miss the new connection when it lets its connections go. A full backlog drops
+      // the SYN; the client's retransmission tries again later.
+      kernel::ScopedRecursiveMutex hold(listener->lock());
+      if (listener->state() == TcpState::Listen && listener->embryo_count() + listener->accepted_waiting() < TcpSocket::kBacklog)
+        spawn(*listener, source, source_port, destination_port, s);
       return;
     }
     send_reset(source, source_port, destination_port, s);
@@ -178,27 +231,19 @@ void TcpManager::handle(const IpAddress& source, const IpAddress& destination, C
 
 void TcpManager::poll() {
   const uint64_t now = ip_.now_ms();
-  const uint64_t count = sockets_.count();
-  for (uint64_t i = 0; i < count; ++i) sockets_[i]->on_timer(now);
+  List<SharedPointer<TcpSocket>> all(allocator_);
+  snapshot(&all);
+  for (SharedPointer<TcpSocket>& s : all) s->on_timer(now);
+  // A connection nobody but the table holds any more (this pass's copy aside: use_count 2) is closed - the application let go of it.
+  for (SharedPointer<TcpSocket>& s : all)
+    if (s.use_count() == 2) s->close_if_abandoned();
+  all.clear();
 
-  // Clean up. A connection nobody holds any more (use_count 1 = only this list)
-  // is closed; one that is closed and unreferenced is forgotten.
-  for (uint64_t i = count; i > 0; --i) {
-    SharedPointer<TcpSocket>& s = sockets_[i - 1];
-    if (s.use_count() != 1) continue;
-    switch (s->state()) {
-      case TcpState::Closed:
-        sockets_.remove_at(i - 1);
-        break;
-      case TcpState::Listen:
-      case TcpState::SynSent:
-      case TcpState::Established:
-      case TcpState::CloseWait:
-        if (!s->listener()) s->close();  // the application let go of a live socket
-        break;
-      default:
-        break;
-    }
+  // Forget sockets that are closed and that nobody holds (use_count 1 = only the table).
+  kernel::ScopedMutex guard(table_mutex_);
+  for (uint64_t i = sockets_.count(); i > 0; --i) {
+    const Entry& e = sockets_[i - 1];
+    if (e.kind == Kind::None && e.socket.use_count() == 1) sockets_.remove_at(i - 1);
   }
 }
 

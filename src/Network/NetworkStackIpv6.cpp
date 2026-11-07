@@ -72,7 +72,7 @@ bool link_address_option(ConstByteView body, hardware::MacAddress* mac) {
 // ------------------------------------------------------------------ addresses and the state of autoconfiguration
 
 Ipv6Configuration NetworkStack::configuration6() const {
-  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   return config6_;
 }
 
@@ -178,7 +178,6 @@ void NetworkStack::service_ipv6() {
 // ------------------------------------------------------------------ receiving
 
 void NetworkStack::handle_ipv6(ConstByteView packet, bool looped, const hardware::ReceivedFrame& checks) {
-  if (!ipv6_started_ && !looped) return;
   ByteReader in(packet);
   const uint32_t first = in.be32();
   const uint16_t payload_length = in.be16();
@@ -188,7 +187,14 @@ void NetworkStack::handle_ipv6(ConstByteView packet, bool looped, const hardware
   const Ipv6Address destination = Ipv6Address::read(in);
   if (!in.ok() || (first >> 28) != 6 || payload_length > packet.size() - kIpv6HeaderSize) return;  // (Ethernet padding makes the frame longer)
   if (source.is_multicast()) return;
-  if (!looped && (source.is_loopback() || destination.is_loopback() || !accepts_destination6(destination))) return;
+  bool accepted, mine;
+  {
+    kernel::ScopedRecursiveMutex ip(ip_lock_);   // (the addresses looked at; let go before the packet goes to a socket)
+    if (!ipv6_started_ && !looped) return;
+    accepted = accepts_destination6(destination);
+    mine = is_my_ipv6(destination);
+  }
+  if (!looped && (source.is_loopback() || destination.is_loopback() || !accepted)) return;
   ConstByteView payload = packet.subview(kIpv6HeaderSize, payload_length);
 
   // Extension headers: hop-by-hop and destination options are skipped (no option here needs acting on), a routing header only when it has
@@ -208,11 +214,12 @@ void NetworkStack::handle_ipv6(ConstByteView packet, bool looped, const hardware
   } else if (next == kProtocolUdp) {
     udp_.handle(from, to, payload, checks.transport_checksum_good);
   } else if (next == kProtocolTcp) {
-    if (looped || (!destination.is_multicast() && is_my_ipv6(destination))) tcp_.handle(from, to, payload, checks.transport_checksum_good, static_cast<uint8_t>((first >> 20) & 3));
+    if (looped || (!destination.is_multicast() && mine)) tcp_.handle(from, to, payload, checks.transport_checksum_good, static_cast<uint8_t>((first >> 20) & 3));
   }
 }
 
 void NetworkStack::handle_icmpv6(const Ipv6Address& source, const Ipv6Address& destination, uint8_t hop_limit, ConstByteView icmp, bool looped) {
+  kernel::ScopedRecursiveMutex ip(ip_lock_);   // (echo, the ping, and neighbor discovery: all IP-layer state)
   if (icmp.size() < 4) return;
   if (checksum_finish(checksum_add(pseudo_header_sum(source, destination, kProtocolIcmpv6, static_cast<uint32_t>(icmp.size())), icmp)) != 0) return;
   const uint8_t type = icmp[0], code = icmp[1];
@@ -431,7 +438,7 @@ void NetworkStack::service_pending6() {
 
 bool NetworkStack::send_ip6(const Ipv6Address& source, const Ipv6Address& destination, uint8_t next_header, ConstByteView payload, uint8_t hop_limit,
                             bool router_alert) {
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   const uint32_t extension = router_alert ? 8 : 0;
   if (payload.size() > kMaxIpv6Payload - extension) return false;
   uint8_t storage[kMtu];
@@ -609,7 +616,7 @@ bool NetworkStack::resolve_ip(StringView name, uint32_t timeout_ms, IpAddress* a
   };
   bool reachable6;
   {
-    kernel::ScopedRecursiveMutex guard(mutex_);
+    kernel::ScopedRecursiveMutex guard(ip_lock_);
     reachable6 = config6_.global_ready && !config6_.router.is_unspecified();
   }
   Ipv6Address literal;
@@ -629,7 +636,7 @@ bool NetworkStack::ping6(const Ipv6Address& address, uint32_t timeout_ms, uint32
   bool ok;
   uint64_t deadline;
   {
-    kernel::ScopedRecursiveMutex guard(mutex_);
+    kernel::ScopedRecursiveMutex guard(ip_lock_);
     const Ipv6Address source = source_for6(address);
     if (source.is_unspecified()) return false;
     ByteWriter request{ByteView(request_storage)};
@@ -649,13 +656,13 @@ bool NetworkStack::ping6(const Ipv6Address& address, uint32_t timeout_ms, uint32
   }
   for (;;) {
     {
-      kernel::ScopedRecursiveMutex guard(mutex_);
+      kernel::ScopedRecursiveMutex guard(ip_lock_);
       if (!ok || ping_answered_ || now_ms() >= deadline) break;
     }
     poll();
     kernel::sleep_us(200);
   }
-  kernel::ScopedRecursiveMutex guard(mutex_);
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
   ok = ok && ping_answered_;
   ping_active_ = false;
   ping_v6_ = false;

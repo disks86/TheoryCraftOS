@@ -48,7 +48,7 @@ class UdpSocket final : public IUdpSocket {
 
   // The UDP manager hands arriving datagrams in here.
   void deliver(const IpAddress& from_address, uint16_t from_port, ConstByteView data);
-  bool closed() const { return closed_; }
+  bool closed() const { return __atomic_load_n(&closed_, __ATOMIC_ACQUIRE); }   // (read by the manager without this socket's lock)
   IpFamilies families() const { return families_; }  // whose datagrams it takes
 
  private:
@@ -64,6 +64,9 @@ class UdpSocket final : public IUdpSocket {
   IpFamilies families_;
   bool closed_ = false;
   Queue<Datagram> queue_;
+  // Guards the queue (the port and families never change; closed_ is read atomically). Datagrams arrive from the stack's receive threads while
+  // the application reads: this lock, not the stack's, is what they share.
+  mutable kernel::RecursiveMutex lock_;
 };
 
 }  // namespace network

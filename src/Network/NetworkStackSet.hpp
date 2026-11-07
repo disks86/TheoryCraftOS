@@ -56,9 +56,10 @@ class IStackProvider {
 //   stacks.resolve("example.com", 3000, &address);   // asks every network
 //
 // Every stack is thread-safe. poll() may be called from any thread, or
-// start_service() starts a thread per stack that polls it, so that application
-// threads only ever wait for their sockets (wait_for_progress() wakes them as soon
-// as a poll did something). Each stack's thread runs on its own: interfaces are
+// start_service() starts a thread per receive queue of each stack (an interface
+// with RSS has several), so that application threads only ever wait for their
+// sockets (wait_for_progress() wakes them as soon as a poll did something). The
+// threads run on their own: interfaces, and the queues of one interface, are
 // serviced concurrently, on different cores, and a busy one does not delay another.
 class NetworkStackSet final : public IStackProvider {
  public:
@@ -76,7 +77,7 @@ class NetworkStackSet final : public IStackProvider {
   NetworkStackSet(const NetworkStackSet&) = delete;
   NetworkStackSet& operator=(const NetworkStackSet&) = delete;
 
-  // Runs a thread per stack that keeps it polled: woken by its interface's interrupts
+  // Runs a thread per receive queue of each stack that keeps it polled (the first also runs the stack's control poll): woken by its interface's interrupts
   // where it has them (and every 5 ms for timers), else about every 500 microseconds;
   // at once by the stack itself when it has work (a packet over the loopback, frames
   // waiting for room in the interface); immediately again while frames keep coming.
@@ -103,13 +104,17 @@ class NetworkStackSet final : public IStackProvider {
   bool wait_for_progress(uint64_t seen, uint64_t timeout_us) override;
 
  private:
-  // One stack's service thread, and what wakes it.
+  // One receive queue's service thread (queue 0's also runs the stack's control poll), and what wakes it. An interface's interrupt wakes all of
+  // its workers (`next`: the interface's next one); the stack's own wake hook (loopback, queued frames) the control one.
   struct Worker {
     NetworkStackSet* set = nullptr;
     NetworkStack* stack = nullptr;
+    uint32_t queue = 0;
+    Worker* next = nullptr;
     kernel::Event activity{true};
     kernel::Thread* thread = nullptr;
   };
+  static void on_interrupt(void* first_worker);
   hardware::IClock& clock_;
   allocators::IAllocator& allocator_;
   static void service_main(void* worker);
@@ -118,7 +123,7 @@ class NetworkStackSet final : public IStackProvider {
   static constexpr uint64_t kPolledIdleUs = 500, kInterruptIdleUs = 5000;
 
   List<UniquePointer<NetworkStack>> stacks_;
-  List<UniquePointer<Worker>> workers_;   // (one per stack, in the same order)
+  List<UniquePointer<Worker>> workers_;   // (one per receive queue of each stack)
   bool service_ = false;
   volatile bool stop_ = false;
   uint64_t progress_ = 0;

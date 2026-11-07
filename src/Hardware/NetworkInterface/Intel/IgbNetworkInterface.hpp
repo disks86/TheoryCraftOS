@@ -82,6 +82,8 @@ class IgbNetworkInterface final : public INetworkInterface {
     return NetworkOffloads{true, true, kMaxSegmentation, static_cast<uint16_t>(msix_vectors_ ? queues_ : 1)};
   }
   bool receive_frame(ByteView buffer, ReceivedFrame* frame) override;
+  uint32_t receive_queue_count() const override { return queues_; }
+  bool receive_frame_from(uint32_t queue, ByteView buffer, ReceivedFrame* frame) override;
   bool transmit_frame(ConstByteView frame, TransmitChecksum checksum) override;
   bool transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) override;
   bool enable_interrupts(NetworkWake wake, void* context) override;
@@ -131,6 +133,7 @@ class IgbNetworkInterface final : public INetworkInterface {
     ByteView buffers;
     uint32_t next = 0;
     uint64_t frames = 0;
+    kernel::Mutex lock;   // the queue's own: its ring is read by the thread handling it (see receive_frame_from), not under mutex_
   };
 
   INicRegisters& regs() const { return device_->registers(); }
