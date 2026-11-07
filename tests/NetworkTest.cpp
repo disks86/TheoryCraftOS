@@ -467,7 +467,8 @@ int main() {
     assert(g_live == 0);
   }
   { // ---- TCP under 8% loss
-    Lan lan; lan.configure_static(); lan.wire.loss_percent = 8; assert(echo_transfer(lan, 150000, 9000)); assert(lan.wire.dropped > 50);
+    Lan lan; lan.configure_static(); lan.wire.loss_percent = 8; assert(echo_transfer(lan, 150000, 9000));
+    assert(lan.wire.dropped * 100 >= lan.wire.frames * 5);   // (the loss really was applied; with SACK fewer frames are retransmitted, so the count is lower than it was)
   }
   { // ---- TCP under duplication and reordering
     Lan lan; lan.configure_static(); lan.wire.duplicate_percent = 10; lan.wire.reorder_percent = 10; assert(echo_transfer(lan, 100000, 9100));

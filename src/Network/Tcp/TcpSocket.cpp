@@ -48,7 +48,10 @@ constexpr uint32_t kMinRtoMs = 200, kMaxRtoMs = 8000, kInitialRtoMs = 1000;
 TcpSocket::TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& allocator)
     : ip_(ip), manager_(manager), allocator_(allocator), send_buffer_(allocator), receive_buffer_(allocator), accept_queue_(allocator) {}
 
-TcpSocket::~TcpSocket() { release_view(allocator_, burst_); }
+TcpSocket::~TcpSocket() {
+  release_view(allocator_, burst_);
+  release_view(allocator_, ooo_storage_);
+}
 
 // ------------------------------------------------------------------ user API
 
@@ -60,7 +63,7 @@ bool TcpSocket::connect_ip(const IpAddress& address, uint16_t port) {
   prepare_to_connect(manager_.allocate_port(), manager_.next_initial_sequence());
   if (failed_) return false;
   enter(TcpState::SynSent);
-  send_segment(tcp_flags::kSyn, iss_, ConstByteView(), true);
+  send_segment(tcp_flags::kSyn | tcp_flags::kEce | tcp_flags::kCwr, iss_, ConstByteView(), true);   // (offers ECN, RFC 3168 6.1.1, and SACK)
   arm_timer();
   return true;
 }
@@ -166,28 +169,75 @@ uint32_t TcpSocket::advertised_window() const {
 }
 
 void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView data, bool with_mss) {
+  using namespace tcp_flags;
+  // Options, a multiple of four bytes: the MSS on a SYN (with SACK-permitted when this side offers it or answers the peer's offer), else
+  // SACK blocks when this side holds data beyond a gap - as many as the packet has room for, the latest segment's range first.
+  uint8_t options[40];
+  ByteWriter opt{ByteView(options)};
+  if (with_mss) {
+    opt.u8(2);
+    opt.u8(4);
+    opt.be16(our_mss());
+    if (!(flags & kAck) || sack_ok_) {
+      opt.u8(1);
+      opt.u8(1);
+      opt.u8(4);
+      opt.u8(2);
+    }
+  } else if (sack_ok_ && !held_.empty() && (flags & kAck)) {
+    const uint32_t room = ip_.max_payload_for(remote_) - 20 - static_cast<uint32_t>(data.size());
+    uint32_t blocks = room >= 4 ? (room - 4) / 8 : 0;
+    if (blocks > 4) blocks = 4;
+    if (blocks > held_.count()) blocks = held_.count();
+    if (blocks) {
+      opt.u8(1);
+      opt.u8(1);
+      opt.u8(5);
+      opt.u8(static_cast<uint8_t>(2 + 8 * blocks));
+      const SequenceRanges::Range* latest = held_.find(latest_held_);
+      uint32_t written = 0;
+      if (latest) {
+        opt.be32(latest->start);
+        opt.be32(latest->end);
+        ++written;
+      }
+      for (uint32_t r = 0; r < held_.count() && written < blocks; ++r) {
+        if (&held_.at(r) == latest) continue;
+        opt.be32(held_.at(r).start);
+        opt.be32(held_.at(r).end);
+        ++written;
+      }
+    }
+  }
+  if (!opt.ok()) return;
+  const ConstByteView option_bytes = opt.written();
+  const uint32_t header = 20 + static_cast<uint32_t>(option_bytes.size());
+  // ECN: new data is ECN-capable (ECT(0)); retransmissions, pure ACKs and control segments are not (RFC 3168 6.1.4, 6.1.5).
+  const bool fresh_data = !data.empty() && !seq_lt(sequence, snd_max_);
+  if (ece_pending_ && (flags & kAck) && !(flags & kSyn)) flags |= kEce;
+  if (cwr_pending_ && fresh_data) {
+    flags |= kCwr;
+    cwr_pending_ = false;
+  }
+  const uint8_t ecn = ecn_ok_ && fresh_data ? kEcnEct0 : 0;
+
   uint8_t storage[kMaxIpPayload];
   ByteWriter out{ByteView(storage)};
-  const uint32_t header = with_mss ? 24 : 20;
   last_advertised_window_ = advertised_window();
   out.be16(local_port_);
   out.be16(remote_port_);
   out.be32(sequence);
-  out.be32((flags & tcp_flags::kAck) ? rcv_nxt_ : 0);
+  out.be32((flags & kAck) ? rcv_nxt_ : 0);
   out.u8(static_cast<uint8_t>((header / 4) << 4));
   out.u8(flags);
   out.be16(static_cast<uint16_t>(last_advertised_window_));
   out.be16(0);  // checksum: the IP layer fills it in
   out.be16(0);  // urgent pointer (unused)
-  if (with_mss) {  // option: kind 2, length 4, our maximum segment size
-    out.u8(2);
-    out.u8(4);
-    out.be16(our_mss());
-  }
+  out.bytes(option_bytes);
   out.bytes(data);
-  if (!out.ok()) return;  // payload larger than a packet: cannot happen, the sender chunks to the MSS
+  if (!out.ok()) return;  // payload larger than a packet: cannot happen, the sender chunks to the MSS (less the room options take)
 
-  ip_.send_ip_to(remote_, kProtocolTcp, out.written());  // a lost segment is retransmitted
+  ip_.send_ip_to(remote_, kProtocolTcp, out.written(), ecn);  // a lost segment is retransmitted
 }
 
 bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, uint32_t length, uint16_t mss) {
@@ -199,6 +249,12 @@ bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, ui
   out.be16(remote_port_);
   out.be32(sequence);
   out.be32(rcv_nxt_);
+  const bool fresh_data = !seq_lt(sequence, snd_max_);
+  if (ece_pending_) flags |= tcp_flags::kEce;
+  if (cwr_pending_ && fresh_data) {
+    flags |= tcp_flags::kCwr;   // (the interface copies the header to every frame: harmless, the peer acts on the first)
+    cwr_pending_ = false;
+  }
   out.u8(5 << 4);
   out.u8(flags);
   out.be16(static_cast<uint16_t>(last_advertised_window_));
@@ -206,7 +262,7 @@ bool TcpSocket::send_burst(uint8_t flags, uint32_t sequence, uint32_t offset, ui
   out.be16(0);
   if (!out.ok()) return false;
   send_buffer_.peek(offset, burst_.subview(20, length));
-  return ip_.send_tcp_segmented(remote_, burst_.first(20 + length), mss);
+  return ip_.send_tcp_segmented(remote_, burst_.first(20 + length), mss, ecn_ok_ && fresh_data ? kEcnEct0 : 0);
 }
 
 // Sends whatever the peer's window and our send buffer allow, then the FIN if
@@ -236,6 +292,7 @@ void TcpSocket::grow_window(uint32_t acked) {
   if (in_recovery_) {
     if (!seq_ge(snd_una_, recover_)) return;   // a partial ACK: still recovering (go-back-N already resends the rest)
     in_recovery_ = false;
+    retransmitted_ = 0;
     cwnd_ = ssthresh_;                          // RFC 6582: the window after recovery
     return;
   }
@@ -249,6 +306,56 @@ void TcpSocket::grow_window(uint32_t acked) {
     }
   }
   if (cwnd_ > kMaxCongestionWindow) cwnd_ = kMaxCongestionWindow;
+}
+
+// The bytes in flight as the network sees them: in SACK recovery, those sent less those the peer holds and those taken as lost (below the
+// highest SACKed byte and not SACKed), plus what was retransmitted (RFC 6675's "pipe", by bytes); otherwise everything unacknowledged.
+uint32_t TcpSocket::pipe() const {
+  const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);
+  if (!sack_recovery() || sacked_.empty()) return in_flight;
+  const uint32_t sacked = sacked_.bytes();
+  const uint32_t below_highest = sacked_.highest(snd_una_) - snd_una_;
+  const uint32_t lost = below_highest > sacked ? below_highest - sacked : 0;
+  const uint64_t out = uint64_t{in_flight} + retransmitted_;
+  const uint64_t gone = uint64_t{sacked} + lost;
+  return out > gone ? static_cast<uint32_t>(out - gone) : 0;
+}
+
+// Retransmits the holes the scoreboard shows, a segment at a time, while the congestion window has room. True if any went.
+bool TcpSocket::retransmit_holes(uint32_t mss) {
+  bool any = false;
+  const uint32_t highest = sacked_.highest(snd_una_);
+  for (uint32_t guard = 0; guard < 64 && pipe() < cwnd_; ++guard) {
+    uint32_t from = seq_lt(retransmit_next_, snd_una_) ? snd_una_ : retransmit_next_;
+    uint32_t gap_start = 0, gap_end = 0;
+    if (!sacked_.next_gap(from, highest, &gap_start, &gap_end)) break;
+    uint32_t n = gap_end - gap_start;
+    if (n > mss) n = mss;
+    uint8_t chunk[kMaxIpPayload];
+    const ByteView payload = ByteView(chunk).first(n);
+    send_buffer_.peek(gap_start - snd_una_, payload);
+    send_segment(tcp_flags::kAck, gap_start, payload, false);
+    retransmit_next_ = gap_start + n;
+    retransmitted_ += n;
+    timing_ = false;   // (Karn)
+    any = true;
+  }
+  if (any && !timer_deadline_) arm_timer();
+  return any;
+}
+
+// What pacing lets out now (~0: no pacing - the round trip is shorter than the clock's millisecond, so there is nothing to spread). The rate
+// is twice the congestion window per smoothed round trip in slow start and 1.2 times it after; up to two milliseconds' worth (at least four
+// segments) may build up for a burst.
+uint32_t TcpSocket::pacing_allowance(uint64_t now) {
+  if (!have_rtt_ || srtt_ms_ == 0) return ~0u;
+  const uint64_t per_ms = (uint64_t{cwnd_} * (cwnd_ < ssthresh_ ? 10 : 6)) / (5 * uint64_t{srtt_ms_});
+  uint64_t cap = per_ms * 2;
+  if (cap < 4u * send_mss()) cap = 4u * send_mss();
+  if (now > paced_at_ms_) pacing_credit_ += per_ms * (now - paced_at_ms_);
+  paced_at_ms_ = now;
+  if (pacing_credit_ > cap) pacing_credit_ = cap;
+  return pacing_credit_ > 0xFFFFFFFEu ? 0xFFFFFFFEu : static_cast<uint32_t>(pacing_credit_);
 }
 
 void TcpSocket::output() {
@@ -265,16 +372,31 @@ void TcpSocket::output() {
     const uint32_t restart = initial_window();
     if (cwnd_ > restart) cwnd_ = restart;
   }
+  paced_out_ = false;
+  // In loss recovery with SACK the holes go first (only they: what the peer holds is not sent again).
+  if (sack_recovery()) retransmit_holes(mss);
+  uint32_t allowance = pacing_allowance(now);
   for (;;) {
     const uint32_t in_flight = snd_nxt_ - snd_una_ - (fin_sent_ ? 1 : 0);  // data only
     if (fin_sent_) break;  // nothing follows a FIN
     const uint32_t unsent = send_buffer_.size() > in_flight ? send_buffer_.size() - in_flight : 0;
-    const uint32_t limit = snd_wnd_ < cwnd_ ? snd_wnd_ : cwnd_;   // the receiver's window and the network's
+    // The receiver's window counts from snd_una_; the network's from what is really in flight (in SACK recovery: less what arrived or was lost).
+    const uint32_t pipe_now = pipe();
+    const uint32_t receiver_room = snd_wnd_ > in_flight ? snd_wnd_ - in_flight : 0;
+    const uint32_t network_room = cwnd_ > pipe_now ? cwnd_ - pipe_now : 0;
     // (a zero receive window is probed by on_timer; a congestion window smaller than a segment still lets one segment out)
-    const uint32_t window_room = limit > in_flight ? limit - in_flight : (in_flight == 0 && snd_wnd_ > 0 ? mss : 0);
+    uint32_t window_room = receiver_room < network_room ? receiver_room : network_room;
+    if (window_room == 0 && in_flight == 0 && snd_wnd_ > 0) window_room = mss;
     uint32_t n = unsent < window_room ? unsent : window_room;
     if (n == 0) break;
     if (ip_.queued_for(remote_, local_port_, remote_port_) >= kMaxQueuedFrames) break;   // its frames wait for the interface: hold back
+    if (n > allowance) {   // the pacing rate allows less now: whole segments of it, or wait (on_timer goes on)
+      if (allowance < mss && allowance < unsent) {
+        paced_out_ = true;
+        break;
+      }
+      n = allowance > mss ? allowance - allowance % mss : allowance;
+    }
     if (n > mss && burst > 20u + mss) {  // several segments' worth, cut by the interface
       if (n > burst - 20) n = burst - 20;
       if (n > kBufferSize) n = kBufferSize;
@@ -288,10 +410,14 @@ void TcpSocket::output() {
       const bool last = n == unsent;
       send_segment(tcp_flags::kAck | (last ? tcp_flags::kPsh : 0), snd_nxt_, payload, false);
     }
-    if (!timing_) {  // time this segment (Karn: never a retransmission, see rollback)
+    if (!timing_ && snd_nxt_ == snd_max_) {  // time this segment (Karn: never a retransmission - after a go-back-N, data below snd_max_ is one)
       timing_ = true;
       timed_sequence_ = snd_nxt_ + n;
       timed_at_ = ip_.now_ms();
+    }
+    if (allowance != ~0u) {
+      allowance -= n;
+      pacing_credit_ -= n;
     }
     advance_next(n);
     last_send_ms_ = now;
@@ -352,11 +478,13 @@ void TcpSocket::accept_syn(TcpSocket* listener, const IpAddress& remote_address,
   irs_ = syn.sequence;
   rcv_nxt_ = irs_ + 1;
   if (syn.mss) peer_mss_ = syn.mss;
+  sack_ok_ = syn.sack_permitted;
+  ecn_ok_ = (syn.flags & tcp_flags::kEce) && (syn.flags & tcp_flags::kCwr);   // an ECN-setup SYN: answered with ECE (RFC 3168 6.1.1)
   snd_wnd_ = syn.window;
   snd_wl1_ = syn.sequence;
   snd_wl2_ = 0;
   enter(TcpState::SynReceived);
-  send_segment(tcp_flags::kSyn | tcp_flags::kAck, iss_, ConstByteView(), true);
+  send_segment(tcp_flags::kSyn | tcp_flags::kAck | (ecn_ok_ ? tcp_flags::kEce : 0), iss_, ConstByteView(), true);
   arm_timer();
 }
 
@@ -379,6 +507,8 @@ void TcpSocket::on_segment(const TcpSegment& s) {
     irs_ = s.sequence;
     rcv_nxt_ = irs_ + 1;
     if (s.mss) peer_mss_ = s.mss;
+    sack_ok_ = s.sack_permitted;                                  // (this side offered it on its SYN)
+    ecn_ok_ = (s.flags & kEce) && !(s.flags & kCwr);              // RFC 3168 6.1.1: an ECN-setup SYN-ACK
     if (s.flags & kAck) {
       snd_una_ = s.acknowledgement;
       snd_wnd_ = s.window;
@@ -391,6 +521,7 @@ void TcpSocket::on_segment(const TcpSegment& s) {
       output();
     } else {  // simultaneous open
       enter(TcpState::SynReceived);
+      ecn_ok_ = false;
       send_segment(kSyn | kAck, iss_, ConstByteView(), true);
     }
     return;
@@ -406,7 +537,7 @@ void TcpSocket::on_segment(const TcpSegment& s) {
     return;
   }
   if (s.flags & kSyn) {  // a retransmitted SYN: answer again; anything else is ignored
-    if (state_ == TcpState::SynReceived && s.sequence == irs_) send_segment(kSyn | kAck, iss_, ConstByteView(), true);
+    if (state_ == TcpState::SynReceived && s.sequence == irs_) send_segment(kSyn | kAck | (ecn_ok_ ? kEce : 0), iss_, ConstByteView(), true);
     return;
   }
   if (!(s.flags & kAck)) return;
@@ -428,6 +559,10 @@ void TcpSocket::on_segment(const TcpSegment& s) {
   }
 
   process_ack(s);
+  if (ecn_ok_) {   // (RFC 3168 6.1.3: CWR ends the echo, a CE mark on data starts it)
+    if (s.flags & kCwr) ece_pending_ = false;
+    if (s.congestion_experienced && !s.data.empty()) ece_pending_ = true;
+  }
   accept_data(s);
   output();
 }
@@ -458,6 +593,7 @@ void TcpSocket::process_ack(const TcpSegment& s) {
     send_buffer_.discard(acked);
     snd_una_ = s.acknowledgement;
     if (seq_gt(snd_una_, snd_nxt_)) snd_nxt_ = snd_una_;   // (data sent before a go-back-N had arrived after all)
+    note_sack(s);
     grow_window(acked);
     sample_rtt(s.acknowledgement);
     retries_ = 0;
@@ -470,13 +606,45 @@ void TcpSocket::process_ack(const TcpSegment& s) {
       else if (state_ == TcpState::Closing) enter(TcpState::TimeWait);
       else if (state_ == TcpState::LastAck) enter(TcpState::Closed);
     }
-  } else if (s.acknowledgement == snd_una_ && s.data.empty() && snd_una_ != snd_nxt_ && s.window == old_window &&
-             !(s.flags & kFin)) {
-    if (++duplicate_acks_ == 3) {  // fast retransmit: the receiver keeps asking for the same byte
+  } else if (s.acknowledgement == snd_una_ && snd_una_ != snd_nxt_ &&
+             ((s.data.empty() && s.window == old_window && !(s.flags & kFin)) || adds_sack(s))) {
+    // A duplicate ACK: RFC 5681's (nothing new, the same window), or - with SACK - one that says the peer holds more than it did (RFC 6675's
+    // definition: a receiver whose application reads meanwhile changes its window on every ACK, and would never send the first kind).
+    note_sack(s);
+    ++duplicate_acks_;
+    // Fast retransmit: the receiver kept asking for the same byte three times - or, with SACK, holds three segments' worth beyond it (RFC 6675's
+    // loss rule: what the receiver coalesced into one segment, and so acknowledged once, still counts by what it holds).
+    const bool lost = duplicate_acks_ == 3 || (sack_ok_ && !in_recovery_ && duplicate_acks_ < 3 && sacked_.bytes() >= 3u * send_mss());
+    if (lost) {
+      duplicate_acks_ = 3;
+      const bool was_recovering = in_recovery_;
       if (!in_recovery_) on_congestion(false);
-      rollback_for_retransmission();
+      if (sack_ok_) {   // only the holes (output() does them first), from snd_una_ on
+        if (!was_recovering) {
+          retransmit_next_ = snd_una_;
+          retransmitted_ = 0;
+        }
+      } else {
+        rollback_for_retransmission();
+      }
       output();
+    } else if (sack_recovery()) {
+      output();   // (each further duplicate ACK can make room: more holes, or new data)
     }
+  } else {
+    note_sack(s);
+  }
+  // ECN-Echo: congestion on the way - cut the window as for a loss, once per window of data, without retransmitting anything (RFC 3168 6.1.2).
+  // (strictly past ecn_recover_: an ECE on the ACK of the window the cut was for is the same congestion, echoed until the peer saw CWR)
+  if (ecn_ok_ && (s.flags & kEce) && !in_recovery_ && (!ecn_cut_ || seq_gt(snd_una_, ecn_recover_))) {
+    const uint32_t mss = send_mss();
+    const uint32_t flight = snd_nxt_ - snd_una_;
+    ssthresh_ = flight / 2 > 2 * mss ? flight / 2 : 2 * mss;
+    if (cwnd_ > ssthresh_) cwnd_ = ssthresh_;
+    bytes_acked_ = 0;
+    ecn_recover_ = snd_max_;
+    ecn_cut_ = true;
+    cwr_pending_ = true;
   }
 }
 
@@ -495,7 +663,8 @@ void TcpSocket::accept_data(const TcpSegment& s) {
     return;
   }
   if (seq_gt(s.sequence, rcv_nxt_)) {  // a gap: the missing segment is on its way or lost
-    send_ack();                        // a duplicate ACK tells the sender what we are waiting for
+    if (!s.data.empty()) accept_out_of_order(s.sequence, s.data);   // kept until the gap fills (a FIN beyond a gap waits for its retransmission)
+    send_ack();                        // a duplicate ACK (with SACK blocks) tells the sender what we are waiting for, and what we have
     return;
   }
 
@@ -510,11 +679,66 @@ void TcpSocket::accept_data(const TcpSegment& s) {
   if (fin && stored == length && end_sequence == rcv_nxt_) {
     ++rcv_nxt_;
     fin_received_ = true;
+    held_.clear();   // (nothing comes after a FIN)
     if (state_ == TcpState::Established) enter(TcpState::CloseWait);
     else if (state_ == TcpState::FinWait1) enter(fin_acked_ ? TcpState::TimeWait : TcpState::Closing);
     else if (state_ == TcpState::FinWait2) enter(TcpState::TimeWait);
+  } else {
+    take_reassembled();
   }
   send_ack();
+}
+
+// Data past a gap: kept (within the receive window, while there are ranges to spare) in ooo_storage_, at its sequence number modulo the
+// buffer size.
+void TcpSocket::accept_out_of_order(uint32_t sequence, ConstByteView data) {
+  const uint32_t window_end = rcv_nxt_ + receive_buffer_.free_space();
+  uint32_t end = sequence + static_cast<uint32_t>(data.size());
+  if (!seq_lt(sequence, window_end)) return;
+  if (seq_gt(end, window_end)) end = window_end;
+  if (ooo_storage_.empty()) ooo_storage_ = allocate_view<uint8_t>(allocator_, kBufferSize);
+  if (ooo_storage_.empty() || !held_.add(sequence, end)) return;
+  const uint32_t n = end - sequence;
+  for (uint32_t i = 0; i < n; ++i) ooo_storage_[(sequence + i) % kBufferSize] = data[i];
+  latest_held_ = sequence;
+}
+
+// After rcv_nxt_ moved: what was held from there on goes into the receive buffer (as much as fits) and is acknowledged with it.
+void TcpSocket::take_reassembled() {
+  held_.remove_below(rcv_nxt_);
+  while (!held_.empty() && held_.at(0).start == rcv_nxt_ && receive_buffer_.free_space() > 0) {
+    const uint32_t available = held_.at(0).end - rcv_nxt_;
+    uint8_t chunk[512];
+    uint32_t n = available < sizeof chunk ? available : static_cast<uint32_t>(sizeof chunk);
+    for (uint32_t i = 0; i < n; ++i) chunk[i] = ooo_storage_[(rcv_nxt_ + i) % kBufferSize];
+    n = receive_buffer_.write(ConstByteView(chunk).first(n));
+    if (n == 0) break;
+    rcv_nxt_ += n;
+    held_.remove_below(rcv_nxt_);
+  }
+}
+
+// The ACK brings SACK blocks that cover something the scoreboard does not have yet.
+bool TcpSocket::adds_sack(const TcpSegment& s) const {
+  if (!sack_ok_) return false;
+  for (uint32_t b = 0; b < s.sack_blocks; ++b) {
+    const uint32_t left = s.sack[b][0], right = s.sack[b][1];
+    if (seq_le(left, snd_una_) || seq_gt(right, snd_max_) || !seq_lt(left, right)) continue;
+    uint32_t gap_start, gap_end;
+    if (sacked_.next_gap(left, right, &gap_start, &gap_end)) return true;
+  }
+  return false;
+}
+
+// The peer's SACK blocks (those within what was sent and not yet acknowledged) go on the scoreboard.
+void TcpSocket::note_sack(const TcpSegment& s) {
+  if (!sack_ok_) return;
+  for (uint32_t b = 0; b < s.sack_blocks; ++b) {
+    const uint32_t left = s.sack[b][0], right = s.sack[b][1];
+    if (seq_le(left, snd_una_) || seq_gt(right, snd_max_) || !seq_lt(left, right)) continue;   // (stale, or claims what was never sent)
+    sacked_.add(left, right);
+  }
+  sacked_.remove_below(snd_una_);
 }
 
 // ------------------------------------------------------------------ timers
@@ -553,11 +777,12 @@ void TcpSocket::on_timer(uint64_t now) {
     }
     rto_ms_ = rto_ms_ * 2 > kMaxRtoMs ? kMaxRtoMs : rto_ms_ * 2;
     if (state_ == TcpState::SynSent) {
-      send_segment(tcp_flags::kSyn, iss_, ConstByteView(), true);
+      send_segment(tcp_flags::kSyn | tcp_flags::kEce | tcp_flags::kCwr, iss_, ConstByteView(), true);
     } else if (state_ == TcpState::SynReceived) {
-      send_segment(tcp_flags::kSyn | tcp_flags::kAck, iss_, ConstByteView(), true);
+      send_segment(tcp_flags::kSyn | tcp_flags::kAck | (ecn_ok_ ? tcp_flags::kEce : 0), iss_, ConstByteView(), true);
     } else {
       if (cwnd_) on_congestion(true);
+      sacked_.clear();   // (after a timeout the scoreboard is not trusted: go-back-N, RFC 2018 8)
       rollback_for_retransmission();
       output();
     }

@@ -26,13 +26,17 @@
 
 namespace network {
 
-// The frames an interface had no room for yet, waiting to go out, shared fairly between the flows that sent them: the scheduler of RFC 8290
-// (FQ-CoDel) without its CoDel part. Each flow (a hash of the destination address, the protocol and the two ports) has its own first-in
+// The frames an interface had no room for yet, waiting to go out, shared fairly between the flows that sent them: RFC 8290 (FQ-CoDel). Each flow (a hash of the destination address, the protocol and the two ports) has its own first-in
 // first-out queue; the flows take turns by deficit round robin, a turn worth kQuantum bytes. A flow that had nothing queued (an ACK, a DNS
 // query, the one packet of a keystroke) starts on the "new" list, served before the "old" one, so a sparse flow does not wait behind bulk
 // ones. When the queue is full, the oldest frame of the flow with the most bytes queued is dropped - the flow that caused the backlog pays
 // for it - and a frame that has waited kMaxSojournMs is dropped when it comes up (a frame the interface keeps refusing, or a backlog the
 // sender ignores, never holds the queue up for longer than that). A dropped TCP segment is retransmitted by its sender.
+//
+// Each flow also runs CoDel (RFC 8289): once its frames have waited longer than kTargetMs for a whole kIntervalMs, it drops one, then more
+// often (the interval over the square root of the count) for as long as that lasts - the sender sees the loss and slows down before the
+// queue is full. A frame whose packet is ECN-capable is marked "congestion experienced" instead of dropped (RFC 3168): an ECN sender slows
+// down just the same and loses nothing.
 //
 // Not thread-safe: the network stack's mutex guards it.
 class EgressQueue {
@@ -43,9 +47,10 @@ class EgressQueue {
   static constexpr uint32_t kFlows = 64;                   // flow queues (flows hash into them)
   static constexpr uint32_t kQuantum = 1514;               // bytes a flow may send per turn (one full Ethernet frame)
   static constexpr uint64_t kMaxSojournMs = 100;
+  static constexpr uint64_t kTargetMs = 5, kIntervalMs = 100;   // CoDel's (RFC 8289 4.3, 4.4)
 
   struct Stats {
-    uint64_t queued = 0, sent = 0, dropped_full = 0, dropped_stale = 0;
+    uint64_t queued = 0, sent = 0, dropped_full = 0, dropped_stale = 0, dropped_codel = 0, marked = 0;
   };
 
   explicit EgressQueue(allocators::IAllocator& allocator) : allocator_(allocator) {}
@@ -88,6 +93,10 @@ class EgressQueue {
     uint64_t bytes = 0;
     int64_t deficit = 0;
     uint8_t list = 0;          // 0 none, 1 new, 2 old
+    // CoDel
+    uint64_t first_above_ms = 0, drop_next_ms = 0;
+    uint32_t count = 0, last_count = 0;
+    bool dropping = false;
   };
   // A list of flow numbers (the new and the old flows), first in first out.
   struct FlowList {
@@ -103,6 +112,8 @@ class EgressQueue {
   void pop_head(uint32_t flow);
   bool drop_from_fattest();
   bool send(hardware::INetworkInterface& nic, uint32_t slot);
+  bool codel_says_drop(Flow& flow, uint64_t sojourn_ms, uint64_t now_ms);
+  static bool mark_congestion(ByteView frame);
 
   allocators::IAllocator& allocator_;
   Array<Slot, kSlots> slots_;

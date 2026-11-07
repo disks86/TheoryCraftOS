@@ -209,6 +209,7 @@ add_executable(BOOTX64
   src/Network/Tcp/TcpManager.cpp
   src/Network/Tcp/TcpCoalescer.cpp
   src/Network/Dhcp/DhcpClient.cpp
+  src/Network/Dns/AddressText.cpp
   src/Network/Dns/DnsMessage.cpp
   src/Network/Dns/DnsResolver.cpp
   src/Hardware/Clock/TscClock.cpp

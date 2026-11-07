@@ -86,6 +86,17 @@ class INetworkStack {
 
   // --- IPv6 (stacks without it keep these defaults). What stateless autoconfiguration has given the interface so far.
   virtual Ipv6Configuration configuration6() const { return Ipv6Configuration{}; }
+
+  // Waiting for the stack (see NetworkStackSet::wait_for_progress for the pattern): progress() goes up after every poll that did something
+  // sockets may wait for; wait_for_progress() returns once it is no longer `seen` or `timeout_us` passed, false if this stack cannot be waited
+  // on that way. serviced(): a service thread polls it (without one, whoever waits must poll it too, and should not wait long).
+  virtual uint64_t progress() const { return 0; }
+  virtual bool wait_for_progress(uint64_t seen, uint64_t timeout_us) {
+    (void)seen;
+    (void)timeout_us;
+    return false;
+  }
+  virtual bool serviced() const { return false; }
   // An ICMPv6 echo request, as ping().
   virtual bool ping6(const Ipv6Address& address, uint32_t timeout_ms, uint32_t* rtt_ms) {
     (void)address;

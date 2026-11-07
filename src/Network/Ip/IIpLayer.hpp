@@ -58,7 +58,9 @@ class IIpLayer {
   virtual uint32_t max_payload_for(const IpAddress& destination) const { return destination.v6 ? kMaxIpv6Payload : max_payload(); }
   // send_ip() for either version: an IPv6 packet to a loopback, own or link-local address, a neighbor or via the default router. TCP and UDP
   // come with their checksum field zero, as for send_ip().
-  virtual bool send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload) {
+  // `ecn` is the ECN field to send it with (kEcnEct0 for ECN-capable TCP data; a congested queue on the way may turn that into kEcnCe).
+  virtual bool send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload, uint8_t ecn = kEcnNotEct) {
+    (void)ecn;
     return !destination.v6 && send_ip(destination.ipv4, protocol, payload);
   }
 
@@ -71,10 +73,11 @@ class IIpLayer {
   }
   // Sends a TCP segment (checksum field zero, as for send_ip()) that the interface cuts into frames of at most `mss` bytes of data. False if
   // it cannot now (the segment is then as good as lost: TCP retransmits).
-  virtual bool send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss) {
+  virtual bool send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss, uint8_t ecn = kEcnNotEct) {
     (void)destination;
     (void)segment;
     (void)mss;
+    (void)ecn;
     return false;
   }
 

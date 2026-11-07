@@ -132,14 +132,36 @@ bool join(Thread* thread, uint64_t) {
 
 void detach(Thread* thread) { pthread_detach(reinterpret_cast<HostThread*>(thread)->handle); }  // (leaked: tests only)
 
+// A fair mutex here is a ticket lock (the mutex's wait list is not used on the host otherwise): list_.lock hands out tickets, handoff_ is the
+// ticket being served, so the mutex goes to waiters strictly in the order they came - the kernel's hands it to its oldest waiter.
 void Mutex::lock() {
+  if (fair_) {
+    const uint32_t ticket = __atomic_fetch_add(&list_.lock, 1u, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&handoff_, __ATOMIC_ACQUIRE) == ticket) return;
+    __atomic_add_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);   // (what contended() reads)
+    while (__atomic_load_n(&handoff_, __ATOMIC_ACQUIRE) != ticket) nap();
+    __atomic_sub_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);
+    return;
+  }
   if (!__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE)) return;
-  __atomic_add_fetch(&waiters_, 1, __ATOMIC_RELAXED);   // (what contended() reads)
+  __atomic_add_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);
   while (__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE)) nap();
-  __atomic_sub_fetch(&waiters_, 1, __ATOMIC_RELAXED);
+  __atomic_sub_fetch(&waiters_, 1, __ATOMIC_SEQ_CST);
 }
-bool Mutex::try_lock() { return !__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE); }
-void Mutex::unlock() { __atomic_store_n(&state_, 0u, __ATOMIC_RELEASE); }
+bool Mutex::try_lock() {
+  if (fair_) {   // (only when nobody holds or waits for it: the next ticket is the one being served)
+    uint32_t serving = __atomic_load_n(&handoff_, __ATOMIC_ACQUIRE);
+    return __atomic_compare_exchange_n(&list_.lock, &serving, serving + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+  }
+  return !__atomic_exchange_n(&state_, 1u, __ATOMIC_ACQUIRE);
+}
+void Mutex::unlock() {
+  if (fair_) {
+    __atomic_fetch_add(&handoff_, 1u, __ATOMIC_RELEASE);
+    return;
+  }
+  __atomic_store_n(&state_, 0u, __ATOMIC_RELEASE);
+}
 
 // A condition variable that polls: the wait list's lock word counts notifications here (nothing else takes this list's lock on the host). A waiter reads the count
 // while it still holds the mutex, so a notification sent after it let go is not missed.

@@ -80,10 +80,14 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   kernel::RecursiveMutex& mutex() override { return mutex_; }
   void poll() override;
   // The last poll() stopped at its limit of frames: more are probably waiting (an interrupt will not announce those again).
-  bool saturated() const { return saturated_; }
+  // (read by the service thread while another thread's poll may be setting it: a hint, accessed atomically)
+  bool saturated() const { return __atomic_load_n(&saturated_, __ATOMIC_RELAXED); }
   // Frames are waiting for room in the interface's transmit queue (EgressQueue): the stack should be polled again soon, whether or not the
   // interface interrupts when it has sent some.
   bool backlogged() const;
+  uint64_t progress() const override { return __atomic_load_n(&progress_, __ATOMIC_ACQUIRE); }
+  bool wait_for_progress(uint64_t seen, uint64_t timeout_us) override;
+  bool serviced() const override { return hooks_.wake != nullptr; }
   EgressQueue::Stats egress_stats() const;
   IpConfiguration configuration() const override;
   void configure(const IpConfiguration& configuration) override;
@@ -108,9 +112,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
                     bool link_broadcast) override;
   uint32_t max_segmented_payload(const IpAddress& destination) const override;
   uint32_t queued_for(const IpAddress& remote, uint16_t local_port, uint16_t remote_port) const override;
-  bool send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss) override;
+  bool send_tcp_segmented(const IpAddress& destination, ConstByteView segment, uint16_t mss, uint8_t ecn = kEcnNotEct) override;
   IpAddress source_for_ip(const IpAddress& destination) const override;
-  bool send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload) override;
+  bool send_ip_to(const IpAddress& destination, uint8_t protocol, ConstByteView payload, uint8_t ecn = kEcnNotEct) override;
 
   // --- IPv6 (NetworkStackIpv6.cpp)
   Ipv6Configuration configuration6() const override;
@@ -211,7 +215,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void handle_igmp(ConstByteView igmp);
   void send_igmp_report(Ipv4Address group);
 
-  kernel::RecursiveMutex mutex_;  // guards everything below, and the sockets and resolver
+  // Guards everything below, and the sockets and resolver. Fair (handed to waiters in turn): the service thread holds it in long stretches,
+  // and application threads must get it in between - an unfair one let the polling thread take it straight back (see poll()).
+  kernel::RecursiveMutex mutex_;
   kernel::Mutex ping_mutex_;      // one ping at a time (they share the ping_* state)
   hardware::INetworkInterface& nic_;
   hardware::IClock& clock_;
@@ -230,6 +236,11 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   Queue<LoopedPacket> looped_;
   EgressQueue egress_;   // frames the interface had no room for, sent fairly as it makes room
   ServiceHooks hooks_;
+  uint64_t progress_ = 0;            // (see progress(); with progress_mutex_ and progress_cv_ for wait_for_progress)
+  kernel::Mutex progress_mutex_;
+  kernel::ConditionVariable progress_cv_;
+  void note_progress();
+  uint8_t outgoing_ecn_ = kEcnNotEct;   // the ECN field of the IP packet being built (set by send_ip_to for its call)
   UdpManager udp_;
   TcpManager tcp_;
   SharedPointer<UdpSocket> dhcp_socket_;

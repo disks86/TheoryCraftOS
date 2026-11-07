@@ -101,7 +101,7 @@ void TcpManager::send_reset(const IpAddress& to, uint16_t to_port, uint16_t from
   ip_.send_ip_to(to, kProtocolTcp, out.written());
 }
 
-void TcpManager::handle(const IpAddress& source, const IpAddress& destination, ConstByteView segment, bool checksum_verified) {
+void TcpManager::handle(const IpAddress& source, const IpAddress& destination, ConstByteView segment, bool checksum_verified, uint8_t ecn) {
   ByteReader in(segment);
   const uint16_t source_port = in.be16();
   const uint16_t destination_port = in.be16();
@@ -118,8 +118,8 @@ void TcpManager::handle(const IpAddress& source, const IpAddress& destination, C
   const uint32_t sum = checksum_verified ? 0 : checksum_add(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint32_t>(segment.size())), segment);
   if (!checksum_verified && checksum_finish(sum) != 0) return;  // corrupted in transit
 
-  // Options: only the maximum segment size matters. Each one is bounds-checked
-  // against the option area; a malformed list just ends the scan.
+  // Options: the maximum segment size, SACK-permitted and SACK blocks. Each one is
+  // bounds-checked against the option area; a malformed list just ends the scan.
   ByteReader options(segment.subview(20, header - 20));
   while (options.ok() && !options.at_end()) {
     const uint8_t kind = options.u8();
@@ -132,9 +132,20 @@ void TcpManager::handle(const IpAddress& source, const IpAddress& destination, C
     if (kind == 2 && length == 4) {
       ByteReader value(body);
       s.mss = value.be16();
+    } else if (kind == 4 && length == 2) {
+      s.sack_permitted = true;
+    } else if (kind == 5 && length >= 10 && (length - 2) % 8 == 0 && (length - 2) / 8 <= 4) {
+      ByteReader value(body);
+      s.sack_blocks = static_cast<uint8_t>((length - 2) / 8);
+      for (uint32_t b = 0; b < s.sack_blocks; ++b) {
+        s.sack[b][0] = value.be32();
+        s.sack[b][1] = value.be32();
+      }
+      if (!value.ok()) s.sack_blocks = 0;
     }
   }
   s.data = segment.dropped(header);
+  s.congestion_experienced = ecn == kEcnCe;
 
   // An existing connection first, then a listener.
   for (SharedPointer<TcpSocket>& socket : sockets_) {

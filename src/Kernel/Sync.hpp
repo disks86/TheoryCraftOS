@@ -26,9 +26,14 @@
 // Before kernel::start() they degrade to spinning, so early code may use them too.
 namespace kernel {
 
+// A Mutex is not fair by default: whoever tries when it is free gets it, so a thread that lets go and takes it again at once usually beats one
+// that was waiting (cheap, and right for short sections). A fair one (Mutex(true)) hands it over: an unlock with threads waiting gives it
+// to the one that has waited longest, which then holds it without trying again - first come, first served, and the thread that let go
+// queues behind. For a lock that one thread holds in long stretches while others need it in between (a network stack's, say).
 class Mutex {
  public:
   Mutex() = default;
+  explicit Mutex(bool fair) : fair_(fair) {}
   Mutex(const Mutex&) = delete;
   Mutex& operator=(const Mutex&) = delete;
 
@@ -39,6 +44,8 @@ class Mutex {
   bool contended() const { return __atomic_load_n(&waiters_, __ATOMIC_RELAXED) != 0; }
 
  private:
+  bool fair_ = false;
+  uint32_t handoff_ = 0;  // (fair) 1: the unlock gave the mutex to the waiter it woke, which takes it without trying
   uint32_t state_ = 0;    // 1 while held
   uint32_t waiters_ = 0;  // threads in, or about to be in, list_
   WaitList list_;
@@ -60,6 +67,7 @@ class ScopedMutex {
 class RecursiveMutex {
  public:
   RecursiveMutex() = default;
+  explicit RecursiveMutex(bool fair) : mutex_(fair) {}   // (see Mutex)
   RecursiveMutex(const RecursiveMutex&) = delete;
   RecursiveMutex& operator=(const RecursiveMutex&) = delete;
 

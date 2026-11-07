@@ -35,12 +35,18 @@ class TcpManager {
 
   // A TCP segment arrived in an IP packet (`segment` = TCP header and data).
   // `checksum_verified`: the network interface checked the checksum already (and found it right).
-  void handle(const IpAddress& source, const IpAddress& destination, ConstByteView segment, bool checksum_verified = false);
+  void handle(const IpAddress& source, const IpAddress& destination, ConstByteView segment, bool checksum_verified = false, uint8_t ecn = kEcnNotEct);
   // Runs timers, finishes accepted handshakes and forgets sockets that are done.
   void poll();
 
   // Some listener on `port` takes connections of one of `families` already.
   bool listening_on(uint16_t port, IpFamilies families = IpFamilies::Both) const;
+  // Some connection has data waiting only for its pacing rate: the stack should be polled again within a millisecond or so.
+  bool pacing() const {
+    for (const SharedPointer<TcpSocket>& s : sockets_)
+      if (s->pacing_paused()) return true;
+    return false;
+  }
   uint16_t allocate_port();
   uint32_t next_initial_sequence();
   // Disowns (and resets) connections spawned by a listener that is going away.

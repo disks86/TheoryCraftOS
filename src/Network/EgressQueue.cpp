@@ -203,10 +203,20 @@ uint32_t EgressQueue::drain(hardware::INetworkInterface& nic, uint64_t now_ms) {
     }
     const uint32_t slot = flow.head;
     const Slot s = slots_[slot];
-    if (now_ms - s.queued_ms > kMaxSojournMs) {   // waited too long: drop it (its sender retransmits if it cares)
+    const uint64_t sojourn = now_ms > s.queued_ms ? now_ms - s.queued_ms : 0;
+    if (sojourn > kMaxSojournMs) {   // waited too long: drop it (its sender retransmits if it cares)
       pop_head(flow_number);
       ++stats_.dropped_stale;
       continue;
+    }
+    if (codel_says_drop(flow, sojourn, now_ms)) {
+      if (mark_congestion(buffers_[slot]->writable_view())) {
+        ++stats_.marked;   // (and it goes out below)
+      } else {
+        pop_head(flow_number);
+        ++stats_.dropped_codel;
+        continue;
+      }
     }
     if (!send(nic, slot)) break;   // the interface is full: try again later, in the same order
     flow.deficit -= s.length;
@@ -215,6 +225,71 @@ uint32_t EgressQueue::drain(hardware::INetworkInterface& nic, uint64_t now_ms) {
     ++sent;
   }
   return sent;
+}
+
+namespace {
+uint32_t isqrt(uint32_t n) {
+  uint32_t r = 0;
+  while ((r + 1) * (r + 1) <= n) ++r;   // (n is a drop count: small)
+  return r ? r : 1;
+}
+}  // namespace
+
+// RFC 8289's dequeue decision, per flow: a sojourn above the target for an interval starts a dropping state, whose drops come at intervals
+// that shrink with the square root of the count; a sojourn back under the target (or a flow down to a frame) ends it.
+bool EgressQueue::codel_says_drop(Flow& flow, uint64_t sojourn_ms, uint64_t now_ms) {
+  bool ok_to_drop = false;
+  if (sojourn_ms < kTargetMs || flow.bytes <= kQuantum) {
+    flow.first_above_ms = 0;
+  } else if (flow.first_above_ms == 0) {
+    flow.first_above_ms = now_ms + kIntervalMs;
+  } else if (now_ms >= flow.first_above_ms) {
+    ok_to_drop = true;
+  }
+  if (flow.dropping) {
+    if (!ok_to_drop) {
+      flow.dropping = false;
+      return false;
+    }
+    if (now_ms < flow.drop_next_ms) return false;
+    ++flow.count;
+    flow.drop_next_ms += kIntervalMs / isqrt(flow.count);
+    return true;
+  }
+  if (!ok_to_drop) return false;
+  flow.dropping = true;
+  // (coming back soon after the last dropping state: start near where it ended, RFC 8289 5.5)
+  const uint32_t delta = flow.count - flow.last_count;
+  flow.count = delta > 1 && now_ms - flow.drop_next_ms < 16 * kIntervalMs ? delta : 1;
+  flow.last_count = flow.count;
+  flow.drop_next_ms = now_ms + kIntervalMs / isqrt(flow.count);
+  return true;
+}
+
+// Marks an ECN-capable IPv4 or IPv6 packet "congestion experienced" in place (IPv4's header checksum redone). False for one that is not
+// ECN-capable (or not IP).
+bool EgressQueue::mark_congestion(ByteView frame) {
+  if (frame.size() < 14 + 20) return false;
+  const uint16_t ether_type = static_cast<uint16_t>(frame[12] << 8 | frame[13]);
+  if (ether_type == kEtherTypeIpv4) {
+    if ((frame[14] >> 4) != 4 || (frame[15] & 3) == kEcnNotEct) return false;
+    const uint32_t header = (frame[14] & 15u) * 4;
+    if (header < 20 || frame.size() < 14 + header) return false;
+    frame[15] |= kEcnCe;
+    frame[24] = frame[25] = 0;
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < header; i += 2) sum += uint32_t{frame[14 + i]} << 8 | frame[14 + i + 1];
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    frame[24] = static_cast<uint8_t>(~sum >> 8);
+    frame[25] = static_cast<uint8_t>(~sum);
+    return true;
+  }
+  if (ether_type == kEtherTypeIpv6) {
+    if (frame.size() < 14 + 40 || (frame[14] >> 4) != 6 || ((frame[15] >> 4) & 3) == kEcnNotEct) return false;
+    frame[15] |= kEcnCe << 4;   // (the traffic class straddles bytes 14 and 15: its low two bits are bits 4 and 5 of byte 15)
+    return true;
+  }
+  return false;
 }
 
 void EgressQueue::clear() {
