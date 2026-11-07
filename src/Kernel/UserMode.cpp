@@ -248,6 +248,7 @@ void on_user_tick(Frame* frame) {
   if (task && (kill_pending(task) || task->program.process()->exited())) {
     frame->rip = 0;
   } else if (UserThread* u = current_user_thread()) {      // asked to stop or end: send it to address 0 (the fault there is how it gets into the kernel in a state it can wait in)
+    u->tick_rip = frame->rip;
     if (!u->redirected && (__atomic_load_n(&u->suspend_requested, __ATOMIC_ACQUIRE) || __atomic_load_n(&u->terminate_requested, __ATOMIC_ACQUIRE))) {
       u->saved_rip = frame->rip;
       u->redirected = true;
@@ -263,6 +264,11 @@ Frame* on_syscall(Frame* frame, void*) {
   Task* task = self->task;
   process::Process* process = task->program.process();
   irq_enable();      // the frame is saved: the call may take as long as it needs and be preempted
+  self->call_service = frame->rax;
+  self->call_rip = frame->rip;
+  self->call_rsp = frame->rsp;
+  ++self->calls;
+  self->in_call = true;
   if (process->exited()) { thread_ends_now(self); exit_thread(); }      // another thread ended the program
   if (kill_pending(task)) {
     task->killed = true;
@@ -311,6 +317,7 @@ Frame* on_syscall(Frame* frame, void*) {
     }
   }
   if (!alive || thread_ends) thread_ends_now(self);
+  self->in_call = false;
   task->mutex.unlock();
   if (!alive || thread_ends) exit_thread();
   irq_disable();      // the way back is not re-entrant
@@ -1168,6 +1175,71 @@ uint32_t remote_operation(uint64_t pid, process::IProcessRuntime::RemoteOp& op) 
     return status;
   }
   return kInvalidCid;
+}
+
+void report() {
+  ScopedMutex registry(g_tasks_mutex);
+  for (Task* task = g_tasks; task; task = task->all_next) {
+    if (!task->program.loaded()) continue;
+    bool locked = false;
+    for (int i = 0; i < 100 && !(locked = task->mutex.try_lock()); ++i) sleep_ms(10);
+    console::puts("report: program ");
+    console::put_dec(int64_t(task->program.process()->id()));
+    console::puts(" ");
+    console::puts(task->name);
+    console::puts(locked ? "" : " (its lock is held: what follows may be changing)");
+    console::puts(", memory ");
+    console::put_dec(int64_t(task->program.address_space().resident_bytes() >> 20));
+    console::puts(" MiB resident\n");
+    const process::ModuleSet* modules = task->program.modules();
+    auto where = [&](uint64_t address) {
+      console::put_hex(address);
+      for (uint64_t i = 0; modules && i < modules->count(); ++i) {
+        const process::Module& m = modules->at(i);
+        if (address < m.base || address - m.base >= m.size) continue;
+        console::puts(" (");
+        console::puts(m.name.view());
+        console::puts("+");
+        console::put_hex(address - m.base);
+        console::puts(")");
+        return true;
+      }
+      return false;
+    };
+    for (UserThread* t = task->threads; t; t = t->next) {
+      console::puts("  thread ");
+      console::put_dec(int64_t(t->id >> 20));
+      if (t->finished) { console::puts(" finished\n"); continue; }
+      console::puts(t->in_call ? " in call " : " running, last seen at ");
+      if (t->in_call) {
+        console::put_hex(t->call_service);
+        console::puts(" from ");
+        where(t->call_rip);
+      } else {
+        where(t->tick_rip);
+      }
+      console::puts(", calls ");
+      console::put_dec(int64_t(t->calls));
+      console::puts("\n");
+      if (t->in_call && t->call_rsp) {      // return addresses on its stack that point into a module
+        uint8_t raw[2048] = {};
+        if (!task->program.address_space().read_privileged(t->call_rsp, ByteView(raw, sizeof raw)) && !task->program.address_space().read_privileged(t->call_rsp, ByteView(raw, 256))) continue;
+        uint32_t shown = 0;
+        for (uint32_t at = 0; at + 8 <= sizeof raw && shown < 12; at += 8) {
+          uint64_t w = 0;
+          for (uint32_t k = 0; k < 8; ++k) w |= uint64_t{raw[at + k]} << (8 * k);
+          bool in_module = false;
+          for (uint64_t i = 0; modules && i < modules->count() && !in_module; ++i) in_module = w >= modules->at(i).base && w - modules->at(i).base < modules->at(i).size;
+          if (!in_module) continue;
+          console::puts("      ");
+          where(w);
+          console::puts("\n");
+          ++shown;
+        }
+      }
+    }
+    if (locked) task->mutex.unlock();
+  }
 }
 
 uint32_t thread_snapshot(uint64_t pid, process::IProcessRuntime::ThreadEntry* out, uint32_t capacity) {

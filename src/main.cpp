@@ -2085,7 +2085,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         console::puts("autorun: starting " TCOS_AUTORUN "\n");
         uint32_t code = 0;
         String message(*a.allocator);
+        // Every 20 seconds while it runs, what each of its threads is doing goes to the debug console (kernel::usermode::report).
+        static volatile bool running = true;
+        kernel::detach(kernel::spawn([](void*) { for (uint32_t s = 0; running; ++s) { kernel::sleep_ms(1000); if (running && s % 20 == 19) kernel::usermode::report(); } }, nullptr, "autorun-report"));
         const desktop::RunResult result = desktop::run_program(run, &code, &message);
+        running = false;
         console::puts("autorun: ended, result ");
         console::put_dec(static_cast<int64_t>(result));
         console::puts(", exit code ");
