@@ -18,7 +18,8 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
   appended to the blob after the name; a caller that asks for the old 96 bytes still gets them).
 * Limits (`maxPushConstantsSize`, `maxPerStageDescriptorSamplers`, `maxVertexInputAttributes`, `maxFragmentOutputAttachments`, ...), the sample counts, the features
   (`independentBlend` only with `kFeatureIndependentBlend`) and the formats (sRGB, float, integer, 16 bit unorm / snorm and 10-10-10-2 only with their feature bits) follow the adapter.
-  A small GPU (128 byte push constant block, 2 texture units, 4 attributes, 4 varyings) is a small Vulkan device; the CPU renderer is a big one.
+  virgl gives 16 texture units, 16 vertex attributes (`maxVertexInputAttributes`, the most vulkan-1 takes) and 15 varyings (14 on a GL 3.3 host); a GPU with less is a smaller
+  Vulkan device, and the CPU renderer is a big one. virgl 3D commands wait up to 20 s for the host (a cold shader compile can be slow), display commands 250 ms.
 * A pipeline the adapter cannot run is refused when it is created (`VK_ERROR_FEATURE_NOT_PRESENT`, with the reason written to the debugger when `VULKAN_1_DEBUG` is set), never
   when it is drawn with.
 
@@ -37,6 +38,9 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
 * **Cube maps** (also cube map arrays: `imageCubeArray`) are 2D arrays of six layers a cube to the kernel. A cube compatible image of 6·n layers is one `Texture2DArray`, and the
   translated shader works out the face (Vulkan's table: the major axis and its sign), the point on it and the layer `face + 6 · round(cube)`, then samples the array. Filtering does not
   cross faces. Not taken: depth comparisons and gradients with a cube map.
+* **Textures in vertex and compute shaders**: lookups at a level (`textureLod`; `texture` there is one at level 0, as in GLSL), texel fetches, sizes, gathers and depth comparisons
+  at level 0 - what needs no derivatives. A pipeline's units are numbered for all its stages; virgl binds them to the vertex and pixel stage of a draw and to the compute stage of a
+  dispatch, the CPU renderer hands its texture set to the vertex and compute shaders through their contexts.
 * **Dynamic indices into registers** (a local array `a[i]`, a vector's `v[i]`, nested and struct-member arrays): a load is a chain of comparisons and `movc` over the places the
   indices may pick (at most 256), a store writes each of them under its comparison.
 * **Memory in shaders** (storage buffers, `Workgroup` variables) is addressed by bytes: an access chain is a constant offset plus an integer for its dynamic indices, a load `ld_raw`, a
@@ -68,6 +72,6 @@ images that are also sampled (the kernel's depth images have no CPU view), blend
 matrices in shaders, `OpArrayLength` (the length of a runtime array),
 `gl_NumWorkGroups`, compare-exchange atomics, more than 4 written and 4 read-only storage buffers a pipeline, arrays of storage buffers indexed dynamically, Vulkan 1.1 and later
 (`vkEnumerateInstanceVersion` says 1.0). A draw that writes a storage buffer another draw of the same pass reads from mapped memory may see the old contents (the copy back is when
-the pass's stream has run). Kernel limits Godot's renderers run into next: only pixel shaders sample textures (not vertex or compute shaders), arrays and cubes
+the pass's stream has run). Kernel limits Godot's renderers run into next: arrays and cubes
 have one mip level, an 8-bit colour format and cannot be drawn into, and uniform data is the push constant block (`maxUniformBufferRange` 4096, below Vulkan's 16384). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
 that answer `VK_ERROR_FEATURE_NOT_PRESENT` (`src/Windows/stubs/vulkan-1.inc`). Not validated on real GPUs: only the CPU renderer and what QEMU gives (virgl, standard VGA) run it.

@@ -1181,6 +1181,7 @@ void D3d9Program::run_vertex_ex(const graphics::Vec4* attributes, const uint8_t*
   s.sys[kSysVertexId].f[0] = from_bits(context.vertex_id);
   s.sys[kSysInstanceId].f[0] = from_bits(context.instance_id);
   s.storage = context.storage;
+  s.textures = context.textures;
   execute(s);
   out->position = {s.pos.f[0], -s.pos.f[1], s.pos.f[2], s.pos.f[3]};   // (Direct3D's +Y up to the device's +Y down)
   for (uint32_t i = 0; i < graphics::kMaxVaryings; ++i) out->varying[i] = {s.var[i].f[0], s.var[i].f[1], s.var[i].f[2], s.var[i].f[3]};
@@ -1267,6 +1268,7 @@ void D3d9Program::run_compute(const graphics::ComputeContext& context, const uin
   s.constants = constants;
   s.compute = &context;
   s.storage = context.buffers;
+  s.textures = context.textures;
   for (uint32_t k = 0; k < 3; ++k) {
     s.sys[kSysDispatchThreadId].f[k] = from_bits(context.dispatch_id[k]);
     s.sys[kSysGroupId].f[k] = from_bits(context.group_id[k]);
@@ -1305,6 +1307,7 @@ void D3d9Program::run_compute_group(const graphics::ComputeContext& context, con
       s->constants = constants;
       s->compute = &group;
       s->storage = group.buffers;
+      s->textures = group.textures;
       const uint32_t i = constructed;
       const uint32_t tx = i % thread_group_[0], ty = (i / thread_group_[0]) % thread_group_[1], tz = i / (thread_group_[0] * thread_group_[1]);
       const uint32_t id[3] = {tx, ty, tz};

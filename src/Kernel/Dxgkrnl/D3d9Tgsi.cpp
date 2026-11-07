@@ -62,13 +62,16 @@ class TgsiEmitter {
   // (the emitter's registers come after the program's temporaries: the text declares no more registers than it uses)
   const uint32_t kScratch;   // 4 registers for source operands
   const uint32_t kWork = kScratch + 4, kWork2 = kScratch + 5, kWork3 = kScratch + 6;
-  const uint32_t kPosition = kScratch + 7, kVarying = kScratch + 8, kColor = kScratch + 12;   // (kVarying: four)
-  const uint32_t kSys = kScratch + 13;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape
+  const uint32_t kPosition = kScratch + 7, kVarying = kScratch + 8, kColor = kVarying + graphics::kMaxVaryings;   // (kVarying: one for each varying there may be)
+  const uint32_t kSys = kColor + 1;     // the system values (SysValue order), copied from where TGSI keeps them into registers of the interpreter's shape (each block of registers after the one before)
   const uint32_t kColorExtra = kSys + kSysValueCount;   // colour outputs 1..3 (output 0 is kColor)
   const uint32_t kGsPosition = kColorExtra + graphics::kMaxColorTargets - 1;   // a geometry shader's input positions, up to six vertices, turned back to Direct3D's +Y up
   const uint32_t kPatchBase = kGsPosition + 6;   // a hull shader's patch constant registers (shadows of the tessellation factors)
   const uint32_t kTempCount = kPatchBase + graphics::kMaxPatchRegisters;
   uint32_t color_register(uint32_t target) const { return target == 0 ? kColor : kColorExtra + target - 1; }
+  // The first output after the position and the varyings: the position as the shader wrote it (one a stream), or a hull shader's tessellation factors. (With the device's four
+  // varyings of old it was OUT[5]; virgl's stream output declaration names the same register: VirglShaderModule.)
+  uint32_t extra() const { return varyings_ + 1; }
   static constexpr uint32_t kMaxOutput = 8u << 20;   // (virgl takes the text in pieces: VirglShaderModule)
 
   struct Imm {
@@ -854,7 +857,7 @@ bool TgsiEmitter::instruction(const Instr& ins) {
       line("MUL", &o, &pos, &factor);
       String upright = str();
       add(upright, "OUT[");
-      add_uint(upright, 5 + ins.control);   // (a register for each stream, so that several can capture the position)
+      add_uint(upright, extra() + ins.control);   // (a register for each stream, so that several can capture the position)
       add(upright, "]");
       line("MOV", &upright, &pos);
       for (uint32_t i = 0; i < varyings_; ++i) {
@@ -1434,9 +1437,9 @@ void TgsiEmitter::assemble(String* out) {
     // (the position as the shader wrote it, +Y up: what stream output takes, as the host's output 0 is turned over; one register for each stream)
     for (uint32_t k = 0; k < p_.geometry_streams(); ++k) {
       add(*out, "DCL OUT[");
-      add_uint(*out, 5 + k);
+      add_uint(*out, extra() + k);
       add(*out, "], GENERIC[");
-      add_uint(*out, 4 + k);
+      add_uint(*out, varyings_ + k);
       add(*out, "]\n");
     }
   }
@@ -1472,8 +1475,20 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
-    if (hull_) add(*out, "DCL OUT[5], TESSOUTER\nDCL OUT[6], TESSINNER\n");
-    if (domain_) add(*out, "DCL OUT[5], GENERIC[4]\n");
+    if (hull_) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, extra());
+      add(*out, "], TESSOUTER\nDCL OUT[");
+      add_uint(*out, extra() + 1);
+      add(*out, "], TESSINNER\n");
+    }
+    if (domain_) {
+      add(*out, "DCL OUT[");
+      add_uint(*out, extra());
+      add(*out, "], GENERIC[");
+      add_uint(*out, varyings_);
+      add(*out, "]\n");
+    }
   }
   if (!geometry_ && !hull_ && !domain_) add(*out, compute_ ? "COMP\n" : vertex_ ? "VERT\n" : p_.color_outputs_ > 1 ? "FRAG\n" : "FRAG\nPROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n");
   if (geometry_ || hull_ || domain_) {
@@ -1509,7 +1524,12 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
-    add(*out, "DCL OUT[5], GENERIC[4]\n");   // (the position as the shader wrote it, for stream output: see the geometry shader's)
+    // (the position as the shader wrote it, for stream output: see the geometry shader's)
+    add(*out, "DCL OUT[");
+    add_uint(*out, extra());
+    add(*out, "], GENERIC[");
+    add_uint(*out, varyings_);
+    add(*out, "]\n");
   } else {
     for (uint32_t i = 0; i < 16; ++i) {
       if (!in_used_[i]) continue;
@@ -1530,16 +1550,17 @@ void TgsiEmitter::assemble(String* out) {
       add_uint(*out, i);
       add(*out, "]\n");
     }
-    for (uint32_t i = 0; i < graphics::kMaxTextureUnits; ++i) {
-      if (!sampler_used_[i]) continue;
-      add(*out, "DCL SAMP[");
-      add_uint(*out, i);
-      add(*out, "]\nDCL SVIEW[");
-      add_uint(*out, i);
-      add(*out, "], ");
-      add(*out, dimension_name(p_.texture_kind(i)));
-      add(*out, ", FLOAT\n");
-    }
+  }
+  // The samplers and views the program reads, in whichever stage it is (a vertex or compute shader reads textures too)
+  for (uint32_t i = 0; i < graphics::kMaxTextureUnits; ++i) {
+    if (!sampler_used_[i]) continue;
+    add(*out, "DCL SAMP[");
+    add_uint(*out, i);
+    add(*out, "]\nDCL SVIEW[");
+    add_uint(*out, i);
+    add(*out, "], ");
+    add(*out, dimension_name(p_.texture_kind(i)));
+    add(*out, ", FLOAT\n");
   }
   if (!compute_) {   // (the buffers a vertex, geometry, tessellation or pixel shader reads and writes: all the numbers up to the last, so that the host's binding points are the numbers)
     uint32_t last = 0;
@@ -1591,7 +1612,9 @@ if (vertex_ || domain_) {
     add(o, "OUT[0]");
     line("MUL", &o, &pos, &factor);
     String upright = str();
-    add(upright, "OUT[5]");
+    add(upright, "OUT[");
+    add_uint(upright, extra());
+    add(upright, "]");
     line("MOV", &upright, &pos);
     for (uint32_t i = 0; i < varyings_; ++i) {
       String target = str();
@@ -1802,12 +1825,14 @@ NtStatus TgsiEmitter::run(String* out) {
   if (!oom_ && !unsupported_) {
     if (hull_) {
       // The patch constants: the factors out of the registers the shader wrote them to (the patch outputs, as TGSI has them, are the two vectors of factors).
-      const String tess_outer = [&] { String s = str(); add(s, "OUT[5]"); return s; }(), tess_inner = [&] { String s = str(); add(s, "OUT[6]"); return s; }();
+      const String tess_outer = [&] { String s = str(); add(s, "OUT["); add_uint(s, extra()); add(s, "]"); return s; }(), tess_inner = [&] { String s = str(); add(s, "OUT["); add_uint(s, extra() + 1); add(s, "]"); return s; }();
       const bool pow2 = p_.tess_partitioning_ == graphics::TessPartitioning::Pow2;
       // (a power of two: the factor rounded up to the next one, found by comparing it with each of them in turn rather than by a logarithm, which is not exact at the powers)
-      auto write_factor = [&](const char* vector, uint32_t component, uint32_t reg, bool round_up) {
+      auto write_factor = [&](uint32_t output, uint32_t component, uint32_t reg, bool round_up) {
         String target = str();
-        add(target, vector);
+        add(target, "OUT[");
+        add_uint(target, output);
+        add(target, "].");
         add(target, StringView(&"xyzw"[component], 1));
         const String source = temp(kPatchBase + reg, ".xxxx");
         if (!round_up) {
@@ -1827,9 +1852,9 @@ NtStatus TgsiEmitter::run(String* out) {
       };
       // (an isoline's line density is always an integer, not a power of two)
       for (uint32_t k = 0; k < 4; ++k)
-        if (p_.outer_factor_reg_[k] >= 0) write_factor("OUT[5].", k, static_cast<uint32_t>(p_.outer_factor_reg_[k]), pow2 && !(p_.tess_domain_ == graphics::TessDomain::Isoline && k == 0));
+        if (p_.outer_factor_reg_[k] >= 0) write_factor(extra(), k, static_cast<uint32_t>(p_.outer_factor_reg_[k]), pow2 && !(p_.tess_domain_ == graphics::TessDomain::Isoline && k == 0));
       for (uint32_t k = 0; k < 2; ++k)
-        if (p_.inner_factor_reg_[k] >= 0) write_factor("OUT[6].", k, static_cast<uint32_t>(p_.inner_factor_reg_[k]), pow2);
+        if (p_.inner_factor_reg_[k] >= 0) write_factor(extra() + 1, k, static_cast<uint32_t>(p_.inner_factor_reg_[k]), pow2);
       (void)tess_outer, (void)tess_inner;
       line("ENDIF");
     } else if (geometry_) {

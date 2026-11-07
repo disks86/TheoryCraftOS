@@ -162,14 +162,19 @@ typedef struct Scene {
   VkShaderModule vs, fs_color, fs_tex;
 } Scene;
 
+static VkPipeline make_pipeline_with(Rig *r, Scene *s, VkShaderModule vs, VkShaderModule fs, const VkPipelineVertexInputStateCreateInfo *input, VkCullModeFlags cull, VkFrontFace front, VkResult *result);
 static VkPipeline make_pipeline(Rig *r, Scene *s, VkShaderModule fs, VkCullModeFlags cull, VkFrontFace front, VkResult *result) {
-  VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
-  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = s->vs, stages[0].pName = "main";
-  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs, stages[1].pName = "main";
   VkVertexInputBindingDescription binding = {0, 20, VK_VERTEX_INPUT_RATE_VERTEX};
   VkVertexInputAttributeDescription attrs[2] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 8}};
   VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &binding, vi.vertexAttributeDescriptionCount = 2, vi.pVertexAttributeDescriptions = attrs;
+  return make_pipeline_with(r, s, s->vs, fs, &vi, cull, front, result);
+}
+static VkPipeline make_pipeline_with(Rig *r, Scene *s, VkShaderModule vs, VkShaderModule fs, const VkPipelineVertexInputStateCreateInfo *input, VkCullModeFlags cull, VkFrontFace front, VkResult *result) {
+  VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = vs, stages[0].pName = "main";
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT, stages[1].module = fs, stages[1].pName = "main";
+  const VkPipelineVertexInputStateCreateInfo vi = *input;
   VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
   ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   VkViewport viewport = {0, 0, W, H, 0, 1};
@@ -751,6 +756,250 @@ static void test_cube_array(Rig *r, Scene *s) {
   p_vkFreeMemory(r->dev, image_memory, NULL);
 }
 
+/* Textures outside pixel shaders: a vertex shader whose colour is a texel it fetches (green), and a compute shader that fetches, looks up at level 0 and asks the size of the
+ * scene's 2 x 2 texture (red, green / blue, white). */
+static void test_textures_in_vertex_and_compute(Rig *r, Scene *s) {
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof vtexdraw_vert, smi.pCode = vtexdraw_vert;
+  VkShaderModule vs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &vs);
+  VkShaderModule scene_vs = s->vs;
+  s->vs = vs;
+  VkResult result;
+  VkPipeline pipeline = make_pipeline(r, s, s->fs_color, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, &result);
+  s->vs = scene_vs;
+  check(result == VK_SUCCESS && pipeline, "a pipeline whose vertex shader reads a texture");
+  if (pipeline) {
+    static const float white[15] = {-1, -1, 1, 1, 1, 3, -1, 1, 1, 1, -1, 3, 1, 1, 1};
+    memcpy(s->vertex_map, white, sizeof white);
+    draw_frame(r, s, pipeline, 0, 0, 0);
+    const unsigned char *picture = (const unsigned char *)s->readback_map;
+    check(near_pixel(pixel(picture, W, 10, 10), 0, 255, 0, 255) && near_pixel(pixel(picture, W, 50, 40), 0, 255, 0, 255), "a vertex shader's texel fetch colours the draw");
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  if (vs) p_vkDestroyShaderModule(r->dev, vs, NULL);
+
+  VkQueueFamilyProperties fam;
+  unsigned nfam = 1;
+  p_vkGetPhysicalDeviceQueueFamilyProperties(r->pd, &nfam, &fam);
+  if (!(fam.queueFlags & VK_QUEUE_COMPUTE_BIT)) return;
+  VkDescriptorSetLayoutBinding bindings[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
+  VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dl.bindingCount = 2, dl.pBindings = bindings;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  p_vkCreateDescriptorSetLayout(r->dev, &dl, NULL, &set_layout);
+  VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pl.setLayoutCount = 1, pl.pSetLayouts = &set_layout;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  p_vkCreatePipelineLayout(r->dev, &pl, NULL, &layout);
+  VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+  VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 2, dpi.pPoolSizes = sizes;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  p_vkCreateDescriptorPool(r->dev, &dpi, NULL, &pool);
+  VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &set_layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  p_vkAllocateDescriptorSets(r->dev, &dai, &set);
+  VkDeviceMemory mem;
+  void *map;
+  VkBuffer buf = make_buffer(r, 3 * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mem, &map);
+  memset(map, 0, 3 * 16);
+  VkDescriptorImageInfo dii = {s->sampler, s->texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  VkDescriptorBufferInfo dbi = {buf, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet writes[2];
+  memset(writes, 0, sizeof writes);
+  writes[0].sType = writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[0].dstSet = writes[1].dstSet = set;
+  writes[0].dstBinding = 0, writes[0].descriptorCount = 1, writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes[0].pImageInfo = &dii;
+  writes[1].dstBinding = 1, writes[1].descriptorCount = 1, writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, writes[1].pBufferInfo = &dbi;
+  p_vkUpdateDescriptorSets(r->dev, 2, writes, 0, NULL);
+  smi.codeSize = sizeof ctex_comp, smi.pCode = ctex_comp;
+  VkShaderModule cs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &cs);
+  VkComputePipelineCreateInfo cpi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT, cpi.stage.module = cs, cpi.stage.pName = "main";
+  cpi.layout = layout;
+  VkPipeline cpipe = VK_NULL_HANDLE;
+  check(p_vkCreateComputePipelines(r->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &cpipe) == VK_SUCCESS && cpipe, "a compute pipeline that reads a texture");
+  if (cpipe) {
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    p_vkResetCommandBuffer(r->cb, 0);
+    p_vkBeginCommandBuffer(r->cb, &cbi);
+    p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, cpipe);
+    p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+    p_vkCmdDispatch(r->cb, 1, 1, 1);
+    p_vkEndCommandBuffer(r->cb);
+    submit_and_wait(r);
+    const float *o = map;
+    const int fetched = o[0] > 0.99f && o[1] > 0.99f && o[2] > 0.99f && o[3] > 0.99f;                 /* (1, 1): white */
+    const int looked = o[4] < 0.01f && o[5] < 0.01f && o[6] > 0.99f && o[7] > 0.99f;                  /* (0.25, 0.75): blue */
+    check(fetched && looked && o[8] == 2.0f && o[9] == 2.0f, "a compute shader reads a texture: a fetch, a lookup at level 0, its size");
+    if (!(fetched && looked && o[8] == 2.0f)) printf("    compute texture: %g %g %g %g | %g %g %g %g | %g %g\n", o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8], o[9]);
+    p_vkDestroyPipeline(r->dev, cpipe, NULL);
+  }
+  if (cs) p_vkDestroyShaderModule(r->dev, cs, NULL);
+  p_vkDestroyBuffer(r->dev, buf, NULL);
+  p_vkFreeMemory(r->dev, mem, NULL);
+  p_vkDestroyDescriptorPool(r->dev, pool, NULL);
+  p_vkDestroyPipelineLayout(r->dev, layout, NULL);
+  p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
+}
+
+/* Twelve texture units (vk_units.frag: an array of twelve samplers) bound in turn to three 1 x 1 images, red, green and blue: the picture mixes units 1, 6 and 11 (green, red,
+ * blue). Skipped on an adapter with fewer units. */
+static void test_many_units(Rig *r, Scene *s) {
+  if (r->props.limits.maxPerStageDescriptorSamplers < 12) {
+    printf("    %u texture units on this adapter: skipped\n", r->props.limits.maxPerStageDescriptorSamplers);
+    return;
+  }
+  VkImage images[3];
+  VkDeviceMemory memories[3];
+  VkImageView views[3];
+  VkDeviceMemory staging_memory;
+  void *staging_map;
+  VkBuffer staging = make_buffer(r, 3 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging_memory, &staging_map);
+  static const unsigned char colours[12] = {0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255};   /* B, G, R, A: red, green, blue */
+  memcpy(staging_map, colours, sizeof colours);
+  p_vkResetCommandBuffer(r->cb, 0);
+  VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  p_vkBeginCommandBuffer(r->cb, &cbi);
+  for (unsigned k = 0; k < 3; ++k) {
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D, ici.format = VK_FORMAT_B8G8R8A8_UNORM, ici.extent.width = ici.extent.height = ici.extent.depth = 1, ici.mipLevels = ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT, ici.tiling = VK_IMAGE_TILING_OPTIMAL, ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    p_vkCreateImage(r->dev, &ici, NULL, &images[k]);
+    VkMemoryRequirements req;
+    p_vkGetImageMemoryRequirements(r->dev, images[k], &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size, ai.memoryTypeIndex = (unsigned)memory_type(&r->mem, req.memoryTypeBits, 0);
+    p_vkAllocateMemory(r->dev, &ai, NULL, &memories[k]);
+    p_vkBindImageMemory(r->dev, images[k], memories[k], 0);
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = images[k], vci.viewType = VK_IMAGE_VIEW_TYPE_2D, vci.format = ici.format;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, vci.subresourceRange.levelCount = 1, vci.subresourceRange.layerCount = 1;
+    p_vkCreateImageView(r->dev, &vci, NULL, &views[k]);
+    VkBufferImageCopy copy;
+    memset(&copy, 0, sizeof copy);
+    copy.bufferOffset = 4 * k, copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, copy.imageSubresource.layerCount = 1, copy.imageExtent.width = copy.imageExtent.height = copy.imageExtent.depth = 1;
+    p_vkCmdCopyBufferToImage(r->cb, staging, images[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  }
+  p_vkEndCommandBuffer(r->cb);
+  submit_and_wait(r);
+  VkDescriptorSetLayoutBinding bindings[2] = {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
+  VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  dl.bindingCount = 2, dl.pBindings = bindings;
+  VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+  p_vkCreateDescriptorSetLayout(r->dev, &dl, NULL, &set_layout);
+  VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  plci.setLayoutCount = 1, plci.pSetLayouts = &set_layout;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  p_vkCreatePipelineLayout(r->dev, &plci, NULL, &layout);
+  VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12}};
+  VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dpi.maxSets = 1, dpi.poolSizeCount = 2, dpi.pPoolSizes = sizes;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  p_vkCreateDescriptorPool(r->dev, &dpi, NULL, &pool);
+  VkDescriptorSetAllocateInfo dai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  dai.descriptorPool = pool, dai.descriptorSetCount = 1, dai.pSetLayouts = &set_layout;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  p_vkAllocateDescriptorSets(r->dev, &dai, &set);
+  VkDescriptorBufferInfo dbi = {s->uniform, 0, VK_WHOLE_SIZE};
+  VkDescriptorImageInfo dii[12];
+  for (unsigned k = 0; k < 12; ++k) dii[k].sampler = s->sampler, dii[k].imageView = views[k % 3], dii[k].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet writes[2];
+  memset(writes, 0, sizeof writes);
+  writes[0].sType = writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  writes[0].dstSet = writes[1].dstSet = set;
+  writes[0].dstBinding = 0, writes[0].descriptorCount = 1, writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, writes[0].pBufferInfo = &dbi;
+  writes[1].dstBinding = 1, writes[1].descriptorCount = 12, writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes[1].pImageInfo = dii;
+  p_vkUpdateDescriptorSets(r->dev, 2, writes, 0, NULL);
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof units_frag, smi.pCode = units_frag;
+  VkShaderModule fs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &fs);
+  VkPipelineLayout scene_layout = s->layout;
+  s->layout = layout;
+  VkResult result;
+  VkPipeline pipeline = make_pipeline(r, s, fs, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, &result);
+  s->layout = scene_layout;
+  check(result == VK_SUCCESS && pipeline, "a pipeline of twelve texture units");
+  if (pipeline) {
+    static const float white[15] = {-1, -1, 1, 1, 1, 3, -1, 1, 1, 1, -1, 3, 1, 1, 1};
+    memcpy(s->vertex_map, white, sizeof white);
+    s->layout = layout;
+    draw_frame_with(r, s, pipeline, set, 0, 0, 0);
+    s->layout = scene_layout;
+    const unsigned char *picture = (const unsigned char *)s->readback_map;
+    /* unit 1 green, unit 6 red, unit 11 blue: 0.25 red, 0.25 green, 0.5 blue */
+    check(near_pixel(pixel(picture, W, 20, 20), 128, 64, 64, 255) && near_pixel(pixel(picture, W, 45, 50), 128, 64, 64, 255), "twelve texture units: each reads the image bound to it");
+    if (!near_pixel(pixel(picture, W, 20, 20), 128, 64, 64, 255)) printf("    twelve units: pixel %08x\n", pixel(picture, W, 20, 20));
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  if (fs) p_vkDestroyShaderModule(r->dev, fs, NULL);
+  p_vkDestroyDescriptorPool(r->dev, pool, NULL);
+  p_vkDestroyPipelineLayout(r->dev, layout, NULL);
+  p_vkDestroyDescriptorSetLayout(r->dev, set_layout, NULL);
+  for (unsigned k = 0; k < 3; ++k) {
+    p_vkDestroyImageView(r->dev, views[k], NULL);
+    p_vkDestroyImage(r->dev, images[k], NULL);
+    p_vkFreeMemory(r->dev, memories[k], NULL);
+  }
+  p_vkDestroyBuffer(r->dev, staging, NULL);
+  p_vkFreeMemory(r->dev, staging_memory, NULL);
+}
+
+/* Sixteen vertex attributes and fifteen varyings (vk_manydraw.vert / .frag): the colour is x of attribute 1, y of attribute 8, z of attribute 15, through varyings 0, 7 and 14.
+ * Skipped on an adapter with fewer. */
+static void test_many_inputs(Rig *r, Scene *s) {
+  if (r->props.limits.maxVertexInputAttributes < 16 || r->props.limits.maxVertexOutputComponents < 64) {
+    printf("    %u vertex attributes, %u output components on this adapter: skipped\n", r->props.limits.maxVertexInputAttributes, r->props.limits.maxVertexOutputComponents);
+    return;
+  }
+  /* three vertices of sixteen vec4s: attribute 0 the position, 1 .. 15 values that the varyings carry */
+  VkDeviceMemory memory;
+  void *map;
+  VkBuffer vertices = make_buffer(r, 3 * 16 * 16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &memory, &map);
+  float *v = map;
+  static const float corners[3][2] = {{-1, -1}, {3, -1}, {-1, 3}};
+  for (unsigned i = 0; i < 3; ++i)
+    for (unsigned k = 0; k < 16; ++k) {
+      float *a = v + (i * 16 + k) * 4;
+      a[0] = k == 0 ? corners[i][0] : 0.9f, a[1] = k == 0 ? corners[i][1] : 0.9f, a[2] = 0.9f, a[3] = 1.0f;
+    }
+  v[(0 * 16 + 1) * 4 + 0] = v[(1 * 16 + 1) * 4 + 0] = v[(2 * 16 + 1) * 4 + 0] = 0.25f;   /* attribute 1, x */
+  v[(0 * 16 + 8) * 4 + 1] = v[(1 * 16 + 8) * 4 + 1] = v[(2 * 16 + 8) * 4 + 1] = 0.5f;    /* attribute 8, y */
+  v[(0 * 16 + 15) * 4 + 2] = v[(1 * 16 + 15) * 4 + 2] = v[(2 * 16 + 15) * 4 + 2] = 0.75f;   /* attribute 15, z */
+  VkVertexInputBindingDescription binding = {0, 16 * 16, VK_VERTEX_INPUT_RATE_VERTEX};
+  VkVertexInputAttributeDescription attrs[16];
+  for (unsigned k = 0; k < 16; ++k) attrs[k].location = k, attrs[k].binding = 0, attrs[k].format = VK_FORMAT_R32G32B32A32_SFLOAT, attrs[k].offset = 16 * k;
+  VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  vi.vertexBindingDescriptionCount = 1, vi.pVertexBindingDescriptions = &binding, vi.vertexAttributeDescriptionCount = 16, vi.pVertexAttributeDescriptions = attrs;
+  VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = sizeof manydraw_vert, smi.pCode = manydraw_vert;
+  VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &vs);
+  smi.codeSize = sizeof manydraw_frag, smi.pCode = manydraw_frag;
+  p_vkCreateShaderModule(r->dev, &smi, NULL, &fs);
+  VkResult result;
+  VkPipeline pipeline = make_pipeline_with(r, s, vs, fs, &vi, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, &result);
+  check(result == VK_SUCCESS && pipeline, "a pipeline of sixteen vertex attributes and fifteen varyings");
+  if (pipeline) {
+    VkBuffer scene_vertex = s->vertex;
+    s->vertex = vertices;
+    draw_frame(r, s, pipeline, 0, 0, 0);
+    s->vertex = scene_vertex;
+    const unsigned char *picture = (const unsigned char *)s->readback_map;
+    check(near_pixel(pixel(picture, W, 16, 16), 191, 128, 64, 255) && near_pixel(pixel(picture, W, 40, 50), 191, 128, 64, 255), "sixteen attributes and fifteen varyings reach the pixel shader");
+    if (!near_pixel(pixel(picture, W, 16, 16), 191, 128, 64, 255)) printf("    many inputs: pixel %08x\n", pixel(picture, W, 16, 16));
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  if (vs) p_vkDestroyShaderModule(r->dev, vs, NULL);
+  if (fs) p_vkDestroyShaderModule(r->dev, fs, NULL);
+  p_vkDestroyBuffer(r->dev, vertices, NULL);
+  p_vkFreeMemory(r->dev, memory, NULL);
+}
+
 /* Timestamps: two around a dispatch-free submission's work, read back with and without availability; they go up. */
 static void test_timestamps(Rig *r) {
   VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -998,6 +1247,9 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   test_compute(&r);
   test_compute_big(&r);
   test_cube_array(&r, &s);
+  test_textures_in_vertex_and_compute(&r, &s);
+  test_many_units(&r, &s);
+  test_many_inputs(&r, &s);
   test_timestamps(&r);
 
   /* copies and clears that need no GPU */

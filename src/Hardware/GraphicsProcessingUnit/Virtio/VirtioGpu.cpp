@@ -94,9 +94,10 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
   // flush for its display's refresh) takes milliseconds, and spinning that long is a core at 100% for nothing: after the first look the thread sleeps
   // (delay_us sleeps from 200 us on, where that is allowed) and checks again.
   const uint64_t start = uptime_us();
+  const uint64_t limit = head->type >= kCmdCtxCreate ? k3dCommandTimeoutUs : kCommandTimeoutUs;
   while (!control_.take_used(&index, &length)) {
     const uint64_t waited = uptime_us() - start;
-    if (waited >= kCommandTimeoutUs) {
+    if (waited >= limit) {
       in_flight_ = true;
       if (__atomic_fetch_add(&timeouts_, 1, __ATOMIC_ACQ_REL) % 16 == 0)
         console::debug_puts("virtio-gpu: the host is not answering (display hidden or busy?); skipping frames\n");
