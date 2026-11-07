@@ -1024,6 +1024,150 @@ static void test_timestamps(Rig *r) {
   p_vkDestroyQueryPool(r->dev, pool, NULL);
 }
 
+/* How long the work of a frame takes (no checks of its own beyond the calls succeeding): printed as "timing:" lines, for the speed of each adapter. */
+static double now_us(void) {
+  static LARGE_INTEGER frequency;
+  LARGE_INTEGER t;
+  if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+  QueryPerformanceCounter(&t);
+  return (double)t.QuadPart * 1e6 / (double)frequency.QuadPart;
+}
+static LRESULT CALLBACK timing_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) { return DefWindowProcW(hwnd, message, wparam, lparam); }
+/* `window`: 0 presents to the display, else into that window. */
+static void time_presents(Rig *r, HWND window, const char *what) {
+  VkWin32SurfaceCreateInfoKHR sci = {VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+  sci.hinstance = GetModuleHandleA(NULL), sci.hwnd = window;
+  VkSurfaceKHR surface = VK_NULL_HANDLE;
+  if (p_vkCreateWin32SurfaceKHR(g_instance, &sci, NULL, &surface) != VK_SUCCESS) return;
+  VkSurfaceCapabilitiesKHR caps;
+  unsigned nf = 1;
+  VkSurfaceFormatKHR format;
+  p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(r->pd, surface, &caps);
+  p_vkGetPhysicalDeviceSurfaceFormatsKHR(r->pd, surface, &nf, &format);
+  VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+  ci.surface = surface, ci.minImageCount = 2, ci.imageFormat = format.format, ci.imageColorSpace = format.colorSpace, ci.imageExtent = caps.currentExtent, ci.imageArrayLayers = 1;
+  ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, ci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, ci.presentMode = VK_PRESENT_MODE_FIFO_KHR, ci.clipped = VK_TRUE;
+  VkSwapchainKHR chain = VK_NULL_HANDLE;
+  if (p_vkCreateSwapchainKHR(r->dev, &ci, NULL, &chain) == VK_SUCCESS) {
+    unsigned n = 8;
+    VkImage images[8];
+    p_vkGetSwapchainImagesKHR(r->dev, chain, &n, images);
+    enum { kFrames = 60 };
+    double submit = 0, present = 0;
+    int ok = 1;
+    for (unsigned frame = 0; frame < kFrames && ok; ++frame) {
+      MSG msg;
+      while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+      unsigned index = 0;
+      p_vkAcquireNextImageKHR(r->dev, chain, ~0ull, VK_NULL_HANDLE, VK_NULL_HANDLE, &index);
+      const double t0 = now_us();
+      p_vkResetCommandBuffer(r->cb, 0);
+      VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      p_vkBeginCommandBuffer(r->cb, &bi);
+      VkClearColorValue cc = {{(float)(frame % 2), 0.5f, 0.25f, 1.0f}};
+      VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      p_vkCmdClearColorImage(r->cb, images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range);
+      p_vkEndCommandBuffer(r->cb);
+      submit_and_wait(r);
+      const double t1 = now_us();
+      VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+      pi.swapchainCount = 1, pi.pSwapchains = &chain, pi.pImageIndices = &index;
+      ok = p_vkQueuePresentKHR(r->queue, &pi) == VK_SUCCESS;
+      p_vkQueueWaitIdle(r->queue);
+      const double t2 = now_us();
+      submit += t1 - t0, present += t2 - t1;
+    }
+    printf("timing: %s %ux%u: clear %.0f us, present %.0f us a frame%s\n", what, caps.currentExtent.width, caps.currentExtent.height, submit / kFrames, present / kFrames, ok ? "" : " (a present failed)");
+    p_vkDestroySwapchainKHR(r->dev, chain, NULL);
+  }
+  p_vkDestroySurfaceKHR(g_instance, surface, NULL);
+}
+static void test_timing(Rig *r, Scene *s) {
+  enum { kRuns = 100, kDraws = 500 };
+  /* an empty submission: the cost of a round trip through the kernel */
+  p_vkResetCommandBuffer(r->cb, 0);
+  VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  p_vkBeginCommandBuffer(r->cb, &bi);
+  p_vkEndCommandBuffer(r->cb);
+  double t = now_us();
+  for (unsigned i = 0; i < kRuns; ++i) submit_and_wait(r);
+  printf("timing: empty submit %.0f us\n", (now_us() - t) / kRuns);
+  VkResult pr;
+  VkPipeline pipeline = make_pipeline(r, s, s->fs_color, VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE, &pr);
+  if (pipeline) {
+    /* a small frame: a pass with one draw and its picture copied to host memory */
+    t = now_us();
+    for (unsigned i = 0; i < kRuns; ++i) draw_frame(r, s, pipeline, 0.1f, 0.2f, 0.3f);
+    printf("timing: %ux%u frame, one draw, read back %.0f us\n", W, H, (now_us() - t) / kRuns);
+    /* many draws in one pass */
+    p_vkResetCommandBuffer(r->cb, 0);
+    p_vkBeginCommandBuffer(r->cb, &bi);
+    VkClearValue clear;
+    memset(&clear, 0, sizeof clear);
+    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = s->pass, rb.framebuffer = s->framebuffer, rb.renderArea.extent.width = W, rb.renderArea.extent.height = H, rb.clearValueCount = 1, rb.pClearValues = &clear;
+    p_vkCmdBeginRenderPass(r->cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    VkDeviceSize offset = 0;
+    p_vkCmdBindVertexBuffers(r->cb, 0, 1, &s->vertex, &offset);
+    p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 1, &s->set, 0, NULL);
+    for (unsigned i = 0; i < kDraws; ++i) p_vkCmdDraw(r->cb, 3, 1, 0, 0);
+    p_vkCmdEndRenderPass(r->cb);
+    p_vkEndCommandBuffer(r->cb);
+    enum { kManyRuns = 10 };
+    t = now_us();
+    for (unsigned i = 0; i < kManyRuns; ++i) submit_and_wait(r);
+    const double many = (now_us() - t) / kManyRuns;
+    printf("timing: %u draws in a pass %.0f us (%.1f us a draw)\n", kDraws, many, many / kDraws);
+    /* a big vertex buffer in memory that stays mapped (as engines keep theirs), one draw from it a frame: unchanged, then with a little of it written each frame */
+    {
+      enum { kBig = 4 << 20, kFrames = 30 };
+      VkDeviceMemory big_memory;
+      void *big_map = NULL;
+      VkBuffer big = make_buffer(r, kBig, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &big_memory, &big_map);
+      if (big_map) {
+        unsigned char *bytes = big_map;
+        for (unsigned i = 0; i < kBig; i += 60) memcpy(bytes + i, s->vertex_map, kBig - i < 60 ? kBig - i : 60);
+        for (int changing = 0; changing < 2; ++changing) {
+          p_vkResetCommandBuffer(r->cb, 0);
+          p_vkBeginCommandBuffer(r->cb, &bi);
+          p_vkCmdBeginRenderPass(r->cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+          p_vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+          p_vkCmdBindVertexBuffers(r->cb, 0, 1, &big, &offset);
+          p_vkCmdBindDescriptorSets(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 1, &s->set, 0, NULL);
+          p_vkCmdDraw(r->cb, 3, 1, 0, 0);
+          p_vkCmdEndRenderPass(r->cb);
+          p_vkEndCommandBuffer(r->cb);
+          submit_and_wait(r);   /* (the first use: the whole buffer goes up) */
+          t = now_us();
+          for (unsigned i = 0; i < kFrames; ++i) {
+            if (changing) memcpy(bytes + kBig / 2 + (i % 16) * 1024, s->vertex_map, 60);   /* (a vertex rewritten in the middle of the buffer, with what it held) */
+            submit_and_wait(r);
+          }
+          printf("timing: one draw from a mapped %u MiB vertex buffer, %s %.0f us a frame\n", kBig >> 20, changing ? "60 bytes of it written" : "unchanged", (now_us() - t) / kFrames);
+        }
+      }
+      p_vkDestroyBuffer(r->dev, big, NULL);
+      p_vkFreeMemory(r->dev, big_memory, NULL);
+    }
+    p_vkDestroyPipeline(r->dev, pipeline, NULL);
+  }
+  time_presents(r, NULL, "present to the display");
+  WNDCLASSW cls = {0};
+  cls.lpfnWndProc = timing_window_proc, cls.hInstance = GetModuleHandleA(NULL), cls.lpszClassName = L"vulkantest timing";
+  RegisterClassW(&cls);
+  RECT wr = {0, 0, 640, 480};
+  AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
+  HWND window = CreateWindowExW(0, cls.lpszClassName, L"vulkantest timing", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 40, wr.right - wr.left, wr.bottom - wr.top, NULL, NULL, cls.hInstance, NULL);
+  if (window) {
+    time_presents(r, window, "present into a window");
+    DestroyWindow(window);
+  } else {
+    printf("timing: no window (%lu)\n", (unsigned long)GetLastError());
+  }
+}
+
 static void test_device(VkPhysicalDevice pd, unsigned index) {
   Rig r;
   memset(&r, 0, sizeof r);
@@ -1251,6 +1395,7 @@ static void test_device(VkPhysicalDevice pd, unsigned index) {
   test_many_units(&r, &s);
   test_many_inputs(&r, &s);
   test_timestamps(&r);
+  test_timing(&r, &s);
 
   /* copies and clears that need no GPU */
   p_vkResetCommandBuffer(r.cb, 0);

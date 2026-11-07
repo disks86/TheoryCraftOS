@@ -53,9 +53,16 @@ VKAPI void VKAPI_CALL vkGetDeviceMemoryCommitment(VkDevice device, VkDeviceMemor
   *bytes = ((Mem *)memory)->size;
 }
 
-/* The version of a memory object, counting a mapped one as written since it was last looked at (a mapping is how the program writes without telling us). */
+/* The submissions so far (vkQueueSubmit counts them). */
+static UINT g_submission;
+
+/* The version of a memory object, counting a mapped one as written once in each submission (a mapping is how the program writes without telling us; Vulkan makes what the host
+ * wrote visible to the commands of a submission when it is submitted, not while it runs, so a buffer used by many draws of one submission is brought up once). */
 static UINT mem_version(Mem *m) {
-  if (m->mapped) ++m->version;
+  if (m->mapped && m->seen_submission != g_submission) {
+    ++m->version;
+    m->seen_submission = g_submission;
+  }
   return m->version;
 }
 
@@ -74,6 +81,7 @@ VKAPI void VKAPI_CALL vkDestroyBuffer(VkDevice device, VkBuffer buffer, const Vk
   (void)alloc;
   if (!b) return;
   kmt_free((Device *)device, b->alloc);
+  vk_free(b->sent);
   vk_free(b);
 }
 VKAPI void VKAPI_CALL vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkMemoryRequirements *r) {
@@ -107,11 +115,20 @@ static BOOL buf_sync(Buf *b, UINT *alloc_out) {
   }
   UINT version = mem_version(b->mem);
   if (b->synced != version) {
-    BYTE *p = kmt_lock(b->dev, b->alloc, 0, LOCK_DISCARD);
-    if (!p) return FALSE;
-    memcpy(p, b->mem->data + b->off, (size_t)b->size);
-    kmt_unlock(b->dev, b->alloc);
-    b->synced = version;
+    const BYTE *now = b->mem->data + b->off;
+    /* Mapped memory counts as written in every submission whether the program wrote it or not: what is the same as last time (static geometry an engine keeps mapped) is not
+     * copied up again. A buffer the CPU writes through the driver (copies, updates) or that the GPU wrote (sent is dropped) is copied as before. */
+    if (b->sent && b->synced != 0 && memcmp(b->sent, now, (size_t)b->size) == 0) {
+      b->synced = version;
+    } else {
+      BYTE *p = kmt_lock(b->dev, b->alloc, 0, LOCK_DISCARD);
+      if (!p) return FALSE;
+      memcpy(p, now, (size_t)b->size);
+      kmt_unlock(b->dev, b->alloc);
+      b->synced = version;
+      if (b->mem->mapped && !b->sent) b->sent = vk_alloc((size_t)b->size);
+      if (b->sent) memcpy(b->sent, now, (size_t)b->size);
+    }
   }
   *alloc_out = b->alloc;
   return TRUE;
@@ -127,6 +144,7 @@ static void buf_readback(Buf *b, ULONGLONG off, ULONGLONG size) {
   memcpy(b->mem->data + b->off + off, p + off, (size_t)size);
   kmt_unlock(b->dev, b->alloc);
   b->synced = b->mem->version;
+  if (b->sent) memcpy(b->sent + off, b->mem->data + b->off + off, (size_t)size);   /* (what the GPU holds now; the locked view is gone after the unlock) */
 }
 
 /* ---- images ---------------------------------------------------------------------------------------------------------------------------------------------------------------- */

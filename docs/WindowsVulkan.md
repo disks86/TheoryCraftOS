@@ -52,9 +52,12 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
   `vThreadID`, `vThreadGroupID`, `vThreadIDInGroup`, `vThreadIDInGroupFlattened`. Queue family 0 has `VK_QUEUE_COMPUTE_BIT` on an adapter with compute. Graphics and compute have
   their own bound pipeline and descriptor sets, as Vulkan's bind points do; push constants are shared.
 * **Memory** is host memory. A `VkBuffer` or `VkImage` bound to it gets a kernel allocation when the GPU needs it; the contents are copied to it when the program has written the
-  memory since (a mapped memory counts as written every time). Uniform buffers never reach the GPU as buffers: their bytes are read at draw time into the constant block.
+  memory since. A mapped memory counts as written once in each `vkQueueSubmit` (Vulkan makes host writes visible at the submission, not while it runs), so a buffer that many draws
+  of a submission use is brought up once; and a buffer in mapped memory keeps a copy of what it last sent, so one found unchanged (static geometry an engine keeps mapped) is not
+  copied at all. Uniform buffers never reach the GPU as buffers: their bytes are read at draw time into the constant block.
 * **Command buffers** are recorded as a list and run at `vkQueueSubmit`: a render pass is one command stream (`CommandStream.hpp`; a pass that does not fit the 64 KiB buffer of
-  the context is run in parts), copies, fills, updates and clears that the CPU can do are done in order with it. A vertex buffer is used directly when it is one binding of 32-bit
+  the context is run in parts), copies, fills, updates and clears that the CPU can do are done in order with it. A clear of an image that can be drawn into (one level, one layer,
+  one sample, not linear) is a pass that only clears it, in the stream, done by the GPU. A vertex buffer is used directly when it is one binding of 32-bit
   floats with the stride the pipeline expects; otherwise (normalised or integer formats, several bindings, instancing, other strides) the vertices are gathered into a temporary
   buffer of floats. Every submission has run when `vkQueueSubmit` returns, so fences, semaphores and events only keep a state.
 * **Dispatches** (`vkCmdDispatch`, `vkCmdDispatchIndirect`) are a stream of their own: the pipeline, the constants, the storage buffers (`BindUav`), `Dispatch`. When it has run, what
@@ -63,6 +66,16 @@ What differs between GPUs is what the adapter reports, and the driver exposes ex
   ones `kFeatureVertexStores` / `kFeatureFragmentStores`, which are `vertexPipelineStoresAndAtomics` / `fragmentStoresAndAtomics`) and copied back when the pass's stream has run.
 * **Presentation**: `VK_KHR_win32_surface` + `VK_KHR_swapchain`; a swapchain image is a kernel allocation that `D3DKMTPresent` flips onto the display. A swapchain image is a render target and a present image, and a texture only when the program asks to sample it: virgl cannot show an image that is also
   sampled (making it resident for the present fails, and a present that fails loses the context).
+
+## Speed
+
+`vulkantest.c` ends with `test_timing`, which prints `timing:` lines for each adapter: an empty submission, a 64 x 64 frame read back, 500 draws in a pass, one draw a frame from a
+mapped 4 MiB vertex buffer (unchanged, then with 60 bytes written), and a clear and present to the display and into a 640 x 480 window. On virgl in QEMU (2026-11-07): a draw 1 us
+(was 140 us), the mapped buffer 0.4 ms a frame unchanged and 3.6 ms written (it was copied and uploaded whole on every draw), a 640 x 480 clear 0.07 ms (was 2.1 ms on the CPU),
+a present 0.5 ms (was 1.6 ms). What it took: mapped memory counted as written once a submission, unchanged buffers not sent, clears on the GPU, virgl command streams and uploads
+sent without a fence (the host answers when it has the commands, not when its GPU is done: `VirtioGpu::execute`), and memory copies, fills and compares that are no longer a byte at
+a time (ntdll / msvcrt `libc_string.inc`, the kernel's `runtime.cpp`). Left: a written buffer is still sent whole (no range), and a present into a window reads the picture back
+from the host and the desktop composites it on the CPU.
 
 ## Not done
 

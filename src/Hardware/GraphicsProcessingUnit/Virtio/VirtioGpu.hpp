@@ -108,9 +108,12 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // busy): a command waits at most kCommandTimeoutUs, and while one is still outstanding the buffers
   // are not reused and further calls fail at once instead of piling up. The wait never masks interrupts,
   // so the rest of the system keeps running.
-  uint32_t execute(ConstByteView request, ByteView response = ByteView());
+  // A 3D command (a virgl context's) has a fence when `fence` is set: the host answers it only when its GPU has finished the work (and its fence poll has noticed). Without one the
+  // host answers as soon as it has taken the command in, and the GPU works on while the guest goes on: the host runs the commands of the queue in order, and what reads back
+  // (a transfer from the host) waits for the work before it, so only a caller that needs the GPU to be done - or the host to poll - asks for the fence.
+  uint32_t execute(ConstByteView request, ByteView response = ByteView(), bool fence = true);
   // execute() for commands that answer with "OK, no data".
-  bool command(ConstByteView request) { return execute(request) == virtio_gpu::kRespOkNoData; }
+  bool command(ConstByteView request, bool fence = true) { return execute(request, ByteView(), fence) == virtio_gpu::kRespOkNoData; }
   // Shows resource `id` (size w x h) on the screen and flushes it. The 2D screen comes back
   // on the next present() of this class.
   bool show_resource(uint32_t id, uint32_t width, uint32_t height);

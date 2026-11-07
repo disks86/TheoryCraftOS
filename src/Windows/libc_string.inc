@@ -20,31 +20,46 @@
  * tcos_win.h). Not compiled by itself. */
 
 
+/* The memory functions are what every program and DLL copies with (frames, vertex buffers, file data): a byte at a time is far too slow for them. The copies and fills are the
+ * string instructions (fast strings make rep movsb / stosb as quick as any loop of wide moves on the processors this runs on); the comparison goes 8 bytes at a time. These DLLs are
+ * built for x86-64 only. */
+static inline unsigned long long tcos_load8(const BYTE *p) {
+  unsigned long long v;
+  __builtin_memcpy(&v, p, 8);   /* (an unaligned load; the builtin stays a builtin with -fno-builtin) */
+  return v;
+}
 EXPORT void *memcpy(void *d, const void *s, size_t_ n) {
-  BYTE *p = d;
-  const BYTE *q = s;
-  while (n--) *p++ = *q++;
-  return d;
+  void *r = d;
+  __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
+  return r;
 }
 EXPORT void *memmove(void *d, const void *s, size_t_ n) {
   BYTE *p = d;
   const BYTE *q = s;
-  if (p < q) {
-    while (n--) *p++ = *q++;
-  } else {
-    p += n;
-    q += n;
-    while (n--) *--p = *--q;
+  if (p <= q || p >= q + n) {   /* (the destination is not inside the source after its start: copying forwards reads each byte before it is overwritten) */
+    __asm__ volatile("rep movsb" : "+D"(p), "+S"(q), "+c"(n) : : "memory");
+    return d;
   }
+  /* Backwards, 8 bytes at a time while there are as many left, then the bytes at the start. */
+  p += n;
+  q += n;
+  while (n >= 8) {
+    p -= 8, q -= 8, n -= 8;
+    const unsigned long long v = tcos_load8(q);
+    __builtin_memcpy(p, &v, 8);
+  }
+  while (n--) *--p = *--q;
   return d;
 }
 EXPORT void *memset(void *d, int c, size_t_ n) {
-  BYTE *p = d;
-  while (n--) *p++ = (BYTE)c;
-  return d;
+  void *r = d;
+  __asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
+  return r;
 }
 EXPORT int memcmp(const void *a, const void *b, size_t_ n) {
   const BYTE *p = a, *q = b;
+  for (; n >= 8; n -= 8, p += 8, q += 8)
+    if (tcos_load8(p) != tcos_load8(q)) break;   /* (the bytes of this word decide: compared one at a time below) */
   for (; n; --n, ++p, ++q) if (*p != *q) return *p < *q ? -1 : 1;
   return 0;
 }
