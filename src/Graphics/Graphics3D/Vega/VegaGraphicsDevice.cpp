@@ -132,6 +132,10 @@ class VegaModule final : public IShaderModule {
   const List<uint32_t>& code() const { return code_; }
   List<uint32_t>& code() { return code_; }
   gcn::ShaderInfo info;
+  // What each register means (the TGSI declarations): a vertex shader's outputs and a pixel shader's inputs are linked by these, not by their order.
+  uint32_t registers = 0;
+  gcn::TgsiSemantic semantic[gcn::TgsiShader::kMaxInputs > gcn::TgsiShader::kMaxOutputs ? gcn::TgsiShader::kMaxInputs : gcn::TgsiShader::kMaxOutputs] = {};
+  uint8_t semantic_index[sizeof semantic / sizeof semantic[0]] = {};
 
  private:
   ShaderStage stage_;
@@ -206,6 +210,7 @@ class VegaPipeline final : public IPipeline {
   GraphicsPipelineDesc desc_;
   List<uint32_t> vertex_code_, pixel_code_;
   gcn::ShaderInfo vertex_info, pixel_info;
+  uint8_t ps_param[16] = {};   // the vertex shader's parameter export each pixel shader attribute reads (SPI_PS_INPUT_CNTL_k.OFFSET)
   gcn::BlendState blend;
   gcn::DepthStencilState depth_stencil;
 };
@@ -237,6 +242,7 @@ struct VegaGraphicsDevice::DrawArgs {
   VegaImage* color = nullptr;
   VegaImage* depth = nullptr;
   Rect2D scissor;
+  Viewport viewport;   // (in the target's pixels; the whole target when no viewport was set)
   IBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
   IBuffer* index_buffer = nullptr;
@@ -297,6 +303,12 @@ IShaderModule* VegaGraphicsDevice::create_shader_module(const ShaderModuleDesc& 
   VegaModule* module = make<VegaModule>(allocator_, allocator_, desc.stage);
   if (!module) return nullptr;
   module->info = info;
+  const bool fragment = desc.stage == ShaderStage::Fragment;
+  module->registers = fragment ? shader.inputs : shader.outputs;
+  for (uint32_t k = 0; k < module->registers; ++k) {
+    module->semantic[k] = fragment ? shader.input_semantic[k] : shader.output_semantic[k];
+    module->semantic_index[k] = fragment ? shader.input_semantic_index[k] : shader.output_semantic_index[k];
+  }
   for (const uint32_t w : code.words())
     if (!module->code().push_back(w)) {
       destroy(allocator_, module);
@@ -315,8 +327,22 @@ IPipeline* VegaGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
   for (uint32_t i = 0; i < desc.attribute_count; ++i)
     if (desc.attributes[i].location >= gcn::abi::kMaxAttributes || desc.attributes[i].per_instance || desc.attributes[i].offset % 4 != 0) return nullptr;
   if (fs->info.color_outputs != 1 || (fs->info.samplers_used >> desc.texture_count) != 0) return nullptr;
+  // Each attribute the pixel shader reads comes from the vertex shader's output of the same meaning (GENERIC[n] from GENERIC[n]), wherever the two declare it; a pixel shader input
+  // the vertex shader does not write is refused.
+  uint8_t ps_param[16] = {};
+  for (uint32_t k = 0; k < fs->registers; ++k) {
+    const uint32_t attr = fs->info.input_attribute[k];
+    if (attr == 0xFF) continue;
+    if (attr >= 16) return nullptr;
+    uint32_t param = 0xFF;
+    for (uint32_t o = 0; o < vs->registers && param == 0xFF; ++o)
+      if (vs->semantic[o] == fs->semantic[k] && vs->semantic_index[o] == fs->semantic_index[k]) param = vs->info.output_param[o];
+    if (param == 0xFF) return nullptr;
+    ps_param[attr] = static_cast<uint8_t>(param);
+  }
   VegaPipeline* p = make<VegaPipeline>(allocator_, allocator_, desc);
   if (!p) return nullptr;
+  for (uint32_t k = 0; k < 16; ++k) p->ps_param[k] = ps_param[k];
   p->desc_.vertex_shader = p->desc_.fragment_shader = nullptr;   // (the code is copied: the modules may go first)
   for (const uint32_t w : vs->code()) p->vertex_code_.push_back(w);
   for (const uint32_t w : fs->code()) p->pixel_code_.push_back(w);
@@ -351,6 +377,7 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
   r.width = width;
   r.height = height;
   r.device_clip_space = true;
+  r.viewport = {true, a.viewport.x, a.viewport.y, a.viewport.width, a.viewport.height, a.viewport.min_depth, a.viewport.max_depth};
   r.blend = pipe.blend;
   r.depth_stencil = pipe.depth_stencil;
   if (!a.depth) {   // (nothing to test against: every fragment passes, as on the software device)
@@ -364,7 +391,7 @@ bool VegaGraphicsDevice::run_draw(const DrawArgs& a) {
     r.attributes[at.location] = {static_cast<uint32_t>(at.format) + 1, at.offset};
   }
   r.vertex_stride = pd.vertex_stride;
-  r.ps_param[0] = 0;   // (the interpolants in order: the default)
+  for (uint32_t k = 0; k < 16; ++k) r.ps_param[k] = pipe.ps_param[k];   // (linked by meaning when the pipeline was made)
   // the constants: the same rows for both stages
   r.vertex_constants = ArrayView<const float>(a.constants, uint64_t{a.constant_rows} * 4);
   r.pixel_constants = r.vertex_constants;
@@ -551,9 +578,10 @@ bool VegaGraphicsDevice::submit(ICommandBuffer* commands) {
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !a.index_buffer) return fail("an indexed draw without indices");
         if (topology != PrimitiveTopology::TriangleList) return fail("lines and points");
-        const Extent2D e = a.color->extent();
-        if (viewport.x != 0 || viewport.y != 0 || viewport.width != static_cast<float>(e.width) || viewport.height != static_cast<float>(e.height) || viewport.min_depth != 0 || viewport.max_depth != 1)
-          return fail("a viewport other than the whole target");
+        if (!(viewport.width > 0 && viewport.height > 0 && viewport.x >= -16384.0f && viewport.y >= -16384.0f && viewport.x + viewport.width <= 16384.0f && viewport.y + viewport.height <= 16384.0f &&
+              viewport.min_depth >= 0 && viewport.max_depth <= 1 && viewport.min_depth <= viewport.max_depth))
+          return fail("a viewport the card cannot take");
+        a.viewport = viewport;
         a.indexed = indexed;
         a.count = cmd.count;
         a.first = cmd.first;

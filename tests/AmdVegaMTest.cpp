@@ -45,6 +45,7 @@
 #include "FakeAmdIh3.hpp"
 #include "FakeAmdSdma3.hpp"
 #include "AtomBiosImage.hpp"
+#include "DxgkrnlDeviceSuite.hpp"
 
 using namespace hardware;
 
@@ -3564,6 +3565,12 @@ static void test_graphics_device() {
   no_text.tgsi = nullptr;
   CHECK(device.create_shader_module(no_text) == nullptr);
   CHECK(!device.present(nullptr));
+
+  // Every Direct3D conformance scene the system runs at boot on each accelerated GPU: drawn as the CPU renderer draws it, or refused, never wrong or broken.
+  dxgk_suite::ConformanceCounts counts;
+  CHECK(dxgk_suite::conformance(rig.alloc, device, nullptr, "Radeon RX Vega M", &counts) == 0);
+  CHECK(counts.same >= 10);
+  printf("  conformance on the Vega M: %u scenes the same, %u refused\n", counts.same, counts.refused);
   release_view(rig.alloc, got);
   release_view(rig.alloc, want);
   vega.shutdown();

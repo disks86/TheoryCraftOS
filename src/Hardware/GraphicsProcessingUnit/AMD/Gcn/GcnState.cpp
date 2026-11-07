@@ -53,6 +53,13 @@ bool surface_ok(uint32_t tile_index, uint32_t bytes, uint32_t pitch, uint64_t ad
 // DB_Z_INFO / DB_STENCIL_INFO.TILE_SPLIT: the tile split of the table entry
 uint32_t tile_split_code(uint32_t tile_index) { return (tile_mode_register(tile_index) & GB_TILE_MODE0__TILE_SPLIT_MASK) >> GB_TILE_MODE0__TILE_SPLIT__SHIFT; }
 
+// A viewport the registers can hold: a finite rectangle of some size within the rasterizer's range (16K pixels either way), a depth range inside 0 to 1.
+bool viewport_ok(const ViewportRect& v) {
+  if (!v.set) return true;
+  const float limit = 16384.0f;
+  return v.x >= -limit && v.y >= -limit && v.width > 0 && v.height > 0 && v.x + v.width <= limit && v.y + v.height <= limit && v.min_depth >= 0 && v.max_depth <= 1 && v.min_depth <= v.max_depth;
+}
+
 bool blend_ok(const BlendState& b) {
   return b.color_src <= 0x1F && b.color_dst <= 0x1F && b.alpha_src <= 0x1F && b.alpha_dst <= 0x1F && b.color_op <= 7 && b.alpha_op <= 7 && (b.write_mask & ~0xFu) == 0;
 }
@@ -100,7 +107,7 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                   t.pitch_pixels >= t.width && t.pitch_pixels % 8 == 0 && t.pitch_pixels <= kMaxTargetDimension && (t.address & 0xFF) == 0 && fits(t.address) && t.address != 0 &&
                   pi.ps_inputs <= kMaxInterpolants && vi.param_exports <= kMaxInterpolants && s.index_count != 0 && (!indexed || (fits(s.index_address) && s.index_max >= s.index_count)) &&
                   (s.fence_address == 0 || ((s.fence_address & 7) == 0 && fits(s.fence_address))) && surface_ok(t.tile_index, ColorTarget::kPixelBytes, t.pitch_pixels, t.address) && blend_ok(s.blend) &&
-                  pi.color_outputs >= 1 && pi.color_outputs <= 2 && (!s.blend.uses_second_source() || pi.color_outputs == 2);
+                  pi.color_outputs >= 1 && pi.color_outputs <= 2 && (!s.blend.uses_second_source() || pi.color_outputs == 2) && viewport_ok(s.viewport);
   if (!ok) return false;
   const DepthTarget& dt = s.depth;
   const bool has_z = dt.z_address != 0, has_stencil = dt.stencil_address != 0;
@@ -204,11 +211,14 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
                              (pitch8 * rows8 == 0 ? 0 : pitch8 * rows8 - 1) << DB_DEPTH_SLICE__SLICE_TILE_MAX__SHIFT};
   w.set_context_reg(mmDB_Z_INFO, ArrayView<const uint32_t>(planes, 8));
 
-  // the viewport transform over the target (y down), scissors over the target, no clipping modes beyond the defaults, pixel centres at the half
+  // the viewport transform over the viewport rectangle (the target unless set; y down), scissors over the target and the viewport, no clipping modes beyond the defaults, pixel
+  // centres at the half
+  const ViewportRect& vp = s.viewport;
+  const float vx = vp.set ? vp.x : 0.0f, vy = vp.set ? vp.y : 0.0f, vw = vp.set ? vp.width : static_cast<float>(t.width), vh = vp.set ? vp.height : static_cast<float>(t.height);
+  const float zmin = vp.set ? vp.min_depth : 0.0f, zmax = vp.set ? vp.max_depth : 1.0f;
   const float y_sign = s.device_clip_space ? 1.0f : -1.0f;                 // (clip +Y down the screen, or up as in OpenGL)
-  const float z_scale = s.device_clip_space ? 1.0f : 0.5f, z_offset = s.device_clip_space ? 0.0f : 0.5f;   // (depth 0 to 1, or -1 to 1 mapped onto it)
-  const uint32_t viewport[] = {float_bits(0.5f * static_cast<float>(t.width)), float_bits(0.5f * static_cast<float>(t.width)), float_bits(y_sign * 0.5f * static_cast<float>(t.height)),
-                               float_bits(0.5f * static_cast<float>(t.height)), float_bits(z_scale), float_bits(z_offset)};
+  const float z_scale = s.device_clip_space ? zmax - zmin : 0.5f * (zmax - zmin), z_offset = s.device_clip_space ? zmin : zmin + 0.5f * (zmax - zmin);   // (depth 0 to 1, or -1 to 1 mapped onto the range)
+  const uint32_t viewport[] = {float_bits(0.5f * vw), float_bits(vx + 0.5f * vw), float_bits(y_sign * 0.5f * vh), float_bits(vy + 0.5f * vh), float_bits(z_scale), float_bits(z_offset)};
   w.set_context_reg(mmPA_CL_VPORT_XSCALE, ArrayView<const uint32_t>(viewport, 6));
   const uint32_t vte = (1u << PA_CL_VTE_CNTL__VPORT_X_SCALE_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_X_OFFSET_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_Y_SCALE_ENA__SHIFT) |
                        (1u << PA_CL_VTE_CNTL__VPORT_Y_OFFSET_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_Z_SCALE_ENA__SHIFT) | (1u << PA_CL_VTE_CNTL__VPORT_Z_OFFSET_ENA__SHIFT) |
@@ -227,9 +237,18 @@ bool emit_draw(Pm4Writer& w, const DrawState& s) {
   w.set_context_reg(mmPA_SC_WINDOW_SCISSOR_BR, scissor_br);
   w.set_context_reg(mmPA_SC_GENERIC_SCISSOR_TL, scissor_tl);
   w.set_context_reg(mmPA_SC_GENERIC_SCISSOR_BR, scissor_br);
-  w.set_context_reg(mmPA_SC_VPORT_SCISSOR_0_TL, scissor_tl);
-  w.set_context_reg(mmPA_SC_VPORT_SCISSOR_0_BR, scissor_br);
-  const uint32_t zrange[] = {float_bits(0.0f), float_bits(1.0f)};
+  // (the viewport scissor: the pixels the viewport touches, its edges rounded outwards as radeonsi does, within the target; the clipper keeps triangles inside the viewport itself)
+  auto pixel_edge = [](float edge, bool up, uint32_t limit) {
+    if (edge <= 0.0f) return 0u;
+    if (edge >= static_cast<float>(limit)) return limit;
+    const uint32_t whole = static_cast<uint32_t>(edge);   // (positive: the conversion is the floor)
+    return up && static_cast<float>(whole) < edge ? whole + 1 : whole;
+  };
+  const uint32_t vl = pixel_edge(vx, false, t.width), vt = pixel_edge(vy, false, t.height), vr = pixel_edge(vx + vw, true, t.width), vb = pixel_edge(vy + vh, true, t.height);
+  w.set_context_reg(mmPA_SC_VPORT_SCISSOR_0_TL, (1u << PA_SC_WINDOW_SCISSOR_TL__WINDOW_OFFSET_DISABLE__SHIFT) | (vl << PA_SC_WINDOW_SCISSOR_TL__TL_X__SHIFT) | (vt << PA_SC_WINDOW_SCISSOR_TL__TL_Y__SHIFT));
+  w.set_context_reg(mmPA_SC_VPORT_SCISSOR_0_BR, (vr << PA_SC_WINDOW_SCISSOR_BR__BR_X__SHIFT) | (vb << PA_SC_WINDOW_SCISSOR_BR__BR_Y__SHIFT));
+  w.set_context_reg(mmPA_SC_MODE_CNTL_0, 1u << PA_SC_MODE_CNTL_0__VPORT_SCISSOR_ENABLE__SHIFT);
+  const uint32_t zrange[] = {float_bits(zmin), float_bits(zmax)};
   w.set_context_reg(mmPA_SC_VPORT_ZMIN_0, ArrayView<const uint32_t>(zrange, 2));
 
   // the primitives and the draw

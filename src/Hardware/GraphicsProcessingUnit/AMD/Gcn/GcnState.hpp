@@ -64,6 +64,14 @@ struct DepthTarget {
   static constexpr uint32_t kTiled1DThinTileIndex = 13;
 };
 
+// The rectangle of the target clip space maps onto (pixels, y down) and the depth range it maps onto; unset: the whole target and 0 to 1. Pixels outside it are not drawn (the
+// viewport scissor).
+struct ViewportRect {
+  bool set = false;
+  float x = 0, y = 0, width = 0, height = 0;
+  float min_depth = 0, max_depth = 1;
+};
+
 struct DrawState {
   ShaderProgram vertex, pixel;
   uint64_t vertex_constants = 0;      // GPU addresses of the constant rows each stage reads (user data 0, 1) and of the descriptor table (user data 2, 3)
@@ -76,6 +84,7 @@ struct DrawState {
   uint8_t ps_param[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};      // SPI_PS_INPUT_CNTL_k.OFFSET: the parameter pixel shader input k reads
   // The clip space of this OS's devices (IGraphicsDevice: Vulkan's): +Y down the screen and depth 0 to 1, instead of OpenGL's +Y up and -1 to 1.
   bool device_clip_space = false;
+  ViewportRect viewport;
   // The draw: `index_count` vertices (a triangle list) numbered 0, 1, 2 ... (DRAW_INDEX_AUTO), or when `index_address` is not 0 the 32 bit indices at that address (DRAW_INDEX_2).
   uint32_t index_count = 0;
   uint64_t index_address = 0;

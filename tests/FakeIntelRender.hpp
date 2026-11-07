@@ -255,13 +255,17 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
   const int32_t x_max = static_cast<int32_t>(dump[rect + 2] & 0xFFFF), y_max = static_cast<int32_t>(dump[rect + 2] >> 16);
   auto to8 = [](float c) { return static_cast<uint8_t>((c < 0 ? 0 : c > 1 ? 1 : c) * 255.0f + 0.5f); };
   auto cross = [](float ax, float ay, float bx, float by, float px, float py) { return (bx - ax) * (py - ay) - (by - ay) * (px - ax); };
+  // The primitives in their order, as the hardware draws them: a later triangle is tested against (and blends over) what an earlier one of the same job drew.
+  const bool rect_list = dump[topo + 1] == kTopologyRectList;
+  const uint32_t primitives = rect_list ? 1 : count / 3;
+  for (uint32_t primitive = 0; primitive < primitives; ++primitive)
   for (int32_t y = y_min; y <= y_max && y < static_cast<int32_t>(height); ++y) {
     for (int32_t x = x_min; x <= x_max && x < static_cast<int32_t>(width); ++x) {
       const float px = static_cast<float>(x) + 0.5f, py = static_cast<float>(y) + 0.5f;
       float color[4] = {flat_color[0], flat_color[1], flat_color[2], flat_color[3]};
       bool covered = false;
       float z = v[2];
-      if (dump[topo + 1] == kTopologyRectList) {
+      if (rect_list) {
         float lx = v[0], hx = v[0], ly = v[1], hy = v[1];
         for (int k = 1; k < 3; ++k) {
           if (v[k * 8] < lx) lx = v[k * 8];
@@ -271,7 +275,7 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
         }
         covered = px > lx && px < hx && py > ly && py < hy;
       } else {
-        for (uint32_t t = 0; t + 2 < count && !covered; t += 3) {
+        for (uint32_t t = 3 * primitive; t == 3 * primitive && t + 2 < count; t += 3) {   // (this primitive only: `continue` leaves it uncovered)
           const float* a = &v[t * 8];
           const float* b = &v[(t + 1) * 8];
           const float* c = &v[(t + 2) * 8];

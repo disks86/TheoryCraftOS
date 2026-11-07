@@ -285,6 +285,7 @@ bool AmdVegaDraw::draw(AmdVegaM& card, const VegaDrawRequest& r, uint64_t area_o
   if (uses_stencil(r)) s.depth.stencil_address = base + p.stencil;
   for (uint32_t k = 0; k < 16; ++k) s.ps_param[k] = r.ps_param[k];
   s.device_clip_space = r.device_clip_space;
+  s.viewport = r.viewport;
   s.index_count = vertex_count;
   if (r.indices.size() != 0) {
     s.index_address = base + p.indices;

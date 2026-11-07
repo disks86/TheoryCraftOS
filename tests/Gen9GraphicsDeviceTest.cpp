@@ -440,6 +440,16 @@ static void test_direct3d_kernel() {
   CHECK(caps.textures && caps.stencil && caps.mipmaps && caps.programmable_vertex && !caps.programmable_pixel);
 }
 
+// Every Direct3D conformance scene the system runs at boot: drawn as the CPU renderer draws it, or refused (the pixel stage takes only two fixed kernels), never wrong.
+static void test_conformance() {
+  Pair p;
+  if (!p.gpu) { CHECK(false); return; }
+  dxgk_suite::ConformanceCounts n;
+  CHECK(dxgk_suite::conformance(p.alloc, *p.gpu, &p.display, "Intel Gen9", &n) == 0);
+  CHECK(n.same >= 3);
+  printf("  conformance on Intel Gen9: %u scenes the same, %u refused\n", n.same, n.refused);
+}
+
 static void test_scenes() {
   Pair p;
   if (!p.gpu) { CHECK(false); return; }
@@ -1163,6 +1173,7 @@ int main() {
   test_scenes();
   test_programmable_vertex();
   test_direct3d_kernel();
+  test_conformance();
   test_textures();
   test_tiling_and_mipmaps();
   test_stencil();
