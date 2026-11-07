@@ -82,3 +82,5 @@ SetWindowTheme @196
 SetWindowThemeAttribute @197
 ThemeInitApiHook @198
 UpdatePanningFeedback @199
+
+OpenThemeDataForDpi @194

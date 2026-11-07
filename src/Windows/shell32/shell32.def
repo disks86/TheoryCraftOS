@@ -33,6 +33,8 @@ MonitorFromWindow = user32.MonitorFromWindow
 GetSystemWow64DirectoryA = kernel32.GetSystemWow64DirectoryA
 IsWow64Process = kernel32.IsWow64Process
 ; ordinals that programs import by number
+SHChangeNotifyRegister @2
+SHChangeNotifyDeregister @4
 SHAllocShared @7
 SHLockShared @8
 ILFindLastID @16
@@ -68,12 +70,11 @@ SHFree @195
 SHAlloc @196
 ReadCabinetState @654
 WriteCabinetState @652
+IsUserAnAdmin @680
 SetCurrentProcessExplicitAppUserModelID = shcore.SetCurrentProcessExplicitAppUserModelID @563
 GetCurrentProcessExplicitAppUserModelID = shcore.GetCurrentProcessExplicitAppUserModelID @307
 ; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
-SHChangeNotifyRegister @2
 SHDefExtractIconA @3
-SHChangeNotifyDeregister @4
 SHDefExtractIconW @6
 PifMgr_OpenProperties @9
 PifMgr_GetProperties @10
@@ -330,7 +331,6 @@ WOWShellExecute @612
 WaitForExplorerRestartW @613
 SHChangeNotification_Lock @644
 SHChangeNotification_Unlock @645
-IsUserAnAdmin @680
 StgMakeUniqueName @682
 SHPropStgCreate @685
 SHPropStgReadMultiple @688

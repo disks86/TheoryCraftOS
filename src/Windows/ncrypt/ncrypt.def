@@ -1,62 +1,62 @@
 LIBRARY ncrypt.dll
 EXPORTS
+BCryptAddContextFunction = bcrypt.BCryptAddContextFunction @1
+BCryptAddContextFunctionProvider = bcrypt.BCryptAddContextFunctionProvider @2
+BCryptCloseAlgorithmProvider = bcrypt.BCryptCloseAlgorithmProvider @3
+BCryptConfigureContext = bcrypt.BCryptConfigureContext @4
+BCryptConfigureContextFunction = bcrypt.BCryptConfigureContextFunction @5
+BCryptCreateContext = bcrypt.BCryptCreateContext @6
+BCryptCreateHash = bcrypt.BCryptCreateHash @7
+BCryptDecrypt = bcrypt.BCryptDecrypt @10
+BCryptDeleteContext = bcrypt.BCryptDeleteContext @11
+BCryptDeriveKey = bcrypt.BCryptDeriveKey @12
+BCryptDeriveKeyCapi = bcrypt.BCryptDeriveKeyCapi @13
+BCryptDeriveKeyPBKDF2 = bcrypt.BCryptDeriveKeyPBKDF2 @14
+BCryptDestroyHash = bcrypt.BCryptDestroyHash @15
+BCryptDestroyKey = bcrypt.BCryptDestroyKey @16
+BCryptDestroySecret = bcrypt.BCryptDestroySecret @17
+BCryptDuplicateHash = bcrypt.BCryptDuplicateHash @18
+BCryptDuplicateKey = bcrypt.BCryptDuplicateKey @19
+BCryptEncrypt = bcrypt.BCryptEncrypt @21
+BCryptEnumAlgorithms = bcrypt.BCryptEnumAlgorithms @22
+BCryptEnumContextFunctionProviders = bcrypt.BCryptEnumContextFunctionProviders @23
+BCryptEnumContextFunctions = bcrypt.BCryptEnumContextFunctions @24
+BCryptEnumContexts = bcrypt.BCryptEnumContexts @25
+BCryptEnumProviders = bcrypt.BCryptEnumProviders @26
+BCryptEnumRegisteredProviders = bcrypt.BCryptEnumRegisteredProviders @27
+BCryptExportKey = bcrypt.BCryptExportKey @28
+BCryptFinalizeKeyPair = bcrypt.BCryptFinalizeKeyPair @29
+BCryptFinishHash = bcrypt.BCryptFinishHash @30
+BCryptFreeBuffer = bcrypt.BCryptFreeBuffer @31
+BCryptGenRandom = bcrypt.BCryptGenRandom @32
+BCryptGenerateKeyPair = bcrypt.BCryptGenerateKeyPair @33
+BCryptGenerateSymmetricKey = bcrypt.BCryptGenerateSymmetricKey @34
+BCryptGetFipsAlgorithmMode = bcrypt.BCryptGetFipsAlgorithmMode @35
+BCryptGetProperty = bcrypt.BCryptGetProperty @36
+BCryptHash = bcrypt.BCryptHash @37
+BCryptHashData = bcrypt.BCryptHashData @38
+BCryptImportKey = bcrypt.BCryptImportKey @39
+BCryptImportKeyPair = bcrypt.BCryptImportKeyPair @40
+BCryptKeyDerivation = bcrypt.BCryptKeyDerivation @41
+BCryptOpenAlgorithmProvider = bcrypt.BCryptOpenAlgorithmProvider @42
+BCryptQueryContextConfiguration = bcrypt.BCryptQueryContextConfiguration @44
+BCryptQueryContextFunctionConfiguration = bcrypt.BCryptQueryContextFunctionConfiguration @45
+BCryptQueryContextFunctionProperty = bcrypt.BCryptQueryContextFunctionProperty @46
+BCryptQueryProviderRegistration = bcrypt.BCryptQueryProviderRegistration @47
+BCryptRegisterConfigChangeNotify = bcrypt.BCryptRegisterConfigChangeNotify @48
+BCryptRegisterProvider = bcrypt.BCryptRegisterProvider @49
+BCryptRemoveContextFunction = bcrypt.BCryptRemoveContextFunction @50
+BCryptRemoveContextFunctionProvider = bcrypt.BCryptRemoveContextFunctionProvider @51
+BCryptResolveProviders = bcrypt.BCryptResolveProviders @52
+BCryptSecretAgreement = bcrypt.BCryptSecretAgreement @53
+BCryptSetAuditingInterface = bcrypt.BCryptSetAuditingInterface @54
+BCryptSetContextFunctionProperty = bcrypt.BCryptSetContextFunctionProperty @55
+BCryptSetProperty = bcrypt.BCryptSetProperty @56
+BCryptSignHash = bcrypt.BCryptSignHash @57
+BCryptUnregisterConfigChangeNotify = bcrypt.BCryptUnregisterConfigChangeNotify @58
+BCryptUnregisterProvider = bcrypt.BCryptUnregisterProvider @59
+BCryptVerifySignature = bcrypt.BCryptVerifySignature @60
 ; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
-BCryptAddContextFunction @1
-BCryptAddContextFunctionProvider @2
-BCryptCloseAlgorithmProvider @3
-BCryptConfigureContext @4
-BCryptConfigureContextFunction @5
-BCryptCreateContext @6
-BCryptCreateHash @7
-BCryptDecrypt @10
-BCryptDeleteContext @11
-BCryptDeriveKey @12
-BCryptDeriveKeyCapi @13
-BCryptDeriveKeyPBKDF2 @14
-BCryptDestroyHash @15
-BCryptDestroyKey @16
-BCryptDestroySecret @17
-BCryptDuplicateHash @18
-BCryptDuplicateKey @19
-BCryptEncrypt @21
-BCryptEnumAlgorithms @22
-BCryptEnumContextFunctionProviders @23
-BCryptEnumContextFunctions @24
-BCryptEnumContexts @25
-BCryptEnumProviders @26
-BCryptEnumRegisteredProviders @27
-BCryptExportKey @28
-BCryptFinalizeKeyPair @29
-BCryptFinishHash @30
-BCryptFreeBuffer @31
-BCryptGenRandom @32
-BCryptGenerateKeyPair @33
-BCryptGenerateSymmetricKey @34
-BCryptGetFipsAlgorithmMode @35
-BCryptGetProperty @36
-BCryptHash @37
-BCryptHashData @38
-BCryptImportKey @39
-BCryptImportKeyPair @40
-BCryptKeyDerivation @41
-BCryptOpenAlgorithmProvider @42
-BCryptQueryContextConfiguration @44
-BCryptQueryContextFunctionConfiguration @45
-BCryptQueryContextFunctionProperty @46
-BCryptQueryProviderRegistration @47
-BCryptRegisterConfigChangeNotify @48
-BCryptRegisterProvider @49
-BCryptRemoveContextFunction @50
-BCryptRemoveContextFunctionProvider @51
-BCryptResolveProviders @52
-BCryptSecretAgreement @53
-BCryptSetAuditingInterface @54
-BCryptSetContextFunctionProperty @55
-BCryptSetProperty @56
-BCryptSignHash @57
-BCryptUnregisterConfigChangeNotify @58
-BCryptUnregisterProvider @59
-BCryptVerifySignature @60
 GetIsolationServerInterface @61
 GetKeyStorageInterface @62
 GetSChannelInterface @63

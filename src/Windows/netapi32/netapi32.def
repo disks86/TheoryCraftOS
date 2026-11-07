@@ -295,3 +295,6 @@ RxNetAccessSetInfo @295
 RxNetServerEnum @296
 RxNetUserPasswordSet @297
 RxRemoteApi @298
+
+NetFreeAadJoinInformation @131
+NetGetAadJoinInformation @132

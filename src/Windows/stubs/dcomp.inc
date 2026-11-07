@@ -19,10 +19,6 @@
  * To implement one, define it in the DLL and delete its line here. */
 X(DCompositionAttachMouseDragToHwnd)
 X(DCompositionAttachMouseWheelToHwnd)
-X(DCompositionCreateDevice)
-X(DCompositionCreateDevice2)
-X(DCompositionCreateDevice3)
-X(DCompositionCreateSurfaceHandle)
 X(DllCanUnloadNow)
 X(DllGetActivationFactory)
 X(DllGetClassObject)

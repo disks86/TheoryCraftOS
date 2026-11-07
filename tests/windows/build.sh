@@ -82,6 +82,18 @@ $cc -O1 -Wall -Wextra -o "$out/user32test.exe" tests/windows/user32test.c -luser
 echo "built $out/user32test.exe (user32 windows over win32k: classes, creation messages, tree, text, posted/sent messages, loop, timers, enumeration)"
 $cc -O1 -Wall -Wextra -Wno-unused-parameter -o "$out/shell32test.exe" tests/windows/shell32test.c -lshell32 -lole32 -lshlwapi -ladvapi32 -luuid
 echo "built $out/shell32test.exe (shell32 and ole32: command lines, special folders, item id lists, shell items, file operations, ShellExecute, shortcuts; procchild.exe in System32)"
+x86_64-w64-mingw32-windres tests/windows/chromedlltest.rc -O coff -o "$out/chromedlltest_rc.o"
+$cc -O1 -Wall -Wextra -o "$out/chromedlltest.exe" tests/windows/chromedlltest.c "$out/chromedlltest_rc.o" -lversion -lruntimeobject -lnetapi32 -lwinspool -lbcryptprimitives -luuid
+echo "built $out/chromedlltest.exe (Chrome's startup libraries: ProcessPrng, version resources, HSTRINGs, netapi32, winspool, interrupt time, imports by ordinal)"
+$cc -O1 -Wall -o "$out/ws2eventtest.exe" tests/windows/ws2eventtest.c -lws2_32
+echo "built $out/ws2eventtest.exe (ws2_32: WSA events, WSAEventSelect, overlapped WSARecv/WSASend, WSAIoctl, protocol catalogue, GetAddrInfoExW)"
+$cc -O1 -Wall -o "$out/crypt32test.exe" tests/windows/crypt32test.c -lcrypt32 -lsecur32
+echo "built $out/crypt32test.exe (crypt32: DPAPI round trip, CryptProtectMemory, certificate stores; secur32 GetUserNameExW)"
+x86_64-w64-mingw32-windres tests/windows/user32misctest.rc -O coff -o "$out/user32misctest_rc.o"
+$cc -O1 -Wall -o "$out/user32misctest.exe" tests/windows/user32misctest.c "$out/user32misctest_rc.o" -luser32 -lgdi32
+echo "built $out/user32misctest.exe (user32: rectangles, LoadString, window stations and desktops, notifications)"
+$cc -O1 -Wall -o "$out/winhttptest.exe" tests/windows/winhttptest.c -lwinhttp
+echo "built $out/winhttptest.exe (winhttp: WinHttpCrackUrl, no proxy, handles)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c
 echo "built $out/suspendtest.exe (SuspendThread, thread contexts, TerminateThread)"
 if command -v clang >/dev/null; then
