@@ -132,7 +132,7 @@ struct OpName {
   uint8_t sources;
 };
 constexpr OpName kOps[] = {
-    {"MOV", TgsiOp::Mov, 1}, {"ADD", TgsiOp::Add, 2}, {"SUB", TgsiOp::Sub, 2}, {"MUL", TgsiOp::Mul, 2}, {"MAD", TgsiOp::Mad, 3}, {"DIV", TgsiOp::Div, 2}, {"LRP", TgsiOp::Lrp, 3},
+    {"MOV", TgsiOp::Mov, 1}, {"NEG", TgsiOp::Neg, 1}, {"ADD", TgsiOp::Add, 2}, {"SUB", TgsiOp::Sub, 2}, {"MUL", TgsiOp::Mul, 2}, {"MAD", TgsiOp::Mad, 3}, {"DIV", TgsiOp::Div, 2}, {"LRP", TgsiOp::Lrp, 3},
     {"MAX", TgsiOp::Max, 2}, {"MIN", TgsiOp::Min, 2}, {"ABS", TgsiOp::Abs, 1}, {"FRC", TgsiOp::Frc, 1}, {"FLR", TgsiOp::Flr, 1}, {"CEIL", TgsiOp::Ceil, 1}, {"TRUNC", TgsiOp::Trunc, 1},
     {"ROUND", TgsiOp::Round, 1}, {"SSG", TgsiOp::Ssg, 1}, {"RCP", TgsiOp::Rcp, 1}, {"RSQ", TgsiOp::Rsq, 1}, {"SQRT", TgsiOp::Sqrt, 1}, {"EX2", TgsiOp::Ex2, 1}, {"LG2", TgsiOp::Lg2, 1},
     {"POW", TgsiOp::Pow, 2}, {"SIN", TgsiOp::Sin, 1}, {"COS", TgsiOp::Cos, 1}, {"DP2", TgsiOp::Dp2, 2}, {"DP3", TgsiOp::Dp3, 2}, {"DP4", TgsiOp::Dp4, 2}, {"XPD", TgsiOp::Xpd, 2},

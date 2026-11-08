@@ -117,6 +117,11 @@ bool emit_absolute(Program& program, uint8_t dst, uint8_t src, uint8_t scratch, 
          emit(program, binary(Add::Fmax, dst, src, scratch), source_line, error, line);
 }
 
+bool emit_negate(Program& program, uint8_t dst, uint8_t src, uint8_t zero, uint32_t source_line, const char** error, uint32_t* line) {
+  return emit(program, move_zero(zero), source_line, error, line) &&
+         emit(program, binary(Add::Fsub, dst, zero, src), source_line, error, line);
+}
+
 }  // namespace
 
 bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,
@@ -178,11 +183,11 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     const bool shader_output = shader.outputs != 0 && inst.dst.file == gcn::TgsiFile::Out && inst.dst.index < shader.outputs;
     if ((!temp_destination && !shader_output) || inst.dst.saturate)
       return fail("destination must be an unsaturated TEMP or the supported shader output", inst.line, error, line);
-    if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul && inst.op != gcn::TgsiOp::Div &&
+    if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Neg && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul && inst.op != gcn::TgsiOp::Div &&
         inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Abs && inst.op != gcn::TgsiOp::Frc && inst.op != gcn::TgsiOp::Flr &&
         inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil && inst.op != gcn::TgsiOp::Rcp)
       return fail("TGSI operation is not implemented by the V3D QPU compiler yet", inst.line, error, line);
-    const bool unary_op = inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Abs || inst.op == gcn::TgsiOp::Frc || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc ||
+    const bool unary_op = inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Neg || inst.op == gcn::TgsiOp::Abs || inst.op == gcn::TgsiOp::Frc || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc ||
                           inst.op == gcn::TgsiOp::Ceil || inst.op == gcn::TgsiOp::Rcp;
     const uint8_t expected_sources = unary_op ? 1 : inst.op == gcn::TgsiOp::Mad ? 3 : 2;
     if (inst.src_count != expected_sources)
@@ -294,6 +299,12 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
 
       bool ok = false;
       switch (inst.op) {
+        case gcn::TgsiOp::Neg: {
+          const uint8_t zero = static_cast<uint8_t>(scratch_base + 3);
+          ok = emit_negate(program, dst, src[0], zero, inst.line, error, line);
+          if (register_count < static_cast<uint32_t>(zero) + 1) register_count = static_cast<uint32_t>(zero) + 1;
+          break;
+        }
         case gcn::TgsiOp::Abs: ok = emit_absolute(program, dst, src[0], static_cast<uint8_t>(scratch_base + 3), inst.line, error, line); break;
         case gcn::TgsiOp::Mov: {
           Instruction i;
