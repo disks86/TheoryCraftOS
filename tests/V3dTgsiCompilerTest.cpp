@@ -156,6 +156,30 @@ static void test_vertex_input_vpm_binding() {
   CHECK(error && line == 4);
 }
 
+static void test_reciprocal_sfu_lowering() {
+  TestAllocator allocator;
+  const char* source = "VERT\nDCL TEMP[0]\n0: RCP TEMP[0], TEMP[0]\n1: END\n";
+  uint64_t words[32] = {};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(info.instruction_count == 19);
+  hardware::v3d_qpu::Instruction expected;
+  expected.add_op = hardware::v3d_qpu::Add::Or;
+  expected.add_dest = hardware::v3d_qpu::recip();
+  expected.add_a = expected.add_b = hardware::v3d_qpu::rf(0);
+  uint64_t expected_word = 0;
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[0] == expected_word);
+  expected = {};
+  expected.add_op = hardware::v3d_qpu::Add::Or;
+  expected.add_dest = hardware::v3d_qpu::rf_dest(0);
+  expected.add_a = expected.add_b = hardware::v3d_qpu::acc(4);
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[3] == expected_word);
+}
+
 static void test_decimal_immediates_parse_without_host_float_runtime() {
   TestAllocator allocator;
   gcn::TgsiShader shader(allocator);
@@ -177,6 +201,7 @@ int main() {
   test_rejections_and_bounds();
   test_uniform_sources();
   test_vertex_input_vpm_binding();
+  test_reciprocal_sfu_lowering();
   test_decimal_immediates_parse_without_host_float_runtime();
   if (failed) return 1;
   puts("V3dTgsiCompilerTest passed");

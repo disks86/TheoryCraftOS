@@ -45,8 +45,8 @@ struct TgsiInputBinding {
 };
 
 // Lowers the straight-line arithmetic portion of TGSI to V3D 4.2 QPU code. This first backend slice
-// accepts TEMP/CONST/IMM MOV/ADD/SUB/MUL/MAD/MIN/MAX and ROUND/FLOOR/TRUNC/CEIL operations, with no
-// source modifiers or saturation. CONST and IMM values are emitted as ordered uniform bindings for
+// accepts TEMP/CONST/IMM MOV/ADD/SUB/MUL/MAD/MIN/MAX/RCP and ROUND/FLOOR/TRUNC/CEIL operations, with
+// no source modifiers or saturation. CONST and IMM values are emitted as ordered uniform bindings for
 // the caller to place in the QPU uniform stream. Stage I/O, flow control, and texture operations are
 // reported as errors until their V3D stage ABI and instruction support are implemented. Vertex IN
 // sources need an explicit mapping from TGSI location/component to the packed VPM value index.

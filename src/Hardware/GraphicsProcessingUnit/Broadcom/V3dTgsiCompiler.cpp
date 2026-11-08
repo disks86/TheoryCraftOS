@@ -67,6 +67,22 @@ Instruction load_vpm(uint8_t dst, uint8_t value) {
   return i;
 }
 
+Instruction reciprocal(Operand source) {
+  Instruction i;
+  i.add_op = Add::Or;
+  i.add_dest = recip();
+  i.add_a = i.add_b = source;
+  return i;
+}
+
+Instruction copy_accumulator(uint8_t dst, uint8_t accumulator) {
+  Instruction i;
+  i.add_op = Add::Or;
+  i.add_dest = rf_dest(dst);
+  i.add_a = i.add_b = acc(accumulator);
+  return i;
+}
+
 bool emit(Program& p, const Instruction& i, uint32_t source_line, const char** error, uint32_t* line) {
   return p.emit(i) || fail("QPU instruction buffer is too small or an instruction cannot be encoded", source_line, error, line);
 }
@@ -96,9 +112,12 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
       return fail("destination must be an unsaturated TEMP", inst.line, error, line);
     if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul &&
         inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Flr &&
-        inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil)
+        inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil && inst.op != gcn::TgsiOp::Rcp)
       return fail("TGSI operation is not implemented by the V3D QPU compiler yet", inst.line, error, line);
-    if (inst.src_count != (inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc || inst.op == gcn::TgsiOp::Ceil ? 1 : inst.op == gcn::TgsiOp::Mad ? 3 : 2))
+    const bool unary_op = inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc ||
+                          inst.op == gcn::TgsiOp::Ceil || inst.op == gcn::TgsiOp::Rcp;
+    const uint8_t expected_sources = unary_op ? 1 : inst.op == gcn::TgsiOp::Mad ? 3 : 2;
+    if (inst.src_count != expected_sources)
       return fail("unexpected number of sources for TGSI operation", inst.line, error, line);
 
     for (uint32_t c = 0; c < 4; ++c) {
@@ -180,6 +199,10 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
         case gcn::TgsiOp::Round: ok = emit(program, unary(Add::Fround, dst, src[0]), inst.line, error, line); break;
         case gcn::TgsiOp::Trunc: ok = emit(program, unary(Add::Ftrunc, dst, src[0]), inst.line, error, line); break;
         case gcn::TgsiOp::Ceil: ok = emit(program, unary(Add::Fceil, dst, src[0]), inst.line, error, line); break;
+        case gcn::TgsiOp::Rcp:
+          ok = emit(program, reciprocal(rf(src[0])), inst.line, error, line) && program.nop(2) && emit(program, copy_accumulator(dst, 4), inst.line, error, line);
+          if (!ok && error && !*error) fail("QPU instruction buffer is too small", inst.line, error, line);
+          break;
         default: break;
       }
       if (!ok) return false;
