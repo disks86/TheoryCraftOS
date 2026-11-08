@@ -277,12 +277,12 @@ bool wait_loop(Call& call, uint64_t timeout_ns, bool (*attempt)(void* context), 
       }
     }
     if (p.exited() || (runtime && runtime->interrupted())) return false;
-    if (runtime) {      // asked to suspend while it waits: it stops here and goes on waiting when resumed
-      sync.unlock();
+    if (runtime && runtime->park_wanted()) {      // asked to suspend while it waits: it stops here and goes on waiting when resumed
+      sync.unlock();      // (only then: dropping the lock here would let a wake-up fall between the look above and the wait below)
       const int parked = runtime->park_point();
       sync.lock();
       if (parked == 2) return false;
-      if (parked == 1) continue;
+      continue;      // (look again: anything may have changed while the lock was let go)
     }
     if (runtime) runtime->unlock();
     else p.host().yield();

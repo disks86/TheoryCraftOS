@@ -45,12 +45,12 @@ inline uint32_t wait_until(Process& p, uint64_t timeout_ns, Attempt&& attempt) {
       left = timeout_ns - used;
     }
     if (p.exited() || (runtime && runtime->interrupted())) { sync.unlock(); return 0x101u; }
-    if (runtime) {      // asked to suspend while it waits: it stops here, with its registers kept (GetThreadContext), and goes on waiting when resumed
-      sync.unlock();
+    if (runtime && runtime->park_wanted()) {      // asked to suspend while it waits: it stops here, with its registers kept (GetThreadContext), and goes on waiting when resumed
+      sync.unlock();      // (only then: dropping the lock here would let a wake-up fall between the look above and the wait below)
       const int parked = runtime->park_point();
       sync.lock();
       if (parked == 2) { sync.unlock(); return 0x101u; }
-      if (parked == 1) continue;
+      continue;      // (look again: anything may have changed while the lock was let go)
     }
     if (runtime) runtime->unlock();
     else p.host().yield();
