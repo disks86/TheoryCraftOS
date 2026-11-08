@@ -213,13 +213,12 @@ struct BefsImage {
     return me;
   }
 
-  // A directory: its entries in a B+tree of nodes holding at most four keys, in as many levels as that takes.
-  uint64_t directory(std::vector<Entry> entries) {
+  // A directory: its entries in a B+tree of nodes holding at most `cap` keys, in as many levels as that takes.
+  uint64_t directory(std::vector<Entry> entries, size_t cap = 4) {
     std::sort(entries.begin(), entries.end());
     std::vector<uint8_t> tree(ns, 0);
     struct Link { uint64_t offset; std::string max_key; };
     std::vector<Link> level;
-    const size_t cap = 4;
     size_t leaves = entries.empty() ? 1 : (entries.size() + cap - 1) / cap;
     for (size_t l = 0; l < leaves; ++l) {
       std::vector<Entry> part;
@@ -1439,6 +1438,46 @@ static void test_namespace_random(uint32_t block_size, uint32_t ag_shift, const 
   CHECK(a.live == 0);
 }
 
+// A 512-byte node of the tree holds only one 250-byte name at a time: every split must work, and a removal that empties an inner
+// node down to a single child must not make the tree uninsertable again.
+static void test_small_nodes() {
+  printf("BeFS one-name nodes\n");
+  BefsImage image(1024, 13, 3, 512);
+  std::vector<BefsImage::Entry> longs, root;
+  for (int i = 0; i < 4; ++i) longs.push_back({long_name(i, 250), image.file(make_data(30 + i, i), false)});
+  root.push_back({"longs", image.directory(longs, 1)});
+  root.push_back({"hi", image.text("hi")});
+  image.finish(image.directory(root, 1), "SMALL");
+  TestAllocator a;
+  {
+    MemDisk disk(image.img.data(), image.img.size(), 512, 0, true);
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (!fs) return;
+    CHECK(names_in(*fs, "/longs").size() == 4);
+    for (int i = 100; i < 104; ++i) CHECK(put_file(*fs, "/longs/" + long_name(i, 250), make_data(60 + i, i)));
+    for (int i = 0; i < 3; ++i) CHECK_STATUS(fs->remove(("/longs/" + long_name(i, 250)).c_str()), Status::Ok);
+    for (int i = 110; i < 113; ++i) CHECK(put_file(*fs, "/longs/" + long_name(i, 250), make_data(70 + i, i)));
+    std::vector<std::string> want = {long_name(3, 250), long_name(100, 250), long_name(101, 250), long_name(102, 250), long_name(103, 250),
+                                     long_name(110, 250), long_name(111, 250), long_name(112, 250)};
+    std::sort(want.begin(), want.end());
+    CHECK(names_in(*fs, "/longs") == want);
+    std::vector<std::string> all = names_in(*fs, "/longs");
+    for (const std::string& name : all) CHECK_STATUS(fs->remove(("/longs/" + name).c_str()), Status::Ok);
+    CHECK(names_in(*fs, "/longs").empty());
+    const RawVolume raw{disk.data, image.bs, image.ag_shift, image.ag_count, image.total, image.per_group};
+    TreeInfo root_info, longs_info;
+    CHECK(check_tree(raw, (rd32(disk.data + 512 + 116) << image.ag_shift) + rd16(disk.data + 512 + 120), &root_info, "root"));
+    uint64_t longs_inode = 0;
+    for (auto& entry : root_info.entries) if (entry.first == "longs") longs_inode = entry.second;
+    CHECK(longs_inode != 0 && check_tree(raw, longs_inode, &longs_info, "longs") && longs_info.entries.empty());
+    check_accounting(disk.data, image, "small nodes");
+    CHECK_STATUS(fs->remove("/longs"), Status::Ok);
+    check_accounting(disk.data, image, "small nodes, cleaned up");
+  }
+  CHECK(a.live == 0);
+}
+
 // ---- The journal --------------------------------------------------------------------------------------------------------------------
 
 // Puts a log entry of `targets.size()` blocks (arrays of at most 127 runs, each followed by its blocks) into the image at ring
@@ -1926,6 +1965,7 @@ int main(int argc, char** argv) {
   test_namespace();
   test_namespace_random(1024, 13, "1 KiB blocks");
   test_namespace_random(2048, 12, "2 KiB blocks");
+  test_small_nodes();
   test_discard(1024, 13, 3, 512);
   test_discard(2048, 12, 3, 2048);
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
