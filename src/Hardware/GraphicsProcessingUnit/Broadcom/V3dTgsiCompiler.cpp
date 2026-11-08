@@ -208,7 +208,7 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     if ((!temp_destination && !shader_output) || inst.dst.saturate)
       return fail("destination must be an unsaturated TEMP or the supported shader output", inst.line, error, line);
     if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Neg && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul && inst.op != gcn::TgsiOp::Div &&
-        inst.op != gcn::TgsiOp::Rsq && inst.op != gcn::TgsiOp::Sqrt && inst.op != gcn::TgsiOp::Ex2 && inst.op != gcn::TgsiOp::Lg2 &&
+        inst.op != gcn::TgsiOp::Rsq && inst.op != gcn::TgsiOp::Sqrt && inst.op != gcn::TgsiOp::Ex2 && inst.op != gcn::TgsiOp::Lg2 && inst.op != gcn::TgsiOp::Pow &&
         inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Abs && inst.op != gcn::TgsiOp::Frc && inst.op != gcn::TgsiOp::Flr &&
         inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil && inst.op != gcn::TgsiOp::Rcp)
       return fail("TGSI operation is not implemented by the V3D QPU compiler yet", inst.line, error, line);
@@ -372,6 +372,17 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
           const Instruction sfu = inst.op == gcn::TgsiOp::Ex2 ? exp2(rf(src[0])) : log2(rf(src[0]));
           ok = emit(program, sfu, inst.line, error, line) && program.nop(2) && emit(program, copy_accumulator(dst, 4), inst.line, error, line);
           if (!ok && error && !*error) fail("QPU instruction buffer is too small", inst.line, error, line);
+          break;
+        }
+        case gcn::TgsiOp::Pow: {
+          const uint8_t logarithm = static_cast<uint8_t>(scratch_base + 3);
+          ok = emit(program, log2(rf(src[0])), inst.line, error, line) && program.nop(2) &&
+               emit(program, copy_accumulator(logarithm, 4), inst.line, error, line) &&
+               emit(program, multiply(logarithm, logarithm, src[1]), inst.line, error, line) &&
+               emit(program, exp2(rf(logarithm)), inst.line, error, line) && program.nop(2) &&
+               emit(program, copy_accumulator(dst, 4), inst.line, error, line);
+          if (!ok && error && !*error) fail("QPU instruction buffer is too small", inst.line, error, line);
+          if (register_count < static_cast<uint32_t>(logarithm) + 1) register_count = static_cast<uint32_t>(logarithm) + 1;
           break;
         }
         case gcn::TgsiOp::Frc: {

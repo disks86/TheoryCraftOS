@@ -348,6 +348,37 @@ static void test_exp2_and_log2_lowering() {
   }
 }
 
+static void test_pow_lowering() {
+  TestAllocator allocator;
+  const char* source = "VERT\nDCL TEMP[0..1]\n0: POW TEMP[0].x, TEMP[0], TEMP[1]\n1: END\n";
+  uint64_t words[16] = {};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(error == nullptr && info.instruction_count == 12 && info.register_count == 12);
+  hardware::v3d_qpu::Instruction expected;
+  expected.add_op = hardware::v3d_qpu::Add::Or;
+  expected.add_dest = hardware::v3d_qpu::log();
+  expected.add_a = expected.add_b = hardware::v3d_qpu::rf(0);
+  uint64_t expected_word = 0;
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[0] == expected_word);
+  expected = {};
+  expected.mul_op = hardware::v3d_qpu::Mul::Fmul;
+  expected.mul_dest = hardware::v3d_qpu::rf_dest(11);
+  expected.mul_a = hardware::v3d_qpu::rf(11);
+  expected.mul_b = hardware::v3d_qpu::rf(4);
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[4] == expected_word);
+  expected = {};
+  expected.add_op = hardware::v3d_qpu::Add::Or;
+  expected.add_dest = hardware::v3d_qpu::exp();
+  expected.add_a = expected.add_b = hardware::v3d_qpu::rf(11);
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[5] == expected_word);
+}
+
 static void test_fragment_color_output() {
   TestAllocator allocator;
   const char* source = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 {1.0, 0.5, 0.25, 1.0}\n0: MOV OUT[0], IMM[0]\n1: END\n";
@@ -480,6 +511,7 @@ int main() {
   test_negate_opcode_lowering();
   test_rsqrt_and_sqrt_lowering();
   test_exp2_and_log2_lowering();
+  test_pow_lowering();
   test_fragment_color_output();
   test_vertex_position_output();
   test_varying_interpolation_and_output();
