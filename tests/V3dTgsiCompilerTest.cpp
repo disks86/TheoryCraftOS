@@ -213,6 +213,44 @@ static void test_fragment_color_output() {
   CHECK(depth_words[12] == expected_word);
 }
 
+static void test_vertex_position_output() {
+  TestAllocator allocator;
+  const char* source = "VERT\nDCL IN[0], POSITION\nDCL OUT[0], POSITION\nDCL TEMP[0]\n0: MOV TEMP[0], IN[0]\n1: MOV OUT[0], TEMP[0]\n2: END\n";
+  uint64_t words[32] = {};
+  hardware::v3d_shader::TgsiInputBinding inputs[4] = {{0, 0, 0}, {0, 1, 1}, {0, 2, 2}, {0, 3, 3}};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line, {},
+                                               ArrayView<const hardware::v3d_shader::TgsiInputBinding>(inputs)));
+  CHECK(info.output_register_base == 60 && info.output_count == 1 && info.register_count == 64 && info.instruction_count == 19);
+  hardware::v3d_qpu::Instruction expected;
+  expected.add_op = hardware::v3d_qpu::Add::Or;
+  expected.add_dest = hardware::v3d_qpu::rf_dest(60);
+  expected.add_a = expected.add_b = hardware::v3d_qpu::rf(0);
+  uint64_t expected_word = 0;
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[12] == expected_word);
+
+  const char* wrong_semantic = "VERT\nDCL OUT[0], COLOR\n0: END\n";
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(wrong_semantic), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(error && line == 0);
+
+  const char* no_temp = "VERT\nDCL IN[0], POSITION\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+  uint64_t body[32] = {};
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(no_temp), ArrayView<uint64_t>(body), &info, &error, &line, {},
+                                               ArrayView<const hardware::v3d_shader::TgsiInputBinding>(inputs), false, false));
+  CHECK(info.output_count == 1 && info.output_register_base == 60 && info.instruction_count == 12);
+  hardware::v3d_shader::TgsiInputBinding fixed_layout_inputs[8] = {{0, 0, 0}, {0, 1, 1}, {0, 2, 2}, {0, 3, 0, true, 0x3F800000},
+                                                                  {1, 0, 3}, {1, 1, 4}, {1, 2, 5}, {1, 3, 6}};
+  hardware::v3d_shader::TgsiUniformBinding fixed_layout_uniform[4] = {};
+  const bool fixed_compiled = hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(no_temp), ArrayView<uint64_t>(body), &info, &error, &line,
+                                                                      ArrayView<hardware::v3d_shader::TgsiUniformBinding>(fixed_layout_uniform),
+                                                                      ArrayView<const hardware::v3d_shader::TgsiInputBinding>(fixed_layout_inputs), false, false);
+  CHECK(fixed_compiled);
+  CHECK(info.uniform_count == 1 && fixed_layout_uniform[0].file == gcn::TgsiFile::None && fixed_layout_uniform[0].immediate_bits == 0x3F800000u);
+}
+
 static void test_decimal_immediates_parse_without_host_float_runtime() {
   TestAllocator allocator;
   gcn::TgsiShader shader(allocator);
@@ -236,6 +274,7 @@ int main() {
   test_vertex_input_vpm_binding();
   test_reciprocal_sfu_lowering();
   test_fragment_color_output();
+  test_vertex_position_output();
   test_decimal_immediates_parse_without_host_float_runtime();
   if (failed) return 1;
   puts("V3dTgsiCompilerTest passed");

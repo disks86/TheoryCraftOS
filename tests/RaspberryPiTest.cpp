@@ -976,18 +976,31 @@ static void test_graphics_device() {
     custom_pd.fragment_shader = compiled_fs;
     IPipeline* custom_pipeline = device.create_graphics_pipeline(custom_pd);
     CHECK(compiled_fs && custom_pipeline);
-    device.destroy_shader_module(compiled_fs);  // the pipeline owns the compiled code and its uniform bindings
+    ShaderModuleDesc vertex_tgsi;
+    vertex_tgsi.stage = ShaderStage::Vertex;
+    vertex_tgsi.tgsi = "VERT\nDCL IN[0], POSITION\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    IShaderModule* compiled_vs = device.create_shader_module(vertex_tgsi);
+    GraphicsPipelineDesc custom_vertex_pd = custom_pd;
+    custom_vertex_pd.vertex_shader = compiled_vs;
+    IPipeline* custom_vertex_pipeline = device.create_graphics_pipeline(custom_vertex_pd);
+    CHECK(compiled_vs);
+    CHECK(custom_vertex_pipeline);
+    device.destroy_shader_module(compiled_fs);
+    device.destroy_shader_module(compiled_vs);  // both pipelines own their compiled code and uniform bindings
     cmd->begin();
     cmd->begin_render_pass(rp);
     cmd->bind_pipeline(custom_pipeline);
     cmd->bind_vertex_buffer(vb, 0);
     cmd->push_constants(&cc, sizeof cc);
     cmd->draw(3, 0);
+    cmd->bind_pipeline(custom_vertex_pipeline);
+    cmd->draw(3, 0);
     cmd->end_render_pass();
     CHECK(cmd->end());
     core.at(v3d::kCtlIntSts) = v3d::kIntFlDone | v3d::kIntFrDone;
     CHECK(device.submit(cmd));
     device.destroy_pipeline(custom_pipeline);
+    device.destroy_pipeline(custom_vertex_pipeline);
 
     device.destroy_command_buffer(cmd);
     device.destroy_buffer(vb); device.destroy_buffer(ib);

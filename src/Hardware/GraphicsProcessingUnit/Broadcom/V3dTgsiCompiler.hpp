@@ -30,6 +30,8 @@ struct TgsiCompileInfo {
   uint32_t register_count = 0;
   uint32_t uniform_count = 0;
   uint32_t tlb_config_count = 0;  // implicit TLB uniforms consumed by the fragment output epilogue
+  uint32_t output_register_base = 0;
+  uint32_t output_count = 0;
 };
 
 struct TgsiUniformBinding {
@@ -43,16 +45,19 @@ struct TgsiInputBinding {
   uint16_t index = 0;
   uint8_t component = 0;
   uint8_t vpm_value = 0;
+  bool constant = false;
+  uint32_t constant_bits = 0;
 };
 
 // Lowers the straight-line arithmetic portion of TGSI to V3D 4.2 QPU code. This first backend slice
 // accepts TEMP/CONST/IMM MOV/ADD/SUB/MUL/MAD/MIN/MAX/RCP and ROUND/FLOOR/TRUNC/CEIL operations, with
-// no source modifiers or saturation. Fragment shaders may write OUT[0] COLOR. CONST and IMM values
-// are emitted as ordered uniform bindings for the caller to place in the QPU uniform stream. Other
-// stage I/O, flow control, and texture operations are reported as errors until their V3D ABI and
-// instruction support are implemented. Vertex IN sources need an explicit location/component-to-VPM mapping.
+// no source modifiers or saturation. Fragment shaders may write OUT[0] COLOR, and vertex shaders
+// may write OUT[0] POSITION in RF60..RF63 for a later V3D stage epilogue. CONST and IMM values are
+// emitted as ordered uniform bindings for the caller to place in the QPU uniform stream. Other stage
+// I/O, flow control, and texture operations are reported as errors until their V3D ABI is implemented.
+// Vertex IN sources need an explicit location/component-to-VPM mapping.
 // The output is a QPU thread body ending in the required thread-switch and delay slots.
 bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,
-                      ArrayView<TgsiUniformBinding> uniforms = {}, ArrayView<const TgsiInputBinding> inputs = {}, bool write_depth = false);
+                      ArrayView<TgsiUniformBinding> uniforms = {}, ArrayView<const TgsiInputBinding> inputs = {}, bool write_depth = false, bool terminate = true);
 
 }  // namespace hardware::v3d_shader
