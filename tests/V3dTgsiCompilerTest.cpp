@@ -380,6 +380,44 @@ static void test_pow_lowering() {
   CHECK(words[5] == expected_word);
 }
 
+static void test_if_else_predication() {
+  TestAllocator allocator;
+  const char* source =
+      "VERT\nDCL TEMP[0..1]\n"
+      "0: IF TEMP[0]\n"
+      "1: MOV TEMP[1], TEMP[0]\n"
+      "2: ELSE\n"
+      "3: MUL TEMP[1], TEMP[0], TEMP[0]\n"
+      "4: ENDIF\n"
+      "5: END\n";
+  uint64_t words[32] = {};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(error == nullptr && info.instruction_count == 12 && info.register_count == 8);
+  CHECK(((words[0] >> 46) & 0x7F) == 1);  // ADD PF_PUSHZ records condition == 0 in predicate A.
+  for (uint32_t i = 1; i <= 4; ++i) CHECK(((words[i] >> 46) & 0x7F) == 0x28);  // ADD conditional on !A.
+  for (uint32_t i = 5; i <= 8; ++i) CHECK(((words[i] >> 46) & 0x7F) == 0x30);  // MUL conditional on A.
+
+  const char* nested = "VERT\nDCL TEMP[0]\nIF TEMP[0]\nIF TEMP[0]\nENDIF\nENDIF\nEND\n";
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(nested), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(error && line == 4);
+  const char* missing_end_if = "VERT\nDCL TEMP[0]\nIF TEMP[0]\nEND\n";
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(missing_end_if), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(error && line == 4);
+  const char* unmatched_else = "VERT\nELSE\nEND\n";
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(unmatched_else), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(error && line == 2);
+
+  const char* uniform_condition = "VERT\nDCL TEMP[0]\nIMM[0] FLT32 {1.0, 0.0, 0.0, 0.0}\nIF IMM[0].x\nENDIF\nEND\n";
+  hardware::v3d_shader::TgsiUniformBinding bindings[4] = {};
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(uniform_condition), ArrayView<uint64_t>(words), &info, &error, &line,
+                                               ArrayView<hardware::v3d_shader::TgsiUniformBinding>(bindings)));
+  CHECK(error == nullptr && info.instruction_count == 5 && info.uniform_count == 1);
+  CHECK(bindings[0].file == gcn::TgsiFile::Imm && bindings[0].component == 0 && bindings[0].immediate_bits == 0x3F800000u);
+}
+
 static void test_fragment_color_output() {
   TestAllocator allocator;
   const char* source = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 {1.0, 0.5, 0.25, 1.0}\n0: MOV OUT[0], IMM[0]\n1: END\n";
@@ -513,6 +551,7 @@ int main() {
   test_rsqrt_and_sqrt_lowering();
   test_exp2_log2_and_sin_lowering();
   test_pow_lowering();
+  test_if_else_predication();
   test_fragment_color_output();
   test_vertex_position_output();
   test_varying_interpolation_and_output();

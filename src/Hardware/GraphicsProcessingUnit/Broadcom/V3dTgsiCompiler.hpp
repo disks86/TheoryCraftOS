@@ -56,7 +56,8 @@ struct TgsiInputBinding {
 // source negation and absolute-value modifiers supported and saturation rejected. Fragment shaders may read one perspective GENERIC[0] vec4 and
 // write OUT[0] COLOR. Vertex shaders may write OUT[0] POSITION (RF60..RF63) and optional OUT[1]
 // GENERIC[0] (RF56..RF59) for V3D stage epilogues. CONST, IMM, and fixed input values become ordered
-// uniform bindings. Other stage I/O, flow control, and texture operations remain unsupported. Vertex
+// uniform bindings. Flow control supports non-nested IF/ELSE/ENDIF with TEMP, IN, CONST, or IMM conditions;
+// nested control flow, loops, other stage I/O, and texture operations remain unsupported. Vertex
 // IN sources need an explicit location/component-to-VPM mapping. `terminate` adds the thread-switch
 // and delay slots when the output is a complete standalone QPU program.
 bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,

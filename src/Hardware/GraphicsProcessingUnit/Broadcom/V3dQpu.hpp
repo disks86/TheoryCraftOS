@@ -29,6 +29,9 @@ namespace hardware::v3d_qpu {
 
 enum class Add : uint8_t { Nop, Fadd, Fsub, Fmin, Fmax, Or, Fround, Ftoiz, Ffloor, Ftrunc, Fceil, Vfpack, LdVpmvIn, StVpmv, VpmWt };
 enum class Mul : uint8_t { Nop, Fmul };
+// Per-lane QPU predicate selection. None leaves the corresponding ALU pipe unconditional.
+enum class Condition : uint8_t { None, IfA, IfB, IfNotA, IfNotB };
+enum class PredicateFlag : uint8_t { None, PushZ, PushN, PushC };
 
 // A source: nothing, a register file entry, an accumulator (r0..r5; r4 is where an SFU result shows up, r5 where the varying's C coefficient is) or a small
 // immediate (0..15).
@@ -67,6 +70,10 @@ struct Instruction {
   bool ldvary = false;     // load the next varying into `sig_dest`; the C coefficient follows in r5
   bool ldunifrf = false;   // load the next uniform into `sig_dest`
   Dest sig_dest = rf_dest(0);
+  Condition add_condition = Condition::None;
+  Condition mul_condition = Condition::None;
+  PredicateFlag add_predicate = PredicateFlag::None;
+  PredicateFlag mul_predicate = PredicateFlag::None;
 };
 
 // Encodes one instruction. False if it cannot be encoded: more than two register file entries or an immediate besides one, an immediate out of range, a register
@@ -79,6 +86,8 @@ class Program {
   explicit Program(ArrayView<uint64_t> storage) : storage_(storage) {}
   bool emit(const Instruction& instruction);
   bool nop(uint32_t count = 1);
+  // Predicates subsequent add/mul ALU writes until reset to Condition::None; signal instructions stay unconditional.
+  void set_condition(Condition condition) { condition_ = condition; }
   uint32_t count() const { return count_; }
   bool ok() const { return ok_; }
   ArrayView<const uint64_t> words() const { return ArrayView<const uint64_t>(storage_.data(), count_); }
@@ -87,6 +96,7 @@ class Program {
   ArrayView<uint64_t> storage_;
   uint32_t count_ = 0;
   bool ok_ = true;
+  Condition condition_ = Condition::None;
 };
 
 }  // namespace hardware::v3d_qpu

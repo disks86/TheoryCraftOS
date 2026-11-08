@@ -979,7 +979,10 @@ static void test_graphics_device() {
     CHECK(compiled_fs && custom_pipeline);
     ShaderModuleDesc varying_fragment;
     varying_fragment.stage = ShaderStage::Fragment;
-    varying_fragment.tgsi = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n0: MOV OUT[0], IN[0]\n1: END\n";
+    varying_fragment.tgsi = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\nDCL TEMP[0]\n"
+                            "IMM[0] FLT32 {1.0, 0.5, 0.25, 1.0}\n"
+                            "0: MOV TEMP[0], IN[0]\n1: IF TEMP[0]\n2: MOV OUT[0], IN[0]\n"
+                            "3: ELSE\n4: MOV OUT[0], IMM[0]\n5: ENDIF\n6: END\n";
     IShaderModule* varying_fs = device.create_shader_module(varying_fragment);
     GraphicsPipelineDesc varying_pd = pd;
     varying_pd.fragment_shader = varying_fs;

@@ -139,6 +139,23 @@ bool encode(const Instruction& i, uint64_t* word) {
   if (sig < 0) return false;
   const bool sig_writes_address = i.ldvary || i.ldunifrf;
   if (sig_writes_address && i.sig_dest.addr > 63) return false;
+  if (i.add_condition > Condition::IfNotB || i.mul_condition > Condition::IfNotB || i.add_predicate > PredicateFlag::PushC ||
+      i.mul_predicate > PredicateFlag::PushC) return false;
+  if (sig_writes_address && (i.add_condition != Condition::None || i.mul_condition != Condition::None ||
+                             i.add_predicate != PredicateFlag::None || i.mul_predicate != PredicateFlag::None)) return false;
+  uint8_t packed_condition = 0;
+  if (i.add_condition != Condition::None) {
+    if (i.mul_condition != Condition::None || i.add_predicate != PredicateFlag::None || i.mul_predicate != PredicateFlag::None) return false;
+    packed_condition = static_cast<uint8_t>(0x20 + (static_cast<uint8_t>(i.add_condition) - static_cast<uint8_t>(Condition::IfA)) * 4);
+  } else if (i.mul_condition != Condition::None) {
+    if (i.add_predicate != PredicateFlag::None || i.mul_predicate != PredicateFlag::None) return false;
+    packed_condition = static_cast<uint8_t>(0x30 + (static_cast<uint8_t>(i.mul_condition) - static_cast<uint8_t>(Condition::IfA)) * 4);
+  } else if (i.add_predicate != PredicateFlag::None) {
+    if (i.mul_predicate != PredicateFlag::None) return false;
+    packed_condition = static_cast<uint8_t>(i.add_predicate);
+  } else if (i.mul_predicate != PredicateFlag::None) {
+    packed_condition = static_cast<uint8_t>(0x10 + static_cast<uint8_t>(i.mul_predicate));
+  }
 
   uint64_t w = 0;
   w |= static_cast<uint64_t>(mul.opcode) << 58;
@@ -155,13 +172,22 @@ bool encode(const Instruction& i, uint64_t* word) {
   w |= static_cast<uint64_t>(add_a) << 12;
   w |= static_cast<uint64_t>(ports.a >= 0 ? ports.a : 0) << 6;
   w |= static_cast<uint64_t>(ports.imm ? ports.imm_value : (ports.b >= 0 ? ports.b : 0));
+  // V3D 4.2 shares bits 52:46 between signal destinations and its tagged predicate/flag field.
+  if (!sig_writes_address) w |= static_cast<uint64_t>(packed_condition) << 46;
   *word = w;
   return true;
 }
 
 bool Program::emit(const Instruction& instruction) {
+  Instruction encoded = instruction;
+  if (!encoded.ldvary && !encoded.ldunifrf) {
+    if (condition_ != Condition::None) {
+      if (encoded.add_op != Add::Nop && encoded.add_condition == Condition::None) encoded.add_condition = condition_;
+      if (encoded.mul_op != Mul::Nop && encoded.mul_condition == Condition::None) encoded.mul_condition = condition_;
+    }
+  }
   uint64_t word = 0;
-  if (!ok_ || count_ >= storage_.size() || !encode(instruction, &word)) {
+  if (!ok_ || count_ >= storage_.size() || !encode(encoded, &word)) {
     ok_ = false;
     return false;
   }

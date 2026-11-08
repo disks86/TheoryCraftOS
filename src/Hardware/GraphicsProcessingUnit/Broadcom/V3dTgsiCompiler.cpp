@@ -208,9 +208,95 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
       if (!emit(program, interpolate, 0, error, line)) return false;
     }
   }
+  bool if_open = false, else_seen = false;
   for (uint64_t n = 0; n < shader.instructions.count(); ++n) {
     const gcn::TgsiInst& inst = shader.instructions[n];
-    if (inst.op == gcn::TgsiOp::End) continue;
+    if (inst.op == gcn::TgsiOp::If) {
+      if (if_open) return fail("nested TGSI IF is not supported by this V3D compiler stage", inst.line, error, line);
+      if (inst.src_count != 1 || inst.src[0].swizzle[0] > 3) return fail("TGSI IF requires one scalar-readable condition", inst.line, error, line);
+      const gcn::TgsiSrc& condition_source = inst.src[0];
+      uint8_t condition = 0;
+      if (condition_source.file == gcn::TgsiFile::Temp) {
+        if (condition_source.index >= shader.temps) return fail("TGSI IF TEMP condition index is out of range", inst.line, error, line);
+        condition = static_cast<uint8_t>(temp_base + condition_source.index * 4 + condition_source.swizzle[0]);
+      } else if (condition_source.file == gcn::TgsiFile::In && fragment_input) {
+        if (condition_source.index != 0) return fail("TGSI IF fragment input location is not supported", inst.line, error, line);
+        condition = static_cast<uint8_t>(kFragmentVaryingBase + condition_source.swizzle[0]);
+      } else {
+        condition = static_cast<uint8_t>(scratch_base + 3);
+        if (condition_source.file == gcn::TgsiFile::Const || condition_source.file == gcn::TgsiFile::Imm) {
+          if ((condition_source.file == gcn::TgsiFile::Const && condition_source.index >= shader.consts) ||
+              (condition_source.file == gcn::TgsiFile::Imm && condition_source.index >= shader.immediates.count()))
+            return fail("TGSI IF uniform condition index is out of range", inst.line, error, line);
+          if (uniform_count >= uniforms.size()) return fail("uniform binding buffer is too small", inst.line, error, line);
+          TgsiUniformBinding binding;
+          binding.file = condition_source.file;
+          binding.index = condition_source.index;
+          binding.component = condition_source.swizzle[0];
+          if (condition_source.file == gcn::TgsiFile::Imm)
+            binding.immediate_bits = __builtin_bit_cast(uint32_t, shader.immediates[condition_source.index].value[condition_source.swizzle[0]]);
+          uniforms[uniform_count++] = binding;
+          Instruction load;
+          load.ldunifrf = true;
+          load.sig_dest = rf_dest(condition);
+          if (!emit(program, load, inst.line, error, line)) return false;
+        } else if (condition_source.file == gcn::TgsiFile::In) {
+          if (condition_source.index >= shader.inputs) return fail("TGSI IF vertex input index is out of range", inst.line, error, line);
+          const TgsiInputBinding* binding = nullptr;
+          for (const TgsiInputBinding& candidate : inputs)
+            if (candidate.index == condition_source.index && candidate.component == condition_source.swizzle[0]) {
+              binding = &candidate;
+              break;
+            }
+          if (!binding) return fail("TGSI IF vertex input has no VPM binding", inst.line, error, line);
+          if (binding->constant) {
+            if (uniform_count >= uniforms.size()) return fail("uniform binding buffer is too small", inst.line, error, line);
+            TgsiUniformBinding uniform;
+            uniform.file = gcn::TgsiFile::None;
+            uniform.index = condition_source.index;
+            uniform.component = condition_source.swizzle[0];
+            uniform.immediate_bits = binding->constant_bits;
+            uniforms[uniform_count++] = uniform;
+            Instruction load;
+            load.ldunifrf = true;
+            load.sig_dest = rf_dest(condition);
+            if (!emit(program, load, inst.line, error, line)) return false;
+          } else {
+            if (binding->vpm_value > 15 || !emit(program, load_vpm(condition, binding->vpm_value), inst.line, error, line))
+              return fail("TGSI IF vertex input could not be loaded", inst.line, error, line);
+          }
+        } else {
+          return fail("TGSI IF condition must be TEMP, IN, CONST, or IMM", inst.line, error, line);
+        }
+      }
+      if (register_count < static_cast<uint32_t>(condition) + 1) register_count = static_cast<uint32_t>(condition) + 1;
+      Instruction test;
+      test.add_op = Add::Or;
+      test.add_dest = nowhere();
+      test.add_a = test.add_b = rf(condition);
+      test.add_predicate = PredicateFlag::PushZ;
+      if (!emit(program, test, inst.line, error, line)) return false;
+      program.set_condition(Condition::IfNotA);
+      if_open = true;
+      continue;
+    }
+    if (inst.op == gcn::TgsiOp::Else) {
+      if (!if_open || else_seen) return fail("TGSI ELSE has no matching IF or is repeated", inst.line, error, line);
+      program.set_condition(Condition::IfA);
+      else_seen = true;
+      continue;
+    }
+    if (inst.op == gcn::TgsiOp::EndIf) {
+      if (!if_open) return fail("TGSI ENDIF has no matching IF", inst.line, error, line);
+      program.set_condition(Condition::None);
+      if_open = false;
+      else_seen = false;
+      continue;
+    }
+    if (inst.op == gcn::TgsiOp::End) {
+      if (if_open) return fail("TGSI IF is missing ENDIF", inst.line, error, line);
+      continue;
+    }
     const bool temp_destination = inst.dst.file == gcn::TgsiFile::Temp && inst.dst.index < shader.temps;
     const bool shader_output = shader.outputs != 0 && inst.dst.file == gcn::TgsiFile::Out && inst.dst.index < shader.outputs;
     if ((!temp_destination && !shader_output) || inst.dst.saturate)
@@ -426,6 +512,8 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
       if (!ok) return fail("QPU TGSI arithmetic instruction could not be encoded", inst.line, error, line);
     }
   }
+
+  if (if_open) return fail("TGSI IF is missing ENDIF", 0, error, line);
 
   if (shader.fragment && shader.outputs != 0) {
     if (write_depth) {
