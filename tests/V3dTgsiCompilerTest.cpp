@@ -110,6 +110,27 @@ static void test_rejections_and_bounds() {
   CHECK(error && line == 3);
 }
 
+static void test_uniform_sources() {
+  TestAllocator allocator;
+  const char* source = "VERT\nDCL TEMP[0]\nDCL CONST[0]\nIMM[0] FLT32 {1.25, -0.5, 3.0, 4.0}\n0: ADD TEMP[0], CONST[0], IMM[0]\n1: END\n";
+  uint64_t words[32] = {};
+  hardware::v3d_shader::TgsiUniformBinding bindings[8] = {};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line,
+                                               ArrayView<hardware::v3d_shader::TgsiUniformBinding>(bindings)));
+  CHECK(info.uniform_count == 8 && info.instruction_count == 15 && info.register_count == 6);
+  CHECK(bindings[0].file == gcn::TgsiFile::Const && bindings[0].index == 0 && bindings[0].component == 0);
+  CHECK(bindings[1].file == gcn::TgsiFile::Imm && bindings[1].index == 0 && bindings[1].component == 0 && bindings[1].immediate_bits == 0x3FA00000u);
+  CHECK(bindings[6].component == 3 && bindings[7].component == 3 && bindings[7].immediate_bits == 0x40800000u);
+
+  hardware::v3d_shader::TgsiUniformBinding too_small[7] = {};
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line,
+                                                ArrayView<hardware::v3d_shader::TgsiUniformBinding>(too_small)));
+  CHECK(error && line == 5);
+}
+
 static void test_decimal_immediates_parse_without_host_float_runtime() {
   TestAllocator allocator;
   gcn::TgsiShader shader(allocator);
@@ -129,6 +150,7 @@ static void test_decimal_immediates_parse_without_host_float_runtime() {
 int main() {
   test_arithmetic_lowering();
   test_rejections_and_bounds();
+  test_uniform_sources();
   test_decimal_immediates_parse_without_host_float_runtime();
   if (failed) return 1;
   puts("V3dTgsiCompilerTest passed");

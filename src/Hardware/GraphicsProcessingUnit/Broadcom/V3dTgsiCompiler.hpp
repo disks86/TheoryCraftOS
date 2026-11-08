@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/StringView.hpp"
 
@@ -27,13 +28,23 @@ namespace hardware::v3d_shader {
 struct TgsiCompileInfo {
   uint32_t instruction_count = 0;
   uint32_t register_count = 0;
+  uint32_t uniform_count = 0;
+};
+
+struct TgsiUniformBinding {
+  gcn::TgsiFile file = gcn::TgsiFile::None;  // CONST is read from push constants; IMM carries its value below
+  uint16_t index = 0;
+  uint8_t component = 0;
+  uint32_t immediate_bits = 0;
 };
 
 // Lowers the straight-line arithmetic portion of TGSI to V3D 4.2 QPU code. This first backend slice
-// accepts TEMP-only MOV/ADD/SUB/MUL/MAD/MIN/MAX and ROUND/FLOOR/TRUNC/CEIL operations, with no source
-// modifiers or saturation. Inputs, constants, stage I/O, flow control, and texture operations are
+// accepts TEMP/CONST/IMM MOV/ADD/SUB/MUL/MAD/MIN/MAX and ROUND/FLOOR/TRUNC/CEIL operations, with no
+// source modifiers or saturation. CONST and IMM values are emitted as ordered uniform bindings for
+// the caller to place in the QPU uniform stream. Stage I/O, flow control, and texture operations are
 // reported as errors until their V3D stage ABI and instruction support are implemented. The output
 // is a QPU thread body ending in the required thread-switch and delay slots.
-bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line);
+bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,
+                      ArrayView<TgsiUniformBinding> uniforms = {});
 
 }  // namespace hardware::v3d_shader

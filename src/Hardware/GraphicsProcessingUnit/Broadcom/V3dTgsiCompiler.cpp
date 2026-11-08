@@ -63,28 +63,24 @@ bool emit(Program& p, const Instruction& i, uint32_t source_line, const char** e
   return p.emit(i) || fail("QPU instruction buffer is too small or an instruction cannot be encoded", source_line, error, line);
 }
 
-bool temp_register(const gcn::TgsiSrc& src, uint32_t component, uint32_t temps, uint8_t* out) {
-  if (src.file != gcn::TgsiFile::Temp || src.index >= temps || src.negate || src.absolute) return false;
-  const uint32_t reg = static_cast<uint32_t>(src.index) * 4 + src.swizzle[component];
-  if (reg >= kMaxTemps * 4) return false;
-  *out = static_cast<uint8_t>(reg);
-  return true;
-}
 }  // namespace
 
-bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line) {
+bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,
+                      ArrayView<TgsiUniformBinding> uniforms) {
   if (info) *info = {};
   if (error) *error = nullptr;
   if (line) *line = 0;
 
   gcn::TgsiShader shader(allocator);
   if (!gcn::parse_tgsi(allocator, text, &shader, error, line)) return false;
-  if (shader.inputs != 0 || shader.outputs != 0 || shader.consts != 0 || shader.immediates.count() != 0 || shader.samplers != 0)
-    return fail("this compiler stage currently accepts TEMP-only TGSI", 0, error, line);
+  if (shader.inputs != 0 || shader.outputs != 0 || shader.samplers != 0)
+    return fail("this compiler stage currently accepts TEMP, CONST, and IMM arithmetic only", 0, error, line);
   if (shader.temps > kMaxTemps) return fail("shader needs more temporary registers than the current QPU allocator provides", 0, error, line);
 
   Program program(output);
-  const uint8_t scratch = static_cast<uint8_t>(shader.temps * 4);
+  const uint8_t scratch_base = static_cast<uint8_t>(shader.temps * 4);
+  uint32_t register_count = shader.temps * 4;
+  uint32_t uniform_count = 0;
   for (uint64_t n = 0; n < shader.instructions.count(); ++n) {
     const gcn::TgsiInst& inst = shader.instructions[n];
     if (inst.op == gcn::TgsiOp::End) continue;
@@ -101,8 +97,36 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
       if (!(inst.dst.mask & (1u << c))) continue;
       const uint8_t dst = static_cast<uint8_t>(inst.dst.index * 4 + c);
       uint8_t src[3] = {};
-      for (uint32_t k = 0; k < inst.src_count; ++k)
-        if (!temp_register(inst.src[k], c, shader.temps, &src[k])) return fail("source must be an unmodified TEMP", inst.line, error, line);
+      uint8_t uniform_scratch_mask = 0;
+      for (uint32_t k = 0; k < inst.src_count; ++k) {
+        const gcn::TgsiSrc& source = inst.src[k];
+        if (source.negate || source.absolute) return fail("source modifiers are not supported by this V3D compiler stage", inst.line, error, line);
+        if (source.file == gcn::TgsiFile::Temp) {
+          if (source.index >= shader.temps) return fail("TEMP source index is out of range", inst.line, error, line);
+          src[k] = static_cast<uint8_t>(source.index * 4 + source.swizzle[c]);
+          continue;
+        }
+        if (source.file != gcn::TgsiFile::Const && source.file != gcn::TgsiFile::Imm)
+          return fail("source must be TEMP, CONST, or IMM", inst.line, error, line);
+        if ((source.file == gcn::TgsiFile::Const && source.index >= shader.consts) ||
+            (source.file == gcn::TgsiFile::Imm && source.index >= shader.immediates.count()))
+          return fail("constant source index is out of range", inst.line, error, line);
+        if (uniform_count >= uniforms.size()) return fail("uniform binding buffer is too small", inst.line, error, line);
+        TgsiUniformBinding binding;
+        binding.file = source.file;
+        binding.index = source.index;
+        binding.component = source.swizzle[c];
+        if (source.file == gcn::TgsiFile::Imm)
+          binding.immediate_bits = __builtin_bit_cast(uint32_t, shader.immediates[source.index].value[source.swizzle[c]]);
+        uniforms[uniform_count++] = binding;
+        src[k] = static_cast<uint8_t>(scratch_base + k);
+        uniform_scratch_mask |= static_cast<uint8_t>(1u << k);
+        if (register_count < static_cast<uint32_t>(src[k]) + 1) register_count = static_cast<uint32_t>(src[k]) + 1;
+        Instruction load;
+        load.ldunifrf = true;
+        load.sig_dest = rf_dest(src[k]);
+        if (!emit(program, load, inst.line, error, line)) return false;
+      }
 
       bool ok = false;
       switch (inst.op) {
@@ -119,9 +143,15 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
         case gcn::TgsiOp::Min: ok = emit(program, binary(Add::Fmin, dst, src[0], src[1]), inst.line, error, line); break;
         case gcn::TgsiOp::Max: ok = emit(program, binary(Add::Fmax, dst, src[0], src[1]), inst.line, error, line); break;
         case gcn::TgsiOp::Mul: ok = emit(program, multiply(dst, src[0], src[1]), inst.line, error, line); break;
-        case gcn::TgsiOp::Mad:
-          ok = emit(program, multiply(scratch, src[0], src[1]), inst.line, error, line) && emit(program, binary(Add::Fadd, dst, scratch, src[2]), inst.line, error, line);
+        case gcn::TgsiOp::Mad: {
+          uint8_t scratch_slot = 0;
+          while (scratch_slot < 3 && (uniform_scratch_mask & (1u << scratch_slot))) ++scratch_slot;
+          const uint8_t mad_scratch = static_cast<uint8_t>(scratch_base + scratch_slot);
+          ok = emit(program, multiply(mad_scratch, src[0], src[1]), inst.line, error, line) &&
+               emit(program, binary(Add::Fadd, dst, mad_scratch, src[2]), inst.line, error, line);
+          if (register_count < static_cast<uint32_t>(mad_scratch) + 1) register_count = static_cast<uint32_t>(mad_scratch) + 1;
           break;
+        }
         case gcn::TgsiOp::Flr: ok = emit(program, unary(Add::Ffloor, dst, src[0]), inst.line, error, line); break;
         case gcn::TgsiOp::Round: ok = emit(program, unary(Add::Fround, dst, src[0]), inst.line, error, line); break;
         case gcn::TgsiOp::Trunc: ok = emit(program, unary(Add::Ftrunc, dst, src[0]), inst.line, error, line); break;
@@ -137,7 +167,8 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
   if (!emit(program, end, 0, error, line) || !program.nop(2)) return fail("QPU code buffer is too small", 0, error, line);
   if (info) {
     info->instruction_count = program.count();
-    info->register_count = shader.temps * 4 + 1;
+    info->register_count = register_count;
+    info->uniform_count = uniform_count;
   }
   if (error) *error = nullptr;
   if (line) *line = 0;
