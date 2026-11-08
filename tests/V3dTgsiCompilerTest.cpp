@@ -319,17 +319,18 @@ static void test_rsqrt_and_sqrt_lowering() {
   CHECK(words[4] == expected_word);
 }
 
-static void test_exp2_and_log2_lowering() {
+static void test_exp2_log2_and_sin_lowering() {
   TestAllocator allocator;
   const char* sources[] = {
       "VERT\nDCL TEMP[0]\n0: EX2 TEMP[0].x, TEMP[0]\n1: END\n",
-      "VERT\nDCL TEMP[0]\n0: LG2 TEMP[0].x, TEMP[0]\n1: END\n"};
-  const uint8_t sfu_addresses[] = {21, 22};
+      "VERT\nDCL TEMP[0]\n0: LG2 TEMP[0].x, TEMP[0]\n1: END\n",
+      "VERT\nDCL TEMP[0]\n0: SIN TEMP[0].x, TEMP[0]\n1: END\n"};
+  const uint8_t sfu_addresses[] = {21, 22, 23};
   uint64_t words[16] = {};
   hardware::v3d_shader::TgsiCompileInfo info;
   const char* error = nullptr;
   uint32_t line = 0;
-  for (uint32_t op = 0; op < 2; ++op) {
+  for (uint32_t op = 0; op < 3; ++op) {
     CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(sources[op]), ArrayView<uint64_t>(words), &info, &error, &line));
     CHECK(error == nullptr && info.instruction_count == 7);
     hardware::v3d_qpu::Instruction expected;
@@ -510,7 +511,7 @@ int main() {
   test_fraction_lowering();
   test_negate_opcode_lowering();
   test_rsqrt_and_sqrt_lowering();
-  test_exp2_and_log2_lowering();
+  test_exp2_log2_and_sin_lowering();
   test_pow_lowering();
   test_fragment_color_output();
   test_vertex_position_output();

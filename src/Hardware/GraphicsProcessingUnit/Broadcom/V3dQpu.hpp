@@ -54,6 +54,7 @@ constexpr Dest recip() { return {true, 19}; } // starts a reciprocal; the result
 constexpr Dest rsqrt() { return {true, 20}; } // starts a reciprocal square root on V3D 4.2; its result shows up in r4 three instructions later
 constexpr Dest exp() { return {true, 21}; }   // starts 2^x on V3D 4.2; the result shows up in r4 three instructions later
 constexpr Dest log() { return {true, 22}; }   // starts log2(x) on V3D 4.2; the result shows up in r4 three instructions later
+constexpr Dest sin() { return {true, 23}; }   // starts sin(x) on V3D 4.2; the result shows up in r4 three instructions later
 
 struct Instruction {
   Add add_op = Add::Nop;
