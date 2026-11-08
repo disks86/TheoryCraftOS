@@ -484,6 +484,12 @@ static void test_qpu_encoder() {
   CHECK(encode(i, &w) && w == 0x3c0021848083e10bULL);   // fmin rf4, rf4, rf11
   i.add_op = Add::Fmax;
   CHECK(encode(i, &w) && w == 0x3c0021848083710bULL);   // fmax rf4, rf4, rf11
+  i.add_op = Add::Fround; i.add_a = rf(4); i.add_b = none();
+  CHECK(encode(i, &w) && w == 0x3c002184f5806100ULL);   // fround rf4, rf4
+  i.add_op = Add::Ftrunc;
+  CHECK(encode(i, &w) && w == 0x3c002184f580e100ULL);   // ftrunc rf4, rf4
+  i.add_op = Add::Fceil;
+  CHECK(encode(i, &w) && w == 0x3c002184f5816100ULL);   // fceil rf4, rf4
   Instruction c;
   c.add_op = Add::Fadd; c.add_a = rf(1); c.add_b = rf(2); c.mul_op = Mul::Fmul; c.mul_a = rf(3);
   CHECK(!encode(c, &w));                                 // three register file entries need three ports

@@ -40,8 +40,11 @@ AddDesc add_desc(Add op) {
     case Add::Fmin: return {128, 2, -1, -1, 1, -1};             // opcode 128 and increasing mux order select fmin (reverse selects fmax)
     case Add::Fmax: return {128, 2, -1, -1, -1, -1};
     case Add::Or: return {182, 2, -1, -1, false, -1};
+    case Add::Fround: return {245, 1, -1, 0, false, -1};
     case Add::Ftoiz: return {245, 1, -1, 7, false, -1};
     case Add::Ffloor: return {246, 1, -1, 0, false, -1};
+    case Add::Ftrunc: return {245, 1, -1, 1, false, -1};
+    case Add::Fceil: return {245, 1, -1, 2, false, -1};
     case Add::Vfpack: return {53, 2, -1, -1, false, -1};
     case Add::LdVpmvIn: return {188, 1, -1, 0, false, -1};
     case Add::StVpmv: return {248, 2, -1, -1, false, 0};         // the destination field says which store (0: a vector at a uniform offset)
