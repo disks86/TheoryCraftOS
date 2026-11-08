@@ -404,3 +404,21 @@ EXPORT NTSTATUS NTAPI RtlCopyContext(PVOID destination, ULONG flags, PVOID sourc
   memcpy(destination, source, sizeof(CONTEXT));
   return STATUS_SUCCESS;
 }
+/* The libraries this process unloaded (the last 64, as RTL_UNLOAD_EVENT_TRACE records): debuggers and crash reporters read it. Nothing is recorded yet, so it is
+ * an empty table of the right shape - all its records zero, which is how a reader knows where the used ones end. */
+typedef struct {
+  PVOID BaseAddress;
+  SIZE_T SizeOfImage;
+  ULONG Sequence, TimeDateStamp, CheckSum;
+  WCHAR ImageName[32];
+  ULONG Version[2];
+} RTL_UNLOAD_EVENT_TRACE_;
+static RTL_UNLOAD_EVENT_TRACE_ g_unload_trace[64];
+static ULONG g_unload_trace_size = sizeof(RTL_UNLOAD_EVENT_TRACE_), g_unload_trace_count = 64;
+static PVOID g_unload_trace_pointer = g_unload_trace;
+EXPORT PVOID NTAPI RtlGetUnloadEventTrace(void) { return g_unload_trace; }
+EXPORT void NTAPI RtlGetUnloadEventTraceEx(PULONG *element_size, PULONG *element_count, PVOID *event_trace) {
+  if (element_size) *element_size = &g_unload_trace_size;
+  if (element_count) *element_count = &g_unload_trace_count;
+  if (event_trace) *event_trace = &g_unload_trace_pointer;      /* (a pointer to the pointer: the table may be moved while a reader looks) */
+}

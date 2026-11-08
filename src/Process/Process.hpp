@@ -130,6 +130,9 @@ class IProcessRuntime {
   virtual bool is_parked(uint64_t id) { (void)id; return false; }
   // A thread that waits inside a system call stops here when it was asked to suspend (with the process lock held): 0 nothing to do, 1 it was parked and runs on, 2 it ended.
   virtual int park_point() { return 0; }
+  // Would park_point() stop the calling thread now (a lock-free look)? A wait asks this before it lets go of the system lock to park: the lock is held
+  // from the last look at what it waits for to the wait itself, so that a wake-up cannot fall in between.
+  virtual bool park_wanted() { return false; }
   // The registers of a thread that is parked (or has not started yet); false if it is neither. set_context takes effect when it runs again.
   virtual bool get_context(uint64_t id, X86Context* out) { (void)id; (void)out; return false; }
   virtual bool set_context(uint64_t id, const X86Context& context) { (void)id; (void)context; return false; }

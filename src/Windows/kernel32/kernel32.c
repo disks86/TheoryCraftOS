@@ -297,8 +297,9 @@ EXPORT BOOL WINAPI TerminateProcess(HANDLE process, UINT code) {
     const NTSTATUS status = NtTerminateProcess(process, (NTSTATUS)code);
     return NT_SUCCESS(status) ? TRUE : fail_nt(status);
   }
-  RtlExitUserProcess((NTSTATUS)code);
-  return TRUE;
+  /* This process: it ends at once, as with any other handle - unlike ExitProcess the libraries are not told (Chromium crashes on purpose if they are). */
+  const NTSTATUS status = NtTerminateProcess(NtCurrentProcess(), (NTSTATUS)code);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT void WINAPI ExitThread(DWORD code) { RtlExitUserThread((NTSTATUS)code); }
 EXPORT void WINAPI FatalExit(int code) { RtlExitUserProcess((NTSTATUS)code); }

@@ -195,6 +195,22 @@ void panic(const char* what, const Frame* frame) {
       console::puts("\n");
     }
   }
+#if defined(__x86_64__)
+  if (!frame) {
+    // A panic the code asked for: the callers, by the frame-pointer chain (the kernel keeps frame pointers), to resolve against TCOS_IMAGE_BASE. A link is followed
+    // only while it points further up the same stack, so a broken chain ends the walk instead of a fault.
+    console::puts("called from");
+    const uint64_t* fp = static_cast<const uint64_t*>(__builtin_frame_address(0));
+    for (uint32_t i = 0; i < 16 && fp && (reinterpret_cast<uint64_t>(fp) & 7) == 0; ++i) {
+      const uint64_t* up = reinterpret_cast<const uint64_t*>(fp[0]);
+      console::puts(" ");
+      console::put_hex(fp[1]);
+      if (up <= fp || reinterpret_cast<uint64_t>(up) - reinterpret_cast<uint64_t>(fp) > 0x10000) break;
+      fp = up;
+    }
+    console::puts("\n");
+  }
+#endif
   hardware::PvPanic::notify_panic();  // tell the host before the machine goes quiet
   for (;;) __asm__ volatile("hlt");
 }

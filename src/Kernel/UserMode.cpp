@@ -475,11 +475,11 @@ Frame* on_user_fault(Frame* frame) {
       irq_enable();      // (the frame is saved) the program's lock may have to be waited for: writing on its stack looks at its address space
       task->mutex.lock();
       delivered = process::dispatch_exception(*process, at, info, process->exception_dispatcher(), &entry);
+      if (delivered) log_exception(task, info.code, frame->rip, address, frame->rsp);      // (here: reading its stack may have to wait, and its memory may not change meanwhile)
       task->mutex.unlock();
       irq_disable();
     }
     if (delivered) {
-      log_exception(task, info.code, frame->rip, address, frame->rsp);
       context_to_frame(entry, frame);
       return frame;
     }
@@ -607,8 +607,32 @@ bool init(allocators::IAllocator& allocator) {
 
 namespace {
 // The running programs. A task joins the list when it has started and leaves it in its destructor, so a snapshot (which holds the lock) never sees a destroyed one.
+// Lock order: a program's own lock comes before the registry's (a system call holds its program's lock, and ending a child takes the registry's), so nothing
+// waits for a program's lock while it holds the registry's: the program is pinned, the registry let go, and then its lock taken.
 Mutex g_tasks_mutex;
 Task* g_tasks = nullptr;
+
+void unpin(Task* task) { __atomic_sub_fetch(&task->pins, 1u, __ATOMIC_ACQ_REL); }
+
+// Pins the programs `keep` accepts (under the registry's lock: they cannot be destroyed until unpinned), up to the capacity of `out`.
+template <typename Keep>
+uint32_t pin_tasks(ArrayView<Task*> out, Keep keep) {
+  uint32_t n = 0;
+  ScopedMutex registry(g_tasks_mutex);
+  for (Task* task = g_tasks; task && n < out.size(); task = task->all_next) {
+    if (!keep(*task)) continue;
+    __atomic_add_fetch(&task->pins, 1u, __ATOMIC_ACQ_REL);
+    out[n++] = task;
+  }
+  return n;
+}
+
+// The program with this id, pinned (unpin it), or null.
+Task* pin_task(uint64_t pid) {
+  Task* found[1] = {};
+  pin_tasks(ArrayView<Task*>(found, 1), [pid](Task& t) { return t.program.loaded() && t.program.process()->id() == pid; });
+  return found[0];
+}
 }  // namespace
 
 void Task::set_name(StringView text) {
@@ -619,12 +643,15 @@ void Task::set_name(StringView text) {
 
 Task::~Task() {
   if (registered) {
-    ScopedMutex hold(g_tasks_mutex);
-    for (Task** link = &g_tasks; *link; link = &(*link)->all_next)
-      if (*link == this) {
-        *link = all_next;
-        break;
-      }
+    {
+      ScopedMutex hold(g_tasks_mutex);
+      for (Task** link = &g_tasks; *link; link = &(*link)->all_next)
+        if (*link == this) {
+          *link = all_next;
+          break;
+        }
+    }
+    while (__atomic_load_n(&pins, __ATOMIC_ACQUIRE) != 0) sleep_ms(1);      // (whoever found it before it left the list finishes with it)
   }
   reap_children(true);
   while (threads) {
@@ -656,6 +683,10 @@ void Task::request_suspend(uint64_t id) {
 void Task::request_resume(uint64_t id) {
   if (UserThread* t = find_thread(id)) __atomic_store_n(&t->suspend_requested, false, __ATOMIC_RELEASE);
   changed.notify_all();
+}
+bool Task::park_wanted() {
+  UserThread* ut = current_user_thread();
+  return ut && ut->task == this && ut->syscall_frame && __atomic_load_n(&ut->suspend_requested, __ATOMIC_ACQUIRE);
 }
 int Task::park_point() {
   UserThread* ut = current_user_thread();
@@ -1112,13 +1143,14 @@ static bool with_child(Task& self, uint64_t pid, Action action) {
   }
   bool found = false, result = false;
   self.mutex.unlock();      // (another program's lock is taken, and no lock of this one may be held meanwhile: see remote_operation)
-  {
-    ScopedMutex registry(g_tasks_mutex);
-    for (Task* t = g_tasks; t && !found; t = t->all_next) {
-      if (t == &self) continue;
-      ScopedMutex hold(t->mutex);
-      for (Task::Child* c = t->children; c; c = c->next) if (c->pid == pid) { found = true; result = action(c); break; }
+  Task* pinned[256];
+  const uint32_t n = pin_tasks(ArrayView<Task*>(pinned, 256), [&self](Task& t) { return &t != &self; });
+  for (uint32_t i = 0; i < n; ++i) {
+    if (!found) {
+      ScopedMutex hold(pinned[i]->mutex);
+      for (Task::Child* c = pinned[i]->children; c; c = c->next) if (c->pid == pid) { found = true; result = action(c); break; }
     }
+    unpin(pinned[i]);
   }
   self.mutex.lock();
   return found && result;
@@ -1126,20 +1158,15 @@ static bool with_child(Task& self, uint64_t pid, Action action) {
 
 uint32_t Task::spawn_process_for(uint64_t parent_pid, const process::ChildSpec& spec) {
   if (parent_pid == program.process()->id()) return spawn_process(spec);
-  Task* target = nullptr;
   mutex.unlock();      // (another program's lock is taken, and no lock of this one may be held meanwhile: see remote_operation)
-  g_tasks_mutex.lock();
-  for (Task* t = g_tasks; t; t = t->all_next) {
-    if (t == this || !t->program.loaded() || t->program.process()->id() != parent_pid || t->program.process()->exited()) continue;
-    t->mutex.lock();      // (the registry's lock is let go of first: starting the program takes it again)
-    target = t;
-    break;
-  }
-  g_tasks_mutex.unlock();
+  Task* target = pin_task(parent_pid);
   uint32_t status = 0xC000000Bu;      // STATUS_INVALID_CID
   if (target) {
-    status = target->spawn_process(spec);
-    target->mutex.unlock();
+    if (target != this) {
+      ScopedMutex hold(target->mutex);
+      if (!target->program.process()->exited()) status = target->spawn_process(spec);
+    }
+    unpin(target);
   }
   mutex.lock();
   return status;
@@ -1227,18 +1254,19 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
 
 uint32_t remote_operation(uint64_t pid, process::IProcessRuntime::RemoteOp& op) {
   constexpr uint32_t kInvalidCid = 0xC000000Bu;
-  ScopedMutex registry(g_tasks_mutex);
-  for (Task* task = g_tasks; task; task = task->all_next) {
-    if (!task->program.loaded() || task->program.process()->id() != pid) continue;
+  Task* task = pin_task(pid);
+  if (!task) return kInvalidCid;
+  uint32_t status = 0;
+  {
     ScopedMutex hold(task->mutex);
-    const uint32_t status = process::windowsabi::run_remote(*task->program.process(), op);
+    status = process::windowsabi::run_remote(*task->program.process(), op);
     // The layout may have changed: the page tables are rebuilt and given to the threads of that program (on whatever cores they run), as at the end of one of its own system calls.
     using Op = process::IProcessRuntime::RemoteOp;
     const bool layout = op.kind == Op::Allocate || op.kind == Op::Free || op.kind == Op::Protect || op.kind == Op::MapView || op.kind == Op::Unmap;      // (a view that came or went changes the layout too)
-    if (layout && status == 0 && !task->sync_tables()) return 0xC0000017u;
-    return status;
+    if (layout && status == 0 && !task->sync_tables()) status = 0xC0000017u;
   }
-  return kInvalidCid;
+  unpin(task);
+  return status;
 }
 
 void report() {
@@ -1306,12 +1334,12 @@ uint32_t thread_snapshot(uint64_t pid, process::IProcessRuntime::ThreadEntry* ou
   uint64_t ids[process::Process::kMaxThreads], starts[process::Process::kMaxThreads];
   int32_t priorities[process::Process::kMaxThreads];
   uint32_t n = 0;
-  ScopedMutex registry(g_tasks_mutex);
-  for (Task* task = g_tasks; task; task = task->all_next) {
-    if (!task->program.loaded() || task->program.process()->id() != pid) continue;
-    ScopedMutex hold(task->mutex);
-    n = task->program.process()->thread_snapshot(ids, starts, priorities, process::Process::kMaxThreads);
-    break;
+  if (Task* task = pin_task(pid)) {
+    {
+      ScopedMutex hold(task->mutex);
+      n = task->program.process()->thread_snapshot(ids, starts, priorities, process::Process::kMaxThreads);
+    }
+    unpin(task);
   }
   if (n > capacity) n = capacity;
   for (uint32_t i = 0; i < n; ++i) {
@@ -1323,13 +1351,12 @@ uint32_t thread_snapshot(uint64_t pid, process::IProcessRuntime::ThreadEntry* ou
 
 uint32_t module_snapshot(uint64_t pid, process::IProcessRuntime::ModuleEntry* out, uint32_t capacity) {
   uint32_t n = 0;
-  ScopedMutex registry(g_tasks_mutex);
-  for (Task* task = g_tasks; task; task = task->all_next) {
-    if (!task->program.loaded() || task->program.process()->id() != pid) continue;
+  Task* task = pin_task(pid);
+  if (!task) return 0;
+  {
     ScopedMutex hold(task->mutex);
     const process::ModuleSet* modules = task->program.modules();
-    if (!modules) break;
-    for (uint64_t i = 0; i < modules->count() && n < capacity; ++i) {
+    for (uint64_t i = 0; modules && i < modules->count() && n < capacity; ++i) {
       const process::Module& m = modules->at(i);
       process::IProcessRuntime::ModuleEntry& e = out[n++];
       e = process::IProcessRuntime::ModuleEntry();
@@ -1338,16 +1365,18 @@ uint32_t module_snapshot(uint64_t pid, process::IProcessRuntime::ModuleEntry* ou
       for (; k + 1 < sizeof e.name && k < m.name.size(); ++k) e.name[k] = m.name.view()[k];
       e.name[k] = 0;
     }
-    break;
   }
+  unpin(task);
   return n;
 }
 
 uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
   uint32_t n = 0;
-  ScopedMutex registry(g_tasks_mutex);
-  for (Task* task = g_tasks; task && n < capacity; task = task->all_next) {
-    if (!task->program.loaded() || task->program.process()->exited()) continue;      // (one that has ended is gone from the list, whatever still holds its record)
+  Task* pinned[256];
+  const uint32_t count = pin_tasks(ArrayView<Task*>(pinned, capacity < 256 ? capacity : 256), [](Task& t) {
+    return t.program.loaded() && !t.program.process()->exited();      // (one that has ended is gone from the list, whatever still holds its record)
+  });
+  for (Task* task : ArrayView<Task*>(pinned, count)) {
     ProcessInfo& info = out[n++];
     info = ProcessInfo();
     info.id = task->program.process()->id();
@@ -1368,6 +1397,7 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
       else if (t->thread->state == ThreadState::Ready) ready = true;
     }
     if (info.state != ThreadState::Running && ready) info.state = ThreadState::Ready;
+    unpin(task);
   }
   return n;
 }
