@@ -84,7 +84,7 @@ static void test_rejections_and_bounds() {
   const char* error = nullptr;
   uint32_t line = 0;
 
-  const char* unsupported = "VERT\nDCL TEMP[0]\n0: EX2 TEMP[0], TEMP[0]\n1: END\n";
+  const char* unsupported = "VERT\nDCL TEMP[0]\n0: SSG TEMP[0], TEMP[0]\n1: END\n";
   CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(unsupported), ArrayView<uint64_t>(words), &info, &error, &line));
   CHECK(error && line == 3);
 
@@ -319,6 +319,35 @@ static void test_rsqrt_and_sqrt_lowering() {
   CHECK(words[4] == expected_word);
 }
 
+static void test_exp2_and_log2_lowering() {
+  TestAllocator allocator;
+  const char* sources[] = {
+      "VERT\nDCL TEMP[0]\n0: EX2 TEMP[0].x, TEMP[0]\n1: END\n",
+      "VERT\nDCL TEMP[0]\n0: LG2 TEMP[0].x, TEMP[0]\n1: END\n"};
+  const uint8_t sfu_addresses[] = {21, 22};
+  uint64_t words[16] = {};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  for (uint32_t op = 0; op < 2; ++op) {
+    CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(sources[op]), ArrayView<uint64_t>(words), &info, &error, &line));
+    CHECK(error == nullptr && info.instruction_count == 7);
+    hardware::v3d_qpu::Instruction expected;
+    expected.add_op = hardware::v3d_qpu::Add::Or;
+    expected.add_dest = {true, sfu_addresses[op]};
+    expected.add_a = expected.add_b = hardware::v3d_qpu::rf(0);
+    uint64_t expected_word = 0;
+    CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+    CHECK(words[0] == expected_word);
+    expected = {};
+    expected.add_op = hardware::v3d_qpu::Add::Or;
+    expected.add_dest = hardware::v3d_qpu::rf_dest(0);
+    expected.add_a = expected.add_b = hardware::v3d_qpu::acc(4);
+    CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+    CHECK(words[3] == expected_word);
+  }
+}
+
 static void test_fragment_color_output() {
   TestAllocator allocator;
   const char* source = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 {1.0, 0.5, 0.25, 1.0}\n0: MOV OUT[0], IMM[0]\n1: END\n";
@@ -450,6 +479,7 @@ int main() {
   test_fraction_lowering();
   test_negate_opcode_lowering();
   test_rsqrt_and_sqrt_lowering();
+  test_exp2_and_log2_lowering();
   test_fragment_color_output();
   test_vertex_position_output();
   test_varying_interpolation_and_output();

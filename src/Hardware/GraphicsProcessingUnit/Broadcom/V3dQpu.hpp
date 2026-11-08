@@ -52,6 +52,8 @@ constexpr Dest tlb() { return {true, 7}; }    // colour data for the tile buffer
 constexpr Dest tlbu() { return {true, 8}; }   // the first colour write: takes the next uniform as its configuration
 constexpr Dest recip() { return {true, 19}; } // starts a reciprocal; the result shows up in r4 three instructions later
 constexpr Dest rsqrt() { return {true, 20}; } // starts a reciprocal square root on V3D 4.2; its result shows up in r4 three instructions later
+constexpr Dest exp() { return {true, 21}; }   // starts 2^x on V3D 4.2; the result shows up in r4 three instructions later
+constexpr Dest log() { return {true, 22}; }   // starts log2(x) on V3D 4.2; the result shows up in r4 three instructions later
 
 struct Instruction {
   Add add_op = Add::Nop;
