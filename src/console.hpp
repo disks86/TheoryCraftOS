@@ -39,6 +39,8 @@ void set_color(uint32_t rgb);
 // Turns the QEMU debug console (port 0x402) output on or off; the screen is unaffected. For
 // redrawing text the debug console has already seen.
 void set_debug_output(bool enabled);
+// Turns the screen output on or off; the debug console is unaffected. For a desktop that owns the screen and must not be drawn over by kernel messages.
+void set_screen_output(bool enabled);
 void puts(StringView text);  // a literal or any C string converts implicitly
 // Text for the debug console only (port 0x402), never the screen: safe to use while something else is drawing.
 void debug_puts(StringView text);

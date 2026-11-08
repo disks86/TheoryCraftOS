@@ -37,8 +37,10 @@ kernel::RawSpinLock g_lock;
 uint64_t g_owner = 0;  // the holder: its thread (or, before threads exist, 1 + the core); 0 = free
 uint32_t g_depth = 0;
 
+bool g_screen_enabled = true;
 void putc(char c) {
   if (g_debug_enabled) g_debug.put(c);
+  if (!g_screen_enabled) return;
   if (g_graphics.attached()) g_graphics.put(c);
   else g_text.put(c);
 }
@@ -92,6 +94,11 @@ void show_banner(ArrayView<const uint32_t> pixels, uint32_t width, uint32_t heig
 void set_debug_output(bool enabled) {
   Guard guard;
   g_debug_enabled = enabled;
+}
+
+void set_screen_output(bool enabled) {
+  Guard guard;
+  g_screen_enabled = enabled;
 }
 
 void set_color(uint32_t rgb) {
