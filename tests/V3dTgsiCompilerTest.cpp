@@ -437,6 +437,14 @@ static void test_qpu_relative_branches() {
   CHECK(program.count() == 12);
   CHECK(static_cast<int32_t>(words[8]) == -96);
 
+  uint64_t patched_words[12] = {};
+  Program patched{ArrayView<uint64_t>(patched_words)};
+  uint32_t branch_index = UINT32_MAX;
+  CHECK(patched.branch_placeholder(BranchCondition::AnyZeroSet, &branch_index));
+  CHECK(branch_index == 0 && patched.nop(4));
+  CHECK(patched.patch_branch(branch_index, 8));
+  CHECK(static_cast<uint32_t>(patched_words[0]) == 32);
+
   Instruction invalid;
   invalid.branch = true;
   invalid.branch_offset_bytes = 3;

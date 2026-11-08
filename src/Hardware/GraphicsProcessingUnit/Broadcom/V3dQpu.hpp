@@ -97,6 +97,9 @@ class Program {
   // Emits a relative branch and its three mandatory delay slots. Target is an instruction index
   // in this program; backward targets are supported. The branch target is patched immediately.
   bool branch(BranchCondition condition, uint32_t target_instruction);
+  // Emits a branch whose destination is not known yet; patch_branch fills its target later.
+  bool branch_placeholder(BranchCondition condition, uint32_t* instruction_index);
+  bool patch_branch(uint32_t instruction_index, uint32_t target_instruction);
   bool nop(uint32_t count = 1);
   // Predicates subsequent add/mul ALU writes until reset to Condition::None; signal instructions stay unconditional.
   void set_condition(Condition condition) { condition_ = condition; }

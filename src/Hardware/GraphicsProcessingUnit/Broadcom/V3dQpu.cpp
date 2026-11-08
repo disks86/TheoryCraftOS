@@ -208,21 +208,19 @@ bool Program::nop(uint32_t count) {
 }
 
 bool Program::branch(BranchCondition condition, uint32_t target_instruction) {
-  if (target_instruction > UINT32_MAX / 8 || count_ > UINT32_MAX / 8 - 4) {
+  uint32_t branch_instruction = 0;
+  return branch_placeholder(condition, &branch_instruction) && patch_branch(branch_instruction, target_instruction);
+}
+
+bool Program::branch_placeholder(BranchCondition condition, uint32_t* instruction_index) {
+  if (!instruction_index || condition > BranchCondition::Always) {
     ok_ = false;
     return false;
   }
-  const int64_t after_delay_bytes = static_cast<int64_t>(count_ + 4) * 8;
-  const int64_t target_bytes = static_cast<int64_t>(target_instruction) * 8;
-  const int64_t offset = target_bytes - after_delay_bytes;
-  if (offset < INT32_MIN || offset > INT32_MAX) {
-    ok_ = false;
-    return false;
-  }
+  *instruction_index = count_;
   Instruction i;
   i.branch = true;
   i.branch_condition = condition;
-  i.branch_offset_bytes = static_cast<int32_t>(offset);
   uint64_t word = 0;
   if (!ok_ || count_ >= storage_.size() || !encode(i, &word)) {
     ok_ = false;
@@ -230,6 +228,27 @@ bool Program::branch(BranchCondition condition, uint32_t target_instruction) {
   }
   storage_[count_++] = word;
   return nop(3);
+}
+
+bool Program::patch_branch(uint32_t instruction_index, uint32_t target_instruction) {
+  if (target_instruction > UINT32_MAX / 8 || count_ > UINT32_MAX / 8 - 4) {
+    ok_ = false;
+    return false;
+  }
+  if (instruction_index >= count_ || instruction_index + 3 >= count_ || (storage_[instruction_index] >> 60) != 1 ||
+      ((storage_[instruction_index] >> 51) & 1) == 0) {
+    ok_ = false;
+    return false;
+  }
+  const int64_t after_delay_bytes = static_cast<int64_t>(instruction_index + 4) * 8;
+  const int64_t target_bytes = static_cast<int64_t>(target_instruction) * 8;
+  const int64_t offset = target_bytes - after_delay_bytes;
+  if (offset < INT32_MIN || offset > INT32_MAX) {
+    ok_ = false;
+    return false;
+  }
+  storage_[instruction_index] = (storage_[instruction_index] & 0xFFFFFFFF00000000ull) | static_cast<uint32_t>(offset);
+  return true;
 }
 
 }  // namespace hardware::v3d_qpu
