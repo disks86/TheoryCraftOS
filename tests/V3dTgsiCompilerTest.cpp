@@ -107,9 +107,15 @@ static void test_rejections_and_bounds() {
   CHECK(hardware::v3d_qpu::encode(negate, &expected_negate));
   CHECK(words[1] == expected_negate);
 
-  const char* absolute = "VERT\nDCL TEMP[0]\n0: ADD TEMP[0], |TEMP[0]|, TEMP[0]\n1: END\n";
-  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(absolute), ArrayView<uint64_t>(words), &info, &error, &line));
-  CHECK(error && line == 3);
+  const char* absolute = "VERT\nDCL TEMP[0]\n0: ABS TEMP[0].x, TEMP[0]\n1: END\n";
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(absolute), ArrayView<uint64_t>(words), &info, &error, &line));
+  CHECK(error == nullptr && info.instruction_count == 6);
+
+  const char* absolute_source = "VERT\nDCL TEMP[0]\n0: ADD TEMP[0].x, |TEMP[0]|, TEMP[0]\n1: END\n";
+  const bool absolute_source_compiled = hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(absolute_source), ArrayView<uint64_t>(words), &info, &error, &line);
+  if (!absolute_source_compiled) printf("absolute source compile error at line %u: %s\n", line, error ? error : "(none)");
+  CHECK(absolute_source_compiled);
+  CHECK(error == nullptr && info.instruction_count == 7);
 
   const char* bit_flip = "VERT\nDCL TEMP[0]\n0: ADZ TEMP[0], TEMP[0], TEMP[0]\n1: END\n";
   CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(bit_flip), ArrayView<uint64_t>(words), &info, &error, &line));

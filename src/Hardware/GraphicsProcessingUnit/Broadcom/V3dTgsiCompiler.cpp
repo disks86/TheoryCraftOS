@@ -111,6 +111,12 @@ bool emit(Program& p, const Instruction& i, uint32_t source_line, const char** e
   return p.emit(i) || fail("QPU instruction buffer is too small or an instruction cannot be encoded", source_line, error, line);
 }
 
+bool emit_absolute(Program& program, uint8_t dst, uint8_t src, uint8_t scratch, uint32_t source_line, const char** error, uint32_t* line) {
+  return emit(program, move_zero(scratch), source_line, error, line) &&
+         emit(program, binary(Add::Fsub, scratch, scratch, src), source_line, error, line) &&
+         emit(program, binary(Add::Fmax, dst, src, scratch), source_line, error, line);
+}
+
 }  // namespace
 
 bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,
@@ -173,10 +179,10 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     if ((!temp_destination && !shader_output) || inst.dst.saturate)
       return fail("destination must be an unsaturated TEMP or the supported shader output", inst.line, error, line);
     if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul &&
-        inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Flr &&
+        inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Abs && inst.op != gcn::TgsiOp::Flr &&
         inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil && inst.op != gcn::TgsiOp::Rcp)
       return fail("TGSI operation is not implemented by the V3D QPU compiler yet", inst.line, error, line);
-    const bool unary_op = inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc ||
+    const bool unary_op = inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Abs || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc ||
                           inst.op == gcn::TgsiOp::Ceil || inst.op == gcn::TgsiOp::Rcp;
     const uint8_t expected_sources = unary_op ? 1 : inst.op == gcn::TgsiOp::Mad ? 3 : 2;
     if (inst.src_count != expected_sources)
@@ -191,7 +197,6 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
       bool source_in_scratch[3] = {};
       for (uint32_t k = 0; k < inst.src_count; ++k) {
         const gcn::TgsiSrc& source = inst.src[k];
-        if (source.absolute) return fail("absolute source modifiers are not supported by this V3D compiler stage", inst.line, error, line);
         if (source.file == gcn::TgsiFile::Temp) {
           if (source.index >= shader.temps) return fail("TEMP source index is out of range", inst.line, error, line);
           src[k] = static_cast<uint8_t>(temp_base + source.index * 4 + source.swizzle[c]);
@@ -257,6 +262,21 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
       }
 
       for (uint32_t k = 0; k < inst.src_count; ++k) {
+        if (!inst.src[k].absolute) continue;
+        uint8_t scratch_slot = 0;
+        if (!source_in_scratch[k]) {
+          while (scratch_slot < 3 && (scratch_mask & (1u << scratch_slot))) ++scratch_slot;
+          if (scratch_slot == 3) return fail("no QPU scratch register is available for source absolute value", inst.line, error, line);
+        }
+        const uint8_t absolute_value = source_in_scratch[k] ? src[k] : static_cast<uint8_t>(scratch_base + scratch_slot);
+        if (!emit_absolute(program, absolute_value, src[k], static_cast<uint8_t>(scratch_base + 3), inst.line, error, line)) return false;
+        src[k] = absolute_value;
+        if (!source_in_scratch[k]) scratch_mask |= static_cast<uint8_t>(1u << scratch_slot);
+        source_in_scratch[k] = true;
+        if (register_count < static_cast<uint32_t>(absolute_value) + 1) register_count = static_cast<uint32_t>(absolute_value) + 1;
+      }
+
+      for (uint32_t k = 0; k < inst.src_count; ++k) {
         if (!inst.src[k].negate) continue;
         uint8_t scratch_slot = 0;
         if (!source_in_scratch[k]) {
@@ -274,6 +294,7 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
 
       bool ok = false;
       switch (inst.op) {
+        case gcn::TgsiOp::Abs: ok = emit_absolute(program, dst, src[0], static_cast<uint8_t>(scratch_base + 3), inst.line, error, line); break;
         case gcn::TgsiOp::Mov: {
           Instruction i;
           i.add_op = Add::Or;
