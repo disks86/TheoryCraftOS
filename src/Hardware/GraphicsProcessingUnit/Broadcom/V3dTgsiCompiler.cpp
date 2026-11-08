@@ -67,6 +67,13 @@ Instruction load_vpm(uint8_t dst, uint8_t value) {
   return i;
 }
 
+Instruction load_varying(uint8_t dst) {
+  Instruction i;
+  i.ldvary = true;
+  i.sig_dest = rf_dest(dst);
+  return i;
+}
+
 Instruction reciprocal(Operand source) {
   Instruction i;
   i.add_op = Add::Or;
@@ -114,31 +121,55 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
 
   gcn::TgsiShader shader(allocator);
   if (!gcn::parse_tgsi(allocator, text, &shader, error, line)) return false;
-  if (shader.samplers != 0 || (shader.fragment && shader.inputs != 0) || shader.outputs > 1)
-    return fail("this compiler stage accepts one fragment COLOR output or one vertex POSITION output", 0, error, line);
+  if (shader.samplers != 0 || shader.outputs > 2 || (shader.fragment && shader.outputs > 1))
+    return fail("this compiler stage accepts a fragment COLOR output or vertex POSITION and GENERIC[0] outputs", 0, error, line);
   if (shader.fragment && shader.outputs != 0 && shader.output_semantic[0] != gcn::TgsiSemantic::Color)
     return fail("fragment output must use the COLOR semantic", 0, error, line);
-  if (!shader.fragment && shader.outputs != 0 && shader.output_semantic[0] != gcn::TgsiSemantic::Position)
-    return fail("vertex output must use the POSITION semantic", 0, error, line);
-  if (shader.outputs != 0 && shader.temps > 14)
-    return fail("shader output needs four QPU registers beyond the current TEMP allocation", 0, error, line);
+  if (!shader.fragment && shader.outputs != 0 && (shader.output_semantic[0] != gcn::TgsiSemantic::Position ||
+      (shader.outputs == 2 && (shader.output_semantic[1] != gcn::TgsiSemantic::Generic || shader.output_semantic_index[1] != 0))))
+    return fail("vertex outputs must be POSITION and optional GENERIC[0]", 0, error, line);
+  if (shader.fragment && shader.inputs != 0 && (shader.inputs != 1 || shader.input_semantic[0] != gcn::TgsiSemantic::Generic ||
+                                                shader.input_semantic_index[0] != 0 || shader.input_flat[0]))
+    return fail("fragment input must be one smooth GENERIC[0] vec4", 0, error, line);
+  const bool fragment_input = shader.fragment && shader.inputs != 0;
+  const uint32_t max_temps = fragment_input ? 12 : shader.outputs == 2 && !shader.fragment ? 13 : 14;
+  if (shader.outputs != 0 && shader.temps > max_temps)
+    return fail("shader outputs exceed the current QPU register allocation", 0, error, line);
   if (shader.temps > kMaxTemps) return fail("shader needs more temporary registers than the current QPU allocator provides", 0, error, line);
 
   Program program(output);
-  const uint8_t scratch_base = static_cast<uint8_t>(shader.temps * 4);
-  uint32_t register_count = shader.temps * 4;
+  constexpr uint8_t kFragmentTempBase = 4, kFragmentVaryingBase = 52, kVertexVaryingBase = 56;
+  const uint8_t temp_base = fragment_input ? kFragmentTempBase : 0;
+  const uint8_t scratch_base = fragment_input ? 56 : static_cast<uint8_t>(shader.temps * 4);
+  uint32_t register_count = temp_base + shader.temps * 4;
   uint32_t uniform_count = 0;
   constexpr uint8_t kShaderOutputRegisterBase = 60;
   if (shader.outputs != 0) {
     for (uint8_t component = 0; component < 4; ++component)
       if (!emit(program, move_zero(static_cast<uint8_t>(kShaderOutputRegisterBase + component)), 0, error, line)) return false;
+    if (!shader.fragment && shader.outputs == 2)
+      for (uint8_t component = 0; component < 4; ++component)
+        if (!emit(program, move_zero(static_cast<uint8_t>(kVertexVaryingBase + component)), 0, error, line)) return false;
     register_count = 64;
+  }
+  if (fragment_input) {
+    for (uint8_t component = 0; component < 4; ++component) {
+      const uint8_t dest = static_cast<uint8_t>(kFragmentVaryingBase + component);
+      if (!emit(program, load_varying(dest), 0, error, line) || !program.nop() || !emit(program, multiply(dest, dest, 0), 0, error, line)) return false;
+      // The fragment ABI places 1/W in rf0 and the varying's C coefficient in acc5.
+      Instruction interpolate;
+      interpolate.add_op = Add::Fadd;
+      interpolate.add_dest = rf_dest(dest);
+      interpolate.add_a = rf(dest);
+      interpolate.add_b = acc(5);
+      if (!emit(program, interpolate, 0, error, line)) return false;
+    }
   }
   for (uint64_t n = 0; n < shader.instructions.count(); ++n) {
     const gcn::TgsiInst& inst = shader.instructions[n];
     if (inst.op == gcn::TgsiOp::End) continue;
     const bool temp_destination = inst.dst.file == gcn::TgsiFile::Temp && inst.dst.index < shader.temps;
-    const bool shader_output = shader.outputs != 0 && inst.dst.file == gcn::TgsiFile::Out && inst.dst.index == 0;
+    const bool shader_output = shader.outputs != 0 && inst.dst.file == gcn::TgsiFile::Out && inst.dst.index < shader.outputs;
     if ((!temp_destination && !shader_output) || inst.dst.saturate)
       return fail("destination must be an unsaturated TEMP or the supported shader output", inst.line, error, line);
     if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul &&
@@ -153,7 +184,8 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
 
     for (uint32_t c = 0; c < 4; ++c) {
       if (!(inst.dst.mask & (1u << c))) continue;
-      const uint8_t dst = shader_output ? static_cast<uint8_t>(kShaderOutputRegisterBase + c) : static_cast<uint8_t>(inst.dst.index * 4 + c);
+      const uint8_t dst = shader_output ? static_cast<uint8_t>((!shader.fragment && inst.dst.index == 1 ? kVertexVaryingBase : kShaderOutputRegisterBase) + c)
+                                         : static_cast<uint8_t>(temp_base + inst.dst.index * 4 + c);
       uint8_t src[3] = {};
       uint8_t scratch_mask = 0;
       for (uint32_t k = 0; k < inst.src_count; ++k) {
@@ -161,11 +193,16 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
         if (source.negate || source.absolute) return fail("source modifiers are not supported by this V3D compiler stage", inst.line, error, line);
         if (source.file == gcn::TgsiFile::Temp) {
           if (source.index >= shader.temps) return fail("TEMP source index is out of range", inst.line, error, line);
-          src[k] = static_cast<uint8_t>(source.index * 4 + source.swizzle[c]);
+          src[k] = static_cast<uint8_t>(temp_base + source.index * 4 + source.swizzle[c]);
           continue;
         }
         if (source.file == gcn::TgsiFile::In) {
           if (source.index >= shader.inputs || source.swizzle[c] > 3) return fail("vertex input source index is out of range", inst.line, error, line);
+          if (fragment_input) {
+            if (source.index != 0) return fail("fragment input location is not supported", inst.line, error, line);
+            src[k] = static_cast<uint8_t>(kFragmentVaryingBase + source.swizzle[c]);
+            continue;
+          }
           const TgsiInputBinding* binding = nullptr;
           for (const TgsiInputBinding& candidate : inputs)
             if (candidate.index == source.index && candidate.component == source.swizzle[c]) {
@@ -279,8 +316,10 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     info->tlb_config_count = shader.fragment && shader.outputs != 0 ? (write_depth ? 2 : 1) : 0;
     if (!shader.fragment && shader.outputs != 0) {
       info->output_register_base = kShaderOutputRegisterBase;
-      info->output_count = 1;
+      info->output_count = shader.outputs;
+      info->varying_output_count = shader.outputs == 2 ? 1 : 0;
     }
+    info->varying_input_count = fragment_input ? 1 : 0;
   }
   if (error) *error = nullptr;
   if (line) *line = 0;

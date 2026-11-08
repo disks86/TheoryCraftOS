@@ -754,7 +754,8 @@ static void test_graphics_device() {
     IShaderModule* fs = device.create_shader_module(colored_fragment_shader());
     ShaderModuleDesc plain = colored_vertex_shader();
     plain.qpu_program = QpuProgram::None;
-    CHECK(vs && fs && !device.create_shader_module(plain));
+    IShaderModule* compiled_plain = device.create_shader_module(plain);
+    CHECK(vs && fs && compiled_plain);
     GraphicsPipelineDesc pd;
     describe_colored_pipeline(&pd);
     pd.vertex_shader = vs; pd.fragment_shader = fs;
@@ -976,31 +977,52 @@ static void test_graphics_device() {
     custom_pd.fragment_shader = compiled_fs;
     IPipeline* custom_pipeline = device.create_graphics_pipeline(custom_pd);
     CHECK(compiled_fs && custom_pipeline);
+    ShaderModuleDesc varying_fragment;
+    varying_fragment.stage = ShaderStage::Fragment;
+    varying_fragment.tgsi = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n0: MOV OUT[0], IN[0]\n1: END\n";
+    IShaderModule* varying_fs = device.create_shader_module(varying_fragment);
+    GraphicsPipelineDesc varying_pd = pd;
+    varying_pd.fragment_shader = varying_fs;
+    IPipeline* varying_pipeline = device.create_graphics_pipeline(varying_pd);
+    CHECK(varying_fs && varying_pipeline);
     ShaderModuleDesc vertex_tgsi;
     vertex_tgsi.stage = ShaderStage::Vertex;
-    vertex_tgsi.tgsi = "VERT\nDCL IN[0], POSITION\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n";
+    vertex_tgsi.tgsi = "VERT\nDCL IN[0], POSITION\nDCL IN[1], GENERIC[0]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\n"
+                       "0: MOV OUT[0], IN[0]\n1: MOV OUT[1], IN[1]\n2: END\n";
     IShaderModule* compiled_vs = device.create_shader_module(vertex_tgsi);
-    GraphicsPipelineDesc custom_vertex_pd = custom_pd;
+    GraphicsPipelineDesc custom_vertex_pd = varying_pd;
     custom_vertex_pd.vertex_shader = compiled_vs;
     IPipeline* custom_vertex_pipeline = device.create_graphics_pipeline(custom_vertex_pd);
     CHECK(compiled_vs);
     CHECK(custom_vertex_pipeline);
+    GraphicsPipelineDesc tgsi_vertex_pd = pd;
+    tgsi_vertex_pd.vertex_shader = compiled_plain;
+    IPipeline* tgsi_vertex_pipeline = device.create_graphics_pipeline(tgsi_vertex_pd);
+    CHECK(tgsi_vertex_pipeline);
+    device.destroy_shader_module(compiled_plain);
     device.destroy_shader_module(compiled_fs);
-    device.destroy_shader_module(compiled_vs);  // both pipelines own their compiled code and uniform bindings
+    device.destroy_shader_module(varying_fs);
+    device.destroy_shader_module(compiled_vs);  // the pipelines own their compiled code and uniform bindings
     cmd->begin();
     cmd->begin_render_pass(rp);
     cmd->bind_pipeline(custom_pipeline);
     cmd->bind_vertex_buffer(vb, 0);
     cmd->push_constants(&cc, sizeof cc);
     cmd->draw(3, 0);
+    cmd->bind_pipeline(varying_pipeline);
+    cmd->draw(3, 0);
     cmd->bind_pipeline(custom_vertex_pipeline);
+    cmd->draw(3, 0);
+    cmd->bind_pipeline(tgsi_vertex_pipeline);
     cmd->draw(3, 0);
     cmd->end_render_pass();
     CHECK(cmd->end());
     core.at(v3d::kCtlIntSts) = v3d::kIntFlDone | v3d::kIntFrDone;
     CHECK(device.submit(cmd));
     device.destroy_pipeline(custom_pipeline);
+    device.destroy_pipeline(varying_pipeline);
     device.destroy_pipeline(custom_vertex_pipeline);
+    device.destroy_pipeline(tgsi_vertex_pipeline);
 
     device.destroy_command_buffer(cmd);
     device.destroy_buffer(vb); device.destroy_buffer(ib);

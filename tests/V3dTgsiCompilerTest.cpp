@@ -251,6 +251,40 @@ static void test_vertex_position_output() {
   CHECK(info.uniform_count == 1 && fixed_layout_uniform[0].file == gcn::TgsiFile::None && fixed_layout_uniform[0].immediate_bits == 0x3F800000u);
 }
 
+static void test_varying_interpolation_and_output() {
+  TestAllocator allocator;
+  const char* fragment = "FRAG\nDCL IN[0], GENERIC[0], PERSPECTIVE\nDCL OUT[0], COLOR\n0: MOV OUT[0], IN[0]\n1: END\n";
+  uint64_t fragment_words[64] = {};
+  hardware::v3d_shader::TgsiCompileInfo fragment_info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(fragment), ArrayView<uint64_t>(fragment_words), &fragment_info, &error, &line));
+  CHECK(fragment_info.varying_input_count == 1 && fragment_info.instruction_count == 29 && fragment_info.register_count == 64);
+  hardware::v3d_qpu::Instruction expected;
+  expected.ldvary = true;
+  expected.sig_dest = hardware::v3d_qpu::rf_dest(52);
+  uint64_t expected_word = 0;
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(fragment_words[4] == expected_word);
+
+  const char* vertex = "VERT\nDCL IN[0], POSITION\nDCL IN[1], GENERIC[0]\nDCL OUT[0], POSITION\nDCL OUT[1], GENERIC[0]\n"
+                      "0: MOV OUT[0], IN[0]\n1: MOV OUT[1], IN[1]\n2: END\n";
+  uint64_t vertex_words[64] = {};
+  hardware::v3d_shader::TgsiUniformBinding vertex_uniforms[16] = {};
+  hardware::v3d_shader::TgsiInputBinding inputs[8] = {{0, 0, 0}, {0, 1, 1}, {0, 2, 2}, {0, 3, 0, true, 0x3F800000},
+                                                      {1, 0, 3}, {1, 1, 4}, {1, 2, 5}, {1, 3, 6}};
+  hardware::v3d_shader::TgsiCompileInfo vertex_info;
+  const bool vertex_compiled = hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(vertex), ArrayView<uint64_t>(vertex_words), &vertex_info, &error, &line,
+                                                                      ArrayView<hardware::v3d_shader::TgsiUniformBinding>(vertex_uniforms),
+                                                                      ArrayView<const hardware::v3d_shader::TgsiInputBinding>(inputs), false, false);
+  CHECK(vertex_compiled);
+  CHECK(vertex_info.output_count == 2 && vertex_info.varying_output_count == 1 && vertex_info.output_register_base == 60);
+
+  const char* flat = "FRAG\nDCL IN[0], GENERIC[0], CONSTANT\nDCL OUT[0], COLOR\n0: MOV OUT[0], IN[0]\n1: END\n";
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(flat), ArrayView<uint64_t>(fragment_words), &fragment_info, &error, &line));
+  CHECK(error && line == 0);
+}
+
 static void test_decimal_immediates_parse_without_host_float_runtime() {
   TestAllocator allocator;
   gcn::TgsiShader shader(allocator);
@@ -275,6 +309,7 @@ int main() {
   test_reciprocal_sfu_lowering();
   test_fragment_color_output();
   test_vertex_position_output();
+  test_varying_interpolation_and_output();
   test_decimal_immediates_parse_without_host_float_runtime();
   if (failed) return 1;
   puts("V3dTgsiCompilerTest passed");

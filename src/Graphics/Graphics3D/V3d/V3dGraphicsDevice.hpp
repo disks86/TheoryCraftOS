@@ -30,10 +30,10 @@ namespace graphics {
 // recorded as usual and, at submit, each render pass becomes one frame on the GPU: the binner sorts the pass's draws into 64x64 tiles and the renderer runs the
 // QPU programs per tile and stores the tile buffer to the image. present() copies a finished image to the display.
 //
-// What it can run: the built-in coloured-vertex stage or a compiled TGSI vertex POSITION shader, paired with either the built-in fragment stage or a compiled
-// TGSI constant-color fragment shader. The vertex layout is a float3 at location 0 and a float4 at location 1; the built-in vertex shader takes the MVP matrix as the
-// first 64 bytes of push constants. Compiled vertex shaders produce clip-space position and do not use the MVP. Other shader outputs and fragment inputs remain
-// unsupported. Within a pass the viewport must lie inside the image; a scissor narrows
+// What it can run: the built-in coloured-vertex stage or a compiled TGSI vertex shader with POSITION and optional GENERIC[0], paired with the built-in fragment
+// stage or a compiled TGSI fragment shader with optional perspective GENERIC[0] input and COLOR output. The vertex layout is a float3 at location 0 and a float4 at
+// location 1; the built-in vertex shader takes the MVP matrix as the first 64 bytes of push constants. Compiled vertex shaders produce clip-space position and do not
+// use the MVP. Other shader outputs and fragment inputs remain unsupported. Within a pass the viewport must lie inside the image; a scissor narrows
 // the clip window. Only triangle lists are drawn, and only B8G8R8A8 and R8G8B8A8 colour images with an optional D32Float depth image of the same size are supported.
 // Nothing here has run on a real V3D (see README).
 class V3dGraphicsDevice final : public IGraphicsDevice {
