@@ -61,6 +61,9 @@ add_executable(BOOTAA64
   src/Hardware/GraphicsProcessingUnit/Broadcom/V3dRenderer.cpp
   src/Hardware/GraphicsProcessingUnit/Broadcom/V3dQpu.cpp
   src/Hardware/GraphicsProcessingUnit/Broadcom/V3dShaders.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dTgsiCompiler.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.cpp
+  src/Emulation/SoftFloat.cpp
   src/Hardware/GraphicsProcessingUnit/Broadcom/V3dGpuMemory.cpp
   src/Hardware/GraphicsProcessingUnit/Broadcom/V3dSelfTest.cpp
   src/Hardware/VideoCodec/Broadcom/RpiHevcBlock.cpp

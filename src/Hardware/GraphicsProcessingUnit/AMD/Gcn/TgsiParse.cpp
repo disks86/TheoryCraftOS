@@ -18,6 +18,7 @@
 
 
 #include "Hardware/GraphicsProcessingUnit/AMD/Gcn/TgsiParse.hpp"
+#include "Emulation/SoftFloat.hpp"
 
 namespace gcn {
 
@@ -59,7 +60,8 @@ struct Scanner {
     *out = static_cast<uint32_t>(v);
     return true;
   }
-  // a decimal float: [-+]digits[.digits][e[-+]digits]
+  // a decimal float: [-+]digits[.digits][e[-+]digits]. Convert it with the integer-only IEEE-754
+  // helper: the kernel build uses -mgeneral-regs-only and must not pull in a host double runtime.
   bool float_value(float* out) {
     skip_space();
     bool neg = false;
@@ -68,17 +70,24 @@ struct Scanner {
       ++pos;
     }
     if (!((peek() >= '0' && peek() <= '9') || peek() == '.')) return false;
-    double v = 0;
+    using emulation::softfloat::Env;
+    using emulation::softfloat::Format;
+    constexpr uint64_t ten = 0x4024000000000000ULL;  // binary64 10.0
+    Env env;
+    uint64_t v = 0;  // binary64 bits
     while (peek() >= '0' && peek() <= '9') {
-      v = v * 10 + static_cast<double>(peek() - '0');
+      v = emulation::softfloat::add(Format::F64, emulation::softfloat::mul(Format::F64, v, ten, env),
+                                    emulation::softfloat::from_int(Format::F64, peek() - '0', env), env);
       ++pos;
     }
+    uint32_t fractional_digits = 0;
     if (peek() == '.') {
       ++pos;
-      double scale = 0.1;
       while (peek() >= '0' && peek() <= '9') {
-        v += scale * static_cast<double>(peek() - '0');
-        scale *= 0.1;
+        v = emulation::softfloat::add(Format::F64, emulation::softfloat::mul(Format::F64, v, ten, env),
+                                      emulation::softfloat::from_int(Format::F64, peek() - '0', env), env);
+        if (fractional_digits == 1000) return false;
+        ++fractional_digits;
         ++pos;
       }
     }
@@ -91,10 +100,18 @@ struct Scanner {
       }
       uint32_t e = 0;
       if (!uint_value(&e) || e > 60) return false;
-      for (uint32_t i = 0; i < e; ++i) v = eneg ? v / 10.0 : v * 10.0;
+      if (eneg) {
+        if (e > 1000 - fractional_digits) return false;
+        fractional_digits += e;
+      }
+      else for (uint32_t i = 0; i < e; ++i) v = emulation::softfloat::mul(Format::F64, v, ten, env);
     }
-    if (v > 3.4e38) return false;
-    *out = static_cast<float>(neg ? -v : v);
+    if (fractional_digits > 1000) return false;
+    for (uint32_t i = 0; i < fractional_digits; ++i) v = emulation::softfloat::div(Format::F64, v, ten, env);
+    uint32_t bits = static_cast<uint32_t>(emulation::softfloat::convert(Format::F64, Format::F32, v, env));
+    if ((bits & 0x7F800000u) == 0x7F800000u) return false;
+    if (neg) bits |= 0x80000000u;
+    *out = __builtin_bit_cast(float, bits);
     return true;
   }
 };
