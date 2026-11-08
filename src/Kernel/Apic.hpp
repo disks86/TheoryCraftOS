@@ -38,6 +38,8 @@ void stop_timer();
 void eoi();
 // Fixed-delivery IPI to the core with the given APIC id.
 void send_ipi(uint32_t apic_id, uint8_t vector);
+// Non-maskable interrupt to the core with the given APIC id; it arrives even with interrupts masked.
+void send_nmi(uint32_t apic_id);
 // Acknowledges an interrupt nobody handles (also the legacy PIC for its vector range).
 void acknowledge_stray(uint8_t vector);
 

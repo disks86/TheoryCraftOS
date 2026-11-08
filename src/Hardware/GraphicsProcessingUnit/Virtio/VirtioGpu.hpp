@@ -70,6 +70,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   uint32_t current_mode() const override { return current_; }
   bool set_mode(uint32_t index) override;
   void present() override;
+  void take_over_for_panic() override;
   IMonitorSource* monitor_source() override { return this; }
 
   // --- IMonitorSource
@@ -123,6 +124,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   static constexpr uint64_t kCommandTimeoutUs = 250000;
   // ... but a 3D command (a submission of virgl commands) waits longer: the host may be compiling a big shader for it, which takes seconds when its shader cache does not have it.
   static constexpr uint64_t k3dCommandTimeoutUs = 20000000;
+  static constexpr uint64_t kPanicAnswerWaitUs = 1000000;   // how long a panic waits for the answer to a command a stopped thread had out
   static constexpr uint64_t kMaskedLockWaitUs = 2000;   // how long a caller with interrupts masked looks for the mutex before it gives up
   static constexpr uint64_t kInterruptWaitUs = 2000;   // one sleep for the interrupt; short, so a lost one costs little before the next look
   static constexpr uint64_t kSpinWaitUs = 50;   // how long a command's answer is waited for by spinning before the thread sleeps between looks
@@ -148,6 +150,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   Virtqueue control_;
   ByteView request_, response_;
   kernel::Mutex lock_;
+  bool alone_ = false;   // take_over_for_panic() was called: nobody else is left to take lock_ or to give it back
   kernel::Event completion_{true};   // set by the interrupt handler: a command finished
   bool interrupts_ = false;
   int32_t io_device_ = -1;           // kernel::register_io_device: what the threads waiting for completion_ follow

@@ -53,6 +53,8 @@ constexpr uint64_t g_xstate_mask = 0, g_xstate_bytes = 0;
 constexpr uint32_t kMaxCores = 128;
 static_assert(kMaxCores <= scheduling::kMaxPlacementCores);
 constexpr uint32_t kSliceTicks = 10;
+constexpr uint64_t kPanicStopWaitUs = 100000;   // how long a panic waits for the other cores to take its interrupt
+constexpr uint64_t kPanicNmiWaitUs = 1000;      // and then for the NMI to reach those that did not
 // What a thread gets on top of its placement_score on the core it was sent to when it became ready (more than any score), so that the core
 // that was woken for it takes it rather than something it suits slightly better.
 constexpr uint32_t kScoreSentHere = 32;
@@ -66,6 +68,7 @@ struct alignas(4096) Core {
   uint64_t apic_id = 0;   // what addresses the core in an inter-processor interrupt (APIC id; MPIDR affinity on ARM)
   bool online = false;
   bool parked = false;
+  bool stopped_for_panic = false;   // it has taken the interrupt stop_other_cores() sent and halted
   hardware::CoreKind kind = hardware::CoreKind::Performance;
   uint32_t slice = kSliceTicks;
   Thread* current = nullptr;
@@ -852,9 +855,22 @@ void run_core_work(Core* c) {
   __atomic_fetch_and(&g_core_work.pending, ~bit, __ATOMIC_ACQ_REL);
 }
 
+// The core that is stopping the others for a panic.
+constexpr uint32_t kNoPanicCore = 0xFFFFFFFFu;
+uint32_t g_panic_core = kNoPanicCore;
+
+#if defined(__x86_64__)
+// A core that had interrupts masked for too long. It does not touch the core's record: the NMI may have come in the middle of an entry from user mode.
+Frame* on_stop_nmi(Frame*, void*) { halt_forever(); }
+#endif
+
 Frame* on_wakeup(Frame* frame, void*) {
   ack_wakeup();
   Core* c = this_core();
+  if (__atomic_load_n(&g_panic_core, __ATOMIC_ACQUIRE) != kNoPanicCore) {
+    __atomic_store_n(&c->stopped_for_panic, true, __ATOMIC_RELEASE);
+    halt_forever();
+  }
   run_core_work(c);
   __atomic_fetch_add(&c->kernel_entries, 1, __ATOMIC_SEQ_CST);
   if (g.stopping && c->index != g.boot_core) park_core(c);
@@ -1136,6 +1152,37 @@ uint32_t reap_zombies() { return reap_zombies_impl(); }
 
 uint32_t current_core() { return g.running ? this_core()->index : 0; }
 uint32_t core_count() { return g.running ? g.core_count : 1; }
+
+void stop_other_cores() {
+  if (!g.running) return;
+  const uint32_t self = this_core()->index;
+  uint32_t expected = kNoPanicCore;
+  if (!__atomic_compare_exchange_n(&g_panic_core, &expected, self, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    if (expected != self) halt_forever();   // two cores panicked at once: one of them tells, and it must not wait for this one
+    return;
+  }
+  for (uint32_t i = 0; i < g.core_count; ++i)
+    if (i != self && g.cores[i].online) send_wakeup(g.cores[i].apic_id);
+  auto all_stopped = [&] {
+    for (uint32_t i = 0; i < g.core_count; ++i)
+      if (i != self && g.cores[i].online && !__atomic_load_n(&g.cores[i].stopped_for_panic, __ATOMIC_ACQUIRE)) return false;
+    return true;
+  };
+  const uint64_t limit = hardware::read_tsc() + hardware::tsc_ticks_per_us() * kPanicStopWaitUs;
+  while (!all_stopped() && hardware::read_tsc() < limit) cpu_relax();
+#if defined(__x86_64__)
+  // A core that did not answer has interrupts masked and may be spinning on a lock for ever. Only now the NMI: the kernel's gates have no stack of their own for it, so one that
+  // came in the few instructions after a SYSCALL would run on the program's stack. A core in those few instructions answered the interrupt above.
+  set_interrupt_handler(kVectorNmi, on_stop_nmi, nullptr);
+  bool sent = false;
+  for (uint32_t i = 0; i < g.core_count; ++i) {
+    if (i == self || !g.cores[i].online || __atomic_load_n(&g.cores[i].stopped_for_panic, __ATOMIC_ACQUIRE)) continue;
+    apic::send_nmi(static_cast<uint32_t>(g.cores[i].apic_id));
+    sent = true;
+  }
+  if (sent) hardware::delay_spin_us(kPanicNmiWaitUs);
+#endif
+}
 
 uint32_t tick_rate() { return g.tick_hz; }
 

@@ -37,6 +37,7 @@ static_assert(sizeof(Frame) == 512 + 15 * 8 + 16 + 40);
 
 using Vector = uint8_t;
 constexpr uint8_t kSelectorCode = 0x08, kSelectorData = 0x10;
+constexpr uint8_t kVectorNmi = 2;         // the processor's non-maskable interrupt
 constexpr uint8_t kVectorTimer = 0x40;     // local APIC timer: preemption tick
 constexpr uint8_t kVectorYield = 0x41;     // software interrupt: give up the core
 constexpr uint8_t kVectorWakeup = 0x42;    // inter-processor interrupt: look for work

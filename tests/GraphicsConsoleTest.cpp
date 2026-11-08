@@ -42,6 +42,7 @@ class FakeGpu final : public hardware::IGraphicsProcessingUnit {
   void clear(uint32_t) override { ++drawn; }
   void blit(uint32_t, uint32_t, uint32_t, uint32_t, const uint32_t*, uint32_t) override { ++drawn; }
   void present() override { ++presents; }
+  void take_over_for_panic() override { ++takeovers; }
   uint32_t glyph_width() const override { return 8; }
   uint32_t glyph_height() const override { return 16; }
   void draw_char(uint32_t, uint32_t, char, uint32_t, uint32_t) override { ++drawn; }
@@ -49,6 +50,7 @@ class FakeGpu final : public hardware::IGraphicsProcessingUnit {
 
   int drawn = 0;
   int presents = 0;
+  int takeovers = 0;
 };
 
 // A flush with nothing drawn since the last one leaves the GPU alone, however often it comes.
@@ -139,6 +141,16 @@ void test_attach() {
   console.flush();
   CHECK(second.presents == 1);
 }
+
+// A panic reaches the GPU the console draws on, and a console with no GPU survives it.
+void test_panic_takeover() {
+  GraphicsConsole console;
+  console.take_over_for_panic();
+  FakeGpu gpu;
+  console.attach(&gpu);
+  console.take_over_for_panic();
+  CHECK(gpu.takeovers == 1);
+}
 }  // namespace
 
 int main() {
@@ -147,6 +159,7 @@ int main() {
   test_carriage_return_is_not_drawing();
   test_newline_without_scroll_is_not_drawing();
   test_attach();
+  test_panic_takeover();
   printf(g_failed ? "GraphicsConsoleTest: %d FAILED\n" : "GraphicsConsoleTest: all ok\n", g_failed);
   return g_failed ? 1 : 0;
 }

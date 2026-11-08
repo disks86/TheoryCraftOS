@@ -44,6 +44,10 @@ class GraphicsConsole {
       gpu_->present();
     }
   }
+  // See IGraphicsProcessingUnit::take_over_for_panic.
+  void take_over_for_panic() {
+    if (gpu_) gpu_->take_over_for_panic();
+  }
 
  private:
   void new_line();

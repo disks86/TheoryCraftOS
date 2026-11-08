@@ -63,6 +63,9 @@ class IGraphicsProcessingUnit : public IHardware {
   // Makes everything drawn so far visible. Direct framebuffers show drawing at once; a GPU that
   // keeps its screen in separate memory (virtio-gpu) copies the changes over here.
   virtual void present() {}
+  // A panic: the caller is the only code still running, and the other cores may have stopped anywhere, also in the middle of this device's work with its locks held. From here on
+  // the device must draw and present without waiting for them.
+  virtual void take_over_for_panic() {}
 
   // The connectors and monitors of this device (see Hardware/Monitor); nullptr for a device that tells nothing about them. The monitor layer
   // (SystemMonitors) then treats the whole screen as one display.
