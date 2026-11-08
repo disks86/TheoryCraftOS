@@ -72,6 +72,7 @@ class IWindowSurfaceSink {
 };
 void set_window_surface_sink(IWindowSurfaceSink* sink);
 bool is_dc(uint32_t handle);
+bool is_screen_dc(uint32_t handle);      // a DC of the screen or of a window (not a memory DC, not a printer's)
 bool delete_dc(uint32_t dc);      // ReleaseDC / EndPaint: the DC goes (any objects selected into it stay)
 
 // --- Regions as lists of rectangles (HRGN <-> window update regions, window shapes).

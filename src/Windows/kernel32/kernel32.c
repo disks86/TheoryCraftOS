@@ -1059,6 +1059,7 @@ static void exclusive_release(LPCVOID view) {
 static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out);
 static DWORD g_default_dll_dirs;      /* SetDefaultDllDirectories */
 static BOOL has_separator(LPCWSTR name) { for (; *name; name++) if (*name == '\\' || *name == '/') return TRUE; return FALSE; }
+static BOOL is_api_set_name(LPCWSTR name);
 EXPORT HMODULE WINAPI LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags) {
   const DWORD saved = GetLastError();      /* (a call that works leaves the last error as it was) */
   WCHAR trimmed[PATH_CHARS];
@@ -1097,7 +1098,7 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     const int found = find_library_restricted(name, search, path);
     if (found < 0) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
     if (found > 0) unicode_string(&us, path);
-    else if (GetModuleHandleW(name)) unicode_string(&us, name);      /* (a library the process has already is not searched for) */
+    else if (GetModuleHandleW(name) || is_api_set_name(name)) unicode_string(&us, name);      /* (a library the process has already is not searched for; an API set is a name the loader knows, never a file) */
     else { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   } else if (find_file(name, dll, g_dll_directory, path)) {
     unicode_string(&us, path);
@@ -2329,6 +2330,17 @@ EXPORT BOOL WINAPI SetDefaultDllDirectories(DWORD flags) {
   return TRUE;
 }
 
+/* "api-ms-win-..." and "ext-ms-win-...", with ".dll" or without: a contract the loader maps to the library that implements it (no file has the name). */
+static BOOL is_api_set_name(LPCWSTR name) {
+  static const char *const prefixes[] = {"api-ms-", "ext-ms-"};
+  for (int p = 0; p < 2; ++p) {
+    const char *prefix = prefixes[p];
+    SIZE_T i = 0;
+    while (prefix[i] && name[i] && (name[i] | 0x20) == prefix[i]) ++i;
+    if (!prefix[i]) return TRUE;
+  }
+  return FALSE;
+}
 /* The LOAD_LIBRARY_SEARCH_* lookup: a full path is taken as it is, anything else is looked for in the folders the flags name (application 0x200, user 0x400, System32 0x800).
    Returns 1 found, 0 not found, -1 for flags that cannot work with this name. */
 static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
@@ -2344,7 +2356,10 @@ static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
   if (!has_extension) memcpy(file + length, dll, sizeof(dll));
   const BOOL rooted = name[0] == '\\' || (name[0] && name[1] == ':');      /* (rooted in the current drive, or a drive with its current folder) */
   if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
-  if (search & 0x100) return -1;      /* (the folder of the library that is loaded needs a path to take it from) */
+  if (search & 0x100) {      /* (the folder of the library that is loaded needs a path to take it from: a bare name may do without it only with the default folders) */
+    if (!(search & 0x1000)) return -1;
+    search &= ~(DWORD)0x100;
+  }
   PWSTR list = NULL, unused = NULL;
   if (!NT_SUCCESS(LdrGetDllPath(name, search, &list, &unused))) return -1;
   int found = 0;

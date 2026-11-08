@@ -566,6 +566,10 @@ bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView
 }
 
 bool is_dc(uint32_t handle) { return find_dc(handle) != nullptr; }
+bool is_screen_dc(uint32_t handle) {
+  const Dc* d = find_dc(handle);
+  return d && d->screen;
+}
 
 bool delete_dc(uint32_t dc) {
   Dc* d = find_dc(dc);

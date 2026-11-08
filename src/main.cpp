@@ -2083,6 +2083,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         run.arguments = ArrayView<const StringView>(arguments, count);
         run.kind = exe::ExecutableKind::Pe;
         run.output = [](void*, StringView text) { console::puts(text); };
+        console::set_screen_output(false);      // (the desktop has the screen: what the program and the kernel say goes to the debug console only)
         console::puts("autorun: starting " TCOS_AUTORUN "\n");
         uint32_t code = 0;
         String message(*a.allocator);

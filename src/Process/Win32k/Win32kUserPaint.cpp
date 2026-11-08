@@ -223,6 +223,8 @@ uint64_t nt_release_dc(Call& call) {
 uint64_t nt_window_from_dc(Call& call) {
   const uint32_t dc = call.arg32(0);
   for (WinDc& d : S().dcs) if (d.dc == dc) return d.hwnd;
+  // A DC of the whole screen (GetDC(NULL)) belongs to the desktop window, as on Windows: ANGLE takes such a DC as its display and checks it this way.
+  if (gdi::is_screen_dc(dc)) return user::desktop_window();
   return 0;
 }
 
