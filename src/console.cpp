@@ -73,9 +73,12 @@ void unlock() {
 }
 
 void break_lock() {  // for a panic: the holder may be the code that just crashed
+  kernel::stop_other_cores();  // first: they could take the lock again, or draw over what comes
   g_depth = 0;
   g_owner = 0;
   g_lock.reset();
+  g_screen_enabled = true;  // whoever has the screen, the panic message goes on it
+  g_graphics.take_over_for_panic();
 }
 
 void init(efi::SystemTable* st) {

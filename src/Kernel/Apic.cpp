@@ -31,6 +31,7 @@ constexpr uint32_t kRegId = 0x20, kRegEoi = 0xB0, kRegSpurious = 0xF0, kRegIcrLo
                    kRegLvtTimer = 0x320, kRegTimerInitial = 0x380, kRegTimerCurrent = 0x390, kRegTimerDivide = 0x3E0;
 constexpr uint32_t kLvtMasked = 1u << 16, kLvtPeriodic = 1u << 17;
 constexpr uint32_t kIcrDeliveryPending = 1u << 12;
+constexpr uint32_t kIcrDeliveryNmi = 4u << 8;
 constexpr uint32_t kDivideBy16 = 0x3;
 
 uint64_t g_base = 0xFEE00000;
@@ -108,6 +109,18 @@ void send_ipi(uint32_t apic_id, uint8_t vector) {
   } else {
     write(kRegIcrHigh, apic_id << 24);
     write(kRegIcrLow, vector);
+    while (read(kRegIcrLow) & kIcrDeliveryPending) __asm__ volatile("pause");
+  }
+  irq_restore(flags);
+}
+
+void send_nmi(uint32_t apic_id) {
+  const uint64_t flags = irq_save();
+  if (g_x2apic) {
+    wrmsr(0x800 + (kRegIcrLow >> 4), (uint64_t{apic_id} << 32) | kIcrDeliveryNmi);
+  } else {
+    write(kRegIcrHigh, apic_id << 24);
+    write(kRegIcrLow, kIcrDeliveryNmi);
     while (read(kRegIcrLow) & kIcrDeliveryPending) __asm__ volatile("pause");
   }
   irq_restore(flags);

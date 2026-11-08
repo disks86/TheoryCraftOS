@@ -207,6 +207,10 @@ uint32_t tick_rate();
 Thread* current_thread();
 uint32_t current_core();
 uint32_t core_count();
+// For a panic, with interrupts masked: halts every other core, so that nothing draws over the message and the panicking core is alone with what the others held. It waits a moment
+// for them and then goes on. On x86 a core with interrupts masked is stopped too (by an NMI); on the other architectures such a core runs on. A second core that calls this while a
+// first one is at it halts instead of returning.
+void stop_other_cores();
 
 // --- Device-aware scheduling (I/O affinity). A thread runs best on the core that takes the interrupts of the device it waits for: the handler
 // has just pulled the device's data (descriptors, completion entries, buffers) into that core's cache. The scheduler learns this by itself for

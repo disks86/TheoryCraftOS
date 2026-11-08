@@ -48,7 +48,7 @@ void debug_puts(StringView text);
 // output from another. Nests; always release in reverse order (use Guard).
 void lock();
 void unlock();
-void break_lock();  // panic only
+void break_lock();  // panic only: stops the other cores too, and makes the screen usable whatever they held
 class Guard {
  public:
   Guard() { lock(); }

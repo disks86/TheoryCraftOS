@@ -30,6 +30,7 @@ void GraphicsConsole::attach(hardware::IGraphicsProcessingUnit* gpu) {
     return;
   }
   gpu_->clear(kBackground);
+  pending_ = true;
 }
 
 void GraphicsConsole::show_banner(ArrayView<const uint32_t> pixels, uint32_t width, uint32_t height) {
@@ -41,6 +42,7 @@ void GraphicsConsole::show_banner(ArrayView<const uint32_t> pixels, uint32_t wid
   gpu_->blit(0, 0, width, height, pixels.data(), width);
   top_row_ = row_ = banner_rows;
   col_ = 0;
+  pending_ = true;
 }
 
 void GraphicsConsole::new_line() {
@@ -50,6 +52,7 @@ void GraphicsConsole::new_line() {
   const uint32_t gh = gpu_->glyph_height();
   gpu_->copy_rect(0, (top_row_ + 1) * gh, 0, top_row_ * gh, gpu_->width(), (rows_ - 1 - top_row_) * gh);
   gpu_->fill_rect(0, (rows_ - 1) * gh, gpu_->width(), gh, kBackground);
+  pending_ = true;
 }
 
 void GraphicsConsole::put(char c) {
@@ -63,4 +66,5 @@ void GraphicsConsole::put(char c) {
   gpu_->draw_char(col_ * gpu_->glyph_width(), row_ * gpu_->glyph_height(), c, foreground_,
                   kBackground);
   ++col_;
+  pending_ = true;
 }

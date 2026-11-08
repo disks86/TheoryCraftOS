@@ -54,7 +54,9 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence
   // for the mutex again instead (blocking there is a kernel panic), and not for ever: the thread that holds it may be waiting for the host's answer on this
   // very core, which cannot switch to it while interrupts are masked - spinning on would hang the machine. It gives up, as for a host that does not answer
   // (the console skips a frame).
-  if (kernel::irq_enabled() || !kernel::running()) {
+  if (alone_) {
+    // (no lock: see take_over_for_panic)
+  } else if (kernel::irq_enabled() || !kernel::running()) {
     lock_.lock();
   } else {
     const uint64_t start = uptime_us();
@@ -65,8 +67,9 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence
   }
   struct Release {
     kernel::Mutex& mutex;
-    ~Release() { mutex.unlock(); }
-  } guard{lock_};
+    bool locked;
+    ~Release() { if (locked) mutex.unlock(); }
+  } guard{lock_, !alone_};
   uint16_t index;
   uint32_t length;
   if (in_flight_) {  // an earlier command never got its answer: the buffers still belong to the device
@@ -442,7 +445,7 @@ void VirtioGpu::present() {
   if (!ready_ || !screen_resource_) return;
   uint32_t x, y, w, h;
   const bool dirty = take_dirty(&x, &y, &w, &h);
-  if (shown_resource_ != screen_resource_) {  // a 3D image had the screen: bring the console back
+  if (shown_resource_ != screen_resource_) {  // a 3D image had the screen: this 2D drawing takes it back
     mark_all_dirty();
     take_dirty(&x, &y, &w, &h);
     show_resource(screen_resource_, width(), height());
@@ -454,6 +457,20 @@ void VirtioGpu::present() {
   ResourceFlush flush{header(kCmdResourceFlush), {x, y, w, h}, screen_resource_, 0};
   command(as_bytes(transfer));
   command(as_bytes(flush));
+}
+
+// A stopped thread may hold the lock, and is often waiting for the host's answer to a command with it. That answer is awaited here, so that the buffers are ours again.
+void VirtioGpu::take_over_for_panic() {
+  alone_ = true;
+  if (!ready_) return;
+  if (control_.unanswered()) transport_->notify(0);   // (the thread may have stopped between posting the command and telling the device)
+  const uint64_t start = uptime_us();
+  uint16_t index;
+  uint32_t length;
+  while (control_.unanswered() && uptime_us() - start < kPanicAnswerWaitUs) {
+    if (!control_.take_used(&index, &length)) delay_spin_us(20);
+  }
+  in_flight_ = control_.unanswered();
 }
 
 void VirtioGpu::shutdown() {

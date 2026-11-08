@@ -50,6 +50,8 @@ class Virtqueue {
   void post_chain(uint16_t head, const Segment* segments, uint16_t count);
   // The next buffer the device finished: its descriptor index and bytes written.
   bool take_used(uint16_t* index, uint32_t* length);
+  // Whether a posted buffer has not come back through take_used yet.
+  bool unanswered() const { return available_index() != last_used_; }
 
  private:
   struct Descriptor {
