@@ -116,6 +116,12 @@ int32_t signal_code(const Instruction& i, bool small_imm) {
 }  // namespace
 
 bool encode(const Instruction& i, uint64_t* word) {
+  if (i.branch) {
+    if (i.branch_condition > BranchCondition::Always || i.branch_offset_bytes % 8 != 0) return false;
+    const uint64_t offset = static_cast<uint32_t>(i.branch_offset_bytes);
+    *word = (uint64_t{1} << 60) | (static_cast<uint64_t>(i.branch_condition) << 52) | (uint64_t{1} << 51) | offset;
+    return true;
+  }
   const AddDesc add = add_desc(i.add_op);
   const MulDesc mul = mul_desc(i.mul_op);
   if (i.ldvary && i.ldunifrf) return false;
@@ -199,6 +205,31 @@ bool Program::nop(uint32_t count) {
   for (uint32_t i = 0; i < count; ++i)
     if (!emit(Instruction())) return false;
   return true;
+}
+
+bool Program::branch(BranchCondition condition, uint32_t target_instruction) {
+  if (target_instruction > UINT32_MAX / 8 || count_ > UINT32_MAX / 8 - 4) {
+    ok_ = false;
+    return false;
+  }
+  const int64_t after_delay_bytes = static_cast<int64_t>(count_ + 4) * 8;
+  const int64_t target_bytes = static_cast<int64_t>(target_instruction) * 8;
+  const int64_t offset = target_bytes - after_delay_bytes;
+  if (offset < INT32_MIN || offset > INT32_MAX) {
+    ok_ = false;
+    return false;
+  }
+  Instruction i;
+  i.branch = true;
+  i.branch_condition = condition;
+  i.branch_offset_bytes = static_cast<int32_t>(offset);
+  uint64_t word = 0;
+  if (!ok_ || count_ >= storage_.size() || !encode(i, &word)) {
+    ok_ = false;
+    return false;
+  }
+  storage_[count_++] = word;
+  return nop(3);
 }
 
 }  // namespace hardware::v3d_qpu

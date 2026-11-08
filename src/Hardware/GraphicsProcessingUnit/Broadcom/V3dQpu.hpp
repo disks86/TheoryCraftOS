@@ -32,6 +32,12 @@ enum class Mul : uint8_t { Nop, Fmul };
 // Per-lane QPU predicate selection. None leaves the corresponding ALU pipe unconditional.
 enum class Condition : uint8_t { None, IfA, IfB, IfNotA, IfNotB };
 enum class PredicateFlag : uint8_t { None, PushZ, PushN, PushC };
+// Collective branch conditions consume the per-lane flags set by an ALU instruction.
+enum class BranchCondition : uint8_t {
+  AllZeroSet, AllZeroClear, AnyZeroSet, AnyZeroClear,
+  AllNegativeSet, AllNegativeClear, AnyNegativeSet, AnyNegativeClear,
+  AllCarrySet, AllCarryClear, AnyCarrySet, AnyCarryClear, Always = 15,
+};
 
 // A source: nothing, a register file entry, an accumulator (r0..r5; r4 is where an SFU result shows up, r5 where the varying's C coefficient is) or a small
 // immediate (0..15).
@@ -74,6 +80,9 @@ struct Instruction {
   Condition mul_condition = Condition::None;
   PredicateFlag add_predicate = PredicateFlag::None;
   PredicateFlag mul_predicate = PredicateFlag::None;
+  bool branch = false;
+  BranchCondition branch_condition = BranchCondition::Always;
+  int32_t branch_offset_bytes = 0;  // relative to the instruction after the three delay slots
 };
 
 // Encodes one instruction. False if it cannot be encoded: more than two register file entries or an immediate besides one, an immediate out of range, a register
@@ -85,6 +94,9 @@ class Program {
  public:
   explicit Program(ArrayView<uint64_t> storage) : storage_(storage) {}
   bool emit(const Instruction& instruction);
+  // Emits a relative branch and its three mandatory delay slots. Target is an instruction index
+  // in this program; backward targets are supported. The branch target is patched immediately.
+  bool branch(BranchCondition condition, uint32_t target_instruction);
   bool nop(uint32_t count = 1);
   // Predicates subsequent add/mul ALU writes until reset to Condition::None; signal instructions stay unconditional.
   void set_condition(Condition condition) { condition_ = condition; }

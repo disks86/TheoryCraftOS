@@ -418,6 +418,32 @@ static void test_if_else_predication() {
   CHECK(bindings[0].file == gcn::TgsiFile::Imm && bindings[0].component == 0 && bindings[0].immediate_bits == 0x3F800000u);
 }
 
+static void test_qpu_relative_branches() {
+  using namespace hardware::v3d_qpu;
+  uint64_t words[16] = {};
+  Program program{ArrayView<uint64_t>(words)};
+  CHECK(program.branch(BranchCondition::AnyZeroClear, 8));
+  CHECK(program.count() == 4);
+  CHECK((words[0] >> 60) == 1);                         // branch signal
+  CHECK(((words[0] >> 52) & 0xF) == static_cast<uint8_t>(BranchCondition::AnyZeroClear));
+  CHECK(((words[0] >> 51) & 1) == 1);                   // relative addressing
+  CHECK(static_cast<uint32_t>(words[0]) == 32);         // target - (branch + three delay slots)
+  Instruction nop;
+  uint64_t nop_word = 0;
+  CHECK(encode(nop, &nop_word));
+  CHECK(words[1] == nop_word && words[2] == nop_word && words[3] == nop_word);
+  CHECK(program.nop(4));
+  CHECK(program.branch(BranchCondition::Always, 0));
+  CHECK(program.count() == 12);
+  CHECK(static_cast<int32_t>(words[8]) == -96);
+
+  Instruction invalid;
+  invalid.branch = true;
+  invalid.branch_offset_bytes = 3;
+  uint64_t word = 0;
+  CHECK(!encode(invalid, &word));
+}
+
 static void test_fragment_color_output() {
   TestAllocator allocator;
   const char* source = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 {1.0, 0.5, 0.25, 1.0}\n0: MOV OUT[0], IMM[0]\n1: END\n";
@@ -552,6 +578,7 @@ int main() {
   test_exp2_log2_and_sin_lowering();
   test_pow_lowering();
   test_if_else_predication();
+  test_qpu_relative_branches();
   test_fragment_color_output();
   test_vertex_position_output();
   test_varying_interpolation_and_output();
