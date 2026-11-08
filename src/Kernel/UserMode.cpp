@@ -1254,7 +1254,9 @@ void report() {
     console::puts(locked ? "" : " (its lock is held: what follows may be changing)");
     console::puts(", memory ");
     console::put_dec(int64_t(task->program.address_space().resident_bytes() >> 20));
-    console::puts(" MiB resident\n");
+    console::puts(" MiB resident");
+    if (task->program.process()->exited()) { console::puts(", ended with "); console::put_hex(task->program.process()->exit_code()); }
+    console::puts("\n");
     const process::ModuleSet* modules = task->program.modules();
     auto where = [&](uint64_t address) { return put_code_address(modules, address); };
     for (uint64_t i = 0; modules && i < modules->count(); ++i) {      // where its modules are (a library that had to move is not where the others have it)

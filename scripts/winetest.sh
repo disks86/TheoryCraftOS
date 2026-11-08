@@ -78,7 +78,9 @@ while kill -0 $pid 2>/dev/null && [ $n -lt 2400 ]; do
     if [ $quiet -ge ${WINETEST_QUIET:-90} ]; then
       # Hung: ask the QEMU monitor where every CPU is (registers, twice a second apart) so the stall can be located in the kernel (image base is in the log)
       { echo "--- HANG DUMP (qemu monitor) ---"; grep -a TCOS_IMAGE_BASE "$log" | head -1
-        for i in 1 2; do (echo "info registers -a"; sleep 1) | socat - UNIX-CONNECT:"$mon" 2>/dev/null; done; } > "$(dirname "$0")/hang-dump.txt" 2>&1
+        for i in 1 2; do (echo "info registers -a"; sleep 1) | socat - UNIX-CONNECT:"$mon" 2>/dev/null; done
+        # (and each core's local APIC: an interrupt left in service, or a stopped timer, keeps that core's timeouts from ever ending)
+        for c in 0 1 2 3 4 5 6 7; do (echo "cpu $c"; echo "info lapic"; sleep 1) | socat - UNIX-CONNECT:"$mon" 2>/dev/null; done; } > "$(dirname "$0")/hang-dump.txt" 2>&1
       break
     fi
   fi

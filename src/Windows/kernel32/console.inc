@@ -706,13 +706,20 @@ static void con_orphan_events(ULONG_PTR keep) {
 }
 /* Does a wait on the handle look at the input of the console here? The standard input and the aliases of the console (CONIN$, CONOUT$) have no state of their own: they are ready when
  * the input is. The events above have one, which the kernel looks at. */
-static BOOL con_wait_polled(HANDLE h) { return h && ((h == GetStdHandle(STD_INPUT_HANDLE) && con_std_is_console(h)) || con_table_alias_kind(h) != 0); }
+static BOOL con_wait_polled(HANDLE h) {
+  if (!h) return FALSE;
+  if (con_table_alias_kind(h) != 0) return TRUE;
+  if (h != GetStdHandle(STD_INPUT_HANDLE) || !con_std_is_console(h)) return FALSE;
+  /* (looked at again: a standard input that was closed leaves its number in the process parameters, and the number may be a process or an event now) */
+  return device_type(h) == 0x50 || con_unbound_kind(h);
+}
 IMPORT void NTAPI RtlTcosSetConsoleWait(BOOL (*handle)(HANDLE), BOOL (*ready)(void));
 static BOOL con_wait_ready(void) { return con_input_ready(); }
 static void con_register_waits(void) { RtlTcosSetConsoleWait(con_wait_polled, con_wait_ready); }
 /* A handle is closed. */
 static void con_screen_closed(HANDLE h);
 static void con_handle_closed(HANDLE h) {
+  for (int i = 0; i < 3; ++i) if (g_con_cache[i].h == h) g_con_cache[i].h = NULL;      /* (the number may be given to something else next) */
   con_unbound_forget(h);
   RtlTcosConsoleEventForget(h);
   con_screen_closed(h);

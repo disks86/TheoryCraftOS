@@ -452,6 +452,7 @@ class ObjectManager {
   struct Job {
     bool used = false;
     uint32_t object = 0;
+    uint32_t parent = 0;      // the job object it nested under (its first process was in that job already), 0 if none: whoever joins this one joins that one too
     JobInfo info;
     JobMember members[kJobMaxMembers];
     bool port_set = false;      // a completion port is associated: the events below wait to be taken
@@ -462,6 +463,7 @@ class ObjectManager {
     uint32_t event_head = 0, event_count = 0;
   };
   void job_event_locked(Job& j, uint32_t message, uint64_t pid);
+  bool job_add_locked(Job& j, uint64_t pid);      // a new member (it is not in the job); false when the job is full
   void free_job_locked(Object& o);
   void job_forget_locked(uint64_t pid);
   Job* job_of(uint32_t id);      // (locked)

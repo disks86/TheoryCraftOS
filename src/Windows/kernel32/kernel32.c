@@ -2533,7 +2533,9 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     const ProcThreadAttributeList *attributes = *(ProcThreadAttributeList *const *)((const BYTE *)startup + sizeof(STARTUPINFOW));
     const ProcThreadAttributeEntry *jobs = attributes ? attribute_of(attributes, 0x0002000D) : NULL;
     for (SIZE_T i = 0; jobs && i < jobs->size / sizeof(HANDLE); ++i) {
-      const NTSTATUS joined = NtAssignProcessToJobObject(((HANDLE *)jobs->value)[i], process);
+      const HANDLE job = ((HANDLE *)jobs->value)[i];
+      if (job && NtIsProcessInJob(process, job) == (NTSTATUS)0x124 /* STATUS_PROCESS_IN_JOB */) continue;      /* (it has that one from its parent already) */
+      const NTSTATUS joined = NtAssignProcessToJobObject(job, process);
       if (!NT_SUCCESS(joined)) { NtTerminateProcess(process, (DWORD)joined); NtClose(process); NtClose(thread); fail_nt(joined); return FALSE; }
     }
   }
@@ -4148,6 +4150,10 @@ EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPST
 }
 EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options) {
   const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, inherit ? 2 /* OBJ_INHERIT */ : 0, options & 7);      /* DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DUPLICATE_SAME_ATTRIBUTES */
+  if ((options & 1) && (sp == GetCurrentProcess() || GetProcessId(sp) == GetCurrentProcessId())) {      /* (a handle of this process was closed: what remembers its number forgets it) */
+    con_alias_forget(source);
+    con_handle_closed(source);
+  }
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 
