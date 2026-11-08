@@ -178,7 +178,7 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     const bool shader_output = shader.outputs != 0 && inst.dst.file == gcn::TgsiFile::Out && inst.dst.index < shader.outputs;
     if ((!temp_destination && !shader_output) || inst.dst.saturate)
       return fail("destination must be an unsaturated TEMP or the supported shader output", inst.line, error, line);
-    if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul &&
+    if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul && inst.op != gcn::TgsiOp::Div &&
         inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Abs && inst.op != gcn::TgsiOp::Flr &&
         inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil && inst.op != gcn::TgsiOp::Rcp)
       return fail("TGSI operation is not implemented by the V3D QPU compiler yet", inst.line, error, line);
@@ -308,6 +308,15 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
         case gcn::TgsiOp::Min: ok = emit(program, binary(Add::Fmin, dst, src[0], src[1]), inst.line, error, line); break;
         case gcn::TgsiOp::Max: ok = emit(program, binary(Add::Fmax, dst, src[0], src[1]), inst.line, error, line); break;
         case gcn::TgsiOp::Mul: ok = emit(program, multiply(dst, src[0], src[1]), inst.line, error, line); break;
+        case gcn::TgsiOp::Div: {
+          const uint8_t reciprocal_result = static_cast<uint8_t>(scratch_base + 3);
+          ok = emit(program, reciprocal(rf(src[1])), inst.line, error, line) && program.nop(2) &&
+               emit(program, copy_accumulator(reciprocal_result, 4), inst.line, error, line) &&
+               emit(program, multiply(dst, src[0], reciprocal_result), inst.line, error, line);
+          if (!ok && error && !*error) fail("QPU instruction buffer is too small", inst.line, error, line);
+          if (register_count < static_cast<uint32_t>(reciprocal_result) + 1) register_count = static_cast<uint32_t>(reciprocal_result) + 1;
+          break;
+        }
         case gcn::TgsiOp::Mad: {
           uint8_t scratch_slot = 0;
           while (scratch_slot < 3 && (scratch_mask & (1u << scratch_slot))) ++scratch_slot;
