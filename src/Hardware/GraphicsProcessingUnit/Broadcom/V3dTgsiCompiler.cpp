@@ -179,10 +179,10 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     if ((!temp_destination && !shader_output) || inst.dst.saturate)
       return fail("destination must be an unsaturated TEMP or the supported shader output", inst.line, error, line);
     if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul && inst.op != gcn::TgsiOp::Div &&
-        inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Abs && inst.op != gcn::TgsiOp::Flr &&
+        inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Abs && inst.op != gcn::TgsiOp::Frc && inst.op != gcn::TgsiOp::Flr &&
         inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil && inst.op != gcn::TgsiOp::Rcp)
       return fail("TGSI operation is not implemented by the V3D QPU compiler yet", inst.line, error, line);
-    const bool unary_op = inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Abs || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc ||
+    const bool unary_op = inst.op == gcn::TgsiOp::Mov || inst.op == gcn::TgsiOp::Abs || inst.op == gcn::TgsiOp::Frc || inst.op == gcn::TgsiOp::Flr || inst.op == gcn::TgsiOp::Round || inst.op == gcn::TgsiOp::Trunc ||
                           inst.op == gcn::TgsiOp::Ceil || inst.op == gcn::TgsiOp::Rcp;
     const uint8_t expected_sources = unary_op ? 1 : inst.op == gcn::TgsiOp::Mad ? 3 : 2;
     if (inst.src_count != expected_sources)
@@ -315,6 +315,13 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
                emit(program, multiply(dst, src[0], reciprocal_result), inst.line, error, line);
           if (!ok && error && !*error) fail("QPU instruction buffer is too small", inst.line, error, line);
           if (register_count < static_cast<uint32_t>(reciprocal_result) + 1) register_count = static_cast<uint32_t>(reciprocal_result) + 1;
+          break;
+        }
+        case gcn::TgsiOp::Frc: {
+          const uint8_t whole = static_cast<uint8_t>(scratch_base + 3);
+          ok = emit(program, unary(Add::Ffloor, whole, src[0]), inst.line, error, line) &&
+               emit(program, binary(Add::Fsub, dst, src[0], whole), inst.line, error, line);
+          if (register_count < static_cast<uint32_t>(whole) + 1) register_count = static_cast<uint32_t>(whole) + 1;
           break;
         }
         case gcn::TgsiOp::Mad: {
