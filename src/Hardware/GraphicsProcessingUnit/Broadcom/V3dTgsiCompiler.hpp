@@ -29,6 +29,7 @@ struct TgsiCompileInfo {
   uint32_t instruction_count = 0;
   uint32_t register_count = 0;
   uint32_t uniform_count = 0;
+  uint32_t tlb_config_count = 0;  // implicit TLB uniforms consumed by the fragment output epilogue
 };
 
 struct TgsiUniformBinding {
@@ -46,12 +47,12 @@ struct TgsiInputBinding {
 
 // Lowers the straight-line arithmetic portion of TGSI to V3D 4.2 QPU code. This first backend slice
 // accepts TEMP/CONST/IMM MOV/ADD/SUB/MUL/MAD/MIN/MAX/RCP and ROUND/FLOOR/TRUNC/CEIL operations, with
-// no source modifiers or saturation. CONST and IMM values are emitted as ordered uniform bindings for
-// the caller to place in the QPU uniform stream. Stage I/O, flow control, and texture operations are
-// reported as errors until their V3D stage ABI and instruction support are implemented. Vertex IN
-// sources need an explicit mapping from TGSI location/component to the packed VPM value index.
+// no source modifiers or saturation. Fragment shaders may write OUT[0] COLOR. CONST and IMM values
+// are emitted as ordered uniform bindings for the caller to place in the QPU uniform stream. Other
+// stage I/O, flow control, and texture operations are reported as errors until their V3D ABI and
+// instruction support are implemented. Vertex IN sources need an explicit location/component-to-VPM mapping.
 // The output is a QPU thread body ending in the required thread-switch and delay slots.
 bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,
-                      ArrayView<TgsiUniformBinding> uniforms = {}, ArrayView<const TgsiInputBinding> inputs = {});
+                      ArrayView<TgsiUniformBinding> uniforms = {}, ArrayView<const TgsiInputBinding> inputs = {}, bool write_depth = false);
 
 }  // namespace hardware::v3d_shader

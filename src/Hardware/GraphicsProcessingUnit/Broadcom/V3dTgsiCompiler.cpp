@@ -83,6 +83,23 @@ Instruction copy_accumulator(uint8_t dst, uint8_t accumulator) {
   return i;
 }
 
+Instruction move_zero(uint8_t dst) {
+  Instruction i;
+  i.add_op = Add::Or;
+  i.add_dest = rf_dest(dst);
+  i.add_a = i.add_b = imm(0);
+  return i;
+}
+
+Instruction pack(Dest dst, uint8_t a, uint8_t b) {
+  Instruction i;
+  i.add_op = Add::Vfpack;
+  i.add_dest = dst;
+  i.add_a = rf(a);
+  i.add_b = rf(b);
+  return i;
+}
+
 bool emit(Program& p, const Instruction& i, uint32_t source_line, const char** error, uint32_t* line) {
   return p.emit(i) || fail("QPU instruction buffer is too small or an instruction cannot be encoded", source_line, error, line);
 }
@@ -90,26 +107,38 @@ bool emit(Program& p, const Instruction& i, uint32_t source_line, const char** e
 }  // namespace
 
 bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayView<uint64_t> output, TgsiCompileInfo* info, const char** error, uint32_t* line,
-                      ArrayView<TgsiUniformBinding> uniforms, ArrayView<const TgsiInputBinding> inputs) {
+                      ArrayView<TgsiUniformBinding> uniforms, ArrayView<const TgsiInputBinding> inputs, bool write_depth) {
   if (info) *info = {};
   if (error) *error = nullptr;
   if (line) *line = 0;
 
   gcn::TgsiShader shader(allocator);
   if (!gcn::parse_tgsi(allocator, text, &shader, error, line)) return false;
-  if (shader.outputs != 0 || shader.samplers != 0 || (shader.fragment && shader.inputs != 0))
-    return fail("this compiler stage currently accepts vertex IN, TEMP, CONST, and IMM arithmetic only", 0, error, line);
+  if (shader.samplers != 0 || (shader.fragment && shader.inputs != 0) || (shader.outputs != 0 && (!shader.fragment || shader.outputs != 1)))
+    return fail("this compiler stage accepts fragment OUT[0] COLOR or vertex IN with TEMP, CONST, and IMM arithmetic", 0, error, line);
+  if (shader.fragment && shader.outputs != 0 && shader.output_semantic[0] != gcn::TgsiSemantic::Color)
+    return fail("fragment output must use the COLOR semantic", 0, error, line);
+  if (shader.fragment && shader.outputs != 0 && shader.temps > 14)
+    return fail("fragment output needs four QPU registers beyond the current TEMP allocation", 0, error, line);
   if (shader.temps > kMaxTemps) return fail("shader needs more temporary registers than the current QPU allocator provides", 0, error, line);
 
   Program program(output);
   const uint8_t scratch_base = static_cast<uint8_t>(shader.temps * 4);
   uint32_t register_count = shader.temps * 4;
   uint32_t uniform_count = 0;
+  constexpr uint8_t kFragmentColor = 60;
+  if (shader.fragment && shader.outputs != 0) {
+    for (uint8_t component = 0; component < 4; ++component)
+      if (!emit(program, move_zero(static_cast<uint8_t>(kFragmentColor + component)), 0, error, line)) return false;
+    register_count = 64;
+  }
   for (uint64_t n = 0; n < shader.instructions.count(); ++n) {
     const gcn::TgsiInst& inst = shader.instructions[n];
     if (inst.op == gcn::TgsiOp::End) continue;
-    if (inst.dst.file != gcn::TgsiFile::Temp || inst.dst.index >= shader.temps || inst.dst.saturate)
-      return fail("destination must be an unsaturated TEMP", inst.line, error, line);
+    const bool temp_destination = inst.dst.file == gcn::TgsiFile::Temp && inst.dst.index < shader.temps;
+    const bool fragment_output = shader.fragment && shader.outputs != 0 && inst.dst.file == gcn::TgsiFile::Out && inst.dst.index == 0;
+    if ((!temp_destination && !fragment_output) || inst.dst.saturate)
+      return fail("destination must be an unsaturated TEMP or fragment OUT[0]", inst.line, error, line);
     if (inst.op != gcn::TgsiOp::Mov && inst.op != gcn::TgsiOp::Add && inst.op != gcn::TgsiOp::Sub && inst.op != gcn::TgsiOp::Mul &&
         inst.op != gcn::TgsiOp::Mad && inst.op != gcn::TgsiOp::Min && inst.op != gcn::TgsiOp::Max && inst.op != gcn::TgsiOp::Flr &&
         inst.op != gcn::TgsiOp::Round && inst.op != gcn::TgsiOp::Trunc && inst.op != gcn::TgsiOp::Ceil && inst.op != gcn::TgsiOp::Rcp)
@@ -122,7 +151,7 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
 
     for (uint32_t c = 0; c < 4; ++c) {
       if (!(inst.dst.mask & (1u << c))) continue;
-      const uint8_t dst = static_cast<uint8_t>(inst.dst.index * 4 + c);
+      const uint8_t dst = fragment_output ? static_cast<uint8_t>(kFragmentColor + c) : static_cast<uint8_t>(inst.dst.index * 4 + c);
       uint8_t src[3] = {};
       uint8_t scratch_mask = 0;
       for (uint32_t k = 0; k < inst.src_count; ++k) {
@@ -209,6 +238,19 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     }
   }
 
+  if (shader.fragment && shader.outputs != 0) {
+    if (write_depth) {
+      Instruction z;
+      z.add_op = Add::Or;
+      z.add_dest = tlbu();
+      z.add_a = z.add_b = rf(2);
+      if (!emit(program, z, 0, error, line)) return false;
+    }
+    if (!emit(program, pack(tlbu(), kFragmentColor, kFragmentColor + 1), 0, error, line) ||
+        !emit(program, pack(tlb(), kFragmentColor + 2, kFragmentColor + 3), 0, error, line))
+      return false;
+  }
+
   Instruction end;
   end.thrsw = true;
   if (!emit(program, end, 0, error, line) || !program.nop(2)) return fail("QPU code buffer is too small", 0, error, line);
@@ -216,6 +258,7 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
     info->instruction_count = program.count();
     info->register_count = register_count;
     info->uniform_count = uniform_count;
+    info->tlb_config_count = shader.fragment && shader.outputs != 0 ? (write_depth ? 2 : 1) : 0;
   }
   if (error) *error = nullptr;
   if (line) *line = 0;

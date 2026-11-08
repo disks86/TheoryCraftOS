@@ -180,6 +180,39 @@ static void test_reciprocal_sfu_lowering() {
   CHECK(words[3] == expected_word);
 }
 
+static void test_fragment_color_output() {
+  TestAllocator allocator;
+  const char* source = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 {1.0, 0.5, 0.25, 1.0}\n0: MOV OUT[0], IMM[0]\n1: END\n";
+  uint64_t words[32] = {};
+  hardware::v3d_shader::TgsiUniformBinding bindings[4] = {};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line,
+                                               ArrayView<hardware::v3d_shader::TgsiUniformBinding>(bindings)));
+  CHECK(info.instruction_count == 17 && info.register_count == 64 && info.uniform_count == 4 && info.tlb_config_count == 1);
+  CHECK(bindings[0].component == 0 && bindings[1].component == 1 && bindings[3].immediate_bits == 0x3F800000u);
+  hardware::v3d_qpu::Instruction expected;
+  expected.add_op = hardware::v3d_qpu::Add::Vfpack;
+  expected.add_dest = hardware::v3d_qpu::tlbu();
+  expected.add_a = hardware::v3d_qpu::rf(60);
+  expected.add_b = hardware::v3d_qpu::rf(61);
+  uint64_t expected_word = 0;
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[12] == expected_word);
+
+  uint64_t depth_words[32] = {};
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(depth_words), &info, &error, &line,
+                                               ArrayView<hardware::v3d_shader::TgsiUniformBinding>(bindings), {}, true));
+  CHECK(info.instruction_count == 18 && info.tlb_config_count == 2);
+  expected = {};
+  expected.add_op = hardware::v3d_qpu::Add::Or;
+  expected.add_dest = hardware::v3d_qpu::tlbu();
+  expected.add_a = expected.add_b = hardware::v3d_qpu::rf(2);
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(depth_words[12] == expected_word);
+}
+
 static void test_decimal_immediates_parse_without_host_float_runtime() {
   TestAllocator allocator;
   gcn::TgsiShader shader(allocator);
@@ -202,6 +235,7 @@ int main() {
   test_uniform_sources();
   test_vertex_input_vpm_binding();
   test_reciprocal_sfu_lowering();
+  test_fragment_color_output();
   test_decimal_immediates_parse_without_host_float_runtime();
   if (failed) return 1;
   puts("V3dTgsiCompilerTest passed");
