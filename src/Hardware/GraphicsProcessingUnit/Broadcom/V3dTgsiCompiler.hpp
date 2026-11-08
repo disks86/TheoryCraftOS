@@ -53,7 +53,7 @@ struct TgsiInputBinding {
 
 // Lowers a straight-line arithmetic subset of TGSI to V3D 4.2 QPU code. It supports TEMP/CONST/IMM
 // MOV/ADD/SUB/MUL/MAD/MIN/MAX/RCP and ROUND/FLOOR/TRUNC/CEIL operations, with
-// no source modifiers or saturation. Fragment shaders may read one perspective GENERIC[0] vec4 and
+// source negation supported and absolute-value modifiers and saturation rejected. Fragment shaders may read one perspective GENERIC[0] vec4 and
 // write OUT[0] COLOR. Vertex shaders may write OUT[0] POSITION (RF60..RF63) and optional OUT[1]
 // GENERIC[0] (RF56..RF59) for V3D stage epilogues. CONST, IMM, and fixed input values become ordered
 // uniform bindings. Other stage I/O, flow control, and texture operations remain unsupported. Vertex

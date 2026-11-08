@@ -188,9 +188,10 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
                                          : static_cast<uint8_t>(temp_base + inst.dst.index * 4 + c);
       uint8_t src[3] = {};
       uint8_t scratch_mask = 0;
+      bool source_in_scratch[3] = {};
       for (uint32_t k = 0; k < inst.src_count; ++k) {
         const gcn::TgsiSrc& source = inst.src[k];
-        if (source.negate || source.absolute) return fail("source modifiers are not supported by this V3D compiler stage", inst.line, error, line);
+        if (source.absolute) return fail("absolute source modifiers are not supported by this V3D compiler stage", inst.line, error, line);
         if (source.file == gcn::TgsiFile::Temp) {
           if (source.index >= shader.temps) return fail("TEMP source index is out of range", inst.line, error, line);
           src[k] = static_cast<uint8_t>(temp_base + source.index * 4 + source.swizzle[c]);
@@ -211,6 +212,7 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
             }
           if (!binding) return fail("vertex input has no VPM binding", inst.line, error, line);
           src[k] = static_cast<uint8_t>(scratch_base + k);
+          source_in_scratch[k] = true;
           scratch_mask |= static_cast<uint8_t>(1u << k);
           if (register_count < static_cast<uint32_t>(src[k]) + 1) register_count = static_cast<uint32_t>(src[k]) + 1;
           if (binding->constant) {
@@ -245,12 +247,29 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
           binding.immediate_bits = __builtin_bit_cast(uint32_t, shader.immediates[source.index].value[source.swizzle[c]]);
         uniforms[uniform_count++] = binding;
         src[k] = static_cast<uint8_t>(scratch_base + k);
+        source_in_scratch[k] = true;
         scratch_mask |= static_cast<uint8_t>(1u << k);
         if (register_count < static_cast<uint32_t>(src[k]) + 1) register_count = static_cast<uint32_t>(src[k]) + 1;
         Instruction load;
         load.ldunifrf = true;
         load.sig_dest = rf_dest(src[k]);
         if (!emit(program, load, inst.line, error, line)) return false;
+      }
+
+      for (uint32_t k = 0; k < inst.src_count; ++k) {
+        if (!inst.src[k].negate) continue;
+        uint8_t scratch_slot = 0;
+        if (!source_in_scratch[k]) {
+          while (scratch_slot < 3 && (scratch_mask & (1u << scratch_slot))) ++scratch_slot;
+          if (scratch_slot == 3) return fail("no QPU scratch register is available for source negation", inst.line, error, line);
+        }
+        const uint8_t negated = source_in_scratch[k] ? src[k] : static_cast<uint8_t>(scratch_base + scratch_slot);
+        if (!emit(program, move_zero(negated), inst.line, error, line)) return fail("QPU source-negation zero could not be encoded", inst.line, error, line);
+        if (!emit(program, binary(Add::Fsub, negated, negated, src[k]), inst.line, error, line))
+          return fail("QPU source-negation subtract could not be encoded", inst.line, error, line);
+        src[k] = negated;
+        if (!source_in_scratch[k]) scratch_mask |= static_cast<uint8_t>(1u << scratch_slot);
+        if (register_count < static_cast<uint32_t>(negated) + 1) register_count = static_cast<uint32_t>(negated) + 1;
       }
 
       bool ok = false;
@@ -287,7 +306,7 @@ bool compile_tgsi_alu(allocators::IAllocator& allocator, StringView text, ArrayV
           break;
         default: break;
       }
-      if (!ok) return false;
+      if (!ok) return fail("QPU TGSI arithmetic instruction could not be encoded", inst.line, error, line);
     }
   }
 

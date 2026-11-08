@@ -79,7 +79,7 @@ static void test_arithmetic_lowering() {
 
 static void test_rejections_and_bounds() {
   TestAllocator allocator;
-  uint64_t words[8] = {};
+  uint64_t words[32] = {};
   hardware::v3d_shader::TgsiCompileInfo info;
   const char* error = nullptr;
   uint32_t line = 0;
@@ -89,7 +89,26 @@ static void test_rejections_and_bounds() {
   CHECK(error && line == 3);
 
   const char* modified = "VERT\nDCL TEMP[0]\n0: ADD TEMP[0], -TEMP[0], TEMP[0]\n1: END\n";
-  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(modified), ArrayView<uint64_t>(words), &info, &error, &line));
+  const bool modified_compiled = hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(modified), ArrayView<uint64_t>(words), &info, &error, &line);
+  CHECK(modified_compiled);
+  CHECK(error == nullptr && info.instruction_count == 15);
+  hardware::v3d_qpu::Instruction negate;
+  negate.add_op = hardware::v3d_qpu::Add::Or;
+  negate.add_dest = hardware::v3d_qpu::rf_dest(4);
+  negate.add_a = negate.add_b = hardware::v3d_qpu::imm(0);
+  uint64_t expected_negate = 0;
+  CHECK(hardware::v3d_qpu::encode(negate, &expected_negate));
+  CHECK(words[0] == expected_negate);
+  negate = {};
+  negate.add_op = hardware::v3d_qpu::Add::Fsub;
+  negate.add_dest = hardware::v3d_qpu::rf_dest(4);
+  negate.add_a = hardware::v3d_qpu::rf(4);
+  negate.add_b = hardware::v3d_qpu::rf(0);
+  CHECK(hardware::v3d_qpu::encode(negate, &expected_negate));
+  CHECK(words[1] == expected_negate);
+
+  const char* absolute = "VERT\nDCL TEMP[0]\n0: ADD TEMP[0], |TEMP[0]|, TEMP[0]\n1: END\n";
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(absolute), ArrayView<uint64_t>(words), &info, &error, &line));
   CHECK(error && line == 3);
 
   const char* bit_flip = "VERT\nDCL TEMP[0]\n0: ADZ TEMP[0], TEMP[0], TEMP[0]\n1: END\n";
