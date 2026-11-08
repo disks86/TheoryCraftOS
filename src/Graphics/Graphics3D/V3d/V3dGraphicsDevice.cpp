@@ -22,6 +22,7 @@
 #include "Hardware/GraphicsProcessingUnit/Broadcom/V3dDraw.hpp"
 #include "Hardware/GraphicsProcessingUnit/Broadcom/V3dFloat.hpp"
 #include "Hardware/GraphicsProcessingUnit/Broadcom/V3dRenderer.hpp"
+#include "Hardware/GraphicsProcessingUnit/Broadcom/V3dTgsiCompiler.hpp"
 
 namespace graphics {
 
@@ -127,30 +128,75 @@ class V3dImage final : public IImage {
 
 class V3dShaderModule final : public IShaderModule {
  public:
+  static constexpr uint32_t kCompiledWordCapacity = 512;
+  static constexpr uint32_t kCompiledBindingCapacity = 768;
   explicit V3dShaderModule(const ShaderModuleDesc& desc) : desc_(desc) {}
   ShaderStage stage() const override { return desc_.stage; }
   QpuProgram program() const { return desc_.qpu_program; }
   bool matrix_rows() const { return desc_.qpu_matrix_rows; }
   bool flip_y() const { return desc_.qpu_flip_y; }
+  bool compile_fragment(allocators::IAllocator& allocator) {
+    if (desc_.stage != ShaderStage::Fragment || !desc_.tgsi) return false;
+    hardware::v3d_shader::TgsiCompileInfo plain_info, depth_info;
+    const char* error = nullptr;
+    uint32_t line = 0;
+    if (!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(desc_.tgsi), ArrayView<uint64_t>(fragment_words_), &plain_info, &error, &line,
+                                                 ArrayView<hardware::v3d_shader::TgsiUniformBinding>(bindings_)) ||
+        !hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(desc_.tgsi), ArrayView<uint64_t>(fragment_depth_words_), &depth_info, &error, &line,
+                                                 ArrayView<hardware::v3d_shader::TgsiUniformBinding>(depth_bindings_), {}, true))
+      return false;
+    if (plain_info.tlb_config_count != 1 || depth_info.tlb_config_count != 2 || plain_info.uniform_count != depth_info.uniform_count) return false;
+    fragment_count_ = plain_info.instruction_count;
+    fragment_depth_count_ = depth_info.instruction_count;
+    binding_count_ = plain_info.uniform_count;
+    compiled_fragment_ = true;
+    return true;
+  }
+  bool compiled_fragment() const { return compiled_fragment_; }
+  ArrayView<const uint64_t> fragment_words(bool depth) const {
+    return depth ? ArrayView<const uint64_t>(fragment_depth_words_, fragment_depth_count_) : ArrayView<const uint64_t>(fragment_words_, fragment_count_);
+  }
+  ArrayView<const hardware::v3d_shader::TgsiUniformBinding> fragment_bindings() const {
+    return ArrayView<const hardware::v3d_shader::TgsiUniformBinding>(bindings_, binding_count_);
+  }
 
  private:
   ShaderModuleDesc desc_;
+  uint64_t fragment_words_[kCompiledWordCapacity] = {};
+  uint64_t fragment_depth_words_[kCompiledWordCapacity] = {};
+  hardware::v3d_shader::TgsiUniformBinding bindings_[kCompiledBindingCapacity] = {};
+  hardware::v3d_shader::TgsiUniformBinding depth_bindings_[kCompiledBindingCapacity] = {};
+  uint32_t fragment_count_ = 0, fragment_depth_count_ = 0, binding_count_ = 0;
+  bool compiled_fragment_ = false;
 };
 
 class V3dPipeline final : public IPipeline {
  public:
-  V3dPipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset, bool matrix_rows = false, bool flip_y = false)
-      : desc_(desc), position_offset_(position_offset), color_offset_(color_offset), matrix_rows_(matrix_rows), flip_y_(flip_y) {}
+  V3dPipeline(const GraphicsPipelineDesc& desc, uint32_t position_offset, uint32_t color_offset, const v3d_shader::ShaderCode& shaders,
+              const V3dGpuBlock& custom_code = {}, ArrayView<const v3d_shader::TgsiUniformBinding> bindings = {}, bool matrix_rows = false, bool flip_y = false)
+      : desc_(desc), position_offset_(position_offset), color_offset_(color_offset), matrix_rows_(matrix_rows), flip_y_(flip_y), shaders_(shaders), custom_code_(custom_code) {
+    desc_.vertex_shader = nullptr;
+    desc_.fragment_shader = nullptr;
+    binding_count_ = static_cast<uint32_t>(bindings.size());
+    for (uint32_t i = 0; i < binding_count_; ++i) bindings_[i] = bindings[i];
+  }
   bool matrix_rows() const { return matrix_rows_; }
   bool flip_y() const { return flip_y_; }
   const GraphicsPipelineDesc& desc() const { return desc_; }
   uint32_t position_offset() const { return position_offset_; }
   uint32_t color_offset() const { return color_offset_; }
+  const v3d_shader::ShaderCode& shaders() const { return shaders_; }
+  const V3dGpuBlock& custom_code() const { return custom_code_; }
+  ArrayView<const v3d_shader::TgsiUniformBinding> fragment_bindings() const { return ArrayView<const v3d_shader::TgsiUniformBinding>(bindings_, binding_count_); }
 
  private:
   GraphicsPipelineDesc desc_;
   uint32_t position_offset_, color_offset_;
   bool matrix_rows_, flip_y_;
+  v3d_shader::ShaderCode shaders_;
+  V3dGpuBlock custom_code_;
+  v3d_shader::TgsiUniformBinding bindings_[V3dShaderModule::kCompiledBindingCapacity] = {};
+  uint32_t binding_count_ = 0;
 };
 
 uint32_t word_from_bytes(const uint8_t* b) { return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) | (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24); }
@@ -194,8 +240,8 @@ struct V3dGraphicsDevice::DrawRecord {
 // Fills the binner's list of one pass with the state and the draws.
 class V3dGraphicsDevice::PassContent final : public IV3dBinningContent {
  public:
-  PassContent(const List<DrawRecord>& draws, const V3dFrameDesc& frame, const V3dGpuBlock& code, const V3dGpuBlock& defaults, const v3d_shader::ShaderCode& shaders)
-      : draws_(draws), frame_(frame), code_(code), defaults_(defaults), shaders_(shaders) {}
+  PassContent(const List<DrawRecord>& draws, const V3dFrameDesc& frame, const V3dGpuBlock& code, const V3dGpuBlock& defaults)
+      : draws_(draws), frame_(frame), code_(code), defaults_(defaults) {}
 
   bool emit(V3dControlList& bcl, V3dControlList& indirect) override {
     for (uint64_t i = 0; i < draws_.count(); ++i) {
@@ -239,8 +285,8 @@ class V3dGraphicsDevice::PassContent final : public IV3dBinningContent {
     const uint64_t attribute_bytes = d.pipeline->color_offset() + 16 > d.pipeline->position_offset() + 12 ? d.pipeline->color_offset() + 16 : d.pipeline->position_offset() + 12;
     int64_t lowest = 0, highest = 0;
     V3dDrawCall call;
-    call.code_address = code_.gpu_address;
-    call.code = shaders_;
+    call.code_address = d.pipeline->custom_code().valid() ? d.pipeline->custom_code().gpu_address : code_.gpu_address;
+    call.code = d.pipeline->shaders();
     call.with_z_write = frame_.has_depth;
     call.defaults_address = defaults_.gpu_address;
     if (d.indexed) {
@@ -283,12 +329,25 @@ class V3dGraphicsDevice::PassContent final : public IV3dBinningContent {
     uint32_t mvp[16];
     for (uint32_t k = 0; k < 16; ++k) mvp[k] = word_from_bytes(d.constants + 4 * k);
     kernel_matrix_words(mvp, d.pipeline->matrix_rows(), d.pipeline->flip_y());   // (a Direct3D 9 vertex shader: rows, Y up)
-    uint32_t cs[v3d_shader::kCoordinateUniformWords], vs[v3d_shader::kVertexUniformWords], fs[v3d_shader::kFragmentZUniformWords];
+    uint32_t cs[v3d_shader::kCoordinateUniformWords], vs[v3d_shader::kVertexUniformWords], fs[V3dShaderModule::kCompiledBindingCapacity + v3d_shader::kFragmentZUniformWords];
     const uint32_t x_scale = v3d_shader::float_bits(vp.width * 128), y_scale = v3d_shader::float_bits(vp.height * 128);
     if (!v3d_shader::coordinate_uniforms(ArrayView<uint32_t>(cs), ArrayView<const uint32_t>(mvp), x_scale, y_scale) ||
         !v3d_shader::vertex_uniforms(ArrayView<uint32_t>(vs), ArrayView<const uint32_t>(mvp), x_scale, y_scale, vp.z_scale_bits, vp.z_offset_bits))
       return false;
     uint32_t fragment_words = 0;
+    if (d.pipeline->custom_code().valid()) {
+      for (const v3d_shader::TgsiUniformBinding& binding : d.pipeline->fragment_bindings()) {
+        if (binding.file == gcn::TgsiFile::Imm) {
+          fs[fragment_words++] = binding.immediate_bits;
+        } else if (binding.file == gcn::TgsiFile::Const) {
+          const uint32_t offset = static_cast<uint32_t>(binding.index) * 16 + static_cast<uint32_t>(binding.component) * 4;
+          if (offset > d.constants_size || 4 > d.constants_size - offset) return false;
+          fs[fragment_words++] = word_from_bytes(d.constants + offset);
+        } else {
+          return false;
+        }
+      }
+    }
     if (frame_.has_depth) fs[fragment_words++] = v3d_shader::kTlbDepthConfig;
     fs[fragment_words++] = v3d_shader::kTlbColorConfig;
     call.coordinate_uniforms = ArrayView<const uint32_t>(cs);
@@ -302,7 +361,6 @@ class V3dGraphicsDevice::PassContent final : public IV3dBinningContent {
   const V3dFrameDesc& frame_;
   const V3dGpuBlock& code_;
   const V3dGpuBlock& defaults_;
-  const v3d_shader::ShaderCode& shaders_;
 };
 
 V3dGraphicsDevice::~V3dGraphicsDevice() {
@@ -360,7 +418,16 @@ void V3dGraphicsDevice::destroy_image(IImage* image) { destroy(allocator_, stati
 IShaderModule* V3dGraphicsDevice::create_shader_module(const ShaderModuleDesc& desc) {
   const bool matches = (desc.stage == ShaderStage::Vertex && desc.qpu_program == QpuProgram::ColoredVertex) ||
                        (desc.stage == ShaderStage::Fragment && desc.qpu_program == QpuProgram::ColoredFragment);
-  return matches ? make<V3dShaderModule>(allocator_, desc) : nullptr;
+  if (matches) return make<V3dShaderModule>(allocator_, desc);
+  if (desc.stage == ShaderStage::Fragment && desc.qpu_program == QpuProgram::None && desc.tgsi) {
+    V3dShaderModule* module = make<V3dShaderModule>(allocator_, desc);
+    if (module && !module->compile_fragment(allocator_)) {
+      destroy(allocator_, module);
+      return nullptr;
+    }
+    return module;
+  }
+  return nullptr;
 }
 void V3dGraphicsDevice::destroy_shader_module(IShaderModule* module) { destroy(allocator_, static_cast<V3dShaderModule*>(module)); }
 
@@ -369,7 +436,7 @@ IPipeline* V3dGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDes
   if (desc.stencil.enable) return nullptr;   // (no stencil test on this device)
   const V3dShaderModule* vs = static_cast<const V3dShaderModule*>(desc.vertex_shader);
   const V3dShaderModule* fs = static_cast<const V3dShaderModule*>(desc.fragment_shader);
-  if (!vs || !fs || vs->program() != QpuProgram::ColoredVertex || fs->program() != QpuProgram::ColoredFragment) return nullptr;
+  if (!vs || !fs || vs->program() != QpuProgram::ColoredVertex || (fs->program() != QpuProgram::ColoredFragment && !fs->compiled_fragment())) return nullptr;
   if (desc.attribute_count != 2 || desc.varying_count != 1 || desc.vertex_stride == 0 || desc.vertex_stride > 2048) return nullptr;
   int32_t position = -1, color = -1;
   for (uint32_t i = 0; i < desc.attribute_count; ++i) {
@@ -378,9 +445,35 @@ IPipeline* V3dGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDes
     else if (a.location == 1 && a.format == VertexFormat::Float4) color = static_cast<int32_t>(a.offset);
   }
   if (position < 0 || color < 0 || position > 2000 || color > 2000) return nullptr;
-  return make<V3dPipeline>(allocator_, desc, static_cast<uint32_t>(position), static_cast<uint32_t>(color), vs->matrix_rows(), vs->flip_y());
+  if (!fs->compiled_fragment()) return make<V3dPipeline>(allocator_, desc, static_cast<uint32_t>(position), static_cast<uint32_t>(color), shader_code_, V3dGpuBlock(),
+                                                         ArrayView<const v3d_shader::TgsiUniformBinding>(), vs->matrix_rows(), vs->flip_y());
+  if (!ready()) return nullptr;
+  const uint32_t builtin_words = shader_code_.fragment_z.first + shader_code_.fragment_z.instructions;
+  const ArrayView<const uint64_t> fragment = fs->fragment_words(false), fragment_depth = fs->fragment_words(true);
+  const uint64_t total_words = static_cast<uint64_t>(builtin_words) + fragment.size() + fragment_depth.size();
+  if (total_words > UINT32_MAX / 8) return nullptr;
+  V3dGpuBlock custom_code;
+  if (!memory_.allocate(static_cast<uint32_t>(total_words * 8), 4096, &custom_code)) return nullptr;
+  for (uint32_t i = 0; i < builtin_words * 8; ++i) custom_code.cpu[i] = code_.cpu[i];
+  uint32_t at = builtin_words * 8;
+  for (uint64_t i = 0; i < fragment.size(); ++i)
+    for (uint32_t b = 0; b < 8; ++b) custom_code.cpu[at++] = static_cast<uint8_t>(fragment[i] >> (8 * b));
+  v3d_shader::ShaderCode pipeline_shaders = shader_code_;
+  pipeline_shaders.fragment = {builtin_words, static_cast<uint32_t>(fragment.size())};
+  pipeline_shaders.fragment_z = {builtin_words + static_cast<uint32_t>(fragment.size()), static_cast<uint32_t>(fragment_depth.size())};
+  for (uint64_t i = 0; i < fragment_depth.size(); ++i)
+    for (uint32_t b = 0; b < 8; ++b) custom_code.cpu[at++] = static_cast<uint8_t>(fragment_depth[i] >> (8 * b));
+  memory_.clean(custom_code);
+  V3dPipeline* pipeline = make<V3dPipeline>(allocator_, desc, static_cast<uint32_t>(position), static_cast<uint32_t>(color), pipeline_shaders, custom_code,
+                                            fs->fragment_bindings(), vs->matrix_rows(), vs->flip_y());
+  if (!pipeline) memory_.release(custom_code);
+  return pipeline;
 }
-void V3dGraphicsDevice::destroy_pipeline(IPipeline* pipeline) { destroy(allocator_, static_cast<V3dPipeline*>(pipeline)); }
+void V3dGraphicsDevice::destroy_pipeline(IPipeline* pipeline) {
+  V3dPipeline* v3d_pipeline = static_cast<V3dPipeline*>(pipeline);
+  if (v3d_pipeline && v3d_pipeline->custom_code().valid()) memory_.release(v3d_pipeline->custom_code());
+  destroy(allocator_, v3d_pipeline);
+}
 
 ICommandBuffer* V3dGraphicsDevice::create_command_buffer() { return make<CommandRecorder>(allocator_, allocator_); }
 void V3dGraphicsDevice::destroy_command_buffer(ICommandBuffer* commands) { destroy(allocator_, static_cast<CommandRecorder*>(commands)); }
@@ -428,7 +521,7 @@ bool V3dGraphicsDevice::run_pass(const RenderPassBegin& pass, const List<DrawRec
   uint32_t overflow_count = 0;
   if (memory_.allocate(kOverflowBytes, 4096, &overflow)) overflow_blocks[overflow_count++] = {overflow.gpu_address, kOverflowBytes};
 
-  PassContent content(draws, frame, code_, defaults_, shader_code_);
+  PassContent content(draws, frame, code_, defaults_);
   V3dBlockJobMemory job_memory(memory_, job);
   // Vertex and index buffers were cleaned when they were unmapped; the images are only written by the GPU.
   const V3dJobResult result = V3dRenderer::render(gpu_, frame, job_memory, attempts_, ArrayView<const V3dMemoryBlock>(overflow_blocks, overflow_count), layout, &content);

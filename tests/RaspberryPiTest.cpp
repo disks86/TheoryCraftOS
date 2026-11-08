@@ -967,6 +967,28 @@ static void test_graphics_device() {
     std::vector<uint32_t> small(5);
     CHECK(!color->read_pixels(ArrayView<uint32_t>(small.data(), small.size())));
 
+    // A TGSI fragment module compiles to a pipeline-owned QPU program and submits with the built-in vertex stage.
+    ShaderModuleDesc constant_fragment;
+    constant_fragment.stage = ShaderStage::Fragment;
+    constant_fragment.tgsi = "FRAG\nDCL OUT[0], COLOR\nIMM[0] FLT32 {1.0, 0.5, 0.25, 1.0}\n0: MOV OUT[0], IMM[0]\n1: END\n";
+    IShaderModule* compiled_fs = device.create_shader_module(constant_fragment);
+    GraphicsPipelineDesc custom_pd = pd;
+    custom_pd.fragment_shader = compiled_fs;
+    IPipeline* custom_pipeline = device.create_graphics_pipeline(custom_pd);
+    CHECK(compiled_fs && custom_pipeline);
+    device.destroy_shader_module(compiled_fs);  // the pipeline owns the compiled code and its uniform bindings
+    cmd->begin();
+    cmd->begin_render_pass(rp);
+    cmd->bind_pipeline(custom_pipeline);
+    cmd->bind_vertex_buffer(vb, 0);
+    cmd->push_constants(&cc, sizeof cc);
+    cmd->draw(3, 0);
+    cmd->end_render_pass();
+    CHECK(cmd->end());
+    core.at(v3d::kCtlIntSts) = v3d::kIntFlDone | v3d::kIntFrDone;
+    CHECK(device.submit(cmd));
+    device.destroy_pipeline(custom_pipeline);
+
     device.destroy_command_buffer(cmd);
     device.destroy_buffer(vb); device.destroy_buffer(ib);
     device.destroy_image(color); device.destroy_image(depth);
