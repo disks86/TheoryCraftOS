@@ -131,6 +131,31 @@ static void test_uniform_sources() {
   CHECK(error && line == 5);
 }
 
+static void test_vertex_input_vpm_binding() {
+  TestAllocator allocator;
+  const char* source = "VERT\nDCL IN[0]\nDCL TEMP[0]\n0: ADD TEMP[0], IN[0], TEMP[0]\n1: END\n";
+  uint64_t words[32] = {};
+  hardware::v3d_shader::TgsiInputBinding bindings[4] = {{0, 0, 3}, {0, 1, 4}, {0, 2, 5}, {0, 3, 6}};
+  hardware::v3d_shader::TgsiCompileInfo info;
+  const char* error = nullptr;
+  uint32_t line = 0;
+  CHECK(hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line, {},
+                                               ArrayView<const hardware::v3d_shader::TgsiInputBinding>(bindings)));
+  CHECK(info.instruction_count == 11 && info.register_count == 5 && info.uniform_count == 0);
+  hardware::v3d_qpu::Instruction expected;
+  expected.add_op = hardware::v3d_qpu::Add::LdVpmvIn;
+  expected.add_dest = hardware::v3d_qpu::rf_dest(4);
+  expected.add_a = hardware::v3d_qpu::imm(3);
+  uint64_t expected_word = 0;
+  CHECK(hardware::v3d_qpu::encode(expected, &expected_word));
+  CHECK(words[0] == expected_word);
+
+  hardware::v3d_shader::TgsiInputBinding missing[1] = {{0, 0, 0}};
+  CHECK(!hardware::v3d_shader::compile_tgsi_alu(allocator, StringView(source), ArrayView<uint64_t>(words), &info, &error, &line, {},
+                                                ArrayView<const hardware::v3d_shader::TgsiInputBinding>(missing)));
+  CHECK(error && line == 4);
+}
+
 static void test_decimal_immediates_parse_without_host_float_runtime() {
   TestAllocator allocator;
   gcn::TgsiShader shader(allocator);
@@ -151,6 +176,7 @@ int main() {
   test_arithmetic_lowering();
   test_rejections_and_bounds();
   test_uniform_sources();
+  test_vertex_input_vpm_binding();
   test_decimal_immediates_parse_without_host_float_runtime();
   if (failed) return 1;
   puts("V3dTgsiCompilerTest passed");
