@@ -93,7 +93,25 @@ EXPORT DWORD WINAPI GetActiveProcessorCount(WORD group) {
 EXPORT DWORD WINAPI GetMaximumProcessorCount(WORD group) { return GetActiveProcessorCount(group); }
 EXPORT WORD WINAPI GetActiveProcessorGroupCount(void) { return 1; }
 EXPORT WORD WINAPI GetMaximumProcessorGroupCount(void) { return 1; }
-EXPORT BOOL WINAPI QueryUnbiasedInterruptTime(PULONGLONG t) { if (!t) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *t = GetTickCount64() * 10000; return TRUE; }
+/* The interrupt time (100 ns since boot) is the one of KUSER_SHARED_DATA, the clock QueryPerformanceCounter runs on: reading the counter brings the page up to date, so
+ * the "precise" forms and the plain ones are the same here. The unbiased time leaves out the time asleep (InterruptTimeBias). */
+static ULONGLONG interrupt_time(void) {
+  LARGE_INTEGER c, f;
+  NtQueryPerformanceCounter(&c, &f);
+  volatile LONG *t = (volatile LONG *)(0x7ffe0000ull + 0x08);      /* KSYSTEM_TIME: LowPart, High1Time, High2Time */
+  LONG high;
+  ULONG low;
+  do { high = t[1]; low = (ULONG)t[0]; } while (high != t[2]);
+  return ((ULONGLONG)(ULONG)high << 32) | low;
+}
+static ULONGLONG interrupt_time_bias(void) { return *(volatile ULONGLONG *)(0x7ffe0000ull + 0x3b0); }
+EXPORT BOOL WINAPI QueryUnbiasedInterruptTime(PULONGLONG t) { if (!t) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *t = interrupt_time() - interrupt_time_bias(); return TRUE; }
+EXPORT void WINAPI QueryInterruptTime(PULONGLONG t) { *t = interrupt_time(); }
+EXPORT void WINAPI QueryInterruptTimePrecise(PULONGLONG t) { *t = interrupt_time(); }
+EXPORT void WINAPI QueryUnbiasedInterruptTimePrecise(PULONGLONG t) { *t = interrupt_time() - interrupt_time_bias(); }
+/* Whether two handles refer to the same kernel object (the object manager compares what is behind them). */
+NTSTATUS NTAPI NtCompareObjects(HANDLE first, HANDLE second);
+EXPORT BOOL WINAPI CompareObjectHandles(HANDLE first, HANDLE second) { return NtCompareObjects(first, second) == 0; }
 EXPORT LONG WINAPI ConvertAuxiliaryCounterToPerformanceCounter(ULONGLONG aux, PULONGLONG perf, PULONGLONG error) { return 0x80004001; }      /* E_NOTIMPL: no auxiliary counter */
 EXPORT LONG WINAPI ConvertPerformanceCounterToAuxiliaryCounter(ULONGLONG perf, PULONGLONG aux, PULONGLONG error) { return 0x80004001; }
 EXPORT DWORD WINAPI GetProcessIdOfThread(HANDLE thread) {

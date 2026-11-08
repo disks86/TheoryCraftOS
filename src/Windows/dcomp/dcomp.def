@@ -1,0 +1,15 @@
+LIBRARY dcomp.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+DCompositionAttachMouseDragToHwnd @1017
+DCompositionAttachMouseWheelToHwnd @1018
+DCompositionCreateDevice @1020
+DCompositionCreateDevice2 @1021
+DCompositionCreateDevice3 @1022
+DCompositionCreateSurfaceHandle @1023
+DllCanUnloadNow @1024
+DllGetActivationFactory @1025
+DllGetClassObject @1026
+DwmEnableMMCSS @1027
+DwmFlush @1029
+DwmpEnableDDASupport @1030

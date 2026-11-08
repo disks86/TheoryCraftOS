@@ -22,6 +22,7 @@
 #include "ObjectContainer/List.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Kernel/Sync.hpp"
 #include "Process/ImageLoader.hpp"
 #include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
@@ -35,6 +36,8 @@ class ILibraryProvider {
   // The file of a library by its canonical name ("kernel32.dll", see canonical_library_name()). False if there is none. The bytes must stay valid until the
   // provider is destroyed or find() is called again for the same name.
   virtual bool find(StringView canonical_name, ConstByteView* image) = 0;
+  // The Windows folder the library found by find() came from ("C:\\Program Files\\App\\", with the backslash at the end), if not System32. False: System32.
+  virtual bool directory_of(StringView canonical_name, String* windows_directory) { (void)canonical_name; (void)windows_directory; return false; }
 
  protected:
   ILibraryProvider() = default;
@@ -49,32 +52,50 @@ bool canonical_library_name(StringView name, String* out);
 class ChainedLibraryProvider final : public ILibraryProvider {
  public:
   ChainedLibraryProvider(ILibraryProvider* first, ILibraryProvider* second) : first_(first), second_(second) {}
-  bool find(StringView canonical_name, ConstByteView* image) override { return (first_ && first_->find(canonical_name, image)) || (second_ && second_->find(canonical_name, image)); }
+  bool find(StringView canonical_name, ConstByteView* image) override {
+    if (first_ && first_->find(canonical_name, image)) { from_first_ = true; return true; }
+    from_first_ = false;
+    return second_ && second_->find(canonical_name, image);
+  }
+  bool directory_of(StringView canonical_name, String* windows_directory) override {
+    ILibraryProvider* from = from_first_ ? first_ : second_;
+    return from && from->directory_of(canonical_name, windows_directory);
+  }
 
  private:
   ILibraryProvider* first_;
   ILibraryProvider* second_;
+  bool from_first_ = false;
 };
 
-// Libraries in the folder C:\Windows\System32 of the Windows world (/Windows/Windows/System32 in the OS file system): DLLs a user put there, built for this OS. The
-// files are read when first asked for and kept until the provider is destroyed.
+// Libraries in the folder C:\Windows\System32 of the Windows world (/Windows/Windows/System32 in the OS file system): DLLs a user put there, built for this OS. Folders
+// added with add_directory() are searched first, in the order given (the program's own folder: an application's DLLs next to its .exe, as Windows looks there first).
+// The files are read when first asked for and kept until the provider is destroyed. The provider may be shared by programs that run at once (a program and the ones it
+// starts), so finding is serialised.
 class FileLibraryProvider final : public ILibraryProvider {
  public:
   FileLibraryProvider(allocators::IAllocator& allocator, filesystem::IFileSystem* files);
   ~FileLibraryProvider();
   bool find(StringView canonical_name, ConstByteView* image) override;
+  bool directory_of(StringView canonical_name, String* windows_directory) override;
+  // A folder of the OS file system ("/Windows/Program Files/App") to look in before System32.
+  bool add_directory(StringView directory);
 
  private:
   struct Entry;
+  bool load(StringView path, StringView canonical_name, ConstByteView* image);
   allocators::IAllocator& allocator_;
   filesystem::IFileSystem* files_;
   Entry* entries_ = nullptr;
+  List<String> directories_;
+  kernel::Mutex lock_;
 };
 
 // One image of the process: the program itself or a DLL it (indirectly) imports.
 struct Module {
-  explicit Module(allocators::IAllocator& allocator) : name(allocator), owned(allocator), forward_deps(allocator) {}
+  explicit Module(allocators::IAllocator& allocator) : name(allocator), directory(allocator), owned(allocator), forward_deps(allocator) {}
   String name;                          // canonical
+  String directory;                     // the Windows folder its file is in, when not System32 ("C:\\Program Files\\App\\"); empty for System32
   exe::PeFile owned;                    // the parsed headers of a DLL (the program's are the caller's)
   const exe::PeFile* pe = nullptr;      // the headers in use: &owned, or the program's
   uint64_t base = 0, size = 0;

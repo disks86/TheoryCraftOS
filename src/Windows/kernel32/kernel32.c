@@ -955,6 +955,7 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
   }
   if (index >= d->NumberOfFunctions) return NULL;
   const ULONG rva = functions[index];
+  if (rva == 0) return NULL;      /* (a gap in the numbers: no function has that ordinal) */
   if (rva >= dir_rva && rva < dir_rva + dir_size) {      /* a forwarder: "DLL.Function" or "DLL.#ordinal" */
     const char *forward = (const char *)(base + rva);
     WCHAR library[64];
@@ -1080,8 +1081,9 @@ static HMODULE load_library_ex(LPCWSTR name, HANDLE file, DWORD flags) {
     ULONG ldr_flags = ((flags & 1) ? 2 : 0) | 0x40000000;
     unicode_string(&us, path);
     const NTSTATUS status = LdrLoadDll(NULL, &ldr_flags, &us, &handle);
-    if (!NT_SUCCESS(status)) { set_error(dos_error_of_load(status)); return NULL; }
-    return (HMODULE)handle;
+    if (NT_SUCCESS(status)) return (HMODULE)handle;
+    /* An assembly the manifest names whose file is not there (Common Controls 6 is the comctl32.dll of System32 here): the usual search finds the library. */
+    if (status != (NTSTATUS)0xC0000135 && status != (NTSTATUS)0xC0000034 && status != (NTSTATUS)0xC000003A) { set_error(dos_error_of_load(status)); return NULL; }
   }
   /* The file, if there is one; otherwise the bare name (a library the process has already may be known by an alias, "api-ms-win-crt-runtime-l1-1-0.dll"): the kernel knows
      which libraries are loaded, and decides under the loader lock. */
@@ -1326,41 +1328,27 @@ EXPORT BOOL WINAPI InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN function, 
 EXPORT void WINAPI Sleep(DWORD ms);
 EXPORT ULONGLONG WINAPI GetTickCount64(void);
 
-/* Slim reader/writer locks and condition variables for the threads of the process: waiting threads give their time slice away (condition variables wake all waiters,
- * which the contract allows: a waiter rechecks its condition). */
-/* The lock word: bit 0 is set while a thread holds the lock exclusively, bits 4 and up count the shared holders (16 each), bits 32 and up count the threads waiting for the
- * exclusive lock; shared requests give way to those. */
-#define SRW_EXCLUSIVE 1ull
-#define SRW_SHARED_UNIT 16ull
-#define SRW_SHARED_MASK 0xFFFFFFF0ull
-#define SRW_WAITER_UNIT (1ull << 32)
-#define SRW_WORD(lock) ((volatile ULONGLONG *)&(lock)->Ptr)
-EXPORT void WINAPI InitializeSRWLock(PSRWLOCK lock) { lock->Ptr = NULL; }
-EXPORT BOOLEAN WINAPI TryAcquireSRWLockExclusive(PSRWLOCK lock) {
-  for (;;) {
-    const ULONGLONG v = *SRW_WORD(lock);
-    if (v & (SRW_EXCLUSIVE | SRW_SHARED_MASK)) return FALSE;
-    if (__sync_bool_compare_and_swap(SRW_WORD(lock), v, v | SRW_EXCLUSIVE)) return TRUE;
-  }
-}
-EXPORT void WINAPI AcquireSRWLockExclusive(PSRWLOCK lock) {
-  __sync_fetch_and_add(SRW_WORD(lock), SRW_WAITER_UNIT);
-  for (;;) {
-    const ULONGLONG v = *SRW_WORD(lock);
-    if (!(v & (SRW_EXCLUSIVE | SRW_SHARED_MASK)) && __sync_bool_compare_and_swap(SRW_WORD(lock), v, (v | SRW_EXCLUSIVE) - SRW_WAITER_UNIT)) return;
-    NtYieldExecution();
-  }
-}
-EXPORT void WINAPI ReleaseSRWLockExclusive(PSRWLOCK lock) { __sync_fetch_and_and(SRW_WORD(lock), ~SRW_EXCLUSIVE); }
-EXPORT BOOLEAN WINAPI TryAcquireSRWLockShared(PSRWLOCK lock) {
-  for (;;) {
-    const ULONGLONG v = *SRW_WORD(lock);
-    if ((v & SRW_EXCLUSIVE) || (v >> 32) != 0) return FALSE;      /* (held, or a thread is waiting for it exclusively) */
-    if (__sync_bool_compare_and_swap(SRW_WORD(lock), v, v + SRW_SHARED_UNIT)) return TRUE;
-  }
-}
-EXPORT void WINAPI AcquireSRWLockShared(PSRWLOCK lock) { while (!TryAcquireSRWLockShared(lock)) NtYieldExecution(); }
-EXPORT void WINAPI ReleaseSRWLockShared(PSRWLOCK lock) { __sync_fetch_and_sub(SRW_WORD(lock), SRW_SHARED_UNIT); }
+/* Slim reader/writer locks and condition variables are ntdll's (src/Windows/ntdll/sync.inc): a waiting thread sleeps in the kernel until it is woken. */
+IMPORT void NTAPI RtlInitializeSRWLock(PSRWLOCK lock);
+IMPORT void NTAPI RtlAcquireSRWLockExclusive(PSRWLOCK lock);
+IMPORT BOOLEAN NTAPI RtlTryAcquireSRWLockExclusive(PSRWLOCK lock);
+IMPORT void NTAPI RtlReleaseSRWLockExclusive(PSRWLOCK lock);
+IMPORT void NTAPI RtlAcquireSRWLockShared(PSRWLOCK lock);
+IMPORT BOOLEAN NTAPI RtlTryAcquireSRWLockShared(PSRWLOCK lock);
+IMPORT void NTAPI RtlReleaseSRWLockShared(PSRWLOCK lock);
+IMPORT void NTAPI RtlWakeConditionVariable(PCONDITION_VARIABLE cv);
+IMPORT void NTAPI RtlWakeAllConditionVariable(PCONDITION_VARIABLE cv);
+IMPORT NTSTATUS NTAPI RtlSleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, PLARGE_INTEGER timeout, ULONG flags);
+IMPORT NTSTATUS NTAPI RtlSleepConditionVariableCS(PCONDITION_VARIABLE cv, PRTL_CRITICAL_SECTION cs, PLARGE_INTEGER timeout);
+IMPORT NTSTATUS NTAPI RtlWaitOnAddress(volatile VOID *address, PVOID compare, SIZE_T size, PLARGE_INTEGER timeout);
+IMPORT VOID NTAPI RtlWakeAddressAll(PVOID address);
+EXPORT void WINAPI InitializeSRWLock(PSRWLOCK lock) { RtlInitializeSRWLock(lock); }
+EXPORT BOOLEAN WINAPI TryAcquireSRWLockExclusive(PSRWLOCK lock) { return RtlTryAcquireSRWLockExclusive(lock); }
+EXPORT void WINAPI AcquireSRWLockExclusive(PSRWLOCK lock) { RtlAcquireSRWLockExclusive(lock); }
+EXPORT void WINAPI ReleaseSRWLockExclusive(PSRWLOCK lock) { RtlReleaseSRWLockExclusive(lock); }
+EXPORT BOOLEAN WINAPI TryAcquireSRWLockShared(PSRWLOCK lock) { return RtlTryAcquireSRWLockShared(lock); }
+EXPORT void WINAPI AcquireSRWLockShared(PSRWLOCK lock) { RtlAcquireSRWLockShared(lock); }
+EXPORT void WINAPI ReleaseSRWLockShared(PSRWLOCK lock) { RtlReleaseSRWLockShared(lock); }
 /* Synchronization barriers. The 32 bytes of the SYNCHRONIZATION_BARRIER hold: the number of threads that wait without NO_DELETE (DeleteSynchronizationBarrier waits for them to
  * be gone), the number of threads the barrier is for, and one 64-bit word with the generation (high half) and how many have arrived in it (low half). The thread that
  * arrives last starts the next generation and gets TRUE. */
@@ -1383,12 +1371,17 @@ EXPORT BOOL WINAPI EnterSynchronizationBarrier(SyncBarrier *barrier, DWORD flags
     generation = v >> 32;
     if ((LONG)(v & 0xFFFFFFFFu) + 1 >= barrier->total) {      /* the last to arrive */
       if (__sync_bool_compare_and_swap(&barrier->state, v, (generation + 1) << 32)) {
+        RtlWakeAddressAll((PVOID)&barrier->state);
         if (counted) __sync_fetch_and_sub(&barrier->delete_waiters, 1);
         return TRUE;
       }
     } else if (__sync_bool_compare_and_swap(&barrier->state, v, v + 1)) break;
   }
-  while ((barrier->state >> 32) == generation) NtYieldExecution();
+  for (;;) {      /* until the last one starts the next generation (it wakes everybody) */
+    const ULONGLONG v = barrier->state;
+    if ((v >> 32) != generation) break;
+    RtlWaitOnAddress(&barrier->state, (PVOID)&v, sizeof(v), NULL);
+  }
   if (counted) __sync_fetch_and_sub(&barrier->delete_waiters, 1);
   return FALSE;
 }
@@ -1397,33 +1390,23 @@ EXPORT BOOL WINAPI DeleteSynchronizationBarrier(SyncBarrier *barrier) {
   return TRUE;
 }
 EXPORT void WINAPI InitializeConditionVariable(PCONDITION_VARIABLE cv) { cv->Ptr = NULL; }
-EXPORT void WINAPI WakeConditionVariable(PCONDITION_VARIABLE cv) { __sync_fetch_and_add((ULONG_PTR *)&cv->Ptr, 1); }
-EXPORT void WINAPI WakeAllConditionVariable(PCONDITION_VARIABLE cv) { __sync_fetch_and_add((ULONG_PTR *)&cv->Ptr, 1); }
-EXPORT void WINAPI Sleep(DWORD ms);
-EXPORT ULONGLONG WINAPI GetTickCount64(void);
-static BOOL wait_condition(PCONDITION_VARIABLE cv, DWORD timeout_ms, void (*release)(PVOID), void (*acquire)(PVOID), PVOID lock) {
-  const ULONG_PTR seen = (ULONG_PTR)cv->Ptr;
-  const ULONGLONG start = GetTickCount64();
-  release(lock);
-  BOOL woken = TRUE;
-  while ((ULONG_PTR)cv->Ptr == seen) {
-    if (timeout_ms != INFINITE && GetTickCount64() - start >= timeout_ms) { woken = FALSE; break; }
-    Sleep(0);
-  }
-  acquire(lock);
-  if (!woken) set_error(ERROR_TIMEOUT);
-  return woken;
+EXPORT void WINAPI WakeConditionVariable(PCONDITION_VARIABLE cv) { RtlWakeConditionVariable(cv); }
+EXPORT void WINAPI WakeAllConditionVariable(PCONDITION_VARIABLE cv) { RtlWakeAllConditionVariable(cv); }
+/* The time-outs of the condition variables are relative, in 100 ns units (negative); INFINITE is none. */
+static BOOL condition_result(NTSTATUS status) {
+  if (status == 0x102 /* STATUS_TIMEOUT */) { set_error(ERROR_TIMEOUT); return FALSE; }
+  if (!NT_SUCCESS(status)) { set_error(RtlNtStatusToDosError(status)); return FALSE; }
+  return TRUE;
 }
-static void cs_release(PVOID cs) { RtlLeaveCriticalSection(cs); }
-static void cs_acquire(PVOID cs) { RtlEnterCriticalSection(cs); }
-EXPORT BOOL WINAPI SleepConditionVariableCS(PCONDITION_VARIABLE cv, LPCRITICAL_SECTION cs, DWORD timeout_ms) { return wait_condition(cv, timeout_ms, cs_release, cs_acquire, cs); }
-/* SleepConditionVariableSRW: exclusive (flags 0) or shared (flags 1) */
-static BOOL g_srw_shared;
-static void srw_release(PVOID lock) { if (g_srw_shared) ReleaseSRWLockShared(lock); else ReleaseSRWLockExclusive(lock); }
-static void srw_acquire(PVOID lock) { if (g_srw_shared) AcquireSRWLockShared(lock); else AcquireSRWLockExclusive(lock); }
+EXPORT BOOL WINAPI SleepConditionVariableCS(PCONDITION_VARIABLE cv, LPCRITICAL_SECTION cs, DWORD timeout_ms) {
+  LARGE_INTEGER timeout;
+  timeout.QuadPart = -(LONGLONG)timeout_ms * 10000;
+  return condition_result(RtlSleepConditionVariableCS(cv, cs, timeout_ms == INFINITE ? NULL : &timeout));
+}
 EXPORT BOOL WINAPI SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD timeout_ms, ULONG flags) {
-  g_srw_shared = (flags & 1) != 0;
-  return wait_condition(cv, timeout_ms, srw_release, srw_acquire, lock);
+  LARGE_INTEGER timeout;
+  timeout.QuadPart = -(LONGLONG)timeout_ms * 10000;
+  return condition_result(RtlSleepConditionVariableSRW(cv, lock, timeout_ms == INFINITE ? NULL : &timeout, flags));
 }
 
 /* Events, mutexes and semaphores are objects of the system (src/Process/Objects.hpp): a name makes two processes share one. The wait functions below wait for them and
@@ -2546,6 +2529,16 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
     return FALSE;
   }
   con_note_child(process_id, block.console, block.words[11] == 0xFFFFFFFFu ? process_id : block.words[11], block.words[10] & 1);
+  if ((flags & 0x80000 /* EXTENDED_STARTUPINFO_PRESENT */) && startup && startup->cb >= sizeof(STARTUPINFOW) + sizeof(PVOID)) {      /* PROC_THREAD_ATTRIBUTE_JOB_LIST: into those jobs */
+    const ProcThreadAttributeList *attributes = *(ProcThreadAttributeList *const *)((const BYTE *)startup + sizeof(STARTUPINFOW));
+    const ProcThreadAttributeEntry *jobs = attributes ? attribute_of(attributes, 0x0002000D) : NULL;
+    for (SIZE_T i = 0; jobs && i < jobs->size / sizeof(HANDLE); ++i) {
+      const HANDLE job = ((HANDLE *)jobs->value)[i];
+      if (job && NtIsProcessInJob(process, job) == (NTSTATUS)0x124 /* STATUS_PROCESS_IN_JOB */) continue;      /* (it has that one from its parent already) */
+      const NTSTATUS joined = NtAssignProcessToJobObject(job, process);
+      if (!NT_SUCCESS(joined)) { NtTerminateProcess(process, (DWORD)joined); NtClose(process); NtClose(thread); fail_nt(joined); return FALSE; }
+    }
+  }
   if (process_attributes && process_attributes->lpSecurityDescriptor) {      /* the descriptors the process and its first thread are made with */
     OBJECT_ATTRIBUTES made = { sizeof(made), NULL, NULL, 0, process_attributes->lpSecurityDescriptor, NULL };
     RtlTcosNewObjectSecurity(process, &made, FALSE, 10 /* a process */);
@@ -4157,6 +4150,10 @@ EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPST
 }
 EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options) {
   const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, inherit ? 2 /* OBJ_INHERIT */ : 0, options & 7);      /* DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DUPLICATE_SAME_ATTRIBUTES */
+  if ((options & 1) && (sp == GetCurrentProcess() || GetProcessId(sp) == GetCurrentProcessId())) {      /* (a handle of this process was closed: what remembers its number forgets it) */
+    con_alias_forget(source);
+    con_handle_closed(source);
+  }
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 
@@ -4687,7 +4684,7 @@ static const char *error_text(DWORD error) {
 }
 /* ---- start ------------------------------------------------------------------------------------------------------------------------------------------------ */
 
-EXPORT BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
+BOOL WINAPI DllMain(HANDLE module, DWORD reason, PVOID reserved) {
   (void)module; (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) RtlTcosSetUnhandledExceptionHook(UnhandledExceptionFilter);      /* (what runs when nothing handled an exception) */
   return TRUE;

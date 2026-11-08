@@ -907,6 +907,19 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
         if (const uint32_t refused = open_with_descriptor(p, 'p', pid, uint32_t(desired_access), kProcessMapping, &granted)) return refused;
     }
   }
+  if (!(options & 2) && !(desired_access & kMaximumAllowed) && p.files().kind(slot) == DescriptorKind::Section) {
+    // A section handle asked for with rights its source does not have: only what the section's descriptor grants (Windows checks the object then). Without one here the
+    // rights stay those of the source: Chromium tells a read-only region from a writable one this way (its sections have an empty DACL, which grants nothing more).
+    const uint32_t more = mapped_access(DescriptorKind::Section, uint32_t(desired_access)) & p.files().denied_access(slot) & ~uint32_t{0x02000000u};
+    if (more) {
+      uint32_t wanted = uint32_t(desired_access);
+      char key[16];
+      ObjectManager* objects = system_objects();
+      const uint32_t n = ObjectManager::object_key('s', uint32_t(p.files().token(slot)), key);
+      if (!objects || objects->security_size(StringView(key, n)) == 0) return kAccessDeniedStatus;
+      if (const uint32_t refused = restrict_by_descriptor(p, uint32_t(p.files().token(slot)), DescriptorKind::Section, &wanted)) return refused;
+    }
+  }
   const int64_t copy = p.files().duplicate(slot, 0);
   if (copy < 0) return kNoResources;
   if (is_object_kind(p.files().kind(slot))) if (ObjectManager* objects = system_objects()) objects->add_ref(uint32_t(p.files().token(slot)));
@@ -1552,8 +1565,14 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
   if (view == 0 || view > info.size - offset) view = info.size - offset;
   uint64_t bytes = 0;
   if (!AddressSpace::round_up(view, &bytes)) return kInvalidParameter;
-  if (base == 0) {
-    if (!space->find_free(bytes, 0x00007FF500000000ull, &base)) return kNoResources;
+  if (base == 0) {      // views begin on the allocation granularity (64 KiB), as on Windows: programs round a view's address down to it to unmap the view
+    uint64_t hint = 0x00007FF500000000ull;
+    for (uint32_t attempt = 0;; ++attempt) {
+      if (attempt >= 256 || !space->find_free(bytes, hint, &base)) return kNoResources;
+      const uint64_t aligned = (base + 0xFFFF) & ~uint64_t{0xFFFF};
+      if (aligned == base) break;
+      hint = aligned;
+    }
   } else if (base % 4096 != 0) {
     return kInvalidParameter;
   }

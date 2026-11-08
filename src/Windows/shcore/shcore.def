@@ -1,18 +1,100 @@
 LIBRARY shcore.dll
 EXPORTS
-CommandLineToArgvW = shell32.CommandLineToArgvW
-IStream_Read = shlwapi.IStream_Read
-IStream_Reset = shlwapi.IStream_Reset
-IStream_Size = shlwapi.IStream_Size
-IStream_Write = shlwapi.IStream_Write
-SHCreateStreamOnFileA = shlwapi.SHCreateStreamOnFileA
-SHCreateStreamOnFileEx = shlwapi.SHCreateStreamOnFileEx
-SHCreateStreamOnFileW = shlwapi.SHCreateStreamOnFileW
-SHDeleteEmptyKeyW = shlwapi.SHDeleteEmptyKeyW
-SHDeleteKeyA = shlwapi.SHDeleteKeyA
-SHDeleteKeyW = shlwapi.SHDeleteKeyW
-SHDeleteValueW = shlwapi.SHDeleteValueW
-SHSetValueA = shlwapi.SHSetValueA
-SHSetValueW = shlwapi.SHSetValueW
-SHStrDupA = shlwapi.SHStrDupA
-SHStrDupW = shlwapi.SHStrDupW
+CommandLineToArgvW = shell32.CommandLineToArgvW @2
+IStream_Read = shlwapi.IStream_Read @19
+IStream_Reset = shlwapi.IStream_Reset @21
+IStream_Size = shlwapi.IStream_Size @22
+IStream_Write = shlwapi.IStream_Write @23
+SHCreateStreamOnFileA = shlwapi.SHCreateStreamOnFileA @43
+SHCreateStreamOnFileEx = shlwapi.SHCreateStreamOnFileEx @44
+SHCreateStreamOnFileW = shlwapi.SHCreateStreamOnFileW @45
+SHDeleteEmptyKeyW = shlwapi.SHDeleteEmptyKeyW @50
+SHDeleteKeyA = shlwapi.SHDeleteKeyA @51
+SHDeleteKeyW = shlwapi.SHDeleteKeyW @52
+SHDeleteValueW = shlwapi.SHDeleteValueW @54
+SHSetValueA = shlwapi.SHSetValueA @80
+SHSetValueW = shlwapi.SHSetValueW @81
+SHStrDupA = shlwapi.SHStrDupA @82
+SHStrDupW = shlwapi.SHStrDupW @83
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+CreateRandomAccessStreamOnFile @3
+CreateRandomAccessStreamOverStream @4
+CreateStreamOverRandomAccessStream @5
+DllCanUnloadNow @6
+DllGetActivationFactory @7
+DllGetClassObject @8
+GetCurrentProcessExplicitAppUserModelID @9
+GetDpiForMonitor @10
+GetDpiForShellUIComponent @11
+GetFeatureEnabledState @12
+GetFeatureVariant @13
+GetProcessDpiAwareness @14
+GetProcessReference @15
+GetScaleFactorForDevice @16
+GetScaleFactorForMonitor @17
+IStream_Copy @18
+IStream_ReadStr @20
+IStream_WriteStr @24
+IUnknown_AtomicRelease @25
+IUnknown_GetSite @26
+IUnknown_QueryService @27
+IUnknown_Set @28
+IUnknown_SetSite @29
+IsOS @30
+IsProcessInIsolatedContainer @31
+IsProcessInWDAGContainer @32
+RecordFeatureError @33
+RecordFeatureUsage @34
+RegisterScaleChangeEvent @35
+RegisterScaleChangeNotifications @36
+RevokeScaleChangeNotifications @37
+SHAnsiToAnsi @38
+SHAnsiToUnicode @39
+SHCopyKeyA @40
+SHCopyKeyW @41
+SHCreateMemStream @42
+SHCreateThread @46
+SHCreateThreadRef @47
+SHCreateThreadWithHandle @48
+SHDeleteEmptyKeyA @49
+SHDeleteValueA @53
+SHEnumKeyExA @55
+SHEnumKeyExW @56
+SHEnumValueA @57
+SHEnumValueW @58
+SHGetThreadRef @59
+SHGetValueA @60
+SHGetValueW @61
+SHOpenRegStream2A @62
+SHOpenRegStream2W @63
+SHOpenRegStreamA @64
+SHOpenRegStreamW @65
+SHQueryInfoKeyA @66
+SHQueryInfoKeyW @67
+SHQueryValueExA @68
+SHQueryValueExW @69
+SHRegDuplicateHKey @70
+SHRegGetIntW @71
+SHRegGetPathA @72
+SHRegGetPathW @73
+SHRegGetValueA @74
+SHRegGetValueW @75
+SHRegSetPathA @76
+SHRegSetPathW @77
+SHReleaseThreadRef @78
+SHSetThreadRef @79
+SHTaskPoolAllowThreadReuse @84
+SHTaskPoolDoNotWaitForMoreTasks @85
+SHTaskPoolGetCurrentThreadLifetime @86
+SHTaskPoolGetUniqueContext @87
+SHTaskPoolQueueTask @88
+SHTaskPoolSetThreadReuseAllowed @89
+SHUnicodeToAnsi @90
+SHUnicodeToUnicode @91
+SetCurrentProcessExplicitAppUserModelID @92
+SetProcessDpiAwareness @93
+SetProcessReference @94
+SubscribeFeatureStateChangeNotification @95
+UnregisterScaleChangeEvent @96
+UnsubscribeFeatureStateChangeNotification @97
+SHRegGetValueFromHKCUHKLM @122

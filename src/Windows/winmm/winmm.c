@@ -247,6 +247,45 @@ EXPORT MMRESULT WINAPI midiInGetDevCapsW(UINT_PTR id, LPMIDIINCAPSW caps, UINT s
 EXPORT MMRESULT WINAPI mixerGetDevCapsA(UINT_PTR id, LPMIXERCAPSA caps, UINT size) { (void)id; (void)size; return caps ? MMSYSERR_BADDEVICEID : MMSYSERR_INVALPARAM; }
 EXPORT MMRESULT WINAPI mixerGetDevCapsW(UINT_PTR id, LPMIXERCAPSW caps, UINT size) { (void)id; (void)size; return caps ? MMSYSERR_BADDEVICEID : MMSYSERR_INVALPARAM; }
 
+/* The counts: no devices. The functions on an open device get a handle that no open function ever gave out: MMSYSERR_INVALHANDLE (a stub answered MMSYSERR_NOERROR, so
+ * a program that wrote a buffer waited for a WOM_DONE that never came). */
+EXPORT UINT WINAPI waveOutGetNumDevs(void) { return 0; }
+EXPORT UINT WINAPI waveInGetNumDevs(void) { return 0; }
+EXPORT UINT WINAPI midiOutGetNumDevs(void) { return 0; }
+EXPORT UINT WINAPI midiInGetNumDevs(void) { return 0; }
+EXPORT UINT WINAPI mixerGetNumDevs(void) { return 0; }
+EXPORT UINT WINAPI auxGetNumDevs(void) { return 0; }
+EXPORT MMRESULT WINAPI waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutPrepareHeader(HWAVEOUT h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutUnprepareHeader(HWAVEOUT h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutWrite(HWAVEOUT h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutPause(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutRestart(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutBreakLoop(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveOutGetPosition(HWAVEOUT h, LPMMTIME time, UINT size) { (void)h; (void)time; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveInClose(HWAVEIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveInPrepareHeader(HWAVEIN h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveInUnprepareHeader(HWAVEIN h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveInAddBuffer(HWAVEIN h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveInStart(HWAVEIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveInStop(HWAVEIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI waveInReset(HWAVEIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiOutClose(HMIDIOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiOutShortMsg(HMIDIOUT h, DWORD message) { (void)h; (void)message; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiOutLongMsg(HMIDIOUT h, LPMIDIHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiOutPrepareHeader(HMIDIOUT h, LPMIDIHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiOutUnprepareHeader(HMIDIOUT h, LPMIDIHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiOutReset(HMIDIOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiInClose(HMIDIIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiInPrepareHeader(HMIDIIN h, LPMIDIHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiInUnprepareHeader(HMIDIIN h, LPMIDIHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiInAddBuffer(HMIDIIN h, LPMIDIHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiInStart(HMIDIIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiInStop(HMIDIIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI midiInReset(HMIDIIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
+EXPORT MMRESULT WINAPI mixerClose(HMIXER h) { (void)h; return MMSYSERR_INVALHANDLE; }
+
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module;
   /* events still set when the library is freed (not at process exit, when the threads are gone): their timers must not call into unloaded code */

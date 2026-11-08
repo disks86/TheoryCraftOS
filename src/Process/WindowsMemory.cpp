@@ -131,6 +131,10 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
     const uint64_t reset_base = AddressSpace::round_down(base);
     if (!AddressSpace::round_up(size + (base - reset_base), &reset_size)) return kStatusInvalidParameter;
     if (!space->check(reset_base, reset_size, 0)) return kStatusConflictingAddresses;
+    if (type & kMemReset) {      // the contents may be dropped: the memory of private pages goes back (they read as zeros, as Windows allows)
+      PageAttributes existing;
+      if (space->attributes_at(reset_base, &existing) && existing.type == PageAttributes::Private) space->discard(reset_base, reset_size);
+    }
     *base_io = reset_base;
     *size_io = reset_size;
     return kStatusSuccess;
@@ -170,8 +174,12 @@ uint32_t vm_allocate(Process& target, uint64_t* base_io, uint64_t* size_io, uint
   } else {
     uint64_t at = 0;
     const uint64_t hint = (target.mmap_cursor() + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
-    if (!space->find_free(rounded, hint, &at)) return kStatusNoMemory;
-    at = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);      // reservations begin on the allocation granularity
+    for (uint64_t probe = hint, attempt = 0;; ++attempt) {      // reservations begin on the allocation granularity: a free place that starts on it
+      if (attempt >= 256 || !space->find_free(rounded, probe, &at)) return kStatusNoMemory;
+      const uint64_t aligned = (at + kAllocationGranularity - 1) & ~(kAllocationGranularity - 1);
+      if (aligned == at) break;
+      probe = aligned;
+    }
     if (!space->map(at, rounded, prot)) return kStatusNoMemory;
     set_private_attributes(*space, at, rounded, protect, type);
     target.set_mmap_cursor(at + rounded);
@@ -202,8 +210,9 @@ uint32_t vm_free(Process& target, uint64_t* base_io, uint64_t* size_io, uint32_t
     if (size == 0 || !AddressSpace::round_up(size, &rounded)) return kStatusInvalidParameter;
     PageAttributes existing;
     if (space->attributes_at(base, &existing) && existing.type != PageAttributes::Private) return kStatusInvalidParameter;      // the pages of a view stay committed
-    if (!space->protect(base, rounded, 0)) return kStatusUnableToFreeVm;      // decommitted pages become inaccessible (their contents are not cleared)
+    if (!space->protect(base, rounded, 0)) return kStatusUnableToFreeVm;      // decommitted pages become inaccessible, and their memory goes (committed again, they are zero)
     space->set_page_protect(base, rounded, kPageNoAccess, true);
+    space->discard(base, rounded);
     *base_io = base;
     *size_io = rounded;
     return kStatusSuccess;
@@ -227,7 +236,7 @@ uint32_t vm_protect(Process& target, uint64_t* base_io, uint64_t* size_io, uint3
   if (!space->protection_at(base, &old)) return kStatusConflictingAddresses;
   {      // every page of the range has to be committed
     AddressSpace::RegionInfo region;
-    for (uint64_t i = 0; space->region_at(i, &region); ++i) {
+    for (uint64_t i = space->region_index(base); space->region_at(i, &region); ++i) {
       if (region.base + region.size <= base) continue;
       if (region.base >= base + rounded) break;
       if (region.attributes.protect != 0 && region.attributes.reserved) return kStatusConflictingAddresses;
@@ -271,7 +280,7 @@ void vm_query(Process& target, uint64_t address, uint8_t* out) {
     // The run of pages that look the same: neighbours of one allocation with the same permissions and attributes.
     uint64_t end = base + size, id = 0;
     AddressSpace::RegionInfo next;
-    for (uint64_t i = 0; space->region_at(i, &next); ++i) {
+    for (uint64_t i = space->region_index(base); space->region_at(i, &next); ++i) {
       if (next.base == base) { id = next.allocation; continue; }
       if (next.base < end) continue;
       if (next.base != end || next.allocation != id || next.protection != protection || !(next.attributes == attributes)) break;
@@ -289,7 +298,7 @@ void vm_query(Process& target, uint64_t address, uint8_t* out) {
     // Free: up to the next mapped page.
     uint64_t next = AddressSpace::kUserTop;
     AddressSpace::RegionInfo region;
-    for (uint64_t i = 0; space && space->region_at(i, &region); ++i) {
+    for (uint64_t i = space ? space->region_index(page) : 0; space && space->region_at(i, &region); ++i) {
       if (region.base > page) { next = region.base; break; }
     }
     put64(0, page);
@@ -452,6 +461,9 @@ uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op) {
       for (uint32_t i = 0; i < 64; ++i) op.image[i] = target.image_information()[i];
       op.protect = target.priority_class;      // (the Win32 priority class)
       if (const Process::ThreadRecord* main_thread = target.find_thread(target.id())) op.argument = main_thread->teb;      // (the TEB of its main thread)
+      if (target.runtime()) target.runtime()->cpu_time(0, &op.cpu_time);
+      op.create_time = target.create_time;
+      if (const AddressSpace* space = target.address_space()) { op.mapped_bytes = space->mapped_bytes(); op.resident_bytes = space->resident_bytes(); }
       return kStatusSuccess;
     }
   }

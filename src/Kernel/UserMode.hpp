@@ -43,6 +43,9 @@ using MemorySource = void (*)(void* context, uint64_t* total_bytes, uint64_t* fr
 void set_memory_source(MemorySource source, void* context);
 // Addresses a user address space must stay away from (pages the CPU needs on the user page tables): hand them to AddressSpace::set_reserved().
 ArrayView<const process::AddressRange> reserved_ranges();
+// Writes to the debug console what every thread of every program is doing (the system call it waits in, or where it last ran in user mode, with the return addresses on its
+// stack that point into its modules) and the modules of each program: for finding where a big program hangs.
+void report();
 
 struct Task;
 
@@ -66,6 +69,9 @@ struct UserThread {
   bool affinity_explicit = false;         // its own mask was set (the process's mask only narrows it); otherwise it follows the process's
   uint8_t priority = kernel::kDefaultPriority;      // the kernel scheduler priority (0..31), reapplied at launch() if the thread was not spawned yet
   uint64_t saved_rip = 0;
+  // For report(): where a timer tick last found it in user mode, and the system call it is in (the service number, the return address, the stack).
+  uint64_t tick_rip = 0, call_service = 0, call_rip = 0, call_rsp = 0, calls = 0;
+  volatile bool in_call = false;
   process::X86Context saved;      // its registers while it is parked
   volatile bool finished = false;      // it has reached the end of its life (set just before the CPU thread ends; only then may the CPU thread be joined)
   UserThread* next = nullptr;
@@ -91,6 +97,7 @@ struct Task final : process::IProcessRuntime {
   Mutex mutex;
   ConditionVariable changed;
   char name[24] = {};             // what the process manager calls the program (see set_name())
+  uint32_t exceptions_logged = 0;      // (see log_exception in UserMode.cpp)
   uint64_t retired_ticks = 0;     // CPU ticks of the threads that have ended (under `mutex`)
   Task* all_next = nullptr;       // every running program (see process_snapshot()); under the registry's lock
   bool registered = false;
@@ -148,6 +155,8 @@ struct Task final : process::IProcessRuntime {
   bool launch(UserThread* thread, uint32_t stack_bytes);
   // Rebuilds the page tables if the address space changed and gives them to all the threads. False if memory ran out.
   bool sync_tables();
+  // Makes the entry of one page the program may use and that has memory (the page fault calls it after giving the page its memory).
+  bool fault_in(uint64_t page);
 
  private:
   allocators::IAllocator& allocator_;

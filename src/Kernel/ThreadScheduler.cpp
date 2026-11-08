@@ -17,6 +17,7 @@
  */
 
 #include <new>
+#include "Utility/ArrayView.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Firmware.hpp"
 #if defined(__x86_64__)
@@ -41,6 +42,13 @@
 namespace kernel {
 
 namespace {
+#if defined(__x86_64__)
+uint64_t g_xstate_mask = 0;      // the XSAVE components switched with threads (XCR0 without x87 and SSE, which the interrupt frames hold)
+uint64_t g_xstate_bytes = 0;     // the size of a save area for all of XCR0
+uint64_t g_xstate_cores[2] = {};      // the cores that have it turned on (a core that has not would fault on XSAVE)
+#else
+constexpr uint64_t g_xstate_mask = 0, g_xstate_bytes = 0;
+#endif
 
 constexpr uint32_t kMaxCores = 128;
 static_assert(kMaxCores <= scheduling::kMaxPlacementCores);
@@ -717,6 +725,11 @@ Frame* reschedule(Frame* frame, Core* c, bool voluntary) {
   }
   c->user.user_cr3 = next->user_cr3;
   c->user.kernel_stack = reinterpret_cast<uint64_t>(next->stack_top);
+  if (next != prev && g_xstate_mask && c->index < 128 && (__atomic_load_n(&g_xstate_cores[c->index / 64], __ATOMIC_RELAXED) >> (c->index % 64) & 1)) {      // the AVX / AVX-512 registers go with their thread
+    const uint32_t low = static_cast<uint32_t>(g_xstate_mask), high = static_cast<uint32_t>(g_xstate_mask >> 32);
+    if (prev->xstate) __asm__ volatile("xsave64 %0" : "=m"(*prev->xstate) : "a"(low), "d"(high) : "memory");
+    if (next->xstate) __asm__ volatile("xrstor64 %0" ::"m"(*next->xstate), "a"(low), "d"(high) : "memory");
+  }
   if (next->user_cr3) {
     wrmsr(kMsrKernelGsBase, next->user_gs);
     wrmsr(kMsrFsBase, next->user_fs);
@@ -942,6 +955,10 @@ Thread* make_thread(ThreadFunction fn, void* argument, const char* name, int32_t
     return nullptr;
   }
   t->stack_top = t->stack + stack_bytes;
+  if (const uint64_t bytes = __atomic_load_n(&g_xstate_bytes, __ATOMIC_ACQUIRE)) {      // (zeroed: the header says every component is in its initial state)
+    t->xstate = static_cast<uint8_t*>(g.allocator->allocate_aligned(bytes, 64));
+    if (t->xstate) ByteView(t->xstate, bytes).fill(0);
+  }
   t->entry = fn;
   t->argument = argument;
   t->name = name;
@@ -993,6 +1010,7 @@ uint32_t reap_zombies_impl() {
     Thread* t = done;
     done = t->next;
     g.allocator->deallocate(t->stack);
+    g.allocator->deallocate(t->xstate);
     g.allocator->deallocate(t);
   }
   return left;
@@ -1652,8 +1670,36 @@ bool join(Thread* t, uint64_t timeout_us) {
     unlock_irq(&g.threads_lock, flags);
   }
   g.allocator->deallocate(t->stack);
+  g.allocator->deallocate(t->xstate);
   g.allocator->deallocate(t);
   return true;
+}
+
+uint64_t enable_extended_state() {
+#if defined(__x86_64__)
+  uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0;
+  __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+  if (!(ecx & (1u << 26)) || !(ecx & (1u << 28))) return 0;      // no XSAVE, or no AVX
+  eax = 0xD; ecx = 0;
+  __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+  uint64_t mask = eax & 0x7u;      // x87, SSE, AVX
+  if ((eax & 0xE0u) == 0xE0u) mask |= 0xE0u;      // AVX-512: the mask registers and both halves of the upper registers, or none of it
+  if ((mask & 0x7u) != 0x7u) return 0;
+  uint64_t cr4 = 0;
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  __asm__ volatile("movq %0, %%cr4" ::"r"(cr4 | (uint64_t{1} << 18)) : "memory");      // CR4.OSXSAVE
+  __asm__ volatile("xsetbv" ::"c"(0u), "a"(static_cast<uint32_t>(mask)), "d"(static_cast<uint32_t>(mask >> 32)) : "memory");
+  eax = 0xD; ecx = 0;
+  __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));      // EBX: the save area for what XCR0 now holds
+  uint64_t expected = 0;
+  __atomic_compare_exchange_n(&g_xstate_bytes, &expected, uint64_t{(ebx + 63u) & ~63u}, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+  __atomic_store_n(&g_xstate_mask, mask & ~uint64_t{3}, __ATOMIC_RELEASE);
+  const uint32_t core = current_core();
+  if (core < 128) __atomic_or_fetch(&g_xstate_cores[core / 64], uint64_t{1} << (core % 64), __ATOMIC_RELEASE);
+  return mask;
+#else
+  return 0;
+#endif
 }
 
 void detach(Thread* t) {

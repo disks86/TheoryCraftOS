@@ -26,11 +26,14 @@ NTSTATUS NTAPI NtQuerySystemTime(PLARGE_INTEGER time);
 #define SYNC_STATUS_TIMEOUT_ ((NTSTATUS)0x102)
 #define SYNC_STATUS_UNSUCCESSFUL_ ((NTSTATUS)0xC0000001)
 
-/* ---- slim reader/writer locks: bit 0 held exclusively, bit 1 somebody waits, the readers are counted from bit 4 up ---- */
+/* ---- slim reader/writer locks: bit 0 held exclusively, bit 1 somebody sleeps on the word, the readers are counted from bit 4 up, the threads waiting for the lock
+ * exclusively from bit 32 up. A writer that waits keeps new readers out (as on Windows), so readers cannot starve it. ---- */
 
 #define SRW_EXCLUSIVE_ 1u
 #define SRW_WAITERS_ 2u
 #define SRW_READER_ 16u
+#define SRW_READERS_MASK_ 0xFFFFFFF0ull
+#define SRW_WRITER_ (1ull << 32)
 #define SRW_WORD(lock) ((volatile ULONG_PTR *)&(lock)->Ptr)
 
 EXPORT void NTAPI RtlInitializeSRWLock(PSRWLOCK lock) { lock->Ptr = NULL; }
@@ -49,9 +52,13 @@ static void srw_wake_if_waited(volatile ULONG_PTR *word) {
 }
 EXPORT void NTAPI RtlAcquireSRWLockExclusive(PSRWLOCK lock) {
   volatile ULONG_PTR *word = SRW_WORD(lock);
-  for (;;) {
-    const ULONG_PTR v = *word;
-    if ((v & ~(ULONG_PTR)SRW_WAITERS_) == 0) { if (__sync_bool_compare_and_swap(word, v, v | SRW_EXCLUSIVE_)) return; }
+  ULONG_PTR v = *word;
+  if (!(v & (SRW_EXCLUSIVE_ | SRW_READERS_MASK_)) && __sync_bool_compare_and_swap(word, v, v | SRW_EXCLUSIVE_)) return;
+  __sync_fetch_and_add(word, SRW_WRITER_);      /* counted as waiting: readers that come now wait behind it */
+  for (unsigned spins = 0;;) {
+    v = *word;
+    if (!(v & (SRW_EXCLUSIVE_ | SRW_READERS_MASK_))) { if (__sync_bool_compare_and_swap(word, v, (v | SRW_EXCLUSIVE_) - SRW_WRITER_)) return; }
+    else if (++spins < 64) __asm__ volatile("pause");
     else srw_wait(word, v);
   }
 }
@@ -59,7 +66,7 @@ EXPORT BOOLEAN NTAPI RtlTryAcquireSRWLockExclusive(PSRWLOCK lock) {
   volatile ULONG_PTR *word = SRW_WORD(lock);
   for (;;) {
     const ULONG_PTR v = *word;
-    if ((v & ~(ULONG_PTR)SRW_WAITERS_) != 0) return FALSE;
+    if (v & (SRW_EXCLUSIVE_ | SRW_READERS_MASK_)) return FALSE;
     if (__sync_bool_compare_and_swap(word, v, v | SRW_EXCLUSIVE_)) return TRUE;
   }
 }
@@ -78,9 +85,10 @@ EXPORT void NTAPI RtlReleaseSRWLockExclusive(PSRWLOCK lock) {
 }
 EXPORT void NTAPI RtlAcquireSRWLockShared(PSRWLOCK lock) {
   volatile ULONG_PTR *word = SRW_WORD(lock);
-  for (;;) {
+  for (unsigned spins = 0;;) {
     const ULONG_PTR v = *word;
-    if (!(v & SRW_EXCLUSIVE_)) { if (__sync_bool_compare_and_swap(word, v, v + SRW_READER_)) return; }
+    if (!(v & SRW_EXCLUSIVE_) && (v >> 32) == 0) { if (__sync_bool_compare_and_swap(word, v, v + SRW_READER_)) return; }
+    else if (++spins < 64) __asm__ volatile("pause");
     else srw_wait(word, v);
   }
 }
@@ -88,13 +96,13 @@ EXPORT BOOLEAN NTAPI RtlTryAcquireSRWLockShared(PSRWLOCK lock) {
   volatile ULONG_PTR *word = SRW_WORD(lock);
   for (;;) {
     const ULONG_PTR v = *word;
-    if (v & SRW_EXCLUSIVE_) return FALSE;
+    if ((v & SRW_EXCLUSIVE_) || (v >> 32) != 0) return FALSE;      /* (held, or a thread is waiting for it exclusively) */
     if (__sync_bool_compare_and_swap(word, v, v + SRW_READER_)) return TRUE;
   }
 }
 EXPORT void NTAPI RtlReleaseSRWLockShared(PSRWLOCK lock) {
   volatile ULONG_PTR *word = SRW_WORD(lock);
-  if ((*word & SRW_EXCLUSIVE_) || *word < SRW_READER_) {
+  if ((*word & SRW_EXCLUSIVE_) || (*word & SRW_READERS_MASK_) == 0) {
     EXCEPTION_RECORD record;
     memset(&record, 0, sizeof(record));
     record.ExceptionCode = 0xC0000264u;
@@ -103,7 +111,7 @@ EXPORT void NTAPI RtlReleaseSRWLockShared(PSRWLOCK lock) {
     return;
   }
   const ULONG_PTR after = __sync_sub_and_fetch(word, SRW_READER_);
-  if (after < SRW_READER_) srw_wake_if_waited(word);      /* the last reader: a writer may go on */
+  if ((after & SRW_READERS_MASK_) == 0) srw_wake_if_waited(word);      /* the last reader: a writer may go on */
 }
 EXPORT void NTAPI RtlAcquireReleaseSRWLockExclusive(PSRWLOCK lock) { RtlAcquireSRWLockExclusive(lock); RtlReleaseSRWLockExclusive(lock); }
 EXPORT void NTAPI RtlConvertSRWLockExclusiveToShared(PSRWLOCK lock) {
@@ -119,7 +127,7 @@ EXPORT BOOLEAN NTAPI RtlTryConvertSRWLockSharedToExclusiveOrRelease(PSRWLOCK loc
   volatile ULONG_PTR *word = SRW_WORD(lock);
   for (;;) {
     const ULONG_PTR v = *word;
-    if ((v & ~(ULONG_PTR)SRW_WAITERS_) == SRW_READER_) { if (__sync_bool_compare_and_swap(word, v, (v & SRW_WAITERS_) | SRW_EXCLUSIVE_)) return TRUE; }
+    if ((v & (SRW_EXCLUSIVE_ | SRW_READERS_MASK_)) == SRW_READER_) { if (__sync_bool_compare_and_swap(word, v, (v & ~(ULONG_PTR)SRW_READERS_MASK_) | SRW_EXCLUSIVE_)) return TRUE; }
     else { RtlReleaseSRWLockShared(lock); return FALSE; }
   }
 }

@@ -100,7 +100,14 @@ struct Thread {
   uint64_t user_gs = 0;
   uint64_t user_fs = 0;        // the program's FS base (saved when the thread is switched out)
   void* user_context = nullptr;
+  // The CPU state beyond x87 and SSE (AVX and AVX-512 registers), saved here when the thread leaves a core and loaded when it comes back (XSAVE format, 64-byte aligned;
+  // nullptr for threads made before enable_extended_state(), which never use it). The interrupt frames keep only the x87/SSE part: the kernel does not touch the rest.
+  uint8_t* xstate = nullptr;
 };
+
+// Turns on the CPU's extended register state (XSAVE: AVX, and AVX-512 where all of it is there) on the calling core, so that user programs may use those registers;
+// threads made afterwards keep theirs across switches. Called on every core (the first call decides the state saved). Returns the XCR0 mask in force (0: none).
+uint64_t enable_extended_state();
 
 constexpr uint32_t kDefaultStackBytes = 8 * 1024 * 1024;   // (what Linux gives a thread; reading a big web page and running its scripts is deep)
 

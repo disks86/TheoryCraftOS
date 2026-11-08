@@ -2227,59 +2227,133 @@ void ObjectManager::job_event_locked(Job& j, uint32_t message, uint64_t pid) {
   j.events[(j.event_head + j.event_count++) % Job::kMaxEvents] = JobEvent{message, pid};
 }
 
+bool ObjectManager::job_add_locked(Job& j, uint64_t pid) {
+  for (int pass = 0; pass < 2; ++pass) {      // a free place, else one of a process that has ended
+    for (JobMember& m : j.members) {
+      if (pass == 0 ? m.pid != 0 : !m.gone) continue;
+      m.kill = 0; m.code = 0; m.gone = 0;
+      m.joined = ++job_joins_;
+      __atomic_store_n(&m.pid, pid, __ATOMIC_RELEASE);
+      ++j.info.active_processes;
+      ++j.info.total_processes;
+      job_event_locked(j, 6, pid);      // JOB_OBJECT_MSG_NEW_PROCESS
+      return true;
+    }
+  }
+  return false;
+}
+
 uint32_t ObjectManager::job_assign(uint32_t job, uint64_t pid) {
   Locked hold(sync_);
   Job* j = job_of(job);
   if (!j) return kInvalidHandle;
-  for (uint32_t k = 0; k < kJobMaxJobs; ++k) if (jobs_[k].used) for (const JobMember& m : jobs_[k].members) if (m.pid == pid) return kAccessDenied;
-  if ((j->info.limit_flags & kJobLimitActiveProcess) && j->info.active_processes >= j->info.active_limit) return kQuotaExceeded;
-  for (int pass = 0; pass < 2; ++pass) {      // a free place, else one of a process that has ended
-    for (JobMember& m : j->members) {
-      if (pass == 0 ? m.pid != 0 : !m.gone) continue;
-      m.kill = 0; m.code = 0; m.gone = 0;
-      __atomic_store_n(&m.pid, pid, __ATOMIC_RELEASE);
-      ++j->info.active_processes;
-      ++j->info.total_processes;
-      job_event_locked(*j, 6, pid);      // JOB_OBJECT_MSG_NEW_PROCESS
-      return kSuccess;
+  auto alive_in = [pid](const Job& in) {
+    for (const JobMember& m : in.members) if (m.pid == pid && !m.gone) return true;
+    return false;
+  };
+  if (alive_in(*j)) return kAccessDenied;      // (already in it)
+  // A process that is in a job may join another one only if that job never had a process: it then nests inside the process's innermost job, as on Windows 8 and later.
+  uint32_t innermost = 0;
+  uint64_t latest = 0;
+  for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
+    if (!jobs_[k].used || jobs_[k].object == 0 || &jobs_[k] == j) continue;
+    for (const JobMember& m : jobs_[k].members) {
+      if (m.pid != pid || m.gone || (innermost != 0 && m.joined <= latest)) continue;
+      innermost = jobs_[k].object;
+      latest = m.joined;
     }
   }
-  return kQuotaExceeded;
+  if (innermost != 0) {
+    if (j->info.total_processes > 0 && j->parent != innermost) return kAccessDenied;
+    if (j->parent == 0) j->parent = innermost;
+  }
+  if ((j->info.limit_flags & kJobLimitActiveProcess) && j->info.active_processes >= j->info.active_limit) return kQuotaExceeded;
+  // The jobs it nests in, outermost first (so that it joins them before this one, which stays its innermost).
+  static constexpr uint32_t kMaxDepth = 16;
+  Job* chain[kMaxDepth];
+  uint32_t depth = 0;
+  for (Job* up = job_of(j->parent); up && up != j && depth < kMaxDepth; up = job_of(up->parent)) chain[depth++] = up;
+  for (uint32_t d = depth; d-- > 0;) if (!alive_in(*chain[d]) && !job_add_locked(*chain[d], pid)) return kQuotaExceeded;
+  return job_add_locked(*j, pid) ? kSuccess : kQuotaExceeded;
 }
 
 uint32_t ObjectManager::job_of_process(uint64_t pid) {
   Locked hold(sync_);
   if (!jobs_) return 0;
+  uint32_t innermost = 0;
+  uint64_t latest = 0;
   for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
     if (!jobs_[k].used || jobs_[k].object == 0) continue;
-    for (const JobMember& m : jobs_[k].members) if (m.pid == pid) return jobs_[k].object;
+    for (const JobMember& m : jobs_[k].members) {
+      if (m.pid != pid || (innermost != 0 && m.joined <= latest)) continue;
+      innermost = jobs_[k].object;
+      latest = m.joined;
+    }
   }
-  return 0;
+  return innermost;
+}
+
+bool ObjectManager::job_contains(uint32_t job, uint64_t pid) {
+  Locked hold(sync_);
+  if (!jobs_) return false;
+  Job* j = job_of(job);
+  if (!j) return false;
+  for (const JobMember& m : j->members) if (m.pid == pid) return true;
+  return false;
 }
 
 uint32_t ObjectManager::job_inherit(uint64_t parent, uint64_t child, bool breakaway) {
   Locked hold(sync_);
   if (!jobs_) return kSuccess;
+  // Every job of the parent (they are nested) takes the child, in the order the parent joined them; a breakaway needs the innermost one to allow it.
+  bool any = false;
+  const Job* innermost = nullptr;
+  uint64_t latest = 0;
   for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
     Job& j = jobs_[k];
     if (!j.used || j.object == 0) continue;
     for (const JobMember& pm : j.members) {
-      if (pm.pid != parent) continue;
-      if (breakaway) return (j.info.limit_flags & kJobLimitBreakawayOk) ? kSuccess : kAccessDenied;
-      if (j.info.limit_flags & kJobLimitSilentBreakawayOk) return kSuccess;
-      if ((j.info.limit_flags & kJobLimitActiveProcess) && j.info.active_processes >= j.info.active_limit) return kQuotaExceeded;
-      for (JobMember& m : j.members) {
-        if (m.pid != 0 && !m.gone) continue;
-        m.kill = 0; m.code = 0; m.gone = 0;
-        if (pm.kill) { m.code = pm.code; m.kill = 1; __atomic_add_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL); }      // (a child of a process being ended is ended too)
-        __atomic_store_n(&m.pid, child, __ATOMIC_RELEASE);
-        ++j.info.active_processes;
-        ++j.info.total_processes;
-        job_event_locked(j, 6, child);      // JOB_OBJECT_MSG_NEW_PROCESS
-        return kSuccess;
-      }
-      return kQuotaExceeded;
+      if (pm.pid != parent || pm.gone) continue;
+      if (!any || pm.joined > latest) { innermost = &j; latest = pm.joined; }
+      any = true;
+      if (!breakaway && !(j.info.limit_flags & kJobLimitSilentBreakawayOk) && (j.info.limit_flags & kJobLimitActiveProcess) && j.info.active_processes >= j.info.active_limit) return kQuotaExceeded;
     }
+  }
+  if (breakaway && innermost && !(innermost->info.limit_flags & kJobLimitBreakawayOk)) return kAccessDenied;
+  if (!any) return kSuccess;
+  // A breakaway leaves the jobs from the innermost outwards while each allows it: the child stays in the first that does not, and in those outside it.
+  uint64_t cutoff = ~uint64_t(0);      // (the child keeps the jobs the parent joined before this)
+  while (breakaway) {
+    const Job* next = nullptr;
+    uint64_t next_joined = 0;
+    for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
+      const Job& j = jobs_[k];
+      if (!j.used || j.object == 0) continue;
+      for (const JobMember& pm : j.members) {
+        if (pm.pid != parent || pm.gone || pm.joined >= cutoff || (next && pm.joined <= next_joined)) continue;
+        next = &j;
+        next_joined = pm.joined;
+      }
+    }
+    if (!next || !(next->info.limit_flags & kJobLimitBreakawayOk)) break;
+    cutoff = next_joined;
+  }
+  for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
+    Job& j = jobs_[k];
+    if (!j.used || j.object == 0 || (j.info.limit_flags & kJobLimitSilentBreakawayOk)) continue;
+    const JobMember* parent_member = nullptr;
+    for (const JobMember& pm : j.members) if (pm.pid == parent && !pm.gone && pm.joined < cutoff) parent_member = &pm;
+    if (!parent_member) continue;
+    JobMember* place = nullptr;
+    for (JobMember& m : j.members) if (!place && (m.pid == 0 || m.gone)) place = &m;
+    if (!place) return kQuotaExceeded;
+    place->kill = 0; place->code = 0; place->gone = 0;
+    if (parent_member->kill) { place->code = parent_member->code; place->kill = 1; __atomic_add_fetch(&pending_kills_, 1u, __ATOMIC_ACQ_REL); }      // (a child of a process being ended is ended too)
+    place->joined = parent_member->joined;      // (the same depth as the parent's: the order of its jobs stays)
+    __atomic_store_n(&place->pid, child, __ATOMIC_RELEASE);
+    ++j.info.active_processes;
+    ++j.info.total_processes;
+    job_event_locked(j, 6, child);      // JOB_OBJECT_MSG_NEW_PROCESS
   }
   return kSuccess;
 }
@@ -2302,7 +2376,7 @@ void ObjectManager::job_forget_locked(uint64_t pid) {
         for (const JobMember& other : j.members) if (other.pid != 0 && !other.gone) any = true;
         if (!any) j.used = false;
       }
-      return;
+      break;      // (the next job: a process may be in several)
     }
   }
 }
@@ -2379,8 +2453,7 @@ bool ObjectManager::job_kill_for(uint64_t pid, uint32_t* code) {
   if (!jobs) return false;
   for (uint32_t k = 0; k < kJobMaxJobs; ++k) {
     for (const JobMember& m : jobs[k].members) {
-      if (__atomic_load_n(&m.pid, __ATOMIC_ACQUIRE) != pid) continue;
-      if (!__atomic_load_n(&m.kill, __ATOMIC_ACQUIRE)) return false;
+      if (__atomic_load_n(&m.pid, __ATOMIC_ACQUIRE) != pid || !__atomic_load_n(&m.kill, __ATOMIC_ACQUIRE)) continue;      // (a process in several jobs ends when any of them is ended)
       *code = m.code;
       return true;
     }

@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "ObjectContainer/List.hpp"
+#include "Process/PageMap.hpp"
 #include "Process/Process.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -31,12 +32,13 @@ struct AddressRange {
 
 constexpr uint8_t kProtRead = 1, kProtWrite = 2, kProtExecute = 4;
 
-// The memory of one user-mode process: a set of page-aligned regions, each with its own permissions and its own zero-filled backing store. This is the
-// kernel's view of the address space (the bounds-checked way a system call reaches user memory); it does not touch the CPU's page tables. When the
-// ring-3 entry exists, the same regions are what gets mapped into the process's hardware page tables.
+// The memory of one user-mode process: a set of page-aligned regions, each with its own permissions. A private region's pages get memory of their own only when
+// they are first written (or touched by the program: the page fault asks for it), so reserving or committing even gigabytes costs nothing; a page without memory
+// reads as zeros. A shared region (a section view) shows memory that is not the address space's own. This is the kernel's view of the address space (the
+// bounds-checked way a system call reaches user memory); it does not touch the CPU's page tables, but it remembers which ranges changed since they were last
+// brought up to date (take_change), so that only those are redone.
 //
-// Regions never overlap and the whole space is below kUserTop. A request that does not fit (overlap, beyond the top, over the byte budget, out of memory)
-// fails and changes nothing.
+// Regions never overlap and the whole space is below kUserTop. A request that does not fit (overlap, beyond the top, out of memory) fails and changes nothing.
 // Memory that several address spaces map at once (a section: CreateFileMapping). The owner counts the mappings and frees the memory when the last is gone.
 class SharedMemory {
  public:
@@ -66,12 +68,10 @@ class AddressSpace final : public IUserMemory {
   static constexpr uint64_t kPageSize = 4096;
   static constexpr uint64_t kUserTop = 0x0000800000000000ull;      // the lower half of 48-bit addresses
 
-  // `max_bytes` limits what all regions together may hold.
-  explicit AddressSpace(allocators::IAllocator& allocator, uint64_t max_bytes = 256ull << 20) : allocator_(allocator), retired_(allocator), regions_(allocator), max_bytes_(max_bytes) {}
-  ~AddressSpace() {
-    retired_.deferred = false;
-    reclaim();
-  }
+  // `max_bytes` limits what all regions together may span (kNoLimit: only memory itself limits what is touched).
+  explicit AddressSpace(allocators::IAllocator& allocator, uint64_t max_bytes = kNoLimit) : allocator_(allocator), retired_(allocator), regions_(allocator), pages_(allocator), max_bytes_(max_bytes) {}
+  ~AddressSpace();
+  static constexpr uint64_t kNoLimit = ~uint64_t{0};
   AddressSpace(const AddressSpace&) = delete;
   AddressSpace& operator=(const AddressSpace&) = delete;
 
@@ -83,7 +83,8 @@ class AddressSpace final : public IUserMemory {
     return true;
   }
 
-  // Maps [address, address + size) with `protection` (size rounded up to whole pages), zero-filled. `address` must be page-aligned and size non-zero.
+  // Maps [address, address + size) with `protection` (size rounded up to whole pages), zero-filled (no memory is taken until a page is written). `address` must be
+  // page-aligned and size non-zero; the regions together must stay within the byte budget.
   bool map(uint64_t address, uint64_t size, uint8_t protection);
   // Maps memory that is not the address space's own: `storage` (page-aligned, `size` bytes, rounded up to pages) stays as it is and is shared with whoever else maps it.
   // `owner` is told (retain) once for the mapping and again for every piece it is cut into, and (release) when a piece is unmapped, which with deferred freeing is when the
@@ -120,8 +121,8 @@ class AddressSpace final : public IUserMemory {
   // Addresses no region may cover (map, resize and find_free keep away from them). The ranges must outlive the address space.
   void set_reserved(ArrayView<const AddressRange> ranges) { reserved_ = ranges; }
 
-  // For building hardware page tables: region `index` (0 .. region_count() - 1, in address order), with the memory that backs it. The backing memory is
-  // page-aligned, `size` bytes long and stays where it is until the layout changes (generation() moves).
+  // For building hardware page tables: region `index` (0 .. region_count() - 1, in address order). `storage` is the memory of a shared region (page-aligned, `size`
+  // bytes, there until the layout changes); a private region has none of its own: page_memory() tells, page by page.
   struct RegionInfo {
     uint64_t base = 0, size = 0;
     uint8_t protection = 0;
@@ -130,8 +131,26 @@ class AddressSpace final : public IUserMemory {
     PageAttributes attributes;
   };
   bool region_at(uint64_t index, RegionInfo* out) const;
-  // Counts every change to the layout (map, unmap, protect, resize), so a user of the page tables knows when to rebuild them.
+  // The first region that ends above `address` (region_count() if none): where to start region_at() for a range.
+  uint64_t region_index(uint64_t address) const { return first_ending_after(address); }
+  // Counts every change to the layout (map, unmap, protect, resize).
   uint64_t generation() const { return generation_; }
+
+  // The memory behind one page (page-aligned address): a private page's own (nullptr while it has none) or what a shared region shows there; nullptr if unmapped.
+  const uint8_t* page_memory(uint64_t page) const;
+  // The same, giving a private page its (zeroed) memory first if it has none. nullptr if the page is unmapped or memory ran out.
+  uint8_t* materialize(uint64_t page);
+  // Calls fn(page, memory) for every private page of [start, end) that has memory of its own.
+  template <typename F>
+  void for_each_private_page(uint64_t start, uint64_t end, F&& fn) const { pages_.for_each(start, end, fn); }
+  // Lets go of the memory of the private pages of [address, address + size): they read as zeros again (MEM_DECOMMIT, MEM_RESET, DiscardVirtualMemory). The
+  // range must be mapped.
+  bool discard(uint64_t address, uint64_t size);
+  // The ranges whose pages changed (mapped, unmapped, protected, given other memory) since they were last taken, one at a time, merged when there are many.
+  bool take_change(uint64_t* start, uint64_t* end);
+  bool has_changes() const { return change_count_ != 0; }
+  // Whether memory waits for reclaim() (something the CPUs may still have been able to see was let go of).
+  bool has_retired() const { return !retired_.storages.empty(); }
 
   // The kernel's own access, which ignores the permissions (a loader fills read-only code pages this way). Fails if any byte is unmapped.
   bool read_privileged(uint64_t address, ByteView out) const { return check(address, out.size(), 0) && copy_out(address, out); }
@@ -158,7 +177,9 @@ class AddressSpace final : public IUserMemory {
   // sharing it), becomes writable and is PAGE_READWRITE / PAGE_EXECUTE_READWRITE from then on. False if the range holds no such page or memory ran out.
   bool break_copy_on_write(uint64_t address, uint64_t size);
   bool set_page_protect(uint64_t address, uint64_t size, uint32_t protect, bool reserved);
+  // What the regions span (reserved, committed or touched alike), and the memory the space really uses: private pages that have memory, and the shared regions.
   uint64_t mapped_bytes() const { return mapped_bytes_; }
+  uint64_t resident_bytes() const { return pages_.count() * kPageSize + shared_bytes_; }
   uint64_t region_count() const { return regions_.count(); }
 
  private:
@@ -178,15 +199,11 @@ class AddressSpace final : public IUserMemory {
     ~Region() { release(); }
     Region(const Region&) = delete;
     Region& operator=(const Region&) = delete;
-    // Gets `bytes` of zeroed, page-aligned memory (replacing any). False if it ran out.
-    bool allocate(uint64_t bytes);
-    void release();
-    ByteView bytes() const { return ByteView(storage, size); }
+    void release();      // lets go of the shared memory (private pages are in the page map)
     uint64_t base = 0, size = 0, allocation = 0;      // `allocation` ties together the pieces of one map() call
     uint8_t protection = 0;
     PageAttributes attributes;
-    uint8_t* storage = nullptr;
-    uint64_t capacity = 0;
+    uint8_t* storage = nullptr;          // a shared region's memory (nullptr for a private one)
     SharedMemory* shared = nullptr;      // not ours: a section's memory, which we only map
 
    private:
@@ -200,15 +217,33 @@ class AddressSpace final : public IUserMemory {
   // Both assume check() passed for the range.
   bool copy_out(uint64_t address, ByteView out) const;
   bool copy_in(uint64_t address, ConstByteView data);
-  // Makes `address` (page-aligned) a region boundary, copying the tail of the region it falls inside.
+  // Makes `address` (page-aligned) a region boundary (the tail of the region it falls inside becomes a region of its own).
   bool split_at(uint64_t address);
   bool prepare_range(uint64_t address, uint64_t size, uint64_t* end) const;
+  // Joins the regions of [first, last] with the ones next to them where nothing tells them apart, so repeated protection changes do not leave many small pieces.
+  void coalesce(uint64_t first, uint64_t last);
+  bool same_kind(const Region& a, const Region& b) const;
+  // Frees (or retires) the private pages of [start, end).
+  void drop_pages(uint64_t start, uint64_t end);
+  void retire(uint8_t* page);
+  void note_change(uint64_t start, uint64_t end);
+  // A shared region whose pages are copied before the kernel writes them: an image (shared by every process that maps it) or a copy-on-write view.
+  static bool keeps_private_copies(const Region& r);
+  // Gives the page of a shared region a private copy of what it shows (its protection and attributes stay). True if it is private now.
+  bool privatize(uint64_t page);
+  void remove_region(uint64_t index);
 
   allocators::IAllocator& allocator_;
   Retired retired_;
   List<UniquePointer<Region>> regions_;      // sorted by base
+  PageMap pages_;                            // the memory of the private pages
   uint64_t max_bytes_;
   uint64_t mapped_bytes_ = 0;
+  uint64_t shared_bytes_ = 0;
+  static constexpr uint32_t kMaxChanges = 16;
+  struct Change { uint64_t start = 0, end = 0; };
+  Change changes_[kMaxChanges];
+  uint32_t change_count_ = 0;
   uint64_t next_allocation_ = 1;
   uint64_t generation_ = 0;
   ArrayView<const AddressRange> reserved_;

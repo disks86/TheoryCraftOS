@@ -624,24 +624,56 @@ static uint64_t translate(uint64_t root, uint64_t address, uint64_t* flags) {
 }
 
 // With deferred freeing, the memory of what is unmapped, cut or moved stays allocated until reclaim() (other CPUs may still run on the old page tables).
+// Pages of a shared image (or a copy-on-write view) that the kernel writes into get copies of their own: the shared memory is never written through them.
+static void test_private_copies_of_shared_pages() {
+  struct Owner final : SharedMemory {
+    int refs = 0;
+    void retain() override { ++refs; }
+    void release() override { --refs; }
+  } owner;
+  alignas(4096) static uint8_t shared[3 * 4096];
+  for (uint64_t i = 0; i < sizeof(shared); ++i) shared[i] = uint8_t(i / 4096 + 1);
+  {
+    AddressSpace s(A);
+    CHECK(s.map_shared(0x500000, sizeof(shared), kProtRead | kProtExecute, shared, &owner) && owner.refs == 1);
+    PageAttributes image;
+    image.type = PageAttributes::Image;
+    image.protect = 0x20;
+    CHECK(s.set_attributes(0x500000, sizeof(shared), image) && s.resident_bytes() == sizeof(shared));
+    const uint8_t patch[2] = {0xAA, 0xBB};
+    CHECK(s.write_privileged(0x500FFF, ConstByteView(patch, 2)));      // across the first two pages
+    CHECK(shared[0xFFF] == 1 && shared[0x1000] == 2);                    // the shared memory is as it was
+    uint8_t back[4] = {};
+    CHECK(s.read_privileged(0x500FFE, ByteView(back, 4)) && back[0] == 1 && back[1] == 0xAA && back[2] == 0xBB && back[3] == 2);
+    CHECK(!s.is_shared(0x500000) && !s.is_shared(0x501000) && s.is_shared(0x502000));
+    uint8_t prot = 0;
+    CHECK(s.protection_at(0x501000, &prot) && prot == (kProtRead | kProtExecute));      // (the protection stays)
+    CHECK(s.read_privileged(0x502000, ByteView(back, 1)) && back[0] == 3);
+    // A plain shared view is written through.
+    CHECK(s.map_shared(0x600000, 4096, kProtRead | kProtWrite, shared + 2 * 4096, &owner) && s.write_privileged(0x600000, ConstByteView(patch, 1)) && shared[2 * 4096] == 0xAA);
+  }
+  CHECK(owner.refs == 0);
+}
+
 static void test_deferred_free() {
   const int base = A.live;
   {
     AddressSpace s(A);
     s.set_deferred_free(true);
     CHECK(s.map(0x400000, 0x4000, kProtRead | kProtWrite));
+    CHECK(A.live <= base + 4);             // (no page has memory before it is written)
+    const uint8_t one = 1;
+    for (uint64_t page = 0x400000; page < 0x404000; page += 0x1000) CHECK(s.write_privileged(page, ConstByteView(&one, 1)));
     const int mapped = A.live;
-    CHECK(s.unmap(0x401000, 0x1000));      // a hole in the middle: the tail is copied to new memory, the old memory stays whole
+    CHECK(s.unmap(0x401000, 0x1000));      // a hole in the middle: the region is cut, no memory moves
     CHECK(s.unmap(0x400000, 0x1000));
-    CHECK(A.live > mapped);                // nothing was given back yet
+    CHECK(A.live >= mapped && s.has_retired());      // nothing was given back yet
     s.reclaim();
-    CHECK(A.live < mapped + 4);
-    CHECK(s.resize(0x402000, 0x8000));     // growing moves the region to bigger memory
-    const int before = A.live;
-    s.reclaim();
-    CHECK(A.live < before);
+    CHECK(A.live < mapped && !s.has_retired());
+    CHECK(s.resize(0x402000, 0x8000));     // growing takes no memory
+    CHECK(!s.has_retired());
     CHECK(s.unmap(0x402000, 0x10000));
-    CHECK(A.live > base);
+    CHECK(A.live > base && s.has_retired());
     s.set_deferred_free(false);
     s.reclaim();
   }
@@ -676,8 +708,12 @@ static void test_user_page_tables() {
   AddressSpace::RegionInfo info;
   CHECK(s.region_at(0, &info));
   uint64_t pa = translate(tables.root(), 0x400010, &flags);
-  CHECK(pa == reinterpret_cast<uint64_t>(info.storage) + 0x10 && *reinterpret_cast<const uint8_t*>(pa) == 0x5A);
+  CHECK(info.storage == nullptr && pa == reinterpret_cast<uint64_t>(s.page_memory(0x400000)) + 0x10 && *reinterpret_cast<const uint8_t*>(pa) == 0x5A);
   CHECK((flags & UserPageTables::kUser) && !(flags & UserPageTables::kWritable) && !(flags & UserPageTables::kNoExecute));     // code: user, read-only, executable
+  // A page that was never written has no memory, and no entry until the program's first touch (the page fault) gives it both.
+  CHECK(translate(tables.root(), 0x401FFF, &flags) == 0 && s.page_memory(0x401000) == nullptr);
+  bool flush = false;
+  CHECK(s.materialize(0x401000) != nullptr && tables.update(s, 0x401000, 0x402000, &flush) && !flush);
   CHECK(translate(tables.root(), 0x401FFF, &flags) != 0 && translate(tables.root(), 0x402000, &flags) == 0);
   CHECK(translate(tables.root(), 0x601000, &flags) != 0 && (flags & UserPageTables::kWritable) && (flags & UserPageTables::kNoExecute));       // data: writable, no-execute
   CHECK(translate(tables.root(), 0x7F0000000000ull, &flags) == 0);                      // PROT_NONE: nothing mapped
@@ -686,17 +722,38 @@ static void test_user_page_tables() {
   CHECK(translate(tables.root(), k + 5, &flags) == k + 5 && !(flags & UserPageTables::kUser) && !(flags & UserPageTables::kNoExecute) && !(flags & UserPageTables::kWritable));
   CHECK(translate(tables.root(), k + 4096, &flags) == k + 4096 && !(flags & UserPageTables::kUser) && (flags & UserPageTables::kWritable) && (flags & UserPageTables::kNoExecute));
 
-  // Unchanged space: no rebuild. A change: rebuilt, and the new layout shows.
+  // The tables are changed in place: a change shows, and a page that went away asks for the TLBs to be flushed.
   const uint64_t root = tables.root();
   CHECK(tables.sync(s) && tables.root() == root);
-  CHECK(s.unmap(0x601000, 0x1000) && s.map(0x800000, 0x1000, kProtRead | kProtWrite));
-  CHECK(tables.sync(s) && translate(tables.root(), 0x601000, &flags) == 0 && translate(tables.root(), 0x800000, &flags) != 0);
+  CHECK(s.unmap(0x601000, 0x1000) && s.map(0x800000, 0x1000, kProtRead | kProtWrite) && s.write_privileged(0x800000, ConstByteView(&mark, 1)));
+  flush = false;
+  CHECK(tables.sync(s, false, &flush) && flush && tables.root() == root && translate(tables.root(), 0x601000, &flags) == 0 && translate(tables.root(), 0x800000, &flags) != 0);
+  // More permission needs no flush; less does.
+  flush = false;
+  CHECK(s.protect(0x800000, 0x1000, kProtRead | kProtWrite | kProtExecute) && tables.sync(s, false, &flush) && !flush && translate(tables.root(), 0x800000, &flags) != 0 && !(flags & UserPageTables::kNoExecute));
+  CHECK(s.protect(0x800000, 0x1000, kProtRead) && tables.sync(s, false, &flush) && flush && translate(tables.root(), 0x800000, &flags) != 0 && !(flags & UserPageTables::kWritable));
+  flush = false;
+  CHECK(s.protect(0x800000, 0x1000, 0) && tables.sync(s, false, &flush) && flush && translate(tables.root(), 0x800000, &flags) == 0);
+  CHECK(s.protect(0x800000, 0x1000, kProtRead | kProtWrite) && tables.sync(s) && translate(tables.root(), 0x800000, &flags) != 0);      // (its memory stayed)
+  // Discarded pages read as zeros and lose their entry.
+  flush = false;
+  CHECK(s.discard(0x800000, 0x1000) && s.page_memory(0x800000) == nullptr && tables.sync(s, false, &flush) && flush && translate(tables.root(), 0x800000, &flags) == 0);
+  uint8_t back = 1;
+  CHECK(s.read(0x800000, ByteView(&back, 1)) && back == 0 && s.write_privileged(0x800000, ConstByteView(&mark, 1)) && tables.sync(s));
   CHECK(translate(tables.root(), k + 5, &flags) == k + 5);      // the kernel pages survive a rebuild
   // The heap moving to bigger memory is noticed.
-  CHECK(s.map(0x900000, 0x1000, kProtRead | kProtWrite) && tables.sync(s));
+  CHECK(s.map(0x900000, 0x1000, kProtRead | kProtWrite) && s.write_privileged(0x900000, ConstByteView(&mark, 1)) && tables.sync(s));
   const uint64_t before = translate(tables.root(), 0x900000, &flags);
-  CHECK(s.resize(0x900000, 0x10000) && tables.sync(s));
-  CHECK(translate(tables.root(), 0x900000, &flags) != 0 && translate(tables.root(), 0x90F000, &flags) != 0 && before != 0);
+  CHECK(s.resize(0x900000, 0x10000) && s.write_privileged(0x90F000, ConstByteView(&mark, 1)) && tables.sync(s));
+  CHECK(translate(tables.root(), 0x900000, &flags) == before && translate(tables.root(), 0x90F000, &flags) != 0 && before != 0);
+  CHECK(s.resize(0x900000, 0x1000) && tables.sync(s) && translate(tables.root(), 0x90F000, &flags) == 0 && s.page_memory(0x90F000) == nullptr);
+  // A huge reservation costs neither memory nor table entries.
+  CHECK(s.map(0x100000000ull, 64ull << 30, 0) && s.protect(0x100000000ull, 64ull << 30, kProtRead | kProtWrite) && tables.sync(s));
+  CHECK(translate(tables.root(), 0x100000000ull, &flags) == 0 && s.resident_bytes() < (1u << 20));
+  const uint64_t far = 0x100000000ull + (32ull << 30);
+  CHECK(s.write_privileged(far, ConstByteView(&mark, 1)) && tables.sync(s) && translate(tables.root(), far, &flags) == 0);      // (the kernel's write gives memory, not an entry)
+  CHECK(tables.update(s, far, far + 4096, &flush) && translate(tables.root(), far, &flags) == reinterpret_cast<uint64_t>(s.page_memory(far)));
+  CHECK(s.unmap(0x100000000ull, 64ull << 30) && tables.sync(s) && translate(tables.root(), 0x100000000ull + (32ull << 30), &flags) == 0);
 
   // Without NX the bit is never set.
   UserPageTables plain(A, false);
@@ -881,6 +938,7 @@ int main() {
   test_windows_memory();
   test_user_program();
   test_deferred_free();
+  test_private_copies_of_shared_pages();
   test_user_page_tables();
   test_linux_thread_pointer_and_startup_calls();
   test_windows_startup();

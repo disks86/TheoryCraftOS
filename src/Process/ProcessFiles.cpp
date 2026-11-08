@@ -323,6 +323,7 @@ uint32_t ProcessFiles::inherit_from(const ProcessFiles& parent, void (*copy_toke
     slots_[slot].object = s.object;
     slots_[slot].token = s.token;
     slots_[slot].inherit = true;
+    slots_[slot].denied = s.denied;      // (the child's handle has the rights the parent's has: a read-only section stays read-only)
     if (copy_token && s.token != 0) copy_token(s.kind, s.token);
     ++copied;
   }
@@ -339,6 +340,7 @@ bool ProcessFiles::adopt_from(const ProcessFiles& parent, uint64_t slot, void (*
   slots_[slot].close_on_exec = false;
   slots_[slot].inherit = s.inherit;
   slots_[slot].protect = s.protect;
+  slots_[slot].denied = s.denied;
   if (copy_token && s.token != 0) copy_token(s.kind, s.token);
   return true;
 }

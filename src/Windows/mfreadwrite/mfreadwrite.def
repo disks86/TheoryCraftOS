@@ -1,0 +1,8 @@
+LIBRARY mfreadwrite.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+MFCreateSinkWriterFromMediaSink @3
+MFCreateSinkWriterFromURL @4
+MFCreateSourceReaderFromByteStream @5
+MFCreateSourceReaderFromMediaSource @6
+MFCreateSourceReaderFromURL @7

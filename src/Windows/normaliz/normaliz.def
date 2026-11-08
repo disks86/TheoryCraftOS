@@ -1,0 +1,8 @@
+LIBRARY normaliz.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+IdnToAscii @1
+IdnToNameprepUnicode @2
+IdnToUnicode @3
+IsNormalizedString @4
+NormalizeString @5

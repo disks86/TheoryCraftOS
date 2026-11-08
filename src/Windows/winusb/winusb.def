@@ -1,0 +1,37 @@
+LIBRARY winusb.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+WinUsb_AbortPipe @1
+WinUsb_AbortPipeAsync @2
+WinUsb_ControlTransfer @3
+WinUsb_FlushPipe @4
+WinUsb_Free @5
+WinUsb_GetAdjustedFrameNumber @6
+WinUsb_GetAssociatedInterface @7
+WinUsb_GetCurrentAlternateSetting @8
+WinUsb_GetCurrentFrameNumber @9
+WinUsb_GetDescriptor @11
+WinUsb_GetOverlappedResult @12
+WinUsb_GetPipePolicy @13
+WinUsb_GetPowerPolicy @14
+WinUsb_Initialize @15
+WinUsb_ParseConfigurationDescriptor @16
+WinUsb_ParseDescriptors @17
+WinUsb_QueryDeviceInformation @18
+WinUsb_QueryInterfaceSettings @19
+WinUsb_QueryPipe @20
+WinUsb_QueryPipeEx @21
+WinUsb_ReadIsochPipe @22
+WinUsb_ReadIsochPipeAsap @23
+WinUsb_ReadPipe @24
+WinUsb_RegisterIsochBuffer @25
+WinUsb_ResetPipe @26
+WinUsb_ResetPipeAsync @27
+WinUsb_SetCurrentAlternateSetting @28
+WinUsb_SetCurrentAlternateSettingAsync @29
+WinUsb_SetPipePolicy @30
+WinUsb_SetPowerPolicy @31
+WinUsb_UnregisterIsochBuffer @34
+WinUsb_WriteIsochPipe @35
+WinUsb_WriteIsochPipeAsap @36
+WinUsb_WritePipe @37

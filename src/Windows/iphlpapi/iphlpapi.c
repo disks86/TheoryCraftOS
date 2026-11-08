@@ -23,7 +23,7 @@
  * whose size does not depend on the flags that only leave parts out; GetAdaptersInfo lists the Ethernet adapters. The interface LUID / GUID / index conversions follow the
  * same numbering, and so do the MIB tables of the interfaces (GetIfTable, GetIfEntry(2), GetIpAddrTable, GetAdapterIndex, GetBestInterface). Not done: IPv6 in anything but
  * GetAdaptersAddresses, the MAC address (the kernel does not report it: PhysicalAddressLength is 0), the routing / neighbour / connection tables (they answer
- * ERROR_NOT_SUPPORTED) and notifications (still stubs). Built freestanding over kernel32.dll and ntdll.dll. */
+ * ERROR_NOT_SUPPORTED) and notifications (NotifyAddrChange stays pending for good). Built freestanding over kernel32.dll and ntdll.dll. */
 #include <winsock2.h>
 #include <ws2ipdef.h>
 #include <windows.h>
@@ -627,6 +627,132 @@ NOT_SUPPORTED_TABLE(GetAnycastIpAddressTable, ADDRESS_FAMILY family, PMIB_ANYCAS
 NOT_SUPPORTED_TABLE(GetMulticastIpAddressTable, ADDRESS_FAMILY family, PMIB_MULTICASTIPADDRESS_TABLE *table) { (void)family; if (table) *table = NULL; return ERROR_NOT_SUPPORTED; }
 NOT_SUPPORTED_TABLE(GetIfStackTable, PMIB_IFSTACK_TABLE *table) { if (table) *table = NULL; return ERROR_NOT_SUPPORTED; }
 NOT_SUPPORTED_TABLE(GetInvertedIfStackTable, PMIB_INVERTEDIFSTACK_TABLE *table) { if (table) *table = NULL; return ERROR_NOT_SUPPORTED; }
+
+/* ---- interface names, the interface list, address-change notifications ---------------------------------------------------------------------------------------- */
+
+/* The name of an interface's LUID: "<type>_<NetLuidIndex>" as on Windows ("loopback_1", "ethernet_2"). */
+static ULONG luid_name(const NET_LUID *luid, char *out, SIZE_T room) {
+  const char *type = luid->Info.IfType == IF_TYPE_LOOPBACK_ ? "loopback" : luid->Info.IfType == IF_TYPE_ETHERNET_ ? "ethernet" : NULL;
+  if (!type) return ERROR_INVALID_PARAMETER;
+  char digits[12];
+  SIZE_T d = 0;
+  ULONG v = (ULONG)luid->Info.NetLuidIndex;
+  do { digits[d++] = (char)('0' + v % 10); v /= 10; } while (v && d < sizeof digits);
+  SIZE_T o = 0;
+  for (; *type; ++type) { if (o + 1 >= room) return ERROR_NOT_ENOUGH_MEMORY; out[o++] = *type; }
+  if (o + 1 >= room) return ERROR_NOT_ENOUGH_MEMORY;
+  out[o++] = '_';
+  while (d) { if (o + 1 >= room) return ERROR_NOT_ENOUGH_MEMORY; out[o++] = digits[--d]; }
+  out[o] = 0;
+  return NO_ERROR;
+}
+static BOOL known_luid(const NET_LUID *luid) {
+  Adapter list[MAX_ADAPTERS];
+  const ULONG count = list_adapters(list);
+  for (ULONG i = 0; i < count; ++i) {
+    NET_LUID l;
+    luid_of(&list[i], &l);
+    if (l.Value == luid->Value) return TRUE;
+  }
+  return FALSE;
+}
+EXPORT DWORD WINAPI ConvertInterfaceLuidToNameA(const NET_LUID *luid, PSTR name, SIZE_T length) {
+  if (!luid || !name || !length) return ERROR_INVALID_PARAMETER;
+  name[0] = 0;
+  if (!known_luid(luid)) return ERROR_INVALID_PARAMETER;
+  return luid_name(luid, name, length);
+}
+EXPORT DWORD WINAPI ConvertInterfaceLuidToNameW(const NET_LUID *luid, PWSTR name, SIZE_T length) {
+  if (!luid || !name || !length) return ERROR_INVALID_PARAMETER;
+  name[0] = 0;
+  char narrow[64];
+  if (!known_luid(luid)) return ERROR_INVALID_PARAMETER;
+  const ULONG r = luid_name(luid, narrow, sizeof narrow);
+  if (r) return r;
+  SIZE_T n = 0;
+  while (narrow[n]) ++n;
+  if (n + 1 > length) return ERROR_NOT_ENOUGH_MEMORY;
+  for (SIZE_T i = 0; i <= n; ++i) name[i] = (WCHAR)(BYTE)narrow[i];
+  return NO_ERROR;
+}
+/* if_indextoname: the name into a buffer of IF_NAMESIZE (256) characters, or NULL for an index that is no interface. */
+EXPORT PCHAR WINAPI if_indextoname(NET_IFINDEX index, PCHAR name) {
+  if (!name) return NULL;
+  Adapter list[MAX_ADAPTERS];
+  const Adapter *a = find_by_index(list, list_adapters(list), index);
+  if (!a) return NULL;
+  NET_LUID luid;
+  luid_of(a, &luid);
+  return luid_name(&luid, name, 256) == NO_ERROR ? name : NULL;
+}
+EXPORT NET_IFINDEX WINAPI if_nametoindex(PCSTR name) {
+  if (!name) return 0;
+  Adapter list[MAX_ADAPTERS];
+  const ULONG count = list_adapters(list);
+  for (ULONG i = 0; i < count; ++i) {
+    NET_LUID luid;
+    char candidate[64];
+    luid_of(&list[i], &luid);
+    if (luid_name(&luid, candidate, sizeof candidate) != NO_ERROR) continue;
+    SIZE_T k = 0;
+    while (candidate[k] && (name[k] >= 'A' && name[k] <= 'Z' ? name[k] + 32 : name[k]) == candidate[k]) ++k;
+    if (!candidate[k] && !name[k]) return list[i].index;
+  }
+  return 0;
+}
+
+/* GetInterfaceInfo: the adapters that are not the loopback, by index and device name. */
+EXPORT DWORD WINAPI GetInterfaceInfo(PIP_INTERFACE_INFO info, PULONG size) {
+  if (!size) return ERROR_INVALID_PARAMETER;
+  Adapter list[MAX_ADAPTERS];
+  const ULONG count = list_adapters(list);
+  ULONG rows = 0;
+  for (ULONG i = 0; i < count; ++i) if (list[i].type != IF_TYPE_LOOPBACK_) ++rows;
+  if (rows == 0) return ERROR_NO_DATA;
+  const ULONG need = (ULONG)(FIELD_OFFSET(IP_INTERFACE_INFO, Adapter) + rows * sizeof(IP_ADAPTER_INDEX_MAP));
+  if (!info || *size < need) { *size = need; return ERROR_INSUFFICIENT_BUFFER; }
+  zero(info, need);
+  info->NumAdapters = (LONG)rows;
+  ULONG r = 0;
+  for (ULONG i = 0; i < count; ++i) {
+    if (list[i].type == IF_TYPE_LOOPBACK_) continue;
+    info->Adapter[r].Index = list[i].index;
+    device_name(&list[i], info->Adapter[r].Name, MAX_ADAPTER_NAME);
+    ++r;
+  }
+  *size = need;
+  return NO_ERROR;
+}
+
+/* The addresses are set by the kernel's network stack (DHCP there): a program cannot release or renew them. */
+EXPORT DWORD WINAPI IpReleaseAddress(PIP_ADAPTER_INDEX_MAP adapter) { (void)adapter; return ERROR_NOT_SUPPORTED; }
+EXPORT DWORD WINAPI IpRenewAddress(PIP_ADAPTER_INDEX_MAP adapter) { (void)adapter; return ERROR_NOT_SUPPORTED; }
+
+/* NotifyAddrChange: there are no change notifications yet, so an overlapped request stays pending for good (its event is never set; CancelIPChangeNotify drops it).
+ * The handle given back is one event of this library, shared by the requests. The blocking form (no OVERLAPPED) would wait for ever: it answers ERROR_NOT_SUPPORTED. */
+static HANDLE g_notify_handle;
+EXPORT DWORD WINAPI NotifyAddrChange(PHANDLE handle, LPOVERLAPPED overlapped) {
+  if (!overlapped) {
+    if (handle) *handle = NULL;
+    return ERROR_NOT_SUPPORTED;
+  }
+  if (!handle) return ERROR_INVALID_PARAMETER;
+  if (!g_notify_handle) {
+    HANDLE h = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!h) return GetLastError();
+    if (InterlockedCompareExchangePointer(&g_notify_handle, h, NULL) != NULL) CloseHandle(h);
+  }
+  *handle = g_notify_handle;
+  overlapped->Internal = (ULONG_PTR)0x103;      /* STATUS_PENDING */
+  overlapped->InternalHigh = 0;
+  return ERROR_IO_PENDING;
+}
+EXPORT BOOL WINAPI CancelIPChangeNotify(LPOVERLAPPED overlapped) { return overlapped != NULL; }
+
+/* No function here gives out MIB tables that are allocated (the *2 tables answer ERROR_NOT_SUPPORTED with NULL); a table from the process heap is freed. */
+EXPORT VOID WINAPI FreeMibTable(PVOID memory) {
+  if (memory) HeapFree(GetProcessHeap(), 0, memory);
+}
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module; (void)reason; (void)reserved;

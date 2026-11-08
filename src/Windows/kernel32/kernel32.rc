@@ -1,0 +1,47 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/* The version of kernel32.dll: the one of Windows 10 22H2, which the system reports itself to be (RtlGetVersion: 10.0.19045). Programs read the version of the
+ * operating system from this file too (Chromium's base::win::OSInfo does, and stops when the file has none). */
+1 VERSIONINFO
+FILEVERSION 10,0,19041,5794
+PRODUCTVERSION 10,0,19041,5794
+FILEFLAGSMASK 0x3F
+FILEFLAGS 0
+FILEOS 0x40004
+FILETYPE 2
+FILESUBTYPE 0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Microsoft Corporation"
+      VALUE "FileDescription", "Windows NT BASE API Client DLL"
+      VALUE "FileVersion", "10.0.19041.5794 (WinBuild.160101.0800)"
+      VALUE "InternalName", "kernel32"
+      VALUE "OriginalFilename", "kernel32"
+      VALUE "ProductName", "Microsoft Windows Operating System"
+      VALUE "ProductVersion", "10.0.19041.5794"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

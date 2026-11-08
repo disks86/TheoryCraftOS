@@ -301,8 +301,10 @@ class ObjectManager {
     uint32_t limit_flags = 0, active_limit = 0, priority_class = 0, scheduling_class = 0, ui_flags = 0;
     uint32_t total_processes = 0, active_processes = 0, terminated_processes = 0;
   };
-  uint32_t job_assign(uint32_t job, uint64_t pid);                  // NTSTATUS: 0, access denied (already in a job), quota exceeded
-  uint32_t job_of_process(uint64_t pid);                            // the job object's id, 0 if none
+  // A process may be in several jobs (nested, as since Windows 8: a job assigned to a process already in one is inside it); limits, kills and events of each apply.
+  uint32_t job_assign(uint32_t job, uint64_t pid);                  // NTSTATUS: 0, access denied (already in this job), quota exceeded
+  uint32_t job_of_process(uint64_t pid);                            // the job object's id (the innermost: the one it joined last), 0 if none
+  bool job_contains(uint32_t job, uint64_t pid);                    // whether the process is in that job (at any depth)
   // A process starts another: the child joins the parent's job unless it breaks away (`breakaway`: asked to; allowed only if the job says so). NTSTATUS.
   uint32_t job_inherit(uint64_t parent, uint64_t child, bool breakaway);
   void job_forget(uint64_t pid);                                    // the process is not a member any more (it ended, or it could not be started)
@@ -445,11 +447,12 @@ class ObjectManager {
   void write_section_locked(Section& s);
   Section* section_of_owner(const SharedMemory* owner);      // (locked)
   void free_section_locked(Object& o);
-  struct JobMember { uint64_t pid = 0; uint32_t kill = 0, code = 0, gone = 0; };      // (gone: the process has ended; it is still said to be in the job)
+  struct JobMember { uint64_t pid = 0; uint32_t kill = 0, code = 0, gone = 0; uint64_t joined = 0; };      // (gone: the process has ended; it is still said to be in the job. joined: when, in assignment order)
   struct JobEvent { uint32_t message = 0; uint64_t pid = 0; };
   struct Job {
     bool used = false;
     uint32_t object = 0;
+    uint32_t parent = 0;      // the job object it nested under (its first process was in that job already), 0 if none: whoever joins this one joins that one too
     JobInfo info;
     JobMember members[kJobMaxMembers];
     bool port_set = false;      // a completion port is associated: the events below wait to be taken
@@ -460,6 +463,7 @@ class ObjectManager {
     uint32_t event_head = 0, event_count = 0;
   };
   void job_event_locked(Job& j, uint32_t message, uint64_t pid);
+  bool job_add_locked(Job& j, uint64_t pid);      // a new member (it is not in the job); false when the job is full
   void free_job_locked(Object& o);
   void job_forget_locked(uint64_t pid);
   Job* job_of(uint32_t id);      // (locked)
@@ -534,6 +538,7 @@ class ObjectManager {
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)
+  uint64_t job_joins_ = 0;           // counts assignments to jobs (JobMember::joined)
   Watch* watches_ = nullptr;         // kMaxWatches, made with the first change notification
   Mailslot* mailslots_ = nullptr;    // kMaxMailslots, made with the first mailslot
 };

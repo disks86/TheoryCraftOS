@@ -704,3 +704,33 @@ GDI module (`docs/win32k/Gdi.md`), the design of Wine's gdi32. Its list of stubs
 - Tests: Wine's gdi32 tests (`scripts/winetest.sh gdi32`). They still fail in many places; most of the failures are in the kernel's GDI module (palettes, system colours, DDB details,
   fonts), some in the stubs: `AddFontResource`, `GetGlyphOutline`, printing and the like are not in the kernel module yet. `SelectPalette` / `RealizePalette` need `NtUserSelectPalette` /
   `NtUserRealizePalette`, which the kernel does not have; a DIB section on a file mapping is refused by the kernel.
+
+## Chromium
+
+The Windows build of Chromium (a snapshot from commondatastorage.googleapis.com/chromium-browser-snapshots/Win_x64, `--no-sandbox`) starts: its browser window opens
+on the desktop and it starts its GPU, network, storage and renderer processes. Not working yet: the network and storage processes never get their IPC channel's
+"connected" signal and end after 15 seconds, so pages do not load and the window's content stays empty.
+
+What it took, in the order Chromium ran into it:
+
+- **Memory** (src/Process/AddressSpace, PageMap, UserPageTables): Chromium reserves tens of gigabytes. Private pages get memory on first touch (the page fault gives it),
+  reservations cost nothing, and the page tables are changed in place for the ranges that changed, with a TLB shootdown only when an entry a core may hold went away or
+  lost a permission. Section views and reservations begin on 64 KiB (Chromium unmaps a view by the aligned address below it).
+- **Images** (src/Process/ImageCache): a DLL's pages are shared by every process that maps it at the same base, relocated ones too (chrome.dll, 349 MiB, is one copy
+  for all its processes); pages that are written get private copies.
+- **Loader**: DLLs next to the program are found (chrome_elf.dll), images up to 1 GiB, 512 modules, PEB.LoaderLock is a real critical section, modules know their folder.
+- **Ordinals**: chrome.dll imports bind, connect, recv, SysAllocString and more by number. `scripts/sync-ordinals.py <folder of Windows DLLs>` gives every export of
+  our DLLs the ordinal Windows gives it (src/Windows/<dll>/<dll>.def).
+- **Synchronisation**: kernel32's SRW locks, condition variables and critical sections block in the kernel instead of yielding in a loop; ntdll's wait-on-address is
+  hashed. SRW locks prefer waiting writers.
+- **Processes**: UpdateProcThreadAttribute takes the mitigation policy and the other documented attributes; nested jobs; inherited handles keep their rights; a
+  section handle is not given rights its source lacks (Chromium's read-only shared memory check); another process's times and memory can be queried.
+- **Build**: the Windows DLLs are compiled with `-fno-strict-aliasing` (GCC had turned RtlVerifyVersionInfo into a constant failure, so programs believed they ran on
+  Windows XP).
+- **AVX**: user programs may use AVX and AVX-512; the kernel saves those registers with each thread.
+
+Trying it: `scripts/run-chromium.sh <chrome-win folder> --no-sandbox --disable-gpu --enable-logging '--log-file=C:/chrome.log'` boots QEMU with Chromium on a disk of
+its own (build/chromium.img) and starts it (`TCOS_AUTORUN`). The debug console (build/chromium.log) shows the faults the kernel delivers (module and offset, return
+addresses), every failed CreateProcess, and every 20 seconds what each thread of each program waits in. `build/tools/primary_image build/chromium.img
+get:/Windows/chrome.log=chrome.log` copies Chromium's own log out. `CHROMIUM_GDB=1234` starts QEMU's gdb stub (hardware breakpoints on user addresses work).
+`scripts/check-imports.py <pe files>` lists imports our DLLs lack or only stub.

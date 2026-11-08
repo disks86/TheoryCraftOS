@@ -1,0 +1,25 @@
+LIBRARY tbs.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+Tbsi_Create_Attestation_From_Log @1
+Tbsi_Get_TCG_Logs @2
+GetDeviceID @3
+GetDeviceIDString @4
+GetDeviceIDWithTimeout @5
+Tbsi_Context_Create @6
+Tbsi_Create_Windows_Key @7
+Tbsi_FilterLog @8
+Tbsi_GetDeviceInfo @9
+Tbsi_Get_OwnerAuth @10
+Tbsi_Get_TCG_Log @11
+Tbsi_Get_TCG_Log_Ex @12
+Tbsi_Is_Tpm_Present @13
+Tbsi_Physical_Presence_Command @14
+Tbsi_Revoke_Attestation @15
+Tbsi_ShaHash @16
+Tbsip_Cancel_Commands @18
+Tbsip_Context_Close @19
+Tbsip_Submit_Command @20
+Tbsip_Submit_Command_NonBlocking @21
+Tbsip_TestInterruptInformation @22
+Tbsip_TestMorBit @23

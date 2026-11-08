@@ -530,6 +530,15 @@ EXPORT BOOL WINAPI UpdateProcThreadAttribute(ProcThreadAttributeList *list, DWOR
     case 0x00030003: if (size != sizeof(GROUP_AFFINITY)) { set_error(24); return FALSE; } break;      /* GROUP_AFFINITY */
     case 0x00030005: if (size != 4) { set_error(24); return FALSE; } break;      /* IDEAL_PROCESSOR (a PROCESSOR_NUMBER) */
     case 0x00020016: if (size != sizeof(HANDLE)) { set_error(24); return FALSE; } break;      /* PSEUDOCONSOLE */
+    case 0x0002000D: if (size == 0 || size % sizeof(HANDLE)) { set_error(24); return FALSE; } break;      /* JOB_LIST: the child is put in these jobs */
+    /* Accepted and kept, not enforced: the mitigation policies (one to three DWORD64s), the AppContainer's capabilities, the protection level, the child process,
+       application package, desktop app and component policies, the win32k filter, the preferred NUMA node, the machine type and the optional XSTATE features. */
+    case 0x00020007: if (size != 8 && size != 16 && size != 24) { set_error(24); return FALSE; } break;      /* MITIGATION_POLICY */
+    case 0x00020009: if (size != 2 * sizeof(PVOID) + 8) { set_error(24); return FALSE; } break;      /* SECURITY_CAPABILITIES */
+    case 0x0002000B: case 0x0002000E: case 0x0002000F: case 0x00020012: case 0x0002001A: if (size != 4) { set_error(24); return FALSE; } break;
+    case 0x00020010: if (size != 8 && size != 16) { set_error(24); return FALSE; } break;      /* WIN32K_FILTER */
+    case 0x00030004: case 0x00020019: if (size != 2) { set_error(24); return FALSE; } break;      /* PREFERRED_NODE, MACHINE_TYPE */
+    case 0x0003001B: if (size != 8) { set_error(24); return FALSE; } break;      /* ENABLE_OPTIONAL_XSTATE_FEATURES */
     default: set_error(ERROR_NOT_SUPPORTED); return FALSE;
   }
   const DWORD bit = 1u << (attribute & 0xFFFF);

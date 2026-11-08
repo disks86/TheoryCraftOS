@@ -1281,6 +1281,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SystemGuestServices guest(pci, shared_allocator, st);
   guest.initialize();
   if (guest.entropy()) Entry(Level::Ok, "Guest").text("virtio-rng: host entropy available");
+  desktop::set_system_entropy(guest.entropy());      // (what programs' random bytes come from on a CPU without RDRAND)
   if (guest.balloon()) Entry(Level::Ok, "Guest").text("virtio-balloon: ").dec(guest.balloon()->target_pages() / 256).text(" MiB requested by the host");
   if (guest.virtualbox()) Entry(Level::Ok, "Guest").text("VirtualBox guest device: pointer integration, display requests, balloon, heartbeat");
   if (hardware::PvPanic::present()) Entry(Level::Ok, "Guest").text("pvpanic: crashes are reported to the host");
@@ -2057,6 +2058,51 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     struct WindowsBridgeGuard { desktop::Desktop& d; ~WindowsBridgeGuard() { d.set_windows_session(nullptr); } } windows_bridge_guard{desktop};      // (the desktop lets go first)
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);
+#ifdef TCOS_AUTORUN
+    // The program the build names (TCOS_AUTORUN), started on a thread of its own a few seconds after the desktop came up; its output goes to the debug console.
+    struct AutoRun {
+      allocators::IAllocator* allocator;
+      filesystem::IFileSystem* files;
+      static void main(void* argument) {
+        AutoRun& a = *static_cast<AutoRun*>(argument);
+        kernel::sleep_ms(3000);
+        StringView arguments[32];
+        uint32_t count = 0;
+        StringView rest(TCOS_AUTORUN_ARGUMENTS);
+        while (!rest.empty() && count < 32) {      // (the build separates them with 0x1F)
+          const uint64_t end = rest.find('\x1f');
+          arguments[count++] = end == StringView::npos ? rest : rest.first(end);
+          rest = end == StringView::npos ? StringView() : rest.without_prefix(end + 1);
+        }
+        desktop::ProgramRun run;
+        run.allocator = a.allocator;
+        run.files = a.files;
+        run.path = TCOS_AUTORUN;
+        const uint64_t slash = run.path.rfind('/');
+        run.working_directory = slash == StringView::npos ? StringView("/") : run.path.first(slash);
+        run.arguments = ArrayView<const StringView>(arguments, count);
+        run.kind = exe::ExecutableKind::Pe;
+        run.output = [](void*, StringView text) { console::puts(text); };
+        console::puts("autorun: starting " TCOS_AUTORUN "\n");
+        uint32_t code = 0;
+        String message(*a.allocator);
+        // Every 20 seconds while it runs, what each of its threads is doing goes to the debug console (kernel::usermode::report).
+        static volatile bool running = true;
+        kernel::detach(kernel::spawn([](void*) { for (uint32_t s = 0; running; ++s) { kernel::sleep_ms(1000); if (running && s % 20 == 19) kernel::usermode::report(); } }, nullptr, "autorun-report"));
+        const desktop::RunResult result = desktop::run_program(run, &code, &message);
+        running = false;
+        console::puts("autorun: ended, result ");
+        console::put_dec(static_cast<int64_t>(result));
+        console::puts(", exit code ");
+        console::put_hex(code);
+        console::puts(" ");
+        console::puts(message.view());
+        console::puts("\n");
+      }
+    };
+    static AutoRun autorun{&shared_allocator, &explorer_files.file_system()};
+    kernel::detach(kernel::spawn(&AutoRun::main, &autorun, "autorun"));
+#endif
     explorer_files.set_notifier(on_storage_change, &desktop);
     EjectContext eject_context{&explorer_files, {}};
     desktop.explorer().set_eject_handler(on_eject, &eject_context);
@@ -2563,6 +2609,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   i2c_hid.stop(input.mice());
   input.mice().remove(&pen_mouse);
   input.shutdown();
+  desktop::set_system_entropy(nullptr);
   guest.shutdown();
   hyperv.shutdown();
   for (uint32_t i = 0; i < storage.count(); ++i) {

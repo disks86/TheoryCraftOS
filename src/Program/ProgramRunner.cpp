@@ -38,7 +38,7 @@ namespace desktop {
 
 namespace {
 
-constexpr uint64_t kMaxProgramBytes = 128ull << 20;
+constexpr uint64_t kMaxProgramBytes = 1ull << 30;
 constexpr uint32_t kMaxArguments = 16;
 
 bool fail(String* message, StringView text) {
@@ -200,6 +200,7 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
 #endif
   program.set_file_system(run.files);
   process::FileLibraryProvider libraries(allocator, run.files);      // every DLL, ntdll.dll and kernel32.dll included, comes from C:\Windows\System32
+  if (const uint64_t slash = run.path.rfind('/'); slash != StringView::npos && slash > 0) libraries.add_directory(run.path.first(slash));      // ... after the program's own folder
   if (abi == process::SyscallAbi::Windows) program.set_library_provider(&libraries);
   String directory(allocator);
   if (process::world_directory(abi, run.working_directory, &directory)) program.set_working_directory(directory.view());

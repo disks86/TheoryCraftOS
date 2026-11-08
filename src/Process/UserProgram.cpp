@@ -47,6 +47,7 @@ class SingleFileProvider final : public ILibraryProvider {
     if (canonical_name.equals(name_)) { *image = file_; return true; }
     return fallback_ && fallback_->find(canonical_name, image);
   }
+  bool directory_of(StringView canonical_name, String* windows_directory) override { return !canonical_name.equals(name_) && fallback_ && fallback_->directory_of(canonical_name, windows_directory); }
 
  private:
   StringView name_;
@@ -308,23 +309,23 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     input.defer_ldr = defer_loading_ && modules;
     input.current_directory = working_directory_.empty() ? StringView("/") : working_directory_.view();
     // The module lists for PEB.Ldr: the program, then the libraries in load order; the initialization order as indexes.
-    WindowsModule listed[64];
-    uint32_t init_order[64];
-    uint32_t listed_count = 0, init_count = 0;
+    List<WindowsModule> listed(allocator_);
+    List<uint32_t> init_order(allocator_);
     if (modules) {
-      for (uint64_t i = 0; i < modules->count() && listed_count < 64; ++i) {
+      for (uint64_t i = 0; i < modules->count(); ++i) {
         const Module& m = modules->at(i);
         WindowsModule entry{m.main ? program_file : m.name.view(), m.base, m.size, m.entry, m.main, true};
+        entry.directory = m.directory.view();
         (m.main ? &pe : m.pe)->directory(9, &entry.tls_rva, &entry.tls_size);      // IMAGE_DIRECTORY_ENTRY_TLS (the program's headers are the caller's)
-        listed[listed_count++] = entry;
+        if (!listed.push_back(entry)) return LoadStatus::OutOfMemory;
       }
-      for (uint64_t i = 0; i < modules->init_count() && init_count < 64; ++i) {
-        for (uint32_t j = 0; j < listed_count; ++j) {
-          if (&modules->at(j) == &modules->init_at(i)) init_order[init_count++] = j;
+      for (uint64_t i = 0; i < modules->init_count(); ++i) {
+        for (uint32_t j = 0; j < listed.count(); ++j) {
+          if (&modules->at(j) == &modules->init_at(i) && !init_order.push_back(j)) return LoadStatus::OutOfMemory;
         }
       }
-      input.modules = ArrayView<const WindowsModule>(listed, listed_count);
-      input.init_order = ArrayView<const uint32_t>(init_order, init_count);
+      input.modules = listed.view();
+      input.init_order = init_order.view();
     }
     WindowsStartup startup;
     status = build_windows_startup(space_, pe, image, input, &startup);

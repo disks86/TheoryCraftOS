@@ -32,7 +32,7 @@ namespace {
 constexpr uint32_t kSuccess = 0, kNotImplemented = 0xC0000002u, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du,
                    kNoMemory = 0xC0000017u, kObjectNameNotFound = 0xC0000034u, kInvalidImageFormat = 0xC000007Bu, kNoResources = 0xC000009Au,
                    kNameTooLong = 0xC0000106u;
-constexpr uint64_t kMaxImageBytes = 64ull << 20, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
+constexpr uint64_t kMaxImageBytes = 1ull << 30, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
 constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8, kExplicitStdHandles = 0x10, kPseudoConsole = 0x20, kHasParent = 0x40, kHasHandleList = 0x80, kFreshConsole = 0x100, kDetachedProcess = 0x200;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
@@ -195,7 +195,36 @@ uint32_t resume_process_handle(Process& p, uint64_t handle, uint32_t* previous, 
   return kSuccess;
 }
 
+static uint32_t create_user_process(Process& p, const SyscallRequest& r);
+static uint32_t g_create_failure_line;      // (which check refused a call that answered STATUS_INVALID_PARAMETER, for the log)
+static uint64_t g_create_failure_value;     // (and what it looked at: a handle of the list, with its kind and whether it is inheritable)
+// (a program that cannot start its children is hard to follow: the reason goes to the system log)
 uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
+  const uint32_t status = create_user_process(p, r);
+  if (status != kSuccess) {
+    char text[96] = "CreateProcess failed: status 0x";
+    uint32_t n = 31;
+    for (int shift = 28; shift >= 0; shift -= 4) text[n++] = "0123456789ABCDEF"[(status >> shift) & 15];
+    if (status == kInvalidParameter) {
+      const char* at = " (WindowsProcess.cpp:";
+      while (*at) text[n++] = *at++;
+      char digits[8];
+      uint32_t d = 0;
+      for (uint32_t v = g_create_failure_line; d == 0 || v; v /= 10) digits[d++] = char('0' + v % 10);
+      while (d) text[n++] = digits[--d];
+      text[n++] = ')';
+      if (g_create_failure_value) {
+        text[n++] = ' ';
+        for (int shift = 44; shift >= 0; shift -= 4) text[n++] = "0123456789ABCDEF"[(g_create_failure_value >> shift) & 15];
+        g_create_failure_value = 0;
+      }
+    }
+    process_log(StringView(text, n));
+  }
+  return status;
+}
+
+static uint32_t create_user_process(Process& p, const SyscallRequest& r) {
   uint64_t cwd_at = 0, environment_at = 0, flags_arg = 0, pid_out = 0, tid_out = 0;
   uint64_t std_handles[3] = {}, startup_at = 0;
   if (!argument(p, r, 4, &cwd_at) || !argument(p, r, 5, &environment_at) || !argument(p, r, 6, &flags_arg) || !argument(p, r, 7, &pid_out) || !argument(p, r, 8, &tid_out) ||
@@ -204,7 +233,7 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
   IProcessRuntime* runtime = p.runtime();
   if (!objects || !runtime || !p.files().attached()) return kNotImplemented;
-  if (r.args[0] == 0 || r.args[1] == 0) return kInvalidParameter;
+  if (r.args[0] == 0 || r.args[1] == 0) return (g_create_failure_line = __LINE__, kInvalidParameter);
   allocators::IAllocator& allocator = p.files().allocator();
   String image_path(allocator), command_line(allocator), directory(allocator), environment(allocator), world_directory(allocator);
   uint32_t status = read_text(p, r.args[2], &image_path);
@@ -213,7 +242,7 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   uint32_t entry_count = 0;
   if (status == kSuccess) status = read_environment(p, environment_at, &environment, &entry_count);
   if (status != kSuccess) return status;
-  if (image_path.empty()) return kInvalidParameter;
+  if (image_path.empty()) return (g_create_failure_line = __LINE__, kInvalidParameter);
   if (directory.empty() ? !world_directory.assign(p.files().cwd()) : p.files().resolve(directory.view(), &world_directory) != PathResult::Ok) return kObjectNameNotFound;
   ByteBuffer image(allocator);
   if (!read_program_file(p, image_path.view(), &image, &status)) return status;
@@ -270,12 +299,15 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
     }
   }
   if (flags_arg & kHasHandleList) {      // PROC_THREAD_ATTRIBUTE_HANDLE_LIST: the child inherits those handles only
-    if (!spec.inherit_handles || list_count == 0 || list_count > ChildSpec::kMaxInheritList) return kInvalidParameter;
+    if (!spec.inherit_handles || list_count == 0 || list_count > ChildSpec::kMaxInheritList) return (g_create_failure_line = __LINE__, kInvalidParameter);
     spec.restrict_inherit = true;
     for (uint32_t i = 0; i < list_count; ++i) {
       uint64_t handle = 0, slot = 0;
       if (!p.read_user_u64(list_at + 8 * uint64_t{i}, &handle)) return kAccessViolation;
-      if (!slot_of(handle, &slot) || p.files().kind(slot) == DescriptorKind::Closed || (parent_pid == p.id() && !p.files().inheritable(slot))) return kInvalidParameter;
+      if (!slot_of(handle, &slot) || p.files().kind(slot) == DescriptorKind::Closed || (parent_pid == p.id() && !p.files().inheritable(slot))) {
+        g_create_failure_value = handle | (uint64_t(slot_of(handle, &slot) ? uint32_t(p.files().kind(slot)) : 0xFFu) << 32) | (uint64_t(slot_of(handle, &slot) && p.files().inheritable(slot)) << 40);
+        return (g_create_failure_line = __LINE__, kInvalidParameter);
+      }
       spec.inherit_list[spec.inherit_list_count++] = slot;
     }
   }
@@ -291,8 +323,12 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
       const bool known = slot_of(value, &slot) && p.files().kind(slot) != DescriptorKind::Closed;
       const DescriptorKind kind = known ? p.files().kind(slot) : DescriptorKind::Closed;
       const bool console = kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError;
+      // (a console handle the parent names in its PROC_THREAD_ATTRIBUTE_HANDLE_LIST is a handle like any other, as since Windows 8: a window program keeps it, and writing to it
+      // reaches the parent's console. Chromium hands its children its standard error this way, and their C runtime fails on a write to a standard handle that is not there.)
+      bool listed = false;
+      for (uint32_t k = 0; k < spec.inherit_list_count && known; ++k) listed |= spec.inherit_list[k] == slot;
       if (use_startup) {
-        if (!inherit || (window_program && console)) value = 0;
+        if (!inherit || (window_program && console && !listed)) value = 0;
       } else if (detached) {
         value = 0;
       } else if (!inherit) {
@@ -494,13 +530,15 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   uint64_t remote_peb = 0;
   uint32_t remote_priority = 0x20;      // NORMAL_PRIORITY_CLASS
   uint8_t remote_image[64] = {};
-  if (!self && p.runtime() && (info_class == 0 || info_class == 37 || info_class == 18)) {      // (another program's PEB and image are not ours to look into: it tells)
-    IProcessRuntime::RemoteOp op;
-    op.kind = IProcessRuntime::RemoteOp::ProcessInfo;
-    if (p.runtime()->remote_operation(child_pid, op) == kSuccess) {
-      remote_peb = op.address;
-      remote_priority = op.protect;
-      for (uint32_t i = 0; i < 64; ++i) remote_image[i] = op.image[i];
+  IProcessRuntime::RemoteOp remote;
+  remote.kind = IProcessRuntime::RemoteOp::ProcessInfo;
+  bool remote_known = false;
+  if (!self && p.runtime() && (info_class == 0 || info_class == 37 || info_class == 18 || info_class == 2 || info_class == 3 || info_class == 4)) {      // (another program's PEB and image are not ours to look into: it tells)
+    if (p.runtime()->remote_operation(child_pid, remote) == kSuccess) {
+      remote_known = true;
+      remote_peb = remote.address;
+      remote_priority = remote.protect;
+      for (uint32_t i = 0; i < 64; ++i) remote_image[i] = remote.image[i];
     }
   }
   Buffer b;
@@ -526,6 +564,21 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   } else if (info_class == 26 || info_class == 24) {      // ProcessWow64Information: not a 32-bit process; ProcessSessionInformation: session 1 (the one in the PEB)
     if (info_class == 24) b.put(0, 1, 4);
     size = info_class == 24 ? 4 : 8;
+  } else if (!self && (info_class == 2 || info_class == 3 || info_class == 4)) {      // another program's I/O counters (none counted), memory and times
+    if (info_class == 3) {
+      b.put(0, remote.mapped_bytes, 8);
+      b.put(8, remote.mapped_bytes, 8);
+      const uint32_t used_at[5] = {24, 32, 72, 80, 88};      // the working set and page file figures: what it uses
+      for (uint32_t at : used_at) b.put(at, remote.resident_bytes, 8);
+      size = length >= 96 ? 96 : 88;
+    } else if (info_class == 4) {
+      b.put(0, remote_known ? remote.create_time : 0, 8);
+      if (child_exited) b.put(8, remote_known ? remote.create_time : 0, 8);      // ExitTime (an ended program's is not kept: its start)
+      b.put(24, remote.cpu_time, 8);
+      size = 32;
+    } else {
+      size = 48;
+    }
   } else if (!self) {
     return kInvalidInfoClass;
   } else {
@@ -533,13 +586,14 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
       case 2: size = 48; break;      // IO_COUNTERS (nothing is counted)
       case 3: {      // VM_COUNTERS_EX
         const uint64_t mapped = p.address_space() ? p.address_space()->mapped_bytes() : 0;
+        const uint64_t used = p.address_space() ? p.address_space()->resident_bytes() : 0;      // (pages that were never touched take no memory)
         b.put(0, mapped, 8);         // PeakVirtualSize
         b.put(8, mapped, 8);         // VirtualSize
-        b.put(24, mapped, 8);        // PeakWorkingSetSize
-        b.put(32, mapped, 8);        // WorkingSetSize
-        b.put(72, mapped, 8);        // PagefileUsage
-        b.put(80, mapped, 8);        // PeakPagefileUsage
-        b.put(88, mapped, 8);        // PrivateUsage
+        b.put(24, used, 8);          // PeakWorkingSetSize
+        b.put(32, used, 8);          // WorkingSetSize
+        b.put(72, used, 8);          // PagefileUsage
+        b.put(80, used, 8);          // PeakPagefileUsage
+        b.put(88, used, 8);          // PrivateUsage
         size = length >= 96 ? 96 : 88;
         break;
       }

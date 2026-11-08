@@ -1812,17 +1812,67 @@ API size_t_ wcrtomb(char *out, wchar_t c, void *state) { (void)state; if (!out) 
 API size_t_ mbrtowc(wchar_t *out, const char *s, size_t_ n, void *state) { (void)state; if (!s) return 0; if (!n) return (size_t_)-2; int r = mbtowc(out, s, n); return r < 0 ? (size_t_)-1 : (size_t_)r; }
 API unsigned btowc(int c) { return c >= 0 && c < 128 ? (unsigned)c : (unsigned)-1; }
 API int wctob(unsigned c) { return c < 128 ? (int)c : EOF; }
-API long wcstol(const wchar_t *s, wchar_t **end, int base) {
-  char tmp[80];
-  int i = 0;
-  while (s[i] && i < 79 && s[i] < 128) { tmp[i] = (char)s[i]; ++i; }
+/* The wide forms of the integer conversions: the leading run of ASCII characters is converted by the narrow one (the digits, signs and blanks they accept are all ASCII). */
+static size_t_ narrow_number(const wchar_t *s, char *tmp, size_t_ room) {
+  size_t_ i = 0;
+  while (s[i] && i + 1 < room && s[i] < 128) { tmp[i] = (char)s[i]; ++i; }
   tmp[i] = 0;
+  return i;
+}
+API long long wcstoll(const wchar_t *s, wchar_t **end, int base) {
+  char tmp[128];
+  narrow_number(s, tmp, sizeof tmp);
   char *e;
-  long v = strtol(tmp, &e, base);
+  const long long v = strtoll(tmp, &e, base);
   if (end) *end = (wchar_t *)s + (e - tmp);
   return v;
 }
-API unsigned long wcstoul(const wchar_t *s, wchar_t **end, int base) { return (unsigned long)wcstol(s, end, base); }
+API unsigned long long wcstoull(const wchar_t *s, wchar_t **end, int base) {
+  char tmp[128];
+  narrow_number(s, tmp, sizeof tmp);
+  char *e;
+  const unsigned long long v = strtoull(tmp, &e, base);
+  if (end) *end = (wchar_t *)s + (e - tmp);
+  return v;
+}
+API long wcstol(const wchar_t *s, wchar_t **end, int base) {
+  char tmp[128];
+  narrow_number(s, tmp, sizeof tmp);
+  char *e;
+  const long v = strtol(tmp, &e, base);
+  if (end) *end = (wchar_t *)s + (e - tmp);
+  return v;
+}
+API unsigned long wcstoul(const wchar_t *s, wchar_t **end, int base) {
+  char tmp[128];
+  narrow_number(s, tmp, sizeof tmp);
+  char *e;
+  const unsigned long v = strtoul(tmp, &e, base);
+  if (end) *end = (wchar_t *)s + (e - tmp);
+  return v;
+}
+API long long _wcstoi64(const wchar_t *s, wchar_t **end, int base) { return wcstoll(s, end, base); }
+API unsigned long long _wcstoui64(const wchar_t *s, wchar_t **end, int base) { return wcstoull(s, end, base); }
+/* (the locale does not change how integers are read) */
+API long _wcstol_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstol(s, end, base); }
+API unsigned long _wcstoul_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoul(s, end, base); }
+API long long _wcstoll_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoll(s, end, base); }
+API unsigned long long _wcstoull_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoull(s, end, base); }
+API long long _wcstoi64_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoll(s, end, base); }
+API unsigned long long _wcstoui64_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoull(s, end, base); }
+/* The UCRT's "_o_" names of the same functions. */
+API long _o_wcstol(const wchar_t *s, wchar_t **end, int base) { return wcstol(s, end, base); }
+API unsigned long _o_wcstoul(const wchar_t *s, wchar_t **end, int base) { return wcstoul(s, end, base); }
+API long long _o_wcstoll(const wchar_t *s, wchar_t **end, int base) { return wcstoll(s, end, base); }
+API unsigned long long _o_wcstoull(const wchar_t *s, wchar_t **end, int base) { return wcstoull(s, end, base); }
+API long long _o__wcstoi64(const wchar_t *s, wchar_t **end, int base) { return wcstoll(s, end, base); }
+API unsigned long long _o__wcstoui64(const wchar_t *s, wchar_t **end, int base) { return wcstoull(s, end, base); }
+API long _o__wcstol_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstol(s, end, base); }
+API unsigned long _o__wcstoul_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoul(s, end, base); }
+API long long _o__wcstoll_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoll(s, end, base); }
+API unsigned long long _o__wcstoull_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoull(s, end, base); }
+API long long _o__wcstoi64_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoll(s, end, base); }
+API unsigned long long _o__wcstoui64_l(const wchar_t *s, wchar_t **end, int base, void *locale) { (void)locale; return wcstoull(s, end, base); }
 API int _wtoi(const wchar_t *s) { return (int)wcstol(s, NULL, 10); }
 API long _wtol(const wchar_t *s) { return wcstol(s, NULL, 10); }
 API double wcstod(const wchar_t *s, wchar_t **end) {

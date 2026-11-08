@@ -64,6 +64,13 @@ void describe_pe_image(const exe::PeFile& pe, uint64_t file_size, uint8_t (&out)
 // The mapping step of load_pe() at an address of the caller's choosing, for DLLs too (an entry point is then optional unless `require_entry`). Does not apply
 // relocations or bind imports (see ModuleLoader.hpp). The headers and sections are mapped at base + their RVAs.
 LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out);
+// Where map_pe_image() puts each section that has a size: its RVA and span, its permissions, and the bytes of the file copied to its start (`copy` bytes from `source`;
+// the rest is zero). False if a section lies outside the image or the file, or there are more than `capacity`.
+struct PeSectionPlacement {
+  uint64_t rva = 0, span = 0, source = 0, copy = 0;
+  uint8_t protection = 0;
+};
+bool place_pe_sections(const exe::PeFile& pe, ConstByteView file, uint64_t image_pages, PeSectionPlacement* out, uint32_t capacity, uint32_t* count);
 
 constexpr uint64_t kDefaultStackBytes = 8ull << 20;
 // Maps a read-write stack of `size` bytes just under the top of the user space, with an unmapped guard page above it. `*top` is the first address

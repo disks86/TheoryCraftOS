@@ -704,6 +704,8 @@ add_executable(BOOTX64
   src/Process/Syscall.cpp
   src/Process/Process.cpp
   src/Process/AddressSpace.cpp
+  src/Process/PageMap.cpp
+  src/Process/ImageCache.cpp
   src/Process/ImageLoader.cpp
   src/Process/UserProgram.cpp
   src/Process/UserPageTables.cpp
@@ -1110,7 +1112,9 @@ endif()
 # library, as a real one would be.
 if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_DIR ${CMAKE_BINARY_DIR}/windows)
-  set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector
+  # (-fno-strict-aliasing: the Windows interfaces pass one structure as another all the time, an OSVERSIONINFOEXW as an OSVERSIONINFOW say, which is what their compiler
+  # allows; with strict aliasing GCC took a read of such a field for an uninitialised one and compiled RtlVerifyVersionInfo down to a constant failure.)
+  set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector -fno-strict-aliasing
       -fasynchronous-unwind-tables -nostdlib -shared -Wl,--entry=DllMain)
   file(GLOB WINDOWS_HEADERS ${CMAKE_SOURCE_DIR}/src/Windows/*.h)
   set(WINDOWS_STUBS_C ${CMAKE_SOURCE_DIR}/src/Windows/stubs/stubs.c)
@@ -1127,10 +1131,13 @@ if(TCOS_ARCH STREQUAL "x86_64")
     DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/security.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/security.h ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/token.c ${CMAKE_SOURCE_DIR}/src/Windows/ntsec.h ${CMAKE_SOURCE_DIR}/src/Windows/tcos_token.h ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/heap.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/ntdll.inc ${WINDOWS_STUBS_C} ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/services.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/zw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/libc.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtl3.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/atom.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ps.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/sec.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/status.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/casetab.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/normalize.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/uilang.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/locale_names.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/unidata.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/reg.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/sync.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/threadpool.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/etw.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtlx1.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtlx2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/rtlx3.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntwrap.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ldr2.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/fls.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/actctx.inc
     COMMENT "Building ntdll.dll")
   windows_stub_flags(kernel32_stubs kernel32 0)
+  # (kernel32.rc: its version resource, which programs read the version of Windows from)
+  string(REGEX REPLACE "gcc$" "windres" WINDOWS_WINDRES ${CMAKE_C_COMPILER})
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
+    COMMAND ${WINDOWS_WINDRES} -O coff -o ${WINDOWS_DIR}/kernel32_rc.o ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.rc
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} ${kernel32_stubs} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
-            ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/comm.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/profile.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/appmodel.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra4.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
+            ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/kernel32_rc.o ${WINDOWS_DIR}/libntdll.a
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.rc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/volume.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra3.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/console.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/legacy.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/fmtmsg.inc ${CMAKE_SOURCE_DIR}/src/Windows/fmtengine.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/time.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/comm.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/profile.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/appmodel.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/memory.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/actctx.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/codepage_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/ctype_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/idn.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/nls2.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/geo_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/locale_data.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/rsrcupdate.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/extra4.inc ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS} ${CMAKE_SOURCE_DIR}/src/Windows/stubs/kernel32.inc ${WINDOWS_STUBS_C}
     COMMENT "Building kernel32.dll")
   windows_stub_flags(msvcrt_stubs msvcrt 0)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
@@ -1157,7 +1164,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_STUB_LIBRARIES user32 gdi32 shell32 ole32 oleaut32 comctl32 comdlg32 rpcrt4 shlwapi winmm version imm32 secur32 crypt32 bcrypt ncrypt userenv setupapi iphlpapi
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
       vulkan-1 avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
-      activeds normaliz sensapi authz rasapi32)
+      activeds normaliz sensapi authz rasapi32
+      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
   add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1176,6 +1184,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_imm32 win32u)      # (the services of win32k: input contexts, hot keys)
   set(WINDOWS_IMPORTS_user32 win32u gdi32)      # (the window manager of win32k: classes, windows, messages)
   set(WINDOWS_IMPORTS_vulkan-1 gdi32 user32)      # (the D3DKMT services of the kernel-mode Direct3D layer, the window size)
+  set(WINDOWS_IMPORTS_crypt32 advapi32 bcrypt)      # (DPAPI: the per-user key in the registry, AES and HMAC of bcrypt)
+  set(WINDOWS_IMPORTS_secur32 advapi32)      # (GetUserNameExW: the user name of the token)
   set(WINDOWS_STUB_RESULT_vulkan-1 0xFFFFFFF8u)   # (VK_ERROR_FEATURE_NOT_PRESENT for the exports that are not implemented)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     if(DEFINED WINDOWS_STUB_RESULT_${_library})
@@ -1196,17 +1206,18 @@ if(TCOS_ARCH STREQUAL "x86_64")
         list(APPEND _own_sources ${WINDOWS_DIR}/advapi32.dll)
         list(APPEND _own_depends ${WINDOWS_DIR}/advapi32.dll)
       endif()
-      # <dll>.def: forwarders to other libraries (and exports that the C code cannot spell).
-      set(_own_def ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.def)
-      if(EXISTS ${_own_def})
-        list(APPEND _own_sources ${_own_def})
-        list(APPEND _own_depends ${_own_def})
-      endif()
       # Libraries this one imports besides kernel32.dll (a list in WINDOWS_IMPORTS_<dll>).
       foreach(_import ${WINDOWS_IMPORTS_${_library}})
         list(APPEND _own_sources ${WINDOWS_DIR}/${_import}.dll)
         list(APPEND _own_depends ${WINDOWS_DIR}/${_import}.dll)
       endforeach()
+    endif()
+    # <dll>.def: forwarders to other libraries, exports that the C code cannot spell, and the ordinals Windows gives the exports (scripts/sync-ordinals.py: a program may
+    # import by number). A library that is only stubs may have one too.
+    set(_own_def ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/${_library}.def)
+    if(EXISTS ${_own_def})
+      list(APPEND _own_sources ${_own_def})
+      list(APPEND _own_depends ${_own_def})
     endif()
     add_custom_command(OUTPUT ${WINDOWS_DIR}/${_library}.dll
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1274,6 +1285,14 @@ endif()
 option(TCOS_AMD_VEGAM "Bring up the Radeon RX Vega M (Kaby Lake-G): memory controller and GART, interrupt ring, microcode through the SMC, graphics engine with compute queues, SDMA, and the display surface (not yet run on a real card)" OFF)
 if(TCOS_AMD_VEGAM)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_VEGAM)
+endif()
+# A program on the primary disk to start once the desktop is up (an OS path such as "/Windows/Program Files/Chromium/chrome.exe"), with its arguments (a ;-separated list):
+# what it prints goes to the debug console. For trying a big program in QEMU without driving the desktop (see scripts/run-program.sh).
+set(TCOS_AUTORUN "" CACHE STRING "A program on the primary disk to start when the desktop is up")
+set(TCOS_AUTORUN_ARGUMENTS "" CACHE STRING "Its arguments (;-separated)")
+if(TCOS_AUTORUN)
+  string(REPLACE ";" "\\x1f" _autorun_arguments "${TCOS_AUTORUN_ARGUMENTS}")
+  target_compile_definitions(BOOTX64 PRIVATE "TCOS_AUTORUN=\"${TCOS_AUTORUN}\"" "TCOS_AUTORUN_ARGUMENTS=\"${_autorun_arguments}\"")
 endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)

@@ -1,0 +1,13 @@
+LIBRARY bcryptprimitives.dll
+EXPORTS
+; The ordinals Windows gives these exports (scripts/sync-ordinals.py)
+GetAsymmetricEncryptionInterface @1
+GetCipherInterface @2
+GetHashInterface @3
+GetKeyDerivationInterface @4
+GetRngInterface @6
+GetSecretAgreementInterface @7
+GetSignatureInterface @8
+MSCryptConvertRsaPrivateBlobToFullRsaBlob @9
+ProcessPrng @10
+ProcessPrngGuid @11

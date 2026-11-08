@@ -404,15 +404,21 @@ EXPORT NTSTATUS NTAPI RtlVerifyVersionInfo(const RTL_OSVERSIONINFOEXW *info, ULO
  * something may take again). The libraries are told in load order when something starts and in the opposite order when it ends; the program's callbacks come first and last. */
 typedef void (NTAPI *TlsCallback)(PVOID, DWORD, PVOID);
 #define LDRP_DONT_CALL_FOR_THREADS 0x00040000u
-static volatile ULONG_PTR g_loader_owner;
-static volatile LONG g_loader_depth;
-static void loader_lock(void) {
-  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
-  if (g_loader_owner == me) { ++g_loader_depth; return; }
-  while (!__sync_bool_compare_and_swap(&g_loader_owner, 0, me)) NtYieldExecution();
-  g_loader_depth = 1;
+/* The loader lock is a critical section that PEB.LoaderLock (offset 0x110) points at, as on Windows: programs look at its OwningThread to tell whether they run under it. */
+EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
+EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs);
+static RTL_CRITICAL_SECTION g_loader_section = {NULL, -1, 0, NULL, NULL, 0};
+static void loader_publish(void) {
+  PRTL_CRITICAL_SECTION *slot = (PRTL_CRITICAL_SECTION *)((BYTE *)NtCurrentPeb() + 0x110);
+  if (*slot != &g_loader_section) *slot = &g_loader_section;
 }
-static void loader_unlock(void) { if (--g_loader_depth == 0) __sync_lock_release(&g_loader_owner); }
+static void loader_lock(void) {
+  loader_publish();
+  RtlEnterCriticalSection(&g_loader_section);
+}
+static void loader_unlock(void) { RtlLeaveCriticalSection(&g_loader_section); }
+#define g_loader_owner ((ULONG_PTR)g_loader_section.OwningThread)
+#define g_loader_depth (g_loader_section.RecursionCount)
 
 /* LdrLockLoaderLock(flags, &disposition, &cookie): flag 1 raises on error, flag 2 only tries. Disposition 1: taken, 2: someone else holds it (try only). The cookie is
  * what LdrUnlockLoaderLock wants back (it is the owner: a different thread may not release the lock). */
@@ -987,16 +993,24 @@ EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionEx(PRTL_CRITICAL_SECTION cs, U
 }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION cs) { return RtlInitializeCriticalSectionEx(cs, 0, 0); }
 EXPORT NTSTATUS NTAPI RtlInitializeCriticalSectionAndSpinCount(PRTL_CRITICAL_SECTION cs, ULONG spin) { return RtlInitializeCriticalSectionEx(cs, spin, 0); }
-/* LockCount is -1 while the section is free and -2 while a thread holds it (the recursion depth is the RecursionCount; a thread waiting adds 4 to its distance from -1). A thread that finds it taken gives its time slice away until the owner
- * has let go. */
+/* LockCount is -1 while the section is free and -2 while a thread holds it (the recursion depth is the RecursionCount; a thread waiting adds 4 to its distance from -1). A thread that finds it taken spins a
+ * little (the section's spin count) and then sleeps on the LockCount word (RtlWaitOnAddress) until the owner lets go and wakes one waiter. */
+EXPORT NTSTATUS NTAPI RtlWaitOnAddress(volatile VOID *address, PVOID compare, SIZE_T size, PLARGE_INTEGER timeout);
+EXPORT VOID NTAPI RtlWakeAddressSingle(PVOID address);
 EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs) {
   const HANDLE me = (HANDLE)TEB_CLIENT_THREAD(NtCurrentTeb());
   if (cs->OwningThread == me && cs->RecursionCount > 0) {      /* (only the owner can see itself here) */
     ++cs->RecursionCount;
     return STATUS_SUCCESS;
   }
-  while (!__sync_bool_compare_and_swap(&cs->LockCount, -1, -2)) {
+  for (ULONG spins = 0; !__sync_bool_compare_and_swap(&cs->LockCount, -1, -2);) {
     if (g_process_ending) { g_cs_taken_over = 1; cs->LockCount = -2; break; }      /* (the other threads are gone: a section one of them held is taken over rather than waited for) */
+    if (!cs->LockSemaphore) {
+      if (spins < (cs->SpinCount < 4000 ? cs->SpinCount : 4000) + 64) { ++spins; __asm__ volatile("pause"); continue; }
+      LONG seen = cs->LockCount;
+      if (seen != -1) RtlWaitOnAddress(&cs->LockCount, &seen, sizeof(seen), NULL);      /* (back at once if it changed meanwhile) */
+      continue;
+    }
     if (cs->LockSemaphore) {      /* a section somebody gave a semaphore: the wait is on it, and a handle that is not one is an error that cannot be carried on from */
       LARGE_INTEGER none = { 0 };
       __sync_sub_and_fetch(&cs->LockCount, 4);
@@ -1028,6 +1042,7 @@ EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs) {
   if (--cs->RecursionCount > 0) return STATUS_SUCCESS;
   cs->OwningThread = NULL;
   __sync_lock_test_and_set(&cs->LockCount, -1);
+  RtlWakeAddressSingle(&cs->LockCount);      /* (costs nothing when nobody sleeps on it) */
   return STATUS_SUCCESS;
 }
 EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) {
@@ -1083,7 +1098,7 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
 
 typedef struct { ULONG64 base, size, entry; char name[40]; } LoadRecord;      /* what NtLoadModule and NtReleaseModule report */
 #define LDR_STATIC 0xFFFF
-#define MAX_LOAD_RECORDS 32
+#define MAX_LOAD_RECORDS 256      /* (a browser's main DLL brings some 50 libraries along; the records live on the heap: DllMain may load more while they are in use) */
 #define STATUS_DLL_NOT_FOUND ((NTSTATUS)0xC0000135)
 #define STATUS_DLL_INIT_FAILED ((NTSTATUS)0xC0000142)
 
@@ -1212,9 +1227,10 @@ static void ldr_forget(LDR_DATA_TABLE_ENTRY *e) {
 
 /* One use less of the library at `base`; what nobody uses any more is told about it (`detach`), taken out of the lists and unmapped. Loader lock held. */
 static void ldr_release(PVOID base, int detach) {
-  LoadRecord doomed[MAX_LOAD_RECORDS];
+  LoadRecord *doomed = RtlAllocateHeap(process_heap(), 0, sizeof(LoadRecord) * MAX_LOAD_RECORDS);
   ULONG count = 0;
-  if (!NT_SUCCESS(NtReleaseModule(base, doomed, MAX_LOAD_RECORDS, &count))) return;
+  if (!doomed) return;
+  if (!NT_SUCCESS(NtReleaseModule(base, doomed, MAX_LOAD_RECORDS, &count))) { RtlFreeHeap(process_heap(), 0, doomed); return; }
   for (ULONG i = 0; detach && i < count; ++i) {
     LDR_DATA_TABLE_ENTRY *e = ldr_find_base((PVOID)(ULONG_PTR)doomed[i].base);
     if (e) notify_module(e, DLL_PROCESS_DETACH, NULL);
@@ -1224,24 +1240,26 @@ static void ldr_release(PVOID base, int detach) {
     if (e) ldr_forget(e);
   }
   for (ULONG i = 0; i < count; ++i) NtUnloadModule((PVOID)(ULONG_PTR)doomed[i].base);
+  RtlFreeHeap(process_heap(), 0, doomed);
 }
 
 /* Loads the DLL file at `name` (a Win32 path; or just a library's name when it is loaded already) and what it imports; calls the entry points. */
 static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) {
   const int mapped_only = flags && (*flags & 2);      /* LDR_DONT_RESOLVE_REFS */
   const int redirected = flags && (*flags & 0x40000000);      /* (ours) a library of an activation context: its own copy, whatever else of that name is loaded */
-  LoadRecord records[MAX_LOAD_RECORDS];
+  LoadRecord *records = RtlAllocateHeap(process_heap(), 0, (sizeof(LoadRecord) + sizeof(LDR_DATA_TABLE_ENTRY *)) * MAX_LOAD_RECORDS);
+  if (!records) return STATUS_NO_MEMORY;
+  LDR_DATA_TABLE_ENTRY **added = (LDR_DATA_TABLE_ENTRY **)(records + MAX_LOAD_RECORDS);
   ULONG count = 0;
   PVOID base = NULL;
   loader_lock();
   NTSTATUS status = NtLoadModule(name, &base, records, MAX_LOAD_RECORDS, &count, (mapped_only ? 1 : 0) | (redirected ? 4 : 0));
-  if (!NT_SUCCESS(status)) { loader_unlock(); return status; }
-  if (count == 0) {      /* it was there: one more use (or a library the process started with) */
-    *handle = base;
+  if (!NT_SUCCESS(status) || count == 0) {      /* (count 0: it was there, one more use, or a library the process started with) */
+    if (NT_SUCCESS(status)) *handle = base;
     loader_unlock();
-    return STATUS_SUCCESS;
+    RtlFreeHeap(process_heap(), 0, records);
+    return status;
   }
-  LDR_DATA_TABLE_ENTRY *added[MAX_LOAD_RECORDS];
   ULONG listed = 0;
   for (; listed < count; ++listed) {
     added[listed] = ldr_add(&records[listed], records[listed].base == (ULONG64)(ULONG_PTR)base ? name : NULL, mapped_only, records[listed].base == (ULONG64)(ULONG_PTR)base && redirected ? 0x10000000u : 0);
@@ -1257,12 +1275,14 @@ static NTSTATUS ldr_load_one(PULONG flags, PUNICODE_STRING name, PVOID *handle) 
   if (listed == count && attached == count) {
     *handle = base;
     loader_unlock();
+    RtlFreeHeap(process_heap(), 0, records);
     return STATUS_SUCCESS;
   }
   /* it did not start: the libraries that did are told, then everything goes again */
   for (ULONG i = attached < listed ? attached + 1 : attached; i > 0; --i) notify_module(added[i - 1], DLL_PROCESS_DETACH, NULL);      /* (the one that refused is told as well) */
   ldr_release(base, 0);
   loader_unlock();
+  RtlFreeHeap(process_heap(), 0, records);
   return listed == count ? STATUS_DLL_INIT_FAILED : STATUS_NO_MEMORY;
 }
 

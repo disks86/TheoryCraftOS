@@ -19,25 +19,22 @@
 
 namespace process {
 
-bool AddressSpace::Region::allocate(uint64_t bytes) {
-  release();
-  void* memory = allocator_.allocate_aligned(bytes, kPageSize);
-  if (!memory) return false;
-  storage = static_cast<uint8_t*>(memory);
-  capacity = bytes;
-  ByteView(storage, bytes).fill(0);
-  return true;
+AddressSpace::~AddressSpace() {
+  retired_.deferred = false;
+  reclaim();
+  pages_.remove(0, PageMap::kTop, [&](uint8_t* page) { allocator_.deallocate(page); });
 }
 
 void AddressSpace::Region::release() {
   if (shared) {
     if (!retired_.deferred || !retired_.storages.push_back(RetiredPiece{nullptr, shared})) shared->release();      // (the mapping is let go of when no CPU can see it any more)
     shared = nullptr;
-  } else if (storage) {
-    if (!retired_.deferred || !retired_.storages.push_back(RetiredPiece{storage, nullptr})) allocator_.deallocate(storage);      // (kept for reclaim(), unless there is no room to remember it)
   }
   storage = nullptr;
-  capacity = 0;
+}
+
+void AddressSpace::retire(uint8_t* page) {
+  if (!retired_.deferred || !retired_.storages.push_back(RetiredPiece{page, nullptr})) allocator_.deallocate(page);      // (kept for reclaim(), unless there is no room to remember it)
 }
 
 void AddressSpace::reclaim() {
@@ -46,6 +43,41 @@ void AddressSpace::reclaim() {
     else allocator_.deallocate(piece.storage);
   }
   retired_.storages.clear();
+}
+
+void AddressSpace::drop_pages(uint64_t start, uint64_t end) {
+  pages_.remove(start, end, [&](uint8_t* page) { retire(page); });
+}
+
+void AddressSpace::note_change(uint64_t start, uint64_t end) {
+  if (start >= end) return;
+  for (uint32_t i = 0; i < change_count_; ++i) {
+    Change& c = changes_[i];
+    if (start <= c.end && end >= c.start) {      // touches one already noted: grows it
+      if (start < c.start) c.start = start;
+      if (end > c.end) c.end = end;
+      return;
+    }
+  }
+  if (change_count_ == kMaxChanges) {      // many scattered changes: one range that covers them all
+    for (uint32_t i = 1; i < change_count_; ++i) {
+      if (changes_[i].start < changes_[0].start) changes_[0].start = changes_[i].start;
+      if (changes_[i].end > changes_[0].end) changes_[0].end = changes_[i].end;
+    }
+    if (start < changes_[0].start) changes_[0].start = start;
+    if (end > changes_[0].end) changes_[0].end = end;
+    change_count_ = 1;
+    return;
+  }
+  changes_[change_count_++] = Change{start, end};
+}
+
+bool AddressSpace::take_change(uint64_t* start, uint64_t* end) {
+  if (change_count_ == 0) return false;
+  --change_count_;
+  *start = changes_[change_count_].start;
+  *end = changes_[change_count_].end;
+  return true;
 }
 
 bool AddressSpace::overlaps_reserved(uint64_t start, uint64_t end, uint64_t* reserved_end) const {
@@ -74,6 +106,15 @@ uint64_t AddressSpace::first_ending_after(uint64_t address) const {
   return low;
 }
 
+void AddressSpace::remove_region(uint64_t index) {
+  Region& r = *regions_[index];
+  mapped_bytes_ -= r.size;
+  if (r.shared) shared_bytes_ -= r.size;
+  else drop_pages(r.base, r.base + r.size);
+  note_change(r.base, r.base + r.size);
+  regions_.remove_at(index);
+}
+
 bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   uint64_t rounded = 0;
   if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded)) return false;
@@ -88,11 +129,11 @@ bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   region->size = rounded;
   region->protection = protection;
   region->allocation = next_allocation_;
-  if (!region->allocate(rounded)) return false;
   if (!regions_.insert(index, static_cast<UniquePointer<Region>&&>(region))) return false;
   mapped_bytes_ += rounded;
   ++next_allocation_;
   ++generation_;
+  note_change(address, address + rounded);
   return true;
 }
 
@@ -112,12 +153,13 @@ bool AddressSpace::map_shared(uint64_t address, uint64_t size, uint8_t protectio
   region->allocation = next_allocation_;
   if (!regions_.insert(index, static_cast<UniquePointer<Region>&&>(region))) return false;      // (the region has no memory yet: nothing to let go of)
   regions_[index]->storage = storage;
-  regions_[index]->capacity = rounded;
   regions_[index]->shared = owner;
   owner->retain();
+  shared_bytes_ += rounded;
   mapped_bytes_ += rounded;
   ++next_allocation_;
   ++generation_;
+  note_change(address, address + rounded);
   return true;
 }
 
@@ -148,6 +190,40 @@ bool AddressSpace::is_shared(uint64_t address) const {
   return i < regions_.count() && regions_[i]->base <= address && regions_[i]->shared != nullptr;
 }
 
+const uint8_t* AddressSpace::page_memory(uint64_t page) const {
+  const uint64_t i = first_ending_after(page);
+  if (i >= regions_.count() || regions_[i]->base > page) return nullptr;
+  const Region& r = *regions_[i];
+  return r.shared ? r.storage + (round_down(page) - r.base) : pages_.get(round_down(page));
+}
+
+uint8_t* AddressSpace::materialize(uint64_t page) {
+  page = round_down(page);
+  const uint64_t i = first_ending_after(page);
+  if (i >= regions_.count() || regions_[i]->base > page) return nullptr;
+  const Region& r = *regions_[i];
+  if (r.shared) return r.storage + (page - r.base);
+  if (uint8_t* have = pages_.get(page)) return have;
+  uint8_t* memory = static_cast<uint8_t*>(allocator_.allocate_aligned(kPageSize, kPageSize));
+  if (!memory) return nullptr;
+  ByteView(memory, kPageSize).fill(0);
+  if (!pages_.set(page, memory)) {
+    allocator_.deallocate(memory);
+    return nullptr;
+  }
+  return memory;
+}
+
+bool AddressSpace::discard(uint64_t address, uint64_t size) {
+  uint64_t end = 0;
+  if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
+  if (!pages_.any(address, end)) return true;
+  drop_pages(address, end);
+  note_change(address, end);
+  ++generation_;
+  return true;
+}
+
 bool AddressSpace::prepare_range(uint64_t address, uint64_t size, uint64_t* end) const {
   uint64_t rounded = 0;
   if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded) || address >= kUserTop || rounded > kUserTop - address) return false;
@@ -169,19 +245,34 @@ bool AddressSpace::split_at(uint64_t address) {
   tail->attributes = r.attributes;
   if (r.shared) {      // the tail maps the same memory further on
     tail->storage = r.storage + offset;
-    tail->capacity = tail->size;
     tail->shared = r.shared;
     r.shared->retain();
-  } else if (!tail->allocate(tail->size) || !ByteView(tail->storage, tail->size).copy_from(ConstByteView(r.storage + offset, tail->size))) {
-    return false;
   }
   if (!regions_.insert(i + 1, static_cast<UniquePointer<Region>&&>(tail))) {
     tail.reset();      // (releases the mapping the tail took)
     return false;
   }
-  r.size = offset;      // its memory stays (the tail pages are simply unused until it is released)
+  regions_[i]->size = offset;      // (the private pages stay where they are: they belong to addresses, not regions)
   ++generation_;
   return true;
+}
+
+bool AddressSpace::same_kind(const Region& a, const Region& b) const {
+  return a.base + a.size == b.base && !a.shared && !b.shared && a.protection == b.protection && a.allocation == b.allocation && a.attributes == b.attributes;
+}
+
+void AddressSpace::coalesce(uint64_t first, uint64_t last) {
+  if (regions_.count() < 2) return;
+  if (first > 0) --first;
+  if (last + 1 >= regions_.count()) last = regions_.count() - 1;
+  for (uint64_t i = first; i < last && i + 1 < regions_.count();) {
+    Region& a = *regions_[i];
+    const Region& b = *regions_[i + 1];
+    if (!same_kind(a, b)) { ++i; continue; }
+    a.size += b.size;
+    regions_.remove_at(i + 1);
+    --last;
+  }
 }
 
 bool AddressSpace::unmap(uint64_t address, uint64_t size) {
@@ -189,10 +280,7 @@ bool AddressSpace::unmap(uint64_t address, uint64_t size) {
   if (!prepare_range(address, size, &end)) return false;
   if (!split_at(address) || !split_at(end)) return false;
   const uint64_t first = first_ending_after(address);
-  while (first < regions_.count() && regions_[first]->base < end) {
-    mapped_bytes_ -= regions_[first]->size;
-    regions_.remove_at(first);
-  }
+  while (first < regions_.count() && regions_[first]->base < end) remove_region(first);
   ++generation_;
   return true;
 }
@@ -201,8 +289,19 @@ bool AddressSpace::protect(uint64_t address, uint64_t size, uint8_t protection) 
   uint64_t end = 0;
   if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
   if (!split_at(address) || !split_at(end)) return false;
-  for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) regions_[i]->protection = protection;
-  ++generation_;
+  const uint64_t first = first_ending_after(address);
+  uint64_t last = first;
+  bool changed = false;
+  for (uint64_t i = first; i < regions_.count() && regions_[i]->base < end; ++i) {
+    changed |= regions_[i]->protection != protection;
+    regions_[i]->protection = protection;
+    last = i;
+  }
+  if (changed) {
+    note_change(address, end);
+    ++generation_;
+  }
+  coalesce(first, last);
   return true;
 }
 
@@ -210,7 +309,13 @@ bool AddressSpace::set_attributes(uint64_t address, uint64_t size, const PageAtt
   uint64_t end = 0;
   if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
   if (!split_at(address) || !split_at(end)) return false;
-  for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) regions_[i]->attributes = attributes;
+  const uint64_t first = first_ending_after(address);
+  uint64_t last = first;
+  for (uint64_t i = first; i < regions_.count() && regions_[i]->base < end; ++i) {
+    regions_[i]->attributes = attributes;
+    last = i;
+  }
+  coalesce(first, last);
   ++generation_;
   return true;
 }
@@ -219,10 +324,14 @@ bool AddressSpace::set_page_protect(uint64_t address, uint64_t size, uint32_t pr
   uint64_t end = 0;
   if (!prepare_range(address, size, &end) || !check(address, end - address, 0)) return false;
   if (!split_at(address) || !split_at(end)) return false;
-  for (uint64_t i = first_ending_after(address); i < regions_.count() && regions_[i]->base < end; ++i) {
+  const uint64_t first = first_ending_after(address);
+  uint64_t last = first;
+  for (uint64_t i = first; i < regions_.count() && regions_[i]->base < end; ++i) {
     regions_[i]->attributes.protect = protect;
     regions_[i]->attributes.reserved = reserved;
+    last = i;
   }
+  coalesce(first, last);
   ++generation_;
   return true;
 }
@@ -236,23 +345,39 @@ bool AddressSpace::break_copy_on_write(uint64_t address, uint64_t size) {
     const uint32_t protect = regions_[i]->attributes.protect;
     if (protect != 0x08 && protect != 0x80) continue;
     if (!split_at(page) || !split_at(page + kPageSize)) return false;
+    if (!privatize(page)) return false;      // a shared page gets a copy for this address space alone (the mapping is let go of; its memory is not ours)
     i = first_ending_after(page);
-    Region& r = *regions_[i];
-    if (r.shared) {      // a copy of this page for this address space alone
-      uint8_t* copy = static_cast<uint8_t*>(allocator_.allocate_aligned(kPageSize, kPageSize));
-      if (!copy) return false;
-      if (!ByteView(copy, kPageSize).copy_from(ConstByteView(r.storage, kPageSize))) { allocator_.deallocate(copy); return false; }
-      r.release();      // (the mapping is let go of; its memory is not ours)
-      r.storage = copy;
-      r.capacity = kPageSize;
-    }
-    r.protection |= kProtWrite;
-    r.attributes.protect = protect == 0x08 ? 0x04 : 0x40;
-    r.attributes.copied = true;
+    Region& own = *regions_[i];
+    own.protection |= kProtWrite;
+    own.attributes.protect = protect == 0x08 ? 0x04 : 0x40;
+    own.attributes.copied = true;
+    note_change(page, page + kPageSize);
     any = true;
   }
   if (any) ++generation_;
   return any;
+}
+
+bool AddressSpace::keeps_private_copies(const Region& r) {
+  return r.shared && (r.attributes.type == PageAttributes::Image || r.attributes.protect == 0x08 || r.attributes.protect == 0x80);
+}
+
+bool AddressSpace::privatize(uint64_t page) {
+  uint64_t i = first_ending_after(page);
+  if (i >= regions_.count() || regions_[i]->base > page) return false;
+  if (!regions_[i]->shared) return true;
+  if (!split_at(page) || !split_at(page + kPageSize)) return false;
+  i = first_ending_after(page);
+  Region& r = *regions_[i];
+  uint8_t* copy = static_cast<uint8_t*>(allocator_.allocate_aligned(kPageSize, kPageSize));
+  if (!copy) return false;
+  if (!ByteView(copy, kPageSize).copy_from(ConstByteView(r.storage, kPageSize)) || !pages_.set(page, copy)) { allocator_.deallocate(copy); return false; }
+  shared_bytes_ -= kPageSize;
+  r.release();
+  r.attributes.copied = true;
+  note_change(page, page + kPageSize);
+  ++generation_;
+  return true;
 }
 
 bool AddressSpace::join_allocation(uint64_t address, uint64_t size, uint64_t with) {
@@ -270,9 +395,7 @@ bool AddressSpace::unmap_allocation(uint64_t address) {
   if (i >= regions_.count() || regions_[i]->base > address) return false;
   const uint64_t id = regions_[i]->allocation;
   for (uint64_t k = regions_.count(); k > 0; --k) {
-    if (regions_[k - 1]->allocation != id) continue;
-    mapped_bytes_ -= regions_[k - 1]->size;
-    regions_.remove_at(k - 1);
+    if (regions_[k - 1]->allocation == id) remove_region(k - 1);
   }
   ++generation_;
   return true;
@@ -301,8 +424,7 @@ bool AddressSpace::resize(uint64_t base, uint64_t size) {
   uint64_t rounded = 0;
   if (!round_up(size, &rounded)) return false;
   if (rounded == 0) {
-    mapped_bytes_ -= r.size;
-    regions_.remove_at(i);
+    remove_region(i);
     ++generation_;
     return true;
   }
@@ -311,22 +433,12 @@ bool AddressSpace::resize(uint64_t base, uint64_t size) {
     if (base >= kUserTop || rounded > kUserTop - base || extra > max_bytes_ || mapped_bytes_ > max_bytes_ - extra) return false;
     if (i + 1 < regions_.count() && regions_[i + 1]->base < base + rounded) return false;
     if (overlaps_reserved(base + r.size, base + rounded)) return false;
-    if (rounded > r.capacity) {
-      // Move to bigger page-aligned memory.
-      Region bigger(allocator_, retired_);
-      if (!bigger.allocate(rounded)) return false;
-      if (r.size) ByteView(bigger.storage, rounded).first(r.size).copy_from(ConstByteView(r.storage, r.size));
-      uint8_t* old = r.storage;
-      r.storage = bigger.storage;
-      r.capacity = bigger.capacity;
-      bigger.storage = old;      // `bigger` now owns (and frees) the old memory
-      bigger.capacity = 0;
-    } else {
-      ByteView(r.storage + r.size, extra).fill(0);      // pages that were cut off earlier come back zeroed
-    }
+    note_change(base + r.size, base + rounded);      // (the new pages have no memory: they are zero)
     mapped_bytes_ += extra;
-  } else {
+  } else if (rounded < r.size) {
     mapped_bytes_ -= r.size - rounded;
+    drop_pages(base + rounded, base + r.size);
+    note_change(base + rounded, base + r.size);
   }
   r.size = rounded;
   ++generation_;
@@ -402,7 +514,22 @@ bool AddressSpace::copy_out(uint64_t address, ByteView out) const {
     const uint64_t at = address + done;
     const uint64_t offset = at - r.base;
     const uint64_t n = out.size() - done < r.size - offset ? out.size() - done : r.size - offset;
-    if (!out.subview(done, n).copy_from(ConstByteView(r.storage + offset, n))) return false;
+    if (r.shared) {
+      if (!out.subview(done, n).copy_from(ConstByteView(r.storage + offset, n))) return false;
+      done += n;
+      continue;
+    }
+    for (uint64_t moved = 0; moved < n;) {      // page by page: a page without memory reads as zeros
+      const uint64_t page = round_down(at + moved), within = at + moved - page;
+      const uint64_t piece = n - moved < kPageSize - within ? n - moved : kPageSize - within;
+      const ByteView target = out.subview(done + moved, piece);
+      if (const uint8_t* memory = pages_.get(page)) {
+        if (!target.copy_from(ConstByteView(memory + within, piece))) return false;
+      } else {
+        target.fill(0);
+      }
+      moved += piece;
+    }
     done += n;
   }
   return true;
@@ -410,13 +537,34 @@ bool AddressSpace::copy_out(uint64_t address, ByteView out) const {
 
 bool AddressSpace::copy_in(uint64_t address, ConstByteView data) {
   uint64_t done = 0;
-  for (uint64_t i = first_ending_after(address); done < data.size(); ++i) {
-    if (i >= regions_.count()) return false;
-    Region& r = *regions_[i];
+  while (done < data.size()) {
     const uint64_t at = address + done;
-    const uint64_t offset = at - r.base;
-    const uint64_t n = data.size() - done < r.size - offset ? data.size() - done : r.size - offset;
-    if (!r.bytes().subview(offset, n).copy_from(data.subview(done, n))) return false;
+    const uint64_t i = first_ending_after(at);
+    if (i >= regions_.count() || regions_[i]->base > at) return false;
+    const uint64_t offset = at - regions_[i]->base;
+    const uint64_t n = data.size() - done < regions_[i]->size - offset ? data.size() - done : regions_[i]->size - offset;
+    if (regions_[i]->shared && keeps_private_copies(*regions_[i])) {      // the pages written get copies of their own first (the region is cut, so look again)
+      for (uint64_t page = round_down(at); page < at + n; page += kPageSize) if (!privatize(page)) return false;
+      continue;
+    }
+    if (regions_[i]->shared) {
+      if (!ByteView(regions_[i]->storage + offset, n).copy_from(data.subview(done, n))) return false;
+      done += n;
+      continue;
+    }
+    for (uint64_t moved = 0; moved < n;) {
+      const uint64_t page = round_down(at + moved), within = at + moved - page;
+      const uint64_t piece = n - moved < kPageSize - within ? n - moved : kPageSize - within;
+      const ConstByteView source = data.subview(done + moved, piece);
+      uint8_t* memory = pages_.get(page);
+      if (!memory) {
+        bool zero = true;      // writing zeros into a page that has no memory changes nothing
+        for (uint8_t b : source) if (b) { zero = false; break; }
+        if (!zero && !(memory = materialize(page))) return false;
+      }
+      if (memory && !ByteView(memory + within, piece).copy_from(source)) return false;
+      moved += piece;
+    }
     done += n;
   }
   return true;

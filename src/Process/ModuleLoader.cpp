@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/ModuleLoader.hpp"
+#include "Process/ImageCache.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace process {
@@ -24,7 +25,8 @@ namespace {
 
 constexpr uint64_t kPage = AddressSpace::kPageSize;
 constexpr uint64_t kDllHint = 0x00007FF800000000ull;      // where libraries are looked for room, from here upwards (a Windows-like place)
-constexpr uint32_t kMaxModules = 64;
+constexpr uint32_t kMaxModules = 512;
+constexpr uint64_t kMaxLibraryBytes = 1ull << 30;      // (a browser's main DLL is a third of that)
 constexpr uint32_t kMaxDepth = 16;
 constexpr uint64_t kStubSize = 8, kStubsPerPage = kPage / kStubSize, kMaxStubs = kStubsPerPage * 4;
 
@@ -49,6 +51,13 @@ bool canonical_library_name(StringView name, String* out) {
   for (char c : name) if (!out->push_back(lower(c))) return false;
   if (out->view().rfind('.') == StringView::npos && !out->append(".dll")) return false;
   const StringView text = out->view();
+  // The API sets of other libraries than kernel32 (checked first: the WinRT ones start with api-ms-win-core- too).
+  if (starts_with(text, "api-ms-win-core-winrt-")) return out->assign("combase.dll");
+  if (starts_with(text, "api-ms-win-power-")) return out->assign("powrprof.dll");
+  if (starts_with(text, "api-ms-win-shcore-")) return out->assign("shcore.dll");
+  // Libraries with other extensions than .dll: here they are DLLs like the others (the print spooler's winspool.drv is winspool.dll).
+  if (text.equals("winspool.drv")) return out->assign("winspool.dll");
+  if (text.equals("bthprops.cpl")) return out->assign("bthprops.dll");
   if (starts_with(text, "api-ms-win-core-") || starts_with(text, "api-ms-win-eventing-") || text.equals("kernelbase.dll")) return out->assign("kernel32.dll");
   if (starts_with(text, "api-ms-win-security-")) return out->assign("advapi32.dll");
   if (text.equals("wsock32.dll") || text.equals("winsock.dll")) return out->assign("ws2_32.dll");
@@ -62,13 +71,14 @@ bool canonical_library_name(StringView name, String* out) {
 }
 
 struct FileLibraryProvider::Entry {
-  Entry(allocators::IAllocator& allocator, StringView n) : name(allocator), bytes(allocator) { name.assign(n); }
+  Entry(allocators::IAllocator& allocator, StringView n) : name(allocator), directory(allocator), bytes(allocator) { name.assign(n); }
   String name;
+  String directory;      // the Windows folder it was read from, if not System32
   ByteBuffer bytes;
   Entry* next = nullptr;
 };
 
-FileLibraryProvider::FileLibraryProvider(allocators::IAllocator& allocator, filesystem::IFileSystem* files) : allocator_(allocator), files_(files) {}
+FileLibraryProvider::FileLibraryProvider(allocators::IAllocator& allocator, filesystem::IFileSystem* files) : allocator_(allocator), files_(files), directories_(allocator) {}
 
 FileLibraryProvider::~FileLibraryProvider() {
   while (entries_) {
@@ -79,7 +89,17 @@ FileLibraryProvider::~FileLibraryProvider() {
   }
 }
 
+bool FileLibraryProvider::add_directory(StringView directory) {
+  String copy(allocator_);
+  if (directory.empty() || !copy.assign(directory)) return false;
+  if (copy.view()[copy.size() - 1] != '/' && !copy.push_back('/')) return false;
+  kernel::ScopedMutex hold(lock_);
+  for (const String& have : directories_.view()) if (have.view().equals(copy.view())) return true;
+  return directories_.push_back(static_cast<String&&>(copy));
+}
+
 bool FileLibraryProvider::find(StringView canonical_name, ConstByteView* image) {
+  kernel::ScopedMutex hold(lock_);
   for (Entry* e = entries_; e; e = e->next) {
     if (e->name.view().equals(canonical_name)) {
       *image = e->bytes.view();
@@ -88,11 +108,32 @@ bool FileLibraryProvider::find(StringView canonical_name, ConstByteView* image) 
   }
   if (!files_ || canonical_name.contains('/') || canonical_name.contains('\\')) return false;      // a plain file name only
   String path(allocator_);
-  if (!path.assign("/Windows/Windows/System32/") || !path.append(canonical_name)) return false;
+  for (const String& directory : directories_.view()) {
+    if (path.assign(directory.view()) && path.append(canonical_name) && load(path.view(), canonical_name, image)) {
+      // The folder as the program sees it: the Windows world is the OS folder /Windows, drive C.
+      const StringView os = directory.view();
+      if (os.size() > 9 && os.first(9).equals("/Windows/") && entries_->directory.assign("C:\\")) {
+        for (char ch : os.without_prefix(9)) entries_->directory.push_back(ch == '/' ? '\\' : ch);
+      }
+      return true;
+    }
+  }
+  return path.assign("/Windows/Windows/System32/") && path.append(canonical_name) && load(path.view(), canonical_name, image);
+}
+
+bool FileLibraryProvider::directory_of(StringView canonical_name, String* windows_directory) {
+  kernel::ScopedMutex hold(lock_);
+  for (Entry* e = entries_; e; e = e->next) {
+    if (e->name.view().equals(canonical_name)) return !e->directory.empty() && windows_directory->assign(e->directory.view());
+  }
+  return false;
+}
+
+bool FileLibraryProvider::load(StringView path, StringView canonical_name, ConstByteView* image) {
   UniquePointer<filesystem::IFile> file;
-  if (files_->open_file(path.view(), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return false;
+  if (files_->open_file(path, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return false;
   const uint64_t size = file->size();
-  if (size == 0 || size > (64ull << 20)) return false;
+  if (size == 0 || size > kMaxLibraryBytes) return false;
   void* memory = allocator_.allocate(sizeof(Entry));
   if (!memory) return false;
   Entry* entry = new (memory) Entry(allocator_, canonical_name);
@@ -100,7 +141,7 @@ bool FileLibraryProvider::find(StringView canonical_name, ConstByteView* image) 
   ByteView bytes = entry->bytes.writable_view();
   for (uint64_t done = 0; done < size;) {
     uint64_t got = 0;
-    if (file->read(done, bytes.subview(done, size - done < (1u << 20) ? size - done : (1u << 20)), &got) != filesystem::Status::Ok || got == 0) {
+    if (file->read(done, bytes.subview(done, size - done < (4u << 20) ? size - done : (4u << 20)), &got) != filesystem::Status::Ok || got == 0) {
       entry->~Entry();
       allocator_.deallocate(entry);
       return false;
@@ -256,6 +297,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   if (!c.provider.find(canonical, &file)) return LoadStatus::Ok;      // not available: its imports become stubs
   UniquePointer<Module> module = UniquePointer<Module>::make(c.allocator, c.allocator);
   if (!module || !module->name.assign(canonical)) return LoadStatus::OutOfMemory;
+  c.provider.directory_of(canonical, &module->directory);      // (where it came from, when that is not System32: the program's own folder)
   const bool parsed_ok = module->owned.parse(file);
   const bool data_only_32bit = parsed_ok && !module->owned.is_pe32_plus() && module->owned.machine() == 0x14C && !pe_image_contains_code(module->owned);
   if (!parsed_ok || !(data_only_32bit || (module->owned.is_pe32_plus() && module->owned.machine() == exe::kPeMachineAmd64)) || (!module->owned.is_dll() && !(c.allow_program && depth == 1))) {
@@ -287,17 +329,32 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     say(c, canonical, " cannot be moved (it has no relocations)");
     return LoadStatus::Malformed;
   }
-  LoadStatus status = map_pe_image(pe, file, c.space, base, false, &image);
-  if (status != LoadStatus::Ok) {
+  // At a given base an image is the same in every process (the processes of one program load their libraries alike, moved ones included): its pages are shared
+  // (ImageCache, with the relocations for that base applied once), and only the ones written get copies of their own.
+  bool shared = false;
+  if (pe.entry_rva() < size) {
+    if (ImageCache* cache = image_cache()) {
+      if (ImageCache::Image* cached = cache->acquire(pe, file, base)) {
+        shared = ImageCache::map(*cached, c.space);
+        cached->release();      // (the mappings hold it now)
+      }
+    }
+  }
+  if (shared) {
+    image.base = base;
+    image.end = base + size;
+    image.entry = pe.entry_rva() ? base + pe.entry_rva() : 0;
+  } else if (const LoadStatus status = map_pe_image(pe, file, c.space, base, false, &image); status != LoadStatus::Ok) {
     say(c, canonical, " could not be mapped");
     return status;
   }
-  if (!apply_relocations(c.space, pe, base, base - pe.image_base())) {
+  LoadStatus status = LoadStatus::Ok;
+  if (!shared && !apply_relocations(c.space, pe, base, base - pe.image_base())) {      // (a shared image was relocated when it was made)
     say(c, canonical, " has damaged relocations");
     return LoadStatus::Malformed;
   }
   initialise_security_cookie(c.space, pe, base);
-  if (relocate && (pe.dll_characteristics() & 0x40)) record_image_base(c.space, base);
+  if (!shared && relocate && (pe.dll_characteristics() & 0x40)) record_image_base(c.space, base);
   describe_image_pages(c.space, pe, base);
   module->base = base;
   module->size = size;
