@@ -516,6 +516,7 @@ uint64_t NtGdiExtGetObjectW(Call& c) {
         put_u16(out + 44, b.planes); put_u16(out + 46, b.bpp); put_u32(out + 48, b.compression); put_u32(out + 52, b.stride * uint32_t(b.height));
         put_u32(out + 56, b.x_ppm); put_u32(out + 60, b.y_ppm); put_u32(out + 64, b.bpp <= 8 ? uint32_t(b.colors.count()) : 0); put_u32(out + 68, b.clr_important);
         if (b.compression == 3) for (int i = 0; i < 3; ++i) put_u32(out + 72 + 4 * i, b.masks[i]);
+        for (int i = 0; i < 8; ++i) out[88 + i] = uint8_t(b.section_handle >> (8 * i));
         put_u32(out + 96, b.section_offset);
       }
       break;

@@ -287,7 +287,12 @@ EXPORT int WINAPI MultiByteToWideChar(UINT code_page, DWORD flags, LPCSTR source
   const UINT cp = cp_resolve(code_page);
   const struct CodePageTable *table = NULL;
   if (cp == CPX_SYMBOL || cp == CPX_UTF7) { if (flags) { set_error(ERROR_INVALID_FLAGS); return 0; } }
-  else if (cp == CP_UTF8) { if (flags & ~CPX_MB_ERR_INVALID_CHARS) { set_error(ERROR_INVALID_FLAGS); return 0; } }
+  else if (cp == CP_UTF8) {
+    if (flags & ~CPX_MB_ERR_INVALID_CHARS) {
+      if (code_page == CP_UTF8 || (flags & ~CPX_MB_VALID)) { set_error(ERROR_INVALID_FLAGS); return 0; }
+      flags &= CPX_MB_ERR_INVALID_CHARS;      /* (the ANSI code page is UTF-8 here: MB_PRECOMPOSED and the like have nothing to do, they are not an error as they are for CP_UTF8) */
+    }
+  }
   else {
     table = cp_find(cp);
     if (!table) { set_error(ERROR_INVALID_PARAMETER); return 0; }

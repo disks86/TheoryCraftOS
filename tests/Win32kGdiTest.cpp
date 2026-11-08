@@ -700,7 +700,7 @@ static void test_dib() {
   CHECK(f.u(N(CreateDIBSection), dc, 0, 0, 0x10, 0, 40, 0, 0, kOut) == 0);      // unmapped header
   put_bmi(f, kIn, 4, 4, 32);
   CHECK(f.u(N(CreateDIBSection), dc, 0, 0, kIn, 0, 20, 0, 0, kOut) == 0);      // the header is cut off
-  CHECK(f.u(N(CreateDIBSection), dc, 0x55, 0, kIn, 0, 40, 0, 0, kOut) == 0);      // a section handle is not supported
+  CHECK(f.u(N(CreateDIBSection), dc, 0x55, 0, kIn, 0, 40, 0, 0, kOut) == 0);      // a handle that names no section of the process
 
   // SetDIBitsToDevice / GetDIBits round trip on a memory DC
   const uint32_t mem = make_dc(f, 8, 8);

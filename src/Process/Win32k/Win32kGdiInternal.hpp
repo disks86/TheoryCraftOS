@@ -141,7 +141,9 @@ struct Bitmap : Object {
   Process* proc = nullptr;     // DIB section: whose memory holds the bits
   uint64_t user_address = 0;
   bool user_mapped = false;    // the region was mapped by this module (and is unmapped with the bitmap)
+  uint64_t section_view = 0;   // a DIB section on a section of the program's (CreateDIBSection's hSection): the view of it the bits are in (unmapped with the bitmap)
   uint32_t section_offset = 0;
+  uint64_t section_handle = 0; // the program's handle to that section (DIBSECTION.dshSection)
   int32_t dim_cx = 0, dim_cy = 0;
   uint32_t attributes = 0;
   bool is_screen = false;      // the screen surface (not in the handle table)
@@ -261,6 +263,10 @@ void dib_sync_in(Bitmap& b);               // a DIB section: reads the process's
 void dib_sync_out(Bitmap& b);              // ... and writes the mirror back
 void release_dib_memory(Bitmap& b);
 bool allocate_dib_memory(Process& process, Bitmap& b, uint64_t bytes);
+// A view of the program's section `section` (a handle of `process`) for the bits of a DIB section, from byte `offset`: *address is where they begin. Lets go of the
+// system lock while it maps (so call it before anything of the handler's is half made). use_dib_section_view gives the view to the bitmap, which unmaps it.
+bool map_section_for_dib(Process& process, uint64_t section, uint64_t offset, uint64_t bytes, uint64_t* view, uint64_t* address);
+void use_dib_section_view(Process& process, Bitmap& b, uint64_t view, uint64_t address);
 
 // ---- Regions (Win32kGdiRegion.cpp). All results are canonical (banded, coalesced).
 bool rgn_normalize(ArrayView<const Rect> in, List<Rect>* out);

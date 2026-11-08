@@ -231,12 +231,19 @@ uint64_t NtGdiCreateDIBSection(Call& c) {
   if (c.arg32(0) && !dc_arg(c, c.arg32(0))) return 0;
   const uint32_t usage = c.arg32(4), header_size = c.arg32(5);
   const uint64_t bits_ptr = c.arg(8);
-  if (c.arg(1) != 0) return c.fail(kErrorNotSupported);      // a file-mapping section as the storage
+  const uint64_t section = c.arg(1), offset = c.arg32(2);
+  if (section != 0 && offset % 4 != 0) return c.fail(kErrorInvalidParameter);      // (the bits of a section begin on a DWORD)
   if (usage > 2) return c.fail(kErrorInvalidParameter);
   DibInfo info(*alloc());
   if (!read_bitmap_info(c, c.arg(3), usage, header_size, &info, c.arg32(0) ? find_dc(c.arg32(0)) : nullptr) || info.compression == 1 || info.compression == 2) return c.fail(kErrorInvalidParameter);
+  const uint64_t bytes = dib_stride(uint32_t(info.width), info.bpp) * uint64_t(uint32_t(info.height));
+  uint64_t view = 0, view_address = 0;
+  if (section != 0 && !map_section_for_dib(c.process(), section, offset, bytes, &view, &view_address)) return c.fail(kErrorInvalidParameter);      // (first: it lets go of the lock)
   Bitmap* b = make_object<Bitmap>(kObjBitmap, c.pid());
-  if (!b) return c.fail(kErrorNotEnoughMemory);
+  if (!b) {
+    if (view != 0) unmap_view_later(c.process(), view);
+    return c.fail(kErrorNotEnoughMemory);
+  }
   b->width = info.width;
   b->height = info.height;
   b->bpp = info.bpp;
@@ -248,9 +255,16 @@ uint64_t NtGdiCreateDIBSection(Call& c) {
   b->dib_usage = usage;
   for (int i = 0; i < 3; ++i) b->masks[i] = info.masks[i];
   for (uint32_t col : info.colors.view()) b->colors.push_back(col);
-  const uint64_t bytes = uint64_t{b->stride} * uint32_t(b->height);
-  if (!b->data.put_zeros(bytes) || !allocate_dib_memory(c.process(), *b, bytes)) { destroy_object(b->handle); return c.fail(kErrorNotEnoughMemory); }
-  dib_sync_out(*b);
+  if (section != 0) use_dib_section_view(c.process(), *b, view, view_address);      // (the bitmap unmaps it from now on)
+  if (!b->data.put_zeros(bytes)) { destroy_object(b->handle); return c.fail(kErrorNotEnoughMemory); }
+  if (section != 0) {      // the bits are the section's, as they are (the program may have drawn into it already, or share it with another)
+    b->section_handle = section;
+    b->section_offset = uint32_t(offset);
+    dib_sync_in(*b);
+  } else {
+    if (!allocate_dib_memory(c.process(), *b, bytes)) { destroy_object(b->handle); return c.fail(kErrorNotEnoughMemory); }
+    dib_sync_out(*b);
+  }
   if (bits_ptr != 0 && !c.write_u64(bits_ptr, b->user_address)) { destroy_object(b->handle); return c.fail(kErrorInvalidParameter); }
   return b->handle;
 }
