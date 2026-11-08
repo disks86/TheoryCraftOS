@@ -20,6 +20,7 @@
 #include <new>
 #include "Process/AddressSpace.hpp"
 #include "Process/Win32k/Win32kGdiInternal.hpp"
+#include "Process/WindowsObjects.hpp"
 
 namespace process::win32k {
 
@@ -308,7 +309,10 @@ bool allocate_dib_memory(Process& process, Bitmap& b, uint64_t bytes) {
 void release_dib_memory(Bitmap& b) {
   if (!b.dib || !b.proc || b.user_address == 0 || !b.user_mapped) return;
   State* st = state();
-  if (st && !st->exiting) {
+  if (b.section_view != 0) {      // (an ended process takes its views with it)
+    if (st && !st->exiting && !b.proc->exited()) unmap_view_later(*b.proc, b.section_view);
+    b.section_view = 0;
+  } else if (st && !st->exiting) {
     if (st->dib_memory && st->dib_memory->release) st->dib_memory->release(*b.proc, b.user_address, b.data.size());
     else if (AddressSpace* space = b.proc->address_space()) space->unmap(b.user_address, b.data.size());
   }
@@ -324,6 +328,22 @@ void dib_sync_in(Bitmap& b) {
 void dib_sync_out(Bitmap& b) {
   if (!b.dib || !b.proc || b.user_address == 0 || b.data.size() == 0) return;
   b.proc->write_user(b.user_address, b.data.view());
+}
+
+bool map_section_for_dib(Process& process, uint64_t section, uint64_t offset, uint64_t bytes, uint64_t* view, uint64_t* address) {
+  ObjectManager* objects = system_objects();
+  if (bytes == 0 || !objects) return false;
+  objects->sync().unlock();      // (the handler holds the system lock, and mapping a view takes it)
+  const uint32_t status = windowsabi::map_section_handle(process, section, offset, bytes, view, address);
+  objects->sync().lock();
+  return status == 0;
+}
+
+void use_dib_section_view(Process& process, Bitmap& b, uint64_t view, uint64_t address) {
+  b.proc = &process;
+  b.user_address = address;
+  b.user_mapped = true;
+  b.section_view = view;
 }
 
 // ---- Floating point.

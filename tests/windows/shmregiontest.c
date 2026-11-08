@@ -18,6 +18,8 @@
 
 /* What Chromium's shared memory regions (base::PlatformSharedMemoryRegion, mojo) do with a section on Windows: create it, query it with NtQuerySection, hand it on with
  * DuplicateHandle through a real handle of the process (same access, or reduced to read-only), map it, and check that a read-only handle cannot be mapped for writing.
+ * Also what Chromium's software compositor does with a section (a DIB section on it, skia::CreatePlatformCanvasWithSharedSection) and the name conversion its C runtime
+ * makes before freopen("CONOUT$") (MultiByteToWideChar on the ANSI code page with MB_PRECOMPOSED).
  * Prints "shmregiontest: N checks, M failed". */
 #include <windows.h>
 #include <stdio.h>
@@ -129,6 +131,59 @@ int main(void) {
     for (int i = 0; i < 32; ++i) nonzero += random[i] != 0;
     printf("shmregiontest: random %02x%02x%02x%02x%02x%02x%02x%02x...\n", random[0], random[1], random[2], random[3], random[4], random[5], random[6], random[7]);
     CHECK(nonzero > 16);
+  }
+  /* A DIB section whose bits are a section's: they are the section's memory (what is in it shows, what is drawn lands in it), at the offset given. */
+  {
+    HANDLE pixels = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 0x10000, NULL);
+    DWORD* mirror = pixels ? (DWORD*)MapViewOfFile(pixels, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0x10000) : NULL;
+    CHECK(pixels != NULL && mirror != NULL);
+    if (mirror) {
+      mirror[0] = 0x00112233;
+      mirror[1024] = 0x00445566;
+      BITMAPINFO bi;
+      memset(&bi, 0, sizeof bi);
+      bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+      bi.bmiHeader.biWidth = 16;
+      bi.bmiHeader.biHeight = -16;      /* (top-down: the first row first) */
+      bi.bmiHeader.biPlanes = 1;
+      bi.bmiHeader.biBitCount = 32;
+      bi.bmiHeader.biCompression = BI_RGB;
+      DWORD* bits = NULL;
+      HBITMAP bitmap = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, (void**)&bits, pixels, 0);
+      CHECK(bitmap != NULL && bits != NULL);
+      if (bitmap && bits) {
+        CHECK(bits[0] == 0x00112233);      /* what the section held */
+        bits[3] = 0x00778899;
+        CHECK(mirror[3] == 0x00778899);      /* written through the bits, seen in the other view */
+        HDC dc = CreateCompatibleDC(NULL);
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        SetPixel(dc, 2, 0, RGB(255, 0, 0));
+        GdiFlush();
+        CHECK((mirror[2] & 0x00FFFFFF) == 0x00FF0000);      /* drawn by GDI, in the section */
+        DIBSECTION ds;
+        memset(&ds, 0, sizeof ds);
+        CHECK(GetObjectW(bitmap, sizeof ds, &ds) == sizeof ds && ds.dshSection == pixels && ds.dsOffset == 0 && ds.dsBm.bmBits == bits);
+        SelectObject(dc, old);
+        DeleteDC(dc);
+        CHECK(DeleteObject(bitmap));
+      }
+      DWORD* later = NULL;      /* at an offset, and as small as Chromium's check of a failed allocation makes it */
+      bi.bmiHeader.biWidth = 1;
+      bi.bmiHeader.biHeight = 1;
+      HBITMAP small = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, (void**)&later, pixels, 4096);
+      CHECK(small != NULL && later != NULL && later[0] == 0x00445566);
+      if (small) DeleteObject(small);
+      SetLastError(0);
+      CHECK(CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, (void**)&later, pixels, 0x10000) == NULL);      /* (past the end of the section) */
+      UnmapViewOfFile(mirror);
+    }
+    if (pixels) CloseHandle(pixels);
+  }
+  /* The name Chromium's C runtime gives freopen, made wide on the ANSI code page with the flags it always passes. */
+  {
+    WCHAR wide[16];
+    CHECK(MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED | MB_ERR_INVALID_CHARS, "CONOUT$", -1, wide, 16) == 8 && wide[0] == 'C' && wide[7] == 0);
+    CHECK(MultiByteToWideChar(CP_UTF8, MB_PRECOMPOSED, "CONOUT$", -1, wide, 16) == 0 && GetLastError() == ERROR_INVALID_FLAGS);      /* (CP_UTF8 itself still takes no such flags) */
   }
   printf("shmregiontest: %d checks, %d failed\n", checks, failed);
   return failed;

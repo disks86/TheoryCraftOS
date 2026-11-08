@@ -51,7 +51,7 @@ enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, 
 
 class ObjectManager {
  public:
-  static constexpr uint32_t kCapacity = 1024;
+  static constexpr uint32_t kCapacity = 1024;      // the object slots kept in place; up to kCapacity * (1 + ObjectTable::kChunks) with the chunks added on demand
   static constexpr uint32_t kNameBytes = 256;
 
   explicit ObjectManager(ISystemSync& sync) : sync_(sync) {}
@@ -435,7 +435,40 @@ class ObjectManager {
     bool armed = false, apc_pending = false;
     uint64_t fired_at = 0;
   };
-  Object* at(uint32_t id) { return id >= 1 && id <= kCapacity && objects_[id - 1].kind != ObjectKind::None ? &objects_[id - 1] : nullptr; }
+  // The object slots: kCapacity in place, then chunks of kCapacity more, made from the allocator when the ones there are all taken (a program like Chromium keeps
+  // thousands of events and sections). A chunk is never moved or freed before the manager, so a pointer to a slot stays good. An object's id is its index + 1.
+  // Under the manager's lock, except size() (a chunk is in place before it is counted).
+  class ObjectTable {
+   public:
+    static constexpr uint32_t kChunks = 16;
+    ObjectTable() = default;
+    ObjectTable(const ObjectTable&) = delete;
+    ObjectTable& operator=(const ObjectTable&) = delete;
+    Object& operator[](uint32_t i) { return i < kCapacity ? first_[i] : chunks_[i / kCapacity - 1][i % kCapacity]; }
+    uint32_t size() const { return kCapacity * (1 + __atomic_load_n(&chunk_count_, __ATOMIC_ACQUIRE)); }
+    uint32_t index_of(const Object* o) const;
+    bool has_free() const;
+    bool grow(allocators::IAllocator* allocator);      // one chunk more; false without an allocator, memory or chunks left
+    void release(allocators::IAllocator* allocator);      // (the manager's destructor)
+    class Iterator {
+     public:
+      Iterator(ObjectTable* table, uint32_t index) : table_(table), index_(index) {}
+      Object& operator*() const { return (*table_)[index_]; }
+      Iterator& operator++() { ++index_; return *this; }
+      bool operator!=(const Iterator& other) const { return index_ != other.index_; }
+     private:
+      ObjectTable* table_;
+      uint32_t index_;
+    };
+    Iterator begin() { return Iterator(this, 0); }
+    Iterator end() { return Iterator(this, size()); }
+   private:
+    Object first_[kCapacity];
+    Object* chunks_[kChunks] = {};
+    uint32_t chunk_count_ = 0;
+  };
+  Object* at(uint32_t id) { return id >= 1 && id <= objects_.size() && objects_[id - 1].kind != ObjectKind::None ? &objects_[id - 1] : nullptr; }
+  void make_room_locked() { if (!objects_.has_free()) objects_.grow(allocator_); }      // (before a search for a free slot)
   Object* find_locked(StringView name, bool case_insensitive = false);
   void fire_timer_locked(Object& o, uint64_t now);
   void free_object_locked(Object& o);
@@ -484,7 +517,7 @@ class ObjectManager {
   PipeOp* pipe_new_op_locked(Pipe& p, PipeOpKind kind, uint32_t end, uint64_t owner);
   PipeOp* pipe_find_op_locked(Pipe& p, uint32_t tag);
   void pipe_free_op_locked(Pipe& p, PipeOp& op);
-  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 2048;
+  static constexpr uint32_t kMaxPipes = 128, kMaxSections = 1024, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 2048;
 
   struct Watch {
     bool used = false;
@@ -518,7 +551,7 @@ class ObjectManager {
   void free_port_locked(Object& o);
   uint64_t pipe_sequence_ = 0;      // numbers the instances of pipes in the order they start to listen
   allocators::IAllocator* allocator_ = nullptr;
-  Object objects_[kCapacity];
+  ObjectTable objects_;
   Pipe* pipes_ = nullptr;      // kMaxPipes of them, made when the first pipe is
   struct RangeLock;
   RangeLock* locks_ = nullptr;      // kMaxLocks of them, made with the first

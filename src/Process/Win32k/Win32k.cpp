@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/Win32k/Win32k.hpp"
+#include "Process/WindowsObjects.hpp"
 
 namespace process {
 
@@ -203,6 +204,33 @@ allocators::IAllocator* system_allocator() {
 }
 void set_thread_override(uint64_t tid) { g_table.thread_override = tid; }
 
+namespace {
+struct LaterUnmap {
+  Process* process = nullptr;
+  uint64_t view = 0;
+};
+constexpr uint32_t kMaxLaterUnmaps = 64;
+LaterUnmap g_later_unmaps[kMaxLaterUnmaps];      // (under the system lock)
+uint32_t g_later_unmap_count = 0;
+
+// The views the handler that just ran queued for `process` (the system lock held); the others stay queued for a call of theirs.
+uint32_t take_later_unmaps(Process& process, ArrayView<uint64_t> out) {
+  uint32_t taken = 0, kept = 0;
+  for (uint32_t i = 0; i < g_later_unmap_count; ++i) {
+    if (g_later_unmaps[i].process == &process && taken < out.size()) out[taken++] = g_later_unmaps[i].view;
+    else g_later_unmaps[kept++] = g_later_unmaps[i];
+  }
+  g_later_unmap_count = kept;
+  return taken;
+}
+}  // namespace
+
+bool unmap_view_later(Process& process, uint64_t view) {
+  if (g_later_unmap_count >= kMaxLaterUnmaps) return false;
+  g_later_unmaps[g_later_unmap_count++] = LaterUnmap{&process, view};
+  return true;
+}
+
 bool dispatch(Process& process, const SyscallRequest& request, uint64_t* result) {
   if (request.number == uint32_t(WindowsSyscallNumber::NtTcosDwm)) {
     ObjectManager* objects = objects_or_null();
@@ -227,7 +255,10 @@ bool dispatch(Process& process, const SyscallRequest& request, uint64_t* result)
   ISystemSync& sync = objects->sync();
   sync.lock();
   *result = handler(call);
+  uint64_t views[kMaxLaterUnmaps];
+  const uint32_t unmaps = g_later_unmap_count ? take_later_unmaps(process, ArrayView<uint64_t>(views, kMaxLaterUnmaps)) : 0;
   sync.unlock();
+  for (uint32_t i = 0; i < unmaps; ++i) windowsabi::unmap_view_in(process, views[i]);
   return true;
 }
 

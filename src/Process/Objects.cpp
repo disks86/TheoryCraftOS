@@ -79,11 +79,12 @@ ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, b
   if (Object* existing = find_locked(name)) {
     if (existing->kind != kind) { result.status = kTypeMismatch; return result; }
     ++existing->references;
-    result.id = static_cast<uint32_t>(existing - objects_) + 1;
+    result.id = objects_.index_of(existing) + 1;
     result.status = kNameExists;
     return result;
   }
-  for (uint32_t i = 0; i < kCapacity; ++i) {
+  make_room_locked();
+  for (uint32_t i = 0; i < objects_.size(); ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::None) continue;
     o = Object();
@@ -136,7 +137,8 @@ ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, b
 ObjectManager::Created ObjectManager::create_process(uint64_t pid) {
   Created result;
   Locked hold(sync_);
-  for (uint32_t i = 0; i < kCapacity; ++i) {
+  make_room_locked();
+  for (uint32_t i = 0; i < objects_.size(); ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::None) continue;
     o = Object();
@@ -155,7 +157,7 @@ ObjectManager::Created ObjectManager::create_process(uint64_t pid) {
 ObjectManager::Created ObjectManager::open_process(uint64_t pid, bool create) {
   {
     Locked hold(sync_);
-    for (uint32_t i = 0; i < kCapacity; ++i) {
+    for (uint32_t i = 0; i < objects_.size(); ++i) {
       Object& o = objects_[i];
       if (o.kind != ObjectKind::Process || o.owner != pid) continue;
       ++o.references;
@@ -295,7 +297,45 @@ struct ObjectManager::Mailslot {
   uint64_t read_timeout_100ns = ~uint64_t{0};
 };
 
+uint32_t ObjectManager::ObjectTable::index_of(const Object* o) const {
+  const uintptr_t at = reinterpret_cast<uintptr_t>(o);      // (comparing addresses: o is a slot of this table)
+  const uintptr_t first = reinterpret_cast<uintptr_t>(first_);
+  if (at >= first && at < first + sizeof(first_)) return static_cast<uint32_t>((at - first) / sizeof(Object));
+  for (uint32_t c = 0; c < chunk_count_; ++c) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(chunks_[c]);
+    if (at >= base && at < base + sizeof(Object) * kCapacity) return kCapacity * (c + 1) + static_cast<uint32_t>((at - base) / sizeof(Object));
+  }
+  return 0;
+}
+
+bool ObjectManager::ObjectTable::has_free() const {
+  for (const Object& o : first_) if (o.kind == ObjectKind::None) return true;
+  for (uint32_t c = 0; c < chunk_count_; ++c) for (uint32_t i = 0; i < kCapacity; ++i) if (chunks_[c][i].kind == ObjectKind::None) return true;
+  return false;
+}
+
+bool ObjectManager::ObjectTable::grow(allocators::IAllocator* allocator) {
+  if (!allocator || chunk_count_ >= kChunks) return false;
+  void* memory = allocator->allocate(sizeof(Object) * kCapacity);
+  if (!memory) return false;
+  Object* chunk = static_cast<Object*>(memory);
+  for (uint32_t i = 0; i < kCapacity; ++i) new (&chunk[i]) Object();      // (one by one: an array new may put a count in front of them)
+  chunks_[chunk_count_] = chunk;
+  __atomic_store_n(&chunk_count_, chunk_count_ + 1, __ATOMIC_RELEASE);      // (counted once it is in place)
+  return true;
+}
+
+void ObjectManager::ObjectTable::release(allocators::IAllocator* allocator) {
+  for (uint32_t c = 0; c < chunk_count_; ++c) {
+    for (uint32_t i = 0; i < kCapacity; ++i) chunks_[c][i].~Object();
+    if (allocator) allocator->deallocate(chunks_[c]);
+    chunks_[c] = nullptr;
+  }
+  chunk_count_ = 0;
+}
+
 ObjectManager::~ObjectManager() {
+  objects_.release(allocator_);
   if (pipes_) {
     for (uint32_t i = 0; i < kMaxPipes; ++i) {
       if (!allocator_) continue;
@@ -368,7 +408,8 @@ ObjectManager::Created ObjectManager::create_pipe(StringView name, uint32_t out_
   int32_t pipe_index = -1;
   for (uint32_t i = 0; i < kMaxPipes && pipe_index < 0; ++i) if (!pipes_[i].used) pipe_index = static_cast<int32_t>(i);
   if (pipe_index < 0) { result.status = kNoResources; return result; }
-  for (uint32_t i = 0; i < kCapacity; ++i) {
+  make_room_locked();
+  for (uint32_t i = 0; i < objects_.size(); ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::None) continue;
     Pipe& p = pipes_[pipe_index];
@@ -416,7 +457,7 @@ ObjectManager::Created ObjectManager::connect_pipe(StringView name, bool want_re
   Locked hold(sync_);
   bool found = false;
   int32_t best = -1;      // the instance that has been listening longest
-  for (uint32_t i = 0; i < kCapacity; ++i) {
+  for (uint32_t i = 0; i < objects_.size(); ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::Pipe || o.name_size == 0 || !same_name(o.name, o.name_size, name)) continue;
     found = true;
@@ -1636,7 +1677,7 @@ ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t s
   if (Object* existing = find_locked(name)) {
     if (existing->kind != ObjectKind::Section) { result.status = kTypeMismatch; return result; }
     ++existing->references;
-    result.id = static_cast<uint32_t>(existing - objects_) + 1;
+    result.id = objects_.index_of(existing) + 1;
     result.status = kNameExists;
     return result;
   }
@@ -1668,7 +1709,8 @@ ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t s
     done += got;
   }
   file.reset();
-  for (uint32_t i = 0; i < kCapacity; ++i) {
+  make_room_locked();
+  for (uint32_t i = 0; i < objects_.size(); ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::None) continue;
     o = Object();
@@ -1911,7 +1953,7 @@ ObjectManager::Created ObjectManager::open(ObjectKind kind, StringView name) {
   if (!o) { result.status = kNotFound; return result; }
   if (o->kind != kind) { result.status = kTypeMismatch; return result; }
   ++o->references;
-  result.id = static_cast<uint32_t>(o - objects_) + 1;
+  result.id = objects_.index_of(o) + 1;
   return result;
 }
 
@@ -1966,8 +2008,8 @@ void ObjectManager::add_ref(uint32_t id) {
 namespace windowsabi { void debug_object_freed_locked(uint32_t object); }
 
 void ObjectManager::free_object_locked(Object& o) {
-  forget_object_security_locked(static_cast<uint32_t>(&o - objects_) + 1);
-  if (o.kind == ObjectKind::DebugObject) windowsabi::debug_object_freed_locked(static_cast<uint32_t>(&o - objects_) + 1);
+  forget_object_security_locked(objects_.index_of(&o) + 1);
+  if (o.kind == ObjectKind::DebugObject) windowsabi::debug_object_freed_locked(objects_.index_of(&o) + 1);
   free_pipe_locked(o);
   free_section_locked(o);
   free_job_locked(o);
@@ -2091,7 +2133,7 @@ void ObjectManager::abandon_process(uint64_t process) {
     if (w.event_object == 0 || w.owner != process) continue;
     release_locked(w.event_object);
     w.event_object = 0;
-    release_locked(static_cast<uint32_t>(&o - objects_) + 1);
+    release_locked(objects_.index_of(&o) + 1);
   }
   for (Object& o : objects_) {
     if (o.kind != ObjectKind::Mutex || o.owner == 0 || (o.owner & 0xFFFFF) != process) continue;      // (a thread id carries its process's id in the low 20 bits)
@@ -2480,7 +2522,8 @@ ObjectManager::Created ObjectManager::create_change_notification(StringView path
   int32_t slot = -1;
   for (uint32_t i = 0; watches_ && i < kMaxWatches && slot < 0; ++i) if (!watches_[i].used) slot = int32_t(i);
   if (slot < 0) { result.status = kNoResources; return result; }
-  for (uint32_t i = 0; i < kCapacity; ++i) {
+  make_room_locked();
+  for (uint32_t i = 0; i < objects_.size(); ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::None) continue;
     Watch& w = watches_[slot];
@@ -2566,7 +2609,7 @@ void ObjectManager::notify_entry_changed(StringView changed_path, uint32_t actio
     if (w.event_object != 0 && finished_count < 16) {      // a registry watch of the kernel: it signals its event, and it is over
       if (Object* event = at(w.event_object)) { event->signaled = true; release_locked(w.event_object); }
       w.event_object = 0;
-      finished[finished_count++] = static_cast<uint32_t>(&o - objects_) + 1;
+      finished[finished_count++] = objects_.index_of(&o) + 1;
       continue;
     }
     if (!w.want_data) { w.overflow = true; if (w.waiters != 0) w.owes_ack = true; continue; }
@@ -2714,7 +2757,8 @@ ObjectManager::Created ObjectManager::create_mailslot(StringView name, uint32_t 
   if (slot < 0) { result.status = kNoResources; return result; }
   uint8_t* buffer = allocator_ ? static_cast<uint8_t*>(allocator_->allocate(kMailslotBufferBytes)) : nullptr;
   if (!buffer) { result.status = kNoResources; return result; }
-  for (uint32_t i = 0; i < kCapacity; ++i) {
+  make_room_locked();
+  for (uint32_t i = 0; i < objects_.size(); ++i) {
     Object& o = objects_[i];
     if (o.kind != ObjectKind::None) continue;
     Mailslot& m = mailslots_[slot];
@@ -2746,7 +2790,7 @@ ObjectManager::Created ObjectManager::open_mailslot_writer(StringView name) {
   Object* o = find_locked(name);
   if (!o || o->kind != ObjectKind::Mailslot) { result.status = kNotFound; return result; }
   ++o->references;
-  result.id = static_cast<uint32_t>(o - objects_) + 1;
+  result.id = objects_.index_of(o) + 1;
   result.status = kSuccess;
   return result;
 }

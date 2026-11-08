@@ -1603,6 +1603,23 @@ uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* ba
   return kSuccess;
 }
 
+uint32_t map_section_handle(Process& p, uint64_t handle, uint64_t offset, uint64_t bytes, uint64_t* view_base, uint64_t* address) {
+  const uint32_t id = object_of(p, handle, DescriptorKind::Section);
+  if (!id) return kInvalidHandle;
+  if (!handle_allows(p, handle, 0x2 /* SECTION_MAP_WRITE */)) return kAccessDeniedStatus;
+  ObjectManager* objects = system_objects();
+  ObjectManager::SectionInfo info;
+  if (!objects || !objects->section_info(id, &info)) return kInvalidHandle;
+  const uint64_t page_offset = offset & ~uint64_t{4095}, inside = offset - page_offset;
+  if (offset >= info.size || bytes > info.size - offset) return kInvalidParameter;      // (the bits have to fit in the section)
+  uint64_t base = 0, view = inside + bytes;
+  const uint32_t status = map_view_in(p, id, page_offset, &base, &view, kPageReadWrite);
+  if (status != kSuccess) return status;
+  *view_base = base;
+  *address = base + inside;
+  return kSuccess;
+}
+
 // The whole view that starts at `address` in `target`'s address space.
 uint32_t unmap_view_in(Process& target, uint64_t address) {
   AddressSpace* space = target.address_space();

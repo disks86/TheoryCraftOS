@@ -164,6 +164,9 @@ using Handler = uint64_t (*)(Call&);
 // handler that talks to a component with a lock of its own (the Direct3D kernel) registers with locked = false and takes care of everything itself. False if the number is
 // outside the win32k range or already has a handler (the first one stays).
 bool register_handler(WindowsSyscallNumber number, Handler handler, bool locked = true);
+// A view of a section to unmap from `process` once the system lock is let go (a locked handler cannot: unmapping a view takes that lock). Done when the call that
+// queued it returns, if it is a call of that process; a view of another process stays until it ends. False when the queue is full (the view then stays too).
+bool unmap_view_later(Process& process, uint64_t view);
 // NtTcosDwm (dwmapi.dll's one service, outside the win32k range): the module that implements it registers its handler here. False if there is one already.
 bool register_dwm_handler(Handler handler);
 // The handler of a service, null if there is none.

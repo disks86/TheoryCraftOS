@@ -32,6 +32,9 @@ uint32_t image_header_status(ConstByteView file);
 uint32_t image_section_status(ConstByteView file, exe::PeFile& pe);
 // A view of the (not image) section `id` in `target`; and a handle for an object the caller already holds a reference for (kind and token as in the descriptor table).
 uint32_t map_view_in(Process& target, uint32_t id, uint64_t offset, uint64_t* base_in_out, uint64_t* view_in_out, uint32_t view_page);
+// A read-write view of the section `handle` names (of `p`), from `offset` (any byte; the view begins on the page below it) and at least `bytes` long: *view_base is
+// where the view begins (unmap_view_in takes it), *address where the byte at `offset` is. For a DIB section made on a section (CreateDIBSection's hSection).
+uint32_t map_section_handle(Process& p, uint64_t handle, uint64_t offset, uint64_t bytes, uint64_t* view_base, uint64_t* address);
 // RemoteOp::TakeHandle in the program that owns the handle op.address: its kind, token and denied rights come back in op.type, op.argument and op.protect, and the copy
 // is counted (op.suspended: the handle is closed after, DUPLICATE_CLOSE_SOURCE).
 uint32_t take_object_handle_from(Process& source, IProcessRuntime::RemoteOp& op);
