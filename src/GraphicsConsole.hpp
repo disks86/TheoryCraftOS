@@ -36,9 +36,13 @@ class GraphicsConsole {
   void show_banner(ArrayView<const uint32_t> pixels, uint32_t width, uint32_t height);
   // Text color for what is put next (0x00RRGGBB); 0 restores the default.
   void set_foreground(uint32_t color) { foreground_ = color ? color : kForeground; }
-  // Shows what has been put so far on GPUs that need telling.
+  // Shows what has been drawn since the last flush, on GPUs that need telling. With nothing new it leaves the GPU alone: presenting takes the screen back from
+  // a 3D image that has it (virtio-gpu), and the console is flushed whenever its lock is let go, also after output that never comes here (the debug console).
   void flush() {
-    if (gpu_) gpu_->present();
+    if (gpu_ && pending_) {
+      pending_ = false;
+      gpu_->present();
+    }
   }
 
  private:
@@ -51,4 +55,5 @@ class GraphicsConsole {
   uint32_t foreground_ = kForeground;
   uint32_t cols_ = 0, rows_ = 0, col_ = 0, row_ = 0;
   uint32_t top_row_ = 0;   // the first row text goes to (below the banner)
+  bool pending_ = false;   // something was drawn that the next flush has to show
 };

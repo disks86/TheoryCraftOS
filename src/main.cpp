@@ -1266,9 +1266,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_SELFTESTS
   const bool isp_drawn = gpu && run_isp_demo(*gpu, isp, shared_allocator);
   if (gpu) {
-    // These demos take over the whole screen, so the console is attached afresh afterwards.
+    // These demos take over the whole screen: what is said meanwhile goes to the debug console only, and the console is attached afresh afterwards.
+    console::set_screen_output(false);
     const bool graphics_ok = run_graphics_demo(system_graphics, shared_allocator);
     const bool gui_ok = run_gui_demo(system_graphics, shared_allocator);
+    console::set_screen_output(true);
     console::use_gpu(gpu);
     Entry(isp_drawn ? Level::Ok : Level::Fault, "Self-test").text("ISP demo ").text(isp_drawn ? "drawn" : "failed");
     Entry(graphics_ok ? Level::Ok : Level::Fault, "Self-test").text("graphics demo ").text(graphics_ok ? "ok" : "FAILED");
@@ -2083,7 +2085,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         run.arguments = ArrayView<const StringView>(arguments, count);
         run.kind = exe::ExecutableKind::Pe;
         run.output = [](void*, StringView text) { console::puts(text); };
-        console::set_screen_output(false);      // (the desktop has the screen: what the program and the kernel say goes to the debug console only)
         console::puts("autorun: starting " TCOS_AUTORUN "\n");
         uint32_t code = 0;
         String message(*a.allocator);
@@ -2311,6 +2312,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (browser_items) Entry(Level::Info, "Desktop").text("restored ").dec(browser_items).text(" cookie(s) and stored item(s) of the web browser");
     const uint32_t restored = desktop.restore_session();
     if (restored) Entry(Level::Info, "Desktop").text("restored ").dec(restored).text(" window(s) from the last session");
+    console::set_screen_output(false);   // the desktop has the screen from here: what the kernel says goes to the debug console only (a panic takes the screen back)
     const bool threaded = desktop.start();
     if (!threaded) Entry(Level::Warning, "Desktop").text("could not start the render and handler threads; running single-threaded");
     uint64_t clock_synced_us = hardware::uptime_us();
@@ -2583,6 +2585,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // is flushed before the devices are handed back to the firmware.
   if (gpu) {
     if (monitors.layout().count() > 1) monitors.show_single_display();   // the console is a screen of one monitor
+    console::set_screen_output(true);
     console::use_gpu(gpu);
     console::puts("TheoryCraftOS: shutting down\n");
   }

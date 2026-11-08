@@ -76,6 +76,7 @@ void break_lock() {  // for a panic: the holder may be the code that just crashe
   g_depth = 0;
   g_owner = 0;
   g_lock.reset();
+  g_screen_enabled = true;  // whoever has the screen, the panic message goes on it
 }
 
 void init(efi::SystemTable* st) {

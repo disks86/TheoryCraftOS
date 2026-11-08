@@ -442,7 +442,7 @@ void VirtioGpu::present() {
   if (!ready_ || !screen_resource_) return;
   uint32_t x, y, w, h;
   const bool dirty = take_dirty(&x, &y, &w, &h);
-  if (shown_resource_ != screen_resource_) {  // a 3D image had the screen: bring the console back
+  if (shown_resource_ != screen_resource_) {  // a 3D image had the screen: this 2D drawing takes it back
     mark_all_dirty();
     take_dirty(&x, &y, &w, &h);
     show_resource(screen_resource_, width(), height());
