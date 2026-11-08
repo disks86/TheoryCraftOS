@@ -28,7 +28,7 @@ struct AddDesc {
   uint32_t sources;       // how many operands the operation reads
   int32_t fixed_mux_a;    // mux value that identifies the operation when it reads no first operand (-1: not fixed)
   int32_t fixed_mux_b;    // and no second
-  bool swap_to_order;     // FADD: its operands are put in increasing mux order (the other order is FADDNF)
+  int8_t operand_order;   // 1: increasing mux order, -1: decreasing order, 0: any order
   int32_t waddr;          // the destination field is part of the operation (-1: it is the destination)
 };
 
@@ -36,6 +36,9 @@ AddDesc add_desc(Add op) {
   switch (op) {
     case Add::Nop: return {187, 0, 0, 0, false, -1};
     case Add::Fadd: return {5, 2, -1, -1, true, -1};            // opcode 0, both inputs "no unpack" (1 << 2 | 1)
+    case Add::Fsub: return {64, 2, -1, -1, false, -1};          // opcode 64, both inputs "no unpack"
+    case Add::Fmin: return {128, 2, -1, -1, 1, -1};             // opcode 128 and increasing mux order select fmin (reverse selects fmax)
+    case Add::Fmax: return {128, 2, -1, -1, -1, -1};
     case Add::Or: return {182, 2, -1, -1, false, -1};
     case Add::Ftoiz: return {245, 1, -1, 7, false, -1};
     case Add::Ffloor: return {246, 1, -1, 0, false, -1};
@@ -127,7 +130,7 @@ bool encode(const Instruction& i, uint64_t* word) {
   if (add.sources >= 2 && !resolve(b, &ports, &add_b)) return false;
   if (mul.sources >= 1 && !resolve(i.mul_a, &ports, &mul_a)) return false;
   if (mul.sources >= 2 && !resolve(i.mul_b, &ports, &mul_b)) return false;
-  if (add.swap_to_order && add_a > add_b) { const uint32_t t = add_a; add_a = add_b; add_b = t; }
+  if ((add.operand_order > 0 && add_a > add_b) || (add.operand_order < 0 && add_a < add_b)) { const uint32_t t = add_a; add_a = add_b; add_b = t; }
 
   const int32_t sig = signal_code(i, ports.imm);
   if (sig < 0) return false;

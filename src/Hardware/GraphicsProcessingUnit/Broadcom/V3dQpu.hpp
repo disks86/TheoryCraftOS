@@ -27,7 +27,7 @@ namespace hardware::v3d_qpu {
 // uniform into a register), up to two register file reads (ports A and B, where B can instead carry a small immediate) and the destinations of each part.
 // Nothing here knows the pipeline hazards of the machine; the program builder (V3dShaders) places the nops those need.
 
-enum class Add : uint8_t { Nop, Fadd, Or, Ftoiz, Ffloor, Vfpack, LdVpmvIn, StVpmv, VpmWt };
+enum class Add : uint8_t { Nop, Fadd, Fsub, Fmin, Fmax, Or, Ftoiz, Ffloor, Vfpack, LdVpmvIn, StVpmv, VpmWt };
 enum class Mul : uint8_t { Nop, Fmul };
 
 // A source: nothing, a register file entry, an accumulator (r0..r5; r4 is where an SFU result shows up, r5 where the varying's C coefficient is) or a small
