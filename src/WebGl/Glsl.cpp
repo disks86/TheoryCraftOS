@@ -16,469 +16,20 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The GLSL ES 1.00 and 3.00 front end: a small preprocessor, a lexer and a recursive-descent parser that builds a shader::Module.
+// The GLSL ES 1.00 and 3.00 front end: the preprocessor (GlslPreprocessor.cpp), a lexer and a recursive-descent parser that builds a shader::Module.
+#include "WebGl/GlslPreprocessor.hpp"
 #include "WebGl/ShaderInternal.hpp"
 
 namespace shader {
 
 namespace {
 
-// --- Preprocessor ----------------------------------------------------------------------------------------------------------------------------------------
-
-struct Macro {
-  explicit Macro(allocators::IAllocator& a) : name(a), body(a), params(a) {}
-  String name, body;
-  bool function = false;
-  List<UniquePointer<String>> params;
-};
+// --- Characters ------------------------------------------------------------------------------------------------------------------------------------------
 
 bool is_ident_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 bool is_ident(char c) { return is_ident_start(c) || (c >= '0' && c <= '9'); }
 bool is_digit(char c) { return c >= '0' && c <= '9'; }
 bool is_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v'; }
-
-class Preprocessor {
- public:
-  Preprocessor(allocators::IAllocator& a, String* error) : alloc_(a), macros_(a), cond_(a), error_(error) {}
-
-  bool run(StringView src, String* out, uint32_t* version) {
-    define_simple("GL_ES", "1");
-    define_simple("GL_FRAGMENT_PRECISION_HIGH", "1");
-    define_simple("GL_OES_standard_derivatives", "1");
-    define_simple("GL_EXT_shader_texture_lod", "1");
-    define_simple("GL_EXT_frag_depth", "1");
-    define_simple("GL_EXT_draw_buffers", "1");
-    // strip comments and join continued lines
-    String clean(alloc_);
-    for (uint64_t i = 0; i < src.size();) {
-      const char c = src[i];
-      if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
-        while (i < src.size() && src[i] != '\n') ++i;
-      } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
-        i += 2;
-        while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) {
-          if (src[i] == '\n') clean.push_back('\n');
-          ++i;
-        }
-        i += 2;
-        clean.push_back(' ');
-      } else if (c == '\\' && i + 1 < src.size() && (src[i + 1] == '\n' || (src[i + 1] == '\r' && i + 2 < src.size() && src[i + 2] == '\n'))) {
-        i += src[i + 1] == '\r' ? 3 : 2;
-      } else {
-        clean.push_back(c);
-        ++i;
-      }
-    }
-    uint32_t lineno = 0;
-    StringView rest = clean.view();
-    while (!rest.empty() || lineno == 0) {
-      ++lineno;
-      const uint64_t nl = rest.find('\n');
-      StringView line = nl == StringView::npos ? rest : rest.substr(0, nl);
-      rest = nl == StringView::npos ? StringView() : rest.substr(nl + 1);
-      if (!handle_line(line, out, version)) return false;
-      out->push_back('\n');
-      if (nl == StringView::npos) break;
-    }
-    if (cond_.count() != 0) return fail("unterminated #if");
-    return true;
-  }
-
- private:
-  struct Cond { bool active; bool taken; bool parent; };
-
-  bool fail(const char* why) {
-    if (error_->empty()) error_->assign(why);
-    return false;
-  }
-
-  bool active() const { return cond_.count() == 0 || cond_[cond_.count() - 1].active; }
-
-  void define_simple(const char* name, const char* body) {
-    UniquePointer<Macro> m = UniquePointer<Macro>::make(alloc_, alloc_);
-    if (!m) return;
-    m->name.assign(name);
-    m->body.assign(body);
-    macros_.push_back(static_cast<UniquePointer<Macro>&&>(m));
-  }
-
-  Macro* find(StringView name) {
-    for (uint64_t i = 0; i < macros_.count(); ++i)
-      if (macros_[i]->name.view().equals(name)) return macros_[i].get();
-    return nullptr;
-  }
-
-  void undef(StringView name) {
-    for (uint64_t i = 0; i < macros_.count(); ++i)
-      if (macros_[i]->name.view().equals(name)) {
-        macros_.remove_at(i);
-        return;
-      }
-  }
-
-  static StringView trim(StringView s) {
-    uint64_t a = 0, b = s.size();
-    while (a < b && is_space(s[a])) ++a;
-    while (b > a && is_space(s[b - 1])) --b;
-    return s.substr(a, b - a);
-  }
-
-  bool handle_line(StringView line, String* out, uint32_t* version) {
-    StringView t = trim(line);
-    if (t.empty() || t[0] != '#') {
-      if (!active()) return true;
-      return expand(line, out, 0);
-    }
-    t = trim(t.substr(1));
-    uint64_t e = 0;
-    while (e < t.size() && is_ident(t[e])) ++e;
-    const StringView dir = t.substr(0, e);
-    const StringView arg = trim(t.substr(e));
-    if (dir.equals("ifdef") || dir.equals("ifndef")) {
-      const bool def = find(first_word(arg)) != nullptr;
-      const bool cond = dir.equals("ifdef") ? def : !def;
-      const bool par = active();
-      cond_.push_back(Cond{par && cond, cond, par});
-      return true;
-    }
-    if (dir.equals("if")) {
-      const bool par = active();
-      bool v = false;
-      if (par && !eval_if(arg, &v)) return false;
-      cond_.push_back(Cond{par && v, v, par});
-      return true;
-    }
-    if (dir.equals("elif")) {
-      if (cond_.count() == 0) return fail("#elif without #if");
-      Cond& c = cond_[cond_.count() - 1];
-      if (c.taken || !c.parent) {
-        c.active = false;
-      } else {
-        bool v = false;
-        if (!eval_if(arg, &v)) return false;
-        c.active = v;
-        c.taken = v;
-      }
-      return true;
-    }
-    if (dir.equals("else")) {
-      if (cond_.count() == 0) return fail("#else without #if");
-      Cond& c = cond_[cond_.count() - 1];
-      c.active = c.parent && !c.taken;
-      c.taken = true;
-      return true;
-    }
-    if (dir.equals("endif")) {
-      if (cond_.count() == 0) return fail("#endif without #if");
-      cond_.remove_at(cond_.count() - 1);
-      return true;
-    }
-    if (!active()) return true;
-    if (dir.equals("define")) return define(arg);
-    if (dir.equals("undef")) {
-      undef(first_word(arg));
-      return true;
-    }
-    if (dir.equals("version")) {
-      uint32_t v = 0;
-      for (uint64_t i = 0; i < arg.size() && is_digit(arg[i]); ++i) v = v * 10 + static_cast<uint32_t>(arg[i] - '0');
-      *version = v;
-      undef("__VERSION__");
-      define_simple("__VERSION__", v == 300 ? "300" : "100");
-      return true;
-    }
-    if (dir.equals("error")) {
-      error_->assign("#error ");
-      error_->append(arg);
-      return false;
-    }
-    return true;   // extension, pragma, line
-  }
-
-  static StringView first_word(StringView s) {
-    uint64_t e = 0;
-    while (e < s.size() && is_ident(s[e])) ++e;
-    return s.substr(0, e);
-  }
-
-  bool define(StringView arg) {
-    const StringView name = first_word(arg);
-    if (name.empty()) return fail("bad #define");
-    UniquePointer<Macro> m = UniquePointer<Macro>::make(alloc_, alloc_);
-    if (!m) return fail("out of memory");
-    m->name.assign(name);
-    uint64_t i = name.size();
-    if (i < arg.size() && arg[i] == '(') {
-      m->function = true;
-      ++i;
-      while (i < arg.size() && arg[i] != ')') {
-        while (i < arg.size() && (is_space(arg[i]) || arg[i] == ',')) ++i;
-        uint64_t s = i;
-        while (i < arg.size() && is_ident(arg[i])) ++i;
-        if (i > s) {
-          UniquePointer<String> p = UniquePointer<String>::make(alloc_, alloc_);
-          if (!p) return fail("out of memory");
-          p->assign(arg.substr(s, i - s));
-          m->params.push_back(static_cast<UniquePointer<String>&&>(p));
-        } else if (i < arg.size() && arg[i] != ')') {
-          return fail("bad macro parameter");
-        }
-      }
-      ++i;
-    }
-    m->body.assign(trim(arg.substr(i < arg.size() ? i : arg.size())));
-    undef(name);
-    macros_.push_back(static_cast<UniquePointer<Macro>&&>(m));
-    return true;
-  }
-
-  // Replaces the macros in `text` and appends the result.
-  bool expand(StringView text, String* out, uint32_t depth) {
-    if (depth > 16) return fail("macro expansion too deep");
-    for (uint64_t i = 0; i < text.size();) {
-      const char c = text[i];
-      if (is_ident_start(c)) {
-        uint64_t j = i;
-        while (j < text.size() && is_ident(text[j])) ++j;
-        const StringView word = text.substr(i, j - i);
-        Macro* mac = find(word);
-        if (!mac) {
-          out->append(word);
-          i = j;
-          continue;
-        }
-        if (!mac->function) {
-          if (!expand(mac->body.view(), out, depth + 1)) return false;
-          i = j;
-          continue;
-        }
-        uint64_t k = j;
-        while (k < text.size() && is_space(text[k])) ++k;
-        if (k >= text.size() || text[k] != '(') {
-          out->append(word);
-          i = j;
-          continue;
-        }
-        // gather the arguments
-        List<UniquePointer<String>> args(alloc_);
-        ++k;
-        int level = 0;
-        uint64_t s = k;
-        for (; k < text.size(); ++k) {
-          const char ch = text[k];
-          if (ch == '(') ++level;
-          else if (ch == ')') {
-            if (level == 0) break;
-            --level;
-          } else if (ch == ',' && level == 0) {
-            UniquePointer<String> a = UniquePointer<String>::make(alloc_, alloc_);
-            if (!a) return fail("out of memory");
-            a->assign(trim(text.substr(s, k - s)));
-            args.push_back(static_cast<UniquePointer<String>&&>(a));
-            s = k + 1;
-          }
-        }
-        if (k >= text.size()) return fail("unterminated macro call");
-        {
-          UniquePointer<String> a = UniquePointer<String>::make(alloc_, alloc_);
-          if (!a) return fail("out of memory");
-          a->assign(trim(text.substr(s, k - s)));
-          if (!(args.count() == 0 && a->empty() && mac->params.count() == 0)) args.push_back(static_cast<UniquePointer<String>&&>(a));
-        }
-        // substitute
-        String body(alloc_);
-        const StringView b = mac->body.view();
-        for (uint64_t p = 0; p < b.size();) {
-          if (is_ident_start(b[p])) {
-            uint64_t q = p;
-            while (q < b.size() && is_ident(b[q])) ++q;
-            const StringView id = b.substr(p, q - p);
-            bool replaced = false;
-            for (uint64_t pi = 0; pi < mac->params.count(); ++pi)
-              if (mac->params[pi]->view().equals(id)) {
-                if (pi < args.count()) body.append(args[pi]->view());
-                replaced = true;
-                break;
-              }
-            if (!replaced) body.append(id);
-            p = q;
-          } else {
-            body.push_back(b[p++]);
-          }
-        }
-        if (!expand(body.view(), out, depth + 1)) return false;
-        i = k + 1;
-        continue;
-      }
-      if (is_digit(c)) {   // keep numbers (and their suffixes) whole
-        uint64_t j = i;
-        while (j < text.size() && (is_ident(text[j]) || text[j] == '.')) ++j;
-        out->append(text.substr(i, j - i));
-        i = j;
-        continue;
-      }
-      out->push_back(c);
-      ++i;
-    }
-    return true;
-  }
-
-  // #if expressions
-  struct Cur {
-    StringView s;
-    uint64_t i = 0;
-  };
-
-  bool eval_if(StringView arg, bool* result) {
-    // replace defined(X) / defined X first, expand the rest, then evaluate
-    String pre(alloc_);
-    for (uint64_t i = 0; i < arg.size();) {
-      if (is_ident_start(arg[i])) {
-        uint64_t j = i;
-        while (j < arg.size() && is_ident(arg[j])) ++j;
-        if (arg.substr(i, j - i).equals("defined")) {
-          while (j < arg.size() && is_space(arg[j])) ++j;
-          bool paren = false;
-          if (j < arg.size() && arg[j] == '(') {
-            paren = true;
-            ++j;
-          }
-          while (j < arg.size() && is_space(arg[j])) ++j;
-          uint64_t s = j;
-          while (j < arg.size() && is_ident(arg[j])) ++j;
-          pre.append(find(arg.substr(s, j - s)) ? "1" : "0");
-          if (paren) {
-            while (j < arg.size() && arg[j] != ')') ++j;
-            ++j;
-          }
-          i = j;
-          continue;
-        }
-        pre.append(arg.substr(i, j - i));
-        i = j;
-        continue;
-      }
-      pre.push_back(arg[i++]);
-    }
-    String ex(alloc_);
-    if (!expand(pre.view(), &ex, 0)) return false;
-    Cur c;
-    c.s = ex.view();
-    int64_t v = 0;
-    if (!parse_or(c, &v)) return fail("bad #if expression");
-    *result = v != 0;
-    return true;
-  }
-
-  static void skip(Cur& c) {
-    while (c.i < c.s.size() && is_space(c.s[c.i])) ++c.i;
-  }
-  static bool eat(Cur& c, const char* op) {
-    skip(c);
-    const StringView o(op);
-    if (c.s.size() - c.i >= o.size() && c.s.substr(c.i, o.size()).equals(o)) {
-      c.i += o.size();
-      return true;
-    }
-    return false;
-  }
-  bool parse_or(Cur& c, int64_t* v) {
-    if (!parse_and(c, v)) return false;
-    while (eat(c, "||")) {
-      int64_t r;
-      if (!parse_and(c, &r)) return false;
-      *v = (*v || r);
-    }
-    return true;
-  }
-  bool parse_and(Cur& c, int64_t* v) {
-    if (!parse_eq(c, v)) return false;
-    while (eat(c, "&&")) {
-      int64_t r;
-      if (!parse_eq(c, &r)) return false;
-      *v = (*v && r);
-    }
-    return true;
-  }
-  bool parse_eq(Cur& c, int64_t* v) {
-    if (!parse_rel(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "==")) { if (!parse_rel(c, &r)) return false; *v = *v == r; }
-      else if (eat(c, "!=")) { if (!parse_rel(c, &r)) return false; *v = *v != r; }
-      else return true;
-    }
-  }
-  bool parse_rel(Cur& c, int64_t* v) {
-    if (!parse_add(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "<=")) { if (!parse_add(c, &r)) return false; *v = *v <= r; }
-      else if (eat(c, ">=")) { if (!parse_add(c, &r)) return false; *v = *v >= r; }
-      else if (eat(c, "<")) { if (!parse_add(c, &r)) return false; *v = *v < r; }
-      else if (eat(c, ">")) { if (!parse_add(c, &r)) return false; *v = *v > r; }
-      else return true;
-    }
-  }
-  bool parse_add(Cur& c, int64_t* v) {
-    if (!parse_mul(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "+")) { if (!parse_mul(c, &r)) return false; *v += r; }
-      else if (eat(c, "-")) { if (!parse_mul(c, &r)) return false; *v -= r; }
-      else return true;
-    }
-  }
-  bool parse_mul(Cur& c, int64_t* v) {
-    if (!parse_unary(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "*")) { if (!parse_unary(c, &r)) return false; *v *= r; }
-      else if (eat(c, "/")) { if (!parse_unary(c, &r)) return false; *v = r ? *v / r : 0; }
-      else if (eat(c, "%")) { if (!parse_unary(c, &r)) return false; *v = r ? *v % r : 0; }
-      else return true;
-    }
-  }
-  bool parse_unary(Cur& c, int64_t* v) {
-    skip(c);
-    if (eat(c, "!")) { if (!parse_unary(c, v)) return false; *v = !*v; return true; }
-    if (eat(c, "-")) { if (!parse_unary(c, v)) return false; *v = -*v; return true; }
-    if (eat(c, "+")) return parse_unary(c, v);
-    if (eat(c, "(")) {
-      if (!parse_or(c, v)) return false;
-      return eat(c, ")");
-    }
-    if (c.i < c.s.size() && is_digit(c.s[c.i])) {
-      int64_t n = 0;
-      if (c.s[c.i] == '0' && c.i + 1 < c.s.size() && (c.s[c.i + 1] == 'x' || c.s[c.i + 1] == 'X')) {
-        c.i += 2;
-        while (c.i < c.s.size()) {
-          const char ch = c.s[c.i];
-          int d = is_digit(ch) ? ch - '0' : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10 : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
-          if (d < 0) break;
-          n = n * 16 + d;
-          ++c.i;
-        }
-      } else {
-        while (c.i < c.s.size() && is_digit(c.s[c.i])) n = n * 10 + (c.s[c.i++] - '0');
-      }
-      while (c.i < c.s.size() && (c.s[c.i] == 'u' || c.s[c.i] == 'U')) ++c.i;
-      *v = n;
-      return true;
-    }
-    if (c.i < c.s.size() && is_ident_start(c.s[c.i])) {   // an undefined name is 0
-      while (c.i < c.s.size() && is_ident(c.s[c.i])) ++c.i;
-      *v = 0;
-      return true;
-    }
-    return false;
-  }
-
-  allocators::IAllocator& alloc_;
-  List<UniquePointer<Macro>> macros_;
-  List<Cond> cond_;
-  String* error_;
-};
 
 // --- Lexer -----------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -1845,12 +1396,29 @@ class Parser {
 bool parse_glsl(Module& module, StringView source, Stage stage) {
   module.stage = stage;
   module.language = Language::Glsl100;
-  String pp(module.allocator);
-  uint32_t version = 100;
-  Preprocessor pre(module.allocator, &module.error);
-  if (!pre.run(source, &pp, &version)) {
-    if (module.error.empty()) module.error.assign("preprocessor error");
+  // The preprocessor is glcpp's (GlslPreprocessor.cpp). Its output keeps #version, #extension, #pragma and #line as lines: they are blanked here, keeping the line count.
+  PreprocessOptions options;
+  options.default_version = 100;
+  options.default_es = true;
+  PreprocessResult pre(module.allocator);
+  if (!preprocess_glsl(module.allocator, source, options, &pre)) {
+    module.error.assign(pre.log.empty() ? StringView("preprocessor error") : pre.log.view());
     return false;
+  }
+  const uint32_t version = pre.version;
+  String pp(module.allocator);
+  {
+    const StringView text = pre.output.view();
+    uint64_t i = 0;
+    while (i < text.size()) {
+      uint64_t end = i;
+      while (end < text.size() && text[end] != '\n') ++end;
+      uint64_t k = i;
+      while (k < end && (text[k] == ' ' || text[k] == '\t' || text[k] == '\r')) ++k;
+      if (k >= end || text[k] != '#') pp.append(text.substr(i, end - i));
+      if (end < text.size()) pp.append("\n");
+      i = end + 1;
+    }
   }
   module.glsl_version = version;
   if (version >= 300) module.language = Language::Glsl300;
