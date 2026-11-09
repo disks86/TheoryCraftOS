@@ -949,7 +949,42 @@ bool GlApi::list_expand_draw(uint32_t op, ConstByteView command) {
   }
 }
 
-// Fixed-function state for GLSL programs that read it comes with the compatibility built-ins: loaded here when the front end declares them.
-void GlApi::load_compat_uniforms(uint32_t) {}
+// The compatibility uniforms a desktop GLSL program reads (GlslDesktop.hpp), from the fixed-function state, before each of its draws.
+void GlApi::load_compat_uniforms(uint32_t program) {
+  const webgl::ProgramObj* po = gl_.program(program);
+  if (!po) return;
+  bool any = false;
+  for (uint64_t i = 0; i < po->uniforms.count() && !any; ++i) any = po->uniforms[i]->name.view().starts_with("tcos_");
+  if (!any) return;
+  const auto set = [&](const char* name, uint32_t n, const float* m) {
+    const int32_t loc = gl_.get_uniform_location(program, name);
+    if (loc < 0) return;
+    uint32_t lanes[16];
+    for (uint32_t i = 0; i < n * n; ++i) lanes[i] = __builtin_bit_cast(uint32_t, m[i]);
+    gl_.uniform(loc, 'f', n, n, 1, lanes);
+  };
+  const Mat4& mv = modelview_.entries[modelview_.top];
+  const Mat4& pr = projection_.entries[projection_.top];
+  const Mat4 mvp = mat_multiply(pr, mv);
+  set("tcos_ModelViewMatrix", 4, mv.m);
+  set("tcos_ProjectionMatrix", 4, pr.m);
+  set("tcos_ModelViewProjectionMatrix", 4, mvp.m);
+  Mat4 inv;
+  mat_inverse(mv, &inv);
+  set("tcos_ModelViewMatrixInverse", 4, inv.m);
+  const float nm[9] = {inv.m[0], inv.m[4], inv.m[8], inv.m[1], inv.m[5], inv.m[9], inv.m[2], inv.m[6], inv.m[10]};
+  set("tcos_NormalMatrix", 3, nm);
+  const int32_t scale_loc = gl_.get_uniform_location(program, "tcos_NormalScale");
+  if (scale_loc >= 0) {
+    const float len = shader::fsqrt(inv.m[8] * inv.m[8] + inv.m[9] * inv.m[9] + inv.m[10] * inv.m[10]);
+    const uint32_t lane = __builtin_bit_cast(uint32_t, len > 0 ? 1.0f / len : 1.0f);
+    gl_.uniform(scale_loc, 'f', 1, 1, 1, &lane);
+  }
+  for (uint32_t u = 0; u < kMaxTexUnits; ++u) {
+    char name[24] = "tcos_TextureMatrix[0]";
+    name[19] = static_cast<char>('0' + u);
+    set(name, 4, texture_stack_[u].entries[texture_stack_[u].top].m);
+  }
+}
 
 }  // namespace opengl

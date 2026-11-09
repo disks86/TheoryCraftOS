@@ -18,6 +18,7 @@
 
 // Buffer objects, vertex array objects, renderbuffers and framebuffers.
 #include "OpenGl/GlApi.hpp"
+#include "OpenGl/GlSurface.hpp"
 #include "OpenGl/generated/GlEnums.inc"
 
 namespace opengl {
@@ -27,24 +28,24 @@ namespace opengl {
 void GlApi::glGenBuffers(GLsizei n, UserPtr buffers) {
   if (n < 0) { error(GL_INVALID_VALUE); return; }
   for (int32_t i = 0; i < n; ++i) {
-    const uint32_t name = group_.buffers.generate();
+    const uint32_t name = group_->buffers.generate();
     if (!write_values(buffers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
   }
 }
 void GlApi::glCreateBuffers(GLsizei n, UserPtr buffers) {
   if (n < 0) { error(GL_INVALID_VALUE); return; }
   for (int32_t i = 0; i < n; ++i) {
-    const uint32_t name = group_.buffers.generate();
+    const uint32_t name = group_->buffers.generate();
     engine_buffer(name);
     if (!write_values(buffers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
   }
 }
 
 uint32_t GlApi::engine_buffer(uint32_t name) {
-  uint32_t object = group_.buffers.object(name);
+  uint32_t object = group_->buffers.object(name);
   if (!object) {
     object = gl_.create_buffer();
-    group_.buffers.set(name, object);
+    group_->buffers.set(name, object);
   }
   return object;
 }
@@ -55,19 +56,19 @@ void GlApi::glDeleteBuffers(GLsizei n, UserPtr buffers) {
     uint32_t name = 0;
     if (!read_values(buffers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
     if (!name) continue;
-    const uint32_t object = group_.buffers.object(name);
+    const uint32_t object = group_->buffers.object(name);
     if (object) {
       unmap_engine_buffer(object, false);
       gl_.delete_object('b', object);
     }
-    group_.buffers.erase(name);
+    group_->buffers.erase(name);
   }
 }
 
-uint64_t GlApi::glIsBuffer(GLuint buffer) { return buffer && group_.buffers.object(buffer) != 0; }
+uint64_t GlApi::glIsBuffer(GLuint buffer) { return buffer && group_->buffers.object(buffer) != 0; }
 
 void GlApi::glBindBuffer(GLenum target, GLuint buffer) {
-  if (buffer && config_.core_profile && !group_.buffers.known(buffer)) { error(GL_INVALID_OPERATION); return; }
+  if (buffer && config_.core_profile && !group_->buffers.known(buffer)) { error(GL_INVALID_OPERATION); return; }
   gl_.bind_buffer(target, buffer ? engine_buffer(buffer) : 0);
 }
 
@@ -87,7 +88,7 @@ void GlApi::glBufferData(GLenum target, GLsizeiptr size, UserPtr data, GLenum us
   const uint32_t object = gl_.bound_buffer(target);
   buffer_data_named(object, size, data, usage);
 }
-void GlApi::glNamedBufferData(GLuint buffer, GLsizeiptr size, UserPtr data, GLenum usage) { buffer_data_named(group_.buffers.object(buffer), size, data, usage); }
+void GlApi::glNamedBufferData(GLuint buffer, GLsizeiptr size, UserPtr data, GLenum usage) { buffer_data_named(group_->buffers.object(buffer), size, data, usage); }
 
 void GlApi::buffer_storage_named(uint32_t object, int64_t size, UserPtr data, uint32_t flags) {
   if (size <= 0) { error(GL_INVALID_VALUE); return; }
@@ -100,7 +101,7 @@ void GlApi::buffer_storage_named(uint32_t object, int64_t size, UserPtr data, ui
   if (!data.null() && !read_client(data, b->data.writable_view())) error(GL_INVALID_VALUE);
 }
 void GlApi::glBufferStorage(GLenum target, GLsizeiptr size, UserPtr data, GLbitfield flags) { buffer_storage_named(gl_.bound_buffer(target), size, data, flags); }
-void GlApi::glNamedBufferStorage(GLuint buffer, GLsizeiptr size, UserPtr data, GLbitfield flags) { buffer_storage_named(group_.buffers.object(buffer), size, data, flags); }
+void GlApi::glNamedBufferStorage(GLuint buffer, GLsizeiptr size, UserPtr data, GLbitfield flags) { buffer_storage_named(group_->buffers.object(buffer), size, data, flags); }
 
 void GlApi::buffer_sub_data_named(uint32_t object, int64_t offset, int64_t size, UserPtr data) {
   if (offset < 0 || size < 0) { error(GL_INVALID_VALUE); return; }
@@ -111,7 +112,7 @@ void GlApi::buffer_sub_data_named(uint32_t object, int64_t offset, int64_t size,
   if (size && !read_client(data, part)) error(GL_INVALID_VALUE);
 }
 void GlApi::glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, UserPtr data) { buffer_sub_data_named(gl_.bound_buffer(target), offset, size, data); }
-void GlApi::glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, UserPtr data) { buffer_sub_data_named(group_.buffers.object(buffer), offset, size, data); }
+void GlApi::glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, UserPtr data) { buffer_sub_data_named(group_->buffers.object(buffer), offset, size, data); }
 
 void GlApi::get_buffer_sub_data_named(uint32_t object, int64_t offset, int64_t size, UserPtr data) {
   if (offset < 0 || size < 0) { error(GL_INVALID_VALUE); return; }
@@ -122,13 +123,13 @@ void GlApi::get_buffer_sub_data_named(uint32_t object, int64_t offset, int64_t s
   if (!write_client(data, part)) error(GL_INVALID_VALUE);
 }
 void GlApi::glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, UserPtr data) { get_buffer_sub_data_named(gl_.bound_buffer(target), offset, size, data); }
-void GlApi::glGetNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, UserPtr data) { get_buffer_sub_data_named(group_.buffers.object(buffer), offset, size, data); }
+void GlApi::glGetNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, UserPtr data) { get_buffer_sub_data_named(group_->buffers.object(buffer), offset, size, data); }
 
 void GlApi::glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
   copy_buffer_named(gl_.bound_buffer(readTarget), gl_.bound_buffer(writeTarget), readOffset, writeOffset, size);
 }
 void GlApi::glCopyNamedBufferSubData(GLuint readBuffer, GLuint writeBuffer, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
-  copy_buffer_named(group_.buffers.object(readBuffer), group_.buffers.object(writeBuffer), readOffset, writeOffset, size);
+  copy_buffer_named(group_->buffers.object(readBuffer), group_->buffers.object(writeBuffer), readOffset, writeOffset, size);
 }
 void GlApi::copy_buffer_named(uint32_t from, uint32_t to, int64_t ro, int64_t wo, int64_t size) {
   webgl::Buffer* r = gl_.buffer_at(from);
@@ -217,18 +218,18 @@ uint64_t GlApi::glMapBuffer(GLenum target, GLenum access) {
 }
 uint64_t GlApi::glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) { return map_named(gl_.bound_buffer(target), offset, length, access); }
 uint64_t GlApi::glMapNamedBuffer(GLuint buffer, GLenum access) {
-  const uint32_t object = group_.buffers.object(buffer);
+  const uint32_t object = group_->buffers.object(buffer);
   const webgl::Buffer* b = gl_.buffer_at(object);
   if (!b) { error(GL_INVALID_OPERATION); return 0; }
   return map_named(object, 0, static_cast<int64_t>(b->data.size()), access == GL_READ_ONLY ? GL_MAP_READ_BIT : access == GL_WRITE_ONLY ? GL_MAP_WRITE_BIT : GL_MAP_READ_BIT | GL_MAP_WRITE_BIT);
 }
-uint64_t GlApi::glMapNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length, GLbitfield access) { return map_named(group_.buffers.object(buffer), offset, length, access); }
+uint64_t GlApi::glMapNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length, GLbitfield access) { return map_named(group_->buffers.object(buffer), offset, length, access); }
 uint64_t GlApi::glUnmapBuffer(GLenum target) {
   if (!unmap_engine_buffer(gl_.bound_buffer(target), true)) { error(GL_INVALID_OPERATION); return 0; }
   return 1;
 }
 uint64_t GlApi::glUnmapNamedBuffer(GLuint buffer) {
-  if (!unmap_engine_buffer(group_.buffers.object(buffer), true)) { error(GL_INVALID_OPERATION); return 0; }
+  if (!unmap_engine_buffer(group_->buffers.object(buffer), true)) { error(GL_INVALID_OPERATION); return 0; }
   return 1;
 }
 void GlApi::flush_range(uint32_t object, int64_t offset, int64_t length) {
@@ -239,7 +240,7 @@ void GlApi::flush_range(uint32_t object, int64_t offset, int64_t length) {
   if (b && length) memory_->read(m->address + static_cast<uint64_t>(offset), b->data.writable_view().subview(m->offset + static_cast<uint64_t>(offset), static_cast<uint64_t>(length)));
 }
 void GlApi::glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) { flush_range(gl_.bound_buffer(target), offset, length); }
-void GlApi::glFlushMappedNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length) { flush_range(group_.buffers.object(buffer), offset, length); }
+void GlApi::glFlushMappedNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length) { flush_range(group_->buffers.object(buffer), offset, length); }
 
 void GlApi::buffer_param_get(uint32_t object, uint32_t pname, int64_t* out) {
   const webgl::Buffer* b = gl_.buffer_at(object);
@@ -271,13 +272,13 @@ void GlApi::glGetBufferParameteri64v(GLenum target, GLenum pname, UserPtr params
 }
 void GlApi::glGetNamedBufferParameteriv(GLuint buffer, GLenum pname, UserPtr params) {
   int64_t v = 0;
-  buffer_param_get(group_.buffers.object(buffer), pname, &v);
+  buffer_param_get(group_->buffers.object(buffer), pname, &v);
   const int32_t i = static_cast<int32_t>(v);
   write_values(params, &i, 1);
 }
 void GlApi::glGetNamedBufferParameteri64v(GLuint buffer, GLenum pname, UserPtr params) {
   int64_t v = 0;
-  buffer_param_get(group_.buffers.object(buffer), pname, &v);
+  buffer_param_get(group_->buffers.object(buffer), pname, &v);
   write_values(params, &v, 1);
 }
 void GlApi::glGetBufferPointerv(GLenum target, GLenum pname, UserPtr params) {
@@ -288,7 +289,7 @@ void GlApi::glGetBufferPointerv(GLenum target, GLenum pname, UserPtr params) {
 }
 void GlApi::glGetNamedBufferPointerv(GLuint buffer, GLenum pname, UserPtr params) {
   if (pname != GL_BUFFER_MAP_POINTER) { error(GL_INVALID_ENUM); return; }
-  const Mapping* m = find_mapping(group_.buffers.object(buffer));
+  const Mapping* m = find_mapping(group_->buffers.object(buffer));
   const uint64_t address = m ? m->address : 0;
   write_values(params, &address, 1);
 }
@@ -362,7 +363,7 @@ void GlApi::glBindVertexArray(GLuint array) {
 void GlApi::glGenRenderbuffers(GLsizei n, UserPtr renderbuffers) {
   if (n < 0) { error(GL_INVALID_VALUE); return; }
   for (int32_t i = 0; i < n; ++i) {
-    const uint32_t name = group_.renderbuffers.generate();
+    const uint32_t name = group_->renderbuffers.generate();
     if (!write_values(renderbuffers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
   }
 }
@@ -372,19 +373,19 @@ void GlApi::glDeleteRenderbuffers(GLsizei n, UserPtr renderbuffers) {
     uint32_t name = 0;
     if (!read_values(renderbuffers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
     if (!name) continue;
-    const uint32_t object = group_.renderbuffers.object(name);
+    const uint32_t object = group_->renderbuffers.object(name);
     if (object) gl_.delete_object('r', object);
-    group_.renderbuffers.erase(name);
+    group_->renderbuffers.erase(name);
   }
 }
-uint64_t GlApi::glIsRenderbuffer(GLuint renderbuffer) { return renderbuffer && group_.renderbuffers.object(renderbuffer) != 0; }
+uint64_t GlApi::glIsRenderbuffer(GLuint renderbuffer) { return renderbuffer && group_->renderbuffers.object(renderbuffer) != 0; }
 void GlApi::glBindRenderbuffer(GLenum target, GLuint renderbuffer) {
   if (target != GL_RENDERBUFFER) { error(GL_INVALID_ENUM); return; }
   if (!renderbuffer) { gl_.bind_renderbuffer(0); return; }
-  uint32_t object = group_.renderbuffers.object(renderbuffer);
+  uint32_t object = group_->renderbuffers.object(renderbuffer);
   if (!object) {
     object = gl_.create_renderbuffer();
-    group_.renderbuffers.set(renderbuffer, object);
+    group_->renderbuffers.set(renderbuffer, object);
   }
   gl_.bind_renderbuffer(object);
 }
@@ -445,20 +446,20 @@ uint64_t GlApi::glCheckFramebufferStatus(GLenum target) {
 }
 void GlApi::glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
   if (renderbuffertarget != GL_RENDERBUFFER) { error(GL_INVALID_ENUM); return; }
-  gl_.framebuffer_renderbuffer(target, attachment, renderbuffer ? group_.renderbuffers.object(renderbuffer) : 0);
+  gl_.framebuffer_renderbuffer(target, attachment, renderbuffer ? group_->renderbuffers.object(renderbuffer) : 0);
 }
 void GlApi::attach_texture(uint32_t target, uint32_t attachment, uint32_t textarget, uint32_t texture, int32_t level, int32_t layer) {
-  gl_.framebuffer_texture(target, attachment, textarget, texture ? group_.textures.object(texture) : 0, level, layer);
+  gl_.framebuffer_texture(target, attachment, textarget, texture ? group_->textures.object(texture) : 0, level, layer);
 }
 void GlApi::glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) { attach_texture(target, attachment, textarget, texture, level, 0); }
 void GlApi::glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) { attach_texture(target, attachment, textarget, texture, level, 0); }
 void GlApi::glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) { attach_texture(target, attachment, textarget, texture, level, zoffset); }
 void GlApi::glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture, GLint level, GLint layer) {
-  const webgl::Texture* t = texture ? gl_.texture_at(group_.textures.object(texture)) : nullptr;
+  const webgl::Texture* t = texture ? gl_.texture_at(group_->textures.object(texture)) : nullptr;
   attach_texture(target, attachment, t ? t->target : GL_TEXTURE_2D_ARRAY, texture, level, layer);
 }
 void GlApi::glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
-  const webgl::Texture* t = texture ? gl_.texture_at(group_.textures.object(texture)) : nullptr;
+  const webgl::Texture* t = texture ? gl_.texture_at(group_->textures.object(texture)) : nullptr;
   attach_texture(target, attachment, t ? (t->target == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP_POSITIVE_X : t->target) : GL_TEXTURE_2D, texture, level, 0);
 }
 void GlApi::glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, UserPtr params) {
@@ -670,6 +671,82 @@ void GlApi::glClearBufferuiv(GLenum buffer, GLint drawbuffer, UserPtr value) {
 void GlApi::glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
   if (buffer != GL_DEPTH_STENCIL) { error(GL_INVALID_ENUM); return; }
   gl_.clear_buffer_fi(drawbuffer, depth, stencil);
+}
+
+}  // namespace opengl
+
+namespace opengl {
+
+// --- Framebuffer parameters (GL 4.3/4.5, EXT_direct_state_access). Framebuffers without attachments are not drawn to: their default size reads back as set.
+
+void GlApi::glCreateFramebuffers(GLsizei n, UserPtr framebuffers) {
+  if (n < 0) { error(GL_INVALID_VALUE); return; }
+  for (int32_t i = 0; i < n; ++i) {
+    const uint32_t name = fbo_names_.generate();
+    fbo_names_.set(name, gl_.create_framebuffer());
+    if (!write_values(framebuffers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
+  }
+}
+
+void GlApi::glCreateRenderbuffers(GLsizei n, UserPtr renderbuffers) {
+  if (n < 0) { error(GL_INVALID_VALUE); return; }
+  for (int32_t i = 0; i < n; ++i) {
+    const uint32_t name = group_->renderbuffers.generate();
+    group_->renderbuffers.set(name, gl_.create_renderbuffer());
+    if (!write_values(renderbuffers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
+  }
+}
+
+// `object` the engine's framebuffer (0 the default one). `draw_read`: GL_DRAW_BUFFER and GL_READ_BUFFER may be asked (only the EXT_direct_state_access query allows them).
+bool GlApi::framebuffer_parameter(uint32_t object, uint32_t pname, bool draw_read, int32_t* out) {
+  switch (pname) {
+    case GL_DOUBLEBUFFER: *out = object == 0 && surface_ && surface_->double_buffered(); return true;
+    case GL_STEREO: *out = 0; return true;
+    case GL_SAMPLES: case GL_SAMPLE_BUFFERS: *out = 0; return true;
+    case GL_IMPLEMENTATION_COLOR_READ_FORMAT: *out = GL_RGBA; return true;
+    case GL_IMPLEMENTATION_COLOR_READ_TYPE: *out = GL_UNSIGNED_BYTE; return true;
+    case GL_FRAMEBUFFER_DEFAULT_WIDTH: case GL_FRAMEBUFFER_DEFAULT_HEIGHT: case GL_FRAMEBUFFER_DEFAULT_LAYERS: case GL_FRAMEBUFFER_DEFAULT_SAMPLES:
+    case GL_FRAMEBUFFER_DEFAULT_FIXED_SAMPLE_LOCATIONS:
+      if (object == 0) { error(GL_INVALID_OPERATION); return false; }
+      *out = fbo_defaults_[pname - GL_FRAMEBUFFER_DEFAULT_WIDTH];
+      return true;
+    case GL_DRAW_BUFFER: case GL_READ_BUFFER:
+      if (!draw_read) break;
+      if (object == 0) { *out = static_cast<int32_t>(pname == GL_DRAW_BUFFER ? default_draw_buffer_ : default_read_buffer_); return true; }
+      {
+        const webgl::Framebuffer* fb = gl_.fb_at(object);
+        if (!fb) { error(GL_INVALID_OPERATION); return false; }
+        *out = static_cast<int32_t>(pname == GL_DRAW_BUFFER ? fb->draw_buffers[0] : fb->read_buffer);
+        return true;
+      }
+    default: break;
+  }
+  error(GL_INVALID_ENUM);
+  return false;
+}
+
+void GlApi::glGetFramebufferParameteriv(GLenum target, GLenum pname, UserPtr params) {
+  if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) { error(GL_INVALID_ENUM); return; }
+  int32_t v = 0;
+  if (framebuffer_parameter(gl_.bound_framebuffer(target == GL_READ_FRAMEBUFFER ? GL_READ_FRAMEBUFFER : GL_DRAW_FRAMEBUFFER), pname, false, &v)) write_values(params, &v, 1);
+}
+void GlApi::glGetNamedFramebufferParameteriv(GLuint framebuffer, GLenum pname, UserPtr param) {
+  if (framebuffer && !fbo_names_.object(framebuffer)) { error(GL_INVALID_OPERATION); return; }
+  int32_t v = 0;
+  if (framebuffer_parameter(fbo_names_.object(framebuffer), pname, false, &v)) write_values(param, &v, 1);
+}
+void GlApi::glGetNamedFramebufferParameterivEXT(GLuint framebuffer, GLenum pname, UserPtr params) { glGetNamedFramebufferParameteriv(framebuffer, pname, params); }
+void GlApi::glGetFramebufferParameterivEXT(GLuint framebuffer, GLenum pname, UserPtr params) {
+  if (framebuffer && !fbo_names_.object(framebuffer)) { error(GL_INVALID_OPERATION); return; }
+  int32_t v = 0;
+  if (framebuffer_parameter(fbo_names_.object(framebuffer), pname, true, &v)) write_values(params, &v, 1);
+}
+void GlApi::glFramebufferParameteri(GLenum target, GLenum pname, GLint param) {
+  if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) { error(GL_INVALID_ENUM); return; }
+  if (pname < GL_FRAMEBUFFER_DEFAULT_WIDTH || pname > GL_FRAMEBUFFER_DEFAULT_FIXED_SAMPLE_LOCATIONS) { error(GL_INVALID_ENUM); return; }
+  if (gl_.bound_framebuffer(target == GL_READ_FRAMEBUFFER ? GL_READ_FRAMEBUFFER : GL_DRAW_FRAMEBUFFER) == 0) { error(GL_INVALID_OPERATION); return; }
+  if (param < 0) { error(GL_INVALID_VALUE); return; }
+  fbo_defaults_[pname - GL_FRAMEBUFFER_DEFAULT_WIDTH] = param;
 }
 
 }  // namespace opengl

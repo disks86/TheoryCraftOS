@@ -35,7 +35,7 @@ const char* const kExtensions[] = {
     "GL_EXT_abgr", "GL_EXT_bgra", "GL_EXT_blend_color", "GL_EXT_blend_minmax", "GL_EXT_blend_subtract", "GL_EXT_blend_func_separate", "GL_EXT_draw_range_elements", "GL_EXT_multi_draw_arrays", "GL_EXT_packed_pixels",
     "GL_EXT_packed_depth_stencil", "GL_EXT_rescale_normal", "GL_EXT_secondary_color", "GL_EXT_separate_specular_color", "GL_EXT_stencil_wrap", "GL_EXT_texture_edge_clamp", "GL_EXT_texture3D", "GL_EXT_texture_env_add", "GL_EXT_texture_env_combine",
     "GL_EXT_texture_filter_anisotropic", "GL_EXT_texture_compression_s3tc", "GL_EXT_texture_sRGB", "GL_EXT_framebuffer_object", "GL_EXT_framebuffer_blit", "GL_EXT_vertex_array", "GL_EXT_fog_coord", "GL_EXT_polygon_offset", "GL_EXT_texture_object",
-    "GL_NV_blend_square", "GL_SGIS_generate_mipmap", "GL_SGIS_texture_edge_clamp", "GL_SGIS_texture_lod", "GL_IBM_texture_mirrored_repeat", "GL_KHR_debug"};
+    "GL_NV_blend_square", "GL_SGIS_generate_mipmap", "GL_SGIS_texture_edge_clamp", "GL_SGIS_texture_lod", "GL_IBM_texture_mirrored_repeat"};
 constexpr uint32_t kExtensionCount = sizeof(kExtensions) / sizeof(kExtensions[0]) - 0;
 
 bool real_extension(const char* e) { return StringView(e) != StringView("GL_ARB_blend_func_extended_unavailable_placeholder"); }
@@ -110,11 +110,11 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
       case 0: return at.bgra ? GL_BGRA : at.size;
       case 1: return at.type;
       case 2: return at.stride;
-      default: return at.from_client ? 0 : group_.buffers.name_of(at.buffer);
+      default: return at.from_client ? 0 : group_->buffers.name_of(at.buffer);
     }
   };
   // Names of bound objects instead of the engine's numbers.
-  const auto texture_name = [&](uint32_t object, uint32_t index) { return object == default_textures_[index] ? 0.0 : static_cast<double>(group_.textures.name_of(object)); };
+  const auto texture_name = [&](uint32_t object, uint32_t index) { return object == default_textures_[index] ? 0.0 : static_cast<double>(group_->textures.name_of(object)); };
   const webgl::TextureUnit& eu = gl_.units_[gl_.active_unit_];
   switch (pname) {
     // Limits and versions
@@ -266,19 +266,19 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
     case GL_TEXTURE_BINDING_RECTANGLE: return one(texture_name(eu.rect, 4));
     case GL_TEXTURE_BINDING_2D_ARRAY: return one(texture_name(eu.array, 5));
     case GL_TEXTURE_BINDING_1D_ARRAY: return one(texture_name(eu.array1d, 6));
-    case GL_SAMPLER_BINDING: return one(group_.samplers.name_of(eu.sampler));
-    case GL_CURRENT_PROGRAM: return one(user_program_ ? group_.shaders_and_programs.name_of(user_program_ | kProgramObjectBit) : 0);
+    case GL_SAMPLER_BINDING: return one(group_->samplers.name_of(eu.sampler));
+    case GL_CURRENT_PROGRAM: return one(user_program_ ? group_->shaders_and_programs.name_of(user_program_ | kProgramObjectBit) : 0);
     case GL_VERTEX_ARRAY_BINDING: return one(vao_names_.name_of(gl_.vao_id_));
-    case GL_ARRAY_BUFFER_BINDING: return one(group_.buffers.name_of(gl_.array_buffer_));
-    case GL_ELEMENT_ARRAY_BUFFER_BINDING: return one(group_.buffers.name_of(vao->element_buffer));
-    case GL_PIXEL_PACK_BUFFER_BINDING: return one(group_.buffers.name_of(gl_.pixel_pack_));
-    case GL_PIXEL_UNPACK_BUFFER_BINDING: return one(group_.buffers.name_of(gl_.pixel_unpack_));
-    case GL_UNIFORM_BUFFER_BINDING: return one(group_.buffers.name_of(gl_.uniform_buffer_));
-    case GL_COPY_READ_BUFFER_BINDING: return one(group_.buffers.name_of(gl_.copy_read_));
-    case GL_COPY_WRITE_BUFFER_BINDING: return one(group_.buffers.name_of(gl_.copy_write_));
+    case GL_ARRAY_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.array_buffer_));
+    case GL_ELEMENT_ARRAY_BUFFER_BINDING: return one(group_->buffers.name_of(vao->element_buffer));
+    case GL_PIXEL_PACK_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.pixel_pack_));
+    case GL_PIXEL_UNPACK_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.pixel_unpack_));
+    case GL_UNIFORM_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.uniform_buffer_));
+    case GL_COPY_READ_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.copy_read_));
+    case GL_COPY_WRITE_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.copy_write_));
     case GL_FRAMEBUFFER_BINDING: return one(fbo_names_.name_of(gl_.draw_fb_));
     case GL_READ_FRAMEBUFFER_BINDING: return one(fbo_names_.name_of(gl_.read_fb_));
-    case GL_RENDERBUFFER_BINDING: return one(group_.renderbuffers.name_of(gl_.rb_bound_));
+    case GL_RENDERBUFFER_BINDING: return one(group_->renderbuffers.name_of(gl_.rb_bound_));
     case GL_VERTEX_ARRAY_SIZE: return one(array_info(kAttrVertex, 0));
     case GL_VERTEX_ARRAY_TYPE: return one(array_info(kAttrVertex, 1));
     case GL_VERTEX_ARRAY_STRIDE: return one(array_info(kAttrVertex, 2));
@@ -417,7 +417,7 @@ void GlApi::glGetDoublev(GLenum pname, UserPtr data) {
 void GlApi::glGetIntegeri_v(GLenum target, GLuint index, UserPtr data) {
   int32_t out = 0;
   switch (target) {
-    case GL_UNIFORM_BUFFER_BINDING: if (index >= webgl::kMaxUniformBindings) { error(GL_INVALID_VALUE); return; } out = static_cast<int32_t>(group_.buffers.name_of(gl_.ubo_bindings_[index].buffer)); break;
+    case GL_UNIFORM_BUFFER_BINDING: if (index >= webgl::kMaxUniformBindings) { error(GL_INVALID_VALUE); return; } out = static_cast<int32_t>(group_->buffers.name_of(gl_.ubo_bindings_[index].buffer)); break;
     case GL_UNIFORM_BUFFER_START: if (index >= webgl::kMaxUniformBindings) { error(GL_INVALID_VALUE); return; } out = static_cast<int32_t>(gl_.ubo_bindings_[index].offset); break;
     case GL_UNIFORM_BUFFER_SIZE: if (index >= webgl::kMaxUniformBindings) { error(GL_INVALID_VALUE); return; } out = static_cast<int32_t>(gl_.ubo_bindings_[index].size); break;
     default: error(GL_INVALID_ENUM); return;

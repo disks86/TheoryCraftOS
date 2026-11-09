@@ -32,9 +32,7 @@ bool is_cube_face(uint32_t t) { return t >= 0x8515 && t <= 0x851A; }
 }  // namespace
 
 GlContext::GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32_t height, const Attributes& attrs, GlObjects* shared)
-    : a_(a), es3_(es3), attrs_(attrs), width_(width), height_(height), own_objects_(a), buffers_(shared ? shared->buffers : own_objects_.buffers),
-      textures_(shared ? shared->textures : own_objects_.textures), fbos_(a), rbos_(shared ? shared->rbos : own_objects_.rbos), shaders_(shared ? shared->shaders : own_objects_.shaders),
-      programs_(shared ? shared->programs : own_objects_.programs), vaos_(a), samplers_(shared ? shared->samplers : own_objects_.samplers), queries_(a), tfs_(a),
+    : a_(a), es3_(es3), attrs_(attrs), width_(width), height_(height), own_objects_(a), objects_(shared ? shared : &own_objects_), fbos_(a), vaos_(a), queries_(a), tfs_(a),
       own_color_(a), own_depth_(a), hw_textures_(a) {
   dcolor_ = dread_ = &own_color_;
   ddepth_ = &own_depth_;
@@ -107,13 +105,13 @@ uint32_t GlContext::get_error() {
 
 uint32_t GlContext::create_buffer() {
   UniquePointer<Buffer> b = UniquePointer<Buffer>::make(a_, a_);
-  if (!b || !buffers_.push_back(static_cast<UniquePointer<Buffer>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
-  return static_cast<uint32_t>(buffers_.count());
+  if (!b || !objects_->buffers.push_back(static_cast<UniquePointer<Buffer>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
+  return static_cast<uint32_t>(objects_->buffers.count());
 }
 uint32_t GlContext::create_texture() {
   UniquePointer<Texture> b = UniquePointer<Texture>::make(a_, a_);
-  if (!b || !textures_.push_back(static_cast<UniquePointer<Texture>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
-  return static_cast<uint32_t>(textures_.count());
+  if (!b || !objects_->textures.push_back(static_cast<UniquePointer<Texture>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
+  return static_cast<uint32_t>(objects_->textures.count());
 }
 uint32_t GlContext::create_framebuffer() {
   UniquePointer<Framebuffer> b = UniquePointer<Framebuffer>::make(a_);
@@ -122,21 +120,21 @@ uint32_t GlContext::create_framebuffer() {
 }
 uint32_t GlContext::create_renderbuffer() {
   UniquePointer<Renderbuffer> b = UniquePointer<Renderbuffer>::make(a_, a_);
-  if (!b || !rbos_.push_back(static_cast<UniquePointer<Renderbuffer>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
-  return static_cast<uint32_t>(rbos_.count());
+  if (!b || !objects_->rbos.push_back(static_cast<UniquePointer<Renderbuffer>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
+  return static_cast<uint32_t>(objects_->rbos.count());
 }
 uint32_t GlContext::create_shader(uint32_t type) {
   if (type != 0x8B31 && type != 0x8B30) { set_error(INVALID_ENUM); return 0; }
   UniquePointer<ShaderObj> b = UniquePointer<ShaderObj>::make(a_, a_);
   if (!b) { set_error(OUT_OF_MEMORY); return 0; }
   b->type = type;
-  shaders_.push_back(static_cast<UniquePointer<ShaderObj>&&>(b));
-  return static_cast<uint32_t>(shaders_.count());
+  objects_->shaders.push_back(static_cast<UniquePointer<ShaderObj>&&>(b));
+  return static_cast<uint32_t>(objects_->shaders.count());
 }
 uint32_t GlContext::create_program() {
   UniquePointer<ProgramObj> b = UniquePointer<ProgramObj>::make(a_, a_);
-  if (!b || !programs_.push_back(static_cast<UniquePointer<ProgramObj>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
-  return static_cast<uint32_t>(programs_.count());
+  if (!b || !objects_->programs.push_back(static_cast<UniquePointer<ProgramObj>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
+  return static_cast<uint32_t>(objects_->programs.count());
 }
 uint32_t GlContext::create_vao() {
   UniquePointer<Vao> b = UniquePointer<Vao>::make(a_);
@@ -145,8 +143,8 @@ uint32_t GlContext::create_vao() {
 }
 uint32_t GlContext::create_sampler() {
   UniquePointer<SamplerObj> b = UniquePointer<SamplerObj>::make(a_);
-  if (!b || !samplers_.push_back(static_cast<UniquePointer<SamplerObj>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
-  return static_cast<uint32_t>(samplers_.count());
+  if (!b || !objects_->samplers.push_back(static_cast<UniquePointer<SamplerObj>&&>(b))) { set_error(OUT_OF_MEMORY); return 0; }
+  return static_cast<uint32_t>(objects_->samplers.count());
 }
 uint32_t GlContext::create_query() {
   UniquePointer<QueryObj> b = UniquePointer<QueryObj>::make(a_);
@@ -163,9 +161,9 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
   if (!id) return;
   switch (kind) {
     case 'b':
-      if (id <= buffers_.count()) {
+      if (id <= objects_->buffers.count()) {
         if (buffer_at(id)) { total_bytes_ -= buffer_at(id)->data.size() < total_bytes_ ? buffer_at(id)->data.size() : total_bytes_; }
-        buffers_[id - 1].reset();
+        objects_->buffers[id - 1].reset();
         if (array_buffer_ == id) array_buffer_ = 0;
         if (copy_read_ == id) copy_read_ = 0;
         if (copy_write_ == id) copy_write_ = 0;
@@ -183,9 +181,9 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
       }
       break;
     case 't':
-      if (id <= textures_.count()) {
+      if (id <= objects_->textures.count()) {
         hw_forget_texture(id);
-        textures_[id - 1].reset();
+        objects_->textures[id - 1].reset();
         for (auto& u : units_) {
           if (u.tex2d == id) u.tex2d = 0;
           if (u.cube == id) u.cube = 0;
@@ -208,8 +206,8 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
       }
       break;
     case 'r':
-      if (id <= rbos_.count()) {
-        rbos_[id - 1].reset();
+      if (id <= objects_->rbos.count()) {
+        objects_->rbos[id - 1].reset();
         if (rb_bound_ == id) rb_bound_ = 0;
         for (auto& f : fbos_) {
           if (!f) continue;
@@ -220,17 +218,17 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
       }
       break;
     case 's':
-      if (id <= shaders_.count() && shaders_[id - 1]) {
-        shaders_[id - 1]->deleted = true;
+      if (id <= objects_->shaders.count() && objects_->shaders[id - 1]) {
+        objects_->shaders[id - 1]->deleted = true;
         bool attached = false;
-        for (auto& p : programs_) if (p && (p->vs == id || p->fs == id)) attached = true;
-        if (!attached) shaders_[id - 1].reset();
+        for (auto& p : objects_->programs) if (p && (p->vs == id || p->fs == id)) attached = true;
+        if (!attached) objects_->shaders[id - 1].reset();
       }
       break;
     case 'p':
-      if (id <= programs_.count() && programs_[id - 1]) {
-        if (program_ == id) programs_[id - 1]->deleted = true;
-        else programs_[id - 1].reset();
+      if (id <= objects_->programs.count() && objects_->programs[id - 1]) {
+        if (program_ == id) objects_->programs[id - 1]->deleted = true;
+        else objects_->programs[id - 1].reset();
       }
       break;
     case 'v':
@@ -239,7 +237,7 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
         if (vao_id_ == id) vao_id_ = 0;
       }
       break;
-    case 'a': if (id <= samplers_.count()) samplers_[id - 1].reset(); for (auto& u : units_) if (u.sampler == id) u.sampler = 0; break;
+    case 'a': if (id <= objects_->samplers.count()) objects_->samplers[id - 1].reset(); for (auto& u : units_) if (u.sampler == id) u.sampler = 0; break;
     case 'q': if (id <= queries_.count()) queries_[id - 1].reset(); break;
     case 'x': if (id <= tfs_.count()) tfs_[id - 1].reset(); if (tf_bound_ == id) tf_bound_ = 0; break;
     default: break;
@@ -249,14 +247,14 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
 bool GlContext::is_object(uint32_t kind, uint32_t id) const {
   if (!id) return false;
   switch (kind) {
-    case 'b': return id <= buffers_.count() && buffers_[id - 1] && buffers_[id - 1]->ever_bound;
-    case 't': return id <= textures_.count() && textures_[id - 1] && textures_[id - 1]->target != 0;
+    case 'b': return id <= objects_->buffers.count() && objects_->buffers[id - 1] && objects_->buffers[id - 1]->ever_bound;
+    case 't': return id <= objects_->textures.count() && objects_->textures[id - 1] && objects_->textures[id - 1]->target != 0;
     case 'f': return id <= fbos_.count() && fbos_[id - 1];
-    case 'r': return id <= rbos_.count() && rbos_[id - 1];
-    case 's': return id <= shaders_.count() && shaders_[id - 1];
-    case 'p': return id <= programs_.count() && programs_[id - 1];
+    case 'r': return id <= objects_->rbos.count() && objects_->rbos[id - 1];
+    case 's': return id <= objects_->shaders.count() && objects_->shaders[id - 1];
+    case 'p': return id <= objects_->programs.count() && objects_->programs[id - 1];
     case 'v': return id <= vaos_.count() && vaos_[id - 1];
-    case 'a': return id <= samplers_.count() && samplers_[id - 1];
+    case 'a': return id <= objects_->samplers.count() && objects_->samplers[id - 1];
     case 'q': return id <= queries_.count() && queries_[id - 1];
     case 'x': return id <= tfs_.count() && tfs_[id - 1];
     default: return false;
@@ -1063,7 +1061,7 @@ void GlContext::use_program(uint32_t id) {
   program_ = id;
   if (old && old != id) {
     ProgramObj* o = program_at(old);
-    if (o && o->deleted) programs_[old - 1].reset();
+    if (o && o->deleted) objects_->programs[old - 1].reset();
   }
 }
 

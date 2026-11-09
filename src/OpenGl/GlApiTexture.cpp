@@ -62,7 +62,7 @@ void shape_for_base(uint32_t base, float v[4]) {
 void GlApi::glGenTextures(GLsizei n, UserPtr textures) {
   if (n < 0) { error(GL_INVALID_VALUE); return; }
   for (int32_t i = 0; i < n; ++i) {
-    const uint32_t name = group_.textures.generate();
+    const uint32_t name = group_->textures.generate();
     if (!write_values(textures.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
   }
 }
@@ -70,7 +70,7 @@ void GlApi::glGenTextures(GLsizei n, UserPtr textures) {
 void GlApi::glCreateTextures(GLenum target, GLsizei n, UserPtr textures) {
   if (n < 0) { error(GL_INVALID_VALUE); return; }
   for (int32_t i = 0; i < n; ++i) {
-    const uint32_t name = group_.textures.generate();
+    const uint32_t name = group_->textures.generate();
     engine_texture(name, target);
     if (!write_values(textures.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
   }
@@ -82,7 +82,7 @@ void GlApi::glDeleteTextures(GLsizei n, UserPtr textures) {
     uint32_t name = 0;
     if (!read_values(textures.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
     if (name == 0) continue;
-    const uint32_t object = group_.textures.object(name);
+    const uint32_t object = group_->textures.object(name);
     if (object) {
       // Bound textures go back to the default ones.
       for (webgl::TextureUnit& u : gl_.units_) {
@@ -100,11 +100,11 @@ void GlApi::glDeleteTextures(GLsizei n, UserPtr textures) {
       }
       gl_.delete_object('t', object);
     }
-    group_.textures.erase(name);
+    group_->textures.erase(name);
   }
 }
 
-uint64_t GlApi::glIsTexture(GLuint texture) { return texture != 0 && group_.textures.object(texture) != 0; }
+uint64_t GlApi::glIsTexture(GLuint texture) { return texture != 0 && group_->textures.object(texture) != 0; }
 
 uint32_t GlApi::default_texture_index(uint32_t target) {
   switch (target) {
@@ -136,10 +136,10 @@ void GlApi::create_default_textures() {
 }
 
 uint32_t GlApi::engine_texture(uint32_t name, uint32_t target) {
-  uint32_t object = group_.textures.object(name);
+  uint32_t object = group_->textures.object(name);
   if (object == 0) {
     object = gl_.create_texture();
-    group_.textures.set(name, object);
+    group_->textures.set(name, object);
     const uint32_t saved_active = gl_.active_unit_;
     // (The engine names the target of a texture when it is first bound.)
     uint32_t* slot = gl_.bound_texture_slot(target);
@@ -160,7 +160,7 @@ void GlApi::glBindTexture(GLenum target, GLuint texture) {
     gl_.bind_texture(target, default_textures_[index]);
     return;
   }
-  if (!group_.textures.known(texture) && config_.core_profile) { error(GL_INVALID_OPERATION); return; }
+  if (!group_->textures.known(texture) && config_.core_profile) { error(GL_INVALID_OPERATION); return; }
   gl_.bind_texture(target, engine_texture(texture, target));
 }
 
@@ -171,7 +171,7 @@ void GlApi::glBindTextureUnit(GLuint unit, GLuint texture) {
   if (texture == 0) {
     gl_.units_[unit].tex2d = default_textures_[1];
   } else {
-    const uint32_t object = group_.textures.object(texture);
+    const uint32_t object = group_->textures.object(texture);
     const webgl::Texture* t = object ? gl_.texture_at(object) : nullptr;
     if (!t) { error(GL_INVALID_OPERATION); gl_.active_unit_ = saved; return; }
     gl_.bind_texture(t->target, object);
@@ -191,7 +191,7 @@ uint64_t GlApi::glAreTexturesResident(GLsizei n, UserPtr textures, UserPtr resid
   if (n < 0) { error(GL_INVALID_VALUE); return 0; }
   for (int32_t i = 0; i < n; ++i) {
     uint32_t name = 0;
-    if (!read_values(textures.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1) || name == 0 || !group_.textures.object(name)) { error(GL_INVALID_VALUE); return 0; }
+    if (!read_values(textures.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1) || name == 0 || !group_->textures.object(name)) { error(GL_INVALID_VALUE); return 0; }
   }
   (void)residences;
   return 1;
@@ -677,8 +677,8 @@ void GlApi::glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset,
 void GlApi::glGenSamplers(GLsizei count, UserPtr samplers) {
   if (count < 0) { error(GL_INVALID_VALUE); return; }
   for (int32_t i = 0; i < count; ++i) {
-    const uint32_t name = group_.samplers.generate();
-    group_.samplers.set(name, gl_.create_sampler());
+    const uint32_t name = group_->samplers.generate();
+    group_->samplers.set(name, gl_.create_sampler());
     if (!write_values(samplers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
   }
 }
@@ -689,46 +689,118 @@ void GlApi::glDeleteSamplers(GLsizei count, UserPtr samplers) {
     uint32_t name = 0;
     if (!read_values(samplers.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
     if (!name) continue;
-    const uint32_t object = group_.samplers.object(name);
+    const uint32_t object = group_->samplers.object(name);
     if (object) {
       for (webgl::TextureUnit& u : gl_.units_) if (u.sampler == object) u.sampler = 0;
       gl_.delete_object('a', object);
     }
-    group_.samplers.erase(name);
+    group_->samplers.erase(name);
   }
 }
-uint64_t GlApi::glIsSampler(GLuint sampler) { return sampler && group_.samplers.object(sampler) != 0; }
+uint64_t GlApi::glIsSampler(GLuint sampler) { return sampler && group_->samplers.object(sampler) != 0; }
 void GlApi::glBindSampler(GLuint unit, GLuint sampler) {
   if (unit >= webgl::kMaxTextureUnits) { error(GL_INVALID_VALUE); return; }
-  if (sampler != 0 && !group_.samplers.object(sampler)) { error(GL_INVALID_OPERATION); return; }
-  gl_.units_[unit].sampler = sampler ? group_.samplers.object(sampler) : 0;
+  if (sampler != 0 && !group_->samplers.object(sampler)) { error(GL_INVALID_OPERATION); return; }
+  gl_.units_[unit].sampler = sampler ? group_->samplers.object(sampler) : 0;
 }
-void GlApi::glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) { gl_.sampler_parameter(group_.samplers.object(sampler), pname, param); }
-void GlApi::glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) { gl_.sampler_parameter(group_.samplers.object(sampler), pname, param); }
+void GlApi::glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param) { gl_.sampler_parameter(group_->samplers.object(sampler), pname, param); }
+void GlApi::glSamplerParameteri(GLuint sampler, GLenum pname, GLint param) { gl_.sampler_parameter(group_->samplers.object(sampler), pname, param); }
 void GlApi::glSamplerParameterfv(GLuint sampler, GLenum pname, UserPtr param) {
   float v[4];
   if (!read_values(param, v, tex_param_count(pname))) { error(GL_INVALID_VALUE); return; }
   if (pname == GL_TEXTURE_BORDER_COLOR) {
-    webgl::SamplerObj* so = gl_.sampler_at(group_.samplers.object(sampler));
+    webgl::SamplerObj* so = gl_.sampler_at(group_->samplers.object(sampler));
     if (so) for (int i = 0; i < 4; ++i) so->border[i] = v[i];
     return;
   }
-  gl_.sampler_parameter(group_.samplers.object(sampler), pname, v[0]);
+  gl_.sampler_parameter(group_->samplers.object(sampler), pname, v[0]);
 }
 void GlApi::glSamplerParameteriv(GLuint sampler, GLenum pname, UserPtr param) {
   int32_t v[4];
   if (!read_values(param, v, tex_param_count(pname))) { error(GL_INVALID_VALUE); return; }
   if (pname == GL_TEXTURE_BORDER_COLOR) {
-    webgl::SamplerObj* so = gl_.sampler_at(group_.samplers.object(sampler));
+    webgl::SamplerObj* so = gl_.sampler_at(group_->samplers.object(sampler));
     if (so) for (int i = 0; i < 4; ++i) so->border[i] = static_cast<float>((2.0 * v[i] + 1.0) / 4294967295.0);
     return;
   }
-  gl_.sampler_parameter(group_.samplers.object(sampler), pname, v[0]);
+  gl_.sampler_parameter(group_->samplers.object(sampler), pname, v[0]);
 }
 
 ArrayView<float> GlApi::float_view(ByteBuffer& data) {
   // (A buffer of 32-bit floats written and read only as such; the allocator's alignment is at least 16.)
   return ArrayView<float>(reinterpret_cast<float*>(data.writable_view().data()), data.size() / 4);
+}
+
+}  // namespace opengl
+
+namespace opengl {
+
+bool GlApi::sampler_get(uint32_t sampler, uint32_t pname, double* out, uint32_t* n) {
+  const webgl::SamplerObj* so = gl_.sampler_at(group_->samplers.object(sampler));
+  if (!so) { error(GL_INVALID_OPERATION); return false; }
+  *n = 1;
+  switch (pname) {
+    case GL_TEXTURE_MIN_FILTER: *out = so->min_filter; return true;
+    case GL_TEXTURE_MAG_FILTER: *out = so->mag_filter; return true;
+    case GL_TEXTURE_WRAP_S: *out = so->wrap_s; return true;
+    case GL_TEXTURE_WRAP_T: *out = so->wrap_t; return true;
+    case GL_TEXTURE_WRAP_R: *out = so->wrap_r; return true;
+    case GL_TEXTURE_COMPARE_MODE: *out = so->compare_mode; return true;
+    case GL_TEXTURE_COMPARE_FUNC: *out = so->compare_func; return true;
+    case GL_TEXTURE_MIN_LOD: *out = so->min_lod; return true;
+    case GL_TEXTURE_MAX_LOD: *out = so->max_lod; return true;
+    case GL_TEXTURE_LOD_BIAS: *out = so->lod_bias; return true;
+    case GL_TEXTURE_MAX_ANISOTROPY: *out = 1; return true;
+    case GL_TEXTURE_BORDER_COLOR: for (int i = 0; i < 4; ++i) out[i] = so->border[i]; *n = 4; return true;
+    default: error(GL_INVALID_ENUM); return false;
+  }
+}
+
+void GlApi::glGetSamplerParameteriv(GLuint sampler, GLenum pname, UserPtr params) {
+  double v[4];
+  uint32_t n = 0;
+  if (!sampler_get(sampler, pname, v, &n)) return;
+  int32_t out[4];
+  for (uint32_t i = 0; i < n; ++i) out[i] = pname == GL_TEXTURE_BORDER_COLOR ? static_cast<int32_t>(v[i] * 2147483647.0) : static_cast<int32_t>(v[i]);
+  write_values(params, out, n);
+}
+void GlApi::glGetSamplerParameterfv(GLuint sampler, GLenum pname, UserPtr params) {
+  double v[4];
+  uint32_t n = 0;
+  if (!sampler_get(sampler, pname, v, &n)) return;
+  float out[4];
+  for (uint32_t i = 0; i < n; ++i) out[i] = static_cast<float>(v[i]);
+  write_values(params, out, n);
+}
+void GlApi::glGetSamplerParameterIiv(GLuint sampler, GLenum pname, UserPtr params) {
+  double v[4];
+  uint32_t n = 0;
+  if (!sampler_get(sampler, pname, v, &n)) return;
+  int32_t out[4];
+  for (uint32_t i = 0; i < n; ++i) out[i] = static_cast<int32_t>(v[i]);
+  write_values(params, out, n);
+}
+void GlApi::glGetSamplerParameterIuiv(GLuint sampler, GLenum pname, UserPtr params) { glGetSamplerParameterIiv(sampler, pname, params); }
+void GlApi::glSamplerParameterIiv(GLuint sampler, GLenum pname, UserPtr param) {
+  int32_t v[4];
+  if (!read_values(param, v, tex_param_count(pname))) { error(GL_INVALID_VALUE); return; }
+  if (pname == GL_TEXTURE_BORDER_COLOR) {
+    webgl::SamplerObj* so = gl_.sampler_at(group_->samplers.object(sampler));
+    if (so) for (int i = 0; i < 4; ++i) so->border[i] = static_cast<float>(v[i]);
+    return;
+  }
+  gl_.sampler_parameter(group_->samplers.object(sampler), pname, v[0]);
+}
+void GlApi::glSamplerParameterIuiv(GLuint sampler, GLenum pname, UserPtr param) { glSamplerParameterIiv(sampler, pname, param); }
+
+// No 1D compressed formats exist, and images are kept decoded: these say so as GL does for formats it does not take.
+void GlApi::glCompressedTexImage1D(GLenum, GLint, GLenum, GLsizei, GLint, GLsizei, UserPtr) { error(GL_INVALID_ENUM); }
+void GlApi::glCompressedTexSubImage1D(GLenum, GLint, GLint, GLsizei, GLenum, GLsizei, UserPtr) { error(GL_INVALID_ENUM); }
+void GlApi::glGetCompressedTexImage(GLenum target, GLint level, UserPtr) {
+  uint32_t face;
+  webgl::Texture* t = texture_for_target(target, &face);
+  if (!t) return;
+  error(GL_INVALID_OPERATION);      // (the blocks a compressed image came in are not kept)
 }
 
 }  // namespace opengl

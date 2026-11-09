@@ -570,13 +570,33 @@ GLAPI void APIENTRY glColorPointer(GLint a0, GLenum a1, GLsizei a2, const void *
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
   gl_stream_end(6);
 }
+GLAPI void APIENTRY glColorPointerEXT(GLint a0, GLenum a1, GLsizei a2, GLsizei a3, const void * a4) {
+  uint32_t *s = gl_stream_begin(88, 7);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  s[4] = (uint32_t)a3;
+  gl_stream_u64(s + 5, (uint64_t)(uintptr_t)a4);
+  gl_stream_end(7);
+}
 GLAPI void APIENTRY glCompileShader(GLuint a0) {
-  uint32_t *s = gl_stream_begin(88, 2);
+  uint32_t *s = gl_stream_begin(89, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
+GLAPI void APIENTRY glCompressedTexImage1D(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLint a4, GLsizei a5, const void * a6) {
+  uint32_t *s = gl_stream_begin(90, 9);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  s[4] = (uint32_t)a3;
+  s[5] = (uint32_t)a4;
+  s[6] = (uint32_t)a5;
+  gl_stream_u64(s + 7, (uint64_t)(uintptr_t)a6);
+  gl_stream_sync(9);
+}
 GLAPI void APIENTRY glCompressedTexImage2D(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLsizei a4, GLint a5, GLsizei a6, const void * a7) {
-  uint32_t *s = gl_stream_begin(89, 10);
+  uint32_t *s = gl_stream_begin(91, 10);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -588,7 +608,7 @@ GLAPI void APIENTRY glCompressedTexImage2D(GLenum a0, GLint a1, GLenum a2, GLsiz
   gl_stream_sync(10);
 }
 GLAPI void APIENTRY glCompressedTexImage3D(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLsizei a4, GLsizei a5, GLint a6, GLsizei a7, const void * a8) {
-  uint32_t *s = gl_stream_begin(90, 11);
+  uint32_t *s = gl_stream_begin(92, 11);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -600,8 +620,19 @@ GLAPI void APIENTRY glCompressedTexImage3D(GLenum a0, GLint a1, GLenum a2, GLsiz
   gl_stream_u64(s + 9, (uint64_t)(uintptr_t)a8);
   gl_stream_sync(11);
 }
+GLAPI void APIENTRY glCompressedTexSubImage1D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLenum a4, GLsizei a5, const void * a6) {
+  uint32_t *s = gl_stream_begin(93, 9);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  s[4] = (uint32_t)a3;
+  s[5] = (uint32_t)a4;
+  s[6] = (uint32_t)a5;
+  gl_stream_u64(s + 7, (uint64_t)(uintptr_t)a6);
+  gl_stream_sync(9);
+}
 GLAPI void APIENTRY glCompressedTexSubImage2D(GLenum a0, GLint a1, GLint a2, GLint a3, GLsizei a4, GLsizei a5, GLenum a6, GLsizei a7, const void * a8) {
-  uint32_t *s = gl_stream_begin(91, 11);
+  uint32_t *s = gl_stream_begin(94, 11);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -614,7 +645,7 @@ GLAPI void APIENTRY glCompressedTexSubImage2D(GLenum a0, GLint a1, GLint a2, GLi
   gl_stream_sync(11);
 }
 GLAPI void APIENTRY glCompressedTexSubImage3D(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLsizei a7, GLenum a8, GLsizei a9, const void * a10) {
-  uint32_t *s = gl_stream_begin(92, 13);
+  uint32_t *s = gl_stream_begin(95, 13);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -629,7 +660,7 @@ GLAPI void APIENTRY glCompressedTexSubImage3D(GLenum a0, GLint a1, GLint a2, GLi
   gl_stream_sync(13);
 }
 GLAPI void APIENTRY glCopyBufferSubData(GLenum a0, GLenum a1, GLintptr a2, GLintptr a3, GLsizeiptr a4) {
-  uint32_t *s = gl_stream_begin(93, 9);
+  uint32_t *s = gl_stream_begin(96, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)a2);
@@ -638,7 +669,7 @@ GLAPI void APIENTRY glCopyBufferSubData(GLenum a0, GLenum a1, GLintptr a2, GLint
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glCopyNamedBufferSubData(GLuint a0, GLuint a1, GLintptr a2, GLintptr a3, GLsizeiptr a4) {
-  uint32_t *s = gl_stream_begin(94, 9);
+  uint32_t *s = gl_stream_begin(97, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)a2);
@@ -647,7 +678,7 @@ GLAPI void APIENTRY glCopyNamedBufferSubData(GLuint a0, GLuint a1, GLintptr a2, 
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glCopyPixels(GLint a0, GLint a1, GLsizei a2, GLsizei a3, GLenum a4) {
-  uint32_t *s = gl_stream_begin(95, 6);
+  uint32_t *s = gl_stream_begin(98, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -656,7 +687,7 @@ GLAPI void APIENTRY glCopyPixels(GLint a0, GLint a1, GLsizei a2, GLsizei a3, GLe
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glCopyTexImage1D(GLenum a0, GLint a1, GLenum a2, GLint a3, GLint a4, GLsizei a5, GLint a6) {
-  uint32_t *s = gl_stream_begin(96, 8);
+  uint32_t *s = gl_stream_begin(99, 8);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -667,7 +698,7 @@ GLAPI void APIENTRY glCopyTexImage1D(GLenum a0, GLint a1, GLenum a2, GLint a3, G
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glCopyTexImage2D(GLenum a0, GLint a1, GLenum a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLint a7) {
-  uint32_t *s = gl_stream_begin(97, 9);
+  uint32_t *s = gl_stream_begin(100, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -679,7 +710,7 @@ GLAPI void APIENTRY glCopyTexImage2D(GLenum a0, GLint a1, GLenum a2, GLint a3, G
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glCopyTexSubImage1D(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5) {
-  uint32_t *s = gl_stream_begin(98, 7);
+  uint32_t *s = gl_stream_begin(101, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -689,7 +720,7 @@ GLAPI void APIENTRY glCopyTexSubImage1D(GLenum a0, GLint a1, GLint a2, GLint a3,
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glCopyTexSubImage2D(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5, GLsizei a6, GLsizei a7) {
-  uint32_t *s = gl_stream_begin(99, 9);
+  uint32_t *s = gl_stream_begin(102, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -701,7 +732,7 @@ GLAPI void APIENTRY glCopyTexSubImage2D(GLenum a0, GLint a1, GLint a2, GLint a3,
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glCopyTexSubImage3D(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5, GLint a6, GLsizei a7, GLsizei a8) {
-  uint32_t *s = gl_stream_begin(100, 10);
+  uint32_t *s = gl_stream_begin(103, 10);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -714,167 +745,184 @@ GLAPI void APIENTRY glCopyTexSubImage3D(GLenum a0, GLint a1, GLint a2, GLint a3,
   gl_stream_end(10);
 }
 GLAPI void APIENTRY glCreateBuffers(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(101, 4);
+  uint32_t *s = gl_stream_begin(104, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+GLAPI void APIENTRY glCreateFramebuffers(GLsizei a0, GLuint * a1) {
+  uint32_t *s = gl_stream_begin(105, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI GLuint APIENTRY glCreateProgram(void) {
-  uint32_t *s = gl_stream_begin(102, 1);
+  (void)gl_stream_begin(106, 1);
   const uint64_t r = gl_stream_sync(1);
   return (GLuint)r;
 }
+GLAPI void APIENTRY glCreateRenderbuffers(GLsizei a0, GLuint * a1) {
+  uint32_t *s = gl_stream_begin(107, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
 GLAPI void APIENTRY glCreateSamplers(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(103, 4);
+  uint32_t *s = gl_stream_begin(108, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI GLuint APIENTRY glCreateShader(GLenum a0) {
-  uint32_t *s = gl_stream_begin(104, 2);
+  uint32_t *s = gl_stream_begin(109, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLuint)r;
 }
 GLAPI void APIENTRY glCreateTextures(GLenum a0, GLsizei a1, GLuint * a2) {
-  uint32_t *s = gl_stream_begin(105, 5);
+  uint32_t *s = gl_stream_begin(110, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glCreateVertexArrays(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(106, 4);
+  uint32_t *s = gl_stream_begin(111, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glCullFace(GLenum a0) {
-  uint32_t *s = gl_stream_begin(107, 2);
+  uint32_t *s = gl_stream_begin(112, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glDeleteBuffers(GLsizei a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(108, 4);
-  s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
-}
-GLAPI void APIENTRY glDeleteFramebuffers(GLsizei a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(109, 4);
-  s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
-}
-GLAPI void APIENTRY glDeleteLists(GLuint a0, GLsizei a1) {
-  uint32_t *s = gl_stream_begin(110, 3);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_end(3);
-}
-GLAPI void APIENTRY glDeleteProgram(GLuint a0) {
-  uint32_t *s = gl_stream_begin(111, 2);
-  s[1] = (uint32_t)a0;
-  gl_stream_end(2);
-}
-GLAPI void APIENTRY glDeleteQueries(GLsizei a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(112, 4);
-  s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
-}
-GLAPI void APIENTRY glDeleteRenderbuffers(GLsizei a0, const GLuint * a1) {
   uint32_t *s = gl_stream_begin(113, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
-GLAPI void APIENTRY glDeleteSamplers(GLsizei a0, const GLuint * a1) {
+GLAPI void APIENTRY glDeleteFramebuffers(GLsizei a0, const GLuint * a1) {
   uint32_t *s = gl_stream_begin(114, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
-GLAPI void APIENTRY glDeleteShader(GLuint a0) {
-  uint32_t *s = gl_stream_begin(115, 2);
+GLAPI void APIENTRY glDeleteLists(GLuint a0, GLsizei a1) {
+  uint32_t *s = gl_stream_begin(115, 3);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_end(3);
+}
+GLAPI void APIENTRY glDeleteObjectARB(GLhandleARB a0) {
+  uint32_t *s = gl_stream_begin(116, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
-GLAPI void APIENTRY glDeleteSync(GLsync a0) {
-  uint32_t *s = gl_stream_begin(116, 3);
-  gl_stream_u64(s + 1, (uint64_t)(uintptr_t)a0);
-  gl_stream_end(3);
-}
-GLAPI void APIENTRY glDeleteTextures(GLsizei a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(117, 4);
+GLAPI void APIENTRY glDeleteProgram(GLuint a0) {
+  uint32_t *s = gl_stream_begin(117, 2);
   s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
+  gl_stream_end(2);
 }
-GLAPI void APIENTRY glDeleteVertexArrays(GLsizei a0, const GLuint * a1) {
+GLAPI void APIENTRY glDeleteQueries(GLsizei a0, const GLuint * a1) {
   uint32_t *s = gl_stream_begin(118, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
+GLAPI void APIENTRY glDeleteRenderbuffers(GLsizei a0, const GLuint * a1) {
+  uint32_t *s = gl_stream_begin(119, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+GLAPI void APIENTRY glDeleteSamplers(GLsizei a0, const GLuint * a1) {
+  uint32_t *s = gl_stream_begin(120, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+GLAPI void APIENTRY glDeleteShader(GLuint a0) {
+  uint32_t *s = gl_stream_begin(121, 2);
+  s[1] = (uint32_t)a0;
+  gl_stream_end(2);
+}
+GLAPI void APIENTRY glDeleteSync(GLsync a0) {
+  uint32_t *s = gl_stream_begin(122, 3);
+  gl_stream_u64(s + 1, (uint64_t)(uintptr_t)a0);
+  gl_stream_end(3);
+}
+GLAPI void APIENTRY glDeleteTextures(GLsizei a0, const GLuint * a1) {
+  uint32_t *s = gl_stream_begin(123, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+GLAPI void APIENTRY glDeleteVertexArrays(GLsizei a0, const GLuint * a1) {
+  uint32_t *s = gl_stream_begin(124, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
 GLAPI void APIENTRY glDepthFunc(GLenum a0) {
-  uint32_t *s = gl_stream_begin(119, 2);
+  uint32_t *s = gl_stream_begin(125, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glDepthMask(GLboolean a0) {
-  uint32_t *s = gl_stream_begin(120, 2);
+  uint32_t *s = gl_stream_begin(126, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glDepthRange(GLdouble a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(121, 5);
+  uint32_t *s = gl_stream_begin(127, 5);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glDepthRangef(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(122, 3);
+  uint32_t *s = gl_stream_begin(128, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glDetachShader(GLuint a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(123, 3);
+  uint32_t *s = gl_stream_begin(129, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glDisable(GLenum a0) {
-  uint32_t *s = gl_stream_begin(124, 2);
+  uint32_t *s = gl_stream_begin(130, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glDisableClientState(GLenum a0) {
-  uint32_t *s = gl_stream_begin(125, 2);
+  uint32_t *s = gl_stream_begin(131, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glDisableVertexAttribArray(GLuint a0) {
-  uint32_t *s = gl_stream_begin(126, 2);
+  uint32_t *s = gl_stream_begin(132, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glDisablei(GLenum a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(127, 3);
+  uint32_t *s = gl_stream_begin(133, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glDrawArrays(GLenum a0, GLint a1, GLsizei a2) {
-  uint32_t *s = gl_stream_begin(128, 4);
+  uint32_t *s = gl_stream_begin(134, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glDrawArraysInstanced(GLenum a0, GLint a1, GLsizei a2, GLsizei a3) {
-  uint32_t *s = gl_stream_begin(129, 5);
+  uint32_t *s = gl_stream_begin(135, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -882,7 +930,7 @@ GLAPI void APIENTRY glDrawArraysInstanced(GLenum a0, GLint a1, GLsizei a2, GLsiz
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glDrawArraysInstancedBaseInstance(GLenum a0, GLint a1, GLsizei a2, GLsizei a3, GLuint a4) {
-  uint32_t *s = gl_stream_begin(130, 6);
+  uint32_t *s = gl_stream_begin(136, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -891,18 +939,18 @@ GLAPI void APIENTRY glDrawArraysInstancedBaseInstance(GLenum a0, GLint a1, GLsiz
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glDrawBuffer(GLenum a0) {
-  uint32_t *s = gl_stream_begin(131, 2);
+  uint32_t *s = gl_stream_begin(137, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glDrawBuffers(GLsizei a0, const GLenum * a1) {
-  uint32_t *s = gl_stream_begin(132, 4);
+  uint32_t *s = gl_stream_begin(138, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glDrawElements(GLenum a0, GLsizei a1, GLenum a2, const void * a3) {
-  uint32_t *s = gl_stream_begin(133, 6);
+  uint32_t *s = gl_stream_begin(139, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -910,7 +958,7 @@ GLAPI void APIENTRY glDrawElements(GLenum a0, GLsizei a1, GLenum a2, const void 
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glDrawElementsBaseVertex(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(134, 7);
+  uint32_t *s = gl_stream_begin(140, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -919,7 +967,7 @@ GLAPI void APIENTRY glDrawElementsBaseVertex(GLenum a0, GLsizei a1, GLenum a2, c
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glDrawElementsInstanced(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLsizei a4) {
-  uint32_t *s = gl_stream_begin(135, 7);
+  uint32_t *s = gl_stream_begin(141, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -928,7 +976,7 @@ GLAPI void APIENTRY glDrawElementsInstanced(GLenum a0, GLsizei a1, GLenum a2, co
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glDrawElementsInstancedBaseInstance(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLsizei a4, GLuint a5) {
-  uint32_t *s = gl_stream_begin(136, 8);
+  uint32_t *s = gl_stream_begin(142, 8);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -938,7 +986,7 @@ GLAPI void APIENTRY glDrawElementsInstancedBaseInstance(GLenum a0, GLsizei a1, G
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glDrawElementsInstancedBaseVertex(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLsizei a4, GLint a5) {
-  uint32_t *s = gl_stream_begin(137, 8);
+  uint32_t *s = gl_stream_begin(143, 8);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -948,7 +996,7 @@ GLAPI void APIENTRY glDrawElementsInstancedBaseVertex(GLenum a0, GLsizei a1, GLe
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glDrawElementsInstancedBaseVertexBaseInstance(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLsizei a4, GLint a5, GLuint a6) {
-  uint32_t *s = gl_stream_begin(138, 9);
+  uint32_t *s = gl_stream_begin(144, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -959,7 +1007,7 @@ GLAPI void APIENTRY glDrawElementsInstancedBaseVertexBaseInstance(GLenum a0, GLs
   gl_stream_sync(9);
 }
 GLAPI void APIENTRY glDrawPixels(GLsizei a0, GLsizei a1, GLenum a2, GLenum a3, const void * a4) {
-  uint32_t *s = gl_stream_begin(139, 7);
+  uint32_t *s = gl_stream_begin(145, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -968,7 +1016,7 @@ GLAPI void APIENTRY glDrawPixels(GLsizei a0, GLsizei a1, GLenum a2, GLenum a3, c
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glDrawRangeElements(GLenum a0, GLuint a1, GLuint a2, GLsizei a3, GLenum a4, const void * a5) {
-  uint32_t *s = gl_stream_begin(140, 8);
+  uint32_t *s = gl_stream_begin(146, 8);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -978,7 +1026,7 @@ GLAPI void APIENTRY glDrawRangeElements(GLenum a0, GLuint a1, GLuint a2, GLsizei
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glDrawRangeElementsBaseVertex(GLenum a0, GLuint a1, GLuint a2, GLsizei a3, GLenum a4, const void * a5, GLint a6) {
-  uint32_t *s = gl_stream_begin(141, 9);
+  uint32_t *s = gl_stream_begin(147, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -989,110 +1037,117 @@ GLAPI void APIENTRY glDrawRangeElementsBaseVertex(GLenum a0, GLuint a1, GLuint a
   gl_stream_sync(9);
 }
 GLAPI void APIENTRY glEdgeFlag(GLboolean a0) {
-  uint32_t *s = gl_stream_begin(142, 2);
+  uint32_t *s = gl_stream_begin(148, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEdgeFlagPointer(GLsizei a0, const void * a1) {
-  uint32_t *s = gl_stream_begin(143, 4);
+  uint32_t *s = gl_stream_begin(149, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_end(4);
 }
+GLAPI void APIENTRY glEdgeFlagPointerEXT(GLsizei a0, GLsizei a1, const GLboolean * a2) {
+  uint32_t *s = gl_stream_begin(150, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_end(5);
+}
 GLAPI void APIENTRY glEdgeFlagv(const GLboolean * a0) {
-  uint32_t *s = gl_stream_begin(144, 2);
+  uint32_t *s = gl_stream_begin(151, 2);
   gl_stream_copy(s + 1, a0, 1);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEnable(GLenum a0) {
-  uint32_t *s = gl_stream_begin(145, 2);
+  uint32_t *s = gl_stream_begin(152, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEnableClientState(GLenum a0) {
-  uint32_t *s = gl_stream_begin(146, 2);
+  uint32_t *s = gl_stream_begin(153, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEnableVertexAttribArray(GLuint a0) {
-  uint32_t *s = gl_stream_begin(147, 2);
+  uint32_t *s = gl_stream_begin(154, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEnablei(GLenum a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(148, 3);
+  uint32_t *s = gl_stream_begin(155, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glEnd(void) {
-  uint32_t *s = gl_stream_begin(149, 1);
+  (void)gl_stream_begin(156, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glEndList(void) {
-  uint32_t *s = gl_stream_begin(150, 1);
+  (void)gl_stream_begin(157, 1);
   gl_stream_sync(1);
 }
 GLAPI void APIENTRY glEndQuery(GLenum a0) {
-  uint32_t *s = gl_stream_begin(151, 2);
+  uint32_t *s = gl_stream_begin(158, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEndTransformFeedback(void) {
-  uint32_t *s = gl_stream_begin(152, 1);
+  (void)gl_stream_begin(159, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glEvalCoord1d(GLdouble a0) {
-  uint32_t *s = gl_stream_begin(153, 3);
+  uint32_t *s = gl_stream_begin(160, 3);
   gl_stream_f64(s + 1, a0);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glEvalCoord1dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(154, 3);
+  uint32_t *s = gl_stream_begin(161, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glEvalCoord1f(GLfloat a0) {
-  uint32_t *s = gl_stream_begin(155, 2);
+  uint32_t *s = gl_stream_begin(162, 2);
   s[1] = gl_stream_f32(a0);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEvalCoord1fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(156, 2);
+  uint32_t *s = gl_stream_begin(163, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEvalCoord2d(GLdouble a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(157, 5);
+  uint32_t *s = gl_stream_begin(164, 5);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glEvalCoord2dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(158, 5);
+  uint32_t *s = gl_stream_begin(165, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glEvalCoord2f(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(159, 3);
+  uint32_t *s = gl_stream_begin(166, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glEvalCoord2fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(160, 3);
+  uint32_t *s = gl_stream_begin(167, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glEvalMesh1(GLenum a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(161, 4);
+  uint32_t *s = gl_stream_begin(168, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glEvalMesh2(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(162, 6);
+  uint32_t *s = gl_stream_begin(169, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1101,105 +1156,112 @@ GLAPI void APIENTRY glEvalMesh2(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glEvalPoint1(GLint a0) {
-  uint32_t *s = gl_stream_begin(163, 2);
+  uint32_t *s = gl_stream_begin(170, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glEvalPoint2(GLint a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(164, 3);
+  uint32_t *s = gl_stream_begin(171, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glFeedbackBuffer(GLsizei a0, GLenum a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(165, 5);
+  uint32_t *s = gl_stream_begin(172, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_end(5);
 }
 GLAPI GLsync APIENTRY glFenceSync(GLenum a0, GLbitfield a1) {
-  uint32_t *s = gl_stream_begin(166, 3);
+  uint32_t *s = gl_stream_begin(173, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   const uint64_t r = gl_stream_sync(3);
   return (GLsync)(uintptr_t)r;
 }
-GLAPI void APIENTRY glFinish(void) {
-  uint32_t *s = gl_stream_begin(167, 1);
+static void tcos_glFinish(void) {
+  (void)gl_stream_begin(174, 1);
   gl_stream_sync(1);
 }
-GLAPI void APIENTRY glFlush(void) {
-  uint32_t *s = gl_stream_begin(168, 1);
+static void tcos_glFlush(void) {
+  (void)gl_stream_begin(175, 1);
   gl_stream_sync(1);
 }
 GLAPI void APIENTRY glFlushMappedBufferRange(GLenum a0, GLintptr a1, GLsizeiptr a2) {
-  uint32_t *s = gl_stream_begin(169, 6);
+  uint32_t *s = gl_stream_begin(176, 6);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)a2);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glFlushMappedNamedBufferRange(GLuint a0, GLintptr a1, GLsizeiptr a2) {
-  uint32_t *s = gl_stream_begin(170, 6);
+  uint32_t *s = gl_stream_begin(177, 6);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)a2);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glFogCoordPointer(GLenum a0, GLsizei a1, const void * a2) {
-  uint32_t *s = gl_stream_begin(171, 5);
+  uint32_t *s = gl_stream_begin(178, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glFogCoordd(GLdouble a0) {
-  uint32_t *s = gl_stream_begin(172, 3);
+  uint32_t *s = gl_stream_begin(179, 3);
   gl_stream_f64(s + 1, a0);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glFogCoorddv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(173, 3);
+  uint32_t *s = gl_stream_begin(180, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glFogCoordf(GLfloat a0) {
-  uint32_t *s = gl_stream_begin(174, 2);
+  uint32_t *s = gl_stream_begin(181, 2);
   s[1] = gl_stream_f32(a0);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glFogCoordfv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(175, 2);
+  uint32_t *s = gl_stream_begin(182, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glFogf(GLenum a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(176, 3);
+  uint32_t *s = gl_stream_begin(183, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glFogfv(GLenum a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(177, 4);
+  uint32_t *s = gl_stream_begin(184, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glFogi(GLenum a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(178, 3);
+  uint32_t *s = gl_stream_begin(185, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glFogiv(GLenum a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(179, 4);
+  uint32_t *s = gl_stream_begin(186, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
+GLAPI void APIENTRY glFramebufferParameteri(GLenum a0, GLenum a1, GLint a2) {
+  uint32_t *s = gl_stream_begin(187, 4);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  gl_stream_end(4);
+}
 GLAPI void APIENTRY glFramebufferRenderbuffer(GLenum a0, GLenum a1, GLenum a2, GLuint a3) {
-  uint32_t *s = gl_stream_begin(180, 5);
+  uint32_t *s = gl_stream_begin(188, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1207,7 +1269,7 @@ GLAPI void APIENTRY glFramebufferRenderbuffer(GLenum a0, GLenum a1, GLenum a2, G
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glFramebufferTexture(GLenum a0, GLenum a1, GLuint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(181, 5);
+  uint32_t *s = gl_stream_begin(189, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1215,7 +1277,7 @@ GLAPI void APIENTRY glFramebufferTexture(GLenum a0, GLenum a1, GLuint a2, GLint 
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glFramebufferTexture1D(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(182, 6);
+  uint32_t *s = gl_stream_begin(190, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1224,7 +1286,7 @@ GLAPI void APIENTRY glFramebufferTexture1D(GLenum a0, GLenum a1, GLenum a2, GLui
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glFramebufferTexture2D(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(183, 6);
+  uint32_t *s = gl_stream_begin(191, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1233,7 +1295,7 @@ GLAPI void APIENTRY glFramebufferTexture2D(GLenum a0, GLenum a1, GLenum a2, GLui
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glFramebufferTexture3D(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4, GLint a5) {
-  uint32_t *s = gl_stream_begin(184, 7);
+  uint32_t *s = gl_stream_begin(192, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1243,7 +1305,7 @@ GLAPI void APIENTRY glFramebufferTexture3D(GLenum a0, GLenum a1, GLenum a2, GLui
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glFramebufferTextureLayer(GLenum a0, GLenum a1, GLuint a2, GLint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(185, 6);
+  uint32_t *s = gl_stream_begin(193, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1252,12 +1314,12 @@ GLAPI void APIENTRY glFramebufferTextureLayer(GLenum a0, GLenum a1, GLuint a2, G
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glFrontFace(GLenum a0) {
-  uint32_t *s = gl_stream_begin(186, 2);
+  uint32_t *s = gl_stream_begin(194, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glFrustum(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4, GLdouble a5) {
-  uint32_t *s = gl_stream_begin(187, 13);
+  uint32_t *s = gl_stream_begin(195, 13);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
@@ -1267,60 +1329,60 @@ GLAPI void APIENTRY glFrustum(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3
   gl_stream_end(13);
 }
 GLAPI void APIENTRY glGenBuffers(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(188, 4);
+  uint32_t *s = gl_stream_begin(196, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGenFramebuffers(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(189, 4);
+  uint32_t *s = gl_stream_begin(197, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI GLuint APIENTRY glGenLists(GLsizei a0) {
-  uint32_t *s = gl_stream_begin(190, 2);
+  uint32_t *s = gl_stream_begin(198, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLuint)r;
 }
 GLAPI void APIENTRY glGenQueries(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(191, 4);
+  uint32_t *s = gl_stream_begin(199, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGenRenderbuffers(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(192, 4);
+  uint32_t *s = gl_stream_begin(200, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGenSamplers(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(193, 4);
+  uint32_t *s = gl_stream_begin(201, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGenTextures(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(194, 4);
+  uint32_t *s = gl_stream_begin(202, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGenVertexArrays(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(195, 4);
+  uint32_t *s = gl_stream_begin(203, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGenerateMipmap(GLenum a0) {
-  uint32_t *s = gl_stream_begin(196, 2);
+  uint32_t *s = gl_stream_begin(204, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glGetActiveAttrib(GLuint a0, GLuint a1, GLsizei a2, GLsizei * a3, GLint * a4, GLenum * a5, GLchar * a6) {
-  uint32_t *s = gl_stream_begin(197, 12);
+  uint32_t *s = gl_stream_begin(205, 12);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1331,7 +1393,7 @@ GLAPI void APIENTRY glGetActiveAttrib(GLuint a0, GLuint a1, GLsizei a2, GLsizei 
   gl_stream_sync(12);
 }
 GLAPI void APIENTRY glGetActiveUniform(GLuint a0, GLuint a1, GLsizei a2, GLsizei * a3, GLint * a4, GLenum * a5, GLchar * a6) {
-  uint32_t *s = gl_stream_begin(198, 12);
+  uint32_t *s = gl_stream_begin(206, 12);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1342,7 +1404,7 @@ GLAPI void APIENTRY glGetActiveUniform(GLuint a0, GLuint a1, GLsizei a2, GLsizei
   gl_stream_sync(12);
 }
 GLAPI void APIENTRY glGetActiveUniformBlockName(GLuint a0, GLuint a1, GLsizei a2, GLsizei * a3, GLchar * a4) {
-  uint32_t *s = gl_stream_begin(199, 8);
+  uint32_t *s = gl_stream_begin(207, 8);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1351,15 +1413,24 @@ GLAPI void APIENTRY glGetActiveUniformBlockName(GLuint a0, GLuint a1, GLsizei a2
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glGetActiveUniformBlockiv(GLuint a0, GLuint a1, GLenum a2, GLint * a3) {
-  uint32_t *s = gl_stream_begin(200, 6);
+  uint32_t *s = gl_stream_begin(208, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
   gl_stream_sync(6);
 }
+GLAPI void APIENTRY glGetActiveUniformName(GLuint a0, GLuint a1, GLsizei a2, GLsizei * a3, GLchar * a4) {
+  uint32_t *s = gl_stream_begin(209, 8);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
+  gl_stream_u64(s + 6, (uint64_t)(uintptr_t)a4);
+  gl_stream_sync(8);
+}
 GLAPI void APIENTRY glGetActiveUniformsiv(GLuint a0, GLsizei a1, const GLuint * a2, GLenum a3, GLint * a4) {
-  uint32_t *s = gl_stream_begin(201, 8);
+  uint32_t *s = gl_stream_begin(210, 8);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -1367,8 +1438,16 @@ GLAPI void APIENTRY glGetActiveUniformsiv(GLuint a0, GLsizei a1, const GLuint * 
   gl_stream_u64(s + 6, (uint64_t)(uintptr_t)a4);
   gl_stream_sync(8);
 }
+GLAPI void APIENTRY glGetAttachedObjectsARB(GLhandleARB a0, GLsizei a1, GLsizei * a2, GLhandleARB * a3) {
+  uint32_t *s = gl_stream_begin(211, 7);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_u64(s + 5, (uint64_t)(uintptr_t)a3);
+  gl_stream_sync(7);
+}
 GLAPI void APIENTRY glGetAttachedShaders(GLuint a0, GLsizei a1, GLsizei * a2, GLuint * a3) {
-  uint32_t *s = gl_stream_begin(202, 7);
+  uint32_t *s = gl_stream_begin(212, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -1376,48 +1455,48 @@ GLAPI void APIENTRY glGetAttachedShaders(GLuint a0, GLsizei a1, GLsizei * a2, GL
   gl_stream_sync(7);
 }
 GLAPI GLint APIENTRY glGetAttribLocation(GLuint a0, const GLchar * a1) {
-  uint32_t *s = gl_stream_begin(203, 4);
+  uint32_t *s = gl_stream_begin(213, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   const uint64_t r = gl_stream_sync(4);
   return (GLint)r;
 }
 GLAPI void APIENTRY glGetBooleani_v(GLenum a0, GLuint a1, GLboolean * a2) {
-  uint32_t *s = gl_stream_begin(204, 5);
+  uint32_t *s = gl_stream_begin(214, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetBooleanv(GLenum a0, GLboolean * a1) {
-  uint32_t *s = gl_stream_begin(205, 4);
+  uint32_t *s = gl_stream_begin(215, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGetBufferParameteri64v(GLenum a0, GLenum a1, GLint64 * a2) {
-  uint32_t *s = gl_stream_begin(206, 5);
+  uint32_t *s = gl_stream_begin(216, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetBufferParameteriv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(207, 5);
+  uint32_t *s = gl_stream_begin(217, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetBufferPointerv(GLenum a0, GLenum a1, void ** a2) {
-  uint32_t *s = gl_stream_begin(208, 5);
+  uint32_t *s = gl_stream_begin(218, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetBufferSubData(GLenum a0, GLintptr a1, GLsizeiptr a2, void * a3) {
-  uint32_t *s = gl_stream_begin(209, 8);
+  uint32_t *s = gl_stream_begin(219, 8);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)a2);
@@ -1425,164 +1504,227 @@ GLAPI void APIENTRY glGetBufferSubData(GLenum a0, GLintptr a1, GLsizeiptr a2, vo
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glGetClipPlane(GLenum a0, GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(210, 4);
+  uint32_t *s = gl_stream_begin(220, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
-GLAPI void APIENTRY glGetDoublev(GLenum a0, GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(211, 4);
-  s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
-}
-GLAPI GLenum APIENTRY glGetError(void) {
-  uint32_t *s = gl_stream_begin(212, 1);
-  const uint64_t r = gl_stream_sync(1);
-  return (GLenum)r;
-}
-GLAPI void APIENTRY glGetFloatv(GLenum a0, GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(213, 4);
-  s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
-}
-GLAPI void APIENTRY glGetFramebufferAttachmentParameteriv(GLenum a0, GLenum a1, GLenum a2, GLint * a3) {
-  uint32_t *s = gl_stream_begin(214, 6);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  s[3] = (uint32_t)a2;
-  gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
-  gl_stream_sync(6);
-}
-GLAPI void APIENTRY glGetInteger64v(GLenum a0, GLint64 * a1) {
-  uint32_t *s = gl_stream_begin(215, 4);
-  s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
-}
-GLAPI void APIENTRY glGetIntegeri_v(GLenum a0, GLuint a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(216, 5);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
-}
-GLAPI void APIENTRY glGetIntegerv(GLenum a0, GLint * a1) {
-  uint32_t *s = gl_stream_begin(217, 4);
-  s[1] = (uint32_t)a0;
-  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
-  gl_stream_sync(4);
-}
-GLAPI void APIENTRY glGetLightfv(GLenum a0, GLenum a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(218, 5);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
-}
-GLAPI void APIENTRY glGetLightiv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(219, 5);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
-}
-GLAPI void APIENTRY glGetMapdv(GLenum a0, GLenum a1, GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(220, 5);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
-}
-GLAPI void APIENTRY glGetMapfv(GLenum a0, GLenum a1, GLfloat * a2) {
+GLAPI void APIENTRY glGetCompressedTexImage(GLenum a0, GLint a1, void * a2) {
   uint32_t *s = gl_stream_begin(221, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
-GLAPI void APIENTRY glGetMapiv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(222, 5);
+GLAPI void APIENTRY glGetDoublev(GLenum a0, GLdouble * a1) {
+  uint32_t *s = gl_stream_begin(222, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+static GLenum tcos_glGetError(void) {
+  (void)gl_stream_begin(223, 1);
+  const uint64_t r = gl_stream_sync(1);
+  return (GLenum)r;
+}
+GLAPI void APIENTRY glGetFloatv(GLenum a0, GLfloat * a1) {
+  uint32_t *s = gl_stream_begin(224, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+GLAPI void APIENTRY glGetFramebufferAttachmentParameteriv(GLenum a0, GLenum a1, GLenum a2, GLint * a3) {
+  uint32_t *s = gl_stream_begin(225, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
+  s[3] = (uint32_t)a2;
+  gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
+  gl_stream_sync(6);
 }
-GLAPI void APIENTRY glGetMaterialfv(GLenum a0, GLenum a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(223, 5);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
-}
-GLAPI void APIENTRY glGetMaterialiv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(224, 5);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
-}
-GLAPI void APIENTRY glGetNamedBufferParameteri64v(GLuint a0, GLenum a1, GLint64 * a2) {
-  uint32_t *s = gl_stream_begin(225, 5);
-  s[1] = (uint32_t)a0;
-  s[2] = (uint32_t)a1;
-  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
-  gl_stream_sync(5);
-}
-GLAPI void APIENTRY glGetNamedBufferParameteriv(GLuint a0, GLenum a1, GLint * a2) {
+GLAPI void APIENTRY glGetFramebufferParameteriv(GLenum a0, GLenum a1, GLint * a2) {
   uint32_t *s = gl_stream_begin(226, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
-GLAPI void APIENTRY glGetNamedBufferPointerv(GLuint a0, GLenum a1, void ** a2) {
+GLAPI void APIENTRY glGetFramebufferParameterivEXT(GLuint a0, GLenum a1, GLint * a2) {
   uint32_t *s = gl_stream_begin(227, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
+GLAPI GLhandleARB APIENTRY glGetHandleARB(GLenum a0) {
+  uint32_t *s = gl_stream_begin(228, 2);
+  s[1] = (uint32_t)a0;
+  const uint64_t r = gl_stream_sync(2);
+  return (GLhandleARB)r;
+}
+GLAPI void APIENTRY glGetInfoLogARB(GLhandleARB a0, GLsizei a1, GLsizei * a2, GLcharARB * a3) {
+  uint32_t *s = gl_stream_begin(229, 7);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_u64(s + 5, (uint64_t)(uintptr_t)a3);
+  gl_stream_sync(7);
+}
+GLAPI void APIENTRY glGetInteger64v(GLenum a0, GLint64 * a1) {
+  uint32_t *s = gl_stream_begin(230, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+GLAPI void APIENTRY glGetIntegeri_v(GLenum a0, GLuint a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(231, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetIntegerv(GLenum a0, GLint * a1) {
+  uint32_t *s = gl_stream_begin(232, 4);
+  s[1] = (uint32_t)a0;
+  gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
+  gl_stream_sync(4);
+}
+GLAPI void APIENTRY glGetLightfv(GLenum a0, GLenum a1, GLfloat * a2) {
+  uint32_t *s = gl_stream_begin(233, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetLightiv(GLenum a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(234, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetMapdv(GLenum a0, GLenum a1, GLdouble * a2) {
+  uint32_t *s = gl_stream_begin(235, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetMapfv(GLenum a0, GLenum a1, GLfloat * a2) {
+  uint32_t *s = gl_stream_begin(236, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetMapiv(GLenum a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(237, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetMaterialfv(GLenum a0, GLenum a1, GLfloat * a2) {
+  uint32_t *s = gl_stream_begin(238, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetMaterialiv(GLenum a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(239, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetNamedBufferParameteri64v(GLuint a0, GLenum a1, GLint64 * a2) {
+  uint32_t *s = gl_stream_begin(240, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetNamedBufferParameteriv(GLuint a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(241, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetNamedBufferPointerv(GLuint a0, GLenum a1, void ** a2) {
+  uint32_t *s = gl_stream_begin(242, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
 GLAPI void APIENTRY glGetNamedBufferSubData(GLuint a0, GLintptr a1, GLsizeiptr a2, void * a3) {
-  uint32_t *s = gl_stream_begin(228, 8);
+  uint32_t *s = gl_stream_begin(243, 8);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)a2);
   gl_stream_u64(s + 6, (uint64_t)(uintptr_t)a3);
   gl_stream_sync(8);
 }
+GLAPI void APIENTRY glGetNamedFramebufferParameteriv(GLuint a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(244, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetNamedFramebufferParameterivEXT(GLuint a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(245, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetObjectParameterfvARB(GLhandleARB a0, GLenum a1, GLfloat * a2) {
+  uint32_t *s = gl_stream_begin(246, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetObjectParameterivARB(GLhandleARB a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(247, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
 GLAPI void APIENTRY glGetPixelMapfv(GLenum a0, GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(229, 4);
+  uint32_t *s = gl_stream_begin(248, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGetPixelMapuiv(GLenum a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(230, 4);
+  uint32_t *s = gl_stream_begin(249, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGetPixelMapusv(GLenum a0, GLushort * a1) {
-  uint32_t *s = gl_stream_begin(231, 4);
+  uint32_t *s = gl_stream_begin(250, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGetPointerv(GLenum a0, void ** a1) {
-  uint32_t *s = gl_stream_begin(232, 4);
+  uint32_t *s = gl_stream_begin(251, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glGetPolygonStipple(GLubyte * a0) {
-  uint32_t *s = gl_stream_begin(233, 3);
+  uint32_t *s = gl_stream_begin(252, 3);
   gl_stream_u64(s + 1, (uint64_t)(uintptr_t)a0);
   gl_stream_sync(3);
 }
 GLAPI void APIENTRY glGetProgramInfoLog(GLuint a0, GLsizei a1, GLsizei * a2, GLchar * a3) {
-  uint32_t *s = gl_stream_begin(234, 7);
+  uint32_t *s = gl_stream_begin(253, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -1590,56 +1732,84 @@ GLAPI void APIENTRY glGetProgramInfoLog(GLuint a0, GLsizei a1, GLsizei * a2, GLc
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glGetProgramiv(GLuint a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(235, 5);
+  uint32_t *s = gl_stream_begin(254, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetQueryObjecti64v(GLuint a0, GLenum a1, GLint64 * a2) {
-  uint32_t *s = gl_stream_begin(236, 5);
+  uint32_t *s = gl_stream_begin(255, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetQueryObjectiv(GLuint a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(237, 5);
+  uint32_t *s = gl_stream_begin(256, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetQueryObjectui64v(GLuint a0, GLenum a1, GLuint64 * a2) {
-  uint32_t *s = gl_stream_begin(238, 5);
+  uint32_t *s = gl_stream_begin(257, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetQueryObjectuiv(GLuint a0, GLenum a1, GLuint * a2) {
-  uint32_t *s = gl_stream_begin(239, 5);
+  uint32_t *s = gl_stream_begin(258, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetQueryiv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(240, 5);
+  uint32_t *s = gl_stream_begin(259, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetRenderbufferParameteriv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(241, 5);
+  uint32_t *s = gl_stream_begin(260, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetSamplerParameterIiv(GLuint a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(261, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetSamplerParameterIuiv(GLuint a0, GLenum a1, GLuint * a2) {
+  uint32_t *s = gl_stream_begin(262, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetSamplerParameterfv(GLuint a0, GLenum a1, GLfloat * a2) {
+  uint32_t *s = gl_stream_begin(263, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glGetSamplerParameteriv(GLuint a0, GLenum a1, GLint * a2) {
+  uint32_t *s = gl_stream_begin(264, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetShaderInfoLog(GLuint a0, GLsizei a1, GLsizei * a2, GLchar * a3) {
-  uint32_t *s = gl_stream_begin(242, 7);
+  uint32_t *s = gl_stream_begin(265, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -1647,7 +1817,7 @@ GLAPI void APIENTRY glGetShaderInfoLog(GLuint a0, GLsizei a1, GLsizei * a2, GLch
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glGetShaderSource(GLuint a0, GLsizei a1, GLsizei * a2, GLchar * a3) {
-  uint32_t *s = gl_stream_begin(243, 7);
+  uint32_t *s = gl_stream_begin(266, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -1655,27 +1825,27 @@ GLAPI void APIENTRY glGetShaderSource(GLuint a0, GLsizei a1, GLsizei * a2, GLcha
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glGetShaderiv(GLuint a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(244, 5);
+  uint32_t *s = gl_stream_begin(267, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI const GLubyte * APIENTRY glGetString(GLenum a0) {
-  uint32_t *s = gl_stream_begin(245, 2);
+  uint32_t *s = gl_stream_begin(268, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (const GLubyte *)(uintptr_t)r;
 }
 GLAPI const GLubyte * APIENTRY glGetStringi(GLenum a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(246, 3);
+  uint32_t *s = gl_stream_begin(269, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   const uint64_t r = gl_stream_sync(3);
   return (const GLubyte *)(uintptr_t)r;
 }
 GLAPI void APIENTRY glGetSynciv(GLsync a0, GLenum a1, GLsizei a2, GLsizei * a3, GLint * a4) {
-  uint32_t *s = gl_stream_begin(247, 9);
+  uint32_t *s = gl_stream_begin(270, 9);
   gl_stream_u64(s + 1, (uint64_t)(uintptr_t)a0);
   s[3] = (uint32_t)a1;
   s[4] = (uint32_t)a2;
@@ -1684,42 +1854,42 @@ GLAPI void APIENTRY glGetSynciv(GLsync a0, GLenum a1, GLsizei a2, GLsizei * a3, 
   gl_stream_sync(9);
 }
 GLAPI void APIENTRY glGetTexEnvfv(GLenum a0, GLenum a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(248, 5);
+  uint32_t *s = gl_stream_begin(271, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetTexEnviv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(249, 5);
+  uint32_t *s = gl_stream_begin(272, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetTexGendv(GLenum a0, GLenum a1, GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(250, 5);
+  uint32_t *s = gl_stream_begin(273, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetTexGenfv(GLenum a0, GLenum a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(251, 5);
+  uint32_t *s = gl_stream_begin(274, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetTexGeniv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(252, 5);
+  uint32_t *s = gl_stream_begin(275, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetTexImage(GLenum a0, GLint a1, GLenum a2, GLenum a3, void * a4) {
-  uint32_t *s = gl_stream_begin(253, 7);
+  uint32_t *s = gl_stream_begin(276, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1728,7 +1898,7 @@ GLAPI void APIENTRY glGetTexImage(GLenum a0, GLint a1, GLenum a2, GLenum a3, voi
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glGetTexLevelParameterfv(GLenum a0, GLint a1, GLenum a2, GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(254, 6);
+  uint32_t *s = gl_stream_begin(277, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1736,7 +1906,7 @@ GLAPI void APIENTRY glGetTexLevelParameterfv(GLenum a0, GLint a1, GLenum a2, GLf
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glGetTexLevelParameteriv(GLenum a0, GLint a1, GLenum a2, GLint * a3) {
-  uint32_t *s = gl_stream_begin(255, 6);
+  uint32_t *s = gl_stream_begin(278, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -1744,28 +1914,28 @@ GLAPI void APIENTRY glGetTexLevelParameteriv(GLenum a0, GLint a1, GLenum a2, GLi
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glGetTexParameterfv(GLenum a0, GLenum a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(256, 5);
+  uint32_t *s = gl_stream_begin(279, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetTexParameteriv(GLenum a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(257, 5);
+  uint32_t *s = gl_stream_begin(280, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI GLuint APIENTRY glGetUniformBlockIndex(GLuint a0, const GLchar * a1) {
-  uint32_t *s = gl_stream_begin(258, 4);
+  uint32_t *s = gl_stream_begin(281, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   const uint64_t r = gl_stream_sync(4);
   return (GLuint)r;
 }
 GLAPI void APIENTRY glGetUniformIndices(GLuint a0, GLsizei a1, const GLchar *const* a2, GLuint * a3) {
-  uint32_t *s = gl_stream_begin(259, 7);
+  uint32_t *s = gl_stream_begin(282, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -1773,149 +1943,157 @@ GLAPI void APIENTRY glGetUniformIndices(GLuint a0, GLsizei a1, const GLchar *con
   gl_stream_sync(7);
 }
 GLAPI GLint APIENTRY glGetUniformLocation(GLuint a0, const GLchar * a1) {
-  uint32_t *s = gl_stream_begin(260, 4);
+  uint32_t *s = gl_stream_begin(283, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   const uint64_t r = gl_stream_sync(4);
   return (GLint)r;
 }
 GLAPI void APIENTRY glGetUniformfv(GLuint a0, GLint a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(261, 5);
+  uint32_t *s = gl_stream_begin(284, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetUniformiv(GLuint a0, GLint a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(262, 5);
+  uint32_t *s = gl_stream_begin(285, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetUniformuiv(GLuint a0, GLint a1, GLuint * a2) {
-  uint32_t *s = gl_stream_begin(263, 5);
+  uint32_t *s = gl_stream_begin(286, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetVertexAttribPointerv(GLuint a0, GLenum a1, void ** a2) {
-  uint32_t *s = gl_stream_begin(264, 5);
+  uint32_t *s = gl_stream_begin(287, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetVertexAttribdv(GLuint a0, GLenum a1, GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(265, 5);
+  uint32_t *s = gl_stream_begin(288, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetVertexAttribfv(GLuint a0, GLenum a1, GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(266, 5);
+  uint32_t *s = gl_stream_begin(289, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glGetVertexAttribiv(GLuint a0, GLenum a1, GLint * a2) {
-  uint32_t *s = gl_stream_begin(267, 5);
+  uint32_t *s = gl_stream_begin(290, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glHint(GLenum a0, GLenum a1) {
-  uint32_t *s = gl_stream_begin(268, 3);
+  uint32_t *s = gl_stream_begin(291, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glIndexMask(GLuint a0) {
-  uint32_t *s = gl_stream_begin(269, 2);
+  uint32_t *s = gl_stream_begin(292, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexPointer(GLenum a0, GLsizei a1, const void * a2) {
-  uint32_t *s = gl_stream_begin(270, 5);
+  uint32_t *s = gl_stream_begin(293, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_end(5);
 }
+GLAPI void APIENTRY glIndexPointerEXT(GLenum a0, GLsizei a1, GLsizei a2, const void * a3) {
+  uint32_t *s = gl_stream_begin(294, 6);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
+  gl_stream_end(6);
+}
 GLAPI void APIENTRY glIndexd(GLdouble a0) {
-  uint32_t *s = gl_stream_begin(271, 3);
+  uint32_t *s = gl_stream_begin(295, 3);
   gl_stream_f64(s + 1, a0);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glIndexdv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(272, 3);
+  uint32_t *s = gl_stream_begin(296, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glIndexf(GLfloat a0) {
-  uint32_t *s = gl_stream_begin(273, 2);
+  uint32_t *s = gl_stream_begin(297, 2);
   s[1] = gl_stream_f32(a0);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexfv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(274, 2);
+  uint32_t *s = gl_stream_begin(298, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexi(GLint a0) {
-  uint32_t *s = gl_stream_begin(275, 2);
+  uint32_t *s = gl_stream_begin(299, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexiv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(276, 2);
+  uint32_t *s = gl_stream_begin(300, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexs(GLshort a0) {
-  uint32_t *s = gl_stream_begin(277, 2);
+  uint32_t *s = gl_stream_begin(301, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexsv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(278, 2);
+  uint32_t *s = gl_stream_begin(302, 2);
   gl_stream_copy(s + 1, a0, 2);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexub(GLubyte a0) {
-  uint32_t *s = gl_stream_begin(279, 2);
+  uint32_t *s = gl_stream_begin(303, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glIndexubv(const GLubyte * a0) {
-  uint32_t *s = gl_stream_begin(280, 2);
+  uint32_t *s = gl_stream_begin(304, 2);
   gl_stream_copy(s + 1, a0, 1);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glInitNames(void) {
-  uint32_t *s = gl_stream_begin(281, 1);
+  (void)gl_stream_begin(305, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glInterleavedArrays(GLenum a0, GLsizei a1, const void * a2) {
-  uint32_t *s = gl_stream_begin(282, 5);
+  uint32_t *s = gl_stream_begin(306, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glInvalidateFramebuffer(GLenum a0, GLsizei a1, const GLenum * a2) {
-  uint32_t *s = gl_stream_begin(283, 5);
+  uint32_t *s = gl_stream_begin(307, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glInvalidateSubFramebuffer(GLenum a0, GLsizei a1, const GLenum * a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6) {
-  uint32_t *s = gl_stream_begin(284, 9);
+  uint32_t *s = gl_stream_begin(308, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -1926,193 +2104,193 @@ GLAPI void APIENTRY glInvalidateSubFramebuffer(GLenum a0, GLsizei a1, const GLen
   gl_stream_sync(9);
 }
 GLAPI GLboolean APIENTRY glIsBuffer(GLuint a0) {
-  uint32_t *s = gl_stream_begin(285, 2);
+  uint32_t *s = gl_stream_begin(309, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsEnabled(GLenum a0) {
-  uint32_t *s = gl_stream_begin(286, 2);
+  uint32_t *s = gl_stream_begin(310, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsEnabledi(GLenum a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(287, 3);
+  uint32_t *s = gl_stream_begin(311, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   const uint64_t r = gl_stream_sync(3);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsFramebuffer(GLuint a0) {
-  uint32_t *s = gl_stream_begin(288, 2);
+  uint32_t *s = gl_stream_begin(312, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsList(GLuint a0) {
-  uint32_t *s = gl_stream_begin(289, 2);
+  uint32_t *s = gl_stream_begin(313, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsProgram(GLuint a0) {
-  uint32_t *s = gl_stream_begin(290, 2);
+  uint32_t *s = gl_stream_begin(314, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsQuery(GLuint a0) {
-  uint32_t *s = gl_stream_begin(291, 2);
+  uint32_t *s = gl_stream_begin(315, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsRenderbuffer(GLuint a0) {
-  uint32_t *s = gl_stream_begin(292, 2);
+  uint32_t *s = gl_stream_begin(316, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsSampler(GLuint a0) {
-  uint32_t *s = gl_stream_begin(293, 2);
+  uint32_t *s = gl_stream_begin(317, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsShader(GLuint a0) {
-  uint32_t *s = gl_stream_begin(294, 2);
+  uint32_t *s = gl_stream_begin(318, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsSync(GLsync a0) {
-  uint32_t *s = gl_stream_begin(295, 3);
+  uint32_t *s = gl_stream_begin(319, 3);
   gl_stream_u64(s + 1, (uint64_t)(uintptr_t)a0);
   const uint64_t r = gl_stream_sync(3);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsTexture(GLuint a0) {
-  uint32_t *s = gl_stream_begin(296, 2);
+  uint32_t *s = gl_stream_begin(320, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glIsVertexArray(GLuint a0) {
-  uint32_t *s = gl_stream_begin(297, 2);
+  uint32_t *s = gl_stream_begin(321, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI void APIENTRY glLightModelf(GLenum a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(298, 3);
+  uint32_t *s = gl_stream_begin(322, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glLightModelfv(GLenum a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(299, 4);
+  uint32_t *s = gl_stream_begin(323, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glLightModeli(GLenum a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(300, 3);
+  uint32_t *s = gl_stream_begin(324, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glLightModeliv(GLenum a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(301, 4);
+  uint32_t *s = gl_stream_begin(325, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glLightf(GLenum a0, GLenum a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(302, 4);
+  uint32_t *s = gl_stream_begin(326, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glLightfv(GLenum a0, GLenum a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(303, 5);
+  uint32_t *s = gl_stream_begin(327, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glLighti(GLenum a0, GLenum a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(304, 4);
+  uint32_t *s = gl_stream_begin(328, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glLightiv(GLenum a0, GLenum a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(305, 5);
+  uint32_t *s = gl_stream_begin(329, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glLineStipple(GLint a0, GLushort a1) {
-  uint32_t *s = gl_stream_begin(306, 3);
+  uint32_t *s = gl_stream_begin(330, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glLineWidth(GLfloat a0) {
-  uint32_t *s = gl_stream_begin(307, 2);
+  uint32_t *s = gl_stream_begin(331, 2);
   s[1] = gl_stream_f32(a0);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glLinkProgram(GLuint a0) {
-  uint32_t *s = gl_stream_begin(308, 2);
+  uint32_t *s = gl_stream_begin(332, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glListBase(GLuint a0) {
-  uint32_t *s = gl_stream_begin(309, 2);
+  uint32_t *s = gl_stream_begin(333, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glLoadIdentity(void) {
-  uint32_t *s = gl_stream_begin(310, 1);
+  (void)gl_stream_begin(334, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glLoadMatrixd(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(311, 33);
+  uint32_t *s = gl_stream_begin(335, 33);
   gl_stream_copy(s + 1, a0, 128);
   gl_stream_end(33);
 }
 GLAPI void APIENTRY glLoadMatrixf(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(312, 17);
+  uint32_t *s = gl_stream_begin(336, 17);
   gl_stream_copy(s + 1, a0, 64);
   gl_stream_end(17);
 }
 GLAPI void APIENTRY glLoadName(GLuint a0) {
-  uint32_t *s = gl_stream_begin(313, 2);
+  uint32_t *s = gl_stream_begin(337, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glLoadTransposeMatrixd(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(314, 33);
+  uint32_t *s = gl_stream_begin(338, 33);
   gl_stream_copy(s + 1, a0, 128);
   gl_stream_end(33);
 }
 GLAPI void APIENTRY glLoadTransposeMatrixf(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(315, 17);
+  uint32_t *s = gl_stream_begin(339, 17);
   gl_stream_copy(s + 1, a0, 64);
   gl_stream_end(17);
 }
 GLAPI void APIENTRY glLogicOp(GLenum a0) {
-  uint32_t *s = gl_stream_begin(316, 2);
+  uint32_t *s = gl_stream_begin(340, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glMap1d(GLenum a0, GLdouble a1, GLdouble a2, GLint a3, GLint a4, const GLdouble * a5) {
-  uint32_t *s = gl_stream_begin(317, 10);
+  uint32_t *s = gl_stream_begin(341, 10);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -2122,7 +2300,7 @@ GLAPI void APIENTRY glMap1d(GLenum a0, GLdouble a1, GLdouble a2, GLint a3, GLint
   gl_stream_sync(10);
 }
 GLAPI void APIENTRY glMap1f(GLenum a0, GLfloat a1, GLfloat a2, GLint a3, GLint a4, const GLfloat * a5) {
-  uint32_t *s = gl_stream_begin(318, 8);
+  uint32_t *s = gl_stream_begin(342, 8);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -2132,7 +2310,7 @@ GLAPI void APIENTRY glMap1f(GLenum a0, GLfloat a1, GLfloat a2, GLint a3, GLint a
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glMap2d(GLenum a0, GLdouble a1, GLdouble a2, GLint a3, GLint a4, GLdouble a5, GLdouble a6, GLint a7, GLint a8, const GLdouble * a9) {
-  uint32_t *s = gl_stream_begin(319, 16);
+  uint32_t *s = gl_stream_begin(343, 16);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -2146,7 +2324,7 @@ GLAPI void APIENTRY glMap2d(GLenum a0, GLdouble a1, GLdouble a2, GLint a3, GLint
   gl_stream_sync(16);
 }
 GLAPI void APIENTRY glMap2f(GLenum a0, GLfloat a1, GLfloat a2, GLint a3, GLint a4, GLfloat a5, GLfloat a6, GLint a7, GLint a8, const GLfloat * a9) {
-  uint32_t *s = gl_stream_begin(320, 12);
+  uint32_t *s = gl_stream_begin(344, 12);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -2160,14 +2338,14 @@ GLAPI void APIENTRY glMap2f(GLenum a0, GLfloat a1, GLfloat a2, GLint a3, GLint a
   gl_stream_sync(12);
 }
 GLAPI void * APIENTRY glMapBuffer(GLenum a0, GLenum a1) {
-  uint32_t *s = gl_stream_begin(321, 3);
+  uint32_t *s = gl_stream_begin(345, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   const uint64_t r = gl_stream_sync(3);
   return (void *)(uintptr_t)r;
 }
 GLAPI void * APIENTRY glMapBufferRange(GLenum a0, GLintptr a1, GLsizeiptr a2, GLbitfield a3) {
-  uint32_t *s = gl_stream_begin(322, 7);
+  uint32_t *s = gl_stream_begin(346, 7);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)a2);
@@ -2176,21 +2354,21 @@ GLAPI void * APIENTRY glMapBufferRange(GLenum a0, GLintptr a1, GLsizeiptr a2, GL
   return (void *)(uintptr_t)r;
 }
 GLAPI void APIENTRY glMapGrid1d(GLint a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(323, 6);
+  uint32_t *s = gl_stream_begin(347, 6);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMapGrid1f(GLint a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(324, 4);
+  uint32_t *s = gl_stream_begin(348, 4);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMapGrid2d(GLint a0, GLdouble a1, GLdouble a2, GLint a3, GLdouble a4, GLdouble a5) {
-  uint32_t *s = gl_stream_begin(325, 11);
+  uint32_t *s = gl_stream_begin(349, 11);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -2200,7 +2378,7 @@ GLAPI void APIENTRY glMapGrid2d(GLint a0, GLdouble a1, GLdouble a2, GLint a3, GL
   gl_stream_end(11);
 }
 GLAPI void APIENTRY glMapGrid2f(GLint a0, GLfloat a1, GLfloat a2, GLint a3, GLfloat a4, GLfloat a5) {
-  uint32_t *s = gl_stream_begin(326, 7);
+  uint32_t *s = gl_stream_begin(350, 7);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -2210,14 +2388,14 @@ GLAPI void APIENTRY glMapGrid2f(GLint a0, GLfloat a1, GLfloat a2, GLint a3, GLfl
   gl_stream_end(7);
 }
 GLAPI void * APIENTRY glMapNamedBuffer(GLuint a0, GLenum a1) {
-  uint32_t *s = gl_stream_begin(327, 3);
+  uint32_t *s = gl_stream_begin(351, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   const uint64_t r = gl_stream_sync(3);
   return (void *)(uintptr_t)r;
 }
 GLAPI void * APIENTRY glMapNamedBufferRange(GLuint a0, GLintptr a1, GLsizeiptr a2, GLbitfield a3) {
-  uint32_t *s = gl_stream_begin(328, 7);
+  uint32_t *s = gl_stream_begin(352, 7);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)a2);
@@ -2226,60 +2404,60 @@ GLAPI void * APIENTRY glMapNamedBufferRange(GLuint a0, GLintptr a1, GLsizeiptr a
   return (void *)(uintptr_t)r;
 }
 GLAPI void APIENTRY glMaterialf(GLenum a0, GLenum a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(329, 4);
+  uint32_t *s = gl_stream_begin(353, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMaterialfv(GLenum a0, GLenum a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(330, 5);
+  uint32_t *s = gl_stream_begin(354, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glMateriali(GLenum a0, GLenum a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(331, 4);
+  uint32_t *s = gl_stream_begin(355, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMaterialiv(GLenum a0, GLenum a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(332, 5);
+  uint32_t *s = gl_stream_begin(356, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glMatrixMode(GLenum a0) {
-  uint32_t *s = gl_stream_begin(333, 2);
+  uint32_t *s = gl_stream_begin(357, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glMultMatrixd(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(334, 33);
+  uint32_t *s = gl_stream_begin(358, 33);
   gl_stream_copy(s + 1, a0, 128);
   gl_stream_end(33);
 }
 GLAPI void APIENTRY glMultMatrixf(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(335, 17);
+  uint32_t *s = gl_stream_begin(359, 17);
   gl_stream_copy(s + 1, a0, 64);
   gl_stream_end(17);
 }
 GLAPI void APIENTRY glMultTransposeMatrixd(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(336, 33);
+  uint32_t *s = gl_stream_begin(360, 33);
   gl_stream_copy(s + 1, a0, 128);
   gl_stream_end(33);
 }
 GLAPI void APIENTRY glMultTransposeMatrixf(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(337, 17);
+  uint32_t *s = gl_stream_begin(361, 17);
   gl_stream_copy(s + 1, a0, 64);
   gl_stream_end(17);
 }
 GLAPI void APIENTRY glMultiDrawArrays(GLenum a0, const GLint * a1, const GLsizei * a2, GLsizei a3) {
-  uint32_t *s = gl_stream_begin(338, 7);
+  uint32_t *s = gl_stream_begin(362, 7);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a2);
@@ -2287,7 +2465,7 @@ GLAPI void APIENTRY glMultiDrawArrays(GLenum a0, const GLint * a1, const GLsizei
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glMultiDrawElements(GLenum a0, const GLsizei * a1, GLenum a2, const void *const* a3, GLsizei a4) {
-  uint32_t *s = gl_stream_begin(339, 8);
+  uint32_t *s = gl_stream_begin(363, 8);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   s[4] = (uint32_t)a2;
@@ -2296,7 +2474,7 @@ GLAPI void APIENTRY glMultiDrawElements(GLenum a0, const GLsizei * a1, GLenum a2
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glMultiDrawElementsBaseVertex(GLenum a0, const GLsizei * a1, GLenum a2, const void *const* a3, GLsizei a4, const GLint * a5) {
-  uint32_t *s = gl_stream_begin(340, 10);
+  uint32_t *s = gl_stream_begin(364, 10);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   s[4] = (uint32_t)a2;
@@ -2306,107 +2484,107 @@ GLAPI void APIENTRY glMultiDrawElementsBaseVertex(GLenum a0, const GLsizei * a1,
   gl_stream_sync(10);
 }
 GLAPI void APIENTRY glMultiTexCoord1d(GLenum a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(341, 4);
+  uint32_t *s = gl_stream_begin(365, 4);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord1dv(GLenum a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(342, 4);
+  uint32_t *s = gl_stream_begin(366, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord1f(GLenum a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(343, 3);
+  uint32_t *s = gl_stream_begin(367, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glMultiTexCoord1fv(GLenum a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(344, 3);
+  uint32_t *s = gl_stream_begin(368, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glMultiTexCoord1i(GLenum a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(345, 3);
+  uint32_t *s = gl_stream_begin(369, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glMultiTexCoord1iv(GLenum a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(346, 3);
+  uint32_t *s = gl_stream_begin(370, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glMultiTexCoord1s(GLenum a0, GLshort a1) {
-  uint32_t *s = gl_stream_begin(347, 3);
+  uint32_t *s = gl_stream_begin(371, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glMultiTexCoord1sv(GLenum a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(348, 3);
+  uint32_t *s = gl_stream_begin(372, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 2);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glMultiTexCoord2d(GLenum a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(349, 6);
+  uint32_t *s = gl_stream_begin(373, 6);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMultiTexCoord2dv(GLenum a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(350, 6);
+  uint32_t *s = gl_stream_begin(374, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMultiTexCoord2f(GLenum a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(351, 4);
+  uint32_t *s = gl_stream_begin(375, 4);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord2fv(GLenum a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(352, 4);
+  uint32_t *s = gl_stream_begin(376, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord2i(GLenum a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(353, 4);
+  uint32_t *s = gl_stream_begin(377, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord2iv(GLenum a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(354, 4);
+  uint32_t *s = gl_stream_begin(378, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord2s(GLenum a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(355, 4);
+  uint32_t *s = gl_stream_begin(379, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord2sv(GLenum a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(356, 3);
+  uint32_t *s = gl_stream_begin(380, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glMultiTexCoord3d(GLenum a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(357, 8);
+  uint32_t *s = gl_stream_begin(381, 8);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -2414,13 +2592,13 @@ GLAPI void APIENTRY glMultiTexCoord3d(GLenum a0, GLdouble a1, GLdouble a2, GLdou
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glMultiTexCoord3dv(GLenum a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(358, 8);
+  uint32_t *s = gl_stream_begin(382, 8);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 24);
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glMultiTexCoord3f(GLenum a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(359, 5);
+  uint32_t *s = gl_stream_begin(383, 5);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -2428,13 +2606,13 @@ GLAPI void APIENTRY glMultiTexCoord3f(GLenum a0, GLfloat a1, GLfloat a2, GLfloat
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glMultiTexCoord3fv(GLenum a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(360, 5);
+  uint32_t *s = gl_stream_begin(384, 5);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 12);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glMultiTexCoord3i(GLenum a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(361, 5);
+  uint32_t *s = gl_stream_begin(385, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2442,13 +2620,13 @@ GLAPI void APIENTRY glMultiTexCoord3i(GLenum a0, GLint a1, GLint a2, GLint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glMultiTexCoord3iv(GLenum a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(362, 5);
+  uint32_t *s = gl_stream_begin(386, 5);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 12);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glMultiTexCoord3s(GLenum a0, GLshort a1, GLshort a2, GLshort a3) {
-  uint32_t *s = gl_stream_begin(363, 5);
+  uint32_t *s = gl_stream_begin(387, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2456,13 +2634,13 @@ GLAPI void APIENTRY glMultiTexCoord3s(GLenum a0, GLshort a1, GLshort a2, GLshort
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glMultiTexCoord3sv(GLenum a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(364, 4);
+  uint32_t *s = gl_stream_begin(388, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 6);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glMultiTexCoord4d(GLenum a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4) {
-  uint32_t *s = gl_stream_begin(365, 10);
+  uint32_t *s = gl_stream_begin(389, 10);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -2471,13 +2649,13 @@ GLAPI void APIENTRY glMultiTexCoord4d(GLenum a0, GLdouble a1, GLdouble a2, GLdou
   gl_stream_end(10);
 }
 GLAPI void APIENTRY glMultiTexCoord4dv(GLenum a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(366, 10);
+  uint32_t *s = gl_stream_begin(390, 10);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 32);
   gl_stream_end(10);
 }
 GLAPI void APIENTRY glMultiTexCoord4f(GLenum a0, GLfloat a1, GLfloat a2, GLfloat a3, GLfloat a4) {
-  uint32_t *s = gl_stream_begin(367, 6);
+  uint32_t *s = gl_stream_begin(391, 6);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -2486,13 +2664,13 @@ GLAPI void APIENTRY glMultiTexCoord4f(GLenum a0, GLfloat a1, GLfloat a2, GLfloat
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMultiTexCoord4fv(GLenum a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(368, 6);
+  uint32_t *s = gl_stream_begin(392, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMultiTexCoord4i(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(369, 6);
+  uint32_t *s = gl_stream_begin(393, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2501,13 +2679,13 @@ GLAPI void APIENTRY glMultiTexCoord4i(GLenum a0, GLint a1, GLint a2, GLint a3, G
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMultiTexCoord4iv(GLenum a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(370, 6);
+  uint32_t *s = gl_stream_begin(394, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMultiTexCoord4s(GLenum a0, GLshort a1, GLshort a2, GLshort a3, GLshort a4) {
-  uint32_t *s = gl_stream_begin(371, 6);
+  uint32_t *s = gl_stream_begin(395, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2516,13 +2694,13 @@ GLAPI void APIENTRY glMultiTexCoord4s(GLenum a0, GLshort a1, GLshort a2, GLshort
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glMultiTexCoord4sv(GLenum a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(372, 4);
+  uint32_t *s = gl_stream_begin(396, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glNamedBufferData(GLuint a0, GLsizeiptr a1, const void * a2, GLenum a3) {
-  uint32_t *s = gl_stream_begin(373, 7);
+  uint32_t *s = gl_stream_begin(397, 7);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a2);
@@ -2530,7 +2708,7 @@ GLAPI void APIENTRY glNamedBufferData(GLuint a0, GLsizeiptr a1, const void * a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glNamedBufferStorage(GLuint a0, GLsizeiptr a1, const void * a2, GLbitfield a3) {
-  uint32_t *s = gl_stream_begin(374, 7);
+  uint32_t *s = gl_stream_begin(398, 7);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a2);
@@ -2538,7 +2716,7 @@ GLAPI void APIENTRY glNamedBufferStorage(GLuint a0, GLsizeiptr a1, const void * 
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glNamedBufferSubData(GLuint a0, GLintptr a1, GLsizeiptr a2, const void * a3) {
-  uint32_t *s = gl_stream_begin(375, 8);
+  uint32_t *s = gl_stream_begin(399, 8);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)a1);
   gl_stream_u64(s + 4, (uint64_t)a2);
@@ -2546,80 +2724,88 @@ GLAPI void APIENTRY glNamedBufferSubData(GLuint a0, GLintptr a1, GLsizeiptr a2, 
   gl_stream_sync(8);
 }
 GLAPI void APIENTRY glNewList(GLuint a0, GLenum a1) {
-  uint32_t *s = gl_stream_begin(376, 3);
+  uint32_t *s = gl_stream_begin(400, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glNormal3b(GLbyte a0, GLbyte a1, GLbyte a2) {
-  uint32_t *s = gl_stream_begin(377, 4);
+  uint32_t *s = gl_stream_begin(401, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glNormal3bv(const GLbyte * a0) {
-  uint32_t *s = gl_stream_begin(378, 2);
+  uint32_t *s = gl_stream_begin(402, 2);
   gl_stream_copy(s + 1, a0, 3);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glNormal3d(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(379, 7);
+  uint32_t *s = gl_stream_begin(403, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glNormal3dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(380, 7);
+  uint32_t *s = gl_stream_begin(404, 7);
   gl_stream_copy(s + 1, a0, 24);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glNormal3f(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(381, 4);
+  uint32_t *s = gl_stream_begin(405, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glNormal3fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(382, 4);
+  uint32_t *s = gl_stream_begin(406, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glNormal3i(GLint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(383, 4);
+  uint32_t *s = gl_stream_begin(407, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glNormal3iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(384, 4);
+  uint32_t *s = gl_stream_begin(408, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glNormal3s(GLshort a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(385, 4);
+  uint32_t *s = gl_stream_begin(409, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glNormal3sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(386, 3);
+  uint32_t *s = gl_stream_begin(410, 3);
   gl_stream_copy(s + 1, a0, 6);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glNormalPointer(GLenum a0, GLsizei a1, const void * a2) {
-  uint32_t *s = gl_stream_begin(387, 5);
+  uint32_t *s = gl_stream_begin(411, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_end(5);
 }
+GLAPI void APIENTRY glNormalPointerEXT(GLenum a0, GLsizei a1, GLsizei a2, const void * a3) {
+  uint32_t *s = gl_stream_begin(412, 6);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
+  gl_stream_end(6);
+}
 GLAPI void APIENTRY glOrtho(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4, GLdouble a5) {
-  uint32_t *s = gl_stream_begin(388, 13);
+  uint32_t *s = gl_stream_begin(413, 13);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
@@ -2629,137 +2815,137 @@ GLAPI void APIENTRY glOrtho(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3, 
   gl_stream_end(13);
 }
 GLAPI void APIENTRY glPassThrough(GLfloat a0) {
-  uint32_t *s = gl_stream_begin(389, 2);
+  uint32_t *s = gl_stream_begin(414, 2);
   s[1] = gl_stream_f32(a0);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glPixelMapfv(GLenum a0, GLsizei a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(390, 5);
+  uint32_t *s = gl_stream_begin(415, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glPixelMapuiv(GLenum a0, GLsizei a1, const GLuint * a2) {
-  uint32_t *s = gl_stream_begin(391, 5);
+  uint32_t *s = gl_stream_begin(416, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glPixelMapusv(GLenum a0, GLsizei a1, const GLushort * a2) {
-  uint32_t *s = gl_stream_begin(392, 5);
+  uint32_t *s = gl_stream_begin(417, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glPixelStoref(GLenum a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(393, 3);
+  uint32_t *s = gl_stream_begin(418, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPixelStorei(GLenum a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(394, 3);
+  uint32_t *s = gl_stream_begin(419, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPixelTransferf(GLenum a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(395, 3);
+  uint32_t *s = gl_stream_begin(420, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPixelTransferi(GLenum a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(396, 3);
+  uint32_t *s = gl_stream_begin(421, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPixelZoom(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(397, 3);
+  uint32_t *s = gl_stream_begin(422, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPointParameterf(GLenum a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(398, 3);
+  uint32_t *s = gl_stream_begin(423, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPointParameterfv(GLenum a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(399, 4);
+  uint32_t *s = gl_stream_begin(424, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glPointParameteri(GLenum a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(400, 3);
+  uint32_t *s = gl_stream_begin(425, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPointParameteriv(GLenum a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(401, 4);
+  uint32_t *s = gl_stream_begin(426, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_sync(4);
 }
 GLAPI void APIENTRY glPointSize(GLfloat a0) {
-  uint32_t *s = gl_stream_begin(402, 2);
+  uint32_t *s = gl_stream_begin(427, 2);
   s[1] = gl_stream_f32(a0);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glPolygonMode(GLenum a0, GLenum a1) {
-  uint32_t *s = gl_stream_begin(403, 3);
+  uint32_t *s = gl_stream_begin(428, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPolygonOffset(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(404, 3);
+  uint32_t *s = gl_stream_begin(429, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glPolygonStipple(const GLubyte * a0) {
-  uint32_t *s = gl_stream_begin(405, 3);
+  uint32_t *s = gl_stream_begin(430, 3);
   gl_stream_u64(s + 1, (uint64_t)(uintptr_t)a0);
   gl_stream_sync(3);
 }
 GLAPI void APIENTRY glPopAttrib(void) {
-  uint32_t *s = gl_stream_begin(406, 1);
+  (void)gl_stream_begin(431, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glPopClientAttrib(void) {
-  uint32_t *s = gl_stream_begin(407, 1);
+  (void)gl_stream_begin(432, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glPopMatrix(void) {
-  uint32_t *s = gl_stream_begin(408, 1);
+  (void)gl_stream_begin(433, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glPopName(void) {
-  uint32_t *s = gl_stream_begin(409, 1);
+  (void)gl_stream_begin(434, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glPrimitiveRestartIndex(GLuint a0) {
-  uint32_t *s = gl_stream_begin(410, 2);
+  uint32_t *s = gl_stream_begin(435, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glPrioritizeTextures(GLsizei a0, const GLuint * a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(411, 6);
+  uint32_t *s = gl_stream_begin(436, 6);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform1dv(GLuint a0, GLint a1, GLsizei a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(412, 6);
+  uint32_t *s = gl_stream_begin(437, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2767,14 +2953,14 @@ GLAPI void APIENTRY glProgramUniform1dv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform1f(GLuint a0, GLint a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(413, 4);
+  uint32_t *s = gl_stream_begin(438, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glProgramUniform1fv(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(414, 6);
+  uint32_t *s = gl_stream_begin(439, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2782,14 +2968,14 @@ GLAPI void APIENTRY glProgramUniform1fv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform1i(GLuint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(415, 4);
+  uint32_t *s = gl_stream_begin(440, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glProgramUniform1iv(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) {
-  uint32_t *s = gl_stream_begin(416, 6);
+  uint32_t *s = gl_stream_begin(441, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2797,14 +2983,14 @@ GLAPI void APIENTRY glProgramUniform1iv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform1ui(GLuint a0, GLint a1, GLuint a2) {
-  uint32_t *s = gl_stream_begin(417, 4);
+  uint32_t *s = gl_stream_begin(442, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glProgramUniform1uiv(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) {
-  uint32_t *s = gl_stream_begin(418, 6);
+  uint32_t *s = gl_stream_begin(443, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2812,7 +2998,7 @@ GLAPI void APIENTRY glProgramUniform1uiv(GLuint a0, GLint a1, GLsizei a2, const 
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform2dv(GLuint a0, GLint a1, GLsizei a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(419, 6);
+  uint32_t *s = gl_stream_begin(444, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2820,7 +3006,7 @@ GLAPI void APIENTRY glProgramUniform2dv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform2f(GLuint a0, GLint a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(420, 5);
+  uint32_t *s = gl_stream_begin(445, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
@@ -2828,7 +3014,7 @@ GLAPI void APIENTRY glProgramUniform2f(GLuint a0, GLint a1, GLfloat a2, GLfloat 
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glProgramUniform2fv(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(421, 6);
+  uint32_t *s = gl_stream_begin(446, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2836,7 +3022,7 @@ GLAPI void APIENTRY glProgramUniform2fv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform2i(GLuint a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(422, 5);
+  uint32_t *s = gl_stream_begin(447, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2844,7 +3030,7 @@ GLAPI void APIENTRY glProgramUniform2i(GLuint a0, GLint a1, GLint a2, GLint a3) 
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glProgramUniform2iv(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) {
-  uint32_t *s = gl_stream_begin(423, 6);
+  uint32_t *s = gl_stream_begin(448, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2852,7 +3038,7 @@ GLAPI void APIENTRY glProgramUniform2iv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform2ui(GLuint a0, GLint a1, GLuint a2, GLuint a3) {
-  uint32_t *s = gl_stream_begin(424, 5);
+  uint32_t *s = gl_stream_begin(449, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2860,7 +3046,7 @@ GLAPI void APIENTRY glProgramUniform2ui(GLuint a0, GLint a1, GLuint a2, GLuint a
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glProgramUniform2uiv(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) {
-  uint32_t *s = gl_stream_begin(425, 6);
+  uint32_t *s = gl_stream_begin(450, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2868,7 +3054,7 @@ GLAPI void APIENTRY glProgramUniform2uiv(GLuint a0, GLint a1, GLsizei a2, const 
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform3dv(GLuint a0, GLint a1, GLsizei a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(426, 6);
+  uint32_t *s = gl_stream_begin(451, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2876,7 +3062,7 @@ GLAPI void APIENTRY glProgramUniform3dv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform3f(GLuint a0, GLint a1, GLfloat a2, GLfloat a3, GLfloat a4) {
-  uint32_t *s = gl_stream_begin(427, 6);
+  uint32_t *s = gl_stream_begin(452, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
@@ -2885,7 +3071,7 @@ GLAPI void APIENTRY glProgramUniform3f(GLuint a0, GLint a1, GLfloat a2, GLfloat 
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glProgramUniform3fv(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(428, 6);
+  uint32_t *s = gl_stream_begin(453, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2893,7 +3079,7 @@ GLAPI void APIENTRY glProgramUniform3fv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform3i(GLuint a0, GLint a1, GLint a2, GLint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(429, 6);
+  uint32_t *s = gl_stream_begin(454, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2902,7 +3088,7 @@ GLAPI void APIENTRY glProgramUniform3i(GLuint a0, GLint a1, GLint a2, GLint a3, 
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glProgramUniform3iv(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) {
-  uint32_t *s = gl_stream_begin(430, 6);
+  uint32_t *s = gl_stream_begin(455, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2910,7 +3096,7 @@ GLAPI void APIENTRY glProgramUniform3iv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform3ui(GLuint a0, GLint a1, GLuint a2, GLuint a3, GLuint a4) {
-  uint32_t *s = gl_stream_begin(431, 6);
+  uint32_t *s = gl_stream_begin(456, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2919,7 +3105,7 @@ GLAPI void APIENTRY glProgramUniform3ui(GLuint a0, GLint a1, GLuint a2, GLuint a
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glProgramUniform3uiv(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) {
-  uint32_t *s = gl_stream_begin(432, 6);
+  uint32_t *s = gl_stream_begin(457, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2927,7 +3113,7 @@ GLAPI void APIENTRY glProgramUniform3uiv(GLuint a0, GLint a1, GLsizei a2, const 
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform4dv(GLuint a0, GLint a1, GLsizei a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(433, 6);
+  uint32_t *s = gl_stream_begin(458, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2935,7 +3121,7 @@ GLAPI void APIENTRY glProgramUniform4dv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform4f(GLuint a0, GLint a1, GLfloat a2, GLfloat a3, GLfloat a4, GLfloat a5) {
-  uint32_t *s = gl_stream_begin(434, 7);
+  uint32_t *s = gl_stream_begin(459, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
@@ -2945,7 +3131,7 @@ GLAPI void APIENTRY glProgramUniform4f(GLuint a0, GLint a1, GLfloat a2, GLfloat 
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glProgramUniform4fv(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(435, 6);
+  uint32_t *s = gl_stream_begin(460, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2953,7 +3139,7 @@ GLAPI void APIENTRY glProgramUniform4fv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform4i(GLuint a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5) {
-  uint32_t *s = gl_stream_begin(436, 7);
+  uint32_t *s = gl_stream_begin(461, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2963,7 +3149,7 @@ GLAPI void APIENTRY glProgramUniform4i(GLuint a0, GLint a1, GLint a2, GLint a3, 
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glProgramUniform4iv(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) {
-  uint32_t *s = gl_stream_begin(437, 6);
+  uint32_t *s = gl_stream_begin(462, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2971,7 +3157,7 @@ GLAPI void APIENTRY glProgramUniform4iv(GLuint a0, GLint a1, GLsizei a2, const G
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniform4ui(GLuint a0, GLint a1, GLuint a2, GLuint a3, GLuint a4, GLuint a5) {
-  uint32_t *s = gl_stream_begin(438, 7);
+  uint32_t *s = gl_stream_begin(463, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2981,7 +3167,7 @@ GLAPI void APIENTRY glProgramUniform4ui(GLuint a0, GLint a1, GLuint a2, GLuint a
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glProgramUniform4uiv(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) {
-  uint32_t *s = gl_stream_begin(439, 6);
+  uint32_t *s = gl_stream_begin(464, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2989,7 +3175,7 @@ GLAPI void APIENTRY glProgramUniform4uiv(GLuint a0, GLint a1, GLsizei a2, const 
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glProgramUniformMatrix2dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(440, 7);
+  uint32_t *s = gl_stream_begin(465, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -2998,7 +3184,7 @@ GLAPI void APIENTRY glProgramUniformMatrix2dv(GLuint a0, GLint a1, GLsizei a2, G
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix2fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(441, 7);
+  uint32_t *s = gl_stream_begin(466, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3007,7 +3193,7 @@ GLAPI void APIENTRY glProgramUniformMatrix2fv(GLuint a0, GLint a1, GLsizei a2, G
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix2x3dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(442, 7);
+  uint32_t *s = gl_stream_begin(467, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3016,7 +3202,7 @@ GLAPI void APIENTRY glProgramUniformMatrix2x3dv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix2x3fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(443, 7);
+  uint32_t *s = gl_stream_begin(468, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3025,7 +3211,7 @@ GLAPI void APIENTRY glProgramUniformMatrix2x3fv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix2x4dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(444, 7);
+  uint32_t *s = gl_stream_begin(469, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3034,7 +3220,7 @@ GLAPI void APIENTRY glProgramUniformMatrix2x4dv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix2x4fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(445, 7);
+  uint32_t *s = gl_stream_begin(470, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3043,7 +3229,7 @@ GLAPI void APIENTRY glProgramUniformMatrix2x4fv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix3dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(446, 7);
+  uint32_t *s = gl_stream_begin(471, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3052,7 +3238,7 @@ GLAPI void APIENTRY glProgramUniformMatrix3dv(GLuint a0, GLint a1, GLsizei a2, G
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix3fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(447, 7);
+  uint32_t *s = gl_stream_begin(472, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3061,7 +3247,7 @@ GLAPI void APIENTRY glProgramUniformMatrix3fv(GLuint a0, GLint a1, GLsizei a2, G
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix3x2dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(448, 7);
+  uint32_t *s = gl_stream_begin(473, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3070,7 +3256,7 @@ GLAPI void APIENTRY glProgramUniformMatrix3x2dv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix3x2fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(449, 7);
+  uint32_t *s = gl_stream_begin(474, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3079,7 +3265,7 @@ GLAPI void APIENTRY glProgramUniformMatrix3x2fv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix3x4dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(450, 7);
+  uint32_t *s = gl_stream_begin(475, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3088,7 +3274,7 @@ GLAPI void APIENTRY glProgramUniformMatrix3x4dv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix3x4fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(451, 7);
+  uint32_t *s = gl_stream_begin(476, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3097,7 +3283,7 @@ GLAPI void APIENTRY glProgramUniformMatrix3x4fv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix4dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(452, 7);
+  uint32_t *s = gl_stream_begin(477, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3106,7 +3292,7 @@ GLAPI void APIENTRY glProgramUniformMatrix4dv(GLuint a0, GLint a1, GLsizei a2, G
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix4fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(453, 7);
+  uint32_t *s = gl_stream_begin(478, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3115,7 +3301,7 @@ GLAPI void APIENTRY glProgramUniformMatrix4fv(GLuint a0, GLint a1, GLsizei a2, G
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix4x2dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(454, 7);
+  uint32_t *s = gl_stream_begin(479, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3124,7 +3310,7 @@ GLAPI void APIENTRY glProgramUniformMatrix4x2dv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix4x2fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(455, 7);
+  uint32_t *s = gl_stream_begin(480, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3133,7 +3319,7 @@ GLAPI void APIENTRY glProgramUniformMatrix4x2fv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix4x3dv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLdouble * a4) {
-  uint32_t *s = gl_stream_begin(456, 7);
+  uint32_t *s = gl_stream_begin(481, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3142,7 +3328,7 @@ GLAPI void APIENTRY glProgramUniformMatrix4x3dv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProgramUniformMatrix4x3fv(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) {
-  uint32_t *s = gl_stream_begin(457, 7);
+  uint32_t *s = gl_stream_begin(482, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3151,123 +3337,123 @@ GLAPI void APIENTRY glProgramUniformMatrix4x3fv(GLuint a0, GLint a1, GLsizei a2,
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glProvokingVertex(GLenum a0) {
-  uint32_t *s = gl_stream_begin(458, 2);
+  uint32_t *s = gl_stream_begin(483, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glPushAttrib(GLbitfield a0) {
-  uint32_t *s = gl_stream_begin(459, 2);
+  uint32_t *s = gl_stream_begin(484, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glPushClientAttrib(GLbitfield a0) {
-  uint32_t *s = gl_stream_begin(460, 2);
+  uint32_t *s = gl_stream_begin(485, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glPushMatrix(void) {
-  uint32_t *s = gl_stream_begin(461, 1);
+  (void)gl_stream_begin(486, 1);
   gl_stream_end(1);
 }
 GLAPI void APIENTRY glPushName(GLuint a0) {
-  uint32_t *s = gl_stream_begin(462, 2);
+  uint32_t *s = gl_stream_begin(487, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glRasterPos2d(GLdouble a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(463, 5);
+  uint32_t *s = gl_stream_begin(488, 5);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRasterPos2dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(464, 5);
+  uint32_t *s = gl_stream_begin(489, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRasterPos2f(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(465, 3);
+  uint32_t *s = gl_stream_begin(490, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glRasterPos2fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(466, 3);
+  uint32_t *s = gl_stream_begin(491, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glRasterPos2i(GLint a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(467, 3);
+  uint32_t *s = gl_stream_begin(492, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glRasterPos2iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(468, 3);
+  uint32_t *s = gl_stream_begin(493, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glRasterPos2s(GLshort a0, GLshort a1) {
-  uint32_t *s = gl_stream_begin(469, 3);
+  uint32_t *s = gl_stream_begin(494, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glRasterPos2sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(470, 2);
+  uint32_t *s = gl_stream_begin(495, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glRasterPos3d(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(471, 7);
+  uint32_t *s = gl_stream_begin(496, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glRasterPos3dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(472, 7);
+  uint32_t *s = gl_stream_begin(497, 7);
   gl_stream_copy(s + 1, a0, 24);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glRasterPos3f(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(473, 4);
+  uint32_t *s = gl_stream_begin(498, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glRasterPos3fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(474, 4);
+  uint32_t *s = gl_stream_begin(499, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glRasterPos3i(GLint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(475, 4);
+  uint32_t *s = gl_stream_begin(500, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glRasterPos3iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(476, 4);
+  uint32_t *s = gl_stream_begin(501, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glRasterPos3s(GLshort a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(477, 4);
+  uint32_t *s = gl_stream_begin(502, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glRasterPos3sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(478, 3);
+  uint32_t *s = gl_stream_begin(503, 3);
   gl_stream_copy(s + 1, a0, 6);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glRasterPos4d(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(479, 9);
+  uint32_t *s = gl_stream_begin(504, 9);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
@@ -3275,12 +3461,12 @@ GLAPI void APIENTRY glRasterPos4d(GLdouble a0, GLdouble a1, GLdouble a2, GLdoubl
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glRasterPos4dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(480, 9);
+  uint32_t *s = gl_stream_begin(505, 9);
   gl_stream_copy(s + 1, a0, 32);
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glRasterPos4f(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(481, 5);
+  uint32_t *s = gl_stream_begin(506, 5);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -3288,12 +3474,12 @@ GLAPI void APIENTRY glRasterPos4f(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRasterPos4fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(482, 5);
+  uint32_t *s = gl_stream_begin(507, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRasterPos4i(GLint a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(483, 5);
+  uint32_t *s = gl_stream_begin(508, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3301,12 +3487,12 @@ GLAPI void APIENTRY glRasterPos4i(GLint a0, GLint a1, GLint a2, GLint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRasterPos4iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(484, 5);
+  uint32_t *s = gl_stream_begin(509, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRasterPos4s(GLshort a0, GLshort a1, GLshort a2, GLshort a3) {
-  uint32_t *s = gl_stream_begin(485, 5);
+  uint32_t *s = gl_stream_begin(510, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3314,17 +3500,17 @@ GLAPI void APIENTRY glRasterPos4s(GLshort a0, GLshort a1, GLshort a2, GLshort a3
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRasterPos4sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(486, 3);
+  uint32_t *s = gl_stream_begin(511, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glReadBuffer(GLenum a0) {
-  uint32_t *s = gl_stream_begin(487, 2);
+  uint32_t *s = gl_stream_begin(512, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glReadPixels(GLint a0, GLint a1, GLsizei a2, GLsizei a3, GLenum a4, GLenum a5, void * a6) {
-  uint32_t *s = gl_stream_begin(488, 9);
+  uint32_t *s = gl_stream_begin(513, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3335,7 +3521,7 @@ GLAPI void APIENTRY glReadPixels(GLint a0, GLint a1, GLsizei a2, GLsizei a3, GLe
   gl_stream_sync(9);
 }
 GLAPI void APIENTRY glRectd(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(489, 9);
+  uint32_t *s = gl_stream_begin(514, 9);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
@@ -3343,13 +3529,13 @@ GLAPI void APIENTRY glRectd(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3) 
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glRectdv(const GLdouble * a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(490, 9);
+  uint32_t *s = gl_stream_begin(515, 9);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_copy(s + 5, a1, 16);
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glRectf(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(491, 5);
+  uint32_t *s = gl_stream_begin(516, 5);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -3357,13 +3543,13 @@ GLAPI void APIENTRY glRectf(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRectfv(const GLfloat * a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(492, 5);
+  uint32_t *s = gl_stream_begin(517, 5);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_copy(s + 3, a1, 8);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRecti(GLint a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(493, 5);
+  uint32_t *s = gl_stream_begin(518, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3371,13 +3557,13 @@ GLAPI void APIENTRY glRecti(GLint a0, GLint a1, GLint a2, GLint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRectiv(const GLint * a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(494, 5);
+  uint32_t *s = gl_stream_begin(519, 5);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_copy(s + 3, a1, 8);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRects(GLshort a0, GLshort a1, GLshort a2, GLshort a3) {
-  uint32_t *s = gl_stream_begin(495, 5);
+  uint32_t *s = gl_stream_begin(520, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3385,19 +3571,19 @@ GLAPI void APIENTRY glRects(GLshort a0, GLshort a1, GLshort a2, GLshort a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRectsv(const GLshort * a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(496, 3);
+  uint32_t *s = gl_stream_begin(521, 3);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI GLint APIENTRY glRenderMode(GLenum a0) {
-  uint32_t *s = gl_stream_begin(497, 2);
+  uint32_t *s = gl_stream_begin(522, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLint)r;
 }
 GLAPI void APIENTRY glRenderbufferStorage(GLenum a0, GLenum a1, GLsizei a2, GLsizei a3) {
-  uint32_t *s = gl_stream_begin(498, 5);
+  uint32_t *s = gl_stream_begin(523, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3405,7 +3591,7 @@ GLAPI void APIENTRY glRenderbufferStorage(GLenum a0, GLenum a1, GLsizei a2, GLsi
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glRenderbufferStorageMultisample(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4) {
-  uint32_t *s = gl_stream_begin(499, 6);
+  uint32_t *s = gl_stream_begin(524, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3414,7 +3600,7 @@ GLAPI void APIENTRY glRenderbufferStorageMultisample(GLenum a0, GLsizei a1, GLen
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glRotated(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(500, 9);
+  uint32_t *s = gl_stream_begin(525, 9);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
@@ -3422,7 +3608,7 @@ GLAPI void APIENTRY glRotated(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glRotatef(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(501, 5);
+  uint32_t *s = gl_stream_begin(526, 5);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -3430,55 +3616,69 @@ GLAPI void APIENTRY glRotatef(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glSampleCoverage(GLfloat a0, GLboolean a1) {
-  uint32_t *s = gl_stream_begin(502, 3);
+  uint32_t *s = gl_stream_begin(527, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
+GLAPI void APIENTRY glSamplerParameterIiv(GLuint a0, GLenum a1, const GLint * a2) {
+  uint32_t *s = gl_stream_begin(528, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
+GLAPI void APIENTRY glSamplerParameterIuiv(GLuint a0, GLenum a1, const GLuint * a2) {
+  uint32_t *s = gl_stream_begin(529, 5);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
+  gl_stream_sync(5);
+}
 GLAPI void APIENTRY glSamplerParameterf(GLuint a0, GLenum a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(503, 4);
+  uint32_t *s = gl_stream_begin(530, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSamplerParameterfv(GLuint a0, GLenum a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(504, 5);
+  uint32_t *s = gl_stream_begin(531, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glSamplerParameteri(GLuint a0, GLenum a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(505, 4);
+  uint32_t *s = gl_stream_begin(532, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSamplerParameteriv(GLuint a0, GLenum a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(506, 5);
+  uint32_t *s = gl_stream_begin(533, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glScaled(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(507, 7);
+  uint32_t *s = gl_stream_begin(534, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glScalef(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(508, 4);
+  uint32_t *s = gl_stream_begin(535, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glScissor(GLint a0, GLint a1, GLsizei a2, GLsizei a3) {
-  uint32_t *s = gl_stream_begin(509, 5);
+  uint32_t *s = gl_stream_begin(536, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3486,103 +3686,103 @@ GLAPI void APIENTRY glScissor(GLint a0, GLint a1, GLsizei a2, GLsizei a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glSecondaryColor3b(GLbyte a0, GLbyte a1, GLbyte a2) {
-  uint32_t *s = gl_stream_begin(510, 4);
+  uint32_t *s = gl_stream_begin(537, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3bv(const GLbyte * a0) {
-  uint32_t *s = gl_stream_begin(511, 2);
+  uint32_t *s = gl_stream_begin(538, 2);
   gl_stream_copy(s + 1, a0, 3);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glSecondaryColor3d(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(512, 7);
+  uint32_t *s = gl_stream_begin(539, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glSecondaryColor3dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(513, 7);
+  uint32_t *s = gl_stream_begin(540, 7);
   gl_stream_copy(s + 1, a0, 24);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glSecondaryColor3f(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(514, 4);
+  uint32_t *s = gl_stream_begin(541, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(515, 4);
+  uint32_t *s = gl_stream_begin(542, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3i(GLint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(516, 4);
+  uint32_t *s = gl_stream_begin(543, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(517, 4);
+  uint32_t *s = gl_stream_begin(544, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3s(GLshort a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(518, 4);
+  uint32_t *s = gl_stream_begin(545, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(519, 3);
+  uint32_t *s = gl_stream_begin(546, 3);
   gl_stream_copy(s + 1, a0, 6);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glSecondaryColor3ub(GLubyte a0, GLubyte a1, GLubyte a2) {
-  uint32_t *s = gl_stream_begin(520, 4);
+  uint32_t *s = gl_stream_begin(547, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3ubv(const GLubyte * a0) {
-  uint32_t *s = gl_stream_begin(521, 2);
+  uint32_t *s = gl_stream_begin(548, 2);
   gl_stream_copy(s + 1, a0, 3);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glSecondaryColor3ui(GLuint a0, GLuint a1, GLuint a2) {
-  uint32_t *s = gl_stream_begin(522, 4);
+  uint32_t *s = gl_stream_begin(549, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3uiv(const GLuint * a0) {
-  uint32_t *s = gl_stream_begin(523, 4);
+  uint32_t *s = gl_stream_begin(550, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3us(GLushort a0, GLushort a1, GLushort a2) {
-  uint32_t *s = gl_stream_begin(524, 4);
+  uint32_t *s = gl_stream_begin(551, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glSecondaryColor3usv(const GLushort * a0) {
-  uint32_t *s = gl_stream_begin(525, 3);
+  uint32_t *s = gl_stream_begin(552, 3);
   gl_stream_copy(s + 1, a0, 6);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glSecondaryColorPointer(GLint a0, GLenum a1, GLsizei a2, const void * a3) {
-  uint32_t *s = gl_stream_begin(526, 6);
+  uint32_t *s = gl_stream_begin(553, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3590,18 +3790,18 @@ GLAPI void APIENTRY glSecondaryColorPointer(GLint a0, GLenum a1, GLsizei a2, con
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glSelectBuffer(GLsizei a0, GLuint * a1) {
-  uint32_t *s = gl_stream_begin(527, 4);
+  uint32_t *s = gl_stream_begin(554, 4);
   s[1] = (uint32_t)a0;
   gl_stream_u64(s + 2, (uint64_t)(uintptr_t)a1);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glShadeModel(GLenum a0) {
-  uint32_t *s = gl_stream_begin(528, 2);
+  uint32_t *s = gl_stream_begin(555, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glShaderSource(GLuint a0, GLsizei a1, const GLchar *const* a2, const GLint * a3) {
-  uint32_t *s = gl_stream_begin(529, 7);
+  uint32_t *s = gl_stream_begin(556, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -3609,14 +3809,14 @@ GLAPI void APIENTRY glShaderSource(GLuint a0, GLsizei a1, const GLchar *const* a
   gl_stream_sync(7);
 }
 GLAPI void APIENTRY glStencilFunc(GLenum a0, GLint a1, GLuint a2) {
-  uint32_t *s = gl_stream_begin(530, 4);
+  uint32_t *s = gl_stream_begin(557, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glStencilFuncSeparate(GLenum a0, GLenum a1, GLint a2, GLuint a3) {
-  uint32_t *s = gl_stream_begin(531, 5);
+  uint32_t *s = gl_stream_begin(558, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3624,25 +3824,25 @@ GLAPI void APIENTRY glStencilFuncSeparate(GLenum a0, GLenum a1, GLint a2, GLuint
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glStencilMask(GLuint a0) {
-  uint32_t *s = gl_stream_begin(532, 2);
+  uint32_t *s = gl_stream_begin(559, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glStencilMaskSeparate(GLenum a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(533, 3);
+  uint32_t *s = gl_stream_begin(560, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glStencilOp(GLenum a0, GLenum a1, GLenum a2) {
-  uint32_t *s = gl_stream_begin(534, 4);
+  uint32_t *s = gl_stream_begin(561, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glStencilOpSeparate(GLenum a0, GLenum a1, GLenum a2, GLenum a3) {
-  uint32_t *s = gl_stream_begin(535, 5);
+  uint32_t *s = gl_stream_begin(562, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3650,139 +3850,139 @@ GLAPI void APIENTRY glStencilOpSeparate(GLenum a0, GLenum a1, GLenum a2, GLenum 
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord1d(GLdouble a0) {
-  uint32_t *s = gl_stream_begin(536, 3);
+  uint32_t *s = gl_stream_begin(563, 3);
   gl_stream_f64(s + 1, a0);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord1dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(537, 3);
+  uint32_t *s = gl_stream_begin(564, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord1f(GLfloat a0) {
-  uint32_t *s = gl_stream_begin(538, 2);
+  uint32_t *s = gl_stream_begin(565, 2);
   s[1] = gl_stream_f32(a0);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glTexCoord1fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(539, 2);
+  uint32_t *s = gl_stream_begin(566, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glTexCoord1i(GLint a0) {
-  uint32_t *s = gl_stream_begin(540, 2);
+  uint32_t *s = gl_stream_begin(567, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glTexCoord1iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(541, 2);
+  uint32_t *s = gl_stream_begin(568, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glTexCoord1s(GLshort a0) {
-  uint32_t *s = gl_stream_begin(542, 2);
+  uint32_t *s = gl_stream_begin(569, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glTexCoord1sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(543, 2);
+  uint32_t *s = gl_stream_begin(570, 2);
   gl_stream_copy(s + 1, a0, 2);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glTexCoord2d(GLdouble a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(544, 5);
+  uint32_t *s = gl_stream_begin(571, 5);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord2dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(545, 5);
+  uint32_t *s = gl_stream_begin(572, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord2f(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(546, 3);
+  uint32_t *s = gl_stream_begin(573, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord2fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(547, 3);
+  uint32_t *s = gl_stream_begin(574, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord2i(GLint a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(548, 3);
+  uint32_t *s = gl_stream_begin(575, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord2iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(549, 3);
+  uint32_t *s = gl_stream_begin(576, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord2s(GLshort a0, GLshort a1) {
-  uint32_t *s = gl_stream_begin(550, 3);
+  uint32_t *s = gl_stream_begin(577, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord2sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(551, 2);
+  uint32_t *s = gl_stream_begin(578, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glTexCoord3d(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(552, 7);
+  uint32_t *s = gl_stream_begin(579, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glTexCoord3dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(553, 7);
+  uint32_t *s = gl_stream_begin(580, 7);
   gl_stream_copy(s + 1, a0, 24);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glTexCoord3f(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(554, 4);
+  uint32_t *s = gl_stream_begin(581, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexCoord3fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(555, 4);
+  uint32_t *s = gl_stream_begin(582, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexCoord3i(GLint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(556, 4);
+  uint32_t *s = gl_stream_begin(583, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexCoord3iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(557, 4);
+  uint32_t *s = gl_stream_begin(584, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexCoord3s(GLshort a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(558, 4);
+  uint32_t *s = gl_stream_begin(585, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexCoord3sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(559, 3);
+  uint32_t *s = gl_stream_begin(586, 3);
   gl_stream_copy(s + 1, a0, 6);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoord4d(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(560, 9);
+  uint32_t *s = gl_stream_begin(587, 9);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
@@ -3790,12 +3990,12 @@ GLAPI void APIENTRY glTexCoord4d(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glTexCoord4dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(561, 9);
+  uint32_t *s = gl_stream_begin(588, 9);
   gl_stream_copy(s + 1, a0, 32);
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glTexCoord4f(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(562, 5);
+  uint32_t *s = gl_stream_begin(589, 5);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -3803,12 +4003,12 @@ GLAPI void APIENTRY glTexCoord4f(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3)
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord4fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(563, 5);
+  uint32_t *s = gl_stream_begin(590, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord4i(GLint a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(564, 5);
+  uint32_t *s = gl_stream_begin(591, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3816,12 +4016,12 @@ GLAPI void APIENTRY glTexCoord4i(GLint a0, GLint a1, GLint a2, GLint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord4iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(565, 5);
+  uint32_t *s = gl_stream_begin(592, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord4s(GLshort a0, GLshort a1, GLshort a2, GLshort a3) {
-  uint32_t *s = gl_stream_begin(566, 5);
+  uint32_t *s = gl_stream_begin(593, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3829,90 +4029,99 @@ GLAPI void APIENTRY glTexCoord4s(GLshort a0, GLshort a1, GLshort a2, GLshort a3)
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexCoord4sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(567, 3);
+  uint32_t *s = gl_stream_begin(594, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glTexCoordPointer(GLint a0, GLenum a1, GLsizei a2, const void * a3) {
-  uint32_t *s = gl_stream_begin(568, 6);
+  uint32_t *s = gl_stream_begin(595, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
   gl_stream_end(6);
 }
+GLAPI void APIENTRY glTexCoordPointerEXT(GLint a0, GLenum a1, GLsizei a2, GLsizei a3, const void * a4) {
+  uint32_t *s = gl_stream_begin(596, 7);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  s[4] = (uint32_t)a3;
+  gl_stream_u64(s + 5, (uint64_t)(uintptr_t)a4);
+  gl_stream_end(7);
+}
 GLAPI void APIENTRY glTexEnvf(GLenum a0, GLenum a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(569, 4);
+  uint32_t *s = gl_stream_begin(597, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexEnvfv(GLenum a0, GLenum a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(570, 5);
+  uint32_t *s = gl_stream_begin(598, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glTexEnvi(GLenum a0, GLenum a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(571, 4);
+  uint32_t *s = gl_stream_begin(599, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexEnviv(GLenum a0, GLenum a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(572, 5);
+  uint32_t *s = gl_stream_begin(600, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glTexGend(GLenum a0, GLenum a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(573, 5);
+  uint32_t *s = gl_stream_begin(601, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_f64(s + 3, a2);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexGendv(GLenum a0, GLenum a1, const GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(574, 5);
+  uint32_t *s = gl_stream_begin(602, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glTexGenf(GLenum a0, GLenum a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(575, 4);
+  uint32_t *s = gl_stream_begin(603, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexGenfv(GLenum a0, GLenum a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(576, 5);
+  uint32_t *s = gl_stream_begin(604, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glTexGeni(GLenum a0, GLenum a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(577, 4);
+  uint32_t *s = gl_stream_begin(605, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexGeniv(GLenum a0, GLenum a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(578, 5);
+  uint32_t *s = gl_stream_begin(606, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glTexImage1D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLint a4, GLenum a5, GLenum a6, const void * a7) {
-  uint32_t *s = gl_stream_begin(579, 10);
+  uint32_t *s = gl_stream_begin(607, 10);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3924,7 +4133,7 @@ GLAPI void APIENTRY glTexImage1D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLin
   gl_stream_sync(10);
 }
 GLAPI void APIENTRY glTexImage2D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLsizei a4, GLint a5, GLenum a6, GLenum a7, const void * a8) {
-  uint32_t *s = gl_stream_begin(580, 11);
+  uint32_t *s = gl_stream_begin(608, 11);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3937,7 +4146,7 @@ GLAPI void APIENTRY glTexImage2D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLsi
   gl_stream_sync(11);
 }
 GLAPI void APIENTRY glTexImage3D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLsizei a4, GLsizei a5, GLint a6, GLenum a7, GLenum a8, const void * a9) {
-  uint32_t *s = gl_stream_begin(581, 12);
+  uint32_t *s = gl_stream_begin(609, 12);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3951,35 +4160,35 @@ GLAPI void APIENTRY glTexImage3D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLsi
   gl_stream_sync(12);
 }
 GLAPI void APIENTRY glTexParameterf(GLenum a0, GLenum a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(582, 4);
+  uint32_t *s = gl_stream_begin(610, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexParameterfv(GLenum a0, GLenum a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(583, 5);
+  uint32_t *s = gl_stream_begin(611, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glTexParameteri(GLenum a0, GLenum a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(584, 4);
+  uint32_t *s = gl_stream_begin(612, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glTexParameteriv(GLenum a0, GLenum a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(585, 5);
+  uint32_t *s = gl_stream_begin(613, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glTexStorage1D(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3) {
-  uint32_t *s = gl_stream_begin(586, 5);
+  uint32_t *s = gl_stream_begin(614, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3987,7 +4196,7 @@ GLAPI void APIENTRY glTexStorage1D(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3)
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glTexStorage2D(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4) {
-  uint32_t *s = gl_stream_begin(587, 6);
+  uint32_t *s = gl_stream_begin(615, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -3996,7 +4205,7 @@ GLAPI void APIENTRY glTexStorage2D(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3,
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glTexStorage3D(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4, GLsizei a5) {
-  uint32_t *s = gl_stream_begin(588, 7);
+  uint32_t *s = gl_stream_begin(616, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4006,7 +4215,7 @@ GLAPI void APIENTRY glTexStorage3D(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3,
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glTexSubImage1D(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLenum a4, GLenum a5, const void * a6) {
-  uint32_t *s = gl_stream_begin(589, 9);
+  uint32_t *s = gl_stream_begin(617, 9);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4017,7 +4226,7 @@ GLAPI void APIENTRY glTexSubImage1D(GLenum a0, GLint a1, GLint a2, GLsizei a3, G
   gl_stream_sync(9);
 }
 GLAPI void APIENTRY glTexSubImage2D(GLenum a0, GLint a1, GLint a2, GLint a3, GLsizei a4, GLsizei a5, GLenum a6, GLenum a7, const void * a8) {
-  uint32_t *s = gl_stream_begin(590, 11);
+  uint32_t *s = gl_stream_begin(618, 11);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4030,7 +4239,7 @@ GLAPI void APIENTRY glTexSubImage2D(GLenum a0, GLint a1, GLint a2, GLint a3, GLs
   gl_stream_sync(11);
 }
 GLAPI void APIENTRY glTexSubImage3D(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLsizei a7, GLenum a8, GLenum a9, const void * a10) {
-  uint32_t *s = gl_stream_begin(591, 13);
+  uint32_t *s = gl_stream_begin(619, 13);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4045,7 +4254,7 @@ GLAPI void APIENTRY glTexSubImage3D(GLenum a0, GLint a1, GLint a2, GLint a3, GLi
   gl_stream_sync(13);
 }
 GLAPI void APIENTRY glTransformFeedbackVaryings(GLuint a0, GLsizei a1, const GLchar *const* a2, GLenum a3) {
-  uint32_t *s = gl_stream_begin(592, 6);
+  uint32_t *s = gl_stream_begin(620, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
@@ -4053,123 +4262,123 @@ GLAPI void APIENTRY glTransformFeedbackVaryings(GLuint a0, GLsizei a1, const GLc
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glTranslated(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(593, 7);
+  uint32_t *s = gl_stream_begin(621, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glTranslatef(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(594, 4);
+  uint32_t *s = gl_stream_begin(622, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glUniform1dv(GLint a0, GLsizei a1, const GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(595, 5);
+  uint32_t *s = gl_stream_begin(623, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform1f(GLint a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(596, 3);
+  uint32_t *s = gl_stream_begin(624, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glUniform1fv(GLint a0, GLsizei a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(597, 5);
+  uint32_t *s = gl_stream_begin(625, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform1i(GLint a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(598, 3);
+  uint32_t *s = gl_stream_begin(626, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glUniform1iv(GLint a0, GLsizei a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(599, 5);
+  uint32_t *s = gl_stream_begin(627, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform1ui(GLint a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(600, 3);
+  uint32_t *s = gl_stream_begin(628, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glUniform1uiv(GLint a0, GLsizei a1, const GLuint * a2) {
-  uint32_t *s = gl_stream_begin(601, 5);
+  uint32_t *s = gl_stream_begin(629, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform2dv(GLint a0, GLsizei a1, const GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(602, 5);
+  uint32_t *s = gl_stream_begin(630, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform2f(GLint a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(603, 4);
+  uint32_t *s = gl_stream_begin(631, 4);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glUniform2fv(GLint a0, GLsizei a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(604, 5);
+  uint32_t *s = gl_stream_begin(632, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform2i(GLint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(605, 4);
+  uint32_t *s = gl_stream_begin(633, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glUniform2iv(GLint a0, GLsizei a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(606, 5);
+  uint32_t *s = gl_stream_begin(634, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform2ui(GLint a0, GLuint a1, GLuint a2) {
-  uint32_t *s = gl_stream_begin(607, 4);
+  uint32_t *s = gl_stream_begin(635, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glUniform2uiv(GLint a0, GLsizei a1, const GLuint * a2) {
-  uint32_t *s = gl_stream_begin(608, 5);
+  uint32_t *s = gl_stream_begin(636, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform3dv(GLint a0, GLsizei a1, const GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(609, 5);
+  uint32_t *s = gl_stream_begin(637, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform3f(GLint a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(610, 5);
+  uint32_t *s = gl_stream_begin(638, 5);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -4177,14 +4386,14 @@ GLAPI void APIENTRY glUniform3f(GLint a0, GLfloat a1, GLfloat a2, GLfloat a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glUniform3fv(GLint a0, GLsizei a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(611, 5);
+  uint32_t *s = gl_stream_begin(639, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform3i(GLint a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(612, 5);
+  uint32_t *s = gl_stream_begin(640, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4192,14 +4401,14 @@ GLAPI void APIENTRY glUniform3i(GLint a0, GLint a1, GLint a2, GLint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glUniform3iv(GLint a0, GLsizei a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(613, 5);
+  uint32_t *s = gl_stream_begin(641, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform3ui(GLint a0, GLuint a1, GLuint a2, GLuint a3) {
-  uint32_t *s = gl_stream_begin(614, 5);
+  uint32_t *s = gl_stream_begin(642, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4207,21 +4416,21 @@ GLAPI void APIENTRY glUniform3ui(GLint a0, GLuint a1, GLuint a2, GLuint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glUniform3uiv(GLint a0, GLsizei a1, const GLuint * a2) {
-  uint32_t *s = gl_stream_begin(615, 5);
+  uint32_t *s = gl_stream_begin(643, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform4dv(GLint a0, GLsizei a1, const GLdouble * a2) {
-  uint32_t *s = gl_stream_begin(616, 5);
+  uint32_t *s = gl_stream_begin(644, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform4f(GLint a0, GLfloat a1, GLfloat a2, GLfloat a3, GLfloat a4) {
-  uint32_t *s = gl_stream_begin(617, 6);
+  uint32_t *s = gl_stream_begin(645, 6);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -4230,14 +4439,14 @@ GLAPI void APIENTRY glUniform4f(GLint a0, GLfloat a1, GLfloat a2, GLfloat a3, GL
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glUniform4fv(GLint a0, GLsizei a1, const GLfloat * a2) {
-  uint32_t *s = gl_stream_begin(618, 5);
+  uint32_t *s = gl_stream_begin(646, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform4i(GLint a0, GLint a1, GLint a2, GLint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(619, 6);
+  uint32_t *s = gl_stream_begin(647, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4246,14 +4455,14 @@ GLAPI void APIENTRY glUniform4i(GLint a0, GLint a1, GLint a2, GLint a3, GLint a4
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glUniform4iv(GLint a0, GLsizei a1, const GLint * a2) {
-  uint32_t *s = gl_stream_begin(620, 5);
+  uint32_t *s = gl_stream_begin(648, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniform4ui(GLint a0, GLuint a1, GLuint a2, GLuint a3, GLuint a4) {
-  uint32_t *s = gl_stream_begin(621, 6);
+  uint32_t *s = gl_stream_begin(649, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4262,21 +4471,21 @@ GLAPI void APIENTRY glUniform4ui(GLint a0, GLuint a1, GLuint a2, GLuint a3, GLui
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glUniform4uiv(GLint a0, GLsizei a1, const GLuint * a2) {
-  uint32_t *s = gl_stream_begin(622, 5);
+  uint32_t *s = gl_stream_begin(650, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_u64(s + 3, (uint64_t)(uintptr_t)a2);
   gl_stream_sync(5);
 }
 GLAPI void APIENTRY glUniformBlockBinding(GLuint a0, GLuint a1, GLuint a2) {
-  uint32_t *s = gl_stream_begin(623, 4);
+  uint32_t *s = gl_stream_begin(651, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glUniformMatrix2dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(624, 6);
+  uint32_t *s = gl_stream_begin(652, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4284,7 +4493,7 @@ GLAPI void APIENTRY glUniformMatrix2dv(GLint a0, GLsizei a1, GLboolean a2, const
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix2fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(625, 6);
+  uint32_t *s = gl_stream_begin(653, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4292,7 +4501,7 @@ GLAPI void APIENTRY glUniformMatrix2fv(GLint a0, GLsizei a1, GLboolean a2, const
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix2x3dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(626, 6);
+  uint32_t *s = gl_stream_begin(654, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4300,7 +4509,7 @@ GLAPI void APIENTRY glUniformMatrix2x3dv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix2x3fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(627, 6);
+  uint32_t *s = gl_stream_begin(655, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4308,7 +4517,7 @@ GLAPI void APIENTRY glUniformMatrix2x3fv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix2x4dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(628, 6);
+  uint32_t *s = gl_stream_begin(656, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4316,7 +4525,7 @@ GLAPI void APIENTRY glUniformMatrix2x4dv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix2x4fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(629, 6);
+  uint32_t *s = gl_stream_begin(657, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4324,7 +4533,7 @@ GLAPI void APIENTRY glUniformMatrix2x4fv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix3dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(630, 6);
+  uint32_t *s = gl_stream_begin(658, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4332,7 +4541,7 @@ GLAPI void APIENTRY glUniformMatrix3dv(GLint a0, GLsizei a1, GLboolean a2, const
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix3fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(631, 6);
+  uint32_t *s = gl_stream_begin(659, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4340,7 +4549,7 @@ GLAPI void APIENTRY glUniformMatrix3fv(GLint a0, GLsizei a1, GLboolean a2, const
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix3x2dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(632, 6);
+  uint32_t *s = gl_stream_begin(660, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4348,7 +4557,7 @@ GLAPI void APIENTRY glUniformMatrix3x2dv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix3x2fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(633, 6);
+  uint32_t *s = gl_stream_begin(661, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4356,7 +4565,7 @@ GLAPI void APIENTRY glUniformMatrix3x2fv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix3x4dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(634, 6);
+  uint32_t *s = gl_stream_begin(662, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4364,7 +4573,7 @@ GLAPI void APIENTRY glUniformMatrix3x4dv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix3x4fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(635, 6);
+  uint32_t *s = gl_stream_begin(663, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4372,7 +4581,7 @@ GLAPI void APIENTRY glUniformMatrix3x4fv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix4dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(636, 6);
+  uint32_t *s = gl_stream_begin(664, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4380,7 +4589,7 @@ GLAPI void APIENTRY glUniformMatrix4dv(GLint a0, GLsizei a1, GLboolean a2, const
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix4fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(637, 6);
+  uint32_t *s = gl_stream_begin(665, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4388,7 +4597,7 @@ GLAPI void APIENTRY glUniformMatrix4fv(GLint a0, GLsizei a1, GLboolean a2, const
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix4x2dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(638, 6);
+  uint32_t *s = gl_stream_begin(666, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4396,7 +4605,7 @@ GLAPI void APIENTRY glUniformMatrix4x2dv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix4x2fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(639, 6);
+  uint32_t *s = gl_stream_begin(667, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4404,7 +4613,7 @@ GLAPI void APIENTRY glUniformMatrix4x2fv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix4x3dv(GLint a0, GLsizei a1, GLboolean a2, const GLdouble * a3) {
-  uint32_t *s = gl_stream_begin(640, 6);
+  uint32_t *s = gl_stream_begin(668, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4412,7 +4621,7 @@ GLAPI void APIENTRY glUniformMatrix4x3dv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI void APIENTRY glUniformMatrix4x3fv(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) {
-  uint32_t *s = gl_stream_begin(641, 6);
+  uint32_t *s = gl_stream_begin(669, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4420,121 +4629,121 @@ GLAPI void APIENTRY glUniformMatrix4x3fv(GLint a0, GLsizei a1, GLboolean a2, con
   gl_stream_sync(6);
 }
 GLAPI GLboolean APIENTRY glUnmapBuffer(GLenum a0) {
-  uint32_t *s = gl_stream_begin(642, 2);
+  uint32_t *s = gl_stream_begin(670, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI GLboolean APIENTRY glUnmapNamedBuffer(GLuint a0) {
-  uint32_t *s = gl_stream_begin(643, 2);
+  uint32_t *s = gl_stream_begin(671, 2);
   s[1] = (uint32_t)a0;
   const uint64_t r = gl_stream_sync(2);
   return (GLboolean)r;
 }
 GLAPI void APIENTRY glUseProgram(GLuint a0) {
-  uint32_t *s = gl_stream_begin(644, 2);
+  uint32_t *s = gl_stream_begin(672, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glValidateProgram(GLuint a0) {
-  uint32_t *s = gl_stream_begin(645, 2);
+  uint32_t *s = gl_stream_begin(673, 2);
   s[1] = (uint32_t)a0;
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glVertex2d(GLdouble a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(646, 5);
+  uint32_t *s = gl_stream_begin(674, 5);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertex2dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(647, 5);
+  uint32_t *s = gl_stream_begin(675, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertex2f(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(648, 3);
+  uint32_t *s = gl_stream_begin(676, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertex2fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(649, 3);
+  uint32_t *s = gl_stream_begin(677, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertex2i(GLint a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(650, 3);
+  uint32_t *s = gl_stream_begin(678, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertex2iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(651, 3);
+  uint32_t *s = gl_stream_begin(679, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertex2s(GLshort a0, GLshort a1) {
-  uint32_t *s = gl_stream_begin(652, 3);
+  uint32_t *s = gl_stream_begin(680, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertex2sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(653, 2);
+  uint32_t *s = gl_stream_begin(681, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glVertex3d(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(654, 7);
+  uint32_t *s = gl_stream_begin(682, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glVertex3dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(655, 7);
+  uint32_t *s = gl_stream_begin(683, 7);
   gl_stream_copy(s + 1, a0, 24);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glVertex3f(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(656, 4);
+  uint32_t *s = gl_stream_begin(684, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertex3fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(657, 4);
+  uint32_t *s = gl_stream_begin(685, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertex3i(GLint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(658, 4);
+  uint32_t *s = gl_stream_begin(686, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertex3iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(659, 4);
+  uint32_t *s = gl_stream_begin(687, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertex3s(GLshort a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(660, 4);
+  uint32_t *s = gl_stream_begin(688, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertex3sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(661, 3);
+  uint32_t *s = gl_stream_begin(689, 3);
   gl_stream_copy(s + 1, a0, 6);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertex4d(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(662, 9);
+  uint32_t *s = gl_stream_begin(690, 9);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
@@ -4542,12 +4751,12 @@ GLAPI void APIENTRY glVertex4d(GLdouble a0, GLdouble a1, GLdouble a2, GLdouble a
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glVertex4dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(663, 9);
+  uint32_t *s = gl_stream_begin(691, 9);
   gl_stream_copy(s + 1, a0, 32);
   gl_stream_end(9);
 }
 GLAPI void APIENTRY glVertex4f(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(664, 5);
+  uint32_t *s = gl_stream_begin(692, 5);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -4555,12 +4764,12 @@ GLAPI void APIENTRY glVertex4f(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertex4fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(665, 5);
+  uint32_t *s = gl_stream_begin(693, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertex4i(GLint a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(666, 5);
+  uint32_t *s = gl_stream_begin(694, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4568,12 +4777,12 @@ GLAPI void APIENTRY glVertex4i(GLint a0, GLint a1, GLint a2, GLint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertex4iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(667, 5);
+  uint32_t *s = gl_stream_begin(695, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertex4s(GLshort a0, GLshort a1, GLshort a2, GLshort a3) {
-  uint32_t *s = gl_stream_begin(668, 5);
+  uint32_t *s = gl_stream_begin(696, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4581,87 +4790,87 @@ GLAPI void APIENTRY glVertex4s(GLshort a0, GLshort a1, GLshort a2, GLshort a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertex4sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(669, 3);
+  uint32_t *s = gl_stream_begin(697, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib1d(GLuint a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(670, 4);
+  uint32_t *s = gl_stream_begin(698, 4);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib1dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(671, 4);
+  uint32_t *s = gl_stream_begin(699, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib1f(GLuint a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(672, 3);
+  uint32_t *s = gl_stream_begin(700, 3);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib1fv(GLuint a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(673, 3);
+  uint32_t *s = gl_stream_begin(701, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib1s(GLuint a0, GLshort a1) {
-  uint32_t *s = gl_stream_begin(674, 3);
+  uint32_t *s = gl_stream_begin(702, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib1sv(GLuint a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(675, 3);
+  uint32_t *s = gl_stream_begin(703, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 2);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib2d(GLuint a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(676, 6);
+  uint32_t *s = gl_stream_begin(704, 6);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib2dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(677, 6);
+  uint32_t *s = gl_stream_begin(705, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib2f(GLuint a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(678, 4);
+  uint32_t *s = gl_stream_begin(706, 4);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib2fv(GLuint a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(679, 4);
+  uint32_t *s = gl_stream_begin(707, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib2s(GLuint a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(680, 4);
+  uint32_t *s = gl_stream_begin(708, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib2sv(GLuint a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(681, 3);
+  uint32_t *s = gl_stream_begin(709, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib3d(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(682, 8);
+  uint32_t *s = gl_stream_begin(710, 8);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -4669,13 +4878,13 @@ GLAPI void APIENTRY glVertexAttrib3d(GLuint a0, GLdouble a1, GLdouble a2, GLdoub
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glVertexAttrib3dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(683, 8);
+  uint32_t *s = gl_stream_begin(711, 8);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 24);
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glVertexAttrib3f(GLuint a0, GLfloat a1, GLfloat a2, GLfloat a3) {
-  uint32_t *s = gl_stream_begin(684, 5);
+  uint32_t *s = gl_stream_begin(712, 5);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -4683,13 +4892,13 @@ GLAPI void APIENTRY glVertexAttrib3f(GLuint a0, GLfloat a1, GLfloat a2, GLfloat 
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertexAttrib3fv(GLuint a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(685, 5);
+  uint32_t *s = gl_stream_begin(713, 5);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 12);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertexAttrib3s(GLuint a0, GLshort a1, GLshort a2, GLshort a3) {
-  uint32_t *s = gl_stream_begin(686, 5);
+  uint32_t *s = gl_stream_begin(714, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4697,31 +4906,31 @@ GLAPI void APIENTRY glVertexAttrib3s(GLuint a0, GLshort a1, GLshort a2, GLshort 
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertexAttrib3sv(GLuint a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(687, 4);
+  uint32_t *s = gl_stream_begin(715, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 6);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib4Nbv(GLuint a0, const GLbyte * a1) {
-  uint32_t *s = gl_stream_begin(688, 3);
+  uint32_t *s = gl_stream_begin(716, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib4Niv(GLuint a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(689, 6);
+  uint32_t *s = gl_stream_begin(717, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4Nsv(GLuint a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(690, 4);
+  uint32_t *s = gl_stream_begin(718, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib4Nub(GLuint a0, GLubyte a1, GLubyte a2, GLubyte a3, GLubyte a4) {
-  uint32_t *s = gl_stream_begin(691, 6);
+  uint32_t *s = gl_stream_begin(719, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4730,31 +4939,31 @@ GLAPI void APIENTRY glVertexAttrib4Nub(GLuint a0, GLubyte a1, GLubyte a2, GLubyt
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4Nubv(GLuint a0, const GLubyte * a1) {
-  uint32_t *s = gl_stream_begin(692, 3);
+  uint32_t *s = gl_stream_begin(720, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib4Nuiv(GLuint a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(693, 6);
+  uint32_t *s = gl_stream_begin(721, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4Nusv(GLuint a0, const GLushort * a1) {
-  uint32_t *s = gl_stream_begin(694, 4);
+  uint32_t *s = gl_stream_begin(722, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib4bv(GLuint a0, const GLbyte * a1) {
-  uint32_t *s = gl_stream_begin(695, 3);
+  uint32_t *s = gl_stream_begin(723, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib4d(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4) {
-  uint32_t *s = gl_stream_begin(696, 10);
+  uint32_t *s = gl_stream_begin(724, 10);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -4763,13 +4972,13 @@ GLAPI void APIENTRY glVertexAttrib4d(GLuint a0, GLdouble a1, GLdouble a2, GLdoub
   gl_stream_end(10);
 }
 GLAPI void APIENTRY glVertexAttrib4dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(697, 10);
+  uint32_t *s = gl_stream_begin(725, 10);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 32);
   gl_stream_end(10);
 }
 GLAPI void APIENTRY glVertexAttrib4f(GLuint a0, GLfloat a1, GLfloat a2, GLfloat a3, GLfloat a4) {
-  uint32_t *s = gl_stream_begin(698, 6);
+  uint32_t *s = gl_stream_begin(726, 6);
   s[1] = (uint32_t)a0;
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
@@ -4778,19 +4987,19 @@ GLAPI void APIENTRY glVertexAttrib4f(GLuint a0, GLfloat a1, GLfloat a2, GLfloat 
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4fv(GLuint a0, const GLfloat * a1) {
-  uint32_t *s = gl_stream_begin(699, 6);
+  uint32_t *s = gl_stream_begin(727, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4iv(GLuint a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(700, 6);
+  uint32_t *s = gl_stream_begin(728, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4s(GLuint a0, GLshort a1, GLshort a2, GLshort a3, GLshort a4) {
-  uint32_t *s = gl_stream_begin(701, 6);
+  uint32_t *s = gl_stream_begin(729, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4799,87 +5008,87 @@ GLAPI void APIENTRY glVertexAttrib4s(GLuint a0, GLshort a1, GLshort a2, GLshort 
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4sv(GLuint a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(702, 4);
+  uint32_t *s = gl_stream_begin(730, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttrib4ubv(GLuint a0, const GLubyte * a1) {
-  uint32_t *s = gl_stream_begin(703, 3);
+  uint32_t *s = gl_stream_begin(731, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttrib4uiv(GLuint a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(704, 6);
+  uint32_t *s = gl_stream_begin(732, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttrib4usv(GLuint a0, const GLushort * a1) {
-  uint32_t *s = gl_stream_begin(705, 4);
+  uint32_t *s = gl_stream_begin(733, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribDivisor(GLuint a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(706, 3);
+  uint32_t *s = gl_stream_begin(734, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttribI1i(GLuint a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(707, 3);
+  uint32_t *s = gl_stream_begin(735, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttribI1iv(GLuint a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(708, 3);
+  uint32_t *s = gl_stream_begin(736, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttribI1ui(GLuint a0, GLuint a1) {
-  uint32_t *s = gl_stream_begin(709, 3);
+  uint32_t *s = gl_stream_begin(737, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttribI1uiv(GLuint a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(710, 3);
+  uint32_t *s = gl_stream_begin(738, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttribI2i(GLuint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(711, 4);
+  uint32_t *s = gl_stream_begin(739, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribI2iv(GLuint a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(712, 4);
+  uint32_t *s = gl_stream_begin(740, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribI2ui(GLuint a0, GLuint a1, GLuint a2) {
-  uint32_t *s = gl_stream_begin(713, 4);
+  uint32_t *s = gl_stream_begin(741, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribI2uiv(GLuint a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(714, 4);
+  uint32_t *s = gl_stream_begin(742, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribI3i(GLuint a0, GLint a1, GLint a2, GLint a3) {
-  uint32_t *s = gl_stream_begin(715, 5);
+  uint32_t *s = gl_stream_begin(743, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4887,13 +5096,13 @@ GLAPI void APIENTRY glVertexAttribI3i(GLuint a0, GLint a1, GLint a2, GLint a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertexAttribI3iv(GLuint a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(716, 5);
+  uint32_t *s = gl_stream_begin(744, 5);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 12);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertexAttribI3ui(GLuint a0, GLuint a1, GLuint a2, GLuint a3) {
-  uint32_t *s = gl_stream_begin(717, 5);
+  uint32_t *s = gl_stream_begin(745, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4901,19 +5110,19 @@ GLAPI void APIENTRY glVertexAttribI3ui(GLuint a0, GLuint a1, GLuint a2, GLuint a
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertexAttribI3uiv(GLuint a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(718, 5);
+  uint32_t *s = gl_stream_begin(746, 5);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 12);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glVertexAttribI4bv(GLuint a0, const GLbyte * a1) {
-  uint32_t *s = gl_stream_begin(719, 3);
+  uint32_t *s = gl_stream_begin(747, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttribI4i(GLuint a0, GLint a1, GLint a2, GLint a3, GLint a4) {
-  uint32_t *s = gl_stream_begin(720, 6);
+  uint32_t *s = gl_stream_begin(748, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4922,25 +5131,25 @@ GLAPI void APIENTRY glVertexAttribI4i(GLuint a0, GLint a1, GLint a2, GLint a3, G
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttribI4iv(GLuint a0, const GLint * a1) {
-  uint32_t *s = gl_stream_begin(721, 6);
+  uint32_t *s = gl_stream_begin(749, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttribI4sv(GLuint a0, const GLshort * a1) {
-  uint32_t *s = gl_stream_begin(722, 4);
+  uint32_t *s = gl_stream_begin(750, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribI4ubv(GLuint a0, const GLubyte * a1) {
-  uint32_t *s = gl_stream_begin(723, 3);
+  uint32_t *s = gl_stream_begin(751, 3);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 4);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glVertexAttribI4ui(GLuint a0, GLuint a1, GLuint a2, GLuint a3, GLuint a4) {
-  uint32_t *s = gl_stream_begin(724, 6);
+  uint32_t *s = gl_stream_begin(752, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4949,19 +5158,19 @@ GLAPI void APIENTRY glVertexAttribI4ui(GLuint a0, GLuint a1, GLuint a2, GLuint a
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttribI4uiv(GLuint a0, const GLuint * a1) {
-  uint32_t *s = gl_stream_begin(725, 6);
+  uint32_t *s = gl_stream_begin(753, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttribI4usv(GLuint a0, const GLushort * a1) {
-  uint32_t *s = gl_stream_begin(726, 4);
+  uint32_t *s = gl_stream_begin(754, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribIPointer(GLuint a0, GLint a1, GLenum a2, GLsizei a3, const void * a4) {
-  uint32_t *s = gl_stream_begin(727, 7);
+  uint32_t *s = gl_stream_begin(755, 7);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -4970,32 +5179,32 @@ GLAPI void APIENTRY glVertexAttribIPointer(GLuint a0, GLint a1, GLenum a2, GLsiz
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glVertexAttribL1d(GLuint a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(728, 4);
+  uint32_t *s = gl_stream_begin(756, 4);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribL1dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(729, 4);
+  uint32_t *s = gl_stream_begin(757, 4);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 8);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glVertexAttribL2d(GLuint a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(730, 6);
+  uint32_t *s = gl_stream_begin(758, 6);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttribL2dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(731, 6);
+  uint32_t *s = gl_stream_begin(759, 6);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 16);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glVertexAttribL3d(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3) {
-  uint32_t *s = gl_stream_begin(732, 8);
+  uint32_t *s = gl_stream_begin(760, 8);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -5003,13 +5212,13 @@ GLAPI void APIENTRY glVertexAttribL3d(GLuint a0, GLdouble a1, GLdouble a2, GLdou
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glVertexAttribL3dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(733, 8);
+  uint32_t *s = gl_stream_begin(761, 8);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 24);
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glVertexAttribL4d(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4) {
-  uint32_t *s = gl_stream_begin(734, 10);
+  uint32_t *s = gl_stream_begin(762, 10);
   s[1] = (uint32_t)a0;
   gl_stream_f64(s + 2, a1);
   gl_stream_f64(s + 4, a2);
@@ -5018,13 +5227,13 @@ GLAPI void APIENTRY glVertexAttribL4d(GLuint a0, GLdouble a1, GLdouble a2, GLdou
   gl_stream_end(10);
 }
 GLAPI void APIENTRY glVertexAttribL4dv(GLuint a0, const GLdouble * a1) {
-  uint32_t *s = gl_stream_begin(735, 10);
+  uint32_t *s = gl_stream_begin(763, 10);
   s[1] = (uint32_t)a0;
   gl_stream_copy(s + 2, a1, 32);
   gl_stream_end(10);
 }
 GLAPI void APIENTRY glVertexAttribPointer(GLuint a0, GLint a1, GLenum a2, GLboolean a3, GLsizei a4, const void * a5) {
-  uint32_t *s = gl_stream_begin(736, 8);
+  uint32_t *s = gl_stream_begin(764, 8);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -5034,15 +5243,24 @@ GLAPI void APIENTRY glVertexAttribPointer(GLuint a0, GLint a1, GLenum a2, GLbool
   gl_stream_end(8);
 }
 GLAPI void APIENTRY glVertexPointer(GLint a0, GLenum a1, GLsizei a2, const void * a3) {
-  uint32_t *s = gl_stream_begin(737, 6);
+  uint32_t *s = gl_stream_begin(765, 6);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_u64(s + 4, (uint64_t)(uintptr_t)a3);
   gl_stream_end(6);
 }
+GLAPI void APIENTRY glVertexPointerEXT(GLint a0, GLenum a1, GLsizei a2, GLsizei a3, const void * a4) {
+  uint32_t *s = gl_stream_begin(766, 7);
+  s[1] = (uint32_t)a0;
+  s[2] = (uint32_t)a1;
+  s[3] = (uint32_t)a2;
+  s[4] = (uint32_t)a3;
+  gl_stream_u64(s + 5, (uint64_t)(uintptr_t)a4);
+  gl_stream_end(7);
+}
 GLAPI void APIENTRY glViewport(GLint a0, GLint a1, GLsizei a2, GLsizei a3) {
-  uint32_t *s = gl_stream_begin(738, 5);
+  uint32_t *s = gl_stream_begin(767, 5);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
@@ -5050,123 +5268,126 @@ GLAPI void APIENTRY glViewport(GLint a0, GLint a1, GLsizei a2, GLsizei a3) {
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glWaitSync(GLsync a0, GLbitfield a1, GLuint64 a2) {
-  uint32_t *s = gl_stream_begin(739, 6);
+  uint32_t *s = gl_stream_begin(768, 6);
   gl_stream_u64(s + 1, (uint64_t)(uintptr_t)a0);
   s[3] = (uint32_t)a1;
   gl_stream_u64(s + 4, (uint64_t)a2);
   gl_stream_end(6);
 }
 GLAPI void APIENTRY glWindowPos2d(GLdouble a0, GLdouble a1) {
-  uint32_t *s = gl_stream_begin(740, 5);
+  uint32_t *s = gl_stream_begin(769, 5);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glWindowPos2dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(741, 5);
+  uint32_t *s = gl_stream_begin(770, 5);
   gl_stream_copy(s + 1, a0, 16);
   gl_stream_end(5);
 }
 GLAPI void APIENTRY glWindowPos2f(GLfloat a0, GLfloat a1) {
-  uint32_t *s = gl_stream_begin(742, 3);
+  uint32_t *s = gl_stream_begin(771, 3);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glWindowPos2fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(743, 3);
+  uint32_t *s = gl_stream_begin(772, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glWindowPos2i(GLint a0, GLint a1) {
-  uint32_t *s = gl_stream_begin(744, 3);
+  uint32_t *s = gl_stream_begin(773, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glWindowPos2iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(745, 3);
+  uint32_t *s = gl_stream_begin(774, 3);
   gl_stream_copy(s + 1, a0, 8);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glWindowPos2s(GLshort a0, GLshort a1) {
-  uint32_t *s = gl_stream_begin(746, 3);
+  uint32_t *s = gl_stream_begin(775, 3);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glWindowPos2sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(747, 2);
+  uint32_t *s = gl_stream_begin(776, 2);
   gl_stream_copy(s + 1, a0, 4);
   gl_stream_end(2);
 }
 GLAPI void APIENTRY glWindowPos3d(GLdouble a0, GLdouble a1, GLdouble a2) {
-  uint32_t *s = gl_stream_begin(748, 7);
+  uint32_t *s = gl_stream_begin(777, 7);
   gl_stream_f64(s + 1, a0);
   gl_stream_f64(s + 3, a1);
   gl_stream_f64(s + 5, a2);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glWindowPos3dv(const GLdouble * a0) {
-  uint32_t *s = gl_stream_begin(749, 7);
+  uint32_t *s = gl_stream_begin(778, 7);
   gl_stream_copy(s + 1, a0, 24);
   gl_stream_end(7);
 }
 GLAPI void APIENTRY glWindowPos3f(GLfloat a0, GLfloat a1, GLfloat a2) {
-  uint32_t *s = gl_stream_begin(750, 4);
+  uint32_t *s = gl_stream_begin(779, 4);
   s[1] = gl_stream_f32(a0);
   s[2] = gl_stream_f32(a1);
   s[3] = gl_stream_f32(a2);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glWindowPos3fv(const GLfloat * a0) {
-  uint32_t *s = gl_stream_begin(751, 4);
+  uint32_t *s = gl_stream_begin(780, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glWindowPos3i(GLint a0, GLint a1, GLint a2) {
-  uint32_t *s = gl_stream_begin(752, 4);
+  uint32_t *s = gl_stream_begin(781, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glWindowPos3iv(const GLint * a0) {
-  uint32_t *s = gl_stream_begin(753, 4);
+  uint32_t *s = gl_stream_begin(782, 4);
   gl_stream_copy(s + 1, a0, 12);
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glWindowPos3s(GLshort a0, GLshort a1, GLshort a2) {
-  uint32_t *s = gl_stream_begin(754, 4);
+  uint32_t *s = gl_stream_begin(783, 4);
   s[1] = (uint32_t)a0;
   s[2] = (uint32_t)a1;
   s[3] = (uint32_t)a2;
   gl_stream_end(4);
 }
 GLAPI void APIENTRY glWindowPos3sv(const GLshort * a0) {
-  uint32_t *s = gl_stream_begin(755, 3);
+  uint32_t *s = gl_stream_begin(784, 3);
   gl_stream_copy(s + 1, a0, 6);
   gl_stream_end(3);
 }
 GLAPI void APIENTRY glActiveTextureARB(GLenum a0) { glActiveTexture((GLenum)a0); }
+GLAPI GLboolean APIENTRY glAreTexturesResidentEXT(GLsizei a0, const GLuint * a1, GLboolean * a2) { return (GLboolean)glAreTexturesResident((GLsizei)a0, (const GLuint *)a1, (GLboolean *)a2); }
 GLAPI void APIENTRY glArrayElementEXT(GLint a0) { glArrayElement((GLint)a0); }
 GLAPI void APIENTRY glAttachObjectARB(GLhandleARB a0, GLhandleARB a1) { glAttachShader((GLuint)a0, (GLuint)a1); }
 GLAPI void APIENTRY glBeginQueryARB(GLenum a0, GLuint a1) { glBeginQuery((GLenum)a0, (GLuint)a1); }
-GLAPI void APIENTRY glBeginTransformFeedbackEXT(GLenum a0) { glBeginTransformFeedback((GLenum)a0); }
-GLAPI void APIENTRY glBeginTransformFeedbackNV(GLenum a0) { glBeginTransformFeedback((GLenum)a0); }
+GLAPI void APIENTRY glBeginQueryEXT(GLenum a0, GLuint a1) { glBeginQuery((GLenum)a0, (GLuint)a1); }
 GLAPI void APIENTRY glBindAttribLocationARB(GLhandleARB a0, GLuint a1, const GLcharARB * a2) { glBindAttribLocation((GLuint)a0, (GLuint)a1, (const GLchar *)a2); }
 GLAPI void APIENTRY glBindBufferARB(GLenum a0, GLuint a1) { glBindBuffer((GLenum)a0, (GLuint)a1); }
-GLAPI void APIENTRY glBindBufferBaseEXT(GLenum a0, GLuint a1, GLuint a2) { glBindBufferBase((GLenum)a0, (GLuint)a1, (GLuint)a2); }
-GLAPI void APIENTRY glBindBufferBaseNV(GLenum a0, GLuint a1, GLuint a2) { glBindBufferBase((GLenum)a0, (GLuint)a1, (GLuint)a2); }
-GLAPI void APIENTRY glBindBufferRangeEXT(GLenum a0, GLuint a1, GLuint a2, GLintptr a3, GLsizeiptr a4) { glBindBufferRange((GLenum)a0, (GLuint)a1, (GLuint)a2, (GLintptr)a3, (GLsizeiptr)a4); }
-GLAPI void APIENTRY glBindBufferRangeNV(GLenum a0, GLuint a1, GLuint a2, GLintptr a3, GLsizeiptr a4) { glBindBufferRange((GLenum)a0, (GLuint)a1, (GLuint)a2, (GLintptr)a3, (GLsizeiptr)a4); }
+GLAPI void APIENTRY glBindFramebufferEXT(GLenum a0, GLuint a1) { glBindFramebuffer((GLenum)a0, (GLuint)a1); }
+GLAPI void APIENTRY glBindFramebufferOES(GLenum a0, GLuint a1) { glBindFramebuffer((GLenum)a0, (GLuint)a1); }
+GLAPI void APIENTRY glBindRenderbufferEXT(GLenum a0, GLuint a1) { glBindRenderbuffer((GLenum)a0, (GLuint)a1); }
+GLAPI void APIENTRY glBindRenderbufferOES(GLenum a0, GLuint a1) { glBindRenderbuffer((GLenum)a0, (GLuint)a1); }
 GLAPI void APIENTRY glBindTextureEXT(GLenum a0, GLuint a1) { glBindTexture((GLenum)a0, (GLuint)a1); }
+GLAPI void APIENTRY glBindVertexArrayAPPLE(GLuint a0) { glBindVertexArray((GLuint)a0); }
 GLAPI void APIENTRY glBindVertexArrayOES(GLuint a0) { glBindVertexArray((GLuint)a0); }
 GLAPI void APIENTRY glBlendColorEXT(GLfloat a0, GLfloat a1, GLfloat a2, GLfloat a3) { glBlendColor((GLfloat)a0, (GLfloat)a1, (GLfloat)a2, (GLfloat)a3); }
 GLAPI void APIENTRY glBlendEquationEXT(GLenum a0) { glBlendEquation((GLenum)a0); }
 GLAPI void APIENTRY glBlendEquationIndexedAMD(GLuint a0, GLenum a1) { glBlendEquationi((GLuint)a0, (GLenum)a1); }
+GLAPI void APIENTRY glBlendEquationOES(GLenum a0) { glBlendEquation((GLenum)a0); }
 GLAPI void APIENTRY glBlendEquationSeparateEXT(GLenum a0, GLenum a1) { glBlendEquationSeparate((GLenum)a0, (GLenum)a1); }
 GLAPI void APIENTRY glBlendEquationSeparateIndexedAMD(GLuint a0, GLenum a1, GLenum a2) { glBlendEquationSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2); }
+GLAPI void APIENTRY glBlendEquationSeparateOES(GLenum a0, GLenum a1) { glBlendEquationSeparate((GLenum)a0, (GLenum)a1); }
 GLAPI void APIENTRY glBlendEquationSeparateiARB(GLuint a0, GLenum a1, GLenum a2) { glBlendEquationSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2); }
 GLAPI void APIENTRY glBlendEquationSeparateiEXT(GLuint a0, GLenum a1, GLenum a2) { glBlendEquationSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2); }
 GLAPI void APIENTRY glBlendEquationSeparateiOES(GLuint a0, GLenum a1, GLenum a2) { glBlendEquationSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2); }
@@ -5177,6 +5398,7 @@ GLAPI void APIENTRY glBlendFuncIndexedAMD(GLuint a0, GLenum a1, GLenum a2) { glB
 GLAPI void APIENTRY glBlendFuncSeparateEXT(GLenum a0, GLenum a1, GLenum a2, GLenum a3) { glBlendFuncSeparate((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3); }
 GLAPI void APIENTRY glBlendFuncSeparateINGR(GLenum a0, GLenum a1, GLenum a2, GLenum a3) { glBlendFuncSeparate((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3); }
 GLAPI void APIENTRY glBlendFuncSeparateIndexedAMD(GLuint a0, GLenum a1, GLenum a2, GLenum a3, GLenum a4) { glBlendFuncSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3, (GLenum)a4); }
+GLAPI void APIENTRY glBlendFuncSeparateOES(GLenum a0, GLenum a1, GLenum a2, GLenum a3) { glBlendFuncSeparate((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3); }
 GLAPI void APIENTRY glBlendFuncSeparateiARB(GLuint a0, GLenum a1, GLenum a2, GLenum a3, GLenum a4) { glBlendFuncSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3, (GLenum)a4); }
 GLAPI void APIENTRY glBlendFuncSeparateiEXT(GLuint a0, GLenum a1, GLenum a2, GLenum a3, GLenum a4) { glBlendFuncSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3, (GLenum)a4); }
 GLAPI void APIENTRY glBlendFuncSeparateiOES(GLuint a0, GLenum a1, GLenum a2, GLenum a3, GLenum a4) { glBlendFuncSeparatei((GLuint)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3, (GLenum)a4); }
@@ -5189,34 +5411,42 @@ GLAPI void APIENTRY glBufferDataARB(GLenum a0, GLsizeiptrARB a1, const void * a2
 GLAPI void APIENTRY glBufferStorageEXT(GLenum a0, GLsizeiptr a1, const void * a2, GLbitfield a3) { glBufferStorage((GLenum)a0, (GLsizeiptr)a1, (const void *)a2, (GLbitfield)a3); }
 GLAPI void APIENTRY glBufferSubDataARB(GLenum a0, GLintptrARB a1, GLsizeiptrARB a2, const void * a3) { glBufferSubData((GLenum)a0, (GLintptr)a1, (GLsizeiptr)a2, (const void *)a3); }
 GLAPI GLenum APIENTRY glCheckFramebufferStatusEXT(GLenum a0) { return (GLenum)glCheckFramebufferStatus((GLenum)a0); }
+GLAPI GLenum APIENTRY glCheckFramebufferStatusOES(GLenum a0) { return (GLenum)glCheckFramebufferStatus((GLenum)a0); }
 GLAPI void APIENTRY glClampColorARB(GLenum a0, GLenum a1) { glClampColor((GLenum)a0, (GLenum)a1); }
-GLAPI void APIENTRY glClearDepthfOES(GLclampf a0) { glClearDepthf((GLfloat)a0); }
 GLAPI void APIENTRY glClientActiveTextureARB(GLenum a0) { glClientActiveTexture((GLenum)a0); }
 GLAPI GLenum APIENTRY glClientWaitSyncAPPLE(GLsync a0, GLbitfield a1, GLuint64 a2) { return (GLenum)glClientWaitSync((GLsync)a0, (GLbitfield)a1, (GLuint64)a2); }
 GLAPI void APIENTRY glColorMaskIndexedEXT(GLuint a0, GLboolean a1, GLboolean a2, GLboolean a3, GLboolean a4) { glColorMaski((GLuint)a0, (GLboolean)a1, (GLboolean)a2, (GLboolean)a3, (GLboolean)a4); }
 GLAPI void APIENTRY glColorMaskiEXT(GLuint a0, GLboolean a1, GLboolean a2, GLboolean a3, GLboolean a4) { glColorMaski((GLuint)a0, (GLboolean)a1, (GLboolean)a2, (GLboolean)a3, (GLboolean)a4); }
 GLAPI void APIENTRY glColorMaskiOES(GLuint a0, GLboolean a1, GLboolean a2, GLboolean a3, GLboolean a4) { glColorMaski((GLuint)a0, (GLboolean)a1, (GLboolean)a2, (GLboolean)a3, (GLboolean)a4); }
 GLAPI void APIENTRY glCompileShaderARB(GLhandleARB a0) { glCompileShader((GLuint)a0); }
+GLAPI void APIENTRY glCompressedTexImage1DARB(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLint a4, GLsizei a5, const void * a6) { glCompressedTexImage1D((GLenum)a0, (GLint)a1, (GLenum)a2, (GLsizei)a3, (GLint)a4, (GLsizei)a5, (const void *)a6); }
 GLAPI void APIENTRY glCompressedTexImage2DARB(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLsizei a4, GLint a5, GLsizei a6, const void * a7) { glCompressedTexImage2D((GLenum)a0, (GLint)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4, (GLint)a5, (GLsizei)a6, (const void *)a7); }
 GLAPI void APIENTRY glCompressedTexImage3DARB(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLsizei a4, GLsizei a5, GLint a6, GLsizei a7, const void * a8) { glCompressedTexImage3D((GLenum)a0, (GLint)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4, (GLsizei)a5, (GLint)a6, (GLsizei)a7, (const void *)a8); }
+GLAPI void APIENTRY glCompressedTexImage3DOES(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLsizei a4, GLsizei a5, GLint a6, GLsizei a7, const void * a8) { glCompressedTexImage3D((GLenum)a0, (GLint)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4, (GLsizei)a5, (GLint)a6, (GLsizei)a7, (const void *)a8); }
+GLAPI void APIENTRY glCompressedTexSubImage1DARB(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLenum a4, GLsizei a5, const void * a6) { glCompressedTexSubImage1D((GLenum)a0, (GLint)a1, (GLint)a2, (GLsizei)a3, (GLenum)a4, (GLsizei)a5, (const void *)a6); }
 GLAPI void APIENTRY glCompressedTexSubImage2DARB(GLenum a0, GLint a1, GLint a2, GLint a3, GLsizei a4, GLsizei a5, GLenum a6, GLsizei a7, const void * a8) { glCompressedTexSubImage2D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLsizei)a4, (GLsizei)a5, (GLenum)a6, (GLsizei)a7, (const void *)a8); }
 GLAPI void APIENTRY glCompressedTexSubImage3DARB(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLsizei a7, GLenum a8, GLsizei a9, const void * a10) { glCompressedTexSubImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLsizei)a5, (GLsizei)a6, (GLsizei)a7, (GLenum)a8, (GLsizei)a9, (const void *)a10); }
+GLAPI void APIENTRY glCompressedTexSubImage3DOES(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLsizei a7, GLenum a8, GLsizei a9, const void * a10) { glCompressedTexSubImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLsizei)a5, (GLsizei)a6, (GLsizei)a7, (GLenum)a8, (GLsizei)a9, (const void *)a10); }
 GLAPI void APIENTRY glCopyBufferSubDataNV(GLenum a0, GLenum a1, GLintptr a2, GLintptr a3, GLsizeiptr a4) { glCopyBufferSubData((GLenum)a0, (GLenum)a1, (GLintptr)a2, (GLintptr)a3, (GLsizeiptr)a4); }
 GLAPI void APIENTRY glCopyTexImage1DEXT(GLenum a0, GLint a1, GLenum a2, GLint a3, GLint a4, GLsizei a5, GLint a6) { glCopyTexImage1D((GLenum)a0, (GLint)a1, (GLenum)a2, (GLint)a3, (GLint)a4, (GLsizei)a5, (GLint)a6); }
 GLAPI void APIENTRY glCopyTexImage2DEXT(GLenum a0, GLint a1, GLenum a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLint a7) { glCopyTexImage2D((GLenum)a0, (GLint)a1, (GLenum)a2, (GLint)a3, (GLint)a4, (GLsizei)a5, (GLsizei)a6, (GLint)a7); }
 GLAPI void APIENTRY glCopyTexSubImage1DEXT(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5) { glCopyTexSubImage1D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLsizei)a5); }
 GLAPI void APIENTRY glCopyTexSubImage2DEXT(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5, GLsizei a6, GLsizei a7) { glCopyTexSubImage2D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLint)a5, (GLsizei)a6, (GLsizei)a7); }
 GLAPI void APIENTRY glCopyTexSubImage3DEXT(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5, GLint a6, GLsizei a7, GLsizei a8) { glCopyTexSubImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLint)a5, (GLint)a6, (GLsizei)a7, (GLsizei)a8); }
+GLAPI void APIENTRY glCopyTexSubImage3DOES(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5, GLint a6, GLsizei a7, GLsizei a8) { glCopyTexSubImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLint)a5, (GLint)a6, (GLsizei)a7, (GLsizei)a8); }
 GLAPI GLhandleARB APIENTRY glCreateProgramObjectARB(void) { return (GLhandleARB)glCreateProgram(); }
 GLAPI GLhandleARB APIENTRY glCreateShaderObjectARB(GLenum a0) { return (GLhandleARB)glCreateShader((GLenum)a0); }
 GLAPI void APIENTRY glDeleteBuffersARB(GLsizei a0, const GLuint * a1) { glDeleteBuffers((GLsizei)a0, (const GLuint *)a1); }
 GLAPI void APIENTRY glDeleteFramebuffersEXT(GLsizei a0, const GLuint * a1) { glDeleteFramebuffers((GLsizei)a0, (const GLuint *)a1); }
+GLAPI void APIENTRY glDeleteFramebuffersOES(GLsizei a0, const GLuint * a1) { glDeleteFramebuffers((GLsizei)a0, (const GLuint *)a1); }
 GLAPI void APIENTRY glDeleteQueriesARB(GLsizei a0, const GLuint * a1) { glDeleteQueries((GLsizei)a0, (const GLuint *)a1); }
+GLAPI void APIENTRY glDeleteQueriesEXT(GLsizei a0, const GLuint * a1) { glDeleteQueries((GLsizei)a0, (const GLuint *)a1); }
 GLAPI void APIENTRY glDeleteRenderbuffersEXT(GLsizei a0, const GLuint * a1) { glDeleteRenderbuffers((GLsizei)a0, (const GLuint *)a1); }
+GLAPI void APIENTRY glDeleteRenderbuffersOES(GLsizei a0, const GLuint * a1) { glDeleteRenderbuffers((GLsizei)a0, (const GLuint *)a1); }
 GLAPI void APIENTRY glDeleteSyncAPPLE(GLsync a0) { glDeleteSync((GLsync)a0); }
+GLAPI void APIENTRY glDeleteTexturesEXT(GLsizei a0, const GLuint * a1) { glDeleteTextures((GLsizei)a0, (const GLuint *)a1); }
 GLAPI void APIENTRY glDeleteVertexArraysAPPLE(GLsizei a0, const GLuint * a1) { glDeleteVertexArrays((GLsizei)a0, (const GLuint *)a1); }
 GLAPI void APIENTRY glDeleteVertexArraysOES(GLsizei a0, const GLuint * a1) { glDeleteVertexArrays((GLsizei)a0, (const GLuint *)a1); }
-GLAPI void APIENTRY glDepthRangefOES(GLclampf a0, GLclampf a1) { glDepthRangef((GLfloat)a0, (GLfloat)a1); }
 GLAPI void APIENTRY glDetachObjectARB(GLhandleARB a0, GLhandleARB a1) { glDetachShader((GLuint)a0, (GLuint)a1); }
 GLAPI void APIENTRY glDisableIndexedEXT(GLenum a0, GLuint a1) { glDisablei((GLenum)a0, (GLuint)a1); }
 GLAPI void APIENTRY glDisableVertexAttribArrayARB(GLuint a0) { glDisableVertexAttribArray((GLuint)a0); }
@@ -5232,6 +5462,7 @@ GLAPI void APIENTRY glDrawArraysInstancedNV(GLenum a0, GLint a1, GLsizei a2, GLs
 GLAPI void APIENTRY glDrawBuffersARB(GLsizei a0, const GLenum * a1) { glDrawBuffers((GLsizei)a0, (const GLenum *)a1); }
 GLAPI void APIENTRY glDrawBuffersATI(GLsizei a0, const GLenum * a1) { glDrawBuffers((GLsizei)a0, (const GLenum *)a1); }
 GLAPI void APIENTRY glDrawBuffersEXT(GLsizei a0, const GLenum * a1) { glDrawBuffers((GLsizei)a0, (const GLenum *)a1); }
+GLAPI void APIENTRY glDrawBuffersNV(GLsizei a0, const GLenum * a1) { glDrawBuffers((GLsizei)a0, (const GLenum *)a1); }
 GLAPI void APIENTRY glDrawElementsBaseVertexEXT(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLint a4) { glDrawElementsBaseVertex((GLenum)a0, (GLsizei)a1, (GLenum)a2, (const void *)a3, (GLint)a4); }
 GLAPI void APIENTRY glDrawElementsBaseVertexOES(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLint a4) { glDrawElementsBaseVertex((GLenum)a0, (GLsizei)a1, (GLenum)a2, (const void *)a3, (GLint)a4); }
 GLAPI void APIENTRY glDrawElementsInstancedANGLE(GLenum a0, GLsizei a1, GLenum a2, const void * a3, GLsizei a4) { glDrawElementsInstanced((GLenum)a0, (GLsizei)a1, (GLenum)a2, (const void *)a3, (GLsizei)a4); }
@@ -5251,10 +5482,8 @@ GLAPI void APIENTRY glEnableiEXT(GLenum a0, GLuint a1) { glEnablei((GLenum)a0, (
 GLAPI void APIENTRY glEnableiNV(GLenum a0, GLuint a1) { glEnablei((GLenum)a0, (GLuint)a1); }
 GLAPI void APIENTRY glEnableiOES(GLenum a0, GLuint a1) { glEnablei((GLenum)a0, (GLuint)a1); }
 GLAPI void APIENTRY glEndQueryARB(GLenum a0) { glEndQuery((GLenum)a0); }
-GLAPI void APIENTRY glEndTransformFeedbackEXT(void) { glEndTransformFeedback(); }
-GLAPI void APIENTRY glEndTransformFeedbackNV(void) { glEndTransformFeedback(); }
+GLAPI void APIENTRY glEndQueryEXT(GLenum a0) { glEndQuery((GLenum)a0); }
 GLAPI GLsync APIENTRY glFenceSyncAPPLE(GLenum a0, GLbitfield a1) { return (GLsync)glFenceSync((GLenum)a0, (GLbitfield)a1); }
-GLAPI void APIENTRY glFlushMappedBufferRangeAPPLE(GLenum a0, GLintptr a1, GLsizeiptr a2) { glFlushMappedBufferRange((GLenum)a0, (GLintptr)a1, (GLsizeiptr)a2); }
 GLAPI void APIENTRY glFlushMappedBufferRangeEXT(GLenum a0, GLintptr a1, GLsizeiptr a2) { glFlushMappedBufferRange((GLenum)a0, (GLintptr)a1, (GLsizeiptr)a2); }
 GLAPI void APIENTRY glFogCoordPointerEXT(GLenum a0, GLsizei a1, const void * a2) { glFogCoordPointer((GLenum)a0, (GLsizei)a1, (const void *)a2); }
 GLAPI void APIENTRY glFogCoorddEXT(GLdouble a0) { glFogCoordd((GLdouble)a0); }
@@ -5262,21 +5491,26 @@ GLAPI void APIENTRY glFogCoorddvEXT(const GLdouble * a0) { glFogCoorddv((const G
 GLAPI void APIENTRY glFogCoordfEXT(GLfloat a0) { glFogCoordf((GLfloat)a0); }
 GLAPI void APIENTRY glFogCoordfvEXT(const GLfloat * a0) { glFogCoordfv((const GLfloat *)a0); }
 GLAPI void APIENTRY glFramebufferRenderbufferEXT(GLenum a0, GLenum a1, GLenum a2, GLuint a3) { glFramebufferRenderbuffer((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLuint)a3); }
+GLAPI void APIENTRY glFramebufferRenderbufferOES(GLenum a0, GLenum a1, GLenum a2, GLuint a3) { glFramebufferRenderbuffer((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLuint)a3); }
 GLAPI void APIENTRY glFramebufferTexture1DEXT(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4) { glFramebufferTexture1D((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLuint)a3, (GLint)a4); }
 GLAPI void APIENTRY glFramebufferTexture2DEXT(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4) { glFramebufferTexture2D((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLuint)a3, (GLint)a4); }
+GLAPI void APIENTRY glFramebufferTexture2DOES(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4) { glFramebufferTexture2D((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLuint)a3, (GLint)a4); }
 GLAPI void APIENTRY glFramebufferTexture3DEXT(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4, GLint a5) { glFramebufferTexture3D((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLuint)a3, (GLint)a4, (GLint)a5); }
-GLAPI void APIENTRY glFramebufferTextureARB(GLenum a0, GLenum a1, GLuint a2, GLint a3) { glFramebufferTexture((GLenum)a0, (GLenum)a1, (GLuint)a2, (GLint)a3); }
-GLAPI void APIENTRY glFramebufferTextureEXT(GLenum a0, GLenum a1, GLuint a2, GLint a3) { glFramebufferTexture((GLenum)a0, (GLenum)a1, (GLuint)a2, (GLint)a3); }
-GLAPI void APIENTRY glFramebufferTextureLayerARB(GLenum a0, GLenum a1, GLuint a2, GLint a3, GLint a4) { glFramebufferTextureLayer((GLenum)a0, (GLenum)a1, (GLuint)a2, (GLint)a3, (GLint)a4); }
+GLAPI void APIENTRY glFramebufferTexture3DOES(GLenum a0, GLenum a1, GLenum a2, GLuint a3, GLint a4, GLint a5) { glFramebufferTexture3D((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLuint)a3, (GLint)a4, (GLint)a5); }
 GLAPI void APIENTRY glFramebufferTextureLayerEXT(GLenum a0, GLenum a1, GLuint a2, GLint a3, GLint a4) { glFramebufferTextureLayer((GLenum)a0, (GLenum)a1, (GLuint)a2, (GLint)a3, (GLint)a4); }
 GLAPI void APIENTRY glFramebufferTextureOES(GLenum a0, GLenum a1, GLuint a2, GLint a3) { glFramebufferTexture((GLenum)a0, (GLenum)a1, (GLuint)a2, (GLint)a3); }
 GLAPI void APIENTRY glGenBuffersARB(GLsizei a0, GLuint * a1) { glGenBuffers((GLsizei)a0, (GLuint *)a1); }
 GLAPI void APIENTRY glGenFramebuffersEXT(GLsizei a0, GLuint * a1) { glGenFramebuffers((GLsizei)a0, (GLuint *)a1); }
+GLAPI void APIENTRY glGenFramebuffersOES(GLsizei a0, GLuint * a1) { glGenFramebuffers((GLsizei)a0, (GLuint *)a1); }
 GLAPI void APIENTRY glGenQueriesARB(GLsizei a0, GLuint * a1) { glGenQueries((GLsizei)a0, (GLuint *)a1); }
+GLAPI void APIENTRY glGenQueriesEXT(GLsizei a0, GLuint * a1) { glGenQueries((GLsizei)a0, (GLuint *)a1); }
 GLAPI void APIENTRY glGenRenderbuffersEXT(GLsizei a0, GLuint * a1) { glGenRenderbuffers((GLsizei)a0, (GLuint *)a1); }
+GLAPI void APIENTRY glGenRenderbuffersOES(GLsizei a0, GLuint * a1) { glGenRenderbuffers((GLsizei)a0, (GLuint *)a1); }
+GLAPI void APIENTRY glGenTexturesEXT(GLsizei a0, GLuint * a1) { glGenTextures((GLsizei)a0, (GLuint *)a1); }
 GLAPI void APIENTRY glGenVertexArraysAPPLE(GLsizei a0, GLuint * a1) { glGenVertexArrays((GLsizei)a0, (GLuint *)a1); }
 GLAPI void APIENTRY glGenVertexArraysOES(GLsizei a0, GLuint * a1) { glGenVertexArrays((GLsizei)a0, (GLuint *)a1); }
 GLAPI void APIENTRY glGenerateMipmapEXT(GLenum a0) { glGenerateMipmap((GLenum)a0); }
+GLAPI void APIENTRY glGenerateMipmapOES(GLenum a0) { glGenerateMipmap((GLenum)a0); }
 GLAPI void APIENTRY glGetActiveAttribARB(GLhandleARB a0, GLuint a1, GLsizei a2, GLsizei * a3, GLint * a4, GLenum * a5, GLcharARB * a6) { glGetActiveAttrib((GLuint)a0, (GLuint)a1, (GLsizei)a2, (GLsizei *)a3, (GLint *)a4, (GLenum *)a5, (GLchar *)a6); }
 GLAPI void APIENTRY glGetActiveUniformARB(GLhandleARB a0, GLuint a1, GLsizei a2, GLsizei * a3, GLint * a4, GLenum * a5, GLcharARB * a6) { glGetActiveUniform((GLuint)a0, (GLuint)a1, (GLsizei)a2, (GLsizei *)a3, (GLint *)a4, (GLenum *)a5, (GLchar *)a6); }
 GLAPI GLint APIENTRY glGetAttribLocationARB(GLhandleARB a0, const GLcharARB * a1) { return (GLint)glGetAttribLocation((GLuint)a0, (const GLchar *)a1); }
@@ -5285,10 +5519,13 @@ GLAPI void APIENTRY glGetBufferParameterivARB(GLenum a0, GLenum a1, GLint * a2) 
 GLAPI void APIENTRY glGetBufferPointervARB(GLenum a0, GLenum a1, void ** a2) { glGetBufferPointerv((GLenum)a0, (GLenum)a1, (void **)a2); }
 GLAPI void APIENTRY glGetBufferPointervOES(GLenum a0, GLenum a1, void ** a2) { glGetBufferPointerv((GLenum)a0, (GLenum)a1, (void **)a2); }
 GLAPI void APIENTRY glGetBufferSubDataARB(GLenum a0, GLintptrARB a1, GLsizeiptrARB a2, void * a3) { glGetBufferSubData((GLenum)a0, (GLintptr)a1, (GLsizeiptr)a2, (void *)a3); }
+GLAPI void APIENTRY glGetCompressedTexImageARB(GLenum a0, GLint a1, void * a2) { glGetCompressedTexImage((GLenum)a0, (GLint)a1, (void *)a2); }
 GLAPI void APIENTRY glGetFramebufferAttachmentParameterivEXT(GLenum a0, GLenum a1, GLenum a2, GLint * a3) { glGetFramebufferAttachmentParameteriv((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLint *)a3); }
+GLAPI void APIENTRY glGetFramebufferAttachmentParameterivOES(GLenum a0, GLenum a1, GLenum a2, GLint * a3) { glGetFramebufferAttachmentParameteriv((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLint *)a3); }
 GLAPI void APIENTRY glGetInteger64vAPPLE(GLenum a0, GLint64 * a1) { glGetInteger64v((GLenum)a0, (GLint64 *)a1); }
 GLAPI void APIENTRY glGetInteger64vEXT(GLenum a0, GLint64 * a1) { glGetInteger64v((GLenum)a0, (GLint64 *)a1); }
 GLAPI void APIENTRY glGetIntegerIndexedvEXT(GLenum a0, GLuint a1, GLint * a2) { glGetIntegeri_v((GLenum)a0, (GLuint)a1, (GLint *)a2); }
+GLAPI void APIENTRY glGetIntegeri_vEXT(GLenum a0, GLuint a1, GLint * a2) { glGetIntegeri_v((GLenum)a0, (GLuint)a1, (GLint *)a2); }
 GLAPI void APIENTRY glGetPointervEXT(GLenum a0, void ** a1) { glGetPointerv((GLenum)a0, (void **)a1); }
 GLAPI void APIENTRY glGetPointervKHR(GLenum a0, void ** a1) { glGetPointerv((GLenum)a0, (void **)a1); }
 GLAPI void APIENTRY glGetQueryObjecti64vEXT(GLuint a0, GLenum a1, GLint64 * a2) { glGetQueryObjecti64v((GLuint)a0, (GLenum)a1, (GLint64 *)a2); }
@@ -5296,31 +5533,39 @@ GLAPI void APIENTRY glGetQueryObjectivARB(GLuint a0, GLenum a1, GLint * a2) { gl
 GLAPI void APIENTRY glGetQueryObjectivEXT(GLuint a0, GLenum a1, GLint * a2) { glGetQueryObjectiv((GLuint)a0, (GLenum)a1, (GLint *)a2); }
 GLAPI void APIENTRY glGetQueryObjectui64vEXT(GLuint a0, GLenum a1, GLuint64 * a2) { glGetQueryObjectui64v((GLuint)a0, (GLenum)a1, (GLuint64 *)a2); }
 GLAPI void APIENTRY glGetQueryObjectuivARB(GLuint a0, GLenum a1, GLuint * a2) { glGetQueryObjectuiv((GLuint)a0, (GLenum)a1, (GLuint *)a2); }
+GLAPI void APIENTRY glGetQueryObjectuivEXT(GLuint a0, GLenum a1, GLuint * a2) { glGetQueryObjectuiv((GLuint)a0, (GLenum)a1, (GLuint *)a2); }
 GLAPI void APIENTRY glGetQueryivARB(GLenum a0, GLenum a1, GLint * a2) { glGetQueryiv((GLenum)a0, (GLenum)a1, (GLint *)a2); }
+GLAPI void APIENTRY glGetQueryivEXT(GLenum a0, GLenum a1, GLint * a2) { glGetQueryiv((GLenum)a0, (GLenum)a1, (GLint *)a2); }
 GLAPI void APIENTRY glGetRenderbufferParameterivEXT(GLenum a0, GLenum a1, GLint * a2) { glGetRenderbufferParameteriv((GLenum)a0, (GLenum)a1, (GLint *)a2); }
+GLAPI void APIENTRY glGetRenderbufferParameterivOES(GLenum a0, GLenum a1, GLint * a2) { glGetRenderbufferParameteriv((GLenum)a0, (GLenum)a1, (GLint *)a2); }
+GLAPI void APIENTRY glGetSamplerParameterIivEXT(GLuint a0, GLenum a1, GLint * a2) { glGetSamplerParameterIiv((GLuint)a0, (GLenum)a1, (GLint *)a2); }
+GLAPI void APIENTRY glGetSamplerParameterIivOES(GLuint a0, GLenum a1, GLint * a2) { glGetSamplerParameterIiv((GLuint)a0, (GLenum)a1, (GLint *)a2); }
+GLAPI void APIENTRY glGetSamplerParameterIuivEXT(GLuint a0, GLenum a1, GLuint * a2) { glGetSamplerParameterIuiv((GLuint)a0, (GLenum)a1, (GLuint *)a2); }
+GLAPI void APIENTRY glGetSamplerParameterIuivOES(GLuint a0, GLenum a1, GLuint * a2) { glGetSamplerParameterIuiv((GLuint)a0, (GLenum)a1, (GLuint *)a2); }
 GLAPI void APIENTRY glGetShaderSourceARB(GLhandleARB a0, GLsizei a1, GLsizei * a2, GLcharARB * a3) { glGetShaderSource((GLuint)a0, (GLsizei)a1, (GLsizei *)a2, (GLchar *)a3); }
 GLAPI void APIENTRY glGetSyncivAPPLE(GLsync a0, GLenum a1, GLsizei a2, GLsizei * a3, GLint * a4) { glGetSynciv((GLsync)a0, (GLenum)a1, (GLsizei)a2, (GLsizei *)a3, (GLint *)a4); }
+GLAPI void APIENTRY glGetTexGenfvOES(GLenum a0, GLenum a1, GLfloat * a2) { glGetTexGenfv((GLenum)a0, (GLenum)a1, (GLfloat *)a2); }
+GLAPI void APIENTRY glGetTexGenivOES(GLenum a0, GLenum a1, GLint * a2) { glGetTexGeniv((GLenum)a0, (GLenum)a1, (GLint *)a2); }
 GLAPI GLint APIENTRY glGetUniformLocationARB(GLhandleARB a0, const GLcharARB * a1) { return (GLint)glGetUniformLocation((GLuint)a0, (const GLchar *)a1); }
 GLAPI void APIENTRY glGetUniformfvARB(GLhandleARB a0, GLint a1, GLfloat * a2) { glGetUniformfv((GLuint)a0, (GLint)a1, (GLfloat *)a2); }
 GLAPI void APIENTRY glGetUniformivARB(GLhandleARB a0, GLint a1, GLint * a2) { glGetUniformiv((GLuint)a0, (GLint)a1, (GLint *)a2); }
-GLAPI void APIENTRY glGetUniformuivEXT(GLuint a0, GLint a1, GLuint * a2) { glGetUniformuiv((GLuint)a0, (GLint)a1, (GLuint *)a2); }
 GLAPI void APIENTRY glGetVertexAttribPointervARB(GLuint a0, GLenum a1, void ** a2) { glGetVertexAttribPointerv((GLuint)a0, (GLenum)a1, (void **)a2); }
-GLAPI void APIENTRY glGetVertexAttribPointervNV(GLuint a0, GLenum a1, void ** a2) { glGetVertexAttribPointerv((GLuint)a0, (GLenum)a1, (void **)a2); }
 GLAPI void APIENTRY glGetVertexAttribdvARB(GLuint a0, GLenum a1, GLdouble * a2) { glGetVertexAttribdv((GLuint)a0, (GLenum)a1, (GLdouble *)a2); }
-GLAPI void APIENTRY glGetVertexAttribdvNV(GLuint a0, GLenum a1, GLdouble * a2) { glGetVertexAttribdv((GLuint)a0, (GLenum)a1, (GLdouble *)a2); }
 GLAPI void APIENTRY glGetVertexAttribfvARB(GLuint a0, GLenum a1, GLfloat * a2) { glGetVertexAttribfv((GLuint)a0, (GLenum)a1, (GLfloat *)a2); }
-GLAPI void APIENTRY glGetVertexAttribfvNV(GLuint a0, GLenum a1, GLfloat * a2) { glGetVertexAttribfv((GLuint)a0, (GLenum)a1, (GLfloat *)a2); }
 GLAPI void APIENTRY glGetVertexAttribivARB(GLuint a0, GLenum a1, GLint * a2) { glGetVertexAttribiv((GLuint)a0, (GLenum)a1, (GLint *)a2); }
-GLAPI void APIENTRY glGetVertexAttribivNV(GLuint a0, GLenum a1, GLint * a2) { glGetVertexAttribiv((GLuint)a0, (GLenum)a1, (GLint *)a2); }
 GLAPI GLboolean APIENTRY glIsBufferARB(GLuint a0) { return (GLboolean)glIsBuffer((GLuint)a0); }
 GLAPI GLboolean APIENTRY glIsEnabledIndexedEXT(GLenum a0, GLuint a1) { return (GLboolean)glIsEnabledi((GLenum)a0, (GLuint)a1); }
 GLAPI GLboolean APIENTRY glIsEnablediEXT(GLenum a0, GLuint a1) { return (GLboolean)glIsEnabledi((GLenum)a0, (GLuint)a1); }
 GLAPI GLboolean APIENTRY glIsEnablediNV(GLenum a0, GLuint a1) { return (GLboolean)glIsEnabledi((GLenum)a0, (GLuint)a1); }
 GLAPI GLboolean APIENTRY glIsEnablediOES(GLenum a0, GLuint a1) { return (GLboolean)glIsEnabledi((GLenum)a0, (GLuint)a1); }
 GLAPI GLboolean APIENTRY glIsFramebufferEXT(GLuint a0) { return (GLboolean)glIsFramebuffer((GLuint)a0); }
+GLAPI GLboolean APIENTRY glIsFramebufferOES(GLuint a0) { return (GLboolean)glIsFramebuffer((GLuint)a0); }
 GLAPI GLboolean APIENTRY glIsQueryARB(GLuint a0) { return (GLboolean)glIsQuery((GLuint)a0); }
+GLAPI GLboolean APIENTRY glIsQueryEXT(GLuint a0) { return (GLboolean)glIsQuery((GLuint)a0); }
 GLAPI GLboolean APIENTRY glIsRenderbufferEXT(GLuint a0) { return (GLboolean)glIsRenderbuffer((GLuint)a0); }
+GLAPI GLboolean APIENTRY glIsRenderbufferOES(GLuint a0) { return (GLboolean)glIsRenderbuffer((GLuint)a0); }
 GLAPI GLboolean APIENTRY glIsSyncAPPLE(GLsync a0) { return (GLboolean)glIsSync((GLsync)a0); }
+GLAPI GLboolean APIENTRY glIsTextureEXT(GLuint a0) { return (GLboolean)glIsTexture((GLuint)a0); }
 GLAPI GLboolean APIENTRY glIsVertexArrayAPPLE(GLuint a0) { return (GLboolean)glIsVertexArray((GLuint)a0); }
 GLAPI GLboolean APIENTRY glIsVertexArrayOES(GLuint a0) { return (GLboolean)glIsVertexArray((GLuint)a0); }
 GLAPI void APIENTRY glLinkProgramARB(GLhandleARB a0) { glLinkProgram((GLuint)a0); }
@@ -5366,8 +5611,6 @@ GLAPI void APIENTRY glMultiTexCoord4iARB(GLenum a0, GLint a1, GLint a2, GLint a3
 GLAPI void APIENTRY glMultiTexCoord4ivARB(GLenum a0, const GLint * a1) { glMultiTexCoord4iv((GLenum)a0, (const GLint *)a1); }
 GLAPI void APIENTRY glMultiTexCoord4sARB(GLenum a0, GLshort a1, GLshort a2, GLshort a3, GLshort a4) { glMultiTexCoord4s((GLenum)a0, (GLshort)a1, (GLshort)a2, (GLshort)a3, (GLshort)a4); }
 GLAPI void APIENTRY glMultiTexCoord4svARB(GLenum a0, const GLshort * a1) { glMultiTexCoord4sv((GLenum)a0, (const GLshort *)a1); }
-GLAPI void APIENTRY glNamedBufferStorageEXT(GLuint a0, GLsizeiptr a1, const void * a2, GLbitfield a3) { glNamedBufferStorage((GLuint)a0, (GLsizeiptr)a1, (const void *)a2, (GLbitfield)a3); }
-GLAPI void APIENTRY glNamedBufferSubDataEXT(GLuint a0, GLintptr a1, GLsizeiptr a2, const void * a3) { glNamedBufferSubData((GLuint)a0, (GLintptr)a1, (GLsizeiptr)a2, (const void *)a3); }
 GLAPI void APIENTRY glPointParameterfARB(GLenum a0, GLfloat a1) { glPointParameterf((GLenum)a0, (GLfloat)a1); }
 GLAPI void APIENTRY glPointParameterfEXT(GLenum a0, GLfloat a1) { glPointParameterf((GLenum)a0, (GLfloat)a1); }
 GLAPI void APIENTRY glPointParameterfSGIS(GLenum a0, GLfloat a1) { glPointParameterf((GLenum)a0, (GLfloat)a1); }
@@ -5377,45 +5620,20 @@ GLAPI void APIENTRY glPointParameterfvSGIS(GLenum a0, const GLfloat * a1) { glPo
 GLAPI void APIENTRY glPointParameteriNV(GLenum a0, GLint a1) { glPointParameteri((GLenum)a0, (GLint)a1); }
 GLAPI void APIENTRY glPointParameterivNV(GLenum a0, const GLint * a1) { glPointParameteriv((GLenum)a0, (const GLint *)a1); }
 GLAPI void APIENTRY glPolygonModeNV(GLenum a0, GLenum a1) { glPolygonMode((GLenum)a0, (GLenum)a1); }
+GLAPI void APIENTRY glPolygonOffsetEXT(GLfloat a0, GLfloat a1) { glPolygonOffset((GLfloat)a0, (GLfloat)a1); }
 GLAPI void APIENTRY glPrioritizeTexturesEXT(GLsizei a0, const GLuint * a1, const GLclampf * a2) { glPrioritizeTextures((GLsizei)a0, (const GLuint *)a1, (const GLfloat *)a2); }
-GLAPI void APIENTRY glProgramUniform1fEXT(GLuint a0, GLint a1, GLfloat a2) { glProgramUniform1f((GLuint)a0, (GLint)a1, (GLfloat)a2); }
-GLAPI void APIENTRY glProgramUniform1fvEXT(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) { glProgramUniform1fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLfloat *)a3); }
-GLAPI void APIENTRY glProgramUniform1iEXT(GLuint a0, GLint a1, GLint a2) { glProgramUniform1i((GLuint)a0, (GLint)a1, (GLint)a2); }
-GLAPI void APIENTRY glProgramUniform1ivEXT(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) { glProgramUniform1iv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLint *)a3); }
-GLAPI void APIENTRY glProgramUniform1uiEXT(GLuint a0, GLint a1, GLuint a2) { glProgramUniform1ui((GLuint)a0, (GLint)a1, (GLuint)a2); }
-GLAPI void APIENTRY glProgramUniform1uivEXT(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) { glProgramUniform1uiv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLuint *)a3); }
-GLAPI void APIENTRY glProgramUniform2fEXT(GLuint a0, GLint a1, GLfloat a2, GLfloat a3) { glProgramUniform2f((GLuint)a0, (GLint)a1, (GLfloat)a2, (GLfloat)a3); }
-GLAPI void APIENTRY glProgramUniform2fvEXT(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) { glProgramUniform2fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLfloat *)a3); }
-GLAPI void APIENTRY glProgramUniform2iEXT(GLuint a0, GLint a1, GLint a2, GLint a3) { glProgramUniform2i((GLuint)a0, (GLint)a1, (GLint)a2, (GLint)a3); }
-GLAPI void APIENTRY glProgramUniform2ivEXT(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) { glProgramUniform2iv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLint *)a3); }
-GLAPI void APIENTRY glProgramUniform2uiEXT(GLuint a0, GLint a1, GLuint a2, GLuint a3) { glProgramUniform2ui((GLuint)a0, (GLint)a1, (GLuint)a2, (GLuint)a3); }
-GLAPI void APIENTRY glProgramUniform2uivEXT(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) { glProgramUniform2uiv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLuint *)a3); }
-GLAPI void APIENTRY glProgramUniform3fEXT(GLuint a0, GLint a1, GLfloat a2, GLfloat a3, GLfloat a4) { glProgramUniform3f((GLuint)a0, (GLint)a1, (GLfloat)a2, (GLfloat)a3, (GLfloat)a4); }
-GLAPI void APIENTRY glProgramUniform3fvEXT(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) { glProgramUniform3fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLfloat *)a3); }
-GLAPI void APIENTRY glProgramUniform3iEXT(GLuint a0, GLint a1, GLint a2, GLint a3, GLint a4) { glProgramUniform3i((GLuint)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4); }
-GLAPI void APIENTRY glProgramUniform3ivEXT(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) { glProgramUniform3iv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLint *)a3); }
-GLAPI void APIENTRY glProgramUniform3uiEXT(GLuint a0, GLint a1, GLuint a2, GLuint a3, GLuint a4) { glProgramUniform3ui((GLuint)a0, (GLint)a1, (GLuint)a2, (GLuint)a3, (GLuint)a4); }
-GLAPI void APIENTRY glProgramUniform3uivEXT(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) { glProgramUniform3uiv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLuint *)a3); }
-GLAPI void APIENTRY glProgramUniform4fEXT(GLuint a0, GLint a1, GLfloat a2, GLfloat a3, GLfloat a4, GLfloat a5) { glProgramUniform4f((GLuint)a0, (GLint)a1, (GLfloat)a2, (GLfloat)a3, (GLfloat)a4, (GLfloat)a5); }
-GLAPI void APIENTRY glProgramUniform4fvEXT(GLuint a0, GLint a1, GLsizei a2, const GLfloat * a3) { glProgramUniform4fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLfloat *)a3); }
-GLAPI void APIENTRY glProgramUniform4iEXT(GLuint a0, GLint a1, GLint a2, GLint a3, GLint a4, GLint a5) { glProgramUniform4i((GLuint)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLint)a5); }
-GLAPI void APIENTRY glProgramUniform4ivEXT(GLuint a0, GLint a1, GLsizei a2, const GLint * a3) { glProgramUniform4iv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLint *)a3); }
-GLAPI void APIENTRY glProgramUniform4uiEXT(GLuint a0, GLint a1, GLuint a2, GLuint a3, GLuint a4, GLuint a5) { glProgramUniform4ui((GLuint)a0, (GLint)a1, (GLuint)a2, (GLuint)a3, (GLuint)a4, (GLuint)a5); }
-GLAPI void APIENTRY glProgramUniform4uivEXT(GLuint a0, GLint a1, GLsizei a2, const GLuint * a3) { glProgramUniform4uiv((GLuint)a0, (GLint)a1, (GLsizei)a2, (const GLuint *)a3); }
-GLAPI void APIENTRY glProgramUniformMatrix2fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix2fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix2x3fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix2x3fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix2x4fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix2x4fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix3fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix3fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix3x2fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix3x2fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix3x4fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix3x4fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix4fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix4fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix4x2fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix4x2fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
-GLAPI void APIENTRY glProgramUniformMatrix4x3fvEXT(GLuint a0, GLint a1, GLsizei a2, GLboolean a3, const GLfloat * a4) { glProgramUniformMatrix4x3fv((GLuint)a0, (GLint)a1, (GLsizei)a2, (GLboolean)a3, (const GLfloat *)a4); }
 GLAPI void APIENTRY glProvokingVertexEXT(GLenum a0) { glProvokingVertex((GLenum)a0); }
+GLAPI void APIENTRY glReadBufferNV(GLenum a0) { glReadBuffer((GLenum)a0); }
 GLAPI void APIENTRY glRenderbufferStorageEXT(GLenum a0, GLenum a1, GLsizei a2, GLsizei a3) { glRenderbufferStorage((GLenum)a0, (GLenum)a1, (GLsizei)a2, (GLsizei)a3); }
+GLAPI void APIENTRY glRenderbufferStorageMultisampleAPPLE(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4) { glRenderbufferStorageMultisample((GLenum)a0, (GLsizei)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4); }
 GLAPI void APIENTRY glRenderbufferStorageMultisampleEXT(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4) { glRenderbufferStorageMultisample((GLenum)a0, (GLsizei)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4); }
 GLAPI void APIENTRY glRenderbufferStorageMultisampleNV(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4) { glRenderbufferStorageMultisample((GLenum)a0, (GLsizei)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4); }
+GLAPI void APIENTRY glRenderbufferStorageOES(GLenum a0, GLenum a1, GLsizei a2, GLsizei a3) { glRenderbufferStorage((GLenum)a0, (GLenum)a1, (GLsizei)a2, (GLsizei)a3); }
 GLAPI void APIENTRY glSampleCoverageARB(GLfloat a0, GLboolean a1) { glSampleCoverage((GLfloat)a0, (GLboolean)a1); }
+GLAPI void APIENTRY glSamplerParameterIivEXT(GLuint a0, GLenum a1, const GLint * a2) { glSamplerParameterIiv((GLuint)a0, (GLenum)a1, (const GLint *)a2); }
+GLAPI void APIENTRY glSamplerParameterIivOES(GLuint a0, GLenum a1, const GLint * a2) { glSamplerParameterIiv((GLuint)a0, (GLenum)a1, (const GLint *)a2); }
+GLAPI void APIENTRY glSamplerParameterIuivEXT(GLuint a0, GLenum a1, const GLuint * a2) { glSamplerParameterIuiv((GLuint)a0, (GLenum)a1, (const GLuint *)a2); }
+GLAPI void APIENTRY glSamplerParameterIuivOES(GLuint a0, GLenum a1, const GLuint * a2) { glSamplerParameterIuiv((GLuint)a0, (GLenum)a1, (const GLuint *)a2); }
 GLAPI void APIENTRY glSecondaryColor3bEXT(GLbyte a0, GLbyte a1, GLbyte a2) { glSecondaryColor3b((GLbyte)a0, (GLbyte)a1, (GLbyte)a2); }
 GLAPI void APIENTRY glSecondaryColor3bvEXT(const GLbyte * a0) { glSecondaryColor3bv((const GLbyte *)a0); }
 GLAPI void APIENTRY glSecondaryColor3dEXT(GLdouble a0, GLdouble a1, GLdouble a2) { glSecondaryColor3d((GLdouble)a0, (GLdouble)a1, (GLdouble)a2); }
@@ -5434,39 +5652,32 @@ GLAPI void APIENTRY glSecondaryColor3usEXT(GLushort a0, GLushort a1, GLushort a2
 GLAPI void APIENTRY glSecondaryColor3usvEXT(const GLushort * a0) { glSecondaryColor3usv((const GLushort *)a0); }
 GLAPI void APIENTRY glSecondaryColorPointerEXT(GLint a0, GLenum a1, GLsizei a2, const void * a3) { glSecondaryColorPointer((GLint)a0, (GLenum)a1, (GLsizei)a2, (const void *)a3); }
 GLAPI void APIENTRY glShaderSourceARB(GLhandleARB a0, GLsizei a1, const GLcharARB ** a2, const GLint * a3) { glShaderSource((GLuint)a0, (GLsizei)a1, (const GLchar *const*)a2, (const GLint *)a3); }
-GLAPI void APIENTRY glStencilOpSeparateATI(GLenum a0, GLenum a1, GLenum a2, GLenum a3) { glStencilOpSeparate((GLenum)a0, (GLenum)a1, (GLenum)a2, (GLenum)a3); }
+GLAPI void APIENTRY glTexGenfOES(GLenum a0, GLenum a1, GLfloat a2) { glTexGenf((GLenum)a0, (GLenum)a1, (GLfloat)a2); }
+GLAPI void APIENTRY glTexGenfvOES(GLenum a0, GLenum a1, const GLfloat * a2) { glTexGenfv((GLenum)a0, (GLenum)a1, (const GLfloat *)a2); }
+GLAPI void APIENTRY glTexGeniOES(GLenum a0, GLenum a1, GLint a2) { glTexGeni((GLenum)a0, (GLenum)a1, (GLint)a2); }
+GLAPI void APIENTRY glTexGenivOES(GLenum a0, GLenum a1, const GLint * a2) { glTexGeniv((GLenum)a0, (GLenum)a1, (const GLint *)a2); }
 GLAPI void APIENTRY glTexImage3DEXT(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLsizei a4, GLsizei a5, GLint a6, GLenum a7, GLenum a8, const void * a9) { glTexImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLsizei)a3, (GLsizei)a4, (GLsizei)a5, (GLint)a6, (GLenum)a7, (GLenum)a8, (const void *)a9); }
-GLAPI void APIENTRY glTexStorage1DEXT(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3) { glTexStorage1D((GLenum)a0, (GLsizei)a1, (GLenum)a2, (GLsizei)a3); }
-GLAPI void APIENTRY glTexStorage2DEXT(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4) { glTexStorage2D((GLenum)a0, (GLsizei)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4); }
-GLAPI void APIENTRY glTexStorage3DEXT(GLenum a0, GLsizei a1, GLenum a2, GLsizei a3, GLsizei a4, GLsizei a5) { glTexStorage3D((GLenum)a0, (GLsizei)a1, (GLenum)a2, (GLsizei)a3, (GLsizei)a4, (GLsizei)a5); }
+GLAPI void APIENTRY glTexImage3DOES(GLenum a0, GLint a1, GLenum a2, GLsizei a3, GLsizei a4, GLsizei a5, GLint a6, GLenum a7, GLenum a8, const void * a9) { glTexImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLsizei)a3, (GLsizei)a4, (GLsizei)a5, (GLint)a6, (GLenum)a7, (GLenum)a8, (const void *)a9); }
 GLAPI void APIENTRY glTexSubImage1DEXT(GLenum a0, GLint a1, GLint a2, GLsizei a3, GLenum a4, GLenum a5, const void * a6) { glTexSubImage1D((GLenum)a0, (GLint)a1, (GLint)a2, (GLsizei)a3, (GLenum)a4, (GLenum)a5, (const void *)a6); }
 GLAPI void APIENTRY glTexSubImage2DEXT(GLenum a0, GLint a1, GLint a2, GLint a3, GLsizei a4, GLsizei a5, GLenum a6, GLenum a7, const void * a8) { glTexSubImage2D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLsizei)a4, (GLsizei)a5, (GLenum)a6, (GLenum)a7, (const void *)a8); }
 GLAPI void APIENTRY glTexSubImage3DEXT(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLsizei a7, GLenum a8, GLenum a9, const void * a10) { glTexSubImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLsizei)a5, (GLsizei)a6, (GLsizei)a7, (GLenum)a8, (GLenum)a9, (const void *)a10); }
-GLAPI void APIENTRY glTransformFeedbackVaryingsEXT(GLuint a0, GLsizei a1, const GLchar *const* a2, GLenum a3) { glTransformFeedbackVaryings((GLuint)a0, (GLsizei)a1, (const GLchar *const*)a2, (GLenum)a3); }
+GLAPI void APIENTRY glTexSubImage3DOES(GLenum a0, GLint a1, GLint a2, GLint a3, GLint a4, GLsizei a5, GLsizei a6, GLsizei a7, GLenum a8, GLenum a9, const void * a10) { glTexSubImage3D((GLenum)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4, (GLsizei)a5, (GLsizei)a6, (GLsizei)a7, (GLenum)a8, (GLenum)a9, (const void *)a10); }
 GLAPI void APIENTRY glUniform1fARB(GLint a0, GLfloat a1) { glUniform1f((GLint)a0, (GLfloat)a1); }
 GLAPI void APIENTRY glUniform1fvARB(GLint a0, GLsizei a1, const GLfloat * a2) { glUniform1fv((GLint)a0, (GLsizei)a1, (const GLfloat *)a2); }
 GLAPI void APIENTRY glUniform1iARB(GLint a0, GLint a1) { glUniform1i((GLint)a0, (GLint)a1); }
 GLAPI void APIENTRY glUniform1ivARB(GLint a0, GLsizei a1, const GLint * a2) { glUniform1iv((GLint)a0, (GLsizei)a1, (const GLint *)a2); }
-GLAPI void APIENTRY glUniform1uiEXT(GLint a0, GLuint a1) { glUniform1ui((GLint)a0, (GLuint)a1); }
-GLAPI void APIENTRY glUniform1uivEXT(GLint a0, GLsizei a1, const GLuint * a2) { glUniform1uiv((GLint)a0, (GLsizei)a1, (const GLuint *)a2); }
 GLAPI void APIENTRY glUniform2fARB(GLint a0, GLfloat a1, GLfloat a2) { glUniform2f((GLint)a0, (GLfloat)a1, (GLfloat)a2); }
 GLAPI void APIENTRY glUniform2fvARB(GLint a0, GLsizei a1, const GLfloat * a2) { glUniform2fv((GLint)a0, (GLsizei)a1, (const GLfloat *)a2); }
 GLAPI void APIENTRY glUniform2iARB(GLint a0, GLint a1, GLint a2) { glUniform2i((GLint)a0, (GLint)a1, (GLint)a2); }
 GLAPI void APIENTRY glUniform2ivARB(GLint a0, GLsizei a1, const GLint * a2) { glUniform2iv((GLint)a0, (GLsizei)a1, (const GLint *)a2); }
-GLAPI void APIENTRY glUniform2uiEXT(GLint a0, GLuint a1, GLuint a2) { glUniform2ui((GLint)a0, (GLuint)a1, (GLuint)a2); }
-GLAPI void APIENTRY glUniform2uivEXT(GLint a0, GLsizei a1, const GLuint * a2) { glUniform2uiv((GLint)a0, (GLsizei)a1, (const GLuint *)a2); }
 GLAPI void APIENTRY glUniform3fARB(GLint a0, GLfloat a1, GLfloat a2, GLfloat a3) { glUniform3f((GLint)a0, (GLfloat)a1, (GLfloat)a2, (GLfloat)a3); }
 GLAPI void APIENTRY glUniform3fvARB(GLint a0, GLsizei a1, const GLfloat * a2) { glUniform3fv((GLint)a0, (GLsizei)a1, (const GLfloat *)a2); }
 GLAPI void APIENTRY glUniform3iARB(GLint a0, GLint a1, GLint a2, GLint a3) { glUniform3i((GLint)a0, (GLint)a1, (GLint)a2, (GLint)a3); }
 GLAPI void APIENTRY glUniform3ivARB(GLint a0, GLsizei a1, const GLint * a2) { glUniform3iv((GLint)a0, (GLsizei)a1, (const GLint *)a2); }
-GLAPI void APIENTRY glUniform3uiEXT(GLint a0, GLuint a1, GLuint a2, GLuint a3) { glUniform3ui((GLint)a0, (GLuint)a1, (GLuint)a2, (GLuint)a3); }
-GLAPI void APIENTRY glUniform3uivEXT(GLint a0, GLsizei a1, const GLuint * a2) { glUniform3uiv((GLint)a0, (GLsizei)a1, (const GLuint *)a2); }
 GLAPI void APIENTRY glUniform4fARB(GLint a0, GLfloat a1, GLfloat a2, GLfloat a3, GLfloat a4) { glUniform4f((GLint)a0, (GLfloat)a1, (GLfloat)a2, (GLfloat)a3, (GLfloat)a4); }
 GLAPI void APIENTRY glUniform4fvARB(GLint a0, GLsizei a1, const GLfloat * a2) { glUniform4fv((GLint)a0, (GLsizei)a1, (const GLfloat *)a2); }
 GLAPI void APIENTRY glUniform4iARB(GLint a0, GLint a1, GLint a2, GLint a3, GLint a4) { glUniform4i((GLint)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4); }
 GLAPI void APIENTRY glUniform4ivARB(GLint a0, GLsizei a1, const GLint * a2) { glUniform4iv((GLint)a0, (GLsizei)a1, (const GLint *)a2); }
-GLAPI void APIENTRY glUniform4uiEXT(GLint a0, GLuint a1, GLuint a2, GLuint a3, GLuint a4) { glUniform4ui((GLint)a0, (GLuint)a1, (GLuint)a2, (GLuint)a3, (GLuint)a4); }
-GLAPI void APIENTRY glUniform4uivEXT(GLint a0, GLsizei a1, const GLuint * a2) { glUniform4uiv((GLint)a0, (GLsizei)a1, (const GLuint *)a2); }
 GLAPI void APIENTRY glUniformMatrix2fvARB(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) { glUniformMatrix2fv((GLint)a0, (GLsizei)a1, (GLboolean)a2, (const GLfloat *)a3); }
 GLAPI void APIENTRY glUniformMatrix2x3fvNV(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) { glUniformMatrix2x3fv((GLint)a0, (GLsizei)a1, (GLboolean)a2, (const GLfloat *)a3); }
 GLAPI void APIENTRY glUniformMatrix2x4fvNV(GLint a0, GLsizei a1, GLboolean a2, const GLfloat * a3) { glUniformMatrix2x4fv((GLint)a0, (GLsizei)a1, (GLboolean)a2, (const GLfloat *)a3); }
@@ -5481,41 +5692,23 @@ GLAPI GLboolean APIENTRY glUnmapBufferOES(GLenum a0) { return (GLboolean)glUnmap
 GLAPI void APIENTRY glUseProgramObjectARB(GLhandleARB a0) { glUseProgram((GLuint)a0); }
 GLAPI void APIENTRY glValidateProgramARB(GLhandleARB a0) { glValidateProgram((GLuint)a0); }
 GLAPI void APIENTRY glVertexAttrib1dARB(GLuint a0, GLdouble a1) { glVertexAttrib1d((GLuint)a0, (GLdouble)a1); }
-GLAPI void APIENTRY glVertexAttrib1dNV(GLuint a0, GLdouble a1) { glVertexAttrib1d((GLuint)a0, (GLdouble)a1); }
 GLAPI void APIENTRY glVertexAttrib1dvARB(GLuint a0, const GLdouble * a1) { glVertexAttrib1dv((GLuint)a0, (const GLdouble *)a1); }
-GLAPI void APIENTRY glVertexAttrib1dvNV(GLuint a0, const GLdouble * a1) { glVertexAttrib1dv((GLuint)a0, (const GLdouble *)a1); }
 GLAPI void APIENTRY glVertexAttrib1fARB(GLuint a0, GLfloat a1) { glVertexAttrib1f((GLuint)a0, (GLfloat)a1); }
-GLAPI void APIENTRY glVertexAttrib1fNV(GLuint a0, GLfloat a1) { glVertexAttrib1f((GLuint)a0, (GLfloat)a1); }
 GLAPI void APIENTRY glVertexAttrib1fvARB(GLuint a0, const GLfloat * a1) { glVertexAttrib1fv((GLuint)a0, (const GLfloat *)a1); }
-GLAPI void APIENTRY glVertexAttrib1fvNV(GLuint a0, const GLfloat * a1) { glVertexAttrib1fv((GLuint)a0, (const GLfloat *)a1); }
 GLAPI void APIENTRY glVertexAttrib1sARB(GLuint a0, GLshort a1) { glVertexAttrib1s((GLuint)a0, (GLshort)a1); }
-GLAPI void APIENTRY glVertexAttrib1sNV(GLuint a0, GLshort a1) { glVertexAttrib1s((GLuint)a0, (GLshort)a1); }
 GLAPI void APIENTRY glVertexAttrib1svARB(GLuint a0, const GLshort * a1) { glVertexAttrib1sv((GLuint)a0, (const GLshort *)a1); }
-GLAPI void APIENTRY glVertexAttrib1svNV(GLuint a0, const GLshort * a1) { glVertexAttrib1sv((GLuint)a0, (const GLshort *)a1); }
 GLAPI void APIENTRY glVertexAttrib2dARB(GLuint a0, GLdouble a1, GLdouble a2) { glVertexAttrib2d((GLuint)a0, (GLdouble)a1, (GLdouble)a2); }
-GLAPI void APIENTRY glVertexAttrib2dNV(GLuint a0, GLdouble a1, GLdouble a2) { glVertexAttrib2d((GLuint)a0, (GLdouble)a1, (GLdouble)a2); }
 GLAPI void APIENTRY glVertexAttrib2dvARB(GLuint a0, const GLdouble * a1) { glVertexAttrib2dv((GLuint)a0, (const GLdouble *)a1); }
-GLAPI void APIENTRY glVertexAttrib2dvNV(GLuint a0, const GLdouble * a1) { glVertexAttrib2dv((GLuint)a0, (const GLdouble *)a1); }
 GLAPI void APIENTRY glVertexAttrib2fARB(GLuint a0, GLfloat a1, GLfloat a2) { glVertexAttrib2f((GLuint)a0, (GLfloat)a1, (GLfloat)a2); }
-GLAPI void APIENTRY glVertexAttrib2fNV(GLuint a0, GLfloat a1, GLfloat a2) { glVertexAttrib2f((GLuint)a0, (GLfloat)a1, (GLfloat)a2); }
 GLAPI void APIENTRY glVertexAttrib2fvARB(GLuint a0, const GLfloat * a1) { glVertexAttrib2fv((GLuint)a0, (const GLfloat *)a1); }
-GLAPI void APIENTRY glVertexAttrib2fvNV(GLuint a0, const GLfloat * a1) { glVertexAttrib2fv((GLuint)a0, (const GLfloat *)a1); }
 GLAPI void APIENTRY glVertexAttrib2sARB(GLuint a0, GLshort a1, GLshort a2) { glVertexAttrib2s((GLuint)a0, (GLshort)a1, (GLshort)a2); }
-GLAPI void APIENTRY glVertexAttrib2sNV(GLuint a0, GLshort a1, GLshort a2) { glVertexAttrib2s((GLuint)a0, (GLshort)a1, (GLshort)a2); }
 GLAPI void APIENTRY glVertexAttrib2svARB(GLuint a0, const GLshort * a1) { glVertexAttrib2sv((GLuint)a0, (const GLshort *)a1); }
-GLAPI void APIENTRY glVertexAttrib2svNV(GLuint a0, const GLshort * a1) { glVertexAttrib2sv((GLuint)a0, (const GLshort *)a1); }
 GLAPI void APIENTRY glVertexAttrib3dARB(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3) { glVertexAttrib3d((GLuint)a0, (GLdouble)a1, (GLdouble)a2, (GLdouble)a3); }
-GLAPI void APIENTRY glVertexAttrib3dNV(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3) { glVertexAttrib3d((GLuint)a0, (GLdouble)a1, (GLdouble)a2, (GLdouble)a3); }
 GLAPI void APIENTRY glVertexAttrib3dvARB(GLuint a0, const GLdouble * a1) { glVertexAttrib3dv((GLuint)a0, (const GLdouble *)a1); }
-GLAPI void APIENTRY glVertexAttrib3dvNV(GLuint a0, const GLdouble * a1) { glVertexAttrib3dv((GLuint)a0, (const GLdouble *)a1); }
 GLAPI void APIENTRY glVertexAttrib3fARB(GLuint a0, GLfloat a1, GLfloat a2, GLfloat a3) { glVertexAttrib3f((GLuint)a0, (GLfloat)a1, (GLfloat)a2, (GLfloat)a3); }
-GLAPI void APIENTRY glVertexAttrib3fNV(GLuint a0, GLfloat a1, GLfloat a2, GLfloat a3) { glVertexAttrib3f((GLuint)a0, (GLfloat)a1, (GLfloat)a2, (GLfloat)a3); }
 GLAPI void APIENTRY glVertexAttrib3fvARB(GLuint a0, const GLfloat * a1) { glVertexAttrib3fv((GLuint)a0, (const GLfloat *)a1); }
-GLAPI void APIENTRY glVertexAttrib3fvNV(GLuint a0, const GLfloat * a1) { glVertexAttrib3fv((GLuint)a0, (const GLfloat *)a1); }
 GLAPI void APIENTRY glVertexAttrib3sARB(GLuint a0, GLshort a1, GLshort a2, GLshort a3) { glVertexAttrib3s((GLuint)a0, (GLshort)a1, (GLshort)a2, (GLshort)a3); }
-GLAPI void APIENTRY glVertexAttrib3sNV(GLuint a0, GLshort a1, GLshort a2, GLshort a3) { glVertexAttrib3s((GLuint)a0, (GLshort)a1, (GLshort)a2, (GLshort)a3); }
 GLAPI void APIENTRY glVertexAttrib3svARB(GLuint a0, const GLshort * a1) { glVertexAttrib3sv((GLuint)a0, (const GLshort *)a1); }
-GLAPI void APIENTRY glVertexAttrib3svNV(GLuint a0, const GLshort * a1) { glVertexAttrib3sv((GLuint)a0, (const GLshort *)a1); }
 GLAPI void APIENTRY glVertexAttrib4NbvARB(GLuint a0, const GLbyte * a1) { glVertexAttrib4Nbv((GLuint)a0, (const GLbyte *)a1); }
 GLAPI void APIENTRY glVertexAttrib4NivARB(GLuint a0, const GLint * a1) { glVertexAttrib4Niv((GLuint)a0, (const GLint *)a1); }
 GLAPI void APIENTRY glVertexAttrib4NsvARB(GLuint a0, const GLshort * a1) { glVertexAttrib4Nsv((GLuint)a0, (const GLshort *)a1); }
@@ -5525,87 +5718,34 @@ GLAPI void APIENTRY glVertexAttrib4NuivARB(GLuint a0, const GLuint * a1) { glVer
 GLAPI void APIENTRY glVertexAttrib4NusvARB(GLuint a0, const GLushort * a1) { glVertexAttrib4Nusv((GLuint)a0, (const GLushort *)a1); }
 GLAPI void APIENTRY glVertexAttrib4bvARB(GLuint a0, const GLbyte * a1) { glVertexAttrib4bv((GLuint)a0, (const GLbyte *)a1); }
 GLAPI void APIENTRY glVertexAttrib4dARB(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4) { glVertexAttrib4d((GLuint)a0, (GLdouble)a1, (GLdouble)a2, (GLdouble)a3, (GLdouble)a4); }
-GLAPI void APIENTRY glVertexAttrib4dNV(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4) { glVertexAttrib4d((GLuint)a0, (GLdouble)a1, (GLdouble)a2, (GLdouble)a3, (GLdouble)a4); }
 GLAPI void APIENTRY glVertexAttrib4dvARB(GLuint a0, const GLdouble * a1) { glVertexAttrib4dv((GLuint)a0, (const GLdouble *)a1); }
-GLAPI void APIENTRY glVertexAttrib4dvNV(GLuint a0, const GLdouble * a1) { glVertexAttrib4dv((GLuint)a0, (const GLdouble *)a1); }
 GLAPI void APIENTRY glVertexAttrib4fARB(GLuint a0, GLfloat a1, GLfloat a2, GLfloat a3, GLfloat a4) { glVertexAttrib4f((GLuint)a0, (GLfloat)a1, (GLfloat)a2, (GLfloat)a3, (GLfloat)a4); }
-GLAPI void APIENTRY glVertexAttrib4fNV(GLuint a0, GLfloat a1, GLfloat a2, GLfloat a3, GLfloat a4) { glVertexAttrib4f((GLuint)a0, (GLfloat)a1, (GLfloat)a2, (GLfloat)a3, (GLfloat)a4); }
 GLAPI void APIENTRY glVertexAttrib4fvARB(GLuint a0, const GLfloat * a1) { glVertexAttrib4fv((GLuint)a0, (const GLfloat *)a1); }
-GLAPI void APIENTRY glVertexAttrib4fvNV(GLuint a0, const GLfloat * a1) { glVertexAttrib4fv((GLuint)a0, (const GLfloat *)a1); }
 GLAPI void APIENTRY glVertexAttrib4ivARB(GLuint a0, const GLint * a1) { glVertexAttrib4iv((GLuint)a0, (const GLint *)a1); }
 GLAPI void APIENTRY glVertexAttrib4sARB(GLuint a0, GLshort a1, GLshort a2, GLshort a3, GLshort a4) { glVertexAttrib4s((GLuint)a0, (GLshort)a1, (GLshort)a2, (GLshort)a3, (GLshort)a4); }
-GLAPI void APIENTRY glVertexAttrib4sNV(GLuint a0, GLshort a1, GLshort a2, GLshort a3, GLshort a4) { glVertexAttrib4s((GLuint)a0, (GLshort)a1, (GLshort)a2, (GLshort)a3, (GLshort)a4); }
 GLAPI void APIENTRY glVertexAttrib4svARB(GLuint a0, const GLshort * a1) { glVertexAttrib4sv((GLuint)a0, (const GLshort *)a1); }
-GLAPI void APIENTRY glVertexAttrib4svNV(GLuint a0, const GLshort * a1) { glVertexAttrib4sv((GLuint)a0, (const GLshort *)a1); }
-GLAPI void APIENTRY glVertexAttrib4ubNV(GLuint a0, GLubyte a1, GLubyte a2, GLubyte a3, GLubyte a4) { glVertexAttrib4Nub((GLuint)a0, (GLubyte)a1, (GLubyte)a2, (GLubyte)a3, (GLubyte)a4); }
 GLAPI void APIENTRY glVertexAttrib4ubvARB(GLuint a0, const GLubyte * a1) { glVertexAttrib4ubv((GLuint)a0, (const GLubyte *)a1); }
-GLAPI void APIENTRY glVertexAttrib4ubvNV(GLuint a0, const GLubyte * a1) { glVertexAttrib4Nubv((GLuint)a0, (const GLubyte *)a1); }
 GLAPI void APIENTRY glVertexAttrib4uivARB(GLuint a0, const GLuint * a1) { glVertexAttrib4uiv((GLuint)a0, (const GLuint *)a1); }
 GLAPI void APIENTRY glVertexAttrib4usvARB(GLuint a0, const GLushort * a1) { glVertexAttrib4usv((GLuint)a0, (const GLushort *)a1); }
 GLAPI void APIENTRY glVertexAttribDivisorANGLE(GLuint a0, GLuint a1) { glVertexAttribDivisor((GLuint)a0, (GLuint)a1); }
 GLAPI void APIENTRY glVertexAttribDivisorARB(GLuint a0, GLuint a1) { glVertexAttribDivisor((GLuint)a0, (GLuint)a1); }
 GLAPI void APIENTRY glVertexAttribDivisorEXT(GLuint a0, GLuint a1) { glVertexAttribDivisor((GLuint)a0, (GLuint)a1); }
 GLAPI void APIENTRY glVertexAttribDivisorNV(GLuint a0, GLuint a1) { glVertexAttribDivisor((GLuint)a0, (GLuint)a1); }
-GLAPI void APIENTRY glVertexAttribI1iEXT(GLuint a0, GLint a1) { glVertexAttribI1i((GLuint)a0, (GLint)a1); }
-GLAPI void APIENTRY glVertexAttribI1ivEXT(GLuint a0, const GLint * a1) { glVertexAttribI1iv((GLuint)a0, (const GLint *)a1); }
-GLAPI void APIENTRY glVertexAttribI1uiEXT(GLuint a0, GLuint a1) { glVertexAttribI1ui((GLuint)a0, (GLuint)a1); }
-GLAPI void APIENTRY glVertexAttribI1uivEXT(GLuint a0, const GLuint * a1) { glVertexAttribI1uiv((GLuint)a0, (const GLuint *)a1); }
-GLAPI void APIENTRY glVertexAttribI2iEXT(GLuint a0, GLint a1, GLint a2) { glVertexAttribI2i((GLuint)a0, (GLint)a1, (GLint)a2); }
-GLAPI void APIENTRY glVertexAttribI2ivEXT(GLuint a0, const GLint * a1) { glVertexAttribI2iv((GLuint)a0, (const GLint *)a1); }
-GLAPI void APIENTRY glVertexAttribI2uiEXT(GLuint a0, GLuint a1, GLuint a2) { glVertexAttribI2ui((GLuint)a0, (GLuint)a1, (GLuint)a2); }
-GLAPI void APIENTRY glVertexAttribI2uivEXT(GLuint a0, const GLuint * a1) { glVertexAttribI2uiv((GLuint)a0, (const GLuint *)a1); }
-GLAPI void APIENTRY glVertexAttribI3iEXT(GLuint a0, GLint a1, GLint a2, GLint a3) { glVertexAttribI3i((GLuint)a0, (GLint)a1, (GLint)a2, (GLint)a3); }
-GLAPI void APIENTRY glVertexAttribI3ivEXT(GLuint a0, const GLint * a1) { glVertexAttribI3iv((GLuint)a0, (const GLint *)a1); }
-GLAPI void APIENTRY glVertexAttribI3uiEXT(GLuint a0, GLuint a1, GLuint a2, GLuint a3) { glVertexAttribI3ui((GLuint)a0, (GLuint)a1, (GLuint)a2, (GLuint)a3); }
-GLAPI void APIENTRY glVertexAttribI3uivEXT(GLuint a0, const GLuint * a1) { glVertexAttribI3uiv((GLuint)a0, (const GLuint *)a1); }
-GLAPI void APIENTRY glVertexAttribI4bvEXT(GLuint a0, const GLbyte * a1) { glVertexAttribI4bv((GLuint)a0, (const GLbyte *)a1); }
-GLAPI void APIENTRY glVertexAttribI4iEXT(GLuint a0, GLint a1, GLint a2, GLint a3, GLint a4) { glVertexAttribI4i((GLuint)a0, (GLint)a1, (GLint)a2, (GLint)a3, (GLint)a4); }
-GLAPI void APIENTRY glVertexAttribI4ivEXT(GLuint a0, const GLint * a1) { glVertexAttribI4iv((GLuint)a0, (const GLint *)a1); }
-GLAPI void APIENTRY glVertexAttribI4svEXT(GLuint a0, const GLshort * a1) { glVertexAttribI4sv((GLuint)a0, (const GLshort *)a1); }
-GLAPI void APIENTRY glVertexAttribI4ubvEXT(GLuint a0, const GLubyte * a1) { glVertexAttribI4ubv((GLuint)a0, (const GLubyte *)a1); }
-GLAPI void APIENTRY glVertexAttribI4uiEXT(GLuint a0, GLuint a1, GLuint a2, GLuint a3, GLuint a4) { glVertexAttribI4ui((GLuint)a0, (GLuint)a1, (GLuint)a2, (GLuint)a3, (GLuint)a4); }
-GLAPI void APIENTRY glVertexAttribI4uivEXT(GLuint a0, const GLuint * a1) { glVertexAttribI4uiv((GLuint)a0, (const GLuint *)a1); }
-GLAPI void APIENTRY glVertexAttribI4usvEXT(GLuint a0, const GLushort * a1) { glVertexAttribI4usv((GLuint)a0, (const GLushort *)a1); }
-GLAPI void APIENTRY glVertexAttribIPointerEXT(GLuint a0, GLint a1, GLenum a2, GLsizei a3, const void * a4) { glVertexAttribIPointer((GLuint)a0, (GLint)a1, (GLenum)a2, (GLsizei)a3, (const void *)a4); }
-GLAPI void APIENTRY glVertexAttribL1dEXT(GLuint a0, GLdouble a1) { glVertexAttribL1d((GLuint)a0, (GLdouble)a1); }
-GLAPI void APIENTRY glVertexAttribL1dvEXT(GLuint a0, const GLdouble * a1) { glVertexAttribL1dv((GLuint)a0, (const GLdouble *)a1); }
-GLAPI void APIENTRY glVertexAttribL2dEXT(GLuint a0, GLdouble a1, GLdouble a2) { glVertexAttribL2d((GLuint)a0, (GLdouble)a1, (GLdouble)a2); }
-GLAPI void APIENTRY glVertexAttribL2dvEXT(GLuint a0, const GLdouble * a1) { glVertexAttribL2dv((GLuint)a0, (const GLdouble *)a1); }
-GLAPI void APIENTRY glVertexAttribL3dEXT(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3) { glVertexAttribL3d((GLuint)a0, (GLdouble)a1, (GLdouble)a2, (GLdouble)a3); }
-GLAPI void APIENTRY glVertexAttribL3dvEXT(GLuint a0, const GLdouble * a1) { glVertexAttribL3dv((GLuint)a0, (const GLdouble *)a1); }
-GLAPI void APIENTRY glVertexAttribL4dEXT(GLuint a0, GLdouble a1, GLdouble a2, GLdouble a3, GLdouble a4) { glVertexAttribL4d((GLuint)a0, (GLdouble)a1, (GLdouble)a2, (GLdouble)a3, (GLdouble)a4); }
-GLAPI void APIENTRY glVertexAttribL4dvEXT(GLuint a0, const GLdouble * a1) { glVertexAttribL4dv((GLuint)a0, (const GLdouble *)a1); }
 GLAPI void APIENTRY glVertexAttribPointerARB(GLuint a0, GLint a1, GLenum a2, GLboolean a3, GLsizei a4, const void * a5) { glVertexAttribPointer((GLuint)a0, (GLint)a1, (GLenum)a2, (GLboolean)a3, (GLsizei)a4, (const void *)a5); }
 GLAPI void APIENTRY glWaitSyncAPPLE(GLsync a0, GLbitfield a1, GLuint64 a2) { glWaitSync((GLsync)a0, (GLbitfield)a1, (GLuint64)a2); }
 GLAPI void APIENTRY glWindowPos2dARB(GLdouble a0, GLdouble a1) { glWindowPos2d((GLdouble)a0, (GLdouble)a1); }
-GLAPI void APIENTRY glWindowPos2dMESA(GLdouble a0, GLdouble a1) { glWindowPos2d((GLdouble)a0, (GLdouble)a1); }
 GLAPI void APIENTRY glWindowPos2dvARB(const GLdouble * a0) { glWindowPos2dv((const GLdouble *)a0); }
-GLAPI void APIENTRY glWindowPos2dvMESA(const GLdouble * a0) { glWindowPos2dv((const GLdouble *)a0); }
 GLAPI void APIENTRY glWindowPos2fARB(GLfloat a0, GLfloat a1) { glWindowPos2f((GLfloat)a0, (GLfloat)a1); }
-GLAPI void APIENTRY glWindowPos2fMESA(GLfloat a0, GLfloat a1) { glWindowPos2f((GLfloat)a0, (GLfloat)a1); }
 GLAPI void APIENTRY glWindowPos2fvARB(const GLfloat * a0) { glWindowPos2fv((const GLfloat *)a0); }
-GLAPI void APIENTRY glWindowPos2fvMESA(const GLfloat * a0) { glWindowPos2fv((const GLfloat *)a0); }
 GLAPI void APIENTRY glWindowPos2iARB(GLint a0, GLint a1) { glWindowPos2i((GLint)a0, (GLint)a1); }
-GLAPI void APIENTRY glWindowPos2iMESA(GLint a0, GLint a1) { glWindowPos2i((GLint)a0, (GLint)a1); }
 GLAPI void APIENTRY glWindowPos2ivARB(const GLint * a0) { glWindowPos2iv((const GLint *)a0); }
-GLAPI void APIENTRY glWindowPos2ivMESA(const GLint * a0) { glWindowPos2iv((const GLint *)a0); }
 GLAPI void APIENTRY glWindowPos2sARB(GLshort a0, GLshort a1) { glWindowPos2s((GLshort)a0, (GLshort)a1); }
-GLAPI void APIENTRY glWindowPos2sMESA(GLshort a0, GLshort a1) { glWindowPos2s((GLshort)a0, (GLshort)a1); }
 GLAPI void APIENTRY glWindowPos2svARB(const GLshort * a0) { glWindowPos2sv((const GLshort *)a0); }
-GLAPI void APIENTRY glWindowPos2svMESA(const GLshort * a0) { glWindowPos2sv((const GLshort *)a0); }
 GLAPI void APIENTRY glWindowPos3dARB(GLdouble a0, GLdouble a1, GLdouble a2) { glWindowPos3d((GLdouble)a0, (GLdouble)a1, (GLdouble)a2); }
-GLAPI void APIENTRY glWindowPos3dMESA(GLdouble a0, GLdouble a1, GLdouble a2) { glWindowPos3d((GLdouble)a0, (GLdouble)a1, (GLdouble)a2); }
 GLAPI void APIENTRY glWindowPos3dvARB(const GLdouble * a0) { glWindowPos3dv((const GLdouble *)a0); }
-GLAPI void APIENTRY glWindowPos3dvMESA(const GLdouble * a0) { glWindowPos3dv((const GLdouble *)a0); }
 GLAPI void APIENTRY glWindowPos3fARB(GLfloat a0, GLfloat a1, GLfloat a2) { glWindowPos3f((GLfloat)a0, (GLfloat)a1, (GLfloat)a2); }
-GLAPI void APIENTRY glWindowPos3fMESA(GLfloat a0, GLfloat a1, GLfloat a2) { glWindowPos3f((GLfloat)a0, (GLfloat)a1, (GLfloat)a2); }
 GLAPI void APIENTRY glWindowPos3fvARB(const GLfloat * a0) { glWindowPos3fv((const GLfloat *)a0); }
-GLAPI void APIENTRY glWindowPos3fvMESA(const GLfloat * a0) { glWindowPos3fv((const GLfloat *)a0); }
 GLAPI void APIENTRY glWindowPos3iARB(GLint a0, GLint a1, GLint a2) { glWindowPos3i((GLint)a0, (GLint)a1, (GLint)a2); }
-GLAPI void APIENTRY glWindowPos3iMESA(GLint a0, GLint a1, GLint a2) { glWindowPos3i((GLint)a0, (GLint)a1, (GLint)a2); }
 GLAPI void APIENTRY glWindowPos3ivARB(const GLint * a0) { glWindowPos3iv((const GLint *)a0); }
-GLAPI void APIENTRY glWindowPos3ivMESA(const GLint * a0) { glWindowPos3iv((const GLint *)a0); }
 GLAPI void APIENTRY glWindowPos3sARB(GLshort a0, GLshort a1, GLshort a2) { glWindowPos3s((GLshort)a0, (GLshort)a1, (GLshort)a2); }
-GLAPI void APIENTRY glWindowPos3sMESA(GLshort a0, GLshort a1, GLshort a2) { glWindowPos3s((GLshort)a0, (GLshort)a1, (GLshort)a2); }
 GLAPI void APIENTRY glWindowPos3svARB(const GLshort * a0) { glWindowPos3sv((const GLshort *)a0); }
-GLAPI void APIENTRY glWindowPos3svMESA(const GLshort * a0) { glWindowPos3sv((const GLshort *)a0); }

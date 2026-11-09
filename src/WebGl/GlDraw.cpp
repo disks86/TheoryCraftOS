@@ -543,7 +543,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
         const Texture* tx = texture_at(id);
         if (tx && tx->min_filter >= 0x2700) deriv = true;
       }
-      if (u.sampler && u.sampler <= samplers_.count() && samplers_[u.sampler - 1] && samplers_[u.sampler - 1]->min_filter >= 0x2700) deriv = true;
+      if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1] && objects_->samplers[u.sampler - 1]->min_filter >= 0x2700) deriv = true;
     }
   }
   FragmentPipeline pipe(*this, *p, target, fm, deriv);

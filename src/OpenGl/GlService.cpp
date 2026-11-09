@@ -103,17 +103,8 @@ GlStatus GlService::share_objects(uint64_t pid, uint32_t source, uint32_t contex
   Context* to = p->find(context);
   if (!from || !to) return GlStatus::InvalidHandle;
   if (from->group.get() == to->group.get()) return GlStatus::Ok;
-  if (to->thread) return GlStatus::Busy;
-  // A context that has no objects yet joins the other's group: it is made again in that group (wglShareLists must come before objects are made, as on Windows).
-  ContextConfig config;
-  config.major = to->request.major;
-  config.minor = to->request.minor;
-  config.core_profile = to->request.core_profile;
-  config.forward_compatible = to->request.forward_compatible;
-  config.debug = to->request.debug;
-  UniquePointer<GlApi> api = UniquePointer<GlApi>::make(a_, a_, *from->group, config);
-  if (!api) return GlStatus::NoMemory;
-  to->api = static_cast<UniquePointer<GlApi>&&>(api);
+  // The target keeps its state (it may even be current) and takes the source's objects.
+  to->api->join_group(*from->group);
   to->group = from->group;
   return GlStatus::Ok;
 }

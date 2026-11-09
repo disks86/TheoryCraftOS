@@ -58,7 +58,7 @@ uint64_t decode_command(GlApi& api, uint32_t op, StreamReader& rd) {
 }  // namespace
 
 GlApi::GlApi(allocators::IAllocator& allocator, ShareGroup& group, const ContextConfig& config)
-    : a_(allocator), group_(group), config_(config), gl_(allocator, true, 1, 1, engine_attributes(config), &group.objects), client_strings_(allocator), attrib_stack_(allocator), client_stack_(allocator),
+    : a_(allocator), group_(&group), config_(config), gl_(allocator, true, 1, 1, engine_attributes(config), &group.objects), client_strings_(allocator), attrib_stack_(allocator), client_stack_(allocator),
       fixed_programs_(allocator), imm_(allocator), tri_edges_(allocator), vao_names_(allocator), fbo_names_(allocator), query_names_(allocator), tf_names_(allocator), mappings_(allocator), live_syncs_(allocator) {
   gl_.desktop.active = true;
   for (uint32_t& hint : fx_.hints) hint = GL_DONT_CARE;
@@ -87,17 +87,52 @@ GlApi::GlApi(allocators::IAllocator& allocator, ShareGroup& group, const Context
   depth_range_values_[1] = 1;
 }
 
-GlApi::~GlApi() {
+void GlApi::release_internal_objects() {
   gl_.use_program(0);
   for (uint64_t i = 0; i < fixed_programs_.count(); ++i) gl_.delete_object('p', fixed_programs_[i]->program);
+  fixed_programs_.clear();
+  fixed_current_ = nullptr;
   gl_.delete_object('b', imm_buffer_);
   gl_.delete_object('b', index_buffer_);
-  for (uint32_t b : client_buffers_) if (b) gl_.delete_object('b', b);
-  for (uint32_t t : default_textures_) if (t) gl_.delete_object('t', t);
+  for (uint32_t& b : client_buffers_) { if (b) gl_.delete_object('b', b); b = 0; }
+  for (uint32_t& t : default_textures_) { if (t) gl_.delete_object('t', t); t = 0; }
   if (pixel_program_) gl_.delete_object('p', pixel_program_);
   if (pixel_texture_) gl_.delete_object('t', pixel_texture_);
   if (pixel_depth_texture_) gl_.delete_object('t', pixel_depth_texture_);
   if (pixel_buffer_) gl_.delete_object('b', pixel_buffer_);
+  pixel_program_ = pixel_texture_ = pixel_depth_texture_ = pixel_buffer_ = 0;
+  imm_buffer_ = index_buffer_ = 0;
+}
+
+GlApi::~GlApi() { release_internal_objects(); }
+
+void GlApi::join_group(ShareGroup& group) {
+  if (&group == group_) return;
+  if (list_building_) { list_building_.reset(); list_compiling_ = 0; }
+  release_internal_objects();
+  if (deleted_current_program_) gl_.delete_object('p', deleted_current_program_);
+  deleted_current_program_ = 0;
+  user_program_ = 0;
+  // Nothing of the old group stays bound: buffers, textures, samplers, renderbuffers.
+  gl_.array_buffer_ = gl_.copy_read_ = gl_.copy_write_ = gl_.pixel_pack_ = gl_.pixel_unpack_ = gl_.tf_buffer_ = gl_.uniform_buffer_ = 0;
+  for (uint32_t& b : gl_.extra_buffers_) b = 0;
+  for (auto& binding : gl_.ubo_bindings_) binding = webgl::BufferBinding();
+  for (auto& binding : gl_.ssbo_bindings_) binding = webgl::BufferBinding();
+  for (auto& binding : gl_.atomic_bindings_) binding = webgl::BufferBinding();
+  for (webgl::TextureUnit& u : gl_.units_) u = webgl::TextureUnit();
+  gl_.rb_bound_ = 0;
+  const auto clear_vao = [](webgl::Vao& v) {
+    v.element_buffer = 0;
+    for (auto& at : v.attribs) if (!at.from_client) at.buffer = 0;
+  };
+  clear_vao(gl_.default_vao_);
+  for (auto& v : gl_.vaos_) if (v) clear_vao(*v);
+  group_ = &group;
+  gl_.set_objects(&group.objects);
+  create_default_textures();
+  imm_buffer_ = gl_.create_buffer();
+  index_buffer_ = gl_.create_buffer();
+  ++fx_generation_;
 }
 
 void GlApi::bind_surface(GlSurface* surface) {
@@ -311,7 +346,14 @@ uint64_t GlApi::client_bytes_of(uint32_t op, ConstByteView c, uint32_t* pointer_
     CASE_VALUES(glPixelMapuiv, 2, arg(1), 4)
     CASE_VALUES(glPixelMapusv, 2, arg(1), 2)
     CASE_VALUES(glCallLists, 2, arg(0), arg(1) == GL_BYTE || arg(1) == GL_UNSIGNED_BYTE ? 1 : (arg(1) == GL_SHORT || arg(1) == GL_UNSIGNED_SHORT || arg(1) == GL_2_BYTES ? 2 : (arg(1) == GL_3_BYTES ? 3 : 4)))
-    case kOp_glBitmap: *pointer_word = 7; return uint64_t{(arg(0) + 7) / 8} * arg(1);
+    case kOp_glBitmap: {      // (as pixels_in_bitmap reads it: rows padded to the alignment, skipped rows and bits in front)
+      *pointer_word = 7;
+      const uint64_t w = arg(0), h = arg(1);
+      if (!w || !h) return 0;
+      const uint64_t row_length = unpack_.row_length > 0 ? static_cast<uint64_t>(unpack_.row_length) : w;
+      const uint64_t row = ((row_length + 7) / 8 + row_align - 1) / row_align * row_align;
+      return static_cast<uint64_t>(unpack_.skip_rows) * row + (h - 1) * row + (static_cast<uint64_t>(unpack_.skip_pixels) + w + 7) / 8;
+    }
     case kOp_glDrawPixels: *pointer_word = 5; return image(arg(0), arg(1), 1, arg(2), arg(3));
     case kOp_glTexImage1D: *pointer_word = 8; return image(arg(3), 1, 1, arg(5), arg(6));
     case kOp_glTexImage2D: *pointer_word = 9; return image(arg(3), arg(4), 1, arg(6), arg(7));
@@ -361,13 +403,13 @@ void GlApi::glNewList(GLuint list, GLenum mode) {
 
 void GlApi::glEndList() {
   if (!list_building_) { error(GL_INVALID_OPERATION); return; }
-  group_.lists.put(list_compiling_, list_building_);
+  group_->lists.put(list_compiling_, list_building_);
   list_building_.reset();
   list_compiling_ = 0;
 }
 
 void GlApi::list_run(uint32_t name) {
-  const SharedPointer<DisplayList>* found = group_.lists.find(name);
+  const SharedPointer<DisplayList>* found = group_->lists.find(name);
   if (!found || !*found) return;
   if (list_depth_ >= 64) return;      // GL_MAX_LIST_NESTING
   const SharedPointer<DisplayList> list = *found;      // (it may delete itself)
@@ -419,12 +461,12 @@ uint64_t GlApi::glGenLists(GLsizei range) {
   uint32_t start = 1;
   for (;;) {
     uint32_t i = 0;
-    while (i < static_cast<uint32_t>(range) && !group_.lists.contains(start + i)) ++i;
+    while (i < static_cast<uint32_t>(range) && !group_->lists.contains(start + i)) ++i;
     if (i == static_cast<uint32_t>(range)) break;
     start += i + 1;
     if (start > 0x7FFFFFFFu) { error(GL_OUT_OF_MEMORY); return 0; }
   }
-  for (int32_t i = 0; i < range; ++i) group_.lists.put(start + static_cast<uint32_t>(i), SharedPointer<DisplayList>());
+  for (int32_t i = 0; i < range; ++i) group_->lists.put(start + static_cast<uint32_t>(i), SharedPointer<DisplayList>());
   return start;
 }
 
@@ -432,12 +474,12 @@ void GlApi::glDeleteLists(GLuint list, GLsizei range) {
   if (range < 0) { error(GL_INVALID_VALUE); return; }
   for (int64_t i = 0; i < range; ++i) {
     const uint32_t name = list + static_cast<uint32_t>(i);
-    group_.lists.remove(name);
+    group_->lists.remove(name);
   }
 }
 
 uint64_t GlApi::glIsList(GLuint list) {
-  return group_.lists.contains(list) ? 1 : 0;
+  return group_->lists.contains(list) ? 1 : 0;
 }
 
 }  // namespace opengl

@@ -381,6 +381,7 @@ add_executable(BOOTX64
   src/OpenGl/GlApiTexture.cpp
   src/OpenGl/GlService.cpp
   src/OpenGl/GlSurface.cpp
+  src/OpenGl/GlslDesktop.cpp
   src/OpenGl/WindowsGl.cpp
   src/OpenGl/generated/GlApiVariants.cpp
   src/Browser/DomBindingsServiceWorker.cpp
@@ -1199,6 +1200,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_oleaut32 advapi32)      # (type library registration in the registry)
   set(WINDOWS_IMPORTS_imm32 win32u)      # (the services of win32k: input contexts, hot keys)
   set(WINDOWS_IMPORTS_user32 win32u gdi32)      # (the window manager of win32k: classes, windows, messages)
+  set(WINDOWS_IMPORTS_opengl32 gdi32 user32)      # (pixel formats, SetDIBitsToDevice and glyphs of gdi32; WindowFromDC and the client size of user32)
   set(WINDOWS_IMPORTS_vulkan-1 gdi32 user32)      # (the D3DKMT services of the kernel-mode Direct3D layer, the window size)
   set(WINDOWS_IMPORTS_crypt32 advapi32 bcrypt)      # (DPAPI: the per-user key in the registry, AES and HMAC of bcrypt)
   set(WINDOWS_IMPORTS_secur32 advapi32)      # (GetUserNameExW: the user name of the token)

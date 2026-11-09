@@ -149,7 +149,7 @@ void GlContext::sample(const shader::SampleRequest& rq, uint32_t out[4]) {
   if (!t) return;
   SamplerObj tmp;
   const SamplerObj* so = &tmp;
-  if (u.sampler && u.sampler <= samplers_.count() && samplers_[u.sampler - 1]) so = samplers_[u.sampler - 1].get();
+  if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = objects_->samplers[u.sampler - 1].get();
   else {
     tmp.min_filter = t->min_filter; tmp.mag_filter = t->mag_filter; tmp.wrap_s = t->wrap_s; tmp.wrap_t = t->wrap_t; tmp.wrap_r = t->wrap_r;
     tmp.compare_mode = t->compare_mode; tmp.compare_func = t->compare_func; tmp.min_lod = t->min_lod; tmp.max_lod = t->max_lod;

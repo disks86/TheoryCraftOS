@@ -85,6 +85,11 @@ uint64_t gl_stream_submit(const uint32_t* words, uint32_t count) {
 
 #include "OpenGl/generated/GlEntries.inc"
 
+// (what the library defines around the generated encoders: CLIENT_WRAPPED in scripts/gen-opengl.py)
+GLenum glGetError(void) { return tcos_glGetError(); }
+void glFlush(void) { tcos_glFlush(); }
+void glFinish(void) { tcos_glFinish(); }
+
 constexpr uint32_t W = 64, H = 64;
 
 struct Pixel { uint8_t r, g, b, a; };
@@ -459,6 +464,19 @@ static void test_pixels() {
   float raster[4] = {};
   glGetFloatv(GL_CURRENT_RASTER_POSITION, raster);
   CHECK(raster[0] == 50 && raster[1] == 40);
+  // the same bitmap in a display list, rows padded to 4 bytes as the default alignment has them (what wglUseFontBitmaps makes)
+  const uint8_t padded[8 * 4] = {0xFF, 0, 0, 0, 0x81, 0, 0, 0, 0x81, 0, 0, 0, 0x81, 0, 0, 0, 0x81, 0, 0, 0, 0x81, 0, 0, 0, 0x81, 0, 0, 0, 0xFF, 0, 0, 0};
+  const GLuint glyph = glGenLists(1);
+  glNewList(glyph, GL_COMPILE);
+  glBitmap(8, 8, 0, 0, 9, 0, padded);
+  glEndList();
+  glRasterPos2i(50, 50);
+  glCallList(glyph);
+  glCallList(glyph);
+  glGetFloatv(GL_CURRENT_RASTER_POSITION, raster);
+  CHECK(raster[0] == 68);
+  CHECK(near(pixel(59, 50), 255, 255, 0));
+  CHECK(glGetError() == GL_NO_ERROR);
   // copy pixels
   glRasterPos2i(0, 40);
   glCopyPixels(8, 8, 4, 4, GL_COLOR);
@@ -600,6 +618,87 @@ static void test_glsl_program() {
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
+static GLuint build(const char* vs, const char* fs) {
+  const GLuint v = glCreateShader(GL_VERTEX_SHADER), s = glCreateShader(GL_FRAGMENT_SHADER);
+  glShaderSource(v, 1, &vs, nullptr);
+  glShaderSource(s, 1, &fs, nullptr);
+  glCompileShader(v);
+  glCompileShader(s);
+  GLint ok = 0;
+  char log[512] = {};
+  glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
+  if (!ok) { glGetShaderInfoLog(v, sizeof(log), nullptr, log); printf("vertex shader: %s\n", log); }
+  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  if (!ok) { glGetShaderInfoLog(s, sizeof(log), nullptr, log); printf("fragment shader: %s\n", log); }
+  const GLuint p = glCreateProgram();
+  glAttachShader(p, v);
+  glAttachShader(p, s);
+  glLinkProgram(p);
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  if (!ok) { glGetProgramInfoLog(p, sizeof(log), nullptr, log); printf("link: %s\n", log); }
+  glDeleteShader(v);
+  glDeleteShader(s);
+  return ok ? p : 0;
+}
+
+// Desktop GLSL with the compatibility built-ins, fed by the fixed-function state.
+static void test_desktop_glsl() {
+  Fixture f;
+  const GLuint p = build("#version 120\nvarying vec4 tint;\nvoid main(){ gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex; gl_FrontColor = gl_Color; tint = vec4(gl_MultiTexCoord0.xy, 0.0, 1.0); }\n",
+                         "#version 120\nvarying vec4 tint;\nvoid main(){ gl_FragColor = gl_Color + tint; }\n");
+  CHECK(p != 0);
+  glUseProgram(p);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glColor3f(1, 0, 0);
+  glTexCoord2f(0, 1);
+  glBegin(GL_QUADS); glVertex2f(0, 0); glVertex2f(32, 0); glVertex2f(32, 32); glVertex2f(0, 32); glEnd();
+  CHECK(near(pixel(10, 10), 255, 255, 0));      // the colour plus the texture coordinate's green
+  CHECK(near(pixel(50, 50), 0, 0, 0));
+  glUseProgram(0);
+  glDeleteProgram(p);
+  // ftransform() and no #version at all (1.10)
+  const GLuint q = build("void main(){ gl_Position = ftransform(); }\n", "void main(){ gl_FragColor = vec4(0.0, 0.0, 1.0, 1.0); }\n");
+  CHECK(q != 0);
+  glUseProgram(q);
+  glRectf(32, 32, 64, 64);
+  CHECK(near(pixel(50, 50), 0, 0, 255));
+  glUseProgram(0);
+  glDeleteProgram(q);
+  // 3.30 core style: explicit locations, own outputs
+  const GLuint r = build("#version 330 core\nlayout(location = 2) in vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n",
+                         "#version 330 core\nout vec4 color;\nuniform sampler2D unused;\nvoid main(){ color = vec4(0.0, 1.0, 1.0, 1.0); }\n");
+  CHECK(r != 0);
+  glUseProgram(r);
+  const float tri[] = {-1, -1, 1, -1, -1, 1};
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, tri);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glDisableVertexAttribArray(2);
+  CHECK(near(pixel(5, 5), 0, 255, 255));
+  glUseProgram(0);
+  glDeleteProgram(r);
+  // 1.30 with gl_FragColor and texture2D
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  const uint8_t texel[4] = {200, 100, 50, 255};
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texel);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  const GLuint t = build("#version 130\nvoid main(){ gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }\n",
+                         "#version 130\nuniform sampler2D tex;\nvoid main(){ gl_FragColor = texture2D(tex, gl_TexCoord[0].st); }\n");
+  CHECK(t != 0);
+  glUseProgram(t);
+  glUniform1i(glGetUniformLocation(t, "tex"), 0);
+  glRectf(0, 0, 64, 64);
+  CHECK(near(pixel(30, 30), 200, 100, 50));
+  glUseProgram(0);
+  glDeleteProgram(t);
+  glDeleteTextures(1, &tex);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
 static void test_framebuffer_object() {
   Fixture f;
   GLuint fbo = 0, tex = 0;
@@ -654,6 +753,35 @@ static void test_core_profile() {
   CHECK(e && strncmp(e, "GL_", 3) == 0);
 }
 
+// wglShareLists on a context that already has state: it keeps it and sees the other context's objects.
+static void test_join_group() {
+  Fixture first;
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  const GLuint list = glGenLists(1);
+  glNewList(list, GL_COMPILE);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEndList();
+  {
+    Fixture second;
+    glClearColor(0.25f, 0.5f, 0.75f, 1);
+    glEnable(GL_LIGHTING);
+    CHECK(!glIsTexture(tex) && !glIsList(list));
+    second.api.join_group(first.group);
+    CHECK(glIsTexture(tex) && glIsList(list));
+    float c[4] = {};
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, c);
+    CHECK(c[0] == 0.25f && c[2] == 0.75f);
+    CHECK(glIsEnabled(GL_LIGHTING));
+    glCallList(list);
+    CHECK(near(pixel(1, 1), 64, 128, 191, 2));
+    CHECK(glGetError() == GL_NO_ERROR);
+  }
+  g_api = &first.api;
+  CHECK(glIsTexture(tex));
+}
+
 static void test_service() {
   GlService service(g_alloc);
   ContextRequest r;
@@ -691,6 +819,14 @@ static void test_service() {
   uint32_t w = 0, h = 0;
   CHECK(service.read_front(1, 0x100, ByteView(front, sizeof(front)), 32, &w, &h) == GlStatus::Ok);
   CHECK(front[0] == 0 && front[2] == 255);      // B, G, R, A
+  // a current context with state of its own takes another's objects and keeps its state
+  uint32_t c = 0;
+  r.share = 0;
+  CHECK(service.create_context(1, r, &c) == GlStatus::Ok);
+  CHECK(service.make_current(1, 10, c, s) == GlStatus::Ok);
+  CHECK(service.share_objects(1, a, c) == GlStatus::Ok);
+  CHECK(service.context_count(1) == 3);
+  CHECK(service.delete_context(1, c) == GlStatus::Ok);
   CHECK(service.context_count(1) == 2);
   CHECK(service.delete_context(1, b) == GlStatus::Ok);
   CHECK(service.delete_context(1, b) == GlStatus::InvalidHandle);
@@ -733,9 +869,11 @@ int main() {
   test_state_stacks_and_get();
   test_selection_and_feedback();
   test_glsl_program();
+  test_desktop_glsl();
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();
+  test_join_group();
   test_service();
   test_bad_streams();
   printf("opengl: %d checks, %d failed\n", g_checks, g_failed);

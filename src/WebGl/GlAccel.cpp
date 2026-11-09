@@ -48,7 +48,7 @@ bool GlContext::hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sample
   const Texture* t = texture_at(u.tex2d);
   if (!t || t->target != 0x0DE1 || t->base_level != 0) return false;
   SamplerObj so;
-  if (u.sampler && u.sampler <= samplers_.count() && samplers_[u.sampler - 1]) so = *samplers_[u.sampler - 1];
+  if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
   else {
     so.min_filter = t->min_filter;
     so.mag_filter = t->mag_filter;

@@ -82,21 +82,26 @@ uint64_t NtGdiSetColorAdjustment(Call& c) {
 
 uint64_t NtGdiUpdateColors(Call& c) { return dc_arg(c, c.arg32(0)) ? 1 : 0; }
 
-// ---- Pixel formats: the display offers four 32-bit RGBA formats (double or single buffered, with and without a depth buffer).
-constexpr uint32_t kPixelFormats = 4;
+// ---- Pixel formats: 32-bit BGRA formats drawn by the kernel's OpenGL (src/OpenGl). 1..4 windows: single or double buffered (odd single), without or with a depth and stencil
+// buffer (3 and up); 5 and 6 bitmaps (memory device contexts), single buffered, without and with depth. All have an accumulation buffer.
+constexpr uint32_t kPixelFormats = 6;
 
 void describe_format(uint32_t index, uint8_t out[40]) {
   for (int i = 0; i < 40; ++i) out[i] = 0;
-  const bool dbl = (index & 1) == 0, depth = index > 2;
+  const bool bitmap = index >= 5;
+  const bool dbl = !bitmap && (index & 1) == 0, depth = bitmap ? index == 6 : index > 2;
   auto p16 = [&](int o, uint32_t v) { out[o] = uint8_t(v); out[o + 1] = uint8_t(v >> 8); };
   auto p32 = [&](int o, uint32_t v) { for (int k = 0; k < 4; ++k) out[o + k] = uint8_t(v >> (8 * k)); };
   p16(0, 40); p16(2, 1);
-  p32(4, 0x4 | 0x10 | 0x20 | (dbl ? 0x1u : 0u));      // PFD_DRAW_TO_WINDOW | PFD_SUPPORT_GDI | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER
+  // PFD_DRAW_TO_WINDOW 0x4 / PFD_DRAW_TO_BITMAP 0x8, PFD_SUPPORT_GDI 0x10 (not with double buffering), PFD_SUPPORT_OPENGL 0x20, PFD_DOUBLEBUFFER 0x1
+  p32(4, (bitmap ? 0x8u : 0x4u) | 0x20 | (dbl ? 0x1u : 0x10u));
   out[8] = 0;      // PFD_TYPE_RGBA
-  out[9] = 32;
-  out[10] = 8; out[11] = 16; out[12] = 8; out[13] = 8; out[14] = 8; out[15] = 0;
-  out[16] = 8; out[17] = 24;
-  out[24] = depth ? 24 : 0; out[25] = depth ? 8 : 0;
+  out[9] = 32;      // cColorBits
+  out[10] = 8; out[11] = 16; out[12] = 8; out[13] = 8; out[14] = 8; out[15] = 0;      // red, green, blue bits and shifts
+  out[16] = 8; out[17] = 24;      // alpha
+  out[18] = 64; out[19] = 16; out[20] = 16; out[21] = 16; out[22] = 16;      // accumulation
+  out[23] = depth ? 24 : 0;      // cDepthBits
+  out[24] = depth ? 8 : 0;       // cStencilBits
 }
 
 uint64_t NtGdiDescribePixelFormat(Call& c) {
@@ -115,7 +120,8 @@ uint64_t NtGdiSetPixelFormat(Call& c) {
   Dc* dc = dc_arg(c, c.arg32(0));
   const int32_t format = c.argi(1);
   if (!dc) return 0;
-  if (format < 1 || uint32_t(format) > kPixelFormats || dc->pixel_format != 0) return c.fail(kErrorInvalidParameter);
+  if (format < 1 || uint32_t(format) > kPixelFormats) return c.fail(kErrorInvalidParameter);
+  if (dc->pixel_format != 0) return dc->pixel_format == uint32_t(format) ? 1 : c.fail(kErrorInvalidParameter);      // (set once; the same one again is fine)
   dc->pixel_format = uint32_t(format);
   return 1;
 }

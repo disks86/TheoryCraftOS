@@ -109,6 +109,10 @@ class GlApi {
   // Runs a stream of commands. Returns the result of the last command that has one. Bad streams stop at the first thing that makes no sense.
   uint64_t execute(ConstByteView stream, IClientMemory& memory);
 
+  // wglShareLists: the context leaves its share group for `group`, keeping its own state (a context that had made objects of its own loses its names for them, as GL allows
+  // only for a context without objects).
+  void join_group(ShareGroup& group);
+
   // The window surface drawn to (null: none, draws go nowhere and reads give nothing). The first surface a context gets sets its viewport and scissor, as GL says.
   void bind_surface(GlSurface* surface);
   GlSurface* surface() const { return surface_; }
@@ -127,7 +131,7 @@ class GlApi {
 
   // --- GlApiCore.cpp
   allocators::IAllocator& a_;
-  ShareGroup& group_;
+  ShareGroup* group_;
   ContextConfig config_;
   webgl::GlContext gl_;
   IClientMemory* memory_ = nullptr;
@@ -298,6 +302,7 @@ class GlApi {
   // Textures
   uint32_t default_textures_[11] = {};
   void create_default_textures();
+  void release_internal_objects();      // what this context made in its share group for itself
   static uint32_t default_texture_index(uint32_t target);
   webgl::Texture* texture_for_target(uint32_t target, uint32_t* face);
   void store_floats(webgl::Image& image, uint32_t xo, uint32_t yo, uint32_t zo, uint32_t w, uint32_t h, uint32_t d, ConstByteView rgba, bool srgb_source);
@@ -330,6 +335,8 @@ class GlApi {
   void copy_buffer_named(uint32_t from, uint32_t to, int64_t ro, int64_t wo, int64_t size);
   void buffer_param_get(uint32_t object, uint32_t pname, int64_t* out);
   void bind_range(uint32_t target, uint32_t index, uint32_t buffer, uint64_t offset, uint64_t size);
+  bool framebuffer_parameter(uint32_t object, uint32_t pname, bool draw_read, int32_t* out);
+  int32_t fbo_defaults_[5] = {0, 0, 0, 0, 0};
   void attach_texture(uint32_t target, uint32_t attachment, uint32_t textarget, uint32_t texture, int32_t level, int32_t layer);
   void flush_to_surface();
   void clear_accum();
@@ -346,6 +353,21 @@ class GlApi {
   void with_program(uint32_t name, void (GlApi::*)(), bool*);
   uint32_t begin_program_uniform(uint32_t program);
   void end_program_uniform(uint32_t saved);
+
+  bool object_parameter(uint32_t obj, uint32_t pname, int32_t* out);
+  bool sampler_get(uint32_t sampler, uint32_t pname, double* out, uint32_t* n);
+  // A client memory with one word in it, for answering a query through another query's code.
+  class ProbeMemory final : public IClientMemory {
+   public:
+    static constexpr uint64_t kAddress = 0x1000;
+    explicit ProbeMemory(int32_t* word) : word_(word) {}
+    bool read(uint64_t address, ByteView out) override { return address == kAddress && out.size() <= 4 && (__builtin_memcpy(out.data(), word_, out.size()), true); }
+    bool write(uint64_t address, ConstByteView data) override { return address == kAddress && data.size() <= 4 && (__builtin_memcpy(word_, data.data(), data.size()), true); }
+    uint64_t allocate(uint64_t) override { return 0; }
+    void release(uint64_t, uint64_t) override {}
+   private:
+    int32_t* word_;
+  };
 
   // glGet
   uint64_t extensions_address_ = 0;

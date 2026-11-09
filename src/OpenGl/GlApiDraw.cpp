@@ -232,6 +232,20 @@ bool GlApi::upload_client_arrays(int64_t lowest, int64_t highest, uint32_t insta
 // Selects the program: the user's, or the fixed-function one for this state; loads what the program needs from the state.
 bool GlApi::prepare_draw(uint32_t, int64_t lowest, int64_t highest, uint32_t instances) {
   webgl::DesktopState& ds = gl_.desktop;
+  {
+    // Values for arrays that are not enabled.
+    webgl::Vao* vao = gl_.current_vao_ptr();
+    const auto current = [&](uint32_t attr, const float* v, uint32_t n) {
+      webgl::VertexAttrib& at = vao->attribs[attr];
+      for (uint32_t i = 0; i < 4; ++i) at.cur_f[i] = i < n ? v[i] : (i == 3 ? 1.0f : 0.0f);
+      at.cur_is_int = false;
+    };
+    current(kAttrNormal, fx_.current_normal, 3);
+    current(kAttrColor, fx_.current_color, 4);
+    current(kAttrSecondary, fx_.current_secondary, 4);
+    current(kAttrFog, &fx_.current_fog, 1);
+    for (uint32_t i = 0; i < kMaxTexUnits; ++i) current(kAttrTex0 + i, fx_.current_tex[i], 4);
+  }
   if (user_program_ != 0) {
     gl_.program_ = user_program_;
     fixed_current_ = nullptr;
@@ -257,19 +271,7 @@ bool GlApi::prepare_draw(uint32_t, int64_t lowest, int64_t highest, uint32_t ins
       if (key.tex_dim[i] == kDimFixed1D) ds.ff_1d_mask |= 1u << i;
       if (key.tex_dim[i] == kDimFixedRect) ds.ff_rect_mask |= 1u << i;
     }
-    // Values for arrays that are not enabled.
-    webgl::Vao* vao = gl_.current_vao_ptr();
-    const auto current = [&](uint32_t attr, const float* v, uint32_t n) {
-      webgl::VertexAttrib& at = vao->attribs[attr];
-      for (uint32_t i = 0; i < 4; ++i) at.cur_f[i] = i < n ? v[i] : (i == 3 ? 1.0f : 0.0f);
-      at.cur_is_int = false;
-    };
-    current(kAttrNormal, fx_.current_normal, 3);
-    current(kAttrColor, fx_.current_color, 4);
-    current(kAttrSecondary, fx_.current_secondary, 4);
-    current(kAttrFog, &fx_.current_fog, 1);
-    for (uint32_t i = 0; i < kMaxTexUnits; ++i) current(kAttrTex0 + i, fx_.current_tex[i], 4);
-    const webgl::VertexAttrib& vertex = vao->attribs[kAttrVertex];
+    const webgl::VertexAttrib& vertex = gl_.current_vao_ptr()->attribs[kAttrVertex];
     if (!vertex.enabled) return false;      // without a vertex array the compatibility profile draws nothing
   }
   if (!upload_client_arrays(lowest, highest, instances)) return false;
@@ -489,5 +491,17 @@ bool GlApi::list_record_draw(uint32_t op, ConstByteView command) {
   // Evaluated by running it into a temporary immediate buffer is not possible without drawing, so the rows are written as the commands they are made of.
   return list_expand_draw(op, command);
 }
+
+}  // namespace opengl
+
+namespace opengl {
+
+// GL_EXT_vertex_array: the count is a hint.
+void GlApi::glVertexPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei, UserPtr pointer) { glVertexPointer(size, type, stride, pointer); }
+void GlApi::glNormalPointerEXT(GLenum type, GLsizei stride, GLsizei, UserPtr pointer) { glNormalPointer(type, stride, pointer); }
+void GlApi::glColorPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei, UserPtr pointer) { glColorPointer(size, type, stride, pointer); }
+void GlApi::glIndexPointerEXT(GLenum type, GLsizei stride, GLsizei, UserPtr pointer) { glIndexPointer(type, stride, pointer); }
+void GlApi::glTexCoordPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei, UserPtr pointer) { glTexCoordPointer(size, type, stride, pointer); }
+void GlApi::glEdgeFlagPointerEXT(GLsizei stride, GLsizei, UserPtr pointer) { glEdgeFlagPointer(stride, pointer); }
 
 }  // namespace opengl

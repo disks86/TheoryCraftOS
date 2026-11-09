@@ -358,7 +358,7 @@ bool GlContext::program_status(uint32_t id, uint32_t pname, double* out) {
 }
 
 StringView GlContext::program_log(uint32_t id) { ProgramObj* p = program_at(id); return p ? p->log.view() : StringView(); }
-const ProgramObj* GlContext::program(uint32_t id) const { return id && id <= programs_.count() ? programs_[id - 1].get() : nullptr; }
+const ProgramObj* GlContext::program(uint32_t id) const { return id && id <= objects_->programs.count() ? objects_->programs[id - 1].get() : nullptr; }
 
 void GlContext::bind_attrib_location(uint32_t program, uint32_t index, StringView name) {
   ProgramObj* p = program_at(program);

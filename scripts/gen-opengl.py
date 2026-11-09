@@ -40,11 +40,14 @@ CALLBACKS = {"GLDEBUGPROC", "GLDEBUGPROCARB", "GLDEBUGPROCKHR", "GLDEBUGPROCAMD"
 ELEMENT_BYTES = {"GLbyte": 1, "GLubyte": 1, "GLboolean": 1, "GLchar": 1, "GLshort": 2, "GLushort": 2, "GLhalf": 2, "GLhalfNV": 2, "GLint": 4, "GLuint": 4, "GLenum": 4, "GLsizei": 4, "GLfloat": 4,
                  "GLclampf": 4, "GLfixed": 4, "GLdouble": 8, "GLclampd": 8, "GLint64": 8, "GLuint64": 8}
 # These keep the pointer rather than read through it, so they can wait in the stream like a scalar.
-POINTER_STORED = {"glVertexPointer", "glNormalPointer", "glColorPointer", "glTexCoordPointer", "glIndexPointer", "glEdgeFlagPointer", "glSecondaryColorPointer", "glFogCoordPointer", "glVertexAttribPointer",
+POINTER_STORED = {"glVertexPointer", "glNormalPointer", "glColorPointer", "glTexCoordPointer", "glIndexPointer", "glEdgeFlagPointer", "glVertexPointerEXT", "glNormalPointerEXT", "glColorPointerEXT", "glTexCoordPointerEXT", "glIndexPointerEXT", "glEdgeFlagPointerEXT", "glSecondaryColorPointer", "glFogCoordPointer", "glVertexAttribPointer",
                   "glVertexAttribIPointer", "glVertexAttribLPointer", "glFeedbackBuffer", "glSelectBuffer"}
 # The last argument to these is sent at once because they can read client arrays: an array may change the moment the call returns.
 ALWAYS_SYNC = {"glDrawArrays", "glDrawArraysInstanced", "glDrawArraysInstancedBaseInstance", "glArrayElement", "glMultiDrawArrays", "glDrawTransformFeedback", "glFlush", "glFinish", "glEndList", "glCallList",
                "glUnmapBuffer", "glUnmapNamedBuffer"}
+
+# Commands whose user-mode side does more than send the command (opengl32.dll defines them, calling tcos_<name>): a flush shows a single-buffered window.
+CLIENT_WRAPPED = {"glFlush", "glFinish", "glGetError"}
 
 class Param:
     def __init__(self, node, index):
@@ -414,7 +417,7 @@ def c_param(p):
 
 def stub_body(c, op):
     words = 1 + sum(words_of(p) for p in c.params)
-    out = ["  uint32_t *s = gl_stream_begin(%d, %d);\n" % (op + 1, words)]
+    out = [("  uint32_t *s = gl_stream_begin(%d, %d);\n" if c.params else "  (void)gl_stream_begin(%d, %d);\n") % (op + 1, words)]
     at = 1
     for p in c.params:
         n = p.inline_count()
@@ -451,7 +454,10 @@ def generate_user(commands, ops, aliases):
     for name in ops:
         c = commands[name]
         args = ", ".join(c_param(p) for p in c.params) or "void"
-        out.append("GLAPI %s APIENTRY %s(%s) {\n%s}\n" % (c.ret, name, args, stub_body(c, op_of[name])))
+        if name in CLIENT_WRAPPED:      # the library defines the command itself around this encoder
+            out.append("static %s tcos_%s(%s) {\n%s}\n" % (c.ret, name, args, stub_body(c, op_of[name])))
+        else:
+            out.append("GLAPI %s APIENTRY %s(%s) {\n%s}\n" % (c.ret, name, args, stub_body(c, op_of[name])))
         procs.append(name)
     for name in sorted(aliases):
         target = commands[aliases[name]]
@@ -474,7 +480,7 @@ def generate_stub_list(defined):
     text = open(full, encoding="utf-8").read()
     lines = text.split("\n")
     kept = []
-    own = set(defined) | set(re.findall(r"\b(wgl\w+|Glmf\w+|GlmfPlay\w*|glDebugEntry)\b", own_dll_source()))
+    own = set(defined) | set(own_dll_source().split())
     for line in lines:
         m = re.match(r"X\((\w+)\)", line)
         if m and m.group(1) in own:
@@ -489,7 +495,7 @@ def own_dll_source():
     for f in sorted(os.listdir(d)):
         if f.endswith((".c", ".inc")):
             text += open(os.path.join(d, f), encoding="utf-8").read()
-    return " ".join(re.findall(r"WINGDIAPI\s+[\w \*]+?\s+WINAPI\s+(\w+)", text))
+    return " ".join(re.findall(r"\b(?:WINAPI|APIENTRY)\s+(\w+)\s*\(", text))
 
 def main():
     commands, versions, extensions, removed = load()
@@ -514,6 +520,34 @@ def main():
     for name, c in commands.items():
         if c.alias and canonical(commands, name) in implemented and name not in implemented:
             aliases[name] = canonical(commands, name)
+    # Extension versions of core commands the registry does not call aliases (EXT_framebuffer_object's, say) but that take the same arguments: the core command serves them.
+    for name, c in commands.items():
+        if name in implemented or name in aliases:
+            continue
+        m = re.match(r"^(gl\w+?)(ARB|EXT|KHR|OES|APPLE|NV)$", name)
+        if m and m.group(1) in implemented and len(commands[m.group(1)].params) == len(c.params):
+            aliases[name] = m.group(1)
+    # Half an extension misleads a program that looks for one of its commands and then calls another: an extension whose commands are not all there loses its own names.
+    have = set(ops) | set(aliases)
+    in_core = set()
+    for v in versions.values():
+        in_core |= v
+    complete = set()
+    for e, names in extensions.items():
+        if all(n in have for n in names):
+            complete |= names
+    for e, names in extensions.items():
+        if any(n not in have for n in names):
+            for n in names:
+                if n in aliases and n not in in_core and n not in complete:
+                    del aliases[n]
+    # Every extension the kernel says it has must have all its commands.
+    advertised = re.findall(r'"(GL_[A-Za-z0-9_]+)"', open(os.path.join(ROOT, "src/OpenGl/GlApiGet.cpp"), encoding="utf-8").read())
+    have = set(ops) | set(aliases)
+    for e in advertised:
+        missing = sorted(n for n in extensions.get(e, ()) if n not in have)
+        if missing:
+            print("advertised %s lacks: %s" % (e, " ".join(missing)))
     generate_enums()
     generate_kernel(commands, ops, versions, removed)
     defined = generate_user(commands, ops, aliases)

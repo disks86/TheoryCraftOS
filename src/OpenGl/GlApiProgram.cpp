@@ -19,6 +19,7 @@
 // Shaders, programs and uniforms over the engine's. Shaders and programs share a name space, as GL says; the current program is kept here because the engine's "current program" is
 // also whatever the next draw uses, which may be a fixed-function one.
 #include "OpenGl/GlApi.hpp"
+#include "OpenGl/GlslDesktop.hpp"
 #include "OpenGl/generated/GlEnums.inc"
 
 namespace opengl {
@@ -30,19 +31,19 @@ bool is_shader_type(uint32_t type) {
 }  // namespace
 
 uint32_t GlApi::shader_object(uint32_t name) const {
-  const uint32_t object = group_.shaders_and_programs.object(name);
+  const uint32_t object = group_->shaders_and_programs.object(name);
   return (object & kProgramObjectBit) ? 0 : object;
 }
 uint32_t GlApi::program_object(uint32_t name) const {
-  const uint32_t object = group_.shaders_and_programs.object(name);
+  const uint32_t object = group_->shaders_and_programs.object(name);
   return (object & kProgramObjectBit) ? object & ~kProgramObjectBit : 0;
 }
 
 uint64_t GlApi::glCreateShader(GLenum type) {
   if (!is_shader_type(type)) { error(GL_INVALID_ENUM); return 0; }
   const uint32_t object = gl_.create_shader(type);
-  const uint32_t name = group_.shaders_and_programs.generate();
-  group_.shaders_and_programs.set(name, object);
+  const uint32_t name = group_->shaders_and_programs.generate();
+  group_->shaders_and_programs.set(name, object);
   return name;
 }
 void GlApi::glDeleteShader(GLuint shader) {
@@ -50,14 +51,14 @@ void GlApi::glDeleteShader(GLuint shader) {
   const uint32_t object = shader_object(shader);
   if (!object) { error(GL_INVALID_VALUE); return; }
   gl_.delete_object('s', object);
-  group_.shaders_and_programs.erase(shader);
+  group_->shaders_and_programs.erase(shader);
 }
 uint64_t GlApi::glIsShader(GLuint shader) { return shader_object(shader) != 0; }
 
 uint64_t GlApi::glCreateProgram() {
   const uint32_t object = gl_.create_program();
-  const uint32_t name = group_.shaders_and_programs.generate();
-  group_.shaders_and_programs.set(name, object | kProgramObjectBit);
+  const uint32_t name = group_->shaders_and_programs.generate();
+  group_->shaders_and_programs.set(name, object | kProgramObjectBit);
   return name;
 }
 void GlApi::glDeleteProgram(GLuint program) {
@@ -66,7 +67,7 @@ void GlApi::glDeleteProgram(GLuint program) {
   if (!object) { error(GL_INVALID_VALUE); return; }
   if (user_program_ == object) deleted_current_program_ = object;      // lives on while it is current
   else gl_.delete_object('p', object);
-  group_.shaders_and_programs.erase(program);
+  group_->shaders_and_programs.erase(program);
 }
 uint64_t GlApi::glIsProgram(GLuint program) { return program_object(program) != 0; }
 
@@ -84,7 +85,12 @@ void GlApi::glShaderSource(GLuint shader, GLsizei count, UserPtr string, UserPtr
     if (!read_string(UserPtr{at}, n, &part)) { error(GL_INVALID_VALUE); return; }
     if (!whole.append(part.view())) { error(GL_OUT_OF_MEMORY); return; }
   }
-  gl_.shader_source(object, whole.view());
+  // Desktop GLSL goes to the front end as GLSL ES (GlslDesktop.hpp).
+  const webgl::ShaderObj* so = gl_.shader_at(object);
+  String translated(a_);
+  uint32_t uses = 0;
+  if (so && translate_desktop_glsl(whole.view(), so->type == GL_VERTEX_SHADER, &translated, &uses)) gl_.shader_source(object, translated.view());
+  else gl_.shader_source(object, whole.view());
 }
 void GlApi::glCompileShader(GLuint shader) {
   const uint32_t object = shader_object(shader);
@@ -104,6 +110,12 @@ void GlApi::glDetachShader(GLuint program, GLuint shader) {
 void GlApi::glLinkProgram(GLuint program) {
   const uint32_t p = program_object(program);
   if (!p) { error(GL_INVALID_VALUE); return; }
+  // The compatibility attributes sit where the fixed-function arrays feed them (unless the program bound them itself).
+  static constexpr struct { const char* name; uint32_t attr; } kCompat[] = {
+      {"tcos_Vertex", kAttrVertex}, {"tcos_Normal", kAttrNormal}, {"tcos_Color", kAttrColor}, {"tcos_SecondaryColor", kAttrSecondary}, {"tcos_FogCoord", kAttrFog},
+      {"tcos_MultiTexCoord0", kAttrTex0}, {"tcos_MultiTexCoord1", kAttrTex0 + 1}, {"tcos_MultiTexCoord2", kAttrTex0 + 2}, {"tcos_MultiTexCoord3", kAttrTex0 + 3},
+      {"tcos_MultiTexCoord4", kAttrTex0 + 4}, {"tcos_MultiTexCoord5", kAttrTex0 + 5}, {"tcos_MultiTexCoord6", kAttrTex0 + 6}, {"tcos_MultiTexCoord7", kAttrTex0 + 7}};
+  for (const auto& c : kCompat) gl_.bind_attrib_location(p, c.attr, c.name);
   gl_.link_program(p);
 }
 void GlApi::glValidateProgram(GLuint program) {
@@ -221,7 +233,7 @@ void GlApi::glGetAttachedShaders(GLuint program, GLsizei maxCount, UserPtr count
   const uint32_t n = gl_.attached_shaders(object, found, 8);
   int32_t written = 0;
   for (uint32_t i = 0; i < n && written < maxCount; ++i) {
-    const uint32_t name = group_.shaders_and_programs.name_of(found[i]);
+    const uint32_t name = group_->shaders_and_programs.name_of(found[i]);
     if (!write_values(shaders.plus(uint64_t{static_cast<uint32_t>(written)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
     ++written;
   }
@@ -321,7 +333,7 @@ bool GlApi::vertex_attrib_get(uint32_t index, uint32_t pname, double* out, uint3
     case GL_VERTEX_ATTRIB_ARRAY_NORMALIZED: *out = at.normalized; return true;
     case GL_VERTEX_ATTRIB_ARRAY_INTEGER: *out = at.integer; return true;
     case GL_VERTEX_ATTRIB_ARRAY_DIVISOR: *out = at.divisor; return true;
-    case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: *out = at.from_client ? 0 : group_.buffers.name_of(at.buffer); return true;
+    case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: *out = at.from_client ? 0 : group_->buffers.name_of(at.buffer); return true;
     case GL_CURRENT_VERTEX_ATTRIB:
       *count = 4;
       for (int i = 0; i < 4; ++i) out[i] = at.cur_is_int ? at.cur_i[i] : at.cur_f[i];
@@ -461,5 +473,75 @@ void GlApi::glTransformFeedbackVaryings(GLuint program, GLsizei count, UserPtr v
 }
 void GlApi::glBeginTransformFeedback(GLenum primitiveMode) { gl_.program_ = user_program_; gl_.begin_transform_feedback(primitiveMode); }
 void GlApi::glEndTransformFeedback() { gl_.end_transform_feedback(); }
+
+}  // namespace opengl
+
+namespace opengl {
+
+// --- GL_ARB_shader_objects: handles are the shared names of shaders and programs.
+
+void GlApi::glDeleteObjectARB(GLhandleARB obj) {
+  if (program_object(obj)) glDeleteProgram(obj);
+  else if (shader_object(obj)) glDeleteShader(obj);
+  else if (obj) error(GL_INVALID_VALUE);
+}
+
+uint64_t GlApi::glGetHandleARB(GLenum pname) {
+  if (pname != GL_PROGRAM_OBJECT_ARB) { error(GL_INVALID_ENUM); return 0; }
+  return user_program_ ? group_->shaders_and_programs.name_of(user_program_ | kProgramObjectBit) : 0;
+}
+
+void GlApi::glGetInfoLogARB(GLhandleARB obj, GLsizei maxLength, UserPtr length, UserPtr infoLog) {
+  if (program_object(obj)) glGetProgramInfoLog(obj, maxLength, length, infoLog);
+  else glGetShaderInfoLog(obj, maxLength, length, infoLog);
+}
+
+void GlApi::glGetAttachedObjectsARB(GLhandleARB containerObj, GLsizei maxCount, UserPtr count, UserPtr obj) { glGetAttachedShaders(containerObj, maxCount, count, obj); }
+
+bool GlApi::object_parameter(uint32_t obj, uint32_t pname, int32_t* out) {
+  const bool program = program_object(obj) != 0;
+  if (!program && !shader_object(obj)) { error(GL_INVALID_VALUE); return false; }
+  if (pname == GL_OBJECT_TYPE_ARB) { *out = static_cast<int32_t>(program ? GL_PROGRAM_OBJECT_ARB : GL_SHADER_OBJECT_ARB); return true; }
+  if (pname == GL_OBJECT_SUBTYPE_ARB) {
+    if (program) { error(GL_INVALID_OPERATION); return false; }
+    const webgl::ShaderObj* so = gl_.shader_at(shader_object(obj));
+    *out = so ? static_cast<int32_t>(so->type) : 0;
+    return true;
+  }
+  // The other names are those of glGetShaderiv / glGetProgramiv (OBJECT_COMPILE_STATUS_ARB is GL_COMPILE_STATUS ...): answered by them through a word of our own.
+  const uint32_t before = gl_.error_;
+  int32_t value = 0;
+  ProbeMemory probe(&value);
+  IClientMemory* saved = memory_;
+  memory_ = &probe;
+  if (program) glGetProgramiv(obj, pname, UserPtr{ProbeMemory::kAddress});
+  else glGetShaderiv(obj, pname, UserPtr{ProbeMemory::kAddress});
+  memory_ = saved;
+  *out = value;
+  return gl_.error_ == before;
+}
+
+void GlApi::glGetObjectParameterivARB(GLhandleARB obj, GLenum pname, UserPtr params) {
+  int32_t v = 0;
+  if (object_parameter(obj, pname, &v)) write_values(params, &v, 1);
+}
+
+void GlApi::glGetObjectParameterfvARB(GLhandleARB obj, GLenum pname, UserPtr params) {
+  int32_t v = 0;
+  if (!object_parameter(obj, pname, &v)) return;
+  const float f = static_cast<float>(v);
+  write_values(params, &f, 1);
+}
+
+void GlApi::glGetActiveUniformName(GLuint program, GLuint uniformIndex, GLsizei bufSize, UserPtr length, UserPtr uniformName) {
+  const uint32_t object = program_object(program);
+  if (!object) { error(GL_INVALID_VALUE); return; }
+  const webgl::UniformLeaf* u = gl_.active_uniform(object, uniformIndex);
+  if (!u) { error(GL_INVALID_VALUE); return; }
+  String full(a_);
+  full.append(u->name.view());
+  if (u->size > 1) full.append("[0]");
+  write_string(uniformName, bufSize, length, full.view());
+}
 
 }  // namespace opengl

@@ -2073,7 +2073,7 @@
 #define NT_SERVICE_NtUserTcosGetUpcall 5636
 #define NT_SERVICE_NtUserTcosUpcallDone 5637
 #define NT_SERVICE_NtUserTcosResume 5638
-#define NT_SERVICE_COUNT 509
+#define NT_SERVICE_COUNT 510
 #define NT_SERVICE_WIN32K_BASE 4096
 #define NT_SERVICE_WIN32K_END 5639
 #endif

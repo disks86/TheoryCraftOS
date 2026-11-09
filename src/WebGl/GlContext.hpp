@@ -364,6 +364,8 @@ class GlContext final : public shader::ITextureHost {
   // Desktop GL: the default framebuffer lives in a window surface shared by the contexts drawing to it (src/OpenGl/GlSurface.hpp). `read` is the colour buffer reads take; null
   // `color` = there is no default framebuffer (an incomplete one).
   void set_default_images(Image* color, Image* read, Image* depth, uint32_t width, uint32_t height);
+  // Desktop GL (wglShareLists): from now on the context uses these objects. Names of the old ones bound in the context must be dropped by the caller first.
+  void set_objects(GlObjects* objects) { objects_ = objects ? objects : &own_objects_; }
   DesktopState desktop;
   bool lost() const { return lost_; }
   bool antialiased() const { return dcolor_->ss > 1; }
@@ -560,17 +562,17 @@ class GlContext final : public shader::ITextureHost {
   friend class opengl::FeedbackSink;
   friend struct FragmentPipeline;
 
-  Buffer* buffer_at(uint32_t id) { return id && id <= buffers_.count() ? buffers_[id - 1].get() : nullptr; }
-  const Buffer* buffer_at(uint32_t id) const { return id && id <= buffers_.count() ? buffers_[id - 1].get() : nullptr; }
-  Texture* texture_at(uint32_t id) { return id && id <= textures_.count() ? textures_[id - 1].get() : nullptr; }
-  const Texture* texture_at(uint32_t id) const { return id && id <= textures_.count() ? textures_[id - 1].get() : nullptr; }
+  Buffer* buffer_at(uint32_t id) { return id && id <= objects_->buffers.count() ? objects_->buffers[id - 1].get() : nullptr; }
+  const Buffer* buffer_at(uint32_t id) const { return id && id <= objects_->buffers.count() ? objects_->buffers[id - 1].get() : nullptr; }
+  Texture* texture_at(uint32_t id) { return id && id <= objects_->textures.count() ? objects_->textures[id - 1].get() : nullptr; }
+  const Texture* texture_at(uint32_t id) const { return id && id <= objects_->textures.count() ? objects_->textures[id - 1].get() : nullptr; }
   Framebuffer* fb_at(uint32_t id) { return id && id <= fbos_.count() ? fbos_[id - 1].get() : nullptr; }
-  Renderbuffer* rb_at(uint32_t id) { return id && id <= rbos_.count() ? rbos_[id - 1].get() : nullptr; }
-  ShaderObj* shader_at(uint32_t id) { return id && id <= shaders_.count() ? shaders_[id - 1].get() : nullptr; }
-  ProgramObj* program_at(uint32_t id) { return id && id <= programs_.count() ? programs_[id - 1].get() : nullptr; }
+  Renderbuffer* rb_at(uint32_t id) { return id && id <= objects_->rbos.count() ? objects_->rbos[id - 1].get() : nullptr; }
+  ShaderObj* shader_at(uint32_t id) { return id && id <= objects_->shaders.count() ? objects_->shaders[id - 1].get() : nullptr; }
+  ProgramObj* program_at(uint32_t id) { return id && id <= objects_->programs.count() ? objects_->programs[id - 1].get() : nullptr; }
   Vao* vao_at(uint32_t id) { return id == 0 ? &default_vao_ : (id <= vaos_.count() ? vaos_[id - 1].get() : nullptr); }
   Vao* current_vao_ptr() { return vao_at(vao_id_); }
-  SamplerObj* sampler_at(uint32_t id) { return id && id <= samplers_.count() ? samplers_[id - 1].get() : nullptr; }
+  SamplerObj* sampler_at(uint32_t id) { return id && id <= objects_->samplers.count() ? objects_->samplers[id - 1].get() : nullptr; }
   QueryObj* query_at(uint32_t id) { return id && id <= queries_.count() ? queries_[id - 1].get() : nullptr; }
 
   Image* texture_image(Texture* t, uint32_t target, int32_t level);   // the image for a (face) target and level, or null
@@ -622,14 +624,9 @@ class GlContext final : public shader::ITextureHost {
   uint64_t total_bytes_ = 0;
 
   GlObjects own_objects_;
-  List<UniquePointer<Buffer>>& buffers_;
-  List<UniquePointer<Texture>>& textures_;
+  GlObjects* objects_;      // own_objects_, or those of a share group (set_objects)
   List<UniquePointer<Framebuffer>> fbos_;
-  List<UniquePointer<Renderbuffer>>& rbos_;
-  List<UniquePointer<ShaderObj>>& shaders_;
-  List<UniquePointer<ProgramObj>>& programs_;
   List<UniquePointer<Vao>> vaos_;
-  List<UniquePointer<SamplerObj>>& samplers_;
   List<UniquePointer<QueryObj>> queries_;
   List<UniquePointer<TransformFeedbackObj>> tfs_;
   Vao default_vao_;

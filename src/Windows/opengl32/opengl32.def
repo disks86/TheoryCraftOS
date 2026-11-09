@@ -369,3 +369,6 @@ wglUseFontBitmapsA @365
 wglUseFontBitmapsW @366
 wglUseFontOutlinesA @367
 wglUseFontOutlinesW @368
+; (Windows' opengl32.dll exports these two D3DKMT functions too: they are gdi32's)
+D3DKMTCreateDCFromMemory = gdi32.D3DKMTCreateDCFromMemory
+D3DKMTDestroyDCFromMemory = gdi32.D3DKMTDestroyDCFromMemory
