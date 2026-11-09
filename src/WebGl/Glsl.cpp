@@ -292,6 +292,7 @@ class Parser {
   // Unsized global arrays: the highest constant index each is used with (sized at the end, finish_unsized).
   struct Unsized { int32_t global; uint32_t length; };
   List<Unsized> unsized_{a_};
+  int32_t interfaces_ = 0;      // in/out interface blocks seen (they are not Module::blocks)
 
   // --- tokens
   const Token& cur() const { return toks_[pos_]; }
@@ -840,16 +841,31 @@ class Parser {
     return true;
   }
 
+  // A uniform block (Module::blocks), or an in/out interface block, whose members are plain varyings of the stage.
   void uniform_block(const Quals& q) {
-    UniquePointer<UniformBlock> blk = UniquePointer<UniformBlock>::make(a_, a_);
-    if (!blk) { err("out of memory"); return; }
-    blk->name.assign(cur().text);
-    blk->binding = q.binding;
+    const bool is_uniform = q.uniform;
+    int32_t bi = -1;
+    if (is_uniform) {
+      UniquePointer<UniformBlock> blk = UniquePointer<UniformBlock>::make(a_, a_);
+      if (!blk) { err("out of memory"); return; }
+      blk->name.assign(cur().text);
+      blk->binding = q.binding;
+      bi = static_cast<int32_t>(m_.blocks.count());
+      m_.blocks.push_back(static_cast<UniquePointer<UniformBlock>&&>(blk));
+    }
+    const int32_t iface = is_uniform ? -1 : interfaces_++;
+    const StringView block_name = cur().text;
     ++pos_;
     if (!expect("{")) return;
-    const int32_t bi = static_cast<int32_t>(m_.blocks.count());
-    m_.blocks.push_back(static_cast<UniquePointer<UniformBlock>&&>(blk));
-    const bool is_uniform = q.uniform;
+    // An interface block with an instance name: its members are only reached as inst.member, and are named Block.member (as GL names them), so they cannot collide
+    // with the stage's other varyings and match the other stage's block by block and member name.
+    bool named_interface = false;
+    if (!is_uniform) {
+      uint64_t k = pos_;
+      while (k < toks_.count() && toks_[k].kind != Tok::End && !(toks_[k].text.equals("}"))) ++k;
+      named_interface = k + 1 < toks_.count() && toks_[k + 1].kind == Tok::Ident;
+    }
+    String qualified(a_);
     uint32_t offset = 0;
     List<int32_t> members(a_);
     while (!is("}") && !failed_ && cur().kind != Tok::End) {
@@ -863,10 +879,21 @@ class Parser {
         ++pos_;
         Type t = mt;
         if (is("[") && !parse_array_suffix(&t)) return;
-        const int32_t g = new_global(name, t, is_uniform ? GlobalKind::Uniform : (q.in ? GlobalKind::In : GlobalKind::Out), is_uniform);
+        StringView global_name = name;
+        if (named_interface) {
+          qualified.assign(block_name);
+          qualified.push_back('.');
+          qualified.append(name);
+          global_name = qualified.view();
+        }
+        const int32_t g = new_global(global_name, t, is_uniform ? GlobalKind::Uniform : (q.in ? GlobalKind::In : GlobalKind::Out), is_uniform);
         if (g < 0) return;
         Global& gv = *m_.globals[static_cast<uint64_t>(g)];
         gv.block = bi;
+        gv.iface = iface;
+        if (!is_uniform) {      // (a member's own interpolation qualifier)
+          gv.flat = gv.flat || mq.flat || q.flat;
+        }
         members.push_back(g);
         (void)offset;
         if (!accept(",")) break;
@@ -875,8 +902,12 @@ class Parser {
     }
     if (!expect("}")) return;
     if (cur().kind == Tok::Ident) {   // instance name
-      m_.blocks[static_cast<uint64_t>(bi)]->instance.assign(cur().text);
-      add_sym(cur().text, make_type(Base::Void), 2, bi);
+      if (is_uniform) {
+        m_.blocks[static_cast<uint64_t>(bi)]->instance.assign(cur().text);
+        add_sym(cur().text, make_type(Base::Void), 2, bi);
+      } else {
+        add_sym(cur().text, make_type(Base::Void), 3, iface);
+      }
       ++pos_;
     }
     expect(";");
@@ -1450,15 +1481,19 @@ class Parser {
       ++pos_;
       return -1;
     }
-    if (s->kind == 2) {   // block instance: inst.member
+    if (s->kind == 2 || s->kind == 3) {   // block instance (uniform 2, interface 3): inst.member
       if (!accept(".") || cur().kind != Tok::Ident) return err("expected a member of the block"), -1;
       const StringView member = cur().text;
       ++pos_;
       for (uint64_t i = m_.globals.count(); i > 0; --i) {
         const Global& g = *m_.globals[i - 1];
-        if (g.block == s->index && g.name.view().equals(member)) {
+        const StringView gn = g.name.view();
+        const bool named = s->kind == 2 ? gn.equals(member)
+                                         : (gn.size() > member.size() && gn[gn.size() - member.size() - 1] == '.' && gn.substr(gn.size() - member.size(), member.size()).equals(member));
+        if ((s->kind == 2 ? g.block : g.iface) == s->index && named) {
           n.kind = NodeKind::Global;
           n.ival = static_cast<int32_t>(i - 1);
+          m_.globals[i - 1]->referenced = true;
           return add(n);
         }
       }

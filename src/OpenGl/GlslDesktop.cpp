@@ -134,6 +134,53 @@ int32_t parse_version(StringView text, uint64_t* line_end, uint32_t* line, bool*
 
 }  // namespace
 
+// A shader's own declaration of gl_TexCoord (`varying vec4 gl_TexCoord[4];`, GLSL 1.10 lets it give a size): the translation declares the 8 of them itself, so the
+// redeclaration is blanked (spaces, newlines kept). Returns the text, changed or not, in `out`.
+void drop_texcoord_redeclarations(StringView text, String* out) {
+  out->clear();
+  uint64_t i = 0, copied = 0;
+  while (i < text.size()) {
+    if (!ident_char(text[i]) || (i > 0 && ident_char(text[i - 1]))) { ++i; continue; }
+    uint64_t j = i;
+    while (j < text.size() && ident_char(text[j])) ++j;
+    const StringView word = text.substr(i, j - i);
+    if (word.equals("varying") || word.equals("in") || word.equals("out")) {
+      // qualifier, white space, vec4, white space, gl_TexCoord, white space, [ ... ], white space, ;
+      uint64_t k = j;
+      const auto spaces = [&]() { while (k < text.size() && (text[k] == ' ' || text[k] == '\t' || text[k] == '\n' || text[k] == '\r')) ++k; };
+      const auto take = [&](const char* w) {
+        const StringView v(w);
+        if (text.size() - k < v.size() || !text.substr(k, v.size()).equals(v) || (k + v.size() < text.size() && ident_char(text[k + v.size()]))) return false;
+        k += v.size();
+        return true;
+      };
+      spaces();
+      if (take("vec4")) {
+        spaces();
+        if (take("gl_TexCoord")) {
+          spaces();
+          bool ok = true;
+          if (k < text.size() && text[k] == '[') {
+            while (k < text.size() && text[k] != ']') ++k;
+            if (k < text.size()) ++k; else ok = false;
+            spaces();
+          }
+          if (ok && k < text.size() && text[k] == ';') {
+            ++k;
+            out->append(text.substr(copied, i - copied));
+            for (uint64_t c = i; c < k; ++c) out->append(text[c] == '\n' ? StringView("\n") : StringView(" "));
+            copied = k;
+            i = k;
+            continue;
+          }
+        }
+      }
+    }
+    i = j;
+  }
+  out->append(text.substr(copied, text.size() - copied));
+}
+
 bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_t* uses) {
   *uses = 0;
   uint64_t body = 0;
@@ -146,7 +193,9 @@ bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_
   // Which built-ins are named (whole identifiers only), so only those are declared.
   bool used[sizeof(kRenames) / sizeof(kRenames[0])] = {};
   bool used_state[sizeof(kState) / sizeof(kState[0])] = {};
-  const StringView text = source.substr(body, source.size() - body);
+  String cleaned(out->allocator());
+  drop_texcoord_redeclarations(source.substr(body, source.size() - body), &cleaned);
+  const StringView text = cleaned.view();
   for (uint64_t i = 0; i < text.size();) {
     if (!ident_char(text[i]) || (i > 0 && ident_char(text[i - 1]))) { ++i; continue; }
     uint64_t j = i;

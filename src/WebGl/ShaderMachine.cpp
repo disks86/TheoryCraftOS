@@ -1013,6 +1013,7 @@ bool Interp::tex_call(const Node& node, Ref* out) {
     default: break;
   }
   if (tt.shadow && !wgsl) rq.compare = true;
+  rq.legacy_vec4 = (node.flags & 2) != 0;
   // implicit derivatives: from the neighbouring pixels' recorded coordinates
   if (rq.mode == SampleMode::Implicit || rq.mode == SampleMode::Bias) {
     if (m.record_) {
@@ -1034,10 +1035,9 @@ bool Interp::tex_call(const Node& node, Ref* out) {
   m.host_->sample(rq, raw);
   const bool depth_result = tt.shadow && rq.mode != SampleMode::Gather;
   uint32_t* w;
-  if (depth_result && (node.flags & 2)) {      // shadow2D() and the like: vec4(r, r, r, 1)
+  if (depth_result && (node.flags & 2)) {      // shadow2D() and the like: the four lanes the host made (by the depth texture mode)
     if (!new_value(make_type(Base::Float, 4), out, &w)) return false;
-    w[0] = w[1] = w[2] = raw[0];
-    w[3] = f2u(1.0f);
+    for (uint32_t i = 0; i < 4; ++i) w[i] = raw[i];
     return true;
   }
   if (depth_result) {

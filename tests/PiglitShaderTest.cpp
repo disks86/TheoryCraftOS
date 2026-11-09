@@ -561,6 +561,61 @@ struct Runner {
         make_texture(unit, GL_TEXTURE_2D, tw, th, rgba);
         continue;
       }
+      if (w[0] == "ortho" && w.size() >= 5) {
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(f(1), f(2), f(3), f(4), -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        continue;
+      }
+      if (w[0] == "color" && w.size() >= 5) { glColor4f(f(1), f(2), f(3), f(4)); continue; }
+      if (w[0] == "texture" && w.size() >= 3 && w[1] == "miptree") {
+        // piglit_miptree_texture: 8x8 down to 1x1, each level one colour of the wheel (red, green, blue, white)
+        const int unit = atoi(w[2].c_str());
+        glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+        const float wheel[4][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}, {1, 1, 1, 1}};
+        for (int level = 0; level < 4; ++level) {
+          const int size = 8 >> level;
+          std::vector<float> data(static_cast<size_t>(size) * size * 4);
+          for (int i = 0; i < size * size; ++i) memcpy(&data[static_cast<size_t>(i) * 4], wheel[level], 16);
+          glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA, size, size, 0, GL_RGBA, GL_FLOAT, data.data());
+        }
+        glEnable(GL_TEXTURE_2D);
+        glActiveTexture(GL_TEXTURE0);
+        continue;
+      }
+      if (w[0] == "texture" && w.size() >= 4 && (w[1] == "shadow2D" || w[1] == "shadow1D" || w[1] == "shadowRect")) {
+        // piglit_depth_texture: depth x / (w - 1) across, compared GL_GREATER, nearest, clamped
+        const int unit = atoi(w[2].c_str());
+        const int tw = atoi(w[3].c_str()), th = w[1] == "shadow1D" ? 1 : (w.size() >= 5 ? atoi(w[4].c_str()) : 1);
+        if (tw <= 1 || th <= 0 || tw > 4096 || th > 4096) { o.kind = Outcome::Skip; o.why = "skip: depth texture size"; return o; }
+        const GLenum target = w[1] == "shadow1D" ? GL_TEXTURE_1D : (w[1] == "shadowRect" ? GL_TEXTURE_RECTANGLE : GL_TEXTURE_2D);
+        glActiveTexture(GL_TEXTURE0 + static_cast<GLenum>(unit));
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(target, tex);
+        glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        std::vector<float> depth(static_cast<size_t>(tw) * th);
+        for (int y = 0; y < th; ++y) for (int x = 0; x < tw; ++x) depth[static_cast<size_t>(y) * tw + x] = static_cast<float>(x) / static_cast<float>(tw - 1);
+        if (target == GL_TEXTURE_1D) glTexImage1D(target, 0, GL_DEPTH_COMPONENT, tw, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
+        else glTexImage2D(target, 0, GL_DEPTH_COMPONENT, tw, th, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
+        glTexParameteri(target, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_R_TO_TEXTURE);
+        glTexParameteri(target, GL_TEXTURE_COMPARE_FUNC, GL_GREATER);
+        if (target != GL_TEXTURE_RECTANGLE) glEnable(target);
+        glActiveTexture(GL_TEXTURE0);
+        continue;
+      }
       if (w[0] == "texparameter" && w.size() >= 4) {
         uint32_t target = GL_TEXTURE_2D, pname = 0, value = 0;
         if (w[1] == "2D") target = GL_TEXTURE_2D; else if (w[1] == "Rect") target = GL_TEXTURE_RECTANGLE; else if (w[1] == "3D") target = GL_TEXTURE_3D; else if (w[1] == "Cube") target = GL_TEXTURE_CUBE_MAP; else if (w[1] == "1D") target = GL_TEXTURE_1D;

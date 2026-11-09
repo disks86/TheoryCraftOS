@@ -120,6 +120,7 @@ struct Global {
   int32_t group = 0, binding = -1;   // WGSL @group/@binding, GLSL layout(binding)
   int32_t init = -1;        // node of the initializer
   int32_t block = -1;       // uniform block index (GLSL) or -1
+  int32_t iface = -1;       // an in/out interface block's number (members are ordinary varyings; this only resolves instance.member) or -1
   uint32_t block_offset = 0;   // byte offset inside the block (std140)
   uint32_t uniform_index = 0;
 };
@@ -266,6 +267,7 @@ struct SampleRequest {
   int32_t level = 0;                 // Fetch, Size
   int32_t component = 0;             // Gather
   uint32_t value[4] = {0, 0, 0, 0};  // Store: the texel (raw lanes)
+  bool legacy_vec4 = false;          // a shadow1D/shadow2D call: the host answers four lanes made from the comparison by the texture's GL_DEPTH_TEXTURE_MODE
 };
 class ITextureHost {
  public:

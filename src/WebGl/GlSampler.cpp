@@ -175,9 +175,23 @@ void GlContext::sample(const shader::SampleRequest& rq, uint32_t out[4]) {
     }
     r.dim = shader::kDim2D;
     sample_texture(*t, *so, r, out);
+    depth_texture_mode(*t, rq, out);
     return;
   }
   sample_texture(*t, *so, rq, out);
+  depth_texture_mode(*t, rq, out);
+}
+
+// shadow1D/shadow2D (desktop GLSL 1.10-1.20): the comparison as GL_DEPTH_TEXTURE_MODE says, luminance (r, r, r, 1), intensity (r, r, r, r), alpha (0, 0, 0, r) or red (r, 0, 0, 1).
+void GlContext::depth_texture_mode(const Texture& t, const shader::SampleRequest& rq, uint32_t out[4]) const {
+  if (!rq.legacy_vec4) return;
+  const uint32_t r = out[0], one = __builtin_bit_cast(uint32_t, 1.0f), zero = 0;
+  switch (t.depth_mode) {
+    case 0x8049: out[0] = out[1] = out[2] = out[3] = r; break;      // GL_INTENSITY
+    case 0x1906: out[0] = out[1] = out[2] = zero; out[3] = r; break;      // GL_ALPHA
+    case 0x1903: out[0] = r; out[1] = out[2] = zero; out[3] = one; break;      // GL_RED
+    default: out[0] = out[1] = out[2] = r; out[3] = one; break;      // GL_LUMINANCE
+  }
 }
 
 static const Image* texture_image_at(const void* ctx, uint32_t face, int32_t level) {

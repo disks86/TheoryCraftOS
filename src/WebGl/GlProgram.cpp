@@ -242,11 +242,11 @@ void GlContext::link_program(uint32_t id) {
     // A uniform both stages declare must have one type.
     for (uint64_t i = 0; i < vm.globals.count(); ++i) {
       const shader::Global& vg = *vm.globals[i];
-      if (vg.kind != GlobalKind::Uniform) continue;
+      if (vg.kind != GlobalKind::Uniform || vg.block >= 0) continue;      // (members of blocks belong to their blocks: different blocks may use one name)
       for (uint64_t k = 0; k < fm.globals.count(); ++k) {
         const shader::Global& fg = *fm.globals[k];
         // (structure types are numbered per shader: those are not compared here)
-        if (fg.kind == GlobalKind::Uniform && fg.name.view().equals(vg.name.view()) && fg.type.base != Base::Struct && !(fg.type == vg.type)) { link_failed(p, "a uniform has different types in the two stages"); return; }
+        if (fg.kind == GlobalKind::Uniform && fg.block < 0 && fg.name.view().equals(vg.name.view()) && fg.type.base != Base::Struct && !(fg.type == vg.type)) { link_failed(p, "a uniform has different types in the two stages"); return; }
       }
     }
   }
@@ -303,9 +303,20 @@ void GlContext::link_program(uint32_t id) {
       const shader::Global& vg = *vm.globals[k];
       if (vg.kind == GlobalKind::Out && vg.builtin == shader::kBvNone && vg.name.view().equals(fg.name.view())) { match = &vg; break; }
     }
-    if (!match) {
-      // Desktop GL: a varying the fragment stage reads must come from the vertex stage (the compatibility ones, tcos_*, may be left unwritten).
+    if (!match || (desktop.active && !match->referenced)) {
+      // Desktop GL: a varying the fragment stage reads must be written by the vertex stage (the compatibility ones, tcos_*, may be left unwritten).
       if (desktop.active && fm.desktop && !fg.name.view().starts_with("tcos_") && fg.referenced) { link_failed(p, "a fragment shader input is not written by the vertex shader"); return; }
+      if (match) {      // (declared, never written: its value is undefined; zero here)
+        VaryingLink l;
+        l.vs_slot = match->slot;
+        l.fs_slot = fg.slot;
+        l.count = fm.slots_of(fg.type);
+        l.flat = true;
+        l.var_offset = offset;
+        offset += l.count;
+        if (offset > gpu::kMaxVarying) { link_failed(p, "too many varyings"); return; }
+        p->links.push_back(l);
+      }
       continue;   // read but never written: stays zero
     }
     if (match->type != fg.type) { link_failed(p, "varying types do not match between the shaders"); return; }

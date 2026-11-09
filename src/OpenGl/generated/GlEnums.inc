@@ -386,6 +386,7 @@ constexpr uint32_t GL_MULTISAMPLE = 0x809D;
 constexpr uint32_t GL_N3F_V3F = 0x2A25;
 constexpr uint32_t GL_NAME_STACK_DEPTH = 0x0D70;
 constexpr uint32_t GL_NEAREST = 0x2600;
+constexpr uint32_t GL_NEAREST_MIPMAP_NEAREST = 0x2700;
 constexpr uint32_t GL_NEVER = 0x0200;
 constexpr uint32_t GL_NICEST = 0x1102;
 constexpr uint32_t GL_NONE = 0;
