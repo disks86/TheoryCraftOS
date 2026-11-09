@@ -353,6 +353,7 @@ add_executable(BOOTX64
   src/WebGl/ShaderMachine.cpp
   src/WebGl/ShaderBuiltins.cpp
   src/WebGl/ShaderLayout.cpp
+  src/WebGl/GlslPreprocessor.cpp
   src/WebGl/Glsl.cpp
   src/WebGl/Wgsl.cpp
   src/WebGl/GpuDevice.cpp

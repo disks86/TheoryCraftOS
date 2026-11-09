@@ -43,8 +43,8 @@ struct TriSetup {
     const double b0 = e0 / area, b1 = e1 / area, b2 = e2 / area;
     const double d = b0 * iw[0] + b1 * iw[1] + b2 * iw[2];
     const double inv = d != 0 ? 1.0 / d : 0.0;
-    const float p0 = static_cast<float>(b0 * iw[0] * inv), p1 = static_cast<float>(b1 * iw[1] * inv), p2 = static_cast<float>(b2 * iw[2] * inv);
-    for (uint32_t i = 0; i < rs->nvar; ++i) out[i] = rs->flat[i] ? flatvals[i] : p0 * var[0][i] + p1 * var[1][i] + p2 * var[2][i];
+    const float p1 = static_cast<float>(b1 * iw[1] * inv), p2 = static_cast<float>(b2 * iw[2] * inv);
+    for (uint32_t i = 0; i < rs->nvar; ++i) { const float v0 = var[0][i]; out[i] = rs->flat[i] ? flatvals[i] : v0 + p1 * (var[1][i] - v0) + p2 * (var[2][i] - v0); }
   }
 };
 
@@ -225,8 +225,12 @@ void raster_triangle(const RasterState& rs, const RVertex& a, const RVertex& b, 
       if (z > 1) z = 1;
       const double d = b0 * s.iw[0] + b1 * s.iw[1] + b2 * s.iw[2];
       const double inv = d != 0 ? 1.0 / d : 0.0;
-      const float p0 = static_cast<float>(b0 * s.iw[0] * inv), p1 = static_cast<float>(b1 * s.iw[1] * inv), p2 = static_cast<float>(b2 * s.iw[2] * inv);
-      for (uint32_t i = 0; i < rs.nvar; ++i) var[i] = rs.flat[i] ? flatvals[i] : p0 * s.var[0][i] + p1 * s.var[1][i] + p2 * s.var[2][i];
+      const float p1 = static_cast<float>(b1 * s.iw[1] * inv), p2 = static_cast<float>(b2 * s.iw[2] * inv);
+      // (as v0 + p1 (v1 - v0) + p2 (v2 - v0): a value that is the same at the three corners comes out exactly that value, as GL's interpolation gives it)
+      for (uint32_t i = 0; i < rs.nvar; ++i) {
+        const float v0 = s.var[0][i];
+        var[i] = rs.flat[i] ? flatvals[i] : v0 + p1 * (s.var[1][i] - v0) + p2 * (s.var[2][i] - v0);
+      }
       f.x = px;
       f.y = py;
       f.z = z;

@@ -696,6 +696,21 @@ static void test_desktop_glsl() {
   glUseProgram(0);
   glDeleteProgram(t);
   glDeleteTextures(1, &tex);
+  // the uniform state of the compatibility profile: lights, materials, the depth range
+  const float diffuse[4] = {0.5f, 0.25f, 0, 1};
+  glLightfv(GL_LIGHT3, GL_DIFFUSE, diffuse);
+  const float emission[4] = {0, 0, 0.75f, 1};
+  glMaterialfv(GL_FRONT, GL_EMISSION, emission);
+  glDepthRange(0.25, 0.75);
+  const GLuint st = build("#version 110\nvoid main(){ gl_Position = ftransform(); }\n",
+                          "#version 110\nvoid main(){ gl_FragColor = vec4(gl_LightSource[3].diffuse.rg, gl_FrontMaterial.emission.b, gl_DepthRange.diff); }\n");
+  CHECK(st != 0);
+  glUseProgram(st);
+  glRectf(0, 0, 64, 64);
+  CHECK(near(pixel(30, 30), 128, 64, 191, 2));
+  glUseProgram(0);
+  glDeleteProgram(st);
+  glDepthRange(0, 1);
   CHECK(glGetError() == GL_NO_ERROR);
 }
 

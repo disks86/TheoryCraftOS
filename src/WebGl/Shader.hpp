@@ -38,12 +38,17 @@
 namespace shader {
 
 constexpr uint32_t kRuntimeArray = 0xFFFFFFFEu;   // the length of a runtime-sized array until a buffer gives it one
+constexpr uint32_t kUnsizedArray = 0xFFFFFFFFu;   // GLSL `float a[]`: sized later by an initializer, a redeclaration or the highest constant index (Glsl.cpp)
+constexpr uint32_t kMaxArrayLength = 1u << 16;     // the longest array a shader may declare
+constexpr uint32_t kMaxValueSlots = 1u << 24;      // what Module::slots_of answers at most (a module that needs more fails to compile)
 
 enum class Language : uint8_t { Glsl100, Glsl300, Wgsl };
 enum class Stage : uint8_t { Vertex, Fragment, Compute };
 
 enum class Base : uint8_t { Void, Bool, Int, Uint, Float, Sampler, Texture, SamplerState, Struct };
-enum : uint8_t { kDim2D = 0, kDimCube = 1, kDim3D = 2, kDim2DArray = 3, kDimCubeArray = 4, kDim1D = 5, kDimMultisampled = 6, kDimDepth2D = 7 };
+enum : uint8_t { kDim2D = 0, kDimCube = 1, kDim3D = 2, kDim2DArray = 3, kDimCubeArray = 4, kDim1D = 5, kDimMultisampled = 6, kDimDepth2D = 7,
+                 kDim1DArray = 8,   // desktop GLSL: (s, layer); a 1D array texture is kept as a 2D image, one row per layer
+                 kDimRect = 9 };    // desktop GLSL: coordinates in texels, the host normalises them
 
 struct Type {
   Base base = Base::Void;
@@ -115,6 +120,7 @@ struct Global {
   int32_t group = 0, binding = -1;   // WGSL @group/@binding, GLSL layout(binding)
   int32_t init = -1;        // node of the initializer
   int32_t block = -1;       // uniform block index (GLSL) or -1
+  int32_t iface = -1;       // an in/out interface block's number (members are ordinary varyings; this only resolves instance.member) or -1
   uint32_t block_offset = 0;   // byte offset inside the block (std140)
   uint32_t uniform_index = 0;
 };
@@ -161,6 +167,7 @@ enum class NodeKind : uint8_t {
 enum class Op : uint8_t { None, Add, Sub, Mul, Div, Mod, And, Or, Xor, Shl, Shr, Eq, Ne, Lt, Le, Gt, Ge, LogAnd, LogOr, LogXor, Neg, Not, BitNot, Plus };
 
 // A texture call's operation (Node::op of a TexCall).
+// Node::flags of a TexCall: 1 WGSL argument layout, 2 a legacy shadow1D/shadow2D call (the result is vec4(r, r, r, 1), not a float).
 enum class TexOp : uint8_t { Sample, Bias, Lod, Grad, Compare, CompareLevel, Fetch, Size, Levels, Gather, GatherCompare, Proj, ProjBias, ProjLod, Samples, Store };
 
 struct Node {
@@ -214,7 +221,10 @@ struct Module {
   bool uses_discard = false;
   bool uses_barrier = false;
   uint32_t wg_x = 1, wg_y = 1, wg_z = 1;   // WGSL compute entry points: copied from the entry point asked for
-  uint32_t glsl_version = 100;
+  uint32_t glsl_version = 100;     // 100 or 300: the rules the front end applied (desktop GLSL 1.30 and later takes the 300 ones: in/out, uint, ...)
+  bool desktop = false;            // desktop GLSL (GlslOptions::desktop)
+  uint32_t desktop_version = 0;    // its #version (110 when none): 110 ... 460
+  bool compatibility = false;      // desktop GLSL with the compatibility built-ins (1.40 and before, or `compatibility`)
 
   uint32_t slots_of(const Type& t) const;
   const StructDef* struct_of(const Type& t) const { return t.base == Base::Struct && t.sid < structs.count() ? structs[t.sid].get() : nullptr; }
@@ -225,7 +235,10 @@ struct Module {
 
 // --- Front ends. Return false (with module.error set) when the source is wrong.
 // `extensions` (GLSL): the extension names the context offers, as a bit set the front end understands is not needed: #extension is accepted for any name.
-bool parse_glsl(Module& module, StringView source, Stage stage);
+struct GlslOptions {
+  bool desktop = false;      // desktop GLSL (OpenGL): #version 110 when none is given, glcpp's desktop rules, the desktop built-ins; else GLSL ES (WebGL)
+};
+bool parse_glsl(Module& module, StringView source, Stage stage, const GlslOptions& options = GlslOptions());
 bool parse_wgsl(Module& module, StringView source);
 // Gives the runtime-sized array of a storage buffer global (or the last field of its struct) a length and updates the layout.
 void set_runtime_length(Module& module, uint32_t global, uint32_t count);
@@ -254,6 +267,7 @@ struct SampleRequest {
   int32_t level = 0;                 // Fetch, Size
   int32_t component = 0;             // Gather
   uint32_t value[4] = {0, 0, 0, 0};  // Store: the texel (raw lanes)
+  bool legacy_vec4 = false;          // a shadow1D/shadow2D call: the host answers four lanes made from the comparison by the texture's GL_DEPTH_TEXTURE_MODE
 };
 class ITextureHost {
  public:

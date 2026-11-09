@@ -16,469 +16,20 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The GLSL ES 1.00 and 3.00 front end: a small preprocessor, a lexer and a recursive-descent parser that builds a shader::Module.
+// The GLSL ES 1.00 and 3.00 front end: the preprocessor (GlslPreprocessor.cpp), a lexer and a recursive-descent parser that builds a shader::Module.
+#include "WebGl/GlslPreprocessor.hpp"
 #include "WebGl/ShaderInternal.hpp"
 
 namespace shader {
 
 namespace {
 
-// --- Preprocessor ----------------------------------------------------------------------------------------------------------------------------------------
-
-struct Macro {
-  explicit Macro(allocators::IAllocator& a) : name(a), body(a), params(a) {}
-  String name, body;
-  bool function = false;
-  List<UniquePointer<String>> params;
-};
+// --- Characters ------------------------------------------------------------------------------------------------------------------------------------------
 
 bool is_ident_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 bool is_ident(char c) { return is_ident_start(c) || (c >= '0' && c <= '9'); }
 bool is_digit(char c) { return c >= '0' && c <= '9'; }
 bool is_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v'; }
-
-class Preprocessor {
- public:
-  Preprocessor(allocators::IAllocator& a, String* error) : alloc_(a), macros_(a), cond_(a), error_(error) {}
-
-  bool run(StringView src, String* out, uint32_t* version) {
-    define_simple("GL_ES", "1");
-    define_simple("GL_FRAGMENT_PRECISION_HIGH", "1");
-    define_simple("GL_OES_standard_derivatives", "1");
-    define_simple("GL_EXT_shader_texture_lod", "1");
-    define_simple("GL_EXT_frag_depth", "1");
-    define_simple("GL_EXT_draw_buffers", "1");
-    // strip comments and join continued lines
-    String clean(alloc_);
-    for (uint64_t i = 0; i < src.size();) {
-      const char c = src[i];
-      if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
-        while (i < src.size() && src[i] != '\n') ++i;
-      } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
-        i += 2;
-        while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) {
-          if (src[i] == '\n') clean.push_back('\n');
-          ++i;
-        }
-        i += 2;
-        clean.push_back(' ');
-      } else if (c == '\\' && i + 1 < src.size() && (src[i + 1] == '\n' || (src[i + 1] == '\r' && i + 2 < src.size() && src[i + 2] == '\n'))) {
-        i += src[i + 1] == '\r' ? 3 : 2;
-      } else {
-        clean.push_back(c);
-        ++i;
-      }
-    }
-    uint32_t lineno = 0;
-    StringView rest = clean.view();
-    while (!rest.empty() || lineno == 0) {
-      ++lineno;
-      const uint64_t nl = rest.find('\n');
-      StringView line = nl == StringView::npos ? rest : rest.substr(0, nl);
-      rest = nl == StringView::npos ? StringView() : rest.substr(nl + 1);
-      if (!handle_line(line, out, version)) return false;
-      out->push_back('\n');
-      if (nl == StringView::npos) break;
-    }
-    if (cond_.count() != 0) return fail("unterminated #if");
-    return true;
-  }
-
- private:
-  struct Cond { bool active; bool taken; bool parent; };
-
-  bool fail(const char* why) {
-    if (error_->empty()) error_->assign(why);
-    return false;
-  }
-
-  bool active() const { return cond_.count() == 0 || cond_[cond_.count() - 1].active; }
-
-  void define_simple(const char* name, const char* body) {
-    UniquePointer<Macro> m = UniquePointer<Macro>::make(alloc_, alloc_);
-    if (!m) return;
-    m->name.assign(name);
-    m->body.assign(body);
-    macros_.push_back(static_cast<UniquePointer<Macro>&&>(m));
-  }
-
-  Macro* find(StringView name) {
-    for (uint64_t i = 0; i < macros_.count(); ++i)
-      if (macros_[i]->name.view().equals(name)) return macros_[i].get();
-    return nullptr;
-  }
-
-  void undef(StringView name) {
-    for (uint64_t i = 0; i < macros_.count(); ++i)
-      if (macros_[i]->name.view().equals(name)) {
-        macros_.remove_at(i);
-        return;
-      }
-  }
-
-  static StringView trim(StringView s) {
-    uint64_t a = 0, b = s.size();
-    while (a < b && is_space(s[a])) ++a;
-    while (b > a && is_space(s[b - 1])) --b;
-    return s.substr(a, b - a);
-  }
-
-  bool handle_line(StringView line, String* out, uint32_t* version) {
-    StringView t = trim(line);
-    if (t.empty() || t[0] != '#') {
-      if (!active()) return true;
-      return expand(line, out, 0);
-    }
-    t = trim(t.substr(1));
-    uint64_t e = 0;
-    while (e < t.size() && is_ident(t[e])) ++e;
-    const StringView dir = t.substr(0, e);
-    const StringView arg = trim(t.substr(e));
-    if (dir.equals("ifdef") || dir.equals("ifndef")) {
-      const bool def = find(first_word(arg)) != nullptr;
-      const bool cond = dir.equals("ifdef") ? def : !def;
-      const bool par = active();
-      cond_.push_back(Cond{par && cond, cond, par});
-      return true;
-    }
-    if (dir.equals("if")) {
-      const bool par = active();
-      bool v = false;
-      if (par && !eval_if(arg, &v)) return false;
-      cond_.push_back(Cond{par && v, v, par});
-      return true;
-    }
-    if (dir.equals("elif")) {
-      if (cond_.count() == 0) return fail("#elif without #if");
-      Cond& c = cond_[cond_.count() - 1];
-      if (c.taken || !c.parent) {
-        c.active = false;
-      } else {
-        bool v = false;
-        if (!eval_if(arg, &v)) return false;
-        c.active = v;
-        c.taken = v;
-      }
-      return true;
-    }
-    if (dir.equals("else")) {
-      if (cond_.count() == 0) return fail("#else without #if");
-      Cond& c = cond_[cond_.count() - 1];
-      c.active = c.parent && !c.taken;
-      c.taken = true;
-      return true;
-    }
-    if (dir.equals("endif")) {
-      if (cond_.count() == 0) return fail("#endif without #if");
-      cond_.remove_at(cond_.count() - 1);
-      return true;
-    }
-    if (!active()) return true;
-    if (dir.equals("define")) return define(arg);
-    if (dir.equals("undef")) {
-      undef(first_word(arg));
-      return true;
-    }
-    if (dir.equals("version")) {
-      uint32_t v = 0;
-      for (uint64_t i = 0; i < arg.size() && is_digit(arg[i]); ++i) v = v * 10 + static_cast<uint32_t>(arg[i] - '0');
-      *version = v;
-      undef("__VERSION__");
-      define_simple("__VERSION__", v == 300 ? "300" : "100");
-      return true;
-    }
-    if (dir.equals("error")) {
-      error_->assign("#error ");
-      error_->append(arg);
-      return false;
-    }
-    return true;   // extension, pragma, line
-  }
-
-  static StringView first_word(StringView s) {
-    uint64_t e = 0;
-    while (e < s.size() && is_ident(s[e])) ++e;
-    return s.substr(0, e);
-  }
-
-  bool define(StringView arg) {
-    const StringView name = first_word(arg);
-    if (name.empty()) return fail("bad #define");
-    UniquePointer<Macro> m = UniquePointer<Macro>::make(alloc_, alloc_);
-    if (!m) return fail("out of memory");
-    m->name.assign(name);
-    uint64_t i = name.size();
-    if (i < arg.size() && arg[i] == '(') {
-      m->function = true;
-      ++i;
-      while (i < arg.size() && arg[i] != ')') {
-        while (i < arg.size() && (is_space(arg[i]) || arg[i] == ',')) ++i;
-        uint64_t s = i;
-        while (i < arg.size() && is_ident(arg[i])) ++i;
-        if (i > s) {
-          UniquePointer<String> p = UniquePointer<String>::make(alloc_, alloc_);
-          if (!p) return fail("out of memory");
-          p->assign(arg.substr(s, i - s));
-          m->params.push_back(static_cast<UniquePointer<String>&&>(p));
-        } else if (i < arg.size() && arg[i] != ')') {
-          return fail("bad macro parameter");
-        }
-      }
-      ++i;
-    }
-    m->body.assign(trim(arg.substr(i < arg.size() ? i : arg.size())));
-    undef(name);
-    macros_.push_back(static_cast<UniquePointer<Macro>&&>(m));
-    return true;
-  }
-
-  // Replaces the macros in `text` and appends the result.
-  bool expand(StringView text, String* out, uint32_t depth) {
-    if (depth > 16) return fail("macro expansion too deep");
-    for (uint64_t i = 0; i < text.size();) {
-      const char c = text[i];
-      if (is_ident_start(c)) {
-        uint64_t j = i;
-        while (j < text.size() && is_ident(text[j])) ++j;
-        const StringView word = text.substr(i, j - i);
-        Macro* mac = find(word);
-        if (!mac) {
-          out->append(word);
-          i = j;
-          continue;
-        }
-        if (!mac->function) {
-          if (!expand(mac->body.view(), out, depth + 1)) return false;
-          i = j;
-          continue;
-        }
-        uint64_t k = j;
-        while (k < text.size() && is_space(text[k])) ++k;
-        if (k >= text.size() || text[k] != '(') {
-          out->append(word);
-          i = j;
-          continue;
-        }
-        // gather the arguments
-        List<UniquePointer<String>> args(alloc_);
-        ++k;
-        int level = 0;
-        uint64_t s = k;
-        for (; k < text.size(); ++k) {
-          const char ch = text[k];
-          if (ch == '(') ++level;
-          else if (ch == ')') {
-            if (level == 0) break;
-            --level;
-          } else if (ch == ',' && level == 0) {
-            UniquePointer<String> a = UniquePointer<String>::make(alloc_, alloc_);
-            if (!a) return fail("out of memory");
-            a->assign(trim(text.substr(s, k - s)));
-            args.push_back(static_cast<UniquePointer<String>&&>(a));
-            s = k + 1;
-          }
-        }
-        if (k >= text.size()) return fail("unterminated macro call");
-        {
-          UniquePointer<String> a = UniquePointer<String>::make(alloc_, alloc_);
-          if (!a) return fail("out of memory");
-          a->assign(trim(text.substr(s, k - s)));
-          if (!(args.count() == 0 && a->empty() && mac->params.count() == 0)) args.push_back(static_cast<UniquePointer<String>&&>(a));
-        }
-        // substitute
-        String body(alloc_);
-        const StringView b = mac->body.view();
-        for (uint64_t p = 0; p < b.size();) {
-          if (is_ident_start(b[p])) {
-            uint64_t q = p;
-            while (q < b.size() && is_ident(b[q])) ++q;
-            const StringView id = b.substr(p, q - p);
-            bool replaced = false;
-            for (uint64_t pi = 0; pi < mac->params.count(); ++pi)
-              if (mac->params[pi]->view().equals(id)) {
-                if (pi < args.count()) body.append(args[pi]->view());
-                replaced = true;
-                break;
-              }
-            if (!replaced) body.append(id);
-            p = q;
-          } else {
-            body.push_back(b[p++]);
-          }
-        }
-        if (!expand(body.view(), out, depth + 1)) return false;
-        i = k + 1;
-        continue;
-      }
-      if (is_digit(c)) {   // keep numbers (and their suffixes) whole
-        uint64_t j = i;
-        while (j < text.size() && (is_ident(text[j]) || text[j] == '.')) ++j;
-        out->append(text.substr(i, j - i));
-        i = j;
-        continue;
-      }
-      out->push_back(c);
-      ++i;
-    }
-    return true;
-  }
-
-  // #if expressions
-  struct Cur {
-    StringView s;
-    uint64_t i = 0;
-  };
-
-  bool eval_if(StringView arg, bool* result) {
-    // replace defined(X) / defined X first, expand the rest, then evaluate
-    String pre(alloc_);
-    for (uint64_t i = 0; i < arg.size();) {
-      if (is_ident_start(arg[i])) {
-        uint64_t j = i;
-        while (j < arg.size() && is_ident(arg[j])) ++j;
-        if (arg.substr(i, j - i).equals("defined")) {
-          while (j < arg.size() && is_space(arg[j])) ++j;
-          bool paren = false;
-          if (j < arg.size() && arg[j] == '(') {
-            paren = true;
-            ++j;
-          }
-          while (j < arg.size() && is_space(arg[j])) ++j;
-          uint64_t s = j;
-          while (j < arg.size() && is_ident(arg[j])) ++j;
-          pre.append(find(arg.substr(s, j - s)) ? "1" : "0");
-          if (paren) {
-            while (j < arg.size() && arg[j] != ')') ++j;
-            ++j;
-          }
-          i = j;
-          continue;
-        }
-        pre.append(arg.substr(i, j - i));
-        i = j;
-        continue;
-      }
-      pre.push_back(arg[i++]);
-    }
-    String ex(alloc_);
-    if (!expand(pre.view(), &ex, 0)) return false;
-    Cur c;
-    c.s = ex.view();
-    int64_t v = 0;
-    if (!parse_or(c, &v)) return fail("bad #if expression");
-    *result = v != 0;
-    return true;
-  }
-
-  static void skip(Cur& c) {
-    while (c.i < c.s.size() && is_space(c.s[c.i])) ++c.i;
-  }
-  static bool eat(Cur& c, const char* op) {
-    skip(c);
-    const StringView o(op);
-    if (c.s.size() - c.i >= o.size() && c.s.substr(c.i, o.size()).equals(o)) {
-      c.i += o.size();
-      return true;
-    }
-    return false;
-  }
-  bool parse_or(Cur& c, int64_t* v) {
-    if (!parse_and(c, v)) return false;
-    while (eat(c, "||")) {
-      int64_t r;
-      if (!parse_and(c, &r)) return false;
-      *v = (*v || r);
-    }
-    return true;
-  }
-  bool parse_and(Cur& c, int64_t* v) {
-    if (!parse_eq(c, v)) return false;
-    while (eat(c, "&&")) {
-      int64_t r;
-      if (!parse_eq(c, &r)) return false;
-      *v = (*v && r);
-    }
-    return true;
-  }
-  bool parse_eq(Cur& c, int64_t* v) {
-    if (!parse_rel(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "==")) { if (!parse_rel(c, &r)) return false; *v = *v == r; }
-      else if (eat(c, "!=")) { if (!parse_rel(c, &r)) return false; *v = *v != r; }
-      else return true;
-    }
-  }
-  bool parse_rel(Cur& c, int64_t* v) {
-    if (!parse_add(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "<=")) { if (!parse_add(c, &r)) return false; *v = *v <= r; }
-      else if (eat(c, ">=")) { if (!parse_add(c, &r)) return false; *v = *v >= r; }
-      else if (eat(c, "<")) { if (!parse_add(c, &r)) return false; *v = *v < r; }
-      else if (eat(c, ">")) { if (!parse_add(c, &r)) return false; *v = *v > r; }
-      else return true;
-    }
-  }
-  bool parse_add(Cur& c, int64_t* v) {
-    if (!parse_mul(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "+")) { if (!parse_mul(c, &r)) return false; *v += r; }
-      else if (eat(c, "-")) { if (!parse_mul(c, &r)) return false; *v -= r; }
-      else return true;
-    }
-  }
-  bool parse_mul(Cur& c, int64_t* v) {
-    if (!parse_unary(c, v)) return false;
-    for (;;) {
-      int64_t r;
-      if (eat(c, "*")) { if (!parse_unary(c, &r)) return false; *v *= r; }
-      else if (eat(c, "/")) { if (!parse_unary(c, &r)) return false; *v = r ? *v / r : 0; }
-      else if (eat(c, "%")) { if (!parse_unary(c, &r)) return false; *v = r ? *v % r : 0; }
-      else return true;
-    }
-  }
-  bool parse_unary(Cur& c, int64_t* v) {
-    skip(c);
-    if (eat(c, "!")) { if (!parse_unary(c, v)) return false; *v = !*v; return true; }
-    if (eat(c, "-")) { if (!parse_unary(c, v)) return false; *v = -*v; return true; }
-    if (eat(c, "+")) return parse_unary(c, v);
-    if (eat(c, "(")) {
-      if (!parse_or(c, v)) return false;
-      return eat(c, ")");
-    }
-    if (c.i < c.s.size() && is_digit(c.s[c.i])) {
-      int64_t n = 0;
-      if (c.s[c.i] == '0' && c.i + 1 < c.s.size() && (c.s[c.i + 1] == 'x' || c.s[c.i + 1] == 'X')) {
-        c.i += 2;
-        while (c.i < c.s.size()) {
-          const char ch = c.s[c.i];
-          int d = is_digit(ch) ? ch - '0' : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10 : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
-          if (d < 0) break;
-          n = n * 16 + d;
-          ++c.i;
-        }
-      } else {
-        while (c.i < c.s.size() && is_digit(c.s[c.i])) n = n * 10 + (c.s[c.i++] - '0');
-      }
-      while (c.i < c.s.size() && (c.s[c.i] == 'u' || c.s[c.i] == 'U')) ++c.i;
-      *v = n;
-      return true;
-    }
-    if (c.i < c.s.size() && is_ident_start(c.s[c.i])) {   // an undefined name is 0
-      while (c.i < c.s.size() && is_ident(c.s[c.i])) ++c.i;
-      *v = 0;
-      return true;
-    }
-    return false;
-  }
-
-  allocators::IAllocator& alloc_;
-  List<UniquePointer<Macro>> macros_;
-  List<Cond> cond_;
-  String* error_;
-};
 
 // --- Lexer -----------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -635,6 +186,14 @@ const TypeName kTypes[] = {
     {"isampler3D", Base::Sampler, 1, 1, kDim3D, false, Base::Int}, {"isampler2DArray", Base::Sampler, 1, 1, kDim2DArray, false, Base::Int},
     {"usampler2D", Base::Sampler, 1, 1, kDim2D, false, Base::Uint}, {"usamplerCube", Base::Sampler, 1, 1, kDimCube, false, Base::Uint},
     {"usampler3D", Base::Sampler, 1, 1, kDim3D, false, Base::Uint}, {"usampler2DArray", Base::Sampler, 1, 1, kDim2DArray, false, Base::Uint},
+    // desktop GLSL
+    {"sampler1D", Base::Sampler, 1, 1, kDim1D, false, Base::Float}, {"sampler1DShadow", Base::Sampler, 1, 1, kDim1D, true, Base::Float},
+    {"sampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Float}, {"sampler1DArrayShadow", Base::Sampler, 1, 1, kDim1DArray, true, Base::Float},
+    {"sampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Float}, {"sampler2DRectShadow", Base::Sampler, 1, 1, kDimRect, true, Base::Float},
+    {"isampler1D", Base::Sampler, 1, 1, kDim1D, false, Base::Int}, {"usampler1D", Base::Sampler, 1, 1, kDim1D, false, Base::Uint},
+    {"isampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Int}, {"usampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Uint},
+    {"isampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Int}, {"usampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Uint},
+    {"samplerCubeArray", Base::Sampler, 1, 1, kDimCubeArray, false, Base::Float}, {"samplerCubeArrayShadow", Base::Sampler, 1, 1, kDimCubeArray, true, Base::Float},
 };
 
 struct BuiltinName {
@@ -670,6 +229,7 @@ struct TexName {
   const char* name;
   TexOp op;
   uint8_t form;   // 0: (s,P) +opt bias  1: (s,P,lod)  2: (s,P,dx,dy)  3: (s,P,off)+opt bias  4: (s,P,lod,off)  5: (s,P,dx,dy,off)  6: fetch(s,P,lod)  7: fetchOffset  8: size  9: gather  10: levels
+  bool legacy_shadow = false;   // shadow1D/shadow2D...: a vec4 result
 };
 
 const TexName kTex[] = {
@@ -681,6 +241,12 @@ const TexName kTex[] = {
     {"textureOffset", TexOp::Sample, 3}, {"textureProjOffset", TexOp::Proj, 3}, {"textureLodOffset", TexOp::Lod, 4}, {"textureGradOffset", TexOp::Grad, 5},
     {"texelFetch", TexOp::Fetch, 6}, {"texelFetchOffset", TexOp::Fetch, 7}, {"textureSize", TexOp::Size, 8}, {"textureGather", TexOp::Gather, 9},
     {"textureQueryLevels", TexOp::Levels, 10},
+    // desktop GLSL 1.10 - 1.20 (and the compatibility profile)
+    {"texture1D", TexOp::Sample, 0}, {"texture1DProj", TexOp::Proj, 0}, {"texture1DLod", TexOp::Lod, 1}, {"texture1DProjLod", TexOp::ProjLod, 1},
+    {"texture3DProjLod", TexOp::ProjLod, 1}, {"texture2DRect", TexOp::Sample, 0}, {"texture2DRectProj", TexOp::Proj, 0},
+    {"shadow1D", TexOp::Sample, 0, true}, {"shadow2D", TexOp::Sample, 0, true}, {"shadow1DProj", TexOp::Proj, 0, true}, {"shadow2DProj", TexOp::Proj, 0, true},
+    {"shadow1DLod", TexOp::Lod, 1, true}, {"shadow2DLod", TexOp::Lod, 1, true}, {"shadow1DProjLod", TexOp::ProjLod, 1, true}, {"shadow2DProjLod", TexOp::ProjLod, 1, true},
+    {"shadow2DRect", TexOp::Sample, 0, true}, {"shadow2DRectProj", TexOp::Proj, 0, true},
 };
 
 // --- Parser ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -701,6 +267,7 @@ class Parser {
     declare_builtin_vars();
     push_scope();
     while (cur().kind != Tok::End && !failed_) top_level();
+    if (!failed_) finish_unsized();
     pop_scope();
     if (failed_) return false;
     m_.main_function = m_.find_function("main");
@@ -722,6 +289,10 @@ class Parser {
   int32_t cur_fn_ = -1;
   uint32_t nlocals_ = 0;
   uint32_t anon_ = 0;
+  // Unsized global arrays: the highest constant index each is used with (sized at the end, finish_unsized).
+  struct Unsized { int32_t global; uint32_t length; };
+  List<Unsized> unsized_{a_};
+  int32_t interfaces_ = 0;      // in/out interface blocks seen (they are not Module::blocks)
 
   // --- tokens
   const Token& cur() const { return toks_[pos_]; }
@@ -836,6 +407,16 @@ class Parser {
         *v = n.op == Op::Neg ? -x : x;
         return true;
       }
+      case NodeKind::Builtin: {      // min, max, abs of constants (desktop GLSL allows them in constant expressions: array sizes made of gl_Max* limits)
+        const BuiltinFn fn = static_cast<BuiltinFn>(n.ival);
+        int64_t x, y;
+        if (n.count < 1 || !fold_int(m_.kids[static_cast<uint64_t>(n.first)], &x)) return false;
+        if (fn == BuiltinFn::Abs && n.count == 1) { *v = x < 0 ? -x : x; return true; }
+        if (n.count != 2 || !fold_int(m_.kids[static_cast<uint64_t>(n.first + 1)], &y)) return false;
+        if (fn == BuiltinFn::Min) { *v = x < y ? x : y; return true; }
+        if (fn == BuiltinFn::Max) { *v = x > y ? x : y; return true; }
+        return false;
+      }
       case NodeKind::Binary: {
         int64_t x, y;
         if (!fold_int(n.a, &x) || !fold_int(n.b, &y)) return false;
@@ -878,9 +459,21 @@ class Parser {
     Type t;
     return find_type_name(cur().text, &t);
   }
+  bool is_qualifier_word(StringView w) const {
+    static const char* const q[] = {"const", "uniform", "attribute", "varying", "in", "out", "inout", "flat", "smooth", "centroid", "noperspective", "layout"};
+    for (const char* x : q) if (w.equals(x)) return true;
+    return false;
+  }
+  bool at_type_at(uint64_t ahead) const {
+    const Token& t = peek(ahead);
+    if (t.kind != Tok::Ident) return false;
+    Type unused;
+    return find_type_name(t.text, &unused);
+  }
+
   bool at_qualifier() const {
     if (cur().kind != Tok::Ident) return false;
-    static const char* const q[] = {"const", "uniform", "attribute", "varying", "in", "out", "inout", "highp", "mediump", "lowp", "flat", "smooth", "centroid", "invariant", "layout", "precision", "shared", "readonly", "writeonly", "coherent", "volatile", "restrict"};
+    static const char* const q[] = {"const", "uniform", "attribute", "varying", "in", "out", "inout", "highp", "mediump", "lowp", "flat", "smooth", "centroid", "invariant", "noperspective", "sample", "precise", "patch", "layout", "precision", "shared", "readonly", "writeonly", "coherent", "volatile", "restrict"};
     for (const char* w : q)
       if (cur().text.equals(w)) return true;
     return false;
@@ -890,12 +483,13 @@ class Parser {
     while (accept("[")) {
       if (is("]")) {
         ++pos_;
-        t->array = 0xFFFFFFFFu;   // unsized: the initializer says
+        t->array = kUnsizedArray;   // unsized: the initializer, a redeclaration or the indices used say
         continue;
       }
       const int32_t e = expression();
       int64_t v;
       if (e < 0 || !fold_int(e, &v) || v <= 0) return err("array size must be a positive constant");
+      if (v > static_cast<int64_t>(kMaxArrayLength)) return err("array too large");
       if (!expect("]")) return false;
       t->array = static_cast<uint32_t>(v);
     }
@@ -920,6 +514,13 @@ class Parser {
       add_builtin("gl_PointSize", f1, GlobalKind::Out, kBvPointSize);
       add_builtin("gl_VertexID", i1, GlobalKind::In, kBvVertexIndex);
       add_builtin("gl_InstanceID", i1, GlobalKind::In, kBvInstanceIndex);
+      if (m_.desktop) {
+        Type clip = f1;
+        clip.array = 8;
+        add_builtin("gl_ClipDistance", clip, GlobalKind::Out, kBvClipDistance);
+        // (gl_ClipVertex: written, clipping by it is the fixed-function clip planes' job, not done for programs yet)
+        if (m_.compatibility) { const int32_t g = new_global("gl_ClipVertex", f4, GlobalKind::Private, false); (void)g; }
+      }
     } else {
       add_builtin("gl_FragCoord", f4, GlobalKind::In, kBvFragCoord);
       add_builtin("gl_FrontFacing", b1, GlobalKind::In, kBvFrontFacing);
@@ -928,9 +529,27 @@ class Parser {
       add_builtin("gl_FragData", frag_data, GlobalKind::Out, kBvFragData);
       add_builtin("gl_FragDepth", f1, GlobalKind::Out, kBvFragDepth);
       add_builtin("gl_FragDepthEXT", f1, GlobalKind::Out, kBvFragDepth);
+      if (m_.desktop) {
+        const int32_t g = new_global("gl_PrimitiveID", i1, GlobalKind::Private, false);      // (always 0: primitives are not counted for the fragment stage)
+        if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->is_read_only = true;
+        Type clip = f1;
+        clip.array = 8;
+        add_builtin("gl_ClipDistance", clip, GlobalKind::In, kBvClipDistance);
+      }
     }
     const struct { const char* name; int v; } consts[] = {{"gl_MaxVertexAttribs", 16}, {"gl_MaxDrawBuffers", 4}, {"gl_MaxVertexUniformVectors", 1024},
-                                                          {"gl_MaxFragmentUniformVectors", 1024}, {"gl_MaxVaryingVectors", 30}, {"gl_MaxTextureImageUnits", 16}};
+                                                          {"gl_MaxFragmentUniformVectors", 1024}, {"gl_MaxVaryingVectors", 30}, {"gl_MaxTextureImageUnits", 14}};
+    // What desktop GLSL adds (the values the kernel's OpenGL reports through glGet).
+    const struct { const char* name; int v; } desktop_consts[] = {{"gl_MaxLights", 8}, {"gl_MaxClipPlanes", 8}, {"gl_MaxClipDistances", 8}, {"gl_MaxTextureUnits", 8}, {"gl_MaxTextureCoords", 8},
+                                                                  {"gl_MaxVertexUniformComponents", 16384}, {"gl_MaxFragmentUniformComponents", 16384}, {"gl_MaxVaryingFloats", 64},
+                                                                  {"gl_MaxVaryingComponents", 64}, {"gl_MaxVertexTextureImageUnits", 14}, {"gl_MaxCombinedTextureImageUnits", 14},
+                                                                  {"gl_MaxVertexOutputComponents", 64}, {"gl_MaxFragmentInputComponents", 64}};
+    if (m_.desktop)
+      for (const auto& c : desktop_consts) {
+        const int32_t n = int_node(c.v);
+        const int32_t g = new_global(c.name, i1, GlobalKind::Const, false);
+        if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->init = n;
+      }
     for (const auto& c : consts) {
       const int32_t n = int_node(c.v);
       const int32_t g = new_global(c.name, i1, GlobalKind::Const, false);
@@ -946,6 +565,16 @@ class Parser {
     }
   }
 
+  // Room for a global in its region; false (an error) if the module would need more than any shader may.
+  bool place_global(Global& g) {
+    const uint32_t n = m_.slots_of(g.type);
+    uint32_t& top = g.shared ? m_.shared_slots : m_.private_slots;
+    if (n >= kMaxValueSlots || top > kMaxValueSlots - n) return err("the shader's variables are too large");
+    g.slot = top;
+    top += n;
+    return true;
+  }
+
   int32_t new_global(StringView name, const Type& t, GlobalKind kind, bool shared) {
     UniquePointer<Global> g = UniquePointer<Global>::make(a_, a_);
     if (!g) { err("out of memory"); return -1; }
@@ -953,13 +582,42 @@ class Parser {
     g->type = t;
     g->kind = kind;
     g->shared = shared;
-    const uint32_t n = m_.slots_of(t);
-    if (shared) { g->slot = m_.shared_slots; m_.shared_slots += n; }
-    else { g->slot = m_.private_slots; m_.private_slots += n; }
+    // An unsized array gets its room once its size is known (finish_unsized), at the end.
+    if (t.array != kUnsizedArray && !place_global(*g)) return -1;
     m_.globals.push_back(static_cast<UniquePointer<Global>&&>(g));
     const int32_t idx = static_cast<int32_t>(m_.globals.count() - 1);
+    if (t.array == kUnsizedArray && !unsized_.push_back(Unsized{idx, 0})) { err("out of memory"); return -1; }
     add_sym(name, t, 1, idx);
     return idx;
+  }
+
+  struct UnsizedLocal { int32_t local; int32_t decl; uint32_t length; };
+  List<UnsizedLocal> unsized_locals_{a_};
+  UnsizedLocal* unsized_local_of(int32_t local) {
+    for (UnsizedLocal& u : unsized_locals_) if (u.local == local) return &u;
+    return nullptr;
+  }
+  void finish_unsized_locals() {
+    for (const UnsizedLocal& u : unsized_locals_) {
+      Node& d = m_.nodes[static_cast<uint64_t>(u.decl)];
+      if (d.type.array == kUnsizedArray) d.type.array = u.length ? u.length : 1;
+    }
+    unsized_locals_.clear();
+  }
+
+  Unsized* unsized_of(int32_t global) {
+    for (Unsized& u : unsized_) if (u.global == global) return &u;
+    return nullptr;
+  }
+  bool finish_unsized() {
+    for (const Unsized& u : unsized_) {
+      Global& g = *m_.globals[static_cast<uint64_t>(u.global)];
+      if (g.type.array != kUnsizedArray) continue;      // (redeclared with a size)
+      g.type.array = u.length ? u.length : 1;
+      if (!place_global(g)) return false;
+      if (Sym* s = find_sym(g.name.view())) if (s->kind == 1 && s->index == u.global) s->type = g.type;
+    }
+    return true;
   }
 
   struct Quals {
@@ -1006,6 +664,17 @@ class Parser {
 
   void top_level() {
     if (accept(";")) return;
+    if (is_id("invariant") && peek().kind == Tok::Ident && !at_type_at(1) && !is_qualifier_word(peek().text)) {
+      // `invariant gl_Position, v;`: every value is computed the same way here already
+      ++pos_;
+      while (cur().kind == Tok::Ident && !failed_) {
+        if (!find_sym(cur().text)) { err("invariant names an undeclared variable"); return; }
+        ++pos_;
+        if (!accept(",")) break;
+      }
+      expect(";");
+      return;
+    }
     if (is_id("precision")) {
       while (!is(";") && cur().kind != Tok::End) ++pos_;
       expect(";");
@@ -1071,6 +740,21 @@ class Parser {
   }
 
   void declare_global_variable(StringView name, Type t, const Quals& q, int32_t init) {
+    // `float a[];` then `float a[4];`: the second gives the first its size (it must cover the indices used so far).
+    if (t.array && t.array != kUnsizedArray) {
+      const int32_t old = m_.find_global(name);
+      if (old >= 0) {
+        Global& og = *m_.globals[static_cast<uint64_t>(old)];
+        Unsized* u = unsized_of(old);
+        if (u && og.type.array == kUnsizedArray && og.type.element() == t.element()) {
+          if (u->length > t.array) { err("array redeclared smaller than an index used"); return; }
+          og.type.array = t.array;
+          if (!place_global(og)) return;
+          if (Sym* s = find_sym(name)) if (s->kind == 1 && s->index == old) s->type = og.type;
+          return;
+        }
+      }
+    }
     GlobalKind kind = GlobalKind::Private;
     bool shared = false;
     if (q.is_const && !q.uniform) kind = GlobalKind::Const;
@@ -1136,9 +820,12 @@ class Parser {
         ++pos_;
         Type t = ft;
         if (is("[") && !parse_array_suffix(&t)) return false;
+        if (t.array == kUnsizedArray) return err("a structure member must have a size");
         f.type = t;
         f.offset = offset;
-        offset += m_.slots_of(t);
+        const uint32_t n = m_.slots_of(t);
+        if (n >= kMaxValueSlots || offset > kMaxValueSlots - n) return err("structure too large");
+        offset += n;
         sd->fields.push_back(static_cast<Field&&>(f));
         if (!accept(",")) break;
       }
@@ -1154,16 +841,31 @@ class Parser {
     return true;
   }
 
+  // A uniform block (Module::blocks), or an in/out interface block, whose members are plain varyings of the stage.
   void uniform_block(const Quals& q) {
-    UniquePointer<UniformBlock> blk = UniquePointer<UniformBlock>::make(a_, a_);
-    if (!blk) { err("out of memory"); return; }
-    blk->name.assign(cur().text);
-    blk->binding = q.binding;
+    const bool is_uniform = q.uniform;
+    int32_t bi = -1;
+    if (is_uniform) {
+      UniquePointer<UniformBlock> blk = UniquePointer<UniformBlock>::make(a_, a_);
+      if (!blk) { err("out of memory"); return; }
+      blk->name.assign(cur().text);
+      blk->binding = q.binding;
+      bi = static_cast<int32_t>(m_.blocks.count());
+      m_.blocks.push_back(static_cast<UniquePointer<UniformBlock>&&>(blk));
+    }
+    const int32_t iface = is_uniform ? -1 : interfaces_++;
+    const StringView block_name = cur().text;
     ++pos_;
     if (!expect("{")) return;
-    const int32_t bi = static_cast<int32_t>(m_.blocks.count());
-    m_.blocks.push_back(static_cast<UniquePointer<UniformBlock>&&>(blk));
-    const bool is_uniform = q.uniform;
+    // An interface block with an instance name: its members are only reached as inst.member, and are named Block.member (as GL names them), so they cannot collide
+    // with the stage's other varyings and match the other stage's block by block and member name.
+    bool named_interface = false;
+    if (!is_uniform) {
+      uint64_t k = pos_;
+      while (k < toks_.count() && toks_[k].kind != Tok::End && !(toks_[k].text.equals("}"))) ++k;
+      named_interface = k + 1 < toks_.count() && toks_[k + 1].kind == Tok::Ident;
+    }
+    String qualified(a_);
     uint32_t offset = 0;
     List<int32_t> members(a_);
     while (!is("}") && !failed_ && cur().kind != Tok::End) {
@@ -1177,10 +879,21 @@ class Parser {
         ++pos_;
         Type t = mt;
         if (is("[") && !parse_array_suffix(&t)) return;
-        const int32_t g = new_global(name, t, is_uniform ? GlobalKind::Uniform : (q.in ? GlobalKind::In : GlobalKind::Out), is_uniform);
+        StringView global_name = name;
+        if (named_interface) {
+          qualified.assign(block_name);
+          qualified.push_back('.');
+          qualified.append(name);
+          global_name = qualified.view();
+        }
+        const int32_t g = new_global(global_name, t, is_uniform ? GlobalKind::Uniform : (q.in ? GlobalKind::In : GlobalKind::Out), is_uniform);
         if (g < 0) return;
         Global& gv = *m_.globals[static_cast<uint64_t>(g)];
         gv.block = bi;
+        gv.iface = iface;
+        if (!is_uniform) {      // (a member's own interpolation qualifier)
+          gv.flat = gv.flat || mq.flat || q.flat;
+        }
         members.push_back(g);
         (void)offset;
         if (!accept(",")) break;
@@ -1189,8 +902,12 @@ class Parser {
     }
     if (!expect("}")) return;
     if (cur().kind == Tok::Ident) {   // instance name
-      m_.blocks[static_cast<uint64_t>(bi)]->instance.assign(cur().text);
-      add_sym(cur().text, make_type(Base::Void), 2, bi);
+      if (is_uniform) {
+        m_.blocks[static_cast<uint64_t>(bi)]->instance.assign(cur().text);
+        add_sym(cur().text, make_type(Base::Void), 2, bi);
+      } else {
+        add_sym(cur().text, make_type(Base::Void), 3, iface);
+      }
       ++pos_;
     }
     expect(";");
@@ -1253,6 +970,7 @@ class Parser {
     for (uint64_t i = 0; i < pnames.count(); ++i)
       if (!pnames[i]->empty()) add_sym(pnames[i]->view(), F.params[i].type, 0, static_cast<int32_t>(i));
     const int32_t body = block_stmt(false);
+    finish_unsized_locals();
     pop_scope();
     m_.functions[static_cast<uint64_t>(index)]->body = body;
     m_.functions[static_cast<uint64_t>(index)]->locals = nlocals_;
@@ -1368,7 +1086,7 @@ class Parser {
   }
 
   bool starts_decl() {
-    if (is_id("const") || is_id("highp") || is_id("mediump") || is_id("lowp") || is_id("precision")) return true;
+    if (is_id("const") || is_id("highp") || is_id("mediump") || is_id("lowp") || is_id("precision") || is_id("struct")) return true;
     if (!at_type()) return false;
     Type t;
     find_type_name(cur().text, &t);
@@ -1392,7 +1110,12 @@ class Parser {
       return add(e);
     }
     Type base;
-    if (!parse_type(&base)) return -1;
+    if (is_id("struct")) {      // a structure declared inside a function (and maybe variables of it)
+      if (!struct_decl(&base)) return -1;
+      if (accept(";")) { Node e; e.kind = NodeKind::Empty; return add(e); }
+    } else if (!parse_type(&base)) {
+      return -1;
+    }
     List<int32_t> decls(a_);
     for (;;) {
       if (cur().kind != Tok::Ident) return err("expected a variable name"), -1;
@@ -1406,7 +1129,6 @@ class Parser {
         if (init < 0) return -1;
         if (t.array == 0xFFFFFFFFu) t.array = init_array_size(init);
       }
-      if (t.array == 0xFFFFFFFFu) return err("unsized array without an initializer"), -1;
       Node d;
       d.kind = NodeKind::Decl;
       d.type = t;
@@ -1414,8 +1136,11 @@ class Parser {
       d.ival = static_cast<int32_t>(nlocals_);
       d.line = cur().line;
       add_sym(name, t, 0, static_cast<int32_t>(nlocals_));
+      const int32_t decl = add(d);
+      // An unsized local is sized by the constant indices it is used with, when the function ends (finish_unsized_locals).
+      if (t.array == kUnsizedArray && !unsized_locals_.push_back(UnsizedLocal{static_cast<int32_t>(nlocals_), decl, 0})) return err("out of memory"), -1;
       ++nlocals_;
-      decls.push_back(add(d));
+      decls.push_back(decl);
       if (!accept(",")) break;
     }
     if (!expect(";")) return -1;
@@ -1624,6 +1349,23 @@ class Parser {
         n.a = e;
         n.b = expression();
         if (n.b < 0 || !expect("]")) return -1;
+        const Node& base = m_.nodes[static_cast<uint64_t>(e)];
+        if (base.kind == NodeKind::Local) {
+          if (UnsizedLocal* u = unsized_local_of(base.ival)) {
+            int64_t v;
+            if (!fold_int(n.b, &v) || v < 0) return err("an unsized array can only be indexed with a constant"), -1;
+            if (v >= static_cast<int64_t>(kMaxArrayLength)) return err("array too large"), -1;
+            if (static_cast<uint32_t>(v) + 1 > u->length) u->length = static_cast<uint32_t>(v) + 1;
+          }
+        }
+        if (base.kind == NodeKind::Global && m_.globals[static_cast<uint64_t>(base.ival)]->type.array == kUnsizedArray) {
+          // An unsized array grows to the highest constant index it is used with; a variable index needs a size (GLSL 1.10, 4.1.9).
+          int64_t v;
+          Unsized* u = unsized_of(base.ival);
+          if (!u || !fold_int(n.b, &v) || v < 0) return err("an unsized array can only be indexed with a constant"), -1;
+          if (v >= static_cast<int64_t>(kMaxArrayLength)) return err("array too large"), -1;
+          if (static_cast<uint32_t>(v) + 1 > u->length) u->length = static_cast<uint32_t>(v) + 1;
+        }
         e = add(n);
       } else if (is(".")) {
         ++pos_;
@@ -1739,15 +1481,19 @@ class Parser {
       ++pos_;
       return -1;
     }
-    if (s->kind == 2) {   // block instance: inst.member
+    if (s->kind == 2 || s->kind == 3) {   // block instance (uniform 2, interface 3): inst.member
       if (!accept(".") || cur().kind != Tok::Ident) return err("expected a member of the block"), -1;
       const StringView member = cur().text;
       ++pos_;
       for (uint64_t i = m_.globals.count(); i > 0; --i) {
         const Global& g = *m_.globals[i - 1];
-        if (g.block == s->index && g.name.view().equals(member)) {
+        const StringView gn = g.name.view();
+        const bool named = s->kind == 2 ? gn.equals(member)
+                                         : (gn.size() > member.size() && gn[gn.size() - member.size() - 1] == '.' && gn.substr(gn.size() - member.size(), member.size()).equals(member));
+        if ((s->kind == 2 ? g.block : g.iface) == s->index && named) {
           n.kind = NodeKind::Global;
           n.ival = static_cast<int32_t>(i - 1);
+          m_.globals[i - 1]->referenced = true;
           return add(n);
         }
       }
@@ -1832,6 +1578,7 @@ class Parser {
     Node n;
     n.kind = NodeKind::TexCall;
     n.op = static_cast<Op>(op);
+    if (t.legacy_shadow) n.flags |= 2;
     n.first = add_kids(kid, 9);
     n.count = 9;
     n.line = cur().line;
@@ -1842,18 +1589,43 @@ class Parser {
 
 }  // namespace
 
-bool parse_glsl(Module& module, StringView source, Stage stage) {
+bool parse_glsl(Module& module, StringView source, Stage stage, const GlslOptions& glsl) {
   module.stage = stage;
   module.language = Language::Glsl100;
-  String pp(module.allocator);
-  uint32_t version = 100;
-  Preprocessor pre(module.allocator, &module.error);
-  if (!pre.run(source, &pp, &version)) {
-    if (module.error.empty()) module.error.assign("preprocessor error");
+  // The preprocessor is glcpp's (GlslPreprocessor.cpp). Its output keeps #version, #extension, #pragma and #line as lines: they are blanked here, keeping the line count.
+  PreprocessOptions options;
+  options.default_version = glsl.desktop ? 110 : 100;
+  options.default_es = !glsl.desktop;
+  PreprocessResult pre(module.allocator);
+  if (!preprocess_glsl(module.allocator, source, options, &pre)) {
+    module.error.assign(pre.log.empty() ? StringView("preprocessor error") : pre.log.view());
     return false;
   }
-  module.glsl_version = version;
-  if (version >= 300) module.language = Language::Glsl300;
+  const uint32_t version = pre.version;
+  String pp(module.allocator);
+  {
+    const StringView text = pre.output.view();
+    uint64_t i = 0;
+    while (i < text.size()) {
+      uint64_t end = i;
+      while (end < text.size() && text[end] != '\n') ++end;
+      uint64_t k = i;
+      while (k < end && (text[k] == ' ' || text[k] == '\t' || text[k] == '\r')) ++k;
+      if (k >= end || text[k] != '#') pp.append(text.substr(i, end - i));
+      if (end < text.size()) pp.append("\n");
+      i = end + 1;
+    }
+  }
+  if (glsl.desktop && !pre.es) {
+    // Desktop GLSL: 1.10 and 1.20 by the 1.00 rules, 1.30 and later by the 3.00 ones, with what desktop GLSL adds (Module::desktop).
+    module.desktop = true;
+    module.desktop_version = version;
+    module.compatibility = version <= 140 || pre.profile == 2;
+    module.glsl_version = version >= 130 ? 300 : 100;
+  } else {
+    module.glsl_version = version;
+  }
+  if (module.glsl_version >= 300) module.language = Language::Glsl300;
   List<Token> toks(module.allocator);
   if (!lex(pp.view(), &toks)) {
     module.error.assign("out of memory");

@@ -143,6 +143,8 @@ void GlContext::sample(const shader::SampleRequest& rq, uint32_t out[4]) {
     case shader::kDim3D: id = u.tex3d; break;
     case shader::kDim2DArray: id = u.array; break;
     case shader::kDim1D: id = u.tex1d; break;
+    case shader::kDim1DArray: id = u.array1d; break;
+    case shader::kDimRect: id = u.rect; break;
     default: id = (desktop.ff_1d_mask >> unit) & 1 ? u.tex1d : ((desktop.ff_rect_mask >> unit) & 1 ? u.rect : u.tex2d); break;
   }
   const Texture* t = texture_at(id);
@@ -154,7 +156,42 @@ void GlContext::sample(const shader::SampleRequest& rq, uint32_t out[4]) {
     tmp.min_filter = t->min_filter; tmp.mag_filter = t->mag_filter; tmp.wrap_s = t->wrap_s; tmp.wrap_t = t->wrap_t; tmp.wrap_r = t->wrap_r;
     tmp.compare_mode = t->compare_mode; tmp.compare_func = t->compare_func; tmp.min_lod = t->min_lod; tmp.max_lod = t->max_lod;
   }
+  if (rq.dim == shader::kDimRect || rq.dim == shader::kDim1DArray) {
+    // Rectangles take texel coordinates; a 1D array is a 2D image whose rows are its layers (the layer is a row's centre).
+    shader::SampleRequest r = rq;
+    const Image* level0 = t->images.count() && t->images[0] ? t->images[0].get() : nullptr;
+    if (level0 && level0->defined()) {
+      if (rq.dim == shader::kDimRect && rq.mode != shader::SampleMode::Fetch && rq.mode != shader::SampleMode::Size) {
+        r.coord[0] /= static_cast<float>(level0->w);
+        r.coord[1] /= static_cast<float>(level0->h);
+      }
+      if (rq.dim == shader::kDim1DArray && rq.mode != shader::SampleMode::Fetch && rq.mode != shader::SampleMode::Size) {
+        float layer = rq.coord[1] < 0 ? 0 : rq.coord[1];
+        const float last = static_cast<float>(level0->h) - 1;
+        if (layer > last) layer = last;
+        const float rounded = static_cast<float>(static_cast<int32_t>(layer + 0.5f));
+        r.coord[1] = (rounded + 0.5f) / static_cast<float>(level0->h);
+      }
+    }
+    r.dim = shader::kDim2D;
+    sample_texture(*t, *so, r, out);
+    depth_texture_mode(*t, rq, out);
+    return;
+  }
   sample_texture(*t, *so, rq, out);
+  depth_texture_mode(*t, rq, out);
+}
+
+// shadow1D/shadow2D (desktop GLSL 1.10-1.20): the comparison as GL_DEPTH_TEXTURE_MODE says, luminance (r, r, r, 1), intensity (r, r, r, r), alpha (0, 0, 0, r) or red (r, 0, 0, 1).
+void GlContext::depth_texture_mode(const Texture& t, const shader::SampleRequest& rq, uint32_t out[4]) const {
+  if (!rq.legacy_vec4) return;
+  const uint32_t r = out[0], one = __builtin_bit_cast(uint32_t, 1.0f), zero = 0;
+  switch (t.depth_mode) {
+    case 0x8049: out[0] = out[1] = out[2] = out[3] = r; break;      // GL_INTENSITY
+    case 0x1906: out[0] = out[1] = out[2] = zero; out[3] = r; break;      // GL_ALPHA
+    case 0x1903: out[0] = r; out[1] = out[2] = zero; out[3] = one; break;      // GL_RED
+    default: out[0] = out[1] = out[2] = r; out[3] = one; break;      // GL_LUMINANCE
+  }
 }
 
 static const Image* texture_image_at(const void* ctx, uint32_t face, int32_t level) {

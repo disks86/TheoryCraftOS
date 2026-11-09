@@ -582,6 +582,7 @@ class GlContext final : public shader::ITextureHost {
   static uint32_t face_index(uint32_t target);
   bool texture_complete(const Texture& t, const SamplerObj& s, bool* is_cube) const;
   void sample_texture(const Texture& t, const SamplerObj& s, const shader::SampleRequest& rq, uint32_t out[4]) const;
+  void depth_texture_mode(const Texture& t, const shader::SampleRequest& rq, uint32_t out[4]) const;
 
   // render targets
   struct Target {

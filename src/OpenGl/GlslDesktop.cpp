@@ -55,19 +55,67 @@ constexpr Rename kRenames[] = {
     {"gl_ModelViewMatrixInverse", "tcos_ModelViewMatrixInverse", "tcos_ModelViewMatrixInverse", kUseModelViewInverse},
     {"gl_NormalScale", "tcos_NormalScale", "tcos_NormalScale", kUseNormalScale},
     {"ftransform", "tcos_ftransform", nullptr, kUseMvp},
-    {"gl_FragColor", nullptr, "tcos_FragColor", 0},
-    {"gl_FragData", nullptr, "tcos_FragData", 0},
-    {"texture2D", "texture", "texture", 0}, {"texture3D", "texture", "texture", 0}, {"textureCube", "texture", "texture", 0}, {"shadow2D", "texture", "texture", 0},
-    {"texture2DProj", "textureProj", "textureProj", 0}, {"texture2DLod", "textureLod", "textureLod", 0}, {"texture2DRect", "texture", "texture", 0},
-    {"sampler2DRect", "sampler2D", "sampler2D", 0},
 };
 
-int32_t parse_version(StringView text, uint64_t* line_end, bool* es) {
-  // The first #version directive (before any other code, as GLSL requires; comments are not looked into).
+// The uniform state of the compatibility profile (GLSL 1.20, 7.5): each becomes tcos_<name> in both stages, declared with the structure type it needs.
+struct StateUniform {
+  const char* name;          // as the shader writes it
+  const char* declaration;   // after `uniform `, with the name as tcos_...
+  int8_t structure;          // index in kStateStructs, or -1
+};
+constexpr const char* kStateStructs[] = {
+    "struct tcos_DepthRangeParameters { float near; float far; float diff; };\n",
+    "struct tcos_PointParameters { float size; float sizeMin; float sizeMax; float fadeThresholdSize; float distanceConstantAttenuation; float distanceLinearAttenuation; float distanceQuadraticAttenuation; };\n",
+    "struct tcos_MaterialParameters { vec4 emission; vec4 ambient; vec4 diffuse; vec4 specular; float shininess; };\n",
+    "struct tcos_LightSourceParameters { vec4 ambient; vec4 diffuse; vec4 specular; vec4 position; vec4 halfVector; vec3 spotDirection; float spotExponent; float spotCutoff; float spotCosCutoff; float constantAttenuation; float linearAttenuation; float quadraticAttenuation; };\n",
+    "struct tcos_LightModelParameters { vec4 ambient; };\n",
+    "struct tcos_LightModelProducts { vec4 sceneColor; };\n",
+    "struct tcos_LightProducts { vec4 ambient; vec4 diffuse; vec4 specular; };\n",
+    "struct tcos_FogParameters { vec4 color; float density; float start; float end; float scale; };\n",
+};
+constexpr StateUniform kState[] = {
+    {"gl_DepthRange", "tcos_DepthRangeParameters tcos_DepthRange", 0},
+    {"gl_Point", "tcos_PointParameters tcos_Point", 1},
+    {"gl_FrontMaterial", "tcos_MaterialParameters tcos_FrontMaterial", 2},
+    {"gl_BackMaterial", "tcos_MaterialParameters tcos_BackMaterial", 2},
+    {"gl_LightSource", "tcos_LightSourceParameters tcos_LightSource[8]", 3},
+    {"gl_LightModel", "tcos_LightModelParameters tcos_LightModel", 4},
+    {"gl_FrontLightModelProduct", "tcos_LightModelProducts tcos_FrontLightModelProduct", 5},
+    {"gl_BackLightModelProduct", "tcos_LightModelProducts tcos_BackLightModelProduct", 5},
+    {"gl_FrontLightProduct", "tcos_LightProducts tcos_FrontLightProduct[8]", 6},
+    {"gl_BackLightProduct", "tcos_LightProducts tcos_BackLightProduct[8]", 6},
+    {"gl_Fog", "tcos_FogParameters tcos_Fog", 7},
+    {"gl_ClipPlane", "vec4 tcos_ClipPlane[8]", -1},
+    {"gl_TextureEnvColor", "vec4 tcos_TextureEnvColor[8]", -1},
+    {"gl_EyePlaneS", "vec4 tcos_EyePlaneS[8]", -1}, {"gl_EyePlaneT", "vec4 tcos_EyePlaneT[8]", -1}, {"gl_EyePlaneR", "vec4 tcos_EyePlaneR[8]", -1}, {"gl_EyePlaneQ", "vec4 tcos_EyePlaneQ[8]", -1},
+    {"gl_ObjectPlaneS", "vec4 tcos_ObjectPlaneS[8]", -1}, {"gl_ObjectPlaneT", "vec4 tcos_ObjectPlaneT[8]", -1}, {"gl_ObjectPlaneR", "vec4 tcos_ObjectPlaneR[8]", -1}, {"gl_ObjectPlaneQ", "vec4 tcos_ObjectPlaneQ[8]", -1},
+    {"gl_ModelViewMatrixTranspose", "mat4 tcos_ModelViewMatrixTranspose", -1}, {"gl_ModelViewMatrixInverseTranspose", "mat4 tcos_ModelViewMatrixInverseTranspose", -1},
+    {"gl_ProjectionMatrixInverse", "mat4 tcos_ProjectionMatrixInverse", -1}, {"gl_ProjectionMatrixTranspose", "mat4 tcos_ProjectionMatrixTranspose", -1},
+    {"gl_ProjectionMatrixInverseTranspose", "mat4 tcos_ProjectionMatrixInverseTranspose", -1},
+    {"gl_ModelViewProjectionMatrixInverse", "mat4 tcos_ModelViewProjectionMatrixInverse", -1}, {"gl_ModelViewProjectionMatrixTranspose", "mat4 tcos_ModelViewProjectionMatrixTranspose", -1},
+    {"gl_ModelViewProjectionMatrixInverseTranspose", "mat4 tcos_ModelViewProjectionMatrixInverseTranspose", -1},
+    {"gl_TextureMatrixInverse", "mat4 tcos_TextureMatrixInverse[8]", -1}, {"gl_TextureMatrixTranspose", "mat4 tcos_TextureMatrixTranspose[8]", -1},
+    {"gl_TextureMatrixInverseTranspose", "mat4 tcos_TextureMatrixInverseTranspose[8]", -1},
+};
+
+// The first #version directive, past white space and comments (GLSL lets nothing else come before it): its number, the end of its line, and its line number.
+int32_t parse_version(StringView text, uint64_t* line_end, uint32_t* line, bool* es) {
   *line_end = 0;
+  *line = 0;
   *es = false;
   uint64_t i = 0;
-  while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n')) ++i;
+  uint32_t lines = 1;
+  for (;;) {
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n')) { if (text[i] == '\n') ++lines; ++i; }
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '/') { while (i < text.size() && text[i] != '\n') ++i; continue; }
+    if (i + 1 < text.size() && text[i] == '/' && text[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < text.size() && !(text[i] == '*' && text[i + 1] == '/')) { if (text[i] == '\n') ++lines; ++i; }
+      i = i + 2 < text.size() ? i + 2 : text.size();
+      continue;
+    }
+    break;
+  }
   const StringView directive("#version");
   if (text.size() - i < directive.size() || !text.substr(i, directive.size()).equals(directive)) return -1;
   i += directive.size();
@@ -79,35 +127,88 @@ int32_t parse_version(StringView text, uint64_t* line_end, bool* es) {
   const StringView rest = text.substr(i, end - i);
   for (uint64_t k = 0; k + 1 < rest.size(); ++k)
     if (rest[k] == 'e' && rest[k + 1] == 's' && (k == 0 || !ident_char(rest[k - 1])) && (k + 2 >= rest.size() || !ident_char(rest[k + 2]))) *es = true;
-  *line_end = end;
+  *line_end = end < text.size() ? end + 1 : end;
+  *line = lines;
   return v;
 }
 
 }  // namespace
 
+// A shader's own declaration of gl_TexCoord (`varying vec4 gl_TexCoord[4];`, GLSL 1.10 lets it give a size): the translation declares the 8 of them itself, so the
+// redeclaration is blanked (spaces, newlines kept). Returns the text, changed or not, in `out`.
+void drop_texcoord_redeclarations(StringView text, String* out) {
+  out->clear();
+  uint64_t i = 0, copied = 0;
+  while (i < text.size()) {
+    if (!ident_char(text[i]) || (i > 0 && ident_char(text[i - 1]))) { ++i; continue; }
+    uint64_t j = i;
+    while (j < text.size() && ident_char(text[j])) ++j;
+    const StringView word = text.substr(i, j - i);
+    if (word.equals("varying") || word.equals("in") || word.equals("out")) {
+      // qualifier, white space, vec4, white space, gl_TexCoord, white space, [ ... ], white space, ;
+      uint64_t k = j;
+      const auto spaces = [&]() { while (k < text.size() && (text[k] == ' ' || text[k] == '\t' || text[k] == '\n' || text[k] == '\r')) ++k; };
+      const auto take = [&](const char* w) {
+        const StringView v(w);
+        if (text.size() - k < v.size() || !text.substr(k, v.size()).equals(v) || (k + v.size() < text.size() && ident_char(text[k + v.size()]))) return false;
+        k += v.size();
+        return true;
+      };
+      spaces();
+      if (take("vec4")) {
+        spaces();
+        if (take("gl_TexCoord")) {
+          spaces();
+          bool ok = true;
+          if (k < text.size() && text[k] == '[') {
+            while (k < text.size() && text[k] != ']') ++k;
+            if (k < text.size()) ++k; else ok = false;
+            spaces();
+          }
+          if (ok && k < text.size() && text[k] == ';') {
+            ++k;
+            out->append(text.substr(copied, i - copied));
+            for (uint64_t c = i; c < k; ++c) out->append(text[c] == '\n' ? StringView("\n") : StringView(" "));
+            copied = k;
+            i = k;
+            continue;
+          }
+        }
+      }
+    }
+    i = j;
+  }
+  out->append(text.substr(copied, text.size() - copied));
+}
+
 bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_t* uses) {
   *uses = 0;
   uint64_t body = 0;
+  uint32_t version_line = 0;
   bool es = false;
-  int32_t version = parse_version(source, &body, &es);
-  if (es || version == 100) return false;      // already GLSL ES
+  int32_t version = parse_version(source, &body, &version_line, &es);
+  if (es || version == 100 || version == 300 || version == 310 || version == 320) return false;      // GLSL ES: as it is
   if (version < 0) { version = 110; body = 0; }
   const bool modern = version >= 130;
   // Which built-ins are named (whole identifiers only), so only those are declared.
   bool used[sizeof(kRenames) / sizeof(kRenames[0])] = {};
-  const StringView text = source.substr(body, source.size() - body);
+  bool used_state[sizeof(kState) / sizeof(kState[0])] = {};
+  String cleaned(out->allocator());
+  drop_texcoord_redeclarations(source.substr(body, source.size() - body), &cleaned);
+  const StringView text = cleaned.view();
   for (uint64_t i = 0; i < text.size();) {
     if (!ident_char(text[i]) || (i > 0 && ident_char(text[i - 1]))) { ++i; continue; }
     uint64_t j = i;
     while (j < text.size() && ident_char(text[j])) ++j;
     const StringView word = text.substr(i, j - i);
     for (uint64_t r = 0; r < sizeof(kRenames) / sizeof(kRenames[0]); ++r) if (word.equals(kRenames[r].from)) used[r] = true;
+    for (uint64_t r = 0; r < sizeof(kState) / sizeof(kState[0]); ++r) if (word.equals(kState[r].name)) used_state[r] = true;
     i = j;
   }
   out->clear();
-  out->append(modern ? "#version 300 es\n" : "#version 100\n");
-  out->append("precision highp float;\nprecision highp int;\n");
-  if (modern) out->append("precision highp sampler3D;\nprecision highp samplerCube;\nprecision highp sampler2DShadow;\nprecision highp sampler2DArray;\n");
+  // The shader's own #version line stays first; the declarations follow it.
+  out->append(source.substr(0, body));
+  if (body && (source[body - 1] != '\n')) out->append("\n");
   const char* attribute = modern ? "in" : "attribute";
   const char* varying_out = modern ? "out" : "varying";
   const char* varying_in = modern ? "in" : "varying";
@@ -139,8 +240,6 @@ bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_
       else if (name.equals("gl_SecondaryColor")) decl(varying_in, "vec4", "tcos_FrontSecondaryColor", "");
       else if (name.equals("gl_TexCoord")) decl(varying_in, "vec4", "tcos_TexCoord", "[8]");
       else if (name.equals("gl_FogFragCoord")) decl(varying_in, "float", "tcos_FogFragCoord", "");
-      else if (name.equals("gl_FragColor") && modern) decl("out", "vec4", "tcos_FragColor", "");
-      else if (name.equals("gl_FragData") && modern) decl("out", "vec4", "tcos_FragData", "[8]");
     }
     if (name.equals("gl_ModelViewMatrix")) decl("uniform", "mat4", "tcos_ModelViewMatrix", "");
     else if (name.equals("gl_ProjectionMatrix")) decl("uniform", "mat4", "tcos_ProjectionMatrix", "");
@@ -149,6 +248,17 @@ bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_
     else if (name.equals("gl_TextureMatrix")) decl("uniform", "mat4", "tcos_TextureMatrix", "[8]");
     else if (name.equals("gl_ModelViewMatrixInverse")) decl("uniform", "mat4", "tcos_ModelViewMatrixInverse", "");
     else if (name.equals("gl_NormalScale")) decl("uniform", "float", "tcos_NormalScale", "");
+  }
+  // The uniform state, each structure type once.
+  bool struct_done[sizeof(kStateStructs) / sizeof(kStateStructs[0])] = {};
+  for (uint64_t r = 0; r < sizeof(kState) / sizeof(kState[0]); ++r) {
+    if (!used_state[r]) continue;
+    *uses |= kUseState;
+    const int8_t st = kState[r].structure;
+    if (st >= 0 && !struct_done[st]) { out->append(kStateStructs[st]); struct_done[st] = true; }
+    out->append("uniform ");
+    out->append(kState[r].declaration);
+    out->append(";\n");
   }
   // ftransform() needs the vertex too.
   bool ftransform = false;
@@ -160,7 +270,16 @@ bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_
     out->append("vec4 tcos_ftransform() { return tcos_ModelViewProjectionMatrix * tcos_Vertex; }\n");
   }
   // The rest of the text, built-ins renamed; `#version` gone, and in a 300 es translation the desktop keywords attribute/varying become in/out.
-  out->append("#line 2\n");
+  {      // (the text after the declarations keeps its line numbers)
+    char line[24] = "#line ";
+    uint32_t n = version_line + 1, k = 6;
+    char digits[12];
+    uint32_t d = 0;
+    do { digits[d++] = static_cast<char>('0' + n % 10); n /= 10; } while (n && d < sizeof(digits));
+    while (d) line[k++] = digits[--d];
+    line[k++] = '\n';
+    out->append(StringView(line, k));
+  }
   for (uint64_t i = 0; i < text.size();) {
     if (!ident_char(text[i]) || (i > 0 && ident_char(text[i - 1]))) {
       const char c[2] = {text[i], 0};
@@ -172,19 +291,22 @@ bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_
     while (j < text.size() && ident_char(text[j])) ++j;
     const StringView word = text.substr(i, j - i);
     const char* replacement = nullptr;
-    for (const Rename& r : kRenames) {
+    char state_name[64];
+    for (const StateUniform& st : kState) {
+      if (!word.equals(st.name) || word.size() + 3 > sizeof(state_name)) continue;
+      // gl_X -> tcos_X
+      const char* prefix = "tcos_";
+      uint64_t k = 0;
+      for (; prefix[k]; ++k) state_name[k] = prefix[k];
+      for (uint64_t c = 3; c < word.size(); ++c) state_name[k++] = word[c];
+      state_name[k] = 0;
+      replacement = state_name;
+    }
+    if (!replacement) for (const Rename& r : kRenames) {
       if (!word.equals(r.from)) continue;
-      const bool is_texture_fn = StringView(r.from).starts_with("texture") || StringView(r.from).starts_with("shadow") || StringView(r.from).starts_with("sampler2DRect");
-      if (is_texture_fn && !modern) {
-        replacement = StringView(r.from).equals("sampler2DRect") ? "sampler2D" : StringView(r.from).equals("texture2DRect") ? "texture2D" : nullptr;
-        break;
-      }
       replacement = vertex ? r.vertex_to : r.fragment_to;
-      if (!modern && (StringView(r.from).equals("gl_FragColor") || StringView(r.from).equals("gl_FragData"))) replacement = nullptr;
       break;
     }
-    if (modern && !replacement && (word.equals("attribute") || word.equals("varying"))) replacement = word.equals("attribute") ? "in" : (vertex ? "out" : "in");
-    if (!replacement && (word.equals("core") || word.equals("compatibility"))) replacement = "";
     out->append(replacement ? StringView(replacement) : word);
     i = j;
   }

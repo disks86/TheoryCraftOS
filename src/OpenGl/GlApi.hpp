@@ -213,6 +213,7 @@ class GlApi {
   void load_fixed_uniforms(FixedProgram& p);
   uint32_t compile_program(StringView vs, StringView fs);
   void load_compat_uniforms(uint32_t engine_program);
+  bool compat_value(StringView name, uint32_t element, float out[16], uint32_t* cols, uint32_t* rows);
 
   // --- immediate mode
   static constexpr uint32_t kImmFloats = 4 + 3 + 4 + 4 + 1 + 4 * kMaxTexUnits + 1;      // position, normal, colour, secondary, fog, texture coordinates, edge flag
@@ -355,6 +356,12 @@ class GlApi {
   void end_program_uniform(uint32_t saved);
 
   bool object_parameter(uint32_t obj, uint32_t pname, int32_t* out);
+  struct BlockMember {
+    const shader::Module* module = nullptr;
+    const shader::Global* global = nullptr;
+    uint32_t block = 0, offset = 0, array_stride = 0, matrix_stride = 0;
+  };
+  bool block_member(uint32_t object, uint32_t index, BlockMember* out);
   bool sampler_get(uint32_t sampler, uint32_t pname, double* out, uint32_t* n);
   // A client memory with one word in it, for answering a query through another query's code.
   class ProbeMemory final : public IClientMemory {

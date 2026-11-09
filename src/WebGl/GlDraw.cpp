@@ -159,7 +159,7 @@ struct FragmentPipeline final : gpu::IFragmentSink {
   int32_t alpha_slot = -1;
 
   FragmentPipeline(GlContext& ctx, ProgramObj& prog, GlContext::Target& target, shader::Machine& m, bool derivs)
-      : c(ctx), p(prog), t(target), fm(m), mod(m.module()), late(false), deriv(derivs), logx(ctx.a_), logy(ctx.a_) {
+      : c(ctx), p(prog), t(target), fm(m), mod(m.module()), late(false), deriv(derivs), logx(ctx.a_), logy(ctx.a_), initial(ctx.a_) {
     late = mod.uses_discard || mod.writes_frag_depth || c.desktop.alpha_test;
     alpha_slot = -1;
     if (c.desktop.alpha_test) for (const ProgramObj::Output& o : p.outputs) if (o.location == 0 && o.type.rows == 4 && o.type.base == shader::Base::Float) alpha_slot = static_cast<int32_t>(o.slot) + 3;
@@ -171,9 +171,19 @@ struct FragmentPipeline final : gpu::IFragmentSink {
     fd_slot = e >= 0 ? static_cast<int32_t>(mod.globals[static_cast<uint64_t>(e)]->slot) : -1;
   }
 
+  // The private region as the initializers of the shader's globals leave it (const globals, `float x = 2.0;` at file scope), restored before each fragment.
+  List<uint32_t> initial;
+  bool take_initial() {
+    fm.reset_privates();
+    initial.clear();
+    if (!initial.reserve(mod.private_slots)) return false;
+    const uint32_t* pr = fm.private_region();
+    for (uint32_t i = 0; i < mod.private_slots; ++i) initial.push_back(pr[i]);
+    return true;
+  }
   void zero_privates() {
     uint32_t* pr = fm.private_region();
-    for (uint32_t i = 0; i < mod.private_slots; ++i) pr[i] = 0;
+    for (uint32_t i = 0; i < mod.private_slots; ++i) pr[i] = initial[i];
   }
 
   // Runs the shader for pixel (px, py) with the varyings of the fragment as they are there. Returns false if discarded or failed.
@@ -549,7 +559,12 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   FragmentPipeline pipe(*this, *p, target, fm, deriv);
   uint32_t q = query_active_[0] ? query_active_[0] : query_active_[1];
   if (q) pipe.occlusion = query_at(q);
-  fm.reset_privates();
+  if (!pipe.take_initial()) { set_error(0x505); return false; }
+  // (the same for the vertex stage)
+  List<uint32_t> vinitial(a_);
+  vm.reset_privates();
+  if (!vinitial.reserve(vmod.private_slots)) { set_error(0x505); return false; }
+  for (uint32_t i = 0; i < vmod.private_slots; ++i) vinitial.push_back(vm.private_region()[i]);
 
   // vertex shading
   const int32_t vpos_g = vmod.find_builtin_global(shader::kBvPosition), vps_g = vmod.find_builtin_global(shader::kBvPointSize);
@@ -576,7 +591,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
       return true;
     }
     uint32_t* pr = vm.private_region();
-    for (uint32_t i = 0; i < vmod.private_slots; ++i) pr[i] = 0;
+    for (uint32_t i = 0; i < vmod.private_slots; ++i) pr[i] = vinitial[i];
     for (const auto& ai : p->attribs) {
       const uint32_t width = ai->type.cols > 1 ? ai->type.cols : 1;
       const uint32_t comps = ai->type.rows;

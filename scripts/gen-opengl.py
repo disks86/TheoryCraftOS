@@ -350,7 +350,7 @@ def op_flags(name, versions, removed, new_commands):
 
 def generate_enums():
     used = set()
-    places = [(r, fs) for r, _, fs in os.walk(os.path.join(ROOT, "src/OpenGl"))] + [(os.path.join(ROOT, "tests"), ["OpenGlTest.cpp"])]
+    places = [(r, fs) for r, _, fs in os.walk(os.path.join(ROOT, "src/OpenGl"))] + [(os.path.join(ROOT, "tests"), ["OpenGlTest.cpp", "PiglitShaderTest.cpp"])]
     for root, files in places:
         if "generated" in root or "khronos" in root:
             continue
@@ -374,6 +374,9 @@ def generate_enums():
         kind = "uint64_t" if name == "GL_TIMEOUT_IGNORED" else "uint32_t"
         out.append("constexpr %s %s = %s;\n" % (kind, name, v if not v.startswith("-") else "0xFFFFFFFFu"))
     write("src/OpenGl/generated/GlEnums.inc", "".join(out))
+    # Every enum by name, for tools and tests that read GL names from text (tests/PiglitShaderTest.cpp); not part of the kernel image.
+    table = [LICENSE] + ['{"%s", %s},\n' % (n, values[n]) for n in sorted(values) if n.startswith("GL_") and not values[n].startswith("-") and int(values[n], 0) <= 0xFFFFFFFF]
+    write("src/OpenGl/generated/GlEnumNames.inc", "".join(table))
 
 def generate_kernel(commands, ops, versions, removed):
     decl = [LICENSE]

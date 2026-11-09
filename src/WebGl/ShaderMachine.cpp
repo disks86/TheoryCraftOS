@@ -32,7 +32,10 @@ uint32_t Module::slots_of(const Type& t) const {
     case Base::Sampler: case Base::Texture: case Base::SamplerState: one = 1; break;
     default: one = static_cast<uint32_t>(t.cols) * t.rows; break;
   }
-  return t.array ? (t.array == kRuntimeArray ? one : one * t.array) : one;
+  if (!t.array || t.array == kRuntimeArray) return one;
+  // (a size from the shader text: saturates instead of wrapping, so storage that large fails to be made rather than being made small)
+  const uint64_t n = uint64_t{one} * t.array;
+  return n > kMaxValueSlots ? kMaxValueSlots : static_cast<uint32_t>(n);
 }
 
 int32_t Module::find_global(StringView name) const {
@@ -920,11 +923,11 @@ bool Interp::tex_call(const Node& node, Ref* out) {
   };
   uint32_t dims;   // spatial components of the coordinate
   switch (tt.dim) {
-    case kDim1D: dims = 1; break;
+    case kDim1D: case kDim1DArray: dims = 1; break;
     case kDim3D: case kDimCube: case kDimCubeArray: dims = 3; break;
     default: dims = 2; break;
   }
-  const bool layered = tt.dim == kDim2DArray || tt.dim == kDimCubeArray;
+  const bool layered = tt.dim == kDim2DArray || tt.dim == kDimCubeArray || tt.dim == kDim1DArray;
   if (op == TexOp::Size || op == TexOp::Levels || op == TexOp::Samples) {
     rq.mode = op == TexOp::Size ? SampleMode::Size : (op == TexOp::Levels ? SampleMode::Levels : SampleMode::Samples);
     if (have[4]) rq.level = icomp(kid[4], 0);
@@ -975,7 +978,7 @@ bool Interp::tex_call(const Node& node, Ref* out) {
     }
   }
   const bool proj = op == TexOp::Proj || op == TexOp::ProjBias || op == TexOp::ProjLod;
-  if (tt.shadow && !wgsl) ref = c[used];
+  if (tt.shadow && !wgsl) ref = c[tt.dim == kDim1D ? 2 : used];      // (a 1D shadow lookup takes its reference from the third component, as 2D does)
   if (proj) {
     const float q = c[have_c - 1];
     for (uint32_t i = 0; i < dims; ++i) c[i] /= q;
@@ -985,6 +988,8 @@ bool Interp::tex_call(const Node& node, Ref* out) {
   rq.reference = ref;
   for (uint32_t i = 0; i < 3; ++i) rq.coord[i] = c[i];
   if (tt.dim == kDim2DArray) rq.coord[2] = layer;
+  if (tt.dim == kDim1D) rq.coord[1] = 0.5f;
+  if (tt.dim == kDim1DArray) rq.coord[1] = layer;
   if (have[7]) for (uint32_t i = 0; i < 3 && i < count_of(kid[7].t); ++i) rq.offset[i] = icomp(kid[7], i);
   switch (op) {
     case TexOp::Sample: case TexOp::Proj: rq.mode = SampleMode::Implicit; break;
@@ -1008,6 +1013,7 @@ bool Interp::tex_call(const Node& node, Ref* out) {
     default: break;
   }
   if (tt.shadow && !wgsl) rq.compare = true;
+  rq.legacy_vec4 = (node.flags & 2) != 0;
   // implicit derivatives: from the neighbouring pixels' recorded coordinates
   if (rq.mode == SampleMode::Implicit || rq.mode == SampleMode::Bias) {
     if (m.record_) {
@@ -1029,6 +1035,11 @@ bool Interp::tex_call(const Node& node, Ref* out) {
   m.host_->sample(rq, raw);
   const bool depth_result = tt.shadow && rq.mode != SampleMode::Gather;
   uint32_t* w;
+  if (depth_result && (node.flags & 2)) {      // shadow2D() and the like: the four lanes the host made (by the depth texture mode)
+    if (!new_value(make_type(Base::Float, 4), out, &w)) return false;
+    for (uint32_t i = 0; i < 4; ++i) w[i] = raw[i];
+    return true;
+  }
   if (depth_result) {
     if (!new_value(make_type(Base::Float), out, &w)) return false;
     w[0] = raw[0];
