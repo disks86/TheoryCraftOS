@@ -22,6 +22,7 @@
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "Process/WindowsFonts.hpp"
 #include "Font/SystemFontService.hpp"
+#include "OpenGl/WindowsGl.hpp"
 #include "Jit/CodePageSource.hpp"
 #include "Jit/CrossCoreTlbShootdown.hpp"
 #include "Jit/KernelCodeMemory.hpp"
@@ -806,6 +807,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The system's fonts for DirectWrite (dwrite.dll reaches them with NtTcosFont); lives as long as the system does.
   static font::SystemFontService system_fonts(shared_allocator);
   process::windowsabi::set_font_service(&system_fonts);
+  // The system's OpenGL, for every program (opengl32.dll reaches it with NtTcosOpenGl); a process's contexts and surfaces go when it ends.
+  static opengl::GlService system_gl(shared_allocator);
+  opengl::install_windows_gl(system_gl);
+  process::win32k::register_process_exit_hook([](uint64_t pid) { if (opengl::GlService* gl = opengl::system_gl()) gl->process_exited(pid); });
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
   if (dxg_adapters > 1)
     for (uint32_t i = 0; i + 1 < dxg_adapters; ++i) {

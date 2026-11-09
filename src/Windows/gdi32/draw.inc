@@ -90,26 +90,48 @@ EXPORT BOOL WINAPI LineDDA(int x0, int y0, int x1, int y1, LINEDDAPROC proc, LPA
   return TRUE;
 }
 
-EXPORT int WINAPI SwapBuffers(HDC hdc) { return NtGdiSwapBuffers(hdc); }
+/* A window drawn by OpenGL is swapped by opengl32.dll (as Windows' gdi32 hands it to the OpenGL driver): that library is asked when the program has it loaded. */
+EXPORT int WINAPI SwapBuffers(HDC hdc) {
+  HMODULE gl = GetModuleHandleA("opengl32.dll");
+  if (gl) {
+    BOOL(WINAPI * swap)(HDC) = (BOOL(WINAPI *)(HDC))GetProcAddress(gl, "wglSwapBuffers");
+    if (swap) return swap(hdc);
+  }
+  return NtGdiSwapBuffers(hdc);
+}
 EXPORT int WINAPI DescribePixelFormat(HDC hdc, int format, UINT size, PIXELFORMATDESCRIPTOR *descr) { return NtGdiDescribePixelFormat(RD(hdc), format, size, descr); }
-/* (the kernel keeps the pixel format of a DC but has no call to read it back: gdi32 remembers what was set) */
-static struct { HDC dc; int format; } pixel_formats[16];
-EXPORT BOOL WINAPI SetPixelFormat(HDC hdc, int format, const PIXELFORMATDESCRIPTOR *descr) {
-  if (!NtGdiSetPixelFormat(RD(hdc), format)) return FALSE;
-  table_lock();
-  int i, free_slot = -1;
-  for (i = 0; i < 16; ++i) { if (pixel_formats[i].dc == hdc) break; if (!pixel_formats[i].dc && free_slot < 0) free_slot = i; }
-  if (i == 16) i = free_slot;
-  if (i >= 0) { pixel_formats[i].dc = hdc; pixel_formats[i].format = format; }
-  table_unlock();
-  return TRUE;
+/* The pixel format belongs to the window (every device context of it has it) or, for a memory device context, to the DC. The kernel keeps a DC's but has no call to read it
+ * back: gdi32 remembers what was set, by window. (user32 is not imported here: it imports gdi32; the window of a DC comes from win32k directly.) */
+ULONG_PTR NtUserWindowFromDC(ULONG_PTR hdc);
+DXG_SERVICE(NtUserWindowFromDC)
+static struct { ULONG_PTR key; int format; } pixel_formats[64];
+static ULONG_PTR format_key(HDC hdc) {
+  const ULONG_PTR window = NtUserWindowFromDC((ULONG_PTR)hdc);
+  return window ? window : (ULONG_PTR)hdc;
 }
 EXPORT int WINAPI GetPixelFormat(HDC hdc) {
+  const ULONG_PTR key = format_key(hdc);
   int r = 0;
   table_lock();
-  for (int i = 0; i < 16; ++i) if (pixel_formats[i].dc == hdc) r = pixel_formats[i].format;
+  for (int i = 0; i < 64; ++i) if (pixel_formats[i].key == key) r = pixel_formats[i].format;
   table_unlock();
   return r;
+}
+EXPORT BOOL WINAPI SetPixelFormat(HDC hdc, int format, const PIXELFORMATDESCRIPTOR *descr) {
+  const int current = GetPixelFormat(hdc);
+  if (current) {      /* (a window's pixel format is set once: the same one again succeeds, another fails) */
+    if (current != format) { SetLastError(ERROR_INVALID_PIXEL_FORMAT); return FALSE; }
+    return TRUE;
+  }
+  if (!NtGdiSetPixelFormat(RD(hdc), format)) return FALSE;
+  const ULONG_PTR key = format_key(hdc);
+  table_lock();
+  int i, free_slot = -1;
+  for (i = 0; i < 64; ++i) { if (pixel_formats[i].key == key) break; if (!pixel_formats[i].key && free_slot < 0) free_slot = i; }
+  if (i == 64) i = free_slot;
+  if (i >= 0) { pixel_formats[i].key = key; pixel_formats[i].format = format; }
+  table_unlock();
+  return TRUE;
 }
 
 /* ChoosePixelFormat as Wine has it: the format with the fewest mismatches against the request. */
@@ -126,9 +148,12 @@ EXPORT int WINAPI ChoosePixelFormat(HDC hdc, const PIXELFORMATDESCRIPTOR *wanted
     if ((wanted->dwFlags & PFD_DRAW_TO_WINDOW) && !(p.dwFlags & PFD_DRAW_TO_WINDOW)) continue;
     if ((wanted->dwFlags & PFD_DRAW_TO_BITMAP) && !(p.dwFlags & PFD_DRAW_TO_BITMAP)) continue;
     if ((wanted->dwFlags & PFD_SUPPORT_OPENGL) && !(p.dwFlags & PFD_SUPPORT_OPENGL)) continue;
-    if (wanted->iPixelType != p.iPixelType) continue;
+    /* (a pixel type that is not colour index asks for RGBA, as on Windows) */
+    if ((wanted->iPixelType == PFD_TYPE_COLORINDEX) != (p.iPixelType == PFD_TYPE_COLORINDEX)) continue;
     score += wanted->cColorBits > p.cColorBits ? (wanted->cColorBits - p.cColorBits) * 4 : p.cColorBits - wanted->cColorBits;
-    score += wanted->cDepthBits > p.cDepthBits ? (wanted->cDepthBits - p.cDepthBits) * 8 : p.cDepthBits - wanted->cDepthBits;
+    /* PFD_DEPTH_DONTCARE: a format without a depth buffer is best */
+    if (wanted->dwFlags & PFD_DEPTH_DONTCARE) score += p.cDepthBits ? 64 : 0;
+    else score += wanted->cDepthBits > p.cDepthBits ? (wanted->cDepthBits - p.cDepthBits) * 8 : p.cDepthBits - wanted->cDepthBits;
     score += wanted->cStencilBits > p.cStencilBits ? (wanted->cStencilBits - p.cStencilBits) * 8 : p.cStencilBits - wanted->cStencilBits;
     score += wanted->cAlphaBits > p.cAlphaBits ? (wanted->cAlphaBits - p.cAlphaBits) * 2 : p.cAlphaBits - wanted->cAlphaBits;
     if (score < best_score) { best_score = score; best = i; }

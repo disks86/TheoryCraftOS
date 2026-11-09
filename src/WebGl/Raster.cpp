@@ -266,7 +266,7 @@ void draw_triangle(const RasterState& rs, const RVertex& a, const RVertex& b, co
   for (uint32_t i = 1; i + 1 < poly.n; ++i) raster_triangle(rs, poly.v[0], poly.v[i], poly.v[i + 1], flatvals, false, sink);
 }
 
-void draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragmentSink& sink) {
+float draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragmentSink& sink) {
   RVertex p = a, q = b;
   float flatvals[kMaxVarying];
   for (uint32_t i = 0; i < rs.nvar; ++i) flatvals[i] = rs.flat_first ? a.var[i] : b.var[i];
@@ -274,7 +274,7 @@ void draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragm
   for (int plane = 0; plane < 7; ++plane) {
     if (!rs.depth_clip && (plane == 1 || plane == 2)) continue;
     const float dp = plane_dist(rs, p, plane), dq = plane_dist(rs, q, plane);
-    if (dp < 0 && dq < 0) return;
+    if (dp < 0 && dq < 0) return 0;
     if (dp < 0) {
       RVertex n;
       lerp_vertex(p, q, dp / (dp - dq), rs.nvar, &n);
@@ -301,6 +301,8 @@ void draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragm
   Fragment f;
   f.varyings = var;
   f.is_point = false;
+  f.is_line = true;
+  const bool forward = xmajor ? wp.x <= wq.x : wp.y <= wq.y;
   const int32_t thick = rs.line_width > 1 ? static_cast<int32_t>(rs.line_width + 0.5f) : 1;
   const int32_t start = static_cast<int32_t>(xmajor ? (wp.x < wq.x ? wp.x : wq.x) : (wp.y < wq.y ? wp.y : wq.y)) - 0;
   const int32_t end = static_cast<int32_t>(xmajor ? (wp.x < wq.x ? wq.x : wp.x) : (wp.y < wq.y ? wq.y : wp.y));
@@ -344,9 +346,11 @@ void draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragm
       f.coord[1] = py + 0.5f;
       f.coord[2] = z;
       f.coord[3] = iw;
+      f.line_pos = rs.line_start + static_cast<float>(forward ? m - s0 : end - m);
       sink.fragment(f);
     }
   }
+  return len;
 }
 
 void draw_point(const RasterState& rs, const RVertex& a, IFragmentSink& sink) {

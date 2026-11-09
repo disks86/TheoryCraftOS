@@ -754,4 +754,14 @@ uint32_t move_memory(Process& process, const SyscallRequest& r, bool write) {
 uint32_t nt_read_virtual_memory(Process& process, const SyscallRequest& r) { return move_memory(process, r, false); }
 uint32_t nt_write_virtual_memory(Process& process, const SyscallRequest& r) { return move_memory(process, r, true); }
 
+uint64_t allocate_user_memory(Process& p, uint64_t size) {
+  uint64_t base = 0, bytes = size;
+  return vm_allocate(p, &base, &bytes, kMemCommit | kMemReserve, 0x04 /*PAGE_READWRITE*/) == kStatusSuccess ? base : 0;
+}
+
+void free_user_memory(Process& p, uint64_t address) {
+  uint64_t base = address, size = 0;
+  vm_free(p, &base, &size, kMemRelease);
+}
+
 }  // namespace process::windowsabi

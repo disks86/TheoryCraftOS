@@ -142,13 +142,14 @@ void GlContext::sample(const shader::SampleRequest& rq, uint32_t out[4]) {
     case shader::kDimCube: id = u.cube; break;
     case shader::kDim3D: id = u.tex3d; break;
     case shader::kDim2DArray: id = u.array; break;
-    default: id = u.tex2d; break;
+    case shader::kDim1D: id = u.tex1d; break;
+    default: id = (desktop.ff_1d_mask >> unit) & 1 ? u.tex1d : ((desktop.ff_rect_mask >> unit) & 1 ? u.rect : u.tex2d); break;
   }
   const Texture* t = texture_at(id);
   if (!t) return;
   SamplerObj tmp;
   const SamplerObj* so = &tmp;
-  if (u.sampler && u.sampler <= samplers_.count() && samplers_[u.sampler - 1]) so = samplers_[u.sampler - 1].get();
+  if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = objects_->samplers[u.sampler - 1].get();
   else {
     tmp.min_filter = t->min_filter; tmp.mag_filter = t->mag_filter; tmp.wrap_s = t->wrap_s; tmp.wrap_t = t->wrap_t; tmp.wrap_r = t->wrap_r;
     tmp.compare_mode = t->compare_mode; tmp.compare_func = t->compare_func; tmp.min_lod = t->min_lod; tmp.max_lod = t->max_lod;

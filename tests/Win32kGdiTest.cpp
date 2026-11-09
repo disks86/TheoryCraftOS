@@ -933,9 +933,11 @@ static void test_misc_and_errors() {
   // gamma ramp
   CHECK(f.u(N(GetDeviceGammaRamp), dc, kBig) == 1 && f.prog.memory.get16(kBig + 2 * 255) == 0xFFFF && f.prog.memory.get16(kBig + 2) == 257);
   // pixel formats
-  CHECK(f.u(N(DescribePixelFormat), dc, 1, 40, 0) == 4 && f.u(N(DescribePixelFormat), dc, 1, 40, kOut) == 4 && f.prog.memory.get8(kOut + 9) == 32);
+  CHECK(f.u(N(DescribePixelFormat), dc, 1, 40, 0) == 6 && f.u(N(DescribePixelFormat), dc, 1, 40, kOut) == 6 && f.prog.memory.get8(kOut + 9) == 32);
+  CHECK(f.prog.memory.get8(kOut + 23) == 0 && f.u(N(DescribePixelFormat), dc, 4, 40, kOut) == 6 && f.prog.memory.get8(kOut + 23) == 24 && f.prog.memory.get8(kOut + 24) == 8);      // cDepthBits, cStencilBits
+  CHECK((f.prog.memory.get32(kOut + 4) & 0x1) && f.u(N(DescribePixelFormat), dc, 6, 40, kOut) == 6 && (f.prog.memory.get32(kOut + 4) & 0x8));      // double buffered; a bitmap format
   CHECK(f.u(N(DescribePixelFormat), dc, 99, 40, kOut) == 0);
-  CHECK(f.u(N(SetPixelFormat), dc, 1) == 1 && f.u(N(SetPixelFormat), dc, 2) == 0);
+  CHECK(f.u(N(SetPixelFormat), dc, 1) == 1 && f.u(N(SetPixelFormat), dc, 1) == 1 && f.u(N(SetPixelFormat), dc, 2) == 0);      // (once; the same again is fine)
   // colour adjustment round trip
   CHECK(f.u(N(GetColorAdjustment), dc, kOut) == 1 && f.prog.memory.get16(kOut) == 24 && f.prog.memory.get16(kOut + 6) == 10000);
   f.prog.memory.put16(kOut + 6, 12000);
