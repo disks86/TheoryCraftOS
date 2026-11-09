@@ -949,41 +949,170 @@ bool GlApi::list_expand_draw(uint32_t op, ConstByteView command) {
   }
 }
 
-// The compatibility uniforms a desktop GLSL program reads (GlslDesktop.hpp), from the fixed-function state, before each of its draws.
-void GlApi::load_compat_uniforms(uint32_t program) {
-  const webgl::ProgramObj* po = gl_.program(program);
-  if (!po) return;
-  bool any = false;
-  for (uint64_t i = 0; i < po->uniforms.count() && !any; ++i) any = po->uniforms[i]->name.view().starts_with("tcos_");
-  if (!any) return;
-  const auto set = [&](const char* name, uint32_t n, const float* m) {
-    const int32_t loc = gl_.get_uniform_location(program, name);
-    if (loc < 0) return;
-    uint32_t lanes[16];
-    for (uint32_t i = 0; i < n * n; ++i) lanes[i] = __builtin_bit_cast(uint32_t, m[i]);
-    gl_.uniform(loc, 'f', n, n, 1, lanes);
+// The compatibility uniforms a desktop GLSL program reads (GlslDesktop.hpp), from the fixed-function state, before each of its draws: every uniform leaf named tcos_* is
+// one of them (tcos_LightSource[2].diffuse, tcos_TextureMatrix with 8 elements ...).
+bool GlApi::compat_value(StringView name, uint32_t element, float out[16], uint32_t* cols, uint32_t* rows) {
+  // base[index].field
+  uint64_t i = 0;
+  while (i < name.size() && name[i] != '[' && name[i] != '.') ++i;
+  const StringView base = name.substr(0, i);
+  uint32_t index = element;
+  if (i < name.size() && name[i] == '[') {
+    index = 0;
+    ++i;
+    while (i < name.size() && name[i] >= '0' && name[i] <= '9') index = index * 10 + static_cast<uint32_t>(name[i++] - '0');
+    if (i < name.size() && name[i] == ']') ++i;
+  }
+  const StringView field = i < name.size() && name[i] == '.' ? name.substr(i + 1, name.size() - i - 1) : StringView();
+  const auto vec = [&](const float* v, uint32_t n) { for (uint32_t k = 0; k < n; ++k) out[k] = v[k]; *cols = 1; *rows = n; return true; };
+  const auto one = [&](float v) { out[0] = v; *cols = 1; *rows = 1; return true; };
+  const auto mat = [&](const Mat4& m) { for (int k = 0; k < 16; ++k) out[k] = m.m[k]; *cols = 4; *rows = 4; return true; };
+  const auto variants = [&](StringView stem, const Mat4& m) -> int {      // 1 handled, 0 not this matrix
+    if (!base.starts_with(stem)) return 0;
+    const StringView rest = base.substr(stem.size(), base.size() - stem.size());
+    Mat4 inv;
+    if (rest.empty()) return mat(m), 1;
+    if (rest.equals("Transpose")) return mat(mat_transpose(m)), 1;
+    mat_inverse(m, &inv);
+    if (rest.equals("Inverse")) return mat(inv), 1;
+    if (rest.equals("InverseTranspose")) return mat(mat_transpose(inv)), 1;
+    return 0;
   };
   const Mat4& mv = modelview_.entries[modelview_.top];
   const Mat4& pr = projection_.entries[projection_.top];
-  const Mat4 mvp = mat_multiply(pr, mv);
-  set("tcos_ModelViewMatrix", 4, mv.m);
-  set("tcos_ProjectionMatrix", 4, pr.m);
-  set("tcos_ModelViewProjectionMatrix", 4, mvp.m);
-  Mat4 inv;
-  mat_inverse(mv, &inv);
-  set("tcos_ModelViewMatrixInverse", 4, inv.m);
-  const float nm[9] = {inv.m[0], inv.m[4], inv.m[8], inv.m[1], inv.m[5], inv.m[9], inv.m[2], inv.m[6], inv.m[10]};
-  set("tcos_NormalMatrix", 3, nm);
-  const int32_t scale_loc = gl_.get_uniform_location(program, "tcos_NormalScale");
-  if (scale_loc >= 0) {
-    const float len = shader::fsqrt(inv.m[8] * inv.m[8] + inv.m[9] * inv.m[9] + inv.m[10] * inv.m[10]);
-    const uint32_t lane = __builtin_bit_cast(uint32_t, len > 0 ? 1.0f / len : 1.0f);
-    gl_.uniform(scale_loc, 'f', 1, 1, 1, &lane);
+  if (base.starts_with("ModelViewProjectionMatrix")) return variants("ModelViewProjectionMatrix", mat_multiply(pr, mv)) == 1;
+  if (base.starts_with("ModelViewMatrix")) return variants("ModelViewMatrix", mv) == 1;
+  if (base.starts_with("ProjectionMatrix")) return variants("ProjectionMatrix", pr) == 1;
+  if (base.starts_with("TextureMatrix")) {
+    if (index >= kMaxTexUnits) return false;
+    return variants("TextureMatrix", texture_stack_[index].entries[texture_stack_[index].top]) == 1;
   }
-  for (uint32_t u = 0; u < kMaxTexUnits; ++u) {
-    char name[24] = "tcos_TextureMatrix[0]";
-    name[19] = static_cast<char>('0' + u);
-    set(name, 4, texture_stack_[u].entries[texture_stack_[u].top].m);
+  if (base.equals("NormalMatrix") || base.equals("NormalScale")) {
+    Mat4 inv;
+    mat_inverse(mv, &inv);
+    if (base.equals("NormalScale")) {
+      const float len = shader::fsqrt(inv.m[8] * inv.m[8] + inv.m[9] * inv.m[9] + inv.m[10] * inv.m[10]);
+      return one(len > 0 ? 1.0f / len : 1.0f);
+    }
+    const float nm[9] = {inv.m[0], inv.m[4], inv.m[8], inv.m[1], inv.m[5], inv.m[9], inv.m[2], inv.m[6], inv.m[10]};
+    for (int k = 0; k < 9; ++k) out[k] = nm[k];
+    *cols = 3;
+    *rows = 3;
+    return true;
+  }
+  if (base.equals("DepthRange")) {
+    if (field.equals("near")) return one(depth_range_values_[0]);
+    if (field.equals("far")) return one(depth_range_values_[1]);
+    if (field.equals("diff")) return one(depth_range_values_[1] - depth_range_values_[0]);
+    return false;
+  }
+  if (base.equals("Point")) {
+    if (field.equals("size")) return one(fx_.point_size);
+    if (field.equals("sizeMin")) return one(fx_.point_min);
+    if (field.equals("sizeMax")) return one(fx_.point_max);
+    if (field.equals("fadeThresholdSize")) return one(fx_.point_fade);
+    if (field.equals("distanceConstantAttenuation")) return one(fx_.point_atten[0]);
+    if (field.equals("distanceLinearAttenuation")) return one(fx_.point_atten[1]);
+    if (field.equals("distanceQuadraticAttenuation")) return one(fx_.point_atten[2]);
+    return false;
+  }
+  const auto material_field = [&](const Material& m) {
+    if (field.equals("emission")) return vec(m.emission, 4);
+    if (field.equals("ambient")) return vec(m.ambient, 4);
+    if (field.equals("diffuse")) return vec(m.diffuse, 4);
+    if (field.equals("specular")) return vec(m.specular, 4);
+    if (field.equals("shininess")) return one(m.shininess);
+    return false;
+  };
+  if (base.equals("FrontMaterial")) return material_field(fx_.material[0]);
+  if (base.equals("BackMaterial")) return material_field(fx_.material[1]);
+  if (base.equals("LightSource")) {
+    if (index >= kMaxLights) return false;
+    const Light& l = fx_.lights[index];
+    if (field.equals("ambient")) return vec(l.ambient, 4);
+    if (field.equals("diffuse")) return vec(l.diffuse, 4);
+    if (field.equals("specular")) return vec(l.specular, 4);
+    if (field.equals("position")) return vec(l.position, 4);
+    if (field.equals("halfVector")) {
+      // the half way vector of a light at infinity and the viewer at infinity (+z)
+      float h[4] = {l.position[0], l.position[1], l.position[2], 0};
+      const float len = shader::fsqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+      if (len > 0) for (int k = 0; k < 3; ++k) h[k] /= len;
+      h[2] += 1;
+      const float hl = shader::fsqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+      if (hl > 0) for (int k = 0; k < 3; ++k) h[k] /= hl;
+      return vec(h, 4);
+    }
+    if (field.equals("spotDirection")) return vec(l.spot_direction, 3);
+    if (field.equals("spotExponent")) return one(l.spot_exponent);
+    if (field.equals("spotCutoff")) return one(l.spot_cutoff);
+    if (field.equals("spotCosCutoff")) return one(shader::fcos(l.spot_cutoff * 3.14159265358979f / 180.0f));
+    if (field.equals("constantAttenuation")) return one(l.attenuation[0]);
+    if (field.equals("linearAttenuation")) return one(l.attenuation[1]);
+    if (field.equals("quadraticAttenuation")) return one(l.attenuation[2]);
+    return false;
+  }
+  if (base.equals("LightModel")) return field.equals("ambient") && vec(fx_.model_ambient, 4);
+  if (base.equals("FrontLightModelProduct") || base.equals("BackLightModelProduct")) {
+    const Material& m = fx_.material[base.starts_with("Back") ? 1 : 0];
+    float c[4];
+    for (int k = 0; k < 3; ++k) c[k] = m.emission[k] + m.ambient[k] * fx_.model_ambient[k];
+    c[3] = m.diffuse[3];
+    return field.equals("sceneColor") && vec(c, 4);
+  }
+  if (base.equals("FrontLightProduct") || base.equals("BackLightProduct")) {
+    if (index >= kMaxLights) return false;
+    const Material& m = fx_.material[base.starts_with("Back") ? 1 : 0];
+    const Light& l = fx_.lights[index];
+    const float* a = nullptr;
+    const float* b = nullptr;
+    if (field.equals("ambient")) { a = m.ambient; b = l.ambient; }
+    else if (field.equals("diffuse")) { a = m.diffuse; b = l.diffuse; }
+    else if (field.equals("specular")) { a = m.specular; b = l.specular; }
+    else return false;
+    float c[4];
+    for (int k = 0; k < 4; ++k) c[k] = a[k] * b[k];
+    return vec(c, 4);
+  }
+  if (base.equals("Fog")) {
+    if (field.equals("color")) return vec(fx_.fog_color, 4);
+    if (field.equals("density")) return one(fx_.fog_density);
+    if (field.equals("start")) return one(fx_.fog_start);
+    if (field.equals("end")) return one(fx_.fog_end);
+    if (field.equals("scale")) return one(fx_.fog_end != fx_.fog_start ? 1.0f / (fx_.fog_end - fx_.fog_start) : 1.0f);
+    return false;
+  }
+  if (base.equals("ClipPlane")) {
+    if (index >= kMaxClipPlanes) return false;
+    const float c[4] = {static_cast<float>(fx_.clip_plane[index][0]), static_cast<float>(fx_.clip_plane[index][1]), static_cast<float>(fx_.clip_plane[index][2]), static_cast<float>(fx_.clip_plane[index][3])};
+    return vec(c, 4);
+  }
+  if (index >= kMaxTexUnits) return false;
+  const FixedState::Unit& u = fx_.units[index];
+  if (base.equals("TextureEnvColor")) return vec(u.env.color, 4);
+  static const char* const kPlanes = "STRQ";
+  for (uint32_t c = 0; c < 4; ++c) {
+    if (base.size() == 10 && base.starts_with("EyePlane") && base[8] == kPlanes[c]) return vec(u.gen[c].eye_plane, 4);
+    if (base.size() == 13 && base.starts_with("ObjectPlane") && base[11] == kPlanes[c]) return vec(u.gen[c].object_plane, 4);
+  }
+  return false;
+}
+
+void GlApi::load_compat_uniforms(uint32_t program) {
+  const webgl::ProgramObj* po = gl_.program(program);
+  if (!po) return;
+  for (uint64_t i = 0; i < po->uniforms.count(); ++i) {
+    const webgl::UniformLeaf& u = *po->uniforms[i];
+    if (!u.name.view().starts_with("tcos_")) continue;
+    const StringView name = u.name.view().substr(5, u.name.view().size() - 5);
+    for (uint32_t e = 0; e < u.size; ++e) {
+      float v[16];
+      uint32_t cols = 1, rows = 1;
+      if (!compat_value(name, e, v, &cols, &rows)) break;
+      uint32_t lanes[16];
+      for (uint32_t k = 0; k < cols * rows; ++k) lanes[k] = __builtin_bit_cast(uint32_t, v[k]);
+      gl_.uniform(static_cast<int32_t>(u.location + e), 'f', cols, rows, 1, lanes);
+    }
   }
 }
 

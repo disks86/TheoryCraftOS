@@ -186,6 +186,14 @@ const TypeName kTypes[] = {
     {"isampler3D", Base::Sampler, 1, 1, kDim3D, false, Base::Int}, {"isampler2DArray", Base::Sampler, 1, 1, kDim2DArray, false, Base::Int},
     {"usampler2D", Base::Sampler, 1, 1, kDim2D, false, Base::Uint}, {"usamplerCube", Base::Sampler, 1, 1, kDimCube, false, Base::Uint},
     {"usampler3D", Base::Sampler, 1, 1, kDim3D, false, Base::Uint}, {"usampler2DArray", Base::Sampler, 1, 1, kDim2DArray, false, Base::Uint},
+    // desktop GLSL
+    {"sampler1D", Base::Sampler, 1, 1, kDim1D, false, Base::Float}, {"sampler1DShadow", Base::Sampler, 1, 1, kDim1D, true, Base::Float},
+    {"sampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Float}, {"sampler1DArrayShadow", Base::Sampler, 1, 1, kDim1DArray, true, Base::Float},
+    {"sampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Float}, {"sampler2DRectShadow", Base::Sampler, 1, 1, kDimRect, true, Base::Float},
+    {"isampler1D", Base::Sampler, 1, 1, kDim1D, false, Base::Int}, {"usampler1D", Base::Sampler, 1, 1, kDim1D, false, Base::Uint},
+    {"isampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Int}, {"usampler1DArray", Base::Sampler, 1, 1, kDim1DArray, false, Base::Uint},
+    {"isampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Int}, {"usampler2DRect", Base::Sampler, 1, 1, kDimRect, false, Base::Uint},
+    {"samplerCubeArray", Base::Sampler, 1, 1, kDimCubeArray, false, Base::Float}, {"samplerCubeArrayShadow", Base::Sampler, 1, 1, kDimCubeArray, true, Base::Float},
 };
 
 struct BuiltinName {
@@ -221,6 +229,7 @@ struct TexName {
   const char* name;
   TexOp op;
   uint8_t form;   // 0: (s,P) +opt bias  1: (s,P,lod)  2: (s,P,dx,dy)  3: (s,P,off)+opt bias  4: (s,P,lod,off)  5: (s,P,dx,dy,off)  6: fetch(s,P,lod)  7: fetchOffset  8: size  9: gather  10: levels
+  bool legacy_shadow = false;   // shadow1D/shadow2D...: a vec4 result
 };
 
 const TexName kTex[] = {
@@ -232,6 +241,12 @@ const TexName kTex[] = {
     {"textureOffset", TexOp::Sample, 3}, {"textureProjOffset", TexOp::Proj, 3}, {"textureLodOffset", TexOp::Lod, 4}, {"textureGradOffset", TexOp::Grad, 5},
     {"texelFetch", TexOp::Fetch, 6}, {"texelFetchOffset", TexOp::Fetch, 7}, {"textureSize", TexOp::Size, 8}, {"textureGather", TexOp::Gather, 9},
     {"textureQueryLevels", TexOp::Levels, 10},
+    // desktop GLSL 1.10 - 1.20 (and the compatibility profile)
+    {"texture1D", TexOp::Sample, 0}, {"texture1DProj", TexOp::Proj, 0}, {"texture1DLod", TexOp::Lod, 1}, {"texture1DProjLod", TexOp::ProjLod, 1},
+    {"texture3DProjLod", TexOp::ProjLod, 1}, {"texture2DRect", TexOp::Sample, 0}, {"texture2DRectProj", TexOp::Proj, 0},
+    {"shadow1D", TexOp::Sample, 0, true}, {"shadow2D", TexOp::Sample, 0, true}, {"shadow1DProj", TexOp::Proj, 0, true}, {"shadow2DProj", TexOp::Proj, 0, true},
+    {"shadow1DLod", TexOp::Lod, 1, true}, {"shadow2DLod", TexOp::Lod, 1, true}, {"shadow1DProjLod", TexOp::ProjLod, 1, true}, {"shadow2DProjLod", TexOp::ProjLod, 1, true},
+    {"shadow2DRect", TexOp::Sample, 0, true}, {"shadow2DRectProj", TexOp::Proj, 0, true},
 };
 
 // --- Parser ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -252,6 +267,7 @@ class Parser {
     declare_builtin_vars();
     push_scope();
     while (cur().kind != Tok::End && !failed_) top_level();
+    if (!failed_) finish_unsized();
     pop_scope();
     if (failed_) return false;
     m_.main_function = m_.find_function("main");
@@ -273,6 +289,9 @@ class Parser {
   int32_t cur_fn_ = -1;
   uint32_t nlocals_ = 0;
   uint32_t anon_ = 0;
+  // Unsized global arrays: the highest constant index each is used with (sized at the end, finish_unsized).
+  struct Unsized { int32_t global; uint32_t length; };
+  List<Unsized> unsized_{a_};
 
   // --- tokens
   const Token& cur() const { return toks_[pos_]; }
@@ -387,6 +406,16 @@ class Parser {
         *v = n.op == Op::Neg ? -x : x;
         return true;
       }
+      case NodeKind::Builtin: {      // min, max, abs of constants (desktop GLSL allows them in constant expressions: array sizes made of gl_Max* limits)
+        const BuiltinFn fn = static_cast<BuiltinFn>(n.ival);
+        int64_t x, y;
+        if (n.count < 1 || !fold_int(m_.kids[static_cast<uint64_t>(n.first)], &x)) return false;
+        if (fn == BuiltinFn::Abs && n.count == 1) { *v = x < 0 ? -x : x; return true; }
+        if (n.count != 2 || !fold_int(m_.kids[static_cast<uint64_t>(n.first + 1)], &y)) return false;
+        if (fn == BuiltinFn::Min) { *v = x < y ? x : y; return true; }
+        if (fn == BuiltinFn::Max) { *v = x > y ? x : y; return true; }
+        return false;
+      }
       case NodeKind::Binary: {
         int64_t x, y;
         if (!fold_int(n.a, &x) || !fold_int(n.b, &y)) return false;
@@ -429,9 +458,21 @@ class Parser {
     Type t;
     return find_type_name(cur().text, &t);
   }
+  bool is_qualifier_word(StringView w) const {
+    static const char* const q[] = {"const", "uniform", "attribute", "varying", "in", "out", "inout", "flat", "smooth", "centroid", "noperspective", "layout"};
+    for (const char* x : q) if (w.equals(x)) return true;
+    return false;
+  }
+  bool at_type_at(uint64_t ahead) const {
+    const Token& t = peek(ahead);
+    if (t.kind != Tok::Ident) return false;
+    Type unused;
+    return find_type_name(t.text, &unused);
+  }
+
   bool at_qualifier() const {
     if (cur().kind != Tok::Ident) return false;
-    static const char* const q[] = {"const", "uniform", "attribute", "varying", "in", "out", "inout", "highp", "mediump", "lowp", "flat", "smooth", "centroid", "invariant", "layout", "precision", "shared", "readonly", "writeonly", "coherent", "volatile", "restrict"};
+    static const char* const q[] = {"const", "uniform", "attribute", "varying", "in", "out", "inout", "highp", "mediump", "lowp", "flat", "smooth", "centroid", "invariant", "noperspective", "sample", "precise", "patch", "layout", "precision", "shared", "readonly", "writeonly", "coherent", "volatile", "restrict"};
     for (const char* w : q)
       if (cur().text.equals(w)) return true;
     return false;
@@ -441,12 +482,13 @@ class Parser {
     while (accept("[")) {
       if (is("]")) {
         ++pos_;
-        t->array = 0xFFFFFFFFu;   // unsized: the initializer says
+        t->array = kUnsizedArray;   // unsized: the initializer, a redeclaration or the indices used say
         continue;
       }
       const int32_t e = expression();
       int64_t v;
       if (e < 0 || !fold_int(e, &v) || v <= 0) return err("array size must be a positive constant");
+      if (v > static_cast<int64_t>(kMaxArrayLength)) return err("array too large");
       if (!expect("]")) return false;
       t->array = static_cast<uint32_t>(v);
     }
@@ -471,6 +513,13 @@ class Parser {
       add_builtin("gl_PointSize", f1, GlobalKind::Out, kBvPointSize);
       add_builtin("gl_VertexID", i1, GlobalKind::In, kBvVertexIndex);
       add_builtin("gl_InstanceID", i1, GlobalKind::In, kBvInstanceIndex);
+      if (m_.desktop) {
+        Type clip = f1;
+        clip.array = 8;
+        add_builtin("gl_ClipDistance", clip, GlobalKind::Out, kBvClipDistance);
+        // (gl_ClipVertex: written, clipping by it is the fixed-function clip planes' job, not done for programs yet)
+        if (m_.compatibility) { const int32_t g = new_global("gl_ClipVertex", f4, GlobalKind::Private, false); (void)g; }
+      }
     } else {
       add_builtin("gl_FragCoord", f4, GlobalKind::In, kBvFragCoord);
       add_builtin("gl_FrontFacing", b1, GlobalKind::In, kBvFrontFacing);
@@ -479,9 +528,27 @@ class Parser {
       add_builtin("gl_FragData", frag_data, GlobalKind::Out, kBvFragData);
       add_builtin("gl_FragDepth", f1, GlobalKind::Out, kBvFragDepth);
       add_builtin("gl_FragDepthEXT", f1, GlobalKind::Out, kBvFragDepth);
+      if (m_.desktop) {
+        const int32_t g = new_global("gl_PrimitiveID", i1, GlobalKind::Private, false);      // (always 0: primitives are not counted for the fragment stage)
+        if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->is_read_only = true;
+        Type clip = f1;
+        clip.array = 8;
+        add_builtin("gl_ClipDistance", clip, GlobalKind::In, kBvClipDistance);
+      }
     }
     const struct { const char* name; int v; } consts[] = {{"gl_MaxVertexAttribs", 16}, {"gl_MaxDrawBuffers", 4}, {"gl_MaxVertexUniformVectors", 1024},
-                                                          {"gl_MaxFragmentUniformVectors", 1024}, {"gl_MaxVaryingVectors", 30}, {"gl_MaxTextureImageUnits", 16}};
+                                                          {"gl_MaxFragmentUniformVectors", 1024}, {"gl_MaxVaryingVectors", 30}, {"gl_MaxTextureImageUnits", 14}};
+    // What desktop GLSL adds (the values the kernel's OpenGL reports through glGet).
+    const struct { const char* name; int v; } desktop_consts[] = {{"gl_MaxLights", 8}, {"gl_MaxClipPlanes", 8}, {"gl_MaxClipDistances", 8}, {"gl_MaxTextureUnits", 8}, {"gl_MaxTextureCoords", 8},
+                                                                  {"gl_MaxVertexUniformComponents", 16384}, {"gl_MaxFragmentUniformComponents", 16384}, {"gl_MaxVaryingFloats", 64},
+                                                                  {"gl_MaxVaryingComponents", 64}, {"gl_MaxVertexTextureImageUnits", 14}, {"gl_MaxCombinedTextureImageUnits", 14},
+                                                                  {"gl_MaxVertexOutputComponents", 64}, {"gl_MaxFragmentInputComponents", 64}};
+    if (m_.desktop)
+      for (const auto& c : desktop_consts) {
+        const int32_t n = int_node(c.v);
+        const int32_t g = new_global(c.name, i1, GlobalKind::Const, false);
+        if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->init = n;
+      }
     for (const auto& c : consts) {
       const int32_t n = int_node(c.v);
       const int32_t g = new_global(c.name, i1, GlobalKind::Const, false);
@@ -497,6 +564,16 @@ class Parser {
     }
   }
 
+  // Room for a global in its region; false (an error) if the module would need more than any shader may.
+  bool place_global(Global& g) {
+    const uint32_t n = m_.slots_of(g.type);
+    uint32_t& top = g.shared ? m_.shared_slots : m_.private_slots;
+    if (n >= kMaxValueSlots || top > kMaxValueSlots - n) return err("the shader's variables are too large");
+    g.slot = top;
+    top += n;
+    return true;
+  }
+
   int32_t new_global(StringView name, const Type& t, GlobalKind kind, bool shared) {
     UniquePointer<Global> g = UniquePointer<Global>::make(a_, a_);
     if (!g) { err("out of memory"); return -1; }
@@ -504,13 +581,42 @@ class Parser {
     g->type = t;
     g->kind = kind;
     g->shared = shared;
-    const uint32_t n = m_.slots_of(t);
-    if (shared) { g->slot = m_.shared_slots; m_.shared_slots += n; }
-    else { g->slot = m_.private_slots; m_.private_slots += n; }
+    // An unsized array gets its room once its size is known (finish_unsized), at the end.
+    if (t.array != kUnsizedArray && !place_global(*g)) return -1;
     m_.globals.push_back(static_cast<UniquePointer<Global>&&>(g));
     const int32_t idx = static_cast<int32_t>(m_.globals.count() - 1);
+    if (t.array == kUnsizedArray && !unsized_.push_back(Unsized{idx, 0})) { err("out of memory"); return -1; }
     add_sym(name, t, 1, idx);
     return idx;
+  }
+
+  struct UnsizedLocal { int32_t local; int32_t decl; uint32_t length; };
+  List<UnsizedLocal> unsized_locals_{a_};
+  UnsizedLocal* unsized_local_of(int32_t local) {
+    for (UnsizedLocal& u : unsized_locals_) if (u.local == local) return &u;
+    return nullptr;
+  }
+  void finish_unsized_locals() {
+    for (const UnsizedLocal& u : unsized_locals_) {
+      Node& d = m_.nodes[static_cast<uint64_t>(u.decl)];
+      if (d.type.array == kUnsizedArray) d.type.array = u.length ? u.length : 1;
+    }
+    unsized_locals_.clear();
+  }
+
+  Unsized* unsized_of(int32_t global) {
+    for (Unsized& u : unsized_) if (u.global == global) return &u;
+    return nullptr;
+  }
+  bool finish_unsized() {
+    for (const Unsized& u : unsized_) {
+      Global& g = *m_.globals[static_cast<uint64_t>(u.global)];
+      if (g.type.array != kUnsizedArray) continue;      // (redeclared with a size)
+      g.type.array = u.length ? u.length : 1;
+      if (!place_global(g)) return false;
+      if (Sym* s = find_sym(g.name.view())) if (s->kind == 1 && s->index == u.global) s->type = g.type;
+    }
+    return true;
   }
 
   struct Quals {
@@ -557,6 +663,17 @@ class Parser {
 
   void top_level() {
     if (accept(";")) return;
+    if (is_id("invariant") && peek().kind == Tok::Ident && !at_type_at(1) && !is_qualifier_word(peek().text)) {
+      // `invariant gl_Position, v;`: every value is computed the same way here already
+      ++pos_;
+      while (cur().kind == Tok::Ident && !failed_) {
+        if (!find_sym(cur().text)) { err("invariant names an undeclared variable"); return; }
+        ++pos_;
+        if (!accept(",")) break;
+      }
+      expect(";");
+      return;
+    }
     if (is_id("precision")) {
       while (!is(";") && cur().kind != Tok::End) ++pos_;
       expect(";");
@@ -622,6 +739,21 @@ class Parser {
   }
 
   void declare_global_variable(StringView name, Type t, const Quals& q, int32_t init) {
+    // `float a[];` then `float a[4];`: the second gives the first its size (it must cover the indices used so far).
+    if (t.array && t.array != kUnsizedArray) {
+      const int32_t old = m_.find_global(name);
+      if (old >= 0) {
+        Global& og = *m_.globals[static_cast<uint64_t>(old)];
+        Unsized* u = unsized_of(old);
+        if (u && og.type.array == kUnsizedArray && og.type.element() == t.element()) {
+          if (u->length > t.array) { err("array redeclared smaller than an index used"); return; }
+          og.type.array = t.array;
+          if (!place_global(og)) return;
+          if (Sym* s = find_sym(name)) if (s->kind == 1 && s->index == old) s->type = og.type;
+          return;
+        }
+      }
+    }
     GlobalKind kind = GlobalKind::Private;
     bool shared = false;
     if (q.is_const && !q.uniform) kind = GlobalKind::Const;
@@ -687,9 +819,12 @@ class Parser {
         ++pos_;
         Type t = ft;
         if (is("[") && !parse_array_suffix(&t)) return false;
+        if (t.array == kUnsizedArray) return err("a structure member must have a size");
         f.type = t;
         f.offset = offset;
-        offset += m_.slots_of(t);
+        const uint32_t n = m_.slots_of(t);
+        if (n >= kMaxValueSlots || offset > kMaxValueSlots - n) return err("structure too large");
+        offset += n;
         sd->fields.push_back(static_cast<Field&&>(f));
         if (!accept(",")) break;
       }
@@ -804,6 +939,7 @@ class Parser {
     for (uint64_t i = 0; i < pnames.count(); ++i)
       if (!pnames[i]->empty()) add_sym(pnames[i]->view(), F.params[i].type, 0, static_cast<int32_t>(i));
     const int32_t body = block_stmt(false);
+    finish_unsized_locals();
     pop_scope();
     m_.functions[static_cast<uint64_t>(index)]->body = body;
     m_.functions[static_cast<uint64_t>(index)]->locals = nlocals_;
@@ -919,7 +1055,7 @@ class Parser {
   }
 
   bool starts_decl() {
-    if (is_id("const") || is_id("highp") || is_id("mediump") || is_id("lowp") || is_id("precision")) return true;
+    if (is_id("const") || is_id("highp") || is_id("mediump") || is_id("lowp") || is_id("precision") || is_id("struct")) return true;
     if (!at_type()) return false;
     Type t;
     find_type_name(cur().text, &t);
@@ -943,7 +1079,12 @@ class Parser {
       return add(e);
     }
     Type base;
-    if (!parse_type(&base)) return -1;
+    if (is_id("struct")) {      // a structure declared inside a function (and maybe variables of it)
+      if (!struct_decl(&base)) return -1;
+      if (accept(";")) { Node e; e.kind = NodeKind::Empty; return add(e); }
+    } else if (!parse_type(&base)) {
+      return -1;
+    }
     List<int32_t> decls(a_);
     for (;;) {
       if (cur().kind != Tok::Ident) return err("expected a variable name"), -1;
@@ -957,7 +1098,6 @@ class Parser {
         if (init < 0) return -1;
         if (t.array == 0xFFFFFFFFu) t.array = init_array_size(init);
       }
-      if (t.array == 0xFFFFFFFFu) return err("unsized array without an initializer"), -1;
       Node d;
       d.kind = NodeKind::Decl;
       d.type = t;
@@ -965,8 +1105,11 @@ class Parser {
       d.ival = static_cast<int32_t>(nlocals_);
       d.line = cur().line;
       add_sym(name, t, 0, static_cast<int32_t>(nlocals_));
+      const int32_t decl = add(d);
+      // An unsized local is sized by the constant indices it is used with, when the function ends (finish_unsized_locals).
+      if (t.array == kUnsizedArray && !unsized_locals_.push_back(UnsizedLocal{static_cast<int32_t>(nlocals_), decl, 0})) return err("out of memory"), -1;
       ++nlocals_;
-      decls.push_back(add(d));
+      decls.push_back(decl);
       if (!accept(",")) break;
     }
     if (!expect(";")) return -1;
@@ -1175,6 +1318,23 @@ class Parser {
         n.a = e;
         n.b = expression();
         if (n.b < 0 || !expect("]")) return -1;
+        const Node& base = m_.nodes[static_cast<uint64_t>(e)];
+        if (base.kind == NodeKind::Local) {
+          if (UnsizedLocal* u = unsized_local_of(base.ival)) {
+            int64_t v;
+            if (!fold_int(n.b, &v) || v < 0) return err("an unsized array can only be indexed with a constant"), -1;
+            if (v >= static_cast<int64_t>(kMaxArrayLength)) return err("array too large"), -1;
+            if (static_cast<uint32_t>(v) + 1 > u->length) u->length = static_cast<uint32_t>(v) + 1;
+          }
+        }
+        if (base.kind == NodeKind::Global && m_.globals[static_cast<uint64_t>(base.ival)]->type.array == kUnsizedArray) {
+          // An unsized array grows to the highest constant index it is used with; a variable index needs a size (GLSL 1.10, 4.1.9).
+          int64_t v;
+          Unsized* u = unsized_of(base.ival);
+          if (!u || !fold_int(n.b, &v) || v < 0) return err("an unsized array can only be indexed with a constant"), -1;
+          if (v >= static_cast<int64_t>(kMaxArrayLength)) return err("array too large"), -1;
+          if (static_cast<uint32_t>(v) + 1 > u->length) u->length = static_cast<uint32_t>(v) + 1;
+        }
         e = add(n);
       } else if (is(".")) {
         ++pos_;
@@ -1383,6 +1543,7 @@ class Parser {
     Node n;
     n.kind = NodeKind::TexCall;
     n.op = static_cast<Op>(op);
+    if (t.legacy_shadow) n.flags |= 2;
     n.first = add_kids(kid, 9);
     n.count = 9;
     n.line = cur().line;
@@ -1393,13 +1554,13 @@ class Parser {
 
 }  // namespace
 
-bool parse_glsl(Module& module, StringView source, Stage stage) {
+bool parse_glsl(Module& module, StringView source, Stage stage, const GlslOptions& glsl) {
   module.stage = stage;
   module.language = Language::Glsl100;
   // The preprocessor is glcpp's (GlslPreprocessor.cpp). Its output keeps #version, #extension, #pragma and #line as lines: they are blanked here, keeping the line count.
   PreprocessOptions options;
-  options.default_version = 100;
-  options.default_es = true;
+  options.default_version = glsl.desktop ? 110 : 100;
+  options.default_es = !glsl.desktop;
   PreprocessResult pre(module.allocator);
   if (!preprocess_glsl(module.allocator, source, options, &pre)) {
     module.error.assign(pre.log.empty() ? StringView("preprocessor error") : pre.log.view());
@@ -1420,8 +1581,16 @@ bool parse_glsl(Module& module, StringView source, Stage stage) {
       i = end + 1;
     }
   }
-  module.glsl_version = version;
-  if (version >= 300) module.language = Language::Glsl300;
+  if (glsl.desktop && !pre.es) {
+    // Desktop GLSL: 1.10 and 1.20 by the 1.00 rules, 1.30 and later by the 3.00 ones, with what desktop GLSL adds (Module::desktop).
+    module.desktop = true;
+    module.desktop_version = version;
+    module.compatibility = version <= 140 || pre.profile == 2;
+    module.glsl_version = version >= 130 ? 300 : 100;
+  } else {
+    module.glsl_version = version;
+  }
+  if (module.glsl_version >= 300) module.language = Language::Glsl300;
   List<Token> toks(module.allocator);
   if (!lex(pp.view(), &toks)) {
     module.error.assign("out of memory");

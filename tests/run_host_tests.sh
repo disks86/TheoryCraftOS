@@ -174,6 +174,8 @@ for t in "${WANTED[@]}"; do
     GpuTest) build_and_run GpuTest tests/GpuTest.cpp tests/KernelStubs.cpp src/WebGl/*.cpp src/Math/FloatMath.cpp ;;
     GlAccelTest) build_and_run GlAccelTest tests/GlAccelTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Graphics/Graphics3D/WebGlAccelerator.cpp src/WebGl/*.cpp src/Math/FloatMath.cpp ;;
     GlTest) build_and_run GlTest tests/GlTest.cpp tests/KernelStubs.cpp src/WebGl/*.cpp src/Math/FloatMath.cpp ;;
+    # piglit's .shader_test files (fetched, not vendored: tests/fetch_piglit.sh) against the kernel's OpenGL. Long (tens of minutes): not in the default list.
+    PiglitShaderTest) $cxx $flags tests/PiglitShaderTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $(ls src/OpenGl/*.cpp | grep -v WindowsGl) src/OpenGl/generated/GlApiVariants.cpp src/WebGl/*.cpp src/Math/FloatMath.cpp -o "$out/PiglitShaderTest" && ASAN_OPTIONS=detect_leaks=0 "$out/PiglitShaderTest" "$(tests/fetch_piglit.sh)" ;;
     OpenGlTest) build_and_run OpenGlTest tests/OpenGlTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $(ls src/OpenGl/*.cpp | grep -v WindowsGl) src/OpenGl/generated/GlApiVariants.cpp src/WebGl/*.cpp src/Math/FloatMath.cpp ;;
     RtcTest) build_and_run RtcTest tests/RtcTest.cpp tests/KernelStubs.cpp src/Rtc/*.cpp src/Crypto/*.cpp src/Network/Tls/TlsKeys.cpp src/Kernel/Sync.cpp ;;
     CanvasTest) build_and_run CanvasTest tests/CanvasTest.cpp tests/KernelStubs.cpp src/Browser/Canvas.cpp src/Browser/Css.cpp src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Math/FloatMath.cpp src/Dom/*.cpp src/Browser/Media.cpp ;;

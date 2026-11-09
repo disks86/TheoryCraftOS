@@ -116,7 +116,41 @@ void GlApi::glLinkProgram(GLuint program) {
       {"tcos_MultiTexCoord0", kAttrTex0}, {"tcos_MultiTexCoord1", kAttrTex0 + 1}, {"tcos_MultiTexCoord2", kAttrTex0 + 2}, {"tcos_MultiTexCoord3", kAttrTex0 + 3},
       {"tcos_MultiTexCoord4", kAttrTex0 + 4}, {"tcos_MultiTexCoord5", kAttrTex0 + 5}, {"tcos_MultiTexCoord6", kAttrTex0 + 6}, {"tcos_MultiTexCoord7", kAttrTex0 + 7}};
   for (const auto& c : kCompat) gl_.bind_attrib_location(p, c.attr, c.name);
+  // A compatibility program may leave out a stage: the fixed-function one stands in, written at the version of the stage that is there so that the varyings match.
+  const webgl::ProgramObj* po = gl_.program(p);
+  uint32_t stand_in = 0;
+  if (po && compat() && (po->vs == 0) != (po->fs == 0)) {
+    const uint32_t present = po->vs ? po->vs : po->fs;
+    const bool modern = gl_.shader_src(present).starts_with("#version 300");
+    const bool need_vertex = po->vs == 0;
+    String text(a_);
+    text.append(modern ? "#version 130\n" : "#version 110\n");
+    if (need_vertex) {
+      text.append("void main(){ gl_Position = ftransform(); gl_FrontColor = gl_Color; gl_FrontSecondaryColor = gl_SecondaryColor; gl_FogFragCoord = abs((gl_ModelViewMatrix * gl_Vertex).z);\n");
+      for (uint32_t i = 0; i < kMaxTexUnits; ++i) {
+        char line[96] = "  gl_TexCoord[0] = gl_TextureMatrix[0] * gl_MultiTexCoord0;\n";
+        line[14] = static_cast<char>('0' + i);
+        line[36] = static_cast<char>('0' + i);
+        line[57] = static_cast<char>('0' + i);
+        text.append(line);
+      }
+      text.append("}\n");
+    } else {
+      text.append("void main(){ gl_FragColor = gl_Color; }\n");
+    }
+    String translated(a_);
+    uint32_t uses = 0;
+    translate_desktop_glsl(text.view(), need_vertex, &translated, &uses);
+    stand_in = gl_.create_shader(need_vertex ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
+    gl_.shader_source(stand_in, translated.view());
+    gl_.compile_shader(stand_in);
+    gl_.attach_shader(p, stand_in);
+  }
   gl_.link_program(p);
+  if (stand_in) {      // (the program keeps its own copy of what it was linked from)
+    gl_.detach_shader(p, stand_in);
+    gl_.delete_object('s', stand_in);
+  }
 }
 void GlApi::glValidateProgram(GLuint program) {
   const uint32_t p = program_object(program);
@@ -416,6 +450,47 @@ void GlApi::glGetActiveUniformBlockName(GLuint program, GLuint uniformBlockIndex
   if (!object) { error(GL_INVALID_VALUE); return; }
   write_string(uniformBlockName, bufSize, length, gl_.uniform_block_name(object, uniformBlockIndex));
 }
+// Members of uniform blocks: the engine lists only the uniforms outside blocks, so these come after them (index = its uniforms + the member's number), numbered in the order of
+// the vertex stage's blocks and then the fragment stage's new ones, with std140 offsets as the engine lays blocks out (GlContext::load_uniform_blocks).
+bool GlApi::block_member(uint32_t object, uint32_t index, BlockMember* out) {
+  const webgl::ProgramObj* po = gl_.program(object);
+  if (!po || !po->linked || index < po->uniforms.count()) return false;
+  uint32_t n = static_cast<uint32_t>(po->uniforms.count());
+  const shader::Module* mods[2] = {po->vsm.get(), po->fsm.get()};
+  for (int s = 0; s < 2; ++s) {
+    const shader::Module& m = *mods[s];
+    for (uint64_t b = 0; b < m.blocks.count(); ++b) {
+      if (s == 1) {      // (a block both stages have counts once)
+        bool seen = false;
+        for (uint64_t k = 0; k < mods[0]->blocks.count(); ++k) seen = seen || mods[0]->blocks[k]->name.view().equals(m.blocks[b]->name.view());
+        if (seen) continue;
+      }
+      uint32_t off = 0;
+      for (uint64_t g = 0; g < m.globals.count(); ++g) {
+        const shader::Global& gv = *m.globals[g];
+        if (gv.block != static_cast<int32_t>(b)) continue;
+        uint32_t al, sz;
+        shader::layout_of(m, gv.type, shader::Layout::Std140, &al, &sz);
+        off = (off + al - 1) / al * al;
+        if (n == index) {
+          out->module = &m;
+          out->global = &gv;
+          out->block = gl_.get_uniform_block_index(object, m.blocks[b]->name.view());
+          out->offset = off;
+          uint32_t eal, esz;
+          shader::layout_of(m, gv.type.element(), shader::Layout::Std140, &eal, &esz);
+          out->array_stride = gv.type.array ? (esz + 15) / 16 * 16 : 0;
+          out->matrix_stride = gv.type.cols > 1 ? 16 : 0;
+          return true;
+        }
+        off += sz;
+        ++n;
+      }
+    }
+  }
+  return false;
+}
+
 void GlApi::glGetUniformIndices(GLuint program, GLsizei uniformCount, UserPtr uniformNames, UserPtr uniformIndices) {
   const uint32_t object = program_object(program);
   if (!object || uniformCount < 0) { error(GL_INVALID_VALUE); return; }
@@ -424,11 +499,23 @@ void GlApi::glGetUniformIndices(GLuint program, GLsizei uniformCount, UserPtr un
   for (int32_t i = 0; i < uniformCount; ++i) {
     uint64_t at = 0;
     if (!read_values(uniformNames.plus(uint64_t{static_cast<uint32_t>(i)} * 8), &at, 1) || !read_string(UserPtr{at}, -1, &s)) { error(GL_INVALID_VALUE); return; }
+    // ("a[0]" names an array as "a" does)
+    StringView want = s.view();
+    if (want.size() > 3 && want.substr(want.size() - 3, 3).equals("[0]")) want = want.substr(0, want.size() - 3);
     uint32_t found = GL_INVALID_INDEX;
-    for (uint64_t k = 0; k < po->uniforms.count(); ++k) if (po->uniforms[k]->name.view().equals(s.view())) found = static_cast<uint32_t>(k);
+    for (uint64_t k = 0; k < po->uniforms.count() && found == GL_INVALID_INDEX; ++k) if (po->uniforms[k]->name.view().equals(want)) found = static_cast<uint32_t>(k);
+    BlockMember bm;
+    for (uint32_t k = static_cast<uint32_t>(po->uniforms.count()); found == GL_INVALID_INDEX && block_member(object, k, &bm); ++k) {
+      const StringView member = bm.global->name.view();
+      // a member is named by itself, or as Block.member when the block has an instance name
+      if (member.equals(want)) { found = k; break; }
+      const uint64_t dot = want.size() > member.size() ? want.size() - member.size() - 1 : 0;
+      if (dot && want[dot] == '.' && want.substr(dot + 1, member.size()).equals(member)) found = k;
+    }
     write_values(uniformIndices.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &found, 1);
   }
 }
+
 void GlApi::glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, UserPtr uniformIndices, GLenum pname, UserPtr params) {
   const uint32_t object = program_object(program);
   if (!object || uniformCount < 0) { error(GL_INVALID_VALUE); return; }
@@ -436,19 +523,31 @@ void GlApi::glGetActiveUniformsiv(GLuint program, GLsizei uniformCount, UserPtr 
   for (int32_t i = 0; i < uniformCount; ++i) {
     uint32_t index = 0;
     if (!read_values(uniformIndices.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &index, 1)) { error(GL_INVALID_VALUE); return; }
-    if (index >= po->uniforms.count()) { error(GL_INVALID_VALUE); return; }
-    const webgl::UniformLeaf& u = *po->uniforms[index];
     int32_t out = 0;
-    switch (pname) {
-      case GL_UNIFORM_TYPE: out = static_cast<int32_t>(u.gl_type); break;
-      case GL_UNIFORM_SIZE: out = static_cast<int32_t>(u.size); break;
-      case GL_UNIFORM_NAME_LENGTH: out = static_cast<int32_t>(u.name.view().size() + 1 + (u.size > 1 ? 3 : 0)); break;
-      case GL_UNIFORM_BLOCK_INDEX: out = -1; break;
-      case GL_UNIFORM_OFFSET: out = -1; break;
-      case GL_UNIFORM_ARRAY_STRIDE: out = -1; break;
-      case GL_UNIFORM_MATRIX_STRIDE: out = -1; break;
-      case GL_UNIFORM_IS_ROW_MAJOR: out = 0; break;
-      default: error(GL_INVALID_ENUM); return;
+    if (index < po->uniforms.count()) {
+      const webgl::UniformLeaf& u = *po->uniforms[index];
+      switch (pname) {
+        case GL_UNIFORM_TYPE: out = static_cast<int32_t>(u.gl_type); break;
+        case GL_UNIFORM_SIZE: out = static_cast<int32_t>(u.size); break;
+        case GL_UNIFORM_NAME_LENGTH: out = static_cast<int32_t>(u.name.view().size() + 1 + (u.size > 1 ? 3 : 0)); break;
+        case GL_UNIFORM_BLOCK_INDEX: case GL_UNIFORM_OFFSET: case GL_UNIFORM_ARRAY_STRIDE: case GL_UNIFORM_MATRIX_STRIDE: out = -1; break;
+        case GL_UNIFORM_IS_ROW_MAJOR: out = 0; break;
+        default: error(GL_INVALID_ENUM); return;
+      }
+    } else {
+      BlockMember bm;
+      if (!block_member(object, index, &bm)) { error(GL_INVALID_VALUE); return; }
+      switch (pname) {
+        case GL_UNIFORM_TYPE: out = static_cast<int32_t>(gl_.uniform_gl_type(bm.global->type.element())); break;
+        case GL_UNIFORM_SIZE: out = bm.global->type.array ? static_cast<int32_t>(bm.global->type.array) : 1; break;
+        case GL_UNIFORM_NAME_LENGTH: out = static_cast<int32_t>(bm.global->name.view().size() + 1 + (bm.global->type.array ? 3 : 0)); break;
+        case GL_UNIFORM_BLOCK_INDEX: out = static_cast<int32_t>(bm.block); break;
+        case GL_UNIFORM_OFFSET: out = static_cast<int32_t>(bm.offset); break;
+        case GL_UNIFORM_ARRAY_STRIDE: out = static_cast<int32_t>(bm.array_stride); break;
+        case GL_UNIFORM_MATRIX_STRIDE: out = static_cast<int32_t>(bm.matrix_stride); break;
+        case GL_UNIFORM_IS_ROW_MAJOR: out = 0; break;
+        default: error(GL_INVALID_ENUM); return;
+      }
     }
     write_values(params.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &out, 1);
   }

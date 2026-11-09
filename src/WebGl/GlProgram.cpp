@@ -79,7 +79,9 @@ void GlContext::compile_shader(uint32_t id) {
   s->log.clear();
   s->compiled = false;
   if (!m) { s->log.assign("out of memory"); return; }
-  const bool ok = shader::parse_glsl(*m, s->source.view(), s->type == 0x8B31 ? shader::Stage::Vertex : shader::Stage::Fragment);
+  shader::GlslOptions glsl;
+  glsl.desktop = desktop.active;
+  const bool ok = shader::parse_glsl(*m, s->source.view(), s->type == 0x8B31 ? shader::Stage::Vertex : shader::Stage::Fragment, glsl);
   if (ok && !es3_ && m->glsl_version >= 300) {
     s->log.assign("ERROR: 0:1: '#version 300 es' needs a WebGL 2 context");
   } else if (!ok) {
@@ -222,16 +224,34 @@ void GlContext::link_program(uint32_t id) {
   ShaderObj* fs = shader_at(p->fs);
   if (!vs || !fs) { link_failed(p, "a program needs a vertex and a fragment shader"); return; }
   if (!vs->compiled || !fs->compiled || !vs->module || !fs->module) { link_failed(p, "attached shaders did not compile"); return; }
+  shader::GlslOptions link_glsl;
+  link_glsl.desktop = desktop.active;
   // Each program owns its own parse of the shaders, so recompiling a shader later does not change it.
   p->vsm = UniquePointer<shader::Module>::make(a_, a_);
   p->fsm = UniquePointer<shader::Module>::make(a_, a_);
-  if (!p->vsm || !p->fsm || !shader::parse_glsl(*p->vsm, vs->source.view(), shader::Stage::Vertex) || !shader::parse_glsl(*p->fsm, fs->source.view(), shader::Stage::Fragment)) {
+  if (!p->vsm || !p->fsm || !shader::parse_glsl(*p->vsm, vs->source.view(), shader::Stage::Vertex, link_glsl) || !shader::parse_glsl(*p->fsm, fs->source.view(), shader::Stage::Fragment, link_glsl)) {
     link_failed(p, "could not prepare the shaders");
     return;
   }
   const shader::Module& vm = *p->vsm;
   const shader::Module& fm = *p->fsm;
-  if (vm.glsl_version != fm.glsl_version) { link_failed(p, "vertex and fragment shaders must use the same GLSL version"); return; }
+  if (desktop.active && vm.desktop) {
+    // A vertex shader must write gl_Position (GLSL 1.10 to 1.30: the linker says so).
+    const int32_t pos = vm.find_builtin_global(shader::kBvPosition);
+    if (vm.desktop_version < 140 && (pos < 0 || !vm.globals[static_cast<uint64_t>(pos)]->referenced)) { link_failed(p, "the vertex shader does not write gl_Position"); return; }
+    // A uniform both stages declare must have one type.
+    for (uint64_t i = 0; i < vm.globals.count(); ++i) {
+      const shader::Global& vg = *vm.globals[i];
+      if (vg.kind != GlobalKind::Uniform) continue;
+      for (uint64_t k = 0; k < fm.globals.count(); ++k) {
+        const shader::Global& fg = *fm.globals[k];
+        // (structure types are numbered per shader: those are not compared here)
+        if (fg.kind == GlobalKind::Uniform && fg.name.view().equals(vg.name.view()) && fg.type.base != Base::Struct && !(fg.type == vg.type)) { link_failed(p, "a uniform has different types in the two stages"); return; }
+      }
+    }
+  }
+  // (desktop GL links stages of different versions)
+  if (!desktop.active && vm.glsl_version != fm.glsl_version) { link_failed(p, "vertex and fragment shaders must use the same GLSL version"); return; }
 
   // attributes
   uint32_t used = 0;
@@ -283,7 +303,11 @@ void GlContext::link_program(uint32_t id) {
       const shader::Global& vg = *vm.globals[k];
       if (vg.kind == GlobalKind::Out && vg.builtin == shader::kBvNone && vg.name.view().equals(fg.name.view())) { match = &vg; break; }
     }
-    if (!match) continue;   // read but never written: stays zero
+    if (!match) {
+      // Desktop GL: a varying the fragment stage reads must come from the vertex stage (the compatibility ones, tcos_*, may be left unwritten).
+      if (desktop.active && fm.desktop && !fg.name.view().starts_with("tcos_") && fg.referenced) { link_failed(p, "a fragment shader input is not written by the vertex shader"); return; }
+      continue;   // read but never written: stays zero
+    }
     if (match->type != fg.type) { link_failed(p, "varying types do not match between the shaders"); return; }
     VaryingLink l;
     l.vs_slot = match->slot;
