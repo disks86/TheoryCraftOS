@@ -251,7 +251,7 @@ void GlContext::link_program(uint32_t id) {
     const uint32_t width = g.type.cols > 1 ? g.type.cols : 1;
     if (ai->location >= 0) {
       for (uint32_t c = 0; c < width; ++c) {
-        if (ai->location + c >= kMaxAttribs || (used & (1u << (ai->location + c)))) { link_failed(p, "attribute locations collide"); return; }
+        if (ai->location + c >= (desktop.active ? kMaxAttribSlots : kMaxAttribs) || (used & (1u << (ai->location + c)))) { link_failed(p, "attribute locations collide"); return; }
         used |= 1u << (ai->location + c);
       }
     }
@@ -363,7 +363,7 @@ const ProgramObj* GlContext::program(uint32_t id) const { return id && id <= pro
 void GlContext::bind_attrib_location(uint32_t program, uint32_t index, StringView name) {
   ProgramObj* p = program_at(program);
   if (!p) { set_error(INVALID_VALUE); return; }
-  if (index >= kMaxAttribs) { set_error(INVALID_VALUE); return; }
+  if (index >= (desktop.active ? kMaxAttribSlots : kMaxAttribs)) { set_error(INVALID_VALUE); return; }
   if (name.starts_with("gl_")) { set_error(INVALID_OPERATION); return; }
   for (uint64_t i = 0; i < p->bound_attribs.count(); ++i)
     if (p->bound_attribs[i]->name.view().equals(name)) { p->bound_attribs[i]->loc = static_cast<int32_t>(index); return; }

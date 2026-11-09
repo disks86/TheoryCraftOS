@@ -74,6 +74,23 @@ const FormatInfo kFormats[] = {
     {0x8CAC, Store::Depth, DEPTHC, false, true, true, true, false}, {0x1902, Store::Depth, DEPTHC, false, true, true, false, false},
     {0x88F0, Store::DepthStencil, DEPTHSTENCIL, false, true, true, false, false}, {0x8CAD, Store::DepthStencil, DEPTHSTENCIL, false, true, true, true, false},
     {0x84F9, Store::DepthStencil, DEPTHSTENCIL, false, true, true, false, false}, {0x8D48, Store::DepthStencil, DEPTHSTENCIL, false, true, false, false, false},
+    // What only desktop OpenGL has (WebGL's checks never let these through). Up to 8 bits a component in bytes, deeper ones in floats.
+    {1, Store::U8x4, LUM, false, false, true, false, false}, {2, Store::U8x4, LUMA, false, false, true, false, false}, {3, Store::U8x4, RGB, false, true, true, false, false}, {4, Store::U8x4, RGBA, false, true, true, false, false},
+    {0x2A10, Store::U8x4, RGB, false, true, true, false, false},   // R3_G3_B2
+    {0x803B, Store::U8x4, ALPHA, false, true, true, false, false}, {0x803C, Store::U8x4, ALPHA, false, true, true, false, false}, {0x803D, Store::F32x4, ALPHA, false, true, true, false, false}, {0x803E, Store::F32x4, ALPHA, false, true, true, false, false},
+    {0x803F, Store::U8x4, LUM, false, true, true, false, false}, {0x8040, Store::U8x4, LUM, false, true, true, false, false}, {0x8041, Store::F32x4, LUM, false, true, true, false, false}, {0x8042, Store::F32x4, LUM, false, true, true, false, false},
+    {0x8043, Store::U8x4, LUMA, false, true, true, false, false}, {0x8044, Store::U8x4, LUMA, false, true, true, false, false}, {0x8045, Store::U8x4, LUMA, false, true, true, false, false}, {0x8046, Store::F32x4, LUMA, false, true, true, false, false}, {0x8047, Store::F32x4, LUMA, false, true, true, false, false}, {0x8048, Store::F32x4, LUMA, false, true, true, false, false},
+    {0x8049, Store::U8x4, 0x8049, false, true, true, false, false}, {0x804A, Store::U8x4, 0x8049, false, true, true, false, false}, {0x804B, Store::U8x4, 0x8049, false, true, true, false, false}, {0x804C, Store::F32x4, 0x8049, false, true, true, false, false}, {0x804D, Store::F32x4, 0x8049, false, true, true, false, false},
+    {0x804F, Store::U8x4, RGB, false, true, true, false, false}, {0x8050, Store::U8x4, RGB, false, true, true, false, false}, {0x8052, Store::F32x4, RGB, false, true, true, false, false}, {0x8053, Store::F32x4, RGB, false, true, true, false, false}, {0x8054, Store::F32x4, RGB, false, true, true, false, false},
+    {0x8055, Store::U8x4, RGBA, false, true, true, false, false}, {0x805A, Store::F32x4, RGBA, false, true, true, false, false}, {0x805B, Store::F32x4, RGBA, false, true, true, false, false},
+    {0x822A, Store::F32x4, RED, false, true, true, false, false}, {0x822C, Store::F32x4, RG, false, true, true, false, false},      // R16, RG16
+    {0x8F98, Store::F32x4, RED, false, false, true, true, true}, {0x8F99, Store::F32x4, RG, false, false, true, true, true}, {0x8F9A, Store::F32x4, RGB, false, false, true, true, true}, {0x8F9B, Store::F32x4, RGBA, false, false, true, true, true},      // R16_SNORM ...
+    {0x8C40, Store::U8x4, RGB, true, false, true, false, false}, {0x8C42, Store::U8x4, RGBA, true, false, true, false, false},      // SRGB, SRGB_ALPHA
+    {0x8C44, Store::U8x4, LUMA, true, false, true, false, false}, {0x8C45, Store::U8x4, LUMA, true, false, true, false, false}, {0x8C46, Store::U8x4, LUM, true, false, true, false, false}, {0x8C47, Store::U8x4, LUM, true, false, true, false, false},      // SLUMINANCE ...
+    {0x906F, Store::U32x4, RGBA, false, true, false, false, false},      // RGB10_A2UI
+    {0x84ED, Store::U8x4, RGB, false, true, true, false, false}, {0x84EE, Store::U8x4, RGBA, false, true, true, false, false}, {0x84EB, Store::U8x4, LUM, false, true, true, false, false}, {0x84EC, Store::U8x4, LUMA, false, true, true, false, false}, {0x84EA, Store::U8x4, ALPHA, false, true, true, false, false}, {0x8225, Store::U8x4, RED, false, true, true, false, false}, {0x8226, Store::U8x4, RG, false, true, true, false, false},      // COMPRESSED_RGB ... (not compressed)
+    {0x8816, Store::F32x4, ALPHA, false, true, true, true, false}, {0x8818, Store::F32x4, LUM, false, true, true, true, false}, {0x8819, Store::F32x4, LUMA, false, true, true, true, false}, {0x8817, Store::F32x4, 0x8049, false, true, true, true, false},      // ALPHA32F, LUMINANCE32F, LUMINANCE_ALPHA32F, INTENSITY32F
+    {0x881C, Store::F32x4, ALPHA, false, true, true, true, false}, {0x881E, Store::F32x4, LUM, false, true, true, true, false}, {0x881F, Store::F32x4, LUMA, false, true, true, true, false}, {0x881D, Store::F32x4, 0x8049, false, true, true, true, false},      // the 16F versions
 };
 }  // namespace
 
@@ -94,7 +111,7 @@ uint32_t texel_bytes(Store s) {
 
 bool Image::allocate(const FormatInfo* fi, uint32_t width, uint32_t height, uint32_t depth) {
   const uint64_t n = uint64_t{width} * height * depth * texel_bytes(fi->store);
-  if (n > (256ull << 20)) return false;
+  if (n > (2048ull << 20)) return false;
   px.clear();
   if (!px.put_zeros(n)) return false;
   info = fi;

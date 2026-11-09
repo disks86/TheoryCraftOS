@@ -86,8 +86,8 @@ void GlContext::hw_drop() {
 void GlContext::hw_sync() {
   if (!hw_ahead_) return;
   hw_ahead_ = false;
-  const uint64_t bytes = uint64_t{def_color_.w} * def_color_.h * 4;
-  ByteView dst = def_color_.px.writable_view();
+  const uint64_t bytes = uint64_t{dcolor_->w} * dcolor_->h * 4;
+  ByteView dst = dcolor_->px.writable_view();
   if (!hw_owner_ || !hw_target_ || dst.size() != bytes || !hw_owner_->read_color(hw_target_, dst)) {
     hw_valid_ = false;   // the device would not give the picture back: what the CPU has is the best there is
     return;
@@ -100,8 +100,8 @@ void GlContext::hw_sync() {
 bool GlContext::hw_target(IAccelerator* acc) {
   if (hw_owner_ != acc) hw_drop();
   if (hw_target_) return true;
-  if (!def_color_.defined()) return false;
-  hw_target_ = acc->create_target(def_color_.w, def_color_.h);
+  if (!dcolor_->defined()) return false;
+  hw_target_ = acc->create_target(dcolor_->w, dcolor_->h);
   if (!hw_target_) return false;
   hw_owner_ = acc;
   hw_valid_ = false;
@@ -113,7 +113,7 @@ bool GlContext::hw_target(IAccelerator* acc) {
 void GlContext::hw_after_clear(uint32_t mask, bool whole) {
   IAccelerator* acc = accelerator();
   const bool color = (mask & 0x4000) != 0 && cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3];
-  const bool depth = def_depth_.defined();
+  const bool depth = ddepth_->defined();
   if (!acc || !whole || !color || !hw_target(acc)) {
     hw_valid_ = false;
     return;
@@ -150,11 +150,11 @@ bool GlContext::hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int3
                         int32_t instances) {
   IAccelerator* acc = accelerator();
   if (!acc || !target.is_default || draw_fb_ != 0 || !default_draw_back_ || instances != 1 || mode < 4 || mode > 6) return false;
-  if (target.color[0] != &def_color_ || target.color_count != 1 || !def_color_.defined() || tf_active_ || rasterizer_discard_) return false;
+  if (target.color[0] != dcolor_ || target.color_count != 1 || !dcolor_->defined() || tf_active_ || rasterizer_discard_) return false;
   if (query_active_[0] || query_active_[1]) return false;
   if (stencil_test_ || offset_fill_ || alpha_to_coverage_ || sample_coverage_en_) return false;
   if (!(cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3])) return false;
-  const bool depth = def_depth_.defined();
+  const bool depth = ddepth_->defined();
   const bool depth_test = depth_test_ && depth;
   if (depth_test && dfunc_ != 0x0201 && dfunc_ != 0x0203) return false;   // LESS is taken as LEQUAL: they differ only for equal depths
   if (blend_) {

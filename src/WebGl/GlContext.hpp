@@ -32,6 +32,8 @@
 #include "WebGl/Shader.hpp"
 #include "WebGl/TgsiTranslator.hpp"
 
+namespace opengl { class GlApi; class FeedbackSink; }
+
 namespace webgl {
 
 // --- Formats and images ------------------------------------------------------------------------------------------------------------------------------------
@@ -57,6 +59,7 @@ struct Image {
   uint32_t w = 0, h = 0, d = 1;   // (for a multisampled image these are the stored samples: ss x ss of them per pixel)
   uint32_t compressed = 0;        // the compressed format it was uploaded in (it is stored decoded), or 0
   uint32_t ss = 1;                // 2 for a 4-sample image, which is kept as a 2x supersampled image and averaged when resolved
+  uint32_t requested_internal = 0;   // desktop GL: the internal format as the program gave it (reads back through glGetTexLevelParameter)
   const FormatInfo* info = nullptr;
   ByteBuffer px;
   bool defined() const { return info != nullptr && w > 0 && h > 0; }
@@ -74,11 +77,13 @@ void write_texel(Image& img, uint32_t x, uint32_t y, uint32_t z, const uint32_t 
 
 constexpr uint32_t kMaxLevels = 14;
 constexpr uint32_t kMaxTextureSize = 4096;
-constexpr uint32_t kMaxAttribs = 16;
+constexpr uint32_t kMaxAttribs = 16;          // what a program may use by number (GL_MAX_VERTEX_ATTRIBS)
+constexpr uint32_t kMaxAttribSlots = 32;      // what a vertex array holds: past kMaxAttribs are the fixed-function arrays of desktop GL (glNormalPointer ...)
 constexpr uint32_t kMaxTextureUnits = 16;
 constexpr uint32_t kMaxDrawBuffers = 8;
 constexpr uint32_t kMaxUniformBindings = 24;
 constexpr uint64_t kMaxTotalBytes = 512ull << 20;
+constexpr uint32_t kMaxStorageBindings = 16, kMaxAtomicBindings = 8;
 
 // Where a sampler finds the images of a texture: get(ctx, face, level), the kind of texture (a GL target: 0x0DE1, 0x8513 cube, 0x806F 3D, 0x8C1A 2D array) and the
 // level range. A cube whose six faces are the layers of one image (WebGPU) sets faces_in_layers.
@@ -98,6 +103,8 @@ struct Buffer {
   ByteBuffer data;
   uint32_t usage = 0x88E4;
   bool ever_bound = false;
+  bool immutable = false;      // glBufferStorage
+  uint32_t storage_flags = 0;
 };
 
 struct Texture {
@@ -111,11 +118,22 @@ struct Texture {
   float min_lod = -1000, max_lod = 1000;
   bool immutable = false;
   uint32_t immutable_levels = 0;
+  float border_color[4] = {0, 0, 0, 0};
+  uint32_t buffer = 0;      // GL_TEXTURE_BUFFER: the buffer that holds its texels
+  uint32_t buffer_format = 0;
+  uint64_t buffer_offset = 0, buffer_size = 0;
+  bool generate_mipmap_auto = false;      // GL_GENERATE_MIPMAP
+  float lod_bias = 0;
+  uint32_t depth_mode = 0x1909;           // GL_DEPTH_TEXTURE_MODE: GL_LUMINANCE
+  uint32_t swizzle[4] = {0x1903, 0x1904, 0x1905, 0x1906};
+  bool stencil_mode = false;              // GL_DEPTH_STENCIL_TEXTURE_MODE is GL_STENCIL_INDEX
 };
 
 struct SamplerObj {
   uint32_t min_filter = 0x2702, mag_filter = 0x2601, wrap_s = 0x2901, wrap_t = 0x2901, wrap_r = 0x2901, compare_mode = 0, compare_func = 0x0203;
   float min_lod = -1000, max_lod = 1000;
+  float border[4] = {0, 0, 0, 0};
+  float lod_bias = 0;
 };
 
 // Samples a texture. (GlSampler.cpp; the WebGPU device uses it too.)
@@ -229,10 +247,13 @@ struct VertexAttrib {
   float cur_f[4] = {0, 0, 0, 1};
   int32_t cur_i[4] = {0, 0, 0, 1};
   bool cur_is_int = false;
+  uint64_t client = 0;     // desktop GL: the address in the program of an array that is not in a buffer (`buffer` is then where the draw copied it)
+  bool from_client = false;
+  bool bgra = false;       // size GL_BGRA: the first and third components swap
 };
 
 struct Vao {
-  VertexAttrib attribs[kMaxAttribs];
+  VertexAttrib attribs[kMaxAttribSlots];
   uint32_t element_buffer = 0;
 };
 
@@ -251,12 +272,71 @@ struct TransformFeedbackObj {
 
 struct TextureUnit {
   uint32_t tex2d = 0, cube = 0, tex3d = 0, array = 0;
+  uint32_t tex1d = 0, rect = 0, array1d = 0, cube_array = 0, buffer = 0, ms2d = 0, ms2d_array = 0;   // (targets desktop GL adds)
   uint32_t sampler = 0;
 };
 
 struct BufferBinding {
   uint32_t buffer = 0;
   uint64_t offset = 0, size = 0;
+};
+
+// The objects contexts of a share group have in common (wglShareLists, the share argument of wglCreateContextAttribsARB). Vertex arrays, framebuffers, queries and transform
+// feedback objects stay per context, as GL says.
+struct GlObjects {
+  explicit GlObjects(allocators::IAllocator& a) : buffers(a), textures(a), rbos(a), shaders(a), programs(a), samplers(a) {}
+  List<UniquePointer<Buffer>> buffers;
+  List<UniquePointer<Texture>> textures;
+  List<UniquePointer<Renderbuffer>> rbos;
+  List<UniquePointer<ShaderObj>> shaders;
+  List<UniquePointer<ProgramObj>> programs;
+  List<UniquePointer<SamplerObj>> samplers;
+};
+
+// What desktop OpenGL adds to the per-fragment and primitive stages (src/OpenGl sets it; WebGL leaves it at the defaults, for which every test below is a single branch not taken).
+struct DesktopState {
+  bool active = false;                 // this is a desktop context: primitive restart is optional, more draw modes
+  bool primitive_restart = false;
+  bool primitive_restart_fixed = false;
+  uint32_t restart_index = 0;
+  int32_t base_vertex = 0;
+  uint32_t base_instance = 0;
+  uint32_t polygon_mode_front = 0x1B02, polygon_mode_back = 0x1B02;   // GL_FILL
+  int32_t edge_flag_attrib = -1;       // the attribute holding the edge flag (only read when a polygon mode is not GL_FILL)
+  bool offset_line = false, offset_point = false;
+  bool flat_shade = false;             // glShadeModel(GL_FLAT): the colours of the varying range below are flat
+  uint32_t flat_first = 0, flat_count = 0;
+  bool first_vertex_convention = false;
+  bool alpha_test = false;
+  uint32_t alpha_func = 0x0207;
+  float alpha_ref = 0;
+  bool logic_op = false;
+  uint32_t logic_mode = 0x1503;        // GL_COPY
+  bool line_stipple = false;
+  uint32_t stipple_factor = 1;
+  uint16_t stipple_pattern = 0xFFFF;
+  bool polygon_stipple = false;
+  uint32_t polygon_pattern[32] = {};
+  bool depth_clamp = false;
+  bool multisample = true;
+  bool point_sprite = false;
+  bool point_size_from_program = false;
+  float point_size = 1;
+  float point_min = 0, point_max = 64;
+  float point_atten[3] = {1, 0, 0};
+  bool draw_front_and_back = false;    // the default framebuffer: GL_FRONT_AND_BACK
+  Image* front_also = nullptr;         // where the second copy goes
+  uint32_t clip_mask = 0;              // glEnable(GL_CLIP_PLANEi) / GL_CLIP_DISTANCEi
+  int32_t clip_varying = -1;           // the first of the program's clip distances among the varyings (one scalar per set bit, lowest first)
+  uint8_t color_mask[kMaxDrawBuffers] = {15, 15, 15, 15, 15, 15, 15, 15};
+  bool per_buffer_masks = false;
+  // one blend state per draw buffer (glBlendFunci, glEnablei(GL_BLEND, i)) when per_buffer_blend is set
+  bool per_buffer_blend = false;
+  struct BufferBlend { bool enabled = false; uint32_t eq_rgb = 0x8006, eq_a = 0x8006, sr = 1, dr = 0, sa = 1, da = 0; } blend[kMaxDrawBuffers];
+  // Where the vertices go instead of the rasterizer: feedback and selection modes (glRenderMode).
+  gpu::IPrimitiveSink* primitive_sink = nullptr;
+  ConstByteView triangle_edges;        // polygons cut into triangles: one byte per triangle, bits 0..2 say which edges are real ones
+  uint32_t ff_1d_mask = 0, ff_rect_mask = 0;   // texture units whose sampler2D reaches the unit's 1D (rectangle) texture: fixed-function programs
 };
 
 // --- The context ---------------------------------------------------------------------------------------------------------------------------------------
@@ -267,7 +347,8 @@ class GlContext final : public shader::ITextureHost {
     bool alpha = true, depth = true, stencil = false, antialias = true, premultiplied = true, preserve = false;
   };
 
-  GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32_t height, const Attributes& attrs);
+  // `shared`: the objects to use, which outlive this context (null: its own).
+  GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32_t height, const Attributes& attrs, GlObjects* shared = nullptr);
   ~GlContext();
   GlContext(const GlContext&) = delete;
   // True while the default framebuffer is drawn by the 3D hardware (for tests and the browser's status).
@@ -280,8 +361,12 @@ class GlContext final : public shader::ITextureHost {
   uint32_t height() const { return height_; }
   const Attributes& attributes() const { return attrs_; }
   void resize(uint32_t w, uint32_t h);
+  // Desktop GL: the default framebuffer lives in a window surface shared by the contexts drawing to it (src/OpenGl/GlSurface.hpp). `read` is the colour buffer reads take; null
+  // `color` = there is no default framebuffer (an incomplete one).
+  void set_default_images(Image* color, Image* read, Image* depth, uint32_t width, uint32_t height);
+  DesktopState desktop;
   bool lost() const { return lost_; }
-  bool antialiased() const { return def_color_.ss > 1; }
+  bool antialiased() const { return dcolor_->ss > 1; }
   void lose() { lost_ = true; }
   void restore();
   uint64_t version() const { return version_; }
@@ -381,6 +466,9 @@ class GlContext final : public shader::ITextureHost {
   void stencil_func_separate(uint32_t face, uint32_t func, int32_t ref, uint32_t mask);
   void stencil_op_separate(uint32_t face, uint32_t sfail, uint32_t dpfail, uint32_t dppass);
   void stencil_mask_separate(uint32_t face, uint32_t mask);
+  // (state read back, for desktop GL's glGet and attribute stacks)
+  uint32_t get_depth_func() const { return dfunc_; }
+  bool get_depth_mask() const { return dmask_; }
   void cull_face(uint32_t m) { cull_mode_ = m; }
   void front_face(uint32_t m) { front_face_ = m; }
   void polygon_offset(float factor, float units) { po_factor_ = factor; po_units_ = units; }
@@ -468,6 +556,8 @@ class GlContext final : public shader::ITextureHost {
 
  private:
   friend struct DrawJob;
+  friend class opengl::GlApi;   // the desktop layer works on the same objects
+  friend class opengl::FeedbackSink;
   friend struct FragmentPipeline;
 
   Buffer* buffer_at(uint32_t id) { return id && id <= buffers_.count() ? buffers_[id - 1].get() : nullptr; }
@@ -519,7 +609,7 @@ class GlContext final : public shader::ITextureHost {
   bool run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t index_type, uint64_t index_offset, int32_t instances, bool indexed);
   uint32_t fetch_index(const uint8_t* idx, uint32_t type, uint32_t i) const;
   void mark_dirty(int32_t x, int32_t y);
-  Image* default_color() { return &def_color_; }
+  Image* default_color() { return dcolor_; }
 
   allocators::IAllocator& a_;
   bool es3_;
@@ -531,20 +621,24 @@ class GlContext final : public shader::ITextureHost {
   uint64_t version_ = 1;
   uint64_t total_bytes_ = 0;
 
-  List<UniquePointer<Buffer>> buffers_;
-  List<UniquePointer<Texture>> textures_;
+  GlObjects own_objects_;
+  List<UniquePointer<Buffer>>& buffers_;
+  List<UniquePointer<Texture>>& textures_;
   List<UniquePointer<Framebuffer>> fbos_;
-  List<UniquePointer<Renderbuffer>> rbos_;
-  List<UniquePointer<ShaderObj>> shaders_;
-  List<UniquePointer<ProgramObj>> programs_;
+  List<UniquePointer<Renderbuffer>>& rbos_;
+  List<UniquePointer<ShaderObj>>& shaders_;
+  List<UniquePointer<ProgramObj>>& programs_;
   List<UniquePointer<Vao>> vaos_;
-  List<UniquePointer<SamplerObj>> samplers_;
+  List<UniquePointer<SamplerObj>>& samplers_;
   List<UniquePointer<QueryObj>> queries_;
   List<UniquePointer<TransformFeedbackObj>> tfs_;
   Vao default_vao_;
   TransformFeedbackObj default_tf_;
 
-  Image def_color_, def_depth_;
+  Image own_color_, own_depth_;
+  Image* dcolor_ = nullptr;
+  Image* dread_ = nullptr;
+  Image* ddepth_ = nullptr;
   gpu::TouchBox dirty_;
   bool all_dirty_ = true;
 
@@ -552,8 +646,12 @@ class GlContext final : public shader::ITextureHost {
   uint32_t array_buffer_ = 0, copy_read_ = 0, copy_write_ = 0, pixel_pack_ = 0, pixel_unpack_ = 0, tf_buffer_ = 0, uniform_buffer_ = 0;
   BufferBinding ubo_bindings_[kMaxUniformBindings];
   BufferBinding tf_bindings_[4];
+  BufferBinding ssbo_bindings_[kMaxStorageBindings];
+  BufferBinding atomic_bindings_[kMaxAtomicBindings];
   TextureUnit units_[kMaxTextureUnits];
   uint32_t active_unit_ = 0;
+  uint32_t extra_buffers_[6] = {};      // the buffer targets only desktop GL has
+  static int32_t extra_buffer_slot(uint32_t target);
   uint32_t rb_bound_ = 0, read_fb_ = 0, draw_fb_ = 0;
   uint32_t program_ = 0, vao_id_ = 0, tf_bound_ = 0;
   uint32_t query_active_[4] = {0, 0, 0, 0};

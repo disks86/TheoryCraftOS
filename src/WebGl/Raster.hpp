@@ -30,6 +30,7 @@ struct RVertex {
   float pos[4] = {0, 0, 0, 1};      // clip space
   float var[kMaxVarying] = {};
   float point_size = 1;
+  bool edge = true;                 // the edge flag (desktop GL's polygon modes)
 };
 
 struct RasterState {
@@ -48,6 +49,8 @@ struct RasterState {
   float line_width = 1;
   bool depth_clip = true;            // clip against near/far (WebGPU's unclipped_depth turns it off)
   bool clip_z_zero_to_one = false;   // WebGPU clip space has 0 <= z <= w
+  bool offset_lines = false, offset_points = false;   // polygon offset for GL_LINE and GL_POINT polygon modes
+  float line_start = 0;              // the line stipple count at the first pixel of the next line
 };
 
 struct TriSetup;
@@ -60,6 +63,8 @@ struct Fragment {
   float coord[4] = {0, 0, 0, 1};     // gl_FragCoord
   float point_coord[2] = {0, 0};
   bool is_point = false;
+  bool is_line = false;
+  float line_pos = 0;                // along a line, in pixels from where its stipple count started
   const TriSetup* setup = nullptr;
   uint32_t coverage_samples = 1;
   // The varyings as they would be at the centre of another pixel (for derivatives).
@@ -75,8 +80,20 @@ class IFragmentSink {
 };
 
 void draw_triangle(const RasterState& rs, const RVertex& a, const RVertex& b, const RVertex& c, IFragmentSink& sink);
-void draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragmentSink& sink);
+// Returns the length of the line along its major axis in pixels (what the line stipple count moves on by).
+float draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragmentSink& sink);
 void draw_point(const RasterState& rs, const RVertex& a, IFragmentSink& sink);
+
+// Instead of the rasterizer: takes the primitives after the vertex stage, in clip space (feedback and selection in desktop GL).
+class IPrimitiveSink {
+ public:
+  virtual void triangle(const RVertex& a, const RVertex& b, const RVertex& c) = 0;
+  virtual void line(const RVertex& a, const RVertex& b, bool first_of_strip) = 0;
+  virtual void point(const RVertex& a) = 0;
+
+ protected:
+  ~IPrimitiveSink() = default;
+};
 
 // The pixels touched since the last call (a bounding box), for presenting only what changed. Reset by clear_touched().
 struct TouchBox {

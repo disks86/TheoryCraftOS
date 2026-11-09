@@ -31,9 +31,13 @@ constexpr uint32_t INVALID_ENUM = 0x500, INVALID_VALUE = 0x501, INVALID_OPERATIO
 bool is_cube_face(uint32_t t) { return t >= 0x8515 && t <= 0x851A; }
 }  // namespace
 
-GlContext::GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32_t height, const Attributes& attrs)
-    : a_(a), es3_(es3), attrs_(attrs), width_(width), height_(height), buffers_(a), textures_(a), fbos_(a), rbos_(a), shaders_(a), programs_(a), vaos_(a), samplers_(a),
-      queries_(a), tfs_(a), def_color_(a), def_depth_(a), hw_textures_(a) {
+GlContext::GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32_t height, const Attributes& attrs, GlObjects* shared)
+    : a_(a), es3_(es3), attrs_(attrs), width_(width), height_(height), own_objects_(a), buffers_(shared ? shared->buffers : own_objects_.buffers),
+      textures_(shared ? shared->textures : own_objects_.textures), fbos_(a), rbos_(shared ? shared->rbos : own_objects_.rbos), shaders_(shared ? shared->shaders : own_objects_.shaders),
+      programs_(shared ? shared->programs : own_objects_.programs), vaos_(a), samplers_(shared ? shared->samplers : own_objects_.samplers), queries_(a), tfs_(a),
+      own_color_(a), own_depth_(a), hw_textures_(a) {
+  dcolor_ = dread_ = &own_color_;
+  ddepth_ = &own_depth_;
   resize(width, height);
   vp_[0] = vp_[1] = 0;
   vp_[2] = static_cast<int32_t>(width_);
@@ -41,12 +45,22 @@ GlContext::GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32
   sc_[0] = sc_[1] = 0;
   sc_[2] = static_cast<int32_t>(width_);
   sc_[3] = static_cast<int32_t>(height_);
-  valid_ = def_color_.defined();
+  valid_ = dcolor_->defined();
 }
 
 GlContext::~GlContext() { hw_drop(); }
 
 void GlContext::restore() { lost_ = false; }
+
+void GlContext::set_default_images(Image* color, Image* read, Image* depth, uint32_t width, uint32_t height) {
+  hw_drop();
+  dcolor_ = color ? color : &own_color_;
+  dread_ = read ? read : dcolor_;
+  ddepth_ = depth ? depth : &own_depth_;
+  width_ = width;
+  height_ = height;
+  valid_ = true;
+}
 
 void GlContext::resize(uint32_t w, uint32_t h) {
   if (w == 0) w = 1;
@@ -59,18 +73,18 @@ void GlContext::resize(uint32_t w, uint32_t h) {
   const bool had_vp = vp_[2] != 0;
   // an antialiased drawing buffer keeps 2 x 2 samples per pixel (not for very large ones)
   const uint32_t ss = attrs_.antialias && uint64_t{w} * h <= 2048ull * 2048 ? 2 : 1;
-  def_color_.allocate(find_format(0x8058), w * ss, h * ss, 1);
-  def_color_.ss = ss;
-  if (attrs_.depth || attrs_.stencil) { def_depth_.allocate(find_format(0x88F0), w * ss, h * ss, 1); def_depth_.ss = ss; }
+  dcolor_->allocate(find_format(0x8058), w * ss, h * ss, 1);
+  dcolor_->ss = ss;
+  if (attrs_.depth || attrs_.stencil) { ddepth_->allocate(find_format(0x88F0), w * ss, h * ss, 1); ddepth_->ss = ss; }
   // a freshly sized drawing buffer is transparent black (or opaque black without alpha) and has a clear depth of 1
-  if (def_color_.defined() && !attrs_.alpha) {
-    uint8_t* p = def_color_.px.writable_view().data();
-    for (uint64_t i = 3; i < def_color_.px.size(); i += 4) p[i] = 255;
+  if (dcolor_->defined() && !attrs_.alpha) {
+    uint8_t* p = dcolor_->px.writable_view().data();
+    for (uint64_t i = 3; i < dcolor_->px.size(); i += 4) p[i] = 255;
   }
-  if (def_depth_.defined()) {
+  if (ddepth_->defined()) {
     uint32_t v[4] = {__builtin_bit_cast(uint32_t, 1.0f), 0, 0, 0};
-    for (uint32_t y = 0; y < def_depth_.h; ++y)
-      for (uint32_t x = 0; x < def_depth_.w; ++x) write_texel(def_depth_, x, y, 0, v);
+    for (uint32_t y = 0; y < ddepth_->h; ++y)
+      for (uint32_t x = 0; x < ddepth_->w; ++x) write_texel(*ddepth_, x, y, 0, v);
   }
   if (had_vp) {   // the viewport and scissor of a resized buffer follow it, as the specification says only for the initial values
     vp_[2] = static_cast<int32_t>(w);
@@ -251,6 +265,18 @@ bool GlContext::is_object(uint32_t kind, uint32_t id) const {
 
 // --- Buffers -----------------------------------------------------------------------------------------------------------------------------------------------
 
+int32_t GlContext::extra_buffer_slot(uint32_t target) {
+  switch (target) {
+    case 0x8C2A: return 0;      // TEXTURE_BUFFER
+    case 0x8F3F: return 1;      // DRAW_INDIRECT_BUFFER
+    case 0x90EE: return 2;      // DISPATCH_INDIRECT_BUFFER
+    case 0x90D2: return 3;      // SHADER_STORAGE_BUFFER
+    case 0x92C0: return 4;      // ATOMIC_COUNTER_BUFFER
+    case 0x9192: return 5;      // QUERY_BUFFER
+    default: return -1;
+  }
+}
+
 void GlContext::bind_buffer(uint32_t target, uint32_t id) {
   if (id && !buffer_at(id)) { set_error(INVALID_OPERATION); return; }
   if (id) buffer_at(id)->ever_bound = true;
@@ -263,7 +289,12 @@ void GlContext::bind_buffer(uint32_t target, uint32_t id) {
     case GL_PIXEL_PACK: pixel_pack_ = id; break;
     case GL_PIXEL_UNPACK: pixel_unpack_ = id; break;
     case GL_TF_BUFFER: tf_buffer_ = id; break;
-    default: set_error(INVALID_ENUM); break;
+    default: {
+      const int32_t extra = desktop.active ? extra_buffer_slot(target) : -1;
+      if (extra < 0) { set_error(INVALID_ENUM); break; }
+      extra_buffers_[extra] = id;
+      break;
+    }
   }
 }
 
@@ -276,6 +307,7 @@ uint32_t GlContext::bound_buffer(uint32_t target) const {
     case GL_COPY_WRITE: return copy_write_;
     case GL_PIXEL_PACK: return pixel_pack_;
     case GL_PIXEL_UNPACK: return pixel_unpack_;
+    case 0x8C2A: case 0x8F3F: case 0x90EE: case 0x90D2: case 0x92C0: case 0x9192: return extra_buffers_[extra_buffer_slot(target)];
     case GL_TF_BUFFER: return tf_buffer_;
     default: return 0;
   }
@@ -369,6 +401,13 @@ uint32_t* GlContext::bound_texture_slot(uint32_t target) {
   TextureUnit& u = units_[active_unit_];
   if (target == 0x0DE1) return &u.tex2d;
   if (target == 0x8513 || is_cube_face(target)) return &u.cube;
+  if (target == 0x0DE0) return &u.tex1d;
+  if (target == 0x84F5) return &u.rect;
+  if (target == 0x8C18) return &u.array1d;
+  if (target == 0x9009) return &u.cube_array;
+  if (target == 0x8C2A) return &u.buffer;
+  if (target == 0x9100) return &u.ms2d;
+  if (target == 0x9102) return &u.ms2d_array;
   if (target == 0x806F) return es3_ ? &u.tex3d : nullptr;
   if (target == 0x8C1A) return es3_ ? &u.array : nullptr;
   return nullptr;
@@ -567,7 +606,7 @@ void GlContext::tex_parameter(uint32_t target, uint32_t pname, double value) {
     case 0x2800: if (v != 0x2600 && v != 0x2601) { set_error(INVALID_ENUM); return; } t->mag_filter = v; break;
     case 0x2801: if (v < 0x2600 || (v > 0x2601 && (v < 0x2700 || v > 0x2703))) { set_error(INVALID_ENUM); return; } t->min_filter = v; break;
     case 0x2802: case 0x2803: case 0x8072:
-      if (v != 0x2901 && v != 0x812F && v != 0x8370) { set_error(INVALID_ENUM); return; }
+      if (v != 0x2901 && v != 0x812F && v != 0x8370 && !(desktop.active && (v == 0x2900 || v == 0x812D || v == 0x8742))) { set_error(INVALID_ENUM); return; }
       (pname == 0x2802 ? t->wrap_s : pname == 0x2803 ? t->wrap_t : t->wrap_r) = v;
       break;
     case 0x884C: t->compare_mode = v == 0x884E ? v : 0; break;
@@ -798,12 +837,12 @@ void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t) {
   *t = Target();
   if (fb_id == 0) {
     t->is_default = true;
-    t->w = def_color_.w;
-    t->h = def_color_.h;
-    t->ss = def_color_.ss;
+    t->w = dcolor_->w;
+    t->h = dcolor_->h;
+    t->ss = dcolor_->ss;
     t->color_count = 1;
-    if (!draw || default_draw_back_) t->color[0] = &def_color_;
-    if (def_depth_.defined()) { t->depth = &def_depth_; t->stencil = &def_depth_; }
+    if (!draw || default_draw_back_) t->color[0] = dcolor_;
+    if (ddepth_->defined()) { t->depth = ddepth_; t->stencil = ddepth_; }
     t->ok = true;
     return;
   }
@@ -1036,12 +1075,12 @@ void GlContext::bind_vao(uint32_t id) {
 // --- Vertex arrays ------------------------------------------------------------------------------------------------------------------------------------------
 
 void GlContext::enable_vertex_attrib(uint32_t index, bool on) {
-  if (index >= kMaxAttribs) { set_error(INVALID_VALUE); return; }
+  if (index >= (desktop.active ? kMaxAttribSlots : kMaxAttribs)) { set_error(INVALID_VALUE); return; }
   current_vao_ptr()->attribs[index].enabled = on;
 }
 
 void GlContext::vertex_attrib_pointer(uint32_t index, int32_t size, uint32_t type, bool normalized, uint32_t stride, uint64_t offset, bool integer) {
-  if (index >= kMaxAttribs || size < 1 || size > 4 || stride > 255 * 4) { set_error(INVALID_VALUE); return; }
+  if (index >= (desktop.active ? kMaxAttribSlots : kMaxAttribs) || size < 1 || size > 4 || (!desktop.active && stride > 255 * 4)) { set_error(INVALID_VALUE); return; }
   switch (type) {
     case 0x1400: case 0x1401: case 0x1402: case 0x1403: case 0x1406: break;
     case 0x1404: case 0x1405: case 0x140B: case 0x8368: case 0x8D9F:
@@ -1061,12 +1100,12 @@ void GlContext::vertex_attrib_pointer(uint32_t index, int32_t size, uint32_t typ
 }
 
 void GlContext::vertex_attrib_divisor(uint32_t index, uint32_t divisor) {
-  if (index >= kMaxAttribs) { set_error(INVALID_VALUE); return; }
+  if (index >= (desktop.active ? kMaxAttribSlots : kMaxAttribs)) { set_error(INVALID_VALUE); return; }
   current_vao_ptr()->attribs[index].divisor = divisor;
 }
 
 void GlContext::vertex_attrib_value(uint32_t index, const float* v, const int32_t* iv) {
-  if (index >= kMaxAttribs) { set_error(INVALID_VALUE); return; }
+  if (index >= (desktop.active ? kMaxAttribSlots : kMaxAttribs)) { set_error(INVALID_VALUE); return; }
   VertexAttrib& at = default_vao_.attribs[index];
   if (iv) {
     for (int i = 0; i < 4; ++i) at.cur_i[i] = iv[i];
@@ -1082,7 +1121,7 @@ void GlContext::vertex_attrib_value(uint32_t index, const float* v, const int32_
 }
 
 const VertexAttrib* GlContext::attrib(uint32_t index) const {
-  if (index >= kMaxAttribs) return nullptr;
+  if (index >= kMaxAttribSlots) return nullptr;
   return &(vao_id_ == 0 ? &default_vao_ : vaos_[vao_id_ - 1].get())->attribs[index];
 }
 
@@ -1247,8 +1286,8 @@ bool GlContext::get_integer(uint32_t pname, double* o, uint32_t* count) {
     case 0x0D55: *o = attrs_.alpha ? 8 : 0; return true;
     case 0x0D56: *o = attrs_.depth ? 24 : 0; return true;
     case 0x0D57: *o = attrs_.stencil ? 8 : 0; return true;
-    case 0x80A9: *o = def_color_.ss > 1 && draw_fb_ == 0 ? 4 : 0; return true;
-    case 0x80A8: *o = def_color_.ss > 1 && draw_fb_ == 0 ? 1 : 0; return true;
+    case 0x80A9: *o = dcolor_->ss > 1 && draw_fb_ == 0 ? 4 : 0; return true;
+    case 0x80A8: *o = dcolor_->ss > 1 && draw_fb_ == 0 ? 1 : 0; return true;
     case 0x80AA: *o = sc_value_; return true;
     case 0x80AB: *o = sc_invert_; return true;
     case 0x8192: case 0x8B8B: *o = 0x1100; return true;

@@ -71,6 +71,27 @@ uint32_t stencil_apply(uint32_t op, uint32_t cur, uint32_t ref) {
   }
 }
 
+uint8_t logic_apply(uint32_t mode, uint8_t s, uint8_t d) {
+  switch (mode) {
+    case 0x1500: return 0;
+    case 0x1501: return s & d;
+    case 0x1502: return static_cast<uint8_t>(s & ~d);
+    case 0x1503: return s;
+    case 0x1504: return static_cast<uint8_t>(~s & d);
+    case 0x1505: return d;
+    case 0x1506: return s ^ d;
+    case 0x1507: return s | d;
+    case 0x1508: return static_cast<uint8_t>(~(s | d));
+    case 0x1509: return static_cast<uint8_t>(~(s ^ d));
+    case 0x150A: return static_cast<uint8_t>(~d);
+    case 0x150B: return static_cast<uint8_t>(s | ~d);
+    case 0x150C: return static_cast<uint8_t>(~s);
+    case 0x150D: return static_cast<uint8_t>(~s | d);
+    case 0x150E: return static_cast<uint8_t>(~(s & d));
+    default: return 255;
+  }
+}
+
 float blend_factor(uint32_t f, const float src[4], const float dst[4], const float cc[4], int comp, bool alpha_channel) {
   switch (f) {
     case 0: return 0;
@@ -114,6 +135,7 @@ uint32_t attrib_type_size(uint32_t t) {
   switch (t) {
     case 0x1400: case 0x1401: return 1;
     case 0x1402: case 0x1403: case 0x140B: return 2;
+    case 0x140A: return 8;
     default: return 4;
   }
 }
@@ -134,11 +156,13 @@ struct FragmentPipeline final : gpu::IFragmentSink {
   shader::DerivativeLog logx, logy;
   QueryObj* occlusion = nullptr;
   uint64_t samples = 0;
-  float point_size_unused = 0;
+  int32_t alpha_slot = -1;
 
   FragmentPipeline(GlContext& ctx, ProgramObj& prog, GlContext::Target& target, shader::Machine& m, bool derivs)
       : c(ctx), p(prog), t(target), fm(m), mod(m.module()), late(false), deriv(derivs), logx(ctx.a_), logy(ctx.a_) {
-    late = mod.uses_discard || mod.writes_frag_depth;
+    late = mod.uses_discard || mod.writes_frag_depth || c.desktop.alpha_test;
+    alpha_slot = -1;
+    if (c.desktop.alpha_test) for (const ProgramObj::Output& o : p.outputs) if (o.location == 0 && o.type.rows == 4 && o.type.base == shader::Base::Float) alpha_slot = static_cast<int32_t>(o.slot) + 3;
     const int32_t a = mod.find_builtin_global(shader::kBvFragCoord), b = mod.find_builtin_global(shader::kBvFrontFacing), d = mod.find_builtin_global(shader::kBvPointCoord),
                   e = mod.find_builtin_global(shader::kBvFragDepth);
     fc_slot = a >= 0 ? static_cast<int32_t>(mod.globals[static_cast<uint64_t>(a)]->slot) : -1;
@@ -213,6 +237,15 @@ struct FragmentPipeline final : gpu::IFragmentSink {
   void fragment(const gpu::Fragment& f) override {
     const uint32_t x = static_cast<uint32_t>(f.x), y = static_cast<uint32_t>(f.y);
     if (x >= t.w || y >= t.h) return;
+    const DesktopState& ds = c.desktop;
+    if (ds.active) {
+      if (ds.polygon_stipple && !f.is_point && !f.is_line && !((ds.polygon_pattern[(y / t.ss) & 31] >> ((x / t.ss) & 31)) & 1)) return;
+      if (ds.line_stipple && f.is_line && !((ds.stipple_pattern >> ((static_cast<uint32_t>(f.line_pos) / (ds.stipple_factor ? ds.stipple_factor : 1)) & 15)) & 1)) return;
+      if (ds.clip_mask && ds.clip_varying >= 0) {
+        int32_t at = ds.clip_varying;
+        for (uint32_t m = ds.clip_mask; m; m &= m - 1, ++at) if (f.varyings[at] < 0) return;
+      }
+    }
     const bool has_depth = t.depth && c.depth_test_ && (t.depth->info->store == Store::Depth || t.depth->info->store == Store::DepthStencil);
     const bool has_stencil = t.stencil && c.stencil_test_ && t.stencil->info->store == Store::DepthStencil;
     float z = f.z;
@@ -229,6 +262,7 @@ struct FragmentPipeline final : gpu::IFragmentSink {
       }
       return;
     }
+    if (alpha_slot >= 0 && !compare_fn(c.desktop.alpha_func, clamp01(u2f(fm.private_region()[alpha_slot])), c.desktop.alpha_ref)) return;
     if (late) {
       if (fd_slot >= 0 && mod.writes_frag_depth) z = clamp01(u2f(fm.private_region()[fd_slot]));
       if (!ds_test(f, x, y, z, has_depth, has_stencil, true, nullptr)) return;
@@ -269,11 +303,17 @@ struct FragmentPipeline final : gpu::IFragmentSink {
     for (const ProgramObj::Output& o : p.outputs) {
       for (uint32_t bi = 0; bi < kMaxDrawBuffers; ++bi) {
         if (!t.color[bi]) continue;
-        const bool target_for_output = p.frag_writes_all ? true : (static_cast<uint32_t>(o.location) == bi);
+        const bool target_for_output = p.frag_writes_all ? true : (static_cast<uint32_t>(o.location) == bi || (bi == 1 && t.is_default && o.location == 0));
         if (!target_for_output) continue;
         Image& img = *t.color[bi];
         const uint32_t layer = t.layer[bi];
         const FormatInfo* fi = img.info;
+        const DesktopState& ds = c.desktop;
+        bool cmask[4] = {c.cmask_[0], c.cmask_[1], c.cmask_[2], c.cmask_[3]};
+        if (ds.per_buffer_masks) for (int k = 0; k < 4; ++k) cmask[k] = (ds.color_mask[bi] >> k) & 1;
+        const bool blend_on = ds.per_buffer_blend ? ds.blend[bi].enabled : c.blend_;
+        const uint32_t sr = ds.per_buffer_blend ? ds.blend[bi].sr : c.blend_sr_, dr = ds.per_buffer_blend ? ds.blend[bi].dr : c.blend_dr_, sa = ds.per_buffer_blend ? ds.blend[bi].sa : c.blend_sa_,
+                       da = ds.per_buffer_blend ? ds.blend[bi].da : c.blend_da_, eq_rgb = ds.per_buffer_blend ? ds.blend[bi].eq_rgb : c.blend_eq_rgb_, eq_a = ds.per_buffer_blend ? ds.blend[bi].eq_a : c.blend_eq_a_;
         // the shader's vec4 for this output
         uint32_t lanes[4] = {0, 0, 0, f2u(1.0f)};
         const uint32_t comps = o.type.rows;
@@ -281,7 +321,7 @@ struct FragmentPipeline final : gpu::IFragmentSink {
         if (fi->store == Store::I32x4 || fi->store == Store::U32x4) {
           uint32_t cur[4];
           read_texel(img, x, y, layer, cur);
-          for (int k = 0; k < 4; ++k) if (c.cmask_[k]) cur[k] = o.type.base == shader::Base::Float ? static_cast<uint32_t>(static_cast<int32_t>(u2f(lanes[k]))) : lanes[k];
+          for (int k = 0; k < 4; ++k) if (cmask[k]) cur[k] = o.type.base == shader::Base::Float ? static_cast<uint32_t>(static_cast<int32_t>(u2f(lanes[k]))) : lanes[k];
           write_texel(img, x, y, layer, cur);
         } else {
           float src[4];
@@ -298,15 +338,15 @@ struct FragmentPipeline final : gpu::IFragmentSink {
             for (int k = 0; k < 4; ++k) dst[k] = u2f(raw[k]);
           }
           float res[4] = {src[0], src[1], src[2], src[3]};
-          if (c.blend_) {
+          if (blend_on && !ds.logic_op) {
             if (fi->store == Store::U8x4) for (int k = 0; k < 4; ++k) src[k] = clamp01(src[k]);
             float out[4];
             for (int k = 0; k < 3; ++k) {
-              const float sf = blend_factor(c.blend_sr_, src, dst, c.blend_color_, k, false), df = blend_factor(c.blend_dr_, src, dst, c.blend_color_, k, false);
-              out[k] = c.blend_eq_rgb_ == 0x8007 ? (src[k] < dst[k] ? src[k] : dst[k]) : c.blend_eq_rgb_ == 0x8008 ? (src[k] > dst[k] ? src[k] : dst[k]) : blend_op(c.blend_eq_rgb_, src[k] * sf, dst[k] * df);
+              const float sf = blend_factor(sr, src, dst, c.blend_color_, k, false), df = blend_factor(dr, src, dst, c.blend_color_, k, false);
+              out[k] = eq_rgb == 0x8007 ? (src[k] < dst[k] ? src[k] : dst[k]) : eq_rgb == 0x8008 ? (src[k] > dst[k] ? src[k] : dst[k]) : blend_op(eq_rgb, src[k] * sf, dst[k] * df);
             }
-            const float sfa = blend_factor(c.blend_sa_, src, dst, c.blend_color_, 3, true), dfa = blend_factor(c.blend_da_, src, dst, c.blend_color_, 3, true);
-            out[3] = c.blend_eq_a_ == 0x8007 ? (src[3] < dst[3] ? src[3] : dst[3]) : c.blend_eq_a_ == 0x8008 ? (src[3] > dst[3] ? src[3] : dst[3]) : blend_op(c.blend_eq_a_, src[3] * sfa, dst[3] * dfa);
+            const float sfa = blend_factor(sa, src, dst, c.blend_color_, 3, true), dfa = blend_factor(da, src, dst, c.blend_color_, 3, true);
+            out[3] = eq_a == 0x8007 ? (src[3] < dst[3] ? src[3] : dst[3]) : eq_a == 0x8008 ? (src[3] > dst[3] ? src[3] : dst[3]) : blend_op(eq_a, src[3] * sfa, dst[3] * dfa);
             for (int k = 0; k < 4; ++k) res[k] = out[k];
           }
           if (fi->store == Store::U8x4) {
@@ -315,7 +355,8 @@ struct FragmentPipeline final : gpu::IFragmentSink {
               float v = res[k];
               if (fi->srgb && k < 3) v = linear_to_srgb(v);
               q[k] = to_u8(v);
-              if (!c.cmask_[k]) q[k] = static_cast<uint8_t>(raw[k]);
+              if (ds.logic_op) q[k] = logic_apply(ds.logic_mode, q[k], static_cast<uint8_t>(raw[k]));
+              if (!cmask[k]) q[k] = static_cast<uint8_t>(raw[k]);
             }
             // formats without alpha keep alpha at 1
             if (fi->base == 0x1907 || fi->base == 0x8227 || fi->base == 0x1903) q[3] = 255;
@@ -324,7 +365,7 @@ struct FragmentPipeline final : gpu::IFragmentSink {
             write_texel(img, x, y, layer, w4);
           } else {
             uint32_t w4[4];
-            for (int k = 0; k < 4; ++k) w4[k] = c.cmask_[k] ? f2u(res[k]) : raw[k];
+            for (int k = 0; k < 4; ++k) w4[k] = cmask[k] ? f2u(res[k]) : raw[k];
             write_texel(img, x, y, layer, w4);
           }
         }
@@ -372,10 +413,13 @@ void read_attrib(const VertexAttrib& at, const uint8_t* base, uint32_t comps, bo
       case 0x1404: { int32_t v; __builtin_memcpy(&v, p, 4); iv = v; f = at.normalized ? static_cast<float>(v / 2147483647.0) : static_cast<float>(v); break; }
       case 0x1405: { uint32_t v; __builtin_memcpy(&v, p, 4); iv = v; f = at.normalized ? static_cast<float>(v / 4294967295.0) : static_cast<float>(v); break; }
       case 0x140B: { uint16_t v; __builtin_memcpy(&v, p, 2); f = shader::half_to_float(v); iv = static_cast<int64_t>(f); break; }
+      case 0x140A: { double v; __builtin_memcpy(&v, p, 8); f = static_cast<float>(v); iv = static_cast<int64_t>(v); break; }
+      case 0x140C: { int32_t v; __builtin_memcpy(&v, p, 4); f = static_cast<float>(v) / 65536.0f; iv = v >> 16; break; }
       default: __builtin_memcpy(&f, p, 4); iv = static_cast<int64_t>(f); break;
     }
     out[i] = want_int ? static_cast<uint32_t>(iv) : f2u(f);
   }
+  if (at.bgra) { const uint32_t t = out[0]; out[0] = out[2]; out[2] = t; }
 }
 }  // namespace
 
@@ -415,11 +459,15 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     if (index_offset % sz) { set_error(INVALID_OPERATION); return false; }
     if (index_offset > eb->data.size() || uint64_t{static_cast<uint32_t>(count)} * sz > eb->data.size() - index_offset) { set_error(INVALID_OPERATION); return false; }
     idx = eb->data.view().data() + index_offset;
-    const uint32_t restart = index_type == 0x1401 ? 0xFF : (index_type == 0x1403 ? 0xFFFF : 0xFFFFFFFFu);
+    const uint32_t fixed_restart = index_type == 0x1401 ? 0xFF : (index_type == 0x1403 ? 0xFFFF : 0xFFFFFFFFu);
+    const bool restarts = !desktop.active || desktop.primitive_restart || desktop.primitive_restart_fixed;
+    const uint32_t restart = !desktop.active || desktop.primitive_restart_fixed ? fixed_restart : desktop.restart_index;
     for (int32_t i = 0; i < count; ++i) {
       const uint32_t v = fetch_index(idx, index_type, static_cast<uint32_t>(i));
-      if (v != restart && v > max_index) max_index = v;
+      if ((!restarts || v != restart) && v > max_index) max_index = v;
     }
+    if (desktop.base_vertex < 0 && max_index < static_cast<uint32_t>(-desktop.base_vertex)) max_index = 0;
+    else max_index = static_cast<uint32_t>(static_cast<int64_t>(max_index) + desktop.base_vertex);
   } else {
     max_index = static_cast<uint32_t>(first + count - 1);
   }
@@ -448,13 +496,13 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
       if (!b) { set_error(INVALID_OPERATION); return false; }
       const uint32_t esize = attrib_type_size(at.type) * at.size;
       const uint32_t stride = at.stride ? at.stride : esize;
-      const uint64_t last = at.divisor ? (static_cast<uint64_t>(instances) - 1) / at.divisor : max_index;
+      const uint64_t last = at.divisor ? (static_cast<uint64_t>(instances) - 1) / at.divisor + desktop.base_instance : max_index;
       if (at.offset + last * stride + (at.type == 0x8368 || at.type == 0x8D9F ? 4 : esize) > b->data.size()) { set_error(INVALID_OPERATION); return false; }
     }
   }
 
   // The 3D hardware takes the draw if it can (default framebuffer, shaders and state the device has); otherwise the picture is brought back to the CPU first.
-  if (target.is_default) {
+  if (target.is_default && !desktop.primitive_sink) {
     if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
     hw_cpu_write();
   }
@@ -478,6 +526,14 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     for (uint32_t k = 0; k < l.count; ++k) rs.flat[l.var_offset + k] = l.flat;
   rs.flat_first = false;
   rs.line_width = line_width_ < 1 ? 1 : (line_width_ > 16 ? 16 : line_width_);
+  if (desktop.active) {
+    if (desktop.flat_shade) for (uint32_t k = desktop.flat_first; k < desktop.flat_first + desktop.flat_count && k < gpu::kMaxVarying; ++k) rs.flat[k] = true;
+    rs.flat_first = desktop.first_vertex_convention;
+    rs.depth_clip = !desktop.depth_clamp;
+    rs.max_point_size = desktop.point_max > 1 ? desktop.point_max : 1;
+    rs.offset_lines = desktop.offset_line;
+    rs.offset_points = desktop.offset_point;
+  }
 
   bool deriv = fmod.uses_derivatives;
   if (!deriv && fmod.uses_implicit_lod) {
@@ -515,7 +571,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
       for (uint32_t i = 0; i < kCache; ++i) cache[i].key = -1;
       cur_instance = instance;
     }
-    if (indexed && !tf_active_ && slot.key == key) {
+    if (indexed && !tf_active_ && !desktop.primitive_sink && slot.key == key) {
       *out = slot.v;
       return true;
     }
@@ -532,7 +588,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
           const Buffer* b = buffer_at(at.buffer);
           const uint32_t esize = attrib_type_size(at.type) * at.size;
           const uint32_t stride = at.stride ? at.stride : esize;
-          const uint64_t el = at.divisor ? instance / at.divisor : index;
+          const uint64_t el = at.divisor ? instance / at.divisor + desktop.base_instance : index;
           read_attrib(at, b->data.view().data() + at.offset + el * stride, at.size, want_int, lanes);
         } else if (want_int) {
           for (int i = 0; i < 4; ++i) lanes[i] = static_cast<uint32_t>(at.cur_is_int ? at.cur_i[i] : static_cast<int32_t>(at.cur_f[i]));
@@ -541,6 +597,12 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
         }
         for (uint32_t k = 0; k < comps; ++k) pr[ai->slot + col * comps + k] = lanes[k];
       }
+    }
+    if (desktop.active && desktop.edge_flag_attrib >= 0) {
+      const VertexAttrib& ef = vao->attribs[desktop.edge_flag_attrib];
+      out->edge = ef.enabled && buffer_at(ef.buffer) ? buffer_at(ef.buffer)->data.view()[ef.offset + uint64_t{index} * (ef.stride ? ef.stride : 1)] != 0 : ef.cur_f[0] != 0;
+    } else {
+      out->edge = true;
     }
     if (vid_g >= 0) pr[vmod.globals[static_cast<uint64_t>(vid_g)]->slot] = vertex_id;
     if (iid_g >= 0) pr[vmod.globals[static_cast<uint64_t>(iid_g)]->slot] = instance;
@@ -555,8 +617,46 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     return true;
   };
 
-  const bool restart_ok = indexed;
-  const uint32_t restart_val = index_type == 0x1401 ? 0xFF : (index_type == 0x1403 ? 0xFFFF : 0xFFFFFFFFu);
+  const bool restart_ok = indexed && (!desktop.active || desktop.primitive_restart || desktop.primitive_restart_fixed);
+  const uint32_t restart_val = desktop.active && !desktop.primitive_restart_fixed ? desktop.restart_index : (index_type == 0x1401 ? 0xFF : (index_type == 0x1403 ? 0xFFFF : 0xFFFFFFFFu));
+  gpu::IPrimitiveSink* const sink = desktop.primitive_sink;
+  const bool polygon_modes = desktop.polygon_mode_front != 0x1B02 || desktop.polygon_mode_back != 0x1B02;
+  float stipple_at = 0;
+  uint8_t tri_mask = 7;
+  // A triangle by the polygon mode of the side it shows.
+  auto emit_triangle = [&](const gpu::RVertex& a, const gpu::RVertex& b, const gpu::RVertex& c) {
+    if (sink) { sink->triangle(a, b, c); return; }
+    if (!polygon_modes) { gpu::draw_triangle(rs, a, b, c, pipe); return; }
+    const float iwa = a.pos[3] != 0 ? 1 / a.pos[3] : 0, iwb = b.pos[3] != 0 ? 1 / b.pos[3] : 0, iwc = c.pos[3] != 0 ? 1 / c.pos[3] : 0;
+    const float ax = a.pos[0] * iwa * rs.vp_w, ay = a.pos[1] * iwa * rs.vp_h, bx = b.pos[0] * iwb * rs.vp_w, by = b.pos[1] * iwb * rs.vp_h, cx = c.pos[0] * iwc * rs.vp_w, cy = c.pos[1] * iwc * rs.vp_h;
+    const float area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+    const bool front = rs.front_ccw ? area > 0 : area < 0;
+    if ((rs.cull & 1) && front) return;
+    if ((rs.cull & 2) && !front) return;
+    const uint32_t pm = front ? desktop.polygon_mode_front : desktop.polygon_mode_back;
+    if (pm == 0x1B02) {
+      gpu::RasterState one = rs;
+      one.cull = 0;
+      if (front != one.front_ccw) one.front_ccw = !one.front_ccw;
+      gpu::draw_triangle(one, a, b, c, pipe);
+    } else if (pm == 0x1B01) {
+      gpu::RasterState one = rs;
+      if (desktop.offset_line) { one.offset = true; }
+      if (a.edge && (tri_mask & 1)) gpu::draw_line(one, a, b, pipe);
+      if (b.edge && (tri_mask & 2)) gpu::draw_line(one, b, c, pipe);
+      if (c.edge && (tri_mask & 4)) gpu::draw_line(one, c, a, pipe);
+    } else {
+      if (a.edge && (tri_mask & 1)) gpu::draw_point(rs, a, pipe);
+      if (b.edge && (tri_mask & 2)) gpu::draw_point(rs, b, pipe);
+      if (c.edge && (tri_mask & 4)) gpu::draw_point(rs, c, pipe);
+    }
+  };
+  auto emit_line = [&](const gpu::RVertex& a, const gpu::RVertex& b, bool first) {
+    if (sink) { sink->line(a, b, first); return; }
+    if (first) stipple_at = 0;
+    rs.line_start = stipple_at;
+    stipple_at += gpu::draw_line(rs, a, b, pipe);
+  };
   bool ok = true;
   for (int32_t inst = 0; inst < instances && ok; ++inst) {
     // the list of vertex indices of this draw (with restart markers)
@@ -564,6 +664,10 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
       if (!indexed) return first + i;
       const uint32_t v = fetch_index(idx, index_type, static_cast<uint32_t>(i));
       if (restart_ok && v == restart_val) return -1;
+      if (desktop.base_vertex != 0) {
+        const int64_t rebased = static_cast<int64_t>(v) + desktop.base_vertex;
+        return rebased < 0 ? 0 : rebased;
+      }
       return v;
     };
     gpu::RVertex va, vb, vc;
@@ -575,21 +679,23 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     auto tri = [&](int32_t i0, int32_t i1, int32_t i2) {
       if (index_at(i0) < 0 || index_at(i1) < 0 || index_at(i2) < 0) return;
       if (!get(i0, &va) || !get(i1, &vb) || !get(i2, &vc)) { ok = false; return; }
-      gpu::draw_triangle(rs, va, vb, vc, pipe);
+      if (!desktop.triangle_edges.empty() && mode == 4) tri_mask = static_cast<uint64_t>(i0 / 3) < desktop.triangle_edges.size() ? desktop.triangle_edges[static_cast<uint64_t>(i0 / 3)] : 7;
+      emit_triangle(va, vb, vc);
     };
     switch (mode) {
       case 0:
         for (int32_t i = 0; i < count && ok; ++i) {
           if (index_at(i) < 0) continue;
           if (!get(i, &va)) { ok = false; break; }
-          gpu::draw_point(rs, va, pipe);
+          if (sink) sink->point(va);
+          else gpu::draw_point(rs, va, pipe);
         }
         break;
       case 1:
         for (int32_t i = 0; i + 1 < count && ok; i += 2) {
           if (index_at(i) < 0 || index_at(i + 1) < 0) continue;
           if (!get(i, &va) || !get(i + 1, &vb)) { ok = false; break; }
-          gpu::draw_line(rs, va, vb, pipe);
+          emit_line(va, vb, true);
         }
         break;
       case 2: case 3: {
@@ -599,12 +705,12 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
           if (!brk) {
             if (i > start) {
               if (!get(i - 1, &va) || !get(i, &vb)) { ok = false; break; }
-              gpu::draw_line(rs, va, vb, pipe);
+              emit_line(va, vb, i == start + 1);
             }
           } else {
             if (mode == 2 && i - start > 2) {
               if (!get(i - 1, &va) || !get(start, &vb)) { ok = false; break; }
-              gpu::draw_line(rs, va, vb, pipe);
+              emit_line(va, vb, false);
             }
             start = i + 1;
           }
@@ -835,7 +941,7 @@ void GlContext::read_pixels(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32
   if (!t.ok) return;
   Image* src = nullptr;
   uint32_t layer = 0;
-  if (read_fb_ == 0) src = default_read_back_ ? &def_color_ : nullptr;
+  if (read_fb_ == 0) src = default_read_back_ ? dread_ : nullptr;
   else for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (t.color[i]) { src = t.color[i]; layer = t.layer[i]; }
   Image resolved(a_);
   if (src && src->ss > 1 && read_fb_ == 0) {   // the default framebuffer is resolved implicitly
@@ -859,7 +965,7 @@ void GlContext::copy_tex_image_2d(uint32_t target, int32_t level, uint32_t inter
   Target rt;
   resolve_target(read_fb_, false, &rt);
   if (!rt.ok) { set_error(INVALID_FRAMEBUFFER_OPERATION); return; }
-  Image* src = read_fb_ == 0 ? &def_color_ : nullptr;
+  Image* src = read_fb_ == 0 ? dread_ : nullptr;
   uint32_t layer = 0;
   if (!src) for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (rt.color[i]) { src = rt.color[i]; layer = rt.layer[i]; }
   Image resolved(a_);
@@ -893,7 +999,7 @@ void GlContext::copy_tex_sub_image(uint32_t target, int32_t level, int32_t xo, i
   Target rt;
   resolve_target(read_fb_, false, &rt);
   if (!rt.ok) { set_error(INVALID_FRAMEBUFFER_OPERATION); return; }
-  Image* src = read_fb_ == 0 ? &def_color_ : nullptr;
+  Image* src = read_fb_ == 0 ? dread_ : nullptr;
   uint32_t layer = 0;
   if (!src) for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (rt.color[i]) { src = rt.color[i]; layer = rt.layer[i]; }
   Image resolved(a_);
@@ -967,7 +1073,7 @@ void GlContext::blit_framebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
   if (mask & 0x4000) {
     Image* src = nullptr;
     uint32_t sl = 0;
-    if (read_fb_ == 0) src = &def_color_;
+    if (read_fb_ == 0) src = dread_;
     else for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (rt.color[i]) { src = rt.color[i]; sl = rt.layer[i]; }
     Image resolved(a_);
     if (src && src->ss > 1) {
@@ -998,8 +1104,8 @@ void GlContext::blit_framebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
 
 bool GlContext::present(uint32_t* dst, uint32_t pitch, gpu::TouchBox* changed, bool force_all) {
   hw_sync();
-  if (!def_color_.defined()) return false;
-  const int32_t k = static_cast<int32_t>(def_color_.ss);
+  if (!dcolor_->defined()) return false;
+  const int32_t k = static_cast<int32_t>(dcolor_->ss);
   int32_t x0 = 0, y0 = 0, x1 = static_cast<int32_t>(width_) - 1, y1 = static_cast<int32_t>(height_) - 1;
   if (!force_all && !all_dirty_) {
     if (dirty_.empty()) return false;
@@ -1008,8 +1114,8 @@ bool GlContext::present(uint32_t* dst, uint32_t pitch, gpu::TouchBox* changed, b
     x1 = dirty_.x1 / k >= static_cast<int32_t>(width_) ? static_cast<int32_t>(width_) - 1 : dirty_.x1 / k;
     y1 = dirty_.y1 / k >= static_cast<int32_t>(height_) ? static_cast<int32_t>(height_) - 1 : dirty_.y1 / k;
   }
-  const uint8_t* px = def_color_.px.view().data();
-  const uint64_t stride = uint64_t{def_color_.w} * 4;
+  const uint8_t* px = dcolor_->px.view().data();
+  const uint64_t stride = uint64_t{dcolor_->w} * 4;
   for (int32_t gy = y0; gy <= y1; ++gy) {
     const int32_t row = static_cast<int32_t>(height_) - 1 - gy;   // GL rows run bottom to top
     uint32_t* d = dst + static_cast<uint64_t>(row) * pitch;

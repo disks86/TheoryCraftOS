@@ -142,7 +142,8 @@ void GlContext::sample(const shader::SampleRequest& rq, uint32_t out[4]) {
     case shader::kDimCube: id = u.cube; break;
     case shader::kDim3D: id = u.tex3d; break;
     case shader::kDim2DArray: id = u.array; break;
-    default: id = u.tex2d; break;
+    case shader::kDim1D: id = u.tex1d; break;
+    default: id = (desktop.ff_1d_mask >> unit) & 1 ? u.tex1d : ((desktop.ff_rect_mask >> unit) & 1 ? u.rect : u.tex2d); break;
   }
   const Texture* t = texture_at(id);
   if (!t) return;
