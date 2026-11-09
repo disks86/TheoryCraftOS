@@ -1,0 +1,743 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// Host tests of the kernel's OpenGL: the generated client entry points (what opengl32.dll exports) write the command stream, which runs in a GlApi drawing to a GlSurface, so the
+// encoding, the decoder and the implementation are tested together. Pictures are checked by reading pixels back.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sanitizer/asan_interface.h>
+#include "OpenGl/GlApi.hpp"
+#include "OpenGl/GlService.hpp"
+#include "OpenGl/GlSurface.hpp"
+#include "OpenGl/GlClient.h"
+#include "OpenGl/generated/GlEnums.inc"
+
+using opengl::ContextConfig; using opengl::ContextRequest; using opengl::GlApi; using opengl::GlService; using opengl::GlStatus; using opengl::GlSurface; using opengl::IClientMemory; using opengl::ShareGroup; using opengl::SurfaceConfig; using opengl::SurfaceRequest;
+
+static int g_failed = 0, g_checks = 0;
+#define CHECK(...) do { ++g_checks; if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
+
+struct TestAllocator final : allocators::IAllocator {
+  void* allocate(uint64_t size) override { return malloc(size ? size : 1); }
+  void* allocate_aligned(uint64_t size, uint64_t) override { return aligned_alloc(16, (size + 15) & ~uint64_t{15}); }
+  void deallocate(void* p) override { free(p); }
+};
+
+// The program's memory is this process's: addresses are pointers. (The kernel reaches it only through these calls.)
+struct HostMemory final : IClientMemory {
+  bool closed = false;      // (random streams: every address is refused, as a bad one would be)
+  bool read(uint64_t address, ByteView out) override {
+    if (!address || closed) return false;
+    // Memory outside any object is refused, as an unmapped page would be (the kernel's string reads rely on that).
+    if (__asan_region_is_poisoned(reinterpret_cast<void*>(address), out.size())) return false;
+    memcpy(out.data(), reinterpret_cast<const void*>(address), out.size());
+    return true;
+  }
+  bool write(uint64_t address, ConstByteView data) override {
+    if (!address || closed) return false;
+    if (__asan_region_is_poisoned(reinterpret_cast<void*>(address), data.size())) return false;
+    memcpy(reinterpret_cast<void*>(address), data.data(), data.size());
+    return true;
+  }
+  void* blocks[256] = {};
+  uint32_t block_count = 0;
+  uint64_t allocate(uint64_t bytes) override {
+    if (closed || block_count == 256) return 0;
+    void* p = calloc(1, bytes);
+    blocks[block_count++] = p;
+    return reinterpret_cast<uint64_t>(p);
+  }
+  void release(uint64_t address, uint64_t) override {
+    for (uint32_t i = 0; i < block_count; ++i) if (blocks[i] == reinterpret_cast<void*>(address)) { free(blocks[i]); blocks[i] = blocks[--block_count]; return; }
+  }
+  // (what the GL keeps for the program, like the strings of glGetString, lives as long as the program: the test's end)
+  ~HostMemory() { for (uint32_t i = 0; i < block_count; ++i) free(blocks[i]); }
+};
+
+static TestAllocator g_alloc;
+static HostMemory g_memory;
+static GlApi* g_api = nullptr;
+static GlStream g_stream;
+static uint64_t g_submits = 0;
+
+GlStream* gl_stream_current(void) { return &g_stream; }
+uint64_t gl_stream_submit(const uint32_t* words, uint32_t count) {
+  ++g_submits;
+  if (!g_api) return 0;
+  return g_api->execute(ConstByteView(reinterpret_cast<const uint8_t*>(words), uint64_t{count} * 4), g_memory);
+}
+
+#include "OpenGl/generated/GlEntries.inc"
+
+constexpr uint32_t W = 64, H = 64;
+
+struct Pixel { uint8_t r, g, b, a; };
+static Pixel pixel(int x, int y) {
+  Pixel p{0, 0, 0, 0};
+  glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &p);
+  return p;
+}
+static bool near(const Pixel& p, int r, int g, int b, int tolerance = 3) {
+  const auto d = [](int a, int b) { return a > b ? a - b : b - a; };
+  return d(p.r, r) <= tolerance && d(p.g, g) <= tolerance && d(p.b, b) <= tolerance;
+}
+
+// A context drawing to a fresh 64x64 window surface, with an orthographic 0..64 projection.
+struct Fixture {
+  ShareGroup group{g_alloc};
+  GlSurface surface;
+  GlApi api;
+  explicit Fixture(bool core = false, bool accum = false) : surface(g_alloc, config(accum)), api(g_alloc, group, context(core)) {
+    g_api = &api;
+    api.bind_surface(&surface);
+    if (!core) {
+      glMatrixMode(GL_PROJECTION);
+      glLoadIdentity();
+      glOrtho(0, W, 0, H, -1, 1);
+      glMatrixMode(GL_MODELVIEW);
+      glLoadIdentity();
+    }
+  }
+  ~Fixture() { gl_stream_flush(); g_api = nullptr; }
+  static SurfaceConfig config(bool accum) { SurfaceConfig c; c.width = W; c.height = H; c.accum_bits = accum ? 64 : 0; return c; }
+  static ContextConfig context(bool core) { ContextConfig c; c.core_profile = core; return c; }
+};
+
+static void test_strings_and_errors() {
+  Fixture f;
+  const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+  CHECK(version && strncmp(version, "3.3", 3) == 0);
+  const char* ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+  CHECK(ext && strstr(ext, "GL_ARB_vertex_buffer_object"));
+  CHECK(glGetError() == GL_NO_ERROR);
+  glEnable(0x1234);
+  CHECK(glGetError() == GL_INVALID_ENUM);
+  CHECK(glGetError() == GL_NO_ERROR);
+  GLint vp[4] = {0, 0, 0, 0};
+  glGetIntegerv(GL_VIEWPORT, vp);
+  CHECK(vp[2] == int(W) && vp[3] == int(H));
+  glBegin(GL_TRIANGLES);
+  glEnable(GL_BLEND);      // not allowed between glBegin and glEnd
+  glEnd();
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glPopMatrix();
+  CHECK(glGetError() == GL_STACK_UNDERFLOW);
+}
+
+static void test_clear_and_immediate() {
+  Fixture f;
+  glClearColor(0, 0, 1, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  CHECK(near(pixel(5, 5), 0, 0, 255));
+  glColor3f(1, 0, 0);
+  glBegin(GL_TRIANGLES);
+  glVertex2f(0, 0);
+  glVertex2f(64, 0);
+  glVertex2f(0, 64);
+  glEnd();
+  CHECK(near(pixel(10, 10), 255, 0, 0));
+  CHECK(near(pixel(60, 60), 0, 0, 255));
+  // a quad with a colour per vertex: smooth by default, the last vertex's colour with GL_FLAT (quads: the fourth)
+  glClear(GL_COLOR_BUFFER_BIT);
+  glShadeModel(GL_FLAT);
+  glBegin(GL_QUADS);
+  glColor3ub(255, 0, 0); glVertex2i(16, 16);
+  glColor3ub(0, 255, 0); glVertex2i(48, 16);
+  glColor3ub(0, 0, 255); glVertex2i(48, 48);
+  glColor3ub(255, 255, 0); glVertex2i(16, 48);
+  glEnd();
+  CHECK(near(pixel(20, 20), 255, 255, 0));
+  CHECK(near(pixel(44, 44), 255, 255, 0));
+  glShadeModel(GL_SMOOTH);
+  glRectf(0, 0, 8, 8);      // with the current colour (yellow)
+  CHECK(near(pixel(4, 4), 255, 255, 0));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_polygon_and_modes() {
+  Fixture f;
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glColor3f(0, 1, 0);
+  glBegin(GL_POLYGON);
+  glVertex2f(10, 10); glVertex2f(54, 10); glVertex2f(54, 54); glVertex2f(32, 60); glVertex2f(10, 54);
+  glEnd();
+  CHECK(near(pixel(32, 32), 0, 255, 0));
+  CHECK(near(pixel(32, 58), 0, 255, 0));
+  // GL_LINE: only the outline, no inner (diagonal) edges
+  glClear(GL_COLOR_BUFFER_BIT);
+  glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+  glBegin(GL_QUADS);
+  glVertex2f(10.5f, 10.5f); glVertex2f(50.5f, 10.5f); glVertex2f(50.5f, 50.5f); glVertex2f(10.5f, 50.5f);
+  glEnd();
+  glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+  CHECK(near(pixel(30, 10), 0, 255, 0));
+  CHECK(near(pixel(30, 30), 0, 0, 0));      // the diagonal of the two triangles is not drawn
+  CHECK(near(pixel(20, 20), 0, 0, 0));
+  // culling and the front face
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnable(GL_CULL_FACE);
+  glBegin(GL_TRIANGLES);      // clockwise: a back face
+  glVertex2f(0, 0); glVertex2f(0, 64); glVertex2f(64, 0);
+  glEnd();
+  CHECK(near(pixel(10, 10), 0, 0, 0));
+  glFrontFace(GL_CW);
+  glBegin(GL_TRIANGLES);
+  glVertex2f(0, 0); glVertex2f(0, 64); glVertex2f(64, 0);
+  glEnd();
+  CHECK(near(pixel(10, 10), 0, 255, 0));
+  glDisable(GL_CULL_FACE);
+  glFrontFace(GL_CCW);
+  // alpha test
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnable(GL_ALPHA_TEST);
+  glAlphaFunc(GL_GREATER, 0.5f);
+  glColor4f(1, 1, 1, 0.25f);
+  glRectf(0, 0, 32, 64);
+  glColor4f(1, 1, 1, 0.75f);
+  glRectf(32, 0, 64, 64);
+  glDisable(GL_ALPHA_TEST);
+  CHECK(near(pixel(10, 10), 0, 0, 0));
+  CHECK(near(pixel(50, 10), 255, 255, 255));
+  // logic op: XOR of white over white is black
+  glEnable(GL_COLOR_LOGIC_OP);
+  glLogicOp(GL_XOR);
+  glColor3f(1, 1, 1);
+  glRectf(32, 0, 64, 32);
+  glDisable(GL_COLOR_LOGIC_OP);
+  CHECK(near(pixel(50, 10), 0, 0, 0));
+  CHECK(near(pixel(50, 50), 255, 255, 255));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_depth_and_blend() {
+  Fixture f;
+  glClearColor(0, 0, 0, 0);
+  glClearDepth(1);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  glEnable(GL_DEPTH_TEST);
+  glColor3f(1, 0, 0);
+  glBegin(GL_QUADS); glVertex3f(0, 0, 0.5f); glVertex3f(64, 0, 0.5f); glVertex3f(64, 64, 0.5f); glVertex3f(0, 64, 0.5f); glEnd();      // (glOrtho: z -0.5, nearer)
+  glColor3f(0, 1, 0);
+  glBegin(GL_QUADS); glVertex3f(0, 0, -0.5f); glVertex3f(64, 0, -0.5f); glVertex3f(64, 64, -0.5f); glVertex3f(0, 64, -0.5f); glEnd();
+  CHECK(near(pixel(30, 30), 255, 0, 0));
+  glDisable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glColor4f(0, 0, 1, 0.5f);
+  glRectf(0, 0, 64, 64);
+  glDisable(GL_BLEND);
+  CHECK(near(pixel(30, 30), 128, 0, 128, 4));
+  float depth = 0;
+  glReadPixels(30, 30, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+  CHECK(depth > 0.2f && depth < 0.3f);
+}
+
+static void test_lighting() {
+  Fixture f;
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnable(GL_LIGHTING);
+  glEnable(GL_LIGHT0);      // light 0: white diffuse from +z (directional)
+  const float diffuse[4] = {0.5f, 0.5f, 0.5f, 1};
+  glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, diffuse);
+  const float ambient[4] = {0, 0, 0, 1};
+  glLightModelfv(GL_LIGHT_MODEL_AMBIENT, ambient);
+  glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, ambient);
+  glNormal3f(0, 0, 1);
+  glRectf(0, 0, 32, 64);
+  glNormal3f(0, 0, -1);      // facing away: dark
+  glRectf(32, 0, 64, 64);
+  CHECK(near(pixel(10, 10), 128, 128, 128, 3));
+  CHECK(near(pixel(50, 10), 0, 0, 0));
+  // colour material: the colour becomes the diffuse colour
+  glEnable(GL_COLOR_MATERIAL);
+  glColor3f(1, 0, 0);
+  glNormal3f(0, 0, 1);
+  glRectf(0, 0, 32, 64);
+  CHECK(near(pixel(10, 10), 255, 0, 0));
+  float got[4] = {};
+  glGetMaterialfv(GL_FRONT, GL_DIFFUSE, got);
+  CHECK(got[0] == 1 && got[1] == 0);
+  glDisable(GL_COLOR_MATERIAL);
+  glDisable(GL_LIGHTING);
+  // fog: linear, all fog at the far end
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnable(GL_FOG);
+  glFogi(GL_FOG_MODE, GL_LINEAR);
+  glFogf(GL_FOG_START, 0);
+  glFogf(GL_FOG_END, 1);
+  const float fog[4] = {0, 1, 0, 1};
+  glFogfv(GL_FOG_COLOR, fog);
+  glColor3f(1, 0, 0);
+  glBegin(GL_QUADS); glVertex3f(0, 0, -1); glVertex3f(64, 0, -1); glVertex3f(64, 64, -1); glVertex3f(0, 64, -1); glEnd();
+  glDisable(GL_FOG);
+  CHECK(near(pixel(30, 30), 0, 255, 0, 4));
+}
+
+static void test_textures() {
+  Fixture f;
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  CHECK(tex != 0);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  const uint8_t texels[2 * 2 * 3] = {255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255};
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 2, 2, 0, GL_RGB, GL_UNSIGNED_BYTE, texels);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  CHECK(glGetError() == GL_NO_ERROR);
+  GLint width = 0;
+  glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+  CHECK(width == 2);
+  glEnable(GL_TEXTURE_2D);
+  glColor3f(1, 1, 1);
+  glBegin(GL_QUADS);
+  glTexCoord2f(0, 0); glVertex2f(0, 0);
+  glTexCoord2f(1, 0); glVertex2f(64, 0);
+  glTexCoord2f(1, 1); glVertex2f(64, 64);
+  glTexCoord2f(0, 1); glVertex2f(0, 64);
+  glEnd();
+  CHECK(near(pixel(10, 10), 255, 0, 0));
+  CHECK(near(pixel(50, 10), 0, 255, 0));
+  CHECK(near(pixel(10, 50), 0, 0, 255));
+  CHECK(near(pixel(50, 50), 255, 255, 255));
+  // modulate by the colour
+  glColor3f(0.5f, 0.5f, 0.5f);
+  glTexCoord2f(0.25f, 0.75f);
+  glRectf(0, 0, 64, 64);      // (one texture coordinate for every corner: the blue texel)
+  CHECK(near(pixel(30, 30), 0, 0, 128, 3));
+  glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+  glRectf(0, 0, 64, 64);
+  CHECK(near(pixel(30, 30), 0, 0, 255));
+  // read back the image in another format
+  uint8_t back[16] = {};
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE, back);
+  CHECK(back[0] == 0 && back[1] == 0 && back[2] == 255 && back[3] == 255);
+  glDisable(GL_TEXTURE_2D);
+  glDeleteTextures(1, &tex);
+  CHECK(!glIsTexture(tex));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_arrays() {
+  Fixture f;
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  const float positions[] = {0, 0, 32, 0, 32, 32, 0, 32};
+  const uint8_t colors[] = {255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255};
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glEnableClientState(GL_COLOR_ARRAY);
+  glVertexPointer(2, GL_FLOAT, 0, positions);
+  glColorPointer(4, GL_UNSIGNED_BYTE, 0, colors);
+  glDrawArrays(GL_QUADS, 0, 4);
+  CHECK(near(pixel(10, 10), 255, 0, 0));
+  CHECK(near(pixel(40, 40), 0, 0, 0));
+  // indexed, from client memory, and through buffer objects
+  const uint16_t indices[] = {0, 1, 2, 0, 2, 3};
+  glTranslatef(32, 32, 0);
+  glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
+  CHECK(near(pixel(40, 40), 255, 0, 0));
+  glLoadIdentity();
+  glClear(GL_COLOR_BUFFER_BIT);
+  GLuint buffers[2] = {0, 0};
+  glGenBuffers(2, buffers);
+  glBindBuffer(GL_ARRAY_BUFFER, buffers[0]);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(positions), positions, GL_STATIC_DRAW);
+  glVertexPointer(2, GL_FLOAT, 0, nullptr);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffers[1]);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+  glDisableClientState(GL_COLOR_ARRAY);
+  glColor3f(0, 1, 0);
+  glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+  CHECK(near(pixel(10, 10), 0, 255, 0));
+  // a mapped buffer
+  float* mapped = static_cast<float*>(glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY));
+  CHECK(mapped != nullptr);
+  if (mapped) {
+    for (int i = 0; i < 8; ++i) mapped[i] = positions[i] + 32;
+    CHECK(glUnmapBuffer(GL_ARRAY_BUFFER) == GL_TRUE);
+  }
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+  CHECK(near(pixel(10, 10), 0, 0, 0));
+  CHECK(near(pixel(40, 40), 0, 255, 0));
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+  glDeleteBuffers(2, buffers);
+  glDisableClientState(GL_VERTEX_ARRAY);
+  // interleaved
+  struct V { float c[3]; float p[3]; };
+  const V quad[4] = {{{0, 0, 1}, {0, 0, 0}}, {{0, 0, 1}, {64, 0, 0}}, {{0, 0, 1}, {64, 64, 0}}, {{0, 0, 1}, {0, 64, 0}}};
+  glInterleavedArrays(GL_C3F_V3F, 0, quad);
+  glDrawArrays(GL_QUADS, 0, 4);
+  CHECK(near(pixel(30, 30), 0, 0, 255));
+  glDisableClientState(GL_VERTEX_ARRAY);
+  glDisableClientState(GL_COLOR_ARRAY);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_display_lists() {
+  Fixture f;
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  const GLuint list = glGenLists(2);
+  CHECK(list != 0 && glIsList(list));
+  glNewList(list, GL_COMPILE);
+  glColor3f(1, 0, 1);
+  glBegin(GL_TRIANGLES); glVertex2f(0, 0); glVertex2f(32, 0); glVertex2f(0, 32); glEnd();
+  const float white[4] = {1, 1, 1, 1};
+  glMaterialfv(GL_FRONT, GL_EMISSION, white);      // client data is copied into the list
+  glEndList();
+  CHECK(near(pixel(5, 5), 0, 0, 0));      // GL_COMPILE does not draw
+  glCallList(list);
+  CHECK(near(pixel(5, 5), 255, 0, 255));
+  float emission[4] = {};
+  glGetMaterialfv(GL_FRONT, GL_EMISSION, emission);
+  CHECK(emission[0] == 1);
+  // a list that calls another, with the arrays as they were when compiled
+  const float positions[] = {32, 32, 64, 32, 64, 64};
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glVertexPointer(2, GL_FLOAT, 0, positions);
+  glNewList(list + 1, GL_COMPILE);
+  glColor3f(0, 1, 1);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glEndList();
+  glDisableClientState(GL_VERTEX_ARRAY);
+  glClear(GL_COLOR_BUFFER_BIT);
+  const GLubyte which[2] = {0, 1};
+  glListBase(list);
+  glCallLists(2, GL_UNSIGNED_BYTE, which);
+  CHECK(near(pixel(5, 5), 255, 0, 255));
+  CHECK(near(pixel(60, 40), 0, 255, 255));
+  glDeleteLists(list, 2);
+  CHECK(!glIsList(list));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_pixels() {
+  Fixture f(false, true);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  uint8_t block[4 * 4 * 4];
+  for (int i = 0; i < 16; ++i) { block[i * 4] = 10; block[i * 4 + 1] = 200; block[i * 4 + 2] = 30; block[i * 4 + 3] = 255; }
+  glRasterPos2i(8, 8);
+  glDrawPixels(4, 4, GL_RGBA, GL_UNSIGNED_BYTE, block);
+  CHECK(near(pixel(9, 9), 10, 200, 30, 1));
+  CHECK(near(pixel(13, 13), 0, 0, 0));
+  glPixelZoom(2, 2);
+  glRasterPos2i(20, 20);
+  glDrawPixels(4, 4, GL_RGBA, GL_UNSIGNED_BYTE, block);
+  glPixelZoom(1, 1);
+  CHECK(near(pixel(27, 27), 10, 200, 30, 1));
+  // a bitmap in the raster colour, and the raster position moves
+  const uint8_t bits[8] = {0xFF, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xFF};
+  glColor3f(1, 1, 0);
+  glRasterPos2i(40, 40);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glBitmap(8, 8, 0, 0, 10, 0, bits);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  CHECK(near(pixel(40, 40), 255, 255, 0));
+  CHECK(near(pixel(43, 43), 0, 0, 0));
+  float raster[4] = {};
+  glGetFloatv(GL_CURRENT_RASTER_POSITION, raster);
+  CHECK(raster[0] == 50 && raster[1] == 40);
+  // copy pixels
+  glRasterPos2i(0, 40);
+  glCopyPixels(8, 8, 4, 4, GL_COLOR);
+  CHECK(near(pixel(1, 41), 10, 200, 30, 1));
+  // read back as a packed type with row padding
+  uint16_t packed[4] = {};
+  glReadPixels(8, 8, 1, 1, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, packed);
+  CHECK((packed[0] >> 11) == 1 && ((packed[0] >> 5) & 63) == 49);
+  // accumulation: average of two pictures
+  glClearAccum(0, 0, 0, 0);
+  glClear(GL_ACCUM_BUFFER_BIT);
+  glClearColor(1, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glAccum(GL_ACCUM, 0.5f);
+  glClearColor(0, 0, 1, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glAccum(GL_ACCUM, 0.5f);
+  glAccum(GL_RETURN, 1);
+  CHECK(near(pixel(30, 30), 128, 0, 128, 2));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_state_stacks_and_get() {
+  Fixture f;
+  glEnable(GL_LIGHTING);
+  glColor3f(0.25f, 0.5f, 0.75f);
+  glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
+  glDisable(GL_LIGHTING);
+  glColor3f(1, 1, 1);
+  glPopAttrib();
+  CHECK(glIsEnabled(GL_LIGHTING));
+  float c[4] = {};
+  glGetFloatv(GL_CURRENT_COLOR, c);
+  CHECK(c[0] == 0.25f && c[2] == 0.75f);
+  glTranslatef(1, 2, 3);
+  float m[16] = {};
+  glGetFloatv(GL_MODELVIEW_MATRIX, m);
+  CHECK(m[12] == 1 && m[13] == 2 && m[14] == 3);
+  glPushMatrix();
+  glRotatef(90, 0, 0, 1);
+  glPopMatrix();
+  glGetFloatv(GL_MODELVIEW_MATRIX, m);
+  CHECK(m[0] == 1 && m[12] == 1);
+  GLint depth = 0;
+  glGetIntegerv(GL_MODELVIEW_STACK_DEPTH, &depth);
+  CHECK(depth == 1);
+  GLint max_lights = 0;
+  glGetIntegerv(GL_MAX_LIGHTS, &max_lights);
+  CHECK(max_lights == 8);
+  GLboolean mask[4] = {};
+  glColorMask(GL_TRUE, GL_FALSE, GL_TRUE, GL_FALSE);
+  glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+  CHECK(mask[0] && !mask[1] && mask[2] && !mask[3]);
+  glColorMask(1, 1, 1, 1);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 3);
+  CHECK(glGetError() == GL_INVALID_VALUE);
+  glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 8);
+  glPopClientAttrib();
+  GLint align = 0;
+  glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+  CHECK(align == 4);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_selection_and_feedback() {
+  Fixture f;
+  GLuint hits[64] = {};
+  glSelectBuffer(64, hits);
+  glRenderMode(GL_SELECT);
+  glInitNames();
+  glPushName(7);
+  glRectf(0, 0, 10, 10);      // inside
+  glLoadName(8);
+  glRectf(100, 100, 110, 110);      // outside the view volume
+  glLoadName(9);
+  glBegin(GL_POINTS); glVertex2f(5, 5); glEnd();
+  const GLint count = glRenderMode(GL_RENDER);
+  CHECK(count == 2);
+  CHECK(hits[0] == 1 && hits[3] == 7);
+  CHECK(hits[4] == 1 && hits[7] == 9);
+  float fb[64] = {};
+  glFeedbackBuffer(64, GL_2D, fb);
+  glRenderMode(GL_FEEDBACK);
+  glBegin(GL_POINTS); glVertex2f(5, 6); glEnd();
+  glPassThrough(42);
+  glBegin(GL_LINES); glVertex2f(1, 1); glVertex2f(2, 2); glEnd();
+  const GLint values = glRenderMode(GL_RENDER);
+  CHECK(values == 3 + 2 + 5);
+  CHECK(fb[0] == GL_POINT_TOKEN && fb[1] == 5 && fb[2] == 6);
+  CHECK(fb[3] == GL_PASS_THROUGH_TOKEN && fb[4] == 42);
+  CHECK(fb[5] == GL_LINE_RESET_TOKEN);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_glsl_program() {
+  Fixture f;
+  const char* vs = "#version 300 es\nin vec4 pos;\nuniform vec2 offset;\nvoid main(){ gl_Position = vec4(pos.xy + offset, 0.0, 1.0); }\n";
+  const char* fs = "#version 300 es\nprecision mediump float;\nuniform vec4 color;\nout vec4 o;\nvoid main(){ o = color; }\n";
+  const GLuint v = glCreateShader(GL_VERTEX_SHADER), s = glCreateShader(GL_FRAGMENT_SHADER);
+  glShaderSource(v, 1, &vs, nullptr);
+  glShaderSource(s, 1, &fs, nullptr);
+  glCompileShader(v);
+  glCompileShader(s);
+  GLint ok = 0;
+  glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
+  CHECK(ok == GL_TRUE);
+  const GLuint p = glCreateProgram();
+  CHECK(p != v && p != s);
+  glAttachShader(p, v);
+  glAttachShader(p, s);
+  glBindAttribLocation(p, 3, "pos");
+  glLinkProgram(p);
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  CHECK(ok == GL_TRUE);
+  glUseProgram(p);
+  glUniform4f(glGetUniformLocation(p, "color"), 0, 1, 0, 1);
+  glUniform2f(glGetUniformLocation(p, "offset"), 0.5f, 0.5f);
+  GLint current = 0;
+  glGetIntegerv(GL_CURRENT_PROGRAM, &current);
+  CHECK(current == int(p));
+  const float tri[] = {-0.5f, -0.5f, 0.5f, -0.5f, -0.5f, 0.5f};
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnableVertexAttribArray(3);
+  glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, 0, tri);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  glDisableVertexAttribArray(3);
+  CHECK(near(pixel(36, 36), 0, 255, 0));
+  CHECK(near(pixel(10, 10), 0, 0, 0));
+  float got[4] = {};
+  glGetUniformfv(p, glGetUniformLocation(p, "color"), got);
+  CHECK(got[1] == 1);
+  glUseProgram(0);
+  glDeleteProgram(p);
+  glDeleteShader(v);
+  glDeleteShader(s);
+  CHECK(!glIsProgram(p));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_framebuffer_object() {
+  Fixture f;
+  GLuint fbo = 0, tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glGenFramebuffers(1, &fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+  CHECK(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+  glViewport(0, 0, 16, 16);
+  glClearColor(1, 0.5f, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glViewport(0, 0, W, H);
+  glEnable(GL_TEXTURE_2D);
+  glColor3f(1, 1, 1);
+  glBegin(GL_QUADS);
+  glTexCoord2f(0, 0); glVertex2f(0, 0); glTexCoord2f(1, 0); glVertex2f(64, 0); glTexCoord2f(1, 1); glVertex2f(64, 64); glTexCoord2f(0, 1); glVertex2f(0, 64);
+  glEnd();
+  CHECK(near(pixel(30, 30), 255, 128, 0, 2));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_evaluator() {
+  Fixture f;
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  // a flat patch over the whole window
+  const float ctrl[2][2][3] = {{{0, 0, 0}, {0, 64, 0}}, {{64, 0, 0}, {64, 64, 0}}};
+  glMap2f(GL_MAP2_VERTEX_3, 0, 1, 6, 2, 0, 1, 3, 2, &ctrl[0][0][0]);
+  glEnable(GL_MAP2_VERTEX_3);
+  glMapGrid2f(4, 0, 1, 4, 0, 1);
+  glColor3f(0, 1, 0);
+  glEvalMesh2(GL_FILL, 0, 4, 0, 4);
+  CHECK(near(pixel(30, 30), 0, 255, 0));
+  GLint order[2] = {};
+  glGetMapiv(GL_MAP2_VERTEX_3, GL_ORDER, order);
+  CHECK(order[0] == 2 && order[1] == 2);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+static void test_core_profile() {
+  Fixture f(true);
+  glBegin(GL_TRIANGLES);
+  CHECK(glGetError() == GL_INVALID_OPERATION);      // removed from the core profile
+  GLint profile = 0;
+  glGetIntegerv(GL_CONTEXT_PROFILE_MASK, &profile);
+  CHECK(profile == GL_CONTEXT_CORE_PROFILE_BIT);
+  const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, 0));
+  CHECK(e && strncmp(e, "GL_", 3) == 0);
+}
+
+static void test_service() {
+  GlService service(g_alloc);
+  ContextRequest r;
+  uint32_t a = 0, b = 0;
+  CHECK(service.create_context(1, r, &a) == GlStatus::Ok);
+  r.share = a;
+  CHECK(service.create_context(1, r, &b) == GlStatus::Ok && b != a);
+  SurfaceRequest s;
+  s.window = 0x100;
+  s.width = 8;
+  s.height = 8;
+  CHECK(service.make_current(1, 10, a, s) == GlStatus::Ok);
+  CHECK(service.make_current(1, 11, a, s) == GlStatus::Busy);
+  // a stream through the service: clear the window red
+  g_stream.used = 0;
+  uint32_t words[64];
+  uint32_t n = 0;
+  // (the service's own encoder is the client's: build the stream from the entry points, then hand it over)
+  g_api = nullptr;
+  glClearColor(1, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  for (uint32_t i = 0; i < g_stream.used; ++i) words[n++] = g_stream.words[i];
+  g_stream.used = 0;
+  uint64_t result = 0;
+  CHECK(service.execute(1, 10, ConstByteView(reinterpret_cast<const uint8_t*>(words), n * 4), g_memory, &result) == GlStatus::Ok);
+  CHECK(service.execute(1, 12, ConstByteView(reinterpret_cast<const uint8_t*>(words), n * 4), g_memory, &result) == GlStatus::NoContext);
+  struct Seen { uint32_t w = 0, h = 0; uint8_t first[4] = {}; } seen;
+  CHECK(service.swap(1, 0x100, 8, 8, true, [](void* c, uint64_t, ConstByteView rgba, uint32_t w, uint32_t h) {
+    Seen& s = *static_cast<Seen*>(c);
+    s.w = w; s.h = h;
+    for (int i = 0; i < 4; ++i) s.first[i] = rgba[static_cast<uint64_t>(i)];
+  }, &seen) == GlStatus::Ok);
+  CHECK(seen.w == 8 && seen.first[0] == 255 && seen.first[1] == 0);
+  uint8_t front[8 * 8 * 4];
+  uint32_t w = 0, h = 0;
+  CHECK(service.read_front(1, 0x100, ByteView(front, sizeof(front)), 32, &w, &h) == GlStatus::Ok);
+  CHECK(front[0] == 0 && front[2] == 255);      // B, G, R, A
+  CHECK(service.context_count(1) == 2);
+  CHECK(service.delete_context(1, b) == GlStatus::Ok);
+  CHECK(service.delete_context(1, b) == GlStatus::InvalidHandle);
+  service.process_exited(1);
+  CHECK(service.context_count(1) == 0);
+}
+
+// A stream that makes no sense is stopped, not run off the end.
+static void test_bad_streams() {
+  Fixture f;
+  g_memory.closed = true;
+  uint32_t junk[32];
+  uint32_t seed = 12345;
+  for (int round = 0; round < 2000; ++round) {
+    for (uint32_t& w : junk) { seed = seed * 1103515245u + 12345u; w = seed; }
+    // keep the opcodes of commands that read memory out: only scalar commands may be tried blind
+    const uint32_t n = 1 + seed % 32;
+    g_api->execute(ConstByteView(reinterpret_cast<const uint8_t*>(junk), uint64_t{n} * 4 - (seed % 4)), g_memory);
+  }
+  // truncated real commands
+  glClearColor(0, 1, 0, 1);
+  const uint32_t len = g_stream.used;
+  for (uint32_t cut = 0; cut < len * 4; ++cut) g_api->execute(ConstByteView(reinterpret_cast<const uint8_t*>(g_stream.words), cut), g_memory);
+  g_stream.used = 0;
+  g_memory.closed = false;
+  glGetError();
+  CHECK(true);
+}
+
+int main() {
+  test_strings_and_errors();
+  test_clear_and_immediate();
+  test_polygon_and_modes();
+  test_depth_and_blend();
+  test_lighting();
+  test_textures();
+  test_arrays();
+  test_display_lists();
+  test_pixels();
+  test_state_stacks_and_get();
+  test_selection_and_feedback();
+  test_glsl_program();
+  test_framebuffer_object();
+  test_evaluator();
+  test_core_profile();
+  test_service();
+  test_bad_streams();
+  printf("opengl: %d checks, %d failed\n", g_checks, g_failed);
+  return g_failed ? 1 : 0;
+}

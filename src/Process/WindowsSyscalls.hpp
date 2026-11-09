@@ -119,6 +119,7 @@ enum class WindowsSyscallNumber : uint32_t {
   NtTcosDwm = 506,
   NtTcosCrypto = 507,
   NtTcosFont = 508,
+  NtTcosOpenGl = 509,
   NtCreateSocket = 87,
   NtBindSocket = 88,
   NtConnectSocket = 89,

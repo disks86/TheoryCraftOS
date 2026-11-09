@@ -17,6 +17,9 @@
  */
 #include "Process/Win32k/Win32k.hpp"
 #include "Process/WindowsObjects.hpp"
+#include "Process/WindowsOpenGl.hpp"
+#include "Process/Win32k/Win32kUser.hpp"
+#include "Process/Win32k/Win32kUserMisc.hpp"
 
 namespace process {
 
@@ -324,8 +327,18 @@ bool wait_loop(Call& call, uint64_t timeout_ns, bool (*attempt)(void* context), 
   }
 }
 
+namespace {
+// The kernel's OpenGL puts its frames in windows through the window system (see WindowsOpenGl.hpp).
+bool present_gl_frame(uint64_t window, ConstByteView rgba, uint32_t width, uint32_t height) {
+  user_misc::SystemLock system;
+  if (window > 0xFFFFFFFFu || !user::window_redirected_locked(static_cast<uint32_t>(window))) return false;
+  return user::present_to_window_locked(static_cast<uint32_t>(window), rgba, width, height, width * 4, true);
+}
+}  // namespace
+
 void install() {
   if (g_table.installed) return;
+  windowsabi::set_gl_window_present(&present_gl_frame);
   g_table.installed = true;
   install_gdi();
   install_user();

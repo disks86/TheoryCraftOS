@@ -59,4 +59,8 @@ GuardResult guard_fault(Process& process, uint64_t teb, uint64_t address, bool w
 // What a remote operation does, on the process it was asked of (its lock is held by the caller).
 uint32_t run_remote(Process& target, IProcessRuntime::RemoteOp& op);
 
+// Committed read-write memory in the process for the kernel's own services (a string or a mapped buffer handed to the program); 0 if there is none. Freed with free_user_memory.
+uint64_t allocate_user_memory(Process& p, uint64_t size);
+void free_user_memory(Process& p, uint64_t address);
+
 }  // namespace process::windowsabi

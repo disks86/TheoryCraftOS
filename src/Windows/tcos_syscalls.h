@@ -115,6 +115,7 @@
 #define NT_SERVICE_NtTcosDwm 506
 #define NT_SERVICE_NtTcosCrypto 507
 #define NT_SERVICE_NtTcosFont 508
+#define NT_SERVICE_NtTcosOpenGl 509
 #define NT_SERVICE_NtCreateSocket 87
 #define NT_SERVICE_NtBindSocket 88
 #define NT_SERVICE_NtConnectSocket 89

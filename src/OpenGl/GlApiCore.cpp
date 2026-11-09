@@ -160,6 +160,8 @@ bool GlApi::read_string(UserPtr at, int64_t length, String* out) {
   const uint64_t limit = 16ull * 1024 * 1024;
   while (done < limit) {
     uint64_t want = sizeof(buf);
+    const uint64_t to_page = 4096 - ((at.address + done) & 4095);      // (a block never runs into the next page, which may not be there)
+    if (length < 0 && to_page < want) want = to_page;
     if (length >= 0 && static_cast<uint64_t>(length) - done < want) want = static_cast<uint64_t>(length) - done;
     if (want == 0) return true;
     // Near the end of a mapping a block read fails while the string itself is fine: go down to bytes then.

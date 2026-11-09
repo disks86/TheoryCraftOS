@@ -368,6 +368,21 @@ add_executable(BOOTX64
   src/WebGl/GlCompressed.cpp
   src/WebGl/GlSampler.cpp
   src/WebGl/GlDraw.cpp
+  src/OpenGl/FixedFunction.cpp
+  src/OpenGl/GlApiBuffer.cpp
+  src/OpenGl/GlApiCore.cpp
+  src/OpenGl/GlApiDraw.cpp
+  src/OpenGl/GlApiFixed.cpp
+  src/OpenGl/GlApiGet.cpp
+  src/OpenGl/GlApiImmediate.cpp
+  src/OpenGl/GlApiMisc.cpp
+  src/OpenGl/GlApiPixels.cpp
+  src/OpenGl/GlApiProgram.cpp
+  src/OpenGl/GlApiTexture.cpp
+  src/OpenGl/GlService.cpp
+  src/OpenGl/GlSurface.cpp
+  src/OpenGl/WindowsGl.cpp
+  src/OpenGl/generated/GlApiVariants.cpp
   src/Browser/DomBindingsServiceWorker.cpp
   src/Browser/DomBindingsRtc.cpp
   src/Browser/CacheStore.cpp
@@ -728,6 +743,7 @@ add_executable(BOOTX64
   src/Process/WindowsCrypto.cpp
   src/Process/WindowsDialogs.cpp
   src/Process/WindowsFonts.cpp
+  src/Process/WindowsOpenGl.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/Sockets.cpp

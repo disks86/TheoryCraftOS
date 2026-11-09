@@ -347,11 +347,12 @@ def op_flags(name, versions, removed, new_commands):
 
 def generate_enums():
     used = set()
-    for root, _, files in os.walk(os.path.join(ROOT, "src/OpenGl")):
+    places = [(r, fs) for r, _, fs in os.walk(os.path.join(ROOT, "src/OpenGl"))] + [(os.path.join(ROOT, "tests"), ["OpenGlTest.cpp"])]
+    for root, files in places:
         if "generated" in root or "khronos" in root:
             continue
         for f in files:
-            if f.endswith((".cpp", ".hpp")):
+            if f.endswith((".cpp", ".hpp")) and os.path.exists(os.path.join(root, f)):
                 text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', open(os.path.join(root, f), encoding="utf-8").read())
                 text = re.sub(r"//[^\n]*", "", text)
                 used |= set(re.findall(r"\bGL_[A-Z0-9_a-z]+\b", text))
