@@ -69,6 +69,15 @@ class VirglDevice final : public IGraphicsDevice {
   // SUBMIT_3D. Without a fence (the default) the host takes the commands and the GPU runs them while we go on; `fence`: the answer waits for the GPU (and has the host poll).
   bool send_commands(const uint32_t* dwords, uint32_t count, bool fence = false);
   uint32_t new_handle() { return next_handle_++; }
+  // Whether the host's GPU may still be running work numbered `work` (VirtioGpu::work_sent; 0 is no work), or work of a submit that used more buffers than it
+  // kept track of (all buffers count as used by it).
+  bool in_flight(uint64_t work) const {
+    const uint64_t all = __atomic_load_n(&all_used_until_, __ATOMIC_ACQUIRE);
+    const uint64_t last = work > all ? work : all;
+    return last != 0 && last > gpu_.work_done();
+  }
+  // Waits until the host's GPU has finished all the work given to it so far (a fenced empty submission).
+  bool wait_for_gpu();
   bool destroy_object(uint32_t handle);
   // The host-side sampler state object for `sampler`, made on first use (0 if the host refuses it).
   uint32_t sampler_state(const SamplerDesc& sampler);
@@ -77,6 +86,7 @@ class VirglDevice final : public IGraphicsDevice {
   bool clock_interrupted_ = false;   // (until a disjoint query has said so)
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
+  uint64_t all_used_until_ = 0;   // the last work of a submit that used too many buffers to note each one (see in_flight)
   uint32_t sampler_states_[8] = {};   // by filter and address modes (3 bits), 0 until made
 };
 

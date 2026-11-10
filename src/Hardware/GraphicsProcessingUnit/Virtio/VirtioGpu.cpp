@@ -78,7 +78,10 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence
   }
   request_.copy_from(request);
   auto* head = reinterpret_cast<ControlHeader*>(request_.data());
+  uint64_t work = 0;   // (the number of this command, for a 3D one)
   if (head->type >= kCmdCtxCreate) {
+    work = work_sent_ + 1;
+    __atomic_store_n(&work_sent_, work, __ATOMIC_RELEASE);
     head->context_id = kContextId;
     // With a fence the host answers when the work is finished (see execute() in the header). Either way our buffers are free to reuse once it answers: it has read the request.
     if (fence) {
@@ -113,6 +116,8 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response, bool fence
   }
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
   const uint32_t type = reply->type;
+  // (an answer to a fenced command means the host's GPU has finished it and everything before it; an error is answered at once, without waiting for the fence)
+  if (work && fence && type >= kRespOkNoData && type < kRespErrUnspec && work > __atomic_load_n(&work_done_, __ATOMIC_RELAXED)) __atomic_store_n(&work_done_, work, __ATOMIC_RELEASE);
   if (!response.empty()) response.copy_from(ConstByteView(response_).at_most(response.size()));
   return type;
 }

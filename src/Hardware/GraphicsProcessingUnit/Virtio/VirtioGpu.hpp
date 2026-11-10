@@ -96,7 +96,12 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   bool virgl_has_geometry() const { return has_3d_ && virgl_glsl_level_ >= 150; }
   bool virgl_has_compute() const { return has_3d_ && virgl_glsl_level_ >= 430; }
   uint32_t context_id() const { return kContextId; }
-  uint32_t allocate_resource_id() { return next_resource_++; }
+  uint32_t allocate_resource_id() { return __atomic_fetch_add(&next_resource_, 1u, __ATOMIC_RELAXED); }   // (the 3D device makes resources from several threads)
+  // The 3D work the host has been given and finished. Every command of the virgl context (one with a type from kCmdCtxCreate on) takes the next number of
+  // work_sent(); once a fenced one is answered, all of them up to its number are finished on the host's GPU and work_done() says so. Work numbered above
+  // work_done() may still be running: the host takes buffer uploads without waiting for it (see VirglBuffer::unmap).
+  uint64_t work_sent() const { return __atomic_load_n(&work_sent_, __ATOMIC_ACQUIRE); }
+  uint64_t work_done() const { return __atomic_load_n(&work_done_, __ATOMIC_ACQUIRE); }
   // Bookkeeping of the 3D resources (buffers and images) the host holds for us, in bytes; the 3D device calls these as it creates and
   // frees them. Safe from any thread.
   void add_resource_bytes(uint64_t bytes) { __atomic_fetch_add(&resource_bytes_, bytes, __ATOMIC_RELAXED); }
@@ -160,6 +165,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   static bool retarget_interrupt(void* self, uint32_t core, uint64_t hardware_id);
   static kernel::Frame* on_interrupt(kernel::Frame* frame, void* self);
   uint64_t fence_ = 0;
+  uint64_t work_sent_ = 0;   // (written under lock_)
+  uint64_t work_done_ = 0;
   bool in_flight_ = false;  // a command timed out and the device still holds its buffers
   uint32_t timeouts_ = 0;
 
