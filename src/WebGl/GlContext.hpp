@@ -258,6 +258,23 @@ struct ProgramObj {
   UniquePointer<ExtraStage> extra[3];
   List<StageCopy> vs_record;
   uint32_t vs_record_slots = 0;
+  // Clip distances: what the last pre-raster stage writes (gl_ClipDistance, or a compatibility gl_ClipVertex the planes are applied to), as varyings clip_varying ... + 7.
+  int32_t clip_varying = -1;
+  int32_t clip_distance_slot = -1, clip_vertex_slot = -1;      // in the last stage's private region
+  uint32_t clip_count = 0;
+  // A vertex's clip distances into its varyings (from the last stage's private region).
+  void fill_clip_distances(const uint32_t* privates, uint32_t private_slots, const float planes[8][4], float* varyings) const {
+    if (clip_varying < 0) return;
+    for (uint32_t i = 0; i < 8; ++i) {
+      float d = 0;
+      if (clip_distance_slot >= 0 && i < clip_count && static_cast<uint32_t>(clip_distance_slot) + i < private_slots) {
+        d = __builtin_bit_cast(float, privates[static_cast<uint32_t>(clip_distance_slot) + i]);
+      } else if (clip_vertex_slot >= 0 && static_cast<uint32_t>(clip_vertex_slot) + 4 <= private_slots) {
+        for (uint32_t k = 0; k < 4; ++k) d += planes[i][k] * __builtin_bit_cast(float, privates[static_cast<uint32_t>(clip_vertex_slot) + k]);
+      }
+      varyings[static_cast<uint32_t>(clip_varying) + i] = d;
+    }
+  }
   bool has_extra() const { return extra[0] || extra[1] || extra[2]; }
   // The stages by number: 0 vertex, 1 fragment, 2 + kStage* the others (null when absent).
   const shader::Module* stage_module(int s) const { return s == 0 ? vsm.get() : (s == 1 ? fsm.get() : (extra[s - 2] ? extra[s - 2]->module.get() : nullptr)); }
@@ -393,6 +410,8 @@ struct DesktopState {
   Image* front_also = nullptr;         // where the second copy goes
   uint32_t clip_mask = 0;              // glEnable(GL_CLIP_PLANEi) / GL_CLIP_DISTANCEi
   int32_t clip_varying = -1;           // the first of the program's clip distances among the varyings (one scalar per set bit, lowest first)
+  bool clip_indexed = false;           // a program's: the distance of plane i is varying clip_varying + i (not packed by set bit)
+  float clip_planes[8][4] = {};        // the planes in eye space (glClipPlane), for a program's gl_ClipVertex
   uint8_t color_mask[kMaxDrawBuffers] = {15, 15, 15, 15, 15, 15, 15, 15};
   bool per_buffer_masks = false;
   // one blend state per draw buffer (glBlendFunci, glEnablei(GL_BLEND, i)) when per_buffer_blend is set

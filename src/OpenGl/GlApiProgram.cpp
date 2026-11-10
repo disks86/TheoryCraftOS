@@ -129,7 +129,7 @@ void GlApi::glLinkProgram(GLuint program) {
     String text(a_);
     text.append(modern ? "#version 130\n" : "#version 110\n");
     if (need_vertex) {
-      text.append("void main(){ gl_Position = ftransform(); gl_FrontColor = gl_Color; gl_FrontSecondaryColor = gl_SecondaryColor; gl_FogFragCoord = abs((gl_ModelViewMatrix * gl_Vertex).z);\n");
+      text.append("void main(){ gl_Position = ftransform(); gl_ClipVertex = gl_ModelViewMatrix * gl_Vertex; gl_FrontColor = gl_Color; gl_FrontSecondaryColor = gl_SecondaryColor; gl_FogFragCoord = abs((gl_ModelViewMatrix * gl_Vertex).z);\n");
       for (uint32_t i = 0; i < kMaxTexUnits; ++i) {
         char line[96] = "  gl_TexCoord[0] = gl_TextureMatrix[0] * gl_MultiTexCoord0;\n";
         line[14] = static_cast<char>('0' + i);

@@ -329,9 +329,10 @@ bool GlContext::link_stage_inputs(ProgramObj* p, const shader::Module& producer,
       want.assign(cn);
     }
     const shader::Global* pg = nullptr;
-    for (uint64_t k = 0; k < producer.globals.count(); ++k) {
-      const shader::Global& g = *producer.globals[k];
-      const bool output = g.kind == GlobalKind::Out || (g.kind == GlobalKind::Builtin && (g.builtin == shader::kBvPosition || g.builtin == shader::kBvPointSize || g.builtin == shader::kBvClipDistance));
+    for (uint64_t k = producer.globals.count(); k > 0; --k) {      // (the last declaration: a redeclared gl_ClipDistance[n] over the built-in)
+      const shader::Global& g = *producer.globals[k - 1];
+      const bool output = g.kind == GlobalKind::Out || (g.kind == GlobalKind::Builtin && (g.builtin == shader::kBvPosition || g.builtin == shader::kBvPointSize || g.builtin == shader::kBvClipDistance)) ||
+                          (g.kind == GlobalKind::Private && g.name.view().equals("gl_ClipVertex"));      // (a private of the compatibility profile)
       if (output && g.name.view().equals(want.view())) { pg = &g; break; }
     }
     if (!pg) {
@@ -351,7 +352,8 @@ bool GlContext::link_stage_inputs(ProgramObj* p, const shader::Module& producer,
     if (cg.per_vertex && cg.inner) ct.array = cg.inner;
     Type pt = producer_is_control && pg->per_vertex ? pg->type.element() : pg->type;
     if (producer_is_control && pg->per_vertex && pg->inner) pt.array = pg->inner;
-    if (!(ct == pt) && !(ct.base == Base::Struct && pt.base == Base::Struct)) {
+    const bool clip_distances = want.view().ends_with("gl_ClipDistance");      // (sized differently on the two sides: the shorter is copied)
+    if (!(ct == pt) && !(ct.base == Base::Struct && pt.base == Base::Struct) && !clip_distances) {
       String why(a_);
       why.assign(name);
       why.append("the type of ");
@@ -363,11 +365,13 @@ bool GlContext::link_stage_inputs(ProgramObj* p, const shader::Module& producer,
     StageCopy c;
     c.dst = cg.slot;
     c.count = cm.slots_of(ct);
+    if (clip_distances && producer.slots_of(pt) < c.count) c.count = producer.slots_of(pt);
     if (producer_is_control) {      // from the patch's outputs, element by element (or once, per patch)
       c.src = pg->slot;
       c.per_vertex = false;
       if (cg.per_vertex && pg->per_vertex) {
-        c.src_stride = c.dst_stride = c.count;
+        c.src_stride = producer.slots_of(pt);
+        c.dst_stride = cm.slots_of(ct);
         const uint32_t pv = pg->type.array / (pg->inner ? pg->inner : 1), cv = cg.type.array / (cg.inner ? cg.inner : 1);
         c.elements = pv < cv ? pv : cv;
       }
@@ -386,7 +390,7 @@ bool GlContext::link_stage_inputs(ProgramObj* p, const shader::Module& producer,
       }
       c.src = at;
       c.per_vertex = true;
-      c.dst_stride = c.count;
+      c.dst_stride = cm.slots_of(ct);
     }
     if (!consumer.inputs.push_back(c)) { link_failed(p, "out of memory"); return false; }
   }
@@ -506,6 +510,7 @@ void GlContext::link_program(uint32_t id) {
   for (uint64_t i = 0; i < fm.globals.count(); ++i) {
     const shader::Global& fg = *fm.globals[i];
     if (fg.kind != GlobalKind::In || fg.builtin != shader::kBvNone) continue;
+    if (fg.name.view().equals("gl_ClipDistance")) continue;      // (a redeclared one: with the clip distances below)
     const shader::Global* match = nullptr;
     for (uint64_t k = 0; k < lm.globals.count(); ++k) {
       const shader::Global& vg = *lm.globals[k];
@@ -537,6 +542,45 @@ void GlContext::link_program(uint32_t id) {
     offset += l.count;
     if (offset > gpu::kMaxVarying) { link_failed(p, "too many varyings"); return; }
     p->links.push_back(l);
+  }
+  // Clip distances: eight varyings from what the last pre-raster stage writes (a redeclared gl_ClipDistance[n] or the built-in one; a compatibility shader's gl_ClipVertex),
+  // read by the fragment stage's gl_ClipDistance too.
+  p->clip_varying = -1;
+  p->clip_distance_slot = p->clip_vertex_slot = -1;
+  p->clip_count = 0;
+  if (desktop.active) {
+    for (uint64_t k = lm.globals.count(); k > 0; --k) {
+      const shader::Global& g = *lm.globals[k - 1];
+      const bool distance = g.name.view().equals("gl_ClipDistance") && (g.kind == GlobalKind::Out || (g.kind == GlobalKind::Builtin && g.builtin == shader::kBvClipDistance));
+      if (distance && g.referenced && g.type.array) {
+        p->clip_distance_slot = static_cast<int32_t>(g.slot);
+        p->clip_count = g.type.array < 8 ? g.type.array : 8;
+        break;
+      }
+    }
+    if (p->clip_distance_slot < 0) {
+      const int32_t cv = lm.find_global("gl_ClipVertex");
+      if (cv >= 0 && lm.globals[static_cast<uint64_t>(cv)]->referenced) p->clip_vertex_slot = static_cast<int32_t>(lm.globals[static_cast<uint64_t>(cv)]->slot);
+      // (neither written, in the compatibility profile: gl_Position is compared with the planes, GLSL 1.30 section 7.1)
+      const int32_t pos = lm.find_builtin_global(shader::kBvPosition);
+      if (p->clip_vertex_slot < 0 && lm.compatibility && pos >= 0) p->clip_vertex_slot = static_cast<int32_t>(lm.globals[static_cast<uint64_t>(pos)]->slot);
+    }
+    if ((p->clip_distance_slot >= 0 || p->clip_vertex_slot >= 0) && offset + 8 <= gpu::kMaxVarying) {
+      p->clip_varying = static_cast<int32_t>(offset);
+      for (uint64_t k = fm.globals.count(); k > 0; --k) {
+        const shader::Global& fg = *fm.globals[k - 1];
+        if (!fg.name.view().equals("gl_ClipDistance") || !fg.referenced || !fg.type.array || (fg.kind != GlobalKind::In && fg.kind != GlobalKind::Builtin)) continue;
+        VaryingLink l;
+        l.vs_slot = p->clip_distance_slot >= 0 ? static_cast<uint32_t>(p->clip_distance_slot) : 0;
+        l.fs_slot = fg.slot;
+        l.count = fg.type.array < 8 ? fg.type.array : 8;
+        l.flat = false;
+        l.var_offset = offset;
+        if (p->clip_distance_slot >= 0) p->links.push_back(l);
+        break;
+      }
+      offset += 8;
+    }
   }
   // gl_PrimitiveID: what the geometry stage writes, to the fragment stage (flat).
   if (p->extra[kStageGeometry]) {

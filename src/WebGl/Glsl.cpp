@@ -692,10 +692,10 @@ class Parser {
   // The members of gl_in[] / gl_out[]: per-vertex arrays named gl_in.gl_Position ..., reached as gl_in[i].gl_Position (a symbol of kind 4).
   void per_vertex_block(const char* instance, GlobalKind kind, uint32_t count, bool shared) {
     const int32_t iface = interfaces_++;
-    const char* const members[] = {"gl_Position", "gl_PointSize", "gl_ClipDistance"};
-    const Type types[] = {make_type(Base::Float, 4), make_type(Base::Float), make_type(Base::Float)};
-    const uint32_t inners[] = {0, 0, 8};      // (gl_ClipDistance: 8 per vertex)
-    for (int i = 0; i < 3; ++i) {
+    const char* const members[] = {"gl_Position", "gl_PointSize", "gl_ClipDistance", "gl_ClipVertex"};
+    const Type types[] = {make_type(Base::Float, 4), make_type(Base::Float), make_type(Base::Float), make_type(Base::Float, 4)};
+    const uint32_t inners[] = {0, 0, 8, 0};      // (gl_ClipDistance: 8 per vertex)
+    for (int i = 0; i < (m_.compatibility ? 4 : 3); ++i) {      // (gl_ClipVertex: the compatibility profile's)
       String name(a_);
       name.assign(instance);
       name.push_back('.');
@@ -758,6 +758,8 @@ class Parser {
     add_builtin("gl_Position", f4, GlobalKind::Out, kBvPosition);
     add_builtin("gl_PointSize", f1, GlobalKind::Out, kBvPointSize);
     add_builtin("gl_ClipDistance", clip, GlobalKind::Out, kBvClipDistance);
+    // (compatibility: the eye-space vertex the clip planes are applied to)
+    if (m_.compatibility && stage_ != Stage::TessControl) new_global("gl_ClipVertex", f4, GlobalKind::Private, false);
     if (stage_ == Stage::Geometry) {
       new_global("gl_PrimitiveID", i1, GlobalKind::Out, false);
       new_global("gl_Layer", i1, GlobalKind::Out, false);

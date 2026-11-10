@@ -931,6 +931,72 @@ static void test_geometry_and_tessellation() {
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
+// Clip distances: gl_ClipDistance (enabled by GL_CLIP_DISTANCEi), a compatibility shader's gl_ClipVertex against the user planes, and gl_Position when it writes neither.
+static void test_clip_distances() {
+  Fixture f;
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  const char* fs = "#version 130\nvoid main(){ gl_FragColor = vec4(1.0); }\n";
+  // the left half (x < 0) clipped by distance 0; distance 1 written but its plane not enabled
+  const GLuint d = build("#version 130\nvoid main(){ gl_Position = gl_Vertex; gl_ClipDistance[0] = gl_Vertex.x; gl_ClipDistance[1] = -1.0; }\n", fs);
+  CHECK(d != 0);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(d);
+  glEnable(GL_CLIP_DISTANCE0);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(10, 32), 0, 0, 0) && near(pixel(54, 32), 255, 255, 255));
+  glDisable(GL_CLIP_DISTANCE0);      // nothing clipped
+  glClear(GL_COLOR_BUFFER_BIT);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(10, 32), 255, 255, 255));
+  glUseProgram(0);
+  glDeleteProgram(d);
+  // gl_ClipVertex against the plane y >= 0 (eye space; the modelview is the identity)
+  const double plane[4] = {0, 1, 0, 0};
+  glClipPlane(GL_CLIP_PLANE0, plane);
+  glEnable(GL_CLIP_PLANE0);
+  const GLuint v = build("#version 120\nvoid main(){ gl_Position = gl_Vertex; gl_ClipVertex = gl_Vertex; }\n", "#version 120\nvoid main(){ gl_FragColor = vec4(1.0); }\n");
+  CHECK(v != 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(v);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(32, 10), 0, 0, 0) && near(pixel(32, 54), 255, 255, 255));
+  glUseProgram(0);
+  glDeleteProgram(v);
+  // neither written: gl_Position is compared with the plane
+  const GLuint n = build("#version 120\nvoid main(){ gl_Position = gl_Vertex; }\n", "#version 120\nvoid main(){ gl_FragColor = vec4(1.0); }\n");
+  CHECK(n != 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(n);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(32, 10), 0, 0, 0) && near(pixel(32, 54), 255, 255, 255));
+  glUseProgram(0);
+  glDeleteProgram(n);
+  // a fragment shader alone: the fixed-function stand-in clips in eye space
+  const GLuint s = glCreateProgram();
+  const GLuint sf = glCreateShader(GL_FRAGMENT_SHADER);
+  const char* src = "#version 120\nvoid main(){ gl_FragColor = vec4(1.0); }\n";
+  glShaderSource(sf, 1, &src, nullptr);
+  glCompileShader(sf);
+  glAttachShader(s, sf);
+  glLinkProgram(s);
+  GLint ok = 0;
+  glGetProgramiv(s, GL_LINK_STATUS, &ok);
+  CHECK(ok);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(s);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(32, 10), 0, 0, 0) && near(pixel(32, 54), 255, 255, 255));
+  glUseProgram(0);
+  glDeleteProgram(s);
+  glDeleteShader(sf);
+  glDisable(GL_CLIP_PLANE0);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
 static void test_framebuffer_object() {
   Fixture f;
   GLuint fbo = 0, tex = 0;
@@ -1104,6 +1170,7 @@ int main() {
   test_desktop_glsl();
   test_several_shaders_per_stage();
   test_geometry_and_tessellation();
+  test_clip_distances();
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();

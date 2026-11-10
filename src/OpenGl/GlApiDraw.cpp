@@ -250,7 +250,13 @@ bool GlApi::prepare_draw(uint32_t, int64_t lowest, int64_t highest, uint32_t ins
     gl_.program_ = user_program_;
     fixed_current_ = nullptr;
     ds.flat_count = 0;
-    ds.clip_mask = 0;
+    // GL_CLIP_DISTANCEi (the same enables as GL_CLIP_PLANEi), by the program's clip distances
+    const webgl::ProgramObj* po = gl_.program(user_program_);
+    ds.clip_varying = po ? po->clip_varying : -1;
+    ds.clip_mask = ds.clip_varying >= 0 ? fx_.clip_enabled : 0;
+    ds.clip_indexed = true;
+    for (uint32_t i = 0; i < 8 && i < kMaxClipPlanes; ++i)
+      for (int k = 0; k < 4; ++k) ds.clip_planes[i][k] = static_cast<float>(fx_.clip_plane[i][k]);
     load_compat_uniforms(user_program_);
   } else {
     if (config_.core_profile) { error(GL_INVALID_OPERATION); return false; }
@@ -265,6 +271,7 @@ bool GlApi::prepare_draw(uint32_t, int64_t lowest, int64_t highest, uint32_t ins
     ds.flat_count = p->flat_count;
     ds.clip_mask = fx_.clip_enabled;
     ds.clip_varying = p->clip_first;
+    ds.clip_indexed = false;
     ds.ff_1d_mask = 0;
     ds.ff_rect_mask = 0;
     for (uint32_t i = 0; i < kMaxTexUnits; ++i) {
