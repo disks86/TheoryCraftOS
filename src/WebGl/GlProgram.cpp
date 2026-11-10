@@ -697,7 +697,8 @@ bool GlContext::program_status(uint32_t id, uint32_t pname, double* out) {
     case 0x8B87: { uint64_t m = 0; for (auto& u : p->uniforms) if (u->name.size() + 1 > m) m = u->name.size() + 1; *out = static_cast<double>(m); return true; }
     case 0x8B8A: { uint64_t m = 0; for (auto& u : p->attribs) if (u->name.size() + 1 > m) m = u->name.size() + 1; *out = static_cast<double>(m); return true; }
     case 0x8A36: *out = uniform_block_count(id); return true;
-    case 0x8C83: *out = p->tf_varyings.count(); return true;
+    case 0x8C83: *out = static_cast<double>(p->linked ? p->tf_resources.count() : 0); return true;
+    case 0x8C76: { uint64_t m = 0; if (p->linked) for (auto& r : p->tf_resources) if (r->name.size() + 1 > m) m = r->name.size() + 1; *out = static_cast<double>(m); return true; }
     case 0x8C7F: *out = p->tf_mode; return true;
     default: set_error(INVALID_ENUM); return false;
   }
@@ -1008,10 +1009,11 @@ bool GlContext::transform_feedback_vertices(uint32_t id, uint32_t stream, uint64
 bool GlContext::transform_feedback_varying(uint32_t program, uint32_t index, String* name, uint32_t* size, uint32_t* gl_type) {
   ProgramObj* p = program_at(program);
   if (!p) { set_error(INVALID_VALUE); return false; }
-  if (!p->linked || index >= p->tf_varyings.count() || index >= 32) { set_error(INVALID_VALUE); return false; }
-  name->assign(p->tf_varyings[index]->view());
-  *size = p->tf_info[index].size;
-  *gl_type = p->tf_info[index].gl_type;
+  if (!p->linked || index >= p->tf_resources.count()) { set_error(INVALID_VALUE); return false; }
+  const ProgramObj::TfResource& r = *p->tf_resources[index];
+  name->assign(r.name.view());
+  *size = r.size;
+  *gl_type = r.gl_type;
   return true;
 }
 
@@ -1020,6 +1022,7 @@ bool GlContext::transform_feedback_varying(uint32_t program, uint32_t index, Str
 // tcos_ names), and the special gl_NextBuffer / gl_SkipComponents1..4 of interleaved capture. A buffer takes the vertices of one stream.
 bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& last) {
   p->tf_plan.clear();
+  p->tf_resources.clear();
   p->tf_record_slots = 0;
   for (uint32_t& s : p->tf_stride) s = 0;
   if (p->extra[kStageGeometry]) {
@@ -1032,6 +1035,23 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
     p->tf_primitive = 0xFFFFFFFFu;      // (the draw's mode)
   }
   int32_t buffer_stream[4] = {-1, -1, -1, -1};
+  const auto resource = [&](StringView name, uint32_t gl_type, uint32_t size, int32_t offset, int32_t binding) {
+    UniquePointer<ProgramObj::TfResource> r = UniquePointer<ProgramObj::TfResource>::make(a_, a_);
+    if (!r) return link_failed(p, "out of memory"), false;
+    // (the compatibility varyings by their GL names)
+    if (name.starts_with("tcos_")) {
+      r->name.assign("gl_");
+      r->name.append(name.substr(5, name.size() - 5));
+    } else {
+      r->name.assign(name);
+    }
+    r->gl_type = gl_type;
+    r->size = size;
+    r->offset = offset;
+    r->binding = binding;
+    if (!p->tf_resources.push_back(static_cast<UniquePointer<ProgramObj::TfResource>&&>(r))) return link_failed(p, "out of memory"), false;
+    return true;
+  };
   const auto add = [&](const TfPiece& piece) {
     if (buffer_stream[piece.binding] >= 0 && buffer_stream[piece.binding] != static_cast<int32_t>(piece.stream)) return link_failed(p, "a transform feedback buffer takes outputs of two streams"), false;
     buffer_stream[piece.binding] = static_cast<int32_t>(piece.stream);
@@ -1058,6 +1078,8 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
           return false;
         }
       if (!add(piece)) return false;
+      const Type et = g.type.array ? g.type.element() : g.type;
+      if (!resource(g.name.view(), gl_type_of(et), g.type.array ? g.type.array : 1, static_cast<int32_t>(piece.offset), static_cast<int32_t>(piece.binding))) return false;
       if (piece.offset + piece.count * 4 > extent[piece.binding]) extent[piece.binding] = piece.offset + piece.count * 4;
     }
     for (uint32_t b = 0; b < 4; ++b) {
@@ -1073,11 +1095,11 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
   String want(a_);
   for (uint64_t i = 0; i < p->tf_varyings.count(); ++i) {
     const StringView name = p->tf_varyings[i]->view();
-    p->tf_info[i] = ProgramObj::TfVaryingInfo{0, 0};
     if (separate) { binding = static_cast<uint32_t>(i); in_binding = 0; }
     if (name.equals("gl_NextBuffer")) {
       if (separate || ++binding >= 4) { link_failed(p, "gl_NextBuffer past the last transform feedback buffer"); return false; }
       in_binding = 0;
+      if (!resource(name, 0, 0, -1, -1)) return false;
       continue;
     }
     TfPiece piece;
@@ -1087,7 +1109,7 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
     if (name.starts_with(skip) && name.size() == skip.size() + 1 && name[skip.size()] >= '1' && name[skip.size()] <= '4') {
       if (separate) { link_failed(p, "gl_SkipComponents in separate transform feedback"); return false; }
       const uint32_t n = static_cast<uint32_t>(name[skip.size()] - '0');
-      p->tf_info[i] = ProgramObj::TfVaryingInfo{0, n};      // (GL_NONE, the components skipped)
+      if (!resource(name, 0, n, static_cast<int32_t>(p->tf_stride[binding]), static_cast<int32_t>(binding))) return false;      // (GL_NONE, the components skipped)
       p->tf_stride[binding] += n * 4;      // (a gap the vertex's bytes leave as they are)
       total += n;
       in_binding += n;
@@ -1142,11 +1164,11 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
         if (!g->type.array || static_cast<uint64_t>(element) >= g->type.array) { link_failed(p, "a transform feedback varying's index is past the end of its array"); return false; }
         piece.src = g->slot + static_cast<uint32_t>(element) * last.slots_of(et);
         piece.count = last.slots_of(et);
-        p->tf_info[i] = ProgramObj::TfVaryingInfo{gl_type_of(et), 1};
+        if (!resource(name, gl_type_of(et), 1, static_cast<int32_t>(piece.offset), static_cast<int32_t>(binding))) return false;
       } else {
         piece.src = g->slot;
         piece.count = last.slots_of(g->type);
-        p->tf_info[i] = ProgramObj::TfVaryingInfo{gl_type_of(et), g->type.array ? g->type.array : 1};
+        if (!resource(name, gl_type_of(et), g->type.array ? g->type.array : 1, static_cast<int32_t>(piece.offset), static_cast<int32_t>(binding))) return false;
       }
       if (piece.count > last.private_slots || piece.src > last.private_slots - piece.count) { link_failed(p, "a transform feedback varying outside its stage's variables"); return false; }
       piece.stream = g->stream;

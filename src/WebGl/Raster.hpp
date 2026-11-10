@@ -31,6 +31,7 @@ struct RVertex {
   float var[kMaxVarying] = {};
   float point_size = 1;
   bool edge = true;                 // the edge flag (desktop GL's polygon modes)
+  int32_t layer = 0;                // the geometry stage's gl_Layer: the layer of a layered framebuffer the primitive goes to
 };
 
 struct RasterState {

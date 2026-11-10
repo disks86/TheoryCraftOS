@@ -125,6 +125,7 @@ struct Global {
   bool patch = false;       // tessellation: a per-patch varying (`patch out`, gl_TessLevelOuter/Inner)
   uint32_t inner = 0;       // a per-vertex array of arrays (`in vec4 v[][2]`, a member array of an arrayed block): each vertex's array has this many elements, the global's type is
                             // the flat array of all of them (v[i][j] is element i * inner + j)
+  uint32_t declared_length = 0;  // a built-in array a gl_PerVertex redeclaration sizes (`float gl_ClipDistance[2];`): what .length() says (its slots stay those of the built-in)
   uint32_t block_offset = 0;   // byte offset inside the block (std140)
   uint32_t uniform_index = 0;
   uint8_t stream = 0;          // geometry stage: the vertex stream an output belongs to (layout(stream = n))

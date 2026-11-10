@@ -30,7 +30,7 @@ const char* const kExtensions[] = {
     "GL_ARB_shading_language_100", "GL_ARB_texture_env_add", "GL_ARB_texture_env_combine", "GL_ARB_texture_env_crossbar", "GL_ARB_texture_env_dot3", "GL_ARB_texture_cube_map", "GL_ARB_depth_texture",
     "GL_ARB_shadow", "GL_ARB_point_parameters", "GL_ARB_point_sprite", "GL_ARB_occlusion_query", "GL_ARB_occlusion_query2", "GL_ARB_vertex_array_object", "GL_ARB_framebuffer_object", "GL_ARB_map_buffer_range",
     "GL_ARB_copy_buffer", "GL_ARB_draw_elements_base_vertex", "GL_ARB_draw_instanced", "GL_ARB_instanced_arrays", "GL_ARB_base_instance", "GL_ARB_sampler_objects", "GL_ARB_buffer_storage", "GL_ARB_texture_storage",
-    "GL_ARB_uniform_buffer_object", "GL_ARB_tessellation_shader", "GL_ARB_texture_non_power_of_two", "GL_ARB_texture_rectangle", "GL_ARB_texture_compression", "GL_ARB_texture_float", "GL_ARB_texture_rg", "GL_ARB_half_float_pixel", "GL_ARB_half_float_vertex",
+    "GL_ARB_uniform_buffer_object", "GL_ARB_program_interface_query", "GL_ARB_tessellation_shader", "GL_ARB_texture_non_power_of_two", "GL_ARB_texture_rectangle", "GL_ARB_texture_compression", "GL_ARB_texture_float", "GL_ARB_texture_rg", "GL_ARB_half_float_pixel", "GL_ARB_half_float_vertex",
     "GL_ARB_seamless_cube_map", "GL_ARB_explicit_attrib_location", "GL_ARB_provoking_vertex", "GL_ARB_draw_buffers", "GL_ARB_draw_buffers_blend", "GL_ARB_blend_func_extended_unavailable_placeholder",
     "GL_EXT_abgr", "GL_EXT_bgra", "GL_EXT_blend_color", "GL_EXT_blend_minmax", "GL_EXT_blend_subtract", "GL_EXT_blend_func_separate", "GL_EXT_draw_range_elements", "GL_EXT_multi_draw_arrays", "GL_EXT_packed_pixels",
     "GL_EXT_packed_depth_stencil", "GL_EXT_rescale_normal", "GL_EXT_secondary_color", "GL_EXT_separate_specular_color", "GL_EXT_stencil_wrap", "GL_EXT_texture_edge_clamp", "GL_EXT_texture3D", "GL_EXT_texture_env_add", "GL_EXT_texture_env_combine",
@@ -290,6 +290,7 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
     case GL_VERTEX_ARRAY_BINDING: return one(vao_names_.name_of(gl_.vao_id_));
     case GL_TRANSFORM_FEEDBACK_BINDING: return one(tf_names_.name_of(gl_.tf_bound_));
     case GL_MAX_VERTEX_STREAMS: return one(4);
+    case GL_LAYER_PROVOKING_VERTEX: return one(GL_FIRST_VERTEX_CONVENTION);      // (the layer of a primitive is its first vertex's gl_Layer)
     case GL_MAX_TRANSFORM_FEEDBACK_BUFFERS: return one(4);
     case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.tf_buffer_));
     case GL_CLAMP_VERTEX_COLOR: return one(gl_.desktop.clamp_vertex_color ? GL_TRUE : GL_FALSE);

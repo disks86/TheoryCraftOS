@@ -796,6 +796,26 @@ void GlContext::framebuffer_texture(uint32_t target, uint32_t attachment, uint32
   else set_error(INVALID_ENUM);
 }
 
+// glFramebufferTexture of a layered texture (3D, 1D/2D array, cube, cube array): all its layers.
+void GlContext::framebuffer_texture_layered(uint32_t target, uint32_t attachment, uint32_t tex, int32_t level) {
+  framebuffer_texture(target, attachment, 0, tex, level, 0);
+  const uint32_t id = target == 0x8CA8 ? read_fb_ : draw_fb_;
+  Framebuffer* fb = fb_at(id);
+  if (!fb || !tex) return;
+  const Texture* t = texture_at(tex);
+  if (!t) return;
+  Attachment* ats[2] = {nullptr, nullptr};
+  if (attachment >= 0x8CE0 && attachment < 0x8CE0 + kMaxDrawBuffers) ats[0] = &fb->color[attachment - 0x8CE0];
+  else if (attachment == 0x8D00) ats[0] = &fb->depth;
+  else if (attachment == 0x8D20) ats[0] = &fb->stencil;
+  else if (attachment == 0x821A) { ats[0] = &fb->depth; ats[1] = &fb->stencil; }
+  for (Attachment* at : ats) {
+    if (!at) continue;
+    at->layered = true;
+    at->face_target = t->target == 0x8513 ? 0x8515 : t->target;      // (a cube: its faces are the layers, from +X)
+  }
+}
+
 void GlContext::framebuffer_renderbuffer(uint32_t target, uint32_t attachment, uint32_t rb) {
   const uint32_t id = target == 0x8CA8 ? read_fb_ : draw_fb_;
   Framebuffer* fb = fb_at(id);
@@ -813,15 +833,23 @@ void GlContext::framebuffer_renderbuffer(uint32_t target, uint32_t attachment, u
   else set_error(INVALID_ENUM);
 }
 
-bool GlContext::resolve_image(const Attachment& at, Image** img, uint32_t* layer) {
+// The image an attachment draws to; of a layered one, layer `select` (a cube's faces +X..-Z, an array's or 3D texture's slices).
+bool GlContext::resolve_image(const Attachment& at, Image** img, uint32_t* layer, uint32_t select) {
   *layer = 0;
   if (at.kind == 1) {
     Texture* t = texture_at(at.id);
     if (!t) return false;
+    if (at.layered && at.face_target >= 0x8515 && at.face_target <= 0x851A) {
+      if (select >= 6) return false;
+      Image* face = texture_image(t, 0x8515 + select, at.level);
+      if (!face) return false;
+      *img = face;
+      return true;
+    }
     Image* im = texture_image(t, at.face_target, at.level);
     if (!im) return false;
     *img = im;
-    *layer = static_cast<uint32_t>(at.layer < 0 ? 0 : at.layer);
+    *layer = at.layered ? select : static_cast<uint32_t>(at.layer < 0 ? 0 : at.layer);
     return *layer < im->d;
   }
   if (at.kind == 2) {
@@ -833,8 +861,14 @@ bool GlContext::resolve_image(const Attachment& at, Image** img, uint32_t* layer
   return false;
 }
 
-void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t) {
+uint32_t GlContext::attachment_layers(const Attachment& at, const Image& im) {
+  if (!at.layered) return 1;
+  return at.face_target >= 0x8515 && at.face_target <= 0x851A ? 6 : im.d;
+}
+
+void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t, uint32_t select) {
   *t = Target();
+  t->fb = fb_id;
   if (fb_id == 0) {
     t->is_default = true;
     t->w = dcolor_->w;
@@ -851,25 +885,35 @@ void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t) {
   bool any = false;
   uint32_t dw = 0, dh = 0;
   t->color_count = kMaxDrawBuffers;
+  t->current_layer = select;
+  const auto note_layers = [&](const Attachment& at, const Image& im) {
+    if (!at.layered) return;
+    const uint32_t n = attachment_layers(at, im);
+    t->layers = t->layered && t->layers < n ? t->layers : n;
+    t->layered = true;
+  };
   for (uint32_t i = 0; i < kMaxDrawBuffers; ++i) {
     const uint32_t src = draw ? fb->draw_buffers[i] : (fb->read_buffer == 0x8CE0 + i ? fb->read_buffer : 0);
     if (src != 0x8CE0 + i) continue;
     Image* im;
     uint32_t layer;
-    if (!resolve_image(fb->color[i], &im, &layer)) continue;
+    if (!resolve_image(fb->color[i], &im, &layer, select)) continue;
     t->color[i] = im;
     t->layer[i] = layer;
+    note_layers(fb->color[i], *im);
     if (!any) { dw = im->w; dh = im->h; any = true; }
   }
   Image* dimg;
   uint32_t layer;
-  if (fb->depth.kind && resolve_image(fb->depth, &dimg, &layer)) {
+  if (fb->depth.kind && resolve_image(fb->depth, &dimg, &layer, select)) {
     t->depth = dimg;
     t->depth_layer = layer;
+    note_layers(fb->depth, *dimg);
     if (!any) { dw = dimg->w; dh = dimg->h; any = true; }
   }
-  if (fb->stencil.kind && resolve_image(fb->stencil, &dimg, &layer)) {
+  if (fb->stencil.kind && resolve_image(fb->stencil, &dimg, &layer, select)) {
     t->stencil = dimg;
+    note_layers(fb->stencil, *dimg);
     if (!any) { dw = dimg->w; dh = dimg->h; any = true; }
   }
   t->w = dw;
@@ -910,6 +954,16 @@ bool GlContext::framebuffer_complete(uint32_t fb_id, uint32_t* status) {
   s = check(fb->stencil, false, false, true);
   if (s != 0x8CD5) { *status = s; return false; }
   if (!any) { *status = 0x8CD7; return false; }
+  // every attachment layered, or none (GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS)
+  int layered = -1;
+  const auto same_layering = [&](const Attachment& at) {
+    if (!at.kind) return true;
+    if (layered < 0) layered = at.layered;
+    return layered == static_cast<int>(at.layered);
+  };
+  bool same = same_layering(fb->depth) && same_layering(fb->stencil);
+  for (const Attachment& at : fb->color) same = same && same_layering(at);
+  if (!same) { *status = 0x8DA8; return false; }
   *status = 0x8CD5;
   return true;
 }
@@ -942,6 +996,7 @@ bool GlContext::get_framebuffer_attachment_parameter(uint32_t target, uint32_t a
     case 0x8CD2: *out = at->level; return true;
     case 0x8CD3: *out = at->face_target >= 0x8515 ? at->face_target : 0; return true;
     case 0x8CD4: *out = at->layer; return true;
+    case 0x8DA7: *out = at->layered; return true;      // FRAMEBUFFER_ATTACHMENT_LAYERED
     default: {
       Image* im;
       uint32_t layer;

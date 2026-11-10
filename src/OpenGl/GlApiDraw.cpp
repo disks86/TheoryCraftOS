@@ -289,6 +289,7 @@ bool GlApi::prepare_draw(uint32_t, int64_t lowest, int64_t highest, uint32_t ins
 
 void GlApi::finish_draw() {
   gl_.desktop.triangle_edges = ConstByteView();
+  gl_.desktop.primitive_id_divisor = 1;
   gl_.desktop.base_vertex = 0;
   gl_.desktop.base_instance = 0;
   // glUseProgram state lives here, not in the engine's current program: uniforms and so on name programs directly.
@@ -406,6 +407,7 @@ void GlApi::draw_any(uint32_t mode, int32_t first, int32_t count, uint32_t type,
     const uint32_t saved = vao->element_buffer;
     vao->element_buffer = index_buffer_;
     if (polygon_modes) gl_.desktop.triangle_edges = ConstByteView(tri_edges_.view().data(), tri_edges_.count());
+    gl_.desktop.primitive_id_divisor = mode == GL_POLYGON ? 0 : 2;
     gl_.draw_elements(GL_TRIANGLES, static_cast<int32_t>(tri_indices), GL_UNSIGNED_INT, 0, instances);
     vao->element_buffer = saved;
   }

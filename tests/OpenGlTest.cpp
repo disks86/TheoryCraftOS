@@ -1389,6 +1389,253 @@ static void test_clip_distances() {
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
+// gl_PrimitiveID without a geometry stage (quads count as one primitive, every instance starts again at 0), and .length() of a redeclared built-in array.
+static void test_primitive_id_and_lengths() {
+  Fixture f;
+  GLuint vao = 0, vbo = 0;
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+  glGenBuffers(1, &vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  // a quad strip of two quads, left (x < 0) and right
+  const float strip[24] = {-1, -1, 0, 1, -1, 1, 0, 1, 0, -1, 0, 1, 0, 1, 0, 1, 1, -1, 0, 1, 1, 1, 0, 1};
+  glBufferData(GL_ARRAY_BUFFER, sizeof(strip), strip, GL_STATIC_DRAW);
+  const GLuint p = build_stages("#version 150\nin vec4 pos;\nuniform float shift;\nvoid main(){ gl_Position = pos + vec4(shift * float(gl_InstanceID), 0.0, 0.0, 0.0); }\n", nullptr,
+                                nullptr, nullptr,
+                                "#version 150\nout vec4 c;\nvoid main(){ c = gl_PrimitiveID == 0 ? vec4(1.0, 0.0, 0.0, 1.0) : (gl_PrimitiveID == 1 ? vec4(0.0, 1.0, 0.0, 1.0) : vec4(0.0, 0.0, 1.0, 1.0)); }\n");
+  CHECK(p != 0);
+  const GLint at = glGetAttribLocation(p, "pos");
+  glEnableVertexAttribArray(static_cast<GLuint>(at));
+  glVertexAttribPointer(static_cast<GLuint>(at), 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+  glUseProgram(p);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDrawArrays(GL_QUAD_STRIP, 0, 6);
+  CHECK(near(pixel(10, 32), 255, 0, 0) && near(pixel(54, 32), 0, 255, 0));
+  // the same as a triangle strip: four primitives, the left half's two are 0 and 1
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 6);
+  CHECK(near(pixel(3, 32), 255, 0, 0) && near(pixel(29, 32), 0, 255, 0) && near(pixel(54, 32), 0, 0, 255));
+  // a polygon is one primitive
+  const float poly[16] = {-1, -1, 0, 1, 1, -1, 0, 1, 1, 1, 0, 1, -1, 1, 0, 1};
+  glBufferData(GL_ARRAY_BUFFER, sizeof(poly), poly, GL_STATIC_DRAW);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDrawArrays(GL_POLYGON, 0, 4);
+  CHECK(near(pixel(10, 10), 255, 0, 0) && near(pixel(54, 54), 255, 0, 0));
+  // instances: the left quad drawn twice, the second one shifted right, both primitive 0
+  const float quad[16] = {-1, -1, 0, 1, 0, -1, 0, 1, 0, 1, 0, 1, -1, 1, 0, 1};
+  glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+  glUniform1f(glGetUniformLocation(p, "shift"), 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDrawArraysInstanced(GL_QUADS, 0, 4, 2);
+  CHECK(near(pixel(10, 32), 255, 0, 0) && near(pixel(54, 32), 255, 0, 0));
+  glUseProgram(0);
+  glDeleteProgram(p);
+  CHECK(glGetError() == GL_NO_ERROR);
+
+  // gl_ClipDistance redeclared with 2 elements: .length() in the vertex stage and of gl_in[0]'s in the geometry stage, captured by transform feedback
+  GLuint tfb = 0;
+  glGenBuffers(1, &tfb);
+  const char* names[] = {"n"};
+  const GLuint g = build_stages("#version 150\nout gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[2]; };\nout float vlen;\n"
+                                "void main(){ gl_Position = vec4(0.0); gl_ClipDistance[0] = 0.0; gl_ClipDistance[1] = 0.0; vlen = float(gl_ClipDistance.length()); }\n",
+                                nullptr, nullptr,
+                                "#version 150\nlayout(points) in;\nlayout(points, max_vertices = 1) out;\nin gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[2]; } gl_in[];\n"
+                                "in float vlen[];\nout float n;\nvoid main(){ n = vlen[0] * 100.0 + float(gl_in[0].gl_ClipDistance.length() * 10 + gl_in.length()); EmitVertex(); }\n",
+                                "#version 150\nout vec4 c;\nvoid main(){ c = vec4(1.0); }\n", names, 1);
+  CHECK(g != 0);
+  glUseProgram(g);
+  reset_floats(tfb, 2);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb);
+  glEnable(GL_RASTERIZER_DISCARD);
+  glBeginTransformFeedback(GL_POINTS);
+  glDrawArrays(GL_POINTS, 0, 1);
+  glEndTransformFeedback();
+  glDisable(GL_RASTERIZER_DISCARD);
+  float got[2] = {};
+  read_floats(tfb, got, 2);
+  CHECK(got[0] == 221 && got[1] == -1);
+  // larger than the built-in fails
+  CHECK(build_stages("#version 150\nout gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[9]; };\nvoid main(){ gl_Position = vec4(0.0); }\n", nullptr, nullptr, nullptr,
+                     "#version 150\nout vec4 c;\nvoid main(){ c = vec4(1.0); }\n") == 0);
+  glUseProgram(0);
+  glDeleteProgram(g);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+// GL_ARB_program_interface_query: uniforms (with block members), blocks, inputs, outputs, transform feedback varyings and buffers.
+static void test_program_resources() {
+  Fixture f;
+  const char* captured[] = {"id", "gl_SkipComponents1", "gl_NextBuffer", "pair"};
+  const GLuint p = build_stages("#version 150\nin vec4 pos;\nuniform float scale;\nuniform Blk { vec4 u0; float u1[3]; };\nout float id;\nout vec2 pair;\n"
+                                "void main(){ gl_Position = pos * scale; id = u0.x + u1[2]; pair = vec2(id); }\n",
+                                nullptr, nullptr, nullptr,
+                                "#version 330\nlayout(location = 1) out vec4 second;\nlayout(location = 0) out vec4 frag;\nvoid main(){ frag = vec4(1.0); second = vec4(0.5); }\n",
+                                captured, 4);
+  CHECK(p != 0);
+  GLint n = 0;
+  glGetProgramInterfaceiv(p, GL_TRANSFORM_FEEDBACK_VARYING, GL_ACTIVE_RESOURCES, &n);
+  CHECK(n == 4);
+  glGetProgramInterfaceiv(p, GL_TRANSFORM_FEEDBACK_VARYING, GL_MAX_NAME_LENGTH, &n);
+  CHECK(n == 19);
+  glGetProgramInterfaceiv(p, GL_TRANSFORM_FEEDBACK_BUFFER, GL_ACTIVE_RESOURCES, &n);
+  CHECK(n == 2);
+  glGetProgramInterfaceiv(p, GL_TRANSFORM_FEEDBACK_BUFFER, GL_MAX_NUM_ACTIVE_VARIABLES, &n);
+  CHECK(n == 1);
+  glGetProgramInterfaceiv(p, GL_TRANSFORM_FEEDBACK_BUFFER, GL_MAX_NAME_LENGTH, &n);
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glGetProgramInterfaceiv(p, GL_SHADER_STORAGE_BLOCK, GL_ACTIVE_RESOURCES, &n);
+  CHECK(n == 0 && glGetError() == GL_NO_ERROR);
+  char name[32] = {};
+  GLsizei len = 0;
+  glGetProgramResourceName(p, GL_TRANSFORM_FEEDBACK_VARYING, 3, sizeof(name), &len, name);
+  CHECK(len == 4 && strcmp(name, "pair") == 0);
+  CHECK(glGetProgramResourceIndex(p, GL_TRANSFORM_FEEDBACK_VARYING, "pair") == 3);
+  CHECK(glGetProgramResourceIndex(p, GL_TRANSFORM_FEEDBACK_VARYING, "nothing") == GL_INVALID_INDEX);
+  glGetProgramResourceIndex(p, GL_TRANSFORM_FEEDBACK_BUFFER, "pair");
+  CHECK(glGetError() == GL_INVALID_ENUM);
+  const GLenum tf_props[4] = {GL_TYPE, GL_ARRAY_SIZE, GL_OFFSET, GL_TRANSFORM_FEEDBACK_BUFFER_INDEX};
+  GLint v[8] = {};
+  glGetProgramResourceiv(p, GL_TRANSFORM_FEEDBACK_VARYING, 3, 4, tf_props, 8, &len, v);
+  CHECK(len == 4 && v[0] == GL_FLOAT_VEC2 && v[1] == 1 && v[2] == 0 && v[3] == 1);
+  glGetProgramResourceiv(p, GL_TRANSFORM_FEEDBACK_VARYING, 1, 4, tf_props, 8, &len, v);      // gl_SkipComponents1
+  CHECK(v[0] == GL_NONE && v[1] == 1 && v[2] == 4 && v[3] == 0);
+  const GLenum buf_props[4] = {GL_BUFFER_BINDING, GL_TRANSFORM_FEEDBACK_BUFFER_STRIDE, GL_NUM_ACTIVE_VARIABLES, GL_ACTIVE_VARIABLES};
+  glGetProgramResourceiv(p, GL_TRANSFORM_FEEDBACK_BUFFER, 1, 4, buf_props, 8, &len, v);
+  CHECK(len == 4 && v[0] == 1 && v[1] == 8 && v[2] == 1 && v[3] == 3);
+  glGetProgramResourceiv(p, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 4, buf_props, 2, &len, v);      // (only bufSize values)
+  CHECK(len == 2 && v[0] == 0 && v[1] == 8);
+  // uniforms: one outside a block, a block member
+  const GLuint us = glGetProgramResourceIndex(p, GL_UNIFORM, "scale");
+  const GLuint um = glGetProgramResourceIndex(p, GL_UNIFORM, "u1");
+  CHECK(us != GL_INVALID_INDEX && um != GL_INVALID_INDEX && glGetProgramResourceIndex(p, GL_UNIFORM, "u1[0]") == um);
+  const GLenum u_props[6] = {GL_TYPE, GL_ARRAY_SIZE, GL_BLOCK_INDEX, GL_OFFSET, GL_ARRAY_STRIDE, GL_LOCATION};
+  glGetProgramResourceiv(p, GL_UNIFORM, us, 6, u_props, 8, &len, v);
+  CHECK(v[0] == GL_FLOAT && v[1] == 1 && v[2] == -1 && v[5] == glGetUniformLocation(p, "scale"));
+  CHECK(glGetProgramResourceLocation(p, GL_UNIFORM, "scale") == glGetUniformLocation(p, "scale"));
+  glGetProgramResourceiv(p, GL_UNIFORM, um, 6, u_props, 8, &len, v);
+  CHECK(v[0] == GL_FLOAT && v[1] == 3 && v[2] == 0 && v[3] == 16 && v[4] == 16 && v[5] == -1);
+  glGetProgramResourceName(p, GL_UNIFORM, um, sizeof(name), &len, name);
+  CHECK(strcmp(name, "u1[0]") == 0);
+  const GLenum b_props[5] = {GL_NUM_ACTIVE_VARIABLES, GL_BUFFER_DATA_SIZE, GL_REFERENCED_BY_VERTEX_SHADER, GL_REFERENCED_BY_FRAGMENT_SHADER, GL_NAME_LENGTH};
+  glGetProgramResourceiv(p, GL_UNIFORM_BLOCK, 0, 5, b_props, 8, &len, v);
+  CHECK(v[0] == 2 && v[1] == 64 && v[2] == 1 && v[3] == 0 && v[4] == 4);
+  const GLenum bad_prop = GL_BUFFER_BINDING;
+  glGetProgramResourceiv(p, GL_UNIFORM, us, 1, &bad_prop, 8, &len, v);
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  // inputs and outputs
+  const GLenum io_props[3] = {GL_TYPE, GL_LOCATION, GL_REFERENCED_BY_VERTEX_SHADER};
+  const GLuint pi = glGetProgramResourceIndex(p, GL_PROGRAM_INPUT, "pos");
+  glGetProgramResourceiv(p, GL_PROGRAM_INPUT, pi, 3, io_props, 8, &len, v);
+  CHECK(v[0] == 0x8B52 && v[1] == glGetAttribLocation(p, "pos") && v[2] == 1);
+  CHECK(glGetProgramResourceLocation(p, GL_PROGRAM_OUTPUT, "second") == 1 && glGetFragDataLocation(p, "second") == 1 && glGetFragDataLocation(p, "frag") == 0);
+  CHECK(glGetProgramResourceLocationIndex(p, GL_PROGRAM_OUTPUT, "frag") == 0 && glGetProgramResourceLocation(p, GL_PROGRAM_OUTPUT, "none") == -1);
+  glGetProgramResourceLocation(p, GL_TRANSFORM_FEEDBACK_VARYING, "id");
+  CHECK(glGetError() == GL_INVALID_ENUM);
+  glDeleteProgram(p);
+
+  // the shader's own xfb layout: the outputs it captures, at their offsets
+  const GLuint x = build_stages("#version 440\nlayout(xfb_offset = 4) out float a;\nlayout(xfb_buffer = 1, xfb_stride = 12) out;\n"
+                                "layout(xfb_buffer = 1, xfb_offset = 0) out Blk { float p; float q; } blk;\nvoid main(){ gl_Position = vec4(0.0); a = 1.0; blk.p = 2.0; blk.q = 3.0; }\n",
+                                nullptr, nullptr, nullptr, "#version 150\nout vec4 c;\nvoid main(){ c = vec4(1.0); }\n");
+  CHECK(x != 0);
+  glGetProgramiv(x, 0x8C83, &n);      // GL_TRANSFORM_FEEDBACK_VARYINGS
+  CHECK(n == 3);
+  const GLuint q = glGetProgramResourceIndex(x, GL_TRANSFORM_FEEDBACK_VARYING, "Blk.q");
+  CHECK(q != GL_INVALID_INDEX);
+  glGetProgramResourceiv(x, GL_TRANSFORM_FEEDBACK_VARYING, q, 4, tf_props, 8, &len, v);
+  CHECK(v[0] == GL_FLOAT && v[2] == 4 && v[3] == 1);
+  glGetProgramResourceiv(x, GL_TRANSFORM_FEEDBACK_BUFFER, 1, 4, buf_props, 8, &len, v);
+  CHECK(len == 5 && v[0] == 1 && v[1] == 12 && v[2] == 2);
+  glGetProgramResourceiv(x, GL_TRANSFORM_FEEDBACK_BUFFER, 0, 2, buf_props, 8, &len, v);
+  CHECK(v[0] == 0 && v[1] == 8);
+  glDeleteProgram(x);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+// Layered rendering: a whole 2D array or cube texture attached (glFramebufferTexture), the geometry stage's gl_Layer picking each primitive's layer; clears reach every layer.
+static void test_layered_rendering() {
+  Fixture f;
+  GLuint vao = 0, tex = 0, cube = 0, fbo = 0, read_fbo = 0, rb = 0;
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, 16, 16, 3, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glGenFramebuffers(1, &fbo);
+  glGenFramebuffers(1, &read_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0);
+  CHECK(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+  GLint layered = 0;
+  glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 0x8DA7 /* GL_FRAMEBUFFER_ATTACHMENT_LAYERED */, &layered);
+  CHECK(layered == 1);
+  glViewport(0, 0, 16, 16);
+  glClearColor(0, 0, 1, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  const GLuint p = build_stages("#version 150\nvoid main(){ gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0); }\n", nullptr, nullptr,
+                                "#version 150\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 6) out;\nuniform int second;\nflat out vec4 col;\n"
+                                "void main(){ for (int k = 0; k < 2; ++k) { for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; gl_Layer = k == 0 ? 0 : second;\n"
+                                "  col = k == 0 ? vec4(1.0, 0.0, 0.0, 1.0) : vec4(0.0, 1.0, 0.0, 1.0); EmitVertex(); } EndPrimitive(); } }\n",
+                                "#version 150\nflat in vec4 col;\nout vec4 c;\nvoid main(){ c = col; }\n");
+  CHECK(p != 0);
+  glUseProgram(p);
+  glUniform1i(glGetUniformLocation(p, "second"), 2);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  CHECK(glGetError() == GL_NO_ERROR);
+  const auto layer_pixel = [&](GLuint t, GLint layer) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, t, 0, layer);
+    const Pixel px = pixel(8, 8);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    return px;
+  };
+  CHECK(near(layer_pixel(tex, 0), 255, 0, 0) && near(layer_pixel(tex, 1), 0, 0, 255) && near(layer_pixel(tex, 2), 0, 255, 0));
+  // a layer past the last one draws to the last
+  glUniform1i(glGetUniformLocation(p, "second"), 7);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  CHECK(near(layer_pixel(tex, 0), 0, 0, 0) && near(layer_pixel(tex, 1), 0, 0, 0) && near(layer_pixel(tex, 2), 0, 0, 0));
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  CHECK(near(layer_pixel(tex, 1), 0, 0, 0) && near(layer_pixel(tex, 2), 0, 255, 0));
+  // a layered and a non-layered attachment together: incomplete
+  glGenRenderbuffers(1, &rb);
+  glBindRenderbuffer(GL_RENDERBUFFER, rb);
+  glRenderbufferStorage(GL_RENDERBUFFER, 0x81A6 /* GL_DEPTH_COMPONENT24 */, 16, 16);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, 0x8D00 /* GL_DEPTH_ATTACHMENT */, GL_RENDERBUFFER, rb);
+  CHECK(glCheckFramebufferStatus(GL_FRAMEBUFFER) == 0x8DA8 /* GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS */);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, 0x8D00 /* GL_DEPTH_ATTACHMENT */, GL_RENDERBUFFER, 0);
+  // a cube map: its faces are layers 0..5 (+X, -X, +Y, -Y, +Z, -Z)
+  glGenTextures(1, &cube);
+  glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+  for (GLenum face = GL_TEXTURE_CUBE_MAP_POSITIVE_X; face <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z; ++face) glTexImage2D(face, 0, GL_RGBA8, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, cube, 0);
+  CHECK(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+  glClearColor(0, 0, 1, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUniform1i(glGetUniformLocation(p, "second"), 5);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  const auto face_pixel = [&](GLenum face) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, face, cube, 0);
+    const Pixel px = pixel(8, 8);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    return px;
+  };
+  CHECK(near(face_pixel(GL_TEXTURE_CUBE_MAP_POSITIVE_X), 255, 0, 0) && near(face_pixel(GL_TEXTURE_CUBE_MAP_NEGATIVE_Z), 0, 255, 0) &&
+        near(face_pixel(0x8517 /* +Y */), 0, 0, 255));
+  glUseProgram(0);
+  glDeleteProgram(p);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glDeleteFramebuffers(1, &fbo);
+  glDeleteFramebuffers(1, &read_fbo);
+  glDeleteRenderbuffers(1, &rb);
+  glDeleteTextures(1, &tex);
+  glDeleteTextures(1, &cube);
+  glViewport(0, 0, W, H);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
 static void test_framebuffer_object() {
   Fixture f;
   GLuint fbo = 0, tex = 0;
@@ -1565,6 +1812,9 @@ int main() {
   test_clip_distances();
   test_transform_feedback_stages();
   test_compat_stage_varyings();
+  test_primitive_id_and_lengths();
+  test_program_resources();
+  test_layered_rendering();
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();

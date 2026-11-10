@@ -73,14 +73,23 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   `GL_PRIMITIVES_GENERATED` and `GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN`, per stream (`glBeginQueryIndexed`). A geometry shader's `EmitStreamVertex(n)` on streams 1..3
   makes a point for those buffers and queries only (several streams need `points` output; only stream 0 is rasterized). Transform feedback objects keep their
   bindings, and they can be paused and drawn from (`glDrawTransformFeedbackStream`). WebGL 2 has the same objects, pause/resume and `getTransformFeedbackVarying`.
+- `gl_PrimitiveID` in a fragment shader with no geometry stage: the draw counts its primitives per instance (`FragmentPipeline::next_primitive`), a quad drawn as two
+  triangles counting once (`DesktopState::primitive_id_divisor`), a polygon as one, and a tessellated patch's primitives taking the patch's number.
+- A `gl_PerVertex` redeclaration's array sizes (`float gl_ClipDistance[2];`) are what `.length()` says (`Global::declared_length`); the built-in keeps its slots.
+- Layered rendering: `glFramebufferTexture` of a 3D, 2D array or cube texture attaches every layer (`Attachment::layered`; a cube's faces are layers 0..5), and the
+  geometry stage's `gl_Layer` (the first vertex's, `GL_LAYER_PROVOKING_VERTEX`) picks the layer each primitive draws to; past the last layer it is the last. Clears reach
+  every layer. Mixing layered and non-layered attachments is `GL_FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS`.
+- `GL_ARB_program_interface_query` (`GlApiResource.cpp`): uniforms with the block members after them, uniform blocks, vertex inputs, fragment outputs, transform
+  feedback varyings (`ProgramObj::tf_resources`, also what `glGetTransformFeedbackVarying` reads: with xfb layouts, the captured outputs) and their buffers. Storage
+  blocks, atomic counters and subroutines are valid interfaces with no resources. `glGetFragDataLocation` goes through the same code.
 - piglit's `.shader_test` files: `tests/run_host_tests.sh PiglitShaderTest` (pinned piglit, fetched by `tests/fetch_piglit.sh`; tens of minutes), expected failures in
   `tests/data/piglit/shader_test.xfail`.
 
 ## Not done
 
-- GLSL: doubles, compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; layered rendering (`gl_Layer`), `gl_PrimitiveID` without a
-  geometry stage, a redeclared built-in array's size (`gl_in[0].gl_ClipDistance.length()` after `float gl_ClipDistance[2]`), doubles in transform feedback (8-byte
-  alignment), the program interface queries of `GL_TRANSFORM_FEEDBACK_VARYING`/`_BUFFER`.
+- GLSL: doubles (so none in transform feedback either), compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; `gl_Layer` and
+  `gl_ViewportIndex` read by a fragment shader (`GL_ARB_fragment_layer_viewport`), viewport arrays, layered 1D array textures; unnamed blocks' members captured by xfb
+  layouts are reported as `Block.member`; `glBindFragDataLocation`.
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
 - Drawing is on the CPU (the WebGL accelerator path only takes WebGL's default framebuffer, not window surfaces).
